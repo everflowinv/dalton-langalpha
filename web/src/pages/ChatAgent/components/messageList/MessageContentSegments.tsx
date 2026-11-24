@@ -179,6 +179,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
     onResumeCreditPause,
     onApproveToolCall, onRejectToolCall,
     onWidgetSendPrompt,
+    widgetExports, // DALTON-HOOK(shared-widgets): export actions this surface offers
   } = useMessageActions();
 
   // Stable, because `ActivityBlock` is memoized and its other props survive a
@@ -444,6 +445,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
                 html={widgetData.html}
                 title={widgetData.title}
                 onSendPrompt={onWidgetSendPrompt}
+                exports={widgetExports} // DALTON-HOOK(shared-widgets)
                 data={widgetData.data}
               />
             </div>

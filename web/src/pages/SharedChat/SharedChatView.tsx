@@ -30,6 +30,7 @@ import {
   handleHistoryToolCalls,
   handleHistoryToolCallResult,
   handleHistoryTaskArtifactStatus,
+  handleHistoryHtmlWidget, // DALTON-HOOK(shared-widgets): replay inline widgets in shared chats
 } from '../ChatAgent/hooks/utils/historyEventHandlers';
 import type { PairState } from '../ChatAgent/hooks/utils/historyEventHandlers';
 import {
@@ -52,7 +53,7 @@ import { collectRecentWritePaths, downloadTarget, type TurnMessage } from '../Ch
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { DispatchStatusProvider } from '../ChatAgent/hooks/usePTCDispatchStatus';
 import { useIsMobile } from '@/hooks/useIsMobile';
-import type { MessageRecord, SetMessages } from '../ChatAgent/hooks/utils/types';
+import type { HtmlWidgetData, MessageRecord, SetMessages } from '../ChatAgent/hooks/utils/types';
 import { applyPlanSnapshot, readPlanSteps } from '@/pages/ChatAgent/session/planUpdate';
 import { eventOrder } from '@/pages/ChatAgent/session/eventOrder';
 import { threadPlans } from '../ChatAgent/components/messageList/requestPlans';
@@ -290,6 +291,28 @@ export default function SharedChatView({ shareToken, access = shareToken, metada
             return;
           }
 
+          // DALTON-HOOK(shared-widgets): an inline widget (ShowWidget) replays as
+          // the owner's view shows it. The public replay already sends it, its
+          // data_ref resolved, and the widget renders in the same sandboxed frame.
+          if (eventType === 'artifact' && event.artifact_type === 'html_widget' && hasPairIndex) {
+            const pairIndex = event.turn_index as number;
+            const currentAssistantMessageId = assistantMessagesByPair.get(pairIndex);
+            const pairState = pairStateByPair.get(pairIndex);
+            if (!currentAssistantMessageId || !pairState) return;
+            handleHistoryHtmlWidget({
+              assistantMessageId: currentAssistantMessageId,
+              artifactType: 'html_widget',
+              artifactId: event.artifact_id as string,
+              payload: (event.payload as HtmlWidgetData | null) ?? null,
+              pairState,
+              setMessages: setMessagesCompat,
+              // The reply's other segments here sort on the pair's own counter,
+              // so the widget does too, keeping its place among them.
+              eventId: null,
+            });
+            return;
+          }
+
           // tool_calls
           if (eventType === 'tool_calls' && hasPairIndex) {
             const pairIndex = event.turn_index as number;
@@ -487,6 +510,9 @@ export default function SharedChatView({ shareToken, access = shareToken, metada
   // surfaces, so a value would be dead weight pretending to be the gate.
   const readOnlyActions = useMemo<MessageActions>(() => ({
     ...READ_ONLY_MESSAGE_ACTIONS,
+    // DALTON-HOOK(shared-widgets): no new tab or PDF (they run the widget off its
+    // sandbox on the app's origin); the HTML download only where the share allows it.
+    widgetExports: canDownload ? 'download' : 'none',
     onOpenFile: handleOpenFile,
     onOpenChart: handleOpenChart,
     // A copy-link share grants allow_files without allow_download, so the
