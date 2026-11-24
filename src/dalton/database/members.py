@@ -34,6 +34,26 @@ async def list_member_emails(*, conn: Any = None) -> set[str]:
             }
 
 
+async def list_local_role_member_emails(*, conn: Any = None) -> set[str]:
+    """Return lowercase emails for all users holding a role row in ``dalton_user_roles``."""
+    async with get_db_connection(conn) as c:
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT u.email
+                FROM dalton_user_roles r
+                JOIN users u ON u.user_id = r.user_id
+                WHERE u.email IS NOT NULL AND u.email <> ''
+                """
+            )
+            rows = await cur.fetchall()
+            return {
+                str(r["email"]).strip().lower()
+                for r in rows
+                if r and r.get("email") and str(r["email"]).strip()
+            }
+
+
 async def get_member_by_email(
     email: str,
     *,
@@ -116,39 +136,66 @@ async def insert_invite(
     token_sha256: str,
     created_by_user_id: str,
     expires_at: datetime,
+    tier: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     """Insert a new single-use invite into ``dalton_invites`` (storing only ``token_sha256``)."""
     resolved_id = str(uuid.UUID(invite_id)) if invite_id else str(uuid.uuid4())
+    norm_tier = str(tier).strip().lower() if tier is not None else None
     async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                INSERT INTO dalton_invites (
-                    invite_id, token_sha256, created_by_user_id, expires_at
+            if norm_tier is not None:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_invites (
+                        invite_id, token_sha256, created_by_user_id, expires_at, tier
+                    )
+                    VALUES (%s, %s, %s, %s, %s)
+                    RETURNING
+                        invite_id::text AS invite_id,
+                        token_sha256,
+                        created_by_user_id,
+                        created_at,
+                        expires_at,
+                        tier,
+                        redeeming_username,
+                        redeeming_at,
+                        used_at,
+                        used_by_email,
+                        supabase_user_id,
+                        revoked_at
+                    """,
+                    (resolved_id, token_sha256, created_by_user_id, expires_at, norm_tier),
                 )
-                VALUES (%s, %s, %s, %s)
-                RETURNING
-                    invite_id::text AS invite_id,
-                    token_sha256,
-                    created_by_user_id,
-                    created_at,
-                    expires_at,
-                    redeeming_username,
-                    redeeming_at,
-                    used_at,
-                    used_by_email,
-                    supabase_user_id,
-                    revoked_at
-                """,
-                (resolved_id, token_sha256, created_by_user_id, expires_at),
-            )
+            else:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_invites (
+                        invite_id, token_sha256, created_by_user_id, expires_at
+                    )
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING
+                        invite_id::text AS invite_id,
+                        token_sha256,
+                        created_by_user_id,
+                        created_at,
+                        expires_at,
+                        redeeming_username,
+                        redeeming_at,
+                        used_at,
+                        used_by_email,
+                        supabase_user_id,
+                        revoked_at
+                    """,
+                    (resolved_id, token_sha256, created_by_user_id, expires_at),
+                )
             row = await cur.fetchone()
             return _normalize_row(row) or {
                 "invite_id": resolved_id,
                 "token_sha256": token_sha256,
                 "created_by_user_id": created_by_user_id,
                 "expires_at": expires_at,
+                "tier": norm_tier or "external",
                 "redeeming_username": None,
                 "redeeming_at": None,
                 "used_at": None,
@@ -222,6 +269,7 @@ async def list_invites(
                         i.created_by_user_id,
                         i.created_at,
                         i.expires_at,
+                        i.tier,
                         i.redeeming_username,
                         i.redeeming_at,
                         i.used_at,
@@ -244,6 +292,7 @@ async def list_invites(
                         i.created_by_user_id,
                         i.created_at,
                         i.expires_at,
+                        i.tier,
                         i.redeeming_username,
                         i.redeeming_at,
                         i.used_at,
@@ -279,6 +328,7 @@ async def get_invite_by_id(
                     created_by_user_id,
                     created_at,
                     expires_at,
+                    tier,
                     redeeming_username,
                     redeeming_at,
                     used_at,
@@ -322,6 +372,7 @@ async def revoke_invite(
                         created_by_user_id,
                         created_at,
                         expires_at,
+                        tier,
                         redeeming_username,
                         redeeming_at,
                         used_at,
@@ -342,6 +393,7 @@ async def revoke_invite(
                         created_by_user_id,
                         created_at,
                         expires_at,
+                        tier,
                         redeeming_username,
                         redeeming_at,
                         used_at,
@@ -374,6 +426,7 @@ async def get_invite_by_token_hash(
                     created_by_user_id,
                     created_at,
                     expires_at,
+                    tier,
                     redeeming_username,
                     redeeming_at,
                     used_at,
@@ -407,6 +460,7 @@ async def lock_invite_by_token_hash(
                 created_by_user_id,
                 created_at,
                 expires_at,
+                tier,
                 redeeming_username,
                 redeeming_at,
                 used_at,
@@ -449,6 +503,7 @@ async def mark_invite_redeeming(
                 created_by_user_id,
                 created_at,
                 expires_at,
+                tier,
                 redeeming_username,
                 redeeming_at,
                 used_at,
@@ -508,6 +563,7 @@ async def mark_invite_used(
                 created_by_user_id,
                 created_at,
                 expires_at,
+                tier,
                 redeeming_username,
                 redeeming_at,
                 used_at,

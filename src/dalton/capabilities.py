@@ -62,6 +62,7 @@ class CapabilityId(StrEnum):
     FUND_AUTOMATIONS = "fund_automations"  # 内部定时简报模板、市场摘要与播客周报工具
     PROBLEM_REPORTS = "problem_reports"  # 内部运行问题工单上报工具（report_issue）
     NATIVE_OAUTH_SYNC = "native_oauth_sync"  # 私有订阅 OAuth 模型目录与同步面板
+    COLLEAGUE_SHARING = "colleague_sharing"  # 同事工作区共享与智能体跨区访问
 
 
 @dataclass(frozen=True)
@@ -222,6 +223,13 @@ _RAW_CAPABILITY_SPECS: tuple[CapabilitySpec, ...] = (
         everflow_default=True,
         core_default=False,
         yaml_keys=("capabilities.native_oauth_sync",),
+    ),
+    CapabilitySpec(
+        id=CapabilityId.COLLEAGUE_SHARING,
+        description="同事工作区共享与智能体跨区访问",
+        everflow_default=True,
+        core_default=False,
+        yaml_keys=("capabilities.colleague_sharing",),
     ),
 )
 
@@ -855,13 +863,13 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("router.py", "upsert_task_cap_endpoint"): CORE_CAPABILITY,
         ("router.py", "delete_task_cap_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_budget_today_endpoint"): CORE_CAPABILITY,
-        ("router.py", "list_team_workspaces_endpoint"): CORE_CAPABILITY,
-        ("router.py", "get_workspace_sharing_endpoint"): CORE_CAPABILITY,
-        ("router.py", "update_workspace_sharing_endpoint"): CORE_CAPABILITY,
+        ("router.py", "list_team_workspaces_endpoint"): CapabilityId.COLLEAGUE_SHARING,
+        ("router.py", "get_workspace_sharing_endpoint"): CapabilityId.COLLEAGUE_SHARING,
+        ("router.py", "update_workspace_sharing_endpoint"): CapabilityId.COLLEAGUE_SHARING,
         ("router.py", "get_workspace_settings_endpoint"): CORE_CAPABILITY,
         ("router.py", "update_workspace_settings_endpoint"): CORE_CAPABILITY,
-        ("router.py", "get_user_sharing_settings_endpoint"): CORE_CAPABILITY,
-        ("router.py", "update_user_sharing_settings_endpoint"): CORE_CAPABILITY,
+        ("router.py", "get_user_sharing_settings_endpoint"): CapabilityId.COLLEAGUE_SHARING,
+        ("router.py", "update_user_sharing_settings_endpoint"): CapabilityId.COLLEAGUE_SHARING,
         ("router.py", "get_user_settings_endpoint"): CORE_CAPABILITY,
         ("router.py", "update_user_settings_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_team_credentials_status_endpoint"): CORE_CAPABILITY,
@@ -1001,6 +1009,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("chat_uploads.py", "create_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "upload_chat_part_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "complete_chat_upload_endpoint"): CORE_CAPABILITY,
+        ("chat_uploads.py", "download_sandbox_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "get_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "cancel_chat_upload_endpoint"): CORE_CAPABILITY,
     }

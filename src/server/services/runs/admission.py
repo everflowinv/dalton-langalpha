@@ -152,8 +152,9 @@ class RunScope:
             return None
         from src.server.services.runs.coordinator import RunCoordinator
 
+        # DALTON-HOOK(budget): RunScope only owns runs between START and executor handoff; no LLM call ran.
         return await RunCoordinator.get_instance().fail_open_run(
-            run_handle, reason, status=status, metadata=metadata
+            run_handle, reason, status=status, metadata=metadata, no_model_calls=True
         )
 
 
@@ -757,8 +758,12 @@ async def _settle_after_start(
             run_id, **identity
         )
     if committed is not None:
+        # DALTON-HOOK(budget): request disconnected during START before executor handoff; no LLM call ran.
         await RunCoordinator.get_instance().fail_open_run(
-            committed, "client disconnected during START", status="cancelled"
+            committed,
+            "client disconnected during START",
+            status="cancelled",
+            no_model_calls=True,
         )
 
 

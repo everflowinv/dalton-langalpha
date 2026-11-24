@@ -1,0 +1,297 @@
+# Standalone Core Docker Compose override (APP_ENV=core / DALTON_PROFILE=core)
+#
+# Usage:
+#   bash scripts/standalone/init.sh
+#   docker compose -f docker-compose.yml -f docker-compose.core.yml up -d --build
+#
+# Self-contained overlay over upstream docker-compose.yml (never references
+# docker-compose.dalton.yml). Requires Docker Compose v2.24.4+ for !reset / !override.
+#
+# Secret-sourcing contract:
+#   Every secret/credential key (BYOK_ENCRYPTION_KEY, DB_PASSWORD, REDIS_PASSWORD,
+#   MINIO_ROOT_USER, MINIO_ROOT_PASSWORD, DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID,
+#   DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY, DALTON_CHAT_UPLOAD_SIGNING_SECRET,
+#   INTERNAL_SERVICE_TOKEN, JWT_SIGNING_SECRET, BOOTSTRAP_SETUP_TOKEN,
+#   EGRESS_RELAY_SECRET) is supplied exclusively by `env_file: .env` across all
+#   services — never `${...}`-interpolated from the host shell — so every container
+#   (including the optional `ssh-gateway` profile) reads the exact same secrets.
+
+x-backend-build: &backend-build
+  context: .
+  dockerfile: scripts/dalton/Dockerfile.dalton
+  args:
+    BUILD_GIT_SHA: ${BUILD_GIT_SHA:-standalone}
+    BUILD_GIT_DIRTY: ${BUILD_GIT_DIRTY:-false}
+    INSTALL_BROWSER_CRAWLER: ${INSTALL_BROWSER_CRAWLER:-true}
+    INSTALL_OBSERVABILITY: ${INSTALL_OBSERVABILITY:-false}
+
+services:
+  postgres:
+    profiles: !reset []
+    build:
+      context: .
+      dockerfile: scripts/dalton/Dockerfile.postgres
+    image: dalton-postgres:18-pgvector
+    ports: !reset []
+    oom_score_adj: -500
+    env_file: .env
+    # !override drops upstream docker-compose.yml's shell-interpolated POSTGRES_PASSWORD
+    # so DB_USER / DB_PASSWORD / DB_NAME come strictly from `env_file: .env` and are
+    # mapped at container start. POSTGRES_* lines in .env are ignored, so the database,
+    # migrate and backend always use the same credentials. An empty DB_PASSWORD stops
+    # here: the Alembic runs and backend would read it as an empty password.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        if [ -z "$${DB_PASSWORD:-}" ]; then
+          echo "DB_PASSWORD is empty in .env. Run scripts/standalone/init.sh to generate it." >&2
+          exit 1
+        fi
+        unset POSTGRES_PASSWORD_FILE POSTGRES_USER_FILE POSTGRES_DB_FILE
+        export POSTGRES_USER="$${DB_USER:-postgres}"
+        export POSTGRES_PASSWORD="$${DB_PASSWORD}"
+        export POSTGRES_DB="$${DB_NAME:-postgres}"
+        exec docker-entrypoint.sh "$$@"
+      - --
+    command: ["postgres"]
+    environment: !override
+      PGDATA: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${DB_USER:-postgres}\" -d \"$${DB_NAME:-postgres}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    networks:
+      - core_internal
+
+  redis:
+    profiles: !reset []
+    ports: !reset []
+    env_file: .env
+    # Expand REDIS_PASSWORD inside the container from `env_file: .env` instead of
+    # inheriting upstream docker-compose.yml's shell-interpolated `--requirepass`.
+    command:
+      - /bin/sh
+      - -c
+      # Hand off to the image's own entrypoint so it still drops to the redis user.
+      - exec docker-entrypoint.sh redis-server --requirepass "$${REDIS_PASSWORD:-redis}"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD:-redis}\" ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - core_internal
+
+  minio:
+    # MinIO no longer publishes community images on Docker Hub / Quay; Chainguard's
+    # build is pinned by digest and overridable via DALTON_MINIO_IMAGE.
+    image: ${DALTON_MINIO_IMAGE:-cgr.dev/chainguard/minio@sha256:e70b2b1e74d79457f808710483bd726ff364529ca30736eaa15a6ab547d3a5a7}
+    env_file: .env
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        export MINIO_ROOT_USER="$${MINIO_ROOT_USER:-$${DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID:-}}"
+        export MINIO_ROOT_PASSWORD="$${MINIO_ROOT_PASSWORD:-$${DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY:-}}"
+        if [ -z "$${MINIO_ROOT_USER:-}" ] || [ -z "$${MINIO_ROOT_PASSWORD:-}" ]; then
+          echo "ERROR: MINIO_ROOT_USER and MINIO_ROOT_PASSWORD must be set (run scripts/standalone/init.sh)." >&2
+          exit 1
+        fi
+        exec minio "$$@"
+      - --
+    command: ["server", "/data", "--console-address", ":9001"]
+    restart: unless-stopped
+    mem_limit: ${DALTON_MINIO_MEM_LIMIT:-512m}
+    memswap_limit: ${DALTON_MINIO_MEM_LIMIT:-512m}
+    environment:
+      MINIO_API_STALE_UPLOADS_EXPIRY: ${MINIO_API_STALE_UPLOADS_EXPIRY:-24h}
+      MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL: ${MINIO_API_STALE_UPLOADS_CLEANUP_INTERVAL:-6h}
+    volumes:
+      - dalton-minio-data:/data
+    networks:
+      - core_internal
+    healthcheck:
+      # The Chainguard MinIO image has bash but no curl / wget / grep.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /minio/health/live HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n' >&3 && read -r line <&3 && [[ \"$$line\" == *\" 200 \"* ]]"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  minio-init:
+    build: *backend-build
+    image: ${DALTON_BACKEND_IMAGE:-dalton-core-backend:local}
+    restart: "no"
+    entrypoint: ["/usr/bin/tini", "-s", "--"]
+    command: ["uv", "run", "--no-sync", "python", "/app/scripts/standalone/minio_init.py"]
+    depends_on:
+      minio:
+        condition: service_healthy
+    env_file: .env
+    # Storage credentials (MINIO_ROOT_* / DALTON_CHAT_UPLOAD_STORAGE_*_KEY*) come
+    # exclusively from `env_file: .env`; minio_init.py applies its own defaults/fallbacks.
+    environment:
+      # ptc_agent lives under src/; set it explicitly instead of relying on the venv .pth.
+      PYTHONPATH: /app/src
+      DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL: ${DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL:-http://minio:9000}
+      DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME: ${DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME:-chat-uploads}
+      DALTON_CHAT_UPLOAD_STORAGE_REGION: ${DALTON_CHAT_UPLOAD_STORAGE_REGION:-us-east-1}
+      DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE: ${DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE:-path}
+    networks:
+      - core_internal
+
+  migrate:
+    build: *backend-build
+    image: ${DALTON_BACKEND_IMAGE:-dalton-core-backend:local}
+    restart: "no"
+    entrypoint: ["/usr/bin/tini", "-s", "--"]
+    command: ["bash", "/app/scripts/standalone/migrate.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    # DB_PORT / DB_USER / DB_PASSWORD / DB_NAME come exclusively from `env_file: .env`
+    # (never shell-interpolated), the same source PostgreSQL init and backend use.
+    environment:
+      # ptc_agent lives under src/; set it explicitly instead of relying on the venv .pth.
+      PYTHONPATH: /app/src
+      APP_ENV: core
+      DALTON_PROFILE: core
+      DB_HOST: ${DB_HOST:-postgres}
+    networks:
+      - core_internal
+
+  backend:
+    build: *backend-build
+    image: ${DALTON_BACKEND_IMAGE:-dalton-core-backend:local}
+    depends_on: !override
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    ports: !reset []
+    # Skip /docker_entrypoint.sh migrations; the one-shot `migrate` service runs both chains.
+    # Derive runtime REDIS_URL and MinIO key fallbacks inside the container from `env_file: .env`
+    # so no password or storage secret is ever `${...}`-interpolated from the host shell.
+    entrypoint: ["/usr/bin/tini", "-s", "--"]
+    command:
+      - /bin/sh
+      - -c
+      - |
+        export REDIS_URL="$${REDIS_URL:-redis://:$${REDIS_PASSWORD:-redis}@redis:6379/0}"
+        export DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID="$${DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID:-$${MINIO_ROOT_USER:-}}"
+        export DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY="$${DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY:-$${MINIO_ROOT_PASSWORD:-}}"
+        exec uv run --no-sync python server.py --host 0.0.0.0 --port 8000 --workers "$${BACKEND_WORKERS:-2}"
+    oom_score_adj: -500
+    shm_size: "1gb"
+    env_file: .env
+    # !override drops upstream docker-compose.yml's shell-interpolated BYOK_ENCRYPTION_KEY
+    # and REDIS_URL and keeps all auth mode / secret / origin / storage credential keys
+    # strictly sourced from `env_file: .env`.
+    environment: !override
+      # ptc_agent lives under src/; set it explicitly instead of relying on the venv .pth.
+      PYTHONPATH: /app/src
+      APP_ENV: core
+      DALTON_PROFILE: core
+      DB_HOST: ${DB_HOST:-postgres}
+      EGRESS_RELAY_BASE_URL: ${EGRESS_RELAY_BASE_URL:-http://backend:8000}
+      SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-docker}
+      SANDBOX_DOCKER_NETWORK: ${SANDBOX_DOCKER_NETWORK:-${COMPOSE_PROJECT_NAME:-dalton-core}_sandbox}
+      DALTON_BACKEND_VAR_DIR: /app/var/dalton
+      DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL: ${DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL:-http://minio:9000}
+      DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME: ${DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME:-chat-uploads}
+      DALTON_CHAT_UPLOAD_STORAGE_REGION: ${DALTON_CHAT_UPLOAD_STORAGE_REGION:-us-east-1}
+      DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE: ${DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE:-path}
+    volumes: !override
+      - ${DOCKER_HOST_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      - ./Dockerfile.sandbox:/app/Dockerfile.sandbox:ro
+      - ./agent_config.core.yaml:/app/agent_config.core.yaml:ro
+      - dalton-backend-var:/app/var/dalton
+    networks:
+      - core_internal
+      - sandbox-net
+
+  crawler:
+    build: *backend-build
+    image: ${DALTON_BACKEND_IMAGE:-dalton-core-backend:local}
+    entrypoint: ["/usr/bin/tini", "-s", "--"]
+    command: ["uv", "run", "--no-sync", "python", "-m", "src.dalton.crawl_service"]
+    mem_limit: 2g
+    memswap_limit: 2g
+    shm_size: "1gb"
+    pids_limit: 512
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # ptc_agent lives under src/; set it explicitly instead of relying on the venv .pth.
+      PYTHONPATH: /app/src
+      APP_ENV: core
+      DALTON_PROFILE: core
+    networks:
+      - core_internal
+
+  ssh-gateway:
+    # !override drops upstream docker-compose.yml's shell-interpolated BYOK_ENCRYPTION_KEY
+    # so ssh-gateway and backend always share the exact same key from `env_file: .env`.
+    env_file: .env
+    environment: !override
+      DB_HOST: ${DB_HOST:-postgres}
+      SSH_GATEWAY_LISTEN: 0.0.0.0:2022
+      SSH_GATEWAY_DIAL_LISTEN: 0.0.0.0:2023
+      POSTGRES_CONVERSATION_POOL_MAX: ${SSH_GATEWAY_DB_POOL_MAX:-15}
+    networks:
+      - core_internal
+
+  edge:
+    build:
+      context: .
+      dockerfile: deploy/standalone/Dockerfile.edge
+      args:
+        VITE_BRAND_NAME: ${VITE_BRAND_NAME:-${BRAND_NAME:-Dalton}}
+        VITE_BRAND_MARK: ${VITE_BRAND_MARK:-langalpha}
+        VITE_DALTON_UI: ${VITE_DALTON_UI:-true}
+        # Non-secret build ARG sourced from `.env` so switching auth mode invalidates
+        # the frontend build cache automatically (rebuild `edge` after changing auth mode).
+        VITE_DALTON_AUTH: ${VITE_DALTON_AUTH:-}
+        VITE_DALTON_INVITE_EMAIL_DOMAIN: ${VITE_DALTON_INVITE_EMAIL_DOMAIN:-${DALTON_INVITE_EMAIL_DOMAIN:-}}
+        DOCS_SITE_ORIGIN: ${DOCS_SITE_ORIGIN:-${PUBLIC_APP_URL:-}}
+    image: ${DALTON_EDGE_IMAGE:-dalton-core-edge:local}
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${DALTON_EDGE_PORT:-8088}:8088"
+    volumes:
+      - ./deploy/standalone/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/standalone/extra:/etc/caddy/extra:ro
+    networks:
+      - core_internal
+
+  # Upstream dev-only services disabled by default in standalone core mode.
+  cli:
+    profiles: ["dev-disabled"]
+    ports: !reset []
+
+  frontend:
+    profiles: ["dev-disabled"]
+    ports: !reset []
+
+networks:
+  core_internal: {}
+  sandbox-net:
+    # Per-instance network name shared with backend's SANDBOX_DOCKER_NETWORK
+    # (read by DockerProvider in src/ptc_agent/core/sandbox/providers/docker.py).
+    # Default deployment assumes one standalone core stack per Docker host.
+    name: ${SANDBOX_DOCKER_NETWORK:-${COMPOSE_PROJECT_NAME:-dalton-core}_sandbox}
+
+volumes:
+  dalton-minio-data:
+  dalton-backend-var:

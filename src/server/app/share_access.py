@@ -114,7 +114,18 @@ async def shared_thread_allows_files(
     else:
         tier_fn = _default_get_user_tier
 
-    if not is_dalton_supabase_auth_enabled() and tier_fn is _default_get_user_tier:
+    # DALTON-HOOK(colleague-access): separate multi-user auth check from colleague sharing switch.
+    from src.dalton.settings import (
+        is_dalton_multiuser_auth_enabled,
+        is_dalton_supabase_auth_enabled as _settings_supabase_auth,
+    )
+
+    multiuser_on = (
+        bool(is_dalton_supabase_auth_enabled())
+        if is_dalton_supabase_auth_enabled is not _settings_supabase_auth
+        else is_dalton_multiuser_auth_enabled()
+    )
+    if not multiuser_on and tier_fn is _default_get_user_tier:
         return True
 
     owner_candidates: list[str] = []

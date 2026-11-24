@@ -43,7 +43,7 @@ and automation scheduling/execution:
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any
 from uuid import UUID
 
@@ -158,16 +158,48 @@ class _WorkspaceAccessError(ValueError):
         self.unit_error_code = code
 
 
+def is_coverage_multiuser_auth_enabled() -> bool:
+    """Single-source multi-user auth predicate shared by coverage write enforcement and UI action flags."""
+    from src.dalton.settings import is_dalton_auth_enabled
+
+    return is_dalton_auth_enabled()
+
+
+def pm_can_write_bound_workspace(
+    *,
+    actor_user_id: str | None,
+    workspace_owner_id: str | None,
+    workspace_owner_tier: str | None,
+    is_pm: bool,
+    multiuser_auth_enabled: bool,
+) -> bool:
+    """Single-source predicate for whether PM privilege grants write on a bound workspace.
+
+    Shared by ``_require_ws_write`` and ``compute_unit_action_flags`` so UI flags and write
+    enforcement can never drift when a workspace owner's tier changes (e.g. demotion from
+    ``internal`` to ``external``).
+    """
+    if not (is_pm and multiuser_auth_enabled):
+        return False
+    actor_uid = str(actor_user_id or "").strip()
+    ws_owner = str(workspace_owner_id or "").strip()
+    if not actor_uid:
+        return False
+    if not ws_owner or ws_owner == actor_uid:
+        return True
+    return str(workspace_owner_tier or "").strip().lower() in ("admin", "internal")
+
+
 async def _require_ws_write(
     ws_row: dict[str, Any],
     user_id: str,
     *,
     is_pm: bool = False,
     conn: Any = None,
+    owner_tiers: Mapping[str, str] | None = None,
 ) -> None:
     """Enforce ``channel='web', need='write'`` inside a locked transaction."""
     from src.dalton.access_tiers import classify_owner_tier
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
     from src.dalton.sharing import require_workspace_access
     from src.server.database.home_workspace import is_reserved_row
 
@@ -183,10 +215,14 @@ async def _require_ws_write(
 
     ws_owner = str(ws_row.get("user_id") or "").strip()
     uid = str(user_id or "").strip()
-    supabase_auth = is_dalton_supabase_auth_enabled()
+    multiuser_auth = is_coverage_multiuser_auth_enabled()
 
-    if supabase_auth and ws_owner and ws_owner != uid:
-        owner_tier = await classify_owner_tier(ws_owner)
+    owner_tier: str | None = None
+    if multiuser_auth and ws_owner and ws_owner != uid:
+        if owner_tiers is not None and ws_owner in owner_tiers:
+            owner_tier = owner_tiers[ws_owner]
+        else:
+            owner_tier = await classify_owner_tier(ws_owner, conn=conn)
         if owner_tier == "unknown":
             raise _WorkspaceAccessError(
                 "workspace does not exist or is hidden", code="workspace_hidden"
@@ -197,7 +233,13 @@ async def _require_ws_write(
             )
 
     # Closed-auth deployments only allow the workspace owner (even explicit PM).
-    if is_pm and supabase_auth:
+    if pm_can_write_bound_workspace(
+        actor_user_id=uid,
+        workspace_owner_id=ws_owner,
+        workspace_owner_tier=owner_tier,
+        is_pm=is_pm,
+        multiuser_auth_enabled=multiuser_auth,
+    ):
         return
 
     try:
@@ -214,13 +256,184 @@ async def _require_ws_write(
             raise _WorkspaceAccessError(
                 "workspace does not exist or is hidden", code="workspace_hidden"
             ) from exc
-        if not supabase_auth and ws_owner and ws_owner != uid:
+        if not multiuser_auth and ws_owner and ws_owner != uid:
             raise _WorkspaceAccessError(
                 "workspace belongs to another user", code="workspace_not_owned"
             ) from exc
         raise _WorkspaceAccessError(
             "workspace write permission required", code="workspace_write_forbidden"
         ) from exc
+
+
+async def can_write_bound_unit_workspace(
+    ws_row: Mapping[str, Any] | None,
+    user_id: str | None,
+    *,
+    is_pm: bool = False,
+    conn: Any = None,
+    owner_tiers: Mapping[str, str] | None = None,
+) -> bool:
+    """Return True iff ``_require_ws_write`` permits ``user_id`` to write ``ws_row``."""
+    uid = str(user_id or "").strip()
+    if not uid or ws_row is None:
+        return False
+    try:
+        await _require_ws_write(
+            dict(ws_row),
+            uid,
+            is_pm=is_pm,
+            conn=conn,
+            owner_tiers=owner_tiers,
+        )
+        return True
+    except ValueError:
+        return False
+
+
+async def can_write_bound_unit_workspaces_batch(
+    ws_rows: Sequence[Mapping[str, Any]],
+    user_id: str | None,
+    *,
+    is_pm: bool = False,
+    conn: Any = None,
+    owner_tiers: Mapping[str, str] | None = None,
+) -> dict[str, bool]:
+    """Batch-evaluate :func:`can_write_bound_unit_workspace` across many bound workspaces.
+
+    Enforces the exact same authorization rules as ``_require_ws_write`` and
+    ``require_workspace_access(channel="web", need="write")``, while querying caller
+    membership/tier once, owner tiers/membership in batches by owner, and workspace
+    sharing rows in one batch query instead of repeating ~5 queries per row.
+    """
+    from src.dalton.access_tiers import classify_owner_tiers_batch, get_user_tier
+    from src.dalton.sharing import (
+        batch_check_team_readers,
+        get_workspaces_sharing_batch,
+        require_team_reader,
+    )
+    from src.server.database.home_workspace import is_reserved_row
+
+    uid = str(user_id or "").strip()
+    if not uid or not ws_rows:
+        return {}
+
+    multiuser_auth = is_coverage_multiuser_auth_enabled()
+    result: dict[str, bool] = {}
+    pending: list[tuple[str, str, dict[str, Any]]] = []
+    seen_ws: set[str] = set()
+
+    for raw in ws_rows:
+        ws = dict(raw)
+        ws_id = str(ws.get("workspace_id") or "").strip()
+        if not ws_id or ws_id in seen_ws:
+            continue
+        seen_ws.add(ws_id)
+
+        status = str(ws.get("status") or "")
+        if (
+            status == "deleted"
+            or is_reserved_row(ws)
+            or bool(ws.get("is_home"))
+            or status == "unbound"
+        ):
+            result[ws_id] = False
+            continue
+
+        ws_owner = str(ws.get("user_id") or "").strip()
+        if not ws_owner:
+            result[ws_id] = False
+            continue
+        if ws_owner == uid:
+            result[ws_id] = True
+            continue
+        if not multiuser_auth:
+            result[ws_id] = False
+            continue
+
+        pending.append((ws_id, ws_owner, ws))
+
+    if not pending:
+        return result
+
+    resolved_owner_tiers: dict[str, str] = dict(owner_tiers or {})
+    missing_owners = sorted(
+        {owner for _, owner, _ in pending if owner not in resolved_owner_tiers}
+    )
+    if missing_owners:
+        resolved_owner_tiers.update(
+            await classify_owner_tiers_batch(missing_owners, conn=conn)
+        )
+
+    need_sharing_check: list[tuple[str, str]] = []
+    for ws_id, ws_owner, _ws in pending:
+        owner_tier = resolved_owner_tiers.get(ws_owner)
+        if owner_tier in (None, "unknown", "external", "company"):
+            result[ws_id] = False
+            continue
+        if pm_can_write_bound_workspace(
+            actor_user_id=uid,
+            workspace_owner_id=ws_owner,
+            workspace_owner_tier=owner_tier,
+            is_pm=is_pm,
+            multiuser_auth_enabled=True,
+        ):
+            result[ws_id] = True
+            continue
+        need_sharing_check.append((ws_id, ws_owner))
+
+    if not need_sharing_check:
+        return result
+
+    # Caller team membership & tier are checked once for the entire batch.
+    try:
+        if conn is not None:
+            await require_team_reader(uid, conn=conn)
+            caller_tier = await get_user_tier(uid, conn=conn)
+        else:
+            await require_team_reader(uid)
+            caller_tier = await get_user_tier(uid)
+    except HTTPException:
+        for ws_id, _ in need_sharing_check:
+            result[ws_id] = False
+        return result
+
+    if caller_tier in ("external", "company"):
+        for ws_id, _ in need_sharing_check:
+            result[ws_id] = False
+        return result
+
+    # Owner team membership is checked once in batch by unique owner.
+    unique_owners = sorted({owner for _, owner in need_sharing_check})
+    try:
+        valid_owners = await batch_check_team_readers(unique_owners, conn=conn)
+    except HTTPException:
+        for ws_id, _ in need_sharing_check:
+            result[ws_id] = False
+        return result
+
+    eligible_ws_ids: list[str] = []
+    for ws_id, ws_owner in need_sharing_check:
+        if ws_owner not in valid_owners:
+            result[ws_id] = False
+        else:
+            eligible_ws_ids.append(ws_id)
+
+    if not eligible_ws_ids:
+        return result
+
+    # Workspace web_access is checked once in batch for all remaining workspaces.
+    try:
+        sharing_by_ws = await get_workspaces_sharing_batch(eligible_ws_ids, conn=conn)
+    except HTTPException:
+        for ws_id in eligible_ws_ids:
+            result[ws_id] = False
+        return result
+
+    for ws_id in eligible_ws_ids:
+        sharing = sharing_by_ws.get(ws_id) or {}
+        result[ws_id] = str(sharing.get("web_access") or "").strip().lower() == "rw"
+
+    return result
 
 
 def compute_unit_action_flags(
@@ -234,9 +447,9 @@ def compute_unit_action_flags(
     actor_has_ws_write: bool,
     is_pm: bool,
     supabase_auth_enabled: bool,
+    workspace_owner_tier: str | None = None,
 ) -> dict[str, bool]:
     """Single-source action authorization flags matching write-path enforcement."""
-    del workspace_owner_id
     if not actor_user_id:
         return {
             "can_bind": False,
@@ -264,7 +477,14 @@ def compute_unit_action_flags(
             "can_archive": can_recover,
         }
 
-    can_write_old = bool(actor_has_ws_write or eff_pm)
+    pm_ws_write = pm_can_write_bound_workspace(
+        actor_user_id=actor_uid,
+        workspace_owner_id=workspace_owner_id,
+        workspace_owner_tier=workspace_owner_tier,
+        is_pm=is_pm,
+        multiuser_auth_enabled=supabase_auth_enabled,
+    )
+    can_write_old = bool(actor_has_ws_write or pm_ws_write)
     return {
         "can_bind": False,
         "can_unbind": can_write_old,
@@ -694,7 +914,7 @@ async def insert_coverage_unit(
     first, verifies write permission / non-Home / non-historical-duplicate, and
     sets ``lead_analyst_user_id = owner_user_id = target_ws.user_id``.
     """
-    from src.dalton.invites import is_invite_pm
+    from src.dalton.access_tiers import is_admin_user
     from src.dalton.settings import is_coverage_units_enabled
 
     eff_ticker_key = (
@@ -706,7 +926,7 @@ async def insert_coverage_unit(
     eff_lead = str(lead_analyst_user_id or actor_uid).strip()
     eff_owner = eff_lead
     target_ws = str(workspace_id).strip() if workspace_id else None
-    is_pm = is_invite_pm(actor_uid)
+    is_pm = await is_admin_user(actor_uid, conn=conn)
 
     async def _run_in_tx(c: Any) -> dict[str, Any]:
         nonlocal eff_lead, eff_owner
@@ -827,12 +1047,12 @@ async def set_coverage_unit_status(
     previous_out: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Set `status` on a unit (archive/reactivate) after checking workspace write or lead/PM."""
-    from src.dalton.invites import is_invite_pm
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.access_tiers import is_admin_user
+    from src.dalton.settings import is_dalton_auth_enabled
 
     actor_uid = str(owner_user_id or "").strip()
-    is_pm = is_invite_pm(actor_uid)
-    eff_pm = is_pm and is_dalton_supabase_auth_enabled()
+    is_pm = await is_admin_user(actor_uid, conn=conn)
+    eff_pm = is_pm and is_dalton_auth_enabled()
 
     async def _run_in_tx(c: Any) -> dict[str, Any] | None:
         if status == "archived":
@@ -976,13 +1196,13 @@ async def bind_coverage_unit_workspace(
     Lock order: unit row ``FOR UPDATE`` -> sorted ``{old_ws, target_ws} FOR UPDATE``
     -> sorted sector advisory locks. Rebinding to a different workspace is refused (409).
     """
-    from src.dalton.invites import is_invite_pm
-    from src.dalton.settings import is_coverage_units_enabled, is_dalton_supabase_auth_enabled
+    from src.dalton.access_tiers import is_admin_user
+    from src.dalton.settings import is_coverage_units_enabled, is_dalton_auth_enabled
 
     actor_uid = str(owner_user_id or "").strip()
     target_req = _norm_uuid(workspace_id)
-    is_pm = is_invite_pm(actor_uid)
-    eff_pm = is_pm and is_dalton_supabase_auth_enabled()
+    is_pm = await is_admin_user(actor_uid, conn=conn)
+    eff_pm = is_pm and is_dalton_auth_enabled()
 
     async def _run_in_tx(c: Any) -> dict[str, Any]:
         async with c.cursor(row_factory=dict_row) as cur:
@@ -1134,12 +1354,12 @@ async def unbind_coverage_unit_workspace(
     previous_out: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Clear a unit's workspace binding after checking workspace write or lead/PM and zero active tracking."""
-    from src.dalton.invites import is_invite_pm
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.access_tiers import is_admin_user
+    from src.dalton.settings import is_dalton_auth_enabled
 
     actor_uid = str(owner_user_id or "").strip()
-    is_pm = is_invite_pm(actor_uid)
-    eff_pm = is_pm and is_dalton_supabase_auth_enabled()
+    is_pm = await is_admin_user(actor_uid, conn=conn)
+    eff_pm = is_pm and is_dalton_auth_enabled()
 
     async def _run_in_tx(c: Any) -> dict[str, Any] | None:
         await _precheck_blocking_before_unit_lock(

@@ -353,6 +353,8 @@ class TurnContextMiddleware(AgentMiddleware):
         # DALTON-HOOK(team-memory-toggle): per-turn conversation_search availability for durable toggle notices
         conversation_search_enabled: bool | None = None,
         claude_code: bool = False,
+        # DALTON-HOOK(colleague-access): flag cross-user turns in the turn anchor row
+        is_cross_user: bool = False,
     ) -> None:
         super().__init__()
         self._now = now
@@ -372,6 +374,7 @@ class TurnContextMiddleware(AgentMiddleware):
         self._is_subagent = is_subagent
         self._conversation_search_enabled = conversation_search_enabled
         self._claude_code = claude_code
+        self._is_cross_user = bool(is_cross_user)
         # Set once the turn-open hook has run on this instance; see
         # ``abefore_model``.
         self._opened = False
@@ -677,6 +680,8 @@ class TurnContextMiddleware(AgentMiddleware):
             "home_away": None if self._is_subagent else self._home_away,
             "home_back": home_back,
             "forked": forked,
+            # DALTON-HOOK(colleague-access): distinguish cross-user requester from workspace owner
+            "is_cross_user": False if self._is_subagent else self._is_cross_user,
         }
         return render_template("envelope/turn.md.j2", **fields)
 

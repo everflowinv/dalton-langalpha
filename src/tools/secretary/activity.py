@@ -126,10 +126,11 @@ async def read_activity(
 
         await enrich_executions_with_delivery_summary(runs)
         # --- DALTON-HOOK(workspace-sharing-settings): begin ---
+        # DALTON-HOOK(colleague-access): gate colleague activity listing on is_dalton_sharing_auth_enabled().
         colleague_workspaces: list[dict[str, Any]] | None = None
-        from src.dalton.settings import is_dalton_supabase_auth_enabled
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
 
-        if is_dalton_supabase_auth_enabled():
+        if is_dalton_sharing_auth_enabled():
             from src.dalton.sharing import list_colleague_cos_workspaces
 
             try:

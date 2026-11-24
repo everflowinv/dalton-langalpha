@@ -1,0 +1,176 @@
+name: Standalone Core E2E
+
+on:
+  pull_request:
+    paths:
+      - "Makefile"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "server.py"
+      - "alembic.ini"
+      - ".dockerignore"
+      - ".env.core.example"
+      - "docker-compose.yml"
+      - "docker-compose.core.yml"
+      - "docker-compose.ci.yml"
+      - "Dockerfile.sandbox"
+      - "agent_config*.yaml"
+      - "config*.yaml"
+      - "deploy/standalone/**"
+      - "scripts/configure.sh"
+      - "scripts/docker_entrypoint.sh"
+      - "scripts/standalone/**"
+      - "scripts/dalton/Dockerfile.dalton"
+      - "scripts/dalton/Dockerfile.postgres"
+      - "scripts/dalton/docker_entrypoint_dalton.sh"
+      - "migrations/**"
+      - "libs/**"
+      - "mcp_servers/**"
+      - "plugins/**"
+      - "workflows/**"
+      - "web/**"
+      - "docs-site/**"
+      - "src/config/**"
+      - "src/dalton/**"
+      - "src/ptc_agent/config/**"
+      - "src/ptc_agent/agent/**"
+      - "src/ptc_agent/core/sandbox/**"
+      - "src/server/**"
+      - "tests/fakes/**"
+      - "tests/standalone/**"
+      - ".github/workflows/standalone-core-e2e.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: standalone-core-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  standalone-core-e2e:
+    name: Clean Linux Standalone Core E2E
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: Free runner disk space
+        run: |
+          df -h
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost
+          docker system prune -af --volumes || true
+          df -h
+
+      - name: Export clean standalone release directory (with CI harness)
+        run: |
+          mkdir -p /tmp/standalone-artifacts
+          bash scripts/standalone/package_release.sh \
+            --ref HEAD \
+            --include-ci \
+            --output /tmp/dalton-core-dist \
+            --report /tmp/standalone-artifacts/release-scan-report.txt
+
+      - name: Initialize standalone core environment
+        working-directory: /tmp/dalton-core-dist
+        run: |
+          bash scripts/standalone/init.sh --non-interactive --domain localhost --skip-sandbox-build
+
+      - name: Build standalone core images from clean export
+        working-directory: /tmp/dalton-core-dist
+        env:
+          INSTALL_BROWSER_CRAWLER: "false"
+        run: |
+          BUILD_GIT_SHA="$(cat .release_git_sha)"
+          export BUILD_GIT_SHA
+          export BUILD_GIT_DIRTY="false"
+          docker compose \
+            -f docker-compose.yml \
+            -f docker-compose.core.yml \
+            build --build-arg INSTALL_BROWSER_CRAWLER=false
+          df -h
+
+      - name: Set up Docker Buildx for the cached sandbox build
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the sandbox image the core install runs agent code in
+        # The Docker provider starts sandboxes from `langalpha-sandbox:latest`
+        # (agent_config.yaml sandbox.docker.image). Without it the first turn
+        # builds it on demand and the check's stream times out waiting. The
+        # layers are cached between runs, since a cold build takes 20-40 minutes.
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: /tmp/dalton-core-dist
+          file: /tmp/dalton-core-dist/Dockerfile.sandbox
+          tags: langalpha-sandbox:latest
+          build-args: |
+            INSTALL_AGENT_BROWSER=0
+          load: true
+          cache-from: type=gha,scope=core-sandbox
+          cache-to: type=gha,mode=max,scope=core-sandbox
+
+      - name: "Run standalone acceptance checks (auth: oss)"
+        working-directory: /tmp/dalton-core-dist
+        run: |
+          bash tests/standalone/run_checks.sh \
+            --auth oss \
+            --work-dir /tmp/dalton-core-dist \
+            --checks-dir /tmp/dalton-core-dist/tests/standalone/checks \
+            --ci-compose /tmp/dalton-core-dist/docker-compose.ci.yml \
+            --artifacts-dir /tmp/standalone-artifacts
+
+      - name: "Run standalone acceptance checks (auth: local)"
+        working-directory: /tmp/dalton-core-dist
+        run: |
+          bash tests/standalone/run_checks.sh \
+            --auth local \
+            --work-dir /tmp/dalton-core-dist \
+            --checks-dir /tmp/dalton-core-dist/tests/standalone/checks \
+            --ci-compose /tmp/dalton-core-dist/docker-compose.ci.yml \
+            --artifacts-dir /tmp/standalone-artifacts
+
+      - name: Scan collected artifacts for leaked secrets before upload
+        id: secret_scan
+        if: always()
+        working-directory: /tmp/dalton-core-dist
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import sys
+
+          sys.path.insert(0, str(Path("/tmp/dalton-core-dist/tests/standalone/checks")))
+          import _lib
+
+          leaks = _lib.scan_artifacts_for_secrets(
+              Path("/tmp/standalone-artifacts"),
+              Path("/tmp/dalton-core-dist/.env"),
+          )
+          if leaks:
+              print("ERROR: Generated secrets detected in CI artifacts (upload blocked):", file=sys.stderr)
+              for hit in leaks:
+                  print(f"  - {hit}", file=sys.stderr)
+              sys.exit(1)
+          print("[secret_scan] OK: 0 generated secrets found in /tmp/standalone-artifacts.")
+          PY
+
+      - name: Upload logs and scan report
+        if: always() && steps.secret_scan.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: standalone-core-e2e-artifacts
+          path: |
+            /tmp/standalone-artifacts
+            !/tmp/standalone-artifacts/baseline-b1-oss.dump
+            !/tmp/standalone-artifacts/**/*.dump
+          if-no-files-found: warn
+          retention-days: 14

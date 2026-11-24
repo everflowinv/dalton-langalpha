@@ -3,7 +3,11 @@
 - **Name**: {{ user_profile.name | default("User") }}
 - **Timezone**: {{ user_profile.timezone | default("UTC") }}
 - **Locale**: {{ user_profile.locale | default("en-US", true) }}
-{% if main_agent_steering %}
+{# DALTON-HOOK(colleague-access): distinguish cross-user requester profile from workspace owner's read-only user-data #}
+{% if is_cross_user | default(false) %}
+
+This profile belongs to the person sending this message; this workspace and computer belong to the workspace owner. Address the person sending this message directly by name or as "you", and treat `.agents/user/` and memory as the workspace owner's read-only data on this turn.
+{% elif main_agent_steering %}
 
 To change one of these, edit `.agents/user/profile/user.json`.
 {% endif %}

@@ -2400,8 +2400,10 @@ async def _run_publish_state_machine(
         # Verify PM user authorization. Round-2 decision B: approve/reject is
         # the workspace owner's alone — another PM-listed colleague may not
         # decide someone else's workspace.
-        pm_users = set(get_dalton_config().pm_user_ids)
-        if user_id not in pm_users or user_id != ws_owner_id:
+        from src.dalton.access_tiers import is_admin_user
+
+        caller_is_admin = await is_admin_user(user_id, include_config_defaults=True)
+        if not caller_is_admin or user_id != ws_owner_id:
             return {
                 "ok": False,
                 "status": "awaiting_pm",

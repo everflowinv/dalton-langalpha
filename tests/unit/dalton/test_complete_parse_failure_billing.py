@@ -506,7 +506,15 @@ class _FakeCursor:
         if "UPDATE DALTON_LLM_JOURNAL" in text and "SET STATE = %S" in text:
             upd_part = text.split("ALREADY_SETTLED")[0]
             has_usage_param = "USAGE = " in upd_part
-            upd_inv_idx = 6 if has_usage_param else 5
+            has_provider_param = "PROVIDER = COALESCE(%S, PROVIDER)" in upd_part
+            idx = 5
+            usage_idx = idx if has_usage_param else None
+            if has_usage_param:
+                idx += 1
+            prov_idx = idx if has_provider_param else None
+            if has_provider_param:
+                idx += 2
+            upd_inv_idx = idx
             inv_id = str(params[upd_inv_idx])
             attempt = int(params[upd_inv_idx + 1])
             row = rows.get(inv_id)
@@ -528,8 +536,8 @@ class _FakeCursor:
                         cash_usd=Decimal(str(row.get("cash_usd") or "0")) + add_cash,
                         notional_usd=Decimal(str(row.get("notional_usd") or "0")) + add_notional,
                     )
-                    if has_usage_param:
-                        usage_val = json.loads(params[5])
+                    if usage_idx is not None:
+                        usage_val = json.loads(params[usage_idx])
                         if "FROM (VALUES (%S::JSONB)) AS D(U)" in upd_part:
                             usage_val = self._merge_usage_dicts_sql_equiv(
                                 row.get("usage"),
@@ -541,14 +549,23 @@ class _FakeCursor:
                             merged_u.update(usage_val)
                             usage_val = merged_u
                         row["usage"] = usage_val
+                    if prov_idx is not None:
+                        if params[prov_idx] is not None:
+                            row["provider"] = params[prov_idx]
+                        if params[prov_idx + 1] is not None:
+                            row["billing_type"] = params[prov_idx + 1]
                     self._one = dict(row)
                 if "DALTON_LLM_JOURNAL_ATTEMPTS" in text:
-                    # params end with (..., inv_id, att, records_json, inv_id, att)
+                    # params end with (..., [prov, btype,] records_json, inv_id, att)
+                    att_prov = params[prov_idx] if prov_idx is not None else None
+                    att_btype = params[prov_idx + 1] if prov_idx is not None else None
                     written = self._record_call_records(
                         parent=parent_snapshot,
                         attempt=int(params[-1]),
                         records_json=str(params[-3]),
                         now=now,
+                        provider=att_prov,
+                        billing_type=att_btype,
                     )
                     if not updated_parent and "LATE_PARENT_SYNC" in text:
                         self._apply_late_parent_sync(row, written)

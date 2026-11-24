@@ -263,6 +263,10 @@ class PerCallTokenTracker(BaseCallbackHandler):
         # request's start time. One dict rather than one per field so every terminal
         # path drains the whole entry at once.
         self._run_attribution: Dict[UUID, Attribution] = {}
+        # DALTON-HOOK(budget): track distinct LLM run_ids started during this run so
+        # finalize can distinguish zero-model-call turns from unmetered turns even if
+        # a duplicate start callback arrives after on_llm_end/on_llm_error drains _run_attribution.
+        self._seen_llm_run_ids: set[UUID] = set()
 
     def on_llm_start(
         self,
@@ -305,6 +309,8 @@ class PerCallTokenTracker(BaseCallbackHandler):
         """
         captured = billing_attribution(metadata, run_id)
         with self._lock:
+            # DALTON-HOOK(budget): count each unique LLM run_id once across the whole run.
+            self._seen_llm_run_ids.add(run_id)
             entry = self._run_attribution.setdefault(run_id, {})
             entry.update(captured)
             # First start wins: on_llm_start and on_chat_model_start are
@@ -451,6 +457,12 @@ class PerCallTokenTracker(BaseCallbackHandler):
         with self._lock:
             return len(self.per_call_records)
 
+    # DALTON-HOOK(budget): expose count of started LLM calls so finalize can prove zero model calls.
+    def llm_calls_started(self) -> int:
+        """How many distinct LLM calls started on this tracker."""
+        with self._lock:
+            return len(self._seen_llm_run_ids)
+
     def reset(self) -> None:
         """
         Reset all tracked data.
@@ -462,6 +474,7 @@ class PerCallTokenTracker(BaseCallbackHandler):
             self.per_call_records.clear()
             self.usage_metadata.clear()
             self._run_attribution.clear()
+            self._seen_llm_run_ids.clear()  # DALTON-HOOK(budget)
             self._platform_usd = 0.0
             self._priced_upto = 0
             self._pricing_error_logged = False

@@ -11,7 +11,7 @@ Rolling-upgrade / expand-contract note:
   backend processes can keep reading and writing it during upgrades.
 
 Revision ID: d046
-Revises: d047
+Revises: d048
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "d046"
-down_revision: str | None = "d047"
+down_revision: str | None = "d048"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -503,7 +503,7 @@ class TestDataMapD046AndFiltering:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         assert d046.revision == "d046"
-        assert d046.down_revision == "d047"
+        assert d046.down_revision == "d048"
 
         executed_up: list[str] = []
         op_mock = create_autospec(Operations, instance=True)

@@ -1407,6 +1407,7 @@ def test_chief_of_staff_prompt_non_contradictory() -> None:
         current_time="2026-11-20 12:00 ET",
         subagent_summary="",
         role="chief_of_staff",
+        colleague_sharing_enabled=True,
     )
     assert "only when colleague dispatch is enabled for this deployment and the workspace's access is `rw`" in prompt
     assert "company_workspace_exists" in prompt
@@ -6156,10 +6157,10 @@ async def test_dedup_journal_stores_usage_cost_status_without_reason_or_suggesti
     )
     monkeypatch.setattr(
         complete_mod,
-        "compute_call_costs",
+        "compute_call_costs_detailed",
         create_autospec(
-            complete_mod.compute_call_costs,
-            return_value=(Decimal("0"), Decimal("0.0012")),
+            complete_mod.compute_call_costs_detailed,
+            return_value=(Decimal("0"), Decimal("0.0012"), False, []),
         ),
     )
 

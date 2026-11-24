@@ -214,7 +214,7 @@ DALTON_TOOL_REGISTRY: tuple[DaltonToolRegistration, ...] = (
         min_tier="any",
         capability=CORE_CAPABILITY,
         description="核心：公司与行业投研知识层读写",
-        kwarg_mode="filesystem",
+        kwarg_mode="role_and_fs",
         setting_gate="knowledge",
     ),
     DaltonToolRegistration(
@@ -292,6 +292,16 @@ DALTON_TOOL_REGISTRY: tuple[DaltonToolRegistration, ...] = (
     ),
     # --- Analyst role tools ---
     DaltonToolRegistration(
+        id="colleague_workspace_analyst",
+        module="src.dalton.tools.colleague_workspace_tools",
+        builder_name="create_colleague_workspace_tools",
+        tool_names=("colleague_workspace",),
+        roles=_ANALYST_ONLY,
+        min_tier="any",
+        capability=CapabilityId.COLLEAGUE_SHARING,
+        description="工作区分析师跨工作区读取与向当前工作区服务端复制",
+    ),
+    DaltonToolRegistration(
         id="knowledge_tools_analyst",
         module="src.dalton.tools.knowledge_tools",
         builder_name="create_knowledge_tools",
@@ -300,7 +310,7 @@ DALTON_TOOL_REGISTRY: tuple[DaltonToolRegistration, ...] = (
         min_tier="any",
         capability=CORE_CAPABILITY,
         description="核心：公司与行业投研知识层读写",
-        kwarg_mode="filesystem",
+        kwarg_mode="role_and_fs",
         setting_gate="knowledge",
     ),
     DaltonToolRegistration(

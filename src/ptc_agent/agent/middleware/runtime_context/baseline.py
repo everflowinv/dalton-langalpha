@@ -57,6 +57,7 @@ from ptc_agent.agent.middleware.runtime_context.epoch import (
     MEMO_DISPLAY_CAP,
     MEMORY_TIERS,
     OTHER_COMPUTERS,
+    OTHER_COMPUTERS_WITH_COLLEAGUE_WORKSPACE,  # DALTON-HOOK(colleague-access)
     BaselineEpoch,
     Identity,
     Observations,
@@ -273,6 +274,9 @@ class BaselineContextMiddleware(AgentMiddleware):
         switches: ProfileSwitches = ProfileSwitches(),
         subagent: bool = False,
         shared: bool = False,
+        # DALTON-HOOK(colleague-access): gate workspace block colleague_workspace hint & cross-user profile wording
+        colleague_workspace_enabled: bool = False,
+        is_cross_user: bool = False,
     ) -> None:
         super().__init__()
         self._subagent = subagent
@@ -281,6 +285,8 @@ class BaselineContextMiddleware(AgentMiddleware):
         self._role = role
         self._files_mounted = files_mounted
         self._switches = switches
+        self._colleague_workspace_enabled = bool(colleague_workspace_enabled)
+        self._is_cross_user = bool(is_cross_user)
         # None is a read that did not answer; an empty name is a workspace
         # with no name. Only the first is kept out of change detection.
         self._workspace_available = workspace is not None
@@ -456,6 +462,8 @@ class BaselineContextMiddleware(AgentMiddleware):
             compaction_note=None if sent else _compaction_note(event),
             compaction_note_sent=sent,
             role=self._role,
+            # DALTON-HOOK(colleague-access): forward colleague_workspace_enabled into workspace change rows
+            colleague_workspace_enabled=self._colleague_workspace_enabled,
         )
 
     async def _read_sources(self, state: Any) -> list[SourceRead]:
@@ -631,7 +639,12 @@ class BaselineContextMiddleware(AgentMiddleware):
         guidance = self._guidance()
         parts: dict[str, str] = {}
 
-        parts[SECTION_WORKSPACE] = _workspace_block(epoch.workspace, self._role)
+        # DALTON-HOOK(colleague-access): pass colleague_workspace_enabled to workspace block rendering
+        parts[SECTION_WORKSPACE] = _workspace_block(
+            epoch.workspace,
+            self._role,
+            colleague_workspace_enabled=self._colleague_workspace_enabled,
+        )
         parts[SECTION_PROFILE] = self._user_profile_block(
             epoch.profile, epoch.channels_enabled, epoch.wakeups_enabled
         )
@@ -735,6 +748,8 @@ class BaselineContextMiddleware(AgentMiddleware):
                 main_agent_steering=not self._subagent,
                 switches=replace(self._switches, channels=channels, wakeups=wakeups),
                 role=self._role,
+                # DALTON-HOOK(colleague-access): distinguish requester from workspace owner on cross-user turns
+                is_cross_user=self._is_cross_user,
             )
         except Exception:  # noqa: BLE001 - one component is not the whole block
             logger.warning("[Baseline] user_profile render failed", exc_info=True)
@@ -837,7 +852,12 @@ def section_part(key: str) -> str:
 
 
 
-def _workspace_block(workspace: Workspace, role: AgentRole = "analyst") -> str:
+def _workspace_block(
+    workspace: Workspace,
+    role: AgentRole = "analyst",
+    *,
+    colleague_workspace_enabled: bool = False,
+) -> str:
     """What the workspace is called, and the computer it is on, as element text.
 
     Text rather than attributes: a name is free text the user typed, and as text
@@ -855,7 +875,12 @@ def _workspace_block(workspace: Workspace, role: AgentRole = "analyst") -> str:
     if computer:
         lines.append(f"Computer: {escape(computer, quote=False)}")
         if role != "chief_of_staff":
-            lines.append(OTHER_COMPUTERS)
+            # DALTON-HOOK(colleague-access): mention colleague_workspace when mounted
+            lines.append(
+                OTHER_COMPUTERS_WITH_COLLEAGUE_WORKSPACE
+                if colleague_workspace_enabled
+                else OTHER_COMPUTERS
+            )
     lines.extend(machine_lines(workspace, role))
     body = "\n".join(lines)
     return f"<workspace>\n{body}\n</workspace>"

@@ -424,9 +424,182 @@ async def _initial_workspace_file_note(backend: Any, doc_key: str) -> str | None
     return None
 
 
-def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
-    """Build ``[knowledge_update, knowledge_append_verdict, knowledge_read]`` bound to ``filesystem_backend``."""
+def create_knowledge_tools(
+    filesystem_backend: Any = None,
+    *,
+    role: str = "chief_of_staff",
+) -> list[BaseTool]:
+    """Build ``[knowledge_update, knowledge_append_verdict, knowledge_read]`` bound to ``filesystem_backend``.
+
+    When ``role == "analyst"``:
+    - ``knowledge_update`` and ``knowledge_append_verdict`` are restricted to
+      the current workspace ``W_cur`` and re-verify ``W_cur`` write access on
+      the turn's actual ``origin_channel`` for cross-user turns.
+    - Cross-workspace ``knowledge_read`` enforces dual-user verification
+      (caller A and current workspace owner B) and marks the analyst run
+      outbound-blocked.
+    When ``role == "chief_of_staff"`` (default), existing behavior is unchanged.
+    """
+    is_analyst = str(role or "").strip().lower() == "analyst"
     reconciled_workspaces: set[str] = set()
+
+    async def _verify_analyst_write(
+        *,
+        user_id: str,
+        target_ws_id: str,
+        explicit_workspace_id: str | None,
+        cfg: dict[str, Any],
+        cfg_workspace_id: str | None,
+    ) -> str | None:
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if not is_dalton_sharing_auth_enabled():
+            admitted_ws_id = str(cfg.get("turn_admitted_workspace_id") or "")
+            already_admitted = bool(admitted_ws_id and target_ws_id == admitted_ws_id)
+            if not already_admitted:
+                await verify_workspace_access(
+                    target_ws_id, user_id, need="write", channel="cos"
+                )
+            return None
+        w_cur = str(
+            cfg.get("turn_admitted_workspace_id") or cfg_workspace_id or ""
+        ).strip()
+        if explicit_workspace_id and str(explicit_workspace_id).strip() != w_cur:
+            return "ERROR: 工作区分析师只能更新当前工作区的知识库，不能写入其他工作区。"
+        if w_cur and target_ws_id != w_cur:
+            return "ERROR: 工作区分析师只能更新当前工作区的知识库，不能写入其他工作区。"
+        workspace_owner_id = str(cfg.get("workspace_owner_id") or "").strip()
+        is_cross_user = bool(workspace_owner_id and workspace_owner_id != user_id)
+        origin_channel = str(cfg.get("origin_channel") or "web").strip().lower()
+        if origin_channel not in ("web", "cos"):
+            origin_channel = "web"
+        if is_cross_user:
+            try:
+                await verify_workspace_access(
+                    target_ws_id, user_id, need="write", channel=origin_channel
+                )
+            except HTTPException as exc:
+                if exc.status_code == 403:
+                    try:
+                        await verify_workspace_access(
+                            target_ws_id, user_id, need="read", channel=origin_channel
+                        )
+                    except HTTPException:
+                        raise HTTPException(
+                            status_code=404, detail="Workspace not found"
+                        ) from None
+                    raise
+                if exc.status_code == 404:
+                    raise HTTPException(
+                        status_code=404, detail="Workspace not found"
+                    ) from None
+                raise
+            return None
+        admitted_ws_id = str(cfg.get("turn_admitted_workspace_id") or "")
+        already_admitted = bool(admitted_ws_id and target_ws_id == admitted_ws_id)
+        if not already_admitted:
+            await verify_workspace_access(
+                target_ws_id, user_id, need="write", channel="cos"
+            )
+        return None
+
+    async def _verify_read_or_not_found(
+        target_ws_id: str,
+        uid: str,
+        *,
+        channel: str,
+    ) -> None:
+        try:
+            await verify_workspace_access(
+                target_ws_id, uid, need="read", channel=channel
+            )
+        except HTTPException as exc:
+            if exc.status_code in (403, 404):
+                raise HTTPException(
+                    status_code=404, detail="Workspace not found"
+                ) from None
+            raise
+
+    async def _verify_analyst_read(
+        *,
+        user_id: str,
+        target_ws_id: str,
+        cfg: dict[str, Any],
+        cfg_workspace_id: str | None,
+        config: RunnableConfig,
+    ) -> tuple[bool, str | None]:
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if not is_dalton_sharing_auth_enabled():
+            await verify_workspace_access(
+                target_ws_id, user_id, need="read", channel="cos"
+            )
+            return False, None
+        from src.dalton.access_tiers import (
+            classify_owner_tier,
+            get_user_tier,
+            is_internal_tier,
+        )
+        from src.dalton.colleague_outbound_guard import (
+            OUTBOUND_GUARD_PERSIST_ERROR,
+            mark_run_outbound_blocked,
+        )
+        from src.server.database.home_workspace import is_home_row, is_reserved_row
+        from src.server.database.workspace import get_workspace as db_get_workspace
+
+        w_cur = str(
+            cfg.get("turn_admitted_workspace_id") or cfg_workspace_id or ""
+        ).strip()
+        workspace_owner_id = str(cfg.get("workspace_owner_id") or "").strip()
+        is_cross_user = bool(workspace_owner_id and workspace_owner_id != user_id)
+        origin_channel = str(cfg.get("origin_channel") or "web").strip().lower()
+        if origin_channel not in ("web", "cos"):
+            origin_channel = "web"
+
+        if target_ws_id == w_cur:
+            if is_cross_user:
+                await _verify_read_or_not_found(
+                    target_ws_id, user_id, channel=origin_channel
+                )
+            else:
+                await _verify_read_or_not_found(
+                    target_ws_id, user_id, channel="cos"
+                )
+            return False, None
+
+        # Cross-workspace read by an analyst: disallow Home / stand-in / deleted / unbound
+        target_ws = await db_get_workspace(target_ws_id)
+        if (
+            not target_ws
+            or target_ws.get("status") in ("deleted", "unbound")
+            or is_home_row(target_ws)
+            or is_reserved_row(target_ws)
+            or bool(target_ws.get("is_home"))
+        ):
+            raise HTTPException(status_code=404, detail="Workspace not found")
+
+        if is_cross_user:
+            caller_tier = await get_user_tier(user_id)
+            owner_tier = await classify_owner_tier(workspace_owner_id)
+            if not (is_internal_tier(caller_tier) and is_internal_tier(owner_tier)):
+                raise HTTPException(status_code=404, detail="Workspace not found")
+            if w_cur:
+                await _verify_read_or_not_found(
+                    w_cur, user_id, channel=origin_channel
+                )
+            for uid in (user_id, workspace_owner_id):
+                await _verify_read_or_not_found(
+                    target_ws_id, uid, channel="cos"
+                )
+        else:
+            await _verify_read_or_not_found(
+                target_ws_id, user_id, channel="cos"
+            )
+        if not await mark_run_outbound_blocked(
+            config, role="analyst", workspace_id=w_cur
+        ):
+            return True, f"ERROR: {OUTBOUND_GUARD_PERSIST_ERROR}"
+        return True, None
 
     async def _maybe_reconcile(
         workspace_id: str,
@@ -485,11 +658,22 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         # When writing to the turn's already-admitted workspace, skip redundant
         # inner access checks so a mid-turn revocation does not break an in-flight
         # turn; cross-workspace writes (e.g. from Home) still check channel="cos".
-        already_admitted = bool(admitted_ws_id and target_ws_id == admitted_ws_id)
-        if not already_admitted:
-            await verify_workspace_access(
-                target_ws_id, user_id, need="write", channel="cos"
+        if is_analyst:
+            refusal = await _verify_analyst_write(
+                user_id=user_id,
+                target_ws_id=target_ws_id,
+                explicit_workspace_id=workspace_id,
+                cfg=cfg,
+                cfg_workspace_id=cfg_workspace_id,
             )
+            if refusal:
+                return refusal
+        else:
+            already_admitted = bool(admitted_ws_id and target_ws_id == admitted_ws_id)
+            if not already_admitted:
+                await verify_workspace_access(
+                    target_ws_id, user_id, need="write", channel="cos"
+                )
         eff_backend = (
             filesystem_backend if target_ws_id == cfg_workspace_id else None
         )
@@ -581,11 +765,22 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         if not user_id or not target_ws_id or target_ws_id.lower() == "home":
             return "ERROR: user_id and workspace_id are required in RunnableConfig."
 
-        already_admitted = bool(admitted_ws_id and target_ws_id == admitted_ws_id)
-        if not already_admitted:
-            await verify_workspace_access(
-                target_ws_id, user_id, need="write", channel="cos"
+        if is_analyst:
+            refusal = await _verify_analyst_write(
+                user_id=user_id,
+                target_ws_id=target_ws_id,
+                explicit_workspace_id=workspace_id,
+                cfg=cfg,
+                cfg_workspace_id=cfg_workspace_id,
             )
+            if refusal:
+                return refusal
+        else:
+            already_admitted = bool(admitted_ws_id and target_ws_id == admitted_ws_id)
+            if not already_admitted:
+                await verify_workspace_access(
+                    target_ws_id, user_id, need="write", channel="cos"
+                )
         refs = extract_verdict_signal_refs(verdict)
         if refs:
             from src.dalton.database import watch as watch_db
@@ -698,24 +893,51 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
             JSON string with the requested knowledge document(s) and/or verdicts. 单文档时带 `latest_version_no`（最新版本号，含校验失败的行；无任何行为 `null`）——做 `knowledge_update` 时用它作 `base_version`（`version` 是最新有效版本号，最新行无效时用它会 `version_conflict`）。当读取的 `thesis` 含 `underwriting` 时，返回 JSON 中一并附带 `underwriting_summary`（含三情景价格区间、达标终值与盈亏平衡所需概率）。
         """
         user_id, cfg_workspace_id, _, _ = _extract_run_identity(config)
+        cfg = (config or {}).get("configurable") or {}
         target_ws_id = (str(workspace_id).strip() if workspace_id else "") or (
             cfg_workspace_id or ""
         )
         if not user_id or not target_ws_id or target_ws_id.lower() == "home":
             return "ERROR: user_id and workspace_id are required."
 
-        await verify_workspace_access(
-            target_ws_id, user_id, need="read", channel="cos"
-        )
+        is_cross_ws_read = False
+        if is_analyst:
+            is_cross_ws_read, read_refusal = await _verify_analyst_read(
+                user_id=user_id,
+                target_ws_id=target_ws_id,
+                cfg=cfg,
+                cfg_workspace_id=cfg_workspace_id,
+                config=config,
+            )
+            if read_refusal:
+                return read_refusal
+        else:
+            await verify_workspace_access(
+                target_ws_id, user_id, need="read", channel="cos"
+            )
         cleaned_doc = str(doc or "all").strip().lower()
         safe_limit = max(1, min(100, int(limit or 20)))
 
+        def _finalize_read_output(raw_json: str) -> str:
+            if is_analyst and is_cross_ws_read:
+                from src.dalton.tools.colleague_workspace_tools import (
+                    wrap_external_untrusted_content,
+                )
+
+                return wrap_external_untrusted_content(
+                    f"colleague_knowledge:{target_ws_id}/{cleaned_doc}",
+                    raw_json,
+                )
+            return raw_json
+
         if cleaned_doc == "verdicts":
             items = await db_verdicts.list_verdicts(target_ws_id, limit=safe_limit)
-            return json.dumps(
-                {"ok": True, "workspace_id": target_ws_id, "verdicts": items},
-                ensure_ascii=False,
-                default=str,
+            return _finalize_read_output(
+                json.dumps(
+                    {"ok": True, "workspace_id": target_ws_id, "verdicts": items},
+                    ensure_ascii=False,
+                    default=str,
+                )
             )
 
         if cleaned_doc in ALL_DOC_KEYS:
@@ -760,10 +982,12 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
                 )
                 if uw_sum:
                     payload["underwriting_summary"] = uw_sum
-            return json.dumps(
-                payload,
-                ensure_ascii=False,
-                default=str,
+            return _finalize_read_output(
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    default=str,
+                )
             )
 
         latest_map = await db_knowledge.list_all_latest_for_workspace(
@@ -792,15 +1016,17 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
                     entry["underwriting_summary"] = uw_sum
             docs_out[k] = entry
         verdicts_out = await db_verdicts.list_verdicts(target_ws_id, limit=safe_limit)
-        return json.dumps(
-            {
-                "ok": True,
-                "workspace_id": target_ws_id,
-                "documents": docs_out,
-                "verdicts": verdicts_out,
-            },
-            ensure_ascii=False,
-            default=str,
+        return _finalize_read_output(
+            json.dumps(
+                {
+                    "ok": True,
+                    "workspace_id": target_ws_id,
+                    "documents": docs_out,
+                    "verdicts": verdicts_out,
+                },
+                ensure_ascii=False,
+                default=str,
+            )
         )
 
     return [_knowledge_update, _knowledge_append_verdict, _knowledge_read]

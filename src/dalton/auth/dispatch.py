@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
@@ -23,7 +24,12 @@ from fastapi import HTTPException, Request, WebSocket, WebSocketException, statu
 from fastapi.security import HTTPAuthorizationCredentials
 
 from src.dalton.auth.sessions import verify_local_session_active
-from src.dalton.auth.tokens import LocalAccessClaims, decode_local_access_token
+from src.dalton.auth.tokens import (
+    WS_TICKET_TTL_SECONDS,
+    LocalAccessClaims,
+    decode_local_access_token,
+    verify_local_ws_ticket,
+)
 from src.dalton.company_identity import (
     is_company_system_user,
     reject_company_system_auth,
@@ -35,6 +41,125 @@ logger = logging.getLogger(__name__)
 MAX_SESSION_RECHECK_SECONDS = 30.0
 DEFAULT_WS_SESSION_RECHECK_SECONDS = 30.0
 DEFAULT_SSE_SESSION_RECHECK_SECONDS = 30.0
+WS_TICKET_JTI_REDIS_PREFIX = "dalton:local:ws_ticket:jti:"
+
+# Dedicated Redis client/pool for one-time WS ticket replay protection,
+# completely independent of the optional `REDIS_CACHE_ENABLED` cache toggle.
+_ws_ticket_redis_client: Any = None
+_ws_ticket_redis_pool: Any = None
+_ws_ticket_redis_key: tuple[str, int] | None = None
+
+
+def _resolve_ws_ticket_redis_url() -> str:
+    """Resolve the Redis URL for WS ticket replay checks (ignores REDIS_CACHE_ENABLED)."""
+    from src.config.settings import get_nested_config
+
+    return (
+        get_nested_config("redis.url")
+        or os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    )
+
+
+async def _get_ws_ticket_redis_client() -> Any:
+    """Return a Redis client for WS ticket replay protection, independent of ``REDIS_CACHE_ENABLED``."""
+    global _ws_ticket_redis_client, _ws_ticket_redis_pool, _ws_ticket_redis_key
+
+    url = _resolve_ws_ticket_redis_url()
+    loop_id = id(asyncio.get_running_loop())
+    key = (url, loop_id)
+    if _ws_ticket_redis_client is not None and _ws_ticket_redis_key == key:
+        return _ws_ticket_redis_client
+
+    import redis.asyncio as async_redis
+    from redis.asyncio.connection import BlockingConnectionPool
+
+    from src.config.settings import (
+        get_redis_max_connections,
+        get_redis_pool_timeout,
+        get_redis_socket_connect_timeout,
+        get_redis_socket_timeout,
+    )
+
+    try:
+        pool = BlockingConnectionPool.from_url(
+            url,
+            max_connections=max(4, min(16, get_redis_max_connections())),
+            timeout=get_redis_pool_timeout(),
+            socket_timeout=get_redis_socket_timeout(),
+            socket_connect_timeout=get_redis_socket_connect_timeout(),
+            decode_responses=False,
+            health_check_interval=30,
+        )
+        client = async_redis.Redis(connection_pool=pool)
+    except Exception as exc:
+        logger.warning(
+            "Failed to initialize WebSocket ticket Redis client (fail-closed 503): %s",
+            type(exc).__name__,
+        )
+        return None
+
+    old_client, old_pool = _ws_ticket_redis_client, _ws_ticket_redis_pool
+    _ws_ticket_redis_pool = pool
+    _ws_ticket_redis_client = client
+    _ws_ticket_redis_key = key
+
+    if old_client is not None:
+        try:
+            await old_client.aclose()
+        except Exception:
+            pass
+    if old_pool is not None:
+        try:
+            await old_pool.disconnect()
+        except Exception:
+            pass
+
+    return client
+
+
+async def close_ws_ticket_redis_client() -> None:
+    """Close the dedicated WS-ticket Redis client and pool (best-effort)."""
+    global _ws_ticket_redis_client, _ws_ticket_redis_pool, _ws_ticket_redis_key
+    client, _ws_ticket_redis_client = _ws_ticket_redis_client, None
+    pool, _ws_ticket_redis_pool = _ws_ticket_redis_pool, None
+    _ws_ticket_redis_key = None
+    if client is not None:
+        try:
+            await client.aclose()
+        except Exception:
+            pass
+    if pool is not None:
+        try:
+            await pool.disconnect()
+        except Exception:
+            pass
+
+_SENSITIVE_QUERY_PARAM_RE = re.compile(
+    r"([?&](?:ticket|token)=)[^&\s\"'<>#]+",
+    re.IGNORECASE,
+)
+
+
+def redact_sensitive_query_params(value: Any) -> Any:
+    """Redact ``ticket=`` and ``token=`` query values from log strings."""
+    if not isinstance(value, str) or "?" not in value:
+        return value
+    return _SENSITIVE_QUERY_PARAM_RE.sub(r"\1REDACTED", value)
+
+
+class SensitiveQueryLogFilter(logging.Filter):
+    """Redact WebSocket ``ticket`` / ``token`` query values in Uvicorn handshake and access logs."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = redact_sensitive_query_params(record.msg)
+        if isinstance(record.args, tuple):
+            record.args = tuple(redact_sensitive_query_params(arg) for arg in record.args)
+        elif isinstance(record.args, dict):
+            record.args = {
+                k: redact_sensitive_query_params(v) for k, v in record.args.items()
+            }
+        return True
 
 
 def _refuse_holder(user_id: str | None) -> None:
@@ -325,6 +450,62 @@ async def _verify_local_token_and_session(token: str) -> LocalAccessClaims:
     return claims
 
 
+async def _consume_ws_ticket_jti(
+    jti: str,
+    *,
+    ttl_seconds: int = WS_TICKET_TTL_SECONDS,
+) -> None:
+    """Atomically claim a one-time WebSocket ticket ``jti`` in Redis (60s max TTL).
+
+    Uses a dedicated Redis connection independent of ``REDIS_CACHE_ENABLED``.
+    Fails closed (503) if Redis is unavailable and rejects expired or replayed
+    tickets with 401.
+    """
+    cleaned = str(jti or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=401, detail="Missing WebSocket ticket jti")
+    remaining = int(ttl_seconds)
+    if remaining <= 0:
+        raise HTTPException(status_code=401, detail="WebSocket ticket expired")
+    client = await _get_ws_ticket_redis_client()
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="WebSocket ticket replay protection unavailable",
+        )
+    key = f"{WS_TICKET_JTI_REDIS_PREFIX}{cleaned}"
+    ttl = min(WS_TICKET_TTL_SECONDS, remaining)
+    try:
+        claimed = await client.set(key, "1", nx=True, ex=ttl)
+    except Exception as exc:
+        logger.warning(
+            "Failed to record WebSocket ticket jti in Redis (fail-closed 503): %s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="WebSocket ticket replay protection unavailable",
+        ) from exc
+    if not claimed:
+        raise HTTPException(status_code=401, detail="WebSocket ticket already used")
+
+
+async def _verify_local_ws_ticket_and_session(ticket: str) -> LocalAccessClaims:
+    """Verify a short-lived HMAC WebSocket ticket, its backing session in Postgres, and consume its one-time jti."""
+    claims = verify_local_ws_ticket(ticket)
+    reject_company_system_auth(claims.user_id)
+    _refuse_holder(claims.user_id)
+    await verify_local_session_active(
+        user_id=claims.user_id, session_id=claims.session_id
+    )
+    remaining = claims.expires_at - int(time.time())
+    if remaining <= 0:
+        raise HTTPException(status_code=401, detail="WebSocket ticket expired")
+    remaining_ttl = min(WS_TICKET_TTL_SECONDS, remaining)
+    await _consume_ws_ticket_jti(claims.jti, ttl_seconds=remaining_ttl)
+    return claims
+
+
 def is_service_token_rejected_by_dalton_auth(configured_token: str | None) -> bool:
     """Unified service-token policy for ``src/server/utils/api.py:_service_token_user_id``.
 
@@ -498,13 +679,16 @@ async def dispatch_oss_websocket(
         )
 
     token: str | None = None
+    ticket: str | None = None
     auth_header = websocket.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
         token = auth_header[7:].strip()
-    if not token and _allow_ws_query_token():
-        token = websocket.query_params.get("token")
-
     if not token:
+        ticket = (websocket.query_params.get("ticket") or "").strip() or None
+    if not token and not ticket and _allow_ws_query_token():
+        token = (websocket.query_params.get("token") or "").strip() or None
+
+    if not token and not ticket:
         await websocket.close(
             code=status.WS_1008_POLICY_VIOLATION, reason="Missing auth token"
         )
@@ -513,7 +697,10 @@ async def dispatch_oss_websocket(
         )
 
     try:
-        claims = await _verify_local_token_and_session(token)
+        if ticket is not None:
+            claims = await _verify_local_ws_ticket_and_session(ticket)
+        else:
+            claims = await _verify_local_token_and_session(token or "")
         if is_company_system_user(claims.user_id):
             raise HTTPException(status_code=401, detail="Invalid token")
         ws_state = getattr(websocket, "state", None)

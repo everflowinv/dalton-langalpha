@@ -70,6 +70,9 @@ def build_context_middleware(
     conversation_search_enabled: bool | None = None,
     claude_code: bool = False,
     shared: bool = False,
+    # DALTON-HOOK(colleague-access): prompt/baseline flags for colleague_workspace and cross-user turns
+    colleague_workspace_enabled: bool = False,
+    is_cross_user: bool = False,
 ) -> ContextMiddleware:
     """Wire the turn row, the per-thread baseline and the tail envelope.
 
@@ -105,6 +108,7 @@ def build_context_middleware(
             conversation_search_enabled=conversation_search_enabled,  # DALTON-HOOK(team-memory-toggle)
             claude_code=claude_code,  # DALTON-HOOK(team-memory-toggle)
             forked=turn.forked,
+            is_cross_user=is_cross_user,  # DALTON-HOOK(colleague-access)
         ),
         baseline=BaselineContextMiddleware(
             session=session,
@@ -123,6 +127,8 @@ def build_context_middleware(
             role=role,
             switches=switches,
             shared=shared,
+            colleague_workspace_enabled=colleague_workspace_enabled,  # DALTON-HOOK(colleague-access)
+            is_cross_user=is_cross_user,  # DALTON-HOOK(colleague-access)
         ),
         tail=RowCarrierMiddleware(),
     )

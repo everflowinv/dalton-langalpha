@@ -111,6 +111,15 @@ OTHER_COMPUTERS = (
     "computer, out of reach of your files. Say so, and that their Chief of "
     "Staff can reach it, or they can work on it from that workspace."
 )
+# DALTON-HOOK(colleague-access): analyst baseline hint when colleague_workspace is mounted
+OTHER_COMPUTERS_WITH_COLLEAGUE_WORKSPACE = (
+    "A workspace the user names that has no sibling folder is on another "
+    "computer, out of reach of local file paths — use `colleague_workspace` "
+    "(including `copy_file` for binary files <= 50 MB or UTF-8 text files <= 5 MB "
+    "into this workspace; `/chat/<workspace_id>` is a workspace link and "
+    "`/chat/t/<thread_id>` is a thread link) to read or copy from accessible "
+    "non-Home workspaces, or tell the user if it is not shared."
+)
 
 # A computer that is the user's own machine, by its ``computer_machine`` token.
 # Their files and sign-ins sit beside LangAlpha's two folders there, which a
@@ -477,6 +486,8 @@ class Observations:
     # rebuild with any of them in view files one more row that hands authority
     # back. The kinds say which rows a partial rebuild must leave in force.
     retained_rows: tuple[str, ...] = ()
+    # DALTON-HOOK(colleague-access): track whether colleague_workspace is mounted for workspace change rows
+    colleague_workspace_enabled: bool = False
     # False when the platform read behind ``profile`` or ``workspace`` did not
     # answer this turn. A failed read is not a cleared profile or an unnamed
     # workspace, so the change detector skips the source and a rebuild keeps
@@ -965,7 +976,12 @@ def _workspace_row(
         if obs.role != "chief_of_staff" and obs.workspace.computer and not frozen.computer:
             # A block frozen with one computer never said what a workspace on
             # another one means.
-            lines.append(OTHER_COMPUTERS)
+            # DALTON-HOOK(colleague-access): name colleague_workspace when mounted
+            lines.append(
+                OTHER_COMPUTERS_WITH_COLLEAGUE_WORKSPACE
+                if obs.colleague_workspace_enabled
+                else OTHER_COMPUTERS
+            )
         lines.extend(moved_lines(frozen, obs.workspace, obs.role))
         text = "\n".join(lines)
     return DurableUpdate(

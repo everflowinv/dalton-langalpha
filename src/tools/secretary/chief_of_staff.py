@@ -65,6 +65,7 @@ async def chief_of_staff_workspaces(
     content: str | None = None,
     dest_path: str | None = None,
     dest_workspace_id: str | None = None,
+    # DALTON-HOOK(colleague-access): copy_file docstring below covers strict UTF-8 text files up to 5 MB alongside binary files.
     # DALTON-HOOK(workspace-dedup): override duplicate company workspace check only after explicit user confirmation
     allow_duplicate_company: bool = False,
     # DALTON-HOOK(workspace-dedup): optional coverage unit auto-registration fields for "create"
@@ -82,9 +83,10 @@ async def chief_of_staff_workspaces(
     (Excel, PDF, images) use "copy_file" to copy it into Home, then send it from there or link
     it by the returned folder_path.
     Limits: "copy_file" copies binary Office (.xlsx, .xlsm, .docx, .pptx, .xls, .doc, .ppt),
-    PDF (.pdf), and image (.png, .jpg, .jpeg, .gif, .webp, .bmp, .tiff) files up to 50 MB
-    only; archives, pickle/database, audio/video, and text files are refused — read text with
-    "read_file".
+    PDF (.pdf), and image (.png, .jpg, .jpeg, .gif, .webp, .bmp, .tiff) files up to 50 MB,
+    as well as strict UTF-8 text files (.md, .markdown, .txt, .csv, .tsv, .json, .jsonl,
+    .yaml, .yml, .py, .sql, .html, .xml, .log) up to 5 MB; archives, pickle/database,
+    audio/video, and other file types are refused.
     Colleague-shared workspaces are read according to their shared access level; dispatching
     into one with delegate_to_analyst is allowed only when colleague dispatch is enabled for
     this deployment and the workspace's access is "rw" (follow the current access returned by
@@ -110,6 +112,7 @@ async def chief_of_staff_workspaces(
     """
     # DALTON-HOOK(workspace-folder-ready): the create result's folder fields are documented above.
     # DALTON-HOOK(cos-settings-tools): support manage_workspaces(action="update").
+    # DALTON-HOOK(colleague-access): copy_file docstring above covers UTF-8 text files up to 5 MB alongside binary files.
     user_id = config.get("configurable", {}).get("user_id")
     if not user_id:
         return error_command("user_id not found in config", tool_call_id)

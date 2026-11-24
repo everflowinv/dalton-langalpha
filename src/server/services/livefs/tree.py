@@ -260,6 +260,30 @@ class LivefsTree:
         self._context = context or CallContext()
         self._layout = SandboxLayout.for_root(identity.root_dir)
         self._built: dict[_Scope, CompositeFilesystemBackend | None] = {}
+        # DALTON-HOOK(colleague-access): fallback cross-user lock when CallContext is missing during an active cross-user run
+        self._force_cross_user_read_only = False
+        self._missing_context_checked = False
+
+    async def _ensure_mutation_guard(self) -> None:
+        """When CallContext lacks caller_user_id, lock user-data routes read-only
+        if this computer currently has any active cross-user run in Postgres."""
+        # DALTON-HOOK(colleague-access): only engage fallback cross-user DB guard when colleague sharing auth is enabled
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        if not is_dalton_sharing_auth_enabled():
+            return
+        if self._context.caller_user_id or self._missing_context_checked:
+            return
+        self._missing_context_checked = True
+        from src.dalton.colleague_outbound_guard import (
+            computer_has_active_cross_user_run,
+        )
+
+        if await computer_has_active_cross_user_run(
+            self._identity.computer_id, self._identity.user_id
+        ):
+            self._force_cross_user_read_only = True
+            self._built.clear()
 
     def _route_for(self, scope: _Scope, path: str) -> Any:
         # Built on first use, which past threads never make.
@@ -271,11 +295,28 @@ class LivefsTree:
         return found if getattr(found, "mountable", True) else None
 
     def _build(self, scope: _Scope) -> CompositeFilesystemBackend | None:
-        user_id = self._identity.user_id
+        # DALTON-HOOK(colleague-access): enforce cross-user read-only only when colleague sharing auth is enabled
+        from src.dalton.settings import is_dalton_sharing_auth_enabled
+
+        owner_user_id = self._identity.user_id
+        sharing_auth_enabled = is_dalton_sharing_auth_enabled()
+        caller_uid = self._context.caller_user_id if sharing_auth_enabled else None
+        explicit_cross_user = bool(caller_uid and str(caller_uid) != str(owner_user_id))
+        force_ro = sharing_auth_enabled and self._force_cross_user_read_only
+        is_cross_user = explicit_cross_user or force_ro
+        effective_uid = (
+            str(caller_uid)
+            if explicit_cross_user
+            else (
+                "__cross_user_active__"
+                if force_ro
+                else owner_user_id
+            )
+        )
         gates = resolve_identity_gates(
             store=self._store,
-            user_id=user_id,
-            own_data=not is_holder(user_id),
+            user_id=owner_user_id,
+            own_data=not is_holder(owner_user_id),
             workspace_id=scope.workspace_id,
             disable_subagents=True,
         )
@@ -283,8 +324,9 @@ class LivefsTree:
             backend=_PathOnlySandbox(self._layout.root),
             gates=gates,
             store=self._store,
-            user_id=user_id,
+            user_id=effective_uid,
             workspace_id=scope.workspace_id,
+            workspace_owner_id=owner_user_id if is_cross_user else None,
             layout=scope.layout,
             call=self._context,
         )
@@ -455,6 +497,8 @@ class LivefsTree:
         """Replace a whole file on the precondition the caller saw: the
         version it read, or that there was none, so a save never lands over
         a change the caller did not see."""
+        # DALTON-HOOK(colleague-access): check active cross-user run fallback when CallContext is absent
+        await self._ensure_mutation_guard()
         node = await self._file(path)
         with _answering(node.path):
             if len(data) > MAX_FILE_BYTES:
@@ -492,6 +536,8 @@ class LivefsTree:
     async def delete(self, path: str) -> tuple[str, str | None]:
         """The path deleted, and what the delete changed, for a file that
         reports that."""
+        # DALTON-HOOK(colleague-access): check active cross-user run fallback when CallContext is absent
+        await self._ensure_mutation_guard()
         node = await self._file(path)
         with _answering(node.path):
             removed = await node.route.delete(node.path)
@@ -507,6 +553,8 @@ class LivefsTree:
         as a cross-device rename, which ``mv`` completes file by file. Also
         returns what the move changed, as ``write`` does.
         """
+        # DALTON-HOOK(colleague-access): check active cross-user run fallback when CallContext is absent
+        await self._ensure_mutation_guard()
         source = await self._file(path)
         target = await self._file(to)
         if source.path == target.path:

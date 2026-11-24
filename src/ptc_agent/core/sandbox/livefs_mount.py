@@ -61,6 +61,8 @@ class CallContext:
     thread_id: str | None = None
     # None reads the user's stored zone, when a file needs one.
     timezone: str | None = None
+    # DALTON-HOOK(colleague-access): track calling user so cross-user LiveFS writes stay read-only
+    caller_user_id: str | None = None
 
 
 class MountHandle(Protocol):

@@ -75,6 +75,34 @@ class _ApiCallUsageBucket(list):
         self.is_unbilled_error: Optional[Callable[[BaseException], bool]] = is_unbilled_error
         self.call_records: list[Dict[str, Any]] = []
 
+    # DALTON-HOOK(budget): derive latest client pricing identity from per-call records
+    # instead of storing mutable singleton fields on the shared bucket.
+    @property
+    def pricing_model_id(self) -> Optional[str]:
+        for rec in reversed(self.call_records):
+            val = rec.get("pricing_model_id")
+            if isinstance(val, str) and val:
+                return val
+        return None
+
+    # DALTON-HOOK(complete-parse-failure-billing): expose latest per-record provider on the bucket.
+    # DALTON-HOOK(budget): derive latest pricing_provider from call_records.
+    @property
+    def pricing_provider(self) -> Optional[str]:
+        for rec in reversed(self.call_records):
+            val = rec.get("pricing_provider")
+            if isinstance(val, str) and val:
+                return val
+        return None
+
+    @property
+    def billing_type(self) -> Optional[str]:
+        for rec in reversed(self.call_records):
+            val = rec.get("billing_type")
+            if isinstance(val, str) and val:
+                return val
+        return None
+
 
 _USAGE_ACCUMULATOR: ContextVar[Optional[_ApiCallUsageBucket]] = ContextVar(
     "dalton_api_call_usage_accumulator",
@@ -407,8 +435,14 @@ def _record_collected_usage(
 
 
 # DALTON-HOOK(complete-parse-failure-billing): track each upstream ainvoke call's send timestamp and outcome.
+# DALTON-HOOK(budget): bind per-call client pricing identity passed from make_api_call directly on this record.
 @contextlib.contextmanager
-def _track_upstream_call():
+def _track_upstream_call(
+    *,
+    pricing_model_id: Optional[str] = None,
+    pricing_provider: Optional[str] = None,
+    billing_type: Optional[str] = None,
+):
     """Track an active upstream `ainvoke` call, timestamping when it is sent so cross-day
     attribution uses send time and timeouts during retry backoff sleep are distinguished from
     in-flight provider requests."""
@@ -421,6 +455,12 @@ def _track_upstream_call():
         "unknown_usage_calls": 0,
         "outcome": "in_flight",
     }
+    if pricing_model_id:
+        record["pricing_model_id"] = pricing_model_id
+    if pricing_provider:
+        record["pricing_provider"] = pricing_provider
+    if billing_type:
+        record["billing_type"] = billing_type
     capture: Dict[str, Any] = {"usage": {}, "occurred_at": sent_at, "record": record}
     if bucket is not None:
         bucket.tracking_active = True
@@ -552,11 +592,28 @@ async def make_api_call(
     # deployment that never configured LangSmith.
     # DALTON-HOOK(complete-parse-failure-billing): mark collector active upon entering make_api_call.
     mark_api_call_tracking_active()
+    # DALTON-HOOK(budget): read client billing metadata stamped by LLM.get_llm() into local
+    # per-call kwargs for _track_upstream_call so concurrent calls or fallbacks never share
+    # mutable identity state on the bucket singleton.
+    _client_meta = getattr(llm, "metadata", None)
+    if not isinstance(_client_meta, dict):
+        _client_meta = getattr(getattr(llm, "bound", None), "metadata", None)
+    _call_identity_kwargs: Dict[str, Optional[str]] = {}
+    if isinstance(_client_meta, dict):
+        _pmid = _client_meta.get("pricing_model_id")
+        _pprov = _client_meta.get("pricing_provider")
+        _btype = _client_meta.get("billing_type")
+        if isinstance(_pmid, str) and _pmid:
+            _call_identity_kwargs["pricing_model_id"] = _pmid
+        if isinstance(_pprov, str) and _pprov:
+            _call_identity_kwargs["pricing_provider"] = _pprov
+        if isinstance(_btype, str) and _btype:
+            _call_identity_kwargs["billing_type"] = _btype
     with tracing_context(enabled=False) if disable_tracing else contextlib.nullcontext():
         # Case 1: No schema requested, return raw content
         if response_schema is None:
             # DALTON-HOOK(complete-parse-failure-billing): track active upstream call for accurate unknown-usage accounting.
-            with _track_upstream_call() as raw_capture:
+            with _track_upstream_call(**_call_identity_kwargs) as raw_capture:
                 response = await llm.ainvoke(messages)
             content = get_message_content(response)
 
@@ -584,7 +641,7 @@ async def make_api_call(
         try:
             # Use include_raw=True to get token usage with structured output
             client = llm.with_structured_output(response_schema, include_raw=True)
-            with _track_upstream_call() as native_capture:
+            with _track_upstream_call(**_call_identity_kwargs) as native_capture:
                 native_captures.append(native_capture)
                 response_with_raw = await client.ainvoke(messages)
 
@@ -612,7 +669,7 @@ async def make_api_call(
                 # Fallback to direct response if include_raw didn't work
                 # DALTON-HOOK(complete-parse-failure-billing): track direct structured-output upstream call.
                 client = llm.with_structured_output(response_schema)
-                with _track_upstream_call() as direct_capture:
+                with _track_upstream_call(**_call_identity_kwargs) as direct_capture:
                     native_captures.append(direct_capture)
                     response = await client.ainvoke(messages)
 
@@ -655,7 +712,7 @@ async def make_api_call(
             # a ValueError/ValidationError without usage re-raises at once instead of entering parsing
             # retries (its call record decides billed vs unknown); only errors with recovered usage retry.
             try:
-                with _track_upstream_call() as fb_capture:
+                with _track_upstream_call(**_call_identity_kwargs) as fb_capture:
                     response = await llm.ainvoke(messages)
             except (json.JSONDecodeError, ValidationError, ValueError) as invoke_parse_err:
                 if fb_capture.get("usage"):

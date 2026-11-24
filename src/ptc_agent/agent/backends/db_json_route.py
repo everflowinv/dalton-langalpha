@@ -315,6 +315,10 @@ class DbJsonRoute:
     read_failure: ClassVar[str] = ""
     read_only: ClassVar[str] = ""
     undeletable: ClassVar[str] = ""
+    # DALTON-HOOK(colleague-access): shared cross-user read-only refusal message for all user-data routes
+    _CROSS_USER_READ_ONLY_MSG: ClassVar[str] = (
+        "Direct writes to workspace owner user-data files are disabled in cross-user shared workspaces."
+    )
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -327,6 +331,7 @@ class DbJsonRoute:
         call: CallContext,
         sandbox_backend: SandboxBackend,
         root_prefix: str,
+        cross_user_read_only: bool = False,
     ) -> None:
         if not root_prefix.endswith("/"):
             root_prefix = root_prefix + "/"
@@ -336,6 +341,7 @@ class DbJsonRoute:
         self._call = call
         self._sandbox = sandbox_backend
         self._root_prefix = root_prefix
+        self._cross_user_read_only = bool(cross_user_read_only)
         # Agent → filename → what that agent's last Read served. Only the Read
         # tool's path fills it. Request-scoped via agent.py, never reused across
         # users. The request's subagents share this route and run beside the
@@ -698,6 +704,9 @@ class DbJsonRoute:
     def _read_only(self, filename: str | None) -> bool:
         """Whether no save writes ``filename``: none here, the README, or a
         file the server keeps."""
+        # DALTON-HOOK(colleague-access): enforce read-only across all DbJsonRoute subclasses on cross-user turns
+        if self._cross_user_read_only:
+            return True
         return filename in (None, README_FILE) or filename in self.read_only_files
 
     def _read_only_refusal(self, file_path: str) -> UserDataValidationError:
@@ -708,6 +717,10 @@ class DbJsonRoute:
         )
 
     def _unwritable(self, file_path: str, filename: str | None) -> UserDataValidationError:
+        # DALTON-HOOK(colleague-access): return cross-user refusal when route is locked read-only
+        if self._cross_user_read_only:
+            name = filename or file_path.rsplit("/", 1)[-1] or README_FILE
+            return self._refusal("constraint_error", name, self._CROSS_USER_READ_ONLY_MSG)
         if filename == README_FILE:
             return self._readme_refusal(file_path)
         if filename in self.read_only_files:
@@ -749,10 +762,9 @@ class DbJsonRoute:
         filename = self._filename(file_path)
         if filename is None:
             return {"success": False, "error": f"File not found: {file_path}"}
-        if filename == README_FILE:
-            return {"success": False, "error": self._readme_refusal(file_path).hint}
-        if filename in self.read_only_files:
-            return {"success": False, "error": self._read_only_refusal(file_path).hint}
+        # DALTON-HOOK(colleague-access): check _read_only() in aedit_text so cross-user edits are blocked
+        if self._read_only(filename):
+            return {"success": False, "error": self._unwritable(file_path, filename).hint}
         if old_string == new_string:
             return {"success": False, "error": "old_string and new_string are identical"}
 
@@ -810,6 +822,9 @@ class DbJsonRoute:
     def is_writable(self, file_path: str) -> bool:
         """Whether a file at ``file_path`` takes saves, or for the folder
         itself, whether new files may be made in it."""
+        # DALTON-HOOK(colleague-access): cross-user routes are never writable
+        if self._cross_user_read_only:
+            return False
         if file_path.rstrip("/") == self._root_prefix.rstrip("/"):
             return False
         return not self._read_only(self._filename(file_path))
@@ -869,6 +884,9 @@ class DbJsonRoute:
     async def adelete_versioned(self, file_path: str) -> Stored | None:
         """None where no file is; anything else here raises
         ``ReadOnlyStoreError``, since every user has each of these files."""
+        # DALTON-HOOK(colleague-access): refuse deletes on cross-user read-only routes
+        if self._cross_user_read_only:
+            raise ReadOnlyStoreError(self._CROSS_USER_READ_ONLY_MSG)
         filename = self._filename(file_path)
         if filename is None:
             return None

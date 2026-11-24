@@ -282,6 +282,7 @@ async def available_models(user_id: str, provider: str, *, refresh: bool = False
     catalog_read = asyncio.create_task(_gateway_catalog(info))
     try:
         # A list on a base URL the user saved goes out as a key test does.
+        # DALTON-HOOK(standalone-core): route through address-based pinned egress transport in core local auth
         try:
             transport = await egress.user_endpoint_transport(cred.base_url)
         except egress.EndpointRefused as e:

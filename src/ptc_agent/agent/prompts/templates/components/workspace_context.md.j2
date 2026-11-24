@@ -19,6 +19,11 @@ The workspace's name and description are in the `<workspace>` block; a later wor
 
 The user's other workspaces on this computer sit beside this one as sibling folders, each named after its workspace with any character a path cannot hold replaced, so list `..` for the exact folder before you use `../<folder>/<path>`. Read from or write into one when the user asks you to reuse or extend prior work there; a file you put in a sibling belongs to that workspace, so name the workspace when you report it. The file tools refuse a sibling's `.agents/tools`; it is that workspace's runtime, so leave it alone from Bash and code as well.
 {% endif %}
+{# DALTON-HOOK(colleague-access): document analyst colleague_workspace tool and /chat/ links only when mounted #}
+{% if role | default("analyst") != "chief_of_staff" and colleague_workspace_enabled | default(false) %}
+
+To read files or conversations from the user's other workspaces or colleagues' workspaces — including workspaces on another computer or currently stopped — use `colleague_workspace`, or use `colleague_workspace(action="copy_file")` to copy a binary file (up to 50 MB) or UTF-8 text file (up to 5 MB) into this workspace. Pass a `/chat/<workspace_id>` link to `workspace_id`, and a `/chat/t/<thread_id>` link to `thread_id` with `action="read_thread"`. `colleague_workspace` accesses workspaces other than `Home` and writes only into this workspace.
+{% endif %}
 {% if (files_mounted | default(false) or history_files | default(false)) and workspace_folder | default(false) %}
 
 Past conversations on this computer are saved as transcripts, listed in `../.agents/threads.jsonl`. When the user points back at earlier work or another conversation, look it up there instead of guessing; `.agents/skills/langalpha-doc/references/history.md` says how to search them.{% if history_files | default(false) and not files_mounted | default(false) %} On this computer only Read, Grep and Glob reach them: Bash and code find no such files.{% endif %}

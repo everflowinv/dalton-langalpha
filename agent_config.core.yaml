@@ -19,6 +19,7 @@ sandbox:
     memory_limit: "3g"
     cpu_count: 2.0
     auto_stop_interval: 3000
+    network_mode: "sandbox-net"  # Fallback only; actual per-instance network name is determined by SANDBOX_DOCKER_NETWORK
 
 mcp:
   servers:
@@ -38,6 +39,10 @@ x_search:
   enabled: false
 
 fetch_chain: ["inhouse"]
+
+crawler:
+  browser_concurrency: 1
+  browser_service_url: "http://crawler:8100"
 
 compaction:
   cold_compact_tokens: 0

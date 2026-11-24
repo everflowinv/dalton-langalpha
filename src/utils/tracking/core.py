@@ -487,6 +487,10 @@ def calculate_cost_from_per_call_records(
     }
     per_call_costs = []
     by_model: Dict[str, Dict[str, Any]] = {}
+    # DALTON-HOOK(budget): track non-subscription models whose pricing card could not be resolved
+    # so downstream budget aggregation and reservation settlement never treat misses as $0 cash.
+    pricing_failed_models: List[str] = []
+    pricing_failed_seen: set[str] = set()
     resolve = resolve or PricingResolver()
 
     # A stamped client names its own key; an unstamped one leaves the vendor echo as
@@ -507,10 +511,12 @@ def calculate_cost_from_per_call_records(
         billing_type = record.get("billing_type", "platform")
         if record.get("pricing_model_id"):
             stamped_records += 1
-        card, window, straddled, call_cost, call_breakdown, _ = price_call(record, resolve)
+        card, window, straddled, call_cost, call_breakdown, listed = price_call(record, resolve)  # DALTON-HOOK(budget)
         # DALTON-HOOK(notional-pricing): evaluate per-call nominal cost for subscription/OAuth
         # models using the full tiered card while keeping cash cost = 0.0 on subscription cards.
         notional_card, is_sub = resolve.notional_card_for(record)
+        # DALTON-HOOK(budget): a non-subscription call with no pricing card failed pricing lookup.
+        call_pricing_failed = (not listed) and (not is_sub)
 
         input_tokens = usage.get('input_tokens', 0)
         output_tokens = usage.get('output_tokens', 0)
@@ -555,6 +561,12 @@ def calculate_cost_from_per_call_records(
             call_cost_record["pricing_model_id"] = record["pricing_model_id"]
         if record.get("pricing_provider"):
             call_cost_record["pricing_provider"] = record["pricing_provider"]
+        # DALTON-HOOK(budget): flag unpriced cash calls on both per-call record and payload summary.
+        if call_pricing_failed:
+            call_cost_record["pricing_failed"] = True
+            if model_name not in pricing_failed_seen:
+                pricing_failed_seen.add(model_name)
+                pricing_failed_models.append(model_name)
         if call_notional_breakdown:
             call_cost_record["notional_breakdown"] = call_notional_breakdown
         if window:
@@ -628,7 +640,7 @@ def calculate_cost_from_per_call_records(
         model_key_shape = KEY_SHAPE_MIXED
 
     # DALTON-HOOK(notional-pricing): include notional_cost alongside cash total_cost and platform_cost.
-    return {
+    result: Dict[str, Any] = {
         "by_model": by_model,
         "model_key_shape": model_key_shape,
         "total_cost": total_cost,
@@ -637,6 +649,11 @@ def calculate_cost_from_per_call_records(
         "cost_breakdown": cost_breakdown,
         "per_call_costs": per_call_costs,
     }
+    # DALTON-HOOK(budget): stamp row-level pricing_failed + unpriced model list when any cash call missed pricing.
+    if pricing_failed_models:
+        result["pricing_failed"] = True
+        result["pricing_failed_models"] = pricing_failed_models
+    return result
 
 
 # Public API

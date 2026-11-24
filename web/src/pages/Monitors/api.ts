@@ -63,6 +63,9 @@ export interface MonitorDetail {
   data_base: string;
   expires_in: number;
   cut?: boolean;
+  auto_publish_paused?: boolean;
+  auto_publish_pause_token?: string | null;
+  auto_publish_pause_notice?: string | null;
 }
 
 export interface MonitorGrantResponse {
@@ -95,6 +98,7 @@ export interface PublishMonitorPayload {
   loaded?: readonly string[];
   earlier?: readonly string[];
   page_sha256?: string;
+  confirm_pause_token?: string | null;
 }
 
 export interface UpdateMonitorPayload {

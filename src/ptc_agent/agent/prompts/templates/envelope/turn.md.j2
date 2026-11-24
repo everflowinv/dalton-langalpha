@@ -77,3 +77,8 @@ This thread was forked from another thread just before this turn; the conversati
 
 {{ surface_rules }}
 {% endif %}
+{# DALTON-HOOK(colleague-access): distinguish cross-user requester from workspace owner #}
+{% if is_cross_user | default(false) %}
+
+This message is from a colleague; this workspace and computer belong to the workspace owner. Reply directly to the person sending this message (by name or as "you") and distinguish them from the workspace owner. On this turn, `.agents/user/` and memory are read-only, and outputs stay in this workspace (outbound messaging and publishing require a turn started by the workspace owner).
+{% endif %}

@@ -566,3 +566,21 @@ web/src/pages/Settings/panels/__tests__/ModelAccessSection.capabilities.test.tsx
 web/src/components/modelAccess/__tests__/SubscriptionChoices.capabilities.test.tsx
 docs-site/src/integrations/profile-filter.mjs
 docs-site/public/favicon-core.svg
+# Standalone Core Batch 4b: local auth frontend, admin bootstrap step, tiered invites (d048), egress policy, and checks.
+src/dalton/migrations/versions/d048_invite_admin_tier.py
+src/dalton/llm/egress_policy.py
+web/src/pages/Setup/AdminBootstrapStep.tsx
+web/src/pages/Setup/__tests__/AdminBootstrapStep.test.tsx
+tests/standalone/checks/b4_local_auth.py
+tests/unit/dalton/test_standalone_b4b_local_invites_roles_egress.py
+# Standalone Core Batch 1b: compose overlay, env template, standalone Caddy/edge & init scripts.
+docker-compose.core.yml
+.env.core.example
+deploy/standalone/
+scripts/standalone/
+# Standalone Core Batch 1c: fake OpenAI Responses API server, header echo, CI compose,
+# standalone check framework, E2E workflow, and release packaging script.
+docker-compose.ci.yml
+.github/workflows/standalone-core-e2e.yml
+tests/fakes/
+tests/standalone/

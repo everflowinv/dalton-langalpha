@@ -244,6 +244,9 @@ class PTCAgent:
         dalton_monitors_enabled: bool = False,
         # DALTON-HOOK(report-delivery): gate report-delivery prompt hint on whether dalton_report_delivery is mounted
         dalton_report_delivery_enabled: bool = False,
+        # DALTON-HOOK(colleague-access): gate colleague sharing CoS prompt & analyst colleague_workspace prompt
+        colleague_sharing_enabled: bool = False,
+        colleague_workspace_enabled: bool = False,
     ) -> str:
         """Build the static system prompt (excludes time/profile for cacheability).
 
@@ -298,6 +301,9 @@ class PTCAgent:
             dalton_monitors_enabled=dalton_monitors_enabled,
             # DALTON-HOOK(report-delivery): gate report-delivery prompt hint on whether dalton_report_delivery is mounted
             dalton_report_delivery_enabled=dalton_report_delivery_enabled,
+            # DALTON-HOOK(colleague-access): gate colleague sharing & analyst colleague_workspace prompts
+            colleague_sharing_enabled=colleague_sharing_enabled,
+            colleague_workspace_enabled=colleague_workspace_enabled,
         )
 
     def _get_tool_summary(self, mcp_registry: MCPRegistry) -> str:
@@ -497,10 +503,12 @@ class PTCAgent:
 
         # Who this turn writes for: a new automation's defaults, for the
         # file tools and for a save through the file mount alike.
+        # DALTON-HOOK(colleague-access): record caller_user_id on CallContext for cross-user LiveFS read-only check
         call_context = CallContext(
             workspace_id=workspace_id_for_memory,
             thread_id=thread_id,
             timezone=turn_context.tool_timezone if turn_context else None,
+            caller_user_id=str(user_id) if user_id else None,
         )
         # Past threads the file tools read in process, on a machine no file
         # mount ever serves; where one may, its links show them instead.
@@ -508,16 +516,19 @@ class PTCAgent:
         history_routes = history.routes(backend) if history is not None else []
         if thread_history is not None:
             history_routes = [*history_routes, *thread_history.routes(backend)]
+        # DALTON-HOOK(colleague-dispatch): store routes belong to workspace owner
+        # DALTON-HOOK(colleague-access): pass caller user_id (A) and workspace_owner_id (B) so cross-user read-only gates engage
+        fs_owner_id = workspace_owner_id or owner_id
+        fs_user_id = (str(user_id) if user_id else fs_owner_id) if fs_owner_id is not None else None
         filesystem_backend, baseline_store_sources = build_filesystem_backend(
             backend=backend,
             gates=gates,
             store=store,
-            user_id=owner_id,
+            user_id=fs_user_id,
             workspace_id=workspace_id_for_memory,
-            # DALTON-HOOK(colleague-dispatch): store routes belong to workspace owner
             **(
-                {"workspace_owner_id": workspace_owner_id}
-                if workspace_owner_id is not None
+                {"workspace_owner_id": fs_owner_id}
+                if fs_owner_id is not None
                 else {}
             ),
             layout=workspace_layout,
@@ -1044,8 +1055,12 @@ class PTCAgent:
             is still this thread's, so it hands off to it; the mount serves
             it the computer's root, which is no workspace's folder."""
             there = SandboxBackend(target.sandbox, operation_callback=operation_callback)
+            # DALTON-HOOK(colleague-access): preserve caller_user_id on remote computer= commands
             there_call = CallContext(
-                workspace_id=None, thread_id=thread_id, timezone=call_context.timezone
+                workspace_id=None,
+                thread_id=thread_id,
+                timezone=call_context.timezone,
+                caller_user_id=str(user_id) if user_id else None,
             )
             machine = {
                 "thread_id": short_thread_id,
@@ -1128,6 +1143,18 @@ class PTCAgent:
         dalton_report_delivery_enabled = any(
             getattr(t, "name", None) == "dalton_report_delivery" for t in dalton_tools
         )
+        # DALTON-HOOK(colleague-access): gate CoS hand-off & analyst colleague_workspace prompts on actual capability/mounted tool
+        from src.dalton.capabilities import CapabilityId, has_capability
+
+        colleague_sharing_enabled = has_capability(CapabilityId.COLLEAGUE_SHARING)
+        colleague_workspace_enabled = any(
+            getattr(t, "name", None) == "colleague_workspace" for t in dalton_tools
+        )
+        is_cross_user_turn = bool(
+            user_id
+            and (workspace_owner_id or owner_id)
+            and str(user_id) != str(workspace_owner_id or owner_id)
+        )
 
         render_prompt = partial(
             self._build_system_prompt,
@@ -1151,6 +1178,8 @@ class PTCAgent:
             research_writing_enabled=research_writing_enabled,  # DALTON-HOOK(research-writing)
             dalton_monitors_enabled=dalton_monitors_enabled,  # DALTON-HOOK(monitors)
             dalton_report_delivery_enabled=dalton_report_delivery_enabled,  # DALTON-HOOK(report-delivery)
+            colleague_sharing_enabled=colleague_sharing_enabled,  # DALTON-HOOK(colleague-access)
+            colleague_workspace_enabled=colleague_workspace_enabled,  # DALTON-HOOK(colleague-access)
         )
         # Read once: the baseline freezes this value per epoch, and the
         # prompt is sent with the frozen one (FrozenPromptMiddleware).
@@ -1346,6 +1375,8 @@ class PTCAgent:
             claude_code=claude_code,  # DALTON-HOOK(team-memory-toggle)
             # A build without the sender's own data is a shared workspace's.
             shared=not own_data,
+            colleague_workspace_enabled=colleague_workspace_enabled,  # DALTON-HOOK(colleague-access)
+            is_cross_user=is_cross_user_turn,  # DALTON-HOOK(colleague-access)
         )
         if main_compaction is not None:
             main_compaction = main_compaction.with_baseline(context.baseline.sent_sections)
