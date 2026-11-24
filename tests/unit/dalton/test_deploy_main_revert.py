@@ -19,8 +19,12 @@ def _init_temp_repo(tmp_path: Path, *, with_migration_change: bool = True) -> tu
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
     (repo / "src/dalton/migrations/versions").mkdir(parents=True)
     (repo / "migrations/versions").mkdir(parents=True)
-    (repo / "src/dalton/migrations/versions/d040_baseline.py").write_text("revision = 'd040'\n")
-    (repo / "migrations/versions/146_baseline.py").write_text("revision = '146'\n")
+    (repo / "src/dalton/migrations/versions/d040_baseline.py").write_text(
+        "revision = 'd040'\ndown_revision = None\n"
+    )
+    (repo / "migrations/versions/146_baseline.py").write_text(
+        "revision = '146'\ndown_revision = None\n"
+    )
     (repo / "web").mkdir()
     (repo / "scripts/dalton").mkdir(parents=True)
     (repo / "file.txt").write_text("v1\n")
@@ -29,8 +33,12 @@ def _init_temp_repo(tmp_path: Path, *, with_migration_change: bool = True) -> tu
     pre_ff = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
 
     if with_migration_change:
-        (repo / "src/dalton/migrations/versions/d041_next.py").write_text("revision = 'd041'\n")
-        (repo / "migrations/versions/147_next.py").write_text("revision = '147'\n")
+        (repo / "src/dalton/migrations/versions/d041_next.py").write_text(
+            "revision = 'd041'\ndown_revision = 'd040'\n"
+        )
+        (repo / "migrations/versions/147_next.py").write_text(
+            "revision = '147'\ndown_revision = '146'\n"
+        )
     (repo / "file.txt").write_text("v2\n")
     subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "v2"], check=True)
@@ -315,6 +323,12 @@ def test_run_deploy_main_continues_when_pre_deploy_versions_unreadable(tmp_path:
     subprocess.run(["git", "-C", str(seed), "config", "user.name", "Test"], check=True)
     (seed / "src/dalton/migrations/versions").mkdir(parents=True)
     (seed / "migrations/versions").mkdir(parents=True)
+    (seed / "src/dalton/migrations/versions/d040_baseline.py").write_text(
+        "revision = 'd040'\ndown_revision = None\n"
+    )
+    (seed / "migrations/versions/146_baseline.py").write_text(
+        "revision = '146'\ndown_revision = None\n"
+    )
     (seed / "scripts/dalton").mkdir(parents=True)
     (seed / "web").mkdir(parents=True)
     (seed / "web/.keep").write_text("")
@@ -382,17 +396,24 @@ run_deploy_main
     )
     assert res.returncode == 0, res.stdout + res.stderr
     assert "pre-deploy migrations: dalton=未能读取, upstream=未能读取" in res.stdout
-    assert "migrating_deploy=0" in res.stdout
+    assert "DB version unreadable" in res.stdout
+    assert f"deploy target: {new_head}" in res.stdout
+    assert "migrating_deploy=1" in res.stdout
     assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == new_head
 
 
 def test_compute_migrating_deploy_detects_migration_file_changes(tmp_path: Path) -> None:
-    repo_no_mig, pre_ff_no_mig, _ = _init_temp_repo(tmp_path / "no_mig", with_migration_change=False)
-    repo_with_mig, pre_ff_with_mig, _ = _init_temp_repo(tmp_path / "with_mig", with_migration_change=True)
+    repo_no_mig, pre_ff_no_mig, head_no_mig = _init_temp_repo(tmp_path / "no_mig", with_migration_change=False)
+    repo_with_mig, pre_ff_with_mig, head_with_mig = _init_temp_repo(tmp_path / "with_mig", with_migration_change=True)
 
-    for repo, pre_ff, expected in [
-        (repo_no_mig, pre_ff_no_mig, "0"),
-        (repo_with_mig, pre_ff_with_mig, "1"),
+    for repo, pre_ff, dalton_rev, upstream_rev, expected in [
+        (repo_no_mig, pre_ff_no_mig, "d040", "146", "0"),
+        (repo_with_mig, pre_ff_with_mig, "d040", "146", "1"),
+        # Retry deploy: code already at target (PRE_FF == HEAD), DB still at old revisions -> migrating
+        (repo_with_mig, head_with_mig, "d040", "146", "1"),
+        # Unreadable DB version on code-only repo -> migrating
+        (repo_no_mig, head_no_mig, "", "146", "1"),
+        (repo_no_mig, head_no_mig, "d040", "", "1"),
     ]:
         script = f"""
 set -uo pipefail
@@ -400,12 +421,16 @@ DALTON_DEPLOY_LIB_ONLY=1
 source "{_DEPLOY_SCRIPT}"
 cd "{repo}"
 PRE_FF="{pre_ff}"
+PRE_FF_DALTON_REV="{dalton_rev}"
+PRE_FF_UPSTREAM_REV="{upstream_rev}"
 compute_migrating_deploy
 printf '%s' "$MIGRATING_DEPLOY"
 """
         res = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
         assert res.returncode == 0, res.stderr
         assert res.stdout == expected
+        if not dalton_rev or not upstream_rev:
+            assert "unreadable" in res.stderr
 
 
 def test_parse_deploy_args_validates_expect_migration_format() -> None:
@@ -832,6 +857,12 @@ def test_run_deploy_main_cleans_old_container_logs_even_without_recreate(
     subprocess.run(["git", "-C", str(seed), "config", "user.name", "Test"], check=True)
     (seed / "src/dalton/migrations/versions").mkdir(parents=True)
     (seed / "migrations/versions").mkdir(parents=True)
+    (seed / "src/dalton/migrations/versions/d040_baseline.py").write_text(
+        "revision = 'd040'\ndown_revision = None\n"
+    )
+    (seed / "migrations/versions/146_baseline.py").write_text(
+        "revision = '146'\ndown_revision = None\n"
+    )
     (seed / "scripts/dalton").mkdir(parents=True)
     (seed / "web").mkdir(parents=True)
     (seed / "web/.keep").write_text("")
