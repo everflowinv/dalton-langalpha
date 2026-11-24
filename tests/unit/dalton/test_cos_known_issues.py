@@ -2220,6 +2220,19 @@ class TestBinaryCopySecretChecks:
         assert ".ppt" in (cw_tool.description or "")
         assert "拒绝" in (cw_tool.description or "")
 
+    def test_presentation_renamed_to_xls_or_doc_is_refused_like_ppt(self) -> None:
+        renamed_ppt = (
+            sec_tools_mod._OLE_HEADER
+            + b"\x00" * 64
+            + "PowerPoint Document".encode("utf-16-le")
+            + b"\x00\x00"
+        )
+        for name in ("deck.xls", "deck.doc"):
+            assert (
+                sec_tools_mod._scan_copy_bytes_for_secrets(name, renamed_ppt, {})
+                == sec_tools_mod._COS_LEGACY_PPT_REFUSED_ERROR
+            )
+
     def test_legacy_ole_utf16le_fallback_catches_macro_in_truncated_container(self) -> None:
         truncated_macro = (
             sec_tools_mod._OLE_HEADER

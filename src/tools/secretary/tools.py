@@ -1911,6 +1911,10 @@ def _scan_copy_bytes_for_secrets(
         return "文件里含有源用户的凭据，不能拷贝"
 
     if ext_lower in _COS_LEGACY_OFFICE_EXTENSIONS:
+        # A presentation renamed to .xls / .doc keeps its "PowerPoint Document"
+        # stream, where VBA hides compressed; refuse it like a .ppt.
+        if "PowerPoint Document".encode("utf-16-le") in content:
+            return _COS_LEGACY_PPT_REFUSED_ERROR
         if _ole_has_vba_macros(content):
             return _COS_MACRO_OFFICE_REFUSED_ERROR
         return None

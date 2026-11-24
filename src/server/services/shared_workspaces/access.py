@@ -251,12 +251,14 @@ async def has_active_manager(
 
 
 def _is_home_stand_in_workspace(workspace: dict[str, Any]) -> bool:
-    """DALTON-HOOK(colleague-access): decide from the row alone.
+    """DALTON-HOOK(colleague-access): decide from the row alone, with no lookup.
 
-    ``workspace_access`` is handed a row as ``get_workspace`` reads it, which
-    always carries ``config``, so no second lookup is needed here (the
-    colleague path in ``src/dalton/sharing.py`` does its own when a caller's
-    dict omits ``config``)."""
+    A stand-in's id is derived from its owner (``home_workspace.is_home_stand_in_id``)
+    and its ``config`` marker is only ever written on that id, so the id check
+    alone recognises every stand-in, even for a caller that passes only
+    ``workspace_id`` and ``user_id`` (``forks/service.py``); the other callers
+    pass full ``get_workspace`` rows. The colleague path in
+    ``src/dalton/sharing.py`` keeps its own lookup for dicts without ``config``."""
     from src.server.database.home_workspace import (
         is_home_stand_in_id,
         is_home_stand_in_row,
