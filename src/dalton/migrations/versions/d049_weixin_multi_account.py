@@ -369,7 +369,10 @@ def upgrade() -> None:
         )
     )
 
-    # 2. Read-only snapshot of legacy singleton dalton_channel_weixin_state
+    # 2. Read-only snapshot of legacy singleton dalton_channel_weixin_state.
+    # Verified across d030/d032: legacy dalton_channel_weixin_state has no cdn_base_url
+    # column, so migrated accounts intentionally inherit the new table's default
+    # cdn_base_url ('https://novac2c.cdn.weixin.qq.com/c2c').
     legacy_state = bind.execute(
         sa.text(
             """
@@ -480,8 +483,8 @@ def upgrade() -> None:
                 :get_updates_buf,
                 :status,
                 :bot_generation,
-                COALESCE(:updated_at, NOW()),
-                COALESCE(:updated_at, NOW())
+                COALESCE(CAST(:updated_at AS TIMESTAMPTZ), NOW()),
+                COALESCE(CAST(:updated_at AS TIMESTAMPTZ), NOW())
             )
             ON CONFLICT (user_id) DO NOTHING
             RETURNING account_id
@@ -545,7 +548,7 @@ def upgrade() -> None:
                 t.updated_at
             FROM dalton_channel_weixin_context_tokens t
             WHERE t.ilink_bot_id = :ilink_bot_id
-              AND (:eff_ilink_user_id IS NULL OR t.platform_user_id = :eff_ilink_user_id)
+              AND (CAST(:eff_ilink_user_id AS VARCHAR) IS NULL OR t.platform_user_id = CAST(:eff_ilink_user_id AS VARCHAR))
             ON CONFLICT (account_id, bot_generation, platform_user_id) DO NOTHING
             """
         ),
@@ -580,7 +583,7 @@ def upgrade() -> None:
             WHERE platform = 'weixin'
               AND weixin_account_id IS NULL
               AND COALESCE(weixin_context_bot_id, raw_payload->>'ilink_bot_id') = :ilink_bot_id
-              AND (:eff_ilink_user_id IS NULL OR raw_payload->>'platform_user_id' = :eff_ilink_user_id)
+              AND (CAST(:eff_ilink_user_id AS VARCHAR) IS NULL OR raw_payload->>'platform_user_id' = CAST(:eff_ilink_user_id AS VARCHAR))
             """
         ),
         {

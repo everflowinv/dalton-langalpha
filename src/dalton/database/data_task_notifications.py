@@ -1383,8 +1383,16 @@ async def authorize_and_claim_data_task_delivery(
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
                 if gateway_epoch is not None or require_gateway_epoch:
+                    req_plat_hint = (
+                        cleaned_target.split(":", 1)[0].strip().lower()
+                        if ":" in cleaned_target
+                        else None
+                    )
                     await wx_db.verify_gateway_epoch_in_tx(
-                        cur, gateway_epoch, required=require_gateway_epoch
+                        cur,
+                        gateway_epoch,
+                        required=require_gateway_epoch,
+                        platform=req_plat_hint,
                     )
                 await _lock_saved_report_before_outer_identity(cur, cleaned_rid)
                 await _acquire_outer_identity_xact_lock(

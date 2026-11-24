@@ -45,7 +45,11 @@ from src.dalton.access_tiers import (
     evaluate_weixin_member_access,
     get_user_tier,
 )
-from src.dalton.capabilities import CapabilityId, has_capability
+from src.dalton.capabilities import (
+    CapabilityId,
+    has_capability,
+    require_channel_platform_capability,
+)
 from src.dalton.company_identity import reject_company_system_auth
 from src.dalton.settings import (
     get_dalton_channel_gateway_url,
@@ -507,15 +511,24 @@ async def verify_gateway_epoch_in_tx(
     gateway_epoch: int | None,
     *,
     required: bool = False,
+    platform: str | None = None,
 ) -> int | None:
     """Level 0b same-transaction ``FOR SHARE`` epoch check (D12).
 
-    Serializes against ``acquire_gateway_lease`` (``FOR UPDATE``) so no stale-epoch
-    write can commit after a lease takeover.
+    Centralized Batch A / Batch B rollout gate:
+    - When ``dalton_channel_gateway_lease`` has NEVER had a lease row (legacy gateway
+      still running before Batch B deploys):
+      - Non-Weixin (Feishu / Discord / generic recover) requests omitting
+        ``X-Gateway-Epoch`` are allowed so Batch A can deploy independently.
+      - Weixin requests, or any request supplying an ``X-Gateway-Epoch``, are rejected
+        with ``StaleGatewayEpochError`` (409).
+    - Once a lease row exists in ``dalton_channel_gateway_lease``:
+      - ALL required requests (Feishu, Discord, Weixin, recover) MUST carry a valid
+        non-expired ``X-Gateway-Epoch`` matching the active row under ``FOR SHARE``.
     """
-    if gateway_epoch is None:
-        if required:
-            raise StaleGatewayEpochError("Missing X-Gateway-Epoch header.")
+    cleaned_plat = str(platform or "").strip().lower() or None
+    is_weixin = cleaned_plat == "weixin"
+    if gateway_epoch is None and not required:
         return None
     await cur.execute(
         """
@@ -529,7 +542,11 @@ async def verify_gateway_epoch_in_tx(
     if _after_lease_share_hook is not None:
         await _after_lease_share_hook()
     if row is None:
-        raise StaleGatewayEpochError("No active gateway lease found.")
+        if is_weixin or gateway_epoch is not None:
+            raise StaleGatewayEpochError("No active gateway lease found.")
+        return None
+    if gateway_epoch is None:
+        raise StaleGatewayEpochError("Missing X-Gateway-Epoch header.")
     db_now = _coerce_utc(row.get("db_now")) or datetime.now(timezone.utc)
     expires_at = _coerce_utc(row.get("expires_at")) or db_now
     if int(row["epoch"]) != int(gateway_epoch) or expires_at <= db_now:
@@ -1337,12 +1354,38 @@ async def reevaluate_weixin_accounts(
             # Perform live roster & tier checks outside row locks to keep transactions brief
             live_status: dict[str, str] = {}
             live_tier: dict[str, str] = {}
+            lookup_error_count = 0
             for acc in discovered:
                 uid = str(acc["user_id"])
                 st = await check_team_member_status_live(uid, conn=owned_conn)
                 live_status[uid] = st
-                if st == "active":
+                if st == "lookup_error":
+                    lookup_error_count += 1
+                elif st == "active":
                     live_tier[uid] = await get_user_tier(uid, conn=owned_conn)
+
+            # §4.2: If ANY member encounters lookup_error during a reconcile round,
+            # abort the ENTIRE round without modifying any account status or accounts_revision.
+            if lookup_error_count > 0:
+                async with owned_conn.transaction():
+                    async with owned_conn.cursor(row_factory=dict_row) as cur:
+                        await verify_gateway_epoch_in_tx(
+                            cur,
+                            gateway_epoch,
+                            required=require_gateway_epoch,
+                            platform="weixin",
+                        )
+                        cfg_abort = await ensure_and_lock_weixin_config_in_tx(
+                            cur, for_update=False
+                        )
+                        return {
+                            "changed": False,
+                            "aborted_on_lookup_error": True,
+                            "lookup_error_count": lookup_error_count,
+                            "disabled_count": 0,
+                            "restored_count": 0,
+                            "accounts_revision": int(cfg_abort["accounts_revision"]),
+                        }
 
             # Determine which accounts actually need mutation
             async with owned_conn.cursor(row_factory=dict_row) as cur:
@@ -1582,6 +1625,12 @@ async def reevaluate_weixin_accounts(
                     changed = (disabled_count + restored_count) > 0
                     if changed:
                         await ensure_and_lock_weixin_config_in_tx(cur, for_update=True)
+                        # Re-check poller slot capacity AFTER acquiring Level 8 config lock
+                        # so concurrent confirms + restores can never exceed max_slots.
+                        if restored_count > 0:
+                            post_slots = await _count_active_poller_slots_in_tx(cur)
+                            if post_slots > max_slots:
+                                raise WeixinLockSetChanged()
                         await cur.execute(
                             """
                             UPDATE dalton_channel_weixin_config
@@ -1717,7 +1766,9 @@ async def reconcile_weixin_accounts(
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
-                await verify_gateway_epoch_in_tx(cur, gateway_epoch, required=True)
+                await verify_gateway_epoch_in_tx(
+                    cur, gateway_epoch, required=True, platform="weixin"
+                )
                 cfg = await ensure_and_lock_weixin_config_in_tx(cur, for_update=False)
                 enabled = bool(cfg["enabled"])
                 db_allow_ext = cfg.get("allow_external")
@@ -1913,7 +1964,9 @@ async def update_weixin_account_cursor(
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
-                await verify_gateway_epoch_in_tx(cur, gateway_epoch, required=True)
+                await verify_gateway_epoch_in_tx(
+                    cur, gateway_epoch, required=True, platform="weixin"
+                )
                 await cur.execute(
                     """
                     SELECT account_id, ilink_bot_id, bot_generation, get_updates_buf, status
@@ -2003,7 +2056,9 @@ async def update_weixin_account_status(
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
-                await verify_gateway_epoch_in_tx(cur, gateway_epoch, required=True)
+                await verify_gateway_epoch_in_tx(
+                    cur, gateway_epoch, required=True, platform="weixin"
+                )
                 lock_mode = (
                     "FOR UPDATE"
                     if cleaned_action == "mark_session_expired"
@@ -2545,7 +2600,9 @@ async def _patch_login_session_save_qr(
 
             async with owned_conn.transaction():
                 async with owned_conn.cursor(row_factory=dict_row) as cur:
-                    await verify_gateway_epoch_in_tx(cur, gateway_epoch, required=True)
+                    await verify_gateway_epoch_in_tx(
+                    cur, gateway_epoch, required=True, platform="weixin"
+                )
                     await lock_user_settings_in_tx(cur, [owner_uid])
                     cfg = await ensure_and_lock_weixin_config_in_tx(cur, for_update=False)
                     access_ok, deny_code = evaluate_weixin_member_access(
@@ -2632,7 +2689,9 @@ async def _patch_login_session_update(
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
-                await verify_gateway_epoch_in_tx(cur, gateway_epoch, required=True)
+                await verify_gateway_epoch_in_tx(
+                    cur, gateway_epoch, required=True, platform="weixin"
+                )
                 ver_clause = (
                     " AND login_version = %s"
                     if expected_login_version is not None
@@ -2741,7 +2800,7 @@ async def _patch_login_session_confirm(
                     FROM dalton_channel_weixin_accounts
                     WHERE user_id = %s
                        OR ilink_bot_id = %s
-                       OR (%s IS NOT NULL AND COALESCE(ilink_user_id, prev_ilink_user_id) = %s)
+                       OR (%s::text IS NOT NULL AND COALESCE(ilink_user_id, prev_ilink_user_id) = %s::text)
                     """,
                     (owner_uid, cleaned_bot, cleaned_wx_uid, cleaned_wx_uid),
                 )
@@ -2782,7 +2841,9 @@ async def _patch_login_session_confirm(
             # Phase 2: strict lock order Level 0b -> Level 1 -> Level 3a -> Level 3b -> Level 4 -> Level 6/7 -> Level 8
             async with owned_conn.transaction():
                 async with owned_conn.cursor(row_factory=dict_row) as cur:
-                    await verify_gateway_epoch_in_tx(cur, gateway_epoch, required=True)
+                    await verify_gateway_epoch_in_tx(
+                    cur, gateway_epoch, required=True, platform="weixin"
+                )
                     locked_uids = await lock_user_settings_in_tx(cur, discovered_uids)
                     if _after_user_locks_hook is not None:
                         await _after_user_locks_hook()
@@ -2801,7 +2862,7 @@ async def _patch_login_session_confirm(
                         FROM dalton_channel_weixin_accounts
                         WHERE user_id = %s
                            OR ilink_bot_id = %s
-                           OR (%s IS NOT NULL AND COALESCE(ilink_user_id, prev_ilink_user_id) = %s)
+                           OR (%s::text IS NOT NULL AND COALESCE(ilink_user_id, prev_ilink_user_id) = %s::text)
                         """,
                         (owner_uid, cleaned_bot, cleaned_wx_uid, cleaned_wx_uid),
                     )
@@ -2970,6 +3031,10 @@ async def _patch_login_session_confirm(
                                 )
 
                     # Slot capacity gate (D18): rescan of an already-slotted own account passes
+                    already_held_slot = own_acc is not None and str(own_acc["status"]) in (
+                        "active",
+                        "pending_verification",
+                    )
                     other_slots = await _count_active_poller_slots_in_tx(
                         cur, exclude_user_id=owner_uid
                     )
@@ -3131,6 +3196,18 @@ async def _patch_login_session_confirm(
                                 "message": "渠道或外部成员开关已关闭，确认已回滚",
                             },
                         )
+                    # Re-check poller slot capacity AFTER acquiring Level 8 config lock
+                    # so two concurrent confirms at max_slots - 1 serialize and never exceed max_slots.
+                    if not already_held_slot:
+                        total_slots_after_lock = await _count_active_poller_slots_in_tx(cur)
+                        if total_slots_after_lock > max_slots:
+                            raise HTTPException(
+                                status_code=409,
+                                detail={
+                                    "code": WEIXIN_CAPACITY_FULL_CODE,
+                                    "message": f"单实例微信轮询槽位已满（上限 {max_slots}）",
+                                },
+                            )
                     new_rev = int(rev_row["accounts_revision"])
 
                     confirmed_snapshot = _shape_confirmed_result(
@@ -3185,6 +3262,10 @@ async def unbind_weixin_account(
     via_wechat_command: bool = False,
     gateway_epoch: int | None = None,
     require_gateway_epoch: bool = False,
+    expected_bot_id: str | None = None,
+    expected_bot_generation: int | None = None,
+    expected_sender_ilink_user_id: str | None = None,
+    verify_live_roster: bool = False,
     one_time_context_token: str | None = None,
     one_time_recipient_id: str | None = None,
     conn: Any = None,
@@ -3196,6 +3277,8 @@ async def unbind_weixin_account(
     """
     norm_aid = normalize_uuid(account_id) if account_id else None
     cleaned_uid = str(target_user_id or "").strip() or None
+    cleaned_exp_bot = str(expected_bot_id or "").strip() or None
+    cleaned_exp_sender = str(expected_sender_ilink_user_id or "").strip() or None
     if cleaned_uid:
         reject_company_system_auth(cleaned_uid)
 
@@ -3212,6 +3295,8 @@ async def unbind_weixin_account(
                     )
                     r = await cur.fetchone()
                     if r is None:
+                        if via_wechat_command:
+                            return {"ok": False, "reason": "not_linked"}
                         raise HTTPException(
                             status_code=404, detail="Weixin account not found"
                         )
@@ -3225,13 +3310,19 @@ async def unbind_weixin_account(
                     if r is not None:
                         eff_aid = str(r["account_id"])
                 if not eff_uid:
+                    if via_wechat_command:
+                        return {"ok": False, "reason": "not_linked"}
                     raise HTTPException(status_code=404, detail="Weixin account not found")
 
             # Phase 2: strict lock order
+            # Level 0b -> Level 1 -> Level 3a -> Level 3b -> Level 4 -> Level 6 -> Level 7 -> Level 8
             async with owned_conn.transaction():
                 async with owned_conn.cursor(row_factory=dict_row) as cur:
                     await verify_gateway_epoch_in_tx(
-                        cur, gateway_epoch, required=require_gateway_epoch
+                        cur,
+                        gateway_epoch,
+                        required=require_gateway_epoch,
+                        platform="weixin",
                     )
                     await lock_user_settings_in_tx(cur, [eff_uid])
 
@@ -3249,10 +3340,79 @@ async def unbind_weixin_account(
                     )
                     acc = await cur.fetchone()
                     if norm_aid and (acc is None or str(acc["account_id"]) != norm_aid):
+                        if via_wechat_command:
+                            return {"ok": False, "reason": "not_linked"}
                         raise HTTPException(
                             status_code=404, detail="Weixin account not found"
                         )
 
+                    # Level 3b BEFORE Level 4 (§2.1 (8))
+                    if acc is not None:
+                        await lock_weixin_bot_and_users_in_tx(
+                            cur,
+                            bot_ids=[str(acc["ilink_bot_id"])],
+                            ilink_user_ids=[
+                                acc.get("ilink_user_id"),
+                                acc.get("prev_ilink_user_id"),
+                            ],
+                        )
+
+                    # Authorize Weixin /unbind in the SAME transaction BEFORE any mutation!
+                    verified_sender_for_reply: str | None = None
+                    if via_wechat_command or cleaned_exp_bot or expected_bot_generation is not None or cleaned_exp_sender or verify_live_roster:
+                        if acc is None:
+                            return {"ok": False, "reason": "not_linked"}
+                        acc_bot = str(acc["ilink_bot_id"])
+                        acc_gen = int(acc["bot_generation"])
+                        acc_wx_uid = str(acc.get("ilink_user_id") or "").strip() or None
+                        acc_prev_wx_uid = str(acc.get("prev_ilink_user_id") or "").strip() or None
+                        if cleaned_exp_bot and cleaned_exp_bot != acc_bot:
+                            return {
+                                "ok": False,
+                                "reason": "weixin_bot_generation_mismatch",
+                            }
+                        if expected_bot_generation is not None and int(expected_bot_generation) != acc_gen:
+                            return {
+                                "ok": False,
+                                "reason": "weixin_bot_generation_mismatch",
+                            }
+                        if cleaned_exp_sender:
+                            expected_owner_wx = (
+                                acc_wx_uid
+                                if acc_wx_uid is not None
+                                else (
+                                    acc_prev_wx_uid
+                                    if str(acc.get("status") or "") == "pending_verification"
+                                    else None
+                                )
+                            )
+                            if not expected_owner_wx or cleaned_exp_sender != expected_owner_wx:
+                                return {
+                                    "ok": False,
+                                    "reason": "weixin_sender_mismatch",
+                                }
+                            verified_sender_for_reply = expected_owner_wx
+                        elif acc_wx_uid:
+                            verified_sender_for_reply = acc_wx_uid
+                        if verify_live_roster:
+                            roster_st = await check_team_member_status_live(
+                                eff_uid, conn=owned_conn
+                            )
+                            if roster_st == "lookup_error":
+                                raise HTTPException(
+                                    status_code=503,
+                                    detail={
+                                        "code": "roster_lookup_error",
+                                        "message": "成员名册查询异常",
+                                    },
+                                )
+                            if roster_st != "active":
+                                return {
+                                    "ok": False,
+                                    "reason": "member_not_in_roster",
+                                }
+
+                    # Level 4: supersede pending login sessions
                     superseded_sessions = await _supersede_pending_login_sessions_in_tx(
                         cur, eff_uid
                     )
@@ -3269,15 +3429,7 @@ async def unbind_weixin_account(
                         deleted_wx_uid = acc.get("ilink_user_id") or acc.get(
                             "prev_ilink_user_id"
                         )
-                        await lock_weixin_bot_and_users_in_tx(
-                            cur,
-                            bot_ids=[deleted_bot],
-                            ilink_user_ids=[
-                                acc.get("ilink_user_id"),
-                                acc.get("prev_ilink_user_id"),
-                            ],
-                        )
-                        # Cancel unfinished collect buffers and unlink account_id before DELETE
+                        # Level 6: cancel unfinished collect buffers and unlink account_id before DELETE
                         await cancel_active_collect_buffers_in_tx(
                             cur, account_id=deleted_aid, unlink_account=True
                         )
@@ -3295,18 +3447,31 @@ async def unbind_weixin_account(
                             "DELETE FROM dalton_channel_weixin_accounts WHERE account_id = %s::uuid",
                             (deleted_aid,),
                         )
-                        if via_wechat_command and one_time_context_token:
+                        clean_one_time_ctx = str(one_time_context_token or "").strip()
+                        if via_wechat_command and clean_one_time_ctx:
+                            # D16: ONLY reply to the verified owner sender using the inbound context_token
+                            # (never combine current bot credentials with an unverified caller recipient).
                             recip = (
-                                str(one_time_recipient_id or "").strip()
+                                verified_sender_for_reply
+                                or (
+                                    str(one_time_recipient_id or "").strip()
+                                    if str(one_time_recipient_id or "").strip()
+                                    and str(one_time_recipient_id or "").strip()
+                                    == str(deleted_wx_uid or "").strip()
+                                    else ""
+                                )
                                 or str(deleted_wx_uid or "").strip()
                             )
-                            if recip:
+                            if recip and (
+                                not str(one_time_recipient_id or "").strip()
+                                or str(one_time_recipient_id or "").strip() == recip
+                            ):
                                 one_time_reply = {
                                     "bot_token": str(acc["bot_token"]),
                                     "base_url": str(acc["base_url"]),
                                     "ilink_bot_id": deleted_bot,
                                     "recipient_id": recip,
-                                    "context_token": str(one_time_context_token).strip(),
+                                    "context_token": clean_one_time_ctx,
                                     "text": "已解除当前个人微信连接。如需继续使用，请在设置页重新扫码连接。",
                                 }
                     else:
@@ -3782,6 +3947,15 @@ async def get_member_weixin_binding_view(
 # ---------------------------------------------------------------------------
 
 
+def _preflight_deny(deny_code: str, *, retryable: bool = False) -> dict[str, Any]:
+    return {
+        "authorized": False,
+        "decision": "defer" if retryable else "deny",
+        "retryable": bool(retryable),
+        "deny_code": deny_code,
+    }
+
+
 async def preflight_weixin_send(
     *,
     delivery_key: str,
@@ -3796,40 +3970,54 @@ async def preflight_weixin_send(
         raise HTTPException(status_code=400, detail="delivery_key is required")
 
     async with get_db_connection(conn) as owned_conn:
-        # Check gateway epoch first (short read-only check before unlocked peek) so
-        # stale epoch ALWAYS fails with 409 even when delivery_key is absent; the
-        # main transaction below still re-verifies under FOR SHARE atomically.
-        async with owned_conn.cursor(row_factory=dict_row) as cur:
-            await verify_gateway_epoch_in_tx(cur, gateway_epoch, required=True)
-            await cur.execute(
-                """
-                SELECT delivery_key, user_id, platform, status, delivery_attempt,
-                       weixin_account_id::text AS weixin_account_id,
-                       weixin_bot_id, weixin_bot_generation, weixin_recipient_id
-                FROM dalton_channel_deliveries
-                WHERE delivery_key = %s
-                """,
-                (cleaned_key,),
-            )
-            peek = await cur.fetchone()
-            if peek is None:
-                return {"authorized": False, "deny_code": "delivery_not_found"}
-            owner_uid = str(peek.get("user_id") or "").strip()
+        # Phase 1: short transaction checking epoch FOR SHARE + peeking delivery row,
+        # committed immediately so FOR SHARE is NEVER held across external roster lookup.
+        peek: dict[str, Any] | None = None
+        async with owned_conn.transaction():
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await verify_gateway_epoch_in_tx(
+                    cur, gateway_epoch, required=True, platform="weixin"
+                )
+                await cur.execute(
+                    """
+                    SELECT delivery_key, user_id, platform, status, delivery_attempt,
+                           weixin_account_id::text AS weixin_account_id,
+                           weixin_bot_id, weixin_bot_generation, weixin_recipient_id
+                    FROM dalton_channel_deliveries
+                    WHERE delivery_key = %s
+                    """,
+                    (cleaned_key,),
+                )
+                row_p = await cur.fetchone()
+                peek = dict(row_p) if row_p is not None else None
 
+        if peek is None:
+            require_channel_platform_capability("weixin")
+            return _preflight_deny("delivery_not_found")
+        peek_plat = str(peek.get("platform") or "").strip().lower()
+        require_channel_platform_capability(peek_plat or "weixin")
+        if peek_plat != "weixin":
+            return _preflight_deny("not_weixin_delivery")
+        if delivery_attempt is None or int(delivery_attempt) <= 0:
+            return _preflight_deny("delivery_attempt_required")
+
+        owner_uid = str(peek.get("user_id") or "").strip()
         if owner_uid and not owner_uid.startswith("unlinked:"):
             member_status = await check_team_member_status_live(owner_uid, conn=owned_conn)
             if member_status == "lookup_error":
-                return {"authorized": False, "deny_code": "roster_lookup_error"}
+                return _preflight_deny("roster_lookup_error", retryable=True)
             if member_status != "active":
-                return {"authorized": False, "deny_code": "member_not_in_roster"}
+                return _preflight_deny("member_not_in_roster")
             user_tier = await get_user_tier(owner_uid, conn=owned_conn)
         else:
-            return {"authorized": False, "deny_code": "member_not_in_roster"}
+            return _preflight_deny("member_not_in_roster")
 
         enc_key = get_encryption_key()
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
-                await verify_gateway_epoch_in_tx(cur, gateway_epoch, required=True)
+                await verify_gateway_epoch_in_tx(
+                    cur, gateway_epoch, required=True, platform="weixin"
+                )
                 await cur.execute(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"dalton_delivery:{cleaned_key}",),
@@ -3846,16 +4034,15 @@ async def preflight_weixin_send(
                 )
                 d_row = await cur.fetchone()
                 if d_row is None:
-                    return {"authorized": False, "deny_code": "delivery_not_found"}
-                if str(d_row.get("platform") or "").lower() != "weixin":
-                    return {"authorized": False, "deny_code": "not_weixin_delivery"}
+                    return _preflight_deny("delivery_not_found")
+                d_plat = str(d_row.get("platform") or "").strip().lower()
+                require_channel_platform_capability(d_plat or "weixin")
+                if d_plat != "weixin":
+                    return _preflight_deny("not_weixin_delivery")
                 if str(d_row.get("status") or "") != "in_flight":
-                    return {"authorized": False, "deny_code": "delivery_not_in_flight"}
-                if (
-                    delivery_attempt is not None
-                    and int(d_row.get("delivery_attempt") or 1) != int(delivery_attempt)
-                ):
-                    return {"authorized": False, "deny_code": "delivery_attempt_mismatch"}
+                    return _preflight_deny("delivery_not_in_flight")
+                if int(d_row.get("delivery_attempt") or 1) != int(delivery_attempt):
+                    return _preflight_deny("delivery_attempt_mismatch")
 
                 cfg = await ensure_and_lock_weixin_config_in_tx(cur, for_update=False)
                 access_ok, deny_code = evaluate_weixin_member_access(
@@ -3864,16 +4051,13 @@ async def preflight_weixin_send(
                     db_allow_external=cfg.get("allow_external"),
                 )
                 if not access_ok:
-                    return {
-                        "authorized": False,
-                        "deny_code": deny_code or "weixin_channel_disabled",
-                    }
+                    return _preflight_deny(deny_code or "weixin_channel_disabled")
 
                 d_aid = normalize_uuid(d_row.get("weixin_account_id"))
                 d_gen = d_row.get("weixin_bot_generation")
                 d_recip = str(d_row.get("weixin_recipient_id") or "").strip()
                 if not d_aid or d_gen is None or not d_recip:
-                    return {"authorized": False, "deny_code": "source_generation_unknown"}
+                    return _preflight_deny("source_generation_unknown")
 
                 await cur.execute(
                     """
@@ -3893,19 +4077,13 @@ async def preflight_weixin_send(
                 )
                 acc = await cur.fetchone()
                 if acc is None:
-                    return {"authorized": False, "deny_code": "weixin_account_unbound"}
+                    return _preflight_deny("weixin_account_unbound")
                 if str(acc["status"]) != "active":
-                    return {
-                        "authorized": False,
-                        "deny_code": f"weixin_account_{acc['status']}",
-                    }
+                    return _preflight_deny(f"weixin_account_{acc['status']}")
                 if int(acc["bot_generation"]) != int(d_gen):
-                    return {
-                        "authorized": False,
-                        "deny_code": "weixin_bot_generation_superseded",
-                    }
+                    return _preflight_deny("weixin_bot_generation_superseded")
                 if str(acc.get("ilink_user_id") or "").strip() != d_recip:
-                    return {"authorized": False, "deny_code": "weixin_account_rebound"}
+                    return _preflight_deny("weixin_account_rebound")
 
                 ctx_tok, ctx_ver, is_stale = (
                     await resolve_weixin_account_context_token_in_tx(
@@ -3917,18 +4095,14 @@ async def preflight_weixin_send(
                     )
                 )
                 if is_stale:
-                    return {
-                        "authorized": False,
-                        "deny_code": "weixin_context_token_stale",
-                    }
+                    return _preflight_deny("weixin_context_token_stale")
                 if not ctx_tok:
-                    return {
-                        "authorized": False,
-                        "deny_code": "missing_weixin_context_token",
-                    }
+                    return _preflight_deny("missing_weixin_context_token")
 
                 return {
                     "authorized": True,
+                    "decision": "allow",
+                    "retryable": False,
                     "chunk_index": int(chunk_index or 0),
                     "account_id": str(acc["account_id"]),
                     "ilink_bot_id": str(acc["ilink_bot_id"]),
@@ -4087,10 +4261,14 @@ async def register_collect_item_attachments(
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
-                await verify_gateway_epoch_in_tx(cur, gateway_epoch, required=True)
+                await verify_gateway_epoch_in_tx(
+                    cur, gateway_epoch, required=True, platform="weixin"
+                )
                 await cur.execute(
                     """
-                    SELECT buffer_id::text AS buffer_id, status
+                    SELECT buffer_id::text AS buffer_id,
+                           account_id::text AS account_id,
+                           status
                     FROM dalton_channel_weixin_collect_buffers
                     WHERE buffer_id = %s::uuid
                     FOR UPDATE
@@ -4102,20 +4280,56 @@ async def register_collect_item_attachments(
                     raise HTTPException(status_code=404, detail="Collect buffer not found")
 
                 buf_status = str(buf["status"])
+                buf_aid = str(buf["account_id"]) if buf.get("account_id") else None
+
+                # Verify item belongs to THIS buffer before touching any inbound event
+                await cur.execute(
+                    """
+                    SELECT message_id
+                    FROM dalton_channel_weixin_collect_items
+                    WHERE buffer_id = %s::uuid AND message_id = %s
+                    FOR UPDATE
+                    """,
+                    (norm_bid, cleaned_mid),
+                )
+                item_exists = await cur.fetchone()
+                if item_exists is None:
+                    raise HTTPException(status_code=404, detail="Collect item not found")
+
                 if buf_status in ("cancelled", "expired"):
-                    # Codex ④: reject with "已取消" and retire the inbound event immediately
-                    await cur.execute(
-                        """
-                        UPDATE dalton_channel_inbound_events
-                        SET status = 'ignored',
-                            fallback_pending = FALSE,
-                            command_reply_pending = FALSE,
-                            encrypted_weixin_media_meta = NULL,
-                            updated_at = NOW()
-                        WHERE platform = 'weixin' AND message_id = %s
-                        """,
-                        (cleaned_mid,),
-                    )
+                    # Codex ④ + R2 #3e: reject with "已取消" and retire ONLY the inbound row
+                    # scoped to this buffer (and account when still linked).
+                    if buf_aid is not None:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_inbound_events
+                            SET status = 'ignored',
+                                fallback_pending = FALSE,
+                                command_reply_pending = FALSE,
+                                encrypted_weixin_media_meta = NULL,
+                                updated_at = NOW()
+                            WHERE platform = 'weixin'
+                              AND message_id = %s
+                              AND collect_buffer_id = %s::uuid
+                              AND weixin_account_id = %s::uuid
+                            """,
+                            (cleaned_mid, norm_bid, buf_aid),
+                        )
+                    else:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_inbound_events
+                            SET status = 'ignored',
+                                fallback_pending = FALSE,
+                                command_reply_pending = FALSE,
+                                encrypted_weixin_media_meta = NULL,
+                                updated_at = NOW()
+                            WHERE platform = 'weixin'
+                              AND message_id = %s
+                              AND collect_buffer_id = %s::uuid
+                            """,
+                            (cleaned_mid, norm_bid),
+                        )
                     return {
                         "ok": False,
                         "upload_status": "cancelled",
@@ -4147,18 +4361,37 @@ async def register_collect_item_attachments(
                 if item_row is None:
                     raise HTTPException(status_code=404, detail="Collect item not found")
 
-                await cur.execute(
-                    """
-                    UPDATE dalton_channel_inbound_events
-                    SET status = 'completed',
-                        fallback_pending = FALSE,
-                        uploaded_attachments = %s,
-                        encrypted_weixin_media_meta = NULL,
-                        updated_at = NOW()
-                    WHERE platform = 'weixin' AND message_id = %s
-                    """,
-                    (Jsonb(list(uploaded_attachments or [])), cleaned_mid),
-                )
+                if buf_aid is not None:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_channel_inbound_events
+                        SET status = 'completed',
+                            fallback_pending = FALSE,
+                            uploaded_attachments = %s,
+                            encrypted_weixin_media_meta = NULL,
+                            updated_at = NOW()
+                        WHERE platform = 'weixin'
+                          AND message_id = %s
+                          AND collect_buffer_id = %s::uuid
+                          AND weixin_account_id = %s::uuid
+                        """,
+                        (Jsonb(list(uploaded_attachments or [])), cleaned_mid, norm_bid, buf_aid),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_channel_inbound_events
+                        SET status = 'completed',
+                            fallback_pending = FALSE,
+                            uploaded_attachments = %s,
+                            encrypted_weixin_media_meta = NULL,
+                            updated_at = NOW()
+                        WHERE platform = 'weixin'
+                          AND message_id = %s
+                          AND collect_buffer_id = %s::uuid
+                        """,
+                        (Jsonb(list(uploaded_attachments or [])), cleaned_mid, norm_bid),
+                    )
                 return {
                     "ok": True,
                     "upload_status": str(item_row["upload_status"]),
@@ -4653,10 +4886,11 @@ async def verify_pending_weixin_account_first_message(
                             (enc_key, norm_aid),
                         )
                         cred_row = await cur.fetchone()
+                        # Level 4 BEFORE Level 6 (§2.1 (8))
+                        await _supersede_pending_login_sessions_in_tx(cur, owner_uid)
                         await cancel_active_collect_buffers_in_tx(
                             cur, account_id=norm_aid, unlink_account=True
                         )
-                        await _supersede_pending_login_sessions_in_tx(cur, owner_uid)
                         await _remove_weixin_user_settings_in_tx(cur, owner_uid)
                         await _advance_weixin_sessions_and_close_watches_in_tx(
                             cur, user_id=owner_uid, account_id=norm_aid

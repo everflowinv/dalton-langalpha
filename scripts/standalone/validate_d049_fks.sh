@@ -2,6 +2,12 @@
 # Standalone Core post-deploy FK validator for d049_weixin_multi_account.
 # Delegates to shared Python logic in src/dalton/database/weixin_fk_validate.py.
 # Run manually after upgrade/startup (not wired into upgrade.sh in Batch A).
+#
+# Default DSN resolution:
+# - If DALTON_FK_VALIDATE_DSN is set on the host, connects directly with that DSN.
+# - Otherwise runs inside the compose `backend` service (`docker compose ... exec -T backend`)
+#   where `src.server.database.pool.get_db_connection_string()` reads DB_HOST/DB_PORT/DB_NAME/
+#   DB_USER/DB_PASSWORD (or DATABASE_URL) loaded from --env-file (default: ${WORK_DIR}/.env).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

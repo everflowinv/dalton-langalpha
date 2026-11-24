@@ -1290,7 +1290,7 @@ _WEIXIN_SECRET_KEYS: frozenset[str] = frozenset(
 )
 
 _WEIXIN_SECRET_KV_RE = re.compile(
-    r"""(?i)\b(bot_token|context_token|weixin_context_token|qrcode|login_qrcode|verify_code|aes_?key|encrypt_query_param|access_token|x-service-token)\b(\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,&;}\]]+)"""
+    r"""(?i)(?:"|')?\b(bot_token|context_token|weixin_context_token|qrcode|login_qrcode|verify_code|aes_?key|encrypt_query_param|access_token|x-service-token)\b(?:"|')?(\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,&;}\]]+)"""
 )
 
 

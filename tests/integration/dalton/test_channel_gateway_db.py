@@ -7682,8 +7682,13 @@ async def test_d049_copy_only_migration_fk_validate_and_lossless_downgrade_real_
     dsn = _get_test_dsn()
     await _ensure_alembic_upgraded_to_head(dsn)
 
-    dalton_cfg = Config(str(Path(__file__).resolve().parents[3] / "src/dalton/alembic.ini"))
-    dalton_cfg.set_main_option("sqlalchemy.url", dsn)
+    project_root = Path(__file__).resolve().parents[3]
+    sa_url = dsn.replace("postgresql://", "postgresql+psycopg://", 1).replace("%", "%%")
+    dalton_cfg = Config(str(project_root / "src/dalton/alembic.ini"))
+    dalton_cfg.set_main_option(
+        "script_location", str(project_root / "src" / "dalton" / "migrations")
+    )
+    dalton_cfg.set_main_option("sqlalchemy.url", sa_url)
     enc_key = os.environ.get("BYOK_ENCRYPTION_KEY", "").strip() or "d049-real-pg-test-encryption-key!!"
     monkeypatch.setenv("BYOK_ENCRYPTION_KEY", enc_key)
 
@@ -8201,6 +8206,188 @@ async def test_weixin_multi_account_e2e_rescan_codex_rules_and_collect_real_pg(
                     await cur.execute("DELETE FROM dalton_channel_deliveries WHERE delivery_key = %s", (dlv_amb,))
                     await cur.execute("DELETE FROM dalton_channel_weixin_audit_logs WHERE target_user_id = %s", (uid,))
                     await cur.execute("DELETE FROM dalton_channel_weixin_accounts WHERE user_id = %s", (uid,))
+        await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_r2_confirm_sql_types_replay_auth_and_concurrent_capacity_real_pg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 2 Decisions #2, #3, #5 on real PostgreSQL: typed SQL params, I-1 replay isolation, concurrent slot cap."""
+    from fastapi import HTTPException
+
+    from src.dalton.database import weixin_multi_account as wx_db
+
+    dsn = _get_test_dsn()
+    await _ensure_alembic_upgraded_to_head(dsn)
+    monkeypatch.setenv("BYOK_ENCRYPTION_KEY", "d049-real-pg-test-encryption-key!!")
+    monkeypatch.setenv("DALTON_WEIXIN_MAX_CONCURRENT_ACCOUNTS", "2")
+    monkeypatch.setattr(wx_db, "check_team_member_status_live", create_autospec(wx_db.check_team_member_status_live, return_value="active"))
+    monkeypatch.setattr(wx_db, "get_user_tier", create_autospec(wx_db.get_user_tier, return_value="internal"))
+    monkeypatch.setattr(cg_db, "check_team_member_status_live", create_autospec(cg_db.check_team_member_status_live, return_value="active"))
+    monkeypatch.setattr(cg_db, "get_user_tier", create_autospec(cg_db.get_user_tier, return_value="internal"))
+
+    pool = AsyncConnectionPool(conninfo=dsn, min_size=2, max_size=6, open=False)
+    await pool.open()
+    await pool.wait()
+    prefix = f"wxr2_{uuid4().hex[:8]}"
+    u1, u2, u3 = f"{prefix}_u1", f"{prefix}_u2", f"{prefix}_u3"
+    wx1, wx2, wx3 = f"{prefix}_wx1@im.wechat", f"{prefix}_wx2@im.wechat", f"{prefix}_wx3@im.wechat"
+    mid_shared = f"{prefix}_shared_mid"
+    try:
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_channel_gateway_lease (singleton_id, instance_id, epoch, expires_at, updated_at)
+                        VALUES (1, 'gw-r2', 70, NOW() + INTERVAL '5 minutes', NOW())
+                        ON CONFLICT (singleton_id) DO UPDATE SET
+                            instance_id = 'gw-r2', epoch = 70, expires_at = NOW() + INTERVAL '5 minutes', updated_at = NOW()
+                        """
+                    )
+                    await cur.execute(
+                        "UPDATE dalton_channel_weixin_config SET enabled = TRUE, allow_external = TRUE WHERE singleton_id = 1"
+                    )
+
+        # 1. Decision #2: confirm with BOTH non-null ilink_user_id AND None ilink_user_id on real PostgreSQL
+        s1 = await wx_db.start_weixin_login_session(user_id=u1)
+        await wx_db.patch_weixin_login_session(session_key=s1["session_key"], gateway_epoch=70, action="save_qr", qrcode="q1")
+        c1 = await wx_db.patch_weixin_login_session(
+            session_key=s1["session_key"],
+            gateway_epoch=70,
+            action="confirm",
+            expected_login_version=2,
+            ilink_bot_id=f"{prefix}_b1@im.wechat",
+            bot_token="tok-1",
+            ilink_user_id=wx1,
+        )
+        assert c1["ok"] is True
+        aid1 = c1["account_id"]
+
+        # Confirm with ilink_user_id=None (pending_verification) exercises %s::text IS NOT NULL with NULL on real PG!
+        s1_re = await wx_db.start_weixin_login_session(user_id=u1)
+        await wx_db.patch_weixin_login_session(session_key=s1_re["session_key"], gateway_epoch=70, action="save_qr", qrcode="q1r")
+        c1_re = await wx_db.patch_weixin_login_session(
+            session_key=s1_re["session_key"],
+            gateway_epoch=70,
+            action="confirm",
+            expected_login_version=2,
+            expected_bot_generation=1,
+            ilink_bot_id=f"{prefix}_b1r@im.wechat",
+            bot_token="tok-1r",
+            ilink_user_id=None,
+        )
+        assert c1_re["account_status"] == "pending_verification"
+        v1 = await wx_db.verify_pending_weixin_account_first_message(
+            account_id=aid1,
+            platform_user_id=wx1,
+            expected_bot_id=f"{prefix}_b1r@im.wechat",
+            expected_bot_generation=2,
+            gateway_epoch=70,
+            require_gateway_epoch=True,
+            inbound_context_token="ctx-v1",
+        )
+        assert v1["outcome"] == "verified"
+
+        # 2. Decision #5: Concurrent capacity cap (1 existing slot + cap=2 + 2 simultaneous confirms -> strictly 1 succeeds, 1 gets 409!)
+        s2 = await wx_db.start_weixin_login_session(user_id=u2)
+        s3 = await wx_db.start_weixin_login_session(user_id=u3)
+        await wx_db.patch_weixin_login_session(session_key=s2["session_key"], gateway_epoch=70, action="save_qr", qrcode="q2")
+        await wx_db.patch_weixin_login_session(session_key=s3["session_key"], gateway_epoch=70, action="save_qr", qrcode="q3")
+
+        async def _confirm_on_conn(skey: str, bot_id: str, wx_id: str) -> str:
+            async with pool.connection() as c:
+                try:
+                    await wx_db.patch_weixin_login_session(
+                        session_key=skey,
+                        gateway_epoch=70,
+                        action="confirm",
+                        expected_login_version=2,
+                        ilink_bot_id=bot_id,
+                        bot_token="tok-cap",
+                        ilink_user_id=wx_id,
+                        conn=c,
+                    )
+                    return "ok"
+                except HTTPException as exc:
+                    if exc.status_code == 409 and isinstance(exc.detail, dict) and exc.detail.get("code") == wx_db.WEIXIN_CAPACITY_FULL_CODE:
+                        return "capacity_full"
+                    raise
+
+        res_cap = await asyncio.gather(
+            _confirm_on_conn(s2["session_key"], f"{prefix}_b2@im.wechat", wx2),
+            _confirm_on_conn(s3["session_key"], f"{prefix}_b3@im.wechat", wx3),
+        )
+        assert sorted(res_cap) == ["capacity_full", "ok"]
+
+        # 3. Decision #3c: I-1 replay isolation & switch enforcement on real PG
+        in1 = await cg_db.register_and_resolve_inbound(
+            platform="weixin",
+            platform_user_id=wx1,
+            chat_type="dm",
+            chat_address="weixin:@me",
+            thread_scope_key=f"dm:{wx1}",
+            message_id=mid_shared,
+            raw_payload={"text": "u1 secret", "seq": 1},
+            weixin_account_id=aid1,
+            weixin_bot_id=f"{prefix}_b1r@im.wechat",
+            weixin_bot_generation=2,
+            weixin_context_token="ctx-u1",
+            gateway_epoch=70,
+            require_gateway_epoch=True,
+        )
+        assert in1["allowed"] is True
+
+        # Cross-member collision rejected with zero leak
+        in_cross = await cg_db.register_and_resolve_inbound(
+            platform="weixin",
+            platform_user_id=wx2,
+            chat_type="dm",
+            chat_address="weixin:@me",
+            thread_scope_key=f"dm:{wx2}",
+            message_id=mid_shared,
+            raw_payload={"text": "u2"},
+            weixin_account_id=str(uuid4()),
+            weixin_bot_id=f"{prefix}_b2@im.wechat",
+            weixin_bot_generation=1,
+            gateway_epoch=70,
+            require_gateway_epoch=True,
+        )
+        assert in_cross["allowed"] is False
+        assert in_cross["deny_reason"] == "weixin_message_id_account_mismatch"
+        assert "dalton_user_id" not in in_cross
+
+        # Channel switch off denies replay
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute("UPDATE dalton_channel_weixin_config SET enabled = FALSE WHERE singleton_id = 1")
+        in_off = await cg_db.register_and_resolve_inbound(
+            platform="weixin",
+            platform_user_id=wx1,
+            chat_type="dm",
+            chat_address="weixin:@me",
+            thread_scope_key=f"dm:{wx1}",
+            message_id=mid_shared,
+            raw_payload={"text": "u1 secret"},
+            weixin_account_id=aid1,
+            weixin_bot_id=f"{prefix}_b1r@im.wechat",
+            weixin_bot_generation=2,
+            gateway_epoch=70,
+            require_gateway_epoch=True,
+        )
+        assert in_off["allowed"] is False
+        assert in_off["deny_reason"] == "weixin_channel_disabled"
+    finally:
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute("UPDATE dalton_channel_weixin_config SET enabled = TRUE WHERE singleton_id = 1")
+                    await cur.execute("DELETE FROM dalton_channel_inbound_events WHERE platform = 'weixin' AND message_id = %s", (mid_shared,))
+                    await cur.execute("DELETE FROM dalton_channel_weixin_login_sessions WHERE user_id IN (%s, %s, %s)", (u1, u2, u3))
+                    await cur.execute("DELETE FROM dalton_channel_weixin_accounts WHERE user_id IN (%s, %s, %s)", (u1, u2, u3))
+                    await cur.execute("DELETE FROM dalton_channel_weixin_audit_logs WHERE target_user_id IN (%s, %s, %s)", (u1, u2, u3))
         await pool.close()
 
 

@@ -739,6 +739,15 @@ async def authorize_and_claim_automation_notify_delivery(
 
                 owner_user_id = str(plan.get("owner_user_id") or "")
                 require_channel_platform_capability(plan["platform"])
+                if plan["platform"] == "weixin" and (
+                    gateway_epoch is not None or require_gateway_epoch
+                ):
+                    await wx_db.verify_gateway_epoch_in_tx(
+                        cur,
+                        gateway_epoch,
+                        required=require_gateway_epoch,
+                        platform="weixin",
+                    )
 
                 wx_account_id: str | None = None
                 wx_bot_id: str | None = None

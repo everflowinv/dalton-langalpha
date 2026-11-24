@@ -77,9 +77,9 @@ def require_channel_service_token(request: Request) -> None:
 def _parse_gateway_epoch(
     request: Request,
     *,
-    required: bool = True,
+    required: bool = False,
 ) -> int | None:
-    """Parse `X-Gateway-Epoch` header; raise `StaleGatewayEpochError` (409) when missing/invalid."""
+    """Parse `X-Gateway-Epoch` header; raise `StaleGatewayEpochError` (409) when malformed or required-and-missing."""
     raw = request.headers.get("X-Gateway-Epoch")
     if raw is None or not str(raw).strip():
         if required:
@@ -92,6 +92,18 @@ def _parse_gateway_epoch(
     if val <= 0:
         raise StaleGatewayEpochError("Invalid X-Gateway-Epoch header")
     return val
+
+
+def _is_readonly_session_command(
+    *,
+    cmd: str | None,
+    message_id: str | None,
+    is_internal_query: bool = False,
+) -> bool:
+    """Server-authoritative check for read-only I-3 session queries (never trust `is_internal_query` alone)."""
+    cleaned_cmd = str(cmd or "").strip().lower()
+    cleaned_mid = str(message_id or "").strip()
+    return cleaned_cmd == "workspace_list" and not cleaned_mid and bool(is_internal_query)
 
 
 def _handle_structured_http_error(exc: HTTPException) -> JSONResponse:
@@ -830,7 +842,7 @@ async def internal_inbound_register_and_resolve_endpoint(
     )
     _reject_nested_company_user_ids(body.raw_payload)
     try:
-        epoch = _parse_gateway_epoch(request, required=True)
+        epoch = _parse_gateway_epoch(request, required=False)
         return await register_and_resolve_inbound(
             platform=body.platform,
             platform_user_id=body.platform_user_id,
@@ -870,7 +882,7 @@ async def internal_bind_code_consume_endpoint(
         getattr(body, "dalton_user_id", None),
     )
     try:
-        epoch = _parse_gateway_epoch(request, required=True)
+        epoch = _parse_gateway_epoch(request, required=False)
         return await consume_bind_code_or_unbind(
             action=body.action,
             platform=body.platform,
@@ -919,8 +931,13 @@ async def internal_session_command_endpoint(
             detail="dalton_user_id, X-User-Id, or platform_user_id is required",
         )
     try:
-        require_epoch = not bool(body.is_internal_query)
-        epoch = _parse_gateway_epoch(request, required=require_epoch)
+        is_readonly = _is_readonly_session_command(
+            cmd=body.cmd,
+            message_id=body.message_id,
+            is_internal_query=bool(body.is_internal_query),
+        )
+        require_epoch = not is_readonly
+        epoch = _parse_gateway_epoch(request, required=False)
         return await execute_session_command(
             cmd=body.cmd,
             platform=body.platform,
@@ -945,7 +962,7 @@ async def internal_session_command_endpoint(
             weixin_context_source=body.weixin_context_source,
             weixin_context_seq=body.weixin_context_seq,
             command_arg=body.command_arg,
-            is_internal_query=body.is_internal_query,
+            is_internal_query=is_readonly,
             native_interaction=body.native_interaction,
             native_ack_status=body.native_ack_status,
             native_reply_status=body.native_reply_status,
@@ -1029,7 +1046,7 @@ async def internal_deliveries_authorize_and_claim_endpoint(
         getattr(body, "dalton_user_id", None),
     )
     try:
-        epoch = _parse_gateway_epoch(request, required=True)
+        epoch = _parse_gateway_epoch(request, required=False)
         return await authorize_and_claim_delivery(
             delivery_key=body.delivery_key,
             kind=body.kind,
@@ -1068,7 +1085,7 @@ async def internal_deliveries_progress_endpoint(
         getattr(body, "dalton_user_id", None),
     )
     try:
-        epoch = _parse_gateway_epoch(request, required=True)
+        epoch = _parse_gateway_epoch(request, required=False)
         return await update_delivery_progress(
             delivery_key=body.delivery_key,
             sent_chunks=body.sent_chunks,
@@ -1117,7 +1134,7 @@ async def internal_inbound_progress_endpoint(
         body.raw_payload_patch,
     )
     try:
-        epoch = _parse_gateway_epoch(request, required=True)
+        epoch = _parse_gateway_epoch(request, required=False)
         return await update_inbound_progress(
             platform=body.platform,
             message_id=body.message_id,
@@ -1162,7 +1179,7 @@ async def internal_steers_reconcile_endpoint(
         getattr(body, "dalton_user_id", None),
     )
     try:
-        epoch = _parse_gateway_epoch(request, required=True)
+        epoch = _parse_gateway_epoch(request, required=False)
         return await reconcile_steer(
             platform=body.platform,
             message_id=body.message_id,
@@ -1186,7 +1203,7 @@ async def internal_recover_endpoint(
     """I-7 (4): Recover channel gateway state on `startup` or `watch_reconnect`."""
     _resolve_optional_internal_user_id(request)
     try:
-        epoch = _parse_gateway_epoch(request, required=True)
+        epoch = _parse_gateway_epoch(request, required=False)
         return await recover_channel_state(
             mode=mode,
             thread_id=thread_id,
@@ -1443,6 +1460,111 @@ async def _require_weixin_admin(user_id: str) -> str:
     return user_id
 
 
+_PUBLIC_WEIXIN_QR_ERROR_MAP: dict[str, tuple[int, str, dict[str, Any]]] = {
+    "session_revoked": (
+        409,
+        "登录会话已被撤销，请重新获取二维码。",
+        {"revoked": True, "need_rescan": True},
+    ),
+    "login_session_revoked": (
+        409,
+        "登录会话已被撤销，请重新获取二维码。",
+        {"revoked": True, "need_rescan": True},
+    ),
+    "session_expired": (
+        409,
+        "二维码已过期，请重新获取二维码。",
+        {"need_rescan": True},
+    ),
+    "qr_expired": (
+        409,
+        "二维码已过期，请重新获取二维码。",
+        {"need_rescan": True},
+    ),
+    "invalid_verify_code": (
+        400,
+        "验证码无效，请核对后重新输入。",
+        {},
+    ),
+    "verify_code_expired": (
+        409,
+        "验证码已过期，请重新扫码连接。",
+        {"need_rescan": True},
+    ),
+    "ilink_user_already_bound": (
+        409,
+        "该微信号已绑定其他团队成员账号，无法重复绑定。",
+        {},
+    ),
+    "weixin_capacity_full": (
+        409,
+        "团队微信并发连接数已达上限，请联系管理员处理。",
+        {},
+    ),
+    "weixin_channel_disabled": (
+        403,
+        "个人微信渠道当前已关闭。",
+        {},
+    ),
+    "external_access_disabled": (
+        403,
+        "管理员当前未向外部成员开放个人微信渠道。",
+        {},
+    ),
+    "member_not_in_roster": (
+        403,
+        "当前账号不在团队成员名册中，无法连接个人微信。",
+        {},
+    ),
+    "roster_lookup_error": (
+        503,
+        "成员名册查询暂时异常，请稍后重试。",
+        {},
+    ),
+    "stale_bot_generation": (
+        409,
+        "原连接已被其他扫码更新，请重新获取二维码。",
+        {"need_rescan": True},
+    ),
+    "stale_gateway_epoch": (
+        503,
+        "微信网关正在切换中，请稍后重试。",
+        {},
+    ),
+    "gateway_unreachable": (
+        503,
+        "微信网关暂时不可用，请稍后重试。",
+        {},
+    ),
+}
+
+
+def _build_public_weixin_qr_error(
+    raw_code: str | None,
+    upstream_status: int,
+) -> HTTPException:
+    """Build a fixed Chinese public QR error strictly from known error codes (never echo gateway `detail`)."""
+    cleaned_code = str(raw_code or "").strip().lower()
+    if cleaned_code in _PUBLIC_WEIXIN_QR_ERROR_MAP:
+        status_code, msg, extra = _PUBLIC_WEIXIN_QR_ERROR_MAP[cleaned_code]
+        return HTTPException(
+            status_code=status_code,
+            detail={
+                "code": cleaned_code,
+                "message": msg,
+                **extra,
+            },
+        )
+    safe_status = 503 if upstream_status >= 500 else (409 if upstream_status == 409 else 400)
+    return HTTPException(
+        status_code=safe_status,
+        detail={
+            "code": "weixin_qr_gateway_error",
+            "message": "微信扫码服务暂时异常，请稍后重试。",
+        },
+    )
+
+
 async def _proxy_to_gateway_weixin(
     method: str,
     subpath: str,
@@ -1456,10 +1578,7 @@ async def _proxy_to_gateway_weixin(
     require_capability(CapabilityId.CHANNEL_GATEWAY, CapabilityId.CHANNEL_WEIXIN)
     base_url = get_dalton_channel_gateway_url().strip().rstrip("/")
     if not base_url:
-        raise HTTPException(
-            status_code=503,
-            detail="Channel gateway URL is not configured",
-        )
+        raise _build_public_weixin_qr_error("gateway_unreachable", 503)
     token = (
         os.getenv("INTERNAL_SERVICE_TOKEN")
         or getattr(env, "INTERNAL_SERVICE_TOKEN", "")
@@ -1480,34 +1599,22 @@ async def _proxy_to_gateway_weixin(
                 json=json_body,
             )
     except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Channel gateway is unreachable: {redact_weixin_secrets(str(exc))}",
-        ) from exc
+        raise _build_public_weixin_qr_error("gateway_unreachable", 503) from exc
 
     if resp.status_code >= 400:
+        err_code: str | None = None
         try:
             err_data = resp.json()
-            if isinstance(err_data, dict) and "code" in err_data:
-                safe_err = {
-                    k: redact_weixin_secrets(v) if isinstance(v, str) else v
-                    for k, v in err_data.items()
-                    if k in ("code", "message", "detail", "revoked", "status", "need_rescan")
-                }
-                raise HTTPException(status_code=resp.status_code, detail=safe_err)
-            detail = (
-                err_data.get("detail")
-                or err_data.get("message")
-                or f"Gateway error ({resp.status_code})"
-            )
-        except HTTPException:
-            raise
+            if isinstance(err_data, dict):
+                if isinstance(err_data.get("code"), str):
+                    err_code = err_data["code"]
+                elif isinstance(err_data.get("detail"), dict) and isinstance(
+                    err_data["detail"].get("code"), str
+                ):
+                    err_code = err_data["detail"]["code"]
         except Exception:
-            detail = f"Gateway error ({resp.status_code})"
-        raise HTTPException(
-            status_code=resp.status_code,
-            detail=redact_weixin_secrets(str(detail)),
-        )
+            err_code = None
+        raise _build_public_weixin_qr_error(err_code, resp.status_code)
 
     return resp.json()
 
