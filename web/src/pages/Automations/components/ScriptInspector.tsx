@@ -58,7 +58,7 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
   if (runsForbidden || history.historyForbidden) {
     return (
       <article className="automation-inspector">
-        <p className="automations-quiet-note">{t('automation.detailForbidden')}</p>
+        <p className="automations-quiet-note">{t('automation:detailForbidden')}</p>
       </article>
     );
   }
@@ -66,34 +66,34 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
   return (
     <article className="automation-inspector">
       <div className="automations-kicker">
-        {t('automation.taskScript')}
+        {t('automation:taskScript')}
         {statusKey ? ` · ${t(statusKey)}` : script.status ? ` · ${script.status}` : ''}
       </div>
       <h2 className="title-font automation-inspector-title">{script.name}</h2>
       {deleted && <DeletedMeta deletedAt={script.deleted_at} deletedBy={script.deleted_by} />}
       <dl className="automation-details">
-        <dt>{t('automation.scriptStatus')}</dt>
+        <dt>{t('automation:scriptStatus')}</dt>
         <dd>{statusKey ? t(statusKey) : script.status}</dd>
-        <dt>{t('automation.scriptCron')}</dt>
+        <dt>{t('automation:scriptCron')}</dt>
         {/* DALTON-HOOK(ui-unify): render human-readable schedule and timezone name */}
         <dd title={script.cron_expression}>{cronToHuman(script.cron_expression, t, locale)}</dd>
-        <dt>{t('automation.scriptTimezone')}</dt>
+        <dt>{t('automation:scriptTimezone')}</dt>
         <dd title={script.timezone}>{formatTimezoneName(script.timezone, locale)}</dd>
         {script.next_run_at && (
           <>
-            <dt>{t('automation.scriptNextRun')}</dt>
+            <dt>{t('automation:scriptNextRun')}</dt>
             <dd>{formatDateTimeShort(script.next_run_at, locale)}</dd>
           </>
         )}
         {script.last_run_at && (
           <>
-            <dt>{t('automation.scriptLastRun')}</dt>
+            <dt>{t('automation:scriptLastRun')}</dt>
             <dd>{formatDateTimeShort(script.last_run_at, locale)}</dd>
           </>
         )}
         {configVersion != null && (
           <>
-            <dt>{t('automation.versionLabel')}</dt>
+            <dt>{t('automation:versionLabel')}</dt>
             <dd className="automation-mono">{configVersion}</dd>
           </>
         )}
@@ -107,7 +107,7 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
             disabled={busy || history.version == null}
             onClick={() => void history.restoreTask()}
           >
-            {busy ? t('automation.restoring') : t('automation.restoreTask')}
+            {busy ? t('automation:restoring') : t('automation:restoreTask')}
           </HeaderButton>
         </div>
       ) : (
@@ -122,7 +122,7 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
               if (id) pause.mutate(id);
             }}
           >
-            {t('automation.pause')}
+            {t('automation:pause')}
           </HeaderButton>
         )}
         {canResume && (
@@ -135,11 +135,11 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
               if (id) resume.mutate(id);
             }}
           >
-            {t('automation.resume')}
+            {t('automation:resume')}
           </HeaderButton>
         )}
         <HeaderButton variant="secondary" icon={Pencil} disabled={!versionReady} onClick={() => onEdit(script)}>
-          {t('automation.edit')}
+          {t('automation:edit')}
         </HeaderButton>
         {history.prevVersion != null && (
           <HeaderButton
@@ -148,7 +148,7 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
             disabled={busy || history.version == null}
             onClick={() => history.setRollbackOpen(true)}
           >
-            {t('automation.rollbackButton', { version: history.prevVersion })}
+            {t('automation:rollbackButton', { version: history.prevVersion })}
           </HeaderButton>
         )}
         <HeaderButton
@@ -158,7 +158,7 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
           disabled={busy || history.version == null}
           onClick={() => onDelete(script)}
         >
-          {t('automation.moveToRecycle')}
+          {t('automation:moveToRecycle')}
         </HeaderButton>
       </div>
       )}
@@ -175,11 +175,11 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
           />
         ) : (
         <>
-        {runId && !opened && !runs.isLoading && <p className="automations-quiet-note">{t('automation.runNotFound')}</p>}
+        {runId && !opened && !runs.isLoading && <p className="automations-quiet-note">{t('automation:runNotFound')}</p>}
         {runs.isLoading ? (
           <ListSkeleton rows={2} />
         ) : executions.length === 0 && !script.last_execution ? (
-          <p className="automations-quiet-note">{t('automation.noRunsForThis')}</p>
+          <p className="automations-quiet-note">{t('automation:noRunsForThis')}</p>
         ) : (
           <ul className="automation-details">
             {(executions.length > 0 ? executions : script.last_execution ? [script.last_execution] : []).map((run) => {
@@ -187,11 +187,11 @@ export default function ScriptInspector({ script, runId, configVersion, onEdit, 
               const deliveryLabel =
                 run.status === 'succeeded' && delivery
                   ? delivery.status === 'failed'
-                    ? t('automation.deliveryStatusFailed')
+                    ? t('automation:deliveryStatusFailed')
                     : delivery.status === 'partial_failed'
-                      ? t('automation.deliveryStatusPartialFailed')
+                      ? t('automation:deliveryStatusPartialFailed')
                       : delivery.status === 'retrying'
-                        ? t('automation.deliveryStatusRetrying')
+                        ? t('automation:deliveryStatusRetrying')
                         : null
                   : null;
               const deliveryReason =

@@ -65,7 +65,7 @@ export function DaltonOnboardingRedirect({ edit = false }: { edit?: boolean }) {
         toast({
           variant: 'destructive',
           title: t('common.error'),
-          description: t('dashboard.failedOnboarding'),
+          description: t('dashboard:failedOnboarding'),
         });
         navigate('/chat', { replace: true });
         return;

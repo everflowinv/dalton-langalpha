@@ -9,7 +9,7 @@ is ``user_models``.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace  # DALTON-HOOK(antigravity-series)
 from typing import TYPE_CHECKING, Any
 
 from ptc_agent.agent.roles import AgentRole
@@ -791,6 +791,59 @@ async def resolve_llm_config(
         )
         selection = select_model(config, model_pref, slot, request_model)
         apply_policy_to_roles(config, model_pref, selection, slot, policy=policy)
+        # DALTON-HOOK(antigravity-series): map an explicit turn reasoning_effort
+        # (e.g. from delegate_to_analyst) on a built-in Antigravity model to the
+        # closest allowed series variant (same series, step down then up) and
+        # enforce model policy + plan coverage before dropping raw effort.
+        if slot == "primary" and reasoning_effort is not None:
+            from src.dalton.llm.antigravity_series import (
+                ANTIGRAVITY_PROVIDER,
+                resolve_antigravity_effort_model,
+            )
+            from src.llms.llm import LLM as LLMFactory
+
+            _ag_mc = LLMFactory.get_model_config()
+            _ag_entry = (
+                _ag_mc.get_model_config(selection.effective_model)
+                if custom_model(model_pref, selection.effective_model) is None
+                else None
+            )
+            if isinstance(_ag_entry, dict) and _ag_entry.get("provider") == ANTIGRAVITY_PROVIDER:
+                _ag_mapped = resolve_antigravity_effort_model(
+                    selection.effective_model,
+                    reasoning_effort,
+                    model_config=_ag_mc,
+                    allowed_filter=lambda m: policy_refuses(policy, model_pref, m) is None,
+                )
+                if _ag_mapped is not None:
+                    _ag_target = _ag_mapped[0]
+                    if _ag_target != selection.effective_model:
+                        if _ag_target not in plan_exempt_models(base_config.llm, slot):
+                            _ag_covered = await plan_covers(
+                                user_id,
+                                _ag_target,
+                                model_pref=model_pref,
+                                permits=permits,
+                                is_byok=is_byok,
+                                byok_cache={},
+                            )
+                            if _ag_covered is None:
+                                from src.server.services.platform_client import (
+                                    quota_service_unavailable,
+                                )
+
+                                raise quota_service_unavailable()
+                            if not _ag_covered:
+                                raise_model_not_on_plan(_ag_target)
+                        selection = replace(selection, effective_model=_ag_target)
+                        if config.llm is not None:
+                            config.llm.name = _ag_target
+                            config.llm_client = None
+                if rule := policy_refuses(policy, model_pref, selection.effective_model):
+                    if rule == MODELS_ALLOWED:
+                        raise_no_model_allowed(policy, selection.effective_model)
+                    raise_model_denied(policy, rule, selection.effective_model)
+                reasoning_effort = None
         if shared and is_claude_code_model(selection.effective_model):
             # Its session files would be laid out on a member's own computer.
             raise HTTPException(
@@ -864,8 +917,15 @@ async def resolve_llm_config(
     )
 
     # Only a PTC build compiles subagents, so only it builds their clients.
+    # DALTON-HOOK(antigravity-series): forward policy so mapped Antigravity variants respect models.allowed.
     roles = (
-        subagent_roles(turn_roster(config.subagents), model_pref, selection.effective_model, role=role)
+        subagent_roles(
+            turn_roster(config.subagents),
+            model_pref,
+            selection.effective_model,
+            role=role,
+            policy=policy,
+        )
         if slot == "primary"
         else []
     )
@@ -900,11 +960,13 @@ async def resolve_llm_config(
         config.subagent_models = subagent_models(
             config, model_pref, selection.effective_model, role=role,
         )
+        # DALTON-HOOK(antigravity-series): pass policy to TaskModelGate for final variant admission.
         config.task_models = TaskModelGate(
             config, user_id=user_id, workspace_id=workspace_id, thread_id=thread_id,
             model_pref=model_pref, permits=permits, is_byok=is_byok,
             turn_model=selection.effective_model,
             plan_exempt=plan_exempt_models(base_config.llm, "primary"),
+            policy=policy,
         )
 
     return config

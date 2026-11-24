@@ -263,16 +263,16 @@ export function ModelsPanel() {
     if (Array.isArray(val)) {
       const items = val.map((m) => m.trim()).filter(Boolean);
       return items.length > 0
-        ? t('settings.modelTuning.daltonEmptyDefault', { value: items.join(', ') })
-        : t('settings.modelTuning.daltonEmptyDefaultUnset');
+        ? t('settings:modelTuning.daltonEmptyDefault', { value: items.join(', ') })
+        : t('settings:modelTuning.daltonEmptyDefaultUnset');
     }
     if (typeof val === 'number' && Number.isFinite(val)) {
-      return t('settings.modelTuning.daltonEmptyDefault', { value: String(val) });
+      return t('settings:modelTuning.daltonEmptyDefault', { value: String(val) });
     }
     if (typeof val === 'string' && val.trim().length > 0) {
-      return t('settings.modelTuning.daltonEmptyDefault', { value: val.trim() });
+      return t('settings:modelTuning.daltonEmptyDefault', { value: val.trim() });
     }
-    return t('settings.modelTuning.daltonEmptyDefaultUnset');
+    return t('settings:modelTuning.daltonEmptyDefaultUnset');
   };
 
   // DALTON-HOOK(settings-section): Dalton pickers only offer system catalog models (exclude custom_models)
@@ -318,7 +318,7 @@ export function ModelsPanel() {
       }
       const parsed = Number(trimmed);
       if (!Number.isInteger(parsed) || parsed < 60 || parsed > 1800) {
-        setAuditTimeoutError(t('settings.modelTuning.daltonAuditTimeoutError'));
+        setAuditTimeoutError(t('settings:modelTuning.daltonAuditTimeoutError'));
         return;
       }
       setAuditTimeoutError(null);
@@ -407,8 +407,8 @@ export function ModelsPanel() {
     <>
       {/* DALTON-HOOK(settings-reorg): hold skeleton while credential scope resolves; keep personal access on error/shared */}
       <SettingsGroup
-        title={t(usePersonalAccessScope ? 'settings.modelAccess.personalTitle' : SETTINGS.modelAccess.labelKey)}
-        description={usePersonalAccessScope ? t('settings.modelAccess.personalDesc') : undefined}
+        title={t(usePersonalAccessScope ? 'settings:modelAccess.personalTitle' : SETTINGS.modelAccess.labelKey)}
+        description={usePersonalAccessScope ? t('settings:modelAccess.personalDesc') : undefined}
       >
         <SettingsCardBody id={SETTINGS.modelAccess.anchor}>
           {accessPending ? (
@@ -453,9 +453,9 @@ export function ModelsPanel() {
             value={defaultModelScope}
             onChange={(e) => write({ default_model_scope: e.target.value as DefaultModelScope })}
           >
-            <option value="ask">{t('settings.defaultModelChange.scopeAsk')}</option>
-            <option value="new_threads">{t('settings.defaultModelChange.newThreads')}</option>
-            <option value="existing_threads">{t('settings.defaultModelChange.scopeExistingThreads')}</option>
+            <option value="ask">{t('settings:defaultModelChange.scopeAsk')}</option>
+            <option value="new_threads">{t('settings:defaultModelChange.newThreads')}</option>
+            <option value="existing_threads">{t('settings:defaultModelChange.scopeExistingThreads')}</option>
           </Select>
         </SettingRow>
       </SettingsGroup>
@@ -488,7 +488,7 @@ export function ModelsPanel() {
                     // the box ends at the chip's edge, off the next chip and Add.
                     className="tap-target ml-0.5 hover:opacity-70 [--tap-target-h:32px] [--tap-target-x:-9.5px]"
                     style={{ color: 'var(--color-text-tertiary)' }}
-                    aria-label={t('settings.removeModel', { model: label(key) })}
+                    aria-label={t('settings:removeModel', { model: label(key) })}
                   >
                     &times;
                   </button>
@@ -504,7 +504,7 @@ export function ModelsPanel() {
                   color: 'var(--color-text-secondary)',
                 }}
               >
-                + {t('settings.addModels', 'Add')}
+                + {t('settings:addModels', 'Add')}
               </button>
             </div>
 
@@ -634,8 +634,8 @@ export function ModelsPanel() {
             {/* DALTON-HOOK(antigravity-series): pass seriesCatalog, missingLabel & series pickers to Routing controls */}
             <SettingsCardBody id={SETTINGS.routing.anchor} className="flex flex-col gap-4">
               <ModelSelector
-                label={t('settings.modelTuning.fetchModel')}
-                description={t('settings.modelTuning.fetchModelDesc')}
+                label={t('settings:modelTuning.fetchModel')}
+                description={t('settings:modelTuning.fetchModelDesc')}
                 value={mPref.fetch_model ?? ''}
                 onChange={(v) => write({ fetch_model: v || null })}
                 models={slotModels}
@@ -649,8 +649,8 @@ export function ModelsPanel() {
                 customModels={customModels}
               />
               <ModelSelector
-                label={t('settings.modelTuning.compactionModel')}
-                description={t('settings.modelTuning.compactionModelDesc')}
+                label={t('settings:modelTuning.compactionModel')}
+                description={t('settings:modelTuning.compactionModelDesc')}
                 value={mPref.compaction_model ?? ''}
                 onChange={(v) => write({
                   compaction_model: v || null,
@@ -673,7 +673,7 @@ export function ModelsPanel() {
                   the rest of it rather than as a routing slot here. */}
               <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
                 <Trans
-                  i18nKey="settings.modelTuning.subagentsLink"
+                  i18nKey="settings:modelTuning.subagentsLink"
                   components={{
                     pane: (
                       <Link
@@ -696,23 +696,23 @@ export function ModelsPanel() {
                 customModels={customModels}
                 skipped={{
                   models: deploymentOnlyFallbacks,
-                  reason: t(isPlatformMode ? 'settings.payerOrder.skipped' : 'settings.payerOrder.skippedSelfHosted'),
+                  reason: t(isPlatformMode ? 'settings:payerOrder.skipped' : 'settings:payerOrder.skippedSelfHosted'),
                 }}
               />
               {savedCrossesPayer && (
                 <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                  {t('settings.payerOrder.savedNote')}
+                  {t('settings:payerOrder.savedNote')}
                 </p>
               )}
               {deploymentOnlyFallbacks.size > 0 && (
                 <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-                  {t('settings.payerOrder.skippedNote')}{' '}
+                  {t('settings:payerOrder.skippedNote')}{' '}
                   <button
                     type="button"
                     onClick={() => write({ fallback_models: fallbackModels })}
                     className="underline underline-offset-2 hover:text-[var(--color-text-primary)]"
                   >
-                    {t('settings.payerOrder.useAlways')}
+                    {t('settings:payerOrder.useAlways')}
                   </button>
                 </p>
               )}
@@ -722,8 +722,8 @@ export function ModelsPanel() {
           {/* DALTON-HOOK(settings-reorg): collapsed-by-default group combining per-model tuning, compaction profile, and background task models */}
           <SettingsGroup
             id={SETTINGS.daltonRouting.anchor}
-            title={t('settings.modelTuning.daltonHeading')}
-            description={t('settings.modelTuning.daltonRoutingDesc')}
+            title={t('settings:modelTuning.daltonHeading')}
+            description={t('settings:modelTuning.daltonRoutingDesc')}
             action={
               <Button
                 type="button"
@@ -742,8 +742,8 @@ export function ModelsPanel() {
                 <span>
                   {t(
                     daltonRoutingOpen
-                      ? 'settings.modelTuning.collapseGroup'
-                      : 'settings.modelTuning.expandGroup',
+                      ? 'settings:modelTuning.collapseGroup'
+                      : 'settings:modelTuning.expandGroup',
                   )}
                 </span>
               </Button>
@@ -787,8 +787,8 @@ export function ModelsPanel() {
                 </div>
                 <div id={SETTINGS.daltonAuditModel.anchor}>
                   <ModelSelector
-                    label={t('settings.modelTuning.daltonAuditModel')}
-                    description={`${t('settings.modelTuning.daltonAuditModelDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_audit_model)}`}
+                    label={t('settings:modelTuning.daltonAuditModel')}
+                    description={`${t('settings:modelTuning.daltonAuditModelDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_audit_model)}`}
                     value={daltonAuditModel}
                     onChange={(v) => write({ dalton_audit_model: v || null })}
                     models={daltonSystemModels}
@@ -803,8 +803,8 @@ export function ModelsPanel() {
                 </div>
                 <div id={SETTINGS.daltonLanguageModel.anchor}>
                   <ModelSelector
-                    label={t('settings.modelTuning.daltonLanguageModel')}
-                    description={`${t('settings.modelTuning.daltonLanguageModelDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_language_model)}`}
+                    label={t('settings:modelTuning.daltonLanguageModel')}
+                    description={`${t('settings:modelTuning.daltonLanguageModelDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_language_model)}`}
                     value={daltonLanguageModel}
                     onChange={(v) => write({ dalton_language_model: v || null })}
                     models={daltonSystemModels}
@@ -819,8 +819,8 @@ export function ModelsPanel() {
                 </div>
                 <div id={SETTINGS.daltonAuditFallbackModels.anchor}>
                   <FallbackModelsPicker
-                    label={t('settings.modelTuning.daltonAuditFallbackModels')}
-                    description={`${t('settings.modelTuning.daltonAuditFallbackModelsDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_audit_fallback_models)}`}
+                    label={t('settings:modelTuning.daltonAuditFallbackModels')}
+                    description={`${t('settings:modelTuning.daltonAuditFallbackModelsDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_audit_fallback_models)}`}
                     selected={daltonAuditFallback}
                     onChange={(list) => write({ dalton_audit_fallback_models: list.length > 0 ? list : null })}
                     models={daltonSystemModels}
@@ -837,10 +837,10 @@ export function ModelsPanel() {
                     className="text-sm font-medium"
                     style={{ color: 'var(--color-text-primary)' }}
                   >
-                    {t('settings.modelTuning.daltonAuditTimeoutS')}
+                    {t('settings:modelTuning.daltonAuditTimeoutS')}
                   </label>
                   <p className="text-xs leading-relaxed" style={{ color: 'var(--color-text-tertiary)' }}>
-                    {`${t('settings.modelTuning.daltonAuditTimeoutSDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_audit_timeout_s ?? 300)}`}
+                    {`${t('settings:modelTuning.daltonAuditTimeoutSDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_audit_timeout_s ?? 300)}`}
                   </p>
                   {/* DALTON-HOOK(settings-reorg): background audit timeout & model inputs */}
                   <Input
@@ -874,8 +874,8 @@ export function ModelsPanel() {
                 {/* DALTON-HOOK(antigravity-series): pass seriesCatalog & missingLabel to Dalton assist/reviewer/extract selectors */}
                 <div id={SETTINGS.daltonAssistModel.anchor}>
                   <ModelSelector
-                    label={t('settings.modelTuning.daltonAssistModel')}
-                    description={`${t('settings.modelTuning.daltonAssistModelDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_assist_model)}`}
+                    label={t('settings:modelTuning.daltonAssistModel')}
+                    description={`${t('settings:modelTuning.daltonAssistModelDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_assist_model)}`}
                     value={daltonAssistModel}
                     onChange={(v) => write({ dalton_assist_model: v || null })}
                     models={daltonSystemModels}
@@ -891,8 +891,8 @@ export function ModelsPanel() {
                 {/* DALTON-HOOK(settings-reorg): keep remaining background-task model pickers hooked */}
                 <div id={SETTINGS.daltonAssistFallbackModels.anchor}>
                   <FallbackModelsPicker
-                    label={t('settings.modelTuning.daltonAssistFallbackModels')}
-                    description={`${t('settings.modelTuning.daltonAssistFallbackModelsDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_assist_fallback_models)}`}
+                    label={t('settings:modelTuning.daltonAssistFallbackModels')}
+                    description={`${t('settings:modelTuning.daltonAssistFallbackModelsDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_assist_fallback_models)}`}
                     selected={daltonAssistFallback}
                     onChange={(list) => write({ dalton_assist_fallback_models: list.length > 0 ? list : null })}
                     models={daltonSystemModels}
@@ -905,8 +905,8 @@ export function ModelsPanel() {
                 </div>
                 <div id={SETTINGS.daltonReviewerModels.anchor}>
                   <FallbackModelsPicker
-                    label={t('settings.modelTuning.daltonReviewerModels')}
-                    description={`${t('settings.modelTuning.daltonReviewerModelsDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_reviewer_models)}`}
+                    label={t('settings:modelTuning.daltonReviewerModels')}
+                    description={`${t('settings:modelTuning.daltonReviewerModelsDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_reviewer_models)}`}
                     selected={daltonReviewerModels}
                     onChange={(list) => write({ dalton_reviewer_models: list.length > 0 ? list : null })}
                     models={daltonSystemModels}
@@ -922,8 +922,8 @@ export function ModelsPanel() {
                 {hasCapability('conversation_archive') && (
                   <div id={SETTINGS.daltonExtractModel.anchor}>
                     <ModelSelector
-                      label={t('settings.modelTuning.daltonExtractModel')}
-                      description={`${t('settings.modelTuning.daltonExtractModelDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_extract_model)}`}
+                      label={t('settings:modelTuning.daltonExtractModel')}
+                      description={`${t('settings:modelTuning.daltonExtractModelDesc')} ${daltonDefaultHint(hookSystemDefaults?.dalton_extract_model)}`}
                       value={daltonExtractModel}
                       onChange={(v) => write({ dalton_extract_model: v || null })}
                       models={daltonSystemModels}

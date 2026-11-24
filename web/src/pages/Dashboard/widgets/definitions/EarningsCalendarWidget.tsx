@@ -41,11 +41,11 @@ interface EarningsEntry {
 type BucketKey = 'today' | 'tomorrow' | 'week' | 'next' | 'later';
 
 const BUCKET_KEY: Record<BucketKey, string> = {
-  today: 'dashboard.widgets.earningsCalendar.bucket_today',
-  tomorrow: 'dashboard.widgets.earningsCalendar.bucket_tomorrow',
-  week: 'dashboard.widgets.earningsCalendar.bucket_thisWeek',
-  next: 'dashboard.widgets.earningsCalendar.bucket_nextWeek',
-  later: 'dashboard.widgets.earningsCalendar.bucket_later',
+  today: 'dashboard:widgets.earningsCalendar.bucket_today',
+  tomorrow: 'dashboard:widgets.earningsCalendar.bucket_tomorrow',
+  week: 'dashboard:widgets.earningsCalendar.bucket_thisWeek',
+  next: 'dashboard:widgets.earningsCalendar.bucket_nextWeek',
+  later: 'dashboard:widgets.earningsCalendar.bucket_later',
 };
 
 const WINDOW_DAYS: Record<NonNullable<EarningsConfig['window']>, number> = {
@@ -135,9 +135,9 @@ function EarningsRow({
   const label = showDate
     ? shortMonthDay(toDate(item.date), locale)
     : raw === 'Today'
-      ? t('dashboard.widgets.earningsCalendar.bucket_today')
+      ? t('dashboard:widgets.earningsCalendar.bucket_today')
       : raw === 'Tomorrow'
-        ? t('dashboard.widgets.earningsCalendar.bucket_tomorrow')
+        ? t('dashboard:widgets.earningsCalendar.bucket_tomorrow')
         : raw;
   const session = sessionOf(item);
   const eps = epsOf(item);
@@ -157,7 +157,7 @@ function EarningsRow({
         <RowAttachButton instanceId={instanceId} rowId={`${item.symbol}-${item.date}`} />
       </td>
       <td className="term-num term-t2">
-        {eps != null ? t('dashboard.widgets.earningsCalendar.estEps', { value: formatMoney(eps, 'USD', locale) }) : ''}
+        {eps != null ? t('dashboard:widgets.earningsCalendar.estEps', { value: formatMoney(eps, 'USD', locale) }) : ''}
       </td>
     </tr>
   );
@@ -291,7 +291,7 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
           };
       if (next90On) {
         if (next90Items.length > 0) {
-          sections.push(`### ${t('dashboard.earningsCalendarCard.next90Days')} (${next90Items.length})`, '', serializeEarningsToMarkdown(next90Items), '');
+          sections.push(`### ${t('dashboard:earningsCalendarCard.next90Days')} (${next90Items.length})`, '', serializeEarningsToMarkdown(next90Items), '');
         }
       } else {
         (Object.keys(grouped) as BucketKey[]).forEach((b) => {
@@ -311,7 +311,7 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
       return {
         widget_type: 'calendar.earnings',
         widget_id: instance.id,
-        label: `${t('dashboard.widgets.earningsCalendar.title')} · ${exportRows.length}`,
+        label: `${t('dashboard:widgets.earningsCalendar.title')} · ${exportRows.length}`,
         description: `next ${exportWindowDays}d`,
         captured_at: new Date().toISOString(),
         text,
@@ -337,7 +337,7 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
         widget_type: 'calendar.earnings/row',
         widget_id: `${instance.id}/${rowId}`,
         label: `${item.symbol} · ${item.date}`,
-        description: t('dashboard.widgets.earningsCalendar.title'),
+        description: t('dashboard:widgets.earningsCalendar.title'),
         captured_at: new Date().toISOString(),
         text,
         data: { row: { symbol: item.symbol, date: item.date, companyName: item.companyName, session, epsEstimated: eps } },
@@ -349,7 +349,7 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
     <div className="widget-term dash-fill">
       <WidgetCardMeta>
         {!(loading && shownRows.length === 0) && <span>{shownRows.length}</span>}
-        {!next90 && <span>{t('dashboard.widgets.earningsCalendar.windowLabel', { days: windowDays })}</span>}
+        {!next90 && <span>{t('dashboard:widgets.earningsCalendar.windowLabel', { days: windowDays })}</span>}
       </WidgetCardMeta>
       {/* DALTON-HOOK(user-coverage): scope tabs ("mine" / "all market") and 90-day toggle */}
       <div className="dash-chips widget-drag-cancel">
@@ -361,7 +361,7 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
             aria-pressed={next90}
             className="dash-range ml-auto"
           >
-            {t('dashboard.earningsCalendarCard.next90Days')}
+            {t('dashboard:earningsCalendarCard.next90Days')}
           </button>
         )}
       </div>
@@ -392,11 +392,11 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
                   no coverage rows, the market window simply has none. */}
               <span>
                 {scope === 'mine'
-                  ? t('dashboard.earningsCalendarCard.emptyData')
-                  : t('dashboard.widgets.earningsCalendar.empty')}
+                  ? t('dashboard:earningsCalendarCard.emptyData')
+                  : t('dashboard:widgets.earningsCalendar.empty')}
               </span>
               {scope !== 'mine' && (
-                <span>{t('dashboard.widgets.earningsCalendar.emptyHint', { days: windowDays })}</span>
+                <span>{t('dashboard:widgets.earningsCalendar.emptyHint', { days: windowDays })}</span>
               )}
             </div>
           ) : (
@@ -429,9 +429,9 @@ function EarningsCalendarWidget({ instance }: WidgetRenderProps<EarningsConfig>)
 
 registerWidget<EarningsConfig>({
   type: 'calendar.earnings',
-  titleKey: 'dashboard.widgets.earningsCalendar.title',
-  cardTitleKey: 'dashboard.widgets.earningsCalendar.header',
-  descriptionKey: 'dashboard.widgets.earningsCalendar.description',
+  titleKey: 'dashboard:widgets.earningsCalendar.title',
+  cardTitleKey: 'dashboard:widgets.earningsCalendar.header',
+  descriptionKey: 'dashboard:widgets.earningsCalendar.description',
   category: 'intel',
   icon: CalendarDays,
   component: EarningsCalendarWidget,

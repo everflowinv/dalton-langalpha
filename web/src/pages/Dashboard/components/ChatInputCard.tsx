@@ -32,10 +32,10 @@ function ChatInputCard() {
 
   const SUGGESTION_CHIPS = useMemo<string[]>(
     () => [
-      t('dashboard.chatInputCard.suggestion1'),
-      t('dashboard.chatInputCard.suggestion2'),
-      t('dashboard.chatInputCard.suggestion3'),
-      t('dashboard.chatInputCard.suggestion4'),
+      t('dashboard:chatInputCard.suggestion1'),
+      t('dashboard:chatInputCard.suggestion2'),
+      t('dashboard:chatInputCard.suggestion3'),
+      t('dashboard:chatInputCard.suggestion4'),
     ],
     [t],
   );
@@ -80,7 +80,7 @@ function ChatInputCard() {
             workspaces={workspaces}
             selectedWorkspaceId={selectedWorkspaceId}
             onWorkspaceChange={setSelectedWorkspaceId}
-            placeholder={t('dashboard.chatInputCard.placeholderMobile')}
+            placeholder={t('dashboard:chatInputCard.placeholderMobile')}
             minRows={2}
           />
         </div>
@@ -134,7 +134,7 @@ function ChatInputCard() {
             workspaces={workspaces}
             selectedWorkspaceId={selectedWorkspaceId}
             onWorkspaceChange={setSelectedWorkspaceId}
-            placeholder={t('dashboard.chatInputCard.placeholderDesktop')}
+            placeholder={t('dashboard:chatInputCard.placeholderDesktop')}
             minRows={2}
           />
         </div>

@@ -32,7 +32,7 @@ interface PreviewCrumbsProps {
  */
 export function PreviewCrumbs({ entry, onRefresh, refreshDisabled = false, workspaceId = null, threadId = null, readOnly = false }: PreviewCrumbsProps): React.ReactElement {
   const { t } = useTranslation();
-  const name = entry.title || t('filePanel.previewTab');
+  const name = entry.title || t('filePanel:previewTab');
 
   // An app's link is private, so minting it on open costs nothing and
   // lets the copy, or the tab it opens, land inside the click.
@@ -64,8 +64,8 @@ export function PreviewCrumbs({ entry, onRefresh, refreshDisabled = false, works
           type="button"
           onClick={() => void copyLink()}
           className="file-panel-icon-btn shrink-0"
-          title={t('filePanel.copyPrivateLink')}
-          aria-label={t('filePanel.copyPrivateLink')}
+          title={t('filePanel:copyPrivateLink')}
+          aria-label={t('filePanel:copyPrivateLink')}
           disabled={!link}
         >
           {copied
@@ -79,8 +79,8 @@ export function PreviewCrumbs({ entry, onRefresh, refreshDisabled = false, works
         type="button"
         onClick={refreshDisabled ? undefined : onRefresh}
         className="file-panel-icon-btn shrink-0"
-        title={t('filePanel.reloadApp')}
-        aria-label={t('filePanel.reloadApp')}
+        title={t('filePanel:reloadApp')}
+        aria-label={t('filePanel:reloadApp')}
         disabled={entry.loading || refreshDisabled}
       >
         {entry.loading ? <Loader size={14} className="text-current" /> : <RefreshCw className="h-3.5 w-3.5" />}
@@ -91,8 +91,8 @@ export function PreviewCrumbs({ entry, onRefresh, refreshDisabled = false, works
         type="button"
         onClick={() => link && window.open(shareLinkHref(link.code, entry.path ?? '/'), '_blank', 'noopener,noreferrer')}
         className="file-panel-icon-btn shrink-0"
-        title={t('filePanel.openInBrowser')}
-        aria-label={t('filePanel.openInBrowser')}
+        title={t('filePanel:openInBrowser')}
+        aria-label={t('filePanel:openInBrowser')}
         disabled={!link}
       >
         <ExternalLink className="h-3.5 w-3.5" />

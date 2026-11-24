@@ -77,7 +77,7 @@ export default function ScriptScheduleForm({
     <form onSubmit={handleSubmit} className="automation-form">
       {notice}
       <div className="automation-form-rows">
-        <FormRow label={t('automation.scriptCron')} labelId={labelId}>
+        <FormRow label={t('automation:scriptCron')} labelId={labelId}>
           <div className="automation-form-trigger">
             <CronScheduleBuilder
               value={cron}
@@ -94,7 +94,7 @@ export default function ScriptScheduleForm({
           disabled={loading || submitDisabled || !dirty}
           style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
         >
-          {loading ? t('common.saving') : submitLabel ?? t('automation.saveChanges')}
+          {loading ? t('common.saving') : submitLabel ?? t('automation:saveChanges')}
         </Button>
         <Button type="button" variant="ghost" onClick={onCancel}>
           {t('common.cancel')}

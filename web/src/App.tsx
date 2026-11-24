@@ -14,7 +14,7 @@ import { useAuth } from './contexts/AuthContext';
 import { useIsMobile } from './hooks/useIsMobile';
 import { useSyncAppearance } from './hooks/useAppearance';
 import { useLocale } from './hooks/useLocale';
-import { useOnboardingRoute } from './hooks/useOnboardingRoute';
+import { useShellOnboardingRoute } from './hooks/useOnboardingRoute';
 import { setupSkipped } from './hooks/useSetupGate';
 import { shellTarget } from './pages/Setup/answers/gate';
 import { canAddThisMac, isDesktopShell } from './lib/desktop';
@@ -44,6 +44,7 @@ import { CommandPaletteProvider } from './components/CommandPalette/CommandPalet
 import { CreateWorkspaceHost } from './components/CreateWorkspaceHost';
 import { DesktopMenuCommands } from './lib/desktopMenuCommands/DesktopMenuCommands';
 import { setSentryUser } from './lib/sentry';
+import { withCopy } from '@/i18n';
 import './App.css';
 
 // Login carries the market-tape canvas subsystem (~2k lines that only a
@@ -55,25 +56,34 @@ const LoginPage = React.lazy(() => import('./pages/Login/LoginPage'));
 // The public share route reuses the chat transcript renderer, so a static import
 // pulled the whole ChatAgent tree — plus the markdown and chart vendors it reaches
 // — into the entry chunk that every visitor loads before login.
-const SharePage = lazyWithMotion(() => import('./pages/SharedChat/SharePage'));
-const SetupWizard = lazyWithMotion(() => import('./pages/Setup/SetupWizard'));
+const SharePage = lazyWithMotion(withCopy(() => import('./pages/SharedChat/SharePage'), ['marketView']));
+const SetupWizard = lazyWithMotion(withCopy(() => import('./pages/Setup/SetupWizard'), ['setup']));
 // The welcome flow renders in place of the whole app layout, so it is the
 // shell's to load rather than one of Main's routes.
-const Welcome = lazyWithMotion(() => import('./pages/Onboarding/welcome/Welcome'));
+const Welcome = lazyWithMotion(withCopy(() => import('./pages/Onboarding/welcome/Welcome'), [
+  'dashboard', 'filePanel', 'mcp', 'plugins', 'settings',
+]));
 const Legal = React.lazy(() => import('./pages/Legal/Legal'));
 // The desktop shell's menu bar panel, loaded only in that window.
-const DesktopMenubar = React.lazy(() => import('./pages/DesktopMenubar/MenubarPage'));
+const DesktopMenubar = React.lazy(withCopy(() => import('./pages/DesktopMenubar/MenubarPage'), [
+  'marketView', 'settings',
+]));
 const ResetPassword = React.lazy(() => import('./pages/Login/ResetPassword'));
 // DALTON-HOOK(invite-signup): public invite redemption page (/invite#<token>)
 const InviteRedeemPage = React.lazy(() => import('./lib/dalton/InviteRedeemPage'));
 // DALTON-HOOK(monitors): anonymous read-only viewer route for public monitors (/m/:slug)
-const PublicMonitorPage = React.lazy(() => import('./pages/Monitors/PublicMonitorPage'));
+const PublicMonitorPage = React.lazy(withCopy(() => import('./pages/Monitors/PublicMonitorPage'), ['marketView', 'mcp', 'monitors']));
 // DALTON-HOOK(standalone-core): first-admin bootstrap route (/setup/admin) in local auth mode
 const AdminBootstrapStep = React.lazy(() => import('./pages/Setup/AdminBootstrapStep'));
 import { isDaltonLocalAuth } from './config/daltonAuth';
 // DALTON-HOOK(hide-trading): Dalton builds redirect /welcome onto the Chief of Staff interview
 import { isDaltonBuild } from './config/brand';
-import { DaltonOnboardingRedirect } from './pages/Onboarding/dalton/interview';
+const DaltonOnboardingRedirect = React.lazy(
+  withCopy(
+    () => import('./pages/Onboarding/dalton/interview').then((m) => ({ default: m.DaltonOnboardingRedirect })),
+    ['dashboard'],
+  ),
+);
 
 /** How long a callback may sit holding neither a session nor a stated reason
  *  before it is called a failure. What it waits on is the `?code=` exchange the
@@ -250,7 +260,7 @@ function AuthenticatedShell() {
   const location = useLocation();
   const onWelcome = location.pathname === WELCOME_PATH;
   const hideTabBar = isMobile && location.pathname.startsWith('/chat/t/');
-  const onboarding = useOnboardingRoute();
+  const onboarding = useShellOnboardingRoute();
 
   // A new build is taken on a switch between sections, never inside one: chat
   // keeps every thread it has opened mounted, with its unsent message, while
@@ -297,9 +307,9 @@ function AuthenticatedShell() {
     if (window.location.pathname === WELCOME_PATH && !isDaltonBuild) {
       void Welcome.preload().catch(() => {});
     } else {
-      preloadRouteChunk(window.location.pathname);
+      preloadRouteChunk(window.location.pathname, queryClient);
     }
-  }, []);
+  }, [queryClient]);
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     try {
@@ -390,7 +400,7 @@ function AuthenticatedShell() {
       <ThreadLifecycleFeed />
       {/* One prompt at a time: the agent's command requests first, then vendor terms. */}
       <CliApprovalHost fallback={(held) => <VendorTermsHost held={held} />} />
-      <WarmHome setupRunning={onboarding.kind === 'answers'} />
+      <WarmHome />
       {onWelcome ? (
         // Full screen and none of the app's chrome: the flow is the page.
         // The hosts below stay, since a brokerage connect it starts asks for
@@ -400,7 +410,9 @@ function AuthenticatedShell() {
         // Chief of Staff interview in Home instead; `?edit=1` reviews the
         // saved preferences.
         isDaltonBuild ? (
-          <DaltonOnboardingRedirect edit={location.search.includes('edit=1')} />
+          <Suspense fallback={<PageLoading />}>
+            <DaltonOnboardingRedirect edit={location.search.includes('edit=1')} />
+          </Suspense>
         ) : (
           <Suspense fallback={<PageLoading />}>
             <StaleBuildBoundary>

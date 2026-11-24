@@ -11,6 +11,7 @@ from fastapi import Depends, Header, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from src.config.settings import get_sse_keepalive_interval
+from src.llms.model_identity import client_effort
 from src.server.utils.api import (
     CurrentUserId,
     database_unavailable,
@@ -1003,6 +1004,8 @@ async def _handle_send_message(
         user_id=user_id,
         workspace_id=workspace_id,
         model=_model,
+        effort=client_effort(getattr(config, "llm_client", None)),
+        # DALTON-HOOK(chat-large-upload): release preclaimed uploads if priming exits early
         upload_claim_key=upload_claim_key,
     )
 
@@ -1017,12 +1020,14 @@ async def _prime_dispatch(
     user_id: str,
     workspace_id: str,
     model: str,
+    effort: str | None = None,
     # DALTON-HOOK(chat-large-upload): release preclaimed uploads if priming exits before entering gen
     upload_claim_key: str | None = None,
 ) -> JSONResponse:
-    """Drive a background dispatch's turn to its START, answer with the run
-    and the workspace the turn resolved to, then drain ``gen`` in the
-    background.
+    """Drive a background dispatch's turn to its START, answer with the run,
+    the workspace, the model and the level it sends that the turn resolved
+    to (None for a model with no levels: the ladder may have stepped a named
+    effort down), then drain ``gen`` in the background.
 
     Every exit that does not hand ``gen`` to that drain releases ``scope``'s
     slot.
@@ -1257,6 +1262,8 @@ async def _prime_dispatch(
         "thread_id": thread_id,
         "run_id": run_id,
         "workspace_id": workspace_id,
+        "llm_model": model,
+        "reasoning_effort": effort,
     })
 
 

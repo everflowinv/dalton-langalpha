@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/api/client';
-import zhCatalog from '@/locales/zh-CN.json';
+import zhSettings from '@/locales/settings/zh-CN.json';
 import {
   CHANNEL_BINDINGS_MAX_WAIT_MS,
   CHANNEL_BINDINGS_POLL_MS,
@@ -302,6 +302,6 @@ describe('DaltonChannelBindingsCard', () => {
     expect(integrations).toContain('DaltonWeixinBindCard');
     expect(integrations).toContain('DaltonNotifyTargetsCard');
     expect(models).not.toContain('DaltonSection');
-    expect(zhCatalog.settings.dalton.channelBindingsLabel).toBe('飞书与 Discord 账号绑定');
+    expect(zhSettings.dalton.channelBindingsLabel).toBe('飞书与 Discord 账号绑定');
   });
 });

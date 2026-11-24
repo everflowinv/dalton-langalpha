@@ -13,6 +13,7 @@ import PasswordInput from './PasswordInput';
 import PasswordStrength from './PasswordStrength';
 import { validatePasswordPair, MIN_PASSWORD_LENGTH } from './passwordRequirements';
 import EdgeGrain from './EdgeGrain';
+import './AuthPage.css';
 import './LoginPage.css';
 
 /**

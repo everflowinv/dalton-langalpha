@@ -81,16 +81,16 @@ export function RunReport({
   const deliveryErrorLine =
     delivery?.status === 'failed'
       ? deliveryReason
-        ? t('automation.deliveryFailedDetail', { reason: deliveryReason })
-        : t('automation.deliveryStatusFailed')
+        ? t('automation:deliveryFailedDetail', { reason: deliveryReason })
+        : t('automation:deliveryStatusFailed')
       : delivery?.status === 'partial_failed'
         ? deliveryReason
-          ? t('automation.deliveryPartialFailedDetail', {
+          ? t('automation:deliveryPartialFailedDetail', {
               failed: delivery.failed_count,
               total: delivery.total_targets,
               reason: deliveryReason,
             })
-          : t('automation.deliveryPartialFailedNoReason', {
+          : t('automation:deliveryPartialFailedNoReason', {
               failed: delivery.failed_count,
               total: delivery.total_targets,
             })
@@ -116,24 +116,24 @@ export function RunReport({
       {view.ui.danger && run.error_message && <p className="automation-mono automation-run-error">{run.error_message}</p>}
       {/* DALTON-HOOK(execution-delivery-status): render delivery failure summary, per-target states/reasons, or retrying note */}
       {deliveryErrorLine && <p className="automation-mono automation-run-error">{deliveryErrorLine}</p>}
-      {deliveryRetrying && <p className="automation-run-note">{t('automation.deliveryRetryingNote')}</p>}
+      {deliveryRetrying && <p className="automation-run-note">{t('automation:deliveryRetryingNote')}</p>}
       {showDeliveryTargetDetails && (
-        <ul className="automation-run-delivery-targets" aria-label={t('automation.delivery')}>
+        <ul className="automation-run-delivery-targets" aria-label={t('automation:delivery')}>
           {deliveryTargets.map((tgt, idx) => {
             const matched = matchAttemptForTarget(tgt, attempts);
             const displayName = deliveryTargetName(tgt, t, deliveryNames, matched);
             const statusLabel =
               tgt.status === 'sent'
-                ? t('automation.deliveredVia', { method: displayName })
+                ? t('automation:deliveredVia', { method: displayName })
                 : tgt.status === 'retrying'
-                  ? t('automation.deliveryRetryingVia', { method: displayName })
-                  : t('automation.deliveryFailedVia', { method: displayName });
+                  ? t('automation:deliveryRetryingVia', { method: displayName })
+                  : t('automation:deliveryFailedVia', { method: displayName });
             const reason =
               tgt.status === 'failed'
                 ? formatDeliveryFailureReason(tgt.error_code, tgt.error_message, t) ?? tgt.error_message
                 : null;
             const line = reason
-              ? t('automation.deliveryNamedProblem', { name: statusLabel, message: reason })
+              ? t('automation:deliveryNamedProblem', { name: statusLabel, message: reason })
               : statusLabel;
             return (
               <li
@@ -157,7 +157,7 @@ export function RunReport({
           {/* DALTON-HOOK(company-automations): company run reports omit onSkip */}
           {view.waiting && onSkip && (
             <HeaderButton variant="secondary" disabled={busy} onClick={onSkip}>
-              {t('automation.skipRun')}
+              {t('automation:skipRun')}
             </HeaderButton>
           )}
           {onRetry && (
@@ -167,7 +167,7 @@ export function RunReport({
           )}
           {onResume && (
             <HeaderButton variant="secondary" disabled={busy} onClick={onResume}>
-              {t('automation.resume')}
+              {t('automation:resume')}
             </HeaderButton>
           )}
           {links.map((l) => (
@@ -177,7 +177,7 @@ export function RunReport({
           ))}
           {hasThread && (
             <button type="button" className="automation-link" onClick={onOpenThread}>
-              {t(view.ui.live ? 'automation.watchLive' : 'automation.openThread')}
+              {t(view.ui.live ? 'automation:watchLive' : 'automation:openThread')}
               <ArrowUpRight className="h-3 w-3" />
             </button>
           )}
