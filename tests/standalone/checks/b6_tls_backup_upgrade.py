@@ -658,6 +658,89 @@ def check_loopback_ports_caddy_adapt_and_custom_tls(ctx: _lib.ComposeContext) ->
             ctx.compose("up", "-d", "--no-deps", "--force-recreate", "edge")
             _lib.wait_for_http_ready(f"{ctx.edge_url}/__probe/health", timeout=60.0)
 
+    # 2d. Edge startup guard: with .env set to DALTON_AUTH_MODE=oss (+ DALTON_ALLOW_DEV_OSS_AUTH=1)
+    #     and host shell exporting DALTON_EDGE_TLS_BIND=0.0.0.0, recreating ONLY `edge` with the TLS
+    #     overlay must exit non-zero and log the refusal reason without starting Caddy.
+    cur_env_map = _lib.load_env_file(env_file)
+    assert cur_env_map.get("DALTON_AUTH_MODE") == "oss", (
+        f"Expected .env DALTON_AUTH_MODE=oss before edge guard check, got {cur_env_map.get('DALTON_AUTH_MODE')!r}"
+    )
+    assert cur_env_map.get("DALTON_ALLOW_DEV_OSS_AUTH") == "1", (
+        f"Expected .env DALTON_ALLOW_DEV_OSS_AUTH=1 before edge guard check, got {cur_env_map.get('DALTON_ALLOW_DEV_OSS_AUTH')!r}"
+    )
+    guard_shell_env = os.environ.copy()
+    guard_shell_env["DALTON_EDGE_TLS_BIND"] = "0.0.0.0"
+    guard_shell_env.pop("DALTON_AUTH_MODE", None)
+    guard_shell_env.pop("DALTON_PROFILE", None)
+    guard_shell_env.pop("APP_ENV", None)
+    try:
+        _run_cmd(
+            tls_context.compose_cmd("up", "-d", "--no-deps", "--force-recreate", "edge"),
+            cwd=ctx.work_dir,
+            env=guard_shell_env,
+            redact_env=ctx.env,
+            timeout=60,
+        )
+        edge_cid_proc = _run_cmd(
+            tls_context.compose_cmd("ps", "-a", "-q", "edge"),
+            cwd=ctx.work_dir,
+            env=guard_shell_env,
+            redact_env=ctx.env,
+            timeout=30,
+        )
+        edge_cids = [ln.strip() for ln in edge_cid_proc.stdout.splitlines() if ln.strip()]
+        assert edge_cids, "Expected edge container ID after up -d --no-deps edge"
+        bad_edge_cid = edge_cids[0]
+
+        deadline = time.monotonic() + 20.0
+        exit_code = 0
+        status = ""
+        logs_text = ""
+        while time.monotonic() < deadline:
+            insp = _run_cmd(
+                ["docker", "inspect", "--format", "{{json .State}}", bad_edge_cid],
+                cwd=ctx.work_dir,
+                timeout=15,
+            )
+            state = json.loads(insp.stdout.strip())
+            exit_code = int(state.get("ExitCode") or 0)
+            status = str(state.get("Status") or "")
+            logs_proc = _run_cmd(
+                ["docker", "logs", bad_edge_cid],
+                cwd=ctx.work_dir,
+                check=False,
+                redact_env=ctx.env,
+                timeout=15,
+            )
+            logs_text = (logs_proc.stdout or "") + "\n" + (logs_proc.stderr or "")
+            if (
+                exit_code != 0
+                and status in ("exited", "restarting")
+                and "DALTON_EDGE_TLS_BIND" in logs_text
+            ):
+                break
+            time.sleep(0.25)
+
+        assert exit_code != 0 and status in ("exited", "restarting"), (
+            f"Expected edge container to exit non-zero on non-loopback bind with oss auth; "
+            f"status={status!r}, exit_code={exit_code}, logs={logs_text[-800:]}"
+        )
+        assert "DALTON_EDGE_TLS_BIND" in logs_text and "DALTON_AUTH_MODE=local" in logs_text, (
+            f"Expected edge refusal reason in logs, got:\n{logs_text[-800:]}"
+        )
+        assert "serving initial configuration" not in logs_text, (
+            f"Caddy must not start when edge bind guard fails:\n{logs_text[-800:]}"
+        )
+        log(
+            f"2d OK (edge refused non-loopback DALTON_EDGE_TLS_BIND=0.0.0.0 with oss auth: "
+            f"status={status}, exit={exit_code})."
+        )
+    finally:
+        env_file.write_bytes(saved_env_bytes)
+        os.chmod(env_file, 0o600)
+        ctx.compose("up", "-d", "--no-deps", "--force-recreate", "edge")
+        _lib.wait_for_http_ready(f"{ctx.edge_url}/__probe/health", timeout=60.0)
+
 
 def seed_sentinel_data(ctx: _lib.ComposeContext) -> dict[str, str]:
     log("Seeding deterministic B6 workspace, real chat thread (with messages), and MinIO upload sentinel...")

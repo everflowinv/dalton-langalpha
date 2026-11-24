@@ -3,13 +3,89 @@
 # DALTON_EDGE_TLS_BIND is written to .env by scripts/standalone/init.sh based on
 # DOMAIN: loopback hosts stay bound to [::1], and non-loopback addresses (such as
 # [::]) are written only when local sign-in (DALTON_AUTH_MODE=local) is enabled.
-# Backend startup also refuses non-loopback bind addresses unless
-# DALTON_AUTH_MODE=local.
+# Edge enforces this guard on startup using DALTON_AUTH_MODE and DALTON_PROFILE
+# from `env_file: .env` together with the interpolated bind address below;
+# backend startup repeats the check as a second line of defense.
 #
 # Convention: IPv6 addresses in .env use square brackets (e.g. [::1] or [::]) so
 # Docker Compose port strings interpolate directly without adding brackets here.
 services:
   edge:
+    environment:
+      DALTON_EDGE_TLS_BIND: ${DALTON_EDGE_TLS_BIND:-[::1]}
+    command:
+      - /bin/sh
+      - -c
+      - |
+        bind="$${DALTON_EDGE_TLS_BIND:-}"
+        auth="$${DALTON_AUTH_MODE:-}"
+        prof="$${DALTON_PROFILE:-}"
+        appenv="$${APP_ENV:-}"
+        if ! awk -v raw="$$bind" -v auth="$$auth" -v prof="$$prof" -v appenv="$$appenv" '
+          function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$$/, "", s); return s }
+          BEGIN {
+            p = tolower(trim(prof))
+            ae = tolower(trim(appenv))
+            is_core = (p == "core" || (p == "" && ae == "core"))
+            if (!is_core) exit 0
+            if (tolower(trim(auth)) == "local") exit 0
+            b = trim(raw)
+            if (b == "") exit 0
+            low = tolower(b)
+            bracketed = 0
+            if (substr(low, 1, 1) == "[" && substr(low, length(low), 1) == "]") {
+              bracketed = 1
+              low = trim(substr(low, 2, length(low) - 2))
+            }
+            if (!bracketed) {
+              if (low == "localhost") exit 0
+              if (low ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$$/) {
+                n = split(low, oct, ".")
+                if (n == 4 && oct[1] ~ /^(0|[1-9][0-9]*)$$/ && oct[1] + 0 == 127) {
+                  ok = 1
+                  for (i = 2; i <= 4; i++) {
+                    if (oct[i] !~ /^(0|[1-9][0-9]*)$$/ || oct[i] + 0 > 255) ok = 0
+                  }
+                  if (ok) exit 0
+                }
+                exit 1
+              }
+            }
+            if (index(low, ":") == 0) exit 1
+            if (low !~ /^[0-9a-f:]+$$/) exit 1
+            if (low ~ /:::/) exit 1
+            if (substr(low, 1, 1) == ":" && substr(low, 1, 2) != "::") exit 1
+            if (substr(low, length(low), 1) == ":" && substr(low, length(low) - 1, 2) != "::") exit 1
+            pos = index(low, "::")
+            if (pos > 0) {
+              left = substr(low, 1, pos - 1)
+              right = substr(low, pos + 2)
+              if (index(right, "::") > 0) exit 1
+              nl = (left == "" ? 0 : split(left, L, ":"))
+              nr = (right == "" ? 0 : split(right, R, ":"))
+              if (nl + nr >= 8) exit 1
+              ng = 0
+              for (i = 1; i <= nl; i++) G[++ng] = L[i]
+              for (i = 1; i <= 8 - nl - nr; i++) G[++ng] = "0"
+              for (i = 1; i <= nr; i++) G[++ng] = R[i]
+            } else {
+              ng = split(low, G, ":")
+              if (ng != 8) exit 1
+            }
+            for (i = 1; i <= 8; i++) {
+              g = G[i]
+              if (length(g) < 1 || length(g) > 4 || g !~ /^[0-9a-f]+$$/) exit 1
+              sub(/^0+/, "", g)
+              if (i < 8 && g != "") exit 1
+              if (i == 8 && g != "1") exit 1
+            }
+            exit 0
+          }
+        '; then
+          echo "ERROR: Refusing to start edge on non-loopback DALTON_EDGE_TLS_BIND='$$bind' under DALTON_PROFILE=core with DALTON_AUTH_MODE='$${auth:-<unset>}' (requires DALTON_AUTH_MODE=local). Set DALTON_AUTH_MODE=local in .env or bind to 127.0.0.1 / [::1]." >&2
+          exit 1
+        fi
+        exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
     ports: !override
       - "${DALTON_EDGE_TLS_BIND:-[::1]}:${DALTON_EDGE_HTTP_PORT:-18080}:80"
       - "${DALTON_EDGE_TLS_BIND:-[::1]}:${DALTON_EDGE_HTTPS_PORT:-18443}:443"

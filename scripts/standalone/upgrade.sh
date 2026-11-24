@@ -830,12 +830,12 @@ fi
 probe_domain="${DOMAIN#[}"
 probe_domain="${probe_domain%]}"
 probe_url_host="$probe_domain"
-probe_connect_ip="127.0.0.1"
 probe_curl_extra=()
 if [[ "$probe_domain" == *:* ]]; then
   probe_url_host="[${probe_domain}]"
-  probe_connect_ip="[${probe_domain}]"
   probe_curl_extra=(-g)
+else
+  probe_curl_extra=(--resolve "${probe_url_host}:${EDGE_HTTPS_PORT}:127.0.0.1")
 fi
 
 edge_ok=0
@@ -851,7 +851,7 @@ elif [[ "$TLS_MODE" == "internal" ]]; then
   tmp_ca="$(mktemp)"
   for _ in $(seq 1 30); do
     if compose_cmd exec -T edge cat /data/caddy/pki/authorities/local/root.crt > "$tmp_ca" 2>/dev/null && [[ -s "$tmp_ca" ]]; then
-      if curl -sf "${probe_curl_extra[@]}" --cacert "$tmp_ca" --resolve "${probe_url_host}:${EDGE_HTTPS_PORT}:${probe_connect_ip}" \
+      if curl -sf "${probe_curl_extra[@]}" --cacert "$tmp_ca" \
           "https://${probe_url_host}:${EDGE_HTTPS_PORT}/api/v1/auth/cli" >/dev/null 2>&1; then
         edge_ok=1
         break
@@ -866,7 +866,7 @@ else
     curl_ca_args=(--cacert "$CA_FILE")
   fi
   for _ in $(seq 1 30); do
-    if curl -sf "${probe_curl_extra[@]}" "${curl_ca_args[@]}" --resolve "${probe_url_host}:${EDGE_HTTPS_PORT}:${probe_connect_ip}" \
+    if curl -sf "${probe_curl_extra[@]}" ${curl_ca_args[@]+"${curl_ca_args[@]}"} \
         "https://${probe_url_host}:${EDGE_HTTPS_PORT}/api/v1/auth/cli" >/dev/null 2>&1; then
       edge_ok=1
       break

@@ -5053,3 +5053,498 @@ class TestSandboxNetworkAndInitScript:
         assert 'rm -f "$ENV_BACKUP_PATH"' not in restore_src, "restore.sh must never delete ENV_BACKUP_PATH"
         doc_src = (REPO_ROOT / "docs/dalton/dev-guide/STANDALONE-DEPLOY.md").read_text(encoding="utf-8")
         assert "符号链接" in doc_src and "权限由链接指向的文件决定" in doc_src
+
+    def test_b6_r16_edge_guard_ipv6_loopback_bind_flag_and_probe(
+        self, tmp_path: Path
+    ) -> None:
+        """Offline checks for B6 r16: edge TLS bind guard, full IPv6 loopback forms, --bind flag, and IPv6 literal probes."""
+        import json
+        import shutil
+        import tarfile
+        import yaml
+
+        class _ComposeSafeLoader(yaml.SafeLoader):
+            pass
+
+        def _passthrough_tag(loader: yaml.SafeLoader, node: yaml.Node) -> Any:
+            if isinstance(node, yaml.MappingNode):
+                return loader.construct_mapping(node)
+            if isinstance(node, yaml.SequenceNode):
+                return loader.construct_sequence(node)
+            return loader.construct_scalar(node)
+
+        _ComposeSafeLoader.add_constructor("!reset", _passthrough_tag)
+        _ComposeSafeLoader.add_constructor("!override", _passthrough_tag)
+
+        # --- Case 1: Compose TLS overlays own the edge bind guard; backend drops shell-interpolated DALTON_EDGE_TLS_BIND ---
+        core_cfg = yaml.load(
+            (REPO_ROOT / "docker-compose.core.yml").read_text(encoding="utf-8"),
+            Loader=_ComposeSafeLoader,
+        )
+        assert "DALTON_EDGE_TLS_BIND" not in core_cfg["services"]["backend"]["environment"]
+        assert core_cfg["services"]["edge"]["env_file"] == ".env"
+
+        fake_caddy_bin = tmp_path / "fake-caddy-bin"
+        fake_caddy_bin.mkdir()
+        (fake_caddy_bin / "caddy").write_text(
+            '#!/bin/sh\necho "FAKE_CADDY_STARTED:$*"\n',
+            encoding="utf-8",
+        )
+        (fake_caddy_bin / "caddy").chmod(0o755)
+        sh_path = f"{fake_caddy_bin}:{os.environ.get('PATH', '')}"
+
+        for overlay_rel, want_expr in (
+            ("deploy/standalone/docker-compose.tls.yml", "${DALTON_EDGE_TLS_BIND:-127.0.0.1}"),
+            ("deploy/standalone/docker-compose.tls.ipv6.yml", "${DALTON_EDGE_TLS_BIND:-[::1]}"),
+        ):
+            ov_cfg = yaml.load(
+                (REPO_ROOT / overlay_rel).read_text(encoding="utf-8"),
+                Loader=_ComposeSafeLoader,
+            )
+            edge_svc = ov_cfg["services"]["edge"]
+            assert edge_svc["environment"]["DALTON_EDGE_TLS_BIND"] == want_expr
+            assert all(str(p).startswith(f"{want_expr}:") for p in edge_svc["ports"])
+            cmd = edge_svc["command"]
+            assert cmd[0] == "/bin/sh" and cmd[1] == "-c"
+            # Simulate Docker Compose `$$` -> `$` unescaping
+            sh_script = cmd[2].replace("$$", "$")
+
+            # Refused cases: non-loopback bind under core profile without DALTON_AUTH_MODE=local
+            for bind_val, prof_val, app_val, auth_val in (
+                ("0.0.0.0", "core", "core", "oss"),
+                ("[::]", "core", "core", "oss"),
+                ("::", "core", "core", "oss"),
+                ("192.168.1.50", "core", "core", "supabase"),
+                ("0.0.0.0", "core", "core", ""),
+                ("0.0.0.0", "", "core", "oss"),
+                ("[fd00::1]", "core", "core", "oss"),
+                ("[127.0.0.1]", "core", "core", "oss"),
+                ("[localhost]", "core", "core", "oss"),
+                ("127.999.0.1", "core", "core", "oss"),
+            ):
+                res = subprocess.run(
+                    ["/bin/sh", "-c", sh_script],
+                    env={
+                        "PATH": sh_path,
+                        "DALTON_EDGE_TLS_BIND": bind_val,
+                        "DALTON_PROFILE": prof_val,
+                        "APP_ENV": app_val,
+                        "DALTON_AUTH_MODE": auth_val,
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                assert res.returncode != 0, (
+                    f"[{overlay_rel}] Expected refusal for bind={bind_val!r}, prof={prof_val!r}, auth={auth_val!r}"
+                )
+                assert "DALTON_EDGE_TLS_BIND" in res.stderr and "DALTON_AUTH_MODE=local" in res.stderr
+                assert "FAKE_CADDY_STARTED" not in res.stdout
+
+            # Allowed cases: loopback binds with oss, local auth with non-loopback, or everflow profile
+            for bind_val, prof_val, app_val, auth_val in (
+                ("127.0.0.1", "core", "core", "oss"),
+                ("127.0.0.2", "core", "core", "oss"),
+                ("::1", "core", "core", "oss"),
+                ("[::1]", "core", "core", "oss"),
+                ("0:0:0:0:0:0:0:1", "core", "core", "oss"),
+                ("[0:0:0:0:0:0:0:1]", "core", "core", "oss"),
+                ("0000:0000:0000:0000:0000:0000:0000:0001", "core", "core", "oss"),
+                ("::0001", "core", "core", "oss"),
+                ("localhost", "core", "core", "oss"),
+                ("0.0.0.0", "core", "core", "local"),
+                ("[::]", "core", "core", "local"),
+                ("0.0.0.0", "everflow", "dalton", "supabase"),
+            ):
+                res = subprocess.run(
+                    ["/bin/sh", "-c", sh_script],
+                    env={
+                        "PATH": sh_path,
+                        "DALTON_EDGE_TLS_BIND": bind_val,
+                        "DALTON_PROFILE": prof_val,
+                        "APP_ENV": app_val,
+                        "DALTON_AUTH_MODE": auth_val,
+                    },
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                assert res.returncode == 0, (
+                    f"[{overlay_rel}] Expected allow for bind={bind_val!r}, prof={prof_val!r}, auth={auth_val!r}: {res.stderr}"
+                )
+                assert "FAKE_CADDY_STARTED:run --config /etc/caddy/Caddyfile --adapter caddyfile" in res.stdout
+
+        # --- Case 2: init.sh recognizes all equivalent IPv6 loopback representations ---
+        fake_env = self._make_fake_docker_env(tmp_path, "28.0.1")
+
+        def _parse_env(path: Path) -> dict[str, str]:
+            out: dict[str, str] = {}
+            for raw in path.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip()
+            return out
+
+        for idx, v6_loopback in enumerate(
+            (
+                "[0:0:0:0:0:0:0:1]",
+                "0:0:0:0:0:0:0:1",
+                "0000:0000:0000:0000:0000:0000:0000:0001",
+                "[0::0001]",
+                "::0001",
+                "[::1]",
+            )
+        ):
+            inst_lb, init_lb = self._stage_init_install(tmp_path, f"inst-v6-lb-{idx}")
+            res_lb = subprocess.run(
+                [
+                    "bash",
+                    str(init_lb),
+                    "--non-interactive",
+                    "--skip-sandbox-build",
+                    "--domain",
+                    v6_loopback,
+                    "--tls-mode",
+                    "internal",
+                ],
+                env=fake_env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert res_lb.returncode == 0, f"{v6_loopback}: {res_lb.stderr}"
+            parsed_lb = _parse_env(inst_lb / ".env")
+            assert parsed_lb["DALTON_AUTH_MODE"] == "oss", f"{v6_loopback}: {parsed_lb}"
+            assert parsed_lb["DALTON_ALLOW_DEV_OSS_AUTH"] == "1"
+            assert parsed_lb["DALTON_EDGE_TLS_BIND"] == "[::1]"
+            assert parsed_lb["DALTON_EDGE_HTTP_PORT"] == "18080"
+            assert parsed_lb["DALTON_EDGE_HTTPS_PORT"] == "18443"
+            assert parsed_lb["COMPOSE_FILE"] == (
+                "docker-compose.yml:docker-compose.core.yml:deploy/standalone/docker-compose.tls.ipv6.yml"
+            )
+
+        # Negative cases for is_loopback_domain
+        _, init_check = self._stage_init_install(tmp_path, "inst-lb-neg")
+        for non_lb in (
+            "fd00::1",
+            "::",
+            "::2",
+            "0:0:0:0:0:0:0:2",
+            "::1:0",
+            "0:0:0:0:0:0:0:0:1",
+            "[127.0.0.1]",
+            "[localhost]",
+            "127.999.0.1",
+        ):
+            neg_script = (
+                "set -euo pipefail\n"
+                f'eval "$(awk \'/^is_loopback_domain\\(\\) \\{{/ {{p=1}} p {{print}} p && /^\\}}/ {{p=0}}\' "{init_check}")"\n'
+                f'if is_loopback_domain "{non_lb}"; then exit 9; fi\n'
+            )
+            res_neg = subprocess.run(["bash", "-c", neg_script], capture_output=True, text=True, timeout=15)
+            assert res_neg.returncode == 0, f"Expected {non_lb!r} NOT to be loopback"
+
+        # --- Case 3: init.sh --bind flag for AAAA-only public domains & validation ---
+        inst_aaaa, init_aaaa = self._stage_init_install(tmp_path, "inst-aaaa")
+        res_aaaa = subprocess.run(
+            [
+                "bash",
+                str(init_aaaa),
+                "--non-interactive",
+                "--skip-sandbox-build",
+                "--domain",
+                "dalton.example.com",
+                "--bind",
+                "[::]",
+            ],
+            env=fake_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert res_aaaa.returncode == 0, res_aaaa.stderr
+        parsed_aaaa = _parse_env(inst_aaaa / ".env")
+        assert parsed_aaaa["DOMAIN"] == "dalton.example.com"
+        assert parsed_aaaa["DALTON_AUTH_MODE"] == "local"
+        assert parsed_aaaa["VITE_DALTON_AUTH"] == "local"
+        assert parsed_aaaa["DALTON_TLS_MODE"] == "auto"
+        assert parsed_aaaa["DALTON_EDGE_TLS_BIND"] == "[::]"
+        assert parsed_aaaa["DALTON_EDGE_HTTP_PORT"] == "80"
+        assert parsed_aaaa["DALTON_EDGE_HTTPS_PORT"] == "443"
+        assert parsed_aaaa["COMPOSE_FILE"] == (
+            "docker-compose.yml:docker-compose.core.yml:deploy/standalone/docker-compose.tls.ipv6.yml"
+        )
+        assert "DALTON_CADDY_HOST" not in parsed_aaaa
+        assert "docker-compose.tls.ipv6.yml" in res_aaaa.stdout
+
+        # Rerunning init.sh without --bind preserves [::] and IPv6 overlay
+        res_aaaa_rerun = subprocess.run(
+            ["bash", str(init_aaaa), "--non-interactive", "--skip-sandbox-build"],
+            env=fake_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert res_aaaa_rerun.returncode == 0, res_aaaa_rerun.stderr
+        parsed_aaaa_2 = _parse_env(inst_aaaa / ".env")
+        assert parsed_aaaa_2["DALTON_EDGE_TLS_BIND"] == "[::]"
+        assert parsed_aaaa_2["COMPOSE_FILE"] == (
+            "docker-compose.yml:docker-compose.core.yml:deploy/standalone/docker-compose.tls.ipv6.yml"
+        )
+
+        # Unbracketed --bind :: normalizes to [::]
+        inst_unbr, init_unbr = self._stage_init_install(tmp_path, "inst-unbr-bind")
+        res_unbr = subprocess.run(
+            [
+                "bash",
+                str(init_unbr),
+                "--non-interactive",
+                "--skip-sandbox-build",
+                "--domain",
+                "dalton.example.com",
+                "--bind=::",
+            ],
+            env=fake_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert res_unbr.returncode == 0, res_unbr.stderr
+        assert _parse_env(inst_unbr / ".env")["DALTON_EDGE_TLS_BIND"] == "[::]"
+
+        # Non-loopback --bind on loopback domain is rejected (exit 2)
+        _, init_bad_lb = self._stage_init_install(tmp_path, "inst-bad-lb-bind")
+        res_bad_lb = subprocess.run(
+            [
+                "bash",
+                str(init_bad_lb),
+                "--non-interactive",
+                "--skip-sandbox-build",
+                "--domain",
+                "localhost",
+                "--tls-mode",
+                "internal",
+                "--bind",
+                "0.0.0.0",
+            ],
+            env=fake_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert res_bad_lb.returncode == 2
+
+        # Malformed --bind values are rejected (exit 2)
+        for bad_bind in ("not-an-ip", "127.0.0.1:8080", "[::]:443", "999.0.0.1"):
+            _, init_bad_b = self._stage_init_install(tmp_path, f"inst-bad-b-{uuid.uuid4().hex[:6]}")
+            res_bad_b = subprocess.run(
+                [
+                    "bash",
+                    str(init_bad_b),
+                    "--non-interactive",
+                    "--skip-sandbox-build",
+                    "--domain",
+                    "dalton.example.com",
+                    "--bind",
+                    bad_bind,
+                ],
+                env=fake_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_bad_b.returncode == 2, f"Expected exit 2 for bad --bind={bad_bind!r}"
+
+        # --- Case 4: upgrade.sh & restore.sh omit curl --resolve for IPv6 literals and keep it for DNS domains ---
+        for script_kind, domain_val, tls_mode_val, expect_resolve in (
+            ("upgrade", "fd00::1", "internal", False),
+            ("upgrade", "fd00::1", "custom", False),
+            ("upgrade", "dalton.example.com", "internal", True),
+            ("restore", "fd00::1", "internal", False),
+            ("restore", "fd00::1", "custom", False),
+            ("restore", "dalton.example.com", "internal", True),
+        ):
+            case_dir = tmp_path / f"probe-{script_kind}-{domain_val.replace(':', '_')}-{tls_mode_val}"
+            case_dir.mkdir()
+            curl_log = case_dir / "curl.log"
+            bin_dir = case_dir / "bin"
+            bin_dir.mkdir()
+            (bin_dir / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            (bin_dir / "flock").chmod(0o755)
+            (bin_dir / "curl").write_text(
+                "#!/usr/bin/env bash\n"
+                f'printf "%s\\n" "$*" >> "{curl_log}"\n'
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            (bin_dir / "curl").chmod(0o755)
+            (bin_dir / "docker").write_text(
+                "#!/usr/bin/env bash\n"
+                'if [[ "$*" == *" config --format json"* ]]; then echo \'{"services":{"backend":{"environment":{}}}}\'; exit 0; fi\n'
+                'if [[ "$*" == *" ps --status running --services"* ]]; then printf "postgres\\nbackend\\nedge\\n"; exit 0; fi\n'
+                'if [[ "$*" == *" port edge 443"* ]]; then echo "[::]:443"; exit 0; fi\n'
+                'if [[ "$*" == *" port edge 8088"* ]]; then echo "127.0.0.1:8088"; exit 0; fi\n'
+                'if [[ "$*" == *"/data/caddy/pki/authorities/local/root.crt"* ]]; then echo "FAKE_CA_CERT"; exit 0; fi\n'
+                'if [[ "$*" == *"alembic_version_dalton"* ]]; then echo "dalton_head"; exit 0; fi\n'
+                'if [[ "$*" == *"alembic_version"* ]]; then echo "up_head"; exit 0; fi\n'
+                'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+                'if [[ "$*" == *"FROM pg_database"* ]]; then echo "postgres"; exit 0; fi\n'
+                'if [[ "$*" == *"pg_class"* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
+                'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+                'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+                'if [[ "$*" == *"image inspect"* ]]; then exit 1; fi\n'
+                'if [[ "$*" == *"ps -aq"* ]]; then exit 0; fi\n'
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            (bin_dir / "docker").chmod(0o755)
+
+            probe_env = os.environ.copy()
+            probe_env["PATH"] = f"{bin_dir}:{probe_env.get('PATH', '')}"
+            proj_p = f"r16-probe-{uuid.uuid4().hex[:8]}"
+
+            if script_kind == "upgrade":
+                work_u = case_dir / "work"
+                rel_u = case_dir / "release"
+                bak_u = case_dir / "backups"
+                for d in (work_u / "scripts" / "standalone", rel_u / "scripts" / "standalone", bak_u):
+                    d.mkdir(parents=True, exist_ok=True)
+                for root_d in (work_u, rel_u):
+                    (root_d / "deploy/standalone").mkdir(parents=True, exist_ok=True)
+                    (root_d / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+                    (root_d / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+                    (root_d / "deploy/standalone/docker-compose.tls.yml").write_text("services: {}\n", encoding="utf-8")
+                    (root_d / "deploy/standalone/docker-compose.tls.ipv6.yml").write_text("services: {}\n", encoding="utf-8")
+                    (root_d / "deploy/standalone/Caddyfile").write_text("# stub\n", encoding="utf-8")
+                    (root_d / "scripts/standalone/migrate.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+                    (root_d / "scripts/standalone/restore.sh").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+                    (root_d / "scripts/standalone/backup.sh").write_text(
+                        "#!/usr/bin/env bash\n"
+                        f'mkdir -p "{bak_u}/dalton-backup-stub"\n'
+                        f'printf "  Backup directory : %s\\n" "{bak_u}/dalton-backup-stub"\n'
+                        "exit 0\n",
+                        encoding="utf-8",
+                    )
+                    (root_d / "scripts/standalone/backup.sh").chmod(0o755)
+                (work_u / ".env").write_text(
+                    f"COMPOSE_PROJECT_NAME={proj_p}\n"
+                    "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=pg\nDB_NAME=postgres\n"
+                    f"DOMAIN={domain_val}\n"
+                    f"DALTON_TLS_MODE={tls_mode_val}\n"
+                    "DALTON_EDGE_HTTPS_PORT=443\n",
+                    encoding="utf-8",
+                )
+                res_u = subprocess.run(
+                    [
+                        "bash",
+                        str(REPO_ROOT / "scripts/standalone/upgrade.sh"),
+                        "--work-dir",
+                        str(work_u),
+                        "--release-dir",
+                        str(rel_u),
+                        "--backup-dir",
+                        str(bak_u),
+                        "--skip-build",
+                        "--project-name",
+                        proj_p,
+                    ],
+                    env=probe_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                assert res_u.returncode == 0, f"upgrade.sh ({domain_val}, {tls_mode_val}): {res_u.stderr}"
+            else:
+                work_r = case_dir / "work"
+                bak_r = case_dir / "backup"
+                (work_r / "deploy/standalone").mkdir(parents=True, exist_ok=True)
+                bak_r.mkdir()
+                (work_r / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
+                (work_r / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+                (work_r / "deploy/standalone/docker-compose.tls.yml").write_text("services: {}\n", encoding="utf-8")
+                (work_r / "deploy/standalone/docker-compose.tls.ipv6.yml").write_text("services: {}\n", encoding="utf-8")
+                (work_r / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+                (work_r / ".env").write_text(
+                    f"COMPOSE_PROJECT_NAME={proj_p}\n"
+                    "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=pg\nDB_NAME=postgres\n"
+                    f"DOMAIN={domain_val}\n"
+                    f"DALTON_TLS_MODE={tls_mode_val}\n"
+                    "DALTON_EDGE_HTTPS_PORT=443\n",
+                    encoding="utf-8",
+                )
+                (bak_r / "postgres.dump").write_bytes(b"PGDMP-fake")
+                with tarfile.open(bak_r / "caddy-data.tar.gz", "w:gz"):
+                    pass
+                manifest = {
+                    "schema_version": 1,
+                    "compose_project": proj_p,
+                    "db_name": "postgres",
+                    "alembic_upstream": "up_head",
+                    "alembic_dalton": "dalton_head",
+                    "minio": {"included": False, "buckets": []},
+                    "caddy": {"included": False},
+                    "env": {"included": False},
+                }
+                (bak_r / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+                sums_lines = []
+                for fname in ("postgres.dump", "manifest.json"):
+                    digest = hashlib.sha256((bak_r / fname).read_bytes()).hexdigest()
+                    sums_lines.append(f"{digest}  {fname}")
+                (bak_r / "SHA256SUMS").write_text("\n".join(sums_lines) + "\n", encoding="utf-8")
+
+                dir_lock = Path(
+                    f"/tmp/dalton-restore-dir-{hashlib.sha256(str(work_r.resolve()).encode()).hexdigest()[:16]}.lock"
+                )
+                proj_lock = Path(f"/tmp/dalton-{proj_p}.restore.lock")
+                try:
+                    res_r = subprocess.run(
+                        [
+                            "bash",
+                            str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                            "--work-dir",
+                            str(work_r),
+                            "--backup-dir",
+                            str(bak_r),
+                            "--skip-minio",
+                            "--skip-caddy",
+                            "--skip-edge-build",
+                            "--project-name",
+                            proj_p,
+                        ],
+                        env=probe_env,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    assert res_r.returncode == 0, f"restore.sh ({domain_val}, {tls_mode_val}): {res_r.stderr}"
+                finally:
+                    for lk in (proj_lock, dir_lock):
+                        if lk.is_dir():
+                            shutil.rmtree(lk, ignore_errors=True)
+                        elif lk.exists():
+                            lk.unlink(missing_ok=True)
+
+            curl_calls = curl_log.read_text(encoding="utf-8")
+            if expect_resolve:
+                assert f"--resolve {domain_val}:443:127.0.0.1" in curl_calls, (
+                    f"[{script_kind}] Expected --resolve for {domain_val}: {curl_calls}"
+                )
+                assert f"https://{domain_val}:443/api/v1/auth/cli" in curl_calls
+            else:
+                assert "--resolve" not in curl_calls, (
+                    f"[{script_kind}] IPv6 literal {domain_val} must NOT pass --resolve to curl: {curl_calls}"
+                )
+                assert "-g" in curl_calls and f"https://[{domain_val}]:443/api/v1/auth/cli" in curl_calls, (
+                    f"[{script_kind}] Expected direct IPv6 URL probe for {domain_val}: {curl_calls}"
+                )
+
+        # --- Case 5: .env.core.example and STANDALONE-DEPLOY.md wording checks ---
+        env_example_src = (REPO_ROOT / ".env.core.example").read_text(encoding="utf-8")
+        assert "until the local sign-in pages ship" not in env_example_src
+        assert "scripts/standalone/init.sh" in env_example_src
+        doc_r16 = (REPO_ROOT / "docs/dalton/dev-guide/STANDALONE-DEPLOY.md").read_text(encoding="utf-8")
+        assert "--bind '[::]'" in doc_r16
+        assert "--tls-mode internal" in doc_r16
+        assert "up -d --build edge backend" not in doc_r16

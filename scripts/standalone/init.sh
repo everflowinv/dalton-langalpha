@@ -35,6 +35,7 @@ NON_INTERACTIVE=0
 DOMAIN_ARG=""
 TLS_MODE_ARG=""
 TLS_CERT_DIR_ARG=""
+BIND_ARG=""
 BUILD_SANDBOX=1
 SCRIPT_WROTE_LOCAL_AUTH=0
 
@@ -52,6 +53,8 @@ Options:
                              auto (ACME HTTPS) for public domains, internal for private/LAN hosts;
                              use --tls-mode internal for loopback HTTPS (127.0.0.1:18443).
   --tls-cert-dir <path>      Directory containing cert.pem and key.pem (used with --tls-mode custom).
+  --bind <address>           Override DALTON_EDGE_TLS_BIND (for example '[::]' for public domains
+                             with AAAA records only; default is derived from --domain).
   --skip-sandbox-build       Leave the code sandbox image unbuilt (build it later with
                              docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest .).
   -h, --help                 Show this help message.
@@ -102,6 +105,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --tls-cert-dir=*)
       TLS_CERT_DIR_ARG="${1#--tls-cert-dir=}"
+      shift
+      ;;
+    --bind)
+      if [[ $# -lt 2 || -z "${2:-}" ]]; then
+        echo "ERROR: --bind requires an address (e.g. 0.0.0.0 or '[::]')" >&2
+        exit 2
+      fi
+      BIND_ARG="$2"
+      shift 2
+      ;;
+    --bind=*)
+      BIND_ARG="${1#--bind=}"
+      if [[ -z "$BIND_ARG" ]]; then
+        echo "ERROR: --bind requires an address (e.g. 0.0.0.0 or '[::]')" >&2
+        exit 2
+      fi
       shift
       ;;
     -h|--help)
@@ -245,6 +264,72 @@ validate_domain_syntax() {
   printf '%s' "$trimmed"
 }
 
+validate_bind_address() {
+  local raw="$1"
+  raw="${raw#"${raw%%[![:space:]]*}"}"
+  raw="${raw%"${raw##*[![:space:]]}"}"
+  if [[ -z "$raw" ]]; then
+    err "Invalid --bind: address cannot be empty."
+    exit 2
+  fi
+  if [[ "$raw" =~ [[:space:]\'\"\$\\@] ]]; then
+    err "Invalid --bind '${raw}': expected an IPv4 or IPv6 address without spaces or quotes."
+    exit 2
+  fi
+  local inner="$raw"
+  local bracketed=0
+  if [[ "$raw" == \[* ]]; then
+    if [[ "$raw" =~ ^\[([0-9a-fA-F:]+)\]$ ]]; then
+      inner="${BASH_REMATCH[1]}"
+      bracketed=1
+    else
+      err "Invalid --bind '${raw}': malformed bracketed IPv6 address (omit any port number)."
+      exit 2
+    fi
+  fi
+  if [[ "$bracketed" -eq 0 && "$inner" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    local o1="${BASH_REMATCH[1]}" o2="${BASH_REMATCH[2]}" o3="${BASH_REMATCH[3]}" o4="${BASH_REMATCH[4]}"
+    if [[ "$o1" =~ ^(0|[1-9][0-9]*)$ && "$o2" =~ ^(0|[1-9][0-9]*)$ && "$o3" =~ ^(0|[1-9][0-9]*)$ && "$o4" =~ ^(0|[1-9][0-9]*)$ ]] \
+      && (( o1 <= 255 && o2 <= 255 && o3 <= 255 && o4 <= 255 )); then
+      printf '%s' "$inner"
+      return 0
+    fi
+    err "Invalid --bind '${raw}': IPv4 octet out of range (0-255)."
+    exit 2
+  fi
+  if awk -v s="$inner" '
+    BEGIN {
+      low = tolower(s)
+      if (index(low, ":") == 0) exit 1
+      if (low !~ /^[0-9a-f:]+$/) exit 1
+      if (low ~ /:::/) exit 1
+      if (substr(low, 1, 1) == ":" && substr(low, 1, 2) != "::") exit 1
+      if (substr(low, length(low), 1) == ":" && substr(low, length(low) - 1, 2) != "::") exit 1
+      pos = index(low, "::")
+      if (pos > 0) {
+        left = substr(low, 1, pos - 1)
+        right = substr(low, pos + 2)
+        if (index(right, "::") > 0) exit 1
+        nl = (left == "" ? 0 : split(left, L, ":"))
+        nr = (right == "" ? 0 : split(right, R, ":"))
+        if (nl + nr >= 8) exit 1
+        for (i = 1; i <= nl; i++) if (length(L[i]) < 1 || length(L[i]) > 4) exit 1
+        for (i = 1; i <= nr; i++) if (length(R[i]) < 1 || length(R[i]) > 4) exit 1
+      } else {
+        ng = split(low, G, ":")
+        if (ng != 8) exit 1
+        for (i = 1; i <= 8; i++) if (length(G[i]) < 1 || length(G[i]) > 4) exit 1
+      }
+      exit 0
+    }
+  '; then
+    printf '[%s]' "$inner"
+    return 0
+  fi
+  err "Invalid --bind '${raw}': expected an IPv4 address (e.g. 0.0.0.0, 127.0.0.1) or IPv6 address (e.g. '[::]', '[::1]')."
+  exit 2
+}
+
 is_ip_address() {
   local host="$1"
   if [[ "$host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -260,16 +345,13 @@ classify_domain() {
   # Prints one of: loopback | private | public
   local host lower
   host="$1"
+  if is_loopback_domain "$host"; then
+    printf 'loopback'
+    return 0
+  fi
   lower="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
   lower="${lower#[}"
   lower="${lower%]}"
-
-  case "$lower" in
-    localhost|127.0.0.1|::1)
-      printf 'loopback'
-      return 0
-      ;;
-  esac
 
   # IPv4 private / loopback / link-local / CGNAT ranges
   if [[ "$lower" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
@@ -313,11 +395,62 @@ classify_domain() {
 }
 
 is_loopback_domain() {
-  local d
-  d="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
-  d="${d#[}"
-  d="${d%]}"
-  [[ "$d" == "localhost" || "$d" == "127.0.0.1" || "$d" == "::1" || "$d" =~ ^127\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
+  awk -v raw="$1" '
+    BEGIN {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", raw)
+      if (raw == "") exit 1
+      low = tolower(raw)
+      bracketed = 0
+      if (substr(low, 1, 1) == "[" && substr(low, length(low), 1) == "]") {
+        bracketed = 1
+        low = substr(low, 2, length(low) - 2)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", low)
+      }
+      if (!bracketed) {
+        if (low == "localhost") exit 0
+        if (low ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+          n = split(low, oct, ".")
+          if (n == 4 && oct[1] ~ /^(0|[1-9][0-9]*)$/ && oct[1] + 0 == 127) {
+            ok = 1
+            for (i = 2; i <= 4; i++) {
+              if (oct[i] !~ /^(0|[1-9][0-9]*)$/ || oct[i] + 0 > 255) ok = 0
+            }
+            if (ok) exit 0
+          }
+          exit 1
+        }
+      }
+      if (index(low, ":") == 0) exit 1
+      if (low !~ /^[0-9a-f:]+$/) exit 1
+      if (low ~ /:::/) exit 1
+      if (substr(low, 1, 1) == ":" && substr(low, 1, 2) != "::") exit 1
+      if (substr(low, length(low), 1) == ":" && substr(low, length(low) - 1, 2) != "::") exit 1
+      pos = index(low, "::")
+      if (pos > 0) {
+        left = substr(low, 1, pos - 1)
+        right = substr(low, pos + 2)
+        if (index(right, "::") > 0) exit 1
+        nl = (left == "" ? 0 : split(left, L, ":"))
+        nr = (right == "" ? 0 : split(right, R, ":"))
+        if (nl + nr >= 8) exit 1
+        ng = 0
+        for (i = 1; i <= nl; i++) G[++ng] = L[i]
+        for (i = 1; i <= 8 - nl - nr; i++) G[++ng] = "0"
+        for (i = 1; i <= nr; i++) G[++ng] = R[i]
+      } else {
+        ng = split(low, G, ":")
+        if (ng != 8) exit 1
+      }
+      for (i = 1; i <= 8; i++) {
+        g = G[i]
+        if (length(g) < 1 || length(g) > 4 || g !~ /^[0-9a-f]+$/) exit 1
+        sub(/^0+/, "", g)
+        if (i < 8 && g != "") exit 1
+        if (i == 8 && g != "1") exit 1
+      }
+      exit 0
+    }
+  '
 }
 
 check_environment() {
@@ -816,6 +949,9 @@ main() {
   if [[ -n "$TLS_MODE_ARG" ]]; then
     validate_tls_mode "$TLS_MODE_ARG" "--tls-mode"
   fi
+  if [[ -n "$BIND_ARG" ]]; then
+    BIND_ARG="$(validate_bind_address "$BIND_ARG")"
+  fi
 
   printf "\nDalton Standalone Core Initialization\n"
   if [[ -n "$DOMAIN_ARG" ]]; then
@@ -915,7 +1051,7 @@ main() {
   fi
 
   local force_network_update=0
-  if [[ "$domain_changed" -eq 1 || "$tls_changed" -eq 1 ]]; then
+  if [[ "$domain_changed" -eq 1 || "$tls_changed" -eq 1 || -n "$BIND_ARG" ]]; then
     force_network_update=1
   fi
 
@@ -952,31 +1088,37 @@ main() {
   local edge_port tls_bind http_port https_port public_url invite_domain cert_dir compose_file tls_overlay_file
   edge_port="$(get_env_value "DALTON_EDGE_PORT")"
   edge_port="${edge_port:-8088}"
-  if [[ "$domain" == *:* ]]; then
-    tls_overlay_file="deploy/standalone/docker-compose.tls.ipv6.yml"
-  else
-    tls_overlay_file="deploy/standalone/docker-compose.tls.yml"
-  fi
 
   local auth_mode_now
   auth_mode_now="$(get_env_value "DALTON_AUTH_MODE")"
 
+  if [[ -n "$BIND_ARG" ]]; then
+    if [[ "$domain_class" == "loopback" || "$tls_mode" == "loopback" || "$auth_mode_now" != "local" || "$SCRIPT_WROTE_LOCAL_AUTH" -ne 1 ]]; then
+      if ! is_loopback_domain "$BIND_ARG"; then
+        err "Non-loopback --bind '${BIND_ARG}' requires a non-loopback domain with DALTON_AUTH_MODE=local and HTTPS enabled."
+        exit 2
+      fi
+      loopback_bind="$BIND_ARG"
+    fi
+  fi
+
   case "$tls_mode" in
     loopback)
-      tls_bind="$loopback_bind"
+      tls_bind="${BIND_ARG:-$loopback_bind}"
       http_port="18080"
       https_port="18443"
       public_url="http://127.0.0.1:${edge_port}"
-      compose_file="docker-compose.yml:docker-compose.core.yml"
       ;;
     internal|auto|custom)
       if [[ "$domain_class" == "loopback" || "$auth_mode_now" != "local" || "$SCRIPT_WROTE_LOCAL_AUTH" -ne 1 ]]; then
-        tls_bind="$loopback_bind"
+        tls_bind="${BIND_ARG:-$loopback_bind}"
         http_port="18080"
         https_port="18443"
         public_url="https://${url_host}:${https_port}"
       else
-        if [[ "$domain" == *:* ]]; then
+        if [[ -n "$BIND_ARG" ]]; then
+          tls_bind="$BIND_ARG"
+        elif [[ "$domain" == *:* ]]; then
           tls_bind="[::]"
         else
           tls_bind="0.0.0.0"
@@ -985,9 +1127,27 @@ main() {
         https_port="443"
         public_url="https://${url_host}"
       fi
-      compose_file="docker-compose.yml:docker-compose.core.yml:${tls_overlay_file}"
       ;;
   esac
+
+  local effective_bind="$tls_bind"
+  if [[ "$force_network_update" -eq 0 ]]; then
+    local cur_bind
+    cur_bind="$(get_env_value "DALTON_EDGE_TLS_BIND")"
+    if [[ -n "$cur_bind" ]]; then
+      effective_bind="$cur_bind"
+    fi
+  fi
+  if [[ "$domain" == *:* || "$effective_bind" == *:* ]]; then
+    tls_overlay_file="deploy/standalone/docker-compose.tls.ipv6.yml"
+  else
+    tls_overlay_file="deploy/standalone/docker-compose.tls.yml"
+  fi
+  if [[ "$tls_mode" == "loopback" ]]; then
+    compose_file="docker-compose.yml:docker-compose.core.yml"
+  else
+    compose_file="docker-compose.yml:docker-compose.core.yml:${tls_overlay_file}"
+  fi
 
   if [[ "$domain_class" == "loopback" ]] || is_ip_address "$domain"; then
     invite_domain="team.dalton.local"
@@ -1043,6 +1203,11 @@ main() {
   actual_http_port="$(get_env_value "DALTON_EDGE_HTTP_PORT")"
   actual_https_port="$(get_env_value "DALTON_EDGE_HTTPS_PORT")"
   actual_public_url="$(get_env_value "PUBLIC_APP_URL")"
+  if [[ "$domain" == *:* || "${actual_tls_bind:-$tls_bind}" == *:* ]]; then
+    tls_overlay_file="deploy/standalone/docker-compose.tls.ipv6.yml"
+  else
+    tls_overlay_file="deploy/standalone/docker-compose.tls.yml"
+  fi
   ok "DALTON_TLS_MODE=${actual_tls_mode:-$tls_mode} (bind=${actual_tls_bind:-$tls_bind}, http=${actual_http_port:-$http_port}, https=${actual_https_port:-$https_port}, url=${actual_public_url:-$public_url})"
 
   # Generate all secrets with `openssl rand -hex 32` without overwriting existing values.
