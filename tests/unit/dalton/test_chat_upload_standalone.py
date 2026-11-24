@@ -2337,6 +2337,7 @@ class TestSandboxNetworkAndInitScript:
                 f'printf "%s\\n" "$*" >> "{docker_trace}"\n'
                 'if [[ "$*" == *" images -q "* ]]; then echo "img123"; exit 0; fi\n'
                 'if [[ "$1" == "tag" ]]; then exit 0; fi\n'
+                'if [[ "$*" == *" ps --status running --services"* ]]; then printf "postgres\\nbackend\\ncrawler\\nedge\\n"; exit 0; fi\n'
                 f'if [[ "$*" == *" build "* ]]; then {build_body}; fi\n'
                 'if [[ "$*" == *"pg_stat_activity"* ]]; then echo "0"; exit 0; fi\n'
                 f'if [[ "$*" == *" psql "* ]]; then {psql_behavior}; fi\n'

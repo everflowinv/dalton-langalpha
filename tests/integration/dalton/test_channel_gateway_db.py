@@ -6272,8 +6272,9 @@ async def test_weixin_settings_sender_lock_order_and_command_context_real_pg(
         assert internal["ok"] is True
         assert await token_secret() == before_internal
 
-        # I-6 claim returns token only to owner user_a
-        claim = await cg_db.authorize_and_claim_delivery(
+        # I-6 notice for pre-/new command ({prefix}-i3-stop) is denied with session_generation_superseded (R9 Decision #5),
+        # while current-generation command ({prefix}-i3-older) returns the newer stored token only to owner user_a.
+        stale_claim = await cg_db.authorize_and_claim_delivery(
             delivery_key=f"notice:weixin:{prefix}-i3-stop:probe",
             kind="notice",
             user_id=user_a,
@@ -6285,15 +6286,29 @@ async def test_weixin_settings_sender_lock_order_and_command_context_real_pg(
             gateway_epoch=epoch,
             require_gateway_epoch=True,
         )
+        assert stale_claim["claim_status"] == "denied"
+        assert stale_claim["code"] == "session_generation_superseded"
+        claim = await cg_db.authorize_and_claim_delivery(
+            delivery_key=f"notice:weixin:{prefix}-i3-older:probe",
+            kind="notice",
+            user_id=user_a,
+            platform="weixin",
+            target="weixin:@me",
+            inbound_message_id=f"{prefix}-i3-older",
+            has_non_empty_text=True,
+            total_chunks=1,
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
         assert claim["claim_status"] == "claimed"
         assert claim["weixin_context_token"] == "ctx-i3-23"
         other_claim = await cg_db.authorize_and_claim_delivery(
-            delivery_key=f"notice:weixin:{prefix}-i3-stop:other",
+            delivery_key=f"notice:weixin:{prefix}-i3-older:other",
             kind="notice",
             user_id=user_b,
             platform="weixin",
             target="weixin:@me",
-            inbound_message_id=f"{prefix}-i3-stop",
+            inbound_message_id=f"{prefix}-i3-older",
             has_non_empty_text=True,
             total_chunks=1,
             gateway_epoch=epoch,
@@ -8654,31 +8669,36 @@ async def test_r9_partial_deferred_due_poll_collect_too_late_and_dup_media_real_
             require_gateway_epoch=True,
         )
         async with pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT encrypted_weixin_media_meta FROM dalton_channel_inbound_events WHERE platform = 'weixin' AND message_id = %s",
-                    (it_mid,),
-                )
-                orig_cipher = bytes((await cur.fetchone())["encrypted_weixin_media_meta"])
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "SELECT encrypted_weixin_media_meta FROM dalton_channel_inbound_events WHERE platform = 'weixin' AND message_id = %s",
+                        (it_mid,),
+                    )
+                    orig_cipher = bytes((await cur.fetchone())["encrypted_weixin_media_meta"])
 
-                # Direct duplicate call to append_weixin_collect_item_in_tx MUST NOT overwrite encrypted_weixin_media_meta!
-                await wx_db.append_weixin_collect_item_in_tx(
-                    cur,
-                    account_id=aid,
-                    bot_generation=gen,
-                    dalton_user_id=user_a,
-                    scope_key=f"dm:{wx_uid}",
-                    session_generation=1,
-                    message_id=it_mid,
-                    text_content="pdf",
-                    weixin_media_meta=[{"type": "file", "filename": "spoof.pdf", "aes_key": "spoof-key"}],
-                )
-                await cur.execute(
-                    "SELECT encrypted_weixin_media_meta FROM dalton_channel_inbound_events WHERE platform = 'weixin' AND message_id = %s",
-                    (it_mid,),
-                )
-                after_cipher = bytes((await cur.fetchone())["encrypted_weixin_media_meta"])
-                assert after_cipher == orig_cipher
+                    # Direct duplicate call to append_weixin_collect_item_in_tx MUST NOT overwrite encrypted_weixin_media_meta!
+                    await wx_db.append_weixin_collect_item_in_tx(
+                        cur,
+                        account_id=aid,
+                        bot_generation=gen,
+                        dalton_user_id=user_a,
+                        scope_key=f"dm:{wx_uid}",
+                        session_generation=int(r_col.get("generation") or 1),
+                        message_id=it_mid,
+                        text_content="pdf",
+                        protocol_seq=None,
+                        platform_time_ms=None,
+                        weixin_media_meta=[{"type": "file", "filename": "spoof.pdf", "aes_key": "spoof-key"}],
+                        verify_workspace_write_fn=cg_db._verify_workspace_write_permission,
+                        conn=conn,
+                    )
+                    await cur.execute(
+                        "SELECT encrypted_weixin_media_meta FROM dalton_channel_inbound_events WHERE platform = 'weixin' AND message_id = %s",
+                        (it_mid,),
+                    )
+                    after_cipher = bytes((await cur.fetchone())["encrypted_weixin_media_meta"])
+                    assert after_cipher == orig_cipher
 
         # Mark buffer 'done' -> late register_collect_item_attachments returns too_late without writing collect_items
         async with pool.connection() as conn:
