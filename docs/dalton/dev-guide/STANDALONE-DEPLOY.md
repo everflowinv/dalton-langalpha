@@ -187,7 +187,7 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -
 
 公网域名部署可直接启用自动 HTTPS：`init.sh` 自动写入 `DALTON_AUTH_MODE=local`、`VITE_DALTON_AUTH=local`、`DALTON_TLS_MODE=auto`，默认将 `DALTON_EDGE_TLS_BIND` 设为 `0.0.0.0`（监听 80 与 443）：
 
-1. 为目标域名（如 `dalton.example.com`）配置指向服务器公网 IPv4 的 `A` 记录，并使用默认的 IPv4 叠加文件（`deploy/standalone/docker-compose.tls.yml`）。需要同时提供 IPv4 和 IPv6 访问的场景，在本版本统一按 IPv4 发布（仅配置 `A` 记录并绑定 `0.0.0.0`）。服务器只有 IPv6 地址且域名只有 `AAAA` 记录时，在初始化时传入 `--bind '[::]'` 并使用 IPv6 叠加文件（`deploy/standalone/docker-compose.tls.ipv6.yml`）。
+1. 为目标域名（如 `dalton.example.com`）配置指向服务器公网 IPv4 的 `A` 记录，并使用默认的 IPv4 叠加文件（`deploy/standalone/docker-compose.tls.yml`）。需要同时提供 IPv4 和 IPv6 访问的场景，在本版本统一按 IPv4 发布（仅配置 `A` 记录并绑定 `0.0.0.0`）。域名只配置了 `AAAA` 记录时（无论服务器是否另有 IPv4 地址），在初始化时传入 `--bind '[::]'` 并使用 IPv6 叠加文件（`deploy/standalone/docker-compose.tls.ipv6.yml`）。
 2. 在云安全组与系统防火墙放行入站 **TCP 80** 与 **TCP 443** 端口，并保持宿主机 80/443 端口空闲。
 3. 初始化并构建启动整套服务，Caddy 通过 ACME 自动签发并续期证书：
    ```bash

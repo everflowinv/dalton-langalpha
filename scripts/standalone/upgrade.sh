@@ -271,9 +271,12 @@ with open(env_path, encoding="utf-8") as fh:
         if not m or m.group(1) != target_key:
             continue
         val = m.group(3).strip()
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
-            val = val[1:-1]
-        elif val and val[0] not in ("'", '"'):
+        if val and val[0] in ("'", '"'):
+            # Quoted value, possibly followed by an inline comment: keep what is
+            # inside the quotes, as Compose does.
+            end = val.find(val[0], 1)
+            val = val[1:end] if end > 0 else val[1:]
+        elif val:
             val = re.split(r"\s+#", val, maxsplit=1)[0].strip()
         found = val
 if found is not None:
