@@ -490,6 +490,17 @@ async def verify_workspace_access(
     if owner and owner == cleaned_user:
         return ws
 
+    from src.server.database.home_workspace import (
+        is_home_stand_in_id,
+        is_home_stand_in_row,
+    )
+
+    if is_home_stand_in_row(ws) or is_home_stand_in_id(owner, cleaned_ws):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Workspace '{workspace_id}' not found",
+        )
+
     if (need is not None or channel is not None) and (
         is_dalton_supabase_auth_enabled() or is_dalton_local_auth_enabled()
     ):

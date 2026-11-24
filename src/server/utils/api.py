@@ -512,6 +512,16 @@ def require_workspace_owner(workspace: dict | None, *, user_id: str) -> None:
     if not workspace:
         raise HTTPException(status_code=404, detail="Workspace not found")
     if workspace.get("user_id") != user_id:
+        # DALTON-HOOK(colleague-access): Home stand-in rows never leak existence to non-owners (404, not 403)
+        from src.server.database.home_workspace import (
+            is_home_stand_in_id,
+            is_home_stand_in_row,
+        )
+
+        if is_home_stand_in_row(workspace) or is_home_stand_in_id(
+            workspace.get("user_id"), workspace.get("workspace_id")
+        ):
+            raise HTTPException(status_code=404, detail="Workspace not found")
         raise HTTPException(status_code=403, detail="Forbidden")
 
 

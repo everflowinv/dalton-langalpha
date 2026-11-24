@@ -895,7 +895,7 @@ async def get_thread_auth_meta(thread_id: str, *, conn=None) -> Optional[Dict[st
     try:
         async with pool.get_db_connection(conn) as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
-                # DALTON-HOOK(colleague-dispatch): return thread owner (user_id / owner_id / thread_user_id), workspace_owner_id, workspace_status, and metadata.
+                # DALTON-HOOK(colleague-dispatch): return thread owner (user_id / owner_id / thread_user_id), workspace_owner_id, workspace_status, workspace_config, and metadata.
                 await cur.execute(
                     """
                     SELECT COALESCE(t.user_id, w.user_id) AS user_id,
@@ -903,6 +903,7 @@ async def get_thread_auth_meta(thread_id: str, *, conn=None) -> Optional[Dict[st
                            COALESCE(t.user_id, w.user_id) AS thread_user_id,
                            w.user_id AS workspace_owner_id,
                            w.status AS workspace_status,
+                           w.config AS workspace_config,
                            t.metadata,
                            t.is_shared, t.msg_type, t.workspace_id,
                            t.llm_model, t.reasoning_effort, t.fast_mode,

@@ -286,9 +286,9 @@ def classify_workspace_coverage(
     if workspace is None:
         return WorkspaceCoverageIdentity(KIND_UNCLASSIFIED, SOURCE_UNCLASSIFIED)
 
-    from src.server.database.home_workspace import is_home_row
+    from src.server.database.home_workspace import is_reserved_row
 
-    if is_home_row(workspace):
+    if is_reserved_row(workspace):
         return WorkspaceCoverageIdentity(KIND_HOME, SOURCE_HOME)
 
     ticker, ticker_source = _compat_ticker(
@@ -343,9 +343,9 @@ async def resolve_workspace_coverage_identity(
         return WorkspaceCoverageIdentity(KIND_UNCLASSIFIED, SOURCE_UNCLASSIFIED)
     ws_id = str(workspace.get("workspace_id") or "").strip()
 
-    from src.server.database.home_workspace import is_home_row
+    from src.server.database.home_workspace import is_reserved_row
 
-    if is_home_row(workspace):
+    if is_reserved_row(workspace):
         return WorkspaceCoverageIdentity(KIND_HOME, SOURCE_HOME)
 
     if ws_id and (registered_units is not None or is_coverage_units_enabled()):
