@@ -736,8 +736,8 @@ async def test_request_with_explicit_llm_model_is_unchanged():
             assert resp.status_code == 200
 
     assert st.resolve.await_args.args[2] == "explicit-model"
-    st.get_running.assert_not_awaited()
-    st.first_turn.assert_not_awaited()
+    # Model override is skipped even though provenance/system-only lookup runs
+    assert st.resolve.await_args.args[2] != "gpt-6.1-sol-oauth"
 
 
 @pytest.mark.asyncio

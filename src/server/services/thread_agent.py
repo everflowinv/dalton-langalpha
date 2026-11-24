@@ -98,7 +98,8 @@ def thread_resolver(
             workspace_id=route.workspace_id,
             identity=identity,
             role=route.role,
-            ignore_custom_models=effective_ignore_custom,  # DALTON-HOOK(cos-settings-tools)
+            # DALTON-HOOK(cos-settings-tools): only forward ignore_custom_models when True so normal calls stay identical to upstream
+            **({"ignore_custom_models": True} if effective_ignore_custom else {}),
         )
 
     return resolve

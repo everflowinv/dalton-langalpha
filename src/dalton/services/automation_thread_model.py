@@ -215,22 +215,57 @@ async def _get_run_system_only(run_id: str) -> bool | None:
         return None
 
 
-async def _get_latest_run_for_thread(thread_id: str) -> dict[str, Any] | None:
-    """Read the thread's latest attempt row for HITL resume provenance."""
+async def _get_hitl_interrupt_run_id(thread_id: str, request: Any) -> str | None:
+    """Resolve the ``run_id`` of the checkpoint holding the pending HITL interrupt.
+
+    Follows the same checkpoint walk as ``report_back.notify_turn._card_waits`` so a
+    subsequent failed or cancelled attempt that never wrote a new graph step cannot
+    mask the run that originally produced the pending interrupt card.
+    """
     if normalize_uuid(thread_id) is None:
         return None
-    from src.server.database.runs import lifecycle as runs_lifecycle_db
+    from src.server.utils.checkpoint_helpers import (
+        build_checkpoint_config,
+        get_checkpointer,
+        interrupt_records,
+        turn_base_checkpoint_id,
+    )
 
     try:
-        latest = await runs_lifecycle_db.get_latest_attempt(thread_id)
-        return dict(latest) if isinstance(latest, Mapping) else None
-    except RuntimeError as exc:
-        if "pool" in str(exc).lower():
-            return None
-        raise
+        checkpointer = get_checkpointer()
+    except (HTTPException, RuntimeError):
+        return None
     except Exception:
         logger.debug(
-            "[AUTOMATION_THREAD_MODEL] Failed reading latest attempt for thread=%s",
+            "[AUTOMATION_THREAD_MODEL] Checkpointer unavailable for HITL interrupt lookup on thread=%s",
+            thread_id,
+            exc_info=True,
+        )
+        return None
+
+    try:
+        base = getattr(request, "checkpoint_id", None) or await turn_base_checkpoint_id(
+            checkpointer, thread_id
+        )
+        cp = await checkpointer.aget_tuple(build_checkpoint_config(thread_id, base))
+        while cp is not None and (cp.metadata or {}).get("source") == "update":
+            if cp.parent_config is None:
+                return None
+            parent = await checkpointer.aget_tuple(cp.parent_config)
+            if parent is None or (
+                parent.checkpoint["versions_seen"] != cp.checkpoint["versions_seen"]
+            ):
+                return None
+            cp = parent
+        if cp is None or not interrupt_records(cp.pending_writes):
+            return None
+        raw_run_id = (cp.metadata or {}).get("run_id")
+        if not raw_run_id:
+            return None
+        return normalize_uuid(str(raw_run_id).strip())
+    except Exception:
+        logger.debug(
+            "[AUTOMATION_THREAD_MODEL] Failed reading pending HITL interrupt run_id for thread=%s",
             thread_id,
             exc_info=True,
         )
@@ -646,18 +681,13 @@ async def _resolve_automation_notification_context(
             target_exec = exec_row
             match_kind = "user_retry_run" if exec_row is not None else "none"
         elif is_hitl_resume and not is_server_turn:
-            latest_run = await _get_latest_run_for_thread(thread_id)
-            latest_meta = (latest_run or {}).get("metadata") if isinstance(latest_run, Mapping) else None
-            if isinstance(latest_meta, Mapping) and bool(latest_meta.get("llm_model_system_only")):
-                source_run_system_only = True
-            latest_run_id = (
-                str(latest_run.get("conversation_response_id") or "")
-                if isinstance(latest_run, Mapping)
-                else ""
-            )
-            exec_row = await _get_execution_for_run_id(latest_run_id) if latest_run_id else None
-            target_exec = exec_row
-            match_kind = "hitl_resume_run" if exec_row is not None else "none"
+            interrupt_run_id = await _get_hitl_interrupt_run_id(thread_id, request)
+            if interrupt_run_id:
+                if await _get_run_system_only(interrupt_run_id):
+                    source_run_system_only = True
+                exec_row = await _get_execution_for_run_id(interrupt_run_id)
+                target_exec = exec_row
+                match_kind = "hitl_resume_run" if exec_row is not None else "none"
         else:
             target_exec, match_kind = await _resolve_source_execution(
                 request,
@@ -665,15 +695,25 @@ async def _resolve_automation_notification_context(
                 retry_of_run_id=retry_of_run_id,
                 allow_running_fallback=allow_running_fallback,
             )
-            if is_hitl_resume and not source_run_system_only:
-                latest_run = await _get_latest_run_for_thread(thread_id)
-                latest_meta = (latest_run or {}).get("metadata") if isinstance(latest_run, Mapping) else None
-                if isinstance(latest_meta, Mapping) and bool(latest_meta.get("llm_model_system_only")):
-                    source_run_system_only = True
-                if target_exec is None and isinstance(latest_run, Mapping):
-                    latest_run_id = str(latest_run.get("conversation_response_id") or "")
-                    if latest_run_id:
-                        exec_row = await _get_execution_for_run_id(latest_run_id)
+            if (
+                target_exec is None
+                and not source_run_system_only
+                and getattr(request, "query_type", None) == "wakeup"
+            ):
+                wakeup_ids = extract_wakeup_notice_ids(request)
+                if wakeup_ids:
+                    creator_run_ids = await _get_wakeup_creator_run_ids(thread_id, wakeup_ids)
+                    for creator_run_id in creator_run_ids:
+                        if await _get_run_system_only(creator_run_id):
+                            source_run_system_only = True
+                            break
+            if is_hitl_resume:
+                interrupt_run_id = await _get_hitl_interrupt_run_id(thread_id, request)
+                if interrupt_run_id:
+                    if not source_run_system_only and await _get_run_system_only(interrupt_run_id):
+                        source_run_system_only = True
+                    if target_exec is None:
+                        exec_row = await _get_execution_for_run_id(interrupt_run_id)
                         if exec_row is not None:
                             target_exec = exec_row
                             match_kind = "hitl_resume_run"
@@ -1008,9 +1048,7 @@ async def resolve_turn_config_with_automation_inheritance(
             from_service=from_service,
             is_server_retry=is_server_retry,
             retry_of_run_id=retry_of_run_id,
-            allow_running_fallback=(
-                requested_model is None and flagged_subscription is None
-            ),
+            allow_running_fallback=(flagged_subscription is None),
             resolve_model=(requested_model is None),
         )
 
@@ -1026,12 +1064,14 @@ async def resolve_turn_config_with_automation_inheritance(
     )
     if on_automation_context is not None:
         ctx_meta: dict[str, Any] = {}
-        if provenance_for_context and target_exec is not None:
+        if target_exec is not None and (provenance_for_context or inherited_system_only):
             exec_id = target_exec.get("automation_execution_id")
             if exec_id:
                 # Stamp automation_source_execution_id (NOT automation_execution_id) so
                 # restart recovery never mistakes a wakeup/continuation/retry run for a
-                # scheduler-refirable firing turn while still preserving provenance.
+                # scheduler-refirable firing turn while still preserving provenance
+                # (including running_thread continuations carrying llm_model_system_only so
+                # subsequent wakeups find their execution via created_by_run_id).
                 ctx_meta["automation_source_execution_id"] = str(exec_id)
                 if confirmed_for_context and effort_configured:
                     ctx_meta["automation_reasoning_effort_configured"] = True

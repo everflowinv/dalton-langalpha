@@ -171,6 +171,38 @@ async def clear_pending_handoff_after_brief(
         )
 
 
+# DALTON-HOOK(cos-settings-tools): stamp owner_model_switch_run_id when deferred handoff settles so post-handoff manual compaction uses the owner's selection
+async def _settle_pending_model_handoff(
+    thread_id: str, *, version: str | None
+) -> None:
+    cleared = await clear_pending_model_handoff(thread_id, version=version)
+    if not cleared:
+        return
+    try:
+        from collections.abc import Mapping
+
+        from src.dalton.database import model_switch as dalton_model_switch_db
+        from src.server.database.runs import lifecycle as _runs_lifecycle
+
+        latest = await _runs_lifecycle.get_latest_attempt(thread_id)
+        if (
+            isinstance(latest, Mapping)
+            and (latest.get("metadata") or {}).get("llm_model_system_only")
+            and latest.get("conversation_response_id")
+        ):
+            await dalton_model_switch_db.set_thread_metadata_key(
+                thread_id,
+                "owner_model_switch_run_id",
+                str(latest["conversation_response_id"]),
+            )
+    except Exception:
+        logger.debug(
+            "[handoff] thread %s: failed stamping owner_model_switch_run_id on settle",
+            thread_id,
+            exc_info=True,
+        )
+
+
 async def run_pending_model_handoff(
     thread_id: str,
     *,
@@ -206,7 +238,7 @@ async def run_pending_model_handoff(
                 return "retryable_failure"
             owed = await _brief_handoff_still_owed(thread_id)
             if not owed:
-                await clear_pending_model_handoff(thread_id, version=ctx.version)
+                await _settle_pending_model_handoff(thread_id, version=ctx.version)
                 return "not_needed"
             started = await brief_on_switch(
                 thread_id, ctx.user_id, ctx.current_model
@@ -217,7 +249,7 @@ async def run_pending_model_handoff(
                 except Exception:
                     still_owed = True
                 if not still_owed:
-                    await clear_pending_model_handoff(thread_id, version=ctx.version)
+                    await _settle_pending_model_handoff(thread_id, version=ctx.version)
                     return "not_needed"
                 logger.warning(
                     f"[handoff] thread {thread_id}: deferred brief could not start; keeping pending marker"
@@ -254,7 +286,7 @@ async def run_pending_model_handoff(
                 if saw_retryable:
                     pre_status = "retryable_failure"
             if pre_status == "not_needed":
-                await clear_pending_model_handoff(thread_id, version=ctx.version)
+                await _settle_pending_model_handoff(thread_id, version=ctx.version)
                 return "not_needed"
             if pre_status != "ready":
                 logger.warning(
@@ -269,7 +301,7 @@ async def run_pending_model_handoff(
                     thread_id, ctx.user_id, source
                 )
                 if recheck_status == "not_needed":
-                    await clear_pending_model_handoff(thread_id, version=ctx.version)
+                    await _settle_pending_model_handoff(thread_id, version=ctx.version)
                     return "not_needed"
                 logger.warning(
                     f"[handoff] thread {thread_id}: deferred summary handoff could not start ({recheck_status}); keeping pending marker"
@@ -292,7 +324,7 @@ async def run_pending_model_handoff(
                 )
                 return "retryable_failure"
 
-        await clear_pending_model_handoff(thread_id, version=ctx.version)
+        await _settle_pending_model_handoff(thread_id, version=ctx.version)
         return "completed"
     except Exception:
         logger.warning(

@@ -727,6 +727,8 @@ async def update_thread_endpoint(
         if "archived" in provided and request.archived is not None:
             updates["archived"] = request.archived
         switched_from: str | None = None
+        prev_system_only = False
+        latest_run_model: str | None = None
         if "llm_model" in provided:
             # null returns the thread to the account default; a name has to
             # resolve to a model, in the catalog or the user's own, or every
@@ -735,21 +737,41 @@ async def update_thread_endpoint(
             if request.llm_model is not None:
                 await require_selectable_model(x_user_id, request.llm_model)
             updates["llm_model"] = request.llm_model
-            switched_from = (await get_thread_auth_meta(thread_id) or {}).get("llm_model")
-            # DALTON-HOOK(cos-settings-tools): record owner model switch after a system-only run so immediate manual compaction uses the owner's selection
+            prev_thread_meta = await get_thread_auth_meta(thread_id) or {}
+            switched_from = prev_thread_meta.get("llm_model")
+            # DALTON-HOOK(cos-settings-tools): record owner model switch after a system-only run and compare (model, system_only) for handoff
             try:
                 from src.server.database.runs import lifecycle as _runs_lifecycle
 
                 _latest_attempt = await _runs_lifecycle.get_latest_attempt(thread_id)
+                _latest_meta = (
+                    _latest_attempt.get("metadata")
+                    if isinstance(_latest_attempt, dict)
+                    and isinstance(_latest_attempt.get("metadata"), dict)
+                    else {}
+                )
                 if (
                     isinstance(_latest_attempt, dict)
-                    and (_latest_attempt.get("metadata") or {}).get("llm_model_system_only")
+                    and _latest_meta.get("llm_model_system_only")
                     and _latest_attempt.get("conversation_response_id")
                 ):
+                    _latest_run_id = str(_latest_attempt["conversation_response_id"])
+                    _prev_meta_dict = (
+                        prev_thread_meta.get("metadata")
+                        if isinstance(prev_thread_meta.get("metadata"), dict)
+                        else {}
+                    )
+                    _already_switched = (
+                        str(_prev_meta_dict.get("owner_model_switch_run_id") or "").strip()
+                        == _latest_run_id
+                    )
+                    prev_system_only = not _already_switched
+                    raw_latest_model = _latest_meta.get("llm_model")
+                    latest_run_model = (
+                        str(raw_latest_model).strip() if raw_latest_model else None
+                    )
                     updates["metadata_merge"] = {
-                        "owner_model_switch_run_id": str(
-                            _latest_attempt["conversation_response_id"]
-                        )
+                        "owner_model_switch_run_id": _latest_run_id
                     }
             except Exception:
                 logger.debug(
@@ -838,11 +860,20 @@ async def update_thread_endpoint(
                 # only be dropped; its computer need not stay up for it.
                 await request_running_stops(thread_id=thread_id, by="archive")
         item = _thread_list_item(updated_thread)
-        if "llm_model" in updates and updates["llm_model"] != switched_from:
+        # DALTON-HOOK(cos-settings-tools): compare (model, system_only) so switching from system-only to a same-named custom model triggers handoff
+        _model_identity_changed = "llm_model" in updates and (
+            (updates["llm_model"], False) != (switched_from, prev_system_only)
+        )
+        if _model_identity_changed:
             from src.server.handlers.handoff_brief import brief_on_switch
             from src.server.handlers.thread_maintenance import hand_off_on_switch
             from src.server.services.llm.thread_model import next_turn_runs_claude_code
 
+            _handoff_source = (
+                switched_from
+                if switched_from is not None
+                else (latest_run_model if prev_system_only else None)
+            )
             # Claude Code reads none of the thread's messages, so a brief of
             # all of them takes the place of any summary written out for it.
             # The switch is committed: a failed read leaves the hand-off to
@@ -858,7 +889,7 @@ async def update_thread_endpoint(
                 item.brief_handoff = await brief_on_switch(thread_id, x_user_id, updates["llm_model"])
             else:
                 item.summary_handoff = await hand_off_on_switch(
-                    thread_id, x_user_id, switched_from
+                    thread_id, x_user_id, _handoff_source
                 )
         return item
 

@@ -60,7 +60,7 @@ async def reassign_planned_thread_llm_models(
 async def set_thread_metadata_key(
     conversation_thread_id: str,
     key: str,
-    value: dict[str, Any],
+    value: Any,
 ) -> bool:
     """Merge ``{key: value}`` into ``conversation_threads.metadata`` atomically.
 

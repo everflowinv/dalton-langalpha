@@ -546,7 +546,7 @@ async def _resolver(
         is_byok=(await own_access(user_id, sign_ins=False)).api_keys,
         enabled_subagents=latest_meta.get("subagents_enabled"),
         # DALTON-HOOK(cos-settings-tools): preserve system-only catalog resolution for compaction and model-switch handoff
-        ignore_custom_models=effective_ignore_custom,
+        **({"ignore_custom_models": True} if effective_ignore_custom else {}),
     )
 
 

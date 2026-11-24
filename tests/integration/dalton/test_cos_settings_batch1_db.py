@@ -8,6 +8,7 @@ Run outside the sandbox against a temporary *_test PostgreSQL database:
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from typing import Any
 from unittest.mock import create_autospec
@@ -46,7 +47,76 @@ _POOL_HOLDERS = (
     ws_move_db,
 )
 
-pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
+# Must share the session event loop with ``test_db_pool`` (``scope="session"``);
+# otherwise ``psycopg_pool``'s background workers live on the paused session loop and
+# cannot grow the pool beyond ``min_size=1`` when a second concurrent task checks out a connection.
+pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="session")]
+
+
+async def _wait_for_lock_waiter(
+    test_db_uri: str,
+    *,
+    blocker_pid: int,
+    waiter_task: asyncio.Task[Any],
+    holder_task: asyncio.Task[Any] | None = None,
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Poll ``pg_stat_activity`` until ``waiter_task`` is blocked on a PostgreSQL Lock held by ``blocker_pid``."""
+    deadline = time.monotonic() + timeout
+    async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as probe_conn:
+        async with probe_conn.cursor(row_factory=dict_row) as cur:
+            while time.monotonic() < deadline:
+                if waiter_task.done():
+                    exc = waiter_task.exception()
+                    if exc is not None:
+                        raise AssertionError(
+                            f"Waiter task raised before blocking on pid {blocker_pid}: {exc!r}"
+                        ) from exc
+                    raise AssertionError(
+                        f"Waiter task completed without blocking on pid {blocker_pid}: "
+                        f"{waiter_task.result()!r}"
+                    )
+                if holder_task is not None and holder_task.done():
+                    exc = holder_task.exception()
+                    if exc is not None:
+                        raise AssertionError(
+                            f"Holder task raised while holding lock (pid {blocker_pid}): {exc!r}"
+                        ) from exc
+                    raise AssertionError(
+                        f"Holder task ended early before waiter blocked (pid {blocker_pid}): "
+                        f"{holder_task.result()!r}"
+                    )
+                await cur.execute(
+                    """
+                    SELECT pid, state, wait_event_type, wait_event, query,
+                           pg_blocking_pids(pid) AS blocking_pids
+                    FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND pid <> pg_backend_pid()
+                      AND %(blocker_pid)s = ANY(pg_blocking_pids(pid))
+                    LIMIT 1
+                    """,
+                    {"blocker_pid": blocker_pid},
+                )
+                row = await cur.fetchone()
+                if row is not None:
+                    return dict(row)
+                await asyncio.sleep(0.05)
+            await cur.execute(
+                """
+                SELECT pid, state, wait_event_type, wait_event,
+                       pg_blocking_pids(pid) AS blocking_pids,
+                       LEFT(query, 200) AS query
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND pid <> pg_backend_pid()
+                """
+            )
+            snapshot = [dict(r) for r in (await cur.fetchall() or ())]
+    raise AssertionError(
+        f"Expected another session blocked by pid {blocker_pid} within {timeout}s; "
+        f"pg_stat_activity={snapshot!r}"
+    )
 
 
 async def _setup_user_and_two_computers(user_id: str) -> tuple[str, str, str]:
@@ -119,22 +189,30 @@ async def test_automation_tx_for_share_blocks_concurrent_commit_workspace_move_u
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """While schedule_dalton_automation_helper holds FOR SHARE on computers + workspaces,
-    a concurrent commit_workspace_move on another connection blocks until the automation tx commits."""
+    a concurrent commit_workspace_move on another connection blocks on Lock until commit."""
     _stub_catalog(monkeypatch)
     user_id = f"b1-lock-{uuid.uuid4().hex[:10]}"
     c1_id, c2_id, ws_id = await _setup_user_and_two_computers(user_id)
 
     locks_held = asyncio.Event()
     allow_commit = asyncio.Event()
+    holder_pid_box: list[int] = []
     orig_create = auto_db.create_automation
 
     async def _paused_create(*args: Any, **kwargs: Any) -> Any:
         # Called inside the open transaction AFTER _lock_and_verify_workspace_placement took FOR SHARE
+        locked_conn = kwargs.get("conn")
+        assert locked_conn is not None, "create_automation must run on the locked transaction connection"
+        holder_pid_box.append(int(locked_conn.info.backend_pid))
         locks_held.set()
-        await asyncio.wait_for(allow_commit.wait(), timeout=5.0)
+        await asyncio.wait_for(allow_commit.wait(), timeout=15.0)
         return await orig_create(*args, **kwargs)
 
-    monkeypatch.setattr(auto_db, "create_automation", _paused_create)
+    monkeypatch.setattr(
+        auto_db,
+        "create_automation",
+        create_autospec(orig_create, side_effect=_paused_create),
+    )
 
     auto_task = asyncio.create_task(
         schedule_mod.schedule_dalton_automation_helper(
@@ -150,38 +228,60 @@ async def test_automation_tx_for_share_blocks_concurrent_commit_workspace_move_u
             workspace_id=ws_id,
         )
     )
-    await asyncio.wait_for(locks_held.wait(), timeout=5.0)
+    commit_task: asyncio.Task[Any] | None = None
+    try:
+        await asyncio.wait_for(locks_held.wait(), timeout=5.0)
 
-    # On a separate connection, insert a staged move row with valid runner_id and source_folder
-    # so commit_workspace_move attempts FOR UPDATE OF w while auto_task holds FOR SHARE.
-    move_id = str(uuid.uuid4())
-    runner_id = str(uuid.uuid4())
-    async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as aux_conn:
-        async with aux_conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                """
-                INSERT INTO workspace_moves (
-                    move_id, workspace_id, user_id, source_computer_id, target_computer_id,
-                    phase, make_primary, runner_id, source_folder, leftovers_path,
-                    staged_at, heartbeat_at
+        # On a separate connection, insert a staged move row with valid runner_id and source_folder
+        # so commit_workspace_move attempts FOR UPDATE OF w while auto_task holds FOR SHARE.
+        move_id = str(uuid.uuid4())
+        runner_id = str(uuid.uuid4())
+        async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as aux_conn:
+            async with aux_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO workspace_moves (
+                        move_id, workspace_id, user_id, source_computer_id, target_computer_id,
+                        phase, make_primary, runner_id, source_folder, leftovers_path,
+                        staged_at, heartbeat_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, 'staged', false, %s, %s, %s, NOW(), NOW())
+                    """,
+                    (move_id, ws_id, user_id, c1_id, c2_id, runner_id, "NVDA", None),
                 )
-                VALUES (%s, %s, %s, %s, %s, 'staged', false, %s, %s, %s, NOW(), NOW())
-                """,
-                (move_id, ws_id, user_id, c1_id, c2_id, runner_id, "NVDA", None),
-            )
 
-    commit_task = asyncio.create_task(commit_workspace_move(move_id, runner_id))
-    # commit_workspace_move must stay blocked waiting on the FOR SHARE lock held by auto_task
-    done, _pending = await asyncio.wait({commit_task}, timeout=0.3)
-    assert not done, "commit_workspace_move bypassed FOR SHARE lock held by automation transaction"
+        commit_task = asyncio.create_task(commit_workspace_move(move_id, runner_id))
+        await asyncio.sleep(0)
+        # Confirm via pg_stat_activity / pg_blocking_pids that commit_workspace_move is blocked by auto_task's lock holder pid
+        holder_pid = holder_pid_box[0]
+        waiter = await _wait_for_lock_waiter(
+            test_db_uri,
+            blocker_pid=holder_pid,
+            waiter_task=commit_task,
+            holder_task=auto_task,
+            timeout=5.0,
+        )
+        assert waiter["pid"] != holder_pid
+        assert holder_pid in waiter["blocking_pids"]
+        assert waiter["wait_event_type"] == "Lock"
+        assert not commit_task.done(), "commit_workspace_move bypassed FOR SHARE lock held by automation transaction"
 
-    allow_commit.set()
-    auto_res = await asyncio.wait_for(auto_task, timeout=5.0)
-    assert auto_res["ok"] is True
+        allow_commit.set()
+        auto_res = await asyncio.wait_for(auto_task, timeout=5.0)
+        assert auto_res["ok"] is True
 
-    committed = await asyncio.wait_for(commit_task, timeout=5.0)
-    assert committed is not None
-    assert str(committed["phase"]) == "committed"
+        committed = await asyncio.wait_for(commit_task, timeout=5.0)
+        assert committed is not None
+        assert str(committed["phase"]) == "committed"
+    finally:
+        allow_commit.set()
+        for pending in (auto_task, commit_task):
+            if pending is not None and not pending.done():
+                pending.cancel()
+        await asyncio.gather(
+            *(t for t in (auto_task, commit_task) if t is not None),
+            return_exceptions=True,
+        )
 
 
 async def test_concurrent_workspace_move_before_lock_refuses_automation_save_with_workspace_changed(
@@ -205,7 +305,11 @@ async def test_concurrent_workspace_move_before_lock_refuses_automation_save_wit
         await asyncio.wait_for(move_finished.wait(), timeout=5.0)
         return snap
 
-    monkeypatch.setattr(schedule_mod, "_read_workspace_computer_snapshot", _paused_snapshot)
+    monkeypatch.setattr(
+        schedule_mod,
+        "_read_workspace_computer_snapshot",
+        create_autospec(orig_snapshot, side_effect=_paused_snapshot),
+    )
 
     auto_task = asyncio.create_task(
         schedule_mod.schedule_dalton_automation_helper(
@@ -263,6 +367,7 @@ async def test_waiting_automation_tx_observes_just_committed_workspace_move_afte
 
     ws_locked_by_move = asyncio.Event()
     release_move_tx = asyncio.Event()
+    holder_pid_box: list[int] = []
 
     async def _holding_move_claim() -> None:
         async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=False) as conn:
@@ -271,8 +376,9 @@ async def test_waiting_automation_tx_observes_just_committed_workspace_move_afte
                     "SELECT workspace_id FROM workspaces WHERE workspace_id = %s FOR UPDATE",
                     (ws_id,),
                 )
+                holder_pid_box.append(int(conn.info.backend_pid))
                 ws_locked_by_move.set()
-                await asyncio.wait_for(release_move_tx.wait(), timeout=5.0)
+                await asyncio.wait_for(release_move_tx.wait(), timeout=15.0)
                 await cur.execute(
                     """
                     INSERT INTO workspace_moves (
@@ -286,34 +392,56 @@ async def test_waiting_automation_tx_observes_just_committed_workspace_move_afte
             await conn.commit()
 
     move_holder = asyncio.create_task(_holding_move_claim())
-    await asyncio.wait_for(ws_locked_by_move.wait(), timeout=5.0)
+    auto_task: asyncio.Task[Any] | None = None
+    try:
+        await asyncio.wait_for(ws_locked_by_move.wait(), timeout=5.0)
 
-    auto_task = asyncio.create_task(
-        schedule_mod.schedule_dalton_automation_helper(
-            "dalton-nvda-watch",
-            {
-                "trigger_type": "cron",
-                "cron_expression": "0 9 * * 1-5",
-                "instruction": "Monitor NVDA.",
-                "llm_model": "claude-sonnet-4-6",
-            },
-            user_id=user_id,
-            workspace_id=ws_id,
+        auto_task = asyncio.create_task(
+            schedule_mod.schedule_dalton_automation_helper(
+                "dalton-nvda-watch",
+                {
+                    "trigger_type": "cron",
+                    "cron_expression": "0 9 * * 1-5",
+                    "instruction": "Monitor NVDA.",
+                    "llm_model": "claude-sonnet-4-6",
+                },
+                user_id=user_id,
+                workspace_id=ws_id,
+            )
         )
-    )
-    # Give auto_task time to reach FOR SHARE on workspaces and block behind move_holder
-    done, _pending = await asyncio.wait({auto_task}, timeout=0.3)
-    assert not done, "automation tx should wait behind FOR UPDATE on workspaces"
+        await asyncio.sleep(0)
+        # Confirm via pg_stat_activity / pg_blocking_pids that auto_task is actively blocked by move_holder's pid
+        holder_pid = holder_pid_box[0]
+        waiter = await _wait_for_lock_waiter(
+            test_db_uri,
+            blocker_pid=holder_pid,
+            waiter_task=auto_task,
+            holder_task=move_holder,
+            timeout=5.0,
+        )
+        assert waiter["pid"] != holder_pid
+        assert holder_pid in waiter["blocking_pids"]
+        assert waiter["wait_event_type"] == "Lock"
+        assert not auto_task.done(), "automation tx should wait behind FOR UPDATE on workspaces"
 
-    release_move_tx.set()
-    await asyncio.wait_for(move_holder, timeout=5.0)
+        release_move_tx.set()
+        await asyncio.wait_for(move_holder, timeout=5.0)
 
-    auto_res = await asyncio.wait_for(auto_task, timeout=5.0)
-    assert auto_res["ok"] is False
-    assert auto_res["error"] == "workspace_changed"
-    assert auto_res["message"] == "情况已变化，请重新发起"
-    rows = await auto_db.list_all_automations(user_id)
-    assert rows == []
+        auto_res = await asyncio.wait_for(auto_task, timeout=5.0)
+        assert auto_res["ok"] is False
+        assert auto_res["error"] == "workspace_changed"
+        assert auto_res["message"] == "情况已变化，请重新发起"
+        rows = await auto_db.list_all_automations(user_id)
+        assert rows == []
+    finally:
+        release_move_tx.set()
+        for pending in (move_holder, auto_task):
+            if pending is not None and not pending.done():
+                pending.cancel()
+        await asyncio.gather(
+            *(t for t in (move_holder, auto_task) if t is not None),
+            return_exceptions=True,
+        )
 
 
 async def test_home_earnings_calendar_owner_vs_other_home_job_on_real_db(
