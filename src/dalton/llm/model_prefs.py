@@ -1609,11 +1609,11 @@ def collect_auto_pruned_data_task_routes(
     stored_routes: Any = None,
 ) -> dict[str, tuple[list[str], list[str]]]:
     """Return ``{route_key: (old_targets, new_targets)}`` for ``data:*`` routes auto-pruned for the primary admin."""
-    from src.dalton.settings import get_configured_pm_user_ids
+    from src.dalton.access_tiers import get_primary_admin_user_id_sync
 
     uid = str(user_id or "").strip()
-    pm_ids = get_configured_pm_user_ids()
-    if not uid or not pm_ids or uid != pm_ids[0]:
+    primary_admin = get_primary_admin_user_id_sync()
+    if not uid or not primary_admin or uid != primary_admin:
         return {}
     if not isinstance(post_validation_routes, Mapping) or not isinstance(stored_routes, Mapping):
         return {}

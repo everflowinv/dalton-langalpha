@@ -36,6 +36,10 @@ vi.mock('@/config/daltonAuth', () => ({
   get isDaltonAuth() {
     return h.isDaltonAuth;
   },
+  isDaltonLocalAuth: false,
+  get isDaltonSupabaseAuth() {
+    return h.isDaltonAuth;
+  },
 }));
 
 vi.mock('@/config/hostMode', () => ({

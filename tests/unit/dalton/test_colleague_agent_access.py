@@ -3750,12 +3750,15 @@ class TestCapabilityAndPrompts:
             profile=DeploymentProfile.CORE, environ={}, dalton_enabled=True
         )
 
-        # local auth mode: multiuser auth is True, sharing auth stays False
+        # local auth mode (Batch 4b wires dalton_user_roles): sharing follows the capability
         monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
         monkeypatch.setenv("DALTON_AUTH_MODE", "local")
         monkeypatch.setenv("DALTON_CAP_COLLEAGUE_SHARING", "true")
         assert is_dalton_multiuser_auth_enabled() is True
+        assert is_dalton_sharing_auth_enabled() is True
+        monkeypatch.setenv("DALTON_CAP_COLLEAGUE_SHARING", "false")
         assert is_dalton_sharing_auth_enabled() is False
+        monkeypatch.setenv("DALTON_CAP_COLLEAGUE_SHARING", "true")
 
         # supabase auth + COLLEAGUE_SHARING=false -> sharing False, multiuser True
         monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")

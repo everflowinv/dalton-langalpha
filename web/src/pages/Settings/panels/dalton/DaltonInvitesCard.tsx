@@ -4,7 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { Check, Copy, UserPlus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useLocale } from '@/hooks/useLocale';
-import { isDaltonAuth } from '@/config/daltonAuth';
+import { isDaltonAuth, isDaltonLocalAuth } from '@/config/daltonAuth';
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { copyText } from '@/lib/clipboard';
 import { formatTimestamp } from '@/lib/format';
@@ -15,6 +15,7 @@ import {
   revokeDaltonInvite,
   type DaltonInviteItem,
   type DaltonInviteStatus,
+  type DaltonInviteTier,
 } from '@/pages/Settings/utils/daltonApi';
 import type { DaltonSettingVisibilityContext } from './DaltonCosSharingCard';
 import {
@@ -58,8 +59,11 @@ export function DaltonInvitesCard({
 }) {
   const { t } = useTranslation();
   const locale = useLocale();
-  const { canInvite } = useTeamCredentials();
+  const { canInvite, callerTier: hookCallerTier } = useTeamCredentials();
   const queryClient = useQueryClient();
+  const effectiveTier = ctx?.callerTier ?? hookCallerTier;
+  const canPickTier = isDaltonLocalAuth && effectiveTier === 'admin';
+  const [selectedTier, setSelectedTier] = useState<DaltonInviteTier>('external');
 
   const [createdUrl, setCreatedUrl] = useState<{ url: string; expiresAt: string | null } | null>(
     null,
@@ -81,7 +85,7 @@ export function DaltonInvitesCard({
   });
 
   const createMutation = useMutation({
-    mutationFn: createDaltonInvite,
+    mutationFn: (tier?: DaltonInviteTier) => createDaltonInvite(tier),
     onSuccess: (created) => {
       const origin = typeof window !== 'undefined' ? window.location.origin : '';
       const rawUrl = created.url || created.invite_url || '';
@@ -130,6 +134,19 @@ export function DaltonInvitesCard({
     }
   };
 
+  const tierLabel = (tier?: DaltonInviteTier) => {
+    switch (tier) {
+      case 'admin':
+        return t('auth.invites.tierAdmin');
+      case 'internal':
+        return t('auth.invites.tierInternal');
+      case 'external':
+        return t('auth.invites.tierExternal');
+      default:
+        return null;
+    }
+  };
+
   return (
     <DaltonSettingsCard
       id="dalton-invites"
@@ -149,13 +166,32 @@ export function DaltonInvitesCard({
               })}
             />
           )}
+          {canPickTier && (
+            <select
+              aria-label={t('auth.invites.tierLabel')}
+              data-testid="dalton-invites-tier-select"
+              value={selectedTier}
+              onChange={(e) => setSelectedTier(e.target.value as DaltonInviteTier)}
+              disabled={createMutation.isPending}
+              className="h-8 rounded-md border px-2 text-xs"
+              style={{
+                backgroundColor: 'var(--color-bg-card)',
+                borderColor: 'var(--color-border-muted)',
+                color: 'var(--color-text-primary)',
+              }}
+            >
+              <option value="external">{t('auth.invites.tierExternal')}</option>
+              <option value="internal">{t('auth.invites.tierInternal')}</option>
+              <option value="admin">{t('auth.invites.tierAdmin')}</option>
+            </select>
+          )}
           <Button
             type="button"
             variant="outline"
             size="sm"
             className="h-8 gap-1.5 text-xs"
             disabled={createMutation.isPending}
-            onClick={() => createMutation.mutate()}
+            onClick={() => createMutation.mutate(canPickTier ? selectedTier : undefined)}
             data-testid="dalton-invites-generate"
           >
             <UserPlus className="h-3.5 w-3.5" />
@@ -231,7 +267,12 @@ export function DaltonInvitesCard({
                   />
                 }
                 title={
-                  <span className="font-mono text-xs">{item.invite_id.slice(0, 12)}</span>
+                  <span className="inline-flex items-center gap-2">
+                    <span className="font-mono text-xs">{item.invite_id.slice(0, 12)}</span>
+                    {isDaltonLocalAuth && tierLabel(item.tier) && (
+                      <DaltonStatusBadge tone="neutral" label={tierLabel(item.tier)!} />
+                    )}
+                  </span>
                 }
                 meta={
                   <span className="flex flex-wrap gap-x-3 gap-y-0.5">

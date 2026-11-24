@@ -80,9 +80,15 @@ services:
       fake-llm:
         condition: service_healthy
     environment:
+      # CI check groups toggle between `oss` and `local` against one initialized `.env`
+      # (docker-compose.core.yml intentionally keeps auth keys strictly in `env_file: .env`).
+      DALTON_AUTH_MODE: ${DALTON_AUTH_MODE:-oss}
+      DALTON_ALLOW_DEV_OSS_AUTH: ${DALTON_ALLOW_DEV_OSS_AUTH:-}
       # Operator allowlist for private/internal LLM endpoints (enforced in Batch 4+
       # egress checks; declared here from Batch 1 so CI stays consistent across batches).
       DALTON_OPERATOR_LLM_ENDPOINTS: ${DALTON_OPERATOR_LLM_ENDPOINTS:-http://fake-llm:8099/v1}
+      DALTON_AUTH_COOKIE_SECURE: ${DALTON_AUTH_COOKIE_SECURE:-}
+      GINLIX_DATA_URL: ${CI_GINLIX_DATA_URL:-}
       FAKE_LLM_BASE_URL: http://fake-llm:8099/v1
       FAKE_LLM_MODEL: ${FAKE_LLM_MODEL:-gpt-6-luna}
       # Ensure no external search provider API keys leak into CI runs so

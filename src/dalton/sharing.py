@@ -14,7 +14,7 @@ workspace is never reachable from another member's Chief of Staff.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from contextvars import ContextVar
 from typing import Any
 
@@ -34,6 +34,7 @@ from src.dalton.settings import (
     get_dalton_allowed_emails,
     get_dalton_settings,
     is_colleague_dispatch_enabled,
+    is_dalton_local_auth_enabled,
     is_dalton_sharing_auth_enabled,
     is_dalton_supabase_auth_enabled as _default_is_dalton_supabase_auth_enabled,
 )
@@ -104,11 +105,11 @@ class OwnerTierUnavailable(HTTPException):
 
 
 def _classify_owner_row_tier(owner_id: str | None, owner_email: Any) -> str:
-    """Classify a workspace owner from the row's joined email, with exactly the
-    ``classify_owner_tier`` rules (PM -> admin, allowlisted email -> internal,
-    everything else -> external); a missing email or any failing roster read
-    is ``unknown`` so list loops skip the row instead of applying an isolation
-    rule to a guess."""
+    """Classify a workspace owner from the row's joined email (or ``dalton_user_roles`` in ``local`` mode)."""
+    if is_dalton_local_auth_enabled():
+        from src.dalton.access_tiers import classify_owner_tier_sync
+
+        return classify_owner_tier_sync(owner_id, owner_email)
     uid = str(owner_id or "").strip()
     if not uid:
         return "unknown"
@@ -117,14 +118,16 @@ def _classify_owner_row_tier(owner_id: str | None, owner_email: Any) -> str:
     try:
         if is_invite_pm(uid):
             return "admin"
-        email = str(owner_email or "").strip().lower()
-        if not email:
-            return "unknown"
+    except Exception:
+        return "unknown"
+    email = str(owner_email or "").strip().lower()
+    if not email:
+        return "unknown"
+    try:
         if email in get_dalton_allowed_emails():
             return "internal"
         return "external"
     except Exception:
-        # A single unclassifiable row must not fail the whole listing.
         return "unknown"
 
 
@@ -167,8 +170,9 @@ def can_edit_workspace_sharing(
         return False
     if owner_id and uid == owner_id:
         return True
-    pm_ids = get_dalton_settings().pm_user_ids
-    return uid in pm_ids
+    from src.dalton.access_tiers import is_admin_user_sync
+
+    return is_admin_user_sync(uid, include_config_defaults=True)
 
 
 async def get_workspace_sharing(
@@ -235,6 +239,79 @@ async def get_workspace_sharing(
             else updated_at
         ),
     }
+
+
+async def get_workspaces_sharing_batch(
+    workspace_ids: Iterable[str],
+    *,
+    conn: Any = None,
+) -> dict[str, dict[str, Any]]:
+    """Batch-fetch ``dalton_workspace_sharing`` rows for multiple workspaces in one query.
+
+    Missing rows default to ``cos_access=DEFAULT_COS_ACCESS`` and
+    ``web_access=DEFAULT_WEB_ACCESS`` (identical to :func:`get_workspace_sharing`).
+    """
+    unique_ids = sorted({str(wid or "").strip() for wid in workspace_ids if str(wid or "").strip()})
+    if not unique_ids:
+        return {}
+
+    result: dict[str, dict[str, Any]] = {
+        wid: {
+            "workspace_id": wid,
+            "cos_access": DEFAULT_COS_ACCESS,
+            "web_access": DEFAULT_WEB_ACCESS,
+            "updated_by": None,
+            "updated_at": None,
+        }
+        for wid in unique_ids
+    }
+
+    try:
+        async with get_db_connection(conn) as owned_conn:
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT workspace_id::text AS workspace_id, cos_access, web_access, updated_by, updated_at
+                    FROM dalton_workspace_sharing
+                    WHERE workspace_id = ANY(%s::uuid[])
+                    """,
+                    (unique_ids,),
+                )
+                rows = await cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Failed to batch-read dalton_workspace_sharing (%d workspaces): %s",
+            len(unique_ids),
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Workspace sharing settings unavailable",
+        ) from exc
+
+    for row in rows or []:
+        wid = str(row.get("workspace_id") or "").strip()
+        if not wid:
+            continue
+        updated_at = row.get("updated_at")
+        result[wid] = {
+            "workspace_id": wid,
+            "cos_access": _normalize_access_level(
+                row.get("cos_access"), DEFAULT_COS_ACCESS
+            ),
+            "web_access": _normalize_access_level(
+                row.get("web_access"), DEFAULT_WEB_ACCESS
+            ),
+            "updated_by": row.get("updated_by"),
+            "updated_at": (
+                updated_at.isoformat()
+                if hasattr(updated_at, "isoformat")
+                else updated_at
+            ),
+        }
+    return result
 
 
 async def upsert_workspace_sharing(
@@ -781,15 +858,28 @@ async def resolve_turn_team_memory_enabled(
 
 
 async def require_team_reader(user_id: str | None, *, conn: Any = None) -> str:
-    """Verify caller is authenticated and in DALTON_ALLOWED_EMAILS when Dalton auth is on.
+    """Verify caller is authenticated and a team member when Dalton multi-user auth is on.
 
     Raises:
         HTTPException(401): Missing or empty user_id.
-        HTTPException(403): Caller is not in DALTON_ALLOWED_EMAILS.
+        HTTPException(403): Caller is not a team member (``dalton_user_roles`` in ``local`` mode,
+            ``DALTON_ALLOWED_EMAILS ∪ dalton_members`` in ``supabase`` mode).
     """
     uid = (user_id or "").strip()
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
+
+    if is_dalton_local_auth_enabled():
+        from src.dalton.access_tiers import is_team_member_user
+
+        is_member = (
+            await is_team_member_user(uid, conn=conn)
+            if conn is not None
+            else await is_team_member_user(uid)
+        )
+        if is_member:
+            return uid
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     if not is_dalton_supabase_auth_enabled():
         return uid
@@ -832,6 +922,73 @@ async def require_team_reader(user_id: str | None, *, conn: Any = None) -> str:
         raise HTTPException(status_code=403, detail="Forbidden")
 
     return uid
+
+
+async def batch_check_team_readers(
+    user_ids: Iterable[str],
+    *,
+    conn: Any = None,
+) -> set[str]:
+    """Batch-verify which ``user_ids`` satisfy :func:`require_team_reader` in one query.
+
+    Avoids per-owner N+1 user/membership queries when evaluating workspace write access
+    across a list of coverage units.
+    """
+    unique_ids = sorted({str(u or "").strip() for u in user_ids if str(u or "").strip()})
+    if not unique_ids:
+        return set()
+
+    if is_dalton_local_auth_enabled():
+        from src.dalton.auth.roles import get_user_roles_batch
+
+        roles = (
+            await get_user_roles_batch(unique_ids, conn=conn)
+            if conn is not None
+            else await get_user_roles_batch(unique_ids)
+        )
+        return {uid for uid, role in roles.items() if role is not None}
+
+    if not is_dalton_supabase_auth_enabled():
+        return set(unique_ids)
+
+    allowed_emails = (
+        await get_team_member_emails(conn=conn)
+        if conn is not None
+        else await get_team_member_emails()
+    )
+    try:
+        async with get_db_connection(conn) as owned_conn:
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT
+                        u.user_id,
+                        LOWER(BTRIM(u.email)) AS email,
+                        EXISTS (
+                            SELECT 1 FROM dalton_members dm
+                            WHERE dm.email = LOWER(BTRIM(u.email))
+                        ) AS in_members
+                    FROM users u
+                    WHERE u.user_id = ANY(%s::text[])
+                    """,
+                    (unique_ids,),
+                )
+                rows = await cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("Failed to batch-verify team readers (%d users): %s", len(unique_ids), exc)
+        raise HTTPException(
+            status_code=503, detail="Team reader verification unavailable"
+        ) from exc
+
+    valid: set[str] = set()
+    for row in rows or []:
+        uid = str(row.get("user_id") or "").strip()
+        email = str(row.get("email") or "").strip().lower()
+        if uid and email and (email in allowed_emails or bool(row.get("in_members"))):
+            valid.add(uid)
+    return valid
 
 
 async def require_workspace_access(
@@ -1050,7 +1207,10 @@ async def require_thread_access(
         await auth_api.require_thread_owner(thread_id, uid, conn=conn)
         return uid
 
-    await require_team_reader(uid)
+    if conn is not None:
+        await require_team_reader(uid, conn=conn)
+    else:
+        await require_team_reader(uid)
 
     meta: dict[str, Any] | None = None
     resolved_workspace_id = workspace_id
@@ -1091,7 +1251,12 @@ async def require_thread_access(
     #    Read access is exempt from workspace revocation/deletion only on the web channel;
     #    Chief of Staff ('cos') still requires workspace access on 'cos'.
     if is_colleague_thread and uid == thread_owner:
-        if await get_user_tier(uid) == "external":
+        caller_tier = (
+            await get_user_tier(uid, conn=conn)
+            if conn is not None
+            else await get_user_tier(uid)
+        )
+        if caller_tier == "external":
             raise HTTPException(status_code=404, detail="Thread not found")
         if cleaned_need == "read" and cleaned_channel == "web":
             return thread_owner
@@ -2148,14 +2313,27 @@ async def list_team_workspaces(current_user_id: str, *, conn: Any = None) -> lis
     if not _sharing_auth_enabled():
         return []
 
-    uid = await require_team_reader(current_user_id)
+    uid = (
+        await require_team_reader(current_user_id, conn=conn)
+        if conn is not None
+        else await require_team_reader(current_user_id)
+    )
     # Fully isolated environment: external members see no colleague workspace.
-    caller_tier = await get_user_tier(uid)
+    caller_tier = (
+        await get_user_tier(uid, conn=conn)
+        if conn is not None
+        else await get_user_tier(uid)
+    )
     if caller_tier in ("external", "company"):
         return []
-    allowed_emails = sorted(await get_team_member_emails())
+    allowed_emails = sorted(
+        await get_team_member_emails(conn=conn)
+        if conn is not None
+        else await get_team_member_emails()
+    )
 
     dispatch_enabled = is_colleague_dispatch_enabled()
+    owner_tiers: dict[str, str] = {}
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.cursor(row_factory=dict_row) as cur:
             if dispatch_enabled:
@@ -2239,10 +2417,20 @@ async def list_team_workspaces(current_user_id: str, *, conn: Any = None) -> lis
                     (uid, allowed_emails),
                 )
             rows = [dict(r) for r in await cur.fetchall()]
+        if is_dalton_local_auth_enabled() and rows:
+            from src.dalton.access_tiers import classify_owner_tiers_batch
+
+            owner_ids = [
+                str(r["user_id"])
+                for r in rows
+                if not (is_reserved_row(r) or bool(r.get("is_home")))
+            ]
+            owner_tiers = dict(
+                await classify_owner_tiers_batch(owner_ids, conn=owned_conn)
+            )
 
     grouped: dict[str, dict[str, Any]] = {}
     default_cos = "rw" if dispatch_enabled else DEFAULT_COS_ACCESS
-    owner_tiers: dict[str, str] = {}
     for row in rows:
         if is_reserved_row(row) or bool(row.get("is_home")):
             continue
@@ -2273,7 +2461,12 @@ async def list_team_workspaces(current_user_id: str, *, conn: Any = None) -> lis
             cos_access = _normalize_access_level(row.get("cos_access"), default_cos)
 
         owner_email = str(row.get("owner_email") or "").strip()
-        if not await is_team_member(owner_email):
+        member_ok = (
+            await is_team_member(owner_email, conn=conn)
+            if conn is not None
+            else await is_team_member(owner_email)
+        )
+        if not member_ok:
             continue
         owner_display = _display_name(row.get("owner_name"), owner_email)
         member = grouped.get(owner_uid)
@@ -2347,6 +2540,7 @@ async def list_colleague_cos_workspaces(
     allowed_emails = sorted(await get_team_member_emails())
 
     dispatch_enabled = is_colleague_dispatch_enabled()
+    owner_tiers: dict[str, str] = {}
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             if dispatch_enabled:
@@ -2428,13 +2622,24 @@ async def list_colleague_cos_workspaces(
                     (uid, allowed_emails),
                 )
             rows = [dict(r) for r in await cur.fetchall()]
+        if is_dalton_local_auth_enabled() and rows:
+            from src.dalton.access_tiers import classify_owner_tiers_batch
+
+            owner_ids = [
+                str(r["user_id"])
+                for r in rows
+                if not (is_reserved_row(r) or bool(r.get("is_home")))
+            ]
+            owner_tiers = dict(
+                await classify_owner_tiers_batch(owner_ids, conn=conn)
+            )
 
     items: list[dict[str, Any]] = []
     # An external-owned workspace never appears in another member's Chief of
-    # Staff list, whatever its sharing row says. The owner tier is classified
-    # from the joined email (no per-owner lookup).
+    # Staff list, whatever its sharing row says. In local mode owner tiers are
+    # batch-loaded above via one async query; in Supabase mode classified from
+    # the joined email (no per-owner lookup).
     default_cos = "rw" if dispatch_enabled else DEFAULT_COS_ACCESS
-    owner_tiers: dict[str, str] = {}
     for row in rows:
         if is_reserved_row(row) or bool(row.get("is_home")):
             continue

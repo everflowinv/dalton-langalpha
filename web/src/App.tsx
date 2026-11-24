@@ -68,6 +68,9 @@ const ResetPassword = React.lazy(() => import('./pages/Login/ResetPassword'));
 const InviteRedeemPage = React.lazy(() => import('./lib/dalton/InviteRedeemPage'));
 // DALTON-HOOK(monitors): anonymous read-only viewer route for public monitors (/m/:slug)
 const PublicMonitorPage = React.lazy(() => import('./pages/Monitors/PublicMonitorPage'));
+// DALTON-HOOK(standalone-core): first-admin bootstrap route (/setup/admin) in local auth mode
+const AdminBootstrapStep = React.lazy(() => import('./pages/Setup/AdminBootstrapStep'));
+import { isDaltonLocalAuth } from './config/daltonAuth';
 // DALTON-HOOK(hide-trading): Dalton builds redirect /welcome onto the Chief of Staff interview
 import { isDaltonBuild } from './config/brand';
 import { DaltonOnboardingRedirect } from './pages/Onboarding/dalton/interview';
@@ -452,7 +455,9 @@ function AppearanceSync() {
 }
 
 function App() {
-  const { isLoggedIn, isInitialized, userId } = useAuth();
+  const { isLoggedIn, isInitialized, userId, needsBootstrap } = useAuth(); // DALTON-HOOK(standalone-core): route unbootstrapped local deployments to /setup/admin
+  const unauthenticatedTarget =
+    isDaltonLocalAuth && needsBootstrap ? '/setup/admin' : APP_ENTRY_PATH;
 
   useEffect(() => setSentryUser(isLoggedIn ? userId : null), [isLoggedIn, userId]);
 
@@ -478,6 +483,9 @@ function App() {
 
   const appEntryElement = isLoggedIn ? (
     <RootRedirect />
+  ) : isDaltonLocalAuth && needsBootstrap ? (
+    // DALTON-HOOK(standalone-core): guide fresh local-auth installs to first-admin bootstrap
+    <Navigate to="/setup/admin" replace />
   ) : (
     <HostedSignInGate>
       <Suspense fallback={<PageLoading />}>
@@ -547,6 +555,16 @@ function App() {
           <Legal />
         </Suspense>
       } />
+      {/* DALTON-HOOK(standalone-core): unauthenticated first-admin bootstrap route; permanently redirects once completed */}
+      <Route path="/setup/admin" element={
+        isDaltonLocalAuth && !isLoggedIn && needsBootstrap ? (
+          <Suspense fallback={<PageLoading />}>
+            <AdminBootstrapStep />
+          </Suspense>
+        ) : (
+          <Navigate to={isLoggedIn ? '/dashboard' : APP_ENTRY_PATH} replace />
+        )
+      } />
       <Route path="/setup/*" element={
         isLoggedIn ? (
           <SuspendedGate>
@@ -555,7 +573,7 @@ function App() {
             </Suspense>
           </SuspendedGate>
         ) : (
-          <Navigate to={APP_ENTRY_PATH} replace />
+          <Navigate to={unauthenticatedTarget} replace />
         )
       } />
       {/* The desktop shell's menu bar window. None of the app shell, and its
@@ -567,7 +585,8 @@ function App() {
         </Suspense>
       } />
       <Route path="/*" element={
-        isLoggedIn ? <SuspendedGate><AuthenticatedShell /></SuspendedGate> : <Navigate to={APP_ENTRY_PATH} replace />
+        /* DALTON-HOOK(standalone-core): redirect unauthenticated users to bootstrap or login target */
+        isLoggedIn ? <SuspendedGate><AuthenticatedShell /></SuspendedGate> : <Navigate to={unauthenticatedTarget} replace />
       } />
     </Routes>
     </AriaLocale>

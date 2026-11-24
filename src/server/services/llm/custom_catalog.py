@@ -311,6 +311,25 @@ async def refuse_custom_model_endpoints(
                 detail=f"custom_models[{idx}]: parameters.{key} cannot be set. Remove it.",
             )
         to_check.extend((idx, url) for url in egress.parameter_urls(params))
+    # DALTON-HOOK(standalone-core): enforce address-based egress rules in core local auth (no identity exemption)
+    from src.dalton.llm.egress_policy import (
+        check_core_endpoint_refusal,
+        get_saved_team_endpoints,
+        is_core_llm_egress_enforced,
+    )
+
+    if is_core_llm_egress_enforced():
+        saved_team = await get_saved_team_endpoints()
+        for idx, url in to_check:
+            reason, _ = await check_core_endpoint_refusal(
+                url, require_resolution=True, saved_team_endpoints=saved_team
+            )
+            if reason:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"custom_models[{idx}]: the base URL in parameters cannot be used: {reason}",
+                )
+        return
     reasons = await egress.save_refusals(url for _, url in to_check)
     for idx, url in to_check:
         if reasons[url]:

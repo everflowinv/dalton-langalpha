@@ -33,6 +33,7 @@
 			fields {
 				request>uri query {
 					replace token REDACTED
+					replace ticket REDACTED
 				}
 				request>headers>X-Service-Token delete
 				request>headers>X-User-Id delete

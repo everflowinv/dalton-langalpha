@@ -172,6 +172,16 @@ def _require_pm_user(user_id: str) -> None:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
 
 
+async def _require_pm_user_async(user_id: str) -> None:
+    _require_dalton_enabled()
+    from src.dalton.autonomy.system_jobs import require_pm_user_async
+
+    try:
+        await require_pm_user_async(user_id)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+
 async def _verify_workspace_access(workspace_id: str, user_id: str) -> dict[str, Any]:
     """Verify that ``workspace_id`` belongs to ``user_id`` fail-closed (G2 #2, R4-8, R5-1, P0J §8.1 #14)."""
     _require_dalton_enabled()
@@ -431,10 +441,10 @@ async def get_workspace_sharing_endpoint(
 ) -> dict[str, Any]:
     require_capability(CapabilityId.COLLEAGUE_SHARING)
     from src.server.database.home_workspace import is_home_row
-    from src.dalton.access_tiers import classify_owner_tier, get_user_tier
+    from src.dalton.access_tiers import classify_owner_tier, get_user_tier, is_admin_user
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
-        is_dalton_supabase_auth_enabled,
+        is_dalton_auth_enabled,
     )
     from src.dalton.sharing import (
         can_edit_workspace_sharing,
@@ -448,8 +458,8 @@ async def get_workspace_sharing_endpoint(
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    is_pm = uid in get_dalton_settings().pm_user_ids
-    if is_dalton_supabase_auth_enabled() and not is_pm:
+    is_pm = await is_admin_user(uid, include_config_defaults=True)
+    if is_dalton_auth_enabled() and not is_pm:
         await require_team_reader(uid)
 
     ws = await ws_db.get_workspace(workspace_id)
@@ -465,7 +475,7 @@ async def get_workspace_sharing_endpoint(
     # unresolvable) workspaces get 404; an external-owned Home is 404 even
     # for admins (never shown to anyone but its owner).
     owner_tier: str | None = None
-    if is_dalton_supabase_auth_enabled() and owner_id and owner_id != uid:
+    if is_dalton_auth_enabled() and owner_id and owner_id != uid:
         caller_tier = await get_user_tier(uid)
         if caller_tier == "external":
             raise HTTPException(status_code=404, detail="Workspace not found")
@@ -495,7 +505,7 @@ async def get_workspace_sharing_endpoint(
     effective_owner_tier = owner_tier
     if (
         effective_owner_tier is None
-        and is_dalton_supabase_auth_enabled()
+        and is_dalton_auth_enabled()
         and owner_id
     ):
         effective_owner_tier = await classify_owner_tier(owner_id)
@@ -529,7 +539,7 @@ async def get_workspace_sharing_endpoint(
 
     can_edit = can_edit_workspace_sharing(ws, uid)
     if not can_edit:
-        if is_dalton_supabase_auth_enabled():
+        if is_dalton_auth_enabled():
             await require_workspace_access(
                 ws,
                 uid,
@@ -565,9 +575,10 @@ async def update_workspace_sharing_endpoint(
 ) -> dict[str, Any]:
     require_capability(CapabilityId.COLLEAGUE_SHARING)
     from src.server.database.home_workspace import is_home_row
+    from src.dalton.access_tiers import is_admin_user
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
-        is_dalton_supabase_auth_enabled,
+        is_dalton_auth_enabled,
     )
     from src.dalton.sharing import (
         VALID_ACCESS_LEVELS,
@@ -582,8 +593,8 @@ async def update_workspace_sharing_endpoint(
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    is_pm = uid in get_dalton_settings().pm_user_ids
-    if is_dalton_supabase_auth_enabled() and not is_pm:
+    is_pm = await is_admin_user(uid, include_config_defaults=True)
+    if is_dalton_auth_enabled() and not is_pm:
         await require_team_reader(uid)
 
     ws = await ws_db.get_workspace(workspace_id)
@@ -598,7 +609,7 @@ async def update_workspace_sharing_endpoint(
     # callers get 404 for external-owned and unresolvable workspaces; an
     # external-owned Home is 404 even for admins (never shown to anyone).
     owner_tier: str | None = None
-    if is_dalton_supabase_auth_enabled() and owner_id and owner_id != uid:
+    if is_dalton_auth_enabled() and owner_id and owner_id != uid:
         from src.dalton.access_tiers import classify_owner_tier, get_user_tier
 
         caller_tier = await get_user_tier(uid)
@@ -624,7 +635,7 @@ async def update_workspace_sharing_endpoint(
     effective_owner_tier = owner_tier
     if (
         effective_owner_tier is None
-        and is_dalton_supabase_auth_enabled()
+        and is_dalton_auth_enabled()
         and owner_id
     ):
         from src.dalton.access_tiers import classify_owner_tier
@@ -701,8 +712,8 @@ async def get_workspace_settings_endpoint(
     workspace_id: str,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    from src.dalton.access_tiers import classify_owner_tier, get_user_tier
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.access_tiers import classify_owner_tier, get_user_tier, is_admin_user
+    from src.dalton.settings import is_dalton_auth_enabled
     from src.dalton.sharing import (
         can_edit_workspace_settings,
         get_workspace_settings,
@@ -717,8 +728,8 @@ async def get_workspace_settings_endpoint(
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    is_pm = uid in get_dalton_settings().pm_user_ids
-    if is_dalton_supabase_auth_enabled() and not is_pm:
+    is_pm = await is_admin_user(uid, include_config_defaults=True)
+    if is_dalton_auth_enabled() and not is_pm:
         await require_team_reader(uid)
 
     ws = await ws_db.get_workspace(workspace_id)
@@ -729,7 +740,7 @@ async def get_workspace_settings_endpoint(
     owner_id = str(ws.get("user_id") or "").strip()
 
     owner_tier: str | None = None
-    if is_dalton_supabase_auth_enabled() and owner_id and owner_id != uid:
+    if is_dalton_auth_enabled() and owner_id and owner_id != uid:
         caller_tier = await get_user_tier(uid)
         if caller_tier == "external":
             raise HTTPException(status_code=404, detail="Workspace not found")
@@ -758,7 +769,7 @@ async def get_workspace_settings_endpoint(
     effective_owner_tier = owner_tier
     if (
         effective_owner_tier is None
-        and is_dalton_supabase_auth_enabled()
+        and is_dalton_auth_enabled()
         and owner_id
     ):
         effective_owner_tier = await classify_owner_tier(owner_id)
@@ -784,7 +795,7 @@ async def get_workspace_settings_endpoint(
 
     can_edit = can_edit_workspace_settings(ws, uid, owner_external=owner_external)
     if not can_edit:
-        if is_dalton_supabase_auth_enabled():
+        if is_dalton_auth_enabled():
             await require_workspace_access(
                 ws,
                 uid,
@@ -814,8 +825,8 @@ async def update_workspace_settings_endpoint(
     body: WorkspaceSettingsUpdateRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    from src.dalton.access_tiers import classify_owner_tier, get_user_tier
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.access_tiers import classify_owner_tier, get_user_tier, is_admin_user
+    from src.dalton.settings import is_dalton_auth_enabled
     from src.dalton.sharing import (
         can_edit_workspace_settings,
         get_workspace_sharing,
@@ -829,8 +840,8 @@ async def update_workspace_settings_endpoint(
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    is_pm = uid in get_dalton_settings().pm_user_ids
-    if is_dalton_supabase_auth_enabled() and not is_pm:
+    is_pm = await is_admin_user(uid, include_config_defaults=True)
+    if is_dalton_auth_enabled() and not is_pm:
         await require_team_reader(uid)
 
     ws = await ws_db.get_workspace(workspace_id)
@@ -841,7 +852,7 @@ async def update_workspace_settings_endpoint(
     owner_id = str(ws.get("user_id") or "").strip()
 
     owner_tier: str | None = None
-    if is_dalton_supabase_auth_enabled() and owner_id and owner_id != uid:
+    if is_dalton_auth_enabled() and owner_id and owner_id != uid:
         caller_tier = await get_user_tier(uid)
         if caller_tier == "external":
             raise HTTPException(status_code=404, detail="Workspace not found")
@@ -865,7 +876,7 @@ async def update_workspace_settings_endpoint(
     effective_owner_tier = owner_tier
     if (
         effective_owner_tier is None
-        and is_dalton_supabase_auth_enabled()
+        and is_dalton_auth_enabled()
         and owner_id
     ):
         effective_owner_tier = await classify_owner_tier(owner_id)
@@ -1588,11 +1599,12 @@ async def _resolve_tracking_workspace_owner(
 ) -> tuple[str, bool]:
     """Verify workspace access for tracking and return ``(task_owner_user_id, can_edit)``."""
     _require_dalton_enabled()
+    from src.dalton.access_tiers import is_admin_user
     from src.dalton.autonomy.tracking import resolve_workspace_tracking_owner
     from src.dalton.database.coverage_units import get_active_unit_by_workspace
     from src.dalton.settings import (
         is_coverage_units_enabled,
-        is_dalton_supabase_auth_enabled,
+        is_dalton_auth_enabled,
     )
     from src.dalton.sharing import (
         EXTERNAL_OWNED_ADMIN_WRITE_FORBIDDEN_DETAIL,
@@ -1603,10 +1615,10 @@ async def _resolve_tracking_workspace_owner(
     from src.server.database import workspace as ws_db
 
     uid = str(user_id or "").strip()
-    is_pm = bool(uid and uid in get_dalton_settings().pm_user_ids)
+    is_pm = await is_admin_user(uid, include_config_defaults=True)
     units_on = is_coverage_units_enabled()
 
-    if is_dalton_supabase_auth_enabled():
+    if is_dalton_auth_enabled():
         from src.dalton.access_tiers import classify_owner_tier
 
         workspace = await require_workspace_reader(workspace_id, uid)
@@ -1818,13 +1830,12 @@ async def update_workspace_tracking_endpoint(
 async def _authorize_system_job_mutation(key: str, user_id: str) -> str:
     """Resolve effective owner ``user_id`` for company/sector/data jobs; Home/host/ops permissions are enforced in ``system_jobs``."""
     _require_dalton_enabled()
-    from src.dalton.access_tiers import get_user_tier
+    from src.dalton.access_tiers import get_primary_admin_user_id, get_user_tier
     from src.dalton.autonomy.system_jobs import (
         _resolve_company_workspace_id,
         _resolve_sector_unit_for_key,
         classify_system_job_key,
     )
-    from src.dalton.settings import get_configured_pm_user_ids
 
     cleaned_key_lower = str(key or "").strip().lower()
     if cleaned_key_lower.startswith("data:"):
@@ -1844,13 +1855,13 @@ async def _authorize_system_job_mutation(key: str, user_id: str) -> str:
                 status_code=403,
                 detail="仅内部成员可操作公司公共数据任务",
             )
-        pm_ids = get_configured_pm_user_ids()
-        if not pm_ids:
+        primary_admin = await get_primary_admin_user_id()
+        if not primary_admin:
             raise HTTPException(
                 status_code=503,
                 detail="未配置首位管理员 DALTON_PM_USER_IDS，无法操作数据任务",
             )
-        return pm_ids[0]
+        return primary_admin
 
     if scope == "ops":
         require_capability(CapabilityId.RESEARCHDATA_BRIDGE)
@@ -2326,6 +2337,10 @@ async def put_user_earnings_calendar_mirror_endpoint(
         raise HTTPException(status_code=400, detail=msg) from exc
 
 
+class InviteCreateRequest(BaseModel):
+    tier: str | None = None
+
+
 class InviteCheckRequest(BaseModel):
     token: str
 
@@ -2340,10 +2355,14 @@ class InviteRedeemRequest(BaseModel):
 @handle_api_exceptions("create dalton invite", logger)
 async def create_invite_endpoint(
     user_id: CurrentUserId,
+    body: InviteCreateRequest | None = None,
 ) -> dict[str, Any]:
     from src.dalton.invites import create_invite_for_pm
 
-    return await create_invite_for_pm(user_id)
+    return await create_invite_for_pm(
+        user_id,
+        tier=body.tier if body is not None else None,
+    )
 
 
 @router.get("/invites")
@@ -2435,15 +2454,15 @@ class FeishuReadScopesUpdateRequest(BaseModel):
     scopes: list[FeishuScopeEntry] = Field(max_length=200)
 
 
-def _require_feishu_admin(user_id: str | None) -> str:
-    """Require a PM user (`DALTON_PM_USER_IDS`) for read-scope and space-list management."""
+async def _require_feishu_admin(user_id: str | None) -> str:
+    """Require an administrator (`dalton_user_roles` in `local` mode, `DALTON_PM_USER_IDS` otherwise)."""
     require_capability(CapabilityId.FEISHU_DOCS)
-    from src.dalton.invites import is_invite_pm
+    from src.dalton.access_tiers import is_admin_user
 
     uid = str(user_id or "").strip()
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
-    if not is_invite_pm(uid):
+    if not await is_admin_user(uid):
         raise HTTPException(status_code=403, detail="仅管理员可管理飞书读取范围")
     return uid
 
@@ -2458,7 +2477,7 @@ async def list_feishu_read_scopes_endpoint(
 ) -> dict[str, Any]:
     from src.dalton.database.feishu import list_read_scopes
 
-    _require_feishu_admin(user_id)
+    await _require_feishu_admin(user_id)
     return {"scopes": await list_read_scopes()}
 
 
@@ -2473,7 +2492,7 @@ async def update_feishu_read_scopes_endpoint(
 ) -> dict[str, Any]:
     from src.dalton.database.feishu import replace_read_scopes
 
-    uid = _require_feishu_admin(user_id)
+    uid = await _require_feishu_admin(user_id)
     try:
         scopes = await replace_read_scopes(
             [entry.model_dump() for entry in body.scopes],
@@ -2494,7 +2513,7 @@ async def list_feishu_spaces_endpoint(
 ) -> dict[str, Any]:
     from src.dalton.feishu import FeishuBridgeError, post_bridge_feishu
 
-    _require_feishu_admin(user_id)
+    await _require_feishu_admin(user_id)
     try:
         res = await post_bridge_feishu("wiki/nodes", {"space_id": ""})
     except FeishuBridgeError as exc:

@@ -25,6 +25,7 @@ ENV_EXAMPLE="${REPO_ROOT}/.env.core.example"
 NON_INTERACTIVE=0
 DOMAIN_ARG=""
 BUILD_SANDBOX=1
+SCRIPT_WROTE_LOCAL_AUTH=0
 
 usage() {
   cat <<'EOF'
@@ -32,8 +33,9 @@ Usage: bash scripts/standalone/init.sh [OPTIONS]
 
 Options:
   --non-interactive       Do not prompt; use defaults / flags / existing .env values.
-  --domain <host>         localhost, 127.0.0.1 or ::1 (the default). A public domain
-                          is accepted once local sign-in ships (Batch 4b).
+  --domain <host>         localhost, 127.0.0.1 or ::1 (loopback passwordless trial, default),
+                          or a public domain (automatically enables DALTON_AUTH_MODE=local
+                          and VITE_DALTON_AUTH=local).
   --skip-sandbox-build    Leave the code sandbox image unbuilt (build it later with
                           docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest .).
   -h, --help              Show this help message.
@@ -225,6 +227,148 @@ get_env_value() {
   printf '%s' "${line#*=}"
 }
 
+get_env_value_any() {
+  local key="$1"
+  [[ -f "$ENV_FILE" ]] || return 0
+  # Parse `.env` following Docker Compose env-file syntax:
+  # - ignores blank lines and `#` comments, strips CR (`\r`), supports `export`
+  # - accepts both `KEY=value` and `KEY: value` assignments
+  # - preserves `#` inside single/double quotes and strips unquoted inline `#` comments
+  awk -v k="$key" '
+    function parse_val(s,    q, out, i, n, ch, nxt) {
+      sub(/^[[:space:]]+/, "", s)
+      if (s == "") return ""
+      q = substr(s, 1, 1)
+      if (q == "\"") {
+        out = ""
+        n = length(s)
+        for (i = 2; i <= n; i++) {
+          ch = substr(s, i, 1)
+          if (ch == "\\" && i < n) {
+            nxt = substr(s, i + 1, 1)
+            out = out nxt
+            i++
+          } else if (ch == "\"") {
+            return out
+          } else {
+            out = out ch
+          }
+        }
+        return out
+      }
+      if (q == "\047") {
+        n = index(substr(s, 2), "\047")
+        if (n > 0) {
+          return substr(s, 2, n - 1)
+        }
+        return substr(s, 2)
+      }
+      if (substr(s, 1, 1) == "#") return ""
+      sub(/[[:space:]]+#.*$/, "", s)
+      sub(/[[:space:]]+$/, "", s)
+      return s
+    }
+    {
+      line = $0
+      sub(/\r$/, "", line)
+      sub(/^[[:space:]]+/, "", line)
+      if (line == "" || substr(line, 1, 1) == "#") next
+      if (line ~ /^export[[:space:]]+/) {
+        sub(/^export[[:space:]]+/, "", line)
+      }
+      if (substr(line, 1, length(k)) == k) {
+        rest = substr(line, length(k) + 1)
+        if (rest ~ /^[[:space:]]*[=:]/) {
+          sub(/^[[:space:]]*[=:]/, "", rest)
+          val = parse_val(rest)
+        }
+      }
+    }
+    END {
+      if (val != "") print val
+    }
+  ' "$ENV_FILE" 2>/dev/null || true
+}
+
+count_env_key_assignments() {
+  local key="$1"
+  if [[ ! -f "$ENV_FILE" ]]; then
+    printf '0'
+    return 0
+  fi
+  awk -v k="$key" '
+    BEGIN { count = 0 }
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line ~ /^export[[:space:]]+/) {
+        sub(/^export[[:space:]]+/, "", line)
+      }
+      if (substr(line, 1, length(k)) == k) {
+        rest = substr(line, length(k) + 1)
+        if (rest ~ /^[[:space:]]*[=:]/) {
+          count++
+        }
+      }
+    }
+    END { print count }
+  ' "$ENV_FILE"
+}
+
+remove_env_key_all() {
+  local key="$1"
+  [[ -f "$ENV_FILE" ]] || return 0
+  local env_dir tmp
+  env_dir="$(dirname "$ENV_FILE")"
+  tmp="$(mktemp "${env_dir}/.env.tmp.XXXXXX")"
+  chmod 600 "$tmp"
+  awk -v k="$key" '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      if (line ~ /^export[[:space:]]+/) {
+        sub(/^export[[:space:]]+/, "", line)
+      }
+      if (substr(line, 1, length(k)) == k) {
+        rest = substr(line, length(k) + 1)
+        if (rest ~ /^[[:space:]]*[=:]/) {
+          next
+        }
+      }
+      print $0
+    }
+  ' "$ENV_FILE" > "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$ENV_FILE"
+}
+
+append_env_key_unique() {
+  local key="$1" val="$2"
+  remove_env_key_all "$key"
+  local env_dir tmp
+  env_dir="$(dirname "$ENV_FILE")"
+  tmp="$(mktemp "${env_dir}/.env.tmp.XXXXXX")"
+  chmod 600 "$tmp"
+  if [[ -f "$ENV_FILE" ]]; then
+    cat "$ENV_FILE" > "$tmp"
+  fi
+  printf '%s=%s\n' "$key" "$val" >> "$tmp"
+  chmod 600 "$tmp"
+  mv "$tmp" "$ENV_FILE"
+}
+
+configure_public_domain_local_auth() {
+  local domain_val="$1"
+  remove_env_key_all "DALTON_AUTH_MODE"
+  remove_env_key_all "DALTON_ALLOW_DEV_OSS_AUTH"
+  remove_env_key_all "DOMAIN"
+  remove_env_key_all "VITE_DALTON_AUTH"
+  append_env_key_unique "DALTON_AUTH_MODE" "local"
+  append_env_key_unique "DOMAIN" "$domain_val"
+  append_env_key_unique "VITE_DALTON_AUTH" "local"
+  SCRIPT_WROTE_LOCAL_AUTH=1
+}
+
 write_env_key() {
   local key="$1" val="$2"
   local env_dir tmp
@@ -285,20 +429,25 @@ is_loopback_domain() {
 
 validate_domain_for_auth() {
   local domain_val="$1"
-  # Until local sign-in ships (Batch 4b), a core install has no login screen,
-  # so it installs on a loopback address only. Batch 4b's init writes the
-  # local auth mode itself before it accepts a public domain.
-  if ! is_loopback_domain "$domain_val"; then
-    err "当前核心版是免密单机试用，请先用 localhost 安装；正式对外部署等本地登录（Batch 4b）上线后再配置域名。（读到的域名：'${domain_val}'；.env 里请写成单独一行 DOMAIN=localhost，不加引号。）"
+  if is_loopback_domain "$domain_val"; then
+    return 0
+  fi
+  if [[ "$SCRIPT_WROTE_LOCAL_AUTH" -ne 1 ]]; then
+    err "公网域名 '${domain_val}' 仅在脚本本次写入 DALTON_AUTH_MODE=local 后才放行，拒绝在免密模式或未规范化的 .env 下继续。"
+    exit 1
+  fi
+  local auth_count allow_dev_count auth_val
+  auth_count="$(count_env_key_assignments "DALTON_AUTH_MODE")"
+  allow_dev_count="$(count_env_key_assignments "DALTON_ALLOW_DEV_OSS_AUTH")"
+  auth_val="$(get_env_value "DALTON_AUTH_MODE")"
+  if [[ "$auth_count" -ne 1 || "$auth_val" != "local" || "$allow_dev_count" -ne 0 ]]; then
+    err "公网域名 '${domain_val}' 校验失败：.env 必须仅包含唯一的 DALTON_AUTH_MODE=local 且不得包含 DALTON_ALLOW_DEV_OSS_AUTH。"
     exit 1
   fi
 }
 
 main() {
   printf "\nDalton Standalone Core Initialization\n"
-  if [[ -n "$DOMAIN_ARG" ]]; then
-    validate_domain_for_auth "$DOMAIN_ARG"
-  fi
   check_environment
   print_docker_sock_notice
 
@@ -325,23 +474,31 @@ main() {
 
   # Resolve target domain
   local existing_domain domain
-  existing_domain="$(get_env_value "DOMAIN")"
+  existing_domain="$(get_env_value_any "DOMAIN")"
   if [[ -n "$DOMAIN_ARG" ]]; then
     domain="$DOMAIN_ARG"
-    validate_domain_for_auth "$domain"
-    write_env_key "DOMAIN" "$domain"
   elif [[ -n "$existing_domain" ]]; then
     domain="$existing_domain"
-    validate_domain_for_auth "$domain"
   elif [[ "$NON_INTERACTIVE" -eq 1 ]]; then
     domain="localhost"
-    validate_domain_for_auth "$domain"
-    write_env_key "DOMAIN" "$domain"
   else
-    read -r -p "  Target domain (use 'localhost' for loopback trial) [localhost]: " domain
+    read -r -p "  Target domain (use 'localhost' for loopback trial, or a public domain for local auth) [localhost]: " domain
     domain="${domain:-localhost}"
-    validate_domain_for_auth "$domain"
+  fi
+
+  if [[ "$domain" =~ [[:space:]\'\"\$\\] ]]; then
+    err "Invalid domain value '${domain}': whitespace, quotes, and shell metacharacters are not allowed."
+    exit 1
+  fi
+
+  if is_loopback_domain "$domain"; then
     write_env_key "DOMAIN" "$domain"
+    set_env_if_empty "DALTON_AUTH_MODE" "oss" || true
+    set_env_if_empty "DALTON_ALLOW_DEV_OSS_AUTH" "1" || true
+    validate_domain_for_auth "$domain"
+  else
+    configure_public_domain_local_auth "$domain"
+    validate_domain_for_auth "$domain"
   fi
   ok "DOMAIN=${domain}"
 
@@ -379,9 +536,19 @@ main() {
     set_env_if_empty "SERVER_BASE_URL" "http://127.0.0.1:${edge_port}" || true
     set_env_if_empty "DALTON_INVITE_EMAIL_DOMAIN" "team.dalton.local" || true
   else
-    set_env_if_empty "PUBLIC_APP_URL" "https://${domain}" || true
-    set_env_if_empty "SERVER_BASE_URL" "https://${domain}" || true
-    set_env_if_empty "DALTON_INVITE_EMAIL_DOMAIN" "team.${domain}" || true
+    local cur_pub cur_srv cur_inv
+    cur_pub="$(get_env_value "PUBLIC_APP_URL")"
+    cur_srv="$(get_env_value "SERVER_BASE_URL")"
+    cur_inv="$(get_env_value "DALTON_INVITE_EMAIL_DOMAIN")"
+    if [[ -z "$cur_pub" || "$cur_pub" == "http://127.0.0.1:8088" || "$cur_pub" == "http://127.0.0.1:${edge_port}" ]]; then
+      write_env_key "PUBLIC_APP_URL" "https://${domain}"
+    fi
+    if [[ -z "$cur_srv" || "$cur_srv" == "http://127.0.0.1:8088" || "$cur_srv" == "http://127.0.0.1:${edge_port}" ]]; then
+      write_env_key "SERVER_BASE_URL" "https://${domain}"
+    fi
+    if [[ -z "$cur_inv" || "$cur_inv" == "team.dalton.local" ]]; then
+      write_env_key "DALTON_INVITE_EMAIL_DOMAIN" "team.${domain}"
+    fi
   fi
 
   # Generate all secrets with `openssl rand -hex 32` without overwriting existing values.
@@ -454,9 +621,12 @@ main() {
     fi
   fi
 
+  local vite_auth
+  vite_auth="$(get_env_value_any "VITE_DALTON_AUTH")"
+
   printf "\n== Next Steps ==\n"
   if [[ "$NON_INTERACTIVE" -eq 0 ]]; then
-    cat <<'EOF'
+    cat <<EOF
   1. Configure LLM provider keys, optional financial data (FMP), and optional
      web search/fetch keys via the interactive setup wizard:
        make config
@@ -464,13 +634,17 @@ main() {
   2. Optional: set SEC_USER_AGENT="Dalton <your-email@example.com>" in .env
      for SEC EDGAR compliance identification.
 
-  3. Start the Standalone Core stack:
+  3. Build edge with VITE_DALTON_AUTH from .env and start the Standalone Core stack:
+       docker compose -f docker-compose.yml -f docker-compose.core.yml build --build-arg VITE_DALTON_AUTH="${vite_auth}" edge
        docker compose -f docker-compose.yml -f docker-compose.core.yml up -d
+     (Whenever you switch DALTON_AUTH_MODE / VITE_DALTON_AUTH in .env, rebuild edge
+      so the frontend bundle picks up the new authentication mode.)
 
   4. Open the web UI at http://127.0.0.1:8088 (loopback mode).
 EOF
   else
-    info "Non-interactive initialization complete (APP_ENV=core, DOMAIN=${domain})."
+    info "Non-interactive initialization complete (APP_ENV=core, DOMAIN=${domain}, VITE_DALTON_AUTH=${vite_auth:-<empty>})."
+    info "Build edge with: docker compose -f docker-compose.yml -f docker-compose.core.yml build --build-arg VITE_DALTON_AUTH=${vite_auth} edge"
     info "Start the stack with: docker compose -f docker-compose.yml -f docker-compose.core.yml up -d"
   fi
 }

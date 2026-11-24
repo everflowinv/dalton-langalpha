@@ -13,9 +13,15 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from uuid import uuid4
+
 import httpx
 from fastapi import HTTPException, Request
+from psycopg import errors as pg_errors
+from psycopg.rows import dict_row
+from psycopg.types.json import Json
 
+from src.dalton.company_identity import COMPANY_SYSTEM_EMAIL
 from src.dalton.database import members as members_db
 from src.dalton.settings import (
     get_configured_pm_user_ids,
@@ -25,6 +31,7 @@ from src.dalton.settings import (
     get_dalton_trusted_proxies,
     get_supabase_secret_key,
     get_supabase_url,
+    is_dalton_local_auth_enabled,
 )
 from src.server.database.pool import get_db_connection
 from src.utils.cache.redis_cache import get_cache_client
@@ -41,6 +48,8 @@ MAX_ADMIN_USER_PAGES = 1000
 
 USERNAME_PATTERN = re.compile(r"^[a-z0-9._-]{3,32}$")
 MIN_PASSWORD_LENGTH = 10
+VALID_INVITE_TIERS: frozenset[str] = frozenset({"admin", "internal", "external"})
+_DEFAULT_OTHER_PREFERENCE = {"auto_approve_handoffs": True}
 
 INVITE_NOT_CONFIGURED_DETAIL = "邀请注册未配置"
 INVITE_LIMIT_EXCEEDED_DETAIL = "你当前有效的邀请已达 20 个上限，请先撤销不用的邀请"
@@ -109,10 +118,34 @@ async def _fetch_db_member_emails_live(
     return normalized_set
 
 
-async def get_team_member_emails(*, bypass_cache: bool = False) -> set[str]:
-    """Return the union `DALTON_ALLOWED_EMAILS ∪ dalton_members` (lowercase)."""
+async def get_team_member_emails(
+    *,
+    bypass_cache: bool = False,
+    conn: Any = None,
+) -> set[str]:
+    """Return the union ``DALTON_ALLOWED_EMAILS ∪ dalton_members`` (or local role users in ``local`` mode)."""
+    if is_dalton_local_auth_enabled():
+        try:
+            role_emails = (
+                await members_db.list_local_role_member_emails(conn=conn)
+                if conn is not None
+                else await members_db.list_local_role_member_emails()
+            )
+        except Exception as exc:
+            logger.debug("Failed to query local role member emails: %s", exc)
+            role_emails = set()
+        db_emails = (
+            await _fetch_db_member_emails_live(conn=conn)
+            if conn is not None
+            else await _fetch_db_member_emails_live()
+        )
+        return role_emails | db_emails
     env_emails = set(get_dalton_allowed_emails())
-    db_emails = await _fetch_db_member_emails_live()
+    db_emails = (
+        await _fetch_db_member_emails_live(conn=conn)
+        if conn is not None
+        else await _fetch_db_member_emails_live()
+    )
     return env_emails | db_emails
 
 
@@ -123,14 +156,33 @@ async def is_team_member(
     cache: dict[str, float] | None = None,
     conn: Any = None,
 ) -> bool:
-    """Return True if `email` belongs to `DALTON_ALLOWED_EMAILS` or `dalton_members`.
+    """Return True if ``email`` belongs to ``DALTON_ALLOWED_EMAILS`` or ``dalton_members``.
 
+    In ``local`` auth mode, checks ``dalton_user_roles`` (joined with ``users``) and
+    ``dalton_members``.
     Only positive memberships are cached (max 60s TTL). Cache misses always query
-    `dalton_members` directly and never cache negative results.
+    PostgreSQL directly and never cache negative results.
     """
     normalized = str(email or "").strip().lower()
     if not normalized:
         return False
+    if is_dalton_local_auth_enabled():
+        try:
+            role_emails = (
+                await members_db.list_local_role_member_emails(conn=conn)
+                if conn is not None
+                else await members_db.list_local_role_member_emails()
+            )
+            if normalized in role_emails:
+                return True
+        except Exception as exc:
+            logger.debug("Failed to query local role member emails: %s", exc)
+        db_emails = (
+            await _fetch_db_member_emails_live(cache=cache, conn=conn)
+            if conn is not None
+            else await _fetch_db_member_emails_live(cache=cache)
+        )
+        return normalized in db_emails
     if normalized in get_dalton_allowed_emails():
         return True
 
@@ -152,10 +204,14 @@ async def is_team_member(
 
 
 def is_invite_pm(user_id: str | None) -> bool:
-    """Return True if `user_id` is in explicitly configured `DALTON_PM_USER_IDS`."""
+    """Return True if ``user_id`` is an admin (``dalton_user_roles`` in ``local`` mode, ``DALTON_PM_USER_IDS`` otherwise)."""
     uid = str(user_id or "").strip()
     if not uid:
         return False
+    if is_dalton_local_auth_enabled():
+        from src.dalton.access_tiers import is_admin_user_sync
+
+        return is_admin_user_sync(uid)
     return uid in set(get_configured_pm_user_ids())
 
 
@@ -261,7 +317,7 @@ def _format_invite_summary(
     if not used_by_username and row.get("used_by_email"):
         used_email = str(row["used_by_email"]).strip()
         used_by_username = used_email.split("@", 1)[0] if "@" in used_email else used_email
-    return {
+    summary: dict[str, Any] = {
         "invite_id": str(row.get("invite_id") or ""),
         "status": status,
         "status_label": status_label,
@@ -272,6 +328,9 @@ def _format_invite_summary(
         "used_by_username": used_by_username,
         "username": used_by_username,
     }
+    if is_dalton_local_auth_enabled():
+        summary["tier"] = str(row.get("tier") or "external").strip().lower() or "external"
+    return summary
 
 
 def validate_invite_credentials(username: str, password: str) -> tuple[str, str]:
@@ -405,28 +464,53 @@ async def enforce_invite_rate_limit(
         raise HTTPException(status_code=429, detail="请求过于频繁，请稍后再试")
 
 
-async def create_invite_for_pm(user_id: str | None) -> dict[str, Any]:
+async def create_invite_for_pm(
+    user_id: str | None,
+    *,
+    tier: str | None = None,
+) -> dict[str, Any]:
     """Create a 7-day single-use invite token for internal members (`admin` or `internal`).
 
-    Internal members are capped at 20 active (unused, unrevoked, unexpired) invites,
-    enforced under a per-creator transaction-scoped advisory lock; admins are exempt.
+    In ``local`` auth mode, administrators may specify ``tier`` in
+    ``('external', 'internal', 'admin')`` (default ``'external'``); internal members may
+    only issue ``'external'`` invites (capped at 20 active invites under an advisory lock).
+    In ``supabase`` mode (Everflow), preserves existing behavior and requires Supabase Admin config.
     Link uses URL fragment (`{DALTON_FRONTEND_URL}/invite#{token}`) so the token
     is never sent in HTTP request paths or server access logs.
     """
-    uid, tier = await require_pm_for_invites(user_id)
-    _require_invite_supabase_config()
+    uid, caller_tier = await require_pm_for_invites(user_id)
+    local_mode = is_dalton_local_auth_enabled()
+    if local_mode:
+        target_tier = str(tier if tier is not None else "external").strip().lower() or "external"
+        if target_tier not in VALID_INVITE_TIERS:
+            raise HTTPException(
+                status_code=400,
+                detail="邀请等级仅支持 external、internal 或 admin",
+            )
+        if target_tier != "external" and caller_tier != "admin":
+            raise HTTPException(
+                status_code=403,
+                detail="仅管理员可创建内部成员或管理员邀请链接",
+            )
+    else:
+        _require_invite_supabase_config()
+        target_tier = "external"
 
     token = secrets.token_urlsafe(32)
     token_sha256 = hash_invite_token(token)
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(days=INVITE_TTL_DAYS)
 
-    if tier == "admin":
-        row = await members_db.insert_invite(
-            token_sha256=token_sha256,
-            created_by_user_id=uid,
-            expires_at=expires_at,
-        )
+    insert_kwargs: dict[str, Any] = {
+        "token_sha256": token_sha256,
+        "created_by_user_id": uid,
+        "expires_at": expires_at,
+    }
+    if local_mode:
+        insert_kwargs["tier"] = target_tier
+
+    if caller_tier == "admin":
+        row = await members_db.insert_invite(**insert_kwargs)
     else:
         async with get_db_connection() as conn:
             async with conn.transaction():
@@ -440,9 +524,7 @@ async def create_invite_for_pm(user_id: str | None) -> dict[str, Any]:
                         detail=INVITE_LIMIT_EXCEEDED_DETAIL,
                     )
                 row = await members_db.insert_invite(
-                    token_sha256=token_sha256,
-                    created_by_user_id=uid,
-                    expires_at=expires_at,
+                    **insert_kwargs,
                     conn=conn,
                 )
     frontend_base = _resolve_invite_frontend_base_url()
@@ -700,24 +782,207 @@ async def ensure_supabase_invite_user(
     raise HTTPException(status_code=502, detail="创建账户失败，请稍后重试")
 
 
+async def _redeem_invite_token_local(
+    *,
+    token: str,
+    username: str,
+    password: str,
+) -> dict[str, Any]:
+    """Single-transaction local-account invite redemption for ``DALTON_AUTH_MODE=local``.
+
+    1. Validates username/password policy and pre-checks invite validity before scheduling
+       off-loop scrypt hashing so invalid tokens never burn CPU/memory.
+    2. Hashes the password off the event loop via ``hash_password_async``.
+    3. Inside a single PostgreSQL transaction, locks the invite row (``FOR UPDATE``),
+       constant-time verifies ``token_sha256``, verifies pending status against DB
+       ``clock_timestamp()``, checks username/email uniqueness, creates ``users``,
+       ``user_preferences``, ``dalton_local_credentials``, ``dalton_user_roles`` (with
+       the invite's persisted ``tier``), and ``dalton_members``, and marks the invite used.
+    """
+    from src.dalton.auth.passwords import hash_password_async, validate_password_policy
+
+    cleaned_token = str(token or "").strip()
+    if not cleaned_token:
+        raise HTTPException(status_code=400, detail="邀请链接无效或已过期")
+
+    normalized_username, email = validate_invite_credentials(username, password)
+    if email == COMPANY_SYSTEM_EMAIL:
+        raise HTTPException(status_code=400, detail="该用户名不可用")
+    try:
+        validate_password_policy(password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    token_sha256 = hash_invite_token(cleaned_token)
+
+    # Pre-check invite validity before running off-loop scrypt hashing.
+    precheck = await members_db.get_invite_by_token_hash(token_sha256)
+    if not _verify_token_digest(precheck, token_sha256):
+        raise HTTPException(status_code=400, detail="邀请链接无效或已过期")
+    assert precheck is not None
+    pre_status, _ = compute_invite_status(precheck)
+    if pre_status != "pending":
+        raise HTTPException(status_code=400, detail="邀请链接无效或已过期")
+
+    password_hash = await hash_password_async(password)
+    default_tz = os.getenv("DALTON_TIMEZONE", "UTC").strip() or "UTC"
+    user_id = str(uuid4())
+
+    try:
+        async with get_db_connection() as conn:
+            async with conn.transaction():
+                invite = await members_db.lock_invite_by_token_hash(token_sha256, conn=conn)
+                if not _verify_token_digest(invite, token_sha256):
+                    raise HTTPException(status_code=400, detail="邀请链接无效或已过期")
+                assert invite is not None
+
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute("SELECT clock_timestamp() AS db_now")
+                    clock_row = await cur.fetchone()
+                    db_now = (
+                        _ensure_utc(clock_row["db_now"])
+                        if clock_row and clock_row.get("db_now") is not None
+                        else datetime.now(timezone.utc)
+                    )
+                    assert db_now is not None
+
+                    status, _ = compute_invite_status(invite, now=db_now)
+                    if status != "pending":
+                        raise HTTPException(status_code=400, detail="邀请链接无效或已过期")
+
+                    await cur.execute(
+                        "SELECT 1 FROM dalton_local_credentials WHERE email = %s OR username = %s LIMIT 1",
+                        (email, normalized_username),
+                    )
+                    if await cur.fetchone() is not None:
+                        raise HTTPException(status_code=409, detail="用户名已被占用")
+
+                    await cur.execute(
+                        "SELECT 1 FROM users WHERE LOWER(email) = %s LIMIT 1",
+                        (email,),
+                    )
+                    if await cur.fetchone() is not None:
+                        raise HTTPException(status_code=409, detail="用户名已被占用")
+
+                    existing_by_username = await members_db.get_member_by_username(
+                        normalized_username, conn=conn
+                    )
+                    if existing_by_username is not None:
+                        raise HTTPException(status_code=409, detail="用户名已被占用")
+
+                    existing_by_email = await members_db.get_member_by_email(
+                        email, conn=conn
+                    )
+                    if existing_by_email is not None:
+                        raise HTTPException(status_code=409, detail="用户名已被占用")
+
+                    invite_id = str(invite["invite_id"])
+                    invited_by_user_id = str(invite.get("created_by_user_id") or "").strip() or None
+                    raw_tier = str(invite.get("tier") or "external").strip().lower()
+                    invite_tier = raw_tier if raw_tier in VALID_INVITE_TIERS else "external"
+
+                    # 1. users
+                    await cur.execute(
+                        """
+                        INSERT INTO users (
+                            user_id, email, name, auth_provider, timezone,
+                            onboarding_completed, created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, 'local', %s, FALSE, %s, %s)
+                        """,
+                        (user_id, email, normalized_username, default_tz, db_now, db_now),
+                    )
+                    # 2. user_preferences
+                    await cur.execute(
+                        """
+                        INSERT INTO user_preferences (
+                            user_preference_id, user_id, other_preference,
+                            created_at, updated_at
+                        )
+                        VALUES (gen_random_uuid(), %s, %s::jsonb, %s, %s)
+                        ON CONFLICT (user_id) DO NOTHING
+                        """,
+                        (user_id, Json(_DEFAULT_OTHER_PREFERENCE), db_now, db_now),
+                    )
+                    # 3. dalton_local_credentials
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_local_credentials (
+                            user_id, email, username, password_hash,
+                            password_changed_at, failed_attempts, locked_until,
+                            created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s, 0, NULL, %s, %s)
+                        """,
+                        (
+                            user_id,
+                            email,
+                            normalized_username,
+                            password_hash,
+                            db_now,
+                            db_now,
+                            db_now,
+                        ),
+                    )
+                    # 4. dalton_user_roles
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_user_roles (
+                            user_id, tier, granted_by, created_at, updated_at
+                        )
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (
+                            user_id,
+                            invite_tier,
+                            invited_by_user_id or "invite",
+                            db_now,
+                            db_now,
+                        ),
+                    )
+                    # 5. dalton_members (keeps username index & audit record)
+                    await members_db.insert_member(
+                        email=email,
+                        username=normalized_username,
+                        source="invite",
+                        invited_by_user_id=invited_by_user_id,
+                        conn=conn,
+                    )
+                    # 6. Mark invite used (enforces single-use atomically inside the transaction)
+                    marked = await members_db.mark_invite_used(
+                        invite_id=invite_id,
+                        used_by_email=email,
+                        supabase_user_id=None,
+                        conn=conn,
+                    )
+                    if marked is None:
+                        raise HTTPException(status_code=400, detail="邀请链接无效或已过期")
+    except pg_errors.UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="用户名已被占用") from exc
+
+    record_team_member_cached(email)
+    return {
+        "ok": True,
+        "user_id": user_id,
+        "username": normalized_username,
+        "email": email,
+        "tier": invite_tier,
+    }
+
+
 async def redeem_invite_token(
     *,
     token: str,
     username: str,
     password: str,
 ) -> dict[str, Any]:
-    """Two-phase invite redemption bound to `redeeming_username` and `supabase_user_id`.
-
-    Phase 1 (tx 1): Lock invite row (`SELECT ... FOR UPDATE`), constant-time verify
-    `token_sha256`, verify invite is pending and either unclaimed or already
-    redeeming the same `username`, verify no conflict in `dalton_members` /
-    `DALTON_ALLOWED_EMAILS`, and persist `redeeming_username` + `redeeming_at`.
-    Phase 2: Create user in Supabase with `app_metadata.dalton_invite_id` (or, if
-    retrying an already-redeeming invite for the same username whose Supabase user
-    bears matching `app_metadata.dalton_invite_id`, update their password).
-    Phase 3 (tx 2): Lock invite row, strictly verify `locked_redeeming == normalized_username`,
-    insert `dalton_members`, and mark invite used with `supabase_user_id`.
-    """
+    """Redeem a single-use invite token (local single-transaction in ``local`` mode, Supabase two-phase otherwise)."""
+    if is_dalton_local_auth_enabled():
+        return await _redeem_invite_token_local(
+            token=token,
+            username=username,
+            password=password,
+        )
     cleaned_token = str(token or "").strip()
     if not cleaned_token:
         raise HTTPException(status_code=400, detail="邀请链接无效或已过期")
