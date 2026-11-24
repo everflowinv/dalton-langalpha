@@ -414,7 +414,7 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
          printf 'ERROR: 数据库 %s 检查失败，先不要删除卷\n' "$db" >&2
          exit 1
        fi
-       cnt="$(printf '%s' "$cnt_raw" | tr -d '\r')"
+       cnt="${cnt_raw%$'\r'}"
        case "$cnt" in
          ''|*[!0123456789]*)
            printf 'ERROR: 数据库 %s 检查失败，先不要删除卷（输出非纯数字: %s）\n' "$db" "$cnt" >&2

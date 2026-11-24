@@ -9,8 +9,9 @@
 #      acquires `/tmp/dalton-<project>.restore.lock` (`flock`, or `mkdir` fallback
 #      without PID-based auto-cleanup), cleans leftover `.env.tmp-*` files, and
 #      runs static preflight checks (external DB guard, identifiers, Compose files).
-#      When restoring from `env.enc`, backs up any existing `.env` via `cp -p` to
-#      `${ENV_FILE}.pre-restore-<timestamp>` (mode 600) and atomically moves the
+#      When restoring from `env.enc`, backs up any existing `.env` (using `cp -P -p`
+#      for regular files or moving a symlink itself without touching its target) to
+#      `${ENV_FILE}.pre-restore-<timestamp>` and atomically moves the
 #      decrypted `.env` into `${ENV_FILE}` (mode 600) BEFORE any compose-dependent
 #      preflight so all preflight, comparison, write, and startup steps use the
 #      exact same regular `docker compose` arguments (no temporary compose override).
@@ -260,6 +261,10 @@ fi
 
 get_file_mode() {
   local target="$1"
+  if [[ -L "$target" || ! -f "$target" ]]; then
+    printf '600'
+    return 0
+  fi
   if stat -c '%a' "$target" >/dev/null 2>&1; then
     stat -c '%a' "$target"
   elif stat -f '%Lp' "$target" >/dev/null 2>&1; then
@@ -318,11 +323,9 @@ MUTATION_STARTED=0
 RESTORE_SUCCEEDED=0
 ENV_FILE="${WORK_DIR}/.env"
 ENV_EXISTED_BEFORE=0
+ENV_WAS_SYMLINK=0
 ORIG_ENV_MODE="600"
-if [[ -f "$ENV_FILE" ]]; then
-  ENV_EXISTED_BEFORE=1
-  ORIG_ENV_MODE="$(get_file_mode "$ENV_FILE")"
-fi
+PRELOCK_ENV_TMP=""
 STAGED_ENV_TMP=""
 ENV_FROM_BACKUP=0
 ENV_BACKUP_PATH=""
@@ -391,6 +394,9 @@ release_restore_lock() {
 
 cleanup() {
   local rc=$?
+  if [[ -n "$PRELOCK_ENV_TMP" && -f "$PRELOCK_ENV_TMP" ]]; then
+    rm -f "$PRELOCK_ENV_TMP"
+  fi
   if [[ -n "$STAGED_ENV_TMP" && -f "$STAGED_ENV_TMP" ]]; then
     rm -f "$STAGED_ENV_TMP"
   fi
@@ -402,9 +408,11 @@ cleanup() {
   fi
   if [[ "$rc" -ne 0 && "$RESTORE_SUCCEEDED" -ne 1 && "$MUTATION_STARTED" -eq 0 ]]; then
     if [[ "$ENV_SWAPPED" -eq 1 ]]; then
-      if [[ "$ENV_EXISTED_BEFORE" -eq 1 && -n "$ENV_BACKUP_PATH" && -f "$ENV_BACKUP_PATH" ]]; then
+      if [[ "$ENV_EXISTED_BEFORE" -eq 1 && -n "$ENV_BACKUP_PATH" && ( -f "$ENV_BACKUP_PATH" || -L "$ENV_BACKUP_PATH" ) ]]; then
         if mv "$ENV_BACKUP_PATH" "$ENV_FILE"; then
-          chmod "$ORIG_ENV_MODE" "$ENV_FILE" 2>/dev/null || true
+          if [[ "$ENV_WAS_SYMLINK" -eq 0 && ! -L "$ENV_FILE" ]]; then
+            chmod "$ORIG_ENV_MODE" "$ENV_FILE" 2>/dev/null || true
+          fi
           ENV_BACKUP_PATH=""
           warn "已把 .env 恢复为恢复前的内容（${ENV_FILE}）。"
         else
@@ -415,7 +423,7 @@ cleanup() {
         warn "已把 .env 恢复为恢复前的内容（已删除本次新写入的 ${ENV_FILE}）。"
       fi
       ENV_SWAPPED=0
-    elif [[ -n "$ENV_BACKUP_PATH" && -f "$ENV_BACKUP_PATH" ]]; then
+    elif [[ -n "$ENV_BACKUP_PATH" && ( -f "$ENV_BACKUP_PATH" || -L "$ENV_BACKUP_PATH" ) ]]; then
       rm -f "$ENV_BACKUP_PATH"
       ENV_BACKUP_PATH=""
     fi
@@ -428,7 +436,7 @@ cleanup() {
       down_cmd="$(fmt_cmd docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" down -v)"
     fi
     err "Restore failed after writing data to target database or object storage; the instance is now in a partial/half-restored state (半成品)."
-    if [[ "$ENV_SWAPPED" -eq 1 && -n "$ENV_BACKUP_PATH" && -f "$ENV_BACKUP_PATH" ]]; then
+    if [[ "$ENV_SWAPPED" -eq 1 && -n "$ENV_BACKUP_PATH" && ( -f "$ENV_BACKUP_PATH" || -L "$ENV_BACKUP_PATH" ) ]]; then
       err "未自动换回 ${ENV_FILE}（写入开始后换回会导致配置与已写入数据不一致）；原 .env 备份路径：${ENV_BACKUP_PATH}，请按手册处理。"
     elif [[ "$ENV_SWAPPED" -eq 1 ]]; then
       err "未自动删除已写入的 ${ENV_FILE}（写入开始后删除会导致配置与已写入数据不一致），请按手册处理。"
@@ -439,7 +447,15 @@ cleanup() {
     err "  ${down_cmd}"
   fi
 }
+
+on_signal() {
+  local sig_rc="$1"
+  trap - INT TERM
+  exit "$sig_rc"
+}
 trap cleanup EXIT
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
 
 # Step 1: Verify checksums, manifest.json, and MinIO archive readability
 info "1/7 Verifying backup archive integrity..."
@@ -500,71 +516,153 @@ if [[ -f "${BACKUP_DIR}/minio-objects.tar.gz" ]]; then
   fi
 fi
 
-# Step 2: Prepare candidate .env (file-only), check project name verbatim, acquire lock,
-# clean leftover .env.tmp-*, and run static preflight checks.
-if [[ -f "${BACKUP_DIR}/env.enc" && -n "$ENV_PASSPHRASE_FILE" ]]; then
+# Step 2: Determine initial project lock name, acquire project lock FIRST,
+# then inspect `.env` existence/symlink/mode state under the lock, clean leftover
+# `.env.tmp-*`, and run static preflight checks.
+resolve_project_name_from_env() {
+  local env_path="$1"
+  local raw_proj proj
+  raw_proj="$(read_env_file_var "$env_path" "COMPOSE_PROJECT_NAME" "")"
+  if [[ -n "$raw_proj" ]]; then
+    proj="$(normalize_env_project_name "$raw_proj")"
+    validate_project_name "$proj" "COMPOSE_PROJECT_NAME"
+  else
+    proj="$(sanitize_project_name "$(basename "$WORK_DIR")")"
+    validate_project_name "$proj" "COMPOSE_PROJECT_NAME"
+  fi
+  printf '%s' "$proj"
+}
+
+decrypt_backup_env() {
+  local dest="$1"
   if [[ ! -r "$ENV_PASSPHRASE_FILE" || ! -s "$ENV_PASSPHRASE_FILE" ]]; then
     err "Passphrase file is missing, unreadable, or empty: ${ENV_PASSPHRASE_FILE}"
     exit 1
   fi
-  if [[ "$ENV_EXISTED_BEFORE" -eq 0 || "$REPLACE_ENV" -eq 1 ]]; then
-    info "2/7 Decrypting env.enc for preflight validation (${ENV_CIPHER}/${ENV_KDF}/${ENV_KDF_DIGEST}/${ENV_KDF_ITER})..."
-    STAGED_ENV_TMP="$(mktemp "${WORK_DIR}/.env.tmp-decrypt-XXXXXX")"
-    chmod 600 "$STAGED_ENV_TMP"
-    if ! openssl enc -d "-${ENV_CIPHER}" -pbkdf2 -md "${ENV_KDF_DIGEST}" -iter "${ENV_KDF_ITER}" \
-        -in "${BACKUP_DIR}/env.enc" \
-        -out "$STAGED_ENV_TMP" \
-        -pass "file:${ENV_PASSPHRASE_FILE}"; then
-      err "Failed to decrypt ${BACKUP_DIR}/env.enc (check passphrase file)."
+  chmod 600 "$dest"
+  if ! openssl enc -d "-${ENV_CIPHER}" -pbkdf2 -md "${ENV_KDF_DIGEST}" -iter "${ENV_KDF_ITER}" \
+      -in "${BACKUP_DIR}/env.enc" \
+      -out "$dest" \
+      -pass "file:${ENV_PASSPHRASE_FILE}"; then
+    err "Failed to decrypt ${BACKUP_DIR}/env.enc (check passphrase file)."
+    exit 1
+  fi
+  chmod 600 "$dest"
+}
+
+prepare_env_under_lock() {
+  # Inspect .env state strictly AFTER acquiring the project restore lock.
+  ENV_EXISTED_BEFORE=0
+  ENV_WAS_SYMLINK=0
+  ORIG_ENV_MODE="600"
+  ENV_FROM_BACKUP=0
+  CANDIDATE_ENV=""
+
+  if [[ -L "$ENV_FILE" ]]; then
+    ENV_EXISTED_BEFORE=1
+    ENV_WAS_SYMLINK=1
+  elif [[ -f "$ENV_FILE" ]]; then
+    ENV_EXISTED_BEFORE=1
+    ENV_WAS_SYMLINK=0
+    ORIG_ENV_MODE="$(get_file_mode "$ENV_FILE")"
+  fi
+
+  if [[ -f "${BACKUP_DIR}/env.enc" && -n "$ENV_PASSPHRASE_FILE" ]]; then
+    if [[ ! -r "$ENV_PASSPHRASE_FILE" || ! -s "$ENV_PASSPHRASE_FILE" ]]; then
+      err "Passphrase file is missing, unreadable, or empty: ${ENV_PASSPHRASE_FILE}"
       exit 1
     fi
-    chmod 600 "$STAGED_ENV_TMP"
-    ENV_FROM_BACKUP=1
-    CANDIDATE_ENV="$STAGED_ENV_TMP"
-    ok "Decrypted env.enc into temporary staging file."
-  else
-    info "2/7 Using existing ${ENV_FILE} (pass --replace-env to replace it from env.enc on an empty target)."
+    if [[ "$ENV_EXISTED_BEFORE" -eq 0 || "$REPLACE_ENV" -eq 1 ]]; then
+      if [[ -z "$STAGED_ENV_TMP" || ! -f "$STAGED_ENV_TMP" ]]; then
+        info "2/7 Decrypting env.enc for preflight validation (${ENV_CIPHER}/${ENV_KDF}/${ENV_KDF_DIGEST}/${ENV_KDF_ITER})..."
+        STAGED_ENV_TMP="$(mktemp "${WORK_DIR}/.env.tmp-decrypt-XXXXXX")"
+        chmod 600 "$STAGED_ENV_TMP"
+        if [[ -n "$PRELOCK_ENV_TMP" && -f "$PRELOCK_ENV_TMP" ]]; then
+          cat "$PRELOCK_ENV_TMP" > "$STAGED_ENV_TMP"
+          chmod 600 "$STAGED_ENV_TMP"
+        else
+          decrypt_backup_env "$STAGED_ENV_TMP"
+        fi
+        ok "Decrypted env.enc into temporary staging file."
+      fi
+      ENV_FROM_BACKUP=1
+      CANDIDATE_ENV="$STAGED_ENV_TMP"
+    else
+      if [[ -n "$STAGED_ENV_TMP" && -f "$STAGED_ENV_TMP" ]]; then
+        rm -f "$STAGED_ENV_TMP"
+        STAGED_ENV_TMP=""
+      fi
+      if [[ "$ENV_WAS_SYMLINK" -eq 1 && ! -f "$ENV_FILE" ]]; then
+        err "${ENV_FILE} is a broken symlink (target does not exist or is not a regular file)."
+        exit 1
+      fi
+      info "2/7 Using existing ${ENV_FILE} (pass --replace-env to replace it from env.enc on an empty target)."
+      CANDIDATE_ENV="$ENV_FILE"
+    fi
+  elif [[ "$ENV_EXISTED_BEFORE" -eq 1 ]]; then
+    if [[ "$REPLACE_ENV" -eq 1 ]]; then
+      err "--replace-env requires ${BACKUP_DIR}/env.enc and --env-passphrase-file (or DALTON_BACKUP_PASSPHRASE_FILE)."
+      exit 1
+    fi
+    if [[ "$ENV_WAS_SYMLINK" -eq 1 && ! -f "$ENV_FILE" ]]; then
+      err "${ENV_FILE} is a broken symlink (target does not exist or is not a regular file)."
+      exit 1
+    fi
+    info "2/7 Using existing ${ENV_FILE}."
     CANDIDATE_ENV="$ENV_FILE"
-  fi
-elif [[ "$ENV_EXISTED_BEFORE" -eq 1 ]]; then
-  if [[ "$REPLACE_ENV" -eq 1 ]]; then
-    err "--replace-env requires ${BACKUP_DIR}/env.enc and --env-passphrase-file (or DALTON_BACKUP_PASSPHRASE_FILE)."
+  else
+    err "Missing ${ENV_FILE}. Copy your saved .env into ${WORK_DIR}, pass --env-passphrase-file (if env.enc is in the backup), or run scripts/standalone/init.sh first."
     exit 1
   fi
-  info "2/7 Using existing ${ENV_FILE}."
-  CANDIDATE_ENV="$ENV_FILE"
-else
-  err "Missing ${ENV_FILE}. Copy your saved .env into ${WORK_DIR}, pass --env-passphrase-file (if env.enc is in the backup), or run scripts/standalone/init.sh first."
-  exit 1
-fi
 
-# Exact verbatim COMPOSE_PROJECT_NAME check when replacing an existing .env (no normalization).
-if [[ "$ENV_EXISTED_BEFORE" -eq 1 && "$ENV_FROM_BACKUP" -eq 1 ]]; then
-  CUR_PROJECT="$(read_env_file_var "$ENV_FILE" "COMPOSE_PROJECT_NAME" "")"
-  NEW_PROJECT="$(read_env_file_var "$CANDIDATE_ENV" "COMPOSE_PROJECT_NAME" "")"
-  if [[ "$NEW_PROJECT" != "$CUR_PROJECT" ]]; then
-    err "COMPOSE_PROJECT_NAME mismatch: backup .env specifies '${NEW_PROJECT:-<unset>}', but current ${ENV_FILE} specifies '${CUR_PROJECT:-<unset>}'."
-    err "Refusing --replace-env (exact verbatim match required; existing ${ENV_FILE} left untouched)."
-    exit 1
+  # Exact verbatim COMPOSE_PROJECT_NAME check when replacing an existing .env (no normalization).
+  if [[ "$ENV_EXISTED_BEFORE" -eq 1 && "$ENV_FROM_BACKUP" -eq 1 ]]; then
+    CUR_PROJECT="$(read_env_file_var "$ENV_FILE" "COMPOSE_PROJECT_NAME" "")"
+    NEW_PROJECT="$(read_env_file_var "$CANDIDATE_ENV" "COMPOSE_PROJECT_NAME" "")"
+    if [[ "$NEW_PROJECT" != "$CUR_PROJECT" ]]; then
+      err "COMPOSE_PROJECT_NAME mismatch: backup .env specifies '${NEW_PROJECT:-<unset>}', but current ${ENV_FILE} specifies '${CUR_PROJECT:-<unset>}'."
+      err "Refusing --replace-env (exact verbatim match required; existing ${ENV_FILE} left untouched)."
+      exit 1
+    fi
   fi
-fi
+}
 
 # Acquire fixed-path project restore lock at /tmp/dalton-<project>.restore.lock
+# BEFORE inspecting or deciding `.env` existence/backup state.
 if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
   LOCK_PROJECT="$PROJECT_NAME_ARG"
+elif [[ -f "${BACKUP_DIR}/env.enc" && -n "$ENV_PASSPHRASE_FILE" ]]; then
+  PRELOCK_ENV_TMP="$(mktemp)"
+  decrypt_backup_env "$PRELOCK_ENV_TMP"
+  LOCK_PROJECT="$(resolve_project_name_from_env "$PRELOCK_ENV_TMP")"
 else
-  RAW_ENV_PROJECT="$(read_env_file_var "$CANDIDATE_ENV" "COMPOSE_PROJECT_NAME" "")"
-  if [[ -n "$RAW_ENV_PROJECT" ]]; then
-    LOCK_PROJECT="$(normalize_env_project_name "$RAW_ENV_PROJECT")"
-    validate_project_name "$LOCK_PROJECT" "COMPOSE_PROJECT_NAME"
-  else
-    LOCK_PROJECT="$(sanitize_project_name "$(basename "$WORK_DIR")")"
-    validate_project_name "$LOCK_PROJECT" "COMPOSE_PROJECT_NAME"
-  fi
+  LOCK_PROJECT="$(resolve_project_name_from_env "$ENV_FILE")"
 fi
 COMPOSE_PROJECT="$LOCK_PROJECT"
 RESTORE_LOCK_PATH="/tmp/dalton-${LOCK_PROJECT}.restore.lock"
 acquire_restore_lock
+
+prepare_env_under_lock
+
+# If --project-name was not explicit and the post-lock effective candidate .env
+# resolves to a different project name than the initial lock, switch to the real
+# project lock and re-inspect `.env` under it.
+if [[ "$PROJECT_NAME_EXPLICIT" -eq 0 ]]; then
+  ACTUAL_PROJECT="$(resolve_project_name_from_env "$CANDIDATE_ENV")"
+  if [[ "$ACTUAL_PROJECT" != "$LOCK_PROJECT" ]]; then
+    release_restore_lock
+    LOCK_PROJECT="$ACTUAL_PROJECT"
+    COMPOSE_PROJECT="$LOCK_PROJECT"
+    RESTORE_LOCK_PATH="/tmp/dalton-${LOCK_PROJECT}.restore.lock"
+    acquire_restore_lock
+    prepare_env_under_lock
+  fi
+fi
+
+if [[ -n "$PRELOCK_ENV_TMP" && -f "$PRELOCK_ENV_TMP" ]]; then
+  rm -f "$PRELOCK_ENV_TMP"
+  PRELOCK_ENV_TMP=""
+fi
 
 # Clean up any leftover .env.tmp-* from a prior kill -9 (safe under project lock;
 # never remove the current run's own decrypted STAGED_ENV_TMP).
@@ -708,17 +806,23 @@ if [[ "$ENV_FROM_BACKUP" -eq 1 ]]; then
   if [[ "$ENV_EXISTED_BEFORE" -eq 1 ]]; then
     env_bak_ts="$(date -u +%Y%m%d-%H%M%SZ)"
     env_bak_candidate="${ENV_FILE}.pre-restore-${env_bak_ts}"
-    if [[ -e "$env_bak_candidate" ]]; then
+    if [[ -e "$env_bak_candidate" || -L "$env_bak_candidate" ]]; then
       env_bak_seq=1
-      while [[ -e "${env_bak_candidate}-${env_bak_seq}" ]]; do
+      while [[ -e "${env_bak_candidate}-${env_bak_seq}" || -L "${env_bak_candidate}-${env_bak_seq}" ]]; do
         env_bak_seq=$((env_bak_seq + 1))
       done
       env_bak_candidate="${env_bak_candidate}-${env_bak_seq}"
     fi
     ENV_BACKUP_PATH="$env_bak_candidate"
-    cp -p "$ENV_FILE" "$ENV_BACKUP_PATH"
-    chmod 600 "$ENV_BACKUP_PATH"
-    info "Backed up existing ${ENV_FILE} to ${ENV_BACKUP_PATH} (mode 600)."
+    if [[ "$ENV_WAS_SYMLINK" -eq 1 ]]; then
+      mv "$ENV_FILE" "$ENV_BACKUP_PATH"
+      ENV_SWAPPED=1
+      info "Backed up existing symlink ${ENV_FILE} to ${ENV_BACKUP_PATH} (symlink preserved; target untouched)."
+    else
+      cp -P -p "$ENV_FILE" "$ENV_BACKUP_PATH"
+      chmod 600 "$ENV_BACKUP_PATH"
+      info "Backed up existing ${ENV_FILE} to ${ENV_BACKUP_PATH} (mode 600)."
+    fi
   fi
   chmod 600 "$STAGED_ENV_TMP"
   mv "$STAGED_ENV_TMP" "$ENV_FILE"
@@ -1042,11 +1146,6 @@ fi
 # Ensure infrastructure services are up before starting data writes
 compose_cmd up -d postgres redis minio
 
-# Preflight passed: mark mutation boundary immediately before the first write
-# to object storage (Step 4) or PostgreSQL (Step 5). Failures from here on do
-# not roll back .env so configuration remains consistent with any written data.
-MUTATION_STARTED=1
-
 # Step 4: Restore MinIO objects directly into original bucket name(s) with read-back verification
 if [[ "$SKIP_MINIO" -eq 0 && "$STORAGE_ANY_CONFIGURED" -eq 1 && -f "${BACKUP_DIR}/minio-objects.tar.gz" ]]; then
   info "4/7 Restoring MinIO objects into original bucket(s) with read-back verification..."
@@ -1280,6 +1379,16 @@ print(
 )
 '
   manifest_size="$(wc -c < "$MINIO_MANIFEST_TMP" | tr -d '[:space:]')"
+  if [[ ! "$manifest_size" =~ ^[0-9]+$ ]]; then
+    err "Could not determine MinIO manifest size from ${MINIO_MANIFEST_TMP}."
+    exit 1
+  fi
+  if [[ ! -r "${BACKUP_DIR}/minio-objects.tar.gz" ]]; then
+    err "MinIO archive is not readable: ${BACKUP_DIR}/minio-objects.tar.gz"
+    exit 1
+  fi
+  # Mark mutation boundary immediately before the first actual write to object storage.
+  MUTATION_STARTED=1
   {
     printf '%s\n' "$manifest_size"
     cat "$MINIO_MANIFEST_TMP"
@@ -1292,6 +1401,9 @@ fi
 
 # Step 5: Restore PostgreSQL directly into official database, run migrations, and verify DB object references
 info "5/7 Restoring PostgreSQL directly into '${CFG_DB_NAME}' and running migrations..."
+# Mark mutation boundary immediately before the first actual write to PostgreSQL
+# (in case Step 4 MinIO restore was skipped).
+MUTATION_STARTED=1
 if [[ "$DB_EXISTS" -eq 0 ]]; then
   compose_cmd exec -T -e PGPASSWORD="$CFG_DB_PASSWORD" postgres \
     psql -h 127.0.0.1 -p 5432 -U "$CFG_DB_USER" -d template1 -v ON_ERROR_STOP=1 \
@@ -1572,12 +1684,16 @@ printf "  Restored from    : %s\n" "$BACKUP_DIR"
 printf "  Database         : %s (upstream=%s, dalton=%s)\n" "$CFG_DB_NAME" "$RESTORED_UP" "$RESTORED_DA"
 printf "  Active bucket    : %s\n" "$CFG_CHAT_BUCKET"
 printf "  Edge TLS mode    : %s\n" "$CFG_TLS_MODE"
-if [[ -n "$ENV_BACKUP_PATH" && -f "$ENV_BACKUP_PATH" ]]; then
+if [[ -n "$ENV_BACKUP_PATH" && ( -f "$ENV_BACKUP_PATH" || -L "$ENV_BACKUP_PATH" ) ]]; then
   printf "  Previous .env    : %s\n" "$ENV_BACKUP_PATH"
 fi
 printf "\n  Next steps:\n"
 printf "  - Verify service status: %s\n" "$(fmt_cmd docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" ps)"
 printf "  - Open the web UI and confirm your workspaces, threads, and uploaded files are visible.\n"
-if [[ -n "$ENV_BACKUP_PATH" && -f "$ENV_BACKUP_PATH" ]]; then
-  printf "  - 原 .env 已备份保留在 %s（权限 600），确认恢复无误后请自行删除。\n" "$ENV_BACKUP_PATH"
+if [[ -n "$ENV_BACKUP_PATH" && ( -f "$ENV_BACKUP_PATH" || -L "$ENV_BACKUP_PATH" ) ]]; then
+  if [[ "$ENV_WAS_SYMLINK" -eq 1 ]]; then
+    printf "  - 原 .env 符号链接已备份保留在 %s（原目标文件未修改），确认恢复无误后请自行删除。\n" "$ENV_BACKUP_PATH"
+  else
+    printf "  - 原 .env 已备份保留在 %s（权限 600），确认恢复无误后请自行删除。\n" "$ENV_BACKUP_PATH"
+  fi
 fi

@@ -425,20 +425,31 @@ def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
             timeout=60,
         )
         assert _lib.load_env_file(stale_env).get("DALTON_EDGE_TLS_BIND") == "127.0.0.1", (
-            "init.sh must always rewrite pre-existing DALTON_EDGE_TLS_BIND to 127.0.0.1 before Batch 4b"
+            "init.sh must rewrite a pre-existing DALTON_EDGE_TLS_BIND to 127.0.0.1 for a loopback domain"
         )
 
-        # Public domain must be rejected until Batch 4b ships
-        pub_dir = tmp_root / "reject-public"
+        # A public domain turns on local sign-in (Batch 4b) and automatic HTTPS.
+        pub_dir = tmp_root / "public-domain"
         init_pub = _stage_init_dir(ctx.work_dir, pub_dir)
         res_pub = _run_cmd(
             ["bash", str(init_pub), "--non-interactive", "--skip-sandbox-build", "--domain", "dalton.example.com"],
             cwd=pub_dir,
             check=False,
-            timeout=30,
+            timeout=60,
         )
-        assert res_pub.returncode != 0 and not (pub_dir / ".env").exists(), (
-            f"Expected init.sh to refuse non-loopback domain before Batch 4b: rc={res_pub.returncode}"
+        pub_env = _lib.load_env_file(pub_dir / ".env") if (pub_dir / ".env").exists() else {}
+        assert res_pub.returncode == 0, (
+            f"Expected init.sh to accept a public domain: rc={res_pub.returncode}\n{res_pub.stderr[-800:]}"
+        )
+        for key, want in (
+            ("DOMAIN", "dalton.example.com"),
+            ("DALTON_AUTH_MODE", "local"),
+            ("VITE_DALTON_AUTH", "local"),
+            ("DALTON_TLS_MODE", "auto"),
+        ):
+            assert pub_env.get(key) == want, f"Expected {key}={want} for a public domain, got {pub_env.get(key)!r}"
+        assert not pub_env.get("DALTON_ALLOW_DEV_OSS_AUTH"), (
+            "A public domain must not keep DALTON_ALLOW_DEV_OSS_AUTH"
         )
 
         # Domain with port must be rejected
@@ -1949,7 +1960,7 @@ def check_restore_on_clean_stack(
                 #      back to its exact pre-restore state (both when `.env` was absent and when
                 #      replacing an existing `.env` via `--replace-env`).
                 storage_override_prefix = "tenant-b-ci-storage-env"
-                storage_override_env = restore_dir / "storage.env"
+                storage_override_env = (restore_dir / "storage.env").resolve()
                 storage_override_compose = tmp_root / "docker-compose.override-backend-storage-env.yml"
                 storage_override_env.write_text(
                     f"DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX={storage_override_prefix}\n",
@@ -1959,7 +1970,7 @@ def check_restore_on_clean_stack(
                     "services:\n"
                     "  backend:\n"
                     "    env_file:\n"
-                    "      - storage.env\n",
+                    f"      - {json.dumps(str(storage_override_env))}\n",
                     encoding="utf-8",
                 )
                 restored_env_file.unlink()

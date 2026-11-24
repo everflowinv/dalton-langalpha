@@ -26,7 +26,6 @@ from ptc_agent.config.file_utils import load_yaml_config
 from ptc_agent.config.loaders import load_from_dict
 from ptc_agent.core.paths import WorkspaceLayout
 from ptc_agent.core.sandbox import wsfiles_transfer_runtime as transfer_rt
-from ptc_agent.core.sandbox.providers import docker as docker_provider_mod
 from ptc_agent.core.sandbox.providers.docker import DockerProvider
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 from src.dalton import chat_upload_storage as storage
@@ -3947,8 +3946,8 @@ class TestSandboxNetworkAndInitScript:
         )
         assert "postgres\tuser_objects=" not in res_fail.stdout, "Loop must stop immediately on failure"
 
-        # 3c. Non-digit / empty / multi-line output on `analytics` -> exits non-zero, prints DB name + warning
-        for bad_out in ("", "not-a-number", "0\\n1"):
+        # 3c. Non-digit / empty / multi-line / embedded-CR output on `analytics` -> exits non-zero, prints DB name + warning
+        for bad_out in ("", "not-a-number", "0\\n1", "1\\r2", "1\\r\\r"):
             res_bad = _run_doc_snippet(
                 'if [[ "$*" == *"FROM pg_database"* ]]; then printf "analytics\\npostgres\\n"; exit 0; fi\n'
                 f'if [[ "$*" == *" -d analytics "* ]]; then printf "{bad_out}\\n"; exit 0; fi\n'
@@ -4216,3 +4215,326 @@ class TestSandboxNetworkAndInitScript:
                 lock_keep.rmdir()
             elif lock_keep.exists():
                 lock_keep.unlink()
+
+    def test_b6_r12_post_lock_env_state_symlink_sigterm_and_mutation_boundary(
+        self, tmp_path: Path
+    ) -> None:
+        """Offline verification for Batch 6 R12 fixes:
+        1. `.env` existence/backup state is determined strictly AFTER acquiring the
+           project restore lock: if `.env` was absent before lock acquisition and
+           created before the lock was obtained, restore.sh treats it as existing
+           (backs it up before swapping) and leaves its content unchanged on refusal.
+        2. When `.env` is a symlink pointing to a 0600 file, preflight failure restores
+           the exact same symlink and leaves the target file untouched at mode 0600.
+        3. Sending SIGTERM after `.env` swap and before data writes exits 143 and runs
+           EXIT cleanup to roll `.env` back to its pre-restore content and mode.
+        4. `MUTATION_STARTED=1` is placed immediately before the first actual write to
+           object storage or PostgreSQL (after manifest size / `wc -c` preparation).
+        """
+        import signal
+
+        pass_f = tmp_path / "r12.pass"
+        pass_f.write_text("r12-passphrase-abcdef\n", encoding="utf-8")
+        pass_f.chmod(0o600)
+
+        def _make_r12_backup(name: str, proj: str, backup_env_text: str) -> Path:
+            bdir = tmp_path / name
+            bdir.mkdir()
+            (bdir / "postgres.dump").write_bytes(b"PGDMP")
+            plain = tmp_path / f"{name}.plain.env"
+            plain.write_text(backup_env_text, encoding="utf-8")
+            subprocess.run(
+                [
+                    "openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-md", "sha256", "-iter", "10000",
+                    "-salt", "-in", str(plain), "-out", str(bdir / "env.enc"), "-pass", f"file:{pass_f}",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=15,
+            )
+            (bdir / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 2,
+                        "compose_project": proj,
+                        "env_backup": "encrypted",
+                        "env_encryption": {
+                            "cipher": "aes-256-cbc",
+                            "kdf": "pbkdf2",
+                            "digest": "sha256",
+                            "iterations": 10000,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return bdir
+
+        # --- Case 1: `.env` absent before lock, appears by the time lock is acquired ---
+        proj_race = f"r12-race-{uuid.uuid4().hex[:10]}"
+        created_env_text = (
+            f"COMPOSE_PROJECT_NAME={proj_race}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=firstpg\nDB_NAME=postgres\n"
+            "SENTINEL=created-by-first-restore\n"
+        )
+        backup_env_race = (
+            f"COMPOSE_PROJECT_NAME={proj_race}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=secondpg\nDB_NAME=postgres\n"
+            "SENTINEL=second-restore-backup\n"
+        )
+        bak_race = _make_r12_backup("r12-bak-race", proj_race, backup_env_race)
+        w_race = tmp_path / "r12-work-race"
+        w_race.mkdir()
+        (w_race / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
+        (w_race / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_race / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+        assert not (w_race / ".env").exists()
+
+        created_env_src = tmp_path / "r12-created-env.src"
+        created_env_src.write_text(created_env_text, encoding="utf-8")
+        bak_seen_log = tmp_path / "r12-race-bak-seen.log"
+
+        bin_race = tmp_path / "r12-bin-race"
+        bin_race.mkdir()
+        # Stub `flock` simulates another restore creating `.env` right before this process acquires the lock.
+        (bin_race / "flock").write_text(
+            "#!/usr/bin/env bash\n"
+            f'if [[ "$1" == "-n" && ! -e "{w_race}/.env" ]]; then\n'
+            f'  cp "{created_env_src}" "{w_race}/.env"\n'
+            f'  chmod 600 "{w_race}/.env"\n'
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (bin_race / "flock").chmod(0o755)
+        (bin_race / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *" config --format json"* ]]; then\n'
+            f'  ls -1 "{w_race}"/.env.pre-restore-* > "{bak_seen_log}" 2>/dev/null || true\n'
+            '  echo \'{"services":{"backend":{"environment":{}}}}\'\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+            'if [[ "$*" == *"FROM pg_database"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" -d postgres "* && "$*" == *"pg_class"* ]]; then printf "1\\t0\\t0\\n"; exit 0; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (bin_race / "docker").chmod(0o755)
+        env_race = os.environ.copy()
+        env_race["PATH"] = f"{bin_race}:{env_race.get('PATH', '')}"
+        lock_race = Path(f"/tmp/dalton-{proj_race}.restore.lock")
+        lock_race_existed = lock_race.exists()
+        try:
+            res_race = subprocess.run(
+                [
+                    "bash", str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir", str(w_race),
+                    "--backup-dir", str(bak_race),
+                    "--env-passphrase-file", str(pass_f),
+                    "--replace-env",
+                    "--skip-minio", "--skip-caddy", "--skip-edge-build",
+                ],
+                env=env_race,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_race.returncode != 0
+            assert bak_seen_log.exists() and bak_seen_log.read_text(encoding="utf-8").strip(), (
+                "restore.sh must detect post-lock .env and create .env.pre-restore-* backup before swapping"
+            )
+            assert "已把 .env 恢复为恢复前的内容" in res_race.stderr
+            assert (w_race / ".env").is_file(), "restore.sh must NOT delete .env that appeared before lock acquisition!"
+            assert (w_race / ".env").read_text(encoding="utf-8") == created_env_text
+            assert not list(w_race.glob(".env.pre-restore-*"))
+        finally:
+            if not lock_race_existed:
+                if lock_race.is_dir():
+                    lock_race.rmdir()
+                elif lock_race.exists():
+                    lock_race.unlink()
+
+        # --- Case 2: `.env` is a symlink pointing to a 0600 target file ---
+        proj_sym = f"r12-sym-{uuid.uuid4().hex[:10]}"
+        sym_target_text = (
+            f"COMPOSE_PROJECT_NAME={proj_sym}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=sympg\nDB_NAME=postgres\n"
+            "SENTINEL=symlink-target-secret\n"
+        )
+        sym_backup_text = (
+            f"COMPOSE_PROJECT_NAME={proj_sym}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=newpg\nDB_NAME=postgres\n"
+            "SENTINEL=backup-env-over-symlink\n"
+        )
+        bak_sym = _make_r12_backup("r12-bak-sym", proj_sym, sym_backup_text)
+        sym_target = tmp_path / "r12-secret-target.env"
+        sym_target.write_text(sym_target_text, encoding="utf-8")
+        sym_target.chmod(0o600)
+
+        w_sym = tmp_path / "r12-work-sym"
+        w_sym.mkdir()
+        (w_sym / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
+        (w_sym / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_sym / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+        (w_sym / ".env").symlink_to(sym_target)
+
+        sym_bak_check_log = tmp_path / "r12-sym-bak-check.log"
+        bin_sym = tmp_path / "r12-bin-sym"
+        bin_sym.mkdir()
+        (bin_sym / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (bin_sym / "flock").chmod(0o755)
+        (bin_sym / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *" config --format json"* ]]; then\n'
+            f'  for b in "{w_sym}"/.env.pre-restore-*; do\n'
+            '    if [[ -L "$b" ]]; then echo "SYMLINK:$(readlink "$b")" > "' + str(sym_bak_check_log) + '"; fi\n'
+            "  done\n"
+            '  echo \'{"services":{"backend":{"environment":{}}}}\'\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+            'if [[ "$*" == *"FROM pg_database"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" -d postgres "* && "$*" == *"pg_class"* ]]; then printf "1\\t0\\t0\\n"; exit 0; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (bin_sym / "docker").chmod(0o755)
+        env_sym = os.environ.copy()
+        env_sym["PATH"] = f"{bin_sym}:{env_sym.get('PATH', '')}"
+        lock_sym = Path(f"/tmp/dalton-{proj_sym}.restore.lock")
+        lock_sym_existed = lock_sym.exists()
+        try:
+            res_sym = subprocess.run(
+                [
+                    "bash", str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir", str(w_sym),
+                    "--backup-dir", str(bak_sym),
+                    "--env-passphrase-file", str(pass_f),
+                    "--replace-env",
+                    "--skip-minio", "--skip-caddy", "--skip-edge-build",
+                ],
+                env=env_sym,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_sym.returncode != 0
+            assert "已把 .env 恢复为恢复前的内容" in res_sym.stderr
+            assert sym_bak_check_log.exists() and sym_bak_check_log.read_text(encoding="utf-8").strip() == f"SYMLINK:{sym_target}", (
+                "Symlink .env must be moved itself as .env.pre-restore-* backup"
+            )
+            assert (w_sym / ".env").is_symlink(), ".env must remain a symlink after preflight failure!"
+            assert os.readlink(w_sym / ".env") == str(sym_target), ".env must point to the exact same target!"
+            assert sym_target.read_text(encoding="utf-8") == sym_target_text
+            assert stat.S_IMODE(sym_target.stat().st_mode) == 0o600, (
+                f"Symlink target permissions must remain 0600, got {oct(stat.S_IMODE(sym_target.stat().st_mode))}"
+            )
+            assert not list(w_sym.glob(".env.pre-restore-*"))
+        finally:
+            if not lock_sym_existed:
+                if lock_sym.is_dir():
+                    lock_sym.rmdir()
+                elif lock_sym.exists():
+                    lock_sym.unlink()
+
+        # --- Case 3: SIGTERM after `.env` swap and before writes rolls `.env` back and exits 143 ---
+        proj_term = f"r12-term-{uuid.uuid4().hex[:10]}"
+        orig_term_env = (
+            f"COMPOSE_PROJECT_NAME={proj_term}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=oldpg\nDB_NAME=postgres\n"
+            "SENTINEL=original-before-sigterm\n"
+        )
+        new_term_env = (
+            f"COMPOSE_PROJECT_NAME={proj_term}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=newpg\nDB_NAME=postgres\n"
+            "SENTINEL=swapped-during-preflight\n"
+        )
+        bak_term = _make_r12_backup("r12-bak-term", proj_term, new_term_env)
+        w_term = tmp_path / "r12-work-term"
+        w_term.mkdir()
+        (w_term / "docker-compose.yml").write_text("services:\n  backend:\n    env_file: .env\n", encoding="utf-8")
+        (w_term / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_term / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+        (w_term / ".env").write_text(orig_term_env, encoding="utf-8")
+        (w_term / ".env").chmod(0o640)
+
+        term_ready = tmp_path / "r12-term-ready"
+        bin_term = tmp_path / "r12-bin-term"
+        bin_term.mkdir()
+        (bin_term / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (bin_term / "flock").chmod(0o755)
+        (bin_term / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *" config --format json"* ]]; then echo \'{"services":{"backend":{"environment":{}}}}\'; exit 0; fi\n'
+            'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *" pg_restore --list"* ]]; then\n'
+            f'  touch "{term_ready}"\n'
+            "  sleep 0.4\n"
+            "  exit 0\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (bin_term / "docker").chmod(0o755)
+        env_term = os.environ.copy()
+        env_term["PATH"] = f"{bin_term}:{env_term.get('PATH', '')}"
+        lock_term = Path(f"/tmp/dalton-{proj_term}.restore.lock")
+        lock_term_existed = lock_term.exists()
+        try:
+            proc = subprocess.Popen(
+                [
+                    "bash", str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir", str(w_term),
+                    "--backup-dir", str(bak_term),
+                    "--env-passphrase-file", str(pass_f),
+                    "--replace-env",
+                    "--skip-minio", "--skip-caddy", "--skip-edge-build",
+                ],
+                env=env_term,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            deadline = time.monotonic() + 10.0
+            while not term_ready.exists() and time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.02)
+            assert term_ready.exists(), "restore.sh did not reach pre-write pg_restore --list stage"
+            assert (w_term / ".env").read_text(encoding="utf-8") == new_term_env, (
+                "Expected decrypted .env to be swapped in before SIGTERM"
+            )
+            proc.send_signal(signal.SIGTERM)
+            _, term_stderr = proc.communicate(timeout=15)
+            assert proc.returncode == 143, f"Expected exit code 143 on SIGTERM, got {proc.returncode}: {term_stderr}"
+            assert "已把 .env 恢复为恢复前的内容" in term_stderr, (
+                f"SIGTERM before writes must trigger .env rollback warning, got:\n{term_stderr}"
+            )
+            assert (w_term / ".env").read_text(encoding="utf-8") == orig_term_env
+            assert stat.S_IMODE((w_term / ".env").stat().st_mode) == 0o640
+            assert not list(w_term.glob(".env.pre-restore-*"))
+        finally:
+            if not lock_term_existed:
+                if lock_term.is_dir():
+                    lock_term.rmdir()
+                elif lock_term.exists():
+                    lock_term.unlink()
+
+        # --- Case 4: MUTATION_STARTED=1 is set after `wc -c` prep, right before actual writes ---
+        restore_src = (REPO_ROOT / "scripts/standalone/restore.sh").read_text(encoding="utf-8")
+        wc_pos = restore_src.index('manifest_size="$(wc -c < "$MINIO_MANIFEST_TMP"')
+        first_mut_pos = restore_src.index("MUTATION_STARTED=1")
+        assert first_mut_pos > wc_pos, (
+            "MUTATION_STARTED=1 must be set AFTER manifest_size / wc -c preparation, right before writing!"
+        )
+        assert restore_src.count("MUTATION_STARTED=1") == 2, (
+            "MUTATION_STARTED=1 should be set immediately before MinIO upload write and before PG write"
+        )
