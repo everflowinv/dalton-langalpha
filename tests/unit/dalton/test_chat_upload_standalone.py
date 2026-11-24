@@ -3395,18 +3395,21 @@ class TestSandboxNetworkAndInitScript:
         (bak_stub / "postgres.dump").write_bytes(b"PGDMP")
 
         # 7a. Trailing `-` and `_` accepted by --project-name and .env across backup.sh, restore.sh, upgrade.sh
+        trail_suffix = uuid.uuid4().hex[:12]
+        trail_env_proj = f"Dalton_Core_{trail_suffix}-"
+        want_trail_proj = f"dalton_core_{trail_suffix}-"
         w_trail = tmp_path / "r9-work-trail"
         w_trail.mkdir()
         (w_trail / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
         (w_trail / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
-        (w_trail / ".env").write_text("COMPOSE_PROJECT_NAME=Dalton_Core-\nDB_HOST=postgres\n", encoding="utf-8")
+        (w_trail / ".env").write_text(f"COMPOSE_PROJECT_NAME={trail_env_proj}\nDB_HOST=postgres\n", encoding="utf-8")
 
         r9_docker_log.unlink(missing_ok=True)
         subprocess.run(
             ["bash", str(REPO_ROOT / "scripts/standalone/backup.sh"), "--work-dir", str(w_trail)],
             env=r9_env, capture_output=True, text=True, timeout=15,
         )
-        assert "compose -p dalton_core- " in r9_docker_log.read_text(encoding="utf-8")
+        assert f"compose -p {want_trail_proj} " in r9_docker_log.read_text(encoding="utf-8")
 
         r9_docker_log.unlink(missing_ok=True)
         subprocess.run(
@@ -3415,21 +3418,23 @@ class TestSandboxNetworkAndInitScript:
         )
         assert "compose -p dalton_ " in r9_docker_log.read_text(encoding="utf-8")
 
-        lock_trail = Path("/tmp/dalton-dalton_core-.restore.lock")
+        lock_trail = Path(f"/tmp/dalton-{want_trail_proj}.restore.lock")
+        lock_trail_existed = lock_trail.exists()
         r9_docker_log.unlink(missing_ok=True)
         try:
             subprocess.run(
                 ["bash", str(REPO_ROOT / "scripts/standalone/restore.sh"), "--work-dir", str(w_trail), "--backup-dir", str(bak_stub)],
                 env=r9_env, capture_output=True, text=True, timeout=15,
             )
-            assert "compose -p dalton_core- " in r9_docker_log.read_text(encoding="utf-8")
+            assert f"compose -p {want_trail_proj} " in r9_docker_log.read_text(encoding="utf-8")
         finally:
-            if lock_trail.is_dir():
-                lock_trail.rmdir()
-            elif lock_trail.exists():
-                lock_trail.unlink()
+            if not lock_trail_existed:
+                if lock_trail.is_dir():
+                    lock_trail.rmdir()
+                elif lock_trail.exists():
+                    lock_trail.unlink()
 
-        # 7b. upgrade.sh lowercases `.env` COMPOSE_PROJECT_NAME (`Dalton_Core-`) before passing `--project-name` to backup.sh
+        # 7b. upgrade.sh lowercases `.env` COMPOSE_PROJECT_NAME (`Dalton_Core_<uuid>-`) before passing `--project-name` to backup.sh
         rel_r9 = tmp_path / "r9-rel"
         (rel_r9 / "scripts/standalone").mkdir(parents=True)
         (rel_r9 / "deploy/standalone").mkdir(parents=True)
@@ -3450,7 +3455,7 @@ class TestSandboxNetworkAndInitScript:
             ],
             env=r9_env, capture_output=True, text=True, timeout=15,
         )
-        assert "--project-name dalton_core-" in upg_bak_args.read_text(encoding="utf-8")
+        assert f"--project-name {want_trail_proj}" in upg_bak_args.read_text(encoding="utf-8")
 
         # 7c. Invalid `.env` COMPOSE_PROJECT_NAME (e.g. `Bad.Dot`) rejected with exit 2 by all 3 scripts
         w_bad_env = tmp_path / "r9-work-bad-env"
@@ -3469,8 +3474,11 @@ class TestSandboxNetworkAndInitScript:
             )
             assert res_bad_env.returncode == 2, f"{s_name} should reject Bad.Dot in .env with exit 2: {res_bad_env.stderr}"
 
-        # Item 8: Directory name fallback `Dalton.Release` -> `dalton-release` consistently across all 3 scripts
-        w_dir_rel = tmp_path / "Dalton.Release"
+        # Item 8: Directory name fallback `Dalton.Release-<uuid>` -> `dalton-release-<uuid>` across all 3 scripts
+        # (uses a unique random suffix and only removes a lock file created by this test).
+        dir_suffix = uuid.uuid4().hex[:12]
+        w_dir_rel = tmp_path / f"Dalton.Release-{dir_suffix}"
+        want_dir_proj = f"dalton-release-{dir_suffix}"
         w_dir_rel.mkdir()
         (w_dir_rel / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
         (w_dir_rel / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
@@ -3481,21 +3489,23 @@ class TestSandboxNetworkAndInitScript:
             ["bash", str(REPO_ROOT / "scripts/standalone/backup.sh"), "--work-dir", str(w_dir_rel)],
             env=r9_env, capture_output=True, text=True, timeout=15,
         )
-        assert "compose -p dalton-release " in r9_docker_log.read_text(encoding="utf-8")
+        assert f"compose -p {want_dir_proj} " in r9_docker_log.read_text(encoding="utf-8")
 
-        lock_dir_rel = Path("/tmp/dalton-dalton-release.restore.lock")
+        lock_dir_rel = Path(f"/tmp/dalton-{want_dir_proj}.restore.lock")
+        lock_dir_rel_existed = lock_dir_rel.exists()
         r9_docker_log.unlink(missing_ok=True)
         try:
             subprocess.run(
                 ["bash", str(REPO_ROOT / "scripts/standalone/restore.sh"), "--work-dir", str(w_dir_rel), "--backup-dir", str(bak_stub)],
                 env=r9_env, capture_output=True, text=True, timeout=15,
             )
-            assert "compose -p dalton-release " in r9_docker_log.read_text(encoding="utf-8")
+            assert f"compose -p {want_dir_proj} " in r9_docker_log.read_text(encoding="utf-8")
         finally:
-            if lock_dir_rel.is_dir():
-                lock_dir_rel.rmdir()
-            elif lock_dir_rel.exists():
-                lock_dir_rel.unlink()
+            if not lock_dir_rel_existed:
+                if lock_dir_rel.is_dir():
+                    lock_dir_rel.rmdir()
+                elif lock_dir_rel.exists():
+                    lock_dir_rel.unlink()
 
         upg_bak_args.unlink(missing_ok=True)
         subprocess.run(
@@ -3505,7 +3515,7 @@ class TestSandboxNetworkAndInitScript:
             ],
             env=r9_env, capture_output=True, text=True, timeout=15,
         )
-        assert "--project-name dalton-release" in upg_bak_args.read_text(encoding="utf-8")
+        assert f"--project-name {want_dir_proj}" in upg_bak_args.read_text(encoding="utf-8")
 
         # Item 9: Multiple non-empty other databases in restore.sh are joined with `, ` (comma + space)
         proj_multi_db = f"r9-multi-db-{os.getpid()}"
@@ -3558,3 +3568,377 @@ class TestSandboxNetworkAndInitScript:
                 lock_mdb.rmdir()
             elif lock_mdb.exists():
                 lock_mdb.unlink()
+
+    def test_b6_r10_fixes_env_file_override_preservation_and_manual_db_check(
+        self, tmp_path: Path
+    ) -> None:
+        """Offline verification for Batch 6 R10 fixes:
+        1. restore.sh from env.enc replaces ONLY the `.env` entry in each service's
+           merged `env_file` list while preserving extra entries (e.g. `storage.env`)
+           in their exact original order; an extra compose file adding `storage.env`
+           with a mismatched key prefix is refused BEFORE writing `.env` or any data.
+        2. Both PyYAML and pure-stdlib fallback preserve ordering, object entries,
+           `!override`, and `!reset` semantics without touching non-`.env` paths.
+        3. The database check loop in `STANDALONE-DEPLOY.md` uses `set -eu` + explicit
+           status/digit checks (no pipeline exit-code masking), prints the DB name and
+           `检查失败，先不要删除卷`, and exits non-zero when a query fails or returns
+           empty/non-digit output.
+        """
+        import re as _re
+        import tarfile
+
+        # --- Item 1a: Extra compose file adding `storage.env` with mismatched key prefix ---
+        pass_f = tmp_path / "r10.pass"
+        pass_f.write_text("r10-passphrase-987654\n", encoding="utf-8")
+        pass_f.chmod(0o600)
+
+        proj_r10 = f"r10-storage-env-{uuid.uuid4().hex[:10]}"
+        bak_r10 = tmp_path / "r10-bak"
+        bak_r10.mkdir()
+        (bak_r10 / "postgres.dump").write_bytes(b"PGDMP")
+
+        plain_env = tmp_path / "r10.plain.env"
+        plain_env.write_text(
+            f"COMPOSE_PROJECT_NAME={proj_r10}\n"
+            "DB_HOST=postgres\n"
+            "DB_USER=postgres\n"
+            "DB_PASSWORD=secretpg\n"
+            "DB_NAME=postgres\n"
+            "MINIO_ROOT_USER=minioadmin\n"
+            "MINIO_ROOT_PASSWORD=miniopass\n"
+            "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL=http://minio:9000\n"
+            "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME=chat-uploads\n"
+            "DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID=minioadmin\n"
+            "DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY=miniopass\n"
+            "DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX=tenant-a\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                "openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-md", "sha256", "-iter", "10000",
+                "-salt", "-in", str(plain_env), "-out", str(bak_r10 / "env.enc"), "-pass", f"file:{pass_f}",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
+        minio_manifest = {
+            "primary_bucket": "chat-uploads",
+            "primary_key_prefix": "tenant-a",
+            "buckets": ["chat-uploads"],
+            "targets": {
+                "chat_upload": {
+                    "service_type": "s3",
+                    "service_id": "s3:http://minio:9000",
+                    "endpoint": "http://minio:9000",
+                    "bucket": "chat-uploads",
+                    "key_prefix": "tenant-a",
+                }
+            },
+            "objects": [],
+        }
+        mm_path = tmp_path / "_minio_manifest.json"
+        mm_path.write_text(json.dumps(minio_manifest), encoding="utf-8")
+        with tarfile.open(bak_r10 / "minio-objects.tar.gz", "w:gz") as tf:
+            tf.add(mm_path, arcname="_minio_manifest.json")
+        (bak_r10 / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "env_backup": "encrypted",
+                    "env_encryption": {
+                        "cipher": "aes-256-cbc",
+                        "kdf": "pbkdf2",
+                        "digest": "sha256",
+                        "iterations": 10000,
+                    },
+                    "minio": {
+                        "primary_bucket": "chat-uploads",
+                        "primary_key_prefix": "tenant-a",
+                        "targets": minio_manifest["targets"],
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        work_r10 = tmp_path / "r10-work"
+        work_r10.mkdir()
+        (work_r10 / "docker-compose.yml").write_text(
+            "services:\n  backend:\n    env_file: .env\n", encoding="utf-8"
+        )
+        (work_r10 / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (work_r10 / "docker-compose.extra.yml").write_text(
+            "services:\n  backend:\n    env_file:\n      - storage.env\n", encoding="utf-8"
+        )
+        (work_r10 / "storage.env").write_text(
+            "DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX=tenant-b\n", encoding="utf-8"
+        )
+        (work_r10 / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+
+        # Stub `docker` that actually merges `-f` compose files (honoring `env_file: !override`)
+        # and loads every entry in `backend`'s `env_file` list in exact order relative to `--project-directory`.
+        stub_bin = tmp_path / "r10-bin"
+        stub_bin.mkdir()
+        (stub_bin / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (stub_bin / "flock").chmod(0o755)
+        captured_override = tmp_path / "r10-captured-override.yml"
+        captured_calls = tmp_path / "r10-docker-calls.log"
+        stub_compose_py = tmp_path / "r10_stub_compose.py"
+        stub_compose_py.write_text(
+            "import json, os, sys, yaml\n"
+            "args = sys.argv[1:]\n"
+            "files = []\n"
+            "proj_dir = os.getcwd()\n"
+            "i = 0\n"
+            "while i < len(args):\n"
+            "    if args[i] == '-f' and i + 1 < len(args):\n"
+            "        files.append(args[i + 1]); i += 2\n"
+            "    elif args[i] == '--project-directory' and i + 1 < len(args):\n"
+            "        proj_dir = args[i + 1]; i += 2\n"
+            "    else:\n"
+            "        i += 1\n"
+            "class _T:\n"
+            "    def __init__(self, tag, val): self.tag, self.val = tag, val\n"
+            "class _L(yaml.SafeLoader): pass\n"
+            "def _c(l, n):\n"
+            "    v = l.construct_sequence(n, deep=True) if isinstance(n, yaml.SequenceNode) else l.construct_scalar(n)\n"
+            "    return _T(n.tag, v)\n"
+            "_L.add_constructor('!override', _c)\n"
+            "_L.add_constructor('!reset', _c)\n"
+            "env_files = []\n"
+            "for f in files:\n"
+            "    if 'dalton-restore-override' in os.path.basename(f):\n"
+            f"        open({str(captured_override)!r}, 'w', encoding='utf-8').write(open(f, encoding='utf-8').read())\n"
+            "    doc = yaml.load(open(f, encoding='utf-8'), Loader=_L) or {}\n"
+            "    b = (doc.get('services') or {}).get('backend') or {}\n"
+            "    if 'env_file' in b:\n"
+            "        ef = b['env_file']\n"
+            "        tag = ef.tag if isinstance(ef, _T) else None\n"
+            "        val = ef.val if isinstance(ef, _T) else ef\n"
+            "        items = [val] if isinstance(val, str) else list(val or [])\n"
+            "        if tag == '!reset': env_files = []\n"
+            "        elif tag == '!override': env_files = items\n"
+            "        else: env_files.extend(items)\n"
+            "merged_env = {}\n"
+            "for entry in env_files:\n"
+            "    p = entry['path'] if isinstance(entry, dict) else entry\n"
+            "    full = p if os.path.isabs(p) else os.path.join(proj_dir, p)\n"
+            "    for raw in open(full, encoding='utf-8'):\n"
+            "        s = raw.strip()\n"
+            "        if not s or s.startswith('#') or '=' not in s: continue\n"
+            "        k, v = s.split('=', 1)\n"
+            "        merged_env[k.strip()] = v.strip()\n"
+            "print(json.dumps({'services': {'backend': {'environment': merged_env}}}))\n",
+            encoding="utf-8",
+        )
+        (stub_bin / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$*" >> "{captured_calls}"\n'
+            'if [[ "$*" == *" config --format json"* ]]; then\n'
+            f'  "{sys.executable}" "{stub_compose_py}" "$@"\n'
+            "  exit $?\n"
+            "fi\n"
+            "exit 99\n",
+            encoding="utf-8",
+        )
+        (stub_bin / "docker").chmod(0o755)
+
+        r10_env = os.environ.copy()
+        r10_env["PATH"] = f"{stub_bin}:{r10_env.get('PATH', '')}"
+        lock_r10 = Path(f"/tmp/dalton-{proj_r10}.restore.lock")
+        lock_r10_existed = lock_r10.exists()
+        try:
+            res_mismatch = subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir", str(work_r10),
+                    "--backup-dir", str(bak_r10),
+                    "--compose-files", "docker-compose.yml:docker-compose.core.yml:docker-compose.extra.yml",
+                    "--env-passphrase-file", str(pass_f),
+                    "--skip-caddy", "--skip-edge-build",
+                ],
+                env=r10_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_mismatch.returncode != 0, (
+                f"Expected restore.sh to refuse mismatched key_prefix from storage.env, got rc=0:\n{res_mismatch.stdout}"
+            )
+            assert "tenant-b" in res_mismatch.stderr and "key_prefix" in res_mismatch.stderr.lower(), (
+                f"Expected key_prefix mismatch mentioning tenant-b in stderr, got:\n{res_mismatch.stderr}"
+            )
+            assert not (work_r10 / ".env").exists(), (
+                "restore.sh must refuse BEFORE writing .env when storage.env mismatches backup!"
+            )
+            calls_made = captured_calls.read_text(encoding="utf-8").splitlines()
+            assert all(" up -d" not in c for c in calls_made), (
+                f"restore.sh must refuse BEFORE starting/mutating containers, calls={calls_made}"
+            )
+            ov_text = captured_override.read_text(encoding="utf-8")
+            assert '"storage.env"' in ov_text, (
+                f"Override file must preserve storage.env entry in order, got:\n{ov_text}"
+            )
+            assert ".env.tmp-decrypt-" in ov_text and ov_text.index(".env.tmp-decrypt-") < ov_text.index('"storage.env"'), (
+                f"Override file must replace only .env and keep storage.env after it, got:\n{ov_text}"
+            )
+        finally:
+            if not lock_r10_existed:
+                if lock_r10.is_dir():
+                    lock_r10.rmdir()
+                elif lock_r10.exists():
+                    lock_r10.unlink()
+
+        # --- Item 1b: Pure-stdlib fallback & PyYAML parity across complex env_file forms ---
+        restore_src = (REPO_ROOT / "scripts/standalone/restore.sh").read_text(encoding="utf-8")
+        m_ov_fn = _re.search(
+            r"write_compose_env_override\(\)\s*\{.*?<<'PY'\n(.*?)\nPY\n\}",
+            restore_src,
+            flags=_re.DOTALL,
+        )
+        assert m_ov_fn is not None, "Could not extract write_compose_env_override Python body"
+        ov_script = tmp_path / "run_ov.py"
+        ov_script.write_text(m_ov_fn.group(1), encoding="utf-8")
+
+        cmplx_work = tmp_path / "r10-cmplx"
+        cmplx_work.mkdir()
+        cf1 = cmplx_work / "base.yml"
+        cf2 = cmplx_work / "extra.yml"
+        cf1.write_text(
+            "services:\n"
+            "  backend:\n"
+            "    env_file:\n"
+            "      - pre.env\n"
+            "      - path: ./.env\n"
+            "        required: false\n"
+            "  worker:\n"
+            "    env_file: .env\n"
+            "  reset_svc:\n"
+            "    env_file: .env\n"
+            "  other_svc:\n"
+            "    env_file:\n"
+            "      - sub/.env\n"
+            "      - .env.local\n",
+            encoding="utf-8",
+        )
+        cf2.write_text(
+            "services:\n"
+            "  backend:\n"
+            "    env_file:\n"
+            "      - path: storage.env\n"
+            "        required: true\n"
+            "  worker:\n"
+            "    env_file: !override [only-storage.env]\n"
+            "  reset_svc:\n"
+            "    env_file: !reset []\n",
+            encoding="utf-8",
+        )
+
+        # Block PyYAML in a separate PYTHONPATH dir to test the pure-stdlib fallback too
+        no_yaml_dir = tmp_path / "no-yaml"
+        no_yaml_dir.mkdir()
+        (no_yaml_dir / "yaml.py").write_text('raise ImportError("blocked for fallback test")\n', encoding="utf-8")
+        target_decrypted = str(cmplx_work / ".env.tmp-decrypt-xyz")
+        outputs: list[str] = []
+        for mode_name, extra_pypath in (("yaml", ""), ("stdlib-fallback", str(no_yaml_dir))):
+            env_m = os.environ.copy()
+            if extra_pypath:
+                env_m["PYTHONPATH"] = f"{extra_pypath}:{env_m.get('PYTHONPATH', '')}"
+            run_ov = subprocess.run(
+                [sys.executable, str(ov_script), target_decrypted, str(cmplx_work), str(cf1), str(cf2)],
+                env=env_m,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=15,
+            )
+            out_y = run_ov.stdout
+            outputs.append(out_y)
+            assert "  backend:\n" in out_y, f"{mode_name}: backend missing:\n{out_y}"
+            assert "  worker:\n" not in out_y, f"{mode_name}: overridden-away worker must not appear:\n{out_y}"
+            assert "  reset_svc:\n" not in out_y, f"{mode_name}: reset_svc must not appear:\n{out_y}"
+            assert "  other_svc:\n" not in out_y, f"{mode_name}: non-root .env other_svc must not appear:\n{out_y}"
+            assert (
+                out_y.index('"pre.env"')
+                < out_y.index(json.dumps(target_decrypted))
+                < out_y.index('"storage.env"')
+            ), f"{mode_name}: order not preserved:\n{out_y}"
+            assert "required: false" in out_y and "required: true" in out_y, (
+                f"{mode_name}: object attributes not preserved:\n{out_y}"
+            )
+        assert outputs[0] == outputs[1], f"PyYAML vs stdlib fallback diverged:\n{outputs[0]}\n---\n{outputs[1]}"
+
+        # --- Item 3: Manual database check loop in STANDALONE-DEPLOY.md fails loudly on query error / non-digit ---
+        doc_text = (REPO_ROOT / "docs/dalton/dev-guide/STANDALONE-DEPLOY.md").read_text(encoding="utf-8")
+        m_doc_block = _re.search(
+            r"```bash\n(\s*cd /opt/dalton\n\s*# 若修改过 DB_USER.*?)\n\s*```",
+            doc_text,
+            flags=_re.DOTALL,
+        )
+        assert m_doc_block is not None, "Could not locate DB check bash snippet in STANDALONE-DEPLOY.md"
+        # Dedent markdown list indentation (3 spaces) and swap `cd /opt/dalton` to tmp_path
+        raw_lines = [ln[3:] if ln.startswith("   ") else ln for ln in m_doc_block.group(1).splitlines()]
+        snippet_body = "\n".join(raw_lines).replace("cd /opt/dalton", f'cd "{tmp_path}"', 1)
+        assert "set -eu" in snippet_body, "Manual DB check snippet must enable set -eu"
+
+        doc_bin = tmp_path / "r10-doc-bin"
+        doc_bin.mkdir()
+        doc_docker = doc_bin / "docker"
+
+        def _run_doc_snippet(docker_body: str) -> subprocess.CompletedProcess[str]:
+            doc_docker.write_text("#!/usr/bin/env bash\n" + docker_body, encoding="utf-8")
+            doc_docker.chmod(0o755)
+            d_env = os.environ.copy()
+            d_env["PATH"] = f"{doc_bin}:{d_env.get('PATH', '')}"
+            d_env["PROJECT"] = "dalton-doc-check"
+            return subprocess.run(
+                ["bash", "-c", snippet_body],
+                env=d_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+        # 3a. Normal case: both DBs return pure digits -> exits 0
+        res_ok = _run_doc_snippet(
+            'if [[ "$*" == *"FROM pg_database"* ]]; then printf "analytics\\npostgres\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" -d analytics "* ]]; then printf "0\\r\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" -d postgres "* ]]; then printf "12\\n"; exit 0; fi\n'
+            "exit 1\n"
+        )
+        assert res_ok.returncode == 0, f"Expected exit 0 on valid counts, got {res_ok.returncode}: {res_ok.stderr}"
+        assert "analytics\tuser_objects=0" in res_ok.stdout
+        assert "postgres\tuser_objects=12" in res_ok.stdout
+
+        # 3b. Query failure on `analytics` -> exits non-zero, prints DB name + warning
+        res_fail = _run_doc_snippet(
+            'if [[ "$*" == *"FROM pg_database"* ]]; then printf "analytics\\npostgres\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" -d analytics "* ]]; then echo "psql: FATAL: permission denied" >&2; exit 2; fi\n'
+            'if [[ "$*" == *" -d postgres "* ]]; then printf "0\\n"; exit 0; fi\n'
+            "exit 1\n"
+        )
+        assert res_fail.returncode != 0, f"Expected non-zero exit when psql fails on analytics: {res_fail.stdout}"
+        assert "analytics" in res_fail.stderr and "检查失败，先不要删除卷" in res_fail.stderr, (
+            f"Expected analytics + warning in stderr, got: {res_fail.stderr!r}"
+        )
+        assert "postgres\tuser_objects=" not in res_fail.stdout, "Loop must stop immediately on failure"
+
+        # 3c. Non-digit / empty / multi-line output on `analytics` -> exits non-zero, prints DB name + warning
+        for bad_out in ("", "not-a-number", "0\\n1"):
+            res_bad = _run_doc_snippet(
+                'if [[ "$*" == *"FROM pg_database"* ]]; then printf "analytics\\npostgres\\n"; exit 0; fi\n'
+                f'if [[ "$*" == *" -d analytics "* ]]; then printf "{bad_out}\\n"; exit 0; fi\n'
+                'if [[ "$*" == *" -d postgres "* ]]; then printf "0\\n"; exit 0; fi\n'
+                "exit 1\n"
+            )
+            assert res_bad.returncode != 0, f"Expected non-zero exit for bad output {bad_out!r}"
+            assert "analytics" in res_bad.stderr and "检查失败，先不要删除卷" in res_bad.stderr, (
+                f"Expected analytics + warning for {bad_out!r}, got: {res_bad.stderr!r}"
+            )
+
+        # 3d. Outer DB-list query failure -> exits non-zero + warning
+        res_list_fail = _run_doc_snippet('echo "psql: cannot connect" >&2; exit 2\n')
+        assert res_list_fail.returncode != 0
+        assert "检查失败，先不要删除卷" in res_list_fail.stderr

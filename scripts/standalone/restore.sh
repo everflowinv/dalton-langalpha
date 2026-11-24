@@ -673,69 +673,380 @@ for cf in compose_files:
 PY
 )
 
-# Generate an env_file !override file pointing services that reference `.env` at the
-# decrypted env file. When restoring from env.enc we MUST keep the EXACT same compose
-# file list and env_file list across both preflight (`compose config` + empty checks)
-# and formal writes (Steps 4-7); otherwise removing `!override` after preflight would
-# re-enable extra `env_file` entries (e.g. `storage.env` from an additional compose file)
-# that were excluded during preflight comparison, causing formal writes to diverge from
-# what preflight validated. During preflight the override points to $CANDIDATE_ENV so
-# ${WORK_DIR}/.env is untouched until all checks pass; after writing ${ENV_FILE}
-# atomically, the same override is updated in-place to point to the byte-identical
-# ${ENV_FILE} and kept through formal writes until cleanup on exit.
+# Generate an env_file !override file that replaces ONLY entries pointing to
+# `${WORK_DIR}/.env` with the target env path, while preserving every other
+# `env_file` entry (e.g. `storage.env` from an additional compose file) in its
+# exact original order and form. During preflight the `.env` entry points to
+# $CANDIDATE_ENV so ${WORK_DIR}/.env stays untouched until all checks pass; after
+# writing ${ENV_FILE} atomically, the `.env` entry is updated in-place to
+# ${ENV_FILE}. Consequently preflight, formal writes, startup, and subsequent
+# regular `docker compose up` runs after cleanup removes the override file all
+# see the exact same effective `env_file` list.
 write_compose_env_override() {
   local target_env_path="$1"
   local out_path="$2"
-  python3 - "$target_env_path" "${RESOLVED_COMPOSE_FILES[@]}" > "$out_path" <<'PY'
-import json, re, sys
+  python3 - "$target_env_path" "$WORK_DIR" "${RESOLVED_COMPOSE_FILES[@]}" > "$out_path" <<'PY'
+import json, os, re, sys
 
 env_path = sys.argv[1]
-compose_files = sys.argv[2:]
-svcs: set[str] = set()
-for cf in compose_files:
+work_dir = sys.argv[2]
+compose_files = sys.argv[3:]
+
+work_norm = os.path.normpath(os.path.abspath(work_dir))
+dotenv_norm = os.path.normpath(os.path.join(work_norm, ".env"))
+dotenv_real = os.path.realpath(dotenv_norm)
+
+
+def is_dotenv_path(raw_path: str) -> bool:
+    p = raw_path.strip()
+    if not p or "$" in p:
+        return False
+    if os.path.isabs(p):
+        cand_norm = os.path.normpath(p)
+        return cand_norm == dotenv_norm or os.path.realpath(cand_norm) == dotenv_real
+    cand_norm = os.path.normpath(os.path.join(work_norm, p))
+    return cand_norm == dotenv_norm or os.path.realpath(cand_norm) == dotenv_real
+
+
+def strip_comment(text: str) -> str:
+    in_quote: str | None = None
+    escaped = False
+    for idx, ch in enumerate(text):
+        if escaped:
+            escaped = False
+            continue
+        if in_quote == '"' and ch == "\\":
+            escaped = True
+            continue
+        if in_quote is not None:
+            if ch == in_quote:
+                in_quote = None
+            continue
+        if ch in ("'", '"'):
+            in_quote = ch
+        elif ch == "#" and (idx == 0 or text[idx - 1].isspace()):
+            return text[:idx].rstrip()
+    return text.rstrip()
+
+
+def parse_scalar(text: str):
+    val = strip_comment(text).strip()
+    if not val:
+        return ""
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        if val[0] == '"':
+            try:
+                return json.loads(val)
+            except Exception:
+                return val[1:-1]
+        return val[1:-1].replace("''", "'")
+    low = val.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    if low in ("null", "~"):
+        return None
+    return val
+
+
+def split_flow_items(inner: str) -> list[str]:
+    items: list[str] = []
+    buf: list[str] = []
+    in_quote: str | None = None
+    depth = 0
+    escaped = False
+    for ch in inner:
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            continue
+        if in_quote == '"' and ch == "\\":
+            buf.append(ch)
+            escaped = True
+            continue
+        if in_quote is not None:
+            buf.append(ch)
+            if ch == in_quote:
+                in_quote = None
+            continue
+        if ch in ("'", '"'):
+            in_quote = ch
+            buf.append(ch)
+        elif ch in ("{", "["):
+            depth += 1
+            buf.append(ch)
+        elif ch in ("}", "]"):
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch == "," and depth == 0:
+            part = "".join(buf).strip()
+            if part:
+                items.append(part)
+            buf = []
+        else:
+            buf.append(ch)
+    tail = "".join(buf).strip()
+    if tail:
+        items.append(tail)
+    return items
+
+
+def parse_flow_mapping(text: str) -> dict:
+    inner = text.strip()
+    if inner.startswith("{") and inner.endswith("}"):
+        inner = inner[1:-1]
+    out: dict = {}
+    for pair in split_flow_items(inner):
+        if ":" not in pair:
+            continue
+        k, v = pair.split(":", 1)
+        out[str(parse_scalar(k))] = parse_scalar(v)
+    return out
+
+
+def parse_env_file_fallback(cf: str) -> dict[str, tuple[str | None, list]]:
+    result: dict[str, tuple[str | None, list]] = {}
     in_services = False
+    svc_indent: int | None = None
+    prop_indent: int | None = None
     cur_svc: str | None = None
     in_env_file = False
+    ef_indent = 0
+    ef_tag: str | None = None
+    ef_entries: list = []
+    cur_dict: dict | None = None
+    cur_item_indent: int | None = None
+
+    def flush_env_file() -> None:
+        nonlocal in_env_file, ef_tag, ef_entries, cur_dict, cur_item_indent
+        if in_env_file and cur_svc is not None:
+            result[cur_svc] = (ef_tag, ef_entries)
+        in_env_file = False
+        ef_tag = None
+        ef_entries = []
+        cur_dict = None
+        cur_item_indent = None
+
     with open(cf, encoding="utf-8") as fh:
         for raw in fh:
-            stripped = raw.strip()
-            if not stripped or stripped.startswith("#"):
+            cleaned = strip_comment(raw.rstrip("\r\n"))
+            stripped = cleaned.strip()
+            if not stripped:
                 continue
-            indent = len(raw) - len(raw.lstrip(" "))
+            indent = len(cleaned) - len(cleaned.lstrip(" "))
             if indent == 0:
-                in_services = stripped.startswith("services:")
+                flush_env_file()
+                in_services = stripped == "services:" or stripped.startswith("services:")
+                svc_indent = None
+                prop_indent = None
                 cur_svc = None
-                in_env_file = False
                 continue
             if not in_services:
                 continue
-            if indent == 2 and stripped.endswith(":"):
-                cur_svc = stripped[:-1].strip()
-                in_env_file = False
+            if svc_indent is None or indent <= svc_indent:
+                flush_env_file()
+                if stripped.endswith(":"):
+                    svc_indent = indent
+                    prop_indent = None
+                    cur_svc = str(parse_scalar(stripped[:-1]))
+                else:
+                    cur_svc = None
                 continue
             if cur_svc is None:
                 continue
-            if indent == 4:
+            if in_env_file and (
+                indent < ef_indent
+                or (
+                    indent == ef_indent
+                    and not (stripped.startswith("-") and (len(stripped) == 1 or stripped[1].isspace()))
+                )
+            ):
+                flush_env_file()
+            if not in_env_file:
+                if prop_indent is None:
+                    prop_indent = indent
+                if indent != prop_indent:
+                    continue
                 if stripped.startswith("env_file:"):
                     rest = stripped[len("env_file:"):].strip()
-                    if rest:
-                        if rest in (".env", "./.env", '".env"', "'.env'"):
-                            svcs.add(cur_svc)
-                        in_env_file = False
-                    else:
+                    tag: str | None = None
+                    for candidate_tag in ("!override", "!reset"):
+                        if rest == candidate_tag or rest.startswith(candidate_tag + " "):
+                            tag = candidate_tag
+                            rest = rest[len(candidate_tag):].strip()
+                            break
+                    if not rest:
                         in_env_file = True
-                else:
-                    in_env_file = False
-            elif in_env_file and indent > 4:
-                if re.search(r'(^|[\s:/])\.env(["\']|$|\s)', stripped):
-                    svcs.add(cur_svc)
+                        ef_indent = indent
+                        ef_tag = tag
+                        ef_entries = []
+                        cur_dict = None
+                        cur_item_indent = None
+                    elif rest.startswith("[") and rest.endswith("]"):
+                        entries = []
+                        for tok in split_flow_items(rest[1:-1]):
+                            if tok.startswith("{") and tok.endswith("}"):
+                                entries.append(parse_flow_mapping(tok))
+                            else:
+                                entries.append(str(parse_scalar(tok)))
+                        result[cur_svc] = (tag, entries)
+                    elif rest.startswith("{") and rest.endswith("}"):
+                        result[cur_svc] = (tag, [parse_flow_mapping(rest)])
+                    else:
+                        val = parse_scalar(rest)
+                        result[cur_svc] = (tag, [] if val in (None, "") else [str(val)])
+                continue
 
-if svcs:
+            if stripped.startswith("-") and (len(stripped) == 1 or stripped[1].isspace()):
+                item_text = stripped[1:].strip()
+                cur_dict = None
+                cur_item_indent = indent
+                if not item_text:
+                    cur_dict = {}
+                    ef_entries.append(cur_dict)
+                elif item_text.startswith("{") and item_text.endswith("}"):
+                    ef_entries.append(parse_flow_mapping(item_text))
+                elif re.match(r"^[A-Za-z_][A-Za-z0-9_-]*\s*:", item_text):
+                    k, v = item_text.split(":", 1)
+                    cur_dict = {k.strip(): parse_scalar(v)}
+                    ef_entries.append(cur_dict)
+                else:
+                    ef_entries.append(str(parse_scalar(item_text)))
+            elif cur_dict is not None and (cur_item_indent is None or indent > cur_item_indent):
+                if ":" in stripped:
+                    k, v = stripped.split(":", 1)
+                    cur_dict[k.strip()] = parse_scalar(v)
+
+    flush_env_file()
+    return result
+
+
+def parse_env_file_yaml(cf: str) -> dict[str, tuple[str | None, list]] | None:
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except Exception:
+        return None
+
+    class _Tagged:
+        def __init__(self, tag: str, value):
+            self.tag = tag
+            self.value = value
+
+    class _Loader(yaml.SafeLoader):
+        pass
+
+    def _ctor(loader, node):
+        if isinstance(node, yaml.ScalarNode):
+            val = loader.construct_scalar(node)
+        elif isinstance(node, yaml.SequenceNode):
+            val = loader.construct_sequence(node, deep=True)
+        elif isinstance(node, yaml.MappingNode):
+            val = loader.construct_mapping(node, deep=True)
+        else:
+            val = None
+        return _Tagged(node.tag, val)
+
+    def _multi_ctor(loader, tag_suffix, node):
+        if isinstance(node, yaml.ScalarNode):
+            return loader.construct_scalar(node)
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node, deep=True)
+        if isinstance(node, yaml.MappingNode):
+            return loader.construct_mapping(node, deep=True)
+        return None
+
+    _Loader.add_constructor("!override", _ctor)
+    _Loader.add_constructor("!reset", _ctor)
+    _Loader.add_multi_constructor("!", _multi_ctor)
+
+    try:
+        with open(cf, encoding="utf-8") as fh:
+            data = yaml.load(fh, Loader=_Loader)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return {}
+    services = data.get("services")
+    if not isinstance(services, dict):
+        return {}
+    out: dict[str, tuple[str | None, list]] = {}
+    for svc_name, svc_cfg in services.items():
+        if not isinstance(svc_cfg, dict) or "env_file" not in svc_cfg:
+            continue
+        raw_ef = svc_cfg["env_file"]
+        tag = None
+        val = raw_ef
+        if isinstance(raw_ef, _Tagged):
+            tag = raw_ef.tag
+            val = raw_ef.value
+        if val is None:
+            entries = []
+        elif isinstance(val, str):
+            entries = [val]
+        elif isinstance(val, dict):
+            entries = [dict(val)]
+        elif isinstance(val, list):
+            entries = [
+                dict(x) if isinstance(x, dict) else str(x)
+                for x in val
+                if isinstance(x, (str, dict))
+            ]
+        else:
+            entries = []
+        out[str(svc_name)] = (tag, entries)
+    return out
+
+
+merged: dict[str, list] = {}
+for cf in compose_files:
+    parsed = parse_env_file_yaml(cf)
+    if parsed is None:
+        parsed = parse_env_file_fallback(cf)
+    for svc_name, (tag, entries) in parsed.items():
+        if tag == "!reset":
+            merged[svc_name] = []
+        elif tag == "!override":
+            merged[svc_name] = list(entries)
+        else:
+            merged.setdefault(svc_name, []).extend(entries)
+
+escaped_target = env_path.replace("$", "$$")
+rewritten_svcs: dict[str, list] = {}
+for svc, entries in merged.items():
+    replaced_any = False
+    new_entries: list = []
+    for entry in entries:
+        if isinstance(entry, str):
+            if is_dotenv_path(entry):
+                new_entries.append(escaped_target)
+                replaced_any = True
+            else:
+                new_entries.append(entry)
+        elif isinstance(entry, dict):
+            item = dict(entry)
+            p = item.get("path")
+            if isinstance(p, str) and is_dotenv_path(p):
+                item["path"] = escaped_target
+                replaced_any = True
+            new_entries.append(item)
+    if replaced_any:
+        rewritten_svcs[svc] = new_entries
+
+if rewritten_svcs:
     print("services:")
-    for svc in sorted(svcs):
+    for svc in sorted(rewritten_svcs):
         print(f"  {svc}:")
         print("    env_file: !override")
-        print(f"      - {json.dumps(env_path)}")
+        for item in rewritten_svcs[svc]:
+            if isinstance(item, str):
+                print(f"      - {json.dumps(item)}")
+            elif isinstance(item, dict) and item:
+                first = True
+                for k, v in item.items():
+                    prefix = "      - " if first else "        "
+                    first = False
+                    print(f"{prefix}{k}: {json.dumps(v)}")
 PY
 }
 
@@ -1069,10 +1380,10 @@ if [[ "$ENV_FROM_BACKUP" -eq 1 ]]; then
   mv "$ENV_WRITE_TMP" "$ENV_FILE"
   ENV_WRITE_TMP=""
   ACTIVE_COMPOSE_ENV="$ENV_FILE"
-  # Keep the same compose file list and env_file `!override` active for formal writes
-  # (only retargeting its path to the byte-identical ${ENV_FILE} so $STAGED_ENV_TMP can
-  # be deleted immediately). Dropping `!override` here would re-enable extra env_file
-  # entries (e.g. storage.env) that preflight's `compose config` did not evaluate.
+  # Retarget the `.env` entry inside the override file in-place to the now-written
+  # ${ENV_FILE} (still preserving every other `env_file` entry in its exact original
+  # order) so $STAGED_ENV_TMP can be deleted immediately while preflight, formal
+  # writes, startup, and subsequent regular deployments all share the same env_file list.
   if [[ -n "$RESTORE_COMPOSE_OVERRIDE" && -f "$RESTORE_COMPOSE_OVERRIDE" ]]; then
     write_compose_env_override "$ENV_FILE" "$RESTORE_COMPOSE_OVERRIDE"
     chmod 600 "$RESTORE_COMPOSE_OVERRIDE"

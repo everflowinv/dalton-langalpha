@@ -393,16 +393,39 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
    cd /opt/dalton
    # 若修改过 DB_USER，请将下方 DB_USER 替换为 .env 中的超级用户名
    DB_USER=postgres
-   docker compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T postgres \
-     psql -U "$DB_USER" -d template1 -Atqc \
-     "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname NOT IN ('template0','template1') ORDER BY datname;" \
-   | tr -d '\r' | while IFS= read -r db; do
-     [ -z "$db" ] && continue
-     cnt="$(docker compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T postgres \
-       psql -U "$DB_USER" -d "$db" -Atqc \
-       "SELECT (SELECT count(*) FROM pg_class WHERE relnamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname IN ('pg_catalog','information_schema') OR nspname LIKE 'pg_toast%' OR nspname LIKE 'pg_temp%')) + (SELECT count(*) FROM pg_proc WHERE pronamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname IN ('pg_catalog','information_schema') OR nspname LIKE 'pg_toast%' OR nspname LIKE 'pg_temp%')) + (SELECT count(*) FROM pg_type WHERE typnamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname IN ('pg_catalog','information_schema') OR nspname LIKE 'pg_toast%' OR nspname LIKE 'pg_temp%'));" </dev/null | tr -d '\r')"
-     printf '%s\tuser_objects=%s\n' "$db" "$cnt"
-   done
+   (
+     set -eu
+     if ! dbs_raw="$(docker compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T postgres \
+       psql -U "$DB_USER" -d template1 -Atqc \
+       "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname NOT IN ('template0','template1') ORDER BY datname;")"; then
+       printf 'ERROR: 数据库列表检查失败，先不要删除卷\n' >&2
+       exit 1
+     fi
+     dbs="$(printf '%s\n' "$dbs_raw" | tr -d '\r')"
+     if [ -z "$dbs" ]; then
+       printf 'ERROR: 未查到任何非模板数据库，检查失败，先不要删除卷\n' >&2
+       exit 1
+     fi
+     while IFS= read -r db; do
+       [ -z "$db" ] && continue
+       if ! cnt_raw="$(docker compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T postgres \
+         psql -U "$DB_USER" -d "$db" -Atqc \
+         "SELECT (SELECT count(*) FROM pg_class WHERE relnamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname IN ('pg_catalog','information_schema') OR nspname LIKE 'pg_toast%' OR nspname LIKE 'pg_temp%')) + (SELECT count(*) FROM pg_proc WHERE pronamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname IN ('pg_catalog','information_schema') OR nspname LIKE 'pg_toast%' OR nspname LIKE 'pg_temp%')) + (SELECT count(*) FROM pg_type WHERE typnamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname IN ('pg_catalog','information_schema') OR nspname LIKE 'pg_toast%' OR nspname LIKE 'pg_temp%'));" </dev/null)"; then
+         printf 'ERROR: 数据库 %s 检查失败，先不要删除卷\n' "$db" >&2
+         exit 1
+       fi
+       cnt="$(printf '%s' "$cnt_raw" | tr -d '\r')"
+       case "$cnt" in
+         ''|*[!0123456789]*)
+           printf 'ERROR: 数据库 %s 检查失败，先不要删除卷（输出非纯数字: %s）\n' "$db" "$cnt" >&2
+           exit 1
+           ;;
+       esac
+       printf '%s\tuser_objects=%s\n' "$db" "$cnt"
+     done <<EOF
+   $dbs
+   EOF
+   )
    ```
 
 3. **列出项目 `"$PROJECT"` 下的完整卷清单并人工确认后，执行 `down -v` 删除本项目的卷**（仅删除当前项目的容器与数据卷，保留 `/opt/dalton/.env` 与发行文件）：

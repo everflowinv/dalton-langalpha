@@ -1943,6 +1943,63 @@ def check_restore_on_clean_stack(
                 )
                 log("5d2 OK (extra compose file overriding backend bucket refused before writing data).")
 
+                # 5d3. Extra compose file adding `storage.env` to `backend`'s `env_file` with a
+                #      mismatched key prefix MUST remain in effect when restoring from `env.enc`
+                #      and cause restore.sh to refuse BEFORE writing `.env` or any data.
+                storage_override_prefix = "tenant-b-ci-storage-env"
+                storage_override_env = restore_dir / "storage.env"
+                storage_override_compose = tmp_root / "docker-compose.override-backend-storage-env.yml"
+                storage_override_env.write_text(
+                    f"DALTON_CHAT_UPLOAD_STORAGE_KEY_PREFIX={storage_override_prefix}\n",
+                    encoding="utf-8",
+                )
+                storage_override_compose.write_text(
+                    "services:\n"
+                    "  backend:\n"
+                    "    env_file:\n"
+                    "      - storage.env\n",
+                    encoding="utf-8",
+                )
+                restored_env_file.unlink()
+                try:
+                    storage_env_proc = _run_cmd(
+                        [
+                            "bash",
+                            str(restore_dir / "scripts" / "standalone" / "restore.sh"),
+                            "--backup-dir",
+                            str(restore_backup_dir),
+                            "--work-dir",
+                            str(restore_dir),
+                            "--compose-files",
+                            f"{restore_compose_files}:{storage_override_compose}",
+                            "--env-passphrase-file",
+                            str(passphrase_file),
+                            "--project-name",
+                            restore_project,
+                            "--skip-edge-build",
+                        ],
+                        cwd=restore_dir,
+                        env=restore_sh_env,
+                        check=False,
+                        redact_env=ctx.env,
+                        timeout=120,
+                    )
+                    assert storage_env_proc.returncode != 0, (
+                        "restore.sh MUST refuse when an extra compose file adds storage.env with mismatched key prefix!"
+                    )
+                    se_stderr = storage_env_proc.stderr or ""
+                    assert storage_override_prefix in se_stderr and "key_prefix" in se_stderr.lower(), (
+                        f"Extra storage.env key_prefix refusal should report {storage_override_prefix!r}, got:\n{se_stderr[-800:]}"
+                    )
+                    assert not restored_env_file.exists(), (
+                        "restore.sh must refuse mismatched storage.env BEFORE writing .env!"
+                    )
+                finally:
+                    storage_override_env.unlink(missing_ok=True)
+                    restored_env_file.write_text(saved_env_text, encoding="utf-8")
+                    os.chmod(restored_env_file, 0o600)
+                log("5d3 OK (extra compose file storage.env key_prefix mismatch refused before writing .env/data).")
+
                 # 5e. Whole-instance PostgreSQL empty guard: when target DB_NAME is empty,
                 #     another non-empty database in the same PostgreSQL instance MUST still
                 #     cause restore.sh to refuse and leave that database untouched.
