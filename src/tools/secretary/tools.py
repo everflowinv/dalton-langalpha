@@ -1527,6 +1527,42 @@ def _has_archive_signature(buf: bytes) -> bool:
     return any(buf.startswith(sig) for sig in _COS_ARCHIVE_SIGNATURES)
 
 
+def _count_zip_central_entries(buf: bytes, limit: int) -> int | None:
+    """Count central directory entries the way ``ZipFile`` walks them, stopping
+    once ``limit`` is passed, so an end record that understates the count is
+    caught before ``ZipFile`` builds every entry. ``None`` for a malformed
+    directory. Locating the directory reuses ``zipfile._EndRecData``, the same
+    reader ``ZipFile`` uses (ZIP64 and prefixed archives included)."""
+    import struct
+    import zipfile
+
+    try:
+        endrec = zipfile._EndRecData(io.BytesIO(buf))
+    except (zipfile.BadZipFile, OSError, struct.error):
+        return None
+    if not endrec:
+        return None
+    size_cd = endrec[zipfile._ECD_SIZE]
+    offset_cd = endrec[zipfile._ECD_OFFSET]
+    concat = endrec[zipfile._ECD_LOCATION] - size_cd - offset_cd
+    if endrec[zipfile._ECD_SIGNATURE] == zipfile.stringEndArchive64:
+        concat -= zipfile.sizeEndCentDir64 + zipfile.sizeEndCentDir64Locator
+    pos = offset_cd + concat
+    end = pos + size_cd
+    if pos < 0 or end > len(buf):
+        return None
+    count = 0
+    while pos < end:
+        if pos + zipfile.sizeCentralDir > end or buf[pos : pos + 4] != zipfile.stringCentralDir:
+            return None
+        name_len, extra_len, comment_len = struct.unpack_from("<HHH", buf, pos + 28)
+        pos += zipfile.sizeCentralDir + name_len + extra_len + comment_len
+        count += 1
+        if count > limit:
+            return count
+    return count
+
+
 def _read_zip_eocd_member_count(buf: bytes) -> int | None:
     """Read the total entry count from the ZIP End of Central Directory (and
     ZIP64 EOCD when present/required) without opening ``zipfile.ZipFile``.
@@ -1624,7 +1660,8 @@ def _is_ooxml_zip_bytes(buf: bytes) -> bool:
     member_count = _read_zip_eocd_member_count(buf)
     if member_count is None or member_count > _COS_ZIP_MAX_MEMBERS:
         return False
-    if buf.count(b"PK\x01\x02") > _COS_ZIP_MAX_MEMBERS:
+    central = _count_zip_central_entries(buf, _COS_ZIP_MAX_MEMBERS)
+    if central is None or central > _COS_ZIP_MAX_MEMBERS:
         return False
     try:
         with zipfile.ZipFile(io.BytesIO(buf)) as zf:
@@ -1666,7 +1703,12 @@ def _validate_copy_file_format(file_path: str, content: bytes) -> str | None:
         member_count = _read_zip_eocd_member_count(content)
         if member_count is None:
             return _COS_FORMAT_MISMATCH_ERROR
-        if member_count > _COS_ZIP_MAX_MEMBERS or content.count(b"PK\x01\x02") > _COS_ZIP_MAX_MEMBERS:
+        if member_count > _COS_ZIP_MAX_MEMBERS:
+            return "压缩容器成员数量超出安全上限，不能拷贝"
+        central = _count_zip_central_entries(content, _COS_ZIP_MAX_MEMBERS)
+        if central is None:
+            return _COS_FORMAT_MISMATCH_ERROR
+        if central > _COS_ZIP_MAX_MEMBERS:
             return "压缩容器成员数量超出安全上限，不能拷贝"
         ok = _is_ooxml_zip_bytes(content)
     else:
@@ -1803,6 +1845,36 @@ def _decode_pdf_text_filters(stream: Any, chain: list[Any]) -> bytes:
     return data
 
 
+_OLE_PPT_STREAM_UTF16LE_RE = re.compile(
+    b"".join(
+        b"[" + ch.lower().encode("ascii") + ch.upper().encode("ascii") + b"]\x00"
+        if ch.isalpha()
+        else re.escape(ch.encode("ascii")) + b"\x00"
+        for ch in "PowerPoint Document"
+    )
+    + b"\x00\x00"
+)
+
+
+def _ole_has_powerpoint_stream(content: bytes) -> bool:
+    """Whether an OLE2 file holds a ``PowerPoint Document`` stream (a .ppt under
+    another name). Reads the directory like ``_ole_has_vba_macros``, so body
+    text naming it never counts; falls back to the terminated directory name."""
+    if not content.startswith(_OLE_HEADER):
+        return False
+    try:
+        from xlrd.compdoc import CompDoc
+
+        doc = CompDoc(content, logfile=io.StringIO())
+        return any(
+            getattr(node, "etype", 0) == 2
+            and str(getattr(node, "name", "") or "").strip().lower() == "powerpoint document"
+            for node in getattr(doc, "dirlist", ())
+        )
+    except Exception:
+        return bool(_OLE_PPT_STREAM_UTF16LE_RE.search(content))
+
+
 def _ole_has_vba_macros(content: bytes) -> bool:
     """Detect VBA macro storages/streams in a legacy OLE2 document (.xls/.doc).
 
@@ -1913,7 +1985,7 @@ def _scan_copy_bytes_for_secrets(
     if ext_lower in _COS_LEGACY_OFFICE_EXTENSIONS:
         # A presentation renamed to .xls / .doc keeps its "PowerPoint Document"
         # stream, where VBA hides compressed; refuse it like a .ppt.
-        if "PowerPoint Document".encode("utf-16-le") in content:
+        if _ole_has_powerpoint_stream(content):
             return _COS_LEGACY_PPT_REFUSED_ERROR
         if _ole_has_vba_macros(content):
             return _COS_MACRO_OFFICE_REFUSED_ERROR
@@ -1930,9 +2002,13 @@ def _scan_copy_bytes_for_secrets(
             if scan_state["members"] + eocd_members > _COS_ZIP_MAX_MEMBERS:
                 return "压缩容器成员数量超出安全上限，不能拷贝"
             # The end record's count can understate the central directory, which
-            # ZipFile parses in full; every central entry starts with this
-            # signature, so its count bounds what ZipFile would build.
-            if scan_state["members"] + zip_bytes.count(b"PK\x01\x02") > _COS_ZIP_MAX_MEMBERS:
+            # ZipFile parses in full; walk it up to the limit first.
+            central = _count_zip_central_entries(
+                zip_bytes, _COS_ZIP_MAX_MEMBERS - scan_state["members"]
+            )
+            if central is None:
+                return "压缩容器无法解压核验，不能拷贝"
+            if scan_state["members"] + central > _COS_ZIP_MAX_MEMBERS:
                 return "压缩容器成员数量超出安全上限，不能拷贝"
             try:
                 with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:

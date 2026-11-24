@@ -2233,6 +2233,25 @@ class TestBinaryCopySecretChecks:
                 == sec_tools_mod._COS_LEGACY_PPT_REFUSED_ERROR
             )
 
+    def test_body_text_naming_powerpoint_document_is_not_a_presentation(self) -> None:
+        mention = (
+            sec_tools_mod._OLE_HEADER
+            + b"\x00" * 64
+            + "Please open the PowerPoint Document attached.".encode("utf-16-le")
+        )
+        for name in ("memo.doc", "sheet.xls"):
+            assert sec_tools_mod._scan_copy_bytes_for_secrets(name, mention, {}) is None
+
+    def test_stored_member_bytes_resembling_central_entries_do_not_count_as_members(
+        self,
+    ) -> None:
+        noisy = _make_ooxml_zip(
+            {"xl/media/image1.png": b"PK\x01\x02" * 2100},
+            compression=zipfile.ZIP_STORED,
+        )
+        assert sec_tools_mod._count_zip_central_entries(noisy, 2000) == 2
+        assert sec_tools_mod._scan_copy_bytes_for_secrets("book.xlsx", noisy, {}) is None
+
     def test_legacy_ole_utf16le_fallback_catches_macro_in_truncated_container(self) -> None:
         truncated_macro = (
             sec_tools_mod._OLE_HEADER
