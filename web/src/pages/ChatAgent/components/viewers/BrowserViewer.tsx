@@ -1,18 +1,41 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useEffectEvent, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { isImeComposing } from '@/lib/ime';
 import { cn } from '@/lib/utils';
 import type { Modifiers, MouseButton } from '../filePanel/browserProtocol';
-import { Globe, Hand } from 'lucide-react';
+// DALTON-HOOK(mobile-web): Keyboard icon for on-demand touch software keyboard toggle
+import { Globe, Hand, Keyboard } from 'lucide-react';
 import { isBlankPage, type BrowserPhase } from '../filePanel/browserPhase';
 import { PHASE_CARDS } from './browserPhaseCards';
 import type { BrowserViewSession } from '../filePanel/browserStream';
 import { useBrowserViewState } from '../filePanel/useBrowserView';
-import { keyInput, modifiersOf, mouseButton, pagePoint } from './browserInput';
+// DALTON-HOOK(mobile-web): canvasScrollPoint maps letterbox swipes onto remote page scroll coordinates
+import { canvasScrollPoint, keyInput, modifiersOf, mouseButton, pagePoint } from './browserInput';
 import { StatusCard } from './StatusCard';
 import './BrowserViewer.css';
 
 const NUDGE_MS = 4000;
+// DALTON-HOOK(mobile-web): touch gesture constants and coarse-pointer detection
+const TOUCH_SCROLL_THRESHOLD_PX = 8;
+const TOUCH_MOUSE_GUARD_MS = 600;
+const NO_MODIFIERS: Modifiers = { alt: false, ctrl: false, meta: false, shift: false };
+const isCoarsePointer = () => typeof window !== 'undefined' && window.matchMedia('(pointer: coarse)').matches;
+
+interface SingleTouchState {
+  id: number;
+  startX: number;
+  startY: number;
+  lastX: number;
+  lastY: number;
+  scrolling: boolean;
+}
+
+function findTouch(list: TouchList, id: number): Touch | null {
+  for (let i = 0; i < list.length; i += 1) {
+    if (list[i].identifier === id) return list[i];
+  }
+  return null;
+}
 
 /** A pointer sweep or a flick of the wheel is a stream of events; the page needs at
  *  most one a frame. Returns the scheduler and a flush that runs what is pending now. */
@@ -64,6 +87,13 @@ export function BrowserViewer({ view }: { view: BrowserViewSession }): React.Rea
     if (!frame || !target) return null;
     return pagePoint(clientX, clientY, target.getBoundingClientRect(), frame);
   };
+  // DALTON-HOOK(mobile-web): allow single-finger scroll from anywhere on the canvas, including letterbox space
+  const scrollPoint = (clientX: number, clientY: number) => {
+    const { frame } = view.getSnapshot();
+    const target = canvas.current;
+    if (!frame || !target) return null;
+    return canvasScrollPoint(clientX, clientY, target.getBoundingClientRect(), frame);
+  };
 
   const held = useRef<MouseButton | undefined>(undefined);
   // Where the pointer last was on the page, for a release that lands off the
@@ -107,10 +137,147 @@ export function BrowserViewer({ view }: { view: BrowserViewSession }): React.Rea
   });
 
   const keys = useRef<HTMLTextAreaElement>(null);
-  // Keys go to the page from the moment it is theirs, with no click first.
+  // DALTON-HOOK(mobile-web): subscribe to primary coarse-pointer media query so touch listeners only register on touch-primary devices
+  const [coarse, setCoarse] = useState(isCoarsePointer);
   useEffect(() => {
-    if (holding) keys.current?.focus({ preventScroll: true });
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mql = window.matchMedia('(pointer: coarse)');
+    setCoarse(mql.matches);
+    const onChange = (event: MediaQueryListEvent) => setCoarse(event.matches);
+    mql.addEventListener?.('change', onChange);
+    return () => mql.removeEventListener?.('change', onChange);
+  }, []);
+  // DALTON-HOOK(mobile-web): track software keyboard focus for on-demand toggle button on touch devices
+  const [keyboardOpen, setKeyboardOpen] = useState(false);
+  const keyboardActive = holding && keyboardOpen;
+  // Keys go to the page from the moment it is theirs, with no click first.
+  // DALTON-HOOK(mobile-web): skip auto-focus on coarse-pointer devices so taking control does not force open the soft keyboard
+  useEffect(() => {
+    if (holding && !coarse) keys.current?.focus({ preventScroll: true });
+  }, [holding, coarse]);
+
+  // DALTON-HOOK(mobile-web): map single-finger touch tap to remote click (without forcing soft keyboard) and single-finger drag to remote mouseWheel scroll, only under pointer: coarse
+  const touchState = useRef<SingleTouchState | null>(null);
+  const lastTouchAt = useRef<number>(-Infinity);
+  useEffect(() => {
+    if (!holding) touchState.current = null;
   }, [holding]);
+  const isSyntheticTouchMouse = (nativeEvent: MouseEvent): boolean => {
+    // Only discard touch-synthesized mouse events when our own coarse-pointer touch listeners are active;
+    // on fine-pointer touchscreen laptops, let the browser's compatibility mouse events reach the remote page.
+    if (!coarse) return false;
+    const caps = (nativeEvent as MouseEvent & { sourceCapabilities?: { firesTouchEvents?: boolean } }).sourceCapabilities;
+    if (caps?.firesTouchEvents) return true;
+    return touchState.current !== null || (Date.now() - lastTouchAt.current) < TOUCH_MOUSE_GUARD_MS;
+  };
+  const touchScrollScale = () => {
+    const { frame } = view.getSnapshot();
+    const target = canvas.current;
+    if (!frame || !target) return 1;
+    const box = target.getBoundingClientRect();
+    const scale = Math.min(box.width / frame.width, box.height / frame.height);
+    const shownWidth = frame.width * scale;
+    if (shownWidth <= 0) return 1;
+    return Math.min(4, Math.max(1, frame.pageWidth / shownWidth));
+  };
+  const onTouchStart = useEffectEvent((e: TouchEvent) => {
+    lastTouchAt.current = Date.now();
+    if (e.touches.length !== 1) {
+      touchState.current = null;
+      return;
+    }
+    if (!holding) {
+      if (control === 'none' && phase === 'live') {
+        e.preventDefault();
+        setNudgedAt(e.timeStamp);
+      }
+      return;
+    }
+    // Non-passive preventDefault suppresses compatibility mousedown/mouseup events synthesized after touchend.
+    e.preventDefault();
+    const t = e.touches[0];
+    touchState.current = {
+      id: t.identifier,
+      startX: t.clientX,
+      startY: t.clientY,
+      lastX: t.clientX,
+      lastY: t.clientY,
+      scrolling: false,
+    };
+  });
+  const onTouchMove = useEffectEvent((e: TouchEvent) => {
+    lastTouchAt.current = Date.now();
+    const state = touchState.current;
+    if (!holding || !state) return;
+    if (e.touches.length !== 1) {
+      touchState.current = null;
+      return;
+    }
+    const current = findTouch(e.touches, state.id);
+    if (!current) return;
+    e.preventDefault();
+    const dx = current.clientX - state.lastX;
+    const dy = current.clientY - state.lastY;
+    if (!state.scrolling && Math.hypot(current.clientX - state.startX, current.clientY - state.startY) >= TOUCH_SCROLL_THRESHOLD_PX) {
+      state.scrolling = true;
+    }
+    if (state.scrolling) {
+      const at = scrollPoint(current.clientX, current.clientY) ?? scrollPoint(state.startX, state.startY);
+      if (at) {
+        const scale = touchScrollScale();
+        wheel.current = {
+          ...at,
+          deltaX: (wheel.current?.deltaX ?? 0) - dx * scale,
+          deltaY: (wheel.current?.deltaY ?? 0) - dy * scale,
+          modifiers: NO_MODIFIERS,
+        };
+        scheduleWheel();
+      }
+      state.lastX = current.clientX;
+      state.lastY = current.clientY;
+    }
+  });
+  const onTouchEnd = useEffectEvent((e: TouchEvent) => {
+    lastTouchAt.current = Date.now();
+    const state = touchState.current;
+    if (!state) return;
+    const ended = findTouch(e.changedTouches, state.id);
+    if (!ended) return;
+    touchState.current = null;
+    if (!holding) return;
+    e.preventDefault();
+    // Re-check total displacement at lift-off so short flicks whose last touchmove stayed under threshold never click.
+    const totalMove = Math.hypot(ended.clientX - state.startX, ended.clientY - state.startY);
+    if (state.scrolling || totalMove >= TOUCH_SCROLL_THRESHOLD_PX) return;
+    const at = point(ended.clientX, ended.clientY);
+    if (!at) return;
+    flushMove();
+    view.input({ kind: 'mouse', event: 'down', button: 'left', clickCount: 1, modifiers: NO_MODIFIERS, ...at });
+    view.input({ kind: 'mouse', event: 'up', button: 'left', clickCount: 1, modifiers: NO_MODIFIERS, ...at });
+  });
+  const onTouchCancel = useEffectEvent(() => {
+    lastTouchAt.current = Date.now();
+    touchState.current = null;
+  });
+  useEffect(() => {
+    if (!coarse) return;
+    const target = canvas.current;
+    if (!target) return;
+    const handleStart = (e: TouchEvent) => onTouchStart(e);
+    const handleMove = (e: TouchEvent) => onTouchMove(e);
+    const handleEnd = (e: TouchEvent) => onTouchEnd(e);
+    const handleCancel = () => onTouchCancel();
+    target.addEventListener('touchstart', handleStart, { passive: false });
+    target.addEventListener('touchmove', handleMove, { passive: false });
+    target.addEventListener('touchend', handleEnd, { passive: false });
+    target.addEventListener('touchcancel', handleCancel);
+    return () => {
+      target.removeEventListener('touchstart', handleStart);
+      target.removeEventListener('touchmove', handleMove);
+      target.removeEventListener('touchend', handleEnd);
+      target.removeEventListener('touchcancel', handleCancel);
+    };
+  }, [coarse]);
 
   // Each button's release, listened for on the window while the hold it was
   // pressed under lasts. Once the hold ends the session has let the buttons go
@@ -129,11 +296,14 @@ export function BrowserViewer({ view }: { view: BrowserViewSession }): React.Rea
   const onMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
     // The default would move focus off the field the keys arrive in.
     e.preventDefault();
+    // DALTON-HOOK(mobile-web): ignore browser-synthesized mouse events emitted after a touch sequence
+    if (isSyntheticTouchMouse(e.nativeEvent)) return;
     if (!holding) {
       if (control === 'none' && phase === 'live') setNudgedAt(e.timeStamp);
       return;
     }
-    keys.current?.focus({ preventScroll: true });
+    // DALTON-HOOK(mobile-web): on touch devices, open the software keyboard only via the explicit keyboard button
+    if (!coarse) keys.current?.focus({ preventScroll: true });
     const at = point(e.clientX, e.clientY);
     if (!at) return;
     const button = mouseButton(e.button);
@@ -162,7 +332,8 @@ export function BrowserViewer({ view }: { view: BrowserViewSession }): React.Rea
   };
 
   const onMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!holding) return;
+    // DALTON-HOOK(mobile-web): ignore touch-synthesized mousemove events
+    if (!holding || isSyntheticTouchMouse(e.nativeEvent)) return;
     const at = point(e.clientX, e.clientY);
     if (!at) return;
     last.current = at;
@@ -227,6 +398,22 @@ export function BrowserViewer({ view }: { view: BrowserViewSession }): React.Rea
             {t('filePanel:browser.heldNote', 'You have the browser. The agent waits until you hand it back.')}
           </span>
           <span className="browser-viewer-strip-keys">{t('filePanel:browser.heldKeys', 'Shift+Esc to hand back')}</span>
+          {/* DALTON-HOOK(mobile-web): explicit on-demand software keyboard toggle on touch devices */}
+          <button
+            type="button"
+            className="browser-viewer-kbd-btn tap-target"
+            aria-pressed={keyboardActive}
+            aria-label={keyboardActive ? t('filePanel:browser.hideKeyboard') : t('filePanel:browser.showKeyboard')}
+            title={keyboardActive ? t('filePanel:browser.hideKeyboard') : t('filePanel:browser.showKeyboard')}
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => {
+              if (keyboardActive) keys.current?.blur();
+              else keys.current?.focus({ preventScroll: true });
+            }}
+          >
+            <Keyboard className="h-3.5 w-3.5" aria-hidden="true" />
+            <span>{t('filePanel:browser.keyboard')}</span>
+          </button>
         </div>
       )}
       <div ref={stage} className="browser-viewer-stage" tabIndex={-1}>
@@ -252,8 +439,10 @@ export function BrowserViewer({ view }: { view: BrowserViewSession }): React.Rea
           spellCheck={false}
           onKeyDown={onKey('down')}
           onKeyUp={onKey('up')}
+          // DALTON-HOOK(mobile-web): mirror hidden field focus state on the touch keyboard toggle button
+          onFocus={() => setKeyboardOpen(true)}
           // A key let go after focus left goes to wherever it went.
-          onBlur={() => view.releaseKeys()}
+          onBlur={() => { setKeyboardOpen(false); view.releaseKeys(); }}
           onPaste={onPaste}
           onInput={onInput}
           onCompositionEnd={onCompositionEnd}

@@ -2,7 +2,8 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { Link } from 'react-router';
 import { BRAND_NAME } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { ArrowLeft, FolderOpen, PanelRight } from 'lucide-react';
-import { motion, type PanInfo } from '@/lib/framer';
+// DALTON-HOOK(mobile-web): PanInfo no longer needed after disabling content-area drag-to-close on mobile FilePanel
+import { motion } from '@/lib/framer';
 import { TWEEN } from '@/lib/motion';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Loader } from '@/components/ui/loader';
@@ -770,13 +771,7 @@ export default function SharedChatView({ shareToken, access = shareToken, metada
           initial={{ x: '100%' }}
           animate={{ x: 0 }}
           transition={TWEEN.enter}
-          // A chart pans with the same rightward swipe, so a chart tab closes by its button.
-          drag={panelTabKind === 'chart' ? false : 'x'}
-          dragConstraints={{ left: 0, right: 0 }}
-          dragElastic={{ left: 0, right: 0.5 }}
-          onDragEnd={(_: unknown, info: PanInfo) => {
-            if (info.velocity.x > 300 || info.offset.x > 120) setShowFilePanel(false);
-          }}
+          // DALTON-HOOK(mobile-web): disable content-area horizontal drag-to-close so wide tables, PDFs and HTML reports pan freely; close via top back button
           className="flex overflow-hidden mobile-panel-overlay"
           style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 30, backgroundColor: 'var(--color-bg-page)' }}
         >

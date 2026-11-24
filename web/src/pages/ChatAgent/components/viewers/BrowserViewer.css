@@ -34,6 +34,45 @@
   white-space: nowrap;
 }
 
+/* DALTON-HOOK(mobile-web): touch-only keyboard toggle button and touch-action lock on the held canvas */
+.browser-viewer-kbd-btn {
+  display: none;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 2px 8px;
+  border-radius: var(--cs-radius-control, 4px);
+  border: 1px solid var(--color-border-muted);
+  background-color: var(--color-bg-card);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color var(--motion-quick) var(--ease-out), border-color var(--motion-quick) var(--ease-out), background-color var(--motion-quick) var(--ease-out);
+}
+
+.browser-viewer-kbd-btn[aria-pressed='true'] {
+  color: var(--color-text-primary);
+  border-color: var(--color-border-strong);
+  background-color: var(--color-bg-elevated);
+}
+
+@media (pointer: coarse) {
+  .browser-viewer-strip-keys {
+    display: none;
+  }
+
+  .browser-viewer-kbd-btn {
+    display: inline-flex;
+  }
+
+  .browser-viewer-canvas:not(.is-watching) {
+    touch-action: none;
+  }
+}
+
 /* The stage takes focus when the page is handed back from the keyboard, and
    rings for the hidden field the keys go to while the person holds the page,
    which has no box of its own to ring. Inset, as the stage fills the panel. */

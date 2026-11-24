@@ -65,7 +65,8 @@ export function BrowserCrumbs({
         <button
           key={action}
           type="button"
-          className="file-panel-icon-btn shrink-0"
+          // DALTON-HOOK(mobile-web): expand touch hit area for back/forward/reload buttons on coarse pointers
+          className="file-panel-icon-btn tap-target shrink-0"
           title={t(labelKey, label)}
           aria-label={t(labelKey, label)}
           disabled={!steering || stepping}

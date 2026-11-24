@@ -591,3 +591,9 @@ web/src/locales/monitors/
 # Shared chats replay inline widgets (DALTON-HOOK(shared-widgets)).
 web/src/pages/SharedChat/__tests__/SharedChatView.widgets.test.tsx
 web/src/pages/ChatAgent/components/viewers/__tests__/InlineWidget.exports.test.tsx
+# Mobile web P0 fixes unit and Playwright E2E tests (DALTON-HOOK(mobile-web)).
+web/src/lib/__tests__/visualViewport.mobile.test.ts
+web/src/pages/ChatAgent/components/__tests__/CreateWorkspaceModal.mobile.test.tsx
+web/src/pages/ChatAgent/components/filePanel/__tests__/DirectoryNode.mobile.test.tsx
+web/src/pages/ChatAgent/components/viewers/__tests__/BrowserViewer.mobile.test.tsx
+web/e2e/mobile-p0.spec.js

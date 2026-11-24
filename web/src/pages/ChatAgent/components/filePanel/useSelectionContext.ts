@@ -29,11 +29,16 @@ export function useSelectionContext({ selectedFile, fileContent, onAddContext }:
   const [contextMenu, setContextMenu] = useState<ContextMenuData | null>(null);
 
   // Close context menu on outside click
+  // DALTON-HOOK(mobile-web): also listen to pointerdown so outside taps dismiss the menu on iOS Safari
   useEffect(() => {
     if (!contextMenu) return;
     const handler = () => setContextMenu(null);
     document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
+    document.addEventListener('pointerdown', handler);
+    return () => {
+      document.removeEventListener('mousedown', handler);
+      document.removeEventListener('pointerdown', handler);
+    };
   }, [contextMenu]);
 
   // Clear the quote when navigating away from a file

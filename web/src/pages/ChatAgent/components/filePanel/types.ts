@@ -24,6 +24,11 @@ export interface ContextMenuData {
   x: number;
   y: number;
   filePath: string;
+  // DALTON-HOOK(mobile-web): distinguish directory rows, carry folder metadata, and record the opening trigger element for focus restoration
+  kind?: 'file' | 'dir';
+  dirFiles?: string[];
+  isCollapsed?: boolean;
+  triggerEl?: HTMLElement | null;
 }
 
 

@@ -112,7 +112,8 @@ import { DockTurnStatus } from './chatView/DockTurnStatus';
 import { QueuedCommentDeck } from './artifactComments/QueuedCommentDeck';
 import { useTrayFold } from './chatView/useTrayFold';
 import { ErrorBanner } from '@/components/ui/error-banner';
-import { motion, AnimatePresence, type PanInfo } from '@/lib/framer';
+// DALTON-HOOK(mobile-web): PanInfo no longer needed after disabling content-area drag-to-close on mobile FilePanel
+import { motion, AnimatePresence } from '@/lib/framer';
 import { DURATION, EASE_COLLAPSE, SPRING_FOLD, TWEEN } from '@/lib/motion';
 import { MobileBottomSheet } from '@/components/ui/mobile-bottom-sheet';
 import { preloadableLazy } from '@/lib/lazyWithMotion';
@@ -1203,7 +1204,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     handleToggleFilePanel,
     handleFilesLeaveGuardChange,
     handleActiveTabKindChange,
-    activeTabKind,
+    // DALTON-HOOK(mobile-web): activeTabKind no longer needed for mobile FilePanel drag toggle
     leaveFiles,
     handleOpenPreview,
     handleBrowserUse,
@@ -2349,18 +2350,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             animate={{ x: 0 }}
             transition={TWEEN.enter}
             onAnimationComplete={onSheetLanded}
-            // A chart pans with the same rightward swipe, so a chart tab closes by its button.
-            drag={activeTabKind === 'chart' ? false : 'x'}
-            dragConstraints={{ left: 0, right: 0 }}
-            dragElastic={{ left: 0, right: 0.5 }}
-            onDragEnd={(_: unknown, info: PanInfo) => {
-              if (info.velocity.x > 300 || info.offset.x > 120) {
-                leaveFiles(() => {
-                  setRightPanelType(null);
-                  popPanelHistory();
-                });
-              }
-            }}
+            // DALTON-HOOK(mobile-web): disable content-area horizontal drag-to-close so wide tables, PDFs, HTML reports and browser views pan freely; close via top back button or browser back
             className="flex overflow-hidden mobile-panel-overlay"
             style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 30, backgroundColor: 'var(--color-bg-page)' }}
           >

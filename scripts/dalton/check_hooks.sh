@@ -490,6 +490,10 @@ ALLOWED_HOOKS=(
   # and task_run_id on subagent conversation_usages rows so Dalton budget reconciliation
   # drops the conservative floor only when every child's usage is confirmed persisted.
   "budget"
+  # Mobile web P0 fixes: standalone auth scroll, sheet/modal visual-viewport keyboard avoidance,
+  # FilePanel touch gesture/z-index/row-menu fixes, InlineWidget mobile bar/fullscreen, and
+  # BrowserViewer touch scroll + on-demand keyboard button.
+  "mobile-web"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
