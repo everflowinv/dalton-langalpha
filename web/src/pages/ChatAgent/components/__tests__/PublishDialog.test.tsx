@@ -12,11 +12,16 @@ import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { QueryClient } from '@tanstack/react-query';
 
 import { renderWithProviders } from '@/test/utils';
 import { runAuthResets } from '@/lib/authResets';
 import { queryKeys } from '@/lib/queryKeys';
 import { notePageLoads, notePageOpen } from '@/lib/pageLoads';
+import { LOCAL_USER_ID } from '@/config/localUser';
+import type { ApiResponse } from '@/api/client';
+import type { CapabilitiesApiResponse } from '@/hooks/useCapabilities';
+import type { TeamCredentialsStatus } from '@/hooks/useTeamCredentials';
 import type { Artifact, ArtifactStatus, ArtifactVersion, ShareFileEntry, Workspace } from '@/types/api';
 import type { MonitorDetail, MonitorSummary } from '@/pages/Monitors/api';
 
@@ -73,10 +78,10 @@ vi.mock('@/pages/Monitors/api', async (importOriginal) => {
   };
 });
 
-// DALTON-HOOK(colleague-access): optional test overrides for workspace detail, team credentials, and capabilities
+// DALTON-HOOK(colleague-access): test doubles for workspace detail and `/credentials/status` (hooks run real)
 const pauseMocks = vi.hoisted(() => ({
-  credentials: null as null | { colleagueSharingEnabled: boolean; colleagueSharingKnown: boolean },
-  colleagueSharingCapable: null as null | boolean,
+  isDaltonAuth: false,
+  credentialsStatus: null as null | (() => Promise<ApiResponse<TeamCredentialsStatus>>),
 }));
 
 vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
@@ -87,33 +92,28 @@ vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
   };
 });
 
-vi.mock('@/hooks/useTeamCredentials', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/hooks/useTeamCredentials')>();
+vi.mock('@/config/daltonAuth', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/config/daltonAuth')>();
   return {
     ...actual,
-    useTeamCredentials: () => {
-      const live = actual.useTeamCredentials();
-      return pauseMocks.credentials ? { ...live, ...pauseMocks.credentials } : live;
+    get isDaltonAuth() {
+      return pauseMocks.isDaltonAuth;
     },
   };
 });
 
-vi.mock('@/hooks/useCapabilities', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@/hooks/useCapabilities')>();
+vi.mock('@/api/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/client')>();
   return {
     ...actual,
-    useCapabilities: (options?: Parameters<typeof actual.useCapabilities>[0]) => {
-      const live = actual.useCapabilities(options);
-      if (pauseMocks.colleagueSharingCapable === null) return live;
-      const nextCaps = new Set(live.capabilities);
-      if (pauseMocks.colleagueSharingCapable) nextCaps.add('colleague_sharing');
-      else nextCaps.delete('colleague_sharing');
-      return {
-        ...live,
-        capabilities: nextCaps,
-        hasCapability: (required: Parameters<typeof live.hasCapability>[0]) =>
-          actual.hasRequiredCapability(nextCaps, required),
-      };
+    api: {
+      ...actual.api,
+      get: ((url: string, config?: Parameters<typeof actual.api.get>[1]) => {
+        if (url === '/api/v1/dalton/credentials/status' && pauseMocks.credentialsStatus) {
+          return pauseMocks.credentialsStatus();
+        }
+        return actual.api.get(url, config);
+      }) as unknown as typeof actual.api.get,
     },
   };
 });
@@ -263,8 +263,11 @@ function apiError(status: number, detail: unknown) {
   });
 }
 
-function renderDialog(path = ENTRY) {
-  return renderWithProviders(<PublishDialog open workspaceId={WS} path={path} onClose={() => {}} />);
+function renderDialog(path = ENTRY, queryClient?: QueryClient) {
+  return renderWithProviders(
+    <PublishDialog open workspaceId={WS} path={path} onClose={() => {}} />,
+    queryClient ? { queryClient } : undefined,
+  );
 }
 
 /** The review list, named by its heading. */
@@ -284,12 +287,48 @@ function workspace(overrides: Partial<Workspace> = {}): Workspace {
   };
 }
 
+function createPauseQueryClient(colleagueSharingCapable: boolean): QueryClient {
+  const queryClient = new QueryClient({
+    defaultOptions: {
+      queries: { retry: false, retryDelay: 0, gcTime: 0 },
+      mutations: { retry: false },
+    },
+  });
+  queryClient.setQueryData<CapabilitiesApiResponse>(queryKeys.dalton.capabilities(), {
+    profile: colleagueSharingCapable ? 'everflow' : 'core',
+    capabilities: colleagueSharingCapable ? ['colleague_sharing'] : [],
+  });
+  return queryClient;
+}
+
+function credentialsResponse(
+  overrides: Partial<TeamCredentialsStatus> = {},
+): ApiResponse<TeamCredentialsStatus> {
+  return {
+    data: {
+      sharing: 'team',
+      enabled: true,
+      holder_user_id: null,
+      credential_user_id: LOCAL_USER_ID,
+      is_pm: false,
+      can_disconnect: false,
+      can_invite: false,
+      caller_tier: 'internal',
+      colleague_sharing_enabled: true,
+      ...overrides,
+    },
+    status: 200,
+    statusText: 'OK',
+    headers: {},
+  };
+}
+
 describe('PublishDialog', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     runAuthResets();
-    pauseMocks.credentials = null;
-    pauseMocks.colleagueSharingCapable = null;
+    pauseMocks.isDaltonAuth = false;
+    pauseMocks.credentialsStatus = null;
     mockVersions.mockResolvedValue([]);
     mockGetMonitor.mockResolvedValue(null);
   });
@@ -858,63 +897,70 @@ describe('PublishDialog', () => {
     });
   });
 
-  // DALTON-HOOK(colleague-access): auto-publish pause race protection and unknown/capability gating
+  // DALTON-HOOK(colleague-access): auto-publish pause response adoption, detail refresh, credentials error, and capability gating
   describe('auto-publish pause state', () => {
-    it('ignores a late publish response pause override when workspace detail refreshed in flight, and still refreshes detail', async () => {
-      pauseMocks.credentials = { colleagueSharingEnabled: true, colleagueSharingKnown: true };
-      pauseMocks.colleagueSharingCapable = true;
+    it('adopts publish response notice and token when an in-flight detail GET finishes before the publish response', async () => {
+      pauseMocks.isDaltonAuth = true;
+      pauseMocks.credentialsStatus = async () => credentialsResponse();
       serve(artifact());
       mockStatus.mockResolvedValue(status([ENTRY_ROW]));
-      mockGetWorkspace.mockResolvedValue(workspace({
-        auto_publish_paused: true,
-        auto_publish_pause_token: 'tok-1',
+
+      const queryClient = createPauseQueryClient(true);
+      queryClient.setQueryData(
+        queryKeys.workspaces.detail(WS),
+        workspace({ auto_publish_paused: true, auto_publish_pause_token: 'tok-1' }),
+      );
+
+      let resolveInFlightGet!: (value: Workspace) => void;
+      mockGetWorkspace.mockImplementationOnce(() => new Promise<Workspace>((resolve) => {
+        resolveInFlightGet = resolve;
       }));
 
       let resolvePublish!: (value: MonitorDetail) => void;
-      mockPublishMonitor.mockImplementationOnce(() => new Promise<MonitorDetail>((resolve) => {
-        resolvePublish = resolve;
-      }));
+      mockPublishMonitor
+        .mockImplementationOnce(() => new Promise<MonitorDetail>((resolve) => {
+          resolvePublish = resolve;
+        }))
+        .mockImplementationOnce(answers(artifact({ shared: false, latest_seq: 2 })));
 
       const user = userEvent.setup();
-      const { queryClient } = renderDialog();
+      renderDialog(ENTRY, queryClient);
 
       expect(
         await screen.findByText(/Auto-update is paused because this workspace read a colleague's content/),
       ).toBeInTheDocument();
+      await waitFor(() => expect(mockGetWorkspace).toHaveBeenCalledTimes(1));
       await waitFor(() => expect(publishButton()).toBeEnabled());
-      await user.click(publishButton());
 
+      // Click Publish while the dialog-open workspace detail GET is still in flight.
+      await user.click(publishButton());
       await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(1));
       expect(mockPublishMonitor.mock.calls[0][0]).toMatchObject({ confirm_pause_token: 'tok-1' });
 
-      // While the publish request is still in flight, workspace detail refreshes (e.g. another tab resumed auto-publish).
-      mockGetWorkspace.mockResolvedValue(workspace({
-        auto_publish_paused: false,
-        auto_publish_pause_token: null,
-      }));
-      await new Promise((resolve) => setTimeout(resolve, 10));
+      // The pre-click GET completes before the publish response arrives.
       await act(async () => {
-        await queryClient.refetchQueries({ queryKey: queryKeys.workspaces.detail(WS) });
+        resolveInFlightGet(workspace({
+          auto_publish_paused: true,
+          auto_publish_pause_token: 'tok-1',
+        }));
       });
       await waitFor(() => {
-        expect(
-          screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
-        ).not.toBeInTheDocument();
+        expect(queryClient.getQueryState(queryKeys.workspaces.detail(WS))?.fetchStatus).toBe('idle');
       });
+      await new Promise((resolve) => setTimeout(resolve, 10));
 
-      // Hold the post-response workspace detail refresh pending to prove the late response itself never flashes paused state.
-      let resolveRefresh!: (value: Workspace) => void;
+      // Hold the post-response detail refresh pending so the next submit proves the new token came from the publish response.
+      let resolvePostRefresh!: (value: Workspace) => void;
       mockGetWorkspace.mockImplementationOnce(() => new Promise<Workspace>((resolve) => {
-        resolveRefresh = resolve;
+        resolvePostRefresh = resolve;
       }));
-      const callsBeforeResolve = mockGetWorkspace.mock.calls.length;
 
-      const next = artifact({ shared: false, latest_seq: 1 });
-      const mon = monitorSummary(next);
-      serve(next, mon);
+      const firstNext = artifact({ shared: false, latest_seq: 1 });
+      const firstMon = monitorSummary(firstNext);
+      serve(firstNext, firstMon);
       await act(async () => {
         resolvePublish({
-          monitor: mon,
+          monitor: firstMon,
           versions: [version(1)],
           monitor_grant: 'm1.test-grant',
           frame_base: '/api/v1/dalton/monitors/g/m1.test-grant/',
@@ -922,25 +968,112 @@ describe('PublishDialog', () => {
           expires_in: 43200,
           cut: true,
           auto_publish_paused: true,
-          auto_publish_pause_token: 'tok-stale',
-          auto_publish_pause_notice: 'Stale pause notice',
+          auto_publish_pause_token: 'tok-2',
+          auto_publish_pause_notice: 'Colleague turn still active',
         });
       });
 
-      await waitFor(() => expect(mockGetWorkspace.mock.calls.length).toBeGreaterThan(callsBeforeResolve));
-      expect(screen.queryByText('Stale pause notice')).not.toBeInTheDocument();
-      expect(
-        screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
-      ).not.toBeInTheDocument();
+      expect(await screen.findByText('Colleague turn still active')).toBeInTheDocument();
+      await waitFor(() => expect(mockGetWorkspace).toHaveBeenCalledTimes(2));
+
+      await waitFor(() => expect(updateButton()).toBeEnabled());
+      mockGetWorkspace.mockResolvedValue(workspace({ auto_publish_paused: false, auto_publish_pause_token: null }));
+      await user.click(updateButton());
+      await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(2));
+      expect(mockPublishMonitor.mock.calls[1][0]).toMatchObject({ confirm_pause_token: 'tok-2' });
 
       await act(async () => {
-        resolveRefresh(workspace({ auto_publish_paused: false, auto_publish_pause_token: null }));
+        resolvePostRefresh(workspace({ auto_publish_paused: true, auto_publish_pause_token: 'tok-2' }));
       });
     });
 
-    it('handles publish response pause state when credentials status is unknown, and skips tracking when colleague_sharing capability is off', async () => {
-      pauseMocks.credentials = { colleagueSharingEnabled: false, colleagueSharingKnown: false };
-      pauseMocks.colleagueSharingCapable = true;
+    it('shows unpaused once workspace detail refreshes after the publish response', async () => {
+      pauseMocks.isDaltonAuth = true;
+      pauseMocks.credentialsStatus = async () => credentialsResponse();
+      serve(artifact());
+      mockStatus.mockResolvedValue(status([ENTRY_ROW]));
+
+      const queryClient = createPauseQueryClient(true);
+      queryClient.setQueryData(
+        queryKeys.workspaces.detail(WS),
+        workspace({ auto_publish_paused: true, auto_publish_pause_token: 'tok-1' }),
+      );
+
+      let resolvePostRefresh!: (value: Workspace) => void;
+      mockGetWorkspace
+        .mockResolvedValueOnce(workspace({
+          auto_publish_paused: true,
+          auto_publish_pause_token: 'tok-1',
+        }))
+        .mockImplementationOnce(() => new Promise<Workspace>((resolve) => {
+          resolvePostRefresh = resolve;
+        }));
+
+      const firstNext = artifact({ shared: false, latest_seq: 1 });
+      const firstMon = monitorSummary(firstNext);
+      mockPublishMonitor
+        .mockImplementationOnce(async () => {
+          serve(firstNext, firstMon);
+          return {
+            monitor: firstMon,
+            versions: [version(1)],
+            monitor_grant: 'm1.test-grant',
+            frame_base: '/api/v1/dalton/monitors/g/m1.test-grant/',
+            data_base: '/api/v1/dalton/monitors/g/m1.test-grant/data',
+            expires_in: 43200,
+            cut: true,
+            auto_publish_paused: true,
+            auto_publish_pause_token: 'tok-2',
+            auto_publish_pause_notice: 'Colleague turn still active',
+          };
+        })
+        .mockImplementationOnce(answers(artifact({ shared: false, latest_seq: 2 })));
+
+      const user = userEvent.setup();
+      renderDialog(ENTRY, queryClient);
+
+      expect(
+        await screen.findByText(/Auto-update is paused because this workspace read a colleague's content/),
+      ).toBeInTheDocument();
+      await waitFor(() => {
+        expect(mockGetWorkspace).toHaveBeenCalledTimes(1);
+        expect(queryClient.getQueryState(queryKeys.workspaces.detail(WS))?.fetchStatus).toBe('idle');
+      });
+      await waitFor(() => expect(publishButton()).toBeEnabled());
+
+      await user.click(publishButton());
+      expect(await screen.findByText('Colleague turn still active')).toBeInTheDocument();
+      await waitFor(() => expect(mockGetWorkspace).toHaveBeenCalledTimes(2));
+
+      // Post-response detail refresh returns unpaused (e.g. resumed in another tab).
+      await new Promise((resolve) => setTimeout(resolve, 15));
+      await act(async () => {
+        resolvePostRefresh(workspace({
+          auto_publish_paused: false,
+          auto_publish_pause_token: null,
+        }));
+      });
+
+      await waitFor(() => {
+        expect(
+          screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
+        ).not.toBeInTheDocument();
+        expect(screen.queryByText('Colleague turn still active')).not.toBeInTheDocument();
+      });
+
+      await waitFor(() => expect(updateButton()).toBeEnabled());
+      mockGetWorkspace.mockResolvedValue(workspace({ auto_publish_paused: false, auto_publish_pause_token: null }));
+      await user.click(updateButton());
+      await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(2));
+      expect(mockPublishMonitor.mock.calls[1][0]).not.toHaveProperty('confirm_pause_token');
+    });
+
+    it('keeps publish response pause notice and token when /credentials/status fails, while hiding the toggle pause hint', async () => {
+      pauseMocks.isDaltonAuth = true;
+      const mockCredentialsStatus = vi.fn<() => Promise<ApiResponse<TeamCredentialsStatus>>>(async () => {
+        throw apiError(500, 'credentials unavailable');
+      });
+      pauseMocks.credentialsStatus = mockCredentialsStatus;
       serve(artifact());
       mockStatus.mockResolvedValue(status([ENTRY_ROW]));
       mockGetWorkspace.mockResolvedValue(workspace({
@@ -968,8 +1101,14 @@ describe('PublishDialog', () => {
         })
         .mockImplementationOnce(answers(artifact({ shared: false, latest_seq: 2 })));
 
+      const queryClient = createPauseQueryClient(true);
       const user = userEvent.setup();
-      const { unmount } = renderDialog();
+      renderDialog(ENTRY, queryClient);
+
+      await waitFor(() => {
+        expect(queryClient.getQueryState(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID))?.status).toBe('error');
+      });
+      expect(mockCredentialsStatus).toHaveBeenCalled();
 
       await waitFor(() => expect(publishButton()).toBeEnabled());
       expect(mockGetWorkspace).not.toHaveBeenCalled();
@@ -981,6 +1120,10 @@ describe('PublishDialog', () => {
       await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(1));
       expect(mockPublishMonitor.mock.calls[0][0]).not.toHaveProperty('confirm_pause_token');
       expect(await screen.findByText('Colleague turn still active')).toBeInTheDocument();
+      expect(
+        screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
+      ).not.toBeInTheDocument();
+      expect(mockGetWorkspace).not.toHaveBeenCalled();
 
       await waitFor(() => expect(updateButton()).toBeEnabled());
       await user.click(updateButton());
@@ -991,13 +1134,15 @@ describe('PublishDialog', () => {
       await waitFor(() => {
         expect(screen.queryByText('Colleague turn still active')).not.toBeInTheDocument();
       });
-      unmount();
+      expect(
+        screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
+      ).not.toBeInTheDocument();
+      expect(mockGetWorkspace).not.toHaveBeenCalled();
+    });
 
-      // When the colleague_sharing capability is off, never track pause regardless of credentials status.
-      mockPublishMonitor.mockClear();
-      mockGetWorkspace.mockClear();
-      pauseMocks.colleagueSharingCapable = false;
-      pauseMocks.credentials = { colleagueSharingEnabled: true, colleagueSharingKnown: true };
+    it('ignores publish response pause fields when the colleague_sharing capability is off', async () => {
+      pauseMocks.isDaltonAuth = true;
+      pauseMocks.credentialsStatus = async () => credentialsResponse({ colleague_sharing_enabled: true });
       serve(artifact());
       mockStatus.mockResolvedValue(status([ENTRY_ROW]));
 
@@ -1021,7 +1166,13 @@ describe('PublishDialog', () => {
         })
         .mockImplementationOnce(answers(artifact({ shared: false, latest_seq: 2 })));
 
-      renderDialog();
+      const queryClient = createPauseQueryClient(false);
+      const user = userEvent.setup();
+      renderDialog(ENTRY, queryClient);
+
+      await waitFor(() => {
+        expect(queryClient.getQueryState(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID))?.status).toBe('success');
+      });
       await waitFor(() => expect(publishButton()).toBeEnabled());
       expect(mockGetWorkspace).not.toHaveBeenCalled();
 

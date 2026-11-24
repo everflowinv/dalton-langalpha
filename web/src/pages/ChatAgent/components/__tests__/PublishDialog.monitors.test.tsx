@@ -594,7 +594,7 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
       auto_publish_paused: false,
       auto_publish_pause_token: null,
     };
-    workspaceState.dataUpdatedAt = 2000;
+    workspaceState.dataUpdatedAt = Date.now() + 1000;
     rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
 
     await waitFor(() => {

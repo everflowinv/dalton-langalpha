@@ -418,33 +418,20 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
       void refetchWorkspace();
     }
   }, [trackWorkspacePause, workspaceId, refetchWorkspace]);
-  const workspaceSnapshotRef = useRef<{
-    data: typeof workspaceQuery.data;
-    updatedAt: number;
-  }>({ data: workspaceQuery.data, updatedAt: workspaceQuery.dataUpdatedAt ?? 0 });
-  workspaceSnapshotRef.current = {
-    data: workspaceQuery.data,
-    updatedAt: workspaceQuery.dataUpdatedAt ?? 0,
-  };
-  const pauseTrackingRef = useRef({
-    trackWorkspacePause,
-    trackPublishResponsePause,
-  });
-  pauseTrackingRef.current = {
-    trackWorkspacePause,
-    trackPublishResponsePause,
-  };
+  const trackPublishResponsePauseRef = useRef(trackPublishResponsePause);
+  useEffect(() => {
+    trackPublishResponsePauseRef.current = trackPublishResponsePause;
+  }, [trackPublishResponsePause]);
   const [pauseOverride, setPauseOverride] = useState<{
     paused: boolean;
     token: string | null;
     notice: string | null;
-    baseData: typeof workspaceQuery.data;
-    baseUpdatedAt: number;
+    responseAt: number;
   } | null>(null);
   const workspaceRefreshedAfterOverride =
+    trackWorkspacePause &&
     pauseOverride !== null &&
-    ((workspaceQuery.dataUpdatedAt ?? 0) > pauseOverride.baseUpdatedAt ||
-      workspaceQuery.data !== pauseOverride.baseData);
+    (workspaceQuery.dataUpdatedAt ?? 0) > pauseOverride.responseAt;
   const pauseOverrideActive = pauseOverride !== null && !workspaceRefreshedAfterOverride;
   const autoPublishPaused = trackWorkspacePause
     ? (pauseOverrideActive
@@ -453,6 +440,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
     : trackPublishResponsePause && pauseOverrideActive
       ? pauseOverride.paused
       : false;
+  const showAutoPublishPausedHint = trackWorkspacePause && autoPublishPaused;
   const autoPublishPauseToken = trackWorkspacePause
     ? (pauseOverrideActive
         ? pauseOverride.token
@@ -465,7 +453,8 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
     autoPublishPaused &&
     pauseOverride?.notice &&
     (pauseOverrideActive ||
-      (trackWorkspacePause && workspaceQuery.data?.auto_publish_pause_token === pauseOverride.token))
+      (trackWorkspacePause &&
+        (workspaceQuery.data?.auto_publish_pause_token ?? null) === pauseOverride.token))
       ? pauseOverride.notice
       : null;
 
@@ -561,13 +550,8 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
     if (!artifact || !canPublish) return;
     const loads = pageLoadsOf(artifact.workspace_id, artifact.path);
     const statusAt = statusQuery.dataUpdatedAt;
-    const workspaceUpdatedAtAtRequest = Math.max(
-      workspaceQuery.dataUpdatedAt ?? 0,
-      trackWorkspacePause
-        ? (qc.getQueryState(queryKeys.workspaces.detail(workspaceId))?.dataUpdatedAt ?? 0)
-        : 0,
-    );
     setOutcome(null);
+    setPauseOverride((prev) => (prev ? { ...prev, notice: null } : null));
     setPublishingMonitor(true);
     try {
       // DALTON-HOOK(colleague-access): include CAS confirm_pause_token and surface server pause notice
@@ -588,47 +572,23 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
           ? { confirm_pause_token: autoPublishPauseToken }
           : {}),
       });
-      const snapshotAtResponse = workspaceSnapshotRef.current;
-      const latestWorkspaceUpdatedAt = Math.max(
-        snapshotAtResponse.updatedAt,
-        trackWorkspacePause
-          ? (qc.getQueryState(queryKeys.workspaces.detail(workspaceId))?.dataUpdatedAt ?? 0)
-          : 0,
-      );
-      const workspaceRefreshedDuringPublish =
-        latestWorkspaceUpdatedAt > workspaceUpdatedAtAtRequest;
       setLabel('');
       qc.setQueryData(queryKeys.daltonMonitors.byArtifact(artifact.artifact_id), result.monitor);
       void qc.invalidateQueries({ queryKey: queryKeys.daltonMonitors.all });
       void qc.invalidateQueries({ queryKey: queryKeys.artifacts.pathsIn(workspaceId) });
-      if (pauseTrackingRef.current.trackPublishResponsePause) {
-        const shouldInvalidateWorkspace =
-          pauseTrackingRef.current.trackWorkspacePause ||
-          Boolean(result.auto_publish_paused) ||
-          Boolean(pauseOverride?.paused);
-        if (shouldInvalidateWorkspace) {
-          void qc.invalidateQueries({ queryKey: queryKeys.workspaces.detail(workspaceId) });
-          void qc.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
-        }
-        if (!workspaceRefreshedDuringPublish) {
-          if (result.auto_publish_paused) {
-            setPauseOverride({
-              paused: true,
-              token: result.auto_publish_pause_token ?? null,
-              notice: result.auto_publish_pause_notice ?? null,
-              baseData: snapshotAtResponse.data,
-              baseUpdatedAt: latestWorkspaceUpdatedAt,
-            });
-          } else {
-            setPauseOverride({
-              paused: false,
-              token: null,
-              notice: null,
-              baseData: snapshotAtResponse.data,
-              baseUpdatedAt: latestWorkspaceUpdatedAt,
-            });
-          }
-        }
+      if (trackPublishResponsePauseRef.current) {
+        const responseAt = Date.now();
+        setPauseOverride({
+          paused: Boolean(result.auto_publish_paused),
+          token: result.auto_publish_paused ? (result.auto_publish_pause_token ?? null) : null,
+          notice: result.auto_publish_paused ? (result.auto_publish_pause_notice ?? null) : null,
+          responseAt,
+        });
+        void qc.invalidateQueries(
+          { queryKey: queryKeys.workspaces.detail(workspaceId) },
+          { cancelRefetch: true },
+        );
+        void qc.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
       }
       if (result.cut === false) {
         setOutcome({ kind: 'unchanged', seq: result.monitor.published_seq });
@@ -971,7 +931,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
                 )}
             </div>
             {/* DALTON-HOOK(colleague-access): show auto-publish pause guidance under keep-updated toggle */}
-            {autoPublishPaused && (
+            {showAutoPublishPausedHint && (
               <p className="text-xs" role="status" style={{ color: 'var(--color-warning)' }}>
                 {t('monitors.dialog.autoPublishPausedHint', {
                   action: monitorPublished ? t('publish.update') : t('publish.publish'),
