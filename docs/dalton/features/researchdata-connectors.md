@@ -1,21 +1,22 @@
 # 研究数据桥按职责拆分为连接器（独立核心版本第 ② 阶段）
 
-> 状态：设计稿（2026-11-24）
+> 状态：第 2 轮修订定稿（2026-11-24）
 > 前置文档：[standalone-core.md](./standalone-core.md)、[alphaengine-cache.md](./alphaengine-cache.md)、[data-jobs.md](./data-jobs.md)
-> 关联代码：`scripts/dalton/researchdata_bridge.py`、`src/dalton/capabilities.py`、`src/dalton/content_assembly.py`、`plugins/dalton_sec/`
+> 关联代码：`scripts/dalton/researchdata_bridge.py`、`src/dalton/capabilities.py`、`src/dalton/content_assembly.py`、`plugins/dalton_sec/`、`plugins/dalton_data/`
 
-## 0. 背景与既定前提
+## 0. 背景与既定架构决定
 
-当前宿主机单进程服务 `scripts/dalton/researchdata_bridge.py`（共 26,636 行，默认监听 `127.0.0.1:8960`）同时承载内部研究检索、向量嵌入、语音转写、飞书通知与文档代理、宿主任务执行及生产运维巡检。在独立核心版本第 ① 阶段（见 `docs/dalton/features/standalone-core.md:54-92`）中，`alphaengine`、`guidepoint`、`company_wiki`、`sales_notes`、`tmtb`、`funda_ai`、`feishu_docs`、`transcription` 八项能力均通过 `depends_on=(CapabilityId.RESEARCHDATA_BRIDGE,)` 绑定在总开关 `researchdata_bridge` 上（`src/dalton/capabilities.py:95-159`），独立核心部署只能整体关闭整座桥，缺少按需单独启用某项数据源或转写服务的能力。
+宿主机单进程服务 `scripts/dalton/researchdata_bridge.py`（共 26,636 行，默认监听 `127.0.0.1:8960`）目前集中承载内部研究检索、金融与宏观扩展路由、向量嵌入、语音转写、飞书通知与文档代理、宿主定时任务执行及生产运维状态巡检。在独立核心版本第 ① 阶段（`docs/dalton/features/standalone-core.md:54-92`）中，`alphaengine`、`guidepoint`、`company_wiki`、`sales_notes`、`tmtb`、`funda_ai`、`feishu_docs`、`transcription` 八项能力均通过 `depends_on=(CapabilityId.RESEARCHDATA_BRIDGE,)` 挂在总开关 `researchdata_bridge` 下（`src/dalton/capabilities.py:95-159`），部署侧只能整体启停整座桥。
 
-本阶段设计遵循以下已确定的架构前提（2026-11-24 拍板）：
+本设计将研究数据桥按职责边界拆分为独立连接器、后端内建模块、独立转写服务与生产运维守护进程，遵循以下全部既定决定：
 
-1. **Everflow 生产固定运行于当前 Mac 宿主**：AlphaEngine 连接器仅面向 macOS 设计，继续读取 macOS 钥匙串（`security` CLI）与 `/Applications/AlphaEngine.app` 桌面端登录态；核心安装在 Linux 宿主上将 `alphaengine` 保持为关闭态。
-2. **研究检索来源逐一拆分为独立 MCP 连接器插件**：采用与 `plugins/dalton_sec/` 一致的 Agent Plugins 1.0.0 规范（见 `plugins/README.md:1-60` 与 `src/ptc_agent/config/plugins.py:278-355`）；商业与基金私有连接器代码放入私有仓库，公开仓库保留能力枚举、接口契约、装配规则与开关。
-3. **向量嵌入与语音转写各自独立**：`/embed` 收归后端内置嵌入模块（支持可选外部嵌入服务 URL 覆盖）；`/transcriptions*` 拆为独立的转写连接器服务。
-4. **通知与飞书代理移交渠道网关**：`/notify` 与 `/feishu/*` 在本文明确接口边界与交接条件，具体合并工作归入第 ③ 阶段 `integrations/dalton-channel-gateway/`。
-5. **生产宿主巡检归入生产运维目录**：`/jobs/ops` 归入 Everflow 专属生产运维脚本目录 `scripts/dalton/ops/prod/`。
-6. **落地前冻结桥外耦合**：在本设计各批次落地前，针对现行桥的维护仅限于 `scripts/dalton/researchdata_bridge.py` 内部实现调整，保持外部契约稳定。
+1. **Everflow 生产固定运行于 macOS 宿主，宿主平台由部署配置显式传入**：AlphaEngine 连接器仅面向 macOS 设计，继续复用 macOS 钥匙串（`security` CLI）与 `/Applications/AlphaEngine.app` 桌面登录态。新增部署配置 `DALTON_HOST_PLATFORM`（`macos` | `linux`），由宿主部署或初始化脚本写入 `.env`，后端 `src/dalton/capabilities.py` 读取该配置判定 `alphaengine` 可用性，与容器内 Python 的 `sys.platform` 完全解耦。
+2. **商业数据与供应商凭据留在宿主机侧，沙箱仅持有连接器调用令牌**：内部研究检索（AlphaEngine、Guidepoint、销售纪要、TMTB、Funda AI、公司 Wiki、跨库初筛、办公与社区扩展等）统一由宿主机服务提供；商业 SQLite 库、原始文档目录与供应商密钥（如 Guidepoint Auth0 刷新令牌、Gemini 密钥、飞书密钥）全部保留在宿主机进程内，令牌刷新由宿主机单一持有方串行写盘。沙箱与后端沿用现有 `streamable-http` 直连通道（`host.docker.internal`，同 `plugins/dalton_data/mcp.json:4-10`、`src/ptc_agent/core/sandbox/providers/docker.py:774-783`、`scripts/dalton/bridge_subprocess_env.py:2383`）携带连接器令牌与每次请求签发的调用方身份头访问。
+3. **连接器插件采用 Agent Plugins 1.0.0 规范，公开数据进公开插件，商业实现放私有仓库**：每个连接器独立为一个插件包（`plugin.json` + `mcp.json` + 技能文件），按各自 `CapabilityId` 独立开关。SEC 法定披露与公开宏观序列（FRED、美国财政部 TGA/债务）放入公开仓库的公开插件供核心安装直接使用；商业连接器插件声明与接口契约保留在公开仓库（或通过唯一私有插件目录 `DALTON_EXTRA_PLUGINS_DIR` 装配），宿主机商业服务端实现存放在私有仓库。
+4. **跨库初筛 `research(route="all")` 保留在宿主机侧**：由宿主机研究服务完成跨库扇出检索、按文档 ID 前缀分派全文读取（`read`）以及 `sales-mail` 横跨销售纪要与 TMTB 的兼容语义。
+5. **向量嵌入支持库级模型与维度锁定，转写独立为连接器服务**：`/embed` 收归后端嵌入模块，数据库记录嵌入模型名与向量维度元数据（Everflow 锁定 3072 维与既有任务类型，核心新装按所选模型维度建表建索引，强制保证单库单一维度与模型）；`/transcriptions*` 拆为独立转写服务，通过排他锁交接历史结果、进行中任务与用量账本。
+6. **生产运维归 `scripts/dalton/ops/prod/`，渠道通知留待第 ③ 阶段平滑移交**：`/jobs/ops` 与宿主任务执行器归入 `scripts/dalton/ops/prod/`；`/notify`、`/feishu/*` 与 `discord-history` 在第 ③ 阶段渠道网关 `integrations/dalton-channel-gateway/` 就绪前继续保留在缩减后的桥进程上，使研究连接器拆分批次与第 ③ 阶段完全解耦。
+7. **落地前冻结桥外耦合**：各批次合入前，现行桥上的维护仅在 `scripts/dalton/researchdata_bridge.py` 内部完成。
 
 ---
 
@@ -23,410 +24,483 @@
 
 ### 1.1 HTTP 顶层路由组清单
 
-`scripts/dalton/researchdata_bridge.py` 在 `_handle_client`（`scripts/dalton/researchdata_bridge.py:25344-26167`）中分发全部 HTTP 请求。除 `/healthz` 与 `/mcp` 外，其余路径统一在 `scripts/dalton/researchdata_bridge.py:25622` 通过 `_require_admin_token`（`scripts/dalton/researchdata_bridge.py:25316-25342`）校验 `DALTON_BRIDGE_ADMIN_TOKEN`。（注：下表中 `<DALTON_RESEARCH_CODE>`、`<DALTON_RESEARCH_HOME>`、`~/Library/`、`/Applications/AlphaEngine.app` 等宿主机外部目录取自桥配置定义，仓库外本机实际文件排布待核实。）
+`scripts/dalton/researchdata_bridge.py` 在 `_handle_client`（`scripts/dalton/researchdata_bridge.py:25344-26167`）中分发全部 HTTP 请求。`/healthz` 免鉴权；`/mcp` 校验 `DALTON_BRIDGE_TOKEN`（或 `DALTON_BRIDGE_ADMIN_TOKEN`，见 `_is_valid_mcp_token` 于 `:25301-25313`）；其余全部管理与内部路由统一在 `:25622` 经 `_require_admin_token`（`:25316-25342`）校验 `DALTON_BRIDGE_ADMIN_TOKEN`。（注：下表引用的 `<DALTON_RESEARCH_CODE>`、`<DALTON_RESEARCH_HOME>`、`~/Library/`、`/Applications/AlphaEngine.app` 等宿主机外部路径取自桥配置常量，本机工作区外实际文件状态待核实。）
 
-| 路由前缀与方法 | 代码入口 | 职责说明 | 调用方（后端 / 沙箱技能 / 运维脚本） | 依赖的本机资源 | 当前对应能力 |
+| 路由前缀与方法 | 代码入口 | 职责说明 | 调用方（后端模块 / 沙箱技能 / 工作流 / 运维脚本） | 依赖的本机资源 | 当前对应能力 |
 |---|---|---|---|---|---|
-| `GET /healthz` | `scripts/dalton/researchdata_bridge.py:25419-25453` | 返回服务版本、并发限流器状态、AlphaEngine 当日读文计数与熔断器状态、`xreach`/`tmeet` CLI 可用性快照 | 运维检查脚本：`scripts/dalton/check_bridge.sh:32-36`、`scripts/dalton/install_bridge.sh:51-90`、`scripts/dalton/realrun/check_env.py:835`、`scripts/dalton/export_review_window.sh:222` | 内存并发状态、AlphaEngine SQLite 计数库、本机 `xreach` 与 `tmeet` 可执行文件 | `researchdata_bridge` |
-| `POST /mcp`<br>`POST /mcp/<token>` | `scripts/dalton/researchdata_bridge.py:25456-25619`；分发函数 `handle_tools_call` 于 `:13541-15264` | Streamable HTTP JSON-RPC 端点，暴露 `catalog`、`research`、`finance`、`macro`、`community` 5 个 MCP 工具，校验 `DALTON_BRIDGE_TOKEN` 与沙箱每次调用签发的 `X-Dalton-Caller-Token`（`:25560-25589`） | 1. 沙箱 PTC 包装器：`plugins/dalton_data/mcp.json:4-10` + `src/ptc_agent/core/sandbox/mcp_client_runtime.py:2202-2220`<br>2. 后端数据地图探针：`src/dalton/data_map/health.py:173-235`、`:790-1060`<br>3. 后端自治探针：`src/dalton/autonomy/probes/cnhk.py:184-310`<br>4. 沙箱技能脚本（详列于 1.2 节） | 按子路由分别依赖 `:8950`、`:8943`、本地 SQLite 向量库、宿主机 CLI（详列于 1.2 节） | `researchdata_bridge` 及 `BRIDGE_ROUTE_CAPABILITY_MAP` 子能力（`src/dalton/capabilities.py:775-786`） |
-| `POST /embed` | `scripts/dalton/researchdata_bridge.py:25626-25642`；处理函数 `handle_embed` 于 `:15419-15489` | 调用 `company_wiki_cli.py` 子进程请求 Gemini Embedding API（默认 `gemini-embedding-2-preview`，3072 维），支持批量 100 条文档或单条查询向量化 | 后端对话归档模块：`src/dalton/conversations/embedder.py:75-207`（`embed_texts_via_bridge`、`embed_query_via_bridge`），由 `src/dalton/conversations/search.py:259` 检索调用 | `<DALTON_RESEARCH_CODE>/skills/company-wiki/scripts/company_wiki_cli.py`、宿主机环境变量 `GEMINI_API_KEY` | 代码内硬编码检查 `researchdata_bridge`（`src/dalton/conversations/embedder.py:150`），业务归属 `conversation_archive` |
-| `GET /jobs/ops` | `scripts/dalton/researchdata_bridge.py:25645-25651`；处理函数 `handle_get_ops_jobs` 于 `:15766-15794` | 读取 macOS `launchctl` 状态与日志文件，汇总 `com.dalton.pg-backup` 与 `com.dalton.backend-watchdog` 运行状态 | 后端系统任务视图：`src/dalton/autonomy/system_jobs.py:261-315`（`_fetch_ops_jobs` -> `_call_host_bridge` 于 `:232-259`） | macOS `/bin/launchctl`、`~/Library/LaunchAgents/*.plist`、`~/Library/Logs/dalton-pg-backup.log`、`~/Backups/dalton/.watchdog_failures` | `researchdata_bridge`（`src/dalton/autonomy/system_jobs.py:241,265`） |
-| `POST /notify` | `scripts/dalton/researchdata_bridge.py:25659-25675`；处理函数 `handle_notify` 于 `:15796-15983` | 调用 `feishu_send_card.py` 发送飞书交互卡片通知 | 后端通知分发器：`src/dalton/notify/dispatch.py:1985-2080`、`:5148`（当 `DALTON_NOTIFY_VIA_GATEWAY` 关闭时走桥，见 `src/dalton/settings.py:1473-1486`） | `<DALTON_RESEARCH_CODE>/scripts/feishu_send_card.py`、`FEISHU_APP_ID`、`FEISHU_APP_SECRET` | `channel_feishu` / `researchdata_bridge` |
-| `POST /wiki/ingest` | `scripts/dalton/researchdata_bridge.py:25679-25699`；处理函数 `handle_wiki_ingest` 于 `:17050-17850` | 校验 Markdown 载荷、幂等去重、加文件锁并调用 `company-wiki/run.sh` 写入 Wiki Markdown 文件及更新 SQLite 向量索引，记录审计日志 | 后端直连工具：`src/dalton/tools/wiki_tools.py:447-485`、`:676`（`ingest_company_wiki`）；统一入库工具 `src/dalton/tools/ingest_tools.py:615`、`:661-672`（`ingest_research`） | `<DALTON_RESEARCH_HOME>/wiki/` 目录与 `wiki/vectors.db`、`var/dalton/wiki_ingest_audit.jsonl`、`GEMINI_API_KEY` | `company_wiki`（`src/dalton/tools/__init__.py:189-205`） |
-| `POST /sales-notes/ingest` | `scripts/dalton/researchdata_bridge.py:25703-25723`；处理函数 `handle_sales_notes_ingest` 于 `:18052-18430` | 校验销售笔记载荷并调用 `market-digest/run.sh add-note` 写入原始 JSON/文本清单与 SQLite 向量分块库 | 后端直连工具：`src/dalton/tools/ingest_tools.py:72-105`、`:261`、`:578-589`（`ingest_sales_note`、`ingest_research`） | `<DALTON_RESEARCH_HOME>/state/sales-notes/manifest.jsonl`、`skills/market-digest/vectors.db`、`GEMINI_API_KEY` | `sales_notes`（`src/dalton/tools/__init__.py:194-205`） |
-| `POST /feishu/*`（共 8 个子路径） | `scripts/dalton/researchdata_bridge.py:25728-25768`；处理函数 `:18469-19024`；客户端 `FeishuClient` 于 `:22528-23369` | 代理飞书开放平台 API：`doc/read`、`wiki/nodes`、`wiki/node`、`doc/create`、`doc/append`、`doc/grant`、`bot-info`、`chats` | 1. 飞书文档工具封装：`src/dalton/feishu.py:106-167`（`post_bridge_feishu`），供 `src/dalton/tools/feishu_tools.py:69-81,236,346,373,401,521,684` 调用<br>2. 后端管理路由：`src/dalton/app/router.py:2526`（`/feishu/spaces`）、`:2563`（`/notify/feishu-bot`）<br>3. 群组列表服务：`src/dalton/notify/groups.py:28-56` | 宿主机环境变量 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、飞书公网 API | 文档读写归 `feishu_docs`；`bot-info` 与 `chats` 归 `channel_feishu` |
-| `POST /transcriptions`<br>`GET /transcriptions/{id}`<br>`GET /transcriptions/{id}/result`<br>`GET /transcriptions/{id}/result/raw`<br>`POST /transcriptions/{id}/retry`<br>`POST /transcriptions/{id}/cancel` | `scripts/dalton/researchdata_bridge.py:25773-25890`；处理函数 `:19030-19113`；任务引擎 `scripts/dalton/asr_jobs.py:1-160` 与 `scripts/dalton/seed_asr_client.py:1-160` | 接收音视频文件引用，调用 `ffprobe`/`ffmpeg` 转码切分，上传火山引擎 TOS 对象存储并轮询豆包 Seed-ASR 2.0 获取带说话人分离的逐字稿 | 1. 后端转写服务：`src/dalton/services/transcriptions.py:461-584`（供 REST 路由 `src/dalton/app/transcriptions.py:100`、Agent 工具 `src/dalton/tools/transcription_tools.py:410`、后台对账循环 `src/server/app/setup.py:909-919` 调用）<br>2. 沙箱转写技能通过后端 API 间接调用：`plugins/dalton/skills/dalton-transcript-polish/scripts/dalton_asr.py:49,382-588` | 本机 `ffmpeg`/`ffprobe`、`var/dalton/asr_jobs/` 工作目录、火山引擎 `VOLC_TOS_*` 与 `SEED_ASR_*` 凭证 | `transcription`（`src/dalton/capabilities.py:151-159`） |
-| `POST /internal/market-digest/{prepare,read,output/get,output/save,output/finalize}` | `scripts/dalton/researchdata_bridge.py:25894-25954`、`:26082-26112`；处理函数 `:19770-19974` + `scripts/dalton/market_digest_access.py` | 为每日市场摘要任务拉取邮件/电报增量材料、读取分块、保存与定稿输出文件 | 后端内部摘要工具：`src/dalton/tools/market_digest_tools.py:42-43,286-289`、`src/dalton/tools/market_digest_output_tools.py:471-480` | 宿主机邮件与电报拉取脚本、`<DALTON_RESEARCH_HOME>/skills/market-digest/` 目录与专属 Python 虚拟环境 | `fund_automations`（`src/dalton/tools/__init__.py:216-245`） |
-| `POST /internal/ai-finance/{prepare,read,signals,report}` | `scripts/dalton/researchdata_bridge.py:25958-26078`；处理函数 `:19531-19769` + `scripts/dalton/ai_finance_access.py` | 为 AI 金融跟踪任务准备输入材料、读写信号库与生成报告快照 | 后端内部工具：`src/dalton/tools/ai_finance_inputs_tools.py:309`、`src/dalton/tools/ai_finance_signals_tools.py:706`、`src/dalton/tools/ai_finance_report_tools.py:779` | `DALTON_AI_FINANCE_CONFIG` 指向的宿主机目录与本地状态库 | `fund_automations`（`src/dalton/tools/__init__.py:246-275`） |
-| `POST /internal/data-tasks/{host-run,host-kill}` | `scripts/dalton/researchdata_bridge.py:26116-26141`；处理函数 `:19426-19530`、`:19975-20342` | 在宿主机受控执行 `manifest.yaml` 中标记为 `runner: "host"` 的定时采集任务（含进程组监控、超时终止、BBG 镜像同步与敏感词脱敏） | 后端数据任务宿主执行器：`src/dalton/data_jobs/host_runner.py:23-29,108-181`；对应任务为 `src/dalton/data_jobs/manifest.yaml` 中的 `T1`（`:5-26`）、`T29`（`:335-356`）、`T58`（`:549-577`）、`T34`（`:871-895`）、`T60`（`:897-936`）、`T61`（`:939-964`）、`T87`（`:1045-1070`） | 宿主机 `var/dalton/openclaw-data`、SSH 远端 Windows BBG 跳板机、`~/.local/share/everflow-tools/venvs/`、进程组信号 | `data_jobs`（`src/dalton/capabilities.py:199-205`） |
+| `GET /healthz` | `scripts/dalton/researchdata_bridge.py:25419-25453` | 返回服务版本、并发限流器状态、从 JSON 文件读取的 AlphaEngine 当日读文统计（`_read_usage_today` 于 `:10897-10922`）、搜索熔断器状态、`xreach` 与 `tmeet` CLI 可用性 | 运维与验收脚本：`scripts/dalton/check_bridge.sh:32-36`、`scripts/dalton/install_bridge.sh:51-90`、`scripts/dalton/export_review_window.sh:222`、`scripts/dalton/realrun/check_env.py:835`、`scripts/dalton/realrun/g7_bridge.py:44-110` | `cfg.usage_file`（JSON 当日读文计数）、内存限流与熔断状态、本机 `xreach`/`tmeet` 二进制 | `researchdata_bridge` |
+| `POST /mcp`<br>`POST /mcp/<token>` | `scripts/dalton/researchdata_bridge.py:25456-25619`；分发入口 `handle_tools_call` 于 `:13541-15264` | Streamable HTTP JSON-RPC 端点，暴露 `catalog`、`research`、`finance`、`macro`、`community` 5 个工具。在 `:25555-25589` 校验带 `X-Dalton-Caller-Scope: per-request` 的 `X-Dalton-Caller-Token` 用于工作区/用户并发桶与自动化优先级归属；缺失或验签未通过时降级为 `_caller_verified: False` 的未签名调用处理 | 1. 沙箱 PTC 运行时：`plugins/dalton_data/mcp.json:4-10`、`src/ptc_agent/core/sandbox/mcp_client_runtime.py:2165-2220`<br>2. 地址注入与配置中心：`scripts/dalton/bridge_subprocess_env.py:2229-2427`、`src/dalton/settings.py:1090-1151,1419-1435`<br>3. 后端健康探针与数据地图：`src/dalton/data_map/health.py:173-235,790-1060`、`src/dalton/data_map/builder.py:287-355,488-503`<br>4. 后端自治探针：`src/dalton/autonomy/probes/cnhk.py:184-310`、`scripts/dalton/realrun/g4_autonomy.py:412-420`<br>5. 技能脚本与 JS 工作流（详列于 1.2 节与 3.2 节） | 按子路由分别访问本机 `:8950`、`:8943`、`<DALTON_RESEARCH_HOME>` SQLite 库与本机 CLI（详列于 1.2 节） | 总开关 `researchdata_bridge` + `BRIDGE_ROUTE_CAPABILITY_MAP`（`src/dalton/capabilities.py:775-801`） |
+| `POST /embed` | `scripts/dalton/researchdata_bridge.py:25626-25642`；处理函数 `handle_embed` 于 `:15419-15489` | 调用 `company_wiki_cli.py` 子进程请求 Gemini Embedding API（默认 `gemini-embedding-2-preview`，3072 维），支持每次最多 100 条批量向量化与查询向量化 | 1. 后端对话归档嵌入器：`src/dalton/conversations/embedder.py:75-207`，供 `src/dalton/conversations/search.py:259` 检索调用<br>2. 归档重渲染校验：`scripts/dalton/bridge_subprocess_env.py:29,881,1948-1950` | `<DALTON_RESEARCH_CODE>/skills/company-wiki/scripts/company_wiki_cli.py`、宿主机 `GEMINI_API_KEY` | 代码内检查 `researchdata_bridge`（`src/dalton/conversations/embedder.py:150-151`），业务归属 `conversation_archive` |
+| `GET /jobs/ops` | `scripts/dalton/researchdata_bridge.py:25645-25651`；处理函数 `handle_get_ops_jobs` 于 `:15766-15794` | 读取 macOS `launchctl` 与备份日志，汇总 `com.dalton.pg-backup` 与 `com.dalton.backend-watchdog` 状态 | 后端系统任务模块：`src/dalton/autonomy/system_jobs.py:232-315` | macOS `/bin/launchctl`、`~/Library/LaunchAgents/*.plist`、`~/Library/Logs/dalton-pg-backup.log`、`~/Backups/dalton/.watchdog_failures` | `researchdata_bridge`（`src/dalton/autonomy/system_jobs.py:241,265`） |
+| `POST /notify` | `scripts/dalton/researchdata_bridge.py:25659-25675`；处理函数 `handle_notify` 于 `:15796-15983` | 经受控环境过滤（`scripts/dalton/bridge_subprocess_env.py:423-452`）调用 `feishu_send_card.py` 推送飞书卡片 | 后端通知分发器：`src/dalton/notify/dispatch.py:1985-2080,5148`（受 `DALTON_NOTIFY_VIA_GATEWAY` 控制，见 `src/dalton/settings.py:1473-1486`） | `<DALTON_RESEARCH_CODE>/scripts/feishu_send_card.py`、`FEISHU_APP_ID`、`FEISHU_APP_SECRET` | `channel_feishu` + `researchdata_bridge` |
+| `POST /wiki/ingest` | `scripts/dalton/researchdata_bridge.py:25679-25699`；处理函数 `handle_wiki_ingest` 于 `:17050-17850` | 校验 Markdown 载荷、幂等去重、加文件锁并调用 `company-wiki/run.sh` 写入 Wiki 文件、更新 `wiki/vectors.db` 及审计日志 | 1. 后端工具：`src/dalton/tools/wiki_tools.py:447-485,676`（`ingest_company_wiki`，注册于 `src/dalton/tools/__init__.py:370-380`）<br>2. 统一入库工具：`src/dalton/tools/ingest_tools.py:615,661-677`（`ingest_research`，注册于 `src/dalton/tools/__init__.py:393-404`）<br>3. 前端工作区自动入库开关：`web/src/pages/ChatAgent/components/dalton/AutoIngestToggle.tsx:26` | `<DALTON_RESEARCH_HOME>/wiki/`、`wiki/vectors.db`、`var/dalton/wiki_ingest_audit.jsonl`、`GEMINI_API_KEY` | `ingest_company_wiki` 挂 `company_wiki`；`ingest_research` 与 `AutoIngestToggle` 当前挂 `researchdata_bridge` |
+| `POST /sales-notes/ingest` | `scripts/dalton/researchdata_bridge.py:25703-25723`；处理函数 `handle_sales_notes_ingest` 于 `:18052-18430` | 校验销售纪要载荷并调用 `market-digest/run.sh add-note` 写入清单文件与 `skills/market-digest/vectors.db` | 后端工具：`src/dalton/tools/ingest_tools.py:72-105,261,578-594`（`ingest_sales_note` 注册于 `src/dalton/tools/__init__.py:381-392`，及 `ingest_research`） | `<DALTON_RESEARCH_HOME>/state/sales-notes/manifest.jsonl`、`skills/market-digest/vectors.db`、`GEMINI_API_KEY` | `ingest_sales_note` 挂 `sales_notes`；`ingest_research` 挂 `researchdata_bridge` |
+| `POST /feishu/*`（共 8 个子路径） | `scripts/dalton/researchdata_bridge.py:25728-25768`；处理函数 `:18469-19024`；`FeishuClient` 于 `:22528-23369` | 代理飞书开放平台接口：`doc/read`、`wiki/nodes`、`wiki/node`、`doc/create`、`doc/append`、`doc/grant`、`bot-info`、`chats` | 1. 飞书客户端：`src/dalton/feishu.py:106-167`（`:117-118` 强校验 `RESEARCHDATA_BRIDGE`），供 `src/dalton/tools/feishu_tools.py:69-81,236,346,373,401,521,684` 调用<br>2. 后端管理路由：`src/dalton/app/router.py:2526`（`/feishu/spaces`）、`:2563`（`/notify/feishu-bot`）<br>3. 群发现缓存：`src/dalton/notify/groups.py:28-56` | 宿主机 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、飞书公网 OpenAPI | 工具注册挂 `feishu_docs` / `channel_feishu`，底层 `post_bridge_feishu` 挂 `researchdata_bridge` |
+| `POST /transcriptions`<br>`GET /transcriptions/{id}`<br>`GET /transcriptions/{id}/result`<br>`GET /transcriptions/{id}/result/raw`<br>`POST /transcriptions/{id}/retry`<br>`POST /transcriptions/{id}/cancel` | `scripts/dalton/researchdata_bridge.py:25773-25890`；处理函数 `:19030-19113`；启动恢复 `:26191-26194`；引擎 `scripts/dalton/asr_jobs.py:2305-2345` 与 `scripts/dalton/seed_asr_client.py:1-160` | 音视频 `ffprobe`/`ffmpeg` 转码切分、火山引擎 TOS 上传与豆包 Seed-ASR 2.0 异步转写、未完成任务启动恢复及 `asr_usage.jsonl` 计量 | 1. 后端转写服务：`src/dalton/services/transcriptions.py:461-584,2038-2075`（`:465-466` 校验 `RESEARCHDATA_BRIDGE`），支撑路由 `src/dalton/app/transcriptions.py:100`、工具 `src/dalton/tools/transcription_tools.py:410`（注册于 `src/dalton/tools/__init__.py:405-410`）及对账循环 `src/server/app/setup.py:909-919`<br>2. 沙箱 CLI 经后端 API 调用：`plugins/dalton/skills/dalton-transcript-polish/scripts/dalton_asr.py:49,382-588` | 本机 `ffmpeg`/`ffprobe`、`var/dalton/asr_jobs/`（含状态文件、原始结果与 `asr_usage.jsonl`）、`VOLC_TOS_*` 与 `SEED_ASR_*` 密钥 | `transcription`（同时受 `src/dalton/capabilities.py:425-433` 后端转写存储配置约束） |
+| `POST /internal/market-digest/{prepare,read,output/get,output/save,output/finalize}` | `scripts/dalton/researchdata_bridge.py:25894-25954,26082-26112`；处理函数 `:19770-19974` + `scripts/dalton/market_digest_access.py` | 每日市场摘要批次材料准备、分块读取、输出草稿保存与定稿 | 后端工具：`src/dalton/tools/market_digest_tools.py:42-43,286-289`、`src/dalton/tools/market_digest_output_tools.py:471-480`（注册于 `src/dalton/tools/__init__.py:94-113`） | `<DALTON_RESEARCH_HOME>/skills/market-digest/` 目录、邮件/电报拉取环境 | `fund_automations` |
+| `POST /internal/ai-finance/{prepare,read,signals,report}` | `scripts/dalton/researchdata_bridge.py:25958-26078`；处理函数 `:19531-19769` + `scripts/dalton/ai_finance_access.py` | AI Finance 日报材料准备、信号库读写与报告快照提交 | 后端工具：`src/dalton/tools/ai_finance_inputs_tools.py:309`、`src/dalton/tools/ai_finance_signals_tools.py:706`、`src/dalton/tools/ai_finance_report_tools.py:779`（注册于 `src/dalton/tools/__init__.py:114-143`） | `DALTON_AI_FINANCE_CONFIG` 指向的宿主机状态目录 | `fund_automations` |
+| `POST /internal/data-tasks/{host-run,host-kill}` | `scripts/dalton/researchdata_bridge.py:26116-26141`；状态恢复与执行 `:19168-19530,19975-20342`；启动恢复 `:26196-26199` | 受控执行 `src/dalton/data_jobs/manifest.yaml` 中 7 个 `runner: "host"` 任务（`T1` `:5-26`、`T29` `:335-356`、`T58` `:549-577`、`T34` `:871-895`、`T60` `:897-936`、`T61` `:939-964`、`T87` `:1045-1070`），维护 `generation`、进程组 `pgid`+`lstart`、`fence_lost` 标记、命令白名单与按任务凭据注入 | 后端宿主任务调度器：`src/dalton/data_jobs/host_runner.py:23-29,108-181` | `var/dalton/openclaw-data`、`.dalton-host-runner-state.json`、SSH Windows BBG 跳板机、`~/.local/share/everflow-tools/venvs/` | `data_jobs`（`src/dalton/capabilities.py:199-205`） |
 
-### 1.2 `/mcp` 内部工具与子路由清单
+此外，宿主机部署与迁移脚本直接管理桥生命周期：`scripts/dalton/ops/prod/deploy_main.sh:633,658,662,915-924` 在生产发布与回退时重启和校验 `com.dalton.researchdata-bridge`；`scripts/dalton/ops/research_runtime_migrate.sh:806-812` 调用 `researchdata_bridge.py --check-runtime` 校验数据目录完整性。
 
-`/mcp` 暴露的工具及合法路由表定义在 `TOOL_VALID_ROUTES`（`scripts/dalton/researchdata_bridge.py:3212-3230`）与 `scripts/dalton/research_runtime/config/data_sources.json:1-473`。
+### 1.2 `/mcp` 内部工具与全部子路由清单
 
-| MCP 工具 | `route` 子路由 | 代码定义与分发位置 | 职责说明 | 主要调用方（精确位置） | 本机资源与外部依赖 | 对应能力 |
+`/mcp` 的合法子路由集合定义在 `TOOL_VALID_ROUTES`（`scripts/dalton/researchdata_bridge.py:3212-3230`），参数与返回契约定义在 `ROUTE_CONTRACT_SPECS`（`:2219-3210`）及 `scripts/dalton/research_runtime/scripts/data_gateway.py:115-226`。
+
+| MCP 工具 | `route` 子路由 | 现有操作集合（`operations`） | 代码定义位置 | 主要调用方（精确位置） | 本机资源与外部依赖 | 当前能力登记状态 |
 |---|---|---|---|---|---|---|
-| `catalog` | 全部或按 `route` 过滤 | `scripts/dalton/researchdata_bridge.py:2160-2219`、`:13580-13650` | 返回可用工具、路由参数规范与调用示例 | 沙箱 `ExecuteCode` 首轮自省（见 `plugins/dalton/agents/dalton-evidence.md:22`、`plugins/dalton/skills/dalton-bullbear/SKILL.md:29`） | 内存静态 schema | `researchdata_bridge` |
-| `research` | `alphaengine` | `scripts/dalton/researchdata_bridge.py:2517-2659`、`:13930-14041`；上游 `scripts/dalton/research_runtime/scripts/alphaengine-mcp/server.mjs:1-220` | 卖方研报、机构/个人会议纪要、录制任务状态与分类词典检索及分页正文读取；含 SQLite v4 短时缓存、并发合并、熔断器与软配额提示 | 1. 沙箱技能脚本：`plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:569-646,855-925`、`plugins/dalton/skills/dalton-bullbear-tracker/scripts/collect.py:600,2733`、`plugins/dalton/skills/dalton-sector-delta/scripts/collect_sector.py:89-90`、`plugins/dalton/skills/dalton-mark-weekly-newenergy/scripts/rd_transport.py:50-115`、`plugins/dalton/skills/dalton-richard-coverage-weekly/scripts/richard_cov_transport.py:12-45`<br>2. 数据地图探针：`src/dalton/data_map/health.py:860-920` | 本机端口 `8950`（`com.dalton.alphaengine-mcp`）、`/Applications/AlphaEngine.app`（`scripts/dalton/research_runtime/scripts/alphaengine-mcp/server.mjs:112`）、macOS 钥匙串 `dalton-alphaengine`（`scripts/dalton/research_runtime/scripts/alphaengine-mcp/server.mjs:113-116`）、缓存库 `~/Library/Caches/dalton-researchdata-bridge/alphaengine_search_cache.sqlite3`（`scripts/dalton/alphaengine_search_cache.py`）、日志 `~/Library/Logs/alphaengine_usage.jsonl` | `alphaengine` |
-| `research` | `transcript` | `scripts/dalton/researchdata_bridge.py:2704-2738`、`scripts/dalton/research_runtime/scripts/data_gateway.py:43` | 基于 AlphaEngine `IND_SECOND_5FA442AE` 类别定向检索业绩电话会逐字稿，共享 AlphaEngine 缓存与熔断器 | 技能脚本与工作流：`plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:880-920`、`plugins/dalton/skills/dalton-earnings-flash/SKILL.md:42`、`plugins/dalton/skills/dalton-full-coverage/references/branch-c-primary.md:21` | 与 `alphaengine` 相同（`:8950` + 钥匙串 + SQLite 缓存库） | `alphaengine`（`src/dalton/capabilities.py:778`） |
-| `research` | `guidepoint` | `scripts/dalton/researchdata_bridge.py:2660-2703`；代理 `scripts/dalton/research_runtime/scripts/guidepoint_mcp_proxy.py:1-217` | 检索 Guidepoint 专家访谈问答摘录（关键词过滤、时间窗口与近期权重排序） | 技能脚本：`plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:855-925`、`dalton-bullbear-tracker/scripts/collect.py:2733`；健康探针 `src/dalton/data_map/health.py:921-965` | 本机 `127.0.0.1:8943`（`com.dalton.guidepoint-mcp-proxy`）、`guidepoint_mcp_tokens.json`、`GUIDEPOINT_CLIENT_ID`/`GUIDEPOINT_CLIENT_SECRET`、Auth0 刷新端点与 `https://clapi.guidepoint.io/mcp-server/v1/mcp` | `guidepoint` |
-| `research` | `company-wiki` | `scripts/dalton/researchdata_bridge.py:2739-2791`、`scripts/dalton/research_runtime/scripts/research_library.py:162,170` | 内部公司 Wiki 目录列举、混合语义检索与 Markdown/配图只读读取 | 技能脚本：`plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:855-925`、`dalton-wiki-auto-ingest/scripts/wiki_ingest.py:93`；健康探针 `src/dalton/data_map/health.py:795-859` | `<DALTON_RESEARCH_HOME>/wiki/` Markdown 文件、`wiki/vectors.db` SQLite 库、`state/research-images/assets`、`GEMINI_API_KEY`（查询嵌入） | `company_wiki` |
-| `research` | `sales-notes`（含兼容别名 `sales-mail`） | `scripts/dalton/researchdata_bridge.py:2792-2883`、`scripts/dalton/research_runtime/scripts/sales_notes_store.py:18-78` | 检索与精读交易台销售纪要、邮件分块与买方预期摘要 | 技能脚本：`plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:855-925`、`dalton-mark-weekly-newenergy/scripts/rd_transport.py:50-115`、`dalton-richard-coverage-weekly/scripts/richard_cov_transport.py:12-45` | `<DALTON_RESEARCH_HOME>/skills/market-digest/vectors.db`、`state/sales-notes/manifest.jsonl`、`GEMINI_API_KEY` | `sales_notes` |
-| `research` | `tmtb` | `scripts/dalton/researchdata_bridge.py:2884-2929`；同步脚本 `scripts/dalton/research_runtime/scripts/tmtb_alphaengine_sync.py:1-160` | 检索 TMT 每日焦点摘要库（由同步任务从 AlphaEngine 抓取入库） | 技能脚本：`plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:855-925`、`dalton-bullbear-tracker/scripts/collect.py:2733` | `<DALTON_RESEARCH_HOME>/skills/market-digest/vectors.db`（`message_id LIKE 'alphaengine:%'`）、`GEMINI_API_KEY` | `tmtb` |
-| `research` | `funda-ai` | `scripts/dalton/researchdata_bridge.py:2930-2975`、`scripts/dalton/research_runtime/scripts/funda_ai.py:1-160` | 检索与读取 FUNDA AI 独立研究纪要索引库 | 技能脚本：`plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:855-925`、`plugins/dalton/skills/dalton-bullbear-tracker/scripts/collect.py:2733` | `<DALTON_RESEARCH_HOME>/state/funda-ai/index.sqlite`（`scripts/dalton/research_runtime/scripts/funda_ai.py:126-127`） | `funda_ai` |
-| `research` | `all` | `scripts/dalton/researchdata_bridge.py:2460-2516`、`:14042-14422` | 跨本地四库（`company-wiki`、`sales-notes`、`tmtb`、`funda-ai`）与远端两库（`alphaengine`、`guidepoint`）并行扇出初筛（20 秒宽限窗口） | 沙箱 `ExecuteCode` 交互式初筛（见 `plugins/dalton_data/plugin.json:16`） | 组合上述六个来源的全部资源 | `researchdata_bridge`（按已启用子源动态裁剪） |
-| `research` | `tmeet` | `scripts/dalton/researchdata_bridge.py:3094-3138`、`:11686-11708` | 调用本机 `tmeet` CLI 列出与读取腾讯会议纪要和转写 | 技能脚本：`plugins/dalton/skills/dalton-tmeet-weekly-minutes/scripts/tmeet_minutes.py:87,358-501` | 宿主机 `tmeet` 二进制（`BridgeConfig.tmeet_bin` 于 `:1175-1183`）及本机登录态 | `fund_automations` + `feishu_docs`（`src/dalton/content_assembly.py:100-104`） |
-| `research` | `gcal` | `scripts/dalton/researchdata_bridge.py:3139-3184`、`:11970-11993` | 调用本机 `gws` CLI 查询 Google Calendar 财报与会议日程 | 技能脚本：`plugins/dalton/skills/dalton-richard-earnings/scripts/richard_earnings.py:197,565-840` | 宿主机 `gws` 二进制（`:1184-1192`）、`DALTON_GCAL_CALENDAR_ID`、Google 本地凭据 | `fund_automations`（`src/dalton/data_map/sources.yaml:121-128`） |
-| `research` | `discord-history` | `scripts/dalton/researchdata_bridge.py:3185-3209`、`:12079-12145` | 拉取白名单 Discord 频道历史消息供 Wiki 自动入库扫描 | 技能脚本：`plugins/dalton/skills/dalton-wiki-auto-ingest/scripts/wiki_ingest.py:93,475,719` | `DALTON_DISCORD_BOT_TOKEN`、`DALTON_DISCORD_HISTORY_CHANNELS`、Discord REST API | `channel_discord`（`src/dalton/capabilities.py:784`） |
-| `finance` | `sec` / `estimates` / `cn-hk` | `scripts/dalton/researchdata_bridge.py:2220-2374`、`scripts/dalton/research_runtime/scripts/data_gateway.py:142-226` | SEC 公告章节/附件提取、卖方一致预期快照、港股与 A 股公告（披露易/巨潮）及财务初值查询 | 1. `sec`：`plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:932-943`、`dalton-daily-filing-alert/SKILL.md:63`<br>2. `estimates`：`dalton-bullbear/scripts/implied_model.py:21,200`<br>3. `cn-hk`：`dalton-stock-move/scripts/cn_price_fallback.py:253-277`、后端探针 `src/dalton/autonomy/probes/cnhk.py:184-310` | `<DALTON_RESEARCH_CODE>/skills/{findata-analyst,cn-hk-findata}`、`SEC_USER_AGENT`、港股/A 股公开源与平台缓存 | 美股核心能力已由 `dalton_sec` 与 `yf_analysis` 覆盖；`cn-hk` 当前挂 `researchdata_bridge` |
-| `macro` | `fred` / `treasury` / `market-regime` | `scripts/dalton/researchdata_bridge.py:2375-2459`、`:1268-1307`、`:13537-13539` | FRED 宏观序列、美债收益率曲线、本地市场状态面板快照读取 | 沙箱 `ExecuteCode` 宏观查询（`plugins/dalton_data/plugin.json:16`） | `FRED_API_KEY`、`<DALTON_RESEARCH_HOME>` 下市场状态 JSON/CSV（核心版本已有内置 `macro` MCP 服务器） | `researchdata_bridge` |
-| `community` | `xueqiu` / `employee` / `last30days` / `x-timeline` | `scripts/dalton/researchdata_bridge.py:2976-3093`、`:12578-12750` | 雪球讨论、Blind/Glassdoor 员工评价、跨社区近 30 天热度、X 账号时间线抓取 | 技能脚本：`plugins/dalton/skills/dalton-bullbear-tracker/scripts/collect.py:2198,2238`、`dalton-richard-coverage-weekly/scripts/richard_coverage_weekly_cli.py:1435,1503`、`dalton-full-coverage/references/branch-d-offstreet.md:18-29` | `xueqiu_posts.py`、`employee_reviews_cli.py`、`last30days.py`、本机 `xreach` CLI | `researchdata_bridge`（核心版本已有 `x_api` 与 `scrape`） |
+| `catalog` | 可选按 `route` 过滤 | 自省返回路由参数契约 | `scripts/dalton/researchdata_bridge.py:2160-2218,13580-13650` | `plugins/dalton/agents/dalton-evidence.md:22`、`plugins/dalton/skills/dalton-bullbear/SKILL.md:29` | 内存契约字典 | `researchdata_bridge` |
+| `research` | `all` | `search`、`read`、`list`、`get_document` | `:2460-2516,14042-14422` | 定时采集全文读取与联搜：`plugins/dalton/skills/dalton-bullbear-tracker/scripts/collect.py:1410-1418`、`plugins/dalton/skills/dalton-mark-weekly-newenergy/scripts/mark_weekly.py:600-603`、`plugins/dalton/skills/dalton-richard-coverage-weekly/scripts/sales_notes_search.py:199-207`；交互初筛 `plugins/dalton_data/plugin.json:16` | 本地四库 SQLite + 并发扇出 `:8950` 与 `:8943` | `sources.yaml:13-18` 挂 `researchdata_bridge`，未入 `BRIDGE_ROUTE_CAPABILITY_MAP` |
+| `research` | `alphaengine` | `search_library`、`get_document`、`get_document_info`、`list_attachments`、`list_recording_tasks`、`get_recording_status`、`get_recording_task`、`list_filters`、`auth_status` | `:2517-2659,13930-14041`；上游 `scripts/dalton/research_runtime/scripts/alphaengine-mcp/server.mjs:1-220` | `dalton-thesis-delta/scripts/collect.py:902-915`、`dalton-bullbear-tracker/scripts/collect.py:2733`、`dalton-sector-delta/scripts/collect_sector.py:89-90`、`dalton-mark-weekly-newenergy/scripts/mark_weekly.py:610-619`、`dalton-richard-coverage-weekly/scripts/richard_cov_transport.py:12-45`、`dalton-china-consumer-weekly/scripts/china_consumer_weekly.py:1110-1112`、`dalton-global-consumer-weekly/scripts/global_consumer_weekly.py:1143`、`dalton-tob-industry-weekly/SKILL.md:81,89`、`workflows/topic-research/workflow.js:165`、`workflows/bullbear-doc/workflow.js:249`、`src/dalton/data_map/health.py:860-920` | 本机 `:8950`、`/Applications/AlphaEngine.app`（`server.mjs:112`）、钥匙串 `dalton-alphaengine`（`server.mjs:113-116`）、SQLite v4 缓存库 `alphaengine_search_cache.sqlite3`、`cfg.usage_file` | `alphaengine`（`capabilities.py:777`） |
+| `research` | `transcript` | `transcript` | `:2704-2738`、`data_gateway.py:43,212-214` | `dalton-earnings-flash/SKILL.md:42`、`dalton-full-coverage/references/branch-c-primary.md:21`、`dalton-ai-app-weekly-monitor/SKILL.md:201-204` | 与 `alphaengine` 共用 `:8950`、缓存库与熔断器 | `alphaengine`（`capabilities.py:778`） |
+| `research` | `guidepoint` | `search_library` | `:2660-2703`、`scripts/dalton/research_runtime/scripts/guidepoint_mcp_proxy.py:1-217` | `dalton-thesis-delta/scripts/collect.py:890-901`、`dalton-humanoid-robot-weekly/scripts/humanoid_robot_weekly.py:148-159`、`dalton-china-consumer-weekly/scripts/china_consumer_weekly.py:1113-1115`、`dalton-global-consumer-weekly/scripts/global_consumer_weekly.py:1144`、`dalton-tob-industry-weekly/SKILL.md:94`、`workflows/topic-research/workflow.js:186-191`、`src/dalton/data_map/health.py:921-965` | 本机 `:8943` 代理、`guidepoint_mcp_tokens.json`（进程内锁刷新写回，`:57,99`）、`GUIDEPOINT_CLIENT_ID`/`SECRET`、远端 `clapi.guidepoint.io` | `guidepoint`（`capabilities.py:779`） |
+| `research` | `company-wiki` | `search`、`read`、`list`、`topic` | `:2739-2791`、`scripts/dalton/research_runtime/scripts/research_library.py:162,170` | `dalton-thesis-delta/scripts/collect.py:880-889`（传 `params.indexed_since`）、`dalton-mark-weekly-newenergy/scripts/mark_weekly.py:590-595`、`dalton-wiki-auto-ingest/scripts/wiki_ingest.py:93`、`workflows/topic-research/workflow.js:181-185`、`src/dalton/data_map/health.py:795-859` | `<DALTON_RESEARCH_HOME>/wiki/`、`wiki/vectors.db`、`state/research-images/assets`、`GEMINI_API_KEY` | `company_wiki`（`capabilities.py:780`） |
+| `research` | `sales-notes` | `search`、`read`、`list` | `:2792-2837`、`scripts/dalton/research_runtime/scripts/sales_notes_store.py:18-78` | `dalton-thesis-delta/scripts/collect.py:916-928`、`dalton-richard-coverage-weekly/scripts/sales_notes_search.py:186-210`、`dalton-mark-weekly-newenergy/scripts/rd_transport.py:50-115`、`workflows/topic-research/workflow.js:183` | `skills/market-digest/vectors.db`（与 `tmtb` 及 `market-digest` 共用同一库文件，见 `research_library.py:172`）、`state/sales-notes/manifest.jsonl`、`GEMINI_API_KEY` | `sales_notes`（`capabilities.py:781`） |
+| `research` | `sales-mail` | `search`、`read`、`list` | `:2838-2883`、`data_gateway.py:129-131` | 历史技能与交互兼容调用（`search` 同时查 `sales-notes` 与 `tmtb`，`read` 接受 `mail:`/`digest:`/`tmtb:`） | 同 `sales-notes` + `tmtb` | 未登记在 `BRIDGE_ROUTE_CAPABILITY_MAP`（当前随总开关暴露） |
+| `research` | `tmtb` | `search`、`read`、`list` | `:2884-2929`；同步脚本 `scripts/dalton/research_runtime/scripts/tmtb_alphaengine_sync.py:1-160` | `dalton-thesis-delta/scripts/collect.py:916-928`、`dalton-richard-coverage-weekly/scripts/sales_notes_search.py:186`、`workflows/topic-research/workflow.js:183` | `skills/market-digest/vectors.db`（`message_id LIKE 'alphaengine:%'`）、`GEMINI_API_KEY` | `tmtb`（`capabilities.py:782`） |
+| `research` | `funda-ai` | `search`、`read`、`list` | `:2930-2975`、`scripts/dalton/research_runtime/scripts/funda_ai.py:1-160` | `dalton-thesis-delta/scripts/collect.py:916-928`、`dalton-richard-coverage-weekly/scripts/sales_notes_search.py:186`、`workflows/topic-research/workflow.js:183` | `<DALTON_RESEARCH_HOME>/state/funda-ai/index.sqlite`（`funda_ai.py:126-127`） | `funda_ai`（`capabilities.py:783`） |
+| `research` | `tmeet` | `auth_status`、`record_search`、`record_content` | `:3094-3138,11686-11708` | `plugins/dalton/skills/dalton-tmeet-weekly-minutes/scripts/tmeet_minutes.py:85-89,358-501` | 本机 `tmeet` CLI（`BridgeConfig.tmeet_bin` 于 `:1175-1183`）与登录态 | 当前未在 `BRIDGE_ROUTE_CAPABILITY_MAP` 或 `sources.yaml` 登记 |
+| `research` | `gcal` | `list_events`、`insert_event`、`delete_event` | `:3139-3184,11970-11993` | `plugins/dalton/skills/dalton-richard-earnings/scripts/richard_earnings.py:195-199,565-840` | 本机 `gws` CLI（`:1184-1192`）、`DALTON_GCAL_CALENDAR_ID` | `sources.yaml:121-128` 挂 `researchdata_bridge` + `fund_automations`，未入 `BRIDGE_ROUTE_CAPABILITY_MAP` |
+| `research` | `discord-history` | `list_messages` | `:3185-3209,12079-12145` | `plugins/dalton/skills/dalton-wiki-auto-ingest/scripts/wiki_ingest.py:93,475,719` | `DALTON_DISCORD_BOT_TOKEN`、`DALTON_DISCORD_HISTORY_CHANNELS` | `channel_discord`（`capabilities.py:784`） |
+| `finance` | `sec` | 11 个操作：`list-filings`、`financials`、`ratios`、`facts`、`smart-facts`、`search-concepts`、`search-text`、`read-item`、`attachments`、`eight-k`、`insider` | `:2220-2302`、`data_gateway.py:143-187` | `dalton-thesis-delta/scripts/collect.py:932-943`、`dalton-bullbear-tracker/references/{amzn,googl,meta,msft,ant,spcx}-rules.md`、`dalton-short-screen/SKILL.md:33-51`、`dalton-filing-review/SKILL.md:15-33`、`dalton-tob-industry-weekly/SKILL.md:70`、`dalton-global-consumer-weekly/scripts/global_consumer_weekly.py:1147`、`dalton-ai-app-weekly-monitor/SKILL.md:188-191`、`plugins/langalpha_market_data/fundamentals_mcp_server.py:845-858` | `<DALTON_RESEARCH_CODE>/skills/findata-analyst/run.sh`、`SEC_USER_AGENT`、SEC EDGAR API | `sources.yaml:61-66` 挂 `researchdata_bridge` |
+| `finance` | `estimates` | `consensus`（支持 `params.shares_bn`、`params.tax`） | `:2303-2338`、`data_gateway.py:215-225` | `dalton-bullbear/scripts/implied_model.py:21,200`、`dalton-earnings-preview/SKILL.md:38`、`dalton-tob-industry-weekly/SKILL.md:32`、`dalton-init-company/templates/data_consensus_README.md:3,10`、`dalton-conventions/SKILL.md:91` | `<DALTON_RESEARCH_CODE>/scripts/consensus_estimates.sh` | `sources.yaml:67-72` 挂 `researchdata_bridge` |
+| `finance` | `cn-hk` | `filings`、`ask`、`quote` | `:2339-2374`、`data_gateway.py:194-211` | `dalton-daily-filing-alert/SKILL.md:63-80`、`dalton-stock-move/scripts/cn_price_fallback.py:253-277`、`dalton-china-consumer-weekly/scripts/china_consumer_weekly.py:1116-1118`、`dalton-tob-industry-weekly/SKILL.md:71-74`、`dalton-financial-lenses/SKILL.md:41-54`、`src/dalton/autonomy/probes/cnhk.py:184-310` | `<DALTON_RESEARCH_CODE>/skills/cn-hk-findata/run.sh`、巨潮/AkShare/腾讯/新浪接口 | `sources.yaml:73-78` 挂 `researchdata_bridge` |
+| `macro` | `fred` | `macro`（支持 `series`、`start`、`end`、`vintage`） | `:2375-2399`、`data_gateway.py:188-190` | 沙箱宏观折现率与通胀就业查询（`sources.yaml:79-84`、`plugins/dalton_data/plugin.json:16`） | `findata-analyst/run.sh macro`、`FRED_API_KEY` | `sources.yaml:79-84` 挂 `researchdata_bridge` |
+| `macro` | `treasury` | `treasury`（`dataset="tga" \| "debt"`） | `:2400-2422`、`data_gateway.py:191-193` | 沙箱流动性 TGA 余额与联邦债务查询（`sources.yaml:85-90`） | `findata-analyst/run.sh treasury`、美国财政部 Fiscal Data 公开 API | `sources.yaml:85-90` 挂 `researchdata_bridge` |
+| `macro` | `market-regime` | `snapshot`、`us_topbottom`、`crowding`、`cn_leverage` | `:2423-2459,13208-13539` | 大盘状态与仓位拥挤度查询（`sources.yaml:91-96`、`dalton-ct-semi-sentiment/SKILL.md:54-55`） | `<DALTON_RESEARCH_HOME>` 下 `data_jobs` 产出的状态 JSON/CSV | `sources.yaml:91-96` 挂 `researchdata_bridge` |
+| `community` | `xueqiu`、`employee`、`last30days`、`x-timeline` | `xueqiu`(`posts`/`post`/`comments`/`search`/`user`)、`employee`(`blind`/`summary`/`indeed`/`glassdoor`)、`last30days`(`search`)、`x-timeline`(`tweets`/`tweet`/`thread`/`search`) | `:2976-3093,12578-12750` | `dalton-bullbear-tracker/scripts/collect.py:2198,2238`、`dalton-richard-coverage-weekly/scripts/richard_coverage_weekly_cli.py:1435,1503`、`dalton-humanoid-robot-weekly/scripts/humanoid_robot_weekly.py:160-170`、`dalton-china-consumer-weekly/scripts/china_consumer_weekly.py:1122-1124`、`dalton-global-consumer-weekly/scripts/global_consumer_weekly.py:1145`、`dalton-full-coverage/references/branch-d-offstreet.md:18-29`、`dalton-x-accounts-daily/SKILL.md:34-35,94` | `xueqiu_posts.py`、`employee_reviews_cli.py`、`last30days.py`、本机 `xreach` CLI | `sources.yaml:97-120` 挂 `researchdata_bridge` |
 
 ---
 
 ## 2. 目标形态
 
-### 2.1 职责拆分总览映射表
+### 2.1 全路由与全子路由唯一归宿总表
 
-拆分后，原本集中在 `researchdata_bridge.py` 的职责按边界归入五类去向：
+下表为第 2 轮统一的唯一权威归宿清单，覆盖现行桥上每一组 HTTP 路由及 `/mcp` 下每一个子路由与操作：
 
-| 原桥职责组 | 目标承载位置 | 进程与传输形态 | 仓库归属 | 核心安装（Standalone Core）启用方式 | Everflow 生产启用方式 |
+| 原桥入口与子路由 / 操作 | 唯一目标归宿（连接器插件 / 后端模块 / 宿主服务 / 网关） | Everflow 专属 | 对应能力开关（`CapabilityId`） | 交付批次 | 替代后数据等价性与差异处理 |
 |---|---|---|---|---|---|
-| `research(route="alphaengine" \| "transcript")` | 独立连接器插件 `dalton-alphaengine`（MCP 服务名 `dalton_alphaengine`） | macOS 宿主机 `streamable-http` 服务（监听 `127.0.0.1:8951`，内聚 SQLite v4 缓存/熔断/配额账本，上游接 `:8950` `server.mjs`） | 私有仓库 | Linux 宿主固定关闭；macOS 核心安装可通过挂载私有插件并设 `DALTON_CAP_ALPHAENGINE=true` 开启 | 默认开启（`everflow` 形态默认 `True` + macOS 宿主检测通过） |
-| `research(route="guidepoint")` | 独立连接器插件 `dalton-guidepoint`（MCP 服务名 `dalton_guidepoint`） | 沙箱内 `stdio` MCP 子进程（直接内置 Auth0 OAuth 刷新并请求 `https://clapi.guidepoint.io/mcp-server/v1/mcp`，取代宿主机 `:8943` 代理） | 私有仓库 | 安装私有插件、配置 `GUIDEPOINT_CLIENT_ID`/`SECRET` 与刷新令牌并开启 `DALTON_CAP_GUIDEPOINT=true` | 默认开启 |
-| `research(route="company-wiki")` + `POST /wiki/ingest` | 检索归插件 `dalton-company-wiki`（MCP 服务名 `dalton_company_wiki`）；写入归后端内置模块 `src/dalton/wiki_store/`（供 `ingest_company_wiki` 直接调用） | 检索：沙箱 `stdio` MCP 子进程（挂载只读数据目录）或容器内 HTTP；写入：后端进程直写共享卷 `wiki/` + 后端嵌入模块 | 接口与本地 Markdown+SQLite 引擎可放公开仓库（或插件包），基金历史数据放私有数据卷 | 挂载 `wiki` 数据卷、设置 `DALTON_CAP_COMPANY_WIKI=true` 即可独立启用 | 默认开启 |
-| `research(route="sales-notes")` + `POST /sales-notes/ingest` | 检索归插件 `dalton-sales-notes`（MCP 服务名 `dalton_sales_notes`）；写入归后端模块 `src/dalton/sales_notes_store/` | 检索：沙箱 `stdio` MCP 子进程（只读挂载销售笔记库）；写入：后端进程直写共享卷并调用后端嵌入模块 | 私有仓库（含交易台邮件清洗规范） | 安装私有插件、挂载数据卷并设 `DALTON_CAP_SALES_NOTES=true` | 默认开启 |
-| `research(route="tmtb")` | 独立连接器插件 `dalton-tmtb`（MCP 服务名 `dalton_tmtb`） | 沙箱 `stdio` MCP 子进程（只读查询 TMTB SQLite 向量库；增量同步脚本归 `scripts/dalton/ops/prod/`） | 私有仓库 | 安装私有插件并设 `DALTON_CAP_TMTB=true` | 默认开启 |
-| `research(route="funda-ai")` | 独立连接器插件 `dalton-funda-ai`（MCP 服务名 `dalton_funda_ai`） | 沙箱 `stdio` MCP 子进程（只读查询 `state/funda-ai/index.sqlite`） | 私有仓库 | 安装私有插件并设 `DALTON_CAP_FUNDA_AI=true` | 默认开启 |
-| `research(route="all")` | 沙箱 Python 聚合辅助函数 `scripts/dalton/research_runtime/scripts/federated_search.py`（并发调用当前工作区已启用的连接器包装器） | 沙箱内 `ExecuteCode` 进程内并发调用 | 公开仓库（仅按当前已生成的 `tools.dalton_*` 动态扇出） | 自动对当前已启用的研究连接器做并发检索 | 自动聚合全部 6 个已启用连接器 |
-| `POST /embed` | 后端嵌入服务模块 `src/dalton/embeddings/`（直接调用 Gemini / OpenAI 兼容 Embedding HTTP API，支持可选独立容器 `DALTON_EMBEDDING_SERVICE_URL`） | 后端 FastAPI 进程内异步客户端（`httpx.AsyncClient`） | 公开仓库 | 配置 `GEMINI_API_KEY` 或 OpenAI 兼容嵌入密钥后随 `conversation_archive` / `company_wiki` 即开即用 | 默认开启，直接复用后端 `GEMINI_API_KEY` |
-| `/transcriptions*`（共 6 个端点） | 独立转写连接器服务 `dalton-transcription`（独立容器/服务进程，复用 `asr_jobs.py` + `seed_asr_client.py` HTTP 契约） | 独立 HTTP 服务容器 `transcription`（监听内部端口 `:8965`），后端 `src/dalton/services/transcriptions.py` 指向 `DALTON_TRANSCRIPTION_SERVICE_URL` | 火山引擎 Seed-ASR 适配器放私有仓库（或按插件挂载），公开仓库保留标准 HTTP 契约与通用 Whisper/OpenAI ASR 适配器 | 在 `docker-compose` 启用 `transcription` profile 并设 `DALTON_CAP_TRANSCRIPTION=true` | 按需开启（独立 `launchd` 或容器服务） |
-| `POST /notify` 与 `POST /feishu/*`、`research(route="discord-history")` | 渠道网关 `integrations/dalton-channel-gateway/`（第 ③ 阶段承接通知、`bot-info`、`chats`、`discord-history`）；飞书文档直连迁入 `src/dalton/feishu_openapi.py` 或网关文档代理 | 渠道网关独立服务（`:8962`）+ 后端飞书文档客户端 | 公开/私有按第 ③ 阶段网关规范划分 | 开启 `channel_gateway` / `feishu_docs` 时生效 | 默认开启（`DALTON_NOTIFY_VIA_GATEWAY=true` 切流） |
-| `GET /jobs/ops` | `scripts/dalton/ops/prod/export_ops_status.py`（定时落盘 JSON 至共享状态目录）+ 后端 `src/dalton/autonomy/system_jobs.py` 读取状态文件 | 宿主机 `launchd` 轻量定时写入状态快照文件 `var/dalton/ops_jobs_status.json` | 公开仓库 `scripts/dalton/ops/prod/`（打包发布时由 `package_release.sh` 剥离） | `core` 形态下 `ops` 列表为空（保持现有行为） | Everflow 宿主定时刷新快照供后端只读展示 |
-| `/internal/{market-digest,ai-finance,data-tasks}/*` 及 `tmeet`/`gcal`/`cn-hk`/`community` | Everflow 宿主自动化执行器 `scripts/dalton/ops/prod/host_task_daemon.py`（承接 `fund_automations` 与 `data_jobs` 宿主任务）；`cn-hk` 拆为可选插件 `dalton-cnhk` | Everflow 宿主机轻量守护进程（仅服务 `fund_automations` 与 `data_jobs`） | 私有仓库 + `scripts/dalton/ops/prod/` | 核心安装关闭 `fund_automations` 与宿主任务；港股/A 股可通过 `dalton-cnhk` 插件按需开启 | 默认开启 |
+| `GET /healthz` | 各宿主机服务各自提供 `/healthz`：`dalton-research-host`（`:8951/healthz`，保留从 JSON `usage_file` 读取当日 AlphaEngine 读文统计与熔断器状态）、`dalton-transcription`（`:8965/healthz`）、`host_task_daemon`（`:8952/healthz`）；缩减桥保留 `:8960/healthz` 至第 ③ 阶段 | 否（按已运行服务各自暴露） | 随各服务对应能力开启 | 第 2–5 批分步就位 | 等价；运维检查脚本按职责分别探活对应端口 |
+| `/mcp` → `catalog` | 各连接器标准 MCP `tools/list` schema + `plugin.json` `instruction`；全局可用源汇总由 `src/dalton/data_map/builder.py` 渲染至 `<data_map>` | 否 | 随各连接器能力开启 | 第 3–4 批 | 等价；Agent 直接在 `<mcp-servers>` 与 `.agents/tools/docs/<server>/` 查看完整参数说明 |
+| `research` → `alphaengine`（全部 9 个操作，含 `auth_status`、`list_filters`）+ `transcript` | 连接器插件 `dalton-alphaengine`（MCP 服务名 `dalton_alphaengine`，`streamable-http` 直连宿主机 `dalton-research-host` `:8951/mcp/alphaengine`） | 是（仅 `DALTON_HOST_PLATFORM=macos`） | `alphaengine` | 第 4 批 | 完全等价；继续走本机 `:8950` `server.mjs`、钥匙串与桌面客户端，宿主机单实例维护 SQLite v4 缓存、单飞、熔断与当日读文 JSON 账本 |
+| `research` → `guidepoint`（`search_library`） | 连接器插件 `dalton-guidepoint`（MCP 服务名 `dalton_guidepoint`，`streamable-http` 直连宿主机 `:8951/mcp/guidepoint`） | 否（商业私有，Linux/macOS 宿主均可部署宿主服务） | `guidepoint` | 第 3 批 | 完全等价；Auth0 刷新令牌仅保存在宿主机 `dalton-research-host` 进程内由唯一异步锁刷新写盘 |
+| `research` → `company-wiki`（`search`/`read`/`list`/`topic`）+ `POST /wiki/ingest` | 检索归插件 `dalton-company-wiki`（MCP 服务名 `dalton_company_wiki`，`streamable-http` 连研究服务 `:8951/mcp/company-wiki`）；入库归 `wiki_tools.py` 调用研究服务受控写口 `POST :8951/ingest/wiki`（核心安装可选运行开源 `dalton-wiki-service` 容器） | 否（公开引擎接口，核心安装可独立开启） | `company_wiki` | 第 3 批 | 完全等价；保留 `params.indexed_since`、`topic`、配图资产引用及幂等文件锁审计，Wiki 库留在研究服务侧受控访问 |
+| `research` → `sales-notes`（`search`/`read`/`list`）+ `POST /sales-notes/ingest` | 检索归私有插件 `dalton-sales-notes`（MCP 服务名 `dalton_sales_notes`，`streamable-http` 连宿主机 `:8951/mcp/sales-notes`）；入库归 `ingest_tools.py` 调宿主机 `POST :8951/ingest/sales-notes` | 是（基金内部交易台邮件库） | `sales_notes` | 第 3 批 | 完全等价；宿主机服务强制限定查询 `sales-notes` 分区，隔离同库其他表 |
+| `research` → `tmtb`（`search`/`read`/`list`） | 私有插件 `dalton-tmtb`（MCP 服务名 `dalton_tmtb`，`streamable-http` 连宿主机 `:8951/mcp/tmtb`；增量同步脚本归 `scripts/dalton/ops/prod/`） | 是 | `tmtb` | 第 3 批 | 完全等价；宿主机服务在 SQL 层强制限定 `message_id LIKE 'alphaengine:%'`，仅启用 `tmtb` 时无法越权读取同库的 `sales-notes` |
+| `research` → `funda-ai`（`search`/`read`/`list`） | 私有插件 `dalton-funda-ai`（MCP 服务名 `dalton_funda_ai`，`streamable-http` 连宿主机 `:8951/mcp/funda-ai`） | 是 | `funda_ai` | 第 3 批 | 完全等价 |
+| `research` → `all`（`search`/`read`/`list`/`get_document`）及兼容路由 `sales-mail` | 宿主机聚合插件 `dalton-research-all`（MCP 服务名 `dalton_research_all`，`streamable-http` 连宿主机 `:8951/mcp/federated`） | 否（随任一已启用的内部研究源自动生效） | 复合门控：`alphaengine \| guidepoint \| company_wiki \| sales_notes \| tmtb \| funda_ai`（其中 `sales_mail` 子工具要求 `sales_notes \| tmtb`） | 第 3 批 | 完全等价；宿主机进程内对当前已启用研究源并行扇出，保留 `alphaengine`、`guidepoint`、`source_status` 顶层字段、按文档 ID 前缀（`wiki:`/`mail:`/`digest:`/`tmtb:`/`funda:`）分派 `read` 全文及 `sales-mail` 跨 `sales-notes`+`tmtb` 检索语义 |
+| `research` → `tmeet`（3 个操作）与 `gcal`（3 个操作） | 合并为私有办公连接器插件 **`dalton-office`**（MCP 服务名 `dalton_office`，`streamable-http` 连宿主机 `:8951/mcp/office`，在宿主机调用 `tmeet` 与 `gws` CLI） | 是 | `fund_automations`（`dalton-tmeet-weekly-minutes` 技能同时校验 `fund_automations,feishu_docs`） | 第 4 批 | 完全等价；保留 `tmeet` 东八区时间转换与 `gcal` 宿主机固定日历 ID 及 tracker 标记核验 |
+| `finance` → `sec`（全部 11 个操作：`list-filings`、`financials`、`ratios`、`facts`、`smart-facts`、`search-concepts`、`search-text`、`read-item`、`attachments`、`eight-k`、`insider`） | **扩展公开插件 `plugins/dalton_sec/`**（MCP 服务名 `dalton_sec`，沙箱 `stdio` 运行，仅需公开合规头 `SEC_USER_AGENT`） | 否（核心安装与 Everflow 默认共用） | `CORE_CAPABILITY`（常驻开启） | 第 3 批 | **数据等价**：基于官方 SEC EDGAR Submissions、CompanyFacts 与归档 HTML/EX-99.1 全文解析补齐原 `findata-analyst` 全部 11 项能力（含 `as_of` 点时过滤、`form` 默认与显式覆盖、`accession` 精确附件读取、章节 `read-item` 与全文关键词窗口 `search-text`） |
+| `finance` → `estimates`（`consensus`，含 `shares_bn`、`tax`） | 私有连接器插件 `dalton-estimates`（MCP 服务名 `dalton_estimates`，`streamable-http` 连宿主机 `:8951/mcp/estimates` 调 `consensus_estimates.sh`） | 是 | 新增 `CapabilityId.ESTIMATES`（`everflow` 默认 `True`，`core` 默认 `False`） | 第 4 批 | **Everflow 完全等价**（保留 `field_status`、分期预期币种与 `implied_model` 复合快照供 `plugins/dalton/skills/dalton-bullbear/scripts/implied_model.py:200` 消费）。**核心安装差异处理**：核心安装关闭 `estimates` 时，技能经 `DALTON_CAP_ELSE` 改调内置 `yf_analysis` 获取分析师预期表，并在 `implied_model.py` 中使用显式命令行参数计算隐含倍数 |
+| `finance` → `cn-hk`（`filings`、`ask`、`quote`） | 私有连接器插件 `dalton-cnhk`（MCP 服务名 `dalton_cnhk`，`streamable-http` 连宿主机 `:8951/mcp/cnhk`） | 是（依赖宿主机 `cn-hk-findata` 运行环境） | 新增 `CapabilityId.CN_HK`（`everflow` 默认 `True`，`core` 默认 `False`） | 第 4 批 | **Everflow 完全等价**。**核心安装差异处理**：`cn_hk` 关闭时，港 A 股行情走内置 `yfinance`（`yf_price`/`yf_fundamentals`），法定公告原文走 `WebSearch`（`site:hkexnews.hk` / `cninfo.com.cn`） |
+| `macro` → `fred`（`macro`，含 `vintage`）与 `treasury`（`dataset="tga" \| "debt"`） | **新增公开插件 `plugins/dalton_macro/`**（MCP 服务名 `dalton_macro`，沙箱 `stdio` 运行；`treasury` 直连美国财政部 Fiscal Data 免密钥公开 API，`fred` 读取可选 `FRED_API_KEY`） | 否（公开插件，随核心包分发） | `CORE_CAPABILITY`（`fred` 无密钥时返回明确配置提示，`treasury` 开箱即用） | 第 3 批 | **完全等价，且与内置 `macro` 明确区分**：内置 `plugins/langalpha_market_data/macro_mcp_server.py:304` 的 `get_treasury_rates` 返回 1M–30Y 国债收益率曲线，而 `dalton_macro.get_fiscal_treasury(dataset="tga"\|"debt")` 返回财政部 TGA 现金余额与联邦债务总额，两者互补并存 |
+| `macro` → `market-regime`（`snapshot`、`us_topbottom`、`crowding`、`cn_leverage`） | 私有连接器插件 `dalton-market-regime`（MCP 服务名 `dalton_market_regime`，`streamable-http` 连宿主机 `:8951/mcp/market-regime` 读取 `data_jobs` 快照） | 是 | `data_jobs` | 第 4 批 | 完全等价；与生产 `data_jobs` 看板产出同源 |
+| `community` → `xueqiu`、`employee`、`last30days`、`x-timeline` | 私有连接器插件 **`dalton-community`**（MCP 服务名 `dalton_community`，`streamable-http` 连宿主机 `:8951/mcp/community`） | 是 | 新增 `CapabilityId.COMMUNITY_SOURCES`（`everflow` 默认 `True`，`core` 默认 `False`） | 第 4 批 | **Everflow 完全等价**（保留雪球、Blind/Glassdoor、`last30days` 及 `xreach` 固定账号时间线的 `oldest_fetched_at` 水位字段）。**核心安装差异处理**：关闭时经 `DALTON_CAP_ELSE` 改用内置 `x_api` 与 `WebSearch`/`scrape`（内置 `x_api` 按搜索 API 返回推文，不含 `xreach` 主页水位字段） |
+| `POST /embed` | 后端内置嵌入模块 `src/dalton/embeddings/`（支持 Gemini 与 OpenAI 兼容 `/v1/embeddings`，及可选外部服务 URL），配库级元数据表 `dalton_embedding_metadata` | 否（公开仓库核心能力底座） | 随 `conversation_archive` 开启 | 第 1 批 | 完全等价；Everflow 锁定 `gemini-embedding-2-preview` + 3072 维 + 原任务类型，核心新装按所选模型维度初始化 |
+| `GET /jobs/ops` | `scripts/dalton/ops/prod/export_ops_status.py`（宿主机定时原子写入 `var/dalton/ops_jobs_status.json`）+ 后端 `src/dalton/autonomy/system_jobs.py` 只读解析 | 是 | ` DALTON_PROFILE=everflow` 且状态文件存在时展示（`core` 返回空列表） | 第 1 批 | 完全等价 |
+| `/transcriptions*`（6 个端点） | 独立转写连接器服务 `dalton-transcription`（监听 `:8965`，独占接管 `var/dalton/asr_jobs/` 与 `asr_usage.jsonl`） | 否（服务框架与客户端公开，Seed-ASR 2.0 凭据按环境注入） | `transcription`（含转写对象存储门控） | 第 2 批 | 完全等价；保留全部 6 个 HTTP 端点、说话人分离逐字稿与历史任务下载路径 |
+| `/internal/market-digest/*` 与 `/internal/ai-finance/*` | 宿主机研究服务受控管理口 `:8951/internal/{market-digest,ai-finance}/*`（与共享 `market-digest/vectors.db` 同进程协调写入） | 是 | `fund_automations` | 第 5 批 | 完全等价 |
+| `/internal/data-tasks/{host-run,host-kill}` | 宿主机独立守护进程 `scripts/dalton/ops/prod/host_task_daemon.py`（监听 `127.0.0.1:8952`，独占持有 `.dalton-host-runner-state.json`） | 是 | `data_jobs` | 第 5 批 | 完全等价；完整保留 `generation`、进程组 `pgid`+`lstart`、`fence_lost`、命令白名单与按任务凭据注入 |
+| `POST /notify`、`POST /feishu/*`（8 个子路径）、`research` → `discord-history` | **第 ② 阶段保留在缩减后的桥进程 `:8960` 上**；第 ③ 阶段整体并入 `integrations/dalton-channel-gateway/` | 否（按渠道能力开关控制） | `channel_feishu`、`feishu_docs`、`channel_discord` | 留待第 ③ 阶段（第 5 批仅缩减桥代码） | 第 ② 阶段零变动、完全等价；第 5 批完成与第 ③ 阶段的解耦 |
 
-### 2.2 研究检索连接器统一返回信封契约（最小化技能改动）
+### 2.2 宿主机研究服务形态选型：单进程多连接器模块 vs 多独立进程
 
-为使现有沙箱技能脚本中的结果提取函数（如 `plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:649-745` 的 `_extract_route_items_with_page_info`）与溯源中间件 `src/dalton/provenance/declared_sources.py:81-120` 直接复用，所有拆分后的研究检索 MCP 连接器统一保持以下顶层 JSON 返回结构：
+根据既定原则，商业研究检索数据与凭据统一留在宿主机侧。针对宿主机服务形态，**推荐采用“单宿主机研究服务进程 `dalton-research-host`（监听 `127.0.0.1:8951`）内按连接器划分独立子应用 `/mcp/<connector>`，仅保留上游 `:8950` `alphaengine-mcp` Node 桥独立运行”**，理由如下：
 
+1. **共享 SQLite 库的单点访问控制与写协调**：`sales-notes`、`tmtb` 与每日 `market-digest` 共用 `<DALTON_RESEARCH_HOME>/skills/market-digest/vectors.db`（`scripts/dalton/research_runtime/scripts/research_library.py:163,172`）。由单一宿主机进程统一管理该库的读写连接并按路由路径 `/mcp/sales-notes` 与 `/mcp/tmtb` 强制附加来源过滤条件，既消除了多进程并发写锁争用，又保证单独开启 `tmtb` 时请求无法触达同库中的销售纪要记录。
+2. **供应商刷新令牌唯一写入方**：Guidepoint 的 Auth0 令牌每次刷新会轮换或更新本地 `guidepoint_mcp_tokens.json`（`scripts/dalton/research_runtime/scripts/guidepoint_mcp_proxy.py:57,99`）。收编进单实例 `dalton-research-host` 后，进程内唯一异步锁即可保证全机只有一个刷新写入方，同时省去原先独立的 `:8943` 代理守护进程。
+3. **AlphaEngine 全局配额、单飞与缓存一致性**：AlphaEngine 的公平并发限流器、SQLite v4 短时搜索缓存（`scripts/dalton/alphaengine_search_cache.py`）、30 分钟同公司软提示、熔断器及 JSON 当日读文计数（`scripts/dalton/researchdata_bridge.py:10897-10935`）需要跨所有工作区沙箱共享同一份内存与本地状态。
+4. **跨库初筛 `all` 零本机二次网络跳转**：`/mcp/federated` 在同一进程内直接按已启用能力并发调用各连接器模块与按前缀读取全文，并保持对外每个连接器各自拥有独立 URL（`http://host.docker.internal:8951/mcp/<connector>`）与独立 `mcp.json` 插件声明——日后若需将任一连接器独立部署到其他机器或容器，只需修改对应连接器的 URL 环境变量，插件包与沙箱代码保持不变。
+
+### 2.3 返回结构契约与完整工具签名
+
+#### （1）对齐真实采集解析器与溯源提取器的返回信封契约
+
+对照 `plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py` 中的真实解析函数：
+- 错误判别：`_extract_non_empty_error`（`:648-660`）与 `_normalize_dict_result`（`:675-744`）；
+- 分页提取：`_extract_route_page_info`（`:946-1004`）；
+- 条目与分页联合提取：`_extract_route_items_with_page_info`（`:1006-1010`）及 `_extract_route_items`（`:1013-1055`）；
+- 溯源展开：`src/dalton/provenance/declared_sources.py:48-120`（`_extract_raw_sources_list` 与 `expand_declared_sources`）。
+
+所有研究与金融连接器严格遵守以下四条字段契约：
+
+1. **结果数组位置**：统一放在顶层 `"results": [...]` 或 `"data": {"structuredContent": {"results": [...]}}`（`guidepoint` 保持 `"data": {"structuredContent": {"data": [...]}}`，`transcript` 保持 `"data": {"transcripts": [...], "coverage": {...}}`，与 `_extract_route_items` `:1023-1053` 完全匹配）。
+2. **扁平分页元数据字段**：在包含 `results` 的同一字典层级直接返回扁平键 `"cursor"`（字符串或 `null`）、`"has_more"`（布尔值）、`"total_upstream"`（整数或 `null`）、`"returned"`（整数），直接匹配 `_extract_route_page_info`（`:957-967`）。
+3. **跨库初筛 `all` 专属字段**：`dalton_research_all.search` 顶层返回 `{"ok": true, "status": "ok", "results": [...], "result_count": int, "alphaengine": {...}, "guidepoint": {...}, "source_status": {...}, "_sources": [...]}`（对齐 `scripts/dalton/researchdata_bridge.py:2511`）。
+4. **溯源字段契约**：`src/dalton/provenance/declared_sources.py:56-60` 优先读取 `"_declared_sources"`（只要该键的值为 `list` 即直接采用并跳过 `"_sources"`）。因此各连接器统一仅写入非空的 `"_sources": [...]`（省略空的 `_declared_sources` 键）；同时在 `src/dalton/provenance/declared_sources.py:13` 的 `_ALLOWED_SERVERS` 中注册全部新连接器服务名（`dalton_alphaengine`、`dalton_guidepoint`、`dalton_company_wiki`、`dalton_sales_notes`、`dalton_tmtb`、`dalton_funda_ai`、`dalton_research_all`、`dalton_office`、`dalton_sec`、`dalton_estimates`、`dalton_cnhk`、`dalton_macro`、`dalton_market_regime`、`dalton_community`）。
+
+标准检索返回示例：
 ```json
 {
   "ok": true,
   "status": "ok",
-  "route": "alphaengine",
-  "operation": "search_library",
   "normalized_params": {
-    "query": "NVDA 英伟达",
+    "query": "宁德时代 300750",
     "start": "2026-10-01",
     "end": "2026-11-24",
     "limit": 20
   },
   "data": {
-    "results": [
-      {
-        "document_id": "ae_doc_123",
-        "title": "...",
-        "published_at": "2026-11-20",
-        "publisher": "...",
-        "snippet": "...",
-        "url": "https://..."
-      }
-    ],
-    "page_info": {
-      "has_more": false,
-      "next_cursor": null
+    "structuredContent": {
+      "results": [
+        {
+          "doc_id": "290001790954279_inst_134249",
+          "title": "...",
+          "publish_time": "2026-11-20",
+          "type_show_name": "机构会议"
+        }
+      ],
+      "cursor": "eyJwYWdlIjoyfQ==",
+      "has_more": true,
+      "total_upstream": 48,
+      "returned": 20
     }
   },
   "_sources": [
     {
       "identity": "broker_report",
       "source_type": "research_doc",
-      "document_id": "ae_doc_123",
+      "document_id": "290001790954279_inst_134249",
       "title": "...",
       "publisher": "...",
       "as_of": "2026-11-20",
       "url": "https://..."
     }
-  ],
-  "_declared_sources": []
+  ]
 }
 ```
 
-- **空结果与错误语义保持一致**：查询成功但无匹配记录时返回 `{"ok": true, "status": "empty", "empty_reason": "no_matching_documents", "data": {"results": []}, "_sources": []}`；上游报错或熔断时返回 `{"ok": false, "status": "error", "error_code": "...", "error": "...", "hint": "..."}`。
-- **溯源白名单同步注册**：在 `src/dalton/provenance/declared_sources.py:13` 的 `_ALLOWED_SERVERS` 集合中注册全部新连接器服务名（`dalton_alphaengine`、`dalton_guidepoint`、`dalton_company_wiki`、`dalton_sales_notes`、`dalton_tmtb`、`dalton_funda_ai`、`dalton_cnhk`），使 `src/ptc_agent/agent/middleware/provenance/middleware.py:1008` 自动将其 `_sources` / `_declared_sources` 展开为 `prov:` 引用锚点。
+#### （2）核心连接器完整工具签名清单
 
-### 2.3 各连接器工具清单、入参出参与鉴权方式
+1. **`dalton-alphaengine`（服务名 `dalton_alphaengine`，宿主机 `:8951/mcp/alphaengine`）**——完整保留原 `alphaengine` 9 个操作与 `transcript` 路由（对照 `scripts/dalton/researchdata_bridge.py:2520-2658,2704-2738`）：
+   - `search_library(query="", ticker=None, start=None, end=None, limit=20, params=None)`：`params` 支持 `cursor`、`sort`（`"relevance"` | `"newest"`）、`search_in`（`"full_text"` | `"title"`）、`meeting_scope`（`"institution"` | `"personal"`）、`document_categories`、`type_ids`、`industry_names`、`company_names`、`company_short_names`、`stock_group_ids`、`first_regions`、`second_regions`、`fresh`（布尔值）。按 `cursor` / `has_more` 翻页。
+   - `get_document(document=None, params=None)`：支持顶层 `document` 或 `params.doc_id`（保留 `_inst_` 后缀）、`params.content_field`（`"auto"` | `"original_text"` | `"content"` | `"digest"` | `"digest_cn"` | `"main_point"` | `"question_answer"`）、`params.offset`、`params.max_chars`（1–30000）、`params.mode`（`"auto"` | `"public"` | `"private"`）；返回 `next_offset` 与 `complete`。
+   - `get_document_info(document=None, params=None)` 与 `list_attachments(document=None, params=None)`：读取文档元数据与可下载附件列表。
+   - `list_recording_tasks(start=None, end=None, limit=20, params=None)`、`get_recording_status(params=None)`、`get_recording_task(params)`：`list_recording_tasks` 支持未来日期对 `date_from`/`date_to`、`industry_ids`、`meeting_scope`、`page`（返回 `next_page` 与 `has_more`）；`get_recording_task` 必填 `params.roadshow_id`。
+   - `list_filters(params=None)`：`params.filter_type` 完整支持 8 类词典——`"categories"`（默认）、`"upstream_categories"`、`"document_types"`（可选 `params.document_code`）、`"sources"`、`"industries"`（可选 `params.document_code`）、`"companies"`（**必填 `params.query`**）、`"regions"`、`"watchlist_groups"`、`"watchlist_stocks"`（**必填 `params.group_id`**）；支持 `params.limit`（1–200）与 `params.offset`（返回 `next_offset`）。
+   - `auth_status()`：探测桌面客户端与钥匙串会话有效状态。
+   - `transcript(ticker, query=None, start=None, end=None, limit=4, params=None)`：`ticker` 必填，可选 `query` 支持 `|` 分隔中英文公司名，`params.fresh` 控制缓存刷新；单次最多扫描 10 页×50 条，返回 `data.transcripts` 与 `data.coverage`（`complete=false` 时产出 `continuation_params` 供 `search_library` 续查）。
 
-#### （1）`dalton-alphaengine`（MCP 服务名：`dalton_alphaengine`，仅 macOS）
-- **形态**：Agent Plugins 1.0.0 插件包（`streamable-http` 类型，连接宿主机 `dalton_alphaengine_server.py`，默认端口 `8951`），内部整合原桥中的 `scripts/dalton/alphaengine_search_cache.py`（SQLite WAL v4 缓存、单飞合并、熔断器、30 分钟同公司软提示、配额账本）并转发至本机 `127.0.0.1:8950`（`server.mjs`）。同时承载原 `alphaengine` 与 `transcript` 两条路由能力。
-- **工具清单**：
-  1. `search_library(query="", start=None, end=None, limit=20, cursor=None, sort=None, search_in=None, document_categories=None, type_ids=None, industry_names=None, meeting_scope=None, fresh=False)`：对应原 `route="alphaengine", operation="search_library"`，出参含 `data.results`、`data.page_info`、`_bridge_cache` 与 `_sources`。
-  2. `get_document(document, content_field=None, offset=0, max_chars=30000)`：分页读取研报或会议纪要正文，支持独立字段翻页，命中当日已读文档免计额度。
-  3. `get_document_info(document)` / `list_attachments(document)`：读取文档元数据与附件列表。
-  4. `search_transcripts(ticker=None, query=None, start=None, end=None, limit=10)`：对应原 `route="transcript"`，定向检索 `IND_SECOND_5FA442AE` 业绩会转写，出参保留 `coverage`（含 `complete` 与 `continuation_params`）。
-  5. `list_recording_tasks(status=None, limit=20)` / `get_recording_status(task_id)` / `get_recording_task(task_id)`：查询个人/机构会议录制状态。
-  6. `list_filters(filter_type)`：读取 `categories`、`types`、`industries` 词典。
-- **鉴权方式**：
-  - 传输层：`Authorization: Bearer ${DALTON_ALPHAENGINE_MCP_TOKEN}`。
-  - 调用方身份透传：直接复用沙箱运行时 `src/ptc_agent/core/sandbox/mcp_client_runtime.py:2165-2198` 的 `_apply_caller_headers`，自动随每次 HTTP 工具调用附带 `X-Dalton-Caller-Token`、`X-Dalton-User`、`X-Dalton-Workspace`、`X-Dalton-Thread`（由后端 `src/dalton/sandbox_caller_identity.py:94-118` 基于 HKDF 派生密钥签发），用于单线程软提示与配额审计。
-  - 上游认证：`server.mjs`（`scripts/dalton/research_runtime/scripts/alphaengine-mcp/server.mjs:112-116`）读取 macOS 钥匙串条目 `dalton-alphaengine` 与 `/Applications/AlphaEngine.app` 本地会话。
+2. **`dalton-company-wiki`（服务名 `dalton_company_wiki`，`:8951/mcp/company-wiki`）**——完整覆盖 4 个操作（对照 `scripts/dalton/researchdata_bridge.py:2739-2791`）：
+   - `list(limit=50, params=None)`：`params` 完整支持 **`indexed_since`**（`YYYY-MM-DD`，供 `dalton-thesis-delta/scripts/collect.py:880-889` 与 `dalton-mark-weekly-newenergy/scripts/mark_weekly.py:590-595` 增量扫描）、`company`、`sector`、`tag`、`media`（`"text"` | `"all"`）。
+   - `search(query=None, ticker=None, start=None, end=None, limit=10, params=None)`：`params` 支持 `company`、`sector`、`tag`、`search_mode`、`no_decay`、`media`、`indexed_since`。
+   - `read(document, params=None)`：按 `wiki:<id>` 读取正文与关联图表，`params` 支持 `offset`、`max_chars`。
+   - `topic(query=None, limit=20, params=None)`：按主题词 `query` 或 `params.tag` 聚合专题目录。
 
-#### （2）`dalton-guidepoint`（MCP 服务名：`dalton_guidepoint`）
-- **形态**：`stdio` MCP 插件（结构同 `plugins/dalton_sec/mcp.json:1-17`），在沙箱 supervisor 内按需拉起 Python 子进程，内部集成原 `scripts/dalton/research_runtime/scripts/guidepoint_mcp_proxy.py:29-185` 的 Auth0 令牌刷新与远端 JSON-RPC 转发逻辑，直连 `https://clapi.guidepoint.io/mcp-server/v1/mcp`。
-- **工具清单**：
-  1. `search_transcripts(query=None, keywords=None, start=None, end=None, limit=10, recency_bias=None)`：返回问答片段列表 `data.results`（每条含访谈日期、专家身份描述、<=20 词合规引用提示及 `_sources` 中 `identity="expert"`）。
-- **鉴权方式**：通过插件 `plugin.json` 声明 `vault_blueprints` 或环境变量注入 `GUIDEPOINT_CLIENT_ID`、`GUIDEPOINT_CLIENT_SECRET`、`GUIDEPOINT_REFRESH_TOKEN`，令牌刷新后缓存在进程内存与持久化凭据文件。
+3. **`dalton-guidepoint`、`dalton-sales-notes`、`dalton-tmtb`、`dalton-funda-ai`、`dalton-research-all`**：
+   - `dalton_guidepoint.search_library(query, ticker=None, start=None, end=None, limit=10, params=None)`：保留 `params.keywords`（1–10 项）、`params.recency_bias`（1–100）、`params.start_date`/`end_date`。
+   - `dalton_sales_notes` / `dalton_tmtb` / `dalton_funda_ai`：各自提供 `search(query, ticker=None, start=None, end=None, limit=15, params=None)`（`params` 含 `sender`、`layer`、`search_mode`、`media`）、`read(document, params=None)`（`offset`、`max_chars`）、`list(limit=50, params=None)`。
+   - `dalton_research_all`：提供 `search`、`read`（按 `wiki:`/`mail:`/`digest:`/`tmtb:`/`funda:` 前缀在宿主机侧校验对应子能力后分派读取全文）、`list` 及兼容入口 `sales_mail(operation, ...)`。
 
-#### （3）`dalton-company-wiki`（MCP 服务名：`dalton_company_wiki`）与后端 Wiki 入库模块
-- **形态**：
-  - 只读检索端：`stdio`（沙箱绑定只读卷 `/mnt/dalton-wiki`）或容器内 `streamable-http` MCP 插件，复用 `scripts/dalton/research_runtime/scripts/research_library.py:162-220` 的混合检索逻辑。
-  - 受控写入端：后端模块 `src/dalton/wiki_store/ingest.py`，由后端直连工具 `ingest_company_wiki`（`src/dalton/tools/wiki_tools.py:676`）与 `ingest_research`（`src/dalton/tools/ingest_tools.py:615`）直接调用，写入 `wiki/` Markdown 文件并通过后端 `src/dalton/embeddings/` 更新 `wiki/vectors.db`。
-- **工具清单（MCP 只读端）**：
-  1. `list_documents(company=None, category=None, limit=50)`：列举公司或主题 Wiki 页面目录。
-  2. `search(query, company=None, start=None, end=None, limit=10)`：向量 + FTS 混合检索，返回 `wiki:<path>` 文档 ID 与摘要。
-  3. `read_document(document, offset=0, max_chars=30000)`：读取指定 `wiki:` 文档全文及关联研究图表路径。
-- **鉴权方式**：沙箱只读文件系统挂载隔离 + 查询嵌入使用 `GEMINI_API_KEY`（或统一嵌入服务密钥）；写入端仅在后端进程内对已认证用户开放，延续现有审计日志 `wiki_ingest_audit.jsonl`。
+4. **公开插件 `plugins/dalton_sec/`（服务名 `dalton_sec`）扩展清单**：
+   - 保留现有 `list_filings`、`get_company_facts`（`plugins/dalton_sec/dalton_sec_mcp_server.py:967`），并在同一公开插件内新增 `get_financials`（支持 `statement="all"|"income"|"balance"|"cash"`）、`get_ratios`、`search_concepts`、`search_smart_facts`、`search_filing_text`（支持 `form`、`window`、`max_matches`）、`read_filing_item`（支持 `form`、`item`、`max_chars` 1–500000）、`get_filing_attachments`（支持 `document` 或 `accession`+`document_type`、`max_chars`）、`list_eight_k_events`、`list_insider_transactions`，完整承接原 `finance(route="sec")` 全部 11 个操作。
 
-#### （4）`dalton-sales-notes`、`dalton-tmtb`、`dalton-funda-ai`（三个内部研究库连接器）
-- **形态**：各自独立的 Agent Plugins 1.0.0 `stdio` MCP 插件包（`dalton_sales_notes`、`dalton_tmtb`、`dalton_funda_ai`），分别封装 `sales_notes_store.py`、`vectors.db`（`alphaengine:%` 分区）与 `funda_ai.py`（`state/funda-ai/index.sqlite`）；`POST /sales-notes/ingest` 迁入后端模块 `src/dalton/sales_notes_store/ingest.py`。
-- **统一工具清单（每个连接器均提供相同签名）**：
-  1. `search(query, ticker=None, start=None, end=None, limit=15, cursor=None)`：返回对应前缀文档 ID（`mail:<id>`、`tmtb:<id>`、`funda:<id>`）、发布时间、来源摘要与 `_sources`。
-  2. `read_document(document, offset=0, max_chars=30000)`：分页读取单篇完整内容。
-- **鉴权方式**：沙箱只读卷挂载对应 SQLite 库文件 + 向量查询密钥（`dalton_funda_ai` 纯 SQLite FTS 检索，零外部密钥依赖）。
+5. **公开插件 `plugins/dalton_macro/`、私有插件 `dalton-estimates` / `dalton-cnhk` / `dalton-market-regime` / `dalton-office` / `dalton-community`**：
+   - `dalton_macro`：`get_fred_series(series, start, end, vintage=None, limit=None)`、`get_fiscal_treasury(dataset, start, end, limit=None)`（`dataset` 为 `"tga"` 或 `"debt"`）。
+   - `dalton_estimates`：`get_consensus(ticker, params=None)`（支持 `shares_bn`、`tax`，原样返回含 `implied_model` 的复合结构）。
+   - `dalton_cnhk`：`filings(ticker, start, end, limit=20)`、`ask(query, limit=20)`、`quote(ticker)`。
+   - `dalton_market_regime`：`get_regime(operation="snapshot", top=10, order="high", category=None, query=None, limit=None)`（支持 `snapshot`、`us_topbottom`、`crowding`、`cn_leverage`）。
+   - `dalton_office`：`tmeet_auth_status()`、`tmeet_record_search(...)`、`tmeet_record_content(...)`、`gcal_list_events(...)`、`gcal_insert_event(...)`、`gcal_delete_event(...)`。
+   - `dalton_community`：`xueqiu(...)`、`employee(...)`、`last30days(...)`、`x_timeline(...)`。
 
-#### （5）后端嵌入模块 `src/dalton/embeddings/`（承接原 `POST /embed`）
-- **设计选型**：将原桥 `handle_embed`（`scripts/dalton/researchdata_bridge.py:15419-15489`）收归后端模块 `src/dalton/embeddings/client.py`，默认在后端进程内通过异步 HTTP 直接调用配置的提供商 API（Everflow 默认使用 `GEMINI_API_KEY` 请求 `gemini-embedding-2-preview` 3072 维向量；核心安装支持配置 Gemini 或 OpenAI 兼容 `/v1/embeddings` 端点，亦可通过 `DALTON_EMBEDDING_SERVICE_URL` 指向外部独立嵌入微服务）。
-- **内部接口**：
-  - `embed_texts(texts: list[str], *, task_type: str = "RETRIEVAL_DOCUMENT") -> tuple[list[list[float]], str]`
-  - `embed_query(query: str) -> list[float] | None`
-- **统一受益方**：`src/dalton/conversations/embedder.py:126-207`、`src/dalton/wiki_store/ingest.py`、`src/dalton/sales_notes_store/ingest.py` 共享同一套重试与限流客户端，解除 `src/dalton/conversations/embedder.py:150` 对 `CapabilityId.RESEARCHDATA_BRIDGE` 的耦合。
+### 2.4 公开仓库与私有仓库边界及唯一插件目录 `DALTON_EXTRA_PLUGINS_DIR` 装配机制
 
-#### （6）独立转写连接器服务 `dalton-transcription`（承接原 `/transcriptions*`）
-- **形态**：将 `scripts/dalton/asr_jobs.py` 与 `scripts/dalton/seed_asr_client.py` 封装为独立轻量化 FastAPI/aiohttp 服务 `dalton-transcription`（容器镜像内置 `ffmpeg`/`ffprobe`），完整保留原 6 个 HTTP 端点契约：
-  - `POST /transcriptions`、`GET /transcriptions/{job_id}`、`GET /transcriptions/{job_id}/result`、`GET /transcriptions/{job_id}/result/raw`、`POST /transcriptions/{job_id}/retry`、`POST /transcriptions/{job_id}/cancel`。
-- **鉴权与配置**：使用独立令牌 `DALTON_TRANSCRIPTION_TOKEN` 与服务地址 `DALTON_TRANSCRIPTION_SERVICE_URL`（如 `http://transcription:8965`）。后端 `src/dalton/services/transcriptions.py:461-584` 仅将基础 URL 与 Bearer Token 切换至转写专属配置；前端 REST 接口 `/api/v1/dalton/transcriptions*`、Agent 工具 `prepare_transcription` 与沙箱脚本 `dalton_asr.py` 保持零改动。
+1. **仓库边界**：
+   - **公开仓库（主仓，进入核心发布包）**：`src/dalton/capabilities.py` 全部能力定义与映射表、`src/dalton/content_assembly.py`、`src/dalton/embeddings/`、转写 HTTP 客户端 `src/dalton/services/transcriptions.py`、公开数据插件 `plugins/dalton_sec/` 与 `plugins/dalton_macro/`、`dalton-company-wiki` 插件声明与开源版轻量 Wiki 服务实现。
+   - **私有仓库（`dalton-connectors`）**：宿主机 `dalton-research-host` 商业服务端代码（AlphaEngine 缓存与上游对接、Guidepoint Auth0 令牌管理、销售纪要/TMTB/Funda AI/市场摘要/AI Finance/一致预期/港 A 股/社区爬虫/办公 CLI 封装）、火山引擎 Seed-ASR 2.0 转写后端，以及商业连接器的插件声明目录 `plugins/dalton_*`（仅含 `plugin.json`、`mcp.json` 与技能 Markdown，零服务端密钥）。
 
-#### （7）渠道网关交接边界（`/notify`、`/feishu/*`、`discord-history` —— 第 ③ 阶段衔接）
-- **通知推送（`POST /notify`）**：后端 `src/dalton/notify/dispatch.py:1985-2080` 已内置 `DALTON_NOTIFY_VIA_GATEWAY` 切换分支（`src/dalton/settings.py:1473-1486`）。第 ③ 阶段在 `integrations/dalton-channel-gateway/` 补齐卡片发送回执对齐后（网关侧具体路由命名待核实），将 `DALTON_NOTIFY_VIA_GATEWAY` 默认值切为 `true`，随即下线桥上 `/notify`。
-- **飞书机器人与群目录（`POST /feishu/bot-info`、`POST /feishu/chats`）**：归属渠道连通性元数据，移交 `integrations/dalton-channel-gateway/` 的飞书适配器对外暴露，供 `src/dalton/app/router.py:2563` 与 `src/dalton/notify/groups.py:28-56` 调用。
-- **飞书知识库与文档读写（`POST /feishu/doc/*`、`POST /feishu/wiki/*`）**：由 `src/dalton/feishu.py:106-167` 切换至渠道网关文档代理端点（或后端基于 `FEISHU_APP_ID`/`FEISHU_APP_SECRET` 直连飞书开放平台 OpenAPI），保持 `src/dalton/tools/feishu_tools.py` 的 6 个工具入参出参不变，能力继续受 `CapabilityId.FEISHU_DOCS` 独立控制。
-- **Discord 频道历史拉取（`research(route="discord-history")`）**：并入渠道网关 Discord 通道只读历史接口，供 `dalton-wiki-auto-ingest` 通过网关或专用 MCP 工具读取。
+2. **私有插件目录唯一命名与四步装配链路**：
+   全文统一使用单一环境变量 **`DALTON_EXTRA_PLUGINS_DIR`**（指向单个目录路径，Everflow 生产在 `docker-compose.dalton.yml` 中将私有仓库的 `plugins/` 目录只读挂载至 `backend` 容器的 `/opt/dalton-extra-plugins` 并设置 `DALTON_EXTRA_PLUGINS_DIR=/opt/dalton-extra-plugins`）：
+   - **① 插件发现入口**：扩展 `src/ptc_agent/config/plugins.py:100-125` 的 `_bundle_dirs()`，先扫描内置 `BUNDLES_DIR`（`plugins/`），当 `DALTON_EXTRA_PLUGINS_DIR` 设置且目录可读时继续按目录名排序追加扫描；若包名与内置包重名则记录错误并拒绝覆盖。所有私有连接器名称提前静态写入 `src/dalton/capabilities.py:603-637` 的 `MCP_SERVER_CAPABILITY_MAP` 与 `BUNDLED_PLUGIN_CAPABILITY_MAP`，避免未知服务名在 `is_mcp_server_enabled_by_capability`（`:640-653`）中被默认放行。
+   - **② 沙箱代码与包装器同步**：私有连接器在 `mcp.json` 中均为 `type: "streamable-http"`（`auth` 为 `None`，`relay_bound=False`，见 `src/ptc_agent/config/core.py:362-373`），跳过 `src/ptc_agent/core/sandbox/assets.py:669-720` 的单文件 `stdio` 上传路径；后端连接宿主机 `:8951/mcp/<connector>` 拉取工具 schema 后，由 `ToolFunctionGenerator` 在沙箱生成 `tools/dalton_*.py` 包装模块。插件包内附带的技能目录均包含合规 `SKILL.md`，经 `src/ptc_agent/core/sandbox/assets.py:314-335` 自动同步并完成 `DALTON_CAP` 条件裁剪。
+   - **③ 共享采集传输辅助模块分发**：沙箱技能共用的连接器路由分派函数直接放在 `plugins/dalton/skills/dalton-conventions/scripts/connector_transport.py`（位于带 `SKILL.md` 的核心常驻技能 `dalton-conventions` 内，随 `src/ptc_agent/core/sandbox/assets.py:314-335` 同步进每一个沙箱，并保留在 `scripts/standalone/package_release.sh:282-288` 核心导出树内）。
+   - **④ 核心发布包剥离规则**：`scripts/standalone/package_release.sh:152-165,282-310` 维持显式白名单归档：移除归档后的 `plugins/dalton_data`、`scripts/dalton/researchdata_bridge.py`、`scripts/dalton/research_runtime`、`scripts/dalton/ops`；将新增公开插件 `plugins/dalton_macro` 加入白名单；`DALTON_EXTRA_PLUGINS_DIR` 位于仓库树外部，导出的核心包天然不含任何商业连接器文件。
 
-#### （8）生产运维状态与宿主自动化脚本（`/jobs/ops` 与 `/internal/*`）
-- **`/jobs/ops` 归入 `scripts/dalton/ops/prod/`**：新增宿主机脚本 `scripts/dalton/ops/prod/export_ops_status.py`，由 `launchd` 每 5 分钟执行一次，读取 `launchctl` 中 `com.dalton.pg-backup`、`com.dalton.backend-watchdog` 等宿主任务状态并原子写入 `<repo>/var/dalton/ops_jobs_status.json`。后端 `src/dalton/autonomy/system_jobs.py:261-315` 改为直接读取该状态文件（文件存在且 `DALTON_PROFILE=everflow` 时展示），彻底解除后端系统任务页对桥 HTTP 端口的调用。
-- **`/internal/{market-digest,ai-finance,data-tasks}/*`**：抽取为宿主机专属执行守护脚本 `scripts/dalton/ops/prod/host_task_daemon.py`（仅保留进程组受控拉起与摘要文件准备，约 800 行），随 `fund_automations` 与 `data_jobs` 在 Everflow Mac 上运行。
+### 2.5 嵌入模块与库级维度锁定设计（承接 `/embed`）
 
-### 2.4 公开仓库与私有仓库边界
+核查现有代码：`src/dalton/migrations/versions/d009_conversation_archive.py:60,71-74` 将 `dalton_conversation_cards.embedding` 固定定义为 `vector(3072)` 与 `halfvec(3072)` HNSW 索引，`src/dalton/database/conversations.py:534,546,550` 在 SQL 查询中写死 `halfvec(3072)`，且 `src/dalton/conversations/search.py:262-275` 在向量查询报错时仅记录 warning 并静默退回关键词检索。
 
-| 资产类别 | 公开仓库（`langalpha` / 核心发行包）保留内容 | 私有仓库（`dalton-connectors`）承载内容 |
-|---|---|---|
-| 能力与配置开关 | `src/dalton/capabilities.py` 全部 `CapabilityId` 枚举、`MCP_SERVER_CAPABILITY_MAP`、`BUNDLED_PLUGIN_CAPABILITY_MAP`、`src/dalton/dalton.core.yaml` | Everflow 生产环境变量模板与商业上游端点配置 |
-| 内容装配与文档门控 | `src/dalton/content_assembly.py`、`src/dalton/data_map/sources.yaml`、`plugins/dalton/skills/**` 中的 `<!-- DALTON_CAP:... -->` 标记 | 基金专属私有工作流脚本与内部花名册配置 |
-| 通用公共连接器与基础设施 | `plugins/dalton_sec/`、`src/dalton/embeddings/`、`src/dalton/wiki_store/`（通用 Markdown+SQLite Wiki 引擎）、`scripts/dalton/research_runtime/scripts/federated_search.py`、转写服务标准 HTTP 客户端 `src/dalton/services/transcriptions.py` | `dalton-alphaengine`（含 `server.mjs` 与 SQLite 缓存服务）、`dalton-guidepoint`、`dalton-sales-notes`、`dalton-tmtb`、`dalton-funda-ai`、`dalton-cnhk`、火山引擎 Seed-ASR 2.0 后端实现 |
-| 发布剥离校验 | `scripts/standalone/package_release.sh:66-195` 白名单导出机制，确保导出的核心包零私有代码与零内部标识残留 | 通过独立私有部署流水线（软链或插件挂载目录 `DALTON_EXTRA_PLUGINS_DIR`）注入 Everflow 生产或付费客户环境 |
+为此，`src/dalton/embeddings/` 采用**库级元数据锁定 + 动态维度建库与查询**机制：
+1. **元数据表结构（迁移 `d050`）**：在 Postgres 新建 `dalton_embedding_metadata` 表，主键 `scope`（如 `'conversations'`），列包含 `provider`、`model_name`、`dimensions`（正整数约束）、`task_type_doc`、`task_type_query`、`created_at`、`updated_at`（宿主机 Wiki SQLite `vectors.db` 同步维护同结构 `embedding_metadata` 表）。
+2. **Everflow 生产保持 3072 维零变动**：升级执行 `d050` 时，若 `dalton_conversation_cards` 已存在记录或当前运行于 `everflow` 形态，迁移自动写入锁定行 `(scope='conversations', provider='gemini', model_name='gemini-embedding-2-preview', dimensions=3072, task_type_doc='RETRIEVAL_DOCUMENT', task_type_query='RETRIEVAL_QUERY')`，原有 `vector(3072)` 列与 `ix_dalton_conv_cards_embedding_hnsw` 索引原样保留。
+3. **核心安装按所选模型初始化维度**：核心新装首次启用 `conversation_archive` 时，初始化逻辑读取配置的模型与维度 `dim`（如 OpenAI `text-embedding-3-small` 的 `1536` 维或 `3072` 维），在空表状态下执行 `ALTER TABLE dalton_conversation_cards ALTER COLUMN embedding TYPE vector(<dim>)` 并重建 `USING hnsw ((embedding::halfvec(<dim>)) halfvec_cosine_ops)` 索引，随后写入 `dalton_embedding_metadata` 锁定该库维度。
+4. **维度一致性强校验与显式报错**：后端启动及每次调用 `embed_texts` / `search_cards_dense` 前，强制比对当前配置的 `(model_name, dimensions)` 与 `dalton_embedding_metadata` 锁定值；发现差异时立即抛出致命配置错误（在 `src/dalton/conversations/search.py:262-275` 中对维度/元数据异常直接上抛告警，保持与瞬态超时区分）。`src/dalton/database/conversations.py:534-558` 读取经白名单整数校验后的已锁定 `dim` 构造 `halfvec(<dim>)` 余弦距离查询。
 
 ---
 
 ## 3. 调用方迁移
 
-### 3.1 沙箱技能脚本的调用机制演进
+### 3.1 沙箱技能传输层演进与防越权回退规则
 
-核查现有代码可见，沙箱技能脚本已完成从裸 HTTP 向 PTC MCP 包装器的主体过渡：
-- `plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:569-646` 中的 `resolve_researchdata_transport()` 默认优先导入沙箱自动生成的 `tools.researchdata` 模块并通过 `mcp_client.call_mcp_tool_with_error_flag("researchdata", ...)` 发起调用（`mode == "wrapper"`），仅在显式注入 `DALTON_RESEARCHDATA_URL` 时回退到直连 HTTP。
-- `dalton-mark-weekly-newenergy/scripts/rd_transport.py:50-115` 与 `dalton-richard-coverage-weekly/scripts/richard_cov_transport.py:12-45` 已完全使用 `tools.researchdata` / `mcp_client` 包装器模式。
+1. **修正现状认知**：当前 `plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:569-578` 的 `resolve_researchdata_transport()` 逻辑为**显式设置环境变量 `DALTON_RESEARCHDATA_URL` 时优先走直连 HTTP 桥（覆盖模式）**，缺省时导入沙箱包装模块 `tools.researchdata` 经 `mcp_client.call_mcp_tool_with_error_flag` 调用。
+2. **新共享适配层 `plugins/dalton/skills/dalton-conventions/scripts/connector_transport.py`**：
+   - 读取沙箱工作区 `.agents/tools/mcp_client_config.json`（同 `plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:595-627`）获取当前工作区已启用的 MCP 服务集合 `enabled_servers`。
+   - **单源调用 `call_source_connector(source_id, operation, **kwargs)`**：
+     - 若目标新连接器（如 `dalton_alphaengine`、`dalton_guidepoint`、`dalton_company_wiki`、`dalton_sales_notes`、`dalton_tmtb`、`dalton_funda_ai`、`dalton_sec`、`dalton_cnhk`、`dalton_estimates`、`dalton_office`、`dalton_community`）在 `enabled_servers` 中，则直接经 `call_mcp_tool_with_error_flag` 调用该连接器的对应工具（显式调试覆盖变量按连接器独立命名为 `DALTON_CONNECTOR_URL_<NAME>`）。
+     - **受控过渡回退规则**：兼容过渡期内，仅当旧 `researchdata` 仍在 `enabled_servers` 中、**且**旧桥侧 `is_bridge_route_enabled(route_id)`（`src/dalton/capabilities.py:789-801`）与宿主机服务端路由门控同时校验该子路由对应的 `CapabilityId` 处于开启态时，才允许回退调用 `researchdata`；若某子能力已被管理员关闭，新连接器从 `enabled_servers` 隐去且旧桥路由门直接拒绝该 `route`，采集脚本收到明确的能力关闭状态并跳过该源。
 
-拆分后，沙箱技能采用 **PTC MCP 连接器包装器直调 + 共享路由适配层** 方案：
-1. 沙箱启动时，`ToolFunctionGenerator`（`src/ptc_agent/core/tool_generator.py:734-760`）自动为当前工作区已启用的每个连接器生成 `tools/dalton_alphaengine.py`、`tools/dalton_guidepoint.py`、`tools/dalton_company_wiki.py`、`tools/dalton_sales_notes.py`、`tools/dalton_tmtb.py`、`tools/dalton_funda_ai.py`。
-2. 在共享运行时新增轻量适配模块 `plugins/dalton/skills/_shared/connector_transport.py`，提供统一入口 `call_research_source(source, operation, **kwargs)`：
-   - **优先路径（新连接器）**：检测 `mcp_client` 中对应的新服务名（如 `dalton_alphaengine`、`dalton_guidepoint` 等）已挂载时，直接调用 `mcp_client.call_mcp_tool_with_error_flag("dalton_<source>", mapped_tool, args)`。
-   - **兼容路径（过渡期回退）**：当新连接器尚未挂载而旧 `researchdata` 包装器仍存在时，自动回退调用 `mcp_client.call_mcp_tool_with_error_flag("researchdata", "research", {"route": source, "operation": operation, ...})`。
-   - **能力关闭优雅跳过**：当新旧服务均未挂载（说明该数据源能力在当前实例已关闭），立即返回 `{"ok": true, "status": "skipped_disabled_capability", "data": {"results": []}}`，采集脚本自动跳过该源并继续执行其余已启用数据源。
+### 3.2 沙箱技能、工作流与内置插件调用点迁移全表
 
-### 3.2 需迁移的沙箱技能与提示词逐项清单
+| 类别 | 文件路径与精确行号 | 当前调用内容 | 迁移目标与改动说明 |
+|---|---|---|---|
+| 采集脚本 | `plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:569-646,870-944` | `resolve_researchdata_transport`（`:569`）、6 个内部研究路由（`:870-929`，含 Wiki `indexed_since`）、`finance(route="sec", operation="list-filings")`（`:932-943`） | 切换至 `connector_transport.py` 分派 6 个研究连接器；`:932-943` 改调 `tools.dalton_sec.list_filings` |
+| 采集脚本 | `plugins/dalton/skills/dalton-bullbear-tracker/scripts/collect.py:157-158,600-601,1410-1418,1523,1915,2011,2198,2238,2733` | 复用 `thesis-delta` 传输层；`:1410-1418` 调 `research(route="all", operation="read")`；`:2198,2238` 调 `community`（`xueqiu`/`employee`/`last30days`/`x-timeline`） | 研究源走各连接器；`:1410-1418` 全文读取改调 `tools.dalton_research_all.read`；社区调用改调 `tools.dalton_community`（关闭时降级 `x_api`） |
+| 采集脚本 | `plugins/dalton/skills/dalton-sector-delta/scripts/collect_sector.py:89-90,182,376,386` | 导入 `thesis-delta` 传输函数采集内部研究源 | 改用 `connector_transport.py` 按已启用研究连接器并发采集 |
+| 周报脚本 | `plugins/dalton/skills/dalton-mark-weekly-newenergy/scripts/rd_transport.py:50-115` 及 `plugins/dalton/skills/dalton-mark-weekly-newenergy/scripts/mark_weekly.py:590-620,1918,2323` | `plugins/dalton/skills/dalton-mark-weekly-newenergy/scripts/mark_weekly.py:590-595` 调 `company-wiki` `list`(`indexed_since`)，`:600-603` 调 `all` `read`，`:610-619` 调 `alphaengine` `get_document` | `rd_transport.py` 委托 `connector_transport.py`，分别路由至 `dalton_company_wiki`、`dalton_research_all.read`、`dalton_alphaengine` |
+| 周报脚本 | `plugins/dalton/skills/dalton-richard-coverage-weekly/scripts/richard_cov_transport.py:12-45`、`plugins/dalton/skills/dalton-richard-coverage-weekly/scripts/sales_notes_search.py:44,124,192-210,405-421`、`plugins/dalton/skills/dalton-richard-coverage-weekly/scripts/richard_coverage_weekly_cli.py:1216-1224,1435,1503` | `plugins/dalton/skills/dalton-richard-coverage-weekly/scripts/sales_notes_search.py:199-207` 调 `route="all", operation="read"` 读四库全文；`plugins/dalton/skills/dalton-richard-coverage-weekly/scripts/richard_coverage_weekly_cli.py:1435,1503` 调 `community` | `sales_notes_search.py` 改调各库连接器与 `dalton_research_all.read`；周报 CLI 社区调用切至 `dalton_community` |
+| 周报脚本 | `plugins/dalton/skills/dalton-humanoid-robot-weekly/scripts/humanoid_robot_weekly.py:148-170` | 构造 `guidepoint`（`:148-159`）与 `x-timeline`（`:160-170`）调用计划 | 调用计划改为指向 `dalton_guidepoint.search_library` 与 `dalton_community.x_timeline`（带 `DALTON_CAP` 门控） |
+| 周报脚本 | `plugins/dalton/skills/dalton-china-consumer-weekly/scripts/china_consumer_weekly.py:1110-1125` | 输出 `alphaengine`、`guidepoint`、`cn-hk`、`xueqiu`/`last30days` 调用指令 | 按 `effective_capabilities` 或新连接器工具名输出 `dalton_alphaengine`、`dalton_guidepoint`、`dalton_cnhk`、`dalton_community` 调用指引 |
+| 周报脚本 | `plugins/dalton/skills/dalton-global-consumer-weekly/scripts/global_consumer_weekly.py:1143-1147` | 输出 `alphaengine`、`guidepoint`、`last30days`、`sec` 调用指令 | 分别改为 `dalton_alphaengine`、`dalton_guidepoint`、`dalton_community.last30days`、`dalton_sec.list_filings` |
+| 周报/估值脚本 | `plugins/dalton/skills/dalton-tob-industry-weekly/scripts/tob_industry_weekly.py:241`、`plugins/dalton/skills/dalton-bullbear/scripts/implied_model.py:21,200` | `tob` 引用 `finance()` 取公告；`implied_model.py` 读取 `estimates` 快照 JSON | `tob` 指向 `dalton_sec` / `dalton_cnhk`；`implied_model.py` 兼容 `dalton_estimates.get_consensus` 快照与核心安装显式参数模式 |
+| 办公与入库脚本 | `plugins/dalton/skills/dalton-tmeet-weekly-minutes/scripts/tmeet_minutes.py:85-89,358-501`、`plugins/dalton/skills/dalton-richard-earnings/scripts/richard_earnings.py:195-199,565-840`、`plugins/dalton/skills/dalton-wiki-auto-ingest/scripts/wiki_ingest.py:91-95,475,719`、`plugins/dalton/skills/dalton-stock-move/scripts/cn_price_fallback.py:253-277` | 分别调 `tmeet`、`gcal`、`company-wiki`+`discord-history`、`cn-hk` | `tmeet_minutes.py` 与 `richard_earnings.py` 改调 `tools.dalton_office`；`wiki_ingest.py` Wiki 读取改调 `tools.dalton_company_wiki`（`discord-history` 第 ③ 阶段随网关切换）；`cn_price_fallback.py` 改调 `tools.dalton_cnhk` |
+| 转写 CLI 脚本 | `plugins/dalton/skills/dalton-transcript-polish/scripts/dalton_asr.py:49,382-588` | 仅调用后端 `/api/v1/dalton/transcriptions*` | 后端 API 路径与载荷完全不变，原脚本直接沿用 |
+| JS 工作流与契约 | `workflows/topic-research/workflow.js:165,181-186,194,201-208,220,243,260,276` + `contract.json`、`workflows/bullbear-doc/workflow.js:249`、`workflows/initial-coverage/workflow.js:321` | 使用 `/* DALTON_CAP:researchdata_bridge */` 门控四库检索支线并硬编码 `检索 researchdata 的 sales-notes...` | 条件表达式改为 `company_wiki\|sales_notes\|tmtb\|funda_ai`（`content_assembly.py:281-353` 同步改为同一条件），提示词改为按已启用连接器调用 |
+| 内置市场数据插件 | `plugins/langalpha_market_data/fundamentals_mcp_server.py:845-858` | `DALTON-HOOK(market-data-fallback)` 注释与工具文档串指引美股优先调 `finance(route="sec", operation="financials")` | 文档串更新为指引调用公开连接器 `dalton_sec.get_financials`（并同步刷新 `agent_docstring_lock.json`） |
+| 全部技能 Markdown 与规则模板 | 涵盖 `plugins/dalton/agents/dalton-evidence.md:5,22-69`、`dalton-daily-filing-alert/SKILL.md:63-80`（调 `cn-hk` `filings`）、`dalton-short-screen/{SKILL.md,references/four-dimensions.md}`、`dalton-tob-industry-weekly/{SKILL.md,references/source-universe.yaml}`、`dalton-global-consumer-weekly/SKILL.md`、`dalton-china-consumer-weekly/{SKILL.md,references/source-universe.yaml}`、`dalton-humanoid-robot-weekly/SKILL.md`、`dalton-ai-app-weekly-monitor/{SKILL.md,references/backfill-protocol.md}`、`dalton-stock-move/{SKILL.md,references/peer-groups.md}`、`dalton-bullbear-tracker/references/{common,amzn,googl,meta,msft,ant,spcx}-rules.md`、`dalton-init-company/templates/{data_consensus_README,sources_README}.md`、`dalton-conventions/`、`dalton-bullbear/`、`dalton-earnings-{calendar,preview,flash,deep}/`、`dalton-filing-review/`、`dalton-financial-lenses/`、`dalton-company-background/`、`dalton-initial-coverage/`、`dalton-full-coverage/`、`dalton-topic-research/`、`dalton-weekly-review/`、`dalton-ct-semi-sentiment/`、`dalton-x-accounts-daily/`、`dalton-vip-news-alert/`、`dalton-tmeet-weekly-minutes/SKILL.md`（新增 `DALTON_CAP:fund_automations,feishu_docs`） | 使用笼统的 `<!-- DALTON_CAP:researchdata_bridge -->` 及 `researchdata.<tool>(route=...)` 调用示例 | 按具体能力拆分为细粒度 `<!-- DALTON_CAP:alphaengine -->`、`<!-- DALTON_CAP:company_wiki\|sales_notes\|tmtb\|funda_ai -->`、`<!-- DALTON_CAP:cn_hk -->`、`<!-- DALTON_CAP:estimates -->`、`<!-- DALTON_CAP:community_sources -->` 等标签；SEC 调用统一改为 `dalton_sec.*`（常驻无需门控），宏观 TGA/FRED 改为 `dalton_macro.*` |
 
-| 技能 / 文件路径 | 当前调用位置与方式 | 迁移改动内容 |
+### 3.3 后端、前端与宿主机运维脚本迁移全表
+
+| 模块 / 脚本路径与行号 | 当前逻辑 | 迁移改动说明 |
 |---|---|---|
-| `plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py` | `:569-646`（`resolve_researchdata_transport`）、`:855-925`（6 个研究路由采集）、`:932-943`（`finance(route="sec")`） | `resolve_researchdata_transport` 接入共享适配层 `connector_transport.py`，6 个研究源按各自连接器名调用；`:932-943` 的美股 SEC 检索切至核心内置 `tools.dalton_sec` |
-| `plugins/dalton/skills/dalton-bullbear-tracker/scripts/collect.py` | `:157`、`:600-601`、`:2733`（复用 `thesis-delta` 传输层）、`:2198` 与 `:2238`（`community` 路由） | 随 `connector_transport.py` 自动切至各独立连接器；社区路由按能力检测调用或降级至内置 `x_api` / `scrape` |
-| `plugins/dalton/skills/dalton-sector-delta/scripts/collect_sector.py` | `:89-90`（导入 `thesis-delta` 的 `call_bridge_jsonrpc` 与 `resolve_researchdata_transport`） | 改为导入 `_shared/connector_transport.py` 的 `call_research_source`，按已启用连接器动态构建采集任务列表 |
-| `plugins/dalton/skills/dalton-mark-weekly-newenergy/scripts/rd_transport.py` | `:50-115`（调用 `tools.researchdata` 的 `alphaengine`、`sales-notes` 等） | 切换至 `connector_transport.py`，优先调用 `dalton_alphaengine` 与 `dalton_sales_notes` |
-| `plugins/dalton/skills/dalton-richard-coverage-weekly/scripts/richard_cov_transport.py` 及 `plugins/dalton/skills/dalton-richard-coverage-weekly/scripts/richard_coverage_weekly_cli.py` | `plugins/dalton/skills/dalton-richard-coverage-weekly/scripts/richard_cov_transport.py:12-45`、`plugins/dalton/skills/dalton-richard-coverage-weekly/scripts/richard_coverage_weekly_cli.py:1435,1503` | 研究源切至 `connector_transport.py`；X 时间线优先走内置 `tools.x_api` |
-| `plugins/dalton/skills/dalton-tmeet-weekly-minutes/scripts/tmeet_minutes.py` | `:87`、`:358-501`（`from tools.researchdata import research` 调 `route="tmeet"`） | 切换至独立小插件 `dalton_tmeet`（或宿主自动化工具），仅在 `fund_automations` 开启时运行 |
-| `plugins/dalton/skills/dalton-richard-earnings/scripts/richard_earnings.py` | `:197`、`:565-840`（`from tools.researchdata import research` 调 `route="gcal"`） | 切换至 `dalton_gcal` 连接器工具，受 `fund_automations` 门控 |
-| `plugins/dalton/skills/dalton-wiki-auto-ingest/scripts/wiki_ingest.py` | `:93`、`:475`、`:719`（调 `company-wiki` 与 `discord-history`） | Wiki 查重读取改调 `tools.dalton_company_wiki`；Discord 历史读取在第 ③ 阶段切至渠道网关接口 |
-| `plugins/dalton/skills/dalton-stock-move/scripts/cn_price_fallback.py` | `:253-277`（调 `researchdata.finance(route="cn-hk")`） | 优先检测 `tools.dalton_cnhk`，缺省时走公开行情兜底 |
-| `plugins/dalton/skills/dalton-transcript-polish/scripts/dalton_asr.py` | `:49`、`:382-588`（调用后端 `/api/v1/dalton/transcriptions*`） | 保持现有后端 API 调用方式，原脚本代码直接沿用 |
-| 技能 Markdown 与参考文档（`plugins/dalton/agents/dalton-evidence.md:5,22-36`、`dalton-conventions/`、`dalton-bullbear/`、`dalton-earnings-{preview,flash,deep}/`、`dalton-full-coverage/`、`dalton-weekly-review/`、`dalton-financial-lenses/`、`dalton-filing-review/`、`dalton-company-background/`、`dalton-ai-app-weekly-monitor/`） | 原使用 `<!-- DALTON_CAP:researchdata_bridge -->` 包裹内部四库与调用示例（如 `dalton-bullbear/SKILL.md:29-55`、`dalton-weekly-review/references/core-five-sources.md:17-47`） | 将笼统的 `<!-- DALTON_CAP:researchdata_bridge -->` 细化为具体来源能力标签（如 `<!-- DALTON_CAP:company_wiki|sales_notes|tmtb|funda_ai -->`、`<!-- DALTON_CAP:alphaengine -->`、`<!-- DALTON_CAP:guidepoint -->`），并将代码示例更新为对应连接器工具名；美股 SEC 示例统一指向 `dalton_sec` 与 `get_sec_filing` |
+| `src/dalton/settings.py:1090-1151,1227,1263,1324,1419-1435` | 集中解析 `DALTON_RESEARCHDATA_URL`、`DALTON_BRIDGE_URL`、`DALTON_BRIDGE_TOKEN`、`DALTON_BRIDGE_ADMIN_TOKEN` 且强校验 `RESEARCHDATA_BRIDGE` | 新增 `get_dalton_research_host_url()`、`get_dalton_transcription_service_url()`、`get_dalton_host_runner_url()` 及对应独立 Token 读取函数；保留 `get_dalton_bridge_base_url()` 专供缩减后的飞书/通知桥使用直至第 ③ 阶段 |
+| `src/dalton/conversations/embedder.py:75-207`、`src/dalton/database/conversations.py:525-558`、`src/dalton/conversations/search.py:250-285` | 调桥 `/embed`（`:150-151` 强校验 `RESEARCHDATA_BRIDGE`），写死 `halfvec(3072)`，向量报错静默退回关键词 | 改为调用后端 `src/dalton/embeddings/client.py`；读取 `dalton_embedding_metadata` 校验模型与维度并动态构造 `halfvec(<dim>)` 查询；维度不匹配显式报错 |
+| `src/dalton/autonomy/system_jobs.py:232-315` | `_fetch_ops_jobs` 调桥 `GET /jobs/ops`（校验 `RESEARCHDATA_BRIDGE`） | 改为读取宿主机定时导出的 `var/dalton/ops_jobs_status.json`（校验 `resolve_profile() == DeploymentProfile.EVERFLOW`） |
+| `src/dalton/services/transcriptions.py:461-584,2038-2075` | `_require_transcription_bridge_url` 校验 `RESEARCHDATA_BRIDGE` 并调桥 `/transcriptions*` | 改为校验 `CapabilityId.TRANSCRIPTION` 并请求 `DALTON_TRANSCRIPTION_SERVICE_URL` + `DALTON_TRANSCRIPTION_TOKEN` |
+| `src/dalton/tools/__init__.py:94-143,370-410`、`src/dalton/tools/wiki_tools.py:447-485`、`src/dalton/tools/ingest_tools.py:72-105,578-677` | `ingest_research` 门控为 `RESEARCHDATA_BRIDGE`（`:400`）；入库 POST 到旧桥 `:8960` | `ingest_research` 门控改为 `has_capability(COMPANY_WIKI) or has_capability(SALES_NOTES)`；入库请求指向 `dalton-research-host` `:8951/ingest/{wiki,sales-notes}`；`market_digest_*` 与 `ai_finance_*`（`:94-143`）指向 `:8951/internal/*` |
+| `web/src/pages/ChatAgent/components/dalton/AutoIngestToggle.tsx:26` 与 `plugins/langalpha_service/skills/langalpha-doc/references/settings-map.md:27` | `hasCapability('researchdata_bridge')` 控制工作区自动入库按钮与帮助表 | 改为 `hasCapability('company_wiki') \|\| hasCapability('sales_notes')`，帮助文档标签改为 `<!-- DALTON_CAP:company_wiki\|sales_notes -->` |
+| `src/dalton/data_map/builder.py:287-355,488-503`、`src/dalton/data_map/health.py:173-235,790-1060`、`src/dalton/data_map/sources.yaml:1-140` | `builder.py:288` 在 `RESEARCHDATA_BRIDGE` 关闭时直接返回空列表 `[]`；`:325` 调 `is_bridge_route_enabled` | 解除 `:288` 对 `RESEARCHDATA_BRIDGE` 的一刀切返回，改为按各连接器各自 `CapabilityId` 合并渲染与健康探测；更新 `sources.yaml` 各条目的 `capability` 与调用示例 |
+| `src/dalton/content_assembly.py:231-254,267-365` | `assemble_markdown_text`（`:240-253`）与 `assemble_json_text`（`:284,306`）在 `RESEARCHDATA_BRIDGE` 关闭时强制替换“内部研究库”文案并裁剪 JSON 契约 | 触发条件改为“内部四库连接器能力（`company_wiki`、`sales_notes`、`tmtb`、`funda_ai`）全部关闭时”才执行公开模式文案替换与 JSON 契约裁剪 |
+| `src/dalton/feishu.py:106-130` | `post_bridge_feishu`（`:117-118`）统一检查 `RESEARCHDATA_BRIDGE` | 文档子路由检查 `FEISHU_DOCS`，机器人/群列表子路由检查 `CHANNEL_FEISHU`；第 ② 阶段继续请求缩减桥 `:8960/feishu/*`，第 ③ 阶段切至渠道网关 |
+| `src/dalton/autonomy/probes/cnhk.py:184-310` | 拼接 `:8960/mcp/<token>` 探测 `cn-hk` | 校验 `CapabilityId.CN_HK` 并探测 `:8951/mcp/cnhk` |
+| `src/dalton/data_jobs/host_runner.py:23-29,108-181` | 调 `:8960/internal/data-tasks/{host-run,host-kill}` | 改为请求独立守护进程 `DALTON_HOST_RUNNER_URL`（`http://host.docker.internal:8952`）+ `DALTON_HOST_RUNNER_TOKEN` |
+| `scripts/dalton/bridge_subprocess_env.py:2229-2427`、`scripts/dalton/ops/prod/deploy_main.sh:633,658,662,915-924`、`scripts/dalton/ops/research_runtime_migrate.sh:806-812`、`scripts/standalone/init.sh:1-95` | 合并旧桥 `.env`、写入 `DALTON_RESEARCHDATA_URL`、重启桥与 `--check-runtime` | 写入 `DALTON_HOST_PLATFORM`、注入 `dalton-research-host` / `dalton-transcription` / `host_task_daemon` 地址与令牌；`deploy_main.sh` 按服务清单管理新 `launchd` 服务与缩减桥；`research_runtime_migrate.sh` 改为调用 `dalton-research-host --check-runtime` |
 
-### 3.3 需迁移的后端调用点逐项清单
+### 3.4 退役判定标准（双指标核对 + 低频任务主动演练）
 
-| 后端模块文件与行号 | 当前调用的桥路由 | 迁移目标与改动方式 |
-|---|---|---|
-| `src/dalton/conversations/embedder.py:75-207`（被 `src/dalton/conversations/search.py:259` 调用） | `POST /embed`（且 `:150` 检查 `RESEARCHDATA_BRIDGE`） | 改为调用后端内部 `src/dalton/embeddings/client.py`；能力检查改为校验嵌入密钥或 `DALTON_EMBEDDING_SERVICE_URL` 已配置 |
-| `src/dalton/autonomy/system_jobs.py:232-315` | `GET /jobs/ops` | 改为读取 `scripts/dalton/ops/prod/export_ops_status.py` 生成的本地状态文件 `var/dalton/ops_jobs_status.json` |
-| `src/dalton/services/transcriptions.py:461-584` | `/transcriptions*`（6 个端点） | `_require_transcription_bridge_url()` 改为读取 `DALTON_TRANSCRIPTION_SERVICE_URL` 与 `DALTON_TRANSCRIPTION_TOKEN`（过渡期若未设置则回退读取旧桥 URL） |
-| `src/dalton/tools/wiki_tools.py:447-485` 与 `src/dalton/tools/ingest_tools.py:615,661-672` | `POST /wiki/ingest` | 改为调用后端进程内 `src/dalton/wiki_store/ingest.py`（过渡期保留环境变量开关支持双路切换） |
-| `src/dalton/tools/ingest_tools.py:72-105,261,578-589` | `POST /sales-notes/ingest` | 改为调用后端进程内 `src/dalton/sales_notes_store/ingest.py` |
-| `src/dalton/data_map/sources.yaml:1-192`、`src/dalton/data_map/health.py:173-235,790-1060`、`src/dalton/data_map/builder.py:273-820` | 通过桥 `/mcp` 探测各子路由健康度与渲染 `<data_map>` | `sources.yaml` 中各数据源的 `required_capabilities` 移除 `researchdata_bridge`，只保留各自独立 `CapabilityId`；`health.py` 直接探测已注册的对应连接器 MCP 服务或本地 SQLite 库文件可读性 |
-| `src/dalton/provenance/declared_sources.py:13` | `_ALLOWED_SERVERS = frozenset({"researchdata", "dalton_sec"})` | 扩充白名单加入 `dalton_alphaengine`、`dalton_guidepoint`、`dalton_company_wiki`、`dalton_sales_notes`、`dalton_tmtb`、`dalton_funda_ai`、`dalton_cnhk` |
-| `src/dalton/autonomy/probes/cnhk.py:184-310` | `POST /mcp`（`finance(route="cn-hk")`） | 改为调用 `dalton_cnhk` 连接器或模块函数 |
-| `src/dalton/notify/dispatch.py:1985-2080`、`src/dalton/feishu.py:106-167`、`src/dalton/app/router.py:2526,2563`、`src/dalton/notify/groups.py:28-56` | `POST /notify`、`POST /feishu/*` | 第 ③ 阶段统一切流至 `integrations/dalton-channel-gateway/` 与飞书 OpenAPI 直连客户端 |
-| `src/dalton/data_jobs/host_runner.py:23-29,108-181` 及 `src/dalton/tools/{market_digest_*,ai_finance_*}_tools.py` | `/internal/data-tasks/*`、`/internal/{market-digest,ai-finance}/*` | 指向 Everflow 宿主守护脚本 `DALTON_HOST_RUNNER_URL`（`scripts/dalton/ops/prod/host_task_daemon.py`） |
-
-### 3.4 兼容期并存与旧路由下线判定标准
-
-1. **双路并存机制**：迁移期间保留 `plugins/dalton_data/`（`researchdata`）与宿主 `researchdata_bridge.py` 在 Everflow 环境运行；每批新连接器上线时，通过环境变量（如 `DALTON_USE_STANDALONE_EMBED=true`、`DALTON_TRANSCRIPTION_SERVICE_URL`、以及沙箱 `connector_transport.py` 的新服务优先探测）实现灰度切流。一旦出现异常，只需将对应环境变量切回原值即可秒级回滚至桥路由。
-2. **旧路由命中计量**：在 `scripts/dalton/researchdata_bridge.py` 的 `_handle_client`（`:25344`）与 `handle_tools_call`（`:13541`）按路由前缀与 `route` 子路由记录每日请求计数至 `~/Library/Logs/dalton-bridge-route-hits.jsonl`。
-3. **下线准入标准**：某组路由切换至新连接器或后端模块后，在 Everflow 生产环境连续观察 **14 个自然日**（覆盖完整两轮周报、美股/港股盘前盘后定时任务及周末维护任务），满足 `dalton-bridge-route-hits.jsonl` 中该路由业务请求计数为 **0**，且相关定时任务与对话错误率平稳，即可在下一批次 PR 中删除桥内对应处理函数。
+旧路由下线判定同时满足以下三项硬指标，避免因调用方报错中断、低频任务未到排程或日志停更造成“假零命中”误判：
+1. **旧入口请求量归零**：在连续 **14 个自然日**内，旧桥按路由记录的审计日志显示目标路由请求数为 **0**，且计数心跳日志每日持续写入（证明计量器本身存活）。
+2. **新入口成功调用量与质量达标**：同一 14 天窗口内，对应新连接器或新后端模块的成功请求量 > 0、错误率不高于切流前基线，AlphaEngine 搜索缓存命中率与 `prov:` 引用生成率与切流前基线一致。
+3. **低频与周频任务主动实跑通过**：在观察期内确认所有周频/双周频/月频消费者（含 `dalton-mark-weekly-newenergy`、`dalton-richard-coverage-weekly`、`dalton-humanoid-robot-weekly`、`dalton-china-consumer-weekly`、`dalton-global-consumer-weekly`、`dalton-tob-industry-weekly`、`dalton-tmeet-weekly-minutes`、`T58`、`T60`、`T61`）至少完整成功跑通 1 次（未到自然排程的在维护窗口主动触发一次实跑核验）。
 
 ---
 
 ## 4. 能力与开关
 
-### 4.1 连接器与能力 ID 映射表
+### 4.1 宿主平台配置与能力注册表映射
 
-全面沿用 `src/dalton/capabilities.py:42-78` 现有的 `CapabilityId` 枚举，核心变更为**解除各独立子能力对 `CapabilityId.RESEARCHDATA_BRIDGE` 的 `depends_on` 硬依赖**（`src/dalton/capabilities.py:95-159`），使每一项能力均可按需独立开启：
+1. **宿主平台配置 `DALTON_HOST_PLATFORM`**：
+   - 在 `src/dalton/capabilities.py` 新增 `resolve_host_platform()`：优先读取环境变量 `DALTON_HOST_PLATFORM`（及 `dalton.yaml` 的 `host_platform`，合法值为 `macos` 或 `linux`，非法值在启动时抛出 `DaltonStartupConfigError`）；未显式设置时，`everflow` 形态缺省为 `macos`，`core` 形态缺省为 `linux`。
+   - Everflow 生产由 `scripts/dalton/bridge_subprocess_env.py` 与 `scripts/dalton/ops/prod/deploy_main.sh` 固定写入 `DALTON_HOST_PLATFORM=macos`；核心安装由 `scripts/standalone/init.sh` 按宿主机 `uname -s` 实测结果自动写入 `DALTON_HOST_PLATFORM=macos` 或 `DALTON_HOST_PLATFORM=linux`。
+   - `effective_capabilities()` 在解析 `CapabilityId.ALPHAENGINE` 时校验 `resolve_host_platform() == "macos"`；在 Linux 宿主上 `alphaengine` 恒解析为关闭态，且完全不受容器内 Linux Python 的 `sys.platform` 影响。
 
-| 能力 ID（`CapabilityId`） | 承载组件 / MCP 服务名 | 拆分后 `depends_on` | 平台约束 | `core` 默认值 | `everflow` 默认值 | 开启所需配置 |
-|---|---|---|---|---|---|---|
-| `alphaengine` | 插件 `dalton-alphaengine`（`dalton_alphaengine`，含 `transcript`） | `()`（独立顶层能力） | 仅 `sys.platform == "darwin"`（Linux 宿主解析为关闭并记录启动提示日志） | `False` | `True` | macOS 宿主 + `:8950`/`8951` 服务运行 + `DALTON_ALPHAENGINE_MCP_URL` |
-| `guidepoint` | 插件 `dalton-guidepoint`（`dalton_guidepoint`） | `()` | 跨平台（Linux / macOS） | `False` | `True` | `GUIDEPOINT_CLIENT_ID`、`GUIDEPOINT_CLIENT_SECRET`、`GUIDEPOINT_REFRESH_TOKEN` |
-| `company_wiki` | 插件 `dalton-company-wiki`（`dalton_company_wiki`）+ 后端 `wiki_store` | `()` | 跨平台（Linux / macOS） | `False` | `True` | `DALTON_WIKI_ROOT` 数据卷 + 嵌入 API 密钥 |
-| `sales_notes` | 插件 `dalton-sales-notes`（`dalton_sales_notes`）+ 后端 `sales_notes_store` | `()` | 跨平台（Linux / macOS） | `False` | `True` | `DALTON_SALES_NOTES_ROOT` 数据卷 + 嵌入 API 密钥 |
-| `tmtb` | 插件 `dalton-tmtb`（`dalton_tmtb`） | `()` | 跨平台（Linux / macOS） | `False` | `True` | `DALTON_TMTB_DB_PATH` SQLite 文件 |
-| `funda_ai` | 插件 `dalton-funda-ai`（`dalton_funda_ai`） | `()` | 跨平台（Linux / macOS） | `False` | `True` | `DALTON_FUNDA_AI_DB_PATH` SQLite 文件 |
-| `transcription` | 独立服务 `dalton-transcription` | `()` | 跨平台（Linux / macOS） | `False` | `False`（按环境显式开启） | `DALTON_TRANSCRIPTION_SERVICE_URL` + ASR/对象存储密钥 |
-| `conversation_archive` | 后端 `src/dalton/conversations/` + `src/dalton/embeddings/` | `()` | 跨平台（Linux / macOS） | `False` | `True` | 后端嵌入密钥（如 `GEMINI_API_KEY`） |
-| `feishu_docs` | 后端 `src/dalton/feishu.py`（第 ③ 阶段接网关/OpenAPI） | `()` | 跨平台（Linux / macOS） | `False` | `True` | `FEISHU_APP_ID`、`FEISHU_APP_SECRET` |
-| `researchdata_bridge` | 旧桥兼容包 `plugins/dalton_data/`（过渡期保留，全部迁完后退役） | `()` | 仅过渡期使用 | `False` | 过渡期 `True`，收官批改为 `False` | `DALTON_RESEARCHDATA_URL` |
+2. **连接器能力开关总表**（各能力的 `depends_on=(RESEARCHDATA_BRIDGE,)` 仅在对应连接器全入口改完的那一批同步移除）：
 
-同时在 `src/dalton/capabilities.py:603-637` 的 `MCP_SERVER_CAPABILITY_MAP` 与 `BUNDLED_PLUGIN_CAPABILITY_MAP` 中逐一登记新连接器名称与对应 `CapabilityId`，并通过 `src/ptc_agent/config/plugins.py:290-330` 的 `is_bundled_plugin_enabled_by_capability` 在发现阶段自动过滤。
+| 能力 ID（`CapabilityId`） | 绑定的插件包与 MCP 服务名 | 拆分完成后 `depends_on` | 额外前置约束 | `core` 默认值 | `everflow` 默认值 |
+|---|---|---|---|---|---|
+| `alphaengine` | `dalton-alphaengine`（`dalton_alphaengine`，含 `transcript`） | `()` | `resolve_host_platform() == "macos"` | `False` | `True` |
+| `guidepoint` | `dalton-guidepoint`（`dalton_guidepoint`） | `()` | 宿主研究服务已配置 Guidepoint 凭据 | `False` | `True` |
+| `company_wiki` | `dalton-company-wiki`（`dalton_company_wiki`）+ `/ingest/wiki` | `()` | 研究服务已配置 Wiki 存储目录 | `False` | `True` |
+| `sales_notes` | `dalton-sales-notes`（`dalton_sales_notes`）+ `/ingest/sales-notes` | `()` | 宿主研究服务已挂载销售笔记库 | `False` | `True` |
+| `tmtb` | `dalton-tmtb`（`dalton_tmtb`） | `()` | 宿主研究服务已挂载 TMTB 库 | `False` | `True` |
+| `funda_ai` | `dalton-funda-ai`（`dalton_funda_ai`） | `()` | 宿主研究服务已挂载 Funda AI 库 | `False` | `True` |
+| `estimates`（新增） | `dalton-estimates`（`dalton_estimates`） | `()` | 宿主研究服务已配置一致预期脚本 | `False` | `True` |
+| `cn_hk`（新增） | `dalton-cnhk`（`dalton_cnhk`） | `()` | 宿主研究服务已配置 `cn-hk-findata` | `False` | `True` |
+| `community_sources`（新增） | `dalton-community`（`dalton_community`） | `()` | 宿主研究服务已配置社区抓取环境 | `False` | `True` |
+| `fund_automations` | `dalton-office`（`dalton_office`：含 `tmeet` 与 `gcal`）+ 摘要/AI Finance 工具 | `()` | Everflow 宿主办公 CLI 与摘要目录 | `False` | `True` |
+| `data_jobs` | `dalton-market-regime`（`dalton_market_regime`）+ `host_task_daemon.py` | `()` | 定时任务与快照目录 | `False` | `True` |
+| `transcription` | 独立服务 `dalton-transcription` | `()` | `_resolve_transcription_storage_configured()` 为真（`capabilities.py:425-433`） | `False` | `False`（显式开启） |
+| `conversation_archive` | 后端 `src/dalton/conversations/` + `src/dalton/embeddings/` | `()` | 嵌入模型密钥与 `dalton_embedding_metadata` 就绪 | `False` | `True` |
+| `feishu_docs` | 缩减桥 `/feishu/doc/*`、`/feishu/wiki/*`（第 ③ 阶段迁渠道网关） | 第 ② 阶段保持 `(RESEARCHDATA_BRIDGE,)`（第 ③ 阶段改挂 `CHANNEL_GATEWAY` 或独立 OpenAPI） | `FEISHU_APP_ID`、`FEISHU_APP_SECRET` | `False` | `True` |
+| `researchdata_bridge` | 第 5 批后仅代表缩减后的飞书/通知过渡桥（`:8960`），不再控制研究连接器 | `()` | 第 ③ 阶段渠道网关接管后彻底退役 | `False` | 第 ② 阶段保持 `True`（仅服务飞书/通知过渡） |
 
-### 4.2 能力关闭时各层的协同表现
+同时补齐 `BRIDGE_ROUTE_CAPABILITY_MAP`（`src/dalton/capabilities.py:775-786`）中此前缺失的子路由映射：`"sales-mail"` 映射为 `sales_notes | tmtb` 复合校验，`"tmeet"` 与 `"gcal"` 映射为 `CapabilityId.FUND_AUTOMATIONS`，`"estimates"` 映射为 `CapabilityId.ESTIMATES`，`"cn-hk"` 映射为 `CapabilityId.CN_HK`，`"market-regime"` 映射为 `CapabilityId.DATA_JOBS`，`"xueqiu"`/`"employee"`/`"last30days"`/`"x-timeline"` 映射为 `CapabilityId.COMMUNITY_SOURCES`。
 
-沿用 `src/dalton/content_assembly.py` 与前端 `useCapabilities` 的现有多层门控机制，当某项连接器能力处于关闭态时，全栈各层自动保持一致：
+### 4.2 能力关闭时全栈各层的表现
 
-1. **MCP 服务注册与重连层**：`filter_mcp_servers_by_capability`（`src/dalton/capabilities.py:678-690`）与 `filter_reconnectable_builtin_mcp`（`:709-728`）在启动时只保留已启用连接器，后台重连任务只针对已启用的远端连接器运行，沙箱只生成已启用连接器的 `tools/dalton_*.py` 包装模块。
-2. **后端直连工具层**：`src/dalton/tools/__init__.py:189-275` 按 `has_capability` 装配工具——例如 `company_wiki` 关闭时，`ingest_company_wiki` 自动从 Agent 工具集省去；`sales_notes` 关闭时，`ingest_sales_note` 自动省去；两者都关闭时，统一入口 `ingest_research` 一并省去。
-3. **技能目录与 Markdown 指令层**：`src/dalton/content_assembly.py:72-125`（`SKILL_CAPABILITY_REQUIREMENTS`）与 `:220-340`（`strip_disabled_capability_blocks`）在技能装载时裁剪 `<!-- DALTON_CAP:<cap> -->...<!-- /DALTON_CAP -->` 片段（支持 `<!-- DALTON_CAP_ELSE -->` 替代文案）。例如仅开启 `company_wiki` 与 `dalton_sec` 的核心安装实例，其 `dalton-bullbear` 技能提示词自动展示内部 Wiki 与 SEC 检索步骤，并省去 AlphaEngine、Guidepoint、TMTB、FUNDA AI 相关段落。
-4. **系统提示词与 `<data_map>` 层**：`src/dalton/data_map/builder.py:273-820` 结合 `src/dalton/data_map/sources.yaml` 仅渲染当前已启用能力的数据源行与路由决策规则；关闭的能力条目在 `<data_map>` 与系统提示词中完全隐去，节约上下文 Token 并消除模型幻觉调用。
-5. **前端设置页与能力发现层**：后端 `GET /api/v1/dalton/capabilities` 输出实时生效的布尔能力字典；前端 `web/src/hooks/useCapabilities.ts:1-177` 与 `web/src/pages/Settings/sections.ts:1-360` 仅展示已启用能力关联的设置卡片（如飞书绑定、自动入库开关等）。
-6. **帮助中心文档层**：构建与运行时通过 `content_assembly` 相同的能力标记裁剪 `docs-site/` 与 `langalpha-doc` 技能参考文档（如 `plugins/langalpha_service/skills/langalpha-doc/references/settings-map.md:27`），确保用户看到的帮助文档与当前实例实际开启的连接器一致。
+基于 `src/dalton/capabilities.py` 与 `src/dalton/content_assembly.py` 的真实实现，当某项连接器能力处于关闭态时：
+
+1. **插件与 MCP 服务器装配层**：`is_bundled_plugin_enabled_by_capability`（`src/dalton/capabilities.py:656-676`）与 `filter_mcp_servers_by_capability`（`:678-690`）在 `bundled_mcp_servers()`（`src/ptc_agent/config/plugins.py:278-355`）加载阶段直接剔除未启用连接器；`filter_reconnectable_builtin_mcp`（`capabilities.py:709-728`）跳过未启用服务的后台重连；沙箱仅生成已启用连接器的 `tools/dalton_*.py` 包装器。宿主机 `dalton-research-host` 同步读取能力开关，对未启用子路由返回 `403 capability_disabled`。
+2. **后端直连工具注册层**：`src/dalton/tools/__init__.py:94-143,370-410` 按 `DaltonToolRegistration.capability` 过滤工具；`company_wiki` 与 `sales_notes` 均关闭时，`ingest_company_wiki`、`ingest_sales_note` 与 `ingest_research` 全部从工具表省去。
+3. **技能、工作流与 JSON 契约条件装配层**：`src/dalton/content_assembly.py` 通过 `evaluate_capability_expr`（`:70-130`）与栈式解析器 `_assemble_stacked`（`:156-229`）对 `.md`/`.mdx`/`.txt`/`.yaml`（`assemble_markdown_text` 于 `:231-254`）和 `.js` 工作流（`assemble_js_text` 于 `:256-265`）执行嵌套条件裁剪，并通过 `assemble_json_text`（`:267-365`）裁剪 `contract.json` 与 `common.schema.json`。当某连接器关闭时，包含其调用指令的片段自动切换至 `DALTON_CAP_ELSE` 公开源替代方案（如 `yf_analysis`、`x_api`、`WebSearch`）。
+4. **系统提示词与 `<data_map>` 层**：`src/dalton/data_map/builder.py:287-355,488-518` 仅将已启用连接器渲染进可用数据源表，并将未开启的内部源按规则列入“明确没有的数据”提示栏，防止模型猜测或盲调。
+5. **前端设置页、对话栏与帮助文档层**：前端 `web/src/hooks/useCapabilities.ts:1-177`、`web/src/pages/Settings/sections.ts:1-360` 与 `web/src/pages/ChatAgent/components/dalton/AutoIngestToggle.tsx:26` 仅渲染已启用能力对应的设置分组与工作区自动入库开关；帮助站点与 `langalpha-doc` 经同一套 `assemble_markdown_text` 保持展示一致。
 
 ---
 
 ## 5. 运行与部署
 
-### 5.1 连接器进程模型划分
+### 5.1 进程分布与网络访问路径
 
-| 连接器 / 服务 | 运行进程位置 | 生命周期与资源隔离特征 |
-|---|---|---|
-| `dalton_guidepoint`、`dalton_company_wiki`、`dalton_sales_notes`、`dalton_tmtb`、`dalton_funda_ai`、`dalton_cnhk` | **沙箱容器内 `stdio` MCP 子进程**（由沙箱 supervisor 按需拉起，与 `plugins/dalton_sec/mcp.json:4-15` 完全一致） | 随工作区沙箱生命周期启停；本地库连接器通过 Docker bind-mount `:ro` 只读挂载对应 SQLite 目录，零常驻宿主端口开销 |
-| `dalton_alphaengine` | **macOS 宿主机常驻 HTTP 服务**（`127.0.0.1:8951` `dalton_alphaengine_server.py` + `127.0.0.1:8950` `server.mjs`） | 跨工作区与跨线程共享同一个 SQLite WAL 搜索缓存库、并发单飞锁、当日配额账本，并直接调用 macOS 钥匙串与桌面端 `/Applications/AlphaEngine.app` |
-| `src/dalton/embeddings/`、`src/dalton/wiki_store/`、`src/dalton/sales_notes_store/` | **后端 `backend` 容器进程内异步模块** | 直接复用后端进程事件循环、连接池与配置体系，省去跨进程序列化开销 |
-| `dalton-transcription` | **独立 Docker 容器服务**（`transcription:8965`，Everflow 亦可选择宿主 `launchd` 运行） | 隔离 `ffmpeg` 音视频转码的 CPU/磁盘峰值与长耗时火山引擎轮询任务，重启后端进程时正在执行的转写任务持续推进 |
+| 组件名称 | 运行位置与端口 | 进程与网络机制 | 凭据与数据隔离边界 |
+|---|---|---|---|
+| `plugins/dalton_sec/`、`plugins/dalton_macro/` | 沙箱容器内 `stdio` MCP 子进程 | 由沙箱 supervisor 按 `uv run python mcp_servers/<entry>.py` 按需启动（同 `plugins/dalton_sec/mcp.json:4-15`） | 仅访问公开 SEC EDGAR / 财政部 Fiscal Data / 可选 `FRED_API_KEY`，零商业私有数据 |
+| `dalton-research-host`（承载 `alphaengine`、`guidepoint`、`company-wiki`、`sales-notes`、`tmtb`、`funda-ai`、`all`、`office`、`estimates`、`cnhk`、`market-regime`、`community` 及受控入库/摘要管理口） | Everflow：macOS 宿主机 `127.0.0.1:8951`（核心安装若开启 `company_wiki` 则运行独立 `wiki-service:8951` 容器） | 后端容器与 Everflow 沙箱容器（配置 `ExtraHosts = ["host.docker.internal:host-gateway"]`，见 `src/ptc_agent/core/sandbox/providers/docker.py:774-783`）通过 `http://host.docker.internal:8951/mcp/<connector>` 直连 `streamable-http`；`src/ptc_agent/core/sandbox/mcp_client_runtime.py:2177-2198` 自动附带每次请求签名的 `X-Dalton-Caller-Token` | 宿主机进程独占持有 SQLite 库文件、Wiki/邮件目录、Guidepoint Auth0 刷新令牌与 Gemini 密钥；沙箱只持有 `DALTON_RESEARCH_HOST_TOKEN` 调用令牌 |
+| `com.dalton.alphaengine-mcp`（`server.mjs`） | Everflow macOS 宿主机 `127.0.0.1:8950` | 仅对本机回环 `dalton-research-host`（`:8951`）开放调用 | 读取 macOS 钥匙串 `dalton-alphaengine` 与 `/Applications/AlphaEngine.app` |
+| `src/dalton/embeddings/` | 后端 `backend` 容器进程内 | FastAPI 异步进程内直接请求配置的 Embedding API（或可选独立嵌入服务） | 嵌入 API 密钥仅存于 `backend` 容器环境，不进入沙箱 |
+| `dalton-transcription` | 独立容器或宿主机服务（`:8965`） | 后端 `src/dalton/services/transcriptions.py` 通过 `DALTON_TRANSCRIPTION_SERVICE_URL` 访问；沙箱脚本 `dalton_asr.py` 仅调后端 `/api/v1/dalton/transcriptions*` | `SEED_ASR_*`、`VOLC_TOS_*` 与 `var/dalton/asr_jobs/`（排他锁 `.owner.lock`）仅归该服务持有 |
+| `host_task_daemon.py` | Everflow macOS 宿主机 `127.0.0.1:8952` | 后端 `host_runner.py` 通过 `http://host.docker.internal:8952` + `DALTON_HOST_RUNNER_TOKEN` 调用 | 独占持有 `.dalton-host-runner-state.json`，按任务白名单最小化注入凭据 |
+| 缩减后的 `researchdata_bridge.py`（过渡期） | Everflow macOS 宿主机 `127.0.0.1:8960` | 第 5 批后仅保留 `/notify`、`/feishu/*`、`discord-history` 供后端调用，直至第 ③ 阶段并入 `:8962` `dalton-channel-gateway` | 仅持有 `FEISHU_*` 与 `DALTON_DISCORD_BOT_TOKEN` |
 
-### 5.2 Everflow 生产（macOS 宿主 + Colima/Docker）与核心安装（Linux Docker）部署对比
+### 5.2 Everflow 生产与核心安装部署步骤对比
 
-1. **Everflow 生产环境（macOS 宿主 + Colima 容器栈，`docker-compose.dalton.yml`）**：
-   - **私有插件挂载**：将私有连接器仓库目录（如 `~/Projects/dalton-connectors/plugins/*`）挂载或同步至容器与沙箱可见的插件目录，由 `bundled_mcp_servers()`（`src/ptc_agent/config/plugins.py:278`）统一加载。
-   - **数据卷挂载**：在 `docker-compose.dalton.yml` 与沙箱 Docker 配置中，将 `<DALTON_RESEARCH_HOME>/wiki`、`skills/market-digest`、`state/sales-notes`、`state/funda-ai` 以只读模式挂载至沙箱用于检索，以读写模式挂载至 `backend` 容器用于 `ingest_company_wiki` 与 `ingest_sales_note` 入库。
-   - **宿主网络连通（容器访问宿主机 `dalton_alphaengine`）**：
-     - 后端容器（用于启动探测与 `<data_map>` 健康检查）：通过 `http://host.docker.internal:8951/mcp` 访问宿主机上的 `dalton_alphaengine` 服务（与当前 `docker-compose.dalton.yml` 访问 `:8960` 的网络路径一致）。
-     - 沙箱容器（位于隔离网络 `sandbox-net`）：沿用现行双模可达方案——当沙箱配置 `host.docker.internal` 路由（Everflow 单租户受信沙箱）时直连 `http://host.docker.internal:8951/mcp` 并由 `src/ptc_agent/core/sandbox/mcp_client_runtime.py:2177-2198` 注入每次调用的 `X-Dalton-Caller-Token`；在严格隔离的 `sandbox-net` 下，则通过后端出口中继 `EGRESS_RELAY_BASE_URL=http://backend:8000`（`src/server/services/egress/reachability.py:58-68` 与 `src/server/app/egress_relay.py:12`）由后端代签并转发至宿主机 `:8951`，在保持沙箱网桥隔离的同时完成安全转发。
+1. **Everflow 生产（macOS 宿主 + Colima 容器栈，`docker-compose.dalton.yml`）**：
+   - `scripts/dalton/bridge_subprocess_env.py` 与 `scripts/dalton/ops/prod/deploy_main.sh` 向 `<repo>/.env` 写入 `DALTON_HOST_PLATFORM=macos`、`DALTON_EXTRA_PLUGINS_DIR=/opt/dalton-extra-plugins`、`DALTON_RESEARCH_HOST_URL=http://host.docker.internal:8951`、`DALTON_TRANSCRIPTION_SERVICE_URL`、`DALTON_HOST_RUNNER_URL=http://host.docker.internal:8952` 及各自独立的随机令牌。
+   - `docker-compose.dalton.yml` 将私有连接器插件声明目录只读挂载至 `backend` 容器的 `/opt/dalton-extra-plugins:ro`（商业服务端代码与研究数据库留在宿主机文件系统中，不挂载进任何沙箱容器）。
+   - Everflow 沙箱因 `is_core_profile()` 为 `False`（`src/ptc_agent/core/sandbox/providers/docker.py:778-782`），继续获得 `host.docker.internal:host-gateway` 映射，直连宿主机 `:8951` 的各个 `/mcp/<connector>` 端点并附带 `X-Dalton-Caller-Token`。
 
-2. **独立核心安装环境（Linux Docker，`docker-compose.yml` + `docker-compose.core.yml`）**：
-   - **默认零外部依赖开箱即用**：`DALTON_PROFILE=core`，仅内置公共连接器（`dalton_sec`、`yfinance`、`macro`、`scrape` 等）启用；启动时 `alphaengine` 因非 macOS 平台自动保持关闭。
-   - **按需渐进增强**：
-     - 开启对话归档语义检索：在 `.env` 填入 `GEMINI_API_KEY`（或嵌入模型密钥）并设置 `DALTON_CAP_CONVERSATION_ARCHIVE=true`，后端进程内 `src/dalton/embeddings/` 直接生效。
-     - 开启内部公司 Wiki：挂载本地目录至 `/var/lib/dalton/wiki`，设置 `DALTON_CAP_COMPANY_WIKI=true`，立即可用 `ingest_company_wiki` 沉淀文档并通过 `dalton_company_wiki` 混合检索。
-     - 开启商业连接器（如 Guidepoint）或独立转写服务：放入对应插件包或启用 `--profile transcription` 容器组，设置对应 `DALTON_CAP_*=true` 与 API 凭证即可独立运行。
+2. **独立核心安装（Linux 或 macOS Docker，`docker-compose.yml` + `docker-compose.core.yml`）**：
+   - `scripts/standalone/init.sh` 检测宿主机 `uname -s` 自动向 `.env` 写入 `DALTON_HOST_PLATFORM=linux`（或 `macos`），生成核心密钥并保持全部商业能力默认关闭。
+   - 开箱默认启用公开插件 `dalton_sec`（11 项 SEC 能力）、`dalton_macro`（财政部 TGA/债务与可选 FRED）、`yfinance`、`macro`、`scrape` 等。
+   - 按需开启扩展能力：
+     - **对话归档检索**：配置嵌入模型密钥与 `EMBEDDING_DIMENSIONS`（如 `1536` 或 `3072`），设 `DALTON_CAP_CONVERSATION_ARCHIVE=true`，重启 `backend` 完成 `dalton_embedding_metadata` 维度锁定。
+     - **内部公司 Wiki**：启用 `docker-compose.core.yml` 中的可选 `wiki-service` profile（容器内运行开源 Wiki 检索与入库服务），设置 `DALTON_CAP_COMPANY_WIKI=true`。
+     - **语音转写**：配置后端转写专用对象存储（满足 `src/dalton/capabilities.py:425-433` 校验）并启用 `transcription` profile 服务，设置 `DALTON_CAP_TRANSCRIPTION=true`。
 
-### 5.3 macOS `launchd` 服务增减清单（Everflow 生产）
+### 5.3 macOS `launchd` 服务演进清单（Everflow 生产）
 
-| `launchd` 服务标识（Plist 模板位置） | 拆分后动作 | 说明 |
-|---|---|---|
-| `com.dalton.alphaengine-mcp`（`scripts/dalton/launchd/com.dalton.alphaengine-mcp.plist.template`） | **保留** | 继续在宿主机 `127.0.0.1:8950` 运行 `server.mjs`，负责与 `/Applications/AlphaEngine.app` 和钥匙串交互 |
-| `com.dalton.alphaengine-desktop-watchdog`（`scripts/dalton/launchd/com.dalton.alphaengine-desktop-watchdog.plist.template`） | **保留** | 继续守护 macOS AlphaEngine 桌面客户端存活 |
-| `com.dalton.alphaengine-connector`（新增，置于私有仓库或 `scripts/dalton/ops/prod/launchd/`） | **新增** | 在宿主机 `127.0.0.1:8951` 运行轻量 `dalton_alphaengine_server.py`（仅承载 AlphaEngine/Transcript MCP 协议、SQLite v4 缓存、熔断与配额账本） |
-| `com.dalton.guidepoint-mcp-proxy`（`scripts/dalton/launchd/com.dalton.guidepoint-mcp-proxy.plist.template`） | **下线移除** | Auth0 令牌刷新与远端请求迁入 `dalton-guidepoint` `stdio` 插件后，省去宿主机 `:8943` 代理守护进程 |
-| `com.dalton.ops-status-exporter`（新增，置于 `scripts/dalton/ops/prod/launchd/`） | **新增（轻量定时）** | `StartInterval=300` 秒运行一次 `export_ops_status.py`，刷新 `var/dalton/ops_jobs_status.json`，零常驻内存与端口占用 |
-| `com.dalton.host-task-daemon`（新增，置于 `scripts/dalton/ops/prod/launchd/`） | **新增（按需）** | 承接 `T1`/`T29` 等 7 个 `runner: "host"` 任务与摘要准备接口，替代原桥中的 `/internal/*` |
-| `com.dalton.researchdata-bridge`（`scripts/dalton/launchd/com.dalton.researchdata-bridge.plist.template`） | **收官下线移除** | 第 5 批及第 ③ 阶段渠道网关切流完成后正式卸载，回收 `:8960` 端口 |
-| 其余生产运维服务（`com.dalton.colima`、`com.dalton.pg-backup`、`com.dalton.backend-watchdog`、`com.dalton.portwatch`、`com.dalton.channel-gateway` 等） | **保持现状** | 位于 `scripts/dalton/ops/prod/launchd/` 与 `scripts/dalton/launchd/`，职责清晰，维持现有运行方式 |
+| `launchd` 服务标识 | 模板位置 | 演进动作与批次 | 职责说明 |
+|---|---|---|---|
+| `com.dalton.alphaengine-mcp` | `scripts/dalton/launchd/com.dalton.alphaengine-mcp.plist.template` | **长期保留** | 在 `127.0.0.1:8950` 运行 `server.mjs`，对接 `/Applications/AlphaEngine.app` 与钥匙串 |
+| `com.dalton.alphaengine-desktop-watchdog` | `scripts/dalton/launchd/com.dalton.alphaengine-desktop-watchdog.plist.template` | **长期保留** | 守护 macOS AlphaEngine 桌面客户端 |
+| `com.dalton.ops-status-exporter` | 新增于 `scripts/dalton/ops/prod/launchd/` | **第 1 批新增** | 每 300 秒执行 `export_ops_status.py`，原子更新 `var/dalton/ops_jobs_status.json` |
+| `com.dalton.transcription` | 新增于私有仓库 / `scripts/dalton/ops/prod/launchd/` | **第 2 批新增**（按需启用） | 在 `127.0.0.1:8965` 独立运行转写连接器服务，持有 `asr_jobs/.owner.lock` |
+| `com.dalton.research-host` | 新增于私有仓库部署目录 | **第 3 批新增，第 4–5 批扩充模块** | 在 `127.0.0.1:8951` 提供全部内部研究检索连接器端点、受控入库及摘要管理口 |
+| `com.dalton.guidepoint-mcp-proxy` | `scripts/dalton/launchd/com.dalton.guidepoint-mcp-proxy.plist.template` | **第 3 批步骤 C 卸载**（切流并完成观察期后） | 令牌刷新迁入 `com.dalton.research-host` 单实例模块；观察期内暂停旧代理以保证单一刷新方 |
+| `com.dalton.host-task-daemon` | 新增于 `scripts/dalton/ops/prod/launchd/` | **第 5 批新增** | 在 `127.0.0.1:8952` 独立运行宿主任务执行守护，持有 `.dalton-host-runner.owner.lock` |
+| `com.dalton.researchdata-bridge` | `scripts/dalton/launchd/com.dalton.researchdata-bridge.plist.template` | **第 5 批缩减为纯通知/飞书代理，第 ③ 阶段卸载** | 第 5 批清空研究、嵌入、转写、宿主任务代码，仅服务 `/notify`、`/feishu/*`、`discord-history` 直至第 ③ 阶段网关接管 |
+| `com.dalton.colima`、`pg-backup`、`backend-watchdog`、`portwatch`、`channel-gateway`、`monitor-feeds` | `scripts/dalton/ops/prod/launchd/` 等 | **保持现状** | 既有基础设施与运维守护服务 |
 
 ---
 
 ## 6. 分批计划
 
-按影响面从收敛的后端内部接口到高频研究连接器，由低风险向高风险划分为 **5 个独立批次**。每个批次均可独立合并、独立部署并通过单一环境变量开关秒级回滚。
+### 6.1 数据库迁移编号与合并顺序约定
 
-### 数据库迁移编号约定
+当前仓库迁移头为 **`d046`**（`src/dalton/migrations/versions/d046_scoped_data_map_cache.py:23-24`，其 `down_revision = "d048"`）。发布顺序明确约定如下：
+1. **微信多账号迁移 `d049`（接 `d046`）先于本设计含迁移的批次合入**，确保主干始终保持单一线性迁移头。
+2. 本设计首个需要数据库迁移的批次从 **`d050`** 起编号，后续需要迁移的批次依次顺延，每批使用唯一迁移号且合入时严格接当时唯一的迁移头：
+   - **第 1 批**：**`d050_embedding_metadata_and_dimension`**（预计 `down_revision = "d049"`）
+   - **第 2 批**：无数据库迁移
+   - **第 3 批**：无数据库迁移
+   - **第 4 批**：无数据库迁移
+   - **第 5 批**：**`d051_cleanup_legacy_researchdata_mcp_rows`**（预计 `down_revision = "d050"`）
 
-核查 `src/dalton/migrations/versions/` 现有迁移链：`d045 -> d047 (local_auth_and_roles) -> d048 (invite_admin_tier) -> d046 (scoped_data_map_cache)`，当前实际迁移头为 **`d046`**（`src/dalton/migrations/versions/d046_scoped_data_map_cache.py:23-24`）。鉴于第 ③ 阶段前的微信多账号改造已预占 **`d049`**，本设计所有批次优先复用现有 `user_mcp_servers` / `workspace_mcp_servers` 与文件状态存储；若第 2 批转写服务或后续批次确需新增持久化表结构，迁移版本号统一从 **`d050`** 起编（若在微信多账号前合入则 `down_revision = "d046"`，合入后则接 `down_revision = "d049"`）。
+### 6.2 各批次实施范围、三步切换与写实回滚规程
 
-### 第 1 批：能力解耦、`/embed` 收归后端与 `/jobs/ops` 归入生产运维（极低风险）
+每个批次均严格按 **步骤 A（停止旧入口接新单并切流）→ 步骤 B（保留可回退版本与双指标观察）→ 步骤 C（删除旧组件）** 执行。
 
+#### 第 1 批：宿主平台配置 `DALTON_HOST_PLATFORM`、后端嵌入模块（含维度锁定 `d050`）与 `/jobs/ops` 状态文件化（低风险）
+
+- **数据库迁移**：**`d050_embedding_metadata_and_dimension`**（创建 `dalton_embedding_metadata` 表；Everflow 自动锁定 `gemini-embedding-2-preview` + `3072` 维；支持核心新装按配置维度初始化 `vector(<dim>)` 与 `halfvec(<dim>)` HNSW 索引）。
 - **范围**：
-  1. 新增后端嵌入模块 `src/dalton/embeddings/`，迁移 `src/dalton/conversations/embedder.py:75-207` 默认走后端直连嵌入 API（保留 `DALTON_EMBED_VIA_BRIDGE=true` 回退开关），解除 `:150` 对 `RESEARCHDATA_BRIDGE` 的检查。
-  2. 新增 `scripts/dalton/ops/prod/export_ops_status.py` 与对应 plist，`src/dalton/autonomy/system_jobs.py:232-315` 改为优先读取 `var/dalton/ops_jobs_status.json`。
-  3. 在 `src/dalton/capabilities.py:95-159` 中移除 8 个子能力对 `CapabilityId.RESEARCHDATA_BRIDGE` 的 `depends_on` 硬绑定，并为 `CapabilityId.ALPHAENGINE` 增加 `sys.platform == "darwin"` 平台守卫；更新 `src/dalton/provenance/declared_sources.py:13` 预注册新连接器服务名白名单。
-- **数据库迁移**：无（复用现有表结构）。
-- **验收条件**：核心安装在无桥环境下开启 `conversation_archive` + `GEMINI_API_KEY` 可完成对话向量归档与语义检索；Everflow 生产系统任务页正常展示 `pg-backup` 与 `backend-watchdog` 状态；桥上 `/embed` 与 `/jobs/ops` 连续 14 天命中数为 0。
-- **回滚方式**：设置 `DALTON_EMBED_VIA_BRIDGE=true` 与 `DALTON_OPS_JOBS_VIA_BRIDGE=true` 即可切回原桥路由。
+  1. 在 `src/dalton/capabilities.py` 实现 `resolve_host_platform()`（读取 `DALTON_HOST_PLATFORM`），为 `CapabilityId.ALPHAENGINE` 接入宿主平台判定；同步更新 `scripts/standalone/init.sh`、`scripts/dalton/bridge_subprocess_env.py` 与 `scripts/dalton/ops/prod/deploy_main.sh` 写入 `DALTON_HOST_PLATFORM`。（注：本批保持 8 个子能力原有的 `depends_on` 关系不动，待各连接器就绪批次逐个解绑。）
+  2. 新增 `src/dalton/embeddings/`，改造 `src/dalton/conversations/embedder.py:75-207`、`src/dalton/database/conversations.py:525-558`、`src/dalton/conversations/search.py:250-285` 默认走后端直连嵌入并强制核验 `dalton_embedding_metadata`，移除 `embedder.py:150` 对 `RESEARCHDATA_BRIDGE` 的依赖。
+  3. 新增 `scripts/dalton/ops/prod/export_ops_status.py` 与 `com.dalton.ops-status-exporter` plist，改造 `src/dalton/autonomy/system_jobs.py:232-315` 读取 `var/dalton/ops_jobs_status.json`。
+- **三步切换与回滚**：
+  - **步骤 A（切流）**：加载 `com.dalton.ops-status-exporter` 确认生成首份状态文件；执行数据库备份与 `alembic upgrade d050`；重建并重启 `backend` 容器使新嵌入模块与 `DALTON_HOST_PLATFORM=macos` 生效（本批不涉及沙箱工具 schema 变更，无需重刷运行中沙箱）。
+  - **步骤 B（可回退观察）**：旧桥上的 `/embed` 与 `/jobs/ops` 代码保留开启但不再收到后端请求。若后端直连嵌入出现异常，在 `.env` 设置过渡回退开关 `DALTON_EMBED_VIA_BRIDGE=true` / `DALTON_OPS_JOBS_VIA_BRIDGE=true` 并**重启 `backend` 容器**即可恢复走旧桥；若需连同数据库回退发布版本，按 `deploy_main.sh:630-666` 停后端、执行 `alembic downgrade d049` 并重建上一版 `backend` 镜像。
+  - **步骤 C（清理）**：连续 14 天满足旧桥 `/embed`、`/jobs/ops` 零命中且后端嵌入归档写入与检索计数正常后，移除回退开关与桥上这两个处理函数。
+- **验收条件**：Everflow 生产 `alphaengine` 在容器内 `sys.platform == "linux"` 下保持正常开启，历史 3072 维归档检索结果一致；核心安装以 1536 维模型初始化并跑通纯语义向量检索命中验证。
 
-### 第 2 批：独立转写连接器服务 `dalton-transcription` 拆分（低风险）
+#### 第 2 批：独立转写连接器服务 `dalton-transcription` 与存量任务排他交接（中低风险）
 
-- **范围**：
-  1. 将 `scripts/dalton/asr_jobs.py` 与 `scripts/dalton/seed_asr_client.py` 打包为独立服务 `dalton-transcription`（在 `docker-compose.core.yml` 增加可选 `transcription` profile，在 `docker-compose.dalton.yml` 配置独立服务或宿主守护）。
-  2. 更新 `src/dalton/services/transcriptions.py:461-584`，优先读取 `DALTON_TRANSCRIPTION_SERVICE_URL` 与 `DALTON_TRANSCRIPTION_TOKEN`；缺省时兼容回退至旧桥 URL。
-- **数据库迁移**：无（转写任务元数据继续使用服务卷持久化目录，后端对账循环复用现有表；如需将作业元数据迁入 Postgres 则使用 `d050`）。
-- **验收条件**：在独立核心环境启动 `transcription` 服务并开启 `DALTON_CAP_TRANSCRIPTION=true`，通过 `prepare_transcription` 与 `dalton_asr.py` 跑通音视频上传、状态轮询、重试/取消与逐字稿落盘全链路；Everflow 生产切流观察 14 天桥上 `/transcriptions*` 命中为 0。
-- **回滚方式**：清空 `DALTON_TRANSCRIPTION_SERVICE_URL` 即自动回退至宿主桥 `:8960/transcriptions`。
-
-### 第 3 批：跨平台内部研究连接器与入库模块拆分（`guidepoint`、`company-wiki`、`sales-notes`、`tmtb`、`funda-ai`）（中等风险）
-
-- **范围**：
-  1. 按 Agent Plugins 1.0.0 规范交付 `dalton-guidepoint`、`dalton-company-wiki`、`dalton-sales-notes`、`dalton-tmtb`、`dalton-funda-ai` 五个 `stdio` MCP 连接器包（通用 Wiki 连接器入公开仓库，其余商业/内部连接器入私有仓库），在 `MCP_SERVER_CAPABILITY_MAP` 与 `BUNDLED_PLUGIN_CAPABILITY_MAP` 完成绑定。
-  2. 新增后端 `src/dalton/wiki_store/ingest.py` 与 `src/dalton/sales_notes_store/ingest.py`，切换 `wiki_tools.py` 与 `ingest_tools.py` 走后端直写入库。
-  3. 上线共享传输适配层 `plugins/dalton/skills/_shared/connector_transport.py` 与 `federated_search.py`，完成 3.2 节中相关技能脚本与 `sources.yaml` / `health.py` 迁移。
-- **数据库迁移**：无（插件自动扇出写入现有的 `user_mcp_servers` 与 `workspace_mcp_servers` 表，见 `src/server/services/plugins/server_fanout.py:1-60`）。
-- **验收条件**：核心安装在 Linux 下单独开启 `company_wiki`（或挂载私有 `guidepoint` 插件）时，沙箱自动生成 `tools.dalton_company_wiki` 且 `ingest_company_wiki` 读写闭环通过；Everflow 生产下线 `com.dalton.guidepoint-mcp-proxy` 守护进程，五条旧路由在桥上连续 14 天零命中。
-- **回滚方式**：关闭新插件挂载开关并将 `DALTON_INGEST_VIA_BRIDGE=true` 置真，`connector_transport.py` 自动回退至 `tools.researchdata`。
-
-### 第 4 批：macOS 专属 `dalton-alphaengine` 连接器拆分与技能脚本全量切流（中高风险）
-
-- **范围**：
-  1. 在私有仓库交付 `dalton-alphaengine` 插件与宿主机 `dalton_alphaengine_server.py`（监听 `127.0.0.1:8951`），完整迁入 `alphaengine_search_cache.py`（SQLite v4 缓存、单飞、熔断器、30 分钟同公司提示、`X-Dalton-Caller-Token` 验签与配额日志），同时覆盖 `alphaengine` 与 `transcript` 检索。
-  2. 更新全部技能 Markdown 的 `<!-- DALTON_CAP:... -->` 标签，将笼统的 `researchdata_bridge` 替换为细粒度来源能力标签；美股 SEC 调用在 `plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:932-943` 等处统一收口至 `dalton_sec`。
 - **数据库迁移**：无。
-- **验收条件**：Everflow Mac 生产跑通 `dalton-thesis-delta`、`dalton-bullbear-tracker`、`dalton-sector-delta`、`dalton-earnings-flash` 实盘回归，缓存命中率、当日读文额度统计及 `prov:` 引用展开与切流前完全一致；Linux 核心安装启动日志确认 `alphaengine` 自动静默关闭且零报错。
-- **回滚方式**：在 `agent_config.dalton.yaml` / `.env` 关闭 `dalton_alphaengine` URL，技能适配层即时回退走 `:8960` 旧桥的 `alphaengine` 路由。
-
-### 第 5 批：宿主任务守护剥离、第 ③ 阶段网关交接与 `researchdata_bridge.py` 退役（收官批）
-
 - **范围**：
-  1. 将 `/internal/{market-digest,ai-finance,data-tasks}/*` 迁入 `scripts/dalton/ops/prod/host_task_daemon.py`（承接 `fund_automations` 与 `data_jobs` 的 7 个宿主任务），`cn-hk` 迁入可选插件 `dalton-cnhk`。
-  2. 配合第 ③ 阶段完成 `/notify`、`/feishu/*`、`discord-history` 向 `integrations/dalton-channel-gateway/` 的正式切流（开启 `DALTON_NOTIFY_VIA_GATEWAY=true`）。
-  3. 确认 `dalton-bridge-route-hits.jsonl` 全路由连续 14 天零命中后，卸载 `com.dalton.researchdata-bridge` launchd 服务，移除 `plugins/dalton_data/` 与 `scripts/dalton/researchdata_bridge.py`，将 `CapabilityId.RESEARCHDATA_BRIDGE` 标记为历史兼容别名并清理遗留配置。
-- **数据库迁移**：可选清理迁移 `d050`（或 `d051`，视前序占用情况），幂等清理 `user_mcp_servers` / `workspace_mcp_servers` 中残留的 `researchdata` 墓碑行。
-- **验收条件**：Everflow 生产在完全停止 `:8960` 进程的情况下稳定运行全部日常对话、研究技能、数据采集任务与飞书通知；`test_core_capabilities_gate.py` 与 `test_everflow_profile_parity.py` 全部绿灯。
-- **回滚方式**：归档删除前保留整包启动脚本 1 个迭代周期，必要时重新加载 `com.dalton.researchdata-bridge.plist` 恢复旧进程。
+  1. 交付独立服务 `dalton-transcription`（监听 `:8965`，内置 `asr_jobs.py`、`seed_asr_client.py` 与目录排他锁 `var/dalton/asr_jobs/.owner.lock`），在 `docker-compose.core.yml` 增加可选 `transcription` profile，在 Everflow 增加 `com.dalton.transcription` 服务。
+  2. 同步修改 `src/dalton/capabilities.py:151-159`（移除 `TRANSCRIPTION` 的 `depends_on=(RESEARCHDATA_BRIDGE,)`，保留 `:425-433` 转写对象存储校验）与 `src/dalton/services/transcriptions.py:461-584`（`_require_transcription_bridge_url` 改为校验 `CapabilityId.TRANSCRIPTION` 并请求 `DALTON_TRANSCRIPTION_SERVICE_URL` + `DALTON_TRANSCRIPTION_TOKEN`）。
+- **转写任务交接与三步切换规程**：
+  - **步骤 A（单处理方排他交接）**：
+    1. 选定无活跃长音频提交的维护窗口，在旧桥配置写入 `DALTON_BRIDGE_ASR_DISABLED=true` 并重启 `com.dalton.researchdata-bridge`——旧桥跳过启动时的 `recover_incomplete_jobs()`（`scripts/dalton/researchdata_bridge.py:26191-26194`），释放对 `var/dalton/asr_jobs/` 的内存锁并对 `/transcriptions*` 返回 `503`；
+    2. 启动 `com.dalton.transcription`（`:8965`），挂载同一宿主机目录 `var/dalton/asr_jobs/`（完整保留全部历史任务状态 JSON、`/result/raw` 原始逐字稿文件及 `asr_usage.jsonl` 用量账本），获取 `.owner.lock` 文件排他锁后执行唯一的 `recover_incomplete_jobs()` 接续未完成任务；
+    3. 更新 `.env` 中 `DALTON_TRANSCRIPTION_SERVICE_URL` 并**重启 `backend` 容器**（`dalton_asr.py` 走后端 API，无需刷新沙箱）。
+  - **步骤 B（可回退观察）**：旧桥转写代码保留但处于 `DALTON_BRIDGE_ASR_DISABLED=true` 静默态。如需回退：先停止 `com.dalton.transcription`（释放 `.owner.lock`），再将旧桥 `DALTON_BRIDGE_ASR_DISABLED=false` 重启接管目录，最后将后端切回旧桥 URL 并重启 `backend` 容器，确保任一时刻全机仅有一个进程恢复和提交火山引擎付费任务。
+  - **步骤 C（清理）**：核验历史任务查询、`/result/raw` 流式下载、新建/取消/重试任务及 `asr_usage.jsonl` 记账正常且旧桥转写端点 14 天零请求后，删除桥内转写路由代码。
+- **验收条件**：切流前创建的历史已完成任务与进行中任务在切流后通过 `/api/v1/dalton/transcriptions/{id}` 及 `/result/raw` 均返回 200；核心安装在配置转写专用存储后可独立启用 `transcription`。
+
+#### 第 3 批：公开插件扩展（`dalton_sec` 全操作、`dalton_macro`）与五路内部研究连接器 + 跨库初筛上线（中等风险）
+
+- **数据库迁移**：无。
+- **范围**：
+  1. 公开仓库扩展 `plugins/dalton_sec/` 覆盖原 `sec` 全部 11 个操作，新增 `plugins/dalton_macro/` 覆盖 `fred` 与 `treasury`（TGA/债务），更新 `plugins/langalpha_market_data/fundamentals_mcp_server.py:845-858` 文档串。
+  2. 部署宿主机 `com.dalton.research-host`（`:8951`），上线 `dalton-guidepoint`、`dalton-company-wiki`、`dalton-sales-notes`、`dalton-tmtb`、`dalton-funda-ai`、`dalton-research-all`（含 `all` 检索、`read` 前缀分派与 `sales-mail`）六个连接器及 `:8951/ingest/{wiki,sales-notes}` 受控写口；扩展 `src/ptc_agent/config/plugins.py:100-125` 支持 `DALTON_EXTRA_PLUGINS_DIR`。
+  3. **同批改完全部关联能力入口后解绑依赖**：更新 `MCP_SERVER_CAPABILITY_MAP`、`BUNDLED_PLUGIN_CAPABILITY_MAP`、`BRIDGE_ROUTE_CAPABILITY_MAP`（含 `sales-mail`）、`src/dalton/provenance/declared_sources.py:13`、`src/dalton/tools/__init__.py:393-404`（`ingest_research` 改挂 `company_wiki | sales_notes`）、`web/src/pages/ChatAgent/components/dalton/AutoIngestToggle.tsx:26`、`src/dalton/data_map/builder.py:287-355`、`src/dalton/content_assembly.py:240-253,281-353`，随后移除 `guidepoint`、`company_wiki`、`sales_notes`、`tmtb`、`funda_ai` 五项能力对 `RESEARCHDATA_BRIDGE` 的 `depends_on`。
+  4. 上线 `connector_transport.py` 并迁移相关技能脚本与 `workflows/topic-research/workflow.js`（此时 `alphaengine` 仍走旧桥或兼容路由，下一批迁出）。
+- **三步切换与回滚**：
+  - **步骤 A（切流）**：先停 `com.dalton.guidepoint-mcp-proxy`（`:8943`），启动 `com.dalton.research-host`（`:8951`）独占接管 `guidepoint_mcp_tokens.json` 唯一刷新写权与本地库访问（并将旧桥的 Guidepoint 上游临时指向 `:8951` 以保证过渡期旧桥回退同样可用且共享单一刷新方）；重新构建前端静态资源（因 `AutoIngestToggle.tsx` 改动）、**重建并重启 `backend` 容器**，并对所有运行中的活跃工作区沙箱触发资产重同步（刷新 `mcp_client_config.json` 与 `tools/dalton_*.py` 包装器）。
+  - **步骤 B（可回退观察）**：旧桥与 `:8943` plist 模板保留在盘。如需回退：恢复上一版发布代码与配置，停 `:8951` Guidepoint 模块并重新 `launchctl bootstrap` 拉起 `com.dalton.guidepoint-mcp-proxy`，重建 `backend`/前端容器并重刷活跃沙箱包装器。
+  - **步骤 C（清理）**：双指标观察 14 天并实跑全部周频消费者通过后，移除 `com.dalton.guidepoint-mcp-proxy.plist.template` 及旧桥上对应子路由。
+- **验收条件**：核心安装单独开启 `company_wiki` 时，`<data_map>`、`AutoIngestToggle`、`ingest_company_wiki`、`tools.dalton_company_wiki` 读写与 `dalton_sec` 11 个操作、`dalton_macro` TGA 查询全部贯通；沙箱容器内零商业数据库挂载、零供应商密钥。
+
+#### 第 4 批：`dalton-alphaengine`、`dalton-office`、`dalton-estimates`、`dalton-cnhk`、`dalton-market-regime`、`dalton-community` 全量切流（中高风险）
+
+- **数据库迁移**：无。
+- **范围**：
+  1. 在宿主机 `com.dalton.research-host`（`:8951`）启用 `/mcp/alphaengine`（含 `transcript`、SQLite v4 搜索缓存、并发限流、熔断与 JSON 当日读文计数）、`/mcp/office`（`tmeet` + `gcal`）、`/mcp/estimates`、`/mcp/cnhk`、`/mcp/market-regime`、`/mcp/community`。
+  2. 注册 `CapabilityId.ESTIMATES`、`CapabilityId.CN_HK`、`CapabilityId.COMMUNITY_SOURCES` 及 `tmeet`/`gcal` 能力映射，解除 `alphaengine` 对 `RESEARCHDATA_BRIDGE` 的 `depends_on`。
+  3. 完成 3.2 节剩余全部技能脚本、工作流与全部 `SKILL.md` 细粒度 `DALTON_CAP` 标签的迁移，下线 `plugins/dalton_data/` 默认挂载。
+- **单一缓存与配额持有方切换及回滚规程**：
+  - **步骤 A（切流）**：为确保 AlphaEngine 并发上限、SQLite v4 搜索缓存与 `cfg.usage_file` 当日读文计数只有唯一写入方，在旧桥设置 `DALTON_BRIDGE_MCP_DISABLED=true` 重启旧桥（停用旧桥 `/mcp` 入口，释放 `alphaengine_search_cache.sqlite3` 与 `usage_file` 写锁），同窗口启用 `:8951/mcp/alphaengine` 接管同一份缓存库与 `usage_file`；**重建并重启 `backend` 容器**，重刷全部已有工作区沙箱使 `tools.dalton_alphaengine` 等包装器生效并清理旧 `tools.researchdata` 包装器。
+  - **步骤 B（可回退观察）**：如需回退，先停 `:8951` AlphaEngine 模块释放缓存与计数文件写锁，将旧桥 `DALTON_BRIDGE_MCP_DISABLED=false` 重启，回退后端配置/代码版本重建 `backend` 并重刷沙箱恢复 `tools.researchdata`。
+  - **步骤 C（清理）**：连续 14 天旧桥 `/mcp` 零命中且新连接器成功调用量、缓存命中率、全部周报与财报技能实跑通过后，删除桥内全部 `/mcp` 处理代码与 `plugins/dalton_data/` 目录。
+- **验收条件**：全仓静态门控测试确认业务技能与工作流零残留 `tools.researchdata` 调用；Everflow Mac 生产跑通 AlphaEngine 全 9 个操作（含 `auth_status`、`list_filters` 公司/自选股词典）与 `transcript` 续查。
+
+#### 第 5 批：宿主任务守护进程剥离、桥缩减为纯通知/飞书过渡代理与遗留行清理（收官批，与第 ③ 阶段解耦）
+
+- **数据库迁移**：**`d051_cleanup_legacy_researchdata_mcp_rows`**（幂等删除 `user_mcp_servers`、`workspace_mcp_servers` 与工具 schema 缓存表中历史遗留的 `researchdata` 记录；`downgrade()` 为无副作用空操作或按备份恢复）。
+- **范围**：
+  1. `/internal/{market-digest,ai-finance}/*` 切入 `com.dalton.research-host`（`:8951`）管理口。
+  2. 上线 `scripts/dalton/ops/prod/host_task_daemon.py`（`com.dalton.host-task-daemon`，监听 `127.0.0.1:8952`），完整承接 `/internal/data-tasks/{host-run,host-kill}`。
+  3. **将 `scripts/dalton/researchdata_bridge.py` 缩减为纯通知与飞书/Discord 过渡代理**（仅保留 `/healthz`、`/notify`、`/feishu/*` 8 个子路径及 `discord-history`，待第 ③ 阶段渠道网关就绪后再整体下线 `:8960`）。
+  4. 更新 `scripts/dalton/ops/prod/deploy_main.sh:633,658,662,915-924` 与 `scripts/dalton/ops/research_runtime_migrate.sh:806-812` 管理 `com.dalton.research-host`、`com.dalton.host-task-daemon` 与缩减桥。
+- **宿主任务守护进程交接与三步切换规程**：
+  - **步骤 A（单执行方受控交接）**：
+    1. 检查 `.dalton-host-runner-state.json` 确认当前 `active_runs` 为空（避开 `T1`/`T29`/`T58`/`T34`/`T60`/`T61`/`T87` 排程时刻）；
+    2. 在旧桥设置 `DALTON_BRIDGE_HOST_TASKS_DISABLED=true` 重启旧桥，使其跳过启动时的 `recover_host_runner_state_on_startup()`（`scripts/dalton/researchdata_bridge.py:26196-26199`）并拒绝新 `host-run`；
+    3. 启动 `com.dalton.host-task-daemon`（`:8952`），获取 `.dalton-host-runner.owner.lock` 排他锁后加载原 `.dalton-host-runner-state.json`（保留单调递增的 `max_seen_generation`，拦截旧代次重放，见 `scripts/dalton/researchdata_bridge.py:19168-19380,20049-20056`），启用独立令牌 `DALTON_HOST_RUNNER_TOKEN`、命令白名单 `resolve_host_run_command_spec`、`BBG_HOST_JOB_KEYS` 专属 `mirror` 校验及 `scripts/dalton/bridge_subprocess_env.py:385-420` 按任务最小化凭据注入；
+    4. 执行 `alembic upgrade d051`，切换后端 `DALTON_HOST_RUNNER_URL` 并**重启 `backend` 容器**。
+  - **步骤 B（可回退观察）**：回退时先确认 `:8952` 无运行中 `pgid`，停止 `com.dalton.host-task-daemon` 释放 `.owner.lock`，再开启旧桥宿主任务开关并切回后端配置重启 `backend`。
+  - **步骤 C（清理）**：实跑核验 BBG 拉取、市场摘要与 AI Finance 日报连续 14 天稳定且旧桥内部任务端点零请求后，完成桥代码瘦身定稿。
+- **验收条件**：第 5 批在不依赖第 ③ 阶段渠道网关改动的条件下独立合并上线；飞书文档与卡片通知经缩减桥照常工作，研究检索、嵌入、转写、宿主定时任务全部在各自独立组件稳定运行。
 
 ---
 
 ## 7. 测试
 
-### 7.1 单元测试（每次提交必跑，`uv run pytest tests/unit/`）
+### 7.1 单元测试与静态门控测试（每次提交必跑，`uv run pytest tests/unit/`）
 
-| 批次 | 新增与更新的单元测试覆盖点 |
-|---|---|
-| 第 1 批 | 1. 更新 `tests/unit/dalton/test_core_capabilities_gate.py:244-540`（`TestCapabilityRegistry`）：验证 `company_wiki`、`guidepoint`、`transcription` 等在 `researchdata_bridge=False` 时可单独解析为开启态；验证 `monkeypatch.setattr(sys, "platform", "linux")` 下 `alphaengine` 恒为关闭态。<br>2. 扩展 `tests/unit/dalton/test_embedder_retry.py:1-105` 并新增后端嵌入客户端单测：用 `httpx.MockTransport` 测试批量 100 条分片、瞬态 429/503 重试、维度校验及回退逻辑。<br>3. 新增运维状态文件解析单测：验证 `src/dalton/autonomy/system_jobs.py:261-315` 对 `ops_jobs_status.json` 正常、过期、缺失三种状态的解析。<br>4. 更新 `tests/unit/dalton/test_declared_sources.py:1-120`：覆盖全部新连接器服务名的 `_sources` 展开。 |
-| 第 2 批 | 扩展 `tests/unit/dalton/test_transcriptions.py:1-120` 与 `tests/unit/dalton/test_transcription_master_switch.py:1-100`：契约测试 `src/dalton/services/transcriptions.py:461-584` 对独立转写服务 6 个端点的请求头、流式下载 `/result/raw`、独立开关与错误码映射。 |
-| 第 3 批 | 1. 更新 `tests/unit/dalton/test_core_capabilities_gate.py:2144-2378`（`TestBundledPluginsAndMcpRegistrationGate` 与 `TestBatch3BackendTextAndSkillGates`）：校验新连接器注册表映射与技能 Markdown 按单源能力裁剪结果。<br>2. 扩展 `tests/unit/dalton/test_wiki_ingest.py:1-120` 并新增后端直写入库测试：在 `tmp_path` SQLite 库上验证幂等写入、并发文件锁与混合检索回读。<br>3. 新增沙箱技能适配层单测：验证 `connector_transport.py` 在“新连接器就绪 / 仅旧桥就绪 / 能力关闭”三种状态下的路由选择。 |
-| 第 4 批 | 复用并扩展 `tests/unit/dalton/test_alphaengine_search_cache.py:1-120`（验证 SQLite v4 缓存命中、`fresh=True` 绕过、熔断器打开/半开恢复、`X-Dalton-Caller-Token` 验签拒绝伪造令牌）；更新 `tests/unit/dalton/test_everflow_profile_parity.py:142-281` 确保 Everflow 形态下 `<data_map>` 与系统提示词快照对齐。 |
-| 第 5 批 | 验证清理 `researchdata` 遗留配置后的迁移幂等性及全量门控回归。 |
+1. **宿主平台判定与容器环境解耦测试（`tests/unit/dalton/test_core_capabilities_gate.py:244-540`）**：
+   - 在 `monkeypatch.setattr(sys, "platform", "linux")` 条件下（模拟 Linux Docker 后端容器），断言 `DALTON_HOST_PLATFORM=macos` 时 `alphaengine` 正常开启、`DALTON_HOST_PLATFORM=linux` 时即使设置 `DALTON_CAP_ALPHAENGINE=true` 仍解析为关闭；再次在 `sys.platform == "darwin"` 下运行同一组断言，证明容器内 `sys.platform` 对结果零影响。
+2. **返回结构、分页与溯源契约测试（新增 `tests/unit/dalton/test_connector_envelope_contract.py` + 扩展 `tests/unit/dalton/test_declared_sources.py:1-120`）**：
+   - 直接调用 `plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py:946-1055` 的 `_extract_route_page_info` 与 `_extract_route_items_with_page_info` 校验每个连接器响应样例，断言 `cursor`、`has_more`、`total_upstream`、`returned` 准确提取，断言 `dalton_research_all` 保留 `alphaengine`、`guidepoint`、`source_status` 及按前缀 `read` 分派。
+   - 校验 `dalton_company_wiki.list` 接收 `params.indexed_since`、`dalton_alphaengine` 包含 `auth_status` 及 `list_filters` 的 `companies`(`params.query`)/`watchlist_stocks`(`params.group_id`) 参数校验。
+   - 用 `expand_declared_sources`（`src/dalton/provenance/declared_sources.py:81-120`）校验全部 14 个连接器服务名的 `_sources` 展开，并断言任何连接器响应均不同时携带空 `_declared_sources: []` 与非空 `_sources`。
+3. **全仓 `researchdata` 调用点静态归宿门控测试（新增 `tests/unit/dalton/test_researchdata_callers_accounted.py`）**：
+   - 静态扫描 `plugins/`、`workflows/`、`src/`、`web/src/`、`scripts/` 中所有 `tools.researchdata`、`researchdata.`、`DALTON_CAP:researchdata_bridge`、`:8960` 引用：在第 1–3 批对照显式待迁白名单防新增耦合；第 4–5 批收官后断言除缩减桥保留的飞书/通知过渡模块外，业务代码与技能提示词零残留旧桥研究调用。
+4. **凭据与原始商业库不进沙箱门控测试（扩展 `tests/unit/dalton/test_core_capabilities_gate.py:2144-2378`）**：
+   - 构造启用全部商业连接器（`DALTON_EXTRA_PLUGINS_DIR` 挂载测试包）的沙箱配置，断言 Docker `host_config["Binds"]`（`src/ptc_agent/core/sandbox/providers/docker.py:794-804`）不包含任何宿主机 SQLite 库或 `<DALTON_RESEARCH_HOME>` 目录，且沙箱环境变量与 `.agents/tools/` 配置文件不包含 `GUIDEPOINT_CLIENT_SECRET`、`GUIDEPOINT_REFRESH_TOKEN`、`GEMINI_API_KEY`、`SEED_ASR_*`、`FEISHU_APP_SECRET`。
+5. **嵌入维度锁定与防混写单测（扩展 `tests/unit/dalton/test_embedder_retry.py:1-105` + 新增元数据单测）**：
+   - 验证 `dalton_embedding_metadata` 在模型名或维度与锁定值存在差异时立即抛出配置异常，且 `src/dalton/conversations/search.py:262-275` 将该异常直接向上传递；验证 `d050` 在已有 3072 维表上保持原模型与 `RETRIEVAL_DOCUMENT` / `RETRIEVAL_QUERY` 任务类型不变。
+6. **转写排他恢复与宿主任务状态机单测（扩展 `tests/unit/dalton/test_transcriptions.py:1-120`、`tests/unit/dalton/test_transcription_master_switch.py:1-100` 及宿主执行器单测）**：
+   - 验证 `.owner.lock` 阻止双进程并发 `recover_incomplete_jobs()`，覆盖旧任务查询、取消、重试与 `/result/raw` 下载；验证 `host_task_daemon.py` 对 `stale_generation`（409）、`fence_lost`（409）、遗留 `pgid` 清理、命令白名单拒绝与任务执行中途重启/取消的处理。
 
-### 7.2 GitHub Actions 从零安装集成测试（`.github/workflows/standalone-core-e2e.yml`）
+### 7.2 GitHub Actions 从零安装与升级集成测试（`.github/workflows/standalone-core-e2e.yml`）
 
-在零密钥 Ubuntu Runner（`.github/workflows/standalone-core-e2e.yml:52-176`）导出纯净发行目录 `/tmp/dalton-core-dist` 后，扩展 `tests/standalone/checks/` 验收脚本：
+在零密钥 Ubuntu Runner（`.github/workflows/standalone-core-e2e.yml:52-176`）上由 `scripts/standalone/` 驱动两类端到端验证：
 
-1. **打包隔离扫描（`package_release.sh`）**：确认商业私有连接器代码零混入导出目录，同时公开连接器接口（`dalton_sec`、`dalton-company-wiki`、嵌入客户端、转写客户端）完整存在于导出树。
-2. **后端嵌入与归档闭环（扩展 `tests/standalone/checks/b2_backend_capabilities.py`）**：将 `GEMINI_API_KEY` / 嵌入端点指向 `tests/fakes/fake_openai_server.py` 扩展的 `/v1/embeddings` 假端点，开启 `DALTON_CAP_CONVERSATION_ARCHIVE=true`，验证纯容器栈环境下完成对话嵌入写入与混合检索。
-3. **独立 Wiki 读写闭环（扩展 `b2_backend_capabilities.py` 与 `b3_skills_prompts_ui.py`）**：单独开启 `DALTON_CAP_COMPANY_WIKI=true`，验证：
-   - `<data_map>` 仅出现 `company-wiki` 与公共源，其余商业源保持隐藏；
-   - 调用 `ingest_company_wiki` 落盘测试词条后，沙箱 `ExecuteCode` 通过 `from tools.dalton_company_wiki import search, read_document` 成功检索并回读全文，同时生成合法 `prov:` 溯源记录；
-   - `alphaengine` 在 `ubuntu-latest` 上即使显式设置 `DALTON_CAP_ALPHAENGINE=true` 仍被平台守卫安全拦截关闭。
-4. **独立转写服务假桩验证**：在 `tests/fakes/` 下提供 50 行轻量 `fake_transcription_server.py`，验证开启 `DALTON_CAP_TRANSCRIPTION=true` 时后端对账循环与 `/api/v1/dalton/transcriptions` 接口端到端贯通。
+1. **每批纯净发布包从零启动检查（扩展 `tests/standalone/checks/b2_backend_capabilities.py` 与 `b3_skills_prompts_ui.py`）**：
+   - `package_release.sh` 导出后验证 `DALTON_EXTRA_PLUGINS_DIR` 缺失或未设置时后端与沙箱干净启动；验证 `init.sh` 自动写入 `DALTON_HOST_PLATFORM=linux` 且 `alphaengine` 保持关闭。
+   - **1536 维向量检索真实命中检查**：在 `tests/fakes/fake_openai_server.py` 提供返回确定性 1536 维正交向量的 `/v1/embeddings` 端点，初始化核心新装库并写入一条正文字面与查询词零重叠的对话卡片，调用混合检索断言 `dense_hits` 命中该卡片且 `dense_score > 0`。
+   - **公开连接器与独立能力检查**：验证 `dalton_sec` 扩展操作与 `dalton_macro` 在沙箱 `ExecuteCode` 内可调用并产出 `prov:` 引用；开启 `company_wiki`（连接测试容器内开源 `wiki-service`）验证 `AutoIngestToggle`、`ingest_company_wiki` 与 `tools.dalton_company_wiki.list(params={"indexed_since": ...})` 端到端闭环；开启假桩转写服务与对象存储配置验证 `transcription` 全流程。
+2. **每批从上一版升级与沙箱重装配检查（扩展 `tests/standalone/checks/b6_tls_backup_upgrade.py`）**：
+   - 基于上一版数据库快照与已存在的运行中沙箱工作区执行升级（运行 `alembic upgrade head`），验证：① 既有沙箱重新连接时自动更新 `mcp_client_config.json` 与 `tools/` 包装模块；② 当某项能力在升级后被关闭时，即便沙箱脚本尝试请求旧桥路径也被路由门拒绝（返回 `capability_disabled`）。
 
-### 7.3 仅能在 Everflow 生产 Mac 上验证的项目
+### 7.3 Everflow 生产 Mac 实机验证与回滚演练
 
-以下项目强依赖 macOS 图形桌面会话、系统钥匙串及真实机构账号，统一在 Everflow 生产 Mac 上通过灰度验收脚本执行：
+由 `scripts/dalton/ops/prod/` 下的验收脚本在 Everflow Mac 宿主上逐批执行：
 
-1. **AlphaEngine 桌面态与钥匙串链路**：验证 `com.dalton.alphaengine-connector`（`:8951`）-> `com.dalton.alphaengine-mcp`（`:8950`）-> macOS `security` CLI 读取 `dalton-alphaengine` 钥匙串及 `/Applications/AlphaEngine.app` 登录态，完成真实 `search_library`、`get_document`、`search_transcripts` 与录制状态查询。
-2. **Colima 容器跨网桥调用与 Caller Identity 验签**：从运行在 Colima Docker `sandbox-net` 内的真实沙箱容器发起 `tools.dalton_alphaengine` 调用，核验 `~/Library/Logs/alphaengine_usage.jsonl` 中正确记录真实的 `user_id`、`workspace_id`、`thread_id` 及缓存命中标记。
-3. **真实商业上游联调**：验证 `dalton-guidepoint` `stdio` 子进程在沙箱内使用真实 Auth0 凭据完成令牌刷新并返回问答摘录；验证 `dalton-transcription` 连接火山引擎北京区 TOS 与豆包 Seed-ASR 2.0 完成真实长音频说话人分离转写。
-4. **宿主专属任务回归**：验证 `T1`/`T29`（SSH 触发 Windows BBG 刷新）等 `runner: "host"` 任务与 `com.dalton.pg-backup` 运维状态快照在切流后按既定时区调度正常执行。
+1. **宿主机直连与调用方签名验签**：从 Colima 沙箱容器发起 `tools.dalton_alphaengine`、`tools.dalton_guidepoint` 等全部连接器调用，核验 `http://host.docker.internal:8951` 可达、`X-Dalton-Caller-Token` 验签通过且工作区/线程归属准确落入配额日志，`/healthz` JSON 当日读文计数准确累加。
+2. **真实商业源与原采集脚本全量实跑**：在生产工作区实跑 `dalton-thesis-delta`、`dalton-bullbear-tracker`（含 `dalton_research_all.read` 全文分页）、`dalton-mark-weekly-newenergy`、`dalton-richard-coverage-weekly`、`dalton-humanoid-robot-weekly`、`dalton-tmeet-weekly-minutes`、`dalton-richard-earnings` 与 `T1` BBG 宿主任务，对比切流前后产物完整性。
+3. **每批上线前预演回滚**：在每批正式观察期开始前，按 6.2 节的步骤 B 实操演练一次回退与再切回（含第 2 批转写 `.owner.lock` 交接回退、第 3 批 Guidepoint 代理恢复、第 4 批 AlphaEngine 缓存写锁交接、第 5 批宿主任务 `.dalton-host-runner-state.json` 代次衔接），确认回退耗时与步骤全部受控。
 
 ---
 
@@ -434,31 +508,13 @@
 
 ### 8.1 主要技术风险与应对措施
 
-| 风险点 | 影响说明 | 缓解与应对措施 |
+| 风险点 | 影响说明 | 应对措施 |
 |---|---|---|
-| 沙箱内多个 `stdio` MCP 子进程的内存叠加 | 将 5 个研究源全拆为独立 `stdio` 子进程后，Everflow 全开工作区沙箱会多启动数个 Python 进程 | 沙箱 supervisor 采用惰性按需启动与空闲回收机制；内部 SQLite 连接器共享轻量标准库 `sqlite3`（单进程常驻内存 < 35 MB），重负载向量计算统一走外部 Embedding API |
-| 技能提示词裁剪颗粒度变细后的组合膨胀 | 单篇 `SKILL.md` 同时引用多个研究源时，独立开关产生多种启用子集组合 | 在 `content_assembly.py` 已有 `DALTON_CAP:a|b|c` 或语法基础上，章节级使用或表达式（任一内部源开启即保留章节框架），具体源列表行按各自单能力标签逐行裁剪 |
-| `company-wiki` 与 `sales-notes` 读写并发竞争 SQLite 锁 | 后端进程写入 `vectors.db` 的同时，沙箱 `stdio` 连接器挂载同一文件执行只读检索 | SQLite 统一开启 `PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;`；沙箱挂载卷使用 `:ro` 或连接串 `mode=ro`，写入仅由后端单点串行落盘 |
-| 过渡期环境变量增多导致排障复杂 | 5 个批次演进期间存在新旧地址并存 | 在 `GET /api/v1/dalton/capabilities` 与启动日志统一输出每个连接器当前绑定的传输通道（`standalone_connector` vs `legacy_bridge`），一目了然 |
+| 已有长生命周期工作区沙箱缓存旧包装器模块 | 升级后若活跃沙箱未重同步 `.agents/tools/`，可能继续导入已下线的 `tools.researchdata` | 在每批步骤 A 切流后主动触发既有沙箱 `reconnect` 资产同步（`src/ptc_agent/core/sandbox/assets.py` 根据 `mcp_servers` 指纹自动覆盖包装器并清理失效文件），并在升级检查中专项断言 |
+| `sales-notes`、`tmtb` 与 `market-digest` 共用 `market-digest/vectors.db` 的并发读写 | 入库、TMTB 同步与检索并发访问同一宿主机 SQLite 库 | 统一收口于单实例 `dalton-research-host`（`:8951`）宿主机进程内，宿主机文件系统本地读写正常支持 WAL + `busy_timeout=5000` 及单写锁队列，并在查询层强制绑定来源路由过滤条件 |
+| 转写或宿主任务切换瞬间双进程并发恢复 | 新旧守护进程若同时扫描同一状态目录，会重复提交付费 ASR 或重复拉起 BBG 任务 | 强制引入宿主机文件排他锁（`asr_jobs/.owner.lock` 与 `.dalton-host-runner.owner.lock`），严格执行“旧桥置禁用开关重启释放 → 新服务拿锁启动 → 切换后端”的顺序 |
+| SEC 11 个操作迁入公开插件 `dalton_sec` 的解析边界差异 | 原 `findata-analyst` 对特殊表单（如 6-K/20-F 附件与 Item 切分）有定制规则 | 第 3 批上线前用 Everflow 覆盖池全部美股及中概 ADR 近 4 个季度的真实 10-K/10-Q/8-K/6-K/20-F/Form 4 样本对新旧实现做离线回归比对，对齐输出字段后再切流 |
 
-### 8.2 待用户拍板的事项（含推荐选项）
+### 8.2 待用户拍板的事项
 
-1. **私有商业连接器仓库向生产与客户环境的交付方式**
-   - **背景**：公开仓库只保留能力开关与接口，商业连接器（`dalton-alphaengine`、`dalton-guidepoint`、`dalton-sales-notes`、`dalton-tmtb`、`dalton-funda-ai`）存放在私有仓库。后端与沙箱发现插件目前扫描 `plugins/` 目录（`src/ptc_agent/config/plugins.py:60-115`）。
-   - **选项 A（推荐）**：在 `src/ptc_agent/config/plugins.py` 支持可选环境变量 `DALTON_EXTRA_PLUGINS_DIRS`（冒号分隔目录列表），Everflow 生产通过 `docker-compose.dalton.yml` 将宿主机私有仓库 `~/Projects/dalton-connectors/plugins` 直接挂载进容器与沙箱，主仓库与私有仓库各自独立维护版本，零文件拷贝。
-   - **选项 B**：部署时通过构建脚本将私有仓库插件复制到 `plugins/` 目录下（由 `.gitignore` 忽略）。
-
-2. **核心安装下 `/embed` 的向量维度与提供商标准化策略**
-   - **背景**：Everflow 现有 `conversations` 与 `wiki/vectors.db` 均采用 Gemini Embedding 3072 维向量；独立核心安装用户可能只配置 OpenAI 兼容密钥（如 `text-embedding-3-small` 1536 维或 `text-embedding-3-large` 3072 维）。
-   - **选项 A（推荐）**：后端 `src/dalton/embeddings/` 同时内置 Gemini 与 OpenAI 兼容两种协议适配器，并在 `dalton.yaml` / `.env` 中支持配置 `EMBEDDING_DIMENSIONS`（Everflow 固定 3072 维无缝衔接历史库；核心安装初始化时按所选模型维度建表/建库，并在 `vectors.db` 元数据表记录模型名与维度以防混用）。
-   - **选项 B**：核心安装强制要求配置支持 3072 维输出的嵌入模型（Gemini 或 `text-embedding-3-large`）。
-
-3. **跨库初筛路由 `research(route="all")` 的最终去留**
-   - **背景**：原桥提供 `route="all"` 对 6 个研究源做服务端并行扇出（`scripts/dalton/researchdata_bridge.py:14042-14422`）。核查代码库可见，所有确定性技能脚本（`thesis-delta`、`bullbear-tracker`、`sector-delta` 等）均已自行按单源并发调用，仅交互式 `ExecuteCode` 偶有调用 `route="all"`。
-   - **选项 A（推荐）**：采用沙箱进程内聚合方案，预置轻量 Python 辅助模块 `from research_helpers import search_all_sources`（自动并发调用当前工作区已启用的连接器包装函数），并在系统提示词中引导模型按需直调具体连接器或该辅助函数。
-   - **选项 B**：直接下线 `all` 聚合入口，由模型在单次 `ExecuteCode` 脚本中显式使用 `ThreadPoolExecutor` 并发调用所需的 2–4 个连接器。
-
-4. **原桥上非核心长尾子路由（`cn-hk`、`community`、`tmeet`、`gcal`、`market-regime`）的归宿**
-   - **背景**：除 6 个核心研究源外，桥 `/mcp` 还挂有港股/A 股检索 `cn-hk`、社区抓取 `community`（`xueqiu`/`employee`/`last30days`/`x-timeline`）、腾讯会议 `tmeet`、日历 `gcal` 与本地文件 `market-regime`。
-   - **选项 A（推荐）**：`cn-hk` 独立为可选连接器插件 `dalton-cnhk`（绑定新增或复用能力开关，方便研究港股/A 股的核心安装实例选用）；`tmeet` 与 `gcal` 合并为 Everflow 内部办公小插件 `dalton-office`（受 `fund_automations` 门控）；`x-timeline` 与 `macro` 直接收口至核心已有的内置 `x_api`、`scrape` 与 `macro` MCP 服务器；`market-regime` 由沙箱直接只读读取挂载的状态文件。
-   - **选项 B**：仅将 `cn-hk` 拆为插件，其余 `tmeet`、`gcal`、`xueqiu`、`employee` 随第 5 批宿主守护脚本 `host_task_daemon.py` 保留在 Everflow 宿主机内部使用。
+无（第 1 轮提出的私有插件目录交付、嵌入维度策略、跨库初筛归属、长尾子路由拆分及分批解耦等事项均已拍板并完整落入本文 §0–§7）。
