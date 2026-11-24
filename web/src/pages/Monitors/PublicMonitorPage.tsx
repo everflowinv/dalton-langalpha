@@ -2,6 +2,7 @@ import React from 'react';
 import { useParams } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { MonitorViewer } from './MonitorViewer';
+import './Monitors.css';
 
 export default function PublicMonitorPage(): React.ReactElement {
   const { slug } = useParams<{ slug?: string }>();

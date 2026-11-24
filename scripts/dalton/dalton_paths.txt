@@ -588,3 +588,6 @@ tests/standalone/
 NOTICE
 # sync12 (#863): Dalton-only deferred copy namespace for lazy Monitors routes (/monitors, /m/:slug).
 web/src/locales/monitors/
+# Shared chats replay inline widgets (DALTON-HOOK(shared-widgets)).
+web/src/pages/SharedChat/__tests__/SharedChatView.widgets.test.tsx
+web/src/pages/ChatAgent/components/viewers/__tests__/InlineWidget.exports.test.tsx

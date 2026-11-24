@@ -10,7 +10,8 @@ interface HtmlFullscreenModalProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   title: string;
-  actions: HtmlActions;
+  // DALTON-HOOK(shared-widgets): an action left out is not offered.
+  actions: Partial<Pick<HtmlActions, 'openInNewTab' | 'downloadHtml' | 'exportPdf'>>;
   /**
    * widget-fullscreen srcDoc: display markup for this dialog only. `actions`
    * deliberately operates on the inline srcDoc, which is the widget as an

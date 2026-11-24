@@ -94,6 +94,12 @@ export interface MessageActions {
   /** Add to a sent thumbs-down's report, or withdraw it. */
   onThumbDownFollowUp?: (turnIndex: number, action: ThumbDownFollowUp) => Promise<ThumbDownFollowUpOutcome>;
   onWidgetSendPrompt?: (text: string) => void;
+  /** DALTON-HOOK(shared-widgets): which of an inline widget's export actions
+   *  the surface offers. Absent means all of them (the owner's view). A shared
+   *  view offers no new tab or PDF, which run the widget outside its sandbox
+   *  on the app's origin, and the HTML download only where the share allows
+   *  downloads. */
+  widgetExports?: WidgetExports;
   /** The thread a failed turn's card offers to report, once the server has
    *  named it. Absent where reporting is not offered (a shared view). */
   reportThreadId?: string;
@@ -110,6 +116,9 @@ const MessageActionsContext = React.createContext<MessageActions>(EMPTY_ACTIONS)
  * approvals. Named so a read-only host declares the contract instead of
  * relying on absent props to silently disable everything.
  */
+// DALTON-HOOK(shared-widgets): see MessageActions.widgetExports.
+export type WidgetExports = 'all' | 'download' | 'none';
+
 export const READ_ONLY_MESSAGE_ACTIONS: MessageActions = Object.freeze({});
 
 export function MessageActionsProvider({
