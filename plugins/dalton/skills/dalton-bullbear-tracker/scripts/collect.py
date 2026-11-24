@@ -36,6 +36,8 @@ TICKER = "MSFT"
 EXCERPT_MAX = 6000
 PARA_MAX = 1800
 MAX_INTERNAL_PAGES = 5
+MAX_AE_PAGES = 5
+MAX_AE_REQUESTS_PER_QUERY = 20
 MAX_READ_PAGES = 20
 READ_CHARS = 30000
 AE_LIMIT = 20
@@ -200,6 +202,13 @@ LEGACY_COLLECT_SOURCES_KEYS: frozenset[str] = frozenset({"internal_routes", "sec
 
 def _filter_legacy_config(cfg: dict[str, Any]) -> dict[str, Any]:
     filtered = {k: v for k, v in cfg.items() if k in LEGACY_COLLECT_CONFIG_KEYS}
+    if cfg.get("_dalton_cap_alphaengine") is False:
+        filtered["_dalton_cap_alphaengine"] = False
+    if cfg.get("_dalton_cap_researchdata_bridge") is False:
+        filtered["_dalton_cap_researchdata_bridge"] = False
+    disabled_routes = cfg.get("_dalton_cap_disabled_internal_routes")
+    if isinstance(disabled_routes, list) and disabled_routes:
+        filtered["_dalton_cap_disabled_internal_routes"] = list(disabled_routes)
     sources = cfg.get("sources")
     narrowed: dict[str, Any] = {}
     if isinstance(sources, dict):
@@ -1251,16 +1260,91 @@ def is_cursor_invalid(res: dict[str, Any], data: Any) -> bool:
     return any(_g._is_cursor_invalid_error(res, payload) for payload in payloads)
 
 
+def is_upstream_cursor_error(res: dict[str, Any], data: Any) -> bool:
+    """MCP 在上游声明还有数据但缺失或重复游标时返回 E_UPSTREAM_CURSOR。"""
+    payloads: list[dict[str, Any]] = [res] if isinstance(res, dict) else []
+    if isinstance(data, dict):
+        payloads.append(data)
+        unwrapped = unwrap_content(data)
+        if unwrapped is not data:
+            payloads.append(unwrapped)
+    for payload in payloads:
+        for candidate in _payload_dicts(payload):
+            for key in ("error_code", "code", "error", "status", "message"):
+                raw = candidate.get(key)
+                if isinstance(raw, str) and "e_upstream_cursor" in raw.lower():
+                    return True
+    return False
+
+
 def bridge_error(res: dict[str, Any], data: Any) -> str:
     if isinstance(data, dict) and data.get("error"):
         return str(data.get("error"))[:500]
     return str(res.get("error") or res.get("status") or "unknown_error")[:500]
 
 
+def _iter_response_dicts(res: dict[str, Any], data: Any) -> list[dict[str, Any]]:
+    """收集响应外层及常见封装层（structuredContent / data / content JSON 块）中的字典。"""
+    out: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    queue: list[Any] = []
+    if isinstance(res, dict):
+        queue.append(res)
+    if isinstance(data, dict):
+        queue.append(data)
+    while queue:
+        cur = queue.pop(0)
+        if not isinstance(cur, dict) or id(cur) in seen_ids:
+            continue
+        seen_ids.add(id(cur))
+        out.append(cur)
+        for key in ("structuredContent", "data"):
+            nested = cur.get(key)
+            if isinstance(nested, dict):
+                queue.append(nested)
+        content = cur.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and isinstance(block.get("text"), str):
+                    try:
+                        parsed = json.loads(block["text"])
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(parsed, dict):
+                        queue.append(parsed)
+    return out
+
+
+def _is_partial_status(res: dict[str, Any], data: Any) -> bool:
+    """响应任一层声明 status=partial 时返回 True（内层 status=error 不覆盖外层 partial）。"""
+    for candidate in _iter_response_dicts(res, data):
+        st = candidate.get("status")
+        if isinstance(st, str) and st.strip().lower() == "partial":
+            return True
+    return False
+
+
 def _known_truncation(res: dict[str, Any], data: Any) -> str | None:
     """沿用通用采集对 partial / 截断警告的判断。没有 cursor 时这种响应也是未完成。"""
     payload = data if isinstance(data, dict) else {}
     status_val, warnings = _g._extract_route_warnings_and_status(res, payload)
+    if isinstance(data, dict):
+        unwrapped = unwrap_content(data)
+        if unwrapped is not data:
+            u_status, u_warnings = _g._extract_route_warnings_and_status({}, unwrapped)
+            if u_status and str(u_status).strip().lower() in ("partial", "incomplete", "未完成"):
+                status_val = u_status
+            for w in u_warnings:
+                if w not in warnings:
+                    warnings.append(w)
+    if _is_partial_status(res, data):
+        status_val = "partial"
+    elif str(status_val or "").strip().lower() not in ("partial", "incomplete", "未完成"):
+        for candidate in _iter_response_dicts(res, data):
+            st = candidate.get("status")
+            if isinstance(st, str) and st.strip().lower() in ("incomplete", "未完成"):
+                status_val = st.strip()
+                break
     status_text = str(status_val or "").strip().lower()
     matched = [item for item in warnings if any(token in item for token in _TRUNCATION_TOKENS)]
     if status_text not in ("partial", "incomplete", "未完成") and not matched:
@@ -1361,12 +1445,50 @@ def _coerce_retry_since(value: Any) -> str | None:
         return None
 
 
-def _internal_since(last_run: dict[str, Any], global_since: str) -> str:
-    """内部库可以停在更早的重试日。显式更早的全局 since 仍然取更早的那天。"""
-    retry = _coerce_retry_since(last_run.get("internal_retry_since") if isinstance(last_run, dict) else None)
-    if retry is None:
+def _source_since(last_run: dict[str, Any], field: str, global_since: str) -> str:
+    """上次跳过或失败时写下的实际采集日若早于全局 since，重新开启后从该日起采。"""
+    saved = _coerce_day(last_run.get(field) if isinstance(last_run, dict) else None)
+    if saved is None:
         return global_since
-    return min(global_since, retry)
+    return min(global_since, saved)
+
+
+def _prev_source_collected_until(last_run: Any, field: str) -> str | None:
+    """读取该来源上次真正成功采集到的日期。
+
+    若 ``last_run`` 显式记录了 ``field``：有合法日期返回该日期，为 None/空表示从未成功采集，
+    不回退到 ``last_run["until"]``；若不含 ``field``（早前的正常成功轮次），回退到 ``until``。
+    """
+    if not isinstance(last_run, dict):
+        return None
+    if field in last_run:
+        return _coerce_day(last_run.get(field))
+    return _coerce_day(last_run.get("until"))
+
+
+def _resume_point(last_run: Any, field: str, packet: dict[str, Any]) -> str | None:
+    """跳过或失败时保存的续采位置。
+
+    有过成功采集就沿用那一天；从未成功采集（例如新工作区首轮即被跳过）时，记下本轮的起点，
+    重新开启后从这一天补采，不随每天前进的全局窗口丢掉中间的日子。
+    """
+    prev = _prev_source_collected_until(last_run, field)
+    if prev is not None:
+        return prev
+    return _coerce_day(packet.get("since"))
+
+
+def _internal_since(last_run: dict[str, Any], global_since: str) -> str:
+    """内部库可以停在更早的重试日或上次实际采集日。显式更早的全局 since 仍然取更早的那天。"""
+    candidates = [global_since]
+    if isinstance(last_run, dict):
+        retry = _coerce_retry_since(last_run.get("internal_retry_since"))
+        if retry is not None:
+            candidates.append(retry)
+        last_collected = _coerce_day(last_run.get("internal_last_collected_until"))
+        if last_collected is not None:
+            candidates.append(last_collected)
+    return min(candidates)
 
 
 def _internal_needs_retry(internal: dict[str, Any]) -> bool:
@@ -1381,13 +1503,17 @@ def _internal_needs_retry(internal: dict[str, Any]) -> bool:
     return False
 
 
+def _day_shift(day_str: str, delta_days: int) -> str:
+    return (date.fromisoformat(day_str) + timedelta(days=delta_days)).isoformat()
+
+
 def _ae_overlap_start(covered_until: str) -> str:
     day = date.fromisoformat(str(covered_until).strip()[:10])
     return (day - timedelta(days=AE_LOOKBACK_DAYS)).isoformat()
 
 
 def _completed_ae_start(default_start: str, covered_until: Any) -> str:
-    """已完成查询的下一轮起点不晚于上次覆盖日，并保留一小段重叠。"""
+    """下一轮起点不晚于上次覆盖日，并保留 AE_LOOKBACK_DAYS 天回看重叠。"""
     if not isinstance(covered_until, str) or not covered_until.strip():
         return default_start
     try:
@@ -1396,6 +1522,23 @@ def _completed_ae_start(default_start: str, covered_until: Any) -> str:
     except ValueError:
         return default_start
     return min(default_start, overlap, covered_day)
+
+
+def _ae_state_for_last_run(state: dict[str, Any]) -> dict[str, Any]:
+    """写入 last_run.json 的 AE 状态：只保留覆盖日期与状态字段，不写 cursor。"""
+    queries = state.get("queries")
+    if not isinstance(queries, list):
+        return {"queries": []}
+    cleaned: list[dict[str, Any]] = []
+    for row in queries:
+        if not isinstance(row, dict):
+            continue
+        cleaned.append({
+            key: value
+            for key, value in row.items()
+            if key not in ("cursor", "resumed_cursor")
+        })
+    return {"queries": cleaned}
 
 
 def read_document(doc_id: str) -> dict[str, Any]:
@@ -1579,6 +1722,31 @@ def _earnings_calendar_enabled(cfg: dict[str, Any]) -> bool:
     return False
 
 
+
+
+def _researchdata_bridge_capability_enabled(cfg: dict[str, Any] | None = None) -> bool:
+    """Whether the deployment's ``researchdata_bridge`` capability is on for this skill.
+
+    Read exclusively from the backend-assembled config
+    (``_dalton_cap_researchdata_bridge``), never from environment variables.
+    """
+    return not (isinstance(cfg, dict) and cfg.get("_dalton_cap_researchdata_bridge") is False)
+
+
+def _alphaengine_capability_enabled(cfg: dict[str, Any] | None = None) -> bool:
+    """Whether the deployment's ``alphaengine`` capability is on for this skill.
+
+    The backend assembles the skill's config before it reaches the sandbox
+    (``content_assembly.assemble_json_text``) and writes
+    ``_dalton_cap_alphaengine=false`` there when the capability is off; that is
+    the one channel the sandbox has, so the decision stays in
+    ``src/dalton/capabilities.py`` and is not re-derived here.
+    """
+    if not _researchdata_bridge_capability_enabled(cfg):
+        return False
+    return not (isinstance(cfg, dict) and cfg.get("_dalton_cap_alphaengine") is False)
+
+
 def _source_enabled(cfg: dict[str, Any], name: str) -> bool:
     if name == "earnings_calendar":
         return _earnings_calendar_enabled(cfg)
@@ -1595,6 +1763,14 @@ def _effective_internal_routes(cfg: dict[str, Any]) -> list[str]:
     if isinstance(sources, dict) and isinstance(sources.get("internal_routes"), list):
         return [str(r) for r in sources["internal_routes"]]
     return []
+
+
+def _has_capability_skipped_internal_routes(cfg: dict[str, Any] | None = None) -> bool:
+    """本轮配置中是否有内部路线因能力关闭被装配层过滤跳过。"""
+    if not isinstance(cfg, dict):
+        return False
+    raw = cfg.get("_dalton_cap_disabled_internal_routes")
+    return isinstance(raw, list) and bool(raw)
 
 
 def _effective_sec_forms(cfg: dict[str, Any]) -> list[str]:
@@ -1673,6 +1849,8 @@ def collect_internal(
     workspace: Path,
     run_dir: Path,
 ) -> dict[str, Any]:
+    if not _researchdata_bridge_capability_enabled(cfg):
+        return {"status": {}, "new": {}, "irrelevant": {}, "pending": {}, "withheld": {}}
     pat = _aliases_pattern(cfg)
     excluded = {str(item) for item in cfg.get("excluded_documents") or []}
     query = _research_query(cfg)
@@ -1819,7 +1997,7 @@ def collect_internal(
 
 def _has_ae_state(last_run: dict[str, Any]) -> bool:
     state = last_run.get(ae_state_key()) if isinstance(last_run, dict) else None
-    return isinstance(state, dict) and isinstance(state.get("queries"), list)
+    return isinstance(state, dict) and isinstance(state.get("queries"), list) and bool(state["queries"])
 
 
 def _ae_prev_map(last_run: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1837,7 +2015,7 @@ def _ae_prev_map(last_run: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def _legacy_ae_map(last_run: dict[str, Any], queries: list[str]) -> dict[str, dict[str, Any]]:
     """没有本 ticker 的续采状态时，用导入的覆盖日和未完成窗口初始化每一条查询。
 
-    MSFT 的键名是 msft_ae_state。旧 cursor 只对当时那一次筛选有效，这里从窗口起点重放，不带 cursor。
+    MSFT 的键名是 msft_ae_state。旧 cursor 一律忽略，窗口终点不再锁死，只保留已覆盖边界。
     """
     if not isinstance(last_run, dict) or _has_ae_state(last_run):
         return {}
@@ -1853,7 +2031,6 @@ def _legacy_ae_map(last_run: dict[str, Any], queries: list[str]) -> dict[str, di
                 "query": query,
                 "complete": False,
                 "ok": True,
-                "cursor": None,
                 "covered_until": covered if covered and covered < end else None,
                 "window": {"start": start, "end": end},
             }
@@ -1862,47 +2039,74 @@ def _legacy_ae_map(last_run: dict[str, Any], queries: list[str]) -> dict[str, di
                 "query": query,
                 "complete": True,
                 "ok": True,
-                "cursor": None,
                 "covered_until": covered,
             }
     return found
 
 
-def collect_alphaengine(
-    cfg: dict[str, Any],
-    since: str,
-    until: str,
-    seen: set[str],
-    last_run: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """每条查询一轮只搜一次。未完成的查询下一轮重放原窗口和 cursor，不改用新的 until。"""
-    pat = _aliases_pattern(cfg)
-    names = {str(name) for name in cfg.get("ae_company_names") or []}
-    queries = [str(q) for q in (cfg.get("ae_queries") or [])][: int(cfg.get("ae_max_searches") or 2)]
-    prev_map = _ae_prev_map(last_run) or _legacy_ae_map(last_run, queries)
-    found: dict[str, Any] = {}
-    statuses: list[dict[str, Any]] = []
-    state_queries: list[dict[str, Any]] = []
-    default_start = (date.fromisoformat(since) - timedelta(days=AE_LOOKBACK_DAYS)).isoformat()
-    for query in queries:
-        prev = prev_map.get(query)
-        if prev and not prev.get("complete") and isinstance(prev.get("window"), dict):
-            start = str(prev["window"].get("start") or default_start)
-            end = str(prev["window"].get("end") or until)
-            saved_cursor = prev.get("cursor")
-            cursor = (
-                saved_cursor
-                if prev.get("ok", True) is not False and isinstance(saved_cursor, str) and saved_cursor
-                else None
-            )
-            carried_covered = prev.get("covered_until")
-        else:
-            carried_covered = prev.get("covered_until") if isinstance(prev, dict) else None
-            start = _completed_ae_start(default_start, carried_covered)
-            end, cursor = until, None
+def _iter_ae_subwindows(pending_start: str, until: str) -> list[tuple[str, str]]:
+    """按自然日从旧到新生成子窗口；首个子窗口为首个未覆盖日含 AE_LOOKBACK_DAYS 天回看，后续为单日。"""
+    p_day = date.fromisoformat(pending_start)
+    end_day = date.fromisoformat(until)
+    if p_day > end_day:
+        return []
+    first_start = (p_day - timedelta(days=AE_LOOKBACK_DAYS)).isoformat()
+    out: list[tuple[str, str]] = [(first_start, pending_start)]
+    span = (end_day - p_day).days
+    for offset in range(1, span + 1):
+        d = (p_day + timedelta(days=offset)).isoformat()
+        out.append((d, d))
+    return out
+
+
+def _scan_ae_pages(
+    query: str,
+    start: str,
+    end: str,
+    *,
+    budget: int,
+    max_requests: int | None = None,
+    early_exit_total_limit: int | None = None,
+) -> dict[str, Any]:
+    """单窗口内连续翻页，cursor 仅在本轮内使用。
+
+    第一页（含游标失效重扫后的首页）带 params.fresh=True。同轮遇到游标失效
+    （e_cursor_expired / e_cursor_filter_mismatch）时，只要本查询本轮还有剩余请求次数
+    （``max_requests``），第一次游标失效立即从第一页重扫；重扫后再次失效或本轮请求次数用尽
+    则保留已取条目并按本轮未扫完返回，不把整段记为失败。响应带 ``stale: true`` 或
+    ``cursor_unavailable`` 时保留已取条目入包，但不视为扫完。
+    """
+    limit_pages = max(1, int(budget))
+    request_cap = max(limit_pages, int(max_requests)) if max_requests is not None else limit_pages
+    window_limit = min(limit_pages, request_cap)
+    items: list[dict[str, Any]] = []
+    cursor: str | None = None
+    pages = 0
+    ok = True
+    error: str | None = None
+    incomplete = False
+    incomplete_reason: str | None = None
+    has_more = False
+    cursor_restarted = False
+    cursor_error: str | None = None
+    cursor_exhausted = False
+    stale = False
+    stale_reason: str | None = None
+    early_exit = False
+    hit_page_cap = False
+    budget_exhausted = False
+    partial_hit = False
+    upstream_cursor_hit = False
+    last_arguments: dict[str, Any] = {}
+    total_upstream: Any = None
+
+    while pages < window_limit:
         params: dict[str, Any] = {"sort": "relevance"}
-        if cursor:
-            params["cursor"] = cursor
+        sent_cursor = cursor
+        if sent_cursor:
+            params["cursor"] = sent_cursor
+        else:
+            params["fresh"] = True
         arguments = {
             "route": "alphaengine",
             "operation": "search_library",
@@ -1912,52 +2116,535 @@ def collect_alphaengine(
             "limit": AE_LIMIT,
             "params": params,
         }
+        last_arguments = arguments
         res = call_bridge_jsonrpc("research", arguments)
+        pages += 1
         data = res.get("data") if isinstance(res.get("data"), dict) else {}
-        items, page = extract_items_and_page(data)
-        ok = bool(res.get("ok"))
-        error = None
-        if not ok and is_no_match(res, data):
-            ok = True
-            items = []
-        if not ok and cursor and is_cursor_invalid(res, data):
-            error = bridge_error(res, data)
-            cursor = None
+        page_items, page = extract_items_and_page(data)
+        page_ok = bool(res.get("ok"))
+        page_partial = _is_partial_status(res, data)
+        page_partial_error: str | None = None
+        if page.get("total_upstream") is not None:
+            total_upstream = page.get("total_upstream")
+        no_match = is_no_match(res, data)
+        if no_match and (page_partial or page_items):
+            # 带"没有匹配"标记但声明了 partial 或已返回条目时，保留条目并按部分响应进入按日续采。
+            page_partial = True
+        elif not page_ok and no_match:
+            page_ok = True
+            page_items = []
+            page = {**page, "has_more": False, "cursor": None}
+
+        if not page_ok:
+            if sent_cursor and is_cursor_invalid(res, data):
+                detail = bridge_error(res, data)
+                cursor_error = detail
+                if not cursor_restarted and pages < request_cap:
+                    cursor_restarted = True
+                    cursor = None
+                    has_more = False
+                    window_limit = min(request_cap, pages + limit_pages)
+                    continue
+                ok = True
+                incomplete = True
+                has_more = True
+                cursor = None
+                cursor_exhausted = True
+                budget_exhausted = False
+                if cursor_restarted:
+                    incomplete_reason = f"游标失效重扫后仍未扫完（{detail}）"
+                else:
+                    incomplete_reason = f"游标失效且本轮查询请求次数已用完（{detail}）"
+                break
+            if page_partial:
+                # 同时带 status=partial 和非空 error 时，按部分响应处理：保留该页已返回条目，进入按日续采。
+                page_ok = True
+                page_partial_error = bridge_error(res, data)
+            elif is_upstream_cursor_error(res, data):
+                detail = bridge_error(res, data)
+                ok = True
+                incomplete = True
+                incomplete_reason = f"上游游标异常（{detail}）"
+                upstream_cursor_hit = True
+                has_more = False
+                cursor = None
+                budget_exhausted = False
+                break
+            else:
+                ok = False
+                error = bridge_error(res, data)
+                incomplete = True
+                has_more = False
+                cursor = None
+                budget_exhausted = False
+                break
+
+        stale_flag = _g._extract_stale_or_cursor_unavailable(res, data)
+        if stale_flag is not None:
+            tagged_items = [
+                {**it, _g._AE_STALE_KEY: True} if isinstance(it, dict) else it
+                for it in page_items
+            ]
+            items.extend(tagged_items)
             ok = False
-        elif not ok:
-            error = bridge_error(res, data)
-        trunc = _known_truncation(res, data) if ok else None
-        has_more = bool(page.get("has_more")) if ok else False
-        next_cursor = page.get("cursor") if ok and has_more else None
-        if ok and has_more and not next_cursor:
-            error = trunc or "has_more 为真但没有 cursor"
-            next_cursor = None
+            stale = True
+            stale_reason = stale_flag
+            error = "AlphaEngine 暂时不可用，返回的是缓存结果"
+            incomplete = True
+            incomplete_reason = "AlphaEngine 暂时不可用，返回的是缓存结果"
+            has_more = bool(page.get("has_more"))
+            cursor = None
+            budget_exhausted = False
+            break
+
+        items.extend(page_items)
+        page_has_more = bool(page.get("has_more"))
+        next_cursor = page.get("cursor") if page_has_more else None
+        trunc = _known_truncation(res, data)
+        if page_partial:
+            err_detail = page_partial_error
+            if err_detail is None:
+                raw_err = data.get("error") if isinstance(data, dict) else None
+                if not raw_err:
+                    raw_err = res.get("error")
+                if isinstance(raw_err, str) and raw_err.strip():
+                    err_detail = raw_err.strip()[:500]
+            if trunc and err_detail and err_detail not in trunc:
+                trunc = f"{trunc}（{err_detail}）"
+            partial_hit = True
+            incomplete = True
+            incomplete_reason = trunc or (
+                f"未完成: 结果被截断或覆盖不完整（{err_detail}）"
+                if err_detail
+                else "未完成: 结果被截断或覆盖不完整（status=partial）"
+            )
+            has_more = bool(page_has_more)
+            cursor = None
+            break
+
+        if page_has_more and not next_cursor:
+            incomplete = True
+            incomplete_reason = trunc or "has_more 为真但没有 cursor"
             has_more = False
-        elif ok and trunc and not (has_more and next_cursor):
-            error = trunc
-            next_cursor = None
+            cursor = None
+            break
+        if trunc:
+            incomplete = True
+            incomplete_reason = trunc
+            has_more = bool(page_has_more)
+            cursor = None
+            break
+        if not page_has_more:
             has_more = False
-        complete = bool(ok and not has_more and not error)
-        covered = end if complete else carried_covered
-        if complete and isinstance(carried_covered, str) and carried_covered.strip():
-            boundary = carried_covered.strip()[:10]
-            if start > boundary:
-                complete = False
-                error = "窗口起点晚于已覆盖日期，未推进覆盖"
-                covered = carried_covered
+            cursor = None
+            break
+
+        has_more = True
+        if (
+            early_exit_total_limit is not None
+            and isinstance(total_upstream, (int, float))
+            and not isinstance(total_upstream, bool)
+            and total_upstream > early_exit_total_limit
+        ):
+            early_exit = True
+            incomplete = True
+            incomplete_reason = f"上游共 {int(total_upstream)} 条，超出单轮翻页上限"
+            cursor = None
+            break
+
+        if pages >= window_limit:
+            hit_page_cap = True
+            incomplete = True
+            cursor = None
+            budget_exhausted = cursor_error is None
+            if cursor_restarted:
+                incomplete_reason = f"游标失效重扫后仍未扫完（{cursor_error}）"
+            else:
+                incomplete_reason = f"达到翻页上限（{limit_pages} 页）"
+            break
+
+        cursor = str(next_cursor)
+
+    return {
+        "items": items,
+        "ok": ok,
+        "completed": bool(ok and not incomplete),
+        "incomplete": incomplete,
+        "error": error,
+        "incomplete_reason": incomplete_reason,
+        "has_more": has_more,
+        "pages": pages,
+        "cursor_restarted": cursor_restarted,
+        "cursor_error": cursor_error,
+        "cursor_exhausted": cursor_exhausted,
+        "stale": stale,
+        "stale_reason": stale_reason,
+        "early_exit": early_exit,
+        "hit_page_cap": hit_page_cap,
+        "budget_exhausted": budget_exhausted,
+        "partial": partial_hit,
+        "upstream_cursor_error": upstream_cursor_hit,
+        "request": last_arguments,
+    }
+
+
+def _ae_item_day(item: Any) -> str | None:
+    """只从发布日期字段（publish_date / publish_time）读取文档日期；rank_date、date 不参与。"""
+    if not isinstance(item, dict):
+        return None
+    for key in ("publish_date", "publish_time"):
+        day = _coerce_day(item.get(key))
+        if day:
+            return day
+    return None
+
+
+def _ae_subwindow_target_day_status(items: list[dict[str, Any]], sub_end: str) -> str:
+    """判断子窗口翻页用尽时是否取到了待采日 sub_end 的文档。
+
+    只有至少有一条文档日期可解析且等于 sub_end 时返回 ``"has_target"``（允许覆盖越过该日）；
+    全部缺少可解析日期（或无文档）返回 ``"missing_dates"``；其余情况返回 ``"lookback_crowded"``。
+    """
+    dated = [day for item in items if (day := _ae_item_day(item)) is not None]
+    if any(day == sub_end for day in dated):
+        return "has_target"
+    if not dated:
+        return "missing_dates"
+    return "lookback_crowded"
+
+
+def _format_ae_incomplete_error(
+    *,
+    start: str,
+    end: str,
+    carried_covered: str | None,
+    covered: str | None,
+    ok: bool,
+    stale: bool,
+    partial_day: tuple[str, int] | None,
+    lookback_crowded_day: str | None,
+    missing_dates_day: str | None,
+    raw_error: str | None,
+    reason_base: str | None,
+    cursor_restarted: bool,
+    cursor_error: str | None,
+    cursor_exhausted: bool,
+    hit_page_cap: bool,
+    round_cap_hit: bool,
+    round_cap_resume_day: str | None,
+    page_limit: int,
+) -> str:
+    advanced = bool(covered and (not carried_covered or covered > carried_covered))
+    if covered and covered < end:
+        uncovered_note = f"未覆盖日期：{_day_shift(covered, 1)} 至 {end}"
+    elif covered and covered >= end:
+        uncovered_note = f"未覆盖回看窗口：{start} 至 {end}"
+    else:
+        uncovered_note = f"未覆盖日期：{start} 至 {end}"
+
+    if partial_day is not None:
+        p_day, p_count = partial_day
+        prefix = f"{p_day} 超过翻页上限，只取了前 {p_count} 条"
+        if covered and covered < end:
+            return f"{prefix}，覆盖边界已推进至 {covered}，{uncovered_note}"
+        return f"{prefix}，覆盖边界已推进至 {covered}"
+
+    if missing_dates_day is not None:
+        prefix = f"返回的文档缺少日期，{missing_dates_day} 留待下一轮"
+        if advanced:
+            return f"{prefix}，覆盖边界已推进至 {covered}，{uncovered_note}"
+        return f"{prefix}，{uncovered_note}"
+
+    if lookback_crowded_day is not None:
+        prefix = f"回看日文档较多，{lookback_crowded_day} 留待下一轮"
+        if advanced:
+            return f"{prefix}，覆盖边界已推进至 {covered}，{uncovered_note}"
+        return f"{prefix}，{uncovered_note}"
+
+    if stale:
+        base = "AlphaEngine 暂时不可用，返回的是缓存结果"
+        if advanced:
+            return f"{base}，覆盖边界已推进至 {covered}，{uncovered_note}"
+        return f"{base}，{uncovered_note}"
+
+    if not ok:
+        base = raw_error or "unknown_error"
+        if advanced:
+            return f"{base}，覆盖边界已推进至 {covered}，{uncovered_note}"
+        return base
+
+    if cursor_exhausted or cursor_error:
+        if cursor_restarted:
+            prefix = f"游标失效重扫后仍未扫完（{cursor_error}）"
+        else:
+            prefix = f"游标失效且本轮查询请求次数已用完（{cursor_error}）"
+    elif round_cap_hit:
+        resume_day = round_cap_resume_day or (
+            _day_shift(covered, 1) if covered and covered < end else start
+        )
+        prefix = f"本轮请求次数已用完，{resume_day} 起留待下一轮"
+    elif hit_page_cap:
+        prefix = f"达到翻页上限（{page_limit} 页）本轮未扫完"
+    else:
+        prefix = reason_base or "本轮未扫完"
+
+    if advanced:
+        return f"{prefix}，覆盖边界已推进至 {covered}，{uncovered_note}"
+    return f"{prefix}，{uncovered_note}"
+
+
+def collect_alphaengine(
+    cfg: dict[str, Any],
+    since: str,
+    until: str,
+    seen: set[str],
+    last_run: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """每条查询在本轮内连续翻页（单窗口上限 MAX_AE_PAGES，单查询本轮总请求上限 MAX_AE_REQUESTS_PER_QUERY），
+    cursor 不跨轮保存也不从旧状态读取。
+
+    跨轮仅按 covered_until 推进窗口：整段扫不完的所有非失败/非过期缓存情况都进入按日切分，
+    每个未覆盖日有自己的页预算；正常用完某一天的预算且本轮尚未推进任何一天时，只有取到待采日
+    文档才把边界越过该日并写明只取了前 N 条。
+    """
+    if not _source_enabled(cfg, "alphaengine") or not _alphaengine_capability_enabled(cfg):
+        return {"status": [], "new": {}}, {"queries": []}
+
+    pat = _aliases_pattern(cfg)
+    names = {str(name) for name in cfg.get("ae_company_names") or []}
+    queries = [str(q) for q in (cfg.get("ae_queries") or [])][: int(cfg.get("ae_max_searches") or 2)]
+    prev_map = _ae_prev_map(last_run) or _legacy_ae_map(last_run, queries)
+    found: dict[str, Any] = {}
+    statuses: list[dict[str, Any]] = []
+    state_queries: list[dict[str, Any]] = []
+    default_start = _day_shift(since, -AE_LOOKBACK_DAYS)
+    page_limit = max(1, int(MAX_AE_PAGES))
+    round_cap = max(page_limit, int(MAX_AE_REQUESTS_PER_QUERY))
+
+    for query in queries:
+        prev = prev_map.get(query)
+        carried_covered = _coerce_day(prev.get("covered_until")) if isinstance(prev, dict) else None
+        if carried_covered:
+            start = _completed_ae_start(default_start, carried_covered)
+        elif isinstance(prev, dict) and isinstance(prev.get("window"), dict):
+            prev_start = _coerce_day(prev["window"].get("start"))
+            start = min(default_start, prev_start) if prev_start else default_start
+        else:
+            start = default_start
+        end = until
+        if start > end:
+            start = end
+
+        if carried_covered:
+            same_day_rerun = carried_covered >= end
+            pending_start = end if same_day_rerun else _day_shift(carried_covered, 1)
+        else:
+            same_day_rerun = False
+            pending_start = min(end, _day_shift(start, AE_LOOKBACK_DAYS))
+
+        multi_day = (not same_day_rerun) and (pending_start < end)
+        if not same_day_rerun and not multi_day:
+            # 单个待采日时，窗口始终为 [待采日 - AE_LOOKBACK_DAYS, until]，与参照实现的首子窗口一致。
+            start = _day_shift(pending_start, -AE_LOOKBACK_DAYS)
+            if start > end:
+                start = end
+        step1_budget = max(1, page_limit - 1) if multi_day else page_limit
+        early_limit = (page_limit * AE_LIMIT) if multi_day else None
+
+        full_scan = _scan_ae_pages(
+            query,
+            start,
+            end,
+            budget=step1_budget,
+            max_requests=round_cap,
+            early_exit_total_limit=early_limit,
+        )
+        raw_items: list[dict[str, Any]] = list(full_scan["items"])
+        scans: list[dict[str, Any]] = [full_scan]
+        pages_total = int(full_scan["pages"])
+        covered: str | None = carried_covered
+        partial_day: tuple[str, int] | None = None
+        lookback_crowded_day: str | None = None
+        missing_dates_day: str | None = None
+        round_cap_hit = False
+        round_cap_resume_day: str | None = None
+
+        if full_scan["completed"]:
+            covered = max(carried_covered, end) if carried_covered else end
+        elif full_scan["ok"] and not full_scan["stale"]:
+            if not same_day_rerun and not multi_day:
+                if full_scan["budget_exhausted"]:
+                    deduped_full = _g._dedupe_ae_items(full_scan["items"])
+                    target_status = _ae_subwindow_target_day_status(deduped_full, end)
+                    if target_status == "has_target":
+                        covered = max(carried_covered, end) if carried_covered else end
+                        partial_day = (end, len(deduped_full))
+                    elif target_status == "missing_dates":
+                        missing_dates_day = end
+                    else:
+                        lookback_crowded_day = end
+                elif full_scan["partial"] or full_scan["upstream_cursor_error"]:
+                    remaining_round = round_cap - pages_total
+                    if remaining_round <= 0:
+                        if not full_scan["cursor_exhausted"] and not full_scan.get("cursor_error"):
+                            round_cap_hit = True
+                            round_cap_resume_day = end
+                    else:
+                        day_budget = min(page_limit, remaining_round)
+                        d_scan = _scan_ae_pages(
+                            query,
+                            end,
+                            end,
+                            budget=day_budget,
+                            max_requests=remaining_round,
+                        )
+                        raw_items.extend(d_scan["items"])
+                        scans.append(d_scan)
+                        pages_total += int(d_scan["pages"])
+                        if d_scan["ok"] and not d_scan["stale"]:
+                            if d_scan["completed"]:
+                                covered = max(covered, end) if covered else end
+                            elif (
+                                d_scan["hit_page_cap"]
+                                and day_budget < page_limit
+                                and not d_scan["cursor_exhausted"]
+                                and not d_scan.get("cursor_error")
+                            ):
+                                round_cap_hit = True
+                                round_cap_resume_day = end
+                            elif d_scan["budget_exhausted"] and day_budget >= page_limit:
+                                deduped_day = _g._dedupe_ae_items(d_scan["items"])
+                                target_status = _ae_subwindow_target_day_status(deduped_day, end)
+                                if target_status == "has_target":
+                                    covered = max(covered, end) if covered else end
+                                    partial_day = (end, len(deduped_day))
+                                elif target_status == "missing_dates":
+                                    missing_dates_day = end
+                                else:
+                                    lookback_crowded_day = end
+            elif multi_day:
+                if pages_total >= round_cap:
+                    if not full_scan["cursor_exhausted"] and not full_scan.get("cursor_error"):
+                        round_cap_hit = True
+                        round_cap_resume_day = pending_start
+                else:
+                    for sub_start, sub_end in _iter_ae_subwindows(pending_start, end):
+                        remaining_round = round_cap - pages_total
+                        if remaining_round <= 0:
+                            round_cap_hit = True
+                            round_cap_resume_day = sub_end
+                            break
+                        day_budget = min(page_limit, remaining_round)
+                        d_scan = _scan_ae_pages(
+                            query,
+                            sub_start,
+                            sub_end,
+                            budget=day_budget,
+                            max_requests=remaining_round,
+                        )
+                        raw_items.extend(d_scan["items"])
+                        scans.append(d_scan)
+                        pages_total += int(d_scan["pages"])
+                        if not d_scan["ok"] or d_scan["stale"]:
+                            break
+                        if d_scan["completed"]:
+                            covered = max(covered, sub_end) if covered else sub_end
+                            continue
+                        if (
+                            d_scan["hit_page_cap"]
+                            and day_budget < page_limit
+                            and not d_scan["cursor_exhausted"]
+                            and not d_scan.get("cursor_error")
+                        ):
+                            round_cap_hit = True
+                            round_cap_resume_day = sub_end
+                            break
+                        if d_scan["budget_exhausted"] and day_budget >= page_limit:
+                            deduped_day = _g._dedupe_ae_items(d_scan["items"])
+                            target_status = _ae_subwindow_target_day_status(deduped_day, sub_end)
+                            if target_status == "has_target":
+                                if covered == carried_covered:
+                                    covered = max(covered, sub_end) if covered else sub_end
+                                    partial_day = (sub_end, len(deduped_day))
+                            elif target_status == "missing_dates":
+                                missing_dates_day = sub_end
+                            else:
+                                lookback_crowded_day = sub_end
+                        break
+
+        items = _g._dedupe_ae_items(raw_items)
+        ok = all(bool(s["ok"]) for s in scans)
+        any_stale = any(bool(s["stale"]) for s in scans)
+        last_scan = scans[-1]
+        last_cursor_restarted = bool(last_scan["cursor_restarted"])
+        last_cursor_error = last_scan.get("cursor_error")
+        last_cursor_exhausted = bool(last_scan["cursor_exhausted"])
+        raw_error = next((s["error"] for s in reversed(scans) if s.get("error")), None)
+        reason_base = next(
+            (s["incomplete_reason"] for s in reversed(scans) if s.get("incomplete_reason")),
+            None,
+        )
+        complete = bool(
+            ok
+            and not any_stale
+            and partial_day is None
+            and (full_scan["completed"] if same_day_rerun else covered == end)
+        )
+        hit_page_cap = (
+            (not complete)
+            and ok
+            and not last_cursor_exhausted
+            and not last_cursor_error
+            and not round_cap_hit
+            and bool(last_scan["hit_page_cap"])
+        )
+        has_more = (not complete) and ok and (
+            bool(last_scan["has_more"]) or hit_page_cap or round_cap_hit or last_cursor_exhausted
+        )
+
+        if complete and carried_covered and start > carried_covered:
+            complete = False
+            covered = carried_covered
+            error: str | None = "窗口起点晚于已覆盖日期，未推进覆盖"
+        elif complete:
+            error = None
+        else:
+            error = _format_ae_incomplete_error(
+                start=start,
+                end=end,
+                carried_covered=carried_covered,
+                covered=covered,
+                ok=ok,
+                stale=any_stale,
+                partial_day=partial_day,
+                lookback_crowded_day=lookback_crowded_day,
+                missing_dates_day=missing_dates_day,
+                raw_error=raw_error,
+                reason_base=reason_base,
+                cursor_restarted=last_cursor_restarted,
+                cursor_error=last_cursor_error,
+                cursor_exhausted=last_cursor_exhausted,
+                hit_page_cap=hit_page_cap,
+                round_cap_hit=round_cap_hit,
+                round_cap_resume_day=round_cap_resume_day,
+                page_limit=page_limit,
+            )
+
         if isinstance(covered, str) and not covered.strip():
             covered = None
+
+        last_request = last_scan["request"]
         entry = {
             "query": query,
             "window": {"start": start, "end": end},
-            "cursor": next_cursor,
+            "cursor": None,
             "has_more": has_more,
             "complete": complete,
             "covered_until": covered,
             "ok": ok,
-            "returned": len(items) if ok else 0,
+            "returned": len(items) if items else 0,
             "error": error,
-            "resumed_cursor": cursor,
+            "resumed_cursor": None,
         }
         state_queries.append(entry)
         statuses.append({
@@ -1966,13 +2653,11 @@ def collect_alphaengine(
             "returned": entry["returned"],
             "has_more": has_more,
             "incomplete": not complete,
-            "cursor": next_cursor,
+            "cursor": None,
             "window": entry["window"],
             "error": error,
-            "request": arguments,
+            "request": last_request,
         })
-        if not ok:
-            continue
         for row in items:
             raw_id = row.get("doc_id")
             if not raw_id:
@@ -2003,6 +2688,8 @@ def collect_alphaengine(
 
 
 def collect_sec(cfg: dict[str, Any], since: str, seen: set[str]) -> dict[str, Any]:
+    if not _researchdata_bridge_capability_enabled(cfg):
+        return {"status": [], "new": {}}
     floor = (date.fromisoformat(since) - timedelta(days=SEC_LOOKBACK_DAYS)).isoformat()
     found: dict[str, Any] = {}
     statuses: list[dict[str, Any]] = []
@@ -2181,6 +2868,20 @@ def collect_x(
     *,
     legacy_verbatim: bool | None = None,
 ) -> dict[str, Any]:
+    if not _researchdata_bridge_capability_enabled(cfg):
+        return {
+            "status": [],
+            "new": {},
+            "noise_ids": [],
+            "pool_size": 0,
+            "queries": [],
+            "outside_window": 0,
+            "unprocessed_upstream": False,
+            "profile_followup": [],
+            "failures": [],
+            "metrics_note": "",
+            "note": "",
+        }
     timeline_until, search_until = _x_upstream_until(until)
     raw: dict[str, dict[str, Any]] = {}
     statuses: list[dict[str, Any]] = []
@@ -2597,6 +3298,8 @@ def render_packet_md(pk: dict[str, Any]) -> str:
             f"- {row.get('query')} | 窗口 {window.get('start')} 至 {window.get('end')} | "
             f"complete={str(bool(row.get('complete'))).lower()} | cursor={row.get('cursor')}"
         )
+        if not row.get("complete") and row.get("error"):
+            lines.append(f"  备注：{row.get('error')}")
     for doc_id, info in (ae.get("new") or {}).items():
         lines.append(f"- {doc_id} | {info.get('publish_time')} | {info.get('title')}")
         if info.get("snippet"):
@@ -2730,13 +3433,15 @@ def cmd_collect(args: argparse.Namespace) -> int:
             if not md_path.exists():
                 atomic_write_text(workspace, md_path, render_packet_md(existing))
             return emit(_summary(workspace, existing, True, rules_path=rules_path))
-        transport = resolve_researchdata_transport()
-        if transport.get("mode") is None:
-            return fail(
-                _g.RESEARCHDATA_TRANSPORT_UNCONFIGURED,
-                str(transport.get("error") or _g.RESEARCHDATA_TRANSPORT_UNCONFIGURED),
-                hint="本轮未采集任何来源",
-            )
+        bridge_cap_on = _researchdata_bridge_capability_enabled(cfg)
+        if bridge_cap_on:
+            transport = resolve_researchdata_transport()
+            if transport.get("mode") is None:
+                return fail(
+                    _g.RESEARCHDATA_TRANSPORT_UNCONFIGURED,
+                    str(transport.get("error") or _g.RESEARCHDATA_TRANSPORT_UNCONFIGURED),
+                    hint="本轮未采集任何来源",
+                )
         last_run = _read_state_object(paths["last_run"])
         seen = set(_read_state_list(paths["seen"]))
         before = {
@@ -2749,6 +3454,8 @@ def cmd_collect(args: argparse.Namespace) -> int:
         since, until = _window(last_run, args.since, today)
         collected_at = current.isoformat()
         internal_since = _internal_since(last_run, since)
+        sec_since = _source_since(last_run, "sec_last_collected_until", since)
+        x_since = _source_since(last_run, "x_last_collected_until", since)
         run_dir = paths["tracker"] / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
         legacy_verbatim = _is_legacy_four_verbatim(TICKER, cfg)
@@ -2795,20 +3502,21 @@ def cmd_collect(args: argparse.Namespace) -> int:
         snap_rel = Path("data") / "consensus" / f"{stamp}.json"
         snap_path = ensure_relative(workspace, snap_rel)
         previous = _previous_snapshot(workspace, paths["consensus"], snap_path, last_run.get("snapshot_file"))
-        if _source_enabled(cfg, "internal"):
+        internal_ran = bridge_cap_on and _source_enabled(cfg, "internal") and bool(_effective_internal_routes(cfg))
+        if internal_ran:
             internal = collect_internal(cfg, internal_since, until, seen, workspace, run_dir)
         else:
             internal = {"status": {}, "new": {}, "irrelevant": {}, "pending": {}, "withheld": {}}
-        if _source_enabled(cfg, "alphaengine"):
+        if bridge_cap_on and _source_enabled(cfg, "alphaengine") and _alphaengine_capability_enabled(cfg):
             ae, ae_state = collect_alphaengine(cfg, since, until, seen, last_run)
         else:
             ae, ae_state = {"status": [], "new": {}}, {"queries": []}
-        if _source_enabled(cfg, "sec"):
-            sec = collect_sec(cfg, since, seen)
+        if bridge_cap_on and _source_enabled(cfg, "sec"):
+            sec = collect_sec(cfg, sec_since, seen)
         else:
             sec = {"status": [], "new": {}}
-        if _source_enabled(cfg, "x"):
-            xdata = collect_x(cfg, since, until, seen, workspace, legacy_verbatim=legacy_verbatim)
+        if bridge_cap_on and _source_enabled(cfg, "x"):
+            xdata = collect_x(cfg, x_since, until, seen, workspace, legacy_verbatim=legacy_verbatim)
         else:
             xdata = {
                 "status": [],
@@ -2841,6 +3549,19 @@ def cmd_collect(args: argparse.Namespace) -> int:
         )
         failures = failed_sources(internal, ae, sec, xdata, consensus, legacy_verbatim=legacy_verbatim)
         news_enabled = _source_enabled(cfg, "news")
+        prev_internal_retry = _coerce_retry_since(last_run.get("internal_retry_since"))
+        if not internal_ran:
+            next_internal_retry = prev_internal_retry
+        else:
+            round_internal_retry = internal_since if _internal_needs_retry(internal) else None
+            if _has_capability_skipped_internal_routes(cfg):
+                prev_internal_until = _coerce_day(last_run.get("internal_last_collected_until"))
+                retry_candidates = [
+                    d for d in (prev_internal_retry, prev_internal_until, round_internal_retry) if d is not None
+                ]
+                next_internal_retry = min(retry_candidates) if retry_candidates else None
+            else:
+                next_internal_retry = round_internal_retry
         packet: dict[str, Any] = {
             "ticker": TICKER,
             "run_id": run_id,
@@ -2867,7 +3588,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
             "short_circuit_eligible": False,
             "collected_at": collected_at,
             "internal_since": internal_since,
-            "internal_retry_since": internal_since if _internal_needs_retry(internal) else None,
+            "internal_retry_since": next_internal_retry,
             ae_state_key(): ae_state,
             "limits": {
                 "internal_limit": cfg.get("internal_limit"),
@@ -2981,9 +3702,18 @@ def _validate_ae_state(state: dict[str, Any], last_run: dict[str, Any] | None = 
                 raise CollectError("ae_covered_until_mismatch", "完成的 AE 查询只能把 covered_until 记到本窗口终点")
         elif covered not in (None, ""):
             covered_day = parse_day(str(covered), "ae.covered_until")
-            # 同一天重新采集未完成时，保留已经提交的覆盖日期。
-            # 从更早的覆盖日抬到本窗口终点，或超过终点，仍然拒绝。
-            if covered_day > end or (covered_day == end and retained.get(row["query"], "") < covered_day):
+            # 同一天重新采集未完成时，保留已经提交的覆盖日期；单日正常用完翻页预算且本轮
+            # 尚未推进任何一天而越过窗口终点时，允许把 covered_until 记为该日。
+            # 从更早的覆盖日非正常抬到本窗口终点，或超过终点，仍然拒绝。
+            allow_single_day_cap_skip = (
+                row.get("ok") is True
+                and f"{end} 超过翻页上限，只取了前" in str(row.get("error") or "")
+            )
+            if covered_day > end or (
+                covered_day == end
+                and retained.get(row["query"], "") < covered_day
+                and not allow_single_day_cap_skip
+            ):
                 raise CollectError("ae_incomplete_advanced", "未完成的 AE 查询不能把覆盖日期推进到窗口终点")
         if start > end:
             raise CollectError("bad_ae_state", "AE 窗口起点晚于终点")
@@ -3043,6 +3773,11 @@ def cmd_commit(args: argparse.Namespace) -> int:
         if not paths["seen"].exists() or merged_set != set(seen):
             atomic_write_json(workspace, paths["seen"], merged)
         if advance:
+            ae_state_to_save = _ae_state_for_last_run(ae_state)
+            if not ae_state_to_save.get("queries"):
+                prev_ae_state = last_run.get(ae_key) if isinstance(last_run, dict) else None
+                if isinstance(prev_ae_state, dict) and prev_ae_state.get("queries"):
+                    ae_state_to_save = _ae_state_for_last_run(prev_ae_state)
             last_body = {
                 "ticker": TICKER,
                 "run_id": run_id,
@@ -3053,16 +3788,87 @@ def cmd_commit(args: argparse.Namespace) -> int:
                 "snapshot_file": snapshot,
                 "material": args.material,
                 "summary": summary,
-                ae_key: ae_state,
+                ae_key: ae_state_to_save,
             }
-            if "internal_retry_since" in packet:
+            if not ae_state_to_save.get("queries") and isinstance(last_run, dict):
+                if last_run.get("ae_covered_until") is not None:
+                    last_body["ae_covered_until"] = last_run["ae_covered_until"]
+                if last_run.get("ae_resume") is not None:
+                    last_body["ae_resume"] = last_run["ae_resume"]
+            internal_obj = packet.get("internal")
+            internal_skipped = (
+                isinstance(internal_obj, dict)
+                and "status" in internal_obj
+                and not internal_obj.get("status")
+            )
+            internal_failed = isinstance(internal_obj, dict) and _internal_needs_retry(internal_obj)
+            if internal_skipped:
+                if isinstance(last_run, dict) and "internal_retry_since" in last_run:
+                    last_body["internal_retry_since"] = last_run.get("internal_retry_since")
+                elif "internal_retry_since" in packet:
+                    last_body["internal_retry_since"] = _coerce_retry_since(packet.get("internal_retry_since"))
+                last_body["internal_last_collected_until"] = _resume_point(
+                    last_run, "internal_last_collected_until", packet
+                )
+            elif internal_failed:
+                prev_retry = (
+                    _coerce_retry_since(last_run.get("internal_retry_since"))
+                    if isinstance(last_run, dict)
+                    else None
+                )
+                pkt_retry = _coerce_retry_since(packet.get("internal_retry_since"))
+                retry_candidates = [d for d in (prev_retry, pkt_retry) if d is not None]
+                last_body["internal_retry_since"] = min(retry_candidates) if retry_candidates else None
+                last_body["internal_last_collected_until"] = _resume_point(
+                    last_run, "internal_last_collected_until", packet
+                )
+            elif "internal_retry_since" in packet:
                 last_body["internal_retry_since"] = _coerce_retry_since(packet.get("internal_retry_since"))
-            elif "internal_retry_since" in last_run:
+            elif isinstance(last_run, dict) and "internal_retry_since" in last_run:
                 last_body["internal_retry_since"] = last_run.get("internal_retry_since")
+
+            sec_obj = packet.get("sec")
+            sec_skipped = (
+                isinstance(sec_obj, dict)
+                and "status" in sec_obj
+                and not sec_obj.get("status")
+            )
+            sec_failed = (
+                isinstance(sec_obj, dict)
+                and isinstance(sec_obj.get("status"), list)
+                and any(
+                    isinstance(row, dict) and (not row.get("ok", False) or row.get("incomplete"))
+                    for row in sec_obj["status"]
+                )
+            )
+            if sec_skipped or sec_failed:
+                last_body["sec_last_collected_until"] = _resume_point(
+                    last_run, "sec_last_collected_until", packet
+                )
+
+            x_obj = packet.get("x")
+            x_skipped = (
+                isinstance(x_obj, dict)
+                and "status" in x_obj
+                and not x_obj.get("status")
+                and not x_obj.get("metrics_note")
+            )
+            x_failed = isinstance(x_obj, dict) and (
+                bool(x_obj.get("failures"))
+                or (
+                    isinstance(x_obj.get("status"), list)
+                    and any(isinstance(row, dict) and not row.get("ok", False) for row in x_obj["status"])
+                )
+            )
+            if x_skipped or x_failed:
+                last_body["x_last_collected_until"] = _resume_point(
+                    last_run, "x_last_collected_until", packet
+                )
+
             atomic_write_json(workspace, paths["last_run"], last_body)
         log_repaired = False
         # updates.log 是完成回执。比当前 last_run 更早的首次提交也记一行，否则该轮会一直算未完成。
-        # 这一行不改 last_run，也不改其中的 AE cursor 或内部库重试起点。
+        # 这一行不改 last_run，也不改其中的 AE 覆盖状态或内部库重试起点。
         if not already_logged:
             paths["log"].parent.mkdir(parents=True, exist_ok=True)
             with paths["log"].open("a", encoding="utf-8") as handle:
