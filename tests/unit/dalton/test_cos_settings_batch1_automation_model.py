@@ -761,7 +761,9 @@ async def test_executor_stamps_system_only_and_classifies_antigravity_via_system
             "instruction": "Run check.",
             "additional_context": None,
             "thread_strategy": "new",
-            "metadata": {"llm_model_system_only": True},
+            # Even if automation metadata was edited after execution creation,
+            # _run_turn obeys the immutable execution-level flag on firing.
+            "metadata": {},
         },
         workspace_id=WS,
         thread_id=THREAD_ID,
@@ -774,13 +776,14 @@ async def test_executor_stamps_system_only_and_classifies_antigravity_via_system
         checked_computer_id=None,
         run_id=None,
         admitted=False,
+        llm_model_system_only=True,
     )
 
     ok = await executor._run_turn(EXEC_ID, firing, has_byok=False, deadline=9999999999.0)
     assert ok is True
     call_kw = captured[-1]
     assert call_kw["request"].llm_model_system_only is True
-    assert call_kw["run_metadata"]["llm_model_system_only"] is True
+    assert "llm_model_system_only" not in call_kw["run_metadata"]
     # Because ignore_custom_models=True saw built-in Antigravity, stale effort "high" was cleared to None
     assert call_kw["request"].reasoning_effort is None
 
@@ -916,7 +919,7 @@ async def test_first_turn_resolve_ptc_turn_llm_config_ignores_owner_shadowed_cus
         thread_id=THREAD_ID,
         workspace_id=WS,
         identity=TurnIdentity(sender=OWNER, owner=OWNER, recorded_as=OWNER),
-        run_metadata={"automation_execution_id": EXEC_ID, "llm_model_system_only": True},
+        run_metadata={"automation_execution_id": EXEC_ID},
     )
     assert seen_resolve_clients[-1] == {
         "effective_model": "claude-sonnet-4-6",
@@ -1030,6 +1033,7 @@ async def test_continuation_turn_inherits_system_only_into_thread_resolver_and_f
         "status": "running",
         "conversation_thread_id": THREAD_ID,
         "user_id": OWNER,
+        "llm_model_system_only": True,
     }
     monkeypatch.setattr(
         atm_mod,
@@ -1043,10 +1047,10 @@ async def test_continuation_turn_inherits_system_only_into_thread_resolver_and_f
     )
     monkeypatch.setattr(
         atm_mod,
-        "_get_execution_first_turn_run_settings",
+        "_get_execution_first_turn_settings",
         create_autospec(
-            atm_mod._get_execution_first_turn_run_settings,
-            return_value=("claude-sonnet-4-6", True, "high", True),
+            atm_mod._get_execution_first_turn_settings,
+            return_value=("claude-sonnet-4-6", True, "high"),
         ),
     )
     monkeypatch.setattr(
@@ -1118,7 +1122,7 @@ async def test_continuation_turn_inherits_system_only_into_thread_resolver_and_f
             "ignore_custom_models": True,
         }
     ]
-    assert ctx_meta["llm_model_system_only"] is True
+    assert "llm_model_system_only" not in ctx_meta
     assert ctx_meta["automation_source_execution_id"] == EXEC_ID
 
 
@@ -1126,7 +1130,7 @@ async def test_continuation_turn_inherits_system_only_into_thread_resolver_and_f
 async def test_thread_maintenance_resolver_forwards_system_only_for_compaction_and_handoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """grok_r3: thread_maintenance._resolver must pass latest run's llm_model_system_only."""
+    """thread_maintenance._resolver reads execution-level llm_model_system_only for the latest run."""
     monkeypatch.setattr(
         "src.server.services.account.own_access",
         create_autospec(
@@ -1154,28 +1158,48 @@ async def test_thread_maintenance_resolver_forwards_system_only_for_compaction_a
     )
 
     route = TurnRoute(workspace_id=WS, owner_id=OWNER, role="analyst")
+    sys_run_id = "11111111-1111-4111-8111-111111111101"
+    norm_run_id = "22222222-2222-4222-8222-222222222202"
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_run_id",
+        create_autospec(
+            atm_mod._get_execution_for_run_id,
+            side_effect=lambda rid: (
+                {"automation_execution_id": EXEC_ID, "llm_model_system_only": True}
+                if str(rid) == sys_run_id
+                else None
+            ),
+        ),
+    )
 
     orig_latest = runs_lifecycle_db.get_latest_attempt
-    # 1. Latest attempt has llm_model_system_only=True -> ignore_custom_models=True
+    # 1. Latest attempt belongs to a system-only execution -> ignore_custom_models=True
     monkeypatch.setattr(
         runs_lifecycle_db,
         "get_latest_attempt",
         create_autospec(
             orig_latest,
-            return_value={"metadata": {"llm_model_system_only": True, "subagents_enabled": ["research"]}},
+            return_value={
+                "conversation_response_id": sys_run_id,
+                "metadata": {"subagents_enabled": ["research"]},
+            },
         ),
     )
     resolve_sys = await maint_mod._resolver(OWNER, THREAD_ID, {"llm_model": "claude-sonnet-4-6"}, route)
     await resolve_sys("claude-sonnet-4-6")
     assert seen_flags[-1] is True
 
-    # 2. Normal thread without llm_model_system_only -> ignore_custom_models=False
+    # 2. Normal thread run without an automation execution -> ignore_custom_models=False
     monkeypatch.setattr(
         runs_lifecycle_db,
         "get_latest_attempt",
         create_autospec(
             orig_latest,
-            return_value={"metadata": {"subagents_enabled": ["research"]}},
+            return_value={
+                "conversation_response_id": norm_run_id,
+                "metadata": {"subagents_enabled": ["research"]},
+            },
         ),
     )
     resolve_norm = await maint_mod._resolver(OWNER, THREAD_ID, {"llm_model": "claude-sonnet-4-6"}, route)
@@ -1329,6 +1353,7 @@ async def test_continuation_turn_subscription_fallback_forwards_ignore_custom_mo
         "status": "running",
         "conversation_thread_id": THREAD_ID,
         "user_id": OWNER,
+        "llm_model_system_only": True,
     }
     owner_pref = {
         "fallback_models": ["owner-private-only", "gpt-6.2-sol"],
@@ -1345,10 +1370,10 @@ async def test_continuation_turn_subscription_fallback_forwards_ignore_custom_mo
     )
     monkeypatch.setattr(
         atm_mod,
-        "_get_execution_first_turn_run_settings",
+        "_get_execution_first_turn_settings",
         create_autospec(
-            atm_mod._get_execution_first_turn_run_settings,
-            return_value=("claude-sonnet-4-6", True, "medium", True),
+            atm_mod._get_execution_first_turn_settings,
+            return_value=("claude-sonnet-4-6", True, "medium"),
         ),
     )
     fake_mc = SimpleNamespace(
@@ -1427,12 +1452,10 @@ async def test_continuation_turn_subscription_fallback_forwards_ignore_custom_mo
 async def test_system_only_preserved_on_web_retry_hitl_resume_and_running_thread(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Decision 1: llm_model_system_only follows the run across web retry (including with both
-    llm_model and reasoning_effort), /retry pending-input rerun, HITL resume, and running_thread
-    server continuations, and writes llm_model_system_only into run_meta for thread_resolver."""
-    from src.server.models.workflow import RetryRequest
+    """Execution-level llm_model_system_only applies across web retry (including with both
+    llm_model and reasoning_effort), HITL resume, and running_thread server continuations,
+    reading from automation_executions.llm_model_system_only without stamping run_meta."""
     from src.server.services.llm import thread_model as thread_model_mod
-    from src.server.services.runs import pending_input as pending_input_mod
 
     exec_row = {
         "automation_execution_id": EXEC_ID,
@@ -1440,6 +1463,7 @@ async def test_system_only_preserved_on_web_retry_hitl_resume_and_running_thread
         "status": "running",
         "conversation_thread_id": THREAD_ID,
         "user_id": OWNER,
+        "llm_model_system_only": True,
     }
     _install_catalog_and_prefs(monkeypatch, owner_pref={})
     monkeypatch.setattr("src.server.app.setup.agent_config", SimpleNamespace())
@@ -1468,7 +1492,7 @@ async def test_system_only_preserved_on_web_retry_hitl_resume_and_running_thread
         create_autospec(llm_config_mod.resolve_llm_config, side_effect=_fake_resolve_llm),
     )
 
-    def _make_resolver(run_meta: dict[str, Any], effort: str | None = None):
+    def _make_resolver(effort: str | None = None):
         return thread_agent.thread_resolver(
             OWNER,
             THREAD_ID,
@@ -1477,17 +1501,9 @@ async def test_system_only_preserved_on_web_retry_hitl_resume_and_running_thread
             thread={"llm_model": "claude-sonnet-4-6"},
             is_byok=False,
             reasoning_effort=effort,
-            run_metadata=run_meta,
         )
 
-    # (a) User web retry sending BOTH llm_model and reasoning_effort (previously hit early return!)
-    # When the source run row is unavailable (_get_run_system_only returns None), falls back to Layer 4 (first turn).
-    orig_get_run_sys = atm_mod._get_run_system_only
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_run_system_only",
-        create_autospec(orig_get_run_sys, return_value=None),
-    )
+    # (a) User web retry sending BOTH llm_model and reasoning_effort reads execution column
     monkeypatch.setattr(
         atm_mod,
         "_get_execution_for_run_id",
@@ -1495,10 +1511,10 @@ async def test_system_only_preserved_on_web_retry_hitl_resume_and_running_thread
     )
     monkeypatch.setattr(
         atm_mod,
-        "_get_execution_first_turn_run_settings",
+        "_get_execution_first_turn_settings",
         create_autospec(
-            atm_mod._get_execution_first_turn_run_settings,
-            return_value=("claude-sonnet-4-6", True, "medium", True),
+            atm_mod._get_execution_first_turn_settings,
+            return_value=("claude-sonnet-4-6", True, "medium"),
         ),
     )
     run_meta_retry: dict[str, Any] = {}
@@ -1517,10 +1533,10 @@ async def test_system_only_preserved_on_web_retry_hitl_resume_and_running_thread
         from_service=False,
         is_server_retry=False,
         retry_of_run_id="99999999-9999-4999-8999-999999999999",
-        resolve=_make_resolver(run_meta_retry, effort="high"),
+        resolve=_make_resolver(effort="high"),
         on_automation_context=run_meta_retry.update,
     )
-    assert run_meta_retry.get("llm_model_system_only") is True
+    assert "llm_model_system_only" not in run_meta_retry
     assert run_meta_retry.get("automation_source_execution_id") == EXEC_ID
     assert resolve_calls[-1] == ("claude-sonnet-4-6", True, "high")
 
@@ -1540,10 +1556,11 @@ async def test_system_only_preserved_on_web_retry_hitl_resume_and_running_thread
         from_service=False,
         is_server_retry=False,
         retry_of_run_id="99999999-9999-4999-8999-999999999999",
-        resolve=_make_resolver(run_meta_effort_retry, effort="low"),
+        resolve=_make_resolver(effort="low"),
         on_automation_context=run_meta_effort_retry.update,
     )
-    assert run_meta_effort_retry.get("llm_model_system_only") is True
+    assert "llm_model_system_only" not in run_meta_effort_retry
+    assert run_meta_effort_retry.get("automation_source_execution_id") == EXEC_ID
     assert resolve_calls[-1] == ("claude-sonnet-4-6", True, "low")
 
     # (c) HITL resume submitted from web (user request with hitl_response + llm_model + reasoning_effort)
@@ -1553,14 +1570,6 @@ async def test_system_only_preserved_on_web_retry_hitl_resume_and_running_thread
         create_autospec(
             atm_mod._get_hitl_interrupt_run_id,
             return_value="88888888-8888-4888-8888-888888888888",
-        ),
-    )
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_run_system_only",
-        create_autospec(
-            orig_get_run_sys,
-            side_effect=lambda rid: rid == "88888888-8888-4888-8888-888888888888",
         ),
     )
     run_meta_hitl: dict[str, Any] = {}
@@ -1578,15 +1587,15 @@ async def test_system_only_preserved_on_web_retry_hitl_resume_and_running_thread
         requested_model="claude-sonnet-4-6",
         held_model="claude-sonnet-4-6",
         from_service=False,
-        resolve=_make_resolver(run_meta_hitl, effort="medium"),
+        resolve=_make_resolver(effort="medium"),
         on_automation_context=run_meta_hitl.update,
     )
-    assert run_meta_hitl.get("llm_model_system_only") is True
+    assert "llm_model_system_only" not in run_meta_hitl
     assert run_meta_hitl.get("automation_source_execution_id") == EXEC_ID
     assert resolve_calls[-1] == ("claude-sonnet-4-6", True, "medium")
 
-    # (d) Server continuation matching ONLY running_thread fallback writes BOTH llm_model_system_only
-    #     and automation_source_execution_id to run_meta
+    # (d) Server continuation matching ONLY running_thread fallback reads execution column
+    #     and stamps automation_source_execution_id (never llm_model_system_only) to run_meta
     monkeypatch.setattr(
         atm_mod.exec_db,
         "get_running_executions_for_thread",
@@ -1605,34 +1614,13 @@ async def test_system_only_preserved_on_web_retry_hitl_resume_and_running_thread
         requested_model=None,
         held_model=None,
         from_service=True,
-        resolve=_make_resolver(run_meta_running),
+        resolve=_make_resolver(),
         on_automation_context=run_meta_running.update,
     )
-    assert run_meta_running.get("llm_model_system_only") is True
+    assert "llm_model_system_only" not in run_meta_running
     assert run_meta_running.get("automation_source_execution_id") == EXEC_ID
     assert resolve_calls[-1][0] == "claude-sonnet-4-6"
     assert resolve_calls[-1][1] is True
-
-    # (e) input_rerun_request copies llm_model_system_only from failed run metadata
-    monkeypatch.setattr(
-        "src.server.database.conversation.queries.get_query_at_turn",
-        create_autospec(
-            __import__(
-                "src.server.database.conversation.queries", fromlist=["get_query_at_turn"]
-            ).get_query_at_turn,
-            return_value={"content": "retry me", "type": "initial", "metadata": {}},
-        ),
-    )
-    rerun_req = await pending_input_mod.input_rerun_request(
-        THREAD_ID,
-        {"turn_index": 1, "metadata": {"llm_model_system_only": True}},
-        pending_input_mod.PendingInput(replay=False, checkpoint_id=None, resend=False, context=False),
-        workspace_id=WS,
-        body=RetryRequest(
-            workspace_id=WS, llm_model="claude-sonnet-4-6", reasoning_effort="high"
-        ),
-    )
-    assert rerun_req.llm_model_system_only is True
 
 
 @pytest.mark.asyncio
@@ -2072,18 +2060,29 @@ async def test_handoff_and_manual_compaction_only_apply_system_only_to_old_model
 
     route = TurnRoute(workspace_id=WS, owner_id=OWNER, role="analyst")
     latest_run_id = "77777777-7777-4777-8777-777777777777"
+    owner_run_id = "77777777-7777-4777-8777-777777777778"
+    orig_latest = runs_lifecycle_db.get_latest_attempt
     monkeypatch.setattr(
         runs_lifecycle_db,
         "get_latest_attempt",
         create_autospec(
-            runs_lifecycle_db.get_latest_attempt,
+            orig_latest,
             return_value={
                 "conversation_response_id": latest_run_id,
-                "metadata": {
-                    "llm_model": "claude-sonnet-4-6",
-                    "llm_model_system_only": True,
-                },
+                "metadata": {"llm_model": "claude-sonnet-4-6"},
             },
+        ),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_run_id",
+        create_autospec(
+            atm_mod._get_execution_for_run_id,
+            side_effect=lambda rid: (
+                {"automation_execution_id": EXEC_ID, "llm_model_system_only": True}
+                if str(rid) == latest_run_id
+                else None
+            ),
         ),
     )
 
@@ -2134,7 +2133,7 @@ async def test_handoff_and_manual_compaction_only_apply_system_only_to_old_model
     assert res_ho is not None
     assert resolve_log[-2:] == [
         ("owner-custom-only", False),  # new model -> owner's own choice
-        ("claude-sonnet-4-6", True),  # old model -> previous run's system-only flag
+        ("claude-sonnet-4-6", True),  # old model -> previous run's execution system-only flag
     ]
 
     # (b) inspect_hand_off: same split between new model and old model
@@ -2146,7 +2145,7 @@ async def test_handoff_and_manual_compaction_only_apply_system_only_to_old_model
         ("claude-sonnet-4-6", True),
     ]
 
-    # (c) Manual compaction after owner switched to custom model -> ignore_custom_models=False
+    # (c) Manual compaction uses previous run's actual model + execution flag (not thread setting)
     resolve_log.clear()
     monkeypatch.setattr(
         thread_model_mod,
@@ -2157,39 +2156,23 @@ async def test_handoff_and_manual_compaction_only_apply_system_only_to_old_model
         ),
     )
     await maint_mod._compaction_config(THREAD_ID, OWNER)
-    assert resolve_log == [("owner-custom-only", False)]
-
-    # (d) Manual compaction after owner switched to SAME name (shadowed custom) with switch stamp -> False
-    resolve_log.clear()
-    monkeypatch.setattr(
-        maint_mod,
-        "thread_route",
-        create_autospec(
-            orig_thread_route,
-            return_value=(
-                {
-                    "llm_model": "claude-sonnet-4-6",
-                    "metadata": {"owner_model_switch_run_id": latest_run_id},
-                },
-                route,
-            ),
-        ),
-    )
-    await maint_mod._compaction_config(THREAD_ID, OWNER)
-    assert resolve_log == [("claude-sonnet-4-6", False)]
-
-    # (e) Manual compaction WITHOUT switch (still on previous run's model) -> True
-    resolve_log.clear()
-    monkeypatch.setattr(
-        maint_mod,
-        "thread_route",
-        create_autospec(
-            orig_thread_route,
-            return_value=({"llm_model": "claude-sonnet-4-6", "metadata": {}}, route),
-        ),
-    )
-    await maint_mod._compaction_config(THREAD_ID, OWNER)
     assert resolve_log == [("claude-sonnet-4-6", True)]
+
+    # (d) Once an owner turn (no automation execution) runs on owner-custom-only, manual compaction uses it with False
+    resolve_log.clear()
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_latest_attempt",
+        create_autospec(
+            orig_latest,
+            return_value={
+                "conversation_response_id": owner_run_id,
+                "metadata": {"llm_model": "owner-custom-only"},
+            },
+        ),
+    )
+    await maint_mod._compaction_config(THREAD_ID, OWNER)
+    assert resolve_log == [("owner-custom-only", False)]
 
 
 def test_user_profile_prompt_llm_model_guidance_and_autonomy_gate() -> None:
@@ -2260,6 +2243,7 @@ async def test_hitl_resume_reads_interrupt_checkpoint_run_even_after_later_faile
         "status": "running",
         "conversation_thread_id": THREAD_ID,
         "user_id": OWNER,
+        "llm_model_system_only": True,
     }
 
     # Build a checkpointer where:
@@ -2298,7 +2282,7 @@ async def test_hitl_resume_reads_interrupt_checkpoint_run_even_after_later_faile
         "turn_base_checkpoint_id",
         create_autospec(cp_helpers.turn_base_checkpoint_id, return_value="cp-flush"),
     )
-    # Latest attempt on the thread is the LATER cancelled/failed run WITHOUT llm_model_system_only!
+    # Latest attempt on the thread is the LATER cancelled/failed run
     latest_spy = create_autospec(
         runs_lifecycle_db.get_latest_attempt,
         return_value={
@@ -2309,15 +2293,7 @@ async def test_hitl_resume_reads_interrupt_checkpoint_run_even_after_later_faile
     )
     monkeypatch.setattr(runs_lifecycle_db, "get_latest_attempt", latest_spy)
 
-    # _get_run_system_only / _get_execution_for_run_id only return True / exec_row for orig_run_id
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_run_system_only",
-        create_autospec(
-            atm_mod._get_run_system_only,
-            side_effect=lambda rid: str(rid) == orig_run_id,
-        ),
-    )
+    # _get_execution_for_run_id only returns exec_row (with llm_model_system_only=True) for orig_run_id
     monkeypatch.setattr(
         atm_mod,
         "_get_execution_for_run_id",
@@ -2354,7 +2330,6 @@ async def test_hitl_resume_reads_interrupt_checkpoint_run_even_after_later_faile
         identity=TurnIdentity(sender=OWNER, owner=OWNER, recorded_as=OWNER),
         thread={"llm_model": "claude-sonnet-4-6"},
         is_byok=False,
-        run_metadata=run_meta,
     )
     req = ChatRequest(
         workspace_id=WS,
@@ -2373,7 +2348,7 @@ async def test_hitl_resume_reads_interrupt_checkpoint_run_even_after_later_faile
         resolve=resolver,
         on_automation_context=run_meta.update,
     )
-    assert run_meta.get("llm_model_system_only") is True
+    assert "llm_model_system_only" not in run_meta
     assert run_meta.get("automation_source_execution_id") == EXEC_ID
     assert seen_calls == [("claude-sonnet-4-6", True)]
     latest_spy.assert_not_awaited()
@@ -2383,12 +2358,11 @@ async def test_hitl_resume_reads_interrupt_checkpoint_run_even_after_later_faile
 async def test_running_thread_continuation_wakeup_chain_and_server_explicit_model_and_effort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Decision 2 (codex high 2):
-    Chain 1: running_thread continuation stamps BOTH llm_model_system_only and
-    automation_source_execution_id so a wakeup created by that continuation finds the execution
-    via created_by_run_id and stays system-only.
+    """Chain 1: running_thread continuation stamps automation_source_execution_id so a wakeup
+    created by that continuation finds the execution via created_by_run_id and reads its
+    execution-level llm_model_system_only.
     Chain 2: server request with explicit llm_model AND reasoning_effort still queries source
-    execution (running_thread) to inherit llm_model_system_only while keeping the explicit model."""
+    execution (running_thread) to read llm_model_system_only while keeping the explicit model."""
     from src.server.services.llm import thread_model as thread_model_mod
 
     cont_run_id = "cccccccc-cccc-4ccc-8ccc-ccccccccccc1"
@@ -2399,6 +2373,7 @@ async def test_running_thread_continuation_wakeup_chain_and_server_explicit_mode
         "status": "running",
         "conversation_thread_id": THREAD_ID,
         "user_id": OWNER,
+        "llm_model_system_only": True,
     }
     _install_catalog_and_prefs(monkeypatch, owner_pref={})
     monkeypatch.setattr("src.server.app.setup.agent_config", SimpleNamespace())
@@ -2419,10 +2394,10 @@ async def test_running_thread_continuation_wakeup_chain_and_server_explicit_mode
     )
     monkeypatch.setattr(
         atm_mod,
-        "_get_execution_first_turn_run_settings",
+        "_get_execution_first_turn_settings",
         create_autospec(
-            atm_mod._get_execution_first_turn_run_settings,
-            return_value=("claude-sonnet-4-6", True, "medium", True),
+            atm_mod._get_execution_first_turn_settings,
+            return_value=("claude-sonnet-4-6", True, "medium"),
         ),
     )
 
@@ -2450,7 +2425,6 @@ async def test_running_thread_continuation_wakeup_chain_and_server_explicit_mode
         identity=TurnIdentity(sender=OWNER, owner=OWNER, recorded_as=OWNER),
         thread={},
         is_byok=False,
-        run_metadata=cont_meta,
     )
     await atm_mod.resolve_turn_config_with_automation_inheritance(
         user_id=OWNER,
@@ -2466,7 +2440,7 @@ async def test_running_thread_continuation_wakeup_chain_and_server_explicit_mode
         resolve=cont_resolver,
         on_automation_context=cont_meta.update,
     )
-    assert cont_meta["llm_model_system_only"] is True
+    assert "llm_model_system_only" not in cont_meta
     assert cont_meta["automation_source_execution_id"] == EXEC_ID
     persisted_runs[cont_run_id] = dict(cont_meta)
 
@@ -2496,7 +2470,6 @@ async def test_running_thread_continuation_wakeup_chain_and_server_explicit_mode
         identity=TurnIdentity(sender=OWNER, owner=OWNER, recorded_as=OWNER),
         thread={},
         is_byok=False,
-        run_metadata=wakeup_meta,
     )
     await atm_mod.resolve_turn_config_with_automation_inheritance(
         user_id=OWNER,
@@ -2513,7 +2486,7 @@ async def test_running_thread_continuation_wakeup_chain_and_server_explicit_mode
         resolve=wakeup_resolver,
         on_automation_context=wakeup_meta.update,
     )
-    assert wakeup_meta["llm_model_system_only"] is True
+    assert "llm_model_system_only" not in wakeup_meta
     assert wakeup_meta["automation_source_execution_id"] == EXEC_ID
     assert resolve_calls[-1] == ("claude-sonnet-4-6", True, "medium")
 
@@ -2527,7 +2500,6 @@ async def test_running_thread_continuation_wakeup_chain_and_server_explicit_mode
         thread={},
         is_byok=False,
         reasoning_effort="high",
-        run_metadata=explicit_meta,
     )
     await atm_mod.resolve_turn_config_with_automation_inheritance(
         user_id=OWNER,
@@ -2545,7 +2517,7 @@ async def test_running_thread_continuation_wakeup_chain_and_server_explicit_mode
         resolve=explicit_resolver,
         on_automation_context=explicit_meta.update,
     )
-    assert explicit_meta["llm_model_system_only"] is True
+    assert "llm_model_system_only" not in explicit_meta
     assert explicit_meta["automation_source_execution_id"] == EXEC_ID
     # Explicit model & effort are kept (not overridden by first turn), while system-only is enforced
     assert resolve_calls[-1] == ("gpt-6.2-sol", True, "high")
@@ -2698,32 +2670,40 @@ async def test_pause_and_resume_recheck_workspace_web_access_in_tx(
 async def test_same_name_system_to_custom_switch_triggers_handoff_and_post_handoff_manual_compaction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Decision 4 (codex medium 4 + grok medium):
-    1) Web PATCH from system-only 'claude-sonnet-4-6' to owner's same-named 'claude-sonnet-4-6'
-       triggers summary handoff because (model, system_only) changed.
+    """1) Web PATCH from system-only 'claude-sonnet-4-6' to owner's same-named 'claude-sonnet-4-6'
+       triggers summary handoff because (model, execution system_only) changed, without stamping
+       owner_model_switch_run_id.
     2) In-chat switch_thread_model(defer_handoff=True) -> run_pending_model_handoff settles
-       ('completed' / 'not_needed') -> manual compaction resolves with ignore_custom_models=False."""
+       via clear_pending_model_handoff (no owner_model_switch_run_id)."""
     from src.dalton.database import model_switch as dalton_ms_db
     from src.server.app.threads import crud as crud_mod
     from src.server.database.conversation import threads_read, threads_write
     from src.server.handlers import thread_model_handoff as handoff_mod
     from src.server.models.conversation import ThreadUpdateRequest
-    from src.server.services import account as account_mod
     from src.server.services.llm import thread_model as thread_model_mod
     from src.server.services.thread_mutation import ThreadMutationRunner
 
     latest_run_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1"
     latest_run = {
         "conversation_response_id": latest_run_id,
-        "metadata": {
-            "llm_model": "claude-sonnet-4-6",
-            "llm_model_system_only": True,
-        },
+        "metadata": {"llm_model": "claude-sonnet-4-6"},
     }
     monkeypatch.setattr(
         runs_lifecycle_db,
         "get_latest_attempt",
         create_autospec(runs_lifecycle_db.get_latest_attempt, return_value=latest_run),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_run_id",
+        create_autospec(
+            atm_mod._get_execution_for_run_id,
+            side_effect=lambda rid: (
+                {"automation_execution_id": EXEC_ID, "llm_model_system_only": True}
+                if str(rid) == latest_run_id
+                else None
+            ),
+        ),
     )
 
     # --- Part A: Web PATCH /threads/{id} with same model string triggers hand_off_on_switch ---
@@ -2791,20 +2771,14 @@ async def test_same_name_system_to_custom_switch_triggers_handoff_and_post_hando
     )
     assert patched_item.summary_handoff is True
     handoff_spy.assert_awaited_once_with(THREAD_ID, OWNER, "claude-sonnet-4-6")
-    assert thread_state["metadata"]["owner_model_switch_run_id"] == latest_run_id
+    assert "owner_model_switch_run_id" not in thread_state["metadata"]
 
-    # --- Part B: In-chat switch_thread_model(defer_handoff=True) -> run_pending_model_handoff -> manual /compact ---
+    # --- Part B: In-chat switch_thread_model(defer_handoff=True) -> run_pending_model_handoff ---
     orig_req_sel = thread_model_mod.require_selectable_model
     orig_get_auth_meta = threads_read.get_thread_auth_meta
     orig_update_fields = threads_write.update_thread_fields
     orig_clear_meta = dalton_ms_db.clear_thread_metadata_key
-    orig_settle_meta = dalton_ms_db.settle_pending_model_handoff_metadata
     orig_inspect_handoff = handoff_mod.inspect_hand_off
-    orig_own_access = account_mod.own_access
-    orig_turn_identity_of = TurnIdentity.of
-    orig_thread_route = maint_mod.thread_route
-    orig_turn_model = thread_model_mod.turn_model
-    orig_resolve_llm = llm_config_mod.resolve_llm_config
 
     for settle_mode in ("completed", "not_needed"):
         inchat_state: dict[str, Any] = {
@@ -2828,23 +2802,6 @@ async def test_same_name_system_to_custom_switch_triggers_handoff_and_post_hando
                 return True
             return False
 
-        async def _inchat_settle(
-            tid: str,
-            key: str,
-            *,
-            expected_version=None,
-            switch_run_id_key: str = "owner_model_switch_run_id",
-            expected_run_id: str | None = None,
-            _st=inchat_state,
-        ):
-            if key not in _st["metadata"]:
-                return False
-            new_meta = {k: v for k, v in _st["metadata"].items() if k != key}
-            if expected_run_id and expected_run_id == latest_run_id:
-                new_meta[switch_run_id_key] = expected_run_id
-            _st["metadata"] = new_meta
-            return True
-
         monkeypatch.setattr(
             thread_model_mod,
             "require_selectable_model",
@@ -2865,11 +2822,6 @@ async def test_same_name_system_to_custom_switch_triggers_handoff_and_post_hando
             "clear_thread_metadata_key",
             create_autospec(orig_clear_meta, side_effect=_inchat_clear),
         )
-        monkeypatch.setattr(
-            dalton_ms_db,
-            "settle_pending_model_handoff_metadata",
-            create_autospec(orig_settle_meta, side_effect=_inchat_settle),
-        )
 
         sw_res = await thread_model_mod.switch_thread_model(
             OWNER,
@@ -2882,10 +2834,7 @@ async def test_same_name_system_to_custom_switch_triggers_handoff_and_post_hando
         )
         assert sw_res.changed is True
         assert thread_model_mod.PENDING_MODEL_HANDOFF_KEY in inchat_state["metadata"]
-        assert inchat_state["metadata"]["owner_model_switch_run_id"] == latest_run_id
-
-        # Simulate an older thread where only the pending marker was present before handoff settled
-        inchat_state["metadata"].pop("owner_model_switch_run_id", None)
+        assert "owner_model_switch_run_id" not in inchat_state["metadata"]
 
         inspect_seq = (
             [("ready", (SimpleNamespace(), None)), ("not_needed", None)]
@@ -2909,53 +2858,7 @@ async def test_same_name_system_to_custom_switch_triggers_handoff_and_post_hando
         outcome = await handoff_mod.run_pending_model_handoff(THREAD_ID, user_id=OWNER)
         assert outcome == settle_mode
         assert thread_model_mod.PENDING_MODEL_HANDOFF_KEY not in inchat_state["metadata"]
-        assert inchat_state["metadata"]["owner_model_switch_run_id"] == latest_run_id
-
-        # Manual compaction right after handoff settles must resolve under owner's custom model
-        route = TurnRoute(workspace_id=WS, owner_id=OWNER, role="analyst")
-        monkeypatch.setattr(
-            account_mod,
-            "own_access",
-            create_autospec(
-                orig_own_access,
-                return_value=SimpleNamespace(api_keys=False),
-            ),
-        )
-        monkeypatch.setattr(
-            maint_mod.TurnIdentity,
-            "of",
-            create_autospec(
-                orig_turn_identity_of,
-                return_value=TurnIdentity(sender=OWNER, owner=OWNER, recorded_as=OWNER),
-            ),
-        )
-        monkeypatch.setattr("src.server.app.setup.agent_config", SimpleNamespace())
-        monkeypatch.setattr(
-            maint_mod,
-            "thread_route",
-            create_autospec(orig_thread_route, side_effect=lambda _t, _u, _st=inchat_state: (dict(_st), route)),
-        )
-        monkeypatch.setattr(
-            thread_model_mod,
-            "turn_model",
-            create_autospec(
-                orig_turn_model,
-                side_effect=lambda _u, _t, *, named, held, clear_dead=True: named or held,
-            ),
-        )
-        compact_flags: list[tuple[str | None, bool]] = []
-
-        async def _compact_resolve(_base, _uid, model_name, _byok, **kw):
-            compact_flags.append((model_name, bool(kw.get("ignore_custom_models", False))))
-            return SimpleNamespace(llm=SimpleNamespace(name=model_name), llm_client=object())
-
-        monkeypatch.setattr(
-            llm_config_mod,
-            "resolve_llm_config",
-            create_autospec(orig_resolve_llm, side_effect=_compact_resolve),
-        )
-        await maint_mod._compaction_config(THREAD_ID, OWNER)
-        assert compact_flags == [("claude-sonnet-4-6", False)]
+        assert "owner_model_switch_run_id" not in inchat_state["metadata"]
 
 
 @pytest.mark.asyncio
@@ -3100,12 +3003,8 @@ async def test_http_retry_and_pending_input_retry_routes_preserve_system_only_to
         "status": "running",
         "conversation_thread_id": THREAD_ID,
         "user_id": OWNER,
+        "llm_model_system_only": True,
     }
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_run_system_only",
-        create_autospec(atm_mod._get_run_system_only, return_value=True),
-    )
     monkeypatch.setattr(
         atm_mod,
         "_get_execution_for_run_id",
@@ -3159,10 +3058,7 @@ async def test_http_retry_and_pending_input_retry_routes_preserve_system_only_to
                     "turn_index": 1,
                     "status": "error",
                     "error_message": "transient_failure",
-                    "metadata": {
-                        "llm_model_system_only": True,
-                        "automation_execution_id": EXEC_ID,
-                    },
+                    "metadata": {"automation_execution_id": EXEC_ID},
                 },
             ),
         )
@@ -3177,7 +3073,7 @@ async def test_http_retry_and_pending_input_retry_routes_preserve_system_only_to
         assert resp_cp.status_code == 200
         assert resolve_seen[-1] == ("claude-sonnet-4-6", True, "high")
         assert workflow_run_metas[-1] is not None
-        assert workflow_run_metas[-1]["llm_model_system_only"] is True
+        assert "llm_model_system_only" not in workflow_run_metas[-1]
         assert workflow_run_metas[-1]["automation_source_execution_id"] == EXEC_ID
 
         # (2) Pending-input /retry (failed before graph checkpoint -> input_rerun_request)
@@ -3192,7 +3088,6 @@ async def test_http_retry_and_pending_input_retry_routes_preserve_system_only_to
                     "status": "error",
                     "error_message": "transient_failure",
                     "metadata": {
-                        "llm_model_system_only": True,
                         "automation_execution_id": EXEC_ID,
                         pending_input_mod.PENDING_INPUT_KEY: {
                             "replay": False,
@@ -3215,7 +3110,7 @@ async def test_http_retry_and_pending_input_retry_routes_preserve_system_only_to
         assert resp_pending.status_code == 200
         assert resolve_seen[-1] == ("claude-sonnet-4-6", True, "high")
         assert workflow_run_metas[-1] is not None
-        assert workflow_run_metas[-1]["llm_model_system_only"] is True
+        assert "llm_model_system_only" not in workflow_run_metas[-1]
         assert workflow_run_metas[-1]["automation_source_execution_id"] == EXEC_ID
 
 
@@ -3375,316 +3270,20 @@ async def test_http_patch_automation_route_maintains_system_only_marker_to_final
 
 
 # ---------------------------------------------------------------------------
-# Round 4 narrowed tests (Decisions 1, 2, 3, 4)
+# Round 5 tests: immutable execution-level automation_executions.llm_model_system_only
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("first_turn_sys", "source_run_sys"),
-    [(False, True), (True, False)],
-    ids=["first_false_source_true", "first_true_source_false"],
-)
-async def test_wakeup_and_running_thread_system_only_follow_source_run_not_first_turn(
-    monkeypatch: pytest.MonkeyPatch,
-    first_turn_sys: bool,
-    source_run_sys: bool,
-) -> None:
-    """Round 4 Decision 1 (codex high 1):
-    When first_turn and the triggering source run disagree (e.g. automation config changed
-    across a restart), BOTH:
-      (a) wakeup continuation matched via created_by_run_id ('wakeup_creator_run'), and
-      (b) server continuation with explicit llm_model + reasoning_effort matched via
-          'running_thread'
-    MUST inherit llm_model_system_only from the triggering source run / execution's latest run,
-    NOT from the execution's first turn."""
-    from src.server.database import automation_executions as exec_db
-    from src.server.services.llm import thread_model as thread_model_mod
-
-    _install_catalog_and_prefs(monkeypatch, owner_pref={})
-    monkeypatch.setattr(
-        thread_model_mod,
-        "model_resolves",
-        create_autospec(thread_model_mod.model_resolves, return_value=True),
-    )
-    monkeypatch.setattr(
-        atm_mod,
-        "model_resolves",
-        create_autospec(atm_mod.model_resolves, return_value=True),
-    )
-
-    creator_run_id = "cccccccc-cccc-4ccc-8ccc-cccccccccc41"
-    wakeup_id = "dddddddd-dddd-4ddd-8ddd-dddddddddd41"
-    exec_row = {
-        "automation_execution_id": EXEC_ID,
-        "automation_id": AUTO_ID,
-        "status": "running",
-        "conversation_thread_id": THREAD_ID,
-        "user_id": OWNER,
-    }
-
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_wakeup_creator_run_ids",
-        create_autospec(atm_mod._get_wakeup_creator_run_ids, return_value=[creator_run_id]),
-    )
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_execution_for_run_id",
-        create_autospec(atm_mod._get_execution_for_run_id, return_value=exec_row),
-    )
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_run_system_only",
-        create_autospec(
-            atm_mod._get_run_system_only,
-            side_effect=lambda rid: source_run_sys if rid == creator_run_id else None,
-        ),
-    )
-    monkeypatch.setattr(
-        exec_db,
-        "get_running_executions_for_thread",
-        create_autospec(exec_db.get_running_executions_for_thread, return_value=[exec_row]),
-    )
-    latest_run_sys_spy = create_autospec(
-        atm_mod._get_execution_latest_run_system_only,
-        return_value=source_run_sys,
-    )
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_execution_latest_run_system_only",
-        latest_run_sys_spy,
-    )
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_execution_first_turn_run_settings",
-        create_autospec(
-            atm_mod._get_execution_first_turn_run_settings,
-            return_value=("claude-sonnet-4-6", True, "high", first_turn_sys),
-        ),
-    )
-
-    # (a) Wakeup continuation matched via wakeup_creator_run
-    seen_wakeup: list[bool] = []
-    wakeup_ctx: dict[str, Any] = {}
-
-    async def _resolve_wakeup(
-        model_name: str | None,
-        *,
-        reasoning_effort_override: Any = None,
-        ignore_custom_models_override: bool | None = None,
-    ):
-        seen_wakeup.append(bool(ignore_custom_models_override))
-        return SimpleNamespace(model=model_name)
-
-    wakeup_req = SimpleNamespace(
-        query_type="wakeup",
-        platform=None,
-        llm_model=None,
-        reasoning_effort=None,
-        hitl_response=None,
-        automation_delivery=None,
-        automation_earlier_runs=None,
-        report_source=None,
-        wakeup={"notices": [{"wakeup_id": wakeup_id}]},
-    )
-    await atm_mod.resolve_turn_config_with_automation_inheritance(
-        user_id=OWNER,
-        thread_id=THREAD_ID,
-        request=wakeup_req,
-        requested_model=None,
-        held_model=None,
-        from_service=True,
-        resolve=_resolve_wakeup,
-        on_automation_context=wakeup_ctx.update,
-    )
-    assert seen_wakeup == [source_run_sys]
-    assert bool(wakeup_ctx.get("llm_model_system_only", False)) is source_run_sys
-    assert wakeup_ctx.get("automation_source_execution_id") == EXEC_ID
-    latest_run_sys_spy.assert_not_awaited()
-
-    # (b) Server continuation with explicit llm_model + reasoning_effort matched via running_thread
-    seen_running: list[bool] = []
-    running_ctx: dict[str, Any] = {}
-
-    async def _resolve_running(
-        model_name: str | None,
-        *,
-        reasoning_effort_override: Any = None,
-        ignore_custom_models_override: bool | None = None,
-    ):
-        seen_running.append(bool(ignore_custom_models_override))
-        return SimpleNamespace(model=model_name)
-
-    running_req = SimpleNamespace(
-        query_type="system",
-        platform=None,
-        llm_model="claude-sonnet-4-6",
-        reasoning_effort="high",
-        hitl_response=None,
-        automation_delivery=None,
-        automation_earlier_runs=None,
-        report_source=None,
-    )
-    await atm_mod.resolve_turn_config_with_automation_inheritance(
-        user_id=OWNER,
-        thread_id=THREAD_ID,
-        request=running_req,
-        requested_model="claude-sonnet-4-6",
-        held_model=None,
-        from_service=True,
-        resolve=_resolve_running,
-        on_automation_context=running_ctx.update,
-    )
-    latest_run_sys_spy.assert_awaited_once()
-    assert seen_running == [source_run_sys]
-    assert bool(running_ctx.get("llm_model_system_only", False)) is source_run_sys
-    if source_run_sys:
-        assert running_ctx.get("automation_source_execution_id") == EXEC_ID
-
-
-@pytest.mark.asyncio
-async def test_hitl_resume_authoritative_false_is_not_overwritten_by_first_turn_true(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Round 4 Decision 2 (codex medium 2):
-    When execution's first turn used system-only (True), then after restart a later run used
-    owner's custom model (llm_model_system_only=False) and produced the HITL interrupt card,
-    resuming that interrupt MUST keep False (never overwritten by first_turn=True)."""
-    from src.server.services.llm import thread_model as thread_model_mod
-
-    _install_catalog_and_prefs(monkeypatch, owner_pref={})
-    monkeypatch.setattr(
-        thread_model_mod,
-        "model_resolves",
-        create_autospec(thread_model_mod.model_resolves, return_value=True),
-    )
-
-    interrupt_run_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa42"
-    exec_row = {
-        "automation_execution_id": EXEC_ID,
-        "automation_id": AUTO_ID,
-        "status": "running",
-        "conversation_thread_id": THREAD_ID,
-        "user_id": OWNER,
-    }
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_hitl_interrupt_run_id",
-        create_autospec(atm_mod._get_hitl_interrupt_run_id, return_value=interrupt_run_id),
-    )
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_run_system_only",
-        create_autospec(
-            atm_mod._get_run_system_only,
-            side_effect=lambda rid: False if rid == interrupt_run_id else None,
-        ),
-    )
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_execution_for_run_id",
-        create_autospec(atm_mod._get_execution_for_run_id, return_value=exec_row),
-    )
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_execution_first_turn_run_settings",
-        create_autospec(
-            atm_mod._get_execution_first_turn_run_settings,
-            return_value=("claude-sonnet-4-6", True, "high", True),
-        ),
-    )
-
-    # User HITL resume (with no explicit model or effort)
-    seen_user: list[bool] = []
-    user_ctx: dict[str, Any] = {}
-
-    async def _resolve_user(
-        model_name: str | None,
-        *,
-        reasoning_effort_override: Any = None,
-        ignore_custom_models_override: bool | None = None,
-    ):
-        seen_user.append(bool(ignore_custom_models_override))
-        return SimpleNamespace(model=model_name)
-
-    user_hitl_req = SimpleNamespace(
-        query_type="resume",
-        platform="web",
-        llm_model=None,
-        reasoning_effort=None,
-        hitl_response={"approved": True},
-        checkpoint_id=None,
-    )
-    await atm_mod.resolve_turn_config_with_automation_inheritance(
-        user_id=OWNER,
-        thread_id=THREAD_ID,
-        request=user_hitl_req,
-        requested_model=None,
-        held_model="owner-custom-only",
-        from_service=False,
-        resolve=_resolve_user,
-        on_automation_context=user_ctx.update,
-    )
-    assert seen_user == [False]
-    assert "llm_model_system_only" not in user_ctx
-    assert user_ctx.get("automation_source_execution_id") == EXEC_ID
-
-    # Server HITL resume (first turn is True, interrupt run is False -> stays False)
-    seen_server: list[bool] = []
-    server_ctx: dict[str, Any] = {}
-
-    async def _resolve_server(
-        model_name: str | None,
-        *,
-        reasoning_effort_override: Any = None,
-        ignore_custom_models_override: bool | None = None,
-    ):
-        seen_server.append(bool(ignore_custom_models_override))
-        return SimpleNamespace(model=model_name)
-
-    server_hitl_req = SimpleNamespace(
-        query_type="system",
-        platform=None,
-        llm_model="owner-custom-only",
-        reasoning_effort=None,
-        hitl_response={"approved": True},
-        checkpoint_id=None,
-        automation_execution_id=EXEC_ID,
-        automation_delivery=None,
-        automation_earlier_runs=None,
-        report_source=None,
-    )
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_execution_by_id",
-        create_autospec(atm_mod._get_execution_by_id, return_value=exec_row),
-    )
-    await atm_mod.resolve_turn_config_with_automation_inheritance(
-        user_id=OWNER,
-        thread_id=THREAD_ID,
-        request=server_hitl_req,
-        requested_model="owner-custom-only",
-        held_model=None,
-        from_service=True,
-        resolve=_resolve_server,
-        on_automation_context=server_ctx.update,
-    )
-    assert seen_server == [False]
-    assert "llm_model_system_only" not in server_ctx
 
 
 @pytest.mark.asyncio
 async def test_web_patch_handoff_uses_latest_run_model_not_stored_thread_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Round 4 Decision 3 (codex medium 3):
-    Thread stores 'gemini-2.5-pro', previous run was system-catalog OpenAI ('gpt-5.4',
-    llm_model_system_only=True) that wrote an OpenAI native summary, and owner switches
-    on web to same-named custom 'gpt-5.4'.
-    Web PATCH must pass 'gpt-5.4' (the previous run's actual model, NOT 'gemini-2.5-pro')
-    to hand_off_on_switch, and _hand_off_config must resolve the source model under system
-    catalog (ignore_custom_models=True) so OpenAI native summary handoff runs."""
+    """Thread stores 'gemini-2.5-pro', previous run belonged to a system-only execution using
+    OpenAI ('gpt-5.4') that wrote an OpenAI native summary, and owner switches on web to
+    same-named custom 'gpt-5.4' (or consecutively switches gemini -> claude).
+    Web PATCH passes 'gpt-5.4' (previous run's actual model, NOT 'gemini-2.5-pro') to
+    hand_off_on_switch, and _hand_off_config resolves the source model under system catalog
+    via the execution row's llm_model_system_only=True."""
     from src.llms import provider_compaction as pc_mod
     from src.server.app.threads import crud as crud_mod
     from src.server.models.conversation import ThreadUpdateRequest
@@ -3694,15 +3293,24 @@ async def test_web_patch_handoff_uses_latest_run_model_not_stored_thread_model(
     latest_run_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeee43"
     latest_run = {
         "conversation_response_id": latest_run_id,
-        "metadata": {
-            "llm_model": "gpt-5.4",
-            "llm_model_system_only": True,
-        },
+        "metadata": {"llm_model": "gpt-5.4"},
     }
     monkeypatch.setattr(
         runs_lifecycle_db,
         "get_latest_attempt",
         create_autospec(runs_lifecycle_db.get_latest_attempt, return_value=latest_run),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_run_id",
+        create_autospec(
+            atm_mod._get_execution_for_run_id,
+            side_effect=lambda rid: (
+                {"automation_execution_id": EXEC_ID, "llm_model_system_only": True}
+                if str(rid) == latest_run_id
+                else None
+            ),
+        ),
     )
 
     thread_state: dict[str, Any] = {
@@ -3800,7 +3408,6 @@ async def test_web_patch_handoff_uses_latest_run_model_not_stored_thread_model(
         "resolve_llm_config",
         create_autospec(llm_config_mod.resolve_llm_config, side_effect=_resolve_llm),
     )
-    # Only the system OpenAI endpoint can replay the OpenAI native summary (neither Gemini nor owner's custom endpoint can)
     monkeypatch.setattr(
         pc_mod,
         "replays",
@@ -3818,238 +3425,606 @@ async def test_web_patch_handoff_uses_latest_run_model_not_stored_thread_model(
         create_autospec(maint_mod.hand_off_on_switch, side_effect=_run_real_handoff_config),
     )
 
+    # First switch: thread had gemini-2.5-pro -> switch to same-named custom gpt-5.4
     patched_item = await crud_mod.update_thread_endpoint(
         THREAD_ID,
         ThreadUpdateRequest(llm_model="gpt-5.4"),
         x_user_id=OWNER,
     )
-    assert handoff_args == [(THREAD_ID, OWNER, "gpt-5.4")]
+    assert handoff_args[-1] == (THREAD_ID, OWNER, "gpt-5.4")
     assert handoff_resolve_calls == [
         ("gpt-5.4", False),  # newly switched-to custom endpoint cannot read summary
         ("gpt-5.4", True),   # previous run's system OpenAI endpoint reads summary
     ]
     assert patched_item.summary_handoff is True
 
+    # Consecutive second switch before any new turn (e.g. first handoff had failed/been skipped):
+    # switching to claude-sonnet-4-6 still uses previous run's gpt-5.4 + execution system_only=True
+    handoff_resolve_calls.clear()
+    patched_item_2 = await crud_mod.update_thread_endpoint(
+        THREAD_ID,
+        ThreadUpdateRequest(llm_model="claude-sonnet-4-6"),
+        x_user_id=OWNER,
+    )
+    assert handoff_args[-1] == (THREAD_ID, OWNER, "gpt-5.4")
+    assert handoff_resolve_calls == [
+        ("claude-sonnet-4-6", False),
+        ("gpt-5.4", True),
+    ]
+    assert patched_item_2.summary_handoff is True
+
 
 @pytest.mark.asyncio
-async def test_deferred_handoff_atomic_settle_does_not_stamp_new_run_started_mid_handoff(
+@pytest.mark.parametrize("exec_system_only", [True, False], ids=["exec_true", "exec_false"])
+async def test_all_continuation_paths_read_execution_system_only_column(
+    monkeypatch: pytest.MonkeyPatch,
+    exec_system_only: bool,
+) -> None:
+    """Round 5: every continuation path (HITL confirm, wakeup, command report, subagent task
+    report, server retry, deploy restart resume via automation_delivery, and running_thread)
+    reads automation_executions.llm_model_system_only directly and never writes
+    llm_model_system_only into run_metadata."""
+    from src.server.database import automation_executions as exec_db
+    from src.server.services.llm import thread_model as thread_model_mod
+
+    _install_catalog_and_prefs(monkeypatch, owner_pref={})
+    monkeypatch.setattr(
+        thread_model_mod,
+        "model_resolves",
+        create_autospec(thread_model_mod.model_resolves, return_value=True),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "model_resolves",
+        create_autospec(atm_mod.model_resolves, return_value=True),
+    )
+
+    exec_row = {
+        "automation_execution_id": EXEC_ID,
+        "automation_id": AUTO_ID,
+        "status": "running",
+        "conversation_thread_id": THREAD_ID,
+        "user_id": OWNER,
+        "llm_model_system_only": exec_system_only,
+    }
+    interrupt_run_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaa51"
+    creator_run_id = "cccccccc-cccc-4ccc-8ccc-cccccccccc51"
+    retry_run_id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeee51"
+    wakeup_id = "dddddddd-dddd-4ddd-8ddd-dddddddddd51"
+
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_hitl_interrupt_run_id",
+        create_autospec(atm_mod._get_hitl_interrupt_run_id, return_value=interrupt_run_id),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_wakeup_creator_run_ids",
+        create_autospec(atm_mod._get_wakeup_creator_run_ids, return_value=[creator_run_id]),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_run_id",
+        create_autospec(atm_mod._get_execution_for_run_id, return_value=exec_row),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_by_id",
+        create_autospec(atm_mod._get_execution_by_id, return_value=exec_row),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_command",
+        create_autospec(atm_mod._get_execution_for_command, return_value=exec_row),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_task",
+        create_autospec(atm_mod._get_execution_for_task, return_value=exec_row),
+    )
+    monkeypatch.setattr(
+        exec_db,
+        "get_running_executions_for_thread",
+        create_autospec(exec_db.get_running_executions_for_thread, return_value=[exec_row]),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_first_turn_settings",
+        create_autospec(
+            atm_mod._get_execution_first_turn_settings,
+            return_value=("claude-sonnet-4-6", True, "high"),
+        ),
+    )
+
+    cases: list[tuple[str, dict[str, Any]]] = [
+        (
+            "hitl_confirm",
+            dict(
+                request=SimpleNamespace(
+                    query_type="resume",
+                    platform="web",
+                    llm_model="claude-sonnet-4-6",
+                    reasoning_effort="high",
+                    hitl_response={"approved": True},
+                    checkpoint_id=None,
+                ),
+                requested_model="claude-sonnet-4-6",
+                held_model="claude-sonnet-4-6",
+                from_service=False,
+                is_server_retry=False,
+                retry_of_run_id=None,
+            ),
+        ),
+        (
+            "wakeup",
+            dict(
+                request=SimpleNamespace(
+                    query_type="wakeup",
+                    platform=None,
+                    llm_model=None,
+                    reasoning_effort=None,
+                    hitl_response=None,
+                    automation_delivery=None,
+                    automation_earlier_runs=None,
+                    report_source=None,
+                    wakeup={"notices": [{"wakeup_id": wakeup_id}]},
+                ),
+                requested_model=None,
+                held_model=None,
+                from_service=True,
+                is_server_retry=False,
+                retry_of_run_id=None,
+            ),
+        ),
+        (
+            "command_report",
+            dict(
+                request=SimpleNamespace(
+                    query_type="system",
+                    platform=None,
+                    llm_model=None,
+                    reasoning_effort=None,
+                    hitl_response=None,
+                    automation_delivery=None,
+                    automation_earlier_runs=None,
+                    report_source={"kind": "command_report", "command_id": "bg-cmd-51"},
+                ),
+                requested_model=None,
+                held_model=None,
+                from_service=True,
+                is_server_retry=False,
+                retry_of_run_id=None,
+            ),
+        ),
+        (
+            "subagent_task_report",
+            dict(
+                request=SimpleNamespace(
+                    query_type="system",
+                    platform=None,
+                    llm_model=None,
+                    reasoning_effort=None,
+                    hitl_response=None,
+                    automation_delivery=None,
+                    automation_earlier_runs=None,
+                    report_source={"kind": "task", "task_id": "task-51", "task_run_id": None},
+                ),
+                requested_model=None,
+                held_model=None,
+                from_service=True,
+                is_server_retry=False,
+                retry_of_run_id=None,
+            ),
+        ),
+        (
+            "server_retry",
+            dict(
+                request=SimpleNamespace(
+                    query_type="system",
+                    platform=None,
+                    llm_model=None,
+                    reasoning_effort=None,
+                    hitl_response=None,
+                    automation_delivery=None,
+                    automation_earlier_runs=None,
+                    report_source=None,
+                ),
+                requested_model=None,
+                held_model=None,
+                from_service=True,
+                is_server_retry=True,
+                retry_of_run_id=retry_run_id,
+            ),
+        ),
+        (
+            "deploy_restart_resume",
+            dict(
+                request=SimpleNamespace(
+                    query_type="system",
+                    platform=None,
+                    llm_model=None,
+                    reasoning_effort=None,
+                    hitl_response=None,
+                    automation_delivery={"id": EXEC_ID},
+                    automation_earlier_runs=None,
+                    report_source=None,
+                ),
+                requested_model=None,
+                held_model=None,
+                from_service=True,
+                is_server_retry=False,
+                retry_of_run_id=None,
+            ),
+        ),
+        (
+            "running_thread",
+            dict(
+                request=SimpleNamespace(
+                    query_type="system",
+                    platform=None,
+                    llm_model="claude-sonnet-4-6",
+                    reasoning_effort="high",
+                    hitl_response=None,
+                    automation_delivery=None,
+                    automation_earlier_runs=None,
+                    report_source=None,
+                ),
+                requested_model="claude-sonnet-4-6",
+                held_model=None,
+                from_service=True,
+                is_server_retry=False,
+                retry_of_run_id=None,
+            ),
+        ),
+    ]
+
+    for label, kw in cases:
+        seen_ign: list[bool] = []
+        ctx_meta: dict[str, Any] = {}
+
+        async def _resolve(
+            model_name: str | None,
+            *,
+            reasoning_effort_override: Any = None,
+            ignore_custom_models_override: bool | None = None,
+            _log: list[bool] = seen_ign,
+        ):
+            _log.append(bool(ignore_custom_models_override))
+            return SimpleNamespace(model=model_name)
+
+        await atm_mod.resolve_turn_config_with_automation_inheritance(
+            user_id=OWNER,
+            thread_id=THREAD_ID,
+            resolve=_resolve,
+            on_automation_context=ctx_meta.update,
+            **kw,
+        )
+        assert seen_ign == [exec_system_only], f"{label}: expected ignore_custom={exec_system_only}, got {seen_ign}"
+        assert "llm_model_system_only" not in ctx_meta, f"{label}: must not stamp llm_model_system_only into run_metadata"
+        if label != "running_thread" or exec_system_only:
+            assert ctx_meta.get("automation_source_execution_id") == EXEC_ID, f"{label}: missing execution provenance"
+
+
+@pytest.mark.asyncio
+async def test_automation_config_edit_after_execution_start_does_not_affect_in_flight_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Round 4 Decision 4 (codex medium 4):
-    1) run_pending_model_handoff captures initial system-only run_id at handoff start and settles
-       via a single atomic settle_pending_model_handoff_metadata(..., expected_run_id=initial_run_id).
-       If a newer system-only run starts mid-handoff, owner_model_switch_run_id is NOT stamped with
-       the newer run's ID, so subsequent manual compaction after the newer run still uses system catalog.
-    2) settle_pending_model_handoff_metadata issues a single conditional UPDATE checking the latest
-       conversation_responses row against expected_run_id alongside expected_version."""
-    from contextlib import asynccontextmanager
-
-    from src.dalton.database import model_switch as dalton_ms_db
-    from src.server.database import pool as db_pool_mod
-    from src.server.database.conversation import threads_read
-    from src.server.handlers import thread_model_handoff as handoff_mod
-    from src.server.services import account as account_mod
+    """Round 5: changing an automation's metadata.llm_model_system_only after execution creation
+    does NOT change an in-flight execution's effective flag (both at first turn via
+    AutomationExecutor._run_turn and across subsequent continuations)."""
     from src.server.services.llm import thread_model as thread_model_mod
-    from src.server.services.thread_mutation import ThreadMutationRunner
 
-    initial_run_id = "11111111-1111-4111-8111-111111111144"
-    newer_run_id = "22222222-2222-4222-8222-222222222244"
-
-    # (1) Verify SQL shape of settle_pending_model_handoff_metadata directly
-    executed_sqls: list[tuple[str, Any]] = []
-
-    class _FakeCursor:
-        rowcount = 1
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_a):
-            return False
-
-        async def execute(self, sql: str, params: Any = None):
-            executed_sqls.append((sql, params))
-
-    class _FakeConn:
-        def cursor(self):
-            return _FakeCursor()
-
-    @asynccontextmanager
-    async def _fake_get_conn():
-        yield _FakeConn()
-
-    monkeypatch.setattr(db_pool_mod, "get_db_connection", _fake_get_conn)
-    updated = await dalton_ms_db.settle_pending_model_handoff_metadata(
-        THREAD_ID,
-        thread_model_mod.PENDING_MODEL_HANDOFF_KEY,
-        expected_version="ver-1",
-        switch_run_id_key="owner_model_switch_run_id",
-        expected_run_id=initial_run_id,
+    _install_catalog_and_prefs(monkeypatch, owner_pref={})
+    monkeypatch.setattr(
+        thread_model_mod,
+        "model_resolves",
+        create_autospec(thread_model_mod.model_resolves, return_value=True),
     )
-    assert updated is True
-    assert len(executed_sqls) == 1
-    sql_text, sql_params = executed_sqls[0]
-    assert "UPDATE conversation_threads" in sql_text
-    assert "FROM conversation_responses" in sql_text
-    assert "= %(expected_run_id)s" in sql_text
-    assert "metadata - %(pending_key)s" in sql_text
-    assert "|| %(stamp_json)s::jsonb" in sql_text
-    assert "metadata -> %(pending_key)s ->> 'version' = %(expected_version)s" in sql_text
-    assert sql_params["expected_run_id"] == initial_run_id
-    assert sql_params["expected_version"] == "ver-1"
+    monkeypatch.setattr(
+        atm_mod,
+        "model_resolves",
+        create_autospec(atm_mod.model_resolves, return_value=True),
+    )
 
-    # (2) Simulate a new system-only run starting mid-handoff in run_pending_model_handoff
-    thread_state: dict[str, Any] = {
+    orig_get_exec = atm_mod._get_execution_by_id
+    orig_get_auto = auto_db.get_automation_including_deleted
+
+    # Scenario 1: execution was created when llm_model_system_only=True, then automation was edited
+    # to remove llm_model_system_only (metadata={}). Continuation MUST still enforce True.
+    exec_started_true = {
+        "automation_execution_id": EXEC_ID,
+        "automation_id": AUTO_ID,
+        "status": "running",
         "conversation_thread_id": THREAD_ID,
-        "workspace_id": WS,
         "user_id": OWNER,
-        "llm_model": "gpt-5.4",
-        "metadata": {
-            thread_model_mod.PENDING_MODEL_HANDOFF_KEY: {
-                "previous_model": "gpt-5.4",
+        "llm_model_system_only": True,
+    }
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_by_id",
+        create_autospec(orig_get_exec, return_value=exec_started_true),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_first_turn_settings",
+        create_autospec(atm_mod._get_execution_first_turn_settings, return_value=(None, False, None)),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "get_automation_including_deleted",
+        create_autospec(
+            orig_get_auto,
+            return_value={
+                "automation_id": AUTO_ID,
                 "user_id": OWNER,
-                "version": "ver-44",
-                "candidate_models": ["gpt-5.4"],
-            }
-        },
-    }
-    latest_run_holder: dict[str, Any] = {
-        "conversation_response_id": initial_run_id,
-        "metadata": {"llm_model": "gpt-5.4", "llm_model_system_only": True},
-    }
+                "llm_model": "claude-sonnet-4-6",
+                "reasoning_effort": "medium",
+                "metadata": {},  # edited AFTER execution started
+            },
+        ),
+    )
+    seen_1: list[bool] = []
 
+    async def _resolve_1(model_name: str | None, *, reasoning_effort_override: Any = None, ignore_custom_models_override: bool | None = None):
+        seen_1.append(bool(ignore_custom_models_override))
+        return SimpleNamespace(model=model_name)
+
+    await atm_mod.resolve_turn_config_with_automation_inheritance(
+        user_id=OWNER,
+        thread_id=THREAD_ID,
+        request=SimpleNamespace(
+            query_type="system",
+            platform=None,
+            llm_model=None,
+            reasoning_effort=None,
+            hitl_response=None,
+            automation_delivery={"id": EXEC_ID},
+            automation_earlier_runs=None,
+            report_source=None,
+        ),
+        requested_model=None,
+        held_model=None,
+        from_service=True,
+        resolve=_resolve_1,
+    )
+    assert seen_1 == [True]
+
+    # Scenario 2: execution was created when llm_model_system_only=False, then PM edited automation
+    # to set llm_model_system_only=True. In-flight execution MUST stay False.
+    exec_started_false = {**exec_started_true, "llm_model_system_only": False}
     monkeypatch.setattr(
-        runs_lifecycle_db,
-        "get_latest_attempt",
+        atm_mod,
+        "_get_execution_by_id",
+        create_autospec(orig_get_exec, return_value=exec_started_false),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "get_automation_including_deleted",
         create_autospec(
-            runs_lifecycle_db.get_latest_attempt,
-            side_effect=lambda _tid: dict(latest_run_holder),
+            orig_get_auto,
+            return_value={
+                "automation_id": AUTO_ID,
+                "user_id": OWNER,
+                "llm_model": "claude-sonnet-4-6",
+                "reasoning_effort": "medium",
+                "metadata": {"llm_model_system_only": True},  # edited AFTER execution started
+            },
+        ),
+    )
+    seen_2: list[bool] = []
+
+    async def _resolve_2(model_name: str | None, *, reasoning_effort_override: Any = None, ignore_custom_models_override: bool | None = None):
+        seen_2.append(bool(ignore_custom_models_override))
+        return SimpleNamespace(model=model_name)
+
+    await atm_mod.resolve_turn_config_with_automation_inheritance(
+        user_id=OWNER,
+        thread_id=THREAD_ID,
+        request=SimpleNamespace(
+            query_type="system",
+            platform=None,
+            llm_model=None,
+            reasoning_effort=None,
+            hitl_response=None,
+            automation_delivery={"id": EXEC_ID},
+            automation_earlier_runs=None,
+            report_source=None,
+        ),
+        requested_model=None,
+        held_model=None,
+        from_service=True,
+        resolve=_resolve_2,
+    )
+    assert seen_2 == [False]
+
+
+@pytest.mark.asyncio
+async def test_unlinked_continuations_and_user_started_reports_do_not_inherit_system_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5: when a continuation cannot be linked to an automation execution — including a
+    user-started command report, user-started subagent task report, user-started wakeup, server
+    retry of a non-automation run, or HITL resume of a non-automation run — it is treated as a
+    normal owner turn (ignore_custom_models=False) even while a system-only automation is running
+    on the same thread."""
+    from src.server.database import automation_executions as exec_db
+    from src.server.services.llm import thread_model as thread_model_mod
+
+    _install_catalog_and_prefs(monkeypatch, owner_pref={})
+    monkeypatch.setattr(
+        thread_model_mod,
+        "model_resolves",
+        create_autospec(thread_model_mod.model_resolves, return_value=True),
+    )
+
+    unrelated_running_exec = {
+        "automation_execution_id": EXEC_ID,
+        "automation_id": AUTO_ID,
+        "status": "running",
+        "conversation_thread_id": THREAD_ID,
+        "user_id": OWNER,
+        "llm_model_system_only": True,
+    }
+    running_spy = create_autospec(
+        exec_db.get_running_executions_for_thread,
+        return_value=[unrelated_running_exec],
+    )
+    monkeypatch.setattr(exec_db, "get_running_executions_for_thread", running_spy)
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_command",
+        create_autospec(atm_mod._get_execution_for_command, return_value=None),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_task",
+        create_autospec(atm_mod._get_execution_for_task, return_value=None),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_wakeup_creator_run_ids",
+        create_autospec(
+            atm_mod._get_wakeup_creator_run_ids,
+            return_value=["11111111-1111-4111-8111-111111111155"],
         ),
     )
     monkeypatch.setattr(
-        threads_read,
-        "get_thread_auth_meta",
-        create_autospec(threads_read.get_thread_auth_meta, side_effect=lambda _tid: dict(thread_state)),
+        atm_mod,
+        "_get_execution_for_run_id",
+        create_autospec(atm_mod._get_execution_for_run_id, return_value=None),
     )
     monkeypatch.setattr(
-        thread_model_mod,
-        "next_turn_runs_claude_code",
-        create_autospec(thread_model_mod.next_turn_runs_claude_code, return_value=False),
+        atm_mod,
+        "_get_hitl_interrupt_run_id",
+        create_autospec(
+            atm_mod._get_hitl_interrupt_run_id,
+            return_value="22222222-2222-4222-8222-222222222255",
+        ),
     )
 
-    inspect_calls = 0
+    unlinked_cases: list[tuple[str, dict[str, Any]]] = [
+        (
+            "user_command_report",
+            dict(
+                request=SimpleNamespace(
+                    query_type="system",
+                    platform=None,
+                    llm_model=None,
+                    reasoning_effort=None,
+                    hitl_response=None,
+                    automation_delivery=None,
+                    automation_earlier_runs=None,
+                    report_source={"kind": "command_report", "command_id": "user-cmd-1"},
+                ),
+                requested_model=None,
+                held_model="owner-custom-only",
+                from_service=True,
+                is_server_retry=False,
+                retry_of_run_id=None,
+            ),
+        ),
+        (
+            "user_subagent_report",
+            dict(
+                request=SimpleNamespace(
+                    query_type="system",
+                    platform=None,
+                    llm_model=None,
+                    reasoning_effort=None,
+                    hitl_response=None,
+                    automation_delivery=None,
+                    automation_earlier_runs=None,
+                    report_source={"kind": "task", "task_id": "user-task-1", "task_run_id": None},
+                ),
+                requested_model=None,
+                held_model="owner-custom-only",
+                from_service=True,
+                is_server_retry=False,
+                retry_of_run_id=None,
+            ),
+        ),
+        (
+            "user_wakeup",
+            dict(
+                request=SimpleNamespace(
+                    query_type="wakeup",
+                    platform=None,
+                    llm_model=None,
+                    reasoning_effort=None,
+                    hitl_response=None,
+                    automation_delivery=None,
+                    automation_earlier_runs=None,
+                    report_source=None,
+                    wakeup={"notices": [{"wakeup_id": WAKEUP_ID}]},
+                ),
+                requested_model=None,
+                held_model="owner-custom-only",
+                from_service=True,
+                is_server_retry=False,
+                retry_of_run_id=None,
+            ),
+        ),
+        (
+            "server_retry_of_user_run",
+            dict(
+                request=SimpleNamespace(
+                    query_type="system",
+                    platform=None,
+                    llm_model=None,
+                    reasoning_effort=None,
+                    hitl_response=None,
+                    automation_delivery=None,
+                    automation_earlier_runs=None,
+                    report_source=None,
+                ),
+                requested_model=None,
+                held_model="owner-custom-only",
+                from_service=True,
+                is_server_retry=True,
+                retry_of_run_id="33333333-3333-4333-8333-333333333355",
+            ),
+        ),
+        (
+            "user_hitl_resume",
+            dict(
+                request=SimpleNamespace(
+                    query_type="resume",
+                    platform="web",
+                    llm_model="owner-custom-only",
+                    reasoning_effort=None,
+                    hitl_response={"approved": True},
+                    checkpoint_id=None,
+                ),
+                requested_model="owner-custom-only",
+                held_model="owner-custom-only",
+                from_service=False,
+                is_server_retry=False,
+                retry_of_run_id=None,
+            ),
+        ),
+    ]
 
-    async def _inspect_and_inject_new_run(*_a: Any, **_kw: Any):
-        nonlocal inspect_calls
-        inspect_calls += 1
-        if inspect_calls == 1:
-            return "ready", (SimpleNamespace(), None)
-        # Before post-handoff settle, a brand-new system-only automation run starts!
-        latest_run_holder["conversation_response_id"] = newer_run_id
-        return "not_needed", None
+    for label, kw in unlinked_cases:
+        seen_ign: list[bool] = []
+        ctx_meta: dict[str, Any] = {}
 
-    monkeypatch.setattr(
-        handoff_mod,
-        "inspect_hand_off",
-        create_autospec(handoff_mod.inspect_hand_off, side_effect=_inspect_and_inject_new_run),
-    )
-    monkeypatch.setattr(
-        maint_mod,
-        "hand_off_on_switch",
-        create_autospec(maint_mod.hand_off_on_switch, return_value=True),
-    )
-    fake_runner = create_autospec(ThreadMutationRunner, instance=True)
-    fake_runner.wait_until_idle.return_value = True
-    monkeypatch.setattr(
-        ThreadMutationRunner,
-        "get_instance",
-        staticmethod(lambda: fake_runner),
-    )
+        async def _resolve(
+            model_name: str | None,
+            *,
+            reasoning_effort_override: Any = None,
+            ignore_custom_models_override: bool | None = None,
+            _log: list[bool] = seen_ign,
+        ):
+            _log.append(bool(ignore_custom_models_override))
+            return SimpleNamespace(model=model_name)
 
-    settle_calls: list[dict[str, Any]] = []
-
-    async def _atomic_settle_sim(
-        tid: str,
-        key: str,
-        *,
-        expected_version=None,
-        switch_run_id_key: str = "owner_model_switch_run_id",
-        expected_run_id: str | None = None,
-    ) -> bool:
-        settle_calls.append(
-            {
-                "tid": tid,
-                "key": key,
-                "expected_version": expected_version,
-                "expected_run_id": expected_run_id,
-            }
+        await atm_mod.resolve_turn_config_with_automation_inheritance(
+            user_id=OWNER,
+            thread_id=THREAD_ID,
+            resolve=_resolve,
+            on_automation_context=ctx_meta.update,
+            **kw,
         )
-        pending = thread_state["metadata"].get(key)
-        if not isinstance(pending, dict) or pending.get("version") != expected_version:
-            return False
-        new_meta = {k: v for k, v in thread_state["metadata"].items() if k != key}
-        # Mirror the SQL CASE guard: only stamp if latest run is STILL expected_run_id
-        if expected_run_id and latest_run_holder["conversation_response_id"] == expected_run_id:
-            new_meta[switch_run_id_key] = expected_run_id
-        thread_state["metadata"] = new_meta
-        return True
-
-    monkeypatch.setattr(
-        dalton_ms_db,
-        "settle_pending_model_handoff_metadata",
-        create_autospec(
-            dalton_ms_db.settle_pending_model_handoff_metadata,
-            side_effect=_atomic_settle_sim,
-        ),
-    )
-
-    outcome = await handoff_mod.run_pending_model_handoff(THREAD_ID, user_id=OWNER)
-    assert outcome == "completed"
-    assert len(settle_calls) == 1
-    assert settle_calls[0]["expected_run_id"] == initial_run_id
-    assert settle_calls[0]["expected_version"] == "ver-44"
-    assert thread_model_mod.PENDING_MODEL_HANDOFF_KEY not in thread_state["metadata"]
-    assert "owner_model_switch_run_id" not in thread_state["metadata"]
-
-    # Manual compaction after newer_run_id MUST still use system catalog (ignore_custom_models=True)
-    route = TurnRoute(workspace_id=WS, owner_id=OWNER, role="analyst")
-    monkeypatch.setattr("src.server.app.setup.agent_config", SimpleNamespace())
-    monkeypatch.setattr(
-        account_mod,
-        "own_access",
-        create_autospec(account_mod.own_access, return_value=SimpleNamespace(api_keys=False)),
-    )
-    monkeypatch.setattr(
-        maint_mod.TurnIdentity,
-        "of",
-        create_autospec(
-            TurnIdentity.of,
-            return_value=TurnIdentity(sender=OWNER, owner=OWNER, recorded_as=OWNER),
-        ),
-    )
-    monkeypatch.setattr(
-        maint_mod,
-        "thread_route",
-        create_autospec(maint_mod.thread_route, side_effect=lambda _t, _u: (dict(thread_state), route)),
-    )
-    monkeypatch.setattr(
-        thread_model_mod,
-        "turn_model",
-        create_autospec(
-            thread_model_mod.turn_model,
-            side_effect=lambda _u, _t, *, named, held, clear_dead=True: named or held,
-        ),
-    )
-    compact_flags: list[tuple[str | None, bool]] = []
-
-    async def _compact_resolve(_base, _uid, model_name, _byok, **kw):
-        compact_flags.append((model_name, bool(kw.get("ignore_custom_models", False))))
-        return SimpleNamespace(llm=SimpleNamespace(name=model_name), llm_client=object())
-
-    monkeypatch.setattr(
-        llm_config_mod,
-        "resolve_llm_config",
-        create_autospec(llm_config_mod.resolve_llm_config, side_effect=_compact_resolve),
-    )
-    await maint_mod._compaction_config(THREAD_ID, OWNER)
-    assert compact_flags == [("gpt-5.4", True)]
+        assert seen_ign == [False], f"{label}: unlinked turn must NOT apply system-only"
+        assert ctx_meta == {}, f"{label}: unlinked turn must NOT stamp automation context"
+    running_spy.assert_not_awaited()

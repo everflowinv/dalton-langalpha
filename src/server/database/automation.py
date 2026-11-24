@@ -1194,14 +1194,18 @@ async def claim_due_automations(
                         """, (automation_id,))
 
                     # Insert pending execution
+                    # DALTON-HOOK(cos-settings-tools): freeze automation's llm_model_system_only onto automation_executions in the same transaction
+                    exec_system_only = bool(
+                        (row.get("metadata") or {}).get("llm_model_system_only")
+                    )
                     await cur.execute("""
                         INSERT INTO automation_executions (
                             automation_execution_id, automation_id,
                             status, scheduled_at, server_id, created_at,
-                            heartbeat_at
+                            heartbeat_at, llm_model_system_only
                         )
-                        VALUES (%s, %s, 'pending', %s, %s, NOW(), NOW())
-                    """, (execution_id, automation_id, row["next_run_at"], server_id))
+                        VALUES (%s, %s, 'pending', %s, %s, NOW(), NOW(), %s)
+                    """, (execution_id, automation_id, row["next_run_at"], server_id, exec_system_only))
 
                     entry = dict(row)
                     # DALTON-HOOK(company-automations): reflect once_schedule_at on returned claimed entry
@@ -1234,6 +1238,7 @@ async def claim_price_firing(automation_id: str, server_id: str) -> Optional[str
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor() as cur:
+                # DALTON-HOOK(cos-settings-tools): read llm_model_system_only from locked automation row and stamp onto automation_executions in the same transaction
                 await cur.execute("""
                     UPDATE automations
                     SET status = 'executing', next_run_at = NULL, last_run_at = NOW()
@@ -1241,17 +1246,24 @@ async def claim_price_firing(automation_id: str, server_id: str) -> Optional[str
                       -- DALTON-HOOK(company-automations): skip a deleted price claim
                       AND deleted_at IS NULL
                       AND (next_run_at IS NULL OR next_run_at <= NOW())
+                    RETURNING COALESCE((metadata->>'llm_model_system_only')::boolean, FALSE) AS llm_model_system_only
                 """, (automation_id,))
+                claimed_row = await cur.fetchone()
                 if cur.rowcount == 0:
                     return None
+                exec_system_only = bool(
+                    claimed_row["llm_model_system_only"]
+                    if isinstance(claimed_row, dict)
+                    else (claimed_row[0] if claimed_row else False)
+                )
                 await cur.execute("""
                     INSERT INTO automation_executions (
                         automation_execution_id, automation_id,
                         status, scheduled_at, server_id, created_at,
-                        heartbeat_at
+                        heartbeat_at, llm_model_system_only
                     )
-                    VALUES (%s, %s, 'pending', NOW(), %s, NOW(), NOW())
-                """, (execution_id, automation_id, server_id))
+                    VALUES (%s, %s, 'pending', NOW(), %s, NOW(), NOW(), %s)
+                """, (execution_id, automation_id, server_id, exec_system_only))
     return execution_id
 
 

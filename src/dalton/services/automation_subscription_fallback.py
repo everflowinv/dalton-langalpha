@@ -449,10 +449,7 @@ async def resolve_ptc_turn_llm_config(
     run_metadata: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     """Resolve LLM config for ``ptc_run`` with automation subscription fallback when eligible."""
-    ignore_custom = bool(
-        getattr(request, "llm_model_system_only", False)
-        or (run_metadata or {}).get("llm_model_system_only")
-    )
+    ignore_custom = bool(getattr(request, "llm_model_system_only", False))
     if is_automation_executor_turn(request, run_metadata):
         config, fallback_record = await resolve_automation_turn_llm_config(
             base_config,

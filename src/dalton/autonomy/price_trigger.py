@@ -636,9 +636,11 @@ async def claim_dalton_price_move_firing(
                     UPDATE automations
                     SET status = 'executing', next_run_at = NULL, last_run_at = NOW()
                     WHERE automation_id = %s AND user_id = %s AND status = 'active'
+                    RETURNING COALESCE((metadata->>'llm_model_system_only')::boolean, FALSE) AS llm_model_system_only
                     """,
                     (automation_id, user_id),
                 )
+                claimed_row = await cur.fetchone()
                 if cur.rowcount == 0:
                     await cur.execute(
                         """
@@ -650,14 +652,20 @@ async def claim_dalton_price_move_firing(
                     )
                     return None, False
 
+                exec_system_only = bool(
+                    claimed_row["llm_model_system_only"]
+                    if isinstance(claimed_row, dict)
+                    else (claimed_row[0] is True if claimed_row else False)
+                )
+                system_only_sql = "TRUE" if exec_system_only else "FALSE"
                 await cur.execute(
-                    """
+                    f"""
                     INSERT INTO automation_executions (
                         automation_execution_id, automation_id,
                         status, scheduled_at, server_id, created_at,
-                        heartbeat_at
+                        heartbeat_at, llm_model_system_only
                     )
-                    VALUES (%s, %s, 'pending', NOW(), %s, NOW(), NOW())
+                    VALUES (%s, %s, 'pending', NOW(), %s, NOW(), NOW(), {system_only_sql})
                     """,
                     (execution_id, automation_id, server_id),
                 )

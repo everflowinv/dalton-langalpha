@@ -8,6 +8,7 @@ Run outside the sandbox against a temporary *_test PostgreSQL database:
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 import time
 import uuid
 from typing import Any
@@ -18,7 +19,11 @@ import pytest
 from psycopg.rows import dict_row
 
 from src.dalton.autonomy import schedule as schedule_mod
+from src.dalton.database import company_automations as company_automations_db
+from src.dalton.services import automation_thread_model as atm_mod
+from src.dalton.services import company_automations
 from src.server.database import automation as auto_db
+from src.server.database import automation_executions as exec_db
 from src.server.database import computer as computer_db
 from src.server.database import user as user_db
 from src.server.database import workspace as ws_db
@@ -39,7 +44,10 @@ from src.server.services.workspace_move import claim_workspace_move
 # Loaded before patched_get_db_connection sweeps sys.modules so every holder uses test_db_pool.
 _POOL_HOLDERS = (
     schedule_mod,
+    company_automations_db,
+    atm_mod,
     auto_db,
+    exec_db,
     computer_db,
     user_db,
     ws_db,
@@ -490,3 +498,230 @@ async def test_home_earnings_calendar_owner_vs_other_home_job_on_real_db(
     )
     assert refused_res["ok"] is False
     assert refused_res["error"] == "forbidden_pm"
+
+
+async def test_execution_creation_stamps_system_only_atomically_and_later_config_edits_do_not_change_it(
+    patched_get_db_connection,
+    cleanup_tables,
+    test_db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5 real DB test: all execution-creation SQL paths stamp
+    automation_executions.llm_model_system_only in the same transaction from the automation row,
+    and subsequent automation config updates never mutate already-created executions."""
+    monkeypatch.setattr("src.dalton.settings.is_coverage_units_enabled", lambda: False)
+    user_id = f"b1-exec-sys-{uuid.uuid4().hex[:10]}"
+    _c1_id, _c2_id, ws_id = await _setup_user_and_two_computers(user_id)
+
+    now = datetime.now(UTC)
+    due_auto = await auto_db.create_automation(
+        user_id=user_id,
+        name="due-sys-only",
+        trigger_type="cron",
+        cron_expression="0 9 * * 1-5",
+        timezone="Asia/Shanghai",
+        instruction="Check NVDA.",
+        workspace_id=ws_id,
+        llm_model="claude-sonnet-4-6",
+        next_run_at=now - timedelta(minutes=1),
+        metadata={"dalton_managed": True, "llm_model_system_only": True},
+    )
+    due_auto_id = str(due_auto["automation_id"])
+
+    price_auto = await auto_db.create_automation(
+        user_id=user_id,
+        name="price-sys-only",
+        trigger_type="price",
+        trigger_config={"symbol": "NVDA", "conditions": [{"type": "price_above", "value": 100}]},
+        timezone="Asia/Shanghai",
+        instruction="Price alert.",
+        workspace_id=ws_id,
+        llm_model="claude-sonnet-4-6",
+        metadata={"dalton_managed": True, "llm_model_system_only": True},
+    )
+    price_auto_id = str(price_auto["automation_id"])
+
+    # 1. claim_due_automations stamps llm_model_system_only=True in the same tx
+    claimed = await auto_db.claim_due_automations(now, server_id="srv-r5", limit=10)
+    matched_due = [r for r in claimed if str(r["automation_id"]) == due_auto_id]
+    assert len(matched_due) == 1
+    exec_claimed_id = str(matched_due[0]["_execution_id"])
+
+    # 2. create_execution_for_live_parent stamps llm_model_system_only=True in the same tx
+    exec_live_id, _parent = await exec_db.create_execution_for_live_parent(
+        due_auto_id, user_id, now, "srv-r5"
+    )
+
+    # 3. create_execution stamps llm_model_system_only=True in the same tx
+    exec_direct_id = await exec_db.create_execution(due_auto_id, now, "srv-r5")
+
+    # 4. claim_price_firing stamps llm_model_system_only=True in the same tx
+    exec_price_id = await auto_db.claim_price_firing(price_auto_id, "srv-r5")
+    assert exec_price_id is not None
+
+    async def _read_flag(eid: str) -> bool:
+        async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT llm_model_system_only FROM automation_executions WHERE automation_execution_id = %s",
+                    (eid,),
+                )
+                row = await cur.fetchone()
+                assert row is not None
+                return bool(row["llm_model_system_only"])
+
+    for eid in (exec_claimed_id, exec_live_id, exec_direct_id, exec_price_id):
+        assert await _read_flag(eid) is True
+        fetched = await atm_mod._get_execution_by_id(eid)
+        assert fetched is not None and fetched["llm_model_system_only"] is True
+
+    # begin_execution_if_not_deleted returns llm_model_system_only=True from the execution row
+    started = await exec_db.begin_execution_if_not_deleted(exec_live_id, started_at=now)
+    assert started is not None and started["llm_model_system_only"] is True
+
+    # Edit automation config to clear llm_model_system_only (owner chooses custom model)
+    updated = await auto_db.update_automation(
+        due_auto_id,
+        user_id,
+        metadata={"dalton_managed": True},
+    )
+    assert updated is not None
+
+    # All previously created executions remain True (immutable!)
+    for eid in (exec_claimed_id, exec_live_id, exec_direct_id, exec_price_id):
+        assert await _read_flag(eid) is True
+        fetched = await atm_mod._get_execution_by_id(eid)
+        assert fetched is not None and fetched["llm_model_system_only"] is True
+
+    # New executions created AFTER the config edit pick up the new value (False)
+    exec_after_live_id, _ = await exec_db.create_execution_for_live_parent(
+        due_auto_id, user_id, now, "srv-r5"
+    )
+    exec_after_direct_id = await exec_db.create_execution(due_auto_id, now, "srv-r5")
+    assert await _read_flag(exec_after_live_id) is False
+    assert await _read_flag(exec_after_direct_id) is False
+
+
+async def test_concurrent_automation_config_edit_preserves_existing_execution_and_serializes_new_execution_claim(
+    patched_get_db_connection,
+    cleanup_tables,
+    test_db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5 real DB concurrency test:
+    While an automation config UPDATE holds FOR UPDATE on the automations row (clearing
+    llm_model_system_only), a concurrent create_execution_for_live_parent on another connection
+    blocks on PostgreSQL Lock until commit, then stamps the post-commit False value, while an
+    execution created before the edit keeps its frozen True value."""
+    monkeypatch.setattr("src.dalton.settings.is_coverage_units_enabled", lambda: False)
+    user_id = f"b1-exec-conc-{uuid.uuid4().hex[:10]}"
+    _c1_id, _c2_id, ws_id = await _setup_user_and_two_computers(user_id)
+
+    now = datetime.now(UTC)
+    auto = await auto_db.create_automation(
+        user_id=user_id,
+        name="conc-sys-only",
+        trigger_type="cron",
+        cron_expression="0 9 * * 1-5",
+        timezone="Asia/Shanghai",
+        instruction="Check AAPL.",
+        workspace_id=ws_id,
+        llm_model="claude-sonnet-4-6",
+        metadata={"dalton_managed": True, "llm_model_system_only": True},
+    )
+    auto_id = str(auto["automation_id"])
+
+    # Execution created before the concurrent edit is frozen at True
+    exec_before_id, _ = await exec_db.create_execution_for_live_parent(
+        auto_id, user_id, now, "srv-r5"
+    )
+
+    update_locked = asyncio.Event()
+    allow_update_commit = asyncio.Event()
+    holder_pid_box: list[int] = []
+
+    async def _reconcile_pause(locked_row: dict[str, Any], effective: dict[str, Any], locked_conn: Any) -> None:
+        assert locked_conn is not None
+        holder_pid_box.append(int(locked_conn.info.backend_pid))
+        update_locked.set()
+        await asyncio.wait_for(allow_update_commit.wait(), timeout=15.0)
+
+    async def _run_config_edit() -> Any:
+        with company_automations.automation_history_context(
+            actor_user_id=user_id,
+            locked_row_reconciler=_reconcile_pause,
+        ):
+            return await auto_db.update_automation(
+                auto_id,
+                user_id,
+                metadata={"dalton_managed": True},
+            )
+
+    edit_task = asyncio.create_task(_run_config_edit())
+    claim_task: asyncio.Task[Any] | None = None
+    try:
+        lock_waiter = asyncio.create_task(update_locked.wait())
+        done, pending_wait = await asyncio.wait(
+            {edit_task, lock_waiter},
+            timeout=5.0,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for p in pending_wait:
+            if p is lock_waiter:
+                p.cancel()
+        if edit_task in done:
+            exc = edit_task.exception()
+            if exc is not None:
+                raise AssertionError(f"edit_task failed before acquiring FOR UPDATE: {exc!r}") from exc
+            raise AssertionError(
+                f"edit_task finished without invoking locked_row_reconciler: {edit_task.result()!r}"
+            )
+        if lock_waiter not in done:
+            raise TimeoutError("Timed out waiting for update_automation to acquire FOR UPDATE")
+
+        # Launch concurrent execution creation while update_automation holds FOR UPDATE on automations
+        claim_task = asyncio.create_task(
+            exec_db.create_execution_for_live_parent(auto_id, user_id, now, "srv-r5")
+        )
+        await asyncio.sleep(0)
+
+        holder_pid = holder_pid_box[0]
+        waiter = await _wait_for_lock_waiter(
+            test_db_uri,
+            blocker_pid=holder_pid,
+            waiter_task=claim_task,
+            holder_task=edit_task,
+            timeout=5.0,
+        )
+        assert waiter["pid"] != holder_pid
+        assert holder_pid in waiter["blocking_pids"]
+        assert waiter["wait_event_type"] == "Lock"
+        assert not claim_task.done(), "create_execution_for_live_parent should wait behind automations FOR UPDATE"
+
+        allow_update_commit.set()
+        edited_row = await asyncio.wait_for(edit_task, timeout=5.0)
+        assert edited_row is not None
+        exec_after_id, _ = await asyncio.wait_for(claim_task, timeout=5.0)
+
+        async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT automation_execution_id::text AS eid, llm_model_system_only
+                    FROM automation_executions
+                    WHERE automation_execution_id IN (%s, %s)
+                    """,
+                    (exec_before_id, exec_after_id),
+                )
+                by_id = {r["eid"]: bool(r["llm_model_system_only"]) for r in (await cur.fetchall() or ())}
+        assert by_id[exec_before_id] is True
+        assert by_id[exec_after_id] is False
+    finally:
+        allow_update_commit.set()
+        for pending in (edit_task, claim_task):
+            if pending is not None and not pending.done():
+                pending.cancel()
+        await asyncio.gather(
+            *(t for t in (edit_task, claim_task) if t is not None),
+            return_exceptions=True,
+        )

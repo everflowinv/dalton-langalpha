@@ -739,8 +739,11 @@ async def update_thread_endpoint(
             updates["llm_model"] = request.llm_model
             prev_thread_meta = await get_thread_auth_meta(thread_id) or {}
             switched_from = prev_thread_meta.get("llm_model")
-            # DALTON-HOOK(cos-settings-tools): record owner model switch after a system-only run and compare (model, system_only) for handoff
+            # DALTON-HOOK(cos-settings-tools): resolve previous run's actual model and execution-level system-only flag for handoff
             try:
+                from src.dalton.services.automation_thread_model import (
+                    get_run_execution_system_only,
+                )
                 from src.server.database.runs import lifecycle as _runs_lifecycle
 
                 _latest_attempt = await _runs_lifecycle.get_latest_attempt(thread_id)
@@ -750,33 +753,20 @@ async def update_thread_endpoint(
                     and isinstance(_latest_attempt.get("metadata"), dict)
                     else {}
                 )
+                raw_latest_model = _latest_meta.get("llm_model")
+                if raw_latest_model:
+                    latest_run_model = str(raw_latest_model).strip() or None
                 _latest_run_id = (
-                    str(_latest_attempt["conversation_response_id"])
+                    str(_latest_attempt["conversation_response_id"]).strip()
                     if isinstance(_latest_attempt, dict)
                     and _latest_attempt.get("conversation_response_id")
                     else None
                 )
-                _prev_meta_dict = (
-                    prev_thread_meta.get("metadata")
-                    if isinstance(prev_thread_meta.get("metadata"), dict)
-                    else {}
-                )
-                _already_switched = bool(
-                    _latest_run_id
-                    and str(_prev_meta_dict.get("owner_model_switch_run_id") or "").strip()
-                    == _latest_run_id
-                )
-                raw_latest_model = _latest_meta.get("llm_model")
-                if raw_latest_model and not _already_switched:
-                    latest_run_model = str(raw_latest_model).strip() or None
-                if _latest_run_id and _latest_meta.get("llm_model_system_only"):
-                    prev_system_only = not _already_switched
-                    updates["metadata_merge"] = {
-                        "owner_model_switch_run_id": _latest_run_id
-                    }
+                if _latest_run_id:
+                    prev_system_only = await get_run_execution_system_only(_latest_run_id)
             except Exception:
                 logger.debug(
-                    "latest run read for system-only switch stamp failed on thread %s",
+                    "latest run read for handoff identity failed on thread %s",
                     thread_id,
                     exc_info=True,
                 )

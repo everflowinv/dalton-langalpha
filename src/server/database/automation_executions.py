@@ -238,6 +238,7 @@ def _execution_update(
         returning_columns=[
             "conversation_thread_id", "conversation_response_id",
             "scheduled_at", "wait_reason", "awaits_computer", "checked_computer_id",
+            "llm_model_system_only",  # DALTON-HOOK(cos-settings-tools)
         ],
         include_updated_at=False,  # no updated_at column on executions
     )
@@ -308,8 +309,9 @@ async def begin_execution_if_not_deleted(
                       AND a.automation_id = e.automation_id
                       AND a.deleted_at IS NULL
                     RETURNING e.conversation_thread_id, e.conversation_response_id,
-                              e.scheduled_at, e.wait_reason, e.awaits_computer, e.checked_computer_id
-                    """,
+                              e.scheduled_at, e.wait_reason, e.awaits_computer, e.checked_computer_id,
+                              e.llm_model_system_only
+                    """,  # DALTON-HOOK(cos-settings-tools)
                     (started_at, execution_id),
                 )
                 row = await cur.fetchone()
@@ -347,8 +349,9 @@ async def begin_execution_if_not_deleted(
                                   AND NOT ({managed_base_pred})
                                 RETURNING e.conversation_thread_id, e.conversation_response_id,
                                           e.scheduled_at, e.wait_reason, e.awaits_computer, e.checked_computer_id,
+                                          e.llm_model_system_only,
                                           NULL::text AS coverage_unit_id, NULL::timestamptz AS coverage_unit_version
-                                """,
+                                """,  # DALTON-HOOK(cos-settings-tools)
                                 (started_at, execution_id),
                             )
                             fast_row = await cur.fetchone()
@@ -530,19 +533,21 @@ async def begin_execution_if_not_deleted(
                                   AND NOT t.reject_handoff
                                 RETURNING e.conversation_thread_id, e.conversation_response_id,
                                           e.scheduled_at, e.wait_reason, e.awaits_computer, e.checked_computer_id,
+                                          e.llm_model_system_only,
                                           e.coverage_unit_id, e.coverage_unit_version
                             )
                             SELECT s.conversation_thread_id, s.conversation_response_id,
                                    s.scheduled_at, s.wait_reason, s.awaits_computer, s.checked_computer_id,
+                                   s.llm_model_system_only,
                                    s.coverage_unit_id, s.coverage_unit_version,
                                    FALSE AS ws_changed
                             FROM started s
                             UNION ALL
-                            SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                            SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL::boolean, NULL, NULL,
                                    TRUE AS ws_changed
                             FROM target t
                             WHERE t.ws_changed
-                            """,
+                            """,  # DALTON-HOOK(cos-settings-tools)
                             (probe_ws_id, execution_id, started_at, started_at),
                         )
                         row = await cur.fetchone()
@@ -1361,10 +1366,12 @@ async def get_running_executions_for_thread(thread_id: str) -> List[Dict[str, An
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             # DALTON-HOOK(automation-subscription-fallback): select delivery for execution fallback marker check
+            # DALTON-HOOK(cos-settings-tools): select execution-level llm_model_system_only for continuation turns
             await cur.execute("""
                 SELECT e.automation_execution_id, e.automation_id, e.status,
                        e.conversation_thread_id, e.conversation_response_id,
                        e.started_at, e.created_at, e.delivery,
+                       e.llm_model_system_only,
                        a.user_id, t.workspace_id
                 FROM automation_executions e
                 JOIN automations a ON a.automation_id = e.automation_id
@@ -1883,16 +1890,27 @@ async def create_execution_for_live_parent(
                                         ),
                                     )
                         # DALTON-HOOK(coverage-units): stamp actual write time so concurrent pause cutoffs never mis-skip live-parent inserts
+                        # DALTON-HOOK(cos-settings-tools): freeze automation's llm_model_system_only onto automation_executions in the same transaction
+                        exec_system_only = bool(
+                            (parent_row.get("metadata") or {}).get("llm_model_system_only")
+                        )
                         await cur.execute(
                             """
                             INSERT INTO automation_executions (
                                 automation_execution_id, automation_id,
                                 status, scheduled_at, server_id, created_at,
-                                heartbeat_at, checked_computer_id
+                                heartbeat_at, checked_computer_id, llm_model_system_only
                             )
-                            VALUES (%s, %s, 'pending', %s, %s, clock_timestamp(), NOW(), %s)
+                            VALUES (%s, %s, 'pending', %s, %s, clock_timestamp(), NOW(), %s, %s)
                             """,
-                            (execution_id, automation_id, scheduled_at, server_id, checked_computer_id),
+                            (
+                                execution_id,
+                                automation_id,
+                                scheduled_at,
+                                server_id,
+                                checked_computer_id,
+                                exec_system_only,
+                            ),
                         )
                         return execution_id, parent_row
             except _WorkspaceDriftRetry:
@@ -1971,14 +1989,18 @@ async def create_execution(
     checked to run it on, which every start of the firing reads off the row.
     """
     execution_id = str(uuid4())
+    # DALTON-HOOK(cos-settings-tools): freeze automation's llm_model_system_only onto automation_executions in the same transaction
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute("""
                 INSERT INTO automation_executions (
                     automation_execution_id, automation_id,
                     status, scheduled_at, server_id, created_at,
-                    heartbeat_at, checked_computer_id
+                    heartbeat_at, checked_computer_id, llm_model_system_only
                 )
-                VALUES (%s, %s, 'pending', %s, %s, NOW(), NOW(), %s)
-            """, (execution_id, automation_id, scheduled_at, server_id, checked_computer_id))
+                SELECT %s, a.automation_id, 'pending', %s, %s, NOW(), NOW(), %s,
+                       COALESCE((a.metadata->>'llm_model_system_only')::boolean, FALSE)
+                FROM automations a
+                WHERE a.automation_id = %s
+            """, (execution_id, scheduled_at, server_id, checked_computer_id, automation_id))
     return execution_id

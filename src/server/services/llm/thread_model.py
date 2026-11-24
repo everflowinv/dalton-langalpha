@@ -189,41 +189,38 @@ def extract_pending_model_handoff(row: Any) -> dict[str, Any] | None:
     return pending if isinstance(pending, dict) else None
 
 
-# DALTON-HOOK(cos-settings-tools): inspect latest attempt's system-only marker to distinguish same-name endpoint switches
-async def _read_latest_system_only_run(
+# DALTON-HOOK(cos-settings-tools): inspect latest attempt's actual model and execution-level system-only flag
+async def _read_latest_run_identity(
     thread_id: str,
-    meta: Mapping[str, Any] | None,
-) -> tuple[str | None, str | None, bool]:
-    """Return ``(latest_run_id, latest_model, prev_system_only_active)``."""
+) -> tuple[str | None, bool]:
+    """Return ``(latest_run_model, prev_system_only)`` from the thread's latest attempt and its execution row."""
     try:
+        from src.dalton.services.automation_thread_model import (
+            get_run_execution_system_only,
+        )
         from src.server.database.runs import lifecycle as _runs_lifecycle
 
         latest = await _runs_lifecycle.get_latest_attempt(thread_id)
     except Exception:
         logger.debug(
-            "latest run read for system-only switch check failed on thread %s",
+            "latest run read for model switch handoff check failed on thread %s",
             thread_id,
             exc_info=True,
         )
-        return None, None, False
+        return None, False
     if not isinstance(latest, Mapping):
-        return None, None, False
+        return None, False
     latest_meta = latest.get("metadata")
-    if not isinstance(latest_meta, Mapping) or not latest_meta.get("llm_model_system_only"):
-        return None, None, False
+    latest_model = (
+        str(latest_meta.get("llm_model") or "").strip() or None
+        if isinstance(latest_meta, Mapping)
+        else None
+    )
     latest_run_id = str(latest.get("conversation_response_id") or "").strip() or None
-    latest_model = str(latest_meta.get("llm_model") or "").strip() or None
-    thread_meta = (
-        meta.get("metadata")
-        if isinstance(meta, Mapping) and isinstance(meta.get("metadata"), Mapping)
-        else {}
+    prev_system_only = (
+        await get_run_execution_system_only(latest_run_id) if latest_run_id else False
     )
-    already_switched = bool(
-        latest_run_id
-        and str(thread_meta.get("owner_model_switch_run_id") or "").strip()
-        == latest_run_id
-    )
-    return latest_run_id, latest_model, (not already_switched)
+    return latest_model, prev_system_only
 
 
 @dataclass(frozen=True)
@@ -237,8 +234,6 @@ class ThreadModelSwitchPlan:
     model: str | None
     changed: bool
     pending_candidate_models: tuple[str, ...] = ()
-    # DALTON-HOOK(cos-settings-tools): latest system-only run id when switching off a system-only endpoint
-    system_only_run_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -296,12 +291,14 @@ async def prepare_thread_model_switch(
     switched_from = meta.get("llm_model") if meta is not None else None
     ws_id = str(meta["workspace_id"]) if meta and meta.get("workspace_id") else None
 
-    # DALTON-HOOK(cos-settings-tools): compare (model, system_only) as a pair so switching from a system-only model to an owner's same-named custom model still runs handoff
-    sys_run_id, sys_model, prev_system_only = await _read_latest_system_only_run(
-        thread_id, meta
-    )
+    # DALTON-HOOK(cos-settings-tools): compare (model, system_only) against the latest run's actual model and execution flag so switching from a system-only execution to a same-named custom model still runs handoff
+    latest_run_model, prev_system_only = await _read_latest_run_identity(thread_id)
 
-    if meta is not None and (switched_from, prev_system_only) == (model, False):
+    if (
+        meta is not None
+        and (switched_from, prev_system_only) == (model, False)
+        and (latest_run_model is None or latest_run_model == model)
+    ):
         return ThreadModelSwitchPlan(
             meta=meta,
             workspace_id=ws_id,
@@ -353,10 +350,12 @@ async def prepare_thread_model_switch(
     # with (the default may have changed mid-turn) before the current default.
     if existing_prev is not None:
         pending_prev = existing_prev
+    elif latest_run_model is not None:
+        pending_prev = latest_run_model
     elif switched_from is not None:
         pending_prev = switched_from
     else:
-        pending_prev = running_model or (sys_model if prev_system_only else None) or resolved_default
+        pending_prev = running_model or resolved_default
     # Every model that may have written the summary still owed a hand-off: an
     # earlier marker's candidates, this plan's source, and the model this turn was
     # built with (an automation override may have compacted with it). The hand-off
@@ -369,7 +368,8 @@ async def prepare_thread_model_switch(
         for key in ("previous_model", "alt_previous_model"):
             if existing_pending.get(key):
                 candidates.append(str(existing_pending[key]))
-    for m in (pending_prev, running_model, sys_model if prev_system_only else None):
+    # DALTON-HOOK(cos-settings-tools): order candidates oldest -> newest (latest_run_model before running_model, without trailing switched_from)
+    for m in (pending_prev, latest_run_model, running_model):
         if m:
             candidates.append(str(m))
     seen: set[str] = set()
@@ -385,7 +385,6 @@ async def prepare_thread_model_switch(
         pending_candidate_models=pending_candidates,
         model=model,
         changed=True,
-        system_only_run_id=sys_run_id,
     )
 
 
@@ -615,14 +614,10 @@ async def switch_thread_model(
             user_id=user_id,
             candidate_models=plan.pending_candidate_models,
         )
-        # DALTON-HOOK(cos-settings-tools): stamp owner_model_switch_run_id alongside pending handoff so post-handoff manual compaction uses the owner's selection
-        deferred_meta_merge: dict[str, Any] = {PENDING_MODEL_HANDOFF_KEY: marker}
-        if plan.system_only_run_id:
-            deferred_meta_merge["owner_model_switch_run_id"] = plan.system_only_run_id
         updated_thread = await threads_write.update_thread_fields(
             thread_id,
             llm_model=model,
-            metadata_merge=deferred_meta_merge,
+            metadata_merge={PENDING_MODEL_HANDOFF_KEY: marker},
         )
         if not updated_thread:
             raise HTTPException(
@@ -641,21 +636,9 @@ async def switch_thread_model(
             changed=True,
         )
 
-    # DALTON-HOOK(cos-settings-tools): stamp owner model switch after a system-only run so immediate manual compaction uses the owner's selection
-    switch_meta_merge: dict[str, Any] | None = (
-        {"owner_model_switch_run_id": plan.system_only_run_id}
-        if plan.system_only_run_id
-        else None
+    updated_thread = await threads_write.update_thread_fields(
+        thread_id, llm_model=model
     )
-
-    if switch_meta_merge is not None:
-        updated_thread = await threads_write.update_thread_fields(
-            thread_id, llm_model=model, metadata_merge=switch_meta_merge
-        )
-    else:
-        updated_thread = await threads_write.update_thread_fields(
-            thread_id, llm_model=model
-        )
     if not updated_thread:
         raise HTTPException(
             status_code=404, detail=f"Thread not found: {thread_id}"

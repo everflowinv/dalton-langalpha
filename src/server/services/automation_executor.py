@@ -140,6 +140,8 @@ class _Firing:
     # The computer a computer token's run now was checked to run on; its
     # turn's START refuses any other (``admission.refuse_moved_off``).
     checked_computer_id: Optional[str] = None
+    # DALTON-HOOK(cos-settings-tools): immutable execution-level system-catalog marker frozen at execution creation
+    llm_model_system_only: bool = False
     workspace_owner_id: Optional[str] = None
     route: Optional[TurnRoute] = None
     thread_id: Optional[str] = None
@@ -1053,10 +1055,8 @@ class AutomationExecutor:
             # DALTON-HOOK(automation-effort): stamp two-state reasoning_effort on first-turn run metadata
             # and forward automation reasoning_effort into ChatRequest (preserving prior first-turn effort on
             # restart redispatch and ignoring stale column values on built-in Antigravity models).
-            # DALTON-HOOK(cos-settings-tools): propagate llm_model_system_only into effort check, run_metadata, and ChatRequest
-            system_only = bool(
-                (automation.get("metadata") or {}).get("llm_model_system_only")
-            )
+            # DALTON-HOOK(cos-settings-tools): use immutable execution-level llm_model_system_only (frozen on automation_executions at creation)
+            system_only = bool(getattr(firing, "llm_model_system_only", False))
             effective_effort = await self._resolve_turn_reasoning_effort(
                 execution_id=execution_id,
                 thread_id=firing.thread_id,
@@ -1067,8 +1067,6 @@ class AutomationExecutor:
             )
             run_metadata["automation_reasoning_effort_configured"] = True
             run_metadata["automation_reasoning_effort"] = effective_effort
-            if system_only:
-                run_metadata["llm_model_system_only"] = True
             request = ChatRequest(
                 workspace_id=firing.workspace_id,
                 messages=[ChatMessage(role="user", content=instruction)],
@@ -1263,9 +1261,16 @@ class AutomationExecutor:
                 return
             handed_thread = started.get("conversation_thread_id")
             checked = started.get("checked_computer_id")
+            # DALTON-HOOK(cos-settings-tools): read immutable llm_model_system_only from the execution row
+            exec_system_only = (
+                bool(started["llm_model_system_only"])
+                if "llm_model_system_only" in started
+                else bool((automation.get("metadata") or {}).get("llm_model_system_only"))
+            )
             firing = _Firing(
                 automation=automation,
                 checked_computer_id=str(checked) if checked else None,
+                llm_model_system_only=exec_system_only,
                 late=await late_note(automation, started),
             )
         except BaseException:

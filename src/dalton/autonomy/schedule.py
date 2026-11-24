@@ -715,6 +715,8 @@ async def _read_workspace_computer_snapshot(
     from src.server.services.home_placement import home_turn_computer
     from src.server.utils.pg_sanitize import normalize_uuid
 
+    if conn is not None and not _conn_supports_sql_locks(conn):
+        return None, False
     try:
         if is_home:
             comp, _ = await home_turn_computer(task_owner, conn=conn)
