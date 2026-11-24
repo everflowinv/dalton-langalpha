@@ -22,9 +22,10 @@ BRIDGE=0; RECREATE=0; EXPECT=""; REUSE_BACKUP_MIN=""
 usage() {
   cat <<'EOF'
 Usage: deploy_main.sh [--bridge] [--recreate] [--expect-migration dNNN] [--reuse-backup-minutes N]
-  Fetches origin once after backend idle, pins TARGET=origin/dalton/main, and compares pre-deploy
-  DB revisions against TARGET's migration heads (dalton + upstream) to decide backup reuse and
-  auto-revert safety (unreadable DB revisions are treated as migrating).
+  Fetches origin once after backend idle, pins TARGET=origin/dalton/main, verifies HEAD is an
+  ancestor of TARGET, compares pre-deploy DB revisions against TARGET heads (dalton + upstream)
+  for backup reuse, against post-ff HEAD for migrating status, and against PRE_FF before
+  auto-revert (unreadable DB revisions are treated as migrating).
   --reuse-backup-minutes N  Reuse last ' ok ' dump <= N min old only when DB revisions match TARGET heads.
   --expect-migration dNNN   Verify post-deploy dalton migration starts with dNNN.
   --recreate                Recreate backend/crawler containers instead of docker restart.
@@ -70,14 +71,6 @@ parse_deploy_args() {
   done
 }
 
-_dalton_versions_dir() {
-  printf '%s/src/dalton/migrations/versions' "$REPO_ROOT"
-}
-
-_upstream_versions_dir() {
-  printf '%s/migrations/versions' "$REPO_ROOT"
-}
-
 _is_valid_dalton_rev() {
   [[ "${1:-}" =~ ^d[0-9]{3,}$ ]]
 }
@@ -86,17 +79,8 @@ _is_valid_upstream_rev() {
   [[ "${1:-}" =~ ^([0-9]{1,6}|[0-9a-fA-F]{8,40})$ ]]
 }
 
-_revision_file_exists() {
-  local rev="${1:-}" versions_dir="${2:-}" f
-  [ -n "$rev" ] && [ -d "$versions_dir" ] || return 1
-  for f in "${versions_dir}/${rev}.py" "${versions_dir}/${rev}_"*.py; do
-    [ -f "$f" ] && return 0
-  done
-  return 1
-}
-
 parse_strict_migration_version() {
-  local raw="${1-}" chain="${2:-}" versions_dir="${3:-}"
+  local raw="${1-}" chain="${2:-}"
   local candidate=""
   [ -n "$raw" ] || return 1
   # Strip at most one trailing newline from psql -Atc output; any remaining newline
@@ -120,12 +104,11 @@ parse_strict_migration_version() {
       return 1
       ;;
   esac
-  _revision_file_exists "$candidate" "$versions_dir" || return 1
   printf '%s' "$candidate"
 }
 
 _query_alembic_version_table() {
-  local table="$1" chain="$2" versions_dir="$3"
+  local table="$1" chain="$2"
   local raw="" psql_rc=0 rev="" attempt=0 max_attempts=3
   local retry_delay="${DALTON_ALEMBIC_QUERY_RETRY_DELAY_S:-1}"
   local query_timeout="${DALTON_ALEMBIC_QUERY_TIMEOUT_S:-10}"
@@ -149,16 +132,16 @@ _query_alembic_version_table() {
     fi
   done
   [ "$psql_rc" = "0" ] || return 1
-  rev=$(parse_strict_migration_version "$raw" "$chain" "$versions_dir") || return 1
+  rev=$(parse_strict_migration_version "$raw" "$chain") || return 1
   printf '%s' "$rev"
 }
 
 get_dalton_alembic_version() {
-  _query_alembic_version_table "alembic_version_dalton" "dalton" "$(_dalton_versions_dir)"
+  _query_alembic_version_table "alembic_version_dalton" "dalton"
 }
 
 get_upstream_alembic_version() {
-  _query_alembic_version_table "alembic_version" "upstream" "$(_upstream_versions_dir)"
+  _query_alembic_version_table "alembic_version" "upstream"
 }
 
 health() { curl -sf -m3 --noproxy '*' http://127.0.0.1:8000/health >/dev/null; }
@@ -676,17 +659,39 @@ _print_manual_revert_instructions() {
   echo "     launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.dalton.backend-watchdog.plist"
 }
 
+# Auto-revert is safe only when the deploy itself had no pending migrations (MIGRATING_DEPLOY=0)
+# AND the revert target PRE_FF's two migration heads both equal the pre-deploy DB revisions.
+_can_auto_revert_to_pre_ff() {
+  local pre_ff_heads="" pre_ff_dalton="" pre_ff_upstream=""
+  [ "$MIGRATING_DEPLOY" = "0" ] || return 1
+  [ -n "${PRE_FF:-}" ] || return 1
+  if [ -z "${PRE_FF_DALTON_REV:-}" ] || [ -z "${PRE_FF_UPSTREAM_REV:-}" ]; then
+    echo "WARN: auto-revert blocked: pre-deploy DB version unreadable (dalton=${PRE_FF_DALTON_REV:-未能读取}, upstream=${PRE_FF_UPSTREAM_REV:-未能读取})" >&2
+    return 1
+  fi
+  if ! pre_ff_heads=$(target_migration_heads "$PRE_FF"); then
+    echo "WARN: auto-revert blocked: failed to resolve migration heads for PRE_FF=${PRE_FF}" >&2
+    return 1
+  fi
+  IFS=' ' read -r pre_ff_dalton pre_ff_upstream <<<"$pre_ff_heads"
+  if [ "$PRE_FF_DALTON_REV" != "$pre_ff_dalton" ] || [ "$PRE_FF_UPSTREAM_REV" != "$pre_ff_upstream" ]; then
+    echo "WARN: auto-revert blocked: PRE_FF (${PRE_FF}) heads (${pre_ff_dalton}/${pre_ff_upstream}) differ from pre-deploy DB revisions (${PRE_FF_DALTON_REV}/${PRE_FF_UPSTREAM_REV})" >&2
+    return 1
+  fi
+  return 0
+}
+
 # Put code, web dependencies and the served bundle back together, so a failed step never leaves
 # a new frontend (or new code waiting for the next restart) in front of the running backend.
-# Because migration directories are bind-mounted into containers, any deploy with pending migrations
-# (DB revision differs from target head, or DB revision is unreadable -> MIGRATING_DEPLOY=1) aborts
-# automatic code reset and prints manual instructions.
+# Because migration directories are bind-mounted into containers, auto-revert runs only when
+# MIGRATING_DEPLOY=0 and PRE_FF's migration heads match the pre-deploy DB revisions; otherwise
+# it aborts automatic code reset and prints manual instructions.
 revert_deploy() {
   local need_post_health=0 build_out build_rc post_ok=1 cur_head
   local cur_dalton_rev="" cur_upstream_rev=""
   local -a failed_steps=()
 
-  if [ "$MIGRATING_DEPLOY" = "1" ]; then
+  if ! _can_auto_revert_to_pre_ff; then
     cur_head=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
     cur_dalton_rev=$(get_dalton_alembic_version || true)
     cur_upstream_rev=$(get_upstream_alembic_version || true)
@@ -816,10 +821,30 @@ recent_ok_backup() {
   printf '%s\n' "$line"
 }
 
+# Prefer repo .venv/bin/python; fall back to python3 on PATH when absent.
+# Require Python >= 3.9.
+_resolve_deploy_python() {
+  local py="" ver=""
+  if [ -x "${REPO_ROOT}/.venv/bin/python" ]; then
+    py="${REPO_ROOT}/.venv/bin/python"
+  elif command -v python3 >/dev/null 2>&1; then
+    py=$(command -v python3)
+  else
+    echo "ERROR: target_migration_heads: Python >= 3.9 not found (checked ${REPO_ROOT}/.venv/bin/python and python3 on PATH)" >&2
+    return 1
+  fi
+  if ! "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+    ver=$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "unknown")
+    echo "ERROR: target_migration_heads: Python >= 3.9 required, got ${py} (${ver})" >&2
+    return 1
+  fi
+  printf '%s' "$py"
+}
+
 # Print "<dalton_head> <upstream_head>" for git commit $1 by reading revision and down_revision
 # from git history via git ls-tree / git show (no container alembic, no working-tree ff required).
 # Fails if $1 is invalid, a chain has no migration files, a file is invalid/duplicated,
-# or either chain does not resolve to a single unique head.
+# any down_revision is missing from its chain, or either chain does not resolve to a single unique head.
 target_migration_heads() {
   local commit="${1:-}" py=""
   if [ -z "$commit" ]; then
@@ -830,18 +855,14 @@ target_migration_heads() {
     echo "ERROR: target_migration_heads: invalid git commit '${commit}'" >&2
     return 1
   fi
-  if command -v python3 >/dev/null 2>&1; then
-    py="python3"
-  elif [ -x "${REPO_ROOT}/.venv/bin/python" ]; then
-    py="${REPO_ROOT}/.venv/bin/python"
-  else
-    echo "ERROR: target_migration_heads: python3 not found" >&2
-    return 1
-  fi
+  py=$(_resolve_deploy_python) || return 1
   "$py" - "$commit" <<'PY'
 import ast
 import subprocess
 import sys
+
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 commit = sys.argv[1]
 chains = (
@@ -892,6 +913,8 @@ def _extract_rev_and_down(src: str, path: str):
             raise RuntimeError(f"empty down_revision in {path}")
         parents.append(down)
     elif isinstance(down, (tuple, list)):
+        if not down:
+            raise RuntimeError(f"empty down_revision in {path}")
         for item in down:
             if not isinstance(item, str) or not item:
                 raise RuntimeError(f"invalid down_revision entry in {path}: {down!r}")
@@ -907,6 +930,8 @@ def _chain_head(label: str, directory: str) -> str:
         ["git", "ls-tree", "-z", commit, f"{directory}/"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="surrogateescape",
         check=False,
     )
     if proc.returncode != 0:
@@ -929,14 +954,19 @@ def _chain_head(label: str, directory: str) -> str:
         raise RuntimeError(f"{label} chain ({directory}) in {commit} has no migration files")
 
     revs = {}
+    rev_downs = {}
     parents = set()
     for path in sorted(paths):
-        show = subprocess.run(
-            ["git", "show", f"{commit}:{path}"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            show = subprocess.run(
+                ["git", "show", f"{commit}:{path}"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+        except UnicodeDecodeError as exc:
+            raise RuntimeError(f"cannot decode {commit}:{path} as UTF-8: {exc}") from exc
         if show.returncode != 0:
             raise RuntimeError(f"git show failed for {commit}:{path}: {show.stderr.strip()}")
         rev, down_list = _extract_rev_and_down(show.stdout, path)
@@ -945,7 +975,18 @@ def _chain_head(label: str, directory: str) -> str:
                 f"duplicate revision {rev!r} in {label} chain ({revs[rev]} and {path})"
             )
         revs[rev] = path
+        rev_downs[rev] = down_list
         parents.update(down_list)
+
+    missing = sorted(parents - set(revs))
+    if missing:
+        details = ", ".join(
+            f"{m} (referenced by {', '.join(sorted(revs[r] for r, ds in rev_downs.items() if m in ds))})"
+            for m in missing
+        )
+        raise RuntimeError(
+            f"{label} chain ({directory}) in {commit} has missing down_revision(s): {details}"
+        )
 
     heads = sorted(set(revs) - parents)
     if len(heads) != 1:
@@ -1002,7 +1043,7 @@ compute_migrating_deploy() {
 }
 
 run_deploy_main() {
-  local LOG before after out build_rc cur reused TARGET target_heads
+  local LOG before after out build_rc cur reused TARGET target_heads post_ff_head
   parse_deploy_args "$@" || exit $?
   cd "$REPO_ROOT" || exit 1
   cleanup_old_container_logs
@@ -1016,6 +1057,10 @@ run_deploy_main() {
   git fetch -q origin || { echo "git fetch failed, abort"; exit 1; }
   TARGET=$(git rev-parse --verify origin/dalton/main 2>/dev/null) || { echo "cannot resolve origin/dalton/main, abort"; exit 1; }
   echo "deploy target: ${TARGET} ($(git log -1 --oneline "$TARGET" 2>/dev/null || printf '%s' "$TARGET"))"
+  if ! git merge-base --is-ancestor HEAD "$TARGET" 2>/dev/null; then
+    echo "ERROR: 生产检出上有不在 origin/dalton/main 里的提交，先处理再部署 (HEAD=$(git rev-parse --short=9 HEAD 2>/dev/null || echo unknown), TARGET=${TARGET})" >&2
+    exit 1
+  fi
   target_heads=$(target_migration_heads "$TARGET") || { echo "ERROR: failed to resolve unique migration heads for target ${TARGET}, abort" >&2; exit 1; }
   echo "target migration heads: ${target_heads}"
   LOG="${DALTON_PG_BACKUP_LOG:-$HOME/Library/Logs/dalton-pg-backup.log}"; before=$(tail -1 "$LOG" 2>/dev/null)
@@ -1035,13 +1080,25 @@ run_deploy_main() {
   # ff and frontend build only after the idle wait and backup, right before the restart, so the new
   # frontend never goes live against the old backend and running code is not swapped under a busy backend.
   PRE_FF=$(git rev-parse HEAD)
-  MIGRATING_DEPLOY=0
+  MIGRATING_DEPLOY=1
   BACKEND_TOUCHED=0
   CRAWLER_TOUCHED=0
   EDGE_TOUCHED=0
   BRIDGE_TOUCHED=0
   git merge -q --ff-only "$TARGET" || { echo "ff failed, abort"; exit 1; }
-  compute_migrating_deploy || { echo "ERROR: failed to determine migrating_deploy for HEAD, abort" >&2; exit 1; }
+  post_ff_head=$(git rev-parse HEAD 2>/dev/null || true)
+  if [ "$post_ff_head" != "$TARGET" ]; then
+    echo "ERROR: post-ff HEAD (${post_ff_head:-unknown}) does not match TARGET (${TARGET}): reverting" >&2
+    MIGRATING_DEPLOY=1
+    revert_deploy
+    exit 1
+  fi
+  if ! compute_migrating_deploy; then
+    echo "ERROR: failed to determine migrating_deploy for HEAD; treating as migrating deploy" >&2
+    MIGRATING_DEPLOY=1
+    revert_deploy
+    exit 1
+  fi
   echo "$(date '+%T') ff to $(git log --oneline -1) (migrating_deploy=${MIGRATING_DEPLOY})"
   RECREATE_EDGE=0
   if ! git diff --quiet "$PRE_FF" HEAD -- deploy/dalton/Caddyfile 2>/dev/null || edge_compose_changed; then

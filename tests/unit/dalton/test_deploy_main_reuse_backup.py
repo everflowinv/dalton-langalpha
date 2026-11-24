@@ -481,3 +481,351 @@ def test_run_deploy_main_aborts_before_deploy_when_target_has_multiple_heads(
     assert not launchctl_trace.exists()
     assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == v1
     assert os.path.exists(repo / "app.py")
+
+
+def test_run_deploy_main_rejects_local_ahead_or_diverged_checkout(tmp_path: Path) -> None:
+    # Case A: local checkout is ahead of origin/dalton/main with an unpushed migration commit
+    ctx_a = _setup_deploy_env(tmp_path / "ahead")
+    repo_a = Path(ctx_a["repo"])
+    launchctl_a = Path(ctx_a["launchctl_trace"])
+    (repo_a / "src/dalton/migrations/versions/d049_local.py").write_text(
+        "revision = 'd049'\ndown_revision = 'd040'\n"
+    )
+    subprocess.run(["git", "-C", str(repo_a), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo_a), "commit", "-q", "-m", "local ahead"], check=True)
+    local_ahead_sha = subprocess.check_output(["git", "-C", str(repo_a), "rev-parse", "HEAD"], text=True).strip()
+
+    res_a = _run_deploy(ctx_a, tmp_path / "ahead", args="--reuse-backup-minutes 60")
+    assert res_a.returncode != 0
+    assert "生产检出上有不在 origin/dalton/main 里的提交，先处理再部署" in res_a.stderr
+    assert not launchctl_a.exists()
+    assert subprocess.check_output(["git", "-C", str(repo_a), "rev-parse", "HEAD"], text=True).strip() == local_ahead_sha
+
+    # Case B: local checkout diverged from origin/dalton/main
+    ctx_b = _setup_deploy_env(tmp_path / "diverged")
+    seed_b = Path(ctx_b["seed"])
+    repo_b = Path(ctx_b["repo"])
+    launchctl_b = Path(ctx_b["launchctl_trace"])
+    (seed_b / "app.py").write_text("remote-v2\n")
+    subprocess.run(["git", "-C", str(seed_b), "commit", "-qam", "remote v2"], check=True)
+    subprocess.run(["git", "-C", str(seed_b), "push", "-q", "origin", "dalton/main"], check=True)
+    (repo_b / "local.txt").write_text("diverged\n")
+    subprocess.run(["git", "-C", str(repo_b), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(repo_b), "commit", "-q", "-m", "local diverged"], check=True)
+    local_div_sha = subprocess.check_output(["git", "-C", str(repo_b), "rev-parse", "HEAD"], text=True).strip()
+
+    res_b = _run_deploy(ctx_b, tmp_path / "diverged", args="--reuse-backup-minutes 60")
+    assert res_b.returncode != 0
+    assert "生产检出上有不在 origin/dalton/main 里的提交，先处理再部署" in res_b.stderr
+    assert not launchctl_b.exists()
+    assert subprocess.check_output(["git", "-C", str(repo_b), "rev-parse", "HEAD"], text=True).strip() == local_div_sha
+
+
+def test_run_deploy_main_post_ff_head_mismatch_enters_failure_handler(tmp_path: Path) -> None:
+    ctx = _setup_deploy_env(tmp_path)
+    seed = Path(ctx["seed"])
+    repo = Path(ctx["repo"])
+    v1 = str(ctx["v1"])
+    fake_bin = Path(ctx["fake_bin"])
+
+    (seed / "app.py").write_text("v2\n")
+    subprocess.run(["git", "-C", str(seed), "commit", "-qam", "v2"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "-q", "origin", "dalton/main"], check=True)
+
+    # Simulate git merge --ff-only exiting 0 without advancing HEAD to TARGET
+    real_git = subprocess.check_output(["which", "git"], text=True).strip()
+    (fake_bin / "git").write_text(
+        f"""#!/bin/bash
+if [ "${{1:-}}" = "merge" ]; then
+  exit 0
+fi
+exec "{real_git}" "$@"
+"""
+    )
+    (fake_bin / "git").chmod(0o755)
+
+    res = _run_deploy(ctx, tmp_path, args="--reuse-backup-minutes 60")
+    assert res.returncode != 0
+    assert "does not match TARGET" in res.stderr
+    assert "AUTO-REVERT ABORTED" in res.stdout
+    assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == v1
+
+
+def test_target_migration_heads_rejects_missing_down_revision_and_aborts_deploy(tmp_path: Path) -> None:
+    ctx = _setup_deploy_env(tmp_path)
+    seed = Path(ctx["seed"])
+    repo = Path(ctx["repo"])
+    v1 = str(ctx["v1"])
+    launchctl_trace = Path(ctx["launchctl_trace"])
+
+    # Case 1: linear chain with deleted parent revision d040 (d042 still references d040)
+    (seed / "src/dalton/migrations/versions/d042_orphan.py").write_text(
+        "revision = 'd042'\ndown_revision = 'd040'\n"
+    )
+    (seed / "src/dalton/migrations/versions/d040_base.py").unlink()
+    subprocess.run(["git", "-C", str(seed), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "missing linear parent"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "-q", "origin", "dalton/main"], check=True)
+    missing_linear_sha = subprocess.check_output(["git", "-C", str(seed), "rev-parse", "HEAD"], text=True).strip()
+
+    res_linear = _run(f'target_migration_heads "{missing_linear_sha}"', cwd=seed)
+    assert res_linear.returncode != 0
+    assert "missing down_revision" in res_linear.stderr
+    assert "d040" in res_linear.stderr
+
+    # Full deploy must abort before backup and before ff
+    res_deploy = _run_deploy(ctx, tmp_path, args="")
+    assert res_deploy.returncode != 0
+    assert "d040" in res_deploy.stderr
+    assert not launchctl_trace.exists()
+    assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == v1
+
+    # Case 2: merge migration with tuple down_revision where one item is missing
+    subprocess.run(["git", "-C", str(seed), "checkout", "-q", "-b", "missing-merge", v1], check=True)
+    (seed / "migrations/versions/147a_left.py").write_text(
+        "revision = '147a'\ndown_revision = '146'\n"
+    )
+    (seed / "migrations/versions/148_merge.py").write_text(
+        "revision = '148'\ndown_revision = ('147a', '147b_missing')\n"
+    )
+    subprocess.run(["git", "-C", str(seed), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "missing merge parent"], check=True)
+    missing_merge_sha = subprocess.check_output(["git", "-C", str(seed), "rev-parse", "HEAD"], text=True).strip()
+
+    res_merge = _run(f'target_migration_heads "{missing_merge_sha}"', cwd=seed)
+    assert res_merge.returncode != 0
+    assert "missing down_revision" in res_merge.stderr
+    assert "147b_missing" in res_merge.stderr
+
+
+def test_run_deploy_main_accepts_db_revision_from_target_not_present_in_pre_ff_tree(
+    tmp_path: Path,
+) -> None:
+    """DB is already upgraded to d047 (not in pre-ff working tree d040); real
+    _query_alembic_version_table accepts format-valid d047 and allows backup reuse.
+    """
+    ctx = _setup_deploy_env(tmp_path)
+    seed = Path(ctx["seed"])
+    repo = Path(ctx["repo"])
+    fake_bin = Path(ctx["fake_bin"])
+    launchctl_trace = Path(ctx["launchctl_trace"])
+
+    (seed / "src/dalton/migrations/versions/d047_pre_applied.py").write_text(
+        "revision = 'd047'\ndown_revision = 'd040'\n"
+    )
+    subprocess.run(["git", "-C", str(seed), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "v2 d047"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "-q", "origin", "dalton/main"], check=True)
+    v2 = subprocess.check_output(["git", "-C", str(seed), "rev-parse", "HEAD"], text=True).strip()
+
+    # Fake docker returns d047 and 146 through the real _query_alembic_version_table path
+    (fake_bin / "docker").write_text(
+        """#!/bin/bash
+case "$1" in
+  exec)
+    if echo "$*" | grep -q "alembic_version_dalton"; then
+      echo "d047"
+      exit 0
+    elif echo "$*" | grep -q "alembic_version"; then
+      echo "146"
+      exit 0
+    elif echo "$*" | grep -q "conversation_threads"; then
+      echo "0"
+      exit 0
+    fi
+    ;;
+esac
+exit 0
+"""
+    )
+    (fake_bin / "docker").chmod(0o755)
+
+    script = f"""
+set -uo pipefail
+DALTON_DEPLOY_LIB_ONLY=1
+source "{_DEPLOY_SCRIPT}"
+WAIT_IDLE_SCRIPT="{ctx['wait_idle']}"
+run_deploy_main --reuse-backup-minutes 60
+"""
+    res = subprocess.run(
+        ["bash", "-c", script],
+        env={
+            "PATH": f"{fake_bin}:/bin:/usr/bin",
+            "HOME": str(tmp_path),
+            "DALTON_REPO_ROOT": str(repo),
+            "DALTON_PG_BACKUP_LOG": str(ctx["backup_log"]),
+            "DALTON_ALEMBIC_QUERY_RETRY_DELAY_S": "0",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "pre-deploy migrations: dalton=d047, upstream=146" in res.stdout
+    assert "backup: reusing" in res.stdout
+    assert not launchctl_trace.exists()
+    assert "migrating_deploy=0" in res.stdout
+    assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == v2
+
+
+def test_run_deploy_main_post_ff_compute_migrating_failure_prints_manual_revert(
+    tmp_path: Path,
+) -> None:
+    ctx = _setup_deploy_env(tmp_path)
+    seed = Path(ctx["seed"])
+    repo = Path(ctx["repo"])
+
+    (seed / "app.py").write_text("v2\n")
+    subprocess.run(["git", "-C", str(seed), "commit", "-qam", "v2"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "-q", "origin", "dalton/main"], check=True)
+    v2 = subprocess.check_output(["git", "-C", str(seed), "rev-parse", "HEAD"], text=True).strip()
+
+    res = _run_deploy(
+        ctx,
+        tmp_path,
+        args="--reuse-backup-minutes 60",
+        extra_setup="compute_migrating_deploy() { return 1; }",
+    )
+    assert res.returncode != 0
+    assert "treating as migrating deploy" in res.stderr
+    assert "AUTO-REVERT ABORTED" in res.stdout
+    assert "git reset --keep" in res.stdout
+    # Must NOT auto-reset code after fast-forward when post-ff parsing fails
+    assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == v2
+
+
+def test_target_migration_heads_parses_chinese_migration_under_lc_all_c(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git = ["git", "-C", str(repo)]
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run([*git, "config", "user.email", "t@example.com"], check=True)
+    subprocess.run([*git, "config", "user.name", "Test"], check=True)
+    (repo / "src/dalton/migrations/versions").mkdir(parents=True)
+    (repo / "migrations/versions").mkdir(parents=True)
+    (repo / "src/dalton/migrations/versions/d030_channel_gateway.py").write_text(
+        '"""飞书网关配置迁移 — §1.2"""\n'
+        "# 包含中文注释和全角标点：生产环境必须用 UTF-8 解析\n"
+        "revision = 'd030'\n"
+        "down_revision = None\n",
+        encoding="utf-8",
+    )
+    (repo / "migrations/versions/146_zh.py").write_text(
+        '"""上游迁移中文说明 — 测试"""\n'
+        "revision = '146'\n"
+        "down_revision = None\n",
+        encoding="utf-8",
+    )
+    subprocess.run([*git, "add", "."], check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "zh migrations"], check=True)
+
+    script = f"""
+set -uo pipefail
+DALTON_DEPLOY_LIB_ONLY=1
+source "{_DEPLOY_SCRIPT}"
+target_migration_heads HEAD
+"""
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "LC_ALL": "C",
+        "LANG": "C",
+        "PYTHONCOERCECLOCALE": "0",
+    }
+    res = subprocess.run(
+        ["bash", "-c", script],
+        cwd=repo,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 0, res.stderr
+    assert res.stdout.strip() == "d030 146"
+
+
+def test_resolve_deploy_python_prefers_repo_venv_and_checks_min_version(tmp_path: Path) -> None:
+    real_python = str(_REPO_ROOT / ".venv/bin/python")
+    fake_repo = tmp_path / "repo"
+    fake_venv_bin = fake_repo / ".venv/bin"
+    fake_venv_bin.mkdir(parents=True)
+    venv_py = fake_venv_bin / "python"
+    venv_py.symlink_to(real_python)
+
+    bad_bin = tmp_path / "bad_bin"
+    bad_bin.mkdir()
+    (bad_bin / "python3").write_text("#!/bin/bash\nexit 99\n")
+    (bad_bin / "python3").chmod(0o755)
+
+    # 1. Prefers REPO_ROOT/.venv/bin/python even when PATH has a broken python3 first
+    res_venv = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'set -uo pipefail; DALTON_DEPLOY_LIB_ONLY=1; source "{_DEPLOY_SCRIPT}"; _resolve_deploy_python',
+        ],
+        env={
+            "PATH": f"{bad_bin}:/bin:/usr/bin",
+            "HOME": str(tmp_path),
+            "DALTON_REPO_ROOT": str(fake_repo),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_venv.returncode == 0, res_venv.stderr
+    assert res_venv.stdout.strip() == str(venv_py)
+
+    # 2. Falls back to python3 on PATH when .venv/bin/python does not exist
+    no_venv_repo = tmp_path / "no_venv_repo"
+    no_venv_repo.mkdir()
+    res_fallback = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'set -uo pipefail; DALTON_DEPLOY_LIB_ONLY=1; source "{_DEPLOY_SCRIPT}"; _resolve_deploy_python',
+        ],
+        env={
+            "PATH": "/bin:/usr/bin",
+            "HOME": str(tmp_path),
+            "DALTON_REPO_ROOT": str(no_venv_repo),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_fallback.returncode == 0, res_fallback.stderr
+    assert res_fallback.stdout.strip().endswith("/python3")
+
+    # 3. Rejects Python < 3.9
+    old_bin = tmp_path / "old_bin"
+    old_bin.mkdir()
+    (old_bin / "python3").write_text(
+        """#!/bin/bash
+if [[ "$*" == *"print("* ]]; then
+  echo "3.8"
+  exit 0
+fi
+exit 1
+"""
+    )
+    (old_bin / "python3").chmod(0o755)
+    res_old = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f'set -uo pipefail; DALTON_DEPLOY_LIB_ONLY=1; source "{_DEPLOY_SCRIPT}"; _resolve_deploy_python',
+        ],
+        env={
+            "PATH": f"{old_bin}:/bin:/usr/bin",
+            "HOME": str(tmp_path),
+            "DALTON_REPO_ROOT": str(no_venv_repo),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_old.returncode != 0
+    assert "Python >= 3.9 required" in res_old.stderr
+    assert "(3.8)" in res_old.stderr
+
