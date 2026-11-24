@@ -2267,6 +2267,12 @@ class TestBinaryCopySecretChecks:
             )
         assert sec_tools_mod._scan_copy_bytes_for_secrets("memo.doc", mention, {}) is None
 
+    def test_central_entry_running_past_the_directory_is_malformed(self) -> None:
+        good = bytearray(_make_ooxml_zip({"word/document.xml": "<w:document/>"}))
+        last = good.rfind(b"PK\x01\x02")
+        struct.pack_into("<H", good, last + 32, 12)  # comment length the directory lacks
+        assert sec_tools_mod._count_zip_central_entries(bytes(good), 2000) is None
+
     def test_zip64_ooxml_with_a_real_central_directory_is_counted_and_allowed(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

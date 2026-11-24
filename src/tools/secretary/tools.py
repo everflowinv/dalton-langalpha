@@ -1560,6 +1560,9 @@ def _count_zip_central_entries(buf: bytes, limit: int) -> int | None:
         count += 1
         if count > limit:
             return count
+    if pos != end:
+        # The last entry's name, extra or comment runs past the directory.
+        return None
     return count
 
 
