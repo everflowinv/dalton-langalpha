@@ -929,6 +929,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("channels_router.py", "internal_state_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_settings_put_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_deliveries_authorize_and_claim_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_deliveries_deferred_due_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_deliveries_preflight_send_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_deliveries_progress_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_inbound_progress_endpoint"): CapabilityId.CHANNEL_GATEWAY,

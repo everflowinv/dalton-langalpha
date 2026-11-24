@@ -1415,6 +1415,16 @@ class InMemoryChannelStore:
             return []
 
         if "FROM dalton_channel_thread_watches" in norm and "SELECT" in norm:
+            if "WHERE watch_active = TRUE AND weixin_account_id IS NOT NULL" in norm:
+                excluded = {str(x) for x in (params[0] or [])} if params else set()
+                matches = [
+                    {"?column?": 1}
+                    for r in self.thread_watches.values()
+                    if r.get("watch_active")
+                    and r.get("weixin_account_id") is not None
+                    and str(r.get("weixin_account_id")) not in excluded
+                ]
+                return matches[:1]
             if "WHERE thread_id = %s" in norm:
                 tid = str(params[0])
                 r = self.thread_watches.get(tid)
@@ -1697,12 +1707,18 @@ class InMemoryChannelStore:
             return []
 
         if "UPDATE dalton_channel_deliveries SET sent_chunks = %s" in norm:
-            schunks, tchunks, pmids, fstat, fresp, st, ecode, emsg, dkey = params
+            if len(params) == 10:
+                schunks, tchunks, pmids, fstat, dsegs, fresp, st, ecode, emsg, dkey = params
+            else:
+                schunks, tchunks, pmids, fstat, fresp, st, ecode, emsg, dkey = params
+                dsegs = None
             r = self.deliveries[str(dkey)]
             r["sent_chunks"] = int(schunks)
             r["total_chunks"] = int(tchunks)
             r["platform_message_ids"] = pmids.obj if hasattr(pmids, "obj") else pmids
             r["files_status"] = fstat.obj if hasattr(fstat, "obj") else fstat
+            if dsegs is not None:
+                r["delivered_segments"] = dsegs.obj if hasattr(dsegs, "obj") else dsegs
             r["first_response_json"] = (
                 fresp.obj if hasattr(fresp, "obj") else fresp
             )

@@ -28,8 +28,12 @@ def _make_fake_env(
     new_dalton_head: str = "d049",
     drain_counts: tuple[str, ...] = ("2", "0"),
     drain_exit_rc: int = 0,
+    drain_sleep_s: float = 0.0,
+    alembic_sleep_s: float = 0.0,
     up_rc: int = 0,
     health_rc: int = 0,
+    docker_tag_rc: int = 0,
+    running_services: str | None = None,
     crawler_image: str | None = None,
 ) -> tuple[Path, Path, Path, Path]:
     """Create work_dir, release_dir, fake_bin, and docker trace log."""
@@ -124,6 +128,9 @@ printf 'Backup directory : %s\\n' "$bdir"
     drain_file = tmp_path / "drain_counts"
     drain_file.write_text(drain_lines, encoding="utf-8")
 
+    eff_running = (
+        compose_services if running_services is None else running_services
+    )
     fake_docker = fake_bin / "docker"
     fake_docker.write_text(
         f"""#!/bin/bash
@@ -132,7 +139,7 @@ echo "docker $*" >> "{trace}"
 
 # Handle `docker tag ...`
 if [[ "${{1:-}}" == "tag" ]]; then
-  exit 0
+  exit {docker_tag_rc}
 fi
 
 # Find subcommand after `docker compose ...`
@@ -165,7 +172,7 @@ if [[ "${{1:-}}" == "compose" ]]; then
       exit {up_rc}
       ;;
     ps)
-      echo "edge"
+      printf '%b' '{eff_running.replace(chr(10), "\\n")}'
       exit 0
       ;;
     run)
@@ -180,6 +187,9 @@ if [[ "${{1:-}}" == "compose" ]]; then
     exec)
       joined="$*"
       if [[ "$joined" == *"pg_stat_activity"* ]]; then
+        if [[ "{drain_sleep_s}" != "0.0" && "{drain_sleep_s}" != "0" ]]; then
+          sleep {drain_sleep_s}
+        fi
         if [[ {drain_exit_rc} -ne 0 ]]; then
           exit {drain_exit_rc}
         fi
@@ -191,6 +201,9 @@ if [[ "${{1:-}}" == "compose" ]]; then
         exit 0
       fi
       if [[ "$joined" == *"alembic_version_dalton"* ]]; then
+        if [[ "{alembic_sleep_s}" != "0.0" && "{alembic_sleep_s}" != "0" ]]; then
+          sleep {alembic_sleep_s}
+        fi
         if [[ -f "{migrated_flag}" ]]; then
           echo "{post_da}"
         else
@@ -199,6 +212,9 @@ if [[ "${{1:-}}" == "compose" ]]; then
         exit 0
       fi
       if [[ "$joined" == *"alembic_version"* ]]; then
+        if [[ "{alembic_sleep_s}" != "0.0" && "{alembic_sleep_s}" != "0" ]]; then
+          sleep {alembic_sleep_s}
+        fi
         if [[ -f "{migrated_flag}" ]]; then
           echo "{post_up}"
         else
@@ -639,3 +655,172 @@ def test_standalone_upgrade_tar_fallback_without_rsync_purges_new_files_and_keep
     assert not (work_dir / "new_only_dir").exists()
     assert (work_dir / ".env").is_file()
     assert (work_dir / "deploy/standalone/certs/keep.pem").read_text(encoding="utf-8").strip() == "KEEP-CERT"
+
+
+def test_r9_restore_failure_propagates_and_does_not_mark_files_restored(
+    tmp_path: Path,
+) -> None:
+    """R9 Decision #7: A failing rsync/tag inside restore_pre_upgrade_files_and_images
+    must propagate out of `set +e`, leaving AUTO_FILES_RESTORED=0 and not claiming recovery."""
+    work_dir, release_dir, fake_bin, _trace = _make_fake_env(
+        tmp_path,
+        drain_counts=("3", "3"),
+        docker_tag_rc=1,
+    )
+    # Also test rsync failing before docker tag
+    fake_rsync = fake_bin / "rsync"
+    fake_rsync.write_text("#!/bin/bash\nexit 23\n", encoding="utf-8")
+    fake_rsync.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "DALTON_MIGRATE_DRAIN_TIMEOUT_S": "1",
+        "DALTON_RECOVERY_HEALTH_RETRIES": "1",
+        "DALTON_RECOVERY_HEALTH_SLEEP_S": "0",
+    }
+    res = subprocess.run(
+        [
+            "bash",
+            str(_UPGRADE_SCRIPT),
+            "--work-dir",
+            str(work_dir),
+            "--release-dir",
+            str(release_dir),
+            "--skip-build",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 1
+    assert "Failed to restore pre-upgrade files or image tags" in res.stderr
+    assert "ALREADY restored the pre-upgrade release files" not in res.stderr
+
+
+def test_r9_recovery_health_check_catches_dead_crawler_or_gateway(
+    tmp_path: Path,
+) -> None:
+    """R9 Decision #7: Recovery health check verifies backend /health AND that crawler +
+    configured channel-gateway are actually running."""
+    work_dir, release_dir, fake_bin, _trace = _make_fake_env(
+        tmp_path,
+        compose_services="postgres\nredis\nbackend\ncrawler\nedge\nchannel-gateway\n",
+        running_services="postgres\nredis\nbackend\nedge\n",  # crawler & channel-gateway exited!
+        migrate_rc=1,
+        pre_up="148",
+        post_up="148",
+        pre_da="d046",
+        post_da="d046",
+        health_rc=0,
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "DALTON_MIGRATE_DRAIN_TIMEOUT_S": "2",
+        "DALTON_RECOVERY_HEALTH_RETRIES": "2",
+        "DALTON_RECOVERY_HEALTH_SLEEP_S": "0",
+    }
+    res = subprocess.run(
+        [
+            "bash",
+            str(_UPGRADE_SCRIPT),
+            "--work-dir",
+            str(work_dir),
+            "--release-dir",
+            str(release_dir),
+            "--skip-build",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res.returncode == 1
+    assert "did not pass health check" in res.stderr
+    assert "crawler" in res.stderr
+    assert "channel-gateway" in res.stderr
+    assert "Restored previous services" in res.stderr
+
+
+def test_r9_drain_wall_clock_budget_and_alembic_query_timeout(
+    tmp_path: Path,
+) -> None:
+    """R9 Decision #7: Connection drain enforces wall-clock total budget and Alembic version
+    queries enforce per-query timeout."""
+    import time
+
+    work_dir, release_dir, fake_bin, _trace = _make_fake_env(
+        tmp_path,
+        drain_counts=("5", "5", "5", "5", "5"),
+        drain_sleep_s=1.0,
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "DALTON_MIGRATE_DRAIN_TIMEOUT_S": "2",
+        "DALTON_MIGRATE_DRAIN_EXEC_TIMEOUT_S": "10",
+        "DALTON_RECOVERY_HEALTH_RETRIES": "1",
+        "DALTON_RECOVERY_HEALTH_SLEEP_S": "0",
+    }
+    t0 = time.monotonic()
+    res = subprocess.run(
+        [
+            "bash",
+            str(_UPGRADE_SCRIPT),
+            "--work-dir",
+            str(work_dir),
+            "--release-dir",
+            str(release_dir),
+            "--skip-build",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    elapsed = time.monotonic() - t0
+    assert res.returncode == 1
+    assert "Could not confirm database connections drained to 0" in res.stderr
+    # Must stop within wall-clock budget (~2s + recovery overhead), nowhere near 5*10s
+    assert elapsed < 8.0, f"Drain loop exceeded wall-clock budget: {elapsed:.2f}s"
+
+    # Also verify read_alembic_versions times out cleanly when psql hangs
+    t2_dir = tmp_path / "t2"
+    t2_dir.mkdir()
+    work_dir2, release_dir2, fake_bin2, _trace2 = _make_fake_env(
+        t2_dir,
+        drain_counts=("0",),
+        alembic_sleep_s=5.0,
+        migrate_rc=1,
+    )
+    env2 = {
+        **os.environ,
+        "PATH": f"{fake_bin2}:{os.environ['PATH']}",
+        "DALTON_MIGRATE_DRAIN_TIMEOUT_S": "2",
+        "DALTON_ALEMBIC_QUERY_TIMEOUT_S": "1",
+        "DALTON_RECOVERY_HEALTH_RETRIES": "1",
+        "DALTON_RECOVERY_HEALTH_SLEEP_S": "0",
+    }
+    t1 = time.monotonic()
+    res2 = subprocess.run(
+        [
+            "bash",
+            str(_UPGRADE_SCRIPT),
+            "--work-dir",
+            str(work_dir2),
+            "--release-dir",
+            str(release_dir2),
+            "--skip-build",
+        ],
+        env=env2,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    elapsed2 = time.monotonic() - t1
+    assert res2.returncode == 1
+    assert "Could not read Alembic schema versions" in res2.stderr
+    assert elapsed2 < 8.0, f"Alembic version query hung past timeout: {elapsed2:.2f}s"
+

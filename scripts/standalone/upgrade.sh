@@ -770,37 +770,30 @@ else
   info "Skipping image build (--skip-build)."
 fi
 
-read_alembic_versions() {
-  local up da
-  if ! up="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT version_num FROM alembic_version ORDER BY version_num;" 2>/dev/null)"; then
-    return 1
-  fi
-  if ! da="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT version_num FROM alembic_version_dalton ORDER BY version_num;" 2>/dev/null)"; then
-    return 1
-  fi
-  up="$(printf '%s' "$up" | tr -d '[:space:]')"
-  da="$(printf '%s' "$da" | tr -d '[:space:]')"
-  if [[ -z "$up" || -z "$da" ]]; then
-    return 1
-  fi
-  printf '%s\t%s\n' "$up" "$da"
-}
-
 run_with_timeout() {
   local secs="$1"
   shift
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$@"
+    timeout -k 2 "$secs" "$@"
   else
     python3 - "$secs" "$@" <<'PY'
-import subprocess, sys
+import os, signal, subprocess, sys
 
 secs = float(sys.argv[1])
 cmd = sys.argv[2:]
+proc = subprocess.Popen(cmd, start_new_session=True)
 try:
-    rc = subprocess.run(cmd, timeout=secs).returncode
+    rc = proc.wait(timeout=secs)
     sys.exit(rc)
 except subprocess.TimeoutExpired:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
     sys.exit(124)
 PY
   fi
@@ -810,6 +803,26 @@ compose_cmd_timeout() {
   local secs="$1"
   shift
   run_with_timeout "$secs" env "${ENV_UNSET_ARGS[@]}" docker compose -p "$PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" --project-directory "$WORK_DIR" "$@"
+}
+
+read_alembic_versions() {
+  local q_timeout="${DALTON_ALEMBIC_QUERY_TIMEOUT_S:-10}"
+  if [[ ! "$q_timeout" =~ ^[0-9]+$ || "$q_timeout" -lt 1 ]]; then
+    q_timeout=10
+  fi
+  local up da
+  if ! up="$(compose_cmd_timeout "$q_timeout" exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT version_num FROM alembic_version ORDER BY version_num;" 2>/dev/null)"; then
+    return 1
+  fi
+  if ! da="$(compose_cmd_timeout "$q_timeout" exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT version_num FROM alembic_version_dalton ORDER BY version_num;" 2>/dev/null)"; then
+    return 1
+  fi
+  up="$(printf '%s' "$up" | tr -d '[:space:]')"
+  da="$(printf '%s' "$da" | tr -d '[:space:]')"
+  if [[ -z "$up" || -z "$da" ]]; then
+    return 1
+  fi
+  printf '%s\t%s\n' "$up" "$da"
 }
 
 resolve_alembic_head() {
@@ -865,6 +878,7 @@ PY
 }
 
 restore_pre_upgrade_files_and_images() {
+  # Explicit per-step exit checks so failures propagate even when invoked under `set +e`.
   if [[ "$FILES_REPLACED" -eq 1 && "$SNAPSHOT_CREATED" -eq 1 && -d "$SNAPSHOT_DIR" ]]; then
     if command -v rsync >/dev/null 2>&1; then
       rsync -aI --delete \
@@ -876,15 +890,15 @@ restore_pre_upgrade_files_and_images() {
         --exclude=/.git \
         --exclude=/deploy/standalone/certs \
         --exclude=/deploy/standalone/extra \
-        "${SNAPSHOT_DIR}/" "${WORK_DIR}/"
+        "${SNAPSHOT_DIR}/" "${WORK_DIR}/" || return 1
     else
       # Clean replacement without rsync: extract snapshot into a fresh temp stage,
       # remove non-preserved files from WORK_DIR (purging any newly added files from
       # the failed release), then move the clean snapshot tree into WORK_DIR.
       local restore_stage
-      restore_stage="$(mktemp -d)"
+      restore_stage="$(mktemp -d)" || return 1
       (
-        cd "$SNAPSHOT_DIR"
+        cd "$SNAPSHOT_DIR" || exit 1
         tar -cf - \
           --exclude='./.env' \
           --exclude='.env' \
@@ -904,6 +918,11 @@ restore_pre_upgrade_files_and_images() {
           --exclude='deploy/standalone/extra' \
           .
       ) | tar -xf - -C "$restore_stage"
+      local tar_pipe=("${PIPESTATUS[@]}")
+      if [[ "${tar_pipe[0]:-1}" -ne 0 || "${tar_pipe[1]:-1}" -ne 0 ]]; then
+        rm -rf "$restore_stage"
+        return 1
+      fi
       python3 - "$WORK_DIR" "$restore_stage" <<'PY'
 import os, shutil, sys
 
@@ -956,18 +975,23 @@ def _merge_stage(src_dir: str, dst_dir: str) -> None:
 _purge_non_preserved(work_dir)
 _merge_stage(stage_dir, work_dir)
 PY
+      local py_rc=$?
       rm -rf "$restore_stage"
+      if [[ "$py_rc" -ne 0 ]]; then
+        return 1
+      fi
     fi
   fi
   if [[ -n "$PRE_BACKEND_TAG" ]]; then
-    docker tag "$PRE_BACKEND_TAG" "$BACKEND_IMAGE"
+    docker tag "$PRE_BACKEND_TAG" "$BACKEND_IMAGE" || return 1
   fi
   if [[ -n "$PRE_EDGE_TAG" ]]; then
-    docker tag "$PRE_EDGE_TAG" "$EDGE_IMAGE"
+    docker tag "$PRE_EDGE_TAG" "$EDGE_IMAGE" || return 1
   fi
   if [[ -n "$PRE_CRAWLER_TAG" ]]; then
-    docker tag "$PRE_CRAWLER_TAG" "$CRAWLER_IMAGE"
+    docker tag "$PRE_CRAWLER_TAG" "$CRAWLER_IMAGE" || return 1
   fi
+  return 0
 }
 
 recover_previous_services_after_abort() {
@@ -1002,19 +1026,33 @@ recover_previous_services_after_abort() {
     health_sleep=2
   fi
   AUTO_HEALTH_OK=0
-  info "Verifying restored previous backend passes /health (up to ${health_retries} attempts)..."
+  local missing_svcs=""
+  info "Verifying restored previous services (${STOPPED_SERVICES[*]}) are running and backend passes /health (up to ${health_retries} attempts)..."
   for _ in $(seq 1 "$health_retries"); do
+    local backend_ok=0
     if compose_cmd_timeout 10 exec -T backend curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; then
+      backend_ok=1
+    fi
+    local running_svcs=""
+    running_svcs="$(compose_cmd_timeout 10 ps --status running --services 2>/dev/null || true)"
+    missing_svcs=""
+    local svc
+    for svc in "${STOPPED_SERVICES[@]}"; do
+      if ! grep -qx "$svc" <<<"$running_svcs"; then
+        missing_svcs="${missing_svcs:+${missing_svcs} }${svc}"
+      fi
+    done
+    if [[ "$backend_ok" -eq 1 && -z "$missing_svcs" ]]; then
       AUTO_HEALTH_OK=1
       break
     fi
     sleep "$health_sleep"
   done
   if [[ "$AUTO_HEALTH_OK" -eq 1 ]]; then
-    ok "Restored previous services are healthy."
+    ok "Restored previous services (${STOPPED_SERVICES[*]}) are healthy."
     return 0
   fi
-  err "Restored previous backend did not pass /health after ${health_retries} attempts."
+  err "Restored previous services did not pass health check after ${health_retries} attempts (unhealthy/not running: ${missing_svcs:-backend /health})."
   return 1
 }
 
@@ -1043,17 +1081,32 @@ MIGRATE_DRAIN_EXEC_TIMEOUT_S="${DALTON_MIGRATE_DRAIN_EXEC_TIMEOUT_S:-10}"
 if [[ ! "$MIGRATE_DRAIN_EXEC_TIMEOUT_S" =~ ^[0-9]+$ || "$MIGRATE_DRAIN_EXEC_TIMEOUT_S" -lt 1 ]]; then
   MIGRATE_DRAIN_EXEC_TIMEOUT_S=10
 fi
-info "Waiting up to ${MIGRATE_DRAIN_TIMEOUT_S}s for database connections to drain (per-query timeout ${MIGRATE_DRAIN_EXEC_TIMEOUT_S}s)..."
+info "Waiting up to ${MIGRATE_DRAIN_TIMEOUT_S}s (wall-clock total) for database connections to drain (per-query cap ${MIGRATE_DRAIN_EXEC_TIMEOUT_S}s)..."
 db_drained=0
 active_conns=""
-for _ in $(seq 1 "$MIGRATE_DRAIN_TIMEOUT_S"); do
-  active_conns="$(compose_cmd_timeout "$MIGRATE_DRAIN_EXEC_TIMEOUT_S" exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state IS NOT NULL;" 2>/dev/null | tr -d '[:space:]' || true)"
+drain_start_ts="$(date +%s)"
+drain_deadline=$((drain_start_ts + MIGRATE_DRAIN_TIMEOUT_S))
+while true; do
+  now_ts="$(date +%s)"
+  remaining=$((drain_deadline - now_ts))
+  if [[ "$remaining" -le 0 ]]; then
+    break
+  fi
+  q_timeout="$MIGRATE_DRAIN_EXEC_TIMEOUT_S"
+  if [[ "$remaining" -lt "$q_timeout" ]]; then
+    q_timeout="$remaining"
+  fi
+  active_conns="$(compose_cmd_timeout "$q_timeout" exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state IS NOT NULL;" 2>/dev/null | tr -d '[:space:]' || true)"
   if [[ "$active_conns" == "0" ]]; then
     db_drained=1
     break
   fi
   if [[ ! "$active_conns" =~ ^[0-9]+$ ]]; then
     # The count could not be read as a non-negative integer; stop waiting immediately.
+    break
+  fi
+  now_ts="$(date +%s)"
+  if [[ "$now_ts" -ge "$drain_deadline" ]]; then
     break
   fi
   sleep 1

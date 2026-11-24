@@ -4475,6 +4475,7 @@ async def get_weixin_collect_buffer_status(
                 "item_count": int(buf.get("item_count") or 0),
                 "expires_at": _iso(buf.get("expires_at")),
                 "max_expires_at": _iso(buf.get("max_expires_at")),
+                "upload_status": item_upload_status,
                 "item_upload_status": item_upload_status,
             }
 
@@ -4522,7 +4523,7 @@ async def register_collect_item_attachments(
                 # Verify item belongs to THIS buffer before touching any inbound event
                 await cur.execute(
                     """
-                    SELECT message_id
+                    SELECT message_id, upload_status
                     FROM dalton_channel_weixin_collect_items
                     WHERE buffer_id = %s::uuid AND message_id = %s
                     FOR UPDATE
@@ -4532,6 +4533,7 @@ async def register_collect_item_attachments(
                 item_exists = await cur.fetchone()
                 if item_exists is None:
                     raise HTTPException(status_code=404, detail="Collect item not found")
+                cur_item_upload_status = str(item_exists.get("upload_status") or "")
 
                 if buf_status in ("cancelled", "expired"):
                     # Codex ④ + R2 #3e: reject with "已取消" and retire ONLY the inbound row
@@ -4573,6 +4575,48 @@ async def register_collect_item_attachments(
                         "collect_buffer_status": buf_status,
                         "code": "collect_buffer_cancelled",
                         "message": "收集窗口已取消",
+                    }
+
+                # R9 (Decision #9): Reject late attachment registration once the buffer is 'done'
+                # (synthetic inbound already generated) or 'flushing' with an already-settled item,
+                # without mutating collect_items.
+                if buf_status == "done" or (
+                    buf_status == "flushing"
+                    and cur_item_upload_status != "pending_upload"
+                ):
+                    if buf_aid is not None:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_inbound_events
+                            SET encrypted_weixin_media_meta = NULL,
+                                updated_at = NOW()
+                            WHERE platform = 'weixin'
+                              AND message_id = %s
+                              AND collect_buffer_id = %s::uuid
+                              AND weixin_account_id = %s::uuid
+                              AND encrypted_weixin_media_meta IS NOT NULL
+                            """,
+                            (cleaned_mid, norm_bid, buf_aid),
+                        )
+                    else:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_inbound_events
+                            SET encrypted_weixin_media_meta = NULL,
+                                updated_at = NOW()
+                            WHERE platform = 'weixin'
+                              AND message_id = %s
+                              AND collect_buffer_id = %s::uuid
+                              AND encrypted_weixin_media_meta IS NOT NULL
+                            """,
+                            (cleaned_mid, norm_bid),
+                        )
+                    return {
+                        "ok": True,
+                        "upload_status": "too_late",
+                        "collect_buffer_status": buf_status,
+                        "code": "collect_buffer_too_late",
+                        "message": "收集窗口已结束，附件补登已过时",
                     }
 
                 new_upload_status = "failed" if upload_failed else "ready"
@@ -4994,6 +5038,15 @@ def _serialize_synthetic_collect_inbound(row: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+class _WeixinAccessDeniedRollback(Exception):
+    """Internal control-flow rollback when admin pause/config change wins before commit."""
+
+    def __init__(self, deny_reason: str, account: dict[str, Any] | None = None) -> None:
+        super().__init__(deny_reason)
+        self.deny_reason = deny_reason
+        self.account = account
+
+
 async def verify_pending_weixin_account_first_message(
     *,
     account_id: str,
@@ -5205,17 +5258,37 @@ async def verify_pending_weixin_account_first_message(
                                 "one_time_reply_issued": one_time_reply is not None,
                             },
                         )
-                        await ensure_and_lock_weixin_config_in_tx(cur, for_update=True)
+                        cfg_c_locked = await ensure_and_lock_weixin_config_in_tx(
+                            cur, for_update=True
+                        )
+                        c_ok_locked, c_deny_locked = evaluate_weixin_member_access(
+                            user_tier,
+                            channel_enabled=bool(cfg_c_locked["enabled"]),
+                            db_allow_external=cfg_c_locked.get("allow_external"),
+                        )
+                        if not c_ok_locked:
+                            raise _WeixinAccessDeniedRollback(
+                                c_deny_locked or "weixin_channel_disabled", acc
+                            )
+                        default_ext_c = bool(get_dalton_config().weixin.allow_external)
                         await cur.execute(
                             """
                             UPDATE dalton_channel_weixin_config
                             SET accounts_revision = accounts_revision + 1,
                                 updated_at = NOW()
                             WHERE singleton_id = 1
+                              AND enabled = TRUE
+                              AND (%s::text <> 'external' OR COALESCE(allow_external, %s::boolean) = TRUE)
                             RETURNING accounts_revision
-                            """
+                            """,
+                            (str(user_tier), default_ext_c),
                         )
-                        new_rev = int((await cur.fetchone())["accounts_revision"])
+                        rev_c_row = await cur.fetchone()
+                        if rev_c_row is None:
+                            raise _WeixinAccessDeniedRollback(
+                                "weixin_channel_disabled", acc
+                            )
+                        new_rev = int(rev_c_row["accounts_revision"])
                         return {
                             "outcome": "conflict_unbound",
                             "accounts_revision": new_rev,
@@ -5290,17 +5363,37 @@ async def verify_pending_weixin_account_first_message(
                             (cleaned_puid, norm_aid),
                         )
 
-                    await ensure_and_lock_weixin_config_in_tx(cur, for_update=True)
+                    cfg_v_locked = await ensure_and_lock_weixin_config_in_tx(
+                        cur, for_update=True
+                    )
+                    v_ok_locked, v_deny_locked = evaluate_weixin_member_access(
+                        user_tier,
+                        channel_enabled=bool(cfg_v_locked["enabled"]),
+                        db_allow_external=cfg_v_locked.get("allow_external"),
+                    )
+                    if not v_ok_locked:
+                        raise _WeixinAccessDeniedRollback(
+                            v_deny_locked or "weixin_channel_disabled", acc
+                        )
+                    default_ext_v = bool(get_dalton_config().weixin.allow_external)
                     await cur.execute(
                         """
                         UPDATE dalton_channel_weixin_config
                         SET accounts_revision = accounts_revision + 1,
                             updated_at = NOW()
                         WHERE singleton_id = 1
+                          AND enabled = TRUE
+                          AND (%s::text <> 'external' OR COALESCE(allow_external, %s::boolean) = TRUE)
                         RETURNING accounts_revision
-                        """
+                        """,
+                        (str(user_tier), default_ext_v),
                     )
-                    new_rev = int((await cur.fetchone())["accounts_revision"])
+                    rev_v_row = await cur.fetchone()
+                    if rev_v_row is None:
+                        raise _WeixinAccessDeniedRollback(
+                            "weixin_channel_disabled", acc
+                        )
+                    new_rev = int(rev_v_row["accounts_revision"])
                     return {
                         "outcome": "verified",
                         "switched": switched,
@@ -5308,9 +5401,16 @@ async def verify_pending_weixin_account_first_message(
                         "account": updated_acc,
                     }
 
-    return await _run_tx_with_retry(
-        "verify_pending_weixin_account_first_message", conn, _attempt
-    )
+    try:
+        return await _run_tx_with_retry(
+            "verify_pending_weixin_account_first_message", conn, _attempt
+        )
+    except _WeixinAccessDeniedRollback as exc:
+        return {
+            "outcome": "denied",
+            "deny_reason": exc.deny_reason,
+            "account": exc.account,
+        }
 
 
 async def append_weixin_collect_item_in_tx(
@@ -5453,44 +5553,58 @@ async def append_weixin_collect_item_in_tx(
             (len(clean_text), expected_att_count, new_exp, db_now, bid),
         )
 
-    inbound_status = "pending" if expected_att_count > 0 else "completed"
-    if expected_att_count > 0:
-        import json as _json
+        # R9 (Decision #11): Only write inbound status & encrypted_weixin_media_meta on
+        # first insertion; duplicate (buffer_id, message_id) replays never overwrite stored media meta.
+        inbound_status = "pending" if expected_att_count > 0 else "completed"
+        if expected_att_count > 0:
+            import json as _json
 
-        enc_key = get_encryption_key()
-        await cur.execute(
-            """
-            UPDATE dalton_channel_inbound_events
-            SET collect_buffer_id = %s::uuid,
-                workspace_id = %s::uuid,
-                status = %s,
-                fallback_pending = FALSE,
-                encrypted_weixin_media_meta = pgp_sym_encrypt(%s, %s),
-                updated_at = NOW()
-            WHERE platform = 'weixin' AND message_id = %s
-            """,
-            (
-                bid,
-                ws_id,
-                inbound_status,
-                _json.dumps(media_list, ensure_ascii=False),
-                enc_key,
-                message_id,
-            ),
-        )
+            enc_key = get_encryption_key()
+            await cur.execute(
+                """
+                UPDATE dalton_channel_inbound_events
+                SET collect_buffer_id = %s::uuid,
+                    workspace_id = %s::uuid,
+                    status = %s,
+                    fallback_pending = FALSE,
+                    encrypted_weixin_media_meta = pgp_sym_encrypt(%s, %s),
+                    updated_at = NOW()
+                WHERE platform = 'weixin' AND message_id = %s
+                """,
+                (
+                    bid,
+                    ws_id,
+                    inbound_status,
+                    _json.dumps(media_list, ensure_ascii=False),
+                    enc_key,
+                    message_id,
+                ),
+            )
+        else:
+            await cur.execute(
+                """
+                UPDATE dalton_channel_inbound_events
+                SET collect_buffer_id = %s::uuid,
+                    workspace_id = %s::uuid,
+                    status = %s,
+                    fallback_pending = FALSE,
+                    updated_at = NOW()
+                WHERE platform = 'weixin' AND message_id = %s
+                """,
+                (bid, ws_id, inbound_status, message_id),
+            )
     else:
         await cur.execute(
             """
-            UPDATE dalton_channel_inbound_events
-            SET collect_buffer_id = %s::uuid,
-                workspace_id = %s::uuid,
-                status = %s,
-                fallback_pending = FALSE,
-                updated_at = NOW()
-            WHERE platform = 'weixin' AND message_id = %s
+            SELECT upload_status
+            FROM dalton_channel_weixin_collect_items
+            WHERE buffer_id = %s::uuid AND message_id = %s
             """,
-            (bid, ws_id, inbound_status, message_id),
+            (bid, message_id),
         )
+        ex_it = await cur.fetchone()
+        if ex_it is not None and ex_it.get("upload_status"):
+            upload_status = str(ex_it["upload_status"])
 
     return {
         "collection_mode": "appended",
