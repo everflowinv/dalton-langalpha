@@ -394,7 +394,7 @@ describe("Settings: the user's instructions", () => {
       expect(readSection(new URLSearchParams('tab=integrations'), '#dalton-channel-bindings')).toBe('integrations');
       const entry = searchableSettings(true).find((item) => item.anchor === 'dalton-channel-bindings');
       expect(entry?.section).toBe('integrations');
-      expect(entry?.labelKey).toBe('settings.dalton.channelBindingsLabel');
+      expect(entry?.labelKey).toBe('settings:dalton.channelBindingsLabel');
       expect(entry?.advanced).toBeUndefined();
       expect(entry?.visibleWhen).toBeUndefined();
       expect(searchableSettings(false).some((item) => item.anchor === 'dalton-channel-bindings')).toBe(true);

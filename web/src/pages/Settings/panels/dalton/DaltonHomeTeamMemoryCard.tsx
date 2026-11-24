@@ -116,8 +116,8 @@ export function DaltonHomeTeamMemoryCard({
     <DaltonSettingsCard
       id="dalton-home-team-memory"
       testId="dalton-home-team-memory-card"
-      title={t('settings.dalton.homeTeamMemoryLabel')}
-      description={t('settings.dalton.homeTeamMemoryDesc')}
+      title={t('settings:dalton.homeTeamMemoryLabel')}
+      description={t('settings:dalton.homeTeamMemoryDesc')}
       layout="rows"
       action={
         !isLoading && !error ? (

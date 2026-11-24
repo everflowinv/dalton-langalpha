@@ -8,9 +8,15 @@ import { useComputersPanel, usePageComputersHostMounted } from '@/pages/ChatAgen
 import { CREATE_COMPUTER_MUTATION_KEY } from '@/pages/ChatAgent/hooks/useComputers';
 import { useCreateWorkspace } from '@/pages/ChatAgent/hooks/useCreateWorkspace';
 import type { Workspace } from '@/types/api';
+import { withCopy } from '@/i18n';
 
-const CreateWorkspaceModal = lazy(() => import('@/pages/ChatAgent/components/CreateWorkspaceModal'));
-const ComputersDialogHost = lazy(() => import('@/pages/ChatAgent/components/ComputersDialogHost'));
+const CreateWorkspaceModal = lazy(withCopy(() => import('@/pages/ChatAgent/components/CreateWorkspaceModal'), [
+  'filePanel',
+]));
+// DALTON-HOOK(settings-reorg): fallback Computers host for pages without their own ComputersDialogHost.
+const ComputersDialogHost = lazy(withCopy(() => import('@/pages/ChatAgent/components/ComputersDialogHost'), [
+  'filePanel', 'settings', 'setup',
+]));
 
 const OpenCreateWorkspace = createContext<(() => void) | null>(null);
 

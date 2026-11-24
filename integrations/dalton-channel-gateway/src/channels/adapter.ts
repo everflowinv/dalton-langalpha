@@ -203,6 +203,37 @@ export interface WeixinQrWaitResult {
 }
 
 /**
+ * Terminal outcome passed to `ProcessingFeedbackHandle.settle()`:
+ * - `"done"`: at least one reply was delivered, or the turn finished cleanly.
+ * - `"interrupted"`: a HITL / confirmation prompt was delivered and the turn is paused.
+ * - `"failed"`: the turn failed, and an error notice was delivered to the user.
+ * - `"delivery_failed"`: total failure where neither reply nor error notice could be delivered.
+ */
+export type ProcessingFeedbackOutcome =
+  | "done"
+  | "interrupted"
+  | "failed"
+  | "delivery_failed";
+
+export interface ProcessingFeedbackContext {
+  event: InboundChannelEvent;
+}
+
+/**
+ * In-memory handle representing one inbound message's processing status feedback
+ * (reaction and/or typing indicator). State lives strictly in gateway process
+ * memory; indicators left behind across a gateway restart are not cleaned up.
+ */
+export interface ProcessingFeedbackHandle {
+  /**
+   * Idempotently clear the in-progress indicator (and on `"delivery_failed"`,
+   * add the platform's fallback failure reaction when supported).
+   * Must be best-effort and never throw.
+   */
+  settle(outcome: ProcessingFeedbackOutcome): Promise<void> | void;
+}
+
+/**
  * Unified Channel Adapter contract for Phase 2 core & Phase 3 protocol implementations
  * (`feishu`, `discord`, `weixin` — §4.2 ~ §4.4).
  */
@@ -322,6 +353,16 @@ export interface ChannelAdapter {
     sessionKey: string;
     code: string;
   }): Promise<WeixinQrWaitResult>;
+
+  /**
+   * Optional best-effort processing status feedback (reaction and/or typing indicator).
+   * Implementations should fire platform status requests without blocking the main
+   * reply flow; active handles live strictly in gateway process memory (indicators
+   * left behind across a gateway restart are not cleaned up).
+   */
+  beginProcessingFeedback?(
+    context: ProcessingFeedbackContext,
+  ): ProcessingFeedbackHandle | null | Promise<ProcessingFeedbackHandle | null>;
 }
 
 /**

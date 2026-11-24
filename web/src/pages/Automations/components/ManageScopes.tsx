@@ -81,7 +81,7 @@ export function ManageScopes({ pages, readings, selectedId, onSelect, keyboardNa
   }, [activeScope]);
 
   return (
-    <div ref={navRef} className="automations-scopes" aria-label={t('automation.automations')}>
+    <div ref={navRef} className="automations-scopes" aria-label={t('automation:automations')}>
       {pages.map((page) => (
         <section
           key={page.scope}
@@ -98,15 +98,15 @@ export function ManageScopes({ pages, readings, selectedId, onSelect, keyboardNa
           </h2>
           {page.isForbidden ? (
             <p className="automations-quiet-note">
-              {t(page.scope === 'company' ? 'automation.companyUnavailable' : 'automation.detailForbidden')}
+              {t(page.scope === 'company' ? 'automation:companyUnavailable' : 'automation:detailForbidden')}
             </p>
           ) : page.isLoading ? (
             <ListSkeleton rows={3} />
           ) : page.isError ? (
-            <p className="automations-quiet-note">{t('automation.scopeLoadFailed')}</p>
+            <p className="automations-quiet-note">{t('automation:scopeLoadFailed')}</p>
           ) : page.tasks.length === 0 ? (
             <p className="automations-quiet-note">
-              {t(page.showingDeleted ? 'automation.recycleEmpty' : 'automation.scopeEmpty')}
+              {t(page.showingDeleted ? 'automation:recycleEmpty' : 'automation:scopeEmpty')}
             </p>
           ) : page.showingDeleted ? (
             <DeletedRows tasks={page.tasks} selectedId={selectedId} onSelect={onSelect} />
@@ -132,8 +132,8 @@ export function ManageScopes({ pages, readings, selectedId, onSelect, keyboardNa
               onClick={page.onToggleRecycle}
             >
               {page.recycleReady
-                ? t('automation.recycleBin', { total: page.recycleCount })
-                : t('automation.recycleBinPending')}
+                ? t('automation:recycleBin', { total: page.recycleCount })
+                : t('automation:recycleBinPending')}
             </button>
           )}
         </section>
@@ -157,7 +157,7 @@ function DeletedRows({
     <>
       {tasks.map((task) => {
         const selected = task.automation_id === selectedId;
-        const actor = task.deleted_by || t('automation.unknownActor');
+        const actor = task.deleted_by || t('automation:unknownActor');
         const time = task.deleted_at ? formatDateTimeShort(task.deleted_at, locale) : '—';
         return (
           <button
@@ -170,7 +170,7 @@ function DeletedRows({
           >
             <span className="min-w-0 flex-1">
               <span className="automations-list-name">{task.name}</span>
-              <span className="automation-mono automations-list-sub">{t('automation.deletedMeta', { actor, time })}</span>
+              <span className="automation-mono automations-list-sub">{t('automation:deletedMeta', { actor, time })}</span>
             </span>
           </button>
         );
@@ -210,7 +210,7 @@ function CompanyRows({
               <span className="min-w-0 flex-1">
                 <span className="automations-list-name">{task.name}</span>
                 <span className="automation-mono automations-list-sub">
-                  {t('automation.taskScript')} · {task.cron_expression}
+                  {t('automation:taskScript')} · {task.cron_expression}
                 </span>
               </span>
               <span className="automation-mono automations-list-trailing">{statusKey ? t(statusKey) : task.status}</span>
@@ -229,7 +229,7 @@ function CompanyRows({
             <span className="min-w-0 flex-1">
               <span className="automations-list-name">{task.name}</span>
               <span className="automation-mono automations-list-sub">
-                {t('automation.taskAgent')} · {scheduleLine(task, t, homeZone, locale)}
+                {t('automation:taskAgent')} · {scheduleLine(task, t, homeZone, locale)}
               </span>
             </span>
           </button>
@@ -259,22 +259,22 @@ function ScopePager({ page, showCount }: { page: ScopePage; showCount: boolean }
         type="button"
         className="automation-link"
         disabled={page.offset <= 0}
-        aria-label={`${t('automation.prevPage')} ${group}`}
+        aria-label={`${t('automation:prevPage')} ${group}`}
         onClick={() => page.onOffset(Math.max(0, page.offset - MANAGE_PAGE_SIZE))}
       >
-        {t('automation.prevPage')}
+        {t('automation:prevPage')}
       </button>
       {showCount && (
-        <span className="automation-mono automations-scope-page">{t('automation.pageOf', { page: current, pages })}</span>
+        <span className="automation-mono automations-scope-page">{t('automation:pageOf', { page: current, pages })}</span>
       )}
       <button
         type="button"
         className="automation-link"
         disabled={!showCount || page.offset + MANAGE_PAGE_SIZE >= page.total}
-        aria-label={`${t('automation.nextPage')} ${group}`}
+        aria-label={`${t('automation:nextPage')} ${group}`}
         onClick={() => page.onOffset(page.offset + MANAGE_PAGE_SIZE)}
       >
-        {t('automation.nextPage')}
+        {t('automation:nextPage')}
       </button>
     </div>
   );

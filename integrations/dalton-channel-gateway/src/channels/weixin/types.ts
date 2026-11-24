@@ -50,6 +50,11 @@ export const UploadMediaType = {
   VOICE: 4,
 } as const;
 
+export const TypingStatus = {
+  TYPING: 1,
+  CANCEL: 2,
+} as const;
+
 export interface BaseInfo {
   channel_version?: string;
 }
@@ -172,6 +177,32 @@ export interface SendMessageResp {
   errmsg?: string;
   message_id?: string | number;
   msg_id?: string | number;
+}
+
+export interface GetConfigReq {
+  ilink_user_id: string;
+  context_token?: string;
+  base_info?: BaseInfo;
+}
+
+export interface GetConfigResp {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+  typing_ticket?: string;
+}
+
+export interface SendTypingReq {
+  ilink_user_id: string;
+  typing_ticket: string;
+  status: number;
+  base_info?: BaseInfo;
+}
+
+export interface SendTypingResp {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
 }
 
 export interface GetUploadUrlReq {

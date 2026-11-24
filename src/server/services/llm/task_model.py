@@ -19,18 +19,19 @@ from fastapi import HTTPException
 
 from ptc_agent.agent.subagents.merge import turn_roster
 from ptc_agent.agent.subagents.definition import SubagentDefinition
-from ptc_agent.config.agent import AgentConfig, Admitted, TaskModel, TaskModelRefused
+from ptc_agent.config.agent import AgentConfig, Admitted, TaskAsk, TaskModel, TaskModelRefused
 from src.llms.claude_code import is_claude_code_model
 from src.llms.llm import LLM as LLMFactory, stamp_call_metadata
 from src.llms.model_identity import catalog_model
 from src.llms.preferences import resolve_tuning
 
 from . import logger, user_models
-from .availability import model_resolves, plan_covers
+from .availability import model_resolves, plan_covers, policy_refuses  # DALTON-HOOK(antigravity-series)
 from .capabilities import PlanTier
 from .claude_code import PLACEMENT_UNREAD, cli_admission
 from .clients import is_own_key_turn, resolve_model_client, subscription_route
 from .subagents import card_model
+from src.server.services.policy import MODELS_ALLOWED, Policy, _by  # DALTON-HOOK(antigravity-series)
 
 # DALTON-HOOK(computer-cli-tokens-off): omit `la models list` when CLI tokens are off.
 def _list_hint() -> str:
@@ -100,13 +101,30 @@ def _cannot_run(name: str, why: str) -> TaskModelRefused:
     return TaskModelRefused(f"Error: {name} cannot run now: {why} {_list_hint()}", why.rstrip("."))
 
 
+# DALTON-HOOK(antigravity-series): mirror primary-turn policy refusal for Task models/variants.
+def _policy_denied(policy: Policy, rule: str, name: str) -> TaskModelRefused:
+    setter = policy.set_by(rule, name)
+    if rule == MODELS_ALLOWED:
+        by = _by(setter)
+        return TaskModelRefused(
+            f"Error: {name} is not allowed: {by} limits which models can be used. {_list_hint()}",
+            f"{by} does not allow {name}",
+        )
+    why = policy.reason(rule)
+    return TaskModelRefused(
+        f"Error: {name} cannot be used: {why}. {_list_hint()}",
+        why.rstrip("."),
+    )
+
+
 #: OAuth refusals that signing in again answers; any other is quoted.
 _SIGN_IN_AGAIN = frozenset({"oauth_reauth_required", "oauth_required"})
 
 
 class TaskModelGate:
     """The models this turn's Tasks name, each resolved once per subagent
-    type, since a subagent's own set effort applies whatever model serves it.
+    type and named effort, since a subagent's own set effort applies whatever
+    model serves it unless the Task names another.
 
     ``model_pref`` is the plan-gated view the turn resolved its own model
     from, and ``plan_exempt`` the deployment's own models a primary turn runs
@@ -127,6 +145,8 @@ class TaskModelGate:
         is_byok: bool,
         turn_model: str,
         plan_exempt: frozenset[str],
+        # DALTON-HOOK(antigravity-series): enforce deployment/org model policy on final Task model/variant
+        policy: Policy | None = None,
     ) -> None:
         self._config = config
         self._user_id = user_id
@@ -137,24 +157,26 @@ class TaskModelGate:
         self._is_byok = is_byok
         self._turn_model = turn_model
         self._plan_exempt = plan_exempt
+        self._policy = policy
         self._byok_cache: dict[str, dict | None] = {}
         # Where the turn's own admission placed a Claude Code CLI; None where
         # it placed none, read on the first Claude Code name.
         self._claude_code: Admitted | str | None = (
             config.claude_code_admitted if config.claude_code else config.claude_code_pins
         )
-        self._resolved: dict[tuple[str, str], TaskModel] = {}
+        self._resolved: dict[tuple[str, str, str | None], TaskModel] = {}
 
     async def resolve(
-        self, name: str, subagent_type: str, *, keep: bool = False
+        self, ask: TaskAsk, subagent_type: str
     ) -> TaskModel | TaskModelRefused | None:
-        name = name.strip()
-        if not keep and name == self._own_model(subagent_type):
+        own = self._own_model(subagent_type)
+        name = own if ask.model is None else ask.model.strip()
+        if name == own and ask.effort is None:
             return None
-        key = (subagent_type, name)
+        key = (subagent_type, name, ask.effort)
         if key in self._resolved:
             return self._resolved[key]
-        picked = await self._resolve(name, subagent_type)
+        picked = await self._resolve(name, subagent_type, ask.effort, own=name == own)
         if isinstance(picked, TaskModel):
             self._resolved[key] = picked
         return picked
@@ -171,8 +193,14 @@ class TaskModelGate:
     def _definition(self, subagent_type: str) -> SubagentDefinition | None:
         return turn_roster(self._config.subagents).definitions.get(subagent_type)
 
-    async def _resolve(self, name: str, subagent_type: str) -> TaskModel | TaskModelRefused:
+    async def _resolve(
+        self, name: str, subagent_type: str, effort: str | None, *, own: bool
+    ) -> TaskModel | TaskModelRefused:
+        """``own``: the subagent's own model, here only for a named effort.
+        The turn already admitted it, a deployment's pin past the user's
+        plan included (``plan_gated``), so the plan is not read again."""
         user_id, model_pref = self._user_id, self._model_pref
+        original_name = name
         source, entry = await user_models.classify_model(user_id, name, _pref_cache=model_pref)
         if (
             not name
@@ -186,6 +214,51 @@ class TaskModelGate:
         ):
             return _unknown(name)
 
+        # DALTON-HOOK(antigravity-series): resolve call-vs-saved effort priority
+        # first (explicit call effort > saved subagent reasoning_effort), then map
+        # built-in Antigravity models to the closest allowed series variant (step
+        # down first, then up) and check model policy before creating a client.
+        from src.dalton.llm.antigravity_series import (
+            ANTIGRAVITY_PROVIDER,
+            resolve_antigravity_effort_model,
+        )
+
+        definition = self._definition(subagent_type)
+        requested_effort = (
+            effort or (definition.reasoning_effort if definition is not None else None)
+        )
+        mc = LLMFactory.get_model_config()
+        is_builtin_antigravity = (
+            source == user_models.ModelSource.SYSTEM
+            and isinstance(entry, dict)
+            and entry.get("provider") == ANTIGRAVITY_PROVIDER
+        )
+        if is_builtin_antigravity and requested_effort is not None:
+            def _variant_allowed(candidate: str) -> bool:
+                if not model_resolves(model_pref, candidate):
+                    return False
+                if (
+                    self._policy is not None
+                    and policy_refuses(self._policy, model_pref, candidate) is not None
+                ):
+                    return False
+                return True
+
+            mapped = resolve_antigravity_effort_model(
+                name, requested_effort, model_config=mc, allowed_filter=_variant_allowed
+            )
+            if mapped is not None:
+                mapped_name, _ = mapped
+                name = mapped_name
+                source, entry = await user_models.classify_model(
+                    user_id, name, _pref_cache=model_pref
+                )
+
+        if self._policy is not None and (
+            rule := policy_refuses(self._policy, model_pref, name)
+        ):
+            return _policy_denied(self._policy, rule, name)
+
         claude_code: Admitted | None = None
         # A custom model of the same name shadows the row, and its client is
         # built from the custom entry (``resolve_model_client``).
@@ -195,7 +268,7 @@ class TaskModelGate:
                 return _no_claude_code(name, where)
             claude_code = where
 
-        if name not in self._plan_exempt:
+        if (not own or name != original_name) and name not in self._plan_exempt:
             covered = await plan_covers(
                 user_id, name, model_pref=model_pref, permits=self._permits,
                 is_byok=self._is_byok, byok_cache=self._byok_cache,
@@ -205,18 +278,21 @@ class TaskModelGate:
             if not covered:
                 return _off_plan(name)
 
-        definition = self._definition(subagent_type)
         platform_ok = not is_own_key_turn(self._config)
-        mc = LLMFactory.get_model_config()
+        # DALTON-HOOK(antigravity-series): do not forward raw reasoning_effort to
+        # built-in Antigravity models; the mapped model ID carries the level.
+        effective_effort = (
+            None
+            if is_builtin_antigravity
+            else (requested_effort or resolve_tuning(model_pref, name).reasoning_effort)
+        )
         try:
             resolved = await resolve_model_client(
                 user_id, name, is_byok=self._is_byok, cache_key=self._thread_id,
                 allow_platform_fallback=platform_ok,
-                reasoning_effort=(
-                    (definition.reasoning_effort if definition is not None else None)
-                    or resolve_tuning(model_pref, name).reasoning_effort
-                ),
+                reasoning_effort=effective_effort,
                 _pref_cache=model_pref, _byok_cache=self._byok_cache,
+                **({"policy": self._policy} if self._policy is not None else {}),
             )
         except HTTPException as exc:
             detail = exc.detail if isinstance(exc.detail, dict) else {}
@@ -249,6 +325,7 @@ class TaskModelGate:
             guidance=guidance,
             model=card_model(model_pref, catalog_model(resolved.client) or name, self._turn_model),
             claude_code=claude_code,
+            effort=effort,
         )
 
     async def _claude_code_where(self) -> Admitted | str:

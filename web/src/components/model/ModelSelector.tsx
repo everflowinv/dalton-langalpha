@@ -249,7 +249,7 @@ export function ModelSelector({
             aria-label={label ? undefined : ariaLabel}
             className={showSeriesEffortPicker ? "min-w-0 flex-1" : undefined}
           >
-            <option value="">{placeholder ?? t("settings.selectModel")}</option>
+            <option value="">{placeholder ?? t("settings:selectModel")}</option>
             {autoOption && <option value={autoOption.value}>{autoOption.label}</option>}
             {!listed && missingLabel && <option value={value}>{missingLabel(value)}</option>}
             {groups.map(({ provider, display, options, lockedOptions }) => {
@@ -307,7 +307,7 @@ export function ModelSelector({
           className="text-sm py-2"
           style={{ color: "var(--color-text-tertiary)" }}
         >
-          {t("settings.noModelsAvailable")}
+          {t("settings:noModelsAvailable")}
         </p>
       )}
     </div>

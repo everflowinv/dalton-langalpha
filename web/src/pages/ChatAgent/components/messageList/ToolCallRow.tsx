@@ -2,7 +2,7 @@ import React, { memo } from 'react';
 import { Wrench } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { categorizeTool, getDisplayName, getDiscardedToolCallReason, getFailedToolCallLabel, getToolIcon, getPreparingText, isFailedCall } from '../toolDisplayConfig';
+import { categorizeTool, getDisplayName, getDiscardedToolCallReason, getFailedToolCallLabel, getToolIcon, getPreparingText, isFailedCall } from '../toolDisplayConfig'; // DALTON-HOOK(empty-turn-guard)
 import { ToolIcon } from '../ToolIcon';
 import { completedToolTitle, completedToolSummary, liveToolLabel } from './activitySummary';
 import { filePathOf } from './groupFileToolRuns';
@@ -24,7 +24,7 @@ function runningLine(item: ToolActivityItem, t: (key: string) => string): { verb
   const verbKey = RUNNING_VERB_KEY[item.toolName || ''];
   const filePath = verbKey ? filePathOf(item) : null;
   if (verbKey && filePath && classifyAgentPath(filePath, item.root).kind === 'file') {
-    return { verb: t(`toolArtifact.running.${verbKey}`), pill: completedToolSummary(item, t) || filePath.split('/').pop() || null };
+    return { verb: t(`toolArtifact:running.${verbKey}`), pill: completedToolSummary(item, t) || filePath.split('/').pop() || null };
   }
   return { verb: liveToolLabel(item, t), pill: null };
 }
@@ -47,7 +47,7 @@ export function RunningLine({ item, onOpenPill }: { item: ToolActivityItem; onOp
 export function PreparingTimelineRow({ tc }: { tc: PreparingCall }): React.ReactElement {
   const { t } = useTranslation();
   const toolName = tc.toolName || '';
-  const displayName = toolName ? getDisplayName(toolName, t) : t('toolArtifact.toolCall');
+  const displayName = toolName ? getDisplayName(toolName, t) : t('toolArtifact:toolCall');
   const IconComponent: LucideIcon = toolName ? getToolIcon(toolName) : Wrench;
   const prepText = getPreparingText(toolName, tc.argsLength, t);
 
@@ -92,14 +92,14 @@ export const ToolCallRow = memo(function ToolCallRow({ item, onClick, running = 
   const cat = categorizeTool(toolName, item.toolCall, item.root);
   const isMemory = cat === 'memoryRead' || cat === 'memoryWrite';
   const tabLabel = isMemory
-    ? t('filePanel.tabs.memory')
+    ? t('filePanel:tabs.memory')
     : cat === 'memo' || cat === 'memoWrite'
-      ? t('filePanel.tabs.memo')
-      : t('filePanel.tabs.files');
+      ? t('filePanel:tabs.memo')
+      : t('filePanel:tabs.files');
 
   // No pill → the row title becomes the click target so the affordance isn't
   // lost (e.g., memory/memo index rows where the verb already names the file).
-  const openInTabLabel = t('toolArtifact.a11y.openInTab', { tab: tabLabel });
+  const openInTabLabel = t('toolArtifact:a11y.openInTab', { tab: tabLabel });
   const titleNode = summary ? (
     <span className="titem-title">{title}</span>
   ) : (
@@ -137,12 +137,13 @@ export const ToolCallRow = memo(function ToolCallRow({ item, onClick, running = 
                     type="button"
                     onClick={onClick}
                     className="obj"
-                    title={t('toolArtifact.a11y.openInTab', { tab: tabLabel })}
+                    title={t('toolArtifact:a11y.openInTab', { tab: tabLabel })}
                   >
                     {summary}
                   </button>
                 </span>
               )}
+              {/* DALTON-HOOK(empty-turn-guard): show discarded tool call reason */}
               {discardedReason && (
                 <span className="truncate min-w-0" style={{ opacity: 0.65, fontSize: '0.8125rem' }}>
                   {discardedReason}

@@ -38,7 +38,11 @@ import type {
   ThreadStatusInfo,
 } from "../src/backend-client.js";
 import { FakeChannelAdapter } from "../src/channels/fake-adapter.js";
-import { type GatewayConfig, loadConfig } from "../src/config.js";
+import {
+  type GatewayConfig,
+  loadConfig,
+  type StatusFeedbackConfig,
+} from "../src/config.js";
 import { createGatewayApp, type GatewayApp } from "../src/server.js";
 import type { ChannelPlatform } from "../src/types.js";
 
@@ -990,16 +994,22 @@ export function createTestHarness(options?: {
   nowFn?: () => number;
   backoffDelayFn?: (ms: number) => Promise<void>;
   busyThreadMaxWaitMs?: number;
+  statusFeedback?: StatusFeedbackConfig;
+  env?: NodeJS.ProcessEnv;
 }): TestHarness {
   const tempDir = mkdtempSync(join(tmpdir(), "dalton-gw-test-"));
-  const config = loadConfig({
+  const baseConfig = loadConfig({
     GATEWAY_HOST: "127.0.0.1",
     GATEWAY_PORT: "0",
     INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
     DALTON_BACKEND_URL: "http://127.0.0.1:8000",
     WEB_BASE_URL: "https://app.ginlix.ai",
     DALTON_WEIXIN_CACHE_DIR: join(tempDir, "weixin"),
+    ...(options?.env ?? {}),
   });
+  const config: GatewayConfig = options?.statusFeedback
+    ? { ...baseConfig, statusFeedback: options.statusFeedback }
+    : baseConfig;
   const backend = createMockBackend();
   const feishuAdapter = new FakeChannelAdapter("feishu", 2000);
   const discordAdapter = new FakeChannelAdapter("discord", 2000);

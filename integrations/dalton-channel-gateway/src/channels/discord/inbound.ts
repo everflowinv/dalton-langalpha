@@ -5,8 +5,10 @@
  * (lines 1-22, 135-429: `DISCORD_MEDIA_SSRF_POLICY`, `resolveDiscordMediaClassification`,
  * `fetchDiscordMedia`, `resolveDiscordMessageText`, `resolveDiscordMentions`). License: MIT,
  * Copyright (c) 2025 Peter Steinberger. OpenClaw local media storage (`saveRemoteMedia`)
- * and the Typing indicator are removed; downloads go through `src/shared/safe-fetch.ts`
- * into memory only, and the bot token is never sent to CDN or redirect targets.
+ * is removed (best-effort processing status feedback — ⏳/⚠️ reactions plus DM/thread
+ * typing indicator — is handled by `DiscordChannelAdapter.beginProcessingFeedback`);
+ * downloads go through `src/shared/safe-fetch.ts` into memory only, and the bot token
+ * is never sent to CDN or redirect targets.
  */
 
 import { SafeFetchError, safeFetchBuffer, type SafeFetchOptions } from "../../shared/safe-fetch.js";

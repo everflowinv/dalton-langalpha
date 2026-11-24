@@ -7,8 +7,9 @@ import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import '@testing-library/jest-dom';
-import zhCN from '@/locales/zh-CN.json';
-import enUS from '@/locales/en-US.json';
+import zhToolArtifact from '@/locales/toolArtifact/zh-CN.json';
+import enToolArtifact from '@/locales/toolArtifact/en-US.json';
+import { enUS, lookup } from '@/test/catalogs';
 import type { ChatMessage } from '@/types/chat';
 import type { SSEEvent } from '../../session/types';
 import { createStreamEventProcessor } from '../../session/stream/processStreamEvent';
@@ -167,7 +168,7 @@ describe('discarded pre-finish tool calls & same-frame text', () => {
   it.each(['output_cap', 'malformed_call', 'interrupted'] as const)(
     'uses localized reason key "%s" and toolCallNotExecuted a11y label across live row, timeline row, and detail header',
     (reasonKey) => {
-      const expectedKey = `toolArtifact.discarded.${reasonKey}`;
+      const expectedKey = `toolArtifact:discarded.${reasonKey}`;
       const proc = {
         type: 'tool_call' as const,
         id: 'ag-call-1',
@@ -192,8 +193,8 @@ describe('discarded pre-finish tool calls & same-frame text', () => {
       // Live zone row
       const liveView = render(<ToolCallLiveRow tc={proc as never} liveState="failed" />);
       expect(liveView.getByText(new RegExp(expectedKey))).toBeInTheDocument();
-      expect(liveView.getByLabelText('toolArtifact.a11y.toolCallNotExecuted')).toBeInTheDocument();
-      expect(liveView.queryByLabelText('toolArtifact.a11y.toolCallFailed')).toBeNull();
+      expect(liveView.getByLabelText('toolArtifact:a11y.toolCallNotExecuted')).toBeInTheDocument();
+      expect(liveView.queryByLabelText('toolArtifact:a11y.toolCallFailed')).toBeNull();
       liveView.unmount();
 
       // Collapsed/archived timeline row (FileToolGroupRow path for Write)
@@ -203,16 +204,16 @@ describe('discarded pre-finish tool calls & same-frame text', () => {
       const failedRow = container.querySelector('.titem.failed');
       expect(failedRow).not.toBeNull();
       expect(failedRow!.textContent).toContain(expectedKey);
-      expect(failedRow!.querySelector('.nrow-badge')!.getAttribute('aria-label')).toBe('toolArtifact.a11y.toolCallNotExecuted');
-      expect(screen.queryByLabelText('toolArtifact.a11y.toolCallFailed')).toBeNull();
+      expect(failedRow!.querySelector('.nrow-badge')!.getAttribute('aria-label')).toBe('toolArtifact:a11y.toolCallNotExecuted');
+      expect(screen.queryByLabelText('toolArtifact:a11y.toolCallFailed')).toBeNull();
       unmount();
 
       // Mobile detail sheet header
       viewport.mobile = true;
       try {
         render(<DetailPanel toolCallProcess={proc as never} />);
-        expect(screen.getByLabelText('toolArtifact.a11y.toolCallNotExecuted')).toBeInTheDocument();
-        expect(screen.queryByLabelText('toolArtifact.a11y.toolCallFailed')).toBeNull();
+        expect(screen.getByLabelText('toolArtifact:a11y.toolCallNotExecuted')).toBeInTheDocument();
+        expect(screen.queryByLabelText('toolArtifact:a11y.toolCallFailed')).toBeNull();
       } finally {
         viewport.mobile = false;
       }
@@ -220,19 +221,19 @@ describe('discarded pre-finish tool calls & same-frame text', () => {
   );
 
   it('ships matching zh-CN and en-US copy without auto-retry phrasing', () => {
-    expect(zhCN.toolArtifact.a11y.toolCallNotExecuted).toBe('工具调用未执行');
-    expect(enUS.toolArtifact.a11y.toolCallNotExecuted).toBe('Tool call not executed');
-    expect(zhCN.toolArtifact.discarded).toEqual({
+    expect(zhToolArtifact.a11y.toolCallNotExecuted).toBe('工具调用未执行');
+    expect(enToolArtifact.a11y.toolCallNotExecuted).toBe('Tool call not executed');
+    expect(zhToolArtifact.discarded).toEqual({
       output_cap: '工具调用未执行：回复超出输出上限被截断',
       malformed_call: '工具调用未执行：调用格式错误',
       interrupted: '工具调用未执行：模型输出中断',
     });
-    expect(enUS.toolArtifact.discarded).toEqual({
+    expect(enToolArtifact.discarded).toEqual({
       output_cap: 'Tool call not executed: reply truncated at output limit',
       malformed_call: 'Tool call not executed: malformed tool call',
       interrupted: 'Tool call not executed: model output interrupted',
     });
-    expect(enUS.chat.autoRetryExhausted).toBe("Couldn't finish this reply after a few tries. Try again in a moment.");
+    expect(lookup(enUS, 'chat.autoRetryExhausted')).toBe("Couldn't finish this reply after a few tries. Try again in a moment.");
   });
 
   it('ignores discarded-looking prefix in ordinary Bash output without discarded=true & status=error', () => {
@@ -277,7 +278,7 @@ describe('discarded pre-finish tool calls & same-frame text', () => {
     fireEvent.click(screen.getByRole('button', { name: /toolArtifact/i }));
     const failedRow = errView.container.querySelector('.titem.failed');
     expect(failedRow).not.toBeNull();
-    expect(failedRow!.querySelector('.nrow-badge')!.getAttribute('aria-label')).toBe('toolArtifact.a11y.toolCallFailed');
+    expect(failedRow!.querySelector('.nrow-badge')!.getAttribute('aria-label')).toBe('toolArtifact:a11y.toolCallFailed');
     expect(errView.queryByText(new RegExp(FALLBACK_TRUNCATED))).toBeNull();
     errView.unmount();
 
@@ -298,6 +299,6 @@ describe('discarded pre-finish tool calls & same-frame text', () => {
     const weirdView = renderWithQuery(<ToolCallLiveRow tc={discardedFlagWithSuccessStatus as never} liveState="failed" />);
     expect(weirdView.queryByText(/toolArtifact\.discarded\.output_cap/)).toBeNull();
     expect(weirdView.queryByText(new RegExp(FALLBACK_TRUNCATED))).toBeNull();
-    expect(weirdView.getByLabelText('toolArtifact.a11y.toolCallFailed')).toBeInTheDocument();
+    expect(weirdView.getByLabelText('toolArtifact:a11y.toolCallFailed')).toBeInTheDocument();
   });
 });

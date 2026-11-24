@@ -204,6 +204,7 @@ export function createGatewayApp(options: {
     agentRoutes,
     webBaseUrl: config.webBaseUrl,
     weixinCacheDir: config.weixinCacheDir,
+    statusFeedback: config.statusFeedback,
     backoffDelayFn: options.backoffDelayFn,
     busyThreadMaxWaitMs: options.busyThreadMaxWaitMs,
     nowFn: options.nowFn,

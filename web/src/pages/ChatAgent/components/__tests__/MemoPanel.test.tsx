@@ -18,7 +18,7 @@ import { renderWithProviders, createTestQueryClient } from '@/test/utils';
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string, opts?: Record<string, unknown>) => {
     const templates: Record<string, string> = {
-      'memoPanel.errors.uploadFailedSummary': '{{count}} 个文件上传失败：{{details}}',
+      'memoPanel:errors.uploadFailedSummary': '{{count}} 个文件上传失败：{{details}}',
     };
     const template = templates[key] ?? key;
     if (!opts) return template;
@@ -136,11 +136,11 @@ describe('MemoPanel — empty state', () => {
     renderWithProviders(<MemoPanel />);
 
     await waitFor(() =>
-      expect(screen.getByText('memoPanel.empty.title')).toBeInTheDocument(),
+      expect(screen.getByText('memoPanel:empty.title')).toBeInTheDocument(),
     );
-    expect(screen.getByText('memoPanel.empty.hint')).toBeInTheDocument();
+    expect(screen.getByText('memoPanel:empty.hint')).toBeInTheDocument();
     // Upload button is enabled in empty state
-    expect(screen.getByText('memoPanel.uploadButton')).toBeInTheDocument();
+    expect(screen.getByText('memoPanel:uploadButton')).toBeInTheDocument();
   });
 });
 
@@ -178,8 +178,8 @@ describe('MemoPanel — list rendering', () => {
     await waitFor(() => expect(screen.getByText('pending.md')).toBeInTheDocument());
     expect(screen.getByText('ready.md')).toBeInTheDocument();
     // Both badges visible (translation keys come through unchanged)
-    expect(screen.getByText('memoPanel.status.pending')).toBeInTheDocument();
-    expect(screen.getByText('memoPanel.status.ready')).toBeInTheDocument();
+    expect(screen.getByText('memoPanel:status.pending')).toBeInTheDocument();
+    expect(screen.getByText('memoPanel:status.ready')).toBeInTheDocument();
   });
 
   it('shows the "Failed" badge when metadata generation failed', async () => {
@@ -193,7 +193,7 @@ describe('MemoPanel — list rendering', () => {
     renderWithProviders(<MemoPanel />);
 
     await waitFor(() => expect(screen.getByText('broken.md')).toBeInTheDocument());
-    expect(screen.getByText('memoPanel.status.failed')).toBeInTheDocument();
+    expect(screen.getByText('memoPanel:status.failed')).toBeInTheDocument();
   });
 
   it('leaves the date cell empty for an unparseable created_at', async () => {
@@ -261,8 +261,8 @@ describe('MemoPanel — viewer', () => {
     expect(md.textContent).toBe('# Hello memo');
 
     // Viewer header has a back button + delete button
-    expect(screen.getByTitle('memoPanel.backToList')).toBeInTheDocument();
-    expect(screen.getByTitle('memoPanel.actions.delete')).toBeInTheDocument();
+    expect(screen.getByTitle('memoPanel:backToList')).toBeInTheDocument();
+    expect(screen.getByTitle('memoPanel:actions.delete')).toBeInTheDocument();
   });
 
   it('opens delete confirmation when the trash icon is clicked', async () => {
@@ -289,10 +289,10 @@ describe('MemoPanel — viewer', () => {
     const user = userEvent.setup();
 
     await user.click(await screen.findByText('note.md'));
-    await user.click(screen.getByTitle('memoPanel.actions.delete'));
+    await user.click(screen.getByTitle('memoPanel:actions.delete'));
 
     // Dialog now visible
-    expect(await screen.findByText('memoPanel.confirm.deleteTitle')).toBeInTheDocument();
+    expect(await screen.findByText('memoPanel:confirm.deleteTitle')).toBeInTheDocument();
     // Body interpolates the file name
     expect(screen.getByText(/note\.md/)).toBeInTheDocument();
   });
@@ -322,8 +322,8 @@ describe('MemoPanel — viewer', () => {
     const user = userEvent.setup();
 
     await user.click(await screen.findByText('note.md'));
-    await user.click(screen.getByTitle('memoPanel.actions.delete'));
-    await user.click(await screen.findByText('memoPanel.confirm.deleteConfirm'));
+    await user.click(screen.getByTitle('memoPanel:actions.delete'));
+    await user.click(await screen.findByText('memoPanel:confirm.deleteConfirm'));
 
     await waitFor(() => expect(mockDelete).toHaveBeenCalledWith('note.md'));
   });
@@ -353,7 +353,7 @@ describe('MemoPanel — viewer', () => {
     const user = userEvent.setup();
 
     await user.click(await screen.findByText('note.md'));
-    await user.click(screen.getByTitle('memoPanel.actions.download'));
+    await user.click(screen.getByTitle('memoPanel:actions.download'));
 
     expect(mockDownload).toHaveBeenCalledWith('note.md', 'note.md');
   });
@@ -407,7 +407,7 @@ describe('MemoPanel — regenerate on failed memo', () => {
     const user = userEvent.setup();
 
     await user.click(await screen.findByText('broken.md'));
-    const regenBtn = await screen.findByTitle('memoPanel.actions.regenerate');
+    const regenBtn = await screen.findByTitle('memoPanel:actions.regenerate');
     await user.click(regenBtn);
 
     expect(mockRegen).toHaveBeenCalledWith('broken.md');
@@ -465,14 +465,14 @@ describe('MemoPanel — edit + save', () => {
     // Wait for read to populate so the Edit button enables
     await screen.findByTestId('markdown-content');
 
-    await user.click(screen.getByTitle('memoPanel.actions.edit'));
+    await user.click(screen.getByTitle('memoPanel:actions.edit'));
 
     // textarea now visible — replace with new content
     const textarea = await screen.findByDisplayValue('old');
     await user.clear(textarea);
     await user.type(textarea, 'new!');
 
-    await user.click(screen.getByText('memoPanel.actions.save'));
+    await user.click(screen.getByText('memoPanel:actions.save'));
 
     await waitFor(() =>
       expect(mockWrite).toHaveBeenCalledWith('note.md', 'new!'),
@@ -496,7 +496,7 @@ describe('MemoPanel — drag-and-drop upload', () => {
     const { container } = renderWithProviders(<MemoPanel />);
 
     await waitFor(() =>
-      expect(screen.getByText('memoPanel.empty.title')).toBeInTheDocument(),
+      expect(screen.getByText('memoPanel:empty.title')).toBeInTheDocument(),
     );
 
     const dropTarget = container.firstChild as HTMLElement;
@@ -523,7 +523,7 @@ describe('MemoPanel — drag-and-drop upload', () => {
 
     const { container } = renderWithProviders(<MemoPanel />);
     await waitFor(() =>
-      expect(screen.getByText('memoPanel.empty.title')).toBeInTheDocument(),
+      expect(screen.getByText('memoPanel:empty.title')).toBeInTheDocument(),
     );
 
     const dropTarget = container.firstChild as HTMLElement;
@@ -539,7 +539,7 @@ describe('MemoPanel — drag-and-drop upload', () => {
     // DALTON-HOOK(multi-file-upload): rejections are collected per file and
     // surface as one summary strip naming the file and its reason.
     expect(
-      await screen.findByText('1 个文件上传失败：image.png (memoPanel.errors.unsupportedType)'),
+      await screen.findByText('1 个文件上传失败：image.png (memoPanel:errors.unsupportedType)'),
     ).toBeInTheDocument();
     expect(mockUpload).not.toHaveBeenCalled();
   });
@@ -560,7 +560,7 @@ describe('MemoPanel — multi-file upload', () => {
     const { container } = renderWithProviders(<MemoPanel />, { queryClient: client });
 
     await waitFor(() =>
-      expect(screen.getByText('memoPanel.empty.title')).toBeInTheDocument(),
+      expect(screen.getByText('memoPanel:empty.title')).toBeInTheDocument(),
     );
 
     const dropTarget = container.firstChild as HTMLElement;
@@ -579,7 +579,7 @@ describe('MemoPanel — multi-file upload', () => {
     // here also guarantees the batch has finished before the count is read.
     await waitFor(() => expect(invalidateSpy).toHaveBeenCalledTimes(1));
     // No failure summary when everything went up.
-    expect(screen.queryByText('memoPanel.errors.uploadFailedSummary')).not.toBeInTheDocument();
+    expect(screen.queryByText('memoPanel:errors.uploadFailedSummary')).not.toBeInTheDocument();
   });
 
   it('a rejected file does not stop the batch; failures are summarised per file', async () => {
@@ -594,7 +594,7 @@ describe('MemoPanel — multi-file upload', () => {
     const { container } = renderWithProviders(<MemoPanel />, { queryClient: client });
 
     await waitFor(() =>
-      expect(screen.getByText('memoPanel.empty.title')).toBeInTheDocument(),
+      expect(screen.getByText('memoPanel:empty.title')).toBeInTheDocument(),
     );
 
     const dropTarget = container.firstChild as HTMLElement;
@@ -637,7 +637,7 @@ describe('MemoPanel — multi-file upload', () => {
     const { container } = renderWithProviders(<MemoPanel />, { queryClient: client });
 
     await waitFor(() =>
-      expect(screen.getByText('memoPanel.empty.title')).toBeInTheDocument(),
+      expect(screen.getByText('memoPanel:empty.title')).toBeInTheDocument(),
     );
 
     const dropTarget = container.firstChild as HTMLElement;
@@ -672,7 +672,7 @@ describe('MemoPanel — multi-file upload', () => {
     const { container, unmount } = renderWithProviders(<MemoPanel />, { queryClient: client });
 
     await waitFor(() =>
-      expect(screen.getByText('memoPanel.empty.title')).toBeInTheDocument(),
+      expect(screen.getByText('memoPanel:empty.title')).toBeInTheDocument(),
     );
 
     const dropTarget = container.firstChild as HTMLElement;

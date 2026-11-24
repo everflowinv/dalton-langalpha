@@ -120,8 +120,8 @@ export function DaltonCosSharingCard({
     <DaltonSettingsCard
       id="dalton-cos-sharing"
       testId="dalton-cos-sharing-card"
-      title={t('settings.dalton.cosSharingLabel')}
-      description={t('settings.dalton.cosSharingDesc')}
+      title={t('settings:dalton.cosSharingLabel')}
+      description={t('settings:dalton.cosSharingDesc')}
       layout="rows"
       action={
         !isLoading && !error ? (

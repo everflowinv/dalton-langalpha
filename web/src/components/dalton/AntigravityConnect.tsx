@@ -99,7 +99,7 @@ export function AntigravityConnect({
           <div className="flex flex-wrap items-center gap-2">
             <Button type="button" onClick={start} disabled={!agreed || phase === 'starting'} aria-busy={phase === 'starting'} className="gap-1.5">
               {phase === 'starting' && <Loader size={14} className="text-current" />}
-              {phase === 'starting' ? t('setup.connecting') : t(`${ns}.start`)}
+              {phase === 'starting' ? t('setup:connecting') : t(`${ns}.start`)}
               {phase !== 'starting' && <ExternalLink className="h-4 w-4" />}
             </Button>
             {onCancel && (

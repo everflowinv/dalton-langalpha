@@ -17,7 +17,9 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langgraph.types import Command
 
+# DALTON-HOOK(computer-cli-tokens-off): pending_read is used by agent_output below.
 from ptc_agent.agent.limits import pending_read
+from src.llms.reasoning import DelegatedEffort
 from src.tools.secretary._commands import (
     HANDOFF_TOOL_NAME,
     InjectedToolCallId,
@@ -175,6 +177,7 @@ async def delegate_to_analyst(
     thread_id: str | None = None,
     report_back: bool = True,
     model: str | None = None,
+    effort: DelegatedEffort | None = None,
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> Command:
     """Hand work to a workspace's analyst, who does it there in the background unless the user declines.
@@ -194,6 +197,10 @@ async def delegate_to_analyst(
             later turns. Omitted, the turn runs the thread's own model, or the user's
             default on a new thread. A thread mid-turn takes it only into a turn already
             running that model, and otherwise refuses it until that turn ends.
+        effort: How much work the analyst puts into this turn, read as Task's effort
+            is. Omitted, the thread's own effort, else the user's setting. A level the
+            model lacks runs at the next one below, and the result says which. For this
+            turn only; a thread mid-turn refuses it until that turn ends.
 
     Returns:
         The analyst's thread, still running; its report_back field says whether a report-back is coming.
@@ -208,7 +215,7 @@ async def delegate_to_analyst(
         )
     return await dispatch(
         question, config, workspace_id, thread_id, report_back, tool_call_id,
-        preapproved=preapproved(state, tool_call_id), model=model,
+        preapproved=preapproved(state, tool_call_id), model=model, effort=effort,
     )
 
 
