@@ -15,11 +15,11 @@ description: "四维做空风险初筛：核查会计红旗 10 项、高管薪�
 
 1. **SEC Filing 是一手信源**：第 1–3 维核心财务与治理数字必须直接读 SEC filing 原文或结构化 XBRL/财报接口，不得凭记忆或二手摘要作结论。
 2. **数字必须溯源**：报告中的每个财务/薪酬数字必须注明出处（filing 类型 + 章节 + accession number，或工具来源与日期）。
-3. **每条发现附来源链接**：第 4 维（员工、投资者社区、负面新闻、技术口碑、Guidepoint）的**每一条发现都必须附上具体来源 URL**（员工评价页面链接、X 原帖 status URL、新闻文章 URL、SEC 8-K URL 等）或 Guidepoint 的 `source_attribution.markdown`。没有来源链接的条目不得写入报告。
+3. **每条发现附来源链接**：第 4 维（员工、投资者社区、负面新闻、技术口碑<!-- DALTON_CAP:guidepoint -->、Guidepoint<!-- /DALTON_CAP -->）的**每一条发现都必须附上具体来源 URL**（员工评价页面链接、X 原帖 status URL、新闻文章 URL、SEC 8-K URL 等）<!-- DALTON_CAP:guidepoint -->或 Guidepoint 的 `source_attribution.markdown`<!-- /DALTON_CAP -->。没有来源链接的条目不得写入报告。
 4. **边际变化比绝对值更重要**：重点跟踪最近 2–3 个报告期的会计指标、合同资产/负债与资本化趋势变化。
 5. **外国私人发行人适配**：使用 `20-F` 替代 `10-K`、`6-K` 替代 `10-Q`；无 `DEF 14A` 时，直接审阅 `20-F` 的 `Item 6.B`（Compensation）获取高管薪酬与激励条款。
 6. **诚实标注数据缺口**：拿不到的数据写「本轮未取得」并说明原因；通路受限或无覆盖的平台直接写「未覆盖」（例如 Reddit 当前无通路，报告里必须明确写明「Reddit 未覆盖」，严禁写成「查过没有」或尝试伪造 UA/代理/cookie 绕过）。
-7. **多源交叉验证**：社交与职场负面评价须多平台交叉印证；单一来源不足以下定论；`researchdata` 返回 `ok: false` 时按 `hint` 调整重试，仍失败则如实标注未取得。
+7. **多源交叉验证**：社交与职场负面评价须多平台交叉印证；单一来源不足以下定论<!-- DALTON_CAP:researchdata_bridge -->；`researchdata` 返回 `ok: false` 时按 `hint` 调整重试，仍失败则如实标注未取得<!-- /DALTON_CAP -->。
 
 ---
 
@@ -30,7 +30,7 @@ description: "四维做空风险初筛：核查会计红旗 10 项、高管薪�
 - **数据源**：美国本土公司读最新 `10-K`（近 2 期）+ `10-Q`（近 3 期）；外国私人发行人（如 BABA、PDD、JD、TCOM、BIDU）读 `20-F` + `6-K`。
 - **Dalton 取数调用**：
 
-```python
+<!-- DALTON_CAP:researchdata_bridge -->```python
 # 1. 检索监管申报列表（美股本土 10-K/10-Q；外国发行人改传 form="20-F" / form="6-K"）
 researchdata.finance(route="sec", operation="list-filings", ticker="{TICKER}", form="10-K", limit=2)
 researchdata.finance(route="sec", operation="list-filings", ticker="{TICKER}", form="10-Q", limit=3)
@@ -49,7 +49,13 @@ researchdata.finance(route="sec", operation="search-text", ticker="{TICKER}", fo
 
 # 5. 自然语言事实检索（替代旧 ask 路由）
 researchdata.finance(route="sec", operation="smart-facts", ticker="{TICKER}", query="contract assets and contract liabilities", limit=10)
-```
+```<!-- DALTON_CAP_ELSE -->```python
+# 1. 检索监管申报列表（美股本土 10-K/10-Q；外国发行人改传 forms="20-F,6-K"）
+dalton_sec.list_filings(ticker="{TICKER}", forms="10-K,10-Q", limit=10)
+
+# 2. 结构化三表与 XBRL 事实（附注与 MD&A 原文可按 accession 从 SEC EDGAR 下载核对）
+dalton_sec.get_company_facts(ticker="{TICKER}")
+```<!-- /DALTON_CAP -->
 
 - **10 项必查清单**（完整细则见 [`references/four-dimensions.md`](references/four-dimensions.md)）：
   1. 收入确认政策（激进确认、YoY 变更、合同资产 vs 合同负债剪刀差）
@@ -68,13 +74,17 @@ researchdata.finance(route="sec", operation="smart-facts", ticker="{TICKER}", qu
 - **数据源**：最新 Proxy Statement（`DEF 14A`）；**外国私人发行人无 `DEF 14A` 时改查 `20-F` 的 `Item 6.B`（Compensation）**。`DEF 14A` 篇幅较长时先用 `search-text` 定位 CD&A 与 Summary Compensation Table，禁止用 `WebFetch` 猜 SEC URL。
 - **Dalton 取数调用**：
 
-```python
+<!-- DALTON_CAP:researchdata_bridge -->```python
 researchdata.finance(route="sec", operation="list-filings", ticker="{TICKER}", form="DEF 14A", limit=2)
 researchdata.finance(route="sec", operation="search-text", ticker="{TICKER}", form="DEF 14A", query="Summary Compensation Table")
 researchdata.finance(route="sec", operation="search-text", ticker="{TICKER}", form="DEF 14A", query="threshold")
 # 外国发行人无 DEF 14A 时读 20-F（先取完整 Item 6，再在正文内定位 6.B Compensation 小节）：
 researchdata.finance(route="sec", operation="read-item", ticker="{TICKER}", form="20-F", item="6", params={"max_chars": 40000})
-```
+```<!-- DALTON_CAP_ELSE -->```python
+dalton_sec.list_filings(ticker="{TICKER}", forms="DEF 14A", limit=2)
+# 外国发行人无 DEF 14A 时读 20-F（定位 Item 6.B Compensation 小节）：
+dalton_sec.list_filings(ticker="{TICKER}", forms="20-F", limit=2)
+```<!-- /DALTON_CAP -->
 
 - **必查内容**：CEO/CFO 总薪酬结构及比例；短期/长期激励挂钩的**全部财务与经营 KPI、权重、考核周期、threshold / target / maximum 门槛及对应 payout 倍数、peer group 与 Non-GAAP 调整项具体定义**（不可概括）；红旗信号（过度挂钩收入、大额 discretionary bonus、宽泛 Non-GAAP、绝对股价替代相对 TSR、加速 vesting / golden parachute）；过去 3 年 realized pay 与股价对齐度及 Say-on-Pay 投票结果（详情见 [`references/four-dimensions.md`](references/four-dimensions.md)）。
 
@@ -83,17 +93,20 @@ researchdata.finance(route="sec", operation="read-item", ticker="{TICKER}", form
 - **数据源**：最近 2 份 Proxy Statement 董事/高管名单对比 + `8-K`（重点 Item 5.02）+ 两年新闻检索。
 - **Dalton 取数调用**：
 
-```python
+<!-- DALTON_CAP:researchdata_bridge -->```python
 researchdata.finance(route="sec", operation="eight-k", ticker="{TICKER}", limit=20)
 researchdata.finance(route="sec", operation="list-filings", ticker="{TICKER}", form="8-K", limit=20)
 web_search(query='"{COMPANY}" executive departure OR "CFO change" OR "board change"', start_date="<YYYY-MM-DD(两年前)>", end_date="<YYYY-MM-DD(今天)>")
-```
+```<!-- DALTON_CAP_ELSE -->```python
+dalton_sec.list_filings(ticker="{TICKER}", forms="8-K", limit=20)
+web_search(query='"{COMPANY}" executive departure OR "CFO change" OR "board change"', start_date="<YYYY-MM-DD(两年前)>", end_date="<YYYY-MM-DD(今天)>")
+```<!-- /DALTON_CAP -->
 
 - **必查内容**：高管离任/新任清单（CFO、Chief Accounting Officer / Controller 变更为重大红旗）；董事会独立董事比例、审计委员会变更、激进投资人（activist investor）进入董事会；离职理由模式（如模糊的 "spend more time with family"、短期密集离职、新任高管集中来自同一关联背景）。
 
 ### 维度 4：社交媒体、员工、产品口碑与专家信号
 
-- **数据源与 Dalton 路由（付费源默认关闭，不绕过未覆盖平台）**：
+<!-- DALTON_CAP:researchdata_bridge -->- **数据源与 Dalton 路由（付费源默认关闭，不绕过未覆盖平台）**：
 
 | 来源 | Dalton 调用 | 关键规则 |
 |---|---|---|
@@ -103,7 +116,16 @@ web_search(query='"{COMPANY}" executive departure OR "CFO change" OR "board chan
 | 投资者社区（StockTwits / HN / YouTube / 新闻） | `researchdata.community(route="last30days", operation="search", query="{COMPANY} {TICKER}", days=30, quick=True)` | 仅作近 30 天社区情绪与焦点证据 |
 | Reddit | **当前无通路** | 报告中**必须明写「Reddit 未覆盖」**，严禁伪造 UA/代理/cookie/RSS |
 | 新闻 / 监管 / 诉讼 / 做空报告 | `web_search(query='"{COMPANY}" ("SEC investigation" OR restatement OR whistleblower OR "auditor resigned" OR "short report")', start_date="<两年前>", end_date="<今天>")`<br>需要读报告或公告全文时调用 `WebFetch(url="<具体URL>", prompt="提取核心指控、诉讼进展或薪酬评价")` | 必须核对结果发布日期；所有 URL 均须来自搜索或工具返回 |
-| Guidepoint 专家访谈 | `researchdata.research(route="guidepoint", operation="search_library", query="{COMPANY} competitive position customer churn management execution", limit=8, params={"keywords": ["{TICKER}"]})` | 重点查客户流失/砍单、渠道压货、管理层与财务文化、份额变化；verbatim 引文 ≤20 词并附 `source_attribution.markdown`；无结果时放宽到行业/竞品查 1 次，仍无则写「Guidepoint 无覆盖」 |
+| Guidepoint 专家访谈 | `researchdata.research(route="guidepoint", operation="search_library", query="{COMPANY} competitive position customer churn management execution", limit=8, params={"keywords": ["{TICKER}"]})` | 重点查客户流失/砍单、渠道压货、管理层与财务文化、份额变化；verbatim 引文 ≤20 词并附 `source_attribution.markdown`；无结果时放宽到行业/竞品查 1 次，仍无则写「Guidepoint 无覆盖」 |<!-- DALTON_CAP_ELSE -->- **数据源与检索方式（不绕过未覆盖平台）**：
+
+| 来源 | 检索调用 | 关键规则 |
+|---|---|---|
+| 员工口碑（Blind / Glassdoor / PayScale / Levels.fyi / WARN） | `web_search(query='"{COMPANY}" (Blind OR Glassdoor OR PayScale OR Levels.fyi OR WARN layoffs)', start_date="<两年前>", end_date="<今天>")`<br>需要读公开页面时调用 `WebFetch` | 记录公开可见评分、裁员记录与高频投诉词，每条附来源 URL |
+| X / Twitter | `x_search(query='"{COMPANY}" (fraud OR short OR "red flag")', from_date="<两年前>", to_date="<今天>")`<br>辅以 `web_search(query='"{COMPANY}" (fraud OR short OR "red flag") site:x.com', start_date="<两年前>", end_date="<今天>")` | 按原帖 status URL 去重，记录发布时间 |
+| 投资者社区（StockTwits / HN / YouTube / 垂直论坛） | `web_search(query='"{COMPANY}" "{TICKER}" (StockTwits OR "Hacker News" OR "short thesis")', start_date="<近30天>", end_date="<今天>")` | 仅作近 30 天社区情绪与焦点证据 |
+| Reddit | **当前无通路** | 报告中**必须明写「Reddit 未覆盖」**，严禁伪造 UA/代理/cookie/RSS |
+| 新闻 / 监管 / 诉讼 / 做空报告 | `web_search(query='"{COMPANY}" ("SEC investigation" OR restatement OR whistleblower OR "auditor resigned" OR "short report")', start_date="<两年前>", end_date="<今天>")`<br>需要读报告或公告全文时调用 `WebFetch(url="<具体URL>", prompt="提取核心指控、诉讼进展或薪酬评价")` | 必须核对结果发布日期；所有 URL 均须来自搜索或工具返回 |
+| 产业链与一线公开访谈 | `web_search(query='"{COMPANY}" (customer churn OR channel inventory OR former executive interview OR supply chain)', start_date="<两年前>", end_date="<今天>")` + `WebFetch` | 重点查客户流失/砍单、渠道压货、管理层与财务文化、份额变化；每条附来源 URL，无结果则写「公开一线访谈无覆盖」 |<!-- /DALTON_CAP -->
 
 ---
 
@@ -123,5 +145,5 @@ web_search(query='"{COMPANY}" executive departure OR "CFO change" OR "board chan
 ## 输出规范与保存位置
 
 1. **输出位置**：按 `dalton-financial-lenses`、`dalton-full-coverage`、`dalton-filing-review` 等研究类 skill 惯例，完整 Markdown 报告保存至当前工作区 `drafts/<YYYY-MM-DD>-<TICKER>-short-screen.md`（例如 `drafts/2026-11-15-BR-short-screen.md`）。
-2. **报告结构**：严格按 [`references/output-template.md`](references/output-template.md) 组织（核心判断 + 一至四维 + 做空数据概况 + 五、风险信号汇总表 + 资料来源及未覆盖声明）。
-3. **飞书文档**：默认只保存在工作区；**仅当用户在本次对话明确要求输出飞书文档时**，调用 `feishu_create_doc(title="{COMPANY}（{TICKER}）做空风险初筛（YYYY-MM-DD）", markdown=...)` 创建飞书文档并返回链接。
+2. **报告结构**：严格按 [`references/output-template.md`](references/output-template.md) 组织（核心判断 + 一至四维 + 做空数据概况 + 五、风险信号汇总表 + 资料来源及未覆盖声明）。<!-- DALTON_CAP:feishu_docs -->
+3. **飞书文档**：默认只保存在工作区；**仅当用户在本次对话明确要求输出飞书文档时**，调用 `feishu_create_doc(title="{COMPANY}（{TICKER}）做空风险初筛（YYYY-MM-DD）", markdown=...)` 创建飞书文档并返回链接。<!-- /DALTON_CAP -->

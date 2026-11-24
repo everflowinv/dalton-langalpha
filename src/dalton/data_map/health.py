@@ -1302,8 +1302,8 @@ def _parse_iso_utc(raw: Any) -> datetime | None:
         return None
 
 
-async def _has_recent_health_check_within_24h(*, conn: Any = None) -> bool:
-    """Return True if a data-source health check or daily data map cache was recorded within the last 24 hours."""
+async def _has_today_scoped_cache(*, conn: Any = None) -> bool:
+    """Return True if today's scoped data map cache exists for the active capability fingerprint."""
     now_utc = datetime.now(UTC)
     cutoff = now_utc - timedelta(hours=24)
     target_date = today_cache_date()
@@ -1313,7 +1313,13 @@ async def _has_recent_health_check_within_24h(*, conn: Any = None) -> bool:
         updated_dt = _parse_iso_utc(existing.get("updated_at"))
         if updated_dt is None or updated_dt >= cutoff:
             return True
+    return False
 
+
+async def _has_recent_source_health_within_24h(*, conn: Any = None) -> bool:
+    """Return True if any persisted data-source health probe row was checked within the last 24 hours."""
+    now_utc = datetime.now(UTC)
+    cutoff = now_utc - timedelta(hours=24)
     health_rows = await db_data_map.fetch_all_source_health(conn=conn)
     for row in (health_rows or {}).values():
         if not isinstance(row, Mapping):
@@ -1322,6 +1328,23 @@ async def _has_recent_health_check_within_24h(*, conn: Any = None) -> bool:
         if checked_dt is not None and checked_dt >= cutoff:
             return True
     return False
+
+
+async def _has_recent_health_check_within_24h(*, conn: Any = None) -> bool:
+    """Return True if today's capability-scoped data map cache is already populated."""
+    return await _has_today_scoped_cache(conn=conn)
+
+
+async def _load_saved_route_metadata(
+    *, conn: Any = None
+) -> tuple[list[dict[str, Any]] | None, set[str] | None]:
+    """Load persisted ``catalog_routes`` / ``handoff_routes`` for startup cache backfill."""
+    try:
+        return await db_data_map.get_latest_cached_route_metadata(conn=conn)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        return None, None
 
 
 async def _is_data_health_paused_by_user(*, conn: Any = None) -> bool:
@@ -1411,6 +1434,37 @@ async def run_startup_health_check_once(
                 "data_map": None,
             }
         if is_paused:
+            # Even when scheduled probing is paused, backfill today's scoped cache row from
+            # already-persisted recent health rows (e.g. immediately after d046 upgrade) without
+            # probing external data sources.
+            try:
+                if not await _has_today_scoped_cache() and await _has_recent_source_health_within_24h():
+                    saved_catalog, saved_handoff = await _load_saved_route_metadata()
+                    refreshed = await refresh_daily_data_map(
+                        cache_date=today_cache_date(),
+                        catalog_routes=saved_catalog,
+                        handoff_routes=saved_handoff,
+                    )
+                    logger.info(
+                        "[DaltonDataMap] Backfilled today's scoped data map cache from existing health rows while paused"
+                    )
+                    return {
+                        "ok": True,
+                        "skipped": "paused_by_user",
+                        "backfilled": True,
+                        "checked_count": 0,
+                        "available_count": 0,
+                        "unavailable_count": 0,
+                        "results": [],
+                        "data_map": refreshed,
+                    }
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[DaltonDataMap] Startup scoped cache backfill while paused failed (%s)",
+                    type(exc).__name__,
+                )
             logger.info(
                 "[DaltonDataMap] Startup data source health check skipped (paused_by_user)"
             )
@@ -1424,7 +1478,7 @@ async def run_startup_health_check_once(
                 "data_map": None,
             }
         try:
-            has_recent = await _has_recent_health_check_within_24h()
+            has_scoped_cache = await _has_today_scoped_cache()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1441,7 +1495,7 @@ async def run_startup_health_check_once(
                 "results": [],
                 "data_map": None,
             }
-        if has_recent:
+        if has_scoped_cache:
             logger.info(
                 "[DaltonDataMap] Startup data source health check skipped (already_cached)"
             )
@@ -1453,6 +1507,36 @@ async def run_startup_health_check_once(
                 "unavailable_count": 0,
                 "results": [],
                 "data_map": None,
+            }
+        try:
+            has_recent_health = await _has_recent_source_health_within_24h()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[DaltonDataMap] Startup health row lookup failed (%s); falling back to full check",
+                type(exc).__name__,
+            )
+            has_recent_health = False
+        if has_recent_health:
+            saved_catalog, saved_handoff = await _load_saved_route_metadata()
+            refreshed = await refresh_daily_data_map(
+                cache_date=today_cache_date(),
+                catalog_routes=saved_catalog,
+                handoff_routes=saved_handoff,
+            )
+            logger.info(
+                "[DaltonDataMap] Backfilled today's scoped data map cache from existing health rows without re-probing"
+            )
+            return {
+                "ok": True,
+                "skipped": "backfilled_from_health",
+                "backfilled": True,
+                "checked_count": 0,
+                "available_count": 0,
+                "unavailable_count": 0,
+                "results": [],
+                "data_map": refreshed,
             }
         summary = await run_all_health_checks(
             persist=True,

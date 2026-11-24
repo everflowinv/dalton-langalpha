@@ -330,17 +330,20 @@ async def _compute_skills_module(
                     files = {k: v for k, v in files.items() if not k.startswith(prefix)}
                 seen_skill_names.add(skill_name)
 
+                # DALTON-HOOK(standalone-core): hash capability-assembled skill file bytes
+                from src.dalton.content_assembly import read_assembled_text, sha256_assembled_file
+
                 for fp in skill_dir.rglob("*"):
                     if not fp.is_file():
                         continue
                     if "__pycache__" in fp.parts or fp.name == "LICENSE.txt":
                         continue
                     rel = f"{skill_name}/{fp.relative_to(skill_dir)}"
-                    files[rel] = _sha256_file(fp)
+                    files[rel] = sha256_assembled_file(fp)
 
                 # Parse SKILL.md frontmatter
                 try:
-                    content = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+                    content = read_assembled_text(skill_dir / "SKILL.md")
                 except (OSError, UnicodeDecodeError):
                     continue
                 sandbox_path = f"{skills_base}/{skill_name}/SKILL.md"
@@ -353,7 +356,7 @@ async def _compute_skills_module(
                     build_lock_entry,
                 )
 
-                content_hash = f"sha256:{_sha256_file(skill_dir / 'SKILL.md')}"
+                content_hash = f"sha256:{sha256_assembled_file(skill_dir / 'SKILL.md')}"
                 if is_managed_root:
                     lock_entry = build_lock_entry(
                         meta,
@@ -1020,6 +1023,7 @@ async def sync_sandbox_assets(
 
         refreshed: list[str] = []
         skill_collisions: set[str] = set()
+        skill_prune_failures: set[str] = set()  # DALTON-HOOK(standalone-core)
 
         # 4. Upload changed modules
         # Intent-based ordering: tool_modules after mcp_servers (derived from
@@ -1036,9 +1040,11 @@ async def sync_sandbox_assets(
             # Download existing lock file once (shared by prune + upload)
             existing_lock = await sandbox._download_skills_lock()
 
-            await sandbox._prune_remote_skills(
+            failed_prunes = await sandbox._prune_remote_skills(
                 local_skill_names, existing_lock=existing_lock
             )
+            if failed_prunes:
+                skill_prune_failures.update(failed_prunes)
             skills_mod = local_manifest["modules"].get("skills", {})
             if skills_mod.get("files"):
                 merged_lock, collisions = await sandbox._upload_skills(
@@ -1046,6 +1052,7 @@ async def sync_sandbox_assets(
                     manifest=skills_mod,  # type: ignore[arg-type]
                     existing_lock=existing_lock,
                     disabled=disabled_skills,
+                    failed_prunes=failed_prunes,
                 )
                 skill_collisions.update(collisions)
                 # Build complete skills cache from merged lock data
@@ -1149,14 +1156,19 @@ async def sync_sandbox_assets(
         # names into the written version so the next sync's freshly computed
         # version (which never carries `collisions`) differs and retries.
         # Converges once the colliding agent-installed skill is removed.
-        if skill_collisions:
+        if skill_collisions or skill_prune_failures:  # DALTON-HOOK(standalone-core)
             mod = local_manifest["modules"]["skills"]
-            collision_key = ",".join(sorted(skill_collisions))
-            mod["collisions"] = sorted(skill_collisions)
-            mod["base_version"] = mod["version"]
-            mod["version"] = hashlib.sha256(
-                f"{mod['version']}|collisions:{collision_key}".encode()
-            ).hexdigest()
+            mod.setdefault("base_version", mod["version"])
+            stamp_parts: list[str] = [mod["version"]]
+            if skill_collisions:
+                collision_key = ",".join(sorted(skill_collisions))
+                mod["collisions"] = sorted(skill_collisions)
+                stamp_parts.append(f"collisions:{collision_key}")
+            if skill_prune_failures:
+                prune_key = ",".join(sorted(skill_prune_failures))
+                mod["prune_failures"] = sorted(skill_prune_failures)
+                stamp_parts.append(f"prune_failures:{prune_key}")
+            mod["version"] = hashlib.sha256("|".join(stamp_parts).encode()).hexdigest()
 
         # Steps 5+6: independent — parallelize
         await asyncio.gather(
@@ -1402,26 +1414,29 @@ async def _prune_remote_skills(
     local_skill_names: set[str],
     *,
     existing_lock: dict[str, Any] | None = None,
-) -> None:
+) -> set[str]:
     """Prune stale server-authoritative skills, protecting agent-installed ones.
 
     Safe default: if lock is unavailable or a skill has no lock entry,
     it is preserved to prevent data loss on transient failures.
+
+    Returns the set of skill names whose removal failed so the caller can
+    retain retry state in the manifest (DALTON-HOOK(standalone-core)).
     """
     from ptc_agent.agent.middleware.skills.lock import is_agent_installed, is_linked
 
     if existing_lock is None:
         # Every entry would be preserved below, so the listing buys nothing;
-        # on a new sandbox this is the usual case.
-        return
+        # on a new sandbox or unreadable lock we never guess ownership by name.
+        return set()
     assert sandbox.runtime is not None
     runtime = sandbox.runtime
     skills_base = sandbox.layout.skills
     entries = await sandbox.als_directory(skills_base)
     if not entries:
-        return
+        return set()
 
-    paths_to_remove: list[str] = []
+    targets: list[tuple[str, str]] = []
     for entry in entries:
         name = entry.get("name")
         if not name:
@@ -1447,24 +1462,49 @@ async def _prune_remote_skills(
             continue
         # Platform or server-managed skill no longer in local set — stale
         # (deleted or disabled server-side), prune it
-        paths_to_remove.append(entry["path"])
+        targets.append((name, entry["path"]))
 
-    if not paths_to_remove:
-        return
+    if not targets:
+        return set()
 
-    async def remove_one(path: str) -> None:
-        await sandbox._runtime_call(
-            runtime.exec,
-            f"rm -rf {shlex.quote(path)}",
-            retry_policy=RetryPolicy.SAFE,
+    failed: set[str] = set()
+
+    async def remove_one(skill_name: str, path: str) -> None:
+        try:
+            res = await sandbox._runtime_call(
+                runtime.exec,
+                f"rm -rf {shlex.quote(path)}",
+                retry_policy=RetryPolicy.SAFE,
+            )
+        except Exception as exc:
+            failed.add(skill_name)
+            logger.warning(
+                "Failed to prune stale platform skill from sandbox",
+                skill=skill_name,
+                path=path,
+                error=str(exc),
+            )
+            return
+        exit_code = getattr(res, "exit_code", None)
+        if exit_code != 0:
+            failed.add(skill_name)
+            logger.warning(
+                "Stale platform skill removal exited non-zero",
+                skill=skill_name,
+                path=path,
+                exit_code=exit_code,
+                stderr=getattr(res, "stderr", ""),
+            )
+
+    await asyncio.gather(*[remove_one(name, path) for name, path in targets])
+    removed = len(targets) - len(failed)
+    if removed:
+        logger.info(
+            "Pruned stale platform skills from sandbox",
+            removed=removed,
+            sandbox_root=skills_base,
         )
-
-    await asyncio.gather(*[remove_one(path) for path in paths_to_remove])
-    logger.info(
-        "Pruned stale platform skills from sandbox",
-        removed=len(paths_to_remove),
-        sandbox_root=skills_base,
-    )
+    return failed
 
 
 async def _upload_skills(
@@ -1474,6 +1514,7 @@ async def _upload_skills(
     manifest: dict[str, Any] | None = None,
     existing_lock: dict[str, Any] | None = None,
     disabled: frozenset[str] = frozenset(),
+    failed_prunes: set[str] | frozenset[str] = frozenset(),  # DALTON-HOOK(standalone-core)
 ) -> tuple[dict[str, Any] | None, set[str]]:
     """Upload skill files from local filesystem to sandbox.
 
@@ -1624,6 +1665,16 @@ async def _upload_skills(
         lock_entry = skill_meta.get("lock_entry")
         if lock_entry:
             platform_entries[skill_name] = lock_entry
+    # DALTON-HOOK(standalone-core): keep platform ownership records for any
+    # disabled skill whose prune failed so the next sync still recognizes and
+    # retries removing it instead of losing its lock entry on install.
+    if failed_prunes and existing_lock:
+        for failed_name in failed_prunes:
+            if failed_name in platform_entries or failed_name in collisions:
+                continue
+            prev_entry = existing_lock.get(failed_name)
+            if isinstance(prev_entry, dict) and not _held_by_another(existing_lock, failed_name):
+                platform_entries[failed_name] = prev_entry
 
     # ── Pass 2: Execute (minimal sandbox I/O) ──
     # Stage, then swap. A workspace link pass, on any worker, prunes every
@@ -1646,10 +1697,13 @@ async def _upload_skills(
         for name, plan in final_skills.items():
             staged_dirs.add(f"{staging}/{name}")
             staged_dirs.update(f"{staging}/{name}/{d}" for d in plan.subdirs)
+        # DALTON-HOOK(standalone-core): upload capability-assembled skill bytes into sandbox
+        from src.dalton.content_assembly import assemble_file_bytes
+
         await upload_tree(
             sandbox,
             [
-                (fp, f"{staging}/{name}/{rel}")
+                (assemble_file_bytes(fp), f"{staging}/{name}/{rel}")
                 for name, plan in final_skills.items()
                 for fp, rel in plan.files
             ],

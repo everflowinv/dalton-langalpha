@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { api } from '@/api/client';
 import { isDaltonAuth } from '@/config/daltonAuth';
+import type { CapabilityId } from '@/hooks/useCapabilities';
 import { queryKeys } from '@/lib/queryKeys';
 import { SettingRow } from '@/pages/Settings/components/SettingsLayout';
 import { ToggleSwitch } from '@/components/ui/switch';
@@ -23,6 +24,8 @@ export interface DaltonSettingVisibilityContext {
   coverageUnitsEnabled?: boolean;
   coverageUnitsPending?: boolean;
   discordChannelsAdmin?: boolean;
+  capabilities?: ReadonlySet<CapabilityId>;
+  capabilitiesLoading?: boolean;
 }
 
 export interface UserSharingSettingsResponse {

@@ -209,6 +209,16 @@ def test_everflow_profile_manifest_and_prompts_parity(
         update=update,
     )
     _assert_or_update_text(
+        SNAPSHOT_ROOT / "langalpha_doc_assembled.txt",
+        captured["langalpha_doc_assembled"],
+        update=update,
+    )
+    _assert_or_update_text(
+        SNAPSHOT_ROOT / "dalton_evidence_body.md",
+        captured["dalton_evidence_body"],
+        update=update,
+    )
+    _assert_or_update_text(
         SNAPSHOT_ROOT / "workflows_6_fulltext.txt",
         captured["workflows_6_fulltext"],
         update=update,

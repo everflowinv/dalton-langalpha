@@ -322,7 +322,9 @@ SCAN_OUTPUT="$STAGE_DIR/scan_report.txt"
     else
       count="$(printf '%s\n' "$hits" | wc -l | tr -d ' ')"
       echo "Total matches: ${count}"
-      printf '%s\n' "$hits" | sed "s|${EXPORT_ROOT}/||g" | head -n 40
+      # sed stops after 40 lines itself; `| head` would close the pipe early and
+      # fail the export under pipefail (SIGPIPE) once there are many hits.
+      printf '%s\n' "$hits" | sed -n "1,40{s|${EXPORT_ROOT}/||g;p;}"
       if [[ "$count" -gt 40 ]]; then
         echo "... ($((count - 40)) more lines truncated)"
       fi

@@ -10,15 +10,15 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 目标与唤醒机制
 
-每日对覆盖公司收一次“增量包”（一致预期快照与修正、六个内部研究来源 `company-wiki` / `guidepoint` / `funda-ai` / `sales-notes` / `tmtb` / `alphaengine`、新 SEC filing、新闻与 X），判断相对现有知识层是否存在**重要变化（material change）**：
-- **零成本预检与 `<dalton_wake>`**：盘中 `watch` 自动任务不再查内部研究库（只查 `sec`、`cnhk`、`agenda`、`earnings` 四个需要及时发现的探针）；六个内部研究来源全部由每日的 `dalton-thesis-delta`（`collect.py`）统一扫一次。预检另有计划唤醒探针 `schedule` 与价格异动探针 `price`；无任何信号的轮次记 `skip`、花费为 0、不建线程。每日 cron（`dalton-<t>-delta.json`，北京时间 11:00；Core 周二至周六，Watch 周六）唤醒后线程首条上下文包含 `<dalton_wake>`（内含信号 `id`、`kind` 及详情）。
-- **无重要变化不打扰 PM**：被唤醒后，若所有来源均取数成功（`ok: true`）且经判定不属于重要变化（`material=no`），只记一条 `NO_CHANGE` 结论并调用 `commit --material no` 更新 `seen.json`，**绝不向 PM 推送消息**。
+每日对覆盖公司收一次“增量包”（一致预期快照与修正<!-- DALTON_CAP:researchdata_bridge -->、六个内部研究来源 `company-wiki` / `guidepoint` / `funda-ai` / `sales-notes` / `tmtb` / `alphaengine`<!-- /DALTON_CAP -->、新 SEC filing、新闻与 X），判断相对现有知识层是否存在**重要变化（material change）**：
+- **零成本预检与 `<dalton_wake>`**：<!-- DALTON_CAP:researchdata_bridge -->盘中 `watch` 自动任务不再查内部研究库（只查 `sec`、`cnhk`、`agenda`、`earnings` 四个需要及时发现的探针）；六个内部研究来源全部由每日的 `dalton-thesis-delta`（`collect.py`）统一扫一次。<!-- DALTON_CAP_ELSE -->盘中 `watch` 自动任务负责实时监测 `sec`、`agenda`、`earnings` 等即时探针，每日的 `dalton-thesis-delta` 直接通过公开数据源工具汇总最新公告、公开新闻、社交媒体与行情变化。<!-- /DALTON_CAP -->预检另有计划唤醒探针 `schedule` 与价格异动探针 `price`；无任何信号的轮次记 `skip`、花费为 0、不建线程。每日 cron（`dalton-<t>-delta.json`，北京时间 11:00；Core 周二至周六，Watch 周六）唤醒后线程首条上下文包含 `<dalton_wake>`（内含信号 `id`、`kind` 及详情）。
+- **无重要变化不打扰 PM**：被唤醒后，若所有来源均取数成功<!-- DALTON_CAP:researchdata_bridge -->（`ok: true`）<!-- /DALTON_CAP -->且经判定不属于重要变化（`material=no`），只记一条 `NO_CHANGE` 结论<!-- DALTON_CAP:researchdata_bridge -->并调用 `commit --material no` 更新 `seen.json`<!-- /DALTON_CAP -->，**绝不向 PM 推送消息**。
 
 ---
 
 ## 四步执行流程
 
-### 第 1 步：读取 `<dalton_wake>` 并运行 `collect.py` 补齐增量包
+### 第 1 步：读取 `<dalton_wake>` 并<!-- DALTON_CAP:researchdata_bridge -->运行 `collect.py` 补齐增量包<!-- DALTON_CAP_ELSE -->采集公开增量信息<!-- /DALTON_CAP -->
 
 1. 解析线程首条 `<dalton_wake>` 中的唤醒信号（记录信号 `id`、探针名 `probe` 与信号 `key`——唤醒块每行形如 `[P1][agenda] 摘要 (key=validation:V-001:2026-10-28, signal_id=…)`，后续将信号 `id` 写入 `verdict.trigger.ref`，并将探针名按下方对照表映射为 `verdict.schema.json` 允许的 `verdict.trigger.kind` 枚举值）：
 
@@ -35,7 +35,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 | `price` | `price_move` |
 | 手动触发（无 `<dalton_wake>`） | `manual` |
 
-2. 运行采集脚本生成完整增量包（同时把本轮一致预期快照写入工作区 `data/consensus/<YYYY-MM-DD_HHMM>.json`）：
+<!-- DALTON_CAP:researchdata_bridge -->2. 运行采集脚本生成完整增量包（同时把本轮一致预期快照写入工作区 `data/consensus/<YYYY-MM-DD_HHMM>.json`）：
 
 ```bash
 python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
@@ -48,7 +48,7 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
 3. **快速短路分支（不读任何文档全文）**：
    - 检查 `collect.py` 返回的汇总 JSON 中的 `internal_status`、`failed_sources`、`all_sources_ok` 与 `short_circuit_eligible`：
    - **任何来源 `ok: false` 或标记为“未完成”（`incomplete: true` / `completed: false` / `has_more: true` / 状态为 `"partial"`，含 `company-wiki` 列表被截断或 `estimates` 一致预期失败/`partial`）都不能当成“没有新文档”**：当某个来源取数失败、列表被截断（如 `company-wiki` 提示有更多文档）、一致预期不全（`estimates` `error`/`partial`）或因翻满 5 页上限 / 预算中断而未扫完（`all_sources_ok == false` 或 `failed_sources` 非空）时，**严禁走“所有来源 0 新增 → 短路结束”的分支**；在本轮机器记录（`verdict` 与 `commit --summary`）里必须如实写明“`<来源> 本轮取数失败或未完成（原因）`”（给人读的增量笔记按统一缺口规则处理：会改变结论、确信度或行动的缺口在相关判断首次出现处用一句话写清影响，其余未取得的来源与失败原因只放进笔记文末 `## 附注`，同一缺口全文只说明一次，不在笔记正文与 `## 附注` 重复写两遍；向 PM 回复的简短摘要不单设 `## 附注`，仅在缺口影响结论或扫描完整度时用一句人话点明原因；均不贴工具报错原文，也不放进 `## 引用` 节），**绝不能写成“本轮无新文档”“没有新信息”或“无新增”**。
-   - **短路判断要求所有来源（含一致预期）都 `ok: true` 且完整扫完（无 `incomplete` / `partial`），而且都是 `0` 新增**：仅当 `all_sources_ok == true`（所有来源 `ok: true` 且 `incomplete != true`，`failed_sources` 为空）、`auto_flags` 为空，且新内部文档（`counts.internal` + `counts.alphaengine`）与新公告（`counts.sec`）均为 `0`（即 `short_circuit_eligible == true`）时：
+   - **短路判断要求所有来源（含一致预期）都 `ok: true` 且完整扫完（无 `incomplete` / `partial`），而且都是 `0` 新增**：仅当 `all_sources_ok == true`（所有来源 `ok: true` 且 `incomplete != true`，`failed_sources` 为空）、`auto_flags` 为空，且<!-- DALTON_CAP:alphaengine|researchdata_bridge -->新内部文档（`counts.internal` + `counts.alphaengine`）与<!-- /DALTON_CAP -->新公告（`counts.sec`）均为 `0`（即 `short_circuit_eligible == true`）时：
      1. **短路前必须核对价格与价带（不得跳过）**：采集提示没响不等于赔率没变——价格提示阈值（1 日 ±4% / 5 日 ±8%）和三情景价带是两回事，价格可以从 100 慢跌到 99，穿过已登记的 99.5 买点边界而全程不触发提示。**价格不在汇总 JSON 里**：先读汇总 JSON 的 `packet_json` 字段（指向 `research/tracker/<run_id>/packet.json`），打开该文件后读 `consensus.price.close`（最新收盘价）与 `consensus.price.as_of`（收盘日期），对照**上一版三情景价带**（先调用 `knowledge_read(doc="thesis")`，从返回的 `underwriting_summary` 赔率计算摘要中读取 `bear` / `base` / `bull` 三情景目标价格区间，并从 `content.house_view.entry_band` 读取买点价带；若 `thesis` 中 `underwriting` 存在但读不到 `underwriting_summary`，或摘要标了“下面的数字不能写进正文”，一律按“没有价带基准”处理并在 `commit --summary` 与结论里如实写明原因；若旧档 `thesis` 尚未写入 `underwriting`，则回退取最近一份写了赔率卡段的报告正文：`drafts/` 下多空备忘 `*-bullbear.md`、覆盖 memo、财报深评，或 `research/*-stock-move.md` 的收尾三问，按修改时间取最近一份；Bear / Base / Bull 三档价格区间端点与事先登记的买点价带即基准）：
         - 最新收盘价**越过了任一价带端点**（跌破 Bear 下沿、涨穿 Base / Bull 上沿，或进入买点价带）时，**不得走短路分支**：改按分支 A 处理（`material=yes`），`payoff_assessment` 填 `{"changed": true, "reason": "price_crossed_band"}`，并照分支 A 写增量笔记（当 `underwriting_summary` 标明“基准股价是否过期：是”时，照样拿价带比较，但在增量笔记和回复摘要/推送里必须明确写明“基准股价已过期，需要重估”，严禁使用“现在可以行动”的措辞）；
         - 该工作区还没有任何带赔率卡的报告（或 `underwriting` 存在但读不到摘要／摘要标了“不能写进正文”，均归为无价带基准）、`consensus.price` 取数失败（`consensus.price.error`）、或收盘价未越过任何端点时，才继续短路，`payoff_assessment` 填 `{"changed": false, "reason": "none"}`；无基准或取数失败时在 `commit --summary` 里如实写明（如"无价带基准，未比较"），不得写成"已比较、未变"。
@@ -61,17 +61,25 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
           --summary "无新增"
         ```
      3. 调用 `knowledge_append_verdict` 写入一条 `NO_CHANGE`（`progress="none"`，`payoff_assessment` 按上一步核对结论填 `{"changed": false, "reason": "none"}`——穿过价带的情况已在上一步改走分支 A；`trigger.kind` 按上方对照表将 `<dalton_wake>` 探针名映射为合法枚举值，`trigger.ref` 填信号 id，`next_validation` 沿用当前最近待验证项）；
-     4. **立即结束本轮任务，不读取任何文档全文，也不推送 PM**。
+     4. **立即结束本轮任务，不读取任何文档全文，也不推送 PM**。<!-- DALTON_CAP_ELSE -->2. 直接使用公开工具收集本轮增量窗口内（上次 verdict 之后至当前）的最新公开信息，无需运行采集脚本：
+   - **最新报价与涨跌幅**：调用行情与日 K 线工具获取最新收盘价、1 日及 5 日涨跌幅；
+   - **法定公告**：美股调用 SEC 公告与 XBRL 报表工具检索新增 8-K / 10-Q / 10-K / 6-K / 20-F；港股与 A 股使用 `web_search` 检索披露易（`site:hkexnews.hk`）、巨潮资讯网与公司 IR 官网；
+   - **公开新闻与市场动态**：调用 `web_search` 与 X 社媒检索工具查验本轮窗口内的公开卖方评级/目标价调整、重要媒体报道与管理层发言。
+3. **快速短路检查**：
+   - 若任一公开来源取数失败或未完成，不得当成“无新增”，必须在 `verdict` 中如实写明缺失来源与原因；
+   - 若所有来源正常且无新增公告、无重大新闻/卖方评级变动、价格未触发单日 ≥4% 或 5 日 ≥8% 异动，则先调用 `knowledge_read(doc="thesis")` 核对最新收盘价是否越过 `underwriting_summary` 中的 `bear`/`base`/`bull` 价带端点或 `house_view.entry_band` 买点价带：
+     - 若越过任一价带端点，转入分支 A（`material=yes`，`payoff_assessment={"changed": true, "reason": "price_crossed_band"}`）；
+     - 若未越过（或尚无价带基准），调用 `knowledge_append_verdict` 写入一条 `NO_CHANGE`（`progress="none"`，`payoff_assessment={"changed": false, "reason": "none"}`），通过 `dalton_check_done` 后直接结束，不写增量笔记也不推送 PM。<!-- /DALTON_CAP -->
 
 ### 第 2 步：对照知识层与 `materiality.md` 判断是否重要
 
 当第 1 步未短路时：
 1. 按 `.agents/skills/dalton-knowledge/SKILL.md` 读序先读本工作区 `agent.md` 托管块、`thesis.md`、`debate.md`、`drivers.md`、`agenda.md` 及最近 `verdicts.md`。
-2. 读取 `research/tracker/<run_id>/packet.md` 及关联的新文档摘段/原文（若存在 `ok: false` 的来源或 packet 写明某来源**本轮未扫完**〔如 AlphaEngine 翻页预算用完，未扫完的日期下一轮从覆盖边界继续；单日因翻页预算用完被越过时，该日剩余文档只可能在之后的 3 天回看中再次查到〕，同步核实 `packet.md` / `internal_status` 中的原因并在机器记录 `verdict` 中如实登记，不得当作"本轮无新文档"或"没有新信息"；在给人读的增量笔记中，两类缺口均按影响只在一处说明——影响判断的已在相关判断首次出现处用一句话写清影响，就不再进笔记文末 `## 附注`；不影响判断的只写入笔记文末 `## 附注`）：
-   - 一致预期（`deltas`）里的 `*_vs_last_pct` 已按真实财报期间（`period_end`）与上一份快照对齐：`period_alignment` 标 `rolled`（期间滚动，如 0q 从 3Q26 滚到 4Q26）或 `no_period_info` 的期间**不是**预期修正，不得当作上修/下修证据；标 `matched` 且带 `prev_key` 的是同一真实期间跨快照的真修正。
-   - 内部库新文档（`company-wiki`、`guidepoint`、`funda-ai`、`sales-notes`、`tmtb`）：先读摘段，必要时通过 PTC `researchdata.research(..., operation="read", document=...)` 读全文（**Guidepoint 例外：只有 `search_library` 问答检索，没有全文读取**——`read` / `get_document` 均不存在，不要调用；检索到的问答正文已在增量包该访谈条目的 `qa` 字段里，且检索到的问答不等于完整访谈；`internal_status["guidepoint"]` 标注 `scope: "摘录检索，非全量"`，当 Guidepoint 返回 0 条结果时只能表述为“本轮检索未命中”，不得写“Guidepoint 无新增”）；
-   - AlphaEngine 新研报与机构会议纪要：先看摘要，挑带新数字（盈利预测修正、capex/费用、目标价/评级变化、核心 KPI 调查）的文档调用 `researchdata.research(route="alphaengine", operation="get_document", params={"doc_id": ..., "content_field": "auto", "offset": 0, "max_chars": 30000})` 读全文（每轮最多 3 篇；`doc_id` 必须原样传入完整字符串如 `"290001790954279_inst_134249"`，不得转整数或截断 `_inst_` 后缀；`content_field` 仅接受 `"auto"|"original_text"|"content"|"digest"|"digest_cn"|"main_point"|"question_answer"` 七个值——映射：摘要 → `digest`/`digest_cn`，要点 → `main_point`，问答 → `question_answer`，原文/转录 → `original_text`；当所选字段为空但返回 `warning` 与 `available_content_fields` 时，改读有字符数的合法字段如 `original_text`、`digest` 或 `question_answer`，同一分页序列必须固定同一 `content_field` 并按 `next_offset` 续读直到 `complete=true` 或 `next_offset` 为空、核对 `content_sha256`；遇配额或未登录即停并记录状态）；
-   - SEC / 港股与 A 股新公告：若当日 `dalton-filing-review` 或 `dalton-earnings-flash` 已经在 `verdicts.md` 写过同一份公告的结论，直接引用，不重复拆解；否则美股读取对应 SEC Item 或附件，港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 读取巨潮法定公告原文（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），并可调用 `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=20)` 辅助核查资金流、两融、回购或股东变动（平台财务表仅作初值，核心数字回公告核实）。
+2. <!-- DALTON_CAP:researchdata_bridge -->读取 `research/tracker/<run_id>/packet.md` 及关联的新文档摘段/原文（若存在 `ok: false` 的来源或 packet 写明某来源**本轮未扫完**<!-- DALTON_CAP:alphaengine -->〔如 AlphaEngine 翻页预算用完，未扫完的日期下一轮从覆盖边界继续；单日因翻页预算用完被越过时，该日剩余文档只可能在之后的 3 天回看中再次查到〕<!-- /DALTON_CAP -->，同步核实 `packet.md` / `internal_status` 中的原因并在机器记录 `verdict` 中如实登记，不得当作"本轮无新文档"或"没有新信息"；在给人读的增量笔记中，两类缺口均按影响只在一处说明——影响判断的已在相关判断首次出现处用一句话写清影响，就不再进笔记文末 `## 附注`；不影响判断的只写入笔记文末 `## 附注`）：
+   - 一致预期（`deltas`）里的 `*_vs_last_pct` 已按真实财报期间（`period_end`）与上一份快照对齐：`period_alignment` 标 `rolled`（期间滚动，如 0q 从 3Q26 滚到 4Q26）或 `no_period_info` 的期间**不是**预期修正，不得当作上修/下修证据；标 `matched` 且带 `prev_key` 的是同一真实期间跨快照的真修正。<!-- DALTON_CAP_ELSE -->逐项核查第 1 步获取的新公告、公开新闻、公开预期变化与行情数据（若任一来源取数失败，在 `verdict` 与笔记缺口说明中如实登记，不得当作“无新信息”）：<!-- /DALTON_CAP -->
+<!-- DALTON_CAP:researchdata_bridge -->   - 内部库新文档（`company-wiki`、`guidepoint`、`funda-ai`、`sales-notes`、`tmtb`）：先读摘段，必要时通过 PTC `researchdata.research(..., operation="read", document=...)` 读全文（**Guidepoint 例外：只有 `search_library` 问答检索，没有全文读取**——`read` / `get_document` 均不存在，不要调用；检索到的问答正文已在增量包该访谈条目的 `qa` 字段里，且检索到的问答不等于完整访谈；`internal_status["guidepoint"]` 标注 `scope: "摘录检索，非全量"`，当 Guidepoint 返回 0 条结果时只能表述为“本轮检索未命中”，不得写“Guidepoint 无新增”）；
+   - AlphaEngine 新研报与机构会议纪要：先看摘要，挑带新数字（盈利预测修正、capex/费用、目标价/评级变化、核心 KPI 调查）的文档调用 `researchdata.research(route="alphaengine", operation="get_document", params={"doc_id": ..., "content_field": "auto", "offset": 0, "max_chars": 30000})` 读全文（每轮最多 3 篇；`doc_id` 必须原样传入完整字符串如 `"290001790954279_inst_134249"`，不得转整数或截断 `_inst_` 后缀；`content_field` 仅接受 `"auto"|"original_text"|"content"|"digest"|"digest_cn"|"main_point"|"question_answer"` 七个值——映射：摘要 → `digest`/`digest_cn`，要点 → `main_point`，问答 → `question_answer`，原文/转录 → `original_text`；当所选字段为空但返回 `warning` 与 `available_content_fields` 时，改读有字符数的合法字段如 `original_text`、`digest` 或 `question_answer`，同一分页序列必须固定同一 `content_field` 并按 `next_offset` 续读直到 `complete=true` 或 `next_offset` 为空、核对 `content_sha256`；遇配额或未登录即停并记录状态）；<!-- DALTON_CAP_ELSE -->   - 公开新闻与卖方动态：结合 `web_search`、公开网页抓取与社交媒体检索核查本轮窗口内的公开卖方评级/目标价调整、行业深度报道与市场讨论，挑带新数字（盈利预测修正、capex/费用、目标价/评级变化、核心 KPI 调查）的关键报道读取全文；<!-- /DALTON_CAP -->
+   - SEC / 港股与 A 股新公告：若当日 `dalton-filing-review` 或 `dalton-earnings-flash` 已经在 `verdicts.md` 写过同一份公告的结论，直接引用，不重复拆解；否则美股读取对应 SEC Item 或附件，港股与 A 股<!-- DALTON_CAP:researchdata_bridge -->调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 读取巨潮法定公告原文（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），并可调用 `researchdata.finance(route="cn-hk", operation="ask", query=..., limit=20)` 辅助核查资金流、两融、回购或股东变动（平台财务表仅作初值，核心数字回公告核实）<!-- DALTON_CAP_ELSE -->通过 `web_search` 与公开网页读取检索港交所披露易 `site:hkexnews.hk`、巨潮资讯网及公司 IR 官网法定公告原文核实核心数字与回购/股东变动<!-- /DALTON_CAP -->。
 3. 严格按 `.agents/skills/dalton-thesis-delta/references/materiality.md` 的十条标准判定本轮是否为**重要变化（`material=yes`）**：
    - **重要（任一命中即 `material=yes`）**：
      1. 自动提示命中下一财年 EPS、下一财年/下一季收入或目标价均值变化阈值，且经核查非单纯口径噪音；
@@ -79,7 +87,7 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
      3. 公司事实变化：业绩、指引、8-K 重大事项、融资（股权/可转债/大额发债）、管理层新表态、金额重大的法律或监管事项或时间表变化；
      4. 某条 `debate` 的当前倾向或置信度发生改变，或浮现新分歧；
      5. 某个核心 KPI 越过 `data/thesis.json`（`thesis.md`）中的确认、警告或证伪阈值；
-     6. 买方持仓、拥挤度或 whisper 发生明显变化（来自 `sales-notes` 或 `tmtb`）；
+     6. 买方持仓、拥挤度或 whisper 发生明显变化<!-- DALTON_CAP:researchdata_bridge -->（来自 `sales-notes` 或 `tmtb`）<!-- DALTON_CAP_ELSE -->（来自主流公开机构点评或市场共识报道）<!-- /DALTON_CAP -->；
      7. 催化剂新增、改期或取消；
      8. 两个互不相关的专业 X 账号提出同一个新基本面论据，或 X 上的新数据点被第二个独立来源证实；
      9. 价格自动提示命中（单日 ≥4% 或 5 日 ≥8%）并找到基本面/事件原因（若价格触发任务已跑过 `/dalton-stock-move`，直接引用其结论，不重复归因）；
@@ -100,9 +108,9 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
 1. **只记结论**：调用 `knowledge_append_verdict` 写入一条 `NO_CHANGE`（`progress="none"`；`payoff_assessment`：若股价越过上一版三情景或买点价带填 `{"changed": true, "reason": "price_crossed_band"}`，若催化剂到期填 `{"changed": true, "reason": "catalyst_expired"}`，其余情况填 `{"changed": false, "reason": "none"}`；`trigger.kind` 按第 1 步对照表映射，`trigger.ref` 填唤醒信号 id）。
 2. **不写增量笔记，不推送 PM**。
 
-### 第 4 步：提交状态（`commit`）与关闭到期验证项
+### 第 4 步：<!-- DALTON_CAP:researchdata_bridge -->提交状态（`commit`）与<!-- /DALTON_CAP -->关闭到期验证项
 
-1. **必须执行 `commit`**（无论 `material=yes` 还是 `no`），把本轮所有新文档、公告和 X 帖子 id 记入 `research/tracker/seen.json`，更新 `last_run.json` 与 `updates.log`：
+<!-- DALTON_CAP:researchdata_bridge -->1. **必须执行 `commit`**（无论 `material=yes` 还是 `no`），把本轮所有新文档、公告和 X 帖子 id 记入 `research/tracker/seen.json`，更新 `last_run.json` 与 `updates.log`：
 
 ```bash
 python3 .agents/skills/dalton-thesis-delta/scripts/collect.py commit \
@@ -114,10 +122,12 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py commit \
 
 > **强约束**：`seen.json` 只在 `commit` 成功时更新；若 `collect` 或中途分析失败，绝不能提前把未审阅的文档标为已见，确保下一轮自动重取。
 
-2. **议程验证项闭环**：检查 `agenda.md` 中已到期或本轮已获解答的验证项（`V-...`），在第 3 步同一次 `knowledge_append_verdict` 调用的 `agenda_ops` 参数中将其关闭（`{"op":"set","path":"/next_validations/V-xxx/status","value":"done"}`），并把新的待验证事项入列。注意：verdict 的 `next_validation` 只写下一项要看什么，不会关闭任何验证项。
+2. <!-- DALTON_CAP_ELSE -->1. <!-- /DALTON_CAP -->**议程验证项闭环**：检查 `agenda.md` 中已到期或本轮已获解答的验证项（`V-...`），在第 3 步同一次 `knowledge_append_verdict` 调用的 `agenda_ops` 参数中将其关闭（`{"op":"set","path":"/next_validations/V-xxx/status","value":"done"}`），并把新的待验证事项入列。注意：verdict 的 `next_validation` 只写下一项要看什么，不会关闭任何验证项。
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
-- 第 4 步 `commit` 成功后（无论 `material=yes` 还是 `no`，含第 1 步的快速短路分支），结束本轮前调用 `dalton_check_done(workflow="dalton-thesis-delta", params={"ticker": ..., "as_of": "<本轮美东业务日 YYYY-MM-DD，与增量笔记文件名一致>"})`；若笔记文件名日期与 `as_of` 不同（如跨了美东零点），再加 `"delta_note": "<本轮实际写入的笔记路径>"` 显式指给契约。
+- <!-- DALTON_CAP:researchdata_bridge -->第 4 步 `commit` 成功后（无论 `material=yes` 还是 `no`，含第 1 步的快速短路分支），结束本轮前调用 `dalton_check_done(workflow="dalton-thesis-delta", params={"ticker": ..., "as_of": "<本轮美东业务日 YYYY-MM-DD，与增量笔记文件名一致>"})`；若笔记文件名日期与 `as_of` 不同（如跨了美东零点），再加 `"delta_note": "<本轮实际写入的笔记路径>"` 显式指给契约。
 - 契约按 `research/tracker/last_run.json` 判定：它须为本轮 `commit` 写入；`material=yes` 时还要求 `research/<本轮日期>-delta.md` 增量笔记（按本轮运行开始时间核对新近度；也接受本轮实际写入的同目录 `*-delta.md` 或 params 里显式给的 `delta_note` 路径），以及 `thesis`/`debate`/`drivers`/`management` 至少一份本轮 `knowledge_update` 新版本；`material=no` 时没有增量笔记是合法结果。两种情况都要求本轮 `verdict` 已写且带 `payoff_assessment`（契约只看本轮最新一条）。
-- `done=false` 时按 `missing` 先补齐再查（`commit` 未落盘就重跑 `commit`、增量笔记缺失就补写、`verdict` 未写或缺少 `payoff_assessment` 就按分支 A 第 3 点填法调用 `knowledge_append_verdict` **再追加一条**带 `payoff_assessment` 的 `verdict`、知识层缺本轮更新就 `knowledge_update`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
+- `done=false` 时按 `missing` 先补齐再查（`commit` 未落盘就重跑 `commit`、增量笔记缺失就补写、`verdict` 未写或缺少 `payoff_assessment` 就按分支 A 第 3 点填法调用 `knowledge_append_verdict` **再追加一条**带 `payoff_assessment` 的 `verdict`、知识层缺本轮更新就 `knowledge_update`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。<!-- DALTON_CAP_ELSE -->无论 `material=yes` 还是 `no`（含第 1 步的快速短路分支），结束本轮前调用 `dalton_check_done(workflow="dalton-thesis-delta", params={"ticker": ..., "as_of": "<本轮美东业务日 YYYY-MM-DD，与增量笔记文件名一致>"})`；若笔记文件名日期与 `as_of` 不同，再加 `"delta_note": "<本轮实际写入的笔记路径>"`。
+- 两种情况都要求本轮 `verdict` 已写且带 `payoff_assessment`；`material=yes` 时还应同步写入 `research/<本轮日期>-delta.md` 增量笔记并更新受影响的 `thesis`/`debate`/`drivers`/`management`。
+- `done=false` 时按 `missing` 先补齐再查；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。<!-- /DALTON_CAP -->

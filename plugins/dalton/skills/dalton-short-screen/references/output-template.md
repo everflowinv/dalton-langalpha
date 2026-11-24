@@ -55,12 +55,12 @@
 ---
 
 ## 四、员工、投资者与产品口碑
-<!-- 本节每条发现均须附带具体来源 URL（或 Guidepoint source_attribution）；无来源链接不得写入 -->
+<!-- 本节每条发现均须附带具体来源 URL<!-- DALTON_CAP:guidepoint -->（或 Guidepoint source_attribution）<!-- /DALTON_CAP -->；无来源链接不得写入 -->
 ### 4.1 员工口碑
 ### 4.2 投资者社区与做空机构报告（必须写明「Reddit 未覆盖」）
 ### 4.3 负面新闻、监管与诉讼
 ### 4.4 技术与产品口碑
-### 4.5 Guidepoint 专家访谈（无结果则写「Guidepoint 无覆盖」）
+### 4.5 <!-- DALTON_CAP:guidepoint -->Guidepoint 专家访谈（无结果则写「Guidepoint 无覆盖」）<!-- DALTON_CAP_ELSE -->产业链与一线公开访谈（无结果则写「公开一线访谈无覆盖」）<!-- /DALTON_CAP -->
 
 ---
 
@@ -84,6 +84,6 @@
 ## 资料来源与覆盖说明
 - **SEC Filings**：逐条列明 Form、报告期、提交日期与 Accession Number
 - **市场与做空数据**：标明接口与取数日期
-- **Web / 社区 / 专家来源**：逐条列明平台与具体 URL（或 Guidepoint `source_attribution`）
+- **Web / 社区 / 专家来源**：逐条列明平台与具体 URL<!-- DALTON_CAP:guidepoint -->（或 Guidepoint `source_attribution`）<!-- /DALTON_CAP -->
 - **未覆盖通路**：明确写明未覆盖平台（如 `Reddit 未覆盖`、付费招聘/评价源默认未开启等）
 ```

@@ -10,13 +10,13 @@ lastUpdated: 2026-11-22
 
 ## 内置投研技能体系
 
-Everflow（Dalton）在上游能力的基础上，建了一整套贴合中文投研习惯的技能，覆盖从背景调研、财报跟踪到核验发布的完整流程：
+{/* DALTON_DOC:everflow */}Everflow（Dalton）{/* DALTON_DOC_ELSE */}Dalton {/* /DALTON_DOC */}在上游能力的基础上，建了一整套贴合中文投研习惯的技能，覆盖从背景调研、财报跟踪到核验发布的完整流程：
 
 ### 核心研究与跟踪技能
 
 - **公司初始化与档案管理**：`/dalton-init-company` 用来建公司知识档案；`/dalton-company-background` 梳理公司背景；日常对话中可直接要求更新核心论点、多空争论和待验证议程。
 - **覆盖与深度报告**：
-  - `/initial-coverage`（首次覆盖）：多轮编排，并发拉取研报、专家纪要和财报，写出结构化的首次覆盖报告。
+  - `/initial-coverage`（首次覆盖）：多轮编排，并发拉取{/* DALTON_DOC:everflow */}研报、专家纪要和财报{/* DALTON_DOC_ELSE */}财报与公开市场资料{/* /DALTON_DOC */}，写出结构化的首次覆盖报告。
   - `/full-coverage`（完整覆盖）：更深入、覆盖面更全的完整流程。
   - `/topic-research`（主题研究）：做跨公司的专题研究。
   - `/weekly-review`（周度复盘）：做周度复盘总结。
@@ -34,8 +34,8 @@ Everflow（Dalton）在上游能力的基础上，建了一整套贴合中文投
   - `/dalton-filing-review`：重点公告深度拆解。
   - `/dalton-financial-lenses`：多维度财务透视分析。
   - `/dalton-director`（研究总监工作区）：扫描覆盖池待办事项，按紧急程度在当天预算内向各公司分析师派活。
-  - `/transcribe`（仅内部成员与管理员）：对工作区录音或音视频执行后台转写并整理成保真投研纪要。
-- **专题筛选与策略技能**：包括机构 13F 持仓追踪、期权偏度分析、做空筛选、BDC 分析等（在对话中直接描述需求即可触发）。
+{/* DALTON_DOC:everflow */}  - `/transcribe`（仅内部成员与管理员）：对工作区录音或音视频执行后台转写并整理成保真投研纪要。
+{/* /DALTON_DOC */}- **专题筛选与策略技能**：包括{/* DALTON_DOC:everflow */}机构 13F 持仓追踪、{/* /DALTON_DOC */}期权偏度分析、做空筛选、BDC 分析等（在对话中直接描述需求即可触发）。
 - **质量护栏与发布**：研究规范、中文文字审校（自动随报告与日常笔记收尾触发，也可在对话中直接要求审查）与 `/dalton-publish`（数据核验、审校与正式发布流程）。
 
 :::tip[不用死记指令名]
@@ -46,7 +46,7 @@ Everflow（Dalton）在上游能力的基础上，建了一整套贴合中文投
 
 点左侧主导航的 **插件（`/plugins`）**，可以看到现在有哪些可用数据源和扩展：
 
-- **内置核心投研数据插件**：聚合了卖方研报与会议库、专家访谈库、业绩电话会转写、公司 Wiki、销售纪要、TMT 总结、独立研究、SEC 公告与 XBRL 归一化财务事实、一致预期、港 A 股与宏观指标。
+- **内置核心投研数据插件**：聚合了{/* DALTON_DOC:everflow */}卖方研报与会议库、专家访谈库、业绩电话会转写、公司 Wiki、销售纪要、TMT 总结、独立研究、{/* DALTON_DOC_ELSE */}业绩电话会转写、{/* /DALTON_DOC */}SEC 公告与 XBRL 归一化财务事实、一致预期、港 A 股与宏观指标。
 - **实时行情服务**：提供美股、港股、A 股、指数，以及期权和宏观报价。
 - **批量检索并汇总**：面对高密度研究数据源时，助手会在沙箱里编写 Python 脚本，一次批量查数、对齐口径、去掉重复来源，再把精确结果汇总给你。
 
@@ -57,4 +57,4 @@ Everflow（Dalton）在上游能力的基础上，建了一整套贴合中文投
 ## 下一步
 
 - 分清什么时候用技能、什么时候看插件或数据源：阅读 [技能、插件还是数据源？](/help/compare/skill-plugin-or-mcp/)
-- 查看各数据源的详细用法和额度规则：阅读 [研究数据源](/help/everflow/research-data-sources/)
+- {/* DALTON_DOC:everflow */}查看各数据源的详细用法和额度规则：阅读 [研究数据源](/help/everflow/research-data-sources/){/* DALTON_DOC_ELSE */}查看沙箱执行环境与数据通道说明：阅读 [电脑与沙箱](/help/concepts/computers-and-sandboxes/){/* /DALTON_DOC */}

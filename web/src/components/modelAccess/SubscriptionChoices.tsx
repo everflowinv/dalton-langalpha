@@ -1,5 +1,8 @@
 import { useTranslation } from 'react-i18next';
 import { SUBSCRIPTIONS, type SubscriptionProvider } from '@/api/oauth';
+// DALTON-HOOK(standalone-core): gate subscription OAuth sign-in section only in Core builds when native_oauth_sync is disabled
+import { isCoreProfileBuild } from '@/config/brand';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { useOAuthStatus } from '@/hooks/useConfiguredProviders';
 import { CLAUDE_CODE, CLAUDE_CODE_CONNECTION, type ClaudeCodeChoice } from '@/lib/claudeCode';
 import { ProviderRow } from './KeyProviderPicker';
@@ -42,7 +45,12 @@ export function SubscriptionChoices({
   allowedSignIns?: ReadonlySet<string>;
 }) {
   const { t } = useTranslation();
-  const { data: claude, isError: claudeUnread } = useOAuthStatus('claude-oauth');
+  // DALTON-HOOK(standalone-core): hide all subscription OAuth sign-ins only in Core builds when native_oauth_sync is disabled
+  const { hasCapability } = useCapabilities();
+  const signInsEnabled = signIns && !(isCoreProfileBuild && !hasCapability('native_oauth_sync'));
+  const { data: claude, isError: claudeUnread } = useOAuthStatus('claude-oauth', {
+    enabled: signInsEnabled,
+  });
   const signInLifecycle = claude?.lifecycle ?? 'active';
   const offered = (provider: SubscriptionProvider) =>
     (!allowedSignIns || allowedSignIns.has(provider))
@@ -50,7 +58,7 @@ export function SubscriptionChoices({
       || (claudeSignIn && (configured.has(provider) || claudeUnread || (!!claude && claude.can_sign_in !== false))));
   return (
     <div className="flex flex-col gap-3">
-      {signIns && (
+      {signInsEnabled && (
       <section className="flex flex-col gap-1">
         <h4 className="px-3 text-xs font-medium" style={{ color: 'var(--color-text-tertiary)' }}>
           {t('modelAccess.signInPlans')}

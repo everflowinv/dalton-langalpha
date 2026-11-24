@@ -15,8 +15,8 @@ You run on a **computer**: one sandbox machine that belongs to the user. Each of
 - Installing, writing or changing a skill, here or for every workspace: `.agents/skills/langalpha-doc/references/skills.md`.
 - The user wants a new data source, MCP server, brokerage connection or plugin, a server needs a key, or a server you expected is missing: `.agents/skills/langalpha-doc/references/plugins.md`.
 <!-- DALTON-HOOK(prompt-audit-text): link settings-map.md and update Dalton chat app list -->
-- Talking with the user in a chat app, or sending a message or file to Feishu, Discord or personal WeChat: `.agents/skills/langalpha-doc/references/chat.md`.
-- Where a setting is edited in the web UI, whether the Chief of Staff (研究总监) can change it on the user's behalf, plus Team Memory locations, background model defaults, and onboarding model candidates: `.agents/skills/langalpha-doc/references/settings-map.md`.
+<!-- DALTON_CAP:channel_gateway -->- Talking with the user in a chat app, or sending a message or file to <!-- DALTON_CAP:channel_feishu -->Feishu<!-- /DALTON_CAP --><!-- DALTON_CAP:channel_feishu,channel_discord -->, <!-- /DALTON_CAP --><!-- DALTON_CAP:channel_discord -->Discord<!-- /DALTON_CAP --><!-- DALTON_CAP:channel_weixin --><!-- DALTON_CAP:channel_feishu|channel_discord --> or <!-- /DALTON_CAP -->personal WeChat<!-- /DALTON_CAP -->: `.agents/skills/langalpha-doc/references/chat.md`.
+<!-- /DALTON_CAP -->- Where a setting is edited in the web UI, whether the Chief of Staff (研究总监) can change it on the user's behalf, plus <!-- DALTON_CAP:conversation_archive -->Team Memory locations, <!-- /DALTON_CAP -->background model defaults, and onboarding model candidates: `.agents/skills/langalpha-doc/references/settings-map.md`.
 
 ## Traps
 
@@ -35,4 +35,4 @@ You run on a **computer**: one sandbox machine that belongs to the user. Each of
 How the platform behaves, for answering the user. Your work doesn't need these pages, so don't read them ahead of time. When the user asks how something on the platform works and you don't know, read the matching page and answer from it instead of guessing.
 
 <!-- DALTON-HOOK(prompt-audit-text): list Dalton supported chat platforms -->
-- Channels (Feishu, Discord, personal WeChat): which conversation or workspace a message the user sends there reaches, why an answer came from another conversation, how `/new`, `/workspace` and replies pick one, and where your own sends land and whether replies to them come back: `.agents/skills/langalpha-doc/facts/channel-routing.md`.
+<!-- DALTON_CAP:channel_gateway -->- Channels (<!-- DALTON_CAP:channel_feishu -->Feishu<!-- /DALTON_CAP --><!-- DALTON_CAP:channel_feishu,channel_discord -->, <!-- /DALTON_CAP --><!-- DALTON_CAP:channel_discord -->Discord<!-- /DALTON_CAP --><!-- DALTON_CAP:channel_weixin --><!-- DALTON_CAP:channel_feishu|channel_discord -->, <!-- /DALTON_CAP -->personal WeChat<!-- /DALTON_CAP -->): which conversation or workspace a message the user sends there reaches, why an answer came from another conversation, how `/new`, `/workspace` and replies pick one, and where your own sends land and whether replies to them come back: `.agents/skills/langalpha-doc/facts/channel-routing.md`.<!-- DALTON_CAP_ELSE -->- Channel routing: `.agents/skills/langalpha-doc/facts/channel-routing.md`.<!-- /DALTON_CAP -->

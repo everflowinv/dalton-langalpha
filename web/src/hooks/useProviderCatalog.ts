@@ -1,6 +1,9 @@
 import { useMemo } from 'react';
 import { useModels } from './useModels';
 import { usePreferences } from './usePreferences';
+// DALTON-HOOK(standalone-core): surface API-key coding plans in Add API key picker when Core hides OAuth subscriptions
+import { isCoreProfileBuild } from '@/config/brand';
+import { useCapabilities } from './useCapabilities';
 import { indexCatalog, ownProviderNames } from '@/lib/providerCatalog';
 import { modelPrefs } from '@/lib/modelPreferences';
 import type { ProviderCatalogEntry } from '@/components/model/types';
@@ -37,16 +40,25 @@ export function useProviderCatalog() {
   const catalog = models?.provider_catalog ?? NO_ENTRIES;
   const { preferences } = usePreferences();
   const customProviders = modelPrefs(preferences).custom_providers;
+  // DALTON-HOOK(standalone-core): fold API-key coding plans into keyGroups only when Core hides OAuth subscriptions
+  const { hasCapability } = useCapabilities();
+  const includeCodingPlansInKeys = isCoreProfileBuild && !hasCapability('native_oauth_sync');
   return useMemo(() => {
-    const keyGroups = groupProviders(catalog.filter((e) => e.access_type === 'api_key' && e.byok_eligible !== false));
+    const apiKeyGroups = groupProviders(catalog.filter((e) => e.access_type === 'api_key' && e.byok_eligible !== false));
     const planGroups = groupProviders(catalog.filter((e) => e.access_type === 'coding_plan' && e.byok_eligible !== false))
       .map((g) => ({ ...g, name: g.options[0].entry.display_name }));
+    const keyGroups = includeCodingPlansInKeys
+      ? [
+          ...apiKeyGroups,
+          ...planGroups.map((g) => ({ ...g, group: `${g.group}:coding_plan` })),
+        ]
+      : apiKeyGroups;
     const localEntries = catalog.filter((e) => e.access_type === 'local');
 
     const { entryFor, connectionOf } = indexCatalog(catalog, ownProviderNames(customProviders));
 
     const placeOf = (provider: string): KeyPlace | undefined => {
-      for (const group of [...keyGroups, ...planGroups]) {
+      for (const group of [...apiKeyGroups, ...planGroups]) {
         const option = group.options.find((o) => o.provider === provider);
         if (option) return { group, option };
       }
@@ -60,5 +72,5 @@ export function useProviderCatalog() {
     };
 
     return { catalog, keyGroups, planGroups, localEntries, entryFor, placeOf, optionFor, connectionOf, isLoading };
-  }, [catalog, customProviders, isLoading]);
+  }, [catalog, customProviders, includeCodingPlansInKeys, isLoading]);
 }

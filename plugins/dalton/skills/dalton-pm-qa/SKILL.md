@@ -33,7 +33,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      - 股价异动 → 按 `/dalton-stock-move` 跑 `move_quant.py` 并检索异动原因；
      - 刚披露季报 → 按 `/dalton-earnings-flash` 快速比对指引与一致预期；
      - 多空焦点快评 → 按 `/bullbear` 快速模式拆解；
-     - 单项数据核实 → 调用 `researchdata`（`finance` / `research` / `news`）定向拉取一手数据。
+     - 单项数据核实 → 调用 <!-- DALTON_CAP:researchdata_bridge -->`researchdata`（`finance` / `research` / `news`）<!-- DALTON_CAP_ELSE -->`dalton_sec`、`fundamentals`、`yf_price` / `yf_fundamentals` 或 `web_search`<!-- /DALTON_CAP -->定向拉取一手数据。
 
 ### 类型 (c)：需要全新深度研究
 - **场景**：PM 问及知识层尚未覆盖的新竞争对手、新技改路线、未建模的新业务分部、或跨行业专题。

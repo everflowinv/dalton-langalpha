@@ -282,4 +282,44 @@ describe('brand configuration (VITE_BRAND_NAME & VITE_BRAND_MARK)', () => {
     expect(legacyEverflow.BRAND_MARK).toBe('everflow');
     expect(legacyEverflow.isDaltonBuild).toBe(true);
   });
+
+  it('decouples isDaltonBuild via VITE_DALTON_UI with backward-compatible fallback and supports core profile defaults', async () => {
+    // Explicit VITE_DALTON_UI=true enables Dalton UI without Everflow brand mark.
+    vi.stubEnv('VITE_DALTON_UI', 'true');
+    vi.stubEnv('VITE_BRAND_MARK', 'langalpha');
+    vi.stubEnv('VITE_BRAND_NAME', 'Dalton');
+    vi.stubEnv('VITE_DALTON_PROFILE', 'core');
+    vi.resetModules();
+
+    const coreBrand = await import('@/config/brand');
+    expect(coreBrand.isDaltonBuild).toBe(true);
+    expect(coreBrand.BRAND_MARK).toBe('langalpha');
+    expect(coreBrand.BRAND_NAME).toBe('Dalton');
+    expect(coreBrand.DALTON_PROFILE).toBe('core');
+    expect(coreBrand.isCoreProfileBuild).toBe(true);
+
+    // Core profile defaults BRAND_NAME to Dalton and enables isDaltonBuild when VITE_DALTON_UI is unset.
+    vi.stubEnv('VITE_DALTON_UI', '');
+    vi.stubEnv('VITE_BRAND_NAME', '');
+    vi.stubEnv('VITE_BRAND_MARK', '');
+    vi.stubEnv('VITE_DALTON_PROFILE', 'core');
+    vi.resetModules();
+
+    const coreDefault = await import('@/config/brand');
+    expect(coreDefault.BRAND_NAME).toBe('Dalton');
+    expect(coreDefault.BRAND_MARK).toBe('langalpha');
+    expect(coreDefault.isDaltonBuild).toBe(true);
+    expect(coreDefault.isCoreProfileBuild).toBe(true);
+
+    // Explicit VITE_DALTON_UI=false overrides BRAND_MARK=everflow fallback.
+    vi.stubEnv('VITE_DALTON_UI', 'false');
+    vi.stubEnv('VITE_BRAND_MARK', 'everflow');
+    vi.stubEnv('VITE_DALTON_PROFILE', 'everflow');
+    vi.resetModules();
+
+    const disabledDalton = await import('@/config/brand');
+    expect(disabledDalton.BRAND_MARK).toBe('everflow');
+    expect(disabledDalton.isDaltonBuild).toBe(false);
+    expect(disabledDalton.isCoreProfileBuild).toBe(false);
+  });
 });

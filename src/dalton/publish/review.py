@@ -443,7 +443,9 @@ def load_agent_body(agent_name: str = "dalton-reviewer") -> str:
             "你是基金的独立审稿人。只读审稿，输出严格 JSON"
             "（verdict: pass|revise|block, summary, items 覆盖 1–9 项检查, must_fix, nice_to_have）。"
         )
-    raw = path.read_text(encoding="utf-8")
+    from src.dalton.content_assembly import read_assembled_text
+
+    raw = read_assembled_text(path)
     if raw.startswith("---"):
         parts = raw.split("---", 2)
         if len(parts) == 3:

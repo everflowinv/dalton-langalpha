@@ -1,4 +1,7 @@
 import type { SignInLifecycle } from '@/api/oauth';
+// DALTON-HOOK(standalone-core): skip Claude OAuth status query only in Core builds when native_oauth_sync is disabled
+import { isCoreProfileBuild } from '@/config/brand';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { useOAuthStatus } from '@/hooks/useConfiguredProviders';
 import { useLocale } from '@/hooks/useLocale';
 import { formatCalendarDay } from '@/lib/format';
@@ -10,7 +13,10 @@ import { formatCalendarDay } from '@/lib/format';
  * set no day.
  */
 export function useClaudeSignInEnd(): { endsOn: string; date: string } | null {
-  const { data } = useOAuthStatus('claude-oauth');
+  const { hasCapability } = useCapabilities();
+  const { data } = useOAuthStatus('claude-oauth', {
+    enabled: !(isCoreProfileBuild && !hasCapability('native_oauth_sync')),
+  });
   const locale = useLocale();
   const endsOn = data?.connected ? data.ends_on : null;
   return endsOn ? { endsOn, date: formatCalendarDay(endsOn, locale) } : null;
@@ -20,5 +26,10 @@ export function useClaudeSignInEnd(): { endsOn: string; date: string } | null {
  *  with it: once the deployment set an end day, every place that shows it
  *  marks it legacy. */
 export function useClaudeSignInLifecycle(): SignInLifecycle {
-  return useOAuthStatus('claude-oauth').data?.lifecycle ?? 'active';
+  const { hasCapability } = useCapabilities();
+  return (
+    useOAuthStatus('claude-oauth', {
+      enabled: !(isCoreProfileBuild && !hasCapability('native_oauth_sync')),
+    }).data?.lifecycle ?? 'active'
+  );
 }

@@ -10,7 +10,7 @@ description: "在同一报告期、汇率与市值锚点下，拉取一手财报
 
 本技能把基金的三把核心“财务镜头”（净现金双口径、隐含资产、股东回报 R1/R2/R3）及完整覆盖 Stage 0 所需的盈利质量指标（Sloan 比率、CFO/NI、CCC）统一在同一家公司、同一报告期、同一汇率和同一美元市值锚点下完成。它既可通过 `/dalton-financial-lenses` 独立触发，也被 `dalton-company-background`、`dalton-bullbear`、`initial-coverage` 和 `full-coverage`（数字底表 `facts.md`）复用。
 
-**市场范围**：支持**美股（含美股上市 ADR）、港股（HKEX）与 A 股（上交所/深交所/北交所）**。美股走 `dalton_sec` 与 `researchdata.finance(route="sec")`；港股与 A 股走 `researchdata.finance(route="cn-hk", operation="ask"|"filings", ...)`（平台财务表 `operation="ask"` 仅作二手初值线索，核心财务数字与附注拆细必须用 `operation="filings"` 回巨潮法定公告核实，港股披露易未覆盖时用 `web_search` 查 HKEXnews 原文链接），并通过 `anchors.py` 严格锁定交易币种（`listing_currency`）、报表币种（`financial_currency`）、汇率及复权/股本口径。
+**市场范围**：支持**美股（含美股上市 ADR）、港股（HKEX）与 A 股（上交所/深交所/北交所）**。<!-- DALTON_CAP:researchdata_bridge -->美股走 `dalton_sec` 与 `researchdata.finance(route="sec")`；港股与 A 股走 `researchdata.finance(route="cn-hk", operation="ask"|"filings", ...)`（平台财务表 `operation="ask"` 仅作二手初值线索，核心财务数字与附注拆细必须用 `operation="filings"` 回巨潮法定公告核实，港股披露易未覆盖时用 `web_search` 查 HKEXnews 原文链接）<!-- DALTON_CAP_ELSE -->美股走 `dalton_sec` 与 `get_sec_filing`；港股与 A 股通过 `web_search` 查港交所披露易（`site:hkexnews.hk`）、巨潮资讯及交易所官网获取法定公告与附注原文<!-- /DALTON_CAP -->，并通过 `anchors.py` 严格锁定交易币种（`listing_currency`）、报表币种（`financial_currency`）、汇率及复权/股本口径。
 
 ---
 
@@ -36,9 +36,9 @@ python3 .agents/skills/dalton-financial-lenses/scripts/anchors.py \
 
 #### 3.1 美股（含美股上市 ADR）
 1. 用 `dalton_sec.get_company_facts(ticker=..., concepts=..., period=...)` 获取最新 10-Q/10-K/20-F 资产负债表、利润表、现金流量表科目（严格遵守 R1–R10 规则，带单位、期间与 accession）。
-2. 用 `researchdata.finance(route="sec", ...)` 的 `read-item` / `search-text`（或自带 `get_sec_filing`）读取资产负债表附注（现金及短期投资构成、受限资金、有息债务明细、合同负债/递延收入、联营合营与股权投资、回购授权与执行 `share repurchase program`）。
+2. 用<!-- DALTON_CAP:researchdata_bridge --> `researchdata.finance(route="sec", ...)` 的 `read-item` / `search-text`（或自带 `get_sec_filing`）<!-- DALTON_CAP_ELSE --> `get_sec_filing` 与 `dalton_sec.list_filings` <!-- /DALTON_CAP -->读取资产负债表附注（现金及短期投资构成、受限资金、有息债务明细、合同负债/递延收入、联营合营与股权投资、回购授权与执行 `share repurchase program`）。
 
-#### 3.2 港股与 A 股（`route="cn-hk"`：平台初值 + 法定公告核实）
+<!-- DALTON_CAP:researchdata_bridge -->#### 3.2 港股与 A 股（`route="cn-hk"`：平台初值 + 法定公告核实）
 1. **平台三表与分红回购初值提取（`operation="ask"`，仅作二手初值线索）**：
    - 在 PTC（`execute_code`）中按单一意图分别调用 `researchdata.finance(route="cn-hk", operation="ask", ...)`（注意：港股传 **5 位纯数字代码**如 `"00700"` 或中文简称，A 股传 **6 位纯数字代码**如 `"600519"` 或中文简称；`cn-hk` 只用 `operation`、`ticker`、`query`、`start`、`end`、`limit`，每次 `ask` 只查一个意图）：
    ```python
@@ -68,7 +68,10 @@ python3 .agents/skills/dalton-financial-lenses/scripts/anchors.py \
    )
    ```
    - **港股披露易（HKEXnews）退路**：若港股某份业绩公告、年报/中报、或股份回购“翌日披露报表（Next Day Disclosure Return）”未被 `cn-hk` 的 `operation="filings"` 覆盖，必须使用 `web_search` 检索港交所披露易（`site:hkexnews.hk`）或公司 IR 官网，核对官方公告原文链接与具体表格数字。
-   - **币种与复权核对**：核实财报列报币种（`CNY` / `HKD` / `USD`）与单位（元 / 千元 / 百万元），所有报表科目统一通过 `anchors.json` 的 `fx.rate`（`financial_currency -> USD`）换算；以交易币种（如 HKD）披露的回购支出或派息总额通过 `listing_fx.rate`（`listing_currency -> USD`）换算；核对区间内送转股、拆股与前/后复权状态（`cn-hk` A 股日线默认前复权 `qfq`，港股日线默认不复权，跨源回退时核查 `plan.source`）。
+   - **币种与复权核对**：核实财报列报币种（`CNY` / `HKD` / `USD`）与单位（元 / 千元 / 百万元），所有报表科目统一通过 `anchors.json` 的 `fx.rate`（`financial_currency -> USD`）换算；以交易币种（如 HKD）披露的回购支出或派息总额通过 `listing_fx.rate`（`listing_currency -> USD`）换算；核对区间内送转股、拆股与前/后复权状态（`cn-hk` A 股日线默认前复权 `qfq`，港股日线默认不复权，跨源回退时核查 `plan.source`）。<!-- DALTON_CAP_ELSE -->#### 3.2 港股与 A 股（法定公告与附注核实）
+1. **获取法定定期报告与附注原文**：通过 `web_search` 与港交所披露易（`site:hkexnews.hk`）、巨潮资讯（cninfo）或公司 IR 官网，获取最新年报/中报/季报、业绩公告、权益分派实施公告及股份回购披露文件（港股含翌日披露报表 Next Day Disclosure Return）。
+2. **逐项核实核心科目与附注拆细**：回法定公告原文核实受限资金、定期存款期限、理财底层性质、有息债务明细、联营合营与上市股权投资及实际回购注销股数。
+3. **币种与复权核对**：核实财报列报币种（`CNY` / `HKD` / `USD`）与单位（元 / 千元 / 百万元），所有报表科目统一通过 `anchors.json` 的 `fx.rate`（`financial_currency -> USD`）换算；以交易币种（如 HKD）披露的回购支出或派息总额通过 `listing_fx.rate`（`listing_currency -> USD`）换算；核对区间内送转股、拆股与前/后复权状态。<!-- /DALTON_CAP -->
 
 ### 第 4 步：按口径与确定性脚本计算三把镜头（及盈利质量）
 > **硬规则**：以下三个脚本必须统一传入 `--anchors anchors.json` 读取第 2 步锁定的市值、汇率与期间；同时传入 `--anchors` 与手填 `--market-cap-usd-mn` / `--fx-rate` 会直接报错退出（仅手填时输出会标记 `anchors_source: "manual"`）。

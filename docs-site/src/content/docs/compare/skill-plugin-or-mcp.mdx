@@ -4,7 +4,7 @@ description: 这页帮你分清 Everflow 里技能、插件和研究数据源各
 lastUpdated: 2026-11-22
 ---
 
-这页帮你分清 Everflow 里**技能（Skill）**、**插件（Plugin）**和**研究数据源（Research Data）**各自管什么，实操时怎么搭配。
+这页帮你分清 {/* DALTON_DOC:everflow */}Everflow{/* DALTON_DOC_ELSE */}Dalton{/* /DALTON_DOC */} 里**技能（Skill）**、**插件（Plugin）**和**研究数据源（Research Data）**各自管什么，实操时怎么搭配。
 
 **数据源**提供原材料（研报、财报、专家摘录、行情）。**插件**是把数据源或外部工具接进系统的扩展包。**技能**则是教助手按什么步骤、什么格式、走哪几步核验，把原材料加工成成品报告的操作手册。
 
@@ -12,22 +12,22 @@ lastUpdated: 2026-11-22
 
 | 概念 | 在投研流程里的角色 | 类比理解 | 典型例子 |
 | :--- | :--- | :--- | :--- |
-| **研究数据源** | 原材料仓库 | 彭博终端、Wind、SEC EDGAR、内部研报库 | AlphaEngine、Guidepoint、美股 SEC 财报、一致预期、雪球 |
+| **研究数据源** | 原材料仓库 | {/* DALTON_DOC:everflow */}彭博终端、Wind、SEC EDGAR、内部研报库 | AlphaEngine、Guidepoint、美股 SEC 财报、一致预期、雪球{/* DALTON_DOC_ELSE */}彭博终端、Wind、SEC EDGAR、行情终端 | 美股 SEC 财报、业绩电话会转写、市场一致预期、实时行情、全网检索{/* /DALTON_DOC */} |
 | **插件（Plugin）** | 连接仓库和工具箱的适配器 | 装进工作台的接口模块包 | 内置投研数据插件、实时行情服务 |
 | **技能（Skill）** | 标准化投研流程与质量模板 | 团队内部《首次覆盖写作指南与核验清单》 | `/initial-coverage`、`/dalton-earnings-preview`、`/dalton-stock-move`、`/dalton-publish` |
 
 ## 实操里怎么搭配用
 
 1. **只想查单点事实 → 直接点名数据源**
-   - 比如：*“帮我查一下 AlphaEngine 里最近两周关于台积电 CoWoS 产能的卖方纪要，再对比 SEC 财报里的资本开支数字。”*
+   - 比如：*“帮我查一下 {/* DALTON_DOC:everflow */}AlphaEngine 里最近两周关于台积电 CoWoS 产能的卖方纪要{/* DALTON_DOC_ELSE */}最近两周关于台积电 CoWoS 产能的公开新闻与业绩会纪要{/* /DALTON_DOC */}，再对比 SEC 财报里的资本开支数字。”*
    - 这时助手只跑一段短小的沙箱代码直连对应数据源，省去整套覆盖流程的耗时。
 2. **要出整套研究交付物 → 触发对应技能**
    - 比如：*“运行 `/dalton-earnings-preview` 准备这家公司的三季报前瞻。”* 或者 *“帮我用首次覆盖流程跑一份完整初稿。”*
-   - 技能会自动派子代理并发扫卖方研报、专家访谈、业绩会转写、法定财报和一致预期，最后按团队约定结构落盘并做数据核验。
+   - 技能会自动派子代理并发扫{/* DALTON_DOC:everflow */}卖方研报、专家访谈、业绩会转写、法定财报和一致预期{/* DALTON_DOC_ELSE */}业绩会转写、法定财报、市场一致预期和公开资料{/* /DALTON_DOC */}，最后按团队约定结构落盘并做数据核验。
 3. **想改报告模板或加专用检查 → 调整技能或工作区指南**
    - 数据源和插件负责把数据准确取回来。如果你有自己偏好的对比口径或固定排版，把规则写进自定义技能或工作区指南就行。
 
 ## 相关页面
 
 - 看所有内置投研技能列表：[技能与插件](/help/concepts/skills-and-plugins/)
-- 看全部数据源路由和缓存规则：[研究数据源](/help/everflow/research-data-sources/)
+- {/* DALTON_DOC:everflow */}看全部数据源路由和缓存规则：[研究数据源](/help/everflow/research-data-sources/){/* DALTON_DOC_ELSE */}看工作区沙箱如何执行数据脚本：[电脑与沙箱](/help/concepts/computers-and-sandboxes/){/* /DALTON_DOC */}

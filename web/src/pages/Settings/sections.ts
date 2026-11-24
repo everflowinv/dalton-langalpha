@@ -18,6 +18,8 @@ import {
 import { BRAND_NAME, isDaltonBuild } from '@/config/brand'; // DALTON-HOOK(brand-name)
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(settings-reorg)
 import { isPlatformMode } from '@/config/hostMode';
+// DALTON-HOOK(standalone-core): capability-aware section & search gating
+import { hasRequiredCapability, type CapabilityRequirement } from '@/hooks/useCapabilities';
 import { canDesktopSettings } from '@/lib/desktop';
 import { TRADING_PERMISSION_ANCHOR } from '@/lib/tradingPermission';
 // DALTON-HOOK(settings-section): shared visibility context and predicates from Dalton card modules
@@ -31,11 +33,12 @@ import { canShowDaltonHomeTeamMemoryCard } from './panels/dalton/DaltonHomeTeamM
 import { canShowDaltonInviteAdminCard } from './panels/dalton/DaltonInvitesCard';
 import { canShowDaltonFeishuScopesCard } from './panels/dalton/FeishuReadScopesCard';
 
-/** Discord channels card & search visibility: requires verified admin tier. */
+/** Discord channels card & search visibility: requires verified admin tier and channel_discord capability. */
 export function canShowDaltonDiscordChannelsCard(
   ctx?: DaltonSettingVisibilityContext | null,
 ): boolean {
   if (!ctx) return false;
+  if (!hasRequiredCapability(ctx.capabilities, 'channel_discord')) return false;
   if (ctx.discordChannelsAdmin !== undefined) {
     return ctx.discordChannelsAdmin;
   }
@@ -67,6 +70,8 @@ export interface SectionMeta {
   daltonAuthOnly?: boolean;
   /** Rendered only when the coverage units feature flag is enabled. */
   coverageUnitsOnly?: boolean;
+  /** Optional capability gate (DALTON-HOOK(standalone-core)). */
+  capability?: CapabilityRequirement;
   /** What a hosted server's operator decides, so only a self-hosted build shows it. */
   selfHostedOnly?: boolean;
 }
@@ -119,6 +124,7 @@ export function sectionShown(
   // DALTON-HOOK(hide-trading): Dalton does not expose live brokerage trading in Settings
   // DALTON-HOOK(hide-experiments): Dalton does not expose experimental labs in Settings
   // DALTON-HOOK(settings-reorg): hide Computers and self-hosted Server sections in Dalton builds; enforce minTier & coverageUnitsOnly across rail, search, and palette
+  // DALTON-HOOK(standalone-core): enforce capability gating and hide empty Integrations section in Core
   if (section === 'trading' || section === 'experiments') return false;
   if ((section === 'computers' || section === 'server') && isDaltonBuild) return false;
   const meta: SectionMeta = SECTIONS[section];
@@ -128,6 +134,30 @@ export function sectionShown(
   if (meta.daltonAuthOnly && !isDaltonAuth) return false;
   if (meta.minTier && !tierSatisfies(ctx?.callerTier, meta.minTier)) return false;
   if (meta.coverageUnitsOnly && ctx?.coverageUnitsEnabled !== true) return false;
+  if (meta.capability && !hasRequiredCapability(ctx?.capabilities, meta.capability)) return false;
+  if (
+    section === 'integrations' &&
+    !isPlatformMode &&
+    !hasRequiredCapability(ctx?.capabilities, [
+      'channel_gateway',
+      'channel_feishu',
+      'channel_discord',
+      'channel_weixin',
+    ])
+  ) {
+    return false;
+  }
+  if (
+    section === 'teamChannels' &&
+    !hasRequiredCapability(ctx?.capabilities, [
+      'channel_feishu',
+      'channel_discord',
+      'channel_weixin',
+      'data_jobs',
+    ])
+  ) {
+    return false;
+  }
   return true;
 }
 
@@ -156,7 +186,9 @@ export interface SettingEntry {
    *  on a row that is not there, or the name of the group the row sits in. */
   alsoKeys?: readonly string[];
   // DALTON-HOOK(settings-section): bilingual search terms and card-level visibility predicate
+  // DALTON-HOOK(standalone-core): optional capability gate on individual setting entries
   keywords?: string;
+  capability?: CapabilityRequirement;
   visibleWhen?: (ctx?: DaltonSettingVisibilityContext | null) => boolean;
 }
 
@@ -209,7 +241,8 @@ export const SETTINGS = {
   searchProvider: { section: 'chat', anchor: 'search-provider', labelKey: 'settings.searchProvider', descKey: 'settings.searchProviderDesc', alsoKeys: ['settings.searchDepth'] },
   daltonCosSharing: { section: 'chat', anchor: 'dalton-cos-sharing', labelKey: 'settings.dalton.cosSharingLabel', descKey: 'settings.dalton.cosSharingDesc', keywords: '研究总监 工作区协同共享 允许同事的研究总监向我的工作区派活 chief of staff sharing colleague dispatch', visibleWhen: canShowDaltonCosSharingCard },
   // DALTON-HOOK(team-memory-toggle): Home Team Memory user-level setting entry
-  daltonHomeTeamMemory: { section: 'chat', anchor: 'dalton-home-team-memory', labelKey: 'settings.dalton.homeTeamMemoryLabel', descKey: 'settings.dalton.homeTeamMemoryDesc', keywords: '团队记忆 团队历史研究记录 对话记录 team memory conversation archive', visibleWhen: canShowDaltonHomeTeamMemoryCard },
+  // DALTON-HOOK(standalone-core): gate Home Team Memory on conversation_archive
+  daltonHomeTeamMemory: { section: 'chat', anchor: 'dalton-home-team-memory', labelKey: 'settings.dalton.homeTeamMemoryLabel', descKey: 'settings.dalton.homeTeamMemoryDesc', keywords: '团队记忆 团队历史研究记录 对话记录 team memory conversation archive', capability: 'conversation_archive', visibleWhen: canShowDaltonHomeTeamMemoryCard },
   // A machine's own settings are in the Computers panel each row opens, so
   // the list is what a search for one of them lands on.
   computers: {
@@ -248,7 +281,8 @@ export const SETTINGS = {
   daltonAssistModel: { section: 'model', anchor: 'dalton-assist-model', labelKey: 'settings.modelTuning.daltonAssistModel', descKey: 'settings.modelTuning.daltonAssistModelDesc', advanced: true, keywords: '轻量后台任务模型 辅助模型 auxiliary task model assist' },
   daltonAssistFallbackModels: { section: 'model', anchor: 'dalton-assist-fallback-models', labelKey: 'settings.modelTuning.daltonAssistFallbackModels', descKey: 'settings.modelTuning.daltonAssistFallbackModelsDesc', advanced: true, keywords: '轻量后台任务备用模型 auxiliary task fallback models' },
   daltonReviewerModels: { section: 'model', anchor: 'dalton-reviewer-models', labelKey: 'settings.modelTuning.daltonReviewerModels', descKey: 'settings.modelTuning.daltonReviewerModelsDesc', advanced: true, keywords: '独立复核候选模型 审稿模型 independent reviewer candidates' },
-  daltonExtractModel: { section: 'model', anchor: 'dalton-extract-model', labelKey: 'settings.modelTuning.daltonExtractModel', descKey: 'settings.modelTuning.daltonExtractModelDesc', advanced: true, keywords: '研究记忆整理模型 对话归档抽卡模型 conversation archive extraction model' },
+  // DALTON-HOOK(standalone-core): gate archive extraction, channels, native sync, and Feishu scopes on capabilities
+  daltonExtractModel: { section: 'model', anchor: 'dalton-extract-model', labelKey: 'settings.modelTuning.daltonExtractModel', descKey: 'settings.modelTuning.daltonExtractModelDesc', advanced: true, keywords: '研究记忆整理模型 对话归档抽卡模型 conversation archive extraction model', capability: 'conversation_archive' },
 
   plan: { section: 'budget', anchor: 'plan', labelKey: 'settings.planUsage.plan', descKey: 'settings.planUsage.planDesc', visibleWhen: () => isPlatformMode },
   usage: { section: 'budget', anchor: 'usage', labelKey: 'settings.planUsage.usage', descKey: 'settings.planUsage.usageDesc', visibleWhen: () => isPlatformMode },
@@ -256,9 +290,9 @@ export const SETTINGS = {
   daltonBudget: { section: 'budget', anchor: 'dalton-budget', labelKey: 'settings.dalton.budgetLabel', descKey: 'settings.dalton.budgetDesc', keywords: '预算 每日预算 花费上限 USD 额度 调额 daily budget spending limit' },
 
   // DALTON-HOOK(settings-section): personal messaging channels and push targets live together in Messaging & Channels
-  daltonNotifyTargets: { section: 'integrations', anchor: 'dalton-notify-targets', labelKey: 'settings.dalton.notifyTargetsLabel', descKey: 'settings.dalton.notifyTargetsDesc', keywords: '通知目标 飞书 Discord 自动推送 消息提醒 notify targets feishu discord 推送总开关 总开关 飞书提醒 推送开关' },
-  daltonChannelBindings: { section: 'integrations', anchor: 'dalton-channel-bindings', labelKey: 'settings.dalton.channelBindingsLabel', descKey: 'settings.dalton.channelBindingsDesc', keywords: '飞书 Discord 账号绑定 绑定码 私聊 机器人 bind code feishu discord account' },
-  daltonWeixinBind: { section: 'integrations', anchor: 'dalton-weixin-bind', labelKey: 'settings.dalton.weixinBindLabel', descKey: 'settings.dalton.weixinBindDesc', keywords: '微信 我的微信 绑定 个人微信 wechat weixin bind' },
+  daltonNotifyTargets: { section: 'integrations', anchor: 'dalton-notify-targets', labelKey: 'settings.dalton.notifyTargetsLabel', descKey: 'settings.dalton.notifyTargetsDesc', keywords: '通知目标 飞书 Discord 自动推送 消息提醒 notify targets feishu discord 推送总开关 总开关 飞书提醒 推送开关', capability: ['channel_feishu', 'channel_discord'] },
+  daltonChannelBindings: { section: 'integrations', anchor: 'dalton-channel-bindings', labelKey: 'settings.dalton.channelBindingsLabel', descKey: 'settings.dalton.channelBindingsDesc', keywords: '飞书 Discord 账号绑定 绑定码 私聊 机器人 bind code feishu discord account', capability: ['channel_feishu', 'channel_discord'] },
+  daltonWeixinBind: { section: 'integrations', anchor: 'dalton-weixin-bind', labelKey: 'settings.dalton.weixinBindLabel', descKey: 'settings.dalton.weixinBindDesc', keywords: '微信 我的微信 绑定 个人微信 wechat weixin bind', capability: 'channel_weixin' },
   chatApps: { section: 'integrations', anchor: 'chat-apps', labelKey: 'settings.integrations.chatApps', descKey: 'settings.integrations.chatAppsDesc', visibleWhen: () => isPlatformMode },
   // DALTON-HOOK(settings-reorg): match runtime platform-only visibility in search & palette
   connectedApps: { section: 'integrations', anchor: 'connected-apps', labelKey: 'settings.integrations.connectedApps', descKey: 'settings.integrations.connectedAppsDesc', visibleWhen: () => isPlatformMode },
@@ -266,15 +300,17 @@ export const SETTINGS = {
   daltonCoverage: { section: 'coverage', anchor: 'dalton-coverage', labelKey: 'settings.dalton.coverageLabel', descKey: 'settings.dalton.coverageDesc', keywords: '覆盖结构 行业 独立公司 绑定工作区 未归类工作区 coverage sector company' },
 
   daltonProviders: { section: 'teamModels', anchor: 'dalton-providers', labelKey: 'settings.dalton.providersLabel', descKey: 'settings.dalton.providersDesc', keywords: '团队凭据 模型与数据源状态 团队共享凭据 供应商 team credentials provider status' },
-  daltonNativeModels: { section: 'teamModels', anchor: 'dalton-native-models', labelKey: 'dalton.nativeModels.title', descKey: 'dalton.nativeModels.footnote', keywords: '模型目录同步 同步模型 退役模型 model catalog sync' },
+  daltonNativeModels: { section: 'teamModels', anchor: 'dalton-native-models', labelKey: 'dalton.nativeModels.title', descKey: 'dalton.nativeModels.footnote', keywords: '模型目录同步 同步模型 退役模型 model catalog sync', capability: 'native_oauth_sync' },
 
   daltonInvites: { section: 'teamMembers', anchor: 'dalton-invites', labelKey: 'settings.dalton.invitesLabel', descKey: 'settings.dalton.invitesDesc', keywords: '团队邀请 成员权限 邀请链接 team invites allowlist', visibleWhen: canShowDaltonInviteAdminCard },
-  daltonFeishuScopes: { section: 'teamMembers', anchor: 'dalton-feishu-scopes', labelKey: 'settings.dalton.feishuScopesLabel', descKey: 'settings.dalton.feishuScopesDesc', keywords: '飞书读取权限 飞书授权 文档 知识库 多维表格 feishu read scopes', visibleWhen: canShowDaltonFeishuScopesCard },
+  daltonFeishuScopes: { section: 'teamMembers', anchor: 'dalton-feishu-scopes', labelKey: 'settings.dalton.feishuScopesLabel', descKey: 'settings.dalton.feishuScopesDesc', keywords: '飞书读取权限 飞书授权 文档 知识库 多维表格 feishu read scopes', capability: 'feishu_docs', visibleWhen: canShowDaltonFeishuScopesCard },
 
-  daltonWeixinBot: { section: 'teamChannels', anchor: 'dalton-weixin-bot', labelKey: 'settings.dalton.weixinBotLabel', descKey: 'settings.dalton.weixinBotDesc', keywords: '团队微信机器人 微信扫码 wechat bot qr', visibleWhen: (ctx) => ctx?.callerTier === 'admin' },
-  daltonFeishuGroups: { section: 'teamChannels', anchor: 'dalton-feishu-groups', labelKey: 'settings.dalton.feishuGroupsLabel', descKey: 'settings.dalton.feishuGroupsDesc', keywords: '飞书群 团队群 群聊绑定 feishu groups' },
-  daltonDiscordChannels: { section: 'teamChannels', anchor: 'dalton-discord-channels', labelKey: 'settings.dalton.discordChannelsLabel', descKey: 'settings.dalton.discordChannelsDesc', keywords: 'Discord 频道 团队频道 群报告 频道绑定 discord channels', visibleWhen: canShowDaltonDiscordChannelsCard },
-  daltonSystemJobs: { section: 'teamChannels', anchor: 'dalton-system-jobs', labelKey: 'settings.dalton.systemJobsLabel', descKey: 'settings.dalton.systemJobsDesc', keywords: '自动巡检 团队公共任务 知识库同步 研报增量扫描 公司近况巡检 system jobs cron' },
+  // DALTON-HOOK(standalone-core): gate team channel cards on respective channel capabilities
+  daltonWeixinBot: { section: 'teamChannels', anchor: 'dalton-weixin-bot', labelKey: 'settings.dalton.weixinBotLabel', descKey: 'settings.dalton.weixinBotDesc', keywords: '团队微信机器人 微信扫码 wechat bot qr', capability: 'channel_weixin', visibleWhen: (ctx) => ctx?.callerTier === 'admin' },
+  daltonFeishuGroups: { section: 'teamChannels', anchor: 'dalton-feishu-groups', labelKey: 'settings.dalton.feishuGroupsLabel', descKey: 'settings.dalton.feishuGroupsDesc', keywords: '飞书群 团队群 群聊绑定 feishu groups', capability: 'channel_feishu' },
+  daltonDiscordChannels: { section: 'teamChannels', anchor: 'dalton-discord-channels', labelKey: 'settings.dalton.discordChannelsLabel', descKey: 'settings.dalton.discordChannelsDesc', keywords: 'Discord 频道 团队频道 群报告 频道绑定 discord channels', capability: 'channel_discord', visibleWhen: canShowDaltonDiscordChannelsCard },
+  daltonSystemJobs: { section: 'teamChannels', anchor: 'dalton-system-jobs', labelKey: 'settings.dalton.systemJobsLabel', descKey: 'settings.dalton.systemJobsDesc', keywords: '自动巡检 团队公共任务 知识库同步 研报增量扫描 公司近况巡检 system jobs cron', capability: 'data_jobs' },
+
   tradingPermission: { section: 'trading', anchor: TRADING_PERMISSION_ANCHOR, labelKey: 'settings.tradingPermission.title', descKey: 'settings.tradingPermission.desc' },
   experiments: { section: 'experiments', anchor: 'experiments', labelKey: 'settings.experiments', descKey: 'settings.experimentsIntro' },
 } satisfies Record<string, SettingEntry>;
@@ -321,11 +357,13 @@ export function searchableSettings(
   ctx?: DaltonSettingVisibilityContext | null,
   featureOn: (key: string) => boolean = () => true,
 ): SettingEntry[] {
+  // DALTON-HOOK(standalone-core): exclude settings whose required capability is disabled
   return ENTRIES.filter(
     (entry) =>
       (desktop || !entry.desktopOnly) &&
       (!entry.feature || featureOn(entry.feature)) &&
       sectionShown(entry.section, ctx) &&
+      hasRequiredCapability(ctx?.capabilities, entry.capability) &&
       (!entry.visibleWhen || entry.visibleWhen(ctx)),
   );
 }
@@ -349,17 +387,54 @@ const LEGACY_SECTIONS: Record<string, Section> = {
   'team-channels': 'teamChannels',
 };
 
+// DALTON-HOOK(standalone-core): resolve capability-aware setting label so disabled channel names never appear in search results or CommandPalette
+export function settingLabelKey(
+  entry: SettingEntry,
+  ctx?: DaltonSettingVisibilityContext | null,
+): string {
+  if (entry.anchor === 'dalton-channel-bindings') {
+    const canFeishu = hasRequiredCapability(ctx?.capabilities, 'channel_feishu');
+    const canDiscord = hasRequiredCapability(ctx?.capabilities, 'channel_discord');
+    if (canFeishu && !canDiscord) return 'settings.dalton.channelBindingsLabelFeishu';
+    if (!canFeishu && canDiscord) return 'settings.dalton.channelBindingsLabelDiscord';
+  }
+  return entry.labelKey;
+}
+
 export function settingSearchText(
   entry: SettingEntry,
   t: (key: string, opts?: Record<string, unknown>) => string,
+  ctx?: DaltonSettingVisibilityContext | null,
 ): string {
+  // DALTON-HOOK(standalone-core): omit disabled channel names from title, description, and search keywords
+  const labelKey = settingLabelKey(entry, ctx);
+  let descKey = entry.descKey;
+  let keywords = entry.keywords ?? '';
+  if (entry.anchor === 'dalton-notify-targets' || entry.anchor === 'dalton-channel-bindings') {
+    const canFeishu = hasRequiredCapability(ctx?.capabilities, 'channel_feishu');
+    const canDiscord = hasRequiredCapability(ctx?.capabilities, 'channel_discord');
+    const channelTokens: string[] = [];
+    if (canFeishu) channelTokens.push('飞书 feishu 飞书提醒');
+    if (canDiscord) channelTokens.push('Discord discord');
+    if (entry.anchor === 'dalton-channel-bindings') {
+      if (canFeishu && !canDiscord) {
+        descKey = 'settings.dalton.channelBindingsDescFeishu';
+      } else if (!canFeishu && canDiscord) {
+        descKey = 'settings.dalton.channelBindingsDescDiscord';
+      }
+    }
+    keywords =
+      entry.anchor === 'dalton-notify-targets'
+        ? `通知目标 自动推送 消息提醒 notify targets 推送总开关 总开关 推送开关 ${channelTokens.join(' ')}`.trim()
+        : `账号绑定 绑定码 私聊 机器人 bind code account ${channelTokens.join(' ')}`.trim();
+  }
   return [
-    t(entry.labelKey, { brand: BRAND_NAME }), // DALTON-HOOK(brand-name)
-    entry.descKey ? t(entry.descKey, { brand: BRAND_NAME }) : '', // DALTON-HOOK(brand-name)
+    t(labelKey, { brand: BRAND_NAME }), // DALTON-HOOK(brand-name)
+    descKey ? t(descKey, { brand: BRAND_NAME }) : '', // DALTON-HOOK(brand-name)
     ...(entry.alsoKeys ?? []).map((key) => t(key, { brand: BRAND_NAME })), // DALTON-HOOK(brand-name)
     t(SECTIONS[entry.section].labelKey),
     // DALTON-HOOK(settings-section): match bilingual keywords so Chinese and English queries always hit
-    entry.keywords ?? '',
+    keywords,
   ].join(' ');
 }
 

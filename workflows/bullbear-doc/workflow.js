@@ -246,7 +246,7 @@ const main = await agent(
 写 ${C}（${T}）Bull/Bear Discussion 主稿到 ${runDir}/main.md，严格按 v4.2 结构（${S}/references/v42-structure.md 与 ${S}/references/ai-revenue-rules.md）。
 研究窗口 ${days} 天（截至 ${D}）。股东回报只引用 ${runDir}/return_summary.md，预留 <!-- INSERT:return --> 与 <!-- INSERT:return_appendix --> 占位，不自行重算。
 ${args.prior_draft ? `上一版：${args.prior_draft}，“我的判断”有变化要写明原因。` : ''}
-必须检索：内部库（sales-notes、tmtb、funda-ai）、company-wiki（只读）、AlphaEngine（foreign_report、sell_side_comment、meeting_minutes 分开搜）、Guidepoint（英文检索，原话 ≤20 英文词）、最新 filing 与电话会。
+必须检索：/* DALTON_CAP:researchdata_bridge */内部库（sales-notes、tmtb、funda-ai）、company-wiki（只读）、/* /DALTON_CAP *//* DALTON_CAP:alphaengine */AlphaEngine（foreign_report、sell_side_comment、meeting_minutes 分开搜）、/* /DALTON_CAP *//* DALTON_CAP:guidepoint */Guidepoint（英文检索，原话 ≤20 英文词）、/* /DALTON_CAP */最新 filing 与电话会。
 写完跑 python ${S}/scripts/bb_check.py ${runDir}/main.md，直到 0 WARN。`,
   { agentType: 'general-purpose', label: `${T} 主稿`, phase: '主稿', schema: DRAFT_SCHEMA }
 )

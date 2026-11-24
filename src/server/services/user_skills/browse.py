@@ -69,19 +69,37 @@ class DiskFolder:
     """A shipped skill's folder, walked on construction. A symlink is skipped
     rather than followed, so nothing outside the folder is listed or served."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, *, assemble: bool = False) -> None:
+        # DALTON-HOOK(standalone-core): optionally assemble conditional capability fragments
+        # when browsing shipped platform skills so callers never see raw DALTON_CAP markers.
         self._root = root
+        self._assemble = assemble
         self.files: dict[str, int] = {}
+        self._assembled_cache: dict[str, bytes] = {}
+        from src.dalton.content_assembly import assemble_file_bytes
+
         for entry in sorted(root.rglob("*")):
             rel = entry.relative_to(root).as_posix()
             if entry.is_symlink() or not entry.is_file() or not _listed(rel):
                 continue
-            self.files[rel] = entry.stat().st_size
+            if assemble:
+                data = assemble_file_bytes(entry)
+                self._assembled_cache[rel] = data
+                self.files[rel] = len(data)
+            else:
+                self.files[rel] = entry.stat().st_size
             if len(self.files) >= _LISTED:
                 break
 
     def read(self, path: str) -> bytes:
-        return (self._root / path).read_bytes()
+        if self._assemble and path in self._assembled_cache:
+            return self._assembled_cache[path]
+        target = self._root / path
+        if self._assemble:
+            from src.dalton.content_assembly import assemble_file_bytes
+
+            return assemble_file_bytes(target)
+        return target.read_bytes()
 
 
 def _as_text(data: bytes) -> str | None:
