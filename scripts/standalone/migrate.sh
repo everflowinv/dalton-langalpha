@@ -33,7 +33,9 @@ conninfo = {
     # Empty values fall back like the PostgreSQL entrypoint's ${VAR:-default}.
     "port": int(os.getenv("DB_PORT") or "5432"),
     "user": os.getenv("DB_USER") or "postgres",
-    "password": os.getenv("DB_PASSWORD") or "postgres",
+    # PostgreSQL refuses to start with an empty DB_PASSWORD (docker-compose.core.yml),
+    # and Alembic/backend read it verbatim, so there is no default here.
+    "password": os.environ["DB_PASSWORD"],
     "dbname": os.getenv("DB_NAME") or "postgres",
     "sslmode": os.getenv("DB_SSLMODE", "prefer"),
 }

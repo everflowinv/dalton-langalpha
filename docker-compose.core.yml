@@ -38,13 +38,19 @@ services:
     # !override drops upstream docker-compose.yml's shell-interpolated POSTGRES_PASSWORD
     # so DB_USER / DB_PASSWORD / DB_NAME come strictly from `env_file: .env` and are
     # mapped at container start. POSTGRES_* lines in .env are ignored, so the database,
-    # migrate and backend always use the same credentials.
+    # migrate and backend always use the same credentials. An empty DB_PASSWORD stops
+    # here: the Alembic runs and backend would read it as an empty password.
     entrypoint:
       - /bin/sh
       - -c
       - |
+        if [ -z "$${DB_PASSWORD:-}" ]; then
+          echo "DB_PASSWORD is empty in .env. Run scripts/standalone/init.sh to generate it." >&2
+          exit 1
+        fi
+        unset POSTGRES_PASSWORD_FILE POSTGRES_USER_FILE POSTGRES_DB_FILE
         export POSTGRES_USER="$${DB_USER:-postgres}"
-        export POSTGRES_PASSWORD="$${DB_PASSWORD:-postgres}"
+        export POSTGRES_PASSWORD="$${DB_PASSWORD}"
         export POSTGRES_DB="$${DB_NAME:-postgres}"
         exec docker-entrypoint.sh "$$@"
       - --
