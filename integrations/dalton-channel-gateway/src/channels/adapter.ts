@@ -1,10 +1,16 @@
-import type { BackendClient } from "../backend-client.js";
+import type {
+  BackendClient,
+  WeixinPreflightAuthorizedData,
+  WeixinPreflightSendResponse,
+} from "../backend-client.js";
+import type { GatewayLeaseManager } from "../gateway-lease.js";
 import type {
   AvailableChatItem,
   ChannelPlatform,
   InboundAttachmentDescriptor,
   InboundChannelEvent,
   NativeInteractionEvent,
+  OneTimeWeixinReplyEnvelope,
 } from "../types.js";
 
 export type ChannelErrorOutcome = "failed" | "unknown" | "rate_limited";
@@ -18,6 +24,8 @@ export class ChannelDeliveryError extends Error {
   readonly outcome: ChannelErrorOutcome;
   readonly code: ChannelErrorCode;
   readonly retryAfterMs?: number;
+  readonly retryable?: boolean;
+  readonly denyCode?: string;
 
   constructor(
     message: string,
@@ -25,6 +33,8 @@ export class ChannelDeliveryError extends Error {
       outcome: ChannelErrorOutcome;
       code: ChannelErrorCode;
       retryAfterMs?: number;
+      retryable?: boolean;
+      denyCode?: string;
     },
   ) {
     super(message);
@@ -32,6 +42,8 @@ export class ChannelDeliveryError extends Error {
     this.outcome = options.outcome;
     this.code = options.code;
     this.retryAfterMs = options.retryAfterMs;
+    this.retryable = options.retryable;
+    this.denyCode = options.denyCode;
   }
 }
 
@@ -61,6 +73,11 @@ export interface SendTextChunkOptions {
   onConfirmedThread?: (confirmed: { address: string }) => Promise<void>;
   weixinContextToken?: string | null;
   inboundMessageId?: string | null;
+  /** Claim attempt generation from I-6 (used by Weixin `preflight-send`). */
+  deliveryAttempt?: number;
+  /** Authoritative Weixin preflight credentials for this exact chunk send. */
+  weixinPreflight?: WeixinPreflightAuthorizedData | null;
+  weixinAccountId?: string | null;
 }
 
 export interface SendTextChunkResult {
@@ -76,8 +93,15 @@ export interface SendFileOptions {
   content: Buffer;
   mimeType: string;
   threadScopeKey?: string | null;
+  deliveryKey?: string | null;
+  deliveryAttempt?: number;
   weixinContextToken?: string | null;
   inboundMessageId?: string | null;
+  /** Authoritative Weixin preflight credentials before CDN upload. */
+  weixinPreflight?: WeixinPreflightAuthorizedData | null;
+  /** Called right after CDN upload and immediately before `sendmessage` to re-verify account authorization. */
+  refreshWeixinPreflight?: () => Promise<WeixinPreflightSendResponse>;
+  weixinAccountId?: string | null;
 }
 
 export interface SendFileResult {
@@ -178,6 +202,7 @@ export interface WeixinQrStartResult {
   status?: string;
   expires_at?: string;
   message?: string;
+  login_version?: number;
 }
 
 export interface WeixinQrWaitResult {
@@ -190,8 +215,16 @@ export interface WeixinQrWaitResult {
     | "verify_code"
     | "need_verify"
     | "need_verifycode"
+    | "superseded"
     | "error";
   connected?: boolean;
+  already_connected?: boolean;
+  account_id?: string | null;
+  account_status?: string | null;
+  accounts_revision?: number | null;
+  pending_verification?: boolean;
+  revoked?: boolean;
+  code?: string | null;
   ilink_bot_id?: string | null;
   ilink_user_id?: string | null;
   ilink_username?: string | null;
@@ -341,9 +374,30 @@ export interface ChannelAdapter {
     purpose: string;
   }): Promise<CheckTargetLiveResult>;
 
-  /** Optional Weixin iLink QR login methods (§1.5 #4, §4.4). */
+  /** Optional Weixin iLink multi-account & QR login methods (§3.1 ~ §3.5). */
   setBackendClient?(client: BackendClient): void;
-  startQrLogin?(options: { userId: string }): Promise<WeixinQrStartResult>;
+  setLeaseManager?(lease: GatewayLeaseManager): void;
+  onWeixinAccountInvalidated?(
+    handler: (info: { accountId: string; reason: string }) => void,
+  ): void;
+  triggerAccountsSync?(
+    targetRevision?: number | null,
+    reason?: string,
+  ): Promise<{ ok: boolean; accepted_revision: number }>;
+  /**
+   * D16 one-time Weixin reply using inbound `context_token` directly without `preflight-send`.
+   * Deduplicated by `dedupeKey` in process memory so retries do not duplicate the notice.
+   */
+  sendOneTimeReply?(
+    envelope: OneTimeWeixinReplyEnvelope,
+    dedupeKey?: string,
+  ): Promise<{ sent: boolean; duplicate?: boolean; messageId?: string }>;
+  startQrLogin?(options: {
+    userId: string;
+    sessionKey?: string;
+    loginVersion?: number;
+    expectedBotGeneration?: number;
+  }): Promise<WeixinQrStartResult>;
   waitQrLogin?(options: {
     userId: string;
     sessionKey: string;

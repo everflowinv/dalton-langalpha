@@ -4,12 +4,14 @@ import {
   BackendHttpError,
   type I7DeliveriesProgressRequest,
   type I7DeliveriesProgressResponse,
+  type WeixinPreflightAuthorizedData,
 } from "./backend-client.js";
 import {
   type ChannelAdapter,
   ChannelDeliveryError,
   type SendCardImageInput,
 } from "./channels/adapter.js";
+import { isStaleGatewayEpochError } from "./gateway-lease.js";
 import type {
   DataTaskAuthorizePlanResponse,
   DataTaskItemDeliveryOutcome,
@@ -115,6 +117,7 @@ type ValidatedDataTaskClaim =
       isCurrent: false;
       homeWorkspaceId: string | null;
       weixinContextToken: string | null;
+      deliveryAttempt?: number;
     }
   | {
       kind: "already_completed";
@@ -213,6 +216,12 @@ function validateDataTaskClaimResponse(
         reason: "I-6 claimed response has missing or invalid weixin_context_token.",
       };
     }
+    const deliveryAttempt =
+      typeof rawClaim.delivery_attempt === "number" &&
+      Number.isInteger(rawClaim.delivery_attempt) &&
+      rawClaim.delivery_attempt > 0
+        ? rawClaim.delivery_attempt
+        : undefined;
     return {
       kind: "claimed",
       platform: expected.platform,
@@ -221,6 +230,7 @@ function validateDataTaskClaimResponse(
       isCurrent: false,
       homeWorkspaceId: rawClaim.home_workspace_id,
       weixinContextToken: rawClaim.weixin_context_token,
+      ...(deliveryAttempt !== undefined ? { deliveryAttempt } : {}),
     };
   }
 
@@ -384,6 +394,7 @@ export class DataTaskNotificationService {
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
   private readonly mode: "incoming" | "outgoing";
   private readonly queue: SequentialQueue;
+  private startupBlocked = false;
 
   constructor(options: DataTaskNotificationServiceOptions) {
     this.backend = options.backend;
@@ -392,6 +403,55 @@ export class DataTaskNotificationService {
     this.queue = createSequentialQueue({
       taskTimeoutMs: options.queueTaskTimeoutMs ?? 180_000,
     });
+  }
+
+  setStartupBlocked(blocked: boolean): void {
+    this.startupBlocked = blocked;
+  }
+
+  private async runWeixinPreflight(
+    deliveryKey: string,
+    deliveryAttempt: number,
+    chunkIndex: number,
+  ): Promise<WeixinPreflightAuthorizedData> {
+    const pf = await this.backend.preflightWeixinSend(deliveryKey, {
+      delivery_attempt: deliveryAttempt,
+      chunk_index: chunkIndex,
+    });
+    if (pf.authorized) {
+      return pf;
+    }
+    if (pf.deny_code === "source_generation_unknown") {
+      throw new ChannelDeliveryError(
+        pf.message ?? "Weixin delivery source generation is unknown.",
+        {
+          outcome: "unknown",
+          code: "unavailable",
+          retryable: false,
+          denyCode: pf.deny_code,
+        },
+      );
+    }
+    if (pf.decision === "defer" || pf.retryable) {
+      throw new ChannelDeliveryError(
+        pf.message ?? `Weixin send deferred (${pf.deny_code}); please retry.`,
+        {
+          outcome: "failed",
+          code: "unavailable",
+          retryable: true,
+          denyCode: pf.deny_code,
+        },
+      );
+    }
+    throw new ChannelDeliveryError(
+      pf.message ?? `Weixin send denied (${pf.deny_code}).`,
+      {
+        outcome: "failed",
+        code: "not_allowed",
+        retryable: false,
+        denyCode: pf.deny_code,
+      },
+    );
   }
 
   private isAdapterOutboundReady(adapter: ChannelAdapter | undefined): boolean {
@@ -417,6 +477,9 @@ export class DataTaskNotificationService {
     try {
       rawAck = await this.backend.updateDeliveryProgress(req);
     } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        throw err;
+      }
       throw new DataTaskBackendAckError(
         safeBackendErrorMessage(
           err,
@@ -649,6 +712,9 @@ export class DataTaskNotificationService {
         },
       };
     } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        throw err;
+      }
       const isUncertain = tracker.claimedAnyItem || tracker.itemsSent > 0;
       const msg = safeBackendErrorMessage(
         err,
@@ -689,6 +755,23 @@ export class DataTaskNotificationService {
     tracker: ExecutionStateTracker,
     options?: AuthorizedPlanDeliveryOptions,
   ): Promise<{ status: number; data: DataTaskNotificationResponse }> {
+    if (this.startupBlocked) {
+      return {
+        status: 200,
+        data: {
+          ok: false,
+          status: "failed",
+          code: "unavailable",
+          message: "Gateway startup recovery is still in progress.",
+          run_id: runId,
+          target,
+          platform: null,
+          items_total: 0,
+          items_sent: 0,
+          items: [],
+        },
+      };
+    }
     const claimKind = options?.claimKind ?? "data_task";
     const liveCheckPurpose =
       options?.liveCheckPurpose ?? "data_task_notification";
@@ -965,6 +1048,9 @@ export class DataTaskNotificationService {
           total_chunks: totalChunks,
         });
       } catch (claimErr) {
+        if (isStaleGatewayEpochError(claimErr)) {
+          throw claimErr;
+        }
         const cMsg = safeBackendErrorMessage(
           claimErr,
           "I-6 authorize-and-claim request failed without a confirmed response.",
@@ -1463,6 +1549,9 @@ export class DataTaskNotificationService {
               error_message: artMsg,
             });
           } catch (progressErr) {
+            if (isStaleGatewayEpochError(progressErr)) {
+              throw progressErr;
+            }
             const pMsg = safeBackendErrorMessage(
               progressErr,
               "Failed to record attachment validation failure progress.",
@@ -1575,15 +1664,35 @@ export class DataTaskNotificationService {
               text: textChunks[i]!,
             });
           } else {
+            const effectiveWeixinAttempt = validatedClaim.deliveryAttempt ?? 1;
+            let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
+            if (platform === "weixin") {
+              weixinPreflight = await this.runWeixinPreflight(
+                item.delivery_key,
+                effectiveWeixinAttempt,
+                i,
+              );
+            }
             chunkRes = await readyAdapter.sendTextChunk({
               targetAddress,
-              recipientPlatformUserId,
+              recipientPlatformUserId:
+                weixinPreflight?.recipient_id ?? recipientPlatformUserId,
               text: textChunks[i]!,
               chunkIndex: i,
               totalChunks: textChunks.length,
+              deliveryKey: item.delivery_key,
+              deliveryAttempt: effectiveWeixinAttempt,
+              weixinPreflight,
+              weixinAccountId: weixinPreflight?.account_id ?? null,
+              weixinContextToken:
+                weixinPreflight?.weixin_context_token ??
+                validatedClaim.weixinContextToken,
             });
           }
         } catch (chunkErr) {
+          if (isStaleGatewayEpochError(chunkErr)) {
+            throw chunkErr;
+          }
           const classified = classifyAdapterError(chunkErr);
           const anySent = sentChunks > 0;
           const itemStatus: "partial" | "unknown" | "failed" = anySent
@@ -1602,7 +1711,10 @@ export class DataTaskNotificationService {
               error_code: classified.code,
               error_message: classified.message,
             });
-          } catch {
+          } catch (progressErr) {
+            if (isStaleGatewayEpochError(progressErr)) {
+              throw progressErr;
+            }
             itemOutcomes.push({
               item_index: item.item_index,
               delivery_key: item.delivery_key,
@@ -1664,6 +1776,9 @@ export class DataTaskNotificationService {
             platform_message_ids: [...messageIds],
           });
         } catch (progressErr) {
+          if (isStaleGatewayEpochError(progressErr)) {
+            throw progressErr;
+          }
           const pMsg = safeBackendErrorMessage(
             progressErr,
             "I-7 chunk progress acknowledgement failed after platform send; state is uncertain.",
@@ -1697,13 +1812,39 @@ export class DataTaskNotificationService {
 
       if (item.kind === "text_and_file" && verifiedAttachment && !fileAttachedToText) {
         try {
+          const effectiveWeixinAttempt = validatedClaim.deliveryAttempt ?? 1;
+          const fileChunkIndex = textChunks.length;
+          let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
+          if (platform === "weixin") {
+            weixinPreflight = await this.runWeixinPreflight(
+              item.delivery_key,
+              effectiveWeixinAttempt,
+              fileChunkIndex,
+            );
+          }
           const fileRes = await readyAdapter.sendFile({
             targetAddress,
-            recipientPlatformUserId,
+            recipientPlatformUserId:
+              weixinPreflight?.recipient_id ?? recipientPlatformUserId,
             path: verifiedAttachment.filename,
             filename: verifiedAttachment.filename,
             content: verifiedAttachment.content,
             mimeType: verifiedAttachment.mimeType,
+            deliveryKey: item.delivery_key,
+            deliveryAttempt: effectiveWeixinAttempt,
+            weixinPreflight,
+            weixinAccountId: weixinPreflight?.account_id ?? null,
+            weixinContextToken:
+              weixinPreflight?.weixin_context_token ??
+              validatedClaim.weixinContextToken,
+            refreshWeixinPreflight:
+              platform === "weixin"
+                ? () =>
+                    this.backend.preflightWeixinSend(item.delivery_key, {
+                      delivery_attempt: effectiveWeixinAttempt,
+                      chunk_index: fileChunkIndex,
+                    })
+                : undefined,
           });
           if (fileRes.status !== "sent") {
             const substMsg =
@@ -1728,6 +1869,9 @@ export class DataTaskNotificationService {
                 error_message: substMsg,
               });
             } catch (progressErr) {
+              if (isStaleGatewayEpochError(progressErr)) {
+                throw progressErr;
+              }
               const pMsg = safeBackendErrorMessage(
                 progressErr,
                 "Failed to record file delivery failure progress; state is uncertain.",
@@ -1789,6 +1933,9 @@ export class DataTaskNotificationService {
             reason: null,
           });
         } catch (fileErr) {
+          if (isStaleGatewayEpochError(fileErr)) {
+            throw fileErr;
+          }
           const classified = classifyAdapterError(fileErr);
           const anySent = sentChunks > 0;
           const itemStatus: "partial" | "unknown" | "failed" = anySent
@@ -1812,7 +1959,10 @@ export class DataTaskNotificationService {
               error_code: classified.code,
               error_message: classified.message,
             });
-          } catch {
+          } catch (progressErr) {
+            if (isStaleGatewayEpochError(progressErr)) {
+              throw progressErr;
+            }
             itemOutcomes.push({
               item_index: item.item_index,
               delivery_key: item.delivery_key,
@@ -1879,6 +2029,9 @@ export class DataTaskNotificationService {
           },
         });
       } catch (progressErr) {
+        if (isStaleGatewayEpochError(progressErr)) {
+          throw progressErr;
+        }
         const pMsg = safeBackendErrorMessage(
           progressErr,
           "I-7 progress acknowledgement failed after platform delivery; state is uncertain.",

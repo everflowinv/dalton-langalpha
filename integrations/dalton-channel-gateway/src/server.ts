@@ -15,6 +15,10 @@ import { AutomationNotificationService } from "./automation-notifications.js";
 import { DataTaskNotificationService } from "./data-task-notifications.js";
 import { handleOpsAlert } from "./ops-alerts.js";
 import { DeliveryService } from "./delivery-service.js";
+import {
+  GatewayLeaseManager,
+  isStaleGatewayEpochError,
+} from "./gateway-lease.js";
 import { ChannelGatewayOrchestrator } from "./orchestrator.js";
 import type {
   AgentAutomationOutputPutRequest,
@@ -34,6 +38,7 @@ export interface GatewayApp {
   readonly dataTaskNotifications: DataTaskNotificationService;
   readonly agentRoutes: AgentRoutesHandler;
   readonly orchestrator: ChannelGatewayOrchestrator;
+  readonly leaseManager?: GatewayLeaseManager;
   start(): Promise<{ host: string; port: number }>;
   stop(): Promise<void>;
 }
@@ -122,6 +127,33 @@ export function sanitizePublicWeixinQrResponse(
   if (typeof src.already_connected === "boolean") {
     out.already_connected = src.already_connected;
   }
+  if (typeof src.account_id === "string" && src.account_id.trim()) {
+    out.account_id = src.account_id.trim();
+  }
+  if (typeof src.account_status === "string" && src.account_status.trim()) {
+    out.account_status = src.account_status.trim();
+  }
+  if (
+    typeof src.accounts_revision === "number" &&
+    Number.isFinite(src.accounts_revision)
+  ) {
+    out.accounts_revision = Math.trunc(src.accounts_revision);
+  }
+  if (
+    typeof src.login_version === "number" &&
+    Number.isFinite(src.login_version)
+  ) {
+    out.login_version = Math.trunc(src.login_version);
+  }
+  if (typeof src.pending_verification === "boolean") {
+    out.pending_verification = src.pending_verification;
+  }
+  if (typeof src.revoked === "boolean") {
+    out.revoked = src.revoked;
+  }
+  if (typeof src.code === "string" && src.code.trim()) {
+    out.code = src.code.trim();
+  }
   if (typeof src.need_rescan === "boolean") {
     out.need_rescan = src.need_rescan;
   }
@@ -162,6 +194,12 @@ export function createGatewayApp(options: {
   backoffDelayFn?: (ms: number) => Promise<void>;
   busyThreadMaxWaitMs?: number;
   nowFn?: () => number;
+  leaseManager?: GatewayLeaseManager;
+  enableLease?: boolean;
+  leaseTtlSeconds?: number;
+  leaseHeartbeatIntervalMs?: number;
+  leaseAcquireRetryMs?: number;
+  onLeaseLost?: (reason: string, error?: unknown) => void;
 }): GatewayApp {
   const { config, backend, adapters } = options;
   if (config.host !== "127.0.0.1") {
@@ -203,12 +241,59 @@ export function createGatewayApp(options: {
     deliveryService,
     agentRoutes,
     webBaseUrl: config.webBaseUrl,
-    weixinCacheDir: config.weixinCacheDir,
     statusFeedback: config.statusFeedback,
     backoffDelayFn: options.backoffDelayFn,
     busyThreadMaxWaitMs: options.busyThreadMaxWaitMs,
     nowFn: options.nowFn,
   });
+
+  let stopInProgress = false;
+  const handleFatalLeaseLost = (reason: string, error?: unknown): void => {
+    deliveryService.setStartupBlocked(true);
+    dataTaskNotifications.setStartupBlocked(true);
+    backend.setGatewayEpoch?.(null);
+    if (!stopInProgress) {
+      stopInProgress = true;
+      void (async () => {
+        try {
+          await orchestrator.stopAllWatches();
+          for (const adapter of adapters.values()) {
+            await adapter.stop();
+          }
+          if (server.listening) {
+            await new Promise<void>((resolveClose) => {
+              server.close(() => resolveClose());
+            });
+          }
+        } finally {
+          options.onLeaseLost?.(reason, error);
+        }
+      })();
+    }
+  };
+
+  const shouldUseLease =
+    config.mode !== "outgoing" && options.enableLease !== false;
+  const leaseManager = shouldUseLease
+    ? (options.leaseManager ??
+      new GatewayLeaseManager({
+        backend,
+        ttlSeconds: options.leaseTtlSeconds,
+        heartbeatIntervalMs: options.leaseHeartbeatIntervalMs,
+        acquireRetryMs: options.leaseAcquireRetryMs,
+        onEpochAcquired: (epoch) => {
+          backend.setGatewayEpoch?.(epoch);
+        },
+        onLeaseLost: handleFatalLeaseLost,
+      }))
+    : undefined;
+
+  if (leaseManager) {
+    backend.setOnStaleGatewayEpoch?.((err) => {
+      leaseManager.notifyLeaseLost("backend_409_stale_epoch", err);
+    });
+    wxInitial?.setLeaseManager?.(leaseManager);
+  }
 
   const server = createServer(async (req, res) => {
     try {
@@ -405,16 +490,56 @@ export function createGatewayApp(options: {
         return;
       }
 
-      // Internal Weixin QR Login Proxy Routes (§1.5 #4)
+      // Internal Weixin Multi-Account Sync Nudge (§3.1)
+      if (method === "POST" && pathname === "/internal/weixin/accounts/sync") {
+        const body = await readJsonBody<{
+          accounts_revision?: number;
+          reason?: string;
+        }>(req);
+        const wxAdapter = adapters.get("weixin");
+        if (!wxAdapter?.triggerAccountsSync) {
+          sendJson(res, 200, {
+            ok: true,
+            accepted_revision: body.accounts_revision ?? 0,
+          });
+          return;
+        }
+        const syncRes = await wxAdapter.triggerAccountsSync(
+          typeof body.accounts_revision === "number"
+            ? body.accounts_revision
+            : undefined,
+          typeof body.reason === "string" ? body.reason : "backend_nudge",
+        );
+        sendJson(res, 200, syncRes);
+        return;
+      }
+
+      // Internal Weixin QR Login Proxy Routes (§1.5 #4, §3.1)
       if (method === "POST" && pathname === "/internal/weixin/qrcode/start") {
-        const body = await readJsonBody<{ user_id?: string }>(req);
+        const body = await readJsonBody<{
+          user_id?: string;
+          session_key?: string;
+          login_version?: number;
+          expected_bot_generation?: number;
+        }>(req);
         const uid = body.user_id ?? headerUserId ?? "";
         const wxAdapter = adapters.get("weixin");
         if (!wxAdapter?.startQrLogin) {
           sendJson(res, 503, { detail: "Weixin QR login is not available" });
           return;
         }
-        const out = await wxAdapter.startQrLogin({ userId: uid });
+        const out = await wxAdapter.startQrLogin({
+          userId: uid,
+          ...(typeof body.session_key === "string" && body.session_key.trim()
+            ? { sessionKey: body.session_key.trim() }
+            : {}),
+          ...(typeof body.login_version === "number"
+            ? { loginVersion: body.login_version }
+            : {}),
+          ...(typeof body.expected_bot_generation === "number"
+            ? { expectedBotGeneration: body.expected_bot_generation }
+            : {}),
+        });
         sendJson(res, 200, sanitizePublicWeixinQrResponse(out));
         return;
       }
@@ -477,6 +602,13 @@ export function createGatewayApp(options: {
 
       sendJson(res, 404, { detail: "Not found" });
     } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        sendJson(res, 409, {
+          detail: err.message,
+          code: "stale_gateway_epoch",
+        });
+        return;
+      }
       if (err instanceof WeixinQrLoginError) {
         sendJson(res, err.statusCode, {
           detail: err.message,
@@ -499,14 +631,14 @@ export function createGatewayApp(options: {
     dataTaskNotifications,
     agentRoutes,
     orchestrator,
+    leaseManager,
     async start(): Promise<{ host: string; port: number }> {
+      let startupRecoverySnapshot = null;
       if (config.mode !== "outgoing") {
-        await orchestrator.syncWeixinStateCache();
-        for (const adapter of adapters.values()) {
-          if (adapter.isConfigured() || adapter.platform === "weixin") {
-            await adapter.start();
-          }
-        }
+        // D1 / §3.5 strict startup ordering:
+        // Block I-6 claims while HTTP /health binds, lease is acquired, and mode=startup recovery snapshot completes.
+        deliveryService.setStartupBlocked(true);
+        dataTaskNotifications.setStartupBlocked(true);
       }
       await new Promise<void>((resolveListen, rejectListen) => {
         server.once("error", rejectListen);
@@ -516,18 +648,46 @@ export function createGatewayApp(options: {
         });
       });
       if (config.mode !== "outgoing") {
-        // Kick off startup recovery in background without blocking HTTP listen or adapters
-        orchestrator.startStartupRecoveryInBackground();
+        try {
+          if (leaseManager) {
+            const epoch = await leaseManager.acquireUntilGranted();
+            backend.setGatewayEpoch?.(epoch);
+          }
+          // Complete mode=startup recovery snapshot BEFORE starting any long-polling or I-6 claims.
+          startupRecoverySnapshot =
+            await orchestrator.fetchStartupRecoverySnapshot();
+          deliveryService.setStartupBlocked(false);
+          dataTaskNotifications.setStartupBlocked(false);
+          for (const adapter of adapters.values()) {
+            if (adapter.isConfigured() || adapter.platform === "weixin") {
+              await adapter.start();
+            }
+          }
+        } catch (err) {
+          if (server.listening) {
+            await new Promise<void>((resolveClose) => {
+              server.close(() => resolveClose());
+            });
+          }
+          throw err;
+        }
+        if (startupRecoverySnapshot) {
+          // Dispatch long-running recovery streams/tasks in background after HTTP listen & adapters are ready.
+          orchestrator.dispatchStartupRecoverySnapshot(startupRecoverySnapshot);
+        }
       }
       const addr = server.address() as AddressInfo;
       return { host: addr.address, port: addr.port };
     },
     async stop(): Promise<void> {
+      stopInProgress = true;
       if (config.mode !== "outgoing") {
         await orchestrator.stopAllWatches();
         for (const adapter of adapters.values()) {
           await adapter.stop();
         }
+        await leaseManager?.stopAndRelease();
+        backend.setGatewayEpoch?.(null);
       }
       if (server.listening) {
         await new Promise<void>((resolveClose) => {

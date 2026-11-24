@@ -189,7 +189,8 @@ export function assertIlinkBusinessOk(
   throw new WeixinApiError({
     kind: expired ? "session_expired" : "business_error",
     endpoint,
-    message: `${endpoint} business error: ret=${String(ret ?? 0)} errcode=${String(errcode ?? 0)} errmsg=${payload.errmsg ?? ""}`.trim(),
+    // §4.3: never emit raw iLink errmsg text into logs or error strings
+    message: `${endpoint} business error: ret=${String(ret ?? 0)} errcode=${String(errcode ?? 0)}`,
     ret,
     errcode,
     requestSent,
@@ -361,7 +362,8 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
     throw new WeixinApiError({
       kind: "http_error",
       endpoint: params.endpoint,
-      message: `${params.endpoint} HTTP ${response.status}: ${rawText.slice(0, 200)}`,
+      // §4.3: never emit raw HTTP response body into logs or error strings
+      message: `${params.endpoint} HTTP ${response.status}`,
       status: response.status,
       requestSent: requestDispatched,
     });

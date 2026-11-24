@@ -1,4 +1,5 @@
 import type { SessionCommandTargetKind } from "./commands.js";
+import type { WeixinPersistedAttachmentMeta } from "./channels/weixin/types.js";
 
 export type ChannelPlatform = "feishu" | "discord" | "weixin";
 
@@ -222,6 +223,8 @@ export interface InboundChannelEvent {
   isGroupTrigger?: boolean;
   /** Inbound attachments on this message. */
   attachments?: InboundAttachmentDescriptor[];
+  /** Weixin `account_id` (`dalton_weixin_accounts.id`) when `platform === "weixin"`. */
+  weixinAccountId?: string;
   /** Weixin `context_token` when `platform === "weixin"`. */
   weixinContextToken?: string;
   /** Stable Weixin `ilink_bot_id` when `platform === "weixin"`. */
@@ -230,10 +233,30 @@ export interface InboundChannelEvent {
   weixinBotGeneration?: number;
   /** Protocol `seq` for Weixin context ordering. Platform time stays on `create_time_ms`. */
   weixinContextSeq?: number;
+  /** Weixin media decryption metadata sent separately to backend so backend encrypts it at rest. */
+  weixinMediaMeta?: WeixinPersistedAttachmentMeta[];
+  /** Unsupported iLink item types (e.g. merged-forward) observed on this inbound message. */
+  unsupportedItemTypes?: number[];
   /** True when a Weixin voice message had no server-side text transcription. */
   voiceWithoutTranscription?: boolean;
   /** Arbitrary platform payload saved in `raw_payload`. */
   rawPayload?: Record<string, unknown>;
+}
+
+/**
+ * D16 one-time Weixin reply returned by backend after conflict auto-unbind or `/unbind`.
+ * Dispatched directly with the inbound message's `context_token` without `preflight-send`.
+ */
+export interface OneTimeWeixinReplyEnvelope {
+  account_id: string;
+  ilink_bot_id: string;
+  bot_generation: number;
+  bot_token: string;
+  base_url: string;
+  cdn_base_url?: string | null;
+  recipient_id: string;
+  context_token: string;
+  text: string;
 }
 
 export type NativeInteractionAckOutcome = "acknowledged" | "failed" | "unknown";

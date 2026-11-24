@@ -593,23 +593,19 @@ export async function uploadBufferToWeixinCdn(
       }
 
       if (res.status >= 400 && res.status < 500) {
-        const errMsg =
-          res.headers.get("x-error-message") ?? (await res.text());
+        await res.body?.cancel().catch(() => undefined);
         throw new WeixinApiError({
           kind: "http_error",
           endpoint: "cdn/upload",
-          message: `Weixin CDN upload client error HTTP ${res.status}: ${errMsg.slice(0, 200)}`,
+          message: `Weixin CDN upload client error HTTP ${res.status}`,
           status: res.status,
           requestSent: true,
         });
       }
 
       if (!res.ok) {
-        const errMsg =
-          res.headers.get("x-error-message") ?? (await res.text());
-        throw new Error(
-          `Weixin CDN upload server error HTTP ${res.status}: ${errMsg.slice(0, 200)}`,
-        );
+        await res.body?.cancel().catch(() => undefined);
+        throw new Error(`Weixin CDN upload server error HTTP ${res.status}`);
       }
 
       const downloadParam = res.headers.get("x-encrypted-param")?.trim();

@@ -1,8 +1,29 @@
+import type { ChannelPlatform } from "./types.js";
+
 export type SessionCommandTargetKind =
   | "home"
   | "workspace_id"
   | "exact_name"
   | "shortcut_name";
+
+export type CoreSessionCommand =
+  | "workspace_list"
+  | "workspace_switch"
+  | "new"
+  | "stop";
+
+export type WeixinSessionCommand = "collect" | "done" | "cancel" | "help";
+
+export type SessionCommand = CoreSessionCommand | WeixinSessionCommand;
+
+export function isCoreSessionCommand(cmd: string): cmd is CoreSessionCommand {
+  return (
+    cmd === "workspace_list" ||
+    cmd === "workspace_switch" ||
+    cmd === "new" ||
+    cmd === "stop"
+  );
+}
 
 export type ParsedSlashCommand =
   | {
@@ -16,10 +37,11 @@ export type ParsedSlashCommand =
     }
   | {
       kind: "session";
-      cmd: "workspace_list" | "workspace_switch" | "new" | "stop";
+      cmd: SessionCommand;
       targetKind?: SessionCommandTargetKind;
       workspaceId?: string;
       workspaceQuery?: string;
+      commandArg?: string;
       canonicalCommand: string;
     }
   | {
@@ -109,6 +131,7 @@ export function normalizeCommandCandidateText(
 export function parseSlashCommand(
   rawText: string,
   chatType: "dm" | "group" = "dm",
+  platform?: ChannelPlatform,
 ): ParsedSlashCommand | null {
   const candidate = normalizeCommandCandidateText(rawText, chatType);
   if (!candidate.startsWith("/")) {
@@ -222,6 +245,56 @@ export function parseSlashCommand(
       cmd: "stop",
       canonicalCommand: "/stop",
     };
+  }
+
+  if (platform === "weixin") {
+    if (head === "collect" || head === "收集") {
+      return {
+        kind: "session",
+        cmd: "collect",
+        commandArg: rest || undefined,
+        canonicalCommand: rest ? `/collect ${rest}` : "/collect",
+      };
+    }
+
+    if (head === "done" || head === "完成") {
+      return {
+        kind: "session",
+        cmd: "done",
+        commandArg: rest || undefined,
+        canonicalCommand: rest ? `/done ${rest}` : "/done",
+      };
+    }
+
+    if (head === "cancel" || head === "取消") {
+      if (rest) {
+        return {
+          kind: "invalid",
+          reason: "unexpected_arguments",
+          message: `Usage: \`/cancel\` (takes no arguments). To switch to a workspace named "${fullBody}", use \`/workspace ${fullBody}\`.`,
+        };
+      }
+      return {
+        kind: "session",
+        cmd: "cancel",
+        canonicalCommand: "/cancel",
+      };
+    }
+
+    if (head === "help") {
+      if (rest) {
+        return {
+          kind: "invalid",
+          reason: "unexpected_arguments",
+          message: `Usage: \`/help\` (takes no arguments). To switch to a workspace named "${fullBody}", use \`/workspace ${fullBody}\`.`,
+        };
+      }
+      return {
+        kind: "session",
+        cmd: "help",
+        canonicalCommand: "/help",
+      };
+    }
   }
 
   if (head === "workspace") {

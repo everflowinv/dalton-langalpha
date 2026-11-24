@@ -3,6 +3,8 @@ import {
   SafeFetchError,
 } from "./shared/safe-fetch.js";
 import type { SessionCommandTargetKind } from "./commands.js";
+import type { WeixinPersistedAttachmentMeta } from "./channels/weixin/types.js";
+import { StaleGatewayEpochError } from "./gateway-lease.js";
 import type {
   DataTaskAuthorizePlanResponse,
   DataTaskDownloadedArtifact,
@@ -13,6 +15,7 @@ import {
   type ChannelPlatform,
   type ChatContentItem,
   MAX_ATTACHMENT_BYTES,
+  type OneTimeWeixinReplyEnvelope,
   type PendingInterruptState,
   type UploadedAttachmentRecord,
 } from "./types.js";
@@ -125,10 +128,13 @@ export interface I1RegisterAndResolveRequest {
   message_id: string;
   request_key: string;
   raw_payload?: Record<string, unknown>;
+  weixin_account_id?: string | null;
   weixin_context_token?: string | null;
   weixin_bot_id?: string | null;
   weixin_bot_generation?: number | null;
   weixin_context_seq?: number | null;
+  weixin_media_meta?: WeixinPersistedAttachmentMeta[] | null;
+  unsupported_item_types?: number[] | null;
 }
 
 export interface I1RegisterAndResolveResponse {
@@ -154,6 +160,9 @@ export interface I1RegisterAndResolveResponse {
     | "colleague_dispatch_disabled"
     | "workspace_not_found"
     | "weixin_group_unsupported"
+    | "unsupported_merged_forward"
+    | "ilink_user_conflict_auto_unbound"
+    | "conflict_auto_unbound"
     | "invalid_inbound_event"
     | string
     | null;
@@ -183,6 +192,16 @@ export interface I1RegisterAndResolveResponse {
   command_result?: Record<string, unknown> | null;
   /** False means the confirmation was already accepted and must not be sent again. */
   command_reply_pending?: boolean;
+  /** Weixin collection mode outcome (`"appended"` or `"limit_reached"`). */
+  collection_mode?: "appended" | "limit_reached" | string | null;
+  collect_buffer_id?: string | null;
+  collect_buffer_status?: string | null;
+  /** Whether a usable context_token exists for sending a hint (e.g. merged-forward unsupported). */
+  has_usable_weixin_context_token?: boolean;
+  /** D16 one-time Weixin reply envelope (e.g. conflict auto-unbind). */
+  one_time_weixin_reply?: OneTimeWeixinReplyEnvelope | null;
+  weixin_account_id?: string | null;
+  weixin_context_token_version?: number | null;
 }
 
 export interface I2BindCodeConsumeRequest {
@@ -191,6 +210,7 @@ export interface I2BindCodeConsumeRequest {
   platform_user_id: string;
   platform_username?: string | null;
   platform_tenant_key?: string | null;
+  weixin_account_id?: string | null;
   weixin_context_token?: string | null;
   weixin_bot_id?: string | null;
   weixin_bot_generation?: number | null;
@@ -226,10 +246,39 @@ export interface I2BindCodeConsumeResponse {
   duplicate?: boolean;
   command_effect_status?: string | null;
   command_reply_pending?: boolean;
+  accounts_revision?: number | null;
+  one_time_weixin_reply?: OneTimeWeixinReplyEnvelope | null;
+}
+
+export interface WeixinFlushedInbound {
+  message_id: string;
+  request_key: string;
+  dalton_user_id: string;
+  platform_user_id: string;
+  chat_address: string;
+  thread_scope_key: string;
+  workspace_id: string | null;
+  workspace_status?: string | null;
+  external_thread_id: string | null;
+  generation: number;
+  text: string;
+  uploaded_attachments: UploadedAttachmentRecord[];
+  weixin_account_id?: string | null;
+  weixin_bot_id?: string | null;
+  weixin_bot_generation?: number | null;
+  raw_payload?: Record<string, unknown>;
 }
 
 export interface I3SessionCommandRequest {
-  cmd: "workspace_list" | "workspace_switch" | "new" | "stop";
+  cmd:
+    | "workspace_list"
+    | "workspace_switch"
+    | "new"
+    | "stop"
+    | "collect"
+    | "done"
+    | "cancel"
+    | "help";
   platform: ChannelPlatform;
   dalton_user_id?: string | null;
   platform_user_id?: string | null;
@@ -241,10 +290,12 @@ export interface I3SessionCommandRequest {
   workspace_id?: string | null;
   workspace_query?: string | null;
   target_kind?: SessionCommandTargetKind | null;
+  command_arg?: string | null;
   external_thread_id?: string | null;
   message_id?: string | null;
   request_key?: string | null;
   raw_payload?: Record<string, unknown> | null;
+  weixin_account_id?: string | null;
   weixin_context_token?: string | null;
   weixin_bot_id?: string | null;
   weixin_bot_generation?: number | null;
@@ -292,6 +343,8 @@ export interface I3SessionCommandResponse {
     | "colleague_dispatch_disabled"
     | "interaction_ack_unknown"
     | "interaction_ack_failed"
+    | "ilink_user_conflict_auto_unbound"
+    | "conflict_auto_unbound"
     | string;
   candidates?: Array<{ workspace_id: string; name: string }>;
   current_workspace_id?: string | null;
@@ -311,6 +364,13 @@ export interface I3SessionCommandResponse {
   /** HTTP status from a permanent `/stop` cancel denial, kept with the command result. */
   stop_cancel_status?: number | null;
   switched?: boolean;
+  /** Weixin collection mode / help fields. */
+  collect_buffer_id?: string | null;
+  collect_status?: "collecting" | "done" | "cancelled" | "empty" | "not_collecting" | string | null;
+  cancelled_buffer_id?: string | null;
+  reply_text?: string | null;
+  flushed_inbound?: WeixinFlushedInbound | null;
+  one_time_weixin_reply?: OneTimeWeixinReplyEnvelope | null;
 }
 
 /** Stored I-2 bind/unbind result. `user_id` may remain after the platform identity is removed. */
@@ -460,7 +520,11 @@ export interface I6AuthorizeAndClaimResponse {
   thread_scope_key?: string | null;
   is_current?: boolean;
   home_workspace_id?: string;
+  weixin_account_id?: string | null;
+  weixin_bot_id?: string | null;
+  weixin_bot_generation?: number | null;
   weixin_context_token?: string | null;
+  weixin_context_token_version?: number | null;
   source_scope_key?: string | null;
   source_generation?: number | null;
   activity_origin?: string | null;
@@ -636,6 +700,13 @@ export interface RecoverInboundEventRow {
   sent_to_current_count: number;
   uploaded_attachments: UploadedAttachmentRecord[];
   raw_payload: Record<string, unknown>;
+  /** Backend-decrypted Weixin attachment metadata (takes precedence over `raw_payload` during recovery). */
+  decrypted_weixin_attachments?: WeixinPersistedAttachmentMeta[] | null;
+  collect_buffer_id?: string | null;
+  collect_buffer_status?: string | null;
+  weixin_account_id?: string | null;
+  weixin_context_bot_id?: string | null;
+  weixin_context_bot_generation?: number | null;
   pending_interrupt?: PendingInterruptState | null;
   created_at?: string | null;
   updated_at?: string | null;
@@ -689,12 +760,24 @@ export interface RecoverAutomationRunRow {
   targets: AutomationRunTargetRecord[];
 }
 
+export interface RecoverFlushingCollectBufferRow {
+  buffer_id: string;
+  dalton_user_id: string;
+  weixin_account_id?: string | null;
+  thread_scope_key?: string | null;
+  workspace_id?: string | null;
+  status: string;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
 export interface I7RecoverResponse {
   mode: "startup" | "watch_reconnect";
   inbound_events?: RecoverInboundEventRow[];
   background_runs: RecoverBackgroundRunRow[];
   thread_watches: RecoverThreadWatchRow[];
   automation_runs?: RecoverAutomationRunRow[];
+  flushing_collect_buffers?: RecoverFlushingCollectBufferRow[];
 }
 
 export interface I8AutomationRunStartRequest {
@@ -731,83 +814,226 @@ export interface I8AutomationRunFinishResponse {
   targets: AutomationRunTargetRecord[];
 }
 
-export interface I9WeixinStateGetOptions {
-  include_token?: boolean;
-  recipient_platform_user_id?: string | null;
-  inbound_message_id?: string | null;
+// ---------------------------------------------------------------------------
+// Gateway Lease & Weixin Multi-Account Internal Contracts (§3.1 ~ §3.5, §4.4)
+// ---------------------------------------------------------------------------
+
+export interface GatewayLeaseAcquireRequest {
+  instance_id: string;
+  ttl_seconds: number;
 }
 
-export interface I9WeixinStateGetResponse {
-  configured: boolean;
-  ilink_bot_id: string | null;
-  owner_user_id: string | null;
-  ilink_user_id?: string | null;
+export interface GatewayLeaseAcquireResponse {
+  granted: boolean;
+  epoch: number;
+  expires_at: string;
+  retry_after_ms?: number;
+}
+
+export interface GatewayLeaseHeartbeatRequest {
+  instance_id: string;
+  epoch: number;
+  ttl_seconds: number;
+}
+
+export interface GatewayLeaseHeartbeatResponse {
+  ok: boolean;
+  epoch: number;
+  expires_at: string;
+}
+
+export interface GatewayLeaseReleaseRequest {
+  instance_id: string;
+  epoch: number;
+}
+
+export interface GatewayLeaseReleaseResponse {
+  ok: boolean;
+  released: boolean;
+}
+
+export interface WeixinAccountSnapshot {
+  account_id: string;
+  user_id: string;
+  ilink_bot_id: string;
+  ilink_user_id: string | null;
+  prev_ilink_user_id?: string | null;
   ilink_username?: string | null;
-  bot_token?: string | null;
+  bot_token: string;
   base_url: string;
   cdn_base_url?: string | null;
   get_updates_buf: string;
-  status: "active" | "expired" | "unconfigured" | string;
-  bot_generation?: number;
-  updated_at: string | null;
-  login_session_key?: string | null;
-  login_owner_user_id?: string | null;
-  login_version?: number | null;
-  login_expected_bot_generation?: number | null;
-  login_status?: string | null;
-  login_qrcode?: string | null;
-  login_qrcode_img_content?: string | null;
-  login_redirect_base_url?: string | null;
-  login_expires_at?: string | null;
-  login_confirmed_result?: Record<string, unknown> | null;
-  login_updated_at?: string | null;
-  weixin_context_token?: string | null;
+  status: "active" | "pending_verification" | "expired" | "unbound" | string;
+  bot_generation: number;
+  last_inbound_at?: string | null;
+  updated_at?: string | null;
 }
 
-export interface I9WeixinStatePutRequest {
+export interface WeixinAccountsReconcileResponse {
+  changed: boolean;
+  enabled: boolean;
+  allow_external?: boolean;
+  max_concurrent_accounts: number;
+  accounts_revision: number;
+  accounts: WeixinAccountSnapshot[];
+}
+
+export interface WeixinAccountDetailResponse {
+  account_id: string;
+  user_id: string;
+  ilink_bot_id: string;
+  ilink_user_id: string | null;
+  ilink_username?: string | null;
+  bot_token: string;
+  base_url: string;
+  cdn_base_url?: string | null;
+  bot_generation: number;
+  status: string;
+  get_updates_buf?: string | null;
+  weixin_context_token?: string | null;
+  weixin_context_token_version?: number | null;
+}
+
+export interface WeixinAccountCursorUpdateRequest {
+  expected_bot_generation: number;
+  expected_ilink_bot_id: string;
+  expected_get_updates_buf: string;
+  get_updates_buf: string;
+}
+
+export interface WeixinAccountCursorUpdateResponse {
+  ok: boolean;
+  updated: boolean;
+  stale_generation?: boolean;
+  cas_mismatch?: boolean;
+  bot_generation?: number;
+  get_updates_buf?: string;
+  status?: string;
+}
+
+export interface WeixinAccountStatusUpdateRequest {
+  action: "mark_session_expired" | "mark_context_token_stale" | "reset_corrupt_cursor";
+  expected_bot_generation: number;
+  expected_ilink_bot_id: string;
+  error_code?: number | string | null;
+  recipient_platform_user_id?: string | null;
+  expected_token_version?: number | null;
+}
+
+export interface WeixinAccountStatusUpdateResponse {
+  ok: boolean;
+  updated: boolean;
+  stale_generation?: boolean;
+  version_mismatch?: boolean;
+  accounts_revision?: number | null;
+}
+
+export interface WeixinLoginSessionGetResponse {
+  session_key: string;
+  user_id: string;
+  target_account_id?: string | null;
+  login_version: number;
+  expected_bot_generation: number;
+  status: string;
+  qrcode?: string | null;
+  qrcode_img_content?: string | null;
+  redirect_base_url?: string | null;
+  expires_at?: string | null;
+  connected?: boolean;
+  already_connected?: boolean;
+  confirmed_result?: Record<string, unknown> | null;
+}
+
+export interface WeixinLoginSessionPatchRequest {
+  action: "save_qr" | "update" | "confirm";
+  expected_login_version?: number | null;
+  expected_bot_generation?: number | null;
+  status?: string | null;
+  qrcode?: string | null;
+  qrcode_img_content?: string | null;
+  redirect_base_url?: string | null;
   ilink_bot_id?: string | null;
-  owner_user_id?: string | null;
   bot_token?: string | null;
   base_url?: string | null;
   cdn_base_url?: string | null;
-  get_updates_buf?: string | null;
-  status?: string | null;
   ilink_user_id?: string | null;
   ilink_username?: string | null;
-  expected_bot_generation?: number | null;
-  expected_ilink_bot_id?: string | null;
-  expected_get_updates_buf?: string | null;
-  login_session_action?: "start" | "update" | "confirm" | null;
-  login_session_key?: string | null;
-  login_owner_user_id?: string | null;
-  login_version?: number | null;
-  login_status?: string | null;
-  login_qrcode?: string | null;
-  login_qrcode_img_content?: string | null;
-  login_redirect_base_url?: string | null;
-  login_expires_at?: string | null;
 }
 
-export interface I9WeixinStatePutResponse {
+export interface WeixinLoginSessionPatchResponse {
   ok: boolean;
-  updated?: boolean;
-  idempotent?: boolean;
-  stale_session?: boolean;
-  stale_generation?: boolean;
-  cas_mismatch?: boolean;
-  reason?: string | null;
-  session_key?: string | null;
-  login_version?: number | null;
-  expected_bot_generation?: number | null;
-  bot_generation?: number;
+  revoked?: boolean;
+  session_key?: string;
+  status?: string;
+  account_status?: string | null;
+  login_version?: number;
+  expires_at?: string | null;
+  redirect_base_url?: string | null;
+  ilink_bot_id?: string | null;
+  ilink_user_id?: string | null;
+  ilink_username?: string | null;
+  account_id?: string | null;
+  connected?: boolean;
+  already_connected?: boolean;
+  bot_generation?: number | null;
+  accounts_revision?: number | null;
   confirmed_result?: Record<string, unknown> | null;
-  ilink_bot_id: string | null;
-  owner_user_id: string | null;
-  base_url: string;
-  get_updates_buf: string;
-  status: string;
-  updated_at: string | null;
+  code?: string | null;
+  message?: string | null;
 }
+
+export interface WeixinCollectAttachmentsRegisterRequest {
+  uploaded_attachments: UploadedAttachmentRecord[];
+  upload_failed?: boolean;
+  error_message?: string | null;
+}
+
+export interface WeixinCollectAttachmentsRegisterResponse {
+  ok: boolean;
+  upload_status: "ready" | "failed" | "cancelled" | string;
+  collect_buffer_status: string;
+  code?: string | null;
+  message?: string | null;
+}
+
+export interface WeixinCollectBufferFinalizeResponse {
+  ok: boolean;
+  status: "done" | "cancelled" | string;
+  flushed_inbound?: WeixinFlushedInbound | null;
+}
+
+export interface WeixinPreflightSendRequest {
+  delivery_attempt: number;
+  chunk_index: number;
+}
+
+export interface WeixinPreflightAuthorizedData {
+  authorized: true;
+  decision: "allow";
+  retryable: false;
+  chunk_index?: number;
+  account_id: string;
+  ilink_bot_id: string;
+  bot_generation: number;
+  bot_token: string;
+  base_url: string;
+  cdn_base_url?: string | null;
+  recipient_id: string;
+  weixin_context_token: string;
+  weixin_context_token_version: number;
+}
+
+export interface WeixinPreflightDeniedData {
+  authorized: false;
+  decision: "defer" | "deny";
+  retryable: boolean;
+  deny_code: string;
+  message?: string | null;
+}
+
+export type WeixinPreflightSendResponse =
+  | WeixinPreflightAuthorizedData
+  | WeixinPreflightDeniedData;
 
 // ---------------------------------------------------------------------------
 // Upstream Conversation & Workspace Shapes (`PROTOCOL.md` §1 ~ §8)
@@ -940,7 +1166,25 @@ export interface ThreadWakeupItem {
 // ---------------------------------------------------------------------------
 
 export interface BackendClient {
-  // I-1 ~ I-9 Internal Persistence Endpoints
+  // Gateway epoch fencing
+  setGatewayEpoch?(epoch: number | null): void;
+  getGatewayEpoch?(): number | null;
+  setOnStaleGatewayEpoch?(handler: ((err: StaleGatewayEpochError) => void) | null): void;
+
+  // Gateway Deployment Lease (D1)
+  acquireGatewayLease(
+    req: GatewayLeaseAcquireRequest,
+  ): Promise<GatewayLeaseAcquireResponse>;
+
+  heartbeatGatewayLease(
+    req: GatewayLeaseHeartbeatRequest,
+  ): Promise<GatewayLeaseHeartbeatResponse>;
+
+  releaseGatewayLease(
+    req: GatewayLeaseReleaseRequest,
+  ): Promise<GatewayLeaseReleaseResponse>;
+
+  // I-1 ~ I-8 Internal Persistence Endpoints
   registerAndResolveInbound(
     req: I1RegisterAndResolveRequest,
   ): Promise<I1RegisterAndResolveResponse>;
@@ -988,11 +1232,52 @@ export interface BackendClient {
     userId?: string,
   ): Promise<{ status: number; data: I8AutomationRunFinishResponse | null }>;
 
-  getWeixinState(
-    includeTokenOrOptions?: boolean | I9WeixinStateGetOptions,
-  ): Promise<I9WeixinStateGetResponse>;
+  // Weixin Multi-Account, QR Login, Collection & Preflight Internal Endpoints
+  reconcileWeixinAccounts(
+    sinceRevision?: number | null,
+  ): Promise<WeixinAccountsReconcileResponse>;
 
-  putWeixinState(req: I9WeixinStatePutRequest): Promise<I9WeixinStatePutResponse>;
+  getWeixinAccountDetail(
+    accountId: string,
+    options?: {
+      recipient_platform_user_id?: string | null;
+      inbound_message_id?: string | null;
+    },
+  ): Promise<WeixinAccountDetailResponse>;
+
+  updateWeixinAccountCursor(
+    accountId: string,
+    req: WeixinAccountCursorUpdateRequest,
+  ): Promise<WeixinAccountCursorUpdateResponse>;
+
+  updateWeixinAccountStatus(
+    accountId: string,
+    req: WeixinAccountStatusUpdateRequest,
+  ): Promise<WeixinAccountStatusUpdateResponse>;
+
+  getWeixinLoginSession(
+    sessionKey: string,
+  ): Promise<WeixinLoginSessionGetResponse>;
+
+  patchWeixinLoginSession(
+    sessionKey: string,
+    req: WeixinLoginSessionPatchRequest,
+  ): Promise<WeixinLoginSessionPatchResponse>;
+
+  registerWeixinCollectItemAttachments(
+    bufferId: string,
+    messageId: string,
+    req: WeixinCollectAttachmentsRegisterRequest,
+  ): Promise<WeixinCollectAttachmentsRegisterResponse>;
+
+  finalizeWeixinCollectBuffer(
+    bufferId: string,
+  ): Promise<WeixinCollectBufferFinalizeResponse>;
+
+  preflightWeixinSend(
+    deliveryKey: string,
+    req: WeixinPreflightSendRequest,
+  ): Promise<WeixinPreflightSendResponse>;
 
   // Upstream Conversation, Replay, Watch & Workspace Endpoints
   createThreadMessages(
@@ -1107,6 +1392,8 @@ export class HttpBackendClient implements BackendClient {
   private readonly baseUrl: string;
   private readonly serviceToken: string;
   private readonly fetchImpl: typeof fetch;
+  private gatewayEpoch: number | null = null;
+  private onStaleGatewayEpoch: ((err: StaleGatewayEpochError) => void) | null = null;
 
   constructor(options: {
     baseUrl: string;
@@ -1119,7 +1406,23 @@ export class HttpBackendClient implements BackendClient {
     this.fetchImpl = options.fetchImpl ?? options.fetchFn ?? globalThis.fetch;
   }
 
-  private headers(userId?: string | null, extra?: Record<string, string>): Record<string, string> {
+  setGatewayEpoch(epoch: number | null): void {
+    this.gatewayEpoch = epoch;
+  }
+
+  getGatewayEpoch(): number | null {
+    return this.gatewayEpoch;
+  }
+
+  setOnStaleGatewayEpoch(handler: ((err: StaleGatewayEpochError) => void) | null): void {
+    this.onStaleGatewayEpoch = handler;
+  }
+
+  private headers(
+    userId?: string | null,
+    extra?: Record<string, string>,
+    includeGatewayEpoch?: boolean,
+  ): Record<string, string> {
     const h: Record<string, string> = {
       "X-Service-Token": this.serviceToken,
       ...(extra ?? {}),
@@ -1127,7 +1430,44 @@ export class HttpBackendClient implements BackendClient {
     if (userId) {
       h["X-User-Id"] = userId;
     }
+    if (includeGatewayEpoch && this.gatewayEpoch !== null) {
+      h["X-Gateway-Epoch"] = String(this.gatewayEpoch);
+    }
     return h;
+  }
+
+  private checkStaleGatewayEpoch(status: number, parsed: unknown, path: string): void {
+    if (status !== 409) {
+      return;
+    }
+    const obj =
+      parsed && typeof parsed === "object"
+        ? (parsed as Record<string, unknown>)
+        : null;
+    const detailObj =
+      obj?.detail && typeof obj.detail === "object"
+        ? (obj.detail as Record<string, unknown>)
+        : null;
+    const code =
+      typeof obj?.code === "string"
+        ? obj.code
+        : typeof detailObj?.code === "string"
+          ? detailObj.code
+          : null;
+    if (code === "stale_gateway_epoch") {
+      const msg =
+        typeof obj?.message === "string"
+          ? obj.message
+          : typeof detailObj?.message === "string"
+            ? detailObj.message
+            : `Stale gateway epoch on ${path}`;
+      const err = new StaleGatewayEpochError(msg, {
+        status: 409,
+        epoch: this.gatewayEpoch,
+      });
+      this.onStaleGatewayEpoch?.(err);
+      throw err;
+    }
   }
 
   private async jsonRequest<T>(
@@ -1142,6 +1482,7 @@ export class HttpBackendClient implements BackendClient {
       cache?: RequestCache;
       strictJson?: boolean;
       operationLabel?: string;
+      includeGatewayEpoch?: boolean;
     },
   ): Promise<{ status: number; data: T }> {
     const url = new URL(`${this.baseUrl}${path}`);
@@ -1157,6 +1498,7 @@ export class HttpBackendClient implements BackendClient {
       headers: this.headers(
         options?.userId,
         options?.body !== undefined ? { "Content-Type": "application/json" } : undefined,
+        options?.includeGatewayEpoch,
       ),
       ...(options?.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
       ...(options?.redirect ? { redirect: options.redirect } : {}),
@@ -1167,6 +1509,16 @@ export class HttpBackendClient implements BackendClient {
     };
     const resp = await this.fetchImpl(url, init);
     const text = await resp.text();
+    if (resp.status === 409 && text.trim()) {
+      try {
+        const maybeStale = JSON.parse(text);
+        this.checkStaleGatewayEpoch(resp.status, maybeStale, path);
+      } catch (err) {
+        if (err instanceof StaleGatewayEpochError) {
+          throw err;
+        }
+      }
+    }
     if (options?.strictJson) {
       const label = options.operationLabel ?? path;
       if (resp.status >= 300 && resp.status < 400) {
@@ -1210,6 +1562,7 @@ export class HttpBackendClient implements BackendClient {
         parsed = { message: text };
       }
     }
+    this.checkStaleGatewayEpoch(resp.status, parsed, path);
     return { status: resp.status, data: parsed as T };
   }
 
@@ -1274,6 +1627,61 @@ export class HttpBackendClient implements BackendClient {
     };
   }
 
+  // --- Gateway Deployment Lease (D1) ---
+  async acquireGatewayLease(
+    req: GatewayLeaseAcquireRequest,
+  ): Promise<GatewayLeaseAcquireResponse> {
+    const { status, data } = await this.jsonRequest<GatewayLeaseAcquireResponse>(
+      "POST",
+      "/api/v1/dalton/channels/internal/gateway-lease/acquire",
+      { body: req, timeoutMs: 15_000 },
+    );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `gateway-lease/acquire failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
+  async heartbeatGatewayLease(
+    req: GatewayLeaseHeartbeatRequest,
+  ): Promise<GatewayLeaseHeartbeatResponse> {
+    const { status, data } = await this.jsonRequest<GatewayLeaseHeartbeatResponse>(
+      "POST",
+      "/api/v1/dalton/channels/internal/gateway-lease/heartbeat",
+      { body: req, timeoutMs: 15_000 },
+    );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `gateway-lease/heartbeat failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
+  async releaseGatewayLease(
+    req: GatewayLeaseReleaseRequest,
+  ): Promise<GatewayLeaseReleaseResponse> {
+    const { status, data } = await this.jsonRequest<GatewayLeaseReleaseResponse>(
+      "POST",
+      "/api/v1/dalton/channels/internal/gateway-lease/release",
+      { body: req, timeoutMs: 10_000 },
+    );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `gateway-lease/release failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
   // --- I-1 ---
   async registerAndResolveInbound(
     req: I1RegisterAndResolveRequest,
@@ -1281,10 +1689,14 @@ export class HttpBackendClient implements BackendClient {
     const { status, data } = await this.jsonRequest<I1RegisterAndResolveResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
-      { body: req },
+      { body: req, includeGatewayEpoch: true },
     );
     if (status >= 400) {
-      throw new Error(`I-1 register-and-resolve failed (${status}): ${JSON.stringify(data)}`);
+      throw new BackendHttpError(
+        `I-1 register-and-resolve failed (${status})`,
+        status,
+        data,
+      );
     }
     return data;
   }
@@ -1296,10 +1708,14 @@ export class HttpBackendClient implements BackendClient {
     const { status, data } = await this.jsonRequest<I2BindCodeConsumeResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/bind-code/consume",
-      { userId: req.user_id, body: req },
+      { userId: req.user_id, body: req, includeGatewayEpoch: true },
     );
     if (status >= 400) {
-      throw new Error(`I-2 bind-code/consume failed (${status}): ${JSON.stringify(data)}`);
+      throw new BackendHttpError(
+        `I-2 bind-code/consume failed (${status})`,
+        status,
+        data,
+      );
     }
     return data;
   }
@@ -1337,10 +1753,18 @@ export class HttpBackendClient implements BackendClient {
     const { status, data } = await this.jsonRequest<I3SessionCommandResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/session/command",
-      { userId: req.dalton_user_id, body: sanitizedBody },
+      {
+        userId: req.dalton_user_id,
+        body: sanitizedBody,
+        includeGatewayEpoch: !req.is_internal_query,
+      },
     );
     if (status >= 400) {
-      throw new Error(`I-3 session/command failed (${status}): ${JSON.stringify(data)}`);
+      throw new BackendHttpError(
+        `I-3 session/command failed (${status})`,
+        status,
+        data,
+      );
     }
     return data;
   }
@@ -1398,6 +1822,7 @@ export class HttpBackendClient implements BackendClient {
           cache: "no-store",
           strictJson: true,
           operationLabel: "I-6 authorize-and-claim",
+          includeGatewayEpoch: true,
         },
       );
       return data;
@@ -1405,10 +1830,14 @@ export class HttpBackendClient implements BackendClient {
     const { status, data } = await this.jsonRequest<I6AuthorizeAndClaimResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
-      { userId: req.user_id, body: req },
+      { userId: req.user_id, body: req, includeGatewayEpoch: true },
     );
     if (status >= 400) {
-      throw new Error(`I-6 authorize-and-claim failed (${status}): ${JSON.stringify(data)}`);
+      throw new BackendHttpError(
+        `I-6 authorize-and-claim failed (${status})`,
+        status,
+        data,
+      );
     }
     return data;
   }
@@ -1432,6 +1861,7 @@ export class HttpBackendClient implements BackendClient {
           cache: "no-store",
           strictJson: true,
           operationLabel: "I-7 deliveries/progress",
+          includeGatewayEpoch: true,
         },
       );
       return data;
@@ -1439,10 +1869,14 @@ export class HttpBackendClient implements BackendClient {
     const { status, data } = await this.jsonRequest<I7DeliveriesProgressResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/deliveries/progress",
-      { body: req },
+      { body: req, includeGatewayEpoch: true },
     );
     if (status >= 400) {
-      throw new Error(`I-7 deliveries/progress failed (${status}): ${JSON.stringify(data)}`);
+      throw new BackendHttpError(
+        `I-7 deliveries/progress failed (${status})`,
+        status,
+        data,
+      );
     }
     return data;
   }
@@ -1454,10 +1888,14 @@ export class HttpBackendClient implements BackendClient {
     const { status, data } = await this.jsonRequest<I7InboundProgressResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/inbound/progress",
-      { body: req },
+      { body: req, includeGatewayEpoch: true },
     );
     if (status >= 400) {
-      throw new Error(`I-7 inbound/progress failed (${status}): ${JSON.stringify(data)}`);
+      throw new BackendHttpError(
+        `I-7 inbound/progress failed (${status})`,
+        status,
+        data,
+      );
     }
     return data;
   }
@@ -1469,10 +1907,14 @@ export class HttpBackendClient implements BackendClient {
     const { status, data } = await this.jsonRequest<I7SteersReconcileResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/steers/reconcile",
-      { body: req },
+      { body: req, includeGatewayEpoch: true },
     );
     if (status >= 400) {
-      throw new Error(`I-7 steers/reconcile failed (${status}): ${JSON.stringify(data)}`);
+      throw new BackendHttpError(
+        `I-7 steers/reconcile failed (${status})`,
+        status,
+        data,
+      );
     }
     return data;
   }
@@ -1490,10 +1932,15 @@ export class HttpBackendClient implements BackendClient {
           mode: params.mode,
           thread_id: params.thread_id,
         },
+        includeGatewayEpoch: true,
       },
     );
     if (status >= 400) {
-      throw new Error(`I-7 recover failed (${status}): ${JSON.stringify(data)}`);
+      throw new BackendHttpError(
+        `I-7 recover failed (${status})`,
+        status,
+        data,
+      );
     }
     return data;
   }
@@ -1508,7 +1955,11 @@ export class HttpBackendClient implements BackendClient {
       { userId: req.user_id, body: req },
     );
     if (status >= 400) {
-      throw new Error(`I-8 automation-runs failed (${status}): ${JSON.stringify(data)}`);
+      throw new BackendHttpError(
+        `I-8 automation-runs failed (${status})`,
+        status,
+        data,
+      );
     }
     return data;
   }
@@ -1528,46 +1979,224 @@ export class HttpBackendClient implements BackendClient {
       return { status: 404, data: null };
     }
     if (status >= 400) {
-      throw new Error(`I-8 automation-runs/finish failed (${status}): ${JSON.stringify(data)}`);
+      throw new BackendHttpError(
+        `I-8 automation-runs/finish failed (${status})`,
+        status,
+        data,
+      );
     }
     return { status, data };
   }
 
-  // --- I-9 (GET) ---
-  async getWeixinState(
-    includeTokenOrOptions: boolean | I9WeixinStateGetOptions = true,
-  ): Promise<I9WeixinStateGetResponse> {
-    const opts: I9WeixinStateGetOptions =
-      typeof includeTokenOrOptions === "boolean"
-        ? { include_token: includeTokenOrOptions }
-        : includeTokenOrOptions;
-    const includeToken = opts.include_token !== false;
-    const { status, data } = await this.jsonRequest<I9WeixinStateGetResponse>(
-      "GET",
-      "/api/v1/dalton/channels/internal/weixin-state",
+  // --- Weixin Multi-Account, QR Login, Collection & Preflight Internal Endpoints ---
+
+  async reconcileWeixinAccounts(
+    sinceRevision?: number | null,
+  ): Promise<WeixinAccountsReconcileResponse> {
+    const { status, data } = await this.jsonRequest<WeixinAccountsReconcileResponse>(
+      "POST",
+      "/api/v1/dalton/channels/internal/weixin/accounts/reconcile",
       {
-        query: {
-          include_token: includeToken ? "true" : "false",
-          recipient_platform_user_id: opts.recipient_platform_user_id ?? undefined,
-          inbound_message_id: opts.inbound_message_id ?? undefined,
-        },
+        body:
+          sinceRevision !== undefined && sinceRevision !== null
+            ? { since_revision: sinceRevision }
+            : {},
+        timeoutMs: 15_000,
+        includeGatewayEpoch: true,
       },
     );
     if (status >= 400) {
-      throw new Error(`I-9 getWeixinState failed (${status}): ${JSON.stringify(data)}`);
+      throw new BackendHttpError(
+        `weixin/accounts/reconcile failed (${status})`,
+        status,
+        data,
+      );
     }
     return data;
   }
 
-  // --- I-9 (PUT) ---
-  async putWeixinState(req: I9WeixinStatePutRequest): Promise<I9WeixinStatePutResponse> {
-    const { status, data } = await this.jsonRequest<I9WeixinStatePutResponse>(
-      "PUT",
-      "/api/v1/dalton/channels/internal/weixin-state",
-      { body: req },
+  async getWeixinAccountDetail(
+    accountId: string,
+    options?: {
+      recipient_platform_user_id?: string | null;
+      inbound_message_id?: string | null;
+    },
+  ): Promise<WeixinAccountDetailResponse> {
+    const { status, data } = await this.jsonRequest<WeixinAccountDetailResponse>(
+      "GET",
+      `/api/v1/dalton/channels/internal/weixin/accounts/${encodeURIComponent(accountId)}`,
+      {
+        query: {
+          recipient_platform_user_id: options?.recipient_platform_user_id ?? undefined,
+          inbound_message_id: options?.inbound_message_id ?? undefined,
+        },
+        timeoutMs: 15_000,
+      },
     );
     if (status >= 400) {
-      throw new Error(`I-9 putWeixinState failed (${status}): ${JSON.stringify(data)}`);
+      throw new BackendHttpError(
+        `weixin/accounts/detail failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
+  async updateWeixinAccountCursor(
+    accountId: string,
+    req: WeixinAccountCursorUpdateRequest,
+  ): Promise<WeixinAccountCursorUpdateResponse> {
+    const { status, data } = await this.jsonRequest<WeixinAccountCursorUpdateResponse>(
+      "POST",
+      `/api/v1/dalton/channels/internal/weixin/accounts/${encodeURIComponent(accountId)}/cursor`,
+      {
+        body: req,
+        timeoutMs: 15_000,
+        includeGatewayEpoch: true,
+      },
+    );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `weixin/accounts/cursor failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
+  async updateWeixinAccountStatus(
+    accountId: string,
+    req: WeixinAccountStatusUpdateRequest,
+  ): Promise<WeixinAccountStatusUpdateResponse> {
+    const { status, data } = await this.jsonRequest<WeixinAccountStatusUpdateResponse>(
+      "POST",
+      `/api/v1/dalton/channels/internal/weixin/accounts/${encodeURIComponent(accountId)}/status`,
+      {
+        body: req,
+        timeoutMs: 15_000,
+        includeGatewayEpoch: true,
+      },
+    );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `weixin/accounts/status failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
+  async getWeixinLoginSession(
+    sessionKey: string,
+  ): Promise<WeixinLoginSessionGetResponse> {
+    const { status, data } = await this.jsonRequest<WeixinLoginSessionGetResponse>(
+      "GET",
+      `/api/v1/dalton/channels/internal/weixin/login-sessions/${encodeURIComponent(sessionKey)}`,
+      { timeoutMs: 15_000 },
+    );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `weixin/login-sessions GET failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
+  async patchWeixinLoginSession(
+    sessionKey: string,
+    req: WeixinLoginSessionPatchRequest,
+  ): Promise<WeixinLoginSessionPatchResponse> {
+    const { status, data } = await this.jsonRequest<WeixinLoginSessionPatchResponse>(
+      "PATCH",
+      `/api/v1/dalton/channels/internal/weixin/login-sessions/${encodeURIComponent(sessionKey)}`,
+      {
+        body: req,
+        timeoutMs: 15_000,
+        includeGatewayEpoch: true,
+      },
+    );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `weixin/login-sessions PATCH failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
+  async registerWeixinCollectItemAttachments(
+    bufferId: string,
+    messageId: string,
+    req: WeixinCollectAttachmentsRegisterRequest,
+  ): Promise<WeixinCollectAttachmentsRegisterResponse> {
+    const { status, data } =
+      await this.jsonRequest<WeixinCollectAttachmentsRegisterResponse>(
+        "POST",
+        `/api/v1/dalton/channels/internal/weixin/collect-buffers/${encodeURIComponent(bufferId)}/items/${encodeURIComponent(messageId)}/attachments`,
+        {
+          body: req,
+          timeoutMs: 15_000,
+          includeGatewayEpoch: true,
+        },
+      );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `weixin/collect-buffers/attachments failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
+  async finalizeWeixinCollectBuffer(
+    bufferId: string,
+  ): Promise<WeixinCollectBufferFinalizeResponse> {
+    const { status, data } =
+      await this.jsonRequest<WeixinCollectBufferFinalizeResponse>(
+        "POST",
+        `/api/v1/dalton/channels/internal/weixin/collect-buffers/${encodeURIComponent(bufferId)}/finalize`,
+        {
+          body: {},
+          timeoutMs: 35_000,
+          includeGatewayEpoch: true,
+        },
+      );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `weixin/collect-buffers/finalize failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
+  async preflightWeixinSend(
+    deliveryKey: string,
+    req: WeixinPreflightSendRequest,
+  ): Promise<WeixinPreflightSendResponse> {
+    const { status, data } = await this.jsonRequest<WeixinPreflightSendResponse>(
+      "POST",
+      `/api/v1/dalton/channels/internal/deliveries/${encodeURIComponent(deliveryKey)}/preflight-send`,
+      {
+        body: req,
+        timeoutMs: 15_000,
+        includeGatewayEpoch: true,
+      },
+    );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `deliveries/preflight-send failed (${status})`,
+        status,
+        data,
+      );
     }
     return data;
   }

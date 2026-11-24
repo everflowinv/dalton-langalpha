@@ -4,6 +4,7 @@ import type {
   InboundAttachmentDescriptor,
   InboundChannelEvent,
   NativeInteractionEvent,
+  OneTimeWeixinReplyEnvelope,
 } from "../types.js";
 import {
   type AvailableChatsResult,
@@ -74,6 +75,16 @@ export class FakeChannelAdapter implements ChannelAdapter {
   readonly sentPlainTexts: FakeSentPlainTextRecord[] = [];
   readonly sentTextMessages: FakeSentPlainTextRecord[] = [];
   readonly sentFiles: FakeSentFileRecord[] = [];
+  readonly sentOneTimeReplies: Array<{
+    envelope: OneTimeWeixinReplyEnvelope;
+    dedupeKey?: string;
+    messageId: string;
+  }> = [];
+  readonly accountsSyncCalls: Array<{
+    targetRevision?: number | null;
+    reason?: string;
+  }> = [];
+  private readonly sentOneTimeReplyKeys = new Set<string>();
   persistedWeixinState: {
     configured: boolean;
     status: string;
@@ -120,7 +131,12 @@ export class FakeChannelAdapter implements ChannelAdapter {
     | null = null;
 
   private qrStartBehavior:
-    | ((options: { userId: string }) => Promise<WeixinQrStartResult>)
+    | ((options: {
+        userId: string;
+        sessionKey?: string;
+        loginVersion?: number;
+        expectedBotGeneration?: number;
+      }) => Promise<WeixinQrStartResult>)
     | null = null;
 
   private qrWaitBehavior:
@@ -288,7 +304,12 @@ export class FakeChannelAdapter implements ChannelAdapter {
   }
 
   setQrHandlers(handlers: {
-    start?: (options: { userId: string }) => Promise<WeixinQrStartResult>;
+    start?: (options: {
+      userId: string;
+      sessionKey?: string;
+      loginVersion?: number;
+      expectedBotGeneration?: number;
+    }) => Promise<WeixinQrStartResult>;
     wait?: (options: { userId: string; sessionKey: string }) => Promise<WeixinQrWaitResult>;
     verify?: (options: {
       userId: string;
@@ -442,15 +463,44 @@ export class FakeChannelAdapter implements ChannelAdapter {
     };
   }
 
-  async startQrLogin(options: { userId: string }): Promise<WeixinQrStartResult> {
+  async startQrLogin(options: {
+    userId: string;
+    sessionKey?: string;
+    loginVersion?: number;
+    expectedBotGeneration?: number;
+  }): Promise<WeixinQrStartResult> {
     if (this.qrStartBehavior) {
       return await this.qrStartBehavior(options);
     }
     return {
-      session_key: "fake_qr_session",
+      session_key: options.sessionKey ?? "fake_qr_session",
       qrcode_url: "https://ilinkai.weixin.qq.com/qr/fake",
       status: "wait",
     };
+  }
+
+  async triggerAccountsSync(
+    targetRevision?: number | null,
+    reason?: string,
+  ): Promise<{ ok: boolean; accepted_revision: number }> {
+    this.accountsSyncCalls.push({ targetRevision, reason });
+    return { ok: true, accepted_revision: targetRevision ?? 0 };
+  }
+
+  async sendOneTimeReply(
+    envelope: OneTimeWeixinReplyEnvelope,
+    dedupeKey?: string,
+  ): Promise<{ sent: boolean; duplicate?: boolean; messageId?: string }> {
+    if (dedupeKey && this.sentOneTimeReplyKeys.has(dedupeKey)) {
+      return { sent: false, duplicate: true };
+    }
+    if (dedupeKey) {
+      this.sentOneTimeReplyKeys.add(dedupeKey);
+    }
+    this.msgCounter += 1;
+    const messageId = `${this.platform}_onetime_${this.msgCounter}`;
+    this.sentOneTimeReplies.push({ envelope, dedupeKey, messageId });
+    return { sent: true, messageId };
   }
 
   async waitQrLogin(options: {

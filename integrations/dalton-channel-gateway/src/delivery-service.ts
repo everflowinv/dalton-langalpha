@@ -1,7 +1,12 @@
 import { createHash } from "node:crypto";
 import { basename } from "node:path";
-import type { BackendClient, DeliveryActivityOrigin } from "./backend-client.js";
+import type {
+  BackendClient,
+  DeliveryActivityOrigin,
+  WeixinPreflightAuthorizedData,
+} from "./backend-client.js";
 import { ChannelDeliveryError, type ChannelAdapter } from "./channels/adapter.js";
+import { isStaleGatewayEpochError } from "./gateway-lease.js";
 import {
   type AgentSendFileOutcome,
   type AgentSendFileRef,
@@ -53,6 +58,7 @@ export class DeliveryService {
     string,
     Set<Promise<AgentSendResponse>>
   >();
+  private startupBlocked = false;
 
   constructor(options: {
     backend: BackendClient;
@@ -64,6 +70,13 @@ export class DeliveryService {
     if (options.onFirstCurrentDelivery) {
       this.firstCurrentDeliveryListeners.add(options.onFirstCurrentDelivery);
     }
+  }
+
+  /**
+   * Blocks new I-6 delivery claims while startup `mode=startup` recovery is still running (D1 / §3.5).
+   */
+  setStartupBlocked(blocked: boolean): void {
+    this.startupBlocked = blocked;
   }
 
   addFirstCurrentDeliveryListener(
@@ -203,6 +216,19 @@ export class DeliveryService {
     options: ExecuteDeliveryOptions,
     untrackIfNotCurrent?: () => void,
   ): Promise<AgentSendResponse> {
+    if (this.startupBlocked) {
+      untrackIfNotCurrent?.();
+      return {
+        status: "failed",
+        code: "unavailable",
+        address: options.target ?? null,
+        current: options.target === undefined || options.target === null,
+        duplicate: false,
+        message: "Gateway startup recovery is still in progress.",
+        files: [],
+      };
+    }
+
     const rawText = options.text ?? "";
     const trimmedText = rawText.trim();
     const hasNonEmptyText = trimmedText.length > 0;
@@ -451,20 +477,30 @@ export class DeliveryService {
     let chunkFailure: {
       outcome: "failed" | "unknown";
       code: AgentSendResponse["code"];
+      denyCode?: string;
+      retryable?: boolean;
       message: string;
     } | null = null;
+    const effectiveWeixinAttempt =
+      typeof deliveryAttempt === "number" && deliveryAttempt > 0
+        ? deliveryAttempt
+        : 1;
 
     for (let i = 0; i < chunks.length; i++) {
       const chunkText = chunks[i]!;
       try {
-        const weixinContextToken =
-          platformStr === "weixin"
-            ? await this.resolveLatestWeixinContextToken({
-                recipientPlatformUserId,
-                inboundMessageId: options.inboundMessageId ?? null,
-                claimedToken: claim.weixin_context_token ?? null,
-              })
-            : (claim.weixin_context_token ?? null);
+        let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
+        let weixinContextToken: string | null = claim.weixin_context_token ?? null;
+        let effectiveRecipientId = recipientPlatformUserId;
+        if (platformStr === "weixin") {
+          weixinPreflight = await this.runWeixinPreflight(
+            options.deliveryKey,
+            effectiveWeixinAttempt,
+            i,
+          );
+          weixinContextToken = weixinPreflight.weixin_context_token;
+          effectiveRecipientId = weixinPreflight.recipient_id;
+        }
 
         const creatingDiscordThread =
           i === 0 &&
@@ -476,7 +512,7 @@ export class DeliveryService {
         }
         const res = await adapter.sendTextChunk({
           targetAddress: finalAddress,
-          recipientPlatformUserId,
+          recipientPlatformUserId: effectiveRecipientId,
           text: chunkText,
           chunkIndex: i,
           totalChunks,
@@ -484,6 +520,9 @@ export class DeliveryService {
           newThread: i === 0 ? Boolean(options.newThread) && !reuseConfirmedThread : false,
           threadScopeKey: effectiveThreadScopeKey,
           deliveryKey: options.deliveryKey,
+          deliveryAttempt: effectiveWeixinAttempt,
+          weixinPreflight,
+          weixinAccountId: weixinPreflight?.account_id ?? claim.weixin_account_id ?? null,
           weixinContextToken,
           inboundMessageId: options.inboundMessageId ?? null,
           confirmedThreadAddress:
@@ -516,10 +555,16 @@ export class DeliveryService {
           platform_message_ids: platformMessageIds,
         });
       } catch (err) {
+        if (isStaleGatewayEpochError(err)) {
+          // D1 / §3.5: stale epoch MUST stop locally without writing I-7 settlement.
+          throw err;
+        }
         if (err instanceof ChannelDeliveryError) {
           chunkFailure = {
             outcome: err.outcome === "unknown" ? "unknown" : "failed",
             code: err.code,
+            denyCode: err.denyCode,
+            retryable: err.retryable,
             message: err.message,
           };
         } else {
@@ -539,9 +584,12 @@ export class DeliveryService {
     let anyFileSucceeded = false;
     let anyFileFailed = false;
     let fileUnknownError: string | null = null;
+    let fileFailureCode: AgentSendResponse["code"] = null;
+    let fileFailureDenyCode: string | undefined;
 
     if (!chunkFailure) {
-      for (const fileRef of files) {
+      for (let fileIdx = 0; fileIdx < files.length; fileIdx += 1) {
+        const fileRef = files[fileIdx]!;
         const wsId = fileRef.workspace_id || claim.home_workspace_id || "";
         if (!wsId) {
           anyFileFailed = true;
@@ -592,25 +640,42 @@ export class DeliveryService {
         totalDownloadedBytes += byteLen;
 
         try {
-          const weixinContextToken =
-            platformStr === "weixin"
-              ? await this.resolveLatestWeixinContextToken({
-                  recipientPlatformUserId,
-                  inboundMessageId: options.inboundMessageId ?? null,
-                  claimedToken: claim.weixin_context_token ?? null,
-                })
-              : (claim.weixin_context_token ?? null);
+          const fileChunkIndex = chunks.length + fileIdx;
+          let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
+          let weixinContextToken: string | null = claim.weixin_context_token ?? null;
+          let effectiveRecipientId = recipientPlatformUserId;
+          if (platformStr === "weixin") {
+            weixinPreflight = await this.runWeixinPreflight(
+              options.deliveryKey,
+              effectiveWeixinAttempt,
+              fileChunkIndex,
+            );
+            weixinContextToken = weixinPreflight.weixin_context_token;
+            effectiveRecipientId = weixinPreflight.recipient_id;
+          }
 
           const sendRes = await adapter.sendFile({
             targetAddress: finalAddress,
-            recipientPlatformUserId,
+            recipientPlatformUserId: effectiveRecipientId,
             path: fileRef.path,
             filename: basename(fileRef.path) || "attachment",
             content: downloaded.content,
             mimeType: downloaded.mimeType,
             threadScopeKey: effectiveThreadScopeKey,
+            deliveryKey: options.deliveryKey,
+            deliveryAttempt: effectiveWeixinAttempt,
+            weixinPreflight,
+            weixinAccountId: weixinPreflight?.account_id ?? claim.weixin_account_id ?? null,
             weixinContextToken,
             inboundMessageId: options.inboundMessageId ?? null,
+            refreshWeixinPreflight:
+              platformStr === "weixin"
+                ? () =>
+                    this.backend.preflightWeixinSend(options.deliveryKey, {
+                      delivery_attempt: effectiveWeixinAttempt,
+                      chunk_index: fileChunkIndex,
+                    })
+                : undefined,
           });
           const fileSucceeded =
             sendRes.status === "sent" || sendRes.status === "linked";
@@ -636,9 +701,20 @@ export class DeliveryService {
             });
           }
         } catch (err) {
+          if (isStaleGatewayEpochError(err)) {
+            throw err;
+          }
           anyFileFailed = true;
-          if (err instanceof ChannelDeliveryError && err.outcome === "unknown") {
-            fileUnknownError = err.message;
+          if (err instanceof ChannelDeliveryError) {
+            if (err.outcome === "unknown") {
+              fileUnknownError = err.message;
+            }
+            if (!fileFailureCode) {
+              fileFailureCode = err.code;
+            }
+            if (!fileFailureDenyCode && err.denyCode) {
+              fileFailureDenyCode = err.denyCode;
+            }
           }
           fileOutcomes.push({
             path: fileRef.path,
@@ -680,7 +756,7 @@ export class DeliveryService {
     } else if (anyFileFailed) {
       if (somethingSucceeded) {
         finalStatus = "partial";
-        finalCode = null;
+        finalCode = fileFailureCode;
         finalMessage = "Message delivered, but one or more attached files failed.";
       } else if (fileUnknownError) {
         finalStatus = "unknown";
@@ -688,7 +764,7 @@ export class DeliveryService {
         finalMessage = `File delivery outcome could not be confirmed: ${fileUnknownError}`;
       } else {
         finalStatus = "failed";
-        finalCode = null;
+        finalCode = fileFailureCode;
         finalMessage = "All attached files failed to deliver.";
       }
     } else {
@@ -707,6 +783,11 @@ export class DeliveryService {
       files: fileOutcomes,
     };
 
+    const recordedErrorCode =
+      platformStr === "weixin"
+        ? (chunkFailure?.denyCode ?? fileFailureDenyCode ?? finalCode)
+        : finalCode;
+
     await recordProgress({
       delivery_key: options.deliveryKey,
       sent_chunks: sentChunks,
@@ -715,63 +796,56 @@ export class DeliveryService {
       files_status: fileOutcomes,
       first_response_json: responseObj as unknown as Record<string, unknown>,
       status: finalStatus,
-      error_code: finalCode,
+      error_code: recordedErrorCode,
       error_message: finalStatus === "sent" ? null : finalMessage,
     });
 
     return responseObj;
   }
 
-  private async resolveLatestWeixinContextToken(params: {
-    recipientPlatformUserId: string | null;
-    inboundMessageId: string | null;
-    claimedToken: string | null;
-  }): Promise<string> {
-    if (params.recipientPlatformUserId || params.inboundMessageId) {
-      try {
-        const wxState = await this.backend.getWeixinState({
-          include_token: false,
-          recipient_platform_user_id: params.recipientPlatformUserId,
-          inbound_message_id: params.inboundMessageId,
-        });
-        if (wxState.status === "expired") {
-          throw new ChannelDeliveryError(
-            "Weixin bot session has expired (-14); please re-scan QR code in settings.",
-            {
-              outcome: "failed",
-              code: "unavailable",
-            },
-          );
-        }
-        if (wxState.weixin_context_token && wxState.weixin_context_token.trim().length > 0) {
-          return wxState.weixin_context_token.trim();
-        }
-        if (wxState.configured && wxState.weixin_context_token === null) {
-          throw new ChannelDeliveryError(
-            "Missing active Weixin context_token for recipient",
-            {
-              outcome: "failed",
-              code: "unavailable",
-            },
-          );
-        }
-      } catch (err) {
-        if (err instanceof ChannelDeliveryError) {
-          throw err;
-        }
-      }
+  private async runWeixinPreflight(
+    deliveryKey: string,
+    deliveryAttempt: number,
+    chunkIndex: number,
+  ): Promise<WeixinPreflightAuthorizedData> {
+    const pf = await this.backend.preflightWeixinSend(deliveryKey, {
+      delivery_attempt: deliveryAttempt,
+      chunk_index: chunkIndex,
+    });
+    if (pf.authorized) {
+      return pf;
     }
-    const fallback = (params.claimedToken ?? "").trim();
-    if (!fallback) {
+    if (pf.deny_code === "source_generation_unknown") {
       throw new ChannelDeliveryError(
-        "Missing active Weixin context_token for recipient",
+        pf.message ?? "Weixin delivery source generation is unknown.",
         {
-          outcome: "failed",
+          outcome: "unknown",
           code: "unavailable",
+          retryable: false,
+          denyCode: pf.deny_code,
         },
       );
     }
-    return fallback;
+    if (pf.decision === "defer" || pf.retryable) {
+      throw new ChannelDeliveryError(
+        pf.message ?? `Weixin send deferred (${pf.deny_code}); please retry.`,
+        {
+          outcome: "failed",
+          code: "unavailable",
+          retryable: true,
+          denyCode: pf.deny_code,
+        },
+      );
+    }
+    throw new ChannelDeliveryError(
+      pf.message ?? `Weixin send denied (${pf.deny_code}).`,
+      {
+        outcome: "failed",
+        code: "not_allowed",
+        retryable: false,
+        denyCode: pf.deny_code,
+      },
+    );
   }
 
   /**

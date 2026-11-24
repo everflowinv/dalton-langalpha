@@ -126,6 +126,7 @@ export interface PrepareGatewayRuntimeOptions {
   fetchImpl?: typeof fetch;
   logger?: SubsystemLogger;
   vaultTimeoutMs?: number;
+  onLeaseLost?: (reason: string, error?: unknown) => void;
   adapterOverrides?: {
     feishu?: Partial<FeishuChannelAdapterOptions>;
   };
@@ -220,6 +221,7 @@ export async function prepareGatewayRuntime(
     config,
     backend,
     adapters,
+    onLeaseLost: options.onLeaseLost,
   });
 
   return {
@@ -234,7 +236,16 @@ export async function main(
   env: NodeJS.ProcessEnv = process.env,
   argv: readonly string[] = process.argv.slice(2),
 ): Promise<void> {
-  const { app } = await prepareGatewayRuntime({ env, argv });
+  const { app } = await prepareGatewayRuntime({
+    env,
+    argv,
+    onLeaseLost: (reason) => {
+      process.stderr.write(
+        `[dalton-channel-gateway] fatal: gateway lease lost (${reason}); exiting\n`,
+      );
+      process.exit(1);
+    },
+  });
 
   const { host, port } = await app.start();
   process.stdout.write(

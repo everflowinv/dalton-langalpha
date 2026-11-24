@@ -1,10 +1,12 @@
 // Portions adapted from @tencent-weixin/openclaw-weixin (MIT License, Copyright (c) 2026 Tencent).
 
 import { randomUUID } from "node:crypto";
-import type {
-  BackendClient,
-  I9WeixinStateGetResponse,
+import {
+  type BackendClient,
+  BackendHttpError,
+  type WeixinLoginSessionGetResponse,
 } from "../../backend-client.js";
+import { isStaleGatewayEpochError } from "../../gateway-lease.js";
 import type { HostIpResolver } from "../../shared/safe-fetch.js";
 import {
   fetchWeixinQrCode,
@@ -30,7 +32,8 @@ export type WeixinQrPublicStatus =
   | "scaned"
   | "verify_code"
   | "confirmed"
-  | "expired";
+  | "expired"
+  | "superseded";
 
 export type WeixinQrPublicStartResponse = WeixinQrPublicResult;
 export type WeixinQrPublicWaitResponse = WeixinQrPublicResult & {
@@ -38,6 +41,7 @@ export type WeixinQrPublicWaitResponse = WeixinQrPublicResult & {
 };
 
 export interface ConfirmedWeixinAccount {
+  accountId: string;
   ilinkBotId: string;
   botToken: string;
   baseUrl: string;
@@ -45,6 +49,8 @@ export interface ConfirmedWeixinAccount {
   botGeneration: number;
   getUpdatesBuf: string;
   ownerUserId: string;
+  accountStatus?: string | null;
+  accountsRevision?: number | null;
   ilinkUserId?: string | null;
   ilinkUsername?: string | null;
 }
@@ -70,6 +76,35 @@ function isDomainAllowed(
     const clean = pattern.toLowerCase().trim().replace(/^\*\./, "");
     return host === clean || host.endsWith(`.${clean}`);
   });
+}
+
+function extractBackendErrorMeta(body: unknown): {
+  code?: string;
+  message?: string;
+} {
+  if (!body || typeof body !== "object") {
+    return {};
+  }
+  const obj = body as Record<string, unknown>;
+  const detail =
+    obj.detail && typeof obj.detail === "object"
+      ? (obj.detail as Record<string, unknown>)
+      : null;
+  const code =
+    typeof obj.code === "string"
+      ? obj.code
+      : typeof detail?.code === "string"
+        ? detail.code
+        : undefined;
+  const message =
+    typeof obj.message === "string"
+      ? obj.message
+      : typeof detail?.message === "string"
+        ? detail.message
+        : typeof obj.detail === "string"
+          ? obj.detail
+          : undefined;
+  return { code, message };
 }
 
 export function sanitizeQrCodeImageContent(
@@ -119,6 +154,7 @@ export function shapePublicQrStartResponse(params: {
   status?: WeixinQrPublicStatus;
   qrcodeImgContent?: string | null;
   expiresAt?: string | null;
+  loginVersion?: number;
   message?: string | null;
   allowedDomains?: readonly string[];
 }): WeixinQrPublicStartResponse {
@@ -131,6 +167,9 @@ export function shapePublicQrStartResponse(params: {
     status: params.status ?? "wait",
     ...(safeQr ? { qrcode_img_content: safeQr, qrcode_url: safeQr } : {}),
     ...(params.expiresAt ? { expires_at: params.expiresAt } : {}),
+    ...(typeof params.loginVersion === "number"
+      ? { login_version: params.loginVersion }
+      : {}),
     ...(params.message ? { message: params.message } : {}),
   };
 }
@@ -139,6 +178,13 @@ export function shapePublicQrWaitResponse(params: {
   sessionKey: string;
   status: WeixinQrPublicStatus;
   connected: boolean;
+  alreadyConnected?: boolean;
+  accountId?: string | null;
+  accountStatus?: string | null;
+  accountsRevision?: number | null;
+  pendingVerification?: boolean;
+  revoked?: boolean;
+  code?: string | null;
   ilinkBotId?: string | null;
   ilinkUserId?: string | null;
   ilinkUsername?: string | null;
@@ -159,6 +205,19 @@ export function shapePublicQrWaitResponse(params: {
     session_key: params.sessionKey,
     status: params.status,
     connected: Boolean(params.connected),
+    ...(params.alreadyConnected !== undefined
+      ? { already_connected: params.alreadyConnected }
+      : {}),
+    ...(params.accountId ? { account_id: params.accountId } : {}),
+    ...(params.accountStatus ? { account_status: params.accountStatus } : {}),
+    ...(typeof params.accountsRevision === "number"
+      ? { accounts_revision: params.accountsRevision }
+      : {}),
+    ...(params.pendingVerification !== undefined
+      ? { pending_verification: params.pendingVerification }
+      : {}),
+    ...(params.revoked !== undefined ? { revoked: params.revoked } : {}),
+    ...(params.code ? { code: params.code } : {}),
     ...(params.ilinkBotId ? { ilink_bot_id: params.ilinkBotId } : {}),
     ...(params.ilinkUserId ? { ilink_user_id: params.ilinkUserId } : {}),
     ...(params.ilinkUsername ? { ilink_username: params.ilinkUsername } : {}),
@@ -171,16 +230,8 @@ export function shapePublicQrWaitResponse(params: {
   };
 }
 
-function sessionQrImage(
-  state: {
-    login_session_key?: string | null;
-    login_qrcode?: string | null;
-    login_qrcode_img_content?: string | null;
-  },
-  sessionKey: string,
-): string | null {
-  if (state.login_session_key !== sessionKey) return null;
-  return state.login_qrcode_img_content || state.login_qrcode || null;
+function sessionQrImage(session: WeixinLoginSessionGetResponse): string | null {
+  return session.qrcode_img_content || session.qrcode || null;
 }
 
 export class WeixinQrLoginError extends Error {
@@ -250,14 +301,26 @@ export class WeixinQrLoginManager {
     }
   }
 
+  /**
+   * Starts QR login for a backend pre-created `starting` session (`sessionKey`,
+   * `loginVersion`), fetches a QR code from iLink, and saves it via
+   * `PATCH /internal/weixin/login-sessions/{session_key}` (`action: "save_qr"`).
+   */
   async startQrLogin(
     userId: string,
-    opts?: { signal?: AbortSignal },
+    opts?: {
+      sessionKey?: string;
+      loginVersion?: number;
+      expectedBotGeneration?: number;
+      signal?: AbortSignal;
+    },
   ): Promise<WeixinQrPublicStartResponse> {
     const cleanUserId = userId.trim();
     if (!cleanUserId) {
-      throw new WeixinQrLoginError("Missing authenticated user_id", 401);
+      throw new WeixinQrLoginError("Missing authenticated user_id", 401, "unauthorized");
     }
+
+    const sessionKey = opts?.sessionKey?.trim() || randomUUID();
 
     const qrResp = await fetchWeixinQrCode({
       baseUrl: this.baseUrl,
@@ -275,29 +338,45 @@ export class WeixinQrLoginManager {
       throw new WeixinQrLoginError(
         "Weixin iLink did not return a valid QR code",
         502,
+        "ilink_invalid_qrcode",
       );
     }
 
-    const sessionKey = randomUUID();
-    const expiresAt = new Date(Date.now() + QR_SESSION_TTL_MS).toISOString();
+    const fallbackExpiresAt = new Date(
+      Date.now() + QR_SESSION_TTL_MS,
+    ).toISOString();
 
-    const saved = await this.backend.putWeixinState({
-      login_session_action: "start",
-      login_session_key: sessionKey,
-      login_owner_user_id: cleanUserId,
-      login_status: "wait",
-      login_qrcode: qrcode,
-      login_qrcode_img_content: qrcodeImgContent,
-      login_redirect_base_url: this.baseUrl,
-      login_expires_at: expiresAt,
-    });
+    let saved;
+    try {
+      saved = await this.backend.patchWeixinLoginSession(sessionKey, {
+        action: "save_qr",
+        ...(typeof opts?.loginVersion === "number"
+          ? { expected_login_version: opts.loginVersion }
+          : {}),
+        qrcode,
+        qrcode_img_content: qrcodeImgContent,
+        redirect_base_url: this.baseUrl,
+      });
+    } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        throw err;
+      }
+      if (err instanceof BackendHttpError) {
+        const meta = extractBackendErrorMeta(err.body);
+        throw new WeixinQrLoginError(
+          meta.message ?? "Failed to save Weixin QR login session.",
+          err.status,
+          meta.code,
+        );
+      }
+      throw err;
+    }
 
-    if (saved.stale_session || !saved.updated) {
+    if (saved.revoked || !saved.ok) {
       throw new WeixinQrLoginError(
-        saved.reason === "admin_required"
-          ? "Only admin users can start Weixin QR login."
-          : "Failed to initialize Weixin QR login session.",
-        saved.reason === "admin_required" ? 403 : 409,
+        saved.message ?? "Weixin QR login session was superseded or revoked.",
+        409,
+        saved.code ?? "login_session_revoked",
       );
     }
 
@@ -305,7 +384,8 @@ export class WeixinQrLoginManager {
       sessionKey,
       status: "wait",
       qrcodeImgContent,
-      expiresAt,
+      expiresAt: saved.expires_at ?? fallbackExpiresAt,
+      loginVersion: saved.login_version,
       allowedDomains: this.allowedApiDomains,
     });
   }
@@ -318,10 +398,10 @@ export class WeixinQrLoginManager {
     const cleanUserId = userId.trim();
     const cleanSessionKey = sessionKey.trim();
     if (!cleanUserId) {
-      throw new WeixinQrLoginError("Missing authenticated user_id", 401);
+      throw new WeixinQrLoginError("Missing authenticated user_id", 401, "unauthorized");
     }
     if (!cleanSessionKey) {
-      throw new WeixinQrLoginError("Missing session_key", 400);
+      throw new WeixinQrLoginError("Missing session_key", 400, "invalid_request");
     }
 
     const inflightKey = `${cleanUserId}:${cleanSessionKey}`;
@@ -343,47 +423,108 @@ export class WeixinQrLoginManager {
     return promise;
   }
 
+  private shapeAlreadyConfirmedSession(
+    session: WeixinLoginSessionGetResponse,
+  ): WeixinQrPublicWaitResponse {
+    const confirmed =
+      session.confirmed_result && typeof session.confirmed_result === "object"
+        ? session.confirmed_result
+        : {};
+    const accountId =
+      typeof confirmed.account_id === "string"
+        ? confirmed.account_id
+        : session.target_account_id ?? null;
+    const accountStatus =
+      typeof confirmed.account_status === "string"
+        ? confirmed.account_status
+        : null;
+    const ilinkBotId =
+      typeof confirmed.ilink_bot_id === "string" ? confirmed.ilink_bot_id : null;
+    const ilinkUserId =
+      typeof confirmed.ilink_user_id === "string"
+        ? confirmed.ilink_user_id
+        : null;
+    const ilinkUsername =
+      typeof confirmed.ilink_username === "string"
+        ? confirmed.ilink_username
+        : null;
+    const botGeneration =
+      typeof confirmed.bot_generation === "number"
+        ? confirmed.bot_generation
+        : null;
+    const accountsRevision =
+      typeof confirmed.accounts_revision === "number"
+        ? confirmed.accounts_revision
+        : null;
+    return shapePublicQrWaitResponse({
+      sessionKey: session.session_key,
+      status: "confirmed",
+      connected: session.connected ?? true,
+      alreadyConnected: session.already_connected ?? false,
+      accountId,
+      accountStatus,
+      accountsRevision,
+      pendingVerification: accountStatus === "pending_verification",
+      ilinkBotId,
+      ilinkUserId,
+      ilinkUsername,
+      botGeneration,
+      expiresAt: session.expires_at,
+    });
+  }
+
   private validateSessionState(
-    state: I9WeixinStateGetResponse,
+    session: WeixinLoginSessionGetResponse,
     userId: string,
     sessionKey: string,
   ):
     | { valid: true }
     | { valid: false; response: WeixinQrPublicWaitResponse } {
-    if (!state.login_session_key || state.login_session_key !== sessionKey) {
+    if (session.user_id && session.user_id !== userId) {
+      throw new WeixinQrLoginError(
+        "QR login session belongs to a different user",
+        403,
+        "forbidden",
+      );
+    }
+
+    if (session.status === "confirmed") {
+      return {
+        valid: false,
+        response: this.shapeAlreadyConfirmedSession(session),
+      };
+    }
+
+    if (session.status === "superseded") {
       return {
         valid: false,
         response: shapePublicQrWaitResponse({
           sessionKey,
-          status: "expired",
+          status: "superseded",
           connected: false,
-          message: "QR login session has been superseded or expired.",
+          revoked: true,
+          code: "login_session_revoked",
+          expiresAt: session.expires_at,
+          message: "QR login session has been superseded.",
         }),
       };
     }
 
-    if (state.login_owner_user_id && state.login_owner_user_id !== userId) {
-      throw new WeixinQrLoginError(
-        "QR login session belongs to a different user",
-        403,
-      );
-    }
-
-    if (state.login_status === "expired") {
+    if (session.status === "expired") {
       return {
         valid: false,
         response: shapePublicQrWaitResponse({
           sessionKey,
           status: "expired",
           connected: false,
-          expiresAt: state.login_expires_at,
+          expiresAt: session.expires_at,
           message: "QR code has expired.",
         }),
       };
     }
 
-    if (state.login_expires_at) {
-      const expMs = Date.parse(state.login_expires_at);
+    if (session.expires_at) {
+      const expMs = Date.parse(session.expires_at);
       if (Number.isFinite(expMs) && expMs <= Date.now()) {
         return {
           valid: false,
@@ -391,14 +532,14 @@ export class WeixinQrLoginManager {
             sessionKey,
             status: "expired",
             connected: false,
-            expiresAt: state.login_expires_at,
+            expiresAt: session.expires_at,
             message: "QR code has expired.",
           }),
         };
       }
     }
 
-    if (!state.login_qrcode) {
+    if (!session.qrcode) {
       return {
         valid: false,
         response: shapePublicQrWaitResponse({
@@ -413,94 +554,40 @@ export class WeixinQrLoginManager {
     return { valid: true };
   }
 
-  private async finishConfirmedSession(
-    userId: string,
+  private async fetchSessionOrExpired(
     sessionKey: string,
-  ): Promise<WeixinQrPublicWaitResponse> {
-    const state = await this.backend.getWeixinState({ include_token: true });
-    if (!state.login_session_key || state.login_session_key !== sessionKey) {
-      return shapePublicQrWaitResponse({
-        sessionKey,
-        status: "expired",
-        connected: false,
-        message: "QR login session has been superseded or expired.",
-      });
+  ): Promise<
+    | { found: true; session: WeixinLoginSessionGetResponse }
+    | { found: false; response: WeixinQrPublicWaitResponse }
+  > {
+    try {
+      const session = await this.backend.getWeixinLoginSession(sessionKey);
+      return { found: true, session };
+    } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        throw err;
+      }
+      if (err instanceof BackendHttpError) {
+        if (err.status === 404) {
+          return {
+            found: false,
+            response: shapePublicQrWaitResponse({
+              sessionKey,
+              status: "expired",
+              connected: false,
+              message: "QR login session not found or expired.",
+            }),
+          };
+        }
+        const meta = extractBackendErrorMeta(err.body);
+        throw new WeixinQrLoginError(
+          meta.message ?? `Failed to read QR login session (${err.status})`,
+          err.status,
+          meta.code,
+        );
+      }
+      throw err;
     }
-    if (state.login_owner_user_id && state.login_owner_user_id !== userId) {
-      throw new WeixinQrLoginError(
-        "QR login session belongs to a different user",
-        403,
-      );
-    }
-    if (state.login_status !== "confirmed") {
-      const expired = state.login_status === "expired";
-      return shapePublicQrWaitResponse({
-        sessionKey,
-        status: expired ? "expired" : "wait",
-        connected: false,
-        expiresAt: state.login_expires_at,
-        qrcodeImgContent: expired ? null : sessionQrImage(state, sessionKey),
-        message: expired
-          ? "QR code has expired."
-          : "QR login is not confirmed yet.",
-      });
-    }
-
-    const confirmed = state.login_confirmed_result;
-    const botId = state.ilink_bot_id?.trim() ?? "";
-    const token = state.bot_token?.trim() ?? "";
-    const generation = state.bot_generation;
-    const confirmedBotId =
-      typeof confirmed?.ilink_bot_id === "string"
-        ? confirmed.ilink_bot_id.trim()
-        : botId;
-    const confirmedGeneration =
-      typeof confirmed?.bot_generation === "number"
-        ? confirmed.bot_generation
-        : generation;
-    const currentAccount =
-      state.configured === true &&
-      state.status === "active" &&
-      botId.length > 0 &&
-      token.length > 0 &&
-      typeof generation === "number" &&
-      confirmedBotId === botId &&
-      confirmedGeneration === generation;
-
-    if (!currentAccount || typeof generation !== "number") {
-      return shapePublicQrWaitResponse({
-        sessionKey,
-        status: "expired",
-        connected: false,
-        message:
-          "QR login session was superseded or expired before confirmation.",
-      });
-    }
-
-    if (this.onAccountConfirmed) {
-      await this.onAccountConfirmed({
-        ilinkBotId: botId,
-        botToken: token,
-        baseUrl: state.base_url,
-        cdnBaseUrl: state.cdn_base_url?.trim() || this.cdnBaseUrl,
-        botGeneration: generation,
-        getUpdatesBuf: state.get_updates_buf ?? "",
-        ownerUserId: state.owner_user_id?.trim() || userId,
-        ilinkUserId: state.ilink_user_id ?? null,
-        ilinkUsername: state.ilink_username ?? null,
-      });
-    }
-
-    return shapePublicQrWaitResponse({
-      sessionKey,
-      status: "confirmed",
-      connected: true,
-      ilinkBotId: botId,
-      ilinkUserId: state.ilink_user_id ?? null,
-      ilinkUsername: state.ilink_username ?? null,
-      botGeneration: generation,
-      expiresAt: state.login_expires_at,
-    });
   }
 
   private async executeWaitQrLogin(
@@ -508,26 +595,24 @@ export class WeixinQrLoginManager {
     sessionKey: string,
     opts?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<WeixinQrPublicWaitResponse> {
-    const state = await this.backend.getWeixinState({ include_token: false });
-    if (
-      state.login_session_key === sessionKey &&
-      state.login_status === "confirmed"
-    ) {
-      return this.finishConfirmedSession(userId, sessionKey);
+    const fetched = await this.fetchSessionOrExpired(sessionKey);
+    if (!fetched.found) {
+      return fetched.response;
     }
-    const check = this.validateSessionState(state, userId, sessionKey);
+    const { session } = fetched;
+    const check = this.validateSessionState(session, userId, sessionKey);
     if (!check.valid) {
       return check.response;
     }
 
     const pollBaseUrl = await this.safeResolveRedirectBaseUrl(
-      state.login_redirect_base_url,
+      session.redirect_base_url,
       this.baseUrl,
     );
 
     const statusResp = await pollWeixinQrStatus({
       baseUrl: pollBaseUrl,
-      qrcode: state.login_qrcode!,
+      qrcode: session.qrcode!,
       timeoutMs: opts?.timeoutMs,
       signal: opts?.signal,
       fetchImpl: this.fetchImpl,
@@ -539,7 +624,7 @@ export class WeixinQrLoginManager {
     return this.handleStatusPollResult(
       userId,
       sessionKey,
-      state,
+      session,
       pollBaseUrl,
       statusResp,
     );
@@ -555,35 +640,33 @@ export class WeixinQrLoginManager {
     const cleanSessionKey = sessionKey.trim();
     const cleanCode = verifyCode.trim();
     if (!cleanUserId) {
-      throw new WeixinQrLoginError("Missing authenticated user_id", 401);
+      throw new WeixinQrLoginError("Missing authenticated user_id", 401, "unauthorized");
     }
     if (!cleanSessionKey) {
-      throw new WeixinQrLoginError("Missing session_key", 400);
+      throw new WeixinQrLoginError("Missing session_key", 400, "invalid_request");
     }
     if (!cleanCode) {
-      throw new WeixinQrLoginError("Missing verify_code", 400);
+      throw new WeixinQrLoginError("Missing verify_code", 400, "invalid_request");
     }
 
-    const state = await this.backend.getWeixinState({ include_token: false });
-    if (
-      state.login_session_key === cleanSessionKey &&
-      state.login_status === "confirmed"
-    ) {
-      return this.finishConfirmedSession(cleanUserId, cleanSessionKey);
+    const fetched = await this.fetchSessionOrExpired(cleanSessionKey);
+    if (!fetched.found) {
+      return fetched.response;
     }
-    const check = this.validateSessionState(state, cleanUserId, cleanSessionKey);
+    const { session } = fetched;
+    const check = this.validateSessionState(session, cleanUserId, cleanSessionKey);
     if (!check.valid) {
       return check.response;
     }
 
     const pollBaseUrl = await this.safeResolveRedirectBaseUrl(
-      state.login_redirect_base_url,
+      session.redirect_base_url,
       this.baseUrl,
     );
 
     const statusResp = await submitWeixinQrVerifyCode({
       baseUrl: pollBaseUrl,
-      qrcode: state.login_qrcode!,
+      qrcode: session.qrcode!,
       verifyCode: cleanCode,
       timeoutMs: opts?.timeoutMs,
       signal: opts?.signal,
@@ -595,17 +678,54 @@ export class WeixinQrLoginManager {
 
     return this.handleStatusPollResult(
       cleanUserId,
-      sessionKey,
-      state,
+      cleanSessionKey,
+      session,
       pollBaseUrl,
       statusResp,
     );
   }
 
+  private async patchSessionUpdate(
+    sessionKey: string,
+    session: WeixinLoginSessionGetResponse,
+    status: WeixinQrPublicStatus,
+    redirectBaseUrl: string,
+  ): Promise<{ revoked: boolean; code?: string; message?: string }> {
+    try {
+      const upd = await this.backend.patchWeixinLoginSession(sessionKey, {
+        action: "update",
+        expected_login_version: session.login_version,
+        status,
+        redirect_base_url: redirectBaseUrl,
+      });
+      if (upd.revoked || !upd.ok) {
+        return {
+          revoked: true,
+          code: upd.code ?? "login_session_revoked",
+          message: upd.message ?? "QR login session was superseded.",
+        };
+      }
+      return { revoked: false };
+    } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        throw err;
+      }
+      if (err instanceof BackendHttpError && err.status === 409) {
+        const meta = extractBackendErrorMeta(err.body);
+        return {
+          revoked: true,
+          code: meta.code ?? "login_session_revoked",
+          message: meta.message ?? "QR login session was superseded.",
+        };
+      }
+      throw err;
+    }
+  }
+
   private async handleStatusPollResult(
     userId: string,
     sessionKey: string,
-    initialState: I9WeixinStateGetResponse,
+    session: WeixinLoginSessionGetResponse,
     currentPollBaseUrl: string,
     statusResp: QrCodeStatusResp,
   ): Promise<WeixinQrPublicWaitResponse> {
@@ -635,22 +755,20 @@ export class WeixinQrLoginManager {
 
     if (normalizedStatus === "wait") {
       if (nextRedirectBaseUrl !== currentPollBaseUrl) {
-        const upd = await this.backend.putWeixinState({
-          login_session_action: "update",
-          login_session_key: sessionKey,
-          login_owner_user_id: userId,
-          login_version: initialState.login_version ?? undefined,
-          expected_bot_generation:
-            initialState.login_expected_bot_generation ?? undefined,
-          login_status: "wait",
-          login_redirect_base_url: nextRedirectBaseUrl,
-        });
-        if (upd.stale_session) {
+        const upd = await this.patchSessionUpdate(
+          sessionKey,
+          session,
+          "wait",
+          nextRedirectBaseUrl,
+        );
+        if (upd.revoked) {
           return shapePublicQrWaitResponse({
             sessionKey,
-            status: "expired",
+            status: "superseded",
             connected: false,
-            message: "QR login session was superseded.",
+            revoked: true,
+            code: upd.code,
+            message: upd.message,
           });
         }
       }
@@ -658,36 +776,36 @@ export class WeixinQrLoginManager {
         sessionKey,
         status: "wait",
         connected: false,
-        expiresAt: initialState.login_expires_at,
-        qrcodeImgContent: sessionQrImage(initialState, sessionKey),
+        expiresAt: session.expires_at,
+        qrcodeImgContent: sessionQrImage(session),
+        allowedDomains: this.allowedApiDomains,
       });
     }
 
     if (normalizedStatus === "scaned" || normalizedStatus === "verify_code") {
-      const upd = await this.backend.putWeixinState({
-        login_session_action: "update",
-        login_session_key: sessionKey,
-        login_owner_user_id: userId,
-        login_version: initialState.login_version ?? undefined,
-        expected_bot_generation:
-          initialState.login_expected_bot_generation ?? undefined,
-        login_status: normalizedStatus,
-        login_redirect_base_url: nextRedirectBaseUrl,
-      });
-      if (upd.stale_session) {
+      const upd = await this.patchSessionUpdate(
+        sessionKey,
+        session,
+        normalizedStatus,
+        nextRedirectBaseUrl,
+      );
+      if (upd.revoked) {
         return shapePublicQrWaitResponse({
           sessionKey,
-          status: "expired",
+          status: "superseded",
           connected: false,
-          message: "QR login session was superseded.",
+          revoked: true,
+          code: upd.code,
+          message: upd.message,
         });
       }
       return shapePublicQrWaitResponse({
         sessionKey,
         status: normalizedStatus,
         connected: false,
-        expiresAt: initialState.login_expires_at,
-        qrcodeImgContent: sessionQrImage(initialState, sessionKey),
+        expiresAt: session.expires_at,
+        qrcodeImgContent: sessionQrImage(session),
+        allowedDomains: this.allowedApiDomains,
         message:
           normalizedStatus === "verify_code"
             ? "Please enter the verification code shown in WeChat."
@@ -696,31 +814,29 @@ export class WeixinQrLoginManager {
     }
 
     if (normalizedStatus === "expired") {
-      await this.backend.putWeixinState({
-        login_session_action: "update",
-        login_session_key: sessionKey,
-        login_owner_user_id: userId,
-        login_version: initialState.login_version ?? undefined,
-        expected_bot_generation:
-          initialState.login_expected_bot_generation ?? undefined,
-        login_status: "expired",
-      });
+      await this.patchSessionUpdate(
+        sessionKey,
+        session,
+        "expired",
+        nextRedirectBaseUrl,
+      );
       return shapePublicQrWaitResponse({
         sessionKey,
         status: "expired",
         connected: false,
-        expiresAt: initialState.login_expires_at,
+        expiresAt: session.expires_at,
         message: "QR code has expired.",
       });
     }
 
-    // Confirmed state: validate credentials before committing atomically via I-9.
+    // Confirmed state: validate credentials before committing atomically via PATCH confirm.
     const botToken = statusResp.bot_token?.trim();
     const ilinkBotId = statusResp.ilink_bot_id?.trim();
     if (!botToken || !ilinkBotId) {
       throw new WeixinQrLoginError(
         "Weixin login confirmed response is missing bot_token or ilink_bot_id",
         502,
+        "ilink_invalid_confirm",
       );
     }
 
@@ -731,42 +847,90 @@ export class WeixinQrLoginManager {
         )
       : nextRedirectBaseUrl;
 
-    const confirmRes = await this.backend.putWeixinState({
-      login_session_action: "confirm",
-      login_session_key: sessionKey,
-      login_owner_user_id: userId,
-      login_version: initialState.login_version ?? undefined,
-      expected_bot_generation:
-        initialState.login_expected_bot_generation ?? undefined,
-      ilink_bot_id: ilinkBotId,
-      bot_token: botToken,
-      base_url: confirmedBaseUrl,
-      cdn_base_url: this.cdnBaseUrl,
-      owner_user_id: userId,
-      ilink_user_id: statusResp.ilink_user_id?.trim() || undefined,
-      ilink_username: statusResp.ilink_username?.trim() || undefined,
-      status: "active",
-    });
-
-    if (
-      confirmRes.stale_session ||
-      (!confirmRes.updated && !confirmRes.idempotent)
-    ) {
-      if (confirmRes.reason === "admin_required") {
+    let confirmRes;
+    try {
+      confirmRes = await this.backend.patchWeixinLoginSession(sessionKey, {
+        action: "confirm",
+        expected_login_version: session.login_version,
+        expected_bot_generation: session.expected_bot_generation,
+        ilink_bot_id: ilinkBotId,
+        bot_token: botToken,
+        base_url: confirmedBaseUrl,
+        cdn_base_url: this.cdnBaseUrl,
+        ilink_user_id: statusResp.ilink_user_id?.trim() || undefined,
+        ilink_username: statusResp.ilink_username?.trim() || undefined,
+      });
+    } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        throw err;
+      }
+      if (err instanceof BackendHttpError) {
+        const meta = extractBackendErrorMeta(err.body);
         throw new WeixinQrLoginError(
-          "Admin permission is required to confirm Weixin login.",
-          403,
+          meta.message ?? `Failed to confirm Weixin QR login (${err.status})`,
+          err.status,
+          meta.code,
         );
       }
+      throw err;
+    }
+
+    if (confirmRes.revoked || !confirmRes.ok) {
       return shapePublicQrWaitResponse({
         sessionKey,
-        status: "expired",
+        status: "superseded",
         connected: false,
+        revoked: true,
+        code: confirmRes.code ?? "login_session_revoked",
         message:
+          confirmRes.message ??
           "QR login session was superseded or expired before confirmation.",
       });
     }
 
-    return this.finishConfirmedSession(userId, sessionKey);
+    const confirmedAccountId =
+      confirmRes.account_id?.trim() || session.target_account_id?.trim() || "";
+    const confirmedGeneration =
+      typeof confirmRes.bot_generation === "number"
+        ? confirmRes.bot_generation
+        : session.expected_bot_generation + 1;
+
+    if (this.onAccountConfirmed && confirmedAccountId) {
+      await this.onAccountConfirmed({
+        accountId: confirmedAccountId,
+        ilinkBotId: confirmRes.ilink_bot_id?.trim() || ilinkBotId,
+        botToken,
+        baseUrl: confirmedBaseUrl,
+        cdnBaseUrl: this.cdnBaseUrl,
+        botGeneration: confirmedGeneration,
+        getUpdatesBuf: "",
+        ownerUserId: userId,
+        accountStatus: confirmRes.account_status ?? "active",
+        accountsRevision: confirmRes.accounts_revision ?? null,
+        ilinkUserId:
+          confirmRes.ilink_user_id ?? statusResp.ilink_user_id?.trim() ?? null,
+        ilinkUsername:
+          confirmRes.ilink_username ?? statusResp.ilink_username?.trim() ?? null,
+      });
+    }
+
+    return shapePublicQrWaitResponse({
+      sessionKey,
+      status: "confirmed",
+      connected: confirmRes.connected ?? true,
+      alreadyConnected: confirmRes.already_connected ?? false,
+      accountId: confirmedAccountId || null,
+      accountStatus: confirmRes.account_status ?? "active",
+      accountsRevision: confirmRes.accounts_revision ?? null,
+      pendingVerification:
+        confirmRes.account_status === "pending_verification",
+      ilinkBotId: confirmRes.ilink_bot_id ?? ilinkBotId,
+      ilinkUserId:
+        confirmRes.ilink_user_id ?? statusResp.ilink_user_id?.trim() ?? null,
+      ilinkUsername:
+        confirmRes.ilink_username ?? statusResp.ilink_username?.trim() ?? null,
+      botGeneration: confirmedGeneration,
+      expiresAt: session.expires_at,
+    });
   }
 }

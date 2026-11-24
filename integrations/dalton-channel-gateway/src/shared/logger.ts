@@ -24,9 +24,20 @@ export interface LoggerSink {
 }
 
 const SENSITIVE_KEY_PATTERN =
-  /(?:^(?:text|content|body|raw_body|message_body|prompt|buffer|file_bytes|audio_bytes)$|secret|token|password|authorization|cookie|api[_-]?key|app[_-]?secret|app[_-]?id|tenant[_-]?access[_-]?token|bearer|credential)/i;
+  /(?:^(?:text|content|body|raw_body|message_body|prompt|buffer|file_bytes|audio_bytes|errmsg)$|secret|token|password|authorization|cookie|api[_-]?key|app[_-]?secret|app[_-]?id|tenant[_-]?access[_-]?token|bearer|credential|qrcode|qr_code|verify[_-]?code|aes[_-]?key|aeskey|encrypt[_-]?query[_-]?param|encryptqueryparam|cdn[_-]?key|typing[_-]?ticket|upload[_-]?param)/i;
 
 const MAX_LOG_STRING_LENGTH = 512;
+
+/**
+ * Returns only an 8-character prefix of a login session key for safe structured logs (§4.3).
+ */
+export function formatSafeSessionKeyPrefix(sessionKey: string | undefined | null): string {
+  const trimmed = (sessionKey ?? "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  return trimmed.slice(0, 8);
+}
 
 /**
  * Scrubs credential-like substrings (Bearer tokens, JSON/query secret fields,
@@ -55,12 +66,12 @@ export function redactCredentialString(
     )
     // JSON key-value pairs for sensitive keys
     .replace(
-      /("(?:app_secret|appSecret|app_id|appId|tenant_access_token|user_access_token|access_token|refresh_token|client_secret|api_key|apiKey|password|secret|token|authorization)"\s*:\s*)"[^"]*"/gi,
+      /("(?:app_secret|appSecret|app_id|appId|tenant_access_token|user_access_token|access_token|refresh_token|client_secret|api_key|apiKey|password|secret|token|bot_token|botToken|context_token|contextToken|weixin_context_token|typing_ticket|qrcode|qrcode_img_content|qrcode_url|verify_code|aes_key|aeskey|aesKeyHex|aesKeyBase64|encrypt_query_param|encryptQueryParam|upload_param|authorization)"\s*:\s*)"[^"]*"/gi,
       '$1"[REDACTED]"',
     )
     // Query/header/key=value or key: value pairs for sensitive keys
     .replace(
-      /\b((?:app_secret|appSecret|app_id|appId|tenant_access_token|user_access_token|access_token|refresh_token|client_secret|api_key|apiKey|password|secret|token)\s*[=:]\s*)(?:[^\s,&"'}]+)/gi,
+      /\b((?:app_secret|appSecret|app_id|appId|tenant_access_token|user_access_token|access_token|refresh_token|client_secret|api_key|apiKey|password|secret|token|bot_token|botToken|context_token|contextToken|weixin_context_token|typing_ticket|qrcode|qrcode_img_content|qrcode_url|verify_code|aes_key|aeskey|aesKeyHex|aesKeyBase64|encrypt_query_param|encryptQueryParam|encrypted_query_param|upload_param)\s*[=:]\s*)(?:[^\s,&"'}]+)/gi,
       "$1[REDACTED]",
     )
     // Feishu tenant/user access tokens (e.g. t-g104...)
