@@ -568,3 +568,44 @@ async def test_bootstrap_cloud_primary_checks_duplicate_before_creating_computer
         )
     assert len(await get_computers_for_user(user_id)) == before_count
     assert await get_primary_computer(user_id) is None
+
+
+async def test_locked_company_dedup_sql_error_rolls_back_real_postgres_savepoint_and_fails_closed(
+    b2_live_pool,
+) -> None:
+    """Round 7 Decision 3 (real PostgreSQL): a SQL error inside locked company
+    dedup rolls back only the inner SAVEPOINT so the outer transaction remains
+    usable (SELECT 1 succeeds without InFailedSqlTransaction), and
+    check_duplicate_snapshot_unchanged fails closed (returns False -> scope_changed)."""
+    from psycopg.rows import dict_row
+    from src.dalton.coverage import dedup as dedup_mod
+
+    user_id = f"b2-sp-{uuid.uuid4().hex[:8]}"
+    await create_user(user_id=user_id, email=f"{user_id}@test.local", name="Savepoint")
+
+    async def _broken_collect_candidates(uid, raw_name, *, caller_tier, conn=None, stats=None):
+        async with conn.cursor() as bad_cur:
+            # Deliberate real PostgreSQL SQL error inside the dedup savepoint.
+            await bad_cur.execute("SELECT * FROM nonexistent_table_for_savepoint_test")
+        return False, []
+
+    with (
+        patch.object(dedup_mod, "is_coverage_units_enabled", lambda: True),
+        patch.object(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True),
+        patch.object(dedup_mod, "_collect_candidates", _broken_collect_candidates),
+        patch("src.dalton.settings.is_dalton_local_auth_enabled", lambda: False),
+        patch("src.dalton.settings.get_dalton_allowed_emails", lambda: {f"{user_id}@test.local"}),
+    ):
+        async with b2_live_pool.connection() as conn, conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                ok = await ws_db.check_duplicate_snapshot_unchanged(
+                    cur,
+                    user_id,
+                    "700.HK",
+                    check_company_duplicate=True,
+                    conn=conn,
+                )
+                assert ok is False
+                # Outer transaction is NOT aborted — subsequent SQL succeeds cleanly.
+                await cur.execute("SELECT 1 AS alive")
+                assert await cur.fetchone() == {"alive": 1}

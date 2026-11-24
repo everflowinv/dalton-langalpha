@@ -1348,22 +1348,32 @@ async def check_duplicate_snapshot_unchanged(
     if check_company_duplicate:
         from src.dalton.coverage.dedup import find_existing_company_workspace
 
-        dup = None
         try:
             if conn is not None:
                 async with conn.transaction():
                     dup = await find_existing_company_workspace(
-                        user_id, name, channel="cos", conn=conn
+                        user_id,
+                        name,
+                        channel="cos",
+                        conn=conn,
+                        raise_on_error=True,
                     )
             else:
                 dup = await find_existing_company_workspace(
-                    user_id, name, channel="cos"
+                    user_id,
+                    name,
+                    channel="cos",
+                    raise_on_error=True,
                 )
         except Exception as exc:
+            # The savepoint above rolled back on any SQL failure so the outer
+            # transaction stays healthy; treat an unavailable dedup check as
+            # unverifiable (fail closed -> scope_changed), never as "no dup".
             logger.warning(
-                "Locked company workspace dedup check failed (%s); proceeding",
+                "Locked company workspace dedup check unavailable (%s); aborting with scope_changed",
                 type(exc).__name__,
             )
+            return False
         if dup is not None and dup.matches:
             matched_ids = set(dup.matched_workspace_ids) | {
                 str(m.workspace_id) for m in dup.matches if m.workspace_id

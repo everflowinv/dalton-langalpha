@@ -34,6 +34,7 @@ Visibility, credentials, and authorization remain strictly deterministic in code
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -519,9 +520,19 @@ def _is_excluded_workspace(
     return False
 
 
-async def _resolve_caller_tier(uid: str) -> str:
+async def _resolve_caller_tier(uid: str, *, conn: Any = None) -> str:
     """Resolve caller tier strictly so roster/DB lookup failures raise instead of masquerading as 'external'."""
     if get_user_tier is not _REAL_GET_USER_TIER:
+        if conn is not None:
+            try:
+                sig = inspect.signature(get_user_tier)
+                if "conn" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD
+                    for p in sig.parameters.values()
+                ):
+                    return await get_user_tier(uid, conn=conn)
+            except (TypeError, ValueError):
+                pass
         return await get_user_tier(uid)
     from src.dalton.company_identity import is_company_system_user
     from src.dalton.invites import is_invite_pm
@@ -533,11 +544,19 @@ async def _resolve_caller_tier(uid: str) -> str:
     if is_dalton_local_auth_enabled():
         from src.dalton.auth.roles import get_user_role
 
-        role = await get_user_role(uid)
+        role = (
+            await get_user_role(uid, conn=conn)
+            if conn is not None
+            else await get_user_role(uid)
+        )
         return role if role in ("admin", "internal", "external") else "external"
     if is_invite_pm(uid):
         return "admin"
-    user = await get_user_row(uid)
+    user = (
+        await get_user_row(uid, conn=conn)
+        if conn is not None
+        else await get_user_row(uid)
+    )
     email = str((user or {}).get("email") or "").strip().lower()
     if email and email in get_dalton_allowed_emails():
         return "internal"
@@ -1681,8 +1700,15 @@ async def find_existing_company_workspace(
     *,
     channel: str = "web",
     conn: Any = None,
+    raise_on_error: bool = False,
 ) -> DuplicateMatch | None:
-    """Return matching existing company workspaces, or None when clear / disabled / on error."""
+    """Return matching existing company workspaces, or None when clear / disabled / on error.
+
+    When ``raise_on_error=True`` (used by transactional locked rechecks),
+    SQL/LLM failures propagate so the caller's savepoint rolls back cleanly
+    and fails closed instead of leaving an aborted transaction or treating the
+    error as "no duplicate".
+    """
     if not is_coverage_units_enabled() or not is_dalton_supabase_auth_enabled():
         return None
 
@@ -1697,7 +1723,7 @@ async def find_existing_company_workspace(
 
     stats = {"workspace_count": 0}
     try:
-        caller_tier = await _resolve_caller_tier(uid)
+        caller_tier = await _resolve_caller_tier(uid, conn=conn)
         if caller_tier == "company":
             return None
         return await _find_matches(
@@ -1710,8 +1736,11 @@ async def find_existing_company_workspace(
         )
     except Exception as exc:
         logger.warning(
-            "Company workspace dedup check failed (%s, workspace_count=%d); proceeding",
+            "Company workspace dedup check failed (%s, workspace_count=%d); %s",
             type(exc).__name__,
             stats["workspace_count"],
+            "aborting locked recheck" if raise_on_error else "proceeding",
         )
+        if raise_on_error:
+            raise
         return None
