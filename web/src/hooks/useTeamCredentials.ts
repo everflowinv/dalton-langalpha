@@ -38,10 +38,12 @@ export function useTeamCredentials(): {
    */
   callerTierError: boolean;
   colleagueSharingEnabled?: boolean;
+  /** True once `/credentials/status` succeeds (or in OSS mode where sharing auth is off). */
+  colleagueSharingKnown?: boolean;
 } {
   const { userId } = useAuth();
 
-  const { data, isError, isLoading } = useQuery<TeamCredentialsStatus>({
+  const { data, isError, isLoading, isSuccess } = useQuery<TeamCredentialsStatus>({
     queryKey: queryKeys.dalton.credentialsStatus(userId),
     queryFn: async () => {
       const { api } = await import('@/api/client');
@@ -66,12 +68,14 @@ export function useTeamCredentials(): {
       callerTierPending: false,
       callerTierError: false,
       colleagueSharingEnabled: false,
+      colleagueSharingKnown: true,
     };
   }
   const isShared = Boolean(data?.enabled);
   const isPm = !isError && Boolean(data?.is_pm);
   const callerTierError = isError;
   const callerTier = !callerTierError ? (data?.caller_tier ?? null) : null;
+  const colleagueSharingKnown = isSuccess && !isError;
   return {
     isShared,
     canDisconnect: !isError && Boolean(data?.can_disconnect),
@@ -87,6 +91,7 @@ export function useTeamCredentials(): {
     callerTier,
     callerTierPending: Boolean(userId) && isLoading,
     callerTierError,
-    colleagueSharingEnabled: !isError && Boolean(data?.colleague_sharing_enabled),
+    colleagueSharingEnabled: colleagueSharingKnown && Boolean(data?.colleague_sharing_enabled),
+    colleagueSharingKnown,
   };
 }
