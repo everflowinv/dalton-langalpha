@@ -745,3 +745,81 @@ class ComposeContext:
         """Run ``docker save -o <tmp.tar>`` on a service's image and scan every manifest layer."""
         with self.saved_service_image_tar(service) as tar_path:
             return scan_tar_file_for_paths(tar_path, forbidden_substrings)
+
+
+FAKE_PROVIDER_NAME = "fake-openai"
+FAKE_MODEL_NAME = "fake-gpt-6-luna"
+FAKE_BASE_URL = "http://fake-llm:8099/v1"
+FAKE_API_KEY = "sk-fake-standalone-ci-0001"
+
+
+def configure_fake_llm_model(
+    ctx: ComposeContext,
+    *,
+    provider_name: str = FAKE_PROVIDER_NAME,
+    model_name: str = FAKE_MODEL_NAME,
+    model_id: str | None = None,
+    base_url: str = FAKE_BASE_URL,
+    api_key: str = FAKE_API_KEY,
+) -> str:
+    """Register the CI fake OpenAI Responses API provider/model via the HTTP API.
+
+    Idempotent across check scripts sharing the same Compose stack (e.g. ``b1`` and ``b6``)
+    and self-contained when a check script is invoked on a fresh stack.
+    """
+    resolved_model_id = model_id or os.environ.get("FAKE_LLM_MODEL", "gpt-6-luna")
+    pref_resp = http_request(
+        "PUT",
+        f"{ctx.edge_url}/api/v1/users/me/preferences",
+        json_body={
+            "model_preference": {
+                "custom_providers": [
+                    {
+                        "name": provider_name,
+                        "parent_provider": "openai",
+                        "use_response_api": True,
+                    }
+                ],
+                "custom_models": [
+                    {
+                        "name": model_name,
+                        "model_id": resolved_model_id,
+                        "provider": provider_name,
+                        "input_modalities": ["text"],
+                    }
+                ],
+                "preferred_model": model_name,
+            }
+        },
+    )
+    assert pref_resp.status == 200, (
+        f"Failed to save fake provider/model preferences: {pref_resp.status} {pref_resp.text}"
+    )
+
+    key_resp = http_request(
+        "PUT",
+        f"{ctx.edge_url}/api/v1/users/me/api-keys",
+        json_body={
+            "byok_enabled": True,
+            "api_keys": {provider_name: api_key},
+            "base_urls": {provider_name: base_url},
+        },
+    )
+    assert key_resp.status == 200, (
+        f"Failed to save fake provider API key: {key_resp.status} {key_resp.text}"
+    )
+
+    test_key_resp = http_request(
+        "POST",
+        f"{ctx.edge_url}/api/v1/keys/test",
+        json_body={
+            "provider": provider_name,
+            "api_key": api_key,
+            "base_url": base_url,
+        },
+    )
+    assert test_key_resp.status == 200, (
+        f"POST /api/v1/keys/test against fake-llm failed: "
+        f"{test_key_resp.status} {test_key_resp.text}"
+    )
+    return model_name

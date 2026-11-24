@@ -1,9 +1,9 @@
 # Multi-stage Standalone Core edge image:
 #   1. Build the React/Vite frontend bundle (without reading web/.env.dalton or requiring Supabase)
 #   2. Build the static Astro/Starlight /help documentation bundle
-#   3. Serve both from /srv inside the official Caddy image (caddy:2.9.1-alpine)
+#   3. Serve both from /srv inside the official Caddy image (caddy:2.9.1-alpine, pinned by digest)
 
-FROM node:24-alpine AS web-builder
+FROM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS web-builder
 WORKDIR /web
 
 COPY web/package.json web/pnpm-lock.yaml web/pnpm-workspace.yaml ./
@@ -44,7 +44,7 @@ RUN pnpm run build \
     && test -s dist/version.json \
     && test -d dist/assets
 
-FROM node:24-alpine AS docs-builder
+FROM node:24-alpine@sha256:8a32c8cf649a49915a66e81e7a609223c708d0adabf288ee3f4077d765542f85 AS docs-builder
 WORKDIR /docs
 
 COPY web/package.json /tmp/web-package.json
@@ -69,7 +69,7 @@ ENV DOCS_SITE_ORIGIN=${DOCS_SITE_ORIGIN}
 RUN pnpm run build \
     && test -s dist/index.html
 
-FROM caddy:2.9.1-alpine
+FROM caddy:2.9.1-alpine@sha256:b4e3952384eb9524a887633ce65c752dd7c71314d2c2acf98cd5c715aaa534f0
 
 COPY --from=web-builder /web/dist /srv
 COPY --from=docs-builder /docs/dist /srv/help
