@@ -1,8 +1,8 @@
 // DALTON-HOOK(monitors): integrate 4-tier monitor publishing, ACLs, and admin public confirmation
-import { useEffect, useId, useMemo, useRef, useState, type RefObject } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState, useSyncExternalStore, type RefObject } from 'react';
 import { Check, Copy, ExternalLink, Link2, Lock } from 'lucide-react';
 import { Trans, useTranslation } from 'react-i18next';
-import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import {
   Dialog,
@@ -21,6 +21,7 @@ import { cn } from '@/lib/utils';
 import { formatBytes, shortMonthDay } from '@/lib/format';
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { queryKeys } from '@/lib/queryKeys';
+import { registerAuthReset } from '@/lib/authResets';
 import { useCopyShareLink } from '@/hooks/useCopyShareLink';
 import { useLocale } from '@/hooks/useLocale';
 import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(colleague-access): gate auto-publish pause tracking on colleague_sharing capability
@@ -51,7 +52,13 @@ import {
 } from '@/pages/Monitors/api';
 import { pageLoadsOf } from '@/lib/pageLoads';
 import { usePageScout } from './viewers/html/usePageScout';
-import type { ArtifactStatus, ArtifactVersion, ShareFileEntry } from '@/types/api';
+import type {
+  ArtifactStatus,
+  ArtifactVersion,
+  ShareFileEntry,
+  Workspace,
+  WorkspacesResponse,
+} from '@/types/api';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 import { basename, dirname } from '../utils/fileRefResolver';
 import { shareLinkHref } from '../utils/api/shareLinks';
@@ -66,6 +73,68 @@ import type { ShareAudience } from '@/types/api';
 
 /** The server takes a label of 1 to 200 characters. */
 const LABEL_MAX = 200;
+
+/**
+ * DALTON-HOOK(colleague-access): browser-session execution context (not server
+ * state). Holds a publish response's CAS pause token only while the workspace
+ * detail cache is empty (for example, while the first detail GET is in flight
+ * or when `/credentials/status` fails), so closing and reopening the dialog
+ * within this tab still sends the token on the next submit. Removed as soon as
+ * workspace detail data is written to the cache, and cleared on sign-out.
+ */
+const pendingPauseTokens = new Map<string, string>();
+const pendingPauseTokenListeners = new Set<() => void>();
+const watchedPauseQueryClients = new WeakSet<QueryClient>();
+
+function detailWorkspaceIdFromKey(key: readonly unknown[]): string | null {
+  const prefix = queryKeys.workspaces.details();
+  if (key.length !== prefix.length + 1) return null;
+  for (let i = 0; i < prefix.length; i += 1) {
+    if (key[i] !== prefix[i]) return null;
+  }
+  const id = key[prefix.length];
+  return typeof id === 'string' ? id : null;
+}
+
+function notifyPendingPauseTokens(): void {
+  pendingPauseTokenListeners.forEach((listener) => listener());
+}
+
+function subscribePendingPauseTokens(listener: () => void): () => void {
+  pendingPauseTokenListeners.add(listener);
+  return () => pendingPauseTokenListeners.delete(listener);
+}
+
+function deletePendingPauseToken(workspaceId: string): void {
+  if (pendingPauseTokens.delete(workspaceId)) {
+    notifyPendingPauseTokens();
+  }
+}
+
+function ensureDetailCacheWatcher(qc: QueryClient): void {
+  if (watchedPauseQueryClients.has(qc)) return;
+  watchedPauseQueryClients.add(qc);
+  qc.getQueryCache().subscribe((event) => {
+    if (pendingPauseTokens.size === 0) return;
+    if (event.type !== 'updated' && event.type !== 'added') return;
+    if (event.query.state.data === undefined) return;
+    const wsId = detailWorkspaceIdFromKey(event.query.queryKey);
+    if (wsId) deletePendingPauseToken(wsId);
+  });
+}
+
+function setPendingPauseToken(qc: QueryClient, workspaceId: string, token: string): void {
+  ensureDetailCacheWatcher(qc);
+  if (pendingPauseTokens.get(workspaceId) === token) return;
+  pendingPauseTokens.set(workspaceId, token);
+  notifyPendingPauseTokens();
+}
+
+registerAuthReset(() => {
+  if (pendingPauseTokens.size === 0) return;
+  pendingPauseTokens.clear();
+  notifyPendingPauseTokens();
+});
 
 interface PublishDialogProps {
   open: boolean;
@@ -422,41 +491,49 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   useEffect(() => {
     trackPublishResponsePauseRef.current = trackPublishResponsePause;
   }, [trackPublishResponsePause]);
-  const [pauseOverride, setPauseOverride] = useState<{
-    paused: boolean;
-    token: string | null;
-    notice: string | null;
-    responseAt: number;
-  } | null>(null);
-  const workspaceRefreshedAfterOverride =
-    trackWorkspacePause &&
-    pauseOverride !== null &&
-    (workspaceQuery.dataUpdatedAt ?? 0) > pauseOverride.responseAt;
-  const pauseOverrideActive = pauseOverride !== null && !workspaceRefreshedAfterOverride;
+  // Publish response notice stays in component state until dialog close or the next submit.
+  const [pauseNotice, setPauseNotice] = useState<string | null>(null);
+  // Read cached workspace detail reactively without triggering a fetch when sharing status is unknown.
+  const subscribeCachedDetail = useCallback(
+    (onStoreChange: () => void) => {
+      if (!trackPublishResponsePause || trackWorkspacePause) return () => {};
+      return qc.getQueryCache().subscribe((event) => {
+        if (detailWorkspaceIdFromKey(event.query.queryKey) === workspaceId) {
+          onStoreChange();
+        }
+      });
+    },
+    [qc, workspaceId, trackPublishResponsePause, trackWorkspacePause],
+  );
+  const cachedDetail = useSyncExternalStore(
+    subscribeCachedDetail,
+    () =>
+      trackPublishResponsePause && !trackWorkspacePause
+        ? qc.getQueryData<Workspace>(queryKeys.workspaces.detail(workspaceId))
+        : undefined,
+  );
+  const pendingPauseToken = useSyncExternalStore(
+    subscribePendingPauseTokens,
+    () => (trackPublishResponsePause ? (pendingPauseTokens.get(workspaceId) ?? null) : null),
+  );
+  const workspaceDetail = trackWorkspacePause ? workspaceQuery.data : cachedDetail;
+  useEffect(() => {
+    if (workspaceDetail !== undefined) {
+      deletePendingPauseToken(workspaceId);
+    }
+  }, [workspaceDetail, workspaceId]);
   const autoPublishPaused = trackWorkspacePause
-    ? (pauseOverrideActive
-        ? pauseOverride.paused
-        : Boolean(workspaceQuery.data?.auto_publish_paused))
-    : trackPublishResponsePause && pauseOverrideActive
-      ? pauseOverride.paused
-      : false;
-  const showAutoPublishPausedHint = trackWorkspacePause && autoPublishPaused;
-  const autoPublishPauseToken = trackWorkspacePause
-    ? (pauseOverrideActive
-        ? pauseOverride.token
-        : (workspaceQuery.data?.auto_publish_pause_token ?? null))
-    : trackPublishResponsePause && pauseOverrideActive
-      ? pauseOverride.token
-      : null;
-  const autoPublishPauseNotice =
-    trackPublishResponsePause &&
-    autoPublishPaused &&
-    pauseOverride?.notice &&
-    (pauseOverrideActive ||
-      (trackWorkspacePause &&
-        (workspaceQuery.data?.auto_publish_pause_token ?? null) === pauseOverride.token))
-      ? pauseOverride.notice
-      : null;
+    ? workspaceDetail !== undefined
+      ? Boolean(workspaceDetail.auto_publish_paused)
+      : pendingPauseToken !== null
+    : false;
+  const showAutoPublishPausedHint = autoPublishPaused;
+  const autoPublishPauseToken = trackPublishResponsePause
+    ? workspaceDetail !== undefined
+      ? (workspaceDetail.auto_publish_pause_token ?? null)
+      : pendingPauseToken
+    : null;
+  const autoPublishPauseNotice = trackPublishResponsePause ? pauseNotice : null;
 
   const busy = publishingMonitor || unshare.isPending || keepUpdated.isPending || audienceChange.isPending;
   useEffect(() => {
@@ -551,7 +628,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
     const loads = pageLoadsOf(artifact.workspace_id, artifact.path);
     const statusAt = statusQuery.dataUpdatedAt;
     setOutcome(null);
-    setPauseOverride((prev) => (prev ? { ...prev, notice: null } : null));
+    setPauseNotice(null);
     setPublishingMonitor(true);
     try {
       // DALTON-HOOK(colleague-access): include CAS confirm_pause_token and surface server pause notice
@@ -577,18 +654,52 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
       void qc.invalidateQueries({ queryKey: queryKeys.daltonMonitors.all });
       void qc.invalidateQueries({ queryKey: queryKeys.artifacts.pathsIn(workspaceId) });
       if (trackPublishResponsePauseRef.current) {
-        const responseAt = Date.now();
-        setPauseOverride({
-          paused: Boolean(result.auto_publish_paused),
-          token: result.auto_publish_paused ? (result.auto_publish_pause_token ?? null) : null,
-          notice: result.auto_publish_paused ? (result.auto_publish_pause_notice ?? null) : null,
-          responseAt,
-        });
-        void qc.invalidateQueries(
-          { queryKey: queryKeys.workspaces.detail(workspaceId) },
-          { cancelRefetch: true },
-        );
-        void qc.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
+        const detailKey = queryKeys.workspaces.detail(workspaceId);
+        const paused = Boolean(result.auto_publish_paused);
+        const token = paused ? (result.auto_publish_pause_token ?? null) : null;
+        const notice = paused ? (result.auto_publish_pause_notice ?? null) : null;
+        // Cancel any pre-publish detail GET (including a first cold fetch whose data is still undefined)
+        // so its older payload never overwrites this response and invalidateQueries starts a fresh GET.
+        await qc.cancelQueries({ queryKey: detailKey, exact: true });
+        if (trackPublishResponsePauseRef.current) {
+          setPauseNotice(notice);
+          let mergedDetail = false;
+          qc.setQueryData<Workspace>(detailKey, (old) => {
+            if (!old) return old;
+            mergedDetail = true;
+            return {
+              ...old,
+              auto_publish_paused: paused,
+              auto_publish_pause_token: token,
+            };
+          });
+          qc.setQueriesData<WorkspacesResponse | undefined>(
+            { queryKey: queryKeys.workspaces.lists() },
+            (old) => {
+              if (!old?.workspaces) return old;
+              let matched = false;
+              const workspaces = old.workspaces.map((row) => {
+                if (row.workspace_id !== workspaceId) return row;
+                matched = true;
+                return {
+                  ...row,
+                  auto_publish_paused: paused,
+                  auto_publish_pause_token: token,
+                };
+              });
+              return matched ? { ...old, workspaces } : old;
+            },
+          );
+          if (mergedDetail) {
+            deletePendingPauseToken(workspaceId);
+          } else if (token) {
+            setPendingPauseToken(qc, workspaceId, token);
+          } else {
+            deletePendingPauseToken(workspaceId);
+          }
+          void qc.invalidateQueries({ queryKey: detailKey, exact: true });
+          void qc.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
+        }
       }
       if (result.cut === false) {
         setOutcome({ kind: 'unchanged', seq: result.monitor.published_seq });
