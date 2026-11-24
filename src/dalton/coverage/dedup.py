@@ -34,7 +34,6 @@ Visibility, credentials, and authorization remain strictly deterministic in code
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import logging
 import re
@@ -520,19 +519,9 @@ def _is_excluded_workspace(
     return False
 
 
-async def _resolve_caller_tier(uid: str, *, conn: Any = None) -> str:
+async def _resolve_caller_tier(uid: str) -> str:
     """Resolve caller tier strictly so roster/DB lookup failures raise instead of masquerading as 'external'."""
     if get_user_tier is not _REAL_GET_USER_TIER:
-        if conn is not None:
-            try:
-                sig = inspect.signature(get_user_tier)
-                if "conn" in sig.parameters or any(
-                    p.kind == inspect.Parameter.VAR_KEYWORD
-                    for p in sig.parameters.values()
-                ):
-                    return await get_user_tier(uid, conn=conn)
-            except (TypeError, ValueError):
-                pass
         return await get_user_tier(uid)
     from src.dalton.company_identity import is_company_system_user
     from src.dalton.invites import is_invite_pm
@@ -544,19 +533,11 @@ async def _resolve_caller_tier(uid: str, *, conn: Any = None) -> str:
     if is_dalton_local_auth_enabled():
         from src.dalton.auth.roles import get_user_role
 
-        role = (
-            await get_user_role(uid, conn=conn)
-            if conn is not None
-            else await get_user_role(uid)
-        )
+        role = await get_user_role(uid)
         return role if role in ("admin", "internal", "external") else "external"
     if is_invite_pm(uid):
         return "admin"
-    user = (
-        await get_user_row(uid, conn=conn)
-        if conn is not None
-        else await get_user_row(uid)
-    )
+    user = await get_user_row(uid)
     email = str((user or {}).get("email") or "").strip().lower()
     if email and email in get_dalton_allowed_emails():
         return "internal"
@@ -1694,21 +1675,158 @@ async def _find_matches(
     )
 
 
+@dataclass(frozen=True)
+class CompanyDedupRecheckSnapshot:
+    """Result of the lock-free Phase 1 company duplicate recheck executed after
+    user approval and before acquiring ``lock_user_writes``.
+
+    - ``status == "clear"``: no undisclosed duplicate matched; ``checked_candidates``
+      holds ``(workspace_id, workspace_name, unit_ticker)`` tuples for deterministic
+      drift verification inside the write lock.
+    - ``status == "matched"``: one or more undisclosed duplicates matched
+      (``matched_workspace_ids`` names the matched workspace IDs).
+    - ``status == "unavailable"``: tier lookup, candidate read, LLM call, or
+      payload parse failed, so duplicate freedom could not be confirmed.
+    """
+
+    status: Literal["clear", "matched", "unavailable"]
+    matched_workspace_ids: tuple[str, ...] = ()
+    has_unbound_or_unreadable_match: bool = False
+    checked_candidates: tuple[tuple[str, str, str | None], ...] = ()
+    active: bool = True
+    check_colleague_workspaces: bool = False
+
+
+async def recheck_company_workspace_before_create(
+    user_id: str | None,
+    name: str | None,
+    *,
+    channel: str = "cos",
+    expected_duplicate_workspace_id: str | None = None,
+) -> CompanyDedupRecheckSnapshot:
+    """Run lock-free company dedup (Phase 1) after confirmation approval.
+
+    Never holds a DB lock while awaiting ``dalton_complete`` / budget / journal
+    queries. Distinguishes explicit duplicate matches (with their workspace IDs)
+    from check failures (``status="unavailable"``), and returns the observed
+    candidate list for deterministic Phase 2 verification inside the lock.
+    """
+    if not is_coverage_units_enabled() or not is_dalton_supabase_auth_enabled():
+        return CompanyDedupRecheckSnapshot(status="clear", active=False)
+
+    cleaned_channel = str(channel or "cos").strip().lower()
+    if cleaned_channel not in ("web", "cos"):
+        raise ValueError(f"Unsupported channel: {channel!r}")
+
+    uid = str(user_id or "").strip()
+    raw_name = str(name or "").strip()
+    if not uid or not raw_name:
+        return CompanyDedupRecheckSnapshot(status="clear", active=False)
+
+    stats = {"workspace_count": 0}
+    try:
+        caller_tier = await _resolve_caller_tier(uid)
+        if caller_tier == "company":
+            return CompanyDedupRecheckSnapshot(status="clear", active=False)
+        check_colleagues = caller_tier != "external"
+        early_exit, entries = await _collect_candidates(
+            uid,
+            raw_name,
+            caller_tier=caller_tier,
+            stats=stats,
+        )
+        checked_candidates = tuple(
+            (entry.ws_id, entry.workspace_name, entry.unit_ticker)
+            for entry in entries
+            if entry.ws_id
+        )
+        if early_exit:
+            return CompanyDedupRecheckSnapshot(
+                status="matched",
+                has_unbound_or_unreadable_match=True,
+                checked_candidates=checked_candidates,
+                check_colleague_workspaces=check_colleagues,
+            )
+        if not entries:
+            return CompanyDedupRecheckSnapshot(
+                status="clear",
+                checked_candidates=(),
+                check_colleague_workspaces=check_colleagues,
+            )
+
+        hits = await _judge_candidates_with_llm(
+            uid=uid,
+            raw_name=raw_name,
+            entries=entries,
+            stats=stats,
+            is_external=(caller_tier == "external"),
+        )
+        if not hits:
+            return CompanyDedupRecheckSnapshot(
+                status="clear",
+                checked_candidates=checked_candidates,
+                check_colleague_workspaces=check_colleagues,
+            )
+
+        all_live_hits = await _refresh_live_hits(hits)
+        if not all_live_hits:
+            return CompanyDedupRecheckSnapshot(
+                status="clear",
+                checked_candidates=checked_candidates,
+                check_colleague_workspaces=check_colleagues,
+            )
+
+        matched_ids: list[str] = []
+        has_unbound_or_unreadable = False
+        for entry, fresh_ws, _conf, _reason in all_live_hits:
+            cand, ws_id = await _resolve_live_hit_candidate(
+                uid,
+                entry,
+                fresh_ws,
+                channel=cleaned_channel,
+            )
+            if ws_id:
+                if ws_id not in matched_ids:
+                    matched_ids.append(ws_id)
+            if cand.unbound_unit or not cand.workspace_id:
+                has_unbound_or_unreadable = True
+
+        has_undisclosed = (
+            expected_duplicate_workspace_id is None
+            or has_unbound_or_unreadable
+            or any(mid != expected_duplicate_workspace_id for mid in matched_ids)
+            or not matched_ids
+        )
+        if has_undisclosed:
+            return CompanyDedupRecheckSnapshot(
+                status="matched",
+                matched_workspace_ids=tuple(matched_ids),
+                has_unbound_or_unreadable_match=has_unbound_or_unreadable,
+                checked_candidates=checked_candidates,
+                check_colleague_workspaces=check_colleagues,
+            )
+        return CompanyDedupRecheckSnapshot(
+            status="clear",
+            checked_candidates=checked_candidates,
+            check_colleague_workspaces=check_colleagues,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Lock-free company workspace dedup recheck unavailable (%s, workspace_count=%d)",
+            type(exc).__name__,
+            stats["workspace_count"],
+        )
+        return CompanyDedupRecheckSnapshot(status="unavailable")
+
+
 async def find_existing_company_workspace(
     user_id: str | None,
     name: str | None,
     *,
     channel: str = "web",
     conn: Any = None,
-    raise_on_error: bool = False,
 ) -> DuplicateMatch | None:
-    """Return matching existing company workspaces, or None when clear / disabled / on error.
-
-    When ``raise_on_error=True`` (used by transactional locked rechecks),
-    SQL/LLM failures propagate so the caller's savepoint rolls back cleanly
-    and fails closed instead of leaving an aborted transaction or treating the
-    error as "no duplicate".
-    """
+    """Return matching existing company workspaces, or None when clear / disabled / on error."""
     if not is_coverage_units_enabled() or not is_dalton_supabase_auth_enabled():
         return None
 
@@ -1723,7 +1841,7 @@ async def find_existing_company_workspace(
 
     stats = {"workspace_count": 0}
     try:
-        caller_tier = await _resolve_caller_tier(uid, conn=conn)
+        caller_tier = await _resolve_caller_tier(uid)
         if caller_tier == "company":
             return None
         return await _find_matches(
@@ -1736,11 +1854,8 @@ async def find_existing_company_workspace(
         )
     except Exception as exc:
         logger.warning(
-            "Company workspace dedup check failed (%s, workspace_count=%d); %s",
+            "Company workspace dedup check failed (%s, workspace_count=%d); proceeding",
             type(exc).__name__,
             stats["workspace_count"],
-            "aborting locked recheck" if raise_on_error else "proceeding",
         )
-        if raise_on_error:
-            raise
         return None

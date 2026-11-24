@@ -620,6 +620,41 @@ async def workspaces_create(
         workspace_manager = WorkspaceManager.get_instance()
         # --- DALTON-HOOK(cos-settings-tools): begin ---
         if snapshot is not None:
+            # Two-phase duplicate verification:
+            # Phase 1 (lock-free, after approval and before acquiring write
+            # locks): run full company workspace dedup (LLM + colleague
+            # visibility). Any undisclosed match or unavailable check aborts
+            # immediately with scope_changed without holding any DB lock.
+            verified_company_candidates = None
+            check_colleague_duplicate = False
+            if not preapproved and not allow_duplicate_company:
+                from src.dalton.coverage.dedup import (
+                    recheck_company_workspace_before_create,
+                )
+
+                expected_dup_id = (
+                    str(snapshot["duplicate_workspace_id"])
+                    if snapshot.get("duplicate_workspace_id") is not None
+                    else None
+                )
+                recheck = await recheck_company_workspace_before_create(
+                    user_id,
+                    name,
+                    channel="cos",
+                    expected_duplicate_workspace_id=expected_dup_id,
+                )
+                if recheck.status != "clear":
+                    return error_command(
+                        "情况已变化，请重新发起",
+                        tool_call_id,
+                        code="scope_changed",
+                        message_status="error",
+                        **preapproved_meta,
+                    )
+                if recheck.active:
+                    verified_company_candidates = recheck.checked_candidates
+                    check_colleague_duplicate = recheck.check_colleague_workspaces
+
             create_kwargs: dict[str, Any] = {
                 "user_id": user_id,
                 "name": name,
@@ -627,8 +662,10 @@ async def workspaces_create(
                 "verify_snapshot": True,
                 "check_duplicate_snapshot": True,
             }
-            if not preapproved and not allow_duplicate_company:
-                create_kwargs["check_company_duplicate"] = True
+            if verified_company_candidates is not None:
+                create_kwargs["verified_company_candidates"] = verified_company_candidates
+            if check_colleague_duplicate:
+                create_kwargs["check_colleague_duplicate"] = True
             if snapshot.get("duplicate_workspace_id") is not None:
                 create_kwargs["expected_duplicate_workspace_id"] = str(
                     snapshot["duplicate_workspace_id"]

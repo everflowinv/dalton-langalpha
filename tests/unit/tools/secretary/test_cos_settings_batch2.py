@@ -176,7 +176,6 @@ async def test_resume_reads_only_persisted_snapshot_when_primary_switches(
         description="desc",
         verify_snapshot=True,
         check_duplicate_snapshot=True,
-        check_company_duplicate=True,
         expected_computer_kind="docker",
         computer_id=CLOUD_1,
         expected_computer_name="Cloud Primary",
@@ -1069,7 +1068,7 @@ async def test_real_langgraph_resume_reads_scope_changed_and_reject_before_compa
         ("colleague_ticker_0700hk", "user-colleague-1", "0700.HK", "Bob", "bob@team.com"),
     ],
 )
-async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns_scope_changed(
+async def test_real_langgraph_approve_two_phase_dedup_matches_expected_workspace_id_lock_free(
     monkeypatch: pytest.MonkeyPatch,
     scenario: str,
     new_ws_owner: str,
@@ -1077,19 +1076,18 @@ async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns
     owner_name: str,
     owner_email: str,
 ) -> None:
-    """Round 6 Decision 1: real LangGraph StateGraph + InMemorySaver ->
-    real workspaces_create -> real WorkspaceManager.create_workspace ->
-    real create_workspace_on_computer -> real check_duplicate_snapshot_unchanged ->
-    real find_existing_company_workspace (no mocking WorkspaceManager to return
-    scope_changed).
+    """Round 8 Decisions 1 & 3: two-phase duplicate verification on approve.
 
-    Covers both regressions when a duplicate appears while the confirmation card
-    for '700.HK' is pending:
-    1) User adds a workspace named '腾讯控股' (company name match);
-    2) A colleague adds '0700.HK' (colleague-visible ticker match).
-    In both cases, Approve skips lock-outside precheck, runs company dedup
-    inside lock_user_writes, never inserts the workspace, and returns
-    status='error' code='scope_changed'."""
+    Phase 1 (lock-free, after approval and before acquiring lock_user_writes)
+    runs full company dedup (with LLM + colleague visibility):
+    - Asserts recheck_company_workspace_before_create returns status='matched'
+      with the EXACT expected matched_workspace_ids (cannot be confused with a
+      parse failure returning 'unavailable').
+    - Asserts LLM runs while lock_user_writes is NOT held, no write lock is
+      taken, and INSERT INTO workspaces never executes.
+    - Positive control: when LLM reports no match (status='clear'), Phase 2
+      deterministic in-lock recheck runs with ZERO LLM calls under lock and
+      executes INSERT INTO workspaces (success=True)."""
     from contextlib import asynccontextmanager
 
     from langgraph.checkpoint.memory import InMemorySaver
@@ -1101,13 +1099,15 @@ async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns
     from src.server.database import workspace as ws_db
     from src.tools.secretary.tools import workspaces_create
 
+    dup_ws_id = "55555555-5555-5555-5555-555555555555"
     live_workspaces: list[dict[str, Any]] = []
     lock_state = {
         "held": False,
+        "lock_acquires": 0,
         "inserts": 0,
-        "for_share_computer_checks": 0,
     }
     llm_calls: list[dict[str, Any]] = []
+    recheck_results: list[Any] = []
     healthy_computer = _computer_row(
         CLOUD_1, name="Cloud Primary", kind="docker", is_primary=True
     )
@@ -1139,15 +1139,13 @@ async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns
                 ]
                 return
             if "FROM computers" in text:
-                if "FOR SHARE" in text:
-                    lock_state["for_share_computer_checks"] += 1
                 self._rows = [dict(healthy_computer)]
                 return
             if "SELECT dir_name FROM workspaces" in text:
                 self._rows = []
                 return
-            if "FROM dalton_coverage_units" in text or "FROM dalton_knowledge_versions" in text:
-                self._rows = []
+            if "FROM dalton_members" in text:
+                self._rows = [{"email": "alice@team.com"}, {"email": "bob@team.com"}]
                 return
             if "FROM workspaces w" in text:
                 if isinstance(params, tuple) and params and isinstance(params[0], list):
@@ -1157,6 +1155,9 @@ async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns
                     ]
                 else:
                     self._rows = [dict(r) for r in live_workspaces]
+                return
+            if "FROM dalton_coverage_units" in text or "FROM dalton_knowledge_versions" in text:
+                self._rows = []
                 return
             if "FROM workspaces" in text and isinstance(params, dict) and "user_id" in params:
                 uid_filter = str(params["user_id"])
@@ -1195,6 +1196,7 @@ async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns
 
     async def _fake_lock_user_writes(_cur, _uid: str) -> None:
         lock_state["held"] = True
+        lock_state["lock_acquires"] += 1
 
     emit_match = {"flag": True}
 
@@ -1216,6 +1218,13 @@ async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns
             )
         return SimpleNamespace(ok=True, data=DedupLlmResult(matches=[]))
 
+    orig_recheck = dedup_mod.recheck_company_workspace_before_create
+
+    async def _spy_recheck(*args, **kwargs):
+        res = await orig_recheck(*args, **kwargs)
+        recheck_results.append(res)
+        return res
+
     real_ws_mgr = object.__new__(WorkspaceManager)
     real_ws_mgr.resolve_binding = create_autospec(
         real_ws_mgr.resolve_binding, return_value=None
@@ -1231,10 +1240,14 @@ async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns
             side_effect=lambda *_a, **_kw: _async_val(dict(healthy_computer)),
         ),
     )
-    monkeypatch.setattr(ws_db, "get_computer", create_autospec(
-        lambda _cid, conn=None: None,
-        side_effect=lambda *_a, **_kw: _async_val(dict(healthy_computer)),
-    ))
+    monkeypatch.setattr(
+        ws_db,
+        "get_computer",
+        create_autospec(
+            lambda _cid, conn=None: None,
+            side_effect=lambda *_a, **_kw: _async_val(dict(healthy_computer)),
+        ),
+    )
     monkeypatch.setattr(ws_db, "get_db_connection", _fake_get_db_connection)
     monkeypatch.setattr(ws_db, "folder_allocation", _fake_folder_allocation)
     monkeypatch.setattr(ws_db, "lock_user_writes", _fake_lock_user_writes)
@@ -1250,14 +1263,19 @@ async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns
             return_value={"folder_ready": False, "folder_path": None},
         ),
     )
+    monkeypatch.setattr(dedup_mod, "recheck_company_workspace_before_create", _spy_recheck)
     monkeypatch.setattr(dedup_mod, "get_db_connection", _fake_get_db_connection)
     monkeypatch.setattr(dedup_mod, "is_coverage_units_enabled", lambda: True)
     monkeypatch.setattr(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr("src.dalton.settings.is_dalton_local_auth_enabled", lambda: False)
+    monkeypatch.setattr("src.dalton.settings.get_dalton_allowed_emails", lambda: {"alice@team.com", "bob@team.com"})
+    monkeypatch.setattr("src.dalton.settings.get_configured_pm_user_ids", lambda: [])
+    monkeypatch.setattr("src.dalton.company_identity.is_company_system_user", lambda _u: False)
     monkeypatch.setattr(
         dedup_mod,
         "get_user_tier",
         create_autospec(
-            lambda _uid, conn=None: None,
+            lambda _uid: None,
             side_effect=lambda *_a, **_kw: _async_val("internal"),
         ),
     )
@@ -1265,18 +1283,12 @@ async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns
     monkeypatch.setattr(
         dedup_mod,
         "resolve_assist_model",
-        create_autospec(
-            dedup_mod.resolve_assist_model,
-            return_value="gpt-4o-mini",
-        ),
+        create_autospec(dedup_mod.resolve_assist_model, return_value="gpt-4o-mini"),
     )
     monkeypatch.setattr(
         dedup_mod,
         "resolve_assist_fallback_models",
-        create_autospec(
-            dedup_mod.resolve_assist_fallback_models,
-            return_value=[],
-        ),
+        create_autospec(dedup_mod.resolve_assist_fallback_models, return_value=[]),
     )
     monkeypatch.setattr(dedup_mod, "dalton_complete", _fake_dalton_complete)
     monkeypatch.setattr(dedup_mod, "model_requires_user_oauth", lambda _m: False)
@@ -1321,7 +1333,7 @@ async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns
     builder.add_edge("create", END)
 
     graph = builder.compile(checkpointer=InMemorySaver())
-    cfg = {"configurable": {"thread_id": f"lg-real-recheck-{scenario}"}}
+    cfg = {"configurable": {"thread_id": f"lg-two-phase-{scenario}"}}
 
     # Initial turn: no duplicates exist yet -> pauses for confirmation.
     paused = await graph.ainvoke({"messages": []}, config=cfg)
@@ -1332,12 +1344,13 @@ async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns
     # While waiting for confirmation, the duplicate workspace is created.
     live_workspaces.append(
         {
-            "workspace_id": "55555555-5555-5555-5555-555555555555",
+            "workspace_id": dup_ws_id,
             "user_id": new_ws_owner,
             "name": new_ws_name,
             "status": "stopped",
             "owner_name": owner_name,
             "owner_email": owner_email,
+            "unit_ticker": None,
             "is_home_stand_in": False,
             "is_historical_duplicate": False,
             "last_activity_at": None,
@@ -1351,12 +1364,15 @@ async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns
         config=cfg,
     )
 
-    # Company dedup ran strictly inside lock_user_writes and blocked BEFORE
-    # reaching the computer FOR SHARE check or INSERT INTO workspaces.
+    # Assert Phase 1 returned an explicit match naming the exact workspace ID,
+    # ran lock-free (never under lock_user_writes), and aborted before locking.
+    assert len(recheck_results) == 1
+    assert recheck_results[0].status == "matched"
+    assert recheck_results[0].matched_workspace_ids == (dup_ws_id,)
     assert len(llm_calls) == 1
-    assert llm_calls[0]["lock_held"] is True
+    assert llm_calls[0]["lock_held"] is False
     assert new_ws_name in llm_calls[0]["prompt"]
-    assert lock_state["for_share_computer_checks"] == 0
+    assert lock_state["lock_acquires"] == 0
     assert lock_state["inserts"] == 0
 
     tool_msg = resumed["messages"][-1]
@@ -1366,43 +1382,63 @@ async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns
     assert body["code"] == "scope_changed"
     assert body["error"] == "情况已变化，请重新发起"
 
-    # Positive control: with the exact same fake computer & DB, when company
-    # dedup reports no match, execution proceeds all the way through FOR SHARE
-    # and INSERT INTO workspaces (proving the rejection above was strictly due
-    # to the company dedup hit, not a missing fake computer).
+    # Positive control: with a non-duplicate candidate ('BABA') and LLM clear,
+    # Phase 1 returns status='clear' with checked_candidates, Phase 2 verifies
+    # deterministically under lock (zero LLM calls under lock), and INSERT runs.
     emit_match["flag"] = False
-    cfg_ctrl = {"configurable": {"thread_id": f"lg-real-recheck-ctrl-{scenario}"}}
+    live_workspaces[:] = [
+        {
+            "workspace_id": dup_ws_id,
+            "user_id": USER_ID,
+            "name": "BABA",
+            "status": "stopped",
+            "owner_name": "Alice",
+            "owner_email": "alice@team.com",
+            "unit_ticker": None,
+            "is_home_stand_in": False,
+            "is_historical_duplicate": False,
+            "last_activity_at": None,
+            "updated_at": None,
+            "created_at": None,
+        }
+    ]
+    llm_calls.clear()
+    recheck_results.clear()
+    cfg_ctrl = {"configurable": {"thread_id": f"lg-two-phase-ctrl-{scenario}"}}
     paused_ctrl = await graph.ainvoke({"messages": []}, config=cfg_ctrl)
     intr_ctrl = paused_ctrl["__interrupt__"][0].id
+    llm_calls.clear()
     resumed_ctrl = await graph.ainvoke(
         LGCommand(resume={intr_ctrl: {"decisions": [{"type": "approve"}]}}),
         config=cfg_ctrl,
     )
+    assert len(recheck_results) == 1
+    assert recheck_results[0].status == "clear"
+    assert recheck_results[0].checked_candidates == ((dup_ws_id, "BABA", None),)
+    assert all(call["lock_held"] is False for call in llm_calls)
+    assert lock_state["lock_acquires"] == 1
     assert lock_state["inserts"] == 1
     assert json.loads(resumed_ctrl["messages"][-1].content)["success"] is True
 
 
 @pytest.mark.asyncio
-async def test_locked_company_dedup_reuses_single_pool_connection_for_all_queries(
+async def test_lock_free_company_dedup_parse_failure_returns_unavailable_not_matched(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Round 7 Decision 2: when the DB pool has capacity 1 and the outer
-    create_workspace_on_computer transaction holds that single connection,
-    locked company dedup (including _resolve_caller_tier -> get_user and
-    get_user_role) reuses that exact conn instead of acquiring a 2nd pool
-    connection, and catches the duplicate without timing out."""
+    """Round 8 Decision 3: a malformed/unparseable LLM response (e.g. returning
+    ``parsed`` instead of ``data``) produces status='unavailable' (never
+    status='matched' with workspace IDs), and workspaces_create aborts with
+    scope_changed without acquiring the write lock."""
     from contextlib import asynccontextmanager
 
-    from src.dalton.auth import roles as roles_mod
     from src.dalton.coverage import dedup as dedup_mod
-    from src.dalton.coverage.dedup import DedupLlmResult, DedupMatchItem
-    from src.server.database import user as user_db
-    from src.server.database import workspace as ws_db
-
-    pool_state = {"in_use": False, "acquires": 0, "user_queries_on_tx_conn": 0}
-    healthy_computer = _computer_row(
-        CLOUD_1, name="Cloud Primary", kind="docker", is_primary=True
+    from src.dalton.coverage.dedup import (
+        DedupLlmResult,
+        DedupMatchItem,
+        recheck_company_workspace_before_create,
     )
+    from src.tools.secretary.tools import workspaces_create
+
     tencent_row = {
         "workspace_id": "55555555-5555-5555-5555-555555555555",
         "user_id": USER_ID,
@@ -1417,6 +1453,135 @@ async def test_locked_company_dedup_reuses_single_pool_connection_for_all_querie
         "created_at": None,
     }
 
+    class _ParseFailCursor:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            text = " ".join(sql.split())
+            if "FROM workspaces w" in text:
+                self._rows = [dict(tencent_row)]
+            else:
+                self._rows = []
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._rows)
+
+    class _ParseFailConn:
+        def cursor(self, **_kwargs):
+            return _ParseFailCursor()
+
+    @asynccontextmanager
+    async def _use_conn(c=None):
+        yield c or _ParseFailConn()
+
+    async def _malformed_dalton_complete(**_kwargs):
+        # Deliberately return `parsed` instead of `data` so _parse_llm_payload fails.
+        return SimpleNamespace(
+            ok=True,
+            parsed=DedupLlmResult(
+                matches=[DedupMatchItem(id="c1", confidence="high", reason="bad field")]
+            ),
+        )
+
+    monkeypatch.setattr(dedup_mod, "get_db_connection", _use_conn)
+    monkeypatch.setattr(dedup_mod, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "get_user_tier",
+        create_autospec(
+            lambda _uid: None,
+            side_effect=lambda *_a, **_kw: _async_val("internal"),
+        ),
+    )
+    monkeypatch.setattr(dedup_mod, "_is_internal_team_owner", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_model",
+        create_autospec(dedup_mod.resolve_assist_model, return_value="gpt-4o-mini"),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_fallback_models",
+        create_autospec(dedup_mod.resolve_assist_fallback_models, return_value=[]),
+    )
+    monkeypatch.setattr(dedup_mod, "dalton_complete", _malformed_dalton_complete)
+    monkeypatch.setattr(dedup_mod, "model_requires_user_oauth", lambda _m: False)
+
+    recheck = await recheck_company_workspace_before_create(
+        USER_ID, "700.HK", channel="cos"
+    )
+    assert recheck.status == "unavailable"
+    assert recheck.matched_workspace_ids == ()
+
+    # End-to-end in workspaces_create: unavailable check returns scope_changed
+    # without calling WorkspaceManager.create_workspace.
+    mgr = create_autospec(WorkspaceManager, instance=True)
+    monkeypatch.setattr(
+        "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+        create_autospec(WorkspaceManager.get_instance, return_value=mgr),
+    )
+    monkeypatch.setattr(
+        "src.dalton.coverage.dedup.find_existing_company_workspace",
+        create_autospec(
+            lambda _uid, _name, channel="cos": None,
+            side_effect=lambda *_a, **_kw: _async_val(None),
+        ),
+    )
+    monkeypatch.setattr(
+        "src.tools.secretary.tools.hitl_confirm",
+        lambda _action, _payload: (True, {"decisions": [{"type": "approve"}]}),
+    )
+    snap = {
+        "action": "create_workspace",
+        "tool_call_id": "call-parse-fail",
+        "workspace_name": "700.HK",
+        "workspace_description": "",
+        "computer_id": CLOUD_1,
+        "computer_name": "Cloud Primary",
+        "computer_kind": "docker",
+        "computer_is_own_machine": False,
+        "bootstrap_cloud_primary": False,
+        "duplicate_workspace_id": None,
+        "duplicate_workspace_name": None,
+        "duplicate_check_unavailable": False,
+        "precheck_error": None,
+    }
+    cmd = await workspaces_create(
+        USER_ID, "700.HK", "", "call-parse-fail", preapproved=False, snapshot=snap
+    )
+    msg = cmd.update["messages"][0]
+    assert msg.status == "error"
+    assert json.loads(msg.content)["code"] == "scope_changed"
+    mgr.create_workspace.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_in_lock_deterministic_recheck_uses_single_conn_no_llm_and_catches_colleague_and_candidate_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 8 Decision 1: Phase 2 in-lock recheck never calls the LLM and
+    never acquires a second connection from a 1-connection pool. It catches:
+    (a) a colleague workspace matching normalized ticker '0700.HK', and
+    (b) a lock-free checked candidate whose name or unit_ticker drifted."""
+    from contextlib import asynccontextmanager
+
+    from src.dalton.coverage import dedup as dedup_mod
+    from src.server.database import workspace as ws_db
+
+    pool_state = {"in_use": False, "acquires": 0}
+    healthy_computer = _computer_row(
+        CLOUD_1, name="Cloud Primary", kind="docker", is_primary=True
+    )
+    team_workspaces: list[dict[str, Any]] = []
+
     class _SingleConnCursor:
         def __init__(self) -> None:
             self._rows: list[dict[str, Any]] = []
@@ -1429,28 +1594,19 @@ async def test_locked_company_dedup_reuses_single_pool_connection_for_all_querie
 
         async def execute(self, sql: str, params: Any = None) -> None:
             text = " ".join(sql.split())
-            if "FROM users" in text:
-                pool_state["user_queries_on_tx_conn"] += 1
-                self._rows = [
-                    {
-                        "user_id": USER_ID,
-                        "email": "alice@team.com",
-                        "name": "Alice",
-                    }
-                ]
-                return
-            if "FROM dalton_user_roles" in text:
-                pool_state["user_queries_on_tx_conn"] += 1
-                self._rows = [{"tier": "internal"}]
-                return
-            if "FROM dalton_coverage_units" in text or "FROM dalton_knowledge_versions" in text:
-                self._rows = []
+            if "FROM dalton_members" in text:
+                self._rows = [{"email": "alice@team.com"}, {"email": "bob@team.com"}]
                 return
             if "FROM workspaces w" in text:
-                self._rows = [dict(tencent_row)]
+                self._rows = [dict(r) for r in team_workspaces]
                 return
             if "FROM workspaces" in text and isinstance(params, dict) and "user_id" in params:
-                self._rows = [{"workspace_id": tencent_row["workspace_id"], "name": tencent_row["name"]}]
+                uid_filter = str(params["user_id"])
+                self._rows = [
+                    {"workspace_id": r["workspace_id"], "name": r["name"]}
+                    for r in team_workspaces
+                    if r["user_id"] == uid_filter
+                ]
                 return
             if "FROM computers" in text:
                 self._rows = [dict(healthy_computer)]
@@ -1492,56 +1648,32 @@ async def test_locked_company_dedup_reuses_single_pool_connection_for_all_querie
         async with _single_pool_get_db_connection(conn) as owned:
             yield owned
 
-    async def _fake_lock_user_writes(_cur, _uid: str) -> None:
-        return None
+    async def _forbid_llm(**_kwargs):
+        raise AssertionError("LLM must never be called during Phase 2 in-lock recheck")
 
-    async def _fake_dalton_complete(**_kwargs):
-        return SimpleNamespace(
-            ok=True,
-            data=DedupLlmResult(
-                matches=[
-                    DedupMatchItem(id="c1", confidence="high", reason="same Tencent")
-                ]
-            ),
-        )
+    async def _noop_lock(_cur, _uid: str) -> None:
+        return None
 
     monkeypatch.setattr(ws_db, "folder_allocation", _single_pool_folder_allocation)
     monkeypatch.setattr(ws_db, "get_db_connection", _single_pool_get_db_connection)
-    monkeypatch.setattr(ws_db, "lock_user_writes", _fake_lock_user_writes)
-    monkeypatch.setattr(dedup_mod, "get_db_connection", _single_pool_get_db_connection)
-    monkeypatch.setattr(user_db, "get_db_connection", _single_pool_get_db_connection)
-    monkeypatch.setattr(roles_mod, "get_db_connection", _single_pool_get_db_connection)
-    monkeypatch.setattr(dedup_mod, "is_coverage_units_enabled", lambda: True)
-    monkeypatch.setattr(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True)
-    monkeypatch.setattr("src.dalton.company_identity.is_company_system_user", lambda _u: False)
-    monkeypatch.setattr("src.dalton.invites.is_invite_pm", lambda _u: False)
+    monkeypatch.setattr(ws_db, "lock_user_writes", _noop_lock)
+    monkeypatch.setattr(dedup_mod, "dalton_complete", _forbid_llm)
     monkeypatch.setattr("src.dalton.settings.is_dalton_local_auth_enabled", lambda: False)
     monkeypatch.setattr("src.dalton.settings.get_dalton_allowed_emails", lambda: {"alice@team.com"})
-    monkeypatch.setattr(dedup_mod, "_is_internal_team_owner", lambda *_a, **_kw: True)
-    monkeypatch.setattr(
-        dedup_mod,
-        "resolve_assist_model",
-        create_autospec(dedup_mod.resolve_assist_model, return_value="gpt-4o-mini"),
-    )
-    monkeypatch.setattr(
-        dedup_mod,
-        "resolve_assist_fallback_models",
-        create_autospec(dedup_mod.resolve_assist_fallback_models, return_value=[]),
-    )
-    monkeypatch.setattr(dedup_mod, "dalton_complete", _fake_dalton_complete)
-    monkeypatch.setattr(dedup_mod, "model_requires_user_oauth", lambda _m: False)
-    monkeypatch.setattr(
-        dedup_mod.sharing_mod,
-        "require_workspace_access",
-        create_autospec(
-            lambda *a, **kw: None,
-            side_effect=lambda *_a, **_kw: _async_val(None),
-        ),
-    )
+    monkeypatch.setattr("src.dalton.settings.get_configured_pm_user_ids", lambda: [])
+    monkeypatch.setattr("src.dalton.company_identity.is_company_system_user", lambda _u: False)
 
-    # Even with a 1-connection pool fully occupied by create_workspace_on_computer,
-    # _resolve_caller_tier -> get_user(..., conn=conn) reuses tx_conn and catches 腾讯控股.
-    result = await ws_db.create_workspace_on_computer(
+    # (a) Colleague added '0700.HK' between Phase 1 and Phase 2 -> refused on single conn.
+    team_workspaces[:] = [
+        {
+            "workspace_id": "55555555-5555-5555-5555-555555555555",
+            "user_id": "user-colleague-1",
+            "name": "0700.HK",
+            "owner_email": "bob@team.com",
+            "unit_ticker": None,
+        }
+    ]
+    res_colleague = await ws_db.create_workspace_on_computer(
         USER_ID,
         "700.HK",
         CLOUD_1,
@@ -1549,25 +1681,47 @@ async def test_locked_company_dedup_reuses_single_pool_connection_for_all_querie
         expected_computer_name="Cloud Primary",
         expected_computer_kind="docker",
         check_duplicate_snapshot=True,
-        check_company_duplicate=True,
+        check_colleague_duplicate=True,
     )
-    assert result is None
+    assert res_colleague is None
     assert pool_state["acquires"] == 1
-    assert pool_state["user_queries_on_tx_conn"] == 1
+
+    # (b) Candidate 'BABA' observed in Phase 1 was renamed to '腾讯控股' before Phase 2 -> refused.
+    team_workspaces[:] = [
+        {
+            "workspace_id": "55555555-5555-5555-5555-555555555555",
+            "user_id": USER_ID,
+            "name": "腾讯控股",
+            "owner_email": "alice@team.com",
+            "unit_ticker": None,
+        }
+    ]
+    res_drift = await ws_db.create_workspace_on_computer(
+        USER_ID,
+        "700.HK",
+        CLOUD_1,
+        reject_unavailable=True,
+        expected_computer_name="Cloud Primary",
+        expected_computer_kind="docker",
+        check_duplicate_snapshot=True,
+        verified_company_candidates=[("55555555-5555-5555-5555-555555555555", "BABA", None)],
+        check_colleague_duplicate=True,
+    )
+    assert res_drift is None
+    assert pool_state["acquires"] == 2
 
 
 @pytest.mark.asyncio
-async def test_locked_company_dedup_sql_error_rolls_back_savepoint_and_fails_closed(
+async def test_in_lock_recheck_dalton_members_sql_failure_rolls_back_savepoint_and_keeps_outer_tx_usable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Round 7 Decision 3: a SQL error inside locked company dedup propagates
-    out of find_existing_company_workspace(raise_on_error=True) so the inner
-    savepoint rolls back cleanly (never attempting RELEASE SAVEPOINT on a
-    failed transaction), keeps the outer transaction healthy, and returns False
-    (scope_changed) rather than treating the error as 'no duplicate'."""
+    """Round 8 Decision 2: when the ``dalton_members`` query fails with a SQL
+    error inside Phase 2 in-lock recheck, the error propagates out of the
+    savepoint (never swallowed to return an empty set), rolls back the
+    savepoint cleanly, keeps the outer transaction healthy for subsequent
+    queries, and returns False (scope_changed)."""
     from contextlib import asynccontextmanager
 
-    from src.dalton.coverage import dedup as dedup_mod
     from src.server.database import workspace as ws_db
 
     tx_state = {
@@ -1590,9 +1744,9 @@ async def test_locked_company_dedup_sql_error_rolls_back_savepoint_and_fails_clo
             if tx_state["in_failed_tx"]:
                 raise RuntimeError("InFailedSqlTransaction: current transaction is aborted")
             text = " ".join(sql.split())
-            if "FROM dalton_coverage_units" in text or "FROM workspaces w" in text:
+            if "FROM dalton_members" in text:
                 tx_state["in_failed_tx"] = True
-                raise RuntimeError("simulated SQL failure during company dedup")
+                raise RuntimeError("simulated dalton_members SQL failure")
             if "FROM workspaces" in text:
                 self._rows = []
                 return
@@ -1623,38 +1777,22 @@ async def test_locked_company_dedup_sql_error_rolls_back_savepoint_and_fails_clo
                 tx_state["savepoint_released"] = True
 
     conn = _StrictSavepointConn()
-
-    @asynccontextmanager
-    async def _use_conn(c=None):
-        yield c or conn
-
-    monkeypatch.setattr(dedup_mod, "get_db_connection", _use_conn)
-    monkeypatch.setattr(dedup_mod, "is_coverage_units_enabled", lambda: True)
-    monkeypatch.setattr(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True)
-    monkeypatch.setattr(
-        dedup_mod,
-        "get_user_tier",
-        create_autospec(
-            lambda _uid, conn=None: None,
-            side_effect=lambda *_a, **_kw: _async_val("internal"),
-        ),
-    )
+    monkeypatch.setattr("src.dalton.settings.is_dalton_local_auth_enabled", lambda: False)
 
     async with conn.cursor() as cur:
         unchanged = await ws_db.check_duplicate_snapshot_unchanged(
             cur,
             USER_ID,
             "700.HK",
-            check_company_duplicate=True,
+            check_colleague_duplicate=True,
             conn=conn,
         )
-        # Fails closed as scope_changed (False), savepoint rolled back cleanly,
-        # and the outer transaction remains usable for subsequent queries.
         assert unchanged is False
         assert tx_state["savepoint_rolled_back"] is True
         assert tx_state["savepoint_released"] is False
         assert tx_state["in_failed_tx"] is False
 
+        # Outer transaction remains usable after savepoint rollback.
         await cur.execute("SELECT 1 AS ok")
         assert await cur.fetchone() == {"ok": 1}
 
