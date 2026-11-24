@@ -37,6 +37,8 @@ def _make_fake_env(
     crawler_image: str | None = None,
     crawler_health_rc: int = 0,
     gateway_health_rc: int = 0,
+    service_token: str | None = "test-internal-svc-token",
+    expected_gateway_token: str | None = "test-internal-svc-token",
 ) -> tuple[Path, Path, Path, Path]:
     """Create work_dir, release_dir, fake_bin, and docker trace log."""
     work_dir = tmp_path / "work"
@@ -56,6 +58,8 @@ def _make_fake_env(
         "DALTON_BACKEND_IMAGE=dalton-core-backend:local",
         "DALTON_EDGE_IMAGE=dalton-core-edge:local",
     ]
+    if service_token is not None:
+        env_lines.append(f"INTERNAL_SERVICE_TOKEN={service_token}")
     if crawler_image:
         env_lines.append(f"DALTON_CRAWLER_IMAGE={crawler_image}")
     (work_dir / ".env").write_text("\n".join(env_lines) + "\n", encoding="utf-8")
@@ -229,6 +233,13 @@ if [[ "${{1:-}}" == "compose" ]]; then
           exit {crawler_health_rc}
         fi
         if [[ "$joined" == *"channel-gateway"* ]]; then
+          expected_tok="{expected_gateway_token or ''}"
+          if [[ -n "$expected_tok" && "${{DALTON_HEALTH_TOKEN:-}}" != "$expected_tok" ]]; then
+            exit 1
+          fi
+          if [[ "$joined" != *"-e DALTON_HEALTH_TOKEN"* || "$joined" != *"X-Service-Token"* ]]; then
+            exit 1
+          fi
           exit {gateway_health_rc}
         fi
         exit {health_rc}
@@ -884,7 +895,7 @@ def test_r10_recovery_health_check_probes_crawler_and_gateway_health_endpoints(
         assert res.returncode == 1
         trace_txt = trace.read_text(encoding="utf-8")
         assert "exec -T crawler curl -sf http://127.0.0.1:8100/health" in trace_txt
-        assert "exec -T channel-gateway sh -c" in trace_txt
+        assert "exec -T -e DALTON_HEALTH_TOKEN channel-gateway sh -c" in trace_txt
         assert "http://127.0.0.1:8962/health" in trace_txt
         if expect_ok:
             assert "ALREADY restored the pre-upgrade release files" in res.stderr
@@ -892,5 +903,217 @@ def test_r10_recovery_health_check_probes_crawler_and_gateway_health_endpoints(
         else:
             assert expect_err_tag in res.stderr
             assert "health_ok=0" in res.stderr
+
+
+def test_r11_gateway_health_auth_and_normal_upgrade_probes_crawler_and_gateway(
+    tmp_path: Path,
+) -> None:
+    """R11 (Codex #5 / Grok high):
+    1) channel-gateway /health probe reads INTERNAL_SERVICE_TOKEN from .env and sends
+       X-Service-Token (missing or mismatched token fails like HTTP 401, and token never leaks
+       into docker args/logs);
+    2) Normal upgrade branch probes crawler and configured channel-gateway /health before
+       reporting Upgrade Complete;
+    3) Exact sh -c probe snippet extracted from upgrade.sh executes both the curl branch and
+       the node fallback branch, failing on missing/wrong token and succeeding only on match.
+    """
+    import re as _re
+
+    # 1. Normal upgrade succeeds when token matches and both crawler + gateway are healthy;
+    #    secret token must NOT appear in docker trace or stderr.
+    secret_tok = "tok-r11-super-secret-xyz987"
+    ok_dir = tmp_path / "normal-ok"
+    ok_dir.mkdir()
+    work_dir, release_dir, fake_bin, trace = _make_fake_env(
+        ok_dir,
+        compose_services="postgres\nredis\nbackend\ncrawler\nchannel-gateway\nedge\n",
+        running_services="postgres\nredis\nbackend\ncrawler\nchannel-gateway\nedge\n",
+        drain_counts=("0",),
+        migrate_rc=0,
+        service_token=secret_tok,
+        expected_gateway_token=secret_tok,
+    )
+    env = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "DALTON_POST_UPGRADE_HEALTH_RETRIES": "1",
+        "DALTON_POST_UPGRADE_HEALTH_SLEEP_S": "0",
+    }
+    res_ok = subprocess.run(
+        [
+            "bash",
+            str(_UPGRADE_SCRIPT),
+            "--work-dir",
+            str(work_dir),
+            "--release-dir",
+            str(release_dir),
+            "--skip-build",
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_ok.returncode == 0, res_ok.stderr
+    trace_txt = trace.read_text(encoding="utf-8")
+    assert "exec -T crawler curl -sf http://127.0.0.1:8100/health" in trace_txt
+    assert "exec -T -e DALTON_HEALTH_TOKEN channel-gateway sh -c" in trace_txt
+    assert "X-Service-Token" in trace_txt
+    assert secret_tok not in trace_txt
+    assert secret_tok not in res_ok.stdout
+    assert secret_tok not in res_ok.stderr
+
+    # 2. Normal upgrade fails when channel-gateway token is missing or wrong (401), or crawler fails /health
+    for case_name, svc_tok, exp_tok, c_rc, g_rc, expect_tag in (
+        ("missing-token", "", secret_tok, 0, 0, "channel-gateway(/health)"),
+        ("wrong-token", "wrong-tok", secret_tok, 0, 0, "channel-gateway(/health)"),
+        ("normal-crawler-fail", secret_tok, secret_tok, 1, 0, "crawler(/health)"),
+        ("normal-gateway-fail", secret_tok, secret_tok, 0, 1, "channel-gateway(/health)"),
+    ):
+        cdir = tmp_path / case_name
+        cdir.mkdir()
+        w_dir, r_dir, f_bin, _ = _make_fake_env(
+            cdir,
+            compose_services="postgres\nredis\nbackend\ncrawler\nchannel-gateway\nedge\n",
+            running_services="postgres\nredis\nbackend\ncrawler\nchannel-gateway\nedge\n",
+            drain_counts=("0",),
+            migrate_rc=0,
+            service_token=svc_tok,
+            expected_gateway_token=exp_tok,
+            crawler_health_rc=c_rc,
+            gateway_health_rc=g_rc,
+        )
+        c_env = {
+            **os.environ,
+            "PATH": f"{f_bin}:{os.environ['PATH']}",
+            "DALTON_POST_UPGRADE_HEALTH_RETRIES": "1",
+            "DALTON_POST_UPGRADE_HEALTH_SLEEP_S": "0",
+        }
+        res_fail = subprocess.run(
+            [
+                "bash",
+                str(_UPGRADE_SCRIPT),
+                "--work-dir",
+                str(w_dir),
+                "--release-dir",
+                str(r_dir),
+                "--skip-build",
+            ],
+            env=c_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_fail.returncode != 0, f"{case_name}: expected failure"
+        assert expect_tag in res_fail.stderr, f"{case_name}: {res_fail.stderr}"
+
+    # 3. Execute the exact channel-gateway sh -c health probe from upgrade.sh in both
+    #    the curl branch and the node fallback branch without opening network sockets
+    #    (unit tests run under pytest-socket).
+    script_src = _UPGRADE_SCRIPT.read_text(encoding="utf-8")
+    m_probe = _re.search(
+        r"exec -T -e DALTON_HEALTH_TOKEN channel-gateway sh -c \\\n\s+'([^']+)'",
+        script_src,
+    )
+    assert m_probe is not None, "Expected channel-gateway sh -c health probe in upgrade.sh"
+    probe_snippet = m_probe.group(1)
+
+    url = "http://127.0.0.1:8962/health"
+    base_probe_env = {k: v for k, v in os.environ.items() if k != "DALTON_HEALTH_TOKEN"}
+
+    # 3a. curl branch
+    curl_bin = tmp_path / "probe-curl-bin"
+    curl_bin.mkdir()
+    fake_curl = curl_bin / "curl"
+    fake_curl.write_text(
+        f"""#!/bin/bash
+set -euo pipefail
+hdr=""
+target=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -H)
+      hdr="${{2:-}}"
+      shift 2
+      ;;
+    -sf|-s|-f)
+      shift
+      ;;
+    *)
+      target="$1"
+      shift
+      ;;
+  esac
+done
+if [[ "$target" == "{url}" && "$hdr" == "X-Service-Token: {secret_tok}" ]]; then
+  exit 0
+fi
+exit 22
+""",
+        encoding="utf-8",
+    )
+    fake_curl.chmod(0o755)
+    curl_env = {**base_probe_env, "PATH": f"{curl_bin}:{os.environ['PATH']}"}
+    r_missing = subprocess.run(
+        ["/bin/sh", "-c", probe_snippet, "_", url],
+        env=curl_env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert r_missing.returncode != 0
+    r_wrong = subprocess.run(
+        ["/bin/sh", "-c", probe_snippet, "_", url],
+        env={**curl_env, "DALTON_HEALTH_TOKEN": "wrong-token"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert r_wrong.returncode != 0
+    r_good = subprocess.run(
+        ["/bin/sh", "-c", probe_snippet, "_", url],
+        env={**curl_env, "DALTON_HEALTH_TOKEN": secret_tok},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert r_good.returncode == 0, r_good.stderr
+
+    # 3b. node fallback branch (PATH has no curl, only fake node)
+    node_bin = tmp_path / "probe-node-bin"
+    node_bin.mkdir()
+    fake_node = node_bin / "node"
+    fake_node.write_text(
+        f"""#!/bin/bash
+set -euo pipefail
+if [[ "${{1:-}}" != "-e" ]]; then exit 2; fi
+js="${{2:-}}"
+target="${{3:-}}"
+if [[ "$js" != *"X-Service-Token"* || "$js" != *"DALTON_HEALTH_TOKEN"* ]]; then exit 3; fi
+if [[ "$target" != "{url}" ]]; then exit 4; fi
+if [[ "${{DALTON_HEALTH_TOKEN:-}}" != "{secret_tok}" ]]; then exit 1; fi
+exit 0
+""",
+        encoding="utf-8",
+    )
+    fake_node.chmod(0o755)
+    node_env = {**base_probe_env, "PATH": str(node_bin)}
+    r_node_wrong = subprocess.run(
+        ["/bin/sh", "-c", probe_snippet, "_", url],
+        env={**node_env, "DALTON_HEALTH_TOKEN": "wrong-token"},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert r_node_wrong.returncode != 0
+    r_node_good = subprocess.run(
+        ["/bin/sh", "-c", probe_snippet, "_", url],
+        env={**node_env, "DALTON_HEALTH_TOKEN": secret_tok},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert r_node_good.returncode == 0, r_node_good.stderr
+
 
 

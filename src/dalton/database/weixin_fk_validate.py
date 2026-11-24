@@ -1,6 +1,6 @@
 """Post-deploy foreign key validator for migration ``d049_weixin_multi_account``.
 
-Validates the 5 ``NOT VALID`` foreign key constraints created by ``d049`` each
+Validates the 4 ``NOT VALID`` foreign key constraints created by ``d049`` each
 in its own independent PostgreSQL transaction with ``SET LOCAL lock_timeout = '5s'``
 so online reads and writes are never blocked (only ``SHARE UPDATE EXCLUSIVE`` is
 acquired per constraint).
@@ -21,7 +21,6 @@ from psycopg import sql
 
 WEIXIN_D049_FK_CONSTRAINTS: tuple[tuple[str, str], ...] = (
     ("dalton_channel_inbound_events", "fk_dalton_inbound_wx_account"),
-    ("dalton_channel_inbound_events", "fk_dalton_inbound_wx_collect_buf"),
     ("dalton_channel_thread_watches", "fk_dalton_watches_wx_account"),
     ("dalton_channel_background_runs", "fk_dalton_bg_runs_wx_account"),
     ("dalton_channel_deliveries", "fk_dalton_deliveries_wx_account"),
@@ -33,7 +32,7 @@ def validate_d049_foreign_keys(
     *,
     lock_timeout: str = "5s",
 ) -> dict[str, Any]:
-    """Validate all 5 ``d049`` foreign keys in separate transactions and verify ``convalidated``.
+    """Validate all 4 ``d049`` foreign keys in separate transactions and verify ``convalidated``.
 
     Returns a summary dict ``{"ok": True, "validated": [...]}``; raises
     ``RuntimeError`` if any constraint is missing or fails validation.

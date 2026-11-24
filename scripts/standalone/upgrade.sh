@@ -994,6 +994,71 @@ PY
   return 0
 }
 
+probe_service_health_once() {
+  local svc="$1"
+  local crawler_port="$2"
+  local gw_port="$3"
+  local gw_token="$4"
+  case "$svc" in
+    backend)
+      compose_cmd_timeout 10 exec -T backend curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1
+      ;;
+    crawler)
+      compose_cmd_timeout 10 exec -T crawler curl -sf "http://127.0.0.1:${crawler_port}/health" >/dev/null 2>&1
+      ;;
+    channel-gateway)
+      if [[ -z "$gw_token" ]]; then
+        return 1
+      fi
+      DALTON_HEALTH_TOKEN="$gw_token" compose_cmd_timeout 10 exec -T -e DALTON_HEALTH_TOKEN channel-gateway sh -c \
+        'if [ -z "${DALTON_HEALTH_TOKEN:-}" ]; then exit 1; fi; if command -v curl >/dev/null 2>&1; then curl -sf -H "X-Service-Token: ${DALTON_HEALTH_TOKEN}" "$1" >/dev/null 2>&1; else node -e "fetch(process.argv[1], {headers: {\"X-Service-Token\": process.env.DALTON_HEALTH_TOKEN || \"\"}}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" "$1"; fi' \
+        _ "http://127.0.0.1:${gw_port}/health" >/dev/null 2>&1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+wait_services_healthy() {
+  local retries="$1"
+  local sleep_s="$2"
+  shift 2
+  local svcs=("$@")
+  LAST_UNHEALTHY_SERVICES=""
+  local crawler_port gw_port gw_token
+  crawler_port="$(read_env_file_var "$ENV_FILE" "CRAWL_SERVICE_PORT" "8100")"
+  if [[ ! "$crawler_port" =~ ^[0-9]+$ ]]; then crawler_port=8100; fi
+  gw_port="$(read_env_file_var "$ENV_FILE" "GATEWAY_PORT" "8962")"
+  if [[ ! "$gw_port" =~ ^[0-9]+$ ]]; then gw_port=8962; fi
+  gw_token="$(read_env_file_var "$ENV_FILE" "INTERNAL_SERVICE_TOKEN" "")"
+
+  for _ in $(seq 1 "$retries"); do
+    local running_svcs=""
+    running_svcs="$(compose_cmd_timeout 10 ps --status running --services 2>/dev/null || true)"
+    local unhealthy_svcs=""
+    local svc
+    for svc in "${svcs[@]}"; do
+      if ! grep -qx "$svc" <<<"$running_svcs"; then
+        unhealthy_svcs="${unhealthy_svcs:+${unhealthy_svcs} }${svc}(not-running)"
+        continue
+      fi
+      if ! probe_service_health_once "$svc" "$crawler_port" "$gw_port" "$gw_token"; then
+        unhealthy_svcs="${unhealthy_svcs:+${unhealthy_svcs} }${svc}(/health)"
+      fi
+    done
+    if [[ -z "$unhealthy_svcs" ]]; then
+      LAST_UNHEALTHY_SERVICES=""
+      return 0
+    fi
+    LAST_UNHEALTHY_SERVICES="$unhealthy_svcs"
+    if [[ "$sleep_s" -gt 0 ]]; then
+      sleep "$sleep_s"
+    fi
+  done
+  return 1
+}
+
 recover_previous_services_after_abort() {
   local target_state="$1"
   AUTO_RECOVERY_ATTEMPTED=1
@@ -1026,52 +1091,13 @@ recover_previous_services_after_abort() {
     health_sleep=2
   fi
   AUTO_HEALTH_OK=0
-  local unhealthy_svcs=""
-  local crawler_port gw_port
-  crawler_port="$(read_env_file_var "$ENV_FILE" "CRAWL_SERVICE_PORT" "8100")"
-  if [[ ! "$crawler_port" =~ ^[0-9]+$ ]]; then crawler_port=8100; fi
-  gw_port="$(read_env_file_var "$ENV_FILE" "GATEWAY_PORT" "8962")"
-  if [[ ! "$gw_port" =~ ^[0-9]+$ ]]; then gw_port=8962; fi
   info "Verifying restored previous services (${STOPPED_SERVICES[*]}) are running and pass their /health endpoints (up to ${health_retries} attempts)..."
-  for _ in $(seq 1 "$health_retries"); do
-    local running_svcs=""
-    running_svcs="$(compose_cmd_timeout 10 ps --status running --services 2>/dev/null || true)"
-    unhealthy_svcs=""
-    local svc
-    for svc in "${STOPPED_SERVICES[@]}"; do
-      if ! grep -qx "$svc" <<<"$running_svcs"; then
-        unhealthy_svcs="${unhealthy_svcs:+${unhealthy_svcs} }${svc}(not-running)"
-        continue
-      fi
-      case "$svc" in
-        backend)
-          if ! compose_cmd_timeout 10 exec -T backend curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; then
-            unhealthy_svcs="${unhealthy_svcs:+${unhealthy_svcs} }backend(/health)"
-          fi
-          ;;
-        crawler)
-          if ! compose_cmd_timeout 10 exec -T crawler curl -sf "http://127.0.0.1:${crawler_port}/health" >/dev/null 2>&1; then
-            unhealthy_svcs="${unhealthy_svcs:+${unhealthy_svcs} }crawler(/health)"
-          fi
-          ;;
-        channel-gateway)
-          if ! compose_cmd_timeout 10 exec -T channel-gateway sh -c 'if command -v curl >/dev/null 2>&1; then curl -sf "$1" >/dev/null 2>&1; else node -e "fetch(process.argv[1]).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" "$1"; fi' _ "http://127.0.0.1:${gw_port}/health" >/dev/null 2>&1; then
-            unhealthy_svcs="${unhealthy_svcs:+${unhealthy_svcs} }channel-gateway(/health)"
-          fi
-          ;;
-      esac
-    done
-    if [[ -z "$unhealthy_svcs" ]]; then
-      AUTO_HEALTH_OK=1
-      break
-    fi
-    sleep "$health_sleep"
-  done
-  if [[ "$AUTO_HEALTH_OK" -eq 1 ]]; then
+  if wait_services_healthy "$health_retries" "$health_sleep" "${STOPPED_SERVICES[@]}"; then
+    AUTO_HEALTH_OK=1
     ok "Restored previous services (${STOPPED_SERVICES[*]}) are healthy."
     return 0
   fi
-  err "Restored previous services did not pass health check after ${health_retries} attempts (unhealthy/not running: ${unhealthy_svcs:-unknown})."
+  err "Restored previous services did not pass health check after ${health_retries} attempts (unhealthy/not running: ${LAST_UNHEALTHY_SERVICES:-unknown})."
   return 1
 }
 
@@ -1222,6 +1248,26 @@ ok "Replaced crawler and edge containers."
 info "Running plain 'docker compose up -d' to converge all services..."
 compose_cmd up -d
 ok "All services converged."
+
+# Post-upgrade application service /health verification (crawler + configured channel-gateway)
+POST_UPGRADE_HEALTH_SERVICES=(crawler)
+if grep -qx "channel-gateway" <<<"$CONFIG_SERVICES_LIST"; then
+  POST_UPGRADE_HEALTH_SERVICES+=(channel-gateway)
+fi
+POST_UPGRADE_HEALTH_RETRIES="${DALTON_POST_UPGRADE_HEALTH_RETRIES:-30}"
+POST_UPGRADE_HEALTH_SLEEP_S="${DALTON_POST_UPGRADE_HEALTH_SLEEP_S:-2}"
+if [[ ! "$POST_UPGRADE_HEALTH_RETRIES" =~ ^[0-9]+$ || "$POST_UPGRADE_HEALTH_RETRIES" -lt 1 ]]; then
+  POST_UPGRADE_HEALTH_RETRIES=30
+fi
+if [[ ! "$POST_UPGRADE_HEALTH_SLEEP_S" =~ ^[0-9]+$ ]]; then
+  POST_UPGRADE_HEALTH_SLEEP_S=2
+fi
+info "Verifying upgraded services (${POST_UPGRADE_HEALTH_SERVICES[*]}) are running and pass /health..."
+if ! wait_services_healthy "$POST_UPGRADE_HEALTH_RETRIES" "$POST_UPGRADE_HEALTH_SLEEP_S" "${POST_UPGRADE_HEALTH_SERVICES[@]}"; then
+  err "Upgraded services failed post-upgrade /health check (unhealthy/not running: ${LAST_UNHEALTHY_SERVICES:-unknown})."
+  exit 1
+fi
+ok "Upgraded services (${POST_UPGRADE_HEALTH_SERVICES[*]}) are healthy."
 
 # Post-upgrade health & schema verification (strictly from .env, same DB_NAME as migrate)
 DB_USER="$(read_env_file_var "$ENV_FILE" "DB_USER" "postgres")"

@@ -5426,7 +5426,7 @@ class TestSandboxNetworkAndInitScript:
             (bin_dir / "docker").write_text(
                 "#!/usr/bin/env bash\n"
                 'if [[ "$*" == *" config --format json"* ]]; then echo \'{"services":{"backend":{"environment":{}}}}\'; exit 0; fi\n'
-                'if [[ "$*" == *" ps --status running --services"* ]]; then printf "postgres\\nbackend\\nedge\\n"; exit 0; fi\n'
+                'if [[ "$*" == *" ps --status running --services"* ]]; then printf "postgres\\nbackend\\ncrawler\\nedge\\n"; exit 0; fi\n'
                 'if [[ "$*" == *" port edge 443"* ]]; then echo "[::]:443"; exit 0; fi\n'
                 'if [[ "$*" == *" port edge 8088"* ]]; then echo "127.0.0.1:8088"; exit 0; fi\n'
                 'if [[ "$*" == *"/data/caddy/pki/authorities/local/root.crt"* ]]; then echo "FAKE_CA_CERT"; exit 0; fi\n'
@@ -5863,7 +5863,7 @@ class TestSandboxNetworkAndInitScript:
                 (bin_dir / "docker").write_text(
                     "#!/usr/bin/env bash\n"
                     'if [[ "$*" == *" config --format json"* ]]; then echo \'{"services":{"backend":{"environment":{}}}}\'; exit 0; fi\n'
-                    'if [[ "$*" == *" ps --status running --services"* ]]; then printf "postgres\\nbackend\\nedge\\n"; exit 0; fi\n'
+                    'if [[ "$*" == *" ps --status running --services"* ]]; then printf "postgres\\nbackend\\ncrawler\\nedge\\n"; exit 0; fi\n'
                     f'if [[ "$*" == *" port edge 443"* ]]; then echo "{port_map}"; exit 0; fi\n'
                     'if [[ "$*" == *" port edge 8088"* ]]; then echo "127.0.0.1:8088"; exit 0; fi\n'
                     'if [[ "$*" == *"/data/caddy/pki/authorities/local/root.crt"* ]]; then echo "FAKE_CA_CERT"; exit 0; fi\n'

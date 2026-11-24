@@ -7,8 +7,8 @@ Create Date: 2026-11-24
 Design reference: ``docs/dalton/features/weixin-multi-account.md`` §2.1–§2.3.
 
 Zero-mutation / lossless downgrade contract (D2, D10, D18):
-- Creates 8 new ``dalton_channel_*`` tables, 13 nullable columns across 4 hot
-  shared channel tables, and 5 ``NOT VALID`` foreign keys (validated post-deploy
+- Creates 6 new ``dalton_channel_*`` tables, 12 nullable columns across 4 hot
+  shared channel tables, and 4 ``NOT VALID`` foreign keys (validated post-deploy
   via ``src/dalton/database/weixin_fk_validate.py`` outside this transaction).
 - Reads legacy ``dalton_channel_weixin_state``, ``dalton_channel_identities``,
   ``dalton_channel_weixin_context_tokens``, and existing rows/columns of shared
@@ -195,67 +195,12 @@ def upgrade() -> None:
         """
     )
 
-    # (6) Explicit message collection buffers & items
-    op.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dalton_channel_weixin_collect_buffers (
-            buffer_id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-            account_id          UUID REFERENCES dalton_channel_weixin_accounts(account_id) ON DELETE SET NULL,
-            bot_generation      BIGINT NOT NULL,
-            dalton_user_id      VARCHAR(255) NOT NULL,
-            scope_key           VARCHAR(255) NOT NULL,
-            session_generation  INTEGER NOT NULL,
-            workspace_id        UUID NOT NULL,
-            initial_prompt      TEXT NOT NULL DEFAULT '',
-            flush_prompt        TEXT,
-            status              VARCHAR(32) NOT NULL DEFAULT 'collecting'
-                                CHECK (status IN ('collecting', 'flushing', 'done', 'cancelled', 'expired')),
-            item_count          INTEGER NOT NULL DEFAULT 0,
-            total_text_chars    INTEGER NOT NULL DEFAULT 0,
-            attachment_count    INTEGER NOT NULL DEFAULT 0,
-            expires_at          TIMESTAMPTZ NOT NULL,
-            max_expires_at      TIMESTAMPTZ NOT NULL,
-            flushed_message_id  VARCHAR(255),
-            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-        """
-    )
-    op.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uq_dalton_wx_collect_active
-            ON dalton_channel_weixin_collect_buffers (account_id, bot_generation, scope_key, session_generation)
-            WHERE status IN ('collecting', 'flushing');
-        """
-    )
-    op.execute(
-        """
-        CREATE TABLE IF NOT EXISTS dalton_channel_weixin_collect_items (
-            buffer_id                 UUID NOT NULL REFERENCES dalton_channel_weixin_collect_buffers(buffer_id) ON DELETE CASCADE,
-            message_id                VARCHAR(255) NOT NULL,
-            protocol_seq              BIGINT,
-            platform_time_ms          BIGINT,
-            receive_order             INTEGER NOT NULL,
-            text_content              TEXT NOT NULL DEFAULT '',
-            expected_attachment_count INTEGER NOT NULL DEFAULT 0,
-            upload_status             VARCHAR(32) NOT NULL DEFAULT 'ready'
-                                      CHECK (upload_status IN ('pending_upload', 'ready', 'failed')),
-            uploaded_attachments      JSONB NOT NULL DEFAULT '[]'::jsonb,
-            upload_error              TEXT,
-            created_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at                TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            PRIMARY KEY (buffer_id, message_id)
-        );
-        """
-    )
-
-    # (7) Hot shared tables: 13 nullable columns + 5 NOT VALID foreign keys
+    # (6) Hot shared tables: 12 nullable columns + 4 NOT VALID foreign keys
     op.execute(
         """
         ALTER TABLE dalton_channel_inbound_events
             ADD COLUMN IF NOT EXISTS weixin_account_id UUID,
-            ADD COLUMN IF NOT EXISTS encrypted_weixin_media_meta BYTEA,
-            ADD COLUMN IF NOT EXISTS collect_buffer_id UUID;
+            ADD COLUMN IF NOT EXISTS encrypted_weixin_media_meta BYTEA;
         """
     )
     op.execute(
@@ -268,14 +213,6 @@ def upgrade() -> None:
                 ALTER TABLE dalton_channel_inbound_events
                     ADD CONSTRAINT fk_dalton_inbound_wx_account
                     FOREIGN KEY (weixin_account_id) REFERENCES dalton_channel_weixin_accounts(account_id)
-                    ON DELETE SET NULL NOT VALID;
-            END IF;
-            IF NOT EXISTS (
-                SELECT 1 FROM pg_constraint WHERE conname = 'fk_dalton_inbound_wx_collect_buf'
-            ) THEN
-                ALTER TABLE dalton_channel_inbound_events
-                    ADD CONSTRAINT fk_dalton_inbound_wx_collect_buf
-                    FOREIGN KEY (collect_buffer_id) REFERENCES dalton_channel_weixin_collect_buffers(buffer_id)
                     ON DELETE SET NULL NOT VALID;
             END IF;
         END $$;
@@ -895,7 +832,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
 
-    # Drop 5 foreign key constraints added by d049
+    # Drop 4 foreign key constraints added by d049
     op.execute(
         "ALTER TABLE dalton_channel_deliveries DROP CONSTRAINT IF EXISTS fk_dalton_deliveries_wx_account;"
     )
@@ -904,9 +841,6 @@ def downgrade() -> None:
     )
     op.execute(
         "ALTER TABLE dalton_channel_thread_watches DROP CONSTRAINT IF EXISTS fk_dalton_watches_wx_account;"
-    )
-    op.execute(
-        "ALTER TABLE dalton_channel_inbound_events DROP CONSTRAINT IF EXISTS fk_dalton_inbound_wx_collect_buf;"
     )
     op.execute(
         "ALTER TABLE dalton_channel_inbound_events DROP CONSTRAINT IF EXISTS fk_dalton_inbound_wx_account;"
@@ -941,15 +875,12 @@ def downgrade() -> None:
     op.execute(
         """
         ALTER TABLE dalton_channel_inbound_events
-            DROP COLUMN IF EXISTS collect_buffer_id,
             DROP COLUMN IF EXISTS encrypted_weixin_media_meta,
             DROP COLUMN IF EXISTS weixin_account_id;
         """
     )
 
-    # Drop 8 new tables in reverse dependency order
-    op.execute("DROP TABLE IF EXISTS dalton_channel_weixin_collect_items;")
-    op.execute("DROP TABLE IF EXISTS dalton_channel_weixin_collect_buffers;")
+    # Drop 6 new tables in reverse dependency order
     op.execute("DROP TABLE IF EXISTS dalton_channel_weixin_login_sessions;")
     op.execute("DROP TABLE IF EXISTS dalton_channel_weixin_account_tokens;")
     op.execute("DROP TABLE IF EXISTS dalton_channel_weixin_audit_logs;")

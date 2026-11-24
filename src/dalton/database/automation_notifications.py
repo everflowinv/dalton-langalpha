@@ -18,6 +18,9 @@ from uuid import UUID
 
 from psycopg.rows import dict_row
 
+from src.dalton.database.channel_gateway import (
+    _lock_weixin_account_for_key_share_in_tx,
+)
 from src.dalton.notify.channel_transport import UNCERTAIN_NOTIFY_ERROR_CODES
 from src.dalton.notify.dispatch import (
     _default_notify_admin,
@@ -676,15 +679,36 @@ async def authorize_and_claim_automation_notify_delivery(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"dalton_delivery:{cleaned_key}",),
                 )
+                # R11 (Codex #2 / Grok high): Align failed re-claim lock order with
+                # unbind_weixin_account (weixin_accounts FOR KEY SHARE -> deliveries FOR UPDATE)
+                # to prevent AB-BA deadlocks when re-claiming a failed Weixin delivery.
                 await cur.execute(
                     """
-                    SELECT * FROM dalton_channel_deliveries
+                    SELECT user_id, platform,
+                           weixin_account_id::text AS weixin_account_id
+                    FROM dalton_channel_deliveries
                     WHERE delivery_key = %s
-                    FOR UPDATE
                     """,
                     (cleaned_key,),
                 )
-                existing = await cur.fetchone()
+                pre_del = await cur.fetchone()
+                existing = None
+                if pre_del is not None:
+                    if str(pre_del.get("platform") or "").strip().lower() == "weixin":
+                        await _lock_weixin_account_for_key_share_in_tx(
+                            cur,
+                            user_id=pre_del.get("user_id"),
+                            account_id=pre_del.get("weixin_account_id"),
+                        )
+                    await cur.execute(
+                        """
+                        SELECT * FROM dalton_channel_deliveries
+                        WHERE delivery_key = %s
+                        FOR UPDATE
+                        """,
+                        (cleaned_key,),
+                    )
+                    existing = await cur.fetchone()
                 if existing:
                     if str(existing.get("platform") or "").strip().lower() == "weixin" and (
                         gateway_epoch is not None or require_gateway_epoch
