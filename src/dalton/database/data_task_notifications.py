@@ -58,7 +58,8 @@ FEISHU_OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]{3,128}$")
 DISCORD_SNOWFLAKE_RE = re.compile(r"^[0-9]{5,32}$")
 DISCORD_CHANNEL_SNOWFLAKE_RE = re.compile(r"^[0-9]{17,20}$")
 DISCORD_MAX_SNOWFLAKE_INT = (1 << 64) - 1
-SUPPORTED_NOTIFY_PLATFORMS: frozenset[str] = frozenset({"feishu", "discord"})
+WEIXIN_USER_ID_RE = re.compile(r"^[^\s:]{1,255}$")
+SUPPORTED_NOTIFY_PLATFORMS: frozenset[str] = frozenset({"feishu", "discord", "weixin"})
 
 
 def is_valid_discord_channel_snowflake(raw: str | None) -> bool:
@@ -220,6 +221,8 @@ def _parse_requested_notify_target(raw_target: str) -> tuple[str, str, str] | No
                 return ("feishu", "dm", ident)
             if platform == "discord" and DISCORD_SNOWFLAKE_RE.match(ident):
                 return ("discord", "dm", ident)
+            if platform == "weixin" and WEIXIN_USER_ID_RE.match(ident):
+                return ("weixin", "dm", ident)
             return None
         if subkind in ("chat", "channel", "group"):
             if platform == "feishu" and FEISHU_CHAT_ID_RE.match(ident):
@@ -650,14 +653,26 @@ async def _authorize_run_and_target_in_tx(
     bound_platform_uid: str | None = None
     if target_kind == "dm":
         # Resolve dedicated Dalton app binding for owner_user_id on `platform`
-        await cur.execute(
-            """
-            SELECT platform_user_id
-            FROM dalton_channel_identities
-            WHERE user_id = %s AND platform = %s
-            """,
-            (owner_user_id, platform),
-        )
+        if platform == "weixin":
+            await cur.execute(
+                """
+                SELECT ilink_user_id AS platform_user_id
+                FROM dalton_channel_weixin_accounts
+                WHERE user_id = %s
+                  AND status = 'active'
+                  AND ilink_user_id IS NOT NULL
+                """,
+                (owner_user_id,),
+            )
+        else:
+            await cur.execute(
+                """
+                SELECT platform_user_id
+                FROM dalton_channel_identities
+                WHERE user_id = %s AND platform = %s
+                """,
+                (owner_user_id, platform),
+            )
         id_row = await cur.fetchone()
         resolved_uid = str(id_row.get("platform_user_id") or "").strip() if id_row else ""
         if not resolved_uid:
@@ -702,6 +717,16 @@ async def _authorize_run_and_target_in_tx(
                         deny_message="Feishu personal target does not match owner's dedicated app binding.",
                     )
             canonical_target_address = "feishu:@me"
+            recipient_id = bound_platform_uid
+        elif platform == "weixin":
+            if raw_ident != "@me" and raw_ident != bound_platform_uid:
+                return AuthorizedDataTaskTarget(
+                    allowed=False,
+                    deny_status="failed",
+                    deny_code="cross_user_target",
+                    deny_message="Weixin personal target does not match owner's active Weixin account.",
+                )
+            canonical_target_address = "weixin:@me"
             recipient_id = bound_platform_uid
         else:
             # Discord user snowflake IDs are global across Discord apps; require exact owner match.
@@ -1329,6 +1354,8 @@ async def authorize_and_claim_data_task_delivery(
     target: str | None = None,
     has_non_empty_text: bool = True,
     total_chunks: int = 0,
+    gateway_epoch: int | None = None,
+    require_gateway_epoch: bool = False,
     path_map: DataTaskPathMap | None = None,
     conn: Any = None,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] | None = None,
@@ -1338,6 +1365,9 @@ async def authorize_and_claim_data_task_delivery(
     is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
 ) -> dict[str, Any]:
     """I-6 ``kind='data_task'`` path: serialize, check idempotency, re-authorize, and claim ``in_flight``."""
+    from src.dalton.capabilities import require_channel_platform_capability
+    from src.dalton.database import weixin_multi_account as wx_db
+
     cleaned_key = str(delivery_key or "").strip()
     cleaned_rid = str(run_id or "").strip()
     cleaned_target = str(target or "").strip()
@@ -1352,6 +1382,10 @@ async def authorize_and_claim_data_task_delivery(
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
+                if gateway_epoch is not None or require_gateway_epoch:
+                    await wx_db.verify_gateway_epoch_in_tx(
+                        cur, gateway_epoch, required=require_gateway_epoch
+                    )
                 await _lock_saved_report_before_outer_identity(cur, cleaned_rid)
                 await _acquire_outer_identity_xact_lock(
                     cur,
@@ -1453,43 +1487,187 @@ async def authorize_and_claim_data_task_delivery(
                         "message": identity_outcome.message,
                     }
 
-                await cur.execute(
-                    """
-                    INSERT INTO dalton_channel_deliveries (
-                        delivery_key, kind, user_id, thread_id, run_id, execution_id,
-                        is_current, has_non_empty_text, platform, target_address,
-                        status, total_chunks, sent_chunks, platform_message_ids,
-                        files_status, created_at, updated_at
+                require_channel_platform_capability(auth.platform)
+                wx_account_id: str | None = None
+                wx_bot_id: str | None = None
+                wx_bot_gen: int | None = None
+                wx_recipient_id: str | None = None
+                wx_ctx_token: str | None = None
+                wx_ctx_version: int | None = None
+                if auth.platform == "weixin":
+                    from src.dalton.access_tiers import (
+                        check_team_member_status_live,
+                        evaluate_weixin_member_access,
+                        get_user_tier,
                     )
-                    VALUES (%s, 'data_task', %s, NULL, %s, %s::uuid, FALSE, %s, %s, %s, 'in_flight', %s, 0, '[]'::jsonb, '[]'::jsonb, NOW(), NOW())
-                    ON CONFLICT (delivery_key) DO UPDATE SET
-                        status = 'in_flight',
-                        total_chunks = EXCLUDED.total_chunks,
-                        error_code = NULL,
-                        error_message = NULL,
-                        updated_at = NOW()
-                    """,
-                    (
-                        cleaned_key,
-                        auth.owner_user_id,
-                        auth.run_id,
-                        auth.run_id,
-                        bool(has_non_empty_text),
-                        auth.platform,
-                        auth.canonical_target_address,
-                        int(total_chunks or 0),
-                    ),
-                )
+                    from src.server.database.encryption import get_encryption_key
 
-                return {
+                    roster = await check_team_member_status_live(
+                        auth.owner_user_id, conn=owned_conn
+                    )
+                    if roster == "lookup_error":
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "roster_lookup_error",
+                            "message": "Unable to verify team membership right now.",
+                        }
+                    if roster != "active":
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "member_not_in_roster",
+                            "message": "Owner is no longer in the team roster.",
+                        }
+                    await cur.execute(
+                        "SELECT enabled, allow_external FROM dalton_channel_weixin_config WHERE singleton_id = 1"
+                    )
+                    cfg_row = await cur.fetchone()
+                    user_tier = await get_user_tier(auth.owner_user_id)
+                    acc_ok, acc_deny = evaluate_weixin_member_access(
+                        user_tier,
+                        channel_enabled=bool(cfg_row["enabled"]) if cfg_row else True,
+                        db_allow_external=cfg_row["allow_external"] if cfg_row else None,
+                    )
+                    if not acc_ok:
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": acc_deny or "weixin_channel_disabled",
+                            "message": "Weixin channel is disabled for this member.",
+                        }
+                    await cur.execute(
+                        """
+                        SELECT account_id::text AS account_id, ilink_bot_id,
+                               bot_generation, ilink_user_id, status
+                        FROM dalton_channel_weixin_accounts
+                        WHERE user_id = %s AND status = 'active'
+                        """,
+                        (auth.owner_user_id,),
+                    )
+                    wx_acc = await cur.fetchone()
+                    if (
+                        not wx_acc
+                        or str(wx_acc.get("ilink_user_id") or "").strip()
+                        != str(auth.recipient_id)
+                    ):
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "not_linked",
+                            "message": "Owner has no matching active Weixin account.",
+                        }
+                    wx_account_id = str(wx_acc["account_id"])
+                    wx_bot_id = str(wx_acc["ilink_bot_id"])
+                    wx_bot_gen = int(wx_acc["bot_generation"])
+                    wx_recipient_id = str(auth.recipient_id)
+                    enc_key = get_encryption_key()
+                    wx_ctx_token, wx_ctx_version, is_stale = (
+                        await wx_db.resolve_weixin_account_context_token_in_tx(
+                            cur,
+                            enc_key=enc_key,
+                            account_id=wx_account_id,
+                            bot_generation=wx_bot_gen,
+                            platform_user_id=wx_recipient_id,
+                        )
+                    )
+                    if is_stale:
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "weixin_context_token_stale",
+                            "message": "Weixin reply token expired; send any message to your bot first.",
+                        }
+                    if not wx_ctx_token:
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "weixin_context_token_missing",
+                            "message": "Weixin reply token is not activated yet; send any message to your bot first.",
+                        }
+
+                if auth.platform == "weixin":
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_channel_deliveries (
+                            delivery_key, kind, user_id, thread_id, run_id, execution_id,
+                            is_current, has_non_empty_text, platform, target_address,
+                            status, total_chunks, sent_chunks, platform_message_ids,
+                            files_status,
+                            weixin_account_id, weixin_bot_id, weixin_bot_generation, weixin_recipient_id,
+                            created_at, updated_at
+                        )
+                        VALUES (%s, 'data_task', %s, NULL, %s, %s::uuid, FALSE, %s, %s, %s, 'in_flight', %s, 0, '[]'::jsonb, '[]'::jsonb, %s::uuid, %s, %s, %s, NOW(), NOW())
+                        ON CONFLICT (delivery_key) DO UPDATE SET
+                            status = 'in_flight',
+                            total_chunks = EXCLUDED.total_chunks,
+                            weixin_account_id = EXCLUDED.weixin_account_id,
+                            weixin_bot_id = EXCLUDED.weixin_bot_id,
+                            weixin_bot_generation = EXCLUDED.weixin_bot_generation,
+                            weixin_recipient_id = EXCLUDED.weixin_recipient_id,
+                            error_code = NULL,
+                            error_message = NULL,
+                            updated_at = NOW()
+                        """,
+                        (
+                            cleaned_key,
+                            auth.owner_user_id,
+                            auth.run_id,
+                            auth.run_id,
+                            bool(has_non_empty_text),
+                            auth.platform,
+                            auth.canonical_target_address,
+                            int(total_chunks or 0),
+                            wx_account_id,
+                            wx_bot_id,
+                            wx_bot_gen,
+                            wx_recipient_id,
+                        ),
+                    )
+                else:
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_channel_deliveries (
+                            delivery_key, kind, user_id, thread_id, run_id, execution_id,
+                            is_current, has_non_empty_text, platform, target_address,
+                            status, total_chunks, sent_chunks, platform_message_ids,
+                            files_status, created_at, updated_at
+                        )
+                        VALUES (%s, 'data_task', %s, NULL, %s, %s::uuid, FALSE, %s, %s, %s, 'in_flight', %s, 0, '[]'::jsonb, '[]'::jsonb, NOW(), NOW())
+                        ON CONFLICT (delivery_key) DO UPDATE SET
+                            status = 'in_flight',
+                            total_chunks = EXCLUDED.total_chunks,
+                            error_code = NULL,
+                            error_message = NULL,
+                            updated_at = NOW()
+                        """,
+                        (
+                            cleaned_key,
+                            auth.owner_user_id,
+                            auth.run_id,
+                            auth.run_id,
+                            bool(has_non_empty_text),
+                            auth.platform,
+                            auth.canonical_target_address,
+                            int(total_chunks or 0),
+                        ),
+                    )
+
+                claim_res: dict[str, Any] = {
                     "claim_status": "claimed",
                     "recipient_id": auth.recipient_id,
                     "platform": auth.platform,
                     "target_address": auth.canonical_target_address,
                     "is_current": False,
                     "home_workspace_id": get_home_workspace_id(auth.owner_user_id),
-                    "weixin_context_token": None,
+                    "weixin_context_token": wx_ctx_token,
                 }
+                if auth.platform == "weixin":
+                    claim_res["weixin_account_id"] = wx_account_id
+                    claim_res["weixin_bot_id"] = wx_bot_id
+                    claim_res["weixin_bot_generation"] = wx_bot_gen
+                    claim_res["weixin_context_token_version"] = wx_ctx_version
+                return claim_res
 
 
 async def load_authorized_data_task_artifact(
@@ -1677,14 +1855,26 @@ async def ensure_outer_reconcile_identity_persisted(
                         recipient_id = raw_ident
                     else:
                         canonical_target_address = f"{platform}:@me"
-                        await cur.execute(
-                            """
-                            SELECT platform_user_id
-                            FROM dalton_channel_identities
-                            WHERE user_id = %s AND platform = %s
-                            """,
-                            (owner_user_id, platform),
-                        )
+                        if platform == "weixin":
+                            await cur.execute(
+                                """
+                                SELECT ilink_user_id AS platform_user_id
+                                FROM dalton_channel_weixin_accounts
+                                WHERE user_id = %s
+                                  AND status = 'active'
+                                  AND ilink_user_id IS NOT NULL
+                                """,
+                                (owner_user_id,),
+                            )
+                        else:
+                            await cur.execute(
+                                """
+                                SELECT platform_user_id
+                                FROM dalton_channel_identities
+                                WHERE user_id = %s AND platform = %s
+                                """,
+                                (owner_user_id, platform),
+                            )
                         id_row = await cur.fetchone()
                         bound_uid = (
                             str(id_row.get("platform_user_id") or "").strip()

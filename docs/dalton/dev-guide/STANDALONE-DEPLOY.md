@@ -579,15 +579,15 @@ bash scripts/standalone/upgrade.sh \
 
 使用企业自有证书（`custom`）模式时，可附加 `--ca-file <企业CA.pem>` 完成升级后 HTTPS 探测。如需显式指定目标实例的 Docker Compose 项目名，可附加 `--project-name <项目名>`（优先级高于 `.env` 中的 `COMPOSE_PROJECT_NAME` 与部署目录名，并会透传给升级前调用的 `backup.sh`）。
 
-#### 升级失败回滚
+#### 升级失败回滚与双链迁移条件
 
-当任意步骤失败时，脚本输出的所有 `docker compose` 命令均显式携带 `-p <项目名> -f <文件>... --env-file <.env>`，并按以下三种情况给出对应的 shell 转义回滚指引：
-- **迁移尚未开始就失败**（备份、解压、文件替换或镜像构建阶段失败）：数据库表结构未被改动，不需要动数据（避免丢弃备份后的新写入）；脚本仅提示使用 `rsync -a --delete`（排除 `.env`、`backups/`、`.upgrade-backup/`、`.restore-backup/`、`certs/`、`extra/`）还原旧发行文件、恢复 `pre-upgrade-<时间戳>` 镜像标签并重启服务；
-- **迁移之后失败（迁移前后版本号均成功读到且至少一条迁移链版本已变化）**：依次提示：
-  1. 使用 `rsync -a --delete`（带上述排除项）从 `.upgrade-backup/<时间戳>/` 还原旧版发行文件；
-  2. 通过 `docker tag <镜像>:pre-upgrade-<时间戳> <镜像>:local` 恢复旧版容器镜像标签；
-  3. 按上文 §6.2「在已有实例上覆盖恢复（含升级迁移后回滚）」的人工步骤操作：先核验升级前备份，再用 `docker volume ls --filter label=com.docker.compose.project=<项目名>` 列出并确认本项目完整卷清单后执行 `docker compose -p <项目名> -f <文件>... --env-file <.env> down -v`，最后用 `restore.sh --skip-edge-build` 恢复到空实例；
-- **迁移状态不确定（`migrate` 已启动后，迁移前或迁移后未能读到版本号，或者前后版本号相同）**：由于部分迁移会在 `autocommit_block()` 前提交 DDL，版本号未变化也不足以保证表结构完全未改动；脚本**不会**直接认定"未改动"或"已迁移"，而是提示先人工查询当前 `alembic_version` / `alembic_version_dalton` 及表结构并与升级前备份的 `manifest.json` 核对，确认无不兼容改动则只还原文件与镜像，否则按 §6.2 人工步骤恢复。
+当任意步骤失败或升级后需主动回退时，脚本输出的所有 `docker compose` 命令均显式携带 `-p <项目名> -f <文件>... --env-file <.env>`，**所有回退动作均以两条迁移链（上游 `alembic_version` 与 Dalton `alembic_version_dalton`）的实际执行结果为条件**：
+- **迁移尚未开始就失败**（备份、解压、文件替换或镜像构建阶段失败）：两条迁移链均未运行，数据库表结构未被改动，不需要动数据（避免丢弃备份后的新写入）；脚本仅提示使用 `rsync -a --delete`（排除 `.env`、`backups/`、`.upgrade-backup/`、`.restore-backup/`、`certs/`、`extra/`）还原旧发行文件、恢复 `pre-upgrade-<时间戳>` 镜像标签并重启服务；
+- **迁移之后失败或升级后回退（已确认至少一条迁移链版本已变化，即 `MIGRATION_STATE="migrated"`）**：
+  - **情形 A：上游链已推进（含“上游迁移成功、Dalton 迁移如 `d049` 随后失败”的半程失败，或“两条迁移链均成功”）**：即使新版尚未产生业务写入，也不能仅执行 Dalton `downgrade d046`（否则上游已提交的变更仍留在库中）；必须还原旧版发行文件与 `pre-upgrade-<时间戳>` 镜像标签后，按上文 §6.2「在已有实例上覆盖恢复（含升级迁移后回滚）」的人工步骤执行全量备份恢复（先核验升级前备份，确认本项目卷清单后 `down -v`，再用 `scripts/standalone/restore.sh --skip-edge-build` 恢复到空实例）；
+  - **情形 B：可明确确认上游链未变化（`alembic_version` 与升级前及旧版 head 完全一致）、仅推进了可逆 Dalton 迁移（如 `d046 -> d049`）且新版尚未产生业务写入**：停止 `channel-gateway`（若启用）、`backend`、`crawler` 后，先按需导出新增审计表，再在维护容器执行 `alembic -c src/dalton/alembic.ini downgrade d046`，核对双链版本与旧版完全一致后，使用 `rsync -a --delete`（带上述排除项）还原 `.upgrade-backup/<时间戳>/`、通过 `docker tag <镜像>:pre-upgrade-<时间戳> <镜像>:local` 恢复旧镜像并 `docker compose ... up -d` 即可无损回到与升级前逐行一致的状态；若新版已产生业务写入，仍按情形 A 使用 `restore.sh` 从升级前备份恢复；
+- **迁移状态不确定（`migrate` 已启动后，迁移前或迁移后未能读到两条链的版本号，或者两条链版本号均未变化）**：由于部分上游迁移会在 `autocommit_block()` 前提交 DDL，版本号未变化也不足以保证表结构完全未改动；仅当可明确确认本次升级无需运行任何上游迁移（`PRE_MIGRATE_UP` 已等于新包上游 `head`）、仅尝试执行了纯事务性 Dalton 迁移（如 `d049`）且失败后完整回滚、双链版本号与升级前完全一致时，才可直接还原旧发行文件与 `pre-upgrade-<时间戳>` 镜像并重新 `up -d`；其余所有情况一律维持 `MIGRATION_STATE="unknown"`，先人工查询当前 `alembic_version` / `alembic_version_dalton` 及表结构并与升级前备份的 `manifest.json` 核对，确认无不兼容改动则只还原文件与镜像，否则按 §6.2 人工步骤执行 `restore.sh` 恢复。
+- **多账号微信迁移（`d049`）升级后外键校验**：`d049` 对热表新增外键采用 `NOT VALID` 以避免停机长锁；升级完成、服务健康后执行 `bash scripts/standalone/validate_d049_fks.sh` 在独立短事务中逐条执行 `VALIDATE CONSTRAINT` 并确认 `pg_constraint.convalidated = true`。
 
 ---
 

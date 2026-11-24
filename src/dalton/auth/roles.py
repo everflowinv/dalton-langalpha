@@ -224,6 +224,16 @@ async def delete_user_role(user_id: str, *, conn: Any = None) -> bool:
                 (uid,),
             )
             deleted = await cur.fetchone()
+            if deleted is not None:
+                from src.dalton.database.weixin_multi_account import (
+                    revoke_weixin_account_on_member_removed_in_tx,
+                )
+
+                await revoke_weixin_account_on_member_removed_in_tx(
+                    cur,
+                    user_id=uid,
+                    operator_user_id="system:roster-reconciler",
+                )
             return deleted is not None
 
     if conn is not None:
