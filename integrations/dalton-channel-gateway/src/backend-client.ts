@@ -518,6 +518,8 @@ export interface I7DeliveriesProgressRequest {
   status?: "in_flight" | "sent" | "partial" | "failed" | "unknown";
   outcome?: "sent" | "partial" | "failed" | "unknown" | null;
   error_code?: string | null;
+  /** Optional supplementary failure detail (e.g. `"preflight_deadline_exceeded"` while `error_code` preserves the root retryable cause). */
+  error_detail?: string | null;
   error_message?: string | null;
   /** Full Discord thread address. Omitted unless this call confirms a thread. */
   confirmed_thread_address?: string | null;

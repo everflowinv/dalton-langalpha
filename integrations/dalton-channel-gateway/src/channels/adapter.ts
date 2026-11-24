@@ -29,6 +29,7 @@ export class ChannelDeliveryError extends Error {
   readonly retryAfterMs?: number;
   readonly retryable?: boolean;
   readonly denyCode?: string;
+  readonly errorDetail?: string;
 
   constructor(
     message: string,
@@ -38,6 +39,7 @@ export class ChannelDeliveryError extends Error {
       retryAfterMs?: number;
       retryable?: boolean;
       denyCode?: string;
+      errorDetail?: string;
     },
   ) {
     super(message);
@@ -47,6 +49,7 @@ export class ChannelDeliveryError extends Error {
     this.retryAfterMs = options.retryAfterMs;
     this.retryable = options.retryable;
     this.denyCode = options.denyCode;
+    this.errorDetail = options.errorDetail;
   }
 }
 

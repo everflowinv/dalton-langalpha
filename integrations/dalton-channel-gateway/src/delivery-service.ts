@@ -48,6 +48,8 @@ export interface WeixinPreflightBudget {
   readonly deadlineMs: number;
   readonly maxElapsedMs: number;
   virtualElapsedMs: number;
+  lastRetryableDenyCode?: string;
+  lastRetryableMessage?: string;
 }
 
 export async function abortableRetrySleep(
@@ -613,6 +615,7 @@ export class DeliveryService {
       outcome: "failed" | "unknown";
       code: AgentSendResponse["code"];
       denyCode?: string;
+      errorDetail?: string;
       retryable?: boolean;
       message: string;
     } | null = null;
@@ -750,6 +753,7 @@ export class DeliveryService {
             outcome: err.outcome === "unknown" ? "unknown" : "failed",
             code: err.code,
             denyCode: err.denyCode,
+            errorDetail: err.errorDetail,
             retryable: err.retryable,
             message: err.message,
           };
@@ -772,6 +776,7 @@ export class DeliveryService {
     let fileUnknownError: string | null = null;
     let fileFailureCode: AgentSendResponse["code"] = null;
     let fileFailureDenyCode: string | undefined;
+    let fileFailureErrorDetail: string | undefined;
 
     if (!chunkFailure) {
       for (let fileIdx = 0; fileIdx < files.length; fileIdx += 1) {
@@ -933,6 +938,9 @@ export class DeliveryService {
             if (!fileFailureDenyCode && err.denyCode) {
               fileFailureDenyCode = err.denyCode;
             }
+            if (!fileFailureErrorDetail && err.errorDetail) {
+              fileFailureErrorDetail = err.errorDetail;
+            }
           } else {
             fileUnknownError =
               err instanceof Error ? err.message : String(err);
@@ -1025,6 +1033,10 @@ export class DeliveryService {
       platformStr === "weixin"
         ? (chunkFailure?.denyCode ?? fileFailureDenyCode ?? finalCode)
         : finalCode;
+    const recordedErrorDetail =
+      platformStr === "weixin"
+        ? (chunkFailure?.errorDetail ?? fileFailureErrorDetail)
+        : undefined;
 
     await recordProgress({
       delivery_key: options.deliveryKey,
@@ -1035,6 +1047,7 @@ export class DeliveryService {
       first_response_json: responseObj as unknown as Record<string, unknown>,
       status: finalStatus,
       error_code: recordedErrorCode,
+      ...(recordedErrorDetail ? { error_detail: recordedErrorDetail } : {}),
       error_message: finalStatus === "sent" ? null : finalMessage,
     });
 
@@ -1141,20 +1154,29 @@ export class DeliveryService {
       }
     };
 
+    const buildDeadlineExceededError = (
+      fallbackMessage: string,
+    ): ChannelDeliveryError =>
+      new ChannelDeliveryError(
+        budget.lastRetryableMessage ?? fallbackMessage,
+        {
+          outcome: "failed",
+          code: "unavailable",
+          retryable: false,
+          denyCode:
+            budget.lastRetryableDenyCode ?? "preflight_deadline_exceeded",
+          errorDetail: "preflight_deadline_exceeded",
+        },
+      );
+
     for (;;) {
       attempt += 1;
       throwIfAbortedOrLeaseLost();
 
       const preCallRemainingMs = getRemainingBudgetMs();
       if (preCallRemainingMs <= 0) {
-        throw new ChannelDeliveryError(
+        throw buildDeadlineExceededError(
           "Weixin send preflight exceeded shared delivery deadline.",
-          {
-            outcome: "failed",
-            code: "unavailable",
-            retryable: false,
-            denyCode: "preflight_deadline_exceeded",
-          },
         );
       }
 
@@ -1184,14 +1206,8 @@ export class DeliveryService {
         }
         throwIfAbortedOrLeaseLost();
         if (attemptSignal.aborted || getRemainingBudgetMs() <= 0) {
-          throw new ChannelDeliveryError(
+          throw buildDeadlineExceededError(
             "Weixin send preflight exceeded shared delivery deadline.",
-            {
-              outcome: "failed",
-              code: "unavailable",
-              retryable: false,
-              denyCode: "preflight_deadline_exceeded",
-            },
           );
         }
         const isRetryable503 =
@@ -1199,16 +1215,13 @@ export class DeliveryService {
         if (!isRetryable503) {
           throw err;
         }
+        budget.lastRetryableDenyCode = "roster_lookup_error";
+        budget.lastRetryableMessage =
+          "Weixin preflight remained temporarily unavailable (503).";
         const remainingMs = getRemainingBudgetMs();
         if (remainingMs <= 0) {
-          throw new ChannelDeliveryError(
+          throw buildDeadlineExceededError(
             "Weixin preflight remained temporarily unavailable (503).",
-            {
-              outcome: "failed",
-              code: "unavailable",
-              retryable: false,
-              denyCode: "roster_lookup_error",
-            },
           );
         }
         const waitMs = Math.min(delayMs, remainingMs);
@@ -1237,14 +1250,8 @@ export class DeliveryService {
       throwIfAbortedOrLeaseLost();
       // R5 #2 (Codex High #4): Do NOT adopt an authorization returned after the shared deadline.
       if (getRemainingBudgetMs() <= 0) {
-        throw new ChannelDeliveryError(
+        throw buildDeadlineExceededError(
           "Weixin preflight response arrived after shared delivery deadline.",
-          {
-            outcome: "failed",
-            code: "unavailable",
-            retryable: false,
-            denyCode: "preflight_deadline_exceeded",
-          },
         );
       }
 
@@ -1263,18 +1270,13 @@ export class DeliveryService {
         );
       }
       if (pf.retryable === true || pf.decision === "defer") {
+        budget.lastRetryableDenyCode = pf.deny_code;
+        budget.lastRetryableMessage =
+          pf.message ??
+          `Weixin send preflight remained unavailable (${pf.deny_code}).`;
         const remainingMs = getRemainingBudgetMs();
         if (remainingMs <= 0) {
-          throw new ChannelDeliveryError(
-            pf.message ??
-              `Weixin send preflight remained unavailable (${pf.deny_code}).`,
-            {
-              outcome: "failed",
-              code: "unavailable",
-              retryable: false,
-              denyCode: pf.deny_code,
-            },
-          );
+          throw buildDeadlineExceededError(budget.lastRetryableMessage);
         }
         const waitMs = Math.min(delayMs, remainingMs);
         this.logger.warn(

@@ -112,6 +112,7 @@ function classifyAdapterError(err: unknown): {
   outcome: "failed" | "unknown";
   code: string;
   denyCode?: string;
+  errorDetail?: string;
   message: string;
 } {
   if (err instanceof ChannelDeliveryError) {
@@ -119,6 +120,7 @@ function classifyAdapterError(err: unknown): {
       outcome: err.outcome === "unknown" ? "unknown" : "failed",
       code: err.code,
       denyCode: err.denyCode,
+      errorDetail: err.errorDetail,
       message: err.message,
     };
   }
@@ -588,20 +590,29 @@ export class DataTaskNotificationService {
       }
     };
 
+    const buildDeadlineExceededError = (
+      fallbackMessage: string,
+    ): ChannelDeliveryError =>
+      new ChannelDeliveryError(
+        budget.lastRetryableMessage ?? fallbackMessage,
+        {
+          outcome: "failed",
+          code: "unavailable",
+          retryable: false,
+          denyCode:
+            budget.lastRetryableDenyCode ?? "preflight_deadline_exceeded",
+          errorDetail: "preflight_deadline_exceeded",
+        },
+      );
+
     for (;;) {
       attempt += 1;
       throwIfAbortedOrLeaseLost();
 
       const preCallRemainingMs = getRemainingBudgetMs();
       if (preCallRemainingMs <= 0) {
-        throw new ChannelDeliveryError(
+        throw buildDeadlineExceededError(
           "Weixin send preflight exceeded shared delivery deadline.",
-          {
-            outcome: "failed",
-            code: "unavailable",
-            retryable: false,
-            denyCode: "preflight_deadline_exceeded",
-          },
         );
       }
 
@@ -631,14 +642,8 @@ export class DataTaskNotificationService {
         }
         throwIfAbortedOrLeaseLost();
         if (attemptSignal.aborted || getRemainingBudgetMs() <= 0) {
-          throw new ChannelDeliveryError(
+          throw buildDeadlineExceededError(
             "Weixin send preflight exceeded shared delivery deadline.",
-            {
-              outcome: "failed",
-              code: "unavailable",
-              retryable: false,
-              denyCode: "preflight_deadline_exceeded",
-            },
           );
         }
         const isRetryable503 =
@@ -646,16 +651,13 @@ export class DataTaskNotificationService {
         if (!isRetryable503) {
           throw err;
         }
+        budget.lastRetryableDenyCode = "roster_lookup_error";
+        budget.lastRetryableMessage =
+          "Weixin preflight remained temporarily unavailable (503).";
         const remainingMs = getRemainingBudgetMs();
         if (remainingMs <= 0) {
-          throw new ChannelDeliveryError(
+          throw buildDeadlineExceededError(
             "Weixin preflight remained temporarily unavailable (503).",
-            {
-              outcome: "failed",
-              code: "unavailable",
-              retryable: false,
-              denyCode: "roster_lookup_error",
-            },
           );
         }
         const waitMs = Math.min(delayMs, remainingMs);
@@ -686,14 +688,8 @@ export class DataTaskNotificationService {
 
       throwIfAbortedOrLeaseLost();
       if (getRemainingBudgetMs() <= 0) {
-        throw new ChannelDeliveryError(
+        throw buildDeadlineExceededError(
           "Weixin preflight response arrived after shared delivery deadline.",
-          {
-            outcome: "failed",
-            code: "unavailable",
-            retryable: false,
-            denyCode: "preflight_deadline_exceeded",
-          },
         );
       }
 
@@ -712,18 +708,13 @@ export class DataTaskNotificationService {
         );
       }
       if (pf.retryable === true || pf.decision === "defer") {
+        budget.lastRetryableDenyCode = pf.deny_code;
+        budget.lastRetryableMessage =
+          pf.message ??
+          `Weixin send preflight remained unavailable (${pf.deny_code}).`;
         const remainingMs = getRemainingBudgetMs();
         if (remainingMs <= 0) {
-          throw new ChannelDeliveryError(
-            pf.message ??
-              `Weixin send preflight remained unavailable (${pf.deny_code}).`,
-            {
-              outcome: "failed",
-              code: "unavailable",
-              retryable: false,
-              denyCode: pf.deny_code,
-            },
-          );
+          throw buildDeadlineExceededError(budget.lastRetryableMessage);
         }
         const waitMs = Math.min(delayMs, remainingMs);
         this.logger.warn(
@@ -2095,6 +2086,9 @@ export class DataTaskNotificationService {
                 ...(filesStatus.length > 0 ? { files_status: [...filesStatus] } : {}),
                 status: itemStatus,
                 error_code: recordedErrorCode,
+                ...(platform === "weixin" && classified.errorDetail
+                  ? { error_detail: classified.errorDetail }
+                  : {}),
                 error_message: classified.message,
               },
               platform,
@@ -2388,6 +2382,9 @@ export class DataTaskNotificationService {
                 files_status: filesStatus,
                 status: itemStatus,
                 error_code: recordedErrorCode,
+                ...(platform === "weixin" && classified.errorDetail
+                  ? { error_detail: classified.errorDetail }
+                  : {}),
                 error_message: classified.message,
               },
               platform,

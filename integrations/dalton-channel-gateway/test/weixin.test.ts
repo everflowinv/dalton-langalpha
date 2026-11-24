@@ -1460,7 +1460,7 @@ describe("§7.2 #1 — Single-Instance Lease, Epoch Fencing, Strict Startup Orde
   });
 });
 
-describe("§7.2 #2 — Outbound preflight-send, defer vs deny, uncertain unknown, and D16 one-time reply", () => {
+describe("§7.2 #2 — Outbound preflight-send, retryable vs deny, uncertain unknown, and D16 one-time reply", () => {
   it("calls preflight-send before every text chunk, before CDN upload, and again after CDN upload before sendmessage; aborts sendmessage if account changes mid-upload", async () => {
     const h = createTestHarness();
     const paused = pausedCdnFetch();
@@ -2216,7 +2216,7 @@ describe("Multi-Account Reconcile, Layer-2/3 Switches, Sync Nudge & §4.3 Log Re
 // Batch B Round 2 — Review Fixes & Regressions (Decisions #1 ~ #17)
 // ===========================================================================
 
-describe("Batch B Round 2 — Lease Abort, Pre-Lease 503, Deferred/Unknown, Collect Concurrency, Self-Heal & Pools", () => {
+describe("Batch B Round 2 — Lease Abort, Pre-Lease 503, Retryable/Unknown, Self-Heal & Pools", () => {
   it("Decision #1: synchronously aborts hanging sendmessage on lease loss without waiting for poll loop, rejects post-loss send/QR, and lets 2nd instance resume from unadvanced cursor", async () => {
     const backend = createMockBackend();
     const sendEntered = defer<void>();
@@ -3167,7 +3167,7 @@ describe("Batch B Round 2 — Lease Abort, Pre-Lease 503, Deferred/Unknown, Coll
 // Batch B Round 3 — Contract Alignment & Review Fixes (Decisions #1 ~ #13)
 // ===========================================================================
 
-describe("Batch B Round 3 — Lease Timer, Preflight Snapshot, Collect, /cancel, /done, Partial Deferred, Real Undici & Regressions", () => {
+describe("Batch B Round 3 — Lease Timer, Preflight Snapshot, In-Delivery Retry, Real Undici & Regressions", () => {
   it("Decision #1: independent expires_at timer aborts hanging sendmessage even when heartbeat hangs; <5s safety margin pauses without exiting; DNS-phase expiry blocks HTTP dispatch", async () => {
     const backend = createMockBackend();
     const leaseLostReasons: string[] = [];
@@ -4508,6 +4508,12 @@ describe("Round 5 Fixes — Account Rotation, Shared Deadline, Lease Loss No-I7,
       expect(res.status).toBe("partial");
       expect(fakeNow - 10_000).toBeLessThanOrEqual(3_000);
       expect(h.weixinAdapter.sentTexts).toHaveLength(1);
+      expect(h.backend.deliveryUpdates.at(-1)).toMatchObject({
+        delivery_key: "del_r5_shared_deadline",
+        status: "partial",
+        error_code: "roster_lookup_error",
+        error_detail: "preflight_deadline_exceeded",
+      });
     } finally {
       await h.cleanup();
     }
@@ -4536,6 +4542,12 @@ describe("Round 5 Fixes — Account Rotation, Shared Deadline, Lease Loss No-I7,
       });
       expect(lateRes.status).toBe("failed");
       expect(lateHarness.weixinAdapter.sentTexts).toHaveLength(0);
+      expect(lateHarness.backend.deliveryUpdates.at(-1)).toMatchObject({
+        delivery_key: "del_r5_late_allow",
+        status: "failed",
+        error_code: "preflight_deadline_exceeded",
+        error_detail: "preflight_deadline_exceeded",
+      });
     } finally {
       await lateHarness.cleanup();
     }
