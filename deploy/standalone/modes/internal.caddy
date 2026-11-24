@@ -1,0 +1,13 @@
+# Internal CA HTTPS mode (DALTON_TLS_MODE=internal).
+# Caddy provisions a locally-signed certificate from its built-in PKI
+# (/data/caddy/pki/authorities/local/root.crt), serves HTTPS on :443 with HSTS,
+# and redirects HTTP (:80) to the external HTTPS host port.
+http://{$DOMAIN:localhost} {
+	import dalton_http_redirect
+}
+
+https://{$DOMAIN:localhost} {
+	tls internal
+	import dalton_site_common
+	header Strict-Transport-Security "max-age=31536000"
+}

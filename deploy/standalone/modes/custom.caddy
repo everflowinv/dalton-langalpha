@@ -1,0 +1,12 @@
+# Custom TLS certificate mode (DALTON_TLS_MODE=custom).
+# Mount a directory containing cert.pem (full chain) and key.pem (private key)
+# at /etc/caddy/certs (configured via DALTON_TLS_CERT_DIR in .env).
+http://{$DOMAIN} {
+	import dalton_http_redirect
+}
+
+https://{$DOMAIN} {
+	tls /etc/caddy/certs/cert.pem /etc/caddy/certs/key.pem
+	import dalton_site_common
+	header Strict-Transport-Security "max-age=31536000"
+}
