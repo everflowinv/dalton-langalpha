@@ -119,6 +119,25 @@ export function projectHistoryInterrupt(
           });
         }
       }
+    // --- DALTON-HOOK(cos-settings-tools): begin ---
+    } else if (actionType === 'create_workspace') {
+      // A create_workspace card marked `submitting` from a resume turn's
+      // `hitl_interrupt_ids` that failed before the graph consumed the Command
+      // still sits on the checkpoint tip (with no live claim): restore it to
+      // `pending` and re-queue it so the user can retry.
+      const proposalId = event.interrupt_id;
+      const proposalData = actionRequests[0];
+      rt.setMessages((prev) => setCardStatus(prev, 'workspaceProposals', proposalId, 'pending'));
+      if (!ctx.pendingHistoryInterrupts.some((p) => p.interruptId === proposalId)) {
+        ctx.pendingHistoryInterrupts.push({
+          type: 'create_workspace',
+          assistantMessageId: interruptAssistantId || '',
+          proposalId,
+          interruptId: proposalId,
+          toolCallId: proposalData?.tool_call_id,
+        });
+      }
+    // --- DALTON-HOOK(cos-settings-tools): end ---
     }
     return;
   }

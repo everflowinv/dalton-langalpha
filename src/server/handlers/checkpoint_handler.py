@@ -334,12 +334,20 @@ def _snapshot_matches_action(
     if action_type == "create_workspace":
         return (
             snapshot.get("workspace_name") == action_req.get("workspace_name")
+            and (snapshot.get("workspace_description") or "")
+            == (action_req.get("workspace_description") or "")
             and snapshot.get("computer_id") == action_req.get("computer_id")
             and snapshot.get("computer_name") == action_req.get("computer_name")
             and bool(snapshot.get("bootstrap_cloud_primary"))
             == bool(action_req.get("bootstrap_cloud_primary"))
             and bool(snapshot.get("computer_is_own_machine"))
             == bool(action_req.get("computer_is_own_machine"))
+            and snapshot.get("duplicate_workspace_id")
+            == action_req.get("duplicate_workspace_id")
+            and snapshot.get("duplicate_workspace_name")
+            == action_req.get("duplicate_workspace_name")
+            and bool(snapshot.get("duplicate_check_unavailable"))
+            == bool(action_req.get("duplicate_check_unavailable"))
         )
     if action_type == "archive_workspace":
         return (
@@ -359,14 +367,21 @@ async def _verify_web_confirm_resume(
     principal: Any,
     raw_request: Any,
     thread_meta: dict[str, Any] | None,
-) -> None:
-    """Enforce first-party web confirmation authenticity for ``create_workspace``
-    and ``archive_workspace`` HITL resumes."""
+) -> dict[str, Any] | None:
+    """Enforce first-party session confirmation authenticity for ``create_workspace``
+    and ``archive_workspace`` HITL resumes.
+
+    Returns an updated ``hitl_response`` map when a guarded pending interrupt
+    has a missing (e.g. pre-upgrade card) or mismatched snapshot so the graph
+    consumes the interrupt and emits a terminal ``scope_changed`` error tool
+    result instead of leaving the interrupt stranded via HTTP 409.
+    """
     from src.config import settings as app_settings
     from src.dalton.auth import is_dalton_supabase_auth_enabled
     from src.dalton.settings import get_dalton_auth_mode
     from src.server.database.conversation import senders
     from src.server.database.shared_workspaces import is_holder
+    from src.server.models.chat import HITLDecision, HITLResponse
 
     def _forbid(code: str, message: str) -> HTTPException:
         return HTTPException(status_code=403, detail={"code": code, "message": message})
@@ -440,10 +455,14 @@ async def _verify_web_confirm_resume(
             detail={"code": "scope_changed", "message": "情况已变化，请重新发起"},
         )
 
-    # 4. Persisted approval_snapshots consistency check (no client-side confirm_token).
+    # 4. Persisted approval_snapshots consistency check.
+    # Missing (e.g. pre-upgrade card) or mismatched snapshots consume the
+    # interrupt via a server-stamped ``scope_changed`` verdict so the tool
+    # emits a terminal error result and reload never re-arms the stale card.
     checkpoint_data = (newest.checkpoint or {}) if newest is not None else {}
     channel_values = checkpoint_data.get("channel_values") or {}
     snapshots = channel_values.get("approval_snapshots")
+    rewritten: dict[str, Any] | None = None
     for iid in answers:
         if iid not in guarded_by_id:
             continue
@@ -455,10 +474,13 @@ async def _verify_web_confirm_resume(
             else None
         )
         if not isinstance(snap, dict) or not _snapshot_matches_action(snap, action_req):
-            raise HTTPException(
-                status_code=409,
-                detail={"code": "scope_changed", "message": "情况已变化，请重新发起"},
+            if rewritten is None:
+                rewritten = dict(answers)
+            rewritten[iid] = HITLResponse(
+                decisions=[HITLDecision(type="approve")],
+                scope_changed=True,
             )
+    return rewritten
 # --- DALTON-HOOK(cos-settings-tools): end ---
 
 
@@ -518,11 +540,12 @@ async def settle_resume_request(
             for iid, rec in pending_by_id.items()
             if _is_web_confirm_interrupt(rec)
         }
+        rewritten_hitl = None
         if guarded_by_id and (
             any(iid in guarded_by_id for iid in request.hitl_response)
             or not set(request.hitl_response).issubset(set(pending_by_id))
         ):
-            await _verify_web_confirm_resume(
+            rewritten_hitl = await _verify_web_confirm_resume(
                 thread_id=thread_id,
                 request=request,
                 newest=newest,
@@ -531,6 +554,13 @@ async def settle_resume_request(
                 principal=principal,
                 raw_request=raw_request,
                 thread_meta=thread_meta,
+            )
+        if rewritten_hitl is not None:
+            return request.model_copy(
+                update={
+                    "resume_run_horizon": branch.run_horizon,
+                    "hitl_response": rewritten_hitl,
+                }
             )
     # --- DALTON-HOOK(cos-settings-tools): end ---
     return request.model_copy(update={"resume_run_horizon": branch.run_horizon})

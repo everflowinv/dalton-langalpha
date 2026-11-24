@@ -861,10 +861,12 @@ async def create_workspace_on_computer(
     workspace_id: Optional[str] = None,
     selection_from: Optional[str] = None,
     # --- DALTON-HOOK(cos-settings-tools): begin ---
-    # Transactional readiness and snapshot-field re-verification under FOR SHARE
+    # Transactional readiness, snapshot-field, and duplicate re-verification under lock
     reject_unavailable: bool = False,
     expected_computer_name: Optional[str] = None,
     expected_computer_kind: Optional[str] = None,
+    check_duplicate_snapshot: bool = False,
+    expected_duplicate_workspace_id: Optional[str] = None,
     # --- DALTON-HOOK(cos-settings-tools): end ---
     conn=None,
 ) -> Optional[Dict[str, Any]]:
@@ -898,6 +900,33 @@ async def create_workspace_on_computer(
         # folder's release and its MCP selection commit with it.
         async with folder_allocation(computer_id, conn=conn) as owned, _ws_cursor(owned) as cur:
             await lock_user_writes(cur, user_id)
+            # --- DALTON-HOOK(cos-settings-tools): begin ---
+            # Under the per-user write lock, re-check duplicate live workspaces
+            # using the same symbol-aware normalization the card used (e.g.
+            # 700.HK vs 0700.HK) so a concurrent create after snapshot capture
+            # aborts cleanly with scope_changed.
+            if check_duplicate_snapshot:
+                from src.tools.secretary.approvals import is_duplicate_name
+
+                await cur.execute(
+                    f"""
+                    SELECT workspace_id, name
+                    FROM workspaces
+                    WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
+                    """,
+                    {"user_id": user_id},
+                )
+                live_rows = await cur.fetchall()
+                for live_ws in live_rows:
+                    live_id = str(live_ws["workspace_id"])
+                    if (
+                        expected_duplicate_workspace_id is not None
+                        and live_id == expected_duplicate_workspace_id
+                    ):
+                        continue
+                    if is_duplicate_name(name, str(live_ws.get("name") or "")):
+                        return None
+            # --- DALTON-HOOK(cos-settings-tools): end ---
             held = await get_workspace_dir_names_for_computer(computer_id, conn=owned)
             computer = await get_computer(computer_id, conn=owned)
             own_folder = computer is None or takes_name_folders(computer)

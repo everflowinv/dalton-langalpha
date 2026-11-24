@@ -5,7 +5,14 @@
  * A new interrupt type registers here first, then adds its projection branches.
  */
 
-import type { AssistantMessage, ChatMessage } from '@/types/chat';
+// --- DALTON-HOOK(cos-settings-tools): begin ---
+import type {
+  AssistantMessage,
+  ChatMessage,
+  SecretaryActionProposalState,
+  WorkspaceProposalState,
+} from '@/types/chat';
+// --- DALTON-HOOK(cos-settings-tools): end ---
 import { updateMessage } from '../../hooks/utils/messageHelpers';
 import { dispatchResultFields, type ToolResultLike } from '../../utils/dispatchResult';
 import type { HistoryInterruptInfo, SetMessages } from '../types';
@@ -166,20 +173,31 @@ function resolvePendingHistoryInterrupt(
 }
 
 // --- DALTON-HOOK(cos-settings-tools): begin ---
-/** Derive settled card fields (approved / rejected / failed) from a tool result.
- *  Shared by both live stream settlement and history replay so both views agree.
- *  A tool result with `status === 'error'` or non-JSON / unparseable payload on
- *  workspace/archive confirmation cards settles as `failed`, never `approved`. */
-function proposalResultFields(
+type ProposalOutcomeFields = {
+  status: 'approved' | 'rejected' | 'failed';
+  failure_code?: string;
+  failure_error?: string;
+};
+
+type WorkspaceProposalOutcomeFields = {
+  status: 'approved' | 'rejected' | 'failed';
+  failure_code?: string;
+  failure_error?: string;
+  computer_name?: string;
+  bootstrap_cloud_primary?: boolean;
+};
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function proposalOutcomeFields(
   type: string,
   result: ToolResultLike & { status?: unknown },
-): Record<string, unknown> {
+): ProposalOutcomeFields {
   const { content, status: toolStatus } = result;
   if (typeof content === 'string' && content.startsWith('User declined')) {
     return { status: 'rejected', failure_code: undefined, failure_error: undefined };
-  }
-  if (type === 'ptc_agent') {
-    return { status: 'approved', ...dispatchResultFields(result) };
   }
   const isToolError = toolStatus === 'error';
   const strictJsonOutcome = type === 'create_workspace' || type === 'archive_workspace';
@@ -190,8 +208,8 @@ function proposalResultFields(
   }
   const trimmed = content.trim();
   try {
-    const parsed = JSON.parse(content) as Record<string, unknown> | null;
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+    const parsed: unknown = JSON.parse(content);
+    if (isPlainObject(parsed)) {
       if (parsed.success === false || isToolError) {
         return {
           status: 'failed',
@@ -204,15 +222,6 @@ function proposalResultFields(
         };
       }
       if (parsed.success === true) {
-        if (type === 'create_workspace') {
-          return {
-            status: 'approved',
-            failure_code: undefined,
-            failure_error: undefined,
-            ...(typeof parsed.computer_name === 'string' && parsed.computer_name ? { computer_name: parsed.computer_name } : {}),
-            ...(parsed.bootstrap_cloud_primary === true ? { bootstrap_cloud_primary: true } : {}),
-          };
-        }
         return { status: 'approved', failure_code: undefined, failure_error: undefined };
       }
       if (strictJsonOutcome) {
@@ -240,6 +249,50 @@ function proposalResultFields(
   return { status: 'approved', failure_code: undefined, failure_error: undefined };
 }
 
+function workspaceProposalResultFields(
+  result: ToolResultLike & { status?: unknown },
+): WorkspaceProposalOutcomeFields {
+  const outcome = proposalOutcomeFields('create_workspace', result);
+  if (outcome.status !== 'approved' || typeof result.content !== 'string') {
+    return outcome;
+  }
+  try {
+    const parsed: unknown = JSON.parse(result.content);
+    if (isPlainObject(parsed)) {
+      return {
+        ...outcome,
+        ...(typeof parsed.computer_name === 'string' && parsed.computer_name
+          ? { computer_name: parsed.computer_name }
+          : {}),
+        ...(parsed.bootstrap_cloud_primary === true ? { bootstrap_cloud_primary: true } : {}),
+      };
+    }
+  } catch {
+    // Already parsed successfully in proposalOutcomeFields; keep outcome as-is.
+  }
+  return outcome;
+}
+
+/** Derive settled card fields (approved / rejected / failed) from a tool result.
+ *  Shared by both live stream settlement and history replay so both views agree.
+ *  A tool result with `status === 'error'` or non-JSON / unparseable payload on
+ *  workspace/archive confirmation cards settles as `failed`, never `approved`. */
+function proposalResultFields(
+  type: string,
+  result: ToolResultLike & { status?: unknown },
+): Record<string, unknown> {
+  if (type === 'ptc_agent') {
+    if (typeof result.content === 'string' && result.content.startsWith('User declined')) {
+      return { status: 'rejected', failure_code: undefined, failure_error: undefined };
+    }
+    return { status: 'approved', ...dispatchResultFields(result) };
+  }
+  if (type === 'create_workspace') {
+    return workspaceProposalResultFields(result);
+  }
+  return proposalOutcomeFields(type, result);
+}
+
 /** Settle a live submitting/pending proposal card by exact ``tool_call_id``.
  *  Returns ``messages`` unchanged (same reference) when no card matches. */
 function settleLiveProposalFromResult(
@@ -248,42 +301,88 @@ function settleLiveProposalFromResult(
   result: ToolResultLike & { status?: unknown },
 ): ChatMessage[] {
   if (!toolCallId || (typeof result.content !== 'string' && result.status !== 'error')) return messages;
-  const buckets: Array<keyof AssistantMessage & ('workspaceProposals' | 'secretaryActionProposals')> = [
-    'workspaceProposals',
-    'secretaryActionProposals',
-  ];
   let changed = false;
-  const next = messages.map((m) => {
+  const next: ChatMessage[] = messages.map((m): ChatMessage => {
     if (m.role !== 'assistant') return m;
-    const msg = m as AssistantMessage;
     let msgChanged = false;
-    let updatedMsg: AssistantMessage = msg;
-    for (const bucket of buckets) {
-      const cards = msg[bucket] as Record<string, Record<string, unknown>> | undefined;
-      if (!cards) continue;
+    let nextWorkspaceProposals = m.workspaceProposals;
+    if (m.workspaceProposals) {
       let bucketChanged = false;
-      const nextCards: Record<string, Record<string, unknown>> = { ...cards };
-      for (const [cardId, card] of Object.entries(cards)) {
+      const updatedCards: Record<string, WorkspaceProposalState> = { ...m.workspaceProposals };
+      for (const [cardId, card] of Object.entries(m.workspaceProposals)) {
         if (
-          card?.tool_call_id === toolCallId
+          card
+          && card.tool_call_id === toolCallId
           && (card.status === 'submitting' || card.status === 'pending')
         ) {
-          const cardType = bucket === 'workspaceProposals'
-            ? 'create_workspace'
-            : String(card.actionType || 'delete_workspace');
-          nextCards[cardId] = { ...card, ...proposalResultFields(cardType, result) };
+          updatedCards[cardId] = { ...card, ...workspaceProposalResultFields(result) };
           bucketChanged = true;
         }
       }
       if (bucketChanged) {
-        updatedMsg = { ...updatedMsg, [bucket]: nextCards };
+        nextWorkspaceProposals = updatedCards;
         msgChanged = true;
       }
     }
-    if (msgChanged) changed = true;
-    return msgChanged ? updatedMsg : m;
+    let nextSecretaryProposals = m.secretaryActionProposals;
+    if (m.secretaryActionProposals) {
+      let bucketChanged = false;
+      const updatedCards: Record<string, SecretaryActionProposalState> = { ...m.secretaryActionProposals };
+      for (const [cardId, card] of Object.entries(m.secretaryActionProposals)) {
+        if (
+          card
+          && card.tool_call_id === toolCallId
+          && (card.status === 'submitting' || card.status === 'pending')
+        ) {
+          updatedCards[cardId] = {
+            ...card,
+            ...proposalOutcomeFields(card.actionType || 'delete_workspace', result),
+          };
+          bucketChanged = true;
+        }
+      }
+      if (bucketChanged) {
+        nextSecretaryProposals = updatedCards;
+        msgChanged = true;
+      }
+    }
+    if (!msgChanged) return m;
+    changed = true;
+    const updatedMsg: AssistantMessage = {
+      ...m,
+      ...(nextWorkspaceProposals ? { workspaceProposals: nextWorkspaceProposals } : {}),
+      ...(nextSecretaryProposals ? { secretaryActionProposals: nextSecretaryProposals } : {}),
+    };
+    return updatedMsg;
   });
-  return changed ? next : messages;
+  if (changed) return next;
+  // Fallback for pre-upgrade create_workspace cards that carried no tool_call_id:
+  // settle the submitting card when its scope_changed or error result arrives.
+  let fallbackChanged = false;
+  const fallbackNext: ChatMessage[] = messages.map((m): ChatMessage => {
+    if (fallbackChanged || m.role !== 'assistant') return m;
+    const cards = m.workspaceProposals;
+    if (!cards) return m;
+    for (const [cardId, card] of Object.entries(cards)) {
+      if (card && card.status === 'submitting' && !card.tool_call_id) {
+        fallbackChanged = true;
+        const settledCard: WorkspaceProposalState = {
+          ...card,
+          ...workspaceProposalResultFields(result),
+        };
+        const updatedMsg: AssistantMessage = {
+          ...m,
+          workspaceProposals: {
+            ...cards,
+            [cardId]: settledCard,
+          },
+        };
+        return updatedMsg;
+      }
+    }
+    return m;
+  });
+  return fallbackChanged ? fallbackNext : messages;
 }
 // --- DALTON-HOOK(cos-settings-tools): end ---
 

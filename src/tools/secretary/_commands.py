@@ -56,7 +56,8 @@ def hitl_confirm(
     )
 
     approved = False
-    if isinstance(response, dict):
+    # DALTON-HOOK(cos-settings-tools): a server-stamped scope_changed resume never approves execution
+    if isinstance(response, dict) and not response.get("scope_changed"):
         decisions = response.get("decisions", [])
         if decisions and decisions[0].get("type") == "approve":
             approved = True
@@ -151,15 +152,26 @@ def success_command(
     )
 
 
-def error_command(error: str, tool_call_id: str, **fields: Any) -> Command:
+def error_command(
+    error: str,
+    tool_call_id: str,
+    *,
+    # DALTON-HOOK(cos-settings-tools): allow marking ToolMessage.status (e.g. "error" for scope_changed)
+    message_status: str | None = None,
+    **fields: Any,
+) -> Command:
     """Return a Command with a JSON error response, plus any ``fields`` that
     say what the failed action was."""
+    msg_kwargs: dict[str, Any] = {}
+    if message_status is not None:
+        msg_kwargs["status"] = message_status
     return Command(
         update={
             "messages": [
                 ToolMessage(
                     content=json.dumps({"success": False, "error": error, **fields}),
                     tool_call_id=tool_call_id,
+                    **msg_kwargs,
                 ),
             ],
         }

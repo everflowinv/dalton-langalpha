@@ -87,10 +87,14 @@ def _checkpoint_tuple(
             "action": "create_workspace",
             "tool_call_id": tool_call_id,
             "workspace_name": "NVDA",
+            "workspace_description": "",
             "computer_id": COMPUTER_ID,
             "computer_name": "My Mac",
             "computer_is_own_machine": True,
             "bootstrap_cloud_primary": False,
+            "duplicate_workspace_id": None,
+            "duplicate_workspace_name": None,
+            "duplicate_check_unavailable": False,
         }
     elif action_type == "archive_workspace":
         action_req = {
@@ -253,13 +257,13 @@ async def test_local_and_supabase_reject_non_initiator_and_shared_thread_other_m
 
 
 @pytest.mark.asyncio
-async def test_interrupt_id_or_snapshot_mismatch_returns_409_scope_changed(
+async def test_interrupt_id_mismatch_returns_409_and_snapshot_drift_or_missing_consumes_interrupt_with_scope_changed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _set_auth_mode(monkeypatch, "local")
     _setup_checkpointer(monkeypatch, _checkpoint_tuple(action_type="create_workspace"))
 
-    # Wrong interrupt_id
+    # Unknown interrupt_id (not pending on checkpoint) -> 409 scope_changed
     with pytest.raises(HTTPException) as exc_info:
         await settle_resume_request(
             THREAD_ID,
@@ -271,32 +275,59 @@ async def test_interrupt_id_or_snapshot_mismatch_returns_409_scope_changed(
     assert exc_info.value.status_code == 409
     assert exc_info.value.detail["code"] == "scope_changed"
 
-    # Tampered snapshot (computer_id or computer_name differs from interrupt payload)
-    _setup_checkpointer(
-        monkeypatch,
-        _checkpoint_tuple(
-            action_type="create_workspace",
-            snapshot={
-                "action": "create_workspace",
-                "tool_call_id": TOOL_CALL_ID,
-                "workspace_name": "NVDA",
-                "computer_id": "99999999-9999-9999-9999-999999999999",
-                "computer_name": "My Mac",
-                "computer_is_own_machine": True,
-                "bootstrap_cloud_primary": False,
-            },
-        ),
-    )
-    with pytest.raises(HTTPException) as exc_info2:
-        await settle_resume_request(
+    # Snapshot drift on computer_id, workspace_description, duplicate_workspace_id,
+    # or duplicate_check_unavailable -> rewrites hitl_response with scope_changed=True
+    # (no 409) so LangGraph consumes the interrupt and emits a terminal error result.
+    for drifted_field in (
+        {"computer_id": "99999999-9999-9999-9999-999999999999"},
+        {"workspace_description": "Changed description"},
+        {"duplicate_workspace_id": "dup-ws-1", "duplicate_workspace_name": "NVDA"},
+        {"duplicate_check_unavailable": True},
+    ):
+        base_snap = {
+            "action": "create_workspace",
+            "tool_call_id": TOOL_CALL_ID,
+            "workspace_name": "NVDA",
+            "workspace_description": "",
+            "computer_id": COMPUTER_ID,
+            "computer_name": "My Mac",
+            "computer_is_own_machine": True,
+            "bootstrap_cloud_primary": False,
+            "duplicate_workspace_id": None,
+            "duplicate_workspace_name": None,
+            "duplicate_check_unavailable": False,
+            **drifted_field,
+        }
+        _setup_checkpointer(
+            monkeypatch,
+            _checkpoint_tuple(action_type="create_workspace", snapshot=base_snap),
+        )
+        out = await settle_resume_request(
             THREAD_ID,
             _resume_body(),
             principal=Principal(user_id=OWNER_ID, auth="session"),
             raw_request=_make_raw_request(),
             thread_meta={"user_id": OWNER_ID, "workspace_owner_id": OWNER_ID},
         )
-    assert exc_info2.value.status_code == 409
-    assert exc_info2.value.detail["code"] == "scope_changed"
+        assert out.resume_run_horizon == 7
+        assert out.hitl_response is not None
+        assert out.hitl_response[INTERRUPT_ID].scope_changed is True
+
+    # Pre-upgrade card missing approval_snapshots entirely -> also consumes interrupt
+    # via scope_changed=True instead of raising 409.
+    _setup_checkpointer(
+        monkeypatch,
+        _checkpoint_tuple(action_type="create_workspace", include_snapshot=False),
+    )
+    out_legacy = await settle_resume_request(
+        THREAD_ID,
+        _resume_body(),
+        principal=Principal(user_id=OWNER_ID, auth="session"),
+        raw_request=_make_raw_request(),
+        thread_meta={"user_id": OWNER_ID, "workspace_owner_id": OWNER_ID},
+    )
+    assert out_legacy.hitl_response is not None
+    assert out_legacy.hitl_response[INTERRUPT_ID].scope_changed is True
 
 
 @pytest.mark.asyncio
@@ -510,36 +541,104 @@ async def test_route_enforces_web_session_for_create_workspace_confirm(
 
 
 @pytest.mark.asyncio
-async def test_route_first_cos_entry_does_not_promote_existing_own_machine(
+async def test_first_cos_message_without_primary_binds_home_and_reaches_session_acquisition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Route-level regression for Codex High 3: entering Chief of Staff (Home)
-    via messaging.py when the user has an unpromoted own machine and no primary
-    computer defers Home binding through ensure_home_bound ->
-    ensure_primary_computer(create_or_promote=False) and never calls
-    promote_primary_computer or create_computer_for_user."""
+    """Regression for Round 3 Decision 1: a user with no primary computer yet
+    sending their first Chief of Staff message runs through real messaging.py ->
+    route.bind -> ensure_home_bound -> ensure_primary_computer -> real
+    astream_ptc_workflow -> acquire_session -> resolve_binding ->
+    get_session_for_workspace without failing with WorkspaceNotOnComputer."""
+    from contextlib import ExitStack, nullcontext
+    from unittest.mock import MagicMock
+
+    from ptc_agent.config.core import SandboxConfig
+    from src.server.handlers.chat.ptc_run import astream_ptc_workflow
+    from src.server.handlers.chat.request_prep import PriorThread
+    from src.server.services.report_back.handoff.carry import PriorAttempt
+
     home_id = get_home_workspace_id(OWNER_ID)
     app = _app_for(OWNER_ID)
     app.dependency_overrides[get_principal] = lambda: Principal(
         user_id=OWNER_ID, auth="session"
     )
 
+    state: dict[str, Any] = {
+        "primary": None,
+        "home_computer": None,
+        "resolved_binding": None,
+        "session_acquired_for": None,
+        "restored_siblings_for": None,
+    }
+    promoted_computer = {
+        "computer_id": COMPUTER_ID,
+        "user_id": OWNER_ID,
+        "kind": "docker",
+        "name": "Primary Cloud",
+        "is_primary": True,
+        "status": "stopped",
+        "root_dir": "/home/workspace",
+        "dir_name": "Home",
+        "provider_ref": "sbx-1",
+        "config": {},
+    }
+
+    sandbox_cfg = create_autospec(SandboxConfig, instance=True)
+    sandbox_cfg.provider = "docker"
+    sandbox_cfg.creatable_providers.return_value = ("docker",)
+
     real_mgr = object.__new__(ComputerManager)
+    real_mgr.config = SimpleNamespace(
+        sandbox=sandbox_cfg,
+        filesystem=SimpleNamespace(working_directory="/home/workspace"),
+    )
     real_mgr.has_ready_session = lambda _ws: True  # type: ignore[assignment]
-    create_computer_spy = create_autospec(
-        real_mgr.create_computer_for_user,
-        side_effect=AssertionError("create_computer_for_user must not be called"),
+
+    async def _place_on_computer(ws_id, computer, **_kwargs):
+        state["home_computer"] = {**computer, "dir_name": "Home"}
+        return {"workspace_id": ws_id, "status": computer["status"]}
+
+    real_mgr._place_on_computer = _place_on_computer  # type: ignore[method-assign]
+
+    async def _get_session_for_workspace(ws_id, **_kwargs):
+        # Exercise real resolve_binding on the freshly bound Home workspace.
+        binding = await real_mgr.resolve_binding(ws_id)
+        state["resolved_binding"] = binding
+        state["session_acquired_for"] = ws_id
+        return SimpleNamespace(sandbox=SimpleNamespace(), binding=binding)
+
+    real_mgr.get_session_for_workspace = _get_session_for_workspace  # type: ignore[method-assign]
+
+    async def _restore_sibling_folders(_session, ws_id):
+        state["restored_siblings_for"] = ws_id
+
+    real_mgr.restore_sibling_folders = _restore_sibling_folders  # type: ignore[method-assign]
+
+    async def _get_computer_for_ws(ws_id, **_kwargs):
+        return state["home_computer"] if ws_id == home_id else None
+
+    async def _get_primary(_uid, **_kwargs):
+        return state["primary"]
+
+    async def _promote_primary(_uid):
+        state["primary"] = promoted_computer
+        return promoted_computer
+
+    class _StopAfterSession(BaseException):
+        pass
+
+    sentinel_registry_store = MagicMock()
+    sentinel_registry_store.get_or_create_registry = AsyncMock(
+        side_effect=_StopAfterSession("reached past acquire_session")
     )
-    real_mgr.create_computer_for_user = create_computer_spy  # type: ignore[method-assign]
-    promote_spy = create_autospec(
-        lambda _uid: None,
-        side_effect=AssertionError("promote_primary_computer must not be called"),
-    )
-    workflow = create_autospec(
-        lambda **kwargs: _empty_async_gen(), return_value=_empty_async_gen()
+    run_mgr = MagicMock()
+    run_mgr.awaiting_computer.side_effect = lambda _tid, _rid: nullcontext(None)
+    run_handle = MagicMock(
+        run_id="run-first-1", turn_index=1, finalized=False, origin=None
     )
 
-    with (
+    ptc = "src.server.handlers.chat.ptc_run"
+    patches = (
         _stub_downstream(owner_id=None, ws_owner=OWNER_ID),
         patch("src.server.database.workspace.get_workspace", AsyncMock(return_value=None)),
         patch(
@@ -559,7 +658,11 @@ async def test_route_first_cos_entry_does_not_promote_existing_own_machine(
         ),
         patch(
             "src.server.services.computer_manager._machines.get_computer_for_workspace",
-            AsyncMock(return_value=None),
+            side_effect=_get_computer_for_ws,
+        ),
+        patch(
+            "src.server.services.computer_manager._sessions.get_computer_for_workspace",
+            side_effect=_get_computer_for_ws,
         ),
         patch(
             "src.server.services.computer_manager._machines.db_get_workspace",
@@ -574,37 +677,73 @@ async def test_route_first_cos_entry_does_not_promote_existing_own_machine(
         ),
         patch(
             "src.server.services.computer_manager._machines.get_primary_computer",
-            AsyncMock(return_value=None),
+            side_effect=_get_primary,
         ),
         patch(
             "src.server.services.computer_manager._machines.promote_primary_computer",
-            promote_spy,
+            side_effect=_promote_primary,
+        ),
+        patch(
+            "src.server.services.computer_manager._machines.publish_workspace_binding_change",
+            AsyncMock(),
         ),
         patch(
             "src.server.services.home_placement.get_home_computer",
-            AsyncMock(return_value=None),
+            side_effect=lambda _uid: state["home_computer"],
         ),
         patch(
             "src.server.services.home_placement.computer_unreachable",
             AsyncMock(return_value=False),
         ),
-        patch("src.server.handlers.chat.astream_ptc_workflow", workflow),
-    ):
+        patch(
+            "src.server.services.home_placement.home_back_notice",
+            AsyncMock(return_value=None),
+        ),
+        # Keep real astream_ptc_workflow (undo _stub_downstream's replacement).
+        patch("src.server.handlers.chat.astream_ptc_workflow", astream_ptc_workflow),
+        patch(
+            f"{ptc}.carry.prior_attempt",
+            new=AsyncMock(return_value=PriorAttempt(latest=None, retried=None)),
+        ),
+        patch(f"{ptc}.ensure_thread", new=AsyncMock(return_value=PriorThread())),
+        patch(f"{ptc}._resolve_origin_meta", new=AsyncMock(return_value={})),
+        patch(f"{ptc}._resolve_fork", return_value=("create workspace NVDA", None)),
+        patch(f"{ptc}.begin_run", new=AsyncMock(return_value=run_handle)),
+        patch(f"{ptc}.wait_or_steer", new=AsyncMock(return_value=(True, None))),
+        patch(
+            "src.server.services.shared_workspaces.turn.get_user_profile_for_prompt",
+            new=AsyncMock(return_value=None),
+        ),
+        patch(f"{ptc}.init_tracking", return_value=(run_mgr, MagicMock())),
+        patch(f"{ptc}.apply_fetch_override"),
+        patch(f"{ptc}._fire_and_forget"),
+        patch(f"{ptc}.update_workspace_activity"),
+        patch(f"{ptc}.keep_named_model", new=AsyncMock()),
+        patch(
+            f"{ptc}.BackgroundRegistryStore.get_instance",
+            return_value=sentinel_registry_store,
+        ),
+    )
+    with ExitStack() as stack:
+        for ctx in patches:
+            stack.enter_context(ctx)
         async with AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
         ) as client:
-            resp = await client.post(
-                f"/api/v1/threads/{THREAD_ID}/messages",
-                json={
-                    "workspace_id": home_id,
-                    "messages": [{"role": "user", "content": "create workspace NVDA"}],
-                },
-            )
+            with pytest.raises(_StopAfterSession):
+                await client.post(
+                    f"/api/v1/threads/{THREAD_ID}/messages",
+                    json={
+                        "workspace_id": home_id,
+                        "messages": [{"role": "user", "content": "create workspace NVDA"}],
+                    },
+                )
 
-    assert resp.status_code == 200
-    create_computer_spy.assert_not_called()
-    promote_spy.assert_not_called()
-    workflow.assert_called_once()
+    assert state["home_computer"] is not None
+    assert state["resolved_binding"] is not None
+    assert state["resolved_binding"].computer_id == COMPUTER_ID
+    assert state["session_acquired_for"] == home_id
+    assert state["restored_siblings_for"] == home_id
 
 
 def test_sse_producer_interrupt_debug_log_emits_only_whitelisted_fields(

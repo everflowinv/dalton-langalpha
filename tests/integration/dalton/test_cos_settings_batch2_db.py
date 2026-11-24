@@ -260,6 +260,55 @@ async def test_two_connection_concurrent_rename_or_unavailable_returns_scope_cha
     assert ws_errored is None
 
 
+async def test_two_connection_concurrent_ticker_duplicate_700hk_vs_0700hk_returns_scope_changed(
+    b2_live_pool,
+    test_db_uri: str,
+) -> None:
+    """Round 3 Decision 3: card snapshot showed '700.HK' with no duplicate; a
+    second connection inserts '0700.HK' (same normalized ticker, different DB
+    name_key) before confirmation executes. Locked create_workspace_on_computer
+    re-checks is_duplicate_name under lock_user_writes and aborts (returns None)."""
+    user_id = f"b2-dup-{uuid.uuid4().hex[:8]}"
+    await create_user(user_id=user_id, email=f"{user_id}@test.local", name="Analyst")
+
+    comp = await create_computer(
+        user_id,
+        kind="docker",
+        name="HK Box",
+        is_primary=True,
+        status="stopped",
+        provider_ref=f"b2-hk-{uuid.uuid4()}",
+    )
+
+    # Connection B creates '0700.HK' after connection A's card snapshot saw no duplicate.
+    async with await psycopg.AsyncConnection.connect(
+        test_db_uri, autocommit=True
+    ) as conn_b:
+        ws_existing = await ws_db.create_workspace_on_computer(
+            user_id,
+            "0700.HK",
+            str(comp["computer_id"]),
+            conn=conn_b,
+        )
+        assert ws_existing is not None
+
+    # Connection A tries to confirm '700.HK' with check_duplicate_snapshot=True -> refused.
+    ws_dup = await ws_db.create_workspace_on_computer(
+        user_id,
+        "700.HK",
+        str(comp["computer_id"]),
+        reject_unavailable=True,
+        expected_computer_name="HK Box",
+        expected_computer_kind="docker",
+        check_duplicate_snapshot=True,
+    )
+    assert ws_dup is None
+
+    # Confirm no '700.HK' workspace row was inserted.
+    live_names = await ws_db.get_live_workspace_names(user_id)
+    assert [row["name"] for row in live_names] == ["0700.HK"]
+
+
 async def test_bootstrap_cloud_primary_creates_cloud_without_promoting_own_machine_and_aborts_if_primary_appears(
     b2_live_pool,
 ) -> None:

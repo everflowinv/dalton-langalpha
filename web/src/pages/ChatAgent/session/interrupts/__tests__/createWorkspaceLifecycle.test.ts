@@ -17,7 +17,7 @@ import {
   restoreToolApprovalsPending,
 } from '../answerBoard';
 import { createPauseSlot } from '../pauseSlot';
-import { claimedCardFields } from '../claims';
+import { claimedCardFields, createApprovalEvidence, recordApprovalEvidence } from '../claims';
 import { projectLiveInterrupt } from '../fromLiveEvent';
 import { projectHistoryInterrupt, type HistoryInterruptContext } from '../fromHistoryEvent';
 import {
@@ -413,6 +413,135 @@ describe('create_workspace 4-state lifecycle: live vs history parity', () => {
         failure_code: 'scope_changed',
         failure_error: '情况已变化，请重新发起',
       },
+    });
+
+    // Round 3 Decision 6: early returns (company_workspace_exists / coverage_suggestion)
+    // with preapproved=true also produce failed cards displaying the guidance message.
+    const existsCard = preapprovedCard(
+      'manage_workspaces',
+      { action: 'create', name: 'NVDA' },
+      {
+        content: JSON.stringify({
+          success: false,
+          preapproved: true,
+          workspace_name: 'NVDA',
+          workspace_description: '',
+          computer_name: 'Cloud Primary',
+          code: 'company_workspace_exists',
+          error: '已存在同名公司工作区 NVIDIA',
+        }),
+      },
+      'tc-pre-2',
+    );
+    expect(existsCard).toEqual({
+      type: 'create_workspace',
+      proposal: {
+        status: 'failed',
+        workspace_name: 'NVDA',
+        workspace_description: '',
+        computer_name: 'Cloud Primary',
+        failure_code: 'company_workspace_exists',
+        failure_error: '已存在同名公司工作区 NVIDIA',
+      },
+    });
+  });
+
+  it('restores create_workspace to pending on replay when a resume failed before the graph consumed the Command', () => {
+    // Round 3 Decision 5: original card -> failed terminal resume record (has run_id,
+    // no live claim) -> same interrupt still pending at checkpoint tip -> must restore
+    // to pending & re-queue so the user can retry (never stuck in submitting).
+    let msgs: ChatMessage[] = [makeAssistant('a-0'), makeAssistant('a-1')];
+    const rt = {
+      renderedInterruptIdsRef: { current: new Set<string>() },
+      setMessages: (u: ChatMessage[] | ((p: ChatMessage[]) => ChatMessage[])) => {
+        msgs = typeof u === 'function' ? u(msgs) : u;
+      },
+    } as unknown as HistoryRuntime;
+    const pair0: PairState = { contentOrderCounter: 0, reasoningId: null, toolCallId: null, steeringBatches: 0 };
+    const pair1: PairState = { contentOrderCounter: 0, reasoningId: null, toolCallId: null, steeringBatches: 0 };
+    const pending: HistoryInterruptInfo[] = [];
+    const evidence = createApprovalEvidence();
+    const ctx: HistoryInterruptContext = {
+      currentActivePairIndex: 0,
+      assistantMessagesByPair: new Map([[0, 'a-0'], [1, 'a-1']]),
+      pairStateByPair: new Map([[0, pair0], [1, pair1]]),
+      pendingHistoryInterrupts: pending,
+      evidence,
+    };
+
+    // 1. Original card on Turn 0
+    projectHistoryInterrupt(rt, makeInterruptEvent(), ctx);
+    expect((msgs[0] as AssistantMessage).workspaceProposals?.['intr-cw-1']?.status).toBe('pending');
+    expect(pending).toHaveLength(1);
+
+    // 2. Resume turn persisted hitl_interrupt_ids and failed before LangGraph took the Command (terminal: run_id set).
+    const failedResumeUserMsg: SSEEvent = {
+      event: 'user_message',
+      run_id: 'run-failed-1',
+      content: '',
+      metadata: { hitl_interrupt_ids: ['intr-cw-1'] },
+    };
+    recordApprovalEvidence(evidence, failedResumeUserMsg);
+    expect(evidence.claims.has('intr-cw-1')).toBe(false);
+    settleResumedInterrupts(rt, pending, failedResumeUserMsg);
+    expect((msgs[0] as AssistantMessage).workspaceProposals?.['intr-cw-1']?.status).toBe('submitting');
+    expect(pending).toHaveLength(0);
+
+    // 3. Tip interrupt replays (no turn_index): restores card to pending and re-queues it.
+    ctx.currentActivePairIndex = 1;
+    const tipEvent: SSEEvent = { ...makeInterruptEvent(), turn_index: undefined };
+    projectHistoryInterrupt(rt, tipEvent, ctx);
+    expect((msgs[0] as AssistantMessage).workspaceProposals?.['intr-cw-1']?.status).toBe('pending');
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      type: 'create_workspace',
+      interruptId: 'intr-cw-1',
+      proposalId: 'intr-cw-1',
+      toolCallId: 'tc-cw-1',
+    });
+
+    // Contrast: when a resume is STILL RUNNING (no run_id -> live claim recorded),
+    // the duplicate tip interrupt keeps the card in submitting and does not re-queue.
+    const liveResumeUserMsg: SSEEvent = {
+      event: 'user_message',
+      content: '',
+      metadata: { hitl_interrupt_ids: ['intr-cw-1'] },
+    };
+    recordApprovalEvidence(evidence, liveResumeUserMsg);
+    expect(evidence.claims.has('intr-cw-1')).toBe(true);
+    settleResumedInterrupts(rt, pending, liveResumeUserMsg);
+    expect((msgs[0] as AssistantMessage).workspaceProposals?.['intr-cw-1']?.status).toBe('submitting');
+    expect(pending).toHaveLength(0);
+    projectHistoryInterrupt(rt, tipEvent, ctx);
+    expect((msgs[0] as AssistantMessage).workspaceProposals?.['intr-cw-1']?.status).toBe('submitting');
+    expect(pending).toHaveLength(0);
+  });
+
+  it('settles a pre-upgrade submitting create_workspace card without tool_call_id on scope_changed error result', () => {
+    const preUpgradeMsgs: ChatMessage[] = [
+      {
+        ...makeAssistant('a-legacy'),
+        workspaceProposals: {
+          'intr-old': {
+            status: 'submitting',
+            workspace_name: 'LegacyWS',
+            interruptId: 'intr-old',
+          },
+        },
+      },
+    ];
+    const settled = settleLiveProposalFromResult(preUpgradeMsgs, 'tc-legacy-1', {
+      status: 'error',
+      content: JSON.stringify({
+        success: false,
+        code: 'scope_changed',
+        error: '情况已变化，请重新发起',
+      }),
+    });
+    expect((settled[0] as AssistantMessage).workspaceProposals?.['intr-old']).toMatchObject({
+      status: 'failed',
+      failure_code: 'scope_changed',
+      failure_error: '情况已变化，请重新发起',
     });
   });
 });

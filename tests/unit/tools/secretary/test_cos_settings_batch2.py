@@ -175,6 +175,7 @@ async def test_resume_reads_only_persisted_snapshot_when_primary_switches(
         name="Alpha",
         description="desc",
         verify_snapshot=True,
+        check_duplicate_snapshot=True,
         expected_computer_kind="docker",
         computer_id=CLOUD_1,
         expected_computer_name="Cloud Primary",
@@ -307,6 +308,7 @@ async def test_standing_approval_on_cloud_computer_uses_same_snapshot_computer_i
         name="Semis",
         description="Chip research",
         verify_snapshot=True,
+        check_duplicate_snapshot=True,
         expected_computer_kind="daytona",
         computer_id=CLOUD_2,
         expected_computer_name="GPU Cloud",
@@ -482,7 +484,9 @@ async def test_snapshot_drift_during_create_returns_scope_changed(
     res = await workspaces_create(
         USER_ID, "NVDA", "", "call-drift-1", preapproved=True, snapshot=snap
     )
-    payload = json.loads(res.update["messages"][0].content)
+    msg = res.update["messages"][0]
+    assert msg.status == "error"
+    payload = json.loads(msg.content)
     assert payload == {
         "success": False,
         "error": "情况已变化，请重新发起",
@@ -493,18 +497,167 @@ async def test_snapshot_drift_during_create_returns_scope_changed(
         "computer_name": "Cloud",
     }
 
-    # Interactive (non-preapproved) failure omits preapproved metadata.
+    # Interactive (non-preapproved) failure omits preapproved metadata and sets status="error".
     confirm = create_autospec(hitl_confirm, return_value=(True, {}))
     with patch("src.tools.secretary.tools.hitl_confirm", confirm):
         res_interactive = await workspaces_create(
             USER_ID, "NVDA", "", "call-drift-2", preapproved=False, snapshot=snap
         )
-    interactive_payload = json.loads(res_interactive.update["messages"][0].content)
+    interactive_msg = res_interactive.update["messages"][0]
+    assert interactive_msg.status == "error"
+    interactive_payload = json.loads(interactive_msg.content)
     assert interactive_payload == {
         "success": False,
         "error": "情况已变化，请重新发起",
         "code": "scope_changed",
     }
+
+
+@pytest.mark.asyncio
+async def test_scope_changed_resume_consumes_interrupt_with_error_status_including_pre_upgrade_card(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 3 Decision 4: when settle_resume_request stamps scope_changed=True
+    (including for a pre-upgrade card missing approval_snapshots), LangGraph
+    consumes the interrupt and emits a terminal ToolMessage(status='error',
+    code='scope_changed') without creating a workspace."""
+    mgr = _manager_double()
+    monkeypatch.setattr(
+        "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+        create_autospec(WorkspaceManager.get_instance, return_value=mgr),
+    )
+
+    model = _Model(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "manage_workspaces",
+                        "args": {"action": "create", "name": "LegacyWS", "description": ""},
+                        "id": "call-legacy-1",
+                    }
+                ],
+            ),
+            AIMessage(content="Please re-initiate."),
+        ]
+    )
+    # No StandingApprovalMiddleware -> simulates pre-upgrade card with no snapshot.
+    agent = create_agent(
+        model,
+        tools=[chief_of_staff_workspaces],
+        checkpointer=InMemorySaver(),
+    )
+    cfg = {"configurable": {"thread_id": "t-legacy-1", "user_id": USER_ID}}
+
+    paused = await agent.ainvoke({"messages": [("user", "create LegacyWS")]}, cfg)
+    (pending,) = paused["__interrupt__"]
+
+    resumed = await agent.ainvoke(
+        Command(
+            resume={
+                pending.id: {
+                    "decisions": [{"type": "approve"}],
+                    "scope_changed": True,
+                }
+            }
+        ),
+        cfg,
+    )
+    assert "__interrupt__" not in resumed
+    mgr.create_workspace.assert_not_awaited()
+    tool_msgs = [m for m in resumed["messages"] if m.type == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0].status == "error"
+    assert json.loads(tool_msgs[0].content) == {
+        "success": False,
+        "error": "情况已变化，请重新发起",
+        "code": "scope_changed",
+    }
+
+
+@pytest.mark.asyncio
+async def test_preapproved_early_returns_company_exists_and_coverage_suggestion_carry_preapproved_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 3 Decision 6: standing-approval early returns for company_workspace_exists
+    and coverage_suggestion must include preapproved metadata so the frontend draws a card."""
+    snap = {
+        "action": "create_workspace",
+        "tool_call_id": "call-early-1",
+        "workspace_name": "NVDA",
+        "workspace_description": "GPU research",
+        "computer_id": CLOUD_1,
+        "computer_name": "Cloud Primary",
+        "computer_kind": "docker",
+        "computer_is_own_machine": False,
+        "bootstrap_cloud_primary": False,
+    }
+
+    # Case 1: company_workspace_exists
+    dup_exists = SimpleNamespace(
+        matches=[{"workspace_id": WS_1, "name": "NVIDIA"}],
+        message="已存在同名公司工作区 NVIDIA",
+        suggestion=None,
+        suggestion_payload=lambda: None,
+        matches_payload=lambda: [{"workspace_id": WS_1, "name": "NVIDIA"}],
+    )
+    monkeypatch.setattr(
+        "src.dalton.coverage.dedup.find_existing_company_workspace",
+        create_autospec(
+            lambda _uid, _name, channel="cos": None,
+            side_effect=lambda *_a, **_kw: _async_val(dup_exists),
+        ),
+    )
+    monkeypatch.setattr(
+        "src.dalton.coverage.units.is_workspace_coverage_registration_active",
+        create_autospec(
+            lambda _uid: None,
+            side_effect=lambda *_a, **_kw: _async_val(True),
+        ),
+    )
+    res_exists = await workspaces_create(
+        USER_ID, "NVDA", "GPU research", "call-early-1", preapproved=True, snapshot=snap
+    )
+    payload_exists = json.loads(res_exists.update["messages"][0].content)
+    assert payload_exists["success"] is False
+    assert payload_exists["code"] == "company_workspace_exists"
+    assert payload_exists["preapproved"] is True
+    assert payload_exists["workspace_name"] == "NVDA"
+    assert payload_exists["computer_name"] == "Cloud Primary"
+
+    # Case 2: coverage_suggestion
+    dup_sugg = SimpleNamespace(
+        matches=[],
+        message="",
+        suggestion=SimpleNamespace(coverage_kind="company", ticker="NVDA"),
+        suggestion_payload=lambda: {
+            "coverage_kind": "company",
+            "ticker": "NVDA",
+            "display_name": "NVIDIA",
+        },
+        matches_payload=lambda: [],
+    )
+    monkeypatch.setattr(
+        "src.dalton.coverage.dedup.find_existing_company_workspace",
+        create_autospec(
+            lambda _uid, _name, channel="cos": None,
+            side_effect=lambda *_a, **_kw: _async_val(dup_sugg),
+        ),
+    )
+    res_sugg = await workspaces_create(
+        USER_ID, "NVDA", "GPU research", "call-early-2", preapproved=True, snapshot=snap
+    )
+    payload_sugg = json.loads(res_sugg.update["messages"][0].content)
+    assert payload_sugg["success"] is False
+    assert payload_sugg["code"] == "coverage_suggestion"
+    assert payload_sugg["preapproved"] is True
+    assert payload_sugg["workspace_name"] == "NVDA"
+    assert payload_sugg["computer_name"] == "Cloud Primary"
+
+
+async def _async_val(val: Any) -> Any:
+    return val
 
 
 @pytest.mark.asyncio

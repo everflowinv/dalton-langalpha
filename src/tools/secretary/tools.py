@@ -364,11 +364,41 @@ async def workspaces_create(
                 },
             },
         )
+    # Own machines always require per-call confirmation, even if preapproved was passed.
+    if snapshot is not None and snapshot.get("computer_is_own_machine"):
+        preapproved = False
+    snapshot_computer_id = (
+        snapshot.get("computer_id") if snapshot is not None else None
+    )
+    snapshot_bootstrap = bool(
+        snapshot is not None and snapshot.get("bootstrap_cloud_primary")
+    )
+    snapshot_computer_name = (
+        snapshot.get("computer_name") if snapshot is not None else None
+    )
+    snapshot_computer_kind = (
+        snapshot.get("computer_kind") if snapshot is not None else None
+    )
+    # Include preapproved metadata on ALL failure / early-return results (including
+    # company_workspace_exists and coverage_suggestion) so the frontend renders a
+    # failed CreateWorkspaceCard on the standing-approval path.
+    preapproved_meta: dict[str, Any] = {}
+    if preapproved:
+        preapproved_meta = {
+            "preapproved": True,
+            "workspace_name": name,
+            "workspace_description": description or "",
+        }
+        if snapshot_computer_name:
+            preapproved_meta["computer_name"] = snapshot_computer_name
+        if snapshot_bootstrap:
+            preapproved_meta["bootstrap_cloud_primary"] = True
     if snapshot is not None and snapshot.get("precheck_error"):
         return error_command(
             str(snapshot["precheck_error"]),
             tool_call_id,
             code=str(snapshot.get("precheck_error_code") or "precheck_failed"),
+            **preapproved_meta,
         )
     # --- DALTON-HOOK(cos-settings-tools): end ---
 
@@ -398,6 +428,7 @@ async def workspaces_create(
             suggestion = dup.suggestion_payload()
             if suggestion is not None:
                 extra_fields["suggestion"] = suggestion
+            # DALTON-HOOK(cos-settings-tools): include preapproved metadata on early return
             return error_command(
                 dup.message,
                 tool_call_id,
@@ -405,6 +436,7 @@ async def workspaces_create(
                 message=dup.message,
                 matches=dup.matches_payload(),
                 **extra_fields,
+                **preapproved_meta,
             )
         if (
             dup is not None
@@ -429,20 +461,16 @@ async def workspaces_create(
                     "请按 suggestion 带上 coverage_kind / ticker / display_name 重新新建以自动登记覆盖单元，"
                     "或在用户明确不要登记时传 skip_coverage_suggestion=True。"
                 )
+                # DALTON-HOOK(cos-settings-tools): include preapproved metadata on early return
                 return error_command(
                     msg,
                     tool_call_id,
                     code="coverage_suggestion",
                     message=msg,
                     suggestion=suggestion,
+                    **preapproved_meta,
                 )
     # --- DALTON-HOOK(workspace-dedup): end ---
-
-    # --- DALTON-HOOK(cos-settings-tools): begin ---
-    # Own machines always require per-call confirmation, even if preapproved was passed.
-    if snapshot is not None and snapshot.get("computer_is_own_machine"):
-        preapproved = False
-    # --- DALTON-HOOK(cos-settings-tools): end ---
 
     if not preapproved:
         # --- DALTON-HOOK(cos-settings-tools): begin ---
@@ -482,6 +510,19 @@ async def workspaces_create(
         elif not confirmed:
             payload["duplicate_check_unavailable"] = True
         approved, response = hitl_confirm("create_workspace", payload)
+
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        # Server-stamped scope_changed consumes the interrupt and settles the
+        # card to a terminal failure state (including pre-upgrade cards with no
+        # persisted snapshot).
+        if isinstance(response, dict) and response.get("scope_changed"):
+            return error_command(
+                "情况已变化，请重新发起",
+                tool_call_id,
+                code="scope_changed",
+                message_status="error",
+            )
+        # --- DALTON-HOOK(cos-settings-tools): end ---
 
         if not approved:
             # DALTON-HOOK(workspace-duplicate-guard): the decline names the
@@ -534,34 +575,6 @@ async def workspaces_create(
         ProviderNotOffered,  # DALTON-HOOK(cos-settings-tools)
     )
 
-    # --- DALTON-HOOK(cos-settings-tools): begin ---
-    snapshot_computer_id = (
-        snapshot.get("computer_id") if snapshot is not None else None
-    )
-    snapshot_bootstrap = bool(
-        snapshot is not None and snapshot.get("bootstrap_cloud_primary")
-    )
-    snapshot_computer_name = (
-        snapshot.get("computer_name") if snapshot is not None else None
-    )
-    snapshot_computer_kind = (
-        snapshot.get("computer_kind") if snapshot is not None else None
-    )
-    # Include preapproved metadata on failure results so the frontend renders a
-    # failed CreateWorkspaceCard (e.g. scope_changed) on the standing-approval path.
-    preapproved_meta: dict[str, Any] = {}
-    if preapproved:
-        preapproved_meta = {
-            "preapproved": True,
-            "workspace_name": name,
-            "workspace_description": description or "",
-        }
-        if snapshot_computer_name:
-            preapproved_meta["computer_name"] = snapshot_computer_name
-        if snapshot_bootstrap:
-            preapproved_meta["bootstrap_cloud_primary"] = True
-    # --- DALTON-HOOK(cos-settings-tools): end ---
-
     try:
         from src.server.services.workspace_manager import WorkspaceManager
 
@@ -574,6 +587,12 @@ async def workspaces_create(
                 "description": description,
                 "verify_snapshot": True,
             }
+            if not bool(snapshot.get("duplicate_check_unavailable")):
+                create_kwargs["check_duplicate_snapshot"] = True
+                if snapshot.get("duplicate_workspace_id") is not None:
+                    create_kwargs["expected_duplicate_workspace_id"] = str(
+                        snapshot["duplicate_workspace_id"]
+                    )
             if snapshot_computer_kind is not None:
                 create_kwargs["expected_computer_kind"] = str(snapshot_computer_kind)
             if snapshot_bootstrap:
@@ -589,6 +608,7 @@ async def workspaces_create(
                     "情况已变化，请重新发起",
                     tool_call_id,
                     code="scope_changed",
+                    message_status="error",
                     **preapproved_meta,
                 )
             workspace = await workspace_manager.create_workspace(**create_kwargs)
@@ -667,6 +687,7 @@ async def workspaces_create(
             "情况已变化，请重新发起",
             tool_call_id,
             code="scope_changed",
+            message_status="error",
             **preapproved_meta,
         )
     except (ComputerNotFoundError, ComputerArchivingError):
@@ -675,6 +696,7 @@ async def workspaces_create(
                 "情况已变化，请重新发起",
                 tool_call_id,
                 code="scope_changed",
+                message_status="error",
                 **preapproved_meta,
             )
         return error_command(
@@ -695,6 +717,7 @@ async def workspaces_create(
                 "情况已变化，请重新发起",
                 tool_call_id,
                 code="scope_changed",
+                message_status="error",
                 **preapproved_meta,
             )
         return error_command(

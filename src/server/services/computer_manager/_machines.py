@@ -218,9 +218,7 @@ class MachineLifecycleMixin:
         *,
         default_name: Optional[str] = None,
         resource_tier: Optional[str] = None,
-        # DALTON-HOOK(cos-settings-tools): allow callers (ensure_home_bound) to read existing primary without promoting or creating
-        create_or_promote: bool = True,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """Reuse the primary computer to avoid paying for a sandbox per project.
 
         A user with none has one of their own computers promoted (Home's
@@ -237,9 +235,6 @@ class MachineLifecycleMixin:
         computer = await get_primary_computer(user_id)
         if computer is not None:
             return computer
-        # DALTON-HOOK(cos-settings-tools): defer binding when caller opts out of promotion/creation
-        if not create_or_promote:
-            return None
         computer = await promote_primary_computer(user_id)
         if computer is not None:
             return computer
@@ -382,7 +377,7 @@ class MachineLifecycleMixin:
         )
         return computer
 
-    async def ensure_home_bound(self, user_id: str) -> Optional[Dict[str, Any]]:
+    async def ensure_home_bound(self, user_id: str) -> Dict[str, Any]:
         """Put the user's Home on their primary computer, and return that computer.
 
         Lazy and idempotent: every turn routed to Home lands here, and a Home
@@ -398,17 +393,10 @@ class MachineLifecycleMixin:
             return computer
         home = await db_get_workspace(home_id)
         if home is not None:
-            # --- DALTON-HOOK(cos-settings-tools): begin ---
-            # Bind Home only to an already-established primary computer. When
-            # the user has no primary computer yet, defer binding rather than
-            # promoting an existing own machine or silently provisioning a cloud
-            # computer before the user confirms on the card.
+            # The bind takes only a computer still primary, so a primary
+            # flipped since it was read sends this round again for the new one.
             for _ in range(_HOME_BIND_ATTEMPTS):
-                primary = await self.ensure_primary_computer(
-                    user_id, create_or_promote=False
-                )
-                if primary is None:
-                    return None
+                primary = await self.ensure_primary_computer(user_id)
                 bound = await self._place_on_computer(
                     home_id,
                     primary,
@@ -424,7 +412,6 @@ class MachineLifecycleMixin:
                     break
                 if await get_computer_for_workspace(home_id) is not None:
                     break
-            # --- DALTON-HOOK(cos-settings-tools): end ---
         # A losing bind re-reads the winner's.
         computer = await get_computer_for_workspace(home_id)
         if computer is None:

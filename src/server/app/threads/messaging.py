@@ -403,13 +403,24 @@ def _client_body(request: ChatRequest, raw_request: Request) -> ChatRequest:
     """
     if _is_service_request(raw_request):
         return request
-    # DALTON-HOOK(cos-settings-tools): reset boolean llm_model_system_only to False rather than None
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    # Reset boolean llm_model_system_only to False rather than None, and strip
+    # server-only scope_changed flags from client-supplied hitl_response entries.
     cleared = {
         name: (False if name == "llm_model_system_only" else None)
         for name in _SERVER_ONLY_FIELDS
         if getattr(request, name)
     }
+    if request.hitl_response and any(
+        getattr(entry, "scope_changed", False)
+        for entry in request.hitl_response.values()
+    ):
+        cleared["hitl_response"] = {
+            iid: entry.model_copy(update={"scope_changed": False})
+            for iid, entry in request.hitl_response.items()
+        }
     return request.model_copy(update=cleared) if cleared else request
+    # --- DALTON-HOOK(cos-settings-tools): end ---
 
 
 async def _reject_duplicate_request(
@@ -684,6 +695,19 @@ async def _handle_send_message(
                     "code": "invalid_request",
                     "message": "Cannot combine branch edit/fork with hitl_response.",
                 },
+            )
+        # Always clear server-only scope_changed before settle_resume_request.
+        if request.hitl_response and any(
+            getattr(entry, "scope_changed", False)
+            for entry in request.hitl_response.values()
+        ):
+            request = request.model_copy(
+                update={
+                    "hitl_response": {
+                        iid: entry.model_copy(update={"scope_changed": False})
+                        for iid, entry in request.hitl_response.items()
+                    }
+                }
             )
         # Pass principal, raw_request, thread_meta for confirmation authenticity
         request = await _settle_against_branch(
