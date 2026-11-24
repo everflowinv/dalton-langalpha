@@ -68,6 +68,9 @@ services:
 
   redis:
     profiles: !reset []
+    # Valkey 8 (BSD-3-Clause, drop-in Redis protocol replacement) pinned by digest.
+    # Service name and REDIS_* env vars remain unchanged for backend compatibility.
+    image: ${DALTON_VALKEY_IMAGE:-valkey/valkey:8-alpine@sha256:a038175878d66b9d274fbf8be73c0305e93798b83917647f167e18cef3c71eec}
     ports: !reset []
     env_file: .env
     # Expand REDIS_PASSWORD inside the container from `env_file: .env` instead of
@@ -75,10 +78,10 @@ services:
     command:
       - /bin/sh
       - -c
-      # Hand off to the image's own entrypoint so it still drops to the redis user.
-      - exec docker-entrypoint.sh redis-server --requirepass "$${REDIS_PASSWORD:-redis}"
+      # Hand off to the image's own entrypoint so it still drops to the valkey user.
+      - exec docker-entrypoint.sh valkey-server --requirepass "$${REDIS_PASSWORD:-redis}"
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD:-redis}\" ping"]
+      test: ["CMD-SHELL", "valkey-cli -a \"$${REDIS_PASSWORD:-redis}\" ping"]
       interval: 5s
       timeout: 3s
       retries: 5
@@ -188,6 +191,8 @@ services:
         export REDIS_URL="$${REDIS_URL:-redis://:$${REDIS_PASSWORD:-redis}@redis:6379/0}"
         export DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID="$${DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID:-$${MINIO_ROOT_USER:-}}"
         export DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY="$${DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY:-$${MINIO_ROOT_PASSWORD:-}}"
+        export PUBLIC_APP_URL="$${PUBLIC_APP_URL:-http://127.0.0.1:$${DALTON_EDGE_PORT:-8088}}"
+        export SERVER_BASE_URL="$${SERVER_BASE_URL:-http://127.0.0.1:$${DALTON_EDGE_PORT:-8088}}"
         exec uv run --no-sync python server.py --host 0.0.0.0 --port 8000 --workers "$${BACKEND_WORKERS:-2}"
     oom_score_adj: -500
     shm_size: "1gb"
@@ -201,6 +206,9 @@ services:
       APP_ENV: core
       DALTON_PROFILE: core
       DB_HOST: ${DB_HOST:-postgres}
+      # Interpolated like the network's IPAM subnet so trusted proxies never drift from it.
+      DALTON_TRUSTED_PROXIES: ${DALTON_CORE_INTERNAL_SUBNET:-172.31.250.0/24}
+      DALTON_TRUSTED_PROXY_HOPS: ${DALTON_TRUSTED_PROXY_HOPS:-1}
       EGRESS_RELAY_BASE_URL: ${EGRESS_RELAY_BASE_URL:-http://backend:8000}
       SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-docker}
       SANDBOX_DOCKER_NETWORK: ${SANDBOX_DOCKER_NETWORK:-${COMPOSE_PROJECT_NAME:-dalton-core}_sandbox}
@@ -267,11 +275,26 @@ services:
     depends_on:
       backend:
         condition: service_healthy
+    # Keep edge free of `env_file: .env` so DB/JWT/bootstrap/BYOK secrets never
+    # enter the Caddy container; pass only the non-secret runtime and bind-guard
+    # values (`APP_ENV` / `DALTON_PROFILE` match backend; `DALTON_AUTH_MODE`
+    # defaults to `local`, matching src/dalton/settings.py:731-739 for core).
+    environment:
+      APP_ENV: core
+      DALTON_PROFILE: core
+      DALTON_AUTH_MODE: ${DALTON_AUTH_MODE:-local}
+      DOMAIN: ${DALTON_CADDY_HOST:-${DOMAIN:-localhost}}
+      DALTON_TLS_MODE: ${DALTON_TLS_MODE:-loopback}
+      DALTON_EDGE_HTTPS_PORT: ${DALTON_EDGE_HTTPS_PORT:-18443}
     ports:
       - "127.0.0.1:${DALTON_EDGE_PORT:-8088}:8088"
     volumes:
       - ./deploy/standalone/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/standalone/modes:/etc/caddy/modes:ro
+      - ${DALTON_TLS_CERT_DIR:-./deploy/standalone/certs}:/etc/caddy/certs:ro
       - ./deploy/standalone/extra:/etc/caddy/extra:ro
+      - dalton-caddy-data:/data
+      - dalton-caddy-config:/config
     networks:
       - core_internal
 
@@ -285,7 +308,10 @@ services:
     ports: !reset []
 
 networks:
-  core_internal: {}
+  core_internal:
+    ipam:
+      config:
+        - subnet: ${DALTON_CORE_INTERNAL_SUBNET:-172.31.250.0/24}
   sandbox-net:
     # Per-instance network name shared with backend's SANDBOX_DOCKER_NETWORK
     # (read by DockerProvider in src/ptc_agent/core/sandbox/providers/docker.py).
@@ -295,3 +321,5 @@ networks:
 volumes:
   dalton-minio-data:
   dalton-backend-var:
+  dalton-caddy-data:
+  dalton-caddy-config:

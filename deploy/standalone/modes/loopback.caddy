@@ -1,0 +1,6 @@
+# Loopback HTTP trial mode (DALTON_TLS_MODE=loopback).
+# Explicit http:// scheme on :8088 disables Automatic HTTPS and never binds :80/:443.
+# Host exposure is restricted to 127.0.0.1:${DALTON_EDGE_PORT:-8088} in docker-compose.core.yml.
+http://:8088 {
+	import dalton_site_common
+}

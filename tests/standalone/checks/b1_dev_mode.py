@@ -394,59 +394,13 @@ def check_users_and_edge_header_stripping(ctx: _lib.ComposeContext) -> None:
 
 def configure_fake_model_and_workspace(ctx: _lib.ComposeContext) -> str:
     log("4/8 Configuring fake Responses API provider/model (priced gpt-6-luna) and creating workspace...")
-    pref_resp = _lib.http_request(
-        "PUT",
-        f"{ctx.edge_url}/api/v1/users/me/preferences",
-        json_body={
-            "model_preference": {
-                "custom_providers": [
-                    {
-                        "name": FAKE_PROVIDER_NAME,
-                        "parent_provider": "openai",
-                        "use_response_api": True,
-                    }
-                ],
-                "custom_models": [
-                    {
-                        "name": FAKE_MODEL_NAME,
-                        "model_id": FAKE_MODEL_ID,
-                        "provider": FAKE_PROVIDER_NAME,
-                        "input_modalities": ["text"],
-                    }
-                ],
-                "preferred_model": FAKE_MODEL_NAME,
-            }
-        },
-    )
-    assert pref_resp.status == 200, (
-        f"Failed to save fake provider/model preferences: {pref_resp.status} {pref_resp.text}"
-    )
-
-    key_resp = _lib.http_request(
-        "PUT",
-        f"{ctx.edge_url}/api/v1/users/me/api-keys",
-        json_body={
-            "byok_enabled": True,
-            "api_keys": {FAKE_PROVIDER_NAME: FAKE_API_KEY},
-            "base_urls": {FAKE_PROVIDER_NAME: FAKE_BASE_URL},
-        },
-    )
-    assert key_resp.status == 200, (
-        f"Failed to save fake provider API key: {key_resp.status} {key_resp.text}"
-    )
-
-    test_key_resp = _lib.http_request(
-        "POST",
-        f"{ctx.edge_url}/api/v1/keys/test",
-        json_body={
-            "provider": FAKE_PROVIDER_NAME,
-            "api_key": FAKE_API_KEY,
-            "base_url": FAKE_BASE_URL,
-        },
-    )
-    assert test_key_resp.status == 200, (
-        f"POST /api/v1/keys/test against fake-llm failed: "
-        f"{test_key_resp.status} {test_key_resp.text}"
+    _lib.configure_fake_llm_model(
+        ctx,
+        provider_name=FAKE_PROVIDER_NAME,
+        model_name=FAKE_MODEL_NAME,
+        model_id=FAKE_MODEL_ID,
+        base_url=FAKE_BASE_URL,
+        api_key=FAKE_API_KEY,
     )
 
     ws_resp = _lib.http_request(

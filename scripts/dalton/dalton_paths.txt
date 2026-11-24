@@ -584,3 +584,5 @@ docker-compose.ci.yml
 .github/workflows/standalone-core-e2e.yml
 tests/fakes/
 tests/standalone/
+# Standalone Core Batch 6: third-party open-source attribution notice.
+NOTICE
