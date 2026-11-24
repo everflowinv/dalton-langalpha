@@ -1,5 +1,5 @@
 # Automatic HTTPS mode (DALTON_TLS_MODE=auto).
-# On public domains (Batch 4b+, DALTON_EDGE_HTTPS_PORT=443), Caddy serves
+# On public domains (DALTON_EDGE_HTTPS_PORT=443), Caddy serves
 # ACME HTTP-01 challenges on :80 and redirects HTTP to https://{host}{uri}.
 # On loopback hosts (DALTON_EDGE_HTTPS_PORT=18443), HTTP redirects preserve
 # the published host HTTPS port (:18443) via dalton_http_redirect.

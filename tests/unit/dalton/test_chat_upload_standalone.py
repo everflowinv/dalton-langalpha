@@ -1037,6 +1037,67 @@ class TestSandboxNetworkAndInitScript:
         assert parsed_pub["PUBLIC_APP_URL"] == "https://dalton.example.com"
         assert parsed_pub["SERVER_BASE_URL"] == "https://dalton.example.com"
         assert parsed_pub["DALTON_INVITE_EMAIL_DOMAIN"] == "team.dalton.example.com"
+        assert parsed_pub["DALTON_TLS_MODE"] == "auto"
+        assert parsed_pub["DALTON_EDGE_TLS_BIND"] == "0.0.0.0"
+        assert parsed_pub["DALTON_EDGE_HTTP_PORT"] == "80"
+        assert parsed_pub["DALTON_EDGE_HTTPS_PORT"] == "443"
+
+        # 2b. LAN domain, IPv4 LAN IP, and IPv6 LAN IP enable local auth and bind 0.0.0.0 / [::]
+        for case_name, lan_host, want_bind, want_overlay in (
+            ("lan-domain", "dalton.internal", "0.0.0.0", "deploy/standalone/docker-compose.tls.yml"),
+            ("lan-ipv4", "192.168.1.50", "0.0.0.0", "deploy/standalone/docker-compose.tls.yml"),
+            ("lan-ipv6", "fd00::1", "[::]", "deploy/standalone/docker-compose.tls.ipv6.yml"),
+        ):
+            inst_lan, init_lan = self._stage_init_install(tmp_path, f"inst-{case_name}")
+            res_lan = subprocess.run(
+                [
+                    "bash",
+                    str(init_lan),
+                    "--non-interactive",
+                    "--domain",
+                    lan_host,
+                    "--skip-sandbox-build",
+                ],
+                env=self._make_fake_docker_env(tmp_path, "28.0.1"),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert res_lan.returncode == 0, res_lan.stderr
+            parsed_lan = _parse_env(inst_lan / ".env")
+            assert parsed_lan["DALTON_AUTH_MODE"] == "local"
+            assert parsed_lan["VITE_DALTON_AUTH"] == "local"
+            assert "DALTON_ALLOW_DEV_OSS_AUTH" not in parsed_lan
+            assert parsed_lan["DALTON_TLS_MODE"] == "internal"
+            assert parsed_lan["DALTON_EDGE_TLS_BIND"] == want_bind
+            assert parsed_lan["DALTON_EDGE_HTTP_PORT"] == "80"
+            assert parsed_lan["DALTON_EDGE_HTTPS_PORT"] == "443"
+            assert parsed_lan["COMPOSE_FILE"] == f"docker-compose.yml:docker-compose.core.yml:{want_overlay}"
+
+        # 2c. write_edge_tls_bind NEVER writes a non-loopback address unless DALTON_AUTH_MODE=local
+        inst_bind_guard, init_bind_guard = self._stage_init_install(tmp_path, "inst-bind-guard")
+        for non_local_mode in ("oss", "supabase", ""):
+            guard_bind_env = inst_bind_guard / f".env.{non_local_mode or 'empty'}"
+            guard_bind_env.write_text(
+                f"DALTON_AUTH_MODE={non_local_mode}\nDALTON_EDGE_TLS_BIND=0.0.0.0\n",
+                encoding="utf-8",
+            )
+            guard_bind_script = (
+                "set -euo pipefail\n"
+                f'ENV_FILE="{guard_bind_env}"\n'
+                "SCRIPT_WROTE_LOCAL_AUTH=1\n"
+                'info() { :; }\nwarn() { :; }\n'
+                f'eval "$(awk \'/^(get_env_value_any|get_env_value|get_file_mode|write_env_key|write_edge_tls_bind)\\(\\) \\{{/ {{p=1}} p {{print}} p && /^\\}}/ {{p=0}}\' "{init_bind_guard}")"\n'
+                'write_edge_tls_bind "public" "auto" "127.0.0.1" "0.0.0.0" 1\n'
+            )
+            res_bg = subprocess.run(
+                ["bash", "-c", guard_bind_script],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert res_bg.returncode == 0, res_bg.stderr
+            assert _parse_env(guard_bind_env)["DALTON_EDGE_TLS_BIND"] == "127.0.0.1"
 
         # 3. ::1 and localhost keep loopback passwordless trial (DALTON_AUTH_MODE=oss, DALTON_ALLOW_DEV_OSS_AUTH=1)
         inst_v6, init_v6 = self._stage_init_install(tmp_path, "inst-v6")
@@ -1091,10 +1152,11 @@ class TestSandboxNetworkAndInitScript:
         )
         assert res_guard_ok.returncode == 0, res_guard_ok.stderr
 
-        # 3c. Existing public DOMAIN in .env with no --domain is also normalized cleanly to local auth.
+        # 3c. Existing public DOMAIN in .env with no --domain is also normalized cleanly to local auth
+        #     and upgrades a stale 127.0.0.1 bind address to 0.0.0.0.
         inst_prev, init_prev = self._stage_init_install(tmp_path, "inst-env-domain")
         (inst_prev / ".env").write_text(
-            "export DOMAIN = dalton.example.com\nDALTON_AUTH_MODE=oss\nDALTON_ALLOW_DEV_OSS_AUTH=1\n",
+            "export DOMAIN = dalton.example.com\nDALTON_AUTH_MODE=oss\nDALTON_ALLOW_DEV_OSS_AUTH=1\nDALTON_TLS_MODE=auto\nDALTON_EDGE_TLS_BIND=127.0.0.1\n",
             encoding="utf-8",
         )
         res_prev = subprocess.run(
@@ -1107,6 +1169,7 @@ class TestSandboxNetworkAndInitScript:
         assert parsed_prev["DOMAIN"] == "dalton.example.com"
         assert parsed_prev["DALTON_AUTH_MODE"] == "local"
         assert parsed_prev["VITE_DALTON_AUTH"] == "local"
+        assert parsed_prev["DALTON_EDGE_TLS_BIND"] == "0.0.0.0"
         assert "DALTON_ALLOW_DEV_OSS_AUTH" not in parsed_prev
 
         # 4. Docker server < 28.0 or unreachable fails in --non-interactive
@@ -1542,20 +1605,18 @@ class TestSandboxNetworkAndInitScript:
         assert "PUBLIC_APP_URL=https://[::1]:18443\n" in v6_env_text
         assert "DALTON_TRUSTED_PROXIES=" not in v6_env_text
 
-        # 7. Hardcoded loopback binds (no bind env interpolation before Batch 4b) & IPv6 redirect preserves brackets
+        # 7. Configurable TLS bind addresses (safe loopback defaults) & IPv6 redirect preserves brackets
         auto_caddy = (REPO_ROOT / "deploy/standalone/modes/auto.caddy").read_text(encoding="utf-8")
         assert "import dalton_http_redirect" in auto_caddy
         caddyfile = (REPO_ROOT / "deploy/standalone/Caddyfile").read_text(encoding="utf-8")
         assert "vars_regexp ipv6_host {http.request.host}" in caddyfile
         assert "https://[{re.ipv6_host.1}]" in caddyfile
         tls_compose = (REPO_ROOT / "deploy/standalone/docker-compose.tls.yml").read_text(encoding="utf-8")
-        assert '"127.0.0.1:${DALTON_EDGE_HTTP_PORT:-18080}:80"' in tls_compose
-        assert '"127.0.0.1:${DALTON_EDGE_HTTPS_PORT:-18443}:443"' in tls_compose
-        assert "DALTON_EDGE_TLS_BIND" not in tls_compose
+        assert '"${DALTON_EDGE_TLS_BIND:-127.0.0.1}:${DALTON_EDGE_HTTP_PORT:-18080}:80"' in tls_compose
+        assert '"${DALTON_EDGE_TLS_BIND:-127.0.0.1}:${DALTON_EDGE_HTTPS_PORT:-18443}:443"' in tls_compose
         tls_ipv6_compose = (REPO_ROOT / "deploy/standalone/docker-compose.tls.ipv6.yml").read_text(encoding="utf-8")
-        assert '"[::1]:${DALTON_EDGE_HTTP_PORT:-18080}:80"' in tls_ipv6_compose
-        assert '"[::1]:${DALTON_EDGE_HTTPS_PORT:-18443}:443"' in tls_ipv6_compose
-        assert "DALTON_EDGE_TLS_BIND" not in tls_ipv6_compose
+        assert '"${DALTON_EDGE_TLS_BIND:-[::1]}:${DALTON_EDGE_HTTP_PORT:-18080}:80"' in tls_ipv6_compose
+        assert '"${DALTON_EDGE_TLS_BIND:-[::1]}:${DALTON_EDGE_HTTPS_PORT:-18443}:443"' in tls_ipv6_compose
 
         # 8. Standalone images are pinned by digest
         edge_df = (REPO_ROOT / "deploy/standalone/Dockerfile.edge").read_text(encoding="utf-8")

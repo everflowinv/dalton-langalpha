@@ -317,7 +317,7 @@ is_loopback_domain() {
   d="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   d="${d#[}"
   d="${d%]}"
-  [[ "$d" == "localhost" || "$d" == "127.0.0.1" || "$d" == "::1" ]]
+  [[ "$d" == "localhost" || "$d" == "127.0.0.1" || "$d" == "::1" || "$d" =~ ^127\.[0-9]+\.[0-9]+\.[0-9]+$ ]]
 }
 
 check_environment() {
@@ -791,6 +791,27 @@ validate_domain_for_auth() {
   fi
 }
 
+write_edge_tls_bind() {
+  local domain_class="$1" tls_mode="$2" loopback_bind="$3" desired_bind="$4" force_update="$5"
+  local actual_auth_mode existing_tls_bind
+  actual_auth_mode="$(get_env_value "DALTON_AUTH_MODE")"
+  existing_tls_bind="$(get_env_value "DALTON_EDGE_TLS_BIND")"
+  if [[ "$domain_class" == "loopback" || "$tls_mode" == "loopback" || "$actual_auth_mode" != "local" || "$SCRIPT_WROTE_LOCAL_AUTH" -ne 1 ]]; then
+    # Loopback hosts, loopback TLS mode, or any non-local auth configuration
+    # always enforce a loopback listen address (127.0.0.1 or [::1]) in .env.
+    write_env_key "DALTON_EDGE_TLS_BIND" "$loopback_bind"
+    if [[ -n "$existing_tls_bind" && "$existing_tls_bind" != "$loopback_bind" ]]; then
+      warn "Rewrote DALTON_EDGE_TLS_BIND from '${existing_tls_bind}' to '${loopback_bind}' (loopback host or non-local auth requires a loopback listening address)."
+    else
+      info "Enforced loopback listen address DALTON_EDGE_TLS_BIND=${loopback_bind}."
+    fi
+    return 0
+  fi
+  if [[ "$force_update" -eq 1 || -z "$existing_tls_bind" || "$existing_tls_bind" == "127.0.0.1" || "$existing_tls_bind" == "[::1]" ]]; then
+    write_env_key "DALTON_EDGE_TLS_BIND" "$desired_bind"
+  fi
+}
+
 main() {
   if [[ -n "$TLS_MODE_ARG" ]]; then
     validate_tls_mode "$TLS_MODE_ARG" "--tls-mode"
@@ -881,14 +902,16 @@ main() {
   local url_host loopback_bind
   if [[ "$domain" == *:* ]]; then
     url_host="[${domain}]"
-    loopback_bind="[${domain}]"
+    loopback_bind="[::1]"
   else
     url_host="$domain"
     loopback_bind="127.0.0.1"
   fi
 
-  if [[ "$tls_mode" == "auto" && "$domain_class" != "public" ]]; then
-    warn "DALTON_TLS_MODE=auto selected for loopback/non-public host '${domain}'; binding enforced to ${loopback_bind}."
+  if [[ "$tls_mode" == "auto" && "$domain_class" == "loopback" ]]; then
+    warn "DALTON_TLS_MODE=auto selected for loopback host '${domain}'; binding enforced to ${loopback_bind}."
+  elif [[ "$tls_mode" == "auto" && "$domain_class" != "public" ]]; then
+    warn "DALTON_TLS_MODE=auto selected for non-public host '${domain}'; public ACME issuance requires a publicly resolvable DNS domain (use --tls-mode internal or custom for LAN hosts)."
   fi
 
   local force_network_update=0
@@ -935,6 +958,9 @@ main() {
     tls_overlay_file="deploy/standalone/docker-compose.tls.yml"
   fi
 
+  local auth_mode_now
+  auth_mode_now="$(get_env_value "DALTON_AUTH_MODE")"
+
   case "$tls_mode" in
     loopback)
       tls_bind="$loopback_bind"
@@ -944,7 +970,7 @@ main() {
       compose_file="docker-compose.yml:docker-compose.core.yml"
       ;;
     internal|auto|custom)
-      if [[ "$domain_class" == "loopback" ]]; then
+      if [[ "$domain_class" == "loopback" || "$auth_mode_now" != "local" || "$SCRIPT_WROTE_LOCAL_AUTH" -ne 1 ]]; then
         tls_bind="$loopback_bind"
         http_port="18080"
         https_port="18443"
@@ -970,21 +996,7 @@ main() {
   fi
 
   set_env_maybe_override "$force_network_update" "DALTON_TLS_MODE" "$tls_mode"
-  if [[ "$domain_class" == "loopback" || "$tls_mode" == "loopback" ]]; then
-    # For loopback deployments, always rewrite the listen/bind address in .env
-    # to the loopback address (127.0.0.1 or [::1]) on every init.sh run regardless
-    # of any pre-existing value (e.g. 0.0.0.0) so a passwordless stack never publishes externally.
-    local existing_tls_bind
-    existing_tls_bind="$(get_env_value "DALTON_EDGE_TLS_BIND")"
-    write_env_key "DALTON_EDGE_TLS_BIND" "$tls_bind"
-    if [[ -n "$existing_tls_bind" && "$existing_tls_bind" != "$tls_bind" ]]; then
-      warn "Rewrote DALTON_EDGE_TLS_BIND from '${existing_tls_bind}' to '${tls_bind}' (loopback host requires a loopback listening address)."
-    else
-      info "Enforced loopback listen address DALTON_EDGE_TLS_BIND=${tls_bind}."
-    fi
-  else
-    set_env_maybe_override "$force_network_update" "DALTON_EDGE_TLS_BIND" "$tls_bind"
-  fi
+  write_edge_tls_bind "$domain_class" "$tls_mode" "$loopback_bind" "$tls_bind" "$force_network_update"
   if [[ "$domain" == *:* ]]; then
     write_env_key "DALTON_CADDY_HOST" "$url_host"
   else

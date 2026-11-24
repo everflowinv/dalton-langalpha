@@ -796,6 +796,25 @@ def _parse_http_origin_tuple(raw: str) -> tuple[str, str, int] | None:
     return (scheme, host, effective_port)
 
 
+def _is_loopback_bind_address(raw: str) -> bool:
+    """Return True iff ``raw`` is an explicit loopback bind host (``127.0.0.0/8``, ``::1``, or ``localhost``)."""
+    cleaned = raw.strip()
+    if not cleaned:
+        return True
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        inner = cleaned[1:-1].strip()
+        try:
+            return ipaddress.IPv6Address(inner).is_loopback
+        except ValueError:
+            return False
+    if cleaned.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(cleaned).is_loopback
+    except ValueError:
+        return False
+
+
 def validate_dalton_auth_config() -> str:
     """Fail-closed startup validation for ``DALTON_AUTH_MODE`` (Standalone Core §4.2 #1).
 
@@ -806,6 +825,8 @@ def validate_dalton_auth_config() -> str:
     - ``DALTON_AUTH_MODE=local`` has cross-origin frontend and API URLs configured;
     - ``DALTON_AUTH_MODE=local`` has transcription enabled without a dedicated
       ``DALTON_TRANSCRIPTION_TICKET_SECRET`` (>= 32 bytes);
+    - ``DALTON_PROFILE=core`` sets a non-loopback ``DALTON_EDGE_TLS_BIND`` with
+      an authentication mode other than ``local``;
     - ``DALTON_PROFILE=core`` uses ``DALTON_AUTH_MODE=oss`` without
       ``DALTON_ALLOW_DEV_OSS_AUTH=1``.
     """
@@ -871,6 +892,20 @@ def validate_dalton_auth_config() -> str:
                     f"{MIN_TRANSCRIPTION_TICKET_SECRET_BYTES} bytes (got {ticket_secret_bytes}). "
                     "Generate one with `openssl rand -hex 32`."
                 )
+    edge_tls_bind = os.getenv("DALTON_EDGE_TLS_BIND", "").strip()
+    if (
+        profile is DeploymentProfile.CORE
+        and edge_tls_bind
+        and not _is_loopback_bind_address(edge_tls_bind)
+        and mode != "local"
+    ):
+        raise DaltonStartupConfigError(
+            f"Non-loopback DALTON_EDGE_TLS_BIND={edge_tls_bind!r} under "
+            f"DALTON_PROFILE=core requires DALTON_AUTH_MODE=local (got {mode!r}). "
+            "Set DALTON_AUTH_MODE=local (with a >=32-byte JWT_SIGNING_SECRET and "
+            "VITE_DALTON_AUTH=local) to listen on a non-loopback address, or set "
+            "DALTON_EDGE_TLS_BIND=127.0.0.1 (or [::1] for IPv6) for loopback-only access."
+        )
     if profile is DeploymentProfile.CORE and mode == "oss":
         if not is_core_oss_auth_explicitly_allowed():
             raise DaltonStartupConfigError(

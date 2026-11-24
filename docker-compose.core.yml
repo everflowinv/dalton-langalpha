@@ -209,6 +209,10 @@ services:
       # Interpolated like the network's IPAM subnet so trusted proxies never drift from it.
       DALTON_TRUSTED_PROXIES: ${DALTON_CORE_INTERNAL_SUBNET:-172.31.250.0/24}
       DALTON_TRUSTED_PROXY_HOPS: ${DALTON_TRUSTED_PROXY_HOPS:-1}
+      # Interpolated exactly like the edge TLS port binds (deploy/standalone/docker-compose.tls*.yml),
+      # so the startup check in validate_dalton_auth_config sees the address edge really publishes on,
+      # including a value exported in the host shell.
+      DALTON_EDGE_TLS_BIND: ${DALTON_EDGE_TLS_BIND:-127.0.0.1}
       EGRESS_RELAY_BASE_URL: ${EGRESS_RELAY_BASE_URL:-http://backend:8000}
       SANDBOX_PROVIDER: ${SANDBOX_PROVIDER:-docker}
       SANDBOX_DOCKER_NETWORK: ${SANDBOX_DOCKER_NETWORK:-${COMPOSE_PROJECT_NAME:-dalton-core}_sandbox}

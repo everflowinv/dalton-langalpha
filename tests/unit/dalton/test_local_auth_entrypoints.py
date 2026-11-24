@@ -109,6 +109,7 @@ def _clean_auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("APP_ENV", raising=False)
     monkeypatch.delenv("DALTON_AUTH_MODE", raising=False)
     monkeypatch.delenv("DALTON_ALLOW_DEV_OSS_AUTH", raising=False)
+    monkeypatch.delenv("DALTON_EDGE_TLS_BIND", raising=False)
     monkeypatch.delenv("JWT_SIGNING_SECRET", raising=False)
     monkeypatch.delenv("DALTON_TRANSCRIPTION_ENABLED", raising=False)
     monkeypatch.delenv("DALTON_TRANSCRIPTION_TICKET_SECRET", raising=False)
@@ -232,6 +233,80 @@ class TestAuthModeStartupValidationAndTranscriptionSecret:
 
         monkeypatch.setenv("DALTON_ALLOW_DEV_OSS_AUTH", "1")
         assert validate_dalton_auth_config() == "oss"
+
+    @pytest.mark.parametrize(
+        "bind_addr",
+        [
+            "0.0.0.0",
+            "::",
+            "[::]",
+            "192.168.1.50",
+            "10.0.0.5",
+            "fd00::1",
+            "[fd00::1]",
+            "dalton.example.com",
+            "[localhost]",
+        ],
+    )
+    def test_core_profile_non_loopback_tls_bind_requires_local_auth(
+        self, monkeypatch: pytest.MonkeyPatch, bind_addr: str
+    ) -> None:
+        monkeypatch.setenv("DALTON_PROFILE", "core")
+        monkeypatch.setenv("DALTON_EDGE_TLS_BIND", bind_addr)
+
+        # oss + dev flag is still refused when binding outside loopback
+        monkeypatch.setenv("DALTON_AUTH_MODE", "oss")
+        monkeypatch.setenv("DALTON_ALLOW_DEV_OSS_AUTH", "1")
+        with pytest.raises(
+            DaltonStartupConfigError, match="DALTON_EDGE_TLS_BIND.*DALTON_AUTH_MODE=local"
+        ):
+            validate_dalton_auth_config()
+
+        # supabase under core profile is also refused when binding outside loopback
+        monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+        with pytest.raises(
+            DaltonStartupConfigError, match="DALTON_EDGE_TLS_BIND.*DALTON_AUTH_MODE=local"
+        ):
+            validate_dalton_auth_config()
+
+        # local auth with valid JWT secret is allowed
+        monkeypatch.setenv("DALTON_AUTH_MODE", "local")
+        monkeypatch.setenv("JWT_SIGNING_SECRET", TEST_JWT_SECRET)
+        assert validate_dalton_auth_config() == "local"
+
+    @pytest.mark.parametrize(
+        "loopback_addr",
+        [
+            "",
+            "127.0.0.1",
+            "127.0.0.2",
+            "127.255.255.254",
+            "::1",
+            "[::1]",
+            "localhost",
+            "LOCALHOST",
+        ],
+    )
+    def test_core_profile_loopback_tls_bind_allows_dev_oss_auth(
+        self, monkeypatch: pytest.MonkeyPatch, loopback_addr: str
+    ) -> None:
+        monkeypatch.setenv("DALTON_PROFILE", "core")
+        monkeypatch.setenv("DALTON_AUTH_MODE", "oss")
+        monkeypatch.setenv("DALTON_ALLOW_DEV_OSS_AUTH", "1")
+        if loopback_addr:
+            monkeypatch.setenv("DALTON_EDGE_TLS_BIND", loopback_addr)
+        else:
+            monkeypatch.delenv("DALTON_EDGE_TLS_BIND", raising=False)
+        assert validate_dalton_auth_config() == "oss"
+
+    @pytest.mark.parametrize("everflow_auth_mode", ["supabase", "oss"])
+    def test_everflow_profile_unaffected_by_edge_tls_bind(
+        self, monkeypatch: pytest.MonkeyPatch, everflow_auth_mode: str
+    ) -> None:
+        monkeypatch.setenv("DALTON_PROFILE", "everflow")
+        monkeypatch.setenv("DALTON_AUTH_MODE", everflow_auth_mode)
+        monkeypatch.setenv("DALTON_EDGE_TLS_BIND", "0.0.0.0")
+        assert validate_dalton_auth_config() == everflow_auth_mode
 
     def test_transcription_ticket_secret_hardening_in_local_mode(
         self, monkeypatch: pytest.MonkeyPatch

@@ -2,9 +2,6 @@
 # auth: oss
 """Standalone Core Batch 6 acceptance checks (`b6_tls_backup_upgrade.py`).
 
-Note: `auth: local` HTTPS login/refresh smoke verification will be added once
-Batch 4b (local sign-in UI & init wiring) merges.
-
 Uses Python standard library + `_lib.py` only (no `httpx`, `psycopg`, or repo `src`
 imports) so it runs directly on a bare Linux CI runner alongside `b1` / `b2`.
 
@@ -428,7 +425,7 @@ def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
             "init.sh must rewrite a pre-existing DALTON_EDGE_TLS_BIND to 127.0.0.1 for a loopback domain"
         )
 
-        # A public domain turns on local sign-in (Batch 4b) and automatic HTTPS.
+        # A public domain turns on local sign-in, automatic HTTPS, and 0.0.0.0:80/443 binding.
         pub_dir = tmp_root / "public-domain"
         init_pub = _stage_init_dir(ctx.work_dir, pub_dir)
         res_pub = _run_cmd(
@@ -437,7 +434,8 @@ def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
             check=False,
             timeout=60,
         )
-        pub_env = _lib.load_env_file(pub_dir / ".env") if (pub_dir / ".env").exists() else {}
+        pub_env_path = pub_dir / ".env"
+        pub_env = _lib.load_env_file(pub_env_path) if pub_env_path.exists() else {}
         assert res_pub.returncode == 0, (
             f"Expected init.sh to accept a public domain: rc={res_pub.returncode}\n{res_pub.stderr[-800:]}"
         )
@@ -446,11 +444,64 @@ def check_init_tls_modes(ctx: _lib.ComposeContext) -> None:
             ("DALTON_AUTH_MODE", "local"),
             ("VITE_DALTON_AUTH", "local"),
             ("DALTON_TLS_MODE", "auto"),
+            ("DALTON_EDGE_TLS_BIND", "0.0.0.0"),
+            ("DALTON_EDGE_HTTP_PORT", "80"),
+            ("DALTON_EDGE_HTTPS_PORT", "443"),
         ):
             assert pub_env.get(key) == want, f"Expected {key}={want} for a public domain, got {pub_env.get(key)!r}"
         assert not pub_env.get("DALTON_ALLOW_DEV_OSS_AUTH"), (
             "A public domain must not keep DALTON_ALLOW_DEV_OSS_AUTH"
         )
+
+        # Verify compose config (without starting the stack) publishes edge on 0.0.0.0:80 and 0.0.0.0:443.
+        clean_compose_env = os.environ.copy()
+        for var in (
+            "COMPOSE_FILE",
+            "COMPOSE_PROJECT_NAME",
+            "COMPOSE_PROFILES",
+            "DOMAIN",
+            "DALTON_TLS_MODE",
+            "DALTON_AUTH_MODE",
+            "DALTON_ALLOW_DEV_OSS_AUTH",
+            "DALTON_EDGE_TLS_BIND",
+            "DALTON_EDGE_HTTP_PORT",
+            "DALTON_EDGE_HTTPS_PORT",
+        ):
+            clean_compose_env.pop(var, None)
+        pub_cfg_proc = _run_cmd(
+            [
+                "docker",
+                "compose",
+                "--project-directory",
+                str(ctx.work_dir),
+                "-f",
+                str(ctx.work_dir / "docker-compose.yml"),
+                "-f",
+                str(ctx.work_dir / "docker-compose.core.yml"),
+                "-f",
+                str(ctx.work_dir / "deploy" / "standalone" / "docker-compose.tls.yml"),
+                "--env-file",
+                str(pub_env_path),
+                "config",
+                "--format",
+                "json",
+            ],
+            cwd=ctx.work_dir,
+            env=clean_compose_env,
+            redact_env=pub_env,
+            timeout=30,
+        )
+        pub_cfg = json.loads(pub_cfg_proc.stdout)
+        edge_ports = ((pub_cfg.get("services") or {}).get("edge") or {}).get("ports") or []
+        published_by_target = {
+            int(p["target"]): (str(p.get("host_ip") or ""), str(p.get("published") or ""))
+            for p in edge_ports
+            if isinstance(p, dict) and p.get("target") is not None
+        }
+        assert published_by_target == {
+            80: ("0.0.0.0", "80"),
+            443: ("0.0.0.0", "443"),
+        }, f"Expected public-domain TLS compose config to publish edge on 0.0.0.0:80/443, got {edge_ports!r}"
 
         # Domain with port must be rejected
         port_dir = tmp_root / "reject-port"

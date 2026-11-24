@@ -28,12 +28,12 @@ docker compose version
 
 | 部署模式 | 需放行的入站 TCP（传输控制协议）端口 | Compose 编排文件 |
 |---|---|---|
-| 本机回环 HTTP 试用（`DALTON_TLS_MODE=loopback`，当前默认） | 仅本机 `127.0.0.1:8088` | `docker-compose.yml` + `docker-compose.core.yml` |
-| 本机回环 HTTPS（`DALTON_TLS_MODE=internal` / `custom`） | 仅本机 `127.0.0.1:18080` 与 `127.0.0.1:18443`（IPv6 回环 `::1` 为 `[::1]:18080` / `[::1]:18443`） | 额外附加 `deploy/standalone/docker-compose.tls.yml`（IPv6 回环附加 `deploy/standalone/docker-compose.tls.ipv6.yml`） |
-| 公网自动 HTTPS（`DALTON_TLS_MODE=auto`，待 Batch 4b 开放） | **80**（ACME 验证与跳转）与 **443**（HTTPS） | 额外附加 `deploy/standalone/docker-compose.tls.yml` |
-| 企业内网 HTTPS（`DALTON_TLS_MODE=internal` / `custom`，待 Batch 4b 开放） | **80** 与 **443**（内网可达） | 额外附加 `deploy/standalone/docker-compose.tls.yml` |
+| 本机回环 HTTP 试用（`DALTON_TLS_MODE=loopback`，默认） | 仅本机 `127.0.0.1:8088` | `docker-compose.yml` + `docker-compose.core.yml` |
+| 本机回环 HTTPS（`DALTON_TLS_MODE=internal` / `custom`） | 仅本机 `127.0.0.1:18080` 与 `127.0.0.1:18443`（IPv6 回环 `::1` 为 `[::1]:18080` / `[::1]:18443`） | 额外附加 `deploy/standalone/docker-compose.tls.yml`（IPv6 附加 `deploy/standalone/docker-compose.tls.ipv6.yml`） |
+| 公网自动 HTTPS（`DALTON_TLS_MODE=auto`） | **80**（ACME 验证与跳转）与 **443**（HTTPS），监听 `0.0.0.0`（IPv6 为 `[::]`） | 额外附加 `deploy/standalone/docker-compose.tls.yml`（IPv6 附加 `deploy/standalone/docker-compose.tls.ipv6.yml`） |
+| 企业内网 HTTPS（`DALTON_TLS_MODE=internal` / `custom`） | **80** 与 **443**（内网可达），监听 `0.0.0.0`（IPv6 为 `[::]`） | 额外附加 `deploy/standalone/docker-compose.tls.yml`（IPv6 附加 `deploy/standalone/docker-compose.tls.ipv6.yml`） |
 
-> **对外发布范围说明**：当前核心版处于免密单机试用阶段，`docker-compose.core.yml`、`deploy/standalone/docker-compose.tls.yml` 中的端口绑定直接写死 `127.0.0.1`（IPv6 回环使用 `deploy/standalone/docker-compose.tls.ipv6.yml` 写死 `[::1]`），不接受环境变量覆盖绑定地址；`scripts/standalone/init.sh` 仅接受回环地址（`localhost`、`127.0.0.1`、`::1`）。正式面向团队或公网部署将在本地登录（Batch 4b）上线后开放；届时 Compose 绑定地址将改为可配置，且 `init.sh` 会在首次启动前自动写入 `DALTON_AUTH_MODE=local` 与 `VITE_DALTON_AUTH=local`。
+> **对外发布范围说明**：`scripts/standalone/init.sh` 按 `--domain` 自动写入认证模式与监听地址（`DALTON_EDGE_TLS_BIND`）。回环域名（`localhost`、`127.0.0.1`、`::1`）固定监听本机回环地址（`127.0.0.1` 或 `[::1]`），用于单机试用。公网域名、企业内网域名和局域网 IP 在执行 `init.sh` 时会自动启用本地多用户登录（写入 `DALTON_AUTH_MODE=local` 与 `VITE_DALTON_AUTH=local`），并将 `DALTON_EDGE_TLS_BIND` 设为 `0.0.0.0`（IPv6 设为 `[::]`）以通过 `deploy/standalone/docker-compose.tls.yml`（IPv6 使用 `docker-compose.tls.ipv6.yml`）监听所有地址；部署前请在宿主机防火墙和云安全组放行入站 TCP 80 与 443 端口，并带 `VITE_DALTON_AUTH=local` 构建 `edge` 镜像。后端启动时会同步校验：当 `DALTON_EDGE_TLS_BIND` 为非回环地址时，认证模式必须为 `local`。
 
 > **基础镜像版本固定说明**：独立版直接拉取的运行时与边缘网关镜像（`valkey/valkey:8-alpine`、`cgr.dev/chainguard/minio` 以及 `deploy/standalone/Dockerfile.edge` 中的 `node:24-alpine` 与 `caddy:2.9.1-alpine`）均已按不可变 SHA-256 摘要固定版本。PostgreSQL（`scripts/dalton/Dockerfile.postgres` 的 `postgres:18`）、后端（`scripts/dalton/Dockerfile.dalton` 的 `node:24-alpine`、`python:3.13-slim`、`ghcr.io/astral-sh/uv:latest`）与沙箱（`Dockerfile.sandbox` 的 `ubuntu:24.04`）的基础镜像与上游及多架构构建共享，且构建阶段通过 `apt-get` 拉取滚动安全更新，因此仍使用可变主版本标签（详见根目录 `NOTICE`）。如需在严格离线或冻结基线环境中部署，请提前构建并通过私有镜像仓库同步固定摘要后的产物镜像，升级时附加 `--skip-build`。
 
@@ -64,13 +64,19 @@ cd /opt/dalton
 
 ### 第 2 步：运行初始化脚本
 
-执行 `scripts/standalone/init.sh`，脚本会自动检测系统环境、配置回环访问模式、写入 `COMPOSE_FILE` 与可信代理参数、生成全套随机密钥（写入权限为 `0600` 的 `.env` 文件），并构建代码沙箱镜像 `langalpha-sandbox:latest`：
+执行 `scripts/standalone/init.sh`，脚本会自动检测系统环境、按目标域名写入认证模式与监听地址、配置 `COMPOSE_FILE` 与可信代理参数、生成全套随机密钥（写入权限为 `0600` 的 `.env` 文件），并构建代码沙箱镜像 `langalpha-sandbox:latest`：
 
 ```bash
+# 公网域名部署（启用本地登录、自动 HTTPS 与 0.0.0.0 监听）
+bash scripts/standalone/init.sh --domain dalton.example.com
+
+# 企业内网部署（启用本地登录、内部 CA HTTPS 与 0.0.0.0 监听）
+bash scripts/standalone/init.sh --domain dalton.internal
+
 # 本机回环 HTTP 试用（仅发布 127.0.0.1:8088）
 bash scripts/standalone/init.sh --domain localhost
 
-# 或启用本机回环内部 CA HTTPS（仅发布 127.0.0.1:18080 与 127.0.0.1:18443）
+# 本机回环内部 CA HTTPS（仅发布 127.0.0.1:18080 与 127.0.0.1:18443）
 bash scripts/standalone/init.sh --domain localhost --tls-mode internal
 ```
 
@@ -140,9 +146,13 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -
 
 ### 3.2 内部 CA HTTPS 模式（`internal`）
 
-适用于本机 HTTPS 验证（当前可用），以及 Batch 4b 上线后的企业内网域名（如 `dalton.internal`）与局域网 IP：
+适用于企业内网域名（如 `dalton.internal`）、局域网 IP 与本机 HTTPS 验证。传入企业内网域名或局域网 IP 时，`init.sh` 自动启用本地登录（写入 `DALTON_AUTH_MODE=local`、`VITE_DALTON_AUTH=local`），将 `DALTON_EDGE_TLS_BIND` 设为 `0.0.0.0`（IPv6 设为 `[::]`），并监听 80/443 端口：
 
 ```bash
+# 企业内网域名或局域网 IP（自动启用本地登录，监听 0.0.0.0:80 与 0.0.0.0:443；IPv6 换用 docker-compose.tls.ipv6.yml）
+bash scripts/standalone/init.sh --domain dalton.internal
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --build edge backend
+
 # 本机回环 HTTPS（仅绑定 127.0.0.1:18080 与 127.0.0.1:18443，HTTP 跳转自动携带 18443 端口并启用 HSTS）
 bash scripts/standalone/init.sh --domain localhost --tls-mode internal
 docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d
@@ -157,29 +167,33 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -
 
 ### 3.3 企业自有证书模式（`custom`）
 
-将完整证书链 `cert.pem` 与私钥 `key.pem`（权限 `0600`）放入指定目录（默认为 `./deploy/standalone/certs`）后执行：
+将完整证书链 `cert.pem` 与私钥 `key.pem`（权限 `0600`）放入指定目录（默认为 `./deploy/standalone/certs`）后执行（传入企业域名时，`init.sh` 自动启用本地登录并将 `DALTON_EDGE_TLS_BIND` 设为 `0.0.0.0`）：
 
 ```bash
 bash scripts/standalone/init.sh \
-  --domain localhost \
+  --domain dalton.corp.internal \
   --tls-mode custom \
   --tls-cert-dir /etc/dalton/certs
-docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --no-deps --force-recreate edge
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --build edge backend
 ```
 
 > **自有证书备份与健康探测**：`backup.sh` 仅归档 Caddy 的 `/data` 卷，请单独做好 `DALTON_TLS_CERT_DIR`（含 `cert.pem` 与 `key.pem`）的备份与恢复。若证书由企业内部 CA 签发，在执行 `restore.sh` 和 `upgrade.sh` 时传入 `--ca-file <企业CA根证书.pem>` 完成 HTTPS 校验。
 
-### 3.4 公网域名自动 HTTPS（`auto`，待 Batch 4b 上线后启用）
+### 3.4 公网域名自动 HTTPS（`auto`）
 
-本地登录（Batch 4b）上线后，`init.sh` 将接受公网域名并在首次启动前自动写入 `DALTON_AUTH_MODE=local` 与 `VITE_DALTON_AUTH=local`：
+公网域名部署可直接启用自动 HTTPS：`init.sh` 自动写入 `DALTON_AUTH_MODE=local`、`VITE_DALTON_AUTH=local`、`DALTON_TLS_MODE=auto`，并将 `DALTON_EDGE_TLS_BIND` 设为 `0.0.0.0`（监听 80 与 443）：
 
 1. 将目标域名（如 `dalton.example.com`）的 `A` / `AAAA` 记录指向服务器公网 IP。
-2. 在云安全组与系统防火墙放行入站 **TCP 80** 与 **TCP 443** 端口，并确认宿主机端口空闲。
-3. 运行 `bash scripts/standalone/init.sh --domain dalton.example.com`，随后使用含 `deploy/standalone/docker-compose.tls.yml` 的编排命令启动服务，Caddy 将通过 ACME 自动签发并续期证书。
+2. 在云安全组与系统防火墙放行入站 **TCP 80** 与 **TCP 443** 端口，并确认宿主机 80/443 端口空闲。
+3. 运行 `bash scripts/standalone/init.sh --domain dalton.example.com`。
+4. 使用含 `deploy/standalone/docker-compose.tls.yml` 的编排命令构建并启动服务，Caddy 通过 ACME 自动签发并续期证书：
+   ```bash
+   docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --build edge backend
+   ```
 
 ---
 
-## 4. 首位管理员与账号管理（Batch 4b 本地登录上线后）
+## 4. 首位管理员与账号管理
 
 正式面向多人或外部网络部署时，需在**首次对外启动前**启用本地多用户账号体系（基于 PostgreSQL 存储密码哈希、签发短期 JWT〔JSON 网络签名令牌〕与可轮换刷新会话）：
 
@@ -580,7 +594,7 @@ DALTON_MINIO_IMAGE=public.ecr.aws/chainguard/minio@sha256:e70b2b1e74d79457f80871
 docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d minio
 ```
 
-### 7.2 公网 HTTPS 证书签发失败（Batch 4b 公网部署）
+### 7.2 公网 HTTPS 证书签发失败
 
 1. 核对域名解析是否已生效：`dig +short <您的域名>` 返回本机公网 IP。
 2. 核对宿主机防火墙（`ufw` / `firewalld`）与云安全组均已放行入站 TCP 80 和 443 端口。
