@@ -95,6 +95,9 @@ exit 0
 """
     )
     (fake_bin / "docker").chmod(0o755)
+    py_link = fake_bin / "python3"
+    if not py_link.exists():
+        py_link.symlink_to(_REPO_ROOT / ".venv/bin/python")
     return fake_bin, trace
 
 
@@ -584,11 +587,18 @@ def test_revert_deploy_aborts_without_reset_when_backend_touched_with_migration(
     assert "backend_touched=1, crawler_touched=1, edge_touched=0, bridge_touched=1" in out1
     assert "部署前=d040, 刚才读到=d041" in out1
     assert "部署前=146, 刚才读到=147" in out1
-    # Steps 1-8 in order; plan B always stops writes and the backend before reading versions.
-    positions = [out1.index(f"\n{n}. ") for n in range(1, 9)]
+    assert f"PRE_FF ({pre_ff1}) 迁移链 head: dalton=d040, upstream=146" in out1
+    assert f"TARGET ({head1}) 迁移链 head: dalton=d041, upstream=147" in out1
+    # Recommended reset target is TARGET (head1) because its two heads match current DB (d041/147)
+    assert f"target_migration_heads {head1}" in out1
+    assert f"git reset --keep {head1}" in out1
+    assert f"git reset --keep {pre_ff1}" not in out1
+    # Steps 1-9 in order; plan B stops writes, reads DB, verifies target_migration_heads, then resets.
+    positions = [out1.index(f"\n{n}. ") for n in range(1, 10)]
     assert positions == sorted(positions)
     assert out1.index("docker stop dalton-langalpha-edge-1") < out1.index("SELECT version_num FROM alembic_version_dalton")
-    assert out1.index("SELECT version_num FROM alembic_version_dalton") < out1.index("git reset --keep")
+    assert out1.index("SELECT version_num FROM alembic_version_dalton") < out1.index(f"target_migration_heads {head1}")
+    assert out1.index(f"target_migration_heads {head1}") < out1.index("git reset --keep")
     assert "docker ps -a --filter name=dalton-langalpha-" in out1
     assert "docker logs --tail 100 dalton-langalpha-backend-1" in out1
     assert "docker compose config backend | grep -E 'DB_(HOST|PORT|NAME)'" in out1
@@ -630,8 +640,13 @@ def test_revert_deploy_aborts_without_reset_when_backend_touched_with_migration(
     assert subprocess.check_output(["git", "-C", str(repo2), "rev-parse", "HEAD"], text=True).strip() == head2
     assert not trace2.exists()
     assert "部署前=未能读取, 刚才读到=未能读取" in res2.stdout
+    assert "版本读不到" in res2.stdout
+    assert "先不要重启后端" in res2.stdout
+    assert "target_migration_heads <已核对一致的提交>" in res2.stdout
+    assert "git reset --keep <已核对一致的提交>" in res2.stdout
+    assert f"git reset --keep {pre_ff2}" not in res2.stdout
     assert "部署前的备份" in res2.stdout
-    assert "\n1. " in res2.stdout and "\n8. " in res2.stdout
+    assert "\n1. " in res2.stdout and "\n9. " in res2.stdout
 
 
 def test_deploy_scripts_have_no_lock_or_auto_downgrade_or_model_specific_wording() -> None:
@@ -1027,6 +1042,16 @@ run_deploy_main --reuse-backup-minutes 60
     assert "backup: reusing" in res.stdout
     assert "migrating_deploy=0" in res.stdout
     assert "AUTO-REVERT ABORTED" in res.stdout
+    assert "回退目标 PRE_FF 的迁移版本与数据库不一致" in res.stdout
+    assert "本次发布包含数据库迁移文件" not in res.stdout
+    assert f"PRE_FF ({v2_with_d047}) 迁移链 head: dalton=d047, upstream=146" in res.stdout
+    assert f"TARGET ({v3_reverted}) 迁移链 head: dalton=d046, upstream=146" in res.stdout
+    assert f"target_migration_heads {v3_reverted}" in res.stdout
+    assert f"git reset --keep {v3_reverted}" in res.stdout
+    assert f"git reset --keep {v2_with_d047}" not in res.stdout
+    assert res.stdout.index(f"target_migration_heads {v3_reverted}") < res.stdout.index(
+        f"git reset --keep {v3_reverted}"
+    )
     assert "PRE_FF" in res.stderr and "d047" in res.stderr
     # Checkout stays on v3_reverted and must NOT reset back to v2_with_d047
     assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == v3_reverted
@@ -1034,4 +1059,41 @@ run_deploy_main --reuse-backup-minutes 60
     restarts = [l for l in docker_trace.read_text().splitlines() if "restart dalton-langalpha-backend-1" in l]
     assert len(restarts) == 1
 
+
+def test_revert_deploy_manual_instructions_when_neither_pre_ff_nor_target_matches_db(
+    tmp_path: Path,
+) -> None:
+    """When neither PRE_FF nor TARGET matches the DB revisions, manual instructions warn not to
+    restart backend first and provide step-by-step commands to confirm the commit to deploy.
+    """
+    repo, pre_ff, head = _init_temp_repo(tmp_path, with_migration_change=True)
+    res, trace_log, _docker_trace = _run_revert_with_fake_docker(
+        repo,
+        tmp_path,
+        pre_ff=pre_ff,
+        migrating_deploy="1",
+        backend_touched="1",
+        pre_ff_dalton_rev="d039",
+        pre_ff_upstream_rev="146",
+        cur_dalton_out="d039\n",
+        cur_upstream_out="146\n",
+    )
+    assert res.returncode != 0
+    assert not trace_log.exists()
+    out = res.stdout
+    assert "AUTO-REVERT ABORTED" in out
+    assert f"PRE_FF ({pre_ff}) 迁移链 head: dalton=d040, upstream=146" in out
+    assert f"TARGET ({head}) 迁移链 head: dalton=d041, upstream=147" in out
+    assert "刚才读到=d039" in out
+    assert "先不要重启后端" in out
+    assert f"target_migration_heads {pre_ff}" in out
+    assert f"target_migration_heads {head}" in out
+    assert "git log --oneline -n 10" in out
+    assert "target_migration_heads <已核对一致的提交>" in out
+    assert "git reset --keep <已核对一致的提交>" in out
+    assert f"git reset --keep {pre_ff}" not in out
+    assert f"git reset --keep {head}" not in out
+    assert out.index("target_migration_heads <已核对一致的提交>") < out.index(
+        "git reset --keep <已核对一致的提交>"
+    )
 

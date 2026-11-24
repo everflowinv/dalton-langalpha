@@ -101,6 +101,7 @@ exit 0
     (fake_bin / "pnpm").write_text("#!/bin/bash\nexit 0\n")
     for name in ("launchctl", "docker", "curl", "uv", "pnpm"):
         (fake_bin / name).chmod(0o755)
+    (fake_bin / "python3").symlink_to(_REPO_ROOT / ".venv/bin/python")
 
     return {
         "origin": origin,
@@ -731,6 +732,7 @@ target_migration_heads HEAD
         "LC_ALL": "C",
         "LANG": "C",
         "PYTHONCOERCECLOCALE": "0",
+        "PYTHONUTF8": "0",
     }
     res = subprocess.run(
         ["bash", "-c", script],
@@ -776,9 +778,12 @@ def test_resolve_deploy_python_prefers_repo_venv_and_checks_min_version(tmp_path
     assert res_venv.returncode == 0, res_venv.stderr
     assert res_venv.stdout.strip() == str(venv_py)
 
-    # 2. Falls back to python3 on PATH when .venv/bin/python does not exist
+    # 2. Falls back to python3 (>= 3.11) on PATH when .venv/bin/python does not exist
     no_venv_repo = tmp_path / "no_venv_repo"
     no_venv_repo.mkdir()
+    good_bin = tmp_path / "good_bin"
+    good_bin.mkdir()
+    (good_bin / "python3").symlink_to(real_python)
     res_fallback = subprocess.run(
         [
             "bash",
@@ -786,7 +791,7 @@ def test_resolve_deploy_python_prefers_repo_venv_and_checks_min_version(tmp_path
             f'set -uo pipefail; DALTON_DEPLOY_LIB_ONLY=1; source "{_DEPLOY_SCRIPT}"; _resolve_deploy_python',
         ],
         env={
-            "PATH": "/bin:/usr/bin",
+            "PATH": f"{good_bin}:/bin:/usr/bin",
             "HOME": str(tmp_path),
             "DALTON_REPO_ROOT": str(no_venv_repo),
         },
@@ -795,15 +800,15 @@ def test_resolve_deploy_python_prefers_repo_venv_and_checks_min_version(tmp_path
         check=False,
     )
     assert res_fallback.returncode == 0, res_fallback.stderr
-    assert res_fallback.stdout.strip().endswith("/python3")
+    assert res_fallback.stdout.strip() == str(good_bin / "python3")
 
-    # 3. Rejects Python < 3.9
+    # 3. Rejects Python < 3.11
     old_bin = tmp_path / "old_bin"
     old_bin.mkdir()
     (old_bin / "python3").write_text(
         """#!/bin/bash
 if [[ "$*" == *"print("* ]]; then
-  echo "3.8"
+  echo "3.10"
   exit 0
 fi
 exit 1
@@ -826,6 +831,180 @@ exit 1
         check=False,
     )
     assert res_old.returncode != 0
-    assert "Python >= 3.9 required" in res_old.stderr
-    assert "(3.8)" in res_old.stderr
+    assert "Python >= 3.11 required" in res_old.stderr
+    assert "(3.10)" in res_old.stderr
 
+
+def test_run_deploy_main_rejects_uncommitted_files_in_migration_dirs(tmp_path: Path) -> None:
+    # Case 1: untracked migration file in src/dalton/migrations/versions (even when DB matches TARGET)
+    ctx_u = _setup_deploy_env(tmp_path / "untracked")
+    seed_u = Path(ctx_u["seed"])
+    repo_u = Path(ctx_u["repo"])
+    v1_u = str(ctx_u["v1"])
+    launchctl_u = Path(ctx_u["launchctl_trace"])
+    (seed_u / "app.py").write_text("v2\n")
+    subprocess.run(["git", "-C", str(seed_u), "commit", "-qam", "v2"], check=True)
+    subprocess.run(["git", "-C", str(seed_u), "push", "-q", "origin", "dalton/main"], check=True)
+    (repo_u / "src/dalton/migrations/versions/d049_stray.py").write_text(
+        "revision = 'd049'\ndown_revision = 'd040'\n"
+    )
+    res_u = _run_deploy(ctx_u, tmp_path / "untracked", args="--reuse-backup-minutes 60")
+    assert res_u.returncode != 0
+    assert "d049_stray.py" in res_u.stderr
+    assert not launchctl_u.exists()
+    assert subprocess.check_output(["git", "-C", str(repo_u), "rev-parse", "HEAD"], text=True).strip() == v1_u
+
+    # Case 2: modified tracked file in migrations/versions
+    ctx_m = _setup_deploy_env(tmp_path / "modified")
+    seed_m = Path(ctx_m["seed"])
+    repo_m = Path(ctx_m["repo"])
+    v1_m = str(ctx_m["v1"])
+    launchctl_m = Path(ctx_m["launchctl_trace"])
+    (seed_m / "app.py").write_text("v2\n")
+    subprocess.run(["git", "-C", str(seed_m), "commit", "-qam", "v2"], check=True)
+    subprocess.run(["git", "-C", str(seed_m), "push", "-q", "origin", "dalton/main"], check=True)
+    (repo_m / "migrations/versions/146_base.py").write_text(
+        "revision = '146'\ndown_revision = None\n# local edit\n"
+    )
+    res_m = _run_deploy(ctx_m, tmp_path / "modified", args="")
+    assert res_m.returncode != 0
+    assert "146_base.py" in res_m.stderr
+    assert not launchctl_m.exists()
+    assert subprocess.check_output(["git", "-C", str(repo_m), "rev-parse", "HEAD"], text=True).strip() == v1_m
+
+    # Case 3: staged file in src/dalton/migrations/versions
+    ctx_s = _setup_deploy_env(tmp_path / "staged")
+    seed_s = Path(ctx_s["seed"])
+    repo_s = Path(ctx_s["repo"])
+    v1_s = str(ctx_s["v1"])
+    launchctl_s = Path(ctx_s["launchctl_trace"])
+    (seed_s / "app.py").write_text("v2\n")
+    subprocess.run(["git", "-C", str(seed_s), "commit", "-qam", "v2"], check=True)
+    subprocess.run(["git", "-C", str(seed_s), "push", "-q", "origin", "dalton/main"], check=True)
+    staged_file = repo_s / "src/dalton/migrations/versions/d050_staged.py"
+    staged_file.write_text("revision = 'd050'\ndown_revision = 'd040'\n")
+    subprocess.run(["git", "-C", str(repo_s), "add", str(staged_file)], check=True)
+    res_s = _run_deploy(ctx_s, tmp_path / "staged", args="")
+    assert res_s.returncode != 0
+    assert "d050_staged.py" in res_s.stderr
+    assert not launchctl_s.exists()
+    assert subprocess.check_output(["git", "-C", str(repo_s), "rev-parse", "HEAD"], text=True).strip() == v1_s
+
+
+def test_target_migration_heads_rejects_cycles_and_missing_down_revision(tmp_path: Path) -> None:
+    ctx = _setup_deploy_env(tmp_path)
+    seed = Path(ctx["seed"])
+    repo = Path(ctx["repo"])
+    v1 = str(ctx["v1"])
+    launchctl_trace = Path(ctx["launchctl_trace"])
+
+    # Case 1: two revisions mutually referencing each other (disconnected cycle alongside valid d040)
+    (seed / "src/dalton/migrations/versions/d047_cycle_a.py").write_text(
+        "revision = 'd047'\ndown_revision = 'd048'\n"
+    )
+    (seed / "src/dalton/migrations/versions/d048_cycle_b.py").write_text(
+        "revision = 'd048'\ndown_revision = 'd047'\n"
+    )
+    subprocess.run(["git", "-C", str(seed), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "mutual cycle"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "-q", "origin", "dalton/main"], check=True)
+    cycle_sha = subprocess.check_output(["git", "-C", str(seed), "rev-parse", "HEAD"], text=True).strip()
+
+    res_cycle = _run(f'target_migration_heads "{cycle_sha}"', cwd=seed)
+    assert res_cycle.returncode != 0
+    assert "图不完整" in res_cycle.stderr
+    assert "d047" in res_cycle.stderr and "d048" in res_cycle.stderr
+
+    # Full deploy aborts before backup and ff
+    res_deploy_cycle = _run_deploy(ctx, tmp_path, args="")
+    assert res_deploy_cycle.returncode != 0
+    assert "图不完整" in res_deploy_cycle.stderr
+    assert not launchctl_trace.exists()
+    assert subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip() == v1
+
+    # Case 2: file missing down_revision assignment
+    subprocess.run(["git", "-C", str(seed), "checkout", "-q", "-b", "missing-down", v1], check=True)
+    (seed / "src/dalton/migrations/versions/d042_no_down.py").write_text("revision = 'd042'\n")
+    subprocess.run(["git", "-C", str(seed), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "missing down_revision"], check=True)
+    missing_down_sha = subprocess.check_output(["git", "-C", str(seed), "rev-parse", "HEAD"], text=True).strip()
+
+    res_missing_down = _run(f'target_migration_heads "{missing_down_sha}"', cwd=seed)
+    assert res_missing_down.returncode != 0
+    assert "missing down_revision" in res_missing_down.stderr
+    assert "d042_no_down.py" in res_missing_down.stderr
+
+    # Case 3: cycle reachable from the unique head (d049 -> d047 -> d048 -> d047)
+    subprocess.run(["git", "-C", str(seed), "checkout", "-q", "-b", "head-cycle", v1], check=True)
+    (seed / "src/dalton/migrations/versions/d040_base.py").unlink()
+    (seed / "src/dalton/migrations/versions/d047_a.py").write_text(
+        "revision = 'd047'\ndown_revision = 'd048'\n"
+    )
+    (seed / "src/dalton/migrations/versions/d048_b.py").write_text(
+        "revision = 'd048'\ndown_revision = 'd047'\n"
+    )
+    (seed / "src/dalton/migrations/versions/d049_head.py").write_text(
+        "revision = 'd049'\ndown_revision = 'd047'\n"
+    )
+    subprocess.run(["git", "-C", str(seed), "add", "-A"], check=True)
+    subprocess.run(["git", "-C", str(seed), "commit", "-q", "-m", "head cycle"], check=True)
+    head_cycle_sha = subprocess.check_output(["git", "-C", str(seed), "rev-parse", "HEAD"], text=True).strip()
+
+    res_head_cycle = _run(f'target_migration_heads "{head_cycle_sha}"', cwd=seed)
+    assert res_head_cycle.returncode != 0
+    assert "图不完整" in res_head_cycle.stderr
+
+
+def test_run_deploy_main_reads_db_versions_after_wait_idle_and_before_fetch(tmp_path: Path) -> None:
+    ctx = _setup_deploy_env(tmp_path)
+    seed = Path(ctx["seed"])
+    fake_bin = Path(ctx["fake_bin"])
+    wait_idle = Path(ctx["wait_idle"])
+    order_log = tmp_path / "order.log"
+
+    (seed / "app.py").write_text("v2\n")
+    subprocess.run(["git", "-C", str(seed), "commit", "-qam", "v2"], check=True)
+    subprocess.run(["git", "-C", str(seed), "push", "-q", "origin", "dalton/main"], check=True)
+
+    wait_idle.write_text(f'#!/bin/bash\necho "wait_idle" >> "{order_log}"\nexit 0\n')
+    wait_idle.chmod(0o755)
+
+    real_git = subprocess.check_output(["which", "git"], text=True).strip()
+    (fake_bin / "git").write_text(
+        f"""#!/bin/bash
+if [ "${{1:-}}" = "fetch" ]; then
+  echo "git_fetch" >> "{order_log}"
+fi
+exec "{real_git}" "$@"
+"""
+    )
+    (fake_bin / "git").chmod(0o755)
+
+    res = _run_deploy(
+        ctx,
+        tmp_path,
+        args="--reuse-backup-minutes 60",
+        dalton_fn=f'echo "read_dalton" >> "{order_log}"; printf "d040"',
+        upstream_fn=f'echo "read_upstream" >> "{order_log}"; printf "146"',
+    )
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert order_log.read_text().splitlines() == [
+        "wait_idle",
+        "read_dalton",
+        "read_upstream",
+        "git_fetch",
+    ]
+
+    # When wait_idle fails, DB versions are not read and git fetch is not run
+    order_log.unlink()
+    wait_idle.write_text(f'#!/bin/bash\necho "wait_idle_fail" >> "{order_log}"\nexit 1\n')
+    wait_idle.chmod(0o755)
+    res_busy = _run_deploy(
+        ctx,
+        tmp_path,
+        args="--reuse-backup-minutes 60",
+        dalton_fn=f'echo "read_dalton" >> "{order_log}"; printf "d040"',
+        upstream_fn=f'echo "read_upstream" >> "{order_log}"; printf "146"',
+    )
+    assert res_busy.returncode != 0
+    assert order_log.read_text().splitlines() == ["wait_idle_fail"]

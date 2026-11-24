@@ -22,10 +22,11 @@ BRIDGE=0; RECREATE=0; EXPECT=""; REUSE_BACKUP_MIN=""
 usage() {
   cat <<'EOF'
 Usage: deploy_main.sh [--bridge] [--recreate] [--expect-migration dNNN] [--reuse-backup-minutes N]
-  Fetches origin once after backend idle, pins TARGET=origin/dalton/main, verifies HEAD is an
-  ancestor of TARGET, compares pre-deploy DB revisions against TARGET heads (dalton + upstream)
-  for backup reuse, against post-ff HEAD for migrating status, and against PRE_FF before
-  auto-revert (unreadable DB revisions are treated as migrating).
+  Waits for backend idle, reads pre-deploy DB revisions, fetches origin once and pins
+  TARGET=origin/dalton/main, verifies HEAD is an ancestor of TARGET and migration directories
+  have no uncommitted files, compares pre-deploy DB revisions against TARGET heads (dalton +
+  upstream) for backup reuse, against post-ff HEAD for migrating status, and against PRE_FF
+  before auto-revert (unreadable DB revisions are treated as migrating).
   --reuse-backup-minutes N  Reuse last ' ok ' dump <= N min old only when DB revisions match TARGET heads.
   --expect-migration dNNN   Verify post-deploy dalton migration starts with dNNN.
   --recreate                Recreate backend/crawler containers instead of docker restart.
@@ -600,6 +601,7 @@ run_public_edge_check() {
 }
 
 PRE_FF="${PRE_FF:-}"
+TARGET="${TARGET:-}"
 PRE_FF_DALTON_REV="${PRE_FF_DALTON_REV:-}"
 PRE_FF_UPSTREAM_REV="${PRE_FF_UPSTREAM_REV:-}"
 MIGRATING_DEPLOY="${MIGRATING_DEPLOY:-0}"
@@ -610,17 +612,92 @@ BRIDGE_TOUCHED="${BRIDGE_TOUCHED:-0}"
 
 _print_manual_revert_instructions() {
   local cur_head="$1" cur_dalton_rev="$2" cur_upstream_rev="$3"
+  local target_ref="${TARGET:-$cur_head}"
+  local pre_ff_heads="" pre_ff_dalton="" pre_ff_upstream=""
+  local target_heads="" target_dalton="" target_upstream=""
+  local db_readable=0 pre_ff_matches=0 target_matches=0
+  local reason="" recommended_commit="" recommended_label="" reset_target=""
 
-  echo "AUTO-REVERT ABORTED — 本次发布包含数据库迁移文件（或无法确认），已快进到新代码；后端可能已经或将会执行迁移。脚本不执行 git reset、不降级、不停服务，保持当前代码（HEAD=${cur_head}）与各服务现状。"
-  echo "部署记录: PRE_FF=${PRE_FF:-未知}, HEAD=${cur_head}, backend_touched=${BACKEND_TOUCHED}, crawler_touched=${CRAWLER_TOUCHED}, edge_touched=${EDGE_TOUCHED}, bridge_touched=${BRIDGE_TOUCHED}"
+  if [ -n "${PRE_FF:-}" ]; then
+    if pre_ff_heads=$(target_migration_heads "$PRE_FF" 2>/dev/null); then
+      IFS=' ' read -r pre_ff_dalton pre_ff_upstream <<<"$pre_ff_heads"
+    fi
+  fi
+  if [ -n "$target_ref" ] && [ "$target_ref" != "unknown" ]; then
+    if target_heads=$(target_migration_heads "$target_ref" 2>/dev/null); then
+      IFS=' ' read -r target_dalton target_upstream <<<"$target_heads"
+    fi
+  fi
+
+  if [ -n "$cur_dalton_rev" ] && [ -n "$cur_upstream_rev" ]; then
+    db_readable=1
+    if [ -n "$pre_ff_dalton" ] && [ -n "$pre_ff_upstream" ] \
+      && [ "$pre_ff_dalton" = "$cur_dalton_rev" ] && [ "$pre_ff_upstream" = "$cur_upstream_rev" ]; then
+      pre_ff_matches=1
+    fi
+    if [ -n "$target_dalton" ] && [ -n "$target_upstream" ] \
+      && [ "$target_dalton" = "$cur_dalton_rev" ] && [ "$target_upstream" = "$cur_upstream_rev" ]; then
+      target_matches=1
+    fi
+  fi
+
+  if [ -z "${PRE_FF_DALTON_REV:-}" ] || [ -z "${PRE_FF_UPSTREAM_REV:-}" ] || [ "$db_readable" = "0" ]; then
+    reason="数据库迁移版本读不到（部署前或当前版本未能读取），无法确认是否存在待执行迁移；后端可能已经或将会执行迁移。"
+  elif [ "$MIGRATING_DEPLOY" = "1" ]; then
+    if [ "$cur_dalton_rev" != "$PRE_FF_DALTON_REV" ] || [ "$cur_upstream_rev" != "$PRE_FF_UPSTREAM_REV" ]; then
+      reason="本次发布已执行数据库迁移（数据库版本从 ${PRE_FF_DALTON_REV}/${PRE_FF_UPSTREAM_REV} 变为 ${cur_dalton_rev}/${cur_upstream_rev}）；后端可能已经或将会执行迁移。"
+    elif [ -n "$target_dalton" ] && [ -n "$target_upstream" ] \
+      && { [ "$target_dalton" != "$cur_dalton_rev" ] || [ "$target_upstream" != "$cur_upstream_rev" ]; }; then
+      reason="本次发布包含待执行数据库迁移（数据库=${cur_dalton_rev}/${cur_upstream_rev}，TARGET=${target_dalton}/${target_upstream}）；后端可能已经或将会执行迁移。"
+    else
+      reason="本次发布按含数据库迁移处理（快进后校验或迁移判定失败）；后端可能已经或将会执行迁移。"
+    fi
+  elif [ -z "$pre_ff_dalton" ] || [ -z "$pre_ff_upstream" ]; then
+    reason="回退目标 PRE_FF 的迁移版本未能解析（版本读不到），无法确认回退到 PRE_FF 是否安全。"
+  else
+    reason="回退目标 PRE_FF 的迁移版本与数据库不一致（PRE_FF=${pre_ff_dalton}/${pre_ff_upstream}，数据库=${cur_dalton_rev}/${cur_upstream_rev}），直接回到 PRE_FF 会引入未执行的迁移或与数据库失配。"
+  fi
+
+  if [ "$pre_ff_matches" = "1" ] && [ "$target_matches" = "1" ]; then
+    recommended_commit="$PRE_FF"
+    recommended_label="PRE_FF (${PRE_FF})（PRE_FF 与 TARGET 的两条链 head 均等于当前数据库版本 ${cur_dalton_rev}/${cur_upstream_rev}）"
+  elif [ "$pre_ff_matches" = "1" ]; then
+    recommended_commit="$PRE_FF"
+    recommended_label="PRE_FF (${PRE_FF})（两条链 head 均等于当前数据库版本 ${cur_dalton_rev}/${cur_upstream_rev}）"
+  elif [ "$target_matches" = "1" ]; then
+    recommended_commit="$target_ref"
+    recommended_label="TARGET (${target_ref})（两条链 head 均等于当前数据库版本 ${cur_dalton_rev}/${cur_upstream_rev}；PRE_FF 与当前数据库不一致）"
+  else
+    recommended_commit=""
+    recommended_label="无（PRE_FF 与 TARGET 均未满足“两条链 head 都等于数据库版本”；先不要重启后端）"
+  fi
+  reset_target="${recommended_commit:-<已核对一致的提交>}"
+
+  echo "AUTO-REVERT ABORTED — 原因：${reason}脚本不执行 git reset、不降级、不停服务，保持当前代码（HEAD=${cur_head}）与各服务现状。"
+  echo "部署记录: PRE_FF=${PRE_FF:-未知}, TARGET=${target_ref:-未知}, HEAD=${cur_head}, backend_touched=${BACKEND_TOUCHED}, crawler_touched=${CRAWLER_TOUCHED}, edge_touched=${EDGE_TOUCHED}, bridge_touched=${BRIDGE_TOUCHED}"
   echo "  Dalton 链 (alembic_version_dalton): 部署前=${PRE_FF_DALTON_REV:-未能读取}, 刚才读到=${cur_dalton_rev:-未能读取}"
   echo "  上游链   (alembic_version):        部署前=${PRE_FF_UPSTREAM_REV:-未能读取}, 刚才读到=${cur_upstream_rev:-未能读取}"
+  echo "  PRE_FF (${PRE_FF:-未知}) 迁移链 head: dalton=${pre_ff_dalton:-未能解析}, upstream=${pre_ff_upstream:-未能解析}"
+  echo "  TARGET (${target_ref:-未知}) 迁移链 head: dalton=${target_dalton:-未能解析}, upstream=${target_upstream:-未能解析}"
+  echo "  推荐复位目标: ${recommended_label}"
+  if [ -z "$recommended_commit" ]; then
+    echo "  【重要】PRE_FF 与 TARGET 均不满足“两条链 head 都等于当前数据库版本”：先不要重启后端！请先逐条核对数据库版本与候选提交，确认要部署哪个提交后再继续："
+    echo "     docker exec dalton-langalpha-postgres-1 psql -U postgres -d postgres -Atc \"SELECT version_num FROM alembic_version_dalton\""
+    echo "     docker exec dalton-langalpha-postgres-1 psql -U postgres -d postgres -Atc \"SELECT version_num FROM alembic_version\""
+    if [ -n "${PRE_FF:-}" ]; then
+      echo "     DALTON_DEPLOY_LIB_ONLY=1 bash -c 'source scripts/dalton/ops/prod/deploy_main.sh && target_migration_heads ${PRE_FF}'"
+    fi
+    if [ -n "$target_ref" ] && [ "$target_ref" != "unknown" ]; then
+      echo "     DALTON_DEPLOY_LIB_ONLY=1 bash -c 'source scripts/dalton/ops/prod/deploy_main.sh && target_migration_heads ${target_ref}'"
+    fi
+    echo "     git log --oneline -n 10"
+  fi
   echo "  注意：后端仍可能在运行或被看门狗重启，上面“刚才读到”的值随时可能变化，只作参考。"
   echo "以下命令都在部署检出根目录执行： cd ${REPO_ROOT}"
   echo "1. 排查（只读）："
   echo "     docker ps -a --filter name=dalton-langalpha-"
   echo "     docker logs --tail 100 dalton-langalpha-backend-1"
-  echo "2. 选择方案。方案 A（推荐）：后端能正常运行时保持新版本，修复问题后重新部署。方案 B：确需回到旧版本时，严格按 3–8 步顺序执行，任何一步不满足就停下。"
+  echo "2. 选择方案。方案 A（推荐）：后端能正常运行时保持当前版本，修复问题后重新部署。方案 B：确需手工复位或恢复时，严格按 3–9 步顺序执行，任何一步不满足就停下。"
   echo "3. 【方案 B】先停所有写入并暂停看门狗（docs/dalton/OPERATIONS.md §4），再确认后端已停："
   echo "     launchctl bootout gui/\$(id -u)/com.dalton.backend-watchdog"
   echo "     launchctl bootout gui/\$(id -u)/com.dalton.monitor-feeds"
@@ -639,15 +716,22 @@ _print_manual_revert_instructions() {
   if [ -z "$PRE_FF_DALTON_REV" ] || [ -z "$PRE_FF_UPSTREAM_REV" ]; then
     echo "   部署前版本未能读取：用部署前的备份（本次部署开始时生成的那份 dump）核实两条链的版本后再决定降级目标；不要仅凭 git 文件推断。"
   fi
-  echo "6. 【方案 B】仅对读数高于部署前版本的链执行降级（在维护容器里用当前新代码的迁移文件；后端已停，不用 docker exec）。"
+  echo "6. 【方案 B】仅对读数高于部署前版本且决定回退迁移的链执行降级（在维护容器里用当前新代码的迁移文件；后端已停，不用 docker exec）。"
   echo "   降级会执行沿途每个迁移的 downgrade()，可能删除新版本已写入的表或列：先逐个阅读这些 downgrade()，需要保留的数据先导出，再执行："
   echo "     docker compose run --rm --no-deps --entrypoint \"\" backend sh -c \"cd /app && uv run alembic -c src/dalton/alembic.ini downgrade ${PRE_FF_DALTON_REV:-<部署前Dalton版本>}\""
   echo "     docker compose run --rm --no-deps --entrypoint \"\" backend sh -c \"cd /app && uv run alembic -c alembic.ini downgrade ${PRE_FF_UPSTREAM_REV:-<部署前上游版本>}\""
-  echo "   降级后再读一次两条链的版本，必须等于部署前版本；不等就停下，切勿复位代码。"
-  echo "7. 【方案 B】复位代码、重建前端，并强制重建容器（后端仍处于停止状态才执行）："
-  echo "     git reset --keep ${PRE_FF:-<pre_ff>} && (cd web && pnpm install --frozen-lockfile) && bash scripts/dalton/build_frontend_prod.sh --require-supabase"
+  echo "   降级后再读一次两条链的版本，必须等于目标版本；不等就停下，切勿复位代码。"
+  echo "7. 【方案 B】打印所选提交的两条链 head，与第 5/6 步读到的数据库版本比对一致后再继续（不等就停下，先不要重启后端）："
+  echo "     DALTON_DEPLOY_LIB_ONLY=1 bash -c 'source scripts/dalton/ops/prod/deploy_main.sh && target_migration_heads ${reset_target}'"
+  if [ -n "$recommended_commit" ] && [ -n "${PRE_FF:-}" ] && [ "$recommended_commit" != "$PRE_FF" ]; then
+    echo "   如第 6 步已将数据库降级回部署前版本，把上面的提交换为对应历史提交（如 ${PRE_FF}）重新核对一致后再执行第 8 步。"
+  elif [ -z "$recommended_commit" ]; then
+    echo "   请把 <已核对一致的提交> 替换为两条链 head 均等于数据库版本的提交；确认一致前先不要重启后端。"
+  fi
+  echo "8. 【方案 B】确认第 7 步比对一致后，复位代码、重建前端，并强制重建容器（后端仍处于停止状态才执行）："
+  echo "     git reset --keep ${reset_target} && (cd web && pnpm install --frozen-lockfile) && bash scripts/dalton/build_frontend_prod.sh --require-supabase"
   echo "     docker compose up -d --no-deps --force-recreate backend crawler edge"
-  echo "8. 【方案 B】恢复宿主机服务与看门狗，并验证："
+  echo "9. 【方案 B】恢复宿主机服务与看门狗，并验证："
   echo "     launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.dalton.monitor-feeds.plist"
   echo "     launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.dalton.researchdata-bridge.plist"
   echo "     launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.dalton.channel-gateway.plist"
@@ -822,7 +906,7 @@ recent_ok_backup() {
 }
 
 # Prefer repo .venv/bin/python; fall back to python3 on PATH when absent.
-# Require Python >= 3.9.
+# Require Python >= 3.11.
 _resolve_deploy_python() {
   local py="" ver=""
   if [ -x "${REPO_ROOT}/.venv/bin/python" ]; then
@@ -830,21 +914,37 @@ _resolve_deploy_python() {
   elif command -v python3 >/dev/null 2>&1; then
     py=$(command -v python3)
   else
-    echo "ERROR: target_migration_heads: Python >= 3.9 not found (checked ${REPO_ROOT}/.venv/bin/python and python3 on PATH)" >&2
+    echo "ERROR: target_migration_heads: Python >= 3.11 not found (checked ${REPO_ROOT}/.venv/bin/python and python3 on PATH)" >&2
     return 1
   fi
-  if ! "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+  if ! "$py" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)' >/dev/null 2>&1; then
     ver=$("$py" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "unknown")
-    echo "ERROR: target_migration_heads: Python >= 3.9 required, got ${py} (${ver})" >&2
+    echo "ERROR: target_migration_heads: Python >= 3.11 required, got ${py} (${ver})" >&2
     return 1
   fi
   printf '%s' "$py"
 }
 
+# Reject untracked, modified, or staged files in either migration directory before backup or ff.
+check_clean_migration_dirs() {
+  local dirty=""
+  if ! dirty=$(git status --porcelain --untracked-files=all -- migrations/versions src/dalton/migrations/versions); then
+    echo "ERROR: failed to inspect migration directories via git status, abort" >&2
+    return 1
+  fi
+  if [ -n "$dirty" ]; then
+    echo "ERROR: 迁移目录下存在未提交的文件（未跟踪、已修改或已暂存），先清理或提交后再部署:" >&2
+    printf '%s\n' "$dirty" >&2
+    return 1
+  fi
+  return 0
+}
+
 # Print "<dalton_head> <upstream_head>" for git commit $1 by reading revision and down_revision
 # from git history via git ls-tree / git show (no container alembic, no working-tree ff required).
-# Fails if $1 is invalid, a chain has no migration files, a file is invalid/duplicated,
-# any down_revision is missing from its chain, or either chain does not resolve to a single unique head.
+# Fails if $1 is invalid, a chain has no migration files, a file is missing revision/down_revision
+# or duplicated, any down_revision is missing from its chain, either chain does not resolve to a
+# single unique head, or walking down_revision from the head misses revisions / hits a cycle.
 target_migration_heads() {
   local commit="${1:-}" py=""
   if [ -z "$commit" ]; then
@@ -879,6 +979,7 @@ def _extract_rev_and_down(src: str, path: str):
 
     rev = None
     down = None
+    has_rev = False
     has_down = False
     for node in tree.body:
         names = []
@@ -891,6 +992,7 @@ def _extract_rev_and_down(src: str, path: str):
             value_node = node.value
 
         if "revision" in names:
+            has_rev = True
             try:
                 rev = ast.literal_eval(value_node)
             except Exception as exc:
@@ -902,11 +1004,13 @@ def _extract_rev_and_down(src: str, path: str):
             except Exception as exc:
                 raise RuntimeError(f"cannot evaluate down_revision in {path}: {exc}") from exc
 
-    if not isinstance(rev, str) or not rev or any(ch.isspace() for ch in rev):
+    if not has_rev or not isinstance(rev, str) or not rev or any(ch.isspace() for ch in rev):
         raise RuntimeError(f"missing or invalid revision in {path}: {rev!r}")
+    if not has_down:
+        raise RuntimeError(f"missing down_revision in {path}")
 
     parents = []
-    if not has_down or down is None:
+    if down is None:
         pass
     elif isinstance(down, str):
         if not down:
@@ -993,7 +1097,44 @@ def _chain_head(label: str, directory: str) -> str:
         raise RuntimeError(
             f"{label} chain ({directory}) in {commit} expected 1 head, found {len(heads)}: {', '.join(heads) or 'none'}"
         )
-    return heads[0]
+
+    head = heads[0]
+    state = {}  # 1 = visiting, 2 = visited
+    stack = [(head, 0)]
+    while stack:
+        node, idx = stack[-1]
+        if idx == 0:
+            state[node] = 1
+        downs = rev_downs[node]
+        if idx < len(downs):
+            stack[-1] = (node, idx + 1)
+            parent = downs[idx]
+            pstate = state.get(parent, 0)
+            if pstate == 1:
+                raise RuntimeError(
+                    f"{label} chain ({directory}) in {commit} has incomplete migration graph (图不完整): cycle involving {node} -> {parent}"
+                )
+            if pstate == 0:
+                stack.append((parent, 0))
+        else:
+            state[node] = 2
+            stack.pop()
+
+    unreachable = sorted(set(revs) - set(state))
+    if unreachable:
+        details = ", ".join(f"{r} ({revs[r]})" for r in unreachable)
+        raise RuntimeError(
+            f"{label} chain ({directory}) in {commit} has incomplete migration graph (图不完整): unreachable revision(s): {details}"
+        )
+
+    roots = sorted(r for r, ds in rev_downs.items() if not ds)
+    if len(roots) != 1:
+        details = ", ".join(f"{r} ({revs[r]})" for r in roots) or "none"
+        raise RuntimeError(
+            f"{label} chain ({directory}) in {commit} expected 1 root (down_revision = None), found {len(roots)}: {details}"
+        )
+
+    return head
 
 
 try:
@@ -1043,17 +1184,18 @@ compute_migrating_deploy() {
 }
 
 run_deploy_main() {
-  local LOG before after out build_rc cur reused TARGET target_heads post_ff_head
+  local LOG before after out build_rc cur reused target_heads post_ff_head
   parse_deploy_args "$@" || exit $?
   cd "$REPO_ROOT" || exit 1
   cleanup_old_container_logs
+  TARGET=""
+  bash "$WAIT_IDLE_SCRIPT" || { echo "still busy, abort"; exit 1; }
   PRE_FF_DALTON_REV=$(get_dalton_alembic_version || true)
   PRE_FF_UPSTREAM_REV=$(get_upstream_alembic_version || true)
   echo "pre-deploy migrations: dalton=${PRE_FF_DALTON_REV:-未能读取}, upstream=${PRE_FF_UPSTREAM_REV:-未能读取}"
   if [ -z "$PRE_FF_DALTON_REV" ] || [ -z "$PRE_FF_UPSTREAM_REV" ]; then
     echo "pre-deploy migrations: DB version unreadable; treating as migrating deploy (fresh backup required, no auto-revert)"
   fi
-  bash "$WAIT_IDLE_SCRIPT" || { echo "still busy, abort"; exit 1; }
   git fetch -q origin || { echo "git fetch failed, abort"; exit 1; }
   TARGET=$(git rev-parse --verify origin/dalton/main 2>/dev/null) || { echo "cannot resolve origin/dalton/main, abort"; exit 1; }
   echo "deploy target: ${TARGET} ($(git log -1 --oneline "$TARGET" 2>/dev/null || printf '%s' "$TARGET"))"
@@ -1061,6 +1203,7 @@ run_deploy_main() {
     echo "ERROR: 生产检出上有不在 origin/dalton/main 里的提交，先处理再部署 (HEAD=$(git rev-parse --short=9 HEAD 2>/dev/null || echo unknown), TARGET=${TARGET})" >&2
     exit 1
   fi
+  check_clean_migration_dirs || exit 1
   target_heads=$(target_migration_heads "$TARGET") || { echo "ERROR: failed to resolve unique migration heads for target ${TARGET}, abort" >&2; exit 1; }
   echo "target migration heads: ${target_heads}"
   LOG="${DALTON_PG_BACKUP_LOG:-$HOME/Library/Logs/dalton-pg-backup.log}"; before=$(tail -1 "$LOG" 2>/dev/null)
