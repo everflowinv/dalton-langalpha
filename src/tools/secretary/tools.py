@@ -1321,13 +1321,17 @@ _COS_ZIP_CHUNK_BYTES = 64 * 1024
 # DALTON-HOOK(colleague-access): refuse macro-enabled Office formats (new and legacy OLE) and scan OOXML parts with the text secret redactor
 _COS_MACRO_OFFICE_EXTENSIONS = frozenset({".xlsm", ".docm", ".pptm", ".xlam"})
 _COS_MACRO_OFFICE_REFUSED_ERROR = (
-    "带宏的 Office 文件（.xlsm、.docm、.pptm、.xlam 或含 VBA 宏的 .xls/.doc/.ppt/.xlsx/.docx/.pptx）"
+    "带宏的 Office 文件（.xlsm、.docm、.pptm、.xlam 或含 VBA 宏的 .xls/.doc/.xlsx/.docx/.pptx）"
     "不支持通过 copy_file 复制，因为宏项目可能包含无法安全核验的代码或凭据；"
     "请另存为无宏格式（.xlsx、.docx、.pptx）后再复制。"
 )
+_COS_LEGACY_PPT_EXTENSIONS = frozenset({".ppt"})
+_COS_LEGACY_PPT_REFUSED_ERROR = (
+    "老格式 PowerPoint（.ppt）可能内嵌宏，无法检查。请让对方另存为 .pptx 后再复制。"
+)
 _COS_ZIP_CONTAINER_EXTENSIONS = frozenset({".xlsx", ".docx", ".pptx"})
 _COS_OOXML_XML_EXTENSIONS = frozenset({".xml", ".rels"})
-_COS_LEGACY_OFFICE_EXTENSIONS = frozenset({".xls", ".doc", ".ppt"})
+_COS_LEGACY_OFFICE_EXTENSIONS = frozenset({".xls", ".doc"})
 _OLE_VBA_DIR_NAMES = frozenset(
     {"_vba_project", "_vba_project_cur", "vba", "macros", "vbaproject"}
 )
@@ -1399,7 +1403,7 @@ _COS_ARCHIVE_SIGNATURES = (
 )
 _COS_COPY_UNSUPPORTED_ERROR = (
     "copy_file supports binary Office (.xlsx, .docx, .pptx, .xls, "
-    ".doc, .ppt), PDF (.pdf), and image (.png, .jpg, .jpeg, .gif, .webp, "
+    ".doc), PDF (.pdf), and image (.png, .jpg, .jpeg, .gif, .webp, "
     ".bmp, .tiff) files up to 50 MB, and UTF-8 text files (.md, .markdown, "
     ".txt, .csv, .tsv, .json, .jsonl, .yaml, .yml, .py, .sql, .html, .xml, "
     ".log) up to 5 MB. Use read_file to read other text files."
@@ -1448,6 +1452,11 @@ def _cos_read_channel_max_bytes(sandbox: Any) -> int:
 def _is_macro_office_extension(file_path: str) -> bool:
     _, ext = os.path.splitext(file_path)
     return ext.lower() in _COS_MACRO_OFFICE_EXTENSIONS
+
+
+def _is_legacy_ppt_extension(file_path: str) -> bool:
+    _, ext = os.path.splitext(file_path)
+    return ext.lower() in _COS_LEGACY_PPT_EXTENSIONS
 
 
 def _is_allowed_binary_copy_extension(file_path: str) -> bool:
@@ -1518,13 +1527,102 @@ def _has_archive_signature(buf: bytes) -> bool:
     return any(buf.startswith(sig) for sig in _COS_ARCHIVE_SIGNATURES)
 
 
+def _read_zip_eocd_member_count(buf: bytes) -> int | None:
+    """Read the total entry count from the ZIP End of Central Directory (and
+    ZIP64 EOCD when present/required) without opening ``zipfile.ZipFile``.
+
+    Returns ``None`` if no valid EOCD (or required ZIP64 EOCD) record can be
+    read from the tail of ``buf``.
+    """
+    import struct
+
+    buf_len = len(buf)
+    if buf_len < 22:
+        return None
+    min_start = max(0, buf_len - 22 - 65535)
+    search_end = buf_len
+    eocd_pos = -1
+    while search_end >= min_start + 4:
+        pos = buf.rfind(b"PK\x05\x06", min_start, search_end)
+        if pos < 0:
+            return None
+        if pos + 22 <= buf_len:
+            comment_len = struct.unpack_from("<H", buf, pos + 20)[0]
+            if pos + 22 + comment_len == buf_len:
+                eocd_pos = pos
+                break
+        search_end = pos
+    if eocd_pos < 0:
+        return None
+
+    (
+        _sig,
+        disk_num,
+        cd_disk,
+        disk_entries,
+        total_entries,
+        cd_size,
+        cd_offset,
+        _comment_len,
+    ) = struct.unpack_from("<4sHHHHIIH", buf, eocd_pos)
+
+    needs_zip64 = (
+        disk_num == 0xFFFF
+        or cd_disk == 0xFFFF
+        or disk_entries == 0xFFFF
+        or total_entries == 0xFFFF
+        or cd_size == 0xFFFFFFFF
+        or cd_offset == 0xFFFFFFFF
+    )
+    has_zip64_locator = (
+        eocd_pos >= 20 and buf[eocd_pos - 20 : eocd_pos - 16] == b"PK\x06\x07"
+    )
+    if needs_zip64 or has_zip64_locator:
+        if not has_zip64_locator:
+            return None
+        locator_pos = eocd_pos - 20
+        _loc_sig, _z64_disk, z64_offset, _total_disks = struct.unpack_from(
+            "<4sIQI", buf, locator_pos
+        )
+        if z64_offset + 56 > locator_pos:
+            return None
+        if buf[z64_offset : z64_offset + 4] != b"PK\x06\x06":
+            return None
+        (
+            _z64_sig,
+            z64_size,
+            _ver_made,
+            _ver_needed,
+            _z64_disk_num,
+            _z64_cd_disk,
+            z64_disk_entries,
+            z64_total_entries,
+            _z64_cd_size,
+            _z64_cd_offset,
+        ) = struct.unpack_from("<4sQHHIIQQQQ", buf, z64_offset)
+        if z64_size < 44 or z64_offset + 12 + z64_size > locator_pos:
+            return None
+        candidates = [z64_disk_entries, z64_total_entries]
+        if disk_entries != 0xFFFF:
+            candidates.append(disk_entries)
+        if total_entries != 0xFFFF:
+            candidates.append(total_entries)
+        return max(candidates)
+
+    return max(disk_entries, total_entries)
+
+
 def _is_ooxml_zip_bytes(buf: bytes) -> bool:
-    """Return True if ``buf`` starts with ``PK\\x03\\x04`` and is a valid zip
-    archive containing ``[Content_Types].xml``."""
+    """Return True if ``buf`` starts with ``PK\\x03\\x04``, has a valid EOCD
+    within ``_COS_ZIP_MAX_MEMBERS``, and is a valid zip archive containing
+    ``[Content_Types].xml``."""
     import io
     import zipfile
 
     if not buf.startswith(b"PK\x03\x04"):
+        return False
+    member_count = _read_zip_eocd_member_count(buf)
+    if member_count is None or member_count > _COS_ZIP_MAX_MEMBERS:
         return False
     try:
         with zipfile.ZipFile(io.BytesIO(buf)) as zf:
@@ -1561,6 +1659,13 @@ def _validate_copy_file_format(file_path: str, content: bytes) -> str | None:
     elif ext_lower in _COS_LEGACY_OFFICE_EXTENSIONS:
         ok = content.startswith(_OLE_HEADER)
     elif ext_lower in _COS_ZIP_CONTAINER_EXTENSIONS:
+        if not content.startswith(b"PK\x03\x04"):
+            return _COS_FORMAT_MISMATCH_ERROR
+        member_count = _read_zip_eocd_member_count(content)
+        if member_count is None:
+            return _COS_FORMAT_MISMATCH_ERROR
+        if member_count > _COS_ZIP_MAX_MEMBERS:
+            return "压缩容器成员数量超出安全上限，不能拷贝"
         ok = _is_ooxml_zip_bytes(content)
     else:
         ok = False
@@ -1697,7 +1802,7 @@ def _decode_pdf_text_filters(stream: Any, chain: list[Any]) -> bytes:
 
 
 def _ole_has_vba_macros(content: bytes) -> bool:
-    """Detect VBA macro storages/streams in a legacy OLE2 document (.xls/.doc/.ppt).
+    """Detect VBA macro storages/streams in a legacy OLE2 document (.xls/.doc).
 
     Parses the OLE2 directory tree via ``xlrd.compdoc.CompDoc`` (declared
     project dependency) so ordinary UTF-16LE body text mentioning words like
@@ -1742,6 +1847,8 @@ def _scan_copy_bytes_for_secrets(
 
     _, ext = os.path.splitext(file_path)
     ext_lower = ext.lower()
+    if ext_lower in _COS_LEGACY_PPT_EXTENSIONS:
+        return _COS_LEGACY_PPT_REFUSED_ERROR
     if ext_lower in _COS_MACRO_OFFICE_EXTENSIONS:
         return _COS_MACRO_OFFICE_REFUSED_ERROR
 
@@ -1811,6 +1918,11 @@ def _scan_copy_bytes_for_secrets(
         scan_state = {"total_bytes": 0, "members": 0}
 
         def _scan_ooxml_container(zip_bytes: bytes, depth: int) -> str | None:
+            eocd_members = _read_zip_eocd_member_count(zip_bytes)
+            if eocd_members is None:
+                return "压缩容器无法解压核验，不能拷贝"
+            if scan_state["members"] + eocd_members > _COS_ZIP_MAX_MEMBERS:
+                return "压缩容器成员数量超出安全上限，不能拷贝"
             try:
                 with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
                     infos = zf.infolist()
@@ -1820,10 +1932,19 @@ def _scan_copy_bytes_for_secrets(
                     for info in infos:
                         if info.compress_type not in allowed_compress_types:
                             return "压缩容器使用了不支持的压缩方式，不能拷贝"
+                        if info.filename.endswith("/"):
+                            if info.file_size > 0:
+                                return "压缩容器格式异常，不能拷贝"
+                            with zf.open(info) as dir_fp:
+                                if dir_fp.read(1):
+                                    return "压缩容器格式异常，不能拷贝"
+                            continue
                         if info.is_dir():
                             continue
                         _, member_ext = os.path.splitext(info.filename)
                         member_ext_lower = member_ext.lower()
+                        if member_ext_lower in _COS_LEGACY_PPT_EXTENSIONS:
+                            return _COS_LEGACY_PPT_REFUSED_ERROR
                         if member_ext_lower in _COS_MACRO_OFFICE_EXTENSIONS:
                             return _COS_MACRO_OFFICE_REFUSED_ERROR
                         if _COS_OOXML_VBA_MACRO_PART.fullmatch(info.filename):
@@ -1886,6 +2007,11 @@ def _scan_copy_bytes_for_secrets(
                             member_bytes.startswith(b"PK\x03\x04")
                             or member_ext_lower in _COS_ZIP_CONTAINER_EXTENSIONS
                         ):
+                            nested_eocd = _read_zip_eocd_member_count(member_bytes)
+                            if nested_eocd is None:
+                                return "压缩容器内嵌压缩包，不能拷贝"
+                            if scan_state["members"] + nested_eocd > _COS_ZIP_MAX_MEMBERS:
+                                return "压缩容器成员数量超出安全上限，不能拷贝"
                             if not _is_ooxml_zip_bytes(member_bytes):
                                 return "压缩容器内嵌压缩包，不能拷贝"
                             if depth >= _COS_OOXML_MAX_RECURSION_DEPTH:
@@ -2009,17 +2135,123 @@ def _bash_succeeded(res: Any) -> bool:
     return bool(res.get("success"))
 
 
+_COS_COPY_UPLOAD_DRAIN_TIMEOUT_S = 30.0
+_COS_COPY_CLEANUP_TIMEOUT_S = 20.0
+
+
+def _consume_task_exception(task: asyncio.Task[Any]) -> None:
+    if task.done() and not task.cancelled():
+        task.exception()
+
+
+async def _drain_cancelled_upload(
+    upload_task: asyncio.Task[Any],
+    tmp_abs: str,
+    *,
+    timeout: float = _COS_COPY_UPLOAD_DRAIN_TIMEOUT_S,
+) -> asyncio.CancelledError | None:
+    """Wait via ``asyncio.shield`` for an in-flight upload task to finish before
+    cleaning up ``tmp_abs`` so a background upload thread cannot recreate the
+    staging file after ``rm -f`` returns.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    caught_cancel: asyncio.CancelledError | None = None
+    cancel_hits = 0
+    while not upload_task.done():
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.warning(
+                f"Timed out waiting for cancelled upload to finish; temp copy file may remain at {tmp_abs}"
+            )
+            upload_task.add_done_callback(_consume_task_exception)
+            break
+        try:
+            await asyncio.wait_for(asyncio.shield(upload_task), timeout=remaining)
+        except asyncio.CancelledError as exc:
+            caught_cancel = exc
+            cancel_hits += 1
+            if cancel_hits >= 5:
+                logger.warning(
+                    f"Cancelled while waiting for upload to finish; temp copy file may remain at {tmp_abs}"
+                )
+                upload_task.add_done_callback(_consume_task_exception)
+                break
+        except TimeoutError:
+            logger.warning(
+                f"Timed out waiting for cancelled upload to finish; temp copy file may remain at {tmp_abs}"
+            )
+            upload_task.add_done_callback(_consume_task_exception)
+            break
+        except Exception:
+            break
+    _consume_task_exception(upload_task)
+    return caught_cancel
+
+
 async def _remove_temp_copy_file(sandbox: Any, tmp_abs: str) -> None:
-    try:
-        res = await sandbox.execute_bash_command(
+    """Remove ``tmp_abs`` inside a shielded task so cleanup still runs even when
+    the caller task is cancelled; catches ``CancelledError``, finishes cleanup
+    (up to a timeout), logs a warning with ``tmp_abs`` on failure/timeout, and
+    re-raises the ``CancelledError``.
+    """
+
+    async def _do_remove() -> Any:
+        return await sandbox.execute_bash_command(
             command=f"rm -f -- {shlex.quote(tmp_abs)}", timeout=15
         )
-        if not _bash_succeeded(res):
+
+    rm_task = asyncio.create_task(_do_remove())
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _COS_COPY_CLEANUP_TIMEOUT_S
+    caught_cancel: asyncio.CancelledError | None = None
+    cancel_hits = 0
+    try:
+        while not rm_task.done():
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(
+                    f"Timed out removing temp copy file; temp copy file may remain at {tmp_abs}"
+                )
+                rm_task.add_done_callback(_consume_task_exception)
+                return
+            try:
+                await asyncio.wait_for(asyncio.shield(rm_task), timeout=remaining)
+            except asyncio.CancelledError as exc:
+                caught_cancel = exc
+                cancel_hits += 1
+                if cancel_hits >= 5:
+                    logger.warning(
+                        f"Cancelled while removing temp copy file; temp copy file may remain at {tmp_abs}"
+                    )
+                    rm_task.add_done_callback(_consume_task_exception)
+                    return
+            except TimeoutError:
+                logger.warning(
+                    f"Timed out removing temp copy file; temp copy file may remain at {tmp_abs}"
+                )
+                rm_task.add_done_callback(_consume_task_exception)
+                return
+            except Exception as exc:
+                logger.warning(f"Failed to remove temp copy file {tmp_abs}: {exc}")
+                return
+        if rm_task.done() and not rm_task.cancelled():
+            exc = rm_task.exception()
+            if exc is not None:
+                logger.warning(f"Failed to remove temp copy file {tmp_abs}: {exc}")
+            else:
+                res = rm_task.result()
+                if not _bash_succeeded(res):
+                    logger.warning(
+                        f"Failed to remove temp copy file {tmp_abs}: non-zero exit ({res})"
+                    )
+        elif rm_task.cancelled():
             logger.warning(
-                f"Failed to remove temp copy file {tmp_abs}: non-zero exit ({res})"
+                f"Cleanup task cancelled; temp copy file may remain at {tmp_abs}"
             )
-    except Exception as exc:
-        logger.warning(f"Failed to remove temp copy file {tmp_abs}: {exc}")
+    finally:
+        if caught_cancel is not None:
+            raise caught_cancel
 
 
 # DALTON-HOOK(colleague-access): shared server-side copy engine used by CoS and analyst colleague_workspace
@@ -2099,6 +2331,8 @@ async def _workspace_file_copy_server(
             )
             if not file_record:
                 return error_command("file not found", tool_call_id)
+            if _is_legacy_ppt_extension(normalized_path):
+                return error_command(_COS_LEGACY_PPT_REFUSED_ERROR, tool_call_id)
             if _is_macro_office_extension(normalized_path):
                 return error_command(_COS_MACRO_OFFICE_REFUSED_ERROR, tool_call_id)
             if not _is_allowed_copy_extension(normalized_path):
@@ -2130,6 +2364,8 @@ async def _workspace_file_copy_server(
                 )
             source_client_path = normalized_path
         else:
+            if _is_legacy_ppt_extension(normalized_path):
+                return error_command(_COS_LEGACY_PPT_REFUSED_ERROR, tool_call_id)
             if _is_macro_office_extension(normalized_path):
                 return error_command(_COS_MACRO_OFFICE_REFUSED_ERROR, tool_call_id)
             if not _is_allowed_copy_extension(normalized_path):
@@ -2159,6 +2395,8 @@ async def _workspace_file_copy_server(
             source_client_path = _to_client_path(sandbox, normalized, work_dir)
             if source_path_blocked(source_client_path):
                 return error_command("file not found", tool_call_id)
+            if _is_legacy_ppt_extension(source_client_path):
+                return error_command(_COS_LEGACY_PPT_REFUSED_ERROR, tool_call_id)
             if _is_macro_office_extension(source_client_path):
                 return error_command(_COS_MACRO_OFFICE_REFUSED_ERROR, tool_call_id)
             if not _is_allowed_copy_extension(source_client_path):
@@ -2273,7 +2511,7 @@ async def _workspace_file_copy_server(
             # DALTON-HOOK(colleague-access): prepare staging and destination dirs first,
             # stage under .agents/tmp/colleague-copy-<uuid> (excluded from panel, backups,
             # and transfer runtime .wsfiles-* orphan sweep), re-verify permissions right
-            # before `mv -T`, and clean up on any exception/cancellation/refusal.
+            # before POSIX rename, and clean up (shielded) on any exception/cancellation/refusal.
             from ptc_agent.core.paths import SandboxLayout
 
             staging_dir = f"{dest_work_dir.rstrip('/')}/{SandboxLayout.TMP_DIR}"
@@ -2288,27 +2526,34 @@ async def _workspace_file_copy_server(
             if not _bash_succeeded(prep_res):
                 return error_command("Copy failed", tool_call_id)
             committed = False
+            upload_task: asyncio.Task[Any] | None = None
             try:
-                ok = await dest_sandbox.aupload_file_bytes(tmp_abs, content)
+                async def _do_upload() -> Any:
+                    return await dest_sandbox.aupload_file_bytes(tmp_abs, content)
+
+                upload_task = asyncio.create_task(_do_upload())
+                ok = await asyncio.shield(upload_task)
                 if not ok:
                     return error_command("Copy failed", tool_call_id)
-                # Re-check source read (and analyst destination write) permissions
-                # immediately before the rename. The tiny remaining window between
-                # this re-check and `mv -T` is accepted; we intentionally do not use
-                # an fd-based rename because only the sandbox's own agent can swap
-                # directories inside the sandbox, and it can already write there.
-                if recheck_source_access is not None:
-                    recheck_err = await recheck_source_access()
-                    if recheck_err is not None:
-                        return recheck_err
+                # Re-check analyst destination write permission FIRST, then source
+                # read permission IMMEDIATELY before the rename so no DB query sits
+                # between the source re-check and the rename.
                 if recheck_dest_access is not None:
                     dest_err = await recheck_dest_access()
                     if dest_err is not None:
                         return dest_err
-                mv_cmd = (
-                    f"test ! -d {shlex.quote(dest_abs)} && "
-                    f"mv -T -f -- {shlex.quote(tmp_abs)} {shlex.quote(dest_abs)}"
-                )
+                if recheck_source_access is not None:
+                    recheck_err = await recheck_source_access()
+                    if recheck_err is not None:
+                        return recheck_err
+                # Avoid GNU-only `mv -T` (macOS `/bin/mv` fails with `illegal option -- T`).
+                # Verify `[ ! -d "$dst" ]` first (fail if destination is a directory), then
+                # run POSIX `mv -f -- "$src" "$dst"`. The tiny window between `[ ! -d ... ]`
+                # and `mv -f` is accepted because only the sandbox's own agent can create a
+                # directory at that location, and it already has write access there.
+                dst_q = shlex.quote(dest_abs)
+                src_q = shlex.quote(tmp_abs)
+                mv_cmd = f"[ ! -d {dst_q} ] && mv -f -- {src_q} {dst_q}"
                 mv_res = await dest_sandbox.execute_bash_command(
                     command=mv_cmd, timeout=30
                 )
@@ -2317,7 +2562,18 @@ async def _workspace_file_copy_server(
                 committed = True
             finally:
                 if not committed:
-                    await _remove_temp_copy_file(dest_sandbox, tmp_abs)
+                    drain_cancel: asyncio.CancelledError | None = None
+                    if upload_task is not None and not upload_task.done():
+                        drain_cancel = await _drain_cancelled_upload(
+                            upload_task,
+                            tmp_abs,
+                            timeout=_COS_COPY_UPLOAD_DRAIN_TIMEOUT_S,
+                        )
+                    try:
+                        await _remove_temp_copy_file(dest_sandbox, tmp_abs)
+                    finally:
+                        if drain_cancel is not None:
+                            raise drain_cancel
         return success_command(
             {
                 "success": True,

@@ -117,7 +117,7 @@ def _is_non_owner_sensitive_basename(basename: str) -> bool:
     lower = basename.strip().lower()
     if not lower:
         return True
-    if lower == ".env" or lower.startswith(".env.") or ".env." in lower:
+    if lower.startswith(".env"):
         return True
     if lower in _NON_OWNER_SENSITIVE_EXACT_BASENAMES:
         return True
@@ -134,7 +134,6 @@ def _is_non_owner_sensitive_basename(basename: str) -> bool:
         or lower.endswith(_NON_OWNER_SENSITIVE_CONFIG_SUFFIXES)
         or lower.startswith(".env")
         or lower.endswith(".env")
-        or ".env." in lower
     )
     if is_config_or_extensionless and any(
         sub in lower for sub in _NON_OWNER_SENSITIVE_SUBSTRINGS

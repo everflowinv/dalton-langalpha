@@ -332,7 +332,7 @@ def create_colleague_workspace_tools() -> list[BaseTool]:
     ) -> Command:
         """读取用户自己的其他工作区或同事的工作区中的文件与对话，或将文件原样复制到当前工作区。
 
-        仅限访问 Home（个人主页）以外的其他工作区，且只向当前工作区复制文件。copy_file 仅支持 50 MB 以内的二进制文件——Office（办公文档：.xlsx、.docx、.pptx、.xls、.doc、.ppt）、PDF（便携式文档：.pdf）和图片（.png、.jpg、.jpeg、.gif、.webp、.bmp、.tiff）——以及 5 MB 以内的 UTF-8（通用字符编码）文本文件（.md、.markdown、.txt、.csv、.tsv、.json、.jsonl、.yaml、.yml、.py、.sql、.html、.xml、.log）；其他文本文件请用 read_file 读取。
+        仅限访问 Home（个人主页）以外的其他工作区，且只向当前工作区复制文件。copy_file 仅支持 50 MB 以内的二进制文件——Office（办公文档：.xlsx、.docx、.pptx、.xls、.doc；老格式 .ppt 可能内嵌宏无法检查，一律拒绝，请让对方另存为 .pptx 后再复制）、PDF（便携式文档：.pdf）和图片（.png、.jpg、.jpeg、.gif、.webp、.bmp、.tiff）——以及 5 MB 以内的 UTF-8（通用字符编码）文本文件（.md、.markdown、.txt、.csv、.tsv、.json、.jsonl、.yaml、.yml、.py、.sql、.html、.xml、.log）；其他文本文件请用 read_file 读取。
 
         Args:
             action: "list_workspaces"（列出本轮可访问的其他工作区，含已停止的工作区；在同事的工作区运行时仅包含发消息的人与工作区主人均有权访问的工作区）、"list_files"（列出目标工作区文件路径）、"read_file"（读取文本文件）、"copy_file"（复制文件到当前工作区）、"list_threads"（列出最近 20 条对话）或 "read_thread"（读取对话回复，含运行中的对话）。

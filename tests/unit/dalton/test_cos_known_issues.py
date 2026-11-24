@@ -778,11 +778,17 @@ class TestHomeStandInRefusal:
             NORMAL_WS_ID: NORMAL_SHARED_WS_ROW,
         }
         orig_dispatch_enabled = dalton_settings_mod.is_colleague_dispatch_enabled
+        orig_user_cos_sharing = sharing_mod.get_user_cos_sharing
         _patch_sharing_env(monkeypatch, ws_map, cos_access="rw", web_access="hidden")
         monkeypatch.setattr(
             sharing_mod,
             "is_colleague_dispatch_enabled",
             create_autospec(orig_dispatch_enabled, return_value=True),
+        )
+        monkeypatch.setattr(
+            sharing_mod,
+            "get_user_cos_sharing",
+            create_autospec(orig_user_cos_sharing, return_value={"cos_rw_enabled": True}),
         )
 
         # Partial dict omitting "config" must query DB and still return 404 (not assume non-stand-in)
@@ -797,11 +803,6 @@ class TestHomeStandInRefusal:
             )
         assert exc_partial_sharing.value.status_code == 404
         assert exc_partial_sharing.value.detail == "Workspace not found"
-
-        with pytest.raises(HTTPException) as exc_partial_generic:
-            await shared_access_mod.workspace_access(partial_stand_in, COLLEAGUE_ID)
-        assert exc_partial_generic.value.status_code == 404
-        assert exc_partial_generic.value.detail == "Workspace not found"
 
         # Pre-existing cross-user thread in owner's Home stand-in: web thread-initiator fast path
         # MUST NOT bypass workspace ownership / stand-in check, and returns "Thread not found".
@@ -847,6 +848,217 @@ class TestHomeStandInRefusal:
         # Invisible workspace in require_thread_access normalizes 404 detail to "Thread not found"
         assert exc_hidden_ws_t.value.status_code == 404
         assert exc_hidden_ws_t.value.detail == "Thread not found"
+
+    @pytest.mark.asyncio
+    async def test_partial_dict_refetch_missing_returns_404_and_runs_after_hidden_and_ro(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """R4 item 3: missing DB row on refetch returns 404 (not stale dict), and
+        refetch runs after hidden (404) and ro+write (403) so timeouts never turn
+        existing 404/403 refusals into 503."""
+        partial_ws = {
+            "workspace_id": NORMAL_WS_ID,
+            "user_id": OWNER_ID,
+            "status": "running",
+        }
+
+        orig_get_ws = ws_db_mod.get_workspace
+        orig_get_sharing = sharing_mod.get_workspace_sharing
+
+        # 1) Refetch returns None (deleted workspace) -> uniform 404, not authorized
+        _patch_sharing_env(monkeypatch, {}, cos_access="rw", web_access="rw")
+        with pytest.raises(HTTPException) as exc_gone:
+            await sharing_mod.require_workspace_access(
+                partial_ws, COLLEAGUE_ID, channel="cos", need="read"
+            )
+        assert exc_gone.value.status_code == 404
+        assert exc_gone.value.detail == "Workspace not found"
+
+        # 2) hidden workspace -> returns 404 without calling get_workspace (even if DB times out)
+        monkeypatch.setattr(
+            sharing_mod,
+            "get_workspace_sharing",
+            create_autospec(
+                orig_get_sharing,
+                return_value={
+                    "workspace_id": NORMAL_WS_ID,
+                    "cos_access": "hidden",
+                    "web_access": "hidden",
+                    "updated_by": OWNER_ID,
+                    "updated_at": None,
+                },
+            ),
+        )
+        timeout_get_ws = create_autospec(
+            orig_get_ws, side_effect=TimeoutError("db timeout")
+        )
+        monkeypatch.setattr(ws_db_mod, "get_workspace", timeout_get_ws)
+        with pytest.raises(HTTPException) as exc_hidden:
+            await sharing_mod.require_workspace_access(
+                partial_ws, COLLEAGUE_ID, channel="web", need="read"
+            )
+        assert exc_hidden.value.status_code == 404
+        assert exc_hidden.value.detail == "Workspace not found"
+        timeout_get_ws.assert_not_awaited()
+
+        # 3) ro workspace with need="write" -> returns 403 without calling get_workspace
+        monkeypatch.setattr(
+            sharing_mod,
+            "get_workspace_sharing",
+            create_autospec(
+                orig_get_sharing,
+                return_value={
+                    "workspace_id": NORMAL_WS_ID,
+                    "cos_access": "ro",
+                    "web_access": "ro",
+                    "updated_by": OWNER_ID,
+                    "updated_at": None,
+                },
+            ),
+        )
+        timeout_get_ws_ro = create_autospec(
+            orig_get_ws, side_effect=TimeoutError("db timeout")
+        )
+        monkeypatch.setattr(ws_db_mod, "get_workspace", timeout_get_ws_ro)
+        with pytest.raises(HTTPException) as exc_ro:
+            await sharing_mod.require_workspace_access(
+                partial_ws, COLLEAGUE_ID, channel="web", need="write"
+            )
+        assert exc_ro.value.status_code == 403
+        assert exc_ro.value.detail == "Forbidden"
+        timeout_get_ws_ro.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_shared_workspaces_access_decides_from_the_row_without_a_lookup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``workspace_access`` gets a full ``get_workspace`` row, so the stand-in
+        check reads that row and never queries again: a stand-in row is 404 to a
+        non-owner, and a row without ``config`` keeps the plain 403."""
+        get_ws = create_autospec(
+            ws_db_mod.get_workspace,
+            side_effect=RuntimeError("Conversation database pool is not open"),
+        )
+        monkeypatch.setattr(shared_access_mod.workspace_db, "get_workspace", get_ws)
+
+        with pytest.raises(HTTPException) as exc_stand_in:
+            await shared_access_mod.workspace_access(STAND_IN_WS_ROW, COLLEAGUE_ID)
+        assert exc_stand_in.value.status_code == 404
+
+        plain_ws = {
+            "workspace_id": "00000000-0000-4000-8000-0000000000aa",
+            "user_id": OWNER_ID,
+            "status": "running",
+        }
+        with pytest.raises(HTTPException) as exc_plain:
+            await shared_access_mod.workspace_access(plain_ws, COLLEAGUE_ID)
+        assert exc_plain.value.status_code == 403
+        get_ws.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sharing_disabled_refuses_prior_thread_in_colleague_home_stand_in(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """R4 item 4: with colleague sharing OFF, if A previously started a thread in
+        B's Home stand-in workspace, A requesting that thread is refused with 404
+        'Thread not found' (same as a missing thread), both via require_thread_access
+        and via GET /threads/{thread_id}."""
+        from src.server.app.threads import crud as threads_crud_mod
+
+        orig_get_meta = conv_db_mod.get_thread_auth_meta
+        orig_get_owner = conv_db_mod.get_thread_owner_id
+        orig_get_ws = ws_db_mod.get_workspace
+        ws_map = {STAND_IN_WS_ID: STAND_IN_WS_ROW}
+        orig_sharing_enabled = sharing_mod._sharing_auth_enabled
+        orig_supabase_enabled = dalton_settings_mod.is_dalton_supabase_auth_enabled
+        _patch_sharing_env(monkeypatch, ws_map, cos_access="rw", web_access="rw")
+        # Keep Supabase auth ON, turn colleague sharing OFF
+        monkeypatch.setattr(
+            sharing_mod,
+            "_sharing_auth_enabled",
+            create_autospec(orig_sharing_enabled, return_value=False),
+        )
+        monkeypatch.setattr(
+            dalton_settings_mod,
+            "is_dalton_supabase_auth_enabled",
+            create_autospec(orig_supabase_enabled, return_value=True),
+        )
+
+        stand_in_thread_meta = {
+            "workspace_id": STAND_IN_WS_ID,
+            "workspace_owner_id": OWNER_ID,
+            "user_id": COLLEAGUE_ID,
+            "owner_id": COLLEAGUE_ID,
+            "thread_user_id": COLLEAGUE_ID,
+            "is_shared": False,
+        }
+
+        async def _meta(tid: str, **kw: Any) -> dict[str, Any] | None:
+            return dict(stand_in_thread_meta) if tid == "t-legacy-standin" else None
+
+        async def _owner_id(tid: str, **kw: Any) -> str | None:
+            return COLLEAGUE_ID if tid == "t-legacy-standin" else None
+
+        meta_mock = create_autospec(orig_get_meta, side_effect=_meta)
+        owner_mock = create_autospec(orig_get_owner, side_effect=_owner_id)
+        monkeypatch.setattr(conv_db_mod, "get_thread_auth_meta", meta_mock)
+        monkeypatch.setattr(conv_db_mod, "get_thread_owner_id", owner_mock)
+        monkeypatch.setattr(threads_read_mod, "get_thread_auth_meta", meta_mock)
+        monkeypatch.setattr(threads_read_mod, "get_thread_owner_id", owner_mock)
+        monkeypatch.setattr(shared_access_mod.conversation_db, "get_thread_auth_meta", meta_mock)
+        monkeypatch.setattr(
+            shared_access_mod.workspace_db,
+            "get_workspace",
+            create_autospec(
+                orig_get_ws,
+                side_effect=lambda ws_id, **kw: (
+                    dict(ws_map[str(ws_id)]) if str(ws_id) in ws_map else None
+                ),
+            ),
+        )
+
+        # Direct require_thread_access (with and without owner_id shortcut)
+        with pytest.raises(HTTPException) as exc_missing:
+            await sharing_mod.require_thread_access(
+                "t-nonexistent", COLLEAGUE_ID, channel="web", need="read"
+            )
+        with pytest.raises(HTTPException) as exc_off:
+            await sharing_mod.require_thread_access(
+                "t-legacy-standin", COLLEAGUE_ID, channel="web", need="read"
+            )
+        with pytest.raises(HTTPException) as exc_off_owner_hint:
+            await sharing_mod.require_thread_access(
+                "t-legacy-standin",
+                COLLEAGUE_ID,
+                channel="web",
+                need="read",
+                owner_id=COLLEAGUE_ID,
+            )
+        assert exc_off.value.status_code == exc_missing.value.status_code == 404
+        assert exc_off.value.detail == exc_missing.value.detail == "Thread not found"
+        assert exc_off_owner_hint.value.status_code == 404
+        assert exc_off_owner_hint.value.detail == "Thread not found"
+
+        # Web GET /threads/{thread_id} with Supabase auth ON & colleague sharing OFF
+        with pytest.raises(HTTPException) as exc_route:
+            await threads_crud_mod.get_thread("t-legacy-standin", COLLEAGUE_ID)
+        assert exc_route.value.status_code == 404
+        assert exc_route.value.detail == "Thread not found"
+
+        # Also refused via shared_workspaces.access.thread_access when Supabase auth is OFF
+        monkeypatch.setattr(
+            dalton_settings_mod,
+            "is_dalton_supabase_auth_enabled",
+            create_autospec(orig_supabase_enabled, return_value=False),
+        )
+        with pytest.raises(HTTPException) as exc_generic_thread:
+            await shared_access_mod.thread_access(
+                "t-legacy-standin",
+                COLLEAGUE_ID,
+                meta={**stand_in_thread_meta, "workspace_config": {"home_stand_in": True}},
+            )
+        assert exc_generic_thread.value.status_code == 404
+        assert exc_generic_thread.value.detail == "Thread not found"
 
 
 # ===========================================================================
@@ -913,6 +1125,8 @@ class TestUnifiedSensitivePathFilter:
             "models/NVDA_DCF.xlsx",
             "shared/valuation_key_points.txt",
             "work/task1/output.html",
+            "research.env.md",
+            "notes/macro.env.txt",
             ".",
             "./",
         ],
@@ -1268,7 +1482,7 @@ class TestCopyFileRevocationAtomicity:
         async def _record_bash(*, command: str, timeout: int = 30) -> dict[str, Any]:
             if command.startswith("mkdir -p -- "):
                 events.append("mkdir")
-            elif "mv -T" in command:
+            elif "mv -f -- " in command:
                 events.append("mv")
             elif command.startswith("rm -f -- "):
                 events.append("rm")
@@ -1293,14 +1507,15 @@ class TestCopyFileRevocationAtomicity:
         assert payload["success"] is True
         assert payload["path"] == "shared/report.md"
         assert verify_mock.await_count == 2
-        # Order: initial verify -> mkdir -> upload -> recheck right before mv -T -> mv
+        # Order: initial verify -> mkdir -> upload -> recheck right before mv -> mv
         assert events == ["verify_source", "mkdir", "upload", "verify_source", "mv"]
         tmp_path = dest_sandbox.aupload_file_bytes.await_args.args[0]
         assert tmp_path.startswith("/home/workspace/Home/.agents/tmp/colleague-copy-")
         cmds = [c.kwargs["command"] for c in dest_sandbox.execute_bash_command.await_args_list]
         assert len(cmds) == 2
         assert cmds[0].startswith("mkdir -p -- ")
-        assert "test ! -d " in cmds[1] and "mv -T -f -- " in cmds[1]
+        assert "[ ! -d " in cmds[1] and "mv -f -- " in cmds[1]
+        assert "-T" not in cmds[1]
         assert tmp_path in cmds[1] and "/home/workspace/Home/shared/report.md" in cmds[1]
 
     @pytest.mark.asyncio
@@ -1441,7 +1656,7 @@ class TestCopyFileRevocationAtomicity:
         assert cmds[0].startswith("mkdir -p -- ")
         assert cmds[1].startswith("rm -f -- ") and tmp_path in cmds[1]
 
-        # Normal sharing works: both checks succeed -> atomic rename commits via mv -T
+        # Normal sharing works: both checks succeed -> atomic rename commits without GNU -T
         dest_sandbox.aupload_file_bytes.reset_mock()
         dest_sandbox.execute_bash_command.reset_mock()
         dual_ok = create_autospec(orig_dual, side_effect=[None, None])
@@ -1460,7 +1675,249 @@ class TestCopyFileRevocationAtomicity:
         cmds_ok = [c.kwargs["command"] for c in dest_sandbox.execute_bash_command.await_args_list]
         assert len(cmds_ok) == 2
         assert cmds_ok[0].startswith("mkdir -p -- ")
-        assert "test ! -d " in cmds_ok[1] and "mv -T -f -- " in cmds_ok[1]
+        assert "[ ! -d " in cmds_ok[1] and "mv -f -- " in cmds_ok[1]
+        assert "-T" not in cmds_ok[1]
+
+    @pytest.mark.asyncio
+    async def test_real_task_cancel_at_recheck_and_upload_runs_shielded_cleanup_and_reraises(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """R4 item 5: genuine Task.cancel() during recheck await (and during in-flight
+        upload) must finish shielded upload drain and shielded rm cleanup before
+        propagating CancelledError to the caller."""
+        raw = b"# Real Task Cancel Test\n"
+        orig_verify = sec_tools_mod.verify_workspace_owner
+        dest_sandbox = self._setup_copy_env(monkeypatch, file_bytes=raw)
+
+        # 1) Genuine task.cancel() at the recheck await
+        recheck_entered = asyncio.Event()
+        verify_calls = 0
+
+        async def _verify_hang_on_recheck(*args: Any, **kwargs: Any) -> Any:
+            nonlocal verify_calls
+            verify_calls += 1
+            if verify_calls == 2:
+                recheck_entered.set()
+                await asyncio.Future()
+            return None
+
+        monkeypatch.setattr(
+            sec_tools_mod,
+            "verify_workspace_owner",
+            create_autospec(orig_verify, side_effect=_verify_hang_on_recheck),
+        )
+
+        rm_commands: list[str] = []
+
+        async def _bash_for_cancel(*, command: str, timeout: int = 30) -> dict[str, Any]:
+            await asyncio.sleep(0)
+            if command.startswith("rm -f -- "):
+                rm_commands.append(command)
+            return {"success": True, "exit_code": 0}
+
+        dest_sandbox.execute_bash_command.side_effect = _bash_for_cancel
+
+        task = asyncio.create_task(
+            sec_tools_mod.workspace_file_copy_cos(
+                user_id=COLLEAGUE_ID,
+                workspace_id=NORMAL_WS_ID,
+                path="notes/report.md",
+                dest_path="shared/report.md",
+                tool_call_id="tc-real-cancel-recheck",
+            )
+        )
+        await recheck_entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert len(rm_commands) == 1
+        assert "colleague-copy-" in rm_commands[0]
+        all_cmds = [c.kwargs["command"] for c in dest_sandbox.execute_bash_command.await_args_list]
+        assert not any("mv " in c for c in all_cmds)
+
+        # 2) Genuine task.cancel() during an in-flight upload -> waits for upload via shield before rm
+        upload_started = asyncio.Event()
+        allow_upload_finish = asyncio.Event()
+        order: list[str] = []
+
+        async def _slow_upload(tmp_path: str, data: bytes) -> bool:
+            upload_started.set()
+            await allow_upload_finish.wait()
+            order.append("upload_done")
+            return True
+
+        async def _bash_order(*, command: str, timeout: int = 30) -> dict[str, Any]:
+            if command.startswith("rm -f -- "):
+                order.append("rm_done")
+            return {"success": True, "exit_code": 0}
+
+        monkeypatch.setattr(
+            sec_tools_mod,
+            "verify_workspace_owner",
+            create_autospec(orig_verify, return_value=None),
+        )
+        dest_sandbox.aupload_file_bytes.side_effect = _slow_upload
+        dest_sandbox.execute_bash_command.reset_mock()
+        dest_sandbox.execute_bash_command.side_effect = _bash_order
+
+        upload_cancel_task = asyncio.create_task(
+            sec_tools_mod.workspace_file_copy_cos(
+                user_id=COLLEAGUE_ID,
+                workspace_id=NORMAL_WS_ID,
+                path="notes/report.md",
+                dest_path="shared/report.md",
+                tool_call_id="tc-real-cancel-upload",
+            )
+        )
+        await upload_started.wait()
+        upload_cancel_task.cancel()
+        await asyncio.sleep(0.02)
+        # Cleanup must not have run before the upload finished
+        assert order == []
+        allow_upload_finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await upload_cancel_task
+        assert order == ["upload_done", "rm_done"]
+
+        # 3) _remove_temp_copy_file catches CancelledError during rm, completes cleanup, and re-raises
+        rm_entered = asyncio.Event()
+        rm_finish = asyncio.Event()
+        rm_completed = False
+
+        async def _slow_rm(*, command: str, timeout: int = 15) -> dict[str, Any]:
+            nonlocal rm_completed
+            rm_entered.set()
+            await rm_finish.wait()
+            rm_completed = True
+            return {"success": True, "exit_code": 0}
+
+        dest_sandbox.execute_bash_command.side_effect = _slow_rm
+        rm_outer = asyncio.create_task(
+            sec_tools_mod._remove_temp_copy_file(dest_sandbox, "/tmp/colleague-copy-shield")
+        )
+        await rm_entered.wait()
+        rm_outer.cancel()
+        await asyncio.sleep(0.02)
+        rm_finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await rm_outer
+        assert rm_completed is True
+
+        # 4) Upload drain timeout logs a warning naming the leftover staging path
+        monkeypatch.setattr(sec_tools_mod, "_COS_COPY_UPLOAD_DRAIN_TIMEOUT_S", 0.02)
+        never_done = asyncio.create_task(asyncio.sleep(10))
+        with caplog.at_level(logging.WARNING):
+            await sec_tools_mod._drain_cancelled_upload(
+                never_done, "/home/workspace/Home/.agents/tmp/colleague-copy-stale", timeout=0.02
+            )
+        never_done.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await never_done
+        assert any(
+            "/home/workspace/Home/.agents/tmp/colleague-copy-stale" in rec.message
+            for rec in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_analyst_copy_rechecks_dest_before_source_and_mv_immediately_after_source(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """R4 item 6 & item 2: analyst copy rechecks dest write first, then source read
+        immediately before POSIX rename (no DB query between source recheck and mv, no -T)."""
+        raw = b"# Analyst Order Check\n"
+        cross_dest_row = {**COLLEAGUE_CUR_WS_ROW, "user_id": OWNER_ID}
+        dest_sandbox = self._setup_copy_env(
+            monkeypatch, file_bytes=raw, dest_row=cross_dest_row
+        )
+        monkeypatch.setattr(
+            dalton_settings_mod,
+            "is_dalton_sharing_auth_enabled",
+            create_autospec(dalton_settings_mod.is_dalton_sharing_auth_enabled, return_value=True),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "mark_run_outbound_blocked",
+            create_autospec(cw_mod.mark_run_outbound_blocked, return_value=True),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "get_user_tier",
+            create_autospec(cw_mod.get_user_tier, return_value="internal"),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "classify_owner_tier",
+            create_autospec(cw_mod.classify_owner_tier, return_value="internal"),
+        )
+
+        events: list[str] = []
+        dual_calls = 0
+        req_calls = 0
+
+        async def _rec_dual(*args: Any, **kwargs: Any) -> Any:
+            nonlocal dual_calls
+            dual_calls += 1
+            events.append("init_source" if dual_calls == 1 else "recheck_source")
+            return None
+
+        async def _rec_req(*args: Any, **kwargs: Any) -> Any:
+            nonlocal req_calls
+            req_calls += 1
+            events.append("init_dest" if req_calls == 1 else "recheck_dest")
+            return cross_dest_row
+
+        async def _rec_upload(*args: Any, **kwargs: Any) -> bool:
+            events.append("upload")
+            return True
+
+        async def _rec_bash(*, command: str, timeout: int = 30) -> dict[str, Any]:
+            if command.startswith("mkdir -p -- "):
+                events.append("mkdir")
+            elif "mv -f -- " in command:
+                assert "-T" not in command
+                events.append("mv")
+            return {"success": True, "exit_code": 0}
+
+        monkeypatch.setattr(
+            cw_mod,
+            "_dual_verify_workspace",
+            create_autospec(cw_mod._dual_verify_workspace, side_effect=_rec_dual),
+        )
+        monkeypatch.setattr(
+            cw_mod,
+            "require_workspace_access",
+            create_autospec(cw_mod.require_workspace_access, side_effect=_rec_req),
+        )
+        dest_sandbox.aupload_file_bytes.side_effect = _rec_upload
+        dest_sandbox.execute_bash_command.side_effect = _rec_bash
+
+        cw_tool = cw_mod.create_colleague_workspace_tools()[0]
+        cross_cfg = {
+            "configurable": {
+                "user_id": COLLEAGUE_ID,
+                "workspace_id": CUR_WS_ID,
+                "workspace_owner_id": OWNER_ID,
+                "origin_channel": "web",
+            }
+        }
+        cmd = await _invoke_tool(
+            cw_tool,
+            {"action": "copy_file", "workspace_id": NORMAL_WS_ID, "path": "notes/report.md"},
+            config=cross_cfg,
+            call_id="tc-a-order",
+        )
+        assert _cmd_payload(cmd)["success"] is True
+        # Dest write recheck happens BEFORE source read recheck, and mv immediately follows source recheck
+        assert events == [
+            "init_dest",
+            "init_source",
+            "mkdir",
+            "upload",
+            "recheck_dest",
+            "recheck_source",
+            "mv",
+        ]
 
     @pytest.mark.asyncio
     async def test_analyst_copy_file_dest_write_revoked_right_before_rename_deletes_temp(
@@ -1710,6 +2167,16 @@ class TestBinaryCopySecretChecks:
             payload = _cmd_payload(cmd)
             assert payload["success"] is False
             assert payload["error"] == sec_tools_mod._COS_MACRO_OFFICE_REFUSED_ERROR
+        cmd_ppt = await sec_tools_mod.workspace_file_copy_cos(
+            user_id=COLLEAGUE_ID,
+            workspace_id=NORMAL_WS_ID,
+            path="decks/legacy.ppt",
+            dest_path=None,
+            tool_call_id="tc-ppt",
+        )
+        payload_ppt = _cmd_payload(cmd_ppt)
+        assert payload_ppt["success"] is False
+        assert payload_ppt["error"] == sec_tools_mod._COS_LEGACY_PPT_REFUSED_ERROR
         dest_sandbox.aupload_file_bytes.assert_not_called()
 
     @pytest.mark.parametrize(
@@ -1717,7 +2184,6 @@ class TestBinaryCopySecretChecks:
         [
             ("legacy.xls", "Workbook", ("_VBA_PROJECT_CUR", 1)),
             ("legacy.doc", "WordDocument", ("Macros", 1)),
-            ("legacy.ppt", "PowerPoint Document", ("VBA", 1)),
         ],
     )
     def test_legacy_ole_office_macro_refused_and_macro_free_allowed(
@@ -1738,6 +2204,22 @@ class TestBinaryCopySecretChecks:
         err = sec_tools_mod._scan_copy_bytes_for_secrets(filename, macro_ole, {})
         assert err == sec_tools_mod._COS_MACRO_OFFICE_REFUSED_ERROR
 
+    def test_legacy_ppt_always_refused_with_exact_guidance(self) -> None:
+        """R4 item 1: .ppt VBA projects can live compressed inside PowerPoint Document,
+        so .ppt is always refused regardless of outer OLE directory entries."""
+        expected_msg = (
+            "老格式 PowerPoint（.ppt）可能内嵌宏，无法检查。请让对方另存为 .pptx 后再复制。"
+        )
+        clean_ppt = _make_ole2_bytes([("PowerPoint Document", 2)])
+        assert sec_tools_mod._scan_copy_bytes_for_secrets("deck.ppt", clean_ppt, {}) == expected_msg
+        assert sec_tools_mod._scan_copy_bytes_for_secrets("DECK.PPT", clean_ppt, {}) == expected_msg
+        assert sec_tools_mod._is_allowed_copy_extension("deck.ppt") is False
+        assert ".ppt" in (cos_mod.chief_of_staff_workspaces.description or "")
+        assert "refused" in (cos_mod.chief_of_staff_workspaces.description or "")
+        cw_tool = cw_mod.create_colleague_workspace_tools()[0]
+        assert ".ppt" in (cw_tool.description or "")
+        assert "拒绝" in (cw_tool.description or "")
+
     def test_legacy_ole_utf16le_fallback_catches_macro_in_truncated_container(self) -> None:
         truncated_macro = (
             sec_tools_mod._OLE_HEADER
@@ -1748,6 +2230,89 @@ class TestBinaryCopySecretChecks:
         assert (
             sec_tools_mod._scan_copy_bytes_for_secrets("broken.xls", truncated_macro, {})
             == sec_tools_mod._COS_MACRO_OFFICE_REFUSED_ERROR
+        )
+
+    def test_ooxml_eocd_precheck_standard_zip64_missing_and_nonempty_dir_entry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """R4 item 7: EOCD (including ZIP64) member count is checked BEFORE opening
+        ZipFile; unreadable EOCD is refused; dir entries ending in '/' with
+        file_size > 0 are refused as format anomalies."""
+        # 1) Build standard ZIP with 2001 entries and verify ZipFile is NEVER opened
+        many_members = {f"xl/m{i}.xml": "<a/>" for i in range(2001)}
+        too_many_zip = _make_ooxml_zip(many_members)
+
+        # 2) Build synthetic ZIP64 EOCD declaring 2500 entries (no central dir needed)
+        z64_offset = 4
+        z64_eocd = struct.pack(
+            "<4sQHHIIQQQQ",
+            b"PK\x06\x06",
+            44,       # size of remaining record
+            45, 45,   # versions
+            0, 0,     # disks
+            2500,     # disk entries
+            2500,     # total entries
+            0, 0,     # cd size / offset
+        )
+        z64_locator = struct.pack("<4sIQI", b"PK\x06\x07", 0, z64_offset, 1)
+        std_eocd = struct.pack(
+            "<4sHHHHIIH",
+            b"PK\x05\x06",
+            0, 0,
+            0xFFFF, 0xFFFF,
+            0xFFFFFFFF, 0xFFFFFFFF,
+            0,
+        )
+        zip64_too_many = b"PK\x03\x04" + z64_eocd + z64_locator + std_eocd
+        assert sec_tools_mod._read_zip_eocd_member_count(zip64_too_many) == 2500
+
+        # Valid small ZIP64 EOCD returns exact count
+        z64_small_eocd = struct.pack(
+            "<4sQHHIIQQQQ", b"PK\x06\x06", 44, 45, 45, 0, 0, 3, 3, 0, 0
+        )
+        zip64_small = b"PK\x03\x04" + z64_small_eocd + z64_locator + std_eocd
+        assert sec_tools_mod._read_zip_eocd_member_count(zip64_small) == 3
+
+        # Missing EOCD returns None
+        no_eocd = b"PK\x03\x04" + b"\x00" * 64
+        assert sec_tools_mod._read_zip_eocd_member_count(no_eocd) is None
+
+        # Monkeypatch zipfile.ZipFile to fail if opened; all three must be refused BEFORE ZipFile
+        def _forbid_zipfile(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("zipfile.ZipFile must not be opened before EOCD passes")
+
+        monkeypatch.setattr(zipfile, "ZipFile", _forbid_zipfile)
+        err_std = sec_tools_mod._scan_copy_bytes_for_secrets("many.xlsx", too_many_zip, {})
+        assert err_std is not None and "成员数量" in err_std
+        err_z64 = sec_tools_mod._scan_copy_bytes_for_secrets("many64.xlsx", zip64_too_many, {})
+        assert err_z64 is not None and "成员数量" in err_z64
+        err_no_eocd = sec_tools_mod._scan_copy_bytes_for_secrets("broken.xlsx", no_eocd, {})
+        assert err_no_eocd is not None
+
+        monkeypatch.undo()
+
+        # 3) Directory member ending with '/' but file_size > 0 is refused as format anomaly
+        buf_bad_dir = io.BytesIO()
+        with zipfile.ZipFile(buf_bad_dir, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("[Content_Types].xml", "<Types/>")
+            zf.writestr("word/document.xml", "<w:document/>")
+            zf.writestr("word/hidden/", b"secret payload disguised as dir")
+        err_dir_data = sec_tools_mod._scan_copy_bytes_for_secrets(
+            "bad_dir.docx", buf_bad_dir.getvalue(), {}
+        )
+        assert err_dir_data is not None and "格式异常" in err_dir_data
+
+        # 4) Normal empty directory member ending with '/' (file_size == 0) is still allowed
+        buf_empty_dir = io.BytesIO()
+        with zipfile.ZipFile(buf_empty_dir, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("[Content_Types].xml", "<Types/>")
+            zf.writestr("word/document.xml", "<w:document/>")
+            zf.writestr("word/empty/", b"")
+        assert (
+            sec_tools_mod._scan_copy_bytes_for_secrets(
+                "clean_dir.docx", buf_empty_dir.getvalue(), {}
+            )
+            is None
         )
 
     def test_ooxml_resource_limits_compression_members_streaming_bytes_and_non_xml_text(
