@@ -358,6 +358,7 @@ class DeliveryProgressRequest(BaseModel):
     files_status: list[Any] | None = None
     first_response_json: dict[str, Any] | None = None
     status: str | None = None
+    outcome: str | None = None
     error_code: str | None = None
     error_message: str | None = None
     confirmed_thread_address: str | None = None
@@ -748,6 +749,27 @@ async def internal_weixin_login_session_patch_endpoint(
         return _handle_structured_http_error(exc)
 
 
+@channels_router.get(
+    "/internal/weixin/collect-buffers/{buffer_id}",
+    dependencies=[
+        Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN)),
+        Depends(require_channel_service_token),
+    ],
+)
+async def internal_weixin_collect_buffer_status_endpoint(
+    buffer_id: str,
+    message_id: str | None = Query(default=None),
+) -> Any:
+    """Read-only collect buffer status check before uploading each attachment."""
+    try:
+        return await wx_db.get_weixin_collect_buffer_status(
+            buffer_id=buffer_id,
+            message_id=message_id,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
 @channels_router.post(
     "/internal/weixin/collect-buffers/{buffer_id}/items/{message_id}/attachments",
     dependencies=[
@@ -809,12 +831,12 @@ async def internal_deliveries_preflight_send_endpoint(
 ) -> Any:
     """Real-time re-authorization before every iLink outbound chunk / media upload / sendmessage."""
     try:
-        # R5 (Decision #7): Parse epoch without failing early so capability check (404)
-        # runs BEFORE gateway epoch enforcement (409) when Weixin is disabled.
-        epoch = _parse_gateway_epoch(request, required=False)
+        # R7 (Decision #8): Do NOT parse X-Gateway-Epoch before platform capability check;
+        # disabled capability must return 404 even when the header is missing or malformed.
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
         return await wx_db.preflight_weixin_send(
             delivery_key=delivery_key,
-            gateway_epoch=epoch,
+            gateway_epoch=raw_epoch,
             delivery_attempt=body.delivery_attempt,
             chunk_index=body.chunk_index,
         )
@@ -1096,6 +1118,7 @@ async def internal_deliveries_progress_endpoint(
             files_status=body.files_status,
             first_response_json=body.first_response_json,
             status=body.status,
+            outcome=body.outcome,
             error_code=body.error_code,
             error_message=body.error_message,
             confirmed_thread_address=body.confirmed_thread_address,
@@ -1787,14 +1810,11 @@ async def web_weixin_admin_config_put_endpoint(
         return _handle_structured_http_error(exc)
 
 
-def _format_admin_unbind_reason(body: WeixinAdminUnbindRequest | None) -> str | None:
-    if body is None:
-        return None
-    preset = str(body.reason or "").strip()
-    note = str(body.note or "").strip()
-    if preset and note:
-        return f"{preset}：{note}"
-    return preset or note or None
+def _format_admin_unbind_reason(body: WeixinAdminUnbindRequest | None) -> str:
+    return wx_db.validate_admin_unbind_reason(
+        body.reason if body is not None else None,
+        note=body.note if body is not None else None,
+    )
 
 
 @channels_router.delete(

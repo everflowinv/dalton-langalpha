@@ -336,7 +336,10 @@ def upgrade() -> None:
             ADD COLUMN IF NOT EXISTS weixin_account_id UUID,
             ADD COLUMN IF NOT EXISTS weixin_bot_id VARCHAR(255),
             ADD COLUMN IF NOT EXISTS weixin_bot_generation BIGINT,
-            ADD COLUMN IF NOT EXISTS weixin_recipient_id VARCHAR(255);
+            ADD COLUMN IF NOT EXISTS weixin_recipient_id VARCHAR(255),
+            ADD COLUMN IF NOT EXISTS defer_count INTEGER NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS first_deferred_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ;
         """
     )
     op.execute(
@@ -637,20 +640,24 @@ def upgrade() -> None:
         )
 
     # 4③ Backfill NEW columns on dalton_channel_thread_watches
+    # R7 (Decision #4): NEVER fabricate current bot_generation onto legacy rows whose
+    # inbound events lack weixin_context_bot_generation; leave them NULL so I-6 marks
+    # them unknown and writes ambiguous_legacy_delivery_blocked audit.
     if eff_ilink_user_id is not None:
         bind.execute(
             sa.text(
                 """
                 WITH unique_thread_gen AS (
                     SELECT thread_id,
-                           MIN(COALESCE(weixin_context_bot_generation, :default_gen)) AS bot_gen
+                           MIN(weixin_context_bot_generation) AS bot_gen
                     FROM dalton_channel_inbound_events
                     WHERE platform = 'weixin'
                       AND thread_id IS NOT NULL
                     GROUP BY thread_id
                     HAVING COUNT(DISTINCT COALESCE(weixin_context_bot_id, raw_payload->>'ilink_bot_id', '')) = 1
                        AND MIN(COALESCE(weixin_context_bot_id, raw_payload->>'ilink_bot_id', '')) = :ilink_bot_id
-                       AND COUNT(DISTINCT COALESCE(weixin_context_bot_generation, :default_gen)) = 1
+                       AND COUNT(*) FILTER (WHERE weixin_context_bot_generation IS NULL) = 0
+                       AND COUNT(DISTINCT weixin_context_bot_generation) = 1
                 )
                 UPDATE dalton_channel_thread_watches w
                 SET weixin_account_id = :account_id,
@@ -669,7 +676,6 @@ def upgrade() -> None:
                 "eff_ilink_user_id": eff_ilink_user_id,
                 "owner_user_id": owner_user_id,
                 "ilink_bot_id": ilink_bot_id,
-                "default_gen": bot_generation,
             },
         )
     else:
@@ -686,15 +692,27 @@ def upgrade() -> None:
                       AND thread_id IS NOT NULL
                       AND dalton_user_id = :owner_user_id
                     ORDER BY thread_id, created_at DESC
+                ),
+                single_gen_threads AS (
+                    SELECT thread_id
+                    FROM dalton_channel_inbound_events
+                    WHERE platform = 'weixin'
+                      AND thread_id IS NOT NULL
+                      AND dalton_user_id = :owner_user_id
+                    GROUP BY thread_id
+                    HAVING COUNT(*) FILTER (WHERE weixin_context_bot_generation IS NULL) = 0
+                       AND COUNT(DISTINCT weixin_context_bot_generation) = 1
                 )
                 UPDATE dalton_channel_thread_watches w
                 SET weixin_account_id = :account_id,
-                    weixin_bot_generation = COALESCE(l.bot_gen, :default_gen)
+                    weixin_bot_generation = l.bot_gen
                 FROM latest_thread_in l
+                JOIN single_gen_threads sg ON sg.thread_id = l.thread_id
                 WHERE w.thread_id = l.thread_id
                   AND w.platform = 'weixin'
                   AND w.dalton_user_id = :owner_user_id
                   AND l.bot_id = :ilink_bot_id
+                  AND l.bot_gen IS NOT NULL
                   AND w.weixin_account_id IS NULL
                 """
             ),
@@ -702,31 +720,46 @@ def upgrade() -> None:
                 "account_id": new_account_id,
                 "owner_user_id": owner_user_id,
                 "ilink_bot_id": ilink_bot_id,
-                "default_gen": bot_generation,
             },
         )
 
     # 4④ Backfill NEW columns on dalton_channel_background_runs
-    # Priority 1: inherit from already-backfilled thread_watches(thread_id)
+    # Priority 1: inherit from already-backfilled thread_watches(thread_id) ONLY when
+    # every inbound on that thread had a single non-NULL generation (guaranteed by 4③)
+    # AND bg.created_at is at or after the earliest inbound of that generation (never
+    # stamp an earlier/unknown background run with a later watch generation).
     bind.execute(
         sa.text(
             """
+            WITH thread_earliest AS (
+                SELECT thread_id,
+                       MIN(created_at) AS min_ie_created_at
+                FROM dalton_channel_inbound_events
+                WHERE platform = 'weixin'
+                  AND thread_id IS NOT NULL
+                GROUP BY thread_id
+                HAVING COUNT(*) FILTER (WHERE weixin_context_bot_generation IS NULL) = 0
+                   AND COUNT(DISTINCT weixin_context_bot_generation) = 1
+            )
             UPDATE dalton_channel_background_runs bg
             SET weixin_account_id = w.weixin_account_id,
                 weixin_recipient_id = w.weixin_recipient_id,
                 weixin_bot_generation = w.weixin_bot_generation
             FROM dalton_channel_thread_watches w
+            JOIN thread_earliest te ON te.thread_id = w.thread_id
             WHERE bg.thread_id = w.thread_id
               AND bg.platform = 'weixin'
               AND w.platform = 'weixin'
               AND bg.dalton_user_id = w.dalton_user_id
               AND w.weixin_account_id IS NOT NULL
               AND w.weixin_bot_generation IS NOT NULL
+              AND bg.created_at >= te.min_ie_created_at
               AND bg.weixin_account_id IS NULL
             """
         )
     )
     # Priority 2: unique inbound source on same thread_id with created_at <= bg.created_at
+    # ONLY when no inbound with NULL generation exists at or before bg.created_at.
     bind.execute(
         sa.text(
             """
@@ -741,12 +774,12 @@ def upgrade() -> None:
                  AND ie.thread_id = bg.thread_id
                  AND ie.created_at <= bg.created_at
                  AND ie.weixin_account_id = :account_id
-                 AND ie.weixin_context_bot_generation IS NOT NULL
                 WHERE bg.platform = 'weixin'
                   AND bg.dalton_user_id = :owner_user_id
                   AND bg.weixin_account_id IS NULL
                 GROUP BY bg.run_id
-                HAVING COUNT(DISTINCT ie.weixin_account_id) = 1
+                HAVING COUNT(*) FILTER (WHERE ie.weixin_context_bot_generation IS NULL) = 0
+                   AND COUNT(DISTINCT ie.weixin_account_id) = 1
                    AND COUNT(DISTINCT ie.weixin_context_bot_generation) = 1
                    AND COUNT(DISTINCT COALESCE(ie.raw_payload->>'platform_user_id', '')) <= 1
             )
@@ -886,6 +919,9 @@ def downgrade() -> None:
     op.execute(
         """
         ALTER TABLE dalton_channel_deliveries
+            DROP COLUMN IF EXISTS next_retry_at,
+            DROP COLUMN IF EXISTS first_deferred_at,
+            DROP COLUMN IF EXISTS defer_count,
             DROP COLUMN IF EXISTS weixin_recipient_id,
             DROP COLUMN IF EXISTS weixin_bot_generation,
             DROP COLUMN IF EXISTS weixin_bot_id,

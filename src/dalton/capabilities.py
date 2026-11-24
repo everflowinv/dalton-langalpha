@@ -960,6 +960,10 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
             CapabilityId.CHANNEL_GATEWAY,
             CapabilityId.CHANNEL_WEIXIN,
         ),
+        ("channels_router.py", "internal_weixin_collect_buffer_status_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
         ("channels_router.py", "internal_weixin_collect_item_attachments_endpoint"): (
             CapabilityId.CHANNEL_GATEWAY,
             CapabilityId.CHANNEL_WEIXIN,

@@ -667,7 +667,10 @@ async def authorize_and_claim_automation_notify_delivery(
             async with owned.cursor(row_factory=dict_row) as cur:
                 if gateway_epoch is not None or require_gateway_epoch:
                     await wx_db.verify_gateway_epoch_in_tx(
-                        cur, gateway_epoch, required=require_gateway_epoch
+                        cur,
+                        gateway_epoch,
+                        required=require_gateway_epoch,
+                        enforce_post_lease_for_non_weixin=False,
                     )
                 await cur.execute(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
@@ -683,6 +686,15 @@ async def authorize_and_claim_automation_notify_delivery(
                 )
                 existing = await cur.fetchone()
                 if existing:
+                    if str(existing.get("platform") or "").strip().lower() == "weixin" and (
+                        gateway_epoch is not None or require_gateway_epoch
+                    ):
+                        await wx_db.verify_gateway_epoch_in_tx(
+                            cur,
+                            gateway_epoch,
+                            required=require_gateway_epoch,
+                            platform="weixin",
+                        )
                     ex_status = str(existing["status"])
                     if ex_status in ("sent", "partial"):
                         return {
@@ -703,6 +715,16 @@ async def authorize_and_claim_automation_notify_delivery(
                             "target_address": existing["target_address"],
                             "is_current": False,
                         }
+                    if ex_status == "deferred":
+                        from src.dalton.database.channel_gateway import (
+                            _check_deferred_delivery_in_tx,
+                        )
+
+                        deferred_res = await _check_deferred_delivery_in_tx(
+                            cur, existing, is_current=False
+                        )
+                        if deferred_res is not None:
+                            return deferred_res
 
                 row = await _load_delivery_row(cur, delivery_id)
                 plan = await decide_automation_notification_plan(
@@ -863,6 +885,7 @@ async def authorize_and_claim_automation_notify_delivery(
                         )
                         ON CONFLICT (delivery_key) DO UPDATE SET
                             status = 'in_flight',
+                            next_retry_at = NULL,
                             total_chunks = EXCLUDED.total_chunks,
                             weixin_account_id = EXCLUDED.weixin_account_id,
                             weixin_bot_id = EXCLUDED.weixin_bot_id,
@@ -904,6 +927,7 @@ async def authorize_and_claim_automation_notify_delivery(
                         )
                         ON CONFLICT (delivery_key) DO UPDATE SET
                             status = 'in_flight',
+                            next_retry_at = NULL,
                             total_chunks = EXCLUDED.total_chunks,
                             error_code = NULL,
                             error_message = NULL,

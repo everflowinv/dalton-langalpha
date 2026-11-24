@@ -425,6 +425,7 @@ fi
 
 BACKEND_IMAGE="$(read_env_file_var "$ENV_FILE" "DALTON_BACKEND_IMAGE" "dalton-core-backend:local")"
 EDGE_IMAGE="$(read_env_file_var "$ENV_FILE" "DALTON_EDGE_IMAGE" "dalton-core-edge:local")"
+CRAWLER_IMAGE="$(read_env_file_var "$ENV_FILE" "DALTON_CRAWLER_IMAGE" "$BACKEND_IMAGE")"
 BACKEND_REPO="${BACKEND_IMAGE%:*}"
 EDGE_REPO="${EDGE_IMAGE%:*}"
 
@@ -437,13 +438,15 @@ IMAGES_BUILT=0
 # Migration state:
 #   "before"      - failure occurred strictly BEFORE `migrate` was invoked
 #   "rolled_back" - `migrate` failed, versions stayed identical, upstream was already
-#                   at head (pure transactional Dalton migration), and upgrade.sh
-#                   automatically restored files, image tags, and previous services
+#                   at head and Dalton was at d046 attempting only pure-transactional d049
 #   "migrated"    - both pre/post versions read cleanly and at least one version changed
 #   "unknown"     - `migrate` was invoked and either pre/post versions could not be read
-#                   OR versions stayed identical while upstream migration may have run
+#                   OR versions stayed identical without proving pure-transactional d049 only
 MIGRATION_STATE="before"
-AUTO_RECOVERED=0
+AUTO_RECOVERY_ATTEMPTED=0
+AUTO_FILES_RESTORED=0
+AUTO_UP_RC=0
+AUTO_HEALTH_OK=0
 STOPPED_SERVICES=()
 PRE_MIGRATE_UP=""
 PRE_MIGRATE_DA=""
@@ -457,18 +460,31 @@ MANUAL_OVERWRITE_REF="docs/dalton/dev-guide/STANDALONE-DEPLOY.md (§6.2 在已�
 
 print_rollback_steps() {
   printf "\n==================== UPGRADE FAILED — ROLLBACK GUIDE ====================\n" >&2
-  if [[ "$AUTO_RECOVERED" -eq 1 ]]; then
-    printf "  Database migration failed cleanly before advancing any Alembic version (upstream was\n" >&2
-    printf "  already at head; pure transactional Dalton migration rolled back automatically).\n" >&2
-    printf "  upgrade.sh has ALREADY restored the pre-upgrade release files, container image tags,\n" >&2
-    printf "  and restarted the previous services (%s).\n" "${STOPPED_SERVICES[*]:-backend crawler}" >&2
+  if [[ "$AUTO_RECOVERY_ATTEMPTED" -eq 1 && "$AUTO_FILES_RESTORED" -eq 1 ]]; then
+    if [[ "$MIGRATION_STATE" == "rolled_back" ]]; then
+      printf "  Database migration failed cleanly before advancing any Alembic version (upstream was\n" >&2
+      printf "  already at head and Dalton was at d046 attempting only pure-transactional d049).\n" >&2
+    else
+      printf "  Upgrade aborted BEFORE database migrations started (database was not modified).\n" >&2
+    fi
+    if [[ "$AUTO_UP_RC" -eq 0 && "$AUTO_HEALTH_OK" -eq 1 ]]; then
+      printf "  upgrade.sh has ALREADY restored the pre-upgrade release files, container image tags,\n" >&2
+      printf "  and restarted the previous services (%s) — backend /health passed.\n" "${STOPPED_SERVICES[*]:-backend crawler}" >&2
+    else
+      printf "  WARNING: Pre-upgrade release files and container image tags WERE restored, but\n" >&2
+      printf "           previous services (%s) did NOT start cleanly or failed /health\n" "${STOPPED_SERVICES[*]:-backend crawler}" >&2
+      printf "           (compose up exit=%s, health_ok=%s). Do NOT wipe volumes or restore data.\n" "$AUTO_UP_RC" "$AUTO_HEALTH_OK" >&2
+      printf "  Manually restart and inspect the restored previous services:\n" >&2
+      printf "    1. %s\n" "$(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" up -d "${STOPPED_SERVICES[@]:-backend}")" >&2
+      printf "    2. %s\n" "$(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" logs --tail=100 backend edge)" >&2
+    fi
     if [[ -n "$PRE_UPGRADE_BACKUP" && -d "$PRE_UPGRADE_BACKUP" ]]; then
       printf "  Pre-upgrade backup : %s (no data restore required)\n" "$PRE_UPGRADE_BACKUP" >&2
     fi
     if [[ "$SNAPSHOT_CREATED" -eq 1 && -d "$SNAPSHOT_DIR" ]]; then
       printf "  Release snapshot   : %s\n" "$SNAPSHOT_DIR" >&2
     fi
-    printf "  Verify service status and inspect the migration error above:\n" >&2
+    printf "  Verify service status and inspect the error above:\n" >&2
     printf "    %s\n" "$(fmt_cmd docker compose "${COMPOSE_PRINT_ARGS[@]}" ps)" >&2
     printf "=========================================================================\n" >&2
     return 0
@@ -544,7 +560,7 @@ print_rollback_steps() {
       printf "         %s\n" "$(fmt_cmd docker tag "$PRE_EDGE_TAG" "$EDGE_IMAGE")" >&2
     fi
     if [[ -n "$PRE_CRAWLER_TAG" && "$PRE_CRAWLER_TAG" != "$PRE_BACKEND_TAG" ]]; then
-      printf "         # Crawler image tag preserved at: %s\n" "$PRE_CRAWLER_TAG" >&2
+      printf "         %s\n" "$(fmt_cmd docker tag "$PRE_CRAWLER_TAG" "$CRAWLER_IMAGE")" >&2
     fi
     step_no=$(( step_no + 1 ))
   fi
@@ -770,8 +786,34 @@ read_alembic_versions() {
   printf '%s\t%s\n' "$up" "$da"
 }
 
-resolve_new_upstream_head() {
-  local mig_dir="${WORK_DIR}/migrations/versions"
+run_with_timeout() {
+  local secs="$1"
+  shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  else
+    python3 - "$secs" "$@" <<'PY'
+import subprocess, sys
+
+secs = float(sys.argv[1])
+cmd = sys.argv[2:]
+try:
+    rc = subprocess.run(cmd, timeout=secs).returncode
+    sys.exit(rc)
+except subprocess.TimeoutExpired:
+    sys.exit(124)
+PY
+  fi
+}
+
+compose_cmd_timeout() {
+  local secs="$1"
+  shift
+  run_with_timeout "$secs" env "${ENV_UNSET_ARGS[@]}" docker compose -p "$PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" --project-directory "$WORK_DIR" "$@"
+}
+
+resolve_alembic_head() {
+  local mig_dir="$1"
   if [[ ! -d "$mig_dir" ]]; then
     return 1
   fi
@@ -836,6 +878,11 @@ restore_pre_upgrade_files_and_images() {
         --exclude=/deploy/standalone/extra \
         "${SNAPSHOT_DIR}/" "${WORK_DIR}/"
     else
+      # Clean replacement without rsync: extract snapshot into a fresh temp stage,
+      # remove non-preserved files from WORK_DIR (purging any newly added files from
+      # the failed release), then move the clean snapshot tree into WORK_DIR.
+      local restore_stage
+      restore_stage="$(mktemp -d)"
       (
         cd "$SNAPSHOT_DIR"
         tar -cf - \
@@ -856,7 +903,60 @@ restore_pre_upgrade_files_and_images() {
           --exclude='./deploy/standalone/extra' \
           --exclude='deploy/standalone/extra' \
           .
-      ) | tar -xf - -C "$WORK_DIR"
+      ) | tar -xf - -C "$restore_stage"
+      python3 - "$WORK_DIR" "$restore_stage" <<'PY'
+import os, shutil, sys
+
+work_dir = os.path.abspath(sys.argv[1])
+stage_dir = os.path.abspath(sys.argv[2])
+preserved_top = {
+    ".env",
+    "backups",
+    ".upgrade-backup",
+    ".restore-backup",
+    "ci-artifacts",
+    ".git",
+}
+preserved_rel = {
+    os.path.normpath("deploy/standalone/certs"),
+    os.path.normpath("deploy/standalone/extra"),
+}
+
+def _purge_non_preserved(cur_dir: str, rel_prefix: str = "") -> None:
+    for name in os.listdir(cur_dir):
+        rel = os.path.normpath(os.path.join(rel_prefix, name)) if rel_prefix else name
+        full = os.path.join(cur_dir, name)
+        if not rel_prefix and name in preserved_top:
+            continue
+        if rel in preserved_rel:
+            continue
+        if os.path.isdir(full) and not os.path.islink(full):
+            if any(p.startswith(rel + os.sep) for p in preserved_rel):
+                _purge_non_preserved(full, rel)
+            else:
+                shutil.rmtree(full)
+        else:
+            os.unlink(full)
+
+def _merge_stage(src_dir: str, dst_dir: str) -> None:
+    os.makedirs(dst_dir, exist_ok=True)
+    for name in os.listdir(src_dir):
+        s_path = os.path.join(src_dir, name)
+        d_path = os.path.join(dst_dir, name)
+        if os.path.isdir(s_path) and not os.path.islink(s_path):
+            _merge_stage(s_path, d_path)
+        else:
+            if os.path.lexists(d_path):
+                if os.path.isdir(d_path) and not os.path.islink(d_path):
+                    shutil.rmtree(d_path)
+                else:
+                    os.unlink(d_path)
+            shutil.move(s_path, d_path)
+
+_purge_non_preserved(work_dir)
+_merge_stage(stage_dir, work_dir)
+PY
+      rm -rf "$restore_stage"
     fi
   fi
   if [[ -n "$PRE_BACKEND_TAG" ]]; then
@@ -865,6 +965,57 @@ restore_pre_upgrade_files_and_images() {
   if [[ -n "$PRE_EDGE_TAG" ]]; then
     docker tag "$PRE_EDGE_TAG" "$EDGE_IMAGE"
   fi
+  if [[ -n "$PRE_CRAWLER_TAG" ]]; then
+    docker tag "$PRE_CRAWLER_TAG" "$CRAWLER_IMAGE"
+  fi
+}
+
+recover_previous_services_after_abort() {
+  local target_state="$1"
+  AUTO_RECOVERY_ATTEMPTED=1
+  MIGRATION_STATE="$target_state"
+  set +e
+  restore_pre_upgrade_files_and_images
+  local restore_rc=$?
+  set -e
+  if [[ "$restore_rc" -ne 0 ]]; then
+    err "Failed to restore pre-upgrade files or image tags (exit ${restore_rc})."
+    return 1
+  fi
+  AUTO_FILES_RESTORED=1
+
+  set +e
+  compose_cmd up -d "${STOPPED_SERVICES[@]}"
+  AUTO_UP_RC=$?
+  set -e
+  if [[ "$AUTO_UP_RC" -ne 0 ]]; then
+    err "Pre-upgrade files and image tags were restored, but restarting previous services failed (exit ${AUTO_UP_RC})."
+    return 1
+  fi
+
+  local health_retries="${DALTON_RECOVERY_HEALTH_RETRIES:-15}"
+  local health_sleep="${DALTON_RECOVERY_HEALTH_SLEEP_S:-2}"
+  if [[ ! "$health_retries" =~ ^[0-9]+$ || "$health_retries" -lt 1 ]]; then
+    health_retries=15
+  fi
+  if [[ ! "$health_sleep" =~ ^[0-9]+$ ]]; then
+    health_sleep=2
+  fi
+  AUTO_HEALTH_OK=0
+  info "Verifying restored previous backend passes /health (up to ${health_retries} attempts)..."
+  for _ in $(seq 1 "$health_retries"); do
+    if compose_cmd_timeout 10 exec -T backend curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1; then
+      AUTO_HEALTH_OK=1
+      break
+    fi
+    sleep "$health_sleep"
+  done
+  if [[ "$AUTO_HEALTH_OK" -eq 1 ]]; then
+    ok "Restored previous services are healthy."
+    return 0
+  fi
+  err "Restored previous backend did not pass /health after ${health_retries} attempts."
+  return 1
 }
 
 info "Stopping application services before database migrations (prevents lock contention on hot tables)..."
@@ -888,19 +1039,21 @@ MIGRATE_DRAIN_TIMEOUT_S="${DALTON_MIGRATE_DRAIN_TIMEOUT_S:-30}"
 if [[ ! "$MIGRATE_DRAIN_TIMEOUT_S" =~ ^[0-9]+$ || "$MIGRATE_DRAIN_TIMEOUT_S" -lt 1 ]]; then
   MIGRATE_DRAIN_TIMEOUT_S=30
 fi
-info "Waiting up to ${MIGRATE_DRAIN_TIMEOUT_S}s for database connections to drain..."
+MIGRATE_DRAIN_EXEC_TIMEOUT_S="${DALTON_MIGRATE_DRAIN_EXEC_TIMEOUT_S:-10}"
+if [[ ! "$MIGRATE_DRAIN_EXEC_TIMEOUT_S" =~ ^[0-9]+$ || "$MIGRATE_DRAIN_EXEC_TIMEOUT_S" -lt 1 ]]; then
+  MIGRATE_DRAIN_EXEC_TIMEOUT_S=10
+fi
+info "Waiting up to ${MIGRATE_DRAIN_TIMEOUT_S}s for database connections to drain (per-query timeout ${MIGRATE_DRAIN_EXEC_TIMEOUT_S}s)..."
 db_drained=0
 active_conns=""
 for _ in $(seq 1 "$MIGRATE_DRAIN_TIMEOUT_S"); do
-  active_conns="$(compose_cmd exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state IS NOT NULL;" 2>/dev/null | tr -d '[:space:]' || true)"
+  active_conns="$(compose_cmd_timeout "$MIGRATE_DRAIN_EXEC_TIMEOUT_S" exec -T postgres psql -U "$MIG_DB_USER" -d "$MIG_DB_NAME" -v ON_ERROR_STOP=1 -Atqc "SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() AND state IS NOT NULL;" 2>/dev/null | tr -d '[:space:]' || true)"
   if [[ "$active_conns" == "0" ]]; then
     db_drained=1
     break
   fi
   if [[ ! "$active_conns" =~ ^[0-9]+$ ]]; then
-    # The count could not be read as a non-negative integer (postgres not reachable
-    # this way or unexpected psql output); waiting longer cannot change that, so go
-    # on and let migrate report any real problem.
+    # The count could not be read as a non-negative integer; stop waiting immediately.
     break
   fi
   sleep 1
@@ -908,11 +1061,14 @@ done
 if [[ "$db_drained" -eq 1 ]]; then
   ok "Database connections drained cleanly."
 else
-  warn "Database still had non-zero connections after ${MIGRATE_DRAIN_TIMEOUT_S}s (last count=${active_conns:-unknown}); continuing with migrate."
+  err "Could not confirm database connections drained to 0 (last count=${active_conns:-unreadable}); aborting before migrate and restoring previous services..."
+  recover_previous_services_after_abort "before" || true
+  exit 1
 fi
 
 info "Running new version database migrations..."
-NEW_UPSTREAM_HEAD="$(resolve_new_upstream_head || true)"
+NEW_UPSTREAM_HEAD="$(resolve_alembic_head "${WORK_DIR}/migrations/versions" || true)"
+NEW_DALTON_HEAD="$(resolve_alembic_head "${WORK_DIR}/src/dalton/migrations/versions" || true)"
 PRE_MIGRATE_OK=0
 if pre_vers="$(read_alembic_versions)"; then
   IFS=$'\t' read -r PRE_MIGRATE_UP PRE_MIGRATE_DA <<< "$pre_vers"
@@ -946,20 +1102,22 @@ fi
 
 if [[ "$MIGRATE_RC" -ne 0 ]]; then
   err "Database migrations failed (exit ${MIGRATE_RC})."
-  # Safe automatic recovery (§6.3): when both Alembic versions are unchanged AND
-  # upstream was already at the new release's upstream head (so only pure
-  # transactional Dalton migrations could have executed and rolled back cleanly),
-  # restore pre-upgrade release files & images and restart stopped services.
+  # Safe automatic recovery (§6.3, R7 Decision #5): ONLY when ALL hold:
+  #   1) pre & post Alembic versions read cleanly and stayed identical;
+  #   2) upstream was ALREADY at the new release's upstream head (no upstream migrations ran);
+  #   3) pre-upgrade Dalton version was EXACTLY d046 AND new release Dalton head is d049
+  #      (confirming ONLY pure-transactional d049 was attempted and rolled back cleanly).
+  # All other cases (e.g. upgrading from <= d044 with autocommit_block migrations) stay
+  # MIGRATION_STATE="unknown" and require manual inspection / backup restore.
   if [[ "$PRE_MIGRATE_OK" -eq 1 && "$POST_MIGRATE_OK" -eq 1 \
         && "$POST_MIGRATE_UP" == "$PRE_MIGRATE_UP" \
         && "$POST_MIGRATE_DA" == "$PRE_MIGRATE_DA" \
         && -n "$NEW_UPSTREAM_HEAD" \
-        && "$PRE_MIGRATE_UP" == "$NEW_UPSTREAM_HEAD" ]]; then
-    warn "Alembic versions unchanged and upstream was already at head (${NEW_UPSTREAM_HEAD}); automatically restoring pre-upgrade files, image tags, and services..."
-    restore_pre_upgrade_files_and_images
-    compose_cmd up -d "${STOPPED_SERVICES[@]}"
-    MIGRATION_STATE="rolled_back"
-    AUTO_RECOVERED=1
+        && "$PRE_MIGRATE_UP" == "$NEW_UPSTREAM_HEAD" \
+        && "$PRE_MIGRATE_DA" == "d046" \
+        && "$NEW_DALTON_HEAD" == "d049" ]]; then
+    warn "Alembic versions unchanged (upstream at head ${NEW_UPSTREAM_HEAD}, Dalton d046 -> d049 only); automatically restoring pre-upgrade files, image tags, and services..."
+    recover_previous_services_after_abort "rolled_back" || true
   fi
   exit "$MIGRATE_RC"
 fi
