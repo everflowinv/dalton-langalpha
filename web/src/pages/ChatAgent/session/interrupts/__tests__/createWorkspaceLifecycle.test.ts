@@ -517,10 +517,44 @@ describe('create_workspace 4-state lifecycle: live vs history parity', () => {
     expect(pending).toHaveLength(0);
   });
 
-  it('settles a pre-upgrade submitting create_workspace card without tool_call_id on scope_changed error result', () => {
+  it('settles a pre-upgrade submitting create_workspace card without tool_call_id only on matching create_workspace result', () => {
     const preUpgradeMsgs: ChatMessage[] = [
       {
         ...makeAssistant('a-legacy'),
+        toolCallProcesses: {
+          'tc-bash-1': {
+            toolName: 'bash',
+            toolCall: { id: 'tc-bash-1', name: 'bash', args: { command: 'ls' } },
+            toolCallResult: null,
+            isInProgress: true,
+            isComplete: false,
+            order: 0,
+          },
+          'tc-other-create': {
+            toolName: 'manage_workspaces',
+            toolCall: {
+              id: 'tc-other-create',
+              name: 'manage_workspaces',
+              args: { action: 'create', name: 'OtherWS' },
+            },
+            toolCallResult: null,
+            isInProgress: true,
+            isComplete: false,
+            order: 1,
+          },
+          'tc-legacy-1': {
+            toolName: 'manage_workspaces',
+            toolCall: {
+              id: 'tc-legacy-1',
+              name: 'manage_workspaces',
+              args: { action: 'create', name: 'LegacyWS' },
+            },
+            toolCallResult: null,
+            isInProgress: true,
+            isComplete: false,
+            order: 2,
+          },
+        },
         workspaceProposals: {
           'intr-old': {
             status: 'submitting',
@@ -530,7 +564,29 @@ describe('create_workspace 4-state lifecycle: live vs history parity', () => {
         },
       },
     ];
-    const settled = settleLiveProposalFromResult(preUpgradeMsgs, 'tc-legacy-1', {
+
+    // Unrelated tool result with success: true must NOT settle the legacy card as approved.
+    const afterBash = settleLiveProposalFromResult(preUpgradeMsgs, 'tc-bash-1', {
+      content: JSON.stringify({ success: true, output: 'ok' }),
+    });
+    expect(afterBash).toBe(preUpgradeMsgs);
+    expect((afterBash[0] as AssistantMessage).workspaceProposals?.['intr-old']?.status).toBe('submitting');
+
+    // Unregistered tool_call_id must NOT settle the legacy card.
+    const afterUnknown = settleLiveProposalFromResult(preUpgradeMsgs, 'tc-unknown', {
+      content: JSON.stringify({ success: true }),
+    });
+    expect(afterUnknown).toBe(preUpgradeMsgs);
+
+    // A create_workspace result for a DIFFERENT workspace name must NOT settle LegacyWS.
+    const afterOtherCreate = settleLiveProposalFromResult(preUpgradeMsgs, 'tc-other-create', {
+      content: JSON.stringify({ success: true, workspace_name: 'OtherWS' }),
+    });
+    expect(afterOtherCreate).toBe(preUpgradeMsgs);
+    expect((afterOtherCreate[0] as AssistantMessage).workspaceProposals?.['intr-old']?.status).toBe('submitting');
+
+    // Now the matching manage_workspaces(action="create", name="LegacyWS") scope_changed result settles it.
+    const settled = settleLiveProposalFromResult(afterOtherCreate, 'tc-legacy-1', {
       status: 'error',
       content: JSON.stringify({
         success: false,

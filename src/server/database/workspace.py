@@ -867,6 +867,7 @@ async def create_workspace_on_computer(
     expected_computer_kind: Optional[str] = None,
     check_duplicate_snapshot: bool = False,
     expected_duplicate_workspace_id: Optional[str] = None,
+    expected_duplicate_workspace_name: Optional[str] = None,
     # --- DALTON-HOOK(cos-settings-tools): end ---
     conn=None,
 ) -> Optional[Dict[str, Any]]:
@@ -903,29 +904,17 @@ async def create_workspace_on_computer(
             # --- DALTON-HOOK(cos-settings-tools): begin ---
             # Under the per-user write lock, re-check duplicate live workspaces
             # using the same symbol-aware normalization the card used (e.g.
-            # 700.HK vs 0700.HK) so a concurrent create after snapshot capture
-            # aborts cleanly with scope_changed.
+            # 700.HK vs 0700.HK) so a concurrent create, rename, or deletion
+            # after snapshot capture aborts cleanly with scope_changed.
             if check_duplicate_snapshot:
-                from src.tools.secretary.approvals import is_duplicate_name
-
-                await cur.execute(
-                    f"""
-                    SELECT workspace_id, name
-                    FROM workspaces
-                    WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
-                    """,
-                    {"user_id": user_id},
-                )
-                live_rows = await cur.fetchall()
-                for live_ws in live_rows:
-                    live_id = str(live_ws["workspace_id"])
-                    if (
-                        expected_duplicate_workspace_id is not None
-                        and live_id == expected_duplicate_workspace_id
-                    ):
-                        continue
-                    if is_duplicate_name(name, str(live_ws.get("name") or "")):
-                        return None
+                if not await check_duplicate_snapshot_unchanged(
+                    cur,
+                    user_id,
+                    name,
+                    expected_duplicate_workspace_id=expected_duplicate_workspace_id,
+                    expected_duplicate_workspace_name=expected_duplicate_workspace_name,
+                ):
+                    return None
             # --- DALTON-HOOK(cos-settings-tools): end ---
             held = await get_workspace_dir_names_for_computer(computer_id, conn=owned)
             computer = await get_computer(computer_id, conn=owned)
@@ -1294,6 +1283,62 @@ async def get_workspaces_for_user(
         raise
 
 
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+async def check_duplicate_snapshot_unchanged(
+    cur,
+    user_id: str,
+    name: str,
+    *,
+    expected_duplicate_workspace_id: Optional[str] = None,
+    expected_duplicate_workspace_name: Optional[str] = None,
+) -> bool:
+    """Verify under ``lock_user_writes`` that the user's live-workspace
+    duplicate state still matches what the confirmation card displayed.
+
+    Returns False (triggering ``scope_changed``) when:
+    - Any live workspace other than ``expected_duplicate_workspace_id`` matches
+      ``is_duplicate_name(name, live_name)`` (including when the card had
+      ``duplicate_check_unavailable=True`` and the DB has now recovered);
+    - A listed ``expected_duplicate_workspace_id`` was deleted, renamed away
+      from ``expected_duplicate_workspace_name``, or no longer duplicates
+      ``name``.
+    """
+    from src.tools.secretary.approvals import is_duplicate_name
+
+    await cur.execute(
+        f"""
+        SELECT workspace_id, name
+        FROM workspaces
+        WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
+        """,
+        {"user_id": user_id},
+    )
+    live_rows = await cur.fetchall()
+    matched_expected = False
+    for live_ws in live_rows:
+        live_id = str(live_ws["workspace_id"])
+        live_name = str(live_ws.get("name") or "")
+        if (
+            expected_duplicate_workspace_id is not None
+            and live_id == expected_duplicate_workspace_id
+        ):
+            if (
+                expected_duplicate_workspace_name is not None
+                and live_name != expected_duplicate_workspace_name
+            ):
+                return False
+            if not is_duplicate_name(name, live_name):
+                return False
+            matched_expected = True
+            continue
+        if is_duplicate_name(name, live_name):
+            return False
+    if expected_duplicate_workspace_id is not None and not matched_expected:
+        return False
+    return True
+# --- DALTON-HOOK(cos-settings-tools): end ---
+
+
 async def update_workspace(
     workspace_id: str,
     name: Optional[str] = None,
@@ -1365,17 +1410,58 @@ async def update_workspace(
         update_clause = ", ".join(updates)
 
         try:
-            async with _ws_cursor(conn) as cur:
-                await cur.execute(
-                    f"""
-                    UPDATE workspaces
-                    SET {update_clause}
-                    WHERE workspace_id = %s AND status != 'deleted'{where}
-                    RETURNING {_WS_COLS}
-                    """,
-                    params,
-                )
-                result = await cur.fetchone()
+            # --- DALTON-HOOK(cos-settings-tools): begin ---
+            if name is not None:
+                from src.tools.secretary.approvals import is_duplicate_name
+
+                async with _ws_transaction(conn) as cur:
+                    await cur.execute(
+                        "SELECT user_id FROM workspaces WHERE workspace_id = %s AND status != 'deleted'",
+                        (workspace_id,),
+                    )
+                    owner = await cur.fetchone()
+                    if owner is None:
+                        return None
+                    owner_user_id = str(owner["user_id"])
+                    await lock_user_writes(cur, owner_user_id)
+                    await cur.execute(
+                        f"""
+                        SELECT workspace_id, name
+                        FROM workspaces
+                        WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
+                        """,
+                        {"user_id": owner_user_id},
+                    )
+                    for live_ws in await cur.fetchall():
+                        live_id = str(live_ws["workspace_id"])
+                        if live_id == str(workspace_id):
+                            continue
+                        live_name = str(live_ws.get("name") or "")
+                        if is_duplicate_name(name, live_name):
+                            raise WorkspaceNameTaken(live_name, live_id)
+                    await cur.execute(
+                        f"""
+                        UPDATE workspaces
+                        SET {update_clause}
+                        WHERE workspace_id = %s AND status != 'deleted'{where}
+                        RETURNING {_WS_COLS}
+                        """,
+                        params,
+                    )
+                    result = await cur.fetchone()
+            else:
+                async with _ws_cursor(conn) as cur:
+                    await cur.execute(
+                        f"""
+                        UPDATE workspaces
+                        SET {update_clause}
+                        WHERE workspace_id = %s AND status != 'deleted'{where}
+                        RETURNING {_WS_COLS}
+                        """,
+                        params,
+                    )
+                    result = await cur.fetchone()
+            # --- DALTON-HOOK(cos-settings-tools): end ---
         except UniqueViolation as e:
             if name is None or _violated_index(e) != _USER_NAME_INDEX:
                 raise

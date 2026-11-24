@@ -325,6 +325,22 @@ def _verify_oss_loopback_web_caller(raw_request: Any) -> bool:
     return True
 
 
+def _is_reject_answer(answer: Any) -> bool:
+    """True when the caller explicitly declined the pending confirmation."""
+    decisions = (
+        answer.get("decisions")
+        if isinstance(answer, dict)
+        else getattr(answer, "decisions", None)
+    )
+    if not decisions:
+        return False
+    first = decisions[0]
+    decision_type = (
+        first.get("type") if isinstance(first, dict) else getattr(first, "type", None)
+    )
+    return decision_type == "reject"
+
+
 def _snapshot_matches_action(
     snapshot: dict[str, Any], action_req: dict[str, Any]
 ) -> bool:
@@ -465,6 +481,11 @@ async def _verify_web_confirm_resume(
     rewritten: dict[str, Any] | None = None
     for iid in answers:
         if iid not in guarded_by_id:
+            continue
+        # An explicit decline on an expired or pre-upgrade card settles as
+        # rejected rather than being rewritten to approve + scope_changed, so
+        # live display and history replay agree.
+        if _is_reject_answer(answers[iid]):
             continue
         action_req = _interrupt_action_request(guarded_by_id[iid]) or {}
         tool_call_id = action_req.get("tool_call_id")

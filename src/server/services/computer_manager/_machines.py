@@ -279,6 +279,10 @@ class MachineLifecycleMixin:
         default_name: Optional[str] = None,
         resource_tier: Optional[str] = None,
         expected_kind: Optional[str] = None,
+        check_duplicate_snapshot: bool = False,
+        workspace_name: Optional[str] = None,
+        expected_duplicate_workspace_id: Optional[str] = None,
+        expected_duplicate_workspace_name: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a hosted cloud primary computer for a confirmed snapshot that
         observed no primary computer.
@@ -287,7 +291,7 @@ class MachineLifecycleMixin:
         or ``ssh``), uses ``expected_kind`` frozen in the snapshot rather than
         re-reading the deployment default, never promotes an existing own
         machine, and aborts with ``ApprovalScopeChangedError`` if any primary
-        computer appeared before this execution ran.
+        computer appeared or the duplicate snapshot drifted before creation.
         """
         kind = expected_kind or self.config.sandbox.provider
         if (
@@ -306,6 +310,25 @@ class MachineLifecycleMixin:
             user_row = await get_user(user_id, conn=conn)
             if (user_row or {}).get("computer_choice") == "own_machine":
                 raise ApprovalScopeChangedError("情况已变化，请重新发起")
+            target_ws_name = workspace_name or default_name
+            if check_duplicate_snapshot and target_ws_name:
+                from psycopg.rows import dict_row
+                from src.server.database.user_lock import lock_user_writes
+                from src.server.database.workspace import (
+                    check_duplicate_snapshot_unchanged,
+                )
+
+                async with conn.transaction():
+                    async with conn.cursor(row_factory=dict_row) as cur:
+                        await lock_user_writes(cur, user_id)
+                        if not await check_duplicate_snapshot_unchanged(
+                            cur,
+                            user_id,
+                            target_ws_name,
+                            expected_duplicate_workspace_id=expected_duplicate_workspace_id,
+                            expected_duplicate_workspace_name=expected_duplicate_workspace_name,
+                        ):
+                            raise ApprovalScopeChangedError("情况已变化，请重新发起")
             computer = await self.create_computer_for_user(
                 user_id,
                 kind=kind,

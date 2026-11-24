@@ -316,6 +316,29 @@ async def _folder_ready_result(
 # --- DALTON-HOOK(workspace-folder-ready): end ---
 
 
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+def _is_resuming_interrupt() -> bool:
+    """Return True when the active LangGraph task already carries a resume
+    payload for ``interrupt()``, so ``hitl_confirm`` consumes the answer
+    before any pre-interrupt checks can preempt it."""
+    try:
+        from langgraph._internal._constants import CONFIG_KEY_SCRATCHPAD
+        from langgraph.config import get_config
+
+        scratchpad = get_config().get("configurable", {}).get(CONFIG_KEY_SCRATCHPAD)
+        if scratchpad is None:
+            return False
+        if getattr(scratchpad, "resume", None):
+            return True
+        get_null_resume = getattr(scratchpad, "get_null_resume", None)
+        if callable(get_null_resume) and get_null_resume(False) is not None:
+            return True
+    except Exception:
+        return False
+    return False
+# --- DALTON-HOOK(cos-settings-tools): end ---
+
+
 async def workspaces_create(
     user_id: str,
     name: str | None,
@@ -409,10 +432,16 @@ async def workspaces_create(
     raw_coverage_kind = str(coverage_kind or "").strip().lower()
     requested_coverage = raw_coverage_kind not in ("", "none", "other")
     coverage_active: bool | None = None
-    if requested_coverage:
-        coverage_active = await is_workspace_coverage_registration_active(user_id)
-    wants_coverage = bool(requested_coverage and coverage_active)
-    if not allow_duplicate_company:
+
+    async def _ensure_coverage_active() -> bool:
+        nonlocal coverage_active
+        if coverage_active is None:
+            coverage_active = await is_workspace_coverage_registration_active(user_id)
+        return bool(coverage_active)
+
+    async def _check_company_dedup() -> Command | None:
+        if allow_duplicate_company:
+            return None
         dup = None
         try:
             dup = await find_existing_company_workspace(
@@ -441,12 +470,10 @@ async def workspaces_create(
         if (
             dup is not None
             and dup.suggestion is not None
-            and not wants_coverage
+            and not (requested_coverage and await _ensure_coverage_active())
             and not skip_coverage_suggestion
         ):
-            if coverage_active is None:
-                coverage_active = await is_workspace_coverage_registration_active(user_id)
-            if coverage_active:
+            if await _ensure_coverage_active():
                 suggestion = dup.suggestion_payload()
                 kind_label = (
                     "公司" if dup.suggestion.coverage_kind == "company" else "行业"
@@ -470,6 +497,16 @@ async def workspaces_create(
                     suggestion=suggestion,
                     **preapproved_meta,
                 )
+        return None
+
+    # DALTON-HOOK(cos-settings-tools): on interrupt resume, read the interrupt
+    # answer first so a server-stamped scope_changed or user decline is never
+    # preempted by a fresh company dedup check.
+    resuming = (not preapproved) and _is_resuming_interrupt()
+    if not resuming:
+        early_dedup = await _check_company_dedup()
+        if early_dedup is not None:
+            return early_dedup
     # --- DALTON-HOOK(workspace-dedup): end ---
 
     if not preapproved:
@@ -537,6 +574,15 @@ async def workspaces_create(
                 )
             return decline_routing_command(declined, response, tool_call_id)
 
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        if resuming:
+            post_dedup = await _check_company_dedup()
+            if post_dedup is not None:
+                return post_dedup
+        # --- DALTON-HOOK(cos-settings-tools): end ---
+
+    wants_coverage = bool(requested_coverage and await _ensure_coverage_active())  # DALTON-HOOK(workspace-dedup)
+
     # --- DALTON-HOOK(workspace-dedup): begin ---
     if allow_duplicate_company:
         matched_ids: list[str] = []
@@ -586,12 +632,15 @@ async def workspaces_create(
                 "name": name,
                 "description": description,
                 "verify_snapshot": True,
+                "check_duplicate_snapshot": True,
             }
-            if not bool(snapshot.get("duplicate_check_unavailable")):
-                create_kwargs["check_duplicate_snapshot"] = True
-                if snapshot.get("duplicate_workspace_id") is not None:
-                    create_kwargs["expected_duplicate_workspace_id"] = str(
-                        snapshot["duplicate_workspace_id"]
+            if snapshot.get("duplicate_workspace_id") is not None:
+                create_kwargs["expected_duplicate_workspace_id"] = str(
+                    snapshot["duplicate_workspace_id"]
+                )
+                if snapshot.get("duplicate_workspace_name") is not None:
+                    create_kwargs["expected_duplicate_workspace_name"] = str(
+                        snapshot["duplicate_workspace_name"]
                     )
             if snapshot_computer_kind is not None:
                 create_kwargs["expected_computer_kind"] = str(snapshot_computer_kind)

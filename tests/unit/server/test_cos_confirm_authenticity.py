@@ -776,3 +776,49 @@ def test_sse_producer_interrupt_debug_log_emits_only_whitelisted_fields(
     assert secret_marker not in combined
     assert "action_types=['create_workspace']" in combined
     assert INTERRUPT_ID in combined
+
+
+@pytest.mark.asyncio
+async def test_rejecting_expired_card_without_snapshot_preserves_reject_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 Decision 6: when the authenticated initiator clicks Reject on an
+    expired/pre-upgrade card missing approval_snapshots (or with a drifted
+    snapshot), settle_resume_request keeps the reject decision instead of
+    rewriting it to approve + scope_changed so live display and replay agree."""
+    _setup_checkpointer(monkeypatch, _checkpoint_tuple(include_snapshot=False))
+    raw_req = _make_raw_request(headers={"sec-fetch-site": "same-origin"})
+    principal = Principal(user_id=OWNER_ID, auth="session")
+    thread_meta = {"user_id": OWNER_ID, "workspace_owner_id": OWNER_ID}
+
+    reject_req = _resume_body(decision_type="reject")
+    approve_req = _resume_body(decision_type="approve")
+
+    with (
+        patch("src.dalton.settings.get_dalton_auth_mode", return_value="local"),
+        patch("src.dalton.auth.is_dalton_supabase_auth_enabled", return_value=False),
+    ):
+        settled_reject = await settle_resume_request(
+            THREAD_ID,
+            reject_req,
+            principal=principal,
+            raw_request=raw_req,
+            thread_meta=thread_meta,
+        )
+        settled_approve = await settle_resume_request(
+            THREAD_ID,
+            approve_req,
+            principal=principal,
+            raw_request=raw_req,
+            thread_meta=thread_meta,
+        )
+
+    assert settled_reject.hitl_response is not None
+    rej_answer = settled_reject.hitl_response[INTERRUPT_ID]
+    assert rej_answer.decisions[0].type == "reject"
+    assert not rej_answer.scope_changed
+
+    assert settled_approve.hitl_response is not None
+    app_answer = settled_approve.hitl_response[INTERRUPT_ID]
+    assert app_answer.decisions[0].type == "approve"
+    assert app_answer.scope_changed is True

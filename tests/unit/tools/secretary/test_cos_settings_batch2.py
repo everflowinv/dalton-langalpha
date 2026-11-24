@@ -865,3 +865,237 @@ def test_cos_prompt_and_docstring_cover_computer_and_confirmation_flow() -> None
     assert "pass `computer`" in section
     assert "scope_changed" in section
     assert "confirmation card" in section
+
+
+@pytest.mark.asyncio
+async def test_duplicate_recheck_always_enabled_even_when_duplicate_check_unavailable_and_passes_expected_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 Decision 1:
+    1) Even when snapshot.duplicate_check_unavailable is True, workspaces_create
+       still passes check_duplicate_snapshot=True to WorkspaceManager.create_workspace.
+    2) When the card listed a duplicate, both expected_duplicate_workspace_id and
+       expected_duplicate_workspace_name are passed for locked re-verification."""
+    from src.tools.secretary.tools import workspaces_create
+
+    mgr = create_autospec(WorkspaceManager, instance=True)
+    mgr.create_workspace.return_value = {
+        "workspace_id": WS_1,
+        "name": "700.HK",
+        "computer_id": CLOUD_1,
+        "dir_name": "700.HK",
+    }
+    monkeypatch.setattr(
+        "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+        create_autospec(WorkspaceManager.get_instance, return_value=mgr),
+    )
+    monkeypatch.setattr(
+        "src.dalton.coverage.dedup.find_existing_company_workspace",
+        create_autospec(
+            lambda _uid, _name, channel="cos": None,
+            side_effect=lambda *_a, **_kw: _async_val(None),
+        ),
+    )
+    monkeypatch.setattr(
+        "src.tools.secretary.tools._folder_ready_result",
+        create_autospec(
+            _folder_ready_result,
+            return_value={"folder_ready": False, "folder_path": None},
+        ),
+    )
+    monkeypatch.setattr(
+        "src.tools.secretary.tools.hitl_confirm",
+        lambda _action, _payload: (True, {"decisions": [{"type": "approve"}]}),
+    )
+
+    # Case A: duplicate_check_unavailable=True must still enable locked duplicate recheck.
+    snap_unavail = {
+        "action": "create_workspace",
+        "tool_call_id": "call-unavail-1",
+        "workspace_name": "700.HK",
+        "workspace_description": "",
+        "computer_id": CLOUD_1,
+        "computer_name": "Cloud Primary",
+        "computer_kind": "docker",
+        "computer_is_own_machine": False,
+        "bootstrap_cloud_primary": False,
+        "duplicate_workspace_id": None,
+        "duplicate_workspace_name": None,
+        "duplicate_check_unavailable": True,
+        "precheck_error": None,
+    }
+    res_a = await workspaces_create(
+        USER_ID, "700.HK", "", "call-unavail-1", preapproved=False, snapshot=snap_unavail
+    )
+    assert json.loads(res_a.update["messages"][0].content)["success"] is True
+    kwargs_a = mgr.create_workspace.await_args.kwargs
+    assert kwargs_a["check_duplicate_snapshot"] is True
+    assert "expected_duplicate_workspace_id" not in kwargs_a
+
+    # Case B: listed duplicate carries both ID and name for locked rename/delete checks.
+    mgr.create_workspace.reset_mock()
+    snap_dup = {
+        **snap_unavail,
+        "tool_call_id": "call-dup-1",
+        "duplicate_check_unavailable": False,
+        "duplicate_workspace_id": WS_1,
+        "duplicate_workspace_name": "0700.HK",
+    }
+    res_b = await workspaces_create(
+        USER_ID, "700.HK", "", "call-dup-1", preapproved=False, snapshot=snap_dup
+    )
+    assert json.loads(res_b.update["messages"][0].content)["success"] is True
+    kwargs_b = mgr.create_workspace.await_args.kwargs
+    assert kwargs_b["check_duplicate_snapshot"] is True
+    assert kwargs_b["expected_duplicate_workspace_id"] == WS_1
+    assert kwargs_b["expected_duplicate_workspace_name"] == "0700.HK"
+
+
+@pytest.mark.asyncio
+async def test_real_langgraph_resume_reads_scope_changed_and_reject_before_company_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 Decision 3: using a real LangGraph StateGraph + InMemorySaver,
+    when a pre-upgrade create_workspace interrupt resumes with server-stamped
+    scope_changed=True (or user reject) after a matching company workspace
+    appeared, the tool reads the interrupt answer first and returns
+    status='error' code='scope_changed' (or User declined) without running
+    find_existing_company_workspace."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, MessagesState, StateGraph
+    from langgraph.types import Command as LGCommand
+
+    from src.tools.secretary.tools import workspaces_create
+
+    dedup_calls: list[str] = []
+    company_exists_now = {"flag": False}
+
+    async def _fake_find_company(uid: str, ws_name: str, channel: str = "cos"):
+        dedup_calls.append(ws_name)
+        if company_exists_now["flag"]:
+            return SimpleNamespace(
+                matches=[SimpleNamespace(workspace_id=WS_1, name="NVIDIA")],
+                message="已存在同名公司工作区 NVIDIA",
+                suggestion=None,
+                suggestion_payload=lambda: None,
+                matches_payload=lambda: [{"workspace_id": WS_1, "name": "NVIDIA"}],
+            )
+        return None
+
+    monkeypatch.setattr(
+        "src.dalton.coverage.dedup.find_existing_company_workspace",
+        _fake_find_company,
+    )
+    monkeypatch.setattr(
+        "src.tools.secretary.approvals.duplicate_workspace",
+        create_autospec(
+            lambda _uid, _name: None,
+            side_effect=lambda *_a, **_kw: _async_val((None, True)),
+        ),
+    )
+
+    async def _tool_node(_state: MessagesState):
+        return await workspaces_create(
+            USER_ID,
+            "NVDA",
+            "GPU research",
+            "call-lg-1",
+            preapproved=False,
+            snapshot=None,
+        )
+
+    builder = StateGraph(MessagesState)
+    builder.add_node("create", _tool_node)
+    builder.add_edge(START, "create")
+    builder.add_edge("create", END)
+
+    # Scenario 1: server-stamped scope_changed=True must NOT be preempted by company_workspace_exists.
+    graph_sc = builder.compile(checkpointer=InMemorySaver())
+    cfg_sc = {"configurable": {"thread_id": "lg-scope-changed"}}
+    paused_sc = await graph_sc.ainvoke({"messages": []}, config=cfg_sc)
+    assert "__interrupt__" in paused_sc
+    intr_sc_id = paused_sc["__interrupt__"][0].id
+    assert len(dedup_calls) == 1
+
+    # While paused, a matching company workspace appears.
+    company_exists_now["flag"] = True
+    dedup_calls.clear()
+
+    resumed_sc = await graph_sc.ainvoke(
+        LGCommand(
+            resume={
+                intr_sc_id: {
+                    "decisions": [{"type": "approve"}],
+                    "scope_changed": True,
+                }
+            }
+        ),
+        config=cfg_sc,
+    )
+    assert dedup_calls == []
+    tool_msg_sc = resumed_sc["messages"][-1]
+    assert tool_msg_sc.status == "error"
+    body_sc = json.loads(tool_msg_sc.content)
+    assert body_sc["success"] is False
+    assert body_sc["code"] == "scope_changed"
+
+    # Scenario 2: explicit reject on resume must NOT be preempted by company_workspace_exists either.
+    company_exists_now["flag"] = False
+    dedup_calls.clear()
+    graph_rej = builder.compile(checkpointer=InMemorySaver())
+    cfg_rej = {"configurable": {"thread_id": "lg-reject"}}
+    paused_rej = await graph_rej.ainvoke({"messages": []}, config=cfg_rej)
+    intr_rej_id = paused_rej["__interrupt__"][0].id
+    assert len(dedup_calls) == 1
+
+    company_exists_now["flag"] = True
+    dedup_calls.clear()
+
+    resumed_rej = await graph_rej.ainvoke(
+        LGCommand(resume={intr_rej_id: {"decisions": [{"type": "reject"}]}}),
+        config=cfg_rej,
+    )
+    assert dedup_calls == []
+    tool_msg_rej = resumed_rej["messages"][-1]
+    assert tool_msg_rej.content.startswith("User declined workspace creation")
+
+
+@pytest.mark.asyncio
+async def test_workspace_manager_bootstrap_reclaims_orphan_computer_if_insert_aborts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 Decision 5: if create_workspace_on_computer returns None after
+    bootstrap_cloud_primary_computer minted a cloud primary, WorkspaceManager
+    reclaims the empty bootstrapped computer before raising ApprovalScopeChangedError."""
+    ws_mgr = object.__new__(WorkspaceManager)
+    bootstrap_mock = create_autospec(
+        ws_mgr.bootstrap_cloud_primary_computer,
+        return_value=_computer_row(CLOUD_2, name="FirstWS", kind="docker", is_primary=True),
+    )
+    reclaim_mock = create_autospec(
+        WorkspaceManager._reclaim_empty_bootstrapped_computer,
+        return_value=None,
+    )
+    ws_mgr.bootstrap_cloud_primary_computer = bootstrap_mock
+    ws_mgr._reclaim_empty_bootstrapped_computer = reclaim_mock
+    monkeypatch.setattr(
+        "src.server.services.workspace_manager.create_workspace_on_computer",
+        create_autospec(
+            lambda *a, **kw: None,
+            side_effect=lambda *_a, **_kw: _async_val(None),
+        ),
+    )
+
+    with pytest.raises(ApprovalScopeChangedError):
+        await ws_mgr.create_workspace(
+            user_id=USER_ID,
+            name="700.HK",
+            bootstrap_cloud_primary=True,
+            verify_snapshot=True,
+            expected_computer_kind="docker",
+            check_duplicate_snapshot=True,
+        )
+
+    assert bootstrap_mock.await_args.kwargs["check_duplicate_snapshot"] is True
+    assert bootstrap_mock.await_args.kwargs["workspace_name"] == "700.HK"
+    reclaim_mock.assert_awaited_once_with(CLOUD_2)

@@ -2,7 +2,7 @@
 
 > **文档路径**：`docs/dalton/features/cos-settings-tools.md`  
 > **修订轮次**：第 3 轮定案版  
-> **覆盖范围**：① 通过研究总监与网页归档工作区（服务端快照持久化、迁出与归档同级行锁互斥、归档栅栏仅在提供商已结束时清除、网页与研究总监一致的整机确认、源头结构化日志与本地异常捕获）；② 在指定电脑上新建工作区（电脑名称/ID 解析、首次无主电脑时限定新建托管云端电脑、自有电脑逐次确认、实时与回放四态卡片）；③ 托管自动化的 `llm_model`（锁前预读偏好、事务内锁行至提交复核工作区/财报日历例外权限/电脑绑定与运行位置、跨人系统目录限制贯通轮次解析与订阅回退）；④ `.agy/cos_settings_audit.md` 遗漏项第 2–6 条完成度核对。
+> **覆盖范围**：① 通过研究总监与网页归档工作区（服务端快照持久化、迁出与归档同级行锁互斥、归档栅栏仅在提供商已结束时清除、网页与研究总监一致的整机确认、源头结构化日志与本地异常捕获）；② 在指定电脑上新建工作区（电脑名称/ID 解析、首次进入按上游规则自动准备主电脑且新建执行时仍无主电脑则限定新建托管云端电脑、自有电脑逐次确认、实时与回放四态卡片）；③ 托管自动化的 `llm_model`（锁前预读偏好、事务内锁行至提交复核工作区/财报日历例外权限/电脑绑定与运行位置、跨人系统目录限制贯通轮次解析与订阅回退）；④ `.agy/cos_settings_audit.md` 遗漏项第 2–6 条完成度核对。
 
 ---
 
@@ -87,7 +87,7 @@ flowchart TD
     M["模型输出工具调用 (tool_call_id)"] --> MW["StandingApprovalMiddleware.aafter_model<br/>解析电脑/整机工作区并持久化 approval_snapshots[tool_call_id]"]
     MW -->|"满足常驻自动放行 (云端电脑且唯一名称)"| EXEC_CREATE["只读快照 computer_id / bootstrap_cloud_primary<br/>数据库事务内复核并创建"]
     MW -->|"归档 或 需确认的新建 (含自有电脑)"| INT["hitl_confirm interrupt()<br/>卡片展示快照 + 渠道仅发中文通用提示与登录链接"]
-    INT -->|"网页会话核验 + 发起人本人 + 匹配 interrupt_id/快照"| RESUME["恢复重入工具函数<br/>只读 approval_snapshots[tool_call_id]"]
+    INT -->|"登录会话核验 + 发起人本人 + 匹配 interrupt_id/快照"| RESUME["恢复重入工具函数<br/>只读 approval_snapshots[tool_call_id]"]
     RESUME --> TX["PostgreSQL 单事务按序加锁复核快照<br/>(归档与迁出同级锁源电脑 + 打 config.archiving=true)"]
     TX -->|"完全一致"| DONE["执行动作并结算卡片为『执行成功』"]
     TX -->|"任意偏差"| ABORT["回滚事务，返回 code=scope_changed<br/>卡片显示『情况已变化，请重新发起』"]
@@ -279,7 +279,7 @@ flowchart TD
 |---|---|---|
 | `DALTON-HOOK(cos-settings-tools)` | `src/tools/secretary/approvals.py`、`src/tools/secretary/chief_of_staff.py`、`src/tools/secretary/tools.py`、`src/tools/secretary/_commands.py` | `StandingApprovalState.approval_snapshots` 快照持久化、首次无主电脑 `bootstrap_cloud_primary` 规则、自有电脑扣留且共用同一 `computer_id`、`manage_workspaces` 的 `archive` 与 `create(computer=...)`、`list` 多电脑输出 `computer_id`、`_folder_ready_result` 结构化白名单日志。 |
 | `DALTON-HOOK(cos-settings-tools)` | `src/server/database/{sql_fences.py,computer.py,workspace_move.py}`、`src/server/services/workspace_manager.py`、`src/server/services/computer_manager/{_machines.py,_lifecycle.py}`、`src/server/dependencies/cli_approval.py`、`src/server/app/{workspaces.py,computers.py}` | `FENCE_TAKES_WORKSPACES` 排除 `config.archiving = true`、`claim_workspace_move` 源电脑同级加锁、单事务 `claim_computer_for_archive` 锁工作区后复查迁移（含过期 `staged`/`committed`）、仅在提供商终态清除 `archiving` 栅栏、两个 HTTP 归档入口本地捕获沙箱异常并输出白名单日志。 |
-| `DALTON-HOOK(cos-settings-tools)` | `src/server/models/chat.py`、`src/server/app/threads/messaging.py`、`src/server/handlers/checkpoint_handler.py`、`src/server/services/{thread_agent.py,thread_status.py}` | `settle_resume_request` 按认证模式核验第一方 `session`（兼容 `oss` 回环试用并拦截渠道/API 客户端）、发起人、当前 `interrupt_id` 与快照；`ChatRequest.llm_model_system_only` 与 `thread_agent.py` 透传 `ignore_custom_models`；`thread_status.py` 输出当前挂起 `pending_interrupt_ids`。 |
+| `DALTON-HOOK(cos-settings-tools)` | `src/server/models/chat.py`、`src/server/app/threads/messaging.py`、`src/server/handlers/checkpoint_handler.py`、`src/server/services/{thread_agent.py,thread_status.py}` | `settle_resume_request` 按认证模式核验发起人本人登录会话（`local`/`supabase` 核验 `session` 并拒绝 `service`/`pat`/`oauth`/`computer` 与渠道；`oss` 免登录回环试用模式跳过身份认证并拦截带凭据、渠道标记与跨站请求）、发起人、当前 `interrupt_id` 与快照；`ChatRequest.llm_model_system_only` 与 `thread_agent.py` 透传 `ignore_custom_models`；`thread_status.py` 输出当前挂起 `pending_interrupt_ids`。 |
 | `DALTON-HOOK(cos-settings-tools)` | `src/server/services/automations/lifecycle.py`、`src/server/services/automation_executor.py`、`src/ptc_agent/agent/prompts/templates/components/{chief_of_staff.md.j2,user_profile.md.j2}` | `automation_executor.py` 携带 `llm_model_system_only` 进入请求与运行元数据；提示词补充选电脑新建、归档引导与 `llm_model` 参数说明。 |
 | `DALTON-HOOK(cos-settings-tools)` | `web/src/types/chat.ts`、`web/src/pages/ChatAgent/components/{ProposalCard.tsx,SettledStep.tsx,CreateWorkspaceCard.tsx,SecretaryConfirmCard.tsx,SandboxSettingsPanel.tsx,sandbox/OverviewTab.tsx}`、`web/src/pages/ChatAgent/components/messageList/{MessageContentSegments.tsx,buildRenderBlocks.ts,contentProjection.ts}`、`web/src/pages/ChatAgent/session/interrupts/{buckets.ts,useInterruptAnswers.ts,fromLiveEvent.ts,fromHistoryEvent.ts}`、`web/src/pages/ChatAgent/session/history/resumeSettlement.ts`、`web/src/pages/ChatAgent/session/stream/processStreamEvent.ts`、`web/src/pages/ChatAgent/utils/preapprovedCards.ts`、`web/src/locales/{zh-CN,en-US}.json` | 对话确认卡片按 `tool_call_id` 关联四态结算与渲染块登记、自有电脑隐藏「始终允许」、网页端沙箱概览归档整机确认弹窗与移动端自适应布局。 |
 | Dalton 自有目录（直接维护） | `src/dalton/tools/director_tools.py`、`src/dalton/autonomy/schedule.py`、`src/dalton/app/router.py`、`src/dalton/services/{automation_subscription_fallback.py,automation_thread_model.py}`、`integrations/dalton-channel-gateway/src/{orchestrator.ts,backend-client.ts}` | `dalton_schedule_automation` 暴露 `llm_model`、锁前偏好加载、事务内锁行至提交复核（含财报日历例外）与跨人私有模型隐藏；订阅回退与续跑轮次透传 `ignore_custom_models`；渠道网关通用中文提示及按 `interrupt_id` 清理替换旧待确认项。 |
@@ -294,8 +294,8 @@ flowchart TD
 
 | 能力项 | 本人操作（`A == B`） | 普通内部同事跨人访问（`A != B`，已启用 `colleague_sharing`） | 管理员（PM）跨人操作（`A != B`） | 外部成员（`external`） |
 |---|---|---|---|---|
-| **1. 归档工作区** `manage_workspaces(action="archive")` 与网页归档 | 允许归档本人名下已停止、常规工作区所在且提供商支持冷归档（Daytona）的电脑（须经本人网页点击确认）。当前运行研究总监轮次的电脑引导前往网页停止后归档。 | **研究总监与个人电脑 HTTP 路由均拦截**：研究总监统一返回 `"workspace not found"`，个人电脑 HTTP 路由返回 `403`（`src/server/services/shared_workspaces/access.py:287-288`）。 | **他人个人电脑一律拦截**（研究总监返回 `"workspace not found"`，个人电脑 HTTP 路由返回 `403`）。仅组织托管账户（`is_holder(owner)`）名下的组织共享工作区允许组织管理员通过网页端执行整机确认归档（`src/server/services/shared_workspaces/access.py:289-291`）。 | 范围限于外部成员本人名下工作区。 |
-| **2. 指定电脑新建工作区** `manage_workspaces(action="create", computer=...)` | 允许在本人名下任意存活且就绪的电脑上新建工作区（无主电脑时限定新建托管云端电脑）；目标为自有电脑（`MACHINE_KINDS`）时逐次弹卡确认；覆盖单元自动登记对内部成员与管理员生效。 | 新工作区固定创建在调用者 **A 本人**名下，`computer` 仅在 `get_computer_roster(A)` 中解析；传入 B 的电脑标识返回目标缺失提示。 | 同左，仅在管理员本人名下电脑创建本人工作区。 | 允许在外部成员本人电脑新建常规工作区，自动跳过团队覆盖单元登记（`src/tools/secretary/tools.py:319`）。 |
+| **1. 归档工作区** `manage_workspaces(action="archive")` 与网页归档 | 允许归档本人名下已停止、常规工作区所在且提供商支持冷归档（Daytona）的电脑（须经发起人本人登录会话确认；免登录回环试用模式按 §3.2 边界执行）。当前运行研究总监轮次的电脑引导前往网页停止后归档。 | **研究总监与个人电脑 HTTP 路由均拦截**：研究总监统一返回 `"workspace not found"`，个人电脑 HTTP 路由返回 `403`（`src/server/services/shared_workspaces/access.py:287-288`）。 | **他人个人电脑一律拦截**（研究总监返回 `"workspace not found"`，个人电脑 HTTP 路由返回 `403`）。仅组织托管账户（`is_holder(owner)`）名下的组织共享工作区允许组织管理员通过网页端执行整机确认归档（`src/server/services/shared_workspaces/access.py:289-291`）。 | 范围限于外部成员本人名下工作区。 |
+| **2. 指定电脑新建工作区** `manage_workspaces(action="create", computer=...)` | 允许在本人名下任意存活且就绪的电脑上新建工作区（首次进入研究总监时按上游规则自动准备主电脑，新建执行时仍无主电脑则限定新建托管云端电脑）；目标为自有电脑（`MACHINE_KINDS`）时逐次弹卡确认；覆盖单元自动登记对内部成员与管理员生效。 | 新工作区固定创建在调用者 **A 本人**名下，`computer` 仅在 `get_computer_roster(A)` 中解析；传入 B 的电脑标识返回目标缺失提示。 | 同左，仅在管理员本人名下电脑创建本人工作区。 | 允许在外部成员本人电脑新建常规工作区，自动跳过团队覆盖单元登记（`src/tools/secretary/tools.py:319`）。 |
 | **3. 托管自动化的 `llm_model`** `dalton_schedule_automation` | 允许修改本人工作区受管任务及本人 `dalton-earnings-calendar`（`src/dalton/autonomy/schedule.py:799-811,1078-1086`）的 `llm_model`（其余 `Home` 全局任务要求本人具备 PM 身份），支持系统模型、本人自定义模型与自定义服务商。 | ① 绑定活跃覆盖单元的工作区：限定当前主分析师（`lead_analyst_user_id == A`）可改，其余同事返回 `not_unit_lead_analyst`（`src/dalton/autonomy/schedule.py:1051-1068`）；② 常规内部同事工作区：要求具备 `web` 通道 `write` 权限，且任务归属调用者 A 本人。 | 在内部成员活跃覆盖单元工作区允许代管主分析师任务（`task_owner = lead_analyst`，审计记录 `actor_user_id = PM`）；显式 `llm_model` 限定系统目录模型并强制按系统目录端点解析，清除为 `"default"`/`null` 继承主分析师默认模型；跨人 `list` 与报错将主分析师私有自定义模型统一展示为「所有者自定义模型」；外部成员工作区限定其本人维护（`src/dalton/autonomy/schedule.py:727-731`）。 | 范围限于本人常规工作区受管任务（`src/dalton/autonomy/schedule.py:799-811`）。 |
 
 `manage_workspaces` 仅对研究总监角色挂载（`src/ptc_agent/agent/agent.py:1679`）；工作区内分析师（`role == "analyst"`）使用限定为只读与拷入当前工作区动作的 `colleague_workspace` 工具（`docs/dalton/features/colleague-agent-access.md:24-30`），且 `dalton_schedule_automation` 限定分析师仅操作当前所在工作区（`src/dalton/autonomy/schedule.py:635-663`）。
@@ -439,8 +439,8 @@ flowchart TD
      - 断言无主电脑快照（`computer_id=None, bootstrap_cloud_primary=True`）在用户名下已有未提升的自有电脑时仅新建托管云端电脑而不提升自有电脑，若确认等待期间出现了主电脑则中止并返回 `"情况已变化，请重新发起"`；
      - 断言 `auto_approve_workspace_creation=True` 遇自有电脑扣留弹卡，云端电脑放行使用同一快照 `computer_id`。
    - **后端确认身份与免登模式边界单测**：
-     - 在 `DALTON_AUTH_MODE in ("local", "supabase")` 下，断言 `service`、`pat`、`oauth`、`cli` 及非发起人 `session` 提交两类工作区 `hitl_response` 均返回 `403`，渠道 `ask_user_question` 经 `service` 正常恢复；
-     - 在 `DALTON_AUTH_MODE == "oss"` 下，断言回环无凭据网页请求可确认两类卡片，而携带 `X-Service-Token`、`Authorization` 令牌或 `platform` 渠道标记的请求一律返回 `403`。
+     - 在 `DALTON_AUTH_MODE in ("local", "supabase")` 下，断言 `service`、`pat`、`oauth`、`computer` 及非发起人 `session` 提交两类工作区 `hitl_response` 均返回 `403`，渠道 `ask_user_question` 经 `service` 正常恢复；
+     - 在 `DALTON_AUTH_MODE == "oss"` 下，免登录模式跳过身份认证，断言回环无凭据请求可确认两类卡片，而携带 `X-Service-Token`、`Authorization` 令牌、`platform` 渠道标记或 `Sec-Fetch-Site: cross-site` 的请求一律返回 `403`。
    - **托管自动化锁行至提交、财报日历例外与轮次解析单测**：
      - 断言 `_user_automations_lock_for_write` 内对 `user_models.get_model_preference`（`src/server/services/automations/lifecycle.py:362`）调用次数为 `0`；
      - 使用双连接验证自动化事务持 `computers` 与 `workspaces` `FOR SHARE` 锁期间，并发 `commit_workspace_move` 被阻塞至自动化事务提交后才可执行；验证普通内部成员本人可保存 `dalton-earnings-calendar` 的 `llm_model`，修改其他 `Home` 全局任务返回 `forbidden_pm`；

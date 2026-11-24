@@ -361,3 +361,210 @@ async def test_bootstrap_cloud_primary_creates_cloud_without_promoting_own_machi
     assert len(await get_computers_for_user(user_id)) == before_count
 
     await update_computer_status(str(created["computer_id"]), "stopped")
+
+
+async def test_duplicate_snapshot_recheck_catches_unavailable_rename_delete_and_new_duplicate(
+    b2_live_pool,
+) -> None:
+    """Round 4 Decision 1: locked check_duplicate_snapshot always runs and
+    detects (a) a pre-existing duplicate when the card had duplicate_check_unavailable,
+    (b) a second duplicate appearing alongside the listed one, (c) the listed
+    duplicate being renamed, and (d) the listed duplicate being deleted."""
+    user_id = f"b2-d1-{uuid.uuid4().hex[:8]}"
+    await create_user(user_id=user_id, email=f"{user_id}@test.local", name="D1")
+    comp = await create_computer(
+        user_id,
+        kind="docker",
+        name="D1 Box",
+        is_primary=True,
+        status="stopped",
+        provider_ref=f"b2-d1-{uuid.uuid4()}",
+    )
+    comp_id = str(comp["computer_id"])
+
+    ws_orig = await ws_db.create_workspace_on_computer(user_id, "0700.HK", comp_id)
+    assert ws_orig is not None
+    orig_id = str(ws_orig["workspace_id"])
+
+    # (a) Card had duplicate_check_unavailable=True (no expected dup ID) -> refused because 0700.HK exists.
+    assert (
+        await ws_db.create_workspace_on_computer(
+            user_id,
+            "700.HK",
+            comp_id,
+            reject_unavailable=True,
+            check_duplicate_snapshot=True,
+        )
+        is None
+    )
+
+    # (b) Listed duplicate renamed -> refused (scope_changed).
+    renamed = await ws_db.update_workspace(orig_id, name="Tencent Holdings")
+    assert renamed is not None
+    assert (
+        await ws_db.create_workspace_on_computer(
+            user_id,
+            "700.HK",
+            comp_id,
+            reject_unavailable=True,
+            check_duplicate_snapshot=True,
+            expected_duplicate_workspace_id=orig_id,
+            expected_duplicate_workspace_name="0700.HK",
+        )
+        is None
+    )
+
+    # Rename back to 0700.HK, then delete -> refused (scope_changed).
+    await ws_db.update_workspace(orig_id, name="0700.HK")
+    await ws_db.delete_workspace(orig_id)
+    assert (
+        await ws_db.create_workspace_on_computer(
+            user_id,
+            "700.HK",
+            comp_id,
+            reject_unavailable=True,
+            check_duplicate_snapshot=True,
+            expected_duplicate_workspace_id=orig_id,
+            expected_duplicate_workspace_name="0700.HK",
+        )
+        is None
+    )
+
+    # Re-create 0700.HK and confirm "create anyway" succeeds when listed duplicate is unchanged.
+    ws_listed = await ws_db.create_workspace_on_computer(user_id, "0700.HK", comp_id)
+    assert ws_listed is not None
+    ws_anyway = await ws_db.create_workspace_on_computer(
+        user_id,
+        "700.HK",
+        comp_id,
+        reject_unavailable=True,
+        check_duplicate_snapshot=True,
+        expected_duplicate_workspace_id=str(ws_listed["workspace_id"]),
+        expected_duplicate_workspace_name="0700.HK",
+    )
+    assert ws_anyway is not None
+
+
+async def test_two_connection_concurrent_rename_waits_on_user_write_lock_and_rejects_ticker_duplicate(
+    b2_live_pool,
+    test_db_uri: str,
+) -> None:
+    """Round 4 Decision 2: update_workspace(name=...) acquires lock_user_writes
+    and refuses normalized ticker duplicates. When Connection A holds
+    lock_user_writes between duplicate-query and INSERT for '700.HK',
+    Connection B's concurrent rename of another workspace to '0700.HK' waits
+    for the lock and then raises WorkspaceNameTaken, leaving no duplicate ticker."""
+    import asyncio
+    from src.server.database.workspace_names import WorkspaceNameTaken
+
+    user_id = f"b2-ren-{uuid.uuid4().hex[:8]}"
+    await create_user(user_id=user_id, email=f"{user_id}@test.local", name="Renamer")
+    comp = await create_computer(
+        user_id,
+        kind="docker",
+        name="Ren Box",
+        is_primary=True,
+        status="stopped",
+        provider_ref=f"b2-ren-{uuid.uuid4()}",
+    )
+    comp_id = str(comp["computer_id"])
+
+    ws_other = await ws_db.create_workspace_on_computer(user_id, "OtherWS", comp_id)
+    assert ws_other is not None
+    other_id = str(ws_other["workspace_id"])
+
+    after_dup_check = asyncio.Event()
+    allow_insert = asyncio.Event()
+    orig_check = ws_db.check_duplicate_snapshot_unchanged
+
+    async def _gated_check(cur, uid, ws_name, **kwargs):
+        ok = await orig_check(cur, uid, ws_name, **kwargs)
+        if uid == user_id and ws_name == "700.HK":
+            after_dup_check.set()
+            await allow_insert.wait()
+        return ok
+
+    async with (
+        await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn_a,
+        await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn_b,
+    ):
+        with patch.object(ws_db, "check_duplicate_snapshot_unchanged", _gated_check):
+            create_task = asyncio.create_task(
+                ws_db.create_workspace_on_computer(
+                    user_id,
+                    "700.HK",
+                    comp_id,
+                    reject_unavailable=True,
+                    check_duplicate_snapshot=True,
+                    conn=conn_a,
+                )
+            )
+            await asyncio.wait_for(after_dup_check.wait(), timeout=5.0)
+
+            # Connection B attempts to rename OtherWS -> 0700.HK while Connection A
+            # sits between its duplicate check and INSERT under lock_user_writes.
+            rename_task = asyncio.create_task(
+                ws_db.update_workspace(other_id, name="0700.HK", conn=conn_b)
+            )
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(rename_task), timeout=0.15)
+
+            # Release Connection A: INSERT commits '700.HK', then Connection B
+            # acquires lock_user_writes, sees '700.HK', and raises WorkspaceNameTaken.
+            allow_insert.set()
+            created_ws = await asyncio.wait_for(create_task, timeout=5.0)
+            assert created_ws is not None
+            assert created_ws["name"] == "700.HK"
+
+            with pytest.raises(WorkspaceNameTaken) as exc_info:
+                await asyncio.wait_for(rename_task, timeout=5.0)
+            assert exc_info.value.name == "700.HK"
+
+    live_names = sorted(row["name"] for row in await ws_db.get_live_workspace_names(user_id))
+    assert live_names == ["700.HK", "OtherWS"]
+
+
+async def test_bootstrap_cloud_primary_checks_duplicate_before_creating_computer(
+    b2_live_pool,
+) -> None:
+    """Round 4 Decision 5: when a duplicate ticker already exists,
+    bootstrap_cloud_primary_computer aborts with ApprovalScopeChangedError
+    before inserting any cloud primary computer row."""
+    user_id = f"b2-bdup-{uuid.uuid4().hex[:8]}"
+    await create_user(user_id=user_id, email=f"{user_id}@test.local", name="BDup")
+
+    own_ssh = await create_computer(
+        user_id,
+        kind="ssh",
+        name="MacBook",
+        is_primary=False,
+        status="stopped",
+        provider_config={"host": "mac.local", "user": "alice"},
+    )
+    ws_existing = await ws_db.create_workspace_on_computer(
+        user_id, "0700.HK", str(own_ssh["computer_id"])
+    )
+    assert ws_existing is not None
+    assert await get_primary_computer(user_id) is None
+
+    sandbox_cfg = create_autospec(SandboxConfig, instance=True)
+    sandbox_cfg.provider = "docker"
+    sandbox_cfg.creatable_providers.return_value = ("docker",)
+
+    mgr = object.__new__(ComputerManager)
+    mgr.config = SimpleNamespace(
+        sandbox=sandbox_cfg,
+        filesystem=SimpleNamespace(working_directory="/home/workspace"),
+    )
+
+    before_count = len(await get_computers_for_user(user_id))
+    with pytest.raises(ApprovalScopeChangedError):
+        await mgr.bootstrap_cloud_primary_computer(
+            user_id,
+            default_name="700.HK",
+            expected_kind="docker",
+            check_duplicate_snapshot=True,
+            workspace_name="700.HK",
+        )
+    assert len(await get_computers_for_user(user_id)) == before_count
+    assert await get_primary_computer(user_id) is None
