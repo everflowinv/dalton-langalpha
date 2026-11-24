@@ -944,7 +944,7 @@ check_clean_migration_dirs() {
     unquoted="${unquoted%\"}"
     if [ "$status" = "!!" ] || [ "$status" = "??" ]; then
       case "$unquoted" in
-        */__pycache__|*/__pycache__/|*/__pycache__/*|*.pyc)
+        */__pycache__/|*/__pycache__/*|*.pyc)
           continue
           ;;
       esac
@@ -1069,7 +1069,8 @@ def _chain_head(label: str, directory: str) -> str:
         if len(parts) < 2 or parts[1] != "blob":
             continue
         basename = path.rsplit("/", 1)[-1]
-        if not basename.endswith(".py") or basename == "__init__.py":
+        # Alembic's own filter (1.18): it skips __init__* and editor lock files (.#*).
+        if not basename.endswith(".py") or basename.startswith(("__init__", ".#")):
             continue
         paths.append(path)
 
