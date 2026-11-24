@@ -596,9 +596,12 @@ def test_revert_deploy_aborts_without_reset_when_backend_touched_with_migration(
     assert 'git reset --keep "$RESET_SHA"' in out1
     assert f"git reset --keep {head1}" not in out1
     assert f"git reset --keep {pre_ff1}" not in out1
-    assert "降级后，把 RESET_SHA 改为两条链 head 等于降级后数据库版本的那个提交（通常是 PRE_FF），重新执行第 7 步核对，一致后再执行第 8 步。" in out1
-    # Steps 1-9 in order; plan B stops writes, reads DB, sets RESET_SHA, verifies target_migration_heads, then resets.
-    positions = [out1.index(f"\n{n}. ") for n in range(1, 10)]
+    # After a downgrade the operator sets RESET_SHA once and re-runs only the check (7b),
+    # so re-running a step never puts the pre-downgrade commit back into RESET_SHA.
+    assert "跳过 7a，只执行 7b 核对，一致后再执行第 8 步。" in out1
+    # Steps in order; plan B stops writes, reads DB, sets RESET_SHA (7a), verifies it (7b), then resets.
+    labels = [f"{n}. " for n in range(1, 7)] + ["7a.", "7b.", "8. ", "9. "]
+    positions = [out1.index(f"\n{label}") for label in labels]
     assert positions == sorted(positions)
     assert out1.index("docker stop dalton-langalpha-edge-1") < out1.index("SELECT version_num FROM alembic_version_dalton")
     assert out1.index("SELECT version_num FROM alembic_version_dalton") < out1.index(f"RESET_SHA={head1}")

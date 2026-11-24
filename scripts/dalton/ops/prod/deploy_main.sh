@@ -722,16 +722,17 @@ _print_manual_revert_instructions() {
   echo "     docker compose run --rm --no-deps --entrypoint \"\" backend sh -c \"cd /app && uv run alembic -c src/dalton/alembic.ini downgrade ${PRE_FF_DALTON_REV:-<部署前Dalton版本>}\""
   echo "     docker compose run --rm --no-deps --entrypoint \"\" backend sh -c \"cd /app && uv run alembic -c alembic.ini downgrade ${PRE_FF_UPSTREAM_REV:-<部署前上游版本>}\""
   echo "   降级后再读一次两条链的版本，必须等于目标版本；不等就停下，切勿复位代码。"
-  echo "   降级后，把 RESET_SHA 改为两条链 head 等于降级后数据库版本的那个提交（通常是 PRE_FF），重新执行第 7 步核对，一致后再执行第 8 步。"
-  echo "7. 【方案 B】设定复位提交 RESET_SHA 并打印其两条链 head，与第 5/6 步读到的数据库版本比对一致后再继续（不等就停下，先不要重启后端）："
+  echo "   降级后，执行 RESET_SHA=<两条链 head 等于降级后数据库版本的提交>（通常是 PRE_FF），跳过 7a，只执行 7b 核对，一致后再执行第 8 步。"
+  echo "7a.【方案 B】未执行第 6 步降级时，设定复位提交（执行过第 6 步的，按第 6 步末尾设定，跳过本步）："
   echo "     RESET_SHA=${reset_target}"
+  echo "7b.【方案 B】打印 RESET_SHA 的两条链 head，与当前数据库版本（第 6 步降级后以降级后的读数为准，否则用第 5 步）比对一致后再继续（不等就停下，先不要重启后端）："
   echo "     DALTON_DEPLOY_LIB_ONLY=1 RESET_SHA=\"\$RESET_SHA\" bash -c 'source scripts/dalton/ops/prod/deploy_main.sh && target_migration_heads \"\$RESET_SHA\"'"
   if [ -n "$recommended_commit" ] && [ -n "${PRE_FF:-}" ] && [ "$recommended_commit" != "$PRE_FF" ]; then
-    echo "   如第 6 步已将数据库降级回部署前版本，把 RESET_SHA 改为对应历史提交（如 RESET_SHA=${PRE_FF}），重新执行第 7 步核对，一致后再执行第 8 步。"
+    echo "   如第 6 步已将数据库降级回部署前版本，执行 RESET_SHA=${PRE_FF}，只执行 7b 核对，一致后再执行第 8 步。"
   elif [ -z "$recommended_commit" ]; then
     echo "   请把 RESET_SHA 设为两条链 head 均等于数据库版本的提交（替换 <已核对一致的提交>）；确认一致前先不要重启后端。"
   fi
-  echo "8. 【方案 B】确认第 7 步比对一致后，复位代码、重建前端，并强制重建容器（后端仍处于停止状态才执行）："
+  echo "8. 【方案 B】确认 7b 比对一致后，复位代码、重建前端，并强制重建容器（后端仍处于停止状态才执行）："
   echo "     git reset --keep \"\$RESET_SHA\" && (cd web && pnpm install --frozen-lockfile) && bash scripts/dalton/build_frontend_prod.sh --require-supabase"
   echo "     docker compose up -d --no-deps --force-recreate backend crawler edge"
   echo "9. 【方案 B】恢复宿主机服务与看门狗，并验证："
@@ -943,10 +944,12 @@ check_clean_migration_dirs() {
     unquoted="${path#\"}"
     unquoted="${unquoted%\"}"
     if [ "$status" = "!!" ] || [ "$status" = "??" ]; then
+      # Alembic loads only *.py, so untracked or ignored files of any other kind
+      # (.DS_Store, editor backups, __pycache__/) cannot change what runs.
       case "$unquoted" in
-        */__pycache__/|*/__pycache__/*|*.pyc)
-          continue
-          ;;
+        */__pycache__/*) continue ;;
+        *.py) ;;
+        *) continue ;;
       esac
     fi
     dirty="${dirty:+${dirty}${nl}}${line}"
