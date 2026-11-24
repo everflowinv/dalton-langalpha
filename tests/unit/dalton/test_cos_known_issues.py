@@ -2252,6 +2252,32 @@ class TestBinaryCopySecretChecks:
         assert sec_tools_mod._count_zip_central_entries(noisy, 2000) == 2
         assert sec_tools_mod._scan_copy_bytes_for_secrets("book.xlsx", noisy, {}) is None
 
+    def test_powerpoint_stream_found_in_a_real_ole_directory_not_in_body_text(self) -> None:
+        presentation = _make_ole2_bytes([("PowerPoint Document", 2), ("Current User", 2)])
+        assert sec_tools_mod._ole_has_powerpoint_stream(presentation) is True
+        mention = _make_ole2_bytes(
+            [("WordDocument", 2)],
+            extra_body="see the PowerPoint Document".encode("utf-16-le") + b"\x00\x00",
+        )
+        assert sec_tools_mod._ole_has_powerpoint_stream(mention) is False
+        for name in ("deck.xls", "deck.doc"):
+            assert (
+                sec_tools_mod._scan_copy_bytes_for_secrets(name, presentation, {})
+                == sec_tools_mod._COS_LEGACY_PPT_REFUSED_ERROR
+            )
+        assert sec_tools_mod._scan_copy_bytes_for_secrets("memo.doc", mention, {}) is None
+
+    def test_zip64_ooxml_with_a_real_central_directory_is_counted_and_allowed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Make the writer emit ZIP64 end records for a small archive.
+        monkeypatch.setattr(zipfile, "ZIP_FILECOUNT_LIMIT", 1)
+        z64 = _make_ooxml_zip({"word/document.xml": "<w:document/>"})
+        monkeypatch.undo()
+        assert b"PK\x06\x06" in z64
+        assert sec_tools_mod._count_zip_central_entries(z64, 2000) == 2
+        assert sec_tools_mod._scan_copy_bytes_for_secrets("report.docx", z64, {}) is None
+
     def test_legacy_ole_utf16le_fallback_catches_macro_in_truncated_container(self) -> None:
         truncated_macro = (
             sec_tools_mod._OLE_HEADER

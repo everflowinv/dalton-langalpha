@@ -1544,9 +1544,9 @@ def _count_zip_central_entries(buf: bytes, limit: int) -> int | None:
         return None
     size_cd = endrec[zipfile._ECD_SIZE]
     offset_cd = endrec[zipfile._ECD_OFFSET]
+    # Same arithmetic as ZipFile._RealGetContents (3.13) / _handle_prepended_data
+    # (3.14): for ZIP64, _EndRecData already points _ECD_LOCATION at the ZIP64 record.
     concat = endrec[zipfile._ECD_LOCATION] - size_cd - offset_cd
-    if endrec[zipfile._ECD_SIGNATURE] == zipfile.stringEndArchive64:
-        concat -= zipfile.sizeEndCentDir64 + zipfile.sizeEndCentDir64Locator
     pos = offset_cd + concat
     end = pos + size_cd
     if pos < 0 or end > len(buf):
