@@ -311,6 +311,7 @@ export interface WeixinCdnDownloadOptions {
   chunkIdleTimeoutMs?: number;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
+  dispatcher?: unknown;
 }
 
 /**
@@ -381,6 +382,7 @@ export async function downloadWeixinCdnAttachment(
     headers: {},
     signal: options.signal,
     fetchImpl: options.fetchImpl,
+    dispatcher: options.dispatcher,
   });
 
   const plaintext = aesKey
@@ -520,6 +522,7 @@ export async function uploadBufferToWeixinCdn(
     timeoutMs: options.timeoutMs,
     signal: options.signal,
     fetchImpl: options.fetchImpl,
+    dispatcher: options.dispatcher,
     allowedDomains: options.allowedDomains,
     resolveHostIps: options.resolveHostIps,
     checkResolvedIps: options.checkResolvedIps,
@@ -577,6 +580,7 @@ export async function uploadBufferToWeixinCdn(
         timeoutMs: options.timeoutMs ?? WEIXIN_CDN_UPLOAD_TIMEOUT_MS,
         signal: options.signal,
         fetchImpl: options.fetchImpl,
+        dispatcher: options.dispatcher,
       });
 
       if (res.status === 429) {

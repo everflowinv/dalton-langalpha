@@ -56,6 +56,8 @@ export interface WeixinMonitorOptions {
   resolveHostIps?: HostIpResolver;
   checkResolvedIps?: boolean;
   fetchImpl?: typeof fetch;
+  /** Dedicated long-poll HTTP dispatcher (isolated from outbound/control pool, §3.3). */
+  getPollDispatcher?: () => unknown;
   backend: BackendClient;
   logger?: SubsystemLogger;
   /**
@@ -63,6 +65,8 @@ export interface WeixinMonitorOptions {
    * inbound messages or committing the cursor (D1 / §3.5).
    */
   isLeaseValid?: () => boolean;
+  /** Shared instance-wide 429 cooldown remaining time in ms (gates ALL accounts before `getupdates`). */
+  getSharedCooldownRemainingMs?: () => number;
   onInboundEvent: (event: InboundChannelEvent) => Promise<void>;
   onSessionExpired?: (err: WeixinApiError) => Promise<void> | void;
   onCursorCommitted?: (newCursor: string) => void;
@@ -192,7 +196,7 @@ export class WeixinMonitor {
         action: "mark_session_expired",
         expected_bot_generation: botGeneration,
         expected_ilink_bot_id: ilinkBotId,
-        error_code: err.errcode ?? err.ret ?? -14,
+        error_code: String(err.errcode ?? err.ret ?? -14),
       });
     } catch (statusErr) {
       if (isStaleGatewayEpochError(statusErr)) {
@@ -233,6 +237,14 @@ export class WeixinMonitor {
         break;
       }
 
+      // Decision #13: shared 429 cooldown gates ALL accounts before issuing getupdates.
+      const sharedCooldownMs = this.opts.getSharedCooldownRemainingMs?.() ?? 0;
+      if (sharedCooldownMs > 0) {
+        const ok = await sleepWithAbort(sharedCooldownMs, signal);
+        if (!ok) break;
+        continue;
+      }
+
       try {
         const resp = await getWeixinUpdates({
           baseUrl,
@@ -241,6 +253,7 @@ export class WeixinMonitor {
           timeoutMs: this.pollTimeoutMs,
           signal,
           fetchImpl,
+          dispatcher: this.opts.getPollDispatcher?.(),
           allowedDomains: allowedApiDomains,
           resolveHostIps,
           checkResolvedIps,
@@ -260,8 +273,6 @@ export class WeixinMonitor {
           );
           break;
         }
-
-        consecutiveFailures = 0;
 
         if (
           typeof resp.longpolling_timeout_ms === "number" &&
@@ -330,6 +341,10 @@ export class WeixinMonitor {
             break;
           }
         }
+
+        // Decision #13: reset failure counter only after the entire batch succeeded
+        // (and cursor committed), so sustained I-1 503 errors back off exponentially.
+        consecutiveFailures = 0;
       } catch (err) {
         if (signal.aborted) break;
         if (isStaleGatewayEpochError(err)) {

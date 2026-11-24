@@ -36,6 +36,7 @@ const RECOGNIZED_DELIVERY_STATUSES = new Set<string>([
   "partial",
   "failed",
   "unknown",
+  "deferred",
 ]);
 const SKIP_CODES = new Set([
   "dalton_disabled",
@@ -90,14 +91,21 @@ function safeBackendErrorMessage(err: unknown, fallback: string): string {
 }
 
 function classifyAdapterError(err: unknown): {
-  outcome: "failed" | "unknown";
+  outcome: "failed" | "unknown" | "deferred";
   code: string;
+  denyCode?: string;
   message: string;
 } {
   if (err instanceof ChannelDeliveryError) {
     return {
-      outcome: err.outcome === "unknown" ? "unknown" : "failed",
+      outcome:
+        err.outcome === "unknown"
+          ? "unknown"
+          : err.outcome === "deferred"
+            ? "deferred"
+            : "failed",
       code: err.code,
+      denyCode: err.denyCode,
       message: err.message,
     };
   }
@@ -436,7 +444,7 @@ export class DataTaskNotificationService {
       throw new ChannelDeliveryError(
         pf.message ?? `Weixin send deferred (${pf.deny_code}); please retry.`,
         {
-          outcome: "failed",
+          outcome: "deferred",
           code: "unavailable",
           retryable: true,
           denyCode: pf.deny_code,
@@ -1612,7 +1620,7 @@ export class DataTaskNotificationService {
       let sentChunks = 0;
       const filesStatus: Array<{
         path: string;
-        status: "sent" | "linked" | "failed";
+        status: "sent" | "linked" | "failed" | "unknown";
         reason: string | null;
       }> = [];
       const sendTextWithFile = readyAdapter.sendTextWithFile?.bind(readyAdapter);
@@ -1695,12 +1703,22 @@ export class DataTaskNotificationService {
           }
           const classified = classifyAdapterError(chunkErr);
           const anySent = sentChunks > 0;
-          const itemStatus: "partial" | "unknown" | "failed" = anySent
-            ? "partial"
-            : classified.outcome === "unknown"
+          // Decision #14: unknown beats partial; Decision #4: retryable defer records non-terminal deferred + denyCode.
+          const itemStatus: "partial" | "unknown" | "failed" | "deferred" =
+            classified.outcome === "unknown"
               ? "unknown"
-              : "failed";
-          const overallStatus = itemStatus === "failed" ? "failed" : "unknown";
+              : anySent
+                ? "partial"
+                : classified.outcome === "deferred"
+                  ? "deferred"
+                  : "failed";
+          const recordedErrorCode = classified.denyCode ?? classified.code;
+          const overallStatus: "failed" | "unknown" | "deferred" =
+            itemStatus === "deferred"
+              ? "deferred"
+              : itemStatus === "failed"
+                ? "failed"
+                : "unknown";
           try {
             await this.recordValidatedDeliveryProgress({
               delivery_key: item.delivery_key,
@@ -1708,7 +1726,7 @@ export class DataTaskNotificationService {
               total_chunks: totalChunks,
               platform_message_ids: [...messageIds],
               status: itemStatus,
-              error_code: classified.code,
+              error_code: recordedErrorCode,
               error_message: classified.message,
             });
           } catch (progressErr) {
@@ -1746,7 +1764,7 @@ export class DataTaskNotificationService {
             status: itemStatus,
             duplicate: false,
             platform_message_ids: [...messageIds],
-            code: classified.code,
+            code: itemStatus === "partial" ? "partial" : recordedErrorCode,
             message: classified.message,
           });
           return {
@@ -1754,7 +1772,7 @@ export class DataTaskNotificationService {
             data: {
               ok: false,
               status: overallStatus,
-              code: itemStatus === "partial" ? "partial" : classified.code,
+              code: itemStatus === "partial" ? "partial" : recordedErrorCode,
               message: classified.message,
               run_id: runId,
               target,
@@ -1938,14 +1956,19 @@ export class DataTaskNotificationService {
           }
           const classified = classifyAdapterError(fileErr);
           const anySent = sentChunks > 0;
-          const itemStatus: "partial" | "unknown" | "failed" = anySent
-            ? "partial"
-            : classified.outcome === "unknown"
+          // Decision #14: unknown beats partial, and file entry status records "unknown" instead of "failed".
+          const itemStatus: "partial" | "unknown" | "failed" | "deferred" =
+            classified.outcome === "unknown"
               ? "unknown"
-              : "failed";
+              : anySent
+                ? "partial"
+                : classified.outcome === "deferred"
+                  ? "deferred"
+                  : "failed";
+          const recordedErrorCode = classified.denyCode ?? classified.code;
           filesStatus.push({
             path: verifiedAttachment.filename,
-            status: "failed",
+            status: classified.outcome === "unknown" ? "unknown" : "failed",
             reason: classified.message,
           });
           try {
@@ -1956,7 +1979,7 @@ export class DataTaskNotificationService {
               platform_message_ids: [...messageIds],
               files_status: filesStatus,
               status: itemStatus,
-              error_code: classified.code,
+              error_code: recordedErrorCode,
               error_message: classified.message,
             });
           } catch (progressErr) {
@@ -1994,15 +2017,20 @@ export class DataTaskNotificationService {
             status: itemStatus,
             duplicate: false,
             platform_message_ids: [...messageIds],
-            code: itemStatus === "partial" ? "partial" : classified.code,
+            code: itemStatus === "partial" ? "partial" : recordedErrorCode,
             message: classified.message,
           });
           return {
             status: 200,
             data: {
               ok: false,
-              status: itemStatus === "failed" ? "failed" : "unknown",
-              code: itemStatus === "partial" ? "partial" : classified.code,
+              status:
+                itemStatus === "deferred"
+                  ? "deferred"
+                  : itemStatus === "failed"
+                    ? "failed"
+                    : "unknown",
+              code: itemStatus === "partial" ? "partial" : recordedErrorCode,
               message: classified.message,
               run_id: runId,
               target,

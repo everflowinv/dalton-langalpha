@@ -6,7 +6,10 @@ import {
   BackendHttpError,
   type WeixinLoginSessionGetResponse,
 } from "../../backend-client.js";
-import { isStaleGatewayEpochError } from "../../gateway-lease.js";
+import {
+  isStaleGatewayEpochError,
+  StaleGatewayEpochError,
+} from "../../gateway-lease.js";
 import type { HostIpResolver } from "../../shared/safe-fetch.js";
 import {
   fetchWeixinQrCode,
@@ -64,6 +67,10 @@ export interface WeixinQrLoginManagerOptions {
   resolveHostIps?: HostIpResolver;
   checkResolvedIps?: boolean;
   fetchImpl?: typeof fetch;
+  /** Dedicated control HTTP dispatcher (isolated from long-poll pool, §3.3). */
+  getDispatcher?: () => unknown;
+  /** Synchronous local lease check before contacting iLink (Decision #1). */
+  isLeaseValid?: () => boolean;
   onAccountConfirmed?: (account: ConfirmedWeixinAccount) => Promise<void> | void;
 }
 
@@ -255,6 +262,8 @@ export class WeixinQrLoginManager {
   private readonly resolveHostIps?: HostIpResolver;
   private readonly checkResolvedIps?: boolean;
   private readonly fetchImpl?: typeof fetch;
+  private readonly getDispatcher?: () => unknown;
+  private readonly isLeaseValid?: () => boolean;
   private readonly onAccountConfirmed?: (
     account: ConfirmedWeixinAccount,
   ) => Promise<void> | void;
@@ -272,7 +281,18 @@ export class WeixinQrLoginManager {
     this.resolveHostIps = opts.resolveHostIps;
     this.checkResolvedIps = opts.checkResolvedIps;
     this.fetchImpl = opts.fetchImpl;
+    this.getDispatcher = opts.getDispatcher;
+    this.isLeaseValid = opts.isLeaseValid;
     this.onAccountConfirmed = opts.onAccountConfirmed;
+  }
+
+  private assertLeaseValid(operation: string): void {
+    if (this.isLeaseValid && !this.isLeaseValid()) {
+      throw new StaleGatewayEpochError(
+        `Gateway lease is not locally valid before ${operation}`,
+        { status: 409 },
+      );
+    }
   }
 
   private async safeResolveRedirectBaseUrl(
@@ -320,6 +340,8 @@ export class WeixinQrLoginManager {
       throw new WeixinQrLoginError("Missing authenticated user_id", 401, "unauthorized");
     }
 
+    this.assertLeaseValid("startQrLogin");
+
     const sessionKey = opts?.sessionKey?.trim() || randomUUID();
 
     const qrResp = await fetchWeixinQrCode({
@@ -327,6 +349,7 @@ export class WeixinQrLoginManager {
       botType: this.botType,
       signal: opts?.signal,
       fetchImpl: this.fetchImpl,
+      dispatcher: this.getDispatcher?.(),
       allowedDomains: this.allowedApiDomains,
       resolveHostIps: this.resolveHostIps,
       checkResolvedIps: this.checkResolvedIps,
@@ -595,6 +618,8 @@ export class WeixinQrLoginManager {
     sessionKey: string,
     opts?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<WeixinQrPublicWaitResponse> {
+    this.assertLeaseValid("waitQrLogin");
+
     const fetched = await this.fetchSessionOrExpired(sessionKey);
     if (!fetched.found) {
       return fetched.response;
@@ -610,12 +635,15 @@ export class WeixinQrLoginManager {
       this.baseUrl,
     );
 
+    this.assertLeaseValid("pollWeixinQrStatus");
+
     const statusResp = await pollWeixinQrStatus({
       baseUrl: pollBaseUrl,
       qrcode: session.qrcode!,
       timeoutMs: opts?.timeoutMs,
       signal: opts?.signal,
       fetchImpl: this.fetchImpl,
+      dispatcher: this.getDispatcher?.(),
       allowedDomains: this.allowedApiDomains,
       resolveHostIps: this.resolveHostIps,
       checkResolvedIps: this.checkResolvedIps,
@@ -649,6 +677,8 @@ export class WeixinQrLoginManager {
       throw new WeixinQrLoginError("Missing verify_code", 400, "invalid_request");
     }
 
+    this.assertLeaseValid("verifyQrCode");
+
     const fetched = await this.fetchSessionOrExpired(cleanSessionKey);
     if (!fetched.found) {
       return fetched.response;
@@ -664,6 +694,8 @@ export class WeixinQrLoginManager {
       this.baseUrl,
     );
 
+    this.assertLeaseValid("submitWeixinQrVerifyCode");
+
     const statusResp = await submitWeixinQrVerifyCode({
       baseUrl: pollBaseUrl,
       qrcode: session.qrcode!,
@@ -671,6 +703,7 @@ export class WeixinQrLoginManager {
       timeoutMs: opts?.timeoutMs,
       signal: opts?.signal,
       fetchImpl: this.fetchImpl,
+      dispatcher: this.getDispatcher?.(),
       allowedDomains: this.allowedApiDomains,
       resolveHostIps: this.resolveHostIps,
       checkResolvedIps: this.checkResolvedIps,

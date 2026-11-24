@@ -444,7 +444,7 @@ ALTER TABLE dalton_channel_deliveries
 
 #### （1）网关与后端内部契约表（挂于 `/api/v1/dalton/channels/internal/*`，鉴权 `X-Service-Token`）
 
-除租约申请接口 `gateway-lease/acquire` 外，网关发出的**全部写入类内部接口与 `recover`（含二维码登录会话写入 `POST`/`PATCH .../weixin/login-sessions`）**均强制携带请求头 `X-Gateway-Epoch: <epoch>`，后端在同一数据库事务首步 `SELECT ... FOR SHARE` 校验租约有效且 `epoch` 一致，失配或过期一律回滚并返回 HTTP `409`（`code: "stale_gateway_epoch"`）：
+除租约申请接口 `gateway-lease/acquire` 外，网关发出的**全部写入类内部接口与 `recover`（含二维码登录会话写入 `POST`/`PATCH .../weixin/login-sessions`）**均强制携带请求头 `X-Gateway-Epoch: <epoch>`（例外：`I-5` `PUT /internal/settings` 与 `I-8` 自动化运行登记/完成不涉及微信外发，不携带 `X-Gateway-Epoch`），后端在同一数据库事务首步 `SELECT ... FOR SHARE` 校验租约有效且 `epoch` 一致，失配或过期一律回滚并返回 HTTP `409`（`code: "stale_gateway_epoch"`）：
 
 | 方向 | 方法与路由 | 能力守卫 | 关键请求字段 | 关键响应字段 |
 |---|---|---|---|---|

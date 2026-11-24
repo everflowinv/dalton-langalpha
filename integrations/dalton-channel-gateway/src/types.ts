@@ -369,12 +369,12 @@ export interface AgentSendRequest {
 
 export interface AgentSendFileOutcome {
   path: string;
-  status: "sent" | "linked" | "failed";
+  status: "sent" | "linked" | "failed" | "unknown";
   reason: string | null;
 }
 
 export interface AgentSendResponse {
-  status: "sent" | "partial" | "failed" | "unknown";
+  status: "sent" | "partial" | "failed" | "unknown" | "deferred";
   code:
     | "not_linked"
     | "not_allowed"

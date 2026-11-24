@@ -475,7 +475,7 @@ export class DeliveryService {
     const reuseConfirmedThread =
       platformStr === "discord" && confirmedThreadAddress.length > 0;
     let chunkFailure: {
-      outcome: "failed" | "unknown";
+      outcome: "failed" | "unknown" | "deferred";
       code: AgentSendResponse["code"];
       denyCode?: string;
       retryable?: boolean;
@@ -561,7 +561,12 @@ export class DeliveryService {
         }
         if (err instanceof ChannelDeliveryError) {
           chunkFailure = {
-            outcome: err.outcome === "unknown" ? "unknown" : "failed",
+            outcome:
+              err.outcome === "unknown"
+                ? "unknown"
+                : err.outcome === "deferred"
+                  ? "deferred"
+                  : "failed",
             code: err.code,
             denyCode: err.denyCode,
             retryable: err.retryable,
@@ -584,6 +589,7 @@ export class DeliveryService {
     let anyFileSucceeded = false;
     let anyFileFailed = false;
     let fileUnknownError: string | null = null;
+    let fileDeferredError: string | null = null;
     let fileFailureCode: AgentSendResponse["code"] = null;
     let fileFailureDenyCode: string | undefined;
 
@@ -705,9 +711,13 @@ export class DeliveryService {
             throw err;
           }
           anyFileFailed = true;
+          let fileEntryStatus: AgentSendFileOutcome["status"] = "failed";
           if (err instanceof ChannelDeliveryError) {
             if (err.outcome === "unknown") {
               fileUnknownError = err.message;
+              fileEntryStatus = "unknown";
+            } else if (err.outcome === "deferred") {
+              fileDeferredError = err.message;
             }
             if (!fileFailureCode) {
               fileFailureCode = err.code;
@@ -715,10 +725,14 @@ export class DeliveryService {
             if (!fileFailureDenyCode && err.denyCode) {
               fileFailureDenyCode = err.denyCode;
             }
+          } else {
+            fileUnknownError =
+              err instanceof Error ? err.message : String(err);
+            fileEntryStatus = "unknown";
           }
           fileOutcomes.push({
             path: fileRef.path,
-            status: "failed",
+            status: fileEntryStatus,
             reason: err instanceof Error ? err.message : String(err),
           });
         }
@@ -740,28 +754,41 @@ export class DeliveryService {
     let finalMessage: string;
 
     if (chunkFailure) {
-      if (somethingSucceeded) {
+      if (chunkFailure.outcome === "unknown") {
+        // Decision #14: unknown MUST NEVER be masked by partial, even when earlier chunks succeeded.
+        finalStatus = "unknown";
+        finalCode = chunkFailure.code;
+        finalMessage = somethingSucceeded
+          ? `Delivered ${sentChunks}/${totalChunks} text chunks before uncertain outcome: ${chunkFailure.message}`
+          : `Delivery outcome could not be confirmed: ${chunkFailure.message}`;
+      } else if (somethingSucceeded) {
         finalStatus = "partial";
         finalCode = chunkFailure.code;
         finalMessage = `Delivered ${sentChunks}/${totalChunks} text chunks before error: ${chunkFailure.message}`;
-      } else if (chunkFailure.outcome === "unknown") {
-        finalStatus = "unknown";
+      } else if (chunkFailure.outcome === "deferred") {
+        // Decision #4: retryable preflight defer settles I-7 as non-terminal `deferred`.
+        finalStatus = "deferred";
         finalCode = chunkFailure.code;
-        finalMessage = `Delivery outcome could not be confirmed: ${chunkFailure.message}`;
+        finalMessage = chunkFailure.message;
       } else {
         finalStatus = "failed";
         finalCode = chunkFailure.code;
         finalMessage = chunkFailure.message;
       }
     } else if (anyFileFailed) {
-      if (somethingSucceeded) {
-        finalStatus = "partial";
-        finalCode = fileFailureCode;
-        finalMessage = "Message delivered, but one or more attached files failed.";
-      } else if (fileUnknownError) {
+      if (fileUnknownError) {
+        // Decision #14: uncertain file dispatch MUST settle as unknown, not partial.
         finalStatus = "unknown";
         finalCode = "unavailable";
         finalMessage = `File delivery outcome could not be confirmed: ${fileUnknownError}`;
+      } else if (somethingSucceeded) {
+        finalStatus = "partial";
+        finalCode = fileFailureCode;
+        finalMessage = "Message delivered, but one or more attached files failed.";
+      } else if (fileDeferredError) {
+        finalStatus = "deferred";
+        finalCode = fileFailureCode ?? "unavailable";
+        finalMessage = fileDeferredError;
       } else {
         finalStatus = "failed";
         finalCode = fileFailureCode;
@@ -830,7 +857,7 @@ export class DeliveryService {
       throw new ChannelDeliveryError(
         pf.message ?? `Weixin send deferred (${pf.deny_code}); please retry.`,
         {
-          outcome: "failed",
+          outcome: "deferred",
           code: "unavailable",
           retryable: true,
           denyCode: pf.deny_code,

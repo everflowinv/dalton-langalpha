@@ -251,22 +251,24 @@ export interface I2BindCodeConsumeResponse {
 }
 
 export interface WeixinFlushedInbound {
+  platform?: string;
   message_id: string;
   request_key: string;
-  dalton_user_id: string;
-  platform_user_id: string;
-  chat_address: string;
-  thread_scope_key: string;
+  dalton_user_id: string | null;
+  platform_user_id?: string | null;
+  chat_address?: string | null;
+  thread_scope_key?: string | null;
   workspace_id: string | null;
   workspace_status?: string | null;
   external_thread_id: string | null;
-  generation: number;
-  text: string;
-  uploaded_attachments: UploadedAttachmentRecord[];
+  generation?: number | null;
+  text?: string | null;
+  uploaded_attachments?: UploadedAttachmentRecord[];
   weixin_account_id?: string | null;
   weixin_bot_id?: string | null;
   weixin_bot_generation?: number | null;
-  raw_payload?: Record<string, unknown>;
+  raw_payload?: Record<string, unknown> | null;
+  status?: string | null;
 }
 
 export interface I3SessionCommandRequest {
@@ -537,11 +539,11 @@ export interface I7DeliveriesProgressRequest {
   platform_message_ids?: string[];
   files_status?: Array<{
     path: string;
-    status: "sent" | "linked" | "failed";
+    status: "sent" | "linked" | "failed" | "unknown";
     reason: string | null;
   }>;
   first_response_json?: Record<string, unknown>;
-  status?: "in_flight" | "sent" | "partial" | "failed" | "unknown";
+  status?: "in_flight" | "sent" | "partial" | "failed" | "unknown" | "deferred";
   error_code?: string | null;
   error_message?: string | null;
   /** Full Discord thread address. Omitted unless this call confirms a thread. */
@@ -915,7 +917,7 @@ export interface WeixinAccountStatusUpdateRequest {
   action: "mark_session_expired" | "mark_context_token_stale" | "reset_corrupt_cursor";
   expected_bot_generation: number;
   expected_ilink_bot_id: string;
-  error_code?: number | string | null;
+  error_code?: string | null;
   recipient_platform_user_id?: string | null;
   expected_token_version?: number | null;
 }
@@ -980,6 +982,14 @@ export interface WeixinLoginSessionPatchResponse {
   confirmed_result?: Record<string, unknown> | null;
   code?: string | null;
   message?: string | null;
+}
+
+export interface WeixinCollectBufferStatusResponse {
+  ok?: boolean;
+  buffer_id?: string;
+  status: "collecting" | "flushing" | "done" | "cancelled" | "expired" | string;
+  upload_status?: "pending" | "ready" | "failed" | "cancelled" | string | null;
+  cancelled?: boolean;
 }
 
 export interface WeixinCollectAttachmentsRegisterRequest {
@@ -1264,6 +1274,11 @@ export interface BackendClient {
     req: WeixinLoginSessionPatchRequest,
   ): Promise<WeixinLoginSessionPatchResponse>;
 
+  getWeixinCollectBufferStatus?(
+    bufferId: string,
+    messageId?: string,
+  ): Promise<WeixinCollectBufferStatusResponse>;
+
   registerWeixinCollectItemAttachments(
     bufferId: string,
     messageId: string,
@@ -1353,6 +1368,7 @@ export interface BackendClient {
     filename: string,
     content: Buffer,
     mimeType: string,
+    signal?: AbortSignal,
   ): Promise<void>;
 
   downloadWorkspaceFile(
@@ -1393,6 +1409,7 @@ export class HttpBackendClient implements BackendClient {
   private readonly serviceToken: string;
   private readonly fetchImpl: typeof fetch;
   private gatewayEpoch: number | null = null;
+  private hasHeldGatewayLease = false;
   private onStaleGatewayEpoch: ((err: StaleGatewayEpochError) => void) | null = null;
 
   constructor(options: {
@@ -1408,6 +1425,9 @@ export class HttpBackendClient implements BackendClient {
 
   setGatewayEpoch(epoch: number | null): void {
     this.gatewayEpoch = epoch;
+    if (typeof epoch === "number" && Number.isInteger(epoch) && epoch > 0) {
+      this.hasHeldGatewayLease = true;
+    }
   }
 
   getGatewayEpoch(): number | null {
@@ -1465,7 +1485,11 @@ export class HttpBackendClient implements BackendClient {
         status: 409,
         epoch: this.gatewayEpoch,
       });
-      this.onStaleGatewayEpoch?.(err);
+      // Decision #2: Only treat 409 stale_gateway_epoch as lease loss if this process
+      // has actually held a gateway lease; pre-lease startup requests must not trigger fatal exit.
+      if (this.hasHeldGatewayLease) {
+        this.onStaleGatewayEpoch?.(err);
+      }
       throw err;
     }
   }
@@ -2130,6 +2154,29 @@ export class HttpBackendClient implements BackendClient {
     return data;
   }
 
+  async getWeixinCollectBufferStatus(
+    bufferId: string,
+    messageId?: string,
+  ): Promise<WeixinCollectBufferStatusResponse> {
+    const { status, data } =
+      await this.jsonRequest<WeixinCollectBufferStatusResponse>(
+        "GET",
+        `/api/v1/dalton/channels/internal/weixin/collect-buffers/${encodeURIComponent(bufferId)}`,
+        {
+          query: messageId ? { message_id: messageId } : undefined,
+          timeoutMs: 10_000,
+        },
+      );
+    if (status >= 400) {
+      throw new BackendHttpError(
+        `weixin/collect-buffers/status failed (${status})`,
+        status,
+        data,
+      );
+    }
+    return data;
+  }
+
   async registerWeixinCollectItemAttachments(
     bufferId: string,
     messageId: string,
@@ -2458,6 +2505,7 @@ export class HttpBackendClient implements BackendClient {
     filename: string,
     content: Buffer,
     mimeType: string,
+    signal?: AbortSignal,
   ): Promise<void> {
     const url = new URL(
       `${this.baseUrl}/api/v1/workspaces/${encodeURIComponent(workspaceId)}/files/upload`,
@@ -2472,6 +2520,7 @@ export class HttpBackendClient implements BackendClient {
       method: "POST",
       headers: this.headers(userId),
       body: form,
+      ...(signal ? { signal } : {}),
     });
     if (!resp.ok) {
       const errText = await resp.text();

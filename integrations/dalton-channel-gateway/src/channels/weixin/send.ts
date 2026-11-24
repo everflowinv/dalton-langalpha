@@ -79,6 +79,7 @@ export interface WeixinSendContext {
   timeoutMs?: number;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
+  dispatcher?: unknown;
   allowedApiDomains?: readonly string[];
   allowedCdnDomains?: readonly string[];
   resolveHostIps?: HostIpResolver;
@@ -265,6 +266,7 @@ export async function sendWeixinTextMessage(
       timeoutMs: ctx.timeoutMs,
       signal: ctx.signal,
       fetchImpl: ctx.fetchImpl,
+      dispatcher: ctx.dispatcher,
       allowedDomains: ctx.allowedApiDomains,
       resolveHostIps: ctx.resolveHostIps,
       checkResolvedIps: ctx.checkResolvedIps,
@@ -340,6 +342,7 @@ export async function sendWeixinMediaAttachment(
       mediaType: uploadMediaType,
       signal: ctx.signal,
       fetchImpl: ctx.fetchImpl,
+      dispatcher: ctx.dispatcher,
       allowedDomains: ctx.allowedApiDomains,
       allowedCdnDomains: ctx.allowedCdnDomains,
       resolveHostIps: ctx.resolveHostIps,
@@ -390,6 +393,13 @@ export async function sendWeixinMediaAttachment(
     }
   }
 
+  if (ctx.signal?.aborted) {
+    throw new ChannelDeliveryError("Weixin media send aborted before sendmessage", {
+      outcome: "failed",
+      code: "unavailable",
+    });
+  }
+
   const mediaItem: MessageItem = isVerifiedImage
     ? {
         type: MessageItemType.IMAGE,
@@ -436,6 +446,7 @@ export async function sendWeixinMediaAttachment(
       timeoutMs: ctx.timeoutMs,
       signal: ctx.signal,
       fetchImpl: ctx.fetchImpl,
+      dispatcher: ctx.dispatcher,
       allowedDomains: ctx.allowedApiDomains,
       resolveHostIps: ctx.resolveHostIps,
       checkResolvedIps: ctx.checkResolvedIps,

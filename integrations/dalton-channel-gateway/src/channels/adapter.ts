@@ -13,7 +13,11 @@ import type {
   OneTimeWeixinReplyEnvelope,
 } from "../types.js";
 
-export type ChannelErrorOutcome = "failed" | "unknown" | "rate_limited";
+export type ChannelErrorOutcome =
+  | "failed"
+  | "unknown"
+  | "rate_limited"
+  | "deferred";
 export type ChannelErrorCode =
   | "target_not_found"
   | "rate_limited"
@@ -377,6 +381,13 @@ export interface ChannelAdapter {
   /** Optional Weixin iLink multi-account & QR login methods (§3.1 ~ §3.5). */
   setBackendClient?(client: BackendClient): void;
   setLeaseManager?(lease: GatewayLeaseManager): void;
+  /**
+   * Synchronously abort every in-flight network request (sendmessage, CDN upload,
+   * QR login, long-poll loops) without waiting for handlers to settle (D1 / §3.2).
+   */
+  abortAllInFlight?(): void;
+  /** Restart any pollable Weixin account monitors that exited transiently (e.g. brief lease dip). */
+  ensurePollableMonitorsRunning?(): void;
   onWeixinAccountInvalidated?(
     handler: (info: { accountId: string; reason: string }) => void,
   ): void;

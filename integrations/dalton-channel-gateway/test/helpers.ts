@@ -48,6 +48,7 @@ import type {
   WeixinCollectAttachmentsRegisterRequest,
   WeixinCollectAttachmentsRegisterResponse,
   WeixinCollectBufferFinalizeResponse,
+  WeixinCollectBufferStatusResponse,
   WeixinLoginSessionGetResponse,
   WeixinLoginSessionPatchRequest,
   WeixinLoginSessionPatchResponse,
@@ -178,6 +179,7 @@ export type MockBackend = BackendClient &
       BackendClient,
       | "setGatewayEpoch"
       | "setOnStaleGatewayEpoch"
+      | "getWeixinCollectBufferStatus"
       | "authorizeDataTaskNotificationPlan"
       | "authorizeAutomationNotificationPlan"
       | "downloadDataTaskRunArtifact"
@@ -488,6 +490,7 @@ export function createMockBackend(): MockBackend {
         lastUpdate?.status === "sent" &&
         (req.delivery_key.startsWith("notice:partial:") ||
           req.delivery_key.endsWith(":command") ||
+          req.delivery_key.endsWith(":merged_forward_unsupported") ||
           (req.delivery_key.startsWith("fallback:") &&
             prevClaimForKey &&
             (req.inbound_message_id ?? null) ===
@@ -1013,6 +1016,18 @@ export function createMockBackend(): MockBackend {
               accounts_revision: 2,
             }
           : {}),
+      }),
+    ),
+
+    getWeixinCollectBufferStatus: vi.fn(
+      async (
+        bufferId: string,
+      ): Promise<WeixinCollectBufferStatusResponse> => ({
+        ok: true,
+        buffer_id: bufferId,
+        status: "collecting",
+        upload_status: "pending",
+        cancelled: false,
       }),
     ),
 

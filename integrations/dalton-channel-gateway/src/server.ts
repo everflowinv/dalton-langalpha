@@ -20,6 +20,7 @@ import {
   isStaleGatewayEpochError,
 } from "./gateway-lease.js";
 import { ChannelGatewayOrchestrator } from "./orchestrator.js";
+import { redactCredentialString } from "./shared/logger.js";
 import type {
   AgentAutomationOutputPutRequest,
   AgentAutomationRunFinishRequest,
@@ -247,24 +248,45 @@ export function createGatewayApp(options: {
     nowFn: options.nowFn,
   });
 
+  const shouldUseLease =
+    config.mode !== "outgoing" && options.enableLease !== false;
+  let leaseReady = !shouldUseLease;
   let stopInProgress = false;
   const handleFatalLeaseLost = (reason: string, error?: unknown): void => {
+    // Decision #1: synchronously abort ALL in-flight sends, uploads, QR, collect uploads,
+    // and polling loops BEFORE waiting on any async teardown, so nothing can still hit iLink.
+    leaseReady = false;
     deliveryService.setStartupBlocked(true);
     dataTaskNotifications.setStartupBlocked(true);
     backend.setGatewayEpoch?.(null);
+    orchestrator.abortAllActiveCollectUploads();
+    for (const adapter of adapters.values()) {
+      adapter.abortAllInFlight?.();
+    }
     if (!stopInProgress) {
       stopInProgress = true;
       void (async () => {
         try {
-          await orchestrator.stopAllWatches();
-          for (const adapter of adapters.values()) {
-            await adapter.stop();
-          }
           if (server.listening) {
-            await new Promise<void>((resolveClose) => {
-              server.close(() => resolveClose());
-            });
+            (server as Server & { closeAllConnections?: () => void }).closeAllConnections?.();
           }
+          await Promise.race([
+            (async () => {
+              await orchestrator.stopAllWatches();
+              for (const adapter of adapters.values()) {
+                await adapter.stop();
+              }
+              if (server.listening) {
+                await new Promise<void>((resolveClose) => {
+                  server.close(() => resolveClose());
+                });
+              }
+            })(),
+            new Promise<void>((resolveTimeout) => {
+              const timer = setTimeout(resolveTimeout, 1_500);
+              timer.unref?.();
+            }),
+          ]);
         } finally {
           options.onLeaseLost?.(reason, error);
         }
@@ -272,8 +294,6 @@ export function createGatewayApp(options: {
     }
   };
 
-  const shouldUseLease =
-    config.mode !== "outgoing" && options.enableLease !== false;
   const leaseManager = shouldUseLease
     ? (options.leaseManager ??
       new GatewayLeaseManager({
@@ -285,6 +305,9 @@ export function createGatewayApp(options: {
           backend.setGatewayEpoch?.(epoch);
         },
         onLeaseLost: handleFatalLeaseLost,
+        onLeaseRecovered: () => {
+          adapters.get("weixin")?.ensurePollableMonitorsRunning?.();
+        },
       }))
     : undefined;
 
@@ -309,6 +332,40 @@ export function createGatewayApp(options: {
 
       if (method === "GET" && pathname === "/health") {
         sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (method === "POST" && pathname === "/internal/ops-alerts") {
+        let body: unknown;
+        try {
+          body = await readJsonBody<unknown>(req);
+        } catch {
+          sendJson(res, 400, {
+            ok: false,
+            code: "invalid_json",
+            message: "Malformed JSON request body.",
+          });
+          return;
+        }
+        const result = await handleOpsAlert({
+          body,
+          remoteAddress: req.socket.remoteAddress,
+          configPath: config.opsAlertsFile,
+          sendPlainText: sendOpsPlainText,
+        });
+        sendJson(res, result.status, result.data);
+        return;
+      }
+
+      // Decision #2: While acquiring deployment lease / completing startup recovery,
+      // reject ALL iLink & backend-writing routes with 503 `gateway_starting` so they
+      // never contact iLink or trigger false stale-epoch lease loss before epoch is held.
+      if (shouldUseLease && !leaseReady) {
+        sendJson(res, 503, {
+          ok: false,
+          code: "gateway_starting",
+          detail: "Gateway is acquiring deployment lease; retry shortly.",
+        });
         return;
       }
 
@@ -357,28 +414,6 @@ export function createGatewayApp(options: {
           return;
         }
         const result = await automationNotifications.handle(body);
-        sendJson(res, result.status, result.data);
-        return;
-      }
-
-      if (method === "POST" && pathname === "/internal/ops-alerts") {
-        let body: unknown;
-        try {
-          body = await readJsonBody<unknown>(req);
-        } catch {
-          sendJson(res, 400, {
-            ok: false,
-            code: "invalid_json",
-            message: "Malformed JSON request body.",
-          });
-          return;
-        }
-        const result = await handleOpsAlert({
-          body,
-          remoteAddress: req.socket.remoteAddress,
-          configPath: config.opsAlertsFile,
-          sendPlainText: sendOpsPlainText,
-        });
         sendJson(res, result.status, result.data);
         return;
       }
@@ -604,20 +639,23 @@ export function createGatewayApp(options: {
     } catch (err) {
       if (isStaleGatewayEpochError(err)) {
         sendJson(res, 409, {
-          detail: err.message,
           code: "stale_gateway_epoch",
+          detail: "Gateway lease epoch is stale.",
         });
         return;
       }
       if (err instanceof WeixinQrLoginError) {
+        // Decision #15 (§4.3): whitelist code and redact any credential substrings.
         sendJson(res, err.statusCode, {
-          detail: err.message,
-          code: err.code,
+          code: err.code ?? "qr_login_error",
+          detail: redactCredentialString(err.message),
         });
         return;
       }
+      // Decision #15 (§4.3): never echo arbitrary internal/iLink error text on HTTP 500 exit.
       sendJson(res, 500, {
-        detail: err instanceof Error ? err.message : "Internal gateway error",
+        code: "internal_error",
+        detail: "Internal gateway error",
       });
     }
   });
@@ -656,6 +694,7 @@ export function createGatewayApp(options: {
           // Complete mode=startup recovery snapshot BEFORE starting any long-polling or I-6 claims.
           startupRecoverySnapshot =
             await orchestrator.fetchStartupRecoverySnapshot();
+          leaseReady = true;
           deliveryService.setStartupBlocked(false);
           dataTaskNotifications.setStartupBlocked(false);
           for (const adapter of adapters.values()) {
@@ -681,7 +720,9 @@ export function createGatewayApp(options: {
     },
     async stop(): Promise<void> {
       stopInProgress = true;
+      leaseReady = false;
       if (config.mode !== "outgoing") {
+        orchestrator.abortAllActiveCollectUploads();
         await orchestrator.stopAllWatches();
         for (const adapter of adapters.values()) {
           await adapter.stop();

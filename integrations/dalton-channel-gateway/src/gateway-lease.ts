@@ -4,7 +4,7 @@ import { createSubsystemLogger, type SubsystemLogger } from "./shared/logger.js"
 export const DEFAULT_GATEWAY_LEASE_TTL_SECONDS = 45;
 export const DEFAULT_GATEWAY_LEASE_HEARTBEAT_MS = 15_000;
 export const DEFAULT_GATEWAY_LEASE_SAFETY_MARGIN_MS = 5_000;
-export const DEFAULT_GATEWAY_LEASE_ACQUIRE_RETRY_MS = 2_000;
+export const DEFAULT_GATEWAY_LEASE_ACQUIRE_RETRY_MS = 3_000;
 
 export class StaleGatewayEpochError extends Error {
   readonly code = "stale_gateway_epoch";
@@ -72,6 +72,8 @@ export interface GatewayLeaseManagerOptions {
   logger?: SubsystemLogger;
   onEpochAcquired?: (epoch: number) => void;
   onLeaseLost?: (reason: string, error?: unknown) => void;
+  /** Invoked when a heartbeat succeeds after the local lease had transiently dipped into the safety margin. */
+  onLeaseRecovered?: (epoch: number) => void;
 }
 
 async function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
@@ -114,6 +116,8 @@ export class GatewayLeaseManager {
   private readonly logger: SubsystemLogger;
   private readonly onEpochAcquired?: (epoch: number) => void;
   private readonly onLeaseLost?: (reason: string, error?: unknown) => void;
+  private readonly onLeaseRecovered?: (epoch: number) => void;
+  private readonly leaseRecoveredListeners = new Set<(epoch: number) => void>();
 
   private currentEpoch: number | null = null;
   private expiresAtMs = 0;
@@ -136,6 +140,14 @@ export class GatewayLeaseManager {
     this.logger = options.logger ?? createSubsystemLogger("gateway-lease");
     this.onEpochAcquired = options.onEpochAcquired;
     this.onLeaseLost = options.onLeaseLost;
+    this.onLeaseRecovered = options.onLeaseRecovered;
+  }
+
+  addLeaseRecoveredListener(listener: (epoch: number) => void): () => void {
+    this.leaseRecoveredListeners.add(listener);
+    return () => {
+      this.leaseRecoveredListeners.delete(listener);
+    };
   }
 
   get epoch(): number | null {
@@ -258,8 +270,19 @@ export class GatewayLeaseManager {
         this.notifyLeaseLost("heartbeat_rejected");
         return false;
       }
+      const wasLocallyValid = this.isLeaseLocallyValid();
       this.expiresAtMs = parseExpiresAtMs(res.expires_at, this.ttlSeconds);
       this.lastHeartbeatOk = true;
+      if (!wasLocallyValid && this.isLeaseLocallyValid()) {
+        this.onLeaseRecovered?.(epoch);
+        for (const listener of this.leaseRecoveredListeners) {
+          try {
+            listener(epoch);
+          } catch {
+            // Ignore listener errors during lease recovery notification
+          }
+        }
+      }
       return true;
     } catch (err) {
       if (this.stopped || this.leaseLost) {
