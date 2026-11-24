@@ -52,6 +52,17 @@ vi.mock('../viewers/html/liveFrame', async (importOriginal) => {
   };
 });
 
+vi.mock('@/pages/ChatAgent/utils/api/shareLinks', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/pages/ChatAgent/utils/api/shareLinks')>();
+  return {
+    ...actual,
+    createFileGrant: vi.fn<typeof actual.createFileGrant>(async () => ({
+      prefix: '/api/v1/wsfiles/g/test-grant/',
+      expires_in: 3600,
+    })),
+  };
+});
+
 vi.mock('@/pages/ChatAgent/utils/api/artifacts', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/pages/ChatAgent/utils/api/artifacts')>();
   return {
@@ -290,7 +301,7 @@ function workspace(overrides: Partial<Workspace> = {}): Workspace {
 function createPauseQueryClient(colleagueSharingCapable: boolean): QueryClient {
   const queryClient = new QueryClient({
     defaultOptions: {
-      queries: { retry: false, retryDelay: 0, gcTime: 0 },
+      queries: { retry: false, retryDelay: 0, gcTime: Infinity },
       mutations: { retry: false },
     },
   });
@@ -329,6 +340,7 @@ describe('PublishDialog', () => {
     runAuthResets();
     pauseMocks.isDaltonAuth = false;
     pauseMocks.credentialsStatus = null;
+    mockGetWorkspace.mockReset();
     mockVersions.mockResolvedValue([]);
     mockGetMonitor.mockResolvedValue(null);
   });
