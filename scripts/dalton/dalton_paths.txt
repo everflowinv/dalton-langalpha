@@ -586,3 +586,6 @@ tests/fakes/
 tests/standalone/
 # Standalone Core Batch 6: third-party open-source attribution notice.
 NOTICE
+# Shared chats replay inline widgets (DALTON-HOOK(shared-widgets)).
+web/src/pages/SharedChat/__tests__/SharedChatView.widgets.test.tsx
+web/src/pages/ChatAgent/components/viewers/__tests__/InlineWidget.exports.test.tsx

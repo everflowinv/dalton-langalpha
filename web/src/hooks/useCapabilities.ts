@@ -26,6 +26,7 @@ export const CAPABILITY_IDS = [
   'conversation_archive',
   'native_oauth_sync',
   'transcription',
+  'colleague_sharing',
 ] as const;
 
 export type CapabilityId = (typeof CAPABILITY_IDS)[number];
@@ -47,6 +48,7 @@ export const EVERFLOW_DEFAULT_CAPABILITIES: readonly CapabilityId[] = [
   'data_jobs',
   'conversation_archive',
   'native_oauth_sync',
+  'colleague_sharing',
 ];
 
 /**

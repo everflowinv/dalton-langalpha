@@ -1,9 +1,11 @@
 import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { fireEvent, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { renderWithProviders } from '@/test/utils';
-import type { Artifact, ArtifactStatus } from '@/types/api';
+import { runAuthResets } from '@/lib/authResets';
+import { queryKeys } from '@/lib/queryKeys';
+import type { Artifact, ArtifactStatus, Workspace } from '@/types/api';
 
 const tierState = vi.hoisted(() => ({
   callerTier: 'internal' as 'external' | 'internal' | 'admin',
@@ -17,8 +19,6 @@ const workspaceState = vi.hoisted(() => ({
     auto_publish_paused: false,
     auto_publish_pause_token: null as string | null,
   },
-  dataUpdatedAt: 1000,
-  refetch: vi.fn(),
   requestedIds: [] as Array<string | null | undefined>,
 }));
 
@@ -64,6 +64,7 @@ vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
   }));
   return {
     ...orig,
+    getWorkspace: vi.fn<typeof orig.getWorkspace>(),
     readWorkspaceFile: answer,
     readWorkspaceFileFull: answer as unknown as typeof orig.readWorkspaceFileFull,
     writeWorkspaceFile: vi.fn<typeof orig.writeWorkspaceFile>(),
@@ -73,12 +74,16 @@ vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
     getPreviewUrl: vi.fn<typeof orig.getPreviewUrl>(),
   };
 });
-vi.mock('@/hooks/useWorkspace', () => ({
-  useWorkspace: (id: string | null | undefined) => {
-    workspaceState.requestedIds.push(id);
-    return workspaceState;
-  },
-}));
+vi.mock('@/hooks/useWorkspace', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/useWorkspace')>();
+  return {
+    ...actual,
+    useWorkspace: (id: string | null | undefined) => {
+      workspaceState.requestedIds.push(id);
+      return actual.useWorkspace(id);
+    },
+  };
+});
 vi.mock('@/contexts/ThemeContext', () => ({
   useTheme: () => ({ theme: 'dark' }),
 }));
@@ -136,6 +141,7 @@ vi.mock('@/pages/Monitors/api', async (importOriginal) => {
   };
 });
 
+import { getWorkspace } from '@/pages/ChatAgent/utils/api';
 import {
   ensureArtifact,
   findArtifact,
@@ -147,6 +153,7 @@ import FilePanel from '../FilePanel';
 import { fileTarget } from '../filePanel/types';
 import PublishDialog from '../PublishDialog';
 
+const mockGetWorkspace = vi.mocked(getWorkspace);
 const mockFind = vi.mocked(findArtifact);
 const mockEnsure = vi.mocked(ensureArtifact);
 const mockStatus = vi.mocked(getArtifactStatus);
@@ -185,6 +192,7 @@ const STATUS: ArtifactStatus = {
 describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    runAuthResets();
     tierState.colleagueSharingEnabled = true;
     workspaceState.data = {
       status: 'running',
@@ -192,8 +200,12 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
       auto_publish_paused: false,
       auto_publish_pause_token: null,
     };
-    workspaceState.dataUpdatedAt = 1000;
     workspaceState.requestedIds = [];
+    mockGetWorkspace.mockImplementation(async () => ({
+      workspace_id: 'ws-1',
+      is_home: false,
+      ...workspaceState.data,
+    }));
     mockEnsure.mockResolvedValue(ARTIFACT);
     mockFind.mockResolvedValue(ARTIFACT);
     mockStatus.mockResolvedValue(STATUS);
@@ -428,21 +440,43 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
       updated_at: '2026-11-16T12:00:00Z',
       can_manage: true,
     };
-    mockPublishMonitor.mockImplementationOnce(async () => {
-      mockGetMonitor.mockResolvedValue(publishedMonitor);
-      return {
-        monitor: publishedMonitor,
-        versions: [],
-        monitor_grant: 'm1.tok',
-        frame_base: '/api/v1/dalton/monitors/g/m1.tok/',
-        data_base: '/api/v1/dalton/monitors/g/m1.tok/data',
-        expires_in: 43200,
-        cut: true,
-        auto_publish_paused: true,
-        auto_publish_pause_token: 'tok-pause-2',
-        auto_publish_pause_notice: notice,
-      };
-    });
+    mockPublishMonitor
+      .mockImplementationOnce(async () => {
+        workspaceState.data = {
+          ...workspaceState.data,
+          auto_publish_paused: true,
+          auto_publish_pause_token: 'tok-pause-2',
+        };
+        mockGetMonitor.mockResolvedValue(publishedMonitor);
+        return {
+          monitor: publishedMonitor,
+          versions: [],
+          monitor_grant: 'm1.tok',
+          frame_base: '/api/v1/dalton/monitors/g/m1.tok/',
+          data_base: '/api/v1/dalton/monitors/g/m1.tok/data',
+          expires_in: 43200,
+          cut: true,
+          auto_publish_paused: true,
+          auto_publish_pause_token: 'tok-pause-2',
+          auto_publish_pause_notice: notice,
+        };
+      })
+      .mockImplementationOnce(async () => {
+        workspaceState.data = {
+          ...workspaceState.data,
+          auto_publish_paused: false,
+          auto_publish_pause_token: null,
+        };
+        return {
+          monitor: publishedMonitor,
+          versions: [],
+          monitor_grant: 'm1.tok',
+          frame_base: '/api/v1/dalton/monitors/g/m1.tok/',
+          data_base: '/api/v1/dalton/monitors/g/m1.tok/data',
+          expires_in: 43200,
+          cut: true,
+        };
+      });
 
     renderWithProviders(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
 
@@ -507,7 +541,7 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
     await waitFor(() => expect(publishBtn).toBeEnabled());
 
     expect(workspaceState.requestedIds.every((id) => id === null)).toBe(true);
-    expect(workspaceState.refetch).not.toHaveBeenCalled();
+    expect(mockGetWorkspace).not.toHaveBeenCalled();
     expect(
       screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
     ).not.toBeInTheDocument();
@@ -523,8 +557,8 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
     expect(invalidatedRoots).not.toContain('workspaces');
   });
 
-  // DALTON-HOOK(colleague-access): refreshed workspace detail supersedes previous submit pauseOverride
-  it('prefers freshly refetched workspace detail over stale pauseOverride from an earlier submit', async () => {
+  // DALTON-HOOK(colleague-access): refreshed workspace detail updates pause state while notice persists until next submit
+  it('prefers freshly refetched workspace detail for pause state while keeping the publish notice until the next submit', async () => {
     tierState.callerTier = 'internal';
     tierState.colleagueSharingEnabled = true;
     workspaceState.data = {
@@ -533,7 +567,6 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
       auto_publish_paused: true,
       auto_publish_pause_token: 'tok-1',
     };
-    workspaceState.dataUpdatedAt = 1000;
 
     const publishedMonitor = {
       monitor_id: 'm-1',
@@ -563,6 +596,11 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
       can_manage: true,
     };
     mockPublishMonitor.mockImplementationOnce(async () => {
+      workspaceState.data = {
+        ...workspaceState.data,
+        auto_publish_paused: true,
+        auto_publish_pause_token: 'tok-2',
+      };
       mockGetMonitor.mockResolvedValue(publishedMonitor);
       return {
         monitor: publishedMonitor,
@@ -578,10 +616,13 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
       };
     });
 
-    const { rerender } = renderWithProviders(
+    const { queryClient } = renderWithProviders(
       <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
     );
 
+    expect(
+      await screen.findByText(/Auto-update is paused because this workspace read a colleague's content/),
+    ).toBeInTheDocument();
     const publishBtn = await screen.findByRole('button', { name: 'Publish' });
     await waitFor(() => expect(publishBtn).toBeEnabled());
     await userEvent.click(publishBtn);
@@ -594,20 +635,28 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
       auto_publish_paused: false,
       auto_publish_pause_token: null,
     };
-    workspaceState.dataUpdatedAt = 2000;
-    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    act(() => {
+      queryClient.setQueryData<Workspace>(queryKeys.workspaces.detail('ws-1'), {
+        workspace_id: 'ws-1',
+        is_home: false,
+        ...workspaceState.data,
+      });
+    });
 
     await waitFor(() => {
-      expect(screen.queryByText('仍有进行中的同事协作轮次，结束后再确认')).not.toBeInTheDocument();
       expect(
         screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
       ).not.toBeInTheDocument();
     });
+    expect(screen.getByText('仍有进行中的同事协作轮次，结束后再确认')).toBeInTheDocument();
 
     const updateBtn = await screen.findByRole('button', { name: 'Update' });
     await waitFor(() => expect(updateBtn).toBeEnabled());
     await userEvent.click(updateBtn);
     await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(2));
     expect(mockPublishMonitor.mock.calls[1][0]).not.toHaveProperty('confirm_pause_token');
+    await waitFor(() => {
+      expect(screen.queryByText('仍有进行中的同事协作轮次，结束后再确认')).not.toBeInTheDocument();
+    });
   });
 });
