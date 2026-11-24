@@ -22,6 +22,7 @@ import {
   GatewayLeaseManager,
   isLeaseSafetyMarginPauseError,
   isStaleGatewayEpochError,
+  StaleGatewayEpochError,
 } from "./gateway-lease.js";
 import { ChannelGatewayOrchestrator } from "./orchestrator.js";
 import type {
@@ -197,7 +198,6 @@ export function createGatewayApp(options: {
   adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
   backoffDelayFn?: (ms: number) => Promise<void>;
   busyThreadMaxWaitMs?: number;
-  collectCleanupLateRecheckMs?: number;
   nowFn?: () => number;
   leaseManager?: GatewayLeaseManager;
   enableLease?: boolean;
@@ -263,7 +263,6 @@ export function createGatewayApp(options: {
     statusFeedback: config.statusFeedback,
     backoffDelayFn: options.backoffDelayFn,
     busyThreadMaxWaitMs: options.busyThreadMaxWaitMs,
-    collectCleanupLateRecheckMs: options.collectCleanupLateRecheckMs,
     nowFn: options.nowFn,
   });
 
@@ -272,14 +271,14 @@ export function createGatewayApp(options: {
   let leaseReady = !shouldUseLease;
   let stopInProgress = false;
   const handleFatalLeaseLost = (reason: string, error?: unknown): void => {
-    // Decision #1: synchronously abort ALL in-flight sends, uploads, QR, collect uploads,
-    // in-delivery retry waits, and long-polling loops BEFORE waiting on any async teardown,
-    // so nothing can still hit iLink.
+    // Decision #1 & R5 #3: synchronously abort ALL in-flight sends, uploads, QR, inbound
+    // attachment uploads, in-delivery retry waits, and long-polling loops BEFORE waiting on
+    // any async teardown, and prevent any post-lease-loss I-7 settlement.
     leaseReady = false;
-    deliveryService.setStartupBlocked(true);
-    dataTaskNotifications.setStartupBlocked(true);
+    deliveryService.abortOnLeaseLost();
+    dataTaskNotifications.abortOnLeaseLost();
     backend.setGatewayEpoch?.(null);
-    orchestrator.abortAllActiveCollectUploads();
+    orchestrator.abortAllActiveInboundUploads();
     for (const adapter of adapters.values()) {
       adapter.abortAllInFlight?.();
     }
@@ -730,12 +729,22 @@ export function createGatewayApp(options: {
           // Complete mode=startup recovery snapshot BEFORE starting any long-polling or I-6 claims.
           startupRecoverySnapshot =
             await orchestrator.fetchStartupRecoverySnapshot();
-          // R4 #5 (Codex #9): Apply initial managed account snapshots BEFORE lifting write
+          // R4 #5 & R5 #4 (Codex #6): Apply initial managed account snapshots BEFORE lifting write
           // restrictions so no outbound request can run before the first snapshot is applied.
+          // If snapshot fails or lease is lost during startup, keep write routes blocked.
           for (const adapter of adapters.values()) {
             if (adapter.isConfigured() || adapter.platform === "weixin") {
               await adapter.prepareStartupSnapshot?.();
             }
+          }
+          if (
+            stopInProgress ||
+            (leaseManager && (leaseManager.isLost || leaseManager.isLeaseExpired()))
+          ) {
+            throw new StaleGatewayEpochError(
+              "Gateway lease lost before startup completed",
+              { status: 409, epoch: leaseManager?.epoch ?? null },
+            );
           }
           leaseReady = true;
           deliveryService.setStartupBlocked(false);
@@ -746,6 +755,9 @@ export function createGatewayApp(options: {
             }
           }
         } catch (err) {
+          leaseReady = false;
+          deliveryService.setStartupBlocked(true);
+          dataTaskNotifications.setStartupBlocked(true);
           if (server.listening) {
             await new Promise<void>((resolveClose) => {
               server.close(() => resolveClose());
@@ -764,10 +776,10 @@ export function createGatewayApp(options: {
     async stop(): Promise<void> {
       stopInProgress = true;
       leaseReady = false;
-      deliveryService.abortAllRetries();
-      dataTaskNotifications.abortAllRetries();
+      deliveryService.setStartupBlocked(true);
+      dataTaskNotifications.setStartupBlocked(true);
       if (config.mode !== "outgoing") {
-        orchestrator.abortAllActiveCollectUploads();
+        orchestrator.abortAllActiveInboundUploads();
         await orchestrator.stopAllWatches();
         for (const adapter of adapters.values()) {
           await adapter.stop();

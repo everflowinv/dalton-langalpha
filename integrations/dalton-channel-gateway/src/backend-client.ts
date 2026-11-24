@@ -134,7 +134,7 @@ export interface I1RegisterAndResolveRequest {
   weixin_bot_generation?: number | null;
   weixin_context_seq?: number | null;
   weixin_media_meta?: WeixinPersistedAttachmentMeta[] | null;
-  unsupported_item_types?: string[] | null;
+  unsupported_item_types?: number[] | null;
 }
 
 export interface I1RegisterAndResolveResponse {
@@ -192,10 +192,6 @@ export interface I1RegisterAndResolveResponse {
   command_result?: Record<string, unknown> | null;
   /** False means the confirmation was already accepted and must not be sent again. */
   command_reply_pending?: boolean;
-  /** Weixin collection mode outcome (`"appended"` or `"limit_reached"`). */
-  collection_mode?: "appended" | "limit_reached" | string | null;
-  collect_buffer_id?: string | null;
-  collect_buffer_status?: string | null;
   /** Whether a usable context_token exists for sending a hint (e.g. merged-forward unsupported). */
   has_usable_weixin_context_token?: boolean;
   /** D16 one-time Weixin reply envelope (e.g. conflict auto-unbind). */
@@ -250,36 +246,12 @@ export interface I2BindCodeConsumeResponse {
   one_time_weixin_reply?: OneTimeWeixinReplyEnvelope | null;
 }
 
-export interface WeixinFlushedInbound {
-  platform?: string;
-  message_id: string;
-  request_key: string;
-  dalton_user_id: string | null;
-  platform_user_id?: string | null;
-  chat_address?: string | null;
-  thread_scope_key?: string | null;
-  workspace_id: string | null;
-  workspace_status?: string | null;
-  external_thread_id: string | null;
-  generation?: number | null;
-  text?: string | null;
-  uploaded_attachments?: UploadedAttachmentRecord[];
-  weixin_account_id?: string | null;
-  weixin_bot_id?: string | null;
-  weixin_bot_generation?: number | null;
-  raw_payload?: Record<string, unknown> | null;
-  status?: string | null;
-}
-
 export interface I3SessionCommandRequest {
   cmd:
     | "workspace_list"
     | "workspace_switch"
     | "new"
     | "stop"
-    | "collect"
-    | "done"
-    | "cancel"
     | "help";
   platform: ChannelPlatform;
   dalton_user_id?: string | null;
@@ -366,15 +338,10 @@ export interface I3SessionCommandResponse {
   /** HTTP status from a permanent `/stop` cancel denial, kept with the command result. */
   stop_cancel_status?: number | null;
   switched?: boolean;
-  /** Weixin collection mode / help fields. */
-  collect_buffer_id?: string | null;
-  collect_status?: "collecting" | "flushing" | "done" | "cancelled" | "empty" | "not_collecting" | string | null;
-  /** Plural array of cancelled collect buffer IDs per contract §5.3 (`I-3 /cancel`). */
-  cancelled_buffer_ids?: string[];
+  /** Optional Weixin help/command reply fields. */
   reply_text?: string | null;
   message?: string | null;
   help_text?: string | null;
-  flushed_inbound?: WeixinFlushedInbound | null;
   one_time_weixin_reply?: OneTimeWeixinReplyEnvelope | null;
 }
 
@@ -719,8 +686,6 @@ export interface RecoverInboundEventRow {
   raw_payload: Record<string, unknown>;
   /** Backend-decrypted Weixin attachment metadata (takes precedence over `raw_payload` during recovery). */
   decrypted_weixin_attachments?: WeixinPersistedAttachmentMeta[] | null;
-  collect_buffer_id?: string | null;
-  collect_buffer_status?: string | null;
   weixin_account_id?: string | null;
   weixin_context_bot_id?: string | null;
   weixin_context_bot_generation?: number | null;
@@ -777,24 +742,12 @@ export interface RecoverAutomationRunRow {
   targets: AutomationRunTargetRecord[];
 }
 
-export interface RecoverFlushingCollectBufferRow {
-  buffer_id: string;
-  dalton_user_id: string;
-  weixin_account_id?: string | null;
-  thread_scope_key?: string | null;
-  workspace_id?: string | null;
-  status: string;
-  created_at?: string | null;
-  updated_at?: string | null;
-}
-
 export interface I7RecoverResponse {
   mode: "startup" | "watch_reconnect";
   inbound_events?: RecoverInboundEventRow[];
   background_runs: RecoverBackgroundRunRow[];
   thread_watches: RecoverThreadWatchRow[];
   automation_runs?: RecoverAutomationRunRow[];
-  flushing_collect_buffers?: RecoverFlushingCollectBufferRow[];
 }
 
 export interface I8AutomationRunStartRequest {
@@ -997,46 +950,6 @@ export interface WeixinLoginSessionPatchResponse {
   confirmed_result?: Record<string, unknown> | null;
   code?: string | null;
   message?: string | null;
-}
-
-export interface WeixinCollectBufferStatusResponse {
-  ok?: boolean;
-  buffer_id?: string;
-  status: "collecting" | "flushing" | "done" | "cancelled" | "expired" | string;
-  /** Contract §4.1: `"pending_upload" | "ready" | "failed" | null`. */
-  upload_status?: "pending_upload" | "ready" | "failed" | string | null;
-  /** Contract §4.1 alias of `upload_status`. */
-  item_upload_status?: "pending_upload" | "ready" | "failed" | string | null;
-  account_id?: string | null;
-  dalton_user_id?: string | null;
-  workspace_id?: string | null;
-  scope_key?: string | null;
-  session_generation?: number;
-  bot_generation?: number;
-  item_count?: number;
-  expires_at?: string | null;
-  max_expires_at?: string | null;
-  cancelled?: boolean;
-}
-
-export interface WeixinCollectAttachmentsRegisterRequest {
-  uploaded_attachments: UploadedAttachmentRecord[];
-  upload_failed?: boolean;
-  error_message?: string | null;
-}
-
-export interface WeixinCollectAttachmentsRegisterResponse {
-  ok: boolean;
-  upload_status: "ready" | "failed" | "cancelled" | "too_late" | string;
-  collect_buffer_status: string;
-  code?: "collect_buffer_cancelled" | "collect_buffer_too_late" | string | null;
-  message?: string | null;
-}
-
-export interface WeixinCollectBufferFinalizeResponse {
-  ok: boolean;
-  status: "done" | "cancelled" | string;
-  flushed_inbound?: WeixinFlushedInbound | null;
 }
 
 export interface WeixinPreflightSendRequest {
@@ -1305,21 +1218,6 @@ export interface BackendClient {
     req: WeixinLoginSessionPatchRequest,
   ): Promise<WeixinLoginSessionPatchResponse>;
 
-  getWeixinCollectBufferStatus?(
-    bufferId: string,
-    messageId?: string,
-  ): Promise<WeixinCollectBufferStatusResponse>;
-
-  registerWeixinCollectItemAttachments(
-    bufferId: string,
-    messageId: string,
-    req: WeixinCollectAttachmentsRegisterRequest,
-  ): Promise<WeixinCollectAttachmentsRegisterResponse>;
-
-  finalizeWeixinCollectBuffer(
-    bufferId: string,
-  ): Promise<WeixinCollectBufferFinalizeResponse>;
-
   preflightWeixinSend(
     deliveryKey: string,
     req: WeixinPreflightSendRequest,
@@ -1402,12 +1300,6 @@ export interface BackendClient {
     mimeType: string,
     signal?: AbortSignal,
   ): Promise<void>;
-
-  deleteWorkspaceFiles?(
-    userId: string,
-    workspaceId: string,
-    paths: string[],
-  ): Promise<{ deleted: string[]; errors: Array<{ path: string; detail: string }> }>;
 
   downloadWorkspaceFile(
     userId: string,
@@ -2271,77 +2163,6 @@ export class HttpBackendClient implements BackendClient {
     return data;
   }
 
-  async getWeixinCollectBufferStatus(
-    bufferId: string,
-    messageId?: string,
-  ): Promise<WeixinCollectBufferStatusResponse> {
-    const { status, data } =
-      await this.jsonRequest<WeixinCollectBufferStatusResponse>(
-        "GET",
-        `/api/v1/dalton/channels/internal/weixin/collect-buffers/${encodeURIComponent(bufferId)}`,
-        {
-          query: messageId ? { message_id: messageId } : undefined,
-          timeoutMs: 10_000,
-        },
-      );
-    if (status >= 400) {
-      throw new BackendHttpError(
-        `weixin/collect-buffers/status failed (${status})`,
-        status,
-        data,
-      );
-    }
-    return data;
-  }
-
-  async registerWeixinCollectItemAttachments(
-    bufferId: string,
-    messageId: string,
-    req: WeixinCollectAttachmentsRegisterRequest,
-  ): Promise<WeixinCollectAttachmentsRegisterResponse> {
-    const { status, data } =
-      await this.jsonRequest<WeixinCollectAttachmentsRegisterResponse>(
-        "POST",
-        `/api/v1/dalton/channels/internal/weixin/collect-buffers/${encodeURIComponent(bufferId)}/items/${encodeURIComponent(messageId)}/attachments`,
-        {
-          body: req,
-          timeoutMs: 15_000,
-          includeGatewayEpoch: true,
-        },
-      );
-    if (status >= 400) {
-      throw new BackendHttpError(
-        `weixin/collect-buffers/attachments failed (${status})`,
-        status,
-        data,
-      );
-    }
-    return data;
-  }
-
-  async finalizeWeixinCollectBuffer(
-    bufferId: string,
-  ): Promise<WeixinCollectBufferFinalizeResponse> {
-    const { status, data } =
-      await this.jsonRequest<WeixinCollectBufferFinalizeResponse>(
-        "POST",
-        `/api/v1/dalton/channels/internal/weixin/collect-buffers/${encodeURIComponent(bufferId)}/finalize`,
-        {
-          body: {},
-          timeoutMs: 35_000,
-          includeGatewayEpoch: true,
-        },
-      );
-    if (status >= 400) {
-      throw new BackendHttpError(
-        `weixin/collect-buffers/finalize failed (${status})`,
-        status,
-        data,
-      );
-    }
-    return data;
-  }
-
   async preflightWeixinSend(
     deliveryKey: string,
     req: WeixinPreflightSendRequest,
@@ -2645,40 +2466,6 @@ export class HttpBackendClient implements BackendClient {
       const errText = await resp.text();
       throw new Error(`uploadWorkspaceFile failed (${resp.status}): ${errText}`);
     }
-  }
-
-  /**
-   * Best-effort cleanup of workspace files uploaded by a cancelled collect-buffer item
-   * (`DELETE /api/v1/workspaces/{workspace_id}/files`, Round 3 Decision #7).
-   */
-  async deleteWorkspaceFiles(
-    userId: string,
-    workspaceId: string,
-    paths: string[],
-  ): Promise<{ deleted: string[]; errors: Array<{ path: string; detail: string }> }> {
-    const cleanPaths = paths.map((p) => p.trim()).filter(Boolean);
-    if (cleanPaths.length === 0) {
-      return { deleted: [], errors: [] };
-    }
-    const { status, data } = await this.jsonRequest<{
-      deleted?: string[];
-      errors?: Array<{ path: string; detail: string }>;
-    }>("DELETE", `/api/v1/workspaces/${encodeURIComponent(workspaceId)}/files`, {
-      userId,
-      body: { paths: cleanPaths },
-      timeoutMs: 15_000,
-    });
-    if (status >= 400) {
-      throw new BackendHttpError(
-        `deleteWorkspaceFiles failed (${status})`,
-        status,
-        data,
-      );
-    }
-    return {
-      deleted: Array.isArray(data?.deleted) ? data.deleted : [],
-      errors: Array.isArray(data?.errors) ? data.errors : [],
-    };
   }
 
   async downloadWorkspaceFile(

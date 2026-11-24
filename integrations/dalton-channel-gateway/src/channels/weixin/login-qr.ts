@@ -967,12 +967,10 @@ export class WeixinQrLoginManager {
       typeof confirmRes.bot_generation === "number"
         ? confirmRes.bot_generation
         : session.expected_bot_generation + 1;
-    // Contract §3.2 places account status in `status` ("active" | "pending_verification"),
-    // while backend `confirm_weixin_login_session` returns `status: "confirmed"` + `account_status`.
-    // Support both so contract-only mocks and live backend behave identically.
+    // Contract §3.2: confirm returns `status: "confirmed"` and account status in
+    // `account_status` (`"active" | "pending_verification"`).
     const resolvedAccountStatus: "active" | "pending_verification" =
-      confirmRes.account_status === "pending_verification" ||
-      confirmRes.status === "pending_verification"
+      confirmRes.account_status === "pending_verification"
         ? "pending_verification"
         : "active";
 

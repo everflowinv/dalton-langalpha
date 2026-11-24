@@ -10,6 +10,7 @@ import {
   type GatewayLeaseManager,
   isLeaseSafetyMarginPauseError,
   isStaleGatewayEpochError,
+  StaleGatewayEpochError,
 } from "../../gateway-lease.js";
 import {
   createSubsystemLogger,
@@ -84,6 +85,7 @@ export const WEIXIN_TYPING_INTERVAL_MS = 10_000;
 export const WEIXIN_TYPING_MAX_DURATION_MS = 120_000;
 export const WEIXIN_TYPING_TICKET_TTL_MS = 24 * 60 * 60 * 1_000;
 export const WEIXIN_DEFAULT_RECONCILE_INTERVAL_MS = 15_000;
+export const WEIXIN_DEFAULT_STARTUP_SNAPSHOT_RETRY_MS = 1_000;
 export const WEIXIN_LAYER2_PROBE_INTERVAL_MS = 5 * 60_000;
 export const WEIXIN_DEFAULT_STAGGER_DELAY_MS = 100; // <= 10 accounts/sec
 export const WEIXIN_DEFAULT_STAGGER_JITTER_MS = 500;
@@ -117,6 +119,7 @@ export interface WeixinChannelAdapterOptions {
   pollTimeoutMs?: number;
   retryDelayMs?: number;
   reconcileIntervalMs?: number;
+  startupSnapshotRetryMs?: number;
   probeInterval404Ms?: number;
   staggerDelayMs?: number;
   staggerJitterMs?: number;
@@ -167,6 +170,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   private readonly typingMaxDurationMs: number;
   private readonly typingTicketTtlMs: number;
   private readonly reconcileIntervalMs: number;
+  private readonly startupSnapshotRetryMs: number;
   private readonly probeInterval404Ms: number;
   private readonly staggerDelayMs: number;
   private readonly staggerJitterMs: number;
@@ -224,6 +228,8 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       opts.typingTicketTtlMs ?? WEIXIN_TYPING_TICKET_TTL_MS;
     this.reconcileIntervalMs =
       opts.reconcileIntervalMs ?? WEIXIN_DEFAULT_RECONCILE_INTERVAL_MS;
+    this.startupSnapshotRetryMs =
+      opts.startupSnapshotRetryMs ?? WEIXIN_DEFAULT_STARTUP_SNAPSHOT_RETRY_MS;
     this.probeInterval404Ms =
       opts.probeInterval404Ms ?? WEIXIN_LAYER2_PROBE_INTERVAL_MS;
     this.staggerDelayMs =
@@ -255,7 +261,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     ).trim();
     if (initialToken && initialBotId) {
       const accountId = opts.accountId?.trim() || "standalone";
-      this.hasAppliedSnapshot = true;
+      if (!this.backend) {
+        this.hasAppliedSnapshot = true;
+      }
       this.accounts.set(accountId, {
         accountId,
         userId: "",
@@ -591,22 +599,67 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   }
 
   /**
-   * R4 #5 (Codex #9): Loads and applies the initial account snapshot BEFORE the gateway
-   * lifts startup write restrictions and before long-polling begins.
+   * R4 #5 & R5 #4 (Codex #6, Grok High): Loads and applies the initial managed account
+   * snapshot BEFORE the gateway lifts startup write restrictions and before long-polling begins.
+   * Retries transient failures (5xx / network / lease safety margin) until an authoritative
+   * snapshot is applied; immediately throws on lease loss (409 / expired) or stop so write
+   * routes are NEVER opened before the initial snapshot succeeds.
    */
   async prepareStartupSnapshot(): Promise<void> {
     if (!this.backend || this.hasAppliedSnapshot) {
       return;
     }
-    if (!this.reconcileAbortController) {
+    if (!this.reconcileAbortController || this.reconcileAbortController.signal.aborted) {
       this.reconcileAbortController = new AbortController();
     }
-    if (this.leaseManager && !this.leaseManager.isLeaseLocallyValid()) {
-      return;
+    const signal = this.reconcileAbortController.signal;
+
+    while (!this.hasAppliedSnapshot) {
+      if (signal.aborted) {
+        throw new Error("Weixin startup snapshot aborted");
+      }
+      if (this.leaseManager?.isLeaseExpired()) {
+        throw new StaleGatewayEpochError(
+          "Gateway lease lost during Weixin startup snapshot",
+          { status: 409, epoch: this.leaseManager.epoch },
+        );
+      }
+      if (this.leaseManager && !this.leaseManager.isLeaseLocallyValid()) {
+        const ok = await sleepWithAbort(this.startupSnapshotRetryMs, signal);
+        if (!ok) {
+          throw new Error("Weixin startup snapshot aborted while waiting for lease");
+        }
+        continue;
+      }
+
+      try {
+        await this.executeSingleReconcilePass("startup_snapshot", {
+          startMonitors: false,
+          throwOnFailure: true,
+        });
+      } catch (err) {
+        if (isStaleGatewayEpochError(err)) {
+          throw err;
+        }
+        if (signal.aborted || this.leaseManager?.isLeaseExpired()) {
+          throw new StaleGatewayEpochError(
+            "Gateway lease lost during Weixin startup snapshot",
+            { status: 409, epoch: this.leaseManager?.epoch ?? null, cause: err },
+          );
+        }
+        this.logger.warn(
+          "Weixin initial startup snapshot failed; retrying before opening write routes",
+          {
+            retry_ms: this.startupSnapshotRetryMs,
+            ...extractSafeLogErrorFields(err),
+          },
+        );
+        const ok = await sleepWithAbort(this.startupSnapshotRetryMs, signal);
+        if (!ok) {
+          throw new Error("Weixin startup snapshot aborted during retry wait");
+        }
+      }
     }
-    await this.executeSingleReconcilePass("startup_snapshot", {
-      startMonitors: false,
-    });
   }
 
   async start(): Promise<void> {
@@ -620,7 +673,20 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
     if (this.backend) {
       if (this.hasAppliedSnapshot) {
-        this.ensurePollableMonitorsRunning();
+        const pendingToStart = [...this.accounts.values()].filter(
+          (acc) =>
+            !acc.monitorTask &&
+            isPollableAccountStatus(acc.status) &&
+            Boolean(acc.botToken) &&
+            Boolean(acc.ilinkBotId),
+        );
+        if (
+          this.backendEnabled &&
+          !this.backendNotFound404 &&
+          (!this.leaseManager || this.leaseManager.isLeaseLocallyValid())
+        ) {
+          await this.startAccountMonitorsStaggered(pendingToStart);
+        }
         const nextDelay = this.backendNotFound404
           ? this.probeInterval404Ms
           : this.reconcileIntervalMs;
@@ -903,7 +969,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
   private async executeSingleReconcilePass(
     reason: string,
-    options?: { startMonitors?: boolean },
+    options?: { startMonitors?: boolean; throwOnFailure?: boolean },
   ): Promise<void> {
     if (!this.backend) return;
     try {
@@ -923,6 +989,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
       if (!resp.enabled) {
         this.backendEnabled = false;
+        this.hasAppliedSnapshot = true;
         this.lastRevision = resp.accounts_revision;
         if (this.accounts.size > 0) {
           this.logger.info(
@@ -953,6 +1020,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
       this.backendEnabled = true;
       if (!resp.changed) {
+        this.hasAppliedSnapshot = true;
         if (this.lastRevision === null) {
           this.lastRevision = resp.accounts_revision;
         }
@@ -973,12 +1041,16 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         this.abortAllInFlight();
         this.leaseManager?.notifyLeaseLost("reconcile_stale_epoch", err);
         await this.stopAllAccountMonitors();
+        if (options?.throwOnFailure) {
+          throw err;
+        }
         return;
       }
       if (err instanceof BackendHttpError && err.status === 404) {
         // Layer 2 disabled: backend Weixin routes unmounted -> stop all pollers, probe every 5m.
         this.backendNotFound404 = true;
         this.backendEnabled = false;
+        this.hasAppliedSnapshot = true;
         this.lastRevision = null;
         const removedIds = [...this.accounts.keys()];
         for (const accountId of removedIds) {
@@ -1001,6 +1073,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           },
         );
         return;
+      }
+      if (options?.throwOnFailure) {
+        throw err;
       }
       this.logger.warn("Weixin accounts reconcile failed; retaining current pollers", {
         reason,
@@ -1150,8 +1225,18 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     if (!startMonitors) {
       return;
     }
+    await this.startAccountMonitorsStaggered(toStart);
+  }
+
+  /**
+   * Starts pollers sequentially with configured stagger delay + jitter (§3.4 / R5 #4).
+   * Shared by both `applyAccountSnapshots()` and preloaded `start()`.
+   */
+  private async startAccountMonitorsStaggered(
+    accounts: readonly ManagedWeixinAccount[],
+  ): Promise<void> {
     const signal = this.reconcileAbortController?.signal;
-    for (let idx = 0; idx < toStart.length; idx += 1) {
+    for (let idx = 0; idx < accounts.length; idx += 1) {
       if (!this.started || signal?.aborted) {
         return;
       }
@@ -1163,8 +1248,8 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         const ok = await sleepWithAbort(this.staggerDelayMs + jitter, signal);
         if (!ok) return;
       }
-      const acc = toStart[idx]!;
-      if (this.accounts.get(acc.accountId) === acc) {
+      const acc = accounts[idx]!;
+      if (this.accounts.get(acc.accountId) === acc && !acc.monitorTask) {
         this.startAccountMonitor(acc);
       }
     }
@@ -1273,6 +1358,20 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         throw statusErr;
       }
     }
+  }
+
+  /**
+   * R5 #1 (Codex High #2): Returns true iff the Weixin account referenced by `event`
+   * still exists in the current snapshot, is pollable, and matches `ilinkBotId` + `botGeneration`.
+   */
+  isWeixinAccountGenerationActive(
+    event: Pick<
+      InboundChannelEvent,
+      "weixinAccountId" | "weixinBotId" | "weixinBotGeneration"
+    >,
+  ): boolean {
+    const account = this.resolveAccountForEvent(event as InboundChannelEvent);
+    return Boolean(account && isPollableAccountStatus(account.status));
   }
 
   /**
@@ -1699,7 +1798,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     if (dedupeKey && this.sentOneTimeReplyKeys.has(dedupeKey)) {
       return { sent: false, duplicate: true };
     }
-    const { signal, release } = this.createOperationSignal(envelope.account_id);
+    const { signal, release } = this.createOperationSignal(null);
     try {
       const safeBaseUrl = await this.resolveSafeBaseUrl(envelope.base_url);
       this.assertLeaseForOutbound("sendOneTimeReply.dispatch");
@@ -1710,9 +1809,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         });
       }
       const cdnBaseUrl = (
-        envelope.cdn_base_url ||
-        this.opts.cdnBaseUrl ||
-        ILINK_DEFAULT_CDN_BASE_URL
+        this.opts.cdnBaseUrl || ILINK_DEFAULT_CDN_BASE_URL
       ).trim();
       const res = await sendWeixinTextMessage(
         {
@@ -2079,11 +2176,28 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   async downloadAttachment(
     descriptor: InboundAttachmentDescriptor,
     event: InboundChannelEvent,
+    options?: { signal?: AbortSignal },
   ): Promise<DownloadedAttachment> {
     this.assertLeaseForOutbound("downloadAttachment");
     const account = this.resolveAccountForEvent(event);
-    if (account && account.status === "expired") {
-      throw new Error("Weixin bot session has expired (-14)");
+    // R5 #1 (Codex High #2): Never fall back to a default CDN base URL when a matching active
+    // account/generation cannot be resolved; abort immediately if the account rotated or vanished.
+    const requiresMatchedAccount =
+      Boolean(this.backend) ||
+      Boolean(event.weixinAccountId?.trim()) ||
+      Boolean(event.weixinBotId?.trim()) ||
+      event.weixinBotGeneration !== undefined;
+    if (!account && requiresMatchedAccount) {
+      throw new Error(
+        "Weixin account not found or bot generation superseded; aborting attachment download",
+      );
+    }
+    if (account && !isPollableAccountStatus(account.status)) {
+      throw new Error(
+        account.status === "expired"
+          ? "Weixin bot session has expired (-14)"
+          : `Weixin account status "${account.status}" is not active`,
+      );
     }
     const meta = resolvePersistedAttachmentMeta(descriptor, event);
     if (!meta) {
@@ -2092,14 +2206,18 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       );
     }
 
-    const cdnBaseUrl =
-      account?.cdnBaseUrl ||
-      (this.opts.cdnBaseUrl || ILINK_DEFAULT_CDN_BASE_URL).trim();
+    const cdnBaseUrl = account
+      ? account.cdnBaseUrl
+      : (this.opts.cdnBaseUrl || ILINK_DEFAULT_CDN_BASE_URL).trim();
 
     const { signal, release } = this.createOperationSignal(
       account?.accountId ?? event.weixinAccountId,
+      options?.signal,
     );
     try {
+      if (signal.aborted) {
+        throw new Error("Weixin attachment download aborted");
+      }
       const downloaded = await downloadWeixinCdnAttachment(meta, {
         cdnBaseUrl,
         allowedCdnDomains: this.opts.allowedCdnDomains,

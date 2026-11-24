@@ -39,11 +39,112 @@ export function formatSafeSessionKeyPrefix(sessionKey: string | undefined | null
   return trimmed.slice(0, 8);
 }
 
-const SAFE_LOG_ERROR_CODE_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
+const HTTP_STATUS_ERROR_CODE_RE = /^http_[1-5]\d{2}$/;
+
+/**
+ * Fixed whitelist of known safe error codes / class names that may appear raw in structured logs.
+ * Any unknown or synthetic code/name is normalized to `"unknown_error"` (§4.3 / R5 #7).
+ */
+export const KNOWN_LOG_ERROR_CODES: ReadonlySet<string> = new Set([
+  // Backend / contract deny & operational codes
+  "roster_lookup_error",
+  "preflight_deadline_exceeded",
+  "stale_gateway_epoch",
+  "gateway_lease_safety_margin",
+  "gateway_lease_paused",
+  "gateway_starting",
+  "gateway_stopping",
+  "weixin_snapshot_not_ready",
+  "weixin_bot_generation_mismatch",
+  "weixin_bot_generation_superseded",
+  "weixin_account_rebound",
+  "weixin_session_expired",
+  "weixin_context_token_stale",
+  "missing_weixin_context_token",
+  "session_generation_superseded",
+  "source_generation_unknown",
+  "member_not_in_roster",
+  "weixin_channel_disabled",
+  "external_access_disabled",
+  "not_linked",
+  "not_allowed",
+  "unavailable",
+  "rate_limited",
+  "target_not_found",
+  "invalid_request",
+  "forbidden",
+  "internal_error",
+  "delivery_uncertain",
+  "in_flight",
+  "artifact_invalid",
+  "file_not_sent",
+  // QR login codes
+  "login_session_revoked",
+  "ilink_user_already_bound",
+  "weixin_capacity_reached",
+  "qr_login_error",
+  "qr_start_failed",
+  "qr_poll_failed",
+  "qr_expired",
+  "verify_code_failed",
+  // Weixin API / safe-fetch kinds & codes
+  "session_expired",
+  "api_error",
+  "http_error",
+  "network_error",
+  "timeout",
+  "size_exceeded",
+  "ssrf_blocked",
+  "redirect_blocked",
+  // Node.js / Undici system error codes
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EPIPE",
+  "ECONNABORTED",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_SOCKET",
+  "UND_ERR_ABORTED",
+  // Standard / gateway Error class names
+  "AbortError",
+  "TimeoutError",
+  "TypeError",
+  "Error",
+  "BackendHttpError",
+  "WeixinApiError",
+  "SafeFetchError",
+  "ChannelDeliveryError",
+  "StaleGatewayEpochError",
+  "LeaseSafetyMarginPauseError",
+  "WeixinQrLoginError",
+]);
+
+/**
+ * Normalizes an error / deny code against `KNOWN_LOG_ERROR_CODES`.
+ * Unknown or arbitrary strings always collapse to `"unknown_error"`.
+ */
+export function sanitizeLogErrorCode(rawCode: unknown): string {
+  if (typeof rawCode === "string") {
+    const trimmed = rawCode.trim();
+    if (
+      KNOWN_LOG_ERROR_CODES.has(trimmed) ||
+      HTTP_STATUS_ERROR_CODE_RE.test(trimmed)
+    ) {
+      return trimmed;
+    }
+  }
+  return "unknown_error";
+}
 
 /**
  * Extracts strictly whitelisted error code / HTTP status metadata from an arbitrary error,
- * never emitting free-text `err.message` or `String(err)` into logs (§4.3 / R4 #8).
+ * never emitting free-text `err.message`, `String(err)`, or unknown/synthetic error names (§4.3 / R5 #7).
  */
 export function extractSafeLogErrorFields(
   err: unknown,
@@ -92,11 +193,9 @@ export function extractSafeLogErrorFields(
       rec.kind,
       rec.name,
     ]) {
-      if (
-        typeof candidate === "string" &&
-        SAFE_LOG_ERROR_CODE_RE.test(candidate.trim())
-      ) {
-        out.error_code = candidate.trim();
+      const sanitized = sanitizeLogErrorCode(candidate);
+      if (sanitized !== "unknown_error") {
+        out.error_code = sanitized;
         return out;
       }
     }

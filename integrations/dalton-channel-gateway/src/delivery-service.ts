@@ -9,10 +9,14 @@ import {
   type WeixinPreflightAuthorizedData,
 } from "./backend-client.js";
 import { ChannelDeliveryError, type ChannelAdapter } from "./channels/adapter.js";
-import { isStaleGatewayEpochError } from "./gateway-lease.js";
+import {
+  isStaleGatewayEpochError,
+  StaleGatewayEpochError,
+} from "./gateway-lease.js";
 import {
   createSubsystemLogger,
   extractSafeLogErrorFields,
+  sanitizeLogErrorCode,
 } from "./shared/logger.js";
 import {
   type AgentSendFileOutcome,
@@ -27,13 +31,24 @@ import {
   MAX_TOTAL_ATTACHMENT_BYTES,
 } from "./types.js";
 
-/** R4 Design: in-delivery bounded backoff retry for retryable preflight (`roster_lookup_error`) and I-6 503. */
+/**
+ * R4/R5 Design: in-delivery bounded backoff retry for retryable preflight (`roster_lookup_error`)
+ * and Weixin I-6 503. Shared deadline across an entire delivery MUST stay strictly below backend
+ * caller HTTP read timeouts (`_SEND_TIMEOUT = 90s` in `src/tools/messaging/tools.py:57` and
+ * `max(45s, notify_http_timeout_s * 2.5)` in `src/dalton/notify/channel_transport.py:176`).
+ */
 export const WEIXIN_PREFLIGHT_RETRY_INITIAL_DELAY_MS = 1_000;
 export const WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS = 16_000;
-export const WEIXIN_PREFLIGHT_RETRY_MAX_ELAPSED_MS = 3 * 60 * 1000;
+export const WEIXIN_PREFLIGHT_RETRY_MAX_ELAPSED_MS = 35_000;
 export const DELIVERY_CLAIM_503_INITIAL_DELAY_MS = 1_000;
 export const DELIVERY_CLAIM_503_MAX_DELAY_MS = 8_000;
 export const DELIVERY_CLAIM_503_MAX_ATTEMPTS = 5;
+
+export interface WeixinPreflightBudget {
+  readonly deadlineMs: number;
+  readonly maxElapsedMs: number;
+  virtualElapsedMs: number;
+}
 
 export async function abortableRetrySleep(
   ms: number,
@@ -107,6 +122,7 @@ export class DeliveryService {
   >();
   private retryAbortController = new AbortController();
   private startupBlocked = false;
+  private leaseLost = false;
 
   constructor(options: {
     backend: BackendClient;
@@ -133,18 +149,39 @@ export class DeliveryService {
 
   /**
    * Blocks new I-6 delivery claims while startup `mode=startup` recovery is still running (D1 / §3.5).
-   * When blocking (e.g. on lease loss), also aborts any in-delivery retry waits immediately.
+   * When blocking, also aborts any in-delivery retry waits immediately.
    */
   setStartupBlocked(blocked: boolean): void {
     this.startupBlocked = blocked;
     if (blocked) {
       this.abortAllRetries();
+    } else {
+      this.leaseLost = false;
     }
+  }
+
+  /**
+   * R5 #3 (Codex Medium #5): Synchronously aborts all in-delivery retries on lease loss
+   * and marks `leaseLost = true` so aborted deliveries rethrow `StaleGatewayEpochError`
+   * WITHOUT writing I-7 `failed` settlement.
+   */
+  abortOnLeaseLost(): void {
+    this.leaseLost = true;
+    this.startupBlocked = true;
+    this.abortAllRetries();
   }
 
   abortAllRetries(): void {
     this.retryAbortController.abort();
     this.retryAbortController = new AbortController();
+  }
+
+  private createWeixinPreflightBudget(): WeixinPreflightBudget {
+    return {
+      deadlineMs: this.nowFn() + this.preflightRetryMaxElapsedMs,
+      maxElapsedMs: this.preflightRetryMaxElapsedMs,
+      virtualElapsedMs: 0,
+    };
   }
 
   addFirstCurrentDeliveryListener(
@@ -457,13 +494,19 @@ export class DeliveryService {
     const platformStr = (claim.platform ?? preliminaryPlat ?? "").toLowerCase();
     const recordProgress = (
       body: Parameters<BackendClient["updateDeliveryProgress"]>[0],
-    ) =>
-      this.backend.updateDeliveryProgress(
+    ) => {
+      if (this.leaseLost) {
+        throw new StaleGatewayEpochError(
+          "Gateway lease lost before I-7 settlement",
+        );
+      }
+      return this.backend.updateDeliveryProgress(
         deliveryAttempt === undefined
           ? body
           : { ...body, delivery_attempt: deliveryAttempt },
         { platform: platformStr || null },
       );
+    };
     const targetAddress = claim.target_address ?? options.target ?? null;
     const isCurrent = Boolean(claim.is_current);
     const effectiveThreadScopeKey =
@@ -577,6 +620,10 @@ export class DeliveryService {
       typeof deliveryAttempt === "number" && deliveryAttempt > 0
         ? deliveryAttempt
         : 1;
+    // R5 #2 (Codex High #4): ONE shared deadline across all preflights in this delivery
+    // (all text chunks, all files, and post-upload refresh preflights).
+    const weixinPreflightBudget =
+      platformStr === "weixin" ? this.createWeixinPreflightBudget() : null;
 
     const runWithWeixinSignal = async <T>(
       initialAccountId: string | null | undefined,
@@ -609,9 +656,15 @@ export class DeliveryService {
                 options.deliveryKey,
                 effectiveWeixinAttempt,
                 i,
+                weixinPreflightBudget!,
                 signal,
               );
               attachAccount(weixinPreflight.account_id);
+              if (this.leaseLost) {
+                throw new StaleGatewayEpochError(
+                  "Gateway lease lost before Weixin text send",
+                );
+              }
               if (signal?.aborted) {
                 throw new ChannelDeliveryError("Weixin text send aborted", {
                   outcome: "failed",
@@ -683,9 +736,14 @@ export class DeliveryService {
           platform_message_ids: [...platformMessageIds],
         });
       } catch (err) {
-        if (isStaleGatewayEpochError(err)) {
-          // D1 / §3.5: stale epoch MUST stop locally without writing I-7 settlement.
-          throw err;
+        if (isStaleGatewayEpochError(err) || this.leaseLost) {
+          // D1 / §3.5 / R5 #3: lease loss MUST stop locally without writing I-7 settlement.
+          throw isStaleGatewayEpochError(err)
+            ? err
+            : new StaleGatewayEpochError(
+                "Gateway lease lost during chunk delivery",
+                { cause: err },
+              );
         }
         if (err instanceof ChannelDeliveryError) {
           chunkFailure = {
@@ -781,9 +839,15 @@ export class DeliveryService {
                   options.deliveryKey,
                   effectiveWeixinAttempt,
                   fileChunkIndex,
+                  weixinPreflightBudget!,
                   signal,
                 );
                 attachAccount(weixinPreflight.account_id);
+                if (this.leaseLost) {
+                  throw new StaleGatewayEpochError(
+                    "Gateway lease lost before Weixin file send",
+                  );
+                }
                 if (signal?.aborted) {
                   throw new ChannelDeliveryError("Weixin file send aborted", {
                     outcome: "failed",
@@ -817,6 +881,7 @@ export class DeliveryService {
                           options.deliveryKey,
                           effectiveWeixinAttempt,
                           fileChunkIndex,
+                          weixinPreflightBudget!,
                           signal,
                         )
                     : undefined,
@@ -847,8 +912,13 @@ export class DeliveryService {
             });
           }
         } catch (err) {
-          if (isStaleGatewayEpochError(err)) {
-            throw err;
+          if (isStaleGatewayEpochError(err) || this.leaseLost) {
+            throw isStaleGatewayEpochError(err)
+              ? err
+              : new StaleGatewayEpochError(
+                  "Gateway lease lost during file delivery",
+                  { cause: err },
+                );
           }
           anyFileFailed = true;
           let fileEntryStatus: AgentSendFileOutcome["status"] = "failed";
@@ -974,9 +1044,21 @@ export class DeliveryService {
   private async claimDeliveryWith503Retry(
     req: I6AuthorizeAndClaimRequest,
   ): Promise<I6AuthorizeAndClaimResponse> {
+    // R5 #5 (Codex Medium #7): In-delivery I-6 503 retry applies ONLY to Weixin;
+    // Feishu and Discord keep original fail-immediately behavior on 503.
+    const isWeixinTarget =
+      req.platform === "weixin" ||
+      (typeof req.target === "string" &&
+        req.target.trim().toLowerCase().startsWith("weixin:"));
+    const maxAttempts = isWeixinTarget ? this.claim503MaxAttempts : 1;
     const signal = this.retryAbortController.signal;
     let delayMs = DELIVERY_CLAIM_503_INITIAL_DELAY_MS;
-    for (let attempt = 1; attempt <= this.claim503MaxAttempts; attempt += 1) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (this.leaseLost) {
+        throw new StaleGatewayEpochError(
+          "Gateway lease lost before I-6 authorize-and-claim",
+        );
+      }
       if (this.startupBlocked || signal.aborted) {
         throw new BackendHttpError(
           "Delivery claim aborted due to lease loss or shutdown",
@@ -985,14 +1067,24 @@ export class DeliveryService {
         );
       }
       try {
-        return await this.backend.authorizeAndClaimDelivery(req, { signal });
+        return await this.backend.authorizeAndClaimDelivery(
+          req,
+          isWeixinTarget ? { signal } : undefined,
+        );
       } catch (err) {
-        if (isStaleGatewayEpochError(err)) {
-          throw err;
+        if (isStaleGatewayEpochError(err) || this.leaseLost) {
+          throw isStaleGatewayEpochError(err)
+            ? err
+            : new StaleGatewayEpochError(
+                "Gateway lease lost during I-6 authorize-and-claim",
+                { cause: err },
+              );
         }
         const isRetryable503 =
-          err instanceof BackendHttpError && err.status === 503;
-        if (!isRetryable503 || attempt >= this.claim503MaxAttempts) {
+          isWeixinTarget &&
+          err instanceof BackendHttpError &&
+          err.status === 503;
+        if (!isRetryable503 || attempt >= maxAttempts) {
           throw err;
         }
         this.logger.warn("I-6 authorize-and-claim returned 503; retrying in delivery", {
@@ -1003,6 +1095,11 @@ export class DeliveryService {
           ...extractSafeLogErrorFields(err),
         });
         const slept = await this.retryDelayFn(delayMs, signal);
+        if (this.leaseLost) {
+          throw new StaleGatewayEpochError(
+            "Gateway lease lost while retrying I-6 authorize-and-claim",
+          );
+        }
         if (!slept || this.startupBlocked || signal.aborted) {
           throw err;
         }
@@ -1016,21 +1113,25 @@ export class DeliveryService {
     deliveryKey: string,
     deliveryAttempt: number,
     chunkIndex: number,
+    budget: WeixinPreflightBudget,
     signal?: AbortSignal,
   ): Promise<WeixinPreflightAuthorizedData> {
     const combinedSignal = signal
       ? AbortSignal.any([signal, this.retryAbortController.signal])
       : this.retryAbortController.signal;
-    const startedAt = this.nowFn();
-    let accumulatedDelayMs = 0;
     let delayMs = WEIXIN_PREFLIGHT_RETRY_INITIAL_DELAY_MS;
     let attempt = 0;
     const getRemainingBudgetMs = (): number =>
-      this.preflightRetryMaxElapsedMs -
-      Math.max(this.nowFn() - startedAt, accumulatedDelayMs);
-
-    for (;;) {
-      attempt += 1;
+      Math.min(
+        budget.deadlineMs - this.nowFn(),
+        budget.maxElapsedMs - budget.virtualElapsedMs,
+      );
+    const throwIfAbortedOrLeaseLost = (): void => {
+      if (this.leaseLost) {
+        throw new StaleGatewayEpochError(
+          "Gateway lease lost during Weixin preflight",
+        );
+      }
       if (this.startupBlocked || combinedSignal.aborted) {
         throw new ChannelDeliveryError("Weixin preflight aborted", {
           outcome: "failed",
@@ -1038,6 +1139,29 @@ export class DeliveryService {
           retryable: false,
         });
       }
+    };
+
+    for (;;) {
+      attempt += 1;
+      throwIfAbortedOrLeaseLost();
+
+      const preCallRemainingMs = getRemainingBudgetMs();
+      if (preCallRemainingMs <= 0) {
+        throw new ChannelDeliveryError(
+          "Weixin send preflight exceeded shared delivery deadline.",
+          {
+            outcome: "failed",
+            code: "unavailable",
+            retryable: false,
+            denyCode: "preflight_deadline_exceeded",
+          },
+        );
+      }
+
+      const attemptSignal = AbortSignal.any([
+        combinedSignal,
+        AbortSignal.timeout(Math.max(1, Math.ceil(preCallRemainingMs))),
+      ]);
 
       let pf: Awaited<ReturnType<BackendClient["preflightWeixinSend"]>>;
       try {
@@ -1047,18 +1171,28 @@ export class DeliveryService {
             delivery_attempt: deliveryAttempt,
             chunk_index: chunkIndex,
           },
-          { signal: combinedSignal },
+          { signal: attemptSignal },
         );
       } catch (err) {
-        if (isStaleGatewayEpochError(err)) {
-          throw err;
+        if (isStaleGatewayEpochError(err) || this.leaseLost) {
+          throw isStaleGatewayEpochError(err)
+            ? err
+            : new StaleGatewayEpochError(
+                "Gateway lease lost during Weixin preflight",
+                { cause: err },
+              );
         }
-        if (this.startupBlocked || combinedSignal.aborted) {
-          throw new ChannelDeliveryError("Weixin preflight aborted", {
-            outcome: "failed",
-            code: "unavailable",
-            retryable: false,
-          });
+        throwIfAbortedOrLeaseLost();
+        if (attemptSignal.aborted || getRemainingBudgetMs() <= 0) {
+          throw new ChannelDeliveryError(
+            "Weixin send preflight exceeded shared delivery deadline.",
+            {
+              outcome: "failed",
+              code: "unavailable",
+              retryable: false,
+              denyCode: "preflight_deadline_exceeded",
+            },
+          );
         }
         const isRetryable503 =
           err instanceof BackendHttpError && err.status === 503;
@@ -1086,16 +1220,32 @@ export class DeliveryService {
           ...extractSafeLogErrorFields(err),
         });
         const slept = await this.retryDelayFn(waitMs, combinedSignal);
-        accumulatedDelayMs += waitMs;
-        if (!slept || this.startupBlocked || combinedSignal.aborted) {
+        budget.virtualElapsedMs += waitMs;
+        if (!slept) {
+          throwIfAbortedOrLeaseLost();
           throw new ChannelDeliveryError("Weixin preflight aborted", {
             outcome: "failed",
             code: "unavailable",
             retryable: false,
           });
         }
+        throwIfAbortedOrLeaseLost();
         delayMs = Math.min(delayMs * 2, WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS);
         continue;
+      }
+
+      throwIfAbortedOrLeaseLost();
+      // R5 #2 (Codex High #4): Do NOT adopt an authorization returned after the shared deadline.
+      if (getRemainingBudgetMs() <= 0) {
+        throw new ChannelDeliveryError(
+          "Weixin preflight response arrived after shared delivery deadline.",
+          {
+            outcome: "failed",
+            code: "unavailable",
+            retryable: false,
+            denyCode: "preflight_deadline_exceeded",
+          },
+        );
       }
 
       if (pf.authorized) {
@@ -1134,18 +1284,20 @@ export class DeliveryService {
             chunk_index: chunkIndex,
             attempt,
             delay_ms: waitMs,
-            error_code: pf.deny_code,
+            error_code: sanitizeLogErrorCode(pf.deny_code),
           },
         );
         const slept = await this.retryDelayFn(waitMs, combinedSignal);
-        accumulatedDelayMs += waitMs;
-        if (!slept || this.startupBlocked || combinedSignal.aborted) {
+        budget.virtualElapsedMs += waitMs;
+        if (!slept) {
+          throwIfAbortedOrLeaseLost();
           throw new ChannelDeliveryError("Weixin preflight aborted", {
             outcome: "failed",
             code: "unavailable",
             retryable: false,
           });
         }
+        throwIfAbortedOrLeaseLost();
         delayMs = Math.min(delayMs * 2, WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS);
         continue;
       }

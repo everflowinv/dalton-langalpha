@@ -145,7 +145,7 @@ export class WeixinMonitor {
       // otherwise let commitCursorUntilSettled retry the CAS write idempotently
       // (a retry after an already-committed write returns cas_mismatch with authoritative cursor).
       try {
-        const detail = await backend.getWeixinAccountDetail(accountId);
+        const detail = await backend.getWeixinAccountDetail(accountId, { signal });
         if (
           detail.bot_generation !== botGeneration ||
           detail.ilink_bot_id !== ilinkBotId ||

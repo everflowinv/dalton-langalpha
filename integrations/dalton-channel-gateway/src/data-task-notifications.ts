@@ -17,11 +17,15 @@ import {
   DELIVERY_CLAIM_503_INITIAL_DELAY_MS,
   DELIVERY_CLAIM_503_MAX_ATTEMPTS,
   DELIVERY_CLAIM_503_MAX_DELAY_MS,
+  type WeixinPreflightBudget,
   WEIXIN_PREFLIGHT_RETRY_INITIAL_DELAY_MS,
   WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS,
   WEIXIN_PREFLIGHT_RETRY_MAX_ELAPSED_MS,
 } from "./delivery-service.js";
-import { isStaleGatewayEpochError } from "./gateway-lease.js";
+import {
+  isStaleGatewayEpochError,
+  StaleGatewayEpochError,
+} from "./gateway-lease.js";
 import type {
   DataTaskAuthorizePlanResponse,
   DataTaskItemDeliveryOutcome,
@@ -36,6 +40,7 @@ import {
 import {
   createSubsystemLogger,
   extractSafeLogErrorFields,
+  sanitizeLogErrorCode,
 } from "./shared/logger.js";
 import type { ChannelPlatform } from "./types.js";
 
@@ -431,6 +436,7 @@ export class DataTaskNotificationService {
   private readonly nowFn: () => number;
   private retryAbortController = new AbortController();
   private startupBlocked = false;
+  private leaseLost = false;
 
   constructor(options: DataTaskNotificationServiceOptions) {
     this.backend = options.backend;
@@ -443,10 +449,9 @@ export class DataTaskNotificationService {
     this.claim503MaxAttempts =
       options.claim503MaxAttempts ?? DELIVERY_CLAIM_503_MAX_ATTEMPTS;
     this.nowFn = options.nowFn ?? (() => Date.now());
+    // R5 #5 (Codex Medium #7): Preserve original 180s default queue task timeout unchanged for Feishu/Discord.
     this.queue = createSequentialQueue({
-      taskTimeoutMs:
-        options.queueTaskTimeoutMs ??
-        Math.max(180_000, this.preflightRetryMaxElapsedMs + 30_000),
+      taskTimeoutMs: options.queueTaskTimeoutMs ?? 180_000,
     });
   }
 
@@ -454,7 +459,20 @@ export class DataTaskNotificationService {
     this.startupBlocked = blocked;
     if (blocked) {
       this.abortAllRetries();
+    } else {
+      this.leaseLost = false;
     }
+  }
+
+  /**
+   * R5 #3 (Codex Medium #5): Synchronously aborts all in-delivery retries on lease loss
+   * and marks `leaseLost = true` so aborted deliveries rethrow `StaleGatewayEpochError`
+   * WITHOUT writing I-7 `failed` settlement.
+   */
+  abortOnLeaseLost(): void {
+    this.leaseLost = true;
+    this.startupBlocked = true;
+    this.abortAllRetries();
   }
 
   abortAllRetries(): void {
@@ -462,12 +480,29 @@ export class DataTaskNotificationService {
     this.retryAbortController = new AbortController();
   }
 
+  private createWeixinPreflightBudget(): WeixinPreflightBudget {
+    return {
+      deadlineMs: this.nowFn() + this.preflightRetryMaxElapsedMs,
+      maxElapsedMs: this.preflightRetryMaxElapsedMs,
+      virtualElapsedMs: 0,
+    };
+  }
+
   private async claimDeliveryWith503Retry(
     req: I6AuthorizeAndClaimRequest,
   ): Promise<unknown> {
+    // R5 #5 (Codex Medium #7): In-delivery I-6 503 retry applies ONLY to Weixin;
+    // Feishu and Discord keep original fail-immediately behavior on 503.
+    const isWeixinTarget = req.platform === "weixin";
+    const maxAttempts = isWeixinTarget ? this.claim503MaxAttempts : 1;
     const signal = this.retryAbortController.signal;
     let delayMs = DELIVERY_CLAIM_503_INITIAL_DELAY_MS;
-    for (let attempt = 1; attempt <= this.claim503MaxAttempts; attempt += 1) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (this.leaseLost) {
+        throw new StaleGatewayEpochError(
+          "Gateway lease lost before data-task I-6 authorize-and-claim",
+        );
+      }
       if (this.startupBlocked || signal.aborted) {
         throw new BackendHttpError(
           "I-6 authorize-and-claim aborted due to lease loss or shutdown",
@@ -476,14 +511,24 @@ export class DataTaskNotificationService {
         );
       }
       try {
-        return await this.backend.authorizeAndClaimDelivery(req, { signal });
+        return await this.backend.authorizeAndClaimDelivery(
+          req,
+          isWeixinTarget ? { signal } : undefined,
+        );
       } catch (err) {
-        if (isStaleGatewayEpochError(err)) {
-          throw err;
+        if (isStaleGatewayEpochError(err) || this.leaseLost) {
+          throw isStaleGatewayEpochError(err)
+            ? err
+            : new StaleGatewayEpochError(
+                "Gateway lease lost during data-task I-6 authorize-and-claim",
+                { cause: err },
+              );
         }
         const isRetryable503 =
-          err instanceof BackendHttpError && err.status === 503;
-        if (!isRetryable503 || attempt >= this.claim503MaxAttempts) {
+          isWeixinTarget &&
+          err instanceof BackendHttpError &&
+          err.status === 503;
+        if (!isRetryable503 || attempt >= maxAttempts) {
           throw err;
         }
         this.logger.warn(
@@ -497,6 +542,11 @@ export class DataTaskNotificationService {
           },
         );
         const slept = await this.retryDelayFn(delayMs, signal);
+        if (this.leaseLost) {
+          throw new StaleGatewayEpochError(
+            "Gateway lease lost while retrying data-task I-6 authorize-and-claim",
+          );
+        }
         if (!slept || this.startupBlocked || signal.aborted) {
           throw err;
         }
@@ -510,21 +560,25 @@ export class DataTaskNotificationService {
     deliveryKey: string,
     deliveryAttempt: number,
     chunkIndex: number,
+    budget: WeixinPreflightBudget,
     signal?: AbortSignal,
   ): Promise<WeixinPreflightAuthorizedData> {
     const combinedSignal = signal
       ? AbortSignal.any([signal, this.retryAbortController.signal])
       : this.retryAbortController.signal;
-    const startedAt = this.nowFn();
-    let accumulatedDelayMs = 0;
     let delayMs = WEIXIN_PREFLIGHT_RETRY_INITIAL_DELAY_MS;
     let attempt = 0;
     const getRemainingBudgetMs = (): number =>
-      this.preflightRetryMaxElapsedMs -
-      Math.max(this.nowFn() - startedAt, accumulatedDelayMs);
-
-    for (;;) {
-      attempt += 1;
+      Math.min(
+        budget.deadlineMs - this.nowFn(),
+        budget.maxElapsedMs - budget.virtualElapsedMs,
+      );
+    const throwIfAbortedOrLeaseLost = (): void => {
+      if (this.leaseLost) {
+        throw new StaleGatewayEpochError(
+          "Gateway lease lost during data-task Weixin preflight",
+        );
+      }
       if (this.startupBlocked || combinedSignal.aborted) {
         throw new ChannelDeliveryError("Weixin preflight aborted", {
           outcome: "failed",
@@ -532,6 +586,29 @@ export class DataTaskNotificationService {
           retryable: false,
         });
       }
+    };
+
+    for (;;) {
+      attempt += 1;
+      throwIfAbortedOrLeaseLost();
+
+      const preCallRemainingMs = getRemainingBudgetMs();
+      if (preCallRemainingMs <= 0) {
+        throw new ChannelDeliveryError(
+          "Weixin send preflight exceeded shared delivery deadline.",
+          {
+            outcome: "failed",
+            code: "unavailable",
+            retryable: false,
+            denyCode: "preflight_deadline_exceeded",
+          },
+        );
+      }
+
+      const attemptSignal = AbortSignal.any([
+        combinedSignal,
+        AbortSignal.timeout(Math.max(1, Math.ceil(preCallRemainingMs))),
+      ]);
 
       let pf: Awaited<ReturnType<BackendClient["preflightWeixinSend"]>>;
       try {
@@ -541,18 +618,28 @@ export class DataTaskNotificationService {
             delivery_attempt: deliveryAttempt,
             chunk_index: chunkIndex,
           },
-          { signal: combinedSignal },
+          { signal: attemptSignal },
         );
       } catch (err) {
-        if (isStaleGatewayEpochError(err)) {
-          throw err;
+        if (isStaleGatewayEpochError(err) || this.leaseLost) {
+          throw isStaleGatewayEpochError(err)
+            ? err
+            : new StaleGatewayEpochError(
+                "Gateway lease lost during data-task Weixin preflight",
+                { cause: err },
+              );
         }
-        if (this.startupBlocked || combinedSignal.aborted) {
-          throw new ChannelDeliveryError("Weixin preflight aborted", {
-            outcome: "failed",
-            code: "unavailable",
-            retryable: false,
-          });
+        throwIfAbortedOrLeaseLost();
+        if (attemptSignal.aborted || getRemainingBudgetMs() <= 0) {
+          throw new ChannelDeliveryError(
+            "Weixin send preflight exceeded shared delivery deadline.",
+            {
+              outcome: "failed",
+              code: "unavailable",
+              retryable: false,
+              denyCode: "preflight_deadline_exceeded",
+            },
+          );
         }
         const isRetryable503 =
           err instanceof BackendHttpError && err.status === 503;
@@ -583,16 +670,31 @@ export class DataTaskNotificationService {
           },
         );
         const slept = await this.retryDelayFn(waitMs, combinedSignal);
-        accumulatedDelayMs += waitMs;
-        if (!slept || this.startupBlocked || combinedSignal.aborted) {
+        budget.virtualElapsedMs += waitMs;
+        if (!slept) {
+          throwIfAbortedOrLeaseLost();
           throw new ChannelDeliveryError("Weixin preflight aborted", {
             outcome: "failed",
             code: "unavailable",
             retryable: false,
           });
         }
+        throwIfAbortedOrLeaseLost();
         delayMs = Math.min(delayMs * 2, WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS);
         continue;
+      }
+
+      throwIfAbortedOrLeaseLost();
+      if (getRemainingBudgetMs() <= 0) {
+        throw new ChannelDeliveryError(
+          "Weixin preflight response arrived after shared delivery deadline.",
+          {
+            outcome: "failed",
+            code: "unavailable",
+            retryable: false,
+            denyCode: "preflight_deadline_exceeded",
+          },
+        );
       }
 
       if (pf.authorized) {
@@ -631,18 +733,20 @@ export class DataTaskNotificationService {
             chunk_index: chunkIndex,
             attempt,
             delay_ms: waitMs,
-            error_code: pf.deny_code,
+            error_code: sanitizeLogErrorCode(pf.deny_code),
           },
         );
         const slept = await this.retryDelayFn(waitMs, combinedSignal);
-        accumulatedDelayMs += waitMs;
-        if (!slept || this.startupBlocked || combinedSignal.aborted) {
+        budget.virtualElapsedMs += waitMs;
+        if (!slept) {
+          throwIfAbortedOrLeaseLost();
           throw new ChannelDeliveryError("Weixin preflight aborted", {
             outcome: "failed",
             code: "unavailable",
             retryable: false,
           });
         }
+        throwIfAbortedOrLeaseLost();
         delayMs = Math.min(delayMs * 2, WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS);
         continue;
       }
@@ -672,6 +776,11 @@ export class DataTaskNotificationService {
     req: I7DeliveriesProgressRequest,
     platform?: ChannelPlatform,
   ): Promise<I7DeliveriesProgressResponse> {
+    if (this.leaseLost) {
+      throw new StaleGatewayEpochError(
+        "Gateway lease lost before data-task I-7 settlement",
+      );
+    }
     const expectedStatus = req.status ?? "in_flight";
     if (!RECOGNIZED_DELIVERY_STATUSES.has(expectedStatus)) {
       throw new DataTaskBackendAckError(
@@ -1191,6 +1300,9 @@ export class DataTaskNotificationService {
     const itemOutcomes: DataTaskItemDeliveryOutcome[] = tracker.outcomes;
     let itemsSent = 0;
     let groupLiveVerified = false;
+    // R5 #2 (Codex High #4): ONE shared deadline across all Weixin preflights in this delivery.
+    const weixinPreflightBudget =
+      platform === "weixin" ? this.createWeixinPreflightBudget() : null;
 
     for (const item of planItems) {
       if (
@@ -1913,9 +2025,15 @@ export class DataTaskNotificationService {
                     item.delivery_key,
                     effectiveWeixinAttempt,
                     i,
+                    weixinPreflightBudget!,
                     signal,
                   );
                   attachAccount(weixinPreflight.account_id);
+                  if (this.leaseLost) {
+                    throw new StaleGatewayEpochError(
+                      "Gateway lease lost before data-task Weixin text send",
+                    );
+                  }
                   if (signal?.aborted) {
                     throw new ChannelDeliveryError("Weixin text send aborted", {
                       outcome: "failed",
@@ -1945,8 +2063,13 @@ export class DataTaskNotificationService {
             );
           }
         } catch (chunkErr) {
-          if (isStaleGatewayEpochError(chunkErr)) {
-            throw chunkErr;
+          if (isStaleGatewayEpochError(chunkErr) || this.leaseLost) {
+            throw isStaleGatewayEpochError(chunkErr)
+              ? chunkErr
+              : new StaleGatewayEpochError(
+                  "Gateway lease lost during data-task chunk delivery",
+                  { cause: chunkErr },
+                );
           }
           const classified = classifyAdapterError(chunkErr);
           const anySent = sentChunks > 0 || filesStatus.length > 0;
@@ -2090,9 +2213,15 @@ export class DataTaskNotificationService {
                   item.delivery_key,
                   effectiveWeixinAttempt,
                   fileChunkIndex,
+                  weixinPreflightBudget!,
                   signal,
                 );
                 attachAccount(weixinPreflight.account_id);
+                if (this.leaseLost) {
+                  throw new StaleGatewayEpochError(
+                    "Gateway lease lost before data-task Weixin file send",
+                  );
+                }
                 if (signal?.aborted) {
                   throw new ChannelDeliveryError("Weixin file send aborted", {
                     outcome: "failed",
@@ -2125,6 +2254,7 @@ export class DataTaskNotificationService {
                           item.delivery_key,
                           effectiveWeixinAttempt,
                           fileChunkIndex,
+                          weixinPreflightBudget!,
                           signal,
                         )
                     : undefined,
@@ -2221,8 +2351,13 @@ export class DataTaskNotificationService {
             reason: null,
           });
         } catch (fileErr) {
-          if (isStaleGatewayEpochError(fileErr)) {
-            throw fileErr;
+          if (isStaleGatewayEpochError(fileErr) || this.leaseLost) {
+            throw isStaleGatewayEpochError(fileErr)
+              ? fileErr
+              : new StaleGatewayEpochError(
+                  "Gateway lease lost during data-task file delivery",
+                  { cause: fileErr },
+                );
           }
           const classified = classifyAdapterError(fileErr);
           const anySent = sentChunks > 0 || filesStatus.length > 0;

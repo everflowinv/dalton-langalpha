@@ -362,6 +362,7 @@ export interface ChannelAdapter {
   downloadAttachment(
     descriptor: InboundAttachmentDescriptor,
     event: InboundChannelEvent,
+    options?: { signal?: AbortSignal },
   ): Promise<DownloadedAttachment>;
 
   /**
@@ -408,6 +409,16 @@ export interface ChannelAdapter {
   ): Promise<T>;
   /** Restart any pollable Weixin account monitors that exited transiently (e.g. brief lease dip). */
   ensurePollableMonitorsRunning?(): void;
+  /**
+   * Returns true iff the Weixin account referenced by `event` is still present,
+   * pollable, and matches the exact `ilinkBotId` + `botGeneration` in the current snapshot.
+   */
+  isWeixinAccountGenerationActive?(
+    event: Pick<
+      InboundChannelEvent,
+      "weixinAccountId" | "weixinBotId" | "weixinBotGeneration"
+    >,
+  ): boolean;
   onWeixinAccountInvalidated?(
     handler: (info: { accountId: string; reason: string }) => void,
   ): void;

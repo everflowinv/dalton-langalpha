@@ -12,7 +12,7 @@ export type CoreSessionCommand =
   | "new"
   | "stop";
 
-export type WeixinSessionCommand = "collect" | "done" | "cancel" | "help";
+export type WeixinSessionCommand = "help";
 
 export type SessionCommand = CoreSessionCommand | WeixinSessionCommand;
 
@@ -247,54 +247,19 @@ export function parseSlashCommand(
     };
   }
 
-  if (platform === "weixin") {
-    if (head === "collect" || head === "收集") {
+  if (platform === "weixin" && head === "help") {
+    if (rest) {
       return {
-        kind: "session",
-        cmd: "collect",
-        commandArg: rest || undefined,
-        canonicalCommand: rest ? `/collect ${rest}` : "/collect",
+        kind: "invalid",
+        reason: "unexpected_arguments",
+        message: `Usage: \`/help\` (takes no arguments). To switch to a workspace named "${fullBody}", use \`/workspace ${fullBody}\`.`,
       };
     }
-
-    if (head === "done" || head === "完成") {
-      return {
-        kind: "session",
-        cmd: "done",
-        commandArg: rest || undefined,
-        canonicalCommand: rest ? `/done ${rest}` : "/done",
-      };
-    }
-
-    if (head === "cancel" || head === "取消") {
-      if (rest) {
-        return {
-          kind: "invalid",
-          reason: "unexpected_arguments",
-          message: `Usage: \`/cancel\` (takes no arguments). To switch to a workspace named "${fullBody}", use \`/workspace ${fullBody}\`.`,
-        };
-      }
-      return {
-        kind: "session",
-        cmd: "cancel",
-        canonicalCommand: "/cancel",
-      };
-    }
-
-    if (head === "help") {
-      if (rest) {
-        return {
-          kind: "invalid",
-          reason: "unexpected_arguments",
-          message: `Usage: \`/help\` (takes no arguments). To switch to a workspace named "${fullBody}", use \`/workspace ${fullBody}\`.`,
-        };
-      }
-      return {
-        kind: "session",
-        cmd: "help",
-        canonicalCommand: "/help",
-      };
-    }
+    return {
+      kind: "session",
+      cmd: "help",
+      canonicalCommand: "/help",
+    };
   }
 
   if (head === "workspace") {

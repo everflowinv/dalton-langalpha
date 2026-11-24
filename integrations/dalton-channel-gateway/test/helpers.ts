@@ -45,10 +45,6 @@ import type {
   WeixinAccountsReconcileResponse,
   WeixinAccountStatusUpdateRequest,
   WeixinAccountStatusUpdateResponse,
-  WeixinCollectAttachmentsRegisterRequest,
-  WeixinCollectAttachmentsRegisterResponse,
-  WeixinCollectBufferFinalizeResponse,
-  WeixinCollectBufferStatusResponse,
   WeixinLoginSessionGetResponse,
   WeixinLoginSessionPatchRequest,
   WeixinLoginSessionPatchResponse,
@@ -179,8 +175,6 @@ export type MockBackend = BackendClient &
       BackendClient,
       | "setGatewayEpoch"
       | "setOnStaleGatewayEpoch"
-      | "getWeixinCollectBufferStatus"
-      | "deleteWorkspaceFiles"
       | "authorizeDataTaskNotificationPlan"
       | "authorizeAutomationNotificationPlan"
       | "downloadDataTaskRunArtifact"
@@ -1036,38 +1030,6 @@ export function createMockBackend(): MockBackend {
       }),
     ),
 
-    getWeixinCollectBufferStatus: vi.fn(
-      async (
-        bufferId: string,
-      ): Promise<WeixinCollectBufferStatusResponse> => ({
-        ok: true,
-        buffer_id: bufferId,
-        status: "collecting",
-        upload_status: "pending_upload",
-        item_upload_status: "pending_upload",
-      }),
-    ),
-
-    registerWeixinCollectItemAttachments: vi.fn(
-      async (
-        _bufferId: string,
-        _messageId: string,
-        req: WeixinCollectAttachmentsRegisterRequest,
-      ): Promise<WeixinCollectAttachmentsRegisterResponse> => ({
-        ok: true,
-        upload_status: req.upload_failed ? "failed" : "ready",
-        collect_buffer_status: "collecting",
-      }),
-    ),
-
-    finalizeWeixinCollectBuffer: vi.fn(
-      async (): Promise<WeixinCollectBufferFinalizeResponse> => ({
-        ok: true,
-        status: "done",
-        flushed_inbound: null,
-      }),
-    ),
-
     preflightWeixinSend: vi.fn(
       async (
         _deliveryKey: string,
@@ -1152,11 +1114,6 @@ export function createMockBackend(): MockBackend {
 
     uploadWorkspaceFile: vi.fn(async () => undefined),
 
-    deleteWorkspaceFiles: vi.fn(async (_userId: string, _workspaceId: string, paths: string[]) => ({
-      deleted: [...paths],
-      errors: [],
-    })),
-
     downloadWorkspaceFile: vi.fn(async () => ({
       content: Buffer.from("PDF_REPORT_CONTENT", "utf8"),
       mimeType: "application/pdf",
@@ -1205,7 +1162,6 @@ export function createTestHarness(options?: {
   retryDelayFn?: (ms: number, signal?: AbortSignal) => Promise<boolean>;
   preflightRetryMaxElapsedMs?: number;
   claim503MaxAttempts?: number;
-  collectCleanupLateRecheckMs?: number;
   busyThreadMaxWaitMs?: number;
   statusFeedback?: StatusFeedbackConfig;
   env?: NodeJS.ProcessEnv;
@@ -1240,7 +1196,6 @@ export function createTestHarness(options?: {
       options?.retryDelayFn ?? (async (_ms, signal) => !signal?.aborted),
     preflightRetryMaxElapsedMs: options?.preflightRetryMaxElapsedMs,
     claim503MaxAttempts: options?.claim503MaxAttempts,
-    collectCleanupLateRecheckMs: options?.collectCleanupLateRecheckMs ?? 25,
     busyThreadMaxWaitMs: options?.busyThreadMaxWaitMs,
     nowFn: options?.nowFn,
   });

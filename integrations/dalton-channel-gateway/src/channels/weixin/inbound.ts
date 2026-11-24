@@ -329,7 +329,7 @@ export function parseWeixinInboundMessage(
   const textSegments: string[] = [];
   const attachments: InboundAttachmentDescriptor[] = [];
   const persistedAttachments: WeixinPersistedAttachmentMeta[] = [];
-  const unsupportedItemTypes: string[] = [];
+  const unsupportedItemTypes: number[] = [];
   let voiceWithoutTranscription = false;
   let inlineQuote: { replyToId?: string; quotedText?: string } = {};
 
@@ -459,11 +459,11 @@ export function parseWeixinInboundMessage(
     }
 
     // Any other item type (e.g. merged-forward, mini-program, unknown type) is recorded
-    // so §4.4 can either append a system note (mixed message) or emit conditional guidance (pure unsupported).
+    // as numeric iLink item type codes per contract §5.1 (`int[]`).
     if (typeof item.type === "number" && Number.isFinite(item.type)) {
-      const itemTypeStr = String(item.type);
-      if (!unsupportedItemTypes.includes(itemTypeStr)) {
-        unsupportedItemTypes.push(itemTypeStr);
+      const itemTypeCode = Math.trunc(item.type);
+      if (!unsupportedItemTypes.includes(itemTypeCode)) {
+        unsupportedItemTypes.push(itemTypeCode);
       }
     }
   }

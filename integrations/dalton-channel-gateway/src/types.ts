@@ -235,8 +235,8 @@ export interface InboundChannelEvent {
   weixinContextSeq?: number;
   /** Weixin media decryption metadata sent separately to backend so backend encrypts it at rest. */
   weixinMediaMeta?: WeixinPersistedAttachmentMeta[];
-  /** Unsupported iLink item types (e.g. merged-forward) observed on this inbound message (contract §5.1 string array). */
-  unsupportedItemTypes?: string[];
+  /** Unsupported iLink item type codes (e.g. merged-forward) observed on this inbound message (contract §5.1 int[]). */
+  unsupportedItemTypes?: number[];
   /** True when a Weixin voice message had no server-side text transcription. */
   voiceWithoutTranscription?: boolean;
   /** Arbitrary platform payload saved in `raw_payload`. */
@@ -244,16 +244,13 @@ export interface InboundChannelEvent {
 }
 
 /**
- * D16 one-time Weixin reply returned by backend after conflict auto-unbind or `/unbind` (contract §5.1).
+ * D16 one-time Weixin reply returned by backend after conflict auto-unbind or `/unbind` (contract §0 / §5.1).
  * Dispatched directly with the inbound message's `context_token` without `preflight-send`.
  */
 export interface OneTimeWeixinReplyEnvelope {
-  account_id?: string | null;
-  ilink_bot_id: string;
-  bot_generation?: number | null;
   bot_token: string;
   base_url: string;
-  cdn_base_url?: string | null;
+  ilink_bot_id: string;
   recipient_id: string;
   context_token: string;
   text: string;

@@ -406,7 +406,17 @@ export class FakeChannelAdapter implements ChannelAdapter {
     | ((
         descriptor: InboundAttachmentDescriptor,
         event: InboundChannelEvent,
+        options?: { signal?: AbortSignal },
       ) => Promise<DownloadedAttachment>)
+    | null = null;
+
+  private weixinAccountGenerationActiveCheck:
+    | ((
+        event: Pick<
+          InboundChannelEvent,
+          "weixinAccountId" | "weixinBotId" | "weixinBotGeneration"
+        >,
+      ) => boolean)
     | null = null;
 
   setDownloadAttachmentDelegate(
@@ -414,15 +424,42 @@ export class FakeChannelAdapter implements ChannelAdapter {
       | ((
           descriptor: InboundAttachmentDescriptor,
           event: InboundChannelEvent,
+          options?: { signal?: AbortSignal },
         ) => Promise<DownloadedAttachment>)
       | null,
   ): void {
     this.downloadAttachmentDelegate = fn;
   }
 
+  setWeixinAccountGenerationActiveCheck(
+    fn:
+      | ((
+          event: Pick<
+            InboundChannelEvent,
+            "weixinAccountId" | "weixinBotId" | "weixinBotGeneration"
+          >,
+        ) => boolean)
+      | null,
+  ): void {
+    this.weixinAccountGenerationActiveCheck = fn;
+  }
+
+  isWeixinAccountGenerationActive(
+    event: Pick<
+      InboundChannelEvent,
+      "weixinAccountId" | "weixinBotId" | "weixinBotGeneration"
+    >,
+  ): boolean {
+    if (this.weixinAccountGenerationActiveCheck) {
+      return this.weixinAccountGenerationActiveCheck(event);
+    }
+    return true;
+  }
+
   async downloadAttachment(
     descriptor: InboundAttachmentDescriptor,
     event?: InboundChannelEvent,
+    options?: { signal?: AbortSignal },
   ): Promise<DownloadedAttachment> {
     if (this.downloadAttachmentDelegate) {
       if (!event) {
@@ -430,7 +467,7 @@ export class FakeChannelAdapter implements ChannelAdapter {
           "FakeChannelAdapter download delegate requires the inbound event",
         );
       }
-      return this.downloadAttachmentDelegate(descriptor, event);
+      return this.downloadAttachmentDelegate(descriptor, event, options);
     }
     const found = this.attachments.get(descriptor.id);
     if (!found) {
