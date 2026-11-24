@@ -46,8 +46,8 @@ const EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']
 // #435 的团队模型判断已移出首屏，回落到 560
 // #457 在 zh-CN 文案目录（首屏必载）加了投递状态文案，生产构建实测 560.1 kB，上调到 562
 // sync11 (#482) 合并上游后生产构建实测 574.4 kB（2026-11-23 部署时的检查结果），上调到 580
-// sync12: upstream dropped to 444 after #863/#865 (lazy copy namespaces + logo split); keep 580 pending production build measurement.
-const MAX_EAGER_KB = 580
+// sync12: upstream dropped to 444 after #863/#865 (lazy copy namespaces + logo split); Dalton measured 475.0 kB, lowered ceiling to 490 (~15 kB headroom).
+const MAX_EAGER_KB = 490
 
 const outDir = process.argv[2] || 'dist'
 const indexPath = join(outDir, 'index.html')

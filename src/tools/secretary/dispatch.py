@@ -530,6 +530,11 @@ async def dispatch(
             }
             if model:
                 result["model"] = model
+            # DALTON-HOOK(antigravity-series): distinguish this turn's actual resolved
+            # model (e.g. Antigravity effort variant) from the requested/thread model
+            # in both Chief of Staff and colleague dispatch results.
+            if runs_at is not None and runs_at.model:
+                result["actual_model"] = runs_at.model
             if effort:
                 result.update(_effort_result(effort, runs_at))
             if steered:
