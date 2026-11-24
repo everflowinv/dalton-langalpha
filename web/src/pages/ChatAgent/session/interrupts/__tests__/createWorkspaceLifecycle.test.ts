@@ -517,87 +517,119 @@ describe('create_workspace 4-state lifecycle: live vs history parity', () => {
     expect(pending).toHaveLength(0);
   });
 
-  it('settles a pre-upgrade submitting create_workspace card without tool_call_id only on matching create_workspace result', () => {
-    const preUpgradeMsgs: ChatMessage[] = [
-      {
-        ...makeAssistant('a-legacy'),
-        toolCallProcesses: {
-          'tc-bash-1': {
-            toolName: 'bash',
-            toolCall: { id: 'tc-bash-1', name: 'bash', args: { command: 'ls' } },
-            toolCallResult: null,
-            isInProgress: true,
-            isComplete: false,
-            order: 0,
-          },
-          'tc-other-create': {
-            toolName: 'manage_workspaces',
-            toolCall: {
-              id: 'tc-other-create',
-              name: 'manage_workspaces',
-              args: { action: 'create', name: 'OtherWS' },
-            },
-            toolCallResult: null,
-            isInProgress: true,
-            isComplete: false,
-            order: 1,
-          },
-          'tc-legacy-1': {
-            toolName: 'manage_workspaces',
-            toolCall: {
-              id: 'tc-legacy-1',
-              name: 'manage_workspaces',
-              args: { action: 'create', name: 'LegacyWS' },
-            },
-            toolCallResult: null,
-            isInProgress: true,
-            isComplete: false,
-            order: 2,
-          },
+  it('settles pre-upgrade create_workspace cards without tool_call_id directly as scope_changed in live and history replay', () => {
+    const legacyEvent: SSEEvent = {
+      event: 'interrupt',
+      interrupt_id: 'intr-old',
+      turn_index: 0,
+      action_requests: [
+        {
+          type: 'create_workspace',
+          workspace_name: 'LegacyWS',
+          workspace_description: 'Pre-upgrade card',
         },
-        workspaceProposals: {
-          'intr-old': {
-            status: 'submitting',
-            workspace_name: 'LegacyWS',
-            interruptId: 'intr-old',
-          },
-        },
+      ],
+    };
+
+    // --- Live path: directly failed (scope_changed), never armed, immune to unrelated tool results ---
+    let liveMsgs: ChatMessage[] = [makeAssistant('a-live-legacy')];
+    const armSpy = vi.fn();
+    const liveRt = {
+      renderedInterruptIdsRef: { current: new Set<string>() },
+      currentRunIdRef: { current: 'run-legacy' },
+      pause: { arm: armSpy },
+      setMessages: (u: ChatMessage[] | ((p: ChatMessage[]) => ChatMessage[])) => {
+        liveMsgs = typeof u === 'function' ? u(liveMsgs) : u;
       },
-    ];
+    } as unknown as StreamRuntime;
+    const liveRefs = {
+      contentOrderCounterRef: { current: 0 },
+    } as unknown as StreamProcessorRefs;
 
-    // Unrelated tool result with success: true must NOT settle the legacy card as approved.
-    const afterBash = settleLiveProposalFromResult(preUpgradeMsgs, 'tc-bash-1', {
-      content: JSON.stringify({ success: true, output: 'ok' }),
-    });
-    expect(afterBash).toBe(preUpgradeMsgs);
-    expect((afterBash[0] as AssistantMessage).workspaceProposals?.['intr-old']?.status).toBe('submitting');
-
-    // Unregistered tool_call_id must NOT settle the legacy card.
-    const afterUnknown = settleLiveProposalFromResult(preUpgradeMsgs, 'tc-unknown', {
-      content: JSON.stringify({ success: true }),
-    });
-    expect(afterUnknown).toBe(preUpgradeMsgs);
-
-    // A create_workspace result for a DIFFERENT workspace name must NOT settle LegacyWS.
-    const afterOtherCreate = settleLiveProposalFromResult(preUpgradeMsgs, 'tc-other-create', {
-      content: JSON.stringify({ success: true, workspace_name: 'OtherWS' }),
-    });
-    expect(afterOtherCreate).toBe(preUpgradeMsgs);
-    expect((afterOtherCreate[0] as AssistantMessage).workspaceProposals?.['intr-old']?.status).toBe('submitting');
-
-    // Now the matching manage_workspaces(action="create", name="LegacyWS") scope_changed result settles it.
-    const settled = settleLiveProposalFromResult(afterOtherCreate, 'tc-legacy-1', {
-      status: 'error',
-      content: JSON.stringify({
-        success: false,
-        code: 'scope_changed',
-        error: '情况已变化，请重新发起',
-      }),
-    });
-    expect((settled[0] as AssistantMessage).workspaceProposals?.['intr-old']).toMatchObject({
+    projectLiveInterrupt(liveRt, legacyEvent, 'a-live-legacy', liveRefs);
+    expect(armSpy).not.toHaveBeenCalled();
+    expect((liveMsgs[0] as AssistantMessage).workspaceProposals?.['intr-old']).toMatchObject({
       status: 'failed',
       failure_code: 'scope_changed',
       failure_error: '情况已变化，请重新发起',
     });
+
+    const afterLiveResult = settleLiveProposalFromResult(liveMsgs, 'tc-unrelated', {
+      content: JSON.stringify({ success: true, output: 'ok' }),
+    });
+    expect(afterLiveResult).toBe(liveMsgs);
+
+    // --- History replay path: directly failed (scope_changed), never queued, immune to unrelated results & tip re-raise ---
+    let histMsgs: ChatMessage[] = [makeAssistant('a-hist-legacy')];
+    const histRt = {
+      renderedInterruptIdsRef: { current: new Set<string>() },
+      setMessages: (u: ChatMessage[] | ((p: ChatMessage[]) => ChatMessage[])) => {
+        histMsgs = typeof u === 'function' ? u(histMsgs) : u;
+      },
+    } as unknown as HistoryRuntime;
+    const pairState: PairState = {
+      contentOrderCounter: 0,
+      reasoningId: null,
+      toolCallId: null,
+      steeringBatches: 0,
+    };
+    const pending: HistoryInterruptInfo[] = [];
+    const ctx: HistoryInterruptContext = {
+      currentActivePairIndex: 0,
+      assistantMessagesByPair: new Map([[0, 'a-hist-legacy']]),
+      pairStateByPair: new Map([[0, pairState]]),
+      pendingHistoryInterrupts: pending,
+      evidence: createApprovalEvidence(),
+    };
+
+    projectHistoryInterrupt(histRt, legacyEvent, ctx);
+    expect(pending).toHaveLength(0);
+    expect((histMsgs[0] as AssistantMessage).workspaceProposals?.['intr-old']).toMatchObject({
+      status: 'failed',
+      failure_code: 'scope_changed',
+      failure_error: '情况已变化，请重新发起',
+    });
+
+    // Unrelated tool result must NOT overwrite the terminal scope_changed state.
+    applyHistoryToolResult({
+      event: {
+        event: 'tool_call_result',
+        tool_call_id: 'tc-unrelated',
+        content: JSON.stringify({ success: true, output: 'unrelated' }),
+        content_type: 'text',
+      },
+      assistantMessageId: 'a-hist-legacy',
+      pairState,
+      pending,
+      setMessages: histRt.setMessages,
+    });
+    expect((histMsgs[0] as AssistantMessage).workspaceProposals?.['intr-old']).toMatchObject({
+      status: 'failed',
+      failure_code: 'scope_changed',
+      failure_error: '情况已变化，请重新发起',
+    });
+
+    // Duplicate tip interrupt must NOT re-arm the legacy card to pending.
+    projectHistoryInterrupt(histRt, { ...legacyEvent, turn_index: undefined }, ctx);
+    expect(pending).toHaveLength(0);
+    expect((histMsgs[0] as AssistantMessage).workspaceProposals?.['intr-old']).toMatchObject({
+      status: 'failed',
+      failure_code: 'scope_changed',
+      failure_error: '情况已变化，请重新发起',
+    });
+
+    // Defense-in-depth: settleProposalFromResult never positionally pairs create_workspace without toolCallId.
+    const strayPending: HistoryInterruptInfo[] = [
+      { type: 'create_workspace', assistantMessageId: 'a-hist-legacy', proposalId: 'intr-old', interruptId: 'intr-old' },
+    ];
+    expect(
+      settleProposalFromResult(
+        strayPending,
+        'tc-unrelated',
+        { content: JSON.stringify({ success: true }) },
+        histRt.setMessages,
+      ),
+    ).toBe(false);
+    expect(strayPending).toHaveLength(1);
   });
 });

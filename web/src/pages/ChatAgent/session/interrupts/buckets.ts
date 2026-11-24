@@ -10,7 +10,6 @@ import type {
   AssistantMessage,
   ChatMessage,
   SecretaryActionProposalState,
-  ToolCallProcess,
   WorkspaceProposalState,
 } from '@/types/chat';
 // --- DALTON-HOOK(cos-settings-tools): end ---
@@ -294,34 +293,6 @@ function proposalResultFields(
   return proposalOutcomeFields(type, result);
 }
 
-function findToolCallProcess(
-  messages: ChatMessage[],
-  toolCallId: string,
-): ToolCallProcess | undefined {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role === 'assistant') {
-      const proc = msg.toolCallProcesses?.[toolCallId];
-      if (proc) return proc;
-    }
-  }
-  return undefined;
-}
-
-function matchesLegacyCreateWorkspaceCall(
-  proc: ToolCallProcess,
-  card: WorkspaceProposalState,
-): boolean {
-  const toolName = proc.toolName || proc.toolCall?.name;
-  if (toolName !== 'manage_workspaces') return false;
-  const args = proc.toolCall?.args;
-  if (!args || args.action !== 'create') return false;
-  const cardName = (card.workspace_name ?? '').trim();
-  const callName = typeof args.name === 'string' ? args.name.trim() : '';
-  if (!cardName || !callName) return false;
-  return callName === cardName;
-}
-
 /** Settle a live submitting/pending proposal card by exact ``tool_call_id``.
  *  Returns ``messages`` unchanged (same reference) when no card matches. */
 function settleLiveProposalFromResult(
@@ -384,43 +355,7 @@ function settleLiveProposalFromResult(
     };
     return updatedMsg;
   });
-  if (changed) return next;
-  // Fallback for pre-upgrade create_workspace cards that carried no tool_call_id:
-  // settle only when the tool_call_result belongs to a matching
-  // manage_workspaces(action="create", name=<card.workspace_name>) call so
-  // unrelated tool results never settle the card.
-  const matchingProc = findToolCallProcess(messages, toolCallId);
-  if (!matchingProc) return messages;
-  let fallbackChanged = false;
-  const fallbackNext: ChatMessage[] = messages.map((m): ChatMessage => {
-    if (fallbackChanged || m.role !== 'assistant') return m;
-    const cards = m.workspaceProposals;
-    if (!cards) return m;
-    for (const [cardId, card] of Object.entries(cards)) {
-      if (
-        card
-        && card.status === 'submitting'
-        && !card.tool_call_id
-        && matchesLegacyCreateWorkspaceCall(matchingProc, card)
-      ) {
-        fallbackChanged = true;
-        const settledCard: WorkspaceProposalState = {
-          ...card,
-          ...workspaceProposalResultFields(result),
-        };
-        const updatedMsg: AssistantMessage = {
-          ...m,
-          workspaceProposals: {
-            ...cards,
-            [cardId]: settledCard,
-          },
-        };
-        return updatedMsg;
-      }
-    }
-    return m;
-  });
-  return fallbackChanged ? fallbackNext : messages;
+  return changed ? next : messages;
 }
 // --- DALTON-HOOK(cos-settings-tools): end ---
 
@@ -444,8 +379,12 @@ function settleProposalFromResult(
   const named = !!toolCallId && pending.some((p) => p.toolCallId === toolCallId);
   return resolvePendingHistoryInterrupt(
     pending,
-    (p) => PROPOSAL_INTERRUPT_TYPES.has(p.type) &&
-      (named ? p.toolCallId === toolCallId : !toolCallId || !p.toolCallId),
+    // DALTON-HOOK(cos-settings-tools): create_workspace settles only by exact tool_call_id (never positional fallback)
+    (p) => PROPOSAL_INTERRUPT_TYPES.has(p.type) && (
+      p.type === 'create_workspace'
+        ? (!!toolCallId && p.toolCallId === toolCallId)
+        : (named ? p.toolCallId === toolCallId : !toolCallId || !p.toolCallId)
+    ),
     // Parsed here so a result pays for it only when it settles a proposal.
     (m) => ({
       bucket: PROPOSAL_DATA_KEY_MAP[m.type] || 'questionProposals',

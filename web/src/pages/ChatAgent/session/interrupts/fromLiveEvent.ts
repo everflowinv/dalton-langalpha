@@ -80,6 +80,8 @@ export function projectLiveInterrupt(
     const proposalId = event.interrupt_id || `workspace-${Date.now()}`;
     const proposalData = actionRequests[0];
     const order = eventOrder(event, () => ++refs.contentOrderCounterRef.current);
+    // DALTON-HOOK(cos-settings-tools): pre-upgrade create_workspace cards without tool_call_id settle directly as scope_changed
+    const hasToolCallId = typeof proposalData.tool_call_id === 'string' && proposalData.tool_call_id.length > 0;
 
     rt.setMessages((prev) =>
       updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
@@ -94,28 +96,36 @@ export function projectLiveInterrupt(
             duplicate_workspace_id: proposalData.duplicate_workspace_id,
             duplicate_workspace_name: proposalData.duplicate_workspace_name,
             duplicate_check_unavailable: proposalData.duplicate_check_unavailable,
-            // DALTON-HOOK(cos-settings-tools): confirmation snapshot fields and tool_call_id
+            // DALTON-HOOK(cos-settings-tools): confirmation snapshot fields, tool_call_id, and legacy scope_changed terminal state
             computer_id: proposalData.computer_id,
             computer_name: proposalData.computer_name,
             computer_is_own_machine: proposalData.computer_is_own_machine,
             bootstrap_cloud_primary: proposalData.bootstrap_cloud_primary,
             tool_call_id: proposalData.tool_call_id,
             interruptId: event.interrupt_id,
-            status: 'pending',
+            status: hasToolCallId ? 'pending' : 'failed',
+            ...(hasToolCallId
+              ? {}
+              : {
+                  failure_code: 'scope_changed',
+                  failure_error: '情况已变化，请重新发起',
+                }),
           },
         },
         isStreaming: false,
       }; })
     );
 
-    arm({
-      type: 'create_workspace',
-      interruptId: event.interrupt_id,
-      assistantMessageId,
-      proposalId,
-      // DALTON-HOOK(cos-settings-tools): correlate create_workspace card with its tool_call_id
-      toolCallId: proposalData.tool_call_id,
-    });
+    // DALTON-HOOK(cos-settings-tools): do not arm legacy cards lacking tool_call_id
+    if (hasToolCallId) {
+      arm({
+        type: 'create_workspace',
+        interruptId: event.interrupt_id,
+        assistantMessageId,
+        proposalId,
+        toolCallId: proposalData.tool_call_id,
+      });
+    }
   } else if (actionType === 'start_question') {
     // --- Start question interrupt ---
     const proposalId = event.interrupt_id || `question-start-${Date.now()}`;

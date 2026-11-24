@@ -1061,23 +1061,120 @@ async def test_real_langgraph_resume_reads_scope_changed_and_reject_before_compa
 
 
 @pytest.mark.asyncio
-async def test_workspace_manager_bootstrap_reclaims_orphan_computer_if_insert_aborts(
+async def test_real_langgraph_approve_skips_company_dedup_and_reaches_locked_scope_changed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Round 4 Decision 5: if create_workspace_on_computer returns None after
+    """Round 5 Decision 3: using a real LangGraph StateGraph + InMemorySaver,
+    when a same-ticker workspace appears while a confirmation card is pending
+    and the user clicks Approve, resume skips company_workspace_exists precheck
+    and enters locked WorkspaceManager.create_workspace, returning status='error'
+    code='scope_changed'."""
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, MessagesState, StateGraph
+    from langgraph.types import Command as LGCommand
+
+    from src.tools.secretary.tools import workspaces_create
+
+    dedup_calls: list[str] = []
+    company_exists_now = {"flag": False}
+
+    async def _fake_find_company(uid: str, ws_name: str, channel: str = "cos"):
+        dedup_calls.append(ws_name)
+        if company_exists_now["flag"]:
+            return SimpleNamespace(
+                matches=[SimpleNamespace(workspace_id=WS_1, name="0700.HK")],
+                message="已存在同名公司工作区 0700.HK",
+                suggestion=None,
+                suggestion_payload=lambda: None,
+                matches_payload=lambda: [{"workspace_id": WS_1, "name": "0700.HK"}],
+            )
+        return None
+
+    mgr = create_autospec(WorkspaceManager, instance=True)
+    mgr.create_workspace.side_effect = ApprovalScopeChangedError("情况已变化，请重新发起")
+
+    monkeypatch.setattr(
+        "src.dalton.coverage.dedup.find_existing_company_workspace",
+        _fake_find_company,
+    )
+    monkeypatch.setattr(
+        "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+        create_autospec(WorkspaceManager.get_instance, return_value=mgr),
+    )
+
+    snap = {
+        "action": "create_workspace",
+        "tool_call_id": "call-lg-approve-1",
+        "workspace_name": "700.HK",
+        "workspace_description": "Tencent research",
+        "computer_id": CLOUD_1,
+        "computer_name": "Cloud Primary",
+        "computer_kind": "docker",
+        "computer_is_own_machine": False,
+        "bootstrap_cloud_primary": False,
+        "duplicate_workspace_id": None,
+        "duplicate_workspace_name": None,
+        "duplicate_check_unavailable": False,
+        "precheck_error": None,
+    }
+
+    async def _tool_node(_state: MessagesState):
+        return await workspaces_create(
+            USER_ID,
+            "700.HK",
+            "Tencent research",
+            "call-lg-approve-1",
+            preapproved=False,
+            snapshot=snap,
+        )
+
+    builder = StateGraph(MessagesState)
+    builder.add_node("create", _tool_node)
+    builder.add_edge(START, "create")
+    builder.add_edge("create", END)
+
+    graph = builder.compile(checkpointer=InMemorySaver())
+    cfg = {"configurable": {"thread_id": "lg-approve-dup-scope-changed"}}
+    paused = await graph.ainvoke({"messages": []}, config=cfg)
+    assert "__interrupt__" in paused
+    intr_id = paused["__interrupt__"][0].id
+    assert len(dedup_calls) == 1
+
+    # While waiting for confirmation, another connection creates 0700.HK.
+    company_exists_now["flag"] = True
+    dedup_calls.clear()
+
+    resumed = await graph.ainvoke(
+        LGCommand(resume={intr_id: {"decisions": [{"type": "approve"}]}}),
+        config=cfg,
+    )
+    assert dedup_calls == []
+    mgr.create_workspace.assert_awaited_once()
+    create_kwargs = mgr.create_workspace.await_args.kwargs
+    assert create_kwargs["verify_snapshot"] is True
+    assert create_kwargs["check_duplicate_snapshot"] is True
+
+    tool_msg = resumed["messages"][-1]
+    assert tool_msg.status == "error"
+    body = json.loads(tool_msg.content)
+    assert body["success"] is False
+    assert body["code"] == "scope_changed"
+
+
+@pytest.mark.asyncio
+async def test_workspace_manager_bootstrap_keeps_new_primary_computer_if_insert_aborts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5 Decision 1: if create_workspace_on_computer returns None after
     bootstrap_cloud_primary_computer minted a cloud primary, WorkspaceManager
-    reclaims the empty bootstrapped computer before raising ApprovalScopeChangedError."""
+    raises ApprovalScopeChangedError and keeps the new primary computer rather
+    than trying to delete/reclaim it."""
     ws_mgr = object.__new__(WorkspaceManager)
     bootstrap_mock = create_autospec(
         ws_mgr.bootstrap_cloud_primary_computer,
         return_value=_computer_row(CLOUD_2, name="FirstWS", kind="docker", is_primary=True),
     )
-    reclaim_mock = create_autospec(
-        WorkspaceManager._reclaim_empty_bootstrapped_computer,
-        return_value=None,
-    )
     ws_mgr.bootstrap_cloud_primary_computer = bootstrap_mock
-    ws_mgr._reclaim_empty_bootstrapped_computer = reclaim_mock
     monkeypatch.setattr(
         "src.server.services.workspace_manager.create_workspace_on_computer",
         create_autospec(
@@ -1086,6 +1183,7 @@ async def test_workspace_manager_bootstrap_reclaims_orphan_computer_if_insert_ab
         ),
     )
 
+    assert not hasattr(WorkspaceManager, "_reclaim_empty_bootstrapped_computer")
     with pytest.raises(ApprovalScopeChangedError):
         await ws_mgr.create_workspace(
             user_id=USER_ID,
@@ -1098,4 +1196,3 @@ async def test_workspace_manager_bootstrap_reclaims_orphan_computer_if_insert_ab
 
     assert bootstrap_mock.await_args.kwargs["check_duplicate_snapshot"] is True
     assert bootstrap_mock.await_args.kwargs["workspace_name"] == "700.HK"
-    reclaim_mock.assert_awaited_once_with(CLOUD_2)

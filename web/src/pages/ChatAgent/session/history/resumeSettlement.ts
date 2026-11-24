@@ -161,7 +161,7 @@ export function settleResumedInterrupts(
           (p) =>
             p.type === 'create_workspace'
             && p.interruptId === interruptId
-            && (!!p.toolCallId || !event.run_id),
+            && !!p.toolCallId,
         );
         if (idx === -1) continue;
         const [matched] = pendingHistoryInterrupts.splice(idx, 1);

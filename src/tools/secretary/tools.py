@@ -574,13 +574,6 @@ async def workspaces_create(
                 )
             return decline_routing_command(declined, response, tool_call_id)
 
-        # --- DALTON-HOOK(cos-settings-tools): begin ---
-        if resuming:
-            post_dedup = await _check_company_dedup()
-            if post_dedup is not None:
-                return post_dedup
-        # --- DALTON-HOOK(cos-settings-tools): end ---
-
     wants_coverage = bool(requested_coverage and await _ensure_coverage_active())  # DALTON-HOOK(workspace-dedup)
 
     # --- DALTON-HOOK(workspace-dedup): begin ---

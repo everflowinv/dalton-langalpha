@@ -384,13 +384,15 @@ async def _verify_web_confirm_resume(
     raw_request: Any,
     thread_meta: dict[str, Any] | None,
 ) -> dict[str, Any] | None:
-    """Enforce first-party session confirmation authenticity for ``create_workspace``
-    and ``archive_workspace`` HITL resumes.
+    """Enforce initiator login-session confirmation authenticity for
+    ``create_workspace`` and ``archive_workspace`` HITL resumes.
 
-    Returns an updated ``hitl_response`` map when a guarded pending interrupt
-    has a missing (e.g. pre-upgrade card) or mismatched snapshot so the graph
-    consumes the interrupt and emits a terminal ``scope_changed`` error tool
-    result instead of leaving the interrupt stranded via HTTP 409.
+    Explicit rejections always keep their reject verdict (even when the
+    snapshot is missing or drifted) so live display and replay agree. When an
+    approval hits a missing (e.g. pre-upgrade card) or mismatched snapshot,
+    returns an updated ``hitl_response`` map carrying ``scope_changed=True`` so
+    the graph consumes the interrupt and emits a terminal ``scope_changed``
+    error tool result instead of leaving the interrupt stranded via HTTP 409.
     """
     from src.config import settings as app_settings
     from src.dalton.auth import is_dalton_supabase_auth_enabled
@@ -472,7 +474,8 @@ async def _verify_web_confirm_resume(
         )
 
     # 4. Persisted approval_snapshots consistency check.
-    # Missing (e.g. pre-upgrade card) or mismatched snapshots consume the
+    # Explicit rejections keep their reject verdict; approvals against a
+    # missing (e.g. pre-upgrade card) or mismatched snapshot consume the
     # interrupt via a server-stamped ``scope_changed`` verdict so the tool
     # emits a terminal error result and reload never re-arms the stale card.
     checkpoint_data = (newest.checkpoint or {}) if newest is not None else {}

@@ -187,7 +187,6 @@ class WorkspaceManager(ComputerManager):
         name = checked_workspace_name(name)
         chosen = computer_id is not None
         # --- DALTON-HOOK(cos-settings-tools): begin ---
-        bootstrapped_computer_id: Optional[str] = None
         if bootstrap_cloud_primary:
             if chosen:
                 raise ApprovalScopeChangedError("情况已变化，请重新发起")
@@ -201,7 +200,6 @@ class WorkspaceManager(ComputerManager):
                 expected_duplicate_workspace_id=expected_duplicate_workspace_id,
                 expected_duplicate_workspace_name=expected_duplicate_workspace_name,
             )
-            bootstrapped_computer_id = str(computer["computer_id"])
         elif chosen:
             try:
                 computer = await self._chosen_computer(user_id, computer_id)
@@ -264,24 +262,13 @@ class WorkspaceManager(ComputerManager):
                 create_kwargs["expected_duplicate_workspace_name"] = (
                     expected_duplicate_workspace_name
                 )
-        try:
-            workspace = await create_workspace_on_computer(
-                user_id,
-                name,
-                computer_id,
-                **create_kwargs,
-            )
-        except Exception:
-            if bootstrapped_computer_id is not None:
-                await self._reclaim_empty_bootstrapped_computer(
-                    bootstrapped_computer_id
-                )
-            raise
+        workspace = await create_workspace_on_computer(
+            user_id,
+            name,
+            computer_id,
+            **create_kwargs,
+        )
         if workspace is None:
-            if bootstrapped_computer_id is not None:
-                await self._reclaim_empty_bootstrapped_computer(
-                    bootstrapped_computer_id
-                )
             if verify_snapshot or bootstrap_cloud_primary:
                 raise ApprovalScopeChangedError("情况已变化，请重新发起")
             if chosen:
@@ -300,37 +287,6 @@ class WorkspaceManager(ComputerManager):
         )
         safe_add(workspace_created, 1)
         return workspace
-
-    # --- DALTON-HOOK(cos-settings-tools): begin ---
-    @staticmethod
-    async def _reclaim_empty_bootstrapped_computer(computer_id: str) -> None:
-        """Delete a freshly bootstrapped primary computer if subsequent
-        workspace creation aborted and no live workspace landed on it."""
-        from src.server.database.pool import get_db_connection
-
-        try:
-            async with get_db_connection() as conn, conn.transaction():
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        """
-                        UPDATE computers
-                        SET status = 'deleted', is_primary = FALSE, updated_at = NOW()
-                        WHERE computer_id = %s
-                          AND status <> 'deleted'
-                          AND NOT EXISTS (
-                              SELECT 1 FROM workspaces
-                              WHERE computer_id = %s AND status <> 'deleted'
-                          )
-                        """,
-                        (computer_id, computer_id),
-                    )
-        except Exception as exc:
-            logger.warning(
-                "reclaim_bootstrapped_computer_failed computer_id=%s exc_type=%s",
-                computer_id,
-                type(exc).__name__,
-            )
-    # --- DALTON-HOOK(cos-settings-tools): end ---
 
     @staticmethod
     async def _chosen_computer(user_id: str, computer_id: str) -> Dict[str, Any]:
