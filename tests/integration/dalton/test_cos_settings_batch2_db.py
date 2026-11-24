@@ -570,10 +570,10 @@ async def test_bootstrap_cloud_primary_checks_duplicate_before_creating_computer
     assert await get_primary_computer(user_id) is None
 
 
-async def test_in_lock_recheck_members_sql_error_rolls_back_real_postgres_savepoint_and_fails_closed(
+async def test_in_lock_recheck_roles_sql_error_rolls_back_real_postgres_savepoint_and_fails_closed(
     b2_live_pool,
 ) -> None:
-    """Round 8 Decision 2 (real PostgreSQL): when the ``dalton_members`` read
+    """Round 8 Decision 2 (real PostgreSQL): when the ``dalton_user_roles`` read
     inside Phase 2 deterministic in-lock recheck raises a real PostgreSQL SQL
     error, only the inner SAVEPOINT rolls back so the outer transaction stays
     usable (SELECT 1 succeeds without InFailedSqlTransaction), and
@@ -584,13 +584,13 @@ async def test_in_lock_recheck_members_sql_error_rolls_back_real_postgres_savepo
     await create_user(user_id=user_id, email=f"{user_id}@test.local", name="Savepoint")
 
     async with b2_live_pool.connection() as conn, conn.transaction():
-        # Shadow dalton_members inside this transaction with a temp view that
+        # Shadow dalton_user_roles inside this transaction with a temp view that
         # raises a real PostgreSQL division-by-zero SQL error on SELECT.
         async with conn.cursor() as setup_cur:
             await setup_cur.execute(
-                "CREATE TEMP VIEW dalton_members AS SELECT (1 / 0)::text AS email"
+                "CREATE TEMP VIEW dalton_user_roles AS SELECT (1 / 0)::text AS user_id, 'internal'::text AS tier"
             )
-        with patch("src.dalton.settings.is_dalton_local_auth_enabled", lambda: False):
+        with patch("src.dalton.settings.is_dalton_local_auth_enabled", lambda: True):
             async with conn.cursor(row_factory=dict_row) as cur:
                 ok = await ws_db.check_duplicate_snapshot_unchanged(
                     cur,
@@ -603,4 +603,4 @@ async def test_in_lock_recheck_members_sql_error_rolls_back_real_postgres_savepo
                 # Outer transaction is NOT aborted — subsequent SQL succeeds cleanly.
                 await cur.execute("SELECT 1 AS alive")
                 assert await cur.fetchone() == {"alive": 1}
-                await cur.execute("DROP VIEW IF EXISTS pg_temp.dalton_members")
+                await cur.execute("DROP VIEW IF EXISTS pg_temp.dalton_user_roles")

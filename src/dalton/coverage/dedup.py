@@ -51,7 +51,9 @@ from pydantic import BaseModel
 from src.dalton.access_tiers import get_user_tier
 from src.dalton.coverage.identity import (
     _extract_ticker_from_text,
+    canonical_workspace_ticker_key,
     is_historical_duplicate_workspace,
+    normalize_ticker_key,
 )
 from src.dalton.credentials import get_team_credential_holder_id
 from src.dalton.database.coverage_units import _norm_uuid
@@ -270,8 +272,7 @@ def _safe_workspace_name_key(raw: str | None) -> str | None:
 
 
 def _is_internal_team_owner(owner_id: str | None, owner_email: Any) -> bool:
-    tier = sharing_mod._classify_owner_row_tier(owner_id, owner_email)
-    return tier in ("admin", "internal")
+    return sharing_mod.is_internal_team_owner(owner_id, owner_email)
 
 
 def _resolve_display_name(
@@ -1223,6 +1224,7 @@ async def _judge_candidates_with_llm(
     is_external: bool = False,
     skip_journal: bool = False,
     suggestion_out: list[DedupCoverageSuggestion] | None = None,
+    partial_failure_out: list[Exception] | None = None,
 ) -> list[tuple[_CandidateEntry, str, str]]:
     """Run parallel batched LLM matching under a shared 15s deadline."""
     if not entries:
@@ -1296,6 +1298,8 @@ async def _judge_candidates_with_llm(
             suggestion_out.append(best_suggestion)
 
     if failed_exc is not None:
+        if partial_failure_out is not None:
+            partial_failure_out.append(failed_exc)
         logger.warning(
             "Company workspace dedup partial batch failure (%s, succeeded=%d/%d, workspace_count=%d)",
             type(failed_exc).__name__,
@@ -1736,7 +1740,7 @@ async def recheck_company_workspace_before_create(
             stats=stats,
         )
         checked_candidates = tuple(
-            (entry.ws_id, entry.workspace_name, entry.unit_ticker)
+            (entry.ws_id, entry.workspace_name, normalize_ticker_key(entry.unit_ticker))
             for entry in entries
             if entry.ws_id
         )
@@ -1754,14 +1758,55 @@ async def recheck_company_workspace_before_create(
                 check_colleague_workspaces=check_colleagues,
             )
 
+        target_ticker_key = canonical_workspace_ticker_key(raw_name)
+
+        def _deterministic_ticker_match_snapshot() -> CompanyDedupRecheckSnapshot | None:
+            if target_ticker_key is None:
+                return None
+            det_ids: list[str] = []
+            det_unbound = False
+            for entry in entries:
+                entry_ws_id = entry.ws_id
+                if (
+                    expected_duplicate_workspace_id is not None
+                    and entry_ws_id is not None
+                    and entry_ws_id == expected_duplicate_workspace_id
+                ):
+                    continue
+                unit_key = normalize_ticker_key(entry.unit_ticker)
+                name_key = canonical_workspace_ticker_key(entry.workspace_name)
+                if unit_key != target_ticker_key and name_key != target_ticker_key:
+                    continue
+                if entry_ws_id:
+                    if entry_ws_id not in det_ids:
+                        det_ids.append(entry_ws_id)
+                if entry.unbound_unit or not entry_ws_id:
+                    det_unbound = True
+            if det_ids or det_unbound:
+                return CompanyDedupRecheckSnapshot(
+                    status="matched",
+                    matched_workspace_ids=tuple(det_ids),
+                    has_unbound_or_unreadable_match=det_unbound,
+                    checked_candidates=checked_candidates,
+                    check_colleague_workspaces=check_colleagues,
+                )
+            return None
+
+        partial_failures: list[Exception] = []
         hits = await _judge_candidates_with_llm(
             uid=uid,
             raw_name=raw_name,
             entries=entries,
             stats=stats,
             is_external=(caller_tier == "external"),
+            partial_failure_out=partial_failures,
         )
         if not hits:
+            det_match = _deterministic_ticker_match_snapshot()
+            if det_match is not None:
+                return det_match
+            if partial_failures:
+                return CompanyDedupRecheckSnapshot(status="unavailable")
             return CompanyDedupRecheckSnapshot(
                 status="clear",
                 checked_candidates=checked_candidates,
@@ -1770,6 +1815,11 @@ async def recheck_company_workspace_before_create(
 
         all_live_hits = await _refresh_live_hits(hits)
         if not all_live_hits:
+            det_match = _deterministic_ticker_match_snapshot()
+            if det_match is not None:
+                return det_match
+            if partial_failures:
+                return CompanyDedupRecheckSnapshot(status="unavailable")
             return CompanyDedupRecheckSnapshot(
                 status="clear",
                 checked_candidates=checked_candidates,
@@ -1805,6 +1855,11 @@ async def recheck_company_workspace_before_create(
                 checked_candidates=checked_candidates,
                 check_colleague_workspaces=check_colleagues,
             )
+        det_match = _deterministic_ticker_match_snapshot()
+        if det_match is not None:
+            return det_match
+        if partial_failures:
+            return CompanyDedupRecheckSnapshot(status="unavailable")
         return CompanyDedupRecheckSnapshot(
             status="clear",
             checked_candidates=checked_candidates,

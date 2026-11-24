@@ -1304,37 +1304,53 @@ async def check_duplicate_snapshot_unchanged(
 
     Runs entirely inside a single savepoint on the caller's transaction
     connection — never calls an LLM and never acquires a second connection from
-    the pool. Any SQL error (including ``dalton_members`` / ``dalton_user_roles``
+    the pool. Any SQL error (including ``dalton_user_roles`` or workspace/unit
     reads) rolls back the savepoint so the outer transaction stays usable and
     fails closed by returning ``False`` (triggering ``scope_changed``).
+
+    Shares the exact same canonical ticker normalizer
+    (``normalize_ticker_key`` / ``canonical_workspace_ticker_key``) and
+    internal-team owner classifier (``is_internal_team_owner``) as Phase 1.
 
     Returns ``False`` when:
     - Any live workspace of ``user_id`` other than
       ``expected_duplicate_workspace_id`` shares the same ``workspace_name_key``
-      or normalized ticker (``is_duplicate_name``);
+      or canonical ticker key (``700.HK`` / ``0700.HK`` / ``00700``);
     - A listed ``expected_duplicate_workspace_id`` was deleted, renamed away
       from ``expected_duplicate_workspace_name``, or no longer duplicates
       ``name``;
     - ``check_colleague_duplicate`` is True and any live internal-team
-      colleague workspace shares the same ``workspace_name_key``, normalized
-      ticker, or active company coverage unit ticker;
+      colleague workspace shares the same ``workspace_name_key``, canonical
+      ticker key, or active company coverage unit canonical ticker key;
     - Any candidate ``(workspace_id, name, unit_ticker)`` observed during the
       lock-free Phase 1 check was deleted, renamed, or changed its active
-      company unit ticker.
+      company unit canonical ticker key.
     """
+    from src.dalton.coverage.identity import (
+        canonical_workspace_ticker_key,
+        normalize_ticker_key,
+    )
     from src.tools.secretary.approvals import is_duplicate_name
 
-    def _same_name_or_ticker(target: str, candidate: str) -> bool:
+    target_ticker_key = canonical_workspace_ticker_key(name)
+
+    def _same_name_or_ticker(
+        target: str, candidate: str, *, candidate_is_ticker: bool = False
+    ) -> bool:
         if is_duplicate_name(target, candidate):
             return True
+        if target_ticker_key is not None:
+            cand_key = (
+                normalize_ticker_key(candidate)
+                if candidate_is_ticker
+                else canonical_workspace_ticker_key(candidate)
+            )
+            if cand_key is not None and cand_key == target_ticker_key:
+                return True
         try:
             return workspace_name_key(target) == workspace_name_key(candidate)
         except WorkspaceNameInvalid:
             return False
-
-    def _norm_ticker(val: Any) -> Optional[str]:
-        cleaned = str(val or "").strip().upper()
-        return cleaned or None
 
     candidates_list = list(verified_company_candidates) if verified_company_candidates else []
 
@@ -1371,17 +1387,11 @@ async def check_duplicate_snapshot_unchanged(
             return False
 
         if check_colleague_duplicate:
-            from src.dalton.company_identity import is_company_system_user
-            from src.dalton.settings import (
-                get_configured_pm_user_ids,
-                get_dalton_allowed_emails,
-                is_dalton_local_auth_enabled,
-            )
+            from src.dalton import settings as dalton_settings
+            from src.dalton.sharing import is_internal_team_owner
 
             internal_user_ids: Optional[set[str]] = None
-            internal_emails: set[str] = set()
-            pm_user_ids: set[str] = set()
-            if is_dalton_local_auth_enabled():
+            if dalton_settings.is_dalton_local_auth_enabled():
                 await check_cur.execute(
                     """
                     SELECT user_id
@@ -1393,26 +1403,6 @@ async def check_duplicate_snapshot_unchanged(
                     str(r["user_id"]).strip()
                     for r in await check_cur.fetchall()
                     if r and r.get("user_id")
-                }
-            else:
-                # Query dalton_members directly on the transaction cursor (no
-                # exception swallowing) so any SQL error rolls back the
-                # savepoint and fails closed as scope_changed.
-                await check_cur.execute("SELECT email FROM dalton_members")
-                member_emails = {
-                    str(r["email"]).strip().lower()
-                    for r in await check_cur.fetchall()
-                    if r and r.get("email") and str(r["email"]).strip()
-                }
-                internal_emails = member_emails | {
-                    str(e).strip().lower()
-                    for e in get_dalton_allowed_emails()
-                    if str(e).strip()
-                }
-                pm_user_ids = {
-                    str(u).strip()
-                    for u in get_configured_pm_user_ids()
-                    if str(u).strip()
                 }
 
             await check_cur.execute(
@@ -1443,21 +1433,19 @@ async def check_duplicate_snapshot_unchanged(
                 ws_id_s = str(row["workspace_id"])
                 ws_owner = str(row.get("user_id") or "").strip()
                 ws_name = str(row.get("name") or "").strip()
-                ws_email = str(row.get("owner_email") or "").strip().lower()
-                unit_ticker = _norm_ticker(row.get("unit_ticker"))
+                ws_email = row.get("owner_email")
+                unit_ticker = normalize_ticker_key(row.get("unit_ticker"))
                 live_by_id[ws_id_s] = {
                     "name": ws_name,
                     "unit_ticker": unit_ticker,
                 }
-                if not ws_name or is_company_system_user(ws_owner):
+                if not ws_name:
                     continue
-                if internal_user_ids is not None:
-                    is_internal = ws_owner in internal_user_ids
-                else:
-                    is_internal = (ws_owner in pm_user_ids) or (
-                        bool(ws_email) and ws_email in internal_emails
-                    )
-                if not is_internal:
+                if not is_internal_team_owner(
+                    ws_owner,
+                    ws_email,
+                    local_internal_user_ids=internal_user_ids,
+                ):
                     continue
                 if (
                     expected_duplicate_workspace_id is not None
@@ -1466,7 +1454,9 @@ async def check_duplicate_snapshot_unchanged(
                     continue
                 if _same_name_or_ticker(name, ws_name):
                     return False
-                if unit_ticker is not None and _same_name_or_ticker(name, unit_ticker):
+                if unit_ticker is not None and _same_name_or_ticker(
+                    name, unit_ticker, candidate_is_ticker=True
+                ):
                     return False
 
             for cand_id, cand_name, cand_ticker in candidates_list:
@@ -1475,7 +1465,7 @@ async def check_duplicate_snapshot_unchanged(
                     return False
                 if current["name"] != str(cand_name).strip():
                     return False
-                if current["unit_ticker"] != _norm_ticker(cand_ticker):
+                if current["unit_ticker"] != normalize_ticker_key(cand_ticker):
                     return False
         elif candidates_list:
             cand_ids = [str(cid) for cid, _, _ in candidates_list]
@@ -1503,7 +1493,7 @@ async def check_duplicate_snapshot_unchanged(
             current_by_id = {
                 str(r["workspace_id"]): {
                     "name": str(r.get("name") or "").strip(),
-                    "unit_ticker": _norm_ticker(r.get("unit_ticker")),
+                    "unit_ticker": normalize_ticker_key(r.get("unit_ticker")),
                 }
                 for r in await check_cur.fetchall()
             }
@@ -1513,7 +1503,7 @@ async def check_duplicate_snapshot_unchanged(
                     return False
                 if current["name"] != str(cand_name).strip():
                     return False
-                if current["unit_ticker"] != _norm_ticker(cand_ticker):
+                if current["unit_ticker"] != normalize_ticker_key(cand_ticker):
                     return False
 
         return True
