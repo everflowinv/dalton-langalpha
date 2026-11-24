@@ -160,15 +160,28 @@ fmt_cmd() {
 
 validate_project_name() {
   local name="$1"
+  local source_label="${2:---project-name}"
   local LC_ALL=C
-  if [[ -z "$name" || "$name" == *$'\n'* || ! "$name" =~ ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ ]]; then
-    err "Invalid --project-name '${name}': must match ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ (lowercase ASCII letters, digits, hyphens, underscores; must start and end with a letter or digit)."
+  if [[ -z "$name" || "$name" == *$'\n'* || ! "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    err "Invalid ${source_label} '${name}': must match ^[a-z0-9][a-z0-9_-]*$ (lowercase ASCII letters, digits, hyphens, underscores; must start with a letter or digit)."
     exit 2
   fi
 }
 
+normalize_env_project_name() {
+  local raw="$1"
+  printf '%s' "$raw" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+}
+
+sanitize_project_name() {
+  local raw="$1"
+  local cleaned
+  cleaned="$(printf '%s' "$raw" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed -E 's/[^a-z0-9_-]+/-/g; s/^[^a-z0-9]+//; s/[-_]+$//')"
+  printf '%s' "${cleaned:-dalton-core}"
+}
+
 if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
-  validate_project_name "$PROJECT_NAME_ARG"
+  validate_project_name "$PROJECT_NAME_ARG" "--project-name"
 fi
 
 if ! [[ "$RETAIN" =~ ^[0-9]+$ ]]; then
@@ -233,13 +246,6 @@ PY
   fi
 }
 
-sanitize_project_name() {
-  local raw="$1"
-  local cleaned
-  cleaned="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g; s/^[^a-z0-9]+//; s/[-_]+$//')"
-  printf '%s' "${cleaned:-dalton-core}"
-}
-
 # External PostgreSQL guard: strictly read from .env (never shell environment).
 DB_HOST="$(read_env_file_var "$ENV_FILE" "DB_HOST" "postgres")"
 if [[ "$DB_HOST" != "postgres" ]]; then
@@ -262,9 +268,13 @@ DB_NAME="$(read_env_file_var "$ENV_FILE" "DB_NAME" "postgres")"
 if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
   PROJECT_NAME="$PROJECT_NAME_ARG"
 else
-  PROJECT_NAME="$(read_env_file_var "$ENV_FILE" "COMPOSE_PROJECT_NAME" "")"
-  if [[ -z "$PROJECT_NAME" ]]; then
+  RAW_ENV_PROJECT="$(read_env_file_var "$ENV_FILE" "COMPOSE_PROJECT_NAME" "")"
+  if [[ -n "$RAW_ENV_PROJECT" ]]; then
+    PROJECT_NAME="$(normalize_env_project_name "$RAW_ENV_PROJECT")"
+    validate_project_name "$PROJECT_NAME" "COMPOSE_PROJECT_NAME"
+  else
     PROJECT_NAME="$(sanitize_project_name "$(basename "$WORK_DIR")")"
+    validate_project_name "$PROJECT_NAME" "COMPOSE_PROJECT_NAME"
   fi
 fi
 DOMAIN="$(read_env_file_var "$ENV_FILE" "DOMAIN" "localhost")"
@@ -480,16 +490,16 @@ PG_DUMP_BYTES="$(wc -c < "${STAGE_DIR}/postgres.dump" | tr -d ' ')"
 ALEMBIC_UPSTREAM="$(compose_cmd exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -Atqc "SELECT version_num FROM alembic_version;" 2>/dev/null | tr -d '\r\n' || true)"
 ALEMBIC_DALTON="$(compose_cmd exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -Atqc "SELECT version_num FROM alembic_version_dalton;" 2>/dev/null | tr -d '\r\n' || true)"
 
-PG_TOC=""
+PG_TOC_FILE="${STAGE_DIR}/.pg-toc.tmp"
 PG_TOC_ENTRIES=0
 if [[ "$VERIFY" -eq 1 ]]; then
-  PG_TOC="$(compose_cmd exec -T postgres pg_restore --list < "${STAGE_DIR}/postgres.dump")"
-  PG_TOC_ENTRIES="$(printf '%s\n' "$PG_TOC" | grep -vcE '^[[:space:]]*(;|$)' || true)"
+  compose_cmd exec -T postgres pg_restore --list < "${STAGE_DIR}/postgres.dump" > "$PG_TOC_FILE"
+  PG_TOC_ENTRIES="$(grep -vcE '^[[:space:]]*(;|$)' "$PG_TOC_FILE" || true)"
   if (( PG_TOC_ENTRIES == 0 )); then
     err "pg_restore --list returned 0 TOC entries."
     exit 1
   fi
-  if ! printf '%s\n' "$PG_TOC" | grep -q 'alembic_version_dalton'; then
+  if ! grep -q 'alembic_version_dalton' "$PG_TOC_FILE"; then
     warn "TOC does not contain alembic_version_dalton (database may not be migrated yet)."
   fi
   ok "PostgreSQL dump verified (${PG_DUMP_BYTES} bytes, ${PG_TOC_ENTRIES} TOC entries; upstream=${ALEMBIC_UPSTREAM:-unknown}, dalton=${ALEMBIC_DALTON:-unknown})."
@@ -594,16 +604,21 @@ def _norm_ep(url: str) -> str:
     from urllib.parse import urlsplit, urlunsplit
 
     try:
-        parts = urlsplit(raw)
-        if parts.username or parts.password:
-            host = parts.hostname or ""
+        has_scheme = "://" in raw
+        parts = urlsplit(raw if has_scheme else f"//{raw}")
+        if parts.hostname is not None:
+            host = parts.hostname.lower()
             if ":" in host and not host.startswith("["):
                 host = f"[{host}]"
-            netloc = f"{host}:{parts.port}" if parts.port else host
-            return urlunsplit((parts.scheme, netloc, parts.path, "", "")).rstrip("/").lower()
+            port = parts.port
+            netloc = f"{host}:{port}" if port is not None else host
+            path = parts.path.rstrip("/") if not (parts.query or parts.fragment) else parts.path
+            if has_scheme:
+                return urlunsplit((parts.scheme.lower(), netloc, path, parts.query, parts.fragment))
+            return urlunsplit(("", netloc, path, parts.query, parts.fragment)).lstrip("/")
     except Exception:
         pass
-    return raw.lower()
+    return raw
 
 
 def _norm_prefix(raw: str) -> str:
@@ -935,13 +950,13 @@ fi
 
 # Immediately verify every completed (non-'uploading') chat upload in the PostgreSQL snapshot
 # exists in the MinIO archive just enumerated; fail the backup if any object is missing.
-if [[ -z "$PG_TOC" ]]; then
-  PG_TOC="$(compose_cmd exec -T postgres pg_restore --list < "${STAGE_DIR}/postgres.dump")"
+if [[ ! -s "$PG_TOC_FILE" ]]; then
+  compose_cmd exec -T postgres pg_restore --list < "${STAGE_DIR}/postgres.dump" > "$PG_TOC_FILE"
 fi
-if printf '%s\n' "$PG_TOC" | grep -Eq '^[[:space:]]*[0-9]+;[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+TABLE DATA[[:space:]]+public[[:space:]]+dalton_chat_file_uploads([[:space:]]|$)'; then
+if grep -Eq '^[[:space:]]*[0-9]+;[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+TABLE DATA[[:space:]]+public[[:space:]]+dalton_chat_file_uploads([[:space:]]|$)' "$PG_TOC_FILE"; then
   info "Verifying completed chat upload references in PostgreSQL snapshot against MinIO archive..."
   CHAT_UPLOADS_COPY_TMP="${STAGE_DIR}/.chat-uploads-copy.sql"
-  if ! compose_cmd exec -T postgres pg_restore --data-only --schema=public --table=dalton_chat_file_uploads \
+  if ! compose_cmd exec -T postgres pg_restore -f - --data-only --schema=public --table=dalton_chat_file_uploads \
       < "${STAGE_DIR}/postgres.dump" > "$CHAT_UPLOADS_COPY_TMP"; then
     err "Failed to extract dalton_chat_file_uploads data from PostgreSQL snapshot for object verification."
     exit 1
@@ -954,6 +969,7 @@ if printf '%s\n' "$PG_TOC" | grep -Eq '^[[:space:]]*[0-9]+;[[:space:]]+[0-9]+[[:
   fi
   rm -f "$CHAT_UPLOADS_COPY_TMP"
 fi
+rm -f "$PG_TOC_FILE"
 
 # 3. Caddy certificate & PKI data backup (/data on edge)
 info "3/4 Backing up Caddy certificate & PKI data..."

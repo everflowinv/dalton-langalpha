@@ -1224,10 +1224,67 @@ def check_backup_script(
             f"Encrypted env.enc contains plaintext {secret_key}!"
         )
 
+    # 4d. Uppercase COMPOSE_PROJECT_NAME in .env (stack running under its lowercased name):
+    #     backup.sh WITHOUT --project-name must lowercase .env's project name, validate it,
+    #     ignore shell COMPOSE_PROJECT_NAME, and succeed against the live stack.
+    if project_name.startswith("dalton-core"):
+        mixed_case_project = "Dalton-Core" + project_name[len("dalton-core"):]
+    else:
+        mixed_case_project = "".join(
+            ch.upper() if idx == 0 else ch for idx, ch in enumerate(project_name)
+        )
+        if mixed_case_project == project_name:
+            for idx, ch in enumerate(project_name):
+                if ch.isalpha():
+                    mixed_case_project = project_name[:idx] + ch.upper() + project_name[idx + 1:]
+                    break
+    assert mixed_case_project.lower() == project_name
+    env_file = ctx.work_dir / ".env"
+    saved_env_bytes_4d = env_file.read_bytes()
+    upper_env_text = _rewrite_env_keys(
+        saved_env_bytes_4d.decode("utf-8"),
+        {"COMPOSE_PROJECT_NAME": mixed_case_project},
+    )
+    poison_shell_env = os.environ.copy()
+    poison_shell_env["COMPOSE_PROJECT_NAME"] = "wrong_shell_project_must_be_ignored"
+    try:
+        env_file.write_text(upper_env_text, encoding="utf-8")
+        os.chmod(env_file, 0o600)
+        with tempfile.TemporaryDirectory(prefix="b6-upper-proj-backup-") as upper_bak_tmp:
+            upper_bak_root = Path(upper_bak_tmp)
+            _run_cmd(
+                [
+                    "bash",
+                    str(backup_script),
+                    "--work-dir",
+                    str(ctx.work_dir),
+                    "--output-dir",
+                    str(upper_bak_root),
+                    "--retain",
+                    "1",
+                    "--compose-files",
+                    compose_files_str,
+                ],
+                cwd=ctx.work_dir,
+                env=poison_shell_env,
+                redact_env=ctx.env,
+                timeout=300,
+            )
+            upper_dirs = sorted(p for p in upper_bak_root.glob("dalton-backup-*") if p.is_dir())
+            assert len(upper_dirs) == 1, f"Expected 1 backup dir for uppercase .env project, got {upper_dirs}"
+            upper_manifest = json.loads((upper_dirs[0] / "manifest.json").read_text(encoding="utf-8"))
+            assert upper_manifest.get("compose_project") == project_name, (
+                f"Expected backup.sh to normalize .env COMPOSE_PROJECT_NAME={mixed_case_project!r} "
+                f"to {project_name!r}, got {upper_manifest.get('compose_project')!r}"
+            )
+    finally:
+        env_file.write_bytes(saved_env_bytes_4d)
+        os.chmod(env_file, 0o600)
+
     log(
         f"4/6 OK (backup={latest_backup.name}, db_toc={manifest['database']['toc_entries']}, "
         f"minio_objects={manifest['minio']['object_count']}, caddy_files={manifest['caddy']['file_count']}, "
-        "retention=2 verified, 0 secret leaks)."
+        f"retention=2 & uppercase .env project ({mixed_case_project} -> {project_name}) verified, 0 secret leaks)."
     )
     return latest_backup
 

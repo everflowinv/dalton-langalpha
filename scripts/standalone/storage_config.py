@@ -71,16 +71,21 @@ def _norm_ep(url: str | None) -> str:
     if not raw:
         return ""
     try:
-        parts = urlsplit(raw)
-        if parts.username or parts.password:
-            host = parts.hostname or ""
+        has_scheme = "://" in raw
+        parts = urlsplit(raw if has_scheme else f"//{raw}")
+        if parts.hostname is not None:
+            host = parts.hostname.lower()
             if ":" in host and not host.startswith("["):
                 host = f"[{host}]"
-            netloc = f"{host}:{parts.port}" if parts.port else host
-            return urlunsplit((parts.scheme, netloc, parts.path, "", "")).rstrip("/").lower()
+            port = parts.port
+            netloc = f"{host}:{port}" if port is not None else host
+            path = parts.path.rstrip("/") if not (parts.query or parts.fragment) else parts.path
+            if has_scheme:
+                return urlunsplit((parts.scheme.lower(), netloc, path, parts.query, parts.fragment))
+            return urlunsplit(("", netloc, path, parts.query, parts.fragment)).lstrip("/")
     except Exception:
         pass
-    return raw.lower()
+    return raw
 
 
 def _norm_prefix(raw: str | None) -> str:
@@ -142,7 +147,8 @@ def _extract_yaml_storage_provider_file(yaml_path: Path) -> str | None:
 
     in_storage = False
     storage_indent = 0
-    for raw in yaml_path.read_text(encoding="utf-8").splitlines():
+    for raw in yaml_path.read_text(encoding="utf-8").split("\n"):
+        raw = raw.rstrip("\r")
         stripped = raw.strip()
         if not stripped or stripped.startswith("#"):
             continue
@@ -514,7 +520,7 @@ def parse_chat_uploads_copy_sql(copy_sql: str) -> list[dict[str, str | None]]:
     closed_block = False
     rows: list[dict[str, str | None]] = []
 
-    for raw_line in copy_sql.splitlines():
+    for raw_line in copy_sql.split("\n"):
         line = raw_line.rstrip("\r")
         if not in_copy:
             m = _COPY_HEADER_RE.match(line)

@@ -1942,7 +1942,8 @@ class TestSandboxNetworkAndInitScript:
 
         restore_text = (REPO_ROOT / "scripts/standalone/restore.sh").read_text(encoding="utf-8")
         assert "read_env_var()" not in restore_text, "restore.sh must read .env files strictly via read_env_file_var"
-        assert "sanitize_project_name" not in restore_text, "restore.sh must compare COMPOSE_PROJECT_NAME verbatim"
+        assert 'if [[ "$NEW_PROJECT" != "$CUR_PROJECT" ]]' in restore_text, "restore.sh must compare COMPOSE_PROJECT_NAME verbatim for --replace-env"
+        assert "sanitize_project_name()" in restore_text, "restore.sh must share sanitize_project_name for directory fallback"
         assert "--replace-data" not in restore_text, "restore.sh must remove --replace-data"
         assert "ALTER DATABASE" not in restore_text, "restore.sh must remove DB rename / swap logic"
         assert "_pre_restore_" not in restore_text, "restore.sh must remove preserved DB logic"
@@ -2935,13 +2936,12 @@ class TestSandboxNetworkAndInitScript:
         )
 
         # 1. Invalid --project-name values and missing argument are rejected with exit 2 by all 3 scripts
+        #    (Compose rule `^[a-z0-9][a-z0-9_-]*$` allows trailing `-` / `_`).
         invalid_names = (
             "",
             "UpperCase",
             "-leading",
             "_leading",
-            "trailing-",
-            "trailing_",
             "bad.dot",
             "bad/slash",
             "bad space",
@@ -3160,3 +3160,401 @@ class TestSandboxNetworkAndInitScript:
                     lock_p.rmdir()
                 elif lock_p.exists():
                     lock_p.unlink()
+
+    def test_b6_r9_fixes_pg_restore_sigpipe_override_endpoints_u2028_and_project_names(
+        self, tmp_path: Path
+    ) -> None:
+        """Offline verification for Batch 6 R9 fixes (items 1-9):
+        1. backup.sh passes `-f -` to `pg_restore --data-only` (stdout).
+        2. backup.sh greps TOC temp file instead of `printf ... | grep -q` (no SIGPIPE skip).
+        3. restore.sh keeps the same compose override file (`env_file: !override`) across
+           both preflight `compose config` and formal writes when restoring from `env.enc`.
+        5. Endpoint comparison lowercases only scheme & hostname while keeping path case-sensitive
+           (`/Archive` != `/archive`).
+        6. COPY SQL parser splits on `\\n` (not `splitlines()`) so filenames with U+2028 parse cleanly.
+        7-8. Compose project name rule `^[a-z0-9][a-z0-9_-]*$` (trailing `-`/`_` allowed, `.env`
+             lowercased before validation, `upgrade.sh` passes lowercased name to `backup.sh`,
+             and `Dalton.Release` dir fallback produces `dalton-release` in all 3 scripts).
+        9. Multiple non-empty other DBs are formatted with `, ` separator in `restore.sh`.
+        """
+        import re as _re
+
+        spec = importlib.util.spec_from_file_location(
+            "standalone_storage_config_r9",
+            REPO_ROOT / "scripts/standalone/storage_config.py",
+        )
+        assert spec is not None and spec.loader is not None
+        sc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sc)
+
+        # Item 1 & Item 2: backup.sh uses `pg_restore -f - --data-only` and no `printf/echo ... | grep -q`
+        backup_text = (REPO_ROOT / "scripts/standalone/backup.sh").read_text(encoding="utf-8")
+        assert "pg_restore -f - --data-only --schema=public --table=dalton_chat_file_uploads" in backup_text
+        for script_name in ("backup.sh", "restore.sh", "upgrade.sh"):
+            src_text = (REPO_ROOT / "scripts/standalone" / script_name).read_text(encoding="utf-8")
+            assert not _re.search(r"\b(?:printf|echo)\b[^\n|]*\|\s*grep\s+-[^\s]*q", src_text), (
+                f"{script_name} still pipes printf/echo directly into grep -q (SIGPIPE risk under pipefail)"
+            )
+
+        # Item 5: Endpoint normalization lowercases only scheme + hostname, keeping path case-sensitive
+        assert sc._norm_ep("https://S3.Example.Test/Archive/") == "https://s3.example.test/Archive"
+        assert sc._norm_ep("https://s3.example.test/archive") == "https://s3.example.test/archive"
+        assert sc._norm_ep("https://S3.Example.Test/Archive") != sc._norm_ep("https://s3.example.test/archive")
+        assert sc._norm_ep("HTTPS://User:Pass@S3.Example.TEST:8443/Archive/") == "https://s3.example.test:8443/Archive"
+        assert sc._norm_ep("http://user:pass@[2001:DB8::1]:9000/Archive") == "http://[2001:db8::1]:9000/Archive"
+
+        backup_manifest_archive = {
+            "targets": {
+                "chat_upload": {
+                    "endpoint": "https://s3.example.test/Archive",
+                    "bucket": "chat-uploads",
+                    "key_prefix": "",
+                }
+            }
+        }
+        target_lower_path = sc.resolve_effective_storage(
+            {
+                "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL": "https://s3.example.test/archive",
+                "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME": "chat-uploads",
+                "DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID": "ak",
+                "DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY": "sk",
+            },
+            apply_compose_defaults=False,
+        )
+        mismatches_case = sc.compare_backup_with_target(target_lower_path, backup_manifest_archive, None)
+        assert any("endpoint mismatch" in m for m in mismatches_case), (
+            f"Expected /Archive vs /archive to be reported as endpoint mismatch, got {mismatches_case!r}"
+        )
+
+        target_same_path_upper_host = sc.resolve_effective_storage(
+            {
+                "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL": "HTTPS://S3.EXAMPLE.TEST/Archive/",
+                "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME": "chat-uploads",
+                "DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID": "ak",
+                "DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY": "sk",
+            },
+            apply_compose_defaults=False,
+        )
+        assert sc.compare_backup_with_target(target_same_path_upper_host, backup_manifest_archive, None) == []
+
+        # Also verify backup.sh embedded `_norm_ep` matches the same case-sensitive path rule
+        m_ep = _re.search(r"(def _norm_ep\(url: str\) -> str:.*?    return raw\n)", backup_text, flags=_re.DOTALL)
+        assert m_ep is not None, "Could not locate _norm_ep in backup.sh"
+        ep_ns: dict[str, Any] = {}
+        exec(m_ep.group(1), ep_ns)
+        assert ep_ns["_norm_ep"]("https://S3.Example.Test/Archive") == "https://s3.example.test/Archive"
+        assert ep_ns["_norm_ep"]("https://s3.example.test/archive") == "https://s3.example.test/archive"
+        assert ep_ns["_norm_ep"]("https://S3.Example.Test/Archive") != ep_ns["_norm_ep"]("https://s3.example.test/archive")
+
+        # Item 6: COPY SQL containing U+2028 (Line Separator) in filename / object_key parses without splitting rows
+        u2028_name = "report\u2028q4.pdf"
+        u2028_key = f"chat-uploads/ws1/u1/{u2028_name}"
+        u2028_wip = "chat-uploads/ws1/u2/draft\u2028wip.pdf"
+        copy_u2028 = (
+            "COPY public.dalton_chat_file_uploads (upload_id, filename, object_key, state, cleaned_at) FROM stdin;\n"
+            f"u1\t{u2028_name}\t{u2028_key}\tready\t\\N\n"
+            f"u2\tdraft\u2028wip.pdf\t{u2028_wip}\tuploading\t\\N\n"
+            "\\.\n"
+        )
+        parsed_rows = sc.parse_chat_uploads_copy_sql(copy_u2028)
+        assert len(parsed_rows) == 2
+        assert parsed_rows[0]["filename"] == u2028_name
+        assert parsed_rows[0]["object_key"] == u2028_key
+        assert parsed_rows[1]["state"] == "uploading"
+
+        verify_res = sc.verify_backup_chat_upload_refs(
+            copy_u2028,
+            {
+                "primary_bucket": "chat-uploads",
+                "targets": {"chat_upload": {"bucket": "chat-uploads", "key_prefix": ""}},
+                "objects": [{"bucket": "chat-uploads", "key": u2028_key, "size": 12}],
+            },
+        )
+        assert verify_res["missing"] == []
+        assert verify_res["checked"] == 1
+        assert verify_res["skipped_uploading"] == 1
+
+        # Item 3: restore.sh from env.enc keeps the exact same override compose file across preflight & formal write
+        pass_f = tmp_path / "r9.pass"
+        pass_f.write_text("r9-passphrase-123456\n", encoding="utf-8")
+        pass_f.chmod(0o600)
+        proj_ov = f"r9-ov-parity-{os.getpid()}"
+        bak_ov = tmp_path / "r9-bak-ov"
+        bak_ov.mkdir()
+        (bak_ov / "postgres.dump").write_bytes(b"PGDMP")
+        plain_ov = tmp_path / "r9-ov.plain.env"
+        plain_ov.write_text(
+            f"COMPOSE_PROJECT_NAME={proj_ov}\n"
+            "DB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=secretpg\nDB_NAME=postgres\n",
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                "openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-md", "sha256", "-iter", "10000",
+                "-salt", "-in", str(plain_ov), "-out", str(bak_ov / "env.enc"), "-pass", f"file:{pass_f}",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=15,
+        )
+        (bak_ov / "manifest.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "env_backup": "encrypted",
+                    "env_encryption": {
+                        "cipher": "aes-256-cbc", "kdf": "pbkdf2", "digest": "sha256", "iterations": 10000,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        w_ov = tmp_path / "r9-work-ov"
+        w_ov.mkdir()
+        (w_ov / "docker-compose.yml").write_text(
+            "services:\n  backend:\n    env_file: .env\n", encoding="utf-8"
+        )
+        (w_ov / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_ov / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+
+        ov_stub_dir = tmp_path / "r9-ov-bin"
+        ov_stub_dir.mkdir()
+        (ov_stub_dir / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (ov_stub_dir / "flock").chmod(0o755)
+        ov_calls_log = tmp_path / "r9-ov-calls.log"
+        (ov_stub_dir / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$*" >> "{ov_calls_log}"\n'
+            'if [[ "$*" == *" config --format json"* ]]; then echo \'{"services":{"backend":{"environment":{}}}}\'; exit 0; fi\n'
+            'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+            'if [[ "$*" == *"FROM pg_database"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" -d postgres "* && "$*" == *"pg_class"* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" up -d postgres redis minio"* ]]; then exit 99; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (ov_stub_dir / "docker").chmod(0o755)
+        ov_env = os.environ.copy()
+        ov_env["PATH"] = f"{ov_stub_dir}:{ov_env.get('PATH', '')}"
+        lock_ov = Path(f"/tmp/dalton-{proj_ov}.restore.lock")
+        try:
+            subprocess.run(
+                [
+                    "bash",
+                    str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir", str(w_ov),
+                    "--backup-dir", str(bak_ov),
+                    "--env-passphrase-file", str(pass_f),
+                    "--skip-minio", "--skip-caddy", "--skip-edge-build",
+                ],
+                env=ov_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            calls = ov_calls_log.read_text(encoding="utf-8").splitlines()
+            cfg_calls = [c for c in calls if " config --format json" in c]
+            write_calls = [c for c in calls if " up -d postgres redis minio" in c]
+            assert cfg_calls and write_calls, f"Missing expected compose calls: {calls}"
+            m_cfg = _re.search(r"-f (\S*dalton-restore-override\.\S+)", cfg_calls[0])
+            m_wrt = _re.search(r"-f (\S*dalton-restore-override\.\S+)", write_calls[0])
+            assert m_cfg is not None and m_wrt is not None, (
+                f"Both preflight and formal write must pass the override file: cfg={cfg_calls[0]!r}, write={write_calls[0]!r}"
+            )
+            assert m_cfg.group(1) == m_wrt.group(1), (
+                f"Preflight and formal write used different override files: {m_cfg.group(1)!r} != {m_wrt.group(1)!r}"
+            )
+        finally:
+            if lock_ov.is_dir():
+                lock_ov.rmdir()
+            elif lock_ov.exists():
+                lock_ov.unlink()
+
+        # Item 7 & Item 8: trailing `-`/`_` accepted, uppercase `.env` lowercased & forwarded by upgrade.sh,
+        # invalid `.env` project rejected, and `Dalton.Release` dir fallback -> `dalton-release` in all 3 scripts.
+        r9_bin = tmp_path / "r9-proj-bin"
+        r9_bin.mkdir()
+        (r9_bin / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (r9_bin / "flock").chmod(0o755)
+        r9_docker_log = tmp_path / "r9-proj-docker.log"
+        (r9_bin / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            f'printf "%s\\n" "$*" > "{r9_docker_log}"\n'
+            "exit 99\n",
+            encoding="utf-8",
+        )
+        (r9_bin / "docker").chmod(0o755)
+        r9_env = os.environ.copy()
+        r9_env["PATH"] = f"{r9_bin}:{r9_env.get('PATH', '')}"
+
+        bak_stub = tmp_path / "r9-bak-stub"
+        bak_stub.mkdir()
+        (bak_stub / "postgres.dump").write_bytes(b"PGDMP")
+
+        # 7a. Trailing `-` and `_` accepted by --project-name and .env across backup.sh, restore.sh, upgrade.sh
+        w_trail = tmp_path / "r9-work-trail"
+        w_trail.mkdir()
+        (w_trail / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_trail / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_trail / ".env").write_text("COMPOSE_PROJECT_NAME=Dalton_Core-\nDB_HOST=postgres\n", encoding="utf-8")
+
+        r9_docker_log.unlink(missing_ok=True)
+        subprocess.run(
+            ["bash", str(REPO_ROOT / "scripts/standalone/backup.sh"), "--work-dir", str(w_trail)],
+            env=r9_env, capture_output=True, text=True, timeout=15,
+        )
+        assert "compose -p dalton_core- " in r9_docker_log.read_text(encoding="utf-8")
+
+        r9_docker_log.unlink(missing_ok=True)
+        subprocess.run(
+            ["bash", str(REPO_ROOT / "scripts/standalone/backup.sh"), "--work-dir", str(w_trail), "--project-name", "dalton_"],
+            env=r9_env, capture_output=True, text=True, timeout=15,
+        )
+        assert "compose -p dalton_ " in r9_docker_log.read_text(encoding="utf-8")
+
+        lock_trail = Path("/tmp/dalton-dalton_core-.restore.lock")
+        r9_docker_log.unlink(missing_ok=True)
+        try:
+            subprocess.run(
+                ["bash", str(REPO_ROOT / "scripts/standalone/restore.sh"), "--work-dir", str(w_trail), "--backup-dir", str(bak_stub)],
+                env=r9_env, capture_output=True, text=True, timeout=15,
+            )
+            assert "compose -p dalton_core- " in r9_docker_log.read_text(encoding="utf-8")
+        finally:
+            if lock_trail.is_dir():
+                lock_trail.rmdir()
+            elif lock_trail.exists():
+                lock_trail.unlink()
+
+        # 7b. upgrade.sh lowercases `.env` COMPOSE_PROJECT_NAME (`Dalton_Core-`) before passing `--project-name` to backup.sh
+        rel_r9 = tmp_path / "r9-rel"
+        (rel_r9 / "scripts/standalone").mkdir(parents=True)
+        (rel_r9 / "deploy/standalone").mkdir(parents=True)
+        for req in (
+            "docker-compose.yml", "docker-compose.core.yml",
+            "scripts/standalone/migrate.sh", "scripts/standalone/restore.sh", "deploy/standalone/Caddyfile",
+        ):
+            (rel_r9 / req).write_text("stub\n", encoding="utf-8")
+        upg_bak_args = tmp_path / "r9-upg-bak-args.txt"
+        (rel_r9 / "scripts/standalone/backup.sh").write_text(
+            f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" > "{upg_bak_args}"\nexit 1\n',
+            encoding="utf-8",
+        )
+        subprocess.run(
+            [
+                "bash", str(REPO_ROOT / "scripts/standalone/upgrade.sh"),
+                "--work-dir", str(w_trail), "--release-dir", str(rel_r9),
+            ],
+            env=r9_env, capture_output=True, text=True, timeout=15,
+        )
+        assert "--project-name dalton_core-" in upg_bak_args.read_text(encoding="utf-8")
+
+        # 7c. Invalid `.env` COMPOSE_PROJECT_NAME (e.g. `Bad.Dot`) rejected with exit 2 by all 3 scripts
+        w_bad_env = tmp_path / "r9-work-bad-env"
+        w_bad_env.mkdir()
+        (w_bad_env / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_bad_env / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_bad_env / ".env").write_text("COMPOSE_PROJECT_NAME=Bad.Dot\nDB_HOST=postgres\n", encoding="utf-8")
+        for s_name, s_args in (
+            ("backup.sh", ["--work-dir", str(w_bad_env)]),
+            ("restore.sh", ["--work-dir", str(w_bad_env), "--backup-dir", str(bak_stub)]),
+            ("upgrade.sh", ["--work-dir", str(w_bad_env), "--release-dir", str(rel_r9)]),
+        ):
+            res_bad_env = subprocess.run(
+                ["bash", str(REPO_ROOT / "scripts/standalone" / s_name), *s_args],
+                env=r9_env, capture_output=True, text=True, timeout=15,
+            )
+            assert res_bad_env.returncode == 2, f"{s_name} should reject Bad.Dot in .env with exit 2: {res_bad_env.stderr}"
+
+        # Item 8: Directory name fallback `Dalton.Release` -> `dalton-release` consistently across all 3 scripts
+        w_dir_rel = tmp_path / "Dalton.Release"
+        w_dir_rel.mkdir()
+        (w_dir_rel / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_dir_rel / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_dir_rel / ".env").write_text("DB_HOST=postgres\n", encoding="utf-8")
+
+        r9_docker_log.unlink(missing_ok=True)
+        subprocess.run(
+            ["bash", str(REPO_ROOT / "scripts/standalone/backup.sh"), "--work-dir", str(w_dir_rel)],
+            env=r9_env, capture_output=True, text=True, timeout=15,
+        )
+        assert "compose -p dalton-release " in r9_docker_log.read_text(encoding="utf-8")
+
+        lock_dir_rel = Path("/tmp/dalton-dalton-release.restore.lock")
+        r9_docker_log.unlink(missing_ok=True)
+        try:
+            subprocess.run(
+                ["bash", str(REPO_ROOT / "scripts/standalone/restore.sh"), "--work-dir", str(w_dir_rel), "--backup-dir", str(bak_stub)],
+                env=r9_env, capture_output=True, text=True, timeout=15,
+            )
+            assert "compose -p dalton-release " in r9_docker_log.read_text(encoding="utf-8")
+        finally:
+            if lock_dir_rel.is_dir():
+                lock_dir_rel.rmdir()
+            elif lock_dir_rel.exists():
+                lock_dir_rel.unlink()
+
+        upg_bak_args.unlink(missing_ok=True)
+        subprocess.run(
+            [
+                "bash", str(REPO_ROOT / "scripts/standalone/upgrade.sh"),
+                "--work-dir", str(w_dir_rel), "--release-dir", str(rel_r9),
+            ],
+            env=r9_env, capture_output=True, text=True, timeout=15,
+        )
+        assert "--project-name dalton-release" in upg_bak_args.read_text(encoding="utf-8")
+
+        # Item 9: Multiple non-empty other databases in restore.sh are joined with `, ` (comma + space)
+        proj_multi_db = f"r9-multi-db-{os.getpid()}"
+        w_mdb = tmp_path / "r9-work-mdb"
+        w_mdb.mkdir()
+        (w_mdb / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_mdb / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+        (w_mdb / "agent_config.yaml").write_text('storage:\n  provider: "none"\n', encoding="utf-8")
+        (w_mdb / ".env").write_text(
+            f"COMPOSE_PROJECT_NAME={proj_multi_db}\nDB_HOST=postgres\nDB_USER=postgres\nDB_PASSWORD=pg\nDB_NAME=postgres\n",
+            encoding="utf-8",
+        )
+        mdb_bin = tmp_path / "r9-mdb-bin"
+        mdb_bin.mkdir()
+        (mdb_bin / "flock").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (mdb_bin / "flock").chmod(0o755)
+        (mdb_bin / "docker").write_text(
+            "#!/usr/bin/env bash\n"
+            'if [[ "$*" == *" config --format json"* ]]; then echo \'{"services":{"backend":{"environment":{}}}}\'; exit 0; fi\n'
+            'if [[ "$*" == *" ps --status running --services"* ]]; then echo "postgres"; exit 0; fi\n'
+            'if [[ "$*" == *" pg_isready "* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *" pg_restore --list"* ]]; then exit 0; fi\n'
+            'if [[ "$*" == *"current_setting(\'is_superuser\')"* ]]; then echo "on"; exit 0; fi\n'
+            'if [[ "$*" == *"FROM pg_database"* ]]; then printf "analytics\\nbilling\\npostgres\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" -d analytics "* ]]; then printf "1\\t0\\t0\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" -d billing "* ]]; then printf "2\\t0\\t0\\n"; exit 0; fi\n'
+            'if [[ "$*" == *" -d postgres "* ]]; then printf "0\\t0\\t0\\n"; exit 0; fi\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        (mdb_bin / "docker").chmod(0o755)
+        mdb_env = os.environ.copy()
+        mdb_env["PATH"] = f"{mdb_bin}:{mdb_env.get('PATH', '')}"
+        lock_mdb = Path(f"/tmp/dalton-{proj_multi_db}.restore.lock")
+        try:
+            res_mdb = subprocess.run(
+                [
+                    "bash", str(REPO_ROOT / "scripts/standalone/restore.sh"),
+                    "--work-dir", str(w_mdb), "--backup-dir", str(bak_stub),
+                ],
+                env=mdb_env, capture_output=True, text=True, timeout=15,
+            )
+            assert res_mdb.returncode != 0
+            assert "（analytics, billing）" in res_mdb.stderr, (
+                f"Expected comma+space joined DB list in stderr, got:\n{res_mdb.stderr}"
+            )
+            assert "down -v" not in res_mdb.stderr
+        finally:
+            if lock_mdb.is_dir():
+                lock_mdb.rmdir()
+            elif lock_mdb.exists():
+                lock_mdb.unlink()

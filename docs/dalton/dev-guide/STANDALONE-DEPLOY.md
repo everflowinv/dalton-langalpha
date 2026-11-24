@@ -366,11 +366,21 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
 
 #### 在已有实例上覆盖恢复（含升级迁移后回滚）
 
-> **危险操作警告**：下列第 2 步的 `docker compose -p "${PROJECT_NAME}" ... down -v` **会永久删除当前实例的数据库、对象存储、缓存与证书卷中的所有当前数据**，且无法撤回。执行前**必须**先完成第 1 步，确认手里有一份校验通过且完整可用的备份！
+> **危险操作警告**：下列第 3 步的 `docker compose -p "$PROJECT" ... down -v` **会永久删除目标项目的数据库、对象存储、缓存与证书卷中的所有当前数据**，且无法撤回。执行前**必须**先完成第 1–2 步，确认目标项目名无误、手里有一份校验通过且完整可用的备份，且实例里除应用库外没有需要保留的其他数据库！
 
 如果需要用备份覆盖已有数据的实例（包括升级执行数据库迁移后需要回滚到升级前状态），请按以下人工步骤依次操作（以下以部署目录 `/opt/dalton`、备份目录 `/var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3` 为例；启用 HTTPS 时在所有 `docker compose` 命令中一并加上 `-f deploy/standalone/docker-compose.tls.yml`，IPv6 回环加上 `-f deploy/standalone/docker-compose.tls.ipv6.yml`）：
 
-1. **确认有一份校验通过的备份，并确认实例里只有应用库**：检查 `backup.sh` 输出中是否包含 PostgreSQL、MinIO、Caddy 的 `OK: ... verified` 校验结果与 `== Backup Complete ==`，并在备份目录中重新核验 `SHA256SUMS`：
+1. **先确定唯一的目标项目名 `PROJECT`**（后面所有检查数据库、列出卷、`down -v` 与恢复命令都必须使用这同一个 `$PROJECT`，切勿中途改用其他项目名）：
+
+   这里填的就是 `upgrade.sh` / `restore.sh` 输出里显示的那个项目名（例如 `label=com.docker.compose.project=<项目名>` 或 `docker compose -p <项目名>` 中的值；若未显式传入 `--project-name`，对应 `.env` 里转小写后的 `COMPOSE_PROJECT_NAME`，`.env` 未设置时由部署目录名推导）：
+   ```bash
+   cd /opt/dalton
+   PROJECT=<项目名>
+   test -n "$PROJECT"
+   echo "目标项目名: ${PROJECT}"
+   ```
+
+2. **确认有一份校验通过的备份，并检查实例里应用库以外的数据库有没有用户对象**：检查 `backup.sh` 输出中是否包含 PostgreSQL、MinIO、Caddy 的 `OK: ... verified` 校验结果与 `== Backup Complete ==`，并在备份目录中重新核验 `SHA256SUMS`：
    ```bash
    cd /var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3
    sha256sum -c SHA256SUMS
@@ -378,41 +388,48 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
    ```
    确认全部文件返回 `OK`、`postgres.dump` 与 `minio-objects.tar.gz` 完整存在，且同期 `.env`（或 `env.enc` 与口令文件）可用；若打算保留当前 `.env`，请先核对 `manifest.json` 里的桶名、端点与键前缀是否与实际生效的 `backend` 配置一致。
 
-   **执行 `down -v` 之前，先确认 PostgreSQL 实例里只有应用库**（`backup.sh` 只备份 `.env` 里的 `DB_NAME`，而 `down -v` 会删除整个 PostgreSQL 数据卷；如果实例里还有其他业务数据库，请先自行备份并确认不再需要）：
+   **执行 `down -v` 之前，逐个检查该实例所有非模板库中是否存在用户对象**（`backup.sh` 只备份 `.env` 里的 `DB_NAME`，而 `down -v` 会删除整个 PostgreSQL 数据卷；下面循环会输出每个非模板库的用户对象数量，若除应用库 `DB_NAME` 之外还有任意库的结果大于 0，说明该库里有数据，请先自行备份并确认不再需要）：
    ```bash
    cd /opt/dalton
-   # <项目名> 从 .env 读取；若修改过 DB_USER，请将 postgres 替换为对应用户名
-   docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T postgres psql -U postgres -l
+   # 若修改过 DB_USER，请将下方 DB_USER 替换为 .env 中的超级用户名
+   DB_USER=postgres
+   docker compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T postgres \
+     psql -U "$DB_USER" -d template1 -Atqc \
+     "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname NOT IN ('template0','template1') ORDER BY datname;" \
+   | tr -d '\r' | while IFS= read -r db; do
+     [ -z "$db" ] && continue
+     cnt="$(docker compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T postgres \
+       psql -U "$DB_USER" -d "$db" -Atqc \
+       "SELECT (SELECT count(*) FROM pg_class WHERE relnamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname IN ('pg_catalog','information_schema') OR nspname LIKE 'pg_toast%' OR nspname LIKE 'pg_temp%')) + (SELECT count(*) FROM pg_proc WHERE pronamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname IN ('pg_catalog','information_schema') OR nspname LIKE 'pg_toast%' OR nspname LIKE 'pg_temp%')) + (SELECT count(*) FROM pg_type WHERE typnamespace NOT IN (SELECT oid FROM pg_namespace WHERE nspname IN ('pg_catalog','information_schema') OR nspname LIKE 'pg_toast%' OR nspname LIKE 'pg_temp%'));" </dev/null | tr -d '\r')"
+     printf '%s\tuser_objects=%s\n' "$db" "$cnt"
+   done
    ```
 
-2. **从 `.env` 读取项目名，列出该项目下的完整卷清单并人工确认后，执行 `down -v` 删除本项目的卷**（仅删除当前项目的容器与数据卷，保留 `/opt/dalton/.env` 与发行文件）：
+3. **列出项目 `"$PROJECT"` 下的完整卷清单并人工确认后，执行 `down -v` 删除本项目的卷**（仅删除当前项目的容器与数据卷，保留 `/opt/dalton/.env` 与发行文件）：
    ```bash
    cd /opt/dalton
-
-   # 严格从 .env 读取项目名（不读 shell 环境变量）
-   PROJECT_NAME="$(python3 -c 'import re; m=[re.match(r"^\s*(?:export\s+)?COMPOSE_PROJECT_NAME\s*[=:]\s*[\"'"'"']?([^\"'"'"'#\s]+)", l) for l in open(".env")]; vals=[x.group(1) for x in m if x]; print(vals[-1] if vals else "")')"
-   test -n "$PROJECT_NAME"
-   echo "目标项目名: ${PROJECT_NAME}"
 
    # 按项目标签列出完整卷清单（包含已移除容器残留的数据卷），请逐项人工确认
-   docker volume ls --filter "label=com.docker.compose.project=${PROJECT_NAME}"
+   docker volume ls --filter "label=com.docker.compose.project=${PROJECT}"
    ```
-   **请仔细核对上面输出的完整卷清单**，确认每一个卷均属于当前要重置的项目且第 1 步备份已校验通过，然后显式指定项目与 `.env` 删除容器与卷：
+   **请仔细核对上面输出的完整卷清单**，确认每一个卷均属于当前要重置的项目 `"$PROJECT"` 且第 2 步备份与数据库检查均已通过，然后显式指定 `-p "$PROJECT"` 与 `.env` 删除容器与卷：
    ```bash
    # 回环 HTTP 模式（启用 HTTPS 时额外加上 -f deploy/standalone/docker-compose.tls.yml）
-   docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env down -v
+   docker compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.core.yml --env-file .env down -v
    ```
 
-3. **使用 `restore.sh` 恢复到这个空实例**：
+4. **使用 `restore.sh`（显式指定 `--project-name "$PROJECT"`）恢复到这个空实例**：
    ```bash
    cd /opt/dalton
 
    # 使用当前目录保留的 .env 恢复数据
    bash scripts/standalone/restore.sh \
+     --project-name "$PROJECT" \
      --backup-dir /var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3
 
    # 如需同时用备份中的 env.enc 替换当前 .env，附加 --env-passphrase-file 与 --replace-env
    # bash scripts/standalone/restore.sh \
+   #   --project-name "$PROJECT" \
    #   --backup-dir /var/backups/dalton/dalton-backup-20260101-023000Z-a1b2c3 \
    #   --env-passphrase-file /etc/dalton/backup.pass \
    #   --replace-env
@@ -422,17 +439,17 @@ v1 的 `scripts/standalone/restore.sh` **只恢复到空的目标实例**（不�
 
 如果 `restore.sh` 在**写入 `.env`（或开始写入对象/数据库）之后**的任何一步失败（例如对象上传中断、`pg_restore` / `migrate` 报错、DB 对象引用核对发现缺失、容器启动或健康探测失败），目标实例会处于**半成品**状态——此时直接重跑 `restore.sh` 会被空实例守卫拒绝。
 
-**备份目录本身只读、完全不受影响。** 请直接按上方 §6.2「在已有实例上覆盖恢复」的第 2–3 步处理：
-1. 用 `docker volume ls --filter "label=com.docker.compose.project=${PROJECT_NAME}"` 确认本项目的完整卷清单；
-2. 执行 `docker compose -p "${PROJECT_NAME}" -f <文件>... --env-file .env down -v` 清理半成品实例；
-3. 排查并修正导致上次失败的原因后，重新运行 `restore.sh` 完成恢复。
+**备份目录本身只读、完全不受影响。** 请直接按上方 §6.2「在已有实例上覆盖恢复」的第 1 步与第 3–4 步处理（沿用同一个 `PROJECT=<项目名>`）：
+1. 用 `docker volume ls --filter "label=com.docker.compose.project=${PROJECT}"` 确认本项目的完整卷清单；
+2. 执行 `docker compose -p "$PROJECT" -f <文件>... --env-file .env down -v` 清理半成品实例；
+3. 排查并修正导致上次失败的原因后，重新运行 `restore.sh --project-name "$PROJECT" ...` 完成恢复。
 
 #### 恢复后的确认方法
 
-1. 检查容器状态与桶配置（`<项目名>` 从 `.env` 读取，启用 HTTPS 时加上 `-f deploy/standalone/docker-compose.tls.yml`）：
+1. 检查容器状态与桶配置（沿用同一个 `PROJECT=<项目名>`，启用 HTTPS 时加上 `-f deploy/standalone/docker-compose.tls.yml`）：
    ```bash
    cd /opt/dalton
-   docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env ps
+   docker compose -p "$PROJECT" -f docker-compose.yml -f docker-compose.core.yml --env-file .env ps
    grep -E '^DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME=' .env
    ```
 2. 打开 Web UI，确认历史工作区、对话线程回放与既有上传文件均可正常打开与下载，并尝试上传一个新文件验证对象存储可写。

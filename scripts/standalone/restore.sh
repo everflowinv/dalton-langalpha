@@ -205,15 +205,28 @@ print_non_empty_manual_hint() {
 
 validate_project_name() {
   local name="$1"
+  local source_label="${2:---project-name}"
   local LC_ALL=C
-  if [[ -z "$name" || "$name" == *$'\n'* || ! "$name" =~ ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ ]]; then
-    err "Invalid --project-name '${name}': must match ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ (lowercase ASCII letters, digits, hyphens, underscores; must start and end with a letter or digit)."
+  if [[ -z "$name" || "$name" == *$'\n'* || ! "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    err "Invalid ${source_label} '${name}': must match ^[a-z0-9][a-z0-9_-]*$ (lowercase ASCII letters, digits, hyphens, underscores; must start with a letter or digit)."
     exit 2
   fi
 }
 
+normalize_env_project_name() {
+  local raw="$1"
+  printf '%s' "$raw" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+}
+
+sanitize_project_name() {
+  local raw="$1"
+  local cleaned
+  cleaned="$(printf '%s' "$raw" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed -E 's/[^a-z0-9_-]+/-/g; s/^[^a-z0-9]+//; s/[-_]+$//')"
+  printf '%s' "${cleaned:-dalton-core}"
+}
+
 if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
-  validate_project_name "$PROJECT_NAME_ARG"
+  validate_project_name "$PROJECT_NAME_ARG" "--project-name"
 fi
 
 if [[ -z "$BACKUP_DIR" ]]; then
@@ -307,7 +320,7 @@ ENV_WRITE_TMP=""
 ENV_FROM_BACKUP=0
 CANDIDATE_ENV=""
 ACTIVE_COMPOSE_ENV=""
-PREFLIGHT_COMPOSE_OVERRIDE=""
+RESTORE_COMPOSE_OVERRIDE=""
 MINIO_MANIFEST_TMP=""
 COMPOSE_CFG_TMP=""
 
@@ -377,8 +390,8 @@ cleanup() {
   if [[ -n "$STAGED_ENV_TMP" && -f "$STAGED_ENV_TMP" ]]; then
     rm -f "$STAGED_ENV_TMP"
   fi
-  if [[ -n "$PREFLIGHT_COMPOSE_OVERRIDE" && -f "$PREFLIGHT_COMPOSE_OVERRIDE" ]]; then
-    rm -f "$PREFLIGHT_COMPOSE_OVERRIDE"
+  if [[ -n "$RESTORE_COMPOSE_OVERRIDE" && -f "$RESTORE_COMPOSE_OVERRIDE" ]]; then
+    rm -f "$RESTORE_COMPOSE_OVERRIDE"
   fi
   if [[ -n "$MINIO_MANIFEST_TMP" && -f "$MINIO_MANIFEST_TMP" ]]; then
     rm -f "$MINIO_MANIFEST_TMP"
@@ -514,13 +527,13 @@ fi
 if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
   LOCK_PROJECT="$PROJECT_NAME_ARG"
 else
-  LOCK_PROJECT="$(read_env_file_var "$CANDIDATE_ENV" "COMPOSE_PROJECT_NAME" "")"
-  if [[ -z "$LOCK_PROJECT" ]]; then
-    LOCK_PROJECT="$(basename "$WORK_DIR")"
-  fi
-  if [[ ! "$LOCK_PROJECT" =~ ^[a-zA-Z0-9._-]+$ || "$LOCK_PROJECT" == "." || "$LOCK_PROJECT" == ".." ]]; then
-    err "Invalid COMPOSE_PROJECT_NAME '${LOCK_PROJECT}': must match ^[a-zA-Z0-9._-]+$."
-    exit 1
+  RAW_ENV_PROJECT="$(read_env_file_var "$CANDIDATE_ENV" "COMPOSE_PROJECT_NAME" "")"
+  if [[ -n "$RAW_ENV_PROJECT" ]]; then
+    LOCK_PROJECT="$(normalize_env_project_name "$RAW_ENV_PROJECT")"
+    validate_project_name "$LOCK_PROJECT" "COMPOSE_PROJECT_NAME"
+  else
+    LOCK_PROJECT="$(sanitize_project_name "$(basename "$WORK_DIR")")"
+    validate_project_name "$LOCK_PROJECT" "COMPOSE_PROJECT_NAME"
   fi
 fi
 COMPOSE_PROJECT="$LOCK_PROJECT"
@@ -660,12 +673,20 @@ for cf in compose_files:
 PY
 )
 
-# When .env will come from backup, override `env_file: .env` during preflight so
-# ${WORK_DIR}/.env is neither created nor overwritten until target-empty checks pass.
-if [[ "$ENV_FROM_BACKUP" -eq 1 ]]; then
-  PREFLIGHT_COMPOSE_OVERRIDE="$(mktemp "${TMPDIR:-/tmp}/dalton-restore-preflight.XXXXXX")"
-  chmod 600 "$PREFLIGHT_COMPOSE_OVERRIDE"
-  python3 - "$CANDIDATE_ENV" "${RESOLVED_COMPOSE_FILES[@]}" > "$PREFLIGHT_COMPOSE_OVERRIDE" <<'PY'
+# Generate an env_file !override file pointing services that reference `.env` at the
+# decrypted env file. When restoring from env.enc we MUST keep the EXACT same compose
+# file list and env_file list across both preflight (`compose config` + empty checks)
+# and formal writes (Steps 4-7); otherwise removing `!override` after preflight would
+# re-enable extra `env_file` entries (e.g. `storage.env` from an additional compose file)
+# that were excluded during preflight comparison, causing formal writes to diverge from
+# what preflight validated. During preflight the override points to $CANDIDATE_ENV so
+# ${WORK_DIR}/.env is untouched until all checks pass; after writing ${ENV_FILE}
+# atomically, the same override is updated in-place to point to the byte-identical
+# ${ENV_FILE} and kept through formal writes until cleanup on exit.
+write_compose_env_override() {
+  local target_env_path="$1"
+  local out_path="$2"
+  python3 - "$target_env_path" "${RESOLVED_COMPOSE_FILES[@]}" > "$out_path" <<'PY'
 import json, re, sys
 
 env_path = sys.argv[1]
@@ -716,16 +737,22 @@ if svcs:
         print("    env_file: !override")
         print(f"      - {json.dumps(env_path)}")
 PY
-  if [[ ! -s "$PREFLIGHT_COMPOSE_OVERRIDE" ]]; then
-    rm -f "$PREFLIGHT_COMPOSE_OVERRIDE"
-    PREFLIGHT_COMPOSE_OVERRIDE=""
+}
+
+if [[ "$ENV_FROM_BACKUP" -eq 1 ]]; then
+  RESTORE_COMPOSE_OVERRIDE="$(mktemp "${TMPDIR:-/tmp}/dalton-restore-override.XXXXXX")"
+  chmod 600 "$RESTORE_COMPOSE_OVERRIDE"
+  write_compose_env_override "$CANDIDATE_ENV" "$RESTORE_COMPOSE_OVERRIDE"
+  if [[ ! -s "$RESTORE_COMPOSE_OVERRIDE" ]]; then
+    rm -f "$RESTORE_COMPOSE_OVERRIDE"
+    RESTORE_COMPOSE_OVERRIDE=""
   fi
 fi
 
 ACTIVE_COMPOSE_ENV="$CANDIDATE_ENV"
 compose_cmd() {
-  if [[ -n "$PREFLIGHT_COMPOSE_OVERRIDE" && -f "$PREFLIGHT_COMPOSE_OVERRIDE" ]]; then
-    env "${ENV_UNSET_ARGS[@]}" docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" -f "$PREFLIGHT_COMPOSE_OVERRIDE" --env-file "$ACTIVE_COMPOSE_ENV" --project-directory "$WORK_DIR" "$@"
+  if [[ -n "$RESTORE_COMPOSE_OVERRIDE" && -f "$RESTORE_COMPOSE_OVERRIDE" ]]; then
+    env "${ENV_UNSET_ARGS[@]}" docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" -f "$RESTORE_COMPOSE_OVERRIDE" --env-file "$ACTIVE_COMPOSE_ENV" --project-directory "$WORK_DIR" "$@"
   else
     env "${ENV_UNSET_ARGS[@]}" docker compose -p "$COMPOSE_PROJECT" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ACTIVE_COMPOSE_ENV" --project-directory "$WORK_DIR" "$@"
   fi
@@ -916,7 +943,8 @@ if (( ${#NON_EMPTY_OTHER_DBS[@]} > 0 )); then
   if [[ -n "$NON_EMPTY_APP_DESC" ]]; then
     err "$NON_EMPTY_APP_DESC"
   fi
-  OTHER_DB_LIST="$(IFS=', '; printf '%s' "${NON_EMPTY_OTHER_DBS[*]}")"
+  OTHER_DB_LIST="$(printf '%s, ' "${NON_EMPTY_OTHER_DBS[@]}")"
+  OTHER_DB_LIST="${OTHER_DB_LIST%, }"
   err "这个 PostgreSQL 实例里还有其他数据库（${OTHER_DB_LIST}），backup.sh 只备份 ${CFG_DB_NAME}。请先自行备份这些库，确认不再需要后再按手册清空实例（参见 ${MANUAL_OVERWRITE_REF}）。"
   exit 1
 fi
@@ -1041,9 +1069,13 @@ if [[ "$ENV_FROM_BACKUP" -eq 1 ]]; then
   mv "$ENV_WRITE_TMP" "$ENV_FILE"
   ENV_WRITE_TMP=""
   ACTIVE_COMPOSE_ENV="$ENV_FILE"
-  if [[ -n "$PREFLIGHT_COMPOSE_OVERRIDE" && -f "$PREFLIGHT_COMPOSE_OVERRIDE" ]]; then
-    rm -f "$PREFLIGHT_COMPOSE_OVERRIDE"
-    PREFLIGHT_COMPOSE_OVERRIDE=""
+  # Keep the same compose file list and env_file `!override` active for formal writes
+  # (only retargeting its path to the byte-identical ${ENV_FILE} so $STAGED_ENV_TMP can
+  # be deleted immediately). Dropping `!override` here would re-enable extra env_file
+  # entries (e.g. storage.env) that preflight's `compose config` did not evaluate.
+  if [[ -n "$RESTORE_COMPOSE_OVERRIDE" && -f "$RESTORE_COMPOSE_OVERRIDE" ]]; then
+    write_compose_env_override "$ENV_FILE" "$RESTORE_COMPOSE_OVERRIDE"
+    chmod 600 "$RESTORE_COMPOSE_OVERRIDE"
   fi
   if [[ -n "$STAGED_ENV_TMP" && -f "$STAGED_ENV_TMP" ]]; then
     rm -f "$STAGED_ENV_TMP"

@@ -188,15 +188,28 @@ fmt_cmd() {
 
 validate_project_name() {
   local name="$1"
+  local source_label="${2:---project-name}"
   local LC_ALL=C
-  if [[ -z "$name" || "$name" == *$'\n'* || ! "$name" =~ ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ ]]; then
-    err "Invalid --project-name '${name}': must match ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ (lowercase ASCII letters, digits, hyphens, underscores; must start and end with a letter or digit)."
+  if [[ -z "$name" || "$name" == *$'\n'* || ! "$name" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; then
+    err "Invalid ${source_label} '${name}': must match ^[a-z0-9][a-z0-9_-]*$ (lowercase ASCII letters, digits, hyphens, underscores; must start with a letter or digit)."
     exit 2
   fi
 }
 
+normalize_env_project_name() {
+  local raw="$1"
+  printf '%s' "$raw" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+}
+
+sanitize_project_name() {
+  local raw="$1"
+  local cleaned
+  cleaned="$(printf '%s' "$raw" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C sed -E 's/[^a-z0-9_-]+/-/g; s/^[^a-z0-9]+//; s/[-_]+$//')"
+  printf '%s' "${cleaned:-dalton-core}"
+}
+
 if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
-  validate_project_name "$PROJECT_NAME_ARG"
+  validate_project_name "$PROJECT_NAME_ARG" "--project-name"
 fi
 
 if [[ -n "$RELEASE_TAR" && -n "$RELEASE_DIR" ]]; then
@@ -274,13 +287,6 @@ PY
   fi
 }
 
-sanitize_project_name() {
-  local raw="$1"
-  local cleaned
-  cleaned="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g; s/^[^a-z0-9]+//; s/[-_]+$//')"
-  printf '%s' "${cleaned:-dalton-core}"
-}
-
 # Read deployment settings strictly from .env (never shell environment).
 DB_HOST="$(read_env_file_var "$ENV_FILE" "DB_HOST" "postgres")"
 if [[ "$DB_HOST" != "postgres" ]]; then
@@ -292,9 +298,13 @@ fi
 if [[ "$PROJECT_NAME_EXPLICIT" -eq 1 ]]; then
   PROJECT_NAME="$PROJECT_NAME_ARG"
 else
-  PROJECT_NAME="$(read_env_file_var "$ENV_FILE" "COMPOSE_PROJECT_NAME" "")"
-  if [[ -z "$PROJECT_NAME" ]]; then
+  RAW_ENV_PROJECT="$(read_env_file_var "$ENV_FILE" "COMPOSE_PROJECT_NAME" "")"
+  if [[ -n "$RAW_ENV_PROJECT" ]]; then
+    PROJECT_NAME="$(normalize_env_project_name "$RAW_ENV_PROJECT")"
+    validate_project_name "$PROJECT_NAME" "COMPOSE_PROJECT_NAME"
+  else
     PROJECT_NAME="$(sanitize_project_name "$(basename "$WORK_DIR")")"
+    validate_project_name "$PROJECT_NAME" "COMPOSE_PROJECT_NAME"
   fi
 fi
 DOMAIN="$(read_env_file_var "$ENV_FILE" "DOMAIN" "localhost")"
