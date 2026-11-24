@@ -23,6 +23,7 @@ import { isDaltonAuth } from '@/config/daltonAuth';
 import { queryKeys } from '@/lib/queryKeys';
 import { useCopyShareLink } from '@/hooks/useCopyShareLink';
 import { useLocale } from '@/hooks/useLocale';
+import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(colleague-access): gate auto-publish pause tracking on colleague_sharing capability
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { useWorkspace } from '@/hooks/useWorkspace'; // DALTON-HOOK(colleague-access): read workspace auto-publish pause state & token
 import {
@@ -358,7 +359,14 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   const qc = useQueryClient();
   const root = useWorkspaceFolders()?.rootDir;
   // DALTON-HOOK(monitors): caller tier gates 4-tier visibility (external=own only, admin=public allowed)
-  const { callerTier, colleagueSharingEnabled = false } = useTeamCredentials();
+  const {
+    callerTier,
+    colleagueSharingEnabled = false,
+    colleagueSharingKnown = true,
+  } = useTeamCredentials();
+  // DALTON-HOOK(colleague-access): gate auto-publish pause tracking on colleague_sharing capability
+  const { hasCapability } = useCapabilities();
+  const colleagueSharingCapable = hasCapability('colleague_sharing');
   const isExternal = callerTier === 'external';
   const isAdmin = callerTier === 'admin' || !isDaltonAuth;
 
@@ -399,14 +407,17 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   const [copiedPermalink, setCopiedPermalink] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   // DALTON-HOOK(colleague-access): read workspace auto-publish pause state & CAS token only when colleague sharing is enabled
-  const trackAutoPublishPause = !unshareOnly && colleagueSharingEnabled;
-  const workspaceQuery = useWorkspace(trackAutoPublishPause ? workspaceId : null);
+  const trackWorkspacePause =
+    !unshareOnly && colleagueSharingCapable && colleagueSharingKnown && colleagueSharingEnabled;
+  const trackPublishResponsePause =
+    !unshareOnly && colleagueSharingCapable && (!colleagueSharingKnown || colleagueSharingEnabled);
+  const workspaceQuery = useWorkspace(trackWorkspacePause ? workspaceId : null);
   const refetchWorkspace = workspaceQuery.refetch;
   useEffect(() => {
-    if (trackAutoPublishPause && workspaceId && refetchWorkspace) {
+    if (trackWorkspacePause && workspaceId && refetchWorkspace) {
       void refetchWorkspace();
     }
-  }, [trackAutoPublishPause, workspaceId, refetchWorkspace]);
+  }, [trackWorkspacePause, workspaceId, refetchWorkspace]);
   const workspaceSnapshotRef = useRef<{
     data: typeof workspaceQuery.data;
     updatedAt: number;
@@ -414,6 +425,14 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
   workspaceSnapshotRef.current = {
     data: workspaceQuery.data,
     updatedAt: workspaceQuery.dataUpdatedAt ?? 0,
+  };
+  const pauseTrackingRef = useRef({
+    trackWorkspacePause,
+    trackPublishResponsePause,
+  });
+  pauseTrackingRef.current = {
+    trackWorkspacePause,
+    trackPublishResponsePause,
   };
   const [pauseOverride, setPauseOverride] = useState<{
     paused: boolean;
@@ -427,22 +446,26 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
     ((workspaceQuery.dataUpdatedAt ?? 0) > pauseOverride.baseUpdatedAt ||
       workspaceQuery.data !== pauseOverride.baseData);
   const pauseOverrideActive = pauseOverride !== null && !workspaceRefreshedAfterOverride;
-  const autoPublishPaused = trackAutoPublishPause
+  const autoPublishPaused = trackWorkspacePause
     ? (pauseOverrideActive
         ? pauseOverride.paused
         : Boolean(workspaceQuery.data?.auto_publish_paused))
-    : false;
-  const autoPublishPauseToken = trackAutoPublishPause
+    : trackPublishResponsePause && pauseOverrideActive
+      ? pauseOverride.paused
+      : false;
+  const autoPublishPauseToken = trackWorkspacePause
     ? (pauseOverrideActive
         ? pauseOverride.token
         : (workspaceQuery.data?.auto_publish_pause_token ?? null))
-    : null;
+    : trackPublishResponsePause && pauseOverrideActive
+      ? pauseOverride.token
+      : null;
   const autoPublishPauseNotice =
-    trackAutoPublishPause &&
+    trackPublishResponsePause &&
     autoPublishPaused &&
     pauseOverride?.notice &&
     (pauseOverrideActive ||
-      workspaceQuery.data?.auto_publish_pause_token === pauseOverride.token)
+      (trackWorkspacePause && workspaceQuery.data?.auto_publish_pause_token === pauseOverride.token))
       ? pauseOverride.notice
       : null;
 
@@ -538,6 +561,12 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
     if (!artifact || !canPublish) return;
     const loads = pageLoadsOf(artifact.workspace_id, artifact.path);
     const statusAt = statusQuery.dataUpdatedAt;
+    const workspaceUpdatedAtAtRequest = Math.max(
+      workspaceQuery.dataUpdatedAt ?? 0,
+      trackWorkspacePause
+        ? (qc.getQueryState(queryKeys.workspaces.detail(workspaceId))?.dataUpdatedAt ?? 0)
+        : 0,
+    );
     setOutcome(null);
     setPublishingMonitor(true);
     try {
@@ -555,34 +584,50 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
         loaded: loads.now,
         earlier: loads.earlier,
         page_sha256: status?.page_sha256 ?? undefined,
-        ...(trackAutoPublishPause && autoPublishPauseToken
+        ...(trackPublishResponsePause && autoPublishPauseToken
           ? { confirm_pause_token: autoPublishPauseToken }
           : {}),
       });
       const snapshotAtResponse = workspaceSnapshotRef.current;
+      const latestWorkspaceUpdatedAt = Math.max(
+        snapshotAtResponse.updatedAt,
+        trackWorkspacePause
+          ? (qc.getQueryState(queryKeys.workspaces.detail(workspaceId))?.dataUpdatedAt ?? 0)
+          : 0,
+      );
+      const workspaceRefreshedDuringPublish =
+        latestWorkspaceUpdatedAt > workspaceUpdatedAtAtRequest;
       setLabel('');
       qc.setQueryData(queryKeys.daltonMonitors.byArtifact(artifact.artifact_id), result.monitor);
       void qc.invalidateQueries({ queryKey: queryKeys.daltonMonitors.all });
       void qc.invalidateQueries({ queryKey: queryKeys.artifacts.pathsIn(workspaceId) });
-      if (trackAutoPublishPause) {
-        void qc.invalidateQueries({ queryKey: queryKeys.workspaces.detail(workspaceId) });
-        void qc.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
-        if (result.auto_publish_paused) {
-          setPauseOverride({
-            paused: true,
-            token: result.auto_publish_pause_token ?? null,
-            notice: result.auto_publish_pause_notice ?? null,
-            baseData: snapshotAtResponse.data,
-            baseUpdatedAt: snapshotAtResponse.updatedAt,
-          });
-        } else {
-          setPauseOverride({
-            paused: false,
-            token: null,
-            notice: null,
-            baseData: snapshotAtResponse.data,
-            baseUpdatedAt: snapshotAtResponse.updatedAt,
-          });
+      if (pauseTrackingRef.current.trackPublishResponsePause) {
+        const shouldInvalidateWorkspace =
+          pauseTrackingRef.current.trackWorkspacePause ||
+          Boolean(result.auto_publish_paused) ||
+          Boolean(pauseOverride?.paused);
+        if (shouldInvalidateWorkspace) {
+          void qc.invalidateQueries({ queryKey: queryKeys.workspaces.detail(workspaceId) });
+          void qc.invalidateQueries({ queryKey: queryKeys.workspaces.lists() });
+        }
+        if (!workspaceRefreshedDuringPublish) {
+          if (result.auto_publish_paused) {
+            setPauseOverride({
+              paused: true,
+              token: result.auto_publish_pause_token ?? null,
+              notice: result.auto_publish_pause_notice ?? null,
+              baseData: snapshotAtResponse.data,
+              baseUpdatedAt: latestWorkspaceUpdatedAt,
+            });
+          } else {
+            setPauseOverride({
+              paused: false,
+              token: null,
+              notice: null,
+              baseData: snapshotAtResponse.data,
+              baseUpdatedAt: latestWorkspaceUpdatedAt,
+            });
+          }
         }
       }
       if (result.cut === false) {

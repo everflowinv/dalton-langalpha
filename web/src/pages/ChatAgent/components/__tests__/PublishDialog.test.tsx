@@ -15,9 +15,10 @@ import userEvent from '@testing-library/user-event';
 
 import { renderWithProviders } from '@/test/utils';
 import { runAuthResets } from '@/lib/authResets';
+import { queryKeys } from '@/lib/queryKeys';
 import { notePageLoads, notePageOpen } from '@/lib/pageLoads';
-import type { Artifact, ArtifactStatus, ArtifactVersion, ShareFileEntry } from '@/types/api';
-import type { MonitorSummary } from '@/pages/Monitors/api';
+import type { Artifact, ArtifactStatus, ArtifactVersion, ShareFileEntry, Workspace } from '@/types/api';
+import type { MonitorDetail, MonitorSummary } from '@/pages/Monitors/api';
 
 vi.mock('@/components/ui/use-toast', () => ({ toast: vi.fn() }));
 
@@ -72,7 +73,53 @@ vi.mock('@/pages/Monitors/api', async (importOriginal) => {
   };
 });
 
+// DALTON-HOOK(colleague-access): optional test overrides for workspace detail, team credentials, and capabilities
+const pauseMocks = vi.hoisted(() => ({
+  credentials: null as null | { colleagueSharingEnabled: boolean; colleagueSharingKnown: boolean },
+  colleagueSharingCapable: null as null | boolean,
+}));
+
+vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/pages/ChatAgent/utils/api')>();
+  return {
+    ...actual,
+    getWorkspace: vi.fn<typeof actual.getWorkspace>(),
+  };
+});
+
+vi.mock('@/hooks/useTeamCredentials', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/useTeamCredentials')>();
+  return {
+    ...actual,
+    useTeamCredentials: () => {
+      const live = actual.useTeamCredentials();
+      return pauseMocks.credentials ? { ...live, ...pauseMocks.credentials } : live;
+    },
+  };
+});
+
+vi.mock('@/hooks/useCapabilities', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/useCapabilities')>();
+  return {
+    ...actual,
+    useCapabilities: (options?: Parameters<typeof actual.useCapabilities>[0]) => {
+      const live = actual.useCapabilities(options);
+      if (pauseMocks.colleagueSharingCapable === null) return live;
+      const nextCaps = new Set(live.capabilities);
+      if (pauseMocks.colleagueSharingCapable) nextCaps.add('colleague_sharing');
+      else nextCaps.delete('colleague_sharing');
+      return {
+        ...live,
+        capabilities: nextCaps,
+        hasCapability: (required: Parameters<typeof live.hasCapability>[0]) =>
+          actual.hasRequiredCapability(nextCaps, required),
+      };
+    },
+  };
+});
+
 import { toast } from '@/components/ui/use-toast';
+import { getWorkspace } from '@/pages/ChatAgent/utils/api';
 import {
   ensureArtifact,
   findArtifact,
@@ -91,6 +138,7 @@ const mockVersions = vi.mocked(listArtifactVersions);
 const mockUnshare = vi.mocked(unshareArtifact);
 const mockGetMonitor = vi.mocked(getMonitorByArtifact);
 const mockPublishMonitor = vi.mocked(publishMonitor);
+const mockGetWorkspace = vi.mocked(getWorkspace);
 
 const WS = 'ws-1';
 const ID = '6f1c2a7e-3b4d-4e5f-8a9b-0c1d2e3f4a5b';
@@ -224,10 +272,24 @@ const filesList = (count: number) => screen.getByRole('list', { name: new RegExp
 const publishButton = () => screen.getByRole('button', { name: 'Publish' });
 const updateButton = () => screen.getByRole('button', { name: 'Update' });
 
+function workspace(overrides: Partial<Workspace> = {}): Workspace {
+  return {
+    workspace_id: WS,
+    name: 'ws-1',
+    status: 'running',
+    is_home: false,
+    auto_publish_paused: false,
+    auto_publish_pause_token: null,
+    ...overrides,
+  };
+}
+
 describe('PublishDialog', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     runAuthResets();
+    pauseMocks.credentials = null;
+    pauseMocks.colleagueSharingCapable = null;
     mockVersions.mockResolvedValue([]);
     mockGetMonitor.mockResolvedValue(null);
   });
@@ -793,6 +855,189 @@ describe('PublishDialog', () => {
         variant: 'destructive',
       })));
       expect(screen.getByText('Private')).toBeInTheDocument();
+    });
+  });
+
+  // DALTON-HOOK(colleague-access): auto-publish pause race protection and unknown/capability gating
+  describe('auto-publish pause state', () => {
+    it('ignores a late publish response pause override when workspace detail refreshed in flight, and still refreshes detail', async () => {
+      pauseMocks.credentials = { colleagueSharingEnabled: true, colleagueSharingKnown: true };
+      pauseMocks.colleagueSharingCapable = true;
+      serve(artifact());
+      mockStatus.mockResolvedValue(status([ENTRY_ROW]));
+      mockGetWorkspace.mockResolvedValue(workspace({
+        auto_publish_paused: true,
+        auto_publish_pause_token: 'tok-1',
+      }));
+
+      let resolvePublish!: (value: MonitorDetail) => void;
+      mockPublishMonitor.mockImplementationOnce(() => new Promise<MonitorDetail>((resolve) => {
+        resolvePublish = resolve;
+      }));
+
+      const user = userEvent.setup();
+      const { queryClient } = renderDialog();
+
+      expect(
+        await screen.findByText(/Auto-update is paused because this workspace read a colleague's content/),
+      ).toBeInTheDocument();
+      await waitFor(() => expect(publishButton()).toBeEnabled());
+      await user.click(publishButton());
+
+      await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(1));
+      expect(mockPublishMonitor.mock.calls[0][0]).toMatchObject({ confirm_pause_token: 'tok-1' });
+
+      // While the publish request is still in flight, workspace detail refreshes (e.g. another tab resumed auto-publish).
+      mockGetWorkspace.mockResolvedValue(workspace({
+        auto_publish_paused: false,
+        auto_publish_pause_token: null,
+      }));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      await act(async () => {
+        await queryClient.refetchQueries({ queryKey: queryKeys.workspaces.detail(WS) });
+      });
+      await waitFor(() => {
+        expect(
+          screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
+        ).not.toBeInTheDocument();
+      });
+
+      // Hold the post-response workspace detail refresh pending to prove the late response itself never flashes paused state.
+      let resolveRefresh!: (value: Workspace) => void;
+      mockGetWorkspace.mockImplementationOnce(() => new Promise<Workspace>((resolve) => {
+        resolveRefresh = resolve;
+      }));
+      const callsBeforeResolve = mockGetWorkspace.mock.calls.length;
+
+      const next = artifact({ shared: false, latest_seq: 1 });
+      const mon = monitorSummary(next);
+      serve(next, mon);
+      await act(async () => {
+        resolvePublish({
+          monitor: mon,
+          versions: [version(1)],
+          monitor_grant: 'm1.test-grant',
+          frame_base: '/api/v1/dalton/monitors/g/m1.test-grant/',
+          data_base: '/api/v1/dalton/monitors/g/m1.test-grant/data',
+          expires_in: 43200,
+          cut: true,
+          auto_publish_paused: true,
+          auto_publish_pause_token: 'tok-stale',
+          auto_publish_pause_notice: 'Stale pause notice',
+        });
+      });
+
+      await waitFor(() => expect(mockGetWorkspace.mock.calls.length).toBeGreaterThan(callsBeforeResolve));
+      expect(screen.queryByText('Stale pause notice')).not.toBeInTheDocument();
+      expect(
+        screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
+      ).not.toBeInTheDocument();
+
+      await act(async () => {
+        resolveRefresh(workspace({ auto_publish_paused: false, auto_publish_pause_token: null }));
+      });
+    });
+
+    it('handles publish response pause state when credentials status is unknown, and skips tracking when colleague_sharing capability is off', async () => {
+      pauseMocks.credentials = { colleagueSharingEnabled: false, colleagueSharingKnown: false };
+      pauseMocks.colleagueSharingCapable = true;
+      serve(artifact());
+      mockStatus.mockResolvedValue(status([ENTRY_ROW]));
+      mockGetWorkspace.mockResolvedValue(workspace({
+        auto_publish_paused: true,
+        auto_publish_pause_token: 'tok-unfetched',
+      }));
+
+      const firstNext = artifact({ shared: false, latest_seq: 1 });
+      const firstMon = monitorSummary(firstNext);
+      mockPublishMonitor
+        .mockImplementationOnce(async () => {
+          serve(firstNext, firstMon);
+          return {
+            monitor: firstMon,
+            versions: [version(1)],
+            monitor_grant: 'm1.test-grant',
+            frame_base: '/api/v1/dalton/monitors/g/m1.test-grant/',
+            data_base: '/api/v1/dalton/monitors/g/m1.test-grant/data',
+            expires_in: 43200,
+            cut: true,
+            auto_publish_paused: true,
+            auto_publish_pause_token: 'tok-from-resp',
+            auto_publish_pause_notice: 'Colleague turn still active',
+          };
+        })
+        .mockImplementationOnce(answers(artifact({ shared: false, latest_seq: 2 })));
+
+      const user = userEvent.setup();
+      const { unmount } = renderDialog();
+
+      await waitFor(() => expect(publishButton()).toBeEnabled());
+      expect(mockGetWorkspace).not.toHaveBeenCalled();
+      expect(
+        screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
+      ).not.toBeInTheDocument();
+
+      await user.click(publishButton());
+      await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(1));
+      expect(mockPublishMonitor.mock.calls[0][0]).not.toHaveProperty('confirm_pause_token');
+      expect(await screen.findByText('Colleague turn still active')).toBeInTheDocument();
+
+      await waitFor(() => expect(updateButton()).toBeEnabled());
+      await user.click(updateButton());
+      await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(2));
+      expect(mockPublishMonitor.mock.calls[1][0]).toMatchObject({
+        confirm_pause_token: 'tok-from-resp',
+      });
+      await waitFor(() => {
+        expect(screen.queryByText('Colleague turn still active')).not.toBeInTheDocument();
+      });
+      unmount();
+
+      // When the colleague_sharing capability is off, never track pause regardless of credentials status.
+      mockPublishMonitor.mockClear();
+      mockGetWorkspace.mockClear();
+      pauseMocks.colleagueSharingCapable = false;
+      pauseMocks.credentials = { colleagueSharingEnabled: true, colleagueSharingKnown: true };
+      serve(artifact());
+      mockStatus.mockResolvedValue(status([ENTRY_ROW]));
+
+      const capNext = artifact({ shared: false, latest_seq: 1 });
+      const capMon = monitorSummary(capNext);
+      mockPublishMonitor
+        .mockImplementationOnce(async () => {
+          serve(capNext, capMon);
+          return {
+            monitor: capMon,
+            versions: [version(1)],
+            monitor_grant: 'm1.test-grant',
+            frame_base: '/api/v1/dalton/monitors/g/m1.test-grant/',
+            data_base: '/api/v1/dalton/monitors/g/m1.test-grant/data',
+            expires_in: 43200,
+            cut: true,
+            auto_publish_paused: true,
+            auto_publish_pause_token: 'tok-ignored',
+            auto_publish_pause_notice: 'Ignored when capability off',
+          };
+        })
+        .mockImplementationOnce(answers(artifact({ shared: false, latest_seq: 2 })));
+
+      renderDialog();
+      await waitFor(() => expect(publishButton()).toBeEnabled());
+      expect(mockGetWorkspace).not.toHaveBeenCalled();
+
+      await user.click(publishButton());
+      await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(1));
+      expect(await screen.findByText('Published v1')).toBeInTheDocument();
+      expect(screen.queryByText('Ignored when capability off')).not.toBeInTheDocument();
+      expect(
+        screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
+      ).not.toBeInTheDocument();
+
+      await waitFor(() => expect(updateButton()).toBeEnabled());
+      await user.click(updateButton());
+      await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(2));
+      expect(mockPublishMonitor.mock.calls[1][0]).not.toHaveProperty('confirm_pause_token');
+      expect(mockGetWorkspace).not.toHaveBeenCalled();
     });
   });
 });
