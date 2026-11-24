@@ -375,7 +375,18 @@ async def tier_refusals(user_id: str) -> dict[str, ComputerRefusal]:
     return refusals
 
 
-async def cli_placement(user_id: str, workspace_id: str | None, *, conn=None, token: bool = False) -> Placement:
+# DALTON-HOOK(cos-settings-tools): sentinel distinguishing omitted vs pre-resolved computer (which may be None)
+_UNSET_COMPUTER: Any = object()
+
+
+async def cli_placement(
+    user_id: str,
+    workspace_id: str | None,
+    *,
+    conn=None,
+    token: bool = False,
+    resolved_computer: Mapping[str, Any] | None = _UNSET_COMPUTER,  # DALTON-HOOK(cos-settings-tools)
+) -> Placement:
     """Where the CLI of the user's Claude Code turn in ``workspace_id`` runs,
     the one rule for analysts and the Chief of Staff alike: on the
     workspace's computer where it is one of the user's own, so a workspace on
@@ -393,7 +404,10 @@ async def cli_placement(user_id: str, workspace_id: str | None, *, conn=None, to
 
     stand_in = bool(workspace_id) and is_home_stand_in_id(user_id, workspace_id)
     home = stand_in or (bool(workspace_id) and is_home_id(user_id, workspace_id))
-    if stand_in:
+    # DALTON-HOOK(cos-settings-tools): reuse caller's transaction-resolved computer when provided
+    if resolved_computer is not _UNSET_COMPUTER:
+        computer = resolved_computer
+    elif stand_in:
         computer = await get_computer_for_workspace(workspace_id, conn=conn)
     elif home:
         from src.server.services.home_placement import home_turn_computer

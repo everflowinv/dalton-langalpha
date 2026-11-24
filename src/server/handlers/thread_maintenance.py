@@ -483,6 +483,7 @@ async def _resolver(user_id: str, thread_id: str, meta: dict, route):
     except Exception:
         logger.debug("latest run read failed for thread %s", thread_id, exc_info=True)
         latest = None
+    latest_meta = (latest or {}).get("metadata") or {}
     return thread_resolver(
         user_id,
         thread_id,
@@ -490,7 +491,9 @@ async def _resolver(user_id: str, thread_id: str, meta: dict, route):
         identity=await TurnIdentity.of(user_id, route.owner_id),
         thread=meta,
         is_byok=(await own_access(user_id, sign_ins=False)).api_keys,
-        enabled_subagents=((latest or {}).get("metadata") or {}).get("subagents_enabled"),
+        enabled_subagents=latest_meta.get("subagents_enabled"),
+        # DALTON-HOOK(cos-settings-tools): preserve system-only catalog resolution for compaction and model-switch handoff
+        ignore_custom_models=bool(latest_meta.get("llm_model_system_only")),
     )
 
 

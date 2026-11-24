@@ -1523,6 +1523,7 @@ def build_director_tools(
         timezone_name: str | None = None,
         workspace_id: str | None = None,
         ticker: str | None = None,
+        llm_model: str | None = None,
         reasoning_effort: str | None = None,
         config: RunnableConfig = None,
     ) -> str:
@@ -1543,7 +1544,8 @@ def build_director_tools(
             timezone_name: IANA timezone. Omit on create to use the deployment default; omit on update to keep the existing timezone.
             workspace_id: Workspace UUID used to place a new automation or locate an existing one in that workspace (does not move an existing automation; defaults to the current workspace in config).
             ticker: Optional company ticker for naming validation.
-            reasoning_effort: Optional thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Omit on create to inherit user/model default; omit on update to keep the current value, or pass `""` / `"default"` to clear. Built-in Antigravity effort is determined by the task's model ID; change the model in the automation's settings.
+            llm_model: Optional model ID override. Omit on create to inherit the task owner's default model; omit on update to keep the current model; pass `""`, `"default"`, or `"clear"` to clear the override and inherit the owner's default. Cross-user edits accept system-catalog models only.
+            reasoning_effort: Optional thinking effort override (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). Omit on create to inherit user/model default; omit on update to keep the current value, or pass `""` / `"default"` to clear. Built-in Antigravity effort is determined by the task's model ID; change the model via `llm_model` or the automation's settings.
         """
         configurable = (config or {}).get("configurable") or {}
         user_id = str(configurable.get("user_id") or "").strip()
@@ -1580,6 +1582,11 @@ def build_director_tools(
             "workspace_id": ws_id,
             "ticker": ticker,
         }
+        if llm_model is not None:
+            cleaned_model = llm_model.strip()
+            spec["llm_model"] = (
+                None if cleaned_model.lower() in ("", "default", "clear") else cleaned_model
+            )
         if reasoning_effort is not None:
             cleaned_effort = reasoning_effort.strip().lower()
             spec["reasoning_effort"] = (

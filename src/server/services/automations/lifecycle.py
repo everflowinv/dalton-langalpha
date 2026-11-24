@@ -293,8 +293,18 @@ async def _require_pin_in(
 _MAY_RUN_LATER = frozenset({"no_own_computer", "cli_computer_offline"})
 
 
+# DALTON-HOOK(cos-settings-tools): sentinel distinguishing omitted vs pre-resolved computer (which may be None)
+_UNSET_COMPUTER: Any = object()
+
+
 async def check_claude_code_hosted(
-    user_id: str, name: str | None, workspace_id: str | None, conn=None, pref: dict[str, Any] | None = None,
+    user_id: str,
+    name: str | None,
+    workspace_id: str | None,
+    conn=None,
+    pref: dict[str, Any] | None = None,
+    *,
+    resolved_computer: Mapping[str, Any] | None = _UNSET_COMPUTER,  # DALTON-HOOK(cos-settings-tools)
 ) -> None:
     """Refuse a Claude Code row in a workspace on a cloud computer whose turns
     admission refuses (``hosted.Refused``, in its order), so every firing
@@ -311,7 +321,13 @@ async def check_claude_code_hosted(
         return
     if not is_claude_code_model(name):
         return
-    where = await cli_placement(user_id, workspace_id, conn=conn)
+    # DALTON-HOOK(cos-settings-tools): forward caller's transaction-resolved computer when provided
+    if resolved_computer is not _UNSET_COMPUTER:
+        where = await cli_placement(
+            user_id, workspace_id, conn=conn, resolved_computer=resolved_computer
+        )
+    else:
+        where = await cli_placement(user_id, workspace_id, conn=conn)
     if not isinstance(where, Refused) or where.reason in _MAY_RUN_LATER:
         return
     raise AutomationRefusal(claude_code_off_message(where.reason, **where.fields), field="llm_model")

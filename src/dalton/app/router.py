@@ -1347,6 +1347,16 @@ async def put_dalton_automation_endpoint(
         for nullable_key in ("llm_model", "reasoning_effort"):
             if nullable_key in extra_fields and extra_fields[nullable_key] is None and nullable_key not in spec:
                 spec = {**spec, nullable_key: None}
+        if "llm_model" in spec and isinstance(spec["llm_model"], str):
+            cleaned_model = spec["llm_model"].strip()
+            spec = {
+                **spec,
+                "llm_model": (
+                    None
+                    if cleaned_model.lower() in ("", "default", "clear")
+                    else cleaned_model
+                ),
+            }
     if (
         isinstance(spec, dict)
         and "automation_id" in raw_body_dict

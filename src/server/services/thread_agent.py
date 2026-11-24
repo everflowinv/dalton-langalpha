@@ -46,6 +46,7 @@ def thread_resolver(
     reasoning_effort: str | None = None,
     fast_mode: bool | None = None,
     enabled_subagents: list[str] | None = None,
+    ignore_custom_models: bool = False,  # DALTON-HOOK(cos-settings-tools)
 ) -> Callable[..., Awaitable[AgentConfig]]:
     """Maps a model name (None for the account default) to the config a turn
     on the thread runs it under, in the route's workspace and role.
@@ -67,11 +68,17 @@ def thread_resolver(
         model: str | None,
         *,
         reasoning_effort_override: Any = _UNSET_EFFORT,  # DALTON-HOOK(automation-effort)
+        ignore_custom_models_override: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
     ) -> AgentConfig:
         effective_effort = (
             effort
             if reasoning_effort_override is _UNSET_EFFORT
             else reasoning_effort_override
+        )
+        effective_ignore_custom = (
+            ignore_custom_models
+            if ignore_custom_models_override is None
+            else bool(ignore_custom_models_override)
         )
         return await resolve_llm_config(
             setup.agent_config,
@@ -85,6 +92,7 @@ def thread_resolver(
             workspace_id=route.workspace_id,
             identity=identity,
             role=route.role,
+            ignore_custom_models=effective_ignore_custom,  # DALTON-HOOK(cos-settings-tools)
         )
 
     return resolve

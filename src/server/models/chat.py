@@ -492,6 +492,12 @@ class ChatRequest(BaseModel):
         description="Run id this request is an attempt-chain retry of. "
         "Internal use only; ignored when supplied by clients.",
     )
+    # DALTON-HOOK(cos-settings-tools): server-stamped flag forcing system-catalog model resolution (ignores owner custom_models)
+    llm_model_system_only: bool = Field(
+        default=False,
+        description="Server-stamped flag for cross-user managed automation turns; "
+        "ignores owner custom_models/custom_providers during LLM resolution.",
+    )
 
     # Interrupt/resume support (HITL)
     hitl_response: Optional[Dict[str, HITLResponse]] = Field(

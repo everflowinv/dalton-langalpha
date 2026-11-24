@@ -913,6 +913,7 @@ class AutomationExecutor:
         user_id: str,
         llm_model: str | None,
         stored_effort: str | None,
+        system_only: bool = False,  # DALTON-HOOK(cos-settings-tools)
     ) -> str | None:
         from src.dalton.llm.antigravity_series import ANTIGRAVITY_PROVIDER
         from src.dalton.services import automation_thread_model
@@ -947,10 +948,15 @@ class AutomationExecutor:
                     effective_effort = prior_effort
 
         # DALTON-HOOK(automation-effort): ignore stale column values when the automation runs a built-in Antigravity model
+        # DALTON-HOOK(cos-settings-tools): classify against system catalog only when llm_model_system_only is set
         if effective_effort is not None and llm_model:
             is_builtin_antigravity = False
             try:
-                source, entry = await user_models.classify_model(user_id, llm_model)
+                source, entry = await user_models.classify_model(
+                    user_id,
+                    llm_model,
+                    **({"ignore_custom_models": True} if system_only else {}),
+                )
                 is_builtin_antigravity = (
                     source == user_models.ModelSource.SYSTEM
                     and isinstance(entry, dict)
@@ -1047,19 +1053,27 @@ class AutomationExecutor:
             # DALTON-HOOK(automation-effort): stamp two-state reasoning_effort on first-turn run metadata
             # and forward automation reasoning_effort into ChatRequest (preserving prior first-turn effort on
             # restart redispatch and ignoring stale column values on built-in Antigravity models).
+            # DALTON-HOOK(cos-settings-tools): propagate llm_model_system_only into effort check, run_metadata, and ChatRequest
+            system_only = bool(
+                (automation.get("metadata") or {}).get("llm_model_system_only")
+            )
             effective_effort = await self._resolve_turn_reasoning_effort(
                 execution_id=execution_id,
                 thread_id=firing.thread_id,
                 user_id=user_id,
                 llm_model=automation.get("llm_model"),
                 stored_effort=automation.get("reasoning_effort"),
+                system_only=system_only,
             )
             run_metadata["automation_reasoning_effort_configured"] = True
             run_metadata["automation_reasoning_effort"] = effective_effort
+            if system_only:
+                run_metadata["llm_model_system_only"] = True
             request = ChatRequest(
                 workspace_id=firing.workspace_id,
                 messages=[ChatMessage(role="user", content=instruction)],
                 llm_model=automation.get("llm_model"),
+                llm_model_system_only=system_only,
                 reasoning_effort=effective_effort,
                 additional_context=additional_context,
                 origin=ThreadOrigin(

@@ -385,29 +385,29 @@ async def _resolve_source_execution(
     return running[-1], "running_thread"
 
 
-async def _get_execution_first_turn_settings(
+async def _get_execution_first_turn_run_settings(
     execution: Mapping[str, Any],
     *,
     fallback_thread_id: str,
-) -> tuple[str | None, bool, str | None]:
-    """Read ``(first_model, effort_configured, first_effort)`` from the execution's first turn.
+) -> tuple[str | None, bool, str | None, bool | None]:
+    """Read ``(first_model, effort_configured, first_effort, system_only)`` from the execution's first turn.
 
     Reads the earliest ``conversation_responses`` row for this execution
     (``turn_index ASC, attempt_no ASC``) so idempotent ``conversation_queries``
-    upserts on retries cannot overwrite the first turn's recorded effort.
-    ``effort_configured=True`` distinguishes a first turn explicitly configured
-    with ``reasoning_effort=None`` from a pre-d042 in-flight execution whose
-    first turn had no effort metadata.
+    upserts on retries cannot overwrite the first turn's recorded effort or
+    ``llm_model_system_only`` marker. ``system_only`` is ``None`` only when no
+    first-turn ``conversation_responses`` row was found.
     """
     exec_id = str(execution["automation_execution_id"])
     exec_thread_id = str(execution.get("conversation_thread_id") or fallback_thread_id)
     if normalize_uuid(exec_thread_id) is None:
-        return None, False, None
+        return None, False, None, None
     started_at = execution.get("started_at") or execution.get("created_at")
 
     first_model: str | None = None
     effort_configured = False
     first_effort: str | None = None
+    first_system_only: bool | None = None
 
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -425,7 +425,8 @@ async def _get_execution_first_turn_settings(
                          )
                          ELSE FALSE
                        END AS effort_configured,
-                       NULLIF(r.metadata->>'automation_reasoning_effort', '') AS reasoning_effort
+                       NULLIF(r.metadata->>'automation_reasoning_effort', '') AS reasoning_effort,
+                       COALESCE((r.metadata->>'llm_model_system_only')::boolean, FALSE) AS llm_model_system_only
                 FROM conversation_responses r
                 LEFT JOIN conversation_queries q
                   ON q.conversation_thread_id = r.conversation_thread_id
@@ -449,11 +450,12 @@ async def _get_execution_first_turn_settings(
                 effort_configured = bool(row.get("effort_configured"))
                 raw_effort = row.get("reasoning_effort")
                 first_effort = str(raw_effort) if raw_effort else None
+                first_system_only = bool(row.get("llm_model_system_only"))
                 if first_model:
-                    return first_model, effort_configured, first_effort
+                    return first_model, effort_configured, first_effort, first_system_only
 
             if started_at is None:
-                return first_model, effort_configured, first_effort
+                return first_model, effort_configured, first_effort, first_system_only
 
             await cur.execute(
                 """
@@ -473,7 +475,28 @@ async def _get_execution_first_turn_settings(
                 str(fallback_model) if fallback_model else first_model,
                 effort_configured,
                 first_effort,
+                first_system_only,
             )
+
+
+async def _get_execution_first_turn_settings(
+    execution: Mapping[str, Any],
+    *,
+    fallback_thread_id: str,
+) -> tuple[str | None, bool, str | None]:
+    """Read ``(first_model, effort_configured, first_effort)`` from the execution's first turn."""
+    (
+        first_model,
+        effort_configured,
+        first_effort,
+        _first_system_only,
+    ) = await _get_execution_first_turn_run_settings(
+        execution, fallback_thread_id=fallback_thread_id
+    )
+    return first_model, effort_configured, first_effort
+
+
+_DEFAULT_GET_FIRST_TURN_SETTINGS = _get_execution_first_turn_settings
 
 
 async def _get_execution_first_turn_llm_model(
@@ -508,6 +531,20 @@ def _accepts_effort_override(resolve: Callable[..., Awaitable[Any]]) -> bool:
         return False
     for name, param in sig.parameters.items():
         if name == "reasoning_effort_override" or param.kind == inspect.Parameter.VAR_KEYWORD:
+            return True
+    return False
+
+
+def _accepts_ignore_custom_models_override(resolve: Callable[..., Awaitable[Any]]) -> bool:
+    try:
+        sig = inspect.signature(resolve)
+    except (TypeError, ValueError):
+        return False
+    for name, param in sig.parameters.items():
+        if (
+            name == "ignore_custom_models_override"
+            or param.kind == inspect.Parameter.VAR_KEYWORD
+        ):
             return True
     return False
 
@@ -581,6 +618,8 @@ async def _resolve_automation_notification_context(
     source: str | None = None
     effort_configured = False
     inherited_effort: str | None = None
+    inherited_system_only = False
+    first_system_only: bool | None = None
     try:
         if _get_execution_first_turn_llm_model is not _DEFAULT_GET_FIRST_TURN_LLM_MODEL:
             first_model = await _get_execution_first_turn_llm_model(
@@ -588,12 +627,23 @@ async def _resolve_automation_notification_context(
             )
             first_effort_configured = bool(first_model)
             first_effort = None
-        else:
+            first_system_only = False if first_model else None
+        elif _get_execution_first_turn_settings is not _DEFAULT_GET_FIRST_TURN_SETTINGS:
             (
                 first_model,
                 first_effort_configured,
                 first_effort,
             ) = await _get_execution_first_turn_settings(
+                target_exec, fallback_thread_id=thread_id
+            )
+            first_system_only = False
+        else:
+            (
+                first_model,
+                first_effort_configured,
+                first_effort,
+                first_system_only,
+            ) = await _get_execution_first_turn_run_settings(
                 target_exec, fallback_thread_id=thread_id
             )
         if need_model and first_model:
@@ -602,10 +652,13 @@ async def _resolve_automation_notification_context(
         if confirmed_source and first_effort_configured:
             effort_configured = True
             inherited_effort = first_effort
+        if first_system_only is not None:
+            inherited_system_only = bool(first_system_only)
 
         need_db_model = need_model and not chosen_model
         need_db_effort = need_effort and not effort_configured
-        if need_db_model or need_db_effort:
+        need_db_system_only = first_system_only is None
+        if need_db_model or need_db_effort or need_db_system_only:
             try:
                 automation = await auto_db.get_automation_including_deleted(
                     str(target_exec["automation_id"]),
@@ -630,6 +683,12 @@ async def _resolve_automation_notification_context(
                     effort_configured = True
                     cfg_effort = automation.get("reasoning_effort")
                     inherited_effort = str(cfg_effort) if cfg_effort else None
+                if need_db_system_only:
+                    auto_meta = automation.get("metadata")
+                    if isinstance(auto_meta, Mapping) and bool(
+                        auto_meta.get("llm_model_system_only")
+                    ):
+                        inherited_system_only = True
     except Exception:
         logger.warning(
             f"[AUTOMATION_THREAD_MODEL] Failed reading execution settings for thread={thread_id} "
@@ -650,6 +709,9 @@ async def _resolve_automation_notification_context(
                 None,
             )
         return None, None, None, False, False, None
+
+    if inherited_system_only:
+        target_exec = {**target_exec, "_llm_model_system_only": True}
 
     if not chosen_model:
         return (
@@ -682,7 +744,16 @@ async def _resolve_automation_notification_context(
         # Inferred link only: the previous behavior, default resolution.
         return None, None, None, False, False, None
 
-    if not model_resolves(prefs, chosen_model):
+    prefs_for_resolve = (
+        {
+            k: v
+            for k, v in prefs.items()
+            if k not in ("custom_models", "custom_providers")
+        }
+        if inherited_system_only
+        else prefs
+    )
+    if not model_resolves(prefs_for_resolve, chosen_model):
         logger.warning(
             f"[AUTOMATION_THREAD_MODEL] Model {chosen_model!r} for thread={thread_id} "
             f"execution_id={exec_id} source={source} via={match_kind} is unavailable; "
@@ -839,6 +910,10 @@ async def resolve_turn_config_with_automation_inheritance(
             resolve_model=(requested_model is None),
         )
 
+    inherited_system_only = bool(
+        getattr(request, "llm_model_system_only", False)
+        or (target_exec or {}).get("_llm_model_system_only")
+    )
     confirmed_for_context = target_exec is not None and (
         fallback_eligible or bool(target_exec.get("_effort_source_confirmed"))
     )
@@ -854,6 +929,8 @@ async def resolve_turn_config_with_automation_inheritance(
             if effort_configured:
                 ctx_meta["automation_reasoning_effort_configured"] = True
                 ctx_meta["automation_reasoning_effort"] = inherited_effort
+            if inherited_system_only:
+                ctx_meta["llm_model_system_only"] = True
             on_automation_context(ctx_meta)
 
     explicit_request_effort = getattr(request, "reasoning_effort", None)
@@ -863,11 +940,17 @@ async def resolve_turn_config_with_automation_inheritance(
         and explicit_request_effort is None
         and _accepts_effort_override(resolve)
     )
-    if apply_effort_override:
+    apply_system_only_override = (
+        inherited_system_only and _accepts_ignore_custom_models_override(resolve)
+    )
+    if apply_effort_override or apply_system_only_override:
         async def _effective_resolve(model_name: str | None) -> Any:
-            return await resolve(
-                model_name, reasoning_effort_override=inherited_effort
-            )
+            extra_kw: dict[str, Any] = {}
+            if apply_effort_override:
+                extra_kw["reasoning_effort_override"] = inherited_effort
+            if apply_system_only_override:
+                extra_kw["ignore_custom_models_override"] = True
+            return await resolve(model_name, **extra_kw)
     else:
         _effective_resolve = resolve
 
@@ -888,10 +971,19 @@ async def resolve_turn_config_with_automation_inheritance(
                 context=f"user={user_id} thread={thread_id}",
             )
         )
+        default_pref_map = (
+            {
+                k: v
+                for k, v in pref_map.items()
+                if k not in ("custom_models", "custom_providers")
+            }
+            if inherited_system_only
+            else pref_map
+        )
         orig = (
             None
             if failed_subject is not None
-            else (original_model or thread_model.effective_default_model(pref_map))
+            else (original_model or thread_model.effective_default_model(default_pref_map))
         )
         cfg, record = await resolve_with_subscription_fallback(
             user_id=user_id,
@@ -903,6 +995,7 @@ async def resolve_turn_config_with_automation_inheritance(
             exc_to_raise=exc_to_raise,
             model_resolves_fn=model_resolves,
             failed_subject=failed_subject,
+            ignore_custom_models=inherited_system_only,
         )
         if target_exec and target_exec.get("automation_execution_id"):
             record = {

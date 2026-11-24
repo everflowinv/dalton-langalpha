@@ -381,6 +381,7 @@ _SERVER_ONLY_FIELDS = (
     "steer_job_id",
     "artifact_comments",
     "checked_computer_id",
+    "llm_model_system_only",  # DALTON-HOOK(cos-settings-tools)
 )
 
 
@@ -393,7 +394,12 @@ def _client_body(request: ChatRequest, raw_request: Request) -> ChatRequest:
     """
     if _is_service_request(raw_request):
         return request
-    cleared = {name: None for name in _SERVER_ONLY_FIELDS if getattr(request, name)}
+    # DALTON-HOOK(cos-settings-tools): reset boolean llm_model_system_only to False rather than None
+    cleared = {
+        name: (False if name == "llm_model_system_only" else None)
+        for name in _SERVER_ONLY_FIELDS
+        if getattr(request, name)
+    }
     return request.model_copy(update=cleared) if cleared else request
 
 
@@ -781,6 +787,8 @@ async def _handle_send_message(
             reasoning_effort=getattr(request, "reasoning_effort", None),
             fast_mode=getattr(request, "fast_mode", None),
             enabled_subagents=request.subagents_enabled,
+            # DALTON-HOOK(cos-settings-tools): enforce system-catalog model resolution when server-stamped
+            ignore_custom_models=bool(getattr(request, "llm_model_system_only", False)),
         )
 
         # A report-back or a channel message has nobody at a client to
@@ -915,9 +923,12 @@ async def _handle_send_message(
 
     # DALTON-HOOK(colleague-dispatch): pass origin_channel, tail_turn_no_new_work, and workspace_owner_id into run metadata & configurable.
     # DALTON-HOOK(automation-effort): propagate automation_source_execution_id (not scheduler firing automation_execution_id) and two-state effort to continuation/retry run_meta
+    # DALTON-HOOK(cos-settings-tools): persist llm_model_system_only onto continuation/retry run_meta
     run_meta: dict[str, object] = {}
     if automation_run_ctx:
         run_meta.update(automation_run_ctx)
+    if getattr(request, "llm_model_system_only", False):
+        run_meta["llm_model_system_only"] = True
     # DALTON-HOOK(automation-subscription-fallback): record fallback notice on run row metadata
     if fallback_records:
         run_meta["subscription_fallback"] = fallback_records[0]
