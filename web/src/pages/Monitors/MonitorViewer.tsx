@@ -19,6 +19,9 @@ import { SERVED_HTML_SANDBOX } from '@/pages/ChatAgent/components/viewers/html/s
 import { buildServeUrl, versionPrefix } from '@/pages/ChatAgent/components/viewers/html/wsfilesUrl';
 import type { PageBridge } from '@/pages/ChatAgent/components/viewers/html/usePageBridge';
 import { useBridgeMessage } from '@/pages/ChatAgent/components/viewers/html/usePageBridge';
+// The public route (/m/:slug) reaches this viewer without the Monitors page, so
+// the viewer brings its own styles; otherwise its frame host has no height.
+import './Monitors.css';
 import {
   getMonitorDetail,
   getPublicMonitorDetail,
