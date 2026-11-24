@@ -1,9 +1,14 @@
-# Dalton Standalone Core edge gateway (Batch 1 initial loopback HTTP edition).
-# Caddy listens on :8088 inside the container; docker-compose.core.yml publishes
-# only 127.0.0.1:8088 on the host (requires Docker Engine >= 28 for reliable
-# loopback-only host port isolation). Automatic HTTPS / custom TLS arrives in Batch 6.
+# Dalton Standalone Core edge gateway (Batch 6: Loopback HTTP / Internal CA / Automatic HTTPS / Custom TLS).
+#
+# Mode selection is controlled by DALTON_TLS_MODE (imported from /etc/caddy/modes/*.caddy):
+#   - loopback (default): plain HTTP on :8088, published only on 127.0.0.1:${DALTON_EDGE_PORT:-8088}
+#   - internal:           HTTPS on :443 using Caddy's built-in internal CA (localhost or LAN/private hosts)
+#   - auto:               Automatic HTTPS (ACME / Let's Encrypt) on :80 and :443 for public domains
+#   - custom:             HTTPS on :443 using operator-provided certificates in /etc/caddy/certs/
+#
+# Every mode shares the exact same (dalton_site_common) route table, header stripping,
+# access-log redaction, and internal-endpoint blocking boundary.
 {
-	auto_https off
 	admin off
 }
 
@@ -20,12 +25,11 @@
 	header_up -X-User-Id
 }
 
-:8088 {
-	root * /srv
-	encode zstd gzip
-
-	# Redact ?token=<jwt> and delete sensitive authentication / internal headers
-	# from access logs (Caddy logs the original request before header mutation).
+# Redact ?token=<jwt>, delete sensitive authentication / internal headers, and
+# strip response Location headers from access logs so HTTP->HTTPS redirects or
+# query tokens never leak into logs (Caddy logs the original request before
+# header mutation).
+(dalton_access_log) {
 	log {
 		output stdout
 		format filter {
@@ -40,9 +44,45 @@
 				request>headers>X-Dalton-Relay-Token delete
 				request>headers>Authorization delete
 				request>headers>Cookie delete
+				resp_headers>Location delete
 			}
 		}
 	}
+}
+
+# HTTP (:80) -> HTTPS redirect that preserves a non-default host HTTPS port
+# (e.g. 18443 in loopback HTTPS mode) while omitting :443 on standard deployments.
+# IPv6 literals are explicitly re-bracketed because Caddy's {http.request.host}
+# strips brackets when Host carries a port (e.g. [::1]:18080 -> ::1).
+(dalton_http_redirect) {
+	import dalton_access_log
+	@ipv6_non_default_https_port {
+		vars_regexp ipv6_host {http.request.host} ^\[?([^\[\]]*:[^\[\]]+)\]?$
+		expression `"{$DALTON_EDGE_HTTPS_PORT:443}" != "443" && "{$DALTON_EDGE_HTTPS_PORT:443}" != ""`
+	}
+	handle @ipv6_non_default_https_port {
+		redir https://[{re.ipv6_host.1}]:{$DALTON_EDGE_HTTPS_PORT:443}{uri} permanent
+	}
+	@ipv6_default_https_port {
+		vars_regexp ipv6_host_def {http.request.host} ^\[?([^\[\]]*:[^\[\]]+)\]?$
+	}
+	handle @ipv6_default_https_port {
+		redir https://[{re.ipv6_host_def.1}]{uri} permanent
+	}
+	@non_default_https_port expression `"{$DALTON_EDGE_HTTPS_PORT:443}" != "443" && "{$DALTON_EDGE_HTTPS_PORT:443}" != ""`
+	handle @non_default_https_port {
+		redir https://{host}:{$DALTON_EDGE_HTTPS_PORT:443}{uri} permanent
+	}
+	handle {
+		redir https://{host}{uri} permanent
+	}
+}
+
+# Shared site configuration imported by every TLS / loopback mode block.
+(dalton_site_common) {
+	root * /srv
+	encode zstd gzip
+	import dalton_access_log
 
 	# Baseline security response headers.
 	header {
@@ -180,3 +220,6 @@
 		respond 404
 	}
 }
+
+# Activate the configured TLS / loopback listener mode.
+import /etc/caddy/modes/{$DALTON_TLS_MODE:loopback}.caddy
