@@ -1,8 +1,8 @@
 # 团队微信多账号（「每人扫自己的码」）设计方案
 
 > **基线提交**：`34b353a0b`（已合入最新主分支独立核心运维脚本；Dalton 迁移链当前唯一头节点为 `d046`，链路 `d045 -> d047 -> d048 -> d046`，见 `src/dalton/migrations/versions/d046_scoped_data_map_cache.py:23-24`）  
-> **文档轮次**：第 3 轮最终定案版（已合入全部拍板决策 D1～D9 与第 1～2 轮技术审查修订）  
-> **架构定位**：严格对齐独立核心架构（`docs/dalton/features/standalone-core.md:8-42,64,243-246`）与第 ③ 阶段渠道网关插件化边界——每套部署固定运行 **1 个**渠道网关实例（由后端单行租约与单调 `epoch` 围栏保障单活）；后端以 `--workers N` 运行并掌管全部账号归属、加密凭据、网关租约、材料收集窗口、会话状态、审计日志与权限，网关仅作为纯内存协议适配器按后端契约存取状态与凭据。
+> **文档轮次**：第 4 轮最终定案版（已完整合入拍板决策 D1～D18 与第 1～3 轮技术审查修订）  
+> **架构定位**：严格对齐独立核心架构（`docs/dalton/features/standalone-core.md:8-42,64,243-246`）与第 ③ 阶段渠道网关插件化边界——每套部署固定运行 **1 个**渠道网关实例（由后端单行租约与单调 `epoch` 同事务锁围栏保障单活）；后端以 `--workers N` 运行并掌管全部账号归属、加密凭据、网关租约、材料收集窗口、会话状态、审计日志与权限，网关仅作为纯内存协议适配器按后端契约存取状态与凭据。
 
 ---
 
@@ -10,34 +10,34 @@
 
 ### 0.1 问题根因
 
-微信 iLink（微信智能体机器人接入协议，ClawBot〔腾讯微信个人智能体机器人形态〕，`bot_type="3"`，见 `integrations/dalton-channel-gateway/src/channels/weixin/types.ts:10`）通过扫码创建的机器人属于**扫码微信号专属的一对一私聊通道**：只有扫码的那个微信号（`ilink_user_id`）能在微信聊天列表中看到该机器人并收发消息，群聊事件也在协议接入层直接归档拦截（`integrations/dalton-channel-gateway/src/channels/weixin/inbound.ts:147-167`、`src/dalton/database/channel_gateway.py:1601-1619`）。OpenClaw（开源多渠道智能体框架）社区方案同样采取每次扫码创建一个独立机器人账号、按账号与对端隔离会话的做法。
+微信 iLink（微信智能体机器人接入协议，ClawBot〔腾讯微信个人智能体机器人形态〕，`bot_type="3"`，见 `integrations/dalton-channel-gateway/src/channels/weixin/types.ts:10`）通过扫码创建的机器人属于**扫码微信号专属的一对一私聊通道**：仅扫码的微信号（`ilink_user_id`）能在微信聊天列表中看到该机器人并收发消息，群聊事件在协议接入层直接归档拦截（`integrations/dalton-channel-gateway/src/channels/weixin/inbound.ts:147-167`、`src/dalton/database/channel_gateway.py:1729-1749`）。OpenClaw（开源多渠道智能体框架）社区方案同样采用每次扫码创建独立机器人账号、按账号与对端隔离会话的模型。
 
 当前实现采用「全局单实例机器人 + 成员一次性绑定码」模型，在团队场景下仅扫码管理员一人可用：
 
 1. **数据库单行约束**：`dalton_channel_weixin_state` 以 `singleton_id = 1` 固定保存全系统唯一一组 `ilink_bot_id` 与 `encrypted_bot_token`（`src/dalton/migrations/versions/d030_channel_gateway.py:256-265`、`src/dalton/migrations/versions/d032_weixin_state.py:23-42`、`src/dalton/database/channel_gateway.py:9795-10031`），另一位管理员扫码会覆盖原在线凭据。
-2. **扫码接口限死管理员**：`/weixin/qrcode/start|wait|verify-code` 强制调用 `_require_weixin_admin`（`src/dalton/app/channels_router.py:1035-1039,1099-1157`）与数据库层 `get_user_tier(eff_owner) != "admin"` 校验（`src/dalton/database/channel_gateway.py:10092,10250,10397`）。
+2. **扫码接口限死管理员**：`/weixin/qrcode/start|wait|verify-code` 强制要求 `_require_weixin_admin`（`src/dalton/app/channels_router.py:1035-1039,1099-1157`）与数据库层 `get_user_tier(eff_owner) != "admin"` 校验（`src/dalton/database/channel_gateway.py:10092,10250,10397`）。
 3. **网关单实例单账号内存状态**：`WeixinChannelAdapter` 仅维护单个 `this.account` 与单个 `WeixinMonitor` 长轮询协程（`integrations/dalton-channel-gateway/src/channels/weixin/index.ts:92-106,361-407`）。
-4. **前端拆成管理员扫码与成员绑定码两套流程**：管理员在 `DaltonTeamOpsPanel`（`web/src/pages/Settings/panels/dalton/DaltonTeamOpsPanel.tsx:50`）使用 `DaltonWeixinBotCard`（`web/src/pages/Settings/panels/dalton/DaltonWeixinBotCard.tsx:39-44`）扫码，普通成员在 `IntegrationsPanel`（`web/src/pages/Settings/panels/IntegrationsPanel.tsx:43`）使用 `DaltonWeixinBindCard`（`web/src/pages/Settings/panels/dalton/DaltonWeixinBindCard.tsx:48-56`）生成 `/bind DLT-XXXX-XXXX` 绑定码，而微信端仅扫码本人拥有机器人会话窗口。
+4. **前端拆为管理员扫码与成员绑定码两套流程**：管理员在 `DaltonTeamOpsPanel`（`web/src/pages/Settings/panels/dalton/DaltonTeamOpsPanel.tsx:50`）操作 `DaltonWeixinBotCard`（`web/src/pages/Settings/panels/dalton/DaltonWeixinBotCard.tsx:39-44`）扫码，普通成员在 `IntegrationsPanel`（`web/src/pages/Settings/panels/IntegrationsPanel.tsx:43`）操作 `DaltonWeixinBindCard`（`web/src/pages/Settings/panels/dalton/DaltonWeixinBindCard.tsx:48-56`）生成 `/bind DLT-XXXX-XXXX` 绑定码，而微信侧仅扫码本人拥有机器人会话窗口。
 
 ### 0.2 硬性架构约束与三层开关协同规则
 
 1. **后端单一真值与多 worker 安全**：后端以 `--workers N` 多进程模式运行（`AGENTS.md:103`、`src/server/AGENTS.md:38-50`）。账号与成员映射、部署级单行网关租约（`dalton_channel_gateway_lease`）、二维码登录会话、加密后的 `bot_token` / `context_token` / 入站媒体解密材料、长轮询游标 `get_updates_buf`、显式材料收集缓冲、管理审计日志以及账号配置变更代际号 `accounts_revision` 全部持久化在后端 PostgreSQL（开源关系型数据库）自有 `dalton_*` 表中。
-2. **每套部署固定运行 1 个无状态网关实例（部署级单一租约 + `epoch` 围栏）**：
-   - Everflow 生产通过 macOS `launchd` 托管唯一 `com.dalton.channel-gateway` 守护进程（模板 `scripts/dalton/launchd/com.dalton.channel-gateway.plist.template:18-25`）；独立核心安装在网关进入核心发布包后于 Docker Compose 固定运行 1 个网关容器副本。
+2. **每套部署固定运行 1 个无状态网关实例（部署级单一租约 + 同事务 `epoch` 锁围栏，D1, D12, D13）**：
+   - Everflow 生产通过 macOS `launchd` 托管唯一 `com.dalton.channel-gateway` 守护进程（模板 `scripts/dalton/launchd/com.dalton.channel-gateway.plist.template:18-25`）；独立核心安装在网关进入核心发布包后于 Docker Compose 固定配置 1 个网关容器副本。
    - `integrations/dalton-channel-gateway/` 仅负责协议适配与微信 CDN（Content Delivery Network，内容分发网络）加解密，移除遗留本地目录配置 `weixinCacheDir`（`integrations/dalton-channel-gateway/src/config.ts:24,132-135,195`、`orchestrator.ts:163,180,190`、`server.ts:206`）。
-   - 后端通过单行表 `dalton_channel_gateway_lease`（`instance_id`、`epoch`、`expires_at`）保证**任意时刻全系统最多只有 1 个网关进程持有有效 `epoch` 执行轮询、发送与启动恢复**；网关发出的全部写入类内部请求均携带 `epoch`，旧 `epoch` 一律被后端以 HTTP `409` 拒绝，旧进程收到拒绝后立即停止轮询并退出（详见 §2.1 与 §3.2）。
+   - 后端单行表 `dalton_channel_gateway_lease`（`instance_id`、`epoch`、`expires_at`）保证任意时刻全系统仅 1 个网关进程持有有效 `epoch`。网关发出的**全部受保护写入请求（含入站、指令、游标、状态上报、材料补登、二维码登录会话写入、投递认领/预检/结算与启动恢复）**均在同一数据库事务首步对租约行执行 `SELECT ... FOR SHARE` 并核对 `epoch`；租约交接更新 `epoch` 对该行取 `FOR UPDATE`，从事务锁层面严格互斥。新获租进程先执行 `mode=startup` 完成遗留 `in_flight` 投递结算，成功后再开启长轮询与新投递认领；旧进程收到 HTTP `409` 后直接停止轮询并退出（详见 §2.1、§3.2、§3.4）。
 3. **统一配置读取、平台级能力门控与三层开关协同**：
-   - 形态解析仅使用 `src.dalton.profile.resolve_profile`（`src/dalton/profile.py:37-96`），能力判定仅使用 `src.dalton.capabilities`（`src/dalton/capabilities.py:56,59,160-191,475-540`），前端统一使用 `useCapabilities()`（`web/src/hooks/useCapabilities.ts:24,129`）；触及上游共享源码的钩子统一标注 `DALTON-HOOK` 注释并受能力门控保护；行为配置（`weixin.allow_external`、`weixin.max_concurrent_accounts`）统一定义在 `src/dalton/settings.py`（合并 `dalton.yaml` 与 `dalton.core.yaml`，见 `src/dalton/settings.py:420-588`），运维脚本严格区分 Everflow 生产（`scripts/dalton/ops/prod/`）与核心安装（`scripts/standalone/`）。
-   - **共享路由按实际平台检查子能力**：`/channels` 路由组顶层仅挂 `CapabilityId.CHANNEL_GATEWAY`（`src/dalton/app/channels_router.py:49-53`）；`I-1`～`I-7`、`/bindings`、`/settings`、`/bind-codes` 等共享入口在解析出请求或数据库记录所属平台后调用 `require_channel_platform_capability(platform)`（`src/dalton/capabilities.py:533-540`）或按激活能力裁剪微信字段，确保关闭 `channel_weixin` 时微信入口全部返回 HTTP `404` 且零字段暴露，同时飞书与 Discord 原样运行。
-   - **网关是否执行微信长轮询由三层开关共同决定**（网关实例持有有效部署级租约且以下三层同为真时才启动 `WeixinMonitor`）：
+   - 形态解析统一使用 `src.dalton.profile.resolve_profile`（`src/dalton/profile.py:37-96`），能力判定统一使用 `src.dalton.capabilities`（`src/dalton/capabilities.py:56,59,160-191,475-540`），前端统一使用 `useCapabilities()`（`web/src/hooks/useCapabilities.ts:24,129`）；触及上游共享源码的钩子标注 `DALTON-HOOK` 注释并受能力门控保护；行为配置（`weixin.allow_external`、`weixin.max_concurrent_accounts`）统一定义在 `src/dalton/settings.py`（`DaltonConfig`，`src/dalton/settings.py:420-460`），运维脚本分别落在 Everflow 生产（`scripts/dalton/ops/prod/`）与核心安装（`scripts/standalone/`）。
+   - **共享路由按实际平台检查子能力**：`/channels` 路由组顶层挂 `CapabilityId.CHANNEL_GATEWAY`（`src/dalton/app/channels_router.py:49-53`）；`I-1`～`I-7`、`/bindings`、`/settings`、`/bind-codes` 等共享入口在解析出目标平台后调用 `require_channel_platform_capability(platform)`（`src/dalton/capabilities.py:533-540`）或按激活能力过滤微信键，确保 `channel_weixin` 关闭时微信入口全部返回 HTTP `404` 且零字段暴露，飞书与 Discord 原样运行。
+   - **网关是否执行微信长轮询由三层开关共同决定**（网关实例持有有效部署级租约、已完成 `mode=startup` 恢复且以下三层同为真时才启动 `WeixinMonitor`）：
 
 | 开关层级 | 配置位置 | 作用域与变更方式 | 为 `false` 时的精确行为 |
 |---|---|---|---|
 | **第 1 层：网关适配器开关** | 网关环境变量 `DALTON_WEIXIN_ENABLED`（`integrations/dalton-channel-gateway/src/config.ts:212-216`，`mode === "outgoing"` 时固定为 `false`） | 网关进程静态开关 | 网关跳过初始化 `WeixinMultiAccountManager`，仅运行同进程已启用的飞书 / Discord 适配器，零 `/internal/weixin/*` 请求。 |
-| **第 2 层：后端部署能力开关** | `DALTON_CAP_CHANNEL_WEIXIN` / `dalton.yaml` `capabilities.channel_weixin`（依赖 `channel_gateway`，`src/dalton/capabilities.py:185-191,325-424`） | 部署级静态能力（Core 默认关闭，Everflow 默认开启） | 后端全部 `/weixin/*` 路由返回 HTTP `404`，共享路由剔除微信数据；若网关误设 `DALTON_WEIXIN_ENABLED=true`，拉取账号列表收到 `404` 后立即停止本地全部微信轮询并进入每 `5 分钟` 静默探测，飞书 / Discord 照常运行。 |
-| **第 3 层：数据库运行期总开关** | `dalton_channel_weixin_config.enabled`（管理员在设置页热切换） | 运行期热开关（默认 `TRUE`） | 后端暂停受理新扫码与微信外发授权，账号快照接口返回 `200` 且 `enabled: false, accounts: []`；网关立即中止全部 `WeixinMonitor` 并维持 15 秒心跳，数据库内既有凭据与游标原样保留，重新开启后免重扫自动恢复。 |
+| **第 2 层：后端部署能力开关** | `DALTON_CAP_CHANNEL_WEIXIN` / `dalton.yaml` `capabilities.channel_weixin`（依赖 `channel_gateway`，`src/dalton/capabilities.py:185-191,325-424`） | 部署级静态能力（Core 默认关闭，Everflow 默认开启） | 后端全部 `/weixin/*` 路由返回 HTTP `404`，共享路由省略微信数据；网关若收到 `404` 立即中止本地全部微信轮询并转为每 `5 分钟` 静默探测，飞书 / Discord 照常运行。 |
+| **第 3 层：数据库运行期总开关** | `dalton_channel_weixin_config.enabled`（管理员在设置页热切换） | 运行期热开关（默认 `TRUE`） | 后端暂停受理新扫码与常规微信外发授权，账号快照接口返回 `200` 且 `enabled: false, accounts: []`；网关立即中止全部 `WeixinMonitor` 并维持 15 秒心跳，数据库内既有凭据与游标原样保留，重开后免重扫恢复。 |
 
-4. **停机迁移与简洁回退边界**：迁移 `d049_weixin_multi_account.py` 接在 `d046` 之后，仅操作 `dalton_*` 表；升级执行 `d049` 时后端与网关均处于停止状态（零并发写微信状态），从 `dalton_channel_weixin_state` 复制数据并清空明文 `login_qrcode` 后冻结旧表；`d049.downgrade()` 仅删除 `d049` 新增对象，使系统直接回到升级前的单账号状态（详见 §2.3 与 §6.3）。
+4. **只复制不改旧行的停机迁移与无损回退边界（D2, D10, D18）**：迁移 `d049_weixin_multi_account.py` 接在 `d046` 之后，在后端与网关均已停止的静默窗口内执行；`d049.upgrade()` 仅创建新表、新列与 `NOT VALID` 外键并将存量数据复制进新表/新列（除按 D2 清空 `dalton_channel_weixin_state` 临时明文 `login_*` 扫码字段外，**保留旧代码仍读取的全部共享表既有行与既有列原封未动**），新代码改为只读新表与新列；`VALIDATE CONSTRAINT` 放在部署后独立事务执行；`d049.downgrade()` 仅删除 `d049` 新增对象，降级后旧代码所读数据行与升级前逐行一致（详见 §2.2、§2.3、§6.3）。
 
 ```mermaid
 flowchart LR
@@ -48,16 +48,16 @@ flowchart LR
 
     subgraph Backend["FastAPI 后端 (--workers N)"]
         Router["channels_router.py<br/>专属路由挂 channel_weixin<br/>共享路由按 platform 校验能力"]
-        DB[("PostgreSQL (pgcrypto)<br/>gateway_lease (单实例 epoch)<br/>weixin_accounts / login_sessions<br/>context_tokens / collect_buffers / audit_logs")]
+        DB[("PostgreSQL (pgcrypto)<br/>gateway_lease (FOR SHARE / FOR UPDATE)<br/>weixin_accounts / account_tokens / login_sessions<br/>collect_buffers / audit_logs")]
         Router --> DB
     end
 
-    subgraph Gateway["唯一渠道网关实例 (持有有效 epoch)"]
+    subgraph Gateway["唯一渠道网关实例 (获租 -> startup 恢复 -> 轮询)"]
         Lease["GatewayLeaseHolder<br/>15s 续期 / 全写入带 epoch"]
         Mgr["WeixinMultiAccountManager<br/>全量快照同步 (上限 200)"]
         M1["WeixinMonitor #1 (成员 A)"]
         M2["WeixinMonitor #2 (成员 B)"]
-        Send["每次外发前重授权 preflight"]
+        Send["每次常规外发前 preflight 重授权"]
         Lease --> Mgr
         Mgr --> M1
         Mgr --> M2
@@ -70,7 +70,7 @@ flowchart LR
 
     MemberUI -->|"Bearer / Cookie"| Router
     AdminUI -->|"Admin 鉴权"| Router
-    Router <-->|"X-Service-Token + X-Gateway-Epoch<br/>租约 / 二维码 / 轻推 / 收发重授权"| Lease
+    Router <-->|"X-Service-Token + X-Gateway-Epoch<br/>租约 / 启动恢复 / 二维码 / 轻推 / 收发"| Lease
     M1 <-->|"bot_token A"| ILink
     M2 <-->|"bot_token B"| ILink
     Send -->|"bot_token + context_token"| ILink
@@ -82,44 +82,44 @@ flowchart LR
 
 ### 1.1 团队成员个人操作流程（「个人设置 → 消息与渠道」）
 
-当部署启用 `channel_weixin` 能力，且当前登录用户为在册团队成员（默认覆盖 `admin`、`internal`、`external`；当外部成员接入开关关闭时，对 `external` 成员隐藏卡片与搜索词）时，打开「设置 → 消息与渠道」（`web/src/pages/Settings/panels/IntegrationsPanel.tsx:29,43`，锚点 `#dalton-weixin-bind`，见 `web/src/pages/Settings/sections.ts:295`）可操作重构后的 **「我的微信」卡片**（`web/src/pages/Settings/panels/dalton/DaltonWeixinBindCard.tsx`）：
+当部署启用 `channel_weixin` 能力，且当前登录用户通过实时名册与按层级开关判定（`admin` 与 `internal` 仅受总开关控制；`external` 同时受外部成员开关控制，关闭时对 `external` 成员隐藏卡片与搜索词）时，打开「设置 → 消息与渠道」（`web/src/pages/Settings/panels/IntegrationsPanel.tsx:29,43`，锚点 `#dalton-weixin-bind`，见 `web/src/pages/Settings/sections.ts:295`）可操作重构后的 **「我的微信」卡片**（`web/src/pages/Settings/panels/dalton/DaltonWeixinBindCard.tsx`）：
 
 1. **首次扫码连接（每人限连 1 个微信号）**：
-   - 成员点击「扫码连接个人微信」，调用 `POST /api/v1/dalton/channels/weixin/qrcode/start`。当系统当前活跃轮询账号数已达单网关并发上限（默认 `200`）时，直接返回容量已满提示；通过预检后向网关请求二维码，并在后端持有该成员用户锁时再次复核成员资格与运行开关后写入待扫会话，返回脱敏 `session_key` 与二维码图像（`qrcode_url` / `qrcode_img_content`）。
+   - 成员点击「扫码连接个人微信」，调用 `POST /api/v1/dalton/channels/weixin/qrcode/start`。后端在持有该成员用户锁（Level 1）时先核验成员资格、按成员层级求值运行开关与容量（新占槽位要求活跃轮询数 `< max_concurrent_accounts`，已占槽位账号重扫直接放行），在调用 iLink 前先写入一条 `status = 'starting'` 的待扫会话记录；网关取得二维码后按 `status = 'starting'` 状态条件更新为 `'wait'`（期间若已被撤销则整笔回滚并返回已撤销），向前端返回脱敏 `session_key` 与二维码图像（`qrcode_url` / `qrcode_img_content`）。
    - 前端沿用串行长轮询状态机（`web/src/pages/Settings/panels/dalton/DaltonWeixinBotCard.tsx:74-114`）调用 `GET /api/v1/dalton/channels/weixin/qrcode/wait?session_key=...`（网关对 iLink 单次长轮询最长约 `35s`，后端代理超时 `45s`，前端超时 `50s`；每次返回未终态后间隔 `1.2s` 发起下一轮）：
      - `wait`：展示二维码与提示「请用本人手机微信扫描二维码」；
-     - `scaned`：提示「已扫码，请在手机微信上点击确认登录」（iLink `scaned_but_redirect` 经回写跨区域名后归一展示为 `scaned`）；
+     - `scaned`：提示「已扫码，请在手机微信上点击确认登录」（iLink `scaned_but_redirect` 回写跨区域名后归一展示为 `scaned`）；
      - `verify_code`：风控要求手机端辅助验证码时展示输入框，提交 `POST /api/v1/dalton/channels/weixin/qrcode/verify-code`；
-     - `confirmed`：后端在单事务内同时复核登录会话未撤销、当前账号状态、成员在册资格、渠道总开关与外部成员开关，并核查微信号占用：
-       - 若该 `ilink_user_id` 已被团队内另一名在职成员（含 `active`、`expired` 或因外部成员开关关闭而暂停的账号）关联，拒绝确认并提示 **「该微信号已关联团队内另一账号，请先在原账号解除连接后再试」**；若原持有者已离开团队（名册判定为 `removed`），则按统一锁序安全释放旧记录并完成当前成员绑定；
-       - 若确认响应包含 `ilink_user_id`，账号状态直接置为 **`active`（已连接）**，自动写入 `dalton_channel_identities` 与默认 `dalton_channel_user_settings.apps.weixin`；
-       - 若确认响应缺少 `ilink_user_id`，账号状态置为 **`pending_verification`（已连接，待验证）**，待成员在微信发出首条消息回填 `ilink_user_id` 并通过唯一性核验后转为 `active`（若首条消息回填时发现与团队内他人微信号重复，自动解除该新连接并在微信回复原因）；
-     - `expired`：超过 5 分钟有效期（TTL，Time-To-Live，存活有效期）、被新码取代或账号已被解除时展示「刷新二维码」按钮。
+     - `confirmed`：后端按统一锁序在同一事务内校验登录会话仍处待扫态（`wait` / `scaned` / `verify_code`）、成员实时在册、按该成员层级求值总开关与外部开关、核对轮询槽位容量上限（默认 `200`）并核查微信号占用：
+       - 若该 `ilink_user_id` 已被团队内另一名在职成员（含 `active`、`pending_verification`、`expired` 或 `external_access_disabled` 暂停账号）关联，拒绝确认并提示 **「该微信号已关联团队内另一账号，请先在原账号解除连接后再试」**；若原持有者已离开团队（`disabled_reason = 'member_not_in_roster'`），按全局统一锁序物理删除旧停用行并完成当前成员绑定；
+       - 确认响应包含 `ilink_user_id` 时，账号状态置为 **`active`（已连接）**，自动初始化默认 `dalton_channel_user_settings.apps.weixin`；
+       - 确认响应缺少 `ilink_user_id` 时，账号状态置为 **`pending_verification`（已连接，待验证）**，待微信首条消息回填 `ilink_user_id` 并通过唯一性核验后转为 `active`（首条消息若发现与团队内他人微信号重复，自动解除该新连接、写入审计并用该条入站携带的 `context_token` 直接回复说明原因）；
+     - `expired`：超过 5 分钟有效期（TTL，Time-To-Live，存活有效期）、被新码取代或已被撤销解除时展示「刷新二维码」按钮。
 2. **查看连接与推送状态**：
-   - 状态徽章展示五种明确状态：**已连接**（`active`，绿色）、**已连接，待验证**（`pending_verification`，蓝色，待首条消息核验微信号身份）、**登录已过期**（`expired`，黄色，对应 iLink `-14`）、**渠道已暂停**（总开关关闭或外部成员开关收紧）或 **待连接**（`unconfigured`）。
+   - 状态徽章展示五种明确状态：**已连接**（`active`，绿色）、**已连接，待验证**（`pending_verification`，蓝色）、**登录已过期**（`expired`，黄色，对应 iLink `-14`）、**渠道已暂停**（总开关关闭，或 `external` 成员遇外部开关收紧）或 **待连接**（`unconfigured`）。
    - 已连接状态下展示微信昵称 `ilink_username`、末 4 位掩码 `ilink_user_id`（如 `****a1b2`）、更新时间 `updated_at`、最近收信时间 `last_inbound_at`、**主动推送激活状态**，以及常驻可见的「聊天记录转发指引」（说明使用 `/collect` 逐条转发收集或发送长截图）。
 3. **重新扫码（过期续期或更换微信号，替换原连接）**：
-   - 二维码等待期间独立保存在 `dalton_channel_weixin_login_sessions` 表中，原在线连接在手机确认新码前保持正常收发；确认新码后原子递增 `bot_generation`、替换加密凭据与 `base_url`、清理旧代际 `context_token`：
-     - **同一微信号重扫续期（`ilink_user_id` 相同）**：保持 `scope_key = 'dm:<ilink_user_id>'` 与会话代数 `generation` 不变，延续原对话线程与工作区选择；
+   - 已占轮询槽位的账号（`status IN ('active', 'pending_verification')`）重新扫码在 `200 / 200` 满额时照常放行；新二维码等待期间独立保存在 `dalton_channel_weixin_login_sessions` 表中，原在线连接在手机确认新码前保持正常收发；确认新码后原子递增 `bot_generation`、替换加密凭据与 `base_url`、清理本账号旧代际令牌：
+     - **同一微信号重扫续期（`ilink_user_id` 相同）**：保持 `scope_key = 'dm:<ilink_user_id>'` 与会话代数 `generation` 原值，延续原对话线程与工作区选择；
      - **更换另一微信号（`ilink_user_id` 变化）**：替换原连接，推进会话 `generation + 1`、清空工作区覆盖与待决中断、关闭旧监听，开启新线程。
 4. **本人解除连接**：
    - 成员在设置页点击「解除连接」二次确认（`DELETE /api/v1/dalton/channels/bindings/weixin`）或在微信发送 `/unbind`。
-   - 后端单事务物理删除 `dalton_channel_weixin_accounts` 记录（彻底释放该微信号占用，级联清理 `context_token` 与收集缓冲）、作废该成员所有待扫 `login_sessions`、删除 `dalton_channel_identities (user_id, 'weixin')`、移除 `apps.weixin`、推进会话 `generation + 1`、关闭活跃 `thread_watches`、按固定默认文案写入 `dalton_channel_weixin_audit_logs` 并递增 `accounts_revision`，通知网关立即终止轮询。
+   - 后端单事务物理删除 `dalton_channel_weixin_accounts` 记录（彻底释放该微信号占用，级联清理 `account_tokens` 与收集缓冲）、将该成员所有未终态 `login_sessions`（含 `starting`）置为 `superseded`、移除 `apps.weixin`、推进会话 `generation + 1`、关闭该账号关联 `thread_watches`、按固定默认文案写入 `dalton_channel_weixin_audit_logs` 并递增 `accounts_revision`，通知网关立即终止轮询；若由微信 `/unbind` 触发且该条入站携带 `context_token`，在同一事务返回一次性回执信封由网关直接发出告别提示（豁免活跃账号预检，见 D16）。
 
 ### 1.2 管理员视图与管理权限（「团队管理 → 团队渠道与运维」）
 
 管理员打开「设置 → 团队管理 → 团队渠道与运维」（`web/src/pages/Settings/panels/dalton/DaltonTeamOpsPanel.tsx:50`，重构 `DaltonWeixinBotCard.tsx` 为 **「团队微信渠道管理」卡片**，仅 `callerTier === 'admin'` 可见，见 `web/src/pages/Settings/sections.ts:309`）：
 
-1. **渠道运行期总开关与外部成员接入开关**：
-   - **「启用团队个人微信接入」总开关**（`dalton_channel_weixin_config.enabled`，默认开启）：关闭后暂停新扫码与外发，网关停止全部微信长轮询，数据库保留凭据与游标；重开后免重扫按原游标恢复。
-   - **「允许外部受邀成员（`external`）连接个人微信」开关**（默认开启）：关闭后隐藏 `external` 成员微信入口、拦截其扫码与收发，并将已绑定的 `external` 成员账号置为暂停态（`status = 'disabled', disabled_reason = 'external_access_disabled'`，保留微信号占用，重开开关后自动恢复）。
+1. **渠道运行期总开关与外部成员接入开关（按层级生效，D15）**：
+   - **「启用团队个人微信接入」总开关**（`dalton_channel_weixin_config.enabled`，默认开启）：对全体成员（`admin` / `internal` / `external`）生效；关闭后暂停新扫码与常规外发，网关停止全部微信长轮询，数据库保留凭据与游标；重开后免重扫按原游标恢复。
+   - **「允许外部受邀成员（`external`）连接个人微信」开关**（默认开启）：仅约束 `external` 层级成员，管理员与内部成员（`admin` / `internal`）始终允许扫码与收发；关闭后隐藏 `external` 成员微信入口、拦截其扫码与收发，并将已绑定的 `external` 成员账号置为 `status = 'disabled', disabled_reason = 'external_access_disabled'`（保留微信号占用，15 秒对账保持该暂停态，仅在管理员重新打开该开关时按容量上限恢复）。
    - 顶部提供「去管理我自己的个人微信 →」跳转链接（`#dalton-weixin-bind`）。
 2. **成员状态总览与单实例容量监控**：
-   - 顶部统计栏展示：`在线轮询账号数 / 已连接总数`、`待验证 / 已过期数`、`单网关实例轮询槽位（当前活跃 / 上限 200）`。
-   - 列表展示已绑定账号成员及当前持有待扫二维码会话的成员：姓名与邮箱、层级（`admin` / `internal` / `external`）、**微信昵称 `ilink_username` 与末 4 位掩码 `ilink_user_id`**、状态（`已连接` / `已连接，待验证` / `扫码等待中` / `登录已过期` / `外部暂停` / `离职已停用`）、最近收信时间 `last_inbound_at` 与更新时间 `updated_at`。
+   - 顶部统计栏展示：`在线轮询账号数 / 已连接总数`、`待验证 / 已过期数`、`单网关实例轮询槽位（当前占槽 / 上限 200）`。
+   - 列表展示已绑定账号成员及当前持有待扫会话（`starting` / `wait` / `scaned` / `verify_code`）的成员：姓名与邮箱、层级（`admin` / `internal` / `external`）、**微信昵称 `ilink_username` 与末 4 位掩码 `ilink_user_id`**、状态（`已连接` / `已连接，待验证` / `扫码等待中` / `登录已过期` / `外部暂停` / `离职已停用`）、最近收信时间 `last_inbound_at` 与更新时间 `updated_at`。
 3. **管理员随时代任意成员解除或撤销待扫会话（二次确认 + 预设原因落表审计）**：
-   - 对已有账号行提供「代为解除」（调用 `DELETE /weixin/admin/accounts/{account_id}`），对尚无账号行但处于「扫码等待中」的成员及按成员操作统一提供按成员撤销入口（`DELETE /weixin/admin/users/{target_user_id}/weixin`）。
-   - 二次确认弹窗要求选择预设原因（`离职交接` / `手机遗失应急` / `误绑微信号` / `其他原因`，支持附加说明），在同一数据库事务内物理删除微信账号（释放微信号）、作废待扫二维码、关闭监听并写入 **`dalton_channel_weixin_audit_logs`**（完整记录操作人、目标成员、时间、原因）。
+   - 对已有账号行提供「代为解除」（`DELETE /weixin/admin/accounts/{account_id}`），对尚无账号行但处于「扫码等待中」（含 `starting`）的成员及按成员操作统一提供按成员撤销接口（`DELETE /weixin/admin/users/{target_user_id}/weixin`）。
+   - 二次确认弹窗要求选择预设原因（`离职交接` / `手机遗失应急` / `误绑微信号` / `其他原因`，支持附加说明），在同一事务内物理删除微信账号（释放微信号）、将未终态待扫二维码全部置为 `superseded`、关闭监听并写入 **`dalton_channel_weixin_audit_logs`**（完整记录操作人、目标成员、时间、原因）。
 
 ### 1.3 扫码后微信侧呈现与开始对话方式
 
@@ -136,7 +136,7 @@ flowchart LR
 
 ### 2.1 多账号表结构设计（迁移 `d049_weixin_multi_account.py`）
 
-新增 Alembic（数据库表结构版本迁移工具）脚本 `src/dalton/migrations/versions/d049_weixin_multi_account.py`（`revision = "d049"`，`down_revision = "d046"`），仅操作 `dalton_*` 表，每个 DDL（Data Definition Language，数据定义语言）步骤开头执行 `SET LOCAL lock_timeout = '5s'`（对齐 `src/dalton/migrations/versions/d046_scoped_data_map_cache.py:30`）：
+新增 Alembic（数据库表结构版本迁移工具）脚本 `src/dalton/migrations/versions/d049_weixin_multi_account.py`（`revision = "d049"`，`down_revision = "d046"`），仅操作 `dalton_*` 表，每个步骤开头执行 `SET LOCAL lock_timeout = '5s'`（对齐 `src/dalton/migrations/versions/d046_scoped_data_map_cache.py:30`）：
 
 #### （1）部署级单一网关实例租约表 `dalton_channel_gateway_lease`
 
@@ -144,7 +144,7 @@ flowchart LR
 CREATE TABLE IF NOT EXISTS dalton_channel_gateway_lease (
     singleton_id SMALLINT PRIMARY KEY DEFAULT 1 CHECK (singleton_id = 1),
     instance_id  VARCHAR(128) NOT NULL,               -- 当前持有租约的唯一网关进程 ID
-    epoch        BIGINT NOT NULL DEFAULT 1,           -- 每次新实例接管单调 +1，全写入接口强制校验
+    epoch        BIGINT NOT NULL DEFAULT 1,           -- 每次新实例接管单调 +1，全写入同事务 FOR SHARE 校验
     acquired_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     expires_at   TIMESTAMPTZ NOT NULL,                -- 租约到期时间（45s TTL，15s 心跳续期）
     updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -156,15 +156,17 @@ CREATE TABLE IF NOT EXISTS dalton_channel_gateway_lease (
 ```sql
 CREATE TABLE IF NOT EXISTS dalton_channel_weixin_config (
     singleton_id      SMALLINT PRIMARY KEY DEFAULT 1 CHECK (singleton_id = 1),
-    enabled           BOOLEAN NOT NULL DEFAULT TRUE,  -- 管理员运行期渠道总开关
-    allow_external    BOOLEAN,                        -- 非空时覆盖 settings.py 的 weixin.allow_external
+    enabled           BOOLEAN NOT NULL DEFAULT TRUE,  -- 管理员运行期渠道总开关（全体层级生效）
+    allow_external    BOOLEAN,                        -- 非空时覆盖 settings.py 的 weixin.allow_external（仅约束 external 层级）
     accounts_revision BIGINT NOT NULL DEFAULT 1,      -- 账号/开关每次变更在事务最末尾单调 +1
     updated_by        VARCHAR(255),
     updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 ```
 
-#### （3）个人微信多账号凭据与游标主表 `dalton_channel_weixin_accounts`
+#### （3）个人微信多账号凭据、身份与游标主表 `dalton_channel_weixin_accounts`
+
+新代码以本表作为微信账号与成员微信身份的唯一真值来源（替代旧代码对 `dalton_channel_identities WHERE platform = 'weixin'` 的读写，保持旧身份行原样不动）：
 
 ```sql
 CREATE TABLE IF NOT EXISTS dalton_channel_weixin_accounts (
@@ -172,7 +174,7 @@ CREATE TABLE IF NOT EXISTS dalton_channel_weixin_accounts (
     user_id             VARCHAR(255) NOT NULL UNIQUE                -- 每人限连 1 个微信号
                         CHECK (user_id <> 'system:dalton-company'),
     ilink_bot_id        VARCHAR(255) NOT NULL UNIQUE,               -- iLink 机器人唯一标识
-    ilink_user_id       VARCHAR(255),                               -- 扫码微信号 iLink 用户 ID（待验证阶段可为空）
+    ilink_user_id       VARCHAR(255),                               -- 扫码微信号 iLink 用户 ID（pending_verification 阶段为空）
     prev_ilink_user_id  VARCHAR(255),                               -- 上一次已核验的微信号 ID（供待验证首包判断是否换号）
     ilink_username      VARCHAR(255),                               -- 扫码微信号昵称
     encrypted_bot_token BYTEA NOT NULL,                             -- pgp_sym_encrypt(bot_token, get_encryption_key())
@@ -181,14 +183,17 @@ CREATE TABLE IF NOT EXISTS dalton_channel_weixin_accounts (
     get_updates_buf     TEXT NOT NULL DEFAULT '',                   -- 该账号独立 getupdates 长轮询游标
     status              VARCHAR(32) NOT NULL DEFAULT 'active'
                         CHECK (status IN ('active', 'pending_verification', 'expired', 'disabled')),
-    disabled_reason     VARCHAR(64)                                 -- 仅 status='disabled' 时非空
-                        CHECK (disabled_reason IS NULL OR disabled_reason IN ('member_not_in_roster', 'external_access_disabled')),
+    disabled_reason     VARCHAR(64),
     bot_generation      BIGINT NOT NULL DEFAULT 1,                  -- 账号内重登代际号
     last_inbound_at     TIMESTAMPTZ,
     last_error_code     VARCHAR(64),
     last_error_at       TIMESTAMPTZ,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (
+        (status = 'disabled' AND disabled_reason IN ('member_not_in_roster', 'external_access_disabled'))
+        OR (status <> 'disabled' AND disabled_reason IS NULL)
+    )
 );
 
 -- 微信号占用与释放唯一索引（D6）：
@@ -203,101 +208,54 @@ CREATE INDEX IF NOT EXISTS idx_dalton_wx_accounts_status
     ON dalton_channel_weixin_accounts (status, updated_at DESC);
 ```
 
-#### （4）二维码登录会话表 `dalton_channel_weixin_login_sessions`
+#### （4）多账号上下文令牌表 `dalton_channel_weixin_account_tokens` 与二维码登录会话表 `dalton_channel_weixin_login_sessions`
+
+多账号令牌独立建表（`d049` 从旧表 `dalton_channel_weixin_context_tokens` 复制存量记录，旧表保持原样不动，满足 D10）；登录会话表包含调用 iLink 前预写的 `'starting'` 状态（满足 D14）：
 
 ```sql
+CREATE TABLE IF NOT EXISTS dalton_channel_weixin_account_tokens (
+    account_id              UUID NOT NULL REFERENCES dalton_channel_weixin_accounts(account_id) ON DELETE CASCADE,
+    ilink_bot_id            VARCHAR(255) NOT NULL,
+    bot_generation          BIGINT NOT NULL,
+    platform_user_id        VARCHAR(255) NOT NULL,
+    encrypted_context_token BYTEA NOT NULL,
+    seq                     BIGINT NOT NULL DEFAULT 0,
+    seq_source              VARCHAR(32) NOT NULL DEFAULT 'protocol',
+    protocol_seq_high       BIGINT NOT NULL DEFAULT 0,
+    platform_time_high      BIGINT NOT NULL DEFAULT 0,
+    token_version           BIGINT NOT NULL DEFAULT 1,
+    stale_at                TIMESTAMPTZ,
+    stale_reason            VARCHAR(64),
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (account_id, bot_generation, platform_user_id)
+);
+
 CREATE TABLE IF NOT EXISTS dalton_channel_weixin_login_sessions (
     session_key             VARCHAR(255) PRIMARY KEY,
     user_id                 VARCHAR(255) NOT NULL CHECK (user_id <> 'system:dalton-company'),
     target_account_id       UUID REFERENCES dalton_channel_weixin_accounts(account_id) ON DELETE SET NULL,
-    login_version           BIGINT NOT NULL DEFAULT 1,       -- 会话中间态与跨区域名更新 CAS（Compare-And-Swap，比较并交换）版本号
+    login_version           BIGINT NOT NULL DEFAULT 1,       -- 会话状态流转 CAS（Compare-And-Swap，比较并交换）版本号
     expected_bot_generation BIGINT,                          -- 发起重登时原账号的 bot_generation（首次扫码为 NULL）
-    status                  VARCHAR(64) NOT NULL DEFAULT 'wait'
-                            CHECK (status IN ('wait', 'scaned', 'verify_code', 'confirmed', 'expired', 'superseded')),
-    encrypted_qrcode        BYTEA NOT NULL,                  -- pgp_sym_encrypt(qrcode, get_encryption_key())
+    status                  VARCHAR(64) NOT NULL DEFAULT 'starting'
+                            CHECK (status IN ('starting', 'wait', 'scaned', 'verify_code', 'confirmed', 'expired', 'superseded')),
+    encrypted_qrcode        BYTEA,                           -- starting 阶段为空，写入票据后为 pgp_sym_encrypt(qrcode, key)
     qrcode_img_content      TEXT,                            -- 仅在 wait/scaned/verify_code 保留，终态立即置 NULL
     redirect_base_url       VARCHAR(512) NOT NULL DEFAULT 'https://ilinkai.weixin.qq.com',
     expires_at              TIMESTAMPTZ NOT NULL,
     confirmed_result        JSONB,                           -- 严格限 5 字段白名单: {account_id, connected, already_connected, bot_generation, accounts_revision}
     created_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at              TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CHECK (status IN ('starting', 'expired', 'superseded') OR encrypted_qrcode IS NOT NULL)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_dalton_wx_login_sessions_user_pending
     ON dalton_channel_weixin_login_sessions (user_id)
-    WHERE status IN ('wait', 'scaned', 'verify_code');
+    WHERE status IN ('starting', 'wait', 'scaned', 'verify_code');
 ```
 
-#### （5）`context_token` 表与热表扩展（外键采用 `NOT VALID` + 独立校验）
+#### （5）微信渠道管理与解绑审计表 `dalton_channel_weixin_audit_logs`
 
-所有向既有业务表新增的外键均分两步执行：第一步在 `SET LOCAL lock_timeout = '5s'` 下以 `ADD CONSTRAINT ... NOT VALID` 瞬时添加，第二步在独立语句中执行 `VALIDATE CONSTRAINT ...`（仅持 `SHARE UPDATE EXCLUSIVE` 弱锁，避免全表强锁）：
-
-```sql
-ALTER TABLE dalton_channel_weixin_context_tokens
-    ADD COLUMN IF NOT EXISTS account_id UUID,
-    ADD COLUMN IF NOT EXISTS token_version BIGINT NOT NULL DEFAULT 1,
-    ADD COLUMN IF NOT EXISTS stale_at TIMESTAMPTZ,
-    ADD COLUMN IF NOT EXISTS stale_reason VARCHAR(64);
-
-ALTER TABLE dalton_channel_weixin_context_tokens
-    ADD CONSTRAINT fk_dalton_wx_ctx_tokens_account
-    FOREIGN KEY (account_id) REFERENCES dalton_channel_weixin_accounts(account_id)
-    ON DELETE CASCADE NOT VALID;
-
-CREATE INDEX IF NOT EXISTS idx_dalton_wx_ctx_tokens_account
-    ON dalton_channel_weixin_context_tokens (account_id, bot_generation);
-
-ALTER TABLE dalton_channel_identities
-    ADD COLUMN IF NOT EXISTS weixin_account_id UUID;
-
-ALTER TABLE dalton_channel_identities
-    ADD CONSTRAINT fk_dalton_identities_wx_account
-    FOREIGN KEY (weixin_account_id) REFERENCES dalton_channel_weixin_accounts(account_id)
-    ON DELETE SET NULL NOT VALID;
-
-ALTER TABLE dalton_channel_inbound_events
-    ADD COLUMN IF NOT EXISTS weixin_account_id UUID,
-    ADD COLUMN IF NOT EXISTS encrypted_weixin_media_meta BYTEA; -- 加密保存微信附件 CDN 参数与 AES 密钥
-
-ALTER TABLE dalton_channel_inbound_events
-    ADD CONSTRAINT fk_dalton_inbound_wx_account
-    FOREIGN KEY (weixin_account_id) REFERENCES dalton_channel_weixin_accounts(account_id)
-    ON DELETE SET NULL NOT VALID;
-
-ALTER TABLE dalton_channel_thread_watches
-    ADD COLUMN IF NOT EXISTS weixin_account_id UUID;
-
-ALTER TABLE dalton_channel_thread_watches
-    ADD CONSTRAINT fk_dalton_watches_wx_account
-    FOREIGN KEY (weixin_account_id) REFERENCES dalton_channel_weixin_accounts(account_id)
-    ON DELETE SET NULL NOT VALID;
-
-ALTER TABLE dalton_channel_background_runs
-    ADD COLUMN IF NOT EXISTS weixin_account_id UUID;
-
-ALTER TABLE dalton_channel_background_runs
-    ADD CONSTRAINT fk_dalton_bg_runs_wx_account
-    FOREIGN KEY (weixin_account_id) REFERENCES dalton_channel_weixin_accounts(account_id)
-    ON DELETE SET NULL NOT VALID;
-
-ALTER TABLE dalton_channel_deliveries
-    ADD COLUMN IF NOT EXISTS weixin_account_id UUID,
-    ADD COLUMN IF NOT EXISTS weixin_bot_id VARCHAR(255),
-    ADD COLUMN IF NOT EXISTS weixin_bot_generation BIGINT,
-    ADD COLUMN IF NOT EXISTS weixin_recipient_id VARCHAR(255); -- 持久化实际收件 ilink_user_id
-
-ALTER TABLE dalton_channel_deliveries
-    ADD CONSTRAINT fk_dalton_deliveries_wx_account
-    FOREIGN KEY (weixin_account_id) REFERENCES dalton_channel_weixin_accounts(account_id)
-    ON DELETE SET NULL NOT VALID;
-
--- 数据回填完成后逐条执行低锁校验：
--- ALTER TABLE <table_name> VALIDATE CONSTRAINT <fk_name>;
-```
-
-#### （6）微信渠道管理与解绑审计表 `dalton_channel_weixin_audit_logs`
-
-审计表保存当时的账号与掩码快照，无级联删除外键，账号物理删除后审计记录完整保留；每种 `action` 均规定非空默认 `reason` 文案（见 §4.3）：
+审计表保存当时的账号与掩码快照，账号物理删除后审计记录完整保留；全部 8 种 `action` 均设固定非空默认 `reason` 文案（见 §4.3）：
 
 ```sql
 CREATE TABLE IF NOT EXISTS dalton_channel_weixin_audit_logs (
@@ -320,7 +278,7 @@ CREATE INDEX IF NOT EXISTS idx_dalton_wx_audit_logs_time
     ON dalton_channel_weixin_audit_logs (created_at DESC);
 ```
 
-#### （7）逐条转发材料收集表（含附件分步上传状态跟踪）
+#### （6）逐条转发材料收集表（含 `done` 终态、`flush_prompt` 与附件三步状态跟踪，D4 & D17）
 
 ```sql
 CREATE TABLE IF NOT EXISTS dalton_channel_weixin_collect_buffers (
@@ -330,10 +288,11 @@ CREATE TABLE IF NOT EXISTS dalton_channel_weixin_collect_buffers (
     dalton_user_id      VARCHAR(255) NOT NULL,
     scope_key           VARCHAR(255) NOT NULL,
     session_generation  INTEGER NOT NULL,
-    workspace_id        UUID NOT NULL,          -- 无覆盖工作区时锁存 get_home_workspace_id(dalton_user_id)
+    workspace_id        UUID NOT NULL,          -- 无覆盖工作区时先确保创建 Home 工作区再锁存其 UUID
     initial_prompt      TEXT NOT NULL DEFAULT '',
+    flush_prompt        TEXT,                   -- /done 传入的补充提问（供 flushing 重启恢复使用）
     status              VARCHAR(32) NOT NULL DEFAULT 'collecting'
-                        CHECK (status IN ('collecting', 'flushing', 'completed', 'cancelled', 'expired')),
+                        CHECK (status IN ('collecting', 'flushing', 'done', 'cancelled', 'expired')),
     item_count          INTEGER NOT NULL DEFAULT 0,
     total_text_chars    INTEGER NOT NULL DEFAULT 0,
     attachment_count    INTEGER NOT NULL DEFAULT 0,
@@ -366,60 +325,109 @@ CREATE TABLE IF NOT EXISTS dalton_channel_weixin_collect_items (
 );
 ```
 
-#### （8）全局统一事务加锁顺序与跨成员接管/恢复两阶段加锁规程
+#### （7）热表新增列与 `NOT VALID` 外键（校验移至部署后独立步骤执行，D18）
 
-所有跨表事务严格遵守以下单向递增锁层级（继承并对齐 `src/dalton/database/channel_gateway.py:6-14` 与 `src/dalton/auth/roles.py:206-220`）：
+由于 Alembic `env.py` 在单一事务中执行迁移（`src/dalton/migrations/env.py:75-76`），`d049.upgrade()` 事务内**仅执行毫秒级元数据变更（`ADD COLUMN` 与 `ADD CONSTRAINT ... NOT VALID`）**；5 条外键的 `VALIDATE CONSTRAINT` 全部移出迁移事务，作为服务启动后的独立上线步骤逐条在单独事务中执行（仅持 `SHARE UPDATE EXCLUSIVE` 弱锁，零读写阻塞）：
+
+```sql
+ALTER TABLE dalton_channel_inbound_events
+    ADD COLUMN IF NOT EXISTS weixin_account_id UUID,
+    ADD COLUMN IF NOT EXISTS encrypted_weixin_media_meta BYTEA,
+    ADD COLUMN IF NOT EXISTS collect_buffer_id UUID;
+
+ALTER TABLE dalton_channel_inbound_events
+    ADD CONSTRAINT fk_dalton_inbound_wx_account
+    FOREIGN KEY (weixin_account_id) REFERENCES dalton_channel_weixin_accounts(account_id)
+    ON DELETE SET NULL NOT VALID;
+
+ALTER TABLE dalton_channel_inbound_events
+    ADD CONSTRAINT fk_dalton_inbound_wx_collect_buf
+    FOREIGN KEY (collect_buffer_id) REFERENCES dalton_channel_weixin_collect_buffers(buffer_id)
+    ON DELETE SET NULL NOT VALID;
+
+ALTER TABLE dalton_channel_thread_watches
+    ADD COLUMN IF NOT EXISTS weixin_account_id UUID;
+
+ALTER TABLE dalton_channel_thread_watches
+    ADD CONSTRAINT fk_dalton_watches_wx_account
+    FOREIGN KEY (weixin_account_id) REFERENCES dalton_channel_weixin_accounts(account_id)
+    ON DELETE SET NULL NOT VALID;
+
+ALTER TABLE dalton_channel_background_runs
+    ADD COLUMN IF NOT EXISTS weixin_account_id UUID;
+
+ALTER TABLE dalton_channel_background_runs
+    ADD CONSTRAINT fk_dalton_bg_runs_wx_account
+    FOREIGN KEY (weixin_account_id) REFERENCES dalton_channel_weixin_accounts(account_id)
+    ON DELETE SET NULL NOT VALID;
+
+ALTER TABLE dalton_channel_deliveries
+    ADD COLUMN IF NOT EXISTS weixin_account_id UUID,
+    ADD COLUMN IF NOT EXISTS weixin_bot_id VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS weixin_bot_generation BIGINT,
+    ADD COLUMN IF NOT EXISTS weixin_recipient_id VARCHAR(255);
+
+ALTER TABLE dalton_channel_deliveries
+    ADD CONSTRAINT fk_dalton_deliveries_wx_account
+    FOREIGN KEY (weixin_account_id) REFERENCES dalton_channel_weixin_accounts(account_id)
+    ON DELETE SET NULL NOT VALID;
+```
+
+#### （8）唯一全局事务加锁顺序（零例外，D5, D11, D12）
+
+所有跨表事务严格遵循以下唯一单向递增锁层级，无任何旁路或逆序例外（继承并对齐 `src/dalton/database/channel_gateway.py:6-14,219-235,286-320` 与 `src/dalton/auth/roles.py:206-220`）：
 
 - **Level 0a（角色表锁，仅本地角色增删改事务涉及）**：`dalton_user_roles`（按 `user_id` 升序 `FOR UPDATE`）→ `dalton_credential_holder`（`singleton_id = 1 FOR SHARE`）。
-- **Level 0b（网关单实例 `epoch` 校验与单消息 / 单投递幂等咨询锁）**：读取 `dalton_channel_gateway_lease` 核对当前有效 `epoch`（仅网关租约申请/续期/释放接口单独取 `FOR UPDATE`）→ `pg_advisory_xact_lock(hashtext('dalton_inbound:<platform>:<message_id>'))` / `dalton_delivery:<delivery_key>`。
-- **Level 1（用户级门闩咨询锁与个人设置行锁——首次扫码无账号行时的锁定对象）**：`pg_advisory_xact_lock(hashtext('dalton_user_settings:' || user_id))` +（修改频道设置时）`dalton_channel_user_settings FOR UPDATE`，**涉及多名成员时严格按 `user_id` 字典序升序加锁**（`src/dalton/database/channel_gateway.py:219-235`）。
+- **Level 0b（网关租约行同事务锁与单消息 / 单投递幂等咨询锁，D12）**：
+  - 网关租约申请 / 续期 / 释放接口单独对 `dalton_channel_gateway_lease (singleton_id = 1)` 取 **`FOR UPDATE`**；
+  - 网关发出的**全部受保护写入事务**（含 `I-1`、`I-2`、`I-3`、`/cursor`、`/status`、`reconcile` 写分支、`login-sessions` 写入、收集附件补登与完成、`I-6`、`preflight-send`、`I-7`、`recover`）在同一事务首步执行 `SELECT epoch, expires_at FROM dalton_channel_gateway_lease WHERE singleton_id = 1 FOR SHARE`，核对 `epoch` 相等且 `expires_at > NOW()`（失配立即回滚并返回 HTTP `409 stale_gateway_epoch`；因 `FOR SHARE` 与租约交接的 `FOR UPDATE` 互斥，进行中的写入与租约交接严格串行）；
+  - 随后（如适用）获取 `pg_advisory_xact_lock(hashtext('dalton_inbound:<platform>:<message_id>'))` 或 `dalton_delivery:<delivery_key>`。
+- **Level 1（用户级门闩咨询锁与个人设置行锁）**：`pg_advisory_xact_lock(hashtext('dalton_user_settings:' || user_id))` +（修改频道设置时）`dalton_channel_user_settings FOR UPDATE`，**涉及多名成员时严格按 `user_id` 字典序升序加锁**。**任何需要用户锁的路径（含 `qrcode/start`、`confirm`、本人/管理员解绑、`I-2 /unbind`、名册对账自动恢复、`I-1`/`I-3` 待验证首包回填与重复微信号冲突解除）一律先取 Level 1 用户锁、再取 Level 3a 账号行锁。**
 - **Level 2（群聊咨询锁，飞书 / Discord 群事务保留）**：`_acquire_group_chat_lock`（按平台与群地址升序）。
 - **Level 3（微信账号行锁与微信号唯一性咨询锁）**：
-  - **3a**：`dalton_channel_weixin_accounts`（**涉及多个账号时严格按 `account_id` 升序加锁**：确认、重登、接管、解绑、停用/恢复取 `FOR UPDATE`；入站 `I-1`/`I-3`、游标提交 `/cursor`、状态上报 `/status` 取 `FOR NO KEY UPDATE`，消除锁升级死锁；只读校验取 `FOR SHARE` 或无锁快照）；
-  - **3b**：`pg_advisory_xact_lock(hashtext('dalton_weixin_bot:' || ilink_bot_id))` →（当 `ilink_user_id` 非空时）`pg_advisory_xact_lock(hashtext('dalton_weixin_ilink_user:' || ilink_user_id))`。
+  - **3a**：`dalton_channel_weixin_accounts`（**涉及多个账号时严格按 `account_id` 升序加锁**：`confirm`、重登、接管、解绑、停用/恢复、待验证首包回填取 `FOR UPDATE`；已处于 `active` 态的常规 `I-1`/`I-3`、`/cursor`、`/status` 取 `FOR NO KEY UPDATE`）；
+  - **3b**：`pg_advisory_xact_lock(hashtext('dalton_weixin_bot:' || ilink_bot_id))` →（`ilink_user_id` 非空时）`pg_advisory_xact_lock(hashtext('dalton_weixin_ilink_user:' || ilink_user_id))`。
 - **Level 4（二维码登录会话行锁）**：`dalton_channel_weixin_login_sessions FOR UPDATE`（按 `session_key` 升序）。
-- **Level 5（微信 `context_token` 发送方咨询锁与行锁）**：`dalton_weixin_context:<bot>:<gen>:<sender>`（按三元组升序）→ `dalton_channel_weixin_context_tokens FOR UPDATE`。
-- **Level 6（绑定、身份、会话代数与收集缓冲行锁）**：`dalton_channel_chat_bindings` → `dalton_channel_identities FOR UPDATE` → `dalton_channel_session_generations FOR UPDATE`（按主键升序）→ `dalton_channel_weixin_collect_buffers` / `collect_items FOR UPDATE`。
+- **Level 5（微信 `account_tokens` 发送方咨询锁与行锁）**：`dalton_weixin_context:<bot>:<gen>:<sender>`（按三元组升序）→ `dalton_channel_weixin_account_tokens FOR UPDATE`。
+- **Level 6（绑定、会话代数与收集缓冲行锁）**：`dalton_channel_chat_bindings` → `dalton_channel_session_generations FOR UPDATE`（按主键升序）→ `dalton_channel_weixin_collect_buffers` / `collect_items FOR UPDATE`。
 - **Level 7（事件、监听、后台运行、投递行锁与审计表插入）**：`dalton_channel_inbound_events` → `dalton_channel_thread_watches` → `dalton_channel_background_runs` → `dalton_channel_deliveries`（`FOR UPDATE`）→ `INSERT INTO dalton_channel_weixin_audit_logs`。
-- **Level 8（微信全局配置单行锁——固定为事务最后一步）**：`UPDATE dalton_channel_weixin_config ... WHERE singleton_id = 1 RETURNING accounts_revision`。
+- **Level 8（微信全局配置单行锁——固定为变更账号/配置/槽位事务的最后一步）**：`SELECT / UPDATE dalton_channel_weixin_config WHERE singleton_id = 1 FOR UPDATE`。
 
-**接管已停用账号与自动恢复的统一两阶段加锁协议（D5）**：
-当扫码 `confirm`、首条消息身份回填或名册对账**自动恢复**涉及跨成员微信号核查（可能删除离职成员 `disabled_reason = 'member_not_in_roster'` 的旧账号行，或与原持有人同时重扫/恢复竞争）时，统一执行以下步骤（复用 `_run_tx_with_retry` + `_WeixinSettingsLockSetChanged` 重试机制，见 `src/dalton/database/channel_gateway.py:158-165,286-320`）：
-1. **无锁预发现**：无锁查询当前匹配目标 `user_id`、`ilink_user_id`、`ilink_bot_id` 的全部 `dalton_channel_weixin_accounts` 行与 `dalton_channel_identities` 行，汇总全部受影响的 `affected_user_ids` 与 `affected_account_ids`；
-2. **按 `user_id` 升序加 Level 1 用户设置锁**：锁定排序后的全部 `affected_user_ids`；
-3. **按 `account_id` 升序加 Level 3a 账号排他行锁**：`SELECT * FROM dalton_channel_weixin_accounts WHERE account_id = ANY(%s) ORDER BY account_id ASC FOR UPDATE`；
-4. **加 Level 3b 微信号咨询锁并重新核验集合**：获取 `ilink_bot_id` 与 `ilink_user_id` 咨询锁后，再次查询匹配该 `user_id` / `ilink_user_id` / `ilink_bot_id` 的全部账号行与身份行——若发现新出现的用户或账号不在已锁集合内，立即抛出 `_WeixinSettingsLockSetChanged` 回滚事务并按扩大后的集合从第 1 步重新执行；集合一致后在锁内安全执行接管删除或自动恢复，彻底消除逆序死锁。
+**两阶段统一取锁与 `I-1`/`I-3` 待验证首包回滚重取规程（D5 & D11）**：
+1. **常规多用户/单用户变更路径**（`confirm`、解绑、名册对账自动恢复、首包重入）：① 无锁预查询匹配目标 `user_id`、`ilink_user_id`、`ilink_bot_id` 的全部 `weixin_accounts` 行，汇总受影响 `affected_user_ids` 与 `affected_account_ids`；② 取 Level 0b 锁；③ 按 `user_id` 升序取全部 `affected_user_ids` 的 Level 1 锁；④ 按 `account_id` 升序取全部 `affected_account_ids` 的 Level 3a `FOR UPDATE` 锁；⑤ 取 Level 3b 咨询锁并重新查询核验——若出现新用户或新账号未在已锁集合内，立即抛出 `_WeixinSettingsLockSetChanged` 回滚事务并按扩大后的集合从步骤 ① 重试。
+2. **`I-1` / `I-3` 发现 `pending_verification` 时的强制回滚重取**：常规 `I-1`/`I-3` 快路径跳过 Level 1 直接取 Level 3a `FOR NO KEY UPDATE`；**一旦读到该账号 `status == 'pending_verification'`（需要回填 `ilink_user_id` 或执行重复微信号冲突解绑，涉及 Level 1 用户锁），立即抛出 `_NeedsTwoPhaseVerificationLock` 回滚当前事务以释放已持有的账号行锁，随后按上述步骤 ①～⑤ 从头先取 Level 1 用户锁、再取 Level 3a 账号行锁执行**。
 
-### 2.2 现有单行表存量数据迁移与精确历史回填
+### 2.2 存量数据只复制迁移与精确回填（只写新表新列、保留旧行原样，D10 & D18）
 
-`d049.upgrade()` 在后端与网关均已停止的静默窗口内执行：
+`d049.upgrade()` 在后端与网关均已停止的静默窗口内执行，**全程只建新表、加新列并将存量数据复制填充至新表与新列，保持 `dalton_channel_identities`、`dalton_channel_bind_codes`、`dalton_channel_session_generations`、`dalton_channel_weixin_context_tokens`、`dalton_channel_inbound_events.raw_payload`、`dalton_channel_thread_watches.watch_active`、`dalton_channel_background_runs.fallback_pending` 与 `dalton_channel_deliveries` 既有列逐行原封未动**：
 
 1. **初始化配置表**：插入 `dalton_channel_weixin_config (singleton_id = 1, enabled = TRUE, accounts_revision = 1)`。
-2. **擦除旧表明文扫码票据并冻结旧表**：执行 `UPDATE dalton_channel_weixin_state SET login_qrcode = NULL, login_qrcode_img_content = NULL, login_session_key = NULL, login_status = NULL, login_confirmed_result = NULL WHERE singleton_id = 1`；其余列（原管理员凭据、游标、代际等）**原封保留在 `dalton_channel_weixin_state` 中作为升级前快照，新代码不再读写该表**。
-3. **原管理员账号复制入新表**：若 `dalton_channel_weixin_state (singleton_id = 1)` 含有效凭据（`ilink_bot_id IS NOT NULL AND encrypted_bot_token IS NOT NULL AND owner_user_id IS NOT NULL AND owner_user_id <> 'system:dalton-company'`）：
-   - 确定有效微信号 `eff_ilink_user_id`：优先取 `dalton_channel_weixin_state.ilink_user_id`；若为空，仅当 `dalton_channel_identities (owner_user_id, 'weixin')` 的 `platform_user_id` 在 `dalton_channel_weixin_context_tokens` 存在同 `ilink_bot_id` 记录时取用，否则为 `NULL`；
-   - 插入 `dalton_channel_weixin_accounts`（生成 `new_account_id`；当 `eff_ilink_user_id` 为空且原状态为活跃时置 `status = 'pending_verification'`，过期态归一为 `'expired'`，其余活跃态为 `'active'`）；
-   - 删除 `dalton_channel_identities` 中 `platform = 'weixin'` 且无对应 `dalton_channel_weixin_accounts`（或曾借用同一 `eff_ilink_user_id` 的非属主成员）的孤立行；当 `eff_ilink_user_id` 非空时，确保 `(owner_user_id, 'weixin')` 指向 `eff_ilink_user_id` 且关联 `weixin_account_id = new_account_id`；将 `dalton_channel_bind_codes` 中未使用的微信绑定码标为 `used_at = NOW(), revoked_reason = 'migrated_to_qr_login'`。
-4. **逐类精确回填运行态与历史记录（按原记录实际来源回填，保持已有会话不换线程）**：
-   - **① 私聊会话键与运行态（`dalton_channel_session_generations`）**：微信私聊继续采用 `scope_key = 'dm:<ilink_user_id>'` 与 `external_thread_id = 'weixin:dm:<ilink_user_id>:gen:<generation>'`（`src/dalton/database/channel_gateway.py:360-375`、`inbound.ts:472`）。原管理员的 `generation`、`override_workspace_id`、`pending_interrupt` 原样保留，升级后直接在原线程续聊；其余孤立成员微信会话行推进 `generation = generation + 1` 并清空覆盖工作区与待处理中断。
-   - **② 上下文令牌（`dalton_channel_weixin_context_tokens`）**：按 `ilink_bot_id = account.ilink_bot_id`（且当 `eff_ilink_user_id` 非空时 `platform_user_id = eff_ilink_user_id`）回填 `account_id = new_account_id`，取 `MAX(updated_at)` 回填 `last_inbound_at`，清理其余孤立微信令牌。
-   - **③ 入站事件（`dalton_channel_inbound_events`）**：严格按原事件实际属性回填——仅对 `platform = 'weixin'` 且 `COALESCE(weixin_context_bot_id, raw_payload->>'ilink_bot_id') = account.ilink_bot_id` **且**（`eff_ilink_user_id IS NULL` 或 `raw_payload->>'platform_user_id' = eff_ilink_user_id`）的记录回填 `weixin_account_id = new_account_id`，保留原行的 `weixin_context_bot_generation` 与 `session_generation`；未完成事件中的 `raw_payload.weixin_attachments` 加密迁入 `encrypted_weixin_media_meta`，再统一剥离全表 `raw_payload` 中的明文 AES 密钥与 CDN 下载参数；无主孤立未完成微信事件收敛为 `status = 'ignored', fallback_pending = FALSE`。
-   - **④ 线程监听与后台唤醒（`dalton_channel_thread_watches` / `dalton_channel_background_runs`）**：对 `platform = 'weixin' AND dalton_user_id = owner_user_id`（且 `scope_key = 'dm:' || eff_ilink_user_id`）回填 `weixin_account_id = new_account_id`；其余孤立微信监听置 `watch_active = FALSE`、后台运行置 `fallback_pending = FALSE`。
-   - **⑤ 历史与在途投递（`dalton_channel_deliveries`，D8）**：按每条投递关联的源事件（通过 `run_id` / `thread_id` 反查 `dalton_channel_inbound_events`）精确提取当时的 `(weixin_context_bot_id, weixin_context_bot_generation, raw_payload->>'platform_user_id')` 回填至 `weixin_bot_id`、`weixin_bot_generation` 与 `weixin_recipient_id`（若 `target_address` 形如 `weixin:user:<id>` 则直接取 `<id>` 为 `weixin_recipient_id`），仅当其 `weixin_bot_id = account.ilink_bot_id` 且收件人与 `eff_ilink_user_id` 一致时回填 `weixin_account_id = new_account_id`；无源代际可查的纯历史已完成行保持 `weixin_bot_generation = NULL`，保留真实历史来源。
-5. **外键校验收尾**：依次对 §2.1 (5) 的 6 条 `NOT VALID` 外键执行 `VALIDATE CONSTRAINT`。
+2. **擦除旧表临时扫码票据并冻结旧表（D2）**：执行 `UPDATE dalton_channel_weixin_state SET login_qrcode = NULL, login_qrcode_img_content = NULL, login_session_key = NULL, login_status = NULL, login_confirmed_result = NULL WHERE singleton_id = 1`；旧表中的机器人凭据、属主、游标、代际与微信号（`ilink_bot_id`、`owner_user_id`、`encrypted_bot_token`、`base_url`、`get_updates_buf`、`status`、`bot_generation`、`ilink_user_id`、`ilink_username`）原样冻结保留，新代码停止读写该表。
+3. **原管理员账号与上下文令牌复制入新表**：当 `dalton_channel_weixin_state (singleton_id = 1)` 含有效凭据（`ilink_bot_id IS NOT NULL AND encrypted_bot_token IS NOT NULL AND owner_user_id IS NOT NULL AND owner_user_id <> 'system:dalton-company'`）时：
+   - 确定有效微信号 `eff_ilink_user_id`：优先取 `dalton_channel_weixin_state.ilink_user_id`；若为空，只读查询 `dalton_channel_identities (owner_user_id, 'weixin')` 的 `platform_user_id`，当其在 `dalton_channel_weixin_context_tokens` 存在同 `ilink_bot_id` 记录时采用，否则置为 `NULL`；
+   - 插入新表 `dalton_channel_weixin_accounts`（生成 `new_account_id`；`eff_ilink_user_id` 为空且原状态活跃时置 `'pending_verification'`，原 `session_expired` 置 `'expired'`，其余置 `'active'`）；
+   - 从 `dalton_channel_weixin_context_tokens` 将匹配 `ilink_bot_id = account.ilink_bot_id`（且 `eff_ilink_user_id IS NULL` 或 `platform_user_id = eff_ilink_user_id`）的记录复制插入新表 `dalton_channel_weixin_account_tokens`，取 `MAX(updated_at)` 填入 `weixin_accounts.last_inbound_at`。`dalton_channel_identities`、`dalton_channel_bind_codes`、`dalton_channel_session_generations` 与 `dalton_channel_weixin_context_tokens` 的全部既有行保持原状。
+4. **4 张共享热表仅回填新增列（既有列原封保留）**：
+   - **① 私聊会话键延续**：微信私聊保持 `scope_key = 'dm:<ilink_user_id>'` 与 `external_thread_id = 'weixin:dm:<ilink_user_id>:gen:<generation>'`（`src/dalton/database/channel_gateway.py:360-375`），`dalton_channel_session_generations` 原行原样保留，原管理员升级后直接在原线程与原工作区续聊。
+   - **② 入站事件新增列回填（`dalton_channel_inbound_events`）**：对 `platform = 'weixin'` 且 `COALESCE(weixin_context_bot_id, raw_payload->>'ilink_bot_id') = account.ilink_bot_id` 且（`eff_ilink_user_id IS NULL` 或 `raw_payload->>'platform_user_id' = eff_ilink_user_id`）的记录回填新列 `weixin_account_id = new_account_id`；对其中未完成且 `raw_payload ? 'weixin_attachments'` 的行，将附件密钥加密写入新列 `encrypted_weixin_media_meta`（既有 `raw_payload`、`status`、`fallback_pending` 保持原值，待未来删旧表迁移统一清理历史 `raw_payload`）。
+   - **③ 线程监听新增列回填（`dalton_channel_thread_watches`）**：对 `platform = 'weixin' AND dalton_user_id = owner_user_id AND (eff_ilink_user_id IS NULL OR scope_key = 'dm:' || eff_ilink_user_id)` 回填新列 `weixin_account_id = new_account_id`；其余行保持 `weixin_account_id = NULL` 与原 `watch_active` 值。
+   - **④ 后台运行新增列回填（`dalton_channel_background_runs`，D18）**：因该表无 `scope_key` 列（`src/dalton/migrations/versions/d030_channel_gateway.py:175-188`），严格对齐现有 `_resolve_thread_scope_key_for_thread`（`src/dalton/database/channel_gateway.py:6284-6339`）通过 `thread_id` 关联解析会话键——优先取 `dalton_channel_thread_watches(thread_id).scope_key`（当 `scope_key <> target_address` 时），否则取 `dalton_channel_inbound_events` 中同 `thread_id` 最新一条（`ORDER BY created_at DESC LIMIT 1`）的 `thread_scope_key`（再兜底 `watches.scope_key`）：
+     - 当 `dalton_user_id = owner_user_id` 且 `eff_ilink_user_id IS NOT NULL` 时，对解析出会话键等于 `'dm:' || eff_ilink_user_id`（或 `target_address = 'weixin:user:' || eff_ilink_user_id`）的记录回填 `weixin_account_id = new_account_id`；
+     - 当 `dalton_user_id = owner_user_id` 且 `eff_ilink_user_id IS NULL`（旧微信号为空）时，对同 `thread_id` 最新入站事件来自 `account.ilink_bot_id`（或属主无冲突微信记录）的原属主记录回填 `weixin_account_id = new_account_id`，确保原属主待恢复后台投递继续有效；
+     - **匹配不到的记录保持原样**（`weixin_account_id = NULL`，`fallback_pending` 与 `status` 原值保留），运行时及降级后均由现有基于 `dalton_user_id + thread_id` 的旧恢复逻辑（`src/dalton/database/channel_gateway.py:9240-9273`）处理。
+   - **⑤ 历史与在途投递新增列回填（`dalton_channel_deliveries`，D8 & D18）**：按唯一确定性顺序关联源入站事件——优先当 `run_id IS NOT NULL` 时精确匹配 `dalton_channel_inbound_events (platform = 'weixin', run_id = deliveries.run_id)`，无 `run_id` 时仅当同 `thread_id` 下 `created_at <= deliveries.created_at` 的微信入站事件全部具有唯一 `(weixin_context_bot_id, weixin_context_bot_generation, raw_payload->>'platform_user_id')` 时取用，将机器人 ID、源事件机器人代际与收件人填入新列 `weixin_bot_id`、`weixin_bot_generation`、`weixin_recipient_id`（`target_address` 形如 `weixin:user:<id>` 时直接填入 `weixin_recipient_id`），并在匹配原管理员账号与 `eff_ilink_user_id` 时填入 `weixin_account_id = new_account_id`；来源无法唯一确定的行保持新列为 `NULL`（既有 `status` 列在 `d049` 中原样保留；其中 `status = 'in_flight'` 的遗留行在新网关获租执行 `mode=startup` 或 `I-6` 恢复时统一标为 `status = 'unknown'`）。
 
-### 2.3 降级回退规程与未来旧表清理规则（D2）
+### 2.3 降级回退规程、可恢复状态说明与未来旧表清理规则（D2 & D10）
 
-1. **`d049.downgrade()` 只删新增对象，不写旧表**：
-   - 降级必须在**后端与网关均已停止**的静默窗口内执行（需要保留新审计日志时先将 `dalton_channel_weixin_audit_logs` 导出为 JSONL〔JSON Lines，按行分隔的 JSON 文本格式〕文件）。
-   - `d049.downgrade()` 在 `SET LOCAL lock_timeout = '5s'` 下仅按逆序删除 `d049` 新增的 6 条外键约束、新增列与 7 张新表（`collect_items`、`collect_buffers`、`login_sessions`、`audit_logs`、`weixin_accounts`、`weixin_config`、`gateway_lease`），**不对 `dalton_channel_weixin_state` 执行任何写操作**。
-2. **回退后的明确系统状态与后果**：
-   - 切回上一版本后端与网关镜像启动后，系统直接回到**升级前冻结在 `dalton_channel_weixin_state` 中的单账号状态**：
-     - 原管理员微信机器人使用升级前保存的游标与令牌（游标可能落后于升级期间已收到的消息；若升级期间原管理员重新扫过码使旧令牌失效，在旧管理页重新扫码一次即可恢复）；
-     - 升级后新扫码连接的其他成员微信账号随新表删除而移除（若再次升级多账号版本，各成员重新扫码连接即可）；
-     - 如需在极端故障下连同升级前旧绑定码记录百分百精确还原至升级前一秒状态，直接使用升级前已落盘的全量数据库备份恢复（Everflow 用 `pg_restore`，核心安装用 `scripts/standalone/restore.sh`）。
-3. **旧表未来移除规则**：
-   - `dalton_channel_weixin_state` 在多账号方案线上稳定运行一段时间后，由后续单独的清理迁移执行 `DROP TABLE IF EXISTS dalton_channel_weixin_state`；**该清理迁移的 `downgrade()` 直接抛出 `RuntimeError("dalton_channel_weixin_state was permanently dropped after multi-account stabilization; downgrading past this revision is not supported.")` 并说明原因**。
+1. **`d049.downgrade()` 只删新增对象，旧代码所读数据逐行还原**：
+   - 降级在**后端与网关均已停止**的静默窗口内执行（需留存新审计日志时先将 `dalton_channel_weixin_audit_logs` 导出为 JSONL〔JSON Lines，按行分隔的 JSON 文本格式〕文件）。
+   - `d049.downgrade()` 在 `SET LOCAL lock_timeout = '5s'` 下仅按逆序删除 `d049` 新增的 5 条外键约束、4 张表上的 8 个新增列以及 8 张新表（`collect_items`、`collect_buffers`、`login_sessions`、`account_tokens`、`audit_logs`、`weixin_accounts`、`weixin_config`、`gateway_lease`）。
+2. **回退后的明确系统状态、何时重扫与何时使用全量备份恢复（§6.3 两套回退同步遵循）**：
+   - **升级后直接或短期内回退（原管理员未在多账号期间重新扫码覆盖远端令牌）**：因 `d049` 未删改旧代码读取的任何共享表行与 `raw_payload`，`downgrade d046` 后旧版代码看到的 `dalton_channel_weixin_state` 凭据、`dalton_channel_identities`（含原管理员及升级前已绑定成员）、`dalton_channel_bind_codes`、`dalton_channel_session_generations`、`dalton_channel_weixin_context_tokens` 与停机前未传完入站附件的 `raw_payload.weixin_attachments` **与升级前逐行一致**，启动旧后端与旧网关即可直接恢复升级前单账号运行及未完成附件续传（仅 `get_updates_buf` 停在升级前位置，升级后新扫码的其他成员账号随新表移除）。
+   - **多账号运行期间原管理员曾重新扫码（使升级前旧 `bot_token` 在腾讯侧失效）**：`downgrade d046` 后旧网关用冻结的旧令牌轮询会收到 iLink `-14` 过期错误，原管理员在旧版「团队渠道与运维」页重新扫码一次即可恢复单机器人收发。
+   - **多账号运行期间共享表已产生新业务写入（如成员通过 `/new` 或 `/workspace` 推进了 `dalton_channel_session_generations`、修改了 `dalton_channel_user_settings`、产生了新对话线程，需连同运行期全部共享表变更彻底回退至升级前一刻）**：使用升级前已落盘的全量备份恢复（Everflow 执行 `pg_restore`，核心安装执行 `scripts/standalone/restore.sh`）。
+3. **未来旧表与遗留数据清理迁移规则（D2 & D10）**：
+   - 多账号方案线上稳定运行一段时间后，由后续独立的清理迁移一并执行：`DROP TABLE dalton_channel_weixin_state`、`DROP TABLE dalton_channel_weixin_context_tokens`、清理 `dalton_channel_identities` / `dalton_channel_bind_codes` 中的历史微信旧行，并剥离历史已完成 `dalton_channel_inbound_events.raw_payload` 中的旧版微信媒体字段；**该清理迁移的 `downgrade()` 直接抛出 `RuntimeError("Legacy single-account WeChat tables and rows were permanently removed; downgrading past this revision is unsupported.")` 并说明原因**。
 
 ---
 
@@ -429,78 +437,88 @@ CREATE TABLE IF NOT EXISTS dalton_channel_weixin_collect_items (
 
 #### （1）网关与后端内部契约表（挂于 `/api/v1/dalton/channels/internal/*`，鉴权 `X-Service-Token`）
 
-所有写入类接口及 `recover` 均要求请求头 `X-Gateway-Epoch: <epoch>`（或请求体 `gateway_epoch`）与 `dalton_channel_gateway_lease` 当前有效 `epoch` 一致，过期或失配一律返回 HTTP `409`（`code: "stale_gateway_epoch"`）：
+除租约申请接口 `gateway-lease/acquire` 外，网关发出的**全部写入类内部接口与 `recover`（含二维码登录会话写入 `POST`/`PATCH .../weixin/login-sessions`）**均强制携带请求头 `X-Gateway-Epoch: <epoch>`，后端在同一数据库事务首步 `SELECT ... FOR SHARE` 校验租约有效且 `epoch` 一致，失配或过期一律回滚并返回 HTTP `409`（`code: "stale_gateway_epoch"`）：
 
 | 方向 | 方法与路由 | 能力守卫 | 关键请求字段 | 关键响应字段 |
 |---|---|---|---|---|
 | 网关 → 后端 | `POST .../gateway-lease/acquire` | `CHANNEL_GATEWAY` | `{instance_id, ttl_seconds: 45}` | `{granted: true\|false, epoch, expires_at?, retry_after_ms?}` |
 | 网关 → 后端 | `POST .../gateway-lease/heartbeat` | `CHANNEL_GATEWAY` | `{instance_id, epoch, ttl_seconds: 45}` | `{ok: true, epoch, expires_at}`（失租返回 `409`） |
 | 网关 → 后端 | `POST .../gateway-lease/release` | `CHANNEL_GATEWAY` | `{instance_id, epoch}` | `{ok: true, released: true\|false}` |
-| 网关 → 后端 | `POST .../weixin/accounts/reconcile` | `CHANNEL_GATEWAY` + `CHANNEL_WEIXIN` | 请求头 `X-Gateway-Epoch` + `{since_revision?}` | `{changed, enabled, allow_external, max_concurrent_accounts, accounts_revision, accounts: [{account_id, user_id, ilink_bot_id, ilink_user_id, bot_token, base_url, cdn_base_url, get_updates_buf, bot_generation, status}]}`（`changed: true` 时固定为全量快照） |
+| 网关 → 后端 | `GET .../recover`（`I-7`） | `CHANNEL_GATEWAY`（按已启用子能力过滤） | `X-Gateway-Epoch` + 查询参数 `mode=startup\|watch_reconnect`、`thread_id?` | 现有结构 + 微信未完成入站附带 `decrypted_weixin_attachments`、`collect_buffer_id?`、`workspace_id?` + 顶层 `flushing_collect_buffers` |
+| 网关 → 后端 | `POST .../weixin/accounts/reconcile` | `CHANNEL_GATEWAY` + `CHANNEL_WEIXIN` | `X-Gateway-Epoch` + `{since_revision?}` | `{changed, enabled, allow_external, max_concurrent_accounts, accounts_revision, accounts: [...]}`（`changed: true` 时固定下发全量快照） |
 | 网关 → 后端 | `GET .../weixin/accounts/{account_id}` | `CHANNEL_GATEWAY` + `CHANNEL_WEIXIN` | 查询参数：`recipient_platform_user_id?`、`inbound_message_id?`（纯只读） | `{account_id, user_id, ilink_bot_id, ilink_user_id, bot_token, base_url, cdn_base_url, bot_generation, status, weixin_context_token?, weixin_context_token_version?}` |
 | 后端 → 网关 | `POST /internal/weixin/accounts/sync` | `X-Service-Token` | `{accounts_revision: 42, reason: "account_confirmed"}` | `{ok: true, accepted_revision: 42}` |
 | 网关 → 后端 | `POST .../weixin/accounts/{account_id}/cursor` | `CHANNEL_GATEWAY` + `CHANNEL_WEIXIN` | `X-Gateway-Epoch` + `{expected_bot_generation, expected_ilink_bot_id, expected_get_updates_buf, get_updates_buf}` | `{ok, updated, stale_generation, cas_mismatch, bot_generation, get_updates_buf, status}` |
 | 网关 → 后端 | `POST .../weixin/accounts/{account_id}/status` | `CHANNEL_GATEWAY` + `CHANNEL_WEIXIN` | `X-Gateway-Epoch` + `{action: "mark_session_expired" \| "mark_context_token_stale" \| "reset_corrupt_cursor", expected_bot_generation, expected_ilink_bot_id, error_code?, recipient_platform_user_id?, expected_token_version?}` | `{ok, updated, stale_generation, version_mismatch, accounts_revision}` |
-| 网关 → 后端 | `POST` / `GET` / `PATCH` `.../weixin/login-sessions[/{session_key}]` | `CHANNEL_GATEWAY` + `CHANNEL_WEIXIN` | `POST` 创建待扫会话；`GET` 读取待扫票据或复核有效已确认快照；`PATCH` 执行 `action="update" \| "confirm"`（二维码代理操作不受网关轮询租约阻塞，由 `login_version` CAS 保护） | 见 §3.2 #2 |
-| 网关 → 后端 | `POST .../inbound/register-and-resolve`（`I-1`） | `CHANNEL_GATEWAY` + 按 `body.platform` 校验子能力 | `X-Gateway-Epoch` + 原字段 + 可选 `weixin_account_id`、`weixin_bot_id`、`weixin_bot_generation`、`weixin_context_token`、`weixin_context_seq`、`weixin_media_meta?`、`unsupported_item_types?` | 原字段 + `collection_mode?: "appended" \| "limit_reached"`、`collect_buffer_id?`、`workspace_id`、`has_usable_weixin_context_token?`（名册 `lookup_error` 时返回 `503`） |
+| 网关 → 后端 | `GET` / `PATCH` `.../weixin/login-sessions/{session_key}` | `CHANNEL_GATEWAY` + `CHANNEL_WEIXIN` | `GET` 读取待扫票据或复核有效已确认快照；`PATCH` 携带 `X-Gateway-Epoch` 执行 `action="save_qr" \| "update" \| "confirm"`（全带状态条件，0 行命中整笔回滚返已撤销） | 见 §3.2 #2 |
+| 网关 → 后端 | `POST .../inbound/register-and-resolve`（`I-1`） | `CHANNEL_GATEWAY` + 按 `body.platform` 校验子能力 | `X-Gateway-Epoch` + 原字段 + 可选 `weixin_account_id`、`weixin_bot_id`、`weixin_bot_generation`、`weixin_context_token`、`weixin_context_seq`、`weixin_media_meta?`、`unsupported_item_types?` | 原字段 + `collection_mode?: "appended" \| "limit_reached"`、`collect_buffer_id?`、`workspace_id`、`has_usable_weixin_context_token?`、`one_time_weixin_reply?`（名册 `lookup_error` 返 `503`） |
 | 网关 → 后端 | `POST .../weixin/collect-buffers/{buffer_id}/items/{message_id}/attachments` | `CHANNEL_GATEWAY` + `CHANNEL_WEIXIN` | `X-Gateway-Epoch` + `{uploaded_attachments, upload_failed?: boolean, error_message?: string}` | `{ok: true, upload_status: "ready" \| "failed"}` |
-| 网关 → 后端 | `POST .../bind-code/consume`（`I-2`） | `CHANNEL_GATEWAY` + 按 `body.platform` 校验子能力（含 `unbind`） | `X-Gateway-Epoch` + 原字段 + 可选 `weixin_account_id`、`weixin_bot_id`、`weixin_bot_generation` | 原字段 +（微信 `/unbind` 时）一次性告别凭据 `farewell_weixin_dispatch?` |
+| 网关 → 后端 | `POST .../weixin/collect-buffers/{buffer_id}/finalize` | `CHANNEL_GATEWAY` + `CHANNEL_WEIXIN` | `X-Gateway-Epoch`（供启动恢复继续完成 `flushing` 窗口最后一步） | `{ok: true, status: "done", flushed_inbound?}` |
+| 网关 → 后端 | `POST .../bind-code/consume`（`I-2`） | `CHANNEL_GATEWAY` + 按 `body.platform` 校验子能力（含 `unbind`） | `X-Gateway-Epoch` + 原字段 + 可选 `weixin_account_id`、`weixin_bot_id`、`weixin_bot_generation` | 原字段 +（微信 `/unbind` 时）一次性回执信封 `one_time_weixin_reply?` |
 | 网关 → 后端 | `POST .../session/command`（`I-3`） | `CHANNEL_GATEWAY` + 按 `body.platform` 校验子能力 | `X-Gateway-Epoch` + 原字段（`cmd` 含 `collect`、`done`、`cancel`、`help`）+ 可选微信账号/代际/令牌字段 | 原字段 + `collect_status?`、`flushed_inbound?` |
 | 网关 → 后端 | `POST .../deliveries/authorize-and-claim`（`I-6`） | `CHANNEL_GATEWAY` + 解析 `resolved_platform` 后校验子能力 | `X-Gateway-Epoch` + 原字段 | 原字段 + `weixin_account_id?`、`weixin_bot_id?`、`weixin_bot_generation?`、`weixin_context_token?`、`weixin_context_token_version?` |
 | 网关 → 后端 | `POST .../deliveries/{delivery_key}/preflight-send` | `CHANNEL_GATEWAY` + 按投递行 `platform` 校验子能力 | `X-Gateway-Epoch` + `{delivery_attempt, chunk_index}` | `{authorized: true\|false, deny_code?, bot_token?, base_url?, cdn_base_url?, recipient_id?, weixin_context_token?, weixin_context_token_version?}` |
 | 网关 → 后端 | `POST .../deliveries/progress`、`.../inbound/progress`、`.../steers/reconcile`（`I-7`） | `CHANNEL_GATEWAY` + 按请求或数据库行 `platform` 校验子能力 | `X-Gateway-Epoch` + 原字段 | 原字段（旧 `epoch` 返回 `409`） |
-| 网关 → 后端 | `GET .../recover`（`I-7`） | `CHANNEL_GATEWAY`（按已启用渠道子能力过滤返回行） | `X-Gateway-Epoch` + 查询参数 `mode=startup\|watch_reconnect`、`thread_id?` | 沿用现有结构，在微信未完成入站行顶层附带解密后的 `decrypted_weixin_attachments`（及 `raw_payload.weixin_attachments`） |
 
-#### （2）公开路由、混合平台设置守卫与统一设置读取
+#### （2）公开路由、混合平台设置守卫与按成员层级开关函数（D15）
 
 - **管理端路由**（挂 `CapabilityId.CHANNEL_WEIXIN` 且校验 `is_admin_user`）：
-  - `GET /weixin/admin/overview`：返回 `enabled`、`allow_external`、`max_concurrent_accounts`、`active_poller_count`、网关租约状态、全员脱敏微信状态列表（含待扫会话成员、昵称与末 4 位掩码 ID）及最近 50 条审计记录；
-  - `PUT /weixin/admin/config`：更新 `enabled` / `allow_external`；
-  - `DELETE /weixin/admin/accounts/{account_id}` 与 **`DELETE /weixin/admin/users/{target_user_id}/weixin`**（请求体 `{"reason": "..."}`，支持对尚无 `account_id` 的待扫成员直接执行撤销）。
-- **共享公开与内部路由的逐项子能力门控**：
-  - `GET /bindings` 与 `I-4` `GET /internal/state`（`src/dalton/app/channels_router.py:563-584,891-940`）：仅当 `has_capability(CapabilityId.CHANNEL_WEIXIN)` 为真时才输出 `bindings.weixin`、`identities.weixin` 与 `settings.apps.weixin`；`channel_weixin` 关闭时完全省略微信键；
-  - `PUT /settings` 与 `I-5` `PUT /internal/settings`（`src/dalton/app/channels_router.py:586-619,942-975`）：当 `channel_weixin` 关闭时，若请求显式新增或变更 `settings.apps.weixin`（或传 `platform == "weixin"`）返回 `404`；若仅保存 `feishu` / `discord` 配置，后端保留数据库既有非激活键原状并正常提交飞书 / Discord 变更；
-  - `I-7` `POST /internal/deliveries/progress`（`src/dalton/app/channels_router.py:654-682`）：在 `update_delivery_progress` 内读取 `dalton_channel_deliveries.platform` 后调用 `require_channel_platform_capability(row["platform"])`；
-  - `POST /bind-codes` 与 `DELETE /bindings/{platform}`（`src/dalton/app/channels_router.py:881-889,1017-1033`）：首行调用 `require_channel_platform_capability(platform)`。
-- **Everflow 与 Core 共用同一套设置读取**：在 `src/dalton/settings.py:420-460` 的 `DaltonConfig` 新增 `weixin: DaltonWeixinConfig`（`allow_external: bool = True`、`max_concurrent_accounts: int = 200`），提供 `is_weixin_external_allowed(db_override)`（`!has_capability(CHANNEL_WEIXIN)` 时固定返回 `False`）与 `get_weixin_max_concurrent_accounts()`（支持后端 `DALTON_WEIXIN_MAX_CONCURRENT_ACCOUNTS` 覆盖），`/api/v1/dalton/capabilities` 在 `channel_weixin` 关闭时零微信字段暴露。
+  - `GET /weixin/admin/overview`：返回 `enabled`、`allow_external`、`max_concurrent_accounts`、`active_poller_count`、网关租约状态、全员脱敏微信状态列表（含 `starting`/`wait`/`scaned`/`verify_code` 待扫成员、昵称与末 4 位掩码 ID）及最近 50 条审计记录；
+  - `PUT /weixin/admin/config`：更新 `enabled` / `allow_external`（当有效 `allow_external` 由 `False` 切为 `True` 时，在同一事务按容量上限将满足在册条件的 `disabled_reason = 'external_access_disabled'` 账号恢复为 `active` 并递增 `accounts_revision`）；
+  - `DELETE /weixin/admin/accounts/{account_id}` 与 **`DELETE /weixin/admin/users/{target_user_id}/weixin`**（请求体 `{"reason": "..."}`，支持对尚无 `account_id` 的 `starting`/`wait` 待扫成员直接撤销）。
+- **共享公开与内部路由的逐项子能力门控与新表数据源切换（D10）**：
+  - 全仓微信身份读取点（`src/dalton/database/channel_gateway.py`、`automation_reports.py:1609,2803,3145`、`automation_notifications.py:263`、`data_task_notifications.py:656,678,1683`、`report_delivery.py:435`、`model_prefs.py:886,898`）对 `platform == "weixin"` 统一改为读取新表 `dalton_channel_weixin_accounts`（`status = 'active' AND ilink_user_id IS NOT NULL`），飞书与 Discord 继续读取 `dalton_channel_identities`；
+  - `GET /bindings` 与 `I-4` `GET /internal/state`（`src/dalton/app/channels_router.py:563-584,891-940`）：仅当 `has_capability(CapabilityId.CHANNEL_WEIXIN)` 为真时才输出由新表投影的 `bindings.weixin`、`identities.weixin` 与 `settings.apps.weixin`；`channel_weixin` 关闭时完全省略微信键；
+  - `PUT /settings` 与 `I-5` `PUT /internal/settings`（`src/dalton/app/channels_router.py:586-619,942-975`）：`channel_weixin` 关闭时，显式新增或修改 `settings.apps.weixin`（或传 `platform == "weixin"`）返回 `404`；仅提交 `feishu` / `discord` 配置时保留数据库既有非激活键原状并正常保存；
+  - `I-7` `POST /internal/deliveries/progress`（`src/dalton/app/channels_router.py:654-682`）、`POST /bind-codes` 与 `DELETE /bindings/{platform}`（`channels_router.py:881-889,1017-1033`）：解析出目标 `platform` 后调用 `require_channel_platform_capability(platform)`。
+- **跨形态统一设置与按成员层级开关求值函数 `evaluate_weixin_member_access`（D15）**：
+  - 在 `src/dalton/settings.py:420-460` 的 `DaltonConfig` 新增 `weixin: DaltonWeixinConfig`（`allow_external: bool = True`、`max_concurrent_accounts: int = 200`），提供 `get_weixin_max_concurrent_accounts()`（支持后端 `DALTON_WEIXIN_MAX_CONCURRENT_ACCOUNTS` 覆盖）；
+  - 统一定义 **`evaluate_weixin_member_access(user_tier: str, *, channel_enabled: bool, db_allow_external: bool | None) -> tuple[bool, str | None]`**：
+    1. `!has_capability(CHANNEL_WEIXIN)` 或 `not channel_enabled` → 返回 `(False, "weixin_channel_disabled")`（总开关约束全体成员）；
+    2. `user_tier in ("admin", "internal")` → 直接返回 **`(True, None)`**（内部成员与管理员始终放行，与 `allow_external` 取值无关）；
+    3. `user_tier == "external"` → 计算有效值 `eff_ext = db_allow_external if db_allow_external is not None else get_dalton_config().weixin.allow_external`，为真返回 `(True, None)`，为假返回 `(False, "external_access_disabled")`。
+  - `qrcode/start`、`confirm`、入站（`I-1`/`I-2`/`I-3`）、对账恢复、`I-6` 与 `preflight-send` 全部调用该函数求值。
 
 ### 3.2 关键数据流详解
 
-1. **部署级单实例租约、长轮询批次前 `epoch` 确认与全量快照同步（D1）**：
-   - **网关启动获取租约**：网关启动后循环调用 `POST .../gateway-lease/acquire`（`TTL = 45s`）；若另一实例仍持有未过期租约（`granted: false`），新实例每隔 `3s` 等待重试，期间不轮询、不恢复、不发送。一旦获租拿到 `epoch`，启动每 `15s` 的 `heartbeat` 定时续期；收到 `SIGTERM`/`SIGINT` 时先停止本地协程并调 `release` 立即释放租约。
-   - **长轮询返回双检与旧 `epoch` 即停**：每次 `WeixinMonitor` 从腾讯 `getupdates` 长轮询返回后，在处理这批 `msgs` 之前**先检查本进程租约仍有效**（最近一次心跳成功且距离本地记录的 `expiresAt` 剩余 `> 5s`）；随后在处理每条消息（`I-1` / `I-2` / `I-3`）与提交 `/cursor` 时均附带 `X-Gateway-Epoch`。若旧实例在心跳中断期间被新实例接管（`epoch` 已递增），旧实例发出的第一笔内部写请求即收到 HTTP `409 stale_gateway_epoch`：**被拒的入站批次不推进 `get_updates_buf` 游标**，旧实例立即 `abort()` 全部分支并退出进程，由新实例从持久化游标完整重拉该批消息。
-   - **全量快照对账**：每 `15s`（或收到 `POST /internal/weixin/accounts/sync` 轻推后单飞合并），持有租约的网关调用 `POST .../weixin/accounts/reconcile`：后端先在比较 `since_revision` 之前运行实时名册核验（§4.2），若 `changed: true` 则下发**全量活跃与待验证账号快照**（`status IN ('active', 'pending_verification')`）及 `max_concurrent_accounts`。网关对比本地监控表：快照中已不存在或 `enabled == false` 的账号立即 `abort()` 轮询并清空内存 `botToken`，新增或 `bot_generation` 变化的账号启动/重启 `WeixinMonitor`。
-2. **二维码登录全流程（无撤销空窗 + 跨区跳转 + 已确认重试复核，D6 & D7）**：
-   - **`start` 持锁复核防撤销空窗**：后端预检活跃轮询账号数 `< max_concurrent_accounts` 后代理至网关调 iLink `get_bot_qrcode`；网关回调 `POST .../weixin/login-sessions` 落库时，**后端在获取 Level 1 `dalton_user_settings:<user_id>` 锁后，再次在锁内核验 `check_team_member_status_live == "active"`、`weixin_config.enabled == True` 与有效 `allow_external`**——若在调 iLink 期间该成员刚被管理员撤销或移出名册，直接拒绝写入待扫会话并返回 `403`。
-   - **`wait` 长轮询与跨区 `redirect_host` 回写**：网关调 `GET .../weixin/login-sessions/{session_key}`：
-     - **已确认会话重试先核对账号仍有效（D7）**：若该登录会话 `status == 'confirmed'` 且存有 5 字段 `confirmed_result`，后端**先核查 `confirmed_result.account_id` 在 `dalton_channel_weixin_accounts` 中仍存在、属主一致、`status IN ('active', 'pending_verification')` 且 `bot_generation == confirmed_result.bot_generation`**——核查通过才拼装返回 `connected: true, already_connected: true`；若账号已被解绑、代解除或停用，将该登录会话更新为 `expired` 并返回 `connected: false`，杜绝解除后仍显示「已连接」；
-     - 待扫态下，网关向 `redirect_base_url` 发起约 `35s` 的 `get_qrcode_status` 长轮询（`integrations/dalton-channel-gateway/src/channels/weixin/login-qr.ts:585-696`）；收到 `redirect_host` 或中间态变更时，经 `safeResolveRedirectBaseUrl` 校验后以 `PATCH`（`action="update"`）更新 `redirect_base_url` 与 `status`。
-   - **`confirm` 全条件原子提交**：iLink 返回 `confirmed` 后，网关提取 `bot_token`、`ilink_bot_id` 与专属 `confirmedBaseUrl`（取自 `statusResp.baseurl`，见 `login-qr.ts:727-733`）调用 `PATCH`（`action="confirm"`）：
-     - 后端按 §2.1 (8) 两阶段锁序锁定全部受影响用户与账号，在锁内同时校验：① 登录会话仍处待扫态且未过期；② 原账号（若有）`bot_generation` 未变；③ 成员实时在册 `"active"`；④ 微信号占用规则（若命中其他成员的在职或 `external_access_disabled` 账号则拒绝；若命中 `member_not_in_roster` 离职旧行则物理删除接管并写审计）；⑤ 事务末尾 Level 8 `UPDATE dalton_channel_weixin_config` 的 `WHERE` 子句同时校验 `enabled = TRUE` 及外部成员开关开启；
-     - 若 `ilink_user_id` 非空，账号置 `status = 'active'` 并同步写入 `dalton_channel_identities` 与默认 `apps.weixin`；若 `ilink_user_id` 缺失，账号置 `status = 'pending_verification'`（前端显示「已连接，待验证」）；`confirmed_result` 仅写入 `{account_id, connected: true, already_connected: false, bot_generation, accounts_revision}` 五个字段，擦除 `qrcode_img_content`。
-3. **入站全入口（`I-1` / `I-2` / `I-3`）账号隔离、待验证身份首包核验与 `lookup_error` 5xx 保护**：
-   - `I-1`、`I-2`（`/unbind`）与 `I-3`（全部斜杠指令）统一先校验 `X-Gateway-Epoch` 有效，再锁定 `dalton_channel_weixin_accounts`（`FOR NO KEY UPDATE` / `FOR UPDATE`）校验总开关、外部开关、账号 `status IN ('active', 'pending_verification')` 及 `(ilink_bot_id, bot_generation)` 匹配。
-   - 实时调用三态函数 `check_team_member_status_live`（§4.2）：若返回 **`"lookup_error"`，接口直接返回 HTTP `503`**，网关不推进游标并在退避后重拉重试；若返回 `"removed"` 则归档拒绝。
-   - 当账号处于 `'pending_verification'`（`ilink_user_id IS NULL`）且收到首条单聊事件（含普通消息或斜杠指令）时，按 §2.1 (8) 两阶段锁序核验入站 `platform_user_id`：
-     - **未冲突**：回填 `ilink_user_id`、将账号状态更新为 `'active'`、建立 `dalton_channel_identities`（若与 `prev_ilink_user_id` 不同则推进会话 `generation + 1`），继续正常处理该条消息或指令；
-     - **与团队内其他占用微信号冲突（D6）**：物理删除本条 `pending_verification` 账号行、写入 `conflict_auto_unbound` 审计记录、递增 `accounts_revision`，并在本条入站携带非空 `context_token` 时一次性向微信回复冲突解除原因。
-4. **出站选号、每次外部发送前重授权 `preflight-send` 与已发请求结算（D8）**：
-   - **首次抢占（`I-6`）**：原会话关联投递（当前回合回复、重放、HITL〔Human-in-the-Loop，人工介入确认〕提问、指令回执、线程监听）严格核对源事件的 `(weixin_account_id, platform_user_id, session_generation)` 与当前活跃账号完全一致，改绑微信号后以 `weixin_account_rebound` 拒绝；新建主动推送按目标成员当前 `status == 'active'` 账号选取（具名 `weixin:user:<id>` 额外要求 `account.ilink_user_id == <id>`）。抢占时在 `dalton_channel_deliveries` 固化 `weixin_account_id`、`weixin_bot_id`、`weixin_bot_generation` 与 `weixin_recipient_id`。
-   - **每次调用 iLink 前实时重授权（`preflight-send`）**：网关在发送每一段文本分片前、文件上传前及上传完成后的 `sendmessage` 前，均调用 `POST .../deliveries/{delivery_key}/preflight-send` 实时复核：`gateway_epoch` 有效、收件成员实时在册 `"active"`、账号 `status == 'active'`、`account.bot_generation == delivery.weixin_bot_generation`、总开关与外部成员开关均开启，并取回最新有效 `context_token`。一旦中途发生解绑、停用、代际切换或开关关闭，立即阻断后续分段/附件向腾讯发出。
-   - **已发 iLink 请求的独立结算**：调用 `sendWeixinMessage` 前连接失败或收到明确业务错误码时按 `failed`（已有成功前序分片则为 `partial`）结算；**当请求已向 iLink 发出（`requestSent === true`）但遇到响应超时、连接断开、进程收到 `409 stale_gateway_epoch` 或信号退出时，单独结算为 `status = 'unknown'`**，不重发结果未明的分片。
+1. **部署级单实例租约、严格启动顺序与长轮询双检（D1, D12, D13）**：
+   - **获租 → 先完成 `mode=startup` → 再开放轮询与投递认领（D13）**：网关启动后（改造 `integrations/dalton-channel-gateway/src/server.ts:501-523`）循环调用 `POST .../gateway-lease/acquire`（`TTL = 45s`）；租约被他人持有且未过期时每 `3s` 等待重试，期间零轮询、零发送。一旦获租取得 `epoch`：① 启动每 `15s` 的 `heartbeat` 续期定时器；② **同步调用 `GET .../recover?mode=startup`（携带 `X-Gateway-Epoch`）并等待其成功返回**，在数据库事务内先行将前代遗留的全部 `in_flight` 投递结算为 `unknown / gateway_restarted`；③ **`mode=startup` 成功后，才开放出站投递认领（`I-6`）、启动飞书/Discord 适配器与微信 `reconcile` + `WeixinMonitor` 长轮询，并分派本次恢复返回的入站行、收集窗口、监听与后台运行**。
+   - **长轮询返回双检与同事务 `FOR SHARE` 围栏（D1, D12）**：每次 `WeixinMonitor` 从腾讯 `getupdates` 返回后，处理批次前先确认本地租约仍有效（最近心跳成功且距本地 `expiresAt` 剩余 `> 5s`）；随后每笔写入请求在后端同一事务首步 `SELECT ... FOR SHARE` 网关租约行校验 `epoch`。旧进程一旦在任意心跳或写入请求收到 `409 stale_gateway_epoch`，**保持原 `get_updates_buf` 游标未推进，跳过一切本地 `I-7` 结算，立即 `abort()` 全部协程并退出进程**，由新进程在 `mode=startup` 统一结算旧投递并按原游标重拉消息。
+   - **全量快照对账**：每 `15s`（或收到 `POST /internal/weixin/accounts/sync` 轻推后单飞合并），持租网关调用 `POST .../weixin/accounts/reconcile`：`changed: true` 时固定下发**全量活跃与待验证账号快照**（`status IN ('active', 'pending_verification')`）及 `max_concurrent_accounts`，网关据此启停或按新 `bot_generation` 重建 `WeixinMonitor`。
+2. **二维码登录全流程（`starting` 预写 + 状态条件防覆盖 + 容量与层级开关校验，D7, D14, D15, D18）**：
+   - **`start` 预写 `starting` 会话消除首次扫码撤销空窗（D14）**：后端在调用网关/iLink 之前，先在数据库事务内获取该成员 Level 1 用户锁，核验实时在册 `"active"`、`evaluate_weixin_member_access` 通过以及容量预检（该成员尚无 `active`/`pending_verification` 占槽账号时要求当前占槽数 `< max_concurrent_accounts`；已占槽账号重扫直接放行），将该成员此前未终态的登录会话全部置为 `superseded`，**插入一条 `status = 'starting', login_version = 1, expires_at = NOW() + INTERVAL '60 seconds'` 的待扫会话并提交**。随后通过网关调 iLink `get_bot_qrcode`，网关携 `X-Gateway-Epoch` 回调 `PATCH .../login-sessions/{session_key}`（`action="save_qr"`）：后端在 Level 0b `FOR SHARE` + Level 1 用户锁 + Level 4 会话锁内复核成员资格与开关，并执行**带状态条件更新 `UPDATE dalton_channel_weixin_login_sessions SET status = 'wait', encrypted_qrcode = ..., qrcode_img_content = ..., expires_at = NOW() + INTERVAL '5 minutes', login_version = 2 WHERE session_key = %s AND status = 'starting' AND login_version = 1 AND expires_at > NOW()`——若 `rowcount == 0`（期间已被管理员按成员撤销或本人解绑置为 `superseded`），整笔事务回滚并返回 HTTP `409`（「已撤销」）**。
+   - **`wait` 长轮询、`update` 状态条件与已确认重试复核（D7, D14）**：
+     - 若 `GET .../login-sessions/{session_key}` 读到 `status == 'confirmed'`，后端先核查 `confirmed_result.account_id` 在 `weixin_accounts` 中仍存在、属主一致、`status IN ('active', 'pending_verification')` 且 `bot_generation == confirmed_result.bot_generation`——核查通过才返回 `connected: true, already_connected: true`，否则将该会话置为 `expired` 并返回 `connected: false`；
+     - 待扫态下，网关向 `redirect_base_url` 发起约 `35s` 的 `get_qrcode_status` 轮询（`login-qr.ts:585-696`）；收到中间态（`scaned` / `verify_code`）或跨区 `redirect_host` 时，携 `X-Gateway-Epoch` 调用 `PATCH`（`action="update"`），执行 **`UPDATE dalton_channel_weixin_login_sessions SET ... login_version = login_version + 1 WHERE session_key = %s AND status IN ('wait', 'scaned', 'verify_code') AND login_version = %s AND expires_at > NOW()`——若 `rowcount == 0`，整笔事务回滚并返回 `{revoked: true, status: "superseded"}`（「已撤销」）**。
+   - **`confirm` 全条件原子提交与槽位容量门控（D14, D15, D18）**：iLink 返回 `confirmed` 后，网关提取 `bot_token`、`ilink_bot_id` 与专属 `confirmedBaseUrl`（`login-qr.ts:727-733`）携 `X-Gateway-Epoch` 调用 `PATCH`（`action="confirm"`）：
+     - 后端按 §2.1 (8) 全局唯一锁序锁定 Level 0b（租约 `FOR SHARE`）→ Level 1（全部受影响 `user_id` 升序）→ Level 3a（全部受影响 `account_id` 升序 `FOR UPDATE`）→ Level 3b（微信号咨询锁并重验集合）→ Level 4（`login_sessions FOR UPDATE`）→ Level 8（`weixin_config FOR UPDATE`）；
+     - 在锁内依次校验：① 登录会话条件更新 `WHERE session_key = %s AND status IN ('wait', 'scaned', 'verify_code') AND login_version = %s AND expires_at > NOW()`，**`rowcount == 0` 立即整笔回滚并返回「已撤销」**；② 原账号（若有）`bot_generation` 与 `expected_bot_generation` 一致；③ 成员实时在册 `"active"` 且读取 `weixin_config` 后调用 **`evaluate_weixin_member_access(user_tier, channel_enabled=cfg.enabled, db_allow_external=cfg.allow_external)` 返回 `(True, None)`**（不通过立即回滚）；④ 微信号占用核查（命中他人在职或 `external_access_disabled` 账号则回滚拒绝；命中 `member_not_in_roster` 离职旧行则物理删除接管并写审计）；⑤ **轮询槽位容量检查（D18）**：查询除当前成员既有账号外的占槽数 `SELECT COUNT(*) FROM dalton_channel_weixin_accounts WHERE status IN ('active', 'pending_verification') AND user_id <> %s`，若 `>= max_concurrent_accounts` 则整笔回滚并返回容量已满（原已占槽账号重扫自动满足 `< max_concurrent_accounts`，满额时照常替换连接）；⑥ 执行 Level 8 配置行条件更新 `UPDATE dalton_channel_weixin_config SET accounts_revision = accounts_revision + 1, updated_at = NOW() WHERE singleton_id = 1 AND enabled = TRUE AND (%s <> 'external' OR COALESCE(allow_external, %s) = TRUE) RETURNING accounts_revision`，**若影响 `0` 行立即整笔回滚**；
+     - `ilink_user_id` 非空置 `status = 'active'`，缺失置 `status = 'pending_verification'`；`confirmed_result` 仅保存 `{account_id, connected: true, already_connected: false, bot_generation, accounts_revision}` 五字段并清空 `qrcode_img_content`。
+3. **入站全入口（`I-1` / `I-2` / `I-3`）统一锁序、待验证首包回滚重取与回执例外（D11, D16）**：
+   - **同事务校验 `epoch` 与开关**：所有入站事务首步在 Level 0b 对 `gateway_lease` 取 `FOR SHARE` 校验 `epoch`；`I-2`（`/unbind`）先无锁预查账号 `user_id`、按顺序先取 Level 1 用户锁再取 Level 3a `weixin_accounts FOR UPDATE`；`I-1` 与 `I-3` 快路径直接取 Level 3a `weixin_accounts FOR NO KEY UPDATE`。
+   - **三态名册与层级开关校验**：调用 `check_team_member_status_live`（返回 `"lookup_error"` 时直接回滚返回 HTTP `503`，网关保留游标稍后重试；返回 `"removed"` 则归档拒绝）与 `evaluate_weixin_member_access`。
+   - **待验证首包强制回滚重取与冲突回执（D11, D16）**：当 `I-1` 或 `I-3` 读到账号 `status == 'pending_verification'` 时，若当前事务尚未先持有 Level 1 用户锁而已持有 Level 3a 账号锁，**立即回滚当前事务，改为按 §2.1 (8) 两阶段规程从头先按 `user_id` 升序取 Level 1 用户锁、再按 `account_id` 升序取 Level 3a `FOR UPDATE` 锁**：
+     - **微信号未冲突**：回填 `ilink_user_id`、置 `status = 'active'`、初始化默认 `apps.weixin`（若与 `prev_ilink_user_id` 变化则推进会话 `generation + 1`），继续处理本条消息或指令；
+     - **微信号与团队内其他占用记录冲突（D6, D16）**：在同一事务内物理删除该 `pending_verification` 账号行、写入 `conflict_auto_unbound` 审计日志、递增 `accounts_revision`，并在本条入站携带非空 `weixin_context_token` 时在响应中返回一次性 `one_time_weixin_reply` 信封，由网关用该条入站的 `context_token` 直接调用 `sendWeixinMessage` 回复冲突解除原因（与 `/unbind` 告别回执同属 D16 回执例外，跳过活跃账号预检）。
+4. **出站选号（源事件机器人代际强核对）、每次发送前 `preflight-send` 与结算（D8, D13, D16, D18）**：
+   - **首次认领（`I-6`）核对源事件 `weixin_bot_generation`（D18）**：原会话关联投递（当前回合回复、重放、HITL〔Human-in-the-Loop，人工介入确认〕提问、普通指令回执、线程监听）优先按 `inbound_message_id`、其次按 `run_id` 精确查出源入站事件（`src/dalton/database/channel_gateway.py:6364-6386`；来源事件缺失或代际不明的遗留在途投递直接结算为 `status = 'unknown', error_code = 'source_generation_unknown'`），**强制校验源事件的 `(weixin_account_id, weixin_context_bot_id, weixin_context_bot_generation, platform_user_id, session_generation)` 与当前活跃账号（`account.account_id`, `account.ilink_bot_id`, `account.bot_generation`, `account.ilink_user_id`）及当前会话代数完全一致**——同号重扫前延迟到达的旧代际回复因 `weixin_context_bot_generation != account.bot_generation` 直接以 `weixin_bot_generation_superseded` 拒绝，换号后以 `weixin_account_rebound` 拒绝；新建主动推送按目标成员当前 `status == 'active'` 账号选取，并在 `dalton_channel_deliveries` 固化 `weixin_account_id`、`weixin_bot_id`、`weixin_bot_generation`、`weixin_recipient_id`。
+   - **每次向 iLink 发送前实时重授权（`preflight-send`）**：除 D16 两类一次性解绑/冲突回执外，每一段文本分片、媒体上传前及上传完成后的 `sendmessage` 前均调用 `POST .../deliveries/{delivery_key}/preflight-send`（同事务 `gateway_lease FOR SHARE` 校验 `epoch` + 实时名册 `"active"` + `evaluate_weixin_member_access` 通过 + `account.status == 'active'` + `account.bot_generation == delivery.weixin_bot_generation`），取回最新有效 `context_token` 后再发往腾讯。
+   - **已发请求与旧 `epoch` 结算规则（D8, D13）**：当前有效 `epoch` 下，请求已向 iLink 发出（`requestSent === true`）而遇网络超时或连接中断时结算为 `status = 'unknown'`；进程一旦收到 `409 stale_gateway_epoch` 则停止一切 `I-7` 结算并退出，由新获租进程的 `mode=startup` 统一将其遗留 `in_flight` 投递标为 `unknown`。
 
 ### 3.3 单实例多账号长轮询容量上限与退避策略
 
-1. **单实例容量上限 `200`（D1）**：默认并发活跃账号上限 `200` 唯一定义在后端 `DaltonConfig.weixin.max_concurrent_accounts`（可通过后端 `DALTON_WEIXIN_MAX_CONCURRENT_ACCOUNTS` 调整）；后端在扫码准入时按当前活跃/待验证账号数拦截超限请求，网关直接读取 `reconcile` 返回的 `max_concurrent_accounts` 初始化**长轮询专用连接池**（`connections = max_concurrent_accounts + 16`）与独立的**控制/出站发送专用连接池**（`connections = 64`），网关本地不另设独立上限环境变量。
-2. **错峰启动与三级退避**：批量恢复账号按 **每秒最多启动 10 个账号 + `0 ~ 500ms` 随机抖动** 错峰建连；单账号网络或 5xx 异常（含名册 `lookup_error` 触发的 `503`）按 `min(2000ms * 2^min(failures - 1, 4), 30000ms) + random(0..500ms)` 独立退避且保持原游标；10 秒内 `>= 3` 个账号收到 HTTP 429 时触发出口 IP（Internet Protocol，网络协议地址）级协同冷却。
+1. **单实例容量上限 `200`（确认与自动恢复时锁内拦截，D1 & D18）**：默认并发占槽上限 `200` 唯一定义在后端 `DaltonConfig.weixin.max_concurrent_accounts`（可通过后端 `DALTON_WEIXIN_MAX_CONCURRENT_ACCOUNTS` 覆盖）；在 `qrcode/start` 预检、`confirm` 提交与自动恢复（名册恢复及外部开关重开恢复）时于 Level 8 配置行锁内校验占槽数 `< max_concurrent_accounts`，已占槽账号重扫替换连接直接放行；网关从 `reconcile` 读取该值初始化长轮询连接池（`max_concurrent_accounts + 16`）与独立控制/发送连接池（`64`）。
+2. **错峰启动与三级退避**：批量恢复按 **每秒最多启动 10 个账号 + `0 ~ 500ms` 抖动** 错峰建连；单账号网络或 5xx 异常（含名册 `lookup_error` 触发的 `503`）按指数退避（上限 `30s`）独立重试且保留游标；10 秒内 `>= 3` 个账号遇 HTTP 429 时触发出口 IP（Internet Protocol，网络协议地址）级协同冷却。
 
-### 3.4 唯一网关实例的启动恢复与附件解密续传（D1 & D9）
+### 3.4 唯一网关实例的启动恢复、收集条目续传与 `flushing` 窗口恢复（D1, D9, D13, D17）
 
-1. **获租后执行全局 `mode=startup` 恢复**：网关成功取得 `dalton_channel_gateway_lease` 租约后，调用 `reconcile` 拉起微信长轮询，并调用 `GET /api/v1/dalton/channels/internal/recover?mode=startup`（携带 `X-Gateway-Epoch`）。因全部署同一时刻仅这一个网关实例运行，后端校验 `epoch` 后直接沿用现有 `recover_channel_state(mode="startup")`（`src/dalton/database/channel_gateway.py:9279-9420`）统一将前代进程遗留的全部平台 `in_flight` 投递标为 `unknown / gateway_restarted`，并恢复未完成的入站回合、后台监听与自动化结算。
-2. **微信入站附件恢复字段与优先读取顺序（D9）**：
-   - 后端在 `GET /internal/recover` 返回未完成微信入站行（`encrypted_weixin_media_meta IS NOT NULL`）时，在内存中解密 `WeixinPersistedAttachmentMeta[]`（含 `id`、`filename`、`mimeType`、`sizeBytes`、`kind`、`encryptQueryParam`、`fullUrl`、`aesKeyHex`、`aesKeyBase64`），同时填入返回行顶层字段 **`row.decrypted_weixin_attachments`** 及返回副本的 **`row.raw_payload.weixin_attachments`**（数据库列不改写）。
-   - 网关升级 `recoverSingleInboundRow` 与 `parseRecoveredAttachments`（`integrations/dalton-channel-gateway/src/orchestrator.ts:7893-7903,7970-7973`）：对 `row.platform === "weixin"`，**优先读取解密材料 `row.decrypted_weixin_attachments ?? row.raw_payload?.weixin_attachments`**，仅在二者均为空时回退读取普通描述 `row.raw_payload?.attachments`，并将解密数组同步写入 `syntheticEvent.rawPayload.weixin_attachments`，使 `downloadAndUploadAttachments` 跳过 `row.uploaded_attachments` 中已完成的附件、用解密密钥续传剩余附件。
-3. **离线消息保留边界与游标容错**：网关仅在整批消息全部经后端落库成功后提交 `/cursor`（`monitor.ts:215-255`），重拉时由 `(platform, message_id)` 主键保证单次触发；腾讯服务端离线消息保留时长归入 §7.4 实机测定，遇到非 `-14` 的损坏游标错误码时通过 `reset_corrupt_cursor` 重置游标恢复轮询。
+1. **严格先恢复后轮询（D13）**：网关获租后首先同步执行 `GET /api/v1/dalton/channels/internal/recover?mode=startup`（同事务 `gateway_lease FOR SHARE` 校验 `epoch`），后端沿用 `recover_channel_state(mode="startup")`（`src/dalton/database/channel_gateway.py:9193,9279-9305`）将前代遗留的全部 `in_flight` 投递统一置为 `unknown / gateway_restarted`，并返回未完成入站行、`flushing_collect_buffers`、活跃监听、后台运行（含 `weixin_account_id IS NULL` 交旧逻辑恢复的行）与自动化运行；待该请求成功返回后，网关再启动轮询与新投递认领。
+2. **入站附件解密续传与收集模式专属恢复分支（D9 & D17）**：
+   - 后端在 `GET /internal/recover` 返回未完成微信入站行（`encrypted_weixin_media_meta IS NOT NULL`）时，内存解密出 `WeixinPersistedAttachmentMeta[]` 填入返回行顶层 **`row.decrypted_weixin_attachments`** 及返回副本的 **`row.raw_payload.weixin_attachments`**，并附带 `row.collect_buffer_id` 与 `row.workspace_id`。
+   - 网关升级 `recoverSingleInboundRow` 与 `parseRecoveredAttachments`（`integrations/dalton-channel-gateway/src/orchestrator.ts:7893-7903,7970-7973,8607-8634`）：对微信行优先读取解密材料 `row.decrypted_weixin_attachments ?? row.raw_payload?.weixin_attachments`（回退 `row.raw_payload?.attachments`），跳过 `row.uploaded_attachments` 已完成项下载上传剩余附件：
+     - **收集窗口条目恢复分支（`row.collect_buffer_id != null`，D17）**：将剩余附件上传至 `row.workspace_id` 后，**仅调用 `POST .../weixin/collect-buffers/{buffer_id}/items/{message_id}/attachments` 幂等补登并直接返回，跳过 `executeRegisteredInboundTurn`（绝不单独启动对话回合）**；
+     - **普通对话入站行（`row.collect_buffer_id == null`）**：续传完成后按原有 Case 1～4 恢复对话回合；
+     - **`flushing` 收集窗口恢复（`recovery.flushing_collect_buffers`，D17）**：在收集条目附件恢复启动后，对每个仍处 `status = 'flushing'` 的窗口调用 `POST .../weixin/collect-buffers/{buffer_id}/finalize`（在事务外等待该窗口剩余未完成附件最多 30 秒，再在单事务内登记合成入站事件 `collect:<buffer_id>` 并将窗口置为 `'done'`），取得 `flushed_inbound` 后启动单次智能体回合。
 
 ---
 
@@ -508,70 +526,66 @@ CREATE TABLE IF NOT EXISTS dalton_channel_weixin_collect_items (
 
 ### 4.1 成员级严格会话隔离
 
-1. **物理通道与入站强校验**：单账号专属 `bot_token` 长轮询 + `I-1`/`I-2`/`I-3` 强核对 `(weixin_account_id, ilink_bot_id, bot_generation)` 与单聊 `platform_user_id == account.ilink_user_id`。
-2. **私聊会话键与用户级线程隔离**：统一保持 `scope_key = 'dm:<ilink_user_id>'` 与 `external_thread_id = 'weixin:dm:<ilink_user_id>:gen:<generation>'`（`src/dalton/database/channel_gateway.py:360-375`），由 `dalton_channel_session_generations` 主键 `(platform, scope_key, dalton_user_id)` 与 `lookup_thread_by_external_id` 的 `user_id` 过滤（`src/server/database/conversation/threads_read.py:41-44`）实现跨成员隔离与同微信号重扫无缝续聊。
-3. **工作区写权限校验**：切换工作区实时调用 `_verify_workspace_write_permission`（`src/dalton/database/channel_gateway.py:424-451`）。
+1. **物理通道与入站分流校验**：每个账号使用独立 `bot_token` 长轮询；入站 `I-1`/`I-2`/`I-3` 强核对 `(weixin_account_id, ilink_bot_id, bot_generation)`——账号处于 `'active'` 时直接要求单聊 `platform_user_id == account.ilink_user_id`，处于 `'pending_verification'`（`ilink_user_id IS NULL`）时先分流进入 §2.1 (8) 两阶段锁序完成微信号回填与唯一性核验。
+2. **私聊会话键与用户级线程隔离**：统一保持 `scope_key = 'dm:<ilink_user_id>'` 与 `external_thread_id = 'weixin:dm:<ilink_user_id>:gen:<generation>'`（`src/dalton/database/channel_gateway.py:360-375`），由 `dalton_channel_session_generations` 主键 `(platform, scope_key, dalton_user_id)` 与 `lookup_thread_by_external_id` 的 `user_id` 过滤（`src/server/database/conversation/threads_read.py:41-44`）实现跨成员隔离与同微信号重扫原线程续聊。
+3. **工作区写权限校验**：切换工作区与收集材料均实时调用 `_verify_workspace_write_permission`（`src/dalton/database/channel_gateway.py:424-451`）。
 
-### 4.2 三态名册核验、微信号释放边界与零空窗撤销（D3, D6, D7）
+### 4.2 三态名册核验、按原因隔离恢复与微信号释放边界（D3, D6, D15, D18）
 
 1. **严格复用现有在册定义的三态核验函数（D3）**：
-   - 在 `src/dalton/access_tiers.py` 新增 `check_team_member_status_live(user_id, *, email=None, conn=None) -> Literal["active", "removed", "lookup_error"]`，直接复用 `src.dalton` 既有在册定义，显式透传数据库异常（不调用吞异常返回空集的 `_fetch_db_member_emails_live`，见 `src/dalton/invites.py:89-109`）：
-     - **核心安装 / 本地认证模式（`is_dalton_local_auth_enabled() == True`）**：复用 `src.dalton.auth.roles.get_user_role(uid, conn=conn)`（`src/dalton/auth/roles.py:54-80`）——返回 `"admin" | "internal" | "external"` 判为 `"active"`；查询正常返回 `None` 判为 `"removed"`；数据库抛异常判为 `"lookup_error"`。
-     - **Everflow / Supabase 模式（`is_dalton_local_auth_enabled() == False`）**：严格沿用 **`DALTON_ALLOWED_EMAILS ∪ dalton_members`**（`src/dalton/invites.py:1`）——先取用户邮箱（未传 `email` 时调 `src.server.database.user.get_user`，数据库抛错立即返回 `"lookup_error"`，正常查无用户或无邮箱返回 `"removed"`）；随后**先检查内存允许名单 `get_dalton_allowed_emails()`（`src/dalton/settings.py:29`），命中即直接返回 `"active"`**；未命中允许名单时调用 `src.dalton.database.members.get_member_by_email(email, conn=conn)`（`src/dalton/database/members.py:57-78`）直查 `dalton_members` 主键，有行返回 `"active"`，正常无行返回 `"removed"`，数据库抛错返回 `"lookup_error"`。
-   - **三态行为矩阵**：
-     - `"active"`：正常放行；若原处于 `disabled` 且原微信号未被他人占用，按 §2.1 (8) 锁序自动恢复为 `active`；
-     - `"lookup_error"`：**对账保持全部账号状态与 `accounts_revision` 不变**（防抖动误停）；**`I-1` / `I-2` / `I-3` 返回 HTTP `503` 使网关保留游标稍后重试**；`preflight-send` 暂缓当次外发；
-     - `"removed"`：15 秒对账（在判断 `changed: false` 前执行）将其置为 `status = 'disabled', disabled_reason = 'member_not_in_roster'`、删除 `dalton_channel_identities (user_id, 'weixin')`、作废待扫会话、关闭监听并写审计；本地认证 `delete_user_role`（`src/dalton/auth/roles.py:194-237`）同事务执行撤销。
-2. **微信号占用与释放边界汇总（D6）**：
+   - 在 `src/dalton/access_tiers.py` 新增 `check_team_member_status_live(user_id, *, email=None, conn=None) -> Literal["active", "removed", "lookup_error"]`，复用 `src.dalton` 既有定义并显式保留数据库异常（绕开吞异常的 `_fetch_db_member_emails_live`，见 `src/dalton/invites.py:89-109`）：
+     - **核心安装 / 本地认证模式（`is_dalton_local_auth_enabled() == True`，`src/dalton/settings.py:925`）**：调用 `src.dalton.auth.roles.get_user_role(uid, conn=conn)`（`src/dalton/auth/roles.py:54-80`）——返回 `"admin" | "internal" | "external"` 判为 `"active"`；正常返回 `None` 判为 `"removed"`；数据库抛异常判为 `"lookup_error"`。
+     - **Everflow / Supabase 模式（`is_dalton_local_auth_enabled() == False`）**：严格沿用 **`DALTON_ALLOWED_EMAILS ∪ dalton_members`**（`src/dalton/invites.py:1`）——获取用户邮箱（`src.server.database.user.get_user` 抛错立即返回 `"lookup_error"`，正常无用户或无邮箱返回 `"removed"`）；**先核对内存允许名单 `get_dalton_allowed_emails()`（`src/dalton/settings.py:919`），命中即返回 `"active"`**；未命中时调用 `src.dalton.database.members.get_member_by_email(email, conn=conn)`（`src/dalton/database/members.py:57-78`），有行返回 `"active"`，正常无行返回 `"removed"`，数据库抛错返回 `"lookup_error"`。
+   - **三态与两类停用原因的精确行为（D3, D15, D18）**：
+     - `"active"`：正常在册；15 秒 `reconcile` 对账**仅对 `status == 'disabled' AND disabled_reason == 'member_not_in_roster'` 的账号**，在 `evaluate_weixin_member_access` 通过、原微信号未被他人占用且当前占槽数 `< max_concurrent_accounts` 时，按 §2.1 (8) 两阶段锁序自动恢复为 `active`（**`disabled_reason == 'external_access_disabled'` 保持暂停，仅在外部成员开关重新打开时恢复**）；
+     - `"lookup_error"`：对账保持全部账号状态与 `accounts_revision` 原值；`I-1` / `I-2` / `I-3` 返回 HTTP `503` 使网关保留游标稍后重试；`preflight-send` 暂缓当次外发；
+     - `"removed"`：15 秒对账（在判断 `changed: false` 前执行）按统一锁序将其置为 `status = 'disabled', disabled_reason = 'member_not_in_roster'`、作废未终态 `login_sessions`、关闭监听并写审计；本地认证 `delete_user_role`（`src/dalton/auth/roles.py:194-237`）同事务执行撤销。
+2. **微信号占用、释放与恢复触发边界汇总（D6 & D15）**：
 
-| 触发场景 | 数据库账号行处置 | 是否释放 `ilink_user_id` 占用 | 其他成员扫同一微信号的结果 |
-|---|---|---|---|
-| 本人解除（网页或 `/unbind`） | 物理删除 `weixin_accounts` 行 | **释放** | 允许绑定 |
-| 管理员代解除 / 按成员撤销 | 物理删除 `weixin_accounts` 行 | **释放** | 允许绑定 |
-| 离开团队（名册核验 `"removed"` / `delete_user_role`） | `status='disabled', disabled_reason='member_not_in_roster'` | **释放** | 允许绑定（确认时按 D5 锁序删除该旧停用行） |
-| 外部成员接入开关关闭（`allow_external=False`） | `status='disabled', disabled_reason='external_access_disabled'` | **保留占用** | **拒绝**（提示已关联团队内另一账号） |
-| 名册查询异常（`lookup_error`）或渠道总开关关闭 | 账号行保持原 `status` 不变 | **保留占用** | **拒绝**（提示已关联团队内另一账号） |
+| 触发场景 | 数据库账号行处置 | 是否释放 `ilink_user_id` 占用 | 其他成员扫同一微信号 | 原成员恢复触发条件 |
+|---|---|---|---|---|
+| 本人解除（网页或 `/unbind`） | 物理删除 `weixin_accounts` 行 | **释放** | 允许绑定 | 重新扫码 |
+| 管理员代解除 / 按成员撤销 | 物理删除 `weixin_accounts` 行 | **释放** | 允许绑定 | 重新扫码 |
+| 离开团队（名册 `"removed"` / `delete_user_role`） | `status='disabled', disabled_reason='member_not_in_roster'` | **释放** | 允许绑定（`confirm` 按统一锁序删除旧行） | 重新入册且微信号未被人接管、槽位未满时由对账自动恢复 |
+| 外部成员接入开关关闭（`allow_external=False`） | `status='disabled', disabled_reason='external_access_disabled'` | **保留占用** | **拒绝**（提示已关联团队内另一账号） | **仅在管理员重新打开外部成员开关时**按容量上限恢复 |
+| 名册查询异常（`lookup_error`）或渠道总开关关闭 | 账号行保持原 `status` 原值 | **保留占用** | **拒绝**（提示已关联团队内另一账号） | 查询恢复正常或总开关重开后即刻恢复 |
 
-### 4.3 静态加密、日志脱敏与审计默认文案（D9）
+### 4.3 静态加密、日志脱敏与审计默认文案（D9 & D10）
 
-1. **静态加密与即时擦除**：`encrypted_bot_token`、`encrypted_qrcode`、`encrypted_context_token` 与 `encrypted_weixin_media_meta` 全部经 `pgp_sym_encrypt(..., get_encryption_key())`（`src/server/database/encryption.py:10-18`）存储；`d049` 当场清空旧表明文 `login_qrcode`；新登录会话进入终态即清空 `qrcode_img_content`，`confirmed_result` 严格限定为 `{account_id, connected, already_connected, bot_generation, accounts_revision}` 五个字段；入站附件上传完成或事件进入终态即清空 `encrypted_weixin_media_meta`，`raw_payload` 递归剥离全部令牌、票据、验证码与 AES/CDN 参数。
+1. **静态加密与即时擦除**：`encrypted_bot_token`、`encrypted_qrcode`、`encrypted_context_token`（于 `weixin_account_tokens`）与 `encrypted_weixin_media_meta` 全部经 `pgp_sym_encrypt(..., get_encryption_key())`（`src/server/database/encryption.py:10-18`）存储；`d049` 清空 `dalton_channel_weixin_state` 临时 `login_qrcode*` 字段；登录会话进入终态即清空 `qrcode_img_content`，`confirmed_result` 固定限定为 `{account_id, connected, already_connected, bot_generation, accounts_revision}` 五字段白名单；升级后新产生的入站事件将附件密钥仅写入 `encrypted_weixin_media_meta`（上传完成或事件终态即清空），`raw_payload` 在入库前剥离全部令牌、票据、验证码与 AES/CDN 参数（升级前既有历史行的 `raw_payload` 保持原样至删旧表迁移清理）。
 2. **日志与公开错误白名单**：网关 `assertIlinkBusinessOk`（`integrations/dalton-channel-gateway/src/channels/weixin/api.ts:172-193`）移除外部 `payload.errmsg` 拼接；网关 `logger.ts` 与后端新增 `redact_weixin_secrets`（配合 `src/dalton/settings.py:1209-1220`）确保日志仅输出 `account_id`、`user_id`、`ilink_bot_id`、`session_key` 前缀、端点、状态码、`ret`/`errcode` 与耗时。
 3. **审计表 `dalton_channel_weixin_audit_logs.reason` 固定默认文案规范（D9）**：
-   - `admin_unbind`：管理员二次确认选择的预设原因（`离职交接` / `手机遗失应急` / `误绑微信号` / `其他原因`；附带备注时记为 `<预设原因>：<备注>`）；
-   - `member_unbind`：`"成员本人主动解除微信连接"`（微信内触发记为 `"成员通过微信 /unbind 指令主动解除连接"`）；
+   - `admin_unbind`：管理员二次确认选择的预设原因（`离职交接` / `手机遗失应急` / `误绑微信号` / `其他原因`；附带说明记为 `<预设原因>：<备注>`）；
+   - `member_unbind`：`"成员本人主动解除微信连接"`（微信内触发记为 `"成员通过微信 /unbind 指令主动解除连接"`，`metadata` 记录是否发出一次性告别回执）；
    - `admin_toggle_channel`：`"管理员开启团队个人微信接入"` / `"管理员暂停团队个人微信接入"`；
    - `admin_toggle_external`：`"管理员允许外部成员连接个人微信"` / `"管理员关闭外部成员连接个人微信"`；
    - `member_removed_revoke`：`"成员移出团队名册或角色移除，系统自动回收微信连接"`；
    - `member_reinstated_restore`：`"成员恢复团队名册资格，系统自动恢复微信连接"`；
    - `disabled_account_reclaimed`：`"在职成员扫码接管已离职成员释放的微信号"`；
-   - `conflict_auto_unbound`：`"首条消息核验发现微信号已被团队内其他成员关联，自动解除待验证连接"`。
+   - `conflict_auto_unbound`：`"首条消息核验发现微信号已被团队内其他成员关联，自动解除待验证连接"`（`metadata` 记录是否发出一次性冲突说明回执）。
 
-### 4.4 微信合并转发提示与逐条转发显式材料收集模式（D4 & D9）
+### 4.4 微信合并转发提示与逐条转发显式材料收集模式（D4, D9, D17）
 
 #### （1）合并转发探测、混合事件保留与按令牌条件提示（D9）
 
-先通过 §7.4 实机抓包确认合并转发在 `getupdates` 中的线上表现，代码同时按以下确定性规则处理 `inbound.ts:326-450`：
+先通过 §7.4 实机抓包确认合并转发在 `getupdates` 中的线上表现，同时在 `inbound.ts:326-450` 执行以下确定性处理：
 
-1. **混合事件保留有效内容**：当同一条 `WeixinMessage.item_list` 中既包含可识别条目（`TEXT`、`IMAGE`、`FILE`、带转写的 `VOICE`、`VIDEO`）又包含未知 `item.type` 时，**可识别的文字与附件照常提取、上传并送入对话回合（或当前 `/collect` 窗口）处理**，仅忽略不支持的条目并在模型输入末尾附注 `[系统注：此消息还包含暂不支持解析的微信特殊条目]`。
-2. **纯不支持条目事件（仅含未知 `item.type`，无任何可识别文字或媒体）**：
-   - 调用 `I-1` 保存可能携带的 `context_token` 并将事件幂等归档为 `status = 'ignored', deny_reason = 'unsupported_merged_forward'`（不启动模型回合）；
-   - **`I-1` 返回 `has_usable_weixin_context_token: true` 时**：经 `I-6` 回复固定中文提示：「暂无法直接解析微信『合并转发』的聊天记录，请改用『逐条转发』（发 `/collect` 开始收集、转完发 `/done` 统一分析）或发送聊天长截图。」；
-   - **入站未带 `context_token` 且当前代际也无可用令牌（`has_usable_weixin_context_token: false`）或腾讯侧根本不推送事件时**：跳过出站回复，依靠始终可见的**网页扫码成功引导、个人微信卡片使用帮助与微信端 `/help` 指令**提供完整指引。
+1. **混合事件保留有效内容**：同一条 `WeixinMessage.item_list` 同时含可识别条目（`TEXT`、`IMAGE`、`FILE`、带转写的 `VOICE`、`VIDEO`）与未知 `item.type` 时，可识别的文字与附件照常提取上传并送入对话回合（或当前 `/collect` 窗口），末尾附注 `[系统注：此消息还包含暂不支持解析的微信特殊条目]`。
+2. **纯不支持条目事件**：经 `I-1` 保存可能携带的 `context_token` 并归档为 `status = 'ignored', deny_reason = 'unsupported_merged_forward'`；仅当 `I-1` 返回 `has_usable_weixin_context_token: true` 时经 `I-6` 回复中文指引（「暂无法直接解析微信『合并转发』的聊天记录，请改用『逐条转发』（发 `/collect` 开始收集、转完发 `/done` 统一分析）或发送聊天长截图。」），无可用令牌或无事件时直接跳过回复，由网页常驻引导与 `/help` 指令承接。
 
-#### （2）逐条转发的显式材料收集模式（先登记、再上传、再补登，D4）
+#### （2）逐条转发的显式材料收集模式（Home 工作区自动创建 + 三步附件 + 事务外等待与重启恢复，D4 & D17）
 
-1. **开启与续期 `/collect [说明]`（别名 `/收集`）**：
-   - `I-3` 先将该会话下已超时的旧窗口（`status = 'collecting' AND expires_at <= db_now`）置为 `'expired'`；
-   - 若已存在未过期的 `'collecting'` 窗口，仅刷新 `expires_at = LEAST(db_now + INTERVAL '5 minutes', max_expires_at)`（追加新说明）并回复「已在收集中，已刷新有效期（当前已收集 N 条），发 `/done` 结束提交」；
-   - 若无活跃窗口，解析目标工作区——存在 `override_workspace_id` 时校验写权限，**无覆盖工作区时调用 `get_home_workspace_id(dalton_user_id)`（`src/server/database/home_workspace.py:36-42`）锁定非空 Home 工作区 UUID**，创建新 `collecting` 窗口（空闲 5 分钟、绝对上限 15 分钟）。
-2. **收集期内单条消息三步入库（无孤儿文件、重启可续传）**：
-   - **第 1 步（先 `I-1` 登记授权）**：网关收到普通消息后先调 `I-1`。若窗口已超期，后端先将其置为 `'expired'` 并把本条消息按普通对话处理（附一行提示告知上次超时收集已自动关闭）；若窗口有效且未超容量上限（`50` 条 / `60,000` 字符 / `20` 个附件；超限返回 `collection_mode = "limit_reached"` 提示发 `/done`），后端校验该成员对锁定 `workspace_id` 仍具写权限后，按 `(buffer_id, message_id)` 幂等插入 `collect_items`（无附件置 `upload_status = 'ready'`，有附件置 `upload_status = 'pending_upload'` 且附件密钥存入 `inbound_events.encrypted_weixin_media_meta`），返回 `{ collection_mode: "appended", collect_buffer_id, workspace_id }`；网关不启动对话回合。
-   - **第 2 步（上传附件）**：若该消息带附件，网关使用 `I-1` 返回的 `workspace_id` 下载解密微信 CDN 媒体并上传至该工作区。
-   - **第 3 步（幂等补登附件）**：网关调用 `POST .../weixin/collect-buffers/{buffer_id}/items/{message_id}/attachments`，按 `(buffer_id, message_id)` 幂等写入 `uploaded_attachments` 并将 `upload_status` 置为 `'ready'`（失败置 `'failed'`），同时擦除 `encrypted_weixin_media_meta`。
-3. **`/done` 等待未完成上传（最多 30 秒）与单回合合成提交**：
-   - 成员发送 `/done [补充提问]`（别名 `/完成`）时：若窗口为空（0 条）则置 `cancelled`/退出并提示无材料；若窗口已有条目（含刚超期尚未被普通消息关闭的窗口），`I-3` 先原子将窗口置为 `status = 'flushing'`；
-   - 若该窗口下仍有 `upload_status = 'pending_upload'` 的条目，等待其完成补登，**最长等待 `30 秒`**（每 `500ms` 检查一次）；满 30 秒仍未完成或标为 `'failed'` 的附件，在合成文本对应条目处注明 **`[注：附件 <文件名> 上传超时或失败，缺失未附带]`**；
-   - 按 `(protocol_seq IS NULL) ASC, protocol_seq ASC, platform_time_ms ASC, receive_order ASC, message_id ASC` 全序拼装全部材料与已就绪 `uploaded_attachments`，生成合成入站事件 `message_id = 'collect:' || buffer_id` 启动单次智能体回合，登记完成后窗口置为 `'completed'`。发送 `/cancel`、`/new`、切换工作区、解绑或重扫时自动将未完成窗口置为 `'cancelled'`。
+1. **开启与续期 `/collect [说明]`（别名 `/收集`，首次使用自动创建 Home 工作区）**：
+   - 若该会话当前 `override_workspace_id` 为空，在开启收集事务前先调用现有 `get_or_create_home_workspace(dalton_user_id)`（`src/server/database/workspace.py:156`，复用 `resolve_caller_home_workspace_id`，见 `src/dalton/auth/__init__.py:522-550`）确保该成员的 Home 工作区行已在 `workspaces` 表中落盘，再锁定其 UUID；存在 `override_workspace_id` 时校验写权限（`_verify_workspace_write_permission`，`src/dalton/database/channel_gateway.py:424-451`）；
+   - `I-3` 先将该会话已超时的旧窗口（`status = 'collecting' AND expires_at <= db_now`）置为 `'expired'`；若已有未过期的 `'collecting'` 窗口，仅刷新 `expires_at = LEAST(db_now + INTERVAL '5 minutes', max_expires_at)` 并回复「已在收集中，已刷新有效期（当前已收集 N 条），发 `/done` 结束提交」；若无活跃窗口则创建新 `collecting` 窗口（空闲 5 分钟、绝对上限 15 分钟）。
+2. **收集期内单条消息三步入库**：
+   - **第 1 步（先 `I-1` 登记）**：网关先调 `I-1`。窗口已超期时后端将其置为 `'expired'` 并将本条按普通对话处理；窗口有效且未超容量上限（`50` 条 / `60,000` 字符 / `20` 个附件；超限返回 `collection_mode = "limit_reached"`）时，后端校验锁定 `workspace_id` 写权限，在 `dalton_channel_inbound_events` 记录 `collect_buffer_id = buffer_id`、`workspace_id = buffer.workspace_id`（有附件时置 `status = 'pending'` 并加密保存 `encrypted_weixin_media_meta`，无附件置 `status = 'completed'`），按 `(buffer_id, message_id)` 幂等写入 `collect_items`（有附件置 `upload_status = 'pending_upload'`，无附件置 `'ready'`），返回 `{ collection_mode: "appended", collect_buffer_id, workspace_id }`；网关跳过启动对话回合。
+   - **第 2 步（上传附件）**：带附件时，网关将微信 CDN 媒体下载解密并上传至 `I-1` 返回的 `workspace_id`。
+   - **第 3 步（幂等补登附件）**：网关调 `POST .../weixin/collect-buffers/{buffer_id}/items/{message_id}/attachments`，按 `(buffer_id, message_id)` 幂等写入 `uploaded_attachments`、将 `collect_items.upload_status` 更新为 `'ready'`（失败置 `'failed'`），同时将对应 `inbound_events` 置为 `'completed'` 并擦除 `encrypted_weixin_media_meta`。
+3. **`/done` 分阶段提交（事务外零行锁等待最多 30 秒 + 单事务合成置 `done` + 重启恢复，D17）**：
+   - **阶段 A（短事务提交 `flushing`）**：成员发送 `/done [补充提问]`（别名 `/完成`）时，若窗口为 0 条则置 `cancelled` 并提示无材料；已有条目时，在短事务内将窗口更新为 **`status = 'flushing', flush_prompt = <补充提问>, updated_at = NOW()` 并立即提交事务**；
+   - **阶段 B（事务外无锁等待未完成上传，最长 30 秒）**：在数据库事务之外（**期间不持有任何数据库行锁**，使网关正在进行的补登请求可随时获取 `collect_items` 锁写入 `'ready'`）每 `500ms` 只读检查一次该 `buffer_id` 是否仍有 `upload_status = 'pending_upload'` 的条目，最长等待 `30 秒`；
+   - **阶段 C（单事务登记合成入站事件并置窗口为 `done`）**：开启新短事务（校验 `gateway_lease FOR SHARE`），若窗口已为 `'done'` 则幂等返回已登记的合成事件；将满 30 秒仍处 `'pending_upload'` 的条目置为 `'failed'`，按 `(protocol_seq IS NULL) ASC, protocol_seq ASC, platform_time_ms ASC, receive_order ASC, message_id ASC` 全序拼装文本与已就绪附件（超时或失败的附件在对应条目注明 **`[注：附件 <文件名> 上传超时或失败，缺失未附带]`**），**在同一数据库事务内登记合成入站事件 `message_id = 'collect:' || buffer_id` 并将 `collect_buffers` 更新为 `status = 'done', flushed_message_id = 'collect:' || buffer_id`**，返回网关启动单次智能体回合。若进程在阶段 A 提交后重启，新网关在 `mode=startup` 恢复完待补登附件后调用 `POST .../collect-buffers/{buffer_id}/finalize` 继续执行阶段 B 与阶段 C（见 §3.4 #2）。发送 `/cancel`、`/new`、切换工作区、解绑或重扫时自动将未完成窗口置为 `'cancelled'`。
 
 ---
 
@@ -582,17 +596,17 @@ CREATE TABLE IF NOT EXISTS dalton_channel_weixin_collect_items (
 1. **智能体主动发信与工作区自动化**：`send_message(target="weixin:@me")`（`src/tools/messaging/tools.py:775`）与 `automation_delivery.py`（`src/server/services/automation_delivery.py:181-248,568-638`）经 `I-6` 与 `preflight-send` 选取活跃 `weixin_account_id` 投递文本及工作区 PNG / PDF 附件。
 2. **研报目标保存与正文读取**：
    - 在 `src/dalton/database/automation_reports.py:153-156,1053-1059` 新增 `_WEIXIN_USER_TARGET_RE = re.compile(r"^weixin:user:[^\s:]{1,255}$")` 纳入 `_target_allowed(target, outcome="text")`，同步更新 `src/dalton/services/report_delivery.py:404-418,455,2042`（`supports_text_targets` 含 `"weixin"`）与 `report_delivery_tools.py:56`；
-   - 研报纯文本批次（`source = "automation_report"`, `content_kind = "text"`）从 **`dalton_notify_deliveries.payload_json["text"]`** 读取不可变正文（`src/dalton/database/automation_reports.py:270,1232`），经网关 `filterWeixinMarkdown`（`send.ts:227`）清洗分段发送；数据任务通知在 `src/dalton/database/data_task_notifications.py:1456-1492` 实时查询收件成员活跃微信账号与有效 `context_token`。
+   - 研报纯文本批次（`source = "automation_report"`, `content_kind = "text"`）从 **`dalton_notify_deliveries.payload_json["text"]`** 读取不可变正文（`src/dalton/database/automation_reports.py:270,1232,1352-1353`），经网关 `filterWeixinMarkdown`（`send.ts:227`）清洗分段发送；数据任务通知在 `src/dalton/database/data_task_notifications.py:1456-1492` 从新表实时查询收件成员活跃微信账号与有效 `context_token`。
 3. **测试推送走通知计划授权**：
-   - `send_dalton_notify_test`（`src/dalton/notify/dispatch.py:2148,2194-2232`）对 `weixin:user:<id>` 目标直接调用 `_send_claimed_notify_test` 写入 `source="notify_test", transport="gateway"` 行并调 `post_automation_gateway_notify`；网关回调后端执行 **`decide_automation_notification_plan`**（`src/dalton/database/automation_notifications.py:106-143,323-337,382-520`：扩展 `_parse_target` 解析 `weixin:user:<id>`，对 `platform == "weixin"` 直接读取 `payload_json["text"]` 构造 `kind="text"` 计划项并校验本人通知开关与目标列表），授权通过后再经 `I-6` 与 `preflight-send` 发送并结算。
+   - `send_dalton_notify_test`（`src/dalton/notify/dispatch.py:2148,2194-2232`）对 `weixin:user:<id>` 目标调用 `_send_claimed_notify_test` 写入 `source="notify_test", transport="gateway"` 行并调 `post_automation_gateway_notify`；网关回调后端执行 **`decide_automation_notification_plan`**（`src/dalton/database/automation_notifications.py:106-143,323-337,382-520`：扩展 `_parse_target` 解析 `weixin:user:<id>`，对 `platform == "weixin"` 读取 `payload_json["text"]` 构造 `kind="text"` 计划项并校验本人通知开关与目标列表），授权通过后再经 `I-6` 与 `preflight-send` 发送结算。
 4. **普通自动化完成通知按每个目标（per-target）选择传输方式**：
-   - 改造 `src/dalton/notify/dispatch.py:5292-5382`：对同一次通知的 `targets` 列表逐目标求值 `target_via_gateway = cleaned_tgt.startswith("weixin:") or via_gateway`。`weixin:` 目标始终写入 `transport = "gateway"` 并通过 `claim_target_delivery_with_attempt` + `post_automation_gateway_notify` 经渠道网关发送；同批次飞书与 Discord 目标按原有 `via_gateway` 规则走网关或宿主机 `post_bridge_notify` 桥接，互不干扰。
+   - 改造 `src/dalton/notify/dispatch.py:5292-5382`：对同一次通知的 `targets` 逐目标求值 `target_via_gateway = cleaned_tgt.startswith("weixin:") or via_gateway`。`weixin:` 目标固定写入 `transport = "gateway"` 并通过 `claim_target_delivery_with_attempt` + `post_automation_gateway_notify` 经网关发送；同批次飞书与 Discord 目标按原有 `via_gateway` 规则走网关或宿主机 `post_bridge_notify` 桥接，各目标独立结算。
    - 前端在 `IntegrationsPanel.tsx:28`、`DaltonNotifyTargetsCard.tsx:29,65-66`、`AutomationNotifyTargets.tsx:94` 与 `sections.ts:293` 扩展包含 `'channel_weixin'`。
 
 ### 5.2 缺少或过期 `context_token` 的版本围栏与带令牌恢复闭环
 
-1. **白名单错误码 + `token_version` CAS**：仅当 `sendmessage` 返回实机确认填入 `CONTEXT_TOKEN_STALE_ERRCODES`（初始为空集）的错误码且 `bot_generation` 与 `token_version` 均匹配本次发送所用版本时，才写入 `stale_at = NOW()`；其余非 `-14` 普通业务错误仅记单次投递失败，保持 `stale_at` 为空。
-2. **禁止旧副本复活与唯一清除条件**：`dalton_channel_weixin_context_tokens` 为当前令牌唯一真值，`stale_at IS NOT NULL` 时直接返回 `weixin_context_token_stale`（不回退读取 `identities` 或 `inbound_events` 旧副本，`src/dalton/database/channel_gateway.py:1080-1185`）；**仅当收到首次登记、携带非空有效 `context_token` 且通过序号水位校验的新入站消息时**，才递增 `token_version` 并清除 `stale_at`（与 §1.3 激活条件完全一致），网页卡片、测试推送与执行记录三处同步展示中文引导。
+1. **白名单错误码 + `token_version` CAS**：仅当 `sendmessage` 返回实机确认填入 `CONTEXT_TOKEN_STALE_ERRCODES`（初始为空集）的错误码且 `bot_generation` 与 `token_version` 均匹配本次发送所用版本时，才在 `dalton_channel_weixin_account_tokens` 写入 `stale_at = NOW()`；其余非 `-14` 普通业务错误仅记单次投递失败，保持 `stale_at` 为空。
+2. **唯一真值与清除条件**：新代码仅从 `dalton_channel_weixin_account_tokens` 读取微信上下文令牌，`stale_at IS NOT NULL` 时直接返回 `weixin_context_token_stale`；**仅当收到首次登记、携带非空有效 `context_token` 且通过序号水位校验的新入站消息时**，才递增 `token_version` 并清除 `stale_at`（与 §1.3 激活条件完全一致），网页卡片、测试推送与执行记录三处同步展示中文引导。
 
 ---
 
@@ -602,41 +616,45 @@ CREATE TABLE IF NOT EXISTS dalton_channel_weixin_collect_items (
 
 | 模块 | 旧实现位置 | 下线与替换处理方式 |
 |---|---|---|
-| 旧单行内部路由 | `src/dalton/app/channels_router.py:808-874`（`/internal/weixin-state`） | 直接删除该路由及 `get_weixin_state` / `upsert_weixin_state`，切换为 `/internal/gateway-lease/*` 与 `/internal/weixin/*` 多账号契约。 |
+| 旧单行内部路由 | `src/dalton/app/channels_router.py:808-874`（`/internal/weixin-state`） | 删除该路由及 `get_weixin_state` / `upsert_weixin_state`，切换为 `/internal/gateway-lease/*` 与 `/internal/weixin/*` 多账号契约。 |
 | 微信绑定码接口 | `src/dalton/app/channels_router.py:881-889`（`POST /channels/bind-codes`） | 先校验 `require_channel_platform_capability`；`platform == "weixin"` 返回 HTTP `400`（`code: "weixin_uses_qr_login"`）；飞书与 Discord 保持原样。 |
-| 微信端 `/bind` 指令 | `integrations/dalton-channel-gateway/src/orchestrator.ts:263-271,592-622` | 微信私聊发 `/bind` 直接提示已自动关联；保留 `/unbind` 自助解绑。 |
+| 微信端 `/bind` 指令 | `integrations/dalton-channel-gateway/src/orchestrator.ts:263-271,592-622` | 微信私聊发 `/bind` 直接提示已自动关联；保留 `/unbind` 自助解绑（支持一次性告别回执）。 |
 | 个人与团队微信卡片 | `DaltonWeixinBindCard.tsx`、`DaltonWeixinBotCard.tsx` | 分别升级为个人扫码连接卡片与管理员状态/开关/代解除审计卡片，同步更新 `zh-CN.json` / `en-US.json`。 |
 
-### 6.2 核心发布包边界与网关后续入包改动清单（D9）
+### 6.2 核心发布包边界与网关后续入包改动清单（D9 & D18）
 
-1. **当前独立核心发布包边界**：`scripts/standalone/package_release.sh:164` 当前显式将 `integrations/dalton-channel-gateway/` 排除在核心发布包之外，`docker-compose.core.yml` 不含网关容器，且 `DALTON_PROFILE=core` 下 `channel_gateway` 与 `channel_weixin` 默认关闭（`src/dalton/capabilities.py:164,189`）。因此在网关进入核心发布包之前，核心安装执行 `d049` 仅完成数据库空表对齐，`channel_weixin` 默认关闭、全部微信路由返回 `404`、前端零暴露。
-2. **网关进入核心发布包所需的配套改动（作为后续独立批次实施）**：
+1. **当前独立核心发布包边界**：`scripts/standalone/package_release.sh:164` 当前将 `integrations/dalton-channel-gateway/` 排除在核心发布包之外，`docker-compose.core.yml` 尚未编排网关容器，且 `DALTON_PROFILE=core` 下 `channel_gateway` 与 `channel_weixin` 默认关闭（`src/dalton/capabilities.py:164,189`）。在网关进入核心发布包之前，核心安装执行 `d049` 仅完成数据库表结构对齐，`channel_weixin` 默认关闭、全部微信路由返回 `404`、前端零暴露。
+2. **网关进入核心发布包所需的后续独立批次改动清单（含 Compose 私有网络监听与连通性检查，D18）**：
    - ① 在 `integrations/dalton-channel-gateway/` 新增生产多阶段 `Dockerfile`；
-   - ② 在 `docker-compose.core.yml` 增加可选 `profiles: ["channel-gateway"]` 的单副本服务 `channel-gateway`（固定 1 个容器实例，`env_file: .env`，`DALTON_BACKEND_URL=http://backend:8000`），并在 `backend` 注入 `CHANNEL_GATEWAY_URL=http://channel-gateway:8962`；
+   - ② **容器内私有网络监听配置（解决 `server.ts:512` 硬编码 `127.0.0.1` 跨容器不可达问题）**：在 `integrations/dalton-channel-gateway/src/config.ts` 与 `src/server.ts:512` 增加 `DALTON_GATEWAY_BIND_HOST` 配置项——宿主机 `launchd` 部署保持默认 `"127.0.0.1"`；`docker-compose.core.yml` 中的单副本 `channel-gateway` 服务（`profiles: ["channel-gateway"]`）设 `DALTON_GATEWAY_BIND_HOST=0.0.0.0`、**仅接入 Compose 内部私有网络（零宿主机 `ports:` 映射，宿主机与外网无法直连 `8962` 端口）**，并在 `backend` 注入 `CHANNEL_GATEWAY_URL=http://channel-gateway:8962`；
    - ③ 将 `integrations/dalton-channel-gateway` 纳入 `scripts/standalone/package_release.sh:168-227` 发布白名单并通过 `SCAN_TERMS` 专有词扫描；
-   - ④ 在 `scripts/standalone/init.sh`、`.env.core.example`、`upgrade.sh`、`restore.sh` 与 `STANDALONE-DEPLOY.md` 补齐 `channel-gateway` 开关、镜像打标与启停编排。
+   - ④ **健康检查与容器间连通性校验**：为 `channel-gateway` 容器配置自检 `healthcheck`（`http://127.0.0.1:8962/health`），并在 `scripts/standalone/init.sh`、`upgrade.sh`、`restore.sh` 启用 `channel-gateway` profile 时增加从 `backend` 容器执行 `curl -sf http://channel-gateway:8962/health` 的私有网络连通性验收，同步补齐 `.env.core.example` 与 `STANDALONE-DEPLOY.md`。
 
-### 6.3 分形态部署、停机迁移与回退步骤（D2 & D9）
+### 6.3 分形态部署、停机迁移、部署后外键校验与回退步骤（D2, D10, D18）
 
 #### （1）Everflow 生产部署（`launchd` + Docker Compose，脚本目录 `scripts/dalton/ops/prod/`）
 
-1. **预演校验**：在集成测试环境用含活跃多线程会话（`generation > 1`、非 Home 工作区、`pending_interrupt`）、活跃监听、未完成附件入站与在途投递的数据集跑通 `d046 -> d049 -> 多人收发 -> downgrade d046`。
-2. **停止网关**：执行 `launchctl bootout gui/$(id -u)/com.dalton.channel-gateway`（对应 `scripts/dalton/launchd/com.dalton.channel-gateway.plist.template:18-25`），切断网关对微信状态的写入。
-3. **备份、重启后端并在停写态执行 `d049`**：执行 `bash scripts/dalton/ops/prod/deploy_main.sh --expect-migration d049`（`deploy_main.sh:824-943`：自动调 `wait_backend_idle.sh` 等待活跃回合结束 → 触发 `com.dalton.pg-backup` 运行 `scripts/dalton/ops/prod/backup.sh:13-16` 生成新鲜 `pg_dump -Fc` 备份 → 拉取代码并构建前端 → 重启 `dalton-langalpha-backend-1`，在旧后端已退出、无任何进程写微信状态时由容器入口 `scripts/dalton/docker_entrypoint_dalton.sh:15-21` 执行 `d049` 迁移 → 校验 `/health` 与版本到达 `d049`）。
-4. **构建并启动唯一新网关实例**：执行 `(cd integrations/dalton-channel-gateway && pnpm install --frozen-lockfile && pnpm build)`，确认 plist 中 `DALTON_WEIXIN_ENABLED=true`，执行 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.channel-gateway.plist`；验证网关获租（`epoch >= 1`）、原管理员免重扫原线程续聊、新成员扫码独立对话。
-5. **回退步骤（如需）**：遵循 `scripts/dalton/ops/prod/deploy_main.sh:630-665` 规程——先 `launchctl bootout` 停 `backend-watchdog`、`channel-gateway` 等宿主服务并 `docker stop dalton-langalpha-edge-1 dalton-langalpha-crawler-1 dalton-langalpha-backend-1` 确认活跃连接归零 → 触发备份并导出 `dalton_channel_weixin_audit_logs` → 用维护容器执行 `docker compose run --rm --no-deps --entrypoint "" backend sh -c "cd /app && uv run alembic -c src/dalton/alembic.ini downgrade d046"` → 复位旧代码、重编前端与旧网关产物后重新启动服务（回到升级前的单账号状态）。
+1. **预演校验**：在集成测试环境用含活跃多线程会话（`generation > 1`、非 Home 工作区、`pending_interrupt`）、活跃监听、未完成附件入站、无 `scope_key` 后台运行与多代际投递的数据集跑通 `d046 -> d049 -> 部署后外键 VALIDATE -> 多人收发 -> downgrade d046`。
+2. **停止网关**：执行 `launchctl bootout gui/$(id -u)/com.dalton.channel-gateway`（对应 `scripts/dalton/launchd/com.dalton.channel-gateway.plist.template:18-25`）。
+3. **备份、重启后端并在停写态执行 `d049`**：执行 `bash scripts/dalton/ops/prod/deploy_main.sh --expect-migration d049`（`deploy_main.sh:824-943`：自动调 `wait_backend_idle.sh` 等待活跃回合结束 → 触发 `com.dalton.pg-backup` 运行 `scripts/dalton/ops/prod/backup.sh:13-16` 生成 `pg_dump -Fc` 全量备份 → 拉取代码构建前端 → 重启 `dalton-langalpha-backend-1`，在旧后端已退出、无进程写微信状态时由 `scripts/dalton/docker_entrypoint_dalton.sh:15-21` 执行 `d049` 迁移 → 校验 `/health` 与版本到达 `d049`）。
+4. **构建并启动唯一新网关实例**：执行 `(cd integrations/dalton-channel-gateway && pnpm install --frozen-lockfile && pnpm build)`，确认 plist 中 `DALTON_WEIXIN_ENABLED=true`，执行 `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.channel-gateway.plist`；验证网关获租后先完成 `mode=startup` 再开启轮询、原管理员原线程续聊、新成员扫码可用。
+5. **部署后独立事务执行外键 `VALIDATE CONSTRAINT`（D18）**：在服务正常对外期间，分 5 条独立 SQL 事务（每条带 `SET lock_timeout = '5s';`）对 §2.1 (7) 的 5 条 `NOT VALID` 外键依次执行 `ALTER TABLE ... VALIDATE CONSTRAINT ...;`，并查询 `pg_constraint.convalidated = true` 确认全部通过。
+6. **回退步骤与状态判定（如需，对齐 §2.3）**：遵循 `scripts/dalton/ops/prod/deploy_main.sh:630-665` 规程——先 `launchctl bootout` 停 `backend-watchdog`、`channel-gateway` 等宿主服务并 `docker stop dalton-langalpha-edge-1 dalton-langalpha-crawler-1 dalton-langalpha-backend-1` 确认活跃连接归零 → 备份并按需导出 `dalton_channel_weixin_audit_logs` → 用维护容器执行 `docker compose run --rm --no-deps --entrypoint "" backend sh -c "cd /app && uv run alembic -c src/dalton/alembic.ini downgrade d046"` → 复位旧代码、重编前端与旧网关产物后启动服务。若原管理员未重扫，旧单账号与旧绑定成员及未完附件直接恢复；若原管理员在升级期间重扫过码，在旧管理页重扫一次恢复；若需连同运行期全部共享表变更一并回滚至升级前，改用步骤 3 的 `pg_dump` 备份执行 `pg_restore`。
 
 #### （2）独立核心安装部署（Docker Compose，脚本目录 `scripts/standalone/`）
 
-1. **`scripts/standalone/upgrade.sh` 现状核实与具体改法（D2）**：
-   - **现状核实**：`scripts/standalone/upgrade.sh:764` 当前在旧 `backend` 容器仍运行时执行 `compose_cmd run --rm migrate`，直到第 `794` 行才重建 `backend`。
-   - **具体改法**：改造 `scripts/standalone/upgrade.sh:752-795`——保留第 `617-641` 行在线运行 `scripts/standalone/backup.sh` 完成升级前零停机全量备份、第 `644-734` 行旧镜像打标快照与新镜像构建；**在读取迁移前版本（第 `756` 行）与执行 `compose_cmd run --rm migrate`（第 `764` 行）之前，先查询当前运行服务并执行 `compose_cmd stop` 停止 `channel-gateway`（若已配置）、`backend`、`crawler`**，待应用连接排空后运行 `compose_cmd run --rm migrate`（调用 `scripts/standalone/migrate.sh:49-82`）与 `minio-init`，迁移成功后再执行 `compose_cmd up -d` 启动新版 `backend`、`crawler`、`edge`（及启用时的单副本 `channel-gateway`）并校验健康；同步更新 `print_rollback_steps()`（`upgrade.sh:553-557`），使迁移前失败分支可通过 `docker compose up -d` 直接恢复刚停止的旧容器。
-2. **核心安装回退**：若需在升级后回退，停止 `channel-gateway`、`backend`、`crawler` 容器后，通过一次性维护容器执行 `alembic -c src/dalton/alembic.ini downgrade d046` 并恢复 `pre-upgrade-<ts>` 镜像标签与快照文件（或按 `upgrade.sh:530-552` 调用 `scripts/standalone/restore.sh` 从升级前备份完整还原）。
+1. **`scripts/standalone/upgrade.sh` 现状核实、先停后迁与版本未变失败自动指引恢复改法（D2 & D18）**：
+   - **现状核实**：`scripts/standalone/upgrade.sh:764` 当前在旧 `backend` 仍运行时调用 `compose_cmd run --rm migrate`（第 `794` 行才重建 `backend`）；且当 `migrate` 失败退出、Alembic 事务回滚使前后版本未变时，第 `780-784` 行将 `MIGRATION_STATE` 置为 `"unknown"`，而 `print_rollback_steps()`（`upgrade.sh:553-557`）仅在 `MIGRATION_STATE == "before"` 时输出 `docker compose ... up -d` 启动步骤。
+   - **具体改法**：
+     - 在第 `617-641` 行完成升级前在线备份（`backup.sh`）、第 `644-734` 行完成 `PRE_BACKEND_TAG` / `PRE_EDGE_TAG` / `PRE_CRAWLER_TAG` 镜像打标、`SNAPSHOT_DIR` 文件快照与新镜像构建后，**于第 `756` 行读取迁移前版本与第 `764` 行运行 `compose_cmd run --rm migrate` 之前，先执行 `compose_cmd stop` 停止 `channel-gateway`（若已配置）、`backend`、`crawler` 并确认应用连接排空**；
+     - 改造第 `776-789` 行与 `print_rollback_steps()`（`upgrade.sh:482-492,517-529,553-557`）：当 `MIGRATE_RC != 0` 且 `PRE_MIGRATE_OK == 1 && POST_MIGRATE_OK == 1 && POST_MIGRATE_UP == PRE_MIGRATE_UP && POST_MIGRATE_DA == PRE_MIGRATE_DA`（即迁移事务完整回滚、数据库版本未变）时，置 `MIGRATION_STATE="unchanged_failed"`，在 `print_rollback_steps()` 中明确走与 `"before"` 相同的无损快速恢复分支——从 `$SNAPSHOT_DIR` 还原旧版发布文件、将 `$PRE_BACKEND_TAG` / `$PRE_EDGE_TAG` / `$PRE_CRAWLER_TAG` 重新打回 `$BACKEND_IMAGE` / `$EDGE_IMAGE`（`upgrade.sh:517-528`），随即执行 **`docker compose ... up -d` 用升级前镜像重新拉起刚停止的 `backend`、`crawler`（及 `channel-gateway`）容器**；仅在版本已变化（`"migrated"`）或版本无法读取（`"unknown"`）时引导检查或调 `restore.sh`；
+     - `migrate` 与 `minio-init` 成功后（`upgrade.sh:790-819`），执行 `compose_cmd up -d` 启动新版 `backend`、`crawler`、`edge`（及启用时的单副本 `channel-gateway`）并通过 `/health` 校验，最后在独立事务中对 §2.1 (7) 的 5 条 `NOT VALID` 外键逐条执行 `VALIDATE CONSTRAINT`。
+2. **核心安装升级后回退（对齐 §2.3）**：停止 `channel-gateway`、`backend`、`crawler` 后，若仅回退多账号特性，用维护容器执行 `alembic -c src/dalton/alembic.ini downgrade d046`、还原 `$SNAPSHOT_DIR` 与 `pre-upgrade-<ts>` 镜像标签并执行 `docker compose up -d`（原管理员未重扫时直接恢复单账号状态，重扫过则在旧管理页重扫一次）；若需将升级后运行期共享表写入完整还原至升级前备份点，按 `upgrade.sh:530-552` 执行 `scripts/standalone/restore.sh`。
 
 ### 6.4 对飞书与 Discord 零影响保证
 
-1. **能力与绑定流独立**：`CHANNEL_FEISHU`、`CHANNEL_DISCORD`、`CHANNEL_WEIXIN` 独立求值（`src/dalton/capabilities.py:168-191`），共享路由按实际平台检查能力；飞书与 Discord 的绑定码（`POST /channels/bind-codes` + `/bind`）、群绑定表与 Discord 确认线程列（`d036`）原封保留。
-2. **热表无阻塞迁移与通知独立结算**：`d049` 对共享表外键采用 `NOT VALID` + 独立校验，普通通知按每个目标独立选择传输通道且各目标独立结算。
+1. **能力、身份与绑定流独立**：`CHANNEL_FEISHU`、`CHANNEL_DISCORD`、`CHANNEL_WEIXIN` 独立求值（`src/dalton/capabilities.py:168-191`），飞书与 Discord 的 `dalton_channel_identities`、绑定码（`POST /channels/bind-codes` + `/bind`）、群绑定表与 Discord 确认线程列（`d036`）原封保留。
+2. **热表零长锁迁移与通知独立结算**：`d049` 在迁移事务内仅做元数据级加列与 `NOT VALID` 外键，`VALIDATE CONSTRAINT` 在部署后单独执行；普通通知按每个目标独立选择传输通道并独立结算。
 
 ---
 
@@ -646,43 +664,60 @@ CREATE TABLE IF NOT EXISTS dalton_channel_weixin_collect_items (
 
 覆盖文件：`tests/unit/dalton/test_weixin_multi_account.py`（新建）、`tests/unit/dalton/test_channel_gateway.py`、`tests/unit/dalton/test_core_capabilities_gate.py`、`tests/integration/dalton/test_channel_gateway_db.py`、`tests/integration/dalton/test_weixin_full_stack.py`：
 
-1. **停机迁移、历史来源回填与只删新增对象降级**：构造含 `generation > 1`、非 Home 工作区、`pending_interrupt`、活跃监听、未完成附件入站、多代际历史投递与空 `ilink_user_id` 边界的 `d046` 库，执行 `d046 -> d049 -> downgrade d046`：验证 `d049` 后原管理员不换线程、历史投递保留真实来源代际与收件人、旧表 `login_qrcode` 清空而原凭据与游标冻结未改、`NOT VALID` 外键全部 `convalidated = true`；验证 `downgrade d046` 干净移除全部新增对象且旧表保持升级前快照无报错。
-2. **部署级单行网关租约与全写入 `epoch` 围栏**：验证双实例竞选 `gateway-lease/acquire` 仅 1 个获租，未获租方返回 `granted: false`；模拟实例 1 过期后实例 2 接管递增 `epoch`，断言实例 1 迟到的 `I-1`、`I-2`、`I-3`、`/cursor`、`/status`、`I-6`、`I-7`、`recover` 全部返回 `409 stale_gateway_epoch` 且游标保持未推进。
-3. **全局锁序与「接管与原持有人重扫或恢复同时发生」双连接交错测试（D5）**：使用双真实 PostgreSQL 连接与屏障钩子交错执行：① 同一无账号新成员双并发 `qrcode/start`；② 同一账号双并发入站更新 `last_inbound_at`；③ **在职成员 A 扫码 `confirm` 接管已离职成员 B（`disabled_reason = 'member_not_in_roster'`）释放的同一 `ilink_user_id`，与成员 B 重新入册触发自动恢复或重扫 `confirm` 同时并发交错**（断言严格按 `user_id` 升序 → `account_id` 升序 → 微信号锁执行，零死锁 `40P01`，最终唯一 1 人成功持有该微信号）。
-4. **三态名册判定、微信号释放边界与撤销零空窗（D3, D6, D7）**：验证 `DALTON_ALLOWED_EMAILS` 成员在数据库查询异常时仍判为 `"active"`，仅在 `dalton_members` 的成员遇数据库异常判为 `"lookup_error"`（对账保持原状态不变，`I-1` 返回 `503` 不推进游标），确切不在册判为 `"removed"` 停用并释放微信号；验证 `external_access_disabled` 暂停态仍阻止他人扫同一微信号；验证 `start` 调 iLink 期间被管理员调用 `DELETE /weixin/admin/users/{uid}/weixin` 撤销时落库被拒、`confirm` 同时受总开关与外部开关约束、解除后重试已确认 `session_key` 返回未连接；验证空 `ilink_user_id` 确认进入 `pending_verification`（「已连接，待验证」），首条消息发现重复微信号时自动删除新连接并写审计；验证全部 8 种审计 `action` 的默认/预设 `reason` 非空落表。
-5. **每次外发前重授权 `preflight-send`、通知三路径与共享路由能力门控（D8, D9）**：验证多段回复发完第 1 段后账号被代解除、停用、重扫换代或关闭总开关/外部开关时，第 2 段在 `preflight-send` 被即时阻断；验证混合 `/settings` 请求与 `I-7` `/deliveries/progress` 按平台能力门控；验证研报读取 `payload_json["text"]`、测试推送经 `decide_automation_notification_plan` 计划授权、普通通知按每个目标分别走网关（微信）与桥接/网关（飞书/Discord），覆盖单开微信、单关微信与同批混发隔离。
-6. **`context_token` 版本围栏与凭据/日志脱敏**：验证非失效业务错误不写 `stale_at`、旧 `token_version` 迟到错误不覆盖新令牌、`stale_at` 非空不读旧副本、仅新有效带令牌入站清除 `stale_at`；验证 `confirmed_result` 仅含 5 个白名单字段、公开接口可正常展示二维码且日志/错误零敏感泄露。
-7. **材料收集模式三步附件与并发边界（D4）**：验证默认会话 `/collect` 锁定 `get_home_workspace_id`、收集中再发 `/collect` 刷新有效期、超期后再发 `/collect` 先归档旧窗口不撞唯一索引；验证 `I-1` 返回 `collection_mode="appended"` 与 `workspace_id` → 上传重试 → 幂等补登附件；验证 **最后一笔附件上传与 `/done` 并发（在 30 秒内完成补登成功合入，超过 30 秒在合成材料中注明缺失）** 以及超期后直接发 `/done` 的处理。
+1. **只复制迁移、部署后外键独立校验与降级逐行一致测试（D10, D18）**：构造含原管理员与绑定码成员的 `dalton_channel_identities`、未用微信 `bind_codes`、`generation > 1` 且带非 Home 工作区与 `pending_interrupt` 的 `session_generations`、`context_tokens`、含 `raw_payload.weixin_attachments` 明文密钥的未完成 `inbound_events`、活跃 `thread_watches`、无 `scope_key` 的各类 `background_runs`（含 `eff_ilink_user_id` 为空与无法匹配会话键的记录）以及多代际 `deliveries` 的 `d046` 库：
+   - 执行 `d049.upgrade()`：断言原管理员会话不换线程、新表与新列回填准确（`background_runs` 按 `thread_id` 经监听/入站解析回填且未匹配行保持原样，历史投递按源事件精确回填代际）、5 条外键此时 `convalidated = false`，随后执行部署后独立外键校验脚本并断言全部 `convalidated = true`；
+   - 执行 `d049.downgrade()` 回到 `d046`：**逐表逐行比对升级前快照，断言旧代码所读的全部行与列（`identities`、`bind_codes`、`session_generations`、`weixin_context_tokens`、`inbound_events.raw_payload`/`status`、`thread_watches`、`background_runs`、`deliveries` 及 `weixin_state` 凭据游标列）与升级前逐行完全一致**。
+2. **同事务 `epoch` `FOR SHARE`/`FOR UPDATE` 互斥与全写入围栏测试（D12）**：验证未获租实例返回 `granted: false`；覆盖 `I-1`、`I-2`、`I-3`、`/cursor`、`/status`、`login-sessions` 写入、收集补登、`I-6`、`preflight-send`、`I-7`、`recover` 旧 `epoch` 全部返回 `409` 且游标保持原位；使用双真实数据库连接交错测试 **「旧请求已通过前置校验或阻塞在下游锁 / 已持 `FOR SHARE` 尚未写入 vs 新实例 `acquire` 交接递增 `epoch`」**，断言 `FOR SHARE` 与 `FOR UPDATE` 严格串行，交接提交后零旧 `epoch` 数据落库。
+3. **零例外全局锁序双连接交错测试（D5, D11）**：使用双真实 PostgreSQL 连接与屏障钩子交错执行：
+   - ① 同一无账号新成员双并发 `qrcode/start`；
+   - ② 在职成员 A 扫码 `confirm` 接管已离职成员 B（`member_not_in_roster`）释放的同一 `ilink_user_id` **与成员 B 重新入册触发自动恢复或重扫 `confirm` 同时发生**；
+   - ③ **成员处于 `pending_verification` 时发来首条微信消息触发 `I-1` 回填/冲突解除，与该成员本人在网页重新扫码 `confirm`（或原微信号持有人重扫）同时发生**（断言 `I-1` 读到 `pending_verification` 后立即回滚释放账号锁、按 Level 1 → Level 3a 统一顺序重取锁，全程零 `40P01` 死锁）。
+4. **撤销零空窗、状态条件、按层级开关、槽位容量与回执例外测试（D3, D6, D7, D14, D15, D16, D18）**：
+   - 验证首次扫码 `start` 在调 iLink 前写入 `starting` 会话，在途被管理员调 `DELETE /weixin/admin/users/{uid}/weixin` 撤销后，`save_qr` / `update` / `confirm` 均因状态条件 `rowcount == 0` 整笔回滚并返回已撤销；验证解除后重试已确认 `session_key` 返回未连接；
+   - 验证三态名册判定（允许名单优先 `"active"`、查询异常 `"lookup_error"` 不动账号且 `I-1` 返 `503`、`"removed"` 停用释放微信号）；
+   - 验证 **`allow_external = NULL`（默认开启）与 `allow_external = FALSE` 两态下**：外部开关关闭后，`external` 成员账号置 `external_access_disabled`、保留微信号占用、**连续多轮 15 秒 `reconcile` 对账均保持暂停不恢复（仅在重开外部开关时恢复）**，同时 **`admin` 与 `internal` 成员扫码 `confirm`（配置行 `UPDATE` 正常命中 1 行）及收发消息全程正常进行**，并验证配置行 `UPDATE` 命中 0 行时整笔回滚；
+   - 验证容量达 `200 / 200` 时：两名新成员并发 `confirm` 仅最后剩 1 槽者成功、超限者回滚，自动恢复在满额时暂停恢复，而**已占槽账号同号重扫在 `200 / 200` 时照常成功**；
+   - 验证空 `ilink_user_id` 确认进入 `pending_verification`，首包发现重复微信号时删除新连接、写 `conflict_auto_unbound` 审计并返回一次性 `one_time_weixin_reply`（以及 `/unbind` 返回一次性告别回执并写 `member_unbind` 审计），覆盖全部 8 种审计 `action` 默认非空 `reason`。
+5. **源事件机器人代际校验、每次外发 `preflight-send`、通知三路径与共享路由门控（D8, D9, D18）**：验证同号重扫后重扫前延迟到达的旧回复在 `I-6` 因源事件 `weixin_bot_generation` 失配被拒，来源不明的在途投递标 `unknown`；验证多段回复中途解绑/停用/换代/关开关在第 2 段 `preflight-send` 即时阻断；验证混合 `/settings` 与 `I-7` 按平台能力门控；验证研报读 `payload_json["text"]`、测试推送走 `decide_automation_notification_plan`、普通通知按目标独立选网关或桥接。
+6. **`context_token` 版本围栏与凭据/日志脱敏**：验证非失效错误不写 `stale_at`、旧 `token_version` 迟到错误不覆盖新令牌、仅新有效带令牌入站清除 `stale_at`；验证 `confirmed_result` 严格 5 字段白名单且日志/公开错误零敏感信息泄露。
+7. **材料收集模式（无 Home 自动创建 + 事务外 30 秒等待 + `flushing` 重启恢复，D4, D17）**：
+   - 验证首次使用且库中尚无 Home 工作区行的成员发 `/collect` 时自动调 `get_or_create_home_workspace` 创建并锁定 `workspace_id`，第一条材料写权限校验通过；
+   - 验证收集中重发 `/collect` 续期、超期重发先置旧窗口 `expired`；
+   - 验证 `/done` 先提交 `flushing`，**在 30 秒事务外等待期间并发附件补登接口可无阻塞获取 `collect_items` 锁完成写入并合入最终材料**（超时条目注明缺失），随后单事务原子登记 `collect:<buffer_id>` 并置窗口为 `done`；
+   - 验证 **进入 `flushing` 提交后立即模拟重启**：恢复接口驱动 `finalize` 完成合成事件登记并将窗口置为 `done`，后续再次发 `/collect` 正常开启新窗口。
 
 ### 7.2 网关测试
 
 覆盖文件：`integrations/dalton-channel-gateway/test/weixin.test.ts`、`integrations/dalton-channel-gateway/test/weixin-real-backend.integration.test.ts`：
 
-1. **单实例租约等待、`getupdates` 返回后 `epoch` 检查与 `409` 退场**：验证未获租实例保持静默等待；模拟长轮询挂起期间租约过期被新实例接管，旧实例在 `getupdates` 返回后检测到租约失效（或首条 `I-1` 收到 `409`）时立即丢弃该批消息、不提交 `/cursor` 并退出进程，新实例按原游标完整接续处理。
-2. **每次外发前重授权与已发 iLink 请求 `unknown` 结算**：验证分段发送与文件上传后发送均调用 `preflight-send`；模拟向 iLink 发出 `sendmessage` 后网络超时，断言该投递结算为 `status = 'unknown'` 且不重复发送。
-3. **上传中途重启恢复与解密材料优先读取（D9）**：构造含 2 个微信附件的未完成入站事件（第 1 个已在 `uploaded_attachments`，`raw_payload.attachments` 仅含无密钥描述，`decrypted_weixin_attachments` 含完整 AES 密钥），模拟网关重启执行 `mode=startup` 恢复，断言 `parseRecoveredAttachments` 优先读取解密材料、跳过第 1 个附件并成功下载上传第 2 个附件（覆盖普通回合与收集模式待补登条目）。
-4. **合并转发混合事件与无令牌静默处理（D9）**：测试 ① 同一消息含文字/图片 + 未知 `item.type` 时文字图片照常处理；② 纯未知 `item.type` 且有可用 `context_token` 时回复指引；③ 纯未知 `item.type` 且无可用 `context_token` 时静默归档不报错；④ 重复投递幂等。
+1. **获租严格启动顺序（先 `mode=startup` 后轮询/认领）与 `409` 即停退场（D1, D13）**：断言新获租网关在 `GET /internal/recover?mode=startup` 返回成功之前零 `getupdates` 请求、零 `I-6` 新认领（不会把自身刚认领的投递误标 `unknown`）；模拟长轮询期间失租，旧实例返回后检测到失租或收到 `409` 时不推进游标、不调 `I-7` 结算并立即退出，新实例完成 `mode=startup` 后按原游标接续。
+2. **每次常规外发重授权、一次性回执直发与 `unknown` 结算（D8, D16）**：验证常规分段与上传后发送均调 `preflight-send`，向 iLink 发出请求后网络超时结算为 `unknown`；验证 `I-1` 冲突解绑与 `I-2` `/unbind` 返回的 `one_time_weixin_reply` 直接用触发入站的 `context_token` 发出且不重发。
+3. **上传中途重启恢复（普通回合 vs 收集条目分流 + `flushing` 恢复，D9 & D17）**：
+   - 普通未完成入站双附件重启恢复：断言优先读 `decrypted_weixin_attachments`、跳过已完成第 1 附件、续传第 2 附件并恢复对话回合；
+   - **收集窗口内未完成附件入站重启恢复**：断言 `row.collect_buffer_id != null` 时仅续传剩余附件并调用 `POST .../collect-buffers/{buffer_id}/items/{message_id}/attachments` 补登，**零 `executeRegisteredInboundTurn` 调用（不提前启动独立回合）**；
+   - **`flushing` 窗口重启恢复**：断言网关先跑完收集附件续传，再调 `finalize` 启动唯一一次合成回合。
+4. **合并转发混合事件与无令牌静默处理（D9）**：覆盖混合条目保留有效图文、纯未知条目有令牌提示、无令牌静默归档及重复投递幂等。
 
 ### 7.3 前端测试
 
 覆盖文件：`web/src/pages/Settings/panels/dalton/__tests__/DaltonWeixinChannelCard.test.tsx`、`web/src/pages/Settings/__tests__/sections.capabilities.test.ts`、`web/src/pages/Settings/__tests__/SettingsRail.capabilities.test.tsx`：
 
-1. **个人「我的微信」卡片**：测试 `wait -> scaned -> verify_code -> confirmed` 全流转、「已连接」与「已连接，待验证」徽章、跨成员冲突提示、常驻转发指引、重扫替换、二次确认解绑，以及 `allow_external === false` 时对 `external` 成员隐藏入口。
-2. **管理员「团队微信渠道管理」卡片**：验证总开关与外部成员开关切换、单实例槽位（`活跃 / 200`）、昵称与末 4 位掩码 ID 展示，以及对已绑定成员和「扫码等待中」无账号 ID 成员执行预设原因二次确认解除。
+1. **个人「我的微信」卡片**：测试 `wait -> scaned -> verify_code -> confirmed` 全流转、「已连接」与「已连接，待验证」徽章、跨成员冲突提示、常驻转发指引、满额下同号重扫替换、二次确认解绑，以及 `allow_external === false` 时仅隐藏 `external` 成员入口而保留 `admin` / `internal` 入口。
+2. **管理员「团队微信渠道管理」卡片**：验证总开关与外部成员开关切换、单实例槽位（`占槽 / 200`）、昵称与末 4 位掩码 ID 展示，以及对已绑定成员和 `starting`/`wait` 无账号 ID 待扫成员执行预设原因二次确认解除。
 3. **能力门控**：验证 `channel_weixin` 关闭时全部微信组件与搜索词零渲染，`test_core_capabilities_gate.py` 扫描通过。
 
 ### 7.4 需要真实微信号才能验证的实机清单（上线前必测）
 
 使用 **至少 2 个不同真实个人微信号** 在上线前完成实测：
 
-1. **双微信号并发扫码、跨区跳转与重复微信号冲突**：两人同时扫码确认（覆盖 `redirect_host`、`baseurl`、`verify_code` 及核实 `confirmed` 是否返回 `ilink_user_id`）；再用成员 B 扫成员 A 已绑定的微信号，验证成员 B 被拒绝提示且成员 A 原在线连接不受影响。
+1. **双微信号并发扫码、跨区跳转与重复微信号冲突**：两人同时扫码确认（覆盖 `redirect_host`、`baseurl`、`verify_code` 及核实 `confirmed` 是否返回 `ilink_user_id`）；再用成员 B 扫成员 A 已绑定的微信号，验证成员 B 被拒（或首包核验自动解除并在微信收到原因回复）且成员 A 原连接正常。
 2. **双人并发私聊、斜杠指令与同号重扫续聊**：两人并发对话、切工作区、发 `/new`，其中一人重扫同一微信号后验证原线程与工作区无缝延续。
 3. **合并转发线上表现测定**：实测发送「合并转发聊天记录」及「合并转发 + 附言文字」，验证有无事件、混合内容保留、有令牌提示与无事件时页面/`/help` 指引可达。
-4. **逐条转发 `/collect` → `/done` 含附件并发实测**：发 `/collect` 后连续逐条转发多条文字、高清大图与大体积 PDF 并立即发 `/done`，验证等待附件上传完成后单轮完整综合分析。
+4. **逐条转发 `/collect` → `/done` 含附件并发实测**：新成员首次发 `/collect`（验证自动创建 Home 工作区），连续逐条转发文字、大图与 PDF 后立即发 `/done`，验证无锁等待上传完成后单轮综合分析。
 5. **多账号 CDN 媒体收发**：实测入站图片、PDF、转写语音、视频（存为工作区 `.mp4`）与出站 PNG 图片气泡、PDF 文件气泡。
 6. **首条带令牌消息激活推送与过期错误码采集**：新扫码后发 `/workspace` 激活令牌，验证网页「发送测试」（经计划授权）与研报推送正常送达；采集长期静默后过期 `context_token` 的真实 `errcode` 填入 `CONTEXT_TOKEN_STALE_ERRCODES`。
-7. **即时撤销与代解除审计**：实测管理员对「扫码等待中」和「已连接」成员分别执行代解除，验证二维码即刻失效、在途分段外发即时阻断、`dalton_channel_weixin_audit_logs` 落表准确。
-8. **网关重启单实例接管与离线消息续拉**：重启 `launchd` 网关服务，核验新进程接管 `epoch` 并拉回停机窗口（1 分钟 / 15 分钟）离线消息单次回复。
+7. **即时撤销、告别回执与代解除审计**：实测管理员对刚点扫码（`starting`/`wait`）和已连接成员分别代解除，以及成员微信内发 `/unbind`，验证二维码即刻失效、微信收到告别回执、在途分段外发即时阻断、`dalton_channel_weixin_audit_logs` 落表准确。
+8. **网关重启单实例接管与离线消息续拉**：重启 `launchd` 网关服务，核验新进程先完成 `mode=startup` 再开启轮询接管 `epoch`，并拉回停机窗口（1 分钟 / 15 分钟）离线消息单次回复。
 
 ---
 
@@ -690,12 +725,12 @@ CREATE TABLE IF NOT EXISTS dalton_channel_weixin_collect_items (
 
 | 编号 | 决策事项 | 状态 | 定案内容与落地位置 |
 |---|---|---|---|
-| **决策 1** | **每人微信号数量与重扫策略** | **已定** | 每人限连 **1 个**微信号（`dalton_channel_weixin_accounts(user_id)` 与 `dalton_channel_identities(user_id, platform)` 唯一约束）；重扫替换原连接，同号保持原线程，换号推进 `generation + 1`（§1.1、§2.1）。 |
-| **决策 2** | **管理员代解除、无账号待扫撤销与审计** | **已定** | 管理员可随时代任意成员解除连接或按 `user_id` 撤销待扫会话，二次确认选预设原因，写入 `dalton_channel_weixin_audit_logs`（操作人、目标成员、时间、原因；全部 8 类 `action` 均设固定非空默认文案，§1.2、§2.1 (6)、§4.3）。 |
-| **决策 3** | **同一微信号冲突、停用释放边界与待验证态** | **已定** | 同一微信号被另一成员扫时拒绝并提示先在原账号解除；仅「本人解除」「管理员代解除」「离开团队（名册 `removed`）」释放微信号占用，「外部成员开关关闭」与 `lookup_error` 保留占用；扫码缺 `ilink_user_id` 显示「已连接，待验证」，首包发现重复自动解除并回复原因；跨成员接管与自动恢复遵守统一两阶段锁序（§1.1、§2.1 (3)(8)、§4.2）。 |
-| **决策 4** | **外部成员开关与跨形态统一设置** | **已定** | 默认向外部成员开放，收紧开关定义于 `src/dalton/settings.py` `DaltonConfig.weixin.allow_external`（支持 `dalton_channel_weixin_config.allow_external` 覆盖），Everflow 与核心安装从同一套设置读取，`channel_weixin` 关闭时零暴露（§0.2、§3.1）。 |
-| **决策 5** | **管理页掩码展示与单实例 200 上限** | **已定** | 管理页展示微信昵称与末 4 位掩码 `ilink_user_id`；单网关并发轮询上限默认 **200**，由后端统一配置拦截并下发网关，网关本地不另设上限（§1.2、§3.1、§3.3）。 |
-| **决策 6** | **部署级单网关实例与 `epoch` 围栏（D1）** | **已定** | 每套部署固定运行 **1 个**网关实例（Everflow `launchd` 单进程 / 核心 Compose 单副本），后端单行表 `dalton_channel_gateway_lease` 维护租约与 `epoch`；全量写入请求与长轮询批次均校验 `epoch`，旧实例遇 `409` 不推进游标并立即退出；启动恢复由持租实例按 `mode=startup` 统一执行（§0.2、§2.1 (1)、§3.2、§3.4）。 |
-| **决策 7** | **停机迁移与只删新增对象回退（D2）** | **已定** | 执行 `d049` 时后端与网关均停止（核心 `upgrade.sh` 改为先停 `channel-gateway`/`backend`/`crawler` 再 `migrate`）；`d049` 复制数据并清空 `login_qrcode` 后不再写旧表；`d049.downgrade()` 只删新增表/列/索引/外键回到升级前单账号状态；热表外键用 `NOT VALID` + `lock_timeout`；旧表由未来独立迁移删除且其 `downgrade()` 直接报错（§2.1 (5)、§2.2、§2.3、§6.3）。 |
-| **决策 8** | **三态名册判定与每次外发重授权（D3, D7, D8）** | **已定** | 复用现有在册定义（`DALTON_ALLOWED_EMAILS ∪ dalton_members` / 本地角色）返回 `active` / `removed` / `lookup_error`（异常不动账号、`I-1` 返 5xx 保留游标）；`start`/`confirm`/重试全链路复核防撤销空窗；每次向 iLink 外发前经 `preflight-send` 重授权，已发出而结果未明的标 `unknown`；历史投递保留实际来源代际与收件人（§2.2、§3.2、§4.2）。 |
-| **决策 9** | **材料收集三步附件与通知/部署对齐（D4, D9）** | **已定** | 收集模式先 `I-1` 登记返回 `workspace_id`、上传后再补登附件，`/done` 最多等 30 秒未完上传；恢复优先读解密附件材料；合并转发无令牌不回复且保留混合事件有效内容；研报读 `payload_json["text"]`、测试推送走计划授权、普通通知逐目标选传输通道；核心发布包在网关入包前默认关闭 `channel_weixin`（§3.4、§4.4、§5.1、§6.2、§6.3）。 |
+| **决策 1** | **每人微信号数量与重扫策略** | **已定** | 每人限连 **1 个**微信号（`dalton_channel_weixin_accounts(user_id)` 唯一约束）；重扫替换原连接，同号保持原线程，换号推进 `generation + 1`（§1.1、§2.1）。 |
+| **决策 2** | **管理员代解除、按成员撤销与审计** | **已定** | 管理员可随时代任意成员解除连接或按 `user_id` 撤销待扫会话（含 `starting`），二次确认选预设原因，写入 `dalton_channel_weixin_audit_logs`（全部 8 类 `action` 均设固定非空默认文案，§1.2、§2.1 (5)、§4.3）。 |
+| **决策 3** | **同一微信号冲突、占用释放与回执例外（D6, D16）** | **已定** | 同一微信号被另一成员扫时拒绝；仅「本人解除」「管理员代解除」「离开团队（`member_not_in_roster`）」释放微信号占用，「外部成员开关关闭」与 `lookup_error` 保留占用；扫码缺 `ilink_user_id` 置 `pending_verification`，首包发现重复自动解除并写审计；重复微信号解除回执与 `/unbind` 告别回执直接用触发入站的 `context_token` 发送，跳过活跃账号预检（§1.1、§2.1 (3)、§3.2 #3–#4、§4.2）。 |
+| **决策 4** | **按层级求值开关与跨形态统一设置（D15）** | **已定** | 总开关对全员生效；`allow_external`（`NULL` 取 `settings.py` 默认开启）仅约束 `external` 成员，内部成员与管理员始终放行；确认、入站、对账恢复、外发预检统一调用 `evaluate_weixin_member_access`，`confirm` 配置行 `UPDATE` 命中 0 行整笔回滚；对账仅恢复 `member_not_in_roster`，`external_access_disabled` 仅在开关重开时恢复（§1.2、§3.1 (2)、§3.2 #2、§4.2）。 |
+| **决策 5** | **管理页掩码展示与 200 容量门控（D18）** | **已定** | 管理页展示微信昵称与末 4 位掩码 `ilink_user_id`；单网关上限默认 **200**，在 `confirm` 与自动恢复时于锁内检查容量，已占槽位账号重扫不受满额限制（§1.1、§3.2 #2、§3.3）。 |
+| **决策 6** | **单网关实例、同事务 `epoch` 锁与启动顺序（D1, D12, D13）** | **已定** | 每套部署固定运行 **1 个**网关实例；全量网关受保护写入（含二维码会话写入）在同一事务首步对 `dalton_channel_gateway_lease` 取 `FOR SHARE` 核对 `epoch`，与租约交接 `FOR UPDATE` 互斥；新获租网关先完成 `mode=startup` 处理遗留投递，成功后再开启长轮询与新投递认领；旧进程收到 `409` 直接退出，交新实例恢复结算（§0.2、§2.1 (1)(8)、§3.1、§3.2 #1、§3.4）。 |
+| **决策 7** | **只复制停机迁移、部署后校验外键与无损回退（D2, D10, D18）** | **已定** | 升级时后端与网关均停止（核心 `upgrade.sh` 先停服务再迁移，迁移失败且版本未变时用升级前镜像 `up -d` 恢复）；`d049` 只建新表新列并复制回填（`background_runs` 按 `thread_id` 经监听/入站解析会话键，未匹配行保留原样交旧逻辑恢复），保留旧代码所读既有行与 `raw_payload` 原状，新代码只读新表新列；`VALIDATE CONSTRAINT` 放在部署后独立事务执行；`d049.downgrade()` 只删新增对象使旧代码看到升级前逐行一致状态；旧行清理归入未来报错禁退的删旧表迁移（§2.1 (7)、§2.2、§2.3、§6.3、§7.1 #1）。 |
+| **决策 8** | **三态名册、扫码状态条件与源代际外发重授权（D3, D7, D8, D11, D14, D18）** | **已定** | 全局唯一锁序（需用户锁必先锁用户再锁账号，`I-1` 待验证首包已持账号锁则先回滚重取）；`start` 调 iLink 前持锁写 `starting` 会话，`save_qr`/`update`/`confirm` 均带状态条件（0 行回滚返已撤销）；名册三态 `active` / `removed` / `lookup_error`；历史投递与 `I-6` 首次认领核对源入站事件机器人代际（来源不明在途标 `unknown`），常规外发每次调用 iLink 前经 `preflight-send` 重授权（§2.1 (4)(8)、§2.2、§3.2 #2–#4、§4.2）。 |
+| **决策 9** | **收集窗口提交/恢复与通知、网关入包对齐（D4, D9, D17, D18）** | **已定** | `/collect` 在 Home 未创建时先调 `get_or_create_home_workspace` 再锁 ID；收集条目先 `I-1` 登记、上传后补登，重启恢复仅续传补登不启动回合；`/done` 短事务提交 `flushing` → 事务外无锁最多等 30 秒 → 单事务登记合成事件并置 `done`（重启由恢复接口调 `finalize` 续完）；合并转发保留混合有效内容且无令牌跳过回复；研报读 `payload_json["text"]`、测试推送走计划授权、普通通知逐目标选传输；核心包后续网关入包清单加入 Compose 私有网络监听（`DALTON_GATEWAY_BIND_HOST`）与容器间连通性检查（§3.4、§4.4、§5.1、§6.2）。 |
