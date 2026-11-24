@@ -9,11 +9,12 @@ from datetime import date
 from typing import Any
 from unittest.mock import create_autospec
 
-from alembic.operations import Operations
 import psycopg
 import pytest
+from alembic.operations import Operations
 
 from ptc_agent.agent.backends import automations as automations_backend_mod
+from ptc_agent.agent.middleware.runtime_context.profile import answer_preferences
 from ptc_agent.agent.middleware.skills import content as skill_content_mod
 from ptc_agent.agent.middleware.skills import dalton_registry as dalton_reg_mod
 from ptc_agent.agent.middleware.skills import registry as skill_reg_mod
@@ -29,7 +30,12 @@ from ptc_agent.config.core import (
 )
 from ptc_agent.core.sandbox import assets as sandbox_assets_mod
 from ptc_agent.core.sandbox import ptc_sandbox as ptc_sandbox_mod
-from ptc_agent.core.sandbox.runtime import ExecResult, RuntimeState, SandboxProvider, SandboxRuntime
+from ptc_agent.core.sandbox.runtime import (
+    ExecResult,
+    RuntimeState,
+    SandboxProvider,
+    SandboxRuntime,
+)
 from src.config.core import clear_config_cache
 from src.dalton import transcription_storage as transcription_storage_mod
 from src.dalton.capabilities import (
@@ -1056,8 +1062,7 @@ class TestPromptsAndAutomationsConditionalRendering:
         profile_md = loader.render(
             "components/user_profile.md.j2",
             user_profile={"name": "Analyst"},
-            preference_lines=[],
-            agent_steering={},
+            preferences=answer_preferences(None, steering=True),
             investment_lines=[],
             user_data_counts=None,
             main_agent_steering=True,
