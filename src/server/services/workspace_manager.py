@@ -155,6 +155,7 @@ class WorkspaceManager(ComputerManager):
         check_duplicate_snapshot: bool = False,
         expected_duplicate_workspace_id: Optional[str] = None,
         expected_duplicate_workspace_name: Optional[str] = None,
+        check_company_duplicate: bool = False,
         # --- DALTON-HOOK(cos-settings-tools): end ---
     ) -> Dict[str, Any]:
         """Create a project on the user's computer and return it straight away.
@@ -199,6 +200,7 @@ class WorkspaceManager(ComputerManager):
                 workspace_name=name,
                 expected_duplicate_workspace_id=expected_duplicate_workspace_id,
                 expected_duplicate_workspace_name=expected_duplicate_workspace_name,
+                check_company_duplicate=bool(verify_snapshot and check_company_duplicate),
             )
         elif chosen:
             try:
@@ -262,6 +264,8 @@ class WorkspaceManager(ComputerManager):
                 create_kwargs["expected_duplicate_workspace_name"] = (
                     expected_duplicate_workspace_name
                 )
+            if check_company_duplicate:
+                create_kwargs["check_company_duplicate"] = True
         workspace = await create_workspace_on_computer(
             user_id,
             name,

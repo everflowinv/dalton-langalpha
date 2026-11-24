@@ -283,6 +283,7 @@ class MachineLifecycleMixin:
         workspace_name: Optional[str] = None,
         expected_duplicate_workspace_id: Optional[str] = None,
         expected_duplicate_workspace_name: Optional[str] = None,
+        check_company_duplicate: bool = False,
     ) -> Dict[str, Any]:
         """Create a hosted cloud primary computer for a confirmed snapshot that
         observed no primary computer.
@@ -327,6 +328,8 @@ class MachineLifecycleMixin:
                             target_ws_name,
                             expected_duplicate_workspace_id=expected_duplicate_workspace_id,
                             expected_duplicate_workspace_name=expected_duplicate_workspace_name,
+                            check_company_duplicate=check_company_duplicate,
+                            conn=conn,
                         ):
                             raise ApprovalScopeChangedError("情况已变化，请重新发起")
             computer = await self.create_computer_for_user(

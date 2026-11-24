@@ -627,6 +627,8 @@ async def workspaces_create(
                 "verify_snapshot": True,
                 "check_duplicate_snapshot": True,
             }
+            if not preapproved and not allow_duplicate_company:
+                create_kwargs["check_company_duplicate"] = True
             if snapshot.get("duplicate_workspace_id") is not None:
                 create_kwargs["expected_duplicate_workspace_id"] = str(
                     snapshot["duplicate_workspace_id"]

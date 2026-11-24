@@ -868,6 +868,7 @@ async def create_workspace_on_computer(
     check_duplicate_snapshot: bool = False,
     expected_duplicate_workspace_id: Optional[str] = None,
     expected_duplicate_workspace_name: Optional[str] = None,
+    check_company_duplicate: bool = False,
     # --- DALTON-HOOK(cos-settings-tools): end ---
     conn=None,
 ) -> Optional[Dict[str, Any]]:
@@ -913,6 +914,8 @@ async def create_workspace_on_computer(
                     name,
                     expected_duplicate_workspace_id=expected_duplicate_workspace_id,
                     expected_duplicate_workspace_name=expected_duplicate_workspace_name,
+                    check_company_duplicate=check_company_duplicate,
+                    conn=owned,
                 ):
                     return None
             # --- DALTON-HOOK(cos-settings-tools): end ---
@@ -1291,17 +1294,23 @@ async def check_duplicate_snapshot_unchanged(
     *,
     expected_duplicate_workspace_id: Optional[str] = None,
     expected_duplicate_workspace_name: Optional[str] = None,
+    check_company_duplicate: bool = False,
+    conn: Any = None,
 ) -> bool:
-    """Verify under ``lock_user_writes`` that the user's live-workspace
-    duplicate state still matches what the confirmation card displayed.
+    """Verify under ``lock_user_writes`` that the live-workspace duplicate
+    state still matches what the confirmation card displayed.
 
     Returns False (triggering ``scope_changed``) when:
-    - Any live workspace other than ``expected_duplicate_workspace_id`` matches
+    - Any live workspace of ``user_id`` other than
+      ``expected_duplicate_workspace_id`` matches
       ``is_duplicate_name(name, live_name)`` (including when the card had
       ``duplicate_check_unavailable=True`` and the DB has now recovered);
     - A listed ``expected_duplicate_workspace_id`` was deleted, renamed away
       from ``expected_duplicate_workspace_name``, or no longer duplicates
-      ``name``.
+      ``name``;
+    - ``check_company_duplicate`` is True and the company workspace dedup
+      rules (company names, normalized tickers, colleague-visible workspaces,
+      and active company coverage units) match an undisclosed duplicate.
     """
     from src.tools.secretary.approvals import is_duplicate_name
 
@@ -1335,6 +1344,38 @@ async def check_duplicate_snapshot_unchanged(
             return False
     if expected_duplicate_workspace_id is not None and not matched_expected:
         return False
+
+    if check_company_duplicate:
+        from src.dalton.coverage.dedup import find_existing_company_workspace
+
+        dup = None
+        try:
+            if conn is not None:
+                async with conn.transaction():
+                    dup = await find_existing_company_workspace(
+                        user_id, name, channel="cos", conn=conn
+                    )
+            else:
+                dup = await find_existing_company_workspace(
+                    user_id, name, channel="cos"
+                )
+        except Exception as exc:
+            logger.warning(
+                "Locked company workspace dedup check failed (%s); proceeding",
+                type(exc).__name__,
+            )
+        if dup is not None and dup.matches:
+            matched_ids = set(dup.matched_workspace_ids) | {
+                str(m.workspace_id) for m in dup.matches if m.workspace_id
+            }
+            has_undisclosed = (
+                expected_duplicate_workspace_id is None
+                or any(m.unbound_unit or not m.workspace_id for m in dup.matches)
+                or any(mid != expected_duplicate_workspace_id for mid in matched_ids)
+                or not matched_ids
+            )
+            if has_undisclosed:
+                return False
     return True
 # --- DALTON-HOOK(cos-settings-tools): end ---
 

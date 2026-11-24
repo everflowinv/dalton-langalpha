@@ -176,6 +176,7 @@ async def test_resume_reads_only_persisted_snapshot_when_primary_switches(
         description="desc",
         verify_snapshot=True,
         check_duplicate_snapshot=True,
+        check_company_duplicate=True,
         expected_computer_kind="docker",
         computer_id=CLOUD_1,
         expected_computer_name="Cloud Primary",
@@ -1061,50 +1062,191 @@ async def test_real_langgraph_resume_reads_scope_changed_and_reject_before_compa
 
 
 @pytest.mark.asyncio
-async def test_real_langgraph_approve_skips_company_dedup_and_reaches_locked_scope_changed(
+@pytest.mark.parametrize(
+    ("scenario", "new_ws_owner", "new_ws_name", "owner_name", "owner_email"),
+    [
+        ("company_name_tencent", USER_ID, "腾讯控股", "Alice", "alice@team.com"),
+        ("colleague_ticker_0700hk", "user-colleague-1", "0700.HK", "Bob", "bob@team.com"),
+    ],
+)
+async def test_real_langgraph_approve_runs_real_locked_company_dedup_and_returns_scope_changed(
     monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    new_ws_owner: str,
+    new_ws_name: str,
+    owner_name: str,
+    owner_email: str,
 ) -> None:
-    """Round 5 Decision 3: using a real LangGraph StateGraph + InMemorySaver,
-    when a same-ticker workspace appears while a confirmation card is pending
-    and the user clicks Approve, resume skips company_workspace_exists precheck
-    and enters locked WorkspaceManager.create_workspace, returning status='error'
-    code='scope_changed'."""
+    """Round 6 Decision 1: real LangGraph StateGraph + InMemorySaver ->
+    real workspaces_create -> real WorkspaceManager.create_workspace ->
+    real create_workspace_on_computer -> real check_duplicate_snapshot_unchanged ->
+    real find_existing_company_workspace (no mocking WorkspaceManager to return
+    scope_changed).
+
+    Covers both regressions when a duplicate appears while the confirmation card
+    for '700.HK' is pending:
+    1) User adds a workspace named '腾讯控股' (company name match);
+    2) A colleague adds '0700.HK' (colleague-visible ticker match).
+    In both cases, Approve skips lock-outside precheck, runs company dedup
+    inside lock_user_writes, never inserts the workspace, and returns
+    status='error' code='scope_changed'."""
+    from contextlib import asynccontextmanager
+
     from langgraph.checkpoint.memory import InMemorySaver
     from langgraph.graph import END, START, MessagesState, StateGraph
     from langgraph.types import Command as LGCommand
 
+    from src.dalton.coverage import dedup as dedup_mod
+    from src.dalton.coverage.dedup import DedupLlmResult, DedupMatchItem
+    from src.server.database import workspace as ws_db
     from src.tools.secretary.tools import workspaces_create
 
-    dedup_calls: list[str] = []
-    company_exists_now = {"flag": False}
+    live_workspaces: list[dict[str, Any]] = []
+    lock_state = {"held": False, "inserts": 0}
+    llm_calls: list[dict[str, Any]] = []
 
-    async def _fake_find_company(uid: str, ws_name: str, channel: str = "cos"):
-        dedup_calls.append(ws_name)
-        if company_exists_now["flag"]:
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            text = " ".join(sql.split())
+            if "INSERT INTO workspaces" in text:
+                lock_state["inserts"] += 1
+                self._rows = []
+                return
+            if "FROM dalton_coverage_units" in text or "FROM dalton_knowledge_versions" in text:
+                self._rows = []
+                return
+            if "FROM workspaces w" in text:
+                if isinstance(params, tuple) and params and isinstance(params[0], list):
+                    wanted = set(params[0])
+                    self._rows = [
+                        dict(r) for r in live_workspaces if r["workspace_id"] in wanted
+                    ]
+                else:
+                    self._rows = [dict(r) for r in live_workspaces]
+                return
+            if "FROM workspaces" in text and isinstance(params, dict) and "user_id" in params:
+                uid_filter = str(params["user_id"])
+                self._rows = [
+                    {"workspace_id": r["workspace_id"], "name": r["name"]}
+                    for r in live_workspaces
+                    if r["user_id"] == uid_filter
+                ]
+                return
+            self._rows = []
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._rows)
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            return self._rows[0] if self._rows else None
+
+    class _FakeConn:
+        def cursor(self, **_kwargs):
+            return _FakeCursor()
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+    @asynccontextmanager
+    async def _fake_folder_allocation(_computer_id: str, conn=None):
+        try:
+            yield conn or _FakeConn()
+        finally:
+            lock_state["held"] = False
+
+    @asynccontextmanager
+    async def _fake_get_db_connection(conn=None):
+        yield conn or _FakeConn()
+
+    async def _fake_lock_user_writes(_cur, _uid: str) -> None:
+        lock_state["held"] = True
+
+    async def _fake_dalton_complete(**kwargs):
+        prompt = str(kwargs.get("user_prompt") or "")
+        llm_calls.append({"lock_held": lock_state["held"], "prompt": prompt})
+        if new_ws_name in prompt:
             return SimpleNamespace(
-                matches=[SimpleNamespace(workspace_id=WS_1, name="0700.HK")],
-                message="已存在同名公司工作区 0700.HK",
-                suggestion=None,
-                suggestion_payload=lambda: None,
-                matches_payload=lambda: [{"workspace_id": WS_1, "name": "0700.HK"}],
+                ok=True,
+                parsed=DedupLlmResult(
+                    matches=[
+                        DedupMatchItem(
+                            id="1",
+                            confidence="high",
+                            reason=f"same company ({scenario})",
+                        )
+                    ]
+                ),
             )
-        return None
+        return SimpleNamespace(ok=True, parsed=DedupLlmResult(matches=[]))
 
-    mgr = create_autospec(WorkspaceManager, instance=True)
-    mgr.create_workspace.side_effect = ApprovalScopeChangedError("情况已变化，请重新发起")
-
-    monkeypatch.setattr(
-        "src.dalton.coverage.dedup.find_existing_company_workspace",
-        _fake_find_company,
-    )
+    real_ws_mgr = object.__new__(WorkspaceManager)
     monkeypatch.setattr(
         "src.server.services.workspace_manager.WorkspaceManager.get_instance",
-        create_autospec(WorkspaceManager.get_instance, return_value=mgr),
+        create_autospec(WorkspaceManager.get_instance, return_value=real_ws_mgr),
+    )
+    monkeypatch.setattr(
+        "src.server.services.workspace_manager.get_computer",
+        create_autospec(
+            lambda _cid: None,
+            side_effect=lambda *_a, **_kw: _async_val(
+                _computer_row(CLOUD_1, name="Cloud Primary", kind="docker", is_primary=True)
+            ),
+        ),
+    )
+    monkeypatch.setattr(ws_db, "folder_allocation", _fake_folder_allocation)
+    monkeypatch.setattr(ws_db, "lock_user_writes", _fake_lock_user_writes)
+    monkeypatch.setattr(dedup_mod, "get_db_connection", _fake_get_db_connection)
+    monkeypatch.setattr(dedup_mod, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "get_user_tier",
+        create_autospec(
+            lambda _uid: None,
+            side_effect=lambda *_a, **_kw: _async_val("internal"),
+        ),
+    )
+    monkeypatch.setattr(dedup_mod, "_is_internal_team_owner", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_model",
+        create_autospec(
+            dedup_mod.resolve_assist_model,
+            return_value="gpt-4o-mini",
+        ),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_fallback_models",
+        create_autospec(
+            dedup_mod.resolve_assist_fallback_models,
+            return_value=[],
+        ),
+    )
+    monkeypatch.setattr(dedup_mod, "dalton_complete", _fake_dalton_complete)
+    monkeypatch.setattr(dedup_mod, "model_requires_user_oauth", lambda _m: False)
+    monkeypatch.setattr(
+        dedup_mod.sharing_mod,
+        "require_workspace_access",
+        create_autospec(
+            lambda *a, **kw: None,
+            side_effect=lambda *_a, **_kw: _async_val(None),
+        ),
     )
 
     snap = {
         "action": "create_workspace",
-        "tool_call_id": "call-lg-approve-1",
+        "tool_call_id": f"call-lg-{scenario}",
         "workspace_name": "700.HK",
         "workspace_description": "Tencent research",
         "computer_id": CLOUD_1,
@@ -1123,7 +1265,7 @@ async def test_real_langgraph_approve_skips_company_dedup_and_reaches_locked_sco
             USER_ID,
             "700.HK",
             "Tencent research",
-            "call-lg-approve-1",
+            f"call-lg-{scenario}",
             preapproved=False,
             snapshot=snap,
         )
@@ -1134,31 +1276,48 @@ async def test_real_langgraph_approve_skips_company_dedup_and_reaches_locked_sco
     builder.add_edge("create", END)
 
     graph = builder.compile(checkpointer=InMemorySaver())
-    cfg = {"configurable": {"thread_id": "lg-approve-dup-scope-changed"}}
+    cfg = {"configurable": {"thread_id": f"lg-real-recheck-{scenario}"}}
+
+    # Initial turn: no duplicates exist yet -> pauses for confirmation.
     paused = await graph.ainvoke({"messages": []}, config=cfg)
     assert "__interrupt__" in paused
     intr_id = paused["__interrupt__"][0].id
-    assert len(dedup_calls) == 1
+    assert llm_calls == []
 
-    # While waiting for confirmation, another connection creates 0700.HK.
-    company_exists_now["flag"] = True
-    dedup_calls.clear()
+    # While waiting for confirmation, the duplicate workspace is created.
+    live_workspaces.append(
+        {
+            "workspace_id": "55555555-5555-5555-5555-555555555555",
+            "user_id": new_ws_owner,
+            "name": new_ws_name,
+            "status": "stopped",
+            "owner_name": owner_name,
+            "owner_email": owner_email,
+            "is_home_stand_in": False,
+            "is_historical_duplicate": False,
+            "last_activity_at": None,
+            "updated_at": None,
+            "created_at": None,
+        }
+    )
 
     resumed = await graph.ainvoke(
         LGCommand(resume={intr_id: {"decisions": [{"type": "approve"}]}}),
         config=cfg,
     )
-    assert dedup_calls == []
-    mgr.create_workspace.assert_awaited_once()
-    create_kwargs = mgr.create_workspace.await_args.kwargs
-    assert create_kwargs["verify_snapshot"] is True
-    assert create_kwargs["check_duplicate_snapshot"] is True
+
+    # Company dedup ran strictly inside lock_user_writes (never outside lock on resume).
+    assert len(llm_calls) == 1
+    assert llm_calls[0]["lock_held"] is True
+    assert new_ws_name in llm_calls[0]["prompt"]
+    assert lock_state["inserts"] == 0
 
     tool_msg = resumed["messages"][-1]
     assert tool_msg.status == "error"
     body = json.loads(tool_msg.content)
     assert body["success"] is False
     assert body["code"] == "scope_changed"
+    assert body["error"] == "情况已变化，请重新发起"
 
 
 @pytest.mark.asyncio
