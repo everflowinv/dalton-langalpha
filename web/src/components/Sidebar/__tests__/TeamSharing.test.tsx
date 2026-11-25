@@ -1238,6 +1238,42 @@ describe('Dalton Team Sharing', () => {
     }
   });
 
+  // DALTON-HOOK(external-member-perms): cached team lists grant write access only to a confirmed internal member.
+  it('keeps a cached rw colleague workspace read-only for an external caller', () => {
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID), {
+      ...SAMPLE_INTERNAL_CREDS,
+      caller_tier: 'external' as const,
+    });
+    queryClient.setQueryData(queryKeys.workspaces.team(), {
+      caller_tier: 'internal',
+      members: [
+        {
+          user_id: 'u-richard',
+          email: 'richard.lu@dalton.test',
+          display_name: 'Richard Lu',
+          workspaces: [
+            {
+              workspace_id: 'ws-rw-cached',
+              user_id: 'u-richard',
+              owner_name: 'Richard Lu',
+              owner_email: 'richard.lu@dalton.test',
+              name: 'Cached RW',
+              status: 'running',
+              access: 'rw',
+              web_access: 'rw',
+              cos_access: 'rw',
+            },
+          ],
+        },
+      ],
+    } as TeamWorkspacesResponse);
+    const { result } = renderHookWithProviders(() => useTeamReadOnly('ws-rw-cached'), { queryClient });
+    expect(result.current.isColleague).toBe(true);
+    expect(result.current.access).toBe('ro');
+    expect(result.current.canWriteFiles).toBe(false);
+  });
+
   it('supports 3-state useTeamReadOnly (owner / rw / ro) and renders access badges in TeamWorkspacesSection', async () => {
     const { default: i18n } = await import('@/i18n');
     await i18n.changeLanguage('zh-CN');

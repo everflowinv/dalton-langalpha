@@ -149,6 +149,15 @@ export function useTeamReadOnly(
 
   const effectiveAccess = workspaceRecord?.effective_web_access ?? null;
   const isThreadOnly = effectiveAccess === 'thread_only';
+  // DALTON-HOOK(external-member-perms): the workspace record's effective access is computed by the
+  // server for this caller; cached team lists and route state grant write access only to a caller
+  // confirmed as an internal member or admin.
+  const confirmedTeamWriter =
+    identity.status === 'ready' && (identity.isInternal || identity.isAdmin);
+  const writeModeFor = (rawAccess: string | null | undefined): TeamAccessMode =>
+    !isThreadOnly && rawAccess === 'rw' && (effectiveAccess === 'rw' || confirmedTeamWriter)
+      ? 'rw'
+      : 'ro';
 
   const members = teamData?.members ?? [];
   for (const member of members) {
@@ -166,7 +175,7 @@ export function useTeamReadOnly(
         matched.access ||
         navState?.teamAccess ||
         'ro';
-      const mode: TeamAccessMode = !isThreadOnly && rawAccess === 'rw' ? 'rw' : 'ro';
+      const mode: TeamAccessMode = writeModeFor(rawAccess);
       return {
         access: mode,
         isColleague: true,
@@ -194,7 +203,7 @@ export function useTeamReadOnly(
       (effectiveAccess === 'rw' || effectiveAccess === 'ro' ? effectiveAccess : null) ||
       navState?.teamAccess ||
       'ro';
-    const mode: TeamAccessMode = !isThreadOnly && rawAccess === 'rw' ? 'rw' : 'ro';
+    const mode: TeamAccessMode = writeModeFor(rawAccess);
     return {
       access: mode,
       isColleague: true,
@@ -209,7 +218,7 @@ export function useTeamReadOnly(
   }
 
   if (navState?.isTeamReadOnly) {
-    const mode: TeamAccessMode = !isThreadOnly && navState.teamAccess === 'rw' ? 'rw' : 'ro';
+    const mode: TeamAccessMode = writeModeFor(navState.teamAccess);
     return {
       access: mode,
       isColleague: true,
