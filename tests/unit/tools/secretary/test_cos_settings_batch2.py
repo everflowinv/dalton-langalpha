@@ -2844,6 +2844,13 @@ async def test_update_workspace_unchanged_name_skips_sibling_check_but_rename_bl
             self._all = []
             if text.startswith("SELECT user_id, name FROM workspaces WHERE workspace_id ="):
                 self._one = {"user_id": USER_ID, "name": "700"}
+            elif "FROM workspaces WHERE workspace_id =" in text and text.startswith("SELECT "):
+                self._one = {
+                    "workspace_id": ws_700,
+                    "user_id": USER_ID,
+                    "name": "700",
+                    "description": "updated desc",
+                }
             elif "SELECT workspace_id, name FROM workspaces" in text:
                 self._all = [
                     {"workspace_id": ws_700, "name": "700"},
@@ -2882,7 +2889,19 @@ async def test_update_workspace_unchanged_name_skips_sibling_check_but_rename_bl
     assert updated["description"] == "updated desc"
     assert lock_mock.await_count == 0
     assert not any("SELECT workspace_id, name FROM workspaces" in s for s in sql_log)
-    assert sum(1 for s in sql_log if s.startswith("UPDATE workspaces SET")) == 1
+    update_sqls = [s for s in sql_log if s.startswith("UPDATE workspaces SET")]
+    assert len(update_sqls) == 1
+    assert "description = %s" in update_sqls[0]
+    assert "name = %s" not in update_sqls[0]
+    assert "name_key = %s" not in update_sqls[0]
+
+    # Pure same-name no-op (name="700" with no description/config/is_pinned) skips UPDATE too.
+    sql_log.clear()
+    noop_row = await ws_db.update_workspace(ws_700, name="700")
+    assert noop_row is not None
+    assert lock_mock.await_count == 0
+    assert any(s.startswith("SELECT") for s in sql_log)
+    assert not any(s.startswith("UPDATE workspaces SET") for s in sql_log)
 
     sql_log.clear()
     with pytest.raises(WorkspaceNameTaken) as exc_info:
@@ -3052,3 +3071,151 @@ async def test_lock_free_company_dedup_keeps_live_workspace_when_bound_unit_arch
     )
     assert res_fallback.status == "matched"
     assert ws_00700 in res_fallback.matched_workspace_ids
+
+
+@pytest.mark.asyncio
+async def test_lock_free_company_dedup_drops_unrelated_workspace_when_bound_unit_archived(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 12 (Codex R11 #2): when an ordinary workspace '行业笔记' (no own ticker)
+    only matched '700.HK' via its bound 00700 coverage unit and that unit archives
+    during the LLM call, _refresh_live_hits re-checks '行业笔记' without unit info
+    and drops it instead of falsely returning company_workspace_exists."""
+    from contextlib import asynccontextmanager
+    from unittest.mock import create_autospec
+
+    from src.dalton.coverage import dedup as dedup_mod
+    from src.dalton.coverage.dedup import (
+        DedupLlmResult,
+        DedupMatchItem,
+        recheck_company_workspace_before_create,
+    )
+
+    unit_id = "aaaaaaaa-aaaa-4aaa-8aaa-000000000002"
+    ws_notes = "bbbbbbbb-bbbb-4bbb-8bbb-000000000999"
+    unit_state = {"status": "active"}
+
+    def _unit_row() -> dict[str, Any]:
+        return {
+            "unit_id": unit_id,
+            "kind": "company",
+            "status": unit_state["status"],
+            "owner_user_id": USER_ID,
+            "lead_analyst_user_id": USER_ID,
+            "display_name": "腾讯控股",
+            "workspace_id": ws_notes,
+            "ticker": "00700",
+            "unit_updated_at": None,
+            "unit_created_at": None,
+            "workspace_name": "行业笔记",
+            "workspace_owner_id": USER_ID,
+            "workspace_status": "stopped",
+            "is_home_stand_in": False,
+            "is_historical_duplicate": False,
+            "workspace_last_activity_at": None,
+            "workspace_updated_at": None,
+            "workspace_created_at": None,
+            "owner_name": "Alice",
+            "owner_email": "alice@team.com",
+            "unit_owner_email": "alice@team.com",
+            "lead_name": "Alice",
+            "lead_email": "alice@team.com",
+        }
+
+    live_ws_row = {
+        "workspace_id": ws_notes,
+        "user_id": USER_ID,
+        "name": "行业笔记",
+        "status": "stopped",
+        "owner_name": "Alice",
+        "owner_email": "alice@team.com",
+        "is_home_stand_in": False,
+        "is_historical_duplicate": False,
+        "last_activity_at": None,
+        "updated_at": None,
+        "created_at": None,
+    }
+
+    class _UnrelatedArchivedCursor:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            text = " ".join(sql.split())
+            if "FROM dalton_coverage_units" in text:
+                row = _unit_row()
+                if isinstance(params, tuple) and params and isinstance(params[0], list):
+                    wanted = set(params[0])
+                    self._rows = [row] if unit_id in wanted else []
+                else:
+                    self._rows = [row] if row["status"] == "active" else []
+                return
+            if "FROM workspaces w" in text:
+                if isinstance(params, tuple) and params and isinstance(params[0], list):
+                    wanted = set(params[0])
+                    self._rows = [dict(live_ws_row)] if ws_notes in wanted else []
+                else:
+                    self._rows = []
+                return
+            self._rows = []
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._rows)
+
+    class _UnrelatedArchivedConn:
+        def cursor(self, **_kwargs):
+            return _UnrelatedArchivedCursor()
+
+    @asynccontextmanager
+    async def _use_conn(c=None):
+        yield c or _UnrelatedArchivedConn()
+
+    async def _internal_tier(*_a, **_kw) -> str:
+        return "internal"
+
+    monkeypatch.setattr(dedup_mod, "get_db_connection", _use_conn)
+    monkeypatch.setattr(dedup_mod, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(dedup_mod, "get_user_tier", _internal_tier)
+    monkeypatch.setattr(dedup_mod, "_is_internal_team_owner", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_model",
+        create_autospec(dedup_mod.resolve_assist_model, return_value="gpt-4o-mini"),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_fallback_models",
+        create_autospec(dedup_mod.resolve_assist_fallback_models, return_value=[]),
+    )
+    monkeypatch.setattr(dedup_mod, "model_requires_user_oauth", lambda _m: False)
+
+    llm_prompts: list[str] = []
+
+    async def _llm_rejudge(**kwargs):
+        llm_prompts.append(str(kwargs.get("user_prompt") or ""))
+        if len(llm_prompts) == 1:
+            unit_state["status"] = "archived"
+            return SimpleNamespace(
+                ok=True,
+                data=DedupLlmResult(
+                    matches=[DedupMatchItem(id="c1", confidence="high", reason="bound 00700 unit")]
+                ),
+            )
+        # Re-judge receives only workspace "行业笔记" without unit ticker/display_name -> no match.
+        return SimpleNamespace(ok=True, data=DedupLlmResult(matches=[]))
+
+    monkeypatch.setattr(dedup_mod, "dalton_complete", _llm_rejudge)
+    res = await recheck_company_workspace_before_create(USER_ID, "700.HK", channel="cos")
+    assert res.status == "clear"
+    assert res.matched_workspace_ids == ()
+    assert len(llm_prompts) == 2
+    assert "00700" in llm_prompts[0]
+    assert "00700" not in llm_prompts[1]
+    assert "行业笔记" in llm_prompts[1]

@@ -1537,67 +1537,61 @@ async def update_workspace(
     from psycopg.types.json import Json
 
     try:
-        updates = []
-        params = []
+        cleaned_name = checked_workspace_name(name) if name is not None else None
 
-        if name is not None:
-            # The folder follows on the next settle; dir_name stays where it is.
-            name = checked_workspace_name(name)
-            updates.extend(("name = %s", "name_key = %s"))
-            params.extend((name, workspace_name_key(name)))
-
-        if description is not None:
-            updates.append("description = %s")
-            params.append(description)
-
-        config_sql, config_params = "config", []
-        if config is not None:
-            # A replaced config keeps the row's server-owned keys and never
-            # takes the caller's.
-            # DALTON-HOOK(historical-duplicate-marker): SERVER_OWNED_CONFIG_KEYS includes dalton_historical_duplicate_of
-            # DALTON-HOOK(colleague-access): include pending_outbound_confirm only when colleague sharing auth is enabled
-            config_sql = (
-                "(%s::jsonb - %s::text[]) || COALESCE("
-                "(SELECT jsonb_object_agg(key, value) FROM jsonb_each(config)"
-                " WHERE key = ANY(%s::text[])), '{}'::jsonb)"
-            )
-            owned = list(server_owned_config_keys())
-            config_params = [Json(config), owned, owned]
-        if name is not None:
-            # A new name ends a backoff a settle left for want of room, as the
-            # folder is asked for again, even under the name it had no room for.
-            config_sql = (
-                f"({config_sql}) #- (CASE WHEN name IS DISTINCT FROM %s"
-                " THEN '{folder_move_blocked}' ELSE '{}' END)::text[]"
-            )
-            config_params.append(name)
-        if config_params:
-            updates.append(f"config = {config_sql}")
-            params.extend(config_params)
-
-        if is_pinned is not None:
-            updates.append("is_pinned = %s")
-            params.append(is_pinned)
-
-        if not updates:
-            return await get_workspace(workspace_id, conn=conn)
-
-        updates.append("updated_at = %s")
-        params.append(datetime.now(timezone.utc))
-        params.append(workspace_id)
-        where = ""
-        if name is not None:
-            # A row staged mid-move keeps its name until the move is recorded:
-            # its last landing went to that name's folder, and only the name
-            # keeps another workspace from being given that folder meanwhile.
-            where = " AND (name = %s OR dir_name IS DISTINCT FROM %s)"
-            params.extend((name, moving_path(workspace_id)))
-
-        update_clause = ", ".join(updates)
+        def _build_update_parts(*, include_name: bool) -> tuple[list[str], list[Any], str]:
+            parts: list[str] = []
+            part_params: list[Any] = []
+            if include_name and cleaned_name is not None:
+                # The folder follows on the next settle; dir_name stays where it is.
+                parts.extend(("name = %s", "name_key = %s"))
+                part_params.extend((cleaned_name, workspace_name_key(cleaned_name)))
+            if description is not None:
+                parts.append("description = %s")
+                part_params.append(description)
+            cfg_sql, cfg_params = "config", []
+            if config is not None:
+                # A replaced config keeps the row's server-owned keys and never
+                # takes the caller's.
+                # DALTON-HOOK(historical-duplicate-marker): SERVER_OWNED_CONFIG_KEYS includes dalton_historical_duplicate_of
+                # DALTON-HOOK(colleague-access): include pending_outbound_confirm only when colleague sharing auth is enabled
+                cfg_sql = (
+                    "(%s::jsonb - %s::text[]) || COALESCE("
+                    "(SELECT jsonb_object_agg(key, value) FROM jsonb_each(config)"
+                    " WHERE key = ANY(%s::text[])), '{}'::jsonb)"
+                )
+                owned = list(server_owned_config_keys())
+                cfg_params = [Json(config), owned, owned]
+            if include_name and cleaned_name is not None:
+                # A new name ends a backoff a settle left for want of room, as the
+                # folder is asked for again, even under the name it had no room for.
+                cfg_sql = (
+                    f"({cfg_sql}) #- (CASE WHEN name IS DISTINCT FROM %s"
+                    " THEN '{folder_move_blocked}' ELSE '{}' END)::text[]"
+                )
+                cfg_params.append(cleaned_name)
+            if cfg_params:
+                parts.append(f"config = {cfg_sql}")
+                part_params.extend(cfg_params)
+            if is_pinned is not None:
+                parts.append("is_pinned = %s")
+                part_params.append(is_pinned)
+            clause_where = ""
+            if parts:
+                parts.append("updated_at = %s")
+                part_params.append(datetime.now(timezone.utc))
+                part_params.append(workspace_id)
+                if include_name and cleaned_name is not None:
+                    # A row staged mid-move keeps its name until the move is recorded:
+                    # its last landing went to that name's folder, and only the name
+                    # keeps another workspace from being given that folder meanwhile.
+                    clause_where = " AND (name = %s OR dir_name IS DISTINCT FROM %s)"
+                    part_params.extend((cleaned_name, moving_path(workspace_id)))
+            return parts, part_params, clause_where
 
         try:
             # --- DALTON-HOOK(cos-settings-tools): begin ---
-            if name is not None:
+            if cleaned_name is not None:
                 from src.tools.secretary.approvals import is_duplicate_name
 
                 async with _ws_transaction(conn) as cur:
@@ -1610,7 +1604,8 @@ async def update_workspace(
                         return None
                     owner_user_id = str(owner["user_id"])
                     current_name = str(owner.get("name") or "")
-                    if name.strip() != current_name.strip():
+                    renaming = cleaned_name != current_name.strip()
+                    if renaming:
                         await lock_user_writes(cur, owner_user_id)
                         await cur.execute(
                             f"""
@@ -1625,19 +1620,33 @@ async def update_workspace(
                             if live_id == str(workspace_id):
                                 continue
                             live_name = str(live_ws.get("name") or "")
-                            if is_duplicate_name(name, live_name):
+                            if is_duplicate_name(cleaned_name, live_name):
                                 raise WorkspaceNameTaken(live_name, live_id)
-                    await cur.execute(
-                        f"""
-                        UPDATE workspaces
-                        SET {update_clause}
-                        WHERE workspace_id = %s AND status != 'deleted'{where}
-                        RETURNING {_WS_COLS}
-                        """,
-                        params,
-                    )
-                    result = await cur.fetchone()
+                    updates, params, where = _build_update_parts(include_name=renaming)
+                    if not updates:
+                        await cur.execute(
+                            f"SELECT {_WS_COLS} FROM workspaces WHERE workspace_id = %s AND status != 'deleted'",
+                            (workspace_id,),
+                        )
+                        result = await cur.fetchone()
+                    else:
+                        update_clause = ", ".join(updates)
+                        await cur.execute(
+                            f"""
+                            UPDATE workspaces
+                            SET {update_clause}
+                            WHERE workspace_id = %s AND status != 'deleted'{where}
+                            RETURNING {_WS_COLS}
+                            """,
+                            params,
+                        )
+                        result = await cur.fetchone()
+                name = cleaned_name if renaming else None
             else:
+                updates, params, where = _build_update_parts(include_name=False)
+                if not updates:
+                    return await get_workspace(workspace_id, conn=conn)
+                update_clause = ", ".join(updates)
                 async with _ws_cursor(conn) as cur:
                     await cur.execute(
                         f"""

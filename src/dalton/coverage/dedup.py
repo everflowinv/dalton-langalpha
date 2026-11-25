@@ -1333,6 +1333,10 @@ async def _judge_candidates_with_llm(
 async def _refresh_live_hits(
     hits: list[tuple[_CandidateEntry, str, str]],
     *,
+    raw_name: str | None = None,
+    uid: str | None = None,
+    is_external: bool = False,
+    partial_failure_out: list[Exception] | None = None,
     conn: Any = None,
 ) -> list[tuple[_CandidateEntry, dict[str, Any] | None, str, str]]:
     """Re-query hit workspaces and unit bindings after LLM return, releasing conn before permission checks."""
@@ -1433,6 +1437,7 @@ async def _refresh_live_hits(
                     }
 
     raw_refreshed: list[tuple[_CandidateEntry, dict[str, Any] | None, str, str]] = []
+    downgraded_hits: list[tuple[_CandidateEntry, dict[str, Any], str, str]] = []
     for entry, conf, reason in hits:
         if entry.unit_id:
             u_row = unit_state_by_id.get(entry.unit_id)
@@ -1442,8 +1447,8 @@ async def _refresh_live_hits(
             ).strip().lower()
             if u_row is None or u_kind != "company" or u_status != "active":
                 # --- DALTON-HOOK(cos-settings-tools): begin ---
-                # Unit missing/archived: drop the coverage unit, but preserve its workspace
-                # as an active unclassified match if the workspace row itself is still live.
+                # Unit missing/archived: drop the coverage unit, and stage its still-live
+                # workspace for self-match verification against ``raw_name`` after releasing conn.
                 fallback_ws_id = entry.ws_id
                 fresh_ws = live_ws_by_id.get(fallback_ws_id) if fallback_ws_id else None
                 if fresh_ws is None:
@@ -1463,7 +1468,7 @@ async def _refresh_live_hits(
                     unit_display_name=None,
                     ws_row=fresh_ws,
                 )
-                raw_refreshed.append((updated_entry, fresh_ws, conf, reason))
+                downgraded_hits.append((updated_entry, fresh_ws, conf, reason))
                 continue
                 # --- DALTON-HOOK(cos-settings-tools): end ---
 
@@ -1535,6 +1540,58 @@ async def _refresh_live_hits(
             ws_row=fresh_ws,
         )
         raw_refreshed.append((updated_entry, fresh_ws, conf, reason))
+
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    # Re-verify workspaces whose bound coverage unit archived/rebound after releasing conn,
+    # so unrelated workspaces (e.g. "行业笔记") that only matched via the unit are dropped.
+    if downgraded_hits:
+        cleaned_query = str(raw_name or "").strip()
+        if not cleaned_query:
+            raw_refreshed.extend(downgraded_hits)
+        else:
+            from src.tools.secretary.approvals import is_duplicate_name
+
+            target_ticker_key = canonical_workspace_ticker_key(cleaned_query)
+            need_rejudge: list[tuple[_CandidateEntry, dict[str, Any], str, str]] = []
+            for upd_entry, f_ws, c_conf, r_reason in downgraded_hits:
+                fresh_ws_name = str(f_ws.get("name") or "").strip()
+                ws_ticker_key = canonical_workspace_ticker_key(fresh_ws_name)
+                doc_ticker_key = normalize_ticker_key(upd_entry.doc_ticker)
+                if is_duplicate_name(cleaned_query, fresh_ws_name) or (
+                    target_ticker_key is not None
+                    and (
+                        ws_ticker_key == target_ticker_key
+                        or doc_ticker_key == target_ticker_key
+                    )
+                ):
+                    raw_refreshed.append((upd_entry, f_ws, c_conf, r_reason))
+                else:
+                    need_rejudge.append((upd_entry, f_ws, c_conf, r_reason))
+
+            if need_rejudge:
+                rejudge_by_ws = {
+                    e.ws_id: f_ws for e, f_ws, _, _ in need_rejudge if e.ws_id
+                }
+                try:
+                    re_hits = await _judge_candidates_with_llm(
+                        uid=uid or "",
+                        raw_name=cleaned_query,
+                        entries=[e for e, _, _, _ in need_rejudge],
+                        is_external=is_external,
+                        partial_failure_out=partial_failure_out,
+                    )
+                    for re_entry, re_conf, re_reason in re_hits:
+                        f_ws = rejudge_by_ws.get(re_entry.ws_id or "")
+                        if f_ws is not None:
+                            raw_refreshed.append((re_entry, f_ws, re_conf, re_reason))
+                except Exception as exc:
+                    if partial_failure_out is not None:
+                        partial_failure_out.append(exc)
+                    logger.warning(
+                        "Company dedup downgraded workspace recheck failed (%s)",
+                        type(exc).__name__,
+                    )
+    # --- DALTON-HOOK(cos-settings-tools): end ---
 
     # Deduplicate after refreshing bindings (e.g. a previously unbound unit bound
     # to a workspace that was also matched in the same batch/run).
@@ -1663,7 +1720,13 @@ async def _find_matches(
     # Re-verify live workspace/unit status and bindings after LLM return, release DB
     # connection before permission checks, check read access across ALL live hits,
     # and truncate to MAX_DUPLICATE_MATCHES afterwards.
-    all_live_hits = await _refresh_live_hits(hits, conn=conn)
+    all_live_hits = await _refresh_live_hits(
+        hits,
+        raw_name=raw_name,
+        uid=uid,
+        is_external=(caller_tier == "external"),
+        conn=conn,
+    )
     if not all_live_hits:
         if suggestion_out:
             return DuplicateMatch(
@@ -1925,7 +1988,13 @@ async def recheck_company_workspace_before_create(
                 check_colleague_workspaces=check_colleagues,
             )
 
-        all_live_hits = await _refresh_live_hits(hits)
+        all_live_hits = await _refresh_live_hits(
+            hits,
+            raw_name=raw_name,
+            uid=uid,
+            is_external=(caller_tier == "external"),
+            partial_failure_out=partial_failures,
+        )
         if not all_live_hits:
             det_match = await _deterministic_ticker_match_snapshot(
                 checked_hits=hits,
