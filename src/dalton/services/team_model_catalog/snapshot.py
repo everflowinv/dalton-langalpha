@@ -668,6 +668,7 @@ def build_effective_catalog_snapshot(
     *,
     compiled: Any = None,
     variant_credentials: Mapping[str, Mapping[str, Any]] | None = None,
+    excluded_custom_keys: Iterable[str] | None = None,
 ) -> dict[str, Any] | None:
     """Build a self-contained ``effective_catalog_snapshot`` dict for ``model_keys``.
 
@@ -683,7 +684,19 @@ def build_effective_catalog_snapshot(
     llm_cfg = mc.llm_config or {}
     meta_map = cat.dalton_meta or {}
 
-    unique_keys = list(dict.fromkeys(str(k).strip() for k in model_keys if str(k or "").strip()))
+    cleaned_excluded = list(
+        dict.fromkeys(
+            str(k).strip()
+            for k in (excluded_custom_keys or ())
+            if str(k or "").strip()
+        )
+    )
+    excluded_set = set(cleaned_excluded)
+    unique_keys = [
+        k
+        for k in dict.fromkeys(str(k).strip() for k in model_keys if str(k or "").strip())
+        if k not in excluded_set
+    ]
     needs_variant_creds = any(
         isinstance(llm_cfg.get(k), Mapping)
         and bool(
@@ -841,13 +854,16 @@ def build_effective_catalog_snapshot(
             else:
                 by_identity[id_key] = id_record
 
-    return {
+    snapshot_out: dict[str, Any] = {
         "schema": TURN_SNAPSHOT_SCHEMA,
         "catalog_revision": int(cat.revision),
         "models": models_out,
         "by_identity": by_identity,
         "variants": variants_out,
     }
+    if cleaned_excluded:
+        snapshot_out["excluded_custom_keys"] = cleaned_excluded
+    return snapshot_out
 
 
 def _entry_matches_request(
@@ -1048,6 +1064,27 @@ def _extract_candidate_models_from_run(
     return list(dict.fromkeys(keys))
 
 
+def _extract_excluded_custom_keys_from_run(run_row: Mapping[str, Any]) -> list[str]:
+    """Extract persisted ``excluded_custom_keys`` from a run row or its JSON container."""
+    excluded: list[str] = []
+    sources: list[Any] = [run_row.get("excluded_custom_keys")]
+    for container_key in ("metadata", "replay_facts"):
+        container = run_row.get(container_key)
+        if not isinstance(container, Mapping):
+            continue
+        sources.append(container.get("excluded_custom_keys"))
+        existing_snap = container.get("effective_catalog_snapshot")
+        if isinstance(existing_snap, Mapping):
+            sources.append(existing_snap.get("excluded_custom_keys"))
+    for src in sources:
+        if isinstance(src, (list, tuple, set, frozenset)):
+            for item in src:
+                mk = _extract_model_key_value(item)
+                if mk:
+                    excluded.append(mk)
+    return list(dict.fromkeys(excluded))
+
+
 async def ensure_run_catalog_snapshot(
     run_row: Mapping[str, Any] | None,
     *,
@@ -1062,11 +1099,21 @@ async def ensure_run_catalog_snapshot(
     container = run_row.get(container_key)
     if isinstance(container, Mapping):
         existing = container.get("effective_catalog_snapshot")
-        if isinstance(existing, Mapping) and existing.get("schema") == TURN_SNAPSHOT_SCHEMA:
+        if (
+            isinstance(existing, Mapping)
+            and existing.get("schema") == TURN_SNAPSHOT_SCHEMA
+            and isinstance(existing.get("models"), Mapping)
+        ):
             return dict(existing)
 
-    candidates = _extract_candidate_models_from_run(run_row, model_keys)
-    if not candidates:
+    excluded_custom = _extract_excluded_custom_keys_from_run(run_row)
+    excluded_set = set(excluded_custom)
+    candidates = [
+        k
+        for k in _extract_candidate_models_from_run(run_row, model_keys)
+        if k not in excluded_set
+    ]
+    if not candidates and not excluded_custom:
         logger.info(
             "[team_model_catalog] Legacy run missing effective_catalog_snapshot and model metadata; "
             "falling back to pre-feature handling"
@@ -1109,8 +1156,9 @@ async def ensure_run_catalog_snapshot(
         candidates,
         compiled=compiled,
         variant_credentials=creds,
+        excluded_custom_keys=excluded_custom or None,
     )
-    if not snapshot or not snapshot.get("models"):
+    if not snapshot or (not snapshot.get("models") and not excluded_custom):
         logger.info(
             "[team_model_catalog] Legacy run models %s missing from current catalog; "
             "cannot backfill snapshot, falling back to pre-feature handling",

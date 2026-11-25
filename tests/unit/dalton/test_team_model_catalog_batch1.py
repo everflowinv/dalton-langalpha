@@ -48,6 +48,7 @@ from src.dalton.services.team_model_catalog.compiled import (
 )
 from src.dalton.services.team_model_catalog.constants import (
     CATALOG_SCHEMA,
+    TURN_SNAPSHOT_SCHEMA,
     CatalogConflictError,
     CatalogValidationError,
     CatalogVariantCredentialRevokedError,
@@ -7076,7 +7077,8 @@ class TestR8Fixes:
             async def cursor(self, **_kw: Any) -> Any:
                 yield _FakeCursor()
 
-        # 1) Personal custom model shadowing team catalog model -> no team catalog snapshot written
+        # 1) Personal custom model shadowing team catalog model -> writes valid empty snapshot
+        #    with excluded_custom_keys so later load_run_catalog_snapshot never backfills team route
         row_personal = asyncio.run(
             subagent_runs.start_task_run(
                 task_run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
@@ -7089,8 +7091,12 @@ class TestR8Fixes:
                 conn=_FakeConn(),
             )
         )
-        assert "effective_catalog_snapshot" not in row_personal["replay_facts"]
-        assert "catalog_revision" not in row_personal["replay_facts"]
+        personal_snap = row_personal["replay_facts"].get("effective_catalog_snapshot")
+        assert isinstance(personal_snap, dict)
+        assert personal_snap.get("schema") == TURN_SNAPSHOT_SCHEMA
+        assert personal_snap.get("models") == {}
+        assert personal_snap.get("excluded_custom_keys") == ["shared-alias"]
+        assert row_personal["replay_facts"].get("catalog_revision") == 170
 
         # 2) Control: user without personal shadow resolves to team catalog -> snapshot IS written
         active_user["uid"] = "u-team"
@@ -7554,3 +7560,516 @@ class TestR8Fixes:
             )
         assert exc_b3.value.status_code == 503
         assert exc_b3.value.detail["code"] == "resume_verification_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Group 11: R11 fixes — empty snapshot prevents backfill overwrite &
+#           start_task_run classifies outside pool connection / transaction
+# ---------------------------------------------------------------------------
+
+
+class TestR11Fixes:
+    def test_r11_1_subagent_personal_custom_empty_snapshot_survives_load_backfill_settlement_and_resume(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        from langchain_core.messages import ToolMessage
+
+        from ptc_agent.agent.middleware.background_subagent import task_actions
+        from ptc_agent.config.agent import TaskAsk, TaskModelRefused
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog import snapshot as snap_mod
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.dalton.services.team_model_catalog.snapshot import (
+            RouteFingerprint,
+            load_run_catalog_snapshot,
+            verify_resume_route,
+        )
+        from src.llms.llm import LLM as LLMFactory
+        from src.server.database import workspace as ws_db
+        from src.server.database.runs import subagent_runs
+        from src.server.services.llm import user_models
+        from src.utils.tracking.core import calculate_cost_from_per_call_records
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        payload = {
+            "schema": CATALOG_SCHEMA,
+            "providers": {
+                "provider_variants": {
+                    "openai": {
+                        "sub-team-gw": {
+                            "parent_provider": "openai",
+                            "display_name": "Sub Team GW",
+                            "sdk": "openai",
+                            "billing": "cash",
+                            "base_url": "https://sub-team-gw.example.com/v1",
+                        }
+                    }
+                },
+                "models": {
+                    "openai": [
+                        {
+                            "id": "gpt-personal-only",
+                            "name": "GPT Personal Only",
+                            "pricing": {"input": 2.0, "output": 4.0},
+                        }
+                    ],
+                    "sub-team-gw": [
+                        {
+                            "id": "team-shared-id",
+                            "name": "Team Shared",
+                            "pricing": {"input": 80.0, "output": 160.0},
+                        }
+                    ],
+                },
+            },
+            "models": {
+                "shared-alias": {
+                    "model_id": "team-shared-id",
+                    "provider": "sub-team-gw",
+                    "display_name": "Shared Alias",
+                    "visible": True,
+                }
+            },
+            "dalton_meta": {"shared-alias": {"billing": "cash", "tool_calling": True}},
+        }
+        cat = compile_catalog_from_payload(payload, revision=180)
+        cache_compiled_catalog(cat)
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(compiled_mod.get_compiled_catalog_sync, return_value=cat),
+        )
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_async",
+            create_autospec(compiled_mod.get_compiled_catalog_async, return_value=cat),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", cat.model_config)
+        monkeypatch.setattr(
+            tmc_db,
+            "list_catalog_provider_credentials_sync",
+            create_autospec(
+                tmc_db.list_catalog_provider_credentials_sync,
+                return_value={
+                    "sub-team-gw": {
+                        "provider_slug": "sub-team-gw",
+                        "bound_base_url": "https://sub-team-gw.example.com/v1",
+                        "canonical_bound_url": "https://sub-team-gw.example.com:443/v1",
+                        "key_fingerprint": "fp-r11-team",
+                    }
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            tmc_db,
+            "list_catalog_provider_credentials",
+            create_autospec(
+                tmc_db.list_catalog_provider_credentials,
+                return_value={
+                    "sub-team-gw": {
+                        "provider_slug": "sub-team-gw",
+                        "bound_base_url": "https://sub-team-gw.example.com/v1",
+                        "canonical_bound_url": "https://sub-team-gw.example.com:443/v1",
+                        "key_fingerprint": "fp-r11-team",
+                    }
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            ws_db,
+            "lock_run_workspace",
+            create_autospec(ws_db.lock_run_workspace, return_value=None),
+        )
+
+        personal_entry = {
+            "name": "shared-alias",
+            "provider": "openai",
+            "model_id": "gpt-personal-only",
+            "base_url": "https://personal.example.com/v1",
+        }
+
+        async def _fake_classify(
+            uid: str,
+            model_name: str,
+            _pref_cache: dict[str, Any] | None = None,
+            ignore_custom_models: bool = False,
+        ) -> tuple[str, dict[str, Any]]:
+            if not ignore_custom_models and uid == "u-personal" and model_name == "shared-alias":
+                return user_models.ModelSource.CUSTOM, personal_entry
+            return user_models.ModelSource.SYSTEM, {}
+
+        monkeypatch.setattr(
+            user_models,
+            "classify_model",
+            create_autospec(user_models.classify_model, side_effect=_fake_classify),
+        )
+
+        class _FakeCursor:
+            def __init__(self) -> None:
+                self._next_row: dict[str, Any] | None = None
+
+            async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+                if "AS user_id" in sql:
+                    self._next_row = {"user_id": "u-personal"}
+                elif "INSERT INTO subagent_runs" in sql:
+                    facts_bind = params[8]
+                    facts_dict = (
+                        dict(facts_bind.obj)
+                        if facts_bind is not None and hasattr(facts_bind, "obj")
+                        else {}
+                    )
+                    self._next_row = {
+                        "task_run_id": params[0],
+                        "thread_id": params[1],
+                        "task_id": params[2],
+                        "replay_facts": facts_dict,
+                        "user_id": "u-personal",
+                    }
+                else:
+                    self._next_row = None
+
+            async def fetchone(self) -> dict[str, Any] | None:
+                return self._next_row
+
+        class _FakeConn:
+            @asynccontextmanager
+            async def transaction(self) -> Any:
+                yield self
+
+            @asynccontextmanager
+            async def cursor(self, **_kw: Any) -> Any:
+                yield _FakeCursor()
+
+        # 1) start_task_run persists a valid empty snapshot with excluded_custom_keys
+        task_run_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb1"
+        row_personal = asyncio.run(
+            subagent_runs.start_task_run(
+                task_run_id=task_run_id,
+                thread_id="thread-r11-1",
+                task_id="task-r11-personal",
+                cause="init",
+                actual_model_key="shared-alias",
+                model={"id": "shared-alias", "display_name": "Shared Alias"},
+                model_override="shared-alias",
+                conn=_FakeConn(),
+            )
+        )
+        persisted_snap = row_personal["replay_facts"]["effective_catalog_snapshot"]
+        assert persisted_snap["schema"] == TURN_SNAPSHOT_SCHEMA
+        assert persisted_snap["models"] == {}
+        assert persisted_snap["excluded_custom_keys"] == ["shared-alias"]
+        assert row_personal["replay_facts"]["catalog_revision"] == 180
+
+        # 2) load_run_catalog_snapshot returns the empty snapshot WITHOUT calling backfill
+        backfill_spy = create_autospec(tmc_db.backfill_run_catalog_snapshot, return_value=True)
+        monkeypatch.setattr(tmc_db, "backfill_run_catalog_snapshot", backfill_spy)
+        monkeypatch.setattr(
+            snap_mod,
+            "_fetch_persisted_run_row",
+            create_autospec(snap_mod._fetch_persisted_run_row, return_value=row_personal),
+        )
+        loaded_snap = asyncio.run(load_run_catalog_snapshot(task_run_id, is_subagent=True))
+        assert loaded_snap == persisted_snap
+        assert backfill_spy.await_count == 0
+        assert row_personal["replay_facts"]["effective_catalog_snapshot"]["models"] == {}
+
+        # 3) Settlement under the loaded empty snapshot uses the personal model's pricing,
+        #    not the team catalog rate ($80/$160), even if a parent team snapshot was active
+        parent_team_snap = build_effective_catalog_snapshot(["shared-alias"], compiled=cat)
+        assert parent_team_snap is not None and "shared-alias" in parent_team_snap["models"]
+        with bind_catalog_snapshot(parent_team_snap):
+            with bind_catalog_snapshot(loaded_snap):
+                settled = calculate_cost_from_per_call_records(
+                    [
+                        {
+                            "model_name": "shared-alias",
+                            "pricing_model_id": "gpt-personal-only",
+                            "pricing_provider": "openai",
+                            "billing_type": "byok",
+                            "usage": {
+                                "input_tokens": 1_000_000,
+                                "output_tokens": 1_000_000,
+                            },
+                        }
+                    ]
+                )
+        # Personal pricing: $2 input + $4 output = $6, platform_cost = $0 (byok)
+        assert settled["total_cost"] == pytest.approx(6.0, rel=1e-6)
+        assert settled["platform_cost"] == pytest.approx(0.0, abs=1e-9)
+
+        # 4) verify_resume_route and _handle_resume after load_run_catalog_snapshot allow resume
+        asyncio.run(
+            verify_resume_route(
+                task_run_id,
+                RouteFingerprint(
+                    model_key="shared-alias",
+                    provider="openai",
+                    model_id="gpt-personal-only",
+                    bound_base_url="https://personal.example.com:443/v1",
+                    key_fingerprint=None,
+                    billing="cash",
+                ),
+                is_subagent=True,
+                run_row=row_personal,
+            )
+        )
+        sentinel_refusal = TaskModelRefused(
+            message="sentinel-r11-reached-resolve-model", reason="sentinel"
+        )
+        resolve_spy = create_autospec(task_actions._resolve_model, return_value=sentinel_refusal)
+        monkeypatch.setattr(task_actions, "_resolve_model", resolve_spy)
+        monkeypatch.setattr(
+            task_actions,
+            "_read_latest_run",
+            create_autospec(task_actions._read_latest_run, return_value=row_personal),
+        )
+        fake_task = SimpleNamespace(
+            task_id="task-r11-personal",
+            display_id="Task-task-r11-personal",
+            subagent_type="research",
+            is_pending=False,
+            cancelled=False,
+            terminal_status=None,
+            asyncio_task=None,
+            result=None,
+            ask=TaskAsk(model="shared-alias"),
+            lock=asyncio.Lock(),
+        )
+
+        async def _resolve_ok_task(*_a: Any, **_kw: Any) -> Any:
+            return fake_task
+
+        fake_mw = SimpleNamespace(
+            _resolve_or_error=_resolve_ok_task,
+            subagent_types={"research"},
+            _resume_claims=set(),
+            registry=SimpleNamespace(
+                get_by_id=lambda tid: fake_task if tid == "task-r11-personal" else None,
+                run_ledger=object(),
+            ),
+            task_models=SimpleNamespace(
+                _own_model=lambda _st: "shared-alias",
+                _user_id="u-personal",
+                _model_pref={"custom_models": [personal_entry]},
+            ),
+            namespace_owner=None,
+        )
+        fake_request = SimpleNamespace(
+            tool_call={
+                "id": "tc-r11-personal",
+                "args": {"action": "resume", "task_id": "task-r11-personal"},
+            },
+            state={},
+        )
+        res = asyncio.run(
+            task_actions._handle_resume(
+                fake_mw,
+                fake_request,
+                handler=lambda _req: None,
+                target_task_id="task-r11-personal",
+                subagent_type=None,
+                description="resume after load_run_catalog_snapshot",
+                prompt="continue",
+                args={"action": "resume", "task_id": "task-r11-personal"},
+                parent_thread_id="thread-r11-1",
+                tool_call_id="tc-r11-personal",
+                current_run_id="parent-run-r11-1",
+                ask=TaskAsk(),
+            )
+        )
+        assert isinstance(res, ToolMessage)
+        assert resolve_spy.call_count == 1
+        assert "(sentinel)" in str(res.content)  # reached _resolve_model past the route check
+
+        # 5) Legacy backfill strips excluded_custom_keys (both all-excluded and mixed rows)
+        backfill_spy.reset_mock()
+        legacy_all_excluded = {
+            "task_run_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2",
+            "replay_facts": {
+                "actual_model_key": "shared-alias",
+                "excluded_custom_keys": ["shared-alias"],
+            },
+        }
+        snap_all_excl = asyncio.run(
+            ensure_run_catalog_snapshot(legacy_all_excluded, is_subagent=True)
+        )
+        assert snap_all_excl is not None
+        assert snap_all_excl["schema"] == TURN_SNAPSHOT_SCHEMA
+        assert snap_all_excl["models"] == {}
+        assert snap_all_excl["excluded_custom_keys"] == ["shared-alias"]
+        assert backfill_spy.await_count == 1
+        assert backfill_spy.await_args.args[1]["models"] == {}
+
+        backfill_spy.reset_mock()
+        legacy_mixed = {
+            "task_run_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb3",
+            "replay_facts": {
+                "actual_model_key": "shared-alias",
+                "model_override": "gpt-test",
+                "excluded_custom_keys": ["shared-alias"],
+            },
+        }
+        snap_mixed = asyncio.run(ensure_run_catalog_snapshot(legacy_mixed, is_subagent=True))
+        assert snap_mixed is not None
+        assert "shared-alias" not in snap_mixed["models"]
+        assert "gpt-test" in snap_mixed["models"]
+        assert snap_mixed["excluded_custom_keys"] == ["shared-alias"]
+        assert backfill_spy.await_count == 1
+
+    def test_r11_2_start_task_run_classifies_outside_pool_connection_and_transaction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.llms.llm import LLM as LLMFactory
+        from src.server.database import pool as pool_mod
+        from src.server.database import workspace as ws_db
+        from src.server.database.runs import subagent_runs
+        from src.server.services.llm import user_models
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+        cat = compile_catalog_from_payload({"schema": CATALOG_SCHEMA}, revision=181)
+        cache_compiled_catalog(cat)
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(compiled_mod.get_compiled_catalog_sync, return_value=cat),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", cat.model_config)
+        monkeypatch.setattr(
+            ws_db,
+            "lock_run_workspace",
+            create_autospec(ws_db.lock_run_workspace, return_value=None),
+        )
+
+        # Single-connection pool: raises immediately on nested checkout while a connection is held.
+        pool_state = {
+            "active": 0,
+            "max_active": 0,
+            "in_tx": False,
+            "classify_saw_active": None,
+            "classify_saw_in_tx": None,
+        }
+
+        class _SinglePoolCursor:
+            def __init__(self) -> None:
+                self._next_row: dict[str, Any] | None = None
+
+            async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+                if "AS user_id" in sql:
+                    self._next_row = {"user_id": "u-pool-test"}
+                elif "INSERT INTO subagent_runs" in sql:
+                    facts_bind = params[8]
+                    facts_dict = (
+                        dict(facts_bind.obj)
+                        if facts_bind is not None and hasattr(facts_bind, "obj")
+                        else {}
+                    )
+                    self._next_row = {
+                        "task_run_id": params[0],
+                        "thread_id": params[1],
+                        "task_id": params[2],
+                        "replay_facts": facts_dict,
+                        "user_id": "u-pool-test",
+                    }
+                else:
+                    self._next_row = None
+
+            async def fetchone(self) -> dict[str, Any] | None:
+                return self._next_row
+
+        class _SinglePoolConn:
+            @asynccontextmanager
+            async def transaction(self) -> Any:
+                pool_state["in_tx"] = True
+                try:
+                    yield self
+                finally:
+                    pool_state["in_tx"] = False
+
+            @asynccontextmanager
+            async def cursor(self, **_kw: Any) -> Any:
+                yield _SinglePoolCursor()
+
+        @asynccontextmanager
+        async def _single_slot_get_db_connection(conn: Any = None) -> Any:
+            if conn is not None:
+                yield conn
+                return
+            if pool_state["active"] >= 1:
+                raise RuntimeError("pool exhausted: nested connection checkout inside start_task_run")
+            pool_state["active"] += 1
+            pool_state["max_active"] = max(pool_state["max_active"], pool_state["active"])
+            try:
+                yield _SinglePoolConn()
+            finally:
+                pool_state["active"] -= 1
+
+        monkeypatch.setattr(pool_mod, "get_db_connection", _single_slot_get_db_connection)
+
+        async def _classify_checking_out_from_same_pool(
+            uid: str,
+            model_name: str,
+            _pref_cache: dict[str, Any] | None = None,
+            ignore_custom_models: bool = False,
+        ) -> tuple[str, dict[str, Any]]:
+            pool_state["classify_saw_active"] = pool_state["active"]
+            pool_state["classify_saw_in_tx"] = pool_state["in_tx"]
+            # Simulate preference cache miss borrowing from the same 1-slot pool.
+            async with pool_mod.get_db_connection():
+                pass
+            return (
+                user_models.ModelSource.CUSTOM,
+                {"name": model_name, "provider": "openai", "model_id": "gpt-personal-only"},
+            )
+
+        monkeypatch.setattr(
+            user_models,
+            "classify_model",
+            create_autospec(
+                user_models.classify_model,
+                side_effect=_classify_checking_out_from_same_pool,
+            ),
+        )
+
+        row = asyncio.run(
+            subagent_runs.start_task_run(
+                task_run_id="cccccccc-cccc-4ccc-8ccc-ccccccccccc1",
+                thread_id="thread-r11-pool",
+                task_id="task-r11-pool",
+                cause="init",
+                actual_model_key="gpt-test",
+                model={"id": "gpt-test", "display_name": "GPT Test"},
+                conn=None,
+            )
+        )
+        assert pool_state["max_active"] == 1
+        assert pool_state["active"] == 0
+        assert pool_state["classify_saw_active"] == 0
+        assert pool_state["classify_saw_in_tx"] is False
+        snap = row["replay_facts"]["effective_catalog_snapshot"]
+        assert snap["schema"] == TURN_SNAPSHOT_SCHEMA
+        assert snap["models"] == {}
+        assert snap["excluded_custom_keys"] == ["gpt-test"]
