@@ -105,6 +105,7 @@ export const SAFE_WEIXIN_QR_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   login_session_revoked: "Weixin QR login session was superseded or expired.",
   ilink_user_already_bound: "This WeChat account is already bound to another user.",
   weixin_capacity_reached: "Weixin active account capacity limit has been reached.",
+  weixin_capacity_full: "Weixin active account capacity limit has been reached.",
   roster_lookup_error: "Unable to verify team roster right now; please retry shortly.",
   member_not_in_roster: "Your account is not eligible for Weixin channel access.",
   external_member_forbidden: "External members are not permitted to bind Weixin.",
@@ -486,39 +487,63 @@ export class WeixinQrLoginManager {
     return promise;
   }
 
-  private shapeAlreadyConfirmedSession(
+  private async shapeAlreadyConfirmedSession(
     session: WeixinLoginSessionGetResponse,
-  ): WeixinQrPublicWaitResponse {
+  ): Promise<WeixinQrPublicWaitResponse> {
     const confirmed =
       session.confirmed_result && typeof session.confirmed_result === "object"
         ? session.confirmed_result
         : {};
     const accountId =
-      typeof confirmed.account_id === "string"
-        ? confirmed.account_id
-        : session.target_account_id ?? null;
-    const accountStatus =
-      typeof confirmed.account_status === "string"
-        ? confirmed.account_status
-        : null;
+      (typeof session.account_id === "string" && session.account_id.trim()) ||
+      (typeof confirmed.account_id === "string" && confirmed.account_id.trim()) ||
+      session.target_account_id ||
+      null;
+    let accountStatus: string | null =
+      (typeof session.account_status === "string" &&
+        session.account_status.trim()) ||
+      (typeof confirmed.account_status === "string" &&
+        confirmed.account_status.trim()) ||
+      null;
+    if (!accountStatus && accountId) {
+      try {
+        const detail = await this.backend.getWeixinAccountDetail(accountId);
+        if (detail && typeof detail.status === "string" && detail.status.trim()) {
+          accountStatus = detail.status.trim();
+        }
+      } catch (err) {
+        if (isStaleGatewayEpochError(err) || isLeaseSafetyMarginPauseError(err)) {
+          throw err;
+        }
+      }
+    }
     const ilinkBotId =
-      typeof confirmed.ilink_bot_id === "string" ? confirmed.ilink_bot_id : null;
+      (typeof session.ilink_bot_id === "string" && session.ilink_bot_id.trim()) ||
+      (typeof confirmed.ilink_bot_id === "string" ? confirmed.ilink_bot_id : null);
     const ilinkUserId =
-      typeof confirmed.ilink_user_id === "string"
+      (typeof session.ilink_user_id === "string" &&
+        session.ilink_user_id.trim()) ||
+      (typeof confirmed.ilink_user_id === "string"
         ? confirmed.ilink_user_id
-        : null;
+        : null);
     const ilinkUsername =
-      typeof confirmed.ilink_username === "string"
+      (typeof session.ilink_username === "string" &&
+        session.ilink_username.trim()) ||
+      (typeof confirmed.ilink_username === "string"
         ? confirmed.ilink_username
-        : null;
+        : null);
     const botGeneration =
-      typeof confirmed.bot_generation === "number"
-        ? confirmed.bot_generation
-        : null;
+      typeof session.bot_generation === "number"
+        ? session.bot_generation
+        : typeof confirmed.bot_generation === "number"
+          ? confirmed.bot_generation
+          : null;
     const accountsRevision =
-      typeof confirmed.accounts_revision === "number"
-        ? confirmed.accounts_revision
-        : null;
+      typeof session.accounts_revision === "number"
+        ? session.accounts_revision
+        : typeof confirmed.accounts_revision === "number"
+          ? confirmed.accounts_revision
+          : null;
     return shapePublicQrWaitResponse({
       sessionKey: session.session_key,
       status: "confirmed",
@@ -536,13 +561,14 @@ export class WeixinQrLoginManager {
     });
   }
 
-  private validateSessionState(
+  private async validateSessionState(
     session: WeixinLoginSessionGetResponse,
     userId: string,
     sessionKey: string,
-  ):
+  ): Promise<
     | { valid: true }
-    | { valid: false; response: WeixinQrPublicWaitResponse } {
+    | { valid: false; response: WeixinQrPublicWaitResponse }
+  > {
     if (session.user_id && session.user_id !== userId) {
       throw new WeixinQrLoginError(
         "QR login session belongs to a different user",
@@ -554,7 +580,7 @@ export class WeixinQrLoginManager {
     if (session.status === "confirmed") {
       return {
         valid: false,
-        response: this.shapeAlreadyConfirmedSession(session),
+        response: await this.shapeAlreadyConfirmedSession(session),
       };
     }
 
@@ -662,7 +688,7 @@ export class WeixinQrLoginManager {
       return fetched.response;
     }
     const { session } = fetched;
-    const check = this.validateSessionState(session, userId, sessionKey);
+    const check = await this.validateSessionState(session, userId, sessionKey);
     if (!check.valid) {
       return check.response;
     }
@@ -722,7 +748,7 @@ export class WeixinQrLoginManager {
       return fetched.response;
     }
     const { session } = fetched;
-    const check = this.validateSessionState(session, cleanUserId, cleanSessionKey);
+    const check = await this.validateSessionState(session, cleanUserId, cleanSessionKey);
     if (!check.valid) {
       return check.response;
     }

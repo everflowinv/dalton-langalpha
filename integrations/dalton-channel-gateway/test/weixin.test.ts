@@ -12,6 +12,7 @@ import {
   filterWeixinMarkdown,
   getWeixinUpdates,
   isSessionExpiredCode,
+  loadUndiciAgentCtorWithImporter,
   normalizeAndValidateCdnBaseUrl,
   normalizeAndValidateIlinkBaseUrl,
   parseInboundAesKey,
@@ -1788,7 +1789,7 @@ describe("§7.2 #2 — Outbound preflight-send, retryable vs deny, uncertain unk
   });
 });
 
-describe("§7.2 #3 — Startup Recovery & Weixin Slash Commands (/help)", () => {
+describe("§7.2 #3 — Startup Recovery & Weixin Slash Commands", () => {
   it("recovers normal 2-attachment Weixin row using decrypted_weixin_attachments (skips #1, uploads #2, runs turn)", async () => {
     const h = createTestHarness();
     try {
@@ -1884,7 +1885,7 @@ describe("§7.2 #3 — Startup Recovery & Weixin Slash Commands (/help)", () => 
         }),
       );
 
-      // Skipped already-uploaded #1, uploaded ONLY #2 (with Weixin AbortSignal), then started turn
+      // Skipped already-uploaded #1, uploaded ONLY #2 (with Weixin AbortSignal + generation context), then started turn
       expect(h.backend.uploadWorkspaceFile).toHaveBeenCalledTimes(1);
       expect(h.backend.uploadWorkspaceFile).toHaveBeenCalledWith(
         USER_ID,
@@ -1894,6 +1895,11 @@ describe("§7.2 #3 — Startup Recovery & Weixin Slash Commands (/help)", () => 
         expect.any(Buffer),
         "application/pdf",
         expect.any(AbortSignal),
+        {
+          weixinAccountId: "wx_acc_1",
+          weixinBotId: "bot_1",
+          weixinBotGeneration: 1,
+        },
       );
       expect(h.backend.createThreadMessages).toHaveBeenCalledTimes(1);
     } finally {
@@ -1901,14 +1907,15 @@ describe("§7.2 #3 — Startup Recovery & Weixin Slash Commands (/help)", () => 
     }
   });
 
-  it("isolates Weixin-only /help command from Feishu and Discord, and does not parse removed collect commands on any platform", () => {
-    expect(parseSlashCommand("/help", "dm", "weixin")).toMatchObject({
-      kind: "session",
-      cmd: "help",
-    });
-
-    // Removed collection-mode words are no longer special commands on Weixin, Feishu, or Discord
+  it("does not parse removed /help or collect commands as special session commands on any platform", () => {
+    // Removed /help and collection-mode words are no longer special commands on Weixin, Feishu, or Discord
     for (const plat of ["weixin", "feishu", "discord", undefined] as const) {
+      expect(parseSlashCommand("/help", "dm", plat)).toMatchObject({
+        kind: "session",
+        cmd: "workspace_switch",
+        targetKind: "shortcut_name",
+        workspaceQuery: "help",
+      });
       expect(parseSlashCommand("/collect", "dm", plat)).toMatchObject({
         kind: "session",
         cmd: "workspace_switch",
@@ -1926,14 +1933,6 @@ describe("§7.2 #3 — Startup Recovery & Weixin Slash Commands (/help)", () => 
         cmd: "workspace_switch",
         targetKind: "shortcut_name",
         workspaceQuery: "cancel",
-      });
-    }
-    for (const plat of ["feishu", "discord", undefined] as const) {
-      expect(parseSlashCommand("/help", "dm", plat)).toMatchObject({
-        kind: "session",
-        cmd: "workspace_switch",
-        targetKind: "shortcut_name",
-        workspaceQuery: "help",
       });
     }
   });
@@ -2773,15 +2772,14 @@ describe("Batch B Round 2 — Lease Abort, Pre-Lease 503, Retryable/Unknown, Sel
   });
 
   it("Decision #9, #10, #12, #13, #15, #16: preflighted command hints without stalling poll, account rotation aborts in-flight send, strict resolveAccountForEvent, monitor self-heal on changed=false & lease recovery, shared 429 cooldown + I-1 503 backoff, QR error redaction, and dual HTTP pools", async () => {
-    // 1) Decision #9 / Round 3 Decision #12: Weixin `/bind` & invalid command hints route via I-3 (cmd=help) +
-    //    preflight-send and swallow errors without stalling poll loop
+    // 1) Decision #9 / R6 #1: Weixin `/bind` & invalid command hints register via I-1
+    //    (NEVER I-3 `cmd: "help"`), deliver fixed text via preflight-send, and swallow errors without stalling poll loop
     const h = createTestHarness();
     try {
       await h.weixinAdapter.emitInbound(weixinDm("bot_1:bind_hint_1", "/bind"));
-      expect(h.backend.registerAndResolveInbound).not.toHaveBeenCalled();
-      expect(h.backend.sessionCommand).toHaveBeenCalledWith(
+      expect(h.backend.sessionCommand).not.toHaveBeenCalled();
+      expect(h.backend.registerAndResolveInbound).toHaveBeenCalledWith(
         expect.objectContaining({
-          cmd: "help",
           platform: "weixin",
           message_id: "bot_1:bind_hint_1",
         }),
@@ -2796,7 +2794,7 @@ describe("Batch B Round 2 — Lease Abort, Pre-Lease 503, Retryable/Unknown, Sel
       await expect(
         h.weixinAdapter.emitInbound(weixinDm("bot_1:bad_cmd_1", "/unbind extra")),
       ).resolves.toBeUndefined();
-      expect(h.backend.registerAndResolveInbound).not.toHaveBeenCalled();
+      expect(h.backend.sessionCommand).not.toHaveBeenCalled();
     } finally {
       await h.cleanup();
     }
@@ -4940,5 +4938,856 @@ describe("Round 5 Fixes — Account Rotation, Shared Deadline, Lease Loss No-I7,
     expect(sanitizeLogErrorCode("http_503")).toBe("http_503");
     expect(sanitizeLogErrorCode("unlisted_custom_code_abc")).toBe("unknown_error");
     expect(sanitizeLogErrorCode(null)).toBe("unknown_error");
+  });
+});
+
+describe("Round 6 Fixes (Codex R5 + Grok R5)", () => {
+  it("R6 #1: /help is not sent as I-3 cmd='help' and advances WeixinMonitor cursor cleanly", async () => {
+    const h = createTestHarness();
+    const ctrl = new AbortController();
+    const committedCursors: string[] = [];
+    let pollCalls = 0;
+
+    try {
+      const monitor = new WeixinMonitor({
+        accountId: "wx_acc_1",
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        botToken: "tok_v1",
+        ilinkBotId: "bot_1",
+        botGeneration: 1,
+        initialGetUpdatesBuf: "cursor_0",
+        allowedApiDomains: ["ilinkai.weixin.qq.com"],
+        checkResolvedIps: false,
+        backend: h.backend,
+        signal: ctrl.signal,
+        fetchImpl: async () => {
+          pollCalls += 1;
+          if (pollCalls === 1) {
+            return new Response(
+              JSON.stringify({
+                ret: 0,
+                get_updates_buf: "cursor_after_help",
+                msgs: [
+                  {
+                    seq: 101,
+                    message_id: 9001,
+                    from_user_id: "wx_user_1@im.wechat",
+                    to_user_id: "bot_1",
+                    message_type: 1,
+                    message_state: 2,
+                    context_token: "ctx_help_1",
+                    item_list: [{ type: 1, text_item: { text: "/help" } }],
+                  },
+                ],
+              }),
+              { status: 200, headers: { "Content-Type": "application/json" } },
+            );
+          }
+          ctrl.abort();
+          return new Response(JSON.stringify({ ret: 0, msgs: [] }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        },
+        onInboundEvent: async (ev) => {
+          await h.weixinAdapter.emitInbound(ev);
+        },
+        onCursorCommitted: (buf) => {
+          committedCursors.push(buf);
+        },
+      });
+
+      await monitor.start();
+
+      expect(h.backend.sessionCommand).toHaveBeenCalledTimes(1);
+      const sentCmd = vi.mocked(h.backend.sessionCommand).mock.calls[0]![0];
+      expect(sentCmd.cmd).toBe("workspace_switch");
+      expect(sentCmd.workspace_query).toBe("help");
+      expect(["workspace_list", "workspace_switch", "new", "stop"]).toContain(
+        sentCmd.cmd,
+      );
+      expect(committedCursors).toContain("cursor_after_help");
+      expect(h.backend.commitWeixinCursor).toHaveBeenCalledWith(
+        "wx_acc_1",
+        expect.objectContaining({
+          get_updates_buf: "cursor_after_help",
+        }),
+      );
+    } finally {
+      ctrl.abort();
+      await h.cleanup();
+    }
+  });
+
+  it("R6 #2: backend rotation signals abort old-gen attachments immediately and uploadWorkspaceFile carries Weixin generation headers only for Weixin", async () => {
+    // 1) Monitor `stale_generation: true` from commitWeixinCursor aborts old-gen upload immediately
+    //    while keeping a newer active-generation upload alive.
+    const h = createTestHarness();
+    const startEnteredGen1 = defer<void>();
+    const startEnteredGen2 = defer<void>();
+    const releaseStartGen1 = defer<void>();
+    const releaseStartGen2 = defer<void>();
+    let startCall = 0;
+
+    try {
+      vi.mocked(h.backend.registerAndResolveInbound)
+        .mockResolvedValueOnce({
+          existing_status: null,
+          linked: true,
+          allowed: true,
+          dalton_user_id: USER_ID,
+          workspace_id: HOME_WS_ID,
+          workspace_status: "stopped",
+          workspace_owner_id: USER_ID,
+          thread_id: "thread_gen1",
+          external_thread_id: null,
+          request_key: "rk_gen1",
+          retry_request_key: null,
+          resubmitted_request_key: null,
+          steered_into_run_id: null,
+          run_id: null,
+          turn_index: null,
+          generation: 1,
+          fallback_pending: false,
+          sent_to_current_count: 0,
+          uploaded_attachments: [],
+          raw_payload: {},
+          pending_interrupt: null,
+        })
+        .mockResolvedValueOnce({
+          existing_status: null,
+          linked: true,
+          allowed: true,
+          dalton_user_id: USER_ID,
+          workspace_id: HOME_WS_ID,
+          workspace_status: "stopped",
+          workspace_owner_id: USER_ID,
+          thread_id: "thread_gen2",
+          external_thread_id: null,
+          request_key: "rk_gen2",
+          retry_request_key: null,
+          resubmitted_request_key: null,
+          steered_into_run_id: null,
+          run_id: null,
+          turn_index: null,
+          generation: 2,
+          fallback_pending: false,
+          sent_to_current_count: 0,
+          uploaded_attachments: [],
+          raw_payload: {},
+          pending_interrupt: null,
+        });
+
+      vi.mocked(h.backend.startWorkspace).mockImplementation(async () => {
+        startCall += 1;
+        if (startCall === 1) {
+          startEnteredGen1.resolve();
+          await releaseStartGen1.promise;
+        } else {
+          startEnteredGen2.resolve();
+          await releaseStartGen2.promise;
+        }
+        return { status: "running" };
+      });
+
+      const oldGenEvent: InboundChannelEvent = {
+        ...weixinDm("bot_1:rot_old_att", "old gen file"),
+        weixinAccountId: "wx_acc_1",
+        weixinBotId: "bot_1",
+        weixinBotGeneration: 1,
+        attachments: [
+          {
+            fileKey: "old_file_1",
+            filename: "old.pdf",
+            mimeType: "application/pdf",
+            sizeBytes: 128,
+          },
+        ],
+      };
+      const newGenEvent: InboundChannelEvent = {
+        ...weixinDm("bot_2:rot_new_att", "new gen file"),
+        weixinAccountId: "wx_acc_1",
+        weixinBotId: "bot_2",
+        weixinBotGeneration: 2,
+        attachments: [
+          {
+            fileKey: "new_file_2",
+            filename: "new.pdf",
+            mimeType: "application/pdf",
+            sizeBytes: 128,
+          },
+        ],
+      };
+
+      const oldTask = h.weixinAdapter.emitInbound(oldGenEvent);
+      await waitBounded(startEnteredGen1.promise, "old gen startWorkspace entered");
+      const newTask = h.weixinAdapter.emitInbound(newGenEvent);
+      await waitBounded(startEnteredGen2.promise, "new gen startWorkspace entered");
+
+      // Notify invalidation with activeBotGeneration=2: gen 1 is aborted, gen 2 survives
+      h.weixinAdapter.emitWeixinAccountInvalidated({
+        accountId: "wx_acc_1",
+        reason: "monitor_generation_superseded",
+        activeBotGeneration: 2,
+      });
+
+      releaseStartGen1.resolve();
+      releaseStartGen2.resolve();
+      await Promise.all([oldTask, newTask]);
+
+      // Only gen 2 uploaded; gen 1 was aborted before download/upload
+      expect(h.backend.uploadWorkspaceFile).toHaveBeenCalledTimes(1);
+      expect(h.backend.uploadWorkspaceFile).toHaveBeenCalledWith(
+        USER_ID,
+        HOME_WS_ID,
+        expect.stringContaining("new.pdf"),
+        "new.pdf",
+        expect.any(Buffer),
+        "application/pdf",
+        expect.any(AbortSignal),
+        {
+          weixinAccountId: "wx_acc_1",
+          weixinBotId: "bot_2",
+          weixinBotGeneration: 2,
+        },
+      );
+
+      // 2) Preflight returning `weixin_bot_generation_superseded` triggers `onWeixinAccountRotated`
+      //    (wired in server.ts to cancel uploads + trigger accounts sync)
+      const syncCallsBefore = h.weixinAdapter.accountsSyncCalls.length;
+      vi.mocked(h.backend.preflightWeixinSend).mockResolvedValueOnce({
+        authorized: false,
+        decision: "deny",
+        deny_code: "weixin_bot_generation_superseded",
+        retryable: false,
+        message: "Bot generation superseded",
+      });
+      const deniedSend = await h.app.deliveryService.executeDelivery({
+        deliveryKey: "del_r6_rot_preflight",
+        kind: "agent_send",
+        userId: USER_ID,
+        platform: "weixin",
+        target: "weixin:@me",
+        text: "Rotated preflight",
+      });
+      expect(deniedSend.status).toBe("failed");
+      expect(h.weixinAdapter.accountsSyncCalls.slice(syncCallsBefore)).toContainEqual({
+        targetRevision: undefined,
+        reason: "weixin_bot_generation_superseded",
+      });
+    } finally {
+      releaseStartGen1.resolve();
+      releaseStartGen2.resolve();
+      await h.cleanup();
+    }
+
+    // 3) HttpBackendClient.uploadWorkspaceFile sends Weixin generation + epoch headers ONLY when weixinContext is provided
+    const capturedHeaders: Array<Record<string, string | null>> = [];
+    const httpClient = new HttpBackendClient({
+      baseUrl: "http://127.0.0.1:8000",
+      serviceToken: TEST_SERVICE_TOKEN,
+      fetchImpl: async (_input, init) => {
+        const hdrs = new Headers(init?.headers);
+        capturedHeaders.push({
+          accountId: hdrs.get("X-Weixin-Account-Id"),
+          botId: hdrs.get("X-Weixin-Bot-Id"),
+          botGen: hdrs.get("X-Weixin-Bot-Generation"),
+          epoch: hdrs.get("X-Gateway-Epoch"),
+        });
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+    httpClient.setGatewayEpoch(17);
+
+    // Feishu/Discord (no weixinContext): NO Weixin headers, NO X-Gateway-Epoch
+    await httpClient.uploadWorkspaceFile(
+      USER_ID,
+      HOME_WS_ID,
+      "uploads/feishu/m1/a.txt",
+      "a.txt",
+      Buffer.from("hello"),
+      "text/plain",
+    );
+    expect(capturedHeaders[0]).toEqual({
+      accountId: null,
+      botId: null,
+      botGen: null,
+      epoch: null,
+    });
+
+    // Weixin (with weixinContext): includes account, bot_id, generation, and X-Gateway-Epoch
+    await httpClient.uploadWorkspaceFile(
+      USER_ID,
+      HOME_WS_ID,
+      "uploads/weixin/m1/b.txt",
+      "b.txt",
+      Buffer.from("world"),
+      "text/plain",
+      undefined,
+      {
+        weixinAccountId: "wx_acc_1",
+        weixinBotId: "bot_2",
+        weixinBotGeneration: 2,
+      },
+    );
+    expect(capturedHeaders[1]).toEqual({
+      accountId: "wx_acc_1",
+      botId: "bot_2",
+      botGen: "2",
+      epoch: "17",
+    });
+  });
+
+  it("R6 #3: single-call preflight timeout retries within shared deadline, DataTaskNotificationService gives each item its own budget, and late retryable deny preserves root cause", async () => {
+    // 1) Single-call 15s TimeoutError retries within shared deadline instead of settling `unknown`
+    let nowMs = 10_000;
+    const h = createTestHarness({
+      preflightRetryMaxElapsedMs: 35_000,
+      nowFn: () => nowMs,
+      retryDelayFn: async (ms) => {
+        nowMs += ms;
+        return true;
+      },
+    });
+    try {
+      const timeoutErr = new DOMException("The operation was aborted due to timeout", "TimeoutError");
+      let pfCalls = 0;
+      vi.mocked(h.backend.preflightWeixinSend).mockImplementation(async () => {
+        pfCalls += 1;
+        if (pfCalls <= 2) {
+          nowMs += 15_000;
+          throw timeoutErr;
+        }
+        return {
+          authorized: true,
+          decision: "allow",
+          retryable: false,
+          account_id: "wx_acc_1",
+          ilink_bot_id: "bot_1",
+          bot_generation: 1,
+          bot_token: "tok_1",
+          base_url: "https://ilinkai.weixin.qq.com",
+          recipient_id: "wx_user_1@im.wechat",
+          weixin_context_token: "ctx_after_timeout",
+          weixin_context_token_version: 2,
+        };
+      });
+
+      const res = await h.app.deliveryService.executeDelivery({
+        deliveryKey: "del_r6_timeout_retry",
+        kind: "agent_send",
+        userId: USER_ID,
+        platform: "weixin",
+        target: "weixin:@me",
+        text: "Recovered after single-call preflight timeouts",
+      });
+      expect(res.status).toBe("sent");
+      expect(pfCalls).toBe(3);
+
+      // 2) Late retryable `roster_lookup_error` arriving right after deadline still reports
+      //    `error_code: "roster_lookup_error"` + `error_detail: "preflight_deadline_exceeded"`
+      nowMs = 100_000;
+      vi.mocked(h.backend.updateDeliveryProgress).mockClear();
+      vi.mocked(h.backend.preflightWeixinSend).mockImplementationOnce(async () => {
+        // Simulate single call taking past the 35s deadline before returning retryable denial
+        nowMs += 40_000;
+        return {
+          authorized: false,
+          decision: "deny",
+          deny_code: "roster_lookup_error",
+          retryable: true,
+          message: "Late roster lookup timeout",
+        };
+      });
+      const lateDenyRes = await h.app.deliveryService.executeDelivery({
+        deliveryKey: "del_r6_late_retryable",
+        kind: "agent_send",
+        userId: USER_ID,
+        platform: "weixin",
+        target: "weixin:@me",
+        text: "Late retryable deny",
+      });
+      expect(lateDenyRes.status).toBe("failed");
+      const progressCalls = vi.mocked(h.backend.updateDeliveryProgress).mock.calls;
+      const terminalProgress = progressCalls.at(-1)?.[0];
+      expect(terminalProgress).toMatchObject({
+        delivery_key: "del_r6_late_retryable",
+        status: "failed",
+        error_code: "roster_lookup_error",
+        error_detail: "preflight_deadline_exceeded",
+      });
+
+      // 3) Late `authorized: true` arriving after deadline is STILL rejected (never sent!)
+      nowMs = 200_000;
+      const sentBefore = h.weixinAdapter.sentTexts.length;
+      vi.mocked(h.backend.preflightWeixinSend).mockImplementationOnce(async () => {
+        nowMs += 40_000;
+        return {
+          authorized: true,
+          decision: "allow",
+          retryable: false,
+          account_id: "wx_acc_1",
+          ilink_bot_id: "bot_1",
+          bot_generation: 1,
+          bot_token: "tok_1",
+          base_url: "https://ilinkai.weixin.qq.com",
+          recipient_id: "wx_user_1@im.wechat",
+          weixin_context_token: "ctx_late_allow",
+          weixin_context_token_version: 3,
+        };
+      });
+      const lateAllowRes = await h.app.deliveryService.executeDelivery({
+        deliveryKey: "del_r6_late_allow",
+        kind: "agent_send",
+        userId: USER_ID,
+        platform: "weixin",
+        target: "weixin:@me",
+        text: "Must not send after deadline",
+      });
+      expect(lateAllowRes.status).toBe("failed");
+      expect(h.weixinAdapter.sentTexts.length).toBe(sentBefore);
+
+      // 4) DataTaskNotificationService: each item in a multi-item plan gets its OWN budget!
+      nowMs = 300_000;
+      const runUuid = "66666666-6666-4666-8666-666666666666";
+      vi.mocked(h.backend.authorizeDataTaskNotificationPlan).mockResolvedValueOnce({
+        authorized: true,
+        status: "authorized",
+        run_id: runUuid,
+        owner_user_id: USER_ID,
+        owner_platform_user_id: "wx_user_1@im.wechat",
+        platform: "weixin",
+        target_kind: "dm",
+        requested_target: "weixin:@me",
+        canonical_target_address: "weixin:@me",
+        recipient_id: "wx_user_1@im.wechat",
+        items: [
+          {
+            item_index: 0,
+            delivery_key: "data_task:r6_item_0",
+            kind: "text",
+            text: "Item 0 spends 30s of its 35s budget",
+          },
+          {
+            item_index: 1,
+            delivery_key: "data_task:r6_item_1",
+            kind: "text",
+            text: "Item 1 gets a fresh 35s budget and also spends 30s",
+          },
+        ],
+      });
+      const itemAttempts = new Map<string, number>();
+      vi.mocked(h.backend.preflightWeixinSend).mockImplementation(async (dk) => {
+        const count = (itemAttempts.get(dk) ?? 0) + 1;
+        itemAttempts.set(dk, count);
+        if (count === 1) {
+          // Each item's first preflight takes 20s and times out (total 40s > 35s if shared!)
+          nowMs += 20_000;
+          throw timeoutErr;
+        }
+        return {
+          authorized: true,
+          decision: "allow",
+          retryable: false,
+          account_id: "wx_acc_1",
+          ilink_bot_id: "bot_1",
+          bot_generation: 1,
+          bot_token: "tok_1",
+          base_url: "https://ilinkai.weixin.qq.com",
+          recipient_id: "wx_user_1@im.wechat",
+          weixin_context_token: `ctx_${dk}`,
+          weixin_context_token_version: 1,
+        };
+      });
+      const dtRes = await h.app.dataTaskNotifications.handleDataTaskNotification({
+        run_id: runUuid,
+        target: "weixin:@me",
+      });
+      expect(dtRes.data.status).toBe("sent");
+      expect(dtRes.data.items_sent).toBe(2);
+      expect(itemAttempts.get("data_task:r6_item_0")).toBe(2);
+      expect(itemAttempts.get("data_task:r6_item_1")).toBe(2);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("R6 #4: initial reconcile rejects HTTP 200 empty body, non-JSON, and {} and keeps write routes at 503 until valid snapshot", async () => {
+    // 1) Direct HttpBackendClient validation
+    const invalidBodies = ["", "not-json", "{}"];
+    let bodyIdx = 0;
+    const rawHttp = new HttpBackendClient({
+      baseUrl: "http://127.0.0.1:8000",
+      serviceToken: TEST_SERVICE_TOKEN,
+      fetchImpl: async () => {
+        const payload = invalidBodies[bodyIdx++] ?? "{}";
+        return new Response(payload, {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+    rawHttp.setGatewayEpoch(1);
+    for (let i = 0; i < invalidBodies.length; i += 1) {
+      await expect(rawHttp.reconcileWeixinAccounts(null)).rejects.toMatchObject({
+        status: 502,
+        body: expect.objectContaining({ code: "invalid_reconcile_snapshot" }),
+      });
+    }
+
+    // 2) Full gateway startup blocks `/agent/send` with 503 `gateway_starting` while reconcile returns `{}`
+    const badSnapshotHit = defer<void>();
+    const releaseValidSnapshot = defer<void>();
+    let reconcileCalls = 0;
+    const mockBackend = createMockBackend();
+    vi.mocked(mockBackend.reconcileWeixinAccounts).mockImplementation(async () => {
+      reconcileCalls += 1;
+      if (reconcileCalls === 1) {
+        badSnapshotHit.resolve();
+        await releaseValidSnapshot.promise;
+        // Return an empty `{}` object simulating malformed backend 200 response
+        return {} as unknown as Awaited<
+          ReturnType<typeof mockBackend.reconcileWeixinAccounts>
+        >;
+      }
+      return {
+        changed: true,
+        enabled: true,
+        max_concurrent_accounts: 50,
+        accounts_revision: 1,
+        accounts: [makeAccountSnapshot()],
+      };
+    });
+
+    const lease = new GatewayLeaseManager({
+      backend: mockBackend,
+      ttlSeconds: 45,
+      heartbeatIntervalMs: 60_000,
+    });
+    const adapter = new WeixinChannelAdapter({
+      backend: mockBackend,
+      leaseManager: lease,
+      startupSnapshotRetryMs: 15,
+      staggerDelayMs: 0,
+      staggerJitterMs: 0,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+      fetchImpl: async (_url, init) =>
+        await new Promise((_res, rej) => {
+          init?.signal?.addEventListener("abort", () => rej(new Error("aborted")), {
+            once: true,
+          });
+        }),
+    });
+    const app = createGatewayApp({
+      config: loadConfig({
+        GATEWAY_HOST: "127.0.0.1",
+        GATEWAY_PORT: "0",
+        INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+        DALTON_WEIXIN_ENABLED: "true",
+      }),
+      backend: mockBackend,
+      adapters: new Map<ChannelPlatform, WeixinChannelAdapter>([
+        ["weixin", adapter],
+      ]),
+      leaseManager: lease,
+      enableLease: true,
+    });
+    const startPromise = app.start();
+    try {
+      await waitBounded(badSnapshotHit.promise, "first bad reconcile entered");
+      const addr = app.server.address();
+      if (!addr || typeof addr === "string") {
+        throw new Error("Expected TCP address");
+      }
+      const blockedResp = await fetchGatewayServer(
+        app,
+        `http://${addr.address}:${addr.port}/agent/send`,
+        {
+          method: "POST",
+          headers: {
+            "X-Service-Token": TEST_SERVICE_TOKEN,
+            "X-User-Id": USER_ID,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ thread_id: "t1", run_id: "r1", text: "blocked" }),
+        },
+      );
+      expect(blockedResp.status).toBe(503);
+      expect(await blockedResp.json()).toMatchObject({ code: "gateway_starting" });
+
+      releaseValidSnapshot.resolve();
+      await waitBounded(startPromise, "gateway started after valid snapshot");
+      expect(reconcileCalls).toBeGreaterThanOrEqual(2);
+    } finally {
+      releaseValidSnapshot.resolve();
+      await startPromise.catch(() => undefined);
+      await app.stop();
+    }
+  });
+
+  it("R6 #5: changed=false sync nudge during preloaded startup shares the same staggered startup queue", async () => {
+    const backend = createMockBackend();
+    vi.mocked(backend.reconcileWeixinAccounts)
+      .mockResolvedValueOnce({
+        changed: true,
+        enabled: true,
+        max_concurrent_accounts: 50,
+        accounts_revision: 1,
+        accounts: [
+          makeAccountSnapshot({ account_id: "acc_q1", ilink_bot_id: "bot_q1", bot_token: "tok_q1" }),
+          makeAccountSnapshot({ account_id: "acc_q2", ilink_bot_id: "bot_q2", bot_token: "tok_q2" }),
+          makeAccountSnapshot({ account_id: "acc_q3", ilink_bot_id: "bot_q3", bot_token: "tok_q3" }),
+        ],
+      })
+      .mockResolvedValue({
+        changed: false,
+        enabled: true,
+        max_concurrent_accounts: 50,
+        accounts_revision: 1,
+        accounts: [],
+      });
+
+    const lease = new GatewayLeaseManager({
+      backend,
+      ttlSeconds: 45,
+      heartbeatIntervalMs: 60_000,
+    });
+    await lease.acquireUntilGranted();
+
+    const pollStartTimes: number[] = [];
+    const firstPollStarted = defer<void>();
+    const adapter = new WeixinChannelAdapter({
+      backend,
+      leaseManager: lease,
+      staggerDelayMs: 60,
+      staggerJitterMs: 0,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+      fetchImpl: async (_url, init) => {
+        pollStartTimes.push(Date.now());
+        if (pollStartTimes.length === 1) {
+          firstPollStarted.resolve();
+        }
+        return await new Promise((_res, rej) => {
+          init?.signal?.addEventListener("abort", () => rej(new Error("aborted")), {
+            once: true,
+          });
+        });
+      },
+    });
+    adapter.onInboundEvent(async () => undefined);
+
+    try {
+      await adapter.prepareStartupSnapshot();
+      const startTask = adapter.start();
+      await waitBounded(firstPollStarted.promise, "first account monitor started");
+
+      // Fire an external `changed: false` sync nudge while acc_q2 and acc_q3 are still staggered
+      await adapter.triggerAccountsSync(1, "external_nudge");
+      await waitBounded(startTask, "staggered start completed");
+      await new Promise((r) => setTimeout(r, 25));
+
+      expect(pollStartTimes.length).toBeGreaterThanOrEqual(3);
+      expect(pollStartTimes[1]! - pollStartTimes[0]!).toBeGreaterThanOrEqual(45);
+      expect(pollStartTimes[2]! - pollStartTimes[1]!).toBeGreaterThanOrEqual(45);
+    } finally {
+      await adapter.stop();
+      await lease.stopAndRelease();
+    }
+  });
+
+  it("R6 #6: fallback settlement (sentToCurrentCount > 0) checks lease loss before and after I-6 and skips I-7 on late claimed response", async () => {
+    const h = createTestHarness();
+    const claimEntered = defer<void>();
+    const releaseClaim = defer<void>();
+
+    try {
+      vi.mocked(h.backend.authorizeAndClaimDelivery).mockImplementationOnce(
+        async () => {
+          claimEntered.resolve();
+          await releaseClaim.promise;
+          return {
+            claim_status: "claimed",
+            platform: "weixin",
+            target_address: "weixin:@me",
+            recipient_id: "wx_user_1@im.wechat",
+            is_current: true,
+            home_workspace_id: HOME_WS_ID,
+            weixin_account_id: "wx_acc_1",
+            weixin_context_token: "ctx_fallback_1",
+            delivery_attempt: 1,
+          };
+        },
+      );
+
+      const settlePromise = (
+        h.app.orchestrator as unknown as {
+          settleTurnFallbackAndPartialNotice: (params: {
+            fallbackDeliveryKey: string;
+            partialNoticeKeyId: string;
+            userId: string;
+            threadId: string | null;
+            runId: string | null;
+            platform: ChannelPlatform;
+            targetAddress: string;
+            inboundMessageId?: string | null;
+            trimmedText: string;
+            sentToCurrentCount: number;
+          }) => Promise<boolean>;
+        }
+      ).settleTurnFallbackAndPartialNotice({
+        fallbackDeliveryKey: "fallback:run_fb_1",
+        partialNoticeKeyId: "run_fb_1",
+        userId: USER_ID,
+        threadId: "thread_fb_1",
+        runId: "run_fb_1",
+        platform: "weixin",
+        targetAddress: "weixin:@me",
+        inboundMessageId: "bot_1:fallback_lease_lost",
+        trimmedText: "Final answer already sent via /agent/send",
+        sentToCurrentCount: 1,
+      });
+
+      await waitBounded(claimEntered.promise, "fallback I-6 claim entered");
+      // Lose lease while I-6 is in flight, then let late `claimed` arrive
+      h.app.deliveryService.abortOnLeaseLost();
+      releaseClaim.resolve();
+
+      await expect(settlePromise).rejects.toBeInstanceOf(StaleGatewayEpochError);
+      expect(h.backend.updateDeliveryProgress).not.toHaveBeenCalled();
+    } finally {
+      releaseClaim.resolve();
+      await h.cleanup();
+    }
+  });
+
+  it("R6 #7: confirmed QR session fetches live account_status when omitted and maps weixin_capacity_full without falling back to login_session_revoked", async () => {
+    // 1) Already-confirmed session without `account_status` queries `getWeixinAccountDetail`
+    const qrBackend = createMockBackend();
+    vi.mocked(qrBackend.getWeixinLoginSession).mockResolvedValueOnce({
+      session_key: "sess_confirmed_1",
+      user_id: USER_ID,
+      status: "confirmed",
+      login_version: 2,
+      expected_bot_generation: 1,
+      target_account_id: "wx_acc_pending",
+      connected: true,
+      already_connected: false,
+      confirmed_result: {
+        account_id: "wx_acc_pending",
+        ilink_bot_id: "bot_pending",
+        bot_generation: 2,
+        accounts_revision: 9,
+      },
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    });
+    vi.mocked(qrBackend.getWeixinAccountDetail).mockResolvedValueOnce({
+      account_id: "wx_acc_pending",
+      user_id: USER_ID,
+      ilink_bot_id: "bot_pending",
+      ilink_user_id: null,
+      bot_token: "tok_pending",
+      base_url: "https://ilinkai.weixin.qq.com",
+      bot_generation: 2,
+      status: "pending_verification",
+      get_updates_buf: "",
+    });
+
+    const qrMgr = new WeixinQrLoginManager({
+      backend: qrBackend,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+    });
+    const waitRes = await qrMgr.waitQrLogin(USER_ID, "sess_confirmed_1");
+    expect(waitRes.status).toBe("confirmed");
+    expect(waitRes.account_status).toBe("pending_verification");
+    expect(waitRes.pending_verification).toBe(true);
+    expect(qrBackend.getWeixinAccountDetail).toHaveBeenCalledWith("wx_acc_pending");
+
+    // 2) PATCH confirm HTTP 409 `{ code: "weixin_capacity_full" }` preserves `weixin_capacity_full`
+    vi.mocked(qrBackend.getWeixinLoginSession).mockResolvedValueOnce({
+      session_key: "sess_cap_full",
+      user_id: USER_ID,
+      status: "wait",
+      login_version: 1,
+      expected_bot_generation: 0,
+      qrcode: "qr_cap_full",
+      redirect_base_url: "https://ilinkai.weixin.qq.com",
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    });
+    vi.mocked(qrBackend.patchWeixinLoginSession).mockRejectedValueOnce(
+      new BackendHttpError("capacity full", 409, {
+        code: "weixin_capacity_full",
+        message: "Internal DB capacity text that must not leak",
+      }),
+    );
+
+    const capQrMgr = new WeixinQrLoginManager({
+      backend: qrBackend,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            ret: 0,
+            status: "confirmed",
+            bot_token: "tok_cap",
+            ilink_bot_id: "bot_cap",
+            baseurl: "https://ilinkai.weixin.qq.com",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    });
+    let thrownErr: unknown;
+    try {
+      await capQrMgr.waitQrLogin(USER_ID, "sess_cap_full");
+    } catch (err) {
+      thrownErr = err;
+    }
+    expect(thrownErr).toBeInstanceOf(WeixinQrLoginError);
+    expect((thrownErr as WeixinQrLoginError).statusCode).toBe(409);
+    expect((thrownErr as WeixinQrLoginError).code).toBe("weixin_capacity_full");
+    expect((thrownErr as WeixinQrLoginError).message).not.toContain(
+      "Internal DB capacity text",
+    );
+  });
+
+  it("R6 #8: logger whitelist accepts weixin_context_token_missing & weixin_capacity_full and http-pool logs sanitized error_code", async () => {
+    expect(sanitizeLogErrorCode("weixin_context_token_missing")).toBe(
+      "weixin_context_token_missing",
+    );
+    expect(sanitizeLogErrorCode("weixin_capacity_full")).toBe(
+      "weixin_capacity_full",
+    );
+    expect(sanitizeLogErrorCode("invalid_reconcile_snapshot")).toBe(
+      "invalid_reconcile_snapshot",
+    );
+
+    const loggedLines: string[] = [];
+    const customLogger = createSubsystemLogger("weixin-http-pool-test", {
+      sink: {
+        info: (line) => loggedLines.push(line),
+        warn: (line) => loggedLines.push(line),
+        error: (line) => loggedLines.push(line),
+      },
+    });
+    const fakeModuleErr = Object.assign(new Error("Cannot find package 'undici' at /secret/path"), {
+      code: "ERR_MODULE_NOT_FOUND",
+    });
+    const ctor = await loadUndiciAgentCtorWithImporter(
+      async () => {
+        throw fakeModuleErr;
+      },
+      customLogger,
+    );
+    expect(ctor).toBeNull();
+    expect(loggedLines).toHaveLength(1);
+    expect(loggedLines[0]).toContain('"error_code":"unknown_error"');
+    expect(loggedLines[0]).not.toContain('"error_name"');
+    expect(loggedLines[0]).not.toContain("/secret/path");
   });
 });

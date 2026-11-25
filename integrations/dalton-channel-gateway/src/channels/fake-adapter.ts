@@ -564,10 +564,15 @@ export class FakeChannelAdapter implements ChannelAdapter {
   private weixinAccountInvalidatedHandler?: (info: {
     accountId: string;
     reason: string;
+    activeBotGeneration?: number;
   }) => void;
 
   onWeixinAccountInvalidated(
-    handler: (info: { accountId: string; reason: string }) => void,
+    handler: (info: {
+      accountId: string;
+      reason: string;
+      activeBotGeneration?: number;
+    }) => void,
   ): void {
     this.weixinAccountInvalidatedHandler = handler;
   }
@@ -575,6 +580,7 @@ export class FakeChannelAdapter implements ChannelAdapter {
   emitWeixinAccountInvalidated(info: {
     accountId: string;
     reason: string;
+    activeBotGeneration?: number;
   }): void {
     this.weixinAccountInvalidatedHandler?.(info);
   }

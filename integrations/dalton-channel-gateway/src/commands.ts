@@ -12,9 +12,7 @@ export type CoreSessionCommand =
   | "new"
   | "stop";
 
-export type WeixinSessionCommand = "help";
-
-export type SessionCommand = CoreSessionCommand | WeixinSessionCommand;
+export type SessionCommand = CoreSessionCommand;
 
 export function isCoreSessionCommand(cmd: string): cmd is CoreSessionCommand {
   return (
@@ -244,21 +242,6 @@ export function parseSlashCommand(
       kind: "session",
       cmd: "stop",
       canonicalCommand: "/stop",
-    };
-  }
-
-  if (platform === "weixin" && head === "help") {
-    if (rest) {
-      return {
-        kind: "invalid",
-        reason: "unexpected_arguments",
-        message: `Usage: \`/help\` (takes no arguments). To switch to a workspace named "${fullBody}", use \`/workspace ${fullBody}\`.`,
-      };
-    }
-    return {
-      kind: "session",
-      cmd: "help",
-      canonicalCommand: "/help",
     };
   }
 

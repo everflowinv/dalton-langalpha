@@ -251,8 +251,7 @@ export interface I3SessionCommandRequest {
     | "workspace_list"
     | "workspace_switch"
     | "new"
-    | "stop"
-    | "help";
+    | "stop";
   platform: ChannelPlatform;
   dalton_user_id?: string | null;
   platform_user_id?: string | null;
@@ -907,6 +906,13 @@ export interface WeixinLoginSessionGetResponse {
   login_version: number;
   expected_bot_generation: number;
   status: string;
+  account_id?: string | null;
+  account_status?: string | null;
+  ilink_bot_id?: string | null;
+  ilink_user_id?: string | null;
+  ilink_username?: string | null;
+  bot_generation?: number | null;
+  accounts_revision?: number | null;
   qrcode?: string | null;
   qrcode_img_content?: string | null;
   redirect_base_url?: string | null;
@@ -1117,6 +1123,46 @@ export interface ThreadWakeupItem {
 // BackendClient Interface & HTTP Implementation
 // ---------------------------------------------------------------------------
 
+export interface WorkspaceUploadWeixinContext {
+  weixinAccountId?: string | null;
+  weixinBotId?: string | null;
+  weixinBotGeneration?: number | null;
+}
+
+/**
+ * Validates required fields of a `POST /internal/weixin/accounts/reconcile` response
+ * (contract §2.1 / R6 #4). Rejects empty objects, missing booleans/revisions, or non-array accounts.
+ */
+export function isValidWeixinAccountsReconcileResponse(
+  val: unknown,
+): val is WeixinAccountsReconcileResponse {
+  if (!val || typeof val !== "object" || Array.isArray(val)) {
+    return false;
+  }
+  const rec = val as Record<string, unknown>;
+  if (typeof rec.enabled !== "boolean" || typeof rec.changed !== "boolean") {
+    return false;
+  }
+  if (
+    typeof rec.accounts_revision !== "number" ||
+    !Number.isInteger(rec.accounts_revision) ||
+    rec.accounts_revision < 0
+  ) {
+    return false;
+  }
+  if (
+    typeof rec.max_concurrent_accounts !== "number" ||
+    !Number.isInteger(rec.max_concurrent_accounts) ||
+    rec.max_concurrent_accounts <= 0
+  ) {
+    return false;
+  }
+  if (!Array.isArray(rec.accounts)) {
+    return false;
+  }
+  return true;
+}
+
 export interface BackendClient {
   // Gateway epoch fencing
   setGatewayEpoch?(epoch: number | null): void;
@@ -1301,6 +1347,7 @@ export interface BackendClient {
     content: Buffer,
     mimeType: string,
     signal?: AbortSignal,
+    weixinContext?: WorkspaceUploadWeixinContext,
   ): Promise<void>;
 
   downloadWorkspaceFile(
@@ -2036,6 +2083,8 @@ export class HttpBackendClient implements BackendClient {
         timeoutMs: 15_000,
         signal: options?.signal,
         includeGatewayEpoch: true,
+        strictJson: true,
+        operationLabel: "weixin/accounts/reconcile",
       },
     );
     if (status >= 400) {
@@ -2043,6 +2092,13 @@ export class HttpBackendClient implements BackendClient {
         `weixin/accounts/reconcile failed (${status})`,
         status,
         data,
+      );
+    }
+    if (!isValidWeixinAccountsReconcileResponse(data)) {
+      throw new BackendHttpError(
+        "weixin/accounts/reconcile returned invalid snapshot payload",
+        502,
+        { code: "invalid_reconcile_snapshot" },
       );
     }
     return data;
@@ -2448,6 +2504,7 @@ export class HttpBackendClient implements BackendClient {
     content: Buffer,
     mimeType: string,
     signal?: AbortSignal,
+    weixinContext?: WorkspaceUploadWeixinContext,
   ): Promise<void> {
     const url = new URL(
       `${this.baseUrl}/api/v1/workspaces/${encodeURIComponent(workspaceId)}/files/upload`,
@@ -2458,15 +2515,58 @@ export class HttpBackendClient implements BackendClient {
     const blob = new Blob([new Uint8Array(content)], { type: mimeType });
     form.append("file", blob, filename);
 
+    const weixinHeaders: Record<string, string> = {};
+    if (weixinContext) {
+      if (weixinContext.weixinAccountId?.trim()) {
+        weixinHeaders["X-Weixin-Account-Id"] =
+          weixinContext.weixinAccountId.trim();
+      }
+      if (weixinContext.weixinBotId?.trim()) {
+        weixinHeaders["X-Weixin-Bot-Id"] = weixinContext.weixinBotId.trim();
+      }
+      if (
+        typeof weixinContext.weixinBotGeneration === "number" &&
+        Number.isInteger(weixinContext.weixinBotGeneration)
+      ) {
+        weixinHeaders["X-Weixin-Bot-Generation"] = String(
+          weixinContext.weixinBotGeneration,
+        );
+      }
+    }
+
     const resp = await this.fetchImpl(url, {
       method: "POST",
-      headers: this.headers(userId),
+      headers: this.headers(
+        userId,
+        Object.keys(weixinHeaders).length > 0 ? weixinHeaders : undefined,
+        Boolean(weixinContext),
+      ),
       body: form,
       ...(signal ? { signal } : {}),
     });
     if (!resp.ok) {
       const errText = await resp.text();
-      throw new Error(`uploadWorkspaceFile failed (${resp.status}): ${errText}`);
+      if (resp.status === 409 && errText.trim()) {
+        try {
+          const parsedErr = JSON.parse(errText);
+          this.checkStaleGatewayEpoch(resp.status, parsedErr, url.pathname);
+        } catch (err) {
+          if (err instanceof StaleGatewayEpochError) {
+            throw err;
+          }
+        }
+      }
+      throw new BackendHttpError(
+        `uploadWorkspaceFile failed (${resp.status}): ${errText}`,
+        resp.status,
+        (() => {
+          try {
+            return errText ? JSON.parse(errText) : null;
+          } catch {
+            return { message: errText };
+          }
+        })(),
+      );
     }
   }
 

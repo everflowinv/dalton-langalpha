@@ -221,9 +221,21 @@ export function createGatewayApp(options: {
     wxInitial.setBackendClient(backend);
   }
 
+  let orchestrator!: ChannelGatewayOrchestrator;
+  const onWeixinAccountRotated = (info: {
+    accountId?: string | null;
+    reason: string;
+  }): void => {
+    if (orchestrator) {
+      orchestrator.cancelInboundUploadsForAccount(info.accountId);
+    }
+    void adapters.get("weixin")?.triggerAccountsSync?.(undefined, info.reason);
+  };
+
   const deliveryService = new DeliveryService({
     backend,
     adapters,
+    onWeixinAccountRotated,
     retryDelayFn: options.retryDelayFn,
     preflightRetryMaxElapsedMs: options.preflightRetryMaxElapsedMs,
     claim503MaxAttempts: options.claim503MaxAttempts,
@@ -233,6 +245,7 @@ export function createGatewayApp(options: {
     backend,
     adapters,
     mode: config.mode,
+    onWeixinAccountRotated,
     retryDelayFn: options.retryDelayFn,
     preflightRetryMaxElapsedMs: options.preflightRetryMaxElapsedMs,
     claim503MaxAttempts: options.claim503MaxAttempts,
@@ -254,7 +267,7 @@ export function createGatewayApp(options: {
     deliveryService,
     webBaseUrl: config.webBaseUrl,
   });
-  const orchestrator = new ChannelGatewayOrchestrator({
+  orchestrator = new ChannelGatewayOrchestrator({
     backend,
     adapters,
     deliveryService,

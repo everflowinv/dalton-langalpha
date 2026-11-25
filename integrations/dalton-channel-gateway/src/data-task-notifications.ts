@@ -17,10 +17,12 @@ import {
   DELIVERY_CLAIM_503_INITIAL_DELAY_MS,
   DELIVERY_CLAIM_503_MAX_ATTEMPTS,
   DELIVERY_CLAIM_503_MAX_DELAY_MS,
+  isPreflightTimeoutError,
   type WeixinPreflightBudget,
   WEIXIN_PREFLIGHT_RETRY_INITIAL_DELAY_MS,
   WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS,
   WEIXIN_PREFLIGHT_RETRY_MAX_ELAPSED_MS,
+  WEIXIN_ROTATION_DENY_CODES,
 } from "./delivery-service.js";
 import {
   isStaleGatewayEpochError,
@@ -406,6 +408,10 @@ export interface DataTaskNotificationServiceOptions {
   preflightRetryMaxElapsedMs?: number;
   claim503MaxAttempts?: number;
   nowFn?: () => number;
+  onWeixinAccountRotated?: (info: {
+    accountId?: string | null;
+    reason: string;
+  }) => void;
 }
 
 export interface ExecutionStateTracker {
@@ -436,6 +442,10 @@ export class DataTaskNotificationService {
   private readonly preflightRetryMaxElapsedMs: number;
   private readonly claim503MaxAttempts: number;
   private readonly nowFn: () => number;
+  private readonly onWeixinAccountRotated?: (info: {
+    accountId?: string | null;
+    reason: string;
+  }) => void;
   private retryAbortController = new AbortController();
   private startupBlocked = false;
   private leaseLost = false;
@@ -444,6 +454,7 @@ export class DataTaskNotificationService {
     this.backend = options.backend;
     this.adapters = options.adapters;
     this.mode = options.mode ?? "incoming";
+    this.onWeixinAccountRotated = options.onWeixinAccountRotated;
     this.retryDelayFn = options.retryDelayFn ?? abortableRetrySleep;
     this.preflightRetryMaxElapsedMs =
       options.preflightRetryMaxElapsedMs ??
@@ -564,6 +575,7 @@ export class DataTaskNotificationService {
     chunkIndex: number,
     budget: WeixinPreflightBudget,
     signal?: AbortSignal,
+    accountId?: string | null,
   ): Promise<WeixinPreflightAuthorizedData> {
     const combinedSignal = signal
       ? AbortSignal.any([signal, this.retryAbortController.signal])
@@ -641,28 +653,40 @@ export class DataTaskNotificationService {
               );
         }
         throwIfAbortedOrLeaseLost();
+        const isRetryable503 =
+          err instanceof BackendHttpError && err.status === 503;
+        const isRetryableTimeout = isPreflightTimeoutError(err);
+        if (isRetryable503) {
+          budget.lastRetryableDenyCode = "roster_lookup_error";
+          budget.lastRetryableMessage =
+            "Weixin preflight remained temporarily unavailable (503).";
+        } else if (isRetryableTimeout) {
+          budget.lastRetryableDenyCode =
+            budget.lastRetryableDenyCode ?? "preflight_timeout";
+          budget.lastRetryableMessage =
+            budget.lastRetryableMessage ??
+            "Weixin send preflight timed out before completing.";
+        }
         if (attemptSignal.aborted || getRemainingBudgetMs() <= 0) {
           throw buildDeadlineExceededError(
             "Weixin send preflight exceeded shared delivery deadline.",
           );
         }
-        const isRetryable503 =
-          err instanceof BackendHttpError && err.status === 503;
-        if (!isRetryable503) {
+        if (!isRetryable503 && !isRetryableTimeout) {
           throw err;
         }
-        budget.lastRetryableDenyCode = "roster_lookup_error";
-        budget.lastRetryableMessage =
-          "Weixin preflight remained temporarily unavailable (503).";
         const remainingMs = getRemainingBudgetMs();
         if (remainingMs <= 0) {
           throw buildDeadlineExceededError(
-            "Weixin preflight remained temporarily unavailable (503).",
+            budget.lastRetryableMessage ??
+              "Weixin preflight remained temporarily unavailable.",
           );
         }
         const waitMs = Math.min(delayMs, remainingMs);
         this.logger.warn(
-          "Data-task Weixin preflight returned 503; retrying in delivery",
+          isRetryable503
+            ? "Data-task Weixin preflight returned 503; retrying in delivery"
+            : "Data-task Weixin preflight single request timed out; retrying in delivery",
           {
             delivery_key: deliveryKey,
             chunk_index: chunkIndex,
@@ -687,6 +711,20 @@ export class DataTaskNotificationService {
       }
 
       throwIfAbortedOrLeaseLost();
+      // R6 #3 (Codex Low #7): Record retryable deny reason BEFORE checking shared deadline
+      // so a late retryable denial preserves its root cause while late allow is still rejected.
+      if (!pf.authorized && (pf.retryable === true || pf.decision === "defer")) {
+        budget.lastRetryableDenyCode = pf.deny_code;
+        budget.lastRetryableMessage =
+          pf.message ??
+          `Weixin send preflight remained unavailable (${pf.deny_code}).`;
+      } else if (!pf.authorized && WEIXIN_ROTATION_DENY_CODES.has(pf.deny_code)) {
+        this.onWeixinAccountRotated?.({
+          accountId: accountId ?? null,
+          reason: pf.deny_code,
+        });
+      }
+
       if (getRemainingBudgetMs() <= 0) {
         throw buildDeadlineExceededError(
           "Weixin preflight response arrived after shared delivery deadline.",
@@ -708,13 +746,12 @@ export class DataTaskNotificationService {
         );
       }
       if (pf.retryable === true || pf.decision === "defer") {
-        budget.lastRetryableDenyCode = pf.deny_code;
-        budget.lastRetryableMessage =
-          pf.message ??
-          `Weixin send preflight remained unavailable (${pf.deny_code}).`;
         const remainingMs = getRemainingBudgetMs();
         if (remainingMs <= 0) {
-          throw buildDeadlineExceededError(budget.lastRetryableMessage);
+          throw buildDeadlineExceededError(
+            budget.lastRetryableMessage ??
+              `Weixin send preflight remained unavailable (${pf.deny_code}).`,
+          );
         }
         const waitMs = Math.min(delayMs, remainingMs);
         this.logger.warn(
@@ -1291,9 +1328,6 @@ export class DataTaskNotificationService {
     const itemOutcomes: DataTaskItemDeliveryOutcome[] = tracker.outcomes;
     let itemsSent = 0;
     let groupLiveVerified = false;
-    // R5 #2 (Codex High #4): ONE shared deadline across all Weixin preflights in this delivery.
-    const weixinPreflightBudget =
-      platform === "weixin" ? this.createWeixinPreflightBudget() : null;
 
     for (const item of planItems) {
       if (
@@ -1495,6 +1529,12 @@ export class DataTaskNotificationService {
       if (validatedClaim.kind === "denied") {
         tracker.claimedAnyItem = hadPriorClaim;
         const denyCode = validatedClaim.code;
+        if (WEIXIN_ROTATION_DENY_CODES.has(denyCode)) {
+          this.onWeixinAccountRotated?.({
+            accountId: null,
+            reason: denyCode,
+          });
+        }
         itemOutcomes.push({
           item_index: item.item_index,
           delivery_key: item.delivery_key,
@@ -1532,6 +1572,10 @@ export class DataTaskNotificationService {
       const recipientId = validatedClaim.recipientId;
       const recipientPlatformUserId =
         plan.target_kind === "dm" ? recipientId : undefined;
+      // R6 #3 (Grok Medium): Each claimed item delivery in the plan gets its own
+      // independent Weixin preflight deadline budget (all chunks + attachment of this item).
+      const weixinPreflightBudget =
+        platform === "weixin" ? this.createWeixinPreflightBudget() : null;
 
       // Safety fallback if `existing_status` was stale and `claim` transitioned to `claimed`.
       if (plan.target_kind === "group" && !groupLiveVerified) {
@@ -2018,6 +2062,7 @@ export class DataTaskNotificationService {
                     i,
                     weixinPreflightBudget!,
                     signal,
+                    validatedClaim.weixinAccountId,
                   );
                   attachAccount(weixinPreflight.account_id);
                   if (this.leaseLost) {
@@ -2209,6 +2254,7 @@ export class DataTaskNotificationService {
                   fileChunkIndex,
                   weixinPreflightBudget!,
                   signal,
+                  validatedClaim.weixinAccountId,
                 );
                 attachAccount(weixinPreflight.account_id);
                 if (this.leaseLost) {
@@ -2250,6 +2296,8 @@ export class DataTaskNotificationService {
                           fileChunkIndex,
                           weixinPreflightBudget!,
                           signal,
+                          weixinPreflight?.account_id ??
+                            validatedClaim.weixinAccountId,
                         )
                     : undefined,
               });

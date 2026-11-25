@@ -72,6 +72,10 @@ export interface WeixinMonitorOptions {
   getSharedCooldownRemainingMs?: () => number;
   onInboundEvent: (event: InboundChannelEvent) => Promise<void>;
   onSessionExpired?: (err: WeixinApiError) => Promise<void> | void;
+  onAccountGenerationSuperseded?: (info: {
+    accountId: string;
+    activeBotGeneration?: number;
+  }) => void;
   onCursorCommitted?: (newCursor: string) => void;
   onRateLimited?: (err: WeixinApiError) => Promise<number> | number;
   onStaleEpoch?: (err: StaleGatewayEpochError) => void;
@@ -120,6 +124,11 @@ export class WeixinMonitor {
         get_updates_buf: nextCursor,
       });
       if (res.stale_generation) {
+        this.opts.onAccountGenerationSuperseded?.({
+          accountId,
+          activeBotGeneration:
+            typeof res.bot_generation === "number" ? res.bot_generation : undefined,
+        });
         return "stale";
       }
       if (res.updated) {
@@ -151,6 +160,14 @@ export class WeixinMonitor {
           detail.ilink_bot_id !== ilinkBotId ||
           (detail.status !== "active" && detail.status !== "pending_verification")
         ) {
+          this.opts.onAccountGenerationSuperseded?.({
+            accountId,
+            activeBotGeneration:
+              detail.status === "active" ||
+              detail.status === "pending_verification"
+                ? detail.bot_generation
+                : undefined,
+          });
           return "stale";
         }
         if (detail.get_updates_buf === nextCursor) {

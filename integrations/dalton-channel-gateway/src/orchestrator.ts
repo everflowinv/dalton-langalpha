@@ -19,6 +19,7 @@ import {
   type ThreadMessageDispatchPayload,
   type ThreadStatusInfo,
   type ThreadWakeupItem,
+  type WorkspaceUploadWeixinContext,
 } from "./backend-client.js";
 import type { ChannelAdapter } from "./channels/adapter.js";
 import type { WeixinPersistedAttachmentMeta } from "./channels/weixin/types.js";
@@ -30,7 +31,10 @@ import {
   parseSlashCommand,
   type ParsedSlashCommand,
 } from "./commands.js";
-import type { DeliveryService } from "./delivery-service.js";
+import {
+  type DeliveryService,
+  WEIXIN_ROTATION_DENY_CODES,
+} from "./delivery-service.js";
 import { isStaleGatewayEpochError } from "./gateway-lease.js";
 import { ProcessingFeedbackCoordinator } from "./processing-feedback.js";
 import {
@@ -389,23 +393,45 @@ export class ChannelGatewayOrchestrator {
       adapter.onNativeInteraction?.(async (event) => {
         await this.handleNativeInteraction(event);
       });
-      adapter.onWeixinAccountInvalidated?.(({ accountId }) => {
-        this.cancelInboundUploadsForAccount(accountId);
-      });
+      adapter.onWeixinAccountInvalidated?.(
+        ({ accountId, activeBotGeneration }) => {
+          this.cancelInboundUploadsForAccount(accountId, activeBotGeneration);
+        },
+      );
     }
   }
 
-  private cancelInboundUploadsForAccount(
+  /**
+   * R6 #2 (Codex High #1): Cancels in-flight Weixin inbound attachment tasks for an account.
+   * When `activeBotGeneration` is known, only older/mismatched generations are aborted so
+   * newly arrived tasks on the active generation continue unimpeded.
+   */
+  cancelInboundUploadsForAccount(
     accountId: string | null | undefined,
+    activeBotGeneration?: number,
   ): void {
     const cleanAccountId = accountId?.trim();
     if (!cleanAccountId) return;
     for (const [ctrl, meta] of [...this.activeInboundUploadControllers.entries()]) {
-      if (meta.accountId === cleanAccountId) {
-        ctrl.abort();
-        this.activeInboundUploadControllers.delete(ctrl);
+      if (meta.accountId !== cleanAccountId) continue;
+      if (
+        typeof activeBotGeneration === "number" &&
+        typeof meta.botGeneration === "number" &&
+        meta.botGeneration === activeBotGeneration
+      ) {
+        continue;
       }
+      ctrl.abort();
+      this.activeInboundUploadControllers.delete(ctrl);
     }
+  }
+
+  private notifyWeixinAccountRotation(
+    accountId: string | null | undefined,
+    reason: string,
+  ): void {
+    this.cancelInboundUploadsForAccount(accountId);
+    void this.adapters.get("weixin")?.triggerAccountsSync?.(undefined, reason);
   }
 
   /**
@@ -768,6 +794,15 @@ export class ChannelGatewayOrchestrator {
         resolved.deny_reason ??
         (resolved.linked ? "workspace_write_denied" : "not_linked");
       if (
+        event.platform === "weixin" &&
+        WEIXIN_ROTATION_DENY_CODES.has(denyReason)
+      ) {
+        this.notifyWeixinAccountRotation(
+          event.weixinAccountId ?? resolved.weixin_account_id,
+          denyReason,
+        );
+      }
+      if (
         denyReason === "weixin_group_unsupported" ||
         denyReason === "invalid_inbound_event"
       ) {
@@ -1125,10 +1160,10 @@ export class ChannelGatewayOrchestrator {
   }
 
   /**
-   * Round 3 Decision #12: Weixin `/bind` usage and invalid-command hints register the
-   * command inbound via I-3 (`cmd: "help"`, which verifies epoch, account generation,
-   * roster, and upserts `context_token`) and then deliver the hint text through
-   * I-6 + `preflight-send`.
+   * R6 #1 (Grok Critical, Codex High #2): Weixin `/bind` usage and invalid-command hints
+   * register the inbound via I-1 (`register-and-resolve`, NEVER I-3 `cmd: "help"`, which
+   * is not in the contract allowlist) to verify epoch, account generation, roster, and
+   * upsert `context_token`, then deliver fixed gateway-generated text through I-6 + `preflight-send`.
    */
   private async sendWeixinCommandHintViaPreflight(
     event: InboundChannelEvent,
@@ -1136,15 +1171,12 @@ export class ChannelGatewayOrchestrator {
     text: string,
   ): Promise<void> {
     try {
-      const cmdRes = await this.backend.sessionCommand({
-        cmd: "help",
+      const resolved = await this.backend.registerAndResolveInbound({
         platform: "weixin",
         platform_user_id: event.platformUserId,
         chat_type: event.chatType,
         chat_address: event.chatAddress,
-        chat_id: event.chatId,
-        chat_name: event.chatName ?? null,
-        scope_key: event.threadScopeKey,
+        thread_scope_key: event.threadScopeKey,
         message_id: event.messageId,
         request_key: makeInboundRequestKey(event.platform, event.messageId),
         raw_payload: {
@@ -1157,31 +1189,45 @@ export class ChannelGatewayOrchestrator {
         weixin_bot_generation: event.weixinBotGeneration ?? null,
         weixin_context_seq: event.weixinContextSeq ?? null,
       });
-      if (cmdRes.one_time_weixin_reply) {
-        this.cancelInboundUploadsForAccount(event.weixinAccountId);
+      if (resolved.one_time_weixin_reply) {
+        this.cancelInboundUploadsForAccount(
+          event.weixinAccountId ?? resolved.weixin_account_id,
+        );
         await this.dispatchOneTimeWeixinReply(
-          cmdRes.one_time_weixin_reply,
+          resolved.one_time_weixin_reply,
           `onetime:${event.platform}:${event.messageId}:hint`,
         );
         return;
       }
-      if (cmdRes.command_reply_pending === false) {
+      if (
+        resolved.existing_status === "completed" ||
+        resolved.existing_status === "ignored"
+      ) {
         return;
       }
-      if (!cmdRes.ok || !cmdRes.dalton_user_id) {
+      if (!resolved.linked || !resolved.allowed || !resolved.dalton_user_id) {
+        if (
+          resolved.deny_reason &&
+          WEIXIN_ROTATION_DENY_CODES.has(resolved.deny_reason)
+        ) {
+          this.notifyWeixinAccountRotation(
+            event.weixinAccountId ?? resolved.weixin_account_id,
+            resolved.deny_reason,
+          );
+        }
         this.logger.warn(
           "Skipping Weixin command hint because inbound account is not eligible",
           {
             account_id: event.weixinAccountId ?? null,
             message_id: event.messageId,
-            deny_reason: cmdRes.deny_reason ?? null,
+            deny_reason: resolved.deny_reason ?? null,
           },
         );
         return;
       }
       const delivered = await this.sendInboundNotice(
         event,
-        cmdRes.dalton_user_id,
+        resolved.dalton_user_id,
         noticeKey,
         text,
       );
@@ -1748,7 +1794,7 @@ export class ChannelGatewayOrchestrator {
 
   private async completeSessionCommandExecution(params: {
     event: InboundChannelEvent;
-    cmd: "workspace_list" | "workspace_switch" | "new" | "stop" | "help";
+    cmd: "workspace_list" | "workspace_switch" | "new" | "stop";
     targetKind?: SessionCommandTargetKind | null;
     workspaceQuery?: string | null;
     cmdRes: I3SessionCommandResponse;
@@ -1774,6 +1820,17 @@ export class ChannelGatewayOrchestrator {
         `onetime:${event.platform}:${event.messageId}:cmd_${cmd}`,
       );
       return;
+    }
+
+    if (
+      event.platform === "weixin" &&
+      cmdRes.deny_reason &&
+      WEIXIN_ROTATION_DENY_CODES.has(cmdRes.deny_reason)
+    ) {
+      this.notifyWeixinAccountRotation(
+        event.weixinAccountId,
+        cmdRes.deny_reason,
+      );
     }
 
     if (cmdRes.not_executed === true) {
@@ -2089,30 +2146,12 @@ export class ChannelGatewayOrchestrator {
 
   private formatSessionCommandReply(params: {
     platform: ChannelPlatform;
-    cmd: "workspace_list" | "workspace_switch" | "new" | "stop" | "help";
+    cmd: "workspace_list" | "workspace_switch" | "new" | "stop";
     targetKind: SessionCommandTargetKind | null;
     workspaceQuery: string | null;
     cmdRes: I3SessionCommandResponse;
   }): string {
     const { platform, cmd, targetKind, workspaceQuery, cmdRes } = params;
-
-    if (cmd === "help") {
-      if (typeof cmdRes.reply_text === "string" && cmdRes.reply_text.trim()) {
-        return cmdRes.reply_text.trim();
-      }
-      if (!cmdRes.ok) {
-        return this.formatDenyNotice(
-          platform,
-          cmdRes.deny_reason ?? "not_linked",
-        );
-      }
-      return [
-        "可用指令：",
-        "- `/workspace`：查看或切换工作区；`/main` 切回 Chief of Staff",
-        "- `/new`：开启新对话；`/stop`：停止当前运行",
-        "- `/unbind`：解除当前微信绑定",
-      ].join("\n");
-    }
 
     if (cmd === "workspace_list") {
       if (!cmdRes.ok) {
@@ -2409,15 +2448,36 @@ export class ChannelGatewayOrchestrator {
 
         if (weixinTaskController) {
           assertWeixinAttachmentTaskActive("workspace_write");
-          await this.backend.uploadWorkspaceFile(
-            userId,
-            targetWorkspaceId,
-            workspacePath,
-            safeFilename,
-            downloaded.content,
-            downloaded.mimeType || desc.mimeType || "application/octet-stream",
-            weixinTaskController.signal,
-          );
+          const weixinUploadContext: WorkspaceUploadWeixinContext = {
+            weixinAccountId: event.weixinAccountId ?? null,
+            weixinBotId: event.weixinBotId ?? null,
+            weixinBotGeneration: event.weixinBotGeneration ?? null,
+          };
+          try {
+            await this.backend.uploadWorkspaceFile(
+              userId,
+              targetWorkspaceId,
+              workspacePath,
+              safeFilename,
+              downloaded.content,
+              downloaded.mimeType || desc.mimeType || "application/octet-stream",
+              weixinTaskController.signal,
+              weixinUploadContext,
+            );
+          } catch (uploadErr) {
+            if (uploadErr instanceof BackendHttpError && uploadErr.status === 409) {
+              const bodyObj = uploadErr.body as { code?: unknown } | null;
+              const errCode =
+                typeof bodyObj?.code === "string" ? bodyObj.code : "";
+              if (WEIXIN_ROTATION_DENY_CODES.has(errCode)) {
+                this.notifyWeixinAccountRotation(
+                  event.weixinAccountId,
+                  errCode,
+                );
+              }
+            }
+            throw uploadErr;
+          }
           assertWeixinAttachmentTaskActive("post_upload");
         } else {
           await this.backend.uploadWorkspaceFile(
@@ -8804,11 +8864,10 @@ export class ChannelGatewayOrchestrator {
           : typeof cmdResRaw.cmd === "string"
             ? cmdResRaw.cmd
             : "workspace_list";
-      const cmd: "workspace_list" | "workspace_switch" | "new" | "stop" | "help" =
+      const cmd: "workspace_list" | "workspace_switch" | "new" | "stop" =
         rawCmd === "workspace_switch" ||
         rawCmd === "new" ||
-        rawCmd === "stop" ||
-        rawCmd === "help"
+        rawCmd === "stop"
           ? rawCmd
           : "workspace_list";
       const targetKind: SessionCommandTargetKind | null =
@@ -9752,22 +9811,31 @@ export class ChannelGatewayOrchestrator {
       // - `already_completed` with `status === "sent"` -> do not send notice.
       // - `claimed` (meaning `sent_to_current_count > 0` came from `/agent/send` and `fallback:{run_id}` was never used) ->
       //   release the unused claim as `failed` without sending duplicate fallback text or notice.
-      const claim = await this.backend.authorizeAndClaimDelivery({
-        delivery_key: params.fallbackDeliveryKey,
-        kind: "fallback",
-        user_id: params.userId,
-        thread_id: params.threadId,
-        run_id: params.runId,
-        platform: params.platform,
-        target: params.targetAddress,
-        inbound_message_id: params.inboundMessageId ?? null,
-        has_non_empty_text: true,
-        total_chunks: 1,
-        source_scope_key:
-          params.sourceScopeKey ?? params.threadScopeKey ?? null,
-        source_generation: params.sourceGeneration ?? null,
-        activity_origin: params.activityOrigin ?? null,
-      });
+      // R6 #6 (Codex Medium #5): Check lease-loss BEFORE claim and BEFORE I-7 settlement so a late
+      // `claimed` response arriving after lease loss NEVER emits I-7 `updateDeliveryProgress`.
+      this.deliveryService.assertNotLeaseLost("fallback.claim");
+      const claim = await this.backend.authorizeAndClaimDelivery(
+        {
+          delivery_key: params.fallbackDeliveryKey,
+          kind: "fallback",
+          user_id: params.userId,
+          thread_id: params.threadId,
+          run_id: params.runId,
+          platform: params.platform,
+          target: params.targetAddress,
+          inbound_message_id: params.inboundMessageId ?? null,
+          has_non_empty_text: true,
+          total_chunks: 1,
+          source_scope_key:
+            params.sourceScopeKey ?? params.threadScopeKey ?? null,
+          source_generation: params.sourceGeneration ?? null,
+          activity_origin: params.activityOrigin ?? null,
+        },
+        params.platform === "weixin"
+          ? { signal: this.deliveryService.getRetryAbortSignal() }
+          : undefined,
+      );
+      this.deliveryService.assertNotLeaseLost("fallback.post_claim");
       if (claim.claim_status === "already_completed") {
         const prev = (claim.first_response_json ?? {}) as { status?: string };
         const ledgerStatus = prev.status ?? claim.status ?? "sent";
@@ -9778,8 +9846,19 @@ export class ChannelGatewayOrchestrator {
         claim.claim_status === "in_flight_or_unknown" ||
         claim.claim_status === "denied"
       ) {
+        if (
+          claim.claim_status === "denied" &&
+          claim.code &&
+          WEIXIN_ROTATION_DENY_CODES.has(claim.code)
+        ) {
+          this.notifyWeixinAccountRotation(
+            claim.weixin_account_id ?? null,
+            claim.code,
+          );
+        }
         return false;
       } else if (claim.claim_status === "claimed") {
+        this.deliveryService.assertNotLeaseLost("fallback.settlement");
         await this.backend.updateDeliveryProgress(
           {
             delivery_key: params.fallbackDeliveryKey,

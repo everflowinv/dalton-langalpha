@@ -44,6 +44,42 @@ export const DELIVERY_CLAIM_503_INITIAL_DELAY_MS = 1_000;
 export const DELIVERY_CLAIM_503_MAX_DELAY_MS = 8_000;
 export const DELIVERY_CLAIM_503_MAX_ATTEMPTS = 5;
 
+export const WEIXIN_ROTATION_DENY_CODES: ReadonlySet<string> = new Set([
+  "weixin_bot_generation_superseded",
+  "weixin_bot_generation_mismatch",
+  "weixin_account_rebound",
+  "weixin_session_expired",
+  "ilink_user_conflict_auto_unbound",
+  "conflict_auto_unbound",
+]);
+
+/**
+ * R6 #3 (Grok High): Returns true when an error originates from a per-request HTTP timeout
+ * (e.g. `fetchWithTimeout` 15s single-call timeout on `preflightWeixinSend`), so preflight
+ * retries within the shared delivery deadline instead of escaping as `outcome: "unknown"`.
+ */
+export function isPreflightTimeoutError(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const e = err as { name?: unknown; code?: unknown; cause?: unknown };
+  const name = typeof e.name === "string" ? e.name : "";
+  const code = typeof e.code === "string" ? e.code : "";
+  if (
+    name === "TimeoutError" ||
+    name === "AbortError" ||
+    code === "ETIMEDOUT" ||
+    code === "UND_ERR_CONNECT_TIMEOUT" ||
+    code === "UND_ERR_HEADERS_TIMEOUT" ||
+    code === "UND_ERR_BODY_TIMEOUT" ||
+    code === "ABORT_ERR"
+  ) {
+    return true;
+  }
+  if (e.cause && e.cause !== err) {
+    return isPreflightTimeoutError(e.cause);
+  }
+  return false;
+}
+
 export interface WeixinPreflightBudget {
   readonly deadlineMs: number;
   readonly maxElapsedMs: number;
@@ -115,6 +151,10 @@ export class DeliveryService {
   private readonly preflightRetryMaxElapsedMs: number;
   private readonly claim503MaxAttempts: number;
   private readonly nowFn: () => number;
+  private readonly onWeixinAccountRotated?: (info: {
+    accountId?: string | null;
+    reason: string;
+  }) => void;
   private readonly firstCurrentDeliveryListeners = new Set<
     (info: FirstCurrentDeliveryInfo) => void
   >();
@@ -130,6 +170,10 @@ export class DeliveryService {
     backend: BackendClient;
     adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
     onFirstCurrentDelivery?: (info: FirstCurrentDeliveryInfo) => void;
+    onWeixinAccountRotated?: (info: {
+      accountId?: string | null;
+      reason: string;
+    }) => void;
     retryDelayFn?: (ms: number, signal?: AbortSignal) => Promise<boolean>;
     preflightRetryMaxElapsedMs?: number;
     claim503MaxAttempts?: number;
@@ -137,6 +181,7 @@ export class DeliveryService {
   }) {
     this.backend = options.backend;
     this.adapters = options.adapters;
+    this.onWeixinAccountRotated = options.onWeixinAccountRotated;
     this.retryDelayFn = options.retryDelayFn ?? abortableRetrySleep;
     this.preflightRetryMaxElapsedMs =
       options.preflightRetryMaxElapsedMs ??
@@ -176,6 +221,20 @@ export class DeliveryService {
   abortAllRetries(): void {
     this.retryAbortController.abort();
     this.retryAbortController = new AbortController();
+  }
+
+  /**
+   * R6 #6 (Codex Medium #5): Allows callers such as `Orchestrator.settleTurnFallbackAndPartialNotice`
+   * to share the exact same lease-loss guard before I-6 claim and I-7 settlement.
+   */
+  assertNotLeaseLost(operation: string): void {
+    if (this.leaseLost) {
+      throw new StaleGatewayEpochError(`Gateway lease lost before ${operation}`);
+    }
+  }
+
+  getRetryAbortSignal(): AbortSignal {
+    return this.retryAbortController.signal;
   }
 
   private createWeixinPreflightBudget(): WeixinPreflightBudget {
@@ -467,6 +526,12 @@ export class DeliveryService {
       if (!claim.is_current) {
         untrackIfNotCurrent?.();
       }
+      if (claim.code && WEIXIN_ROTATION_DENY_CODES.has(claim.code)) {
+        this.onWeixinAccountRotated?.({
+          accountId: claim.weixin_account_id ?? null,
+          reason: claim.code,
+        });
+      }
       const mappedCode =
         claim.code === "unknown_delivery_blocks_fallback"
           ? null
@@ -661,6 +726,7 @@ export class DeliveryService {
                 i,
                 weixinPreflightBudget!,
                 signal,
+                claim.weixin_account_id ?? null,
               );
               attachAccount(weixinPreflight.account_id);
               if (this.leaseLost) {
@@ -846,6 +912,7 @@ export class DeliveryService {
                   fileChunkIndex,
                   weixinPreflightBudget!,
                   signal,
+                  claim.weixin_account_id ?? null,
                 );
                 attachAccount(weixinPreflight.account_id);
                 if (this.leaseLost) {
@@ -888,6 +955,9 @@ export class DeliveryService {
                           fileChunkIndex,
                           weixinPreflightBudget!,
                           signal,
+                          weixinPreflight?.account_id ??
+                            claim.weixin_account_id ??
+                            null,
                         )
                     : undefined,
               });
@@ -1128,6 +1198,7 @@ export class DeliveryService {
     chunkIndex: number,
     budget: WeixinPreflightBudget,
     signal?: AbortSignal,
+    accountId?: string | null,
   ): Promise<WeixinPreflightAuthorizedData> {
     const combinedSignal = signal
       ? AbortSignal.any([signal, this.retryAbortController.signal])
@@ -1205,33 +1276,48 @@ export class DeliveryService {
               );
         }
         throwIfAbortedOrLeaseLost();
+        const isRetryable503 =
+          err instanceof BackendHttpError && err.status === 503;
+        const isRetryableTimeout = isPreflightTimeoutError(err);
+        if (isRetryable503) {
+          budget.lastRetryableDenyCode = "roster_lookup_error";
+          budget.lastRetryableMessage =
+            "Weixin preflight remained temporarily unavailable (503).";
+        } else if (isRetryableTimeout) {
+          budget.lastRetryableDenyCode =
+            budget.lastRetryableDenyCode ?? "preflight_timeout";
+          budget.lastRetryableMessage =
+            budget.lastRetryableMessage ??
+            "Weixin send preflight timed out before completing.";
+        }
         if (attemptSignal.aborted || getRemainingBudgetMs() <= 0) {
           throw buildDeadlineExceededError(
             "Weixin send preflight exceeded shared delivery deadline.",
           );
         }
-        const isRetryable503 =
-          err instanceof BackendHttpError && err.status === 503;
-        if (!isRetryable503) {
+        if (!isRetryable503 && !isRetryableTimeout) {
           throw err;
         }
-        budget.lastRetryableDenyCode = "roster_lookup_error";
-        budget.lastRetryableMessage =
-          "Weixin preflight remained temporarily unavailable (503).";
         const remainingMs = getRemainingBudgetMs();
         if (remainingMs <= 0) {
           throw buildDeadlineExceededError(
-            "Weixin preflight remained temporarily unavailable (503).",
+            budget.lastRetryableMessage ??
+              "Weixin preflight remained temporarily unavailable.",
           );
         }
         const waitMs = Math.min(delayMs, remainingMs);
-        this.logger.warn("Weixin preflight returned 503; retrying in delivery", {
-          delivery_key: deliveryKey,
-          chunk_index: chunkIndex,
-          attempt,
-          delay_ms: waitMs,
-          ...extractSafeLogErrorFields(err),
-        });
+        this.logger.warn(
+          isRetryable503
+            ? "Weixin preflight returned 503; retrying in delivery"
+            : "Weixin preflight single request timed out; retrying in delivery",
+          {
+            delivery_key: deliveryKey,
+            chunk_index: chunkIndex,
+            attempt,
+            delay_ms: waitMs,
+            ...extractSafeLogErrorFields(err),
+          },
+        );
         const slept = await this.retryDelayFn(waitMs, combinedSignal);
         budget.virtualElapsedMs += waitMs;
         if (!slept) {
@@ -1248,6 +1334,21 @@ export class DeliveryService {
       }
 
       throwIfAbortedOrLeaseLost();
+      // R6 #3 (Codex Low #7): Record retryable deny reason BEFORE checking whether the shared
+      // deadline expired, so a retryable denial arriving right at/after the deadline still
+      // reports its root cause (while a late `authorized: true` is still rejected).
+      if (!pf.authorized && (pf.retryable === true || pf.decision === "defer")) {
+        budget.lastRetryableDenyCode = pf.deny_code;
+        budget.lastRetryableMessage =
+          pf.message ??
+          `Weixin send preflight remained unavailable (${pf.deny_code}).`;
+      } else if (!pf.authorized && WEIXIN_ROTATION_DENY_CODES.has(pf.deny_code)) {
+        this.onWeixinAccountRotated?.({
+          accountId: accountId ?? null,
+          reason: pf.deny_code,
+        });
+      }
+
       // R5 #2 (Codex High #4): Do NOT adopt an authorization returned after the shared deadline.
       if (getRemainingBudgetMs() <= 0) {
         throw buildDeadlineExceededError(
@@ -1270,13 +1371,12 @@ export class DeliveryService {
         );
       }
       if (pf.retryable === true || pf.decision === "defer") {
-        budget.lastRetryableDenyCode = pf.deny_code;
-        budget.lastRetryableMessage =
-          pf.message ??
-          `Weixin send preflight remained unavailable (${pf.deny_code}).`;
         const remainingMs = getRemainingBudgetMs();
         if (remainingMs <= 0) {
-          throw buildDeadlineExceededError(budget.lastRetryableMessage);
+          throw buildDeadlineExceededError(
+            budget.lastRetryableMessage ??
+              `Weixin send preflight remained unavailable (${pf.deny_code}).`,
+          );
         }
         const waitMs = Math.min(delayMs, remainingMs);
         this.logger.warn(

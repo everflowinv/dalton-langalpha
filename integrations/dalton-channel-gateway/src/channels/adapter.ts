@@ -423,7 +423,11 @@ export interface ChannelAdapter {
     >,
   ): boolean;
   onWeixinAccountInvalidated?(
-    handler: (info: { accountId: string; reason: string }) => void,
+    handler: (info: {
+      accountId: string;
+      reason: string;
+      activeBotGeneration?: number;
+    }) => void,
   ): void;
   triggerAccountsSync?(
     targetRevision?: number | null,

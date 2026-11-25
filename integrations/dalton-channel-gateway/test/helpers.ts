@@ -849,16 +849,6 @@ export function createMockBackend(): MockBackend {
         if (req.cmd === "new") {
           return structuredClone(defaultI3NewSession);
         }
-        if (req.cmd === "help") {
-          return {
-            ok: true,
-            linked: true,
-            allowed: true,
-            dalton_user_id: USER_ID,
-            command_effect_status: "done",
-            command_reply_pending: true,
-          };
-        }
         return {
           ...structuredClone(defaultI3WsList),
           ...structuredClone(defaultI3WsSwitch),

@@ -3,6 +3,7 @@
 import {
   type BackendClient,
   BackendHttpError,
+  isValidWeixinAccountsReconcileResponse,
   type WeixinAccountSnapshot,
   type WeixinPreflightAuthorizedData,
 } from "../../backend-client.js";
@@ -203,7 +204,11 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   private inboundHandler: ((event: InboundChannelEvent) => Promise<void>) | null =
     null;
   private accountInvalidatedHandler:
-    | ((info: { accountId: string; reason: string }) => void)
+    | ((info: {
+        accountId: string;
+        reason: string;
+        activeBotGeneration?: number;
+      }) => void)
     | null = null;
 
   private started = false;
@@ -217,6 +222,10 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   private reconcilePending = false;
   private reconcileAbortController: AbortController | null = null;
   private egressCooldownUntilMs = 0;
+  private readonly pendingStaggerIds: string[] = [];
+  private readonly pendingStaggerSet = new Set<string>();
+  private staggerDrainTask: Promise<void> | null = null;
+  private lastMonitorStartAtMs: number | null = null;
 
   constructor(opts: WeixinChannelAdapterOptions = {}) {
     this.opts = opts;
@@ -308,7 +317,11 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   }
 
   onWeixinAccountInvalidated(
-    handler: (info: { accountId: string; reason: string }) => void,
+    handler: (info: {
+      accountId: string;
+      reason: string;
+      activeBotGeneration?: number;
+    }) => void,
   ): void {
     this.accountInvalidatedHandler = handler;
   }
@@ -554,6 +567,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     this.started = false;
     this.clearReconcileTimer();
     this.reconcilePending = false;
+    this.pendingStaggerIds.length = 0;
+    this.pendingStaggerSet.clear();
+    this.lastMonitorStartAtMs = null;
     const recCtrl = this.reconcileAbortController;
     this.reconcileAbortController = null;
     recCtrl?.abort();
@@ -685,7 +701,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           !this.backendNotFound404 &&
           (!this.leaseManager || this.leaseManager.isLeaseLocallyValid())
         ) {
-          await this.startAccountMonitorsStaggered(pendingToStart);
+          await this.enqueueMonitorsStaggered(pendingToStart);
         }
         const nextDelay = this.backendNotFound404
           ? this.probeInterval404Ms
@@ -886,6 +902,18 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       },
       onRateLimited: (err) =>
         this.recordRateLimitAndComputeDelay(capturedAccountId, err),
+      onAccountGenerationSuperseded: ({ accountId, activeBotGeneration }) => {
+        this.abortAccountInFlight(accountId);
+        this.accountInvalidatedHandler?.({
+          accountId,
+          reason: "monitor_generation_superseded",
+          activeBotGeneration,
+        });
+        void this.triggerAccountsSync(
+          undefined,
+          "monitor_generation_superseded",
+        );
+      },
       onStaleEpoch: (err) => {
         this.leaseManager?.notifyLeaseLost("monitor_stale_epoch", err);
       },
@@ -977,6 +1005,13 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         this.lastRevision,
         { signal: this.reconcileAbortController?.signal },
       );
+      if (!isValidWeixinAccountsReconcileResponse(resp)) {
+        throw new BackendHttpError(
+          "Weixin accounts reconcile returned an invalid snapshot payload",
+          502,
+          { code: "invalid_reconcile_snapshot" },
+        );
+      }
       this.backendNotFound404 = false;
       this.maxConcurrentAccounts = Math.max(
         1,
@@ -1086,7 +1121,8 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
   /**
    * Self-heals any pollable managed account whose polling coroutine is missing
-   * (Decision #12: called on `changed: false` reconcile passes and on lease recovery).
+   * (Decision #12 & R6 #5: routes through the shared staggered startup queue so
+   * `changed: false` sync nudges and lease recovery never bypass startup stagger).
    */
   ensurePollableMonitorsRunning(): void {
     if (
@@ -1097,6 +1133,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     ) {
       return;
     }
+    const missing: ManagedWeixinAccount[] = [];
     for (const acc of this.accounts.values()) {
       if (
         !acc.monitorTask &&
@@ -1104,8 +1141,11 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         acc.botToken &&
         acc.ilinkBotId
       ) {
-        this.startAccountMonitor(acc);
+        missing.push(acc);
       }
+    }
+    if (missing.length > 0) {
+      void this.enqueueMonitorsStaggered(missing);
     }
   }
 
@@ -1187,6 +1227,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           this.accountInvalidatedHandler?.({
             accountId: snap.account_id,
             reason: "generation_or_credentials_changed",
+            activeBotGeneration: snap.bot_generation,
           });
           toStart.push(existing);
         } else {
@@ -1225,39 +1266,125 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     if (!startMonitors) {
       return;
     }
-    await this.startAccountMonitorsStaggered(toStart);
+    await this.enqueueMonitorsStaggered(toStart);
   }
 
   /**
-   * Starts pollers sequentially with configured stagger delay + jitter (§3.4 / R5 #4).
-   * Shared by both `applyAccountSnapshots()` and preloaded `start()`.
+   * Single shared staggered monitor-start queue (§3.4 / R5 #4 / R6 #5).
+   * Used by preloaded `start()`, `applyAccountSnapshots()`, and `ensurePollableMonitorsRunning()`
+   * so concurrent sync nudges (`changed: false` or `changed: true`) never launch remaining
+   * accounts simultaneously.
    */
-  private async startAccountMonitorsStaggered(
+  private enqueueMonitorsStaggered(
     accounts: readonly ManagedWeixinAccount[],
   ): Promise<void> {
-    const signal = this.reconcileAbortController?.signal;
-    for (let idx = 0; idx < accounts.length; idx += 1) {
-      if (!this.started || signal?.aborted) {
-        return;
-      }
-      if (idx > 0 && (this.staggerDelayMs > 0 || this.staggerJitterMs > 0)) {
-        const jitter =
-          this.staggerJitterMs > 0
-            ? Math.floor(Math.random() * this.staggerJitterMs)
-            : 0;
-        const ok = await sleepWithAbort(this.staggerDelayMs + jitter, signal);
-        if (!ok) return;
-      }
-      const acc = accounts[idx]!;
-      if (this.accounts.get(acc.accountId) === acc && !acc.monitorTask) {
-        this.startAccountMonitor(acc);
+    for (const acc of accounts) {
+      if (
+        !acc.monitorTask &&
+        !this.pendingStaggerSet.has(acc.accountId) &&
+        isPollableAccountStatus(acc.status) &&
+        acc.botToken &&
+        acc.ilinkBotId
+      ) {
+        this.pendingStaggerSet.add(acc.accountId);
+        this.pendingStaggerIds.push(acc.accountId);
       }
     }
+    if (this.pendingStaggerIds.length === 0) {
+      return this.staggerDrainTask ?? Promise.resolve();
+    }
+    if (this.staggerDrainTask) {
+      return this.staggerDrainTask;
+    }
+
+    const drainTask = (async () => {
+      const signal = this.reconcileAbortController?.signal;
+      while (this.pendingStaggerIds.length > 0) {
+        if (
+          !this.started ||
+          signal?.aborted ||
+          !this.backendEnabled ||
+          this.backendNotFound404 ||
+          (this.leaseManager && !this.leaseManager.isLeaseLocallyValid())
+        ) {
+          this.pendingStaggerIds.length = 0;
+          this.pendingStaggerSet.clear();
+          return;
+        }
+        const accountId = this.pendingStaggerIds.shift()!;
+        this.pendingStaggerSet.delete(accountId);
+        const acc = this.accounts.get(accountId);
+        if (
+          !acc ||
+          acc.monitorTask ||
+          !isPollableAccountStatus(acc.status) ||
+          !acc.botToken ||
+          !acc.ilinkBotId
+        ) {
+          continue;
+        }
+        if (
+          this.lastMonitorStartAtMs !== null &&
+          (this.staggerDelayMs > 0 || this.staggerJitterMs > 0)
+        ) {
+          const jitter =
+            this.staggerJitterMs > 0
+              ? Math.floor(Math.random() * this.staggerJitterMs)
+              : 0;
+          const targetAtMs =
+            this.lastMonitorStartAtMs + this.staggerDelayMs + jitter;
+          const waitMs = targetAtMs - this.nowFn();
+          if (waitMs > 0) {
+            const ok = await sleepWithAbort(waitMs, signal);
+            if (!ok) {
+              this.pendingStaggerIds.length = 0;
+              this.pendingStaggerSet.clear();
+              return;
+            }
+          }
+        }
+        if (
+          !this.started ||
+          signal?.aborted ||
+          !this.backendEnabled ||
+          this.backendNotFound404 ||
+          (this.leaseManager && !this.leaseManager.isLeaseLocallyValid())
+        ) {
+          this.pendingStaggerIds.length = 0;
+          this.pendingStaggerSet.clear();
+          return;
+        }
+        const latest = this.accounts.get(accountId);
+        if (
+          latest &&
+          !latest.monitorTask &&
+          isPollableAccountStatus(latest.status) &&
+          latest.botToken &&
+          latest.ilinkBotId
+        ) {
+          this.startAccountMonitor(latest);
+          this.lastMonitorStartAtMs = this.nowFn();
+        }
+      }
+    })().finally(() => {
+      if (this.staggerDrainTask === drainTask) {
+        this.staggerDrainTask = null;
+      }
+    });
+
+    this.staggerDrainTask = drainTask;
+    return drainTask;
   }
 
   private async handleConfirmedAccount(
     confirmed: ConfirmedWeixinAccount,
   ): Promise<void> {
+    this.abortAccountInFlight(confirmed.accountId);
+    this.accountInvalidatedHandler?.({
+      accountId: confirmed.accountId,
+      reason: "qr_confirmed",
+      activeBotGeneration: confirmed.botGeneration,
+    });
     if (this.backend && this.started) {
       await this.triggerAccountsSync(
         confirmed.accountsRevision ?? undefined,
@@ -1320,12 +1447,20 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       return;
     }
     try {
-      await this.backend.updateWeixinAccountStatus(accountId, {
+      const statusRes = await this.backend.updateWeixinAccountStatus(accountId, {
         action: "mark_session_expired",
         expected_bot_generation: botGeneration,
         expected_ilink_bot_id: ilinkBotId,
         error_code: String(err?.errcode ?? err?.ret ?? -14),
       });
+      if (statusRes?.stale_generation) {
+        this.abortAccountInFlight(accountId);
+        this.accountInvalidatedHandler?.({
+          accountId,
+          reason: "status_stale_generation",
+        });
+        void this.triggerAccountsSync(undefined, "status_stale_generation");
+      }
     } catch (statusErr) {
       if (isStaleGatewayEpochError(statusErr)) {
         this.leaseManager?.notifyLeaseLost("send_status_stale_epoch", statusErr);
@@ -1344,14 +1479,25 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       return;
     }
     try {
-      await this.backend.updateWeixinAccountStatus(preflight.account_id, {
-        action: "mark_context_token_stale",
-        expected_bot_generation: preflight.bot_generation,
-        expected_ilink_bot_id: preflight.ilink_bot_id,
-        error_code: String(code),
-        recipient_platform_user_id: preflight.recipient_id,
-        expected_token_version: preflight.weixin_context_token_version,
-      });
+      const statusRes = await this.backend.updateWeixinAccountStatus(
+        preflight.account_id,
+        {
+          action: "mark_context_token_stale",
+          expected_bot_generation: preflight.bot_generation,
+          expected_ilink_bot_id: preflight.ilink_bot_id,
+          error_code: String(code),
+          recipient_platform_user_id: preflight.recipient_id,
+          expected_token_version: preflight.weixin_context_token_version,
+        },
+      );
+      if (statusRes?.stale_generation) {
+        this.abortAccountInFlight(preflight.account_id);
+        this.accountInvalidatedHandler?.({
+          accountId: preflight.account_id,
+          reason: "token_status_stale_generation",
+        });
+        void this.triggerAccountsSync(undefined, "token_status_stale_generation");
+      }
     } catch (statusErr) {
       if (isStaleGatewayEpochError(statusErr)) {
         this.leaseManager?.notifyLeaseLost("token_stale_epoch", statusErr);
