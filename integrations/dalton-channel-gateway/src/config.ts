@@ -1,5 +1,3 @@
-import { homedir } from "node:os";
-import { resolve } from "node:path";
 import { loadSecureGatewayEnvFile } from "./vault-credentials.js";
 
 export type GatewayStartupMode = "incoming" | "outgoing";
@@ -31,8 +29,6 @@ export interface GatewayConfig {
   backendUrl: string;
   /** Frontend web base URL for settings/interrupt links, e.g. `https://app.ginlix.ai` or `http://localhost:5173`. */
   webBaseUrl: string;
-  /** Local Weixin cache directory (`~/.dalton/channel-gateway/weixin`, mode 0700). */
-  weixinCacheDir: string;
   /**
    * Host file for loopback ops alerts (`DALTON_OPS_ALERTS_FILE`).
    * Read from the merged process and env-file configuration. Empty when unset.
@@ -147,10 +143,6 @@ export function loadConfig(
   const webBaseUrl = (mergedEnv.WEB_BASE_URL ?? "http://localhost:5173")
     .trim()
     .replace(/\/+$/, "");
-  const weixinCacheDir = (
-    mergedEnv.DALTON_WEIXIN_CACHE_DIR ??
-    resolve(homedir(), ".dalton", "channel-gateway", "weixin")
-  ).trim();
 
   const rawMode = (
     mergedEnv.DALTON_GATEWAY_MODE ??
@@ -231,7 +223,6 @@ export function loadConfig(
     serviceToken,
     backendUrl,
     webBaseUrl,
-    weixinCacheDir,
     opsAlertsFile: (mergedEnv.DALTON_OPS_ALERTS_FILE ?? "").trim(),
     colleagueDispatchEnabled: parseBool(
       mergedEnv.DALTON_COLLEAGUE_DISPATCH_ENABLED,
@@ -261,7 +252,8 @@ export function loadConfig(
           .trim()
           .replace(/\/+$/, ""),
         cdnBaseUrl: (
-          env.DALTON_WEIXIN_CDN_BASE_URL ?? "https://novac2c.cdn.weixin.qq.com/c2c"
+          mergedEnv.DALTON_WEIXIN_CDN_BASE_URL ??
+          "https://novac2c.cdn.weixin.qq.com/c2c"
         )
           .trim()
           .replace(/\/+$/, ""),

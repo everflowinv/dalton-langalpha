@@ -9,6 +9,10 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
 import path from "node:path";
 import {
+  isLeaseSafetyMarginPauseError,
+  isStaleGatewayEpochError,
+} from "../../gateway-lease.js";
+import {
   type HostIpResolver,
   MAX_CIPHERTEXT_ATTACHMENT_BYTES,
   SafeFetchError,
@@ -311,6 +315,8 @@ export interface WeixinCdnDownloadOptions {
   chunkIdleTimeoutMs?: number;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
+  dispatcher?: unknown;
+  assertLeaseValid?: () => void;
 }
 
 /**
@@ -368,6 +374,14 @@ export async function downloadWeixinCdnAttachment(
         : aesEcbPaddedSize(meta.sizeBytes)
       : undefined;
 
+  const wrappedDownloadFetch: typeof fetch | undefined = options.assertLeaseValid
+    ? async (input, init) => {
+        options.assertLeaseValid?.();
+        const fn = options.fetchImpl ?? globalThis.fetch;
+        return fn(input, init);
+      }
+    : options.fetchImpl;
+
   const fetched = await safeFetchBuffer(downloadUrl, {
     allowedDomains: allowedCdnDomains,
     requireHttps: true,
@@ -380,7 +394,8 @@ export async function downloadWeixinCdnAttachment(
     // Strictly isolated CDN headers: no Authorization or X-Service-Token
     headers: {},
     signal: options.signal,
-    fetchImpl: options.fetchImpl,
+    fetchImpl: wrappedDownloadFetch,
+    dispatcher: options.dispatcher,
   });
 
   const plaintext = aesKey
@@ -520,9 +535,11 @@ export async function uploadBufferToWeixinCdn(
     timeoutMs: options.timeoutMs,
     signal: options.signal,
     fetchImpl: options.fetchImpl,
+    dispatcher: options.dispatcher,
     allowedDomains: options.allowedDomains,
     resolveHostIps: options.resolveHostIps,
     checkResolvedIps: options.checkResolvedIps,
+    assertLeaseValid: options.assertLeaseValid,
     filekey,
     media_type: options.mediaType,
     to_user_id: toUserId,
@@ -550,17 +567,26 @@ export async function uploadBufferToWeixinCdn(
     resolveHostIps: options.resolveHostIps,
     checkResolvedIps: options.checkResolvedIps,
   });
+  options.assertLeaseValid?.();
 
   const maxAttempts = Math.max(
     1,
     options.maxUploadAttempts ?? WEIXIN_CDN_UPLOAD_MAX_RETRIES,
   );
   let lastError: unknown;
+  const wrappedUploadFetch: typeof fetch | undefined = options.assertLeaseValid
+    ? async (input, init) => {
+        options.assertLeaseValid?.();
+        const fn = options.fetchImpl ?? globalThis.fetch;
+        return fn(input, init);
+      }
+    : options.fetchImpl;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     if (options.signal?.aborted) {
       throw new Error("Weixin CDN upload aborted");
     }
+    options.assertLeaseValid?.();
     try {
       const res = await safeFetchResponse(cdnUploadUrl, {
         method: "POST",
@@ -576,7 +602,8 @@ export async function uploadBufferToWeixinCdn(
         checkResolvedIps: options.checkResolvedIps,
         timeoutMs: options.timeoutMs ?? WEIXIN_CDN_UPLOAD_TIMEOUT_MS,
         signal: options.signal,
-        fetchImpl: options.fetchImpl,
+        fetchImpl: wrappedUploadFetch,
+        dispatcher: options.dispatcher,
       });
 
       if (res.status === 429) {
@@ -593,23 +620,19 @@ export async function uploadBufferToWeixinCdn(
       }
 
       if (res.status >= 400 && res.status < 500) {
-        const errMsg =
-          res.headers.get("x-error-message") ?? (await res.text());
+        await res.body?.cancel().catch(() => undefined);
         throw new WeixinApiError({
           kind: "http_error",
           endpoint: "cdn/upload",
-          message: `Weixin CDN upload client error HTTP ${res.status}: ${errMsg.slice(0, 200)}`,
+          message: `Weixin CDN upload client error HTTP ${res.status}`,
           status: res.status,
           requestSent: true,
         });
       }
 
       if (!res.ok) {
-        const errMsg =
-          res.headers.get("x-error-message") ?? (await res.text());
-        throw new Error(
-          `Weixin CDN upload server error HTTP ${res.status}: ${errMsg.slice(0, 200)}`,
-        );
+        await res.body?.cancel().catch(() => undefined);
+        throw new Error(`Weixin CDN upload server error HTTP ${res.status}`);
       }
 
       const downloadParam = res.headers.get("x-encrypted-param")?.trim();
@@ -631,6 +654,9 @@ export async function uploadBufferToWeixinCdn(
         mediaType: options.mediaType,
       };
     } catch (err) {
+      if (isStaleGatewayEpochError(err) || isLeaseSafetyMarginPauseError(err)) {
+        throw err;
+      }
       lastError = err;
       if (
         err instanceof WeixinApiError &&

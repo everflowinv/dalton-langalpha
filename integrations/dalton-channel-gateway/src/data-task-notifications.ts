@@ -2,14 +2,32 @@ import { createHash } from "node:crypto";
 import {
   type BackendClient,
   BackendHttpError,
+  type I6AuthorizeAndClaimRequest,
   type I7DeliveriesProgressRequest,
   type I7DeliveriesProgressResponse,
+  type WeixinPreflightAuthorizedData,
 } from "./backend-client.js";
 import {
   type ChannelAdapter,
   ChannelDeliveryError,
   type SendCardImageInput,
 } from "./channels/adapter.js";
+import {
+  abortableRetrySleep,
+  DELIVERY_CLAIM_503_INITIAL_DELAY_MS,
+  DELIVERY_CLAIM_503_MAX_ATTEMPTS,
+  DELIVERY_CLAIM_503_MAX_DELAY_MS,
+  isPreflightTimeoutError,
+  type WeixinPreflightBudget,
+  WEIXIN_PREFLIGHT_RETRY_INITIAL_DELAY_MS,
+  WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS,
+  WEIXIN_PREFLIGHT_RETRY_MAX_ELAPSED_MS,
+  WEIXIN_ROTATION_DENY_CODES,
+} from "./delivery-service.js";
+import {
+  isStaleGatewayEpochError,
+  StaleGatewayEpochError,
+} from "./gateway-lease.js";
 import type {
   DataTaskAuthorizePlanResponse,
   DataTaskItemDeliveryOutcome,
@@ -21,6 +39,11 @@ import {
   createSequentialQueue,
   type SequentialQueue,
 } from "./shared/keyed-queue.js";
+import {
+  createSubsystemLogger,
+  extractSafeLogErrorFields,
+  sanitizeLogErrorCode,
+} from "./shared/logger.js";
 import type { ChannelPlatform } from "./types.js";
 
 const MAX_ARTIFACT_BYTES = 20 * 1024 * 1024;
@@ -90,12 +113,16 @@ function safeBackendErrorMessage(err: unknown, fallback: string): string {
 function classifyAdapterError(err: unknown): {
   outcome: "failed" | "unknown";
   code: string;
+  denyCode?: string;
+  errorDetail?: string;
   message: string;
 } {
   if (err instanceof ChannelDeliveryError) {
     return {
       outcome: err.outcome === "unknown" ? "unknown" : "failed",
       code: err.code,
+      denyCode: err.denyCode,
+      errorDetail: err.errorDetail,
       message: err.message,
     };
   }
@@ -114,7 +141,9 @@ type ValidatedDataTaskClaim =
       recipientId: string;
       isCurrent: false;
       homeWorkspaceId: string | null;
+      weixinAccountId: string | null;
       weixinContextToken: string | null;
+      deliveryAttempt?: number;
     }
   | {
       kind: "already_completed";
@@ -213,6 +242,17 @@ function validateDataTaskClaimResponse(
         reason: "I-6 claimed response has missing or invalid weixin_context_token.",
       };
     }
+    const deliveryAttempt =
+      typeof rawClaim.delivery_attempt === "number" &&
+      Number.isInteger(rawClaim.delivery_attempt) &&
+      rawClaim.delivery_attempt > 0
+        ? rawClaim.delivery_attempt
+        : undefined;
+    const weixinAccountId =
+      typeof rawClaim.weixin_account_id === "string" &&
+      rawClaim.weixin_account_id.trim().length > 0
+        ? rawClaim.weixin_account_id.trim()
+        : null;
     return {
       kind: "claimed",
       platform: expected.platform,
@@ -220,7 +260,9 @@ function validateDataTaskClaimResponse(
       recipientId: rawClaim.recipient_id,
       isCurrent: false,
       homeWorkspaceId: rawClaim.home_workspace_id,
+      weixinAccountId,
       weixinContextToken: rawClaim.weixin_context_token,
+      ...(deliveryAttempt !== undefined ? { deliveryAttempt } : {}),
     };
   }
 
@@ -362,6 +404,14 @@ export interface DataTaskNotificationServiceOptions {
   adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
   mode?: "incoming" | "outgoing";
   queueTaskTimeoutMs?: number;
+  retryDelayFn?: (ms: number, signal?: AbortSignal) => Promise<boolean>;
+  preflightRetryMaxElapsedMs?: number;
+  claim503MaxAttempts?: number;
+  nowFn?: () => number;
+  onWeixinAccountRotated?: (info: {
+    accountId?: string | null;
+    reason: string;
+  }) => void;
 }
 
 export interface ExecutionStateTracker {
@@ -384,14 +434,360 @@ export class DataTaskNotificationService {
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
   private readonly mode: "incoming" | "outgoing";
   private readonly queue: SequentialQueue;
+  private readonly logger = createSubsystemLogger("data-task-notifications");
+  private readonly retryDelayFn: (
+    ms: number,
+    signal?: AbortSignal,
+  ) => Promise<boolean>;
+  private readonly preflightRetryMaxElapsedMs: number;
+  private readonly claim503MaxAttempts: number;
+  private readonly nowFn: () => number;
+  private readonly onWeixinAccountRotated?: (info: {
+    accountId?: string | null;
+    reason: string;
+  }) => void;
+  private retryAbortController = new AbortController();
+  private startupBlocked = false;
+  private leaseLost = false;
 
   constructor(options: DataTaskNotificationServiceOptions) {
     this.backend = options.backend;
     this.adapters = options.adapters;
     this.mode = options.mode ?? "incoming";
+    this.onWeixinAccountRotated = options.onWeixinAccountRotated;
+    this.retryDelayFn = options.retryDelayFn ?? abortableRetrySleep;
+    this.preflightRetryMaxElapsedMs =
+      options.preflightRetryMaxElapsedMs ??
+      WEIXIN_PREFLIGHT_RETRY_MAX_ELAPSED_MS;
+    this.claim503MaxAttempts =
+      options.claim503MaxAttempts ?? DELIVERY_CLAIM_503_MAX_ATTEMPTS;
+    this.nowFn = options.nowFn ?? (() => Date.now());
+    // R5 #5 (Codex Medium #7): Preserve original 180s default queue task timeout unchanged for Feishu/Discord.
     this.queue = createSequentialQueue({
       taskTimeoutMs: options.queueTaskTimeoutMs ?? 180_000,
     });
+  }
+
+  setStartupBlocked(blocked: boolean): void {
+    this.startupBlocked = blocked;
+    if (blocked) {
+      this.abortAllRetries();
+    } else {
+      this.leaseLost = false;
+    }
+  }
+
+  /**
+   * R5 #3 (Codex Medium #5): Synchronously aborts all in-delivery retries on lease loss
+   * and marks `leaseLost = true` so aborted deliveries rethrow `StaleGatewayEpochError`
+   * WITHOUT writing I-7 `failed` settlement.
+   */
+  abortOnLeaseLost(): void {
+    this.leaseLost = true;
+    this.startupBlocked = true;
+    this.abortAllRetries();
+  }
+
+  abortAllRetries(): void {
+    this.retryAbortController.abort();
+    this.retryAbortController = new AbortController();
+  }
+
+  private createWeixinPreflightBudget(): WeixinPreflightBudget {
+    return {
+      deadlineMs: this.nowFn() + this.preflightRetryMaxElapsedMs,
+      maxElapsedMs: this.preflightRetryMaxElapsedMs,
+      virtualElapsedMs: 0,
+    };
+  }
+
+  private async claimDeliveryWith503Retry(
+    req: I6AuthorizeAndClaimRequest,
+  ): Promise<unknown> {
+    // R5 #5 (Codex Medium #7): In-delivery I-6 503 retry applies ONLY to Weixin;
+    // Feishu and Discord keep original fail-immediately behavior on 503.
+    const isWeixinTarget = req.platform === "weixin";
+    const maxAttempts = isWeixinTarget ? this.claim503MaxAttempts : 1;
+    const signal = this.retryAbortController.signal;
+    let delayMs = DELIVERY_CLAIM_503_INITIAL_DELAY_MS;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (this.leaseLost) {
+        throw new StaleGatewayEpochError(
+          "Gateway lease lost before data-task I-6 authorize-and-claim",
+        );
+      }
+      if (this.startupBlocked || signal.aborted) {
+        throw new BackendHttpError(
+          "I-6 authorize-and-claim aborted due to lease loss or shutdown",
+          503,
+          null,
+        );
+      }
+      try {
+        return await this.backend.authorizeAndClaimDelivery(
+          req,
+          isWeixinTarget ? { signal } : undefined,
+        );
+      } catch (err) {
+        if (isStaleGatewayEpochError(err) || this.leaseLost) {
+          throw isStaleGatewayEpochError(err)
+            ? err
+            : new StaleGatewayEpochError(
+                "Gateway lease lost during data-task I-6 authorize-and-claim",
+                { cause: err },
+              );
+        }
+        const isRetryable503 =
+          isWeixinTarget &&
+          err instanceof BackendHttpError &&
+          err.status === 503;
+        if (!isRetryable503 || attempt >= maxAttempts) {
+          throw err;
+        }
+        this.logger.warn(
+          "Data-task I-6 authorize-and-claim returned 503; retrying in delivery",
+          {
+            delivery_key: req.delivery_key,
+            platform: req.platform ?? null,
+            attempt,
+            delay_ms: delayMs,
+            ...extractSafeLogErrorFields(err),
+          },
+        );
+        const slept = await this.retryDelayFn(delayMs, signal);
+        if (this.leaseLost) {
+          throw new StaleGatewayEpochError(
+            "Gateway lease lost while retrying data-task I-6 authorize-and-claim",
+          );
+        }
+        if (!slept || this.startupBlocked || signal.aborted) {
+          throw err;
+        }
+        delayMs = Math.min(delayMs * 2, DELIVERY_CLAIM_503_MAX_DELAY_MS);
+      }
+    }
+    throw new BackendHttpError("I-6 authorize-and-claim failed (503)", 503, null);
+  }
+
+  private async runWeixinPreflight(
+    deliveryKey: string,
+    deliveryAttempt: number,
+    chunkIndex: number,
+    budget: WeixinPreflightBudget,
+    signal?: AbortSignal,
+    accountId?: string | null,
+  ): Promise<WeixinPreflightAuthorizedData> {
+    const combinedSignal = signal
+      ? AbortSignal.any([signal, this.retryAbortController.signal])
+      : this.retryAbortController.signal;
+    let delayMs = WEIXIN_PREFLIGHT_RETRY_INITIAL_DELAY_MS;
+    let attempt = 0;
+    const getRemainingBudgetMs = (): number =>
+      Math.min(
+        budget.deadlineMs - this.nowFn(),
+        budget.maxElapsedMs - budget.virtualElapsedMs,
+      );
+    const throwIfAbortedOrLeaseLost = (): void => {
+      if (this.leaseLost) {
+        throw new StaleGatewayEpochError(
+          "Gateway lease lost during data-task Weixin preflight",
+        );
+      }
+      if (this.startupBlocked || combinedSignal.aborted) {
+        throw new ChannelDeliveryError("Weixin preflight aborted", {
+          outcome: "failed",
+          code: "unavailable",
+          retryable: false,
+        });
+      }
+    };
+
+    const buildDeadlineExceededError = (
+      fallbackMessage: string,
+    ): ChannelDeliveryError =>
+      new ChannelDeliveryError(
+        budget.lastRetryableMessage ?? fallbackMessage,
+        {
+          outcome: "failed",
+          code: "unavailable",
+          retryable: false,
+          denyCode:
+            budget.lastRetryableDenyCode ?? "preflight_deadline_exceeded",
+          errorDetail: "preflight_deadline_exceeded",
+        },
+      );
+
+    for (;;) {
+      attempt += 1;
+      throwIfAbortedOrLeaseLost();
+
+      const preCallRemainingMs = getRemainingBudgetMs();
+      if (preCallRemainingMs <= 0) {
+        throw buildDeadlineExceededError(
+          "Weixin send preflight exceeded shared delivery deadline.",
+        );
+      }
+
+      const attemptSignal = AbortSignal.any([
+        combinedSignal,
+        AbortSignal.timeout(Math.max(1, Math.ceil(preCallRemainingMs))),
+      ]);
+
+      let pf: Awaited<ReturnType<BackendClient["preflightWeixinSend"]>>;
+      try {
+        pf = await this.backend.preflightWeixinSend(
+          deliveryKey,
+          {
+            delivery_attempt: deliveryAttempt,
+            chunk_index: chunkIndex,
+          },
+          { signal: attemptSignal },
+        );
+      } catch (err) {
+        if (isStaleGatewayEpochError(err) || this.leaseLost) {
+          throw isStaleGatewayEpochError(err)
+            ? err
+            : new StaleGatewayEpochError(
+                "Gateway lease lost during data-task Weixin preflight",
+                { cause: err },
+              );
+        }
+        throwIfAbortedOrLeaseLost();
+        const isRetryable503 =
+          err instanceof BackendHttpError && err.status === 503;
+        const isRetryableTimeout = isPreflightTimeoutError(err);
+        if (isRetryable503) {
+          budget.lastRetryableDenyCode = "roster_lookup_error";
+          budget.lastRetryableMessage =
+            "Weixin preflight remained temporarily unavailable (503).";
+        } else if (isRetryableTimeout) {
+          budget.lastRetryableDenyCode =
+            budget.lastRetryableDenyCode ?? "preflight_timeout";
+          budget.lastRetryableMessage =
+            budget.lastRetryableMessage ??
+            "Weixin send preflight timed out before completing.";
+        }
+        if (attemptSignal.aborted || getRemainingBudgetMs() <= 0) {
+          throw buildDeadlineExceededError(
+            "Weixin send preflight exceeded shared delivery deadline.",
+          );
+        }
+        if (!isRetryable503 && !isRetryableTimeout) {
+          throw err;
+        }
+        const remainingMs = getRemainingBudgetMs();
+        if (remainingMs <= 0) {
+          throw buildDeadlineExceededError(
+            budget.lastRetryableMessage ??
+              "Weixin preflight remained temporarily unavailable.",
+          );
+        }
+        const waitMs = Math.min(delayMs, remainingMs);
+        this.logger.warn(
+          isRetryable503
+            ? "Data-task Weixin preflight returned 503; retrying in delivery"
+            : "Data-task Weixin preflight single request timed out; retrying in delivery",
+          {
+            delivery_key: deliveryKey,
+            chunk_index: chunkIndex,
+            attempt,
+            delay_ms: waitMs,
+            ...extractSafeLogErrorFields(err),
+          },
+        );
+        const slept = await this.retryDelayFn(waitMs, combinedSignal);
+        budget.virtualElapsedMs += waitMs;
+        if (!slept) {
+          throwIfAbortedOrLeaseLost();
+          throw new ChannelDeliveryError("Weixin preflight aborted", {
+            outcome: "failed",
+            code: "unavailable",
+            retryable: false,
+          });
+        }
+        throwIfAbortedOrLeaseLost();
+        delayMs = Math.min(delayMs * 2, WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS);
+        continue;
+      }
+
+      throwIfAbortedOrLeaseLost();
+      // R6 #3 (Codex Low #7): Record retryable deny reason BEFORE checking shared deadline
+      // so a late retryable denial preserves its root cause while late allow is still rejected.
+      if (!pf.authorized && (pf.retryable === true || pf.decision === "defer")) {
+        budget.lastRetryableDenyCode = pf.deny_code;
+        budget.lastRetryableMessage =
+          pf.message ??
+          `Weixin send preflight remained unavailable (${pf.deny_code}).`;
+      } else if (!pf.authorized && WEIXIN_ROTATION_DENY_CODES.has(pf.deny_code)) {
+        this.onWeixinAccountRotated?.({
+          accountId: accountId ?? null,
+          reason: pf.deny_code,
+        });
+      }
+
+      if (getRemainingBudgetMs() <= 0) {
+        throw buildDeadlineExceededError(
+          "Weixin preflight response arrived after shared delivery deadline.",
+        );
+      }
+
+      if (pf.authorized) {
+        return pf;
+      }
+      if (pf.deny_code === "source_generation_unknown") {
+        throw new ChannelDeliveryError(
+          pf.message ?? "Weixin delivery source generation is unknown.",
+          {
+            outcome: "unknown",
+            code: "unavailable",
+            retryable: false,
+            denyCode: pf.deny_code,
+          },
+        );
+      }
+      if (pf.retryable === true || pf.decision === "defer") {
+        const remainingMs = getRemainingBudgetMs();
+        if (remainingMs <= 0) {
+          throw buildDeadlineExceededError(
+            budget.lastRetryableMessage ??
+              `Weixin send preflight remained unavailable (${pf.deny_code}).`,
+          );
+        }
+        const waitMs = Math.min(delayMs, remainingMs);
+        this.logger.warn(
+          "Data-task Weixin preflight returned retryable denial; retrying in delivery",
+          {
+            delivery_key: deliveryKey,
+            chunk_index: chunkIndex,
+            attempt,
+            delay_ms: waitMs,
+            error_code: sanitizeLogErrorCode(pf.deny_code),
+          },
+        );
+        const slept = await this.retryDelayFn(waitMs, combinedSignal);
+        budget.virtualElapsedMs += waitMs;
+        if (!slept) {
+          throwIfAbortedOrLeaseLost();
+          throw new ChannelDeliveryError("Weixin preflight aborted", {
+            outcome: "failed",
+            code: "unavailable",
+            retryable: false,
+          });
+        }
+        throwIfAbortedOrLeaseLost();
+        delayMs = Math.min(delayMs * 2, WEIXIN_PREFLIGHT_RETRY_MAX_DELAY_MS);
+        continue;
+      }
+      throw new ChannelDeliveryError(
+        pf.message ?? `Weixin send denied (${pf.deny_code}).`,
+        {
+          outcome: "failed",
+          code: "not_allowed",
+          retryable: false,
+          denyCode: pf.deny_code,
+        },
+      );
+    }
   }
 
   private isAdapterOutboundReady(adapter: ChannelAdapter | undefined): boolean {
@@ -406,7 +802,13 @@ export class DataTaskNotificationService {
 
   private async recordValidatedDeliveryProgress(
     req: I7DeliveriesProgressRequest,
+    platform?: ChannelPlatform,
   ): Promise<I7DeliveriesProgressResponse> {
+    if (this.leaseLost) {
+      throw new StaleGatewayEpochError(
+        "Gateway lease lost before data-task I-7 settlement",
+      );
+    }
     const expectedStatus = req.status ?? "in_flight";
     if (!RECOGNIZED_DELIVERY_STATUSES.has(expectedStatus)) {
       throw new DataTaskBackendAckError(
@@ -415,8 +817,13 @@ export class DataTaskNotificationService {
     }
     let rawAck: unknown;
     try {
-      rawAck = await this.backend.updateDeliveryProgress(req);
+      rawAck = await this.backend.updateDeliveryProgress(req, {
+        platform: platform ?? null,
+      });
     } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        throw err;
+      }
       throw new DataTaskBackendAckError(
         safeBackendErrorMessage(
           err,
@@ -649,6 +1056,9 @@ export class DataTaskNotificationService {
         },
       };
     } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        throw err;
+      }
       const isUncertain = tracker.claimedAnyItem || tracker.itemsSent > 0;
       const msg = safeBackendErrorMessage(
         err,
@@ -689,6 +1099,23 @@ export class DataTaskNotificationService {
     tracker: ExecutionStateTracker,
     options?: AuthorizedPlanDeliveryOptions,
   ): Promise<{ status: number; data: DataTaskNotificationResponse }> {
+    if (this.startupBlocked) {
+      return {
+        status: 200,
+        data: {
+          ok: false,
+          status: "failed",
+          code: "unavailable",
+          message: "Gateway startup recovery is still in progress.",
+          run_id: runId,
+          target,
+          platform: null,
+          items_total: 0,
+          items_sent: 0,
+          items: [],
+        },
+      };
+    }
     const claimKind = options?.claimKind ?? "data_task";
     const liveCheckPurpose =
       options?.liveCheckPurpose ?? "data_task_notification";
@@ -955,7 +1382,7 @@ export class DataTaskNotificationService {
       tracker.claimedAnyItem = true;
       let rawClaim: unknown;
       try {
-        rawClaim = await this.backend.authorizeAndClaimDelivery({
+        rawClaim = await this.claimDeliveryWith503Retry({
           delivery_key: item.delivery_key,
           kind: claimKind,
           run_id: plan.run_id ?? runId,
@@ -965,6 +1392,9 @@ export class DataTaskNotificationService {
           total_chunks: totalChunks,
         });
       } catch (claimErr) {
+        if (isStaleGatewayEpochError(claimErr)) {
+          throw claimErr;
+        }
         const cMsg = safeBackendErrorMessage(
           claimErr,
           "I-6 authorize-and-claim request failed without a confirmed response.",
@@ -1099,6 +1529,12 @@ export class DataTaskNotificationService {
       if (validatedClaim.kind === "denied") {
         tracker.claimedAnyItem = hadPriorClaim;
         const denyCode = validatedClaim.code;
+        if (WEIXIN_ROTATION_DENY_CODES.has(denyCode)) {
+          this.onWeixinAccountRotated?.({
+            accountId: null,
+            reason: denyCode,
+          });
+        }
         itemOutcomes.push({
           item_index: item.item_index,
           delivery_key: item.delivery_key,
@@ -1136,6 +1572,10 @@ export class DataTaskNotificationService {
       const recipientId = validatedClaim.recipientId;
       const recipientPlatformUserId =
         plan.target_kind === "dm" ? recipientId : undefined;
+      // R6 #3 (Grok Medium): Each claimed item delivery in the plan gets its own
+      // independent Weixin preflight deadline budget (all chunks + attachment of this item).
+      const weixinPreflightBudget =
+        platform === "weixin" ? this.createWeixinPreflightBudget() : null;
 
       // Safety fallback if `existing_status` was stale and `claim` transitioned to `claimed`.
       if (plan.target_kind === "group" && !groupLiveVerified) {
@@ -1149,14 +1589,17 @@ export class DataTaskNotificationService {
           const denyMsg =
             liveCheck.message ?? `Group target ${targetAddress} is no longer accessible.`;
           try {
-            await this.recordValidatedDeliveryProgress({
-              delivery_key: item.delivery_key,
-              sent_chunks: 0,
-              total_chunks: totalChunks,
-              status: "failed",
-              error_code: failCode,
-              error_message: denyMsg,
-            });
+            await this.recordValidatedDeliveryProgress(
+              {
+                delivery_key: item.delivery_key,
+                sent_chunks: 0,
+                total_chunks: totalChunks,
+                status: "failed",
+                error_code: failCode,
+                error_message: denyMsg,
+              },
+              platform,
+            );
           } catch (progressErr) {
             const pMsg = safeBackendErrorMessage(
               progressErr,
@@ -1238,14 +1681,17 @@ export class DataTaskNotificationService {
             "Card image artifact validation failed.",
           );
           try {
-            await this.recordValidatedDeliveryProgress({
-              delivery_key: item.delivery_key,
-              sent_chunks: 0,
-              total_chunks: 1,
-              status: "failed",
-              error_code: "artifact_invalid",
-              error_message: artMsg,
-            });
+            await this.recordValidatedDeliveryProgress(
+              {
+                delivery_key: item.delivery_key,
+                sent_chunks: 0,
+                total_chunks: 1,
+                status: "failed",
+                error_code: "artifact_invalid",
+                error_message: artMsg,
+              },
+              platform,
+            );
           } catch (progressErr) {
             const pMsg = safeBackendErrorMessage(
               progressErr,
@@ -1315,18 +1761,21 @@ export class DataTaskNotificationService {
             reason: null,
           }));
           try {
-            await this.recordValidatedDeliveryProgress({
-              delivery_key: item.delivery_key,
-              sent_chunks: 1,
-              total_chunks: 1,
-              platform_message_ids: [sendRes.messageId],
-              files_status: filesStatus,
-              status: "sent",
-              first_response_json: {
-                status: "sent",
+            await this.recordValidatedDeliveryProgress(
+              {
+                delivery_key: item.delivery_key,
+                sent_chunks: 1,
+                total_chunks: 1,
                 platform_message_ids: [sendRes.messageId],
+                files_status: filesStatus,
+                status: "sent",
+                first_response_json: {
+                  status: "sent",
+                  platform_message_ids: [sendRes.messageId],
+                },
               },
-            });
+              platform,
+            );
           } catch (progressErr) {
             const pMsg = safeBackendErrorMessage(
               progressErr,
@@ -1374,14 +1823,17 @@ export class DataTaskNotificationService {
           const itemStatus =
             classified.outcome === "unknown" ? "unknown" : "failed";
           try {
-            await this.recordValidatedDeliveryProgress({
-              delivery_key: item.delivery_key,
-              sent_chunks: 0,
-              total_chunks: 1,
-              status: itemStatus,
-              error_code: classified.code,
-              error_message: classified.message,
-            });
+            await this.recordValidatedDeliveryProgress(
+              {
+                delivery_key: item.delivery_key,
+                sent_chunks: 0,
+                total_chunks: 1,
+                status: itemStatus,
+                error_code: classified.code,
+                error_message: classified.message,
+              },
+              platform,
+            );
           } catch {
             // Row remains 'in_flight' in dalton_channel_deliveries (safe uncertain state)
             itemOutcomes.push({
@@ -1454,15 +1906,21 @@ export class DataTaskNotificationService {
             "Attachment artifact validation failed.",
           );
           try {
-            await this.recordValidatedDeliveryProgress({
-              delivery_key: item.delivery_key,
-              sent_chunks: 0,
-              total_chunks: totalChunks,
-              status: "failed",
-              error_code: "artifact_invalid",
-              error_message: artMsg,
-            });
+            await this.recordValidatedDeliveryProgress(
+              {
+                delivery_key: item.delivery_key,
+                sent_chunks: 0,
+                total_chunks: totalChunks,
+                status: "failed",
+                error_code: "artifact_invalid",
+                error_message: artMsg,
+              },
+              platform,
+            );
           } catch (progressErr) {
+            if (isStaleGatewayEpochError(progressErr)) {
+              throw progressErr;
+            }
             const pMsg = safeBackendErrorMessage(
               progressErr,
               "Failed to record attachment validation failure progress.",
@@ -1523,7 +1981,7 @@ export class DataTaskNotificationService {
       let sentChunks = 0;
       const filesStatus: Array<{
         path: string;
-        status: "sent" | "linked" | "failed";
+        status: "sent" | "linked" | "failed" | "unknown";
         reason: string | null;
       }> = [];
       const sendTextWithFile = readyAdapter.sendTextWithFile?.bind(readyAdapter);
@@ -1536,6 +1994,24 @@ export class DataTaskNotificationService {
         typeof sendTextWithFile === "function" &&
         textChunks.length > 0;
       let fileAttachedToText = false;
+
+      const runWithWeixinSignal = async <T>(
+        fn: (ctx: {
+          signal?: AbortSignal;
+          attachAccount: (id: string | null | undefined) => void;
+        }) => Promise<T>,
+      ): Promise<T> => {
+        if (
+          platform === "weixin" &&
+          typeof readyAdapter.runWithAccountOperationSignal === "function"
+        ) {
+          return readyAdapter.runWithAccountOperationSignal(
+            validatedClaim.weixinAccountId,
+            fn,
+          );
+        }
+        return fn({ signal: undefined, attachAccount: () => undefined });
+      };
 
       for (let i = 0; i < textChunks.length; i += 1) {
         let chunkRes: { messageId: string };
@@ -1575,34 +2051,97 @@ export class DataTaskNotificationService {
               text: textChunks[i]!,
             });
           } else {
-            chunkRes = await readyAdapter.sendTextChunk({
-              targetAddress,
-              recipientPlatformUserId,
-              text: textChunks[i]!,
-              chunkIndex: i,
-              totalChunks: textChunks.length,
-            });
+            const effectiveWeixinAttempt = validatedClaim.deliveryAttempt ?? 1;
+            chunkRes = await runWithWeixinSignal(
+              async ({ signal, attachAccount }) => {
+                let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
+                if (platform === "weixin") {
+                  weixinPreflight = await this.runWeixinPreflight(
+                    item.delivery_key,
+                    effectiveWeixinAttempt,
+                    i,
+                    weixinPreflightBudget!,
+                    signal,
+                    validatedClaim.weixinAccountId,
+                  );
+                  attachAccount(weixinPreflight.account_id);
+                  if (this.leaseLost) {
+                    throw new StaleGatewayEpochError(
+                      "Gateway lease lost before data-task Weixin text send",
+                    );
+                  }
+                  if (signal?.aborted) {
+                    throw new ChannelDeliveryError("Weixin text send aborted", {
+                      outcome: "failed",
+                      code: "unavailable",
+                    });
+                  }
+                }
+                return readyAdapter.sendTextChunk({
+                  targetAddress,
+                  recipientPlatformUserId:
+                    weixinPreflight?.recipient_id ?? recipientPlatformUserId,
+                  text: textChunks[i]!,
+                  chunkIndex: i,
+                  totalChunks: textChunks.length,
+                  deliveryKey: item.delivery_key,
+                  deliveryAttempt: effectiveWeixinAttempt,
+                  weixinPreflight,
+                  weixinAccountId:
+                    weixinPreflight?.account_id ??
+                    validatedClaim.weixinAccountId,
+                  weixinContextToken:
+                    weixinPreflight?.weixin_context_token ??
+                    validatedClaim.weixinContextToken,
+                  signal,
+                });
+              },
+            );
           }
         } catch (chunkErr) {
+          if (isStaleGatewayEpochError(chunkErr) || this.leaseLost) {
+            throw isStaleGatewayEpochError(chunkErr)
+              ? chunkErr
+              : new StaleGatewayEpochError(
+                  "Gateway lease lost during data-task chunk delivery",
+                  { cause: chunkErr },
+                );
+          }
           const classified = classifyAdapterError(chunkErr);
-          const anySent = sentChunks > 0;
-          const itemStatus: "partial" | "unknown" | "failed" = anySent
-            ? "partial"
-            : classified.outcome === "unknown"
-              ? "unknown"
-              : "failed";
-          const overallStatus = itemStatus === "failed" ? "failed" : "unknown";
+          const anySent = sentChunks > 0 || filesStatus.length > 0;
+          // `unknown` overrides `partial` ONLY on Weixin; Feishu & Discord keep original `partial`.
+          const itemStatus: "partial" | "unknown" | "failed" =
+            classified.outcome === "unknown"
+              ? platform === "weixin" || !anySent
+                ? "unknown"
+                : "partial"
+              : anySent
+                ? "partial"
+                : "failed";
+          const recordedErrorCode = classified.denyCode ?? classified.code;
+          const overallStatus: DataTaskNotificationResponse["status"] =
+            itemStatus === "failed" ? "failed" : "unknown";
           try {
-            await this.recordValidatedDeliveryProgress({
-              delivery_key: item.delivery_key,
-              sent_chunks: sentChunks,
-              total_chunks: totalChunks,
-              platform_message_ids: [...messageIds],
-              status: itemStatus,
-              error_code: classified.code,
-              error_message: classified.message,
-            });
-          } catch {
+            await this.recordValidatedDeliveryProgress(
+              {
+                delivery_key: item.delivery_key,
+                sent_chunks: sentChunks,
+                total_chunks: totalChunks,
+                platform_message_ids: [...messageIds],
+                ...(filesStatus.length > 0 ? { files_status: [...filesStatus] } : {}),
+                status: itemStatus,
+                error_code: recordedErrorCode,
+                ...(platform === "weixin" && classified.errorDetail
+                  ? { error_detail: classified.errorDetail }
+                  : {}),
+                error_message: classified.message,
+              },
+              platform,
+            );
+          } catch (progressErr) {
+            if (isStaleGatewayEpochError(progressErr)) {
+              throw progressErr;
+            }
             itemOutcomes.push({
               item_index: item.item_index,
               delivery_key: item.delivery_key,
@@ -1634,7 +2173,7 @@ export class DataTaskNotificationService {
             status: itemStatus,
             duplicate: false,
             platform_message_ids: [...messageIds],
-            code: classified.code,
+            code: itemStatus === "partial" ? "partial" : recordedErrorCode,
             message: classified.message,
           });
           return {
@@ -1642,7 +2181,7 @@ export class DataTaskNotificationService {
             data: {
               ok: false,
               status: overallStatus,
-              code: itemStatus === "partial" ? "partial" : classified.code,
+              code: itemStatus === "partial" ? "partial" : recordedErrorCode,
               message: classified.message,
               run_id: runId,
               target,
@@ -1657,13 +2196,19 @@ export class DataTaskNotificationService {
         sentChunks += 1;
         messageIds.push(chunkRes.messageId);
         try {
-          await this.recordValidatedDeliveryProgress({
-            delivery_key: item.delivery_key,
-            sent_chunks: sentChunks,
-            total_chunks: totalChunks,
-            platform_message_ids: [...messageIds],
-          });
+          await this.recordValidatedDeliveryProgress(
+            {
+              delivery_key: item.delivery_key,
+              sent_chunks: sentChunks,
+              total_chunks: totalChunks,
+              platform_message_ids: [...messageIds],
+            },
+            platform,
+          );
         } catch (progressErr) {
+          if (isStaleGatewayEpochError(progressErr)) {
+            throw progressErr;
+          }
           const pMsg = safeBackendErrorMessage(
             progressErr,
             "I-7 chunk progress acknowledgement failed after platform send; state is uncertain.",
@@ -1697,14 +2242,67 @@ export class DataTaskNotificationService {
 
       if (item.kind === "text_and_file" && verifiedAttachment && !fileAttachedToText) {
         try {
-          const fileRes = await readyAdapter.sendFile({
-            targetAddress,
-            recipientPlatformUserId,
-            path: verifiedAttachment.filename,
-            filename: verifiedAttachment.filename,
-            content: verifiedAttachment.content,
-            mimeType: verifiedAttachment.mimeType,
-          });
+          const effectiveWeixinAttempt = validatedClaim.deliveryAttempt ?? 1;
+          const fileChunkIndex = textChunks.length;
+          const fileRes = await runWithWeixinSignal(
+            async ({ signal, attachAccount }) => {
+              let weixinPreflight: WeixinPreflightAuthorizedData | null = null;
+              if (platform === "weixin") {
+                weixinPreflight = await this.runWeixinPreflight(
+                  item.delivery_key,
+                  effectiveWeixinAttempt,
+                  fileChunkIndex,
+                  weixinPreflightBudget!,
+                  signal,
+                  validatedClaim.weixinAccountId,
+                );
+                attachAccount(weixinPreflight.account_id);
+                if (this.leaseLost) {
+                  throw new StaleGatewayEpochError(
+                    "Gateway lease lost before data-task Weixin file send",
+                  );
+                }
+                if (signal?.aborted) {
+                  throw new ChannelDeliveryError("Weixin file send aborted", {
+                    outcome: "failed",
+                    code: "unavailable",
+                  });
+                }
+              }
+              return readyAdapter.sendFile({
+                targetAddress,
+                recipientPlatformUserId:
+                  weixinPreflight?.recipient_id ?? recipientPlatformUserId,
+                path: verifiedAttachment.filename,
+                filename: verifiedAttachment.filename,
+                content: verifiedAttachment.content,
+                mimeType: verifiedAttachment.mimeType,
+                deliveryKey: item.delivery_key,
+                deliveryAttempt: effectiveWeixinAttempt,
+                weixinPreflight,
+                weixinAccountId:
+                  weixinPreflight?.account_id ??
+                  validatedClaim.weixinAccountId,
+                weixinContextToken:
+                  weixinPreflight?.weixin_context_token ??
+                  validatedClaim.weixinContextToken,
+                signal,
+                refreshWeixinPreflight:
+                  platform === "weixin"
+                    ? () =>
+                        this.runWeixinPreflight(
+                          item.delivery_key,
+                          effectiveWeixinAttempt,
+                          fileChunkIndex,
+                          weixinPreflightBudget!,
+                          signal,
+                          weixinPreflight?.account_id ??
+                            validatedClaim.weixinAccountId,
+                        )
+                    : undefined,
+              });
+            },
+          );
           if (fileRes.status !== "sent") {
             const substMsg =
               fileRes.reason ??
@@ -1717,17 +2315,23 @@ export class DataTaskNotificationService {
               reason: substMsg,
             });
             try {
-              await this.recordValidatedDeliveryProgress({
-                delivery_key: item.delivery_key,
-                sent_chunks: sentChunks,
-                total_chunks: totalChunks,
-                platform_message_ids: [...messageIds],
-                files_status: filesStatus,
-                status: itemStatus,
-                error_code: "file_not_sent",
-                error_message: substMsg,
-              });
+              await this.recordValidatedDeliveryProgress(
+                {
+                  delivery_key: item.delivery_key,
+                  sent_chunks: sentChunks,
+                  total_chunks: totalChunks,
+                  platform_message_ids: [...messageIds],
+                  files_status: filesStatus,
+                  status: itemStatus,
+                  error_code: "file_not_sent",
+                  error_message: substMsg,
+                },
+                platform,
+              );
             } catch (progressErr) {
+              if (isStaleGatewayEpochError(progressErr)) {
+                throw progressErr;
+              }
               const pMsg = safeBackendErrorMessage(
                 progressErr,
                 "Failed to record file delivery failure progress; state is uncertain.",
@@ -1789,30 +2393,54 @@ export class DataTaskNotificationService {
             reason: null,
           });
         } catch (fileErr) {
+          if (isStaleGatewayEpochError(fileErr) || this.leaseLost) {
+            throw isStaleGatewayEpochError(fileErr)
+              ? fileErr
+              : new StaleGatewayEpochError(
+                  "Gateway lease lost during data-task file delivery",
+                  { cause: fileErr },
+                );
+          }
           const classified = classifyAdapterError(fileErr);
-          const anySent = sentChunks > 0;
-          const itemStatus: "partial" | "unknown" | "failed" = anySent
-            ? "partial"
-            : classified.outcome === "unknown"
-              ? "unknown"
-              : "failed";
+          const anySent = sentChunks > 0 || filesStatus.length > 0;
+          // `unknown` overrides `partial` ONLY on Weixin; Feishu & Discord keep original `partial`.
+          const itemStatus: "partial" | "unknown" | "failed" =
+            classified.outcome === "unknown"
+              ? platform === "weixin" || !anySent
+                ? "unknown"
+                : "partial"
+              : anySent
+                ? "partial"
+                : "failed";
+          const recordedErrorCode = classified.denyCode ?? classified.code;
           filesStatus.push({
             path: verifiedAttachment.filename,
-            status: "failed",
+            status: classified.outcome === "unknown" ? "unknown" : "failed",
             reason: classified.message,
           });
+          const overallStatus: DataTaskNotificationResponse["status"] =
+            itemStatus === "failed" ? "failed" : "unknown";
           try {
-            await this.recordValidatedDeliveryProgress({
-              delivery_key: item.delivery_key,
-              sent_chunks: sentChunks,
-              total_chunks: totalChunks,
-              platform_message_ids: [...messageIds],
-              files_status: filesStatus,
-              status: itemStatus,
-              error_code: classified.code,
-              error_message: classified.message,
-            });
-          } catch {
+            await this.recordValidatedDeliveryProgress(
+              {
+                delivery_key: item.delivery_key,
+                sent_chunks: sentChunks,
+                total_chunks: totalChunks,
+                platform_message_ids: [...messageIds],
+                files_status: filesStatus,
+                status: itemStatus,
+                error_code: recordedErrorCode,
+                ...(platform === "weixin" && classified.errorDetail
+                  ? { error_detail: classified.errorDetail }
+                  : {}),
+                error_message: classified.message,
+              },
+              platform,
+            );
+          } catch (progressErr) {
+            if (isStaleGatewayEpochError(progressErr)) {
+              throw progressErr;
+            }
             itemOutcomes.push({
               item_index: item.item_index,
               delivery_key: item.delivery_key,
@@ -1844,15 +2472,15 @@ export class DataTaskNotificationService {
             status: itemStatus,
             duplicate: false,
             platform_message_ids: [...messageIds],
-            code: itemStatus === "partial" ? "partial" : classified.code,
+            code: itemStatus === "partial" ? "partial" : recordedErrorCode,
             message: classified.message,
           });
           return {
             status: 200,
             data: {
               ok: false,
-              status: itemStatus === "failed" ? "failed" : "unknown",
-              code: itemStatus === "partial" ? "partial" : classified.code,
+              status: overallStatus,
+              code: itemStatus === "partial" ? "partial" : recordedErrorCode,
               message: classified.message,
               run_id: runId,
               target,
@@ -1866,19 +2494,25 @@ export class DataTaskNotificationService {
       }
 
       try {
-        await this.recordValidatedDeliveryProgress({
-          delivery_key: item.delivery_key,
-          sent_chunks: sentChunks,
-          total_chunks: totalChunks,
-          platform_message_ids: [...messageIds],
-          files_status: filesStatus,
-          status: "sent",
-          first_response_json: {
-            status: "sent",
+        await this.recordValidatedDeliveryProgress(
+          {
+            delivery_key: item.delivery_key,
+            sent_chunks: sentChunks,
+            total_chunks: totalChunks,
             platform_message_ids: [...messageIds],
+            files_status: filesStatus,
+            status: "sent",
+            first_response_json: {
+              status: "sent",
+              platform_message_ids: [...messageIds],
+            },
           },
-        });
+          platform,
+        );
       } catch (progressErr) {
+        if (isStaleGatewayEpochError(progressErr)) {
+          throw progressErr;
+        }
         const pMsg = safeBackendErrorMessage(
           progressErr,
           "I-7 progress acknowledgement failed after platform delivery; state is uncertain.",
