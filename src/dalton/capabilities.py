@@ -40,6 +40,51 @@ CORE_CAPABILITY: None = None
 _TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSY_VALUES = frozenset({"0", "false", "no", "off"})
 
+HOST_PLATFORM_MACOS = "macos"
+HOST_PLATFORM_LINUX = "linux"
+HOST_PLATFORM_UNKNOWN = "unknown"
+VALID_HOST_PLATFORMS: frozenset[str] = frozenset({HOST_PLATFORM_MACOS, HOST_PLATFORM_LINUX})
+
+
+def resolve_host_platform(
+    *,
+    profile: DeploymentProfile | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the deployment host platform (``macos`` | ``linux``) from ``DALTON_HOST_PLATFORM``.
+
+    Container ``sys.platform`` has zero influence on the result:
+    - Explicit ``DALTON_HOST_PLATFORM``: ``macos`` (or ``darwin``) -> ``"macos"``;
+      ``linux`` -> ``"linux"``; any unrecognized non-empty value logs a warning
+      and returns ``"unknown"`` (fail-closed for macOS-only capabilities).
+    - When unset or blank: ``DeploymentProfile.EVERFLOW`` defaults to ``"macos"``
+      and ``DeploymentProfile.CORE`` defaults to ``"linux"``.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get("DALTON_HOST_PLATFORM")
+    if raw is not None and raw.strip():
+        cleaned = raw.strip().lower()
+        if cleaned in (HOST_PLATFORM_MACOS, "darwin"):
+            return HOST_PLATFORM_MACOS
+        if cleaned == HOST_PLATFORM_LINUX:
+            return HOST_PLATFORM_LINUX
+        logger.warning(
+            "Unrecognized DALTON_HOST_PLATFORM=%r; treating host platform as %r (fail-closed for macOS-only capabilities).",
+            raw,
+            HOST_PLATFORM_UNKNOWN,
+        )
+        return HOST_PLATFORM_UNKNOWN
+
+    active_profile = (
+        resolve_profile(
+            app_env=env.get("APP_ENV", "") if environ is not None else None,
+            dalton_profile=env.get("DALTON_PROFILE", "") if environ is not None else None,
+        )
+        if profile is None
+        else profile
+    )
+    return HOST_PLATFORM_MACOS if active_profile is DeploymentProfile.EVERFLOW else HOST_PLATFORM_LINUX
+
 
 class CapabilityId(StrEnum):
     """Optional Dalton capabilities gated at deployment time."""
@@ -319,6 +364,7 @@ def effective_capabilities(
     data_jobs_enabled: bool | None = None,
     dalton_enabled: bool | None = None,
     transcription_storage_configured: bool | None = None,
+    host_platform: str | None = None,
 ) -> frozenset[CapabilityId]:
     """Compute the active capability set as a pure function (no module-level mutable cache).
 
@@ -421,6 +467,18 @@ def effective_capabilities(
             if any(not raw_state[dep] for dep in spec.depends_on):
                 raw_state[cap] = False
                 changed = True
+
+    if raw_state[CapabilityId.ALPHAENGINE]:
+        resolved_host_platform = (
+            resolve_host_platform(profile=active_profile, environ=env)
+            if host_platform is None
+            else resolve_host_platform(
+                profile=active_profile,
+                environ={"DALTON_HOST_PLATFORM": host_platform},
+            )
+        )
+        if resolved_host_platform != HOST_PLATFORM_MACOS:
+            raw_state[CapabilityId.ALPHAENGINE] = False
 
     if raw_state[CapabilityId.TRANSCRIPTION]:
         storage_ok = (
