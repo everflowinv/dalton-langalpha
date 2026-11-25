@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import create_autospec
+from zoneinfo import ZoneInfo
 
 import alembic.op as alembic_op
 import psycopg
@@ -124,8 +125,6 @@ def _sample_workspace(
         "config": {},
     }
 
-
-from zoneinfo import ZoneInfo
 
 _ORIG_GET_SHARING = dalton_sharing.get_workspace_sharing
 
@@ -981,9 +980,15 @@ class TestWebChannelEndpoints:
             "read_capped",
             create_autospec(ws_files_crud.read_capped, return_value=b"a,b,c\n1,2,3\n"),
         )
+        from starlette.requests import Request as StarletteRequest
+
+        plain_req = StarletteRequest(
+            {"type": "http", "method": "POST", "path": "/upload", "headers": []}
+        )
         res_up = await ws_files_crud.upload_workspace_file(
             ws["workspace_id"],
             x_user_id="u-chao",
+            request=plain_req,
             path="data/model.csv",
             file=fake_upload,
         )
@@ -994,6 +999,7 @@ class TestWebChannelEndpoints:
             await ws_files_crud.upload_workspace_file(
                 ws["workspace_id"],
                 x_user_id="u-chao",
+                request=plain_req,
                 path="notes/symlink_skill.md",
                 file=fake_upload,
             )

@@ -924,23 +924,43 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("router.py", "dalton_notify_test_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("router.py", "global_search_endpoint"): CORE_CAPABILITY,
         # --- channels_router.py ---
+        ("channels_router.py", "internal_gateway_lease_acquire_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_gateway_lease_heartbeat_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_gateway_lease_release_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_inbound_register_and_resolve_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_bind_code_consume_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_session_command_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_state_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_settings_put_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_deliveries_authorize_and_claim_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_deliveries_preflight_send_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_deliveries_progress_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_inbound_progress_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_steers_reconcile_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_recover_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_automation_runs_register_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_automation_runs_finish_endpoint"): CapabilityId.CHANNEL_GATEWAY,
-        ("channels_router.py", "internal_weixin_state_get_endpoint"): (
+        ("channels_router.py", "internal_weixin_accounts_reconcile_endpoint"): (
             CapabilityId.CHANNEL_GATEWAY,
             CapabilityId.CHANNEL_WEIXIN,
         ),
-        ("channels_router.py", "internal_weixin_state_put_endpoint"): (
+        ("channels_router.py", "internal_weixin_account_detail_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "internal_weixin_account_cursor_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "internal_weixin_account_status_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "internal_weixin_login_session_get_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "internal_weixin_login_session_patch_endpoint"): (
             CapabilityId.CHANNEL_GATEWAY,
             CapabilityId.CHANNEL_WEIXIN,
         ),
@@ -961,6 +981,22 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
             CapabilityId.CHANNEL_WEIXIN,
         ),
         ("channels_router.py", "web_weixin_qrcode_verify_code_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "web_weixin_admin_overview_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "web_weixin_admin_config_put_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "web_weixin_admin_delete_account_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "web_weixin_admin_delete_user_weixin_endpoint"): (
             CapabilityId.CHANNEL_GATEWAY,
             CapabilityId.CHANNEL_WEIXIN,
         ),

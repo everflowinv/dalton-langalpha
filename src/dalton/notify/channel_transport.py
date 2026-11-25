@@ -27,6 +27,24 @@ logger = logging.getLogger(__name__)
 DATA_TASK_GATEWAY_PATH = "/internal/data-task-notifications"
 AUTOMATION_GATEWAY_PATH = "/internal/automation-notifications"
 
+# Shared preflight-retry budget contract (§3.1 / weixin-gateway-contract.md):
+# Gateway retries transient Weixin preflight `roster_lookup_error` (HTTP 503)
+# in-process within a 180s total deadline per delivery; backend callers wait
+# strictly longer (240s floor) so they do not time out prematurely into `unknown`.
+WEIXIN_PREFLIGHT_RETRY_BUDGET_SECONDS = 180
+GATEWAY_DELIVERY_READ_TIMEOUT_S = 240.0
+
+
+def resolve_gateway_delivery_read_timeout_s(timeout_s: float | None = None) -> float:
+    """Return a gateway HTTP read timeout strictly above the Weixin preflight retry ceiling."""
+    default_s = max(
+        GATEWAY_DELIVERY_READ_TIMEOUT_S,
+        float(get_notify_http_timeout_s()) * 2.5,
+    )
+    if timeout_s is None:
+        return default_s
+    return max(GATEWAY_DELIVERY_READ_TIMEOUT_S, float(timeout_s))
+
 UNCERTAIN_NOTIFY_ERROR_CODES: frozenset[str] = frozenset(
     {
         "delivery_uncertain",
@@ -170,11 +188,7 @@ async def dispatch_data_task_target_via_gateway(
             ],
         }
 
-    eff_timeout_s = (
-        max(1.0, float(timeout_s))
-        if timeout_s is not None
-        else max(45.0, get_notify_http_timeout_s() * 2.5)
-    )
+    eff_timeout_s = resolve_gateway_delivery_read_timeout_s(timeout_s)
     req_timeout = httpx.Timeout(eff_timeout_s, connect=min(5.0, eff_timeout_s))
     endpoint = f"{eff_base}{DATA_TASK_GATEWAY_PATH}"
     headers = {
@@ -521,11 +535,7 @@ async def post_automation_gateway_notify(
             status_code=503,
         )
 
-    eff_timeout_s = (
-        max(1.0, float(timeout_s))
-        if timeout_s is not None
-        else max(45.0, get_notify_http_timeout_s() * 2.5)
-    )
+    eff_timeout_s = resolve_gateway_delivery_read_timeout_s(timeout_s)
     req_timeout = httpx.Timeout(eff_timeout_s, connect=min(5.0, eff_timeout_s))
     endpoint = f"{eff_base}{AUTOMATION_GATEWAY_PATH}"
     headers = {
