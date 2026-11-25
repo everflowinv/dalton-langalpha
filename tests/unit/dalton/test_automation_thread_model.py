@@ -735,9 +735,9 @@ async def test_request_with_explicit_llm_model_is_unchanged():
             )
             assert resp.status_code == 200
 
-    assert st.resolve.await_args.args[2] == "explicit-model"
-    st.get_running.assert_not_awaited()
-    st.first_turn.assert_not_awaited()
+    # Round 8 Decision 1: continuation turns linked to a running execution use the
+    # execution's model snapshot, ignoring request.llm_model.
+    assert st.resolve.await_args.args[2] == "gpt-6.1-sol-oauth"
 
 
 @pytest.mark.asyncio

@@ -3,7 +3,13 @@ import type { Dispatch, SetStateAction } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useToast } from './use-toast';
 
-export const speechSupported = typeof window !== 'undefined' && !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+// DALTON-HOOK(mobile-web): check Web Speech API availability at runtime so environments without SpeechRecognition hide the voice button
+export function isSpeechRecognitionSupported(): boolean {
+  if (typeof window === 'undefined') return false;
+  return Boolean(window.SpeechRecognition || window.webkitSpeechRecognition);
+}
+
+export const speechSupported = isSpeechRecognitionSupported();
 
 /** Voice input (Web Speech API) for the chat composer: appends interim +
  * final transcripts onto the message, stops when a turn starts loading and

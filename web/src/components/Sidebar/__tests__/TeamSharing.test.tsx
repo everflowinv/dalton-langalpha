@@ -2084,4 +2084,78 @@ describe('Dalton Team Sharing', () => {
     expect(screen.queryByRole('menu')).toBeNull();
     unmountWsColleague();
   });
+
+  it('gates TeamWorkspacesSection visibility on colleague_sharing capability while keeping /workspaces/team query timing unchanged', async () => {
+    const neutralTeamResp: TeamWorkspacesResponse = {
+      members: [],
+      caller_tier: 'internal',
+      colleague_dispatch_enabled: false,
+    };
+
+    // 1. Core profile: capabilities loaded without colleague_sharing + neutral 200 -> section hidden, query still sent.
+    mockApiGet.mockReset();
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/v1/dalton/workspaces/team') {
+        return Promise.resolve({ data: neutralTeamResp });
+      }
+      return Promise.resolve({ data: { profile: 'core', capabilities: [] } });
+    });
+    const coreClient = createTestQueryClient();
+    coreClient.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'core',
+      capabilities: [],
+      ticker_logos: false,
+    });
+    const coreView = renderWithProviders(<TeamWorkspacesSection currentWorkspaceId={null} />, {
+      queryClient: coreClient,
+    });
+    await waitFor(() => {
+      expect(mockApiGet).toHaveBeenCalledWith('/api/v1/dalton/workspaces/team');
+    });
+    await waitFor(() => {
+      expect(coreClient.getQueryData(queryKeys.workspaces.team())).toEqual(neutralTeamResp);
+    });
+    expect(screen.queryByTestId('team-workspaces-section')).toBeNull();
+    coreView.unmount();
+
+    // 2. Capabilities include colleague_sharing -> section renders normally, query sent.
+    mockApiGet.mockClear();
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/v1/dalton/workspaces/team') {
+        return Promise.resolve({ data: SAMPLE_TEAM_RESPONSE });
+      }
+      return Promise.resolve({ data: { profile: 'everflow', capabilities: ['colleague_sharing'] } });
+    });
+    const enabledClient = createTestQueryClient();
+    enabledClient.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'everflow',
+      capabilities: ['colleague_sharing'],
+      ticker_logos: true,
+    });
+    const enabledView = renderWithProviders(<TeamWorkspacesSection currentWorkspaceId={null} />, {
+      queryClient: enabledClient,
+    });
+    expect(await screen.findByTestId('team-workspaces-section')).toBeInTheDocument();
+    expect(mockApiGet).toHaveBeenCalledWith('/api/v1/dalton/workspaces/team');
+    enabledView.unmount();
+
+    // 3. Everflow build with capabilities still pending -> section renders normally on first paint, query sent.
+    mockApiGet.mockClear();
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/v1/dalton/capabilities') {
+        return new Promise(() => {});
+      }
+      if (url === '/api/v1/dalton/workspaces/team') {
+        return Promise.resolve({ data: SAMPLE_TEAM_RESPONSE });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    const pendingClient = createTestQueryClient();
+    const pendingView = renderWithProviders(<TeamWorkspacesSection currentWorkspaceId={null} />, {
+      queryClient: pendingClient,
+    });
+    expect(await screen.findByTestId('team-workspaces-section')).toBeInTheDocument();
+    expect(mockApiGet).toHaveBeenCalledWith('/api/v1/dalton/workspaces/team');
+    pendingView.unmount();
+  });
 });

@@ -868,39 +868,57 @@ async def load_bound_dm_targets(
     *,
     conn: Any = None,
 ) -> set[str]:
-    """Return canonical DM targets bound to ``user_id`` in ``dalton_channel_identities``."""
+    """Return canonical DM targets bound to ``user_id`` (new table for Weixin, identities for others)."""
     cleaned_uid = str(user_id or "").strip()
     if not cleaned_uid:
         return set()
     from psycopg.rows import dict_row
+    from src.dalton.capabilities import CapabilityId, has_capability
     from src.server.database.pool import get_db_connection
+
+    wx_enabled = has_capability(CapabilityId.CHANNEL_WEIXIN)
+
+    async def _query_rows(db_conn: Any) -> list[Any]:
+        out_rows: list[Any] = []
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT platform, platform_user_id
+                FROM dalton_channel_identities
+                WHERE user_id = %s AND platform <> 'weixin'
+                """,
+                (cleaned_uid,),
+            )
+            fetched = await cur.fetchall()
+            if isinstance(fetched, list):
+                out_rows.extend(fetched)
+            if wx_enabled:
+                try:
+                    await cur.execute(
+                        """
+                        SELECT 'weixin' AS platform, ilink_user_id AS platform_user_id
+                        FROM dalton_channel_weixin_accounts
+                        WHERE user_id = %s
+                          AND status = 'active'
+                          AND ilink_user_id IS NOT NULL
+                        """,
+                        (cleaned_uid,),
+                    )
+                    wx_fetched = await cur.fetchall()
+                    if isinstance(wx_fetched, list):
+                        out_rows.extend(wx_fetched)
+                except Exception:
+                    pass
+        return out_rows
 
     try:
         if conn is not None:
             if not callable(getattr(conn, "cursor", None)):
                 return set()
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT platform, platform_user_id
-                    FROM dalton_channel_identities
-                    WHERE user_id = %s
-                    """,
-                    (cleaned_uid,),
-                )
-                rows = await cur.fetchall()
+            rows = await _query_rows(conn)
         else:
             async with get_db_connection() as owned_conn:
-                async with owned_conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(
-                        """
-                        SELECT platform, platform_user_id
-                        FROM dalton_channel_identities
-                        WHERE user_id = %s
-                        """,
-                        (cleaned_uid,),
-                    )
-                    rows = await cur.fetchall()
+                rows = await _query_rows(owned_conn)
     except Exception:
         return set()
 
@@ -912,6 +930,8 @@ async def load_bound_dm_targets(
             continue
         plat = str(row.get("platform") or "").strip().lower()
         puid = str(row.get("platform_user_id") or "").strip()
+        if plat == "weixin" and not wx_enabled:
+            continue
         if plat in {"feishu", "discord", "weixin"} and puid:
             bound.add(f"{plat}:user:{puid}")
     return bound

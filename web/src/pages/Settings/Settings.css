@@ -506,3 +506,21 @@ label.settings-row-label { cursor: pointer; }
   .settings-row { min-height: 48px; padding: 9px 12px; }
   .settings-card-body { padding: 12px; }
 }
+
+/* DALTON-HOOK(mobile-web): drop desktop scrollbar gutter reservation, raise pill height on phone viewports, and pad .settings-rail-nav so overflow-x: auto does not clip 44px touch targets */
+@media (max-width: 767px) {
+  .settings-scroll { scrollbar-gutter: auto; }
+  .settings-rail .page-rail-link { height: 34px; }
+}
+
+@media (max-width: 767px), (pointer: coarse) {
+  .settings-rail-nav {
+    min-height: 44px;
+    padding-top: 5px;
+    padding-bottom: 5px;
+  }
+  .settings-search-toggle {
+    --tap-target-w: 36px;
+    --tap-target-h: 44px;
+  }
+}

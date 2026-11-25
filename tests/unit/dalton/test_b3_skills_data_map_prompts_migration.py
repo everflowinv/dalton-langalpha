@@ -96,6 +96,7 @@ EXPLICIT_PROPRIETARY_SKILLS: frozenset[str] = frozenset(
 _CLEAR_ENV_VARS: tuple[str, ...] = (
     "APP_ENV",
     "DALTON_PROFILE",
+    "DALTON_HOST_PLATFORM",
     "DALTON_ENABLED",
     "DALTON_RESEARCHDATA_URL",
     "DALTON_BRIDGE_URL",
@@ -677,6 +678,7 @@ class TestDataMapD046AndFiltering:
         assert "未接直连，切勿以为已核查。" in rendered_static
 
         # Partial capability: bridge + alphaengine only -> alt_data names ONLY alphaengine
+        monkeypatch.setenv("DALTON_HOST_PLATFORM", "macos")
         monkeypatch.setenv("DALTON_CAP_RESEARCHDATA_BRIDGE", "true")
         monkeypatch.setenv("DALTON_CAP_ALPHAENGINE", "true")
         partial_routes = [r["id"] for r in map_builder.merge_catalog_routes(catalog_routes=None)]

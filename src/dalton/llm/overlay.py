@@ -63,6 +63,7 @@ def _filter_generic_overlay(overlay: dict[str, Any]) -> dict[str, Any]:
     providers_block = overlay.get("providers")
     oauth_provider_names: set[str] = set()
     generic_prov_cfg: dict[str, Any] = {}
+    generic_prov_cfg_overrides: dict[str, Any] = {}
     generic_prov_variants: dict[str, Any] = {}
     generic_prov_models: dict[str, Any] = {}
     generic_prov_model_overrides: dict[str, Any] = {}
@@ -97,6 +98,14 @@ def _filter_generic_overlay(overlay: dict[str, Any]) -> dict[str, Any]:
                             kept_variants[v_name] = copy.deepcopy(v_entry)
                     kept_entry["variants"] = kept_variants
                 generic_prov_cfg[group_name] = kept_entry
+
+        raw_prov_cfg_overrides = providers_block.get("provider_config_overrides") or {}
+        if isinstance(raw_prov_cfg_overrides, dict):
+            for group_name, patch in raw_prov_cfg_overrides.items():
+                if group_name in oauth_provider_names or _is_oauth_model_key(group_name):
+                    continue
+                if isinstance(patch, dict):
+                    generic_prov_cfg_overrides[group_name] = copy.deepcopy(patch)
 
         raw_prov_variants = providers_block.get("provider_variants") or {}
         if isinstance(raw_prov_variants, dict):
@@ -156,6 +165,7 @@ def _filter_generic_overlay(overlay: dict[str, Any]) -> dict[str, Any]:
         "model_overrides": generic_model_overrides,
         "providers": {
             "provider_config": generic_prov_cfg,
+            "provider_config_overrides": generic_prov_cfg_overrides,
             "provider_variants": generic_prov_variants,
             "models": generic_prov_models,
             "model_overrides": generic_prov_model_overrides,
@@ -287,6 +297,23 @@ def _merge_single_overlay(
                 )
                 continue
             target_prov_cfg[p_name] = copy.deepcopy(p_entry)
+
+    # DALTON-HOOK(llm-overlay): allow patching listed fields onto existing upstream
+    # provider_config entries (e.g. display_name) without editing providers.json.
+    prov_cfg_overrides = providers_block.get("provider_config_overrides") or {}
+    if isinstance(prov_cfg_overrides, dict):
+        for group_name, patch in prov_cfg_overrides.items():
+            if not isinstance(patch, dict):
+                continue
+            existing_group = target_prov_cfg.get(group_name)
+            if not isinstance(existing_group, dict):
+                logger.error(
+                    "Dalton %s overlay provider_config_overrides references unknown group %r; skipping.",
+                    source_name,
+                    group_name,
+                )
+                continue
+            _deep_merge_patch(existing_group, patch)
 
     prov_variants = providers_block.get("provider_variants") or {}
     if isinstance(prov_variants, dict):

@@ -4,6 +4,7 @@ import type {
   InboundAttachmentDescriptor,
   InboundChannelEvent,
   NativeInteractionEvent,
+  OneTimeWeixinReplyEnvelope,
 } from "../types.js";
 import {
   type AvailableChatsResult,
@@ -11,6 +12,9 @@ import {
   ChannelDeliveryError,
   type CheckTargetLiveResult,
   type DownloadedAttachment,
+  type ProcessingFeedbackContext,
+  type ProcessingFeedbackHandle,
+  type ProcessingFeedbackOutcome,
   type SendCardOptions,
   type SendCardResult,
   type SendFileOptions,
@@ -21,6 +25,17 @@ import {
   type WeixinQrStartResult,
   type WeixinQrWaitResult,
 } from "./adapter.js";
+
+export interface FakeProcessingFeedbackRecord {
+  messageId: string;
+  platform: ChannelPlatform;
+  chatType: "dm" | "group";
+  chatAddress: string;
+  threadScopeKey: string;
+  settled: boolean;
+  outcome: ProcessingFeedbackOutcome | null;
+  settleCount: number;
+}
 
 export interface FakeSentTextRecord extends SendTextChunkOptions {
   messageId: string;
@@ -60,6 +75,16 @@ export class FakeChannelAdapter implements ChannelAdapter {
   readonly sentPlainTexts: FakeSentPlainTextRecord[] = [];
   readonly sentTextMessages: FakeSentPlainTextRecord[] = [];
   readonly sentFiles: FakeSentFileRecord[] = [];
+  readonly sentOneTimeReplies: Array<{
+    envelope: OneTimeWeixinReplyEnvelope;
+    dedupeKey?: string;
+    messageId: string;
+  }> = [];
+  readonly accountsSyncCalls: Array<{
+    targetRevision?: number | null;
+    reason?: string;
+  }> = [];
+  private readonly sentOneTimeReplyKeys = new Set<string>();
   persistedWeixinState: {
     configured: boolean;
     status: string;
@@ -71,6 +96,7 @@ export class FakeChannelAdapter implements ChannelAdapter {
     bot_generation?: number;
   } | null = null;
   readonly sentCards: FakeSentCardRecord[] = [];
+  readonly feedbackRecords: FakeProcessingFeedbackRecord[] = [];
 
   private inboundHandler: ((event: InboundChannelEvent) => Promise<void>) | null = null;
   private nativeInteractionHandler:
@@ -105,7 +131,12 @@ export class FakeChannelAdapter implements ChannelAdapter {
     | null = null;
 
   private qrStartBehavior:
-    | ((options: { userId: string }) => Promise<WeixinQrStartResult>)
+    | ((options: {
+        userId: string;
+        sessionKey?: string;
+        loginVersion?: number;
+        expectedBotGeneration?: number;
+      }) => Promise<WeixinQrStartResult>)
     | null = null;
 
   private qrWaitBehavior:
@@ -118,6 +149,15 @@ export class FakeChannelAdapter implements ChannelAdapter {
         sessionKey: string;
         code: string;
       }) => Promise<WeixinQrWaitResult>)
+    | null = null;
+
+  private beginFeedbackBehavior:
+    | ((
+        context: ProcessingFeedbackContext,
+      ) =>
+        | ProcessingFeedbackHandle
+        | null
+        | Promise<ProcessingFeedbackHandle | null>)
     | null = null;
 
   constructor(platform: ChannelPlatform, maxChunkChars = 2000) {
@@ -209,6 +249,47 @@ export class FakeChannelAdapter implements ChannelAdapter {
     this.sendCardBehavior = fn;
   }
 
+  setBeginFeedbackBehavior(
+    fn:
+      | ((
+          context: ProcessingFeedbackContext,
+        ) =>
+          | ProcessingFeedbackHandle
+          | null
+          | Promise<ProcessingFeedbackHandle | null>)
+      | null,
+  ): void {
+    this.beginFeedbackBehavior = fn;
+  }
+
+  beginProcessingFeedback(
+    context: ProcessingFeedbackContext,
+  ): ProcessingFeedbackHandle | null | Promise<ProcessingFeedbackHandle | null> {
+    if (this.beginFeedbackBehavior) {
+      return this.beginFeedbackBehavior(context);
+    }
+    const { event } = context;
+    const record: FakeProcessingFeedbackRecord = {
+      messageId: event.messageId,
+      platform: event.platform,
+      chatType: event.chatType,
+      chatAddress: event.chatAddress,
+      threadScopeKey: event.threadScopeKey,
+      settled: false,
+      outcome: null,
+      settleCount: 0,
+    };
+    this.feedbackRecords.push(record);
+    return {
+      settle: (outcome: ProcessingFeedbackOutcome) => {
+        if (record.settled) return;
+        record.settled = true;
+        record.outcome = outcome;
+        record.settleCount += 1;
+      },
+    };
+  }
+
   setCheckTargetBehavior(
     fn:
       | ((options: {
@@ -223,7 +304,12 @@ export class FakeChannelAdapter implements ChannelAdapter {
   }
 
   setQrHandlers(handlers: {
-    start?: (options: { userId: string }) => Promise<WeixinQrStartResult>;
+    start?: (options: {
+      userId: string;
+      sessionKey?: string;
+      loginVersion?: number;
+      expectedBotGeneration?: number;
+    }) => Promise<WeixinQrStartResult>;
     wait?: (options: { userId: string; sessionKey: string }) => Promise<WeixinQrWaitResult>;
     verify?: (options: {
       userId: string;
@@ -320,7 +406,17 @@ export class FakeChannelAdapter implements ChannelAdapter {
     | ((
         descriptor: InboundAttachmentDescriptor,
         event: InboundChannelEvent,
+        options?: { signal?: AbortSignal },
       ) => Promise<DownloadedAttachment>)
+    | null = null;
+
+  private weixinAccountGenerationActiveCheck:
+    | ((
+        event: Pick<
+          InboundChannelEvent,
+          "weixinAccountId" | "weixinBotId" | "weixinBotGeneration"
+        >,
+      ) => boolean)
     | null = null;
 
   setDownloadAttachmentDelegate(
@@ -328,15 +424,42 @@ export class FakeChannelAdapter implements ChannelAdapter {
       | ((
           descriptor: InboundAttachmentDescriptor,
           event: InboundChannelEvent,
+          options?: { signal?: AbortSignal },
         ) => Promise<DownloadedAttachment>)
       | null,
   ): void {
     this.downloadAttachmentDelegate = fn;
   }
 
+  setWeixinAccountGenerationActiveCheck(
+    fn:
+      | ((
+          event: Pick<
+            InboundChannelEvent,
+            "weixinAccountId" | "weixinBotId" | "weixinBotGeneration"
+          >,
+        ) => boolean)
+      | null,
+  ): void {
+    this.weixinAccountGenerationActiveCheck = fn;
+  }
+
+  isWeixinAccountGenerationActive(
+    event: Pick<
+      InboundChannelEvent,
+      "weixinAccountId" | "weixinBotId" | "weixinBotGeneration"
+    >,
+  ): boolean {
+    if (this.weixinAccountGenerationActiveCheck) {
+      return this.weixinAccountGenerationActiveCheck(event);
+    }
+    return true;
+  }
+
   async downloadAttachment(
     descriptor: InboundAttachmentDescriptor,
     event?: InboundChannelEvent,
+    options?: { signal?: AbortSignal },
   ): Promise<DownloadedAttachment> {
     if (this.downloadAttachmentDelegate) {
       if (!event) {
@@ -344,7 +467,7 @@ export class FakeChannelAdapter implements ChannelAdapter {
           "FakeChannelAdapter download delegate requires the inbound event",
         );
       }
-      return this.downloadAttachmentDelegate(descriptor, event);
+      return this.downloadAttachmentDelegate(descriptor, event, options);
     }
     const found = this.attachments.get(descriptor.id);
     if (!found) {
@@ -377,15 +500,44 @@ export class FakeChannelAdapter implements ChannelAdapter {
     };
   }
 
-  async startQrLogin(options: { userId: string }): Promise<WeixinQrStartResult> {
+  async startQrLogin(options: {
+    userId: string;
+    sessionKey?: string;
+    loginVersion?: number;
+    expectedBotGeneration?: number;
+  }): Promise<WeixinQrStartResult> {
     if (this.qrStartBehavior) {
       return await this.qrStartBehavior(options);
     }
     return {
-      session_key: "fake_qr_session",
+      session_key: options.sessionKey ?? "fake_qr_session",
       qrcode_url: "https://ilinkai.weixin.qq.com/qr/fake",
       status: "wait",
     };
+  }
+
+  async triggerAccountsSync(
+    targetRevision?: number | null,
+    reason?: string,
+  ): Promise<{ ok: boolean; accepted_revision: number }> {
+    this.accountsSyncCalls.push({ targetRevision, reason });
+    return { ok: true, accepted_revision: targetRevision ?? 0 };
+  }
+
+  async sendOneTimeReply(
+    envelope: OneTimeWeixinReplyEnvelope,
+    dedupeKey?: string,
+  ): Promise<{ sent: boolean; duplicate?: boolean; messageId?: string }> {
+    if (dedupeKey && this.sentOneTimeReplyKeys.has(dedupeKey)) {
+      return { sent: false, duplicate: true };
+    }
+    if (dedupeKey) {
+      this.sentOneTimeReplyKeys.add(dedupeKey);
+    }
+    this.msgCounter += 1;
+    const messageId = `${this.platform}_onetime_${this.msgCounter}`;
+    this.sentOneTimeReplies.push({ envelope, dedupeKey, messageId });
+    return { sent: true, messageId };
   }
 
   async waitQrLogin(options: {
@@ -407,6 +559,33 @@ export class FakeChannelAdapter implements ChannelAdapter {
       return await this.qrVerifyBehavior(options);
     }
     return { status: "confirmed" };
+  }
+
+  private weixinAccountInvalidatedHandler?: (info: {
+    accountId: string;
+    reason: string;
+    activeBotGeneration?: number;
+    includeSameGeneration?: boolean;
+  }) => void;
+
+  onWeixinAccountInvalidated(
+    handler: (info: {
+      accountId: string;
+      reason: string;
+      activeBotGeneration?: number;
+      includeSameGeneration?: boolean;
+    }) => void,
+  ): void {
+    this.weixinAccountInvalidatedHandler = handler;
+  }
+
+  emitWeixinAccountInvalidated(info: {
+    accountId: string;
+    reason: string;
+    activeBotGeneration?: number;
+    includeSameGeneration?: boolean;
+  }): void {
+    this.weixinAccountInvalidatedHandler?.(info);
   }
 
   applyPersistedState(state: {

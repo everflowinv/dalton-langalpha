@@ -1,4 +1,9 @@
-import { parseSlashCommand, type ParsedSlashCommand } from "../../commands.js";
+import {
+  isCoreSessionCommand,
+  parseSlashCommand,
+  type CoreSessionCommand,
+  type ParsedSlashCommand,
+} from "../../commands.js";
 import { isManagedNativeCommandName } from "../../native-commands/manifest.js";
 import type { NativeCommandName } from "../../native-commands/types.js";
 import { makeInboundRequestKey } from "../../uuid.js";
@@ -16,7 +21,12 @@ export const DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND_AUTOCOMPLETE = 4;
 export const DISCORD_APPLICATION_COMMAND_TYPE_CHAT_INPUT = 1;
 export const DISCORD_COMMAND_OPTION_TYPE_STRING = 3;
 
-export type ParsedSessionSlashCommand = Extract<ParsedSlashCommand, { kind: "session" }>;
+export type ParsedSessionSlashCommand = Omit<
+  Extract<ParsedSlashCommand, { kind: "session" }>,
+  "cmd"
+> & {
+  cmd: CoreSessionCommand;
+};
 
 export interface DiscordRawInteractionOption {
   name?: unknown;
@@ -143,13 +153,13 @@ export function mapDiscordNativeCommandToSlashCommand(
   let parsed: ParsedSlashCommand | null = null;
   switch (commandName) {
     case "main":
-      parsed = parseSlashCommand("/main");
+      parsed = parseSlashCommand("/main", "dm", "discord");
       break;
     case "new":
-      parsed = parseSlashCommand("/new");
+      parsed = parseSlashCommand("/new", "dm", "discord");
       break;
     case "stop":
-      parsed = parseSlashCommand("/stop");
+      parsed = parseSlashCommand("/stop", "dm", "discord");
       break;
     case "workspace": {
       if (workspaceArg !== undefined && /[\r\n]/.test(workspaceArg)) {
@@ -157,19 +167,22 @@ export function mapDiscordNativeCommandToSlashCommand(
       }
       const trimmed = (workspaceArg ?? "").trim();
       if (!trimmed) {
-        parsed = parseSlashCommand("/workspace");
+        parsed = parseSlashCommand("/workspace", "dm", "discord");
       } else {
-        parsed = parseSlashCommand(`/workspace ${trimmed}`);
+        parsed = parseSlashCommand(`/workspace ${trimmed}`, "dm", "discord");
       }
       break;
     }
     default:
       return null;
   }
-  if (!parsed || parsed.kind !== "session") {
+  if (!parsed || parsed.kind !== "session" || !isCoreSessionCommand(parsed.cmd)) {
     return null;
   }
-  return parsed;
+  return {
+    ...parsed,
+    cmd: parsed.cmd,
+  };
 }
 
 export async function parseDiscordInteractionCreate(

@@ -24,11 +24,25 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, Optional
 
 from src.server.database.runs import outbox as outbox_db
 from src.server.database.ssh_tunnels import AWAY_GIVE_UP_DAYS
+from src.dalton.notify.channel_transport import (  # DALTON-HOOK(dalton-notify)
+    GATEWAY_DELIVERY_READ_TIMEOUT_S,
+)
 
 logger = logging.getLogger(__name__)
 
 CLAIM_BATCH = 20
 LEASE_SECONDS = 60
+# DALTON-HOOK(dalton-notify): automation_finish waits up to _FINISH_TOTAL_TIMEOUT_S
+# (GATEWAY_DELIVERY_READ_TIMEOUT_S + 15s = 255s) on the gateway /finish call; extend only
+# this hook_type's lease to +60s (300s) while keeping global LEASE_SECONDS = 60.
+_LEASE_SECONDS_BY_HOOK_TYPE: Dict[str, int] = {
+    "automation_finish": int(GATEWAY_DELIVERY_READ_TIMEOUT_S) + 60,
+}
+
+
+def lease_seconds_for_hook_type(hook_type: str) -> int:
+    """Return the claim lease duration in seconds for ``hook_type``."""
+    return _LEASE_SECONDS_BY_HOOK_TYPE.get(hook_type, LEASE_SECONDS)
 POLL_INTERVAL = 5.0
 MAX_ATTEMPTS = 5
 # Bound on concurrently executing jobs per drainer. Same-ordering-key jobs are
@@ -390,6 +404,8 @@ class HookOutboxDrainer:
                     jobs = await outbox_db.claim_outbox_jobs(
                         limit=batch,
                         lease_seconds=LEASE_SECONDS,
+                        # DALTON-HOOK(dalton-notify): per-hook-type lease override (automation_finish)
+                        lease_seconds_by_hook_type=_LEASE_SECONDS_BY_HOOK_TYPE,
                         max_attempts=MAX_ATTEMPTS,
                         excluded_hook_types=excluded,
                     )

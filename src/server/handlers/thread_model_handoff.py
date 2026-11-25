@@ -44,7 +44,14 @@ async def _has_pending_interrupt(thread_id: str) -> bool:
     return bool(saved and interrupt_records(saved.pending_writes))
 
 
-async def inspect_hand_off(thread_id: str, user_id: str, model: str | None):
+async def inspect_hand_off(
+    thread_id: str,
+    user_id: str,
+    model: str | None,
+    *,
+    source_system_only: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
+    source_run_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
+):
     """Classify whether ``model`` needs to and can hand off an opaque summary:
     returns ``("ready", (config, route))``, ``("not_needed", None)``, or
     ``("retryable_failure", None)`` when reading or resolving ``model`` fails
@@ -68,7 +75,19 @@ async def inspect_hand_off(thread_id: str, user_id: str, model: str | None):
         return "not_needed", None
     try:
         meta, route = await thread_route(thread_id, user_id)
-        resolve = await _resolver(user_id, thread_id, meta, route)
+        # DALTON-HOOK(cos-settings-tools): bind source_system_only captured from the same run; None means switch-time read failed so re-read strictly (via source_run_id when present, returning retryable_failure if DB still fails)
+        resolve = await _resolver(
+            user_id,
+            thread_id,
+            meta,
+            route,
+            **(
+                {"ignore_custom_models": source_system_only}
+                if source_system_only is not None
+                else {"strict_system_only": True}
+            ),
+            **({"source_run_id": source_run_id} if source_run_id else {}),
+        )
     except Exception:
         logger.warning(f"[handoff] thread {thread_id}: switch not read", exc_info=True)
         return "retryable_failure", None
@@ -116,6 +135,10 @@ async def run_model_switch_handoff(
     workspace_id: str | None,
     previous_model: str | None,
     model: str | None,
+    *,
+    source_system_only: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
+    source_run_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
+    strict_system_only: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
 ) -> tuple[bool | None, bool | None]:
     """Trigger immediate brief or summary hand-off for a committed model
     switch, returning ``(brief_handoff, summary_handoff)``.
@@ -136,7 +159,23 @@ async def run_model_switch_handoff(
     if to_claude_code:
         brief_handoff = await brief_on_switch(thread_id, user_id, model)
         return brief_handoff, None
-    summary_handoff = await hand_off_on_switch(thread_id, user_id, previous_model)
+    # DALTON-HOOK(cos-settings-tools): forward source_system_only, source_run_id, and strict_system_only from the same run
+    effective_strict = (
+        (source_system_only is None)
+        if strict_system_only is None
+        else bool(strict_system_only)
+    )
+    summary_handoff = await hand_off_on_switch(
+        thread_id,
+        user_id,
+        previous_model,
+        **(
+            {"source_system_only": source_system_only}
+            if source_system_only is not None
+            else ({"strict_system_only": True} if effective_strict else {})
+        ),
+        **({"source_run_id": source_run_id} if source_run_id else {}),
+    )
     return None, summary_handoff
 
 
@@ -153,6 +192,9 @@ async def run_immediate_model_handoff(
         workspace_id,
         plan.pending_previous_model,
         plan.model,
+        source_system_only=plan.source_system_only,  # DALTON-HOOK(cos-settings-tools)
+        source_run_id=plan.source_run_id,  # DALTON-HOOK(cos-settings-tools)
+        strict_system_only=(plan.source_system_only is None),  # DALTON-HOOK(cos-settings-tools)
     )
 
 
@@ -239,14 +281,60 @@ async def run_pending_model_handoff(
         else:
             # Try every model that may have written the owed summary; the first
             # that finds something to hand off is the source.
-            sources = list(ctx.candidate_models) or [ctx.previous_model]
-            source = sources[0]
+            # DALTON-HOOK(cos-settings-tools): deduplicate candidates by (model, system_only, run_id when system_only is None) so legacy False, newer same-name True, and unresolved run_id candidates are all tried; pure legacy markers resolve as non-system-only (False)
+            source_entries: list[tuple[str | None, bool | None, str | None]] = []
+            seen_keys: set[tuple[str | None, bool | None, str | None]] = set()
+            if ctx.candidate_sources:
+                covered_models: set[str] = set()
+                for idx, (m, sys_only) in enumerate(ctx.candidate_sources):
+                    rid = (
+                        ctx.candidate_source_run_ids[idx]
+                        if idx < len(ctx.candidate_source_run_ids)
+                        else None
+                    )
+                    dedup_key: tuple[str | None, bool | None, str | None] = (
+                        m,
+                        sys_only,
+                        rid if sys_only is None else None,
+                    )
+                    if dedup_key not in seen_keys:
+                        source_entries.append((m, sys_only, rid))
+                        seen_keys.add(dedup_key)
+                    if m:
+                        covered_models.add(m)
+                for m in ctx.candidate_models:
+                    if m and m not in covered_models and (m, False, None) not in seen_keys:
+                        source_entries.append((m, False, None))
+                        seen_keys.add((m, False, None))
+                        covered_models.add(m)
+            else:
+                for m in (list(ctx.candidate_models) or [ctx.previous_model]):
+                    key = (m, False, None)
+                    if key not in seen_keys:
+                        source_entries.append((m, False, None))
+                        seen_keys.add(key)
+            source, source_sys_only, source_rid = source_entries[0]
             pre_status = "not_needed"
             saw_retryable = False
-            for candidate in sources:
-                status, _ = await inspect_hand_off(thread_id, ctx.user_id, candidate)
+            for candidate, cand_sys_only, cand_rid in source_entries:
+                status, _ = await inspect_hand_off(
+                    thread_id,
+                    ctx.user_id,
+                    candidate,
+                    **(
+                        {"source_system_only": cand_sys_only}
+                        if cand_sys_only is not None
+                        else {}
+                    ),
+                    **({"source_run_id": cand_rid} if cand_rid else {}),
+                )
                 if status == "ready":
-                    source, pre_status = candidate, status
+                    source, source_sys_only, source_rid, pre_status = (
+                        candidate,
+                        cand_sys_only,
+                        cand_rid,
+                        status,
+                    )
                     break
                 if status != "not_needed":
                     saw_retryable = True
@@ -261,12 +349,29 @@ async def run_pending_model_handoff(
                     f"[handoff] thread {thread_id}: deferred summary handoff not ready ({pre_status}); keeping pending marker"
                 )
                 return "retryable_failure"
+            # DALTON-HOOK(cos-settings-tools): pass strict_system_only=True when source_sys_only is None and forward source_run_id when recorded
             started = await hand_off_on_switch(
-                thread_id, ctx.user_id, source
+                thread_id,
+                ctx.user_id,
+                source,
+                **(
+                    {"source_system_only": source_sys_only}
+                    if source_sys_only is not None
+                    else {"strict_system_only": True}
+                ),
+                **({"source_run_id": source_rid} if source_rid else {}),
             )
             if not started:
                 recheck_status, _ = await inspect_hand_off(
-                    thread_id, ctx.user_id, source
+                    thread_id,
+                    ctx.user_id,
+                    source,
+                    **(
+                        {"source_system_only": source_sys_only}
+                        if source_sys_only is not None
+                        else {}
+                    ),
+                    **({"source_run_id": source_rid} if source_rid else {}),
                 )
                 if recheck_status == "not_needed":
                     await clear_pending_model_handoff(thread_id, version=ctx.version)
@@ -284,7 +389,15 @@ async def run_pending_model_handoff(
                 )
                 return "retryable_failure"
             post_status, _ = await inspect_hand_off(
-                thread_id, ctx.user_id, source
+                thread_id,
+                ctx.user_id,
+                source,
+                **(
+                    {"source_system_only": source_sys_only}
+                    if source_sys_only is not None
+                    else {}
+                ),
+                **({"source_run_id": source_rid} if source_rid else {}),
             )
             if post_status != "not_needed":
                 logger.warning(

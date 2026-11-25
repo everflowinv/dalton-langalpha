@@ -715,6 +715,8 @@ async def _read_workspace_computer_snapshot(
     from src.server.services.home_placement import home_turn_computer
     from src.server.utils.pg_sanitize import normalize_uuid
 
+    if conn is not None and not _conn_supports_sql_locks(conn):
+        return None, False
     try:
         if is_home:
             comp, _ = await home_turn_computer(task_owner, conn=conn)
@@ -1698,6 +1700,11 @@ async def schedule_dalton_automation_helper(
                 effective_kwargs: dict[str, Any],
                 _locked_conn: Any,
             ) -> None:
+                from psycopg.rows import dict_row
+
+                from src.server.database.home_workspace import is_home_id
+                from src.server.utils.pg_sanitize import normalize_uuid
+
                 locked_view = dict(locked_row) if isinstance(locked_row, Mapping) else {}
                 # The row may have moved to another workspace between the
                 # unlocked read that matched it and this lock; a move takes it
@@ -1709,6 +1716,60 @@ async def schedule_dalton_automation_helper(
                     raise AutomationRefusal(
                         f"任务 `{resolved_name}` 已移到其他工作区，请刷新后重试。"
                     )
+                locked_ws_id = str(locked_view.get("workspace_id") or "").strip() or None
+                locked_name = str(locked_view.get("name") or resolved_name)
+                locked_is_home = bool(
+                    not locked_ws_id
+                    or is_home_id(task_owner, locked_ws_id)
+                    or (is_home_target and _ws_key(locked_ws_id) == _ws_key(ws_id))
+                )
+                locked_ws_row: dict[str, Any] | None = None
+                if _conn_supports_sql_locks(_locked_conn) and not locked_is_home:
+                    norm_locked_ws = normalize_uuid(locked_ws_id) if locked_ws_id else None
+                    if norm_locked_ws is None:
+                        raise _make_schedule_refusal(
+                            "情况已变化，请重新发起", field="workspace_id"
+                        )
+                    async with _locked_conn.cursor(row_factory=dict_row) as cur:
+                        await cur.execute(
+                            """
+                            SELECT workspace_id, user_id, computer_id, status, config
+                            FROM workspaces
+                            WHERE workspace_id = %(workspace_id)s AND status <> 'deleted'
+                            ORDER BY workspace_id
+                            FOR SHARE
+                            """,
+                            {"workspace_id": norm_locked_ws},
+                        )
+                        ws_raw = await cur.fetchone()
+                    if ws_raw is None:
+                        raise _make_schedule_refusal(
+                            "情况已变化，请重新发起", field="workspace_id"
+                        )
+                    locked_ws_row = dict(ws_raw)
+                locked_meta_for_auth = (
+                    effective_kwargs.get("metadata")
+                    if isinstance(effective_kwargs.get("metadata"), Mapping)
+                    else (
+                        locked_view.get("metadata")
+                        if isinstance(locked_view.get("metadata"), Mapping)
+                        else {}
+                    )
+                )
+                await _recheck_operator_authorization_in_tx(
+                    _locked_conn,
+                    effective_actor_id=effective_actor_id,
+                    task_owner=task_owner,
+                    role=role,
+                    saved_name=locked_name,
+                    saved_metadata=locked_meta_for_auth,
+                    locked_ws_id=locked_ws_id,
+                    locked_ws_row=locked_ws_row,
+                    locked_row=locked_view,
+                    is_home=locked_is_home,
+                    units_on=units_on,
+                    auth_on=auth_on,
+                )
                 if not locked_view.get("trigger_type"):
                     locked_view["trigger_type"] = (
                         "cron" if locked_view.get("cron_expression") else "price"
@@ -1741,9 +1802,16 @@ async def schedule_dalton_automation_helper(
                         **conn_kw,
                     )
             except AutomationRefusal as exc:
+                explicit_code = getattr(exc, "schedule_error_code", None)
+                if isinstance(explicit_code, str) and explicit_code:
+                    err_code = explicit_code
+                elif exc.field == "workspace_id":
+                    err_code = "workspace_changed"
+                else:
+                    err_code = str(exc)
                 return {
                     "ok": False,
-                    "error": str(exc),
+                    "error": err_code,
                     "message": str(exc),
                 }
             return {

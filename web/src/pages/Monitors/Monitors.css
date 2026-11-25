@@ -68,6 +68,10 @@
   flex-shrink: 0;
 }
 
+.monitors-version-select select {
+  height: 30px;
+}
+
 .monitors-frame-host {
   position: relative;
   flex: 1 1 auto;
@@ -83,5 +87,21 @@
   .monitors-topbar {
     flex-wrap: wrap;
     padding: 8px 12px;
+    row-gap: 6px;
+  }
+
+  .monitors-topbar-title {
+    flex: 1 1 0%;
+  }
+
+  .monitors-topbar-actions {
+    flex: 1 0 100%;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .monitors-version-select,
+  .monitors-version-select select {
+    height: 36px;
   }
 }

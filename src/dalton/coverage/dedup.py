@@ -1337,6 +1337,10 @@ async def _refresh_live_hits(
     uid: str | None = None,
     is_external: bool = False,
     partial_failure_out: list[Exception] | None = None,
+    unverified_downgraded_out: list[
+        tuple[_CandidateEntry, dict[str, Any], str, str]
+    ]
+    | None = None,
     conn: Any = None,
 ) -> list[tuple[_CandidateEntry, dict[str, Any] | None, str, str]]:
     """Re-query hit workspaces and unit bindings after LLM return, releasing conn before permission checks."""
@@ -1572,6 +1576,9 @@ async def _refresh_live_hits(
                 rejudge_by_ws = {
                     e.ws_id: f_ws for e, f_ws, _, _ in need_rejudge if e.ws_id
                 }
+                before_failures = (
+                    len(partial_failure_out) if partial_failure_out is not None else 0
+                )
                 try:
                     re_hits = await _judge_candidates_with_llm(
                         uid=uid or "",
@@ -1580,13 +1587,26 @@ async def _refresh_live_hits(
                         is_external=is_external,
                         partial_failure_out=partial_failure_out,
                     )
+                    matched_re_ws_ids: set[str] = set()
                     for re_entry, re_conf, re_reason in re_hits:
                         f_ws = rejudge_by_ws.get(re_entry.ws_id or "")
                         if f_ws is not None:
+                            if re_entry.ws_id:
+                                matched_re_ws_ids.add(re_entry.ws_id)
                             raw_refreshed.append((re_entry, f_ws, re_conf, re_reason))
+                    if (
+                        unverified_downgraded_out is not None
+                        and partial_failure_out is not None
+                        and len(partial_failure_out) > before_failures
+                    ):
+                        for item in need_rejudge:
+                            if item[0].ws_id not in matched_re_ws_ids:
+                                unverified_downgraded_out.append(item)
                 except Exception as exc:
                     if partial_failure_out is not None:
                         partial_failure_out.append(exc)
+                    if unverified_downgraded_out is not None:
+                        unverified_downgraded_out.extend(need_rejudge)
                     logger.warning(
                         "Company dedup downgraded workspace recheck failed (%s)",
                         type(exc).__name__,
@@ -1720,13 +1740,29 @@ async def _find_matches(
     # Re-verify live workspace/unit status and bindings after LLM return, release DB
     # connection before permission checks, check read access across ALL live hits,
     # and truncate to MAX_DUPLICATE_MATCHES afterwards.
+    recheck_failures: list[Exception] = []
+    unverified_downgraded: list[tuple[_CandidateEntry, dict[str, Any], str, str]] = []
     all_live_hits = await _refresh_live_hits(
         hits,
         raw_name=raw_name,
         uid=uid,
         is_external=(caller_tier == "external"),
+        partial_failure_out=recheck_failures,
+        unverified_downgraded_out=unverified_downgraded,
         conn=conn,
     )
+    if recheck_failures and not all_live_hits and unverified_downgraded:
+        # Downgraded live workspace re-verification failed: cannot confirm the
+        # live workspace is unrelated, so keep the downgraded live candidate(s)
+        # instead of silently dropping them to allow creation.
+        seen_unverified_ws: set[str] = set()
+        for upd_entry, f_ws, c_conf, r_reason in unverified_downgraded:
+            ws_key_id = str(f_ws.get("workspace_id") or upd_entry.ws_id or "").strip()
+            if ws_key_id and ws_key_id in seen_unverified_ws:
+                continue
+            if ws_key_id:
+                seen_unverified_ws.add(ws_key_id)
+            all_live_hits.append((upd_entry, f_ws, c_conf, r_reason))
     if not all_live_hits:
         if suggestion_out:
             return DuplicateMatch(
@@ -1760,7 +1796,11 @@ async def _find_matches(
         message=message,
         matches=tuple(resolved),
         matched_workspace_ids=tuple(matched_ids),
-        suggestion=suggestion_out[0] if (suggestion_out and all_hits_readable) else None,
+        suggestion=(
+            suggestion_out[0]
+            if (suggestion_out and all_hits_readable and not recheck_failures)
+            else None
+        ),
     )
 
 

@@ -228,7 +228,7 @@ export function DaltonNotifyTargetsCard({
       onKeyDown={(e) => {
         if (e.key === 'Enter') e.currentTarget.blur();
       }}
-      className="mt-1 h-7 w-52 text-xs"
+      className="mt-1 h-9 md:h-7 w-full md:w-52 max-w-full text-xs"
     />
   );
 
@@ -370,9 +370,9 @@ export function DaltonNotifyTargetsCard({
                             </span>
                           }
                           subtitle={renderAliasInput(item.target)}
-                          meta={<span className="font-mono">{item.accountId}</span>}
+                          meta={<span className="font-mono max-md:break-all">{item.accountId}</span>}
                           trailing={
-                            <div className="flex items-center gap-2">
+                            <div className="flex flex-wrap items-center gap-2">
                               <Button
                                 type="button"
                                 variant="ghost"
@@ -415,7 +415,7 @@ export function DaltonNotifyTargetsCard({
                 onChange={(e) => setManualInput(e.target.value)}
                 placeholder={t('dalton.notifyTargets.manualAddPlaceholder')}
                 data-testid="dalton-notify-manual-input"
-                className="h-8 w-72 text-xs font-mono"
+                className="h-9 md:h-8 w-full md:w-72 text-xs font-mono"
               />
               <Button
                 type="button"
@@ -459,15 +459,15 @@ export function DaltonNotifyTargetsCard({
                       testId={`dalton-notify-custom-${target}`}
                       title={
                         labels[target] ? (
-                          <span className="text-xs font-medium">{labels[target]}</span>
+                          <span className="text-xs font-medium break-words">{labels[target]}</span>
                         ) : (
-                          <code className="text-xs font-mono">{target}</code>
+                          <code className="text-xs font-mono max-md:break-all">{target}</code>
                         )
                       }
                       subtitle={renderAliasInput(target)}
-                      meta={<code className="font-mono">{target}</code>}
+                      meta={<code className="font-mono max-md:break-all">{target}</code>}
                       trailing={
-                        <div className="flex items-center gap-1.5">
+                        <div className="flex flex-wrap items-center gap-1.5">
                           <Button
                             type="button"
                             variant="ghost"

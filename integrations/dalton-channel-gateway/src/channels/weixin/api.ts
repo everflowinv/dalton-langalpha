@@ -7,6 +7,10 @@
 
 import crypto from "node:crypto";
 import {
+  isLeaseSafetyMarginPauseError,
+  isStaleGatewayEpochError,
+} from "../../gateway-lease.js";
+import {
   type HostIpResolver,
   SafeFetchError,
   safeFetchResponse,
@@ -15,6 +19,8 @@ import {
 } from "../../shared/safe-fetch.js";
 import {
   type BaseInfo,
+  type GetConfigReq,
+  type GetConfigResp,
   type GetUpdatesReq,
   type GetUpdatesResp,
   type GetUploadUrlReq,
@@ -27,6 +33,8 @@ import {
   type QrCodeStatusResp,
   type SendMessageReq,
   type SendMessageResp,
+  type SendTypingReq,
+  type SendTypingResp,
   SESSION_EXPIRED_ERRCODE,
 } from "./types.js";
 
@@ -169,23 +177,40 @@ export function parseRetryAfterMs(
   return Math.min(maxMs, Math.max(100, defaultMs));
 }
 
+export function sanitizeIlinkEndpointForLog(endpoint: string): string {
+  const qIdx = endpoint.indexOf("?");
+  return qIdx >= 0 ? endpoint.slice(0, qIdx) : endpoint;
+}
+
 export function assertIlinkBusinessOk(
-  payload: { ret?: number; errcode?: number; errmsg?: string },
+  payload: { ret?: unknown; errcode?: unknown; errmsg?: unknown },
   endpoint: string,
   requestSent = true,
 ): void {
-  const ret = payload.ret;
-  const errcode = payload.errcode;
-  const hasRetError = ret !== undefined && ret !== 0;
-  const hasErrcodeError = errcode !== undefined && errcode !== 0;
+  const safeEndpoint = sanitizeIlinkEndpointForLog(endpoint);
+  const rawRet = payload.ret;
+  const rawErrcode = payload.errcode;
+  const ret =
+    typeof rawRet === "number" && Number.isFinite(rawRet) ? rawRet : undefined;
+  const errcode =
+    typeof rawErrcode === "number" && Number.isFinite(rawErrcode)
+      ? rawErrcode
+      : undefined;
+  const hasRetError = rawRet !== undefined && (ret === undefined || ret !== 0);
+  const hasErrcodeError =
+    rawErrcode !== undefined && (errcode === undefined || errcode !== 0);
   if (!hasRetError && !hasErrcodeError) {
     return;
   }
   const expired = isSessionExpiredCode(ret, errcode);
+  const retLabel = ret !== undefined ? String(ret) : rawRet === undefined ? "0" : "non_numeric";
+  const errcodeLabel =
+    errcode !== undefined ? String(errcode) : rawErrcode === undefined ? "0" : "non_numeric";
   throw new WeixinApiError({
     kind: expired ? "session_expired" : "business_error",
-    endpoint,
-    message: `${endpoint} business error: ret=${String(ret ?? 0)} errcode=${String(errcode ?? 0)} errmsg=${payload.errmsg ?? ""}`.trim(),
+    endpoint: safeEndpoint,
+    // §4.3: never emit raw iLink errmsg text or unvalidated non-numeric fields into logs/errors
+    message: `${safeEndpoint} business error: ret=${retLabel} errcode=${errcodeLabel}`,
     ret,
     errcode,
     requestSent,
@@ -253,9 +278,12 @@ export interface WeixinHttpCommonOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
+  dispatcher?: unknown;
   allowedDomains?: readonly string[];
   resolveHostIps?: HostIpResolver;
   checkResolvedIps?: boolean;
+  /** Synchronous lease check invoked after DNS resolution and immediately before HTTP dispatch (Round 3 Decision #1). */
+  assertLeaseValid?: () => void;
 }
 
 async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: number; errmsg?: string }>(params: {
@@ -268,10 +296,13 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
   timeoutMs?: number;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
+  dispatcher?: unknown;
   allowedDomains?: readonly string[];
   resolveHostIps?: HostIpResolver;
   checkResolvedIps?: boolean;
+  assertLeaseValid?: () => void;
 }): Promise<T> {
+  const safeEndpoint = sanitizeIlinkEndpointForLog(params.endpoint);
   const allowedDomains = params.allowedDomains ?? OFFICIAL_ILINK_API_DOMAINS;
   const validatedBase = normalizeAndValidateIlinkBaseUrl(
     params.baseUrl,
@@ -285,6 +316,8 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
     resolveHostIps: params.resolveHostIps,
     checkResolvedIps: params.checkResolvedIps,
   });
+  // Round 3 Decision #1: re-verify local lease after DNS resolution and before building/dispatching HTTP request.
+  params.assertLeaseValid?.();
 
   const bodyStr =
     params.bodyObj !== undefined ? JSON.stringify(params.bodyObj) : undefined;
@@ -296,6 +329,7 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
 
   let requestDispatched = false;
   const wrappedFetch: typeof fetch = async (input, init) => {
+    params.assertLeaseValid?.();
     requestDispatched = true;
     const fn = params.fetchImpl ?? globalThis.fetch;
     return fn(input, init);
@@ -314,15 +348,20 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
       timeoutMs: params.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
       signal: params.signal,
       fetchImpl: wrappedFetch,
+      dispatcher: params.dispatcher,
     });
   } catch (err) {
-    if (err instanceof WeixinApiError) {
+    if (
+      err instanceof WeixinApiError ||
+      isStaleGatewayEpochError(err) ||
+      isLeaseSafetyMarginPauseError(err)
+    ) {
       throw err;
     }
     throw new WeixinApiError({
       kind: "network_error",
-      endpoint: params.endpoint,
-      message: `${params.endpoint} network failure: ${err instanceof Error ? err.message : String(err)}`,
+      endpoint: safeEndpoint,
+      message: `${safeEndpoint} network failure: ${err instanceof Error ? err.message : String(err)}`,
       requestSent: requestDispatched,
       cause: err,
     });
@@ -334,8 +373,8 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
   } catch (err) {
     throw new WeixinApiError({
       kind: "network_error",
-      endpoint: params.endpoint,
-      message: `${params.endpoint} response body read failed: ${err instanceof Error ? err.message : String(err)}`,
+      endpoint: safeEndpoint,
+      message: `${safeEndpoint} response body read failed: ${err instanceof Error ? err.message : String(err)}`,
       status: response.status,
       requestSent: requestDispatched,
       cause: err,
@@ -345,8 +384,8 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
     const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
     throw new WeixinApiError({
       kind: "rate_limited",
-      endpoint: params.endpoint,
-      message: `${params.endpoint} rate limited (HTTP 429)`,
+      endpoint: safeEndpoint,
+      message: `${safeEndpoint} rate limited (HTTP 429)`,
       status: 429,
       retryAfterMs,
       requestSent: requestDispatched,
@@ -356,8 +395,9 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
   if (!response.ok) {
     throw new WeixinApiError({
       kind: "http_error",
-      endpoint: params.endpoint,
-      message: `${params.endpoint} HTTP ${response.status}: ${rawText.slice(0, 200)}`,
+      endpoint: safeEndpoint,
+      // §4.3: never emit raw HTTP response body or query credentials into logs or error strings
+      message: `${safeEndpoint} HTTP ${response.status}`,
       status: response.status,
       requestSent: requestDispatched,
     });
@@ -369,8 +409,8 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
   } catch (err) {
     throw new WeixinApiError({
       kind: "http_error",
-      endpoint: params.endpoint,
-      message: `${params.endpoint} returned invalid JSON`,
+      endpoint: safeEndpoint,
+      message: `${safeEndpoint} returned invalid JSON`,
       status: response.status,
       requestSent: requestDispatched,
       cause: err,
@@ -385,14 +425,14 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
   ) {
     throw new WeixinApiError({
       kind: "http_error",
-      endpoint: params.endpoint,
-      message: `${params.endpoint} returned a non-object JSON body`,
+      endpoint: safeEndpoint,
+      message: `${safeEndpoint} returned a non-object JSON body`,
       status: response.status,
       requestSent: requestDispatched,
     });
   }
 
-  assertIlinkBusinessOk(parsed, params.endpoint, requestDispatched);
+  assertIlinkBusinessOk(parsed, safeEndpoint, requestDispatched);
   return parsed;
 }
 
@@ -407,9 +447,11 @@ export async function fetchWeixinQrCode(
     timeoutMs: options.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
     signal: options.signal,
     fetchImpl: options.fetchImpl,
+    dispatcher: options.dispatcher,
     allowedDomains: options.allowedDomains,
     resolveHostIps: options.resolveHostIps,
     checkResolvedIps: options.checkResolvedIps,
+    assertLeaseValid: options.assertLeaseValid,
   });
 }
 
@@ -429,9 +471,11 @@ export async function pollWeixinQrStatus(
       timeoutMs: options.timeoutMs ?? DEFAULT_QR_POLL_TIMEOUT_MS,
       signal: options.signal,
       fetchImpl: options.fetchImpl,
+      dispatcher: options.dispatcher,
       allowedDomains: options.allowedDomains,
       resolveHostIps: options.resolveHostIps,
       checkResolvedIps: options.checkResolvedIps,
+      assertLeaseValid: options.assertLeaseValid,
     });
   } catch (err) {
     if (
@@ -468,9 +512,11 @@ export async function submitWeixinQrVerifyCode(
     timeoutMs: options.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
     signal: options.signal,
     fetchImpl: options.fetchImpl,
+    dispatcher: options.dispatcher,
     allowedDomains: options.allowedDomains,
     resolveHostIps: options.resolveHostIps,
     checkResolvedIps: options.checkResolvedIps,
+    assertLeaseValid: options.assertLeaseValid,
   });
 }
 
@@ -491,9 +537,11 @@ export async function getWeixinUpdates(
       timeoutMs: options.timeoutMs ?? DEFAULT_LONG_POLL_TIMEOUT_MS,
       signal: options.signal,
       fetchImpl: options.fetchImpl,
+      dispatcher: options.dispatcher,
       allowedDomains: options.allowedDomains,
       resolveHostIps: options.resolveHostIps,
       checkResolvedIps: options.checkResolvedIps,
+      assertLeaseValid: options.assertLeaseValid,
     });
   } catch (err) {
     if (
@@ -522,9 +570,11 @@ export async function getWeixinUploadUrl(
     timeoutMs,
     signal,
     fetchImpl,
+    dispatcher,
     allowedDomains,
     resolveHostIps,
     checkResolvedIps,
+    assertLeaseValid,
     ...uploadFields
   } = options;
   return executeIlinkJsonRequest<GetUploadUrlResp>({
@@ -539,9 +589,11 @@ export async function getWeixinUploadUrl(
     timeoutMs: timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
     signal,
     fetchImpl,
+    dispatcher,
     allowedDomains,
     resolveHostIps,
     checkResolvedIps,
+    assertLeaseValid,
   });
 }
 
@@ -560,8 +612,70 @@ export async function sendWeixinMessage(
     timeoutMs: options.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
     signal: options.signal,
     fetchImpl: options.fetchImpl,
+    dispatcher: options.dispatcher,
     allowedDomains: options.allowedDomains,
     resolveHostIps: options.resolveHostIps,
     checkResolvedIps: options.checkResolvedIps,
+    assertLeaseValid: options.assertLeaseValid,
+  });
+}
+
+export async function getWeixinConfig(
+  options: WeixinHttpCommonOptions & {
+    ilinkUserId: string;
+    contextToken?: string;
+  },
+): Promise<GetConfigResp> {
+  const reqBody: GetConfigReq = {
+    ilink_user_id: options.ilinkUserId.trim(),
+    ...(options.contextToken?.trim()
+      ? { context_token: options.contextToken.trim() }
+      : {}),
+    base_info: buildBaseInfo(),
+  };
+  return executeIlinkJsonRequest<GetConfigResp>({
+    method: "POST",
+    endpoint: "ilink/bot/getconfig",
+    baseUrl: options.baseUrl,
+    botToken: options.botToken,
+    bodyObj: reqBody,
+    timeoutMs: options.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
+    signal: options.signal,
+    fetchImpl: options.fetchImpl,
+    dispatcher: options.dispatcher,
+    allowedDomains: options.allowedDomains,
+    resolveHostIps: options.resolveHostIps,
+    checkResolvedIps: options.checkResolvedIps,
+    assertLeaseValid: options.assertLeaseValid,
+  });
+}
+
+export async function sendWeixinTyping(
+  options: WeixinHttpCommonOptions & {
+    ilinkUserId: string;
+    typingTicket: string;
+    status: number;
+  },
+): Promise<SendTypingResp> {
+  const reqBody: SendTypingReq = {
+    ilink_user_id: options.ilinkUserId.trim(),
+    typing_ticket: options.typingTicket.trim(),
+    status: options.status,
+    base_info: buildBaseInfo(),
+  };
+  return executeIlinkJsonRequest<SendTypingResp>({
+    method: "POST",
+    endpoint: "ilink/bot/sendtyping",
+    baseUrl: options.baseUrl,
+    botToken: options.botToken,
+    bodyObj: reqBody,
+    timeoutMs: options.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
+    signal: options.signal,
+    fetchImpl: options.fetchImpl,
+    dispatcher: options.dispatcher,
+    allowedDomains: options.allowedDomains,
+    resolveHostIps: options.resolveHostIps,
+    checkResolvedIps: options.checkResolvedIps,
+    assertLeaseValid: options.assertLeaseValid,
   });
 }

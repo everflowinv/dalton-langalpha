@@ -95,6 +95,7 @@ export interface CapabilitiesApiResponse {
   brand?: {
     name?: string;
   };
+  ticker_logos?: boolean;
 }
 
 export async function fetchDaltonCapabilities(): Promise<CapabilitiesApiResponse> {
@@ -108,6 +109,8 @@ export interface UseCapabilitiesResult {
   hasCapability: (required: CapabilityRequirement) => boolean;
   brandName: string;
   fingerprint: string | null;
+  /** Whether `/api/v1/market-data/logos/{symbol}` is backed by Ginlix Data. */
+  tickerLogosEnabled: boolean;
   /**
    * True only during initial load of a Core profile build so Core UI can render
    * a lightweight placeholder while avoiding any flash of proprietary cards.
@@ -159,6 +162,9 @@ export function useCapabilities(options: { enabled?: boolean } = {}): UseCapabil
 
   const isLoading = isCoreProfileBuild && queryEnabled && query.isPending;
   const isLoaded = query.data !== undefined;
+  const tickerLogosEnabled = isLoaded
+    ? query.data.ticker_logos === true
+    : !isCoreProfileBuild;
 
   const hasCapability = useMemo(
     () => (required: CapabilityRequirement) => hasRequiredCapability(capabilities, required),
@@ -171,6 +177,7 @@ export function useCapabilities(options: { enabled?: boolean } = {}): UseCapabil
     hasCapability,
     brandName,
     fingerprint: query.data?.fingerprint ?? null,
+    tickerLogosEnabled,
     isLoading,
     isLoaded,
     isCoreBuild: isCoreProfileBuild,

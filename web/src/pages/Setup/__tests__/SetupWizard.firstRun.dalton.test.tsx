@@ -1592,7 +1592,9 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     renderRealWizardApp('/setup/method');
     expect(await screen.findByTestId('setup-load-failed', {}, { timeout: 5000 })).toBeInTheDocument();
     // Wait until credentials/status has actually succeeded and populated the cache (admin hint visible).
-    expect(await screen.findByText(/团队共用/, {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Shared with your team|团队共用/i, {}, { timeout: 5000 }),
+    ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Sign in to Google Antigravity, ChatGPT or Grok/i })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /API key/i })).toBeInTheDocument();
 

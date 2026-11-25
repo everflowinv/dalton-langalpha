@@ -469,27 +469,6 @@ async def _previous_run(thread_id: str) -> TurnContext:
     return TurnContext(previous_run_settled_at=run_settled_at(attempt))
 
 
-# DALTON-HOOK(cos-settings-tools): keep previous run's system-only flag for compaction only while thread still runs that model
-def _should_keep_system_only_for_thread_selection(
-    meta: Mapping[str, Any],
-    latest: Mapping[str, Any] | None,
-    latest_meta: Mapping[str, Any],
-) -> bool:
-    if not latest_meta.get("llm_model_system_only"):
-        return False
-    thread_meta = meta.get("metadata") if isinstance(meta.get("metadata"), Mapping) else {}
-    if thread_meta.get("dalton_pending_model_handoff"):
-        return False
-    latest_run_id = str((latest or {}).get("conversation_response_id") or "").strip()
-    switched_after = str(thread_meta.get("owner_model_switch_run_id") or "").strip()
-    if latest_run_id and switched_after == latest_run_id:
-        return False
-    latest_model = latest_meta.get("llm_model")
-    if latest_model and meta.get("llm_model") != latest_model:
-        return False
-    return True
-
-
 def _resolve_accepts_ignore_custom_override(resolve: Any) -> bool:
     import inspect
 
@@ -504,6 +483,9 @@ def _resolve_accepts_ignore_custom_override(resolve: Any) -> bool:
     )
 
 
+_UNSET_LATEST = object()  # DALTON-HOOK(cos-settings-tools)
+
+
 async def _resolver(
     user_id: str,
     thread_id: str,
@@ -511,32 +493,88 @@ async def _resolver(
     route,
     *,
     ignore_custom_models: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
-    for_current_selection: bool = False,  # DALTON-HOOK(cos-settings-tools)
+    latest_attempt: Any = _UNSET_LATEST,  # DALTON-HOOK(cos-settings-tools)
+    strict_system_only: bool = False,  # DALTON-HOOK(cos-settings-tools)
+    source_run_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
 ):
     """``thread_resolver`` for a call between turns, which no composer
     started, so the thread's row sets its effort and fast mode, and its
     latest run the subagents its tools name, as that run's build was given
     them: tools that differ from the turn's miss its whole cached prefix. A
     failed read builds the default subagents."""
+    from src.dalton.services.automation_thread_model import (
+        get_run_model_and_system_only,
+    )
     from src.server.database.runs import lifecycle as tl_db
     from src.server.services.account import own_access
     from src.server.services.thread_agent import thread_resolver
 
-    try:
-        latest = await tl_db.get_latest_attempt(thread_id)
-    except Exception:
-        logger.debug("latest run read failed for thread %s", thread_id, exc_info=True)
-        latest = None
+    if latest_attempt is _UNSET_LATEST:
+        try:
+            latest = await tl_db.get_latest_attempt(thread_id)
+        except Exception:
+            # DALTON-HOOK(cos-settings-tools): propagate latest-attempt DB failure when strict_system_only is True and no source_run_id/ignore_custom_models was supplied
+            if strict_system_only and ignore_custom_models is None and not source_run_id:
+                raise
+            logger.debug("latest run read failed for thread %s", thread_id, exc_info=True)
+            latest = None
+    else:
+        latest = latest_attempt
     latest_meta = (latest or {}).get("metadata") or {}
-    # DALTON-HOOK(cos-settings-tools): preserve system-only catalog resolution for the previous run's model only
+    # DALTON-HOOK(cos-settings-tools): read execution-level system-only flag from source_run_id (fetching full run row via get_run) or the same latest run row, failing closed when strict_system_only=True
     if ignore_custom_models is not None:
         effective_ignore_custom = bool(ignore_custom_models)
-    elif for_current_selection:
-        effective_ignore_custom = _should_keep_system_only_for_thread_selection(
-            meta, latest, latest_meta
-        )
+    elif source_run_id:
+        norm_source_run_id = str(source_run_id).strip()
+        try:
+            run_row = await tl_db.get_run(norm_source_run_id)
+        except Exception as exc:
+            if strict_system_only:
+                raise RuntimeError(
+                    f"Failed reading source run {norm_source_run_id} on thread {thread_id}"
+                ) from exc
+            logger.debug(
+                "source run read failed for run %s on thread %s",
+                norm_source_run_id,
+                thread_id,
+                exc_info=True,
+            )
+            run_row = None
+        if not isinstance(run_row, Mapping):
+            if strict_system_only:
+                raise RuntimeError(
+                    f"Source run {norm_source_run_id} not found for thread {thread_id}"
+                )
+            effective_ignore_custom = False
+        else:
+            try:
+                _, resolved_sys = await get_run_model_and_system_only(run_row)
+            except Exception as exc:
+                if strict_system_only:
+                    raise RuntimeError(
+                        f"Failed reading execution system-only flag for run {norm_source_run_id} on thread {thread_id}"
+                    ) from exc
+                resolved_sys = None
+            if resolved_sys is None:
+                if strict_system_only:
+                    raise RuntimeError(
+                        f"Failed reading execution system-only flag for run {norm_source_run_id} on thread {thread_id}"
+                    )
+                effective_ignore_custom = False
+            else:
+                effective_ignore_custom = bool(resolved_sys)
+    elif isinstance(latest, Mapping):
+        _, resolved_sys = await get_run_model_and_system_only(latest)
+        if resolved_sys is None:
+            if strict_system_only:
+                raise RuntimeError(
+                    f"Failed reading execution system-only flag for thread {thread_id}"
+                )
+            effective_ignore_custom = False
+        else:
+            effective_ignore_custom = bool(resolved_sys)
     else:
-        effective_ignore_custom = bool(latest_meta.get("llm_model_system_only"))
+        effective_ignore_custom = False
     return thread_resolver(
         user_id,
         thread_id,
@@ -546,7 +584,7 @@ async def _resolver(
         is_byok=(await own_access(user_id, sign_ins=False)).api_keys,
         enabled_subagents=latest_meta.get("subagents_enabled"),
         # DALTON-HOOK(cos-settings-tools): preserve system-only catalog resolution for compaction and model-switch handoff
-        ignore_custom_models=effective_ignore_custom,
+        **({"ignore_custom_models": True} if effective_ignore_custom else {}),
     )
 
 
@@ -652,7 +690,22 @@ async def _compaction_config(
     if not (user_id and agent_cfg is not None):
         return agent_cfg, None
     meta, route = await thread_route(thread_id, user_id)
-    on_claude_code = is_claude_code_model(meta.get("llm_model"))
+    # DALTON-HOOK(cos-settings-tools): manual compaction resolves against the previous run's actual model and execution-level system-only flag (not stored thread llm_model)
+    latest: Any = None
+    try:
+        from src.server.database.runs import lifecycle as tl_db
+
+        latest = await tl_db.get_latest_attempt(thread_id)
+    except Exception:
+        logger.debug("latest run read failed for compaction on thread %s", thread_id, exc_info=True)
+        latest = None
+    latest_meta = (latest or {}).get("metadata") if isinstance(latest, Mapping) else {}
+    raw_latest_model = (
+        latest_meta.get("llm_model") if isinstance(latest_meta, Mapping) else None
+    )
+    latest_run_model = str(raw_latest_model).strip() if raw_latest_model else None
+    effective_held = latest_run_model if latest_run_model is not None else meta.get("llm_model")
+    on_claude_code = is_claude_code_model(effective_held)
     try:
         from src.server.services.llm import thread_model
 
@@ -660,11 +713,10 @@ async def _compaction_config(
             user_id,
             thread_id,
             named=None,
-            held=meta.get("llm_model"),
+            held=effective_held,  # DALTON-HOOK(cos-settings-tools)
             fall_back=not on_claude_code,
-            # DALTON-HOOK(cos-settings-tools): do not carry previous run's system-only flag onto a newly switched thread model
             resolve=await _resolver(
-                user_id, thread_id, meta, route, for_current_selection=True
+                user_id, thread_id, meta, route, latest_attempt=latest  # DALTON-HOOK(cos-settings-tools)
             ),
             clear_dead=clear_dead,
         )
@@ -924,7 +976,13 @@ async def _summary_to_hand_off(thread_id: str):
 
 
 async def hand_off_on_switch(
-    thread_id: str, user_id: str, previous_model: str | None
+    thread_id: str,
+    user_id: str,
+    previous_model: str | None,
+    *,
+    source_system_only: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
+    source_run_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
+    strict_system_only: bool = False,  # DALTON-HOOK(cos-settings-tools)
 ) -> bool:
     """When a switch from ``previous_model`` (None for the account default)
     leaves the thread on a model that cannot read the summary its provider
@@ -941,20 +999,47 @@ async def hand_off_on_switch(
     try:
         # Checked again under the fence; asked first so a switch with nothing
         # to hand off never holds the thread.
-        if await _hand_off_config(thread_id, user_id, previous_model) is None:
+        # DALTON-HOOK(cos-settings-tools): forward source_system_only, source_run_id, and strict_system_only from the same run that supplied previous_model
+        if (
+            await _hand_off_config(
+                thread_id,
+                user_id,
+                previous_model,
+                source_system_only=source_system_only,
+                source_run_id=source_run_id,
+                strict_system_only=strict_system_only,
+            )
+            is None
+        ):
             return False
     except Exception:
         logger.warning(f"[handoff] thread {thread_id}: switch not read", exc_info=True)
         return False
     started = asyncio.get_running_loop().create_future()
     fire_and_forget(
-        _hand_off(thread_id, user_id, previous_model, started),
+        _hand_off(
+            thread_id,
+            user_id,
+            previous_model,
+            started,
+            source_system_only=source_system_only,
+            source_run_id=source_run_id,
+            strict_system_only=strict_system_only,
+        ),
         name=f"handoff_{thread_id[:8]}",
     )
     return await asyncio.shield(started)
 
 
-async def _hand_off_config(thread_id: str, user_id: str, model: str | None):
+async def _hand_off_config(
+    thread_id: str,
+    user_id: str,
+    model: str | None,
+    *,
+    source_system_only: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
+    source_run_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
+    strict_system_only: bool = False,  # DALTON-HOOK(cos-settings-tools)
+):
     """The config ``model`` runs under on the thread and the thread's route,
     when the summary is still to hand off, the thread's model cannot read it,
     and ``model`` can; else None."""
@@ -964,7 +1049,19 @@ async def _hand_off_config(thread_id: str, user_id: str, model: str | None):
     if summary is None:
         return None
     meta, route = await thread_route(thread_id, user_id)
-    resolve = await _resolver(user_id, thread_id, meta, route)
+    # DALTON-HOOK(cos-settings-tools): bind source_system_only captured from the same run; when None, re-read via source_run_id (or latest run) respecting strict_system_only
+    resolve = await _resolver(
+        user_id,
+        thread_id,
+        meta,
+        route,
+        **(
+            {"ignore_custom_models": source_system_only}
+            if source_system_only is not None
+            else ({"strict_system_only": True} if strict_system_only else {})
+        ),
+        **({"source_run_id": source_run_id} if source_run_id else {}),
+    )
     try:
         # DALTON-HOOK(cos-settings-tools): resolve the newly switched-to model under the owner's own selection (not previous run's system-only flag)
         if _resolve_accepts_ignore_custom_override(resolve):
@@ -991,7 +1088,14 @@ async def _hand_off_config(thread_id: str, user_id: str, model: str | None):
 
 
 async def _hand_off(
-    thread_id: str, user_id: str, model: str | None, started: asyncio.Future
+    thread_id: str,
+    user_id: str,
+    model: str | None,
+    started: asyncio.Future,
+    *,
+    source_system_only: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
+    source_run_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
+    strict_system_only: bool = False,  # DALTON-HOOK(cos-settings-tools)
 ) -> None:
     """``model``, the one the thread was on, writes out the summary only its
     provider can read (``HandOff``), in place of the digest; ``started`` is
@@ -1005,7 +1109,14 @@ async def _hand_off(
             _hold_thread_mutation(thread_id, "handoff") as mutation,
             AsyncExitStack() as held,
         ):
-            target = await _hand_off_config(thread_id, user_id, model)
+            target = await _hand_off_config(
+                thread_id,
+                user_id,
+                model,
+                source_system_only=source_system_only,
+                source_run_id=source_run_id,
+                strict_system_only=strict_system_only,
+            )
             if target is None:
                 return
             config, route = target

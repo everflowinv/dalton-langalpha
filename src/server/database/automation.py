@@ -1194,14 +1194,27 @@ async def claim_due_automations(
                         """, (automation_id,))
 
                     # Insert pending execution
+                    # DALTON-HOOK(cos-settings-tools): freeze automation's model config snapshot onto automation_executions in the same transaction
+                    exec_system_only = bool(
+                        (row.get("metadata") or {}).get("llm_model_system_only")
+                    )
                     await cur.execute("""
                         INSERT INTO automation_executions (
                             automation_execution_id, automation_id,
                             status, scheduled_at, server_id, created_at,
-                            heartbeat_at
+                            heartbeat_at, llm_model, reasoning_effort, llm_model_system_only,
+                            snapshot_taken
                         )
-                        VALUES (%s, %s, 'pending', %s, %s, NOW(), NOW())
-                    """, (execution_id, automation_id, row["next_run_at"], server_id))
+                        VALUES (%s, %s, 'pending', %s, %s, NOW(), NOW(), %s, %s, %s, TRUE)
+                    """, (
+                        execution_id,
+                        automation_id,
+                        row["next_run_at"],
+                        server_id,
+                        row.get("llm_model"),
+                        row.get("reasoning_effort"),
+                        exec_system_only,
+                    ))
 
                     entry = dict(row)
                     # DALTON-HOOK(company-automations): reflect once_schedule_at on returned claimed entry
@@ -1234,6 +1247,7 @@ async def claim_price_firing(automation_id: str, server_id: str) -> Optional[str
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor() as cur:
+                # DALTON-HOOK(cos-settings-tools): read model config snapshot from locked automation row and stamp onto automation_executions in the same transaction
                 await cur.execute("""
                     UPDATE automations
                     SET status = 'executing', next_run_at = NULL, last_run_at = NOW()
@@ -1241,17 +1255,41 @@ async def claim_price_firing(automation_id: str, server_id: str) -> Optional[str
                       -- DALTON-HOOK(company-automations): skip a deleted price claim
                       AND deleted_at IS NULL
                       AND (next_run_at IS NULL OR next_run_at <= NOW())
+                    RETURNING llm_model, reasoning_effort,
+                              COALESCE((metadata->>'llm_model_system_only')::boolean, FALSE) AS llm_model_system_only
                 """, (automation_id,))
+                claimed_row = await cur.fetchone()
                 if cur.rowcount == 0:
                     return None
+                if isinstance(claimed_row, dict):
+                    exec_llm_model = claimed_row.get("llm_model")
+                    exec_reasoning_effort = claimed_row.get("reasoning_effort")
+                    exec_system_only = bool(claimed_row.get("llm_model_system_only"))
+                elif claimed_row:
+                    exec_llm_model = claimed_row[0]
+                    exec_reasoning_effort = claimed_row[1] if len(claimed_row) > 1 else None
+                    exec_system_only = bool(claimed_row[2]) if len(claimed_row) > 2 else False
+                else:
+                    exec_llm_model = None
+                    exec_reasoning_effort = None
+                    exec_system_only = False
+                # DALTON-HOOK(cos-settings-tools): insert pending price-firing execution with frozen snapshot + snapshot_taken=TRUE
                 await cur.execute("""
                     INSERT INTO automation_executions (
                         automation_execution_id, automation_id,
                         status, scheduled_at, server_id, created_at,
-                        heartbeat_at
+                        heartbeat_at, llm_model, reasoning_effort, llm_model_system_only,
+                        snapshot_taken
                     )
-                    VALUES (%s, %s, 'pending', NOW(), %s, NOW(), NOW())
-                """, (execution_id, automation_id, server_id))
+                    VALUES (%s, %s, 'pending', NOW(), %s, NOW(), NOW(), %s, %s, %s, TRUE)
+                """, (
+                    execution_id,
+                    automation_id,
+                    server_id,
+                    exec_llm_model,
+                    exec_reasoning_effort,
+                    exec_system_only,
+                ))
     return execution_id
 
 

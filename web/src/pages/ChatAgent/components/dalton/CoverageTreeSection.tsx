@@ -63,8 +63,10 @@ function writeSectionCollapsed(collapsed: boolean): void {
  */
 export function CoverageTreeSection({
   currentWorkspaceId,
+  onNavigate,
 }: {
   currentWorkspaceId?: string | null;
+  onNavigate?: () => void;
 }): React.ReactElement | null {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -129,7 +131,10 @@ export function CoverageTreeSection({
   if (!split || (split.sectors.length === 0 && split.standaloneCompanies.length === 0)) return null;
 
   const unclassifiedCount = data.unclassified?.length ?? 0;
-  const enterWorkspace = (wsId: string) => navigate(`/chat/${wsId}`);
+  const enterWorkspace = (wsId: string) => {
+    navigate(`/chat/${wsId}`);
+    onNavigate?.();
+  };
 
   return (
     <div className="shrink-0" data-testid="coverage-tree-section">
@@ -148,7 +153,7 @@ export function CoverageTreeSection({
         <div className="sidebar-section-actions">
           <button
             type="button"
-            className="nav-panel-dismiss-btn sidebar-section-action-btn"
+            className="nav-panel-dismiss-btn sidebar-section-action-btn tap-target"
             onClick={toggleSection}
             aria-label={t('dalton.coverage.toggleSection')}
             title={t('dalton.coverage.toggleSection')}
@@ -244,8 +249,14 @@ export function CoverageTreeSection({
               title={t('dalton.coverage.openSettings')}
               role="button"
               tabIndex={0}
-              onClick={() => navigate('/settings?tab=coverage#dalton-coverage-unclassified')}
-              onKeyDown={rowKeyDown(() => navigate('/settings?tab=coverage#dalton-coverage-unclassified'))}
+              onClick={() => {
+                navigate('/settings?tab=coverage#dalton-coverage-unclassified');
+                onNavigate?.();
+              }}
+              onKeyDown={rowKeyDown(() => {
+                navigate('/settings?tab=coverage#dalton-coverage-unclassified');
+                onNavigate?.();
+              })}
             >
               <Folder className="h-4 w-4 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
               <span className="text-sm font-medium truncate" style={{ color: 'var(--color-text-tertiary)' }}>
@@ -348,7 +359,7 @@ function SectorRow({
               }}
               aria-expanded={expanded}
               aria-label={label}
-              className="flex shrink-0 items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer"
+              className="tap-target flex shrink-0 items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer"
             >
               <ChevronRight
                 className={`${CHEVRON_CLASS}${expanded ? ' rotate-90' : ''}`}

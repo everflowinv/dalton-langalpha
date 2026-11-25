@@ -8,10 +8,11 @@ whitelisting, and unchanged behavior for other interrupts.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, create_autospec, patch
+from unittest.mock import create_autospec, patch
 
 import pytest
 from fastapi import HTTPException
@@ -22,6 +23,7 @@ from src.server.database.conversation import senders, threads_read
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.dependencies.principal import Principal, get_principal
 from src.server.handlers import checkpoint_handler
+from src.server.handlers.chat.ptc_run import astream_ptc_workflow
 from src.server.handlers.checkpoint_handler import settle_resume_request
 from src.server.models.chat import ChatRequest, HITLDecision, HITLResponse
 from src.server.services.computer_manager import ComputerManager
@@ -447,7 +449,7 @@ async def test_route_rejects_service_caller_combining_fork_and_hitl_response(
         user_id=OWNER_ID, auth="service"
     )
     workflow = create_autospec(
-        lambda **kwargs: _empty_async_gen(), return_value=_empty_async_gen()
+        astream_ptc_workflow, return_value=_empty_async_gen()
     )
     with (
         _stub_downstream(owner_id=OWNER_ID, ws_owner=OWNER_ID),
@@ -488,7 +490,7 @@ async def test_route_enforces_web_session_for_create_workspace_confirm(
         user_id=OWNER_ID, auth="service"
     )
     workflow_svc = create_autospec(
-        lambda **kwargs: _empty_async_gen(), return_value=_empty_async_gen()
+        astream_ptc_workflow, return_value=_empty_async_gen()
     )
     with (
         _stub_downstream(owner_id=OWNER_ID, ws_owner=OWNER_ID),
@@ -517,7 +519,7 @@ async def test_route_enforces_web_session_for_create_workspace_confirm(
         user_id=OWNER_ID, auth="session"
     )
     workflow_web = create_autospec(
-        lambda **kwargs: _empty_async_gen(), return_value=_empty_async_gen()
+        astream_ptc_workflow, return_value=_empty_async_gen()
     )
     with (
         _stub_downstream(owner_id=OWNER_ID, ws_owner=OWNER_ID),
@@ -549,13 +551,21 @@ async def test_first_cos_message_without_primary_binds_home_and_reaches_session_
     route.bind -> ensure_home_bound -> ensure_primary_computer -> real
     astream_ptc_workflow -> acquire_session -> resolve_binding ->
     get_session_for_workspace without failing with WorkspaceNotOnComputer."""
-    from contextlib import ExitStack, nullcontext
-    from unittest.mock import MagicMock
+    from contextlib import ExitStack
 
     from ptc_agent.config.core import SandboxConfig
-    from src.server.handlers.chat.ptc_run import astream_ptc_workflow
+    from src.server.database import workspace as ws_db
+    from src.server.handlers.chat import ptc_run
     from src.server.handlers.chat.request_prep import PriorThread
+    from src.server.services import home_placement
+    from src.server.services.background_registry_store import BackgroundRegistryStore
+    from src.server.services.computer_manager import _machines
     from src.server.services.report_back.handoff.carry import PriorAttempt
+    from src.server.services.runs.coordinator import RunHandle
+    from src.server.services.shared_workspaces import turn as sw_turn
+    from src.server.services.workspace_manager import WorkspaceManager
+    from src.tools.decorators import ToolUsageTracker
+    from src.utils.tracking import TokenTrackingManager
 
     home_id = get_home_workspace_id(OWNER_ID)
     app = _app_for(OWNER_ID)
@@ -627,101 +637,167 @@ async def test_first_cos_message_without_primary_binds_home_and_reaches_session_
     class _StopAfterSession(BaseException):
         pass
 
-    sentinel_registry_store = MagicMock()
-    sentinel_registry_store.get_or_create_registry = AsyncMock(
-        side_effect=_StopAfterSession("reached past acquire_session")
+    sentinel_registry_store = create_autospec(BackgroundRegistryStore, instance=True)
+    sentinel_registry_store.get_or_create_registry.side_effect = _StopAfterSession(
+        "reached past acquire_session"
     )
-    run_mgr = MagicMock()
-    run_mgr.awaiting_computer.side_effect = lambda _tid, _rid: nullcontext(None)
-    run_handle = MagicMock(
-        run_id="run-first-1", turn_index=1, finalized=False, origin=None
+    token_callback = create_autospec(TokenTrackingManager, instance=True)
+    tool_tracker = create_autospec(ToolUsageTracker, instance=True)
+    run_handle = RunHandle(
+        run_id="run-first-1",
+        thread_id=THREAD_ID,
+        turn_index=1,
+        attempt_no=1,
+        finalized=False,
+        origin=None,
     )
+
+    def _close_detached(coro: Any, *_args: Any, **_kwargs: Any) -> None:
+        if inspect.iscoroutine(coro):
+            coro.close()
 
     ptc = "src.server.handlers.chat.ptc_run"
     patches = (
         _stub_downstream(owner_id=None, ws_owner=OWNER_ID),
-        patch("src.server.database.workspace.get_workspace", AsyncMock(return_value=None)),
+        patch(
+            "src.server.database.workspace.get_workspace",
+            create_autospec(ws_db.get_workspace, return_value=None),
+        ),
         patch(
             "src.server.database.workspace.get_or_create_home_workspace",
-            AsyncMock(
+            create_autospec(
+                ws_db.get_or_create_home_workspace,
                 return_value={
                     "workspace_id": home_id,
                     "user_id": OWNER_ID,
                     "computer_id": None,
                     "dir_name": None,
-                }
+                },
             ),
         ),
         patch(
             "src.server.services.workspace_manager.WorkspaceManager.get_instance",
-            return_value=real_mgr,
+            create_autospec(WorkspaceManager.get_instance, return_value=real_mgr),
         ),
         patch(
             "src.server.services.computer_manager._machines.get_computer_for_workspace",
-            side_effect=_get_computer_for_ws,
+            create_autospec(
+                _machines.get_computer_for_workspace,
+                side_effect=_get_computer_for_ws,
+            ),
         ),
         patch(
             "src.server.services.computer_manager._sessions.get_computer_for_workspace",
-            side_effect=_get_computer_for_ws,
+            create_autospec(
+                _machines.get_computer_for_workspace,
+                side_effect=_get_computer_for_ws,
+            ),
         ),
         patch(
             "src.server.services.computer_manager._machines.db_get_workspace",
-            AsyncMock(
+            create_autospec(
+                ws_db.get_workspace,
                 return_value={
                     "workspace_id": home_id,
                     "user_id": OWNER_ID,
                     "computer_id": None,
                     "dir_name": None,
-                }
+                },
             ),
         ),
         patch(
             "src.server.services.computer_manager._machines.get_primary_computer",
-            side_effect=_get_primary,
+            create_autospec(_machines.get_primary_computer, side_effect=_get_primary),
         ),
         patch(
             "src.server.services.computer_manager._machines.promote_primary_computer",
-            side_effect=_promote_primary,
+            create_autospec(
+                _machines.promote_primary_computer, side_effect=_promote_primary
+            ),
         ),
         patch(
             "src.server.services.computer_manager._machines.publish_workspace_binding_change",
-            AsyncMock(),
+            create_autospec(_machines.publish_workspace_binding_change, return_value=None),
         ),
         patch(
             "src.server.services.home_placement.get_home_computer",
-            side_effect=lambda _uid: state["home_computer"],
+            create_autospec(
+                home_placement.get_home_computer,
+                side_effect=lambda _uid, *, conn=None: state["home_computer"],
+            ),
         ),
         patch(
             "src.server.services.home_placement.computer_unreachable",
-            AsyncMock(return_value=False),
+            create_autospec(home_placement.computer_unreachable, return_value=False),
         ),
         patch(
             "src.server.services.home_placement.home_back_notice",
-            AsyncMock(return_value=None),
+            create_autospec(home_placement.home_back_notice, return_value=None),
         ),
         # Keep real astream_ptc_workflow (undo _stub_downstream's replacement).
         patch("src.server.handlers.chat.astream_ptc_workflow", astream_ptc_workflow),
         patch(
             f"{ptc}.carry.prior_attempt",
-            new=AsyncMock(return_value=PriorAttempt(latest=None, retried=None)),
+            new=create_autospec(
+                ptc_run.carry.prior_attempt,
+                return_value=PriorAttempt(latest=None, retried=None),
+            ),
         ),
-        patch(f"{ptc}.ensure_thread", new=AsyncMock(return_value=PriorThread())),
-        patch(f"{ptc}._resolve_origin_meta", new=AsyncMock(return_value={})),
-        patch(f"{ptc}._resolve_fork", return_value=("create workspace NVDA", None)),
-        patch(f"{ptc}.begin_run", new=AsyncMock(return_value=run_handle)),
-        patch(f"{ptc}.wait_or_steer", new=AsyncMock(return_value=(True, None))),
+        patch(
+            f"{ptc}.ensure_thread",
+            new=create_autospec(ptc_run.ensure_thread, return_value=PriorThread()),
+        ),
+        patch(
+            f"{ptc}._resolve_origin_meta",
+            new=create_autospec(ptc_run._resolve_origin_meta, return_value={}),
+        ),
+        patch(
+            f"{ptc}._resolve_fork",
+            new=create_autospec(
+                ptc_run._resolve_fork,
+                return_value=("create workspace NVDA", None),
+            ),
+        ),
+        patch(
+            f"{ptc}.begin_run",
+            new=create_autospec(ptc_run.begin_run, return_value=run_handle),
+        ),
+        patch(
+            f"{ptc}.wait_or_steer",
+            new=create_autospec(ptc_run.wait_or_steer, return_value=(True, None)),
+        ),
         patch(
             "src.server.services.shared_workspaces.turn.get_user_profile_for_prompt",
-            new=AsyncMock(return_value=None),
+            new=create_autospec(sw_turn.get_user_profile_for_prompt, return_value=None),
         ),
-        patch(f"{ptc}.init_tracking", return_value=(run_mgr, MagicMock())),
-        patch(f"{ptc}.apply_fetch_override"),
-        patch(f"{ptc}._fire_and_forget"),
-        patch(f"{ptc}.update_workspace_activity"),
-        patch(f"{ptc}.keep_named_model", new=AsyncMock()),
+        patch(
+            f"{ptc}.init_tracking",
+            new=create_autospec(
+                ptc_run.init_tracking, return_value=(token_callback, tool_tracker)
+            ),
+        ),
+        patch(
+            f"{ptc}.apply_fetch_override",
+            new=create_autospec(ptc_run.apply_fetch_override, return_value=None),
+        ),
+        patch(
+            f"{ptc}._fire_and_forget",
+            new=create_autospec(ptc_run._fire_and_forget, side_effect=_close_detached),
+        ),
+        patch(
+            f"{ptc}.update_workspace_activity",
+            new=create_autospec(ptc_run.update_workspace_activity, return_value=None),
+        ),
+        patch(
+            f"{ptc}.keep_named_model",
+            new=create_autospec(ptc_run.keep_named_model, return_value=None),
+        ),
         patch(
             f"{ptc}.BackgroundRegistryStore.get_instance",
-            return_value=sentinel_registry_store,
+            new=create_autospec(
+                BackgroundRegistryStore.get_instance,
+                return_value=sentinel_registry_store,
+            ),
         ),
     )
     with ExitStack() as stack:

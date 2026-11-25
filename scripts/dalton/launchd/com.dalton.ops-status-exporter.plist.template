@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for Dalton host operational jobs status exporter (runs every 60s).
+  Writes var/dalton/ops_jobs_status.json (freshness TTL 300s) consumed by the backend
+  system-jobs service without querying researchdata_bridge /jobs/ops.
+  Install to ~/Library/LaunchAgents/com.dalton.ops-status-exporter.plist:
+    1. Replace __PYTHON_BIN__, __REPO__, __HOME__, and __LOG_DIR__ with host paths.
+    2. Load with: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.ops-status-exporter.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dalton.ops-status-exporter</string>
+    <key>LowPriorityBackgroundIO</key>
+    <false/>
+    <key>LowPriorityIO</key>
+    <false/>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Standard</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>__REPO__/scripts/dalton/ops/prod/export_ops_status.py</string>
+        <string>--output</string>
+        <string>__REPO__/var/dalton/ops_jobs_status.json</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>DALTON_HOST_PLATFORM</key>
+        <string>macos</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>60</integer>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/dalton-ops-status-exporter.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/dalton-ops-status-exporter.err.log</string>
+</dict>
+</plist>

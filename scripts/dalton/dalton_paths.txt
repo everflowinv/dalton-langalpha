@@ -595,3 +595,20 @@ web/src/pages/ChatAgent/components/viewers/__tests__/InlineWidget.exports.test.t
 tests/unit/server/test_cos_confirm_authenticity.py
 tests/unit/tools/secretary/test_cos_settings_batch2.py
 web/src/pages/ChatAgent/session/interrupts/__tests__/createWorkspaceLifecycle.test.ts
+# Mobile web P0 fixes unit and Playwright E2E tests (DALTON-HOOK(mobile-web)).
+web/src/lib/__tests__/visualViewport.mobile.test.ts
+web/src/pages/ChatAgent/components/__tests__/CreateWorkspaceModal.mobile.test.tsx
+web/src/pages/ChatAgent/components/filePanel/__tests__/DirectoryNode.mobile.test.tsx
+web/src/pages/ChatAgent/components/viewers/__tests__/BrowserViewer.mobile.test.tsx
+web/e2e/mobile-p0.spec.js
+# Mobile web P1 usability tests (DALTON-HOOK(mobile-web)).
+web/src/components/BottomTabBar/__tests__/BottomTabBar.mobile.test.tsx
+web/src/components/ui/__tests__/chat-input.mobileEnterAndPicker.test.tsx
+web/src/pages/ChatAgent/components/viewers/html/comments/__tests__/CommentComposer.mobileEnter.test.tsx
+web/src/pages/ChatAgent/components/__tests__/MobileP1Surfaces.test.tsx
+web/e2e/mobile-p1-layout.spec.js
+# Mobile web P2 polish, reading, WeChat, and touch-target tests (DALTON-HOOK(mobile-web)).
+web/src/pages/ChatAgent/components/__tests__/ChatView.mobileSafeArea.test.tsx
+web/src/pages/ChatAgent/components/__tests__/MobileP2ReadingAndWechat.test.tsx
+web/src/components/ui/__tests__/chat-input.mobileVoice.test.tsx
+web/e2e/mobile-p2-touch.spec.js

@@ -48,6 +48,27 @@ pnpm test        # 运行 Vitest 单元测试
   3. 群组已在 Dalton 渠道设置（`dalton_channel_user_settings` 与 `dalton_channel_chat_bindings`）中显式登记，且属主具备绑定工作区写权限（绝不以“机器人在群列表中可见”替代 Dalton 渠道授权）；
   4. 网关发送首条消息前通过适配器实时核验机器人群组可达性（飞书调用完整分页的 `im.chat.list` 与 `im.chat.get`，若分页未完成返回 `unavailable`，若机器人不在目标群返回 `not_allowed`，均在写入发送台账或调用发送接口前中止）。
 
+### 4. 处理状态反馈与所需平台权限
+
+当入站消息通过群聊触发门控且后端 `I-1` 校验返回已绑定、已允许后，网关会以旁路、非阻塞方式添加“已收到/处理中”反馈；首条回复投递成功、进入 `interrupt`（等待用户确认/提问）或主轮次结束（包括已移交后台 `ActiveWatchHandle` 的情况）时自动清理，连错误提示也无法投递的彻底失败场景下给出失败视觉信号。
+
+- **进程内存态与尽力而为**：状态反馈句柄仅保存在网关进程内存，不写入数据库、不依赖后端能力开关；网关重启后旧消息上残留的表情回应不再自动清理。所有状态接口失败（包括缺少权限、限流或网络异常）均仅记录 `debug` / `warn` 日志并跳过，绝不阻塞或影响正常回复与投递；原消息被撤回/删除（飞书 `230011` / `231003` / `230110`、Discord HTTP `404` / `10008`）时静默放弃。
+- **开关配置（Everflow 与核心安装一致，默认全部开启）**：
+  - `DALTON_STATUS_FEEDBACK_ENABLED`：总开关（默认 `true`；设为 `false` / `0` 关闭全部平台反馈）。
+  - `DALTON_FEISHU_STATUS_FEEDBACK_ENABLED`：飞书单独开关（默认 `true`）。
+  - `DALTON_DISCORD_STATUS_FEEDBACK_ENABLED`：Discord 单独开关（默认 `true`）。
+  - `DALTON_WEIXIN_STATUS_FEEDBACK_ENABLED`：微信单独开关（默认 `true`）。
+- **各平台机制与部署所需权限**：
+  1. **飞书**：
+     - 机制：对原消息调用 `POST /open-apis/im/v1/messages/:message_id/reactions` 添加 `Typing` 表情（若该类型不可用自动回退为 `OnIt`，可按适配器选项配置），首条回复成功后调用 `DELETE /open-apis/im/v1/messages/:message_id/reactions/:reaction_id` 删除；投递彻底失败时补加 `CrossMark`。
+     - 所需权限（Scope）：**`im:message.reactions:write_only`**（或已包含表情写入能力的 `im:message`）。飞书企业自建应用新增权限后需创建新版本并由企业管理员审批发布；缺少该权限时网关仅记日志跳过，不影响消息收发。
+  2. **Discord**：
+     - 机制：对原消息调用 `PUT /channels/{channel_id}/messages/{message_id}/reactions/%E2%8F%B3/@me` 添加 `⏳`；私聊与机器人所在子区（Thread）同步调用 `POST /channels/{channel_id}/typing`（每 8 秒续期一次，最长 120 秒），公开频道仅加表情不发 typing。首条回复成功后 `DELETE` 移除 `⏳` 并停止 typing；彻底失败时补加 `⚠️`。
+     - 所需 Bot 权限：**`Add Reactions`（`ADD_REACTIONS`）**、`Read Message History`（`READ_MESSAGE_HISTORY`）、`View Channel`（`VIEW_CHANNEL`）、`Send Messages`（`SEND_MESSAGES`，子区需 `Send Messages in Threads`；私聊默认具备）。缺少权限（如 HTTP `403` / `50013`）时仅记日志跳过，不影响消息收发。
+  3. **微信（iLink）**：
+     - 机制：缺失 `typing_ticket` 时调用 `POST ilink/bot/getconfig` 获取并在进程内存缓存，再调用 `POST ilink/bot/sendtyping`（`status=1` 开启、每 10 秒续期一次、最长 120 秒；结束时 `status=2` 取消）。
+     - 所需权限：复用现有扫码登录后的 `bot_token` 与 `context_token`，无需额外权限审批。
+
 ---
 
 ## 平台原生命令菜单注册（`dalton-native-commands`）

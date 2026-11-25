@@ -403,17 +403,21 @@ def parse_delivery_target(raw_target: str) -> tuple[str, str, str, str]:
         return cleaned, "discord", "dm", ident
     if cleaned.startswith("weixin:user:"):
         ident = cleaned[len("weixin:user:") :]
+        if not ident or len(ident) > 255 or any(ch.isspace() for ch in ident) or ":" in ident:
+            raise ReportDeliveryError(
+                f"非法的微信私信目标格式: {raw_target!r}", code="invalid_target"
+            )
         return cleaned, "weixin", "dm", ident
 
     # Group-shaped identifiers from unsupported or generic channels must not be
     # treated as authorized groups.
     if ":chat:" in cleaned or ":channel:" in cleaned or cleaned.endswith(":@me"):
         raise ReportDeliveryError(
-            f"暂不支持该目标格式 {raw_target!r}；仅支持 feishu:chat:oc_* / feishu:user:ou_* / discord:channel:* / discord:user:*",
+            f"暂不支持该目标格式 {raw_target!r}；仅支持 feishu:chat:oc_* / feishu:user:ou_* / discord:channel:* / discord:user:* / weixin:user:*",
             code="invalid_target",
         )
     raise ReportDeliveryError(
-        f"非法的发送目标格式 {raw_target!r}；应使用 feishu:chat:oc_* / feishu:user:ou_* / discord:user:* / discord:channel:*",
+        f"非法的发送目标格式 {raw_target!r}；应使用 feishu:chat:oc_* / feishu:user:ou_* / discord:user:* / discord:channel:* / weixin:user:*",
         code="invalid_target",
     )
 
@@ -423,22 +427,38 @@ async def list_caller_dm_identities(
     *,
     conn: Any = None,
 ) -> list[dict[str, Any]]:
-    """Return all bound DM channel identities for ``user_id`` from ``dalton_channel_identities``."""
+    """Return all bound DM channel identities for ``user_id`` (new table for Weixin, identities for others)."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
     cleaned_uid = str(user_id or "").strip()
     if not cleaned_uid:
         return []
+    wx_enabled = has_capability(CapabilityId.CHANNEL_WEIXIN)
+    rows: list[dict[str, Any]] = []
     async with _use_conn(conn) as db_conn:
         async with db_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
                 SELECT platform, platform_user_id
                 FROM dalton_channel_identities
-                WHERE user_id = %s
+                WHERE user_id = %s AND platform <> 'weixin'
                 ORDER BY platform, platform_user_id
                 """,
                 (cleaned_uid,),
             )
-            rows = await cur.fetchall()
+            rows.extend(await cur.fetchall() or [])
+            if wx_enabled:
+                await cur.execute(
+                    """
+                    SELECT 'weixin' AS platform, ilink_user_id AS platform_user_id
+                    FROM dalton_channel_weixin_accounts
+                    WHERE user_id = %s
+                      AND status = 'active'
+                      AND ilink_user_id IS NOT NULL
+                    """,
+                    (cleaned_uid,),
+                )
+                rows.extend(await cur.fetchall() or [])
     result: list[dict[str, Any]] = []
     for row in rows:
         plat = str(row.get("platform") or "").strip().lower()
@@ -452,7 +472,7 @@ async def list_caller_dm_identities(
                 "platform_user_id": puid,
                 "target": target,
                 "supports_report_cards": plat == "feishu",
-                "supports_text_targets": plat in {"feishu", "discord"},
+                "supports_text_targets": plat in {"feishu", "discord", "weixin"},
                 "supports_failure_targets": plat == "discord",
             }
         )
@@ -2039,7 +2059,7 @@ async def validate_report_profile_change(
     parsed_ok, parse_err = parse_report_profile({"report_profile": new_profile})
     if parse_err or parsed_ok is None:
         raise ReportDeliveryError(
-            "发送目标格式与 report_profile 规则不兼容：report_targets 仅支持 feishu:chat:oc_* / feishu:user:ou_*，failure_targets 仅支持 discord:user:*，text_targets 支持飞书/Discord，且至少需有一个有效报告/文字目标。",
+            "发送目标格式与 report_profile 规则不兼容：report_targets 仅支持 feishu:chat:oc_* / feishu:user:ou_*，failure_targets 仅支持 discord:user:*，text_targets 支持飞书/Discord/微信，且至少需有一个有效报告/文字目标。",
             code="profile_invalid",
         )
 

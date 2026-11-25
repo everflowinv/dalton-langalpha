@@ -10,7 +10,8 @@
  * - Uses Feishu `WSClient` long connection only (no webhook callback server).
  * - Deduplicates incoming events via `MemoryDedupeGuard` (`src/shared/dedupe.ts`).
  * - Serializes per-chat inbound handling via `createSequentialQueue` (`src/shared/keyed-queue.ts`).
- * - Excludes `FeishuStreamingSession` (streaming cards) and typing reaction lifecycle.
+ * - Excludes `FeishuStreamingSession` (streaming cards); best-effort processing reaction
+ *   feedback (`Typing` / `OnIt` / `CrossMark`) runs in memory via `beginProcessingFeedback`.
  */
 
 import type * as Lark from "@larksuiteoapi/node-sdk";
@@ -37,6 +38,9 @@ import {
   ChannelDeliveryError,
   type CheckTargetLiveResult,
   type DownloadedAttachment,
+  type ProcessingFeedbackContext,
+  type ProcessingFeedbackHandle,
+  type ProcessingFeedbackOutcome,
   type SendCardImageInput,
   type SendCardOptions,
   type SendCardResult,
@@ -78,7 +82,12 @@ import {
 } from "./media.js";
 import { probeFeishu } from "./probe.js";
 import {
+  addFeishuReaction,
+  FEISHU_FAILED_EMOJI_TYPE,
+  FEISHU_PROCESSING_EMOJI_FALLBACK_TYPE,
+  FEISHU_PROCESSING_EMOJI_TYPE,
   getMessageFeishu,
+  removeFeishuReaction,
   sendCardFeishu,
   sendMessageFeishu,
   sendStructuredCardFeishu,
@@ -351,6 +360,12 @@ export interface FeishuChannelAdapterOptions {
   dedupeTtlMs?: number;
   queueTaskTimeoutMs?: number;
   logger?: SubsystemLogger;
+  /** Primary processing reaction emoji type (default `FEISHU_PROCESSING_EMOJI_TYPE` = `"Typing"`). */
+  processingEmojiType?: string;
+  /** Fallback emoji type if the primary type is rejected as unavailable (default `"OnIt"`). */
+  processingEmojiFallbackType?: string;
+  /** Terminal failure emoji type added when delivery fails completely (default `"CrossMark"`). */
+  failedEmojiType?: string;
 }
 
 function collectFeishuCardPlaceholderPaths(node: unknown, out: string[]): void {
@@ -442,6 +457,9 @@ export class FeishuChannelAdapter implements ChannelAdapter {
   private readonly dedupe: MemoryDedupeGuard;
   private readonly queue: SequentialQueue;
   private readonly logger: SubsystemLogger;
+  private readonly processingEmojiType: string;
+  private readonly processingEmojiFallbackType: string;
+  private readonly failedEmojiType: string;
   private readonly handlers: Array<(event: InboundChannelEvent) => Promise<void>> =
     [];
   private monitorHandle: MonitorFeishuWebSocketHandle | null = null;
@@ -461,6 +479,13 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     this.wsClientFactory = options.wsClientFactory;
     this.eventDispatcherFactory = options.eventDispatcherFactory;
     this.logger = options.logger ?? createSubsystemLogger("feishu");
+    this.processingEmojiType =
+      options.processingEmojiType?.trim() || FEISHU_PROCESSING_EMOJI_TYPE;
+    this.processingEmojiFallbackType =
+      options.processingEmojiFallbackType?.trim() ||
+      FEISHU_PROCESSING_EMOJI_FALLBACK_TYPE;
+    this.failedEmojiType =
+      options.failedEmojiType?.trim() || FEISHU_FAILED_EMOJI_TYPE;
     this.dedupe = createMemoryDedupe({ ttlMs: options.dedupeTtlMs });
     this.queue = createSequentialQueue({
       taskTimeoutMs: options.queueTaskTimeoutMs,
@@ -693,6 +718,161 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       return [];
     }
     return chunkFeishuTextMessage(text);
+  }
+
+  /**
+   * Starts best-effort processing reaction feedback (`Typing`, falling back to `OnIt`
+   * if unavailable) on the inbound Feishu message without blocking reply dispatch.
+   * Reaction state lives only in gateway process memory (reactions left behind before
+   * a gateway restart are not cleaned up).
+   */
+  beginProcessingFeedback(
+    context: ProcessingFeedbackContext,
+  ): ProcessingFeedbackHandle | null {
+    const messageId = context.event.messageId.trim();
+    if (!messageId) {
+      return null;
+    }
+
+    let client: Lark.Client;
+    try {
+      client = this.getClient();
+    } catch {
+      return null;
+    }
+
+    let reactionId: string | null = null;
+    let withdrawn = false;
+    let settled = false;
+    let settlePromise: Promise<void> | null = null;
+
+    const addTask = (async () => {
+      const emojiType = this.processingEmojiType;
+      const first = await addFeishuReaction(client, {
+        messageId,
+        emojiType,
+      });
+      if (first.withdrawn) {
+        withdrawn = true;
+        this.logger.debug(
+          "Feishu original message withdrawn before processing reaction",
+          { messageId },
+        );
+        return;
+      }
+      if (first.ok) {
+        reactionId = first.reactionId;
+        return;
+      }
+      // Fallback per message (no shared mutable flag) so concurrent messages
+      // hitting an unavailable primary emoji each fall back independently.
+      if (
+        first.invalidEmojiType &&
+        this.processingEmojiFallbackType &&
+        this.processingEmojiFallbackType !== emojiType
+      ) {
+        const fallback = await addFeishuReaction(client, {
+          messageId,
+          emojiType: this.processingEmojiFallbackType,
+        });
+        if (fallback.withdrawn) {
+          withdrawn = true;
+          this.logger.debug(
+            "Feishu original message withdrawn during fallback processing reaction",
+            { messageId },
+          );
+          return;
+        }
+        if (fallback.ok) {
+          reactionId = fallback.reactionId;
+          return;
+        }
+        this.logger.warn("Feishu fallback processing reaction failed", {
+          messageId,
+          emojiType: this.processingEmojiFallbackType,
+          error: fallback.error,
+        });
+        return;
+      }
+      this.logger.debug("Feishu processing reaction skipped", {
+        messageId,
+        emojiType,
+        error: first.error,
+      });
+    })().catch((err) => {
+      this.logger.warn("Feishu processing reaction unexpected error", {
+        messageId,
+        error: err,
+      });
+    });
+
+    return {
+      settle: (outcome: ProcessingFeedbackOutcome): Promise<void> => {
+        if (settled) {
+          return settlePromise ?? Promise.resolve();
+        }
+        settled = true;
+        settlePromise = (async () => {
+          await addTask;
+          if (withdrawn) {
+            return;
+          }
+          if (reactionId) {
+            const removed = await removeFeishuReaction(client, {
+              messageId,
+              reactionId,
+            });
+            if (removed.withdrawn) {
+              withdrawn = true;
+              this.logger.debug(
+                "Feishu original message withdrawn before removing processing reaction",
+                { messageId, reactionId },
+              );
+              return;
+            }
+            if (!removed.ok) {
+              this.logger.warn("Feishu processing reaction removal failed", {
+                messageId,
+                reactionId,
+                error: removed.error,
+              });
+            }
+          }
+          if (
+            outcome === "delivery_failed" &&
+            !withdrawn &&
+            this.failedEmojiType
+          ) {
+            const addedFailure = await addFeishuReaction(client, {
+              messageId,
+              emojiType: this.failedEmojiType,
+            });
+            if (addedFailure.withdrawn) {
+              withdrawn = true;
+              this.logger.debug(
+                "Feishu original message withdrawn before adding failure reaction",
+                { messageId },
+              );
+              return;
+            }
+            if (!addedFailure.ok) {
+              this.logger.warn("Feishu failure reaction add failed", {
+                messageId,
+                emojiType: this.failedEmojiType,
+                error: addedFailure.error,
+              });
+            }
+          }
+        })().catch((err) => {
+          this.logger.warn("Feishu processing feedback settle error", {
+            messageId,
+            outcome,
+            error: err,
+          });
+        });
+        return settlePromise;
+      },
+    };
   }
 
   async sendTextChunk(

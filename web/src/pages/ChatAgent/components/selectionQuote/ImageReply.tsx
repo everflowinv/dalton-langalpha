@@ -39,9 +39,11 @@ async function fileFromImage(img: HTMLImageElement): Promise<File | null> {
   }
 }
 
-function ReplyButton({ anchor, boundsRef, onReply, onLost }: {
+function ReplyButton({ anchor, boundsRef, mobileOverlay = false, onReply, onLost }: {
   anchor: ImageAnchor;
   boundsRef: RefObject<HTMLElement | null>;
+  // DALTON-HOOK(mobile-web): mark overlays belonging to the active mobile full-screen FilePanel for z-index scoping
+  mobileOverlay?: boolean;
   onReply: () => void;
   onLost: () => void;
 }) {
@@ -53,6 +55,8 @@ function ReplyButton({ anchor, boundsRef, onReply, onLost }: {
     <div
       ref={ref}
       {...surfaceProps}
+      // DALTON-HOOK(mobile-web): scope z-index elevation strictly to the active mobile FilePanel instance
+      data-mobile-overlay-active={mobileOverlay ? '' : undefined}
       className="selection-quote-toolbar"
       style={{ left: position?.left ?? 0, top: position?.top ?? 0, visibility: position && !offscreen ? 'visible' : 'hidden' }}
     >
@@ -69,11 +73,13 @@ function ReplyButton({ anchor, boundsRef, onReply, onLost }: {
  * as an attachment, so the agent sees what the user sees, and the reply becomes
  * the draft's words.
  */
-export function ImageReply({ surfaceRef, enabled, paused = false, agentName, onAddContext }: {
+export function ImageReply({ surfaceRef, enabled, paused = false, mobileOverlay = false, agentName, onAddContext }: {
   surfaceRef: RefObject<HTMLElement | null>;
   enabled: boolean;
   /** Something else has the pointer's attention: nothing new opens, what is open stays. */
   paused?: boolean;
+  // DALTON-HOOK(mobile-web): mark overlays belonging to the active mobile full-screen FilePanel for z-index scoping
+  mobileOverlay?: boolean;
   agentName?: string;
   onAddContext?: ((ctx: ContextPayload) => void) | null;
 }) {
@@ -93,7 +99,7 @@ export function ImageReply({ surfaceRef, enabled, paused = false, agentName, onA
   if (!replyingTo) {
     if (!enabled || !hovered.anchor) return null;
     const anchor = hovered.anchor;
-    return <ReplyButton anchor={anchor} boundsRef={surfaceRef} onReply={() => setReplyingTo(anchor)} onLost={hovered.clear} />;
+    return <ReplyButton anchor={anchor} boundsRef={surfaceRef} mobileOverlay={mobileOverlay} onReply={() => setReplyingTo(anchor)} onLost={hovered.clear} />;
   }
 
   const { image } = replyingTo;
@@ -115,6 +121,7 @@ export function ImageReply({ surfaceRef, enabled, paused = false, agentName, onA
   };
 
   return (
+    /* DALTON-HOOK(mobile-web): forward active mobile FilePanel marker to portaled image reply composer */
     <QuoteComposer
       key={replyingTo.id}
       anchor={replyingTo}
@@ -122,6 +129,7 @@ export function ImageReply({ surfaceRef, enabled, paused = false, agentName, onA
       label={t('context.quote.replyToImage')}
       placeholder={agentName ? t('context.quote.reply', { name: agentName }) : t('context.quote.replyGeneric')}
       hidden={!enabled}
+      mobileOverlay={mobileOverlay}
       onAdd={add}
       onDismiss={() => setReplyingTo(null)}
     />

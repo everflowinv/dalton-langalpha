@@ -24,9 +24,191 @@ export interface LoggerSink {
 }
 
 const SENSITIVE_KEY_PATTERN =
-  /(?:^(?:text|content|body|raw_body|message_body|prompt|buffer|file_bytes|audio_bytes)$|secret|token|password|authorization|cookie|api[_-]?key|app[_-]?secret|app[_-]?id|tenant[_-]?access[_-]?token|bearer|credential)/i;
+  /(?:^(?:text|content|body|raw_body|message_body|prompt|buffer|file_bytes|audio_bytes|errmsg)$|secret|token|password|authorization|cookie|api[_-]?key|app[_-]?secret|app[_-]?id|tenant[_-]?access[_-]?token|bearer|credential|qrcode|qr_code|verify[_-]?code|aes[_-]?key|aeskey|encrypt[_-]?query[_-]?param|encryptqueryparam|cdn[_-]?key|typing[_-]?ticket|upload[_-]?param)/i;
 
 const MAX_LOG_STRING_LENGTH = 512;
+
+/**
+ * Returns only an 8-character prefix of a login session key for safe structured logs (§4.3).
+ */
+export function formatSafeSessionKeyPrefix(sessionKey: string | undefined | null): string {
+  const trimmed = (sessionKey ?? "").trim();
+  if (!trimmed) {
+    return "";
+  }
+  return trimmed.slice(0, 8);
+}
+
+const HTTP_STATUS_ERROR_CODE_RE = /^http_[1-5]\d{2}$/;
+
+/**
+ * Fixed whitelist of known safe error codes / class names that may appear raw in structured logs.
+ * Any unknown or synthetic code/name is normalized to `"unknown_error"` (§4.3 / R5 #7).
+ */
+export const KNOWN_LOG_ERROR_CODES: ReadonlySet<string> = new Set([
+  // Backend / contract deny & operational codes
+  "roster_lookup_error",
+  "preflight_deadline_exceeded",
+  "stale_gateway_epoch",
+  "gateway_lease_safety_margin",
+  "gateway_lease_paused",
+  "gateway_starting",
+  "gateway_stopping",
+  "weixin_snapshot_not_ready",
+  "weixin_bot_generation_mismatch",
+  "weixin_bot_generation_superseded",
+  "weixin_account_rebound",
+  "weixin_session_expired",
+  "weixin_context_token_stale",
+  "missing_weixin_context_token",
+  "weixin_context_token_missing",
+  "invalid_reconcile_snapshot",
+  "session_generation_superseded",
+  "source_generation_unknown",
+  "member_not_in_roster",
+  "weixin_channel_disabled",
+  "external_access_disabled",
+  "not_linked",
+  "not_allowed",
+  "unavailable",
+  "rate_limited",
+  "target_not_found",
+  "invalid_request",
+  "forbidden",
+  "internal_error",
+  "delivery_uncertain",
+  "in_flight",
+  "artifact_invalid",
+  "file_not_sent",
+  // QR login codes
+  "login_session_revoked",
+  "ilink_user_already_bound",
+  "weixin_capacity_full",
+  "weixin_capacity_reached",
+  "qr_login_error",
+  "qr_start_failed",
+  "qr_poll_failed",
+  "qr_expired",
+  "verify_code_failed",
+  // Weixin API / safe-fetch kinds & codes
+  "session_expired",
+  "api_error",
+  "http_error",
+  "network_error",
+  "timeout",
+  "preflight_timeout",
+  "size_exceeded",
+  "ssrf_blocked",
+  "redirect_blocked",
+  // Node.js / Undici system error codes
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EAI_AGAIN",
+  "EPIPE",
+  "ECONNABORTED",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_SOCKET",
+  "UND_ERR_ABORTED",
+  // Standard / gateway Error class names
+  "AbortError",
+  "TimeoutError",
+  "TypeError",
+  "Error",
+  "BackendHttpError",
+  "WeixinApiError",
+  "SafeFetchError",
+  "ChannelDeliveryError",
+  "StaleGatewayEpochError",
+  "LeaseSafetyMarginPauseError",
+  "WeixinQrLoginError",
+]);
+
+/**
+ * Normalizes an error / deny code against `KNOWN_LOG_ERROR_CODES`.
+ * Unknown or arbitrary strings always collapse to `"unknown_error"`.
+ */
+export function sanitizeLogErrorCode(rawCode: unknown): string {
+  if (typeof rawCode === "string") {
+    const trimmed = rawCode.trim();
+    if (
+      KNOWN_LOG_ERROR_CODES.has(trimmed) ||
+      HTTP_STATUS_ERROR_CODE_RE.test(trimmed)
+    ) {
+      return trimmed;
+    }
+  }
+  return "unknown_error";
+}
+
+/**
+ * Extracts strictly whitelisted error code / HTTP status metadata from an arbitrary error,
+ * never emitting free-text `err.message`, `String(err)`, or unknown/synthetic error names (§4.3 / R5 #7).
+ */
+export function extractSafeLogErrorFields(
+  err: unknown,
+): { error_code: string; http_status?: number } {
+  const out: { error_code: string; http_status?: number } = {
+    error_code: "unknown_error",
+  };
+  if (typeof err === "object" && err !== null) {
+    const rec = err as {
+      code?: unknown;
+      denyCode?: unknown;
+      kind?: unknown;
+      status?: unknown;
+      statusCode?: unknown;
+      name?: unknown;
+      body?: unknown;
+      cause?: unknown;
+    };
+    const rawStatus =
+      typeof rec.status === "number"
+        ? rec.status
+        : typeof rec.statusCode === "number"
+          ? rec.statusCode
+          : undefined;
+    if (
+      rawStatus !== undefined &&
+      Number.isInteger(rawStatus) &&
+      rawStatus >= 100 &&
+      rawStatus <= 599
+    ) {
+      out.http_status = rawStatus;
+    }
+    const bodyCode =
+      typeof rec.body === "object" && rec.body !== null && "code" in rec.body
+        ? (rec.body as { code?: unknown }).code
+        : undefined;
+    const causeCode =
+      typeof rec.cause === "object" && rec.cause !== null && "code" in rec.cause
+        ? (rec.cause as { code?: unknown }).code
+        : undefined;
+    for (const candidate of [
+      rec.denyCode,
+      bodyCode,
+      rec.code,
+      causeCode,
+      rec.kind,
+      rec.name,
+    ]) {
+      const sanitized = sanitizeLogErrorCode(candidate);
+      if (sanitized !== "unknown_error") {
+        out.error_code = sanitized;
+        return out;
+      }
+    }
+    if (out.http_status !== undefined) {
+      out.error_code = `http_${out.http_status}`;
+    }
+  }
+  return out;
+}
 
 /**
  * Scrubs credential-like substrings (Bearer tokens, JSON/query secret fields,
@@ -55,12 +237,12 @@ export function redactCredentialString(
     )
     // JSON key-value pairs for sensitive keys
     .replace(
-      /("(?:app_secret|appSecret|app_id|appId|tenant_access_token|user_access_token|access_token|refresh_token|client_secret|api_key|apiKey|password|secret|token|authorization)"\s*:\s*)"[^"]*"/gi,
+      /("(?:app_secret|appSecret|app_id|appId|tenant_access_token|user_access_token|access_token|refresh_token|client_secret|api_key|apiKey|password|secret|token|bot_token|botToken|context_token|contextToken|weixin_context_token|typing_ticket|qrcode|qrcode_img_content|qrcode_url|verify_code|aes_key|aeskey|aesKeyHex|aesKeyBase64|encrypt_query_param|encryptQueryParam|upload_param|authorization)"\s*:\s*)"[^"]*"/gi,
       '$1"[REDACTED]"',
     )
     // Query/header/key=value or key: value pairs for sensitive keys
     .replace(
-      /\b((?:app_secret|appSecret|app_id|appId|tenant_access_token|user_access_token|access_token|refresh_token|client_secret|api_key|apiKey|password|secret|token)\s*[=:]\s*)(?:[^\s,&"'}]+)/gi,
+      /\b((?:app_secret|appSecret|app_id|appId|tenant_access_token|user_access_token|access_token|refresh_token|client_secret|api_key|apiKey|password|secret|token|bot_token|botToken|context_token|contextToken|weixin_context_token|typing_ticket|qrcode|qrcode_img_content|qrcode_url|verify_code|aes_key|aeskey|aesKeyHex|aesKeyBase64|encrypt_query_param|encryptQueryParam|encrypted_query_param|upload_param)\s*[=:]\s*)(?:[^\s,&"'}]+)/gi,
       "$1[REDACTED]",
     )
     // Feishu tenant/user access tokens (e.g. t-g104...)

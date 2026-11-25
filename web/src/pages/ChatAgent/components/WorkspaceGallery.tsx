@@ -46,6 +46,12 @@ import { WorkspaceCard, WorkspaceCardSkeleton } from './workspaceGallery/Workspa
 import type { WorkspaceRecord } from './workspaceGallery/types';
 import './workspaceGallery/WorkspaceCard.css';
 import { PaletteSearchButton } from '@/components/nav/PaletteSearchButton';
+// DALTON-HOOK(mobile-web): mount coverage tree & team shared workspaces in WorkspaceGallery on phones
+import { useIsMobile } from '@/hooks/useIsMobile';
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCapabilities } from '@/hooks/useCapabilities';
+import { CoverageTreeSection } from './dalton/CoverageTreeSection';
+import { TeamWorkspacesSection } from './dalton/TeamSharing';
 
 /** Placeholder cards while the list is read, before this device has seen it:
  *  two rows at a laptop's width. After that, as many as it last held. */
@@ -66,6 +72,9 @@ interface WorkspaceGalleryProps {
 
 function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalleryProps) {
   const { t } = useTranslation();
+  const isMobile = useIsMobile(); // DALTON-HOOK(mobile-web)
+  const { hasCapability } = useCapabilities({ enabled: isMobile }); // DALTON-HOOK(mobile-web)
+  const colleagueSharingReady = hasCapability('colleague_sharing'); // DALTON-HOOK(mobile-web)
   const label = useWorkspaceLabel();
   const queryClient = useQueryClient();
   const now = useNow();
@@ -447,6 +456,15 @@ function WorkspaceGallery({ onWorkspaceSelect, prefetchThreads }: WorkspaceGalle
               </SwapCell>
             </div>
             <SharedSection now={now} query={searchQuery} onWorkspaceSelect={onWorkspaceSelect} />
+            {/* DALTON-HOOK(mobile-web): expose coverage tree & team shared workspaces on phones where AppSidebar is unmounted */}
+            {isMobile && (
+              <div className="mt-6 flex flex-col gap-2" data-testid="mobile-gallery-dalton-sections">
+                <CoverageTreeSection currentWorkspaceId={currentWorkspaceId} />
+                {isDaltonAuth && colleagueSharingReady && (
+                  <TeamWorkspacesSection currentWorkspaceId={currentWorkspaceId} />
+                )}
+              </div>
+            )}
           </div>
         </div>
       </div>

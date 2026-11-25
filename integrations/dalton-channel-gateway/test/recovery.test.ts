@@ -4,7 +4,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   I2BindCodeConsumeResponse,
   I7RecoverResponse,
-  I9WeixinStateGetResponse,
   RecoverInboundEventRow,
   StoredBindingCommandResult,
   ThreadStatusInfo,
@@ -72,22 +71,37 @@ describe("Startup Recovery & Non-Blocking Server Start (§5.2, Codex r2 #17/#18,
     await h.cleanup();
   });
 
-  it("`app.start()` binds HTTP server and starts adapters immediately without blocking on long-running startup recovery streams", async () => {
+  it("`app.start()` binds HTTP server and starts adapters without blocking on long-running startup recovery streams", async () => {
     let resolveSlowRecovery!: () => void;
     const slowRecoveryGate = new Promise<void>((r) => {
       resolveSlowRecovery = r;
     });
 
-    vi.mocked(h.backend.recoverState).mockImplementationOnce(async () => {
-      await slowRecoveryGate;
-      return {
-        mode: "startup",
-        inbound_events: [],
-        background_runs: [],
-        thread_watches: [],
-        automation_runs: [],
-      };
+    vi.mocked(h.backend.recoverState).mockResolvedValueOnce({
+      mode: "startup",
+      inbound_events: [],
+      background_runs: [],
+      thread_watches: [
+        {
+          thread_id: THREAD_ID,
+          dalton_user_id: USER_ID,
+          platform: "feishu",
+          target_address: "feishu:@me",
+          scope_key: "dm:ou_alice",
+          generation: 1,
+          last_seen_turn_index: 1,
+          watch_active: true,
+        },
+      ],
+      automation_runs: [],
     });
+    vi.mocked(h.backend.watchThread).mockImplementationOnce(async () => ({
+      status: 200,
+      isSse: true,
+      events: (async function* () {
+        await slowRecoveryGate;
+      })(),
+    }));
 
     const { host, port } = await h.app.start();
     expect(host).toBe("127.0.0.1");
@@ -138,10 +152,6 @@ describe("Startup Recovery & Non-Blocking Server Start (§5.2, Codex r2 #17/#18,
   });
 
   it("executes full Startup Recovery (§5.2) using real `recover_startup` fixture (without top-level `platform_user_id`/`generation` on inbound rows)", async () => {
-    const wxConfigured = loadFixtureKey<I9WeixinStateGetResponse>(
-      "i9_weixin_state.json",
-      "get_configured",
-    );
     const recoverStartup = loadFixtureKey<I7RecoverResponse>(
       "i7_progress_and_reconcile.json",
       "recover_startup_populated",
@@ -157,7 +167,6 @@ describe("Startup Recovery & Non-Blocking Server Start (§5.2, Codex r2 #17/#18,
       Array<{ event: string; data: unknown }>
     >("replay_events.json", "recover_bg_rec_1_page");
 
-    vi.mocked(h.backend.getWeixinState).mockResolvedValueOnce(wxConfigured);
     vi.mocked(h.backend.recoverState).mockResolvedValueOnce(recoverStartup);
     vi.mocked(h.backend.replayThreadMessages)
       .mockResolvedValueOnce({
@@ -212,15 +221,10 @@ describe("Startup Recovery & Non-Blocking Server Start (§5.2, Codex r2 #17/#18,
 
     await h.app.orchestrator.runStartupRecovery();
 
-    // Verify Weixin state is loaded into adapter memory from I-9 and never written as plaintext state.json
+    // Verify no plaintext Weixin state.json cache file is ever written to disk (§0.2 #2)
     const wxDir = join(h.tempDir, "weixin");
     const wxFile = join(wxDir, "state.json");
     expect(existsSync(wxFile)).toBe(false);
-    expect(h.weixinAdapter.persistedWeixinState).toMatchObject({
-      configured: true,
-      bot_token: "decrypted_secret_bot_token",
-      get_updates_buf: "cursor_xyz",
-    });
 
     // Verify `dispatched` row without `run_id` re-dispatched with `missingRunKey`
     expect(
@@ -986,10 +990,6 @@ describe("Startup Recovery & Non-Blocking Server Start (§5.2, Codex r2 #17/#18,
       thread_watches: [],
       automation_runs: [],
     });
-
-    vi.mocked(h.backend.getWeixinState).mockResolvedValueOnce(
-      loadFixtureKey<I9WeixinStateGetResponse>("i9_weixin_state.json", "get_configured"),
-    );
 
     await waitBounded(h.app.orchestrator.runStartupRecovery(), "unbound denial recovery");
 

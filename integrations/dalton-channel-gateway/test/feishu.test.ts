@@ -6236,6 +6236,7 @@ describe("Feishu card envelope constants parity with Python", () => {
         {
           placeholder: "charts/c1.png",
           filename: "c1.png",
+          mimeType: "image/png",
           content: Buffer.from("fake-png-bytes"),
         },
       ],

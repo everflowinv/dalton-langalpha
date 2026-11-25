@@ -44,3 +44,18 @@ export function pagePoint(
   const perFramePixel = frame.pageWidth / frame.width;
   return { x: Math.round(fx * frame.width * perFramePixel), y: Math.round(fy * frame.height * perFramePixel) };
 }
+
+// DALTON-HOOK(mobile-web): map touch-scroll coordinates anywhere on the canvas (including letterbox space below the frame) onto the remote page
+export function canvasScrollPoint(
+  clientX: number, clientY: number,
+  box: { left: number; top: number; width: number; height: number },
+  frame: FrameGeometry,
+): { x: number; y: number } | null {
+  const exact = pagePoint(clientX, clientY, box, frame);
+  if (exact) return exact;
+  if (box.width <= 0 || box.height <= 0 || frame.width <= 0 || frame.height <= 0) return null;
+  const nx = Math.min(1, Math.max(0, (clientX - box.left) / box.width));
+  const ny = Math.min(1, Math.max(0, (clientY - box.top) / box.height));
+  const pageHeight = frame.height * (frame.pageWidth / frame.width);
+  return { x: Math.round(nx * frame.pageWidth), y: Math.round(ny * pageHeight) };
+}

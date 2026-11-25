@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 import { fireEvent, screen, waitFor } from '@testing-library/react';
+import { api } from '@/api/client';
 import { createTestQueryClient, renderWithProviders } from '@/test/utils';
 import { queryKeys } from '@/lib/queryKeys';
 import {
@@ -584,5 +585,72 @@ describe('WorkspaceSharingModal', () => {
       'aria-checked',
       'true',
     );
+  });
+
+  it('gates sharing button visibility on colleague_sharing capability while keeping sharing query timing unchanged', async () => {
+    const neutralSharing: WorkspaceSharingResponse = {
+      workspace_id: WS_OWN,
+      cos_access: 'hidden',
+      web_access: 'hidden',
+      is_home: false,
+      can_edit: false,
+      owner_external: false,
+      colleague_dispatch_enabled: false,
+      updated_by: null,
+      updated_at: null,
+    };
+
+    // 1. Core profile: capabilities loaded without colleague_sharing + neutral 200 -> button hidden, query still sent.
+    h.fetchWorkspaceSharing.mockClear();
+    h.fetchWorkspaceSharing.mockResolvedValueOnce(neutralSharing);
+    h.fetchWorkspaceSettings.mockResolvedValueOnce(STABLE_OWN_SETTINGS);
+    const coreClient = createTestQueryClient();
+    coreClient.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'core',
+      capabilities: [],
+      ticker_logos: false,
+    });
+    const coreView = renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, {
+      queryClient: coreClient,
+    });
+    await waitFor(() => {
+      expect(h.fetchWorkspaceSharing).toHaveBeenCalledWith(WS_OWN);
+    });
+    await waitFor(() => {
+      expect(coreClient.getQueryData(queryKeys.dalton.sharing(WS_OWN))).toEqual(neutralSharing);
+    });
+    expect(screen.queryByTestId('workspace-sharing-button')).toBeNull();
+    coreView.unmount();
+
+    // 2. Capabilities include colleague_sharing -> button renders normally, query sent.
+    h.fetchWorkspaceSharing.mockClear();
+    h.fetchWorkspaceSharing.mockResolvedValueOnce(STABLE_OWN_SHARING);
+    h.fetchWorkspaceSettings.mockResolvedValueOnce(STABLE_OWN_SETTINGS);
+    const enabledClient = createTestQueryClient();
+    enabledClient.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'everflow',
+      capabilities: ['colleague_sharing'],
+      ticker_logos: true,
+    });
+    const enabledView = renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, {
+      queryClient: enabledClient,
+    });
+    expect(await screen.findByTestId('workspace-sharing-button')).toBeInTheDocument();
+    expect(h.fetchWorkspaceSharing).toHaveBeenCalledWith(WS_OWN);
+    enabledView.unmount();
+
+    // 3. Everflow build with capabilities still pending -> button renders normally on first paint, query sent.
+    const apiGetSpy = vi.spyOn(api, 'get').mockImplementation(() => new Promise(() => {}) as never);
+    onTestFinished(() => apiGetSpy.mockRestore());
+    h.fetchWorkspaceSharing.mockClear();
+    h.fetchWorkspaceSharing.mockResolvedValueOnce(STABLE_OWN_SHARING);
+    h.fetchWorkspaceSettings.mockResolvedValueOnce(STABLE_OWN_SETTINGS);
+    const pendingClient = createTestQueryClient();
+    const pendingView = renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, {
+      queryClient: pendingClient,
+    });
+    expect(await screen.findByTestId('workspace-sharing-button')).toBeInTheDocument();
+    expect(h.fetchWorkspaceSharing).toHaveBeenCalledWith(WS_OWN);
+    pendingView.unmount();
   });
 });

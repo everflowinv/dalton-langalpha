@@ -6,7 +6,9 @@ from __future__ import annotations
 from collections.abc import Mapping
 import json
 import logging
+import os
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -258,12 +260,46 @@ async def _call_host_bridge(
         return resp.status_code, (payload if isinstance(payload, dict) else None)
 
 
-async def _fetch_ops_jobs() -> list[dict[str, Any]]:
-    """Build the ``ops`` scope read-only job entries, returning ``[]`` when bridge capability is off."""
-    from src.dalton.capabilities import CapabilityId, has_capability
+OPS_STATUS_SCHEMA_VERSION = 1
+DEFAULT_OPS_STATUS_MAX_AGE_SECONDS = 300
+MAX_OPS_STATUS_FUTURE_SKEW_SECONDS = 60
+_OPS_TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
 
-    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
-        return []
+
+def is_ops_jobs_via_bridge_enabled() -> bool:
+    """Return True when ``DALTON_OPS_JOBS_VIA_BRIDGE`` rollback switch is enabled."""
+    raw = os.getenv("DALTON_OPS_JOBS_VIA_BRIDGE", "").strip().lower()
+    return raw in _OPS_TRUTHY_VALUES
+
+
+def resolve_ops_status_file_path() -> Path:
+    """Resolve the ``ops_jobs_status.json`` path read by the backend."""
+    explicit = os.getenv("DALTON_OPS_STATUS_FILE", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    var_dir = os.getenv("DALTON_BACKEND_VAR_DIR", "").strip() or "var/dalton"
+    return Path(var_dir).expanduser() / "ops_jobs_status.json"
+
+
+def get_ops_status_max_age_seconds() -> int:
+    """Return maximum allowed age (seconds) for ``ops_jobs_status.json`` before rejection."""
+    raw = os.getenv("DALTON_OPS_STATUS_MAX_AGE_SECONDS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+            if parsed >= 1:
+                return parsed
+        except ValueError:
+            pass
+        logger.warning(
+            "[DALTON_SYSTEM_JOBS] Ignoring invalid DALTON_OPS_STATUS_MAX_AGE_SECONDS=%r; using %ds",
+            raw,
+            DEFAULT_OPS_STATUS_MAX_AGE_SECONDS,
+        )
+    return DEFAULT_OPS_STATUS_MAX_AGE_SECONDS
+
+
+def _default_ops_jobs_map() -> dict[str, dict[str, Any]]:
     by_key: dict[str, dict[str, Any]] = {}
     for spec in DEFAULT_OPS_JOBS:
         by_key[spec["key"]] = {
@@ -279,40 +315,203 @@ async def _fetch_ops_jobs() -> list[dict[str, Any]]:
             "can_toggle": False,
             "can_run_now": False,
         }
+    return by_key
+
+
+_OPS_JOB_OPTIONAL_STR_FIELDS: tuple[str, ...] = (
+    "kind",
+    "title",
+    "description",
+    "status",
+    "last_run_at",
+    "last_result",
+    "next_run_at",
+)
+
+
+def _optional_clean_str(val: Any) -> str | None:
+    if not isinstance(val, str):
+        return None
+    cleaned = val.strip()
+    return cleaned or None
+
+
+def _validate_ops_job_entry(item: Any) -> bool:
+    """Return True when a status-file job item has a valid non-empty key and strictly ``str | None`` fields."""
+    if not isinstance(item, dict):
+        return False
+    raw_key = item.get("key")
+    if not isinstance(raw_key, str) or not raw_key.strip():
+        return False
+    for field in _OPS_JOB_OPTIONAL_STR_FIELDS:
+        val = item.get(field)
+        if val is not None and not isinstance(val, str):
+            return False
+    return True
+
+
+def _merge_ops_jobs_payload(
+    by_key: dict[str, dict[str, Any]],
+    raw_jobs: Any,
+) -> list[dict[str, Any]]:
+    if isinstance(raw_jobs, list):
+        for item in raw_jobs:
+            if not _validate_ops_job_entry(item):
+                continue
+            k = item["key"].strip()
+            raw_status = _optional_clean_str(item.get("status"))
+            st = (raw_status or "unknown").lower()
+            if st not in ("on", "off", "partial", "unknown"):
+                st = "unknown"
+            target = by_key.get(k) or {
+                "key": k,
+                "kind": _optional_clean_str(item.get("kind")) or "ops",
+                "scope": "ops",
+                "title": _optional_clean_str(item.get("title")) or k,
+                "description": _optional_clean_str(item.get("description")) or "",
+                "can_toggle": False,
+                "can_run_now": False,
+            }
+            target.update(
+                {
+                    "status": st,
+                    "last_run_at": _optional_clean_str(item.get("last_run_at")),
+                    "last_result": _optional_clean_str(item.get("last_result")),
+                    "next_run_at": _optional_clean_str(item.get("next_run_at")),
+                    "can_toggle": False,
+                    "can_run_now": False,
+                }
+            )
+            by_key[k] = target
+    return list(by_key.values())
+
+
+def _load_ops_jobs_from_status_file(
+    status_path: Path | None = None,
+    *,
+    now: datetime | None = None,
+    max_age_seconds: int | None = None,
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Read and validate ``ops_jobs_status.json``; reject missing, malformed, or stale files."""
+    path = status_path or resolve_ops_status_file_path()
+    if not path.is_file():
+        return None, "missing"
     try:
-        status_code, data = await _call_host_bridge("GET", "/jobs/ops", timeout_s=5.0)
-        if status_code == 200 and isinstance(data, dict):
-            raw_jobs = data.get("jobs")
-            if isinstance(raw_jobs, list):
-                for item in raw_jobs:
-                    if not isinstance(item, dict) or not item.get("key"):
-                        continue
-                    k = str(item["key"]).strip()
-                    st = str(item.get("status") or "unknown").strip().lower()
-                    if st not in ("on", "off", "partial", "unknown"):
-                        st = "unknown"
-                    target = by_key.get(k) or {
-                        "key": k,
-                        "kind": str(item.get("kind") or "ops"),
-                        "scope": "ops",
-                        "title": str(item.get("title") or k),
-                        "description": str(item.get("description") or ""),
-                        "can_toggle": False,
-                        "can_run_now": False,
-                    }
-                    target.update(
-                        {
-                            "status": st,
-                            "last_run_at": item.get("last_run_at"),
-                            "last_result": item.get("last_result"),
-                            "next_run_at": item.get("next_run_at"),
-                            "can_toggle": False,
-                            "can_run_now": False,
-                        }
-                    )
-                    by_key[k] = target
+        raw_text = path.read_text(encoding="utf-8")
+        data = json.loads(raw_text)
     except Exception as exc:
-        logger.debug("[DALTON_SYSTEM_JOBS] Host bridge ops jobs unreachable: %s", exc)
+        logger.warning("[DALTON_SYSTEM_JOBS] Failed to read ops status file %s: %s", path, exc)
+        return None, "unreadable"
+    if not isinstance(data, dict):
+        logger.warning("[DALTON_SYSTEM_JOBS] Invalid ops status file %s: root must be object", path)
+        return None, "invalid_schema"
+    if data.get("schema_version") != OPS_STATUS_SCHEMA_VERSION:
+        logger.warning(
+            "[DALTON_SYSTEM_JOBS] Unsupported ops status schema_version=%r in %s",
+            data.get("schema_version"),
+            path,
+        )
+        return None, "unsupported_schema"
+
+    raw_gen = data.get("generated_at")
+    if not isinstance(raw_gen, str) or not raw_gen.strip():
+        logger.warning("[DALTON_SYSTEM_JOBS] Missing generated_at in ops status file %s", path)
+        return None, "missing_generated_at"
+    try:
+        gen_dt = datetime.fromisoformat(raw_gen.strip().replace("Z", "+00:00"))
+    except (ValueError, OverflowError):
+        logger.warning("[DALTON_SYSTEM_JOBS] Invalid generated_at=%r in %s", raw_gen, path)
+        return None, "invalid_generated_at"
+    if gen_dt.tzinfo is None:
+        logger.warning("[DALTON_SYSTEM_JOBS] Naive generated_at=%r rejected in %s", raw_gen, path)
+        return None, "naive_generated_at"
+
+    try:
+        now_utc = (now or datetime.now(UTC)).astimezone(UTC)
+        gen_utc = gen_dt.astimezone(UTC)
+    except (ValueError, OverflowError):
+        logger.warning(
+            "[DALTON_SYSTEM_JOBS] Out-of-range generated_at=%r in %s",
+            raw_gen,
+            path,
+        )
+        return None, "invalid_generated_at"
+    age_s = (now_utc - gen_utc).total_seconds()
+    eff_max_age = (
+        max(1, int(max_age_seconds))
+        if max_age_seconds is not None
+        else get_ops_status_max_age_seconds()
+    )
+    raw_ttl = data.get("ttl_seconds")
+    if isinstance(raw_ttl, int) and not isinstance(raw_ttl, bool) and raw_ttl >= 1:
+        eff_max_age = min(eff_max_age, raw_ttl)
+
+    if age_s > eff_max_age:
+        logger.warning(
+            "[DALTON_SYSTEM_JOBS] Rejecting stale ops status file %s (age=%.1fs > max_age=%ds)",
+            path,
+            age_s,
+            eff_max_age,
+        )
+        return None, "stale"
+    if age_s < -MAX_OPS_STATUS_FUTURE_SKEW_SECONDS:
+        logger.warning(
+            "[DALTON_SYSTEM_JOBS] Rejecting future-dated ops status file %s (skew=%.1fs)",
+            path,
+            -age_s,
+        )
+        return None, "future_timestamp"
+
+    raw_jobs = data.get("jobs")
+    if not isinstance(raw_jobs, list):
+        logger.warning("[DALTON_SYSTEM_JOBS] Invalid ops status file %s: jobs must be a list", path)
+        return None, "invalid_jobs"
+    for idx, item in enumerate(raw_jobs):
+        if not _validate_ops_job_entry(item):
+            logger.warning(
+                "[DALTON_SYSTEM_JOBS] Invalid job entry at index %d in ops status file %s",
+                idx,
+                path,
+            )
+            return None, "invalid_job_entry"
+    return raw_jobs, None
+
+
+async def _fetch_ops_jobs() -> list[dict[str, Any]]:
+    """Build the ``ops`` scope read-only job entries.
+
+    - In ``DeploymentProfile.CORE``, always returns ``[]``.
+    - In ``DeploymentProfile.EVERFLOW``:
+      * When ``DALTON_OPS_JOBS_VIA_BRIDGE=true`` (emergency rollback), queries
+        the host bridge ``GET /jobs/ops`` (returning ``[]`` if bridge capability is off).
+      * Otherwise (default), reads ``var/dalton/ops_jobs_status.json`` exported by
+        ``com.dalton.ops-status-exporter``, rejecting stale or malformed files
+        as ``status="unknown"`` without calling the bridge.
+    """
+    from src.dalton.capabilities import CapabilityId, has_capability
+    from src.dalton.profile import DeploymentProfile, resolve_profile
+
+    if resolve_profile() is not DeploymentProfile.EVERFLOW:
+        return []
+
+    by_key = _default_ops_jobs_map()
+    if is_ops_jobs_via_bridge_enabled():
+        if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
+            return []
+        try:
+            status_code, data = await _call_host_bridge("GET", "/jobs/ops", timeout_s=5.0)
+            if status_code == 200 and isinstance(data, dict):
+                return _merge_ops_jobs_payload(by_key, data.get("jobs"))
+        except Exception as exc:
+            logger.debug("[DALTON_SYSTEM_JOBS] Host bridge ops jobs unreachable: %s", exc)
+        return list(by_key.values())
+
+    raw_jobs, err_reason = _load_ops_jobs_from_status_file()
+    if raw_jobs is not None:
+        return _merge_ops_jobs_payload(by_key, raw_jobs)
+    if err_reason == "stale":
+        for entry in by_key.values():
+            entry["last_result"] = "状态文件已过期"
     return list(by_key.values())
 
 

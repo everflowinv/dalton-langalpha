@@ -114,3 +114,13 @@
     display: inline;
   }
 }
+
+/* DALTON-HOOK(mobile-web): collapse Comment button text label in crumb bar on phones */
+@media (max-width: 767px) {
+  .page-comment-mode-btn {
+    padding: 0 6px;
+  }
+  .page-comment-mode-btn > span {
+    display: none;
+  }
+}

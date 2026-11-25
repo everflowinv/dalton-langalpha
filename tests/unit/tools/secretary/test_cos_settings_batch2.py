@@ -1304,8 +1304,8 @@ async def test_real_langgraph_approve_two_phase_dedup_matches_expected_workspace
         dedup_mod.sharing_mod,
         "require_workspace_access",
         create_autospec(
-            lambda *a, **kw: None,
-            side_effect=lambda *_a, **_kw: _async_val(None),
+            dedup_mod.sharing_mod.require_workspace_access,
+            return_value=None,
         ),
     )
 
@@ -2284,6 +2284,8 @@ async def test_workspace_manager_bootstrap_keeps_new_primary_computer_if_insert_
     bootstrap_cloud_primary_computer minted a cloud primary, WorkspaceManager
     raises ApprovalScopeChangedError and keeps the new primary computer rather
     than trying to delete/reclaim it."""
+    from src.server.database import workspace as ws_db
+
     ws_mgr = object.__new__(WorkspaceManager)
     bootstrap_mock = create_autospec(
         ws_mgr.bootstrap_cloud_primary_computer,
@@ -2293,8 +2295,8 @@ async def test_workspace_manager_bootstrap_keeps_new_primary_computer_if_insert_
     monkeypatch.setattr(
         "src.server.services.workspace_manager.create_workspace_on_computer",
         create_autospec(
-            lambda *a, **kw: None,
-            side_effect=lambda *_a, **_kw: _async_val(None),
+            ws_db.create_workspace_on_computer,
+            return_value=None,
         ),
     )
 
@@ -3219,3 +3221,163 @@ async def test_lock_free_company_dedup_drops_unrelated_workspace_when_bound_unit
     assert "00700" in llm_prompts[0]
     assert "00700" not in llm_prompts[1]
     assert "行业笔记" in llm_prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_find_existing_company_workspace_keeps_downgraded_hit_when_rejudge_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 13: _find_matches passes partial_failure_out to _refresh_live_hits;
+    when a bound coverage unit archives during the first LLM call and re-judging
+    the still-live workspace fails, find_existing_company_workspace must not
+    silently drop the live hit and allow creation."""
+    from contextlib import asynccontextmanager
+    from unittest.mock import create_autospec
+
+    from src.dalton.coverage import dedup as dedup_mod
+    from src.dalton.coverage.dedup import (
+        DedupLlmResult,
+        DedupMatchItem,
+        find_existing_company_workspace,
+    )
+
+    unit_id = "aaaaaaaa-aaaa-4aaa-8aaa-000000000013"
+    ws_live = "bbbbbbbb-bbbb-4bbb-8bbb-000000000013"
+    unit_state = {"status": "active"}
+
+    def _unit_row() -> dict[str, Any]:
+        return {
+            "unit_id": unit_id,
+            "kind": "company",
+            "status": unit_state["status"],
+            "owner_user_id": USER_ID,
+            "lead_analyst_user_id": USER_ID,
+            "display_name": "腾讯控股",
+            "workspace_id": ws_live,
+            "ticker": "00700",
+            "unit_updated_at": None,
+            "unit_created_at": None,
+            "workspace_name": "腾讯研究",
+            "workspace_owner_id": USER_ID,
+            "workspace_status": "stopped",
+            "is_home_stand_in": False,
+            "is_historical_duplicate": False,
+            "workspace_last_activity_at": None,
+            "workspace_updated_at": None,
+            "workspace_created_at": None,
+            "owner_name": "Alice",
+            "owner_email": "alice@team.com",
+            "unit_owner_email": "alice@team.com",
+            "lead_name": "Alice",
+            "lead_email": "alice@team.com",
+        }
+
+    live_ws_row = {
+        "workspace_id": ws_live,
+        "user_id": USER_ID,
+        "name": "腾讯研究",
+        "status": "stopped",
+        "owner_name": "Alice",
+        "owner_email": "alice@team.com",
+        "is_home_stand_in": False,
+        "is_historical_duplicate": False,
+        "last_activity_at": None,
+        "updated_at": None,
+        "created_at": None,
+    }
+
+    class _RejudgeFailCursor:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            text = " ".join(sql.split())
+            if "FROM dalton_coverage_units" in text:
+                row = _unit_row()
+                if isinstance(params, tuple) and params and isinstance(params[0], list):
+                    wanted = set(params[0])
+                    self._rows = [row] if unit_id in wanted else []
+                else:
+                    self._rows = [row] if row["status"] == "active" else []
+                return
+            if "FROM workspaces w" in text:
+                if isinstance(params, tuple) and params and isinstance(params[0], list):
+                    wanted = set(params[0])
+                    self._rows = [dict(live_ws_row)] if ws_live in wanted else []
+                else:
+                    self._rows = []
+                return
+            self._rows = []
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._rows)
+
+    class _RejudgeFailConn:
+        def cursor(self, **_kwargs):
+            return _RejudgeFailCursor()
+
+    @asynccontextmanager
+    async def _use_conn(c=None):
+        yield c or _RejudgeFailConn()
+
+    monkeypatch.setattr(dedup_mod, "get_db_connection", _use_conn)
+    monkeypatch.setattr(dedup_mod, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "get_user_tier",
+        create_autospec(dedup_mod._REAL_GET_USER_TIER, return_value="internal"),
+    )
+    monkeypatch.setattr(dedup_mod, "_is_internal_team_owner", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_model",
+        create_autospec(dedup_mod.resolve_assist_model, return_value="gpt-4o-mini"),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_fallback_models",
+        create_autospec(dedup_mod.resolve_assist_fallback_models, return_value=[]),
+    )
+    monkeypatch.setattr(dedup_mod, "model_requires_user_oauth", lambda _m: False)
+    monkeypatch.setattr(
+        dedup_mod.sharing_mod,
+        "require_workspace_access",
+        create_autospec(
+            dedup_mod.sharing_mod.require_workspace_access,
+            return_value=None,
+        ),
+    )
+
+    call_count = {"n": 0}
+
+    async def _llm_hit_then_fail(**_kwargs: Any) -> Any:
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            unit_state["status"] = "archived"
+            return SimpleNamespace(
+                ok=True,
+                data=DedupLlmResult(
+                    matches=[
+                        DedupMatchItem(
+                            id="c1", confidence="high", reason="bound 00700 unit"
+                        )
+                    ]
+                ),
+            )
+        raise TimeoutError("rejudge timed out")
+
+    monkeypatch.setattr(dedup_mod, "dalton_complete", _llm_hit_then_fail)
+    dup = await find_existing_company_workspace(USER_ID, "700.HK", channel="cos")
+    assert dup is not None
+    assert call_count["n"] == 2
+    assert ws_live in dup.matched_workspace_ids
+    assert dup.matches
+    assert dup.matches[0].workspace_name == "腾讯研究"
+    assert dup.suggestion is None

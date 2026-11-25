@@ -496,7 +496,8 @@ export function IconToggle({
           <button
             ref={buttonRef}
             type="button"
-            className={cn(className, 'hover:bg-(--color-border-muted) cursor-pointer')}
+            // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on 32px composer icon toggles (Subagents / Market Watch)
+            className={cn(className, 'tap-target hover:bg-(--color-border-muted) cursor-pointer')}
             style={style}
             onClick={(e) => { e.stopPropagation(); onToggle(); }}
             aria-label={label}

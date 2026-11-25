@@ -8,6 +8,8 @@ import { buttonSlot } from '@/components/ui/button-class';
 import { toast } from '@/components/ui/use-toast';
 import { Input } from '../../../components/ui/input';
 import { Select } from '@/components/ui/select';
+// DALTON-HOOK(mobile-web): detect mobile viewport to skip autoFocus and mark sheet semantics
+import { useIsMobile } from '@/hooks/useIsMobile';
 import { useLocale } from '@/hooks/useLocale';
 import { formatBytes } from '@/lib/format';
 import type { Computer, CoverageUnitKindChoice, Workspace } from '@/types/api';
@@ -41,6 +43,8 @@ interface CreateWorkspaceModalProps {
   onCreate: (data: NewWorkspace) => Promise<Workspace>;
   /** Called with the created workspace once the modal is done with it. */
   onComplete?: (workspace: Workspace) => void;
+  // DALTON-HOOK(mobile-web): where focus returns on close when the opener never took focus (Safari clicks)
+  returnFocusTo?: HTMLElement | null;
 }
 
 type Phase = 'form' | 'progress';
@@ -65,9 +69,11 @@ type FormRefusal =
  * computer still being prepared takes no workspace, so it cannot be picked,
  * and the form waits while it is the target.
  */
-function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateWorkspaceModalProps) {
+function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete, returnFocusTo = null }: CreateWorkspaceModalProps) {
   const { t } = useTranslation();
   const locale = useLocale();
+  // DALTON-HOOK(mobile-web): avoid forcing software keyboard open on mount on mobile
+  const isMobile = useIsMobile();
 
   // Lock body scroll while modal is open
   useEffect(() => {
@@ -102,6 +108,10 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
   const openComputers = useOpenComputers();
   const [pickedComputerId, setPickedComputerId] = useState<string | null>(null);
   const computerFieldId = useId();
+  // DALTON-HOOK(mobile-web): dialog container ref, name input ref (imperative desktop focus so opener is captured before focus moves), and title id for aria-labelledby
+  const modalRef = useRef<HTMLDivElement>(null);
+  const nameInputRef = useRef<HTMLInputElement>(null);
+  const titleId = useId();
 
   // The list the gallery and the computer fan-out already hold, so opening
   // the modal usually reads the cache rather than the network.
@@ -413,6 +423,120 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
   const isInProgress = phase === 'progress' && creationStep === 'uploading';
   const canClose = !isInProgress && !submitting;
 
+  // DALTON-HOOK(mobile-web): focus management and Tab focus trap for role="dialog" aria-modal="true" (moves focus to a non-input control on mobile without popping the keyboard; preserves desktop autoFocus on the name input)
+  const canCloseRef = useRef(canClose);
+  canCloseRef.current = canClose;
+  const closeDialogRef = useRef<() => void>(() => {});
+  closeDialogRef.current = phase === 'progress' ? handleOpenWorkspace : resetAndClose;
+
+  // DALTON-HOOK(mobile-web): Safari (iOS and macOS) does not focus a button on click, so the opener is
+  // remembered from the last press while the modal is closed and used when focus is still on <body>.
+  // Only a press within the last second counts, so a shortcut never sends focus to an older, unrelated click.
+  const lastPressedRef = useRef<{ el: HTMLElement; at: number } | null>(null);
+  useEffect(() => {
+    if (isOpen) return;
+    const onPointerDown = (e: PointerEvent) => {
+      const el = e.target instanceof Element ? e.target.closest<HTMLElement>('button, a[href], [role="button"]') : null;
+      lastPressedRef.current = el ? { el, at: e.timeStamp } : null;
+    };
+    document.addEventListener('pointerdown', onPointerDown, true);
+    return () => document.removeEventListener('pointerdown', onPointerDown, true);
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const node = modalRef.current;
+    if (!node) return;
+    const focused = document.activeElement as HTMLElement | null;
+    const pressed = lastPressedRef.current;
+    lastPressedRef.current = null;
+    const recentPress = pressed && performance.now() - pressed.at < 1000 ? pressed.el : null;
+    const opener = focused && focused !== document.body ? focused : (returnFocusTo ?? recentPress);
+
+    const getFocusables = (root: HTMLElement) =>
+      Array.from(
+        root.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((el) => el.tabIndex >= 0 && el.style.display !== 'none' && getComputedStyle(el).display !== 'none');
+
+    const focusInitial = (root: HTMLElement) => {
+      const items = getFocusables(root);
+      if (isMobile) {
+        const nonInput = items.find((el) => el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA' && el.tagName !== 'SELECT');
+        (nonInput ?? root).focus({ preventScroll: true });
+      } else if (nameInputRef.current && root.contains(nameInputRef.current)) {
+        nameInputRef.current.focus();
+      } else if (!root.contains(document.activeElement)) {
+        (items[0] ?? root).focus({ preventScroll: true });
+      }
+    };
+
+    focusInitial(node);
+
+    const onKeyDown = (e: KeyboardEvent) => {
+      const current = modalRef.current;
+      if (!current || (e.key !== 'Tab' && e.key !== 'Escape')) return;
+      if (e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
+      if (e.key === 'Escape') {
+        if (canCloseRef.current) {
+          e.stopPropagation();
+          closeDialogRef.current();
+        }
+        return;
+      }
+      const items = getFocusables(current);
+      if (items.length === 0) {
+        e.preventDefault();
+        current.focus({ preventScroll: true });
+        return;
+      }
+      const first = items[0];
+      const last = items[items.length - 1];
+      const active = document.activeElement;
+      if (e.shiftKey && (active === first || !current.contains(active))) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && (active === last || !current.contains(active))) {
+        e.preventDefault();
+        first.focus();
+      }
+    };
+
+    const onFocusIn = (e: FocusEvent) => {
+      const current = modalRef.current;
+      if (!current || !(e.target instanceof HTMLElement)) return;
+      if (current.contains(e.target)) return;
+      if (e.target.closest('[data-above-dialogs]') || e.target.closest('[role="dialog"]')) return;
+      focusInitial(current);
+    };
+
+    document.addEventListener('keydown', onKeyDown);
+    document.addEventListener('focusin', onFocusIn);
+    return () => {
+      document.removeEventListener('keydown', onKeyDown);
+      document.removeEventListener('focusin', onFocusIn);
+      const active = document.activeElement;
+      const current = modalRef.current;
+      if (
+        opener?.isConnected
+        && opener !== document.body
+        && (!active || active === document.body || node.contains(active) || Boolean(current?.contains(active)))
+      ) {
+        opener.focus?.();
+      }
+    };
+  }, [isOpen, isMobile, returnFocusTo]);
+
+  // DALTON-HOOK(mobile-web): keep keyboard focus inside the modal container when switching from form to upload progress phase
+  useEffect(() => {
+    if (!isOpen || phase !== 'progress') return;
+    const current = modalRef.current;
+    if (current && !current.contains(document.activeElement)) {
+      current.focus({ preventScroll: true });
+    }
+  }, [isOpen, phase]);
+
   const failedCount = Object.values(fileStatuses).filter((s) => s === 'failed').length;
   const doneCount = Object.values(fileStatuses).filter((s) => s === 'done').length;
 
@@ -422,14 +546,24 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
   if (phase === 'progress') {
     return (
       <div className="cwm-overlay">
-        <div className="cwm-modal" onClick={(e) => e.stopPropagation()}>
+        {/* DALTON-HOOK(mobile-web): mark modal as dialog/sheet with aria-labelledby and focus ref */}
+        <div
+          ref={modalRef}
+          className="cwm-modal"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby={titleId}
+          tabIndex={-1}
+          data-sheet={isMobile ? '' : undefined}
+          onClick={(e) => e.stopPropagation()}
+        >
           {/* Header */}
           <div className="cwm-header">
-            <h2 data-bracket="title" className="cwm-title">
+            <h2 id={titleId} data-bracket="title" className="cwm-title">
               {creationStep === 'done' ? t('workspace.workspaceReady') : t('workspace.uploadingFiles')}
             </h2>
             {canClose && (
-              <button className="cwm-close-btn" onClick={handleOpenWorkspace}>
+              <button type="button" className="cwm-close-btn" aria-label={t('common.close')} onClick={handleOpenWorkspace}>
                 <X className="h-5 w-5" />
               </button>
             )}
@@ -516,11 +650,21 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
   // =========== FORM PHASE ===========
   return (
     <div className="cwm-overlay" onClick={() => { if (canClose) resetAndClose(); }}>
-      <div className="cwm-modal" onClick={(e) => e.stopPropagation()}>
+      {/* DALTON-HOOK(mobile-web): mark modal as dialog/sheet with aria-labelledby and focus ref */}
+      <div
+        ref={modalRef}
+        className="cwm-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        tabIndex={-1}
+        data-sheet={isMobile ? '' : undefined}
+        onClick={(e) => e.stopPropagation()}
+      >
         {/* Header */}
         <div className="cwm-header">
-          <h2 data-bracket="title" className="cwm-title">{t('workspace.createNewWorkspace')}</h2>
-          <button className="cwm-close-btn" disabled={!canClose} onClick={resetAndClose}>
+          <h2 id={titleId} data-bracket="title" className="cwm-title">{t('workspace.createNewWorkspace')}</h2>
+          <button type="button" className="cwm-close-btn" aria-label={t('common.close')} disabled={!canClose} onClick={resetAndClose}>
             <X className="h-5 w-5" />
           </button>
         </div>
@@ -533,6 +677,8 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
               {t('workspace.workspaceName')} <span className="cwm-label-required">*</span>
             </label>
             <Input
+              // DALTON-HOOK(mobile-web): focus imperatively in the dialog effect on desktop so document.activeElement still points to the opener when the modal opens
+              ref={nameInputRef}
               type="text"
               value={name}
               onChange={(e) => {
@@ -558,7 +704,6 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete }: CreateW
                 border: '1px solid var(--color-shell-edge, var(--color-border-muted))',
                 color: 'var(--color-text-primary)',
               }}
-              autoFocus
             />
           </div>
 

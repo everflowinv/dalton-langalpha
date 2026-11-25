@@ -57,7 +57,7 @@ export function MonitorsList(): React.ReactElement {
               type="button"
               variant="outline"
               size="sm"
-              className="h-8 gap-1.5 text-xs shrink-0"
+              className="tap-target h-8 gap-1.5 text-xs shrink-0"
               onClick={() => void refetch()}
               disabled={isFetching}
             >

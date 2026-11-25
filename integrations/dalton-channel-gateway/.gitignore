@@ -1,2 +1,15 @@
+node_modules
 node_modules/
+dist
 dist/
+.deploy-releases/
+.deploy-current
+.deploy-current.*
+.deploy-deployed-tree
+.deploy-deployed-tree.*
+.deploy-legacy-backup-*
+.deploy-failed.*
+.deploy-gateway-pending
+.deploy-gateway-pending.*
+.deploy-staging/
+.deploy-prev/

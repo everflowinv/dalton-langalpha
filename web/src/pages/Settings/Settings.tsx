@@ -29,6 +29,7 @@ import {
   readSection,
   resolveRequestedSection,
   resolveScrollAnchor,
+  sectionDescKey, // DALTON-HOOK(standalone-core)
   SECTIONS,
   tierSatisfies,
   type Section,
@@ -214,7 +215,7 @@ function Settings() {
           <div className="settings-column">
             <header className="settings-head">
               <h1 className="page-head-title">{t(SECTIONS[displaySection].labelKey)}</h1>
-              <p className="settings-head-def">{t(SECTIONS[displaySection].descKey, { brand: BRAND_NAME })}</p> {/* DALTON-HOOK(brand-name) */}
+              <p className="settings-head-def">{t(sectionDescKey(displaySection, daltonVisibility), { brand: BRAND_NAME })}</p> {/* DALTON-HOOK(brand-name) DALTON-HOOK(standalone-core) */}
             </header>
             {/* DALTON-HOOK(settings-reorg): keep skeleton while resolving tier and never mount unauthorized sections */}
             {deniedMessage && (

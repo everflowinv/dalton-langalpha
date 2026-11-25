@@ -36,10 +36,11 @@ export default function HtmlActionBar({
 
   return (
     <div className={cn('html-action-bar', variant === 'overlay' && 'html-action-bar-overlay', className)}>
+      {/* DALTON-HOOK(mobile-web): expand touch hit area via .tap-target on coarse-pointer devices */}
       {onFullscreen && (
         <button
           type="button"
-          className="html-action-btn"
+          className="html-action-btn tap-target"
           onClick={onFullscreen}
           disabled={fullscreenDisabled}
           title={isFullscreen ? t('filePanel:exitFullscreen') : t('filePanel:fullscreen')}
@@ -51,7 +52,7 @@ export default function HtmlActionBar({
       {onOpenInNewTab && (
         <button
           type="button"
-          className="html-action-btn"
+          className="html-action-btn tap-target"
           onClick={onOpenInNewTab}
           title={t('filePanel:openInNewTab')}
           aria-label={t('filePanel:openInNewTab')}
@@ -62,9 +63,10 @@ export default function HtmlActionBar({
       {(onDownload || onExportPdf) && (
         <DropdownMenu modal={false}>
           <DropdownMenuTrigger asChild>
+            {/* DALTON-HOOK(mobile-web): expand touch hit area via .tap-target on coarse-pointer devices */}
             <button
               type="button"
-              className="html-action-btn"
+              className="html-action-btn tap-target"
               title={t('filePanel:moreActions')}
               aria-label={t('filePanel:moreActions')}
             >

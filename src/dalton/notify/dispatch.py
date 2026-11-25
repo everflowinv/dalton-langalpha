@@ -27,11 +27,13 @@ from src.dalton.llm.model_prefs import (
     resolve_dalton_notify_targets,
 )
 from src.dalton.notify.channel_transport import (
+    GATEWAY_DELIVERY_READ_TIMEOUT_S,
     UNCERTAIN_NOTIFY_ERROR_CODES,
     extract_target_uncertain_code,
     is_uncertain_notify_error_code,
     post_automation_gateway_notify,
     post_data_task_gateway_notify,
+    resolve_gateway_delivery_read_timeout_s,
 )
 from src.dalton.settings import (
     get_dalton_bridge_base_url,
@@ -210,7 +212,7 @@ _EXCLUDED_AUTO_RE = re.compile(
 _SECTION_HEADING_RE = re.compile(r"^\s*#{2,4}\s+(.+?)\s*$")
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
 _MD_LINK_RE = re.compile(
-    r"(!?)\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)(?:\s+[\"'][^\"']*[\"'])?\)"
+    r"(!?)\[((?:\\[\[\]]|[^\[\]]|\[[^\[\]]*\])+)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)(?:\s+[\"'][^\"']*[\"'])?\)"
 )
 _CJK_SENTENCE_END_PUNCT = frozenset("。！？；")
 _ASCII_SENTENCE_END_PUNCT = frozenset(".!?;")
@@ -614,8 +616,97 @@ async def populate_automation_notify_state(
             setattr(resp, "dalton_notify_route_targets", None)
 
 
+def _unescape_markdown_label(label: str) -> str:
+    return label.replace("\\[", "[").replace("\\]", "]").replace("\\\\", "\\")
+
+
+def rewrite_monitor_links_for_external(text: str) -> str:
+    """Rewrite same-origin ``/monitors/...`` markdown links for external channel delivery.
+
+    When a public app URL is configured (``DALTON_FRONTEND_URL`` / ``PUBLIC_APP_URL`` /
+    ``FRONTEND_URL``, including single-origin Standalone Core where it matches
+    ``SERVER_BASE_URL``), expands ``[label](/monitors/slug)`` into an absolute
+    ``[label](https://.../monitors/slug)`` link. When no public URL is configured,
+    preserves both the link title and path text as ``label (/monitors/slug)``.
+    """
+    from src.dalton.settings import get_dalton_public_app_url
+
+    public_base = get_dalton_public_app_url()
+
+    def _replace(match: re.Match[str]) -> str:
+        bang, label, target = (
+            match.group(1),
+            match.group(2),
+            match.group(3).strip(),
+        )
+        if bang or not target.startswith("/monitors/"):
+            return match.group(0)
+        if public_base:
+            return f"[{label}]({public_base}{target})"
+        clean_label = _unescape_markdown_label(label)
+        return f"{clean_label} ({target})"
+
+    return _MD_LINK_RE.sub(_replace, text)
+
+
+def _utf16_len(text: str) -> int:
+    """Return the UTF-16 code unit length of ``text`` (matches JavaScript ``String.length``)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _slice_by_utf16(text: str, max_utf16: int) -> str:
+    """Return the longest whole-codepoint prefix of ``text`` within ``max_utf16`` UTF-16 code units."""
+    if max_utf16 <= 0:
+        return ""
+    if _utf16_len(text) <= max_utf16:
+        return text
+    used = 0
+    for idx, ch in enumerate(text):
+        width = 2 if ord(ch) > 0xFFFF else 1
+        if used + width > max_utf16:
+            return text[:idx]
+        used += width
+    return text
+
+
+def truncate_preserving_markdown_links(text: str, max_chars: int) -> str:
+    """Truncate ``text`` to at most ``max_chars`` UTF-16 code units without cutting inside a markdown link."""
+    if max_chars <= 0:
+        return ""
+    if _utf16_len(text) <= max_chars:
+        return text
+    budget = max_chars - 1
+    cut = len(_slice_by_utf16(text, budget))
+    spanning: re.Match[str] | None = None
+    for match in _MD_LINK_RE.finditer(text):
+        if match.start() >= cut:
+            break
+        if match.start() < cut < match.end():
+            spanning = match
+            break
+    if spanning is not None:
+        if text[: spanning.start()].strip():
+            prefix = text[: spanning.start()].rstrip()
+            return prefix + "…"
+        # Oversized link at the start of the message: keep its plain title text (within budget)
+        # rather than slicing inside the markdown link syntax or URL.
+        label = _unescape_markdown_label(spanning.group(2)).strip()
+        if not label:
+            return "…"
+        sliced_label = _slice_by_utf16(label, budget)
+        prefix = sliced_label.rstrip() or sliced_label
+        return prefix + "…"
+    prefix = text[:cut].rstrip()
+    if not prefix and cut > 0:
+        prefix = text[:cut]
+    return prefix + "…"
+
+
 def _strip_non_http_markdown_links(text: str) -> str:
-    """Replace markdown links pointing to sandbox/local/relative paths with their plain link text, keeping http(s) links."""
+    """Keep http(s) links, expand ``/monitors/...`` links to the configured public URL (or title + path), and strip other relative/local links."""
+    from src.dalton.settings import get_dalton_public_app_url
+
+    public_base = get_dalton_public_app_url()
 
     def _replace(match: re.Match[str]) -> str:
         bang, label, target = (
@@ -625,6 +716,11 @@ def _strip_non_http_markdown_links(text: str) -> str:
         )
         if not bang and re.match(r"^https?://", target, re.IGNORECASE):
             return match.group(0)
+        if not bang and target.startswith("/monitors/"):
+            if public_base:
+                return f"[{label}]({public_base}{target})"
+            clean_label = _unescape_markdown_label(label)
+            return f"{clean_label} ({target})"
         return label
 
     return _MD_LINK_RE.sub(_replace, text)
@@ -2145,7 +2241,7 @@ async def send_dalton_notify_test(
     }
     text_msg = f"Dalton 推送测试\n这是一条测试推送，用于确认该目标可用。目标：{display}"
 
-    if notify_via_gateway_enabled():
+    if cleaned.startswith("weixin:") or notify_via_gateway_enabled():
         return await _send_claimed_notify_test(
             user_id=user_id,
             target=cleaned,
@@ -2977,6 +3073,20 @@ async def _fetch_data_task_def_notify_state(job_key: str) -> dict[str, Any] | No
 RETRY_MIN_REQUEST_TIMEOUT_S = 1.0
 RETRY_CLIENT_CLASSIFY_SLACK_S = 0.5
 RETRY_DB_FINALIZE_RESERVE_S = 3.0
+# R13 (Codex #4 / Grok med): Before claiming a gateway retry item, require enough
+# remaining scan budget for one full gateway read (240s) plus 4s to persist status.
+RETRY_GATEWAY_WRITE_RESERVE_S = 4.0
+RETRY_GATEWAY_MIN_REMAINING_BUDGET_S = (
+    GATEWAY_DELIVERY_READ_TIMEOUT_S + RETRY_GATEWAY_WRITE_RESERVE_S
+)
+
+
+def _remaining_retry_wall_budget_s(
+    started_at: float,
+    max_duration_s: float,
+) -> float:
+    """Return raw wall-clock seconds remaining in the current retry scan."""
+    return float(max_duration_s) - (time.monotonic() - started_at)
 
 
 def _remaining_retry_request_budget_s(
@@ -2984,7 +3094,7 @@ def _remaining_retry_request_budget_s(
     max_duration_s: float,
 ) -> float:
     """Return remaining seconds available for a retry HTTP request after reserving client classification slack and DB finalization."""
-    raw_remaining_s = float(max_duration_s) - (time.monotonic() - started_at)
+    raw_remaining_s = _remaining_retry_wall_budget_s(started_at, max_duration_s)
     return raw_remaining_s - (
         RETRY_DB_FINALIZE_RESERVE_S + RETRY_CLIENT_CLASSIFY_SLACK_S
     )
@@ -3287,7 +3397,7 @@ async def retry_failed_notify_deliveries(
     lookback_hours: int = 24,
     stale_pending_minutes: int = 10,
     limit: int = 5,
-    max_duration_s: float = 30.0,
+    max_duration_s: float = GATEWAY_DELIVERY_READ_TIMEOUT_S + 10.0,
 ) -> int:
     """Scan ``dalton_notify_deliveries`` for ``failed`` or stale ``pending`` (>10m) rows and retry them.
 
@@ -3545,10 +3655,10 @@ async def retry_failed_notify_deliveries(
                     if seen_key in report_executions_seen:
                         continue
                     if (
-                        _remaining_retry_request_budget_s(
+                        _remaining_retry_wall_budget_s(
                             started_at, max_duration_s
                         )
-                        < RETRY_MIN_REQUEST_TIMEOUT_S
+                        < RETRY_GATEWAY_MIN_REMAINING_BUDGET_S
                     ):
                         break
                     report_executions_seen.add(seen_key)
@@ -3788,12 +3898,6 @@ async def retry_failed_notify_deliveries(
                 if not is_channel_target_enabled(tgt, channel=ch):
                     continue
 
-                request_timeout_s = _remaining_retry_request_budget_s(
-                    started_at, max_duration_s
-                )
-                if request_timeout_s < RETRY_MIN_REQUEST_TIMEOUT_S:
-                    break
-
                 row_transport = str(payload.get("transport") or "").strip().lower()
                 automation_gateway = (
                     row_transport == "gateway"
@@ -3809,9 +3913,22 @@ async def retry_failed_notify_deliveries(
                     (is_data_task_row and post_notify_fn is post_bridge_notify)
                     or automation_gateway
                 )
+                request_timeout_s = _remaining_retry_request_budget_s(
+                    started_at, max_duration_s
+                )
+                if (
+                    _remaining_retry_wall_budget_s(started_at, max_duration_s)
+                    < RETRY_GATEWAY_MIN_REMAINING_BUDGET_S
+                    if use_gateway_transport
+                    else request_timeout_s < RETRY_MIN_REQUEST_TIMEOUT_S
+                ):
+                    break
                 async with get_db_connection() as conn:
                     if (
-                        _remaining_retry_request_budget_s(
+                        _remaining_retry_wall_budget_s(started_at, max_duration_s)
+                        < RETRY_GATEWAY_MIN_REMAINING_BUDGET_S
+                        if use_gateway_transport
+                        else _remaining_retry_request_budget_s(
                             started_at, max_duration_s
                         )
                         < RETRY_MIN_REQUEST_TIMEOUT_S
@@ -3959,7 +4076,13 @@ async def retry_failed_notify_deliveries(
                 request_timeout_s = _remaining_retry_request_budget_s(
                     started_at, max_duration_s
                 )
-                if request_timeout_s < RETRY_MIN_REQUEST_TIMEOUT_S:
+                insufficient_budget = (
+                    _remaining_retry_wall_budget_s(started_at, max_duration_s)
+                    < RETRY_GATEWAY_MIN_REMAINING_BUDGET_S
+                    if use_gateway_transport
+                    else request_timeout_s < RETRY_MIN_REQUEST_TIMEOUT_S
+                )
+                if insufficient_budget:
                     restored_code = (
                         row_error_code
                         if (
@@ -3990,6 +4113,12 @@ async def retry_failed_notify_deliveries(
                 wait_for_timeout_s = (
                     request_timeout_s + RETRY_CLIENT_CLASSIFY_SLACK_S
                 )
+                gateway_request_timeout_s = resolve_gateway_delivery_read_timeout_s(
+                    request_timeout_s
+                )
+                gateway_wait_for_timeout_s = (
+                    gateway_request_timeout_s + RETRY_CLIENT_CLASSIFY_SLACK_S
+                )
                 if use_gateway_transport and automation_gateway:
                     raw_delivery_id = str(row.get("delivery_id") or "").strip()
                     if not raw_delivery_id:
@@ -4011,9 +4140,9 @@ async def retry_failed_notify_deliveries(
                         post_automation_gateway_notify(
                             raw_delivery_id,
                             target=tgt,
-                            timeout_s=request_timeout_s,
+                            timeout_s=gateway_request_timeout_s,
                         ),
-                        timeout=wait_for_timeout_s,
+                        timeout=gateway_wait_for_timeout_s,
                     )
                 elif use_gateway_transport:
                     native_send_started = True
@@ -4021,10 +4150,10 @@ async def retry_failed_notify_deliveries(
                     if _callable_accepts_kwarg(
                         data_task_notify_fn, "timeout_s"
                     ):
-                        gateway_kwargs["timeout_s"] = request_timeout_s
+                        gateway_kwargs["timeout_s"] = gateway_request_timeout_s
                     bridge_res = await asyncio.wait_for(
                         data_task_notify_fn([tgt], **gateway_kwargs),
-                        timeout=wait_for_timeout_s,
+                        timeout=gateway_wait_for_timeout_s,
                     )
                 else:
                     bridge_res = await asyncio.wait_for(
@@ -4314,13 +4443,15 @@ def _report_dispatch_timeout_s(
     max_duration_s: float | None,
 ) -> float | None:
     """Bound one gateway call. ``None`` means the remaining budget is too small to start."""
-    base = float(get_notify_http_timeout_s())
+    base = resolve_gateway_delivery_read_timeout_s(float(get_notify_http_timeout_s()))
     if started_at is None or max_duration_s is None:
         return base
-    remaining = _remaining_retry_request_budget_s(float(started_at), float(max_duration_s))
-    if remaining < RETRY_MIN_REQUEST_TIMEOUT_S:
+    raw_remaining = _remaining_retry_wall_budget_s(float(started_at), float(max_duration_s))
+    if raw_remaining < RETRY_GATEWAY_MIN_REMAINING_BUDGET_S:
         return None
-    return min(base, remaining)
+    return resolve_gateway_delivery_read_timeout_s(
+        min(base, raw_remaining - RETRY_GATEWAY_WRITE_RESERVE_S)
+    )
 
 
 def _unresolved_saved_item_code(auth: Mapping[str, Any]) -> str | None:
@@ -5294,69 +5425,72 @@ async def on_automation_settled(
             and _post_notify_is_bridge(post_notify_fn)
             and claim_execution_fn is None
         )
-        payload_record = {
+        base_payload_record = {
             "text": message_text,
             "card": card_dict,
             "automation_name": str(automation.get("name") or "").strip(),
             "category": classification.category,
             "source": "automation_completion",
-            "transport": "gateway" if via_gateway else "bridge",
         }
         eff_unit_id = clean_stamped_unit_id or active_unit_id
         if eff_unit_id:
-            payload_record["coverage_unit_id"] = eff_unit_id
-            payload_record["workspace_id"] = ws_id_notify
+            base_payload_record["coverage_unit_id"] = eff_unit_id
+            base_payload_record["workspace_id"] = ws_id_notify
             if clean_stamped_unit_version:
-                payload_record["coverage_unit_version"] = clean_stamped_unit_version
+                base_payload_record["coverage_unit_version"] = clean_stamped_unit_version
         automation_id_str = (
             str(automation.get("automation_id") or "").strip() or None
         )
 
-        claimed_targets: list[tuple[str, str, str | None]] = []
+        claimed_targets: list[tuple[str, str, str | None, bool]] = []
         if claim_execution_fn is not None:
             if await claim_execution_fn(execution_id):
                 for tgt in targets:
                     ch, cleaned_tgt = _split_target_channel(tgt)
-                    claimed_targets.append((ch, cleaned_tgt, None))
-        elif via_gateway:
-            for tgt in targets:
-                ch, cleaned_tgt = _split_target_channel(tgt)
-                claim_res = await claim_target_delivery_with_attempt(
-                    execution_id,
-                    ch,
-                    cleaned_tgt,
-                    user_id=user_id,
-                    automation_id=automation_id_str,
-                    payload=payload_record,
-                )
-                if not claim_res[0]:
-                    continue
-                if not claim_res.delivery_id:
-                    await _invoke_mark_delivery(
-                        mark_target_fn,
-                        execution_id,
-                        ch,
-                        cleaned_tgt,
-                        status="failed",
-                        error_code="missing_delivery_id",
-                        expected_status="pending",
-                    )
-                    continue
-                claimed_targets.append((ch, cleaned_tgt, claim_res.delivery_id))
-                pending_targets.append((ch, cleaned_tgt))
+                    claimed_targets.append((ch, cleaned_tgt, None, False))
         else:
             for tgt in targets:
                 ch, cleaned_tgt = _split_target_channel(tgt)
-                if await claim_target_fn(
-                    execution_id,
-                    ch,
-                    cleaned_tgt,
-                    user_id=user_id,
-                    automation_id=automation_id_str,
-                    payload=payload_record,
-                ):
-                    claimed_targets.append((ch, cleaned_tgt, None))
+                target_via_gateway = cleaned_tgt.startswith("weixin:") or via_gateway
+                target_payload = {
+                    **base_payload_record,
+                    "transport": "gateway" if target_via_gateway else "bridge",
+                }
+                if target_via_gateway:
+                    claim_res = await claim_target_delivery_with_attempt(
+                        execution_id,
+                        ch,
+                        cleaned_tgt,
+                        user_id=user_id,
+                        automation_id=automation_id_str,
+                        payload=target_payload,
+                    )
+                    if not claim_res[0]:
+                        continue
+                    if not claim_res.delivery_id:
+                        await _invoke_mark_delivery(
+                            mark_target_fn,
+                            execution_id,
+                            ch,
+                            cleaned_tgt,
+                            status="failed",
+                            error_code="missing_delivery_id",
+                            expected_status="pending",
+                        )
+                        continue
+                    claimed_targets.append((ch, cleaned_tgt, claim_res.delivery_id, True))
                     pending_targets.append((ch, cleaned_tgt))
+                else:
+                    if await claim_target_fn(
+                        execution_id,
+                        ch,
+                        cleaned_tgt,
+                        user_id=user_id,
+                        automation_id=automation_id_str,
+                        payload=target_payload,
+                    ):
+                        claimed_targets.append((ch, cleaned_tgt, None, False))
+                        pending_targets.append((ch, cleaned_tgt))
 
         if not claimed_targets:
             logger.info(
@@ -5366,9 +5500,9 @@ async def on_automation_settled(
             return False
 
         any_sent = False
-        for ch, cleaned_tgt, delivery_id in claimed_targets:
+        for ch, cleaned_tgt, delivery_id, target_via_gateway in claimed_targets:
             try:
-                if via_gateway:
+                if target_via_gateway:
                     bridge_res = await post_automation_gateway_notify(
                         str(delivery_id),
                         target=cleaned_tgt,
@@ -5381,7 +5515,7 @@ async def on_automation_settled(
                         card_dict,
                     )
             except asyncio.CancelledError:
-                if via_gateway:
+                if target_via_gateway:
                     await _shielded_mark_uncertain(
                         mark_target_fn,
                         execution_id,
@@ -5437,7 +5571,7 @@ async def on_automation_settled(
                 )
                 continue
 
-            if via_gateway:
+            if target_via_gateway:
                 skip_code = _notify_result_skip_code(cleaned_tgt, bridge_res)
                 if skip_code is not None:
                     try:
@@ -5490,7 +5624,7 @@ async def on_automation_settled(
             if ok:
                 any_sent = True
             if claim_execution_fn is None:
-                if via_gateway and not ok:
+                if target_via_gateway and not ok:
                     recorded_error = _extract_retry_target_error_code(
                         cleaned_tgt,
                         bridge_res,

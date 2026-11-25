@@ -84,6 +84,8 @@ interface NavigationPanelProps {
   /** The organization's workspaces the person is in, drawn as a second group
    *  after their own; absent with shared workspaces off or none to show. */
   sharedWorkspaces?: SharedWorkspaceEntry[];
+  // DALTON-HOOK(mobile-web): optional trailing sections mounted inside the mobile drawer's scroll container
+  extraSections?: React.ReactNode;
 }
 
 /**
@@ -169,6 +171,7 @@ function NavigationPanel({
   onDeleteThread,
   headerActions,
   sharedWorkspaces,
+  extraSections, // DALTON-HOOK(mobile-web)
 }: NavigationPanelProps) {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
@@ -539,6 +542,8 @@ function NavigationPanel({
           )}
           </TreeRoot>
           </NavTreeContext>
+          {/* DALTON-HOOK(mobile-web): trailing sections (coverage tree & team workspaces) in MobileNavDrawer */}
+          {extraSections}
         </div>
       </div>
       {wsActions.dialogs}

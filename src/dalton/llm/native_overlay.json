@@ -1067,9 +1067,15 @@
           "doubao-coding": {
             "sdk": "anthropic",
             "base_url": "https://ark.cn-beijing.volces.com/api/coding",
-            "access_type": "coding_plan"
+            "access_type": "coding_plan",
+            "display_name": "Doubao Coding Plan"
           }
         }
+      }
+    },
+    "provider_config_overrides": {
+      "xai": {
+        "display_name": "xAI (Grok)"
       }
     },
     "provider_variants": {},

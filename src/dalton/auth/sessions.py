@@ -500,15 +500,18 @@ async def create_local_session(
 
     Returns ``(session_id, access_token, raw_refresh_token, expires_in)``.
     """
-    ts = now or _utcnow()
-    pw_ts = _as_utc(password_changed_at) or ts
     ttl_seconds = get_refresh_session_ttl_seconds()
-    expires_at = ts + timedelta(seconds=ttl_seconds)
     raw_refresh = generate_refresh_token()
     refresh_hash = hash_refresh_token(raw_refresh)
 
     async def _insert(db_conn: Any) -> str:
         async with db_conn.cursor(row_factory=dict_row) as cur:
+            # The session's clock is the database's, as refresh and logout read it
+            # (``_read_post_lock_clock``); an app-server clock here would let a
+            # skewed host shift every expiry those paths later compare against.
+            ts = await _read_post_lock_clock(cur, override_now=now)
+            pw_ts = _as_utc(password_changed_at) or ts
+            expires_at = ts + timedelta(seconds=ttl_seconds)
             await cur.execute(
                 """
                 INSERT INTO dalton_local_sessions (
@@ -669,7 +672,9 @@ async def authenticate_local_login(
                     client_ip=client_ip,
                     user_agent=user_agent,
                     conn=conn,
-                    now=ts,
+                    # Only an explicit override reaches the session; otherwise it reads
+                    # the database clock, as refresh and logout do.
+                    now=now,
                 )
             )
             tier = await get_user_role(user_id, conn=conn) or "external"

@@ -894,7 +894,9 @@ describe("Dalton data-task report delivery via channel gateway", () => {
 
     const ledger = new Map<
       string,
-      { status: "in_flight" | "sent" | "partial" | "failed" | "unknown" }
+      {
+        status: "in_flight" | "sent" | "partial" | "failed" | "unknown";
+      }
     >();
 
     let failSecondImageUploadOnce = true;
@@ -1670,20 +1672,19 @@ describe("Dalton data-task report delivery via channel gateway", () => {
     await outgoingApp.start();
     try {
       expect(wsStartSpy).not.toHaveBeenCalled();
-      expect(outgoingBackend.getWeixinState).toHaveBeenCalledTimes(0);
+      expect(outgoingBackend.acquireGatewayLease).toHaveBeenCalledTimes(0);
+      expect(outgoingBackend.reconcileWeixinAccounts).toHaveBeenCalledTimes(0);
       expect(outgoingBackend.recoverState).toHaveBeenCalledTimes(0);
     } finally {
       await outgoingApp.stop();
     }
   });
 
-  it("preserves default incoming startup mode with adapter start, startup recovery, and two Weixin sync passes", async () => {
-    const tempDir = mkdtempSync(join(tmpdir(), "dalton-dtn-incoming-"));
+  it("preserves default incoming startup mode with lease acquire, startup recovery, and adapter start", async () => {
     const incomingCfg = loadConfig({
       GATEWAY_HOST: "127.0.0.1",
       GATEWAY_PORT: "0",
       INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
-      DALTON_WEIXIN_CACHE_DIR: join(tempDir, "weixin"),
     });
     expect(incomingCfg.mode).toBe("incoming");
     const incomingBackend = createMockBackend();
@@ -1699,13 +1700,11 @@ describe("Dalton data-task report delivery via channel gateway", () => {
     await incomingApp.start();
     try {
       await incomingApp.orchestrator.waitForStartupRecovery();
-      // 1 sync before listen (`server.ts`) + 1 sync inside `runStartupRecovery` (`orchestrator.ts`)
-      expect(incomingBackend.getWeixinState).toHaveBeenCalledTimes(2);
+      expect(incomingBackend.acquireGatewayLease).toHaveBeenCalledTimes(1);
       expect(incomingBackend.recoverState).toHaveBeenCalledTimes(1);
       expect(fakeFeishu.started).toBe(true);
     } finally {
       await incomingApp.stop();
-      rmSync(tempDir, { recursive: true, force: true });
     }
   });
 

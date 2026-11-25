@@ -11,6 +11,7 @@ import { fetchBootstrapStatus, LocalAuthError } from '@/lib/dalton/localAuth';
 import EdgeGrain from '@/pages/Login/EdgeGrain';
 import PasswordInput from '@/pages/Login/PasswordInput';
 import PasswordStrength from '@/pages/Login/PasswordStrength';
+import '@/pages/Login/AuthPage.css';
 import '@/pages/Login/LoginPage.css';
 
 const MIN_ADMIN_PASSWORD_LEN = 10;
@@ -243,7 +244,7 @@ export default function AdminBootstrapStep() {
               minLength={MIN_ADMIN_PASSWORD_LEN}
               required
             />
-            <PasswordStrength password={password} />
+            <PasswordStrength password={password} minLength={MIN_ADMIN_PASSWORD_LEN} />
           </div>
 
           <div className="login-page__field">

@@ -330,6 +330,7 @@ async def test_manifest_includes_four_scopes_and_derives_statuses(
             }
         return 404, None
 
+    monkeypatch.setenv("DALTON_OPS_JOBS_VIA_BRIDGE", "true")
     monkeypatch.setattr(
         system_jobs_mod,
         "_call_host_bridge",
@@ -497,6 +498,7 @@ async def test_ops_jobs_fallback_to_unknown_without_raising(
     ) -> tuple[int, dict[str, Any] | None]:
         raise RuntimeError("bridge connection refused")
 
+    monkeypatch.setenv("DALTON_OPS_JOBS_VIA_BRIDGE", "true")
     monkeypatch.setattr(
         system_jobs_mod,
         "_call_host_bridge",

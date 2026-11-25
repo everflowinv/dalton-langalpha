@@ -17,6 +17,7 @@ import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useLatestRef } from '@/hooks/useLatestRef';
 import { onKeyboardFit, onScreenKeyboardUp, roomAboveKeyboard } from '@/lib/visualViewport';
+import { isCoarsePointer } from '@/lib/dalton/pointer'; // DALTON-HOOK(mobile-web)
 import { useFavoriteModels } from '@/hooks/useFavoriteModels';
 import { useSeededModel } from '@/hooks/useSeededModel';
 import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
@@ -56,7 +57,7 @@ import {
 import { useMentions } from './chat-input.useMentions';
 import { useQuoteTokens } from './chat-input.useQuoteTokens';
 import { useSlashCommands } from './chat-input.useSlashCommands';
-import { speechSupported, useVoiceInput } from './chat-input.useVoiceInput';
+import { isSpeechRecognitionSupported, useVoiceInput } from './chat-input.useVoiceInput'; // DALTON-HOOK(mobile-web)
 import { useFileAttachments } from './chat-input.useFileAttachments';
 import { useDeviceTuningLift } from './chat-input.useDeviceTuningLift';
 import { readSubagentsDefault } from '@/lib/subagentsDefault';
@@ -1224,7 +1225,8 @@ function ChatInput({
         }
         return;
       }
-      if (!e.shiftKey && !onScreenKeyboardUp()) {
+      // DALTON-HOOK(mobile-web): Enter inserts a newline on coarse-pointer (touch) devices; send via button
+      if (!e.shiftKey && !onScreenKeyboardUp() && !isCoarsePointer()) {
         e.preventDefault();
         handleSend();
       }
@@ -1284,7 +1286,8 @@ function ChatInput({
   const summary = notices?.summary ?? null;
   const ringVisible = usageCounted || !!summary;
   const ringSlot = ringVisible || tokenUsagePending;
-  const micReserved = speechSupported && !!otherPref?.voice_input_enabled;
+  // DALTON-HOOK(mobile-web): hide voice button when browser Web Speech API is unavailable in the current environment
+  const micReserved = isSpeechRecognitionSupported() && !!otherPref?.voice_input_enabled;
   // Right group: the model pill (measured), the mic, and send/stop. A turn
   // hides the mic but keeps its room, so the fold set holds through it.
   const rightGroup = (model: number) => GROUP_GAP + model
@@ -1608,7 +1611,8 @@ function ChatInput({
               <button
                 onClick={(e) => { e.stopPropagation(); fileInputRef.current?.click(); }}
                 disabled={disabled}
-                className="press inline-flex flex-none items-center justify-center h-8 w-8 rounded-lg text-(--color-icon-muted) hover:text-(--color-text-muted) hover:bg-foreground/5"
+                // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on composer attach icon
+                className="tap-target press inline-flex flex-none items-center justify-center h-8 w-8 rounded-lg text-(--color-icon-muted) hover:text-(--color-text-muted) hover:bg-foreground/5"
                 type="button"
                 aria-label={t('chat.composer.attachFile')}
               >
@@ -1624,7 +1628,8 @@ function ChatInput({
               {onCaptureChart && (
                 <button
                   onClick={(e) => { e.stopPropagation(); onCaptureChart(); }}
-                  className="press inline-flex flex-none items-center justify-center h-8 w-8 rounded-lg text-(--color-icon-muted) hover:text-(--color-text-muted) hover:bg-foreground/5"
+                  // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on chart capture icon
+                  className="tap-target press inline-flex flex-none items-center justify-center h-8 w-8 rounded-lg text-(--color-icon-muted) hover:text-(--color-text-muted) hover:bg-foreground/5"
                   type="button"
                   title={t('chat.composer.attachChart')}
                   aria-label={t('chat.composer.captureChart')}

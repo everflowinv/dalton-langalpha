@@ -47,7 +47,6 @@ def thread_resolver(
     fast_mode: bool | None = None,
     enabled_subagents: list[str] | None = None,
     ignore_custom_models: bool = False,  # DALTON-HOOK(cos-settings-tools)
-    run_metadata: Mapping[str, Any] | None = None,  # DALTON-HOOK(cos-settings-tools)
 ) -> Callable[..., Awaitable[AgentConfig]]:
     """Maps a model name (None for the account default) to the config a turn
     on the thread runs it under, in the route's workspace and role.
@@ -76,19 +75,11 @@ def thread_resolver(
             if reasoning_effort_override is _UNSET_EFFORT
             else reasoning_effort_override
         )
-        # DALTON-HOOK(cos-settings-tools): resolve against this run's metadata marker when provided
-        base_ignore_custom = bool(
-            ignore_custom_models
-            or (run_metadata is not None and run_metadata.get("llm_model_system_only"))
-        )
+        # DALTON-HOOK(cos-settings-tools): enforce system-catalog model resolution when execution-level flag applies
         effective_ignore_custom = (
-            base_ignore_custom
+            bool(ignore_custom_models)
             if ignore_custom_models_override is None
             else bool(ignore_custom_models_override)
-        )
-        # DALTON-HOOK(cos-settings-tools): pass ignore_custom_models only when active so default calls keep upstream kwargs
-        extra_kwargs: dict[str, Any] = (
-            {"ignore_custom_models": True} if effective_ignore_custom else {}
         )
         return await resolve_llm_config(
             setup.agent_config,
@@ -102,7 +93,8 @@ def thread_resolver(
             workspace_id=route.workspace_id,
             identity=identity,
             role=route.role,
-            **extra_kwargs,
+            # DALTON-HOOK(cos-settings-tools): only forward ignore_custom_models when True so normal calls stay identical to upstream
+            **({"ignore_custom_models": True} if effective_ignore_custom else {}),
         )
 
     return resolve

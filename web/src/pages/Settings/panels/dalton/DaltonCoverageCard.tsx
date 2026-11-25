@@ -62,7 +62,7 @@ function OpenWorkspaceLink({
       type="button"
       variant="ghost"
       size="sm"
-      className="h-7 gap-1 px-2 text-xs"
+      className="h-8 md:h-7 tap-target gap-1 px-2 text-xs"
       style={{ color: 'var(--color-accent-primary)' }}
       onClick={() => navigate(`/chat/${workspaceId}`)}
       data-testid={`dalton-coverage-open-ws-${workspaceId}`}
@@ -165,7 +165,7 @@ function UnitManageActions({
             onChange={(e) => onSelectWs(e.target.value)}
             aria-label={t('dalton.coverage.bindTargetNone')}
             disabled={busy || availableWorkspaces.length === 0}
-            className="w-48 text-xs"
+            className="w-full md:w-48 h-9 md:h-8 text-xs"
             data-testid={`dalton-coverage-bind-select-${unitId}`}
           >
             <option value="">{t('dalton.coverage.bindTargetNone')}</option>
@@ -361,7 +361,7 @@ function SectorMemberRow({
               type="button"
               variant="ghost"
               size="sm"
-              className="h-6 w-6 p-0"
+              className="h-6 w-6 p-0 tap-target"
               aria-expanded={expanded}
               aria-label={memberLabel}
               onClick={() => setExpanded((v) => !v)}
@@ -818,7 +818,7 @@ export function DaltonCoverageCard() {
             type="button"
             variant="ghost"
             size="sm"
-            className="h-7 w-7 p-0"
+            className="h-7 w-7 p-0 tap-target"
             aria-expanded={isExpanded}
             aria-label={unitName}
             onClick={() => setExpandedUnitId(isExpanded ? null : unit.unit_id)}
@@ -927,20 +927,20 @@ export function DaltonCoverageCard() {
             onChange={(e) => setSlugInput(e.target.value)}
             placeholder={t('dalton.coverage.fieldSlug')}
             data-testid="dalton-coverage-slug-input"
-            className="h-8 w-52 text-xs"
+            className="h-9 md:h-8 w-full md:w-52 text-xs"
           />
           <Input
             value={displayNameInput}
             onChange={(e) => setDisplayNameInput(e.target.value)}
             placeholder={t('dalton.coverage.fieldDisplayName')}
             data-testid="dalton-coverage-name-input"
-            className="h-8 w-44 text-xs"
+            className="h-9 md:h-8 w-full md:w-44 text-xs"
           />
           <TimezonePicker
             value={tzInput}
             onChange={setTzInput}
             placeholder={t('dalton.coverage.fieldResearchTz')}
-            className="w-48"
+            className="w-full md:w-48"
           />
           <Button
             type="button"
