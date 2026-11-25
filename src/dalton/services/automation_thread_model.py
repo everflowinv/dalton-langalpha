@@ -544,12 +544,14 @@ async def _resolve_source_execution(
         exec_row = await _get_execution_by_id(explicit_exec_id)
         if exec_row is not None:
             return exec_row, "execution_id"
+        return None, "none"
 
     delivery_exec_id = _delivery_execution_id(request)
     if delivery_exec_id:
         exec_row = await _get_execution_by_id(delivery_exec_id)
         if exec_row is not None:
             return exec_row, "automation_delivery"
+        return None, "none"
 
     restart_run_id = _restart_from_run_id(request)
     if restart_run_id:
@@ -803,7 +805,11 @@ async def _resolve_automation_notification_context(
     try:
         if is_user_retry:
             exec_row = await _get_execution_for_run_id(str(retry_of_run_id))
-            if exec_row is None and getattr(request, "query_type", None) == "wakeup":
+            if (
+                exec_row is None
+                and known_execution_id is None
+                and getattr(request, "query_type", None) == "wakeup"
+            ):
                 wakeup_ids = extract_wakeup_notice_ids(request)
                 if wakeup_ids:
                     for creator_run_id in await _get_wakeup_creator_run_ids(
@@ -851,13 +857,19 @@ async def _resolve_automation_notification_context(
             exc_info=True,
         )
         return None, None, None, False, False, None
-    if target_exec is None:
-        if known_execution_id is not None:
+    if known_execution_id is not None:
+        resolved_exec_id = (
+            normalize_uuid(str(target_exec.get("automation_execution_id") or ""))
+            if target_exec is not None
+            else None
+        )
+        if target_exec is None or resolved_exec_id != known_execution_id:
             logger.warning(
                 f"[AUTOMATION_THREAD_MODEL] Confirmed execution {known_execution_id} "
-                f"not found (0 rows) for thread={thread_id}; refusing turn"
+                f"not found or mismatched (resolved={resolved_exec_id}) for thread={thread_id}; refusing turn"
             )
             raise _automation_model_unreadable()
+    if target_exec is None:
         return None, None, None, False, False, None
 
     if target_exec.get("snapshot_taken") is False:
