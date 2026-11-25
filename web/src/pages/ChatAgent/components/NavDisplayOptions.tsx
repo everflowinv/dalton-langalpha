@@ -57,7 +57,8 @@ export default function NavDisplayOptions() {
     <Popover>
       <PopoverTrigger asChild>
         <button
-          className="nav-panel-dismiss-btn"
+          // DALTON-HOOK(mobile-web): expand display options trigger touch target on coarse pointers
+          className="nav-panel-dismiss-btn tap-target"
           style={{
             padding: 4,
             background: 'transparent',

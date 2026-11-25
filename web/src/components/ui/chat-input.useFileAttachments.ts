@@ -11,7 +11,7 @@ import {
 } from '@/pages/ChatAgent/utils/attachmentUpload';
 import { checkAttachment } from '@/pages/ChatAgent/utils/api/attachments';
 import { apiErrorStatus } from '@/api/errors';
-import { isImageFile } from '@/pages/ChatAgent/utils/fileUpload';
+import { inferImageMimeType } from '@/pages/ChatAgent/utils/fileUpload'; // DALTON-HOOK(mobile-web)
 import { classifyUploadError } from '@/pages/ChatAgent/utils/partUpload';
 import {
   cancelChatUpload,
@@ -358,7 +358,8 @@ export function useFileAttachments({
       const tiles: Array<FileAttachment & { useServerUpload: boolean }> = planned.map(({ file, useServerUpload }) => ({
         id: newId(),
         file,
-        type: file.type || (isImageFile(file) ? 'image/png' : 'application/octet-stream'),
+        // DALTON-HOOK(mobile-web): preserve image/heic and image/heif when browser omits file.type
+        type: inferImageMimeType(file) || 'application/octet-stream',
         upload: { status: 'uploading', percent: 0 },
         ...(useServerUpload
           ? { uploadStatus: 'uploading' as const, uploadProgress: 0, uploadWorkspaceKey: effectiveWorkspace }
