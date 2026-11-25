@@ -2660,8 +2660,12 @@ async def preflight_check(
     return result
 
 
-PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S = 30.0
-PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S = 26.0
+from src.dalton.notify.channel_transport import GATEWAY_DELIVERY_READ_TIMEOUT_S
+
+# R12 (Codex #3 / Grok med): Preflight retry scan must allow a full gateway delivery
+# read (>= GATEWAY_DELIVERY_READ_TIMEOUT_S = 240s) plus DB finalization headroom (4s).
+PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S = GATEWAY_DELIVERY_READ_TIMEOUT_S + 10.0
+PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S = PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S + 4.0
 
 
 class RecoveryLookupFailed(RuntimeError):

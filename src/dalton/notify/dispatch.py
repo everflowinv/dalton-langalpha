@@ -27,11 +27,13 @@ from src.dalton.llm.model_prefs import (
     resolve_dalton_notify_targets,
 )
 from src.dalton.notify.channel_transport import (
+    GATEWAY_DELIVERY_READ_TIMEOUT_S,
     UNCERTAIN_NOTIFY_ERROR_CODES,
     extract_target_uncertain_code,
     is_uncertain_notify_error_code,
     post_automation_gateway_notify,
     post_data_task_gateway_notify,
+    resolve_gateway_delivery_read_timeout_s,
 )
 from src.dalton.settings import (
     get_dalton_bridge_base_url,
@@ -3287,7 +3289,7 @@ async def retry_failed_notify_deliveries(
     lookback_hours: int = 24,
     stale_pending_minutes: int = 10,
     limit: int = 5,
-    max_duration_s: float = 30.0,
+    max_duration_s: float = GATEWAY_DELIVERY_READ_TIMEOUT_S + 10.0,
 ) -> int:
     """Scan ``dalton_notify_deliveries`` for ``failed`` or stale ``pending`` (>10m) rows and retry them.
 
@@ -3990,6 +3992,12 @@ async def retry_failed_notify_deliveries(
                 wait_for_timeout_s = (
                     request_timeout_s + RETRY_CLIENT_CLASSIFY_SLACK_S
                 )
+                gateway_request_timeout_s = resolve_gateway_delivery_read_timeout_s(
+                    request_timeout_s
+                )
+                gateway_wait_for_timeout_s = (
+                    gateway_request_timeout_s + RETRY_CLIENT_CLASSIFY_SLACK_S
+                )
                 if use_gateway_transport and automation_gateway:
                     raw_delivery_id = str(row.get("delivery_id") or "").strip()
                     if not raw_delivery_id:
@@ -4011,9 +4019,9 @@ async def retry_failed_notify_deliveries(
                         post_automation_gateway_notify(
                             raw_delivery_id,
                             target=tgt,
-                            timeout_s=request_timeout_s,
+                            timeout_s=gateway_request_timeout_s,
                         ),
-                        timeout=wait_for_timeout_s,
+                        timeout=gateway_wait_for_timeout_s,
                     )
                 elif use_gateway_transport:
                     native_send_started = True
@@ -4021,10 +4029,10 @@ async def retry_failed_notify_deliveries(
                     if _callable_accepts_kwarg(
                         data_task_notify_fn, "timeout_s"
                     ):
-                        gateway_kwargs["timeout_s"] = request_timeout_s
+                        gateway_kwargs["timeout_s"] = gateway_request_timeout_s
                     bridge_res = await asyncio.wait_for(
                         data_task_notify_fn([tgt], **gateway_kwargs),
-                        timeout=wait_for_timeout_s,
+                        timeout=gateway_wait_for_timeout_s,
                     )
                 else:
                     bridge_res = await asyncio.wait_for(
@@ -4314,13 +4322,13 @@ def _report_dispatch_timeout_s(
     max_duration_s: float | None,
 ) -> float | None:
     """Bound one gateway call. ``None`` means the remaining budget is too small to start."""
-    base = float(get_notify_http_timeout_s())
+    base = resolve_gateway_delivery_read_timeout_s(float(get_notify_http_timeout_s()))
     if started_at is None or max_duration_s is None:
         return base
     remaining = _remaining_retry_request_budget_s(float(started_at), float(max_duration_s))
     if remaining < RETRY_MIN_REQUEST_TIMEOUT_S:
         return None
-    return min(base, remaining)
+    return resolve_gateway_delivery_read_timeout_s(min(base, remaining))
 
 
 def _unresolved_saved_item_code(auth: Mapping[str, Any]) -> str | None:

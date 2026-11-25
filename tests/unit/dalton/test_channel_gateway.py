@@ -3401,6 +3401,50 @@ def test_outbound_deliveries_progress_steers_recover_automation_and_weixin(
     )
     assert r_auto_fin2.json()["status"] == "finished"
 
+    # R12 (Codex #7): Already-finished run MUST NOT revert to 'finishing' when mark_finished=True
+    # and targets is omitted, nor when mark_finished=False.
+    r_auto_fin_again_no_targets = client.post(
+        f"/api/v1/dalton/channels/internal/automation-runs/{exec_id}/finish",
+        headers=headers,
+        json={"status": "completed", "mark_finished": True},
+    )
+    assert r_auto_fin_again_no_targets.status_code == 200
+    assert r_auto_fin_again_no_targets.json()["status"] == "finished"
+    assert r_auto_fin_again_no_targets.json()["previous_status"] == "finished"
+    assert len(r_auto_fin_again_no_targets.json()["targets"]) == 1
+
+    r_auto_fin_again_false = client.post(
+        f"/api/v1/dalton/channels/internal/automation-runs/{exec_id}/finish",
+        headers=headers,
+        json={"status": "completed", "mark_finished": False},
+    )
+    assert r_auto_fin_again_false.status_code == 200
+    assert r_auto_fin_again_false.json()["status"] == "finished"
+
+    # R12 (Codex #7): Omitting targets with mark_finished=True directly transitions to 'finished'
+    # while preserving persisted targets.
+    exec_id_2 = str(uuid4())
+    r_reg_2 = client.post(
+        "/api/v1/dalton/channels/internal/automation-runs",
+        headers=headers,
+        json={
+            "execution_id": exec_id_2,
+            "user_id": "u-alice",
+            "automation_name": "omitted-targets-finish",
+            "entries": ["feishu"],
+        },
+    )
+    assert r_reg_2.status_code == 200
+    r_fin_direct = client.post(
+        f"/api/v1/dalton/channels/internal/automation-runs/{exec_id_2}/finish",
+        headers=headers,
+        json={"status": "completed", "mark_finished": True},
+    )
+    assert r_fin_direct.status_code == 200
+    assert r_fin_direct.json()["status"] == "finished"
+    assert r_fin_direct.json()["previous_status"] == "registered"
+    assert len(r_fin_direct.json()["targets"]) == 1
+
     # §6.1: Legacy singleton /internal/weixin-state is removed (404)
     assert (
         client.get(

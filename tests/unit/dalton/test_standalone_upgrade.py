@@ -896,7 +896,8 @@ def test_r10_recovery_health_check_probes_crawler_and_gateway_health_endpoints(
         trace_txt = trace.read_text(encoding="utf-8")
         assert "exec -T crawler curl -sf http://127.0.0.1:8100/health" in trace_txt
         assert "exec -T -e DALTON_HEALTH_TOKEN channel-gateway sh -c" in trace_txt
-        assert "http://127.0.0.1:8962/health" in trace_txt
+        assert "http://127.0.0.1:8962" in trace_txt
+        assert "/health" in trace_txt and "/agent/settings" in trace_txt
         if expect_ok:
             assert "ALREADY restored the pre-upgrade release files" in res.stderr
             assert "health_ok=0" not in res.stderr
@@ -1007,33 +1008,49 @@ def test_r11_gateway_health_auth_and_normal_upgrade_probes_crawler_and_gateway(
         assert res_fail.returncode != 0, f"{case_name}: expected failure"
         assert expect_tag in res_fail.stderr, f"{case_name}: {res_fail.stderr}"
 
-    # 3. Execute the exact channel-gateway sh -c health probe from upgrade.sh in both
-    #    the curl branch and the node fallback branch without opening network sockets
-    #    (unit tests run under pytest-socket).
+    # 3. Execute the exact channel-gateway sh -c readiness probe from upgrade.sh in both
+    #    the curl fallback branch and the node branch without opening network sockets
+    #    (unit tests run under pytest-socket):
+    #    - missing/wrong token -> fail
+    #    - /health {"ok":true,"ready":false} -> fail (still starting)
+    #    - /health {"ok":true,"ready":true} -> pass
+    #    - /health {"ok":true} (no ready field) + /agent/settings 503 gateway_starting -> fail
+    #    - /health {"ok":true} (no ready field) + /agent/settings 200 -> pass
     script_src = _UPGRADE_SCRIPT.read_text(encoding="utf-8")
     m_probe = _re.search(
         r"exec -T -e DALTON_HEALTH_TOKEN channel-gateway sh -c \\\n\s+'([^']+)'",
         script_src,
     )
-    assert m_probe is not None, "Expected channel-gateway sh -c health probe in upgrade.sh"
+    assert m_probe is not None, "Expected channel-gateway sh -c readiness probe in upgrade.sh"
     probe_snippet = m_probe.group(1)
 
-    url = "http://127.0.0.1:8962/health"
+    base_url = "http://127.0.0.1:8962"
     base_probe_env = {k: v for k, v in os.environ.items() if k != "DALTON_HEALTH_TOKEN"}
 
-    # 3a. curl branch
+    # 3a. curl fallback branch (PATH contains fake curl + /usr/bin for tr, NO node)
     curl_bin = tmp_path / "probe-curl-bin"
     curl_bin.mkdir()
+    tr_bin = Path("/usr/bin/tr")
+    if tr_bin.exists():
+        (curl_bin / "tr").symlink_to(tr_bin)
     fake_curl = curl_bin / "curl"
     fake_curl.write_text(
         f"""#!/bin/bash
 set -euo pipefail
 hdr=""
 target=""
+write_code=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -H)
       hdr="${{2:-}}"
+      shift 2
+      ;;
+    -o)
+      shift 2
+      ;;
+    -w)
+      write_code=1
       shift 2
       ;;
     -sf|-s|-f)
@@ -1045,7 +1062,19 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-if [[ "$target" == "{url}" && "$hdr" == "X-Service-Token: {secret_tok}" ]]; then
+if [[ "$hdr" != "X-Service-Token: {secret_tok}" ]]; then
+  if [[ "$write_code" -eq 1 ]]; then echo "401"; exit 0; fi
+  exit 22
+fi
+if [[ "$target" == "{base_url}/health" ]]; then
+  printf '%s' "${{FAKE_HEALTH_BODY:-}}"
+  exit "${{FAKE_HEALTH_RC:-0}}"
+fi
+if [[ "$target" == "{base_url}/agent/settings" ]]; then
+  if [[ "$write_code" -eq 1 ]]; then
+    echo "${{FAKE_SETTINGS_CODE:-200}}"
+    exit 0
+  fi
   exit 0
 fi
 exit 22
@@ -1053,33 +1082,25 @@ exit 22
         encoding="utf-8",
     )
     fake_curl.chmod(0o755)
-    curl_env = {**base_probe_env, "PATH": f"{curl_bin}:{os.environ['PATH']}"}
-    r_missing = subprocess.run(
-        ["/bin/sh", "-c", probe_snippet, "_", url],
-        env=curl_env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert r_missing.returncode != 0
-    r_wrong = subprocess.run(
-        ["/bin/sh", "-c", probe_snippet, "_", url],
-        env={**curl_env, "DALTON_HEALTH_TOKEN": "wrong-token"},
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert r_wrong.returncode != 0
-    r_good = subprocess.run(
-        ["/bin/sh", "-c", probe_snippet, "_", url],
-        env={**curl_env, "DALTON_HEALTH_TOKEN": secret_tok},
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    assert r_good.returncode == 0, r_good.stderr
+    curl_env = {**base_probe_env, "PATH": str(curl_bin)}
+    for label, extra_env, expect_ok in (
+        ("missing-token", {}, False),
+        ("wrong-token", {"DALTON_HEALTH_TOKEN": "wrong-token", "FAKE_HEALTH_BODY": '{"ok":true,"ready":true}'}, False),
+        ("health-ready-false", {"DALTON_HEALTH_TOKEN": secret_tok, "FAKE_HEALTH_BODY": '{"ok": true, "ready": false}'}, False),
+        ("health-ready-true", {"DALTON_HEALTH_TOKEN": secret_tok, "FAKE_HEALTH_BODY": '{"ok": true, "ready": true}'}, True),
+        ("health-no-ready-settings-503", {"DALTON_HEALTH_TOKEN": secret_tok, "FAKE_HEALTH_BODY": '{"ok": true}', "FAKE_SETTINGS_CODE": "503"}, False),
+        ("health-no-ready-settings-200", {"DALTON_HEALTH_TOKEN": secret_tok, "FAKE_HEALTH_BODY": '{"ok": true}', "FAKE_SETTINGS_CODE": "200"}, True),
+    ):
+        r_c = subprocess.run(
+            ["/bin/sh", "-c", probe_snippet, "_", base_url],
+            env={**curl_env, **extra_env},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert (r_c.returncode == 0) is expect_ok, f"curl branch {label}: rc={r_c.returncode} err={r_c.stderr}"
 
-    # 3b. node fallback branch (PATH has no curl, only fake node)
+    # 3b. node branch (PATH has fake node; verifies JS checks /health ready + /agent/settings 200 fallback)
     node_bin = tmp_path / "probe-node-bin"
     node_bin.mkdir()
     fake_node = node_bin / "node"
@@ -1090,7 +1111,8 @@ if [[ "${{1:-}}" != "-e" ]]; then exit 2; fi
 js="${{2:-}}"
 target="${{3:-}}"
 if [[ "$js" != *"X-Service-Token"* || "$js" != *"DALTON_HEALTH_TOKEN"* ]]; then exit 3; fi
-if [[ "$target" != "{url}" ]]; then exit 4; fi
+if [[ "$js" != *"/health"* || "$js" != *"ready"* || "$js" != *"/agent/settings"* ]]; then exit 5; fi
+if [[ "$target" != "{base_url}" ]]; then exit 4; fi
 if [[ "${{DALTON_HEALTH_TOKEN:-}}" != "{secret_tok}" ]]; then exit 1; fi
 exit 0
 """,
@@ -1099,7 +1121,7 @@ exit 0
     fake_node.chmod(0o755)
     node_env = {**base_probe_env, "PATH": str(node_bin)}
     r_node_wrong = subprocess.run(
-        ["/bin/sh", "-c", probe_snippet, "_", url],
+        ["/bin/sh", "-c", probe_snippet, "_", base_url],
         env={**node_env, "DALTON_HEALTH_TOKEN": "wrong-token"},
         text=True,
         capture_output=True,
@@ -1107,7 +1129,7 @@ exit 0
     )
     assert r_node_wrong.returncode != 0
     r_node_good = subprocess.run(
-        ["/bin/sh", "-c", probe_snippet, "_", url],
+        ["/bin/sh", "-c", probe_snippet, "_", base_url],
         env={**node_env, "DALTON_HEALTH_TOKEN": secret_tok},
         text=True,
         capture_output=True,

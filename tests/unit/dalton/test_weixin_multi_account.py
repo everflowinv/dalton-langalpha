@@ -1134,6 +1134,21 @@ class InMemoryWeixinMultiAccountStore:
             if "WHERE platform = %s AND message_id = %s" in norm:
                 r = self.inbound_events.get((str(params[0]), str(params[1])))
                 return [dict(r)] if r else []
+            if "WHERE run_id = %s AND thread_id = %s" in norm and len(params) >= 2:
+                want_r, want_t = str(params[0]), str(params[1])
+                return [
+                    dict(r)
+                    for r in self.inbound_events.values()
+                    if str(r.get("run_id") or "") == want_r
+                    and str(r.get("thread_id") or "") == want_t
+                ]
+            if "WHERE thread_id = %s" in norm and params:
+                want_t = str(params[0])
+                return [
+                    dict(r)
+                    for r in self.inbound_events.values()
+                    if str(r.get("thread_id") or "") == want_t
+                ]
             if "run_id = %s" in norm and params:
                 out_r = []
                 p_strs = {str(p) for p in params}
@@ -6094,13 +6109,239 @@ async def test_r11_discord_unknown_error_code_bypass_blocked(
 
 
 def test_r11_backend_caller_timeouts_exceed_weixin_preflight_retry_budget() -> None:
-    """R11 (Codex #4): Backend gateway callers wait strictly longer than the 180s preflight retry cap."""
+    """R11/R12 (Codex #3, #4 / Grok med): Backend gateway callers wait strictly longer than the 180s preflight retry cap."""
+    from src.dalton.autonomy import preflight as preflight_mod
     from src.dalton.notify import channel_transport as ct_mod
+    from src.dalton.notify import dispatch as dispatch_mod
     from src.tools.messaging import tools as msg_tools
 
     assert ct_mod.WEIXIN_PREFLIGHT_RETRY_BUDGET_SECONDS == 180
+    assert ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S == 240.0
     assert ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S > ct_mod.WEIXIN_PREFLIGHT_RETRY_BUDGET_SECONDS
-    assert float(msg_tools._SEND_TIMEOUT.read or 0.0) > ct_mod.WEIXIN_PREFLIGHT_RETRY_BUDGET_SECONDS
+    assert float(msg_tools._SEND_TIMEOUT.read or 0.0) >= ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S
+    assert ct_mod.resolve_gateway_delivery_read_timeout_s(20.0) == ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S
+    assert ct_mod.resolve_gateway_delivery_read_timeout_s(22.5) == ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S
+    assert ct_mod.resolve_gateway_delivery_read_timeout_s(300.0) == 300.0
+    assert dispatch_mod._report_dispatch_timeout_s(None, None) >= ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S
+    assert preflight_mod.PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S >= ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S
+    assert preflight_mod.PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S > preflight_mod.PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S
+
+
+@pytest.mark.asyncio
+async def test_r12_i7_foreign_feishu_run_interrupt_lock_order_and_missing_platform_400(
+    wx_env: dict[str, Any],
+) -> None:
+    """R12 (Codex #1, #2, #4 / Grok high):
+    1) Foreign Feishu background_run + inbound_event (different thread_id) MUST NOT mask a
+       watchless Weixin conversation_threads row (409 stale_gateway_epoch without epoch,
+       409 platform_mismatch with valid epoch);
+    2) Interrupt-only session_interrupt_update omitting platform with no persisted watch/thread
+       returns 400 missing_platform (never 500 KeyError);
+    3) session_interrupt_update on an existing Weixin watch with valid epoch NEVER takes FOR SHARE
+       on dalton_channel_thread_watches, and locks dalton_channel_session_generations FOR UPDATE
+       strictly BEFORE dalton_channel_thread_watches FOR UPDATE.
+    """
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    client: TestClient = wx_env["client"]
+    no_ep = {"X-Service-Token": SERVICE_TOKEN}
+    valid_ep = {"X-Service-Token": SERVICE_TOKEN, "X-Gateway-Epoch": "1"}
+
+    tid_wx = str(uuid4())
+    tid_other_feishu = str(uuid4())
+    foreign_rid = f"run-feishu-{uuid4().hex[:8]}"
+    store.conversation_threads[tid_wx] = {"conversation_thread_id": tid_wx, "platform": "weixin"}
+    store.background_runs[foreign_rid] = {
+        "run_id": foreign_rid,
+        "thread_id": tid_other_feishu,
+        "dalton_user_id": "u-alice",
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "streaming",
+    }
+    store.inbound_events[("feishu", "om_foreign_run")] = {
+        "platform": "feishu",
+        "message_id": "om_foreign_run",
+        "dalton_user_id": "u-alice",
+        "thread_id": tid_other_feishu,
+        "run_id": foreign_rid,
+        "chat_address": "feishu:@me",
+        "status": "completed",
+    }
+
+    # 1a. Without epoch -> 409 stale_gateway_epoch (foreign Feishu run ignored!)
+    r_no_ep = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=no_ep,
+        json={
+            "run_id": foreign_rid,
+            "thread_watch": {
+                "thread_id": tid_wx,
+                "dalton_user_id": "u-alice",
+                "platform": "feishu",
+                "target_address": "feishu:@me",
+                "scope_key": "dm:ou_spoof",
+                "generation": 1,
+                "watch_active": True,
+            },
+        },
+    )
+    assert r_no_ep.status_code == 409
+    assert r_no_ep.json()["code"] == "stale_gateway_epoch"
+    assert tid_wx not in store.thread_watches
+
+    # 1b. With valid epoch -> 409 platform_mismatch
+    r_mm = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=valid_ep,
+        json={
+            "run_id": foreign_rid,
+            "thread_watch": {
+                "thread_id": tid_wx,
+                "dalton_user_id": "u-alice",
+                "platform": "feishu",
+                "target_address": "feishu:@me",
+                "scope_key": "dm:ou_spoof",
+                "generation": 1,
+                "watch_active": True,
+            },
+        },
+    )
+    assert r_mm.status_code == 409
+    assert r_mm.json()["code"] == "platform_mismatch"
+    assert tid_wx not in store.thread_watches
+
+    # 2. Interrupt-only update omitting platform for an unknown thread -> 400 (never 500 KeyError)
+    unknown_tid = str(uuid4())
+    r_400 = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=valid_ep,
+        json={
+            "session_interrupt_update": {
+                "thread_id": unknown_tid,
+                "scope_key": "dm:unknown",
+                "dalton_user_id": "u-alice",
+                "pending_interrupt": {"q": "confirm?"},
+            }
+        },
+    )
+    assert r_400.status_code == 400
+    assert r_400.json()["code"] == "missing_platform"
+
+    # 3. Valid-epoch session_interrupt_update on existing Weixin watch locks session FOR UPDATE
+    #    strictly BEFORE thread_watches FOR UPDATE, with zero FOR SHARE on thread_watches.
+    tid_w_ok = str(uuid4())
+    store.thread_watches[tid_w_ok] = {
+        "thread_id": tid_w_ok,
+        "dalton_user_id": "u-alice",
+        "platform": "weixin",
+        "target_address": "weixin:@me",
+        "scope_key": "dm:wx_lock_order",
+        "generation": 1,
+        "watch_active": True,
+        "pending_interrupt": None,
+    }
+    store.executed_sql.clear()
+    r_ok = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=valid_ep,
+        json={
+            "session_interrupt_update": {
+                "thread_id": tid_w_ok,
+                "scope_key": "dm:wx_lock_order",
+                "dalton_user_id": "u-alice",
+                "generation": 1,
+                "pending_interrupt": {"interrupt_id": "i1", "q": "approve?"},
+            }
+        },
+    )
+    assert r_ok.status_code == 200, r_ok.text
+    sql_texts = [q for q, _ in store.executed_sql]
+    assert not any(
+        "dalton_channel_thread_watches" in q and "FOR SHARE" in q
+        for q in sql_texts
+    )
+    sess_lock_idx = next(
+        i
+        for i, q in enumerate(sql_texts)
+        if "FROM dalton_channel_session_generations" in q and "FOR UPDATE" in q
+    )
+    watch_lock_idx = next(
+        i
+        for i, q in enumerate(sql_texts)
+        if "FROM dalton_channel_thread_watches" in q and "FOR UPDATE" in q
+    )
+    assert sess_lock_idx < watch_lock_idx
+
+
+@pytest.mark.asyncio
+async def test_r12_gateway_transport_and_dispatch_callers_enforce_240s_read_timeout_floor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R12 (Codex #3 / Grok med): Explicit shorter timeout_s in data_task, automation_notify,
+    report dispatch, and retry loops are all floored to GATEWAY_DELIVERY_READ_TIMEOUT_S (240s)."""
+    import httpx
+    import time as _time
+    from unittest.mock import create_autospec
+
+    from src.dalton.notify import channel_transport as ct_mod
+    from src.dalton.notify import dispatch as dispatch_mod
+
+    observed_timeouts: list[float] = []
+
+    class _FakeResp:
+        status_code = 200
+
+        def json(self) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "status": "sent",
+                "results": [{"target": "weixin:user:wx_1", "ok": True, "status": "sent"}],
+            }
+
+    async def _fake_post(_url: str, **kwargs: Any) -> _FakeResp:
+        t = kwargs.get("timeout")
+        assert isinstance(t, httpx.Timeout)
+        observed_timeouts.append(float(t.read or 0.0))
+        return _FakeResp()
+
+    from src.dalton import capabilities as cap_mod
+
+    fake_client = create_autospec(httpx.AsyncClient, instance=True)
+    fake_client.post.side_effect = _fake_post
+    monkeypatch.setattr(
+        cap_mod,
+        "is_channel_target_enabled",
+        create_autospec(cap_mod.is_channel_target_enabled, return_value=True),
+    )
+
+    # 1. dispatch_data_task_target_via_gateway with explicit timeout_s=20.0 -> floored to 240.0
+    await ct_mod.dispatch_data_task_target_via_gateway(
+        run_id=str(uuid4()),
+        target="weixin:user:wx_1",
+        gateway_url="http://127.0.0.1:8962",
+        service_token="tok",
+        timeout_s=20.0,
+        http_client=fake_client,
+    )
+    # 2. post_automation_gateway_notify with explicit timeout_s=22.5 -> floored to 240.0
+    await ct_mod.post_automation_gateway_notify(
+        str(uuid4()),
+        target="weixin:user:wx_1",
+        gateway_url="http://127.0.0.1:8962",
+        service_token="tok",
+        timeout_s=22.5,
+        http_client=fake_client,
+    )
+    assert len(observed_timeouts) == 2
+    assert all(t >= ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S for t in observed_timeouts)
+
+    # 3. _report_dispatch_timeout_s returns >= 240s both standalone and when remaining budget is small (>= 1s)
+    now = _time.monotonic()
+    assert dispatch_mod._report_dispatch_timeout_s(None, None) >= ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S
+    assert dispatch_mod._report_dispatch_timeout_s(now, 26.0) >= ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S
+    # When budget is actually exhausted (< RETRY_MIN_REQUEST_TIMEOUT_S), it still returns None
+    assert dispatch_mod._report_dispatch_timeout_s(now - 25.0, 26.0) is None
+
 
 
 
