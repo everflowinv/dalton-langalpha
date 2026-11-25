@@ -688,6 +688,13 @@ class ChatRequest(BaseModel):
         description="The steer job this turn carries. Internal use only.",
     )
 
+    # DALTON-HOOK(team-model-catalog): server-only interrupted run id for cross-deploy restart resume snapshot binding
+    resume_of_run_id: Optional[str] = Field(
+        default=None,
+        description="Interrupted conversation_response_id whose persisted effective_catalog_snapshot "
+        "should be bound on restart resume. Internal use only.",
+    )
+
     # Internal: the price-target notice a market_target wake turn delivers,
     # kept on the turn's query metadata so a replay can tell which target
     # the turn is about without reading the alert text.

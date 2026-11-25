@@ -94,7 +94,9 @@ async def _validate_plugin_subagent_models_under_lock(
         ov_fields = overrides_by_base.get(plugin_key(plugin_name, plan.name)) or {}
         eff_model = ov_fields.get("model") if "model" in ov_fields else base_model
         if eff_model:
-            await assert_model_not_retired_under_lock(conn, str(eff_model), field="model")
+            await assert_model_not_retired_under_lock(
+                conn, str(eff_model), field="model", user_id=user_id, allow_custom=True
+            )
 
 
 async def relink_subagents(user_id: str, plugin_id: str, plugin_name: str) -> None:

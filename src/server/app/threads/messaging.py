@@ -381,6 +381,8 @@ _SERVER_ONLY_FIELDS = (
     "steer_job_id",
     "artifact_comments",
     "checked_computer_id",
+    # DALTON-HOOK(team-model-catalog): strip resume_of_run_id on any non-service request
+    "resume_of_run_id",
 )
 
 
@@ -487,6 +489,8 @@ async def _handle_send_message(
     raw_request: Request | None = None,
     *,
     retry_of_run_id: str | None = None,
+    # DALTON-HOOK(team-model-catalog): route-internal authoritative effective_catalog_snapshot loaded from DB
+    inherited_catalog_snapshot: dict | None = None,
 ):
     """Shared logic for both POST /threads/messages and POST /threads/{id}/messages.
 
@@ -795,22 +799,56 @@ async def _handle_send_message(
             resolve_turn_config_with_automation_inheritance,
         )
 
+        # DALTON-HOOK(team-model-catalog): authoritatively load persisted effective_catalog_snapshot
+        # for cross-deploy restart resumes (server-only resume_of_run_id) and bind it across LLM
+        # client construction so key_fingerprint / bound_base_url checks enforce the turn snapshot.
+        from contextlib import nullcontext
+
+        from src.dalton.services.team_model_catalog.snapshot import (
+            bind_catalog_snapshot,
+            load_run_catalog_snapshot,
+        )
+
+        effective_inherited_snapshot = inherited_catalog_snapshot
+        if (
+            effective_inherited_snapshot is None
+            and from_service
+            and getattr(request, "resume_of_run_id", None)
+        ):
+            try:
+                effective_inherited_snapshot = await load_run_catalog_snapshot(
+                    str(request.resume_of_run_id),
+                    thread_id=thread_id,
+                    is_subagent=False,
+                )
+            except Exception as _snap_load_err:
+                logger.warning(
+                    "[PTC_CHAT] Failed to load catalog snapshot for resume_of_run_id=%s: %s",
+                    request.resume_of_run_id,
+                    type(_snap_load_err).__name__,
+                )
+
         fallback_records: list[dict[str, object]] = []
         automation_run_ctx: dict[str, object] = {}
-        config = await resolve_turn_config_with_automation_inheritance(
-            user_id=user_id,
-            thread_id=thread_id,
-            request=request,
-            requested_model=requested_model,
-            held_model=held_model,
-            from_service=from_service,
-            is_server_retry=is_server_retry,
-            retry_of_run_id=retry_of_run_id,
-            resolve=resolve,
-            flagged_subscription=flagged_subscription,
-            on_fallback=fallback_records.append,
-            on_automation_context=automation_run_ctx.update,
-        )
+        with (
+            bind_catalog_snapshot(effective_inherited_snapshot)
+            if effective_inherited_snapshot is not None
+            else nullcontext()
+        ):
+            config = await resolve_turn_config_with_automation_inheritance(
+                user_id=user_id,
+                thread_id=thread_id,
+                request=request,
+                requested_model=requested_model,
+                held_model=held_model,
+                from_service=from_service,
+                is_server_retry=is_server_retry,
+                retry_of_run_id=retry_of_run_id,
+                resolve=resolve,
+                flagged_subscription=flagged_subscription,
+                on_fallback=fallback_records.append,
+                on_automation_context=automation_run_ctx.update,
+            )
 
         # is_byok is True only when the stamped credential_source confirms the user
         # supplied their own key (OAUTH or BYOK), not merely that a client object exists.
@@ -918,6 +956,12 @@ async def _handle_send_message(
     run_meta: dict[str, object] = {}
     if automation_run_ctx:
         run_meta.update(automation_run_ctx)
+    # DALTON-HOOK(team-model-catalog): carry authoritative inherited snapshot into the resumed/retried run row
+    if effective_inherited_snapshot is not None:
+        run_meta["effective_catalog_snapshot"] = effective_inherited_snapshot
+        run_meta["catalog_revision"] = int(
+            effective_inherited_snapshot.get("catalog_revision") or 0
+        )
     # DALTON-HOOK(automation-subscription-fallback): record fallback notice on run row metadata
     if fallback_records:
         run_meta["subscription_fallback"] = fallback_records[0]
@@ -2084,12 +2128,40 @@ async def retry_thread(
         await scope.release_slot()
         raise
 
+    # DALTON-HOOK(team-model-catalog): authoritatively load persisted effective_catalog_snapshot
+    # from the retried DB row on server restart-resume retries (never from untrusted request body).
+    from src.server.contracts.status import is_restart_interrupted
+
+    inherited_catalog_snapshot = None
+    if _is_service_request(raw_request) or (
+        is_restart_interrupted(latest) and not (body and body.llm_model)
+    ):
+        try:
+            from src.dalton.services.team_model_catalog.snapshot import (
+                ensure_run_catalog_snapshot,
+            )
+
+            inherited_catalog_snapshot = await ensure_run_catalog_snapshot(
+                latest, is_subagent=False
+            )
+        except Exception as _retry_snap_err:
+            logger.warning(
+                "[RETRY] Failed to load catalog snapshot for run=%s: %s",
+                latest_run_id,
+                type(_retry_snap_err).__name__,
+            )
+
     if checked is not None:
         request = request.model_copy(update={"checked_computer_id": checked})
     # Retry provenance travels as a route-internal parameter, never in the
     # body.
     return await _handle_send_message(
-        request, auth, thread_id, raw_request, retry_of_run_id=latest_run_id
+        request,
+        auth,
+        thread_id,
+        raw_request,
+        retry_of_run_id=latest_run_id,
+        inherited_catalog_snapshot=inherited_catalog_snapshot,
     )
 
 

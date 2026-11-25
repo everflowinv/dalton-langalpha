@@ -1432,7 +1432,12 @@ async def schedule_dalton_automation_helper(
                     )
 
                     await assert_model_not_retired_under_lock(
-                        locked_conn, str(final_model), field="llm_model"
+                        locked_conn,
+                        str(final_model),
+                        field="llm_model",
+                        user_id=task_owner,
+                        model_pref=pref_for_effort,
+                        allow_custom=True,
                     )
                 if not (effort_in_spec or model_in_spec or locked_effort is not None):
                     return
@@ -1572,7 +1577,12 @@ async def schedule_dalton_automation_helper(
                 )
 
                 await assert_model_not_retired_under_lock(
-                    active_conn, str(create_llm_model), field="llm_model"
+                    active_conn,
+                    str(create_llm_model),
+                    field="llm_model",
+                    user_id=task_owner,
+                    model_pref=pref_for_effort,
+                    allow_custom=True,
                 )
             try:
                 _, create_reasoning_effort = await _reconcile_reasoning_effort(

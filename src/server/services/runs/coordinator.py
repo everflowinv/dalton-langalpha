@@ -132,6 +132,8 @@ class RunHandle:
     tail_turn_no_new_work: bool = False
     # Where the run came from (``turn_kinds.RunOrigin``), as START classified it.
     origin: Optional[str] = None
+    # DALTON-HOOK(team-model-catalog): persisted turn effective_catalog_snapshot bound for execution & settlement
+    catalog_snapshot: Optional[Dict[str, Any]] = None
 
     @property
     def checkpointer(self) -> Optional[Any]:
@@ -292,6 +294,11 @@ class RunCoordinator:
             )
             if _tail_turn_no_new_work and isinstance(run_metadata, dict):
                 run_metadata["tail_turn_no_new_work"] = True
+            # DALTON-HOOK(team-model-catalog): capture persisted effective_catalog_snapshot onto RunHandle
+            _raw_catalog_snapshot = (
+                (_row_meta or {}).get("effective_catalog_snapshot")
+                or metadata.get("effective_catalog_snapshot")
+            )
             handle = RunHandle(
                 run_id=run_id,
                 thread_id=thread_id,
@@ -306,6 +313,11 @@ class RunCoordinator:
                 pending_input=pending_input or {},
                 tail_turn_no_new_work=_tail_turn_no_new_work,
                 origin=origin,
+                catalog_snapshot=(
+                    dict(_raw_catalog_snapshot)
+                    if isinstance(_raw_catalog_snapshot, dict)
+                    else None
+                ),
             )
             if guard is not None:
                 guard.bind_owner(handle)
@@ -779,33 +791,44 @@ class RunCoordinator:
 
     def _build_usage_writer(self, handle: RunHandle, outcome: RunOutcome):
         async def _write(conn, final_status: str) -> None:
+            # DALTON-HOOK(team-model-catalog): bind turn's persisted effective_catalog_snapshot during usage settlement
+            from src.dalton.services.team_model_catalog.snapshot import (
+                bind_catalog_snapshot,
+                get_active_catalog_snapshot,
+            )
             from src.server.services.persistence.usage import UsagePersistenceService
 
-            usage = UsagePersistenceService(
-                thread_id=handle.thread_id,
-                workspace_id=handle.workspace_id,
-                user_id=handle.recorded_as,
+            snap = (
+                handle.catalog_snapshot
+                if handle.catalog_snapshot is not None
+                else get_active_catalog_snapshot()
             )
-            if outcome.per_call_records:
-                await usage.track_llm_usage(outcome.per_call_records)
-            if outcome.tool_usage:
-                usage.record_tool_usage_batch(outcome.tool_usage)
-            # final_status comes from the CAS row, not outcome.status: durable
-            # cancel intent may have overridden it.
-            ok = await usage.persist_usage(
-                response_id=handle.run_id,
-                deepthinking=outcome.metadata.get("deepthinking", False),
-                status=final_status,
-                conn=conn,
-                is_byok=outcome.metadata.get("is_byok", handle.is_byok),
-            )
-            if not ok:
-                # persist_usage swallows into False; inside the finalize txn
-                # that would commit a terminal row without its billing rows.
-                raise RuntimeError(
-                    f"usage persist failed for run={handle.run_id}; "
-                    f"aborting finalize transaction"
+            with bind_catalog_snapshot(snap) if snap is not None else nullcontext():
+                usage = UsagePersistenceService(
+                    thread_id=handle.thread_id,
+                    workspace_id=handle.workspace_id,
+                    user_id=handle.recorded_as,
                 )
+                if outcome.per_call_records:
+                    await usage.track_llm_usage(outcome.per_call_records)
+                if outcome.tool_usage:
+                    usage.record_tool_usage_batch(outcome.tool_usage)
+                # final_status comes from the CAS row, not outcome.status: durable
+                # cancel intent may have overridden it.
+                ok = await usage.persist_usage(
+                    response_id=handle.run_id,
+                    deepthinking=outcome.metadata.get("deepthinking", False),
+                    status=final_status,
+                    conn=conn,
+                    is_byok=outcome.metadata.get("is_byok", handle.is_byok),
+                )
+                if not ok:
+                    # persist_usage swallows into False; inside the finalize txn
+                    # that would commit a terminal row without its billing rows.
+                    raise RuntimeError(
+                        f"usage persist failed for run={handle.run_id}; "
+                        f"aborting finalize transaction"
+                    )
 
         return _write
 

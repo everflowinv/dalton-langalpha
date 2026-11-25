@@ -274,19 +274,24 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
 
     # Determine which providers to search (provider → parent → global)
     if provider:
+        # DALTON-HOOK(team-model-catalog): subscription providers (explicitly marked
+        # billing: "subscription") are billed by seat, not per token — never fall back
+        # to a parent provider's cash pricing cards when sharing a model_id.
+        is_sub_prov = is_subscription_provider(provider=provider, model_config=model_config)
         providers_to_search = []
         if provider in manifest['models']:
             providers_to_search.append((provider, manifest['models'][provider]))
-        # Fall back to parent provider's pricing if available
-        parent = model_config.get_parent_provider(provider)
-        if parent != provider and parent in manifest['models']:
-            providers_to_search.append((parent, manifest['models'][parent]))
-            logger.debug(f"Including parent provider '{parent}' in pricing search for '{provider}'")
+        # Fall back to parent provider's pricing if available (non-subscription only)
+        if not is_sub_prov:
+            parent = model_config.get_parent_provider(provider)
+            if parent != provider and parent in manifest['models']:
+                providers_to_search.append((parent, manifest['models'][parent]))
+                logger.debug(f"Including parent provider '{parent}' in pricing search for '{provider}'")
         if not providers_to_search:
             # DALTON-HOOK(llm-overlay): subscription providers (explicitly marked
             # billing: "subscription") are billed by seat, not per token — do not
             # fall through to unrelated providers or warn on missing rates.
-            if is_subscription_provider(provider=provider, model_config=model_config):
+            if is_sub_prov:
                 logger.debug(
                     f"Subscription provider {provider!r} for model {model_name[:_LOGGED_NAME_MAX_LEN]!r}: "
                     "billed by subscription, skipping token pricing lookup"

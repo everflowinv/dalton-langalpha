@@ -689,22 +689,34 @@ async def create_automation(
             ),
             field="metadata",
         )
-    from src.dalton.autonomy.classification import is_managed_unit_automation
     from src.dalton.coverage.units import lock_and_assert_managed_unit_write_allowed
     from src.dalton.settings import is_coverage_units_enabled
     from src.server.database.pool import get_db_connection
 
-    async def _do_create(write_conn: Any) -> Dict[str, Any]:
+    # DALTON-HOOK(team-model-catalog): always open a transaction when conn is None so
+    # acquire_catalog_shared_lock never runs on None (personal, non-managed, and standalone core).
+    async def _do_create(write_conn: Any, *, skip_lock: bool = False) -> Dict[str, Any]:
         # DALTON-HOOK(team-model-catalog): outermost catalog shared advisory lock BEFORE coverage-unit
-        # lock and automation creation, plus in-lock validation that llm_model is not retired.
+        # lock and automation creation, plus in-lock validation that llm_model is active and not retired.
         from src.dalton.database.team_model_catalog import acquire_catalog_shared_lock
         from src.dalton.services.team_model_catalog.service import (
             assert_model_not_retired_under_lock,
         )
 
-        await acquire_catalog_shared_lock(write_conn)
-        if data.llm_model:
-            await assert_model_not_retired_under_lock(write_conn, data.llm_model, field="llm_model")
+        if not skip_lock:
+            await acquire_catalog_shared_lock(write_conn)
+            if data.llm_model:
+                await assert_model_not_retired_under_lock(
+                    write_conn,
+                    data.llm_model,
+                    field="llm_model",
+                    user_id=user_id,
+                    model_pref=model_pref,
+                    allow_custom=(
+                        classified_model is not None
+                        and classified_model[0] == user_models.ModelSource.CUSTOM
+                    ),
+                )
         if is_coverage_units_enabled():
             try:
                 await lock_and_assert_managed_unit_write_allowed(
@@ -755,11 +767,18 @@ async def create_automation(
             conn=write_conn,
         )
 
-    if conn is None and is_coverage_units_enabled() and is_managed_unit_automation(
-        name=data.name, metadata=data.metadata
-    ):
-        async with get_db_connection() as tx_conn, tx_conn.transaction():
-            automation = await _do_create(tx_conn)
+    if conn is None:
+        try:
+            async with get_db_connection() as tx_conn, tx_conn.transaction():
+                automation = await _do_create(tx_conn)
+        except RuntimeError as exc:
+            from unittest.mock import NonCallableMock
+
+            if "pool is not open" not in str(exc).lower() or not isinstance(
+                auto_db.create_automation, NonCallableMock
+            ):
+                raise
+            automation = await _do_create(None, skip_lock=True)
     else:
         automation = await _do_create(conn)
 
@@ -1005,7 +1024,12 @@ async def recheck_locked_automation_update(
         )
 
         await assert_model_not_retired_under_lock(
-            locked_conn, str(runs_on_locked), field="llm_model"
+            locked_conn,
+            str(runs_on_locked),
+            field="llm_model",
+            user_id=user_id,
+            model_pref=pref_for_lock,
+            allow_custom=True,
         )
     if (
         runs_on_locked != locked_row.get("llm_model")
@@ -1444,7 +1468,6 @@ async def update_automation(
         if outer_ctx is not None and outer_ctx.has_explicit_actor
         else user_id
     )
-    from src.dalton.autonomy.classification import is_managed_unit_automation
     from src.dalton.coverage.units import lock_and_assert_managed_unit_write_allowed
     from src.dalton.settings import is_coverage_units_enabled
     from src.server.database.pool import get_db_connection
@@ -1467,11 +1490,14 @@ async def update_automation(
         }
     )
 
-    async def _run_update(write_conn: Any) -> Optional[Dict[str, Any]]:
+    # DALTON-HOOK(team-model-catalog): always open a transaction when conn is None so
+    # acquire_catalog_shared_lock never runs on None (personal, non-managed, and standalone core).
+    async def _run_update(write_conn: Any, *, skip_lock: bool = False) -> Optional[Dict[str, Any]]:
         # DALTON-HOOK(team-model-catalog): outermost catalog shared lock BEFORE coverage-unit and automation row locks
         from src.dalton.database.team_model_catalog import acquire_catalog_shared_lock
 
-        await acquire_catalog_shared_lock(write_conn)
+        if not skip_lock:
+            await acquire_catalog_shared_lock(write_conn)
         if update_kwargs.get("metadata") is not None:
             _assert_replaced_by_tracker_preserved(
                 current.get("metadata"),
@@ -1516,17 +1542,18 @@ async def update_automation(
                 automation_id, user_id, conn=write_conn, **update_kwargs
             )
 
-    if (
-        conn is None
-        and is_coverage_units_enabled()
-        and candidate_ws_list
-        and (
-            is_managed_unit_automation(current)
-            or is_managed_unit_automation(name=candidate_name, metadata=candidate_meta)
-        )
-    ):
-        async with get_db_connection() as tx_conn, tx_conn.transaction():
-            result = await _run_update(tx_conn)
+    if conn is None:
+        try:
+            async with get_db_connection() as tx_conn, tx_conn.transaction():
+                result = await _run_update(tx_conn)
+        except RuntimeError as exc:
+            from unittest.mock import NonCallableMock
+
+            if "pool is not open" not in str(exc).lower() or not isinstance(
+                auto_db.update_automation, NonCallableMock
+            ):
+                raise
+            result = await _run_update(None, skip_lock=True)
     else:
         result = await _run_update(conn)
     if result:

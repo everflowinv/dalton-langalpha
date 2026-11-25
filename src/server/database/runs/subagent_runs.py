@@ -155,6 +155,7 @@ async def start_task_run(
     effort_override: Optional[str] = None,
     workflow_driver: bool = False,  # DALTON-HOOK(budget)
     workflow_driver_run_id: Optional[str] = None,  # DALTON-HOOK(budget)
+    catalog_snapshot: Optional[Dict[str, Any]] = None,  # DALTON-HOOK(team-model-catalog)
     conn=None,
 ) -> Dict[str, Any]:
     """The task-run START transaction: task upsert + in_progress run row +
@@ -233,7 +234,11 @@ async def start_task_run(
                     facts.update(await _stand_in_fact(conn, parent_run_id))
 
                 # DALTON-HOOK(team-model-catalog): persist subagent effective_catalog_snapshot in replay_facts
-                if "effective_catalog_snapshot" not in facts:
+                # (prefer inherited predecessor snapshot on cross-deploy resume when provided).
+                if catalog_snapshot is not None and "effective_catalog_snapshot" not in facts:
+                    facts["catalog_revision"] = int(catalog_snapshot.get("catalog_revision") or 0)
+                    facts["effective_catalog_snapshot"] = dict(catalog_snapshot)
+                elif "effective_catalog_snapshot" not in facts:
                     try:
                         from src.dalton.services.team_model_catalog.snapshot import (
                             build_effective_catalog_snapshot,

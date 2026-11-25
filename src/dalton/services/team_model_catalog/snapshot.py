@@ -21,8 +21,8 @@ from __future__ import annotations
 
 import copy
 import logging
-from collections.abc import Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
+from contextlib import aclosing, contextmanager, suppress
 from contextvars import ContextVar
 from typing import Any
 
@@ -52,6 +52,79 @@ def bind_catalog_snapshot(snapshot: dict[str, Any] | None) -> Iterator[dict[str,
         yield snapshot
     finally:
         _ACTIVE_CATALOG_SNAPSHOT.reset(token)
+
+
+async def run_with_catalog_snapshot(
+    snapshot: dict[str, Any] | None,
+    stream: AsyncIterator[Any],
+) -> AsyncIterator[Any]:
+    """Drive a turn's async stream with ``effective_catalog_snapshot`` bound in its task context."""
+    if snapshot is None:
+        async with aclosing(stream):
+            async for event in stream:
+                yield event
+        return
+    token = _ACTIVE_CATALOG_SNAPSHOT.set(snapshot)
+    try:
+        async with aclosing(stream):
+            async for event in stream:
+                yield event
+    finally:
+        with suppress(ValueError):
+            _ACTIVE_CATALOG_SNAPSHOT.reset(token)
+
+
+async def load_run_catalog_snapshot(
+    run_id: str,
+    *,
+    thread_id: str | None = None,
+    is_subagent: bool = False,
+    conn: Any = None,
+) -> dict[str, Any] | None:
+    """Authoritatively load (or backfill) ``effective_catalog_snapshot`` from a persisted run row."""
+    cleaned_id = str(run_id or "").strip()
+    if not cleaned_id:
+        return None
+    from psycopg.rows import dict_row
+
+    from src.server.database.pool import get_db_connection
+
+    async with get_db_connection(conn) as db:
+        async with db.cursor(row_factory=dict_row) as cur:
+            if is_subagent:
+                await cur.execute(
+                    """
+                    SELECT task_run_id::text AS task_run_id, thread_id, replay_facts
+                    FROM subagent_runs
+                    WHERE task_run_id = %s::uuid
+                    """,
+                    (cleaned_id,),
+                )
+            elif thread_id:
+                await cur.execute(
+                    """
+                    SELECT conversation_response_id::text AS conversation_response_id,
+                           conversation_thread_id, metadata
+                    FROM conversation_responses
+                    WHERE conversation_response_id = %s::uuid
+                      AND conversation_thread_id = %s
+                    """,
+                    (cleaned_id, str(thread_id)),
+                )
+            else:
+                await cur.execute(
+                    """
+                    SELECT conversation_response_id::text AS conversation_response_id,
+                           conversation_thread_id, metadata
+                    FROM conversation_responses
+                    WHERE conversation_response_id = %s::uuid
+                    """,
+                    (cleaned_id,),
+                )
+            row = await cur.fetchone()
+    if not row:
+        return None
+    return await ensure_run_catalog_snapshot(dict(row), is_subagent=is_subagent, conn=conn)
 
 
 def _identity_key(provider: str | None, model_id: str | None) -> str:
@@ -147,7 +220,11 @@ def build_effective_catalog_snapshot(
                 else "cash"
             )
         )
-        cash_card = _extract_cash_pricing_card(mc, provider, model_id)
+        cash_card = (
+            None
+            if billing == "subscription"
+            else _extract_cash_pricing_card(mc, provider, model_id)
+        )
         notional_card = resolve_notional_card(
             key,
             pricing_model_id=model_id,

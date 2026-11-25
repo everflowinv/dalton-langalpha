@@ -802,8 +802,10 @@ async def list_models(response: Response):
         provider_catalog.cache_clear()
         key_candidates.cache_clear()
 
-    models = get_configured_llm_models()
+    # DALTON-HOOK(team-model-catalog): derive models list directly from compiled_catalog.model_config
+    # so X-Dalton-Catalog-Revision header and response body always match atomically.
     config = compiled_catalog.model_config
+    models = get_configured_llm_models(model_config=config)
     from ptc_agent.config.agent import COMPACTION_PROFILES
     from src.server.services.llm.config import system_default_models
 

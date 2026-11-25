@@ -1345,3 +1345,1218 @@ class TestChainedRollbackAndLegacyImport:
             asyncio.run(assert_model_not_retired_under_lock(_FakeConn(), "model-b"))
         assert ret_exc.value.status_code == 400
         assert ret_exc.value.detail["code"] == "model_retired"
+
+
+# ---------------------------------------------------------------------------
+# Group 6: R2 regression tests covering all 7 P1 review findings
+# ---------------------------------------------------------------------------
+
+
+class TestR2Fixes:
+    def test_r2_1_personal_and_core_automation_create_update_open_tx_for_catalog_lock(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from uuid import UUID
+
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.services.team_model_catalog import service as tmc_service
+        from src.server.database import automation as auto_db
+        from src.server.database import pool as pool_mod
+        from src.server.models.automation import AutomationCreate, AutomationUpdate
+        from src.server.services.automations import lifecycle as auto_lifecycle
+
+        events: list[str] = []
+
+        class _TxConn:
+            @asynccontextmanager
+            async def transaction(self):
+                events.append("tx_enter")
+                yield
+                events.append("tx_exit")
+
+            async def execute(self, sql: str, params: Any = None) -> None:
+                events.append(f"exec:{sql[:32]}")
+
+        tx_conn = _TxConn()
+
+        @asynccontextmanager
+        async def _fake_get_db(conn: Any = None):
+            yield conn if conn is not None else tx_conn
+
+        async def _fake_shared_lock(conn: Any) -> None:
+            assert conn is not None, "acquire_catalog_shared_lock must never receive conn=None"
+            events.append("catalog_shared_lock")
+
+        ws_id = "11111111-1111-4111-8111-111111111111"
+        auto_id = "22222222-2222-4222-8222-222222222222"
+
+        monkeypatch.setattr("src.dalton.settings.is_coverage_units_enabled", lambda: False)
+        monkeypatch.setattr(pool_mod, "get_db_connection", _fake_get_db)
+        monkeypatch.setattr(
+            tmc_db,
+            "acquire_catalog_shared_lock",
+            create_autospec(tmc_db.acquire_catalog_shared_lock, side_effect=_fake_shared_lock),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "assert_model_not_retired_under_lock",
+            create_autospec(tmc_service.assert_model_not_retired_under_lock, return_value=None),
+        )
+        monkeypatch.setattr(
+            auto_lifecycle,
+            "_placement",
+            create_autospec(auto_lifecycle._placement, return_value=ws_id),
+        )
+        monkeypatch.setattr(
+            auto_lifecycle,
+            "require_target_ownership",
+            create_autospec(auto_lifecycle.require_target_ownership, return_value=None),
+        )
+        monkeypatch.setattr(
+            auto_lifecycle,
+            "check_claude_code_hosted",
+            create_autospec(auto_lifecycle.check_claude_code_hosted, return_value=None),
+        )
+        monkeypatch.setattr(
+            auto_lifecycle,
+            "check_model",
+            create_autospec(auto_lifecycle.check_model, return_value=("system", {"provider": "openai"})),
+        )
+        monkeypatch.setattr(
+            auto_lifecycle,
+            "_reconcile_reasoning_effort",
+            create_autospec(auto_lifecycle._reconcile_reasoning_effort, return_value=(False, None)),
+        )
+        from src.dalton.database import company_automations as comp_auto_db
+
+        monkeypatch.setattr(
+            comp_auto_db,
+            "resolve_automation_scope_for_write",
+            create_autospec(comp_auto_db.resolve_automation_scope_for_write, return_value="personal"),
+        )
+        monkeypatch.setattr(
+            auto_lifecycle.user_models,
+            "get_model_preference",
+            create_autospec(auto_lifecycle.user_models.get_model_preference, return_value={}),
+        )
+
+        create_conns: list[Any] = []
+
+        async def _fake_db_create(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+            create_conns.append(kwargs.get("conn"))
+            events.append("db_create")
+            return {"automation_id": auto_id, "name": kwargs["name"]}
+
+        monkeypatch.setattr(
+            auto_lifecycle.auto_db,
+            "create_automation",
+            create_autospec(auto_db.create_automation, side_effect=_fake_db_create),
+        )
+
+        # 1. Personal / standalone-core create with conn=None and default model (llm_model=None)
+        asyncio.run(
+            auto_lifecycle.create_automation(
+                "user-1",
+                AutomationCreate(
+                    name="Daily Check",
+                    trigger_type="cron",
+                    cron_expression="0 9 * * *",
+                    instruction="Check portfolio",
+                    workspace_id=UUID(ws_id),
+                ),
+                conn=None,
+            )
+        )
+        assert create_conns == [tx_conn]
+        assert events == ["tx_enter", "catalog_shared_lock", "db_create", "tx_exit"]
+
+        # 2. Personal / standalone-core update with conn=None switching model
+        events.clear()
+        update_conns: list[Any] = []
+
+        async def _fake_db_update(*_args: Any, **kwargs: Any) -> dict[str, Any]:
+            update_conns.append(kwargs.get("conn"))
+            events.append("db_update")
+            return {"automation_id": auto_id, "llm_model": kwargs.get("llm_model")}
+
+        monkeypatch.setattr(
+            auto_lifecycle.auto_db,
+            "update_automation",
+            create_autospec(auto_db.update_automation, side_effect=_fake_db_update),
+        )
+        current_row = {
+            "automation_id": auto_id,
+            "user_id": "user-1",
+            "name": "Daily Check",
+            "trigger_type": "cron",
+            "cron_expression": "0 9 * * *",
+            "timezone": "UTC",
+            "workspace_id": ws_id,
+            "conversation_thread_id": None,
+            "thread_strategy": "new",
+            "llm_model": None,
+            "reasoning_effort": None,
+            "status": "active",
+            "scope": "personal",
+            "metadata": {},
+            "config_version": 1,
+        }
+        asyncio.run(
+            auto_lifecycle.update_automation(
+                auto_id,
+                "user-1",
+                AutomationUpdate(llm_model="gpt-test"),
+                conn=None,
+                current=current_row,
+            )
+        )
+        assert update_conns == [tx_conn]
+        assert events == ["tx_enter", "catalog_shared_lock", "db_update", "tx_exit"]
+
+    def test_r2_2_snapshot_authoritative_server_binding_across_resume_retry_and_settlement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi import Request
+
+        from src.dalton.services.team_model_catalog.snapshot import (
+            get_active_catalog_snapshot,
+            run_with_catalog_snapshot,
+        )
+        from src.server.app.threads import messaging as messaging_mod
+        from src.server.database.runs import subagent_runs as sr_db
+        from src.server.models.chat import ChatRequest
+        from src.server.services.report_back.restart import OwedResume, resume_turn
+        from src.server.services.runs.coordinator import RunCoordinator, RunHandle, RunOutcome
+        from src.server.services.subagent_run_coordinator import SubagentRunCoordinator
+
+        # 1. restart.resume_turn sends server-only resume_of_run_id (not untrusted pricing dict)
+        owed_msg = OwedResume(
+            user_id="u-1",
+            workspace_id="ws-1",
+            interrupted=True,
+            source_run_id="run-old-1",
+            catalog_snapshot={"schema": "dalton-turn-catalog-snapshot/1", "models": {}},
+        )
+        route_msg, body_msg = resume_turn(owed_msg, "req-key-1")
+        assert route_msg == "messages"
+        assert body_msg["resume_of_run_id"] == "run-old-1"
+        assert "effective_catalog_snapshot" not in body_msg
+
+        owed_retry = OwedResume(
+            user_id="u-1",
+            workspace_id="ws-1",
+            interrupted=True,
+            retry_run_id="run-old-2",
+            source_run_id="run-old-2",
+            catalog_snapshot={"schema": "dalton-turn-catalog-snapshot/1", "models": {}},
+        )
+        route_retry, body_retry = resume_turn(owed_retry, "req-key-2")
+        assert route_retry == "retry"
+        assert body_retry["run_id"] == "run-old-2"
+        assert "effective_catalog_snapshot" not in body_retry
+
+        # 2. _client_body strips resume_of_run_id from untrusted client requests, keeps for service requests
+        chat_req = ChatRequest(workspace_id="ws-1", messages=[], resume_of_run_id="run-old-1")
+        fake_req = create_autospec(Request, instance=True)
+        monkeypatch.setattr(messaging_mod, "_is_service_request", lambda _r: False)
+        assert messaging_mod._client_body(chat_req, fake_req).resume_of_run_id is None
+        monkeypatch.setattr(messaging_mod, "_is_service_request", lambda _r: True)
+        assert messaging_mod._client_body(chat_req, fake_req).resume_of_run_id == "run-old-1"
+
+        # 3. run_with_catalog_snapshot binds snapshot across async stream for MultimodalStrip + key_fingerprint check
+        cat_v1 = _compile_test_catalog(
+            {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "provider_variants": {
+                        "openai": {
+                            "corp-gw": {
+                                "display_name": "Corp GW",
+                                "sdk": "openai",
+                                "access_type": "api_key",
+                                "billing": "cash",
+                                "base_url": "https://gw.example.com/v1",
+                            }
+                        }
+                    },
+                    "models": {
+                        "corp-gw": [
+                            {
+                                "id": "corp-m1",
+                                "pricing": {"input": 1.0, "output": 2.0, "unit": "per_1m_tokens"},
+                            }
+                        ]
+                    },
+                },
+                "models": {
+                    "corp-m1": {
+                        "model_id": "corp-m1",
+                        "provider": "corp-gw",
+                        "display_name": "Corp M1",
+                        "visible": True,
+                        "input_modalities": ["text", "image"],
+                    }
+                },
+            },
+            revision=1,
+        )
+        snap_v1 = build_effective_catalog_snapshot(
+            ["corp-m1"],
+            compiled=cat_v1,
+            variant_credentials={
+                "corp-gw": {
+                    "bound_base_url": "https://gw.example.com/v1",
+                    "canonical_bound_url": "https://gw.example.com:443/v1",
+                    "key_fingerprint": make_key_fingerprint("sk-original-key-1111"),
+                }
+            },
+        )
+
+        # Mutate live catalog & rotate DB key after snapshot
+        cat_v2 = _compile_test_catalog(
+            {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "provider_variants": {
+                        "openai": {
+                            "corp-gw": {
+                                "display_name": "Corp GW",
+                                "sdk": "openai",
+                                "access_type": "api_key",
+                                "billing": "cash",
+                                "base_url": "https://gw.example.com/v1",
+                            }
+                        }
+                    },
+                    "models": {
+                        "corp-gw": [
+                            {
+                                "id": "corp-m1",
+                                "pricing": {"input": 50.0, "output": 100.0, "unit": "per_1m_tokens"},
+                            }
+                        ]
+                    },
+                },
+                "models": {
+                    "corp-m1": {
+                        "model_id": "corp-m1",
+                        "provider": "corp-gw",
+                        "display_name": "Corp M1",
+                        "visible": True,
+                        "input_modalities": ["text"],
+                    }
+                },
+            },
+            revision=2,
+        )
+        monkeypatch.setattr(LLM, "get_model_config", classmethod(lambda cls: cat_v2.model_config))
+        monkeypatch.setattr(
+            "src.dalton.database.team_model_catalog.get_catalog_provider_credential_sync",
+            lambda slug, decrypt=True: {
+                "provider_slug": slug,
+                "api_key": "sk-rotated-key-9999",
+                "bound_base_url": "https://gw.example.com/v1",
+                "canonical_bound_url": "https://gw.example.com:443/v1",
+                "key_fingerprint": make_key_fingerprint("sk-rotated-key-9999"),
+            },
+        )
+
+        observed_in_stream: dict[str, Any] = {}
+
+        async def _inner_stream():
+            observed_in_stream["active"] = get_active_catalog_snapshot()
+            strip_mw = MultimodalStripMiddleware(model_name="corp-m1")
+
+            class _FakeClient:
+                metadata = {"manifest_model": "corp-m1"}
+
+            _, mods = strip_mw._target(_FakeClient())
+            observed_in_stream["mods"] = mods
+            with pytest.raises(CatalogVariantCredentialRevokedError):
+                resolve_catalog_variant_binding_sync("corp-gw")
+            yield "ok"
+
+        async def _consume() -> list[str]:
+            out = []
+            async for item in run_with_catalog_snapshot(snap_v1, _inner_stream()):
+                out.append(item)
+            return out
+
+        assert asyncio.run(_consume()) == ["ok"]
+        assert observed_in_stream["active"] == snap_v1
+        assert observed_in_stream["mods"] == ["text", "image"]
+        assert get_active_catalog_snapshot() is None
+
+        # 4. RunCoordinator._build_usage_writer binds handle.catalog_snapshot during settlement
+        captured_costs: list[float] = []
+
+        async def _fake_persist(self, **_kw: Any) -> bool:
+            captured_costs.append(float((self._token_usage or {}).get("total_cost") or 0.0))
+            return True
+
+        from src.server.services.persistence.usage import UsagePersistenceService
+
+        monkeypatch.setattr(
+            UsagePersistenceService,
+            "persist_usage",
+            create_autospec(UsagePersistenceService.persist_usage, side_effect=_fake_persist),
+        )
+        coord = RunCoordinator()
+        handle = RunHandle(
+            run_id="run-1",
+            thread_id="thread-1",
+            turn_index=0,
+            attempt_no=1,
+            workspace_id="ws-1",
+            user_id="u-1",
+            recorded_as="u-1",
+            catalog_snapshot=snap_v1,
+        )
+        outcome = RunOutcome(
+            status="completed",
+            per_call_records=[
+                {
+                    "model_name": "corp-m1",
+                    "pricing_model_id": "corp-m1",
+                    "pricing_provider": "corp-gw",
+                    "billing_type": "platform",
+                    "usage": {
+                        "input_tokens": 1_000_000,
+                        "output_tokens": 1_000_000,
+                    },
+                }
+            ],
+        )
+        writer = coord._build_usage_writer(handle, outcome)
+        asyncio.run(writer(None, "completed"))
+        # Must settle using snap_v1 ($1 + $2 = $3), NOT live cat_v2 ($50 + $100 = $150)
+        assert captured_costs == [pytest.approx(3.0, rel=1e-6)]
+
+        # 5. SubagentRunCoordinator resume inherits predecessor replay_facts['effective_catalog_snapshot']
+        recorded_sub_kwargs: dict[str, Any] = {}
+
+        async def _fake_start_task_run(**kw: Any) -> dict[str, Any]:
+            recorded_sub_kwargs.update(kw)
+            return {"task_run_id": kw["task_run_id"]}
+
+        sub_coord = SubagentRunCoordinator("thread-1")
+        monkeypatch.setattr(
+            sub_coord,
+            "get_latest_run",
+            create_autospec(
+                sub_coord.get_latest_run,
+                return_value={
+                    "task_run_id": "prev-task-run-1",
+                    "final_checkpoint_id": "cp-1",
+                    "replay_facts": {"effective_catalog_snapshot": snap_v1},
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            sr_db,
+            "start_task_run",
+            create_autospec(sr_db.start_task_run, side_effect=_fake_start_task_run),
+        )
+        monkeypatch.setattr(
+            sub_coord,
+            "_append_v2_frame",
+            create_autospec(sub_coord._append_v2_frame, return_value=None),
+        )
+        from src.server.services import thread_control_stream
+
+        monkeypatch.setattr(
+            thread_control_stream,
+            "announce_task_run_started",
+            create_autospec(
+                thread_control_stream.announce_task_run_started, return_value=None
+            ),
+        )
+        asyncio.run(sub_coord.start_task_run(task_id="t1", cause="resume"))
+        assert recorded_sub_kwargs["catalog_snapshot"] == snap_v1
+
+    def test_r2_3_retire_and_rollback_preserve_automation_audit_history_and_canonical_lock_order(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.company_automations import validate_existing_history_state
+        from src.dalton.services.team_model_catalog import service as tmc_service
+        from src.server.database import automation as auto_db
+        from src.server.database import user as user_db
+        from src.server.database import user_subagents as us_db
+        from src.server.services.automations import lifecycle as auto_lifecycle
+
+        lock_events: list[str] = []
+        auto_id = "33333333-3333-4333-8333-333333333333"
+        stored_auto: dict[str, Any] = {
+            "automation_id": auto_id,
+            "user_id": "u-1",
+            "name": "Earnings Watch",
+            "description": None,
+            "trigger_type": "cron",
+            "cron_expression": "0 8 * * *",
+            "timezone": "UTC",
+            "trigger_config": {},
+            "next_run_at": None,
+            "last_run_at": None,
+            "instruction": "Check earnings",
+            "workspace_id": "ws-1",
+            "llm_model": "model-a",
+            "reasoning_effort": None,
+            "additional_context": None,
+            "thread_strategy": "new",
+            "conversation_thread_id": None,
+            "status": "active",
+            "max_failures": 3,
+            "failure_count": 0,
+            "disable_reason": None,
+            "delivery_config": {},
+            "metadata": {},
+            "scope": "personal",
+            "notify_storage_mode": "task_row",
+            "config_version": 1,
+            "active_version": 1,
+            "created_by": "u-1",
+            "updated_by": "u-1",
+            "audit_history": [],
+            "created_at": "2026-11-20T00:00:00+00:00",
+            "updated_at": "2026-11-20T00:00:00+00:00",
+        }
+        stored_pref: dict[str, Any] = {
+            "user_id": "u-1",
+            "model_preference": {"preferred_model": "model-a"},
+            "agent_preference": {},
+            "updated_at": "2026-11-20T00:00:00+00:00",
+        }
+
+        class _FakeCursor:
+            def __init__(self) -> None:
+                self._result: Any = None
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args: Any) -> bool:
+                return False
+
+            async def execute(self, sql: str, params: Any = None) -> None:
+                s = " ".join(sql.split())
+                if s.startswith("UPDATE user_preferences"):
+                    lock_events.append("update_user_preferences")
+                    stored_pref["model_preference"] = params[0].obj
+                    stored_pref["agent_preference"] = params[1].obj
+                    stored_pref["updated_at"] = "2026-11-25T01:00:00+00:00"
+                    self._result = {"updated_at": stored_pref["updated_at"]}
+                elif "FROM automations" in s and "FOR UPDATE" in s:
+                    lock_events.append("lock_automation_row")
+                    self._result = dict(stored_auto)
+                elif s.startswith("UPDATE automations"):
+                    lock_events.append("update_automation")
+                    stored_auto["llm_model"] = params[0]
+                    stored_auto["reasoning_effort"] = params[1]
+                    stored_auto["config_version"] = params[2]
+                    stored_auto["active_version"] = params[3]
+                    stored_auto["updated_by"] = params[4]
+                    stored_auto["audit_history"] = params[5].obj
+                    stored_auto["updated_at"] = "2026-11-25T01:00:01+00:00"
+                    self._result = {
+                        "config_version": stored_auto["config_version"],
+                        "active_version": stored_auto["active_version"],
+                        "updated_at": stored_auto["updated_at"],
+                    }
+                else:
+                    self._result = None
+
+            async def fetchone(self) -> Any:
+                return self._result
+
+        class _FakeConn:
+            @asynccontextmanager
+            async def transaction(self):
+                yield
+
+            def cursor(self, **_kw: Any) -> _FakeCursor:
+                return _FakeCursor()
+
+        async def _fake_lock_prefs(uid: str, *, conn: Any) -> dict[str, Any]:
+            lock_events.append(f"lock_user_preferences:{uid}")
+            return dict(stored_pref)
+
+        async def _fake_lock_autos(uid: str, *, conn: Any) -> None:
+            lock_events.append(f"lock_user_automations:{uid}")
+
+        async def _fake_lock_subs(uid: str, *, conn: Any) -> None:
+            lock_events.append(f"lock_user_subagents:{uid}")
+
+        monkeypatch.setattr(
+            user_db,
+            "lock_user_preferences",
+            create_autospec(user_db.lock_user_preferences, side_effect=_fake_lock_prefs),
+        )
+        monkeypatch.setattr(
+            auto_db,
+            "lock_user_automations",
+            create_autospec(auto_db.lock_user_automations, side_effect=_fake_lock_autos),
+        )
+        monkeypatch.setattr(
+            us_db,
+            "lock_user_subagents",
+            create_autospec(us_db.lock_user_subagents, side_effect=_fake_lock_subs),
+        )
+        monkeypatch.setattr(
+            auto_lifecycle,
+            "check_claude_code_hosted",
+            create_autospec(auto_lifecycle.check_claude_code_hosted, return_value=None),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "_validate_successor_for_owner",
+            create_autospec(tmc_service._validate_successor_for_owner, return_value=None),
+        )
+
+        post_cat = _compile_test_catalog(
+            {"schema": CATALOG_SCHEMA, "retired": [{"key": "model-a", "provider": "openai"}]},
+            revision=2,
+        )
+        refs = {
+            "agent_config": {},
+            "dalton_settings": {},
+            "bundled_plugin_subagents": {},
+            "plugin_subagents": [],
+            "user_subagents": [],
+            "automations": [
+                {
+                    "automation_id": auto_id,
+                    "user_id": "u-1",
+                    "workspace_id": "ws-1",
+                    "llm_model": "model-a",
+                    "reasoning_effort": None,
+                    "config_version": 1,
+                }
+            ],
+            "user_preferences": [
+                {
+                    "user_id": "u-1",
+                    "slots": ["model_preference.preferred_model"],
+                    "model_preference": {"preferred_model": "model-a"},
+                    "agent_preference": {},
+                    "updated_at": stored_pref["updated_at"],
+                }
+            ],
+        }
+
+        side_effects, _ = asyncio.run(
+            tmc_service._validate_and_replace_references_in_tx(
+                _FakeConn(),
+                retired_key="model-a",
+                successor_model="model-b",
+                refs=refs,
+                post_compiled=post_cat,
+                migrate_user_defaults=True,
+                actor_user_id="admin-1",
+            )
+        )
+
+        # Canonical lock order: user_preferences MUST precede automations
+        assert lock_events.index("lock_user_preferences:u-1") < lock_events.index(
+            "lock_user_automations:u-1"
+        )
+        assert lock_events.index("update_user_preferences") < lock_events.index(
+            "lock_automation_row"
+        )
+
+        # Automation history and active_version remain valid for subsequent normal edits/pauses
+        assert stored_auto["llm_model"] == "model-b"
+        assert stored_auto["config_version"] == 2
+        assert stored_auto["active_version"] == 2
+        assert len(stored_auto["audit_history"]) == 2
+        validate_existing_history_state(stored_auto)
+
+        # Now run rollback_catalog back to rev 0 and verify lock order + valid v3 audit_history
+        lock_events.clear()
+
+        @asynccontextmanager
+        async def _fake_get_db(_conn=None):
+            yield _FakeConn()
+
+        monkeypatch.setattr(tmc_service, "get_db_connection", _fake_get_db)
+        monkeypatch.setattr(
+            tmc_service,
+            "acquire_catalog_exclusive_lock",
+            create_autospec(tmc_service.acquire_catalog_exclusive_lock, return_value=None),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "get_catalog_row",
+            create_autospec(
+                tmc_service.get_catalog_row,
+                return_value={
+                    "revision": 2,
+                    "payload": {"schema": CATALOG_SCHEMA, "retired": [{"key": "model-a"}]},
+                    "payload_sha256": "sha2",
+                    "legacy_sync_import_status": "not_applicable",
+                    "last_known_legacy_retired": [],
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "get_catalog_revision",
+            create_autospec(
+                tmc_service.get_catalog_revision,
+                return_value={"revision": 0, "payload": {"schema": CATALOG_SCHEMA}},
+            ),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "list_catalog_provider_credentials",
+            create_autospec(tmc_service.list_catalog_provider_credentials, return_value={}),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "list_revisions_between",
+            create_autospec(
+                tmc_service.list_revisions_between,
+                return_value=[{"revision": 2, "side_effects": side_effects}],
+            ),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "save_catalog_revision",
+            create_autospec(
+                tmc_service.save_catalog_revision,
+                return_value={
+                    "catalog": {"revision": 3},
+                    "revision_record": {"revision": 3, "action": "rollback"},
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "publish_catalog_changed",
+            create_autospec(tmc_service.publish_catalog_changed, return_value=None),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "invalidate_catalog_redis_caches",
+            create_autospec(tmc_service.invalidate_catalog_redis_caches, return_value=None),
+        )
+        monkeypatch.setattr(
+            user_db,
+            "invalidate_user_prefs_cache",
+            create_autospec(user_db.invalidate_user_prefs_cache, return_value=None),
+        )
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr("src.dalton.llm.overlay._is_native_oauth_sync_enabled", lambda: False)
+
+        asyncio.run(
+            rollback_catalog(
+                actor_user_id="admin-1",
+                data=CatalogRollbackInput(target_revision=0, expected_revision=2),
+            )
+        )
+        assert lock_events.index("lock_user_preferences:u-1") < lock_events.index(
+            "lock_user_automations:u-1"
+        )
+        assert stored_auto["llm_model"] == "model-a"
+        assert stored_auto["config_version"] == 3
+        assert stored_auto["active_version"] == 3
+        assert len(stored_auto["audit_history"]) == 3
+        validate_existing_history_state(stored_auto)
+
+    def test_r2_4_in_lock_subagent_and_rollback_deleted_model_checks_and_per_owner_successor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.team_model_catalog import service as tmc_service
+        from src.server.services.account import OwnAccess
+        from src.server.services.policy import Policy
+        from src.server.services.subagents.rules import SubagentInvalid
+        from src.server.services.subagents.writes import PreparedSave, Subagents, apply_save
+
+        cat_live = _compile_test_catalog({"schema": CATALOG_SCHEMA}, revision=3)
+        monkeypatch.setattr(
+            tmc_service,
+            "get_compiled_catalog_async",
+            create_autospec(tmc_service.get_compiled_catalog_async, return_value=cat_live),
+        )
+
+        # 1. Rollback-deleted team model (not in retired list, absent from active catalog) -> 400 model_unavailable
+        with pytest.raises(HTTPException) as exc_unavail:
+            asyncio.run(assert_model_not_retired_under_lock(object(), "team-rolled-back-model"))
+        assert exc_unavail.value.status_code == 400
+        assert exc_unavail.value.detail["code"] == "model_unavailable"
+
+        # Active model succeeds; personal custom model passes only when allow_custom=True & in pref
+        assert asyncio.run(assert_model_not_retired_under_lock(object(), "gpt-test")) is cat_live
+        assert (
+            asyncio.run(
+                assert_model_not_retired_under_lock(
+                    object(),
+                    "my-custom-1",
+                    model_pref={"custom_models": [{"name": "my-custom-1", "provider": "openai"}]},
+                    allow_custom=True,
+                )
+            )
+            is cat_live
+        )
+
+        # 2. subagents/writes.py apply_save rejects model retired/removed after prepare_save (under lock)
+        prepared = PreparedSave(
+            user_id="u-1",
+            name="my-agent",
+            version=None,
+            kind="custom",
+            patch={
+                "description": "Custom analyst",
+                "instructions": "Analyze",
+                "model": "team-rolled-back-model",
+            },
+        )
+        from src.server.services import account as account_mod
+        from src.server.services.llm import byok as byok_mod
+        from src.server.services.llm import user_models as user_models_mod
+
+        found = Subagents.of({}, (), [])
+        monkeypatch.setattr(
+            user_models_mod,
+            "get_model_preference",
+            create_autospec(user_models_mod.get_model_preference, return_value={}),
+        )
+        with pytest.raises(SubagentInvalid) as sub_exc:
+            asyncio.run(apply_save(prepared, found, object(), updated_by="user"))
+        assert any(e.field == "model" for e in sub_exc.value.errors)
+
+        # 3. _validate_successor_for_owner enforces per-owner account policy & credential availability
+        # 3a. Account policy forbids successor_model
+        restricted_policy = create_autospec(Policy, instance=True)
+        restricted_policy.allows_model.return_value = False
+        restricted_policy.allows.return_value = True
+        orig_own_access = account_mod.own_access
+        monkeypatch.setattr(
+            account_mod,
+            "own_access",
+            create_autospec(
+                orig_own_access,
+                return_value=OwnAccess(
+                    policy=restricted_policy, api_keys=True, subscriptions=None
+                ),
+            ),
+        )
+        with pytest.raises(CatalogConflictError) as pol_exc:
+            asyncio.run(
+                tmc_service._validate_successor_for_owner(
+                    object(),
+                    owner_id="u-restricted",
+                    successor="model-b",
+                    post_compiled=cat_live,
+                )
+            )
+        assert pol_exc.value.code == "successor_not_allowed_for_owner"
+
+        # 3b. Account policy allows model, but owner has neither platform key nor BYOK key
+        open_policy = create_autospec(Policy, instance=True)
+        open_policy.allows_model.return_value = True
+        open_policy.allows.return_value = True
+        monkeypatch.setattr(
+            account_mod,
+            "own_access",
+            create_autospec(
+                orig_own_access,
+                return_value=OwnAccess(
+                    policy=open_policy, api_keys=True, subscriptions=None
+                ),
+            ),
+        )
+        monkeypatch.setattr("src.llms.llm.platform_key_configured", lambda _m: False)
+        monkeypatch.setattr(
+            byok_mod,
+            "walk_byok_candidates",
+            create_autospec(byok_mod.walk_byok_candidates, return_value=(None, None)),
+        )
+        with pytest.raises(CatalogConflictError) as cred_exc:
+            asyncio.run(
+                tmc_service._validate_successor_for_owner(
+                    object(),
+                    owner_id="u-no-key",
+                    successor="model-b",
+                    post_compiled=cat_live,
+                )
+            )
+        assert cred_exc.value.code == "successor_credential_unavailable"
+
+    def test_r2_5_atomic_catalog_compile_revision_and_list_models_header_consistency(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi import Response
+
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.constants import CATALOG_REVISION_HEADER
+        from src.server.app import api_keys as api_keys_mod
+
+        invalidate_compiled_catalog_cache()
+        monkeypatch.setattr(
+            compiled_mod,
+            "_load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr("src.dalton.llm.overlay._is_native_oauth_sync_enabled", lambda: False)
+
+        # Simulate concurrent commit advancing revision 1 -> 2 between head read and full row read
+        payload_r2 = {
+            "schema": CATALOG_SCHEMA,
+            "models": {
+                "r2-only-model": {
+                    "model_id": "r2-only-model",
+                    "provider": "openai",
+                    "display_name": "R2 Only Model",
+                    "visible": True,
+                }
+            },
+        }
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_head",
+            create_autospec(
+                tmc_db.get_catalog_head,
+                return_value={
+                    "revision": 1,
+                    "payload_sha256": "sha1",
+                    "legacy_sync_import_status": "not_applicable",
+                    "last_known_legacy_retired": [],
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_row",
+            create_autospec(
+                tmc_db.get_catalog_row,
+                return_value={
+                    "revision": 2,
+                    "payload": payload_r2,
+                    "payload_sha256": "sha2",
+                    "legacy_sync_import_status": "not_applicable",
+                    "last_known_legacy_retired": [],
+                },
+            ),
+        )
+
+        compiled = asyncio.run(get_compiled_catalog_async())
+        # Must compile & cache under row's ACTUAL revision (2), NEVER stale head revision (1)
+        assert compiled.revision == 2
+        assert "r2-only-model" in compiled.model_config.llm_config
+        with compiled_mod._CACHE_LOCK:
+            cached_revs = {k[0] for k in compiled_mod._COMPILED_BY_REVISION}
+        assert 2 in cached_revs
+        assert 1 not in cached_revs
+
+        # GET /api/v1/models must build response models from the SAME compiled_catalog.model_config as header
+        cat_rev5 = _compile_test_catalog(
+            {
+                "schema": CATALOG_SCHEMA,
+                "models": {
+                    "rev5-model": {
+                        "model_id": "rev5-model",
+                        "provider": "openai",
+                        "display_name": "Rev 5 Model",
+                        "visible": True,
+                    }
+                },
+            },
+            revision=5,
+        )
+        cat_rev6 = _compile_test_catalog(
+            {
+                "schema": CATALOG_SCHEMA,
+                "models": {
+                    "rev6-drift-model": {
+                        "model_id": "rev6-drift-model",
+                        "provider": "openai",
+                        "display_name": "Rev 6 Drift",
+                        "visible": True,
+                    }
+                },
+            },
+            revision=6,
+        )
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_async",
+            create_autospec(compiled_mod.get_compiled_catalog_async, return_value=cat_rev5),
+        )
+        # Even if global LLM.get_model_config() returns rev6 due to concurrent worker update,
+        # list_models must strictly use compiled_catalog.model_config (rev5)!
+        monkeypatch.setattr(LLM, "get_model_config", classmethod(lambda cls: cat_rev6.model_config))
+        resp = Response()
+        body = asyncio.run(api_keys_mod.list_models(resp))
+        assert resp.headers[CATALOG_REVISION_HEADER] == "5"
+        assert body["catalog_revision"] == 5
+        openai_models = body["models"]["openai"]["models"]
+        assert "rev5-model" in openai_models
+        assert "rev6-drift-model" not in openai_models
+
+    def test_r2_6_provider_models_single_credential_read_blocks_rotated_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.services.team_model_catalog import transport as tmc_transport
+        from src.server.services.llm.provider_models import service as pm_service
+
+        cat = _compile_test_catalog(
+            {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "provider_variants": {
+                        "openai": {
+                            "corp-gw": {
+                                "display_name": "Corp GW",
+                                "sdk": "openai",
+                                "access_type": "api_key",
+                                "billing": "cash",
+                                "base_url": "https://gw.example.com/v1",
+                            }
+                        }
+                    }
+                },
+            },
+            revision=1,
+        )
+        monkeypatch.setattr(LLM, "get_model_config", classmethod(lambda cls: cat.model_config))
+
+        old_key = "sk-old-discovery-key-1111"
+        old_fp = make_key_fingerprint(old_key)
+        cred_calls: list[bool] = []
+
+        async def _fake_get_cred(slug: str, *, conn: Any = None, decrypt: bool = True):
+            cred_calls.append(decrypt)
+            # First call returns old key; any second call would return a rotated key!
+            if len(cred_calls) == 1:
+                return {
+                    "provider_slug": slug,
+                    "api_key": old_key,
+                    "bound_base_url": "https://gw.example.com/v1",
+                    "canonical_bound_url": "https://gw.example.com:443/v1",
+                    "key_fingerprint": old_fp,
+                }
+            return {
+                "provider_slug": slug,
+                "api_key": "sk-rotated-9999",
+                "bound_base_url": "https://gw.example.com/v1",
+                "canonical_bound_url": "https://gw.example.com:443/v1",
+                "key_fingerprint": make_key_fingerprint("sk-rotated-9999"),
+            }
+
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_provider_credential",
+            create_autospec(tmc_db.get_catalog_provider_credential, side_effect=_fake_get_cred),
+        )
+        monkeypatch.setattr(
+            pm_service,
+            "_cache_read",
+            create_autospec(pm_service._cache_read, return_value=None),
+        )
+        monkeypatch.setattr(
+            pm_service,
+            "_cache_write",
+            create_autospec(pm_service._cache_write, return_value=None),
+        )
+        monkeypatch.setattr(
+            pm_service,
+            "_gateway_catalog",
+            create_autospec(pm_service._gateway_catalog, return_value=None),
+        )
+
+        transport_args: dict[str, Any] = {}
+
+        def _fake_make_transport(**kw: Any):
+            transport_args.update(kw)
+            return object()
+
+        monkeypatch.setattr(
+            tmc_transport,
+            "make_catalog_variant_http_transport",
+            create_autospec(
+                tmc_transport.make_catalog_variant_http_transport,
+                side_effect=_fake_make_transport,
+            ),
+        )
+        monkeypatch.setattr(
+            pm_service,
+            "fetch_list",
+            create_autospec(pm_service.fetch_list, return_value={"data": []}),
+        )
+
+        asyncio.run(pm_service.available_models("u-1", "corp-gw", refresh=True))
+        # Must read DB credential ONCE (decrypt=True) and bind exact matching fingerprint
+        assert cred_calls == [True]
+        assert transport_args["expected_key_fingerprint"] == old_fp
+        assert transport_args["bound_base_url"] == "https://gw.example.com/v1"
+        assert transport_args["verify_db_binding"] is True
+
+    def test_r2_7_restore_factory_default_clears_pricing_overrides_and_subscription_variant_skips_parent_cash(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.team_model_catalog import service as tmc_service
+        from src.dalton.services.team_model_catalog.snapshot import lookup_snapshot_pricing
+
+        # Part A: restore_factory_default_model clears providers.model_overrides[prov][card_id]
+        saved_payloads: list[dict[str, Any]] = []
+
+        class _FakeConn:
+            @asynccontextmanager
+            async def transaction(self):
+                yield
+
+        @asynccontextmanager
+        async def _fake_get_db(_conn=None):
+            yield _FakeConn()
+
+        async def _fake_save(conn: Any, **kw: Any) -> dict[str, Any]:
+            saved_payloads.append(kw["payload"])
+            return {
+                "catalog": {"revision": int(kw["expected_revision"]) + 1},
+                "revision_record": {"revision": int(kw["expected_revision"]) + 1},
+            }
+
+        monkeypatch.setattr(tmc_service, "get_db_connection", _fake_get_db)
+        monkeypatch.setattr(
+            tmc_service,
+            "acquire_catalog_exclusive_lock",
+            create_autospec(tmc_service.acquire_catalog_exclusive_lock, return_value=None),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "get_catalog_row",
+            create_autospec(
+                tmc_service.get_catalog_row,
+                return_value={
+                    "revision": 4,
+                    "payload": {
+                        "schema": CATALOG_SCHEMA,
+                        "model_overrides": {"gpt-test": {"display_name": "Edited GPT"}},
+                        "dalton_meta": {"gpt-test": {"family": "openai-gpt"}},
+                        "task_costs": {"bounds": {"gpt-test": {"model": "model-a", "times": 1.0}}},
+                        "providers": {
+                            "model_overrides": {
+                                "openai": {
+                                    "gpt-test": {
+                                        "pricing": {"input": 99.0, "output": 199.0, "unit": "per_1m_tokens"}
+                                    }
+                                }
+                            }
+                        },
+                    },
+                    "payload_sha256": "sha4",
+                    "legacy_sync_import_status": "not_applicable",
+                    "last_known_legacy_retired": [],
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "save_catalog_revision",
+            create_autospec(tmc_service.save_catalog_revision, side_effect=_fake_save),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "publish_catalog_changed",
+            create_autospec(tmc_service.publish_catalog_changed, return_value=None),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "invalidate_catalog_redis_caches",
+            create_autospec(tmc_service.invalidate_catalog_redis_caches, return_value=None),
+        )
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr("src.dalton.llm.overlay._is_native_oauth_sync_enabled", lambda: False)
+
+        asyncio.run(
+            tmc_service.restore_factory_default_model(
+                actor_user_id="admin-1",
+                model_key="gpt-test",
+                expected_revision=4,
+            )
+        )
+        assert len(saved_payloads) == 1
+        restored = saved_payloads[0]
+        assert "gpt-test" not in (restored.get("model_overrides") or {})
+        assert "openai" not in ((restored.get("providers") or {}).get("model_overrides") or {})
+        restored_compiled = _compile_test_catalog(restored, revision=5)
+        monkeypatch.setattr(
+            LLM, "get_model_config", classmethod(lambda cls: restored_compiled.model_config)
+        )
+        restored_pricing = find_model_pricing("gpt-test", provider="openai")
+        assert restored_pricing is not None
+        assert restored_pricing["input"] == 2.0
+        assert restored_pricing["output"] == 8.0
+
+        # Part B: billing="subscription" catalog variant sharing parent model_id returns subscription marker, NOT parent cash card
+        sub_variant_cat = _compile_test_catalog(
+            {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "provider_variants": {
+                        "openai": {
+                            "acme-openai-sub": {
+                                "display_name": "Acme OpenAI Seat",
+                                "sdk": "openai",
+                                "access_type": "api_key",
+                                "billing": "subscription",
+                                "base_url": "https://sub.example.com/v1",
+                            }
+                        }
+                    }
+                },
+                "models": {
+                    "acme-gpt-sub": {
+                        "model_id": "gpt-test",
+                        "provider": "acme-openai-sub",
+                        "display_name": "Acme GPT Seat",
+                        "visible": True,
+                    }
+                },
+                "dalton_meta": {
+                    "acme-gpt-sub": {
+                        "billing": "subscription",
+                        "notional_pricing": {"input": 1.0, "output": 4.0, "source_kind": "official"},
+                    }
+                },
+            },
+            revision=6,
+        )
+        monkeypatch.setattr(
+            LLM, "get_model_config", classmethod(lambda cls: sub_variant_cat.model_config)
+        )
+        sub_pricing = find_model_pricing("gpt-test", provider="acme-openai-sub")
+        assert sub_pricing == {"pricing_type": "subscription"}
+
+        # Snapshot built for the subscription variant also avoids inheriting parent cash pricing
+        snap_sub = build_effective_catalog_snapshot(
+            ["acme-gpt-sub"],
+            compiled=sub_variant_cat,
+            variant_credentials={
+                "acme-openai-sub": {
+                    "bound_base_url": "https://sub.example.com/v1",
+                    "canonical_bound_url": "https://sub.example.com:443/v1",
+                    "key_fingerprint": make_key_fingerprint("sk-sub-1111"),
+                }
+            },
+        )
+        assert snap_sub["models"]["acme-gpt-sub"]["pricing"] is None
+        hit, snap_p = lookup_snapshot_pricing(
+            "acme-gpt-sub", "acme-openai-sub", model_id="gpt-test", snapshot=snap_sub
+        )
+        assert hit is True
+        assert snap_p == {"pricing_type": "subscription"}

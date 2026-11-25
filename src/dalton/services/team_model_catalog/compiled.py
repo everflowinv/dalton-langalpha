@@ -727,15 +727,49 @@ async def get_compiled_catalog_async(
             return cached
 
     row = await get_catalog_row(conn=conn)
-    payload = (row or {}).get("payload") or empty_catalog_payload()
+    if row is None:
+        fallback_fp = _compute_retired_fingerprint("not_applicable", [])
+        if not force_reload:
+            cached = _get_cached(0, stamp, oauth_on, fallback_fp)
+            if cached is not None:
+                return cached
+        compiled = compile_catalog_from_payload(
+            empty_catalog_payload(),
+            revision=0,
+            oauth_sync_enabled=oauth_on,
+            legacy_sync_import_status="not_applicable",
+        )
+        cache_compiled_catalog(compiled)
+        return compiled
+
+    row_rev = int(row["revision"]) if "revision" in row else rev
+    row_status = str(row.get("legacy_sync_import_status") or status)
+    row_known_retired = (
+        list(row.get("last_known_legacy_retired") or [])
+        if "last_known_legacy_retired" in row
+        else known_retired
+    )
+    row_extra_readonly = _extra_readonly_retired_for_failed(row_status, row_known_retired)
+    if row_status == "failed":
+        try:
+            row_extra_readonly |= await fetch_legacy_retired_history(conn=conn)
+        except Exception:
+            pass
+    row_legacy_fp = _compute_retired_fingerprint(row_status, row_known_retired, row_extra_readonly)
+    if not force_reload:
+        cached = _get_cached(row_rev, stamp, oauth_on, row_legacy_fp)
+        if cached is not None:
+            return cached
+
+    payload = row.get("payload") or empty_catalog_payload()
     compiled = compile_catalog_from_payload(
         payload,
-        revision=rev,
-        payload_sha256=(row or {}).get("payload_sha256"),
+        revision=row_rev,
+        payload_sha256=row.get("payload_sha256"),
         oauth_sync_enabled=oauth_on,
-        legacy_sync_import_status=status,
-        last_known_legacy_retired=known_retired,
-        extra_readonly_legacy_retired=extra_readonly,
+        legacy_sync_import_status=row_status,
+        last_known_legacy_retired=row_known_retired,
+        extra_readonly_legacy_retired=row_extra_readonly,
     )
     cache_compiled_catalog(compiled)
     return compiled
@@ -802,15 +836,44 @@ def get_compiled_catalog_sync(
             return cached
 
     row = get_catalog_row_sync()
-    payload = (row or {}).get("payload") or empty_catalog_payload()
+    if row is None:
+        fallback_fp = _compute_retired_fingerprint("not_applicable", [])
+        if not force_reload:
+            cached = _get_cached(0, stamp, oauth_on, fallback_fp)
+            if cached is not None:
+                return cached
+        compiled = compile_catalog_from_payload(
+            empty_catalog_payload(),
+            revision=0,
+            oauth_sync_enabled=oauth_on,
+            legacy_sync_import_status="not_applicable",
+        )
+        cache_compiled_catalog(compiled)
+        return compiled
+
+    row_rev = int(row["revision"]) if "revision" in row else rev
+    row_status = str(row.get("legacy_sync_import_status") or status)
+    row_known_retired = (
+        list(row.get("last_known_legacy_retired") or [])
+        if "last_known_legacy_retired" in row
+        else known_retired
+    )
+    row_extra_readonly = _extra_readonly_retired_for_failed(row_status, row_known_retired)
+    row_legacy_fp = _compute_retired_fingerprint(row_status, row_known_retired, row_extra_readonly)
+    if not force_reload:
+        cached = _get_cached(row_rev, stamp, oauth_on, row_legacy_fp)
+        if cached is not None:
+            return cached
+
+    payload = row.get("payload") or empty_catalog_payload()
     compiled = compile_catalog_from_payload(
         payload,
-        revision=rev,
-        payload_sha256=(row or {}).get("payload_sha256"),
+        revision=row_rev,
+        payload_sha256=row.get("payload_sha256"),
         oauth_sync_enabled=oauth_on,
-        legacy_sync_import_status=status,
-        last_known_legacy_retired=known_retired,
-        extra_readonly_legacy_retired=extra_readonly,
+        legacy_sync_import_status=row_status,
+        last_known_legacy_retired=row_known_retired,
+        extra_readonly_legacy_retired=row_extra_readonly,
     )
     cache_compiled_catalog(compiled)
     return compiled

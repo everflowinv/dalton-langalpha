@@ -69,7 +69,8 @@ class OwedResume:
     retry_run_id: Optional[str] = None
     # DALTON-HOOK(automation-subscription-fallback): interrupted turn's automation execution id
     automation_execution_id: Optional[str] = None
-    # DALTON-HOOK(team-model-catalog): persisted/backfilled turn catalog snapshot for cross-deploy resume
+    # DALTON-HOOK(team-model-catalog): interrupted run id & backfilled snapshot for authoritative server-side binding on resume
+    source_run_id: Optional[str] = None
     catalog_snapshot: Optional[Mapping[str, Any]] = None
 
     @property
@@ -116,17 +117,16 @@ def resume_turn(owed: OwedResume, request_key: str) -> tuple[str, dict]:
         # DALTON-HOOK(automation-subscription-fallback): carry interrupted execution link on restart resume
         if owed.automation_execution_id:
             body["automation_delivery"] = {"id": owed.automation_execution_id}
-        # DALTON-HOOK(team-model-catalog): propagate effective_catalog_snapshot to resumed turn
-        if owed.catalog_snapshot:
-            body["effective_catalog_snapshot"] = dict(owed.catalog_snapshot)
+        # DALTON-HOOK(team-model-catalog): pass server-only source_run_id so /messages loads effective_catalog_snapshot authoritatively from DB
+        if owed.source_run_id:
+            body["resume_of_run_id"] = owed.source_run_id
         return route, body
     body = {
         "run_id": owed.retry_run_id,
         "workspace_id": owed.workspace_id,
         "request_key": request_key,
     }
-    if owed.catalog_snapshot:  # DALTON-HOOK(team-model-catalog): carry snapshot on /retry resume
-        body["effective_catalog_snapshot"] = dict(owed.catalog_snapshot)
+    # DALTON-HOOK(team-model-catalog): /retry loads effective_catalog_snapshot authoritatively from DB using run_id (never untrusted body rates)
     if owed.tasks:
         body["additional_context"] = [
             {"type": "directive", "content": owed.stopped_tasks_notice(also=False)}
@@ -232,6 +232,7 @@ async def resume_verdict(job: Mapping[str, Any]) -> OwedResume | NotOwed | NotYe
         tasks=tuple(tasks),
         retry_run_id=retry_run_id,
         automation_execution_id=execution_id or None,
+        source_run_id=str(run_id),
         catalog_snapshot=catalog_snapshot,
     )
 

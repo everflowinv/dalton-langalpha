@@ -271,14 +271,43 @@ async def _run_background_task(
     tool_tracker = ToolUsageTracker()
 
     async def run_handler() -> ToolMessage | Command:
+        from contextlib import nullcontext
+
         current_background_token_tracker.set(tracker)
         set_tool_tracker(tool_tracker)
+        # DALTON-HOOK(team-model-catalog): bind subagent_runs.replay_facts['effective_catalog_snapshot']
+        # when persisted for this task_run_id (e.g. subagent-specific model or cross-deploy resume).
+        subagent_snap = None
+        if task.task_run_id:
+            try:
+                from src.dalton.database.team_model_catalog import (
+                    is_conversation_db_pool_open,
+                )
+                from src.dalton.services.team_model_catalog.snapshot import (
+                    load_run_catalog_snapshot,
+                )
+
+                if is_conversation_db_pool_open():
+                    subagent_snap = await load_run_catalog_snapshot(
+                        str(task.task_run_id), is_subagent=True
+                    )
+            except Exception:
+                subagent_snap = None
+        from src.dalton.services.team_model_catalog.snapshot import (
+            bind_catalog_snapshot,
+        )
+
         try:
-            async with _child_credit_lane(task, tracker, tool_tracker, label):
-                # DALTON-HOOK(subagent-caps): wait until a Redis slot lease is held
-                # before invoking the subagent handler, and release it in finally.
-                await wait_for_subagent_slot(task, registry=registry)
-                return await handler(request)
+            with (
+                bind_catalog_snapshot(subagent_snap)
+                if subagent_snap is not None
+                else nullcontext()
+            ):
+                async with _child_credit_lane(task, tracker, tool_tracker, label):
+                    # DALTON-HOOK(subagent-caps): wait until a Redis slot lease is held
+                    # before invoking the subagent handler, and release it in finally.
+                    await wait_for_subagent_slot(task, registry=registry)
+                    return await handler(request)
         finally:
             await release_subagent_slot(task)
             # The astream loop sends a held delta only once it is due, so the

@@ -48,6 +48,7 @@ from src.dalton.services.team_model_catalog.constants import (
     CATALOG_SCHEMA,
     CatalogConflictError,
     CatalogValidationError,
+    empty_catalog_payload,
     norm_id,
 )
 from src.dalton.services.team_model_catalog.follow import (
@@ -118,14 +119,20 @@ async def assert_model_not_retired_under_lock(
     model_key: str | None,
     *,
     field: str = "llm_model",
-) -> None:
-    """Verify ``model_key`` is not retired in the live catalog under a held catalog shared lock.
+    user_id: str | None = None,
+    model_pref: Mapping[str, Any] | None = None,
+    allow_custom: bool = False,
+) -> CompiledCatalog | None:
+    """Verify ``model_key`` is active (exists and not retired) in the live catalog under a held catalog shared lock.
 
-    Raises ``HTTPException(400, detail={"code": "model_retired", ...})`` if retired.
+    Raises:
+        HTTPException(400, detail={"code": "model_retired", ...}) if retired.
+        HTTPException(400, detail={"code": "model_unavailable", ...}) if absent from the
+            active catalog (e.g. removed by a rollback) and not an allowed custom model.
     """
     cleaned = str(model_key or "").strip()
     if not cleaned:
-        return
+        return None
     compiled = await get_compiled_catalog_async(conn=conn)
     all_retired = (
         compiled.factory_retired_keys
@@ -142,6 +149,36 @@ async def assert_model_not_retired_under_lock(
                 "message": f"Model '{cleaned}' has been retired and cannot be assigned.",
             },
         )
+    if compiled.model_config.get_model_config(cleaned) is not None:
+        return compiled
+    if allow_custom:
+        from src.llms.preferences import custom_model_names
+        from src.server.services.llm import user_models
+
+        pref: Mapping[str, Any] | None = model_pref
+        if pref is None and user_id:
+            try:
+                pref = await user_models.get_model_preference(user_id)
+            except Exception:
+                pref = None
+        if isinstance(pref, Mapping):
+            if cleaned in custom_model_names(dict(pref)):
+                return compiled
+            raw_cps = pref.get("custom_providers")
+            if isinstance(raw_cps, list) and any(
+                isinstance(cp, Mapping) and str(cp.get("name") or "") == cleaned
+                for cp in raw_cps
+            ):
+                return compiled
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "code": "model_unavailable",
+            "field": field,
+            "model": cleaned,
+            "message": f"Model '{cleaned}' is not available in the active catalog and cannot be assigned.",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1075,10 +1112,118 @@ async def restore_factory_default_model(
                     f"Expected revision {expected_revision}, current is {cur_rev}.",
                     extra={"expected_revision": expected_revision, "current_revision": cur_rev},
                 )
+            cur_compiled = compile_catalog_from_payload(
+                row["payload"],
+                revision=cur_rev,
+                legacy_sync_import_status=row["legacy_sync_import_status"],
+                last_known_legacy_retired=row["last_known_legacy_retired"],
+            )
+            factory_compiled = compile_catalog_from_payload(
+                empty_catalog_payload(),
+                revision=0,
+                legacy_sync_import_status=row["legacy_sync_import_status"],
+                last_known_legacy_retired=row["last_known_legacy_retired"],
+            )
+            factory_entry = factory_compiled.model_config.get_model_config(key)
+            cur_entry = cur_compiled.model_config.get_model_config(key)
+
+            candidate_providers: set[str] = set()
+            candidate_raw_ids: set[str] = {key}
+            candidate_norm_ids: set[str] = {norm_id(key)}
+            for mc_obj, entry_obj in (
+                (factory_compiled.model_config, factory_entry),
+                (cur_compiled.model_config, cur_entry),
+            ):
+                if not isinstance(entry_obj, Mapping):
+                    continue
+                p = str(entry_obj.get("provider") or "").strip()
+                mid = str(entry_obj.get("model_id") or key).strip()
+                if p:
+                    candidate_providers.add(p)
+                if mid:
+                    candidate_raw_ids.add(mid)
+                    candidate_norm_ids.add(norm_id(mid))
+                if p and mid:
+                    card_info = mc_obj.get_model_info(p, mid)
+                    if isinstance(card_info, Mapping):
+                        cid = str(card_info.get("id") or "").strip()
+                        if cid:
+                            candidate_raw_ids.add(cid)
+                            candidate_norm_ids.add(norm_id(cid))
+                        for alias in card_info.get("alias") or []:
+                            astr = str(alias or "").strip()
+                            if astr:
+                                candidate_raw_ids.add(astr)
+                                candidate_norm_ids.add(norm_id(astr))
+
             next_payload = copy.deepcopy(row["payload"])
-            (next_payload.get("model_overrides") or {}).pop(key, None)
-            (next_payload.get("dalton_meta") or {}).pop(key, None)
-            ((next_payload.get("task_costs") or {}).get("bounds") or {}).pop(key, None)
+            key_lower = key.lower()
+            for section_name in ("model_overrides", "dalton_meta"):
+                sec = next_payload.get(section_name)
+                if isinstance(sec, dict):
+                    for k_exist in [k for k in sec if str(k).lower() == key_lower]:
+                        sec.pop(k_exist, None)
+            tc_bounds = (next_payload.get("task_costs") or {}).get("bounds")
+            if isinstance(tc_bounds, dict):
+                for k_exist in [k for k in tc_bounds if str(k).lower() == key_lower]:
+                    tc_bounds.pop(k_exist, None)
+
+            # If a factory model had a promoted entry in payload.models, remove it so the
+            # factory baseline definition takes effect again.
+            if factory_entry is not None and isinstance(next_payload.get("models"), dict):
+                for k_exist in [k for k in next_payload["models"] if str(k).lower() == key_lower]:
+                    next_payload["models"].pop(k_exist, None)
+
+            # Clear pricing card patches in providers.model_overrides[prov] and any factory-shadow
+            # cards in providers.models[prov] (unless shared with another remaining team model).
+            prov_block = next_payload.get("providers")
+            if isinstance(prov_block, dict) and candidate_providers:
+                remaining_team_cards: dict[str, set[str]] = {}
+                for m_k, m_v in (next_payload.get("models") or {}).items():
+                    if str(m_k).lower() == key_lower or not isinstance(m_v, Mapping):
+                        continue
+                    mp = str(m_v.get("provider") or "").strip()
+                    mmid = str(m_v.get("model_id") or m_k).strip()
+                    if mp and mmid:
+                        remaining_team_cards.setdefault(mp, set()).add(norm_id(mmid))
+
+                prov_ov = prov_block.get("model_overrides")
+                if isinstance(prov_ov, dict):
+                    for p in candidate_providers:
+                        p_ov = prov_ov.get(p)
+                        if not isinstance(p_ov, dict):
+                            continue
+                        shared_norms = remaining_team_cards.get(p, set())
+                        for ov_k in list(p_ov.keys()):
+                            ov_norm = norm_id(str(ov_k))
+                            if (
+                                str(ov_k) in candidate_raw_ids or ov_norm in candidate_norm_ids
+                            ) and ov_norm not in shared_norms:
+                                p_ov.pop(ov_k, None)
+                        if not p_ov:
+                            prov_ov.pop(p, None)
+
+                prov_models = prov_block.get("models")
+                if isinstance(prov_models, dict) and factory_entry is not None:
+                    for p in candidate_providers:
+                        cards = prov_models.get(p)
+                        if not isinstance(cards, list):
+                            continue
+                        shared_norms = remaining_team_cards.get(p, set())
+                        kept = [
+                            c
+                            for c in cards
+                            if not (
+                                isinstance(c, Mapping)
+                                and norm_id(str(c.get("id") or "")) in candidate_norm_ids
+                                and norm_id(str(c.get("id") or "")) not in shared_norms
+                            )
+                        ]
+                        if kept:
+                            prov_models[p] = kept
+                        else:
+                            prov_models.pop(p, None)
+
             compiled = trial_compile_and_validate_catalog(
                 next_payload,
                 revision=cur_rev + 1,
@@ -1109,6 +1254,184 @@ async def restore_factory_default_model(
 # ---------------------------------------------------------------------------
 
 
+async def _validate_successor_for_owner(
+    conn: Any,
+    *,
+    owner_id: str,
+    successor: str,
+    post_compiled: CompiledCatalog,
+    owner_pref: Mapping[str, Any] | None = None,
+) -> None:
+    """Verify ``successor`` satisfies ``owner_id``'s account model policy & credential availability."""
+    from src.dalton.credentials import credential_user_id, uses_shared_team_credential
+    from src.dalton.database.team_model_catalog import get_catalog_provider_credential
+    from src.llms.claude_code import is_claude_code_model
+    from src.llms.llm import platform_key_configured
+    from src.server.services.account import own_access
+    from src.server.services.llm.byok import walk_byok_candidates
+    from src.server.services.platform_client import platform_gating_active
+    from src.server.services.policy import OWN_SUBSCRIPTIONS
+
+    mc = post_compiled.model_config
+    entry = mc.get_model_config(successor)
+    if not isinstance(entry, Mapping):
+        raise CatalogValidationError(
+            "invalid_successor",
+            f"successor_model {successor!r} is not active in the target catalog.",
+        )
+
+    provider = str(entry.get("provider") or "").strip()
+    prov_info = mc.get_provider_info(provider) if provider else {}
+
+    # 1. Account model policy (organization allow-list / role policy)
+    own = await own_access(owner_id, sign_ins=False)
+    policy = getattr(own, "policy", None)
+    if policy is not None and not policy.allows_model(successor):
+        raise CatalogConflictError(
+            "successor_not_allowed_for_owner",
+            f"successor_model {successor!r} is not permitted by account policy for user {owner_id!r}.",
+            extra={"owner_user_id": owner_id, "successor_model": successor},
+        )
+
+    # 2. Credential availability for the successor's provider
+    if is_claude_code_model(successor):
+        return
+
+    if prov_info.get("catalog_defined"):
+        cred = await get_catalog_provider_credential(provider, conn=conn, decrypt=False)
+        target_canonical = canonical_url_key(str(prov_info.get("base_url") or ""))
+        if (
+            not cred
+            or not target_canonical
+            or str(cred.get("canonical_bound_url") or "") != target_canonical
+        ):
+            raise CatalogConflictError(
+                "successor_credential_unavailable",
+                f"successor_model {successor!r} uses catalog variant {provider!r} without a matching bound credential.",
+                extra={
+                    "owner_user_id": owner_id,
+                    "successor_model": successor,
+                    "provider": provider,
+                },
+            )
+        return
+
+    access_type = str(prov_info.get("access_type") or "api_key")
+    has_own_credential = False
+
+    if access_type == "oauth":
+        if policy is not None and not policy.allows(OWN_SUBSCRIPTIONS):
+            raise CatalogConflictError(
+                "successor_not_allowed_for_owner",
+                f"Account policy for user {owner_id!r} disables OAuth subscriptions required by {successor!r}.",
+                extra={"owner_user_id": owner_id, "successor_model": successor, "provider": provider},
+            )
+        from src.server.database.oauth_tokens import get_oauth_connection
+
+        cred_uid = credential_user_id(owner_id) if uses_shared_team_credential(owner_id) else owner_id
+        oauth_row = await get_oauth_connection(cred_uid, provider)
+        if not oauth_row or oauth_row.get("needs_reauth_at"):
+            raise CatalogConflictError(
+                "successor_credential_unavailable",
+                f"User {owner_id!r} has no active {provider!r} OAuth connection for successor_model {successor!r}.",
+                extra={"owner_user_id": owner_id, "successor_model": successor, "provider": provider},
+            )
+        allowed_plans = {str(p).lower() for p in (entry.get("oauth_plans") or ()) if p}
+        user_plan = str(oauth_row.get("plan_type") or "").lower()
+        if allowed_plans and user_plan and user_plan not in allowed_plans:
+            raise CatalogConflictError(
+                "successor_not_allowed_for_owner",
+                f"User {owner_id!r}'s {provider!r} plan ({user_plan!r}) does not cover successor_model {successor!r}.",
+                extra={"owner_user_id": owner_id, "successor_model": successor, "provider": provider},
+            )
+        has_own_credential = True
+    else:
+        has_platform_key = bool(platform_key_configured(successor))
+        byok_allowed = bool(getattr(own, "api_keys", True)) or uses_shared_team_credential(owner_id)
+        if byok_allowed:
+            found_key, _ = await walk_byok_candidates(owner_id, provider, mc)
+            has_own_credential = found_key is not None
+        if not has_platform_key and not has_own_credential:
+            raise CatalogConflictError(
+                "successor_credential_unavailable",
+                f"User {owner_id!r} has no available API key for provider {provider!r} (successor_model {successor!r}).",
+                extra={"owner_user_id": owner_id, "successor_model": successor, "provider": provider},
+            )
+
+    # 3. Platform tier / plan gating (when platform gating is active and no own credential overrides it)
+    if platform_gating_active() and not has_own_credential:
+        from src.server.services.llm.capabilities import PlanTier
+
+        permits = PlanTier(owner_id)
+        tier = entry.get("tier")
+        if not (isinstance(tier, int) and await permits(tier)):
+            raise CatalogConflictError(
+                "successor_not_allowed_for_owner",
+                f"User {owner_id!r}'s plan does not include successor_model {successor!r}.",
+                extra={"owner_user_id": owner_id, "successor_model": successor},
+            )
+
+
+async def _update_automation_model_with_history_in_tx(
+    conn: Any,
+    *,
+    locked_row: Mapping[str, Any],
+    target_model: str | None,
+    target_effort: str | None,
+    actor_user_id: str | None,
+    pref_row: Mapping[str, Any] | None,
+    now_iso: str,
+) -> dict[str, Any] | None:
+    """Update an already-locked automation's model/effort while maintaining ``audit_history`` and ``active_version``."""
+    from src.dalton.database.company_automations import prepare_update_history_columns
+
+    update_fields = {
+        "llm_model": target_model,
+        "reasoning_effort": target_effort,
+    }
+    extra_hist_cols, _ = await prepare_update_history_columns(
+        locked_row,
+        update_fields,
+        actor_user_id=actor_user_id,
+        action="update",
+        skip_if_unchanged=False,
+        pref_row=pref_row,
+        changed_at_iso=now_iso,
+        conn=conn,
+    )
+    new_cv = int(extra_hist_cols["config_version"])
+    new_av = int(extra_hist_cols["active_version"])
+    new_history = extra_hist_cols["audit_history"]
+    eff_updated_by = extra_hist_cols.get("updated_by", actor_user_id)
+
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            UPDATE automations
+            SET llm_model = %s,
+                reasoning_effort = %s,
+                config_version = %s,
+                active_version = %s,
+                updated_by = %s,
+                audit_history = %s,
+                updated_at = NOW()
+            WHERE automation_id = %s::uuid
+              AND deleted_at IS NULL
+            RETURNING config_version, active_version, updated_at
+            """,
+            (
+                target_model,
+                target_effort,
+                new_cv,
+                new_av,
+                eff_updated_by,
+                Json(new_history),
+                str(locked_row["automation_id"]),
+            ),
+        )
+        return await cur.fetchone()
+
+
 async def _validate_and_replace_references_in_tx(
     conn: Any,
     *,
@@ -1118,6 +1441,7 @@ async def _validate_and_replace_references_in_tx(
     post_compiled: CompiledCatalog,
     migrate_user_defaults: bool = False,
     clear_subagent_model: bool = False,
+    actor_user_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], set[str]]:
     """Validate hard blocks and perform transactional batch replacement with CAS side_effects."""
     if refs["agent_config"] or refs["dalton_settings"]:
@@ -1169,13 +1493,107 @@ async def _validate_and_replace_references_in_tx(
 
     from src.llms.model_spec import clamp_reasoning_effort, reasoning_block
     from src.server.database import automation as auto_db
+    from src.server.database.user import lock_user_preferences
     from src.server.database.user_subagents import lock_user_subagents
     from src.server.services.automations.lifecycle import check_claude_code_hosted
 
     side_effects: list[dict[str, Any]] = []
     affected_pref_users: set[str] = set()
+    now_iso = datetime.now(timezone.utc).isoformat()
 
-    # 1. Automations: lock in sorted user_id order (strictly AFTER catalog exclusive lock)
+    # Canonical lock order (strictly AFTER catalog exclusive lock, matching automation.py):
+    #   1. user_preferences (sorted user_id) -> 2. automations (sorted user_id, automation_id) -> 3. user_subagents (sorted user_id)
+    pref_lock_users: set[str] = {str(a["user_id"]) for a in refs["automations"]}
+    if migrate_user_defaults and successor:
+        pref_lock_users.update(str(u["user_id"]) for u in refs["user_preferences"])
+
+    locked_prefs: dict[str, dict[str, Any]] = {}
+    for uid in sorted(pref_lock_users):
+        prow = await lock_user_preferences(uid, conn=conn)
+        if isinstance(prow, Mapping):
+            locked_prefs[uid] = dict(prow)
+
+    # Per-owner account model policy & credential availability check for successor_model
+    if successor:
+        owners_receiving_successor: set[str] = {str(a["user_id"]) for a in refs["automations"]}
+        if not clear_subagent_model:
+            owners_receiving_successor.update(str(r["user_id"]) for r in refs["user_subagents"])
+            owners_receiving_successor.update(str(r["user_id"]) for r in refs["plugin_subagents"])
+        if migrate_user_defaults:
+            owners_receiving_successor.update(str(u["user_id"]) for u in refs["user_preferences"])
+        for uid in sorted(owners_receiving_successor):
+            await _validate_successor_for_owner(
+                conn,
+                owner_id=uid,
+                successor=successor,
+                post_compiled=post_compiled,
+                owner_pref=locked_prefs.get(uid),
+            )
+
+    # 1. Optional one-click migration of user_preferences default slots (FIRST, while user_preferences is locked, BEFORE automations)
+    if migrate_user_defaults and successor and refs["user_preferences"]:
+        successor_entry = post_compiled.model_config.get_model_config(successor) or {}
+        rb = reasoning_block(successor_entry)
+        efforts = rb.get("efforts") or []
+        default_eff = rb.get("default")
+        for up in sorted(refs["user_preferences"], key=lambda item: str(item["user_id"])):
+            uid = str(up["user_id"])
+            live_pref = locked_prefs.get(uid) or up
+            mp = copy.deepcopy(live_pref.get("model_preference") or {})
+            ap = copy.deepcopy(live_pref.get("agent_preference") or {})
+            before_vals: dict[str, Any] = {}
+            after_vals: dict[str, Any] = {}
+            for sk in _USER_PREF_SLOT_KEYS:
+                if mp.get(sk) == retired_key:
+                    before_vals[f"model_preference.{sk}"] = retired_key
+                    mp[sk] = successor
+                    after_vals[f"model_preference.{sk}"] = successor
+            profiles = mp.get("profiles")
+            if isinstance(profiles, dict) and isinstance(profiles.get(successor), dict):
+                raw_eff = profiles[successor].get("reasoning_effort")
+                if raw_eff:
+                    profiles[successor]["reasoning_effort"] = (
+                        clamp_reasoning_effort(efforts, default_eff, raw_eff) if efforts else None
+                    )
+            sub_models = ap.get("subagent_models")
+            if isinstance(sub_models, dict):
+                for sname, smodel in list(sub_models.items()):
+                    if smodel == retired_key:
+                        before_vals[f"agent_preference.subagent_models.{sname}"] = retired_key
+                        sub_models[sname] = successor
+                        after_vals[f"agent_preference.subagent_models.{sname}"] = successor
+            if before_vals:
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        """
+                        UPDATE user_preferences
+                        SET model_preference = %s,
+                            agent_preference = %s,
+                            updated_at = NOW()
+                        WHERE user_id = %s
+                        RETURNING updated_at
+                        """,
+                        (Json(mp), Json(ap), uid),
+                    )
+                    upd = await cur.fetchone()
+                    if upd:
+                        affected_pref_users.add(uid)
+                        if uid in locked_prefs:
+                            locked_prefs[uid]["model_preference"] = mp
+                            locked_prefs[uid]["agent_preference"] = ap
+                        side_effects.append(
+                            {
+                                "kind": "user_preference",
+                                "id": uid,
+                                "user_id": uid,
+                                "before": before_vals,
+                                "after": after_vals,
+                                "before_updated_at": _ts_str(live_pref.get("updated_at") or up.get("updated_at")),
+                                "after_updated_at": _ts_str(upd["updated_at"]),
+                            }
+                        )
+
+    # 2. Automations: lock in sorted user_id order (strictly AFTER catalog exclusive lock and user_preferences lock)
     if refs["automations"]:
         assert successor is not None
         successor_entry = post_compiled.model_config.get_model_config(successor) or {}
@@ -1183,58 +1601,68 @@ async def _validate_and_replace_references_in_tx(
         efforts = rb.get("efforts") or []
         default_eff = rb.get("default")
 
-        for owner_id in sorted({a["user_id"] for a in refs["automations"]}):
+        for owner_id in sorted({str(a["user_id"]) for a in refs["automations"]}):
             await auto_db.lock_user_automations(owner_id, conn=conn)
 
-        for auto in refs["automations"]:
-            owner_id = auto["user_id"]
+        for auto in sorted(refs["automations"], key=lambda a: (str(a["user_id"]), str(a["automation_id"]))):
+            owner_id = str(auto["user_id"])
             ws_id = auto.get("workspace_id")
             # Per-owner Claude Code hosted workspace constraint check
             await check_claude_code_hosted(owner_id, successor, ws_id, conn, None)
-            old_effort = auto.get("reasoning_effort")
+
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    f"""
+                    SELECT {auto_db.AUTOMATION_COLUMNS}, audit_history
+                    FROM automations
+                    WHERE automation_id = %s::uuid
+                      AND deleted_at IS NULL
+                    FOR UPDATE
+                    """,
+                    (auto["automation_id"],),
+                )
+                locked_row = await cur.fetchone()
+            if not locked_row:
+                continue
+
+            old_effort = locked_row.get("reasoning_effort")
             if old_effort:
                 new_effort = clamp_reasoning_effort(efforts, default_eff, old_effort) if efforts else None
             else:
                 new_effort = None
 
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    UPDATE automations
-                    SET llm_model = %s,
-                        reasoning_effort = %s,
-                        config_version = config_version + 1,
-                        updated_at = NOW()
-                    WHERE automation_id = %s::uuid
-                      AND deleted_at IS NULL
-                    RETURNING config_version, updated_at
-                    """,
-                    (successor, new_effort, auto["automation_id"]),
+            updated = await _update_automation_model_with_history_in_tx(
+                conn,
+                locked_row=locked_row,
+                target_model=successor,
+                target_effort=new_effort,
+                actor_user_id=actor_user_id,
+                pref_row=locked_prefs.get(owner_id),
+                now_iso=now_iso,
+            )
+            if updated:
+                side_effects.append(
+                    {
+                        "kind": "automation",
+                        "id": str(locked_row["automation_id"]),
+                        "user_id": owner_id,
+                        "before": {
+                            "llm_model": locked_row["llm_model"],
+                            "reasoning_effort": old_effort,
+                        },
+                        "after": {
+                            "llm_model": successor,
+                            "reasoning_effort": new_effort,
+                        },
+                        "before_config_version": int(locked_row["config_version"]),
+                        "after_config_version": int(updated["config_version"]),
+                    }
                 )
-                updated = await cur.fetchone()
-                if updated:
-                    side_effects.append(
-                        {
-                            "kind": "automation",
-                            "id": auto["automation_id"],
-                            "user_id": owner_id,
-                            "before": {
-                                "llm_model": auto["llm_model"],
-                                "reasoning_effort": old_effort,
-                            },
-                            "after": {
-                                "llm_model": successor,
-                                "reasoning_effort": new_effort,
-                            },
-                            "before_config_version": int(auto["config_version"]),
-                            "after_config_version": int(updated["config_version"]),
-                        }
-                    )
 
-    # 2. User subagents & plugin subagents (lock user_subagents per user in sorted order)
+    # 3. User subagents & plugin subagents (lock user_subagents per user in sorted order)
     sub_users = sorted(
-        {r["user_id"] for r in refs["user_subagents"]}
-        | {r["user_id"] for r in refs["plugin_subagents"]}
+        {str(r["user_id"]) for r in refs["user_subagents"]}
+        | {str(r["user_id"]) for r in refs["plugin_subagents"]}
     )
     for uid in sub_users:
         await lock_user_subagents(uid, conn=conn)
@@ -1302,64 +1730,6 @@ async def _validate_and_replace_references_in_tx(
                         "after_updated_at": _ts_str(upd["updated_at"]),
                     }
                 )
-
-    # 3. Optional one-click migration of user_preferences default slots
-    if migrate_user_defaults and successor and refs["user_preferences"]:
-        successor_entry = post_compiled.model_config.get_model_config(successor) or {}
-        rb = reasoning_block(successor_entry)
-        efforts = rb.get("efforts") or []
-        default_eff = rb.get("default")
-        for up in refs["user_preferences"]:
-            mp = copy.deepcopy(up["model_preference"])
-            ap = copy.deepcopy(up["agent_preference"])
-            before_vals: dict[str, Any] = {}
-            after_vals: dict[str, Any] = {}
-            for sk in _USER_PREF_SLOT_KEYS:
-                if mp.get(sk) == retired_key:
-                    before_vals[f"model_preference.{sk}"] = retired_key
-                    mp[sk] = successor
-                    after_vals[f"model_preference.{sk}"] = successor
-            profiles = mp.get("profiles")
-            if isinstance(profiles, dict) and isinstance(profiles.get(successor), dict):
-                raw_eff = profiles[successor].get("reasoning_effort")
-                if raw_eff:
-                    profiles[successor]["reasoning_effort"] = (
-                        clamp_reasoning_effort(efforts, default_eff, raw_eff) if efforts else None
-                    )
-            sub_models = ap.get("subagent_models")
-            if isinstance(sub_models, dict):
-                for sname, smodel in list(sub_models.items()):
-                    if smodel == retired_key:
-                        before_vals[f"agent_preference.subagent_models.{sname}"] = retired_key
-                        sub_models[sname] = successor
-                        after_vals[f"agent_preference.subagent_models.{sname}"] = successor
-            if before_vals:
-                async with conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(
-                        """
-                        UPDATE user_preferences
-                        SET model_preference = %s,
-                            agent_preference = %s,
-                            updated_at = NOW()
-                        WHERE user_id = %s
-                        RETURNING updated_at
-                        """,
-                        (Json(mp), Json(ap), up["user_id"]),
-                    )
-                    upd = await cur.fetchone()
-                    if upd:
-                        affected_pref_users.add(up["user_id"])
-                        side_effects.append(
-                            {
-                                "kind": "user_preference",
-                                "id": up["user_id"],
-                                "user_id": up["user_id"],
-                                "before": before_vals,
-                                "after": after_vals,
-                                "before_updated_at": up["updated_at"],
-                                "after_updated_at": _ts_str(upd["updated_at"]),
-                            }
-                        )
 
     return side_effects, affected_pref_users
 
@@ -1442,6 +1812,7 @@ async def retire_catalog_model(
                 post_compiled=post_compiled,
                 migrate_user_defaults=data.migrate_user_defaults,
                 clear_subagent_model=data.clear_subagent_model,
+                actor_user_id=actor_user_id,
             )
 
             saved = await save_catalog_revision(
@@ -1821,208 +2192,258 @@ async def rollback_catalog(
 
             target_active_models = set((target_compiled.model_config.llm_config or {}).keys())
             rollback_side_effects: list[dict[str, Any]] = []
+            now_iso = datetime.now(timezone.utc).isoformat()
 
-            for (ekind, eid), hops_oldest_first in chains.items():
+            from src.server.database import automation as auto_db
+            from src.server.database.user import lock_user_preferences
+            from src.server.database.user_subagents import lock_user_subagents
+
+            pref_chains = sorted(
+                ((eid, hops) for (ekind, eid), hops in chains.items() if ekind == "user_preference"),
+                key=lambda item: item[0],
+            )
+            auto_chains = sorted(
+                ((eid, hops) for (ekind, eid), hops in chains.items() if ekind == "automation"),
+                key=lambda item: item[0],
+            )
+            sub_chains = sorted(
+                (
+                    (ekind, eid, hops)
+                    for (ekind, eid), hops in chains.items()
+                    if ekind in ("user_subagent", "plugin_subagent")
+                ),
+                key=lambda item: (item[0], item[1]),
+            )
+
+            # Canonical lock order (strictly AFTER catalog exclusive lock, matching automation.py):
+            #   1. user_preferences (sorted user_id) -> 2. automations (sorted user_id, automation_id) -> 3. user_subagents (sorted user_id)
+            pref_lock_uids: set[str] = {eid for eid, _ in pref_chains}
+            for _eid, hops in auto_chains:
+                for hop in hops:
+                    uid = str(hop.get("user_id") or "").strip()
+                    if uid:
+                        pref_lock_uids.add(uid)
+            locked_prefs: dict[str, dict[str, Any]] = {}
+            for uid in sorted(pref_lock_uids):
+                prow = await lock_user_preferences(uid, conn=conn)
+                if isinstance(prow, Mapping):
+                    locked_prefs[uid] = dict(prow)
+
+            # 1. Restore user_preferences FIRST (before touching automations)
+            for eid, hops_oldest_first in pref_chains:
                 hops_newest_first = list(reversed(hops_oldest_first))
-                if ekind == "automation":
-                    async with conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute(
-                            """
-                            SELECT automation_id::text AS automation_id, user_id,
-                                   llm_model, reasoning_effort, config_version
-                            FROM automations
-                            WHERE automation_id = %s::uuid AND deleted_at IS NULL
-                            FOR UPDATE
-                            """,
-                            (eid,),
-                        )
-                        arow = await cur.fetchone()
-                    if not arow:
-                        continue
-                    restore_before, skip_reason = resolve_chained_side_effect_target(
-                        hops_newest_first,
-                        current_version=arow["config_version"],
-                        version_kind="config_version",
+                prow = locked_prefs.get(eid)
+                if not prow:
+                    continue
+                mp = copy.deepcopy(prow.get("model_preference") or {})
+                ap = copy.deepcopy(prow.get("agent_preference") or {})
+                newest_after = hops_newest_first[0].get("after") or {}
+                cur_vals: dict[str, Any] = {}
+                for path in newest_after:
+                    if path.startswith("model_preference."):
+                        cur_vals[path] = mp.get(path.split(".", 1)[1])
+                    elif path.startswith("agent_preference.subagent_models."):
+                        sname = path.split(".", 2)[2]
+                        cur_vals[path] = (ap.get("subagent_models") or {}).get(sname)
+                restore_before, skip_reason = resolve_chained_side_effect_target(
+                    hops_newest_first,
+                    current_version=_ts_str(prow.get("updated_at")),
+                    current_value=cur_vals,
+                    version_kind="updated_at",
+                )
+                if restore_before is None:
+                    skipped_user_modified.append(
+                        {"kind": "user_preference", "id": eid, "user_id": eid, "reason": skip_reason}
                     )
-                    if restore_before is None:
-                        skipped_user_modified.append(
-                            {
-                                "kind": "automation",
-                                "id": eid,
-                                "user_id": str(arow["user_id"]),
-                                "reason": skip_reason,
-                            }
-                        )
+                    continue
+                for path, old_val in restore_before.items():
+                    if old_val and old_val not in target_active_models:
                         continue
-                    target_model = restore_before.get("llm_model")
-                    if target_model and target_model not in target_active_models:
-                        skipped_user_modified.append(
-                            {
-                                "kind": "automation",
-                                "id": eid,
-                                "user_id": str(arow["user_id"]),
-                                "reason": "target_model_unavailable_in_target_revision",
-                            }
-                        )
-                        continue
-                    target_eff = restore_before.get("reasoning_effort")
-                    async with conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute(
-                            """
-                            UPDATE automations
-                            SET llm_model = %s,
-                                reasoning_effort = %s,
-                                config_version = config_version + 1,
-                                updated_at = NOW()
-                            WHERE automation_id = %s::uuid
-                            RETURNING config_version
-                            """,
-                            (target_model, target_eff, eid),
-                        )
-                        upd = await cur.fetchone()
-                    if upd:
-                        item = {
+                    if path.startswith("model_preference."):
+                        mp[path.split(".", 1)[1]] = old_val
+                    elif path.startswith("agent_preference.subagent_models."):
+                        sname = path.split(".", 2)[2]
+                        ap.setdefault("subagent_models", {})[sname] = old_val
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        """
+                        UPDATE user_preferences
+                        SET model_preference = %s, agent_preference = %s, updated_at = NOW()
+                        WHERE user_id = %s RETURNING updated_at
+                        """,
+                        (Json(mp), Json(ap), eid),
+                    )
+                    upd = await cur.fetchone()
+                if upd:
+                    affected_pref_users.add(eid)
+                    locked_prefs[eid]["model_preference"] = mp
+                    locked_prefs[eid]["agent_preference"] = ap
+                    item = {
+                        "kind": "user_preference",
+                        "id": eid,
+                        "user_id": eid,
+                        "before": cur_vals,
+                        "after": restore_before,
+                        "before_updated_at": _ts_str(prow.get("updated_at")),
+                        "after_updated_at": _ts_str(upd["updated_at"]),
+                    }
+                    restored_tasks.append(item)
+                    rollback_side_effects.append(item)
+
+            # 2. Restore automations SECOND (with full audit_history & active_version maintenance)
+            auto_owner_ids = sorted(
+                {
+                    str(hop.get("user_id") or "").strip()
+                    for _eid, hops in auto_chains
+                    for hop in hops
+                    if str(hop.get("user_id") or "").strip()
+                }
+            )
+            for owner_id in auto_owner_ids:
+                await auto_db.lock_user_automations(owner_id, conn=conn)
+
+            for eid, hops_oldest_first in auto_chains:
+                hops_newest_first = list(reversed(hops_oldest_first))
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        f"""
+                        SELECT {auto_db.AUTOMATION_COLUMNS}, audit_history
+                        FROM automations
+                        WHERE automation_id = %s::uuid AND deleted_at IS NULL
+                        FOR UPDATE
+                        """,
+                        (eid,),
+                    )
+                    arow = await cur.fetchone()
+                if not arow:
+                    continue
+                restore_before, skip_reason = resolve_chained_side_effect_target(
+                    hops_newest_first,
+                    current_version=arow["config_version"],
+                    version_kind="config_version",
+                )
+                if restore_before is None:
+                    skipped_user_modified.append(
+                        {
                             "kind": "automation",
                             "id": eid,
                             "user_id": str(arow["user_id"]),
-                            "before": {
-                                "llm_model": arow["llm_model"],
-                                "reasoning_effort": arow["reasoning_effort"],
-                            },
-                            "after": {
-                                "llm_model": target_model,
-                                "reasoning_effort": target_eff,
-                            },
-                            "before_config_version": int(arow["config_version"]),
-                            "after_config_version": int(upd["config_version"]),
+                            "reason": skip_reason,
                         }
-                        restored_tasks.append(item)
-                        rollback_side_effects.append(item)
-
-                elif ekind in ("user_subagent", "plugin_subagent"):
-                    tbl = "user_subagents" if ekind == "user_subagent" else "plugin_subagents"
-                    id_col = "user_subagent_id" if ekind == "user_subagent" else "plugin_subagent_id"
-                    async with conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute(
-                            f"SELECT {id_col}::text AS id, user_id, fields, updated_at "
-                            f"FROM {tbl} WHERE {id_col} = %s::uuid FOR UPDATE",
-                            (eid,),
-                        )
-                        srow = await cur.fetchone()
-                    if not srow:
-                        continue
-                    cur_fields = dict(srow.get("fields") or {})
-                    restore_before, skip_reason = resolve_chained_side_effect_target(
-                        hops_newest_first,
-                        current_version=_ts_str(srow.get("updated_at")),
-                        current_value={"model": cur_fields.get("model")},
-                        version_kind="updated_at",
                     )
-                    if restore_before is None:
-                        skipped_user_modified.append(
-                            {"kind": ekind, "id": eid, "user_id": str(srow["user_id"]), "reason": skip_reason}
-                        )
-                        continue
-                    target_model = restore_before.get("model")
-                    if target_model and target_model not in target_active_models:
-                        skipped_user_modified.append(
-                            {
-                                "kind": ekind,
-                                "id": eid,
-                                "user_id": str(srow["user_id"]),
-                                "reason": "target_model_unavailable_in_target_revision",
-                            }
-                        )
-                        continue
-                    new_fields = copy.deepcopy(cur_fields)
-                    if target_model is None:
-                        new_fields.pop("model", None)
-                    else:
-                        new_fields["model"] = target_model
-                    async with conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute(
-                            f"UPDATE {tbl} SET fields = %s, updated_at = NOW() "
-                            f"WHERE {id_col} = %s::uuid RETURNING updated_at",
-                            (Json(new_fields), eid),
-                        )
-                        upd = await cur.fetchone()
-                    if upd:
-                        item = {
+                    continue
+                target_model = restore_before.get("llm_model")
+                if target_model and target_model not in target_active_models:
+                    skipped_user_modified.append(
+                        {
+                            "kind": "automation",
+                            "id": eid,
+                            "user_id": str(arow["user_id"]),
+                            "reason": "target_model_unavailable_in_target_revision",
+                        }
+                    )
+                    continue
+                target_eff = restore_before.get("reasoning_effort")
+                upd = await _update_automation_model_with_history_in_tx(
+                    conn,
+                    locked_row=arow,
+                    target_model=target_model,
+                    target_effort=target_eff,
+                    actor_user_id=actor_user_id,
+                    pref_row=locked_prefs.get(str(arow["user_id"])),
+                    now_iso=now_iso,
+                )
+                if upd:
+                    item = {
+                        "kind": "automation",
+                        "id": eid,
+                        "user_id": str(arow["user_id"]),
+                        "before": {
+                            "llm_model": arow["llm_model"],
+                            "reasoning_effort": arow["reasoning_effort"],
+                        },
+                        "after": {
+                            "llm_model": target_model,
+                            "reasoning_effort": target_eff,
+                        },
+                        "before_config_version": int(arow["config_version"]),
+                        "after_config_version": int(upd["config_version"]),
+                    }
+                    restored_tasks.append(item)
+                    rollback_side_effects.append(item)
+
+            # 3. Restore user_subagents & plugin_subagents THIRD
+            sub_owner_ids = sorted(
+                {
+                    str(hop.get("user_id") or "").strip()
+                    for _ekind, _eid, hops in sub_chains
+                    for hop in hops
+                    if str(hop.get("user_id") or "").strip()
+                }
+            )
+            for uid in sub_owner_ids:
+                await lock_user_subagents(uid, conn=conn)
+
+            for ekind, eid, hops_oldest_first in sub_chains:
+                hops_newest_first = list(reversed(hops_oldest_first))
+                tbl = "user_subagents" if ekind == "user_subagent" else "plugin_subagents"
+                id_col = "user_subagent_id" if ekind == "user_subagent" else "plugin_subagent_id"
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        f"SELECT {id_col}::text AS id, user_id, fields, updated_at "
+                        f"FROM {tbl} WHERE {id_col} = %s::uuid FOR UPDATE",
+                        (eid,),
+                    )
+                    srow = await cur.fetchone()
+                if not srow:
+                    continue
+                cur_fields = dict(srow.get("fields") or {})
+                restore_before, skip_reason = resolve_chained_side_effect_target(
+                    hops_newest_first,
+                    current_version=_ts_str(srow.get("updated_at")),
+                    current_value={"model": cur_fields.get("model")},
+                    version_kind="updated_at",
+                )
+                if restore_before is None:
+                    skipped_user_modified.append(
+                        {"kind": ekind, "id": eid, "user_id": str(srow["user_id"]), "reason": skip_reason}
+                    )
+                    continue
+                target_model = restore_before.get("model")
+                if target_model and target_model not in target_active_models:
+                    skipped_user_modified.append(
+                        {
                             "kind": ekind,
                             "id": eid,
                             "user_id": str(srow["user_id"]),
-                            "before": {"model": cur_fields.get("model")},
-                            "after": {"model": target_model},
-                            "before_updated_at": _ts_str(srow.get("updated_at")),
-                            "after_updated_at": _ts_str(upd["updated_at"]),
+                            "reason": "target_model_unavailable_in_target_revision",
                         }
-                        restored_tasks.append(item)
-                        rollback_side_effects.append(item)
-
-                elif ekind == "user_preference":
-                    async with conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute(
-                            """
-                            SELECT user_id, model_preference, agent_preference, updated_at
-                            FROM user_preferences WHERE user_id = %s FOR UPDATE
-                            """,
-                            (eid,),
-                        )
-                        prow = await cur.fetchone()
-                    if not prow:
-                        continue
-                    mp = copy.deepcopy(prow.get("model_preference") or {})
-                    ap = copy.deepcopy(prow.get("agent_preference") or {})
-                    newest_after = hops_newest_first[0].get("after") or {}
-                    cur_vals: dict[str, Any] = {}
-                    for path in newest_after:
-                        if path.startswith("model_preference."):
-                            cur_vals[path] = mp.get(path.split(".", 1)[1])
-                        elif path.startswith("agent_preference.subagent_models."):
-                            sname = path.split(".", 2)[2]
-                            cur_vals[path] = (ap.get("subagent_models") or {}).get(sname)
-                    restore_before, skip_reason = resolve_chained_side_effect_target(
-                        hops_newest_first,
-                        current_version=_ts_str(prow.get("updated_at")),
-                        current_value=cur_vals,
-                        version_kind="updated_at",
                     )
-                    if restore_before is None:
-                        skipped_user_modified.append(
-                            {"kind": "user_preference", "id": eid, "user_id": eid, "reason": skip_reason}
-                        )
-                        continue
-                    for path, old_val in restore_before.items():
-                        if old_val and old_val not in target_active_models:
-                            continue
-                        if path.startswith("model_preference."):
-                            mp[path.split(".", 1)[1]] = old_val
-                        elif path.startswith("agent_preference.subagent_models."):
-                            sname = path.split(".", 2)[2]
-                            ap.setdefault("subagent_models", {})[sname] = old_val
-                    async with conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute(
-                            """
-                            UPDATE user_preferences
-                            SET model_preference = %s, agent_preference = %s, updated_at = NOW()
-                            WHERE user_id = %s RETURNING updated_at
-                            """,
-                            (Json(mp), Json(ap), eid),
-                        )
-                        upd = await cur.fetchone()
-                    if upd:
-                        affected_pref_users.add(eid)
-                        item = {
-                            "kind": "user_preference",
-                            "id": eid,
-                            "user_id": eid,
-                            "before": cur_vals,
-                            "after": restore_before,
-                            "before_updated_at": _ts_str(prow.get("updated_at")),
-                            "after_updated_at": _ts_str(upd["updated_at"]),
-                        }
-                        restored_tasks.append(item)
-                        rollback_side_effects.append(item)
+                    continue
+                new_fields = copy.deepcopy(cur_fields)
+                if target_model is None:
+                    new_fields.pop("model", None)
+                else:
+                    new_fields["model"] = target_model
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        f"UPDATE {tbl} SET fields = %s, updated_at = NOW() "
+                        f"WHERE {id_col} = %s::uuid RETURNING updated_at",
+                        (Json(new_fields), eid),
+                    )
+                    upd = await cur.fetchone()
+                if upd:
+                    item = {
+                        "kind": ekind,
+                        "id": eid,
+                        "user_id": str(srow["user_id"]),
+                        "before": {"model": cur_fields.get("model")},
+                        "after": {"model": target_model},
+                        "before_updated_at": _ts_str(srow.get("updated_at")),
+                        "after_updated_at": _ts_str(upd["updated_at"]),
+                    }
+                    restored_tasks.append(item)
+                    rollback_side_effects.append(item)
 
             # STEP 3: Post-restore 6-source reference check for dropped models
             dropped_keys = set((cur_compiled.model_config.llm_config or {}).keys()) - target_active_models
@@ -2071,6 +2492,7 @@ async def rollback_catalog(
                             successor_model=succ,
                             refs=d_refs,
                             post_compiled=target_compiled,
+                            actor_user_id=actor_user_id,
                         )
                         rollback_side_effects.extend(extra_se)
                         affected_pref_users.update(extra_pref_users)

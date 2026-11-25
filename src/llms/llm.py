@@ -1759,7 +1759,9 @@ def get_llm_by_type(llm_type: str) -> BaseChatModel:
         raise ValueError(f"Unknown LLM type or model: {llm_type}. Error: {e}")
 
 
-def get_configured_llm_models() -> dict[str, list[str]]:
+def get_configured_llm_models(
+    model_config: ModelConfig | None = None,  # DALTON-HOOK(team-model-catalog): allow deriving from a pinned compiled ModelConfig
+) -> dict[str, list[str]]:
     """
     Get listed LLM models grouped by the provider each is listed under.
 
@@ -1771,7 +1773,7 @@ def get_configured_llm_models() -> dict[str, list[str]]:
         Dictionary mapping that provider to list of listed model names.
     """
     try:
-        config = LLM.get_model_config()  # singleton — no disk I/O
+        config = model_config if model_config is not None else LLM.get_model_config()  # DALTON-HOOK(team-model-catalog)
         models: dict[str, list[str]] = {}
 
         for model_name, model_info in config.listed_models():

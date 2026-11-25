@@ -805,6 +805,12 @@ async def astream_ptc_workflow(
                         # Per attempt, since a retry or an automation's turn may
                         # run another model than the turn's query row recorded.
                         **({"llm_model": effective_model} if effective_model else {}),
+                        # DALTON-HOOK(team-model-catalog): include configured fallback_models so turn START snapshot covers fallbacks
+                        **(
+                            {"fallback_models": list(config.llm.fallback)}
+                            if config and getattr(config, "llm", None) and getattr(config.llm, "fallback", None)
+                            else {}
+                        ),
                         **firing,
                         **home.run_metadata(),
                         **identity.stamp(run_metadata),
@@ -1410,6 +1416,12 @@ async def astream_ptc_workflow(
                     min_age_s=TURN_MEASURE_MIN_INTERVAL_SECONDS,
                 )
 
+        # DALTON-HOOK(team-model-catalog): bind persisted turn effective_catalog_snapshot across
+        # the entire background workflow task (LLM client rebuilds, MultimodalStripMiddleware, credit gate).
+        from src.dalton.services.team_model_catalog.snapshot import (
+            run_with_catalog_snapshot,
+        )
+
         # Start workflow in background with event buffering
         await manager.start_run(
             thread_id=thread_id,
@@ -1417,23 +1429,26 @@ async def astream_ptc_workflow(
             # The project is bound outermost, in the run's own task: a graph
             # node runs in a task created from the caller's context, so a
             # ContextVar set inside the graph would not reach the next node.
-            workflow_generator=run_with_project(
-                project,
-                run_with_credit_gate(
-                    credit_gate,
-                    # A Mac the turn runs on stays out of idle sleep until the
-                    # turn ends, between its calls as well as in them.
-                    held_awake(
-                        lambda: getattr(getattr(session, "sandbox", None), "runtime", None),
-                        # Relay sessions for direct tools open and close with the
-                        # run, in the run's task, not with this request's generator.
-                        direct_mcp.drive(
-                            handler.stream_workflow(
-                                graph=ptc_graph,
-                                input_state=input_state,
-                                config=graph_config,
-                                settled_results=cancelled_calls,
-                            )
+            workflow_generator=run_with_catalog_snapshot(
+                getattr(run_handle, "catalog_snapshot", None),
+                run_with_project(
+                    project,
+                    run_with_credit_gate(
+                        credit_gate,
+                        # A Mac the turn runs on stays out of idle sleep until the
+                        # turn ends, between its calls as well as in them.
+                        held_awake(
+                            lambda: getattr(getattr(session, "sandbox", None), "runtime", None),
+                            # Relay sessions for direct tools open and close with the
+                            # run, in the run's task, not with this request's generator.
+                            direct_mcp.drive(
+                                handler.stream_workflow(
+                                    graph=ptc_graph,
+                                    input_state=input_state,
+                                    config=graph_config,
+                                    settled_results=cancelled_calls,
+                                )
+                            ),
                         ),
                     ),
                 ),
