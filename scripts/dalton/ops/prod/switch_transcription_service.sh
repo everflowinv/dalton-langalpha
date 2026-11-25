@@ -223,77 +223,12 @@ check_transcription_runtime_config() {
     echo "ERROR: Cannot verify transcription adapter config: Python binary not executable ($py_bin)." >&2
     return 1
   fi
-  "$py_bin" - "$REPO_ROOT" "$TRANSCRIPTION_PLIST" "$TRANSCRIPTION_ENV_FILE" <<'PY'
-import os
-import plistlib
-import sys
-from pathlib import Path
-
-repo_root = Path(sys.argv[1]).resolve()
-plist_path = Path(sys.argv[2])
-env_file_path = Path(sys.argv[3])
-
-for p in (str(repo_root), str(repo_root / "src")):
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
-from src.dalton.transcription_service.worker_registry import validate_worker_startup_config
-
-def parse_env_file(path: Path) -> dict[str, str]:
-    vals: dict[str, str] = {}
-    if not path.is_file():
-        return vals
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        k, v = line.split("=", 1)
-        k = k.strip()
-        v = v.strip()
-        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
-            v = v[1:-1]
-        if k:
-            vals[k] = v
-    return vals
-
-plist_env: dict[str, str] = {}
-if plist_path.is_file():
-    try:
-        with plist_path.open("rb") as fh:
-            data = plistlib.load(fh)
-        raw_env = data.get("EnvironmentVariables") or {}
-        if isinstance(raw_env, dict):
-            for k, v in raw_env.items():
-                sv = str(v or "").strip()
-                if sv and not any(tok in sv for tok in ("__PYTHON_BIN__", "__REPO__", "__HOME__", "__LOG_DIR__")):
-                    plist_env[str(k)] = sv
-    except Exception:
-        pass
-
-# Match src/dalton/transcription_service/__main__.py precedence:
-# explicit process env (plist EnvironmentVariables) overrides env file.
-merged_env = parse_env_file(env_file_path)
-merged_env.update(plist_env)
-if "PATH" not in merged_env and os.environ.get("PATH"):
-    merged_env["PATH"] = os.environ["PATH"]
-
-validation = validate_worker_startup_config(environ=merged_env)
-if not validation.ok:
-    missing_csv = ", ".join(validation.missing_config)
-    print(
-        f"ERROR: Transcription runtime pre-check failed (adapter={validation.adapter}, "
-        f"worker_mode={validation.worker_mode}): missing required configuration: {missing_csv}",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-print(
-    f"TRANSCRIPTION_ADAPTER:  OK (adapter={validation.adapter}, "
-    f"worker_mode={validation.worker_mode}, ffmpeg=OK, ffprobe=OK)"
-)
-PY
+  PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+    "$py_bin" -m src.dalton.transcription_service.preflight \
+    --check-runtime \
+    --repo-root "$REPO_ROOT" \
+    --plist "$TRANSCRIPTION_PLIST" \
+    --env-file "$TRANSCRIPTION_ENV_FILE"
 }
 
 check_plist_installed() {
@@ -312,96 +247,15 @@ resolve_side_paths() {
   local side="$1"
   local plist_file="$2"
   local env_file="$3"
-  python3 - "$side" "$plist_file" "$env_file" "$REPO_ROOT" "${DALTON_ASR_JOBS_DIR:-}" "${DALTON_ASR_USAGE_FILE:-}" <<'PY'
-import os
-import plistlib
-import sys
-from pathlib import Path
-
-side, plist_raw, env_raw, repo_raw, shell_jobs, shell_usage = sys.argv[1:7]
-plist_path = Path(plist_raw)
-env_path = Path(env_raw)
-repo_root = Path(repo_raw).resolve()
-
-PLACEHOLDERS = ("__PYTHON_BIN__", "__REPO__", "__REPO_ROOT__", "__HOME__", "__LOG_DIR__")
-
-def is_placeholder(val: str) -> bool:
-    return any(tok in val for tok in PLACEHOLDERS)
-
-def parse_env_file(path: Path) -> dict[str, str]:
-    vals: dict[str, str] = {}
-    if not path.is_file():
-        return vals
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        k, v = line.split("=", 1)
-        k = k.strip()
-        v = v.strip()
-        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
-            v = v[1:-1]
-        if k:
-            vals[k] = v
-    return vals
-
-plist_env: dict[str, str] = {}
-service_repo = repo_root
-if plist_path.is_file():
-    try:
-        with plist_path.open("rb") as fh:
-            data = plistlib.load(fh)
-        raw_env = data.get("EnvironmentVariables") or {}
-        if isinstance(raw_env, dict):
-            for k, v in raw_env.items():
-                sv = str(v or "").strip()
-                if sv and not is_placeholder(sv):
-                    plist_env[str(k)] = sv
-        if side == "bridge":
-            prog_args = data.get("ProgramArguments") or []
-            if len(prog_args) >= 2:
-                script_cand = str(prog_args[1] or "").strip()
-                if script_cand and not is_placeholder(script_cand):
-                    sp = Path(script_cand).expanduser()
-                    if sp.name == "researchdata_bridge.py" and len(sp.parents) >= 3:
-                        service_repo = sp.parents[2]
-        else:
-            wd = str(data.get("WorkingDirectory") or "").strip()
-            if wd and not is_placeholder(wd):
-                service_repo = Path(wd).expanduser()
-    except Exception:
-        pass
-
-env_vals = parse_env_file(env_path)
-
-# Startup precedence matches both services: plist EnvironmentVariables > service env file > default.
-jobs_raw = (
-    plist_env.get("DALTON_ASR_JOBS_DIR")
-    or env_vals.get("DALTON_ASR_JOBS_DIR")
-    or shell_jobs.strip()
-    or str(service_repo / "var" / "dalton" / "asr_jobs")
-)
-jobs_path = Path(jobs_raw).expanduser()
-if not jobs_path.is_absolute():
-    jobs_path = service_repo / jobs_path
-jobs_norm = os.path.realpath(str(jobs_path))
-
-usage_raw = (
-    plist_env.get("DALTON_ASR_USAGE_FILE")
-    or env_vals.get("DALTON_ASR_USAGE_FILE")
-    or shell_usage.strip()
-    or str(Path(jobs_norm) / "asr_usage.jsonl")
-)
-usage_path = Path(usage_raw).expanduser()
-if not usage_path.is_absolute():
-    usage_path = service_repo / usage_path
-usage_norm = os.path.realpath(str(usage_path))
-
-print(jobs_norm)
-print(usage_norm)
-PY
+  PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}" \
+    python3 -m src.dalton.transcription_service.preflight \
+    --resolve-paths \
+    --side "$side" \
+    --repo-root "$REPO_ROOT" \
+    --plist "$plist_file" \
+    --env-file "$env_file" \
+    --shell-jobs "${DALTON_ASR_JOBS_DIR:-}" \
+    --shell-usage "${DALTON_ASR_USAGE_FILE:-}"
 }
 
 resolve_jobs_dir() {
@@ -521,10 +375,17 @@ drain_and_wait() {
   fi
   echo "[$label] Sending POST $base_url/transcriptions/drain ..."
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    echo "[dry-run] curl -sf -X POST -H 'Authorization: Bearer <redacted>' $base_url/transcriptions/drain"
+    echo "[dry-run] curl -sf --max-time ${WAIT_SECONDS} -X POST -H 'Authorization: Bearer <redacted>' $base_url/transcriptions/drain"
     return 0
   fi
-  if ! curl -sf -X POST \
+  local post_max_time="$WAIT_SECONDS"
+  if [[ "$post_max_time" -gt 10 ]]; then
+    post_max_time=10
+  fi
+  if [[ "$post_max_time" -lt 1 ]]; then
+    post_max_time=1
+  fi
+  if ! curl -sf --max-time "$post_max_time" -X POST \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
     -d '{"drain":true}' \
@@ -539,15 +400,50 @@ drain_and_wait() {
 
   local deadline=$(( $(date +%s) + WAIT_SECONDS ))
   local last_state="unknown"
+  local polled_once=0
   while true; do
+    local now remaining req_timeout
+    now="$(date +%s)"
+    remaining=$(( deadline - now ))
+    if [[ "$polled_once" -eq 1 && "$remaining" -le 0 ]]; then
+      echo "ERROR: Timed out after ${WAIT_SECONDS}s waiting for $label ready_for_handoff=true and active_jobs=0 (last state: ${last_state})." >&2
+      echo "       $label remains in draining mode. To continue waiting, re-run this script (${ACTION});" >&2
+      echo "       to cancel drain and resume intake, run:" >&2
+      echo "       curl -sf -X POST -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' -d '{\"drain\":false}' ${base_url}/transcriptions/drain" >&2
+      return 1
+    fi
+    req_timeout="$remaining"
+    if [[ "$req_timeout" -gt 10 ]]; then
+      req_timeout=10
+    fi
+    if [[ "$req_timeout" -lt 1 ]]; then
+      req_timeout=1
+    fi
+    polled_once=1
+
     local resp=""
-    if resp="$(curl -sf -H "Authorization: Bearer ${token}" "${base_url}/transcriptions/drain" 2>/dev/null)"; then
-      local active=""
-      if active="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("active_jobs", -1))' "$resp" 2>/dev/null)"; then
-        last_state="active_jobs=${active}"
-        echo "[$label] drain status: active_jobs=${active}"
-        if [[ "$active" == "0" ]]; then
-          echo "[$label] ready for handoff (active_jobs=0)."
+    if resp="$(curl -sf --max-time "$req_timeout" -H "Authorization: Bearer ${token}" "${base_url}/transcriptions/drain" 2>/dev/null)"; then
+      local parsed=""
+      if parsed="$(python3 - "$resp" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+if not isinstance(d, dict):
+    sys.exit(1)
+active = d.get("active_jobs")
+ready = d.get("ready_for_handoff")
+active_valid = isinstance(active, int) and not isinstance(active, bool)
+active_str = str(active) if active_valid else "invalid"
+ready_str = "true" if ready is True else ("false" if ready is False else "invalid")
+is_ready = (ready is True and active_valid and active == 0)
+print(f"{'READY' if is_ready else 'WAIT'} {ready_str} {active_str}")
+PY
+      )"; then
+        local status_tok ready_flag active
+        read -r status_tok ready_flag active <<< "$parsed"
+        last_state="ready_for_handoff=${ready_flag}, active_jobs=${active}"
+        echo "[$label] drain status: ready_for_handoff=${ready_flag}, active_jobs=${active}"
+        if [[ "$status_tok" == "READY" ]]; then
+          echo "[$label] ready for handoff (ready_for_handoff=true, active_jobs=0)."
           return 0
         fi
       else
@@ -559,7 +455,7 @@ drain_and_wait() {
       echo "[$label] WARNING: curl failed while polling ${base_url}/transcriptions/drain; retrying until timeout..." >&2
     fi
     if [[ "$(date +%s)" -ge "$deadline" ]]; then
-      echo "ERROR: Timed out after ${WAIT_SECONDS}s waiting for $label active_jobs to reach 0 (last state: ${last_state})." >&2
+      echo "ERROR: Timed out after ${WAIT_SECONDS}s waiting for $label ready_for_handoff=true and active_jobs=0 (last state: ${last_state})." >&2
       echo "       $label remains in draining mode. To continue waiting, re-run this script (${ACTION});" >&2
       echo "       to cancel drain and resume intake, run:" >&2
       echo "       curl -sf -X POST -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' -d '{\"drain\":false}' ${base_url}/transcriptions/drain" >&2
@@ -608,24 +504,16 @@ show_status_snapshot() {
 }
 
 print_switch_failure_recovery() {
-  local jobs_dir lock_file
-  jobs_dir="$(resolve_jobs_dir)"
-  lock_file="${jobs_dir}/.owner.lock"
   echo >&2
   echo "=== Current Service Status (repo .env and backend container were left unchanged) ===" >&2
   show_status_snapshot >&2
   echo >&2
-  echo "=== Recovery Commands (stop new service, confirm lock released, then re-enable legacy bridge) ===" >&2
+  echo "=== Recovery Commands (use --rollback to drain, wait for active_jobs=0, confirm lock release, and restore legacy bridge) ===" >&2
   cat >&2 <<EOF
-  1. If ${TRANSCRIPTION_LABEL} is loaded, stop it (stop here if bootout fails):
-       if launchctl print "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}" >/dev/null 2>&1; then launchctl bootout "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}"; fi
-  2. Confirm standalone service is stopped and ${lock_file} is released before touching the bridge:
-       ! launchctl print "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}" >/dev/null 2>&1 && ! curl -sf "${TRANSCRIPTION_URL}/healthz" >/dev/null 2>&1 && python3 -c 'import fcntl,os,sys; p=sys.argv[1]; sys.exit(0) if not os.path.exists(p) else None; fh=open(p,"a+"); fcntl.flock(fh.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB); fcntl.flock(fh.fileno(),fcntl.LOCK_UN)' "${lock_file}"
-  3. Only after steps 1 and 2 succeed, re-enable legacy bridge ASR in ${BRIDGE_ENV_FILE} and restart bridge:
-       python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); lines=[l for l in (p.read_text().splitlines() if p.exists() else []) if not l.strip().startswith("DALTON_BRIDGE_ASR_DISABLED=")]; lines.append("DALTON_BRIDGE_ASR_DISABLED=false"); p.write_text("\n".join(lines)+"\n")' "${BRIDGE_ENV_FILE}" && launchctl kickstart -k "${GUI_DOMAIN}/${BRIDGE_LABEL}"
-  4. Verify legacy bridge holds .owner.lock and accepts requests:
-       curl -sf "${BRIDGE_URL}/healthz" | python3 -m json.tool
-  (Or run: bash scripts/dalton/ops/prod/switch_transcription_service.sh --rollback)
+  1. Run rollback so ${TRANSCRIPTION_LABEL} stops accepting new jobs, waits for in-flight jobs to finish, stops safely, and confirms .owner.lock release before re-enabling ${BRIDGE_LABEL}:
+       bash scripts/dalton/ops/prod/switch_transcription_service.sh --rollback --wait-seconds ${WAIT_SECONDS}
+  2. Verify post-rollback health and lock ownership:
+       bash scripts/dalton/ops/prod/switch_transcription_service.sh --check
 EOF
 }
 
@@ -742,8 +630,13 @@ PY
     fi
 
     echo "=== Step 3/4: Start standalone com.dalton.transcription (:8965) and verify lock, auth, and historical read ==="
-    if launchctl print "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}" >/dev/null 2>&1; then
-      if ! run_cmd launchctl kickstart -k "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}"; then
+    ts_agent_state="$(launchagent_state "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}")"
+    ts_already_running=0
+    if [[ "$ts_agent_state" == "running" ]]; then
+      ts_already_running=1
+      echo "${TRANSCRIPTION_LABEL} is already loaded and running; verifying /healthz, auth, and historical job without restarting."
+    elif [[ "$ts_agent_state" == "loaded_stopped" ]]; then
+      if ! run_cmd launchctl kickstart "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}"; then
         echo "ERROR: launchctl kickstart failed for ${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}." >&2
         print_switch_failure_recovery
         exit 1
@@ -785,6 +678,9 @@ PY
       done
       if [[ "$service_lock_ok" -ne 1 ]]; then
         echo "ERROR: dalton-transcription did not report status=ok, configured worker, ffmpeg/ffprobe available, and owner_lock_held=true (last healthz: ${last_hz:-unreachable})." >&2
+        if [[ "$ts_already_running" -eq 1 ]]; then
+          echo "ERROR: ${TRANSCRIPTION_LABEL} is already running and failed verification; refusing to restart via kickstart -k. Run --rollback first." >&2
+        fi
         print_switch_failure_recovery
         exit 1
       fi
@@ -804,6 +700,9 @@ sys.exit(0 if (d.get("ok") is True and d.get("owner_lock_held") is True) else 1)
 PY
       then
         echo "ERROR: Authentication check with DALTON_TRANSCRIPTION_TOKEN failed (HTTP ${auth_code}): ${auth_body}" >&2
+        if [[ "$ts_already_running" -eq 1 ]]; then
+          echo "ERROR: ${TRANSCRIPTION_LABEL} is already running and failed auth verification; refusing to restart via kickstart -k. Run --rollback first." >&2
+        fi
         print_switch_failure_recovery
         exit 1
       fi
@@ -835,6 +734,9 @@ sys.exit(0 if ok else 1)
 PY
         then
           echo "ERROR: Historical job query failed on dalton-transcription for job_id=${SAMPLE_JOB_ID} (HTTP ${hist_code}): ${hist_body}" >&2
+          if [[ "$ts_already_running" -eq 1 ]]; then
+            echo "ERROR: ${TRANSCRIPTION_LABEL} is already running and failed historical job verification; refusing to restart via kickstart -k. Run --rollback first." >&2
+          fi
           print_switch_failure_recovery
           exit 1
         fi
@@ -843,6 +745,9 @@ PY
         echo "Skipping historical job read check (--allow-empty-history set and no succeeded jobs in ${JOBS_DIR})."
       else
         echo "ERROR: No completed historical job found in ${JOBS_DIR} to verify dalton-transcription storage read." >&2
+        if [[ "$ts_already_running" -eq 1 ]]; then
+          echo "ERROR: ${TRANSCRIPTION_LABEL} is already running and failed historical job verification; refusing to restart via kickstart -k. Run --rollback first." >&2
+        fi
         print_switch_failure_recovery
         exit 1
       fi

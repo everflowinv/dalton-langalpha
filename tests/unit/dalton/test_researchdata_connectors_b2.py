@@ -931,11 +931,15 @@ async def test_backend_transcription_client_profile_and_explicit_url_matrix(
 
     real_async_client = httpx.AsyncClient
 
-    def _patched_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+    def _patched_client(**kwargs: Any) -> httpx.AsyncClient:
         kwargs["transport"] = httpx.MockTransport(_mock_handler)
-        return real_async_client(*args, **kwargs)
+        return real_async_client(**kwargs)
 
-    monkeypatch.setattr(svc_transcriptions.httpx, "AsyncClient", _patched_client)
+    monkeypatch.setattr(
+        svc_transcriptions.httpx,
+        "AsyncClient",
+        create_autospec(real_async_client, side_effect=_patched_client),
+    )
 
     # 1) EVERFLOW + URL unset -> keeps hitting legacy bridge (:8960) with DALTON_BRIDGE_ADMIN_TOKEN
     monkeypatch.setenv("APP_ENV", "dalton")
@@ -1084,9 +1088,9 @@ async def test_backend_client_calls_standalone_service_with_independent_token(
         seen_auth: list[str] = []
         real_async_client = httpx.AsyncClient
 
-        def _asgi_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        def _asgi_client(**kwargs: Any) -> httpx.AsyncClient:
             kwargs["transport"] = httpx.ASGITransport(app=app)
-            client = real_async_client(*args, **kwargs)
+            client = real_async_client(**kwargs)
             orig_send = client.send
 
             async def _recording_send(request: httpx.Request, **send_kwargs: Any) -> httpx.Response:
@@ -1094,10 +1098,14 @@ async def test_backend_client_calls_standalone_service_with_independent_token(
                 seen_auth.append(request.headers.get("Authorization", ""))
                 return await orig_send(request, **send_kwargs)
 
-            client.send = _recording_send  # type: ignore[method-assign]
+            client.send = create_autospec(orig_send, side_effect=_recording_send)  # type: ignore[method-assign]
             return client
 
-        monkeypatch.setattr(svc_transcriptions.httpx, "AsyncClient", _asgi_client)
+        monkeypatch.setattr(
+            svc_transcriptions.httpx,
+            "AsyncClient",
+            create_autospec(real_async_client, side_effect=_asgi_client),
+        )
 
         code_sub, body_sub = await svc_transcriptions.call_bridge_submit_transcription(
             _sample_submit_payload("job_be_ok")
@@ -1581,7 +1589,8 @@ def test_deployment_configs_ffmpeg_entrypoint_networks_launchd_and_minio_init(
         region_name="us-east-1",
     )
     fake_s3 = create_autospec(s3_spec)
-    monkeypatch.setattr(minio_init.boto3, "client", lambda *a, **kw: fake_s3)
+    boto3_client_mock = create_autospec(boto3.session.Session().client, return_value=fake_s3)
+    monkeypatch.setattr(minio_init.boto3, "client", boto3_client_mock)
     monkeypatch.setenv("DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL", "http://minio:9000")
     monkeypatch.setenv("DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME", "chat-uploads")
     monkeypatch.setenv("MINIO_ROOT_USER", "ak")
@@ -1590,6 +1599,13 @@ def test_deployment_configs_ffmpeg_entrypoint_networks_launchd_and_minio_init(
     monkeypatch.setenv("DALTON_ASR_STORAGE_BUCKET_NAME", "transcriptions")
 
     assert minio_init.main() == 0
+    boto3_client_mock.assert_called_once()
+    s3_call = boto3_client_mock.call_args
+    assert s3_call.args == ("s3",)
+    assert s3_call.kwargs["endpoint_url"] == "http://minio:9000"
+    assert s3_call.kwargs["aws_access_key_id"] == "ak"
+    assert s3_call.kwargs["aws_secret_access_key"] == "sk"
+    assert s3_call.kwargs["region_name"] == "us-east-1"
     buckets_checked = [call.kwargs["Bucket"] for call in fake_s3.head_bucket.call_args_list]
     assert "chat-uploads" in buckets_checked
     assert "transcriptions" in buckets_checked
@@ -1669,7 +1685,11 @@ async def test_standalone_service_misconfigured_skips_lock_and_recovery_and_repo
     mgr_spy = create_autospec(ts_jobs.AsrJobManager)
     with monkeypatch.context() as mp:
         mp.setattr(ts_app, "AsrJobManager", mgr_spy)
-        mp.setattr(ts_registry, "is_binary_available", lambda _name, _pref=None: True)
+        mp.setattr(
+            ts_registry,
+            "is_binary_available",
+            create_autospec(ts_registry.is_binary_available, return_value=True),
+        )
         cfg1 = ts_app.TranscriptionServiceConfig(
             jobs_dir=jobs_dir_1,
             token="ts-misconfig-tok",
@@ -1728,7 +1748,10 @@ async def test_standalone_service_misconfigured_skips_lock_and_recovery_and_repo
         mp.setattr(
             ts_registry,
             "is_binary_available",
-            lambda name, _pref=None: name != "ffmpeg",
+            create_autospec(
+                ts_registry.is_binary_available,
+                side_effect=lambda name, preferred=None: name != "ffmpeg",
+            ),
         )
         cfg2 = ts_app.TranscriptionServiceConfig(
             jobs_dir=jobs_dir_2,
@@ -1761,7 +1784,11 @@ async def test_standalone_service_misconfigured_skips_lock_and_recovery_and_repo
     env_missing_ep = _valid_seed_asr_env()
     env_missing_ep.pop("DALTON_ASR_STORAGE_ENDPOINT_URL")
     with monkeypatch.context() as mp:
-        mp.setattr(ts_registry, "is_binary_available", lambda _name, _pref=None: True)
+        mp.setattr(
+            ts_registry,
+            "is_binary_available",
+            create_autospec(ts_registry.is_binary_available, return_value=True),
+        )
         val3 = ts_registry.validate_worker_startup_config(
             mode="seed_asr", environ=env_missing_ep
         )
@@ -1817,11 +1844,15 @@ async def test_everflow_pre_cutover_transcription_url_respects_installer_custom_
 
     real_async_client = httpx.AsyncClient
 
-    def _patched_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+    def _patched_client(**kwargs: Any) -> httpx.AsyncClient:
         kwargs["transport"] = httpx.MockTransport(_mock_handler)
-        return real_async_client(*args, **kwargs)
+        return real_async_client(**kwargs)
 
-    monkeypatch.setattr(svc_transcriptions.httpx, "AsyncClient", _patched_client)
+    monkeypatch.setattr(
+        svc_transcriptions.httpx,
+        "AsyncClient",
+        create_autospec(real_async_client, side_effect=_patched_client),
+    )
     code, _ = await svc_transcriptions.call_bridge_get_transcription("j-port")
     assert code == 200
     assert captured_urls == ["http://host.docker.internal:9123/transcriptions/j-port"]
@@ -1850,6 +1881,11 @@ def _build_switch_script_harness(
     omit_ts_env_keys: tuple[str, ...] = (),
     include_ffmpeg: bool = True,
     seed_history: bool = True,
+    bridge_working_dir: Path | None = None,
+    ts_working_dir: Path | None = None,
+    bridge_plist_env_overrides: dict[str, str | None] | None = None,
+    ts_plist_env_overrides: dict[str, str | None] | None = None,
+    bridge_env_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir(parents=True, exist_ok=True)
@@ -1926,6 +1962,7 @@ args = sys.argv[1:]
 method = "GET"
 out_file = None
 write_fmt = None
+max_time = None
 url = ""
 i = 0
 while i < len(args):
@@ -1939,6 +1976,9 @@ while i < len(args):
     elif a == "-w" and i + 1 < len(args):
         write_fmt = args[i + 1]
         i += 2
+    elif a in ("--max-time", "-m") and i + 1 < len(args):
+        max_time = args[i + 1]
+        i += 2
     elif a in ("-H", "-d") and i + 1 < len(args):
         i += 2
     elif a.startswith("-"):
@@ -1948,7 +1988,7 @@ while i < len(args):
         i += 1
 
 with log_p.open("a", encoding="utf-8") as fh:
-    fh.write(json.dumps({{"method": method, "url": url}}) + "\\n")
+    fh.write(json.dumps({{"method": method, "url": url, "max_time": max_time}}) + "\\n")
 
 counts = json.loads(counter_p.read_text(encoding="utf-8")) if counter_p.exists() else {{}}
 key = f"{{method}} {{url}}"
@@ -2022,13 +2062,18 @@ sys.exit(0)
     eff_ts_usage = ts_usage_file or (eff_ts_jobs / "asr_usage.jsonl")
 
     bridge_env_file = tmp_path / "researchdata-bridge.env"
-    bridge_lines = [
-        "DALTON_BRIDGE_ADMIN_TOKEN=bridge-admin-stub-token",
-        f"DALTON_ASR_JOBS_DIR={eff_bridge_jobs}",
-    ]
+    bridge_env_dict: dict[str, str] = {
+        "DALTON_BRIDGE_ADMIN_TOKEN": "bridge-admin-stub-token",
+        "DALTON_ASR_JOBS_DIR": str(eff_bridge_jobs),
+    }
     if bridge_usage_file is not None:
-        bridge_lines.append(f"DALTON_ASR_USAGE_FILE={bridge_usage_file}")
-    bridge_env_file.write_text("\n".join(bridge_lines) + "\n", encoding="utf-8")
+        bridge_env_dict["DALTON_ASR_USAGE_FILE"] = str(bridge_usage_file)
+    if bridge_env_overrides:
+        bridge_env_dict.update(bridge_env_overrides)
+    bridge_env_file.write_text(
+        "\n".join(f"{k}={v}" for k, v in bridge_env_dict.items()) + "\n",
+        encoding="utf-8",
+    )
 
     ts_env_dict = _valid_seed_asr_env()
     ts_env_dict["DALTON_TRANSCRIPTION_TOKEN"] = "ts-stub-token-32bytes"
@@ -2049,22 +2094,41 @@ sys.exit(0)
     launch_agents = tmp_path / "LaunchAgents"
     launch_agents.mkdir(parents=True, exist_ok=True)
 
+    ts_plist_env: dict[str, str] = {
+        "PATH": str(fake_bin),
+        "DALTON_ASR_JOBS_DIR": str(eff_ts_jobs),
+        "DALTON_ASR_USAGE_FILE": str(eff_ts_usage),
+        "DALTON_TRANSCRIPTION_ENV_FILE": str(ts_env_file),
+    }
+    if ts_plist_env_overrides:
+        for k, v in ts_plist_env_overrides.items():
+            if v is None:
+                ts_plist_env.pop(k, None)
+            else:
+                ts_plist_env[k] = v
+
     ts_plist = launch_agents / "com.dalton.transcription.plist"
     with ts_plist.open("wb") as fh:
         plistlib.dump(
             {
                 "Label": "com.dalton.transcription",
                 "ProgramArguments": [sys.executable, "-m", "src.dalton.transcription_service"],
-                "WorkingDirectory": str(REPO_ROOT),
-                "EnvironmentVariables": {
-                    "PATH": str(fake_bin),
-                    "DALTON_ASR_JOBS_DIR": str(eff_ts_jobs),
-                    "DALTON_ASR_USAGE_FILE": str(eff_ts_usage),
-                    "DALTON_TRANSCRIPTION_ENV_FILE": str(ts_env_file),
-                },
+                "WorkingDirectory": str(ts_working_dir or REPO_ROOT),
+                "EnvironmentVariables": ts_plist_env,
             },
             fh,
         )
+
+    bridge_plist_env: dict[str, str] = {
+        "PATH": str(fake_bin),
+        "DALTON_BRIDGE_ENV_FILE": str(bridge_env_file),
+    }
+    if bridge_plist_env_overrides:
+        for k, v in bridge_plist_env_overrides.items():
+            if v is None:
+                bridge_plist_env.pop(k, None)
+            else:
+                bridge_plist_env[k] = v
 
     bridge_plist = launch_agents / "com.dalton.researchdata-bridge.plist"
     with bridge_plist.open("wb") as fh:
@@ -2075,11 +2139,8 @@ sys.exit(0)
                     sys.executable,
                     str(REPO_ROOT / "scripts" / "dalton" / "researchdata_bridge.py"),
                 ],
-                "WorkingDirectory": str(REPO_ROOT),
-                "EnvironmentVariables": {
-                    "PATH": str(fake_bin),
-                    "DALTON_BRIDGE_ENV_FILE": str(bridge_env_file),
-                },
+                "WorkingDirectory": str(bridge_working_dir or REPO_ROOT),
+                "EnvironmentVariables": bridge_plist_env,
             },
             fh,
         )
@@ -2201,10 +2262,13 @@ def test_switch_script_precheck_fails_on_path_mismatch_and_misconfigured_adapter
 def test_switch_script_launchctl_failures_print_recovery_and_leave_repo_env_untouched(
     tmp_path: Path,
 ) -> None:
-    """launchctl kickstart/bootstrap failures during --switch must print safe recovery commands and never mutate repo .env."""
+    """launchctl kickstart/bootstrap failures during --switch must print --rollback recovery (no raw bootout) and never mutate repo .env."""
     base_curl = {
         "POST http://127.0.0.1:8960/transcriptions/drain": {"rc": 0, "body": {"ok": True, "draining": True}},
-        "GET http://127.0.0.1:8960/transcriptions/drain": {"rc": 0, "body": {"ok": True, "active_jobs": 0}},
+        "GET http://127.0.0.1:8960/transcriptions/drain": {
+            "rc": 0,
+            "body": {"ok": True, "draining": True, "active_jobs": 0, "ready_for_handoff": True},
+        },
         "GET http://127.0.0.1:8960/healthz": {
             "rc": 0,
             "body": {"ok": True, "asr": {"disabled": True, "owner_lock_held": False}},
@@ -2229,9 +2293,9 @@ def test_switch_script_launchctl_failures_print_recovery_and_leave_repo_env_unto
     )
     assert p1.returncode != 0
     assert "Recovery Commands" in p1.stderr
-    assert "launchctl bootout" in p1.stderr
-    assert "bootout" in p1.stderr and "|| true" not in p1.stderr
-    assert "fcntl.flock" in p1.stderr
+    assert "switch_transcription_service.sh --rollback" in p1.stderr
+    assert "launchctl bootout" not in p1.stderr
+    assert "|| true" not in p1.stderr
     assert h1["repo_env_file"].read_text(encoding="utf-8") == h1["initial_repo_env"]
 
     # Case 2: Step 3 bootstrap fails (new service not yet loaded)
@@ -2252,16 +2316,17 @@ def test_switch_script_launchctl_failures_print_recovery_and_leave_repo_env_unto
     assert p2.returncode != 0
     assert "launchctl bootstrap failed" in p2.stderr
     assert "Recovery Commands" in p2.stderr
-    assert "|| true" not in p2.stderr
+    assert "switch_transcription_service.sh --rollback" in p2.stderr
+    assert "launchctl bootout" not in p2.stderr
     assert h2["repo_env_file"].read_text(encoding="utf-8") == h2["initial_repo_env"]
 
-    # Case 3: Step 3 kickstart fails (new service already loaded)
+    # Case 3: Step 3 kickstart fails when service is loaded but stopped (must NOT pass -k)
     h3 = _build_switch_script_harness(
         tmp_path / "ts_kickstart_fail",
         stub_config={
             "curl": base_curl,
             "launchctl": {
-                "print": {"com.dalton.transcription": {"rc": 0, "stdout": "state = running\npid = 4242\n"}},
+                "print": {"com.dalton.transcription": {"rc": 0, "stdout": "state = not running\n"}},
                 "kickstart_rc": {"com.dalton.transcription": 113},
             },
         },
@@ -2276,6 +2341,12 @@ def test_switch_script_launchctl_failures_print_recovery_and_leave_repo_env_unto
     assert p3.returncode != 0
     assert "launchctl kickstart failed" in p3.stderr
     assert "Recovery Commands" in p3.stderr
+    assert "switch_transcription_service.sh --rollback" in p3.stderr
+    ts_lc_calls = [
+        call for call in _read_jsonl_log(h3["launchctl_log"])
+        if call and call[0] == "kickstart" and any("com.dalton.transcription" in a for a in call)
+    ]
+    assert ts_lc_calls and "-k" not in ts_lc_calls[0]
     assert h3["repo_env_file"].read_text(encoding="utf-8") == h3["initial_repo_env"]
 
 
@@ -2366,7 +2437,7 @@ def test_switch_script_rollback_inflight_guard_and_launchctl_failure(tmp_path: P
                 },
                 "GET http://127.0.0.1:8965/transcriptions/drain": {
                     "rc": 0,
-                    "body": {"ok": True, "draining": True, "active_jobs": 0},
+                    "body": {"ok": True, "draining": True, "active_jobs": 0, "ready_for_handoff": True},
                 },
             },
         },
@@ -2399,7 +2470,7 @@ def test_switch_script_drain_poll_tolerates_transient_curl_failure_and_hints_on_
                 },
                 "GET http://127.0.0.1:8960/transcriptions/drain": [
                     {"rc": 7, "http_code": "000", "body": ""},
-                    {"rc": 0, "body": {"ok": True, "draining": True, "active_jobs": 0}},
+                    {"rc": 0, "body": {"ok": True, "draining": True, "active_jobs": 0, "ready_for_handoff": True}},
                 ],
             }
         },
@@ -2413,7 +2484,7 @@ def test_switch_script_drain_poll_tolerates_transient_curl_failure_and_hints_on_
     )
     assert p1.returncode == 0, f"stderr:\n{p1.stderr}"
     assert "curl failed while polling" in p1.stderr
-    assert "ready for handoff (active_jobs=0)" in p1.stdout
+    assert "ready for handoff (ready_for_handoff=true, active_jobs=0)" in p1.stdout
 
     # Case 2: Persistent poll curl failure times out after --wait-seconds and hints how to re-run or cancel drain
     h2 = _build_switch_script_harness(
@@ -2443,3 +2514,413 @@ def test_switch_script_drain_poll_tolerates_transient_curl_failure_and_hints_on_
     assert "Timed out after 1s" in p2.stderr
     assert "re-run this script (--drain-bridge)" in p2.stderr
     assert '"drain":false' in p2.stderr
+
+
+# ---------------------------------------------------------------------------
+# 10. r5: strict URL validation & shared preflight, safe re-run & rollback
+#         recovery, LaunchAgent env/WorkingDirectory path parity, and drain
+#         ready_for_handoff + curl --max-time bounds
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_endpoint_url_validation_rejects_malformed_urls_and_blocks_lock_and_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Malformed URLs (host:bad, http://[, bad port, non-http scheme) must fail closed as misconfigured without lock/recovery and fail switch preflight."""
+    for bad_http in (
+        "",
+        "host:bad",
+        "http://host:bad",
+        "http://[",
+        "http://host:0",
+        "http://host:65536",
+        "http://host:",
+        "ftp://example.com",
+    ):
+        assert ts_registry.is_valid_http_url(bad_http) is False, f"expected invalid http url: {bad_http!r}"
+
+    for bad_tos in (
+        "",
+        "host:bad",
+        "tos-s3-cn-beijing.volces.com:bad",
+        "http://[",
+        "tos-s3-cn-beijing.volces.com:0",
+        "tos-s3-cn-beijing.volces.com:65536",
+        "tos-s3-cn-beijing.volces.com:",
+        "ftp://tos-s3-cn-beijing.volces.com",
+    ):
+        assert ts_registry.is_valid_tos_endpoint(bad_tos) is False, f"expected invalid tos endpoint: {bad_tos!r}"
+
+    for good_http in (
+        "http://127.0.0.1:9000",
+        "https://api.openai.com/v1",
+        "https://[::1]:9000",
+    ):
+        assert ts_registry.is_valid_http_url(good_http) is True, f"expected valid http url: {good_http!r}"
+
+    for good_tos in (
+        "tos-s3-cn-beijing.volces.com",
+        "tos-s3-cn-beijing.volces.com:443",
+        "https://tos-s3-cn-beijing.volces.com",
+    ):
+        assert ts_registry.is_valid_tos_endpoint(good_tos) is True, f"expected valid tos endpoint: {good_tos!r}"
+
+    # Runtime startup must report status=misconfigured without raising, taking .owner.lock, or recovering jobs
+    for case_name, env_key, bad_value in (
+        ("tos_host_bad", "VOLC_TOS_ENDPOINT", "host:bad"),
+        ("tos_ipv6_unclosed", "VOLC_TOS_ENDPOINT", "http://["),
+        ("storage_ipv6_unclosed", "DALTON_ASR_STORAGE_ENDPOINT_URL", "http://["),
+        ("storage_host_bad", "DALTON_ASR_STORAGE_ENDPOINT_URL", "http://host:bad"),
+    ):
+        jobs_dir = tmp_path / case_name
+        job_dir = jobs_dir / "job_inflight_url"
+        job_dir.mkdir(parents=True, exist_ok=True)
+        state_path = job_dir / "state.json"
+        state_path.write_text(
+            json.dumps({"job_id": "job_inflight_url", "status": "transcribing", "stage": "transcribing"}),
+            encoding="utf-8",
+        )
+        bad_env = _valid_seed_asr_env()
+        bad_env[env_key] = bad_value
+
+        mgr_spy = create_autospec(ts_jobs.AsrJobManager)
+        with monkeypatch.context() as mp:
+            mp.setattr(ts_app, "AsrJobManager", mgr_spy)
+            mp.setattr(
+                ts_registry,
+                "is_binary_available",
+                create_autospec(ts_registry.is_binary_available, return_value=True),
+            )
+            cfg = ts_app.TranscriptionServiceConfig(
+                jobs_dir=jobs_dir,
+                token="ts-bad-url-tok",
+                worker_mode="auto",
+                lock_timeout_s=0.1,
+            )
+            app = ts_app.create_app(config=cfg, environ=bad_env)
+            resumed = app.state.runtime.startup()
+            try:
+                assert resumed == []
+                mgr_spy.assert_not_called()
+                assert app.state.runtime.owner_lock is None
+                assert not (jobs_dir / ".owner.lock").exists()
+                assert json.loads(state_path.read_text(encoding="utf-8"))["status"] == "transcribing"
+
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app), base_url="http://test"
+                ) as client:
+                    hz = await client.get("/healthz")
+                    assert hz.status_code == 200
+                    body = hz.json()
+                    assert body["status"] == "misconfigured"
+                    assert body["ok"] is False
+                    assert body["owner_lock_held"] is False
+                    assert env_key in body["missing_config"]
+            finally:
+                await app.state.runtime.shutdown()
+
+    # Switch script preflight invokes the shared Python validator (python -m src.dalton.transcription_service.preflight)
+    for bad_ep in ("host:bad", "http://["):
+        slug = "bad_port" if bad_ep == "host:bad" else "bad_bracket"
+        h = _build_switch_script_harness(
+            tmp_path / f"preflight_{slug}",
+            stub_config={},
+            ts_env_overrides={"VOLC_TOS_ENDPOINT": bad_ep},
+        )
+        for flag in ("--check", "--switch"):
+            proc = subprocess.run(
+                ["bash", str(SWITCH_SCRIPT), flag],
+                env=h["env"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            assert proc.returncode != 0
+            assert "VOLC_TOS_ENDPOINT" in proc.stderr
+            assert h["repo_env_file"].read_text(encoding="utf-8") == h["initial_repo_env"]
+        assert not any(
+            entry.get("method") == "POST" and "/transcriptions/drain" in entry.get("url", "")
+            for entry in _read_jsonl_log(h["curl_log"])
+        )
+
+
+def test_switch_script_rerun_verifies_running_service_without_kickstart_k(tmp_path: Path) -> None:
+    """Re-running --switch when com.dalton.transcription is already running must verify health/auth/history without kickstart -k."""
+    base_curl = {
+        "POST http://127.0.0.1:8960/transcriptions/drain": {"rc": 0, "body": {"ok": True, "draining": True}},
+        "GET http://127.0.0.1:8960/transcriptions/drain": {
+            "rc": 0,
+            "body": {"ok": True, "draining": True, "active_jobs": 0, "ready_for_handoff": True},
+        },
+        "GET http://127.0.0.1:8960/healthz": {
+            "rc": 0,
+            "body": {"ok": True, "asr": {"disabled": True, "owner_lock_held": False}},
+        },
+        "GET http://127.0.0.1:8960/transcriptions/health-probe": {"rc": 0, "http_code": "503", "body": {}},
+    }
+    healthy_ts_hz = {
+        "rc": 0,
+        "body": {
+            "ok": True,
+            "status": "ok",
+            "disabled": False,
+            "misconfigured": False,
+            "owner_lock_held": True,
+            "ffmpeg_available": True,
+            "ffprobe_available": True,
+            "worker_name": "seed_asr",
+        },
+    }
+
+    # Case 1: Already running and passes /healthz + auth + history -> skip restart, complete Step 4
+    h_ok = _build_switch_script_harness(
+        tmp_path / "rerun_running_ok",
+        stub_config={
+            "launchctl": {
+                "print": {"com.dalton.transcription": {"rc": 0, "stdout": "state = running\npid = 5150\n"}},
+            },
+            "curl": {
+                **base_curl,
+                "GET http://127.0.0.1:8965/healthz": healthy_ts_hz,
+                "GET http://127.0.0.1:8965/transcriptions/drain": {
+                    "rc": 0,
+                    "http_code": "200",
+                    "body": {"ok": True, "owner_lock_held": True, "active_jobs": 0, "ready_for_handoff": False},
+                },
+                "GET http://127.0.0.1:8965/transcriptions/job_hist_01": {
+                    "rc": 0,
+                    "http_code": "200",
+                    "body": {"ok": True, "job": {"job_id": "job_hist_01", "status": "succeeded"}},
+                },
+            },
+        },
+    )
+    p_ok = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--switch"],
+        env=h_ok["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p_ok.returncode == 0, f"stderr:\n{p_ok.stderr}\nstdout:\n{p_ok.stdout}"
+    ts_lc_ok = [
+        call for call in _read_jsonl_log(h_ok["launchctl_log"])
+        if call and call[0] in ("kickstart", "bootstrap") and any("com.dalton.transcription" in a for a in call)
+    ]
+    assert ts_lc_ok == []
+    assert "DALTON_TRANSCRIPTION_SERVICE_URL=http://host.docker.internal:8965" in h_ok["repo_env_file"].read_text(
+        encoding="utf-8"
+    )
+    assert _read_jsonl_log(h_ok["docker_log"]) != []
+
+    # Case 2: Already running but auth check fails -> refuse kickstart -k, instruct --rollback, untouched repo .env
+    h_fail = _build_switch_script_harness(
+        tmp_path / "rerun_running_auth_fail",
+        stub_config={
+            "launchctl": {
+                "print": {"com.dalton.transcription": {"rc": 0, "stdout": "state = running\npid = 5151\n"}},
+            },
+            "curl": {
+                **base_curl,
+                "GET http://127.0.0.1:8965/healthz": healthy_ts_hz,
+                "GET http://127.0.0.1:8965/transcriptions/drain": {
+                    "rc": 0,
+                    "http_code": "401",
+                    "body": {"detail": "Unauthorized"},
+                },
+            },
+        },
+    )
+    p_fail = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--switch"],
+        env=h_fail["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p_fail.returncode != 0
+    assert "--rollback" in p_fail.stderr
+    assert "launchctl bootout" not in p_fail.stderr
+    ts_lc_fail = [
+        call for call in _read_jsonl_log(h_fail["launchctl_log"])
+        if call and call[0] in ("kickstart", "bootstrap") and any("com.dalton.transcription" in a for a in call)
+    ]
+    assert ts_lc_fail == []
+    assert h_fail["repo_env_file"].read_text(encoding="utf-8") == h_fail["initial_repo_env"]
+
+
+def test_switch_script_path_parity_uses_launchagent_env_file_and_working_directory(
+    tmp_path: Path,
+) -> None:
+    """Path parity must resolve DALTON_ASR_JOBS_DIR and DALTON_ASR_USAGE_FILE using each plist's actual env file and WorkingDirectory."""
+    # Case 1: Same relative DALTON_ASR_USAGE_FILE under different WorkingDirectories must fail parity
+    rel_case = tmp_path / "relative_wd_divergence"
+    bridge_wd = rel_case / "research_code"
+    ts_wd = rel_case / "repo_wd"
+    shared_jobs = rel_case / "shared_jobs"
+    bridge_wd.mkdir(parents=True, exist_ok=True)
+    ts_wd.mkdir(parents=True, exist_ok=True)
+    h1 = _build_switch_script_harness(
+        rel_case,
+        stub_config={},
+        bridge_jobs_dir=shared_jobs,
+        ts_jobs_dir=shared_jobs,
+        bridge_working_dir=bridge_wd,
+        ts_working_dir=ts_wd,
+        bridge_env_overrides={"DALTON_ASR_USAGE_FILE": "var/asr_usage.jsonl"},
+        ts_plist_env_overrides={"DALTON_ASR_USAGE_FILE": "var/asr_usage.jsonl"},
+    )
+    p1 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--check"],
+        env=h1["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p1.returncode != 0
+    assert "DALTON_ASR_USAGE_FILE mismatch" in p1.stderr
+    assert str((bridge_wd / "var" / "asr_usage.jsonl").resolve()) in p1.stderr
+    assert str((ts_wd / "var" / "asr_usage.jsonl").resolve()) in p1.stderr
+
+    # Case 2: Custom env file referenced by plist (relative to bridge WorkingDirectory) overrides shell DALTON_BRIDGE_ENV_FILE
+    custom_case = tmp_path / "custom_env_file"
+    custom_bridge_wd = custom_case / "bridge_wd"
+    custom_bridge_wd.mkdir(parents=True, exist_ok=True)
+    custom_env_dir = custom_bridge_wd / "conf"
+    custom_env_dir.mkdir(parents=True, exist_ok=True)
+    alt_jobs = custom_case / "alt_bridge_jobs"
+    alt_jobs.mkdir(parents=True, exist_ok=True)
+    (custom_env_dir / "custom-bridge.env").write_text(
+        f"DALTON_BRIDGE_ADMIN_TOKEN=bridge-admin-stub-token\nDALTON_ASR_JOBS_DIR={alt_jobs}\n",
+        encoding="utf-8",
+    )
+    h2 = _build_switch_script_harness(
+        custom_case,
+        stub_config={},
+        bridge_working_dir=custom_bridge_wd,
+        bridge_plist_env_overrides={"DALTON_BRIDGE_ENV_FILE": "conf/custom-bridge.env"},
+    )
+    p2 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--switch"],
+        env=h2["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p2.returncode != 0
+    assert "DALTON_ASR_JOBS_DIR mismatch" in p2.stderr
+    assert str(alt_jobs.resolve()) in p2.stderr
+    assert _read_jsonl_log(h2["curl_log"]) == []
+
+    # Case 3: Relative paths + custom env file resolving to identical canonical targets pass parity
+    match_case = tmp_path / "relative_match"
+    b_wd = match_case / "dir_a"
+    t_wd = match_case / "dir_b"
+    b_wd.mkdir(parents=True, exist_ok=True)
+    t_wd.mkdir(parents=True, exist_ok=True)
+    common_jobs = match_case / "common_jobs"
+    common_jobs.mkdir(parents=True, exist_ok=True)
+    custom_ts_env = t_wd / "custom-ts.env"
+    ts_env_vals = _valid_seed_asr_env()
+    ts_env_vals["DALTON_TRANSCRIPTION_TOKEN"] = "ts-custom-tok"
+    ts_env_vals["DALTON_ASR_JOBS_DIR"] = "../common_jobs"
+    ts_env_vals["DALTON_ASR_USAGE_FILE"] = "../common_jobs/ledger.jsonl"
+    custom_ts_env.write_text(
+        "\n".join(f"{k}={v}" for k, v in ts_env_vals.items()) + "\n",
+        encoding="utf-8",
+    )
+    h3 = _build_switch_script_harness(
+        match_case,
+        stub_config={},
+        bridge_jobs_dir=common_jobs,
+        ts_jobs_dir=common_jobs,
+        bridge_working_dir=b_wd,
+        ts_working_dir=t_wd,
+        bridge_env_overrides={
+            "DALTON_ASR_JOBS_DIR": "../common_jobs",
+            "DALTON_ASR_USAGE_FILE": "../common_jobs/ledger.jsonl",
+        },
+        ts_plist_env_overrides={
+            "DALTON_ASR_JOBS_DIR": None,
+            "DALTON_ASR_USAGE_FILE": None,
+            "DALTON_TRANSCRIPTION_ENV_FILE": "custom-ts.env",
+        },
+    )
+    p3 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--check"],
+        env=h3["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p3.returncode == 0, f"stderr:\n{p3.stderr}\nstdout:\n{p3.stdout}"
+    assert "PATH_PARITY:            OK" in p3.stdout
+
+
+def test_switch_script_drain_requires_ready_for_handoff_and_bounds_curl_max_time(
+    tmp_path: Path,
+) -> None:
+    """drain_and_wait must require ready_for_handoff=true AND active_jobs==0, and bound every curl call with --max-time <= remaining."""
+    # Case 1: active_jobs=0 but ready_for_handoff=false (e.g. process restarted and resumed intake) -> must NOT pass
+    h1 = _build_switch_script_harness(
+        tmp_path / "drain_not_ready",
+        stub_config={
+            "curl": {
+                "POST http://127.0.0.1:8960/transcriptions/drain": {
+                    "rc": 0,
+                    "body": {"ok": True, "draining": True, "active_jobs": 0, "ready_for_handoff": True},
+                },
+                "GET http://127.0.0.1:8960/transcriptions/drain": {
+                    "rc": 0,
+                    "body": {"ok": True, "draining": False, "active_jobs": 0, "ready_for_handoff": False},
+                },
+            }
+        },
+    )
+    p1 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--drain-bridge", "--wait-seconds", "1"],
+        env=h1["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p1.returncode != 0
+    assert "Timed out after 1s" in p1.stderr
+    assert "ready_for_handoff=false, active_jobs=0" in p1.stderr
+    calls_1 = _read_jsonl_log(h1["curl_log"])
+    assert calls_1
+    for entry in calls_1:
+        assert entry["max_time"] is not None
+        assert 1 <= int(entry["max_time"]) <= 1
+
+    # Case 2: Transitions from ready_for_handoff=false to ready_for_handoff=true & active_jobs=0, with bounded --max-time
+    h2 = _build_switch_script_harness(
+        tmp_path / "drain_becomes_ready",
+        stub_config={
+            "curl": {
+                "POST http://127.0.0.1:8960/transcriptions/drain": {
+                    "rc": 0,
+                    "body": {"ok": True, "draining": True, "active_jobs": 1, "ready_for_handoff": False},
+                },
+                "GET http://127.0.0.1:8960/transcriptions/drain": [
+                    {"rc": 0, "body": {"ok": True, "draining": False, "active_jobs": 0, "ready_for_handoff": False}},
+                    {"rc": 0, "body": {"ok": True, "draining": True, "active_jobs": 0, "ready_for_handoff": True}},
+                ],
+            }
+        },
+    )
+    p2 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--drain-bridge", "--wait-seconds", "4"],
+        env=h2["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p2.returncode == 0, f"stderr:\n{p2.stderr}"
+    assert "ready for handoff (ready_for_handoff=true, active_jobs=0)" in p2.stdout
+    calls_2 = _read_jsonl_log(h2["curl_log"])
+    assert len(calls_2) >= 3
+    for entry in calls_2:
+        assert entry["max_time"] is not None
+        assert 1 <= int(entry["max_time"]) <= 4

@@ -163,21 +163,42 @@ class WorkerStartupValidation:
     missing_config: tuple[str, ...] = ()
 
 
-def _is_valid_http_url(raw: str) -> bool:
+def is_valid_http_url(raw: str) -> bool:
+    """Return True iff *raw* is a valid ``http``/``https`` URL with host and optional port (1-65535)."""
     cleaned = str(raw or "").strip()
     if not cleaned or any(ch.isspace() for ch in cleaned):
         return False
-    parsed = urlparse(cleaned)
-    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
+    try:
+        parsed = urlparse(cleaned)
+        port = parsed.port
+    except ValueError:
+        return False
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+    if not parsed.hostname:
+        return False
+    if port is not None and not (1 <= port <= 65535):
+        return False
+    hostport = parsed.netloc.rsplit("@", 1)[-1]
+    if hostport.startswith("["):
+        if "]:" in hostport and port is None:
+            return False
+    elif ":" in hostport and port is None:
+        return False
+    return True
 
 
-def _is_valid_tos_endpoint(raw: str) -> bool:
+def is_valid_tos_endpoint(raw: str) -> bool:
+    """Return True iff *raw* is a valid Volcengine TOS endpoint (bare ``host[:port]`` or ``http(s)://...``)."""
     cleaned = str(raw or "").strip()
     if not cleaned or any(ch.isspace() for ch in cleaned):
         return False
     candidate = cleaned if "://" in cleaned else f"https://{cleaned}"
-    parsed = urlparse(candidate)
-    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
+    return is_valid_http_url(candidate)
+
+
+_is_valid_http_url = is_valid_http_url
+_is_valid_tos_endpoint = is_valid_tos_endpoint
 
 
 def _has_builtin_seed_asr_script() -> bool:
@@ -578,6 +599,8 @@ __all__ = [
     "UnconfiguredAsrWorker",
     "WorkerFactory",
     "WorkerStartupValidation",
+    "is_valid_http_url",
+    "is_valid_tos_endpoint",
     "list_registered_worker_factories",
     "load_worker_factory_from_spec",
     "register_worker_factory",

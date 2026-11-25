@@ -384,7 +384,19 @@ docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core
   curl -sf -H "Authorization: Bearer ${ACCESS_TOKEN}" http://127.0.0.1:8000/api/v1/dalton/capabilities
 ```
 
-`healthz` 返回 `owner_lock_held: true`、`ffmpeg_available: true`、`ffprobe_available: true`，且能力列表中出现 `transcription` 即表示就绪。停服维护前可先向 `POST http://127.0.0.1:8965/transcriptions/drain` 发送停止接单信号，等待 `active_jobs` 归零后再重启容器。
+`healthz` 返回 `owner_lock_held: true`、`ffmpeg_available: true`、`ffprobe_available: true`，且能力列表中出现 `transcription` 即表示就绪。
+
+停服维护前，在 `transcription` 容器内携带容器环境变量 `DALTON_TRANSCRIPTION_TOKEN` 发起停止接单，并轮询确认 `ready_for_handoff` 为 `true` 且 `active_jobs` 归零后再重启容器：
+
+```bash
+# 1. 在 transcription 容器内发起停止接单（携带 DALTON_TRANSCRIPTION_TOKEN）
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env --profile transcription exec -T transcription \
+  sh -c 'curl -sf -X POST -H "Authorization: Bearer ${DALTON_TRANSCRIPTION_TOKEN}" -H "Content-Type: application/json" -d "{\"drain\":true}" http://127.0.0.1:8965/transcriptions/drain'
+
+# 2. 在 transcription 容器内查询停止接单状态，确认 ready_for_handoff=true 且 active_jobs=0
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env --profile transcription exec -T transcription \
+  sh -c 'curl -sf -H "Authorization: Bearer ${DALTON_TRANSCRIPTION_TOKEN}" http://127.0.0.1:8965/transcriptions/drain'
+```
 
 ---
 
