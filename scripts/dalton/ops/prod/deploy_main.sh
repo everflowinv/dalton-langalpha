@@ -954,7 +954,17 @@ build_gateway_staging() {
     STAGED_GATEWAY_RELEASE_ID=""
     return 1
   fi
-  for item in package.json pnpm-lock.yaml build.mjs tsconfig.json src; do
+  for item in package.json pnpm-lock.yaml pnpm-workspace.yaml build.mjs tsconfig.json src; do
+    # Older revisions have no pnpm-workspace.yaml; pnpm 11+ then refuses the install (ERR_PNPM_IGNORED_BUILDS),
+    # so staging gets the same build-script approvals the current gateway declares.
+    if [ "$item" = "pnpm-workspace.yaml" ] && [ ! -e "${gw_dir}/${item}" ]; then
+      if ! printf 'allowBuilds:\n  esbuild: true\n  protobufjs: false\n' > "${staging}/${item}"; then
+        echo "ERROR: failed to write default pnpm-workspace.yaml into gateway staging" >&2
+        cleanup_gateway_staging || true
+        return 1
+      fi
+      continue
+    fi
     if [ ! -e "${gw_dir}/${item}" ]; then
       echo "ERROR: gateway staging source missing: ${gw_dir}/${item}" >&2
       cleanup_gateway_staging || true
