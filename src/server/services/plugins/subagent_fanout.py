@@ -137,6 +137,7 @@ async def relink_subagents(user_id: str, plugin_id: str, plugin_name: str) -> No
             )
             for r in rows
         ]
+        # DALTON-HOOK(team-model-catalog): relink keeps plan fields; model validation runs under the catalog lock.
         linked_plans = await _linked(user_id, plugin_id, plugin_name, plans, conn=conn)
         for row, plan in zip(rows, linked_plans):
             if plan.fields != row["fields"]:

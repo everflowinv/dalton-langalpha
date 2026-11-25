@@ -363,6 +363,7 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
                         return model.get('pricing')
         return None
 
+    # DALTON-HOOK(team-model-catalog): alias lookup returns before normalized matching.
     def _match_normalized(prov: str, models: list) -> Optional[Dict[str, Any]]:
         for model in models:
             model_id = model.get('id', '')

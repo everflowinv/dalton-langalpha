@@ -352,6 +352,7 @@ def run_on_by_type(
             claude_code=claude_code if name in targets else None,
             claude_code_model=targets[name].model if name in targets else None,
             actual_model_key=actual_keys.get(name),
+            # DALTON-HOOK(team-model-catalog): carry the resolved model source per subagent type.
             is_custom_model=custom_flags.get(name),
         )
         for name in {*models, *targets, *actual_keys, *custom_flags}
