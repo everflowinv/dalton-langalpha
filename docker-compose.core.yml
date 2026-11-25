@@ -241,6 +241,71 @@ services:
     networks:
       - core_internal
 
+  transcription:
+    profiles: ["transcription"]
+    image: ${DALTON_BACKEND_IMAGE:-dalton-core-backend:local}
+    # Bypass /docker_entrypoint.sh so only the one-shot `migrate` service runs Alembic migrations.
+    entrypoint: ["/usr/bin/tini", "-s", "--"]
+    command:
+      - /bin/sh
+      - -c
+      - |
+        export DALTON_ASR_STORAGE_ACCESS_KEY_ID="$${DALTON_ASR_STORAGE_ACCESS_KEY_ID:-$${MINIO_ROOT_USER:-}}"
+        export DALTON_ASR_STORAGE_SECRET_ACCESS_KEY="$${DALTON_ASR_STORAGE_SECRET_ACCESS_KEY:-$${MINIO_ROOT_PASSWORD:-}}"
+        exec uv run --no-sync python -m src.dalton.transcription_service
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # ptc_agent lives under src/; set it explicitly instead of relying on the venv .pth.
+      PYTHONPATH: /app/src
+      APP_ENV: core
+      DALTON_PROFILE: core
+      DALTON_TRANSCRIPTION_HOST: 0.0.0.0
+      DALTON_TRANSCRIPTION_PORT: "8965"
+      DALTON_ASR_JOBS_DIR: /var/lib/dalton/asr_jobs
+      DALTON_ASR_STORAGE_ENDPOINT_URL: ${DALTON_ASR_STORAGE_ENDPOINT_URL:-http://minio:9000}
+      DALTON_ASR_STORAGE_REGION: ${DALTON_ASR_STORAGE_REGION:-us-east-1}
+      DALTON_ASR_STORAGE_ADDRESSING_STYLE: ${DALTON_ASR_STORAGE_ADDRESSING_STYLE:-path}
+    volumes:
+      - dalton-asr-jobs:/var/lib/dalton/asr_jobs
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8965/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - core_internal
+      - sandbox-net
+
+  minio-s3:
+    profiles: ["transcription"]
+    image: ${DALTON_EDGE_IMAGE:-dalton-core-edge:local}
+    restart: unless-stopped
+    depends_on:
+      minio:
+        condition: service_healthy
+    # Exposes only MinIO's S3 API port (:9000) to sandbox-net when --profile transcription
+    # reuses the built-in MinIO service. MinIO itself, its console (:9001), and databases
+    # stay isolated on core_internal.
+    # Caddy 2.9.1 `caddy reverse-proxy` (`modules/caddyhttp/reverseproxy/command.go`) preserves
+    # the incoming Host header (including port, e.g. `minio-s3:9000`) by default unless
+    # `--change-host-header` is enabled; passing `--change-host-header=false` makes this explicit
+    # so S3v4 presigned PUT URLs signed for http://minio-s3:9000 validate identically at MinIO.
+    entrypoint: ["caddy"]
+    command:
+      [
+        "reverse-proxy",
+        "--from",
+        "http://:9000",
+        "--to",
+        "http://minio:9000",
+        "--change-host-header=false",
+      ]
+    networks:
+      - core_internal
+      - sandbox-net
+
   ssh-gateway:
     # !override drops upstream docker-compose.yml's shell-interpolated BYOK_ENCRYPTION_KEY
     # so ssh-gateway and backend always share the exact same key from `env_file: .env`.
@@ -317,5 +382,6 @@ networks:
 volumes:
   dalton-minio-data:
   dalton-backend-var:
+  dalton-asr-jobs:
   dalton-caddy-data:
   dalton-caddy-config:

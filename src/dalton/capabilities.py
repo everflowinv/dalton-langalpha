@@ -97,7 +97,7 @@ class CapabilityId(StrEnum):
     TMTB = "tmtb"  # TMT 总结库（依赖 researchdata_bridge）
     FUNDA_AI = "funda_ai"  # FUNDA AI 研究库（依赖 researchdata_bridge）
     FEISHU_DOCS = "feishu_docs"  # 飞书文档/知识空间读写（依赖 researchdata_bridge）
-    TRANSCRIPTION = "transcription"  # 语音转写（依赖 researchdata_bridge + 转写专用存储）
+    TRANSCRIPTION = "transcription"  # 语音转写（独立转写服务 + 转写专用存储）
     CHANNEL_GATEWAY = "channel_gateway"  # 多渠道网关总开关
     CHANNEL_FEISHU = "channel_feishu"  # 飞书卡片与群绑定（依赖 channel_gateway）
     CHANNEL_DISCORD = "channel_discord"  # Discord 频道与私信（依赖 channel_gateway）
@@ -195,8 +195,8 @@ _RAW_CAPABILITY_SPECS: tuple[CapabilitySpec, ...] = (
     ),
     CapabilitySpec(
         id=CapabilityId.TRANSCRIPTION,
-        description="语音转写（依赖 researchdata_bridge + 转写专用存储）",
-        depends_on=(CapabilityId.RESEARCHDATA_BRIDGE,),
+        description="语音转写（独立转写服务 + 转写专用存储）",
+        depends_on=(),
         everflow_default=False,
         core_default=False,
         legacy_env_vars=("DALTON_TRANSCRIPTION_ENABLED",),

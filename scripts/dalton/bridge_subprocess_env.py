@@ -89,6 +89,7 @@ BRIDGE_TOKEN_ENV_KEYS: frozenset[str] = frozenset(
     {
         "DALTON_BRIDGE_ADMIN_TOKEN",
         "DALTON_BRIDGE_TOKEN",
+        "DALTON_TRANSCRIPTION_TOKEN",
     }
 )
 

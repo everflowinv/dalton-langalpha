@@ -55,9 +55,10 @@ RUN if [ "$INSTALL_BROWSER_CRAWLER" = "true" ]; then \
         && uv run scrapling install; \
     fi
 
-# Install git + OC-1 data-task APT packages (poppler-utils, fonts-noto-cjk) at image build time
+# Install git + OC-1 data-task APT packages (poppler-utils, fonts-noto-cjk) + ffmpeg/ffprobe for transcription service
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
+    ffmpeg \
     poppler-utils \
     fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/* \

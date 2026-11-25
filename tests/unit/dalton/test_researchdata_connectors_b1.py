@@ -168,7 +168,7 @@ def test_resolve_host_platform_and_batch1_depends_on_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _clear_b1_env(monkeypatch)
-    # All 8 bridge sub-capabilities retain depends_on=(RESEARCHDATA_BRIDGE,) in Batch 1.
+    # Remaining 7 bridge sub-capabilities retain depends_on=(RESEARCHDATA_BRIDGE,).
     for cap in (
         CapabilityId.ALPHAENGINE,
         CapabilityId.GUIDEPOINT,
@@ -177,9 +177,11 @@ def test_resolve_host_platform_and_batch1_depends_on_unchanged(
         CapabilityId.TMTB,
         CapabilityId.FUNDA_AI,
         CapabilityId.FEISHU_DOCS,
-        CapabilityId.TRANSCRIPTION,
     ):
         assert CAPABILITY_SPECS[cap].depends_on == (CapabilityId.RESEARCHDATA_BRIDGE,)
+    # Batch 2 (docs/dalton/features/researchdata-connectors.md §6.3) decoupled
+    # TRANSCRIPTION from RESEARCHDATA_BRIDGE so standalone dalton-transcription runs without the bridge.
+    assert CAPABILITY_SPECS[CapabilityId.TRANSCRIPTION].depends_on == ()
 
     # Explicit macos keeps alphaengine enabled even inside a Linux container.
     monkeypatch.setattr(sys, "platform", "linux")

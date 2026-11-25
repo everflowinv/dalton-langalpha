@@ -312,6 +312,92 @@ DALTON_OPERATOR_LLM_ENDPOINTS=https://llm-gateway.corp.internal/v1
 | `BRAND_NAME` / `VITE_BRAND_NAME` | 自定义站点与智能体品牌名 | 默认 `Dalton` |
 | `DALTON_TIMEZONE` | 部署默认时区与预算日结时区（如 `Asia/Shanghai`） | 默认 `UTC` |
 
+### 5.4 可选能力：独立语音转写服务（`--profile transcription`）与对象存储初始化
+
+核心版内置开源语音转写服务 `transcription`（`python -m src.dalton.transcription_service`，监听容器内 `8965` 端口，镜像自带 `ffmpeg` 与 `ffprobe`，支持任意 OpenAI 兼容 Whisper 接口），通过 Compose `transcription` profile 按需开启，同时接入 `core_internal` 与 `sandbox-net` 网络。
+
+#### 第 1 步：准备专有对象存储与服务凭据
+
+在 `.env` 中生成独立管理凭据与票据签名密钥，并配置转写专用对象存储（以下示例复用内置 MinIO，也可替换为任意兼容 S3 的私有存储桶）：
+
+```bash
+# 生成独立管理凭据与票据签名密钥
+openssl rand -hex 32  # 填入 DALTON_TRANSCRIPTION_TOKEN
+openssl rand -hex 32  # 填入 DALTON_TRANSCRIPTION_TICKET_SECRET
+```
+
+在 `.env` 中写入以下配置（按实际 MinIO 凭据与 Whisper 服务地址填写）：
+
+```dotenv
+DALTON_TRANSCRIPTION_ENABLED=1
+DALTON_TRANSCRIPTION_SERVICE_URL=http://transcription:8965
+DALTON_TRANSCRIPTION_TOKEN=<随机32字节十六进制>
+DALTON_TRANSCRIPTION_TICKET_SECRET=<随机32字节十六进制>
+
+# 转写专用对象存储（私有桶；复用内置 MinIO 时填写与 MINIO_ROOT_USER / MINIO_ROOT_PASSWORD 一致的凭据）
+DALTON_ASR_STORAGE_ENDPOINT_URL=http://minio:9000
+# 对外签名地址（供 sandbox-net 中的沙箱直传分片）：复用内置 MinIO 时设为 http://minio-s3:9000；
+# 使用外部 S3 时设为沙箱可达的外部 S3 端点（兼容旧别名 DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL）
+DALTON_TRANSCRIPTION_S3_PUBLIC_ENDPOINT=http://minio-s3:9000
+DALTON_ASR_STORAGE_BUCKET_NAME=transcriptions
+DALTON_ASR_STORAGE_ACCESS_KEY_ID=<对象存储 Access Key>
+DALTON_ASR_STORAGE_SECRET_ACCESS_KEY=<对象存储 Secret Key>
+DALTON_ASR_STORAGE_REGION=us-east-1
+DALTON_ASR_STORAGE_ADDRESSING_STYLE=path
+
+# OpenAI 兼容 Whisper 接口（可指向 OpenAI、自建 faster-whisper-server 或企业网关）
+DALTON_WHISPER_API_BASE_URL=https://api.openai.com/v1
+DALTON_WHISPER_API_KEY=<Whisper API Key，留空时回退 OPENAI_API_KEY>
+DALTON_WHISPER_MODEL=whisper-1
+```
+
+> **内置 MinIO 沙箱上传与安全边界**：核心版默认将 `minio` 隔离在 `core_internal` 内。启用 `--profile transcription` 复用内置 MinIO 时，可同时启动同属 `transcription` profile 的 `minio-s3` 代理容器（复用 `dalton-core-edge` 镜像中的 Caddy，按 `DALTON_TRANSCRIPTION_S3_PUBLIC_ENDPOINT=http://minio-s3:9000` 生成预签名上传地址）：
+> - 仅向 `sandbox-net` 暴露 MinIO 的 S3 API 端口（`9000`），并原样透传请求 `Host` 头以匹配 S3v4 签名；
+> - `minio` 容器本体、控制台端口（`9001`）以及 `postgres` / `redis` 继续隔离在 `core_internal` 网络，宿主机暴露端口保持原状；
+> - 私有桶策略保持不变（仅允许持有效签名的请求访问，对象存储密钥仅保留在后端与转写服务内）；沙箱仅凭后端签发的单分片限长、15 分钟有效预签名 PUT 地址上传对应音频分片。
+
+#### 第 2 步：初始化私有转写存储桶并启动服务
+
+复用内置 MinIO 时，运行一次 `minio-init` 即可幂等创建私有桶 `transcriptions` 并清空匿名策略；使用外部 S3 时，请提前在云控制台创建同名的私有存储桶并授予 `DALTON_ASR_STORAGE_ACCESS_KEY_ID` 读写权限（此时只需启动 `transcription` 服务即可）。随后携带 `--profile transcription` 启动转写服务并重建 `backend` 使新 `.env` 生效：
+
+```bash
+cd /opt/dalton
+# 1. 初始化私有转写存储桶（复用内置 MinIO 时执行）
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env run --rm minio-init
+
+# 2. 启动 transcription 服务（复用内置 MinIO 时同时启动 minio-s3 代理）并重建 backend
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env --profile transcription up -d transcription minio-s3
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d --no-deps backend
+```
+
+#### 第 3 步：核验服务健康与能力状态
+
+```bash
+# 确认转写服务已持有排他锁且 ffmpeg / ffprobe 就绪
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env --profile transcription exec -T transcription \
+  curl -sf http://127.0.0.1:8965/healthz
+
+# 使用已登录用户的访问令牌确认后端能力列表已包含 transcription
+# （可通过浏览器登录后的会话令牌，或调用 POST /api/v1/dalton/auth/local/login 获取 access_token）
+ACCESS_TOKEN='<已登录用户的访问令牌>'
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T backend \
+  curl -sf -H "Authorization: Bearer ${ACCESS_TOKEN}" http://127.0.0.1:8000/api/v1/dalton/capabilities
+```
+
+`healthz` 返回 `owner_lock_held: true`、`ffmpeg_available: true`、`ffprobe_available: true`，且能力列表中出现 `transcription` 即表示就绪。
+
+停服维护前，在 `transcription` 容器内携带容器环境变量 `DALTON_TRANSCRIPTION_TOKEN` 发起停止接单，并轮询确认 `ready_for_handoff` 为 `true` 且 `active_jobs` 归零后再重启容器：
+
+```bash
+# 1. 在 transcription 容器内发起停止接单（携带 DALTON_TRANSCRIPTION_TOKEN）
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env --profile transcription exec -T transcription \
+  sh -c 'curl -sf -X POST -H "Authorization: Bearer ${DALTON_TRANSCRIPTION_TOKEN}" -H "Content-Type: application/json" -d "{\"drain\":true}" http://127.0.0.1:8965/transcriptions/drain'
+
+# 2. 在 transcription 容器内查询停止接单状态，确认 ready_for_handoff=true 且 active_jobs=0
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env --profile transcription exec -T transcription \
+  sh -c 'curl -sf -H "Authorization: Bearer ${DALTON_TRANSCRIPTION_TOKEN}" http://127.0.0.1:8965/transcriptions/drain'
+```
+
 ---
 
 ## 6. 备份、恢复与平滑升级

@@ -36,6 +36,7 @@ import asr_jobs  # noqa: E402  (scripts/dalton, on sys.path like the other A1 te
 
 _ALL_STORE_VARS = (
     "DALTON_ASR_STORAGE_ENDPOINT_URL",
+    "DALTON_TRANSCRIPTION_S3_PUBLIC_ENDPOINT",
     "DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL",
     "DALTON_ASR_STORAGE_BUCKET_NAME",
     "DALTON_ASR_STORAGE_ACCESS_KEY_ID",
@@ -136,6 +137,39 @@ def test_signing_endpoint_falls_back_to_plain_endpoint(
         "DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL", "http://host.docker.internal:9000/"
     )
     assert tstore.signing_endpoint_url() == "http://host.docker.internal:9000"
+
+
+def test_public_endpoint_takes_precedence_and_drives_presigned_upload_urls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _clear_store_env(monkeypatch)
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_S3_PUBLIC_ENDPOINT", "http://minio-s3:9000/")
+    assert tstore.is_transcription_storage_configured() is False
+
+    _configure_store(
+        monkeypatch, signing_endpoint="http://host.docker.internal:9000"
+    )
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_S3_PUBLIC_ENDPOINT", "http://minio-s3:9000/")
+    assert tstore.signing_endpoint_url() == "http://minio-s3:9000"
+
+    built: dict[str, int] = {}
+
+    def _record_build(endpoint_url: str) -> Any:
+        built[endpoint_url] = built.get(endpoint_url, 0) + 1
+        return _autospec_s3_client()
+
+    monkeypatch.setattr(
+        tstore,
+        "_build_client",
+        create_autospec(tstore._build_client, side_effect=_record_build),
+    )
+
+    assert tstore.sign_upload_part("k", "mp-001", part_number=1, size=5)
+    assert tstore.open_multipart_upload("k", content_type="audio/mp4") is not None
+    assert built == {
+        "http://minio-s3:9000": 1,
+        "http://minio:9000": 1,
+    }
 
 
 # ---------------------------------------------------------------------------

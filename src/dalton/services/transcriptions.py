@@ -39,11 +39,14 @@ from src.dalton.database.transcriptions import (
     TERMINAL_TRANSCRIPTION_STATUSES,
     TranscriptionJobStatus,
 )
+from src.dalton.profile import DeploymentProfile, resolve_profile
 from src.dalton.settings import (
     get_dalton_bridge_admin_token,
-    get_dalton_bridge_base_url,
     get_dalton_settings,
+    get_dalton_transcription_service_url,
     get_dalton_transcription_ticket_hmac_key,
+    get_dalton_transcription_token,
+    has_explicit_transcription_service_url,
 )
 from src.dalton.transcription_storage import (
     abort_multipart_upload,
@@ -444,43 +447,63 @@ async def authorize_job_access(
         raise
 
 
-def _bridge_admin_headers() -> dict[str, str]:
-    admin_token = get_dalton_bridge_admin_token()
-    if not admin_token:
+def _uses_legacy_everflow_bridge_transcription() -> bool:
+    """Return True for pre-cutover Everflow deployments without an explicit transcription service URL."""
+    return (
+        resolve_profile() is DeploymentProfile.EVERFLOW
+        and not has_explicit_transcription_service_url()
+    )
+
+
+def _transcription_service_headers() -> dict[str, str]:
+    if _uses_legacy_everflow_bridge_transcription():
+        token = get_dalton_bridge_admin_token()
+        if not token:
+            raise HTTPException(
+                status_code=503,
+                detail="DALTON_BRIDGE_ADMIN_TOKEN is not configured on backend",
+            )
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "X-Dalton-Bridge-Token": token,
+        }
+    token = get_dalton_transcription_token()
+    if not token:
         raise HTTPException(
             status_code=503,
-            detail="DALTON_BRIDGE_ADMIN_TOKEN is not configured on backend",
+            detail="DALTON_TRANSCRIPTION_TOKEN is not configured on backend",
         )
     return {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {admin_token}",
-        "X-Dalton-Bridge-Token": admin_token,
+        "Authorization": f"Bearer {token}",
+        "X-Dalton-Transcription-Token": token,
     }
 
 
-def _require_transcription_bridge_url() -> str:
-    """Return the host bridge base URL for transcription calls, failing closed when disabled."""
+def _require_transcription_service_url() -> str:
+    """Return the standalone transcription service base URL, failing closed when disabled."""
     from src.dalton.capabilities import CapabilityId, has_capability
 
-    if not has_capability(CapabilityId.RESEARCHDATA_BRIDGE):
-        raise RuntimeError("researchdata_bridge capability is disabled")
-    bridge_url = get_dalton_bridge_base_url().rstrip("/")
-    if not bridge_url:
-        raise RuntimeError("researchdata bridge URL is not configured")
-    return bridge_url
+    if not has_capability(CapabilityId.TRANSCRIPTION):
+        raise RuntimeError("transcription capability is disabled")
+    service_url = get_dalton_transcription_service_url().rstrip("/")
+    if not service_url:
+        raise RuntimeError("transcription service URL is not configured")
+    return service_url
 
 
 async def call_bridge_submit_transcription(
     payload: dict[str, Any],
 ) -> tuple[int, dict[str, Any]]:
-    """POST `payload` to `{bridge_url}/transcriptions` using the bridge admin token."""
-    bridge_url = _require_transcription_bridge_url()
-    headers = _bridge_admin_headers()
+    """POST ``payload`` to ``{transcription_service_url}/transcriptions`` with ``DALTON_TRANSCRIPTION_TOKEN``."""
+    service_url = _require_transcription_service_url()
+    headers = _transcription_service_headers()
     async with httpx.AsyncClient(
         timeout=BRIDGE_TRANSCRIPTION_TIMEOUT_S, trust_env=False
     ) as client:
         resp = await client.post(
-            f"{bridge_url}/transcriptions", json=payload, headers=headers
+            f"{service_url}/transcriptions", json=payload, headers=headers
         )
         return _parse_bridge_response(resp)
 
@@ -488,14 +511,14 @@ async def call_bridge_submit_transcription(
 async def call_bridge_get_transcription(
     job_id: str,
 ) -> tuple[int, dict[str, Any]]:
-    """GET `{bridge_url}/transcriptions/{job_id}` using the bridge admin token."""
-    bridge_url = _require_transcription_bridge_url()
-    headers = _bridge_admin_headers()
+    """GET ``{transcription_service_url}/transcriptions/{job_id}`` with ``DALTON_TRANSCRIPTION_TOKEN``."""
+    service_url = _require_transcription_service_url()
+    headers = _transcription_service_headers()
     async with httpx.AsyncClient(
         timeout=BRIDGE_TRANSCRIPTION_TIMEOUT_S, trust_env=False
     ) as client:
         resp = await client.get(
-            f"{bridge_url}/transcriptions/{job_id}", headers=headers
+            f"{service_url}/transcriptions/{job_id}", headers=headers
         )
         return _parse_bridge_response(resp)
 
@@ -503,14 +526,14 @@ async def call_bridge_get_transcription(
 async def call_bridge_get_transcription_result(
     job_id: str,
 ) -> tuple[int, dict[str, Any]]:
-    """GET `{bridge_url}/transcriptions/{job_id}/result` using the bridge admin token."""
-    bridge_url = _require_transcription_bridge_url()
-    headers = _bridge_admin_headers()
+    """GET ``{transcription_service_url}/transcriptions/{job_id}/result`` with ``DALTON_TRANSCRIPTION_TOKEN``."""
+    service_url = _require_transcription_service_url()
+    headers = _transcription_service_headers()
     async with httpx.AsyncClient(
         timeout=BRIDGE_TRANSCRIPTION_TIMEOUT_S, trust_env=False
     ) as client:
         resp = await client.get(
-            f"{bridge_url}/transcriptions/{job_id}/result", headers=headers
+            f"{service_url}/transcriptions/{job_id}/result", headers=headers
         )
         return _parse_bridge_response(resp)
 
@@ -518,14 +541,14 @@ async def call_bridge_get_transcription_result(
 async def open_bridge_raw_result_stream(
     job_id: str,
 ) -> tuple[int, dict[str, Any] | AsyncIterator[bytes]]:
-    """Open a streaming GET to `{bridge_url}/transcriptions/{job_id}/result/raw` using the bridge admin token."""
-    bridge_url = _require_transcription_bridge_url()
-    headers = _bridge_admin_headers()
+    """Open a streaming GET to ``{transcription_service_url}/transcriptions/{job_id}/result/raw``."""
+    service_url = _require_transcription_service_url()
+    headers = _transcription_service_headers()
     client = httpx.AsyncClient(
         timeout=BRIDGE_TRANSCRIPTION_TIMEOUT_S, trust_env=False
     )
     req = client.build_request(
-        "GET", f"{bridge_url}/transcriptions/{job_id}/result/raw", headers=headers
+        "GET", f"{service_url}/transcriptions/{job_id}/result/raw", headers=headers
     )
     try:
         resp = await client.send(req, stream=True)
@@ -542,7 +565,7 @@ async def open_bridge_raw_result_stream(
         except Exception:
             data = {
                 "ok": False,
-                "error": f"Bridge returned HTTP {resp.status_code}",
+                "error": f"Transcription service returned HTTP {resp.status_code}",
             }
         finally:
             await resp.aclose()
@@ -566,16 +589,16 @@ async def call_bridge_action_transcription(
     action: str,
     payload: dict[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
-    """POST `{bridge_url}/transcriptions/{job_id}/{action}` (`retry` or `cancel`)."""
+    """POST ``{transcription_service_url}/transcriptions/{job_id}/{action}`` (``retry`` or ``cancel``)."""
     if action not in ("retry", "cancel"):
-        raise ValueError(f"Unsupported bridge transcription action: {action!r}")
-    bridge_url = _require_transcription_bridge_url()
-    headers = _bridge_admin_headers()
+        raise ValueError(f"Unsupported transcription service action: {action!r}")
+    service_url = _require_transcription_service_url()
+    headers = _transcription_service_headers()
     async with httpx.AsyncClient(
         timeout=BRIDGE_TRANSCRIPTION_TIMEOUT_S, trust_env=False
     ) as client:
         resp = await client.post(
-            f"{bridge_url}/transcriptions/{job_id}/{action}",
+            f"{service_url}/transcriptions/{job_id}/{action}",
             json=payload or {},
             headers=headers,
         )
@@ -591,7 +614,7 @@ def _parse_bridge_response(resp: httpx.Response) -> tuple[int, dict[str, Any]]:
         data = {
             "ok": False,
             "status": "http_error",
-            "error": f"Bridge returned HTTP {resp.status_code}",
+            "error": f"Transcription service returned HTTP {resp.status_code}",
         }
     return resp.status_code, data
 
@@ -2553,12 +2576,12 @@ async def cancel_transcription_job(
 
 
 def is_transcription_enabled() -> bool:
-    """Return True only when the transcription capability is active (bridge + storage + switch).
+    """Return True only when the transcription capability is active (switch + dedicated ASR storage).
 
     Delegates to :func:`src.dalton.capabilities.effective_capabilities` so
-    ``DALTON_CAP_TRANSCRIPTION``, ``DALTON_TRANSCRIPTION_ENABLED``,
-    ``researchdata_bridge`` dependency, and dedicated ``DALTON_ASR_STORAGE_*``
-    storage are all evaluated consistently.
+    ``DALTON_CAP_TRANSCRIPTION``, ``DALTON_TRANSCRIPTION_ENABLED``, and
+    dedicated ``DALTON_ASR_STORAGE_*`` storage are all evaluated consistently
+    (independent of ``researchdata_bridge``).
     """
     from src.dalton.capabilities import CapabilityId, effective_capabilities
 

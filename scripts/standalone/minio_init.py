@@ -24,6 +24,52 @@ def _env(primary: str, *fallbacks: str, default: str = "") -> str:
     return default
 
 
+def _ensure_private_bucket(
+    client: object,
+    *,
+    bucket: str,
+    region: str,
+    endpoint: str,
+) -> int:
+    try:
+        client.head_bucket(Bucket=bucket)  # type: ignore[attr-defined]
+        print(f"[minio-init] Bucket '{bucket}' already exists.", flush=True)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
+        if code in ("404", "NoSuchBucket", "NotFound") or status == 404:
+            create_kwargs: dict[str, object] = {"Bucket": bucket}
+            if region and region != "us-east-1":
+                create_kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
+            client.create_bucket(**create_kwargs)  # type: ignore[attr-defined]
+            print(f"[minio-init] Created bucket '{bucket}'.", flush=True)
+        else:
+            print(f"[minio-init] ERROR checking bucket '{bucket}': {exc}", file=sys.stderr)
+            return 1
+
+    # Ensure no anonymous public policy is attached.
+    try:
+        client.delete_bucket_policy(Bucket=bucket)  # type: ignore[attr-defined]
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code != "NoSuchBucketPolicy":
+            print(
+                f"[minio-init] ERROR clearing bucket policy on '{bucket}': {exc}",
+                file=sys.stderr,
+            )
+            return 1
+    except Exception as exc:
+        print(
+            f"[minio-init] ERROR clearing bucket policy on '{bucket}': {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    client.head_bucket(Bucket=bucket)  # type: ignore[attr-defined]
+    print(f"[minio-init] Verified private bucket '{bucket}' at {endpoint}.", flush=True)
+    return 0
+
+
 def main() -> int:
     endpoint = _env(
         "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL",
@@ -82,42 +128,23 @@ def main() -> int:
         ),
     )
 
-    try:
-        client.head_bucket(Bucket=bucket)
-        print(f"[minio-init] Bucket '{bucket}' already exists.", flush=True)
-    except ClientError as exc:
-        code = str(exc.response.get("Error", {}).get("Code", ""))
-        status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
-        if code in ("404", "NoSuchBucket", "NotFound") or status == 404:
-            create_kwargs: dict[str, object] = {"Bucket": bucket}
-            if region and region != "us-east-1":
-                create_kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
-            client.create_bucket(**create_kwargs)
-            print(f"[minio-init] Created bucket '{bucket}'.", flush=True)
-        else:
-            print(f"[minio-init] ERROR checking bucket '{bucket}': {exc}", file=sys.stderr)
-            return 1
+    rc = _ensure_private_bucket(client, bucket=bucket, region=region, endpoint=endpoint)
+    if rc != 0:
+        return rc
 
-    # Ensure no anonymous public policy is attached.
-    try:
-        client.delete_bucket_policy(Bucket=bucket)
-    except ClientError as exc:
-        code = str(exc.response.get("Error", {}).get("Code", ""))
-        if code != "NoSuchBucketPolicy":
-            print(
-                f"[minio-init] ERROR clearing bucket policy on '{bucket}': {exc}",
-                file=sys.stderr,
+    # Optional transcription bucket initialization when DALTON_ASR_STORAGE_BUCKET_NAME is set
+    # against the same MinIO endpoint (keeps default Core behavior unchanged when unset).
+    asr_bucket = _env("DALTON_ASR_STORAGE_BUCKET_NAME")
+    if asr_bucket and asr_bucket != bucket:
+        asr_endpoint = _env("DALTON_ASR_STORAGE_ENDPOINT_URL", default=endpoint).rstrip("/")
+        if asr_endpoint == endpoint:
+            asr_region = _env("DALTON_ASR_STORAGE_REGION", default=region)
+            rc = _ensure_private_bucket(
+                client, bucket=asr_bucket, region=asr_region, endpoint=asr_endpoint
             )
-            return 1
-    except Exception as exc:
-        print(
-            f"[minio-init] ERROR clearing bucket policy on '{bucket}': {exc}",
-            file=sys.stderr,
-        )
-        return 1
+            if rc != 0:
+                return rc
 
-    client.head_bucket(Bucket=bucket)
-    print(f"[minio-init] Verified private bucket '{bucket}' at {endpoint}.", flush=True)
     return 0
 
 
