@@ -484,7 +484,9 @@ def validate_model_fields(
         except ReasoningSurfaceError as exc:
             raise CatalogValidationError("invalid_reasoning_surface", str(exc)) from exc
 
-    # Pricing numbers & billing consistency
+    # Pricing numbers & billing consistency (unified via resolve_model_billing)
+    from src.dalton.services.team_model_catalog.billing import resolve_model_billing
+
     prov_billing = str(provider_info.get("billing") or "").strip().lower()
     meta_billing = str((dalton_meta_entry or {}).get("billing") or "").strip().lower()
     if prov_billing == "subscription" and meta_billing == "cash":
@@ -492,18 +494,20 @@ def validate_model_fields(
             "invalid_billing",
             f"Model {model_key!r} on subscription provider {provider!r} cannot override billing to 'cash'.",
         )
-    is_subscription_route = (
-        prov_billing == "subscription"
-        or meta_billing == "subscription"
-        or _is_oauth_model_key(provider.lower())
-        or provider == "z-ai-cn-coding"
+    billing = resolve_model_billing(
+        model_key=model_key,
+        provider=provider,
+        model_id=str(model_entry.get("model_id") or model_key).strip(),
+        provider_info=provider_info,
+        dalton_meta_entry=dalton_meta_entry,
     )
-    billing = "subscription" if is_subscription_route else "cash"
+    is_subscription_route = billing == "subscription"
     if pricing_card is not None:
         validate_pricing_card_numbers(pricing_card, f"pricing.{model_key}")
-        if is_subscription_route and (
-            pricing_explicit or _pricing_card_has_nonzero_rate(pricing_card)
-        ):
+        # Reject newly setting/adding cash rates on subscription routes, while permitting
+        # unrelated edits (pricing_explicit=False) on legacy subscription models that still
+        # carry an inherited cash pricing card (which can be cleared via pricing=null).
+        if is_subscription_route and pricing_explicit:
             raise CatalogValidationError(
                 "subscription_cash_pricing_forbidden",
                 f"Subscription-billed model {model_key!r} cannot configure cash pricing rates; "

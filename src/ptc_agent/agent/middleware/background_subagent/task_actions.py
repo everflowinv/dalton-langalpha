@@ -748,19 +748,25 @@ async def _handle_resume(
                 return refusal
         # Before the fence, so a refused model holds nothing once the claim
         # drops on the way out.
+        # DALTON-HOOK(team-model-catalog): call load_run_recovery_context FIRST to obtain the
+        # predecessor's model_key, effective_catalog_snapshot, and capability enforcement, then
+        # derive the target model/effort and bind the snapshot before building the client.
+        from contextlib import nullcontext
+
+        from fastapi import HTTPException
+
+        from src.dalton.services.team_model_catalog.snapshot import (
+            bind_recovery_context,
+            load_run_recovery_context,
+        )
+
+        pred_row: dict[str, Any] | None = prior_run
         try:
             # DALTON-HOOK(subagent-resume): reuse the latest row already read
             # during orphan arbitration instead of hitting the ledger twice
             # before acquiring the fence.
-            if ask.complete:
-                runs = ask
-            else:
-                last_ask = (
-                    TaskAsk.from_facts(prior_run.get("replay_facts") or {})
-                    if prior_run is not None
-                    else await _last_ask(mw, task)
-                )
-                runs = ask.over(last_ask)
+            if pred_row is None and mw.registry.run_ledger is not None:
+                pred_row = await _read_latest_run(mw, task)
         except Exception:
             logger.warning("latest run read failed", task_id=task.task_id, exc_info=True)
             return _refusal(
@@ -768,13 +774,77 @@ async def _handle_resume(
                 "just now. Try again.",
                 tool_call_id,
             )
-        override = await _resolve_model(mw, runs, task.subagent_type) if runs else None
+
+        subagent_recovery_ctx = None
+        if pred_row is not None:
+            try:
+                subagent_recovery_ctx = await load_run_recovery_context(
+                    run_id=str(pred_row.get("task_run_id") or "") or None,
+                    is_subagent=True,
+                    run_row=pred_row,
+                    explicit_model_key=ask.model,
+                    enforce_capabilities=True,
+                )
+            except HTTPException as exc:
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                msg = str(detail.get("message") or f"Model cannot be resumed ({exc.status_code}).")
+                return _refusal(f"Error: {msg}", tool_call_id)
+            except Exception:
+                logger.warning(
+                    "subagent recovery context load failed",
+                    task_id=task.task_id,
+                    exc_info=True,
+                )
+
+        if ask.complete:
+            runs = ask
+        else:
+            last_ask = (
+                TaskAsk.from_facts(pred_row.get("replay_facts") or {})
+                if pred_row is not None
+                else (task.ask or TaskAsk())
+            )
+            runs = ask.over(last_ask)
+
+        # When recovery context provides a snapshot covering the resumed model, pin to the
+        # predecessor's model_key (unless caller explicitly requested another) and bind the
+        # snapshot before _resolve_model verifies credentials and constructs the client.
+        # If recovery context or its snapshot is absent (pre-ledger task or unbackfillable
+        # legacy run), fall back to the existing live-catalog resolution via ``runs``.
+        use_recovery_snapshot = (
+            subagent_recovery_ctx is not None and subagent_recovery_ctx.snapshot is not None
+        )
+        resolve_ask = runs
+        if (
+            use_recovery_snapshot
+            and (not resolve_ask or resolve_ask.model is None)
+            and subagent_recovery_ctx is not None
+            and subagent_recovery_ctx.model_key
+        ):
+            resolve_ask = TaskAsk(
+                model=subagent_recovery_ctx.model_key,
+                effort=resolve_ask.effort if resolve_ask else None,
+            )
+        with (
+            bind_recovery_context(subagent_recovery_ctx)
+            if use_recovery_snapshot
+            else nullcontext()
+        ):
+            override = (
+                await _resolve_model(mw, resolve_ask, task.subagent_type)
+                if resolve_ask
+                else None
+            )
         if isinstance(override, TaskModelRefused):
             # DALTON-HOOK(computer-cli-tokens-off): omit `la models list` when CLI tokens are off.
             from src.dalton.settings import is_computer_cli_tokens_enabled
 
             # A model carried over is one the agent never named on this call.
-            carried = runs.model if ask.model is None else None
+            carried = (
+                (resolve_ask.model if resolve_ask else runs.model)
+                if ask.model is None
+                else None
+            )
             suffix = (
                 "Resume it with model set to another from `la models list`."
                 if is_computer_cli_tokens_enabled()

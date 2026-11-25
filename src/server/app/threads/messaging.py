@@ -489,8 +489,9 @@ async def _handle_send_message(
     raw_request: Request | None = None,
     *,
     retry_of_run_id: str | None = None,
-    # DALTON-HOOK(team-model-catalog): route-internal authoritative effective_catalog_snapshot loaded from DB
+    # DALTON-HOOK(team-model-catalog): route-internal authoritative recovery context / snapshot loaded from DB
     inherited_catalog_snapshot: dict | None = None,
+    recovery_context: Any | None = None,
 ):
     """Shared logic for both POST /threads/messages and POST /threads/{id}/messages.
 
@@ -799,41 +800,68 @@ async def _handle_send_message(
             resolve_turn_config_with_automation_inheritance,
         )
 
-        # DALTON-HOOK(team-model-catalog): authoritatively load persisted effective_catalog_snapshot
-        # for cross-deploy restart resumes (server-only resume_of_run_id) and bind it across LLM
-        # client construction so key_fingerprint / bound_base_url checks enforce the turn snapshot.
+        # DALTON-HOOK(team-model-catalog): single recovery entry point — load original run's
+        # model_key, effective_catalog_snapshot, and capability checks BEFORE model selection
+        # and LLM client construction so resumes never drift to new account/thread defaults.
         from contextlib import nullcontext
 
         from src.dalton.services.team_model_catalog.snapshot import (
             bind_catalog_snapshot,
-            load_run_catalog_snapshot,
+            bind_recovery_context,
+            enforce_snapshot_capabilities,
+            load_run_recovery_context,
         )
 
-        effective_inherited_snapshot = inherited_catalog_snapshot
+        effective_recovery_ctx = recovery_context
         if (
-            effective_inherited_snapshot is None
+            effective_recovery_ctx is None
             and from_service
             and getattr(request, "resume_of_run_id", None)
         ):
             try:
-                effective_inherited_snapshot = await load_run_catalog_snapshot(
+                effective_recovery_ctx = await load_run_recovery_context(
                     str(request.resume_of_run_id),
                     thread_id=thread_id,
                     is_subagent=False,
+                    explicit_model_key=requested_model,
+                    enforce_capabilities=True,
                 )
+            except HTTPException:
+                raise
             except Exception as _snap_load_err:
                 logger.warning(
-                    "[PTC_CHAT] Failed to load catalog snapshot for resume_of_run_id=%s: %s",
+                    "[PTC_CHAT] Failed to load recovery context for resume_of_run_id=%s: %s",
                     request.resume_of_run_id,
                     type(_snap_load_err).__name__,
                 )
 
+        effective_inherited_snapshot = (
+            effective_recovery_ctx.snapshot
+            if effective_recovery_ctx is not None
+            else inherited_catalog_snapshot
+        )
+        if effective_recovery_ctx is None and effective_inherited_snapshot is not None:
+            enforce_snapshot_capabilities(requested_model, effective_inherited_snapshot)
+
+        # Pin to the original run's selected model_key before model selection so a mid-outage
+        # default-model change (A -> B) does not cause a resumed turn to switch to B.
+        if (
+            requested_model is None
+            and effective_recovery_ctx is not None
+            and effective_recovery_ctx.model_key
+        ):
+            requested_model = effective_recovery_ctx.model_key
+
         fallback_records: list[dict[str, object]] = []
         automation_run_ctx: dict[str, object] = {}
         with (
-            bind_catalog_snapshot(effective_inherited_snapshot)
-            if effective_inherited_snapshot is not None
-            else nullcontext()
+            bind_recovery_context(effective_recovery_ctx)
+            if effective_recovery_ctx is not None
+            else (
+                bind_catalog_snapshot(effective_inherited_snapshot)
+                if effective_inherited_snapshot is not None
+                else nullcontext()
+            )
         ):
             config = await resolve_turn_config_with_automation_inheritance(
                 user_id=user_id,
@@ -2128,25 +2156,34 @@ async def retry_thread(
         await scope.release_slot()
         raise
 
-    # DALTON-HOOK(team-model-catalog): authoritatively load persisted effective_catalog_snapshot
-    # from the retried DB row on server restart-resume retries (never from untrusted request body).
+    # DALTON-HOOK(team-model-catalog): authoritatively load recovery context (model_key +
+    # effective_catalog_snapshot + capability enforcement) from the retried DB row via the
+    # unified recovery entry point (never from untrusted request body).
     from src.server.contracts.status import is_restart_interrupted
 
-    inherited_catalog_snapshot = None
+    retry_recovery_ctx = None
     if _is_service_request(raw_request) or (
         is_restart_interrupted(latest) and not (body and body.llm_model)
     ):
         try:
             from src.dalton.services.team_model_catalog.snapshot import (
-                ensure_run_catalog_snapshot,
+                load_run_recovery_context,
             )
 
-            inherited_catalog_snapshot = await ensure_run_catalog_snapshot(
-                latest, is_subagent=False
+            retry_recovery_ctx = await load_run_recovery_context(
+                latest_run_id,
+                thread_id=thread_id,
+                is_subagent=False,
+                run_row=latest,
+                explicit_model_key=(body.llm_model if body else None),
+                enforce_capabilities=True,
             )
+        except HTTPException:
+            await scope.release_slot()
+            raise
         except Exception as _retry_snap_err:
             logger.warning(
-                "[RETRY] Failed to load catalog snapshot for run=%s: %s",
+                "[RETRY] Failed to load recovery context for run=%s: %s",
                 latest_run_id,
                 type(_retry_snap_err).__name__,
             )
@@ -2155,13 +2192,17 @@ async def retry_thread(
         request = request.model_copy(update={"checked_computer_id": checked})
     # Retry provenance travels as a route-internal parameter, never in the
     # body.
+    # DALTON-HOOK(team-model-catalog): forward authoritative recovery context & snapshot to _handle_send_message
     return await _handle_send_message(
         request,
         auth,
         thread_id,
         raw_request,
         retry_of_run_id=latest_run_id,
-        inherited_catalog_snapshot=inherited_catalog_snapshot,
+        inherited_catalog_snapshot=(
+            retry_recovery_ctx.snapshot if retry_recovery_ctx is not None else None
+        ),
+        recovery_context=retry_recovery_ctx,
     )
 
 

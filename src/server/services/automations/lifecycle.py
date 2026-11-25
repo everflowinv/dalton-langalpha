@@ -767,6 +767,8 @@ async def create_automation(
             conn=write_conn,
         )
 
+    # DALTON-HOOK(team-model-catalog): run create inside an explicit transaction holding the
+    # shared catalog lock (with unit-test fallback when the pool is closed and create_automation is mocked).
     if conn is None:
         try:
             async with get_db_connection() as tx_conn, tx_conn.transaction():
@@ -1542,6 +1544,8 @@ async def update_automation(
                 automation_id, user_id, conn=write_conn, **update_kwargs
             )
 
+    # DALTON-HOOK(team-model-catalog): run update inside an explicit transaction holding the
+    # shared catalog lock (with unit-test fallback when the pool is closed and update_automation is mocked).
     if conn is None:
         try:
             async with get_db_connection() as tx_conn, tx_conn.transaction():

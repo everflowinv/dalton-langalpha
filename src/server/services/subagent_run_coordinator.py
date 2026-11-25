@@ -146,15 +146,22 @@ class SubagentRunCoordinator:
                 start_checkpoint_id = pred.get("final_checkpoint_id")
                 try:
                     from src.dalton.services.team_model_catalog.snapshot import (
-                        ensure_run_catalog_snapshot,
+                        load_run_recovery_context,
                     )
 
-                    inherited_subagent_snapshot = await ensure_run_catalog_snapshot(
-                        pred, is_subagent=True
+                    recovery_ctx = await load_run_recovery_context(
+                        run_id=predecessor_run_id,
+                        is_subagent=True,
+                        run_row=pred,
+                        explicit_model_key=model_override,
+                        enforce_capabilities=False,
+                    )
+                    inherited_subagent_snapshot = (
+                        recovery_ctx.snapshot if recovery_ctx is not None else None
                     )
                 except Exception as _sub_snap_err:
                     logger.warning(
-                        "[subagent_coordinator] Failed to load catalog snapshot for resumed task %s: %s",
+                        "[subagent_coordinator] Failed to load recovery context for resumed task %s: %s",
                         task_id,
                         type(_sub_snap_err).__name__,
                     )

@@ -815,6 +815,7 @@ class RunCoordinator:
                     usage.record_tool_usage_batch(outcome.tool_usage)
                 # final_status comes from the CAS row, not outcome.status: durable
                 # cancel intent may have overridden it.
+                # DALTON-HOOK(team-model-catalog): persist usage inside the snapshot-bound finalize transaction.
                 ok = await usage.persist_usage(
                     response_id=handle.run_id,
                     deepthinking=outcome.metadata.get("deepthinking", False),

@@ -240,6 +240,17 @@ def select_model(
     """
     from ptc_agent.config import LLMConfig
 
+    # DALTON-HOOK(team-model-catalog): on a resumed primary turn under an active recovery context,
+    # pin to the original run's selected model_key instead of drifting to a newly saved default.
+    if request_model is None and slot == "primary":
+        from src.dalton.services.team_model_catalog.snapshot import (
+            get_active_recovery_context,
+        )
+
+        rec_ctx = get_active_recovery_context()
+        if rec_ctx is not None and not rec_ctx.is_subagent and rec_ctx.model_key:
+            request_model = rec_ctx.model_key
+
     model_field, pref_key = _SLOT_MODEL_MAP[slot]
     saved = saved_default_model(model_pref, slot)
 

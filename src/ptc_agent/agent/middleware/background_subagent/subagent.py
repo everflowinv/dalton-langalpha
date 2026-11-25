@@ -1204,6 +1204,24 @@ class SubAgentMiddleware(AgentMiddleware):
         self.tools = [task_tool]
 
     def _graph_on(self, subagent_type: str, on: TaskModel) -> Runnable:
+        # DALTON-HOOK(team-model-catalog): when a resumed subagent runs under a bound catalog
+        # snapshot, compile directly with its snapshot-resolved TaskModel client instead of
+        # colliding with live-catalog entries in self._model_graphs.
+        from src.dalton.services.team_model_catalog.snapshot import (
+            get_active_catalog_snapshot,
+        )
+
+        active_snap = get_active_catalog_snapshot()
+        snap_models = active_snap.get("models") if isinstance(active_snap, dict) else None
+        if isinstance(snap_models, dict) and on.name in snap_models:
+            claude_code = (
+                self._claude_code_on(on.claude_code)
+                if on.claude_code is not None and self._claude_code_on is not None
+                else None
+            )
+            return self._build_graph(
+                self._compile_on(subagent_type, on), claude_code=claude_code
+            )
         # Where Claude Code was placed too: two Tasks resolving at once can be
         # placed apart, and the graph keeps the computer it was built for.
         key = (subagent_type, on.name, on.effort, on.claude_code)

@@ -296,10 +296,15 @@ def _merge_db_payload_layer(
                         )
                         continue
                     patch_copy = copy.deepcopy(dict(patch))
-                    if isinstance(patch_copy.get("pricing"), Mapping):
+                    clear_pricing = "pricing" in patch_copy and patch_copy["pricing"] is None
+                    if clear_pricing:
+                        patch_copy.pop("pricing", None)
+                    elif isinstance(patch_copy.get("pricing"), Mapping):
                         patch_copy["pricing"] = normalize_cash_pricing_card(patch_copy["pricing"])
                     _deep_merge_patch(card, patch_copy)
-                    if isinstance(card.get("pricing"), Mapping):
+                    if clear_pricing:
+                        card.pop("pricing", None)
+                    elif isinstance(card.get("pricing"), Mapping):
                         card["pricing"] = normalize_cash_pricing_card(card["pricing"])
 
     # 4. Models (with §7.2 upgrade same-name promotion by key.lower())

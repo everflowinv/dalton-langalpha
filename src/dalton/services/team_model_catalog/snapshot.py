@@ -25,9 +25,11 @@ import logging
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from contextlib import aclosing, contextmanager, suppress
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 from src.dalton.llm.egress_policy import canonical_url_key
+from src.dalton.services.team_model_catalog.billing import resolve_model_billing
 from src.dalton.services.team_model_catalog.constants import (
     TURN_SNAPSHOT_SCHEMA,
     norm_id,
@@ -36,14 +38,54 @@ from src.dalton.services.team_model_catalog.constants import (
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass(frozen=True)
+class SnapshotClientParams:
+    """Client construction parameters derived from a snapshotted model entry."""
+
+    model_key: str
+    provider: str
+    model_id: str
+    parameters: dict[str, Any]
+    extra_body: dict[str, Any]
+    additional_betas: list[str]
+    reasoning: dict[str, Any] | None
+    use_response_api: bool | None
+    system_provider: str | None
+    provider_info: dict[str, Any]
+    catalog_defined: bool
+    bound_base_url: str | None
+    canonical_bound_url: str | None
+    key_fingerprint: str | None
+
+
+@dataclass(frozen=True)
+class RunRecoveryContext:
+    """Authoritative recovery context loaded for a persisted main or subagent run."""
+
+    run_id: str
+    is_subagent: bool
+    model_key: str | None
+    snapshot: dict[str, Any] | None
+    client_params: SnapshotClientParams | None
+
+
 _ACTIVE_CATALOG_SNAPSHOT: ContextVar[dict[str, Any] | None] = ContextVar(
     "dalton_active_catalog_snapshot", default=None
+)
+_ACTIVE_RECOVERY_CONTEXT: ContextVar[RunRecoveryContext | None] = ContextVar(
+    "dalton_active_recovery_context", default=None
 )
 
 
 def get_active_catalog_snapshot() -> dict[str, Any] | None:
     """Return the ``effective_catalog_snapshot`` bound to the current async/thread context."""
     return _ACTIVE_CATALOG_SNAPSHOT.get()
+
+
+def get_active_recovery_context() -> RunRecoveryContext | None:
+    """Return the active :class:`RunRecoveryContext` bound to the current execution context."""
+    return _ACTIVE_RECOVERY_CONTEXT.get()
 
 
 @contextmanager
@@ -56,34 +98,303 @@ def bind_catalog_snapshot(snapshot: dict[str, Any] | None) -> Iterator[dict[str,
         _ACTIVE_CATALOG_SNAPSHOT.reset(token)
 
 
-async def run_with_catalog_snapshot(
-    snapshot: dict[str, Any] | None,
-    stream: AsyncIterator[Any],
-) -> AsyncIterator[Any]:
-    """Drive a turn's async stream with ``effective_catalog_snapshot`` bound in its task context."""
-    if snapshot is None:
-        async with aclosing(stream):
-            async for event in stream:
-                yield event
+@contextmanager
+def bind_recovery_context(
+    recovery_ctx: RunRecoveryContext | None,
+) -> Iterator[RunRecoveryContext | None]:
+    """Bind ``recovery_ctx`` and its ``snapshot`` to the current execution context."""
+    if recovery_ctx is None:
+        yield None
         return
-    token = _ACTIVE_CATALOG_SNAPSHOT.set(snapshot)
+    ctx_token = _ACTIVE_RECOVERY_CONTEXT.set(recovery_ctx)
+    snap_token = _ACTIVE_CATALOG_SNAPSHOT.set(recovery_ctx.snapshot)
     try:
-        async with aclosing(stream):
-            async for event in stream:
-                yield event
+        yield recovery_ctx
     finally:
-        with suppress(ValueError):
-            _ACTIVE_CATALOG_SNAPSHOT.reset(token)
+        _ACTIVE_CATALOG_SNAPSHOT.reset(snap_token)
+        _ACTIVE_RECOVERY_CONTEXT.reset(ctx_token)
 
 
-async def load_run_catalog_snapshot(
+def _is_oauth_blocked_by_capability(
+    model_key: str | None = None,
+    provider: str | None = None,
+) -> bool:
+    """Return True when ``NATIVE_OAUTH_SYNC`` is disabled and the target is an OAuth model/provider."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+    from src.dalton.llm.overlay import _is_oauth_model_key
+
+    if has_capability(CapabilityId.NATIVE_OAUTH_SYNC):
+        return False
+    mk = str(model_key or "").strip().lower()
+    prov = str(provider or "").strip().lower()
+    return (bool(mk) and _is_oauth_model_key(mk)) or (bool(prov) and _is_oauth_model_key(prov))
+
+
+def enforce_snapshot_capabilities(
+    model_key: str | None,
+    snapshot: Mapping[str, Any] | None,
+) -> None:
+    """Refuse resuming a snapshotted model whose required deployment capability is currently off.
+
+    Raises the exact same ``HTTPException(400, type="model_removed")`` as a normal request
+    for a model stripped by capability gating.
+    """
+    from src.server.services.llm.availability import raise_model_removed
+
+    snap_provider: str | None = None
+    if isinstance(snapshot, Mapping) and model_key:
+        models = snapshot.get("models")
+        if isinstance(models, Mapping):
+            raw = models.get(model_key)
+            if isinstance(raw, Mapping):
+                snap_provider = str(raw.get("provider") or "").strip() or None
+    if _is_oauth_blocked_by_capability(model_key=model_key, provider=snap_provider):
+        raise_model_removed(str(model_key or snap_provider or "oauth"), [])
+
+
+def _output_limit_param_key(
+    params: Mapping[str, Any],
+    *,
+    live_params: Mapping[str, Any] | None = None,
+    provider_info: Mapping[str, Any] | None = None,
+) -> str:
+    """Choose the model's output-limit request parameter key (``max_output_tokens`` vs ``max_tokens``)."""
+    if "max_output_tokens" in params:
+        return "max_output_tokens"
+    if isinstance(live_params, Mapping) and "max_output_tokens" in live_params:
+        return "max_output_tokens"
+    sdk = str((provider_info or {}).get("sdk") or "").strip().lower()
+    if sdk == "gemini":
+        return "max_output_tokens"
+    return "max_tokens"
+
+
+def _normalize_snapshot_parameters(
+    raw: Mapping[str, Any],
+    *,
+    live_entry: Mapping[str, Any] | None = None,
+    same_live_route: bool = False,
+    provider_info: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build request parameters from a snapshot entry, translating legacy ``max_output`` into the output-limit field."""
+    live_params = (
+        live_entry.get("parameters")
+        if isinstance(live_entry, Mapping) and isinstance(live_entry.get("parameters"), Mapping)
+        else None
+    )
+    if "parameters" in raw and isinstance(raw.get("parameters"), Mapping):
+        params = copy.deepcopy(dict(raw["parameters"]))
+    elif same_live_route and live_params is not None:
+        params = copy.deepcopy(dict(live_params))
+    else:
+        params = {}
+
+    raw_max_output = raw.get("max_output")
+    has_legacy_max_output = (
+        isinstance(raw_max_output, int)
+        and not isinstance(raw_max_output, bool)
+        and raw_max_output > 0
+    )
+    if has_legacy_max_output and (
+        "parameters" not in raw
+        or ("max_tokens" not in params and "max_output_tokens" not in params)
+    ):
+        eff_pinfo = (
+            provider_info
+            if isinstance(provider_info, Mapping) and provider_info
+            else (raw.get("provider_info") if isinstance(raw.get("provider_info"), Mapping) else None)
+        )
+        out_key = _output_limit_param_key(
+            params,
+            live_params=live_params,
+            provider_info=eff_pinfo,
+        )
+        params[out_key] = raw_max_output
+    return params
+
+
+def extract_snapshot_client_params(
+    model_key: str,
+    snapshot: Mapping[str, Any] | None,
+    *,
+    base_model_config: Any = None,
+    enforce_capabilities: bool = True,
+) -> SnapshotClientParams | None:
+    """Derive normalized client construction parameters for ``model_key`` from ``snapshot``."""
+    mk = str(model_key or "").strip()
+    if not mk or not isinstance(snapshot, Mapping):
+        return None
+    models = snapshot.get("models")
+    if not isinstance(models, Mapping):
+        return None
+    raw = models.get(mk)
+    if not isinstance(raw, Mapping):
+        return None
+
+    if enforce_capabilities:
+        enforce_snapshot_capabilities(mk, snapshot)
+
+    snap_provider = str(raw.get("provider") or "").strip()
+    snap_model_id = str(raw.get("model_id") or mk).strip()
+    if not enforce_capabilities and _is_oauth_blocked_by_capability(
+        model_key=mk, provider=snap_provider
+    ):
+        return None
+
+    live_entry: Mapping[str, Any] | None = None
+    live_pinfo: Mapping[str, Any] = {}
+    if base_model_config is not None:
+        live_entry = base_model_config.get_model_config(mk)
+        if snap_provider:
+            live_pinfo = base_model_config.get_provider_info(snap_provider) or {}
+
+    same_live_route = (
+        isinstance(live_entry, Mapping)
+        and str(live_entry.get("provider") or "").strip() == snap_provider
+    )
+    pinfo = copy.deepcopy(dict(live_pinfo)) if isinstance(live_pinfo, Mapping) else {}
+    variants = snapshot.get("variants")
+    v_entry = variants.get(snap_provider) if isinstance(variants, Mapping) else None
+    if isinstance(raw.get("provider_info"), Mapping):
+        pinfo.update(copy.deepcopy(dict(raw["provider_info"])))
+    if isinstance(v_entry, Mapping) and isinstance(v_entry.get("provider_info"), Mapping):
+        pinfo.update(copy.deepcopy(dict(v_entry["provider_info"])))
+
+    is_catalog_variant = bool(raw.get("catalog_defined") or pinfo.get("catalog_defined"))
+    bound_base_url = (
+        str(raw.get("bound_base_url")).strip()
+        if raw.get("bound_base_url")
+        else (
+            str(v_entry.get("bound_base_url")).strip()
+            if isinstance(v_entry, Mapping) and v_entry.get("bound_base_url")
+            else (str(pinfo.get("base_url")).strip() if pinfo.get("base_url") else None)
+        )
+    )
+    canonical_bound_url = (
+        str(raw.get("canonical_bound_url")).strip()
+        if raw.get("canonical_bound_url")
+        else (
+            str(v_entry.get("canonical_bound_url")).strip()
+            if isinstance(v_entry, Mapping) and v_entry.get("canonical_bound_url")
+            else (canonical_url_key(bound_base_url) if bound_base_url else None)
+        )
+    )
+    key_fingerprint = (
+        str(raw.get("key_fingerprint")).strip()
+        if raw.get("key_fingerprint")
+        else (
+            str(v_entry.get("key_fingerprint")).strip()
+            if isinstance(v_entry, Mapping) and v_entry.get("key_fingerprint")
+            else None
+        )
+    )
+    if is_catalog_variant:
+        pinfo["catalog_defined"] = True
+        pinfo["own_api_key"] = True
+        pinfo.pop("env_key", None)
+        pinfo.pop("models_url", None)
+        pinfo.pop("platform", None)
+        if bound_base_url:
+            pinfo["base_url"] = bound_base_url
+
+    params = _normalize_snapshot_parameters(
+        raw,
+        live_entry=live_entry,
+        same_live_route=same_live_route,
+        provider_info=pinfo,
+    )
+    if "extra_body" in raw and isinstance(raw.get("extra_body"), Mapping):
+        extra_body = copy.deepcopy(dict(raw["extra_body"]))
+    elif same_live_route and isinstance(live_entry, Mapping) and isinstance(live_entry.get("extra_body"), Mapping):
+        extra_body = copy.deepcopy(dict(live_entry["extra_body"]))
+    else:
+        extra_body = {}
+    if "additional_betas" in raw and isinstance(raw.get("additional_betas"), list):
+        additional_betas = [str(b) for b in raw["additional_betas"]]
+    elif same_live_route and isinstance(live_entry, Mapping) and isinstance(live_entry.get("additional_betas"), list):
+        additional_betas = [str(b) for b in live_entry["additional_betas"]]
+    else:
+        additional_betas = []
+    reasoning = (
+        copy.deepcopy(dict(raw["reasoning"]))
+        if isinstance(raw.get("reasoning"), Mapping)
+        else (
+            copy.deepcopy(dict(live_entry["reasoning"]))
+            if same_live_route
+            and "reasoning" not in raw
+            and isinstance(live_entry, Mapping)
+            and isinstance(live_entry.get("reasoning"), Mapping)
+            else None
+        )
+    )
+    use_response_api = (
+        raw.get("use_response_api")
+        if "use_response_api" in raw
+        else (live_entry.get("use_response_api") if same_live_route and isinstance(live_entry, Mapping) else None)
+    )
+    system_provider = (
+        raw.get("system_provider")
+        if "system_provider" in raw
+        else (live_entry.get("system_provider") if same_live_route and isinstance(live_entry, Mapping) else None)
+    )
+
+    return SnapshotClientParams(
+        model_key=mk,
+        provider=snap_provider,
+        model_id=snap_model_id,
+        parameters=params,
+        extra_body=extra_body,
+        additional_betas=additional_betas,
+        reasoning=reasoning,
+        use_response_api=use_response_api,
+        system_provider=system_provider,
+        provider_info=pinfo,
+        catalog_defined=is_catalog_variant,
+        bound_base_url=bound_base_url,
+        canonical_bound_url=canonical_bound_url,
+        key_fingerprint=key_fingerprint,
+    )
+
+
+def _extract_primary_model_key_from_run(
+    run_row: Mapping[str, Any],
+    *,
+    is_subagent: bool,
+    snapshot: Mapping[str, Any] | None = None,
+) -> str | None:
+    """Extract the actual selected model key of the original persisted run."""
+    container_key = "replay_facts" if is_subagent else "metadata"
+    container = run_row.get(container_key)
+    field_order = (
+        ("model_override", "model", "llm_model")
+        if is_subagent
+        else ("llm_model", "main_model", "model", "model_override")
+    )
+    if isinstance(container, Mapping):
+        for fname in field_order:
+            val = container.get(fname)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    for fname in field_order:
+        val = run_row.get(fname)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    if isinstance(snapshot, Mapping):
+        models = snapshot.get("models")
+        if isinstance(models, Mapping) and len(models) == 1:
+            only_key = next(iter(models.keys()))
+            if isinstance(only_key, str) and only_key.strip():
+                return only_key.strip()
+    return None
+
+
+async def _fetch_persisted_run_row(
     run_id: str,
     *,
     thread_id: str | None = None,
     is_subagent: bool = False,
     conn: Any = None,
 ) -> dict[str, Any] | None:
-    """Authoritatively load (or backfill) ``effective_catalog_snapshot`` from a persisted run row."""
     cleaned_id = str(run_id or "").strip()
     if not cleaned_id:
         return None
@@ -124,9 +435,140 @@ async def load_run_catalog_snapshot(
                     (cleaned_id,),
                 )
             row = await cur.fetchone()
+    return dict(row) if row else None
+
+
+async def load_run_recovery_context(
+    run_id: str | None = None,
+    *,
+    thread_id: str | None = None,
+    is_subagent: bool = False,
+    run_row: Mapping[str, Any] | None = None,
+    explicit_model_key: str | None = None,
+    conn: Any = None,
+    enforce_capabilities: bool = True,
+) -> RunRecoveryContext | None:
+    """Single authoritative recovery entry point for main turns and subagents.
+
+    Given an original run identifier (and optional already-loaded ``run_row``), loads or
+    backfills its ``effective_catalog_snapshot``, resolves the original run's actual
+    selected ``model_key``, enforces current deployment capabilities (e.g. rejecting
+    ``*-oauth`` models when ``NATIVE_OAUTH_SYNC`` is disabled with the exact same error
+    as a normal request), and derives normalized :class:`SnapshotClientParams` (including
+    legacy ``max_output`` translation).
+    """
+    row: dict[str, Any] | None
+    if isinstance(run_row, Mapping):
+        row = dict(run_row)
+    elif run_id:
+        row = await _fetch_persisted_run_row(
+            str(run_id), thread_id=thread_id, is_subagent=is_subagent, conn=conn
+        )
+    else:
+        row = None
     if not row:
         return None
-    return await ensure_run_catalog_snapshot(dict(row), is_subagent=is_subagent, conn=conn)
+
+    resolved_run_id = str(
+        run_id
+        or row.get("task_run_id" if is_subagent else "conversation_response_id")
+        or row.get("run_id")
+        or ""
+    ).strip()
+
+    explicit_mk = str(explicit_model_key or "").strip() or None
+    snapshot = await ensure_run_catalog_snapshot(
+        row,
+        model_keys=([explicit_mk] if explicit_mk else None),
+        is_subagent=is_subagent,
+        conn=conn,
+    )
+    orig_model_key = _extract_primary_model_key_from_run(
+        row, is_subagent=is_subagent, snapshot=snapshot
+    )
+    effective_model_key = explicit_mk or orig_model_key
+
+    # Only apply the predecessor snapshot when staying on a model covered by it.
+    # If the caller explicitly switched to a different model outside the snapshot,
+    # do not force the old snapshot onto the new model.
+    snap_models = snapshot.get("models") if isinstance(snapshot, Mapping) else None
+    effective_snapshot: dict[str, Any] | None = snapshot
+    if (
+        explicit_mk is not None
+        and orig_model_key is not None
+        and explicit_mk != orig_model_key
+        and (not isinstance(snap_models, Mapping) or explicit_mk not in snap_models)
+    ):
+        effective_snapshot = None
+
+    if enforce_capabilities and effective_model_key:
+        enforce_snapshot_capabilities(effective_model_key, effective_snapshot)
+
+    base_mc = None
+    try:
+        from src.llms.llm import LLM
+
+        live_mc = LLM.get_model_config()
+        base_mc = live_mc._base if isinstance(live_mc, SnapshotModelConfig) else live_mc
+    except Exception:
+        base_mc = None
+
+    client_params = (
+        extract_snapshot_client_params(
+            effective_model_key,
+            effective_snapshot,
+            base_model_config=base_mc,
+            enforce_capabilities=enforce_capabilities,
+        )
+        if effective_model_key and effective_snapshot is not None
+        else None
+    )
+
+    return RunRecoveryContext(
+        run_id=resolved_run_id,
+        is_subagent=is_subagent,
+        model_key=effective_model_key,
+        snapshot=effective_snapshot,
+        client_params=client_params,
+    )
+
+
+async def run_with_catalog_snapshot(
+    snapshot: dict[str, Any] | None,
+    stream: AsyncIterator[Any],
+) -> AsyncIterator[Any]:
+    """Drive a turn's async stream with ``effective_catalog_snapshot`` bound in its task context."""
+    if snapshot is None:
+        async with aclosing(stream):
+            async for event in stream:
+                yield event
+        return
+    token = _ACTIVE_CATALOG_SNAPSHOT.set(snapshot)
+    try:
+        async with aclosing(stream):
+            async for event in stream:
+                yield event
+    finally:
+        with suppress(ValueError):
+            _ACTIVE_CATALOG_SNAPSHOT.reset(token)
+
+
+async def load_run_catalog_snapshot(
+    run_id: str,
+    *,
+    thread_id: str | None = None,
+    is_subagent: bool = False,
+    conn: Any = None,
+) -> dict[str, Any] | None:
+    """Authoritatively load (or backfill) ``effective_catalog_snapshot`` from a persisted run row."""
+    ctx = await load_run_recovery_context(
+        run_id,
+        thread_id=thread_id,
+        is_subagent=is_subagent,
+        conn=conn,
+        enforce_capabilities=False,
+    )
+    return ctx.snapshot if ctx is not None else None
 
 
 _SNAPSHOT_PROVIDER_INFO_KEYS = (
@@ -243,7 +685,6 @@ def build_effective_catalog_snapshot(
 ) -> dict[str, Any]:
     """Build a self-contained ``effective_catalog_snapshot`` dict for ``model_keys``."""
     from src.dalton.llm.notional_pricing import resolve_notional_card
-    from src.dalton.llm.overlay import _is_oauth_model_key
     from src.dalton.services.team_model_catalog.compiled import get_compiled_catalog_sync
 
     cat = compiled if compiled is not None else get_compiled_catalog_sync()
@@ -277,13 +718,15 @@ def build_effective_catalog_snapshot(
         is_catalog_variant = bool(prov_info.get("catalog_defined"))
 
         meta_entry = meta_map.get(key) if isinstance(meta_map.get(key), Mapping) else {}
-        is_sub = (
-            str(prov_info.get("billing") or "").strip().lower() == "subscription"
-            or str((meta_entry or {}).get("billing") or "").strip().lower() == "subscription"
-            or _is_oauth_model_key(provider.lower())
-            or provider == "z-ai-cn-coding"
+        billing = resolve_model_billing(
+            model_key=key,
+            provider=provider,
+            model_id=model_id,
+            model_config=mc,
+            provider_info=prov_info,
+            dalton_meta=meta_map,
+            dalton_meta_entry=meta_entry,
         )
-        billing = "subscription" if is_sub else "cash"
         cash_card = (
             None
             if billing == "subscription"
@@ -487,6 +930,8 @@ class SnapshotModelConfig:
             return None
         snap_provider = str(raw.get("provider") or "").strip()
         snap_model_id = str(raw.get("model_id") or model_name).strip()
+        if _is_oauth_blocked_by_capability(model_key=model_name, provider=snap_provider):
+            return None
         live_entry = self._base.get_model_config(model_name)
         same_live_route = (
             isinstance(live_entry, Mapping)
@@ -495,10 +940,15 @@ class SnapshotModelConfig:
         out: dict[str, Any] = copy.deepcopy(dict(live_entry)) if same_live_route else {}
         out["provider"] = snap_provider
         out["model_id"] = snap_model_id
-        if "parameters" in raw and isinstance(raw.get("parameters"), Mapping):
-            out["parameters"] = copy.deepcopy(dict(raw["parameters"]))
-        elif not same_live_route:
-            out["parameters"] = {}
+        snap_pinfo = self._snap_provider_overlay(snap_provider) or (
+            self._base.get_provider_info(snap_provider) if snap_provider else {}
+        )
+        out["parameters"] = _normalize_snapshot_parameters(
+            raw,
+            live_entry=live_entry,
+            same_live_route=same_live_route,
+            provider_info=snap_pinfo,
+        )
         if "extra_body" in raw and isinstance(raw.get("extra_body"), Mapping):
             out["extra_body"] = copy.deepcopy(dict(raw["extra_body"]))
         elif not same_live_route:
@@ -529,7 +979,7 @@ class SnapshotModelConfig:
 
     def _snap_provider_overlay(self, provider: str) -> dict[str, Any] | None:
         prov = str(provider or "").strip()
-        if not prov:
+        if not prov or _is_oauth_blocked_by_capability(provider=prov):
             return None
         variants = self._snapshot.get("variants")
         if isinstance(variants, Mapping):

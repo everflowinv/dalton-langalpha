@@ -275,32 +275,34 @@ async def _run_background_task(
 
         current_background_token_tracker.set(tracker)
         set_tool_tracker(tool_tracker)
-        # DALTON-HOOK(team-model-catalog): bind subagent_runs.replay_facts['effective_catalog_snapshot']
-        # when persisted for this task_run_id (e.g. subagent-specific model or cross-deploy resume).
-        subagent_snap = None
+        # DALTON-HOOK(team-model-catalog): bind subagent RunRecoveryContext (effective_catalog_snapshot)
+        # via unified recovery entry point when persisted for this task_run_id.
+        subagent_recovery_ctx = None
         if task.task_run_id:
             try:
                 from src.dalton.database.team_model_catalog import (
                     is_conversation_db_pool_open,
                 )
                 from src.dalton.services.team_model_catalog.snapshot import (
-                    load_run_catalog_snapshot,
+                    load_run_recovery_context,
                 )
 
                 if is_conversation_db_pool_open():
-                    subagent_snap = await load_run_catalog_snapshot(
-                        str(task.task_run_id), is_subagent=True
+                    subagent_recovery_ctx = await load_run_recovery_context(
+                        str(task.task_run_id),
+                        is_subagent=True,
+                        enforce_capabilities=False,
                     )
             except Exception:
-                subagent_snap = None
+                subagent_recovery_ctx = None
         from src.dalton.services.team_model_catalog.snapshot import (
-            bind_catalog_snapshot,
+            bind_recovery_context,
         )
 
         try:
             with (
-                bind_catalog_snapshot(subagent_snap)
-                if subagent_snap is not None
+                bind_recovery_context(subagent_recovery_ctx)
+                if subagent_recovery_ctx is not None and subagent_recovery_ctx.snapshot is not None
                 else nullcontext()
             ):
                 async with _child_credit_lane(task, tracker, tool_tracker, label):

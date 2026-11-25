@@ -483,35 +483,23 @@ def is_subscription_model(
     pricing_model_id: str | None = None,
     pricing_provider: str | None = None,
 ) -> bool:
-    """Return True when the model or route uses subscription/OAuth billing."""
-    if billing_type == "oauth" or model_name.endswith("-oauth"):
-        return True
-    if pricing_model_id and pricing_model_id.endswith("-oauth"):
-        return True
-    if pricing_provider:
-        if pricing_provider == "z-ai-cn-coding" or pricing_provider.endswith("-oauth"):
-            return True
-        from src.llms.pricing_utils import is_subscription_provider
+    """Return True when the model or route uses subscription/OAuth billing.
 
-        if is_subscription_provider(provider=pricing_provider):
-            return True
+    Delegates to :func:`src.dalton.services.team_model_catalog.billing.resolve_model_billing`.
+    """
+    from src.dalton.services.team_model_catalog.billing import resolve_model_billing
 
     dalton_meta = _overlay_mod.load_dalton_meta() or {}
-    for candidate in (model_name, pricing_model_id):
-        if not candidate:
-            continue
-        meta = dalton_meta.get(candidate)
-        if isinstance(meta, dict):
-            billing = str(meta.get("billing") or "")
-            if billing == "subscription":
-                return True
-            if billing == "cash":
-                return False
-        oauth_meta = dalton_meta.get(f"{candidate}-oauth")
-        if isinstance(oauth_meta, dict) and str(oauth_meta.get("billing") or "") == "subscription":
-            return True
-
-    return False
+    return (
+        resolve_model_billing(
+            model_key=model_name,
+            provider=pricing_provider,
+            model_id=pricing_model_id,
+            billing_type=billing_type,
+            dalton_meta=dalton_meta,
+        )
+        == "subscription"
+    )
 
 
 def resolve_notional_card(

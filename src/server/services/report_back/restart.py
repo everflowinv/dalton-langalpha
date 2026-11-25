@@ -207,20 +207,24 @@ async def resume_verdict(job: Mapping[str, Any]) -> OwedResume | NotOwed | NotYe
         if retry_run_id is not None and state.get("run_user_id")
         else str(state["user_id"])
     )
-    # DALTON-HOOK(team-model-catalog): load persisted snapshot or conditionally backfill pre-feature legacy run
+    # DALTON-HOOK(team-model-catalog): load recovery context (persisted or backfilled snapshot) via unified entry point
     catalog_snapshot = None
     try:
         from src.dalton.services.team_model_catalog.snapshot import (
-            ensure_run_catalog_snapshot,
+            load_run_recovery_context,
         )
 
-        catalog_snapshot = await ensure_run_catalog_snapshot(
-            {**dict(state), "conversation_response_id": str(run_id)},
+        recovery_ctx = await load_run_recovery_context(
+            str(run_id),
+            thread_id=thread_id,
             is_subagent=False,
+            run_row={**dict(state), "conversation_response_id": str(run_id)},
+            enforce_capabilities=False,
         )
+        catalog_snapshot = recovery_ctx.snapshot if recovery_ctx is not None else None
     except Exception as _snap_err:
         logger.warning(
-            "[RESTART_RESUME] Failed to ensure catalog snapshot for run=%s: %s",
+            "[RESTART_RESUME] Failed to load recovery context for run=%s: %s",
             run_id,
             type(_snap_err).__name__,
         )

@@ -925,10 +925,19 @@ async def update_catalog_model(
                 deep_merge_patch_with_null_delete(merged_meta, dm_patch)
 
             existing_card = mc.get_model_info(prov, str(merged_entry.get("model_id") or key))
+            clearing_pricing = "pricing" in data.model_fields_set and data.pricing is None
             pricing_for_check = (
-                data.pricing.model_dump(exclude_none=True)
-                if data.pricing is not None
-                else ((existing_card or {}).get("pricing") if isinstance(existing_card, Mapping) else None)
+                None
+                if clearing_pricing
+                else (
+                    data.pricing.model_dump(exclude_none=True)
+                    if data.pricing is not None
+                    else (
+                        (existing_card or {}).get("pricing")
+                        if isinstance(existing_card, Mapping)
+                        else None
+                    )
+                )
             )
             validate_model_fields(
                 model_key=key,
@@ -947,7 +956,46 @@ async def update_catalog_model(
                 ov = next_payload.setdefault("model_overrides", {}).setdefault(key, {})
                 ov.update(patch)
 
-            if data.pricing is not None or data.pricing_meta is not None:
+            if clearing_pricing:
+                card_id = str(merged_entry.get("model_id") or key)
+                card_norm = norm_id(card_id)
+                prov_block = next_payload.setdefault("providers", {})
+                # Remove team-added card when no other remaining model on prov shares it.
+                other_uses_card = any(
+                    k != key
+                    and isinstance(e, Mapping)
+                    and str(e.get("provider") or "") == prov
+                    and norm_id(str(e.get("model_id") or k)) == card_norm
+                    for k, e in (mc.llm_config or {}).items()
+                )
+                team_cards = (prov_block.get("models") or {}).get(prov)
+                removed_team_card = False
+                if isinstance(team_cards, list) and not other_uses_card:
+                    new_cards = [
+                        tc
+                        for tc in team_cards
+                        if not (isinstance(tc, Mapping) and norm_id(str(tc.get("id"))) == card_norm)
+                    ]
+                    if len(new_cards) != len(team_cards):
+                        removed_team_card = True
+                        if new_cards:
+                            prov_block["models"][prov] = new_cards
+                        else:
+                            prov_block["models"].pop(prov, None)
+                prov_ov = (prov_block.get("model_overrides") or {}).get(prov)
+                if isinstance(prov_ov, dict):
+                    for ov_id in list(prov_ov.keys()):
+                        if norm_id(str(ov_id)) == card_norm:
+                            prov_ov.pop(ov_id, None)
+                    if not prov_ov:
+                        prov_block["model_overrides"].pop(prov, None)
+                # If a factory baseline card still carries cash pricing on this provider,
+                # record an explicit null-pricing override so compile removes it.
+                if not removed_team_card and existing_card is not None and not other_uses_card:
+                    prov_block.setdefault("model_overrides", {}).setdefault(prov, {})[
+                        str(existing_card.get("id") or card_id)
+                    ] = {"pricing": None}
+            elif data.pricing is not None or data.pricing_meta is not None:
                 card_id = str(merged_entry.get("model_id") or key)
                 card_patch: dict[str, Any] = {}
                 if data.pricing is not None:

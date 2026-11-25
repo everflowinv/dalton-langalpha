@@ -3730,3 +3730,852 @@ class TestR4Fixes:
         # Original payload left completely untouched (no partial cleanup of dalton_meta or task_costs)
         assert "team-only-model" in payload["dalton_meta"]
         assert "team-only-model" in payload["task_costs"]["bounds"]
+
+
+# ---------------------------------------------------------------------------
+# Batch 1 r5: root-cause consolidation regressions (recovery entry + billing)
+# ---------------------------------------------------------------------------
+
+
+class TestR5Fixes:
+    """Regressions for Batch 1 r5 root-cause consolidation fixes."""
+
+    def test_r5_1_main_turn_resume_keeps_original_model_after_default_changes_a_to_b(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        from ptc_agent.config import LLMConfig
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.dalton.services.team_model_catalog.snapshot import (
+            bind_recovery_context,
+            build_effective_catalog_snapshot,
+            load_run_recovery_context,
+        )
+        from src.llms.llm import LLM as LLMFactory
+        from src.server.services.llm.config import select_model
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+        payload = {
+            "schema": CATALOG_SCHEMA,
+            "models": {
+                "model-a": {
+                    "model_id": "gpt-a",
+                    "provider": "openai",
+                    "display_name": "Model A",
+                    "visible": True,
+                    "parameters": {"max_tokens": 4096},
+                },
+                "model-b": {
+                    "model_id": "gpt-b",
+                    "provider": "openai",
+                    "display_name": "Model B",
+                    "visible": True,
+                    "parameters": {"max_tokens": 8192},
+                },
+            },
+            "providers": {
+                "models": {
+                    "openai": [
+                        {"id": "gpt-a", "name": "A", "pricing": {"input": 1.0, "output": 2.0}},
+                        {"id": "gpt-b", "name": "B", "pricing": {"input": 3.0, "output": 6.0}},
+                    ]
+                }
+            },
+            "dalton_meta": {
+                "model-a": {"billing": "cash", "tool_calling": True},
+                "model-b": {"billing": "cash", "tool_calling": True},
+            },
+        }
+        compiled = compile_catalog_from_payload(payload, revision=20)
+        cache_compiled_catalog(compiled)
+        orig_get_compiled = compiled_mod.get_compiled_catalog_sync
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_compiled, return_value=compiled),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", compiled.model_config)
+
+        # Original run ran on model-a (saved default at the time)
+        snap = build_effective_catalog_snapshot(["model-a"], compiled=compiled)
+        interrupted_row = {
+            "conversation_response_id": "11111111-1111-1111-1111-111111111111",
+            "conversation_thread_id": "thread-r5-1",
+            "metadata": {
+                "llm_model": "model-a",
+                "effective_catalog_snapshot": snap,
+            },
+        }
+
+        ctx = asyncio.run(
+            load_run_recovery_context(
+                run_id="11111111-1111-1111-1111-111111111111",
+                thread_id="thread-r5-1",
+                is_subagent=False,
+                run_row=interrupted_row,
+                enforce_capabilities=True,
+            )
+        )
+        assert ctx is not None
+        assert ctx.model_key == "model-a"
+        assert ctx.snapshot is not None
+        assert ctx.client_params is not None
+        assert ctx.client_params.provider == "openai"
+        assert ctx.client_params.model_id == "gpt-a"
+        assert ctx.client_params.parameters["max_tokens"] == 4096
+
+        # User changes account default from model-a -> model-b before restart resume
+        cfg = SimpleNamespace(llm=LLMConfig(name="model-b"), llm_client=None)
+        with bind_recovery_context(ctx):
+            selection = select_model(
+                cfg,
+                {"preferred_model": "model-b"},
+                slot="primary",
+                request_model=None,
+            )
+            assert selection.effective_model == "model-a"
+            assert LLMFactory.get_model_config().get_model_config("model-a")["model_id"] == "gpt-a"
+
+    def test_r5_2_subagent_resume_binds_snapshot_before_client_build_and_verifies_variant_a_credential(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import copy
+        import inspect
+        from types import SimpleNamespace
+
+        from ptc_agent.agent.middleware.background_subagent import task_actions
+        from ptc_agent.agent.middleware.background_subagent.subagent import SubAgentMiddleware
+        from ptc_agent.config.agent import TaskAsk, TaskModel
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog import transport as tmc_transport
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.dalton.services.team_model_catalog.snapshot import (
+            bind_recovery_context,
+            build_effective_catalog_snapshot,
+            get_active_catalog_snapshot,
+            load_run_recovery_context,
+        )
+        from src.llms.llm import LLM as LLMFactory
+        from src.server.services.llm.task_model import TaskModelGate
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        # Rev 1: team-shared points to variant A (fp-a)
+        payload_rev1 = {
+            "schema": CATALOG_SCHEMA,
+            "providers": {
+                "provider_variants": {
+                    "openai": {
+                        "var-a": {
+                            "parent_provider": "openai",
+                            "display_name": "Variant A",
+                            "sdk": "openai",
+                            "billing": "cash",
+                            "base_url": "https://var-a.example.com/v1",
+                        },
+                        "var-b": {
+                            "parent_provider": "openai",
+                            "display_name": "Variant B",
+                            "sdk": "openai",
+                            "billing": "cash",
+                            "base_url": "https://var-b.example.com/v1",
+                        },
+                    }
+                },
+                "models": {
+                    "var-a": [{"id": "m-a", "name": "MA", "pricing": {"input": 1.0, "output": 2.0}}],
+                    "var-b": [{"id": "m-b", "name": "MB", "pricing": {"input": 3.0, "output": 6.0}}],
+                },
+            },
+            "models": {
+                "team-shared": {
+                    "model_id": "m-a",
+                    "provider": "var-a",
+                    "display_name": "Team Shared",
+                    "visible": True,
+                }
+            },
+            "dalton_meta": {"team-shared": {"billing": "cash", "tool_calling": True}},
+        }
+        compiled_rev1 = compile_catalog_from_payload(payload_rev1, revision=30)
+        snap_rev1 = build_effective_catalog_snapshot(
+            ["team-shared"],
+            compiled=compiled_rev1,
+            variant_credentials={
+                "var-a": {
+                    "bound_base_url": "https://var-a.example.com/v1",
+                    "canonical_bound_url": "https://var-a.example.com/v1",
+                    "key_fingerprint": "fp-a",
+                }
+            },
+        )
+
+        # Rev 2: team-shared moves to variant B (fp-b)
+        payload_rev2 = copy.deepcopy(payload_rev1)
+        payload_rev2["models"]["team-shared"]["provider"] = "var-b"
+        payload_rev2["models"]["team-shared"]["model_id"] = "m-b"
+        compiled_rev2 = compile_catalog_from_payload(payload_rev2, revision=31)
+        cache_compiled_catalog(compiled_rev2)
+        orig_get_compiled = compiled_mod.get_compiled_catalog_sync
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_compiled, return_value=compiled_rev2),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", compiled_rev2.model_config)
+
+        # Prior subagent run row ran on team-shared under rev1 snapshot
+        prior_subagent_row = {
+            "task_run_id": "22222222-2222-2222-2222-222222222222",
+            "thread_id": "thread-r5-2",
+            "status": "completed",
+            "replay_facts": {
+                "model": "team-shared",
+                "model_override": "team-shared",
+                "effective_catalog_snapshot": snap_rev1,
+            },
+        }
+
+        # Verify load_run_recovery_context extracts var-a + fp-a
+        ctx = asyncio.run(
+            load_run_recovery_context(
+                run_id="22222222-2222-2222-2222-222222222222",
+                is_subagent=True,
+                run_row=prior_subagent_row,
+                enforce_capabilities=True,
+            )
+        )
+        assert ctx is not None
+        assert ctx.model_key == "team-shared"
+        assert ctx.client_params is not None
+        assert ctx.client_params.provider == "var-a"
+        assert ctx.client_params.model_id == "m-a"
+        assert ctx.client_params.key_fingerprint == "fp-a"
+
+        # Verify binding snapshot BEFORE _resolve_model resolves var-a and verifies fp-a (not var-b)
+        checked_providers: list[str] = []
+
+        async def _fake_get_cred(
+            slug: str, conn: Any = None, *, decrypt: bool = True
+        ) -> dict[str, Any]:
+            checked_providers.append(slug)
+            if slug == "var-a":
+                return {
+                    "provider_slug": "var-a",
+                    "api_key": "sk-var-a",
+                    "bound_base_url": "https://var-a.example.com/v1",
+                    "canonical_bound_url": "https://var-a.example.com/v1",
+                    "key_fingerprint": "fp-a",
+                }
+            return {
+                "provider_slug": "var-b",
+                "api_key": "sk-var-b",
+                "bound_base_url": "https://var-b.example.com/v1",
+                "canonical_bound_url": "https://var-b.example.com/v1",
+                "key_fingerprint": "fp-b",
+            }
+
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_provider_credential",
+            create_autospec(
+                tmc_db.get_catalog_provider_credential, side_effect=_fake_get_cred
+            ),
+        )
+
+        # Inside bind_recovery_context (exact pattern used by task_actions._handle_resume before _resolve_model):
+        with bind_recovery_context(ctx):
+            assert get_active_catalog_snapshot() is ctx.snapshot
+            mc_snap = LLMFactory.get_model_config()
+            assert mc_snap.get_model_config("team-shared")["provider"] == "var-a"
+            binding = asyncio.run(
+                tmc_transport.resolve_catalog_variant_binding_async(
+                    mc_snap.get_model_config("team-shared")["provider"],
+                    model_key="team-shared",
+                )
+            )
+            assert binding["bound_base_url"] == "https://var-a.example.com/v1"
+        assert checked_providers == ["var-a"]
+
+        # Verify TaskModelGate.resolve bypasses live cache & own-model short-circuit under bound snapshot
+        live_client_b = SimpleNamespace(name="client-b")
+        snap_client_a = SimpleNamespace(name="client-a")
+        gate = object.__new__(TaskModelGate)
+        gate._resolved = {
+            ("research", "team-shared", None): TaskModel(
+                name="team-shared",
+                display_name="Team Shared",
+                client=live_client_b,
+                guidance="",
+                model="team-shared",
+            )
+        }
+        gate._own_model = lambda _st: "team-shared"
+        seen_in_resolve: list[str] = []
+
+        async def _fake_gate_resolve(name: str, subagent_type: str, effort: str | None, *, own: bool):
+            seen_in_resolve.append(LLMFactory.get_model_config().get_model_config(name)["provider"])
+            return TaskModel(
+                name=name,
+                display_name="Team Shared",
+                client=snap_client_a,
+                guidance="",
+                model=name,
+            )
+
+        gate._resolve = _fake_gate_resolve
+        with bind_recovery_context(ctx):
+            picked = asyncio.run(gate.resolve(TaskAsk(model="team-shared"), "research"))
+        assert isinstance(picked, TaskModel)
+        assert picked.client is snap_client_a
+        assert seen_in_resolve == ["var-a"]
+        # Live cache must NOT be overwritten by the snapshot client
+        assert gate._resolved[("research", "team-shared", None)].client is live_client_b
+
+        # Verify SubAgentMiddleware._graph_on compiles fresh under snapshot instead of hitting live _model_graphs
+        sub_mw = object.__new__(SubAgentMiddleware)
+        live_graph_b = SimpleNamespace(tag="graph-b")
+        sub_mw._model_graphs = {("research", "team-shared", None, None): live_graph_b}
+        sub_mw._claude_code_on = None
+        compiled_clients: list[Any] = []
+        sub_mw._compile_on = lambda _st, on: (compiled_clients.append(on.client) or SimpleNamespace(tag="compiled-a"))
+        sub_mw._build_graph = lambda g, claude_code=None: g
+        with bind_recovery_context(ctx):
+            graph_a = sub_mw._graph_on("research", picked)
+        assert graph_a.tag == "compiled-a"
+        assert compiled_clients == [snap_client_a]
+        assert sub_mw._model_graphs[("research", "team-shared", None, None)] is live_graph_b
+        # Confirm task_actions._handle_resume references load_run_recovery_context before _resolve_model
+        src_text = inspect.getsource(task_actions._handle_resume)
+        assert src_text.index("load_run_recovery_context") < src_text.index("_resolve_model")
+
+    def test_r5_3_model_level_subscription_on_cash_provider_settles_identically_with_and_without_snapshot(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.llm.notional_pricing import is_subscription_model
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.billing import resolve_model_billing
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.dalton.services.team_model_catalog.snapshot import (
+            bind_catalog_snapshot,
+            build_effective_catalog_snapshot,
+        )
+        from src.llms.llm import LLM as LLMFactory
+        from src.llms.pricing_utils import find_model_pricing
+        from src.utils.tracking.core import calculate_cost_from_per_call_records
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        # Cash-billed provider variant with parent="openai" + model reusing existing OpenAI cash model_id="gpt-test"
+        # but marked model-level dalton_meta.billing="subscription".
+        payload = {
+            "schema": CATALOG_SCHEMA,
+            "providers": {
+                "provider_variants": {
+                    "openai": {
+                        "cash-var-openai": {
+                            "parent_provider": "openai",
+                            "display_name": "Cash OpenAI Variant",
+                            "sdk": "openai",
+                            "billing": "cash",
+                            "base_url": "https://cash-var.example.com/v1",
+                        }
+                    }
+                }
+            },
+            "models": {
+                "team-sub-gpt": {
+                    "model_id": "gpt-test",
+                    "provider": "cash-var-openai",
+                    "display_name": "Team Sub GPT",
+                    "visible": True,
+                }
+            },
+            "dalton_meta": {
+                "team-sub-gpt": {
+                    "billing": "subscription",
+                    "tool_calling": True,
+                    "notional_pricing": {
+                        "input": 4.0,
+                        "output": 12.0,
+                        "cached_input": 0.4,
+                    },
+                }
+            },
+        }
+        compiled = compile_catalog_from_payload(payload, revision=40)
+        cache_compiled_catalog(compiled)
+        orig_get_compiled = compiled_mod.get_compiled_catalog_sync
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_compiled, return_value=compiled),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", compiled.model_config)
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_dalton_meta",
+            lambda *a, **kw: compiled.dalton_meta,
+        )
+
+        assert (
+            resolve_model_billing(
+                model_key="team-sub-gpt",
+                provider="cash-var-openai",
+                model_id="gpt-test",
+                model_config=compiled.model_config,
+                dalton_meta=compiled.dalton_meta,
+            )
+            == "subscription"
+        )
+        assert (
+            is_subscription_model(
+                "team-sub-gpt",
+                "platform",
+                pricing_model_id="gpt-test",
+                pricing_provider="cash-var-openai",
+            )
+            is True
+        )
+        # Live pricing (even without model_key or with model_key) returns subscription marker, NOT parent openai cash card
+        assert find_model_pricing(
+            "gpt-test", provider="cash-var-openai", model_key="team-sub-gpt"
+        ) == {"pricing_type": "subscription"}
+        assert find_model_pricing("gpt-test", provider="cash-var-openai") == {
+            "pricing_type": "subscription"
+        }
+
+        snap = build_effective_catalog_snapshot(["team-sub-gpt"], compiled=compiled)
+        assert snap["models"]["team-sub-gpt"]["billing"] == "subscription"
+        assert snap["models"]["team-sub-gpt"]["pricing"] is None
+
+        record = {
+            "model_name": "team-sub-gpt",
+            "served_model": "gpt-test",
+            "pricing_model_id": "gpt-test",
+            "pricing_provider": "cash-var-openai",
+            "billing_type": "platform",
+            "usage": {
+                "input_tokens": 100_000,
+                "output_tokens": 50_000,
+                "cached_tokens": 20_000,
+            },
+        }
+
+        # Between-turns / live settlement (no snapshot bound) vs in-turn settlement (with snapshot bound)
+        settled_live = calculate_cost_from_per_call_records([record])
+        with bind_catalog_snapshot(snap):
+            settled_snap = calculate_cost_from_per_call_records([record])
+
+        assert settled_live["total_cost"] == 0.0
+        assert settled_live["platform_cost"] == 0.0
+        assert settled_snap["total_cost"] == 0.0
+        assert settled_snap["platform_cost"] == 0.0
+        assert settled_live["notional_cost"] > 0.0
+        assert settled_live["notional_cost"] == pytest.approx(settled_snap["notional_cost"])
+        assert settled_live.get("pricing_failed") is None
+        assert settled_snap.get("pricing_failed") is None
+
+    def test_r5_4_legacy_cash_card_on_subscription_model_allows_unrelated_edit_and_pricing_null_clear(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import copy
+
+        from src.dalton.services.team_model_catalog import service as tmc_service
+        from src.dalton.services.team_model_catalog.service import update_catalog_model
+        from src.dalton.services.team_model_catalog.validation import CatalogModelUpsertInput
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        # Pre-existing legacy payload: subscription provider variant + model that already has a non-zero cash card
+        db_state = {
+            "revision": 5,
+            "payload": {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "provider_variants": {
+                        "openai": {
+                            "sub-legacy-var": {
+                                "parent_provider": "openai",
+                                "display_name": "Legacy Sub Variant",
+                                "sdk": "openai",
+                                "billing": "subscription",
+                                "base_url": "https://sub-legacy.example.com/v1",
+                            }
+                        }
+                    },
+                    "models": {
+                        "sub-legacy-var": [
+                            {
+                                "id": "legacy-sub-id",
+                                "name": "Legacy Sub",
+                                "pricing": {"input": 5.0, "output": 15.0},
+                            }
+                        ]
+                    },
+                },
+                "models": {
+                    "legacy-sub-model": {
+                        "model_id": "legacy-sub-id",
+                        "provider": "sub-legacy-var",
+                        "display_name": "Old Name",
+                        "visible": True,
+                    }
+                },
+                "dalton_meta": {
+                    "legacy-sub-model": {
+                        "billing": "subscription",
+                        "tool_calling": True,
+                        "notional_pricing": {"input": 5.0, "output": 15.0},
+                    }
+                },
+            },
+            "payload_sha256": "sha5",
+            "legacy_sync_import_status": "not_applicable",
+            "last_known_legacy_retired": [],
+        }
+
+        class _FakeConn:
+            @asynccontextmanager
+            async def transaction(self):
+                yield
+
+        @asynccontextmanager
+        async def _fake_get_db(_conn=None):
+            yield _FakeConn()
+
+        async def _fake_get_row(conn: Any = None, *, for_update: bool = False) -> dict[str, Any]:
+            return copy.deepcopy(db_state)
+
+        async def _fake_save(
+            conn: Any,
+            *,
+            expected_revision: int,
+            action: str,
+            target_keys: list[str],
+            payload: dict[str, Any],
+            diff_summary: dict[str, Any],
+            side_effects: list[dict[str, Any]],
+            actor_user_id: str,
+            comment: str | None = None,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            db_state["revision"] = expected_revision + 1
+            db_state["payload"] = copy.deepcopy(payload)
+            return {
+                "catalog": {"revision": db_state["revision"]},
+                "revision_record": {"revision": db_state["revision"], "action": action},
+            }
+
+        monkeypatch.setattr(tmc_service, "get_db_connection", _fake_get_db)
+        monkeypatch.setattr(
+            tmc_service,
+            "acquire_catalog_exclusive_lock",
+            create_autospec(tmc_service.acquire_catalog_exclusive_lock),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "get_catalog_row",
+            create_autospec(tmc_service.get_catalog_row, side_effect=_fake_get_row),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "save_catalog_revision",
+            create_autospec(tmc_service.save_catalog_revision, side_effect=_fake_save),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "publish_catalog_changed",
+            create_autospec(tmc_service.publish_catalog_changed),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "invalidate_catalog_redis_caches",
+            create_autospec(tmc_service.invalidate_catalog_redis_caches),
+        )
+
+        # 1) Editing an unrelated field (display_name) succeeds even though a legacy cash card exists
+        res1 = asyncio.run(
+            update_catalog_model(
+                actor_user_id="admin-1",
+                model_key="legacy-sub-model",
+                data=CatalogModelUpsertInput(display_name="Updated Name", expected_revision=5),
+            )
+        )
+        assert res1["revision"] == 6
+        assert db_state["payload"]["models"]["legacy-sub-model"]["display_name"] == "Updated Name"
+
+        # 2) Explicitly setting new cash pricing rates is still rejected
+        with pytest.raises(CatalogValidationError) as exc_info:
+            asyncio.run(
+                update_catalog_model(
+                    actor_user_id="admin-1",
+                    model_key="legacy-sub-model",
+                    data=CatalogModelUpsertInput(
+                        pricing={"input": 2.0, "output": 8.0},
+                        expected_revision=6,
+                    ),
+                )
+            )
+        assert exc_info.value.code == "subscription_cash_pricing_forbidden"
+
+        # 3) Explicitly passing pricing=None deletes the legacy cash card
+        res2 = asyncio.run(
+            update_catalog_model(
+                actor_user_id="admin-1",
+                model_key="legacy-sub-model",
+                data=CatalogModelUpsertInput(pricing=None, expected_revision=6),
+            )
+        )
+        assert res2["revision"] == 7
+        assert "sub-legacy-var" not in (db_state["payload"].get("providers", {}).get("models") or {})
+
+    def test_r5_5_disabling_native_oauth_sync_rejects_resuming_oauth_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton import capabilities as cap_mod
+        from src.dalton.capabilities import CapabilityId
+        from src.dalton.services.team_model_catalog.snapshot import (
+            SnapshotModelConfig,
+            build_effective_catalog_snapshot,
+            load_run_recovery_context,
+        )
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        # Build snapshot while NATIVE_OAUTH_SYNC is enabled
+        compiled_on = compile_catalog_from_payload(
+            {"schema": CATALOG_SCHEMA}, revision=50, oauth_sync_enabled=True
+        )
+        snap = build_effective_catalog_snapshot(["grok-4.7-oauth"], compiled=compiled_on)
+        assert "grok-4.7-oauth" in snap["models"]
+
+        # Disable NATIVE_OAUTH_SYNC capability
+        orig_has_cap = cap_mod.has_capability
+        monkeypatch.setattr(
+            cap_mod,
+            "has_capability",
+            create_autospec(
+                orig_has_cap,
+                side_effect=lambda cid, *a, **kw: False
+                if cid == CapabilityId.NATIVE_OAUTH_SYNC
+                else orig_has_cap(cid, *a, **kw),
+            ),
+        )
+
+        compiled_off = compile_catalog_from_payload(
+            {"schema": CATALOG_SCHEMA}, revision=51, oauth_sync_enabled=False
+        )
+        assert compiled_off.model_config.get_model_config("grok-4.7-oauth") is None
+
+        # SnapshotModelConfig must NOT expose the stripped OAuth model or provider
+        snap_mc = SnapshotModelConfig(compiled_off.model_config, snap)
+        assert snap_mc.get_model_config("grok-4.7-oauth") is None
+        assert snap_mc._snap_provider_overlay("xai-oauth") is None
+
+        # load_run_recovery_context refuses resume with exact same 400 model_removed as a normal request
+        interrupted_oauth_row = {
+            "conversation_response_id": "33333333-3333-3333-3333-333333333333",
+            "conversation_thread_id": "thread-r5-5",
+            "metadata": {
+                "llm_model": "grok-4.7-oauth",
+                "effective_catalog_snapshot": snap,
+            },
+        }
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(
+                load_run_recovery_context(
+                    run_id="33333333-3333-3333-3333-333333333333",
+                    thread_id="thread-r5-5",
+                    is_subagent=False,
+                    run_row=interrupted_oauth_row,
+                    enforce_capabilities=True,
+                )
+            )
+        assert exc_info.value.status_code == 400
+        assert isinstance(exc_info.value.detail, dict)
+        assert exc_info.value.detail["type"] == "model_removed"
+
+    def test_r5_6_legacy_snapshot_max_output_preserved_when_live_catalog_changes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.team_model_catalog.constants import TURN_SNAPSHOT_SCHEMA
+        from src.dalton.services.team_model_catalog.snapshot import (
+            SnapshotModelConfig,
+            extract_snapshot_client_params,
+        )
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        # Live catalog updated gpt-test max_tokens to 8192 and added a gemini model with max_output_tokens=16384
+        payload = {
+            "schema": CATALOG_SCHEMA,
+            "model_overrides": {
+                "gpt-test": {"parameters": {"max_tokens": 8192, "temperature": 0.3}},
+            },
+            "providers": {
+                "provider_variants": {
+                    "openai": {
+                        "gem-var": {
+                            "parent_provider": "openai",
+                            "display_name": "Gemini Var",
+                            "sdk": "gemini",
+                            "billing": "cash",
+                            "base_url": "https://gem.example.com/v1",
+                        }
+                    }
+                },
+                "models": {
+                    "gem-var": [{"id": "gem-1", "name": "G1", "pricing": {"input": 1.0, "output": 2.0}}]
+                },
+            },
+            "models": {
+                "gem-model": {
+                    "model_id": "gem-1",
+                    "provider": "gem-var",
+                    "display_name": "Gem Model",
+                    "visible": True,
+                    "parameters": {"max_output_tokens": 16384},
+                }
+            },
+            "dalton_meta": {"gem-model": {"billing": "cash", "tool_calling": True}},
+        }
+        compiled = compile_catalog_from_payload(payload, revision=60)
+        live_mc = compiled.model_config
+
+        # Legacy snapshot (pre-r4): stores max_output without a parameters dict
+        legacy_snap = {
+            "schema": TURN_SNAPSHOT_SCHEMA,
+            "catalog_revision": 1,
+            "models": {
+                "gpt-test": {
+                    "model_key": "gpt-test",
+                    "provider": "openai",
+                    "model_id": "gpt-test",
+                    "billing": "cash",
+                    "max_output": 4096,
+                },
+                "gem-model": {
+                    "model_key": "gem-model",
+                    "provider": "gem-var",
+                    "model_id": "gem-1",
+                    "billing": "cash",
+                    "max_output": 2048,
+                    "provider_info": {"sdk": "gemini"},
+                },
+            },
+            "by_identity": {},
+            "variants": {},
+        }
+
+        # OpenAI model translates legacy max_output -> parameters.max_tokens=4096 (preserving other live params)
+        cp_openai = extract_snapshot_client_params(
+            "gpt-test", legacy_snap, base_model_config=live_mc
+        )
+        assert cp_openai is not None
+        assert cp_openai.parameters["max_tokens"] == 4096
+        assert cp_openai.parameters["temperature"] == 0.3
+
+        snap_mc = SnapshotModelConfig(live_mc, legacy_snap)
+        assert snap_mc.get_model_config("gpt-test")["parameters"]["max_tokens"] == 4096
+
+        # Gemini SDK model translates legacy max_output -> parameters.max_output_tokens=2048
+        cp_gem = extract_snapshot_client_params(
+            "gem-model", legacy_snap, base_model_config=live_mc
+        )
+        assert cp_gem is not None
+        assert cp_gem.parameters["max_output_tokens"] == 2048
+        assert snap_mc.get_model_config("gem-model")["parameters"]["max_output_tokens"] == 2048
+
+    def test_r5_7_model_list_tool_calling_null_does_not_backfill_stale_process_cache(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.llm import role_policy
+
+        # Warm process-level capability cache with rev 1 where gpt-test had tool_calling=True
+        monkeypatch.setattr(
+            role_policy,
+            "_load_tool_capability_snapshot",
+            create_autospec(
+                role_policy._load_tool_capability_snapshot,
+                return_value=(
+                    {"gpt-test": {"tool_calling": True}},
+                    {"smoke-fail-model": {"checks": {"N3": "fail"}}},
+                    {"gpt-test": True, "smoke-fail-model": False},
+                ),
+            ),
+        )
+
+        # Rev 2 clears gpt-test tool_calling to null (key absent from dalton_meta["gpt-test"])
+        rev2_meta = {
+            "gpt-test": {"billing": "cash"},
+            "explicit-false": {"billing": "cash", "tool_calling": False},
+        }
+        annotated = role_policy.annotate_model_metadata_tool_calling(
+            {
+                "gpt-test": {"provider": "openai"},
+                "explicit-false": {"provider": "openai"},
+                "smoke-fail-model": {"provider": "openai"},
+            },
+            dalton_meta=rev2_meta,
+        )
+        # Must NOT backfill stale True from process-cached resolved_cap
+        assert "tool_calling" not in annotated["gpt-test"]
+        assert annotated["explicit-false"]["tool_calling"] is False
+        assert annotated["smoke-fail-model"]["tool_calling"] is False

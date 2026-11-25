@@ -395,7 +395,9 @@ def annotate_model_metadata_tool_calling(
             dm_entry = dalton_meta.get(model_key)
             if isinstance(dm_entry, dict) and isinstance(dm_entry.get("tool_calling"), bool):
                 cap = dm_entry["tool_calling"]
-        if not isinstance(cap, bool):
+            elif isinstance(smoke_checks, dict) and smoke_checks.get("N3") == "pass":
+                cap = True
+        else:
             cap = resolved_cap.get(model_key)
         if isinstance(cap, bool):
             updated = dict(entry)

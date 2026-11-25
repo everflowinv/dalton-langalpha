@@ -38,7 +38,6 @@ from src.dalton.llm.notional_pricing import (
     build_notional_price_index,
     calculate_notional_cost,
     extract_flat_rates_from_card,
-    is_subscription_model,
     resolve_notional_card,
 )
 from src.dalton.llm.overlay import load_overlay_data
@@ -88,11 +87,16 @@ def _is_subscription_model(
     notional_cost: Any = None,
 ) -> bool:
     """Return True when `model_name`, `billing_type`, or stamped identity denotes a subscription/OAuth model."""
-    is_sub = is_subscription_model(
-        model_name,
-        billing_type,
-        pricing_model_id=pricing_model_id,
-        pricing_provider=pricing_provider,
+    from src.dalton.services.team_model_catalog.billing import resolve_model_billing
+
+    is_sub = (
+        resolve_model_billing(
+            model_key=model_name,
+            provider=pricing_provider,
+            model_id=pricing_model_id,
+            billing_type=billing_type,
+        )
+        == "subscription"
     )
     if is_sub and billing_type != "oauth":
         if (
@@ -102,24 +106,6 @@ def _is_subscription_model(
             and Decimal(str(notional_cost)) == Decimal("0")
         ):
             return False
-        if pricing_model_id and pricing_provider:
-            try:
-                from src.llms.llm import LLM
-                from src.llms.pricing_utils import find_model_pricing
-
-                provider_info = LLM.get_model_config().get_provider_info(pricing_provider)
-                access_type = provider_info.get("access_type", "api_key")
-                if (
-                    access_type not in ("oauth", "coding_plan")
-                    and pricing_provider != "z-ai-cn-coding"
-                ):
-                    card = find_model_pricing(
-                        pricing_model_id, provider=pricing_provider, _warn_on_miss=False
-                    )
-                    if card is not None and card.get("pricing_type") != "subscription":
-                        return False
-            except Exception:
-                pass
     return is_sub
 
 
