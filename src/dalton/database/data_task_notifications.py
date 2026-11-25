@@ -92,6 +92,7 @@ class AuthorizedDataTaskTarget:
     recipient_id: str = ""
     plan: ResolvedDataTaskPlan | None = None
     create_outer_row: bool = True
+    thread_id: str | None = None
 
 
 def build_data_task_item_delivery_key(
@@ -419,6 +420,17 @@ def _authorized_target_from_report(decision: Mapping[str, Any]) -> AuthorizedDat
     owner_platform_user_id = decision.get("owner_platform_user_id")
     if owner_platform_user_id is not None:
         owner_platform_user_id = str(owner_platform_user_id)
+    payload_obj = decision.get("payload")
+    payload_map = payload_obj if isinstance(payload_obj, Mapping) else {}
+    thread_id = (
+        str(
+            decision.get("thread_id")
+            or payload_map.get("conversation_thread_id")
+            or payload_map.get("thread_id")
+            or ""
+        ).strip()
+        or None
+    )
     return AuthorizedDataTaskTarget(
         allowed=True,
         run_id=plan.run_id,
@@ -432,6 +444,7 @@ def _authorized_target_from_report(decision: Mapping[str, Any]) -> AuthorizedDat
         recipient_id=str(decision.get("recipient_id") or ""),
         plan=plan,
         create_outer_row=False,
+        thread_id=thread_id,
     )
 
 
@@ -1347,6 +1360,8 @@ async def authorize_data_task_notification_plan(
                 }
                 if auth.owner_platform_user_id is not None:
                     plan_payload["owner_platform_user_id"] = auth.owner_platform_user_id
+                if auth.thread_id:
+                    plan_payload["thread_id"] = auth.thread_id
                 return plan_payload
 
 

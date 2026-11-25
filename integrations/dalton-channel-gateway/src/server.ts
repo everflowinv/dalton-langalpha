@@ -233,6 +233,7 @@ export function createGatewayApp(options: {
   const deliveryService = new DeliveryService({
     backend,
     adapters,
+    webBaseUrl: config.webBaseUrl,
     onWeixinAccountRotated,
     retryDelayFn: options.retryDelayFn,
     preflightRetryMaxElapsedMs: options.preflightRetryMaxElapsedMs,
@@ -242,6 +243,7 @@ export function createGatewayApp(options: {
   const dataTaskNotifications = new DataTaskNotificationService({
     backend,
     adapters,
+    webBaseUrl: config.webBaseUrl,
     mode: config.mode,
     onWeixinAccountRotated,
     retryDelayFn: options.retryDelayFn,

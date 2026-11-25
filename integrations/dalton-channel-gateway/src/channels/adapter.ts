@@ -4,6 +4,11 @@ import type {
   WeixinPreflightSendResponse,
 } from "../backend-client.js";
 import type { GatewayLeaseManager } from "../gateway-lease.js";
+import {
+  degradeOversizedLink,
+  findAtomicLinkSpans,
+  findSpanStraddling,
+} from "../shared/text.js";
 import type {
   AvailableChatItem,
   ChannelPlatform,
@@ -477,7 +482,9 @@ export interface ChannelAdapter {
 }
 
 /**
- * Default Markdown-aware chunk splitter respecting `maxChunkChars`.
+ * Default Markdown-aware chunk splitter respecting `maxChunkChars`, keeping
+ * Markdown links intact across chunk boundaries and degrading oversized single
+ * links to plain-text workspace hints.
  */
 export function splitTextByLimit(text: string, maxChunkChars: number): string[] {
   if (!text) return [];
@@ -486,11 +493,25 @@ export function splitTextByLimit(text: string, maxChunkChars: number): string[] 
   const chunks: string[] = [];
   let remaining = text;
   while (remaining.length > maxChunkChars) {
-    let splitIdx = remaining.lastIndexOf("\n", maxChunkChars);
-    if (splitIdx <= 0 || splitIdx < Math.floor(maxChunkChars * 0.4)) {
-      splitIdx = remaining.lastIndexOf(" ", maxChunkChars);
+    const linkSpans = findAtomicLinkSpans(remaining);
+    const minPreferred = Math.floor(maxChunkChars * 0.4);
+
+    const findSafeDelimiter = (delim: string): number => {
+      let idx = remaining.lastIndexOf(delim, maxChunkChars);
+      while (idx > 0 && idx >= minPreferred) {
+        if (!findSpanStraddling(linkSpans, idx)) {
+          return idx;
+        }
+        idx = remaining.lastIndexOf(delim, idx - 1);
+      }
+      return -1;
+    };
+
+    let splitIdx = findSafeDelimiter("\n");
+    if (splitIdx <= 0) {
+      splitIdx = findSafeDelimiter(" ");
     }
-    if (splitIdx <= 0 || splitIdx < Math.floor(maxChunkChars * 0.4)) {
+    if (splitIdx <= 0) {
       splitIdx = maxChunkChars;
       // A hard cut must not split a surrogate pair (emoji etc.).
       const before = remaining.charCodeAt(splitIdx - 1);
@@ -498,6 +519,20 @@ export function splitTextByLimit(text: string, maxChunkChars: number): string[] 
         splitIdx -= 1;
       }
     }
+
+    const straddling = findSpanStraddling(linkSpans, splitIdx);
+    if (straddling) {
+      if (straddling.start > 0) {
+        splitIdx = straddling.start;
+      } else {
+        const degraded = degradeOversizedLink(straddling);
+        if (degraded !== null && degraded.length < straddling.end) {
+          remaining = degraded + remaining.slice(straddling.end);
+          continue;
+        }
+      }
+    }
+
     chunks.push(remaining.slice(0, splitIdx));
     remaining = remaining.slice(splitIdx).replace(/^\n/, "");
   }

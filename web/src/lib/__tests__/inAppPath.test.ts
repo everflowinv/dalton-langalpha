@@ -13,6 +13,9 @@ describe('inAppPath', () => {
     ['missing', null],
     ['empty', ''],
     ['protocol-relative', '//evil.example/x'],
+    // DALTON-HOOK(channel-links): reject // and /\ targeting the internal URL-validation placeholder origin
+    ['placeholder-origin protocol-relative', '//in-app.invalid/chat'],
+    ['placeholder-origin backslash', '/\\in-app.invalid/chat'],
     ['backslash host', '/\\evil.example'],
     ['double backslash', '\\\\evil.example'],
     ['absolute URL', 'https://evil.example/chat'],

@@ -498,6 +498,8 @@ ALLOWED_HOOKS=(
   # BrowserViewer touch scroll + on-demand keyboard button.
   # Mobile web P1: compact top bar, bottom bar overflow, coarse-pointer Enter, phone More menu, publish/share/settings layouts.
   "mobile-web"
+  # Channel sandbox link rewriting: preserve validated ?redirect= deep links across login in App.tsx.
+  "channel-links"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
