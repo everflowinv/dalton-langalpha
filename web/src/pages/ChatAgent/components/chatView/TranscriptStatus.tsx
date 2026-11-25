@@ -2,10 +2,13 @@ import type React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Clock, Info } from 'lucide-react';
 import { HoverCard, HoverCardTrigger, HoverCardContent } from '@/components/ui/hover-card';
+// DALTON-HOOK(mobile-web): use tap-friendly Popover instead of HoverCard for sandbox info on mobile
+import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { Loader } from '@/components/ui/loader';
 import { AnimatePresence, motion, useReducedMotion } from '@/lib/framer';
 import { compactNumber } from '@/lib/format';
 import { DURATION, EASE_COLLAPSE, TWEEN } from '@/lib/motion';
+import { useIsMobile } from '@/hooks/useIsMobile'; // DALTON-HOOK(mobile-web)
 import { useLocale } from '@/hooks/useLocale';
 import { useModelName } from '@/hooks/useModelName';
 import type { ModelStatus, TurnStatus } from '../../session/types';
@@ -196,34 +199,52 @@ function TurnHeldLine({ reason, model }: { reason: string; model: string | null 
 
 function WorkspaceStartingLine({ archived }: { archived: boolean }): React.ReactElement {
   const { t } = useTranslation();
+  const isMobile = useIsMobile(); // DALTON-HOOK(mobile-web)
+  const trigger = (
+    <button
+      type="button"
+      aria-label={t('chat.workspaceStateHelp')}
+      // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on sandbox info icon
+      className="tap-target inline-flex items-center justify-center rounded-full p-0.5 hover:opacity-80 focus:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
+      style={{ color: 'var(--color-text-quaternary)' }}
+    >
+      <Info className="h-3 w-3" />
+    </button>
+  );
+  const body = (
+    <>
+      <div className="font-medium mb-1" style={{ color: 'var(--color-text-primary)' }}>
+        {t(archived ? 'chat.workspaceStateArchivedTitle' : 'chat.workspaceStateStartingTitle')}
+      </div>
+      <p style={{ color: 'var(--color-text-secondary)' }}>
+        {t(archived ? 'chat.workspaceStateArchivedBody' : 'chat.workspaceStateStartingBody')}
+      </p>
+      {archived && (
+        <p className="mt-2" style={{ color: 'var(--color-text-tertiary)' }}>
+          {t('chat.workspaceStateArchivedFootnote')}
+        </p>
+      )}
+    </>
+  );
   return (
     <StatusLine live={false} glyph={<Loader size={12} className="text-(--color-accent-primary)" />}>
       <span>{t(archived ? 'chat.workspaceRestoring' : 'chat.workspaceStarting')}</span>
-      <HoverCard openDelay={150} closeDelay={100}>
-        <HoverCardTrigger asChild>
-          <button
-            type="button"
-            aria-label={t('chat.workspaceStateHelp')}
-            className="inline-flex items-center justify-center rounded-full p-0.5 hover:opacity-80 focus:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
-            style={{ color: 'var(--color-text-quaternary)' }}
-          >
-            <Info className="h-3 w-3" />
-          </button>
-        </HoverCardTrigger>
-        <HoverCardContent side="top" align="start" className="w-80 text-xs leading-relaxed">
-          <div className="font-medium mb-1" style={{ color: 'var(--color-text-primary)' }}>
-            {t(archived ? 'chat.workspaceStateArchivedTitle' : 'chat.workspaceStateStartingTitle')}
-          </div>
-          <p style={{ color: 'var(--color-text-secondary)' }}>
-            {t(archived ? 'chat.workspaceStateArchivedBody' : 'chat.workspaceStateStartingBody')}
-          </p>
-          {archived && (
-            <p className="mt-2" style={{ color: 'var(--color-text-tertiary)' }}>
-              {t('chat.workspaceStateArchivedFootnote')}
-            </p>
-          )}
-        </HoverCardContent>
-      </HoverCard>
+      {/* DALTON-HOOK(mobile-web): use click/tap Popover on mobile; keep HoverCard on desktop */}
+      {isMobile ? (
+        <Popover>
+          <PopoverTrigger asChild>{trigger}</PopoverTrigger>
+          <PopoverContent side="top" align="start" className="w-80 max-w-[calc(100vw-2rem)] text-xs leading-relaxed">
+            {body}
+          </PopoverContent>
+        </Popover>
+      ) : (
+        <HoverCard openDelay={150} closeDelay={100}>
+          <HoverCardTrigger asChild>{trigger}</HoverCardTrigger>
+          <HoverCardContent side="top" align="start" className="w-80 text-xs leading-relaxed">
+            {body}
+          </HoverCardContent>
+        </HoverCard>
+      )}
     </StatusLine>
   );
 }

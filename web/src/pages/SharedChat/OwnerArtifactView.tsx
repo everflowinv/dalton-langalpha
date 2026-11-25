@@ -118,6 +118,8 @@ export default function OwnerArtifactView({ code, metadata }: {
         openUrl: shareLinkHref(code),
         printHint: t('filePanel:pdfPrintHint'),
         generatingHint: t('filePanel:pdfGenerating'),
+        // DALTON-HOOK(mobile-web): pass WeChat external-browser download guidance
+        wechatHint: t('filePanel:wechatOpenInBrowserHint'),
       });
     } finally {
       setPdfBusy(false);

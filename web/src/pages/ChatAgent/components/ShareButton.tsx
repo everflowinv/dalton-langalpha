@@ -54,9 +54,10 @@ export default function ShareButton({ threadId, initialIsShared = false, workspa
         <button
           type="button"
           disabled={triggerDisabled}
+          // DALTON-HOOK(mobile-web): ensure mobile share icon button clears 44px touch target
           className={cn(
             'transition-colors disabled:cursor-not-allowed',
-            isMobile ? 'p-2 rounded-md' : 'p-1.5 rounded-[4px]',
+            isMobile ? 'p-2 tap-target rounded-md' : 'p-1.5 rounded-[4px]',
           )}
           style={{
             color: isShared ? 'var(--color-accent-primary)' : 'var(--color-text-primary)',

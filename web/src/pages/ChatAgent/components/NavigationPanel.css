@@ -120,6 +120,61 @@
   }
 }
 
+/* DALTON-HOOK(mobile-web): give adjacent row action buttons (pin/archive, new-thread/options, agents toggle) non-overlapping 36px touch boxes with 4px gap on mobile and coarse pointers */
+@media (max-width: 767px), (hover: none), (pointer: coarse) {
+  .nav-panel-row-actions,
+  .nav-panel-row-actions-mobile,
+  .nav-panel-row-action-pair {
+    gap: 4px;
+  }
+
+  .nav-panel-row .nav-panel-coverage-chip {
+    flex-shrink: 1;
+    min-width: 0;
+    max-width: min(5.5rem, 92px);
+  }
+
+  .nav-panel-action-btn {
+    min-width: 36px;
+    min-height: 36px;
+    --tap-target-w: 36px;
+    --tap-target-h: 44px;
+  }
+}
+
+/* DALTON-HOOK(mobile-web): place workspace/thread row actions inline on touch/no-hover viewports (including >=768px tablets) without disturbing coverage-tree chevron positioning */
+@media (hover: none) and (pointer: coarse) {
+  .nav-panel-workspace-row .nav-panel-row-actions,
+  .nav-panel-thread-row .nav-panel-row-actions {
+    position: static;
+    top: auto;
+    right: auto;
+    bottom: auto;
+    padding-left: 0;
+    padding-right: 0;
+    margin-left: auto;
+    flex-shrink: 0;
+    background: none;
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .nav-panel-workspace-row.nav-panel-row-active .nav-panel-row-actions,
+  .nav-panel-thread-row.nav-panel-row-active .nav-panel-row-actions {
+    top: auto;
+    right: auto;
+    bottom: auto;
+  }
+
+  .nav-panel-row .nav-panel-agents-toggle {
+    opacity: 1;
+  }
+
+  .nav-panel-thread-row .nav-panel-resting-pin {
+    display: none;
+  }
+}
+
 /* Agent group — visually nested under thread with a left guide line.
    margin-right matches .nav-panel-row's 6px so the agent pills' tails align
    with the thread/workspace pills above instead of overhanging to the edge. */

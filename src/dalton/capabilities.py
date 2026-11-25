@@ -40,6 +40,51 @@ CORE_CAPABILITY: None = None
 _TRUTHY_VALUES = frozenset({"1", "true", "yes", "on"})
 _FALSY_VALUES = frozenset({"0", "false", "no", "off"})
 
+HOST_PLATFORM_MACOS = "macos"
+HOST_PLATFORM_LINUX = "linux"
+HOST_PLATFORM_UNKNOWN = "unknown"
+VALID_HOST_PLATFORMS: frozenset[str] = frozenset({HOST_PLATFORM_MACOS, HOST_PLATFORM_LINUX})
+
+
+def resolve_host_platform(
+    *,
+    profile: DeploymentProfile | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> str:
+    """Resolve the deployment host platform (``macos`` | ``linux``) from ``DALTON_HOST_PLATFORM``.
+
+    Container ``sys.platform`` has zero influence on the result:
+    - Explicit ``DALTON_HOST_PLATFORM``: ``macos`` (or ``darwin``) -> ``"macos"``;
+      ``linux`` -> ``"linux"``; any unrecognized non-empty value logs a warning
+      and returns ``"unknown"`` (fail-closed for macOS-only capabilities).
+    - When unset or blank: ``DeploymentProfile.EVERFLOW`` defaults to ``"macos"``
+      and ``DeploymentProfile.CORE`` defaults to ``"linux"``.
+    """
+    env = os.environ if environ is None else environ
+    raw = env.get("DALTON_HOST_PLATFORM")
+    if raw is not None and raw.strip():
+        cleaned = raw.strip().lower()
+        if cleaned in (HOST_PLATFORM_MACOS, "darwin"):
+            return HOST_PLATFORM_MACOS
+        if cleaned == HOST_PLATFORM_LINUX:
+            return HOST_PLATFORM_LINUX
+        logger.warning(
+            "Unrecognized DALTON_HOST_PLATFORM=%r; treating host platform as %r (fail-closed for macOS-only capabilities).",
+            raw,
+            HOST_PLATFORM_UNKNOWN,
+        )
+        return HOST_PLATFORM_UNKNOWN
+
+    active_profile = (
+        resolve_profile(
+            app_env=env.get("APP_ENV", "") if environ is not None else None,
+            dalton_profile=env.get("DALTON_PROFILE", "") if environ is not None else None,
+        )
+        if profile is None
+        else profile
+    )
+    return HOST_PLATFORM_MACOS if active_profile is DeploymentProfile.EVERFLOW else HOST_PLATFORM_LINUX
+
 
 class CapabilityId(StrEnum):
     """Optional Dalton capabilities gated at deployment time."""
@@ -319,6 +364,7 @@ def effective_capabilities(
     data_jobs_enabled: bool | None = None,
     dalton_enabled: bool | None = None,
     transcription_storage_configured: bool | None = None,
+    host_platform: str | None = None,
 ) -> frozenset[CapabilityId]:
     """Compute the active capability set as a pure function (no module-level mutable cache).
 
@@ -421,6 +467,18 @@ def effective_capabilities(
             if any(not raw_state[dep] for dep in spec.depends_on):
                 raw_state[cap] = False
                 changed = True
+
+    if raw_state[CapabilityId.ALPHAENGINE]:
+        resolved_host_platform = (
+            resolve_host_platform(profile=active_profile, environ=env)
+            if host_platform is None
+            else resolve_host_platform(
+                profile=active_profile,
+                environ={"DALTON_HOST_PLATFORM": host_platform},
+            )
+        )
+        if resolved_host_platform != HOST_PLATFORM_MACOS:
+            raw_state[CapabilityId.ALPHAENGINE] = False
 
     if raw_state[CapabilityId.TRANSCRIPTION]:
         storage_ok = (
@@ -924,23 +982,43 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("router.py", "dalton_notify_test_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("router.py", "global_search_endpoint"): CORE_CAPABILITY,
         # --- channels_router.py ---
+        ("channels_router.py", "internal_gateway_lease_acquire_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_gateway_lease_heartbeat_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_gateway_lease_release_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_inbound_register_and_resolve_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_bind_code_consume_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_session_command_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_state_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_settings_put_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_deliveries_authorize_and_claim_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_deliveries_preflight_send_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_deliveries_progress_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_inbound_progress_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_steers_reconcile_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_recover_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_automation_runs_register_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_automation_runs_finish_endpoint"): CapabilityId.CHANNEL_GATEWAY,
-        ("channels_router.py", "internal_weixin_state_get_endpoint"): (
+        ("channels_router.py", "internal_weixin_accounts_reconcile_endpoint"): (
             CapabilityId.CHANNEL_GATEWAY,
             CapabilityId.CHANNEL_WEIXIN,
         ),
-        ("channels_router.py", "internal_weixin_state_put_endpoint"): (
+        ("channels_router.py", "internal_weixin_account_detail_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "internal_weixin_account_cursor_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "internal_weixin_account_status_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "internal_weixin_login_session_get_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "internal_weixin_login_session_patch_endpoint"): (
             CapabilityId.CHANNEL_GATEWAY,
             CapabilityId.CHANNEL_WEIXIN,
         ),
@@ -961,6 +1039,22 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
             CapabilityId.CHANNEL_WEIXIN,
         ),
         ("channels_router.py", "web_weixin_qrcode_verify_code_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "web_weixin_admin_overview_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "web_weixin_admin_config_put_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "web_weixin_admin_delete_account_endpoint"): (
+            CapabilityId.CHANNEL_GATEWAY,
+            CapabilityId.CHANNEL_WEIXIN,
+        ),
+        ("channels_router.py", "web_weixin_admin_delete_user_weixin_endpoint"): (
             CapabilityId.CHANNEL_GATEWAY,
             CapabilityId.CHANNEL_WEIXIN,
         ),

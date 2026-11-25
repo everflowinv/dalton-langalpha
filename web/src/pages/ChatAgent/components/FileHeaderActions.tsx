@@ -27,7 +27,7 @@ import { shortMonthDay } from '@/lib/format'; // DALTON-HOOK(mobile-web)
 import { cn } from '@/lib/utils';
 import { fileExtension, isHtmlFile } from '../utils/filePaths';
 import { useDownloadState, workspaceDownloadKey } from '../utils/downloadNotice';
-import { exportServedPdf } from './viewers/html/useHtmlActions';
+import { exportServedPdf, isWeChatBrowser } from './viewers/html/useHtmlActions'; // DALTON-HOOK(mobile-web)
 import { useServedHtml } from './viewers/html/useServedHtml';
 // DALTON-HOOK(mobile-web): sharedSeq, useArtifactComments for mobile HTML More menu
 import { artifactPathKey, sharedSeq, useArtifactBinding, useArtifactByPath, useArtifactComments } from '@/hooks/useArtifact';
@@ -281,6 +281,8 @@ function FileHeaderActions({
         openUrl: served.openUrl,
         printHint: t('filePanel:pdfPrintHint'),
         generatingHint: t('filePanel:pdfGenerating'),
+        // DALTON-HOOK(mobile-web): pass WeChat external-browser download guidance
+        wechatHint: t('filePanel:wechatOpenInBrowserHint'),
         scale: pdfScale,
         pageNumbers: pdfPageNumbers,
         branding: pdfBranding,
@@ -362,14 +364,21 @@ function FileHeaderActions({
 
   // One handler for every save in this menu. Four sites carried this same body
   // before, which is four places a new one could copy without the guard above.
-  const download = () => triggerDownloadFn(workspaceId, selectedFile).catch((err: unknown) => {
-    console.error('[FileHeaderActions] Download failed:', err);
-    // A save is the whole interaction: nothing opens, nothing navigates, and the
-    // browser shows no file. Without this the menu item is indistinguishable
-    // from a dead one. A toast rather than an inline error, because the document
-    // the reader is looking at is still fine and should stay on screen.
-    toast({ description: t('filePanel:downloadFailed'), variant: 'destructive' });
-  });
+  // DALTON-HOOK(mobile-web): prompt to open in external browser when downloading inside WeChat built-in browser
+  const download = () => {
+    if (isWeChatBrowser()) {
+      toast({ description: t('filePanel:wechatOpenInBrowserHint') });
+      return;
+    }
+    triggerDownloadFn(workspaceId, selectedFile).catch((err: unknown) => {
+      console.error('[FileHeaderActions] Download failed:', err);
+      // A save is the whole interaction: nothing opens, nothing navigates, and the
+      // browser shows no file. Without this the menu item is indistinguishable
+      // from a dead one. A toast rather than an inline error, because the document
+      // the reader is looking at is still fine and should stay on screen.
+      toast({ description: t('filePanel:downloadFailed'), variant: 'destructive' });
+    });
+  };
 
   const isMd = isMarkdownFile(selectedFile, fileMime);
   const isHtml = isHtmlFile(selectedFile);
@@ -607,7 +616,8 @@ function FileHeaderActions({
             <DropdownMenu modal={false}>
               <DropdownMenuTrigger asChild>
                 <button
-                  className="file-panel-icon-btn"
+                  // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on non-HTML file header actions
+                  className="file-panel-icon-btn tap-target"
                   aria-label={t('filePanel:downloadOptions') ?? 'Download options'}
                 >
                   <Download className="h-4 w-4" />
@@ -622,7 +632,7 @@ function FileHeaderActions({
           {actions.showEdit && (
             <button
               onClick={onStartEdit}
-              className="file-panel-icon-btn"
+              className="file-panel-icon-btn tap-target"
               title={t('filePanel:editFile')}
             >
               <Pencil className="h-4 w-4" />

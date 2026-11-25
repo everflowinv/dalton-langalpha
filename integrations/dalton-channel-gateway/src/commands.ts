@@ -1,8 +1,27 @@
+import type { ChannelPlatform } from "./types.js";
+
 export type SessionCommandTargetKind =
   | "home"
   | "workspace_id"
   | "exact_name"
   | "shortcut_name";
+
+export type CoreSessionCommand =
+  | "workspace_list"
+  | "workspace_switch"
+  | "new"
+  | "stop";
+
+export type SessionCommand = CoreSessionCommand;
+
+export function isCoreSessionCommand(cmd: string): cmd is CoreSessionCommand {
+  return (
+    cmd === "workspace_list" ||
+    cmd === "workspace_switch" ||
+    cmd === "new" ||
+    cmd === "stop"
+  );
+}
 
 export type ParsedSlashCommand =
   | {
@@ -16,10 +35,11 @@ export type ParsedSlashCommand =
     }
   | {
       kind: "session";
-      cmd: "workspace_list" | "workspace_switch" | "new" | "stop";
+      cmd: SessionCommand;
       targetKind?: SessionCommandTargetKind;
       workspaceId?: string;
       workspaceQuery?: string;
+      commandArg?: string;
       canonicalCommand: string;
     }
   | {
@@ -109,6 +129,7 @@ export function normalizeCommandCandidateText(
 export function parseSlashCommand(
   rawText: string,
   chatType: "dm" | "group" = "dm",
+  platform?: ChannelPlatform,
 ): ParsedSlashCommand | null {
   const candidate = normalizeCommandCandidateText(rawText, chatType);
   if (!candidate.startsWith("/")) {

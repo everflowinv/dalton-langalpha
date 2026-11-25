@@ -500,7 +500,8 @@ export function TabStrip({
               {tab.kind === 'file' && isHtmlFile(tab.path) && <ArtifactUnreadDot path={tab.path} />}
               <button
                 type="button"
-                className="file-panel-tab-close"
+                // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on tab close button
+                className="file-panel-tab-close tap-target"
                 aria-label={t('filePanel:closeTab', { name })}
                 onClick={(e) => { e.stopPropagation(); if (menuTab !== tab.id) closeFrom(tab.id, e.detail === 0); }}
                 onMouseDown={(e) => e.stopPropagation()}
@@ -538,7 +539,8 @@ export function TabStrip({
       {onNewTab && (
         <ContextMenu onOpenChange={setNewTabMenuOpen}>
           <ContextMenuTrigger asChild disabled={!newTabMenu}>
-            <button type="button" onClick={() => { if (!newTabMenuOpen) onNewTab(); }} className="file-panel-icon-btn shrink-0" title={t('filePanel:newTab')} aria-label={t('filePanel:newTab')}>
+            {/* DALTON-HOOK(mobile-web): expand coarse-pointer touch targets across TabStrip icon buttons */}
+            <button type="button" onClick={() => { if (!newTabMenuOpen) onNewTab(); }} className="file-panel-icon-btn tap-target shrink-0" title={t('filePanel:newTab')} aria-label={t('filePanel:newTab')}>
               <Plus className="h-4 w-4" />
             </button>
           </ContextMenuTrigger>
@@ -555,21 +557,21 @@ export function TabStrip({
       <div className="file-panel-strip-right">
         {history && (
           <>
-            <button type="button" onClick={history.onBack ?? undefined} disabled={!history.onBack} className="file-panel-icon-btn" title={t('filePanel:back')} aria-label={t('filePanel:back')}>
+            <button type="button" onClick={history.onBack ?? undefined} disabled={!history.onBack} className="file-panel-icon-btn tap-target" title={t('filePanel:back')} aria-label={t('filePanel:back')}>
               <ChevronLeft className="h-4 w-4" />
             </button>
-            <button type="button" onClick={history.onForward ?? undefined} disabled={!history.onForward} className="file-panel-icon-btn" title={t('filePanel:forward')} aria-label={t('filePanel:forward')}>
+            <button type="button" onClick={history.onForward ?? undefined} disabled={!history.onForward} className="file-panel-icon-btn tap-target" title={t('filePanel:forward')} aria-label={t('filePanel:forward')}>
               <ChevronRight className="h-4 w-4" />
             </button>
           </>
         )}
         {onOpenMemory && (
-          <button type="button" onClick={onOpenMemory} className="file-panel-icon-btn" title={t('filePanel:tabs.memory')} aria-label={t('filePanel:tabs.memory')}>
+          <button type="button" onClick={onOpenMemory} className="file-panel-icon-btn tap-target" title={t('filePanel:tabs.memory')} aria-label={t('filePanel:tabs.memory')}>
             <BookMarked className="h-4 w-4" />
           </button>
         )}
         {onOpenMemo && (
-          <button type="button" onClick={onOpenMemo} className="file-panel-icon-btn" title={t('filePanel:tabs.memo')} aria-label={t('filePanel:tabs.memo')}>
+          <button type="button" onClick={onOpenMemo} className="file-panel-icon-btn tap-target" title={t('filePanel:tabs.memo')} aria-label={t('filePanel:tabs.memo')}>
             <ScrollText className="h-4 w-4" />
           </button>
         )}
@@ -577,7 +579,7 @@ export function TabStrip({
           <button
             type="button"
             onClick={onToggleExpanded}
-            className="file-panel-icon-btn"
+            className="file-panel-icon-btn tap-target"
             title={expanded ? t('filePanel:collapsePanel') : t('filePanel:expandPanel')}
             aria-label={expanded ? t('filePanel:collapsePanel') : t('filePanel:expandPanel')}
           >
@@ -592,7 +594,7 @@ export function TabStrip({
             type="button"
             onClick={onToggleTree}
             aria-pressed={treeOpen}
-            className="file-panel-icon-btn"
+            className="file-panel-icon-btn tap-target"
             title={t('filePanel:toggleTree')}
             aria-label={t('filePanel:toggleTree')}
           >
@@ -605,14 +607,14 @@ export function TabStrip({
             data-panel-toggle="panel"
             onClick={(event) => onPanelClose(event.detail === 0 ? () => focusToggleWhenRendered('header') : undefined)}
             aria-pressed
-            className="file-panel-icon-btn"
+            className="file-panel-icon-btn tap-target"
             title={t('chat.workspaceFiles')}
             aria-label={t('chat.workspaceFiles')}
           >
             <PanelRight className="h-4 w-4" />
           </button>
         ) : (
-          <button type="button" onClick={() => onPanelClose()} className="file-panel-icon-btn" title={t('filePanel:close')} aria-label={t('filePanel:close')}>
+          <button type="button" onClick={() => onPanelClose()} className="file-panel-icon-btn tap-target" title={t('filePanel:close')} aria-label={t('filePanel:close')}>
             {backArrow ? <ArrowLeft className="h-4 w-4" /> : <X className="h-4 w-4" />}
           </button>
         ))}

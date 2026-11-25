@@ -1,6 +1,16 @@
 // Portions adapted from @tencent-weixin/openclaw-weixin (MIT License, Copyright (c) 2026 Tencent).
 
 import type { BackendClient } from "../../backend-client.js";
+import {
+  isLeaseSafetyMarginPauseError,
+  isStaleGatewayEpochError,
+  type StaleGatewayEpochError,
+} from "../../gateway-lease.js";
+import {
+  createSubsystemLogger,
+  extractSafeLogErrorFields,
+  type SubsystemLogger,
+} from "../../shared/logger.js";
 import type { HostIpResolver } from "../../shared/safe-fetch.js";
 import type { InboundChannelEvent } from "../../types.js";
 import {
@@ -36,6 +46,7 @@ export function sleepWithAbort(
 }
 
 export interface WeixinMonitorOptions {
+  accountId: string;
   baseUrl: string;
   botToken: string;
   ilinkBotId: string;
@@ -47,21 +58,41 @@ export interface WeixinMonitorOptions {
   resolveHostIps?: HostIpResolver;
   checkResolvedIps?: boolean;
   fetchImpl?: typeof fetch;
+  /** Dedicated long-poll HTTP dispatcher (isolated from outbound/control pool, §3.3). */
+  getPollDispatcher?: () => unknown;
   backend: BackendClient;
+  logger?: SubsystemLogger;
+  /**
+   * Local lease double-check evaluated on every `getupdates` return before processing
+   * inbound messages or committing the cursor (D1 / §3.5).
+   */
+  isLeaseValid?: () => boolean;
+  /** Synchronous lease check invoked after DNS resolution and before iLink HTTP dispatch. */
+  assertLeaseValid?: () => void;
+  /** Shared instance-wide 429 cooldown remaining time in ms (gates ALL accounts before `getupdates`). */
+  getSharedCooldownRemainingMs?: () => number;
   onInboundEvent: (event: InboundChannelEvent) => Promise<void>;
   onSessionExpired?: (err: WeixinApiError) => Promise<void> | void;
+  onAccountGenerationSuperseded?: (info: {
+    accountId: string;
+    activeBotGeneration?: number;
+  }) => void;
   onCursorCommitted?: (newCursor: string) => void;
+  onRateLimited?: (err: WeixinApiError) => Promise<number> | number;
+  onStaleEpoch?: (err: StaleGatewayEpochError) => void;
   signal: AbortSignal;
 }
 
 export class WeixinMonitor {
   private readonly opts: WeixinMonitorOptions;
+  private readonly logger: SubsystemLogger;
   private currentCursor: string;
   private pollTimeoutMs: number;
   private runningPromise: Promise<void> | null = null;
 
   constructor(opts: WeixinMonitorOptions) {
     this.opts = opts;
+    this.logger = opts.logger ?? createSubsystemLogger("weixin/monitor");
     this.currentCursor = opts.initialGetUpdatesBuf ?? "";
     this.pollTimeoutMs = opts.pollTimeoutMs ?? DEFAULT_LONG_POLL_TIMEOUT_MS;
   }
@@ -80,17 +111,25 @@ export class WeixinMonitor {
   private async commitCursorWithRecovery(
     nextCursor: string,
   ): Promise<"committed" | "stale" | "retry"> {
-    const { backend, botGeneration, ilinkBotId, signal } = this.opts;
+    const { backend, accountId, botGeneration, ilinkBotId, signal } = this.opts;
     if (signal.aborted) return "retry";
+    if (this.opts.isLeaseValid && !this.opts.isLeaseValid()) {
+      return "stale";
+    }
 
     try {
-      const res = await backend.putWeixinState({
-        get_updates_buf: nextCursor,
-        expected_get_updates_buf: this.currentCursor,
+      const res = await backend.updateWeixinAccountCursor(accountId, {
         expected_bot_generation: botGeneration,
         expected_ilink_bot_id: ilinkBotId,
+        expected_get_updates_buf: this.currentCursor,
+        get_updates_buf: nextCursor,
       });
       if (res.stale_generation) {
+        this.opts.onAccountGenerationSuperseded?.({
+          accountId,
+          activeBotGeneration:
+            typeof res.bot_generation === "number" ? res.bot_generation : undefined,
+        });
         return "stale";
       }
       if (res.updated) {
@@ -106,26 +145,42 @@ export class WeixinMonitor {
         return "committed";
       }
       return "retry";
-    } catch {
-      // I-9 response may have been lost after commit; read back current state from Postgres.
+    } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        this.opts.onStaleEpoch?.(err);
+        throw err;
+      }
       if (signal.aborted) return "retry";
+      // Network drop after POST .../cursor: check account detail for generation switch;
+      // otherwise let commitCursorUntilSettled retry the CAS write idempotently
+      // (a retry after an already-committed write returns cas_mismatch with authoritative cursor).
       try {
-        const current = await backend.getWeixinState({ include_token: false });
+        const detail = await backend.getWeixinAccountDetail(accountId, { signal });
         if (
-          (current.bot_generation !== undefined &&
-            current.bot_generation !== null &&
-            current.bot_generation !== botGeneration) ||
-          (current.ilink_bot_id && current.ilink_bot_id !== ilinkBotId)
+          detail.bot_generation !== botGeneration ||
+          detail.ilink_bot_id !== ilinkBotId ||
+          (detail.status !== "active" && detail.status !== "pending_verification")
         ) {
+          this.opts.onAccountGenerationSuperseded?.({
+            accountId,
+            activeBotGeneration:
+              detail.status === "active" ||
+              detail.status === "pending_verification"
+                ? detail.bot_generation
+                : undefined,
+          });
           return "stale";
         }
-        if (current.get_updates_buf === nextCursor) {
+        if (detail.get_updates_buf === nextCursor) {
           this.currentCursor = nextCursor;
           this.opts.onCursorCommitted?.(nextCursor);
           return "committed";
         }
-      } catch {
-        // Ignore read-back error; next poll will safely replay batch from currentCursor.
+      } catch (detailErr) {
+        if (isStaleGatewayEpochError(detailErr)) {
+          this.opts.onStaleEpoch?.(detailErr);
+          throw detailErr;
+        }
       }
       return "retry";
     }
@@ -137,6 +192,9 @@ export class WeixinMonitor {
     const baseRetryMs = this.opts.retryDelayMs ?? BASE_RETRY_DELAY_MS;
     let attempt = 0;
     while (!this.opts.signal.aborted) {
+      if (this.opts.isLeaseValid && !this.opts.isLeaseValid()) {
+        return "stopped";
+      }
       const status = await this.commitCursorWithRecovery(nextBuf);
       if (status === "committed" || status === "stale") {
         return status;
@@ -152,23 +210,38 @@ export class WeixinMonitor {
     return "stopped";
   }
 
-  private async markExpiredInBackend(err: WeixinApiError): Promise<void> {
-    const { backend, botGeneration, ilinkBotId } = this.opts;
+  private async markExpiredInBackend(err: WeixinApiError): Promise<boolean> {
+    const { backend, accountId, botGeneration, ilinkBotId } = this.opts;
     try {
-      await backend.putWeixinState({
-        status: "expired",
+      const res = await backend.updateWeixinAccountStatus(accountId, {
+        action: "mark_session_expired",
         expected_bot_generation: botGeneration,
         expected_ilink_bot_id: ilinkBotId,
+        error_code: String(err.errcode ?? err.ret ?? -14),
       });
-    } catch {
-      // Best-effort persistence on -14; adapter also pauses local state.
+      return res?.ok !== false;
+    } catch (statusErr) {
+      if (isStaleGatewayEpochError(statusErr)) {
+        this.opts.onStaleEpoch?.(statusErr);
+        throw statusErr;
+      }
+      this.logger.warn(
+        "Failed to report Weixin session expiry (-14) to backend; triggering sync and retrying poll",
+        {
+          account_id: accountId,
+          ilink_bot_id: ilinkBotId,
+          bot_generation: botGeneration,
+          ...extractSafeLogErrorFields(statusErr),
+        },
+      );
+      return false;
     }
-    await this.opts.onSessionExpired?.(err);
   }
 
   private async runLoop(): Promise<void> {
     const {
       signal,
+      accountId,
       baseUrl,
       botToken,
       ilinkBotId,
@@ -182,6 +255,26 @@ export class WeixinMonitor {
     let consecutiveFailures = 0;
 
     while (!signal.aborted) {
+      if (this.opts.isLeaseValid && !this.opts.isLeaseValid()) {
+        this.logger.warn(
+          "Stopping Weixin poll loop because gateway lease is no longer locally valid",
+          {
+            account_id: accountId,
+            ilink_bot_id: ilinkBotId,
+            bot_generation: botGeneration,
+          },
+        );
+        break;
+      }
+
+      // Decision #13: shared 429 cooldown gates ALL accounts before issuing getupdates.
+      const sharedCooldownMs = this.opts.getSharedCooldownRemainingMs?.() ?? 0;
+      if (sharedCooldownMs > 0) {
+        const ok = await sleepWithAbort(sharedCooldownMs, signal);
+        if (!ok) break;
+        continue;
+      }
+
       try {
         const resp = await getWeixinUpdates({
           baseUrl,
@@ -190,13 +283,27 @@ export class WeixinMonitor {
           timeoutMs: this.pollTimeoutMs,
           signal,
           fetchImpl,
+          dispatcher: this.opts.getPollDispatcher?.(),
           allowedDomains: allowedApiDomains,
           resolveHostIps,
           checkResolvedIps,
+          assertLeaseValid: this.opts.assertLeaseValid,
         });
 
         if (signal.aborted) break;
-        consecutiveFailures = 0;
+
+        // D1 double-check on every getupdates return before processing inbound messages or advancing cursor.
+        if (this.opts.isLeaseValid && !this.opts.isLeaseValid()) {
+          this.logger.warn(
+            "Discarding getupdates batch because gateway lease expired during long poll",
+            {
+              account_id: accountId,
+              ilink_bot_id: ilinkBotId,
+              bot_generation: botGeneration,
+            },
+          );
+          break;
+        }
 
         if (
           typeof resp.longpolling_timeout_ms === "number" &&
@@ -220,14 +327,22 @@ export class WeixinMonitor {
             batchAllRegistered = false;
             break;
           }
+          if (this.opts.isLeaseValid && !this.opts.isLeaseValid()) {
+            return;
+          }
           const event = parseWeixinInboundMessage(msg, {
+            accountId,
             ilinkBotId,
             botGeneration,
           });
           try {
             await this.opts.onInboundEvent(event);
-          } catch {
-            // Inbound registration (I-1) failed; do not advance cursor so batch is retried.
+          } catch (inboundErr) {
+            if (isStaleGatewayEpochError(inboundErr)) {
+              this.opts.onStaleEpoch?.(inboundErr);
+              return;
+            }
+            // Inbound registration (I-1) failed (e.g. 503 roster_lookup_error); do not advance cursor so batch is retried.
             batchAllRegistered = false;
             break;
           }
@@ -236,7 +351,11 @@ export class WeixinMonitor {
         if (!batchAllRegistered || signal.aborted) {
           if (signal.aborted) break;
           consecutiveFailures += 1;
-          const ok = await sleepWithAbort(baseRetryMs, signal);
+          const backoffMs = Math.min(
+            baseRetryMs * Math.pow(2, Math.min(consecutiveFailures - 1, 4)),
+            MAX_RETRY_DELAY_MS,
+          );
+          const ok = await sleepWithAbort(backoffMs, signal);
           if (!ok) break;
           continue;
         }
@@ -253,16 +372,50 @@ export class WeixinMonitor {
             break;
           }
         }
+
+        // Decision #13: reset failure counter only after the entire batch succeeded
+        // (and cursor committed), so sustained I-1 503 errors back off exponentially.
+        consecutiveFailures = 0;
       } catch (err) {
         if (signal.aborted) break;
+        if (isLeaseSafetyMarginPauseError(err)) {
+          // Round 3 Decision #1: <5s safety margin only pauses polling; do NOT treat as fatal lease loss.
+          break;
+        }
+        if (isStaleGatewayEpochError(err)) {
+          this.opts.onStaleEpoch?.(err);
+          break;
+        }
 
         if (err instanceof WeixinApiError) {
           if (err.kind === "session_expired") {
-            await this.markExpiredInBackend(err);
-            break;
+            let reported = false;
+            try {
+              reported = await this.markExpiredInBackend(err);
+            } catch (statusErr) {
+              if (isStaleGatewayEpochError(statusErr)) {
+                break;
+              }
+            }
+            await this.opts.onSessionExpired?.(err);
+            if (reported) {
+              break;
+            }
+            // R9 #1 (Codex High #1, Grok High #1): If reporting -14 to backend failed (e.g. 503),
+            // do NOT permanently exit the poll loop; back off and retry while snapshot sync runs.
+            consecutiveFailures += 1;
+            const backoffMs = Math.min(
+              baseRetryMs * Math.pow(2, Math.min(consecutiveFailures - 1, 4)),
+              MAX_RETRY_DELAY_MS,
+            );
+            const ok = await sleepWithAbort(backoffMs, signal);
+            if (!ok) break;
+            continue;
           }
           if (err.kind === "rate_limited") {
-            const delayMs = err.retryAfterMs ?? baseRetryMs;
+            const delayMs = this.opts.onRateLimited
+              ? await this.opts.onRateLimited(err)
+              : (err.retryAfterMs ?? baseRetryMs);
             const ok = await sleepWithAbort(delayMs, signal);
             if (!ok) break;
             continue;

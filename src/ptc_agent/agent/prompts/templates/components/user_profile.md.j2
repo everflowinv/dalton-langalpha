@@ -88,8 +88,8 @@ When handling investment-related queries, check these JSON files under `.agents/
 ## Automations
 
 {# DALTON-HOOK(prompt-audit-text): distinguish personal automation files from managed coverage/earnings/company system jobs #}
-{# DALTON-HOOK(standalone-core): gate company data/ops job guidance on data_jobs and researchdata_bridge capabilities #}
-个人自动化任务（定时或价格触发）通过 `.agents/user/automations/` 下的 JSON 文件管理，每个任务一个文件：新建时写新文件，修改、暂停或删除时改对应文件；首次编辑前先读该目录 `README.md`，新建或删除前先向用户确认。受覆盖单元管理的自动化任务不能直接通过该目录文件新建、修改、删除或改名：财报任务的新建、改期和剩余窗口补建用 `dalton_schedule_automation`，标准覆盖跟踪用 `dalton_coverage_tracking`{% if data_jobs_enabled | default(false) %}，公司公共数据任务用 `dalton_system_jobs`{% endif %}{% if researchdata_bridge_enabled | default(false) %}，运维任务只读{% endif %}。{% if wakeups_enabled %} An automation is for work the user wants repeated or kept beyond this conversation; a follow-up within it, such as checking back at the open, on a price or when an order fills, is a wakeup (`schedule_wakeup`), which needs no confirmation.{% endif %}
+{# DALTON-HOOK(standalone-core): gate company data/ops job guidance on data_jobs capability and ops_jobs_enabled #}
+个人自动化任务（定时或价格触发）通过 `.agents/user/automations/` 下的 JSON 文件管理，每个任务一个文件：新建时写新文件，修改、暂停或删除时改对应文件；首次编辑前先读该目录 `README.md`，新建或删除前先向用户确认。受覆盖单元管理的自动化任务不能直接通过该目录文件新建、修改、删除或改名：财报任务的新建、改期和剩余窗口补建用 `dalton_schedule_automation`，标准覆盖跟踪用 `dalton_coverage_tracking`{% if data_jobs_enabled | default(false) %}，公司公共数据任务用 `dalton_system_jobs`{% endif %}{% if ops_jobs_enabled | default(false) %}，运维任务只读{% endif %}。{% if wakeups_enabled %} An automation is for work the user wants repeated or kept beyond this conversation; a follow-up within it, such as checking back at the open, on a price or when an order fills, is a wakeup (`schedule_wakeup`), which needs no confirmation.{% endif %}
 
 ## Subagents
 

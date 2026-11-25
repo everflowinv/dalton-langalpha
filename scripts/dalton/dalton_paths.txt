@@ -603,6 +603,11 @@ web/src/components/ui/__tests__/chat-input.mobileEnterAndPicker.test.tsx
 web/src/pages/ChatAgent/components/viewers/html/comments/__tests__/CommentComposer.mobileEnter.test.tsx
 web/src/pages/ChatAgent/components/__tests__/MobileP1Surfaces.test.tsx
 web/e2e/mobile-p1-layout.spec.js
+# Mobile web P2 polish, reading, WeChat, and touch-target tests (DALTON-HOOK(mobile-web)).
+web/src/pages/ChatAgent/components/__tests__/ChatView.mobileSafeArea.test.tsx
+web/src/pages/ChatAgent/components/__tests__/MobileP2ReadingAndWechat.test.tsx
+web/src/components/ui/__tests__/chat-input.mobileVoice.test.tsx
+web/e2e/mobile-p2-touch.spec.js
 # External member permissions Batch 2: unified caller identity hook and permission convergence tests.
 web/src/hooks/useCallerIdentity.ts
 web/src/hooks/__tests__/useCallerIdentity.test.tsx

@@ -104,7 +104,8 @@ const NO_SEGMENTS: ContentSegmentRecord[] = [];
 const INDICATOR_EXIT = { duration: DURATION.exit, ease: EASE_COLLAPSE };
 
 /** The footer's icon buttons: hover changes the fill, a press presses in. */
-const ACTION_BUTTON = 'press p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded hover:bg-(--color-bg-elevated) disabled:opacity-50 disabled:pointer-events-none';
+// DALTON-HOOK(mobile-web): expand coarse-pointer touch target to 44px without changing desktop layout
+const ACTION_BUTTON = 'tap-target press p-1 min-h-7 min-w-7 inline-flex items-center justify-center rounded hover:bg-(--color-bg-elevated) disabled:opacity-50 disabled:pointer-events-none';
 const ICON = 'h-3.5 w-3.5';
 const QUIET_INK = { color: 'var(--color-text-tertiary)' };
 
@@ -498,7 +499,8 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
     aria-hidden={!rowShown}
     inert={!rowShown || undefined}
     className={cn(
-      'flex flex-wrap gap-1 min-h-7 transition-opacity',
+      // DALTON-HOOK(mobile-web): widen action button spacing to gap-2 on mobile viewports
+      'flex flex-wrap gap-1 max-md:gap-2 min-h-7 transition-opacity',
       rowShown
         ? (isMobile ? '' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100')
         : 'opacity-0 pointer-events-none',

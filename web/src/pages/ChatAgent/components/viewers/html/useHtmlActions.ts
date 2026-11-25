@@ -65,6 +65,12 @@ function appendQueryParam(url: string, param: string): string {
   return `${url}${url.includes('?') ? '&' : '?'}${param}`;
 }
 
+// DALTON-HOOK(mobile-web): detect WeChat built-in browser where blob/file downloads are blocked
+export function isWeChatBrowser(ua?: string): boolean {
+  const userAgent = ua ?? (typeof navigator !== 'undefined' ? navigator.userAgent : '');
+  return /MicroMessenger/i.test(userAgent);
+}
+
 // Cap the PDF fetch above the server's 30s render budget so a transport-level
 // hang (server never responds) can't leave the request in flight forever —
 // without it the in-flight guard never clears and the user can't retry.
@@ -80,6 +86,8 @@ export interface ExportServedPdfOptions {
   printHint: string;
   /** Toast shown while the server render is in flight (cleared when it settles). */
   generatingHint: string;
+  // DALTON-HOOK(mobile-web): toast shown in WeChat built-in browser when direct download is blocked
+  wechatHint?: string;
   /** Render scale (server clamps to 0.5–2). 1 = default, omitted from the URL. */
   scale?: number;
   /** Draw an 'N / total' footer in the page margin. */
@@ -100,10 +108,16 @@ export async function exportServedPdf({
   openUrl,
   printHint,
   generatingHint,
+  wechatHint,
   scale,
   pageNumbers,
   branding,
 }: ExportServedPdfOptions): Promise<void> {
+  // DALTON-HOOK(mobile-web): prompt users to open in an external browser when WeChat blocks downloads
+  if (isWeChatBrowser() && wechatHint) {
+    toast({ description: wechatHint });
+    return;
+  }
   const pdfUrl = appendQueryParam(servedUrl, pdfQuery(scale, pageNumbers, branding));
 
   const printFallback = () => {
@@ -182,6 +196,11 @@ export function useHtmlActions(opts: UseHtmlActionsOptions): HtmlActions {
   });
 
   const downloadHtml = useStableHandler(() => {
+    // DALTON-HOOK(mobile-web): WeChat built-in browser intercepts blob/file downloads; guide user to open externally
+    if (isWeChatBrowser()) {
+      toast({ description: t('filePanel:wechatOpenInBrowserHint') });
+      return;
+    }
     if (opts.mode === 'widget') {
       const blob = new Blob([opts.srcDoc], { type: 'text/html' });
       const url = URL.createObjectURL(blob);
@@ -201,6 +220,11 @@ export function useHtmlActions(opts: UseHtmlActionsOptions): HtmlActions {
   });
 
   const exportPdf = useStableHandler(async () => {
+    // DALTON-HOOK(mobile-web): WeChat built-in browser blocks blob downloads/popups; guide user to open externally
+    if (isWeChatBrowser()) {
+      toast({ description: t('filePanel:wechatOpenInBrowserHint') });
+      return;
+    }
     if (pdfInFlight.current) return;
     pdfInFlight.current = true;
     try {
@@ -262,6 +286,8 @@ export function useHtmlActions(opts: UseHtmlActionsOptions): HtmlActions {
         openUrl: opts.openUrl,
         printHint: t('filePanel:pdfPrintHint'),
         generatingHint: t('filePanel:pdfGenerating'),
+        // DALTON-HOOK(mobile-web): pass WeChat external-browser download guidance
+        wechatHint: t('filePanel:wechatOpenInBrowserHint'),
       });
     } finally {
       pdfInFlight.current = false;

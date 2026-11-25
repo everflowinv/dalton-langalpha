@@ -1842,13 +1842,16 @@ async def test_channels_router_and_gateway_reject_company_identity_before_db_wri
             )
             assert r_in_prog.status_code == 401
 
-            r_wx = await client.put(
-                "/api/v1/dalton/channels/internal/weixin-state",
-                headers=headers,
+            r_wx = await client.post(
+                "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+                headers={**headers, "X-Gateway-Epoch": "1"},
                 json={
-                    "ilink_bot_id": "bot1",
-                    "owner_user_id": variant,
-                    "bot_token": "tok",
+                    "platform": "weixin",
+                    "platform_user_id": "wx_u1",
+                    "chat_address": "weixin:@me",
+                    "thread_scope_key": "dm:wx_u1",
+                    "message_id": "m1",
+                    "user_id": variant,
                 },
             )
             assert r_wx.status_code == 401

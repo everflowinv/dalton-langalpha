@@ -188,7 +188,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
         <div className="monitors-scroll">
           <div className="monitors-container">
             {!publicMode && (
-              <Link to="/monitors" className="inline-flex items-center gap-1.5 text-xs hover:underline" style={{ color: 'var(--color-text-secondary)' }}>
+              <Link to="/monitors" className="tap-target inline-flex items-center gap-1.5 text-xs hover:underline" style={{ color: 'var(--color-text-secondary)' }}>
                 <ArrowLeft className="h-3.5 w-3.5" />
                 {t('monitors:backToList')}
               </Link>
@@ -209,8 +209,9 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
           <>
             <Link
               to="/monitors"
-              className="inline-flex items-center gap-1 text-xs shrink-0 hover:underline"
+              className="tap-target inline-flex items-center gap-1 text-xs shrink-0 hover:underline"
               style={{ color: 'var(--color-text-secondary)' }}
+              aria-label={t('monitors:backToList')}
             >
               <ArrowLeft className="h-3.5 w-3.5" />
               <span className="hidden sm:inline">{t('monitors:backToList')}</span>
@@ -242,8 +243,8 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
               aria-label={t('monitors:versionSelect')}
               value={String(effectiveSeq)}
               onChange={(e) => setSelectedSeq(Number(e.target.value))}
-              className="w-28"
-              style={{ height: '30px', fontSize: '0.75rem' }}
+              className="monitors-version-select w-28"
+              style={{ fontSize: '0.75rem' }}
             >
               {detail.versions.map((v) => (
                 <option key={v.seq} value={String(v.seq)}>
@@ -257,7 +258,8 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
             type="button"
             variant="outline"
             size="sm"
-            className="h-[30px] gap-1.5 px-2.5 text-xs"
+            className="tap-target h-[30px] gap-1.5 px-2.5 text-xs"
+            aria-label={t('monitors:copyLink')}
             onClick={() => void copyLink()}
           >
             {copied ? <Check className="h-3.5 w-3.5" style={{ color: 'var(--color-success)' }} /> : <Copy className="h-3.5 w-3.5" />}
@@ -268,7 +270,8 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
             href={permalink}
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex h-[30px] items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium hover:bg-(--color-bg-hover)"
+            className="tap-target inline-flex h-[30px] items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium hover:bg-(--color-bg-hover)"
+            aria-label={t('monitors:openInNewWindow')}
             style={{
               borderColor: 'var(--color-border-muted)',
               color: 'var(--color-text-primary)',
@@ -283,7 +286,8 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
               type="button"
               variant="outline"
               size="sm"
-              className="h-[30px] gap-1.5 px-2.5 text-xs"
+              className="tap-target h-[30px] gap-1.5 px-2.5 text-xs"
+              aria-label={t('monitors:goToSource')}
               onClick={() => {
                 const target = monitor.entry_path
                   ? `/chat/${monitor.workspace_id}?file=${encodeURIComponent(monitor.entry_path)}`

@@ -1,6 +1,7 @@
 import type React from 'react';
 import { describe, it, expect, vi } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'; // DALTON-HOOK(mobile-web)
 import '@testing-library/jest-dom';
 
 import { toast } from '@/components/ui/use-toast';
@@ -16,6 +17,11 @@ import FileHeaderActions, {
 
 // --- Mocks ---
 
+vi.mock('react-router', () => ({
+  // DALTON-HOOK(mobile-web): usePinPageAsDashboard -> usePinnedToast calls useNavigate inside MobileHtmlOverflowMenu
+  useNavigate: () => vi.fn(),
+}));
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
 }));
@@ -25,8 +31,16 @@ vi.mock('@/components/ui/use-toast', () => ({
 }));
 
 const exportServedPdfMock = vi.fn().mockResolvedValue(undefined);
+// DALTON-HOOK(mobile-web): allow toggling mobile layout and expose isWeChatBrowser in FileHeaderActions tests
+let mockIsMobile = false;
+vi.mock('@/hooks/useIsMobile', () => ({
+  useIsMobile: () => mockIsMobile,
+  getIsMobileSnapshot: () => mockIsMobile,
+}));
 vi.mock('../viewers/html/useHtmlActions', () => ({
   exportServedPdf: (...args: unknown[]) => exportServedPdfMock(...args),
+  isWeChatBrowser: (ua?: string) =>
+    /MicroMessenger/i.test(ua ?? (typeof navigator !== 'undefined' ? navigator.userAgent : '')),
 }));
 
 vi.mock('@/hooks/useWorkspaceFileGrant', () => ({
@@ -56,6 +70,12 @@ vi.mock('@/hooks/useArtifact', () => ({
   },
   useArtifactDestinations: (artifactId: string | null) => ({ data: artifactId ? destinations : undefined }),
   useArtifactBinding: () => ({ bind: { mutate: bindMutate }, unbind: { mutate: unbindMutate } }),
+  // DALTON-HOOK(mobile-web): stub sharedSeq, useEnsureArtifact, useArtifactComments, useArtifactStatus, and useArtifactPublishing for MobileHtmlOverflowMenu
+  sharedSeq: () => 0,
+  useEnsureArtifact: () => vi.fn(async () => ({ artifact_id: 'art-1', workspace_id: 'ws-123', path: 'results/report.html' })),
+  useArtifactComments: () => ({ data: [] }),
+  useArtifactStatus: () => ({ data: undefined }),
+  useArtifactPublishing: () => ({ publish: { mutateAsync: vi.fn(), isPending: false } }),
 }));
 
 const besideThread = { thread_id: 'th-1', title: 'Beside', workspace_id: 'ws-123', usable: true, home: false };
@@ -344,6 +364,8 @@ describe('FileHeaderActions', () => {
         openUrl: '/api/v1/public/shared/tok-1/files/serve/results/report.html',
         printHint: 'filePanel:pdfPrintHint',
         generatingHint: 'filePanel:pdfGenerating',
+        // DALTON-HOOK(mobile-web): WeChat in-app browser download guidance
+        wechatHint: 'filePanel:wechatOpenInBrowserHint',
         scale: 1,
         pageNumbers: false,
         branding: true,
@@ -642,5 +664,59 @@ describe('FileHeaderActions', () => {
 
   it('returns true for markdown mime in isTextMime', () => {
     expect(isTextMime('text/markdown')).toBe(true);
+  });
+
+  // DALTON-HOOK(mobile-web): verify WeChat download prompt on FileHeaderActions mobile HTML menu download item
+  it('prompts to open in external browser without calling triggerDownloadFn when downloading from mobile HTML menu in WeChat, and downloads normally outside WeChat', () => {
+    const originalUA = navigator.userAgent;
+    const wechatUA =
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 MicroMessenger/8.0.50 NetType/WIFI Language/zh_CN';
+    const safariUA =
+      'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 Version/17.4 Mobile/15E148 Safari/604.1';
+    const triggerDownloadFn = vi.fn().mockResolvedValue(undefined);
+    const toastMock = vi.mocked(toast);
+
+    try {
+      mockIsMobile = true;
+      toastMock.mockClear();
+      Object.defineProperty(navigator, 'userAgent', { value: wechatUA, configurable: true });
+
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const { unmount } = render(
+        <QueryClientProvider client={queryClient}>
+          <FileHeaderActions
+            {...defaultProps}
+            selectedFile="results/report.html"
+            fileMime="text/html"
+            triggerDownloadFn={triggerDownloadFn}
+          />
+        </QueryClientProvider>,
+      );
+
+      fireEvent.click(screen.getByTestId('file-header-mobile-download'));
+      expect(toastMock).toHaveBeenCalledWith({ description: 'filePanel:wechatOpenInBrowserHint' });
+      expect(triggerDownloadFn).not.toHaveBeenCalled();
+      unmount();
+
+      toastMock.mockClear();
+      Object.defineProperty(navigator, 'userAgent', { value: safariUA, configurable: true });
+      render(
+        <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}>
+          <FileHeaderActions
+            {...defaultProps}
+            selectedFile="results/report.html"
+            fileMime="text/html"
+            triggerDownloadFn={triggerDownloadFn}
+          />
+        </QueryClientProvider>,
+      );
+
+      fireEvent.click(screen.getByTestId('file-header-mobile-download'));
+      expect(triggerDownloadFn).toHaveBeenCalledWith('ws-123', 'results/report.html');
+      expect(toastMock).not.toHaveBeenCalledWith({ description: 'filePanel:wechatOpenInBrowserHint' });
+    } finally {
+      mockIsMobile = false;
+      Object.defineProperty(navigator, 'userAgent', { value: originalUA, configurable: true });
+    }
   });
 });

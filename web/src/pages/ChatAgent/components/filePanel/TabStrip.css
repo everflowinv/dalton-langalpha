@@ -200,10 +200,30 @@
   .file-panel-tab { padding-right: 24px; }
   .file-panel-tab-close { left: auto; right: 4px; opacity: 1; }
 }
+/* DALTON-HOOK(mobile-web): prevent .file-panel-tabs overflow-x scrollport from clipping 44px vertical touch targets, keep tab close hit box off tab name, and separate strip icon button hit boxes */
+@media (max-width: 767px), (pointer: coarse) {
+  .file-panel-tabs {
+    padding-block: 8px;
+    margin-block: -8px;
+  }
+}
 @media (pointer: coarse) {
+  .file-panel-tab {
+    padding-right: 30px;
+  }
   .file-panel-tab-close {
     width: 28px;
     height: 28px;
-    right: -1px;
+    right: 0;
+    --tap-target-w: 28px;
+    --tap-target-h: 44px;
+  }
+  .file-panel-tabstrip,
+  .file-panel-strip-right {
+    gap: 6px;
+  }
+  .file-panel-tabstrip .file-panel-icon-btn {
+    --tap-target-w: 32px;
+    --tap-target-h: 44px;
   }
 }

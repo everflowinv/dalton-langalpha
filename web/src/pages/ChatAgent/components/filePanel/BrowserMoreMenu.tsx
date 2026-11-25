@@ -44,7 +44,8 @@ export function BrowserMoreMenu({
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <button type="button" className="file-panel-icon-btn shrink-0" title={title} aria-label={title}>
+        {/* DALTON-HOOK(mobile-web): expand coarse-pointer touch target on browser more-menu icon */}
+        <button type="button" className="file-panel-icon-btn tap-target shrink-0" title={title} aria-label={title}>
           <MoreHorizontal className="h-3.5 w-3.5" />
         </button>
       </DropdownMenuTrigger>

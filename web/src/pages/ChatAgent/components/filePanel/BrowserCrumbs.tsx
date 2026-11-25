@@ -89,7 +89,8 @@ export function BrowserCrumbs({
           variant={holding ? 'default' : 'outline'}
           size="sm"
           // The row's height, as the field and icons beside it are.
-          className="h-6 shrink-0 gap-1 rounded px-2 text-xs"
+          // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on take/release control button
+          className="tap-target h-6 shrink-0 gap-1 rounded px-2 text-xs"
           disabled={control === 'taking'}
           onClick={() => (holding ? view.releaseControl() : view.takeControl())}
         >
@@ -102,7 +103,8 @@ export function BrowserCrumbs({
           href={shown}
           target="_blank"
           rel="noopener noreferrer"
-          className="file-panel-icon-btn shrink-0"
+          // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on open-outside link
+          className="file-panel-icon-btn tap-target shrink-0"
           title={openOutside}
           aria-label={openOutside}
         >

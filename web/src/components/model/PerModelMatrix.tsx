@@ -259,10 +259,14 @@ export function PerModelMatrix({
               instead of the container scrolling, which is the whole point of
               the overflow wrapper. The cells' 1px sides are the browser's
               default cell padding, which the columns were laid out on. */}
-          <table className="w-full text-xs" style={{ borderCollapse: 'collapse', minWidth: '800px' }}>
+          {/* DALTON-HOOK(mobile-web): use border-separate on mobile so sticky first column stays pinned and opaque in WebKit */}
+          <table className="w-full text-xs border-collapse max-md:border-separate max-md:border-spacing-0" style={{ minWidth: '800px' }}>
             <thead>
               <tr style={{ color: 'var(--color-text-tertiary)' }}>
-                <th className="text-left font-medium py-1 pl-px pr-3">{t('settings:modelTuning.colModel')}</th>
+                {/* DALTON-HOOK(mobile-web): pin model name column on mobile horizontal scroll with inner block truncation */}
+                <th className="text-left font-medium py-1 pl-px pr-3 max-md:sticky max-md:left-0 max-md:z-20 max-md:bg-(--color-bg-card)">
+                  <div className="max-md:max-w-[140px] max-md:truncate">{t('settings:modelTuning.colModel')}</div>
+                </th>
                 <th className="text-left font-medium py-1 pl-px pr-3">{t('settings:modelTuning.colEffort')}</th>
                 <th className="text-left font-medium py-1 pl-px pr-3">{t('settings:modelTuning.colContext')}</th>
                 <th className="text-left font-medium py-1 pl-px pr-3">{t('settings:modelTuning.colGuidance')}</th>
@@ -277,10 +281,11 @@ export function PerModelMatrix({
               {rows.map((model) => {
                 if (unreachable.has(model)) {
                   return (
-                    <tr key={model} style={{ borderTop: '1px solid var(--color-border-muted)' }}>
+                    <tr key={model} className="max-md:[&>td]:border-t max-md:[&>td]:border-(--color-border-muted)" style={{ borderTop: '1px solid var(--color-border-muted)' }}>
                       {/* DALTON-HOOK(antigravity-series): display unreachable variant as Series · Effort */}
-                      <td className="py-2 pl-px pr-3 align-middle" style={{ color: 'var(--color-text-tertiary)' }}>
-                        {rowLabel(model)}
+                      {/* DALTON-HOOK(mobile-web): sticky model column on mobile with inner block truncation */}
+                      <td className="py-2 pl-px pr-3 align-middle max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-(--color-bg-card)" title={rowLabel(model)} style={{ color: 'var(--color-text-tertiary)' }}>
+                        <div className="max-md:max-w-[140px] max-md:truncate">{rowLabel(model)}</div>
                       </td>
                       <td className="py-2 pl-px pr-3 align-middle" colSpan={settingColumns}>
                         <NotSupported label={t('settings:modelTuning.modelUnavailable')} />
@@ -291,7 +296,8 @@ export function PerModelMatrix({
                           onClick={() => drop(model)}
                           aria-label={`${t('settings:modelTuning.resetModel')} ${model}`}
                           title={t('settings:modelTuning.resetModel')}
-                          className="hover:opacity-70"
+                          // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on row reset icon
+                          className="tap-target hover:opacity-70"
                           style={{ color: 'var(--color-text-tertiary)' }}
                         >
                           <X className="h-3.5 w-3.5" />
@@ -315,10 +321,11 @@ export function PerModelMatrix({
                 // offers it, so it can still be cleared.
                 const offersNative = inherited.native_compaction !== null || storedNative !== null;
                 return (
-                  <tr key={model} style={{ borderTop: '1px solid var(--color-border-muted)' }}>
+                  <tr key={model} className="max-md:[&>td]:border-t max-md:[&>td]:border-(--color-border-muted)" style={{ borderTop: '1px solid var(--color-border-muted)' }}>
                     {/* DALTON-HOOK(antigravity-series): display reachable Antigravity variant as Series · Effort */}
-                    <td className="py-2 pl-px pr-3 align-middle" style={{ color: 'var(--color-text-primary)' }}>
-                      {rowLabel(model)}
+                    {/* DALTON-HOOK(mobile-web): sticky model column on mobile with inner block truncation */}
+                    <td className="py-2 pl-px pr-3 align-middle max-md:sticky max-md:left-0 max-md:z-10 max-md:bg-(--color-bg-card)" title={rowLabel(model)} style={{ color: 'var(--color-text-primary)' }}>
+                      <div className="max-md:max-w-[140px] max-md:truncate">{rowLabel(model)}</div>
                     </td>
                     <td className="py-2 pl-px pr-3 align-middle">
                       {hasEffortOptions(efforts, storedEffort) ? (
@@ -407,7 +414,8 @@ export function PerModelMatrix({
                         onClick={() => drop(model)}
                         aria-label={`${t('settings:modelTuning.resetModel')} ${model}`}
                         title={t('settings:modelTuning.resetModel')}
-                        className="hover:opacity-70"
+                        // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on row reset icon
+                        className="tap-target hover:opacity-70"
                         style={{ color: 'var(--color-text-tertiary)' }}
                       >
                         <X className="h-3.5 w-3.5" />

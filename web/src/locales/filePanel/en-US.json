@@ -216,6 +216,7 @@
   "pdfPrintHint": "Press Cmd/Ctrl-P to save the page as a PDF.",
   "pdfGenerating": "Generating PDF…",
   "pdfFailed": "Could not save the PDF. Please try again.",
+  "wechatOpenInBrowserHint": "Downloads are restricted in WeChat. Tap \"···\" in the top right and open in your external browser.",
   "copyPrivateLink": "Copy link",
   "shareLinkFailed": "Couldn't copy the link",
   "tryAgain": "Try Again",
