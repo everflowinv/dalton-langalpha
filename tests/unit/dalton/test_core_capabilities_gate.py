@@ -139,7 +139,11 @@ EXPLICIT_PROPRIETARY_ROUTE_PREFIXES: tuple[str, ...] = (
 _CLEAR_CAP_ENV_VARS: tuple[str, ...] = (
     "APP_ENV",
     "DALTON_PROFILE",
+    "DALTON_HOST_PLATFORM",
     "DALTON_ENABLED",
+    "DALTON_EMBED_VIA_BRIDGE",
+    "DALTON_OPS_JOBS_VIA_BRIDGE",
+    "DALTON_OPS_STATUS_FILE",
     "DALTON_RESEARCHDATA_URL",
     "DALTON_BRIDGE_URL",
     "DALTON_BRIDGE_TOKEN",
@@ -364,6 +368,7 @@ class TestCapabilityRegistry:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _clean_cap_env(monkeypatch, app_env="core")
+        monkeypatch.setenv("DALTON_HOST_PLATFORM", "macos")
 
         bridge_children = (
             CapabilityId.ALPHAENGINE,
@@ -440,6 +445,38 @@ class TestCapabilityRegistry:
         _clean_cap_env(monkeypatch, app_env="dalton")
         fp_everflow = capabilities_fingerprint()
         assert fp_everflow != fp_core_1
+
+    def test_host_platform_exclusively_gates_alphaengine_independent_of_sys_platform(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Batch 1 (§7.1 #1): DALTON_HOST_PLATFORM=macos|linux alone gates alphaengine; sys.platform has zero effect."""
+        import sys
+        from src.dalton.capabilities import resolve_host_platform
+
+        _clean_cap_env(monkeypatch, app_env="dalton")
+        monkeypatch.setenv("DALTON_HOST_PLATFORM", "macos")
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert resolve_host_platform() == "macos"
+        assert has_capability(CapabilityId.ALPHAENGINE) is True
+
+        monkeypatch.setenv("DALTON_HOST_PLATFORM", "linux")
+        monkeypatch.setattr(sys, "platform", "darwin")
+        assert resolve_host_platform() == "linux"
+        assert has_capability(CapabilityId.ALPHAENGINE) is False
+
+        # Core profile with bridge + alphaengine explicitly on still requires DALTON_HOST_PLATFORM=macos
+        _clean_cap_env(monkeypatch, app_env="core")
+        monkeypatch.setenv("DALTON_CAP_RESEARCHDATA_BRIDGE", "true")
+        monkeypatch.setenv("DALTON_CAP_ALPHAENGINE", "true")
+        monkeypatch.setattr(sys, "platform", "darwin")
+        assert resolve_host_platform() == "linux"
+        assert has_capability(CapabilityId.ALPHAENGINE) is False
+
+        monkeypatch.setenv("DALTON_HOST_PLATFORM", "macos")
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert resolve_host_platform() == "macos"
+        assert has_capability(CapabilityId.ALPHAENGINE) is True
 
 
 # ---------------------------------------------------------------------------

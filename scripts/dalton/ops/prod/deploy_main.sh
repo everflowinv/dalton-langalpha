@@ -2602,6 +2602,64 @@ compute_migrating_deploy() {
   return 0
 }
 
+# Ensure Everflow production .env declares DALTON_HOST_PLATFORM=macos.
+# When the key is missing or empty, writes DALTON_HOST_PLATFORM=macos atomically
+# (preserving existing permissions) and forces RECREATE=1 so docker compose
+# recreates the backend container with the updated .env snapshot (§5.2 E16).
+# Rejects any explicit non-macos value because Everflow production is fixed on macOS.
+ensure_everflow_host_platform_env() {
+  local env_file="${1:-${REPO_ROOT}/.env}"
+  local cur_val="" normalized="" tmp_file="" orig_mode=""
+  [ -f "$env_file" ] || return 0
+  cur_val=$(awk '
+    /^[[:space:]]*(export[[:space:]]+)?DALTON_HOST_PLATFORM[[:space:]]*=/ {
+      line = $0
+      sub(/^[[:space:]]*(export[[:space:]]+)?DALTON_HOST_PLATFORM[[:space:]]*=[[:space:]]*/, "", line)
+      if (line ~ /^"/) {
+        sub(/^"/, "", line); sub(/".*$/, "", line)
+      } else if (line ~ /^'\''/) {
+        sub(/^'\''/, "", line); sub(/'\''.*$/, "", line)
+      } else {
+        sub(/[[:space:]]*#.*$/, "", line)
+        sub(/[[:space:]]+$/, "", line)
+      }
+      val = line
+    }
+    END { print val }
+  ' "$env_file")
+  normalized=$(printf '%s' "$cur_val" | tr '[:upper:]' '[:lower:]')
+  if [ "$normalized" = "macos" ]; then
+    return 0
+  fi
+  if [ -n "$normalized" ]; then
+    echo "ERROR: Everflow production requires DALTON_HOST_PLATFORM=macos in ${env_file}, got '${cur_val}'" >&2
+    return 1
+  fi
+  orig_mode=$(stat -f '%Lp' "$env_file" 2>/dev/null || stat -c '%a' "$env_file" 2>/dev/null || echo "600")
+  tmp_file=$(mktemp "$(dirname "$env_file")/.env.hostplat.XXXXXX") || return 1
+  awk '
+    BEGIN { replaced = 0 }
+    /^[[:space:]]*(export[[:space:]]+)?DALTON_HOST_PLATFORM[[:space:]]*=/ {
+      if (!replaced) {
+        print "DALTON_HOST_PLATFORM=macos"
+        replaced = 1
+      }
+      next
+    }
+    { print $0 }
+    END {
+      if (!replaced) {
+        print "DALTON_HOST_PLATFORM=macos"
+      }
+    }
+  ' "$env_file" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+  chmod "$orig_mode" "$tmp_file" 2>/dev/null || chmod 600 "$tmp_file"
+  mv -f "$tmp_file" "$env_file" || { rm -f "$tmp_file"; return 1; }
+  echo "env: wrote DALTON_HOST_PLATFORM=macos to ${env_file}; enabling backend recreate"
+  RECREATE=1
+  return 0
+}
+
 run_deploy_main() {
   local LOG before after out build_rc cur reused target_heads post_ff_head pre_restart_heads gw_diff_rc gw_rev_rc gw_tree_write_ok=0
   parse_deploy_args "$@" || exit $?
@@ -2770,6 +2828,12 @@ run_deploy_main() {
   fi
   if [ "$pre_restart_heads" != "$target_heads" ]; then
     echo "ERROR: pre-restart migration heads (${pre_restart_heads}) differ from pre-backup target heads (${target_heads}): reverting (backend not restarted)" >&2
+    revert_deploy
+    exit 1
+  fi
+
+  if ! ensure_everflow_host_platform_env "${REPO_ROOT}/.env"; then
+    echo "ERROR: DALTON_HOST_PLATFORM check failed: reverting (backend not restarted)" >&2
     revert_deploy
     exit 1
   fi

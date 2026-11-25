@@ -164,6 +164,7 @@ RESEARCH_RUNTIME_ENV_KEYS: frozenset[str] = frozenset(
         "DALTON_RESEARCH_CODE",
         "DALTON_RESEARCH_HOME",
         "DALTON_EMBED_PYTHON",
+        "DALTON_HOST_PLATFORM",
         "EDGAR_IDENTITY",
     }
 )
@@ -237,7 +238,30 @@ ARCHIVE_OWNER_OPTIONAL_MODE_KEYS: tuple[str, ...] = (
     "HOST_MODE",
     "DALTON_AUTH_MODE",
     "APP_ENV",
+    "DALTON_PROFILE",
+    "DALTON_HOST_PLATFORM",
 )
+
+DIRECT_EMBEDDING_CONFIG_KEYS: tuple[str, ...] = (
+    "DALTON_EMBED_VIA_BRIDGE",
+    "DALTON_EMBEDDING_PROVIDER",
+    "DALTON_EMBEDDING_MODEL",
+    "DALTON_EMBEDDING_API_MODEL",
+    "DALTON_EMBEDDING_DIMENSIONS",
+    "DALTON_EMBEDDING_BASE_URL",
+    "DALTON_EMBEDDING_TASK_TYPE_DOC",
+    "DALTON_EMBEDDING_TASK_TYPE_QUERY",
+)
+
+DIRECT_EMBEDDING_CREDENTIAL_KEYS: tuple[str, ...] = (
+    "DALTON_EMBEDDING_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "OPENAI_API_KEY",
+)
+
+VALID_HOST_PLATFORMS: frozenset[str] = frozenset({"macos", "linux"})
+_EMBED_TRUTHY_VALUES: frozenset[str] = frozenset({"1", "true", "yes", "on"})
 
 XAI_OAUTH_ALLOWED_ENV_KEYS: frozenset[str] = frozenset(
     {
@@ -876,6 +900,8 @@ _ARCHIVE_NON_PROVIDER_CANDIDATE_KEYS: frozenset[str] = frozenset(
     | set(ARCHIVE_OWNER_REQUIRED_KEYS)
     | set(ARCHIVE_OWNER_OPTIONAL_MODE_KEYS)
     | set(ARCHIVE_WORKSPACE_RUNTIME_KEYS)
+    | set(DIRECT_EMBEDDING_CONFIG_KEYS)
+    | set(DIRECT_EMBEDDING_CREDENTIAL_KEYS)
     | {
         "DALTON_BRIDGE_ADMIN_TOKEN",
         "DALTON_BRIDGE_EMBED_URL",
@@ -1246,6 +1272,8 @@ def archive_allowed_env_keys(
         | set(ARCHIVE_OWNER_OPTIONAL_MODE_KEYS)
         | {"DALTON_ASSIST_FALLBACK_MODEL"}
         | set(provider_allowed)
+        | set(DIRECT_EMBEDDING_CONFIG_KEYS)
+        | set(DIRECT_EMBEDDING_CREDENTIAL_KEYS)
         | {"DALTON_BRIDGE_ADMIN_TOKEN", "DALTON_BRIDGE_EMBED_URL", "no_proxy"}
         | {"DALTON_OCW_AGENTS_ROOT"}
     )
@@ -1387,6 +1415,8 @@ def build_archive_subprocess_env(
         + ["BYOK_ENCRYPTION_KEY"]
         + list(ARCHIVE_OWNER_REQUIRED_KEYS)
         + list(ARCHIVE_OWNER_OPTIONAL_MODE_KEYS)
+        + list(DIRECT_EMBEDDING_CONFIG_KEYS)
+        + list(DIRECT_EMBEDDING_CREDENTIAL_KEYS)
         + ["DALTON_ASSIST_FALLBACK_MODEL"]
         + sorted(provider_allowed)
     )
@@ -1434,6 +1464,71 @@ def build_archive_subprocess_env(
     return out
 
 
+def _is_embed_via_bridge_env(env: Mapping[str, str]) -> bool:
+    raw = str(env.get("DALTON_EMBED_VIA_BRIDGE") or "").strip().lower()
+    return raw in _EMBED_TRUTHY_VALUES
+
+
+def _validate_host_platform_if_set(env: Mapping[str, str]) -> str | None:
+    if "DALTON_HOST_PLATFORM" not in env:
+        return None
+    raw = str(env.get("DALTON_HOST_PLATFORM") or "").strip()
+    if not raw:
+        return None
+    if raw.lower() not in VALID_HOST_PLATFORMS:
+        return "invalid key DALTON_HOST_PLATFORM (expected 'macos' or 'linux')"
+    return None
+
+
+def _validate_direct_embedding_env(env: Mapping[str, str]) -> list[str]:
+    """Validate backend-direct embedding provider/credentials without logging secret values."""
+    issues: list[str] = []
+    raw_provider = str(env.get("DALTON_EMBEDDING_PROVIDER") or "").strip().lower()
+    if raw_provider and raw_provider not in ("gemini", "openai"):
+        issues.append("invalid key DALTON_EMBEDDING_PROVIDER (expected 'gemini' or 'openai')")
+        return issues
+
+    raw_dims = str(env.get("DALTON_EMBEDDING_DIMENSIONS") or "").strip()
+    if raw_dims:
+        try:
+            dims = int(raw_dims)
+            if not (1 <= dims <= 4000):
+                issues.append("invalid key DALTON_EMBEDDING_DIMENSIONS (out of range 1..4000)")
+        except ValueError:
+            issues.append("invalid key DALTON_EMBEDDING_DIMENSIONS (not an integer)")
+
+    is_core = (
+        str(env.get("DALTON_PROFILE") or "").strip().lower() == "core"
+        or str(env.get("APP_ENV") or "").strip().lower() == "core"
+    )
+    if raw_provider:
+        provider = raw_provider
+    elif is_core and str(env.get("OPENAI_API_KEY") or "").strip():
+        provider = "openai"
+    elif is_core and not str(env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY") or "").strip():
+        provider = "openai"
+    else:
+        provider = "gemini"
+
+    has_explicit_key = bool(str(env.get("DALTON_EMBEDDING_API_KEY") or "").strip())
+    if provider == "gemini":
+        has_provider_key = bool(
+            str(env.get("GEMINI_API_KEY") or "").strip()
+            or str(env.get("GOOGLE_API_KEY") or "").strip()
+        )
+        if not (has_explicit_key or has_provider_key):
+            issues.append(
+                "missing required direct embedding credential (set DALTON_EMBEDDING_API_KEY or GEMINI_API_KEY)"
+            )
+    else:
+        has_provider_key = bool(str(env.get("OPENAI_API_KEY") or "").strip())
+        if not (has_explicit_key or has_provider_key):
+            issues.append(
+                "missing required direct embedding credential (set DALTON_EMBEDDING_API_KEY or OPENAI_API_KEY)"
+            )
+    return issues
+
+
 def _validate_host_embed_url(url_val: str) -> str | None:
     raw = str(url_val or "").strip()
     if not raw:
@@ -1466,12 +1561,13 @@ def validate_archive_required_env(
 ) -> None:
     """Validate all unconditional and model-conditional archive env keys without logging values."""
     issues: list[str] = []
+    via_bridge = _is_embed_via_bridge_env(env)
     unconditional = (
         *ARCHIVE_BASE_REQUIRED_KEYS,
         *ARCHIVE_DB_REQUIRED_KEYS,
         "BYOK_ENCRYPTION_KEY",
         *ARCHIVE_OWNER_REQUIRED_KEYS,
-        "DALTON_BRIDGE_ADMIN_TOKEN",
+        *(("DALTON_BRIDGE_ADMIN_TOKEN",) if via_bridge else ()),
     )
     for key in unconditional:
         if not str(env.get(key) or "").strip():
@@ -1489,9 +1585,16 @@ def validate_archive_required_env(
         if not str(env.get(key) or "").strip():
             issues.append(f"missing conditional model key {key}")
 
-    embed_issue = _validate_host_embed_url(env.get("DALTON_BRIDGE_EMBED_URL", ""))
-    if embed_issue:
-        issues.append(embed_issue)
+    if via_bridge:
+        embed_issue = _validate_host_embed_url(env.get("DALTON_BRIDGE_EMBED_URL", ""))
+        if embed_issue:
+            issues.append(embed_issue)
+    else:
+        issues.extend(_validate_direct_embedding_env(env))
+
+    host_plat_issue = _validate_host_platform_if_set(env)
+    if host_plat_issue:
+        issues.append(host_plat_issue)
 
     no_proxy_val = str(env.get("no_proxy") or "").strip()
     if not no_proxy_val:
@@ -1548,6 +1651,8 @@ def scrub_post_dotenv_import_env(
             | set(ARCHIVE_OWNER_REQUIRED_KEYS)
             | set(ARCHIVE_OWNER_OPTIONAL_MODE_KEYS)
             | set(ARCHIVE_WORKSPACE_RUNTIME_KEYS)
+            | set(DIRECT_EMBEDDING_CONFIG_KEYS)
+            | set(DIRECT_EMBEDDING_CREDENTIAL_KEYS)
             | {"DALTON_BRIDGE_ADMIN_TOKEN", "DALTON_BRIDGE_EMBED_URL", "no_proxy", "DALTON_OCW_AGENTS_ROOT"}
         )
 
@@ -1743,6 +1848,8 @@ def reextract_allowed_env_keys(
         allowed |= (
             set(ARCHIVE_OWNER_REQUIRED_KEYS)
             | set(ARCHIVE_OWNER_OPTIONAL_MODE_KEYS)
+            | set(DIRECT_EMBEDDING_CONFIG_KEYS)
+            | set(DIRECT_EMBEDDING_CREDENTIAL_KEYS)
             | {"DALTON_BRIDGE_ADMIN_TOKEN", "DALTON_BRIDGE_EMBED_URL", "no_proxy"}
             | {"DALTON_REEXTRACT_DSN"}
         )
@@ -1859,9 +1966,10 @@ def enforce_reextract_process_env_in_place(
         target_env["TZ"] = "America/New_York"
 
     if cmd == "render":
-        cur_embed = str(target_env.get("DALTON_BRIDGE_EMBED_URL") or "").strip()
-        if not cur_embed or "host.docker.internal" in cur_embed:
-            target_env["DALTON_BRIDGE_EMBED_URL"] = DEFAULT_HOST_EMBED_URL
+        if _is_embed_via_bridge_env(target_env):
+            cur_embed = str(target_env.get("DALTON_BRIDGE_EMBED_URL") or "").strip()
+            if not cur_embed or "host.docker.internal" in cur_embed:
+                target_env["DALTON_BRIDGE_EMBED_URL"] = DEFAULT_HOST_EMBED_URL
         target_env["no_proxy"] = _merge_no_proxy(target_env.get("no_proxy"))
 
     if validate_required:
@@ -1943,18 +2051,25 @@ def validate_reextract_required_env(
         for key in ARCHIVE_OWNER_REQUIRED_KEYS:
             if not str(env.get(key) or "").strip():
                 issues.append(f"missing required key {key}")
-        if not str(env.get("DALTON_BRIDGE_ADMIN_TOKEN") or "").strip():
-            issues.append("missing required key DALTON_BRIDGE_ADMIN_TOKEN")
-        embed_issue = _validate_host_embed_url(env.get("DALTON_BRIDGE_EMBED_URL", ""))
-        if embed_issue:
-            issues.append(embed_issue)
-        no_proxy_val = str(env.get("no_proxy") or "").strip()
-        if not no_proxy_val:
-            issues.append("missing required key no_proxy")
+        if _is_embed_via_bridge_env(env):
+            if not str(env.get("DALTON_BRIDGE_ADMIN_TOKEN") or "").strip():
+                issues.append("missing required key DALTON_BRIDGE_ADMIN_TOKEN")
+            embed_issue = _validate_host_embed_url(env.get("DALTON_BRIDGE_EMBED_URL", ""))
+            if embed_issue:
+                issues.append(embed_issue)
+            no_proxy_val = str(env.get("no_proxy") or "").strip()
+            if not no_proxy_val:
+                issues.append("missing required key no_proxy")
+            else:
+                np_parts = {p.strip() for p in no_proxy_val.split(",") if p.strip()}
+                if "127.0.0.1" not in np_parts or "localhost" not in np_parts:
+                    issues.append("invalid key no_proxy (must include localhost and 127.0.0.1)")
         else:
-            np_parts = {p.strip() for p in no_proxy_val.split(",") if p.strip()}
-            if "127.0.0.1" not in np_parts or "localhost" not in np_parts:
-                issues.append("invalid key no_proxy (must include localhost and 127.0.0.1)")
+            issues.extend(_validate_direct_embedding_env(env))
+
+    host_plat_issue = _validate_host_platform_if_set(env)
+    if host_plat_issue:
+        issues.append(host_plat_issue)
 
     if issues:
         raise ArchiveEnvValidationError(issues)
@@ -2236,6 +2351,7 @@ def merge_bridge_and_repo_env_files(
     default_research_home: str = "",
     existing_plist_path: Path | None = None,
     research_runtime: str = "new",
+    default_host_platform: str = "macos",
 ) -> dict[str, Any]:
     """Validate and atomically merge defaults into `researchdata-bridge.env` and `<repo>/.env`.
 
@@ -2377,13 +2493,30 @@ def merge_bridge_and_repo_env_files(
                 reason="must be >= 1",
             )
 
+    eff_default_host_platform = str(default_host_platform or "macos").strip().lower()
+    if eff_default_host_platform not in VALID_HOST_PLATFORMS:
+        raise EnvFileValidationError(
+            path=repo_env_path,
+            key="DALTON_HOST_PLATFORM",
+            reason="must be 'macos' or 'linux'",
+        )
+
     repo_defaults: list[tuple[str, str]] = [
         ("DALTON_BRIDGE_TOKEN", str(bridge_eff["DALTON_BRIDGE_TOKEN"]).strip()),
         ("DALTON_BRIDGE_ADMIN_TOKEN", str(bridge_eff["DALTON_BRIDGE_ADMIN_TOKEN"]).strip()),
         ("DALTON_RESEARCHDATA_URL", f"http://host.docker.internal:{port_int}/mcp"),
+        ("DALTON_HOST_PLATFORM", eff_default_host_platform),
         ("SEC_USER_AGENT", "DaltonResearch research@dalton.local"),
     ]
     repo_rendered, repo_eff = _apply_env_defaults(repo_entries, repo_vals, repo_defaults)
+
+    eff_host_platform = str(repo_eff.get("DALTON_HOST_PLATFORM") or "").strip().lower()
+    if eff_host_platform not in VALID_HOST_PLATFORMS:
+        raise EnvFileValidationError(
+            path=repo_env_path,
+            key="DALTON_HOST_PLATFORM",
+            reason="must be 'macos' or 'linux'",
+        )
 
     _validate_no_control_or_whitespace(
         path=repo_env_path,
