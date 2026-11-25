@@ -1136,6 +1136,7 @@ async def is_automation_notification_turn(
     from_service: bool,
     is_server_retry: bool = False,
     retry_of_run_id: str | None = None,
+    known_execution_id: str | None = None,
 ) -> bool:
     """Return True when the request explicitly links to an automation execution."""
     if not _is_server_notification_turn(
@@ -1152,6 +1153,7 @@ async def is_automation_notification_turn(
             request,
             thread_id=thread_id,
             retry_of_run_id=retry_of_run_id,
+            known_execution_id=known_execution_id,
             allow_running_fallback=False,
         )
         return (

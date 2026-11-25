@@ -47,6 +47,28 @@ def is_duplicate_name(new: str, existing: str) -> bool:
     """
     if new.strip().casefold() == existing.strip().casefold():
         return True
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    # Align proposal-time duplicate detection with Phase 1/Phase 2 folder-key
+    # and canonical ticker rules (e.g. ``Q3/Q4`` vs ``Q3-Q4``, ``Research  Notes``
+    # vs ``Research Notes``, ``00700`` vs ``700.HK``, ``BRK-B`` vs ``BRK.B``)
+    # without folding non-ticker Unicode variants like ``计划①`` vs ``计划1``.
+    from src.server.database.workspace_names import (
+        WorkspaceNameInvalid,
+        workspace_name_key,
+    )
+
+    try:
+        if workspace_name_key(new) == workspace_name_key(existing):
+            return True
+    except WorkspaceNameInvalid:
+        pass
+    from src.dalton.coverage.identity import canonical_workspace_ticker_key
+
+    new_key = canonical_workspace_ticker_key(new)
+    existing_key = canonical_workspace_ticker_key(existing)
+    if new_key is not None and existing_key is not None and new_key == existing_key:
+        return True
+    # --- DALTON-HOOK(cos-settings-tools): end ---
     if not (
         _TICKER_SHAPED.match(new.strip().upper())
         and _TICKER_SHAPED.match(existing.strip().upper())
@@ -73,16 +95,232 @@ async def duplicate_workspace(user_id: str, name: str) -> tuple[dict | None, boo
 
     try:
         holders = await get_live_workspace_names(user_id)
-    except Exception:
+    except Exception as exc:
+        # DALTON-HOOK(cos-settings-tools): log only whitelisted fields without raw exception text
         logger.error(
-            f"Could not read workspaces for the duplicate check of {name!r}; asking",
-            exc_info=True,
+            "duplicate_workspace_check_failed exc_type=%s",
+            type(exc).__name__,
         )
         return None, False
     for holder in holders:
         if is_duplicate_name(name, holder.get("name") or ""):
             return holder, True
     return None, True
+
+
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+BOOTSTRAP_CLOUD_COMPUTER_LABEL = "新建托管云端电脑"
+
+
+def _sandbox_config_for_bootstrap() -> Any:
+    """Return the active sandbox configuration for hosted cloud bootstrap checks."""
+    from src.server.services.workspace_manager import WorkspaceManager
+
+    return WorkspaceManager.get_instance().config.sandbox
+
+
+async def build_create_workspace_snapshot(
+    user_id: str, call: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Resolve and freeze target computer & duplicate state for ``manage_workspaces(action="create")``.
+
+    Runs once in ``StandingApprovalMiddleware.aafter_model`` before the tool
+    executes or pauses on ``interrupt()``. Both standing auto-approval and the
+    confirmation card / resumed execution read this single snapshot.
+    """
+    from ptc_agent.agent.tools.computer_reach import ComputerUnreachable
+    from ptc_agent.core.sandbox.providers import MACHINE_KINDS, RECREATABLE_KINDS
+    from src.server.database.computer import (
+        get_computer,
+        get_computer_roster,
+        get_computers_for_user,
+        get_primary_computer,
+    )
+    from src.server.database.user import get_user
+    from src.server.models.computer import ComputerStatus
+    from src.server.services.computer_errors import NeedsComputer
+    from src.server.services.computer_reach import pick_computer
+    from src.tools.secretary.utils import spoken_computer_name
+
+    args = call.get("args")
+    if not isinstance(args, dict):
+        return None
+    raw_name = args.get("name")
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        return None
+
+    name = raw_name
+    raw_desc = args.get("description")
+    description = raw_desc if isinstance(raw_desc, str) else ""
+    raw_computer = args.get("computer")
+    computer_wanted = (
+        raw_computer.strip()
+        if isinstance(raw_computer, str) and raw_computer.strip()
+        else None
+    )
+    call_id = str(call.get("id") or "")
+
+    snapshot: dict[str, Any] = {
+        "action": "create_workspace",
+        "tool_call_id": call_id,
+        "workspace_name": name,
+        "workspace_description": description,
+        "requested_computer": computer_wanted,
+        "computer_id": None,
+        "computer_name": None,
+        "computer_kind": None,
+        "computer_is_own_machine": False,
+        "bootstrap_cloud_primary": False,
+        "duplicate_workspace_id": None,
+        "duplicate_workspace_name": None,
+        "duplicate_check_unavailable": False,
+        "precheck_error": None,
+        "precheck_error_code": None,
+    }
+
+    target: dict[str, Any] | None = None
+    try:
+        if computer_wanted is not None:
+            roster = await get_computer_roster(user_id)
+            try:
+                picked = pick_computer(roster, computer_wanted)
+            except ComputerUnreachable as exc:
+                snapshot["precheck_error"] = str(exc)
+                snapshot["precheck_error_code"] = "computer_not_found"
+                return snapshot
+            target = await get_computer(str(picked["computer_id"]))
+            if target is None or str(target.get("user_id")) != str(user_id):
+                snapshot["precheck_error"] = "Computer not found"
+                snapshot["precheck_error_code"] = "computer_not_found"
+                return snapshot
+        else:
+            target = await get_primary_computer(user_id)
+            if target is None:
+                user_row = await get_user(user_id)
+                existing = await get_computers_for_user(user_id)
+                own_only = (user_row or {}).get("computer_choice") == "own_machine"
+                default_kind: str | None = None
+                cloud_ok = False
+                try:
+                    sandbox_cfg = _sandbox_config_for_bootstrap()
+                    default_kind = getattr(sandbox_cfg, "provider", None)
+                    creatable = tuple(sandbox_cfg.creatable_providers())
+                    cloud_ok = (
+                        isinstance(default_kind, str)
+                        and default_kind in RECREATABLE_KINDS
+                        and default_kind in creatable
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "create_snapshot_sandbox_config_failed exc_type=%s",
+                        type(exc).__name__,
+                    )
+                    cloud_ok = False
+
+                if cloud_ok and not own_only:
+                    snapshot["computer_id"] = None
+                    snapshot["bootstrap_cloud_primary"] = True
+                    snapshot["computer_name"] = BOOTSTRAP_CLOUD_COMPUTER_LABEL
+                    snapshot["computer_kind"] = default_kind
+                    snapshot["computer_is_own_machine"] = False
+                else:
+                    if existing:
+                        names = ", ".join(
+                            f'"{spoken_computer_name(c.get("name"))}"' for c in existing
+                        )
+                        if not cloud_ok:
+                            snapshot["precheck_error"] = (
+                                f"当前部署默认提供商（{default_kind or 'unknown'}）不支持自动创建托管云端主电脑。"
+                                f"请通过 computer 参数指定已有电脑后重新发起：{names}。"
+                            )
+                            snapshot["precheck_error_code"] = "provider_not_offered"
+                        else:
+                            snapshot["precheck_error"] = (
+                                "当前账号已设置为使用自有电脑且尚未设定主电脑。"
+                                f"请通过 computer 参数指定已有电脑后重新发起：{names}。"
+                            )
+                            snapshot["precheck_error_code"] = "needs_computer"
+                    else:
+                        if not cloud_ok:
+                            snapshot["precheck_error"] = (
+                                f"当前部署默认提供商（{default_kind or 'unknown'}）不支持自动创建托管云端主电脑，"
+                                "且你名下暂无可用电脑。请先在电脑页面连接一台电脑，"
+                                "或联系管理员配置托管云端提供商（daytona / docker / e2b）。"
+                            )
+                            snapshot["precheck_error_code"] = "provider_not_offered"
+                        else:
+                            snapshot["precheck_error"] = str(NeedsComputer.no_computer())
+                            snapshot["precheck_error_code"] = "needs_computer"
+                    return snapshot
+    except Exception as exc:
+        logger.warning(
+            "create_snapshot_computer_lookup_failed exc_type=%s",
+            type(exc).__name__,
+        )
+        snapshot["precheck_error"] = "Failed to inspect target computer; please try again."
+        snapshot["precheck_error_code"] = "computer_lookup_failed"
+        return snapshot
+
+    if target is not None:
+        cfg = target.get("config") or {}
+        if cfg.get("retire_when_empty") and not target.get("is_primary"):
+            snapshot["precheck_error"] = "Computer not found"
+            snapshot["precheck_error_code"] = "computer_not_found"
+            return snapshot
+        if cfg.get("archiving"):
+            snapshot["precheck_error"] = (
+                "This computer is currently being archived and cannot accept new workspaces."
+            )
+            snapshot["precheck_error_code"] = "computer_archiving"
+            return snapshot
+        if target.get("status") == ComputerStatus.ERROR:
+            snapshot["precheck_error"] = (
+                f'Computer "{spoken_computer_name(target.get("name"))}" is in an error state '
+                "and cannot accept new workspaces until repaired or rebuilt in Computers."
+            )
+            snapshot["precheck_error_code"] = "computer_error"
+            return snapshot
+        if target.get("status") in (
+            ComputerStatus.CREATING,
+            ComputerStatus.STARTING,
+        ) and not target.get("provider_ref"):
+            snapshot["precheck_error"] = (
+                "The user's computer is still being prepared, so no workspace can "
+                "be created on it yet. Tell the user to try again once it is ready."
+            )
+            snapshot["precheck_error_code"] = "computer_preparing"
+            return snapshot
+
+        kind = str(target.get("kind") or "")
+        snapshot["computer_id"] = str(target["computer_id"])
+        snapshot["computer_name"] = spoken_computer_name(target.get("name"))
+        snapshot["computer_kind"] = kind
+        snapshot["computer_is_own_machine"] = kind in MACHINE_KINDS
+        snapshot["bootstrap_cloud_primary"] = False
+
+    holder, confirmed = await duplicate_workspace(user_id, name)
+    if holder is not None:
+        snapshot["duplicate_workspace_id"] = str(holder.get("workspace_id"))
+        snapshot["duplicate_workspace_name"] = holder.get("name")
+    elif not confirmed:
+        snapshot["duplicate_check_unavailable"] = True
+    return snapshot
+
+
+def _snapshot_allows_standing_create(snapshot: dict[str, Any] | None) -> bool:
+    """Whether ``snapshot`` may use standing auto-approval for workspace creation."""
+    if not isinstance(snapshot, dict):
+        return False
+    if snapshot.get("precheck_error"):
+        return False
+    if snapshot.get("computer_is_own_machine"):
+        return False
+    if snapshot.get("duplicate_workspace_id") is not None:
+        return False
+    if snapshot.get("duplicate_check_unavailable"):
+        return False
+    return True
+# --- DALTON-HOOK(cos-settings-tools): end ---
 
 
 async def _standing_create_withheld(user_id: str, call: dict[str, Any]) -> bool:
@@ -161,6 +399,10 @@ class StandingApprovalState(AgentState):
     # only those tools read it, so an id left from an earlier model call can
     # only meet a tool that never looks.
     preapproved_calls: NotRequired[Annotated[list[str], PrivateStateAttr]]
+    # DALTON-HOOK(cos-settings-tools): persist pre-card confirmation snapshots by tool_call_id
+    approval_snapshots: NotRequired[
+        Annotated[dict[str, dict[str, Any]], PrivateStateAttr]
+    ]
 
 
 class StandingApprovalMiddleware(AgentMiddleware):
@@ -186,20 +428,52 @@ class StandingApprovalMiddleware(AgentMiddleware):
         granted = await _granted(self._user_id)
         # DALTON-HOOK(workspace-duplicate-guard): the duplicate check reads the proposed call
         by_id = {call["id"]: call for call in calls}
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        existing_snapshots = state.get("approval_snapshots")
+        if not isinstance(existing_snapshots, dict):
+            existing_snapshots = {}
+        approval_snapshots: dict[str, dict[str, Any]] = {}
         preapproved_calls = []
         for call_id, needed in wanted.items():
+            if needed is AUTO_APPROVE_WORKSPACE_CREATION:
+                prev_snap = existing_snapshots.get(call_id)
+                snapshot = (
+                    dict(prev_snap)
+                    if isinstance(prev_snap, dict)
+                    else await build_create_workspace_snapshot(
+                        self._user_id, by_id[call_id]
+                    )
+                )
+                if snapshot is not None:
+                    approval_snapshots[call_id] = snapshot
+                if needed in granted and _snapshot_allows_standing_create(snapshot):
+                    preapproved_calls.append(call_id)
+                continue
             if needed not in granted:
                 continue
-            # DALTON-HOOK(workspace-duplicate-guard): a duplicate, or a check
-            # that could not run, withholds the standing approval here.
-            if needed is AUTO_APPROVE_WORKSPACE_CREATION and await _standing_create_withheld(
-                self._user_id, by_id[call_id]
-            ):
-                continue
             preapproved_calls.append(call_id)
-        return {"preapproved_calls": preapproved_calls}
+        update: dict[str, Any] = {"preapproved_calls": preapproved_calls}
+        if approval_snapshots:
+            update["approval_snapshots"] = approval_snapshots
+        return update
+        # --- DALTON-HOOK(cos-settings-tools): end ---
 
 
 def preapproved(state: dict[str, Any], tool_call_id: str) -> bool:
     """Whether this call was approved in advance when the model proposed it."""
     return tool_call_id in (state.get("preapproved_calls") or ())
+
+
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+def approval_snapshot(
+    state: dict[str, Any] | None, tool_call_id: str
+) -> dict[str, Any] | None:
+    """Return the frozen confirmation snapshot for ``tool_call_id``, if any."""
+    if not isinstance(state, dict):
+        return None
+    snapshots = state.get("approval_snapshots")
+    if not isinstance(snapshots, dict):
+        return None
+    snap = snapshots.get(tool_call_id)
+    return dict(snap) if isinstance(snap, dict) else None
+# --- DALTON-HOOK(cos-settings-tools): end ---

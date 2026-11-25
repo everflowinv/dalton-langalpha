@@ -491,27 +491,34 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
         if (block.type === 'create_workspace') {
           const made = (block as CreateWorkspaceRenderBlock).proposal;
           // Made without a card in the chat: the workspace, on a line of its own.
-          if (made && made.workspace_name) {
+          // --- DALTON-HOOK(cos-settings-tools): begin ---
+          // Failed standing-approval creates render a read-only CreateWorkspaceCard
+          // with the failure state instead of a WorkspaceCreatedSlip.
+          if (made && made.workspace_name && made.status !== 'failed') {
             return (
               <WorkspaceCreatedSlip
                 key={block.key}
                 name={String(made.workspace_name ?? '')}
                 workspaceId={typeof made.workspace_id === 'string' ? made.workspace_id : undefined}
                 description={typeof made.workspace_description === 'string' ? made.workspace_description : undefined}
+                computerName={typeof made.computer_name === 'string' ? made.computer_name : undefined}
+                bootstrapCloudPrimary={made.bootstrap_cloud_primary === true}
               />
             );
           }
           const wd = made ?? workspaceProposals[(block as CreateWorkspaceRenderBlock).segment.proposalId!];
           if (!wd) return null;
+          const isPreapprovedCard = Boolean(made);
           return (
             <CreateWorkspaceCard
               key={block.key}
               proposalData={wd as any} // TODO: type properly, ProposalData not exported
               // DALTON-HOOK(team-sharing): render proposal card without action buttons in read-only mode
-              onApprove={!readOnly && answers && onApproveCreateWorkspace ? () => onApproveCreateWorkspace(wd) : undefined}
-              onReject={!readOnly && answers && onRejectCreateWorkspace ? () => onRejectCreateWorkspace(wd) : undefined}
+              onApprove={!isPreapprovedCard && !readOnly && answers && onApproveCreateWorkspace ? () => onApproveCreateWorkspace(wd) : undefined}
+              onReject={!isPreapprovedCard && !readOnly && answers && onRejectCreateWorkspace ? () => onRejectCreateWorkspace(wd) : undefined}
             />
           );
+          // --- DALTON-HOOK(cos-settings-tools): end ---
         }
 
         if (block.type === 'start_question') {

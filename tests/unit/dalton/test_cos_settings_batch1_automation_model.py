@@ -2945,7 +2945,7 @@ async def test_http_retry_and_pending_input_retry_routes_preserve_system_only_to
     monkeypatch.setattr(
         msg_mod,
         "_settle_against_branch",
-        create_autospec(msg_mod._settle_against_branch, side_effect=lambda _t, req, _u: req),
+        create_autospec(msg_mod._settle_against_branch, side_effect=lambda _t, req, _u, **_kw: req),
     )
     monkeypatch.setattr(
         "src.dalton.sharing.resolve_colleague_turn_admission",
@@ -6500,7 +6500,7 @@ async def test_r10_web_retry_and_explicit_execution_lookup_timeout_fail_closed_5
     monkeypatch.setattr(
         msg_mod,
         "_settle_against_branch",
-        create_autospec(msg_mod._settle_against_branch, side_effect=lambda _t, req, _u: req),
+        create_autospec(msg_mod._settle_against_branch, side_effect=lambda _t, req, _u, **_kw: req),
     )
     monkeypatch.setattr(
         "src.dalton.sharing.resolve_colleague_turn_admission",
@@ -7201,7 +7201,7 @@ async def test_r11_web_retry_with_known_execution_id_zero_rows_fails_closed_503(
     monkeypatch.setattr(
         msg_mod,
         "_settle_against_branch",
-        create_autospec(msg_mod._settle_against_branch, side_effect=lambda _t, req, _u: req),
+        create_autospec(msg_mod._settle_against_branch, side_effect=lambda _t, req, _u, **_kw: req),
     )
     monkeypatch.setattr(
         "src.dalton.sharing.resolve_colleague_turn_admission",
@@ -7657,7 +7657,7 @@ async def test_r12_web_retry_with_known_execution_id_on_wakeup_never_borrows_wak
     monkeypatch.setattr(
         msg_mod,
         "_settle_against_branch",
-        create_autospec(msg_mod._settle_against_branch, side_effect=lambda _t, req, _u: req),
+        create_autospec(msg_mod._settle_against_branch, side_effect=lambda _t, req, _u, **_kw: req),
     )
     monkeypatch.setattr(
         "src.dalton.sharing.resolve_colleague_turn_admission",

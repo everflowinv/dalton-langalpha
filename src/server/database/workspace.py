@@ -860,6 +860,17 @@ async def create_workspace_on_computer(
     config: Optional[Dict[str, Any]] = None,
     workspace_id: Optional[str] = None,
     selection_from: Optional[str] = None,
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    # Transactional readiness, snapshot-field, and deterministic duplicate re-verification under lock
+    reject_unavailable: bool = False,
+    expected_computer_name: Optional[str] = None,
+    expected_computer_kind: Optional[str] = None,
+    check_duplicate_snapshot: bool = False,
+    expected_duplicate_workspace_id: Optional[str] = None,
+    expected_duplicate_workspace_name: Optional[str] = None,
+    verified_company_candidates: Optional[Iterable[Tuple[str, str, Optional[str]]]] = None,
+    check_colleague_duplicate: bool = False,
+    # --- DALTON-HOOK(cos-settings-tools): end ---
     conn=None,
 ) -> Optional[Dict[str, Any]]:
     """Create a complete shadow atomically so failed binding cannot leave an unbound project.
@@ -892,6 +903,24 @@ async def create_workspace_on_computer(
         # folder's release and its MCP selection commit with it.
         async with folder_allocation(computer_id, conn=conn) as owned, _ws_cursor(owned) as cur:
             await lock_user_writes(cur, user_id)
+            # --- DALTON-HOOK(cos-settings-tools): begin ---
+            # Under the per-user write lock, re-check duplicate live workspaces
+            # using the same symbol-aware normalization the card used (e.g.
+            # 700.HK vs 0700.HK) so a concurrent create, rename, or deletion
+            # after snapshot capture aborts cleanly with scope_changed.
+            if check_duplicate_snapshot:
+                if not await check_duplicate_snapshot_unchanged(
+                    cur,
+                    user_id,
+                    name,
+                    expected_duplicate_workspace_id=expected_duplicate_workspace_id,
+                    expected_duplicate_workspace_name=expected_duplicate_workspace_name,
+                    verified_company_candidates=verified_company_candidates,
+                    check_colleague_duplicate=check_colleague_duplicate,
+                    conn=owned,
+                ):
+                    return None
+            # --- DALTON-HOOK(cos-settings-tools): end ---
             held = await get_workspace_dir_names_for_computer(computer_id, conn=owned)
             computer = await get_computer(computer_id, conn=owned)
             own_folder = computer is None or takes_name_folders(computer)
@@ -900,7 +929,45 @@ async def create_workspace_on_computer(
                 try:
                     # A savepoint, which a failed insert rolls back so the next
                     # attempt can run.
+                    # --- DALTON-HOOK(cos-settings-tools): begin ---
+                    # Enforce readiness and re-verify displayed snapshot fields
+                    # (computer_name, computer_kind) under the FOR SHARE row lock.
+                    extra_fence = (
+                        "\n                                  AND status <> 'error'"
+                        "\n                                  AND (provider_ref IS NOT NULL OR status NOT IN ('creating', 'starting'))"
+                        if reject_unavailable
+                        else ""
+                    )
+                    if expected_computer_kind is not None:
+                        extra_fence += "\n                                  AND kind = %(expected_computer_kind)s"
                     async with owned.transaction():
+                        if expected_computer_name is not None or expected_computer_kind is not None:
+                            from src.tools.secretary.utils import spoken_computer_name
+
+                            await cur.execute(
+                                f"""
+                                SELECT name, kind
+                                FROM computers
+                                WHERE computer_id = %(computer_id)s AND {FENCE_NOT_DELETED}
+                                  AND {FENCE_TAKES_WORKSPACES}
+                                  AND user_id = %(user_id)s{extra_fence}
+                                FOR SHARE
+                                """,
+                                {
+                                    "computer_id": computer_id,
+                                    "user_id": user_id,
+                                    "expected_computer_kind": expected_computer_kind,
+                                },
+                            )
+                            locked_comp = await cur.fetchone()
+                            if locked_comp is None:
+                                return None
+                            if (
+                                expected_computer_name is not None
+                                and spoken_computer_name(locked_comp.get("name"))
+                                != expected_computer_name
+                            ):
+                                return None
                         await cur.execute(
                             f"""
                             WITH comp AS (
@@ -909,7 +976,7 @@ async def create_workspace_on_computer(
                                 FROM computers
                                 WHERE computer_id = %(computer_id)s AND {FENCE_NOT_DELETED}
                                   AND {FENCE_TAKES_WORKSPACES}
-                                  AND user_id = %(user_id)s
+                                  AND user_id = %(user_id)s{extra_fence}
                                 FOR SHARE
                             )
                             INSERT INTO workspaces (
@@ -933,6 +1000,8 @@ async def create_workspace_on_computer(
                                 "name_key": name_key,
                                 "description": description,
                                 "config": Json(config or {}),
+                                "expected_computer_kind": expected_computer_kind,
+                    # --- DALTON-HOOK(cos-settings-tools): end ---
                                 "dir_name": dir_name,
                             },
                         )
@@ -1218,6 +1287,236 @@ async def get_workspaces_for_user(
         raise
 
 
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+async def check_duplicate_snapshot_unchanged(
+    cur,
+    user_id: str,
+    name: str,
+    *,
+    expected_duplicate_workspace_id: Optional[str] = None,
+    expected_duplicate_workspace_name: Optional[str] = None,
+    verified_company_candidates: Optional[Iterable[Tuple[str, str, Optional[str]]]] = None,
+    check_colleague_duplicate: bool = False,
+    conn: Any = None,
+) -> bool:
+    """Deterministic Phase 2 duplicate verification under ``lock_user_writes``.
+
+    Runs entirely inside a single savepoint on the caller's transaction
+    connection — never calls an LLM and never acquires a second connection from
+    the pool. Any SQL error (including ``dalton_user_roles`` or workspace/unit
+    reads) rolls back the savepoint so the outer transaction stays usable and
+    fails closed by returning ``False`` (triggering ``scope_changed``).
+
+    Shares the exact same canonical ticker normalizer
+    (``normalize_ticker_key`` / ``canonical_workspace_ticker_key``) and
+    internal-team owner classifier (``is_internal_team_owner``) as Phase 1.
+
+    Returns ``False`` when:
+    - Any live workspace of ``user_id`` other than
+      ``expected_duplicate_workspace_id`` shares the same ``workspace_name_key``
+      or canonical ticker key (``700.HK`` / ``0700.HK`` / ``00700``);
+    - A listed ``expected_duplicate_workspace_id`` was deleted, renamed away
+      from ``expected_duplicate_workspace_name``, or no longer duplicates
+      ``name``;
+    - ``check_colleague_duplicate`` is True and any live internal-team
+      colleague workspace shares the same ``workspace_name_key``, canonical
+      ticker key, or active company coverage unit canonical ticker key;
+    - Any candidate ``(workspace_id, name, unit_ticker)`` observed during the
+      lock-free Phase 1 check was deleted, renamed, or changed its active
+      company unit canonical ticker key.
+    """
+    from src.dalton.coverage.identity import (
+        canonical_workspace_ticker_key,
+        normalize_ticker_key,
+    )
+    from src.tools.secretary.approvals import is_duplicate_name
+
+    target_ticker_key = canonical_workspace_ticker_key(name)
+
+    def _same_name_or_ticker(
+        target: str, candidate: str, *, candidate_is_ticker: bool = False
+    ) -> bool:
+        if is_duplicate_name(target, candidate):
+            return True
+        if candidate_is_ticker and target_ticker_key is not None:
+            cand_key = normalize_ticker_key(candidate)
+            if cand_key is not None and cand_key == target_ticker_key:
+                return True
+        return False
+
+    candidates_list = list(verified_company_candidates) if verified_company_candidates else []
+
+    async def _run_checks(check_cur) -> bool:
+        await check_cur.execute(
+            f"""
+            SELECT workspace_id, name
+            FROM workspaces
+            WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
+            """,
+            {"user_id": user_id},
+        )
+        live_rows = await check_cur.fetchall()
+        matched_expected = False
+        for live_ws in live_rows:
+            live_id = str(live_ws["workspace_id"])
+            live_name = str(live_ws.get("name") or "")
+            if (
+                expected_duplicate_workspace_id is not None
+                and live_id == expected_duplicate_workspace_id
+            ):
+                if (
+                    expected_duplicate_workspace_name is not None
+                    and live_name != expected_duplicate_workspace_name
+                ):
+                    return False
+                if not _same_name_or_ticker(name, live_name):
+                    return False
+                matched_expected = True
+                continue
+            if _same_name_or_ticker(name, live_name):
+                return False
+        if expected_duplicate_workspace_id is not None and not matched_expected:
+            return False
+
+        if check_colleague_duplicate:
+            from src.dalton import settings as dalton_settings
+            from src.dalton.sharing import is_internal_team_owner
+
+            internal_user_ids: Optional[set[str]] = None
+            if dalton_settings.is_dalton_local_auth_enabled():
+                await check_cur.execute(
+                    """
+                    SELECT user_id
+                    FROM dalton_user_roles
+                    WHERE tier IN ('admin', 'internal')
+                    """
+                )
+                internal_user_ids = {
+                    str(r["user_id"]).strip()
+                    for r in await check_cur.fetchall()
+                    if r and r.get("user_id")
+                }
+
+            await check_cur.execute(
+                """
+                SELECT w.workspace_id::text AS workspace_id,
+                       w.user_id,
+                       w.name,
+                       u.email AS owner_email,
+                       (
+                           SELECT cu.ticker
+                           FROM dalton_coverage_units cu
+                           WHERE cu.workspace_id = w.workspace_id
+                             AND cu.status = 'active'
+                             AND cu.kind = 'company'
+                           ORDER BY cu.updated_at DESC NULLS LAST
+                           LIMIT 1
+                       ) AS unit_ticker
+                FROM workspaces w
+                LEFT JOIN users u ON u.user_id = w.user_id
+                WHERE w.status NOT IN ('deleted', 'unbound')
+                  AND (w.config->'home_stand_in') IS DISTINCT FROM 'true'::jsonb
+                  AND NULLIF(BTRIM(COALESCE(w.config->>'dalton_historical_duplicate_of', '')), '') IS NULL
+                """
+            )
+            team_rows = await check_cur.fetchall()
+            live_by_id: dict[str, dict[str, Any]] = {}
+            for row in team_rows:
+                ws_id_s = str(row["workspace_id"])
+                ws_owner = str(row.get("user_id") or "").strip()
+                ws_name = str(row.get("name") or "").strip()
+                ws_email = row.get("owner_email")
+                unit_ticker = normalize_ticker_key(row.get("unit_ticker"))
+                live_by_id[ws_id_s] = {
+                    "name": ws_name,
+                    "unit_ticker": unit_ticker,
+                }
+                if not ws_name:
+                    continue
+                if not is_internal_team_owner(
+                    ws_owner,
+                    ws_email,
+                    local_internal_user_ids=internal_user_ids,
+                ):
+                    continue
+                if (
+                    expected_duplicate_workspace_id is not None
+                    and ws_id_s == expected_duplicate_workspace_id
+                ):
+                    continue
+                if _same_name_or_ticker(name, ws_name):
+                    return False
+                if unit_ticker is not None and _same_name_or_ticker(
+                    name, unit_ticker, candidate_is_ticker=True
+                ):
+                    return False
+
+            for cand_id, cand_name, cand_ticker in candidates_list:
+                current = live_by_id.get(str(cand_id))
+                if current is None:
+                    return False
+                if current["name"] != str(cand_name).strip():
+                    return False
+                if current["unit_ticker"] != normalize_ticker_key(cand_ticker):
+                    return False
+        elif candidates_list:
+            cand_ids = [str(cid) for cid, _, _ in candidates_list]
+            await check_cur.execute(
+                """
+                SELECT w.workspace_id::text AS workspace_id,
+                       w.name,
+                       (
+                           SELECT cu.ticker
+                           FROM dalton_coverage_units cu
+                           WHERE cu.workspace_id = w.workspace_id
+                             AND cu.status = 'active'
+                             AND cu.kind = 'company'
+                           ORDER BY cu.updated_at DESC NULLS LAST
+                           LIMIT 1
+                       ) AS unit_ticker
+                FROM workspaces w
+                WHERE w.workspace_id = ANY(%(ws_ids)s::uuid[])
+                  AND w.status NOT IN ('deleted', 'unbound')
+                  AND (w.config->'home_stand_in') IS DISTINCT FROM 'true'::jsonb
+                  AND NULLIF(BTRIM(COALESCE(w.config->>'dalton_historical_duplicate_of', '')), '') IS NULL
+                """,
+                {"ws_ids": cand_ids},
+            )
+            current_by_id = {
+                str(r["workspace_id"]): {
+                    "name": str(r.get("name") or "").strip(),
+                    "unit_ticker": normalize_ticker_key(r.get("unit_ticker")),
+                }
+                for r in await check_cur.fetchall()
+            }
+            for cand_id, cand_name, cand_ticker in candidates_list:
+                current = current_by_id.get(str(cand_id))
+                if current is None:
+                    return False
+                if current["name"] != str(cand_name).strip():
+                    return False
+                if current["unit_ticker"] != normalize_ticker_key(cand_ticker):
+                    return False
+
+        return True
+
+    try:
+        if conn is not None:
+            async with conn.transaction():
+                async with conn.cursor(row_factory=dict_row) as sp_cur:
+                    return await _run_checks(sp_cur)
+        return await _run_checks(cur)
+    except Exception as exc:
+        # The savepoint above rolled back cleanly on any SQL error so the outer
+        # transaction stays healthy; fail closed as scope_changed.
+        logger.warning(
+            "Locked duplicate snapshot recheck unavailable (%s); aborting with scope_changed",
+            type(exc).__name__,
+        )
+        return False
+# --- DALTON-HOOK(cos-settings-tools): end ---
+
+
 async def update_workspace(
     workspace_id: str,
     name: Optional[str] = None,
@@ -1230,76 +1529,128 @@ async def update_workspace(
     from psycopg.types.json import Json
 
     try:
-        updates = []
-        params = []
+        cleaned_name = checked_workspace_name(name) if name is not None else None
 
-        if name is not None:
-            # The folder follows on the next settle; dir_name stays where it is.
-            name = checked_workspace_name(name)
-            updates.extend(("name = %s", "name_key = %s"))
-            params.extend((name, workspace_name_key(name)))
-
-        if description is not None:
-            updates.append("description = %s")
-            params.append(description)
-
-        config_sql, config_params = "config", []
-        if config is not None:
-            # A replaced config keeps the row's server-owned keys and never
-            # takes the caller's.
-            # DALTON-HOOK(historical-duplicate-marker): SERVER_OWNED_CONFIG_KEYS includes dalton_historical_duplicate_of
-            # DALTON-HOOK(colleague-access): include pending_outbound_confirm only when colleague sharing auth is enabled
-            config_sql = (
-                "(%s::jsonb - %s::text[]) || COALESCE("
-                "(SELECT jsonb_object_agg(key, value) FROM jsonb_each(config)"
-                " WHERE key = ANY(%s::text[])), '{}'::jsonb)"
-            )
-            owned = list(server_owned_config_keys())
-            config_params = [Json(config), owned, owned]
-        if name is not None:
-            # A new name ends a backoff a settle left for want of room, as the
-            # folder is asked for again, even under the name it had no room for.
-            config_sql = (
-                f"({config_sql}) #- (CASE WHEN name IS DISTINCT FROM %s"
-                " THEN '{folder_move_blocked}' ELSE '{}' END)::text[]"
-            )
-            config_params.append(name)
-        if config_params:
-            updates.append(f"config = {config_sql}")
-            params.extend(config_params)
-
-        if is_pinned is not None:
-            updates.append("is_pinned = %s")
-            params.append(is_pinned)
-
-        if not updates:
-            return await get_workspace(workspace_id, conn=conn)
-
-        updates.append("updated_at = %s")
-        params.append(datetime.now(timezone.utc))
-        params.append(workspace_id)
-        where = ""
-        if name is not None:
-            # A row staged mid-move keeps its name until the move is recorded:
-            # its last landing went to that name's folder, and only the name
-            # keeps another workspace from being given that folder meanwhile.
-            where = " AND (name = %s OR dir_name IS DISTINCT FROM %s)"
-            params.extend((name, moving_path(workspace_id)))
-
-        update_clause = ", ".join(updates)
+        def _build_update_parts(*, include_name: bool) -> tuple[list[str], list[Any], str]:
+            parts: list[str] = []
+            part_params: list[Any] = []
+            if include_name and cleaned_name is not None:
+                # The folder follows on the next settle; dir_name stays where it is.
+                parts.extend(("name = %s", "name_key = %s"))
+                part_params.extend((cleaned_name, workspace_name_key(cleaned_name)))
+            if description is not None:
+                parts.append("description = %s")
+                part_params.append(description)
+            cfg_sql, cfg_params = "config", []
+            if config is not None:
+                # A replaced config keeps the row's server-owned keys and never
+                # takes the caller's.
+                # DALTON-HOOK(historical-duplicate-marker): SERVER_OWNED_CONFIG_KEYS includes dalton_historical_duplicate_of
+                # DALTON-HOOK(colleague-access): include pending_outbound_confirm only when colleague sharing auth is enabled
+                cfg_sql = (
+                    "(%s::jsonb - %s::text[]) || COALESCE("
+                    "(SELECT jsonb_object_agg(key, value) FROM jsonb_each(config)"
+                    " WHERE key = ANY(%s::text[])), '{}'::jsonb)"
+                )
+                owned = list(server_owned_config_keys())
+                cfg_params = [Json(config), owned, owned]
+            if include_name and cleaned_name is not None:
+                # A new name ends a backoff a settle left for want of room, as the
+                # folder is asked for again, even under the name it had no room for.
+                cfg_sql = (
+                    f"({cfg_sql}) #- (CASE WHEN name IS DISTINCT FROM %s"
+                    " THEN '{folder_move_blocked}' ELSE '{}' END)::text[]"
+                )
+                cfg_params.append(cleaned_name)
+            if cfg_params:
+                parts.append(f"config = {cfg_sql}")
+                part_params.extend(cfg_params)
+            if is_pinned is not None:
+                parts.append("is_pinned = %s")
+                part_params.append(is_pinned)
+            clause_where = ""
+            if parts:
+                parts.append("updated_at = %s")
+                part_params.append(datetime.now(timezone.utc))
+                part_params.append(workspace_id)
+                if include_name and cleaned_name is not None:
+                    # A row staged mid-move keeps its name until the move is recorded:
+                    # its last landing went to that name's folder, and only the name
+                    # keeps another workspace from being given that folder meanwhile.
+                    clause_where = " AND (name = %s OR dir_name IS DISTINCT FROM %s)"
+                    part_params.extend((cleaned_name, moving_path(workspace_id)))
+            return parts, part_params, clause_where
 
         try:
-            async with _ws_cursor(conn) as cur:
-                await cur.execute(
-                    f"""
-                    UPDATE workspaces
-                    SET {update_clause}
-                    WHERE workspace_id = %s AND status != 'deleted'{where}
-                    RETURNING {_WS_COLS}
-                    """,
-                    params,
-                )
-                result = await cur.fetchone()
+            # --- DALTON-HOOK(cos-settings-tools): begin ---
+            if cleaned_name is not None:
+                from src.tools.secretary.approvals import is_duplicate_name
+
+                async with _ws_transaction(conn) as cur:
+                    await cur.execute(
+                        "SELECT user_id, name FROM workspaces WHERE workspace_id = %s AND status != 'deleted'",
+                        (workspace_id,),
+                    )
+                    owner = await cur.fetchone()
+                    if owner is None:
+                        return None
+                    owner_user_id = str(owner["user_id"])
+                    current_name = str(owner.get("name") or "")
+                    renaming = cleaned_name != current_name.strip()
+                    if renaming:
+                        await lock_user_writes(cur, owner_user_id)
+                        await cur.execute(
+                            f"""
+                            SELECT workspace_id, name
+                            FROM workspaces
+                            WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
+                            """,
+                            {"user_id": owner_user_id},
+                        )
+                        for live_ws in await cur.fetchall():
+                            live_id = str(live_ws["workspace_id"])
+                            if live_id == str(workspace_id):
+                                continue
+                            live_name = str(live_ws.get("name") or "")
+                            if is_duplicate_name(cleaned_name, live_name):
+                                raise WorkspaceNameTaken(live_name, live_id)
+                    updates, params, where = _build_update_parts(include_name=renaming)
+                    if not updates:
+                        await cur.execute(
+                            f"SELECT {_WS_COLS} FROM workspaces WHERE workspace_id = %s AND status != 'deleted'",
+                            (workspace_id,),
+                        )
+                        result = await cur.fetchone()
+                    else:
+                        update_clause = ", ".join(updates)
+                        await cur.execute(
+                            f"""
+                            UPDATE workspaces
+                            SET {update_clause}
+                            WHERE workspace_id = %s AND status != 'deleted'{where}
+                            RETURNING {_WS_COLS}
+                            """,
+                            params,
+                        )
+                        result = await cur.fetchone()
+                name = cleaned_name if renaming else None
+            else:
+                updates, params, where = _build_update_parts(include_name=False)
+                if not updates:
+                    return await get_workspace(workspace_id, conn=conn)
+                update_clause = ", ".join(updates)
+                async with _ws_cursor(conn) as cur:
+                    await cur.execute(
+                        f"""
+                        UPDATE workspaces
+                        SET {update_clause}
+                        WHERE workspace_id = %s AND status != 'deleted'{where}
+                        RETURNING {_WS_COLS}
+                        """,
+                        params,
+                    )
+                    result = await cur.fetchone()
+            # --- DALTON-HOOK(cos-settings-tools): end ---
         except UniqueViolation as e:
             if name is None or _violated_index(e) != _USER_NAME_INDEX:
                 raise

@@ -5,7 +5,14 @@
  * A new interrupt type registers here first, then adds its projection branches.
  */
 
-import type { AssistantMessage, ChatMessage } from '@/types/chat';
+// --- DALTON-HOOK(cos-settings-tools): begin ---
+import type {
+  AssistantMessage,
+  ChatMessage,
+  SecretaryActionProposalState,
+  WorkspaceProposalState,
+} from '@/types/chat';
+// --- DALTON-HOOK(cos-settings-tools): end ---
 import { updateMessage } from '../../hooks/utils/messageHelpers';
 import { dispatchResultFields, type ToolResultLike } from '../../utils/dispatchResult';
 import type { HistoryInterruptInfo, SetMessages } from '../types';
@@ -165,13 +172,201 @@ function resolvePendingHistoryInterrupt(
   return true;
 }
 
+// --- DALTON-HOOK(cos-settings-tools): begin ---
+type ProposalOutcomeFields = {
+  status: 'approved' | 'rejected' | 'failed';
+  failure_code?: string;
+  failure_error?: string;
+};
+
+type WorkspaceProposalOutcomeFields = {
+  status: 'approved' | 'rejected' | 'failed';
+  failure_code?: string;
+  failure_error?: string;
+  computer_name?: string;
+  bootstrap_cloud_primary?: boolean;
+};
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function proposalOutcomeFields(
+  type: string,
+  result: ToolResultLike & { status?: unknown },
+): ProposalOutcomeFields {
+  const { content, status: toolStatus } = result;
+  if (typeof content === 'string' && content.startsWith('User declined')) {
+    return { status: 'rejected', failure_code: undefined, failure_error: undefined };
+  }
+  const isToolError = toolStatus === 'error';
+  const strictJsonOutcome = type === 'create_workspace' || type === 'archive_workspace';
+  if (typeof content !== 'string') {
+    return isToolError || strictJsonOutcome
+      ? { status: 'failed' }
+      : { status: 'approved', failure_code: undefined, failure_error: undefined };
+  }
+  const trimmed = content.trim();
+  try {
+    const parsed: unknown = JSON.parse(content);
+    if (isPlainObject(parsed)) {
+      if (parsed.success === false || isToolError) {
+        return {
+          status: 'failed',
+          ...(typeof parsed.code === 'string' && parsed.code ? { failure_code: parsed.code } : {}),
+          ...(typeof parsed.error === 'string' && parsed.error
+            ? { failure_error: parsed.error }
+            : isToolError && trimmed
+              ? { failure_error: trimmed }
+              : {}),
+        };
+      }
+      if (parsed.success === true) {
+        return { status: 'approved', failure_code: undefined, failure_error: undefined };
+      }
+      if (strictJsonOutcome) {
+        return {
+          status: 'failed',
+          ...(typeof parsed.code === 'string' && parsed.code ? { failure_code: parsed.code } : {}),
+          ...(typeof parsed.error === 'string' && parsed.error ? { failure_error: parsed.error } : {}),
+        };
+      }
+    }
+  } catch {
+    if (isToolError || strictJsonOutcome) {
+      return {
+        status: 'failed',
+        ...(trimmed ? { failure_error: trimmed } : {}),
+      };
+    }
+  }
+  if (isToolError || strictJsonOutcome) {
+    return {
+      status: 'failed',
+      ...(trimmed ? { failure_error: trimmed } : {}),
+    };
+  }
+  return { status: 'approved', failure_code: undefined, failure_error: undefined };
+}
+
+function workspaceProposalResultFields(
+  result: ToolResultLike & { status?: unknown },
+): WorkspaceProposalOutcomeFields {
+  const outcome = proposalOutcomeFields('create_workspace', result);
+  if (outcome.status !== 'approved' || typeof result.content !== 'string') {
+    return outcome;
+  }
+  try {
+    const parsed: unknown = JSON.parse(result.content);
+    if (isPlainObject(parsed)) {
+      return {
+        ...outcome,
+        ...(typeof parsed.computer_name === 'string' && parsed.computer_name
+          ? { computer_name: parsed.computer_name }
+          : {}),
+        ...(parsed.bootstrap_cloud_primary === true ? { bootstrap_cloud_primary: true } : {}),
+      };
+    }
+  } catch {
+    // Already parsed successfully in proposalOutcomeFields; keep outcome as-is.
+  }
+  return outcome;
+}
+
+/** Derive settled card fields (approved / rejected / failed) from a tool result.
+ *  Shared by both live stream settlement and history replay so both views agree.
+ *  A tool result with `status === 'error'` or non-JSON / unparseable payload on
+ *  workspace/archive confirmation cards settles as `failed`, never `approved`. */
+function proposalResultFields(
+  type: string,
+  result: ToolResultLike & { status?: unknown },
+): Record<string, unknown> {
+  if (type === 'ptc_agent') {
+    if (typeof result.content === 'string' && result.content.startsWith('User declined')) {
+      return { status: 'rejected', failure_code: undefined, failure_error: undefined };
+    }
+    return { status: 'approved', ...dispatchResultFields(result) };
+  }
+  if (type === 'create_workspace') {
+    return workspaceProposalResultFields(result);
+  }
+  return proposalOutcomeFields(type, result);
+}
+
+/** Settle a live submitting/pending proposal card by exact ``tool_call_id``.
+ *  Returns ``messages`` unchanged (same reference) when no card matches. */
+function settleLiveProposalFromResult(
+  messages: ChatMessage[],
+  toolCallId: string | undefined,
+  result: ToolResultLike & { status?: unknown },
+): ChatMessage[] {
+  if (!toolCallId || (typeof result.content !== 'string' && result.status !== 'error')) return messages;
+  let changed = false;
+  const next: ChatMessage[] = messages.map((m): ChatMessage => {
+    if (m.role !== 'assistant') return m;
+    let msgChanged = false;
+    let nextWorkspaceProposals = m.workspaceProposals;
+    if (m.workspaceProposals) {
+      let bucketChanged = false;
+      const updatedCards: Record<string, WorkspaceProposalState> = { ...m.workspaceProposals };
+      for (const [cardId, card] of Object.entries(m.workspaceProposals)) {
+        if (
+          card
+          && card.tool_call_id === toolCallId
+          && (card.status === 'submitting' || card.status === 'pending')
+        ) {
+          updatedCards[cardId] = { ...card, ...workspaceProposalResultFields(result) };
+          bucketChanged = true;
+        }
+      }
+      if (bucketChanged) {
+        nextWorkspaceProposals = updatedCards;
+        msgChanged = true;
+      }
+    }
+    let nextSecretaryProposals = m.secretaryActionProposals;
+    if (m.secretaryActionProposals) {
+      let bucketChanged = false;
+      const updatedCards: Record<string, SecretaryActionProposalState> = { ...m.secretaryActionProposals };
+      for (const [cardId, card] of Object.entries(m.secretaryActionProposals)) {
+        if (
+          card
+          && card.tool_call_id === toolCallId
+          && (card.status === 'submitting' || card.status === 'pending')
+        ) {
+          updatedCards[cardId] = {
+            ...card,
+            ...proposalOutcomeFields(card.actionType || 'delete_workspace', result),
+          };
+          bucketChanged = true;
+        }
+      }
+      if (bucketChanged) {
+        nextSecretaryProposals = updatedCards;
+        msgChanged = true;
+      }
+    }
+    if (!msgChanged) return m;
+    changed = true;
+    const updatedMsg: AssistantMessage = {
+      ...m,
+      ...(nextWorkspaceProposals ? { workspaceProposals: nextWorkspaceProposals } : {}),
+      ...(nextSecretaryProposals ? { secretaryActionProposals: nextSecretaryProposals } : {}),
+    };
+    return updatedMsg;
+  });
+  return changed ? next : messages;
+}
+// --- DALTON-HOOK(cos-settings-tools): end ---
+
 /**
- * Settle the pending proposal a tool result answers. A decline rejects it, and
- * so does a result with `success: false` on any card but a hand-off's (see
- * `dispatchResultFields`); anything else approves it. One resume can answer
- * several interrupts, and their results need not arrive in the order the cards
- * did, so an interrupt that named its tool call (a dispatch does) is settled
- * only by that call's result; the rest take the next result in order.
+ * Settle the pending proposal a tool result answers. A decline rejects it, a
+ * result with `success: false` on any card but a hand-off's marks it failed
+ * (preserving `failure_code` / `failure_error` such as `scope_changed`);
+ * anything else approves it. One resume can answer several interrupts, and
+ * their results need not arrive in the order the cards did, so an interrupt
+ * that named its tool call is settled only by that call's result; the rest
+ * take the next result in order.
  */
 function settleProposalFromResult(
   pending: HistoryInterruptInfo[],
@@ -184,27 +379,19 @@ function settleProposalFromResult(
   const named = !!toolCallId && pending.some((p) => p.toolCallId === toolCallId);
   return resolvePendingHistoryInterrupt(
     pending,
-    (p) => PROPOSAL_INTERRUPT_TYPES.has(p.type) &&
-      (named ? p.toolCallId === toolCallId : !toolCallId || !p.toolCallId),
+    // DALTON-HOOK(cos-settings-tools): create_workspace settles only by exact tool_call_id (never positional fallback)
+    (p) => PROPOSAL_INTERRUPT_TYPES.has(p.type) && (
+      p.type === 'create_workspace'
+        ? (!!toolCallId && p.toolCallId === toolCallId)
+        : (named ? p.toolCallId === toolCallId : !toolCallId || !p.toolCallId)
+    ),
     // Parsed here so a result pays for it only when it settles a proposal.
-    (m) => {
-      let status = 'approved';
-      if (content.startsWith('User declined')) {
-        status = 'rejected';
-      } else if (m.type !== 'ptc_agent') {
-        try {
-          if (JSON.parse(content)?.success === false) status = 'rejected';
-        } catch { /* non-JSON → treat as approved */ }
-      }
-      const extraFields = m.type === 'ptc_agent' && status === 'approved'
-        ? dispatchResultFields(result)
-        : {};
-      return {
-        bucket: PROPOSAL_DATA_KEY_MAP[m.type] || 'questionProposals',
-        key: m.proposalId!,
-        fields: { status, ...extraFields },
-      };
-    },
+    (m) => ({
+      bucket: PROPOSAL_DATA_KEY_MAP[m.type] || 'questionProposals',
+      key: m.proposalId!,
+      // DALTON-HOOK(cos-settings-tools): share 4-state settlement (approved / rejected / failed)
+      fields: proposalResultFields(m.type, result),
+    }),
     setMessages,
   );
 }
@@ -213,6 +400,6 @@ export {
   PROPOSAL_INTERRUPT_TYPES, PROPOSAL_DATA_KEY_MAP,
   INTERRUPT_CARD_BUCKETS, CARD_BUCKET_FOR_TYPE,
   setCardStatus, setCardFields, resolvePendingHistoryInterrupt, historyCardKey,
-  settleProposalFromResult,
+  proposalResultFields, settleProposalFromResult, settleLiveProposalFromResult,
   stripHistoryInterruptCards,
 };

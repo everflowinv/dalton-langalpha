@@ -141,6 +141,11 @@ class HITLResponse(BaseModel):
         default=None,
         description="Verdict per order attempt id, for an order_approval interrupt",
     )
+    # DALTON-HOOK(cos-settings-tools): server-stamped marker to consume stale/mismatched confirm interrupts
+    scope_changed: bool = Field(
+        default=False,
+        description="Server-only flag stamped when confirmation snapshot is missing or changed",
+    )
 
 
 REJECTED_WITH_FEEDBACK = "User rejected this action with the following feedback: "

@@ -146,6 +146,34 @@ def _classify_owner_row_tier(owner_id: str | None, owner_email: Any) -> str:
         return "unknown"
 
 
+def is_internal_team_owner(
+    owner_id: str | None,
+    owner_email: Any,
+    *,
+    local_internal_user_ids: set[str] | None = None,
+) -> bool:
+    """Return True when ``owner_id``/``owner_email`` belongs to the internal team.
+
+    Shared by lock-free company dedup (Phase 1) and locked workspace-create
+    recheck (Phase 2) so both apply the exact same internal-colleague rule:
+    - In Supabase auth mode, delegates to ``_classify_owner_row_tier``
+      (configured PM user IDs and ``DALTON_ALLOWED_EMAILS`` only — never
+      ``dalton_members``, which also holds invited external members).
+    - In local auth mode, when ``local_internal_user_ids`` is pre-loaded from
+      ``dalton_user_roles`` on the active transaction cursor, classifies with
+      that set and the same ``is_company_system_user`` exclusion so an async
+      savepoint never opens a second connection; otherwise delegates to
+      ``_classify_owner_row_tier``.
+    """
+    if local_internal_user_ids is not None:
+        uid = str(owner_id or "").strip()
+        if not uid or is_company_system_user(uid):
+            return False
+        return uid in local_internal_user_ids
+    tier = _classify_owner_row_tier(owner_id, owner_email)
+    return tier in ("admin", "internal")
+
+
 def _display_name(name: str | None, email: str | None) -> str:
     """Resolve display name from user row name or email local-part."""
     cleaned_name = (name or "").strip()
