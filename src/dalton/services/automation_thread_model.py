@@ -519,11 +519,25 @@ def _restart_from_run_id(request: Any) -> str | None:
     return normalize_uuid(raw.strip())
 
 
+def _execution_id_matches(
+    exec_row: Mapping[str, Any] | None,
+    expected_execution_id: str,
+) -> bool:
+    if exec_row is None:
+        return False
+    expected = normalize_uuid(expected_execution_id)
+    if expected is None:
+        return False
+    actual = normalize_uuid(str(exec_row.get("automation_execution_id") or ""))
+    return actual == expected
+
+
 async def _resolve_source_execution(
     request: Any,
     *,
     thread_id: str,
     retry_of_run_id: str | None = None,
+    known_execution_id: str | None = None,
     allow_running_fallback: bool = True,
 ) -> tuple[dict[str, Any] | None, str]:
     """Resolve the execution this notification turn belongs to.
@@ -532,25 +546,55 @@ async def _resolve_source_execution(
     ``automation_delivery``/``automation_earlier_runs``, ``restart_from_run_id``,
     ``report_source`` for ``command_report``/``task``, and
     ``wakeups.created_by_run_id`` for ``wakeup``) take precedence over falling
-    back to the thread's latest ``running`` execution.
+    back to the thread's latest ``running`` execution. When
+    ``known_execution_id`` is provided, every matched row is verified against it
+    and resolution never falls through to unrelated fallback lookups.
     """
+    norm_known_exec_id = (
+        normalize_uuid(known_execution_id)
+        if known_execution_id is not None
+        else None
+    )
+    if known_execution_id is not None and norm_known_exec_id is None:
+        return None, "none"
+
     if retry_of_run_id:
         exec_row = await _get_execution_for_run_id(str(retry_of_run_id))
         if exec_row is not None:
+            if norm_known_exec_id is not None and not _execution_id_matches(
+                exec_row, norm_known_exec_id
+            ):
+                return None, "none"
             return exec_row, "retry_run"
 
     explicit_exec_id = _explicit_execution_id(request)
     if explicit_exec_id:
+        if norm_known_exec_id is not None and explicit_exec_id != norm_known_exec_id:
+            return None, "none"
         exec_row = await _get_execution_by_id(explicit_exec_id)
-        if exec_row is not None:
+        if exec_row is not None and (
+            norm_known_exec_id is None
+            or _execution_id_matches(exec_row, norm_known_exec_id)
+        ):
             return exec_row, "execution_id"
         return None, "none"
 
     delivery_exec_id = _delivery_execution_id(request)
     if delivery_exec_id:
+        if norm_known_exec_id is not None and delivery_exec_id != norm_known_exec_id:
+            return None, "none"
         exec_row = await _get_execution_by_id(delivery_exec_id)
-        if exec_row is not None:
+        if exec_row is not None and (
+            norm_known_exec_id is None
+            or _execution_id_matches(exec_row, norm_known_exec_id)
+        ):
             return exec_row, "automation_delivery"
+        return None, "none"
+
+    if norm_known_exec_id is not None:
+        exec_row = await _get_execution_by_id(norm_known_exec_id)
+        if _execution_id_matches(exec_row, norm_known_exec_id):
+            return exec_row, "execution_id"
         return None, "none"
 
     restart_run_id = _restart_from_run_id(request)
@@ -827,18 +871,25 @@ async def _resolve_automation_notification_context(
                 target_exec = exec_row
                 match_kind = "hitl_resume_run" if exec_row is not None else "none"
         else:
+            hitl_exec_mismatch = False
             if is_hitl_resume:
                 interrupt_run_id = await _get_hitl_interrupt_run_id(thread_id, request)
                 if interrupt_run_id:
                     exec_row = await _get_execution_for_run_id(interrupt_run_id)
                     if exec_row is not None:
-                        target_exec = exec_row
-                        match_kind = "hitl_resume_run"
-            if target_exec is None:
+                        if known_execution_id is not None and not _execution_id_matches(
+                            exec_row, known_execution_id
+                        ):
+                            hitl_exec_mismatch = True
+                        else:
+                            target_exec = exec_row
+                            match_kind = "hitl_resume_run"
+            if target_exec is None and not hitl_exec_mismatch:
                 target_exec, match_kind = await _resolve_source_execution(
                     request,
                     thread_id=thread_id,
                     retry_of_run_id=retry_of_run_id,
+                    known_execution_id=known_execution_id,
                     allow_running_fallback=allow_running_fallback,
                 )
     except HTTPException:

@@ -7484,16 +7484,30 @@ async def test_r11_handoff_source_run_id_missing_row_or_purged_execution_vs_conf
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("case_kind", "explicit_id", "delivery_payload", "lookup_returns_mismatched"),
+    [
+        ("explicit_missing", EXEC_ID, None, False),
+        ("delivery_missing", None, {"id": f"{EXEC_ID}.0"}, False),
+        ("explicit_mismatched", EXEC_ID, None, True),
+        ("delivery_mismatched", None, {"id": f"{EXEC_ID}.0"}, True),
+    ],
+)
 async def test_r12_explicit_execution_zero_rows_never_borrows_sibling_running_execution_on_thread(
     monkeypatch: pytest.MonkeyPatch,
+    case_kind: str,
+    explicit_id: str | None,
+    delivery_payload: dict[str, Any] | None,
+    lookup_returns_mismatched: bool,
 ) -> None:
-    """Round 12 Decision 1a (codex high 1):
-    When a server notification explicitly carries automation_execution_id (or automation_delivery)
-    and _get_execution_by_id returns None (0 rows), it MUST immediately fail closed with HTTP 503
-    (automation_model_unavailable) — never falling through to another running execution on the
-    same thread or recording the other execution's ID."""
+    """Round 12 Decision 1a + Round 13 (codex R12 low 2):
+    When a server notification explicitly carries automation_execution_id or automation_delivery
+    and _get_execution_by_id returns None (0 rows) or a row with a different execution ID,
+    it MUST immediately fail closed with HTTP 503 (automation_model_unavailable) — never
+    falling through to wakeup creator queries or another running execution on the same thread."""
     from src.server.database import automation_executions as exec_db
 
+    assert case_kind
     sibling_exec_id = "66666666-6666-4666-8666-666666666699"
     sibling_running_exec = {
         "automation_execution_id": sibling_exec_id,
@@ -7506,16 +7520,21 @@ async def test_r12_explicit_execution_zero_rows_never_borrows_sibling_running_ex
         "llm_model_system_only": False,
         "snapshot_taken": True,
     }
-    monkeypatch.setattr(
-        atm_mod,
-        "_get_execution_by_id",
-        create_autospec(atm_mod._get_execution_by_id, return_value=None),
+    by_id_spy = create_autospec(
+        atm_mod._get_execution_by_id,
+        return_value=sibling_running_exec if lookup_returns_mismatched else None,
     )
+    monkeypatch.setattr(atm_mod, "_get_execution_by_id", by_id_spy)
     running_spy = create_autospec(
         exec_db.get_running_executions_for_thread,
         return_value=[sibling_running_exec],
     )
     monkeypatch.setattr(exec_db, "get_running_executions_for_thread", running_spy)
+    wakeup_creators_spy = create_autospec(
+        atm_mod._get_wakeup_creator_run_ids,
+        return_value=["77777777-7777-4777-8777-777777777799"],
+    )
+    monkeypatch.setattr(atm_mod, "_get_wakeup_creator_run_ids", wakeup_creators_spy)
 
     resolve_called: list[str | None] = []
 
@@ -7527,13 +7546,14 @@ async def test_r12_explicit_execution_zero_rows_never_borrows_sibling_running_ex
     explicit_req = SimpleNamespace(
         workspace_id=WS,
         messages=[],
-        query_type="system",
+        query_type="wakeup",
         platform=None,
         hitl_response=None,
-        automation_execution_id=EXEC_ID,
-        automation_delivery=None,
+        automation_execution_id=explicit_id,
+        automation_delivery=delivery_payload,
         automation_earlier_runs=None,
         report_source=None,
+        wakeup={"notices": [{"wakeup_id": WAKEUP_ID}]},
     )
     with pytest.raises(HTTPException) as exc_info:
         await atm_mod.resolve_turn_config_with_automation_inheritance(
@@ -7550,22 +7570,38 @@ async def test_r12_explicit_execution_zero_rows_never_borrows_sibling_running_ex
     assert exc_info.value.detail["type"] == "automation_model_unavailable"
     assert resolve_called == []
     assert ctx_captured == []
+    by_id_spy.assert_awaited_once_with(EXEC_ID)
     running_spy.assert_not_awaited()
+    wakeup_creators_spy.assert_not_awaited()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retry_mode", "lookup_outcome"),
+    [
+        ("web", "missing"),
+        ("web", "run_mismatch"),
+        ("server", "missing"),
+        ("server", "run_mismatch"),
+        ("server", "by_id_mismatch"),
+    ],
+)
 async def test_r12_web_retry_with_known_execution_id_on_wakeup_never_borrows_wakeup_creator_execution(
     monkeypatch: pytest.MonkeyPatch,
+    retry_mode: str,
+    lookup_outcome: str,
 ) -> None:
-    """Round 12 Decision 1b (codex high 1):
-    When web /retry retries a wakeup turn whose failed run metadata carries automation_execution_id
-    (so retry_source_execution_id / known_execution_id is set) and _get_execution_for_run_id(retry_of_run_id)
-    returns None, it MUST fail closed with HTTP 503 (automation_model_unavailable) — never falling back
-    to _get_wakeup_creator_run_ids or borrowing another execution on the thread."""
+    """Round 12 Decision 1b + Round 13 (codex R12 med 1 & low 2):
+    When web or server /retry retries a wakeup turn whose failed run metadata carries
+    automation_execution_id (so retry_source_execution_id / known_execution_id is set) and
+    source execution lookup returns None or a mismatched execution ID, it MUST fail closed
+    with HTTP 503 (automation_model_unavailable) — never calling _get_wakeup_creator_run_ids
+    or borrowing another execution on the thread."""
     from fastapi import FastAPI
     from httpx import ASGITransport, AsyncClient
 
     from src.server.app.threads import messaging as msg_mod
+    from src.server.database import automation_executions as exec_db
     from src.server.dependencies import cli_approval, principal as principal_mod, usage_limits
     from src.server.handlers import chat as chat_handlers, checkpoint_handler
     from src.server.services import turn_runtime
@@ -7590,9 +7626,15 @@ async def test_r12_web_retry_with_known_execution_id_on_wakeup_never_borrows_wak
     )
     app.dependency_overrides[usage_limits.chat_limiter] = lambda: _fake_limit
 
+    service_token = "r13-server-retry-service-token-1234567890"
     monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
     monkeypatch.setattr("src.dalton.auth.is_dalton_supabase_auth_enabled", lambda: False)
     monkeypatch.setattr("src.dalton.settings.get_dalton_auth_mode", lambda: "oss")
+    monkeypatch.setattr(
+        msg_mod,
+        "_get_service_token",
+        create_autospec(msg_mod._get_service_token, return_value=service_token),
+    )
     monkeypatch.setattr("src.server.app.setup.agent_config", SimpleNamespace())
     monkeypatch.setattr(
         cli_approval,
@@ -7695,27 +7737,54 @@ async def test_r12_web_retry_with_known_execution_id_on_wakeup_never_borrows_wak
             },
         ),
     )
+
+    async def _exec_for_run(rid: str) -> dict[str, Any] | None:
+        if str(rid) == creator_run_id:
+            return other_exec_row
+        if lookup_outcome == "run_mismatch" and str(rid) == failed_run_id:
+            return other_exec_row
+        return None
+
     monkeypatch.setattr(
         atm_mod,
         "_get_execution_for_run_id",
-        create_autospec(
-            atm_mod._get_execution_for_run_id,
-            side_effect=lambda rid: other_exec_row if str(rid) == creator_run_id else None,
-        ),
+        create_autospec(atm_mod._get_execution_for_run_id, side_effect=_exec_for_run),
     )
+    by_id_spy = create_autospec(
+        atm_mod._get_execution_by_id,
+        return_value=other_exec_row if lookup_outcome == "by_id_mismatch" else None,
+    )
+    monkeypatch.setattr(atm_mod, "_get_execution_by_id", by_id_spy)
+    orig_resolve_source = atm_mod._resolve_source_execution
+    resolve_source_spy = create_autospec(
+        orig_resolve_source,
+        side_effect=orig_resolve_source,
+    )
+    monkeypatch.setattr(atm_mod, "_resolve_source_execution", resolve_source_spy)
     wakeup_creators_spy = create_autospec(
         atm_mod._get_wakeup_creator_run_ids,
         return_value=[creator_run_id],
     )
     monkeypatch.setattr(atm_mod, "_get_wakeup_creator_run_ids", wakeup_creators_spy)
+    running_spy = create_autospec(
+        exec_db.get_running_executions_for_thread,
+        return_value=[other_exec_row],
+    )
+    monkeypatch.setattr(exec_db, "get_running_executions_for_thread", running_spy)
     resolve_spy = create_autospec(llm_config_mod.resolve_llm_config)
     monkeypatch.setattr(llm_config_mod, "resolve_llm_config", resolve_spy)
     workflow_spy = create_autospec(chat_handlers.astream_ptc_workflow)
     monkeypatch.setattr(chat_handlers, "astream_ptc_workflow", workflow_spy)
 
+    headers = (
+        {"X-Service-Token": service_token, "X-Dispatch": "background"}
+        if retry_mode == "server"
+        else {}
+    )
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             f"/api/v1/threads/{THREAD_ID}/retry",
+            headers=headers,
             json={
                 "workspace_id": WS,
                 "llm_model": "owner-composer-model",
@@ -7725,8 +7794,94 @@ async def test_r12_web_retry_with_known_execution_id_on_wakeup_never_borrows_wak
     assert resp.status_code == 503
     assert resp.json()["detail"]["type"] == "automation_model_unavailable"
     wakeup_creators_spy.assert_not_awaited()
+    running_spy.assert_not_awaited()
     resolve_spy.assert_not_awaited()
     workflow_spy.assert_not_called()
+    if retry_mode == "server":
+        resolve_source_spy.assert_awaited_once()
+        assert resolve_source_spy.await_args.kwargs["known_execution_id"] == EXEC_ID
+        if lookup_outcome == "run_mismatch":
+            by_id_spy.assert_not_awaited()
+        else:
+            by_id_spy.assert_awaited_once_with(EXEC_ID)
+    else:
+        resolve_source_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_r13_server_hitl_resume_mismatched_known_execution_fails_closed_without_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 13 (codex R12 med 1):
+    When a server HITL resume turn carries a known_execution_id and the interrupt run resolves
+    to a different execution ID, it MUST discard that row and immediately fail closed with
+    HTTP 503 (automation_model_unavailable) without calling _resolve_source_execution or
+    wakeup/running fallback lookups."""
+    from src.server.database import automation_executions as exec_db
+
+    interrupt_run_id = "88888888-8888-4888-8888-888888888813"
+    other_exec_row = {
+        "automation_execution_id": "66666666-6666-4666-8666-666666666613",
+        "automation_id": AUTO_ID,
+        "status": "running",
+        "conversation_thread_id": THREAD_ID,
+        "user_id": OWNER,
+        "llm_model": "gpt-6.2-sol",
+        "reasoning_effort": "low",
+        "llm_model_system_only": False,
+        "snapshot_taken": True,
+    }
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_hitl_interrupt_run_id",
+        create_autospec(atm_mod._get_hitl_interrupt_run_id, return_value=interrupt_run_id),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_run_id",
+        create_autospec(atm_mod._get_execution_for_run_id, return_value=other_exec_row),
+    )
+    resolve_source_spy = create_autospec(atm_mod._resolve_source_execution)
+    monkeypatch.setattr(atm_mod, "_resolve_source_execution", resolve_source_spy)
+    wakeup_creators_spy = create_autospec(atm_mod._get_wakeup_creator_run_ids)
+    monkeypatch.setattr(atm_mod, "_get_wakeup_creator_run_ids", wakeup_creators_spy)
+    running_spy = create_autospec(exec_db.get_running_executions_for_thread)
+    monkeypatch.setattr(exec_db, "get_running_executions_for_thread", running_spy)
+
+    resolve_called: list[str | None] = []
+
+    async def _never_resolve(model_name: str | None, **_kw: Any):
+        resolve_called.append(model_name)
+        return SimpleNamespace()
+
+    hitl_req = SimpleNamespace(
+        workspace_id=WS,
+        messages=[],
+        query_type="wakeup",
+        platform=None,
+        hitl_response={"interrupt-1": {"decisions": [{"type": "approve"}]}},
+        automation_execution_id=EXEC_ID,
+        automation_delivery=None,
+        automation_earlier_runs=None,
+        report_source=None,
+        wakeup={"notices": [{"wakeup_id": WAKEUP_ID}]},
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        await atm_mod.resolve_turn_config_with_automation_inheritance(
+            user_id=OWNER,
+            thread_id=THREAD_ID,
+            request=hitl_req,
+            requested_model=None,
+            held_model="owner-thread-model",
+            from_service=True,
+            resolve=_never_resolve,
+        )
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail["type"] == "automation_model_unavailable"
+    assert resolve_called == []
+    resolve_source_spy.assert_not_awaited()
+    wakeup_creators_spy.assert_not_awaited()
+    running_spy.assert_not_awaited()
 
 
 @pytest.mark.asyncio
