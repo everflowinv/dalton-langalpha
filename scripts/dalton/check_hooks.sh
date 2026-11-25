@@ -490,6 +490,9 @@ ALLOWED_HOOKS=(
   # and task_run_id on subagent conversation_usages rows so Dalton budget reconciliation
   # drops the conservative floor only when every child's usage is confirmed persisted.
   "budget"
+  # Team personal Weixin multi-account: workspace file upload generation & gateway epoch
+  # guard before writing to sandbox disk (src/server/app/workspace_files/crud.py).
+  "weixin-multi-account"
   # Mobile web P0 fixes: standalone auth scroll, sheet/modal visual-viewport keyboard avoidance,
   # FilePanel touch gesture/z-index/row-menu fixes, InlineWidget mobile bar/fullscreen, and
   # BrowserViewer touch scroll + on-demand keyboard button.

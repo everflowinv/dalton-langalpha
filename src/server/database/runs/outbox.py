@@ -310,6 +310,8 @@ async def claim_outbox_jobs(
     *,
     max_attempts: int = 5,
     excluded_hook_types: Optional[List[str]] = None,
+    # DALTON-HOOK(dalton-notify): optional per-hook-type lease overrides
+    lease_seconds_by_hook_type: Optional[Mapping[str, int]] = None,
 ) -> List[Dict[str, Any]]:
     """Lease a batch of due jobs: pending-and-due, or claimed with an
     expired lease below the attempts ceiling (crash/stall recovery —
@@ -415,6 +417,22 @@ async def claim_outbox_jobs(
                     if row and row["locked"]:
                         locked_keys.append(okey)
 
+                # DALTON-HOOK(dalton-notify): per-hook-type lease override CASE expression
+                lease_overrides = sorted((lease_seconds_by_hook_type or {}).items())
+                if lease_overrides:
+                    lease_case_sql = (
+                        "CASE h.hook_type "
+                        + " ".join("WHEN %s THEN %s::float8" for _ in lease_overrides)
+                        + " ELSE %s::float8 END"
+                    )
+                    lease_params: list[Any] = []
+                    for _ht, _secs in lease_overrides:
+                        lease_params.extend([str(_ht), float(_secs)])
+                    lease_params.append(float(lease_seconds))
+                else:
+                    lease_case_sql = "%s::float8"
+                    lease_params = [float(lease_seconds)]
+
                 await cur.execute(
                     f"""
                     WITH due AS (
@@ -466,7 +484,7 @@ async def claim_outbox_jobs(
                         -- a NOW()-based lease could commit with most (or all)
                         -- of its runway already burned.
                         lease_expires_at =
-                            clock_timestamp() + make_interval(secs => %s),
+                            clock_timestamp() + make_interval(secs => {lease_case_sql}),
                         -- A claimed steer is due by its lease; psycopg
                         -- cannot load 'infinity'. Every way back to pending
                         -- writes 'infinity' and its due_at again.
@@ -487,7 +505,7 @@ async def claim_outbox_jobs(
                     WHERE h.hook_outbox_id = due.hook_outbox_id
                     RETURNING h.*
                     """,
-                    (excluded, max_attempts, locked_keys, limit, float(lease_seconds)),
+                    (excluded, max_attempts, locked_keys, limit, *lease_params),
                 )
                 rows = await cur.fetchall()
                 return [dict(r) for r in rows]
@@ -1965,6 +1983,26 @@ async def requeue_job_with_key(
             )
             row = await cur.fetchone()
             return row["status"] if row else None
+
+
+# DALTON-HOOK(dalton-notify): verify outbox claim ownership inside caller transaction before saving delivery result
+async def owns_claimed_job(job_id: str, *, attempts: int, conn=None) -> bool:
+    """Lock the outbox row ``FOR UPDATE`` and return True iff it is still
+    ``status = 'claimed'`` at ``attempts`` (the monotonic claim fence token)."""
+    async with pool.get_db_connection(conn) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT 1
+                FROM hook_outbox
+                WHERE hook_outbox_id = %s
+                  AND status = 'claimed'
+                  AND attempts = %s
+                FOR UPDATE
+                """,
+                (job_id, attempts),
+            )
+            return await cur.fetchone() is not None
 
 
 async def merge_job_payload(
