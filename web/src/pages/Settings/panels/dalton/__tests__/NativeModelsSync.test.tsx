@@ -50,6 +50,37 @@ vi.mock('@/hooks/useTeamCredentials', () => ({
   }),
 }));
 
+vi.mock('@/hooks/useCallerIdentity', () => ({
+  useCallerIdentity: () => {
+    const snapshot = {
+      tier: 'admin' as const,
+      status: 'ready' as const,
+      authMode: 'local' as const,
+      isPlatform: false,
+      isKnown: true,
+      isConfirming: false,
+      isMultiUserAuth: true,
+      isSingleUserOss: false,
+      isAdmin: true,
+      isInternal: true,
+      isExternal: false,
+      canActAsOwner: true,
+      canPublishPublic: true,
+      canInvite: true,
+      isTeamCredentialsShared: true,
+      canManageCredentials: true,
+      isPm: true,
+      colleagueSharingEnabled: false,
+    };
+    return {
+      ...snapshot,
+      getLatestIdentity: () => snapshot,
+      isConfirmingNow: () => false,
+      revalidate: vi.fn(async () => undefined),
+    };
+  },
+}));
+
 vi.mock('@/config/daltonAuth', () => ({
   isDaltonAuth: true,
 }));

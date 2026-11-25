@@ -443,6 +443,8 @@ export interface WorkspaceSharingResponse {
   web_access: WorkspaceAccessLevel;
   is_home?: boolean;
   can_edit: boolean;
+  can_edit_web_access?: boolean;
+  can_edit_cos_access?: boolean;
   colleague_dispatch_enabled?: boolean;
   /** True when the workspace owner is an external member: sharing settings do
    *  not apply (admin read-only), so the UI shows a notice instead of options. */
@@ -477,6 +479,7 @@ export interface WorkspaceSettingsResponse {
   team_memory_enabled: boolean;
   is_home?: boolean;
   can_edit: boolean;
+  can_edit_team_memory?: boolean;
   owner_external?: boolean;
   updated_by?: string | null;
   updated_at?: string | null;

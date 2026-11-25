@@ -89,6 +89,46 @@ vi.mock('@/hooks/useTeamCredentials', () => ({
   }),
 }));
 
+vi.mock('@/hooks/useCallerIdentity', () => ({
+  useCallerIdentity: () => {
+    const isSingleUserOss = !h.isDaltonAuth && h.isPm && !h.callerTierError && !h.callerTierPending;
+    const rawTier = isSingleUserOss ? 'admin' : h.callerTier;
+    const ready =
+      !h.callerTierPending &&
+      !h.callerTierError &&
+      (rawTier === 'admin' || rawTier === 'internal' || rawTier === 'external');
+    const tier = ready ? rawTier : 'unknown';
+    const isAdmin = ready && tier === 'admin';
+    const isInternal = ready && (tier === 'admin' || tier === 'internal');
+    const snapshot = {
+      tier,
+      status: h.callerTierPending ? 'loading' : ready ? 'ready' : 'error',
+      authMode: isSingleUserOss ? 'oss' : ready ? 'local' : null,
+      isPlatform: false,
+      isKnown: ready,
+      isConfirming: h.callerTierPending,
+      isMultiUserAuth: h.isDaltonAuth && ready,
+      isSingleUserOss,
+      isAdmin,
+      isInternal,
+      isExternal: ready && tier === 'external',
+      canActAsOwner: isInternal,
+      canPublishPublic: isAdmin,
+      canInvite: !isSingleUserOss && isInternal,
+      isTeamCredentialsShared: true,
+      canManageCredentials: isAdmin,
+      isPm: h.callerTier === 'admin' || h.isPm,
+      colleagueSharingEnabled: false,
+    };
+    return {
+      ...snapshot,
+      getLatestIdentity: () => snapshot,
+      isConfirmingNow: () => snapshot.isConfirming,
+      revalidate: vi.fn(async () => undefined),
+    };
+  },
+}));
+
 vi.mock('@/lib/dalton/coverage', () => ({
   useDaltonCoverageUnits: () => ({
     data: h.coverageEnabled ? { enabled: true, units: [], unclassified: [] } : { enabled: false },
@@ -331,7 +371,7 @@ describe('Settings reorganization (groups, minTier guards, legacy links, dropdow
     });
   });
 
-  it('keeps admin on ?tab=teamChannels without redirecting when /credentials/status fails or omits caller_tier while /channels/bindings returns admin', async () => {
+  it('fails closed and redirects away from ?tab=teamChannels when /credentials/status fails without falling back to /channels/bindings', async () => {
     h.isDaltonAuth = true;
     h.userId = 'u-admin';
     h.callerTier = null;
@@ -344,9 +384,11 @@ describe('Settings reorganization (groups, minTier guards, legacy links, dropdow
 
     renderSettings('/settings?tab=teamChannels#dalton-discord-channels');
 
-    expect(await screen.findByTestId('dalton-discord-channels-card')).toBeInTheDocument();
-    expect(screen.getByTestId('location-spy')).toHaveTextContent('/settings?tab=teamChannels');
-    expect(screen.queryByTestId('settings-permission-denied')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('dalton-discord-channels-card')).not.toBeInTheDocument();
+    expect(await screen.findByTestId('settings-permission-denied')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByTestId('location-spy')).toHaveTextContent('/settings?tab=account');
+    });
   });
 
   it('preserves admin & coverage visibility in OSS mode while hiding daltonAuth-only Team Members', async () => {

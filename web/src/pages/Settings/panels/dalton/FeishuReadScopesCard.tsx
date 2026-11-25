@@ -3,8 +3,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { formatApiErrorDetail } from '@/api/errors';
 import { Button } from '@/components/ui/button';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { hasRequiredCapability, useCapabilities } from '@/hooks/useCapabilities';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { queryKeys } from '@/lib/queryKeys';
 import {
@@ -44,14 +44,14 @@ export function FeishuReadScopesCard({
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const { callerTier } = useTeamCredentials();
+  const identity = useCallerIdentity();
   const { hasCapability } = useCapabilities();
   const feishuDocsEnabled = ctx?.capabilities
     ? hasRequiredCapability(ctx.capabilities, 'feishu_docs')
     : hasCapability('feishu_docs');
   const isAdmin =
     feishuDocsEnabled &&
-    callerTier === 'admin' &&
+    identity.isAdmin &&
     (ctx ? ctx.callerTier === 'admin' : true);
 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());

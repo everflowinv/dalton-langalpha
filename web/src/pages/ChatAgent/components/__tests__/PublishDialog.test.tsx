@@ -1503,10 +1503,15 @@ describe('PublishDialog', () => {
       expect(screen.queryByText('Paused again on second submit')).not.toBeInTheDocument();
     });
 
-    it('keeps publish response pause notice and token when /credentials/status fails, while hiding the toggle pause hint', async () => {
+    // DALTON-HOOK(external-share-guard): when /credentials/status fails in Dalton auth mode, Publish stays disabled fail-closed until retry recovers identity
+    it('fails closed while /credentials/status errors, then preserves publish response pause notice and token after recovery', async () => {
       pauseMocks.isDaltonAuth = true;
+      let credentialsShouldFail = true;
       const mockCredentialsStatus = vi.fn<() => Promise<ApiResponse<TeamCredentialsStatus>>>(async () => {
-        throw apiError(500, 'credentials unavailable');
+        if (credentialsShouldFail) {
+          throw apiError(500, 'credentials unavailable');
+        }
+        return credentialsResponse({ colleague_sharing_enabled: true });
       });
       pauseMocks.credentialsStatus = mockCredentialsStatus;
       serve(artifact());
@@ -1518,93 +1523,47 @@ describe('PublishDialog', () => {
 
       const firstNext = artifact({ shared: false, latest_seq: 1 });
       const firstMon = monitorSummary(firstNext);
-      const secondNext = artifact({ shared: false, latest_seq: 2 });
-      const secondMon = monitorSummary(secondNext);
-      mockPublishMonitor
-        .mockImplementationOnce(async () => {
-          serve(firstNext, firstMon);
-          return {
-            monitor: firstMon,
-            versions: [version(1)],
-            monitor_grant: 'm1.test-grant',
-            frame_base: '/api/v1/dalton/monitors/g/m1.test-grant/',
-            data_base: '/api/v1/dalton/monitors/g/m1.test-grant/data',
-            expires_in: 43200,
-            cut: true,
-            auto_publish_paused: true,
-            auto_publish_pause_token: 'tok-from-resp',
-            auto_publish_pause_notice: 'Colleague turn still active',
-          };
-        })
-        .mockImplementationOnce(async () => {
-          serve(secondNext, secondMon);
-          return {
-            monitor: secondMon,
-            versions: [version(2)],
-            monitor_grant: 'm1.test-grant',
-            frame_base: '/api/v1/dalton/monitors/g/m1.test-grant/',
-            data_base: '/api/v1/dalton/monitors/g/m1.test-grant/data',
-            expires_in: 43200,
-            cut: true,
-            auto_publish_paused: true,
-            auto_publish_pause_token: 'tok-from-resp-2',
-            auto_publish_pause_notice: 'Still active after retry',
-          };
-        })
-        .mockImplementationOnce(answers(artifact({ shared: false, latest_seq: 3 })));
+      mockPublishMonitor.mockImplementationOnce(async () => {
+        serve(firstNext, firstMon);
+        return {
+          monitor: firstMon,
+          versions: [version(1)],
+          monitor_grant: 'm1.test-grant',
+          frame_base: '/api/v1/dalton/monitors/g/m1.test-grant/',
+          data_base: '/api/v1/dalton/monitors/g/m1.test-grant/data',
+          expires_in: 43200,
+          cut: true,
+          auto_publish_paused: true,
+          auto_publish_pause_token: 'tok-from-resp',
+          auto_publish_pause_notice: 'Colleague turn still active',
+        };
+      });
 
       const queryClient = createPauseQueryClient(true);
       const user = userEvent.setup();
-      const { rerender } = renderDialog(ENTRY, queryClient);
+      renderDialog(ENTRY, queryClient);
 
       await waitFor(() => {
         expect(queryClient.getQueryState(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID))?.status).toBe('error');
       });
       expect(mockCredentialsStatus).toHaveBeenCalled();
-
-      await waitFor(() => expect(publishButton()).toBeEnabled());
+      expect(publishButton()).toBeDisabled();
       expect(mockGetWorkspace).not.toHaveBeenCalled();
       expect(
         screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
       ).not.toBeInTheDocument();
+
+      // Recovering identity via Retry re-enables Publish and resumes pause tracking.
+      credentialsShouldFail = false;
+      await user.click(screen.getByRole('button', { name: 'Retry' }));
+      await waitFor(() => expect(publishButton()).toBeEnabled());
 
       await user.click(publishButton());
       await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(1));
-      expect(mockPublishMonitor.mock.calls[0][0]).not.toHaveProperty('confirm_pause_token');
       expect(await screen.findByText('Colleague turn still active')).toBeInTheDocument();
-      expect(
-        screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
-      ).not.toBeInTheDocument();
-      expect(mockGetWorkspace).not.toHaveBeenCalled();
-
-      await waitFor(() => expect(updateButton()).toBeEnabled());
-      await user.click(updateButton());
-      await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(2));
-      expect(mockPublishMonitor.mock.calls[1][0]).toMatchObject({
-        confirm_pause_token: 'tok-from-resp',
-      });
-      expect(await screen.findByText('Still active after retry')).toBeInTheDocument();
-      expect(screen.queryByText('Colleague turn still active')).not.toBeInTheDocument();
-
-      // Closing and reopening while credentials still fail drops the notice and preserves the token via the session Map.
-      rerender(<PublishDialog open={false} workspaceId={WS} path={ENTRY} onClose={() => {}} />);
-      await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
-      rerender(<PublishDialog open workspaceId={WS} path={ENTRY} onClose={() => {}} />);
-      await waitFor(() => expect(updateButton()).toBeEnabled());
-      expect(screen.queryByText('Still active after retry')).not.toBeInTheDocument();
-
-      await user.click(updateButton());
-      await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(3));
-      expect(mockPublishMonitor.mock.calls[2][0]).toMatchObject({
-        confirm_pause_token: 'tok-from-resp-2',
-      });
-      expect(
-        screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
-      ).not.toBeInTheDocument();
-      expect(mockGetWorkspace).not.toHaveBeenCalled();
     });
 
-    it('keeps reading the detail cache without reviving a cleared token when a background /credentials/status refresh fails', async () => {
+    it('fails closed on background /credentials/status failure and does not revive a cleared token after recovery', async () => {
       pauseMocks.isDaltonAuth = true;
       let credentialsShouldFail = false;
       pauseMocks.credentialsStatus = async () => {
@@ -1671,7 +1630,7 @@ describe('PublishDialog', () => {
         ).not.toBeInTheDocument();
       });
 
-      // Background credentials refetch now fails: cleared detail state stays authoritative.
+      // Background credentials refetch now fails: Update stays disabled fail-closed until identity recovers.
       credentialsShouldFail = true;
       await act(async () => {
         await queryClient.refetchQueries({
@@ -1681,10 +1640,15 @@ describe('PublishDialog', () => {
       await waitFor(() => {
         expect(queryClient.getQueryState(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID))?.status).toBe('error');
       });
+      expect(updateButton()).toBeDisabled();
       expect(
         screen.queryByText(/Auto-update is paused because this workspace read a colleague's content/),
       ).not.toBeInTheDocument();
 
+      // After recovery, cleared detail state remains authoritative (no stale confirm_pause_token).
+      credentialsShouldFail = false;
+      mockGetWorkspace.mockResolvedValue(workspace({ auto_publish_paused: false, auto_publish_pause_token: null }));
+      await user.click(screen.getByRole('button', { name: 'Retry' }));
       await waitFor(() => expect(updateButton()).toBeEnabled());
       await user.click(updateButton());
       await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(2));

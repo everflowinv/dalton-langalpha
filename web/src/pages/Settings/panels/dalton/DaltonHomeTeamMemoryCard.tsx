@@ -2,8 +2,10 @@ import { useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { api } from '@/api/client';
+import { apiErrorDetail, formatApiErrorDetail, isForbiddenError } from '@/api/errors';
 import { isDaltonAuth } from '@/config/daltonAuth';
-import { hasRequiredCapability } from '@/hooks/useCapabilities';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
+import { hasRequiredCapability, useCapabilities } from '@/hooks/useCapabilities';
 import { queryKeys } from '@/lib/queryKeys';
 import { SettingRow } from '@/pages/Settings/components/SettingsLayout';
 import { ToggleSwitch } from '@/components/ui/switch';
@@ -61,14 +63,24 @@ export function DaltonHomeTeamMemoryCard({
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const [saveError, setSaveError] = useState(false);
+  const identity = useCallerIdentity();
+  const { hasCapability } = useCapabilities();
+  const [saveError, setSaveError] = useState<string | null>(null);
   const optimisticNextRef = useRef<boolean | null>(null);
   const inFlightRef = useRef(false);
+
+  const archiveEnabled = ctx?.capabilities
+    ? hasRequiredCapability(ctx.capabilities, 'conversation_archive')
+    : hasCapability('conversation_archive');
+  const allowed =
+    archiveEnabled &&
+    identity.isInternal &&
+    (ctx ? canShowDaltonHomeTeamMemoryCard(ctx) : true);
 
   const { data, isLoading, error } = useQuery({
     queryKey: queryKeys.dalton.userSettings(),
     queryFn: fetchDaltonUserSettings,
-    enabled: ctx ? canShowDaltonHomeTeamMemoryCard(ctx) : true,
+    enabled: allowed,
   });
 
   const mutation = useMutation({
@@ -76,13 +88,20 @@ export function DaltonHomeTeamMemoryCard({
       updateDaltonUserSettings(payload),
     onSuccess: (updated) => {
       inFlightRef.current = false;
-      setSaveError(false);
+      setSaveError(null);
       optimisticNextRef.current = null;
       queryClient.setQueryData(queryKeys.dalton.userSettings(), updated);
     },
-    onError: () => {
+    onError: (err) => {
       inFlightRef.current = false;
-      setSaveError(true);
+      if (isForbiddenError(err)) {
+        void identity.revalidate();
+      }
+      setSaveError(
+        apiErrorDetail(err) != null
+          ? formatApiErrorDetail(err)
+          : t('dalton.common.saveFailed'),
+      );
       if (optimisticNextRef.current !== null) {
         queryClient.setQueryData(queryKeys.dalton.userSettings(), {
           ...(data ?? {}),
@@ -93,17 +112,28 @@ export function DaltonHomeTeamMemoryCard({
     },
   });
 
-  if (data?.caller_tier === 'external') {
+  if (!allowed) {
     return null;
   }
 
   const enabled = data?.home_team_memory_enabled === true;
-  const canEdit = data?.can_edit !== false;
+  const canEdit = data?.can_edit !== false && identity.status === 'ready' && !identity.isConfirming;
 
   const handleToggle = (checked: boolean) => {
-    if (isLoading || inFlightRef.current || mutation.isPending || !canEdit) return;
+    const latest = identity.getLatestIdentity();
+    if (
+      isLoading ||
+      inFlightRef.current ||
+      mutation.isPending ||
+      !canEdit ||
+      latest.isConfirming ||
+      latest.status !== 'ready' ||
+      !latest.isInternal
+    ) {
+      return;
+    }
     inFlightRef.current = true;
-    setSaveError(false);
+    setSaveError(null);
     optimisticNextRef.current = checked;
     queryClient.setQueryData(queryKeys.dalton.userSettings(), {
       ...(data ?? {}),
@@ -136,7 +166,7 @@ export function DaltonHomeTeamMemoryCard({
         <div className="space-y-2 mt-2">
           {saveError && (
             <DaltonInlineNotice tone="error" testId="dalton-home-team-memory-error">
-              {t('dalton.common.saveFailed')}
+              {saveError}
             </DaltonInlineNotice>
           )}
           <DaltonInlineNotice tone="info">

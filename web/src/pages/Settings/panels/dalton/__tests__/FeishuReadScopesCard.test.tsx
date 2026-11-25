@@ -29,6 +29,39 @@ vi.mock('@/hooks/useTeamCredentials', () => ({
   }),
 }));
 
+vi.mock('@/hooks/useCallerIdentity', () => ({
+  useCallerIdentity: () => {
+    const tier = h.callerTier ?? 'unknown';
+    const ready = tier === 'admin' || tier === 'internal' || tier === 'external';
+    const snapshot = {
+      tier: ready ? tier : 'unknown',
+      status: ready ? 'ready' : 'error',
+      authMode: ready ? 'local' : null,
+      isPlatform: false,
+      isKnown: ready,
+      isConfirming: false,
+      isMultiUserAuth: ready,
+      isSingleUserOss: false,
+      isAdmin: ready && tier === 'admin',
+      isInternal: ready && (tier === 'admin' || tier === 'internal'),
+      isExternal: ready && tier === 'external',
+      canActAsOwner: ready && (tier === 'admin' || tier === 'internal'),
+      canPublishPublic: ready && tier === 'admin',
+      canInvite: ready && (tier === 'admin' || tier === 'internal'),
+      isTeamCredentialsShared: true,
+      canManageCredentials: ready && tier === 'admin',
+      isPm: ready && tier === 'admin',
+      colleagueSharingEnabled: false,
+    };
+    return {
+      ...snapshot,
+      getLatestIdentity: () => snapshot,
+      isConfirmingNow: () => false,
+      revalidate: vi.fn(async () => undefined),
+    };
+  },
+}));
+
 vi.mock('@/pages/Settings/utils/daltonApi', () => ({
   fetchDaltonFeishuReadScopes: () => h.fetchScopes(),
   fetchDaltonFeishuSpaces: () => h.fetchSpaces(),

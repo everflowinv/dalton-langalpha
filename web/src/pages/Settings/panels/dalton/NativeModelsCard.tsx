@@ -3,9 +3,8 @@ import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { Disclosure } from '@/components/ui/Disclosure';
-import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { useLocale } from '@/hooks/useLocale';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { formatTimestamp } from '@/lib/format';
 import {
   useNativeModelsCheck,
@@ -28,8 +27,7 @@ import {
 export function NativeModelsCard() {
   const { t } = useTranslation();
   const locale = useLocale();
-  const { isPm, callerTier } = useTeamCredentials();
-  const isAdmin = callerTier === 'admin' || (!isDaltonAuth && isPm);
+  const { isAdmin } = useCallerIdentity();
 
   const statusQuery = useNativeModelsStatus(true);
   const checkMutation = useNativeModelsCheck();

@@ -10,6 +10,7 @@ import { MessageSelectionQuote } from './selectionQuote/MessageSelectionQuote';
 import { ArrowLeft, PanelRight, Menu, Users } from 'lucide-react';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(mobile-web)
+import { useCallerIdentity } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(external-share-guard)
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useLatestRef } from '@/hooks/useLatestRef';
 import { ScrollArea } from '../../../components/ui/scroll-area';
@@ -219,9 +220,15 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const workspaceName = (isHome ? t('agents.chiefOfStaff') : workspaceRecord?.name) || initialWorkspaceName || '';
   // DALTON-HOOK(team-sharing): detect read-only colleague workspace/thread
   const teamReadOnly = useTeamReadOnly(workspaceId, workspaceRecord);
-  // DALTON-HOOK(mobile-web): gate compact colleague sharing entry on colleague_sharing capability
-  const { hasCapability } = useCapabilities({ enabled: isMobile });
-  const colleagueSharingReady = hasCapability('colleague_sharing');
+  // DALTON-HOOK(external-share-guard): unified caller identity for publish and file panel gating
+  const identity = useCallerIdentity();
+  const resolvedCallerTier = identity.isPlatform
+    ? null
+    : (identity.status === 'ready' ? identity.tier : 'unknown');
+  // DALTON-HOOK(mobile-web): gate WorkspaceSharingModal entry when either colleague_sharing or conversation_archive is enabled
+  const { hasCapability } = useCapabilities();
+  const workspaceSharingEntryReady =
+    hasCapability('colleague_sharing') || hasCapability('conversation_archive');
   // DALTON-HOOK(colleague-dispatch): current user for thread ownership check
   const { user: currentUser } = useUser({ enabled: Boolean(workspaceId) });
 
@@ -325,8 +332,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     // DALTON-HOOK(workspace-sharing-settings): allow file write for rw colleagues, keep colleague identity separate
     readOnly: !teamReadOnly.canWriteFiles,
     isColleague: teamReadOnly.isColleague,
-    // DALTON-HOOK(external-share-guard): external members cannot create public file share links
-    callerTier: teamReadOnly.callerTier,
+    // DALTON-HOOK(external-share-guard): external and unknown-tier members cannot create public file share links
+    callerTier: resolvedCallerTier,
   });
   // A path names a sibling by its folder from the workspace it was written
   // in: the chat's for the transcript, the panel's for the files it shows.
@@ -1445,10 +1452,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     onPublishFile,
     // DALTON-HOOK(external-share-guard)/(team-sharing): the transcript's file
     // cards offer Publish to the workspace's own owner only — a colleague
-    // (rw or ro), an external member, or a read-only thread gets no entry.
+    // (rw or ro), an external/unknown member, or a read-only thread gets no entry.
     publishAllowed:
       !teamReadOnly.isColleague
-      && teamReadOnly.callerTier !== 'external'
+      && identity.canActAsOwner
+      && !identity.isConfirming
       && !isThreadReadOnly,
     downloadKeyFor,
     onRevealFiles: revealFiles,
@@ -1902,7 +1910,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
           <div className={cn('flex items-center', isMobile ? 'gap-2 shrink-0' : 'gap-2')}>
             {/* DALTON-HOOK(coverage-tracking): company workspace auto-tracking toggle in thread top bar */}
             {/* DALTON-HOOK(workspace-sharing-settings): company workspace sharing settings modal in thread top bar */}
-            {/* DALTON-HOOK(mobile-web): desktop uses a Fragment (zero empty wrapper gap); phones group compact controls with gap-2.5 empty:hidden and gate sharing on confirmed colleague_sharing */}
+            {/* DALTON-HOOK(mobile-web): desktop uses a Fragment (zero empty wrapper gap); phones group compact controls with gap-2.5 empty:hidden and gate sharing on confirmed colleague_sharing or conversation_archive */}
             {!isHome && workspaceId && (
               isMobile ? (
                 <div className="flex items-center shrink-0 gap-2.5 empty:hidden">
@@ -1911,7 +1919,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     readOnly={teamReadOnly.isColleague}
                     compact
                   />
-                  {colleagueSharingReady && (
+                  {workspaceSharingEntryReady && (
                     <WorkspaceSharingModal
                       workspaceId={workspaceId}
                       readOnly={teamReadOnly.isColleague}
@@ -1925,10 +1933,12 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                     workspaceId={workspaceId}
                     readOnly={teamReadOnly.isColleague}
                   />
-                  <WorkspaceSharingModal
-                    workspaceId={workspaceId}
-                    readOnly={teamReadOnly.isColleague}
-                  />
+                  {workspaceSharingEntryReady && (
+                    <WorkspaceSharingModal
+                      workspaceId={workspaceId}
+                      readOnly={teamReadOnly.isColleague}
+                    />
+                  )}
                 </>
               )
             )}
@@ -1936,9 +1946,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             {isMobile && <PaletteSearchButton />}
             {/* DALTON-HOOK(workspace-sharing-settings): hide ShareButton for colleagues */}
             {/* DALTON-HOOK(colleague-dispatch): hide ShareButton on read-only foreign threads */}
-            {/* DALTON-HOOK(external-share-guard): pass callerTier so external members only see ShareButton when closing an active share */}
+            {/* DALTON-HOOK(external-share-guard): ShareButton reads unified caller identity directly */}
             {currentThreadId && currentThreadId !== '__default__' && !isThreadReadOnly && !teamReadOnly.isColleague && (
-              <ShareButton threadId={currentThreadId} initialIsShared={threadIsShared} workspaceId={workspaceId} callerTier={teamReadOnly.callerTier} />
+              <ShareButton threadId={currentThreadId} initialIsShared={threadIsShared} workspaceId={workspaceId} />
             )}
             {/* On desktop the open panel carries this toggle in the same
                 corner, so it is sized and placed as the panel's own buttons

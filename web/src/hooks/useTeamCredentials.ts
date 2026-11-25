@@ -18,6 +18,23 @@ export interface TeamCredentialsStatus {
   can_invite?: boolean;
   caller_tier?: 'admin' | 'internal' | 'external' | string | null;
   colleague_sharing_enabled?: boolean;
+  auth_mode?: 'supabase' | 'local' | 'oss' | string | null;
+}
+
+/**
+ * Single shared credentials/status fetcher used by `useTeamCredentials()`,
+ * `useCallerIdentity()`, and `useCallerIdentity().revalidate()`, forwarding
+ * React Query's `AbortSignal` so `cancelQueries()` aborts the in-flight HTTP request.
+ */
+export async function fetchTeamCredentialsStatus(
+  context?: { signal?: AbortSignal },
+): Promise<TeamCredentialsStatus> {
+  const { api } = await import('@/api/client');
+  const res = await api.get<TeamCredentialsStatus>(
+    '/api/v1/dalton/credentials/status',
+    { signal: context?.signal },
+  );
+  return res.data;
 }
 
 export function useTeamCredentials(): {
@@ -30,6 +47,7 @@ export function useTeamCredentials(): {
   isPm: boolean;
   canInvite: boolean;
   callerTier?: string | null;
+  authMode?: 'supabase' | 'local' | 'oss' | string | null;
   /** True while Dalton auth is still reading `caller_tier`. OSS mode is never pending. */
   callerTierPending: boolean;
   /**
@@ -45,11 +63,7 @@ export function useTeamCredentials(): {
 
   const { data, isError, isLoading, isSuccess } = useQuery<TeamCredentialsStatus>({
     queryKey: queryKeys.dalton.credentialsStatus(userId),
-    queryFn: async () => {
-      const { api } = await import('@/api/client');
-      const res = await api.get<TeamCredentialsStatus>('/api/v1/dalton/credentials/status');
-      return res.data;
-    },
+    queryFn: fetchTeamCredentialsStatus,
     enabled: isDaltonAuth && Boolean(userId),
     staleTime: 5 * 60_000,
     retry: 1,
@@ -65,6 +79,7 @@ export function useTeamCredentials(): {
       isPm: true,
       canInvite: false,
       callerTier: null,
+      authMode: null,
       callerTierPending: false,
       callerTierError: false,
       colleagueSharingEnabled: false,
@@ -75,6 +90,7 @@ export function useTeamCredentials(): {
   const isPm = !isError && Boolean(data?.is_pm);
   const callerTierError = isError;
   const callerTier = !callerTierError ? (data?.caller_tier ?? null) : null;
+  const authMode = !callerTierError ? (data?.auth_mode ?? null) : null;
   const colleagueSharingKnown = isSuccess && !isError;
   return {
     isShared,
@@ -89,6 +105,7 @@ export function useTeamCredentials(): {
       callerTier === 'admin' ||
       callerTier === 'internal',
     callerTier,
+    authMode,
     callerTierPending: Boolean(userId) && isLoading,
     callerTierError,
     colleagueSharingEnabled: colleagueSharingKnown && Boolean(data?.colleague_sharing_enabled),

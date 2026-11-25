@@ -40,6 +40,37 @@ vi.mock('@/hooks/useTeamCredentials', () => ({
     callerTierError: false,
   }),
 }));
+// DALTON-HOOK(settings-section): provide admin identity snapshot for SettingsRail migrated to useCallerIdentity
+vi.mock('@/hooks/useCallerIdentity', () => ({
+  useCallerIdentity: () => {
+    const snapshot = {
+      tier: 'admin' as const,
+      status: 'ready' as const,
+      authMode: 'oss' as const,
+      isPlatform: false,
+      isKnown: true,
+      isConfirming: false,
+      isMultiUserAuth: false,
+      isSingleUserOss: true,
+      isAdmin: true,
+      isInternal: true,
+      isExternal: false,
+      canActAsOwner: true,
+      canPublishPublic: true,
+      canInvite: false,
+      isTeamCredentialsShared: false,
+      canManageCredentials: true,
+      isPm: true,
+      colleagueSharingEnabled: false,
+    };
+    return {
+      ...snapshot,
+      getLatestIdentity: () => snapshot,
+      isConfirmingNow: () => false,
+      revalidate: vi.fn(async () => undefined),
+    };
+  },
+}));
 
 vi.mock('@/lib/dalton/coverage', () => ({
   useDaltonCoverageUnits: () => ({ data: { enabled: false }, isLoading: false }),

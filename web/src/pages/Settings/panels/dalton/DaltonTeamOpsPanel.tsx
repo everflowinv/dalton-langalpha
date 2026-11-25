@@ -1,10 +1,6 @@
-import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { useCapabilities } from '@/hooks/useCapabilities';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';
-import { queryKeys } from '@/lib/queryKeys';
-import { fetchDaltonChannelBindings } from '@/pages/Settings/utils/daltonApi';
 import { DaltonLoadingRow } from '@/components/dalton/primitives';
 import { DaltonDiscordChannelsCard } from './DaltonDiscordChannelsCard';
 import { DaltonFeishuGroupsCard } from './DaltonFeishuGroupsCard';
@@ -19,27 +15,12 @@ import { DaltonWeixinBotCard } from './DaltonWeixinBotCard';
  */
 export function DaltonTeamOpsPanel() {
   const { t } = useTranslation();
-  const { isPm, callerTier, callerTierError } = useTeamCredentials();
+  const { isAdmin } = useCallerIdentity();
   const { hasCapability, isLoading: capsLoading } = useCapabilities();
-  const isAdmin = callerTier === 'admin' || (!isDaltonAuth && isPm);
   const canChannelFeishu = hasCapability('channel_feishu');
   const canChannelDiscord = hasCapability('channel_discord');
   const canChannelWeixin = hasCapability('channel_weixin');
   const canDataJobs = hasCapability('data_jobs');
-  const canAnyChannel =
-    canChannelFeishu || canChannelDiscord || canChannelWeixin || hasCapability('channel_gateway');
-  const bindingsQuery = useQuery({
-    queryKey: queryKeys.dalton.channelBindings(),
-    queryFn: fetchDaltonChannelBindings,
-    enabled: canAnyChannel,
-    retry: false,
-  });
-  const backendUserTier = bindingsQuery.data?.user_tier ?? null;
-  const resolvedDaltonTier =
-    !callerTierError && callerTier ? callerTier : backendUserTier;
-  const isDiscordAdmin = isDaltonAuth
-    ? resolvedDaltonTier === 'admin' && (backendUserTier === null || backendUserTier === 'admin')
-    : backendUserTier === 'admin';
 
   if (capsLoading) {
     return <DaltonLoadingRow label={t('dalton.common.loading')} />;
@@ -49,7 +30,7 @@ export function DaltonTeamOpsPanel() {
     <div className="space-y-8">
       {isAdmin && canChannelWeixin && <DaltonWeixinBotCard />}
       {canChannelFeishu && <DaltonFeishuGroupsCard />}
-      {isDiscordAdmin && canChannelDiscord && <DaltonDiscordChannelsCard />}
+      {isAdmin && canChannelDiscord && <DaltonDiscordChannelsCard />}
       {canDataJobs && <DaltonSystemJobsCard />}
       {isAdmin && (canChannelFeishu || canChannelDiscord) && (
         <DaltonNotifyTargetsCard allowManualInput />

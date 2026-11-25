@@ -12,6 +12,7 @@ import { SharedGoneNotice } from '@/components/sharedWorkspaces/SharedGoneNotice
 import { leaveGoneWorkspace } from '@/lib/sharedGone';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(mobile-web)
+import { useCallerIdentity } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(external-share-guard)
 // DALTON-HOOK(colleague-dispatch): read current user to gate thread card actions
 import { useUser } from '@/hooks/useUser';
 import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
@@ -136,10 +137,16 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
   const isHome = isHomeWorkspace(wsData);
   // DALTON-HOOK(team-sharing): detect read-only colleague workspace
   const teamReadOnly = useTeamReadOnly(workspaceId, wsData);
+  // DALTON-HOOK(external-share-guard): unified caller identity for gallery thread/file permissions
+  const identity = useCallerIdentity();
+  const resolvedCallerTier = identity.isPlatform
+    ? null
+    : (identity.status === 'ready' ? identity.tier : 'unknown');
   // DALTON-HOOK(colleague-dispatch): resolve per-thread ownership in gallery
-  // DALTON-HOOK(mobile-web): gate mobile WorkspaceSharingModal on colleague_sharing capability
-  const { hasCapability } = useCapabilities({ enabled: isMobile });
-  const colleagueSharingReady = hasCapability('colleague_sharing');
+  // DALTON-HOOK(mobile-web): gate WorkspaceSharingModal on colleague_sharing or conversation_archive capability
+  const { hasCapability } = useCapabilities();
+  const workspaceSharingEntryReady =
+    hasCapability('colleague_sharing') || hasCapability('conversation_archive');
   const { user: currentUser } = useUser();
   const { data: teamData } = useTeamWorkspaces(isDaltonAuth);
   // Shared with others in the organization: said under its name, with its
@@ -286,8 +293,8 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
     // DALTON-HOOK(workspace-sharing-settings): allow file write for rw colleagues, keep colleague identity separate
     readOnly: !teamReadOnly.canWriteFiles,
     isColleague: teamReadOnly.isColleague,
-    // DALTON-HOOK(external-share-guard): external members cannot create public file share links
-    callerTier: teamReadOnly.callerTier,
+    // DALTON-HOOK(external-share-guard): external and unknown-tier members cannot create public file share links
+    callerTier: resolvedCallerTier,
   });
   // A path names a sibling by its folder from the workspace it was written
   // in: the gallery's own for the link router, the shown one's for the
@@ -794,14 +801,14 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
               {/* DALTON-HOOK(coverage-tracking): company workspace auto-tracking toggle */}
               {/* DALTON-HOOK(workspace-sharing-settings): company workspace sharing settings modal */}
               {/* DALTON-HOOK(wiki-ingest): workspace auto-ingest switch (workspaces.config) */}
-              {/* DALTON-HOOK(mobile-web): gate mobile WorkspaceSharingModal on confirmed colleague_sharing capability */}
+              {/* DALTON-HOOK(mobile-web): gate WorkspaceSharingModal on confirmed colleague_sharing or conversation_archive capability */}
               {!isHome && workspaceId && (
                 <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
                   <WorkspaceTrackingToggle
                     workspaceId={workspaceId}
                     readOnly={teamReadOnly.isColleague}
                   />
-                  {(!isMobile || colleagueSharingReady) && (
+                  {workspaceSharingEntryReady && (
                     <WorkspaceSharingModal
                       workspaceId={workspaceId}
                       readOnly={teamReadOnly.isColleague}
@@ -986,7 +993,8 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                                 wsData,
                                 {
                                   currentUserId: currentUser?.user_id ?? null,
-                                  callerTier: teamData?.caller_tier ?? null,
+                                  // DALTON-HOOK(external-share-guard): source callerTier from useCallerIdentity instead of teamData
+                                  callerTier: resolvedCallerTier,
                                   colleagueDispatchEnabled: teamReadOnly.colleagueDispatchEnabled,
                                   teamMembers: teamData?.members,
                                 },
@@ -1081,9 +1089,9 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                 // DALTON-HOOK(team-sharing): pass teamReadOnly separately from sibling readOnly
                 teamReadOnly={panelAccess.teamReadOnly}
                 // DALTON-HOOK(external-share-guard): the caller's tier decides
-                // the publish entry — an external member is no artifact owner
+                // the publish entry — an external or unknown member is no artifact owner
                 // even in their own workspace's gallery.
-                callerTier={teamReadOnly.callerTier}
+                callerTier={resolvedCallerTier}
                 singleFileMode={panelAccess.singleFileMode}
                 onReturnHome={panelAccess.onReturnHome}
                 returnLabel={panelAccess.returnLabel}

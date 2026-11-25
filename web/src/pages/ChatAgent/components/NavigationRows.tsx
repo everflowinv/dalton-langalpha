@@ -28,6 +28,8 @@ import { isDesktopShell } from '@/lib/desktop';
 import { isImeComposing } from '@/lib/ime';
 // DALTON-HOOK(colleague-dispatch): read cached user and team workspace permissions for sidebar row gating
 import { queryKeys } from '@/lib/queryKeys';
+// DALTON-HOOK(external-share-guard): unified caller identity for nav row gating
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { cn } from '@/lib/utils';
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '../../../components/ui/hover-card';
 import { mediumDate, relativeTime } from '@/lib/format';
@@ -373,7 +375,10 @@ export function resolveNavWorkspacePermissions(
       (wsOwnerId && currentUserId && wsOwnerId !== currentUserId) ||
       matchedTeamWs,
   );
-  const isIsolatedExternal = Boolean(callerTier === 'external' && isColleagueWorkspace);
+  // DALTON-HOOK(external-share-guard): treat unknown caller tier fail-closed alongside external on colleague workspaces
+  const isIsolatedExternal = Boolean(
+    (callerTier === 'external' || callerTier === 'unknown') && isColleagueWorkspace,
+  );
   if (isIsolatedExternal) {
     return {
       isColleagueWorkspace: true,
@@ -448,8 +453,9 @@ export function resolveNavThreadPermissions(
         wsOwnerId &&
         effectiveThreadOwnerId !== wsOwnerId),
   );
+  // DALTON-HOOK(external-share-guard): treat unknown caller tier fail-closed alongside external on colleague/foreign threads
   const isIsolatedExternal = Boolean(
-    callerTier === 'external' &&
+    (callerTier === 'external' || callerTier === 'unknown') &&
       (isColleagueWorkspace ||
         isForeignThread ||
         (wsOwnerId && (!currentUserId || wsOwnerId !== currentUserId)) ||
@@ -518,18 +524,20 @@ export function resolveNavThreadPermissions(
     isDispatcherOwnThread: false,
     isIsolatedExternal: false,
     canMutateThread: true,
-    // DALTON-HOOK(external-share-guard): external members cannot start public thread sharing, only close an existing share
-    canShareThread: callerTier === 'external' ? Boolean(thread?.is_shared) : true,
+    // DALTON-HOOK(external-share-guard): external and unknown-tier members cannot start public thread sharing, only close an existing share
+    canShareThread: callerTier === 'external' || callerTier === 'unknown' ? Boolean(thread?.is_shared) : true,
     canCopyOrOpen: true,
   };
 }
 
 // DALTON-HOOK(colleague-dispatch): the command palette reads the same cached caller and team permissions as the sidebar
+// DALTON-HOOK(external-share-guard): default callerTier comes from useCallerIdentity instead of /workspaces/team
 export function useNavAccessContext(
   currentUserIdProp?: string | null,
   callerTierProp?: string | null,
 ): NavAccessContext {
   const queryClient = useContext(QueryClientContext);
+  const identity = useCallerIdentity();
   const cachedUser = queryClient?.getQueryData<User | { user?: User }>(queryKeys.user.me());
   const resolvedUser = (
     cachedUser && typeof cachedUser === 'object' && 'user' in cachedUser
@@ -539,11 +547,16 @@ export function useNavAccessContext(
   const cachedTeam = queryClient?.getQueryData<TeamWorkspacesResponse>(
     queryKeys.workspaces.team(),
   );
+  const resolvedIdentityTier = identity.isPlatform
+    ? null
+    : identity.status === 'ready'
+      ? identity.tier
+      : 'unknown';
   return {
     currentUserId:
       currentUserIdProp !== undefined ? currentUserIdProp : (resolvedUser?.user_id ?? null),
     callerTier:
-      callerTierProp !== undefined ? callerTierProp : (cachedTeam?.caller_tier ?? null),
+      callerTierProp !== undefined ? callerTierProp : resolvedIdentityTier,
     colleagueDispatchEnabled: cachedTeam?.colleague_dispatch_enabled,
     teamMembers: cachedTeam?.members,
   };

@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(external-share-guard)
 import { useWorkspaceFiles } from '../../hooks/useWorkspaceFiles';
 
 /**
@@ -33,6 +34,20 @@ export function usePanelFiles({
   // DALTON-HOOK(external-share-guard): external members cannot create public file share links
   callerTier?: string | null;
 }) {
+  const identity = useCallerIdentity();
+  // DALTON-HOOK(external-share-guard): fail closed while caller identity is loading/error; external and unknown members cannot create public file share links
+  const effectiveCallerTier =
+    callerTier !== undefined && callerTier !== null
+      ? callerTier
+      : identity.isPlatform
+        ? null
+        : identity.status === 'ready'
+          ? identity.tier
+          : 'unknown';
+  const canShareByTier =
+    effectiveCallerTier === null ||
+    effectiveCallerTier === 'admin' ||
+    effectiveCallerTier === 'internal';
   const [override, setOverride] = useState<string | null>(null);
   const shownId = override ?? workspaceId;
   const showsSibling = !!override && override !== workspaceId;
@@ -62,8 +77,8 @@ export function usePanelFiles({
         }
       : {
           // DALTON-HOOK(workspace-sharing-settings): teamReadOnly follows isColleague; readOnly is file write lock
-          // DALTON-HOOK(external-share-guard): external members get no publish entry; canShare is owner-only
-          readOnly, teamReadOnly: isColleague, singleFileMode: false, canShare: !isColleague && !readOnly && callerTier !== 'external', callerTier, isHome,
+          // DALTON-HOOK(external-share-guard): external/unknown members get no publish entry; canShare is owner-only
+          readOnly, teamReadOnly: isColleague, singleFileMode: false, canShare: !isColleague && !readOnly && canShareByTier, callerTier: effectiveCallerTier, isHome,
           onReturnHome: null, returnLabel: null,
           filesAway: shown.away,
         },

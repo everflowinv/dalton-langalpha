@@ -1,6 +1,8 @@
 import { useState, useCallback, type ElementType } from 'react';
 import { Copy, Check, Link2, Lock, FileText } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { apiErrorDetail, formatApiErrorDetail, isForbiddenError } from '@/api/errors'; // DALTON-HOOK(external-share-guard)
+import { Loader } from '@/components/ui/loader'; // DALTON-HOOK(external-share-guard)
 import { toast } from '@/components/ui/use-toast';
 import { copyText } from '@/lib/clipboard';
 import { shortMonthDay } from '@/lib/format';
@@ -8,11 +10,16 @@ import { useCopyShareLink } from '@/hooks/useCopyShareLink';
 import { useLocale } from '@/hooks/useLocale';
 import { useArtifactPublishing } from '@/hooks/useArtifact';
 import { useSharedLinks, useShareLinkMutations } from '@/hooks/useShareLink';
-// DALTON-HOOK(external-share-guard): external members cannot turn on public thread sharing
+// DALTON-HOOK(external-share-guard): unified caller identity with open/focus/403 revalidation
+import { useCallerIdentity, type CallerIdentity } from '@/hooks/useCallerIdentity';
 import { queryKeys } from '@/lib/queryKeys';
 import { useQueryClient } from '@tanstack/react-query';
-import { saveThreadSharing, useThreadShareStatus } from '../hooks/useThreadShareStatus';
-import type { ShareLink, ThreadShareStatus, ThreadSharePermissions } from '../../../types/api';
+import {
+  saveThreadSharing,
+  useThreadShareStatus,
+  type ThreadShareUpdateBody,
+} from '../hooks/useThreadShareStatus';
+import type { ShareLink, ThreadSharePermissions } from '../../../types/api';
 import { useAccount } from '@/hooks/useAccount';
 import { useLinkStanding } from '@/hooks/useLinkStanding';
 import { LinkRuleNote } from '@/components/organization/LinkRuleNote';
@@ -25,9 +32,17 @@ function sharedLinkName(link: ShareLink): string {
 }
 
 /** Every link the workspace has made public, each with Copy and Stop. */
-function SharedInWorkspace({ workspaceId }: { workspaceId: string }) {
+function SharedInWorkspace({
+  workspaceId,
+  identity,
+}: {
+  workspaceId: string;
+  // DALTON-HOOK(external-share-guard): share panel's unified identity controls copy visibility and 403 revalidation
+  identity: CallerIdentity;
+}) {
   const { t } = useTranslation();
   const locale = useLocale();
+  const queryClient = useQueryClient();
   const { data: links } = useSharedLinks(workspaceId);
   const { patch } = useShareLinkMutations(workspaceId);
   const { unshare } = useArtifactPublishing();
@@ -35,15 +50,41 @@ function SharedInWorkspace({ workspaceId }: { workspaceId: string }) {
 
   if (!links?.length) return null;
 
+  const canCopyLinks = identity.status === 'ready' && identity.canActAsOwner && !identity.isExternal;
+  const isConfirming = identity.isConfirming;
+
   const failed = (err: unknown) => {
     console.error('[ShareButton] Stop sharing failed:', err);
-    toast({ description: t('shareLink.shareFailed'), variant: 'destructive' });
+    if (isForbiddenError(err)) {
+      void identity.revalidate();
+    }
+    const description =
+      isForbiddenError(err) && apiErrorDetail(err) != null
+        ? formatApiErrorDetail(err)
+        : t('shareLink.shareFailed');
+    toast({ description, variant: 'destructive' });
+  };
+  const copyLink = (code: string) => {
+    const latest = identity.getLatestIdentity();
+    if (latest.isConfirming || latest.status !== 'ready' || latest.isExternal || !latest.canActAsOwner) return;
+    void copy(code);
   };
   // A file's link is its artifact's, whose unshare also refreshes the record
   // a file tab or the Publish dialog shows.
+  // DALTON-HOOK(monitors): stopping a file link uniquely calls POST /artifacts/{id}/unshare and invalidates artifacts, shareLinks, and daltonMonitors caches
   const stopSharing = (link: ShareLink) => {
-    if (link.kind === 'file' && link.artifact_id) unshare.mutate(link.artifact_id, { onError: failed });
-    else patch.mutate({ code: link.code, patch: { shared: false } }, { onError: failed });
+    if (link.kind === 'file' && link.artifact_id) {
+      unshare.mutate(link.artifact_id, {
+        onSuccess: () => {
+          void queryClient.invalidateQueries({ queryKey: queryKeys.daltonMonitors.all });
+          void queryClient.invalidateQueries({ queryKey: queryKeys.artifacts.pathsIn(workspaceId) });
+          void queryClient.invalidateQueries({ queryKey: queryKeys.shareLinks.byWorkspace(workspaceId) });
+        },
+        onError: failed,
+      });
+    } else {
+      patch.mutate({ code: link.code, patch: { shared: false } }, { onError: failed });
+    }
   };
 
   return (
@@ -68,16 +109,19 @@ function SharedInWorkspace({ workspaceId }: { workspaceId: string }) {
                 </p>
               )}
             </div>
-            <button
-              type="button"
-              onClick={() => void copy(link.code)}
-              className="p-1 rounded-md shrink-0"
-              style={{ color: copiedCode === link.code ? 'var(--color-success)' : 'var(--color-text-secondary)' }}
-              title={t('share.copyLink')}
-              aria-label={t('share.copyLink')}
-            >
-              {copiedCode === link.code ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
-            </button>
+            {canCopyLinks && (
+              <button
+                type="button"
+                onClick={() => copyLink(link.code)}
+                disabled={isConfirming}
+                className="p-1 rounded-md shrink-0 disabled:opacity-50"
+                style={{ color: copiedCode === link.code ? 'var(--color-success)' : 'var(--color-text-secondary)' }}
+                title={t('share.copyLink')}
+                aria-label={t('share.copyLink')}
+              >
+                {copiedCode === link.code ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+              </button>
+            )}
             <button
               type="button"
               onClick={() => stopSharing(link)}
@@ -98,6 +142,8 @@ interface ThreadSharePanelProps {
   threadId: string;
   /** The workspace whose shared files the panel lists; null hides the list. */
   workspaceId?: string | null;
+  /** DALTON-HOOK(external-share-guard): drive open/visibility/focus revalidation when hosted in a popover or dialog. */
+  open?: boolean;
   /** What the heading renders as: a dialog passes its title so the dialog is named by it. */
   Heading?: ElementType;
 }
@@ -111,6 +157,7 @@ interface ThreadSharePanelProps {
 export function ThreadSharePanel({
   threadId,
   workspaceId = null,
+  open = true,
   Heading = 'span',
 }: ThreadSharePanelProps) {
   const { t } = useTranslation();
@@ -119,12 +166,10 @@ export function ThreadSharePanel({
   const { orgT } = useAccount();
 
   const queryClient = useQueryClient();
-  // DALTON-HOOK(external-share-guard): hide public share toggle when unshared for external members; keep closable when already shared
-  const callerTier =
-    queryClient.getQueryData<{ caller_tier?: string | null }>(queryKeys.workspaces.team())?.caller_tier ??
-    queryClient.getQueryData<{ caller_tier?: string | null }>(queryKeys.dalton.userSharing())?.caller_tier ??
-    null;
-  const isExternal = callerTier === 'external';
+  // DALTON-HOOK(external-share-guard): unified caller identity with open/focus/403 revalidation
+  const identity = useCallerIdentity({ revalidateOnOpen: true, open });
+  const isExternal = identity.isExternal;
+  const isIdentityBlocked = identity.status !== 'ready' || identity.isConfirming;
   const { data: shareState, isPending, isError, refetch } = useThreadShareStatus(threadId, { refetchOnMount: 'always' });
 
   const isShared = shareState?.is_shared === true;
@@ -141,28 +186,62 @@ export function ThreadSharePanel({
   const { membersOnly, lockedOut, keptIn, state } = standing;
   const paused = state === 'paused';
 
-  const save = useCallback(async (body: Pick<ThreadShareStatus, 'is_shared' | 'permissions'>) => {
+  const save = useCallback(async (body: ThreadShareUpdateBody) => {
     setUpdating(true);
     try {
       await saveThreadSharing(queryClient, threadId, body);
     } catch (e) {
       console.error('Failed to update sharing:', e);
+      if (isForbiddenError(e)) {
+        void identity.revalidate();
+      }
+      const description =
+        isForbiddenError(e) && apiErrorDetail(e) != null
+          ? formatApiErrorDetail(e)
+          : t('share.updateFailed');
+      toast({ description, variant: 'destructive' });
+    } finally {
+      setUpdating(false);
     }
-    setUpdating(false);
-  }, [queryClient, threadId]);
+  }, [queryClient, threadId, identity, t]);
 
+  // DALTON-HOOK(external-share-guard): stopping a share sends `{ is_shared: false }` without `permissions`; starting/editing verifies latest identity synchronously
   const handleToggleShare = (enabled: boolean) => {
+    if (!enabled) {
+      return save({ is_shared: false });
+    }
+    const latest = identity.getLatestIdentity();
+    if (latest.isConfirming || latest.status !== 'ready' || latest.isExternal || !latest.canActAsOwner) {
+      return;
+    }
     const perms = shareState?.permissions || { allow_files: false, allow_download: false };
-    const toMembers = enabled && standing.turnsOnToMembers;
-    return save({ is_shared: enabled, permissions: toMembers ? { ...perms, audience: 'organization' } : perms });
+    const toMembers = standing.turnsOnToMembers;
+    return save({ is_shared: true, permissions: toMembers ? { ...perms, audience: 'organization' } : perms });
   };
 
-  const handleAudience = (audience: ShareAudience) => save({
-    is_shared: shareState?.is_shared === true,
-    permissions: { ...shareState?.permissions, audience },
-  });
+  const handleAudience = (audience: ShareAudience) => {
+    const latest = identity.getLatestIdentity();
+    if (latest.isConfirming || latest.status !== 'ready' || latest.isExternal || !latest.canActAsOwner) {
+      return;
+    }
+    if (audience === 'public' && !latest.canPublishPublic) {
+      return;
+    }
+    return save({
+      is_shared: shareState?.is_shared === true,
+      permissions: { ...shareState?.permissions, audience },
+    });
+  };
 
+  // DALTON-HOOK(external-share-guard): verify latest identity synchronously before changing file permissions or copying links
   const handlePermissionChange = (key: keyof ThreadSharePermissions, value: boolean) => {
+    const latest = identity.getLatestIdentity();
+    if (latest.isConfirming || latest.status !== 'ready' || latest.isExternal || !latest.canActAsOwner) {
+      return;
+    }
+    if (value && !latest.isAdmin) {
+      return;
+    }
     const newPerms = { ...shareState?.permissions, [key]: value };
     // If disabling files, also disable download
     if (key === 'allow_files' && !value) {
@@ -171,7 +250,10 @@ export function ThreadSharePanel({
     return save({ is_shared: true, permissions: newPerms });
   };
 
+  // DALTON-HOOK(external-share-guard): verify latest identity synchronously before copying thread share link
   const handleCopy = useCallback(() => {
+    const latest = identity.getLatestIdentity();
+    if (latest.isConfirming || latest.status !== 'ready' || latest.isExternal || !latest.canActAsOwner) return;
     if (!shareState?.share_url) return;
     const fullUrl = `${window.location.origin}${shareState.share_url}`;
     copyText(fullUrl).then(() => {
@@ -181,7 +263,7 @@ export function ThreadSharePanel({
       console.error('Failed to copy share link:', e);
       toast({ description: t('filePanel:shareLinkFailed'), variant: 'destructive' });
     });
-  }, [shareState, t]);
+  }, [identity, shareState, t]);
 
 
   if (isPending) {
@@ -212,16 +294,48 @@ export function ThreadSharePanel({
     );
   }
 
-  const audiencePicker = standing.picker && (
+  const audiencePicker = !isExternal && identity.canActAsOwner && standing.picker && (
     <AudiencePicker
       {...standing.picker}
-      disabled={updating || lockedOut}
+      disabled={updating || lockedOut || isIdentityBlocked}
       onChange={(audience) => void handleAudience(audience)}
     />
   );
 
+  const toggleDisabled = updating || lockedOut || (!isShared && isIdentityBlocked);
+  const canShowShareUrl = !isExternal && identity.status === 'ready' && identity.canActAsOwner;
+
   return (
     <div className="p-4 space-y-3">
+      {/* DALTON-HOOK(external-share-guard): show live permission confirmation or retryable error notice */}
+      {identity.isConfirming && (
+        <div
+          role="status"
+          className="flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs"
+          style={{ borderColor: 'var(--color-border-muted)', color: 'var(--color-text-secondary)' }}
+        >
+          <Loader size={12} className="text-(--color-text-tertiary)" />
+          <span>{t('share.confirmingIdentity')}</span>
+        </div>
+      )}
+      {!identity.isConfirming && identity.status === 'error' && (
+        <div
+          role="alert"
+          className="flex items-center justify-between gap-2 rounded-md border px-2.5 py-1.5 text-xs"
+          style={{ borderColor: 'var(--color-border-muted)', color: 'var(--color-warning)' }}
+        >
+          <span>{t('share.identityFailed')}</span>
+          <button
+            type="button"
+            onClick={() => void identity.revalidate()}
+            className="shrink-0 hover:underline"
+            style={{ color: 'var(--color-text-secondary)' }}
+          >
+            {t('common.retry')}
+          </button>
+        </div>
+      )}
+
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
@@ -236,7 +350,7 @@ export function ThreadSharePanel({
                 : isShared ? t('share.publicLinkEnabled') : t('share.shareConversation')}
           </Heading>
         </div>
-        {/* Toggle — DALTON-HOOK(external-share-guard): external members only see the switch to close an existing share; under the rule only a shared link's, which turns it off. */}
+        {/* Toggle — DALTON-HOOK(external-share-guard): external members only see the switch to close an existing share; stopping stays clickable while confirming/error */}
         {(!isExternal || isShared) && (isShared || state !== 'blocked') && (
           <button
             type="button"
@@ -244,11 +358,11 @@ export function ThreadSharePanel({
             aria-checked={isShared}
             aria-label={t('share.shareConversation')}
             onClick={() => handleToggleShare(!isShared)}
-            disabled={updating || lockedOut}
+            disabled={toggleDisabled}
             className="tap-target relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors disabled:cursor-not-allowed"
             style={{
               backgroundColor: isShared ? 'var(--color-accent-primary)' : 'var(--color-border-muted)',
-              opacity: updating || lockedOut ? 0.5 : 1,
+              opacity: toggleDisabled ? 0.5 : 1,
             }}
           >
             <span
@@ -260,15 +374,27 @@ export function ThreadSharePanel({
       </div>
 
       {!isShared && (
-        <>
-          <LinkRuleNote note={standing.note} />
-          {audiencePicker}
-        </>
+        isExternal ? (
+          <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+            {t('share.externalReadOnlyHint')}
+          </p>
+        ) : (
+          <>
+            <LinkRuleNote note={standing.note} />
+            {audiencePicker}
+          </>
+        )
       )}
 
       {isShared && shareState && (
+        isExternal ? (
+          <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
+            {t('share.externalStopOnlyHint')}
+          </p>
+        ) : (
         <>
-          {/* Share URL */}
+          {/* Share URL — DALTON-HOOK(external-share-guard): hide URL/copy until identity is ready; disable copy while confirming */}
+          {canShowShareUrl && (
           <div className="flex items-center gap-2">
             <div
               className="flex-1 flex items-center px-3 py-1.5 rounded-md text-xs truncate"
@@ -283,19 +409,22 @@ export function ThreadSharePanel({
             </div>
             <button
               onClick={handleCopy}
-              className="p-1.5 rounded-md transition-colors shrink-0"
+              disabled={isIdentityBlocked}
+              className="p-1.5 rounded-md transition-colors shrink-0 disabled:opacity-50"
               style={{ color: copied ? 'var(--color-success)' : 'var(--color-text-secondary)' }}
-              onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'; }}
+              onMouseEnter={(e) => { if (!isIdentityBlocked) e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'; }}
               onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = ''; }}
               title={t('share.copyLink')}
             >
               {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
             </button>
           </div>
+          )}
 
           {paused && <LinkRuleNote note={standing.note} />}
           {audiencePicker}
-          {!paused && (
+          {/* DALTON-HOOK(external-share-guard): gate file permissions and library row on confirmed owner/admin identity */}
+          {!paused && identity.canActAsOwner && (
           <>
           {/* Permissions */}
           <div className="space-y-2 pt-1">
@@ -307,7 +436,7 @@ export function ThreadSharePanel({
                 type="checkbox"
                 checked={permissions.allow_files || false}
                 onChange={(e) => handlePermissionChange('allow_files', e.target.checked)}
-                disabled={updating || lockedOut}
+                disabled={updating || lockedOut || isIdentityBlocked || (!permissions.allow_files && !identity.isAdmin)}
                 className="rounded border-gray-300"
               />
               <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
@@ -320,7 +449,7 @@ export function ThreadSharePanel({
                   type="checkbox"
                   checked={permissions.allow_download || false}
                   onChange={(e) => handlePermissionChange('allow_download', e.target.checked)}
-                  disabled={updating || lockedOut}
+                  disabled={updating || lockedOut || isIdentityBlocked || (!permissions.allow_download && !identity.isAdmin)}
                   className="rounded border-gray-300"
                 />
                 <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
@@ -337,16 +466,21 @@ export function ThreadSharePanel({
           </p>
           )}
           <LinkRuleNote note={standing.note} />
-          <LibraryPublishRow
-            target={{ kind: 'thread', threadId }}
-            linkOn={isShared}
-            hint={t('organization.library.publishThreadHint')}
-          />
+          {/* DALTON-HOOK(external-share-guard): hide organization library publish row until identity is ready */}
+          {identity.status === 'ready' && (
+            <LibraryPublishRow
+              target={{ kind: 'thread', threadId }}
+              linkOn={isShared}
+              hint={t('organization.library.publishThreadHint')}
+            />
+          )}
           </>
           )}
         </>
+        )
       )}
-      {workspaceId && <SharedInWorkspace workspaceId={workspaceId} />}
+      {/* DALTON-HOOK(external-share-guard): pass unified identity to workspace shared links list */}
+      {workspaceId && <SharedInWorkspace workspaceId={workspaceId} identity={identity} />}
     </div>
   );
 }

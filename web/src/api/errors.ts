@@ -113,6 +113,11 @@ export function apiErrorStatus(err: unknown): number | null {
   return typeof status === 'number' ? status : null;
 }
 
+// DALTON-HOOK(external-share-guard): detect HTTP 403 refusals to trigger identity revalidation
+export function isForbiddenError(err: unknown): boolean {
+  return apiErrorStatus(err) === 403;
+}
+
 /** A 4xx: the request itself was refused, so asking again gets the same answer. */
 export function isClientError(err: unknown): boolean {
   const status = apiErrorStatus(err);

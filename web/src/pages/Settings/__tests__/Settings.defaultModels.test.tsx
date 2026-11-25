@@ -195,16 +195,23 @@ vi.mock('@/pages/Settings/panels/dalton/DaltonSection', () => ({
 }));
 
 // DALTON-HOOK(settings-reorg): control daltonAuth flag for ModelsPanel permission tests
-vi.mock('@/config/daltonAuth', () => ({
-  get isDaltonAuth() {
-    return h.daltonAuth;
-  },
-  // DALTON-HOOK(standalone-core): default local auth flag off in Settings defaultModels tests
-  isDaltonLocalAuth: false,
-  get isDaltonSupabaseAuth() {
-    return h.daltonAuth;
-  },
-}));
+vi.mock('@/config/daltonAuth', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/config/daltonAuth')>();
+  return {
+    ...actual,
+    get isDaltonAuth() {
+      return h.daltonAuth;
+    },
+    get DALTON_AUTH_MODE() {
+      return h.daltonAuth ? 'supabase' : 'oss';
+    },
+    // DALTON-HOOK(standalone-core): default local auth flag off in Settings defaultModels tests
+    isDaltonLocalAuth: false,
+    get isDaltonSupabaseAuth() {
+      return h.daltonAuth;
+    },
+  };
+});
 
 // DALTON-HOOK(team-credentials): the model-access panel reads the shared-credential hint
 // DALTON-HOOK(settings-reorg): expose mutable team credentials state for loading/error fail-closed tests

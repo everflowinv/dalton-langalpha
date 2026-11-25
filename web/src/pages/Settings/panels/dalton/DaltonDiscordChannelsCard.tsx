@@ -2,9 +2,10 @@ import { useState, type FormEvent } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Pencil, Plus } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { apiErrorDetail, apiErrorReason, apiErrorStatus, formatApiErrorDetail } from '@/api/errors';
+import { apiErrorDetail, apiErrorReason, apiErrorStatus, formatApiErrorDetail, isForbiddenError } from '@/api/errors';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { queryKeys } from '@/lib/queryKeys';
 import {
   fetchDaltonChannelBindings,
@@ -184,6 +185,7 @@ interface NoticeState {
 export function DaltonDiscordChannelsCard() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const identity = useCallerIdentity();
 
   const [channelInput, setChannelInput] = useState('');
   const [nameInput, setNameInput] = useState('');
@@ -195,10 +197,11 @@ export function DaltonDiscordChannelsCard() {
   const bindingsQuery = useQuery({
     queryKey: queryKeys.dalton.channelBindings(),
     queryFn: fetchDaltonChannelBindings,
+    enabled: identity.isAdmin,
     retry: false,
   });
 
-  if (bindingsQuery.data && bindingsQuery.data.user_tier !== 'admin') {
+  if (!identity.isAdmin) {
     return null;
   }
 
@@ -263,6 +266,9 @@ export function DaltonDiscordChannelsCard() {
       }
       return true;
     } catch (err: unknown) {
+      if (isForbiddenError(err)) {
+        void identity.revalidate();
+      }
       const code = extractErrorCode(err);
       if (isVersionConflictError(err, code)) {
         setNotice({

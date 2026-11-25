@@ -8,9 +8,10 @@ import { isEffectivelyPinned } from '../hooks/useNavigationData';
 import type { NavWorkspace } from '../hooks/useNavigationData';
 import { useIsMobile } from '@/hooks/useIsMobile';
 // DALTON-HOOK(colleague-dispatch): pass caller identity and tier into sidebar rows for context-menu gating
+// DALTON-HOOK(external-share-guard): source caller tier from useCallerIdentity
 import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { useUser } from '@/hooks/useUser';
-import { useTeamWorkspaces } from './dalton/TeamSharing';
 // DALTON-HOOK(coverage-tree): workspace-row sector/member chips from the coverage listing
 import { useCoverageRoleByWorkspace } from '@/lib/dalton/coverage';
 import {
@@ -175,14 +176,18 @@ function NavigationPanel({
 }: NavigationPanelProps) {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
-  // DALTON-HOOK(colleague-dispatch): subscribe to current user and team workspaces so row permissions stay reactive
+  // DALTON-HOOK(colleague-dispatch): subscribe to current user and unified caller identity so row permissions stay reactive
   const { user: currentUser } = useUser({ enabled: isDaltonAuth });
-  const { data: teamData } = useTeamWorkspaces(isDaltonAuth);
+  const identity = useCallerIdentity();
   // DALTON-HOOK(coverage-tree): one role map for every workspace row's chip,
   // built once per listing (never per row); empty while the flag is off.
   const coverageRoles = useCoverageRoleByWorkspace();
   const currentUserId = currentUser?.user_id ?? null;
-  const callerTier = teamData?.caller_tier ?? null;
+  const callerTier = identity.isPlatform
+    ? null
+    : identity.status === 'ready'
+      ? identity.tier
+      : 'unknown';
   const rootRef = useRef<HTMLDivElement>(null);
   const navTree = useNavTreeKit(rootRef);
   const { TreeRoot } = navTree.kit;

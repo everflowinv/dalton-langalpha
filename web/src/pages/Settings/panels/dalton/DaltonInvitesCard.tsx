@@ -2,10 +2,11 @@ import { useEffect, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Check, Copy, UserPlus } from 'lucide-react';
+import { apiErrorDetail, formatApiErrorDetail, isForbiddenError } from '@/api/errors';
 import { Button } from '@/components/ui/button';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { useLocale } from '@/hooks/useLocale';
 import { isDaltonAuth, isDaltonLocalAuth } from '@/config/daltonAuth';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { copyText } from '@/lib/clipboard';
 import { formatTimestamp } from '@/lib/format';
 import { queryKeys } from '@/lib/queryKeys';
@@ -59,9 +60,9 @@ export function DaltonInvitesCard({
 }) {
   const { t } = useTranslation();
   const locale = useLocale();
-  const { canInvite, callerTier: hookCallerTier } = useTeamCredentials();
+  const identity = useCallerIdentity();
   const queryClient = useQueryClient();
-  const effectiveTier = ctx?.callerTier ?? hookCallerTier;
+  const effectiveTier = ctx?.callerTier ?? (identity.status === 'ready' ? identity.tier : null);
   const canPickTier = isDaltonLocalAuth && effectiveTier === 'admin';
   const [selectedTier, setSelectedTier] = useState<DaltonInviteTier>('external');
 
@@ -76,7 +77,7 @@ export function DaltonInvitesCard({
     return () => window.clearTimeout(timer);
   }, [copied]);
 
-  const allowed = ctx ? isDaltonInvitesSettingVisible(ctx) : canInvite;
+  const allowed = ctx ? isDaltonInvitesSettingVisible(ctx) : identity.canInvite;
 
   const invitesQuery = useQuery({
     queryKey: queryKeys.dalton.invites(),
@@ -93,12 +94,22 @@ export function DaltonInvitesCard({
       setCreatedUrl({ url: fullUrl, expiresAt: created.expires_at ?? null });
       void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.invites() });
     },
+    onError: (err) => {
+      if (isForbiddenError(err)) {
+        void identity.revalidate();
+      }
+    },
   });
 
   const revokeMutation = useMutation({
     mutationFn: (inviteId: string) => revokeDaltonInvite(inviteId),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.invites() });
+    },
+    onError: (err) => {
+      if (isForbiddenError(err)) {
+        void identity.revalidate();
+      }
     },
   });
 
@@ -205,10 +216,18 @@ export function DaltonInvitesCard({
       }
     >
       {createMutation.isError && (
-        <DaltonInlineNotice tone="error">{t('dalton.common.saveFailed')}</DaltonInlineNotice>
+        <DaltonInlineNotice tone="error">
+          {apiErrorDetail(createMutation.error) != null
+            ? formatApiErrorDetail(createMutation.error)
+            : t('dalton.common.saveFailed')}
+        </DaltonInlineNotice>
       )}
       {revokeMutation.isError && (
-        <DaltonInlineNotice tone="error">{t('dalton.common.saveFailed')}</DaltonInlineNotice>
+        <DaltonInlineNotice tone="error">
+          {apiErrorDetail(revokeMutation.error) != null
+            ? formatApiErrorDetail(revokeMutation.error)
+            : t('dalton.common.saveFailed')}
+        </DaltonInlineNotice>
       )}
 
       {createdUrl && (

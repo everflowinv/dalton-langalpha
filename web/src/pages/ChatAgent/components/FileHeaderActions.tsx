@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { useQueryClient } from '@tanstack/react-query'; // DALTON-HOOK(mobile-web)
+import { useQuery, useQueryClient } from '@tanstack/react-query'; // DALTON-HOOK(mobile-web)
 // DALTON-HOOK(external-share-guard): Link2Off for the external member's stop-only entry
 // DALTON-HOOK(mobile-web): ArrowUp, ChevronDown, History, House, MoreHorizontal, MessageSquare, MessageSquarePlus, RefreshCw for complete mobile HTML report menu
 import { ArrowUp, ChevronDown, Code2, Download, Eye, ExternalLink, FileDown, History, House, Link2, Link2Off, MessageSquare, MessageSquarePlus, MoreHorizontal, Pencil, Pin, PinOff, RefreshCw, Settings2, X, Undo2, Redo2, FileDiff, FileText, Check, Clipboard } from 'lucide-react';
@@ -31,6 +31,9 @@ import { exportServedPdf } from './viewers/html/useHtmlActions';
 import { useServedHtml } from './viewers/html/useServedHtml';
 // DALTON-HOOK(mobile-web): sharedSeq, useArtifactComments for mobile HTML More menu
 import { artifactPathKey, sharedSeq, useArtifactBinding, useArtifactByPath, useArtifactComments } from '@/hooks/useArtifact';
+// DALTON-HOOK(monitors): inspect bound monitor visibility so historical public monitors show stop-share entry
+import { queryKeys } from '@/lib/queryKeys';
+import { getMonitorByArtifact, type MonitorSummary } from '@/pages/Monitors/api';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 import { openComments } from './artifactComments/commentModel'; // DALTON-HOOK(mobile-web)
 import { queuedBatches, refusalReason, sendBatches } from './artifactComments/commentSends'; // DALTON-HOOK(mobile-web)
@@ -239,13 +242,20 @@ function FileHeaderActions({
     access,
   );
   // DALTON-HOOK(external-share-guard): the record behind the selected file,
-  // read only where the unshare-only entry can show (external members).
+  // read only where the unshare-only entry can show (external/unknown members).
   const root = useWorkspaceFolders()?.rootDir;
   const { data: unshareRecord } = useArtifactByPath(
     openUnshareOnly ? workspaceId : null,
     openUnshareOnly ? selectedFile : null,
     { root },
   );
+  // DALTON-HOOK(monitors): also surface stop-share entry when a historical public monitor is attached even if artifact.shared is false
+  const { data: unshareMonitor } = useQuery<MonitorSummary | null>({
+    queryKey: queryKeys.daltonMonitors.byArtifact(unshareRecord?.artifact_id ?? ''),
+    queryFn: () => getMonitorByArtifact(unshareRecord!.artifact_id),
+    enabled: Boolean(openUnshareOnly && unshareRecord?.artifact_id),
+    retry: false,
+  });
 
   const handleExportHtmlPdf = async () => {
     if (!selectedFile || pdfInFlight.current) return;
@@ -469,7 +479,8 @@ function FileHeaderActions({
     access,
     onToggleHtmlSource,
     openUnshareOnly,
-    unshareShared: Boolean(unshareRecord?.shared),
+    // DALTON-HOOK(monitors): include historical public monitors alongside active public artifact links
+    unshareShared: Boolean(unshareRecord?.shared || unshareMonitor?.visibility === 'public'),
     openPublish,
     openUrl,
     canDownload,

@@ -5,8 +5,7 @@ import { QrCode } from 'lucide-react';
 import { apiErrorStatus } from '@/api/errors';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { isDaltonAuth } from '@/config/daltonAuth';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { queryKeys } from '@/lib/queryKeys';
 import {
   fetchDaltonChannelBindings,
@@ -39,8 +38,7 @@ function mergeQrState(
 export function DaltonWeixinBotCard() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
-  const { isPm, callerTier } = useTeamCredentials();
-  const isAdmin = callerTier === 'admin' || (!isDaltonAuth && isPm);
+  const { isAdmin } = useCallerIdentity();
 
   const [qrState, setQrState] = useState<DaltonWeixinQrPublicResponse | null>(null);
   const [verifyCode, setVerifyCode] = useState('');

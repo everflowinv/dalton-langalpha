@@ -1009,7 +1009,12 @@
     "sharedOn": "Shared {{date}}",
     "stop": "Stop",
     "signInForChart": "Sign in to open the live chart.",
-    "statusLoadFailed": "Couldn't load the sharing settings."
+    "statusLoadFailed": "Couldn't load the sharing settings.",
+    "confirmingIdentity": "Confirming account permissions…",
+    "identityFailed": "Couldn't confirm account permissions. Please retry.",
+    "externalReadOnlyHint": "External members can only manage existing shares.",
+    "externalStopOnlyHint": "Use the switch above to stop sharing this conversation.",
+    "updateFailed": "Couldn't update sharing settings. Please try again."
   },
   "shareLink": {
     "title": "Share {{file}}",

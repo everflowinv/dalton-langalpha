@@ -17,9 +17,14 @@ vi.mock('@/hooks/useIsMobile', () => ({
   getIsMobileSnapshot: () => mediaState.mobile,
 }));
 
-vi.mock('@/config/daltonAuth', () => ({
-  isDaltonAuth: true,
-}));
+vi.mock('@/config/daltonAuth', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/config/daltonAuth')>();
+  return {
+    ...actual,
+    isDaltonAuth: true,
+    DALTON_AUTH_MODE: 'local' as const,
+  };
+});
 
 vi.mock('../TeamSharing', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../TeamSharing')>();

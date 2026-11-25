@@ -20,6 +20,43 @@ vi.mock('@/config/daltonAuth', () => ({
   isDaltonAuth: true,
 }));
 
+vi.mock('@/hooks/useCapabilities', () => ({
+  useCapabilities: () => ({
+    hasCapability: () => true,
+  }),
+}));
+
+vi.mock('@/hooks/useCallerIdentity', () => ({
+  useCallerIdentity: () => {
+    const snapshot = {
+      tier: 'internal' as const,
+      status: 'ready' as const,
+      authMode: 'local' as const,
+      isPlatform: false,
+      isKnown: true,
+      isConfirming: false,
+      isMultiUserAuth: true,
+      isSingleUserOss: false,
+      isAdmin: false,
+      isInternal: true,
+      isExternal: false,
+      canActAsOwner: true,
+      canPublishPublic: false,
+      canInvite: true,
+      isTeamCredentialsShared: true,
+      canManageCredentials: false,
+      isPm: false,
+      colleagueSharingEnabled: true,
+    };
+    return {
+      ...snapshot,
+      getLatestIdentity: () => snapshot,
+      isConfirmingNow: () => false,
+      revalidate: vi.fn(async () => undefined),
+    };
+  },
+}));
+
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
     t: (key: string) => key,

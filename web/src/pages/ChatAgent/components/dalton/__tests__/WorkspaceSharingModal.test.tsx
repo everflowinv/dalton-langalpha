@@ -1,6 +1,6 @@
-import { beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, screen, waitFor } from '@testing-library/react';
-import { api } from '@/api/client';
+import { ApiError } from '@/api/client';
 import { createTestQueryClient, renderWithProviders } from '@/test/utils';
 import { queryKeys } from '@/lib/queryKeys';
 import {
@@ -587,23 +587,10 @@ describe('WorkspaceSharingModal', () => {
     );
   });
 
-  it('gates sharing button visibility on colleague_sharing capability while keeping sharing query timing unchanged', async () => {
-    const neutralSharing: WorkspaceSharingResponse = {
-      workspace_id: WS_OWN,
-      cos_access: 'hidden',
-      web_access: 'hidden',
-      is_home: false,
-      can_edit: false,
-      owner_external: false,
-      colleague_dispatch_enabled: false,
-      updated_by: null,
-      updated_at: null,
-    };
-
-    // 1. Core profile: capabilities loaded without colleague_sharing + neutral 200 -> button hidden, query still sent.
+  it('decouples colleague_sharing and conversation_archive capabilities and skips /sharing when colleague_sharing is off', async () => {
+    // 1. Both capabilities off -> button hidden, neither /sharing nor /settings is requested.
     h.fetchWorkspaceSharing.mockClear();
-    h.fetchWorkspaceSharing.mockResolvedValueOnce(neutralSharing);
-    h.fetchWorkspaceSettings.mockResolvedValueOnce(STABLE_OWN_SETTINGS);
+    h.fetchWorkspaceSettings.mockClear();
     const coreClient = createTestQueryClient();
     coreClient.setQueryData(queryKeys.dalton.capabilities(), {
       profile: 'core',
@@ -613,16 +600,43 @@ describe('WorkspaceSharingModal', () => {
     const coreView = renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, {
       queryClient: coreClient,
     });
-    await waitFor(() => {
-      expect(h.fetchWorkspaceSharing).toHaveBeenCalledWith(WS_OWN);
-    });
-    await waitFor(() => {
-      expect(coreClient.getQueryData(queryKeys.dalton.sharing(WS_OWN))).toEqual(neutralSharing);
-    });
     expect(screen.queryByTestId('workspace-sharing-button')).toBeNull();
+    expect(h.fetchWorkspaceSharing).not.toHaveBeenCalled();
+    expect(h.fetchWorkspaceSettings).not.toHaveBeenCalled();
     coreView.unmount();
 
-    // 2. Capabilities include colleague_sharing -> button renders normally, query sent.
+    // 2. Only conversation_archive enabled (colleague_sharing off) -> button shows, skips /sharing, renders & saves team memory.
+    h.fetchWorkspaceSharing.mockClear();
+    h.fetchWorkspaceSettings.mockClear();
+    h.updateWorkspaceSettings.mockResolvedValueOnce({
+      ...STABLE_OWN_SETTINGS,
+      team_memory_enabled: true,
+    });
+    const archiveOnlyClient = createTestQueryClient();
+    archiveOnlyClient.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'core',
+      capabilities: ['conversation_archive'],
+      ticker_logos: false,
+    });
+    const archiveView = renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, {
+      queryClient: archiveOnlyClient,
+    });
+    const btn = await screen.findByTestId('workspace-sharing-button');
+    fireEvent.click(btn);
+    const memSwitch = await screen.findByTestId('workspace-team-memory-switch');
+    expect(h.fetchWorkspaceSharing).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('sharing-cos-fieldset')).toBeNull();
+    expect(screen.queryByTestId('sharing-cos-ro')).toBeNull();
+
+    fireEvent.click(memSwitch);
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+    await waitFor(() =>
+      expect(h.updateWorkspaceSettings).toHaveBeenCalledWith(WS_OWN, { team_memory_enabled: true }),
+    );
+    expect(h.updateWorkspaceSharing).not.toHaveBeenCalled();
+    archiveView.unmount();
+
+    // 3. Capabilities include colleague_sharing -> button renders normally and fetches /sharing.
     h.fetchWorkspaceSharing.mockClear();
     h.fetchWorkspaceSharing.mockResolvedValueOnce(STABLE_OWN_SHARING);
     h.fetchWorkspaceSettings.mockResolvedValueOnce(STABLE_OWN_SETTINGS);
@@ -638,19 +652,49 @@ describe('WorkspaceSharingModal', () => {
     expect(await screen.findByTestId('workspace-sharing-button')).toBeInTheDocument();
     expect(h.fetchWorkspaceSharing).toHaveBeenCalledWith(WS_OWN);
     enabledView.unmount();
+  });
 
-    // 3. Everflow build with capabilities still pending -> button renders normally on first paint, query sent.
-    const apiGetSpy = vi.spyOn(api, 'get').mockImplementation(() => new Promise(() => {}) as never);
-    onTestFinished(() => apiGetSpy.mockRestore());
-    h.fetchWorkspaceSharing.mockClear();
-    h.fetchWorkspaceSharing.mockResolvedValueOnce(STABLE_OWN_SHARING);
-    h.fetchWorkspaceSettings.mockResolvedValueOnce(STABLE_OWN_SETTINGS);
-    const pendingClient = createTestQueryClient();
-    const pendingView = renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, {
-      queryClient: pendingClient,
+  it('respects server per-field edit flags for external owners and surfaces formatted 403 error on save failure', async () => {
+    h.fetchWorkspaceSharing.mockResolvedValue({
+      ...STABLE_OWN_SHARING,
+      owner_external: true,
+      can_edit: true,
+      can_edit_web_access: true,
+      can_edit_cos_access: false,
     });
-    expect(await screen.findByTestId('workspace-sharing-button')).toBeInTheDocument();
-    expect(h.fetchWorkspaceSharing).toHaveBeenCalledWith(WS_OWN);
-    pendingView.unmount();
+    h.fetchWorkspaceSettings.mockResolvedValue({
+      ...STABLE_OWN_SETTINGS,
+      owner_external: true,
+      can_edit: false,
+      can_edit_team_memory: false,
+    });
+    h.updateWorkspaceSharing.mockRejectedValueOnce(
+      new ApiError('Request failed with status code 403', 'ERR_BAD_REQUEST', {
+        status: 403,
+        statusText: 'Forbidden',
+        headers: {},
+        data: {
+          detail: { code: 'external_member_forbidden', message: '外部成员无法修改此配置' },
+        },
+      }),
+    );
+
+    const client = createTestQueryClient();
+    client.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'everflow',
+      capabilities: ['colleague_sharing', 'conversation_archive'],
+      ticker_logos: true,
+    });
+    renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, { queryClient: client });
+    fireEvent.click(await screen.findByTestId('workspace-sharing-button'));
+
+    expect(screen.queryByTestId('sharing-cos-fieldset')).toBeNull();
+    expect(screen.queryByTestId('workspace-team-memory-section')).toBeNull();
+    const webRo = await screen.findByTestId('sharing-web-ro');
+    expect(webRo).not.toBeDisabled();
+    fireEvent.click(webRo);
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+
+    expect(await screen.findByText('外部成员无法修改此配置')).toBeInTheDocument();
   });
 });
