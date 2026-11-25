@@ -77,6 +77,18 @@ vi.mock('@/hooks/useUpdatePreferences', () => ({
 
 vi.mock('@/hooks/useTeamCredentials', () => ({
   TEAM_SHARED_CREDENTIALS_HINT: '',
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: 'team',
+    enabled: true,
+    holder_user_id: null,
+    credential_user_id: 'u-1',
+    is_pm: h.callerTier === 'admin' || h.isPm,
+    can_disconnect: h.callerTier === 'admin' || (!h.isDaltonAuth && h.isPm),
+    can_invite: h.callerTier === 'admin' || h.callerTier === 'internal',
+    caller_tier: h.callerTier,
+    colleague_sharing_enabled: true,
+    auth_mode: h.isDaltonAuth ? 'local' : 'oss',
+  })),
   useTeamCredentials: () => ({
     isShared: true,
     canManage: h.callerTier === 'admin' || (!h.isDaltonAuth && h.isPm),

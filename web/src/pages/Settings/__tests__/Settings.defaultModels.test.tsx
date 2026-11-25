@@ -213,10 +213,22 @@ vi.mock('@/config/daltonAuth', async (importOriginal) => {
   };
 });
 
-// DALTON-HOOK(team-credentials): the model-access panel reads the shared-credential hint
+// DALTON-HOOK(team-credentials): the model-access panel reads the shared-credential hint and shared status fetcher
 // DALTON-HOOK(settings-reorg): expose mutable team credentials state for loading/error fail-closed tests
 vi.mock('@/hooks/useTeamCredentials', () => ({
   TEAM_SHARED_CREDENTIALS_HINT: '',
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: h.teamCreds.isShared ? 'team' : 'off',
+    enabled: h.teamCreds.isShared,
+    holder_user_id: null,
+    credential_user_id: 'u-1',
+    is_pm: h.teamCreds.isPm,
+    can_disconnect: h.teamCreds.canDisconnect,
+    can_invite: h.teamCreds.canInvite,
+    caller_tier: h.teamCreds.callerTier,
+    colleague_sharing_enabled: false,
+    auth_mode: h.daltonAuth ? 'supabase' : 'oss',
+  })),
   useTeamCredentials: () => h.teamCreds,
 }));
 

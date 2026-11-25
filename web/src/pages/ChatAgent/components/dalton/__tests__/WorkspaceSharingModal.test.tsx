@@ -887,4 +887,121 @@ describe('WorkspaceSharingModal', () => {
       });
     });
   });
+
+  it('treats 404 on /sharing and /settings as no-access (hides entry without load error) and skips /settings when readOnly', async () => {
+    const notFound = new ApiError('Request failed with status code 404', 'ERR_BAD_REQUEST', {
+      status: 404,
+      statusText: 'Not Found',
+      headers: {},
+      data: { detail: 'Workspace not found' },
+    });
+
+    // 1. colleague_sharing off + conversation_archive on: non-owner accessing external owner /settings gets 404 -> no trigger, no error.
+    h.fetchWorkspaceSharing.mockClear();
+    h.fetchWorkspaceSettings.mockReset();
+    h.fetchWorkspaceSettings.mockRejectedValueOnce(notFound);
+    const archiveOnlyClient = createTestQueryClient();
+    archiveOnlyClient.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'core',
+      capabilities: ['conversation_archive'],
+      ticker_logos: false,
+    });
+    const view1 = renderWithProviders(<WorkspaceSharingModal workspaceId={WS_COLLEAGUE} />, {
+      queryClient: archiveOnlyClient,
+    });
+    await waitFor(() => expect(h.fetchWorkspaceSettings).toHaveBeenCalledWith(WS_COLLEAGUE));
+    expect(screen.queryByTestId('workspace-sharing-button')).toBeNull();
+    expect(screen.queryByTestId('workspace-team-memory-error')).toBeNull();
+    view1.unmount();
+
+    // 2. readOnly with only conversation_archive enabled skips /settings completely and hides trigger.
+    h.fetchWorkspaceSettings.mockClear();
+    const roClient = createTestQueryClient();
+    roClient.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'core',
+      capabilities: ['conversation_archive'],
+      ticker_logos: false,
+    });
+    const view2 = renderWithProviders(<WorkspaceSharingModal workspaceId={WS_COLLEAGUE} readOnly />, {
+      queryClient: roClient,
+    });
+    expect(screen.queryByTestId('workspace-sharing-button')).toBeNull();
+    expect(h.fetchWorkspaceSettings).not.toHaveBeenCalled();
+    view2.unmount();
+
+    // 3. colleague_sharing on + conversation_archive off: /sharing 404 hides entry without error and skips /settings.
+    h.fetchWorkspaceSharing.mockReset();
+    h.fetchWorkspaceSharing.mockRejectedValueOnce(notFound);
+    h.fetchWorkspaceSettings.mockClear();
+    const sharingOnlyClient = createTestQueryClient();
+    sharingOnlyClient.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'everflow',
+      capabilities: ['colleague_sharing'],
+      ticker_logos: true,
+    });
+    const view3 = renderWithProviders(<WorkspaceSharingModal workspaceId={WS_COLLEAGUE} />, {
+      queryClient: sharingOnlyClient,
+    });
+    await waitFor(() => expect(h.fetchWorkspaceSharing).toHaveBeenCalledWith(WS_COLLEAGUE));
+    expect(h.fetchWorkspaceSettings).not.toHaveBeenCalled();
+    expect(screen.queryByTestId('workspace-sharing-button')).toBeNull();
+    expect(screen.queryByTestId('workspace-sharing-load-error')).toBeNull();
+    view3.unmount();
+
+    // 4. Both capabilities on: /sharing succeeds (200) while /settings returns 404 -> modal shows sharing only, no team-memory error.
+    h.fetchWorkspaceSharing.mockReset();
+    h.fetchWorkspaceSharing.mockResolvedValueOnce(STABLE_COLLEAGUE_SHARING);
+    h.fetchWorkspaceSettings.mockReset();
+    h.fetchWorkspaceSettings.mockRejectedValueOnce(notFound);
+    const bothClient = createTestQueryClient();
+    bothClient.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'everflow',
+      capabilities: ['colleague_sharing', 'conversation_archive'],
+      ticker_logos: true,
+    });
+    const view4 = renderWithProviders(<WorkspaceSharingModal workspaceId={WS_COLLEAGUE} />, {
+      queryClient: bothClient,
+    });
+    fireEvent.click(await screen.findByTestId('workspace-sharing-button'));
+    expect(screen.getByTestId('sharing-web-fieldset')).toBeInTheDocument();
+    expect(screen.queryByTestId('workspace-team-memory-section')).toBeNull();
+    expect(screen.queryByTestId('workspace-team-memory-error')).toBeNull();
+    view4.unmount();
+  });
+
+  it('closes cleanly without rendering a blank modal when visible sections disappear while open', async () => {
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'core',
+      capabilities: ['conversation_archive'],
+      ticker_logos: false,
+    });
+    queryClient.setQueryData(queryKeys.dalton.workspaceSettings(WS_OWN), STABLE_OWN_SETTINGS);
+
+    const { rerender } = renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, {
+      queryClient,
+    });
+
+    fireEvent.click(await screen.findByTestId('workspace-sharing-button'));
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(screen.getByTestId('workspace-team-memory-section')).toBeInTheDocument();
+
+    // Identity downgrades to external while only conversation_archive is enabled -> no visible sections remain; modal must close instead of rendering blank.
+    h.identity = {
+      ...h.identity,
+      tier: 'external',
+      status: 'ready',
+      isAdmin: false,
+      isInternal: false,
+      isExternal: true,
+      canActAsOwner: false,
+      canPublishPublic: false,
+      canInvite: false,
+    };
+    rerender(<WorkspaceSharingModal workspaceId={WS_OWN} />);
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(screen.queryByTestId('workspace-sharing-button')).toBeNull();
+    });
+  });
 });

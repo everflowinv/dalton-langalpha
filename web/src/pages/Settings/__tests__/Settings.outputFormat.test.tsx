@@ -17,8 +17,21 @@ const h = vi.hoisted(() => ({
   validModelNames: new Set<string>(),
 }));
 
+// DALTON-HOOK(team-credentials): export shared fetchTeamCredentialsStatus alongside useTeamCredentials mock
 vi.mock('@/hooks/useTeamCredentials', () => ({
   TEAM_SHARED_CREDENTIALS_HINT: '',
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: 'team',
+    enabled: true,
+    holder_user_id: null,
+    credential_user_id: 'u-1',
+    is_pm: h.canInvite,
+    can_disconnect: h.canInvite,
+    can_invite: h.canInvite,
+    caller_tier: h.callerTier !== undefined ? h.callerTier : (h.canInvite ? 'admin' : null),
+    colleague_sharing_enabled: false,
+    auth_mode: h.daltonAuth ? 'local' : 'oss',
+  })),
   useTeamCredentials: () => ({
     isShared: true,
     canDisconnect: h.canInvite,

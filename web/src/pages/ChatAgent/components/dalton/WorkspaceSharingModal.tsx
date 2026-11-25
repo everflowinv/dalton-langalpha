@@ -1,10 +1,15 @@
 /* eslint-disable react-refresh/only-export-components */
-import React, { useId, useState } from 'react';
+import React, { useEffect, useId, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { AlertTriangle, Share2, Users } from 'lucide-react';
-import { apiErrorDetail, formatApiErrorDetail, isForbiddenError } from '@/api/errors';
+import {
+  apiErrorDetail,
+  formatApiErrorDetail,
+  isForbiddenError,
+  isNotFoundError,
+} from '@/api/errors';
 import { Button } from '@/components/ui/button';
 import { ModalShell } from '@/components/ui/ModalShell';
 import { SegmentedControl } from '@/components/ui/segmented-control';
@@ -132,7 +137,7 @@ export function WorkspaceSharingModal({
   const sharingQuery = useWorkspaceSharing(workspaceId, sharingCapable);
   const settingsQuery = useWorkspaceSettings(
     workspaceId,
-    teamMemoryCapable && identity.isInternal,
+    teamMemoryCapable && identity.isInternal && !readOnly,
   );
   const mutation = useUpdateWorkspaceSharing(workspaceId);
   const settingsMutation = useUpdateWorkspaceSettings(workspaceId);
@@ -146,8 +151,17 @@ export function WorkspaceSharingModal({
 
   const data = sharingCapable ? sharingQuery.data : undefined;
   const settingsData =
-    teamMemoryCapable && identity.isInternal ? settingsQuery.data : undefined;
+    teamMemoryCapable && identity.isInternal && !readOnly ? settingsQuery.data : undefined;
   const sharingReady = sharingCapable && data !== undefined && !sharingQuery.isError;
+  const sharingNotFound =
+    sharingCapable && sharingQuery.isError && isNotFoundError(sharingQuery.error);
+  const settingsLoaded = settingsData !== undefined && !settingsQuery.isError;
+  const settingsNotFound =
+    teamMemoryCapable &&
+    identity.isInternal &&
+    !readOnly &&
+    settingsQuery.isError &&
+    isNotFoundError(settingsQuery.error);
 
   if (open && sharingReady) {
     if (!cosEdited && draftCos !== data.cos_access) {
@@ -158,20 +172,16 @@ export function WorkspaceSharingModal({
     }
   }
 
-  if (open && draftTeamMemory === null && settingsData !== undefined) {
+  if (open && draftTeamMemory === null && settingsLoaded) {
     setDraftTeamMemory(settingsData.team_memory_enabled === true);
   }
 
-  if (
+  const hiddenByContext =
     !workspaceId ||
     (!sharingCapable && !teamMemoryCapable) ||
-    data?.is_home ||
-    settingsData?.is_home
-  ) {
-    return null;
-  }
+    data?.is_home === true ||
+    settingsData?.is_home === true;
 
-  const settingsLoaded = settingsData !== undefined && !settingsQuery.isError;
   const ownerExternal = (data?.owner_external ?? settingsData?.owner_external) === true;
 
   const baseSharingCanEdit = sharingReady ? (data.can_edit ?? !readOnly) : false;
@@ -194,7 +204,8 @@ export function WorkspaceSharingModal({
     !ownerExternal;
 
   const showSharingSection = sharingReady;
-  const showSharingError = sharingCapable && sharingQuery.isError;
+  const showSharingError = sharingCapable && sharingQuery.isError && !sharingNotFound;
+  const showSharingLoading = open && sharingCapable && sharingQuery.isPending;
   const showTeamMemorySection =
     teamMemoryCapable &&
     identity.isInternal &&
@@ -207,7 +218,8 @@ export function WorkspaceSharingModal({
     identity.isInternal &&
     !readOnly &&
     !ownerExternal &&
-    settingsQuery.isError;
+    settingsQuery.isError &&
+    !settingsNotFound;
   const showTeamMemoryLoading =
     open &&
     teamMemoryCapable &&
@@ -222,7 +234,21 @@ export function WorkspaceSharingModal({
     showTeamMemorySection ||
     showTeamMemoryError;
 
-  if (!open && !hasModalContent) {
+  const hasVisibleModalBody =
+    hasModalContent ||
+    showSharingLoading ||
+    showTeamMemoryLoading ||
+    identity.isConfirming ||
+    identity.status === 'error' ||
+    saveError !== null;
+
+  useEffect(() => {
+    if (open && (hiddenByContext || !hasVisibleModalBody)) {
+      setOpen(false);
+    }
+  }, [open, hiddenByContext, hasVisibleModalBody]);
+
+  if (hiddenByContext || (!hasModalContent && (!open || !hasVisibleModalBody))) {
     return null;
   }
 
@@ -370,6 +396,7 @@ export function WorkspaceSharingModal({
       </button>
 
       {open &&
+        hasVisibleModalBody &&
         typeof document !== 'undefined' &&
         createPortal(
           <ModalShell
@@ -436,6 +463,16 @@ export function WorkspaceSharingModal({
                 >
                   {t('share.identityFailed')}
                 </DaltonInlineNotice>
+              )}
+
+              {showSharingLoading && (
+                <div
+                  data-testid="workspace-sharing-loading"
+                  className="flex items-center justify-between gap-3 text-xs"
+                  style={{ color: 'var(--color-text-tertiary)' }}
+                >
+                  <span>{t('dalton.teamMemory.loading')}</span>
+                </div>
               )}
 
               {showSharingError && (

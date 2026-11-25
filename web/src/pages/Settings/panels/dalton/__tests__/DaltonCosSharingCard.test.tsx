@@ -204,4 +204,40 @@ describe('DaltonCosSharingCard', () => {
     );
     expect(h.revalidate).toHaveBeenCalledTimes(1);
   });
+
+  it('hides card without load error when GET /sharing/user-settings returns 404 or 200 neutral payload', async () => {
+    h.get.mockRejectedValueOnce(
+      new ApiError('Request failed with status code 404', 'ERR_BAD_REQUEST', {
+        status: 404,
+        statusText: 'Not Found',
+        headers: {},
+        data: { detail: 'Capability disabled' },
+      }),
+    );
+
+    const view1 = renderWithQueryClient();
+    await waitFor(() => expect(h.get).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.queryByTestId('dalton-cos-sharing-card')).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByText('dalton.common.loadFailed')).toBeNull();
+    view1.unmount();
+
+    h.get.mockResolvedValueOnce({
+      data: {
+        user_id: 'u-1',
+        cos_rw_enabled: false,
+        cos_access: 'hidden',
+        can_edit: false,
+        caller_tier: 'internal',
+        colleague_dispatch_enabled: false,
+      },
+    });
+    renderWithQueryClient();
+    await waitFor(() => expect(h.get).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(screen.queryByTestId('dalton-cos-sharing-card')).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByText('dalton.common.loadFailed')).toBeNull();
+  });
 });

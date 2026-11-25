@@ -24,6 +24,18 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock('@/hooks/useTeamCredentials', () => ({
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: 'team',
+    enabled: true,
+    holder_user_id: null,
+    credential_user_id: 'u-1',
+    is_pm: h.callerTier === 'admin',
+    can_disconnect: h.callerTier === 'admin',
+    can_invite: h.callerTier === 'admin' || h.callerTier === 'internal',
+    caller_tier: h.callerTier,
+    colleague_sharing_enabled: true,
+    auth_mode: 'local',
+  })),
   useTeamCredentials: () => ({
     callerTier: h.callerTier,
     callerTierPending: false,

@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Search, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { isNotFoundError } from '@/api/errors'; // DALTON-HOOK(external-share-guard)
 import { useCallerIdentity, type UseCallerIdentityOptions } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(settings-section)
 import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(standalone-core)
 import { useDaltonCoverageUnits } from '@/lib/dalton/coverage'; // DALTON-HOOK(settings-reorg)
@@ -26,9 +27,10 @@ export function useDaltonSettingsVisibility(
 ): DaltonSettingVisibilityContext {
   const { capabilities, isLoading: capabilitiesLoading, hasCapability } = useCapabilities();
   const identity = useCallerIdentity(identityOptions);
-  const { data } = useUserCosSharingQuery(
+  const { data, error: cosSharingError } = useUserCosSharingQuery(
     identity.isInternal && hasCapability('colleague_sharing'),
   );
+  const cosSharingNotFound = isNotFoundError(cosSharingError);
   const { data: coverageData, isLoading: coverageLoading } = useDaltonCoverageUnits(true);
   const effectiveTier = identity.status === 'ready' ? identity.tier : null;
   return {
@@ -37,8 +39,8 @@ export function useDaltonSettingsVisibility(
     callerTier: effectiveTier,
     callerTierPending: identity.status === 'loading',
     callerTierError: identity.status === 'error',
-    colleagueDispatchEnabled: data?.colleague_dispatch_enabled,
-    cosSharingLoaded: data !== undefined,
+    colleagueDispatchEnabled: cosSharingNotFound ? false : data?.colleague_dispatch_enabled,
+    cosSharingLoaded: data !== undefined || cosSharingNotFound,
     coverageUnitsEnabled: coverageData?.enabled === true,
     coverageUnitsPending: coverageLoading,
     discordChannelsAdmin: identity.isAdmin,

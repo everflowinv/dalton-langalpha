@@ -26,6 +26,18 @@ vi.mock('@/pages/ChatAgent/utils/api/workspaces', async (importOriginal) => ({
   getHomeWorkspace: home.getHomeWorkspace,
 }));
 vi.mock('@/hooks/useTeamCredentials', () => ({
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: 'off',
+    enabled: false,
+    holder_user_id: null,
+    credential_user_id: 'u-1',
+    is_pm: true,
+    can_disconnect: true,
+    can_invite: false,
+    caller_tier: credentials.callerTier,
+    colleague_sharing_enabled: false,
+    auth_mode: 'local',
+  })),
   useTeamCredentials: () => ({
     isShared: false,
     canDisconnect: true,

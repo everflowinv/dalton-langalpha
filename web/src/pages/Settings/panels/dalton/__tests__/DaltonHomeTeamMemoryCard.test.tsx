@@ -213,4 +213,22 @@ describe('DaltonHomeTeamMemoryCard', () => {
     );
     expect(h.revalidate).toHaveBeenCalledTimes(1);
   });
+
+  it('hides card without load error when GET /user-settings returns 404', async () => {
+    h.get.mockRejectedValueOnce(
+      new ApiError('Request failed with status code 404', 'ERR_BAD_REQUEST', {
+        status: 404,
+        statusText: 'Not Found',
+        headers: {},
+        data: { detail: 'Capability disabled' },
+      }),
+    );
+
+    renderWithQueryClient();
+    await waitFor(() => expect(h.get).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.queryByTestId('dalton-home-team-memory-card')).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByText('dalton.common.loadFailed')).toBeNull();
+  });
 });

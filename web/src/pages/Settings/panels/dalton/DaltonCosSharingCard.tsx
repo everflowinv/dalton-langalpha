@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { api } from '@/api/client';
-import { apiErrorDetail, formatApiErrorDetail, isForbiddenError } from '@/api/errors';
+import { apiErrorDetail, formatApiErrorDetail, isForbiddenError, isNotFoundError } from '@/api/errors';
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { hasRequiredCapability, useCapabilities, type CapabilityId } from '@/hooks/useCapabilities';
@@ -114,7 +114,7 @@ export function DaltonCosSharingCard({
     },
   });
 
-  if (!allowed || data?.colleague_dispatch_enabled === false) {
+  if (!allowed || data?.colleague_dispatch_enabled === false || isNotFoundError(error)) {
     return null;
   }
 

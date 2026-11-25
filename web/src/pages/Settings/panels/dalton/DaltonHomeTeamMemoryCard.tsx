@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { api } from '@/api/client';
-import { apiErrorDetail, formatApiErrorDetail, isForbiddenError } from '@/api/errors';
+import { apiErrorDetail, formatApiErrorDetail, isForbiddenError, isNotFoundError } from '@/api/errors';
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { hasRequiredCapability, useCapabilities } from '@/hooks/useCapabilities';
@@ -81,6 +81,7 @@ export function DaltonHomeTeamMemoryCard({
     queryKey: queryKeys.dalton.userSettings(),
     queryFn: fetchDaltonUserSettings,
     enabled: allowed,
+    retry: false,
   });
 
   const mutation = useMutation({
@@ -112,7 +113,7 @@ export function DaltonHomeTeamMemoryCard({
     },
   });
 
-  if (!allowed) {
+  if (!allowed || isNotFoundError(error)) {
     return null;
   }
 

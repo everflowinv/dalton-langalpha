@@ -78,6 +78,18 @@ vi.mock('@/config/hostMode', () => ({ isPlatformMode: false }));
 vi.mock('@/config/daltonAuth', () => ({ isDaltonAuth: false }));
 vi.mock('@/hooks/useTeamCredentials', () => ({
   TEAM_SHARED_CREDENTIALS_HINT: '',
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: 'off',
+    enabled: false,
+    holder_user_id: null,
+    credential_user_id: 'local-user',
+    is_pm: true,
+    can_disconnect: true,
+    can_invite: false,
+    caller_tier: 'admin',
+    colleague_sharing_enabled: false,
+    auth_mode: 'oss',
+  })),
   useTeamCredentials: () => ({
     isShared: false,
     canDisconnect: true,

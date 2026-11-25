@@ -118,6 +118,11 @@ export function isForbiddenError(err: unknown): boolean {
   return apiErrorStatus(err) === 403;
 }
 
+// DALTON-HOOK(external-share-guard): detect HTTP 404 refusals so hidden/disabled endpoints hide entries instead of showing load errors
+export function isNotFoundError(err: unknown): boolean {
+  return apiErrorStatus(err) === 404;
+}
+
 /** A 4xx: the request itself was refused, so asking again gets the same answer. */
 export function isClientError(err: unknown): boolean {
   const status = apiErrorStatus(err);
