@@ -46,6 +46,7 @@ from typing import Any, Dict, Literal, Optional, Union
 
 import httpx
 
+from src.dalton.notify.channel_transport import GATEWAY_DELIVERY_READ_TIMEOUT_S  # DALTON-HOOK(dalton-notify)
 from src.tools.messaging import tools as messaging
 
 logger = logging.getLogger(__name__)
@@ -65,10 +66,9 @@ _START_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 #: The wait before a start's second ask, after a first that got no answer or
 #: found the service briefly unavailable.
 START_RETRY_DELAY = 1.0
-# A finish posts to every chat the run didn't reach. It runs in a hook outbox
-# job, or in a settle's tail, which shutdown waits on for about one webhook's
-# timeout.
-_FINISH_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
+# A finish posts to every chat the run didn't reach (and may wait on gateway
+# Weixin preflight retries within the shared budget).
+_FINISH_TIMEOUT = httpx.Timeout(GATEWAY_DELIVERY_READ_TIMEOUT_S, connect=5.0)  # DALTON-HOOK(dalton-notify)
 
 # What a fallback carries: the same cap ``send_message`` puts on a message.
 _FINAL_TEXT_CHARS = messaging.MAX_TEXT_CHARS

@@ -2979,6 +2979,20 @@ async def _fetch_data_task_def_notify_state(job_key: str) -> dict[str, Any] | No
 RETRY_MIN_REQUEST_TIMEOUT_S = 1.0
 RETRY_CLIENT_CLASSIFY_SLACK_S = 0.5
 RETRY_DB_FINALIZE_RESERVE_S = 3.0
+# R13 (Codex #4 / Grok med): Before claiming a gateway retry item, require enough
+# remaining scan budget for one full gateway read (240s) plus 4s to persist status.
+RETRY_GATEWAY_WRITE_RESERVE_S = 4.0
+RETRY_GATEWAY_MIN_REMAINING_BUDGET_S = (
+    GATEWAY_DELIVERY_READ_TIMEOUT_S + RETRY_GATEWAY_WRITE_RESERVE_S
+)
+
+
+def _remaining_retry_wall_budget_s(
+    started_at: float,
+    max_duration_s: float,
+) -> float:
+    """Return raw wall-clock seconds remaining in the current retry scan."""
+    return float(max_duration_s) - (time.monotonic() - started_at)
 
 
 def _remaining_retry_request_budget_s(
@@ -2986,7 +3000,7 @@ def _remaining_retry_request_budget_s(
     max_duration_s: float,
 ) -> float:
     """Return remaining seconds available for a retry HTTP request after reserving client classification slack and DB finalization."""
-    raw_remaining_s = float(max_duration_s) - (time.monotonic() - started_at)
+    raw_remaining_s = _remaining_retry_wall_budget_s(started_at, max_duration_s)
     return raw_remaining_s - (
         RETRY_DB_FINALIZE_RESERVE_S + RETRY_CLIENT_CLASSIFY_SLACK_S
     )
@@ -3547,10 +3561,10 @@ async def retry_failed_notify_deliveries(
                     if seen_key in report_executions_seen:
                         continue
                     if (
-                        _remaining_retry_request_budget_s(
+                        _remaining_retry_wall_budget_s(
                             started_at, max_duration_s
                         )
-                        < RETRY_MIN_REQUEST_TIMEOUT_S
+                        < RETRY_GATEWAY_MIN_REMAINING_BUDGET_S
                     ):
                         break
                     report_executions_seen.add(seen_key)
@@ -3790,12 +3804,6 @@ async def retry_failed_notify_deliveries(
                 if not is_channel_target_enabled(tgt, channel=ch):
                     continue
 
-                request_timeout_s = _remaining_retry_request_budget_s(
-                    started_at, max_duration_s
-                )
-                if request_timeout_s < RETRY_MIN_REQUEST_TIMEOUT_S:
-                    break
-
                 row_transport = str(payload.get("transport") or "").strip().lower()
                 automation_gateway = (
                     row_transport == "gateway"
@@ -3811,9 +3819,22 @@ async def retry_failed_notify_deliveries(
                     (is_data_task_row and post_notify_fn is post_bridge_notify)
                     or automation_gateway
                 )
+                request_timeout_s = _remaining_retry_request_budget_s(
+                    started_at, max_duration_s
+                )
+                if (
+                    _remaining_retry_wall_budget_s(started_at, max_duration_s)
+                    < RETRY_GATEWAY_MIN_REMAINING_BUDGET_S
+                    if use_gateway_transport
+                    else request_timeout_s < RETRY_MIN_REQUEST_TIMEOUT_S
+                ):
+                    break
                 async with get_db_connection() as conn:
                     if (
-                        _remaining_retry_request_budget_s(
+                        _remaining_retry_wall_budget_s(started_at, max_duration_s)
+                        < RETRY_GATEWAY_MIN_REMAINING_BUDGET_S
+                        if use_gateway_transport
+                        else _remaining_retry_request_budget_s(
                             started_at, max_duration_s
                         )
                         < RETRY_MIN_REQUEST_TIMEOUT_S
@@ -3961,7 +3982,13 @@ async def retry_failed_notify_deliveries(
                 request_timeout_s = _remaining_retry_request_budget_s(
                     started_at, max_duration_s
                 )
-                if request_timeout_s < RETRY_MIN_REQUEST_TIMEOUT_S:
+                insufficient_budget = (
+                    _remaining_retry_wall_budget_s(started_at, max_duration_s)
+                    < RETRY_GATEWAY_MIN_REMAINING_BUDGET_S
+                    if use_gateway_transport
+                    else request_timeout_s < RETRY_MIN_REQUEST_TIMEOUT_S
+                )
+                if insufficient_budget:
                     restored_code = (
                         row_error_code
                         if (
@@ -4325,10 +4352,12 @@ def _report_dispatch_timeout_s(
     base = resolve_gateway_delivery_read_timeout_s(float(get_notify_http_timeout_s()))
     if started_at is None or max_duration_s is None:
         return base
-    remaining = _remaining_retry_request_budget_s(float(started_at), float(max_duration_s))
-    if remaining < RETRY_MIN_REQUEST_TIMEOUT_S:
+    raw_remaining = _remaining_retry_wall_budget_s(float(started_at), float(max_duration_s))
+    if raw_remaining < RETRY_GATEWAY_MIN_REMAINING_BUDGET_S:
         return None
-    return resolve_gateway_delivery_read_timeout_s(min(base, remaining))
+    return resolve_gateway_delivery_read_timeout_s(
+        min(base, raw_remaining - RETRY_GATEWAY_WRITE_RESERVE_S)
+    )
 
 
 def _unresolved_saved_item_code(auth: Mapping[str, Any]) -> str | None:

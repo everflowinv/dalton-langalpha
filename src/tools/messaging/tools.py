@@ -21,6 +21,8 @@ from collections.abc import Sequence
 from typing import Annotated, Any, NamedTuple
 
 import httpx
+
+from src.dalton.notify.channel_transport import GATEWAY_DELIVERY_READ_TIMEOUT_S  # DALTON-HOOK(dalton-notify)
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, StructuredTool
 
@@ -55,7 +57,7 @@ UNKNOWN_SHOWN = "Whether the message went out is unknown."
 # A send fetches each file from the workspace and uploads it to the app
 # before answering, and may wait on gateway preflight retries (<=180s budget),
 # so it gets far longer than a listing does.
-_SEND_TIMEOUT = httpx.Timeout(240.0, connect=5.0)  # DALTON-HOOK(dalton-notify)
+_SEND_TIMEOUT = httpx.Timeout(GATEWAY_DELIVERY_READ_TIMEOUT_S, connect=5.0)  # DALTON-HOOK(dalton-notify)
 _TARGETS_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 
 

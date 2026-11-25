@@ -711,6 +711,15 @@ class InMemoryWeixinMultiAccountStore:
             return [{"platform": plat}] if "RETURNING platform" in norm else []
 
         if "UPDATE dalton_channel_thread_watches" in norm:
+            if "SET pending_interrupt = %s" in norm:
+                val = self._unwrap(params[0])
+                tid_u = str(params[1])
+                plat_u = str(params[2]) if len(params) >= 3 else None
+                w = self.thread_watches.get(tid_u)
+                if w is not None and (plat_u is None or w.get("platform") == plat_u):
+                    w["pending_interrupt"] = val
+                    w["updated_at"] = now
+                return []
             if "SET weixin_bot_generation = %s" in norm:
                 new_gen, aid = int(params[0]), str(params[-1])
                 for w in self.thread_watches.values():
@@ -1188,6 +1197,14 @@ class InMemoryWeixinMultiAccountStore:
             return [{"generation": self.session_generations[key]["generation"]}]
 
         if "UPDATE dalton_channel_session_generations" in norm:
+            if "SET pending_interrupt = %s" in norm and len(params) >= 4:
+                val = self._unwrap(params[0])
+                plat, scope, uid = str(params[1]), str(params[2]), str(params[3])
+                row = self.session_generations.get((plat, scope, uid))
+                if row is not None:
+                    row["pending_interrupt"] = val
+                    row["updated_at"] = now
+                return []
             if "SET generation = %s" in norm and len(params) >= 8:
                 new_g = int(params[0])
                 ov_ws = params[1]
@@ -6335,18 +6352,390 @@ async def test_r12_gateway_transport_and_dispatch_callers_enforce_240s_read_time
     assert len(observed_timeouts) == 2
     assert all(t >= ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S for t in observed_timeouts)
 
-    # 3. _report_dispatch_timeout_s returns >= 240s both standalone and when remaining budget is small (>= 1s)
+    # 3. _report_dispatch_timeout_s returns >= 240s standalone and when >= 244s remains (e.g. 245s),
+    #    and returns None when < 244s remains (e.g. 200s) so scan never claims a doomed gateway call.
     now = _time.monotonic()
     assert dispatch_mod._report_dispatch_timeout_s(None, None) >= ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S
-    assert dispatch_mod._report_dispatch_timeout_s(now, 26.0) >= ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S
-    # When budget is actually exhausted (< RETRY_MIN_REQUEST_TIMEOUT_S), it still returns None
-    assert dispatch_mod._report_dispatch_timeout_s(now - 25.0, 26.0) is None
+    assert dispatch_mod._report_dispatch_timeout_s(now - 5.0, 250.0) >= ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S
+    assert dispatch_mod._report_dispatch_timeout_s(now - 50.0, 250.0) is None
+
+    # 4. R13 (Codex #3): automation_delivery._FINISH_TIMEOUT and messaging.tools._SEND_TIMEOUT
+    #    both reference shared GATEWAY_DELIVERY_READ_TIMEOUT_S (240.0s) with 5.0s connect timeout.
+    from src.server.services import automation_delivery as auto_deliv_mod
+    from src.tools.messaging import tools as msg_tools_mod
+
+    assert float(auto_deliv_mod._FINISH_TIMEOUT.read or 0.0) == ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S
+    assert float(auto_deliv_mod._FINISH_TIMEOUT.connect or 0.0) == 5.0
+    assert float(msg_tools_mod._SEND_TIMEOUT.read or 0.0) == ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S
+    assert float(msg_tools_mod._SEND_TIMEOUT.connect or 0.0) == 5.0
 
 
+@pytest.mark.asyncio
+async def test_r13_i7_inbound_only_thread_id_check_late_watch_retry_and_account_lock_order(
+    wx_env: dict[str, Any],
+) -> None:
+    """R13 (Codex #2, #5, #6 / Grok low):
+    1) Inbound-event-only update carrying top-level thread_id pointing to a Weixin thread
+       rejects Feishu without epoch (409 stale_gateway_epoch) and with epoch (409 platform_mismatch)
+       without linking cross-platform thread_id;
+    2) Late-committed watch appearing after pre-check triggers rollback + one retry on the full
+       main path (account -> session -> watch), updating BOTH session_generations and thread_watches;
+       if watch disappears or conflicts on retry -> 409;
+    3) First-write Weixin thread_watch + session_interrupt_update locks weixin_accounts FOR KEY SHARE
+       strictly BEFORE session_generations FOR UPDATE and thread_watches FOR UPDATE.
+    """
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    client: TestClient = wx_env["client"]
+    no_ep = {"X-Service-Token": SERVICE_TOKEN}
+    valid_ep = {"X-Service-Token": SERVICE_TOKEN, "X-Gateway-Epoch": "1"}
+
+    # 1. Inbound-only update with Feishu inbound event + Weixin thread_id
+    tid_wx = str(uuid4())
+    store.conversation_threads[tid_wx] = {"conversation_thread_id": tid_wx, "platform": "weixin"}
+    store.inbound_events[("feishu", "om_feishu_r13")] = {
+        "platform": "feishu",
+        "message_id": "om_feishu_r13",
+        "dalton_user_id": "u-alice",
+        "thread_id": None,
+        "run_id": None,
+        "status": "accepted",
+    }
+    r_in_no_ep = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=no_ep,
+        json={
+            "platform": "feishu",
+            "message_id": "om_feishu_r13",
+            "thread_id": tid_wx,
+            "status": "streaming",
+        },
+    )
+    assert r_in_no_ep.status_code == 409
+    assert r_in_no_ep.json()["code"] == "stale_gateway_epoch"
+    assert store.inbound_events[("feishu", "om_feishu_r13")]["thread_id"] is None
+
+    r_in_mm = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=valid_ep,
+        json={
+            "platform": "feishu",
+            "message_id": "om_feishu_r13",
+            "thread_id": tid_wx,
+            "status": "streaming",
+        },
+    )
+    assert r_in_mm.status_code == 409
+    assert r_in_mm.json()["code"] == "platform_mismatch"
+    assert store.inbound_events[("feishu", "om_feishu_r13")]["thread_id"] is None
+
+    # 2. First-write Weixin thread_watch + session_interrupt_update lock order:
+    #    weixin_accounts FOR KEY SHARE < session_generations FOR UPDATE < thread_watches FOR UPDATE
+    aid_u = str(uuid4())
+    store.accounts[aid_u] = {
+        "account_id": aid_u,
+        "user_id": "u-alice",
+        "ilink_bot_id": "bot_r13_order@im.wechat",
+        "ilink_user_id": "wx_r13_order@im.wechat",
+        "bot_generation": 1,
+        "status": "active",
+    }
+    tid_first_w = str(uuid4())
+    store.executed_sql.clear()
+    r_first = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=valid_ep,
+        json={
+            "session_interrupt_update": {
+                "platform": "weixin",
+                "thread_id": tid_first_w,
+                "scope_key": "dm:wx_r13_order@im.wechat",
+                "dalton_user_id": "u-alice",
+                "generation": 1,
+                "pending_interrupt": {"interrupt_id": "i-first", "q": "ok?"},
+            },
+            "thread_watch": {
+                "thread_id": tid_first_w,
+                "dalton_user_id": "u-alice",
+                "platform": "weixin",
+                "target_address": "weixin:@me",
+                "scope_key": "dm:wx_r13_order@im.wechat",
+                "generation": 1,
+                "watch_active": True,
+            },
+        },
+    )
+    assert r_first.status_code == 200, r_first.text
+    sql_texts = [q for q, _ in store.executed_sql]
+    acc_idx = next(
+        i for i, q in enumerate(sql_texts)
+        if "FROM dalton_channel_weixin_accounts" in q and "FOR KEY SHARE" in q
+    )
+    sess_idx = next(
+        i for i, q in enumerate(sql_texts)
+        if "FROM dalton_channel_session_generations" in q and "FOR UPDATE" in q
+    )
+    watch_idx = next(
+        i for i, q in enumerate(sql_texts)
+        if "FROM dalton_channel_thread_watches" in q and "FOR UPDATE" in q
+    )
+    assert acc_idx < sess_idx < watch_idx
+
+    # 3. Late-committed watch appearing between pre-check and FOR UPDATE triggers rollback + retry
+    #    on the full main path, updating BOTH session_generations and thread_watches.
+    tid_late = str(uuid4())
+    late_watch_row = {
+        "thread_id": tid_late,
+        "dalton_user_id": "u-alice",
+        "platform": "weixin",
+        "target_address": "weixin:@me",
+        "scope_key": "dm:wx_late",
+        "generation": 1,
+        "watch_active": True,
+        "pending_interrupt": None,
+    }
+    store.session_generations[("weixin", "dm:wx_late", "u-alice")] = {
+        "platform": "weixin",
+        "scope_key": "dm:wx_late",
+        "dalton_user_id": "u-alice",
+        "generation": 1,
+        "override_workspace_id": None,
+        "pending_interrupt": None,
+        "last_conversation_activity_at": datetime.now(timezone.utc),
+    }
+    orig_handle_sql = store.handle_sql
+    late_select_count = {"n": 0}
+
+    async def _inject_late_watch(sql: str, params: Any) -> Any:
+        norm = " ".join(sql.split())
+        if (
+            "FROM dalton_channel_thread_watches" in norm
+            and params
+            and str(params[0]) == tid_late
+        ):
+            late_select_count["n"] += 1
+            if late_select_count["n"] == 1:
+                # Simulate watch not visible during initial pre-check
+                return []
+            if late_select_count["n"] == 2:
+                # Watch commits right before the FOR UPDATE fallback check!
+                store.thread_watches[tid_late] = dict(late_watch_row)
+        return await orig_handle_sql(sql, params)
+
+    store.handle_sql = _inject_late_watch  # type: ignore[method-assign]
+    try:
+        r_late = client.post(
+            "/api/v1/dalton/channels/internal/inbound/progress",
+            headers=valid_ep,
+            json={
+                "session_interrupt_update": {
+                    "thread_id": tid_late,
+                    "scope_key": "dm:wx_late",
+                    "dalton_user_id": "u-alice",
+                    "generation": 1,
+                    "pending_interrupt": {"interrupt_id": "i-late", "q": "confirm?"},
+                }
+            },
+        )
+    finally:
+        store.handle_sql = orig_handle_sql  # type: ignore[method-assign]
+    assert r_late.status_code == 200, r_late.text
+    assert r_late.json()["session_is_current_for_interrupt"] is True
+    assert store.thread_watches[tid_late]["pending_interrupt"] == {
+        "interrupt_id": "i-late",
+        "q": "confirm?",
+    }
+    assert store.session_generations[("weixin", "dm:wx_late", "u-alice")]["pending_interrupt"] == {
+        "interrupt_id": "i-late",
+        "q": "confirm?",
+    }
 
 
+@pytest.mark.asyncio
+async def test_r13_weixin_upload_guard_and_confirmed_login_session_account_status(
+    wx_env: dict[str, Any],
+) -> None:
+    """R13 (Gateway R6 companion):
+    1) verify_weixin_upload_headers skips uploads without Weixin headers (Feishu/Discord/Web),
+       allows matching active account + bot_generation + gateway_epoch, and rejects stale epoch
+       (409 stale_gateway_epoch) or rotated/unbound/other-user account (409 weixin_bot_generation_superseded);
+    2) GET /internal/weixin/login-sessions/{session_key} for a confirmed session directly includes
+       live `account_status` (both top-level and inside `confirmed_result`).
+    """
+    from fastapi import HTTPException
+    from starlette.datastructures import Headers
+    from types import SimpleNamespace
 
+    store: InMemoryWeixinMultiAccountStore = wx_env["store"]
+    client: TestClient = wx_env["client"]
+    hdrs = {"X-Service-Token": SERVICE_TOKEN}
+    aid = str(uuid4())
+    store.accounts[aid] = {
+        "account_id": aid,
+        "user_id": "u-alice",
+        "ilink_bot_id": "bot_up@im.wechat",
+        "ilink_user_id": "wx_up@im.wechat",
+        "bot_generation": 2,
+        "status": "active",
+    }
 
+    # 1a. No Weixin headers (Feishu / Discord / Web) -> no-op
+    await wx_db.verify_weixin_upload_headers(
+        request=SimpleNamespace(headers=Headers({})),
+        user_id="u-alice",
+    )
 
+    # 1b. Matching account + bot_generation + epoch -> allowed
+    await wx_db.verify_weixin_upload_headers(
+        request=SimpleNamespace(
+            headers=Headers(
+                {
+                    "X-Weixin-Account-Id": aid,
+                    "X-Weixin-Bot-Generation": "2",
+                    "X-Gateway-Epoch": "1",
+                }
+            )
+        ),
+        user_id="u-alice",
+    )
 
+    # 1c. Stale epoch -> 409 stale_gateway_epoch
+    with pytest.raises(HTTPException) as exc_ep:
+        await wx_db.verify_weixin_upload_headers(
+            request=SimpleNamespace(
+                headers=Headers(
+                    {
+                        "X-Weixin-Account-Id": aid,
+                        "X-Weixin-Bot-Generation": "2",
+                        "X-Gateway-Epoch": "999",
+                    }
+                )
+            ),
+            user_id="u-alice",
+        )
+    assert exc_ep.value.status_code == 409
+    assert exc_ep.value.detail["code"] == "stale_gateway_epoch"
 
+    # 1d. Superseded bot_generation -> 409 weixin_bot_generation_superseded
+    with pytest.raises(HTTPException) as exc_gen:
+        await wx_db.verify_weixin_upload_headers(
+            request=SimpleNamespace(
+                headers=Headers(
+                    {
+                        "X-Weixin-Account-Id": aid,
+                        "X-Weixin-Bot-Generation": "1",
+                        "X-Gateway-Epoch": "1",
+                    }
+                )
+            ),
+            user_id="u-alice",
+        )
+    assert exc_gen.value.status_code == 409
+    assert exc_gen.value.detail["code"] == "weixin_bot_generation_superseded"
+
+    # 1e. Different user -> 409 weixin_bot_generation_superseded
+    with pytest.raises(HTTPException) as exc_user:
+        await wx_db.verify_weixin_upload_headers(
+            request=SimpleNamespace(
+                headers=Headers(
+                    {
+                        "X-Weixin-Account-Id": aid,
+                        "X-Weixin-Bot-Generation": "2",
+                        "X-Gateway-Epoch": "1",
+                    }
+                )
+            ),
+            user_id="u-bob",
+        )
+    assert exc_user.value.status_code == 409
+    assert exc_user.value.detail["code"] == "weixin_bot_generation_superseded"
+
+    # 1f. Malformed header -> 400
+    with pytest.raises(HTTPException) as exc_bad:
+        await wx_db.verify_weixin_upload_headers(
+            request=SimpleNamespace(
+                headers=Headers(
+                    {
+                        "X-Weixin-Account-Id": "not-a-uuid",
+                        "X-Weixin-Bot-Generation": "2",
+                        "X-Gateway-Epoch": "1",
+                    }
+                )
+            ),
+            user_id="u-alice",
+        )
+    assert exc_bad.value.status_code == 400
+
+    # 2. Confirmed login session GET directly includes live account_status
+    skey = f"sess-r13-{uuid4().hex[:8]}"
+    store.accounts[aid]["status"] = "pending_verification"
+    store.login_sessions[skey] = {
+        "session_key": skey,
+        "user_id": "u-alice",
+        "target_account_id": aid,
+        "login_version": 3,
+        "expected_bot_generation": 2,
+        "status": "confirmed",
+        "qrcode": None,
+        "qrcode_img_content": None,
+        "redirect_base_url": "https://ilinkai.weixin.qq.com",
+        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
+        "confirmed_result": {
+            "account_id": aid,
+            "connected": True,
+            "already_connected": False,
+            "bot_generation": 2,
+            "accounts_revision": 4,
+        },
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    r_sess = client.get(
+        f"/api/v1/dalton/channels/internal/weixin/login-sessions/{skey}",
+        headers=hdrs,
+    )
+    assert r_sess.status_code == 200, r_sess.text
+    body = r_sess.json()
+    assert body["status"] == "confirmed"
+    assert body["account_status"] == "pending_verification"
+    assert body["confirmed_result"]["account_status"] == "pending_verification"
+
+    # 3. Verify POST /{workspace_id}/files/upload invokes verify_weixin_upload_headers
+    #    BEFORE acquire_sandbox_to_change (rejects stale generation 409 without touching sandbox).
+    from io import BytesIO
+    from fastapi import UploadFile
+    from src.server.app.workspace_files import crud as ws_crud
+
+    acquire_spy = create_autospec(ws_crud.acquire_sandbox_to_change)
+    ws_stub = {"workspace_id": str(uuid4()), "user_id": "u-alice", "status": "running"}
+    monkeypatch_ws = pytest.MonkeyPatch()
+    try:
+        monkeypatch_ws.setattr(
+            ws_crud,
+            "reached_workspace_on_computer",
+            create_autospec(
+                ws_crud.reached_workspace_on_computer,
+                return_value=(ws_stub, None),
+            ),
+        )
+        monkeypatch_ws.setattr(ws_crud, "acquire_sandbox_to_change", acquire_spy)
+        with pytest.raises(HTTPException) as exc_route:
+            await ws_crud.upload_workspace_file(
+                workspace_id=ws_stub["workspace_id"],
+                x_user_id="u-alice",
+                request=SimpleNamespace(
+                    headers=Headers(
+                        {
+                            "X-Weixin-Account-Id": aid,
+                            "X-Weixin-Bot-Generation": "1",
+                            "X-Gateway-Epoch": "1",
+                        }
+                    )
+                ),
+                path="uploads/a.txt",
+                file=UploadFile(filename="a.txt", file=BytesIO(b"hello")),
+            )
+        assert exc_route.value.status_code == 409
+        assert exc_route.value.detail["code"] == "weixin_bot_generation_superseded"
+        acquire_spy.assert_not_called()
+    finally:
+        monkeypatch_ws.undo()

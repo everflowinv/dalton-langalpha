@@ -96,20 +96,6 @@ from src.server.services.workspace_files import (
     to_client_path,
 )
 
-# DALTON-HOOK(chat-large-upload): bridge legacy crud.owner_work_dir and crud.owner_layout test patches
-_DEFAULT_OWNER_LAYOUT = owner_layout
-_DEFAULT_OWNER_WORK_DIR = owner_work_dir
-
-
-def _resolve_owner_work_dir(workspace: dict[str, Any]) -> str:
-    fn = owner_work_dir if owner_work_dir is not _DEFAULT_OWNER_WORK_DIR else _shared.owner_work_dir
-    return fn(workspace)
-
-
-def _resolve_owner_layout(workspace: dict[str, Any]) -> Any:
-    fn = owner_layout if owner_layout is not _DEFAULT_OWNER_LAYOUT else _shared.owner_layout
-    return fn(workspace)
-
 from . import _shared
 from ._shared import (
     RoutePaths,
@@ -144,6 +130,20 @@ from .backup_reads import (
     read_from_backup,
 )
 from src.server.services.warm_files import warm_sandbox
+
+# DALTON-HOOK(chat-large-upload): bridge legacy crud.owner_work_dir and crud.owner_layout test patches
+_DEFAULT_OWNER_LAYOUT = owner_layout
+_DEFAULT_OWNER_WORK_DIR = owner_work_dir
+
+
+def _resolve_owner_work_dir(workspace: dict[str, Any]) -> str:
+    fn = owner_work_dir if owner_work_dir is not _DEFAULT_OWNER_WORK_DIR else _shared.owner_work_dir
+    return fn(workspace)
+
+
+def _resolve_owner_layout(workspace: dict[str, Any]) -> Any:
+    fn = owner_layout if owner_layout is not _DEFAULT_OWNER_LAYOUT else _shared.owner_layout
+    return fn(workspace)
 
 logger = logging.getLogger(__name__)
 
@@ -1491,6 +1491,7 @@ async def workspace_file_download_url(
 async def upload_workspace_file(
     workspace_id: str,
     x_user_id: CurrentUserId,
+    request: Request,
     path: str | None = Query(
         None,
         description="Destination path (virtual or absolute). Defaults to filename.",
@@ -1505,6 +1506,11 @@ async def upload_workspace_file(
     is_non_owner = not is_shared_ws and workspace.get("user_id") != x_user_id
     sandbox_owner_id = x_user_id if is_shared_ws else str(workspace.get("user_id") or x_user_id)
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
+
+    # DALTON-HOOK(weixin-multi-account): verify Weixin account generation & gateway epoch before writing to sandbox
+    from src.dalton.database.weixin_multi_account import verify_weixin_upload_headers
+
+    await verify_weixin_upload_headers(request=request, user_id=x_user_id)
 
     if served_from_mirror(workspace.get("status")):
         raise not_running_for_upload(workspace)
