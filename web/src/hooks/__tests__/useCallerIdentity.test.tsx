@@ -47,9 +47,14 @@ vi.mock('@/config/localUser', () => ({
   },
 }));
 
-vi.mock('@/contexts/AuthContext', () => ({
-  useAuth: () => ({ userId: envState.userId }),
-}));
+vi.mock('@/contexts/AuthContext', async () => {
+  const ReactMod = await import('react');
+  const AuthContext = ReactMod.createContext<{ userId: string | null } | null>(null);
+  return {
+    AuthContext,
+    useAuth: () => ({ userId: envState.userId }),
+  };
+});
 
 vi.mock('@/api/client', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/api/client')>();
@@ -62,6 +67,8 @@ vi.mock('@/api/client', async (importOriginal) => {
   };
 });
 
+import { AuthContext } from '@/contexts/AuthContext';
+import { useDaltonTeamModelsAvailable } from '@/pages/Setup/answers/useTeamModelsAvailable';
 import { useCallerIdentity } from '../useCallerIdentity';
 import { useTeamCredentials } from '../useTeamCredentials';
 
@@ -94,7 +101,11 @@ function makeClient() {
 
 function wrapperOf(client: QueryClient) {
   return function Wrapper({ children }: { children: React.ReactNode }) {
-    return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
+    return (
+      <AuthContext.Provider value={{ userId: envState.userId } as never}>
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      </AuthContext.Provider>
+    );
   };
 }
 
@@ -504,5 +515,73 @@ describe('useCallerIdentity', () => {
     expect(result.current.getLatestIdentity().isConfirming).toBe(false);
     expect(result.current.getLatestIdentity().tier).toBe('external');
     expect(result.current.tier).toBe('external');
+  });
+
+  it('defaults canInvite to false when multi-user credentials/status omits can_invite', async () => {
+    for (const authMode of ['local', 'supabase'] as const) {
+      envState.daltonAuthMode = authMode;
+      envState.isDaltonAuth = true;
+      const statusWithoutCanInvite = makeStatus({ auth_mode: authMode, caller_tier: 'internal' });
+      delete statusWithoutCanInvite.can_invite;
+      mockApiGet.mockResolvedValueOnce({ data: statusWithoutCanInvite });
+
+      const client = makeClient();
+      const { result, unmount } = renderHook(() => useCallerIdentity(), {
+        wrapper: wrapperOf(client),
+      });
+      await waitFor(() => expect(result.current.status).toBe('ready'));
+      expect(result.current.isInternal).toBe(true);
+      expect(result.current.canInvite).toBe(false);
+      unmount();
+    }
+  });
+
+  it('aborts an in-flight useDaltonTeamModelsAvailable credentials/status request via shared fetchTeamCredentialsStatus signal on revalidate()', async () => {
+    let signalA: AbortSignal | undefined;
+    let resolveB!: (v: { data: TeamCredentialsStatus }) => void;
+    let statusCalls = 0;
+
+    mockApiGet.mockImplementation((url, config) => {
+      if (url === '/api/v1/models') {
+        return Promise.resolve({ data: { dalton_profile: 'everflow' } as unknown as TeamCredentialsStatus });
+      }
+      statusCalls += 1;
+      if (statusCalls === 1) {
+        signalA = config?.signal;
+        return new Promise((_resolve, reject) => {
+          config?.signal?.addEventListener('abort', () => {
+            reject(new DOMException('Aborted', 'AbortError'));
+          });
+        });
+      }
+      return new Promise((resolve) => {
+        resolveB = resolve;
+      });
+    });
+
+    const client = makeClient();
+    const wrapper = wrapperOf(client);
+
+    // 1. useDaltonTeamModelsAvailable initiates cold-start /credentials/status request A.
+    renderHook(() => useDaltonTeamModelsAvailable(true, [], false, false, false, null), { wrapper });
+    await waitFor(() => expect(statusCalls).toBe(1));
+    expect(signalA).toBeDefined();
+    expect(signalA?.aborted).toBe(false);
+
+    // 2. useCallerIdentity().revalidate() cancels request A and issues fresh request B.
+    const { result } = renderHook(() => useCallerIdentity(), { wrapper });
+    let p!: Promise<void>;
+    act(() => {
+      p = result.current.revalidate();
+    });
+
+    await waitFor(() => expect(statusCalls).toBe(2));
+    expect(signalA?.aborted).toBe(true);
+
+    resolveB({ data: makeStatus({ caller_tier: 'external', can_invite: false }) });
+    await act(async () => {
+      await p;
+    });
+    expect(result.current.getLatestIdentity().tier).toBe('external');
   });
 });

@@ -36,6 +36,7 @@ const h = vi.hoisted(() => ({
   callerTier: 'admin' as string | null,
   callerTierPending: false,
   callerTierError: false,
+  isConfirming: false,
   isPm: true,
 }));
 
@@ -82,39 +83,42 @@ vi.mock('@/hooks/useTeamCredentials', () => ({
 
 vi.mock('@/hooks/useCallerIdentity', () => ({
   useCallerIdentity: () => {
-    const isSingleUserOss = !h.isDaltonAuth && h.isPm && !h.callerTierError && !h.callerTierPending;
-    const rawTier = isSingleUserOss ? 'admin' : h.callerTier;
-    const ready =
-      !h.callerTierPending &&
-      !h.callerTierError &&
-      (rawTier === 'admin' || rawTier === 'internal' || rawTier === 'external');
-    const tier = ready ? rawTier : 'unknown';
-    const isAdmin = ready && tier === 'admin';
-    const isInternal = ready && (tier === 'admin' || tier === 'internal');
-    const snapshot = {
-      tier,
-      status: h.callerTierPending ? 'loading' : ready ? 'ready' : 'error',
-      authMode: isSingleUserOss ? 'oss' : ready ? 'local' : null,
-      isPlatform: false,
-      isKnown: ready,
-      isConfirming: h.callerTierPending,
-      isMultiUserAuth: h.isDaltonAuth && ready,
-      isSingleUserOss,
-      isAdmin,
-      isInternal,
-      isExternal: ready && tier === 'external',
-      canActAsOwner: isInternal,
-      canPublishPublic: isAdmin,
-      canInvite: !isSingleUserOss && isInternal,
-      isTeamCredentialsShared: h.isDaltonAuth,
-      canManageCredentials: isAdmin,
-      isPm: h.isPm,
-      colleagueSharingEnabled: false,
+    const buildSnapshot = () => {
+      const isSingleUserOss = !h.isDaltonAuth && h.isPm && !h.callerTierError && !h.callerTierPending;
+      const rawTier = isSingleUserOss ? 'admin' : h.callerTier;
+      const ready =
+        !h.callerTierPending &&
+        !h.callerTierError &&
+        (rawTier === 'admin' || rawTier === 'internal' || rawTier === 'external');
+      const tier = ready ? rawTier : 'unknown';
+      const isAdmin = ready && tier === 'admin';
+      const isInternal = ready && (tier === 'admin' || tier === 'internal');
+      return {
+        tier,
+        status: h.callerTierPending ? 'loading' : ready ? 'ready' : 'error',
+        authMode: isSingleUserOss ? 'oss' : ready ? 'local' : null,
+        isPlatform: false,
+        isKnown: ready,
+        isConfirming: h.callerTierPending || h.isConfirming,
+        isMultiUserAuth: h.isDaltonAuth && ready,
+        isSingleUserOss,
+        isAdmin,
+        isInternal,
+        isExternal: ready && tier === 'external',
+        canActAsOwner: isInternal,
+        canPublishPublic: isAdmin,
+        canInvite: !isSingleUserOss && isInternal,
+        isTeamCredentialsShared: h.isDaltonAuth,
+        canManageCredentials: isAdmin,
+        isPm: h.isPm,
+        colleagueSharingEnabled: false,
+      };
     };
+    const snapshot = buildSnapshot();
     return {
       ...snapshot,
-      getLatestIdentity: () => snapshot,
-      isConfirmingNow: () => snapshot.isConfirming,
+      getLatestIdentity: () => buildSnapshot(),
+      isConfirmingNow: () => buildSnapshot().isConfirming,
       revalidate: vi.fn(async () => undefined),
     };
   },
@@ -268,6 +272,7 @@ describe('DaltonDiscordChannelsCard', () => {
     h.callerTier = 'admin';
     h.callerTierPending = false;
     h.callerTierError = false;
+    h.isConfirming = false;
     h.isPm = true;
   });
 
@@ -850,5 +855,75 @@ describe('DaltonDiscordChannelsCard', () => {
 
     expect(internalHook.current.callerTier).toBe('internal');
     expect(internalHook.current.discordChannelsAdmin).toBe(false);
+  });
+
+  it('disables add/rename controls during isConfirming and blocks mutations when getLatestIdentity() downgrades before save', async () => {
+    h.isConfirming = true;
+    h.fetchBindings.mockResolvedValue(makeBindings());
+
+    const { unmount } = renderCard();
+    expect(await screen.findByTestId('dalton-discord-channel-id-input')).toBeDisabled();
+    expect(screen.getByTestId('dalton-discord-channel-add-btn')).toBeDisabled();
+    expect(screen.getByTestId('dalton-discord-channel-rename-1528743490555740230')).toBeDisabled();
+    unmount();
+
+    // If identity downgrades while verify is in flight, runChannelMutation blocks the mutation synchronously.
+    h.isConfirming = false;
+    let resolveVerify!: (res: DaltonDiscordChannelVerifyResponse) => void;
+    h.verifyChannel.mockImplementationOnce(
+      () =>
+        new Promise<DaltonDiscordChannelVerifyResponse>((resolve) => {
+          resolveVerify = resolve;
+        }),
+    );
+
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <DaltonDiscordChannelsCard />
+      </QueryClientProvider>,
+    );
+    fireEvent.change(await screen.findByTestId('dalton-discord-channel-id-input'), {
+      target: { value: '1481256083589697566' },
+    });
+    fireEvent.click(screen.getByTestId('dalton-discord-channel-add-btn'));
+    await waitFor(() => expect(h.verifyChannel).toHaveBeenCalledTimes(1));
+
+    // Identity starts confirming / downgrades before verify resolves.
+    h.isConfirming = true;
+    resolveVerify({
+      ok: true,
+      verified: true,
+      reason: null,
+      channel_id: '1481256083589697566',
+      channel_name: 'research-reports',
+      detail: null,
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId('dalton-discord-channel-add-btn')).toHaveTextContent(
+        'dalton.discordChannels.addButton',
+      ),
+    );
+    expect(screen.getByTestId('dalton-discord-channel-add-btn')).toBeDisabled();
+    expect(h.mutateDiscordChannel).not.toHaveBeenCalled();
+
+    // Stale rename save click after identity downgrades is also blocked synchronously.
+    h.isConfirming = false;
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <DaltonDiscordChannelsCard />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByTestId('dalton-discord-channel-rename-1528743490555740230'));
+    fireEvent.change(
+      screen.getByTestId('dalton-discord-channel-rename-input-1528743490555740230'),
+      { target: { value: 'New Name' } },
+    );
+    h.callerTier = 'internal';
+    fireEvent.click(screen.getByTestId('dalton-discord-channel-rename-save-1528743490555740230'));
+    expect(h.mutateDiscordChannel).not.toHaveBeenCalled();
   });
 });

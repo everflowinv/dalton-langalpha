@@ -165,7 +165,7 @@ export function DaltonCosSharingCard({
         <div className="space-y-2 mt-2">
           {mutation.isError && (
             <DaltonInlineNotice tone="error" testId="dalton-cos-sharing-error">
-              {apiErrorDetail(mutation.error) != null
+              {isForbiddenError(mutation.error) && apiErrorDetail(mutation.error) != null
                 ? formatApiErrorDetail(mutation.error)
                 : t('dalton.common.saveFailed')}
             </DaltonInlineNotice>

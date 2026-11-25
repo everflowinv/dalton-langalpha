@@ -49,7 +49,7 @@
     "keepUpdatedHint": "研究助手每轮对话结束发现文件变化时自动发布新版本",
     "autoPublishPausedHint": "自动发布已暂停：本工作区读过同事的内容。请核对文件与可见范围，点「{{action}}」后恢复自动发布。",
     "externalOwnOnlyHint": "外部成员仅支持发布为“仅自己”可见",
-    "nonAdminPublicDowngradeHint": "你没有公开权限，发布后可见范围会改为全公司",
+    "nonAdminPublicDowngradeHint": "当前监控为公开链接，请先重新选择可见范围后再提交更新",
     "confirmingIdentity": "正在确认账号权限…",
     "identityFailed": "权限确认失败，请重试",
     "adminDowngradedReselectHint": "管理员权限已变更，请重新选择可见范围",

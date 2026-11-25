@@ -183,16 +183,35 @@ export function WorkspaceSharingModal({
     !ownerExternal;
 
   const showSharingSection = sharingReady;
+  const showSharingError = sharingCapable && sharingQuery.isError;
   const showTeamMemorySection =
     teamMemoryCapable &&
     identity.isInternal &&
     !readOnly &&
     !ownerExternal &&
-    (settingsLoaded
-      ? (settingsData.can_edit_team_memory ?? settingsData.can_edit === true)
-      : sharingReady && baseSharingCanEdit);
+    settingsLoaded &&
+    (settingsData.can_edit_team_memory ?? settingsData.can_edit === true);
+  const showTeamMemoryError =
+    teamMemoryCapable &&
+    identity.isInternal &&
+    !readOnly &&
+    !ownerExternal &&
+    settingsQuery.isError;
+  const showTeamMemoryLoading =
+    open &&
+    teamMemoryCapable &&
+    identity.isInternal &&
+    !readOnly &&
+    !ownerExternal &&
+    settingsQuery.isPending;
 
-  if (!showSharingSection && !showTeamMemorySection) {
+  const hasModalContent =
+    showSharingSection ||
+    showSharingError ||
+    showTeamMemorySection ||
+    showTeamMemoryError;
+
+  if (!open && !hasModalContent) {
     return null;
   }
 
@@ -287,16 +306,19 @@ export function WorkspaceSharingModal({
     }
 
     const results = await Promise.allSettled(tasks);
-    const rejected = results.find(
+    const rejections = results.filter(
       (r): r is PromiseRejectedResult => r.status === 'rejected',
     );
-    if (rejected) {
-      if (isForbiddenError(rejected.reason)) {
+    if (rejections.length > 0) {
+      if (rejections.some((r) => isForbiddenError(r.reason))) {
         void identity.revalidate();
       }
+      const forbiddenWithDetail = rejections.find(
+        (r) => isForbiddenError(r.reason) && apiErrorDetail(r.reason) != null,
+      );
       setSaveError(
-        isForbiddenError(rejected.reason) && apiErrorDetail(rejected.reason) != null
-          ? formatApiErrorDetail(rejected.reason)
+        forbiddenWithDetail
+          ? formatApiErrorDetail(forbiddenWithDetail.reason)
           : t('dalton.teamMemory.saveFailed', '设置保存失败，请稍后重试'),
       );
       return;
@@ -400,6 +422,28 @@ export function WorkspaceSharingModal({
                   }
                 >
                   {t('share.identityFailed')}
+                </DaltonInlineNotice>
+              )}
+
+              {showSharingError && (
+                <DaltonInlineNotice
+                  tone="error"
+                  testId="workspace-sharing-load-error"
+                  action={
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-7 text-xs"
+                      onClick={() => void sharingQuery.refetch()}
+                      disabled={sharingQuery.isFetching}
+                      data-testid="workspace-sharing-load-retry"
+                    >
+                      {t('common.retry')}
+                    </Button>
+                  }
+                >
+                  {t('dalton.common.loadFailed')}
                 </DaltonInlineNotice>
               )}
 
@@ -508,12 +552,49 @@ export function WorkspaceSharingModal({
                 </>
               )}
 
+              {showTeamMemoryLoading && (
+                <div
+                  data-testid="workspace-team-memory-loading"
+                  className={cn(
+                    'flex items-center justify-between gap-3 text-xs',
+                    (showSharingSection || showSharingError) && 'rule-t pt-3',
+                  )}
+                  style={{ color: 'var(--color-text-tertiary)' }}
+                >
+                  <span>{t('dalton.teamMemory.loading')}</span>
+                </div>
+              )}
+
+              {showTeamMemoryError && (
+                <div className={cn((showSharingSection || showSharingError) && 'rule-t pt-3')}>
+                  <DaltonInlineNotice
+                    tone="error"
+                    testId="workspace-team-memory-error"
+                    action={
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-7 text-xs"
+                        onClick={() => void settingsQuery.refetch()}
+                        disabled={settingsQuery.isFetching}
+                        data-testid="workspace-team-memory-retry"
+                      >
+                        {t('common.retry')}
+                      </Button>
+                    }
+                  >
+                    {t('dalton.common.loadFailed')}
+                  </DaltonInlineNotice>
+                </div>
+              )}
+
               {showTeamMemorySection && (
                 <div
                   data-testid="workspace-team-memory-section"
                   className={cn(
                     'flex items-center justify-between gap-3',
-                    showSharingSection && 'rule-t pt-3',
+                    (showSharingSection || showSharingError) && 'rule-t pt-3',
                   )}
                 >
                   <div className="flex flex-col gap-0.5 min-w-0">
@@ -528,15 +609,13 @@ export function WorkspaceSharingModal({
                       className="text-xs"
                       style={{ color: 'var(--color-text-tertiary)' }}
                     >
-                      {!settingsLoaded
-                        ? t('dalton.teamMemory.loading')
-                        : t('dalton.teamMemory.workspaceDesc')}
+                      {t('dalton.teamMemory.workspaceDesc')}
                     </span>
                   </div>
                   <ToggleSwitch
                     checked={draftTeamMemory === true}
                     disabled={isTeamMemoryDisabled}
-                    ariaBusy={!settingsLoaded || settingsMutation.isPending}
+                    ariaBusy={settingsMutation.isPending}
                     ariaLabel={t('dalton.teamMemory.workspaceTitle')}
                     ariaDescribedBy={teamMemoryTitleId}
                     testId="workspace-team-memory-switch"

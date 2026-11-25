@@ -336,15 +336,15 @@ function FilePanel({
   // from the DB mirror: an rw colleague is no more the workspace's owner than
   // a ro one, so the owner's file grant would only be refused. The owner
   // alone (and never an external member) gets the owner access.
-  // DALTON-HOOK(external-share-guard): an external or unknown-tier member is
-  // no artifact owner — the publish entry and comment UI stay hidden.
+  // DALTON-HOOK(external-share-guard): an external, unknown-tier, or revalidating member is
+  // not granted owner artifact write/comment controls until identity is confirmed.
   const identity = useCallerIdentity();
   const effectiveCallerTier =
     callerTier !== null && callerTier !== undefined
       ? callerTier
       : identity.isPlatform
         ? null
-        : identity.status === 'ready'
+        : identity.status === 'ready' && !identity.isConfirming
           ? identity.tier
           : 'unknown';
   const isNonOwnerTier = effectiveCallerTier === 'external' || effectiveCallerTier === 'unknown';
@@ -1008,10 +1008,10 @@ function FilePanel({
               readFileFullFn={readFileFullFn}
               access={access}
               openPublish={fileComments.openPublish}
-              // DALTON-HOOK(external-share-guard): external and unknown-tier owners may stop a
-              // public link or historical public monitor, but never start one.
+              // DALTON-HOOK(external-share-guard): allow workspace owners (including internal/admin and
+              // external/unknown-tier callers) to stop a public link or historical public monitor from the header.
               openUnshareOnly={
-                isNonOwnerTier && !servePrefix && !teamReadOnly && !readOnly && !!workspaceId
+                !servePrefix && !teamReadOnly && !readOnly && !!workspaceId
                   ? (path) => setUnshareTarget(path)
                   : null
               }

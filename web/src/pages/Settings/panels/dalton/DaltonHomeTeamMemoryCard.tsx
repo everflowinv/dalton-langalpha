@@ -98,7 +98,7 @@ export function DaltonHomeTeamMemoryCard({
         void identity.revalidate();
       }
       setSaveError(
-        apiErrorDetail(err) != null
+        isForbiddenError(err) && apiErrorDetail(err) != null
           ? formatApiErrorDetail(err)
           : t('dalton.common.saveFailed'),
       );

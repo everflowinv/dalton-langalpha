@@ -372,4 +372,127 @@ describe('ThreadSharePanel, ShareButton, and FileHeaderActions permissions', () 
     fireEvent.click(stopBtn);
     expect(openUnshareOnly).toHaveBeenCalledWith('results/report.html');
   });
+
+  it('hides share URL box during isConfirming even when status is ready', () => {
+    setTier('admin', { status: 'ready', isConfirming: true });
+    renderWithProviders(<ThreadSharePanel threadId="th-1" workspaceId="ws-1" />);
+
+    expect(screen.queryByText(/\/s\/thread-code/)).toBeNull();
+    expect(screen.getByRole('switch')).not.toBeDisabled();
+  });
+
+  it('strips historical allow_files and allow_download when non-admin enables sharing and blocks non-admin checkbox toggles in either direction', async () => {
+    setTier('internal');
+    h.shareState = {
+      is_shared: false,
+      share_token: '',
+      share_url: '',
+      permissions: { allow_files: true, allow_download: true },
+    };
+
+    const { unmount } = renderWithProviders(<ThreadSharePanel threadId="th-1" workspaceId="ws-1" />);
+    fireEvent.click(screen.getByRole('switch'));
+
+    await waitFor(() => expect(h.saveThreadSharing).toHaveBeenCalledTimes(1));
+    expect(h.saveThreadSharing.mock.calls[0][2]).toEqual({
+      is_shared: true,
+      permissions: { allow_files: false, allow_download: false },
+    });
+    unmount();
+
+    // Non-admin sees file permission checkboxes disabled even when already checked.
+    h.saveThreadSharing.mockClear();
+    h.shareState = {
+      is_shared: true,
+      share_token: 'thread-code',
+      share_url: '/s/thread-code',
+      permissions: { allow_files: true, allow_download: true, audience: 'public' },
+      audiences: ['public', 'organization'],
+    };
+    const { unmount: unmountInternal } = renderWithProviders(
+      <ThreadSharePanel threadId="th-1" workspaceId="ws-1" />,
+    );
+    const checkboxes = screen.getAllByRole('checkbox');
+    expect(checkboxes).toHaveLength(2);
+    expect(checkboxes[0]).toBeDisabled();
+    expect(checkboxes[1]).toBeDisabled();
+    unmountInternal();
+
+    // Stale admin closure downgraded to internal synchronously before unchecking is also blocked.
+    setTier('admin');
+    renderWithProviders(<ThreadSharePanel threadId="th-1" workspaceId="ws-1" />);
+    const adminBoxes = screen.getAllByRole('checkbox');
+    expect(adminBoxes[0]).toBeEnabled();
+    setTier('internal');
+    fireEvent.click(adminBoxes[0]);
+    expect(h.saveThreadSharing).not.toHaveBeenCalled();
+  });
+
+  it('shows stop-share button for internal/admin owner in FileHeaderActions when artifact.shared=false but a historical public monitor exists', async () => {
+    const openPublish = vi.fn();
+    const openUnshareOnly = vi.fn();
+    h.findArtifact.mockResolvedValue({
+      artifact_id: 'art-owner-legacy',
+      code: 'owner-code',
+      url: '/a/owner-code',
+      workspace_id: 'ws-1',
+      path: 'results/report.html',
+      name: 'report.html',
+      shared: false,
+      shared_at: null,
+      latest_seq: 2,
+      keep_updated: false,
+      bound_thread_id: null,
+      open_comments: 0,
+      unread: 0,
+      created_at: '2026-01-01T00:00:00Z',
+    });
+    h.getMonitorByArtifact.mockResolvedValue({
+      monitor_id: 'mon-owner-pub',
+      slug: 'owner-pub-mon',
+      artifact_id: 'art-owner-legacy',
+      workspace_id: 'ws-1',
+      title: 'Owner Public Monitor',
+      category: 'other',
+      visibility: 'public',
+      published_seq: 2,
+      keep_updated: false,
+      member_user_ids: [],
+    } as unknown as MonitorSummary);
+
+    renderWithProviders(
+      <FileHeaderActions
+        selectedFile="results/report.html"
+        isEditing={false}
+        workspaceId="ws-1"
+        fileContent="<html></html>"
+        fileMime="text/html"
+        canEdit={false}
+        onStartEdit={vi.fn()}
+        onOpenExportModal={vi.fn()}
+        triggerDownloadFn={vi.fn()}
+        canDownload={false}
+        readFileFullFn={vi.fn()}
+        access={{ kind: 'owner' }}
+        openPublish={openPublish}
+        openUnshareOnly={openUnshareOnly}
+        htmlSource={false}
+        onToggleHtmlSource={null}
+        editorRef={{ current: null }}
+        canUndo={false}
+        canRedo={false}
+        hasUnsavedChanges={false}
+        showDiff={false}
+        setShowDiff={vi.fn()}
+        isSaving={false}
+        saveError={null}
+        onSave={vi.fn()}
+        onCancelEdit={vi.fn()}
+      />,
+    );
+
+    const stopBtn = await screen.findByRole('button', { name: /Stop sharing|停止分享|Unshare/i });
+    fireEvent.click(stopBtn);
+    expect(openUnshareOnly).toHaveBeenCalledWith('results/report.html');
+  });
 });

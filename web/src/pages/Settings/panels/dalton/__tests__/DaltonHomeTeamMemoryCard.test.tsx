@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ApiError } from '@/api/client';
 import {
   DaltonHomeTeamMemoryCard,
   type UserTeamMemorySettings,
@@ -14,14 +15,20 @@ const h = vi.hoisted(() => ({
       data: UserTeamMemorySettings;
     }>
   >(),
+  revalidate: vi.fn(async () => undefined),
 }));
 
-vi.mock('@/api/client', () => ({
-  api: {
-    get: (...args: []) => h.get(...args),
-    put: (...args: [string, { home_team_memory_enabled: boolean }]) => h.put(...args),
-  },
-}));
+vi.mock('@/api/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/client')>();
+  return {
+    ...actual,
+    api: {
+      ...actual.api,
+      get: (...args: []) => h.get(...args),
+      put: (...args: [string, { home_team_memory_enabled: boolean }]) => h.put(...args),
+    },
+  };
+});
 
 vi.mock('@/config/daltonAuth', () => ({
   isDaltonAuth: true,
@@ -59,7 +66,7 @@ vi.mock('@/hooks/useCallerIdentity', () => ({
       ...snapshot,
       getLatestIdentity: () => snapshot,
       isConfirmingNow: () => false,
-      revalidate: vi.fn(async () => undefined),
+      revalidate: h.revalidate,
     };
   },
 }));
@@ -83,6 +90,7 @@ describe('DaltonHomeTeamMemoryCard', () => {
   beforeEach(() => {
     h.get.mockReset();
     h.put.mockReset();
+    h.revalidate.mockReset().mockResolvedValue(undefined);
   });
 
   it('renders switch (default off) and toggles via PUT /api/v1/dalton/user-settings', async () => {
@@ -159,5 +167,50 @@ describe('DaltonHomeTeamMemoryCard', () => {
       expect(screen.queryByTestId('dalton-home-team-memory-error')).not.toBeInTheDocument();
     });
     expect(screen.getByRole('switch')).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('shows server detail only on 403 errors and falls back to saveFailed on non-403 errors with detail', async () => {
+    h.get.mockResolvedValueOnce({
+      data: {
+        user_id: 'u-1',
+        home_team_memory_enabled: false,
+        can_edit: true,
+        caller_tier: 'internal',
+      },
+    });
+    h.put
+      .mockRejectedValueOnce(
+        new ApiError('Request failed with status code 422', 'ERR_BAD_REQUEST', {
+          status: 422,
+          statusText: 'Unprocessable Entity',
+          headers: {},
+          data: { detail: 'validation schema mismatch' },
+        }),
+      )
+      .mockRejectedValueOnce(
+        new ApiError('Request failed with status code 403', 'ERR_BAD_REQUEST', {
+          status: 403,
+          statusText: 'Forbidden',
+          headers: {},
+          data: { detail: { code: 'external_member_forbidden', message: '外部成员无法开启团队记忆' } },
+        }),
+      );
+
+    renderWithQueryClient();
+    const toggle = await screen.findByRole('switch');
+
+    fireEvent.click(toggle);
+    expect(await screen.findByTestId('dalton-home-team-memory-error')).toHaveTextContent(
+      'dalton.common.saveFailed',
+    );
+    expect(screen.queryByText('validation schema mismatch')).toBeNull();
+
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(screen.getByTestId('dalton-home-team-memory-error')).toHaveTextContent(
+        '外部成员无法开启团队记忆',
+      ),
+    );
+    expect(h.revalidate).toHaveBeenCalledTimes(1);
   });
 });

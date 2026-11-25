@@ -2,19 +2,26 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { ApiError } from '@/api/client';
 import { DaltonCosSharingCard, type UserCosSharingSettings } from '../DaltonCosSharingCard';
 
 const h = vi.hoisted(() => ({
   get: vi.fn<() => Promise<{ data: UserCosSharingSettings }>>(),
   put: vi.fn<(url: string, body: { cos_rw_enabled: boolean }) => Promise<{ data: UserCosSharingSettings }>>(),
+  revalidate: vi.fn(async () => undefined),
 }));
 
-vi.mock('@/api/client', () => ({
-  api: {
-    get: (...args: []) => h.get(...args),
-    put: (...args: [string, { cos_rw_enabled: boolean }]) => h.put(...args),
-  },
-}));
+vi.mock('@/api/client', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/api/client')>();
+  return {
+    ...actual,
+    api: {
+      ...actual.api,
+      get: (...args: []) => h.get(...args),
+      put: (...args: [string, { cos_rw_enabled: boolean }]) => h.put(...args),
+    },
+  };
+});
 
 vi.mock('@/config/daltonAuth', () => ({
   isDaltonAuth: true,
@@ -52,7 +59,7 @@ vi.mock('@/hooks/useCallerIdentity', () => ({
       ...snapshot,
       getLatestIdentity: () => snapshot,
       isConfirmingNow: () => false,
-      revalidate: vi.fn(async () => undefined),
+      revalidate: h.revalidate,
     };
   },
 }));
@@ -78,6 +85,7 @@ describe('DaltonCosSharingCard', () => {
   beforeEach(() => {
     h.get.mockReset();
     h.put.mockReset();
+    h.revalidate.mockReset().mockResolvedValue(undefined);
   });
 
   it('renders user-level sharing switch and 3-item trust notice for internal users, and toggles via PUT', async () => {
@@ -149,5 +157,51 @@ describe('DaltonCosSharingCard', () => {
     await waitFor(() =>
       expect(screen.queryByTestId('dalton-cos-sharing-card')).not.toBeInTheDocument(),
     );
+  });
+
+  it('shows server detail only on 403 errors and falls back to saveFailed on non-403 errors with detail', async () => {
+    h.get.mockResolvedValueOnce({
+      data: {
+        user_id: 'u-1',
+        cos_rw_enabled: false,
+        can_edit: true,
+        colleague_dispatch_enabled: true,
+        caller_tier: 'internal',
+      },
+    });
+    h.put
+      .mockRejectedValueOnce(
+        new ApiError('Request failed with status code 500', 'ERR_BAD_RESPONSE', {
+          status: 500,
+          statusText: 'Internal Server Error',
+          headers: {},
+          data: { detail: 'raw backend traceback' },
+        }),
+      )
+      .mockRejectedValueOnce(
+        new ApiError('Request failed with status code 403', 'ERR_BAD_REQUEST', {
+          status: 403,
+          statusText: 'Forbidden',
+          headers: {},
+          data: { detail: { code: 'external_member_forbidden', message: '外部成员无法修改研究总监共享' } },
+        }),
+      );
+
+    renderWithQueryClient();
+    const toggle = await screen.findByRole('switch');
+
+    fireEvent.click(toggle);
+    expect(await screen.findByTestId('dalton-cos-sharing-error')).toHaveTextContent(
+      'dalton.common.saveFailed',
+    );
+    expect(screen.queryByText('raw backend traceback')).toBeNull();
+
+    fireEvent.click(toggle);
+    await waitFor(() =>
+      expect(screen.getByTestId('dalton-cos-sharing-error')).toHaveTextContent(
+        '外部成员无法修改研究总监共享',
+      ),
+    );
+    expect(h.revalidate).toHaveBeenCalledTimes(1);
   });
 });

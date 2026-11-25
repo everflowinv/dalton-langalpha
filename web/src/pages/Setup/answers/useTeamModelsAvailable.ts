@@ -8,8 +8,24 @@ import { isDaltonAuth } from '@/config/daltonAuth';
 import type { DaltonDeploymentProfile } from '@/config/daltonSetup';
 import { AuthContext } from '@/contexts/AuthContext';
 import type { ConfiguredProvider } from '@/hooks/useConfiguredProviders';
+import * as teamCredentialsModule from '@/hooks/useTeamCredentials';
 import { queryKeys } from '@/lib/queryKeys';
 import type { AccountPolicy } from '@/types/api';
+
+function fetchCredentialsStatus(context?: { signal?: AbortSignal }) {
+  const mod = teamCredentialsModule as Partial<typeof teamCredentialsModule>;
+  if (
+    'fetchTeamCredentialsStatus' in mod &&
+    typeof mod.fetchTeamCredentialsStatus === 'function'
+  ) {
+    return mod.fetchTeamCredentialsStatus(context);
+  }
+  return api
+    .get<{ enabled?: boolean }>('/api/v1/dalton/credentials/status', {
+      signal: context?.signal,
+    })
+    .then((r) => r.data);
+}
 
 export interface TeamModelsAvailability {
   shared: boolean;
@@ -65,7 +81,7 @@ function useDaltonTeamModelsAvailableImpl(
 
   const creds = useQuery({
     queryKey: queryKeys.dalton.credentialsStatus(userId),
-    queryFn: async () => (await api.get<{ enabled?: boolean }>('/api/v1/dalton/credentials/status')).data,
+    queryFn: ({ signal }) => fetchCredentialsStatus({ signal }),
     enabled: active,
     staleTime: 5 * 60_000,
     retry: false,

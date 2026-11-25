@@ -3,6 +3,7 @@ import { fireEvent, screen, waitFor } from '@testing-library/react';
 import { ApiError } from '@/api/client';
 import { createTestQueryClient, renderWithProviders } from '@/test/utils';
 import { queryKeys } from '@/lib/queryKeys';
+import type { CallerIdentity, CallerIdentitySnapshot } from '@/hooks/useCallerIdentity';
 import {
   formatAccessLevelZh,
   WorkspaceSharingModal,
@@ -15,6 +16,27 @@ const WS_COLLEAGUE = '22222222-2222-4222-8222-222222222222';
 const WS_HOME = '99999999-9999-4999-8999-999999999999';
 
 const h = vi.hoisted(() => ({
+  identity: {
+    tier: 'admin',
+    status: 'ready',
+    authMode: 'local',
+    isPlatform: false,
+    isKnown: true,
+    isConfirming: false,
+    isMultiUserAuth: true,
+    isSingleUserOss: false,
+    isAdmin: true,
+    isInternal: true,
+    isExternal: false,
+    canActAsOwner: true,
+    canPublishPublic: true,
+    canInvite: true,
+    isTeamCredentialsShared: true,
+    canManageCredentials: true,
+    isPm: true,
+    colleagueSharingEnabled: true,
+  } as CallerIdentitySnapshot,
+  revalidate: vi.fn(async () => undefined),
   fetchWorkspaceSharing: vi.fn<(wsId: string) => Promise<WorkspaceSharingResponse>>(),
   updateWorkspaceSharing: vi.fn<
     (
@@ -29,6 +51,15 @@ const h = vi.hoisted(() => ({
       payload: { team_memory_enabled: boolean },
     ) => Promise<WorkspaceSettingsResponse>
   >(),
+}));
+
+vi.mock('@/hooks/useCallerIdentity', () => ({
+  useCallerIdentity: (): CallerIdentity => ({
+    ...h.identity,
+    getLatestIdentity: () => ({ ...h.identity }),
+    isConfirmingNow: () => h.identity.isConfirming,
+    revalidate: h.revalidate,
+  }),
 }));
 
 vi.mock('../../../utils/api/workspaces', async (importOriginal) => {
@@ -93,6 +124,26 @@ const STABLE_HOME_SHARING: WorkspaceSharingResponse = {
 describe('WorkspaceSharingModal', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    h.identity = {
+      tier: 'admin',
+      status: 'ready',
+      authMode: 'local',
+      isPlatform: false,
+      isKnown: true,
+      isConfirming: false,
+      isMultiUserAuth: true,
+      isSingleUserOss: false,
+      isAdmin: true,
+      isInternal: true,
+      isExternal: false,
+      canActAsOwner: true,
+      canPublishPublic: true,
+      canInvite: true,
+      isTeamCredentialsShared: true,
+      canManageCredentials: true,
+      isPm: true,
+      colleagueSharingEnabled: true,
+    };
     h.fetchWorkspaceSharing.mockResolvedValue(STABLE_OWN_SHARING);
     h.fetchWorkspaceSettings.mockResolvedValue(STABLE_OWN_SETTINGS);
   });
@@ -514,7 +565,7 @@ describe('WorkspaceSharingModal', () => {
     ).toEqual(updatedSettings);
   });
 
-  it('disables Team Memory switch while workspace settings are loading, omits Team Memory PUT if saved before loaded, and initializes draft when settings arrive', async () => {
+  it('withholds editable Team Memory switch while workspace settings are loading, omits Team Memory PUT if saved before loaded, and initializes draft when settings arrive', async () => {
     const { default: i18n } = await import('@/i18n');
     await i18n.changeLanguage('zh-CN');
     onTestFinished(async () => {
@@ -543,15 +594,8 @@ describe('WorkspaceSharingModal', () => {
 
     fireEvent.click(screen.getByTestId('workspace-sharing-button'));
 
-    const section = screen.getByTestId('workspace-team-memory-section');
-    expect(section).toHaveTextContent('正在加载设置…');
-    const toggle = screen.getByTestId('workspace-team-memory-switch');
-    expect(toggle).toBeDisabled();
-    expect(toggle).toHaveAttribute('aria-busy', 'true');
-
-    // Clicking disabled switch does nothing
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getByTestId('workspace-team-memory-loading')).toHaveTextContent('正在加载设置…');
+    expect(screen.queryByTestId('workspace-team-memory-switch')).toBeNull();
 
     // Saving while settings are still unloaded only submits sharing changes
     fireEvent.click(screen.getByTestId('sharing-web-ro'));
@@ -567,9 +611,9 @@ describe('WorkspaceSharingModal', () => {
       expect(screen.queryByRole('dialog')).toBeNull();
     });
 
-    // Reopen while still loading, then resolve settings with team_memory_enabled=true -> draft initializes to true
+    // Reopen while still loading, then resolve settings with team_memory_enabled=true -> switch appears with draft=true
     fireEvent.click(screen.getByTestId('workspace-sharing-button'));
-    expect(screen.getByTestId('workspace-team-memory-switch')).toBeDisabled();
+    expect(screen.queryByTestId('workspace-team-memory-switch')).toBeNull();
 
     resolveSettings({
       ...STABLE_OWN_SETTINGS,
@@ -696,5 +740,76 @@ describe('WorkspaceSharingModal', () => {
     fireEvent.click(screen.getByTestId('sharing-save-btn'));
 
     expect(await screen.findByText('外部成员无法修改此配置')).toBeInTheDocument();
+  });
+
+  it('keeps trigger and modal error/retry visible when only conversation_archive is enabled and settings load or identity revalidation fails', async () => {
+    h.fetchWorkspaceSettings
+      .mockRejectedValueOnce(new Error('settings unavailable'))
+      .mockResolvedValueOnce(STABLE_OWN_SETTINGS);
+
+    const client = createTestQueryClient();
+    client.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'core',
+      capabilities: ['conversation_archive'],
+      ticker_logos: false,
+    });
+
+    const { rerender } = renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, {
+      queryClient: client,
+    });
+
+    const trigger = await screen.findByTestId('workspace-sharing-button');
+    fireEvent.click(trigger);
+
+    expect(await screen.findByTestId('workspace-team-memory-error')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('workspace-team-memory-retry'));
+    expect(await screen.findByTestId('workspace-team-memory-switch')).toBeInTheDocument();
+
+    // If identity revalidation fails while the modal is open, the modal stays mounted with retry notice.
+    h.identity = {
+      ...h.identity,
+      tier: 'unknown',
+      status: 'error',
+      isKnown: false,
+      isConfirming: false,
+      isAdmin: false,
+      isInternal: false,
+      canActAsOwner: false,
+    };
+    rerender(<WorkspaceSharingModal workspaceId={WS_OWN} />);
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(screen.getByTestId('workspace-sharing-identity-error')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('workspace-sharing-identity-retry'));
+    expect(h.revalidate).toHaveBeenCalledTimes(1);
+  });
+
+  it('inspects all settled rejections on save, triggering revalidate and showing 403 detail even when the first rejection is 500', async () => {
+    h.updateWorkspaceSharing.mockRejectedValueOnce(new Error('500 Internal Server Error'));
+    h.updateWorkspaceSettings.mockRejectedValueOnce(
+      new ApiError('Request failed with status code 403', 'ERR_BAD_REQUEST', {
+        status: 403,
+        statusText: 'Forbidden',
+        headers: {},
+        data: {
+          detail: { code: 'external_member_forbidden', message: '外部成员无权修改团队记忆' },
+        },
+      }),
+    );
+
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.sharing(WS_OWN), STABLE_OWN_SHARING);
+    queryClient.setQueryData(queryKeys.dalton.workspaceSettings(WS_OWN), STABLE_OWN_SETTINGS);
+
+    renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, { queryClient });
+
+    fireEvent.click(screen.getByTestId('workspace-sharing-button'));
+    fireEvent.click(screen.getByTestId('sharing-web-rw'));
+    fireEvent.click(screen.getByTestId('workspace-team-memory-switch'));
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+
+    await waitFor(() => expect(h.revalidate).toHaveBeenCalledTimes(1));
+    expect(await screen.findByTestId('workspace-sharing-save-error')).toHaveTextContent(
+      '外部成员无权修改团队记忆',
+    );
   });
 });

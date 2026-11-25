@@ -264,6 +264,7 @@ export default function Automations() {
     manageSettled.current = false;
   }
 
+  // DALTON-HOOK(company-automations): hide company automation views from external members based on caller identity
   const manageOn = view === 'manage';
   // External members never see the company group. Wait for the tier before asking, so that
   // request is not sent and then hidden. A failed credentials read is the same: hide the group

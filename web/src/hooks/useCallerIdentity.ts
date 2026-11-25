@@ -293,7 +293,7 @@ export function resolveCallerIdentitySnapshot({
   const isAdmin = tier === 'admin';
   const isInternal = tier === 'admin' || tier === 'internal';
   const isExternal = tier === 'external';
-  const canInvite = isInternal && (data.can_invite !== undefined ? Boolean(data.can_invite) : true);
+  const canInvite = isInternal && Boolean(data.can_invite);
 
   return {
     tier,

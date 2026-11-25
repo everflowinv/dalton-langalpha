@@ -205,7 +205,7 @@ export function ThreadSharePanel({
     }
   }, [queryClient, threadId, identity, t]);
 
-  // DALTON-HOOK(external-share-guard): stopping a share sends `{ is_shared: false }` without `permissions`; starting/editing verifies latest identity synchronously
+  // DALTON-HOOK(external-share-guard): stopping a share sends `{ is_shared: false }` without `permissions`; starting/editing verifies latest identity synchronously and strips file permissions for non-admins
   const handleToggleShare = (enabled: boolean) => {
     if (!enabled) {
       return save({ is_shared: false });
@@ -214,7 +214,10 @@ export function ThreadSharePanel({
     if (latest.isConfirming || latest.status !== 'ready' || latest.isExternal || !latest.canActAsOwner) {
       return;
     }
-    const perms = shareState?.permissions || { allow_files: false, allow_download: false };
+    const rawPerms = shareState?.permissions || { allow_files: false, allow_download: false };
+    const perms = latest.isAdmin
+      ? rawPerms
+      : { ...rawPerms, allow_files: false, allow_download: false };
     const toMembers = standing.turnsOnToMembers;
     return save({ is_shared: true, permissions: toMembers ? { ...perms, audience: 'organization' } : perms });
   };
@@ -233,13 +236,16 @@ export function ThreadSharePanel({
     });
   };
 
-  // DALTON-HOOK(external-share-guard): verify latest identity synchronously before changing file permissions or copying links
+  // DALTON-HOOK(external-share-guard): verify latest admin identity synchronously before toggling file permissions
   const handlePermissionChange = (key: keyof ThreadSharePermissions, value: boolean) => {
     const latest = identity.getLatestIdentity();
-    if (latest.isConfirming || latest.status !== 'ready' || latest.isExternal || !latest.canActAsOwner) {
-      return;
-    }
-    if (value && !latest.isAdmin) {
+    if (
+      latest.isConfirming ||
+      latest.status !== 'ready' ||
+      latest.isExternal ||
+      !latest.canActAsOwner ||
+      !latest.isAdmin
+    ) {
       return;
     }
     const newPerms = { ...shareState?.permissions, [key]: value };
@@ -303,7 +309,9 @@ export function ThreadSharePanel({
   );
 
   const toggleDisabled = updating || lockedOut || (!isShared && isIdentityBlocked);
-  const canShowShareUrl = !isExternal && identity.status === 'ready' && identity.canActAsOwner;
+  // DALTON-HOOK(external-share-guard): hide share URL box while confirming or when caller lacks owner access
+  const canShowShareUrl =
+    !isExternal && identity.status === 'ready' && !identity.isConfirming && identity.canActAsOwner;
 
   return (
     <div className="p-4 space-y-3">
@@ -436,7 +444,7 @@ export function ThreadSharePanel({
                 type="checkbox"
                 checked={permissions.allow_files || false}
                 onChange={(e) => handlePermissionChange('allow_files', e.target.checked)}
-                disabled={updating || lockedOut || isIdentityBlocked || (!permissions.allow_files && !identity.isAdmin)}
+                disabled={updating || lockedOut || isIdentityBlocked || !identity.isAdmin}
                 className="rounded border-gray-300"
               />
               <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>
@@ -449,7 +457,7 @@ export function ThreadSharePanel({
                   type="checkbox"
                   checked={permissions.allow_download || false}
                   onChange={(e) => handlePermissionChange('allow_download', e.target.checked)}
-                  disabled={updating || lockedOut || isIdentityBlocked || (!permissions.allow_download && !identity.isAdmin)}
+                  disabled={updating || lockedOut || isIdentityBlocked || !identity.isAdmin}
                   className="rounded border-gray-300"
                 />
                 <span className="text-xs" style={{ color: 'var(--color-text-secondary)' }}>

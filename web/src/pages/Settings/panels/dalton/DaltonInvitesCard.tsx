@@ -126,6 +126,25 @@ export function DaltonInvitesCard({
     return null;
   }
 
+  const canWriteInvites =
+    identity.status === 'ready' && !identity.isConfirming && identity.canInvite;
+
+  const handleCreate = () => {
+    const latest = identity.getLatestIdentity();
+    if (latest.isConfirming || latest.status !== 'ready' || !latest.canInvite) {
+      return;
+    }
+    createMutation.mutate(canPickTier && latest.isAdmin ? selectedTier : undefined);
+  };
+
+  const handleRevoke = async (inviteId: string) => {
+    const latest = identity.getLatestIdentity();
+    if (latest.isConfirming || latest.status !== 'ready' || !latest.canInvite) {
+      return;
+    }
+    await revokeMutation.mutateAsync(inviteId);
+  };
+
   const invites = invitesQuery.data?.invites ?? [];
   const activeCount =
     invitesQuery.data?.active_count ??
@@ -183,7 +202,7 @@ export function DaltonInvitesCard({
               data-testid="dalton-invites-tier-select"
               value={selectedTier}
               onChange={(e) => setSelectedTier(e.target.value as DaltonInviteTier)}
-              disabled={createMutation.isPending}
+              disabled={createMutation.isPending || !canWriteInvites}
               className="h-9 md:h-8 max-w-full rounded-md border px-2 text-xs"
               style={{
                 backgroundColor: 'var(--color-bg-card)',
@@ -201,8 +220,8 @@ export function DaltonInvitesCard({
             variant="outline"
             size="sm"
             className="h-9 md:h-8 gap-1.5 text-xs"
-            disabled={createMutation.isPending}
-            onClick={() => createMutation.mutate(canPickTier ? selectedTier : undefined)}
+            disabled={createMutation.isPending || !canWriteInvites}
+            onClick={handleCreate}
             data-testid="dalton-invites-generate"
           >
             <UserPlus className="h-3.5 w-3.5" />
@@ -217,14 +236,14 @@ export function DaltonInvitesCard({
     >
       {createMutation.isError && (
         <DaltonInlineNotice tone="error">
-          {apiErrorDetail(createMutation.error) != null
+          {isForbiddenError(createMutation.error) && apiErrorDetail(createMutation.error) != null
             ? formatApiErrorDetail(createMutation.error)
             : t('dalton.common.saveFailed')}
         </DaltonInlineNotice>
       )}
       {revokeMutation.isError && (
         <DaltonInlineNotice tone="error">
-          {apiErrorDetail(revokeMutation.error) != null
+          {isForbiddenError(revokeMutation.error) && apiErrorDetail(revokeMutation.error) != null
             ? formatApiErrorDetail(revokeMutation.error)
             : t('dalton.common.saveFailed')}
         </DaltonInlineNotice>
@@ -324,9 +343,8 @@ export function DaltonInvitesCard({
                       confirmMessage={t('auth.invites.revokeConfirm')}
                       confirmLabel={t('auth.invites.revoke')}
                       busy={isRevoking}
-                      onConfirm={() =>
-                        revokeMutation.mutateAsync(item.invite_id).then(() => undefined)
-                      }
+                      disabled={!canWriteInvites}
+                      onConfirm={() => handleRevoke(item.invite_id)}
                       testId={`dalton-invite-revoke-${item.invite_id}`}
                     />
                   ) : undefined

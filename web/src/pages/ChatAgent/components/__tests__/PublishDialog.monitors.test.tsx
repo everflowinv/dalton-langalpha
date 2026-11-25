@@ -394,7 +394,7 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
     });
   });
 
-  it('non-admin opening an existing public monitor sees downgrade hint, and non-monitor shared file keeps Unshare button', async () => {
+  it('non-admin opening an existing public monitor must explicitly reselect visibility before updating, keeps Unshare visible, and non-monitor shared file keeps Unshare button', async () => {
     tierState.callerTier = 'internal';
     mockGetMonitor.mockResolvedValue({
       monitor_id: 'm-pub',
@@ -428,8 +428,19 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
       <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
     );
     expect(
-      await screen.findByText('You do not have public link permission; publishing will set visibility to Company.'),
+      await screen.findByText('This monitor currently uses a public link. Select a visibility scope before updating.'),
     ).toBeInTheDocument();
+    const updateBtn = screen.getByRole('button', { name: 'Update' });
+    expect(updateBtn).toBeDisabled();
+    // Normal mode also exposes Unshare for an existing public monitor.
+    expect(screen.getByRole('button', { name: 'Unshare' })).toBeEnabled();
+
+    // Explicitly selecting Company re-enables Update and submits company visibility.
+    await userEvent.click(screen.getByRole('button', { name: 'Company' }));
+    await waitFor(() => expect(updateBtn).toBeEnabled());
+    await userEvent.click(updateBtn);
+    await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(1));
+    expect(mockPublishMonitor.mock.calls[0][0]).toMatchObject({ visibility: 'company' });
     unmount();
 
     // Non-monitor shared legacy artifact keeps Unshare button
@@ -928,5 +939,163 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
         variant: 'destructive',
       }),
     );
+  });
+
+  it('fails closed when existing monitor query is pending or errors so external members cannot publish over an unknown monitor', async () => {
+    tierState.callerTier = 'external';
+    tierState.status = 'ready';
+    tierState.isConfirming = false;
+
+    let rejectMonitor!: (err: Error) => void;
+    mockGetMonitor
+      .mockImplementationOnce(
+        () =>
+          new Promise((_, reject) => {
+            rejectMonitor = reject;
+          }),
+      )
+      .mockResolvedValueOnce(null);
+
+    renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+
+    // While existingMonitorQuery is pending, Publish stays disabled.
+    const publishBtn = await screen.findByRole('button', { name: 'Publish' });
+    await waitFor(() => expect(mockGetMonitor).toHaveBeenCalledTimes(1));
+    expect(publishBtn).toBeDisabled();
+
+    // When existingMonitorQuery errors, Publish stays disabled and a retryable error banner shows.
+    act(() => {
+      rejectMonitor(new Error('monitor lookup failed'));
+    });
+    expect(await screen.findByText('Failed to load monitors')).toBeInTheDocument();
+    expect(publishBtn).toBeDisabled();
+
+    // Retrying and resolving null re-enables Publish.
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(publishBtn).toBeEnabled());
+  });
+
+  it('hides keep_updated for external members, forces keep_updated=false on publish, and blocks stale toggleKeep closures', async () => {
+    tierState.callerTier = 'external';
+    tierState.status = 'ready';
+    tierState.isConfirming = false;
+    mockEnsure.mockResolvedValue({ ...ARTIFACT, keep_updated: true });
+    mockGetMonitor.mockResolvedValue({
+      monitor_id: 'mon-own',
+      slug: 'own-slug',
+      artifact_id: ARTIFACT.artifact_id,
+      workspace_id: 'ws-1',
+      title: 'Own Monitor',
+      category: 'other',
+      visibility: 'own',
+      published_seq: 1,
+      keep_updated: true,
+      member_user_ids: [],
+    } as never);
+
+    const { unmount } = renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+
+    const updateBtn = await screen.findByRole('button', { name: 'Update' });
+    await waitFor(() => expect(updateBtn).toBeEnabled());
+    expect(screen.queryByRole('switch', { name: 'Auto-update when files change' })).toBeNull();
+
+    await userEvent.click(updateBtn);
+    await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(1));
+    expect(mockPublishMonitor.mock.calls[0][0]).toMatchObject({
+      visibility: 'own',
+      keep_updated: false,
+    });
+    unmount();
+
+    // Stale internal closure downgraded to external synchronously before click cannot toggle keep_updated.
+    tierState.callerTier = 'internal';
+    vi.mocked(updateMonitor).mockClear();
+    renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+    const keepSwitch = await screen.findByRole('switch', { name: 'Auto-update when files change' });
+    await waitFor(() => expect(keepSwitch).toBeEnabled());
+
+    tierState.callerTier = 'external';
+    fireEvent.click(keepSwitch);
+    expect(updateMonitor).not.toHaveBeenCalled();
+  });
+
+  it('hides selectable link box during isConfirming, keeps normal-mode Unshare clickable, and prevents footer monitor link click on stale identity', async () => {
+    tierState.callerTier = 'internal';
+    tierState.status = 'ready';
+    tierState.isConfirming = true;
+    mockGetMonitor.mockResolvedValue({
+      monitor_id: 'mon-pub',
+      slug: 'pub-slug',
+      artifact_id: ARTIFACT.artifact_id,
+      workspace_id: 'ws-1',
+      title: 'Public Monitor',
+      category: 'other',
+      visibility: 'public',
+      published_seq: 1,
+      keep_updated: false,
+      member_user_ids: [],
+    } as never);
+    mockUnshare.mockResolvedValue({ ...ARTIFACT, shared: false, latest_seq: 1 });
+
+    const { rerender } = renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+
+    const unshareBtn = await screen.findByRole('button', { name: 'Unshare' });
+    expect(unshareBtn).toBeEnabled();
+    expect(screen.queryByRole('button', { name: /^Copy$/i })).toBeNull();
+    expect(screen.queryByText(/\/m\/pub-slug/)).toBeNull();
+    expect(screen.queryByRole('link')).toBeNull();
+
+    await userEvent.click(unshareBtn);
+    await waitFor(() => expect(mockUnshare).toHaveBeenCalledWith(ARTIFACT.artifact_id));
+
+    // When settled, footer link renders; if identity flips to confirming before click, click is prevented.
+    tierState.isConfirming = false;
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    const footerLink = await screen.findByRole('link', { name: /Open in new window/i });
+    tierState.isConfirming = true;
+    const clickEvent = new MouseEvent('click', { bubbles: true, cancelable: true });
+    footerLink.dispatchEvent(clickEvent);
+    expect(clickEvent.defaultPrevented).toBe(true);
+  });
+
+  it('FilePanel treats isConfirming with status=ready as unknown tier, hiding owner publish while keeping stop-share for public monitors', async () => {
+    tierState.callerTier = 'admin';
+    tierState.status = 'ready';
+    tierState.isConfirming = true;
+    mockFind.mockResolvedValue({ ...ARTIFACT, shared: false });
+    mockGetMonitor.mockResolvedValue({
+      monitor_id: 'mon-pub',
+      slug: 'pub-slug',
+      artifact_id: ARTIFACT.artifact_id,
+      workspace_id: 'ws-1',
+      title: 'Public Monitor',
+      category: 'other',
+      visibility: 'public',
+      published_seq: 1,
+      keep_updated: false,
+      member_user_ids: [],
+    } as never);
+
+    renderWithProviders(
+      <FilePanel
+        workspaceId="ws-1"
+        onClose={() => {}}
+        files={['results/report.html']}
+        target={fileTarget('results/report.html', {}, 1)}
+        onTargetHandled={() => {}}
+      />,
+    );
+
+    const stopBtn = await screen.findByRole('button', { name: /Stop sharing|Unshare/i });
+    expect(stopBtn).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Publish' })).toBeNull();
   });
 });
