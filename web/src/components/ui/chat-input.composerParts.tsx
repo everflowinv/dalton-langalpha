@@ -271,7 +271,8 @@ export function VoiceButton({
         disabled={disabled}
         tabIndex={hidden ? -1 : undefined}
         className={cn(
-          'press mic-button inline-flex flex-none items-center justify-center h-8 w-8 rounded-xl',
+          // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on voice icon button
+          'tap-target press mic-button inline-flex flex-none items-center justify-center h-8 w-8 rounded-xl',
           listening ? 'recording' : 'text-(--color-icon-muted) hover:text-(--color-text-muted) hover:bg-foreground/5',
         )}
         type="button"
@@ -346,7 +347,8 @@ export function SendStopButton({
       // controls too; change that row padding and remeasure. The open styles
       // keep it centred.
       className={cn(
-        'send-button press grid place-items-center h-8 w-8 flex-none rounded-[var(--cs-composer-send-radius,0.5rem)] [align-self:var(--cs-composer-send-align,end)] [translate:var(--cs-composer-send-shift,5px_1px)]',
+        // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on send/stop icon button
+        'tap-target send-button press grid place-items-center h-8 w-8 flex-none rounded-[var(--cs-composer-send-radius,0.5rem)] [align-self:var(--cs-composer-send-align,end)] [translate:var(--cs-composer-send-shift,5px_1px)]',
         stopMode ? 'disabled:cursor-not-allowed' : 'disabled:cursor-default',
       )}
       title={stopMode ? stopLabel : undefined}
@@ -413,7 +415,8 @@ export function ToolbarOverflowMenu({
       <DropdownMenuTrigger asChild>
         <button
           ref={triggerRef}
-          className="relative inline-flex flex-none items-center justify-center h-8 w-8 rounded-lg transition-colors text-(--color-icon-muted) hover:text-(--color-text-muted) hover:bg-foreground/5 data-[state=open]:bg-foreground/5 data-[state=open]:text-(--color-text-muted)"
+          // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on composer overflow button
+          className="tap-target relative inline-flex flex-none items-center justify-center h-8 w-8 rounded-lg transition-colors text-(--color-icon-muted) hover:text-(--color-text-muted) hover:bg-foreground/5 data-[state=open]:bg-foreground/5 data-[state=open]:text-(--color-text-muted)"
           onClick={(e) => e.stopPropagation()}
           type="button"
           title={t('chat.moreTools', { defaultValue: 'More tools' })}

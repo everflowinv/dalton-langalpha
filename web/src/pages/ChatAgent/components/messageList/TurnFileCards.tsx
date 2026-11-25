@@ -191,7 +191,8 @@ export function TurnFileCards({ files, entering = false, onOpenFile, onDownloadF
                       <DropdownMenuTrigger asChild>
                         <button
                           type="button"
-                          className="turn-file-more"
+                          // DALTON-HOOK(mobile-web): expand file card overflow trigger touch target on coarse pointers
+                          className="turn-file-more tap-target"
                           aria-label={t('chat.turnFiles.moreActions')}
                         >
                           <ChevronDown className="h-3.5 w-3.5" />
