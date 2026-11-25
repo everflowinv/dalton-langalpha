@@ -565,6 +565,7 @@ export class FakeChannelAdapter implements ChannelAdapter {
     accountId: string;
     reason: string;
     activeBotGeneration?: number;
+    includeSameGeneration?: boolean;
   }) => void;
 
   onWeixinAccountInvalidated(
@@ -572,6 +573,7 @@ export class FakeChannelAdapter implements ChannelAdapter {
       accountId: string;
       reason: string;
       activeBotGeneration?: number;
+      includeSameGeneration?: boolean;
     }) => void,
   ): void {
     this.weixinAccountInvalidatedHandler = handler;
@@ -581,6 +583,7 @@ export class FakeChannelAdapter implements ChannelAdapter {
     accountId: string;
     reason: string;
     activeBotGeneration?: number;
+    includeSameGeneration?: boolean;
   }): void {
     this.weixinAccountInvalidatedHandler?.(info);
   }

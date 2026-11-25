@@ -427,6 +427,7 @@ export interface ChannelAdapter {
       accountId: string;
       reason: string;
       activeBotGeneration?: number;
+      includeSameGeneration?: boolean;
     }) => void,
   ): void;
   hasAppliedStartupSnapshot?(): boolean;

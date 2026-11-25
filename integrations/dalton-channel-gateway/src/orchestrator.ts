@@ -420,32 +420,41 @@ export class ChannelGatewayOrchestrator {
         await this.handleNativeInteraction(event);
       });
       adapter.onWeixinAccountInvalidated?.(
-        ({ accountId, activeBotGeneration }) => {
-          this.cancelInboundUploadsForAccount(accountId, activeBotGeneration);
+        ({ accountId, activeBotGeneration, includeSameGeneration }) => {
+          this.cancelInboundUploadsForAccount(accountId, activeBotGeneration, {
+            includeSameGeneration,
+          });
         },
       );
     }
   }
 
   /**
-   * R6 #2 & R7 #1: Cancels in-flight Weixin inbound attachment tasks for an account.
+   * R6 #2, R7 #1 & R9 #2: Cancels in-flight Weixin inbound attachment tasks for an account.
    * Only driven by authoritative snapshot application:
-   * - When `activeBotGeneration` is provided (rotation/credentials change), only strictly older
-   *   generations (`botGeneration < activeBotGeneration`) are aborted.
+   * - When `activeBotGeneration` is provided for a generation bump (`includeSameGeneration !== true`),
+   *   only strictly older generations (`botGeneration < activeBotGeneration`) are aborted.
+   * - When `includeSameGeneration === true` (same-generation credential rotation), all tasks started
+   *   prior to the switch with `botGeneration <= activeBotGeneration` are aborted so a task whose
+   *   final I-7 returns after new credentials are installed still throws `superseded`.
    * - When `activeBotGeneration` is omitted (account removed/disabled), all tasks for the account are aborted.
    */
   cancelInboundUploadsForAccount(
     accountId: string | null | undefined,
     activeBotGeneration?: number,
+    options?: { includeSameGeneration?: boolean },
   ): void {
     const cleanAccountId = accountId?.trim();
     if (!cleanAccountId) return;
+    const includeSameGen = options?.includeSameGeneration === true;
     for (const [ctrl, meta] of [...this.activeInboundUploadControllers.entries()]) {
       if (meta.accountId !== cleanAccountId) continue;
       if (
         typeof activeBotGeneration === "number" &&
         typeof meta.botGeneration === "number" &&
-        meta.botGeneration >= activeBotGeneration
+        (includeSameGen
+          ? meta.botGeneration > activeBotGeneration
+          : meta.botGeneration >= activeBotGeneration)
       ) {
         continue;
       }

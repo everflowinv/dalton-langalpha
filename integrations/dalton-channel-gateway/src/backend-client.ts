@@ -1129,10 +1129,51 @@ export interface WorkspaceUploadWeixinContext {
   weixinBotGeneration?: number | null;
 }
 
+const WEIXIN_ACCOUNT_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const ISO_8601_TIMESTAMP_RE =
+  /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|([+-]\d{2}):?(\d{2}))?$/i;
+
+function isValidIso8601Timestamp(v: unknown): v is string {
+  if (typeof v !== "string") return false;
+  const trimmed = v.trim();
+  if (trimmed.length === 0 || trimmed !== v) return false;
+  const match = ISO_8601_TIMESTAMP_RE.exec(v);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6]);
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hour > 23 ||
+    minute > 59 ||
+    second > 59
+  ) {
+    return false;
+  }
+  const utcDate = new Date(Date.UTC(year, month - 1, day));
+  if (
+    utcDate.getUTCFullYear() !== year ||
+    utcDate.getUTCMonth() !== month - 1 ||
+    utcDate.getUTCDate() !== day
+  ) {
+    return false;
+  }
+  return !Number.isNaN(Date.parse(v));
+}
+
 /**
  * Validates required fields of a `POST /internal/weixin/accounts/reconcile` response
- * (contract §2.1 / R6 #4 / R7 #5). Rejects empty objects, missing top-level fields
- * (including `allow_external`), non-array `accounts`, and malformed account entries.
+ * (contract §2.1 / R6 #4 / R7 #5 / R8 #5 / R9 #3). Rejects empty objects, missing top-level
+ * fields (including `allow_external`), non-array `accounts`, and any account entry missing
+ * required keys or violating UUID / ISO-8601 / enum constraints.
  */
 export function isValidWeixinAccountsReconcileResponse(
   val: unknown,
@@ -1166,6 +1207,8 @@ export function isValidWeixinAccountsReconcileResponse(
   }
   const isNullableString = (v: unknown): boolean =>
     v === null || typeof v === "string";
+  const isNullableIsoTimestamp = (v: unknown): boolean =>
+    v === null || isValidIso8601Timestamp(v);
   for (const item of rec.accounts) {
     if (!item || typeof item !== "object" || Array.isArray(item)) {
       return false;
@@ -1173,13 +1216,17 @@ export function isValidWeixinAccountsReconcileResponse(
     const acc = item as Record<string, unknown>;
     if (
       typeof acc.account_id !== "string" ||
-      acc.account_id.trim().length === 0 ||
+      !WEIXIN_ACCOUNT_UUID_RE.test(acc.account_id) ||
       typeof acc.user_id !== "string" ||
       acc.user_id.trim().length === 0 ||
       typeof acc.ilink_bot_id !== "string" ||
       acc.ilink_bot_id.trim().length === 0 ||
       !("ilink_user_id" in acc) ||
       !isNullableString(acc.ilink_user_id) ||
+      !("prev_ilink_user_id" in acc) ||
+      !isNullableString(acc.prev_ilink_user_id) ||
+      !("ilink_username" in acc) ||
+      !isNullableString(acc.ilink_username) ||
       typeof acc.bot_token !== "string" ||
       acc.bot_token.trim().length === 0 ||
       typeof acc.base_url !== "string" ||
@@ -1190,29 +1237,12 @@ export function isValidWeixinAccountsReconcileResponse(
       (acc.status !== "active" && acc.status !== "pending_verification") ||
       typeof acc.bot_generation !== "number" ||
       !Number.isInteger(acc.bot_generation) ||
-      acc.bot_generation < 0
+      acc.bot_generation < 0 ||
+      !("last_inbound_at" in acc) ||
+      !isNullableIsoTimestamp(acc.last_inbound_at) ||
+      !("updated_at" in acc) ||
+      !isNullableIsoTimestamp(acc.updated_at)
     ) {
-      return false;
-    }
-    if (
-      acc.prev_ilink_user_id !== undefined &&
-      !isNullableString(acc.prev_ilink_user_id)
-    ) {
-      return false;
-    }
-    if (
-      acc.ilink_username !== undefined &&
-      !isNullableString(acc.ilink_username)
-    ) {
-      return false;
-    }
-    if (
-      acc.last_inbound_at !== undefined &&
-      !isNullableString(acc.last_inbound_at)
-    ) {
-      return false;
-    }
-    if (acc.updated_at !== undefined && !isNullableString(acc.updated_at)) {
       return false;
     }
   }

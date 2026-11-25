@@ -165,6 +165,46 @@ function isPollableAccountStatus(status: string): boolean {
   return status === "active" || status === "pending_verification";
 }
 
+/**
+ * R9 #2 (Codex High #2): Synchronously normalizes an iLink `base_url` using the
+ * same URL parsing (lowercased scheme & hostname, stripped trailing slashes) and
+ * domain allowlist validation as `resolveSafeBaseUrl`, so Phase 1 and Phase 2
+ * credential comparisons agree even when a snapshot `base_url` differs only by
+ * hostname casing (e.g. `HTTPS://ILINKAI.WEIXIN.QQ.COM`).
+ */
+export function normalizeBaseUrlForCompare(
+  candidateUrl: string | undefined | null,
+  defaultBaseUrl: string = ILINK_DEFAULT_BASE_URL,
+  allowedDomains?: readonly string[],
+): string {
+  const normalizeFallback = (): string => {
+    try {
+      return normalizeAndValidateIlinkBaseUrl(defaultBaseUrl, allowedDomains);
+    } catch {
+      try {
+        return new URL((defaultBaseUrl || ILINK_DEFAULT_BASE_URL).trim())
+          .toString()
+          .replace(/\/+$/, "");
+      } catch {
+        return (defaultBaseUrl || ILINK_DEFAULT_BASE_URL)
+          .trim()
+          .replace(/\/+$/, "")
+          .toLowerCase();
+      }
+    }
+  };
+  const raw = candidateUrl?.trim();
+  if (!raw) {
+    return normalizeFallback();
+  }
+  const withScheme = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+  try {
+    return normalizeAndValidateIlinkBaseUrl(withScheme, allowedDomains);
+  } catch {
+    return normalizeFallback();
+  }
+}
+
 export class WeixinChannelAdapter implements ChannelAdapter {
   readonly platform = "weixin" as const;
   readonly maxChunkChars = WEIXIN_MAX_CHUNK_CHARS;
@@ -212,11 +252,14 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         accountId: string;
         reason: string;
         activeBotGeneration?: number;
+        includeSameGeneration?: boolean;
       }) => void)
     | null = null;
 
   private started = false;
   private hasAppliedSnapshot = false;
+  private backendGeneration = 0;
+  private backendReconcileAbortController = new AbortController();
   private backendEnabled = true;
   private backendNotFound404 = false;
   private lastRevision: number | null = null;
@@ -303,10 +346,17 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     const backendChanged = this.backend !== backend;
     this.backend = backend;
     if (backendChanged) {
-      // R8 #6 (Codex Medium #6): Attaching a backend to a standalone adapter (or switching backends)
-      // invalidates any prior snapshot; the adapter MUST fetch a real backend reconcile snapshot before ready.
+      // R8 #6 & R9 #4 (Codex Medium #4): Attaching or switching a backend invalidates any prior
+      // snapshot and bumps `backendGeneration` so an in-flight reconcile from the old backend
+      // is aborted/discarded and can NEVER mark `hasAppliedSnapshot = true`.
+      this.backendGeneration += 1;
       this.hasAppliedSnapshot = false;
       this.lastRevision = null;
+      this.backendReconcileAbortController.abort();
+      this.backendReconcileAbortController = new AbortController();
+      if (this.reconcileInFlight) {
+        this.reconcilePending = true;
+      }
     }
     this.initQrManager(backend);
   }
@@ -333,6 +383,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       accountId: string;
       reason: string;
       activeBotGeneration?: number;
+      includeSameGeneration?: boolean;
     }) => void,
   ): void {
     this.accountInvalidatedHandler = handler;
@@ -791,6 +842,16 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     }
   }
 
+  private normalizeBaseUrlSync(
+    candidateUrl: string | undefined | null,
+  ): string {
+    return normalizeBaseUrlForCompare(
+      candidateUrl,
+      this.opts.baseUrl || ILINK_DEFAULT_BASE_URL,
+      this.opts.allowedApiDomains,
+    );
+  }
+
   private async resolveSafeBaseUrl(
     candidateUrl: string | undefined | null,
   ): Promise<string> {
@@ -907,6 +968,13 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         }
       },
       onSessionExpired: async () => {
+        if (this.backend) {
+          // R9 #1 (Codex High #1, Grok High #1): In backend mode, NEVER mutate local
+          // `current.status = "expired"` or call `accountInvalidatedHandler` before snapshot
+          // confirmation; only trigger accounts sync so the authoritative snapshot decides.
+          void this.triggerAccountsSync(undefined, "monitor_session_expired");
+          return;
+        }
         const current = this.accounts.get(capturedAccountId);
         if (
           current &&
@@ -914,12 +982,10 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           current.ilinkBotId === capturedBotId
         ) {
           current.status = "expired";
-          if (!this.backend) {
-            this.accountInvalidatedHandler?.({
-              accountId: capturedAccountId,
-              reason: "session_expired",
-            });
-          }
+          this.accountInvalidatedHandler?.({
+            accountId: capturedAccountId,
+            reason: "session_expired",
+          });
         }
       },
       onRateLimited: (err) =>
@@ -1016,15 +1082,45 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     reason: string,
     options?: { startMonitors?: boolean; throwOnFailure?: boolean },
   ): Promise<void> {
-    if (!this.backend) return;
+    const expectedBackend = this.backend;
+    if (!expectedBackend) return;
+    const expectedBackendGen = this.backendGeneration;
+    const expectedBackendSignal = this.backendReconcileAbortController.signal;
+    const isCurrentBackend = (): boolean =>
+      this.backend === expectedBackend &&
+      this.backendGeneration === expectedBackendGen;
+
+    const passAbortController = new AbortController();
+    const onAbort = () => passAbortController.abort();
+    const shutdownSignal = this.reconcileAbortController?.signal;
+    if (shutdownSignal?.aborted || expectedBackendSignal.aborted) {
+      passAbortController.abort();
+    } else {
+      shutdownSignal?.addEventListener("abort", onAbort, { once: true });
+      expectedBackendSignal.addEventListener("abort", onAbort, { once: true });
+    }
+
     try {
-      const resp = await this.backend.reconcileWeixinAccounts(
+      const resp = await expectedBackend.reconcileWeixinAccounts(
         this.lastRevision,
-        { signal: this.reconcileAbortController?.signal },
+        { signal: passAbortController.signal },
       );
+      if (!isCurrentBackend()) {
+        return;
+      }
       if (!isValidWeixinAccountsReconcileResponse(resp)) {
         throw new BackendHttpError(
           "Weixin accounts reconcile returned an invalid snapshot payload",
+          502,
+          { code: "invalid_reconcile_snapshot" },
+        );
+      }
+      // R8 #6 & R9 #4 (Codex Medium #4): An initial reconcile (no prior local revision) MUST NOT
+      // accept `changed: false` as a real snapshot — even when `enabled: false` — so startup
+      // retries for a full authoritative snapshot before marking `hasAppliedSnapshot = true`.
+      if (!resp.changed && this.lastRevision === null) {
+        throw new BackendHttpError(
+          "Weixin initial reconcile returned changed=false without a prior snapshot",
           502,
           { code: "invalid_reconcile_snapshot" },
         );
@@ -1064,9 +1160,15 @@ export class WeixinChannelAdapter implements ChannelAdapter {
             });
           }
           await this.stopAllAccountMonitors();
+          if (!isCurrentBackend()) {
+            return;
+          }
           this.accounts.clear();
           this.typingTicketCache.clear();
           this.typingSeqByUser.clear();
+        }
+        if (!isCurrentBackend()) {
+          return;
         }
         this.hasAppliedSnapshot = true;
         return;
@@ -1074,15 +1176,6 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
       this.backendEnabled = true;
       if (!resp.changed) {
-        // R8 #6 (Codex Medium #6): An initial reconcile (no prior local revision) MUST NOT
-        // accept `changed: false` as a real snapshot; fail so startup retries for a full snapshot.
-        if (this.lastRevision === null) {
-          throw new BackendHttpError(
-            "Weixin initial reconcile returned changed=false without a prior snapshot",
-            502,
-            { code: "invalid_reconcile_snapshot" },
-          );
-        }
         this.hasAppliedSnapshot = true;
         // Decision #12: self-heal any pollable monitor whose coroutine exited
         // (e.g. after a transient lease dip) even when accounts_revision did not change.
@@ -1094,9 +1187,16 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
       await this.applyAccountSnapshots(resp.accounts ?? [], {
         startMonitors: options?.startMonitors,
+        isCurrentBackend,
       });
+      if (!isCurrentBackend()) {
+        return;
+      }
       this.lastRevision = resp.accounts_revision;
     } catch (err) {
+      if (!isCurrentBackend()) {
+        return;
+      }
       if (isStaleGatewayEpochError(err)) {
         this.abortAllInFlight();
         this.leaseManager?.notifyLeaseLost("reconcile_stale_epoch", err);
@@ -1126,6 +1226,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           });
         }
         await this.stopAllAccountMonitors();
+        if (!isCurrentBackend()) {
+          return;
+        }
         this.accounts.clear();
         this.typingTicketCache.clear();
         this.typingSeqByUser.clear();
@@ -1145,6 +1248,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         reason,
         ...extractSafeLogErrorFields(err),
       });
+    } finally {
+      shutdownSignal?.removeEventListener("abort", onAbort);
+      expectedBackendSignal.removeEventListener("abort", onAbort);
     }
   }
 
@@ -1180,8 +1286,10 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
   private async applyAccountSnapshots(
     snapshots: readonly WeixinAccountSnapshot[],
-    options?: { startMonitors?: boolean },
+    options?: { startMonitors?: boolean; isCurrentBackend?: () => boolean },
   ): Promise<void> {
+    const isCurrentBackend = options?.isCurrentBackend ?? (() => true);
+    if (!isCurrentBackend()) return;
     const startMonitors = options?.startMonitors !== false && this.started;
     const pollableRaw = snapshots.filter(
       (s) =>
@@ -1205,7 +1313,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     const desiredIds = new Set(pollable.map((s) => s.account_id));
 
     // =========================================================================
-    // Phase 1 (100% SYNCHRONOUS, BEFORE ANY `await`): R8 #2 (Codex High #2)
+    // Phase 1 (100% SYNCHRONOUS, BEFORE ANY `await`): R8 #2 & R9 #2
     // Compute the full snapshot diff upfront and immediately invalidate EVERY
     // removed AND rotated account in the snapshot so a hung monitor on account A
     // can never delay invalidation of account B.
@@ -1224,29 +1332,26 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     }
 
     const preInvalidatedRotatedIds = new Set<string>();
-    const defaultBaseTrimmed = (
-      this.opts.baseUrl || ILINK_DEFAULT_BASE_URL
-    )
-      .trim()
-      .replace(/\/+$/, "");
     for (const snap of pollable) {
       const existing = this.accounts.get(snap.account_id);
       if (!existing) continue;
-      const prelimBase = (snap.base_url?.trim() || defaultBaseTrimmed)
-        .trim()
-        .replace(/\/+$/, "");
-      const existingBase = existing.baseUrl.trim().replace(/\/+$/, "");
+      // R9 #2 (Codex High #2): Use identical URL normalization in Phase 1 and Phase 2
+      // so hostname case differences (e.g. `HTTPS://ILINKAI.WEIXIN.QQ.COM`) never trigger false invalidation.
+      const prelimBase = this.normalizeBaseUrlSync(snap.base_url);
+      const existingBase = this.normalizeBaseUrlSync(existing.baseUrl);
       const syncCredsChanged =
         existing.ilinkBotId !== snap.ilink_bot_id ||
         existing.botGeneration !== snap.bot_generation ||
         existing.botToken !== snap.bot_token ||
         existingBase !== prelimBase;
       if (syncCredsChanged) {
+        const isSameGenCredChange =
+          snap.bot_generation <= existing.botGeneration;
         existing.latestSnapshotGeneration = Math.max(
           existing.latestSnapshotGeneration,
           snap.bot_generation,
         );
-        if (snap.bot_generation <= existing.botGeneration) {
+        if (isSameGenCredChange) {
           existing.credentialsInvalidated = true;
         }
         this.abortAccountInFlight(snap.account_id);
@@ -1254,6 +1359,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           accountId: snap.account_id,
           reason: "generation_or_credentials_changed",
           activeBotGeneration: snap.bot_generation,
+          includeSameGeneration: isSameGenCredChange,
         });
         preInvalidatedRotatedIds.add(snap.account_id);
       }
@@ -1265,6 +1371,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     // =========================================================================
     for (const [accountId, existing] of removedEntries) {
       await this.stopAccountMonitor(existing);
+      if (!isCurrentBackend()) return;
       this.accounts.delete(accountId);
       this.clearTypingCacheForAccount(accountId);
     }
@@ -1273,7 +1380,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     for (const snap of pollable) {
       if (startMonitors && !this.started) return;
       if (this.reconcileAbortController?.signal.aborted) return;
+      if (!isCurrentBackend()) return;
       const safeBaseUrl = await this.resolveSafeBaseUrl(snap.base_url);
+      if (!isCurrentBackend()) return;
       const cdnBaseUrl = (
         snap.cdn_base_url ||
         this.opts.cdnBaseUrl ||
@@ -1287,15 +1396,18 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           existing.ilinkBotId !== snap.ilink_bot_id ||
           existing.botGeneration !== snap.bot_generation ||
           existing.botToken !== snap.bot_token ||
-          existing.baseUrl !== safeBaseUrl;
+          this.normalizeBaseUrlSync(existing.baseUrl) !==
+            this.normalizeBaseUrlSync(safeBaseUrl);
 
         if (credentialsChanged) {
           if (!preInvalidatedRotatedIds.has(snap.account_id)) {
+            const isSameGenCredChange =
+              snap.bot_generation <= existing.botGeneration;
             existing.latestSnapshotGeneration = Math.max(
               existing.latestSnapshotGeneration,
               snap.bot_generation,
             );
-            if (snap.bot_generation <= existing.botGeneration) {
+            if (isSameGenCredChange) {
               existing.credentialsInvalidated = true;
             }
             this.abortAccountInFlight(snap.account_id);
@@ -1303,9 +1415,11 @@ export class WeixinChannelAdapter implements ChannelAdapter {
               accountId: snap.account_id,
               reason: "generation_or_credentials_changed",
               activeBotGeneration: snap.bot_generation,
+              includeSameGeneration: isSameGenCredChange,
             });
           }
           await this.stopAccountMonitor(existing);
+          if (!isCurrentBackend()) return;
           this.clearTypingCacheForAccount(snap.account_id);
           existing.userId = snap.user_id;
           existing.ilinkBotId = snap.ilink_bot_id;
@@ -1357,6 +1471,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       }
     }
 
+    if (!isCurrentBackend()) return;
     // R7 #5 (Codex Medium #4): Only mark snapshot applied AFTER the full snapshot diff succeeds.
     this.hasAppliedSnapshot = true;
 

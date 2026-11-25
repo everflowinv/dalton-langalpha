@@ -8,6 +8,7 @@ import {
 } from "../../gateway-lease.js";
 import {
   createSubsystemLogger,
+  extractSafeLogErrorFields,
   type SubsystemLogger,
 } from "../../shared/logger.js";
 import type { HostIpResolver } from "../../shared/safe-fetch.js";
@@ -209,23 +210,32 @@ export class WeixinMonitor {
     return "stopped";
   }
 
-  private async markExpiredInBackend(err: WeixinApiError): Promise<void> {
+  private async markExpiredInBackend(err: WeixinApiError): Promise<boolean> {
     const { backend, accountId, botGeneration, ilinkBotId } = this.opts;
     try {
-      await backend.updateWeixinAccountStatus(accountId, {
+      const res = await backend.updateWeixinAccountStatus(accountId, {
         action: "mark_session_expired",
         expected_bot_generation: botGeneration,
         expected_ilink_bot_id: ilinkBotId,
         error_code: String(err.errcode ?? err.ret ?? -14),
       });
+      return res?.ok !== false;
     } catch (statusErr) {
       if (isStaleGatewayEpochError(statusErr)) {
         this.opts.onStaleEpoch?.(statusErr);
         throw statusErr;
       }
-      // Best-effort persistence on -14; adapter also pauses local state.
+      this.logger.warn(
+        "Failed to report Weixin session expiry (-14) to backend; triggering sync and retrying poll",
+        {
+          account_id: accountId,
+          ilink_bot_id: ilinkBotId,
+          bot_generation: botGeneration,
+          ...extractSafeLogErrorFields(statusErr),
+        },
+      );
+      return false;
     }
-    await this.opts.onSessionExpired?.(err);
   }
 
   private async runLoop(): Promise<void> {
@@ -379,14 +389,28 @@ export class WeixinMonitor {
 
         if (err instanceof WeixinApiError) {
           if (err.kind === "session_expired") {
+            let reported = false;
             try {
-              await this.markExpiredInBackend(err);
+              reported = await this.markExpiredInBackend(err);
             } catch (statusErr) {
               if (isStaleGatewayEpochError(statusErr)) {
                 break;
               }
             }
-            break;
+            await this.opts.onSessionExpired?.(err);
+            if (reported) {
+              break;
+            }
+            // R9 #1 (Codex High #1, Grok High #1): If reporting -14 to backend failed (e.g. 503),
+            // do NOT permanently exit the poll loop; back off and retry while snapshot sync runs.
+            consecutiveFailures += 1;
+            const backoffMs = Math.min(
+              baseRetryMs * Math.pow(2, Math.min(consecutiveFailures - 1, 4)),
+              MAX_RETRY_DELAY_MS,
+            );
+            const ok = await sleepWithAbort(backoffMs, signal);
+            if (!ok) break;
+            continue;
           }
           if (err.kind === "rate_limited") {
             const delayMs = this.opts.onRateLimited

@@ -528,7 +528,10 @@ export function createMockBackend(): MockBackend {
         thread_scope_key: resolvedThreadScopeKey,
         is_current: isCurrent,
         delivery_attempt: 1,
-        weixin_account_id: plat === "weixin" ? "wx_acc_1" : null,
+        weixin_account_id:
+          plat === "weixin"
+            ? "00000000-0000-4000-8000-000000000001"
+            : null,
         weixin_bot_id: plat === "weixin" ? "bot_1" : null,
         weixin_bot_generation: plat === "weixin" ? 1 : null,
         weixin_context_token: plat === "weixin" ? "ctx_tok_123" : null,
@@ -1008,7 +1011,7 @@ export function createMockBackend(): MockBackend {
         expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
         ...(req.action === "confirm"
           ? {
-              account_id: "wx_acc_1",
+              account_id: "00000000-0000-4000-8000-000000000001",
               account_status: "active",
               ilink_bot_id: req.ilink_bot_id ?? "bot_1",
               ilink_user_id: req.ilink_user_id ?? "wx_alice",
@@ -1031,7 +1034,7 @@ export function createMockBackend(): MockBackend {
         decision: "allow",
         retryable: false,
         chunk_index: req.chunk_index,
-        account_id: "wx_acc_1",
+        account_id: "00000000-0000-4000-8000-000000000001",
         ilink_bot_id: "bot_1",
         bot_generation: 1,
         bot_token: "bot_token_mock",
