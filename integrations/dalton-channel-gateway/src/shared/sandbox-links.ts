@@ -12,9 +12,7 @@
  * workspaces, and custom/former computer roots identically to web clicks.
  */
 
-import { fromMarkdown } from "mdast-util-from-markdown";
-import { gfmTableFromMarkdown } from "mdast-util-gfm-table";
-import { gfmTable } from "micromark-extension-gfm-table";
+import { parseChannelMarkdown, type MdastNode } from "./text.js";
 
 /**
  * Stock sandbox root prefixes (rootless form, trailing slash).
@@ -29,9 +27,6 @@ export const SANDBOX_ROOT_PREFIXES = [
 
 const MAX_LINK_LABEL_LEN = 512;
 const MAX_LINK_DEST_LEN = 4096;
-
-const MARKDOWN_EXTENSIONS = [gfmTable()];
-const MDAST_EXTENSIONS = [gfmTableFromMarkdown()];
 
 const escapeRe = (value: string): string =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -138,20 +133,6 @@ const BARE_LOCALHOST_PORT_RE =
 
 const TRAILING_QUOTED_TITLE_RE =
   /[ \t]+(?:"[^"\n]{0,512}"|'[^'\n]{0,512}')$/;
-
-interface MdastNode {
-  type: string;
-  url?: string;
-  title?: string | null;
-  alt?: string | null;
-  identifier?: string;
-  label?: string | null;
-  children?: MdastNode[];
-  position?: {
-    start?: { offset?: number };
-    end?: { offset?: number };
-  };
-}
 
 interface ParsedMarkdownLink {
   end: number;
@@ -964,10 +945,7 @@ export function rewriteSandboxLinks(
   const publicWebBaseUrl = normalizePublicWebBaseUrl(webBaseUrl);
   const normalizedThreadId = (threadId ?? "").trim() || null;
 
-  const tree = fromMarkdown(text, {
-    extensions: MARKDOWN_EXTENSIONS,
-    mdastExtensions: MDAST_EXTENSIONS,
-  }) as unknown as MdastNode;
+  const tree = parseChannelMarkdown(text);
 
   // Pass 1: collect all reference link definitions and count their references.
   const definitionsById = new Map<string, DefinitionInfo>();

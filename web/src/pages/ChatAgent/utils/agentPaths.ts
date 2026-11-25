@@ -723,7 +723,8 @@ function selectedWorkspacePath(
   folders: ComputerFolders | null | undefined,
 ): string {
   const { dirName, previousDirNames, rootDir, otherRoots } = folders ?? {};
-  const parts = takeApart(rawPath, true, rootDir);
+  // DALTON-HOOK(channel-links): treat decoded file paths as paths (not URLs) so # and ? in filenames are not truncated
+  const parts = takeApart(rawPath, false, rootDir);
   const scoped = workspaceScopedPath(parts, dirName, previousDirNames, otherRoots);
   if (scoped === parts.path) return rawPath;
   return scoped || (parts.directory ? './' : '');
@@ -933,7 +934,8 @@ export function computeAgentArtifactRouting(
     };
   }
   // skill / file → Files tab; pass-through workspace id for cross-workspace links.
-  const parts = takeApart(routedPath, true, root);
+  // DALTON-HOOK(channel-links): keep literal # and ? in decoded file paths when checking directory trailing slash
+  const parts = takeApart(routedPath, false, root);
   if (parts.directory) {
     return {
       ...base,

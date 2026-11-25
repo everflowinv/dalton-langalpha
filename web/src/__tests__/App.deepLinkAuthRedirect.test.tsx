@@ -227,6 +227,7 @@ describe('deep-link preservation across login', () => {
   it.each([
     '/?redirect=https://evil.example/phish',
     '/?redirect=//evil.example/phish',
+    '/?redirect=//in-app.invalid/chat',
     '/?redirect=/\\evil.example/phish',
     '/?redirect=%2F%3Floop%3D1',
   ])('rejects open redirect %s and falls back to /dashboard after login', async (entry) => {

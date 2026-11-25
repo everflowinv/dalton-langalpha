@@ -42,6 +42,7 @@ import { updateThreadTitle } from '../utils/api';
 import { isValidUuid } from '../utils/uuid';
 import { WorkspaceProvider } from '../contexts/WorkspaceContext';
 import { useComputerFolders } from '../hooks/useComputerFolders';
+import { useComputerFoldersReady } from '../hooks/useComputerFoldersReady'; // DALTON-HOOK(channel-links): wait for folder queries before consuming rooted ?file= deep links
 import { usePanelFiles } from './chatView/usePanelFiles';
 import { usePanelAsks, usePanelLinkOpen } from './chatView/usePanelLinks';
 import { useFileDeepLink } from './chatView/useFileDeepLink';
@@ -293,6 +294,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
   // in: the gallery's own for the link router, the shown one's for the
   // documents the panel renders.
   const folders = useComputerFolders(workspaceId);
+  const foldersReady = useComputerFoldersReady(workspaceId); // DALTON-HOOK(channel-links): track folder query settlement for ?file= deep link routing
   const panelFolders = useComputerFolders(shownWorkspaceId);
   const { viewFor: browserViewFor } = useBrowserViews();
   const {
@@ -413,7 +415,8 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
     handleOpenFile(path);
     openFilePanel();
   }, [handleOpenFile, openFilePanel]);
-  useFileDeepLink(true, workspaceId, openLinkedFile);
+  // DALTON-HOOK(channel-links): pass foldersReady so rooted/sibling ?file= deep links wait for folder metadata
+  useFileDeepLink(true, workspaceId, openLinkedFile, foldersReady);
   // Track container width via ResizeObserver
   useEffect(() => {
     const el = containerRef.current;

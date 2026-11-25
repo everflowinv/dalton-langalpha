@@ -49,6 +49,7 @@ import { useThreadSubagents } from '../hooks/useThreadSubagents';
 import { useThreadTuning } from '../hooks/useThreadTuning';
 import { useForeignRunCatchUp } from '../hooks/useForeignRunCatchUp';
 import { useComputerFolders } from '../hooks/useComputerFolders';
+import { useComputerFoldersReady } from '../hooks/useComputerFoldersReady'; // DALTON-HOOK(channel-links): wait for folder queries before consuming rooted ?file= deep links
 import { useComputer } from '../hooks/useComputers';
 import { saveChatSession, getChatSession, clearChatSession } from '../hooks/utils/chatSessionRestore';
 import type { PreviewData } from '../hooks/utils/types';
@@ -331,6 +332,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // A path names a sibling by its folder from the workspace it was written
   // in: the chat's for the transcript, the panel's for the files it shows.
   const chatFolders = useComputerFolders(workspaceId);
+  const chatFoldersReady = useComputerFoldersReady(workspaceId); // DALTON-HOOK(channel-links): track folder query settlement for ?file= deep link routing
   const otherPanelFolders = useComputerFolders(panelWorkspaceId === workspaceId ? null : panelWorkspaceId);
   const panelFolders = panelWorkspaceId === workspaceId ? chatFolders : otherPanelFolders;
   const chatRootDir = chatFolders?.rootDir;
@@ -1224,6 +1226,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     isMobile,
     workspaceId,
     folders: chatFolders,
+    foldersReady: chatFoldersReady, // DALTON-HOOK(channel-links): defer rooted ?file= deep link consumption until folder queries settle
     threadId: panelThreadId,
     isActive,
     containerRef,

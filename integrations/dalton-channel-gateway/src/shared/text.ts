@@ -9,6 +9,38 @@
  * Design §4.1 (`src/shared/text.ts`).
  */
 
+import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmTableFromMarkdown } from "mdast-util-gfm-table";
+import { gfmTable } from "micromark-extension-gfm-table";
+
+export interface MdastNode {
+  type: string;
+  url?: string;
+  title?: string | null;
+  alt?: string | null;
+  identifier?: string;
+  label?: string | null;
+  children?: MdastNode[];
+  position?: {
+    start?: { offset?: number };
+    end?: { offset?: number };
+  };
+}
+
+const MARKDOWN_EXTENSIONS = [gfmTable()];
+const MDAST_EXTENSIONS = [gfmTableFromMarkdown()];
+
+/**
+ * Shared Markdown AST parser (CommonMark + GFM tables) used by both the
+ * sandbox-link rewriter and outbound channel chunkers so link/code spans match.
+ */
+export function parseChannelMarkdown(text: string): MdastNode {
+  return fromMarkdown(text, {
+    extensions: MARKDOWN_EXTENSIONS,
+    mdastExtensions: MDAST_EXTENSIONS,
+  }) as unknown as MdastNode;
+}
+
 export interface CodeRegion {
   start: number;
   end: number;
@@ -29,43 +61,31 @@ const BARE_HTTP_URL_RE =
 
 const STOCK_SANDBOX_PREFIX_RE = /^\/?(?:home\/workspace|home\/daytona)\//;
 
-/**
- * Parses one Markdown link `[label](dest)` or image `![alt](dest)` starting at
- * `start`, supporting balanced nested parentheses in the destination and
- * skipping inline code spans inside the label.
- */
-function parseAtomicMarkdownLinkAt(
+function findBracketCloseUnbounded(
   text: string,
-  start: number,
-  lineEnd: number,
-): AtomicLinkSpan | null {
-  const isImage = text[start] === "!";
-  const bracketOpen = isImage ? start + 1 : start;
-  if (bracketOpen >= lineEnd || text[bracketOpen] !== "[") {
-    return null;
-  }
-  const labelLimit = Math.min(lineEnd, bracketOpen + 1 + 512);
+  bracketOpen: number,
+  limit: number,
+): number {
   let i = bracketOpen + 1;
   let bracketDepth = 0;
-  let bracketClose = -1;
-  while (i < labelLimit) {
+  while (i < limit) {
     const ch = text[i]!;
-    if (ch === "\\" && i + 1 < labelLimit) {
+    if (ch === "\\" && i + 1 < limit) {
       i += 2;
       continue;
     }
     if (ch === "`") {
       let run = 0;
-      while (i + run < labelLimit && text[i + run] === "`") run += 1;
+      while (i + run < limit && text[i + run] === "`") run += 1;
       let k = i + run;
       let foundClose = -1;
-      while (k < labelLimit) {
+      while (k < limit) {
         if (text[k] !== "`") {
           k += 1;
           continue;
         }
         let closeRun = 0;
-        while (k + closeRun < labelLimit && text[k + closeRun] === "`") {
+        while (k + closeRun < limit && text[k + closeRun] === "`") {
           closeRun += 1;
         }
         if (closeRun === run) {
@@ -84,8 +104,7 @@ function parseAtomicMarkdownLinkAt(
     }
     if (ch === "]") {
       if (bracketDepth === 0) {
-        bracketClose = i;
-        break;
+        return i;
       }
       bracketDepth -= 1;
       i += 1;
@@ -93,97 +112,96 @@ function parseAtomicMarkdownLinkAt(
     }
     i += 1;
   }
-  if (
-    bracketClose === -1 ||
-    bracketClose + 1 >= lineEnd ||
-    text[bracketClose + 1] !== "("
-  ) {
-    return null;
-  }
-  const destOpen = bracketClose + 2;
-  let j = destOpen;
-  let parenDepth = 0;
-  let closeParen = -1;
-  while (j < lineEnd) {
-    const ch = text[j]!;
-    if (ch === "\\" && j + 1 < lineEnd) {
-      j += 2;
-      continue;
-    }
-    if (ch === "(") {
-      parenDepth += 1;
-      j += 1;
-      continue;
-    }
-    if (ch === ")") {
-      if (parenDepth === 0) {
-        closeParen = j;
-        break;
-      }
-      parenDepth -= 1;
-      j += 1;
-      continue;
-    }
-    j += 1;
-  }
-  if (closeParen === -1) {
-    return null;
-  }
-  return {
-    start,
-    end: closeParen + 1,
-    isMarkdownLink: true,
-    label: text.slice(bracketOpen + 1, bracketClose),
-    destStart: destOpen,
-    destEnd: closeParen,
-    dest: text.slice(destOpen, closeParen).trim(),
-  };
+  return -1;
 }
 
 /**
- * Finds atomic Markdown links (`[label](url)`, `![alt](url)`) and bare
- * `http(s)://...` URLs outside code regions so chunkers never split mid-link
- * and formatters (such as Discord `__` bold conversion) never mangle URLs.
+ * Finds atomic Markdown links (`[label](url)`, `![alt](url)`, including long
+ * and multiline labels) and bare `http(s)://...` URLs outside Markdown AST code
+ * nodes so chunkers never split mid-link and never degrade code blocks, and
+ * formatters (such as Discord `__` bold conversion) never mangle URLs.
  */
 export function findAtomicLinkSpans(text: string): AtomicLinkSpan[] {
   if (!text) return [];
-  const codeRegions = findCodeRegions(text);
-  const spans: AtomicLinkSpan[] = [];
-  let i = 0;
-  let lineEnd = -1;
-  let nextCloseBracket = -1;
-
-  while (i < text.length) {
-    const codeHit = codeRegions.find((r) => i >= r.start && i < r.end);
-    if (codeHit) {
-      i = codeHit.end;
-      continue;
-    }
-    const ch = text[i]!;
-    if (
-      ch === "[" ||
-      (ch === "!" && i + 1 < text.length && text[i + 1] === "[")
-    ) {
-      if (lineEnd < i) {
-        const nl = text.indexOf("\n", i);
-        lineEnd = nl === -1 ? text.length : nl;
-      }
-      if (nextCloseBracket < i) {
-        nextCloseBracket = text.indexOf("]", i);
-      }
-      if (nextCloseBracket !== -1 && nextCloseBracket < lineEnd) {
-        const parsed = parseAtomicMarkdownLinkAt(text, i, lineEnd);
-        if (parsed) {
-          spans.push(parsed);
-          i = parsed.end;
-          continue;
-        }
-      }
-    }
-    i += 1;
+  if (!text.includes("[") && !text.includes("<") && !/https?:\/\//i.test(text)) {
+    return [];
   }
 
-  // Also protect bare http(s):// URLs outside code and outside Markdown links.
+  const tree = parseChannelMarkdown(text);
+  const codeRanges: CodeRegion[] = [];
+  const spans: AtomicLinkSpan[] = [];
+
+  const visit = (node: MdastNode): void => {
+    const start = node.position?.start?.offset;
+    const end = node.position?.end?.offset;
+    const hasOffsets = typeof start === "number" && typeof end === "number" && end > start;
+
+    if (node.type === "code" || node.type === "inlineCode") {
+      if (hasOffsets) {
+        codeRanges.push({ start, end });
+      }
+      return;
+    }
+
+    if ((node.type === "link" || node.type === "image") && hasOffsets) {
+      const isAutolink =
+        node.type === "link" && text[start] === "<" && text[end - 1] === ">";
+      if (isAutolink) {
+        const url = typeof node.url === "string" ? node.url : text.slice(start + 1, end - 1);
+        spans.push({
+          start,
+          end,
+          isMarkdownLink: false,
+          label: url,
+          destStart: start,
+          destEnd: end,
+          dest: url,
+        });
+        return;
+      }
+
+      const bracketOpen = node.type === "image" && text[start] === "!" ? start + 1 : start;
+      const bracketClose =
+        bracketOpen < end && text[bracketOpen] === "["
+          ? findBracketCloseUnbounded(text, bracketOpen, end)
+          : -1;
+      const label =
+        bracketClose !== -1
+          ? text.slice(bracketOpen + 1, bracketClose)
+          : (node.alt ?? "");
+      const hasInlineParens =
+        bracketClose !== -1 &&
+        bracketClose + 1 < end &&
+        text[bracketClose + 1] === "(" &&
+        text[end - 1] === ")";
+      const destStart = hasInlineParens ? bracketClose + 2 : start;
+      const destEnd = hasInlineParens ? end - 1 : end;
+      const dest =
+        typeof node.url === "string"
+          ? node.url
+          : text.slice(destStart, destEnd).trim();
+      spans.push({
+        start,
+        end,
+        isMarkdownLink: true,
+        label,
+        destStart,
+        destEnd,
+        dest,
+      });
+      return;
+    }
+
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) {
+        visit(child);
+      }
+    }
+  };
+
+  visit(tree);
+
+  // Also protect bare http(s):// URLs outside AST code nodes and Markdown links.
   for (const match of text.matchAll(BARE_HTTP_URL_RE)) {
     const start = match.index ?? 0;
     let raw = match[0]!;
@@ -192,7 +210,7 @@ export function findAtomicLinkSpans(text: string): AtomicLinkSpan[] {
     }
     const end = start + raw.length;
     if (end <= start) continue;
-    const inCode = codeRegions.some((r) => start >= r.start && start < r.end);
+    const inCode = codeRanges.some((r) => start >= r.start && start < r.end);
     const inLink = spans.some((s) => start >= s.start && start < s.end);
     if (!inCode && !inLink) {
       spans.push({
@@ -209,6 +227,27 @@ export function findAtomicLinkSpans(text: string): AtomicLinkSpan[] {
 
   spans.sort((a, b) => a.start - b.start);
   return spans;
+}
+
+/**
+ * Splits `text` on `\n`, keeping newlines that fall strictly inside an atomic
+ * Markdown link span (e.g. multiline link labels `[line1\nline2](url)`) inside
+ * the same logical unit so line-oriented chunkers never split a multiline link.
+ */
+export function splitLogicalLinesPreservingLinks(text: string): string[] {
+  if (!text.includes("\n")) return [text];
+  const spans = findAtomicLinkSpans(text);
+  if (spans.length === 0) return text.split("\n");
+  const lines: string[] = [];
+  let start = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === "\n" && !findSpanStraddling(spans, i)) {
+      lines.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  lines.push(text.slice(start));
+  return lines;
 }
 
 /**
@@ -476,7 +515,7 @@ export function chunkTextForOutbound(text: string, maxChars: number): string[] {
   }
 
   const results: string[] = [];
-  const lines = text.split("\n");
+  const lines = splitLogicalLinesPreservingLinks(text);
   let current = "";
   let activeFence: {
     openLine: string;

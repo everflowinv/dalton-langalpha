@@ -186,6 +186,18 @@ describe("rewriteSandboxLinks", () => {
       `${WEB_BASE}/chat/t/${THREAD_ID}?file=results%2Fa%2Bb.md`,
     );
     expect(plusUrl.searchParams.get("file")).toBe("results/a+b.md");
+
+    // Percent-encoded `#` and `?` in filenames survive gateway rewrite and single-decode via URLSearchParams
+    const specialCharsInput =
+      "[问题](/home/workspace/Research/results/issue%231.md) 与 [问答](/srv/old/Research/results/%E4%B8%AD%E6%96%87%20q%3Fa%232.md)";
+    const specialCharsOut = rewriteSandboxLinks(specialCharsInput, WEB_BASE, THREAD_ID);
+    const urls = Array.from(specialCharsOut.matchAll(/\((https?:\/\/[^)]+)\)/g)).map(
+      (m) => new URL(m[1]!).searchParams.get("file"),
+    );
+    expect(urls).toEqual([
+      "/home/workspace/Research/results/issue#1.md",
+      "/srv/old/Research/results/中文 q?a#2.md",
+    ]);
   });
 
   it("converts bare sandbox paths to relative paths while preserving external URLs including query params", () => {
@@ -452,5 +464,92 @@ describe("channel chunkers preserve rewritten Markdown links and underscores", (
         Buffer.byteLength(JSON.stringify(buildStructuredCard(chunk)), "utf8"),
       ).toBeLessThanOrEqual(350);
     }
+  });
+
+  it("preserves 550-char label links and multiline-label links intact across Feishu, Discord, and Weixin chunkers", () => {
+    const longLabel = "标".repeat(550);
+    const longLabelLink = rewriteSandboxLinks(
+      `[${longLabel}](/home/workspace/results/report.md)`,
+      WEB_BASE,
+      THREAD_ID,
+    );
+    const multilineLink = rewriteSandboxLinks(
+      `[第一行标题\n第二行补充说明](/home/workspace/results/report.md)`,
+      WEB_BASE,
+      THREAD_ID,
+    );
+
+    // 1. Weixin (`splitTextByLimit`, 2000-char boundary)
+    const wxLong = splitTextByLimit(`${"a".repeat(1600)}${longLabelLink}`, 2000);
+    expect(wxLong).toHaveLength(2);
+    expect(wxLong[1]).toBe(longLabelLink);
+    expect(wxLong.every((c) => c.length <= 2000)).toBe(true);
+
+    const wxMulti = splitTextByLimit(`${"a".repeat(1980)}${multilineLink}`, 2000);
+    expect(wxMulti).toHaveLength(2);
+    expect(wxMulti[1]).toBe(multilineLink);
+    expect(wxMulti.every((c) => c.length <= 2000)).toBe(true);
+
+    // 2. Discord (`chunkDiscordText`, 2000-char boundary)
+    const dcLong = chunkDiscordText(`${"a".repeat(1600)}${longLabelLink}`, { maxChars: 2000 });
+    expect(dcLong).toHaveLength(2);
+    expect(dcLong[1]).toBe(longLabelLink);
+    expect(dcLong.every((c) => c.length <= 2000)).toBe(true);
+
+    const dcMulti = chunkDiscordText(`${"a".repeat(1980)}${multilineLink}`, { maxChars: 2000 });
+    expect(dcMulti).toHaveLength(2);
+    expect(dcMulti[1]).toBe(multilineLink);
+    expect(dcMulti.every((c) => c.length <= 2000)).toBe(true);
+
+    // 3. Feishu post & card (`chunkFeishuPostMarkdown`, `chunkFeishuCardMarkdown`, 30KB byte boundary)
+    const fsPostLong = chunkFeishuPostMarkdown(`${"a".repeat(30_000)}${longLabelLink}`);
+    expect(fsPostLong.length).toBeGreaterThanOrEqual(2);
+    expect(fsPostLong.some((c) => c.includes(longLabelLink))).toBe(true);
+    for (const chunk of fsPostLong) {
+      expect(
+        Buffer.byteLength(buildFeishuPostMessageContent({ messageText: chunk }), "utf8"),
+      ).toBeLessThanOrEqual(FEISHU_POST_MAX_BYTES);
+    }
+
+    const fsCardLong = chunkFeishuCardMarkdown(`${"a".repeat(30_000)}${longLabelLink}`);
+    expect(fsCardLong.length).toBeGreaterThanOrEqual(2);
+    expect(fsCardLong.some((c) => c.includes(longLabelLink))).toBe(true);
+    for (const chunk of fsCardLong) {
+      expect(
+        Buffer.byteLength(JSON.stringify(buildStructuredCard(chunk)), "utf8"),
+      ).toBeLessThanOrEqual(FEISHU_CARD_MAX_BYTES);
+    }
+
+    const fsPostMulti = chunkFeishuPostMarkdown(`${"a".repeat(30_600)}${multilineLink}`);
+    expect(fsPostMulti.length).toBeGreaterThanOrEqual(2);
+    expect(fsPostMulti.some((c) => c.includes(multilineLink))).toBe(true);
+    for (const chunk of fsPostMulti) {
+      expect(
+        Buffer.byteLength(buildFeishuPostMessageContent({ messageText: chunk }), "utf8"),
+      ).toBeLessThanOrEqual(FEISHU_POST_MAX_BYTES);
+    }
+
+    const fsCardMulti = chunkFeishuCardMarkdown(`${"a".repeat(30_600)}${multilineLink}`);
+    expect(fsCardMulti.length).toBeGreaterThanOrEqual(2);
+    expect(fsCardMulti.some((c) => c.includes(multilineLink))).toBe(true);
+    for (const chunk of fsCardMulti) {
+      expect(
+        Buffer.byteLength(JSON.stringify(buildStructuredCard(chunk)), "utf8"),
+      ).toBeLessThanOrEqual(FEISHU_CARD_MAX_BYTES);
+    }
+  });
+
+  it("Discord chunkDiscordText preserves overlong Markdown links inside fenced code blocks without degrading", () => {
+    const codeLine = `[样例](https://example.com/${"a".repeat(2100)})`;
+    const input = ["```markdown", codeLine, "```"].join("\n");
+    expect(rewriteSandboxLinks(input, WEB_BASE, THREAD_ID)).toBe(input);
+
+    const chunks = chunkDiscordText(input, { maxChars: 2000 });
+    expect(chunks.length).toBeGreaterThanOrEqual(2);
+    expect(chunks.every((c) => c.length <= 2000)).toBe(true);
+    const restored = chunks
+      .map((chunk) => chunk.replace(/^```markdown\n/, "").replace(/\n```$/, ""))
+      .join("");
+    expect(restored).toBe(codeLine);
   });
 });
