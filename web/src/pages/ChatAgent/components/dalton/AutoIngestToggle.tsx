@@ -73,6 +73,7 @@ export function AutoIngestToggle({
       data-testid="dalton-auto-ingest-toggle"
       className={cn(
         TOOLBAR_CHIP_CLASS,
+        'tap-target',
         readOnly ? 'cursor-not-allowed opacity-60' : 'press cursor-pointer hover:bg-(--color-bg-subtle)',
       )}
       style={toolbarChipStyle(enabled ? 'success' : 'neutral')}

@@ -49,3 +49,20 @@
   pointer-events: none;
   transition: opacity var(--motion-quick) var(--ease-out);
 }
+
+/* DALTON-HOOK(mobile-web): keep inline-widget action bar visible and tappable on touch devices */
+@media (hover: none), (pointer: coarse) {
+  .html-action-bar-overlay {
+    opacity: 0.92;
+    pointer-events: auto;
+  }
+
+  .html-action-bar {
+    gap: 4px;
+  }
+
+  .html-action-btn {
+    --tap-target-w: 32px;
+    --tap-target-h: 44px;
+  }
+}

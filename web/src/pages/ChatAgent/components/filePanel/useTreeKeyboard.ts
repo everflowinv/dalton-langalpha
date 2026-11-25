@@ -47,14 +47,16 @@ export function useTreeKeyboard({ listRef, expandedDirs, toggleDir, onOpenFile, 
     const all = rows();
     if (!all.length) return;
     const current = all.findIndex((el) => el === document.activeElement);
+    // DALTON-HOOK(mobile-web): when focus is on an adjacent row-menu button, keep ArrowUp/ArrowDown relative to that row without hijacking Enter/Space on the button
+    const navIndex = current >= 0 ? current : all.findIndex((el) => el.parentElement?.contains(document.activeElement));
     const move = (to: number) => {
       event.preventDefault();
       all[Math.max(0, Math.min(all.length - 1, to))]?.focus();
     };
 
     switch (event.key) {
-      case 'ArrowDown': return move(current < 0 ? 0 : current + 1);
-      case 'ArrowUp': return move(current < 0 ? all.length - 1 : current - 1);
+      case 'ArrowDown': return move(navIndex < 0 ? 0 : navIndex + 1);
+      case 'ArrowUp': return move(navIndex < 0 ? all.length - 1 : navIndex - 1);
       case 'Home': return move(0);
       case 'End': return move(all.length - 1);
       default: break;

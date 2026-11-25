@@ -176,7 +176,12 @@ def _settlement(row):
         yield conn or _CONN
 
     fx.outbox = MagicMock(
-        enqueue_compensation_job=AsyncMock(), merge_job_payload=AsyncMock(side_effect=merge)
+        enqueue_compensation_job=AsyncMock(),
+        merge_job_payload=AsyncMock(side_effect=merge),
+        # DALTON-HOOK(dalton-notify): default claim ownership check succeeds for active outbox job
+        owns_claimed_job=create_autospec(
+            settlement_mod.outbox_db.owns_claimed_job, return_value=True
+        ),
     )
     with (
         patch(f"{_MOD}.auto_db", new=fx.db),

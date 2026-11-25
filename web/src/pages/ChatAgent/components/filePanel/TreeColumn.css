@@ -361,3 +361,55 @@ p.file-panel-empty-note {
 @media (max-width: 767px) {
   .file-panel-tree { width: min(300px, 85%); }
 }
+
+/* DALTON-HOOK(mobile-web): adjacent row-menu button layout and touch-friendly row height on coarse-pointer devices */
+.file-tree-row-wrap {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+.file-tree-row-wrap > .file-tree-row {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.file-panel-row-menu-btn {
+  display: none;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  margin-right: 4px;
+  padding: 4px;
+  border: 0;
+  border-radius: var(--cs-radius-control, 4px);
+  background: none;
+  color: var(--color-text-tertiary);
+  cursor: pointer;
+}
+.file-panel-row-menu-btn:hover {
+  color: var(--color-text-primary);
+  background-color: var(--color-bg-hover);
+}
+.file-panel-row-menu-btn:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: -2px;
+}
+@media (pointer: coarse) {
+  .file-panel-item,
+  .file-panel-dir-header {
+    --row-py: 9px;
+  }
+  .file-panel-row-menu-btn {
+    display: inline-flex;
+    --tap-target-w: 36px;
+    --tap-target-h: 36px;
+  }
+  /* DALTON-HOOK(mobile-web): space out tree toolbar buttons and clamp horizontal tap width so adjacent 26px buttons do not overlap */
+  .file-panel-tree-tools {
+    gap: 6px;
+    min-height: 44px;
+  }
+  .file-panel-tree-tools .file-panel-icon-btn {
+    --tap-target-w: 32px;
+    --tap-target-h: 44px;
+  }
+}

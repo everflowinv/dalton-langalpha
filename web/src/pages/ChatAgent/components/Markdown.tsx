@@ -13,6 +13,7 @@ import './Markdown.css';
 import SyntaxHighlighter, { oneDark, oneLight } from './SyntaxHighlighter';
 import { Copy, Check } from 'lucide-react';
 import { useTheme } from '@/contexts/ThemeContext';
+import { useIsMobile } from '@/hooks/useIsMobile'; // DALTON-HOOK(mobile-web)
 import { GuardedLink } from '@/components/GuardedLink';
 import { appRoutePath } from '@/lib/appRoutes';
 import { copyText } from '@/lib/clipboard';
@@ -80,6 +81,9 @@ interface CodeBlockProps {
 
 const CODE_STYLE: React.CSSProperties = { margin: 0, padding: '1rem', backgroundColor: 'transparent', fontSize: '0.875rem', lineHeight: '1.5' };
 const COMPACT_CODE_STYLE: React.CSSProperties = { ...CODE_STYLE, padding: '0.6rem', fontSize: '0.75rem' };
+// DALTON-HOOK(mobile-web): override Prism's default pre { overflow: 'auto' } on mobile so the outer [data-code-scroll="horizontal"] container scrolls
+const MOBILE_CODE_STYLE: React.CSSProperties = { ...CODE_STYLE, overflow: 'visible', width: 'max-content', minWidth: '100%' };
+const MOBILE_COMPACT_CODE_STYLE: React.CSSProperties = { ...COMPACT_CODE_STYLE, overflow: 'visible', width: 'max-content', minWidth: '100%' };
 
 /** How long a code block's Copy reads Copied before it turns back. */
 const CODE_COPIED_MS = 1500;
@@ -124,6 +128,7 @@ function Bare({ children }: { children?: React.ReactNode }): React.ReactElement 
 const CodeBlock = React.memo(function CodeBlock({ language, code, compact = false, codeTheme, live = false }: CodeBlockProps): React.ReactElement {
   const { t } = useTranslation();
   const { theme } = useTheme();
+  const isMobile = useIsMobile(); // DALTON-HOOK(mobile-web)
   const effectiveTheme = codeTheme ?? theme;
   const [copied, setCopied] = useState(false);
   const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -137,20 +142,21 @@ const CodeBlock = React.memo(function CodeBlock({ language, code, compact = fals
   const typing = code.slice(cut);
   // Memoized by hand: this is the whole point of the split, so it must not
   // depend on the compiler (REACT_COMPILER=off) to hold.
+  // DALTON-HOOK(mobile-web): scroll code blocks horizontally on mobile instead of wrapping long lines
   const highlighted = useMemo(() => (
     <SyntaxHighlighter
       language={lang}
       style={prismStyle}
-      customStyle={compact ? COMPACT_CODE_STYLE : CODE_STYLE}
+      customStyle={isMobile ? (compact ? MOBILE_COMPACT_CODE_STYLE : MOBILE_CODE_STYLE) : (compact ? COMPACT_CODE_STYLE : CODE_STYLE)}
       codeTagProps={{ style: { backgroundColor: 'transparent' } }}
       CodeTag={LiveCode}
-      wrapLongLines
+      wrapLongLines={!isMobile}
     >
       {done}
     </SyntaxHighlighter>
-  ), [lang, prismStyle, compact, done]);
+  ), [lang, prismStyle, compact, done, isMobile]);
   const typingLine = typing
-    ? <SyntaxHighlighter language={lang} style={prismStyle} PreTag={Bare} CodeTag={Bare} wrapLongLines>{typing}</SyntaxHighlighter>
+    ? <SyntaxHighlighter language={lang} style={prismStyle} PreTag={Bare} CodeTag={Bare} wrapLongLines={!isMobile}>{typing}</SyntaxHighlighter>
     : null;
 
   // Confirmed once the write lands (it rejects when the document has lost
@@ -226,9 +232,12 @@ const CodeBlock = React.memo(function CodeBlock({ language, code, compact = fals
             </button>
           </div>
         )}
-        <TypingLine.Provider value={live ? { line: typingLine } : null}>
-          {language === 'mermaid' && !live ? <MermaidDiagram code={code} theme={effectiveTheme} fallback={highlighted} /> : highlighted}
-        </TypingLine.Provider>
+        {/* DALTON-HOOK(mobile-web): allow horizontal scroll for non-wrapped code blocks on mobile */}
+        <div className={isMobile ? 'overflow-x-auto' : undefined} data-code-scroll={isMobile ? 'horizontal' : undefined}>
+          <TypingLine.Provider value={live ? { line: typingLine } : null}>
+            {language === 'mermaid' && !live ? <MermaidDiagram code={code} theme={effectiveTheme} fallback={highlighted} /> : highlighted}
+          </TypingLine.Provider>
+        </div>
       </div>
     </div>
   );

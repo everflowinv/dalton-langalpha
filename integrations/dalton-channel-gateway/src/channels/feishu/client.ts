@@ -253,10 +253,68 @@ function sanitizeSdkLogEntry(
   return scrubLiteralSecrets(String(entry), appId, appSecret);
 }
 
+const EXPECTED_SDK_DEBUG_CODES = new Set<number>([
+  230011, // message withdrawn
+  231003, // message not found / withdrawn
+  230110, // message deleted
+  231001, // invalid reaction emoji_type (handled by OnIt fallback)
+]);
+
+const EXPECTED_SDK_DEBUG_CODE_RE = /\b(?:230011|231003|230110|231001)\b/;
+
+function containsExpectedSdkDebugError(value: unknown, depth = 0): boolean {
+  if (value === null || value === undefined || depth > 4) {
+    return false;
+  }
+  if (typeof value === "number") {
+    return EXPECTED_SDK_DEBUG_CODES.has(value);
+  }
+  if (typeof value === "string") {
+    return EXPECTED_SDK_DEBUG_CODE_RE.test(value);
+  }
+  if (value instanceof Error) {
+    if (EXPECTED_SDK_DEBUG_CODE_RE.test(value.message)) {
+      return true;
+    }
+    return containsExpectedSdkDebugError(
+      (value as unknown as Record<string, unknown>).response,
+      depth + 1,
+    );
+  }
+  if (Array.isArray(value)) {
+    return value.some((item) => containsExpectedSdkDebugError(item, depth + 1));
+  }
+  if (isRecord(value)) {
+    if (typeof value.code === "number" && EXPECTED_SDK_DEBUG_CODES.has(value.code)) {
+      return true;
+    }
+    if (typeof value.code === "string" && EXPECTED_SDK_DEBUG_CODE_RE.test(value.code)) {
+      return true;
+    }
+    if (containsExpectedSdkDebugError(value.data, depth + 1)) {
+      return true;
+    }
+    if (containsExpectedSdkDebugError(value.response, depth + 1)) {
+      return true;
+    }
+    if (typeof value.message === "string" && EXPECTED_SDK_DEBUG_CODE_RE.test(value.message)) {
+      return true;
+    }
+    if (typeof value.msg === "string" && EXPECTED_SDK_DEBUG_CODE_RE.test(value.msg)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Creates a `@larksuiteoapi/node-sdk` compatible `Lark.Logger` that routes SDK
  * logs through `src/shared/logger.ts` while stripping `appId`, `appSecret`,
  * `tenant_access_token`, and Axios request `config`/`data` objects.
+ *
+ * Expected HTTP 400 client codes for withdrawn/deleted messages (`230011`,
+ * `231003`, `230110`) and unsupported reaction emoji types (`231001`) are
+ * downgraded from `error` to `debug` before gateway-level classification.
  */
 export function createFeishuSdkLogger(options: {
   appId: string;
@@ -287,6 +345,10 @@ export function createFeishuSdkLogger(options: {
   return {
     error: (...msg: unknown[]) => {
       const { message, meta } = formatArgs(msg);
+      if (containsExpectedSdkDebugError(msg)) {
+        targetLogger.debug(message, meta);
+        return;
+      }
       targetLogger.error(message, meta);
     },
     warn: (...msg: unknown[]) => {
@@ -310,42 +372,96 @@ export function createFeishuSdkLogger(options: {
 
 export function createFeishuHttpInstance(options?: {
   defaultTimeoutMs?: number;
+  baseHttpInstance?: Lark.HttpInstance;
 }): Lark.HttpInstance {
   const defaultTimeoutMs =
     options?.defaultTimeoutMs ?? DEFAULT_FEISHU_HTTP_TIMEOUT_MS;
   // The SDK's default instance unwraps `response.data` in an interceptor, so at runtime it
   // already satisfies HttpInstance; its declared axios types do not say so.
-  const base = Lark.defaultHttpInstance as unknown as Lark.HttpInstance;
+  const base =
+    options?.baseHttpInstance ??
+    (Lark.defaultHttpInstance as unknown as Lark.HttpInstance);
+
+  const applyDefaultOptions = (
+    opts?: Record<string, unknown>,
+  ): Record<string, unknown> => {
+    const rec = isRecord(opts) ? opts : {};
+    const configuredTimeout =
+      typeof rec.timeout === "number" &&
+      Number.isFinite(rec.timeout) &&
+      rec.timeout > 0
+        ? rec.timeout
+        : defaultTimeoutMs;
+    const headers = {
+      ...(isRecord(rec.headers) ? (rec.headers as Record<string, string>) : {}),
+      "User-Agent": FEISHU_USER_AGENT,
+    };
+    return {
+      ...rec,
+      headers,
+      timeout: configuredTimeout,
+    };
+  };
 
   return {
     request: ((opts: Record<string, unknown>) => {
-      const configuredTimeout =
-        typeof opts.timeout === "number" &&
-        Number.isFinite(opts.timeout) &&
-        opts.timeout > 0
-          ? opts.timeout
-          : defaultTimeoutMs;
-      const headers = {
-        ...((opts.headers as Record<string, string> | undefined) ?? {}),
-        "User-Agent": FEISHU_USER_AGENT,
-      };
-      const normalizedOpts = normalizeMultipartUploadData({
-        ...opts,
-        headers,
-        timeout: configuredTimeout,
-      }) as Record<string, unknown>;
+      const normalizedOpts = normalizeMultipartUploadData(
+        applyDefaultOptions(opts),
+      ) as Record<string, unknown>;
       return base.request(normalizedOpts as Parameters<typeof base.request>[0]);
     }) as Lark.HttpInstance["request"],
-    get: (url, opts) => base.get(url, opts),
+    get: (url, opts) =>
+      base.get(
+        url,
+        applyDefaultOptions(opts as Record<string, unknown> | undefined) as Parameters<
+          typeof base.get
+        >[1],
+      ),
     post: (url, data, opts) =>
-      base.post(url, normalizeMultipartUploadData(data), opts),
+      base.post(
+        url,
+        normalizeMultipartUploadData(data),
+        applyDefaultOptions(opts as Record<string, unknown> | undefined) as Parameters<
+          typeof base.post
+        >[2],
+      ),
     put: (url, data, opts) =>
-      base.put(url, normalizeMultipartUploadData(data), opts),
+      base.put(
+        url,
+        normalizeMultipartUploadData(data),
+        applyDefaultOptions(opts as Record<string, unknown> | undefined) as Parameters<
+          typeof base.put
+        >[2],
+      ),
     patch: (url, data, opts) =>
-      base.patch(url, normalizeMultipartUploadData(data), opts),
-    delete: (url, opts) => base.delete(url, opts),
-    head: (url, opts) => base.head(url, opts),
-    options: (url, opts) => base.options(url, opts),
+      base.patch(
+        url,
+        normalizeMultipartUploadData(data),
+        applyDefaultOptions(opts as Record<string, unknown> | undefined) as Parameters<
+          typeof base.patch
+        >[2],
+      ),
+    delete: (url, opts) =>
+      base.delete(
+        url,
+        applyDefaultOptions(opts as Record<string, unknown> | undefined) as Parameters<
+          typeof base.delete
+        >[1],
+      ),
+    head: (url, opts) =>
+      base.head(
+        url,
+        applyDefaultOptions(opts as Record<string, unknown> | undefined) as Parameters<
+          typeof base.head
+        >[1],
+      ),
+    options: (url, opts) =>
+      base.options(
+        url,
+        applyDefaultOptions(opts as Record<string, unknown> | undefined) as Parameters<
+          typeof base.options
+        >[1],
+      ),
   };
 }
 

@@ -2,7 +2,8 @@
 #
 # Usage:
 #   bash scripts/standalone/init.sh
-#   docker compose -f docker-compose.yml -f docker-compose.core.yml up -d --build
+#   docker compose -p dalton -f docker-compose.yml -f docker-compose.core.yml --env-file .env build
+#   docker compose -p dalton -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d
 #
 # Self-contained overlay over upstream docker-compose.yml (never references
 # docker-compose.dalton.yml). Requires Docker Compose v2.24.4+ for !reset / !override.
@@ -15,15 +16,6 @@
 #   EGRESS_RELAY_SECRET) is supplied exclusively by `env_file: .env` across all
 #   services — never `${...}`-interpolated from the host shell — so every container
 #   (including the optional `ssh-gateway` profile) reads the exact same secrets.
-
-x-backend-build: &backend-build
-  context: .
-  dockerfile: scripts/dalton/Dockerfile.dalton
-  args:
-    BUILD_GIT_SHA: ${BUILD_GIT_SHA:-standalone}
-    BUILD_GIT_DIRTY: ${BUILD_GIT_DIRTY:-false}
-    INSTALL_BROWSER_CRAWLER: ${INSTALL_BROWSER_CRAWLER:-true}
-    INSTALL_OBSERVABILITY: ${INSTALL_OBSERVABILITY:-false}
 
 services:
   postgres:
@@ -125,7 +117,6 @@ services:
       start_period: 10s
 
   minio-init:
-    build: *backend-build
     image: ${DALTON_BACKEND_IMAGE:-dalton-core-backend:local}
     restart: "no"
     entrypoint: ["/usr/bin/tini", "-s", "--"]
@@ -147,7 +138,6 @@ services:
       - core_internal
 
   migrate:
-    build: *backend-build
     image: ${DALTON_BACKEND_IMAGE:-dalton-core-backend:local}
     restart: "no"
     entrypoint: ["/usr/bin/tini", "-s", "--"]
@@ -168,7 +158,14 @@ services:
       - core_internal
 
   backend:
-    build: *backend-build
+    build:
+      context: .
+      dockerfile: scripts/dalton/Dockerfile.dalton
+      args:
+        BUILD_GIT_SHA: ${BUILD_GIT_SHA:-standalone}
+        BUILD_GIT_DIRTY: ${BUILD_GIT_DIRTY:-false}
+        INSTALL_BROWSER_CRAWLER: ${INSTALL_BROWSER_CRAWLER:-true}
+        INSTALL_OBSERVABILITY: ${INSTALL_OBSERVABILITY:-false}
     image: ${DALTON_BACKEND_IMAGE:-dalton-core-backend:local}
     depends_on: !override
       migrate:
@@ -227,7 +224,6 @@ services:
       - sandbox-net
 
   crawler:
-    build: *backend-build
     image: ${DALTON_BACKEND_IMAGE:-dalton-core-backend:local}
     entrypoint: ["/usr/bin/tini", "-s", "--"]
     command: ["uv", "run", "--no-sync", "python", "-m", "src.dalton.crawl_service"]

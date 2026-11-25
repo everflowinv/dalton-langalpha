@@ -132,7 +132,7 @@ export function FeishuReadScopesCard({
       description={t('auth.feishuScopes.subtitle')}
       layout="rows"
       action={
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
           <DaltonRefreshButton
             busy={spacesQuery.isFetching || scopesQuery.isFetching}
             label={t('auth.feishuScopes.refresh')}
@@ -190,10 +190,10 @@ export function FeishuReadScopesCard({
             key={space.space_id}
             id={`feishu-scope-${space.space_id}`}
             label={
-              <span className="inline-flex items-center gap-2">
-                <span>{space.name}</span>
+              <span className="inline-flex flex-wrap items-center gap-2 min-w-0 max-w-full">
+                <span className="max-md:break-words min-w-0">{space.name}</span>
                 {selectedIds.has(space.space_id) && (
-                  <DaltonStatusBadge tone="accent" label={space.space_id} />
+                  <DaltonStatusBadge tone="accent" label={space.space_id} className="max-w-full max-md:break-all" />
                 )}
               </span>
             }

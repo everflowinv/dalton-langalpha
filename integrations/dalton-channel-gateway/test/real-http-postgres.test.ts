@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, delimiter, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type * as Lark from "@larksuiteoapi/node-sdk";
 import { describe, expect, it, vi } from "vitest";
@@ -190,6 +190,9 @@ async function startOrAttachRealBackend(
       env: {
         ...process.env,
         DALTON_CHANNEL_GATEWAY_TEST_DSN: dsn,
+        PYTHONPATH: process.env.PYTHONPATH
+          ? `${REPO_ROOT}${delimiter}${process.env.PYTHONPATH}`
+          : REPO_ROOT,
       },
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -536,7 +539,16 @@ describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChann
           baseUrl,
           serviceToken: boot.service_token,
         });
+        const preStartLeaseInstanceId = `discord-prestart-${boot.prefix}`;
+        const preStartLease = await realBackendClient.acquireGatewayLease({
+          instance_id: preStartLeaseInstanceId,
+          ttl_seconds: 60,
+        });
+        expect(preStartLease.granted).toBe(true);
+        realBackendClient.setGatewayEpoch(preStartLease.epoch);
+        let preStartLeaseActive = true;
 
+        try {
         // Select ws_a1 before the gateway starts. Startup recovery would otherwise
         // resend a still-pending command confirmation and change later send counts.
         const homeProbeId = `${boot.prefix}_msg_home_probe`;
@@ -630,6 +642,12 @@ describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChann
         );
         expect(snapSwitchAck.inbound?.command_effect_status).toBe("done");
         expect(snapSwitchAck.inbound?.command_reply_pending).toBe(false);
+
+        await realBackendClient.releaseGatewayLease({
+          instance_id: preStartLeaseInstanceId,
+          epoch: preStartLease.epoch,
+        });
+        preStartLeaseActive = false;
 
         const adapters = new Map<ChannelPlatform, ChannelAdapter>([
           ["discord", discordAdapter],
@@ -987,6 +1005,16 @@ describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChann
         expect(snapBgAfter.delivery?.status).toBe("sent");
         expect(snapBgAfter.delivery?.is_current).toBe(true);
       } finally {
+        if (preStartLeaseActive) {
+          await realBackendClient
+            .releaseGatewayLease({
+              instance_id: preStartLeaseInstanceId,
+              epoch: preStartLease.epoch,
+            })
+            .catch(() => undefined);
+        }
+      }
+      } finally {
         if (app) {
           await app.stop();
         }
@@ -1098,7 +1126,15 @@ describe.skipIf(feishuSuiteGate === "skip")("Real HTTP End-to-End: FeishuChannel
           baseUrl,
           serviceToken: boot.service_token,
         });
+        const feishuLeaseInstanceId = `feishu-suite-${boot.prefix}`;
+        const feishuSetupLease = await realBackendClient.acquireGatewayLease({
+          instance_id: feishuLeaseInstanceId,
+          ttl_seconds: 120,
+        });
+        expect(feishuSetupLease.granted).toBe(true);
+        realBackendClient.setGatewayEpoch(feishuSetupLease.epoch);
 
+        try {
         const feishuOutbound = new FakeChannelAdapter("feishu");
         const adapters = new Map<ChannelPlatform, ChannelAdapter>([
           ["feishu", feishuOutbound],
@@ -2450,6 +2486,14 @@ describe.skipIf(feishuSuiteGate === "skip")("Real HTTP End-to-End: FeishuChannel
           agedMissing.activity_epoch,
           3,
         );
+      } finally {
+        await realBackendClient
+          .releaseGatewayLease({
+            instance_id: feishuLeaseInstanceId,
+            epoch: feishuSetupLease.epoch,
+          })
+          .catch(() => undefined);
+      }
       } finally {
         if (app2) {
           await app2.stop();

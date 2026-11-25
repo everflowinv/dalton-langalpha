@@ -8,6 +8,8 @@ export * from "./channels/fake-adapter.js";
 export * from "./channels/feishu/index.js";
 export * from "./channels/discord/index.js";
 export * from "./delivery-service.js";
+export * from "./gateway-lease.js";
+export * from "./processing-feedback.js";
 export * from "./data-task-notification-types.js";
 export * from "./data-task-notifications.js";
 export * from "./vault-credentials.js";

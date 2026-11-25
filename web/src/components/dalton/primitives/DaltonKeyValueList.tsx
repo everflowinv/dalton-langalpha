@@ -82,7 +82,11 @@ export function DaltonItemRow({
   return (
     <div data-testid={testId} className={className}>
       <SettingRow label={composedLabel} description={composedDesc}>
-        {trailing ? <div className="flex shrink-0 items-center gap-1.5">{trailing}</div> : undefined}
+        {trailing ? (
+          <div className="flex items-center gap-1.5 md:shrink-0 max-md:flex-wrap max-md:min-w-0 max-md:max-w-full">
+            {trailing}
+          </div>
+        ) : undefined}
       </SettingRow>
       {children && (
         <div

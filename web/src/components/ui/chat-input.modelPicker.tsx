@@ -41,6 +41,7 @@ import { TuningPane, TuningStrip, type ModelTuning } from './chat-input.modelTun
 import { catalogCostRange, costMarks, formatCostMultiple, type CostMarks } from '@/lib/taskCost';
 import { effortLabelFor, modelHasTuning } from '@/lib/modelTuning';
 import { useLocale } from '@/hooks/useLocale';
+import { useIsMobile } from '@/hooks/useIsMobile'; // DALTON-HOOK(mobile-web)
 
 export const FAVORITES_TAB = '__favorites__';
 
@@ -364,6 +365,7 @@ function ModelList({
   taskCostBaseline,
 }: ModelListProps & { onPick: (model: string) => void; onManage: () => void }) {
   const { t } = useTranslation();
+  const isMobile = useIsMobile(); // DALTON-HOOK(mobile-web)
   const costLabel = useCostMarksLabel(taskCostBaseline, metadata);
   const payerLabel = usePayerLabel();
   const now = useNow();
@@ -457,7 +459,8 @@ function ModelList({
     setQuery('');
     // The search field holds focus so the arrow keys keep moving through the
     // list, whichever tab was clicked.
-    inputRef.current?.focus();
+    // DALTON-HOOK(mobile-web): skip focusing search input on phones so switching tabs does not pop the soft keyboard
+    if (!isMobile) inputRef.current?.focus();
   };
 
   // DALTON-HOOK(antigravity-series): unfavorite all variants in collapsed series row at once
@@ -515,7 +518,8 @@ function ModelList({
               e.continuePropagation();
             }
           }}
-          autoFocus
+          // DALTON-HOOK(mobile-web): do not auto-focus search box on mobile so opening the picker does not pop the soft keyboard
+          autoFocus={!isMobile}
           ruled={false}
           className="min-w-0 flex-1"
         />

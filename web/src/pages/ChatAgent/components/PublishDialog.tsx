@@ -23,6 +23,8 @@ import { isDaltonAuth } from '@/config/daltonAuth';
 import { queryKeys } from '@/lib/queryKeys';
 import { registerAuthReset } from '@/lib/authResets';
 import { useCopyShareLink } from '@/hooks/useCopyShareLink';
+import { useIsMobile } from '@/hooks/useIsMobile'; // DALTON-HOOK(mobile-web)
+import { isCoarsePointer } from '@/lib/dalton/pointer'; // DALTON-HOOK(mobile-web)
 import { useLocale } from '@/hooks/useLocale';
 import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(colleague-access): gate auto-publish pause tracking on colleague_sharing capability
 import { useTeamCredentials } from '@/hooks/useTeamCredentials';
@@ -173,63 +175,80 @@ function FileRow({ artifactId, entry, added, leftOut, gutter, locked }: {
 }) {
   const { t } = useTranslation();
   const locale = useLocale();
+  const isMobile = useIsMobile(); // DALTON-HOOK(mobile-web)
   const toggle = useFileLeftOut(artifactId);
   const out = toggle.isPending ? toggle.variables.leftOut : leftOut;
   const dir = dirname(entry.path);
   const name = basename(entry.path);
+  // DALTON-HOOK(mobile-web): surface tooltip detail inline on mobile / coarse-pointer devices where hover is unavailable
+  const detailText = out
+    ? t('publish:leftOutDetail')
+    : t(`shareLink.reasonDetail.${entry.reason === 'loaded' && entry.optional ? 'loadedBefore' : entry.reason}`);
+  const showInlineDetail = (isMobile || isCoarsePointer()) && (out || (added && !out) || entry.reason !== 'entry');
   return (
     <Tooltip>
       <TooltipTrigger asChild>
         <li
           tabIndex={0}
-          className="flex items-center gap-3 px-3 py-1.5 text-xs outline-none hover:bg-(--color-bg-hover) focus-visible:bg-(--color-bg-hover)"
+          className="flex flex-col gap-0.5 px-3 py-1.5 text-xs outline-none hover:bg-(--color-bg-hover) focus-visible:bg-(--color-bg-hover)"
           data-selectable
         >
-          {leftOut || entry.optional ? (
-            <input
-              type="checkbox"
-              className="h-3.5 w-3.5 shrink-0 cursor-pointer accent-(--color-accent-primary)"
-              aria-label={t('publish:includeFile', { file: name })}
-              checked={!out}
-              disabled={locked || toggle.isPending}
-              onChange={(e) => toggle.mutate(
-                { path: entry.path, leftOut: !e.target.checked },
-                { onError: () => toast({ description: t('publish:leftOutFailed'), variant: 'destructive' }) },
+          <div className="flex items-center gap-3 min-w-0">
+            {leftOut || entry.optional ? (
+              <input
+                type="checkbox"
+                className="h-3.5 w-3.5 shrink-0 cursor-pointer accent-(--color-accent-primary)"
+                aria-label={t('publish:includeFile', { file: name })}
+                checked={!out}
+                disabled={locked || toggle.isPending}
+                onChange={(e) => toggle.mutate(
+                  { path: entry.path, leftOut: !e.target.checked },
+                  { onError: () => toast({ description: t('publish:leftOutFailed'), variant: 'destructive' }) },
+                )}
+              />
+            ) : gutter && <span aria-hidden className="w-3.5 shrink-0" />}
+            {/* The folder gives way first: rows cut from the end would all read as
+                the same folder. A touch screen cannot hover, so there it all wraps. */}
+            <span className="flex flex-1 min-w-0 pointer-coarse:block pointer-coarse:wrap-anywhere">
+              {dir && (
+                <span className="min-w-0 truncate pointer-coarse:whitespace-normal" style={{ color: 'var(--color-text-tertiary)' }}>
+                  {dir}/
+                </span>
               )}
-            />
-          ) : gutter && <span aria-hidden className="w-3.5 shrink-0" />}
-          {/* The folder gives way first: rows cut from the end would all read as
-              the same folder. A touch screen cannot hover, so there it all wraps. */}
-          <span className="flex flex-1 min-w-0 pointer-coarse:block pointer-coarse:wrap-anywhere">
-            {dir && (
-              <span className="min-w-0 truncate pointer-coarse:whitespace-normal" style={{ color: 'var(--color-text-tertiary)' }}>
-                {dir}/
+              <span
+                className="shrink-0 max-w-full truncate pointer-coarse:whitespace-normal"
+                style={{ color: out ? 'var(--color-text-tertiary)' : 'var(--color-text-primary)' }}
+              >
+                {name}
               </span>
-            )}
-            <span
-              className="shrink-0 max-w-full truncate pointer-coarse:whitespace-normal"
-              style={{ color: out ? 'var(--color-text-tertiary)' : 'var(--color-text-primary)' }}
-            >
-              {name}
             </span>
-          </span>
-          <span className="shrink-0 tabular-nums" style={{ color: 'var(--color-text-tertiary)' }}>
-            {entry.size !== null && formatBytes(entry.size, locale)}
-          </span>
-          <span
-            className="shrink-0 w-24 text-right"
-            style={{ color: added && !out ? 'var(--color-warning)' : 'var(--color-text-quaternary)' }}
-          >
-            {out ? t('publish:leftOut') : added ? t('publish:notShared') : t(`shareLink.reason.${entry.reason}`)}
-          </span>
+            <span className="shrink-0 tabular-nums" style={{ color: 'var(--color-text-tertiary)' }}>
+              {entry.size !== null && formatBytes(entry.size, locale)}
+            </span>
+            <span
+              className="shrink-0 w-auto md:w-24 text-right"
+              style={{ color: added && !out ? 'var(--color-warning)' : 'var(--color-text-quaternary)' }}
+            >
+              {out ? t('publish:leftOut') : added ? t('publish:notShared') : t(`shareLink.reason.${entry.reason}`)}
+            </span>
+          </div>
+          {/* DALTON-HOOK(mobile-web): inline file reason on mobile / coarse-pointer */}
+          {showInlineDetail && (
+            <p
+              data-testid="publish-file-inline-reason"
+              className={cn('text-[11px] leading-snug wrap-anywhere', gutter && 'pl-[26px]')}
+              style={{ color: added && !out ? 'var(--color-warning)' : 'var(--color-text-tertiary)' }}
+            >
+              {detailText}
+              {added && !out ? ` · ${t('publish:notSharedDetail')}` : ''}
+            </p>
+          )}
         </li>
       </TooltipTrigger>
       <TooltipContent side="top" align="start" className="max-w-md">
         <p className="wrap-anywhere">{entry.path}</p>
         <p className="mt-1" style={{ color: 'var(--color-text-tertiary)' }}>
-          {out
-            ? t('publish:leftOutDetail')
-            : t(`shareLink.reasonDetail.${entry.reason === 'loaded' && entry.optional ? 'loadedBefore' : entry.reason}`)}
+          {detailText}
         </p>
         {added && !out && <p className="mt-1" style={{ color: 'var(--color-warning)' }}>{t('publish:notSharedDetail')}</p>}
       </TooltipContent>
@@ -425,6 +444,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
 }) {
   const { t } = useTranslation();
   const locale = useLocale();
+  const isMobile = useIsMobile(); // DALTON-HOOK(mobile-web)
   const qc = useQueryClient();
   const root = useWorkspaceFolders()?.rootDir;
   // DALTON-HOOK(monitors): caller tier gates 4-tier visibility (external=own only, admin=public allowed)
@@ -914,14 +934,56 @@ function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = fals
               <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
                 {t('monitors:dialog.visibilityField')}
               </span>
-              <SegmentedControl
-                value={effectiveVisibility}
-                onChange={(val) => setVisibilityDraft(val)}
-                options={visibilityOptions}
-                label={t('monitors:dialog.visibilityField')}
-                disabled={busy}
-                size="compact"
-              />
+              {/* DALTON-HOOK(mobile-web): render 4-tier visibility as a 2x2 grid on phones so labels never clip */}
+              {isMobile ? (
+                <div
+                  role="group"
+                  aria-label={t('monitors:dialog.visibilityField')}
+                  data-testid="publish-visibility-grid"
+                  className="grid grid-cols-2 gap-1.5"
+                >
+                  {visibilityOptions.map((option) => {
+                    const selected = option.value === effectiveVisibility;
+                    return (
+                      <button
+                        key={option.value}
+                        type="button"
+                        aria-pressed={selected}
+                        disabled={busy || option.disabled}
+                        onClick={() => setVisibilityDraft(option.value)}
+                        data-testid={option.testId}
+                        className={cn(
+                          'flex min-h-10 items-center justify-center gap-1.5 rounded-md border px-2.5 py-2 text-xs font-medium transition-colors disabled:cursor-default',
+                          option.disabled
+                            ? 'text-(--color-text-quaternary)'
+                            : selected
+                              ? 'text-(--color-text-primary)'
+                              : 'text-(--color-text-secondary)',
+                        )}
+                        style={{
+                          borderColor: selected
+                            ? 'var(--color-border-strong, var(--color-text-tertiary))'
+                            : 'var(--color-border-muted)',
+                          backgroundColor: selected
+                            ? 'var(--color-shell-fill, var(--color-bg-tag))'
+                            : 'transparent',
+                        }}
+                      >
+                        {option.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : (
+                <SegmentedControl
+                  value={effectiveVisibility}
+                  onChange={(val) => setVisibilityDraft(val)}
+                  options={visibilityOptions}
+                  label={t('monitors:dialog.visibilityField')}
+                  disabled={busy}
+                  size="compact"
+                />
+              )}
               {isExternal && (
                 <p className="text-[0.6875rem]" style={{ color: 'var(--color-text-tertiary)' }}>
                   {t('monitors:dialog.externalOwnOnlyHint')}

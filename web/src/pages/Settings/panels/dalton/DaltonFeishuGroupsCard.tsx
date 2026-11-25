@@ -90,12 +90,12 @@ export function DaltonFeishuGroupsCard() {
                 testId={`dalton-feishu-group-row-${group.chat_id}`}
                 title={group.name || t('dalton.feishuGroups.unnamedGroup')}
                 meta={
-                  <span className="font-mono">
+                  <span className="font-mono max-md:break-all">
                     {t('dalton.feishuGroups.chatIdLabel')}: {group.chat_id}
                   </span>
                 }
                 trailing={
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <Button
                       type="button"
                       variant="ghost"

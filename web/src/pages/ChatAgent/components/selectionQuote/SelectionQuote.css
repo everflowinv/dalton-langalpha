@@ -127,3 +127,11 @@
 ::highlight(selection-quote) {
   background-color: var(--color-quote-highlight);
 }
+
+/* DALTON-HOOK(mobile-web): lift portaled selection quote overlays only for an active mobile FilePanel instance */
+@media (max-width: 767px) {
+  .selection-quote-toolbar[data-mobile-overlay-active],
+  .selection-quote-popover[data-mobile-overlay-active] {
+    z-index: 1030;
+  }
+}

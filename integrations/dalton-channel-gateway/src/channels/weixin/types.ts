@@ -50,6 +50,11 @@ export const UploadMediaType = {
   VOICE: 4,
 } as const;
 
+export const TypingStatus = {
+  TYPING: 1,
+  CANCEL: 2,
+} as const;
+
 export interface BaseInfo {
   channel_version?: string;
 }
@@ -174,6 +179,32 @@ export interface SendMessageResp {
   msg_id?: string | number;
 }
 
+export interface GetConfigReq {
+  ilink_user_id: string;
+  context_token?: string;
+  base_info?: BaseInfo;
+}
+
+export interface GetConfigResp {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+  typing_ticket?: string;
+}
+
+export interface SendTypingReq {
+  ilink_user_id: string;
+  typing_ticket: string;
+  status: number;
+  base_info?: BaseInfo;
+}
+
+export interface SendTypingResp {
+  ret?: number;
+  errcode?: number;
+  errmsg?: string;
+}
+
 export interface GetUploadUrlReq {
   filekey?: string;
   media_type?: number;
@@ -241,10 +272,23 @@ export interface WeixinPersistedAttachmentMeta {
 
 export interface WeixinQrPublicResult {
   session_key: string;
-  status: "wait" | "scaned" | "verify_code" | "confirmed" | "expired";
+  status:
+    | "wait"
+    | "scaned"
+    | "verify_code"
+    | "confirmed"
+    | "expired"
+    | "superseded";
   qrcode_url?: string;
   qrcode_img_content?: string;
   expires_at?: string;
+  login_version?: number;
+  account_id?: string | null;
+  account_status?: string | null;
+  accounts_revision?: number | null;
+  pending_verification?: boolean;
+  revoked?: boolean;
+  code?: string | null;
   ilink_bot_id?: string | null;
   ilink_user_id?: string | null;
   ilink_username?: string | null;

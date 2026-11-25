@@ -54,13 +54,16 @@ function SheetPanel({
         // The open card styles lay it on the page's ground inside their edge,
         // as their dialogs are; it keeps its rounded top, which says it
         // slides. Framer moves only `y`, so the var() colors are inert to it.
+        // DALTON-HOOK(mobile-web): keep MobileBottomSheet inside visualViewport (height + offsetTop) when on-screen keyboard opens
         style={{
           y: dragY,
           backgroundColor: 'var(--color-shell-float, var(--color-bg-card))',
           borderColor: 'var(--color-shell-edge, var(--color-border-muted))',
-          ...(sizing === 'fixed' ? { height } : { maxHeight: height }),
+          ...(sizing === 'fixed'
+            ? { height: `min(${height}, calc(var(--visual-viewport-height, 100dvh) - 1rem))` }
+            : { maxHeight: `min(${height}, calc(var(--visual-viewport-height, 100dvh) - 1rem))` }),
         }}
-        className={`fixed bottom-0 left-0 right-0 z-1020 rounded-t-3xl border-t${sizing === 'fixed' ? ' flex flex-col' : ''}`}
+        className={`fixed bottom-[var(--visual-viewport-bottom-offset,var(--keyboard-overlap,0px))] left-0 right-0 z-1020 rounded-t-3xl border-t${sizing === 'fixed' ? ' flex flex-col' : ''}`}
       >
         {/* Drag handle */}
         <div
@@ -81,7 +84,8 @@ function SheetPanel({
           ref={contentRef}
           className={`overflow-y-auto overflow-x-hidden px-4 mobile-scroll-contain${sizing === 'fixed' ? ' flex-1' : ''}${className ? ` ${className}` : ''}`}
           style={{
-            ...(sizing === 'auto' ? { maxHeight: `calc(${height} - 36px)` } : {}),
+            // DALTON-HOOK(mobile-web): cap inner scroll region to visualViewport-clamped sheet height
+            ...(sizing === 'auto' ? { maxHeight: `calc(min(${height}, calc(var(--visual-viewport-height, 100dvh) - 1rem)) - 36px)` } : {}),
             paddingBottom: 14,
             overscrollBehaviorY: 'contain',
             ...style,

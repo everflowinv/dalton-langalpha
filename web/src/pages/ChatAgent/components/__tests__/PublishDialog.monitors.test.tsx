@@ -10,6 +10,12 @@ import type { Artifact, ArtifactStatus, Workspace } from '@/types/api';
 const tierState = vi.hoisted(() => ({
   callerTier: 'internal' as 'external' | 'internal' | 'admin',
   colleagueSharingEnabled: true,
+  isMobile: false,
+}));
+
+vi.mock('@/hooks/useIsMobile', () => ({
+  useIsMobile: () => tierState.isMobile,
+  getIsMobileSnapshot: () => tierState.isMobile,
 }));
 
 const workspaceState = vi.hoisted(() => ({
@@ -658,5 +664,62 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
     await waitFor(() => {
       expect(screen.queryByText('仍有进行中的同事协作轮次，结束后再确认')).not.toBeInTheDocument();
     });
+  });
+
+  it('renders 2x2 visibility grid and inline file reason on mobile while keeping desktop SegmentedControl', async () => {
+    const originalMatchMedia = window.matchMedia;
+    const prevTier = tierState.callerTier;
+    tierState.callerTier = 'admin';
+    mockStatus.mockResolvedValue({
+      ...STATUS,
+      left_out: [{ path: 'results/notes.md', size: 128, reason: 'markdown', optional: true }],
+    });
+    const setMedia = (mobile: boolean) => {
+      tierState.isMobile = mobile;
+      Object.defineProperty(window, 'matchMedia', {
+        writable: true,
+        configurable: true,
+        value: vi.fn().mockImplementation((query: string) => ({
+          matches:
+            query === '(max-width: 767px)' || query === '(pointer: coarse)' ? mobile : false,
+          media: query,
+          onchange: null,
+          addListener: vi.fn(),
+          removeListener: vi.fn(),
+          addEventListener: vi.fn(),
+          removeEventListener: vi.fn(),
+          dispatchEvent: vi.fn(),
+        })),
+      });
+    };
+
+    try {
+      setMedia(true);
+      const { unmount } = renderWithProviders(
+        <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+      );
+      const grid = await screen.findByTestId('publish-visibility-grid');
+      expect(grid.className).toContain('grid-cols-2');
+      expect(grid.querySelectorAll('button')).toHaveLength(4);
+      const inlineReasons = await screen.findAllByTestId('publish-file-inline-reason');
+      expect(inlineReasons.length).toBeGreaterThan(0);
+      unmount();
+
+      setMedia(false);
+      renderWithProviders(
+        <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+      );
+      await screen.findByRole('button', { name: 'Publish' });
+      expect(screen.queryByTestId('publish-visibility-grid')).toBeNull();
+      expect(screen.queryByTestId('publish-file-inline-reason')).toBeNull();
+    } finally {
+      tierState.callerTier = prevTier;
+      tierState.isMobile = false;
+      Object.defineProperty(window, 'matchMedia', {
+        writable: true,
+        configurable: true,
+        value: originalMatchMedia,
+      });
+    }
   });
 });

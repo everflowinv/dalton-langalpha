@@ -239,7 +239,17 @@ async def test_closed_switch_removed_target_and_eve_chat_are_skipped(
         _completion_row("weixin:user:abc", base),
         targets=["weixin:user:abc"],
     )
-    assert weixin["code"] == "unsupported_platform"
+    assert weixin["status"] == "authorized"
+    assert len(weixin["items"]) == 1
+    assert weixin["items"][0]["kind"] == "text"
+    assert weixin["items"][0]["text"] == "正文"
+
+    unsupported = await _plan(
+        _completion_row("slack:user:abc", base),
+        targets=["slack:user:abc"],
+    )
+    assert unsupported["status"] == "failed"
+    assert unsupported["code"] == "unsupported_platform"
 
 
 def _transport_client(post_result: Any) -> Any:

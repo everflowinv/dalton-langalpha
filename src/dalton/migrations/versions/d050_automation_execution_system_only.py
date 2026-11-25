@@ -10,7 +10,7 @@ recovery, wakeup, command/subagent report, HITL resume, retry, and
 columns directly.
 
 Revision ID: d050
-Revises: d046
+Revises: d052
 Create Date: 2026-11-24
 """
 
@@ -21,7 +21,7 @@ from typing import Sequence, Union
 from alembic import op
 
 revision: str = "d050"
-down_revision: Union[str, None] = "d046"
+down_revision: Union[str, None] = "d052"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

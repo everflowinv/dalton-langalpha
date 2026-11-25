@@ -94,3 +94,18 @@ html.desktop-mac .share-page {
   margin: 0 auto;
   padding: 0.5rem 0 2rem;
 }
+
+/* DALTON-HOOK(mobile-web): reclaim topbar width for document title and respect safe-area on phones */
+@media (max-width: 767px) {
+  .share-page {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+  .share-topbar {
+    gap: 0.375rem;
+    padding: 0 0.625rem;
+  }
+  .share-topbar-brand,
+  .share-topbar-sep {
+    display: none;
+  }
+}

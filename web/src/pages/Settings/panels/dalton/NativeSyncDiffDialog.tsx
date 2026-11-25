@@ -141,7 +141,7 @@ export function NativeSyncDiffDialog({
                 defaultValue: `${unchangedCount} unchanged`,
               })}
             </span>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center justify-end gap-2">
               {onRetire && selectedRetire.size > 0 && (
                 <Button
                   type="button"
@@ -216,7 +216,7 @@ export function NativeSyncDiffDialog({
                         </span>
                       }
                       meta={
-                        <span className="font-mono">
+                        <span className="font-mono max-md:break-all">
                           {item.suggested_key} · {item.upstream_id}
                         </span>
                       }
@@ -267,7 +267,7 @@ export function NativeSyncDiffDialog({
                           />
                         </span>
                       }
-                      meta={<span className="font-mono">{item.key}</span>}
+                      meta={<span className="font-mono max-md:break-all">{item.key}</span>}
                       trailing={
                         onRetire ? (
                           <ToggleSwitch

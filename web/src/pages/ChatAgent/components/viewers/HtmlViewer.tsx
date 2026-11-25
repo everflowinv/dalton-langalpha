@@ -1,4 +1,4 @@
-import React, { useMemo, useRef } from 'react';
+import React, { useEffect, useMemo, useRef } from 'react';
 import { useTheme } from '@/contexts/ThemeContext';
 import SyntaxHighlighter, { oneDark, oneLight } from '../SyntaxHighlighter';
 import { ComposerDockSlot } from '../chatView/composerDock';
@@ -36,6 +36,8 @@ interface HtmlViewerProps {
   artifact?: HtmlArtifactView | null;
   /** Where a link to another workspace file opens. */
   onOpenLink?: FrameLinkHandler | null;
+  // DALTON-HOOK(mobile-web): report the workspace-relative path shown inside the read-only ViewFrame
+  onShownDocChange?: ((docPath: string | null) => void) | null;
 }
 
 /**
@@ -66,6 +68,8 @@ export default function HtmlViewer({
   teamReadOnly = false,
   artifact = null,
   onOpenLink = null,
+  // DALTON-HOOK(mobile-web): forward shown doc path from read-only ViewFrame
+  onShownDocChange = null,
 }: HtmlViewerProps) {
   const { theme } = useTheme();
   const isLight = theme === 'light';
@@ -112,7 +116,16 @@ export default function HtmlViewer({
             // for their session, so the served-URL path cannot serve them.
             <MirrorFrame content={content} fileName={fileName} />
           ) : (
-            <ViewFrame fileName={fileName} workspaceId={workspaceId} filePath={filePath} servePrefix={servePrefix} anchor={anchor} anchorSeq={anchorSeq} onOpenLink={onOpenLink} />
+            <ViewFrame
+              fileName={fileName}
+              workspaceId={workspaceId}
+              filePath={filePath}
+              servePrefix={servePrefix}
+              anchor={anchor}
+              anchorSeq={anchorSeq}
+              onOpenLink={onOpenLink}
+              onShownDocChange={onShownDocChange}
+            />
           )}
         </div>
       )}
@@ -122,7 +135,7 @@ export default function HtmlViewer({
 }
 
 /** The file as served, read only: a share's view, and a panel that takes no comments. */
-function ViewFrame({ fileName, workspaceId, filePath, servePrefix, anchor, anchorSeq, onOpenLink }: {
+function ViewFrame({ fileName, workspaceId, filePath, servePrefix, anchor, anchorSeq, onOpenLink, onShownDocChange }: {
   fileName: string;
   workspaceId: string;
   filePath: string;
@@ -130,8 +143,15 @@ function ViewFrame({ fileName, workspaceId, filePath, servePrefix, anchor, ancho
   anchor: string | null;
   anchorSeq: number | null;
   onOpenLink: FrameLinkHandler | null;
+  onShownDocChange?: ((docPath: string | null) => void) | null;
 }): React.ReactElement {
   const live = useLiveFrame({ workspaceId, filePath, prefix: servePrefix, inject: 'view', anchor, anchorSeq, onOpenLink });
+  // DALTON-HOOK(mobile-web): report the currently displayed document path (e.g. after an in-frame link) to FilePanel
+  const shownDoc = live.failed ? null : (live.bridge?.path ?? null);
+  useEffect(() => {
+    onShownDocChange?.(shownDoc);
+    return () => { onShownDocChange?.(null); };
+  }, [shownDoc, onShownDocChange]);
   if (live.failed) return <ServeFailed onRetry={live.retry} />;
   return <BridgedFrame source={live.source} title={fileName || 'HTML Preview'} groundKey={filePath} onBridge={live.onBridge} />;
 }

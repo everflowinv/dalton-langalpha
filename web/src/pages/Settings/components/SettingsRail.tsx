@@ -187,7 +187,8 @@ export function SettingsRail({ section }: { section: Section }) {
         {query && (
           <button
             type="button"
-            className="settings-search-clear"
+            // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on settings search clear button
+            className="settings-search-clear tap-target"
             aria-label={t('settings:search.clear')}
             onMouseDown={(e) => e.preventDefault()}
             onClick={() => setQuery('')}
@@ -230,7 +231,8 @@ export function SettingsRail({ section }: { section: Section }) {
         <nav ref={navRef} className="settings-rail-nav" aria-label={t('settings:railLabel')}>
           <button
             type="button"
-            className="settings-search-toggle"
+            // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on settings search toggle button
+            className="settings-search-toggle tap-target"
             aria-label={t('settings:search.label')}
             onClick={() => setSearchOpen(true)}
           >
@@ -251,7 +253,8 @@ export function SettingsRail({ section }: { section: Section }) {
                   <Link
                     key={s}
                     to={`?tab=${s}`}
-                    className={cn('page-rail-link', current && 'is-active')}
+                    // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on section pills
+                    className={cn('page-rail-link tap-target', current && 'is-active')}
                     aria-current={current ? 'page' : undefined}
                   >
                     <Icon className="page-rail-icon" aria-hidden />

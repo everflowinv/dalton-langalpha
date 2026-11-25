@@ -35,8 +35,9 @@ function DialogOverlay({
 }
 
 // Mobile swipe variant: flex column container, no overflow (inner scroll child handles it)
+// DALTON-HOOK(mobile-web): lift mobile bottom sheet using visualViewport bottom offset (accounting for offsetTop) and fit max-height to visualViewport height
 const DIALOG_MOBILE_SHEET_CLASSES =
-  "fixed left-0 bottom-0 z-1030 flex flex-col w-full max-w-lg border bg-background shadow-lg rounded-t-3xl max-h-[90dvh] sheet-in";
+  "fixed left-0 bottom-[var(--visual-viewport-bottom-offset,var(--keyboard-overlap,0px))] z-1030 flex flex-col w-full max-w-lg border bg-background shadow-lg rounded-t-3xl max-h-[min(90dvh,calc(var(--visual-viewport-height,100dvh)-1rem))] sheet-in";
 
 // Desktop / centered: single-element grid with native overflow scroll.
 // Centred through `transform`, not translate-*: the pop-in keyframes carry the

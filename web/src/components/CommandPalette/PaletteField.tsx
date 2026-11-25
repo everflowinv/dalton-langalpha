@@ -1,7 +1,8 @@
 import { useLayoutEffect, useRef, type InputHTMLAttributes, type KeyboardEvent } from 'react';
 import { useTranslation } from 'react-i18next';
-import { ChevronRight, Search, X } from 'lucide-react';
+import { ArrowLeft, ChevronRight, Search, X } from 'lucide-react'; // DALTON-HOOK(mobile-web)
 import { Loader } from '@/components/ui/loader';
+import { focusWithoutRing, lastInputWasPointer } from '@/lib/inputModality'; // DALTON-HOOK(mobile-web)
 import { cn } from '@/lib/utils';
 import './PaletteField.css';
 
@@ -24,13 +25,16 @@ interface FieldProps {
   maxLength?: number;
   /** The combobox's wiring to its list. */
   combobox: Pick<InputHTMLAttributes<HTMLInputElement>, 'aria-describedby' | 'aria-controls' | 'aria-activedescendant'>;
+  // DALTON-HOOK(mobile-web): optional mobile-only back & cancel buttons (unset on desktop)
+  onBack?: () => void;
+  onCancel?: () => void;
 }
 
 /**
  * The palette's one field. The row owns its field's focus: the keyboard ring
  * goes round the row, and the always-focused field draws no edge of its own.
  */
-export function PaletteField({ query, onText, onKeyDown, placeholder, label, chips, onLeave, trailing, busy, selected, maxLength, combobox }: FieldProps) {
+export function PaletteField({ query, onText, onKeyDown, placeholder, label, chips, onLeave, trailing, busy, selected, maxLength, combobox, onBack, onCancel }: FieldProps) {
   const { t } = useTranslation();
   const inputRef = useRef<HTMLInputElement>(null);
   // Once, as the value arrives: later edits leave the caret where it is.
@@ -39,7 +43,27 @@ export function PaletteField({ query, onText, onKeyDown, placeholder, label, chi
   }, [selected]);
   return (
     <div className="command-palette-field rings-within owns-its-edge">
-      <Search className="command-palette-field-icon" aria-hidden />
+      {/* DALTON-HOOK(mobile-web): show touch Back button in nested views on mobile */}
+      {onBack ? (
+        <button
+          type="button"
+          className="command-palette-mobile-back tap-target"
+          onMouseDown={(e) => e.preventDefault()}
+          onClick={() => {
+            onBack();
+            // DALTON-HOOK(mobile-web): return focus to the search input before this button unmounts on keyboard activation
+            if (lastInputWasPointer()) focusWithoutRing(inputRef.current);
+            else inputRef.current?.focus();
+          }}
+          aria-label={t('common.back')}
+          title={t('common.back')}
+          data-testid="command-palette-back"
+        >
+          <ArrowLeft className="h-4 w-4" aria-hidden />
+        </button>
+      ) : (
+        <Search className="command-palette-field-icon" aria-hidden />
+      )}
       {chips.map((chip, i) => {
         // Only the last comes off: the one before it is where that leaves.
         const last = i === chips.length - 1;
@@ -83,6 +107,17 @@ export function PaletteField({ query, onText, onKeyDown, placeholder, label, chi
           {trailing}
           <ChevronRight aria-hidden />
         </span>
+      )}
+      {/* DALTON-HOOK(mobile-web): show touch Cancel button on mobile */}
+      {onCancel && (
+        <button
+          type="button"
+          className="command-palette-mobile-cancel tap-target"
+          onClick={onCancel}
+          data-testid="command-palette-cancel"
+        >
+          {t('common.cancel')}
+        </button>
       )}
     </div>
   );

@@ -29,6 +29,9 @@ _MODEL_LITERAL_RE = re.compile(
 # Every entry here is a provider ID, a family/broker prefix pattern (ending with '-' or '-oauth'),
 # an OAuth CLI User-Agent, a nominal price fallback, or a persisted embedding format identifier.
 HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
+    ("embeddings/config.py", "gemini-embedding-2-preview"): "Persisted embedding format identifier: label stored with existing archive vectors",
+    ("embeddings/config.py", "gemini-embedding-2"): "Embedding API model the stored preview label maps to (same vector space)",
+    ("embeddings/config.py", "gemini-"): "Embedding provider inference prefix, not a chat model name",
     ("llm/overlay.py", "-oauth"): "suffix test for private subscription models pruned from the core catalog, not a model name",
     ("llm/antigravity_series.py", "antigravity-oauth"): "Provider id the series grouping matches on",
     ("llm/antigravity_series.py", "-oauth"): "Catalog key suffix stripped before parsing the effort",

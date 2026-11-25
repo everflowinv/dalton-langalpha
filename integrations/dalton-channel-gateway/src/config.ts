@@ -1,9 +1,18 @@
-import { homedir } from "node:os";
-import { resolve } from "node:path";
 import { loadSecureGatewayEnvFile } from "./vault-credentials.js";
 
 export type GatewayStartupMode = "incoming" | "outgoing";
 export type FeishuCredentialSource = "vault" | "env";
+
+export interface StatusFeedbackConfig {
+  /** Global master switch (`DALTON_STATUS_FEEDBACK_ENABLED`, default `true`). */
+  enabled: boolean;
+  /** Per-platform switches (`DALTON_<PLATFORM>_STATUS_FEEDBACK_ENABLED`, each default `true`). */
+  platforms: {
+    feishu: boolean;
+    discord: boolean;
+    weixin: boolean;
+  };
+}
 
 export interface GatewayConfig {
   /** Strictly `127.0.0.1` (§0.2, §5.1). */
@@ -20,8 +29,6 @@ export interface GatewayConfig {
   backendUrl: string;
   /** Frontend web base URL for settings/interrupt links, e.g. `https://app.ginlix.ai` or `http://localhost:5173`. */
   webBaseUrl: string;
-  /** Local Weixin cache directory (`~/.dalton/channel-gateway/weixin`, mode 0700). */
-  weixinCacheDir: string;
   /**
    * Host file for loopback ops alerts (`DALTON_OPS_ALERTS_FILE`).
    * Read from the merged process and env-file configuration. Empty when unset.
@@ -29,6 +36,12 @@ export interface GatewayConfig {
   opsAlertsFile?: string;
   /** Whether colleague workspace dispatch is enabled (`DALTON_COLLEAGUE_DISPATCH_ENABLED`). */
   colleagueDispatchEnabled: boolean;
+  /**
+   * Processing status feedback switches (global + per-platform, all default `true`).
+   * Identical defaults for Everflow and standalone core installs; active handles live
+   * strictly in gateway process memory (indicators left behind across a restart are not cleaned up).
+   */
+  statusFeedback?: StatusFeedbackConfig;
   /** Enabled channel platforms. */
   channels: {
     feishu: {
@@ -60,6 +73,7 @@ export function loadConfig(
 ): GatewayConfig & {
   mode: GatewayStartupMode;
   feishuCredentialSource: FeishuCredentialSource;
+  statusFeedback: StatusFeedbackConfig;
 } {
   const explicitCredSourceRaw = (env.DALTON_FEISHU_CREDENTIAL_SOURCE ?? "")
     .trim()
@@ -129,10 +143,6 @@ export function loadConfig(
   const webBaseUrl = (mergedEnv.WEB_BASE_URL ?? "http://localhost:5173")
     .trim()
     .replace(/\/+$/, "");
-  const weixinCacheDir = (
-    mergedEnv.DALTON_WEIXIN_CACHE_DIR ??
-    resolve(homedir(), ".dalton", "channel-gateway", "weixin")
-  ).trim();
 
   const rawMode = (
     mergedEnv.DALTON_GATEWAY_MODE ??
@@ -184,6 +194,27 @@ export function loadConfig(
       ? Boolean(discordBotToken)
       : parseBool(mergedEnv.DALTON_DISCORD_ENABLED, false);
 
+  const parseDefaultTrueBool = (value: string | undefined): boolean => {
+    const trimmed = value?.trim();
+    if (!trimmed) return true;
+    return parseBool(trimmed, true);
+  };
+
+  const statusFeedback: StatusFeedbackConfig = {
+    enabled: parseDefaultTrueBool(mergedEnv.DALTON_STATUS_FEEDBACK_ENABLED),
+    platforms: {
+      feishu: parseDefaultTrueBool(
+        mergedEnv.DALTON_FEISHU_STATUS_FEEDBACK_ENABLED,
+      ),
+      discord: parseDefaultTrueBool(
+        mergedEnv.DALTON_DISCORD_STATUS_FEEDBACK_ENABLED,
+      ),
+      weixin: parseDefaultTrueBool(
+        mergedEnv.DALTON_WEIXIN_STATUS_FEEDBACK_ENABLED,
+      ),
+    },
+  };
+
   return {
     host: "127.0.0.1",
     port,
@@ -192,12 +223,12 @@ export function loadConfig(
     serviceToken,
     backendUrl,
     webBaseUrl,
-    weixinCacheDir,
     opsAlertsFile: (mergedEnv.DALTON_OPS_ALERTS_FILE ?? "").trim(),
     colleagueDispatchEnabled: parseBool(
       mergedEnv.DALTON_COLLEAGUE_DISPATCH_ENABLED,
       true,
     ),
+    statusFeedback,
     channels: {
       feishu: {
         enabled: feishuEnabled,
@@ -221,7 +252,8 @@ export function loadConfig(
           .trim()
           .replace(/\/+$/, ""),
         cdnBaseUrl: (
-          env.DALTON_WEIXIN_CDN_BASE_URL ?? "https://novac2c.cdn.weixin.qq.com/c2c"
+          mergedEnv.DALTON_WEIXIN_CDN_BASE_URL ??
+          "https://novac2c.cdn.weixin.qq.com/c2c"
         )
           .trim()
           .replace(/\/+$/, ""),

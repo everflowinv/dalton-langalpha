@@ -74,6 +74,10 @@ export function trackVisualViewport(): void {
   if (!viewport) return;
   const root = document.documentElement;
   let revealed: Element | null = null;
+  // DALTON-HOOK(mobile-web): track revealed field inside sheets/modals/auth pages and baseline height for Android/WeChat resizes-content fallback
+  let revealedOverlay: Element | null = null;
+  let baselineHeight = viewport.height;
+  let baselineWidth = viewport.width ?? window.innerWidth;
   let fittedTo: number | null = null;
 
   const notify = (height: number | null) => {
@@ -84,17 +88,57 @@ export function trackVisualViewport(): void {
   const sync = () => {
     const overlap = keyboardOverlap();
     const active = document.activeElement;
+    // DALTON-HOOK(mobile-web): publish visual-viewport height and vertical offsets (offsetTop + bottom inset) for sheets, modals and standalone auth pages, including Android/WeChat where layout clientHeight shrinks with the keyboard (overlap === 0) while dvh may not
+    const unpinched = viewport.scale <= PINCH_SCALE && viewport.height > 0;
+    if (unpinched) {
+      const currentWidth = viewport.width ?? window.innerWidth;
+      if (currentWidth !== baselineWidth || viewport.height > baselineHeight) {
+        baselineWidth = currentWidth;
+        baselineHeight = viewport.height;
+      }
+      const offsetTop = Math.max(0, Math.round(viewport.offsetTop ?? 0));
+      const bottomOffset = Math.max(0, Math.round(root.clientHeight - (offsetTop + viewport.height)));
+      root.style.setProperty('--visual-viewport-height', `${Math.round(viewport.height)}px`);
+      if (offsetTop > 0 || bottomOffset > 0) {
+        root.style.setProperty('--visual-viewport-offset-top', `${offsetTop}px`);
+        root.style.setProperty('--visual-viewport-bottom-offset', `${bottomOffset}px`);
+      } else {
+        root.style.removeProperty('--visual-viewport-offset-top');
+        root.style.removeProperty('--visual-viewport-bottom-offset');
+      }
+    } else {
+      root.style.removeProperty('--visual-viewport-height');
+      root.style.removeProperty('--visual-viewport-offset-top');
+      root.style.removeProperty('--visual-viewport-bottom-offset');
+    }
+    if (overlap) {
+      root.style.setProperty('--keyboard-overlap', `${overlap}px`);
+    } else {
+      root.style.removeProperty('--keyboard-overlap');
+    }
+    const overlayKeyboardUp = overlap > 0 || (unpinched && (baselineHeight - viewport.height) > KEYBOARD_MIN_PX);
+    if (!overlayKeyboardUp) {
+      revealedOverlay = null;
+    }
     if (!overlap || !inShell(active)) {
       delete root.dataset.keyboardOpen;
       root.style.removeProperty('--keyboard-viewport-height');
-      root.style.removeProperty('--keyboard-overlap');
       revealed = null;
+      if (
+        overlayKeyboardUp
+        && active instanceof Element
+        && active !== revealedOverlay
+        && active.closest('.login-page, [data-sheet], .cwm-modal')
+      ) {
+        active.scrollIntoView({ block: 'nearest' });
+        revealedOverlay = active;
+      }
       if (fittedTo !== null) notify(null);
       return;
     }
+    revealedOverlay = null;
     root.dataset.keyboardOpen = '';
     root.style.setProperty('--keyboard-viewport-height', `${viewport.height}px`);
-    root.style.setProperty('--keyboard-overlap', `${overlap}px`);
 
     // Safari revealed the field by panning, so a field low in a scrolling route
     // sits under the keyboard once the pan is gone. Once per field: a textarea
@@ -108,6 +152,8 @@ export function trackVisualViewport(): void {
     if (newField || viewport.height !== fittedTo) notify(viewport.height);
   };
 
+  // DALTON-HOOK(mobile-web): seed --visual-viewport-height on init so fallback holds before the first resize
+  sync();
   viewport.addEventListener('resize', sync);
   viewport.addEventListener('scroll', sync);
   // Focus can cross between the shell and an overlay with the keyboard staying up.

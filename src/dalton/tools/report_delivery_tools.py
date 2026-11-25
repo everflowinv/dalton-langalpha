@@ -53,7 +53,7 @@ def create_report_delivery_tools() -> list[BaseTool]:
           - `automation_id` 必填。
           - `profile`：需在 `REPORT_PROFILES` 中且与任务指令引用的技能匹配；若任务指令可唯一推断（如 `dalton-daily-filing-alert` -> `daily-filing-alert`）可省略，推断不出时必须显式传入。
           - `report_targets`：报告卡片目标列表（仅支持已授权 `feishu:chat:oc_*` 或本人 `feishu:user:ou_*`）。
-          - `text_targets`：可选纯文字摘要目标列表（支持飞书或 Discord）。
+          - `text_targets`：可选纯文字摘要目标列表（支持飞书、Discord 或个人微信 `weixin:user:*`）。
           - `failure_targets`：可选失败告警目标列表（仅支持 `discord:user:*` 或 `[]`；省略时默认使用任务属主的私信（已绑定的 Discord 私信），无绑定则为 `[]`）。
           - 群目标确认要求：**设置任何群/频道目标（`feishu:chat:*` / `discord:channel:*`）时，必须用户在本次对话里明确确认要发到该群，才可传 `user_confirmed=true`**；仅设置调用者本人私信目标无需确认。未在群报告授权名单里的群或非群成员会被拒绝。
         - `action="clear"`：撤销指定任务的 `report_profile` 并清理其 `automation:<id>` 路由（审计记录同步写入任务审计历史 `audit_history`）。

@@ -29,8 +29,19 @@ import {
   resolveReceiveIdType,
 } from "./targets.js";
 
-export const WITHDRAWN_REPLY_ERROR_CODES = new Set<number>([230011, 231003]);
+export const WITHDRAWN_REPLY_ERROR_CODES = new Set<number>([
+  230011,
+  231003,
+  230110,
+]);
 export const FEISHU_SEND_RATE_LIMIT_CODES = new Set<number>([230020, 11232]);
+
+/** Default Feishu emoji types for processing status feedback (configurable via adapter options). */
+export const FEISHU_PROCESSING_EMOJI_TYPE = "Typing";
+export const FEISHU_PROCESSING_EMOJI_FALLBACK_TYPE = "OnIt";
+export const FEISHU_FAILED_EMOJI_TYPE = "CrossMark";
+
+const INVALID_EMOJI_TYPE_FEISHU_CODES = new Set<number>([231001]);
 
 const TARGET_NOT_FOUND_FEISHU_CODES = new Set<number>([
   230002,
@@ -180,6 +191,180 @@ export function shouldFallbackFromReplyTarget(err: unknown): boolean {
     return /withdrawn|not found/i.test(err.message);
   }
   return false;
+}
+
+export function isInvalidFeishuEmojiTypeError(err: unknown): boolean {
+  if (isWithdrawnReplyError(err)) {
+    return false;
+  }
+  const meta = extractFeishuApiErrorMeta(err);
+  if (meta.httpStatus === 401 || meta.httpStatus === 403) {
+    return false;
+  }
+  const numericCode =
+    typeof meta.feishuCode === "number"
+      ? meta.feishuCode
+      : typeof meta.feishuCode === "string" && /^\d+$/.test(meta.feishuCode)
+        ? Number.parseInt(meta.feishuCode, 10)
+        : undefined;
+  if (
+    numericCode === 99991663 ||
+    numericCode === 99991668 ||
+    numericCode === 99991672
+  ) {
+    return false;
+  }
+  if (
+    numericCode !== undefined &&
+    INVALID_EMOJI_TYPE_FEISHU_CODES.has(numericCode)
+  ) {
+    return true;
+  }
+  const combinedMsg = `${meta.feishuMsg ?? ""} ${meta.message ?? ""}`;
+  return /emoji_type|invalid\s+emoji|unsupported\s+emoji|reaction_type/i.test(
+    combinedMsg,
+  );
+}
+
+export interface FeishuAddReactionResult {
+  ok: boolean;
+  reactionId: string | null;
+  withdrawn: boolean;
+  invalidEmojiType: boolean;
+  error?: unknown;
+}
+
+export interface FeishuRemoveReactionResult {
+  ok: boolean;
+  withdrawn: boolean;
+  error?: unknown;
+}
+
+/**
+ * Best-effort wrapper around `POST /open-apis/im/v1/messages/:message_id/reactions`.
+ * Never throws; classifies withdrawn-message errors (`230011` / `231003`) and
+ * unsupported emoji type errors for caller fallback.
+ */
+export async function addFeishuReaction(
+  client: Lark.Client,
+  params: { messageId: string; emojiType: string },
+): Promise<FeishuAddReactionResult> {
+  const createFn = (
+    client as unknown as {
+      im?: {
+        messageReaction?: {
+          create?: (req: {
+            path: { message_id: string };
+            data: { reaction_type: { emoji_type: string } };
+          }) => Promise<{
+            code?: number;
+            msg?: string;
+            data?: { reaction_id?: string };
+          }>;
+        };
+      };
+    }
+  ).im?.messageReaction?.create;
+
+  if (typeof createFn !== "function") {
+    return {
+      ok: false,
+      reactionId: null,
+      withdrawn: false,
+      invalidEmojiType: false,
+      error: "Feishu client does not expose im.messageReaction.create",
+    };
+  }
+
+  try {
+    const response = await createFn({
+      path: { message_id: params.messageId },
+      data: {
+        reaction_type: {
+          emoji_type: params.emojiType,
+        },
+      },
+    });
+    if (response?.code !== undefined && response.code !== 0) {
+      return {
+        ok: false,
+        reactionId: null,
+        withdrawn: WITHDRAWN_REPLY_ERROR_CODES.has(response.code),
+        invalidEmojiType: isInvalidFeishuEmojiTypeError(response),
+        error: response,
+      };
+    }
+    const reactionId = response?.data?.reaction_id?.trim() || null;
+    return {
+      ok: true,
+      reactionId,
+      withdrawn: false,
+      invalidEmojiType: false,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      reactionId: null,
+      withdrawn: isWithdrawnReplyError(err),
+      invalidEmojiType: isInvalidFeishuEmojiTypeError(err),
+      error: err,
+    };
+  }
+}
+
+/**
+ * Best-effort wrapper around `DELETE /open-apis/im/v1/messages/:message_id/reactions/:reaction_id`.
+ * Never throws; classifies withdrawn-message errors (`230011` / `231003`) for silent abandon.
+ */
+export async function removeFeishuReaction(
+  client: Lark.Client,
+  params: { messageId: string; reactionId: string },
+): Promise<FeishuRemoveReactionResult> {
+  const deleteFn = (
+    client as unknown as {
+      im?: {
+        messageReaction?: {
+          delete?: (req: {
+            path: { message_id: string; reaction_id: string };
+          }) => Promise<{
+            code?: number;
+            msg?: string;
+          }>;
+        };
+      };
+    }
+  ).im?.messageReaction?.delete;
+
+  if (typeof deleteFn !== "function") {
+    return {
+      ok: false,
+      withdrawn: false,
+      error: "Feishu client does not expose im.messageReaction.delete",
+    };
+  }
+
+  try {
+    const response = await deleteFn({
+      path: {
+        message_id: params.messageId,
+        reaction_id: params.reactionId,
+      },
+    });
+    if (response?.code !== undefined && response.code !== 0) {
+      return {
+        ok: false,
+        withdrawn: WITHDRAWN_REPLY_ERROR_CODES.has(response.code),
+        error: response,
+      };
+    }
+    return { ok: true, withdrawn: false };
+  } catch (err) {
+    return {
+      ok: false,
+      withdrawn: isWithdrawnReplyError(err),
+      error: err,
+    };
+  }
 }
 
 /**

@@ -12,6 +12,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 import { sharedSeq } from '@/hooks/useArtifact';
+import { useIsMobile } from '@/hooks/useIsMobile'; // DALTON-HOOK(mobile-web)
 import { useLocale } from '@/hooks/useLocale';
 import { shortMonthDay } from '@/lib/format';
 import type { ArtifactVersionView } from '../../filePanel/useArtifactVersionView';
@@ -37,6 +38,7 @@ interface ArtifactVersionPickerProps {
  */
 export function ArtifactVersionPicker({ view, variant }: ArtifactVersionPickerProps): React.ReactElement | null {
   const { t } = useTranslation();
+  const isMobile = useIsMobile(); // DALTON-HOOK(mobile-web)
   const locale = useLocale();
   const { record, version, updatedTo } = view;
   const latestSeq = record?.latest_seq ?? 0;
@@ -58,8 +60,53 @@ export function ArtifactVersionPicker({ view, variant }: ArtifactVersionPickerPr
     : announcing
       ? t('filePanel:pageUpdated', { seq: version })
       : t('filePanel:pageVersion', { seq: version });
+  // DALTON-HOOK(mobile-web): preserve published/unshared/updated status marker on phones via status dot + concise label
+  const compactSeq = version ?? (visitorsAt > 0 ? visitorsAt : latestSeq);
+  const compactStatus: 'published' | 'unshared' | 'updated' | null = announcing
+    ? 'updated'
+    : version === null
+      ? (visitorsAt > 0 || shared ? 'published' : 'unshared')
+      : null;
+  const compactStatusText = compactStatus === 'updated'
+    ? t('artifact.compactUpdated')
+    : compactStatus === 'published'
+      ? t('artifact.compactPublished')
+      : compactStatus === 'unshared'
+        ? t('artifact.compactUnshared')
+        : null;
+  const versionTag = t('filePanel:pageVersion', { seq: compactSeq });
+  const displayLabel = isMobile
+    ? (compactStatusText ? `${compactStatusText} ${versionTag}` : versionTag)
+    : label;
   const name = version === null ? t('artifact.liveName') : t('filePanel:pageVersionName', { seq: version });
-  const face = <SwapCell swapKey={label}>{label}</SwapCell>;
+  // DALTON-HOOK(mobile-web): keep full accessible name on phones — live views state both live status & published/unshared version, snapshots use "Version N"
+  const mobileAriaLabel = version === null
+    ? t('artifact.liveStatusName', { status: label })
+    : announcing
+      ? label
+      : name;
+  const compactDot = isMobile && compactStatus ? (
+    <span
+      aria-hidden="true"
+      data-version-status={compactStatus}
+      className="h-1.5 w-1.5 rounded-full shrink-0"
+      style={
+        compactStatus === 'published'
+          ? { backgroundColor: 'var(--color-success)' }
+          : compactStatus === 'updated'
+            ? { backgroundColor: 'var(--color-accent-primary)' }
+            : { border: '1.5px solid var(--color-text-tertiary)' }
+      }
+    />
+  ) : null;
+  const face = (
+    <SwapCell swapKey={`${compactStatus ?? 'snapshot'}:${displayLabel}`}>
+      <span className="inline-flex items-center gap-1">
+        {compactDot}
+        <span>{displayLabel}</span>
+      </span>
+    </SwapCell>
+  );
   const list = view.versions ?? [];
 
   return (
@@ -68,13 +115,15 @@ export function ArtifactVersionPicker({ view, variant }: ArtifactVersionPickerPr
       <span role="status" className="sr-only">{announcing ? label : ''}</span>
       <DropdownMenu modal={false}>
         <DropdownMenuTrigger asChild>
+          {/* DALTON-HOOK(mobile-web): stamp data-version-status and keep full accessible name on phones */}
           {variant === 'chip' ? (
             <button
               type="button"
               data-artifact-version-picker=""
+              data-version-status={isMobile ? (compactStatus ?? 'snapshot') : undefined}
               className="file-panel-port-chip artifact-version-chip"
-              aria-label={name}
-              title={t('filePanel:pageVersions')}
+              aria-label={isMobile ? mobileAriaLabel : name}
+              title={isMobile ? mobileAriaLabel : t('filePanel:pageVersions')}
             >
               {face}
               <ChevronDown className="h-3 w-3" />
@@ -83,10 +132,11 @@ export function ArtifactVersionPicker({ view, variant }: ArtifactVersionPickerPr
             <Button
               type="button"
               data-artifact-version-picker=""
+              data-version-status={isMobile ? (compactStatus ?? 'snapshot') : undefined}
               variant="outline"
               size="sm"
-              aria-label={name}
-              title={t('filePanel:pageVersions')}
+              aria-label={isMobile ? mobileAriaLabel : name}
+              title={isMobile ? mobileAriaLabel : t('filePanel:pageVersions')}
               className="h-[30px] gap-1 px-2 text-xs sm:px-2.5"
             >
               {face}

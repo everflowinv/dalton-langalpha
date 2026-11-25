@@ -4627,6 +4627,47 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
     assert db_row["attempt_count"] == 1
 
     # -------------------------------------------------------------------------
+    # 1b. R13 (Codex #4 / Grok med): Remaining budget 200s (< 244s) MUST NOT claim!
+    # -------------------------------------------------------------------------
+    clock["t"] = 1500.0
+    db_row.update(
+        {
+            "status": "failed",
+            "attempt_count": 1,
+            "error_code": "ConnectError",
+        }
+    )
+    executed_sql.clear()
+
+    async def _routes_leaving_200s(_uid: str | None) -> dict[str, list[str]]:
+        # 250.0 - 50.0 = 200.0s remaining (< 244.0s required for gateway read + 4s write)
+        clock["t"] = 1550.0
+        return {"data:softbank-nav-monitor": [target]}
+
+    sent_1b = await notify_dispatch_mod.retry_failed_notify_deliveries(
+        data_task_notify_fn=transport_spy,
+        resolve_enabled_fn=create_autospec(
+            resolve_dalton_notify_enabled, return_value=True
+        ),
+        resolve_overrides_fn=create_autospec(
+            resolve_dalton_notify_overrides, return_value={}
+        ),
+        resolve_targets_fn=create_autospec(
+            resolve_dalton_notify_targets, return_value=[target]
+        ),
+        resolve_routes_fn=create_autospec(
+            resolve_dalton_notify_routes, side_effect=_routes_leaving_200s
+        ),
+        is_admin_fn=create_autospec(_is_admin, return_value=True),
+        max_duration_s=250.0,
+    )
+    assert sent_1b == 0
+    transport_spy.assert_not_awaited()
+    assert not any("RETURNING attempt_count" in q for q, _ in executed_sql)
+    assert db_row["status"] == "failed"
+    assert db_row["attempt_count"] == 1
+
+    # -------------------------------------------------------------------------
     # 2. DB claim consumes remaining budget (including on 3rd attempt `attempt_count: 2 -> 3`):
     #    Transport is NOT called, row is restored to `failed` with `attempt_count = 2` (never left
     #    `uncertain` or `attempts_exhausted`), and conditional recovery never overwrites a newer `attempt_count = 3`.
@@ -4639,7 +4680,7 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
             "error_code": "ConnectError",
         }
     )
-    advance_clock_on_claim_to = 2029.95
+    advance_clock_on_claim_to = 2050.0  # 200s remaining (< 244s) after claim -> release claim!
     executed_sql.clear()
 
     sent_2 = await notify_dispatch_mod.retry_failed_notify_deliveries(
@@ -4658,7 +4699,7 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
             return_value={"data:softbank-nav-monitor": [target]},
         ),
         is_admin_fn=create_autospec(_is_admin, return_value=True),
-        max_duration_s=30.0,
+        max_duration_s=250.0,
     )
     assert sent_2 == 0
     transport_spy.assert_not_awaited()
@@ -4676,7 +4717,7 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
             "error_code": "ConnectError",
         }
     )
-    advance_clock_on_claim_to = 3029.95
+    advance_clock_on_claim_to = 3050.0
     concurrent_attempt_on_release = 3
     executed_sql.clear()
 
@@ -4696,7 +4737,7 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
             return_value={"data:softbank-nav-monitor": [target]},
         ),
         is_admin_fn=create_autospec(_is_admin, return_value=True),
-        max_duration_s=30.0,
+        max_duration_s=250.0,
     )
     assert sent_2b == 0
     transport_spy.assert_not_awaited()
@@ -4708,9 +4749,9 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
 
     # -------------------------------------------------------------------------
     # 3. Real `post_data_task_gateway_notify` + synthetic `ConnectTimeout`:
-    #    Client receives `timeout_s` budget (e.g. 2.5s when 24.0s elapsed out of 30.0s),
-    #    completes `ConnectTimeout` classification without being cancelled at 0.1s,
-    #    and outer row is persisted as retryable `failed` (`error_code='ConnectTimeout'`).
+    #    When 245.0s remains (>= 244.0s floor), row IS claimed and dispatched with
+    #    GATEWAY_DELIVERY_READ_TIMEOUT_S (240.0s) read timeout, completes `ConnectTimeout`
+    #    classification cleanly, and persists retryable `failed` (`error_code='ConnectTimeout'`).
     # -------------------------------------------------------------------------
     clock["t"] = 4000.0
     db_row.update(
@@ -4753,9 +4794,9 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
         ),
     )
 
-    async def _routes_leaving_2_5s(_uid: str | None) -> dict[str, list[str]]:
-        # 30.0 - 24.0 - 3.5 = 2.5s request_timeout_s
-        clock["t"] = 4024.0
+    async def _routes_leaving_245s(_uid: str | None) -> dict[str, list[str]]:
+        # 250.0 - 5.0 = 245.0s remaining (>= 244.0s -> claims and dispatches!)
+        clock["t"] = 4005.0
         return {"data:softbank-nav-monitor": [target]}
 
     sent_3 = await notify_dispatch_mod.retry_failed_notify_deliveries(
@@ -4770,20 +4811,23 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
             resolve_dalton_notify_targets, return_value=[target]
         ),
         resolve_routes_fn=create_autospec(
-            resolve_dalton_notify_routes, side_effect=_routes_leaving_2_5s
+            resolve_dalton_notify_routes, side_effect=_routes_leaving_245s
         ),
         is_admin_fn=create_autospec(_is_admin, return_value=True),
-        max_duration_s=30.0,
+        max_duration_s=250.0,
     )
     assert sent_3 == 0
     assert connect_record["started"] is True
     assert connect_record["cancelled"] is False
+    # R12/R13: Gateway HTTP read timeout is >= GATEWAY_DELIVERY_READ_TIMEOUT_S (240s);
+    # with 245.0s wall remaining minus 3.5s reserve -> 241.5s (>= 240.0s), connect stays 5.0s.
     assert connect_record["timeout"] == {
-        "connect": pytest.approx(2.5),
-        "read": pytest.approx(2.5),
-        "write": pytest.approx(2.5),
-        "pool": pytest.approx(2.5),
+        "connect": pytest.approx(5.0),
+        "read": pytest.approx(241.5),
+        "write": pytest.approx(241.5),
+        "pool": pytest.approx(241.5),
     }
+    assert connect_record["timeout"]["read"] >= ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S
     assert db_row["status"] == "failed"
     assert db_row["error_code"] == "ConnectTimeout"
     assert db_row["attempt_count"] == 2
@@ -4829,7 +4873,7 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
             return_value={"data:softbank-nav-monitor": [target]},
         ),
         is_admin_fn=create_autospec(_is_admin, return_value=True),
-        max_duration_s=30.0,
+        max_duration_s=250.0,
     )
     assert sent_4a == 0
     assert read_timeout_calls["count"] == 1
@@ -4854,7 +4898,7 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
             return_value={"data:softbank-nav-monitor": [target]},
         ),
         is_admin_fn=create_autospec(_is_admin, return_value=True),
-        max_duration_s=30.0,
+        max_duration_s=250.0,
     )
     assert sent_4b == 0
     assert read_timeout_calls["count"] == 1
@@ -4904,7 +4948,7 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
             return_value={"data:softbank-nav-monitor": [target]},
         ),
         is_admin_fn=create_autospec(_is_admin, return_value=True),
-        max_duration_s=30.0,
+        max_duration_s=250.0,
     )
     assert sent_4c == 0
     assert db_row["status"] == "pending"
@@ -4912,10 +4956,10 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
     assert db_row["attempt_count"] == 2
 
     # -------------------------------------------------------------------------
-    # 5. `preflight.decide` reserves explicit headroom (`max_duration_s=26.0` inside `timeout=30.0`)
+    # 5. `preflight.decide` reserves explicit headroom above GATEWAY_DELIVERY_READ_TIMEOUT_S (240s)
     # -------------------------------------------------------------------------
-    assert preflight_mod.PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S == 30.0
-    assert preflight_mod.PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S == 26.0
+    assert preflight_mod.PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S == ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S + 10.0
+    assert preflight_mod.PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S == preflight_mod.PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S + 4.0
     assert (
         preflight_mod.PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S
         - preflight_mod.PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S
@@ -4945,7 +4989,7 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
     assert observed_retry_kwargs == [
         {
             "limit": 5,
-            "max_duration_s": 26.0,
+            "max_duration_s": preflight_mod.PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S,
         }
     ]
 

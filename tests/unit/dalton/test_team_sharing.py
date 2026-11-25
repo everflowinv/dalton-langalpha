@@ -1219,11 +1219,17 @@ class TestWriteEndpointsRejectColleagues:
         assert exc_del.value.status_code == 403
 
         # Upload file -> 403
+        from starlette.requests import Request as StarletteRequest
+
+        plain_req = StarletteRequest(
+            {"type": "http", "method": "POST", "path": "/upload", "headers": []}
+        )
         fake_upload = create_autospec(UploadFile, instance=True)
         with pytest.raises(HTTPException) as exc_up:
             await ws_files_crud.upload_workspace_file(
                 ws["workspace_id"],
                 x_user_id="u-chao",
+                request=plain_req,
                 path="results/new.txt",
                 file=fake_upload,
             )

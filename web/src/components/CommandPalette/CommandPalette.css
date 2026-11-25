@@ -379,3 +379,11 @@
   /* A phone has no keys to name. */
   .command-palette-footer { display: none; }
 }
+
+/* DALTON-HOOK(mobile-web): top-align palette and cap height to visual viewport on phones */
+@media (max-width: 767px) {
+  .command-palette {
+    top: 1rem;
+    max-height: calc(var(--command-palette-vh, var(--visual-viewport-height, 100dvh)) - 2rem);
+  }
+}

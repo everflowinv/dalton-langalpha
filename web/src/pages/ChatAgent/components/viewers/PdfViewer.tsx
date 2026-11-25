@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import type { PDFDocumentProxy } from 'pdfjs-dist';
 import { PanelLeft } from 'lucide-react';
 import { useElement } from '@/hooks/useElement';
+import { useIsMobile } from '@/hooks/useIsMobile'; // DALTON-HOOK(mobile-web)
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { isRangedFile, markStale, type RangedFile } from '@/lib/rangedFile';
 import { Document, Page, pdfjs } from 'react-pdf';
@@ -167,6 +168,7 @@ interface PdfViewerProps {
 
 export default function PdfViewer({ data, onFileChanged, focusPage = null, focusSeq = null, onPageCount, comments = null }: PdfViewerProps) {
   const { t } = useTranslation();
+  const isMobile = useIsMobile(); // DALTON-HOOK(mobile-web)
   const [pageSizes, setPageSizes] = useState<PageSize[] | null>(null);
   const [zoom, setZoom] = useState<Zoom>('fit');
   const [fitWidth, setFitWidth] = useState(0);
@@ -180,6 +182,7 @@ export default function PdfViewer({ data, onFileChanged, focusPage = null, focus
   const [hasOutline, setHasOutline] = useState(false);
   const [railOpen, setRailOpen] = useState(false);
   const [railTab, setRailTab] = useState<RailTab>('pages');
+  const railToggleRef = useRef<HTMLButtonElement>(null); // DALTON-HOOK(mobile-web)
   // What the reader is typing into the page field; null while they are not.
   const [pageDraft, setPageDraft] = useState<string | null>(null);
 
@@ -468,12 +471,37 @@ export default function PdfViewer({ data, onFileChanged, focusPage = null, focus
     };
   }, []);
 
+  // DALTON-HOOK(mobile-web): close mobile floating rail and return focus to the Pages toggle button
+  const closeMobileRail = useStableHandler(() => {
+    if (isMobile) railToggleRef.current?.focus();
+    setRailOpen(false);
+  });
+
+  // DALTON-HOOK(mobile-web): fallback window Escape listener when focus is outside .pdf-viewer (e.g. after tapping backdrop)
+  useEffect(() => {
+    if (!isMobile || !railOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation();
+        railToggleRef.current?.focus();
+        setRailOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isMobile, railOpen]);
+
   // Bubble errors to the error boundary via render-phase throw
   if (error) throw error;
 
   const stretch = layout ? layout.scale / pageScale : 1;
   // Names what the rail holds, so it never reads as the app's own sidebar.
   const railLabel = t(hasOutline ? 'pdfViewer.sidebar' : 'pdfViewer.pages');
+  // DALTON-HOOK(mobile-web): auto-close floating rail and restore focus after selecting a thumbnail or outline item on phones
+  const handleRailGoToPage = (index: number) => {
+    scrollToPage(index);
+    if (isMobile) closeMobileRail();
+  };
   // The rail draws only from the current copy, never one being torn down.
   const railDoc = loaded && loaded.from === data && pageSizes ? loaded.pdf : null;
   const rail = railOpen && railDoc && pageSizes ? {
@@ -483,7 +511,7 @@ export default function PdfViewer({ data, onFileChanged, focusPage = null, focus
     hasOutline,
     tab: railTab,
     onTabChange: setRailTab,
-    onGoToPage: scrollToPage,
+    onGoToPage: handleRailGoToPage,
     onMeasure: measurePage,
   } : null;
 
@@ -498,11 +526,22 @@ export default function PdfViewer({ data, onFileChanged, focusPage = null, focus
   };
 
   return (
-    <div className="pdf-viewer">
+    <div
+      className="pdf-viewer"
+      // DALTON-HOOK(mobile-web): intercept Escape inside the viewer before FilePanel's keydown opens the file tree
+      onKeyDown={(e) => {
+        if (isMobile && railOpen && e.key === 'Escape') {
+          e.preventDefault();
+          e.stopPropagation();
+          closeMobileRail();
+        }
+      }}
+    >
       {/* Controls */}
       <div className="pdf-controls rule-b">
         <div className="pdf-nav">
           <button
+            ref={railToggleRef}
             type="button"
             onClick={() => setRailOpen((open) => !open)}
             disabled={!railDoc}
@@ -604,6 +643,15 @@ export default function PdfViewer({ data, onFileChanged, focusPage = null, focus
       </div>
 
       <div className="pdf-body">
+        {/* DALTON-HOOK(mobile-web): backdrop dismisses floating thumbnail rail and restores focus to Pages toggle on phones */}
+        {isMobile && railOpen && (
+          <div
+            className="pdf-rail-backdrop"
+            data-testid="pdf-rail-backdrop"
+            aria-hidden="true"
+            onClick={closeMobileRail}
+          />
+        )}
         {/* Only the owner's view reads the file's comments, to count them on each page. */}
         {rail && (comments ? <CountedRail target={comments} {...rail} /> : <PdfRail {...rail} />)}
 

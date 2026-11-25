@@ -1,9 +1,17 @@
 import React, { useState } from 'react';
-import { FileDown, Link2, RefreshCw } from 'lucide-react';
+import { FileDown, Link2, MoreHorizontal, RefreshCw } from 'lucide-react'; // DALTON-HOOK(mobile-web)
 import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router';
+import { Button } from '@/components/ui/button'; // DALTON-HOOK(mobile-web)
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'; // DALTON-HOOK(mobile-web)
 import { toast } from '@/components/ui/use-toast';
 import { useEnsureArtifact } from '@/hooks/useArtifact';
+import { useIsMobile } from '@/hooks/useIsMobile'; // DALTON-HOOK(mobile-web)
 import { ThreadLifecycleFeed } from '@/lib/threadLifecycle/ThreadLifecycleFeed';
 import PublishDialog from '../ChatAgent/components/PublishDialog';
 import {
@@ -64,6 +72,7 @@ export default function OwnerArtifactView({ code, metadata }: {
   metadata: SharedOwnerFileMetadata;
 }): React.ReactElement {
   const { t } = useTranslation();
+  const isMobile = useIsMobile(); // DALTON-HOOK(mobile-web)
   const { path, name, workspace_id: workspaceId, frame_base: frameBase } = metadata;
   // The record moves with a publish made here or anywhere, so the view reads
   // it rather than the link's answer, which is only where the page started.
@@ -107,6 +116,8 @@ export default function OwnerArtifactView({ code, metadata }: {
         openUrl: shareLinkHref(code),
         printHint: t('filePanel:pdfPrintHint'),
         generatingHint: t('filePanel:pdfGenerating'),
+        // DALTON-HOOK(mobile-web): pass WeChat external-browser download guidance
+        wechatHint: t('filePanel:wechatOpenInBrowserHint'),
       });
     } finally {
       setPdfBusy(false);
@@ -123,13 +134,48 @@ export default function OwnerArtifactView({ code, metadata }: {
           <>
             <CommentTools tabId={VIEW_ID} workspaceId={workspaceId} path={path} ui={ui} variant="bar" modeDisabled={versionView.version !== null} />
             <ArtifactVersionPicker view={versionView} variant="bar" />
-            <ShareTopBarAction icon={RefreshCw} label={t('filePanel:reloadPage')} onClick={() => setReloads((n) => n + 1)} />
-            <ShareTopBarAction icon={FileDown} label={t('filePanel:saveAsPdf')} onClick={() => void savePdf()} disabled={pdfBusy} />
-            {/* DALTON-HOOK(external-share-guard): an external member reads their
-                own /a/ page but may not publish from it — the server refuses;
-                the entry stays hidden rather than failing after the click. */}
-            {callerTier !== 'external' && (
-              <ShareTopBarAction icon={Link2} label={t('artifact.publish')} onClick={() => setPublishOpen(true)} />
+            {/* DALTON-HOOK(mobile-web): fold secondary reload/PDF actions into an overflow menu on phones */}
+            {isMobile ? (
+              <>
+                {callerTier !== 'external' && (
+                  <ShareTopBarAction icon={Link2} label={t('artifact.publish')} onClick={() => setPublishOpen(true)} />
+                )}
+                <DropdownMenu modal={false}>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      aria-label={t('common.more', 'More')}
+                      className="h-[30px] px-2 text-xs tap-target"
+                      data-testid="owner-artifact-mobile-more"
+                    >
+                      <MoreHorizontal className="h-3.5 w-3.5" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" sideOffset={4}>
+                    <DropdownMenuItem onSelect={() => setReloads((n) => n + 1)}>
+                      <RefreshCw className="h-3.5 w-3.5" />
+                      {t('filePanel:reloadPage')}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem onSelect={() => void savePdf()} disabled={pdfBusy}>
+                      <FileDown className="h-3.5 w-3.5" />
+                      {t('filePanel:saveAsPdf')}
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              </>
+            ) : (
+              <>
+                <ShareTopBarAction icon={RefreshCw} label={t('filePanel:reloadPage')} onClick={() => setReloads((n) => n + 1)} />
+                <ShareTopBarAction icon={FileDown} label={t('filePanel:saveAsPdf')} onClick={() => void savePdf()} disabled={pdfBusy} />
+                {/* DALTON-HOOK(external-share-guard): an external member reads their
+                    own /a/ page but may not publish from it — the server refuses;
+                    the entry stays hidden rather than failing after the click. */}
+                {callerTier !== 'external' && (
+                  <ShareTopBarAction icon={Link2} label={t('artifact.publish')} onClick={() => setPublishOpen(true)} />
+                )}
+              </>
             )}
           </>
         )}

@@ -11,7 +11,7 @@ import { isDaltonAuth } from '@/config/daltonAuth';
 // DALTON-HOOK(standalone-core): gate subscription section & connect button on native_oauth_sync in Core builds only
 import { isCoreProfileBuild } from '@/config/brand';
 import { useCapabilities } from '@/hooks/useCapabilities';
-import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials';
+import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { formatUnitList } from '@/lib/format';
 import { useConfiguredProviders, type ConfiguredProvider } from '@/hooks/useConfiguredProviders';
 import { useClaudeCodeSetup, useClaudeCodeStatus } from '@/hooks/useClaudeCode';
@@ -354,7 +354,7 @@ export function ModelAccessSection({
       {/* DALTON-HOOK(settings-reorg): scope-aware personal vs team credentials separation */}
       {showTeamHint && !teamManagedByAdmin && scope === 'all' && !teamCredsError && (
         <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-          {TEAM_SHARED_CREDENTIALS_HINT}
+          {t('modelAccess.teamSharedCredentialsHint')}
         </p>
       )}
       {scope === 'personal' && showTeamHint && canManage && !teamCredsError && (

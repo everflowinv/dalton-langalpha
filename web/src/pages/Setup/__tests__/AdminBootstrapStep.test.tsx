@@ -130,4 +130,10 @@ describe('AdminBootstrapStep', () => {
       expect(screen.getByTestId('login-page')).toBeTruthy();
     });
   });
+
+  it('shows 10-character minimum in real-time password checklist matching placeholder and backend', () => {
+    renderStep();
+    expect(screen.getByText(/At least 10 characters|至少 10 个字符/i)).toBeTruthy();
+    expect(screen.queryByText(/8\+ characters|至少 8 个字符/i)).toBeNull();
+  });
 });

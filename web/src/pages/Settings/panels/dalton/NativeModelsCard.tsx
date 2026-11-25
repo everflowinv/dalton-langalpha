@@ -153,7 +153,7 @@ export function NativeModelsCard() {
         layout="padded"
         bodyClassName="space-y-3"
         action={
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2 min-w-0">
             {(added.length > 0 || deprecated.length > 0) && (
               <Button
                 type="button"

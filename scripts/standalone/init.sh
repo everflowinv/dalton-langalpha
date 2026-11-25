@@ -170,6 +170,35 @@ validate_tls_mode() {
   esac
 }
 
+detect_host_platform() {
+  local raw_os
+  raw_os="$(uname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+  case "$raw_os" in
+    darwin) printf 'macos' ;;
+    linux)  printf 'linux' ;;
+    *)
+      warn "Unrecognized host OS '${raw_os:-unknown}' from uname -s; defaulting DALTON_HOST_PLATFORM=linux."
+      printf 'linux'
+      ;;
+  esac
+}
+
+validate_host_platform() {
+  local raw="$1" source_label="$2"
+  local lowered
+  lowered="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')"
+  case "$lowered" in
+    macos|linux)
+      printf '%s' "$lowered"
+      return 0
+      ;;
+    *)
+      err "Invalid ${source_label} '${raw}'. Expected one of: macos, linux."
+      exit 2
+      ;;
+  esac
+}
+
 normalize_domain() {
   local raw="$1"
   # Trim surrounding whitespace, then strip http(s):// scheme and trailing path/query/fragment.
@@ -1066,6 +1095,15 @@ main() {
   # Ensure Standalone Core profile & networking defaults (without clobbering existing values)
   set_env_if_empty "APP_ENV" "core" || true
   set_env_if_empty "DALTON_PROFILE" "core" || true
+  local existing_host_platform detected_host_platform
+  existing_host_platform="$(get_env_value "DALTON_HOST_PLATFORM")"
+  if [[ -n "$existing_host_platform" ]]; then
+    existing_host_platform="$(validate_host_platform "$existing_host_platform" "DALTON_HOST_PLATFORM in .env")"
+    write_env_key "DALTON_HOST_PLATFORM" "$existing_host_platform"
+  else
+    detected_host_platform="$(detect_host_platform)"
+    write_env_key "DALTON_HOST_PLATFORM" "$detected_host_platform"
+  fi
   set_env_if_empty "HOST_MODE" "oss" || true
   set_env_if_empty "SANDBOX_PROVIDER" "docker" || true
   set_env_if_empty "EGRESS_RELAY_BASE_URL" "http://backend:8000" || true
@@ -1266,15 +1304,20 @@ main() {
           -t langalpha-sandbox:latest "${REPO_ROOT}"; then
         ok "Built langalpha-sandbox:latest."
       else
-        warn "Sandbox image build failed; rerun: docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest ."
+        err "Sandbox image build failed."
+        err "If Docker Hub rate-limited the pull (429 Too Many Requests), run 'docker login' or configure registry-mirrors in /etc/docker/daemon.json (see docs/dalton/dev-guide/STANDALONE-DEPLOY.md §7)."
+        err "Rerun sandbox build with: docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest ."
+        err "Or rerun init.sh with --skip-sandbox-build to complete configuration first."
+        exit 1
       fi
     fi
   fi
 
-  local compose_base_cmd="docker compose -f docker-compose.yml -f docker-compose.core.yml"
+  local compose_base_cmd="docker compose -p ${project_name} -f docker-compose.yml -f docker-compose.core.yml --env-file .env"
   if [[ "$tls_mode" != "loopback" ]]; then
-    compose_base_cmd="docker compose -f docker-compose.yml -f docker-compose.core.yml -f ${tls_overlay_file}"
+    compose_base_cmd="docker compose -p ${project_name} -f docker-compose.yml -f docker-compose.core.yml -f ${tls_overlay_file} --env-file .env"
   fi
+  local compose_build_cmd="env -u VITE_DALTON_AUTH ${compose_base_cmd} build"
   local compose_start_cmd="${compose_base_cmd} up -d"
   local vite_auth
   vite_auth="$(get_env_value_any "VITE_DALTON_AUTH")"
@@ -1289,17 +1332,19 @@ main() {
   2. Optional: set SEC_USER_AGENT="Dalton <your-email@example.com>" in .env
      for SEC EDGAR compliance identification.
 
-  3. Build edge with VITE_DALTON_AUTH from .env and start the Standalone Core stack:
-       ${compose_base_cmd} build --build-arg VITE_DALTON_AUTH="${vite_auth}" edge
+  3. Build the images (clearing any exported shell VITE_DALTON_AUTH so Compose
+     reads the value from .env) and start the Standalone Core stack:
+       ${compose_build_cmd}
        ${compose_start_cmd}
      (Whenever you switch DALTON_AUTH_MODE / VITE_DALTON_AUTH in .env, rebuild edge
+      with \`env -u VITE_DALTON_AUTH ${compose_base_cmd} build edge && ${compose_start_cmd}\`
       so the frontend bundle picks up the new authentication mode.)
 
   4. Open the web UI at ${public_url}
 EOF
   else
     info "Non-interactive initialization complete (APP_ENV=core, DOMAIN=${domain}, DALTON_TLS_MODE=${tls_mode}, VITE_DALTON_AUTH=${vite_auth:-<empty>})."
-    info "Build edge with: ${compose_base_cmd} build --build-arg VITE_DALTON_AUTH=${vite_auth} edge"
+    info "Build images with: ${compose_build_cmd}"
     info "Start the stack with: ${compose_start_cmd}"
   fi
 }

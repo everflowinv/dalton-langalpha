@@ -560,6 +560,11 @@
     .mobile-panel-overlay .file-panel-tree-list {
       padding-bottom: env(safe-area-inset-bottom, 0px);
     }
+
+    /* DALTON-HOOK(mobile-web): lift portaled file tree context menu only for an active mobile FilePanel instance */
+    .file-panel-context-menu[data-mobile-overlay-active] {
+      z-index: 1030;
+    }
   }
 /* A reference's target inside the open file. The tint is annotation, so it
    stays flat amber on the target; arrival fades it in once from a stronger mix. */
@@ -723,4 +728,30 @@
 .file-panel-artifact-update:disabled {
   cursor: default;
   opacity: 0.6;
+}
+
+/* DALTON-HOOK(mobile-web): keep file breadcrumb action row compact, non-overflowing, and padded enough (8px vertical, 44px min-height) for a 44px .tap-target::after without overflow-x: clip clipping */
+@media (max-width: 767px) {
+  .file-panel-crumbs {
+    gap: 0.25rem;
+    min-height: 44px;
+    padding: 0.5rem;
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: clip;
+  }
+  .file-panel-crumb-spacer {
+    min-width: 0;
+  }
+}
+
+@media (pointer: coarse) {
+  .file-panel-crumbs {
+    min-height: 44px;
+    padding-block: 0.5rem;
+  }
+  .file-panel-crumbs .file-panel-icon-btn {
+    --tap-target-w: 30px;
+    --tap-target-h: 44px;
+  }
 }

@@ -13,7 +13,7 @@ import { SetupFooter } from '../../SetupFooter';
 import { useProviderConnected, type LocationState } from './shared';
 // DALTON-HOOK(team-credentials): team-shared credentials hint
 import { isDaltonAuth } from '@/config/daltonAuth';
-import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
+import { useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
 
 /**
  * A provider of the user's own is not in the catalog. Its key is edited as a
@@ -117,7 +117,7 @@ function KeyStep({ state, form, fields, option, place }: {
       {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
       {isDaltonAuth && isTeamShared && !teamManagedByAdmin && (
         <p className="text-xs -mt-3 mb-4" style={{ color: 'var(--color-text-tertiary)' }}>
-          {TEAM_SHARED_CREDENTIALS_HINT}
+          {t('modelAccess.teamSharedCredentialsHint')}
         </p>
       )}
       {teamManagedByAdmin && (

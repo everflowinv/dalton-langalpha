@@ -419,7 +419,7 @@ export function PublishApprovalCard({
           <button
             type="button"
             onClick={() => setIncidentalExpanded((prev) => !prev)}
-            className="w-full flex items-center justify-between text-left font-medium text-[11px] cursor-pointer"
+            className="tap-target w-full flex items-center justify-between text-left font-medium text-[11px] cursor-pointer"
             style={{ color: 'var(--color-text-primary)' }}
             data-testid="publish-incidental-toggle"
           >
@@ -566,7 +566,7 @@ export function PublishApprovalCard({
           <button
             type="button"
             onClick={() => setTechExpanded((prev) => !prev)}
-            className="inline-flex items-center gap-1 text-[11px] cursor-pointer"
+            className="tap-target inline-flex items-center gap-1 text-[11px] cursor-pointer"
             style={{ color: 'var(--color-text-tertiary)' }}
             data-testid="publish-technical-toggle"
           >
@@ -679,7 +679,7 @@ export function PublishApprovalCard({
               onApprove?.();
             }}
             disabled={!onApprove}
-            className="gap-1.5"
+            className="gap-1.5 max-md:min-h-[44px]"
             style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
           >
             <Check className="h-3.5 w-3.5 stroke-[2.5]" />
@@ -694,7 +694,7 @@ export function PublishApprovalCard({
               onReject?.(reason.trim() || undefined);
             }}
             disabled={!onReject}
-            className="gap-1.5"
+            className="gap-1.5 max-md:min-h-[44px]"
           >
             <X className="h-3.5 w-3.5" />
             {t('dalton.publish.rejectBtn')}

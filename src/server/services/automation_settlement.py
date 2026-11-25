@@ -592,15 +592,27 @@ async def _finish_held_run(job: Dict[str, Any]) -> None:
     )
     # DALTON-HOOK(execution-delivery-status): persist sender retry decision on delivery_result
     will_retry = finish.retry and job["attempts"] < MAX_ATTEMPTS
+    job_id = str(job["hook_outbox_id"])
+    attempts = int(job["attempts"])
+    # DALTON-HOOK(dalton-notify): verify outbox claim ownership before writing delivery result
     if not recorded or _replaces_record(finish, answered):
-        await _keep_record(
-            str(job["hook_outbox_id"]),
+        saved = await _keep_record(
+            job_id,
             execution_id,
             _stamp_delivery_retry(finish.result, retrying=will_retry),
             answered=answered or finish.answered,
+            attempts=attempts,
         )
+        if not saved:
+            return
     elif not will_retry:
-        await _clear_delivery_retrying(execution_id)
+        cleared = await _clear_delivery_retrying_for_job(
+            job_id,
+            execution_id,
+            attempts=attempts,
+        )
+        if not cleared:
+            return
     if not finish.retry:
         return
     if job["attempts"] >= MAX_ATTEMPTS:
@@ -614,16 +626,61 @@ async def _finish_held_run(job: Dict[str, Any]) -> None:
     )
 
 
-async def _keep_record(job_id: str, execution_id: str, result: list, *, answered: bool) -> None:
+async def _keep_record(
+    job_id: str,
+    execution_id: str,
+    result: list,
+    *,
+    answered: bool,
+    attempts: int | None = None,
+) -> bool:
     """Write a finish job's record and, in the same transaction, what its
     next attempt needs to know of it: that one is written, and whether the
-    service has answered."""
+    service has answered.
+
+    Returns False without writing if the outbox claim has already been taken
+    over or closed by another attempt."""
     async with get_db_connection() as conn:
         async with conn.transaction():
+            # DALTON-HOOK(dalton-notify): fence write on active outbox claim (status='claimed', attempts)
+            if attempts is not None and not await outbox_db.owns_claimed_job(
+                job_id, attempts=attempts, conn=conn
+            ):
+                logger.warning(
+                    f"[AUTOMATION_SETTLE] Discarding stale automation_finish result after claim takeover: "
+                    f"job_id={job_id} execution_id={execution_id} attempts={attempts}"
+                )
+                return False
             await exec_db.record_delivery(execution_id, result, conn=conn)
             await outbox_db.merge_job_payload(
                 job_id, {"recorded": True, "answered": answered}, conn=conn
             )
+    return True
+
+
+# DALTON-HOOK(dalton-notify): fence retrying-flag clear on active outbox claim ownership
+async def _clear_delivery_retrying_for_job(
+    job_id: str, execution_id: str, *, attempts: int
+) -> bool:
+    try:
+        async with get_db_connection() as conn:
+            async with conn.transaction():
+                if not await outbox_db.owns_claimed_job(
+                    job_id, attempts=attempts, conn=conn
+                ):
+                    logger.warning(
+                        f"[AUTOMATION_SETTLE] Discarding stale retrying-flag clear after claim takeover: "
+                        f"job_id={job_id} execution_id={execution_id} attempts={attempts}"
+                    )
+                    return False
+                await exec_db.clear_delivery_retrying(execution_id, conn=conn)
+        return True
+    except Exception as e:
+        logger.error(
+            f"[AUTOMATION_SETTLE] Clearing delivery retrying flag failed: "
+            f"execution_id={execution_id} error={e}"
+        )
+        return True
 
 
 async def _finish_again(

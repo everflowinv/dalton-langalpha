@@ -154,6 +154,42 @@ _FEISHU_CHAT_TARGET_RE = re.compile(r"^feishu:chat:oc_[A-Za-z0-9_-]{3,128}$")
 _FEISHU_USER_TARGET_RE = re.compile(r"^feishu:user:ou_[A-Za-z0-9_-]{3,128}$")
 _DISCORD_USER_TARGET_RE = re.compile(r"^discord:user:[0-9]{5,32}$")
 _DISCORD_CHANNEL_TARGET_RE = re.compile(r"^discord:channel:[0-9]{5,32}$")
+_WEIXIN_USER_TARGET_RE = re.compile(r"^weixin:user:[^\s:]{1,255}$")
+
+
+async def _fetch_bound_dm_platform_user_id_in_tx(
+    cur: Any,
+    *,
+    owner_user_id: str,
+    platform: str,
+) -> str:
+    """Resolve owner's active DM platform_user_id (new table for weixin, identities for others)."""
+    if str(platform or "").strip().lower() == "weixin":
+        await cur.execute(
+            """
+            SELECT ilink_user_id AS platform_user_id
+            FROM dalton_channel_weixin_accounts
+            WHERE user_id = %s
+              AND status = 'active'
+              AND ilink_user_id IS NOT NULL
+            """,
+            (owner_user_id,),
+        )
+    else:
+        await cur.execute(
+            """
+            SELECT platform_user_id
+            FROM dalton_channel_identities
+            WHERE user_id = %s AND platform = %s
+            """,
+            (owner_user_id, platform),
+        )
+    id_row = await cur.fetchone()
+    return (
+        str(id_row.get("platform_user_id") or "").strip()
+        if isinstance(id_row, Mapping)
+        else ""
+    )
 _FORBIDDEN_KEYS = frozenset(
     {
         "chat_id",
@@ -1056,6 +1092,7 @@ def _target_allowed(target: str, *, outcome: str) -> bool:
             or _FEISHU_USER_TARGET_RE.fullmatch(target)
             or _DISCORD_USER_TARGET_RE.fullmatch(target)
             or _DISCORD_CHANNEL_TARGET_RE.fullmatch(target)
+            or _WEIXIN_USER_TARGET_RE.fullmatch(target)
         )
     return bool(_DISCORD_USER_TARGET_RE.fullmatch(target))
 
@@ -1603,19 +1640,8 @@ async def _authorize_all_targets(
                 if not ok_group:
                     return None, "target_revoked"
                 continue
-            await cur.execute(
-                """
-                SELECT platform_user_id
-                FROM dalton_channel_identities
-                WHERE user_id = %s AND platform = %s
-                """,
-                (owner_user_id, platform),
-            )
-            id_row = await cur.fetchone()
-            bound = (
-                str(id_row.get("platform_user_id") or "").strip()
-                if isinstance(id_row, Mapping)
-                else ""
+            bound = await _fetch_bound_dm_platform_user_id_in_tx(
+                cur, owner_user_id=owner_user_id, platform=platform
             )
             if not bound or bound != ident:
                 return None, "target_revoked"
@@ -2797,19 +2823,8 @@ async def _authorize_failure_alert_row(
             code=reason or "toggle_off",
             message="Current notification settings do not allow this failure recipient.",
         )
-    await cur.execute(
-        """
-        SELECT platform_user_id
-        FROM dalton_channel_identities
-        WHERE user_id = %s AND platform = %s
-        """,
-        (owner_user_id, platform),
-    )
-    id_row = await cur.fetchone()
-    bound = (
-        str(id_row.get("platform_user_id") or "").strip()
-        if isinstance(id_row, Mapping)
-        else ""
+    bound = await _fetch_bound_dm_platform_user_id_in_tx(
+        cur, owner_user_id=owner_user_id, platform=platform
     )
     if not bound or bound != raw_ident:
         return _deny_report(
@@ -3139,19 +3154,8 @@ async def authorize_saved_report_target(
                 message=group_err or "Group target is no longer deliverable.",
             )
     else:
-        await cur.execute(
-            """
-            SELECT platform_user_id
-            FROM dalton_channel_identities
-            WHERE user_id = %s AND platform = %s
-            """,
-            (owner_user_id, platform),
-        )
-        id_row = await cur.fetchone()
-        bound = (
-            str(id_row.get("platform_user_id") or "").strip()
-            if isinstance(id_row, Mapping)
-            else ""
+        bound = await _fetch_bound_dm_platform_user_id_in_tx(
+            cur, owner_user_id=owner_user_id, platform=platform
         )
         if not bound or bound != raw_ident:
             return _deny_report(
