@@ -154,6 +154,7 @@ async def start_task_run(
     model_override: Optional[str] = None,
     effort_override: Optional[str] = None,
     actual_model_key: Optional[str] = None,  # DALTON-HOOK(team-model-catalog)
+    is_custom_model: Optional[bool] = None,  # DALTON-HOOK(team-model-catalog)
     workflow_driver: bool = False,  # DALTON-HOOK(budget)
     workflow_driver_run_id: Optional[str] = None,  # DALTON-HOOK(budget)
     catalog_snapshot: Optional[Dict[str, Any]] = None,  # DALTON-HOOK(team-model-catalog)
@@ -239,41 +240,54 @@ async def start_task_run(
         )
         if sub_models:
             try:
-                sub_user_id: Optional[str] = None
-                async with _ledger_connection(conn) as lookup_conn:
-                    async with lookup_conn.cursor(row_factory=dict_row) as cur:
-                        await cur.execute(
-                            """
-                            SELECT COALESCE(
-                                (SELECT r.user_id
-                                 FROM conversation_responses r
-                                 WHERE r.conversation_response_id = %s::uuid),
-                                (SELECT w.user_id
-                                 FROM conversation_threads t
-                                 JOIN workspaces w ON w.workspace_id = t.workspace_id
-                                 WHERE t.conversation_thread_id = %s)
-                            ) AS user_id
-                            """,
-                            (spending_run, thread_id),
-                        )
-                        user_row = await cur.fetchone()
-                        if user_row and user_row.get("user_id"):
-                            sub_user_id = str(user_row["user_id"])
-
-                filtered_models: list[str] = list(sub_models)
-                excluded_custom_keys: list[str] = []
-                if sub_user_id:
-                    from src.server.services.llm import user_models
-
+                filtered_models: list[str]
+                excluded_custom_keys: list[str]
+                # DALTON-HOOK(team-model-catalog): honor caller-supplied actual resolved model
+                # source (from subagent client build, post-models.allowed filtering) instead of
+                # re-reading unfiltered preferences via classify_model; preserve R11 lookup when
+                # omitted.
+                if is_custom_model is True:
                     filtered_models = []
-                    for mk in sub_models:
-                        src_kind, _ = await user_models.classify_model(
-                            sub_user_id, mk
-                        )
-                        if src_kind == user_models.ModelSource.CUSTOM:
-                            excluded_custom_keys.append(mk)
-                        else:
-                            filtered_models.append(mk)
+                    excluded_custom_keys = list(sub_models)
+                elif is_custom_model is False:
+                    filtered_models = list(sub_models)
+                    excluded_custom_keys = []
+                else:
+                    sub_user_id: Optional[str] = None
+                    async with _ledger_connection(conn) as lookup_conn:
+                        async with lookup_conn.cursor(row_factory=dict_row) as cur:
+                            await cur.execute(
+                                """
+                                SELECT COALESCE(
+                                    (SELECT r.user_id
+                                     FROM conversation_responses r
+                                     WHERE r.conversation_response_id = %s::uuid),
+                                    (SELECT w.user_id
+                                     FROM conversation_threads t
+                                     JOIN workspaces w ON w.workspace_id = t.workspace_id
+                                     WHERE t.conversation_thread_id = %s)
+                                ) AS user_id
+                                """,
+                                (spending_run, thread_id),
+                            )
+                            user_row = await cur.fetchone()
+                            if user_row and user_row.get("user_id"):
+                                sub_user_id = str(user_row["user_id"])
+
+                    filtered_models = list(sub_models)
+                    excluded_custom_keys = []
+                    if sub_user_id:
+                        from src.server.services.llm import user_models
+
+                        filtered_models = []
+                        for mk in sub_models:
+                            src_kind, _ = await user_models.classify_model(
+                                sub_user_id, mk
+                            )
+                            if src_kind == user_models.ModelSource.CUSTOM:
+                                excluded_custom_keys.append(mk)
+                            else:
+                                filtered_models.append(mk)
 
                 if filtered_models or excluded_custom_keys:
                     snap = build_effective_catalog_snapshot(

@@ -317,10 +317,11 @@ def run_on_by_type(
     and for a spec ``build_subagent_graph`` runs on Claude Code (a CLI can
     run here, ``claude_code``, and its model is a Claude Code row) where its
     CLI was placed and the model it runs."""
-    # DALTON-HOOK(team-model-catalog): also record actual_model_key from the built client's
-    # catalog_model so subagents sharing API model_id with the main turn (where card_model
-    # omits ``model``) still persist their effective_catalog_snapshot and model key.
-    from src.llms.model_identity import catalog_model
+    # DALTON-HOOK(team-model-catalog): also record actual_model_key and is_custom_model from the
+    # built client's metadata so subagents sharing API model_id with the main turn (where
+    # card_model omits ``model``) or running allowlisted team models shadowing personal custom
+    # configs still persist the right effective_catalog_snapshot.
+    from src.llms.model_identity import catalog_model, client_is_custom_model
 
     spec_list = list(specs)
     targets = {
@@ -331,6 +332,7 @@ def run_on_by_type(
         and (target := claude_code_target(cast("SubAgent", spec), default_model)) is not None
     }
     actual_keys: dict[str, str] = {}
+    custom_flags: dict[str, bool] = {}
     for spec in spec_list:
         name = spec.get("name")
         if not name or "runnable" in spec:
@@ -341,14 +343,18 @@ def run_on_by_type(
             actual_keys[name] = cat_name.strip()
         elif isinstance(models.get(name), Mapping) and models[name].get("id"):
             actual_keys[name] = str(models[name]["id"]).strip()
+        is_custom = client_is_custom_model(client)
+        if is_custom is not None:
+            custom_flags[name] = is_custom
     return {
         name: RunOn(
             model=models.get(name),
             claude_code=claude_code if name in targets else None,
             claude_code_model=targets[name].model if name in targets else None,
             actual_model_key=actual_keys.get(name),
+            is_custom_model=custom_flags.get(name),
         )
-        for name in {*models, *targets, *actual_keys}
+        for name in {*models, *targets, *actual_keys, *custom_flags}
     }
 
 

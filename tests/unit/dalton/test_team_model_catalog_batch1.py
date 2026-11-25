@@ -8073,3 +8073,594 @@ class TestR11Fixes:
         assert snap["schema"] == TURN_SNAPSHOT_SCHEMA
         assert snap["models"] == {}
         assert snap["excluded_custom_keys"] == ["gpt-test"]
+
+
+class TestR12AllowlistSourceAndPluginOverrideValidation:
+    """R12 fixes: allowlisted team subagent model source forwarding and plugin update override validation."""
+
+    def test_r12_1_allowlist_same_name_personal_model_persists_team_snapshot_and_enforces_resume(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        from ptc_agent.agent.middleware.background_subagent.middleware import (
+            BackgroundSubagentMiddleware,
+        )
+        from ptc_agent.agent.middleware.background_subagent.registry import (
+            BackgroundTaskRegistry,
+        )
+        from ptc_agent.agent.middleware.background_subagent.subagent import (
+            run_on_by_type,
+        )
+        from ptc_agent.config.agent import RunOn, TaskAsk, TaskModel
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.dalton.services.team_model_catalog.constants import (
+            CATALOG_ROUTE_CHANGED_CODE,
+        )
+        from src.dalton.services.team_model_catalog.snapshot import (
+            resolve_live_route_fingerprint,
+            verify_resume_route,
+        )
+        from src.llms.llm import LLM as LLMFactory
+        from src.server.database import workspace as ws_db
+        from src.server.database.runs import subagent_runs
+        from src.server.services import subagent_run_coordinator as coord_mod
+        from src.server.services.llm import (
+            availability as avail_mod,
+            clients as clients_mod,
+            task_model as task_model_mod,
+            user_models,
+        )
+        from src.server.services.llm.capabilities import PlanTier
+        from src.server.services.policy import Policy
+        from src.server.services.subagent_run_coordinator import SubagentRunCoordinator
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        # Team catalog rev 190 defines team model "shared-alias" -> gpt-team-v1.
+        cat_v1 = compile_catalog_from_payload(
+            {
+                "schema": CATALOG_SCHEMA,
+                "models": {
+                    "shared-alias": {
+                        "model_id": "gpt-team-v1",
+                        "provider": "openai",
+                        "display_name": "Team Shared Alias",
+                        "visible": True,
+                        "context": 128000,
+                        "input_modalities": ["text"],
+                    },
+                },
+            },
+            revision=190,
+        )
+        cache_compiled_catalog(cat_v1)
+        real_get_compiled_sync = compiled_mod.get_compiled_catalog_sync
+        real_get_compiled_async = compiled_mod.get_compiled_catalog_async
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(real_get_compiled_sync, return_value=cat_v1),
+        )
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_async",
+            create_autospec(real_get_compiled_async, return_value=cat_v1),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", cat_v1.model_config)
+        monkeypatch.setattr(
+            ws_db,
+            "lock_run_workspace",
+            create_autospec(ws_db.lock_run_workspace, return_value=None),
+        )
+
+        # User retains a same-name personal custom model in unfiltered DB prefs,
+        # while policy models.allowed allows the team model "shared-alias".
+        personal_entry = {
+            "name": "shared-alias",
+            "provider": "openai",
+            "model_id": "gpt-personal-only",
+            "display_name": "Personal Shared Alias",
+        }
+        raw_pref = {"custom_models": [personal_entry]}
+        policy = Policy(models_allowed=frozenset({"shared-alias"}))
+        filtered_pref = avail_mod.builtins_only(policy, raw_pref)
+        assert "custom_models" not in filtered_pref
+
+        # Unfiltered classify_model WOULD return CUSTOM if start_task_run called it.
+        async def _unfiltered_classify(
+            uid: str,
+            model_name: str,
+            _pref_cache: dict[str, Any] | None = None,
+            ignore_custom_models: bool = False,
+        ) -> tuple[str, dict[str, Any]]:
+            if not ignore_custom_models and _pref_cache is None and model_name == "shared-alias":
+                return user_models.ModelSource.CUSTOM, personal_entry
+            if _pref_cache is not None and not ignore_custom_models:
+                for cm in _pref_cache.get("custom_models") or []:
+                    if isinstance(cm, dict) and cm.get("name") == model_name:
+                        return user_models.ModelSource.CUSTOM, cm
+            cfg = LLMFactory.get_model_config().get_model_config(model_name)
+            if cfg:
+                return user_models.ModelSource.SYSTEM, cfg
+            return user_models.ModelSource.UNKNOWN, {}
+
+        classify_spy = create_autospec(
+            user_models.classify_model, side_effect=_unfiltered_classify
+        )
+        monkeypatch.setattr(user_models, "classify_model", classify_spy)
+
+        # 1) run_on_by_type distinguishes built team client vs personal custom client vs bare stub.
+        team_client = SimpleNamespace(
+            metadata={"manifest_model": "shared-alias", "billing_type": "platform"}
+        )
+        personal_client = SimpleNamespace(
+            metadata={
+                "manifest_model": "shared-alias",
+                "billing_type": "byok",
+                "is_custom_model": True,
+            }
+        )
+        bare_stub = SimpleNamespace()
+        ro_map = run_on_by_type(
+            [
+                {"name": "research", "model": team_client},
+                {"name": "personal-sub", "model": personal_client},
+                {"name": "stub-sub", "model": bare_stub},
+            ],
+            default_model=team_client,
+            models={},
+            claude_code=None,
+        )
+        assert ro_map["research"].actual_model_key == "shared-alias"
+        assert ro_map["research"].is_custom_model is False
+        assert ro_map["research"].admission_kwargs()["is_custom_model"] is False
+        assert ro_map["personal-sub"].is_custom_model is True
+        assert ro_map["personal-sub"].admission_kwargs()["is_custom_model"] is True
+        assert "stub-sub" not in ro_map or "is_custom_model" not in ro_map["stub-sub"].admission_kwargs()
+
+        # 2) TaskModelGate._resolve under models.allowed + builtins_only produces TaskModel(is_custom_model=False).
+        fake_cfg = SimpleNamespace(
+            subsidiary_llm_clients={},
+            subagents=SimpleNamespace(enabled=[], definitions={}, resolved=None),
+            claude_code=False,
+            claude_code_admitted=None,
+            claude_code_pins=None,
+            compaction=SimpleNamespace(profile="default"),
+            llm_client=team_client,
+        )
+        monkeypatch.setattr(
+            task_model_mod,
+            "turn_roster",
+            create_autospec(
+                task_model_mod.turn_roster,
+                return_value=SimpleNamespace(definitions={}),
+            ),
+        )
+        monkeypatch.setattr(
+            task_model_mod,
+            "is_own_key_turn",
+            create_autospec(task_model_mod.is_own_key_turn, return_value=False),
+        )
+        monkeypatch.setattr(
+            task_model_mod,
+            "plan_covers",
+            create_autospec(task_model_mod.plan_covers, return_value=True),
+        )
+        monkeypatch.setattr(
+            task_model_mod,
+            "resolve_model_client",
+            create_autospec(
+                task_model_mod.resolve_model_client,
+                return_value=clients_mod.ResolvedClient(
+                    team_client,
+                    user_models.ModelSource.SYSTEM,
+                    clients_mod.CredentialSource.PLATFORM,
+                ),
+            ),
+        )
+        gate = task_model_mod.TaskModelGate(
+            fake_cfg,
+            user_id="u-allowlist",
+            workspace_id="ws-1",
+            thread_id="thread-r12-1",
+            model_pref=filtered_pref,
+            permits=PlanTier("u-allowlist"),
+            is_byok=False,
+            turn_model="gpt-test",
+            plan_exempt=frozenset({"shared-alias"}),
+            policy=policy,
+        )
+        resolved_tm = asyncio.run(gate.resolve(TaskAsk(model="shared-alias"), "research"))
+        assert isinstance(resolved_tm, TaskModel)
+        assert resolved_tm.is_custom_model is False
+        assert resolved_tm.run_on.admission_kwargs()["is_custom_model"] is False
+
+        # 3) Full admission chain: BackgroundSubagentMiddleware -> SubagentRunCoordinator -> subagent_runs.start_task_run
+        captured_rows: list[dict[str, Any]] = []
+
+        class _FakeCursor:
+            def __init__(self) -> None:
+                self._next_row: dict[str, Any] | None = None
+
+            async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+                if "AS user_id" in sql:
+                    self._next_row = {"user_id": "u-allowlist"}
+                elif "INSERT INTO subagent_runs" in sql:
+                    facts_bind = params[8]
+                    facts_dict = (
+                        dict(facts_bind.obj)
+                        if facts_bind is not None and hasattr(facts_bind, "obj")
+                        else {}
+                    )
+                    row = {
+                        "task_run_id": params[0],
+                        "thread_id": params[1],
+                        "task_id": params[2],
+                        "replay_facts": facts_dict,
+                        "user_id": "u-allowlist",
+                    }
+                    captured_rows.append(row)
+                    self._next_row = row
+                else:
+                    self._next_row = None
+
+            async def fetchone(self) -> dict[str, Any] | None:
+                return self._next_row
+
+        class _FakeConn:
+            @asynccontextmanager
+            async def transaction(self) -> Any:
+                yield self
+
+            @asynccontextmanager
+            async def cursor(self, **_kw: Any) -> Any:
+                yield _FakeCursor()
+
+        from src.server.database import pool as pool_mod
+        from src.server.services import thread_control_stream as tcs_mod
+        from src.utils.cache import redis_cache as redis_cache_mod
+
+        @asynccontextmanager
+        async def _fake_pool_conn(conn: Any = None) -> Any:
+            yield conn if conn is not None else _FakeConn()
+
+        monkeypatch.setattr(pool_mod, "get_db_connection", _fake_pool_conn)
+        monkeypatch.setattr(
+            redis_cache_mod,
+            "get_cache_client",
+            create_autospec(
+                redis_cache_mod.get_cache_client,
+                return_value=SimpleNamespace(enabled=False),
+            ),
+        )
+        monkeypatch.setattr(
+            tcs_mod,
+            "announce_task_run_started",
+            create_autospec(tcs_mod.announce_task_run_started, return_value=None),
+        )
+        monkeypatch.setattr(
+            coord_mod,
+            "sr_db",
+            subagent_runs,
+        )
+
+        classify_spy.reset_mock()
+        coord = SubagentRunCoordinator("thread-r12-1")
+        registry = BackgroundTaskRegistry(thread_id="thread-r12-1")
+        registry.run_ledger = coord
+        mw = BackgroundSubagentMiddleware(
+            subagent_types={"research", "fallback-type"},
+            registry=registry,
+            run_on={
+                "research": ro_map["research"],
+                # Omit is_custom_model on RunOn to verify middleware model_client_for fallback.
+                "fallback-type": RunOn(actual_model_key="shared-alias"),
+            },
+            default_model_client=team_client,
+        )
+        task_research = asyncio.run(
+            registry.register(
+                tool_call_id="tc-r12-1",
+                description="allowlist team run",
+                prompt="analyze",
+                subagent_type="research",
+                run_id="parent-run-r12-1",
+            )
+        )
+        run_id_team = asyncio.run(
+            mw.admit_task_run(
+                task_research,
+                cause="init",
+                description="allowlist team run",
+                launch_tool_call_id="tc-r12-1",
+                parent_run_id="parent-run-r12-1",
+            )
+        )
+        assert run_id_team
+        assert classify_spy.await_count == 0
+        row_team = captured_rows[-1]
+        snap_team = row_team["replay_facts"]["effective_catalog_snapshot"]
+        assert snap_team["schema"] == TURN_SNAPSHOT_SCHEMA
+        assert "shared-alias" in snap_team["models"]
+        assert snap_team["models"]["shared-alias"]["model_id"] == "gpt-team-v1"
+        assert "excluded_custom_keys" not in snap_team
+
+        # Verify middleware model_client_for fallback also forwards is_custom_model=False.
+        task_fb = asyncio.run(
+            registry.register(
+                tool_call_id="tc-r12-2",
+                description="fallback client source run",
+                prompt="analyze",
+                subagent_type="fallback-type",
+                run_id="parent-run-r12-1",
+            )
+        )
+        asyncio.run(
+            mw.admit_task_run(
+                task_fb,
+                cause="init",
+                description="fallback client source run",
+                launch_tool_call_id="tc-r12-2",
+                parent_run_id="parent-run-r12-1",
+            )
+        )
+        assert classify_spy.await_count == 0
+        snap_fb = captured_rows[-1]["replay_facts"]["effective_catalog_snapshot"]
+        assert snap_fb["models"]["shared-alias"]["model_id"] == "gpt-team-v1"
+        assert "excluded_custom_keys" not in snap_fb
+
+        # 4) Explicit is_custom_model=True skips classify_model and persists empty excluded snapshot.
+        row_custom = asyncio.run(
+            subagent_runs.start_task_run(
+                task_run_id="dddddddd-dddd-4ddd-8ddd-ddddddddddd1",
+                thread_id="thread-r12-1",
+                task_id="task-r12-personal",
+                cause="init",
+                actual_model_key="shared-alias",
+                is_custom_model=True,
+                conn=_FakeConn(),
+            )
+        )
+        assert classify_spy.await_count == 0
+        snap_custom = row_custom["replay_facts"]["effective_catalog_snapshot"]
+        assert snap_custom["models"] == {}
+        assert snap_custom["excluded_custom_keys"] == ["shared-alias"]
+
+        # 5) Resume verification on the allowlisted team run enforces team route continuity:
+        #    unchanged route passes; changed team route (gpt-team-v2) raises 400 catalog_route_changed.
+        live_same = asyncio.run(
+            resolve_live_route_fingerprint(
+                "shared-alias",
+                user_id="u-allowlist",
+                model_pref=filtered_pref,
+            )
+        )
+        assert live_same.model_id == "gpt-team-v1"
+        asyncio.run(
+            verify_resume_route(
+                row_team["task_run_id"],
+                live_same,
+                is_subagent=True,
+                run_row=row_team,
+            )
+        )
+
+        cat_v2 = compile_catalog_from_payload(
+            {
+                "schema": CATALOG_SCHEMA,
+                "models": {
+                    "shared-alias": {
+                        "model_id": "gpt-team-v2",
+                        "provider": "openai",
+                        "display_name": "Team Shared Alias v2",
+                        "visible": True,
+                        "context": 128000,
+                        "input_modalities": ["text"],
+                    },
+                },
+            },
+            revision=191,
+        )
+        cache_compiled_catalog(cat_v2)
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(real_get_compiled_sync, return_value=cat_v2),
+        )
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_async",
+            create_autospec(real_get_compiled_async, return_value=cat_v2),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", cat_v2.model_config)
+        live_changed = asyncio.run(
+            resolve_live_route_fingerprint(
+                "shared-alias",
+                user_id="u-allowlist",
+                model_pref=filtered_pref,
+            )
+        )
+        assert live_changed.model_id == "gpt-team-v2"
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(
+                verify_resume_route(
+                    row_team["task_run_id"],
+                    live_changed,
+                    is_subagent=True,
+                    run_row=row_team,
+                )
+            )
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["code"] == CATALOG_ROUTE_CHANGED_CODE
+
+    def test_r12_2_plugin_update_validates_active_user_override_when_model_omitted_or_inherit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.team_model_catalog import (
+            compiled as compiled_mod,
+            service as tmc_service,
+        )
+        from src.server.services.llm import user_models
+        from src.server.services.plugins import subagent_fanout
+        from src.server.services.plugins.agents import read_agent
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        cat_retired = compile_catalog_from_payload(
+            {
+                "schema": CATALOG_SCHEMA,
+                "retired": [
+                    {
+                        "key": "retired-model",
+                        "retired_at": "2026-11-25T00:00:00Z",
+                        "reason": "deprecated",
+                    }
+                ],
+            },
+            revision=192,
+            from_db=True,
+        )
+        cat_no_db = compile_catalog_from_payload(
+            {"schema": CATALOG_SCHEMA},
+            revision=0,
+            from_db=False,
+        )
+
+        plan_omitted = read_agent(
+            "screener",
+            b"---\ndescription: Screens tickers.\n---\nScreen them.\n",
+        )
+        plan_inherit = read_agent(
+            "screener",
+            b"---\ndescription: Screens tickers.\nmodel: inherit\n---\nScreen them.\n",
+        )
+        plan_declares_retired = read_agent(
+            "screener",
+            b"---\ndescription: Screens tickers.\nmodel: retired-model\n---\nScreen them.\n",
+        )
+        assert "model" not in plan_omitted.fields
+        assert "model" not in plan_inherit.fields
+        assert plan_declares_retired.fields["model"] == "retired-model"
+
+        fake_conn = object()
+        monkeypatch.setattr(
+            user_models,
+            "get_model_preference",
+            create_autospec(user_models.get_model_preference, return_value={}),
+        )
+
+        # Save references to the real functions before monkeypatching.
+        real_get_compiled = compiled_mod.get_compiled_catalog_async
+        real_list_user_subagents = subagent_fanout.list_user_subagents
+
+        # 1) Update (check_overrides=True): incoming omits model or writes model: inherit,
+        #    while user's still-active override points to a retired team model -> must reject.
+        compiled_spy = create_autospec(real_get_compiled, return_value=cat_retired)
+        monkeypatch.setattr(compiled_mod, "get_compiled_catalog_async", compiled_spy)
+        monkeypatch.setattr(tmc_service, "get_compiled_catalog_async", compiled_spy)
+        monkeypatch.setattr(
+            subagent_fanout,
+            "list_user_subagents",
+            create_autospec(
+                real_list_user_subagents,
+                return_value=[
+                    {
+                        "kind": "override",
+                        "base_key": "plugin:demo/screener",
+                        "fields": {"model": "retired-model"},
+                    }
+                ],
+            ),
+        )
+        for plan in (plan_omitted, plan_inherit):
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    subagent_fanout._validate_plugin_subagent_models_under_lock(
+                        "u-1", "demo", [plan], conn=fake_conn, check_overrides=True
+                    )
+                )
+            assert exc_info.value.status_code == 400
+            assert exc_info.value.detail["code"] == "model_retired"
+
+        # 2) Update where plugin declares retired-model, but user override selects an active model
+        #    or explicitly inherits (None) -> effective model is allowed.
+        for override_fields in ({"model": "gpt-test"}, {"model": None}):
+            monkeypatch.setattr(
+                subagent_fanout,
+                "list_user_subagents",
+                create_autospec(
+                    real_list_user_subagents,
+                    return_value=[
+                        {
+                            "kind": "override",
+                            "base_key": "plugin:demo/screener",
+                            "fields": override_fields,
+                        }
+                    ],
+                ),
+            )
+            asyncio.run(
+                subagent_fanout._validate_plugin_subagent_models_under_lock(
+                    "u-1", "demo", [plan_declares_retired], conn=fake_conn, check_overrides=True
+                )
+            )
+
+        # 3) Fresh install (check_overrides=False): undeclared / inherit plans skip catalog &
+        #    override queries completely; declared retired model still rejects without override read.
+        compiled_spy_install = create_autospec(real_get_compiled, return_value=cat_retired)
+        list_spy_install = create_autospec(real_list_user_subagents, return_value=[])
+        monkeypatch.setattr(compiled_mod, "get_compiled_catalog_async", compiled_spy_install)
+        monkeypatch.setattr(tmc_service, "get_compiled_catalog_async", compiled_spy_install)
+        monkeypatch.setattr(subagent_fanout, "list_user_subagents", list_spy_install)
+        asyncio.run(
+            subagent_fanout._validate_plugin_subagent_models_under_lock(
+                "u-1", "demo", [plan_omitted, plan_inherit], conn=fake_conn, check_overrides=False
+            )
+        )
+        assert compiled_spy_install.await_count == 0
+        assert list_spy_install.await_count == 0
+
+        with pytest.raises(HTTPException) as exc_install:
+            asyncio.run(
+                subagent_fanout._validate_plugin_subagent_models_under_lock(
+                    "u-1", "demo", [plan_declares_retired], conn=fake_conn, check_overrides=False
+                )
+            )
+        assert exc_install.value.status_code == 400
+        assert exc_install.value.detail["code"] == "model_retired"
+        assert list_spy_install.await_count == 0
+
+        # 4) Update when no team catalog is configured (from_db=False): returns early with no
+        #    list_user_subagents query (keeps test_plugin_subagent_lifecycle.py free of extra SQL).
+        compiled_spy_nodb = create_autospec(real_get_compiled, return_value=cat_no_db)
+        list_spy_nodb = create_autospec(real_list_user_subagents, return_value=[])
+        monkeypatch.setattr(compiled_mod, "get_compiled_catalog_async", compiled_spy_nodb)
+        monkeypatch.setattr(tmc_service, "get_compiled_catalog_async", compiled_spy_nodb)
+        monkeypatch.setattr(subagent_fanout, "list_user_subagents", list_spy_nodb)
+        asyncio.run(
+            subagent_fanout._validate_plugin_subagent_models_under_lock(
+                "u-1", "demo", [plan_omitted, plan_inherit], conn=fake_conn, check_overrides=True
+            )
+        )
+        assert compiled_spy_nodb.await_count == 1
+        assert list_spy_nodb.await_count == 0

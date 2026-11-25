@@ -363,6 +363,13 @@ class TaskModelGate:
             resolved.client, prompt_guidance=guidance,
             compaction_profile=self._config.compaction.profile,
         )
+        # DALTON-HOOK(team-model-catalog): carry the actual resolved model source (personal custom
+        # vs catalog) from client construction so start_task_run respects models.allowed filtering.
+        resolved_meta = getattr(resolved.client, "metadata", None)
+        is_custom_model = bool(
+            resolved.model_source == user_models.ModelSource.CUSTOM
+            or (isinstance(resolved_meta, dict) and resolved_meta.get("is_custom_model"))
+        )
         return TaskModel(
             name=name,
             display_name=(user_models.model_entry(model_pref, name) or {}).get("display_name") or name,
@@ -371,6 +378,7 @@ class TaskModelGate:
             model=card_model(model_pref, catalog_model(resolved.client) or name, self._turn_model),
             claude_code=claude_code,
             effort=effort,
+            is_custom_model=is_custom_model,
         )
 
     async def _claude_code_where(self) -> Admitted | str:

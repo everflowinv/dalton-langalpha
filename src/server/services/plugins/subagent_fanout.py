@@ -78,13 +78,20 @@ async def _validate_plugin_subagent_models_under_lock(
     check_overrides: bool = True,
 ) -> None:
     """DALTON-HOOK(team-model-catalog): validate each plugin subagent's effective model (including user override) under the held catalog shared lock."""
-    plans_with_model = [
-        plan
-        for plan in plans
-        if plan.skip_code is None and str((plan.fields or {}).get("model") or "").strip()
-    ]
-    if not plans_with_model:
+    # DALTON-HOOK(team-model-catalog): on updates (check_overrides=True), keep plans whose
+    # incoming file omits model or sets model: inherit so still-active user overrides are merged
+    # and validated; on fresh install (after stale overrides are cleared), skip undeclared plans.
+    active_plans = [plan for plan in plans if plan.skip_code is None]
+    if not active_plans:
         return
+    if not check_overrides:
+        active_plans = [
+            plan
+            for plan in active_plans
+            if str((plan.fields or {}).get("model") or "").strip()
+        ]
+        if not active_plans:
+            return
 
     from src.dalton.services.team_model_catalog.compiled import (
         get_compiled_catalog_async,
@@ -104,13 +111,13 @@ async def _validate_plugin_subagent_models_under_lock(
             if row.get("kind") == "override" and row.get("base_key"):
                 overrides_by_base[str(row["base_key"])] = dict(row.get("fields") or {})
 
-    for plan in plans_with_model:
+    for plan in active_plans:
         base_model = (plan.fields or {}).get("model")
         ov_fields = overrides_by_base.get(plugin_key(plugin_name, plan.name)) or {}
         eff_model = ov_fields.get("model") if "model" in ov_fields else base_model
-        if eff_model:
+        if isinstance(eff_model, str) and (cleaned_model := eff_model.strip()) and cleaned_model.lower() != "inherit":
             await assert_model_not_retired_under_lock(
-                conn, str(eff_model), field="model", user_id=user_id, allow_custom=True
+                conn, cleaned_model, field="model", user_id=user_id, allow_custom=True
             )
 
 

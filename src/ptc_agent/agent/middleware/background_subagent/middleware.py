@@ -290,6 +290,18 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
         ledger = getattr(self.registry, "run_ledger", None)
         if ledger is None:
             return ""
+        admission_kwargs = run_on.admission_kwargs()
+        # DALTON-HOOK(team-model-catalog): forward actual resolved model source from the built
+        # subagent client when RunOn does not already carry it, so start_task_run does not
+        # misclassify allowlisted team models as personal custom models.
+        if "is_custom_model" not in admission_kwargs:
+            from src.llms.model_identity import client_is_custom_model
+
+            resolved_is_custom = client_is_custom_model(
+                self.model_client_for(task.subagent_type, task.runs_on)
+            )
+            if resolved_is_custom is not None:
+                admission_kwargs["is_custom_model"] = resolved_is_custom
         try:
             return await ledger.start_task_run(
                 task_id=task.task_id,
@@ -298,7 +310,7 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
                 subagent_type=task.subagent_type,
                 parent_run_id=parent_run_id,
                 launch_tool_call_id=launch_tool_call_id,
-                **run_on.admission_kwargs(),
+                **admission_kwargs,
                 # The turn the run is spent for: the one resuming it, else the
                 # one that launched it, which a workflow's child (no parent)
                 # carries too.
