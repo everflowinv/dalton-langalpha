@@ -425,6 +425,9 @@ class RunOn:
     claude_code: Admitted | None = None
     claude_code_model: str | None = None
     ask: TaskAsk = TaskAsk()
+    # DALTON-HOOK(team-model-catalog): carry the subagent's actual catalog model key even when
+    # card_model returns None (e.g. subagent shares API model_id with main turn on another route).
+    actual_model_key: str | None = None
 
     def admission_kwargs(self) -> dict[str, Any]:
         """The run ledger's ``start_task_run`` facts."""
@@ -435,6 +438,11 @@ class RunOn:
             "stored_token": bool(admitted is not None and admitted.saved),
             "claude_code_model": self.claude_code_model,
             "cli_computer": admitted.cli_computer if admitted is not None else None,
+            **(
+                {"actual_model_key": self.actual_model_key}
+                if isinstance(self.actual_model_key, str) and self.actual_model_key.strip()
+                else {}
+            ),
             **self.ask.facts(),
         }
 
@@ -469,6 +477,8 @@ class TaskModel:
             model=self.model,
             claude_code=self.claude_code,
             claude_code_model=self.client.model if self.on_claude_code else None,
+            # DALTON-HOOK(team-model-catalog): persist final resolved model key (post-effort mapping)
+            actual_model_key=self.name or None,
         )
 
 

@@ -153,6 +153,7 @@ async def start_task_run(
     spending_run_id: Optional[str] = None,
     model_override: Optional[str] = None,
     effort_override: Optional[str] = None,
+    actual_model_key: Optional[str] = None,  # DALTON-HOOK(team-model-catalog)
     workflow_driver: bool = False,  # DALTON-HOOK(budget)
     workflow_driver_run_id: Optional[str] = None,  # DALTON-HOOK(budget)
     catalog_snapshot: Optional[Dict[str, Any]] = None,  # DALTON-HOOK(team-model-catalog)
@@ -198,6 +199,11 @@ async def start_task_run(
         **({"model": model} if model else {}),
         **({"model_override": model_override} if model_override else {}),
         **({"effort_override": effort_override} if effort_override else {}),
+        **(
+            {"actual_model_key": actual_model_key.strip()}
+            if isinstance(actual_model_key, str) and actual_model_key.strip()
+            else {}
+        ),  # DALTON-HOOK(team-model-catalog)
         **({"claude_code": True} if claude_code else {}),
         **(STORED_TURN if stored_token else {}),
         **({CLI_COMPUTER: cli_computer} if cli_computer else {}),
@@ -247,13 +253,14 @@ async def start_task_run(
 
                         sub_models = [
                             mk
-                            for raw_m in (model_override, model)
+                            for raw_m in (actual_model_key, model, model_override)
                             if (mk := _extract_model_key_value(raw_m))
                         ]
                         if sub_models:
                             snap = build_effective_catalog_snapshot(sub_models)
-                            facts["catalog_revision"] = snap["catalog_revision"]
-                            facts["effective_catalog_snapshot"] = snap
+                            if snap and snap.get("models"):
+                                facts["catalog_revision"] = snap["catalog_revision"]
+                                facts["effective_catalog_snapshot"] = snap
                     except Exception as _sub_snap_exc:
                         logger.debug(
                             "[subagent_runs] catalog snapshot build skipped: %s", _sub_snap_exc

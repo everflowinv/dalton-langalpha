@@ -800,35 +800,75 @@ async def _handle_send_message(
         )
 
         # DALTON-HOOK(team-model-catalog): compare-and-reject resume guard — identify the
-        # interrupted source run (restart resume, /retry, or web HITL resume) and bind
-        # resume_verify_scope so resolve_llm_config calls verify_resume_route BEFORE
-        # constructing any LLM client.
+        # interrupted source run (restart resume, /retry, web HITL resume, or direct
+        # checkpoint resume) and bind resume_verify_scope so resolve_llm_config calls
+        # verify_resume_route BEFORE constructing any LLM client.
         from contextlib import nullcontext
 
         from src.dalton.services.team_model_catalog.snapshot import resume_verify_scope
 
         resume_verify_run_id: str | None = None
         resume_verify_row: dict | None = resume_source_run
+        is_direct_checkpoint_resume = (
+            bool(request.checkpoint_id)
+            and not request.messages
+            and request.fork_from_turn is None
+            and not request.hitl_response
+        )
         if retry_of_run_id:
             resume_verify_run_id = str(retry_of_run_id)
         elif from_service and getattr(request, "resume_of_run_id", None):
             resume_verify_run_id = str(request.resume_of_run_id)
-        elif request.hitl_response and thread_id:
-            try:
-                from src.server.database.runs import lifecycle as _tl_db
+        elif (request.hitl_response or is_direct_checkpoint_resume) and thread_id:
+            from src.server.handlers.checkpoint_handler import (
+                resolve_checkpoint_resume_run_id,
+            )
 
-                _hitl_latest = await _tl_db.get_latest_attempt(thread_id)
-                if _hitl_latest is not None:
-                    resume_verify_run_id = (
-                        str(_hitl_latest.get("conversation_response_id") or "").strip() or None
-                    )
-                    resume_verify_row = _hitl_latest
-            except Exception as _hitl_load_err:
-                logger.warning(
-                    "[PTC_CHAT] Failed to load latest attempt for HITL resume verification on thread=%s: %s",
-                    thread_id,
-                    type(_hitl_load_err).__name__,
+            try:
+                resume_verify_run_id = await resolve_checkpoint_resume_run_id(
+                    thread_id, request.checkpoint_id
                 )
+            except Exception as _cp_load_err:
+                logger.warning(
+                    "[PTC_CHAT] Failed to resolve checkpoint owner for resume verification on thread=%s: %s",
+                    thread_id,
+                    type(_cp_load_err).__name__,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "type": "resume_verification_unavailable",
+                        "code": "resume_verification_unavailable",
+                        "message": "暂时无法校验该回合的模型配置，请稍后重试。",
+                    },
+                ) from _cp_load_err
+
+            if resume_verify_run_id is None and request.hitl_response:
+                # Legacy checkpoints written before run_id stamping fall back to latest attempt.
+                try:
+                    from src.server.database.runs import lifecycle as _tl_db
+
+                    _hitl_latest = await _tl_db.get_latest_attempt(thread_id)
+                    if _hitl_latest is not None:
+                        resume_verify_run_id = (
+                            str(_hitl_latest.get("conversation_response_id") or "").strip()
+                            or None
+                        )
+                        resume_verify_row = _hitl_latest
+                except Exception as _hitl_load_err:
+                    logger.warning(
+                        "[PTC_CHAT] Failed to load latest attempt for HITL resume verification on thread=%s: %s",
+                        thread_id,
+                        type(_hitl_load_err).__name__,
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "type": "resume_verification_unavailable",
+                            "code": "resume_verification_unavailable",
+                            "message": "暂时无法校验该回合的模型配置，请稍后重试。",
+                        },
+                    ) from _hitl_load_err
 
         fallback_records: list[dict[str, object]] = []
         automation_run_ctx: dict[str, object] = {}

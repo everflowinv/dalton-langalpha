@@ -49,9 +49,9 @@ def _isolated_native_sync_overlay(tmp_path, monkeypatch):
     directory (a symlinked checkout), where real retirements would hide keys
     these tests expect."""
     import src.dalton.llm.overlay as overlay_mod
-    from src.dalton.services.team_model_catalog.compiled import invalidate_compiled_catalog_cache
+    from src.dalton.services.team_model_catalog.compiled import reset_catalog_caches_for_tests
 
-    invalidate_compiled_catalog_cache()
+    reset_catalog_caches_for_tests()
     path = tmp_path / "native_sync_overlay.json"
     monkeypatch.setattr(nc, "NATIVE_SYNC_OVERLAY_PATH", path)
     monkeypatch.setattr(overlay_mod, "NATIVE_SYNC_OVERLAY_PATH", path)
@@ -60,7 +60,10 @@ def _isolated_native_sync_overlay(tmp_path, monkeypatch):
         "OVERLAY_SOURCES",
         [(name, path if name == "native_sync" else src) for name, src in overlay_mod.OVERLAY_SOURCES],
     )
-    return path
+    try:
+        yield path
+    finally:
+        reset_catalog_caches_for_tests()
 
 
 def test_overlay_sources_merge_order_is_native_then_native_sync():

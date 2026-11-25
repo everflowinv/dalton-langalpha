@@ -618,8 +618,9 @@ async def start_run(
                             )
                         if snap_candidates:
                             snap = build_effective_catalog_snapshot(snap_candidates)
-                            run_metadata["catalog_revision"] = snap["catalog_revision"]
-                            run_metadata["effective_catalog_snapshot"] = snap
+                            if snap and snap.get("models"):
+                                run_metadata["catalog_revision"] = snap["catalog_revision"]
+                                run_metadata["effective_catalog_snapshot"] = snap
                     except Exception as _snap_exc:
                         logger.debug(
                             "[turn_lifecycle] catalog snapshot build skipped: %s", _snap_exc

@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import { NO_STANDING, type AccountStanding } from '@/lib/accountRules';
+import { projectTurns } from '../../components/messageList/turnProjection';
 import { readTurnFailure } from '../turnFailure';
 
 const t = (key: string, opts?: Record<string, unknown>) => (opts ? `${key}:${String(opts.name)}` : key);
@@ -59,5 +60,25 @@ describe('readTurnFailure', () => {
       holdsDraft: false,
       reread: null,
     });
+  });
+
+  // DALTON-HOOK(team-model-catalog): verify an unadmitted catalog_route_changed bubble does not advance turnIndex
+  it('keeps local turnIndex aligned when a refused catalog_route_changed bubble is marked unadmitted', () => {
+    const projected = projectTurns([
+      { id: 'u-0', role: 'user', content: 'first' },
+      { id: 'a-0', role: 'assistant', content: 'reply 0' },
+      // Refused HITL/checkpoint resume placeholder settled with unadmitted: true
+      { id: 'assistant-hitl-1', role: 'assistant', content: '', unadmitted: true },
+      // User's next fresh send must take turnIndex 1 (not 2)
+      { id: 'u-1', role: 'user', content: 'fresh resend' },
+      { id: 'a-1', role: 'assistant', content: 'reply 1' },
+    ]);
+    expect(projected.map((m) => [m.id, m.turnIndex])).toEqual([
+      ['u-0', 0],
+      ['a-0', 0],
+      ['assistant-hitl-1', null],
+      ['u-1', 1],
+      ['a-1', 1],
+    ]);
   });
 });

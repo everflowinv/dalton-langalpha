@@ -18,6 +18,7 @@ from src.server.utils.checkpoint_helpers import (
     FORK_ROOT_CHECKPOINT_ID,
     build_checkpoint_config,
     get_checkpointer,
+    newest_checkpoint,
     turn_base_checkpoint_id,
 )
 from src.server.utils.pg_sanitize import normalize_uuid
@@ -301,3 +302,32 @@ async def settle_resume_request(thread_id: str, request: ChatRequest) -> ChatReq
     if stale:
         raise HTTPException(status_code=409, detail=stale_fork_detail())
     return request.model_copy(update={"resume_run_horizon": branch.run_horizon})
+
+
+async def resolve_checkpoint_resume_run_id(
+    thread_id: str,
+    checkpoint_id: str | None = None,
+) -> str | None:
+    """DALTON-HOOK(team-model-catalog): resolve the exact run_id that owns the checkpoint being resumed.
+
+    Reads the checkpoint metadata directly (walking past ``source == "update"``
+    flush/handover checkpoints, matching ``newest_checkpoint``) so web HITL resume
+    and direct checkpoint resume verify the checkpoint owner's snapshot rather than
+    an unrelated later pre-graph failed attempt.
+    """
+    checkpointer = get_checkpointer()
+    if checkpoint_id:
+        cp = await checkpointer.aget_tuple(build_checkpoint_config(thread_id, checkpoint_id))
+        if cp is None:
+            return None
+        while (cp.metadata or {}).get("source") == "update" and cp.parent_config:
+            parent = await checkpointer.aget_tuple(cp.parent_config)
+            if parent is None:
+                break
+            cp = parent
+        raw_rid = (cp.metadata or {}).get("run_id")
+        return str(raw_rid).strip() if raw_rid else None
+    nc = await newest_checkpoint(checkpointer, thread_id)
+    if nc is None or not nc.run_id:
+        return None
+    return str(nc.run_id).strip() or None

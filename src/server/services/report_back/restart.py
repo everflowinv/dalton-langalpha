@@ -213,7 +213,7 @@ async def resume_verdict(job: Mapping[str, Any]) -> OwedResume | NotOwed | NotYe
         tasks=tuple(tasks),
         retry_run_id=retry_run_id,
         automation_execution_id=execution_id or None,
-        source_run_id=str(run_id),
+        source_run_id=(str(run_id) if interrupted else None),
     )
 
 

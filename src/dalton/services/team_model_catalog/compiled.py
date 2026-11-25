@@ -663,11 +663,43 @@ def cache_compiled_catalog(compiled: CompiledCatalog) -> None:
 
 
 def invalidate_compiled_catalog_cache() -> None:
-    """Clear the process-local compiled catalog cache and reset the prewarm watermark."""
+    """Clear the process-local compiled catalog cache, dependent caches, and prewarm watermark."""
     global _HIGHEST_PREWARMED_REVISION
     with _CACHE_LOCK:
         _COMPILED_BY_REVISION.clear()
         _HIGHEST_PREWARMED_REVISION = -1
+    try:
+        from src.llms.llm import LLM
+
+        LLM._model_config = None
+    except Exception:
+        pass
+    try:
+        from src.server.services.llm.provider_catalog import key_candidates, provider_catalog
+
+        provider_catalog.cache_clear()
+        key_candidates.cache_clear()
+    except Exception:
+        pass
+
+
+def reset_catalog_caches_for_tests() -> None:
+    """Reset all process-local team catalog, ModelConfig, pricing, and contextvar state for tests."""
+    invalidate_compiled_catalog_cache()
+    try:
+        from src.llms import pricing_utils
+
+        pricing_utils._WARNED_MISSING_PRICING.clear()
+    except Exception:
+        pass
+    try:
+        from src.dalton.services.team_model_catalog import snapshot as _snap_mod
+
+        _snap_mod._ACTIVE_CATALOG_SNAPSHOT.set(None)
+        _snap_mod._ACTIVE_RESUME_VERIFY_TARGET.set(None)
+        _snap_mod._ACTIVE_VERIFIED_RESUME_VARIANT_BINDING.set(None)
+    except Exception:
+        pass
 
 
 def _get_cached(

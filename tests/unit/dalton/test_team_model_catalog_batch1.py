@@ -44,6 +44,7 @@ from src.dalton.services.team_model_catalog.compiled import (
     compile_catalog_from_payload,
     get_compiled_catalog_async,
     invalidate_compiled_catalog_cache,
+    reset_catalog_caches_for_tests,
 )
 from src.dalton.services.team_model_catalog.constants import (
     CATALOG_SCHEMA,
@@ -89,6 +90,16 @@ from src.server.services.llm.custom_catalog import refuse_custom_model_endpoints
 from src.server.services.llm.egress import is_operator_endpoint
 from src.server.utils.egress_guard import EgressBlockedError
 from src.utils.tracking.core import PricingResolver
+
+
+@pytest.fixture(autouse=True)
+def _isolate_team_catalog_process_state():
+    """Prevent compiled catalog, ModelConfig, provider_catalog, or contextvar state from leaking across tests."""
+    reset_catalog_caches_for_tests()
+    try:
+        yield
+    finally:
+        reset_catalog_caches_for_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -4149,7 +4160,18 @@ class TestR5Fixes:
             "pricing_type": "subscription"
         }
 
-        snap = build_effective_catalog_snapshot(["team-sub-gpt"], compiled=compiled)
+        snap = build_effective_catalog_snapshot(
+            ["team-sub-gpt"],
+            compiled=compiled,
+            variant_credentials={
+                "cash-var-openai": {
+                    "bound_base_url": "https://cash-var.example.com/v1",
+                    "canonical_bound_url": "https://cash-var.example.com:443/v1",
+                    "key_fingerprint": "fp-cash-var",
+                }
+            },
+        )
+        assert snap is not None
         assert snap["models"]["team-sub-gpt"]["billing"] == "subscription"
         assert snap["models"]["team-sub-gpt"]["pricing"] is None
 
@@ -6120,3 +6142,767 @@ class TestR7Fixes:
         kept_cards = state_b["payload"]["providers"]["models"]["var-alias"]
         assert len(kept_cards) == 1
         assert kept_cards[0]["id"] == "card-canon"
+
+
+class TestR8Fixes:
+    """Regression suite for Batch 1 r8: test isolation, production cache invalidation,
+    checkpoint resume ownership, subagent effort mapping, custom-model shadow priority,
+    credential read failures, and Codex R7 high/medium items."""
+
+    def test_r8_1_cache_isolation_and_provider_catalog_invalidation_on_revision_change(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.server.services.llm import provider_catalog as pc_mod
+        from src.utils.tracking.core import calculate_cost_from_per_call_records
+
+        # 1) Simulate a test caching a minimal fake revision-0 catalog, then resetting caches
+        with monkeypatch.context() as mp:
+            mp.setattr(
+                "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+                lambda p: _base_upstream_models()
+                if "models.json" in str(p)
+                else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+            )
+            mp.setattr(
+                "src.dalton.llm.overlay.load_overlay_data",
+                lambda path=None: _base_native_overlay(),
+            )
+            fake_rev0 = compile_catalog_from_payload({"schema": CATALOG_SCHEMA}, revision=0)
+            cache_compiled_catalog(fake_rev0)
+            assert "claude-opus-5-5" not in fake_rev0.model_config.llm_config
+
+        reset_catalog_caches_for_tests()
+        real_mc = LLM.get_model_config()
+        assert "claude-opus-5-5" in real_mc.llm_config
+        cost = calculate_cost_from_per_call_records(
+            [
+                {
+                    "model_name": "claude-opus-5-5",
+                    "provider": "anthropic",
+                    "usage": {"input_tokens": 1000, "output_tokens": 500},
+                }
+            ]
+        )
+        assert cost["platform_cost"] > 0
+
+        # 2) Production cache invalidation: provider_catalog() & key_candidates() refresh when
+        #    LLM.get_model_config() moves to a new compiled revision inside the same worker.
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+        cat_r1 = compile_catalog_from_payload({"schema": CATALOG_SCHEMA}, revision=1)
+        cat_r2 = compile_catalog_from_payload(
+            {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "provider_variants": {
+                        "openai": {
+                            "var-new-pc": {
+                                "parent_provider": "openai",
+                                "display_name": "Var New PC",
+                                "sdk": "openai",
+                                "billing": "cash",
+                                "base_url": "https://var-new-pc.example.com/v1",
+                            }
+                        }
+                    },
+                    "models": {
+                        "var-new-pc": [
+                            {"id": "m-new", "name": "M New", "pricing": {"input": 1.0, "output": 2.0}}
+                        ]
+                    },
+                },
+                "models": {
+                    "m-new": {
+                        "model_id": "m-new",
+                        "provider": "var-new-pc",
+                        "display_name": "M New",
+                        "visible": True,
+                    }
+                },
+                "dalton_meta": {"m-new": {"billing": "cash", "tool_calling": True}},
+            },
+            revision=2,
+        )
+        current_cat = {"cat": cat_r1}
+        orig_get_sync = compiled_mod.get_compiled_catalog_sync
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_sync, side_effect=lambda **_kw: current_cat["cat"]),
+        )
+        kc_r1 = pc_mod.key_candidates()
+        assert "var-new-pc" not in kc_r1
+        current_cat["cat"] = cat_r2
+        kc_r2 = pc_mod.key_candidates()
+        assert "var-new-pc" in kc_r2
+        # Cache clear attribute remains callable for upstream callers/tests
+        pc_mod.provider_catalog.cache_clear()
+        pc_mod.key_candidates.cache_clear()
+
+    def test_r8_2_checkpoint_resume_owner_direct_checkpoint_and_read_error_503(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import inspect
+        from types import SimpleNamespace
+
+        from src.server.app.threads import messaging
+        from src.server.handlers import checkpoint_handler as ch_mod
+
+        # 1) resolve_checkpoint_resume_run_id walks past source=="update" flush checkpoints
+        #    and returns the checkpoint's owning run_id (Run A), never a later failed Run B.
+        cp_run_a = SimpleNamespace(
+            config={"configurable": {"thread_id": "t-r8", "checkpoint_id": "cp-a"}},
+            metadata={"source": "loop", "run_id": "run-a-1111"},
+            parent_config=None,
+        )
+        cp_flush = SimpleNamespace(
+            config={"configurable": {"thread_id": "t-r8", "checkpoint_id": "cp-flush"}},
+            metadata={"source": "update"},
+            parent_config={"configurable": {"thread_id": "t-r8", "checkpoint_id": "cp-a"}},
+        )
+
+        class _FakeCP:
+            async def aget_tuple(self, cfg: dict[str, Any]) -> Any:
+                cid = (cfg.get("configurable") or {}).get("checkpoint_id")
+                if cid == "cp-a":
+                    return cp_run_a
+                return cp_flush
+
+        monkeypatch.setattr(ch_mod, "get_checkpointer", lambda: _FakeCP())
+        assert (
+            asyncio.run(ch_mod.resolve_checkpoint_resume_run_id("t-r8", "cp-flush")) == "run-a-1111"
+        )
+        assert asyncio.run(ch_mod.resolve_checkpoint_resume_run_id("t-r8", None)) == "run-a-1111"
+
+        # 2) Verify _handle_send_message wires BOTH direct checkpoint resume and HITL resume
+        #    through resolve_checkpoint_resume_run_id and raises HTTP 503 on read error.
+        msg_src = inspect.getsource(messaging._handle_send_message)
+        assert "is_direct_checkpoint_resume" in msg_src
+        assert "resolve_checkpoint_resume_run_id" in msg_src
+        assert "resume_verification_unavailable" in msg_src
+        assert "status_code=503" in msg_src
+
+    def test_r8_3_subagent_effort_mapping_before_verify_and_shared_model_id_actual_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        from langchain_core.messages import ToolMessage
+
+        from ptc_agent.agent.middleware.background_subagent import task_actions
+        from ptc_agent.agent.middleware.background_subagent.subagent import run_on_by_type
+        from ptc_agent.config.agent import TaskAsk, TaskModelRefused
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.snapshot import (
+            _extract_primary_model_key_from_run,
+        )
+        from src.server.services.llm.task_model import TaskModelGate
+
+        # 1) Shared API model_id: card_model returned None (models={}), but spec["model"] carries
+        #    catalog_model="glm-5.3-cn" -> run_on_by_type records actual_model_key="glm-5.3-cn".
+        fake_client = SimpleNamespace(metadata={"manifest_model": "glm-5.3-cn"})
+        ro_map = run_on_by_type(
+            [{"name": "research", "model": fake_client}],
+            default_model=SimpleNamespace(metadata={"manifest_model": "glm-5.3"}),
+            models={},
+            claude_code=None,
+        )
+        assert "research" in ro_map
+        assert ro_map["research"].model is None
+        assert ro_map["research"].actual_model_key == "glm-5.3-cn"
+        assert ro_map["research"].admission_kwargs()["actual_model_key"] == "glm-5.3-cn"
+
+        # _extract_primary_model_key_from_run prioritizes actual_model_key over unmapped model_override
+        assert (
+            _extract_primary_model_key_from_run(
+                {
+                    "replay_facts": {
+                        "model_override": "gemini-4-neon",
+                        "actual_model_key": "gemini-4-neon-high-oauth",
+                    }
+                },
+                is_subagent=True,
+            )
+            == "gemini-4-neon-high-oauth"
+        )
+
+        # 2) Subagent resume with Antigravity effort maps to the effort variant BEFORE verify_resume_route
+        base_provs = _base_upstream_providers()
+        base_provs["provider_config"]["google"] = {
+            "display_name": "Google",
+            "sdk": "google",
+            "base_url": "https://generativelanguage.googleapis.com/v1",
+            "env_key": "GOOGLE_API_KEY",
+        }
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (base_provs if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+        payload = {
+            "schema": CATALOG_SCHEMA,
+            "providers": {
+                "provider_variants": {
+                    "google": {
+                        "antigravity-oauth": {
+                            "parent_provider": "google",
+                            "display_name": "Antigravity OAuth",
+                            "sdk": "google",
+                            "billing": "subscription",
+                            "base_url": "https://ag.example.com/v1",
+                        }
+                    }
+                }
+            },
+            "models": {
+                "gemini-4-neon-medium-oauth": {
+                    "model_id": "gemini-4-neon-medium",
+                    "provider": "antigravity-oauth",
+                    "display_name": "Neon Medium",
+                    "visible": True,
+                },
+                "gemini-4-neon-high-oauth": {
+                    "model_id": "gemini-4-neon-high",
+                    "provider": "antigravity-oauth",
+                    "display_name": "Neon High",
+                    "visible": True,
+                },
+            },
+            "dalton_meta": {
+                "gemini-4-neon-medium-oauth": {
+                    "billing": "subscription",
+                    "notional_pricing": {"input": 3.0, "output": 15.0},
+                },
+                "gemini-4-neon-high-oauth": {
+                    "billing": "subscription",
+                    "notional_pricing": {"input": 3.0, "output": 15.0},
+                },
+            },
+        }
+        cat = compile_catalog_from_payload(payload, revision=140, oauth_sync_enabled=True)
+        orig_get_sync = compiled_mod.get_compiled_catalog_sync
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_sync, return_value=cat),
+        )
+        monkeypatch.setattr(LLM, "_model_config", cat.model_config)
+        from src.dalton.database import team_model_catalog as tmc_db
+
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_provider_credential",
+            create_autospec(
+                tmc_db.get_catalog_provider_credential,
+                return_value={
+                    "provider_slug": "antigravity-oauth",
+                    "bound_base_url": "https://ag.example.com/v1",
+                    "canonical_bound_url": "https://ag.example.com:443/v1",
+                    "key_fingerprint": "fp-ag",
+                },
+            ),
+        )
+        snap = build_effective_catalog_snapshot(
+            ["gemini-4-neon-high-oauth"],
+            compiled=cat,
+            variant_credentials={
+                "antigravity-oauth": {
+                    "bound_base_url": "https://ag.example.com/v1",
+                    "canonical_bound_url": "https://ag.example.com:443/v1",
+                    "key_fingerprint": "fp-ag",
+                }
+            },
+        )
+        assert snap is not None
+
+        sentinel = TaskModelRefused(message="reached-resolve-model-after-verify", reason="ok")
+        resolve_spy = create_autospec(task_actions._resolve_model, return_value=sentinel)
+        monkeypatch.setattr(task_actions, "_resolve_model", resolve_spy)
+
+        fake_gate = object.__new__(TaskModelGate)
+        fake_gate._user_id = "u-1"
+        fake_gate._model_pref = {}
+        fake_gate._policy = None
+        fake_gate._turn_model = "gpt-test"
+        fake_gate._config = SimpleNamespace(
+            subsidiary_llm_clients={},
+            subagents=SimpleNamespace(resolved=None, definitions={}),
+        )
+        monkeypatch.setattr(fake_gate, "_definition", lambda _st: None)
+        monkeypatch.setattr(fake_gate, "_own_model", lambda _st: "gemini-4-neon-medium-oauth")
+
+        # effective_model_key maps gemini-4-neon-medium-oauth + effort="high" -> gemini-4-neon-high-oauth
+        assert (
+            asyncio.run(
+                fake_gate.effective_model_key(
+                    TaskAsk(model="gemini-4-neon-medium-oauth", effort="high"), "research"
+                )
+            )
+            == "gemini-4-neon-high-oauth"
+        )
+
+        fake_task = SimpleNamespace(
+            task_id="sub-ag-1",
+            display_id="Task-sub-ag-1",
+            subagent_type="research",
+            is_pending=False,
+            cancelled=False,
+            terminal_status=None,
+            asyncio_task=None,
+            result=None,
+            ask=TaskAsk(model="gemini-4-neon-medium-oauth", effort="high"),
+            lock=asyncio.Lock(),
+        )
+
+        async def _resolve_ag_task(*_a: Any, **_kw: Any) -> Any:
+            return fake_task
+
+        fake_mw = SimpleNamespace(
+            _resolve_or_error=_resolve_ag_task,
+            subagent_types={"research"},
+            _resume_claims=set(),
+            registry=SimpleNamespace(
+                get_by_id=lambda tid: fake_task if tid == "sub-ag-1" else None,
+                run_ledger=object(),
+            ),
+            task_models=fake_gate,
+            namespace_owner=None,
+        )
+        fake_request = SimpleNamespace(
+            tool_call={"id": "tc-ag-1", "args": {"action": "resume", "task_id": "sub-ag-1"}},
+            state={},
+        )
+        pred_row = {
+            "task_run_id": "99999999-9999-4999-8999-999999999999",
+            "thread_id": "thread-r8-3",
+            "status": "completed",
+            "replay_facts": {
+                "model_override": "gemini-4-neon-medium-oauth",
+                "effort_override": "high",
+                "actual_model_key": "gemini-4-neon-high-oauth",
+                "effective_catalog_snapshot": snap,
+            },
+        }
+        monkeypatch.setattr(
+            task_actions,
+            "_read_latest_run",
+            create_autospec(task_actions._read_latest_run, return_value=pred_row),
+        )
+        msg = asyncio.run(
+            task_actions._handle_resume(
+                fake_mw,
+                fake_request,
+                handler=lambda _req: None,
+                target_task_id="sub-ag-1",
+                subagent_type=None,
+                description="resume sub-ag-1",
+                prompt="continue",
+                args={"action": "resume", "task_id": "sub-ag-1"},
+                parent_thread_id="thread-r8-3",
+                tool_call_id="tc-ag-1",
+                current_run_id="parent-run-ag-1",
+                ask=TaskAsk(),
+            )
+        )
+        assert isinstance(msg, ToolMessage)
+        assert "catalog_route_changed" not in str(msg.content)
+        assert resolve_spy.call_count == 1
+
+    def test_r8_4_same_name_custom_model_allowed_after_team_model_retirement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.team_model_catalog import service as tmc_service
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+        retired_cat = compile_catalog_from_payload(
+            {
+                "schema": CATALOG_SCHEMA,
+                "retired": [{"key": "gpt-test", "retired_at": "2026-11-25T00:00:00Z"}],
+            },
+            revision=20,
+        )
+        assert "gpt-test" in retired_cat.team_retired_keys
+        monkeypatch.setattr(
+            tmc_service,
+            "get_compiled_catalog_async",
+            create_autospec(tmc_service.get_compiled_catalog_async, return_value=retired_cat),
+        )
+
+        # User with personal custom model named "gpt-test" is ALLOWED even though team retired "gpt-test"
+        pref_with_same_name = {
+            "custom_models": [
+                {"name": "gpt-test", "provider": "openai", "model_id": "gpt-test-custom"}
+            ]
+        }
+        compiled_ok = asyncio.run(
+            assert_model_not_retired_under_lock(
+                None,
+                "gpt-test",
+                field="llm_model",
+                user_id="u-custom",
+                model_pref=pref_with_same_name,
+                allow_custom=True,
+            )
+        )
+        assert compiled_ok is retired_cat
+
+        # User with personal custom provider named "gpt-test" is also ALLOWED
+        pref_with_cp = {
+            "custom_providers": [{"name": "gpt-test", "parent_provider": "openai"}]
+        }
+        compiled_cp_ok = asyncio.run(
+            assert_model_not_retired_under_lock(
+                None,
+                "gpt-test",
+                field="model",
+                user_id="u-cp",
+                model_pref=pref_with_cp,
+                allow_custom=True,
+            )
+        )
+        assert compiled_cp_ok is retired_cat
+
+        # User WITHOUT a custom model/provider named "gpt-test" is still rejected with 400 model_retired
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(
+                assert_model_not_retired_under_lock(
+                    None,
+                    "gpt-test",
+                    field="llm_model",
+                    user_id="u-plain",
+                    model_pref={},
+                    allow_custom=True,
+                )
+            )
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["code"] == "model_retired"
+
+    def test_r8_5_credential_read_failure_skips_incomplete_snapshot_and_live_check_returns_503(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.snapshot import (
+            resolve_live_route_fingerprint,
+        )
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+        payload = {
+            "schema": CATALOG_SCHEMA,
+            "providers": {
+                "provider_variants": {
+                    "openai": {
+                        "var-cred-fail": {
+                            "parent_provider": "openai",
+                            "display_name": "Var Cred Fail",
+                            "sdk": "openai",
+                            "billing": "cash",
+                            "base_url": "https://var-cred-fail.example.com/v1",
+                        }
+                    }
+                },
+                "models": {
+                    "var-cred-fail": [
+                        {"id": "m-cf", "name": "M CF", "pricing": {"input": 1.0, "output": 2.0}}
+                    ]
+                },
+            },
+            "models": {
+                "m-cf": {
+                    "model_id": "m-cf",
+                    "provider": "var-cred-fail",
+                    "display_name": "M CF",
+                    "visible": True,
+                }
+            },
+            "dalton_meta": {"m-cf": {"billing": "cash", "tool_calling": True}},
+        }
+        cat = compile_catalog_from_payload(payload, revision=150)
+
+        # 1) build_effective_catalog_snapshot returns None (skips writing incomplete snapshot) when
+        #    credential read raises for a catalog-defined variant.
+        monkeypatch.setattr(
+            tmc_db,
+            "list_catalog_provider_credentials_sync",
+            create_autospec(
+                tmc_db.list_catalog_provider_credentials_sync,
+                side_effect=RuntimeError("pg connection reset"),
+            ),
+        )
+        assert build_effective_catalog_snapshot(["m-cf"], compiled=cat) is None
+        # Non-variant model does not depend on variant credentials and still succeeds
+        plain_snap = build_effective_catalog_snapshot(["gpt-test"], compiled=cat)
+        assert plain_snap is not None and "gpt-test" in plain_snap["models"]
+
+        # 2) resolve_live_route_fingerprint raises 503 on DB error instead of false catalog_route_changed
+        orig_get_sync = compiled_mod.get_compiled_catalog_sync
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_sync, return_value=cat),
+        )
+        monkeypatch.setattr(LLM, "_model_config", cat.model_config)
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_provider_credential",
+            create_autospec(
+                tmc_db.get_catalog_provider_credential,
+                side_effect=RuntimeError("pg timeout"),
+            ),
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(resolve_live_route_fingerprint("m-cf"))
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.detail["code"] == "catalog_credential_check_unavailable"
+
+    def test_r8_6_toctou_exact_model_id_tasks_restart_pricing_order_and_complete_byok_route(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.llm import complete as complete_mod
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.snapshot import (
+            RouteFingerprint,
+            _extract_cash_pricing_card,
+            bind_verified_resume_variant_binding,
+            verify_resume_route,
+        )
+        from src.dalton.services.team_model_catalog.transport import (
+            resolve_catalog_variant_binding_async,
+        )
+        from src.server.services.llm import clients as llm_clients
+        from src.server.services.llm import user_models
+        from src.server.services.report_back import restart as restart_mod
+
+        # A) Variant credential TOCTOU between verify_resume_route and resolve_catalog_variant_binding_async
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_provider_credential",
+            create_autospec(
+                tmc_db.get_catalog_provider_credential,
+                return_value={
+                    "provider_slug": "var-toctou",
+                    "api_key": "sk-rotated",
+                    "bound_base_url": "https://var-toctou.example.com/v1",
+                    "canonical_bound_url": "https://var-toctou.example.com:443/v1",
+                    "key_fingerprint": "fp-rotated",
+                },
+            ),
+        )
+        verified_fp = RouteFingerprint(
+            model_key="m-toctou",
+            provider="var-toctou",
+            model_id="m-toctou",
+            bound_base_url="https://var-toctou.example.com:443/v1",
+            key_fingerprint="fp-original",
+            billing="cash",
+        )
+        with bind_verified_resume_variant_binding(verified_fp):
+            with pytest.raises(HTTPException) as exc_toctou:
+                asyncio.run(resolve_catalog_variant_binding_async("var-toctou", model_key="m-toctou"))
+            assert exc_toctou.value.status_code == 400
+            assert exc_toctou.value.detail["code"] == "catalog_route_changed"
+
+        # B) Exact model_id comparison: gpt-6.2-sol vs gpt-6-2-sol refuses resume
+        snap_exact = {
+            "schema": "dalton-turn-catalog-snapshot/1",
+            "catalog_revision": 1,
+            "models": {
+                "m-exact": {
+                    "model_key": "m-exact",
+                    "provider": "openai",
+                    "model_id": "gpt-6.2-sol",
+                    "billing": "cash",
+                    "provider_info": {"base_url": "https://api.openai.com/v1"},
+                }
+            },
+            "variants": {},
+        }
+        with pytest.raises(HTTPException) as exc_mid:
+            asyncio.run(
+                verify_resume_route(
+                    "run-mid",
+                    RouteFingerprint(
+                        model_key="m-exact",
+                        provider="openai",
+                        model_id="gpt-6-2-sol",
+                        bound_base_url="https://api.openai.com:443/v1",
+                        billing="cash",
+                    ),
+                    snapshot=snap_exact,
+                )
+            )
+        assert exc_mid.value.status_code == 400
+        assert exc_mid.value.detail["code"] == "catalog_route_changed"
+
+        # C) Tasks-only restart (interrupted=False, tasks non-empty) sets source_run_id=None
+        import inspect
+
+        rv_src = inspect.getsource(restart_mod.resume_verdict)
+        assert "source_run_id=(str(run_id) if interrupted else None)" in rv_src
+
+        # D) Provider-before-parent pricing lookup parity between find_model_pricing and snapshot
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+        pricing_payload = {
+            "schema": CATALOG_SCHEMA,
+            "providers": {
+                "provider_variants": {
+                    "openai": {
+                        "var-price-parity": {
+                            "parent_provider": "openai",
+                            "display_name": "Var Price Parity",
+                            "sdk": "openai",
+                            "billing": "cash",
+                            "base_url": "https://var-price.example.com/v1",
+                        }
+                    }
+                },
+                "models": {
+                    "openai": [
+                        {
+                            "id": "gpt-6.2-sol",
+                            "name": "Parent Exact",
+                            "pricing": {"input": 99.0, "output": 199.0},
+                        }
+                    ],
+                    "var-price-parity": [
+                        {
+                            "id": "gpt-6-2-sol",
+                            "name": "Variant Hyphen",
+                            "pricing": {"input": 2.0, "output": 8.0},
+                        }
+                    ],
+                },
+            },
+            "models": {
+                "m-parity": {
+                    "model_id": "gpt-6.2-sol",
+                    "provider": "var-price-parity",
+                    "display_name": "M Parity",
+                    "visible": True,
+                }
+            },
+            "dalton_meta": {"m-parity": {"billing": "cash", "tool_calling": True}},
+        }
+        cat_parity = compile_catalog_from_payload(pricing_payload, revision=160)
+        snap_card = _extract_cash_pricing_card(
+            cat_parity.model_config, "var-price-parity", "gpt-6.2-sol"
+        )
+        live_card = find_model_pricing(
+            "gpt-6.2-sol",
+            "var-price-parity",
+            model_config=cat_parity.model_config,
+            model_key="m-parity",
+        )
+        assert snap_card is not None and live_card is not None
+        assert snap_card["input"] == 2.0
+        assert live_card["input"] == 2.0
+
+        # E) complete.py resolves actual BYOK credential route (z-ai-cn -> z-ai-cn-coding)
+        orig_get_sync = compiled_mod.get_compiled_catalog_sync
+        cat_zai = compile_catalog_from_payload(
+            {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "provider_variants": {
+                        "openai": {
+                            "z-ai-cn": {
+                                "parent_provider": "openai",
+                                "display_name": "Z-AI CN",
+                                "sdk": "openai",
+                                "billing": "cash",
+                                "base_url": "https://z-ai-cn.example.com/v1",
+                            },
+                            "z-ai-cn-coding": {
+                                "parent_provider": "openai",
+                                "display_name": "Z-AI CN Coding",
+                                "sdk": "openai",
+                                "billing": "subscription",
+                                "base_url": "https://z-ai-cn-coding.example.com/v1",
+                            },
+                        }
+                    }
+                },
+            },
+            revision=161,
+        )
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_sync, return_value=cat_zai),
+        )
+        monkeypatch.setattr(LLM, "_model_config", cat_zai.model_config)
+        custom_entry = {"name": "my-glm", "provider": "z-ai-cn", "model_id": "glm-5"}
+        monkeypatch.setattr(
+            user_models,
+            "classify_model",
+            create_autospec(
+                user_models.classify_model,
+                return_value=(user_models.ModelSource.CUSTOM, custom_entry),
+            ),
+        )
+        monkeypatch.setattr(
+            llm_clients,
+            "byok_key",
+            create_autospec(
+                llm_clients.byok_key,
+                return_value=(
+                    {"api_key": "k-coding"},
+                    "https://z-ai-cn-coding.example.com/v1",
+                    {**custom_entry, "provider": "z-ai-cn-coding"},
+                    "z-ai-cn-coding",
+                ),
+            ),
+        )
+        billing_type, eff_prov, eff_mid, eff_pprov = asyncio.run(
+            complete_mod._resolve_model_pricing_identity(
+                "my-glm",
+                user_id="u-coding",
+            )
+        )
+        assert billing_type == "oauth"
+        assert eff_prov == "z-ai-cn-coding"
+        assert eff_mid == "glm-5"
+        assert eff_pprov == "z-ai-cn-coding"

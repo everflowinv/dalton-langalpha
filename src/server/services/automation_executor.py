@@ -1085,6 +1085,7 @@ class AutomationExecutor:
                     name=(automation.get("name") or "").strip() or None,
                 ),
                 checked_computer_id=firing.checked_computer_id,
+                # DALTON-HOOK(team-model-catalog): carry prior run_id on automation refire for compare-and-reject resume verification
                 resume_of_run_id=refire_source_run_id,
             )
             # Generate run_id locally: automations don't pass through the

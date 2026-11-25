@@ -712,10 +712,7 @@ async def create_automation(
                     field="llm_model",
                     user_id=user_id,
                     model_pref=model_pref,
-                    allow_custom=(
-                        classified_model is not None
-                        and classified_model[0] == user_models.ModelSource.CUSTOM
-                    ),
+                    allow_custom=True,
                 )
         if is_coverage_units_enabled():
             try:
@@ -768,7 +765,7 @@ async def create_automation(
         )
 
     # DALTON-HOOK(team-model-catalog): run create inside an explicit transaction holding the
-    # shared catalog lock (with unit-test fallback when the pool is closed and create_automation is mocked).
+    # shared catalog lock (with unit-test fallback when the pool is closed and create_automation is mocked/autospecced).
     if conn is None:
         try:
             async with get_db_connection() as tx_conn, tx_conn.transaction():
@@ -776,9 +773,10 @@ async def create_automation(
         except RuntimeError as exc:
             from unittest.mock import NonCallableMock
 
-            if "pool is not open" not in str(exc).lower() or not isinstance(
-                auto_db.create_automation, NonCallableMock
-            ):
+            is_mocked = isinstance(auto_db.create_automation, NonCallableMock) or hasattr(
+                auto_db.create_automation, "assert_awaited"
+            )
+            if "pool is not open" not in str(exc).lower() or not is_mocked:
                 raise
             automation = await _do_create(None, skip_lock=True)
     else:
@@ -1492,13 +1490,17 @@ async def update_automation(
         }
     )
 
-    # DALTON-HOOK(team-model-catalog): always open a transaction when conn is None so
-    # acquire_catalog_shared_lock never runs on None (personal, non-managed, and standalone core).
+    # DALTON-HOOK(team-model-catalog): only acquire the catalog shared lock / open an outer
+    # transaction when this update actually sets a model name (not when clearing llm_model=None
+    # or omitting llm_model) or when coverage-unit locking is active.
+    needs_catalog_lock = bool(update_kwargs.get("llm_model"))
+    needs_outer_tx = needs_catalog_lock or (is_coverage_units_enabled() and bool(candidate_ws_list))
+
     async def _run_update(write_conn: Any, *, skip_lock: bool = False) -> Optional[Dict[str, Any]]:
         # DALTON-HOOK(team-model-catalog): outermost catalog shared lock BEFORE coverage-unit and automation row locks
         from src.dalton.database.team_model_catalog import acquire_catalog_shared_lock
 
-        if not skip_lock:
+        if needs_catalog_lock and not skip_lock:
             await acquire_catalog_shared_lock(write_conn)
         if update_kwargs.get("metadata") is not None:
             _assert_replaced_by_tracker_preserved(
@@ -1545,17 +1547,21 @@ async def update_automation(
             )
 
     # DALTON-HOOK(team-model-catalog): run update inside an explicit transaction holding the
-    # shared catalog lock (with unit-test fallback when the pool is closed and update_automation is mocked).
-    if conn is None:
+    # shared catalog lock only when setting a model or locking managed units (with unit-test
+    # fallback when the pool is closed and update_automation is mocked/autospecced).
+    if conn is None and not needs_outer_tx:
+        result = await _run_update(None, skip_lock=True)
+    elif conn is None:
         try:
             async with get_db_connection() as tx_conn, tx_conn.transaction():
                 result = await _run_update(tx_conn)
         except RuntimeError as exc:
             from unittest.mock import NonCallableMock
 
-            if "pool is not open" not in str(exc).lower() or not isinstance(
-                auto_db.update_automation, NonCallableMock
-            ):
+            is_mocked = isinstance(auto_db.update_automation, NonCallableMock) or hasattr(
+                auto_db.update_automation, "assert_awaited"
+            )
+            if "pool is not open" not in str(exc).lower() or not is_mocked:
                 raise
             result = await _run_update(None, skip_lock=True)
     else:

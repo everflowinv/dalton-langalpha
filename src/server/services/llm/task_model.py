@@ -193,6 +193,51 @@ class TaskModelGate:
     def _definition(self, subagent_type: str) -> SubagentDefinition | None:
         return turn_roster(self._config.subagents).definitions.get(subagent_type)
 
+    async def effective_model_key(self, ask: TaskAsk | None, subagent_type: str) -> str:
+        """DALTON-HOOK(team-model-catalog): resolve the final live model key (including
+        Antigravity effort-series mapping) BEFORE resume route verification and client build."""
+        from src.dalton.llm.antigravity_series import (
+            ANTIGRAVITY_PROVIDER,
+            resolve_antigravity_effort_model,
+        )
+
+        raw_model = ask.model.strip() if ask and ask.model else ""
+        base_name = raw_model or self._own_model(subagent_type)
+        if not base_name:
+            return ""
+        model_pref = self._model_pref
+        source, entry = await user_models.classify_model(
+            self._user_id, base_name, _pref_cache=model_pref
+        )
+        definition = self._definition(subagent_type)
+        requested_effort = (
+            (ask.effort if ask is not None else None)
+            or (definition.reasoning_effort if definition is not None else None)
+        )
+        mc = LLMFactory.get_model_config()
+        is_builtin_antigravity = (
+            source == user_models.ModelSource.SYSTEM
+            and isinstance(entry, dict)
+            and entry.get("provider") == ANTIGRAVITY_PROVIDER
+        )
+        if is_builtin_antigravity and requested_effort is not None:
+            def _variant_allowed(candidate: str) -> bool:
+                if not model_resolves(model_pref, candidate):
+                    return False
+                if (
+                    self._policy is not None
+                    and policy_refuses(self._policy, model_pref, candidate) is not None
+                ):
+                    return False
+                return True
+
+            mapped = resolve_antigravity_effort_model(
+                base_name, requested_effort, model_config=mc, allowed_filter=_variant_allowed
+            )
+            if mapped is not None:
+                return mapped[0]
+        return base_name
+
     async def _resolve(
         self, name: str, subagent_type: str, effort: str | None, *, own: bool
     ) -> TaskModel | TaskModelRefused:

@@ -71,6 +71,9 @@ _ACTIVE_CATALOG_SNAPSHOT: ContextVar[dict[str, Any] | None] = ContextVar(
 _ACTIVE_RESUME_VERIFY_TARGET: ContextVar[ResumeVerifyTarget | None] = ContextVar(
     "dalton_active_resume_verify_target", default=None
 )
+_ACTIVE_VERIFIED_RESUME_VARIANT_BINDING: ContextVar[RouteFingerprint | None] = ContextVar(
+    "dalton_active_verified_resume_variant_binding", default=None
+)
 
 
 def get_active_catalog_snapshot() -> dict[str, Any] | None:
@@ -81,6 +84,26 @@ def get_active_catalog_snapshot() -> dict[str, Any] | None:
 def get_active_resume_verify_target() -> ResumeVerifyTarget | None:
     """Return the active :class:`ResumeVerifyTarget` bound for pre-client route comparison."""
     return _ACTIVE_RESUME_VERIFY_TARGET.get()
+
+
+def get_active_verified_resume_variant_binding() -> RouteFingerprint | None:
+    """Return the verified catalog-variant :class:`RouteFingerprint` pinned across client construction."""
+    return _ACTIVE_VERIFIED_RESUME_VARIANT_BINDING.get()
+
+
+@contextmanager
+def bind_verified_resume_variant_binding(
+    route: RouteFingerprint | None,
+) -> Iterator[RouteFingerprint | None]:
+    """Pin the verified catalog-variant binding so ``resolve_catalog_variant_binding_*`` catches TOCTOU rotation."""
+    if route is None or not route.provider or (route.key_fingerprint is None and route.bound_base_url is None):
+        yield None
+        return
+    token = _ACTIVE_VERIFIED_RESUME_VARIANT_BINDING.set(route)
+    try:
+        yield route
+    finally:
+        _ACTIVE_VERIFIED_RESUME_VARIANT_BINDING.reset(token)
 
 
 @contextmanager
@@ -154,7 +177,7 @@ def _extract_primary_model_key_from_run(
     container_key = "replay_facts" if is_subagent else "metadata"
     container = run_row.get(container_key)
     field_order = (
-        ("model_override", "actual_model_key", "model", "llm_model")
+        ("actual_model_key", "model", "model_override", "llm_model")
         if is_subagent
         else ("llm_model", "main_model", "model", "model_override")
     )
@@ -332,13 +355,28 @@ async def resolve_live_route_fingerprint(
 
     bound_url: str | None = None
     key_fp: str | None = None
-    if prov_info.get("catalog_defined"):
+    if prov_info.get("catalog_defined") is True:
         try:
             from src.dalton.database.team_model_catalog import get_catalog_provider_credential
 
             cred = await get_catalog_provider_credential(prov, conn=conn, decrypt=False)
-        except Exception:
-            cred = None
+        except Exception as exc:
+            from fastapi import HTTPException
+
+            logger.warning(
+                "[team_model_catalog] Failed to read catalog variant credential for provider=%s: %s",
+                prov,
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "type": "catalog_credential_check_unavailable",
+                    "code": "catalog_credential_check_unavailable",
+                    "message": "暂时无法校验团队模型凭据，请稍后重试。",
+                    "provider": prov,
+                },
+            ) from exc
         if isinstance(cred, Mapping):
             bound_url = _canonical_url_or_none(
                 cred.get("canonical_bound_url") or cred.get("bound_base_url")
@@ -450,7 +488,7 @@ async def verify_resume_route(
         diffs["model_key"] = {"snapshot": orig_model_key, "live": live.model_key}
     if live.provider.lower() != snap_prov.lower():
         diffs["provider"] = {"snapshot": snap_prov, "live": live.provider}
-    if norm_id(live.model_id) != norm_id(snap_mid):
+    if live.model_id != snap_mid:
         diffs["model_id"] = {"snapshot": snap_mid, "live": live.model_id}
     if snap_url != live_url:
         diffs["bound_base_url"] = {"snapshot": snap_url, "live": live_url}
@@ -565,10 +603,16 @@ def _extract_cash_pricing_card(
     provider: str,
     model_id: str,
 ) -> dict[str, Any] | None:
-    """Resolve the cash pricing card for ``(provider, model_id)`` from ``mc.manifest``."""
+    """Resolve the cash pricing card for ``(provider, model_id)`` from ``mc.manifest``.
+
+    Uses the unified provider-before-parent order matching ``pricing_utils.find_model_pricing``:
+    within each provider (own provider first, then parent), exact case-insensitive ID/alias
+    runs before normalized ID/alias.
+    """
     manifest_models = (getattr(mc, "manifest", None) or {}).get("models") or {}
     if not isinstance(manifest_models, Mapping):
         return None
+    target_lower = model_id.lower()
     target_norm = norm_id(model_id)
     search_providers: list[str] = []
     if provider:
@@ -580,17 +624,36 @@ def _extract_cash_pricing_card(
         cards = manifest_models.get(prov)
         if not isinstance(cards, list):
             continue
+        # Pass 1 within provider: exact ID and exact alias (case-insensitive)
         for card in cards:
             if not isinstance(card, Mapping):
                 continue
             cid = str(card.get("id") or "")
-            if cid.lower() == model_id.lower() or norm_id(cid) == target_norm:
+            if cid.lower() == target_lower:
                 pricing = card.get("pricing")
                 return normalize_cash_pricing_card(pricing) if isinstance(pricing, Mapping) else None
             aliases = card.get("alias") or []
             if isinstance(aliases, list):
                 for alias in aliases:
-                    if str(alias).lower() == model_id.lower() or norm_id(str(alias)) == target_norm:
+                    if str(alias).lower() == target_lower:
+                        pricing = card.get("pricing")
+                        return (
+                            normalize_cash_pricing_card(pricing)
+                            if isinstance(pricing, Mapping)
+                            else None
+                        )
+        # Pass 2 within provider: normalized ID and normalized alias
+        for card in cards:
+            if not isinstance(card, Mapping):
+                continue
+            cid = str(card.get("id") or "")
+            if norm_id(cid) == target_norm:
+                pricing = card.get("pricing")
+                return normalize_cash_pricing_card(pricing) if isinstance(pricing, Mapping) else None
+            aliases = card.get("alias") or []
+            if isinstance(aliases, list):
+                for alias in aliases:
+                    if norm_id(str(alias)) == target_norm:
                         pricing = card.get("pricing")
                         return (
                             normalize_cash_pricing_card(pricing)
@@ -605,8 +668,13 @@ def build_effective_catalog_snapshot(
     *,
     compiled: Any = None,
     variant_credentials: Mapping[str, Mapping[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Build a self-contained ``effective_catalog_snapshot`` dict for ``model_keys``."""
+) -> dict[str, Any] | None:
+    """Build a self-contained ``effective_catalog_snapshot`` dict for ``model_keys``.
+
+    Returns ``None`` if any requested model uses a catalog-defined provider variant and
+    reading its credential metadata failed (so callers skip persisting an incomplete
+    snapshot instead of writing one with ``key_fingerprint=None``).
+    """
     from src.dalton.llm.notional_pricing import resolve_notional_card
     from src.dalton.services.team_model_catalog.compiled import get_compiled_catalog_sync
 
@@ -615,24 +683,42 @@ def build_effective_catalog_snapshot(
     llm_cfg = mc.llm_config or {}
     meta_map = cat.dalton_meta or {}
 
-    creds_map: Mapping[str, Mapping[str, Any]] = variant_credentials or {}
-    if not creds_map and cat.provider_variants:
+    unique_keys = list(dict.fromkeys(str(k).strip() for k in model_keys if str(k or "").strip()))
+    needs_variant_creds = any(
+        isinstance(llm_cfg.get(k), Mapping)
+        and bool(
+            (mc.get_provider_info(str(llm_cfg[k].get("provider") or "").strip()) or {}).get(
+                "catalog_defined"
+            )
+            is True
+        )
+        for k in unique_keys
+    )
+
+    creds_map: Mapping[str, Mapping[str, Any]] = (
+        variant_credentials if variant_credentials is not None else {}
+    )
+    if variant_credentials is None and needs_variant_creds:
         try:
             from src.dalton.database.team_model_catalog import (
                 list_catalog_provider_credentials_sync,
             )
 
             creds_map = list_catalog_provider_credentials_sync()
-        except Exception:
-            creds_map = {}
+        except Exception as exc:
+            logger.warning(
+                "[team_model_catalog] Skipping effective_catalog_snapshot because variant "
+                "credential read failed: %s",
+                type(exc).__name__,
+            )
+            return None
 
     models_out: dict[str, dict[str, Any]] = {}
     by_identity: dict[str, dict[str, Any]] = {}
     ambiguous_identities: set[str] = set()
     variants_out: dict[str, dict[str, Any]] = {}
 
-    unique_keys = [str(k).strip() for k in model_keys if str(k or "").strip()]
-    for key in dict.fromkeys(unique_keys):
+    for key in unique_keys:
         entry = llm_cfg.get(key)
         if not isinstance(entry, Mapping):
             continue
@@ -994,17 +1080,37 @@ async def ensure_run_catalog_snapshot(
     from src.dalton.services.team_model_catalog.compiled import get_compiled_catalog_async
 
     compiled = await get_compiled_catalog_async(conn=conn)
-    try:
-        creds = await list_catalog_provider_credentials(conn=conn)
-    except Exception:
-        creds = {}
+    llm_cfg = compiled.model_config.llm_config or {}
+    needs_variant_creds = any(
+        isinstance(llm_cfg.get(k), Mapping)
+        and (
+            (
+                compiled.model_config.get_provider_info(
+                    str(llm_cfg[k].get("provider") or "").strip()
+                )
+                or {}
+            ).get("catalog_defined")
+            is True
+        )
+        for k in candidates
+    )
+    creds: Mapping[str, Mapping[str, Any]] | None = {}
+    if needs_variant_creds:
+        try:
+            creds = await list_catalog_provider_credentials(conn=conn)
+        except Exception as exc:
+            logger.warning(
+                "[team_model_catalog] Skipping snapshot backfill because variant credential read failed: %s",
+                type(exc).__name__,
+            )
+            return None
 
     snapshot = build_effective_catalog_snapshot(
         candidates,
         compiled=compiled,
         variant_credentials=creds,
     )
-    if not snapshot.get("models"):
+    if not snapshot or not snapshot.get("models"):
         logger.info(
             "[team_model_catalog] Legacy run models %s missing from current catalog; "
             "cannot backfill snapshot, falling back to pre-feature handling",

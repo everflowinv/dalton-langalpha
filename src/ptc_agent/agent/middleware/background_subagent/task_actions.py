@@ -788,30 +788,37 @@ async def _handle_resume(
             )
             runs = ask.over(last_ask)
 
+        verified_subagent_route = None
         if pred_row is not None:
-            live_model_key = (
-                runs.model.strip()
-                if runs and runs.model
-                else (
-                    mw.task_models._own_model(task.subagent_type)
-                    if mw.task_models is not None
-                    else (_extract_primary_model_key_from_run(pred_row, is_subagent=True) or "")
+            if mw.task_models is not None and hasattr(mw.task_models, "effective_model_key"):
+                live_model_key = await mw.task_models.effective_model_key(
+                    runs, task.subagent_type
                 )
-            )
+            else:
+                live_model_key = (
+                    runs.model.strip()
+                    if runs and runs.model
+                    else (
+                        mw.task_models._own_model(task.subagent_type)
+                        if mw.task_models is not None
+                        else (_extract_primary_model_key_from_run(pred_row, is_subagent=True) or "")
+                    )
+                )
             tm_user_id = getattr(mw.task_models, "_user_id", None)
             tm_model_pref = getattr(mw.task_models, "_model_pref", None)
-            live_route = await resolve_live_route_fingerprint(
-                live_model_key,
-                user_id=tm_user_id,
-                model_pref=tm_model_pref,
-            )
             try:
+                live_route = await resolve_live_route_fingerprint(
+                    live_model_key,
+                    user_id=tm_user_id,
+                    model_pref=tm_model_pref,
+                )
                 await verify_resume_route(
                     str(pred_row.get("task_run_id") or "") or None,
                     live_route,
                     is_subagent=True,
                     run_row=pred_row,
                 )
+                verified_subagent_route = live_route
             except HTTPException as exc:
                 detail = exc.detail if isinstance(exc.detail, dict) else {}
                 code = str(
@@ -820,7 +827,18 @@ async def _handle_resume(
                 msg = str(detail.get("message") or CATALOG_ROUTE_CHANGED_MESSAGE)
                 return _refusal(f"Error: [{code}] {msg}", tool_call_id)
 
-        override = await _resolve_model(mw, runs, task.subagent_type) if runs else None
+        from contextlib import nullcontext
+
+        from src.dalton.services.team_model_catalog.snapshot import (
+            bind_verified_resume_variant_binding,
+        )
+
+        with (
+            bind_verified_resume_variant_binding(verified_subagent_route)
+            if verified_subagent_route is not None
+            else nullcontext()
+        ):
+            override = await _resolve_model(mw, runs, task.subagent_type) if runs else None
         if isinstance(override, TaskModelRefused):
             # DALTON-HOOK(computer-cli-tokens-off): omit `la models list` when CLI tokens are off.
             from src.dalton.settings import is_computer_cli_tokens_enabled

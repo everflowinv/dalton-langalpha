@@ -242,7 +242,24 @@ async def _resolve_model_pricing_identity(
                 entry_provider = str(entry.get("provider") or "").strip()
                 routed_entry = entry
                 cp_cfg = None
-                if entry_provider:
+                # Resolve the actual BYOK credential route first so sibling-variant
+                # routing (e.g. declared z-ai-cn served by a stored z-ai-cn-coding key)
+                # aligns budget admission with the endpoint the client actually calls.
+                byok_route = None
+                try:
+                    byok_route = await llm_clients.byok_key(
+                        user_id,
+                        key,
+                        source,
+                        entry,
+                        mc,
+                        **({"ignore_custom_models": True} if ignore_custom_models else {}),
+                    )
+                except Exception:
+                    byok_route = None
+                if byok_route is not None and isinstance(byok_route[2], dict):
+                    routed_entry = byok_route[2]
+                elif entry_provider:
                     cp_cfg = await user_models.get_custom_provider_config(user_id, entry_provider)
                     if cp_cfg and isinstance(cp_cfg.get("parent_provider"), str):
                         routed_entry = user_models.route_custom_entry(entry, cp_cfg, mc)

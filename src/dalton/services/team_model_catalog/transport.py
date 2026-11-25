@@ -585,7 +585,11 @@ async def resolve_catalog_variant_binding_async(
 ) -> dict[str, Any]:
     """Load and verify a catalog variant's encrypted credential and build its transport factory."""
     from src.dalton.database.team_model_catalog import get_catalog_provider_credential
+    from src.dalton.services.team_model_catalog.constants import (
+        build_catalog_route_changed_http_exception,
+    )
     from src.dalton.services.team_model_catalog.snapshot import (
+        get_active_verified_resume_variant_binding,
         lookup_snapshot_model_entry,
         lookup_snapshot_variant_binding,
     )
@@ -602,8 +606,16 @@ async def resolve_catalog_variant_binding_async(
 
     cred = await get_catalog_provider_credential(provider_slug, conn=conn, decrypt=True)
     snap_binding = lookup_snapshot_variant_binding(provider_slug, snapshot=snapshot)
+    verified_resume = get_active_verified_resume_variant_binding()
 
     if cred is None or not cred.get("api_key"):
+        if (
+            verified_resume is not None
+            and verified_resume.provider.lower() == provider_slug.lower()
+        ):
+            raise build_catalog_route_changed_http_exception(
+                diffs={"key_fingerprint": {"snapshot": verified_resume.key_fingerprint, "live": None}}
+            )
         if snap_binding is not None:
             raise CatalogVariantCredentialRevokedError(provider_slug, "credential was deleted")
         raise CatalogVariantSecurityError(
@@ -613,6 +625,22 @@ async def resolve_catalog_variant_binding_async(
     bound_url = str(cred["bound_base_url"])
     canonical_bound = str(cred.get("canonical_bound_url") or canonical_url_key(bound_url) or "")
     key_fp = str(cred["key_fingerprint"])
+
+    if (
+        verified_resume is not None
+        and verified_resume.provider.lower() == provider_slug.lower()
+    ):
+        toctou_diffs: dict[str, dict[str, Any]] = {}
+        expected_url = canonical_url_key(verified_resume.bound_base_url or "") or verified_resume.bound_base_url
+        if expected_url and expected_url != canonical_bound:
+            toctou_diffs["bound_base_url"] = {"snapshot": expected_url, "live": canonical_bound}
+        if verified_resume.key_fingerprint and verified_resume.key_fingerprint != key_fp:
+            toctou_diffs["key_fingerprint"] = {
+                "snapshot": verified_resume.key_fingerprint,
+                "live": key_fp,
+            }
+        if toctou_diffs:
+            raise build_catalog_route_changed_http_exception(diffs=toctou_diffs)
 
     if snap_binding is not None:
         snap_canonical = str(
@@ -658,7 +686,11 @@ def resolve_catalog_variant_binding_sync(
 ) -> dict[str, Any]:
     """Synchronous counterpart for ``create_llm`` direct/system path (#2)."""
     from src.dalton.database.team_model_catalog import get_catalog_provider_credential_sync
+    from src.dalton.services.team_model_catalog.constants import (
+        build_catalog_route_changed_http_exception,
+    )
     from src.dalton.services.team_model_catalog.snapshot import (
+        get_active_verified_resume_variant_binding,
         lookup_snapshot_model_entry,
         lookup_snapshot_variant_binding,
     )
@@ -675,8 +707,16 @@ def resolve_catalog_variant_binding_sync(
 
     cred = get_catalog_provider_credential_sync(provider_slug, decrypt=True)
     snap_binding = lookup_snapshot_variant_binding(provider_slug, snapshot=snapshot)
+    verified_resume = get_active_verified_resume_variant_binding()
 
     if cred is None or not cred.get("api_key"):
+        if (
+            verified_resume is not None
+            and verified_resume.provider.lower() == provider_slug.lower()
+        ):
+            raise build_catalog_route_changed_http_exception(
+                diffs={"key_fingerprint": {"snapshot": verified_resume.key_fingerprint, "live": None}}
+            )
         if snap_binding is not None:
             raise CatalogVariantCredentialRevokedError(provider_slug, "credential was deleted")
         raise CatalogVariantSecurityError(
@@ -686,6 +726,22 @@ def resolve_catalog_variant_binding_sync(
     bound_url = str(cred["bound_base_url"])
     canonical_bound = str(cred.get("canonical_bound_url") or canonical_url_key(bound_url) or "")
     key_fp = str(cred["key_fingerprint"])
+
+    if (
+        verified_resume is not None
+        and verified_resume.provider.lower() == provider_slug.lower()
+    ):
+        toctou_diffs: dict[str, dict[str, Any]] = {}
+        expected_url = canonical_url_key(verified_resume.bound_base_url or "") or verified_resume.bound_base_url
+        if expected_url and expected_url != canonical_bound:
+            toctou_diffs["bound_base_url"] = {"snapshot": expected_url, "live": canonical_bound}
+        if verified_resume.key_fingerprint and verified_resume.key_fingerprint != key_fp:
+            toctou_diffs["key_fingerprint"] = {
+                "snapshot": verified_resume.key_fingerprint,
+                "live": key_fp,
+            }
+        if toctou_diffs:
+            raise build_catalog_route_changed_http_exception(diffs=toctou_diffs)
 
     if snap_binding is not None:
         snap_canonical = str(

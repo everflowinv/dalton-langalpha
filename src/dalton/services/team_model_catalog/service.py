@@ -135,23 +135,9 @@ async def assert_model_not_retired_under_lock(
     if not cleaned:
         return None
     compiled = await get_compiled_catalog_async(conn=conn)
-    all_retired = (
-        compiled.factory_retired_keys
-        | compiled.readonly_legacy_retired_keys
-        | compiled.team_retired_keys
-    )
-    if cleaned in all_retired:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "model_retired",
-                "field": field,
-                "model": cleaned,
-                "message": f"Model '{cleaned}' has been retired and cannot be assigned.",
-            },
-        )
-    if compiled.model_config.get_model_config(cleaned) is not None:
-        return compiled
+    # Personal custom models/providers shadow team catalog names (matching classify_model);
+    # check them BEFORE team retirement checks so retiring a team model never blocks a user's
+    # same-name custom model or custom provider.
     if allow_custom:
         from src.llms.preferences import custom_model_names
         from src.server.services.llm import user_models
@@ -188,6 +174,23 @@ async def assert_model_not_retired_under_lock(
                             return compiled
             except Exception:
                 pass
+    all_retired = (
+        compiled.factory_retired_keys
+        | compiled.readonly_legacy_retired_keys
+        | compiled.team_retired_keys
+    )
+    if cleaned in all_retired:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "model_retired",
+                "field": field,
+                "model": cleaned,
+                "message": f"Model '{cleaned}' has been retired and cannot be assigned.",
+            },
+        )
+    if compiled.model_config.get_model_config(cleaned) is not None:
+        return compiled
     raise HTTPException(
         status_code=400,
         detail={

@@ -3695,7 +3695,10 @@ export function useChatMessages(
           const { banner } = meetRefusal(err);
           if (banner !== null) setMessageError(banner);
           setMessages((prev) =>
-            updateMessage(prev, assistantMessageId, (msg) => finalizeAssistantMessage(msg, 'completed'))
+            updateMessage(prev, assistantMessageId, (msg) => ({
+              ...finalizeAssistantMessage(msg, 'completed'),
+              unadmitted: true,
+            }))
           );
         } else {
           console.error('[HITL] Error resuming turn:', err);
@@ -4197,7 +4200,10 @@ export function useChatMessages(
       if (banner !== null) setMessageError(banner);
       if (isCatalogRouteChanged) {
         setMessages((prev) =>
-          updateMessage(prev, assistantMessageId, (msg) => finalizeAssistantMessage(msg, 'completed'))
+          updateMessage(prev, assistantMessageId, (msg) => ({
+            ...finalizeAssistantMessage(msg, 'completed'),
+            unadmitted: true,
+          }))
         );
       } else {
         console.error('[streamFromCheckpoint] Error:', err);

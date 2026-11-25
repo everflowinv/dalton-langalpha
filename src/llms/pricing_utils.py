@@ -323,6 +323,9 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
             return {"pricing_type": "subscription"}
 
     # Determine which providers to search (provider → parent → global)
+    # DALTON-HOOK(team-model-catalog): resolve own provider (exact+alias -> normalized)
+    # before falling back to parent provider, matching snapshot._extract_cash_pricing_card.
+    provider_scoped = False
     if provider:
         providers_to_search = []
         if provider in manifest['models']:
@@ -337,21 +340,18 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
             providers_to_search = list(manifest['models'].items())
             logger.debug(f"Provider '{provider}' and parent not found in manifest, searching all providers")
         else:
+            provider_scoped = True
             logger.debug(f"Searching for '{model_name}' in provider(s): {[p for p, _ in providers_to_search]}")
     else:
         # Global search across all providers
         providers_to_search = list(manifest['models'].items())
 
-    # STEP 1 & 2: Exact ID and alias matching (case-insensitive)
-    for prov, models in providers_to_search:
+    def _match_exact_or_alias(prov: str, models: list) -> Optional[Dict[str, Any]]:
         for model in models:
-            # Check exact ID match (case-insensitive)
             model_id = model.get('id', '')
             if model_id.lower() == model_name_lower:
                 logger.debug(f"Found pricing for '{model_name}' via exact ID match in provider '{prov}'")
                 return model.get('pricing')
-
-            # Check aliases (case-insensitive)
             aliases = model.get('alias', [])
             if isinstance(aliases, list):
                 for alias in aliases:
@@ -361,9 +361,9 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
                             f"(model_id: {model_id}) in provider '{prov}'"
                         )
                         return model.get('pricing')
+        return None
 
-    # STEP 2.5: Normalized matching (dots ↔ hyphens)
-    for prov, models in providers_to_search:
+    def _match_normalized(prov: str, models: list) -> Optional[Dict[str, Any]]:
         for model in models:
             model_id = model.get('id', '')
             if _normalize(model_id) == model_name_normalized:
@@ -372,7 +372,6 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
                     f"(model_id: {model_id}) in provider '{prov}'"
                 )
                 return model.get('pricing')
-
             aliases = model.get('alias', [])
             if isinstance(aliases, list):
                 for alias in aliases:
@@ -382,6 +381,27 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
                             f"(model_id: {model_id}) in provider '{prov}'"
                         )
                         return model.get('pricing')
+        return None
+
+    if provider_scoped:
+        # Provider-scoped search: check own provider (exact+alias -> normalized) BEFORE parent.
+        for prov, models in providers_to_search:
+            hit = _match_exact_or_alias(prov, models)
+            if hit is not None:
+                return hit
+            hit = _match_normalized(prov, models)
+            if hit is not None:
+                return hit
+    else:
+        # Global search: exact+alias across all providers before normalized fallback.
+        for prov, models in providers_to_search:
+            hit = _match_exact_or_alias(prov, models)
+            if hit is not None:
+                return hit
+        for prov, models in providers_to_search:
+            hit = _match_normalized(prov, models)
+            if hit is not None:
+                return hit
 
     # On an unstamped record this name is the vendor's own string, which can carry
     # newlines and forge a log record downstream, so every line below quotes and
