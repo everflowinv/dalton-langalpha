@@ -6,7 +6,7 @@
 
 - [ARCHITECTURE.md](./ARCHITECTURE.md)：讲清 Dalton 与上游 LangAlpha 的叠加关系、每个 `src/dalton/*` 子包职责、前后端请求与数据流、Dalton 数据库表与 `d001`–`d044` 迁移链路、宿主机 `launchd` 服务入口和外部依赖。
 - [OPERATIONS.md](./OPERATIONS.md)：讲清容器构建启停、生产部署（`deploy_main.sh`）、`.env` 改动生效步骤、宿主机 14 项 `launchd` 常驻服务安装与重启、运维脚本、异地备份、Tailscale Funnel 对外入口及故障排查。
-- [DEVELOPMENT.md](./DEVELOPMENT.md)：讲清上游同步流程、`DALTON-HOOK` 叠加层规则、`pr_baseline.sh` 基线测试、前端首屏体积预算（490 KiB）、双品牌规范、迁移编号规则（当前头节点 `d050`）和代码审查红线。
+- [DEVELOPMENT.md](./DEVELOPMENT.md)：讲清上游同步流程、`DALTON-HOOK` 叠加层规则、`pr_baseline.sh` 基线测试、前端首屏体积预算（490 KiB）、双品牌规范、迁移编号规则（当前头节点 `d051`）和代码审查红线。
 - [blueprint.md](./blueprint.md)：2026-10-18 立项产品蓝图，顶部附「现状对照」节，标出各目标的落地、调整和退役状态。
 
 ## 功能专题（`features/`）
