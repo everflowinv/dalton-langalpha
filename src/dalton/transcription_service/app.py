@@ -454,7 +454,7 @@ def create_app(
         request: Request,
         _: None = Depends(_require_transcription_token),
     ) -> JSONResponse:
-        mgr = _require_manager(intake=True)
+        _require_manager(intake=True)
         try:
             body = await request.json()
             if not isinstance(body, dict):
@@ -464,6 +464,7 @@ def create_app(
                 status_code=400,
                 content={"ok": False, "error": "Parse error"},
             )
+        mgr = _require_manager(intake=True)
         code, payload = await mgr.submit_job(body)
         return JSONResponse(status_code=code, content=payload)
 
@@ -510,7 +511,7 @@ def create_app(
         request: Request,
         _: None = Depends(_require_transcription_token),
     ) -> JSONResponse:
-        mgr = _require_manager(intake=True)
+        _require_manager(intake=True)
         action_body: dict[str, Any] = {}
         raw_body = await request.body()
         if raw_body.strip():
@@ -524,6 +525,7 @@ def create_app(
                     status_code=400,
                     content={"ok": False, "error": "Parse error"},
                 )
+        mgr = _require_manager(intake=True)
         code, payload = await mgr.retry_job(job_id, action_body)
         return JSONResponse(status_code=code, content=payload)
 
@@ -533,7 +535,7 @@ def create_app(
         request: Request,
         _: None = Depends(_require_transcription_token),
     ) -> JSONResponse:
-        mgr = _require_manager(intake=False)
+        _require_manager(intake=False)
         action_body: dict[str, Any] = {}
         raw_body = await request.body()
         if raw_body.strip():
@@ -547,6 +549,7 @@ def create_app(
                     status_code=400,
                     content={"ok": False, "error": "Parse error"},
                 )
+        mgr = _require_manager(intake=False)
         code, payload = await mgr.cancel_job(job_id, action_body)
         return JSONResponse(status_code=code, content=payload)
 

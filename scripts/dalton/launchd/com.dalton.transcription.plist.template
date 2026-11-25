@@ -8,6 +8,9 @@
 
   Install to ~/Library/LaunchAgents/com.dalton.transcription.plist:
     1. Replace __PYTHON_BIN__, __REPO__, __HOME__, and __LOG_DIR__ with host paths.
+       __PYTHON_BIN__ MUST be the repository virtualenv interpreter (<repo>/.venv/bin/python)
+       with fastapi, uvicorn, boto3, and httpx installed. Verify with:
+         <repo>/.venv/bin/python -c "import fastapi, uvicorn, boto3, httpx"
     2. Create ~/.config/dalton/transcription.env (mode 0600) with:
          DALTON_TRANSCRIPTION_TOKEN=<random 32-byte hex>
          DALTON_ASR_STORAGE_ENDPOINT_URL=http://127.0.0.1:9000
@@ -19,6 +22,9 @@
          VOLC_TOS_AK=...
          VOLC_TOS_SK=...
          VOLC_TOS_BUCKET=...
+         # Optional (defaults match code: cn-beijing / tos-s3-cn-beijing.volces.com):
+         # VOLC_TOS_REGION=cn-beijing
+         # VOLC_TOS_ENDPOINT=tos-s3-cn-beijing.volces.com
     3. Load with: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.transcription.plist
 -->
 <plist version="1.0">

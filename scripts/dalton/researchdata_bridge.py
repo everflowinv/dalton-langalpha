@@ -9205,6 +9205,8 @@ class ResearchDataBridge:
                 except Exception as exc:
                     logger.warning("Bridge ASR shutdown warning: %s", type(exc).__name__)
             self._asr_mgr_instance = None
+        self._asr_startup_lock_failed = False
+        self._asr_startup_lock_error = None
         self.release_asr_owner_lock()
 
     @staticmethod
@@ -19222,6 +19224,47 @@ class ResearchDataBridge:
             self._asr_mgr_instance = mgr
         return mgr
 
+    def initialize_asr_on_startup(self) -> list[str]:
+        """Acquire ``.owner.lock`` and recover incomplete ASR jobs at bridge startup.
+
+        When ``.owner.lock`` is held by another owner, marks startup lock acquisition
+        as failed so subsequent requests return 503 instead of acquiring the lock
+        lazily on a request path.
+        """
+        if self.is_asr_disabled():
+            logger.info(
+                "Bridge ASR disabled (DALTON_BRIDGE_ASR_DISABLED=true); "
+                "skipping .owner.lock acquisition and AsrJobManager startup recovery"
+            )
+            return []
+        try:
+            resumed = self._asr_job_manager().recover_incomplete_jobs()
+            self._asr_startup_lock_failed = False
+            self._asr_startup_lock_error = None
+            return resumed
+        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
+            self._asr_startup_lock_failed = True
+            self._asr_startup_lock_error = str(exc)
+            logger.error("Startup ASR owner lock busy (skipping recovery): %s", exc)
+            return []
+        except Exception as exc:
+            logger.warning("Startup ASR job recovery warning: %s", type(exc).__name__)
+            return []
+
+    def _asr_existing_locked_manager(self) -> asr_jobs.AsrJobManager | None:
+        """Return the existing ``AsrJobManager`` only when this bridge already holds ``.owner.lock``."""
+        mgr = getattr(self, "_asr_mgr_instance", None)
+        lock = getattr(self, "_asr_owner_lock", None)
+        jobs_dir = self._asr_jobs_dir().expanduser()
+        if (
+            mgr is not None
+            and mgr.jobs_dir == jobs_dir
+            and lock is not None
+            and lock.is_held
+        ):
+            return mgr
+        return None
+
     def _asr_unavailable_response(
         self, *, intake: bool = False
     ) -> tuple[int, dict[str, Any]] | None:
@@ -19240,106 +19283,109 @@ class ResearchDataBridge:
             }
         return None
 
+    def _get_asr_manager_for_request(
+        self, *, intake: bool
+    ) -> tuple[asr_jobs.AsrJobManager | None, tuple[int, dict[str, Any]] | None]:
+        """Resolve an ``AsrJobManager`` for a request without acquiring a new lock during drain or after startup lock failure."""
+        blocked = self._asr_unavailable_response(intake=intake)
+        if blocked is not None:
+            return None, blocked
+
+        startup_lock_failed = bool(getattr(self, "_asr_startup_lock_failed", False))
+        if self.is_asr_draining() or startup_lock_failed:
+            existing = self._asr_existing_locked_manager()
+            if existing is not None:
+                return existing, None
+            if startup_lock_failed:
+                return None, (
+                    503,
+                    {
+                        "ok": False,
+                        "error_code": "asr_owner_lock_busy",
+                        "error": getattr(self, "_asr_startup_lock_error", None)
+                        or "Bridge ASR did not acquire .owner.lock at startup",
+                    },
+                )
+            return None, (
+                503,
+                {
+                    "ok": False,
+                    "error_code": "asr_not_ready",
+                    "draining": True,
+                    "error": "Bridge ASR is draining without an active locked job manager",
+                },
+            )
+
+        try:
+            return self._asr_job_manager(), None
+        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
+            return None, (
+                503,
+                {
+                    "ok": False,
+                    "error_code": "asr_owner_lock_busy",
+                    "error": str(exc),
+                },
+            )
+
     async def handle_transcription_submit(
         self, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
         """Handle ``POST /transcriptions`` (admin token required; accounting identity from ``caller``)."""
-        blocked = self._asr_unavailable_response(intake=True)
-        if blocked is not None:
-            return blocked
-        try:
-            mgr = self._asr_job_manager()
-        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
-            return 503, {
-                "ok": False,
-                "error_code": "asr_owner_lock_busy",
-                "error": str(exc),
-            }
+        mgr, err = self._get_asr_manager_for_request(intake=True)
+        if err is not None:
+            return err
+        assert mgr is not None
         return await mgr.submit_job(body)
 
     async def handle_transcription_status(
         self, job_id: str
     ) -> tuple[int, dict[str, Any]]:
         """Handle ``GET /transcriptions/{id}``."""
-        blocked = self._asr_unavailable_response(intake=False)
-        if blocked is not None:
-            return blocked
-        try:
-            mgr = self._asr_job_manager()
-        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
-            return 503, {
-                "ok": False,
-                "error_code": "asr_owner_lock_busy",
-                "error": str(exc),
-            }
+        mgr, err = self._get_asr_manager_for_request(intake=False)
+        if err is not None:
+            return err
+        assert mgr is not None
         return await mgr.get_job(job_id)
 
     async def handle_transcription_result(
         self, job_id: str
     ) -> tuple[int, dict[str, Any]]:
         """Handle ``GET /transcriptions/{id}/result``."""
-        blocked = self._asr_unavailable_response(intake=False)
-        if blocked is not None:
-            return blocked
-        try:
-            mgr = self._asr_job_manager()
-        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
-            return 503, {
-                "ok": False,
-                "error_code": "asr_owner_lock_busy",
-                "error": str(exc),
-            }
+        mgr, err = self._get_asr_manager_for_request(intake=False)
+        if err is not None:
+            return err
+        assert mgr is not None
         return await mgr.get_job_result(job_id)
 
     async def handle_transcription_raw_result(
         self, job_id: str
     ) -> tuple[int, dict[str, Any] | Path]:
         """Handle ``GET /transcriptions/{id}/result/raw`` (streams bridge ``raw_response.json``)."""
-        blocked = self._asr_unavailable_response(intake=False)
-        if blocked is not None:
-            return blocked
-        try:
-            mgr = self._asr_job_manager()
-        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
-            return 503, {
-                "ok": False,
-                "error_code": "asr_owner_lock_busy",
-                "error": str(exc),
-            }
+        mgr, err = self._get_asr_manager_for_request(intake=False)
+        if err is not None:
+            return err
+        assert mgr is not None
         return await mgr.get_job_raw_result(job_id)
 
     async def handle_transcription_retry(
         self, job_id: str, body: dict[str, Any] | None = None
     ) -> tuple[int, dict[str, Any]]:
         """Handle ``POST /transcriptions/{id}/retry``."""
-        blocked = self._asr_unavailable_response(intake=True)
-        if blocked is not None:
-            return blocked
-        try:
-            mgr = self._asr_job_manager()
-        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
-            return 503, {
-                "ok": False,
-                "error_code": "asr_owner_lock_busy",
-                "error": str(exc),
-            }
+        mgr, err = self._get_asr_manager_for_request(intake=True)
+        if err is not None:
+            return err
+        assert mgr is not None
         return await mgr.retry_job(job_id, body)
 
     async def handle_transcription_cancel(
         self, job_id: str, body: dict[str, Any] | None = None
     ) -> tuple[int, dict[str, Any]]:
         """Handle ``POST /transcriptions/{id}/cancel``."""
-        blocked = self._asr_unavailable_response(intake=False)
-        if blocked is not None:
-            return blocked
-        try:
-            mgr = self._asr_job_manager()
-        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
-            return 503, {
-                "ok": False,
-                "error_code": "asr_owner_lock_busy",
-                "error": str(exc),
-            }
+        mgr, err = self._get_asr_manager_for_request(intake=False)
+        if err is not None:
+            return err
+        assert mgr is not None
         return await mgr.cancel_job(job_id, body)
 
     # ------------------------------------------------------------------
@@ -26462,18 +26508,7 @@ async def main() -> None:
             type(exc).__name__,
             getattr(exc, "exit_code", None),
         )
-    if bridge.is_asr_disabled():
-        logger.info(
-            "Bridge ASR disabled (DALTON_BRIDGE_ASR_DISABLED=true); "
-            "skipping .owner.lock acquisition and AsrJobManager startup recovery"
-        )
-    else:
-        try:
-            bridge._asr_job_manager().recover_incomplete_jobs()
-        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
-            logger.error("Startup ASR owner lock busy (skipping recovery): %s", exc)
-        except Exception as exc:
-            logger.warning("Startup ASR job recovery warning: %s", type(exc).__name__)
+    bridge.initialize_asr_on_startup()
     # DALTON-HOOK(data-jobs): recover host runner state and stop leftover process groups before serving (§2.3 item 3)
     try:
         await bridge.recover_host_runner_state_on_startup()

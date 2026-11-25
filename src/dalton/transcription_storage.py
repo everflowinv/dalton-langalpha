@@ -28,15 +28,21 @@ def _endpoint_url() -> str:
 def signing_endpoint_url() -> str:
     """The endpoint part-upload URLs are signed for.
 
-    ``DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL`` is the address the sandbox
-    reaches MinIO at (``http://host.docker.internal:9000`` in production),
-    which differs from the backend container's own endpoint; it falls back to
-    the plain endpoint when unset.
+    Checks ``DALTON_TRANSCRIPTION_S3_PUBLIC_ENDPOINT`` first (e.g.
+    ``http://minio-s3:9000`` for standalone core built-in MinIO or an external
+    S3 endpoint reachable by sandboxes), then the legacy alias
+    ``DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL`` (e.g.
+    ``http://host.docker.internal:9000`` in Everflow production), and falls back
+    to ``DALTON_ASR_STORAGE_ENDPOINT_URL`` when neither is set.
     """
-    explicit = (
-        os.getenv("DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL") or ""
-    ).strip().rstrip("/")
-    return explicit or _endpoint_url()
+    for env_name in (
+        "DALTON_TRANSCRIPTION_S3_PUBLIC_ENDPOINT",
+        "DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL",
+    ):
+        explicit = (os.getenv(env_name) or "").strip().rstrip("/")
+        if explicit:
+            return explicit
+    return _endpoint_url()
 
 
 def _bucket_name() -> str:

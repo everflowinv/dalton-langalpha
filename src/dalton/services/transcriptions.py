@@ -39,11 +39,14 @@ from src.dalton.database.transcriptions import (
     TERMINAL_TRANSCRIPTION_STATUSES,
     TranscriptionJobStatus,
 )
+from src.dalton.profile import DeploymentProfile, resolve_profile
 from src.dalton.settings import (
+    get_dalton_bridge_admin_token,
     get_dalton_settings,
     get_dalton_transcription_service_url,
     get_dalton_transcription_ticket_hmac_key,
     get_dalton_transcription_token,
+    has_explicit_transcription_service_url,
 )
 from src.dalton.transcription_storage import (
     abort_multipart_upload,
@@ -444,7 +447,27 @@ async def authorize_job_access(
         raise
 
 
+def _uses_legacy_everflow_bridge_transcription() -> bool:
+    """Return True for pre-cutover Everflow deployments without an explicit transcription service URL."""
+    return (
+        resolve_profile() is DeploymentProfile.EVERFLOW
+        and not has_explicit_transcription_service_url()
+    )
+
+
 def _transcription_service_headers() -> dict[str, str]:
+    if _uses_legacy_everflow_bridge_transcription():
+        token = get_dalton_bridge_admin_token()
+        if not token:
+            raise HTTPException(
+                status_code=503,
+                detail="DALTON_BRIDGE_ADMIN_TOKEN is not configured on backend",
+            )
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+            "X-Dalton-Bridge-Token": token,
+        }
     token = get_dalton_transcription_token()
     if not token:
         raise HTTPException(

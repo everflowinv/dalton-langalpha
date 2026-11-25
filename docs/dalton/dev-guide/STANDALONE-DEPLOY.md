@@ -336,12 +336,14 @@ DALTON_TRANSCRIPTION_TICKET_SECRET=<随机32字节十六进制>
 
 # 转写专用对象存储（私有桶；复用内置 MinIO 时填写与 MINIO_ROOT_USER / MINIO_ROOT_PASSWORD 一致的凭据）
 DALTON_ASR_STORAGE_ENDPOINT_URL=http://minio:9000
+# 对外签名地址（供 sandbox-net 中的沙箱直传分片）：复用内置 MinIO 时设为 http://minio-s3:9000；
+# 使用外部 S3 时设为沙箱可达的外部 S3 端点（兼容旧别名 DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL）
+DALTON_TRANSCRIPTION_S3_PUBLIC_ENDPOINT=http://minio-s3:9000
 DALTON_ASR_STORAGE_BUCKET_NAME=transcriptions
 DALTON_ASR_STORAGE_ACCESS_KEY_ID=<对象存储 Access Key>
 DALTON_ASR_STORAGE_SECRET_ACCESS_KEY=<对象存储 Secret Key>
 DALTON_ASR_STORAGE_REGION=us-east-1
 DALTON_ASR_STORAGE_ADDRESSING_STYLE=path
-# 若使用外部 S3 且沙箱与后端使用不同访问端点，可设置 DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL
 
 # OpenAI 兼容 Whisper 接口（可指向 OpenAI、自建 faster-whisper-server 或企业网关）
 DALTON_WHISPER_API_BASE_URL=https://api.openai.com/v1
@@ -349,17 +351,22 @@ DALTON_WHISPER_API_KEY=<Whisper API Key，留空时回退 OPENAI_API_KEY>
 DALTON_WHISPER_MODEL=whisper-1
 ```
 
+> **内置 MinIO 沙箱上传与安全边界**：核心版默认将 `minio` 隔离在 `core_internal` 内。启用 `--profile transcription` 复用内置 MinIO 时，可同时启动同属 `transcription` profile 的 `minio-s3` 代理容器（复用 `dalton-core-edge` 镜像中的 Caddy，按 `DALTON_TRANSCRIPTION_S3_PUBLIC_ENDPOINT=http://minio-s3:9000` 生成预签名上传地址）：
+> - 仅向 `sandbox-net` 暴露 MinIO 的 S3 API 端口（`9000`），并原样透传请求 `Host` 头以匹配 S3v4 签名；
+> - `minio` 容器本体、控制台端口（`9001`）以及 `postgres` / `redis` 继续隔离在 `core_internal` 网络，宿主机暴露端口保持原状；
+> - 私有桶策略保持不变（仅允许持有效签名的请求访问，对象存储密钥仅保留在后端与转写服务内）；沙箱仅凭后端签发的单分片限长、15 分钟有效预签名 PUT 地址上传对应音频分片。
+
 #### 第 2 步：初始化私有转写存储桶并启动服务
 
-复用内置 MinIO 时，运行一次 `minio-init` 即可幂等创建私有桶 `transcriptions` 并清空匿名策略；使用外部 S3 时，请提前在云控制台创建同名的私有存储桶并授予 `DALTON_ASR_STORAGE_ACCESS_KEY_ID` 读写权限。随后携带 `--profile transcription` 启动转写服务并重建 `backend` 使新 `.env` 生效：
+复用内置 MinIO 时，运行一次 `minio-init` 即可幂等创建私有桶 `transcriptions` 并清空匿名策略；使用外部 S3 时，请提前在云控制台创建同名的私有存储桶并授予 `DALTON_ASR_STORAGE_ACCESS_KEY_ID` 读写权限（此时只需启动 `transcription` 服务即可）。随后携带 `--profile transcription` 启动转写服务并重建 `backend` 使新 `.env` 生效：
 
 ```bash
 cd /opt/dalton
 # 1. 初始化私有转写存储桶（复用内置 MinIO 时执行）
 docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env run --rm minio-init
 
-# 2. 启动 transcription 服务（使用 dalton-asr-jobs 持久化卷）并重建 backend
-docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env --profile transcription up -d transcription
+# 2. 启动 transcription 服务（复用内置 MinIO 时同时启动 minio-s3 代理）并重建 backend
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env --profile transcription up -d transcription minio-s3
 docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d --no-deps backend
 ```
 

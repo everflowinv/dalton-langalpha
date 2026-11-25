@@ -1498,13 +1498,20 @@ def sanitize_mcp_client_config_server(
     return entry
 
 
+def has_explicit_transcription_service_url() -> bool:
+    """Return True when ``DALTON_TRANSCRIPTION_SERVICE_URL`` is explicitly configured."""
+    explicit = os.getenv("DALTON_TRANSCRIPTION_SERVICE_URL", "").strip()
+    return bool(explicit and not (explicit.startswith("${") and explicit.endswith("}")))
+
+
 def resolve_connector_env_defaults(
     profile: DeploymentProfile | None = None,
 ) -> dict[str, str]:
     """Return deployment-profile default service URLs for split connector services.
 
-    - ``DeploymentProfile.CORE``: Compose service DNS names on ``core_internal`` / ``sandbox-net``.
-    - ``DeploymentProfile.EVERFLOW``: macOS host services reached via ``host.docker.internal``.
+    - ``DeploymentProfile.CORE``: standalone Compose service DNS name on ``core_internal`` / ``sandbox-net``.
+    - ``DeploymentProfile.EVERFLOW``: legacy host bridge (`:8960`) until cutover explicitly sets
+      ``DALTON_TRANSCRIPTION_SERVICE_URL`` + ``DALTON_TRANSCRIPTION_TOKEN`` in ``.env``.
     """
     active = resolve_profile() if profile is None else profile
     if active is DeploymentProfile.CORE:
@@ -1512,12 +1519,12 @@ def resolve_connector_env_defaults(
             "DALTON_TRANSCRIPTION_SERVICE_URL": "http://transcription:8965",
         }
     return {
-        "DALTON_TRANSCRIPTION_SERVICE_URL": "http://host.docker.internal:8965",
+        "DALTON_TRANSCRIPTION_SERVICE_URL": "http://host.docker.internal:8960",
     }
 
 
 def get_dalton_transcription_service_url(host: str | None = None) -> str:
-    """Return the standalone transcription service base URL, or ``""`` when transcription capability is off."""
+    """Return the transcription service base URL, or ``""`` when transcription capability is off."""
     from urllib.parse import urlparse, urlunparse
     from src.dalton.capabilities import CapabilityId, has_capability
 
@@ -1525,9 +1532,8 @@ def get_dalton_transcription_service_url(host: str | None = None) -> str:
         return ""
     profile = resolve_profile()
     in_docker = os.path.exists("/.dockerenv")
-    port = os.getenv("DALTON_TRANSCRIPTION_PORT", "8965").strip() or "8965"
-    explicit = os.getenv("DALTON_TRANSCRIPTION_SERVICE_URL", "").strip()
-    if explicit and not (explicit.startswith("${") and explicit.endswith("}")):
+    if has_explicit_transcription_service_url():
+        explicit = os.getenv("DALTON_TRANSCRIPTION_SERVICE_URL", "").strip()
         default_host = host or (HOST_IP if in_docker else "127.0.0.1") or "127.0.0.1"
         expanded = explicit.replace("{HOST_IP}", default_host).rstrip("/")
         parsed = urlparse(expanded)
@@ -1560,14 +1566,21 @@ def get_dalton_transcription_service_url(host: str | None = None) -> str:
                     )
                 ).rstrip("/")
         return expanded
+
+    defaults = resolve_connector_env_defaults(profile)
+    default_url = defaults["DALTON_TRANSCRIPTION_SERVICE_URL"]
+    if profile is DeploymentProfile.EVERFLOW:
+        default_port = "8960"
+        port = os.getenv("DALTON_BRIDGE_PORT", default_port).strip() or default_port
+    else:
+        default_port = "8965"
+        port = os.getenv("DALTON_TRANSCRIPTION_PORT", default_port).strip() or default_port
     if host is not None:
         host_part = f"[{host}]" if ":" in host and not host.startswith("[") else host
         return f"http://{host_part}:{port}"
-    defaults = resolve_connector_env_defaults(profile)
-    default_url = defaults["DALTON_TRANSCRIPTION_SERVICE_URL"]
     if profile is DeploymentProfile.EVERFLOW and not in_docker and HOST_IP:
         return f"http://{HOST_IP}:{port}"
-    if port != "8965":
+    if port != default_port:
         parsed_def = urlparse(default_url)
         if parsed_def.scheme and parsed_def.hostname:
             return f"{parsed_def.scheme}://{parsed_def.hostname}:{port}"

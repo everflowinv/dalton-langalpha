@@ -507,6 +507,261 @@ async def test_bridge_drain_blocks_new_intake_and_reports_ready_for_handoff(
         await bridge.close()
 
 
+@pytest.mark.asyncio
+async def test_standalone_service_drain_during_body_read_rejects_submit_and_retry_without_enqueuing(
+    tmp_path: Path,
+) -> None:
+    """Triggering drain while the HTTP body is still streaming must return 503 and never enqueue submit or retry."""
+    jobs_dir = tmp_path / "asr_jobs"
+    token = "ts-body-drain-race-token"
+    cfg = ts_app.TranscriptionServiceConfig(
+        jobs_dir=jobs_dir,
+        token=token,
+        lock_timeout_s=0.1,
+    )
+    # Seed a failed job so we can test retry race too
+    app = ts_app.create_app(
+        config=cfg,
+        worker=ts_jobs.FakeAsrWorker(
+            ts_jobs.FakeAsrWorkerConfig(delay_s=0.0, fail_category="asr_upstream_timeout")
+        ),
+    )
+    app.state.runtime.startup()
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            seed = await client.post(
+                "/transcriptions",
+                headers=headers,
+                json=_sample_submit_payload("job_retry_race_seed"),
+            )
+            assert seed.status_code == 200
+            for _ in range(50):
+                st = await client.get("/transcriptions/job_retry_race_seed", headers=headers)
+                if st.json()["job"]["status"] == "failed":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("Seed failed job did not reach failed state")
+
+        async def _post_with_drain_mid_body(
+            path: str, payload: dict[str, Any]
+        ) -> tuple[int, dict[str, Any]]:
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            mid = max(1, len(raw) // 2)
+            chunks = [raw[:mid], raw[mid:]]
+            sent_first = asyncio.Event()
+            release_second = asyncio.Event()
+            idx = 0
+
+            async def _receive() -> dict[str, Any]:
+                nonlocal idx
+                if idx == 0:
+                    idx += 1
+                    sent_first.set()
+                    return {"type": "http.request", "body": chunks[0], "more_body": True}
+                if idx == 1:
+                    idx += 1
+                    await release_second.wait()
+                    return {"type": "http.request", "body": chunks[1], "more_body": False}
+                return {"type": "http.disconnect"}
+
+            response_status = 0
+            response_body = bytearray()
+
+            async def _send(message: dict[str, Any]) -> None:
+                nonlocal response_status
+                if message["type"] == "http.response.start":
+                    response_status = int(message["status"])
+                elif message["type"] == "http.response.body":
+                    response_body.extend(message.get("body", b""))
+
+            scope = {
+                "type": "http",
+                "asgi": {"version": "3.0"},
+                "http_version": "1.1",
+                "method": "POST",
+                "scheme": "http",
+                "path": path,
+                "raw_path": path.encode("ascii"),
+                "query_string": b"",
+                "headers": [
+                    (b"authorization", f"Bearer {token}".encode("ascii")),
+                    (b"content-type", b"application/json"),
+                ],
+                "client": ("127.0.0.1", 12345),
+                "server": ("127.0.0.1", 8965),
+            }
+
+            req_task = asyncio.create_task(app(scope, _receive, _send))
+            await asyncio.wait_for(sent_first.wait(), timeout=2.0)
+
+            # Trigger drain while request body is still streaming
+            drain_res = app.state.runtime.begin_drain()
+            assert drain_res["draining"] is True
+            assert drain_res["ready_for_handoff"] is True
+
+            release_second.set()
+            await asyncio.wait_for(req_task, timeout=2.0)
+            parsed = json.loads(bytes(response_body).decode("utf-8"))
+            return response_status, parsed
+
+        # 1) POST /transcriptions drained mid-body -> 503 and job never enqueued
+        sub_code, sub_body = await _post_with_drain_mid_body(
+            "/transcriptions", _sample_submit_payload("job_submit_race_new")
+        )
+        assert sub_code == 503
+        assert sub_body["error_code"] == "service_draining"
+        assert not (jobs_dir / "job_submit_race_new").exists()
+        assert app.state.runtime.active_job_ids() == []
+
+        # Resume intake so we can exercise the same mid-body drain race on retry
+        app.state.runtime.resume_intake()
+
+        # 2) POST /transcriptions/{id}/retry drained mid-body -> 503 and attempt stays 1
+        ret_code, ret_body = await _post_with_drain_mid_body(
+            "/transcriptions/job_retry_race_seed/retry", {"reason": "retry-after-timeout"}
+        )
+        assert ret_code == 503
+        assert ret_body["error_code"] == "service_draining"
+        seed_state = json.loads((jobs_dir / "job_retry_race_seed" / "state.json").read_text())
+        assert seed_state["attempt"] == 1
+        assert seed_state["status"] == "failed"
+        assert app.state.runtime.active_job_ids() == []
+    finally:
+        await app.state.runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_bridge_unlocked_after_startup_busy_or_during_drain_returns_503_without_acquiring_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Legacy bridge must not lazily acquire `.owner.lock` or construct AsrJobManager on query/download/cancel after startup lock busy or while draining."""
+    jobs_dir = tmp_path / "asr_jobs"
+
+    # Case 1: Bridge starts while standalone service holds lock -> startup fails to acquire lock.
+    # Even after the standalone service releases the lock (and even if drain is toggled),
+    # status/result/raw/cancel on the unlocked bridge return 503 and NEVER construct AsrJobManager.
+    holder = ts_lock.AsrOwnerLock(jobs_dir, service_name="dalton-transcription")
+    holder.acquire(timeout_s=0.1)
+    try:
+        legacy_mgr_spy = create_autospec(legacy_asr_jobs.AsrJobManager)
+        with monkeypatch.context() as mp:
+            mp.setattr(legacy_asr_jobs, "AsrJobManager", legacy_mgr_spy)
+            bridge_busy = _make_bridge(tmp_path, jobs_dir=jobs_dir, lock_timeout_s=0.05)
+            resumed = bridge_busy.initialize_asr_on_startup()
+            assert resumed == []
+            assert getattr(bridge_busy, "_asr_mgr_instance", None) is None
+            assert bridge_busy._asr_owner_lock is None
+            legacy_mgr_spy.assert_not_called()
+
+            # Drain reports ready_for_handoff=True (no active jobs)
+            admin_hdr = {"Authorization": f"Bearer {bridge_busy.cfg.admin_token}"}
+            dr_code, dr_resp = await _send_bridge_http(
+                bridge_busy, "POST", "/transcriptions/drain", admin_hdr, {"drain": True}
+            )
+            assert dr_code == 200
+            assert dr_resp["ready_for_handoff"] is True
+
+            # Original holder releases lock -> subsequent requests MUST STILL NOT acquire lock
+            holder.release()
+
+            for method, route, body in (
+                ("GET", "/transcriptions/job_any", None),
+                ("GET", "/transcriptions/job_any/result", None),
+                ("GET", "/transcriptions/job_any/result/raw", None),
+                ("POST", "/transcriptions/job_any/cancel", {}),
+            ):
+                code, resp = await _send_bridge_http(bridge_busy, method, route, admin_hdr, body)
+                assert code == 503, f"Expected 503 for {method} {route}, got {code}"
+                assert resp["error_code"] == "asr_owner_lock_busy"
+
+            # Even if drain is cleared without restarting bridge, startup-failed bridge stays unlocked
+            await _send_bridge_http(
+                bridge_busy, "POST", "/transcriptions/drain", admin_hdr, {"drain": False}
+            )
+            code_after, resp_after = await _send_bridge_http(
+                bridge_busy, "GET", "/transcriptions/job_any", admin_hdr
+            )
+            assert code_after == 503
+            assert resp_after["error_code"] == "asr_owner_lock_busy"
+            legacy_mgr_spy.assert_not_called()
+            assert bridge_busy._asr_owner_lock is None
+            await bridge_busy.close()
+    finally:
+        if holder.is_held:
+            holder.release()
+
+    # Case 2: Fresh bridge without a locked manager enters drain -> query/result/raw/cancel return 503 without acquiring lock
+    jobs_dir_2 = tmp_path / "asr_jobs_drain_unlocked"
+    legacy_mgr_spy_2 = create_autospec(legacy_asr_jobs.AsrJobManager)
+    with monkeypatch.context() as mp:
+        mp.setattr(legacy_asr_jobs, "AsrJobManager", legacy_mgr_spy_2)
+        bridge_drain = _make_bridge(tmp_path, jobs_dir=jobs_dir_2, lock_timeout_s=0.05)
+        admin_hdr_2 = {"Authorization": f"Bearer {bridge_drain.cfg.admin_token}"}
+        dr_code2, dr_resp2 = await _send_bridge_http(
+            bridge_drain, "POST", "/transcriptions/drain", admin_hdr_2, {"drain": True}
+        )
+        assert dr_code2 == 200
+        assert dr_resp2["draining"] is True
+        assert dr_resp2["owner_lock_held"] is False
+
+        for method, route, body in (
+            ("GET", "/transcriptions/job_x", None),
+            ("GET", "/transcriptions/job_x/result", None),
+            ("GET", "/transcriptions/job_x/result/raw", None),
+            ("POST", "/transcriptions/job_x/cancel", {}),
+        ):
+            code, resp = await _send_bridge_http(bridge_drain, method, route, admin_hdr_2, body)
+            assert code == 503, f"Expected 503 for {method} {route}, got {code}"
+            assert resp["error_code"] == "asr_not_ready"
+
+        legacy_mgr_spy_2.assert_not_called()
+        assert not (jobs_dir_2 / ".owner.lock").exists()
+        await bridge_drain.close()
+
+    # Case 3: Control — bridge that ALREADY holds lock and manager keeps serving status/result during drain
+    jobs_dir_3 = tmp_path / "asr_jobs_drain_locked"
+    bridge_locked = _make_bridge(
+        tmp_path, jobs_dir=jobs_dir_3, delay_s=0.0, fixed_text="已持锁排水可读。"
+    )
+    admin_hdr_3 = {"Authorization": f"Bearer {bridge_locked.cfg.admin_token}"}
+    try:
+        sub_code, _ = await _send_bridge_http(
+            bridge_locked,
+            "POST",
+            "/transcriptions",
+            admin_hdr_3,
+            _sample_submit_payload("job_locked_drain"),
+        )
+        assert sub_code == 200
+        for _ in range(50):
+            _, st = await _send_bridge_http(
+                bridge_locked, "GET", "/transcriptions/job_locked_drain", admin_hdr_3
+            )
+            if st["job"]["status"] == "succeeded":
+                break
+            await asyncio.sleep(0.01)
+
+        await _send_bridge_http(
+            bridge_locked, "POST", "/transcriptions/drain", admin_hdr_3, {"drain": True}
+        )
+        st_code, st_body = await _send_bridge_http(
+            bridge_locked, "GET", "/transcriptions/job_locked_drain", admin_hdr_3
+        )
+        assert st_code == 200
+        assert st_body["job"]["status"] == "succeeded"
+        res_code, res_body = await _send_bridge_http(
+            bridge_locked, "GET", "/transcriptions/job_locked_drain/result", admin_hdr_3
+        )
+        assert res_code == 200
+        assert res_body["result"]["text"] == "已持锁排水可读。"
+    finally:
+        await bridge_locked.close()
+
+
 # ---------------------------------------------------------------------------
 # 4. Authentication isolation & secret scrubbing
 # ---------------------------------------------------------------------------
@@ -611,7 +866,7 @@ def test_backend_settings_resolve_connector_env_defaults_and_secret_redaction(
         "DALTON_TRANSCRIPTION_SERVICE_URL": "http://transcription:8965",
     }
     assert dalton_settings.resolve_connector_env_defaults(DeploymentProfile.EVERFLOW) == {
-        "DALTON_TRANSCRIPTION_SERVICE_URL": "http://host.docker.internal:8965",
+        "DALTON_TRANSCRIPTION_SERVICE_URL": "http://host.docker.internal:8960",
     }
 
     monkeypatch.setenv("DALTON_TRANSCRIPTION_TOKEN", "super-secret-ts-token-999")
@@ -641,6 +896,140 @@ def test_backend_settings_resolve_connector_env_defaults_and_secret_redaction(
     # When transcription capability is off -> empty string
     monkeypatch.setenv("DALTON_CAP_TRANSCRIPTION", "false")
     assert dalton_settings.get_dalton_transcription_service_url() == ""
+
+
+@pytest.mark.asyncio
+async def test_backend_transcription_client_profile_and_explicit_url_matrix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify URL and token selection across both profiles (EVERFLOW / CORE) x explicit URL set/unset."""
+    monkeypatch.setenv("DALTON_ENABLED", "true")
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
+    monkeypatch.delenv("DALTON_CAP_TRANSCRIPTION", raising=False)
+    monkeypatch.delenv("DALTON_BRIDGE_PORT", raising=False)
+    monkeypatch.delenv("DALTON_TRANSCRIPTION_PORT", raising=False)
+    monkeypatch.setattr(dalton_settings, "HOST_IP", "")
+    monkeypatch.setattr(
+        svc_transcriptions,
+        "is_transcription_storage_configured",
+        create_autospec(tstore.is_transcription_storage_configured, return_value=True),
+    )
+
+    captured: list[tuple[str, str, str, str]] = []
+
+    def _mock_handler(request: httpx.Request) -> httpx.Response:
+        captured.append(
+            (
+                str(request.url),
+                request.headers.get("Authorization", ""),
+                request.headers.get("X-Dalton-Bridge-Token", ""),
+                request.headers.get("X-Dalton-Transcription-Token", ""),
+            )
+        )
+        return httpx.Response(200, json={"ok": True, "job": {"job_id": "j1", "status": "succeeded"}})
+
+    real_async_client = httpx.AsyncClient
+
+    def _patched_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = httpx.MockTransport(_mock_handler)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(svc_transcriptions.httpx, "AsyncClient", _patched_client)
+
+    # 1) EVERFLOW + URL unset -> keeps hitting legacy bridge (:8960) with DALTON_BRIDGE_ADMIN_TOKEN
+    monkeypatch.setenv("APP_ENV", "dalton")
+    monkeypatch.setenv("DALTON_PROFILE", "everflow")
+    monkeypatch.delenv("DALTON_TRANSCRIPTION_SERVICE_URL", raising=False)
+    monkeypatch.delenv("DALTON_TRANSCRIPTION_TOKEN", raising=False)
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", "legacy-bridge-admin-tok")
+    assert dalton_settings.get_dalton_transcription_service_url() == "http://host.docker.internal:8960"
+    captured.clear()
+    code, _ = await svc_transcriptions.call_bridge_get_transcription("j1")
+    assert code == 200
+    assert captured == [
+        (
+            "http://host.docker.internal:8960/transcriptions/j1",
+            "Bearer legacy-bridge-admin-tok",
+            "legacy-bridge-admin-tok",
+            "",
+        )
+    ]
+
+    # Missing bridge admin token in pre-cutover Everflow fails closed with 503
+    monkeypatch.delenv("DALTON_BRIDGE_ADMIN_TOKEN", raising=False)
+    with pytest.raises(HTTPException) as exc_ef_legacy_missing:
+        await svc_transcriptions.call_bridge_get_transcription("j1")
+    assert exc_ef_legacy_missing.value.status_code == 503
+    assert "DALTON_BRIDGE_ADMIN_TOKEN" in str(exc_ef_legacy_missing.value.detail)
+
+    # 2) EVERFLOW + explicit URL set -> uses standalone service URL + DALTON_TRANSCRIPTION_TOKEN (no bridge fallback)
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", "legacy-bridge-admin-tok")
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_SERVICE_URL", "http://host.docker.internal:8965")
+    monkeypatch.delenv("DALTON_TRANSCRIPTION_TOKEN", raising=False)
+    assert dalton_settings.get_dalton_transcription_service_url() == "http://host.docker.internal:8965"
+    with pytest.raises(HTTPException) as exc_ef_new_missing:
+        await svc_transcriptions.call_bridge_get_transcription("j1")
+    assert exc_ef_new_missing.value.status_code == 503
+    assert "DALTON_TRANSCRIPTION_TOKEN" in str(exc_ef_new_missing.value.detail)
+
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_TOKEN", "standalone-ef-ts-tok")
+    captured.clear()
+    code, _ = await svc_transcriptions.call_bridge_get_transcription("j1")
+    assert code == 200
+    assert captured == [
+        (
+            "http://host.docker.internal:8965/transcriptions/j1",
+            "Bearer standalone-ef-ts-tok",
+            "",
+            "standalone-ef-ts-tok",
+        )
+    ]
+
+    # 3) CORE + URL unset -> directly uses standalone service (http://transcription:8965) + DALTON_TRANSCRIPTION_TOKEN
+    monkeypatch.setenv("APP_ENV", "core")
+    monkeypatch.setenv("DALTON_PROFILE", "core")
+    monkeypatch.delenv("DALTON_TRANSCRIPTION_SERVICE_URL", raising=False)
+    monkeypatch.delenv("DALTON_TRANSCRIPTION_TOKEN", raising=False)
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", "legacy-bridge-admin-tok")
+    assert dalton_settings.get_dalton_transcription_service_url() == "http://transcription:8965"
+    with pytest.raises(HTTPException) as exc_core_unset_missing:
+        await svc_transcriptions.call_bridge_get_transcription("j1")
+    assert exc_core_unset_missing.value.status_code == 503
+    assert "DALTON_TRANSCRIPTION_TOKEN" in str(exc_core_unset_missing.value.detail)
+
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_TOKEN", "standalone-core-ts-tok")
+    captured.clear()
+    code, _ = await svc_transcriptions.call_bridge_get_transcription("j1")
+    assert code == 200
+    assert captured == [
+        (
+            "http://transcription:8965/transcriptions/j1",
+            "Bearer standalone-core-ts-tok",
+            "",
+            "standalone-core-ts-tok",
+        )
+    ]
+
+    # 4) CORE + explicit URL set -> uses explicit URL + DALTON_TRANSCRIPTION_TOKEN
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_SERVICE_URL", "http://custom-transcription:9865/")
+    monkeypatch.delenv("DALTON_TRANSCRIPTION_TOKEN", raising=False)
+    assert dalton_settings.get_dalton_transcription_service_url() == "http://custom-transcription:9865"
+    with pytest.raises(HTTPException) as exc_core_set_missing:
+        await svc_transcriptions.call_bridge_get_transcription("j1")
+    assert exc_core_set_missing.value.status_code == 503
+
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_TOKEN", "standalone-core-custom-tok")
+    captured.clear()
+    code, _ = await svc_transcriptions.call_bridge_get_transcription("j1")
+    assert code == 200
+    assert captured == [
+        (
+            "http://custom-transcription:9865/transcriptions/j1",
+            "Bearer standalone-core-custom-tok",
+            "",
+            "standalone-core-custom-tok",
+        )
+    ]
 
 
 @pytest.mark.asyncio
@@ -1130,6 +1519,20 @@ def test_deployment_configs_ffmpeg_entrypoint_networks_launchd_and_minio_init(
     assert set(ts_svc["networks"]) == {"core_internal", "sandbox-net"}
     assert "dalton-asr-jobs:/var/lib/dalton/asr_jobs" in ts_svc["volumes"]
     assert "dalton-asr-jobs" in compose["volumes"]
+
+    # Built-in MinIO stays isolated on core_internal; opt-in minio-s3 proxy under transcription profile
+    # exposes only S3 :9000 to sandbox-net without inheriting .env secrets.
+    assert set(compose["services"]["minio"]["networks"]) == {"core_internal"}
+    minio_s3_svc = compose["services"]["minio-s3"]
+    assert minio_s3_svc["profiles"] == ["transcription"]
+    assert minio_s3_svc["image"] == "${DALTON_EDGE_IMAGE:-dalton-core-edge:local}"
+    assert "env_file" not in minio_s3_svc
+    assert set(minio_s3_svc["networks"]) == {"core_internal", "sandbox-net"}
+    assert "http://minio:9000" in minio_s3_svc["command"]
+
+    env_core_example = (REPO_ROOT / ".env.core.example").read_text(encoding="utf-8")
+    assert "DALTON_TRANSCRIPTION_S3_PUBLIC_ENDPOINT=http://minio-s3:9000" in env_core_example
+
     for secret_key in (
         "DALTON_TRANSCRIPTION_TOKEN",
         "DALTON_TRANSCRIPTION_TICKET_SECRET",
@@ -1142,15 +1545,20 @@ def test_deployment_configs_ffmpeg_entrypoint_networks_launchd_and_minio_init(
             f"docker-compose.core.yml must not Compose-interpolate secret {secret_key}"
         )
 
-    # 3) Everflow launchd plist template is valid XML and uses identical default production paths
+    # 3) Everflow launchd plist template is valid XML, uses identical default production paths,
+    #    documents repository .venv/bin/python requirement, and lists optional VOLC_TOS_* overrides.
     plist_path = REPO_ROOT / "scripts/dalton/launchd/com.dalton.transcription.plist.template"
-    plist_data = plistlib.loads(plist_path.read_bytes())
+    plist_raw = plist_path.read_text(encoding="utf-8")
+    plist_data = plistlib.loads(plist_raw.encode("utf-8"))
     assert plist_data["Label"] == "com.dalton.transcription"
     env_vars = plist_data["EnvironmentVariables"]
     assert env_vars["DALTON_ASR_JOBS_DIR"] == "__REPO__/var/dalton/asr_jobs"
     assert env_vars["DALTON_ASR_USAGE_FILE"] == "__REPO__/var/dalton/asr_jobs/asr_usage.jsonl"
     assert env_vars["DALTON_TRANSCRIPTION_PORT"] == "8965"
     assert env_vars["DALTON_HOST_PLATFORM"] == "macos"
+    assert ".venv/bin/python" in plist_raw
+    assert "VOLC_TOS_REGION" in plist_raw
+    assert "VOLC_TOS_ENDPOINT" in plist_raw
 
     # 4) Default code path matches legacy researchdata_bridge.py (`<repo>/var/dalton/asr_jobs`)
     assert ts_app.default_asr_jobs_dir() == REPO_ROOT / "var" / "dalton" / "asr_jobs"
