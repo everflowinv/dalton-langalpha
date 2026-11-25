@@ -2634,12 +2634,12 @@ class TestBatch3BackendTextAndSkillGates:
         _clean_cap_env(monkeypatch, app_env="core")
         core_caps = frozenset()
 
-        # All 29 Core-visible Dalton skills assemble cleanly with 0 proprietary hits
+        # All 30 Core-visible Dalton skills assemble cleanly with 0 proprietary hits
         core_skills = sorted(
             name for name in dr_mod.DALTON_SKILL_DEFINITIONS
             if dr_mod.is_dalton_skill_enabled(name)
         )
-        assert len(core_skills) == 29
+        assert len(core_skills) == 30
         assert "dalton-13f-tracker" not in core_skills
         assert "dalton-bullbear-tracker" not in core_skills
 

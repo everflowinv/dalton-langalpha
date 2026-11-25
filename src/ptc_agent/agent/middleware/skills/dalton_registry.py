@@ -87,6 +87,7 @@ _DALTON_SKILL_SPECS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
     ("dalton-agenda", None, ("dalton-conventions", "research-conventions")),
     ("dalton-research-director", "dalton-director", ("dalton-conventions", "research-conventions")),
     ("dalton-financial-lenses", "dalton-financial-lenses", ("dalton-conventions", "research-conventions")),
+    ("dalton-model", "dalton-model", ("dalton-conventions", "research-conventions")),
     ("dalton-company-background", "dalton-company-background", ("dalton-conventions", "research-conventions")),
     ("dalton-bullbear", "bullbear", ("dalton-conventions", "research-conventions", _RW)),
     ("dalton-initial-coverage", "initial-coverage", ("dalton-conventions", "research-conventions", _RW)),
@@ -158,7 +159,7 @@ DALTON_SKILL_CAPABILITY_MAP: Mapping[
     str, CapabilityId | tuple[CapabilityId, ...] | None
 ] = MappingProxyType(
     {
-        # --- Core investment research skeleton (29 skills) ---
+        # --- Core investment research skeleton (30 skills) ---
         "dalton-conventions": CORE_CAPABILITY,
         "dalton-init-company": CORE_CAPABILITY,
         "dalton-init-sector": CORE_CAPABILITY,
@@ -167,6 +168,7 @@ DALTON_SKILL_CAPABILITY_MAP: Mapping[
         "dalton-agenda": CORE_CAPABILITY,
         "dalton-research-director": CORE_CAPABILITY,
         "dalton-financial-lenses": CORE_CAPABILITY,
+        "dalton-model": CORE_CAPABILITY,
         "dalton-company-background": CORE_CAPABILITY,
         "dalton-bullbear": CORE_CAPABILITY,
         "dalton-initial-coverage": CORE_CAPABILITY,

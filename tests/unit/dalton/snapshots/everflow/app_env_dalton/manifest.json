@@ -509,6 +509,17 @@
       "in_sandbox": true,
       "requires": []
     },
+    "dalton-model": {
+      "command": "dalton-model",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
+    },
     "dalton-onboarding": {
       "command": null,
       "enabled_in_registry": true,
