@@ -373,6 +373,8 @@
   "timezoneDesc": "Dates and times are shown in this timezone.",
   "desktopGroup": "Desktop app",
   "helpGroup": "Help",
+  "helpDocs": "Documentation & updates",
+  "helpDocsDesc": "Guides, release notes and changelog.",
   "displayGroup": "Display",
   "themeDesc": "Light or dark. Auto follows your system setting.",
   "fontSizeDesc": "Scales the text across the app on this device.",

@@ -42,7 +42,8 @@ interface CommentToolsProps {
 const BAR_BUTTON = 'h-[30px] gap-1.5 px-2 text-xs sm:px-2.5';
 const NONE: [] = [];
 /** How long Send all's outcome stays in the toolbar before the queue, if any, comes back. */
-const OUTCOME_MS = 6000;
+// DALTON-HOOK(mobile-web): shared with MobileHtmlOverflowMenu for role="status" outcome announcements
+export const OUTCOME_MS = 6000;
 
 /** A new number rises in from below as the old one lifts out. */
 const ROLL = { y: 4 };
@@ -162,7 +163,9 @@ interface SendAllOutcome {
   refused: string | null;
 }
 
-function summarize(t: TFunction, locale: string, outcomes: readonly BatchOutcome[], besideThreadId: string | null): SendAllOutcome {
+// DALTON-HOOK(mobile-web): export outcome formatter so mobile overflow menu announces the same status sentence
+// eslint-disable-next-line react-refresh/only-export-components
+export function summarizeSendAllOutcome(t: TFunction, locale: string, outcomes: readonly BatchOutcome[], besideThreadId: string | null): SendAllOutcome {
   const parts: string[] = [];
   let refused = 0;
   // A destination's full batches went to one thread, so they read as one share.
@@ -241,7 +244,8 @@ function SendAll({ comments, artifactId, workspaceId, docPath, sends, bar }: {
     setOutcome(null);
     void sendBatches(batches, { sender, sends, reasonOf: (err) => refusalReason(t, err, true) }).then((outcomes) => {
       setBusy(false);
-      setOutcome(summarize(t, locale, outcomes, sender.besideThreadId));
+      // DALTON-HOOK(mobile-web): shared outcome formatter with MobileHtmlOverflowMenu
+      setOutcome(summarizeSendAllOutcome(t, locale, outcomes, sender.besideThreadId));
       refreshArtifactComments(queryClient, [{ artifactId, workspaceId }], ALL);
     });
   };
@@ -399,6 +403,8 @@ export function CommentTools({
         className={cn('page-comment-mode-btn press shrink-0', mode && 'is-on')}
         aria-pressed={mode}
         aria-keyshortcuts="C"
+        // DALTON-HOOK(mobile-web): preserve accessible name when the text label hides on narrow phones
+        aria-label={t('pageViewer:comments.comment')}
         title={modeTitle ?? t('pageViewer:comments.modeTitle')}
       >
         <MessageSquarePlus className="h-3.5 w-3.5" />

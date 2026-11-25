@@ -203,6 +203,7 @@
   "pdfPageNumbers": "Page numbers",
   "pdfScale": "Scale",
   "openInNewTab": "Open in new tab",
+  "openReportInTab": "Open this report in its own tab",
   "fullscreen": "Fullscreen",
   "exitFullscreen": "Exit fullscreen",
   "downloadAsHtml": "Download as HTML",

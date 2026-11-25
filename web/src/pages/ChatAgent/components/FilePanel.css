@@ -729,3 +729,17 @@
   cursor: default;
   opacity: 0.6;
 }
+
+/* DALTON-HOOK(mobile-web): keep file breadcrumb action row compact, non-overflowing, and padded enough (8px) for a 44px .tap-target::after on a 28px icon button */
+@media (max-width: 767px) {
+  .file-panel-crumbs {
+    gap: 0.25rem;
+    padding: 0.125rem 0.5rem;
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: clip;
+  }
+  .file-panel-crumb-spacer {
+    min-width: 0;
+  }
+}

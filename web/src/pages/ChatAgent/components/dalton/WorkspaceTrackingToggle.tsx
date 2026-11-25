@@ -2,7 +2,7 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { TFunction } from 'i18next';
-import { ChevronDown, Clock, PauseCircle, Wrench } from 'lucide-react';
+import { Activity, ChevronDown, Clock, PauseCircle, Wrench } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { ToggleSwitch } from '@/components/ui/switch';
@@ -64,7 +64,7 @@ function formatNextRunAt(
 export function WorkspaceTrackingToggle({
   workspaceId,
   readOnly = false,
-  compact: _compact = false,
+  compact = false,
 }: {
   workspaceId: string;
   readOnly?: boolean;
@@ -133,18 +133,21 @@ export function WorkspaceTrackingToggle({
       className="inline-flex items-center relative"
       data-testid="workspace-tracking-toggle"
       data-tracking-status={status}
+      data-compact={compact ? 'true' : undefined}
     >
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <button
             type="button"
             data-testid="workspace-tracking-expand"
+            data-compact={compact ? 'true' : undefined}
             aria-expanded={open}
-            aria-label={t('dalton.tracking.expandAriaLabel')}
+            aria-label={compact ? `${shortLabel} — ${t('dalton.tracking.expandAriaLabel')}` : t('dalton.tracking.expandAriaLabel')}
             title={detailText}
             className={cn(
               TOOLBAR_CHIP_CLASS,
               'press cursor-pointer hover:bg-(--color-bg-subtle)',
+              compact && 'tap-target gap-1 px-2',
             )}
             style={toolbarChipStyle(tone)}
           >
@@ -153,15 +156,21 @@ export function WorkspaceTrackingToggle({
               className="h-1.5 w-1.5 rounded-full shrink-0"
               style={{ backgroundColor: dotColor }}
             />
-            <span data-testid="workspace-tracking-label">{shortLabel}</span>
-            <ChevronDown className="h-3 w-3 shrink-0 opacity-70" />
+            {compact ? (
+              <Activity className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            ) : (
+              <>
+                <span data-testid="workspace-tracking-label">{shortLabel}</span>
+                <ChevronDown className="h-3 w-3 shrink-0 opacity-70" />
+              </>
+            )}
           </button>
         </PopoverTrigger>
 
         <PopoverContent
           align="end"
           sideOffset={6}
-          className="w-80 p-3 text-xs space-y-2.5"
+          className="w-80 max-w-[calc(100vw-24px)] p-3 text-xs space-y-2.5"
         >
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-1.5 min-w-0">

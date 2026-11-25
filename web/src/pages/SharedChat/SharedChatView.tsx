@@ -627,15 +627,16 @@ export default function SharedChatView({ shareToken, access = shareToken, metada
 
   return (
     <div
-      className="pf-shell relative flex h-screen w-full overflow-hidden"
+      // DALTON-HOOK(mobile-web): use dynamic viewport height on phones so Safari bottom toolbar never covers the footer
+      className={cn('pf-shell relative flex w-full overflow-hidden', isMobile ? 'h-dvh' : 'h-screen')}
       style={{ backgroundColor: 'var(--color-bg-page)' }}
     >
       {/* Left Side: Topbar + Chat Window — identical structure to ChatView,
           inert and isolated under an expanded panel as there. */}
       <div className={cn('flex flex-col flex-1 min-w-0', panelExpanded && 'isolate')} inert={panelExpanded}>
         {/* Top bar — matches ChatView's top bar exactly */}
-        <div className="flex items-center justify-between px-4 py-2 border-b min-w-0 shrink-0" style={{ borderColor: 'var(--color-border-muted)' }}>
-          <div className="flex items-center gap-4 min-w-0 shrink">
+        <div className={cn('flex items-center justify-between py-2 border-b min-w-0 shrink-0', isMobile ? 'px-2.5 gap-2' : 'px-4')} style={{ borderColor: 'var(--color-border-muted)' }}>
+          <div className={cn('flex items-center min-w-0', isMobile ? 'gap-2 flex-1' : 'gap-4 shrink')}>
             <Link
               to="/"
               className="p-2 rounded-md transition-colors shrink-0"
@@ -646,7 +647,8 @@ export default function SharedChatView({ shareToken, access = shareToken, metada
             >
               <ArrowLeft className="h-5 w-5" />
             </Link>
-            <h1 className="title-font text-[length:var(--cs-text-heading,1rem)] leading-6 font-semibold tracking-[var(--cs-title-track,-0.01em)] whitespace-nowrap truncate" style={{ color: 'var(--color-text-primary)' }}>
+            {/* DALTON-HOOK(mobile-web): min-w-0 allows long workspace titles to truncate without pushing the file button off-screen */}
+            <h1 className="title-font text-[length:var(--cs-text-heading,1rem)] leading-6 font-semibold tracking-[var(--cs-title-track,-0.01em)] whitespace-nowrap truncate min-w-0" style={{ color: 'var(--color-text-primary)' }}>
               {metadata.workspace_name || metadata.title || 'Shared Conversation'}
             </h1>
             {loading && (
@@ -656,7 +658,7 @@ export default function SharedChatView({ shareToken, access = shareToken, metada
             )}
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 shrink-0">
             {/* Covered by the open panel on desktop, whose corner carries it. */}
             {canBrowseFiles && (isMobile || !showFilePanel) && (
               <button
@@ -685,8 +687,9 @@ export default function SharedChatView({ shareToken, access = shareToken, metada
               style={{ minHeight: 0, height: 0 }}
             >
               <ScrollArea ref={scrollAreaRef} className="h-full w-full">
-                <div className="px-6 py-4 flex justify-center">
-                  <div className="w-full max-w-3xl">
+                {/* DALTON-HOOK(mobile-web): tighter horizontal padding and phone-only overflow-x-clip */}
+                <div className="px-3 md:px-6 py-4 flex justify-center max-md:overflow-x-clip">
+                  <div className="w-full max-w-3xl min-w-0">
                     {/* Until the replay is whole: it writes the transcript an
                         event at a time, and drawn as it went a finished turn
                         showed its work open, then folded it away. */}
@@ -717,7 +720,8 @@ export default function SharedChatView({ shareToken, access = shareToken, metada
             </div>
 
             {/* Input Area — matches ChatView's input area styling */}
-            <div className="shrink-0 p-4 flex justify-center">
+            {/* DALTON-HOOK(mobile-web): respect bottom safe-area inset and narrower padding on phones */}
+            <div className="shrink-0 p-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] md:p-4 flex justify-center">
               <div className="w-full max-w-3xl space-y-3">
                 <div
                   className="flex flex-col items-stretch rounded-2xl border"

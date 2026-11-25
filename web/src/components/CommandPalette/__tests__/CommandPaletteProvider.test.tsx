@@ -1,6 +1,7 @@
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router';
@@ -181,9 +182,11 @@ describe('CommandPaletteProvider shortcuts and entry points', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Close palette' }));
     expect(screen.queryByTestId('mock-command-palette')).not.toBeInTheDocument();
 
-    // Mobile BottomTabBar search button also opens CommandPalette
+    // Mobile BottomTabBar opens CommandPalette via the "More" Radix DropdownMenu
+    const user = userEvent.setup();
     const bottomBar = expanded.container.querySelector('.bottom-tab-bar') as HTMLElement;
-    fireEvent.click(within(bottomBar).getByRole('button', { name: /Commands & jump|命令与跳转/ }));
+    await user.click(within(bottomBar).getByTestId('bottom-tab-more'));
+    await user.click(await screen.findByRole('menuitem', { name: /Commands & jump|命令与跳转/ }));
     expect(await screen.findByTestId('mock-command-palette')).toBeInTheDocument();
 
     expanded.unmount();

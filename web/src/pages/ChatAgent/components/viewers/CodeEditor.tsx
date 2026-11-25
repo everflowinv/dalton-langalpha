@@ -2,6 +2,7 @@ import React from 'react';
 import Editor, { DiffEditor, loader } from '@monaco-editor/react';
 import type { editor } from 'monaco-editor';
 import { useTheme } from '@/contexts/ThemeContext';
+import { useIsMobile } from '@/hooks/useIsMobile'; // DALTON-HOOK(mobile-web)
 import { rememberMonaco, saveViewState } from './editorModels';
 
 // @monaco-editor/loader fetches Monaco from the CDN at a release it picks, which
@@ -77,6 +78,7 @@ interface CodeEditorProps {
 export default function CodeEditor({ value, onChange, fileName, readOnly = false, height = '100%', diffMode = false, originalValue, editorRef, modelPath, onUndoRedoChange, onTextSelect }: CodeEditorProps) {
   const language = getLanguageFromFileName(fileName);
   const theme = useTheme().theme === 'light' ? 'vs' : 'vs-dark';
+  const isMobile = useIsMobile(); // DALTON-HOOK(mobile-web)
   const showDiff = diffMode && originalValue != null;
   // A kept model is the draft itself, so `value` only seeds it. The library
   // writes a changed `value` over the model in a passive effect, which lands
@@ -228,7 +230,8 @@ export default function CodeEditor({ value, onChange, fileName, readOnly = false
                 );
               }
             }}
-            options={{ ...EDITOR_OPTIONS, readOnly, renderSideBySide: true }}
+            // DALTON-HOOK(mobile-web): switch Monaco DiffEditor to single-column inline diff on phones
+            options={{ ...EDITOR_OPTIONS, readOnly, renderSideBySide: !isMobile }}
           />
         </div>
       )}

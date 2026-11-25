@@ -17,6 +17,7 @@ import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useLatestRef } from '@/hooks/useLatestRef';
 import { onKeyboardFit, onScreenKeyboardUp, roomAboveKeyboard } from '@/lib/visualViewport';
+import { isCoarsePointer } from '@/lib/dalton/pointer'; // DALTON-HOOK(mobile-web)
 import { useFavoriteModels } from '@/hooks/useFavoriteModels';
 import { useSeededModel } from '@/hooks/useSeededModel';
 import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
@@ -1224,7 +1225,8 @@ function ChatInput({
         }
         return;
       }
-      if (!e.shiftKey && !onScreenKeyboardUp()) {
+      // DALTON-HOOK(mobile-web): Enter inserts a newline on coarse-pointer (touch) devices; send via button
+      if (!e.shiftKey && !onScreenKeyboardUp() && !isCoarsePointer()) {
         e.preventDefault();
         handleSend();
       }

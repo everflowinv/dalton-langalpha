@@ -341,6 +341,13 @@ html.desktop-mac .sidebar-history {
   opacity: 1;
 }
 
+/* DALTON-HOOK(mobile-web): keep section collapse chevrons visible on touch screens */
+@media (pointer: coarse) {
+  .sidebar-section-actions {
+    opacity: 1;
+  }
+}
+
 .sidebar-section-action-btn {
   display: flex;
   align-items: center;

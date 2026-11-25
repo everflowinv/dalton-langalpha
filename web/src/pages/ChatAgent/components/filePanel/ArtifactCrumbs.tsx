@@ -19,21 +19,32 @@ interface ArtifactCrumbsProps {
 }
 
 /**
- * What a published HTML file's crumb row says about it: the version visitors
- * see, with the others to open, and whether the live file has moved on since
- * ("changed since · Update"), or that visitors can't open its link at all (a
- * link shared before versions whose files were past the caps). A file never
- * published says nothing here; its Publish is in the header menu.
+ * DALTON-HOOK(mobile-web): shared publish-status, readAt invalidation,
+ * and in-place Update flow used by both desktop ArtifactCrumbs and the mobile
+ * HTML overflow menu so both surfaces decide visibility and run Update identically.
  */
-export function ArtifactCrumbs({ view, onReview, readAt }: ArtifactCrumbsProps): React.ReactElement | null {
+export function useArtifactCrumbsState({
+  artifact,
+  version,
+  onReview,
+  readAt,
+  enabled = true,
+}: {
+  artifact: Artifact | null | undefined;
+  version: number | null;
+  onReview: () => void;
+  readAt: number | null;
+  enabled?: boolean;
+}) {
   const { t } = useTranslation();
   const qc = useQueryClient();
-  const { record: artifact, version } = view;
   const artifactId = artifact?.artifact_id ?? null;
   const latest = artifact?.latest_seq ?? 0;
   // Compared only where it is said: a shared file, on its live view.
   const shared = !!artifact?.shared;
-  const { data: status } = useArtifactStatus(artifact, { enabled: shared && latest > 0 && version === null });
+  const { data: status } = useArtifactStatus(artifact, {
+    enabled: enabled && shared && latest > 0 && version === null,
+  });
   const publish = usePublish(t('artifact.updateFailed'));
   // The file an Update is reviewing. Dropped once the crumb shows another, so
   // coming back to this one later publishes nothing on its own.
@@ -44,14 +55,16 @@ export function ArtifactCrumbs({ view, onReview, readAt }: ArtifactCrumbsProps):
   // has not compared yet.
   const lastRead = useRef(readAt);
   useEffect(() => {
+    if (!enabled) return;
     if (lastRead.current === readAt) return;
     lastRead.current = readAt;
     if (artifactId) void qc.invalidateQueries({ queryKey: queryKeys.artifacts.status(artifactId) });
-  }, [readAt, artifactId, qc]);
+  }, [enabled, readAt, artifactId, qc]);
 
   // Shared, but no version for visitors until the owner publishes again.
+  // DALTON-HOOK(mobile-web): expose visibility flags shared with MobileHtmlOverflowMenu
   const refused = shared && !!artifact?.legacy_refused;
-  if (!artifact || (latest < 1 && !refused)) return null;
+  const visible = enabled && Boolean(artifact && (latest >= 1 || refused));
   const changed = shared && version === null && !!status && (status.changed === true || !!status.drift?.added.length);
 
   const update = () => {
@@ -88,24 +101,65 @@ export function ArtifactCrumbs({ view, onReview, readAt }: ArtifactCrumbsProps):
     }
   };
 
+  // DALTON-HOOK(mobile-web): unified Update click handler shared by desktop ArtifactCrumbs & mobile More menu
+  const onUpdate = () => {
+    if (refused) {
+      onReview();
+      return;
+    }
+    update();
+  };
+
+  return {
+    latest,
+    shared,
+    refused,
+    changed,
+    visible,
+    showVersions: visible && latest >= 1,
+    showUpdate: visible && (refused || changed),
+    updatePending: publish.pending || reviewing === artifactId,
+    onUpdate,
+    reviewNode:
+      reviewing === artifact?.artifact_id && artifact
+        ? <UpdateReview artifact={artifact} onReviewed={publishReviewed} />
+        : null,
+  };
+}
+
+/**
+ * What a published HTML file's crumb row says about it: the version visitors
+ * see, with the others to open, and whether the live file has moved on since
+ * ("changed since · Update"), or that visitors can't open its link at all (a
+ * link shared before versions whose files were past the caps). A file never
+ * published says nothing here; its Publish is in the header menu.
+ */
+export function ArtifactCrumbs({ view, onReview, readAt }: ArtifactCrumbsProps): React.ReactElement | null {
+  const { t } = useTranslation();
+  const { record: artifact, version } = view;
+  // DALTON-HOOK(mobile-web): consume shared state & Update handler
+  const crumbs = useArtifactCrumbsState({ artifact, version, onReview, readAt });
+
+  if (!crumbs.visible || !artifact) return null;
+
   return (
     <>
-      {reviewing === artifact.artifact_id && <UpdateReview artifact={artifact} onReviewed={publishReviewed} />}
+      {crumbs.reviewNode}
       <ArtifactVersionPicker view={view} variant="chip" />
-      {refused ? (
+      {crumbs.refused ? (
         // The list goes through the dialog: it may still be past the caps.
         <CrumbStatus key="refused" tone="warning" words={t('artifact.legacyRefused')} label={t('publish:legacyRefused')}>
-          <button type="button" className="file-panel-artifact-update" onClick={onReview}>
+          <button type="button" className="file-panel-artifact-update" onClick={crumbs.onUpdate}>
             {t('artifact.update')}
           </button>
         </CrumbStatus>
-      ) : changed && (
+      ) : crumbs.changed && (
         <CrumbStatus key="changed" words={t('artifact.changedSince')} label={t('publish:changedSince', { seq: sharedSeq(artifact) })}>
           <button
             type="button"
             className="file-panel-artifact-update"
-            onClick={update}
-            disabled={publish.pending || reviewing === artifactId}
+            onClick={crumbs.onUpdate}
+            disabled={crumbs.updatePending}
           >
             {t('artifact.update')}
           </button>

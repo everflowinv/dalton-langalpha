@@ -9,6 +9,7 @@ import { usePreferences } from '@/hooks/usePreferences';
 import { readCommentEnter } from '@/lib/artifactPreferences';
 import { clientOs } from '@/lib/clientOs';
 import { isImeComposing } from '@/lib/ime';
+import { isCoarsePointer } from '@/lib/dalton/pointer'; // DALTON-HOOK(mobile-web)
 import { cn } from '@/lib/utils';
 import { INTENT_LABEL, footerLayout, routeForKey } from './composerFooter';
 import type { CommentIntent } from '../../../artifactComments/destinations';
@@ -155,6 +156,8 @@ export function CommentComposer({
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (isImeComposing(e)) return;
+    // DALTON-HOOK(mobile-web): plain Enter inserts a newline on coarse-pointer devices; submit via button
+    if (isCoarsePointer() && e.key === 'Enter' && !e.metaKey && !e.ctrlKey) return;
     const route = routeForKey(e, layout);
     if (!route) return;
     e.preventDefault();

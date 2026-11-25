@@ -97,6 +97,7 @@
 }
 
 .pdf-body {
+  position: relative; /* DALTON-HOOK(mobile-web): anchor floating thumbnail rail on phones */
   flex: 1;
   min-height: 0;
   display: flex;
@@ -195,6 +196,30 @@
   display: flex;
   flex-direction: column;
   border-right: 1px solid var(--color-shell-divider, var(--color-border-muted));
+}
+
+/* DALTON-HOOK(mobile-web): float PDF thumbnail rail over the document on narrow screens so the page keeps full width */
+.pdf-rail-backdrop {
+  display: none;
+}
+
+@media (max-width: 767px) {
+  .pdf-rail {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 20;
+    background: var(--color-bg-page);
+    box-shadow: var(--shadow-card);
+  }
+  .pdf-rail-backdrop {
+    display: block;
+    position: absolute;
+    inset: 0;
+    z-index: 15;
+    background: var(--color-bg-overlay);
+  }
 }
 
 .pdf-rail-tabs {

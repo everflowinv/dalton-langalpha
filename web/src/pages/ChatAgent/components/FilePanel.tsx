@@ -394,6 +394,22 @@ function FilePanel({
   // for a link they already made public.
   const [unshareTarget, setUnshareTarget] = useState<string | null>(null);
   const [pageCounts, setPageCounts] = useState<Record<string, number>>({});
+  // DALTON-HOOK(mobile-web): track the document shown inside a read-only HTML ViewFrame
+  // (e.g. external member preview) so in-frame links to B collapse mobile More to "Open in its own tab".
+  const [readOnlyHtmlDoc, setReadOnlyHtmlDoc] = useState<{ tabId: string; path: string | null }>({
+    tabId: activeTab.id,
+    path: null,
+  });
+  const handleReadOnlyHtmlDocChange = useCallback(
+    (docPath: string | null) => {
+      setReadOnlyHtmlDoc((prev) =>
+        prev.tabId === activeTab.id && prev.path === docPath
+          ? prev
+          : { tabId: activeTab.id, path: docPath },
+      );
+    },
+    [activeTab.id],
+  );
 
   // DALTON-HOOK(multi-file-upload): uploadStatus carries the batch position
   // ("第 i / 共 n 个") shown above the bar while a serial multi-file upload runs
@@ -963,8 +979,9 @@ function FilePanel({
           chip={focus.chip && (
             <FocusChip state={focus.chip} onJump={focus.jump} onDismiss={() => { focus.dismiss(); tabs.clearLocation(activeTab.id); }} />
           )}
-          artifact={fileComments.crumbs}
-          tools={fileComments.tools}
+          // DALTON-HOOK(mobile-web): fold HTML version/update, comment, dashboard pin, and publish/bind actions into the mobile More menu using the same fileComments visibility conditions as desktop crumbs
+          artifact={isMobile && viewer === 'html' && !edit.isEditing ? null : fileComments.crumbs}
+          tools={isMobile && viewer === 'html' && !edit.isEditing ? null : fileComments.tools}
           actions={(
             <FileHeaderActions
               selectedFile={selectedFile}
@@ -983,7 +1000,9 @@ function FilePanel({
               // DALTON-HOOK(external-share-guard): external members may stop a
               // public link but never start one.
               openUnshareOnly={callerTier === 'external' ? (path) => setUnshareTarget(path) : null}
-              artifactDoc={fileComments.doc}
+              artifactDoc={fileComments.doc ?? (readOnlyHtmlDoc.tabId === activeTab.id ? readOnlyHtmlDoc.path : null)}
+              // DALTON-HOOK(mobile-web): allow mobile HTML More menu to open a linked in-frame document as its own tab
+              onOpenDocAsTab={(docPath) => { void openFileAt(docPath, { pin: true }); }}
               htmlSource={htmlView.source}
               // Only where the viewer is up to switch: not while loading, nor on an error card.
               onToggleHtmlSource={viewer === 'html' && !fileLoading && !fileError ? () => setHtmlSource((v) => !v) : null}
@@ -997,6 +1016,19 @@ function FilePanel({
               saveError={edit.saveError}
               onSave={edit.handleSave}
               onCancelEdit={edit.handleCancelEdit}
+              // DALTON-HOOK(mobile-web): expose comment, queued-send, pin-as-dashboard, version controls, and readAt inside the mobile HTML More menu whenever desktop crumbs would render them
+              mobileHtmlTools={
+                isMobile && viewer === 'html' && !edit.isEditing && fileComments.tools && fileComments.path && comments
+                  ? {
+                      tabId: activeTab.id,
+                      ui: comments,
+                      threadId,
+                      versionView: fileComments.view?.versionView ?? null,
+                      modeDisabled: fileComments.view?.versionView.version !== null || htmlView.source,
+                      readAt: readAt ?? null,
+                    }
+                  : null
+              }
             />
           )}
         />
@@ -1134,6 +1166,8 @@ function FilePanel({
                   teamReadOnly,
                   htmlSource: htmlView.source,
                   htmlArtifact: fileComments.view,
+                  // DALTON-HOOK(mobile-web): track shown doc path in read-only HTML ViewFrame
+                  onHtmlDocChange: handleReadOnlyHtmlDocChange,
                   comments: fileComments.target,
                 }}
                 onPageCount={onPageCount}

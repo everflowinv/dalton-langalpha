@@ -8,6 +8,7 @@ import {
 import { useToast } from '@/components/ui/use-toast';
 import { copyText } from '@/lib/clipboard';
 import { isImeComposing } from '@/lib/ime';
+import { isCoarsePointer } from '@/lib/dalton/pointer'; // DALTON-HOOK(mobile-web)
 import { focusWithoutRing } from '@/lib/inputModality';
 import { isQuoteSurface, surfaceProps, type QuoteAnchor, type TextAnchor } from './quoteAnchor';
 import { placeBeside, useAnchoredPosition, type Place } from './quotePlacement';
@@ -228,7 +229,8 @@ export function QuoteComposer({ anchor, boundsRef, label, placeholder, hidden = 
               const { selectionStart: start, selectionEnd: end } = e.currentTarget;
               pendingCaret.current = start + 1;
               setReply(`${reply.slice(0, start)}\n${reply.slice(end)}`);
-            } else if (!e.shiftKey) {
+            // DALTON-HOOK(mobile-web): Enter inserts a newline on coarse-pointer devices; add via button
+            } else if (!e.shiftKey && !isCoarsePointer()) {
               e.preventDefault();
               onAdd(trimmed || undefined);
             }
