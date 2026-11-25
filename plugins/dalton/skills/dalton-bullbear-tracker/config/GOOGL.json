@@ -22,7 +22,10 @@
   "excluded_documents": [],
   "wiki_min_alias_hits": 2,
   "ae_queries": [
-    "Alphabet Google",
+    {
+      "query": "Alphabet Google",
+      "search_in": "title"
+    },
     "谷歌 Gemini 云 TPU"
   ],
   "ae_max_searches": 2,
