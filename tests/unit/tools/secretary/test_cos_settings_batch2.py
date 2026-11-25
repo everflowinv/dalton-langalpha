@@ -8,8 +8,10 @@ import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Annotated, Any
 from unittest.mock import create_autospec, patch
+
+from langchain.tools import InjectedState, InjectedToolCallId
 
 import pytest
 from langchain.agents import create_agent
@@ -19,6 +21,10 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from ptc_agent.config.core import SandboxConfig
+from src.dalton.coverage.dedup import (
+    find_existing_company_workspace as _REAL_FIND_EXISTING_COMPANY_WORKSPACE,
+    recheck_company_workspace_before_create as _REAL_RECHECK_COMPANY_WORKSPACE,
+)
 from src.server.database.computer import (
     get_computer,
     get_computer_roster,
@@ -29,7 +35,9 @@ from src.server.database.computer import (
 from src.server.database.user import get_user, get_user_preferences
 from src.server.database.workspace import (
     get_live_workspace_names as _REAL_GET_LIVE_WORKSPACE_NAMES,
+    get_workspace_dir_names_for_computer as _REAL_GET_WORKSPACE_DIR_NAMES_FOR_COMPUTER,
     get_workspaces_for_user,
+    lock_user_writes as _REAL_LOCK_USER_WRITES,
 )
 from src.server.services.computer_errors import (
     ApprovalScopeChangedError,
@@ -3381,3 +3389,484 @@ async def test_find_existing_company_workspace_keeps_downgraded_hit_when_rejudge
     assert dup.matches
     assert dup.matches[0].workspace_name == "腾讯研究"
     assert dup.suggestion is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("existing_name", "requested_name"),
+    [
+        ("Research Notes", "Research  Notes"),
+        ("Q3/Q4", "Q3-Q4"),
+        ("Q3\\Q4", "Q3-Q4"),
+    ],
+)
+async def test_card_and_locked_recheck_share_workspace_name_key_duplicate_rule(
+    monkeypatch: pytest.MonkeyPatch,
+    existing_name: str,
+    requested_name: str,
+) -> None:
+    """Round 14 (Grok med / Codex low): confirmation card snapshot and locked
+    check_duplicate_snapshot_unchanged share is_duplicate_name (including
+    workspace_name_key folding of / \\ -> - and collapsed spaces) so folder-key
+    collisions are surfaced on the card instead of failing with scope_changed."""
+    from src.server.database import workspace as ws_db
+    from src.tools.secretary.approvals import build_create_workspace_snapshot
+
+    existing_id = "dddddddd-dddd-4ddd-8ddd-000000000014"
+    monkeypatch.setattr(
+        "src.server.database.computer.get_primary_computer",
+        create_autospec(
+            get_primary_computer,
+            return_value=_computer_row(CLOUD_1, name="Cloud Primary", kind="docker"),
+        ),
+    )
+    monkeypatch.setattr(
+        "src.server.database.workspace.get_live_workspace_names",
+        create_autospec(
+            _REAL_GET_LIVE_WORKSPACE_NAMES,
+            return_value=[{"workspace_id": existing_id, "name": existing_name}],
+        ),
+    )
+
+    snap = await build_create_workspace_snapshot(
+        USER_ID,
+        {
+            "id": "call-dup-key-1",
+            "name": "manage_workspaces",
+            "args": {"action": "create", "name": requested_name},
+        },
+    )
+    assert snap is not None
+    assert snap["duplicate_workspace_id"] == existing_id
+    assert snap["duplicate_workspace_name"] == existing_name
+
+    # Locked recheck with the card's snapshot passes (no false scope_changed).
+    class _FakeCur:
+        async def execute(self, _sql: str, _params: Any = None) -> None:
+            return None
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return [{"workspace_id": existing_id, "name": existing_name}]
+
+    ok_with_snap = await ws_db.check_duplicate_snapshot_unchanged(
+        _FakeCur(),
+        USER_ID,
+        requested_name,
+        expected_duplicate_workspace_id=existing_id,
+        expected_duplicate_workspace_name=existing_name,
+    )
+    assert ok_with_snap is True
+
+    # Without expected_duplicate_workspace_id (concurrent create after clean card),
+    # locked recheck still rejects with False (-> scope_changed).
+    ok_without_snap = await ws_db.check_duplicate_snapshot_unchanged(
+        _FakeCur(),
+        USER_ID,
+        requested_name,
+        expected_duplicate_workspace_id=None,
+    )
+    assert ok_without_snap is False
+
+
+@pytest.mark.asyncio
+async def test_claude_code_create_workspace_persists_snapshot_pauses_and_resumes_on_held_node(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 14 (Codex med 1): Claude Code waits_for_user recognizes
+    manage_workspaces(action='create') via puts_card so the call goes through
+    StandingApprovalMiddleware.after_model (saving approval_snapshots) -> held
+    -> interrupt(), and resumes cleanly after approval without an active CLI."""
+    from typing import Annotated
+
+    from langchain.agents import create_agent
+    from langchain.tools import InjectedState
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+    from langchain_core.messages import AIMessage, ToolMessage
+    from langchain_core.tools import tool
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.types import Command
+
+    from ptc_agent.agent.claude_code.agent import claude_code_graph, waits_for_user
+    from ptc_agent.agent.claude_code.compaction import NO_RULES
+    from ptc_agent.agent.claude_code.launcher import LocalLauncher
+    from ptc_agent.agent.claude_code.mid_turn import BeforeTool
+    from ptc_agent.agent.claude_code.runtime import TURN_KEY
+    from ptc_agent.agent.claude_code.tools_bridge import Deferred, ToolResults
+    from src.dalton.coverage.dedup import CompanyDedupRecheckSnapshot
+    from src.llms.claude_code import ClaudeTurnFailed
+    from src.llms.llm import create_llm
+    from src.tools.secretary._commands import InjectedToolCallId
+    from src.tools.secretary.approvals import approval_snapshot, preapproved
+
+    # 1. waits_for_user + BeforeTool defer manage_workspaces(action="create"),
+    # while leaving non-card actions (list) un-deferred.
+    waits = waits_for_user(frozenset())
+    assert waits("manage_workspaces", {"action": "create", "name": "NVDA"}) is True
+    assert waits("manage_workspaces", {"action": "delete", "workspace_id": "ws-1"}) is True
+    assert waits("manage_workspaces", {"action": "list"}) is False
+    assert waits("delegate_to_analyst", {"question": "q"}) is True
+
+    results = ToolResults(lambda _msg: False)
+    before = BeforeTool(results, waits)
+    assert (
+        await before(
+            {
+                "tool_name": "manage_workspaces",
+                "tool_input": {"action": "list"},
+            },
+            "call-cc-list",
+            None,
+        )
+        == {}
+    )
+    defer_decision = await before(
+        {
+            "tool_name": "manage_workspaces",
+            "tool_input": {"action": "create", "name": "NVDA"},
+        },
+        "call-cc-1",
+        None,
+    )
+    assert defer_decision.get("hookSpecificOutput", {}).get("permissionDecision") == "defer"
+    assert isinstance(await results.due("call-cc-1"), Deferred)
+
+    # 2. Build a real ClaudeCodeGraph with StandingApprovalMiddleware + InMemorySaver.
+    class _Model(FakeMessagesListChatModel):
+        def bind_tools(self, tools, **kwargs):
+            return self
+
+    @tool("manage_workspaces")
+    async def manage_workspaces(
+        action: str,
+        state: Annotated[dict, InjectedState],
+        name: str | None = None,
+        description: str | None = None,
+        tool_call_id: Annotated[str, InjectedToolCallId] = "",
+    ) -> Command:
+        """Manage workspaces."""
+        assert action == "create"
+        return await workspaces_create(
+            USER_ID,
+            name or "",
+            description,
+            tool_call_id,
+            preapproved=preapproved(state, tool_call_id),
+            snapshot=approval_snapshot(state, tool_call_id),
+        )
+
+    mw = StandingApprovalMiddleware(USER_ID)
+    agent = create_agent(
+        _Model(responses=[]),
+        tools=[manage_workspaces],
+        middleware=[mw],
+    ).with_config({"recursion_limit": 50})
+    saver = InMemorySaver()
+    target = create_llm("claude-haiku-5-5-code", reasoning_effort="low")
+    cc_graph = claude_code_graph(
+        agent,
+        system_prompt="You are Chief of Staff.",
+        target=target,
+        user_id=USER_ID,
+        checkpointer=saver,
+        launcher=lambda _w: LocalLauncher(),
+        compaction=NO_RULES,
+        middleware=[mw],
+    )
+    assert cc_graph.turn({"configurable": {"thread_id": "cc-t1"}}).spec.waits(
+        "manage_workspaces", {"action": "create", "name": "NVDA"}
+    )
+
+    # Patch DB + WorkspaceManager for snapshot creation & resumed execution.
+    monkeypatch.setattr(
+        "src.server.database.user.get_user_preferences",
+        create_autospec(
+            get_user_preferences,
+            return_value={"other_preference": {}},
+        ),
+    )
+    monkeypatch.setattr(
+        "src.server.database.computer.get_primary_computer",
+        create_autospec(
+            get_primary_computer,
+            return_value=_computer_row(CLOUD_1, name="Cloud Primary", kind="docker"),
+        ),
+    )
+    monkeypatch.setattr(
+        "src.server.database.workspace.get_live_workspace_names",
+        create_autospec(_REAL_GET_LIVE_WORKSPACE_NAMES, return_value=[]),
+    )
+    monkeypatch.setattr(
+        "src.dalton.coverage.dedup.find_existing_company_workspace",
+        create_autospec(
+            _REAL_FIND_EXISTING_COMPANY_WORKSPACE,
+            return_value=None,
+        ),
+    )
+    monkeypatch.setattr(
+        "src.dalton.coverage.dedup.recheck_company_workspace_before_create",
+        create_autospec(
+            _REAL_RECHECK_COMPANY_WORKSPACE,
+            return_value=CompanyDedupRecheckSnapshot(status="clear", active=False),
+        ),
+    )
+    mgr = create_autospec(WorkspaceManager, instance=True)
+    mgr.create_workspace.return_value = {
+        "workspace_id": "ws-cc-1",
+        "name": "NVDA",
+        "computer_id": CLOUD_1,
+        "status": "stopped",
+    }
+    monkeypatch.setattr(
+        "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+        create_autospec(WorkspaceManager.get_instance, return_value=mgr),
+    )
+    monkeypatch.setattr(
+        "src.tools.secretary.tools._folder_ready_result",
+        create_autospec(
+            _folder_ready_result,
+            return_value={"folder_ready": False, "folder_path": None},
+        ),
+    )
+
+    class _FakeStore:
+        def drain(self, through=None):
+            return []
+
+    class _FakeRun:
+        def __init__(self) -> None:
+            self.store = _FakeStore()
+
+        async def next_message(self, _on_compact):
+            return None
+
+        async def finish(self) -> None:
+            return None
+
+    class _FakeSteering:
+        async def resume(self, _cfg):
+            return None
+
+        def opened(self, _state, _cfg) -> None:
+            return None
+
+        async def read(self, _msgs) -> None:
+            return None
+
+    class _FakeTurn:
+        def __init__(self, *, phase: str) -> None:
+            self.phase = phase
+            self.started = False
+            self.steering = _FakeSteering()
+            self.waits = SimpleNamespace(drain=lambda: [], after=None)
+            self._run = _FakeRun()
+
+        @property
+        def current(self):
+            raise ClaudeTurnFailed("nothing_to_resume", "no CLI running")
+
+        async def hand_off(self, _state, _cfg):
+            return None
+
+        async def _repin(self, _state):
+            return None
+
+        async def run(self, _state):
+            return self._run
+
+        async def again(self, _state, _cfg, _run):
+            if self.phase == "propose":
+                self.phase = "proposed"
+                return [
+                    AIMessage(
+                        content="",
+                        id="ai-cc-1",
+                        tool_calls=[
+                            {
+                                "name": "manage_workspaces",
+                                "args": {"action": "create", "name": "NVDA", "description": "GPU"},
+                                "id": "call-cc-1",
+                                "type": "tool_call",
+                            }
+                        ],
+                    )
+                ]
+            return None
+
+        def commit(self, _records):
+            return {}
+
+        def reading(self, _run):
+            return {}
+
+        async def ended(self, _state, _run):
+            return {"messages": [AIMessage(content="Workspace NVDA created.", id="ai-cc-2")]}
+
+    # Phase 1: model routes deferred create call into pause -> StandingApprovalMiddleware.after_model -> held -> interrupt().
+    cfg_1 = {
+        "configurable": {
+            "thread_id": "cc-create-thread-1",
+            TURN_KEY: _FakeTurn(phase="propose"),
+        }
+    }
+    paused = await cc_graph.graph.ainvoke({"messages": []}, cfg_1)
+    assert "__interrupt__" in paused
+    intr = paused["__interrupt__"][0]
+    action_req = intr.value["action_requests"][0]
+    assert action_req["type"] == "create_workspace"
+    assert action_req["tool_call_id"] == "call-cc-1"
+    assert action_req["computer_id"] == CLOUD_1
+    assert action_req["computer_name"] == "Cloud Primary"
+
+    saved_state = await cc_graph.graph.aget_state(cfg_1)
+    assert saved_state.values["approval_snapshots"]["call-cc-1"]["computer_id"] == CLOUD_1
+
+    # Phase 2: approve on a fresh turn with NO CLI (accessing turn.current would raise nothing_to_resume).
+    cfg_2 = {
+        "configurable": {
+            "thread_id": "cc-create-thread-1",
+            TURN_KEY: _FakeTurn(phase="resume"),
+        }
+    }
+    resumed = await cc_graph.graph.ainvoke(
+        Command(resume={intr.id: {"decisions": [{"type": "approve"}]}}),
+        cfg_2,
+    )
+    mgr.create_workspace.assert_awaited_once()
+    assert mgr.create_workspace.await_args.kwargs["computer_id"] == CLOUD_1
+    assert mgr.create_workspace.await_args.kwargs["verify_snapshot"] is True
+    tool_msgs = [m for m in resumed["messages"] if isinstance(m, ToolMessage)]
+    assert len(tool_msgs) == 1
+    body = json.loads(tool_msgs[0].content)
+    assert body["success"] is True
+    assert body["workspace_id"] == "ws-cc-1"
+    assert body["computer_id"] == CLOUD_1
+
+
+@pytest.mark.asyncio
+async def test_daytona_archive_claim_blocks_workspace_create_across_precheck_manager_and_sql_fence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 14 (Codex med 3): _claim_machine_for_archive stamps config.archiving=True
+    under the stopping CAS and _settle_machine_stop drops it, so precheck
+    (approvals.py), WorkspaceManager.create_workspace (chosen & primary), and
+    create_workspace_on_computer (FENCE_TAKES_WORKSPACES under FOR SHARE) all
+    consistently reject workspace creation while archiving."""
+    from contextlib import asynccontextmanager
+
+    from src.server.database import workspace as ws_db
+    from src.tools.secretary.approvals import build_create_workspace_snapshot
+    from src.server.database.sql_fences import FENCE_TAKES_WORKSPACES
+    from src.server.services.computer_manager import ComputerManager, _machines
+
+    stopped_daytona = _computer_row(CLOUD_1, name="Daytona Box", kind="daytona", status="stopped")
+    archiving_daytona = {
+        **stopped_daytona,
+        "status": "stopping",
+        "config": {"archiving": True},
+    }
+
+    # 1. _claim_machine_for_archive writes status='stopping' + merge_config={'archiving': True}.
+    claim_status_mock = create_autospec(
+        update_computer_status,
+        return_value=archiving_daytona,
+    )
+    monkeypatch.setattr(_machines, "get_computer", create_autospec(get_computer, return_value=stopped_daytona))
+    monkeypatch.setattr(_machines, "update_computer_status", claim_status_mock)
+    cm = object.__new__(ComputerManager)
+    claimed = await cm._claim_machine_for_archive(CLOUD_1)
+    assert claimed["config"]["archiving"] is True
+    claim_status_mock.assert_awaited_once_with(
+        CLOUD_1,
+        "stopping",
+        expected="stopped",
+        merge_config={"archiving": True},
+    )
+
+    # 2. Precheck (build_create_workspace_snapshot) rejects the archiving computer.
+    monkeypatch.setattr(
+        "src.server.database.computer.get_primary_computer",
+        create_autospec(get_primary_computer, return_value=archiving_daytona),
+    )
+    snap = await build_create_workspace_snapshot(
+        USER_ID,
+        {"id": "call-arch-1", "name": "manage_workspaces", "args": {"action": "create", "name": "NVDA"}},
+    )
+    assert snap is not None
+    assert snap["precheck_error_code"] == "computer_archiving"
+
+    # 3. WorkspaceManager.create_workspace rejects both chosen and primary archiving computers.
+    ws_mgr = object.__new__(WorkspaceManager)
+    monkeypatch.setattr(
+        "src.server.services.workspace_manager.get_computer",
+        create_autospec(get_computer, return_value=archiving_daytona),
+    )
+    with pytest.raises(ComputerArchivingError):
+        await ws_mgr.create_workspace(user_id=USER_ID, name="NVDA", computer_id=CLOUD_1)
+    with pytest.raises(ApprovalScopeChangedError):
+        await ws_mgr.create_workspace(
+            user_id=USER_ID, name="NVDA", computer_id=CLOUD_1, verify_snapshot=True
+        )
+    ws_mgr.ensure_primary_computer = create_autospec(
+        ws_mgr.ensure_primary_computer,
+        return_value=archiving_daytona,
+    )
+    with pytest.raises(ComputerArchivingError):
+        await ws_mgr.create_workspace(user_id=USER_ID, name="NVDA")
+    with pytest.raises(ApprovalScopeChangedError):
+        await ws_mgr.create_workspace(user_id=USER_ID, name="NVDA", verify_snapshot=True)
+
+    # 4. Transaction-level SQL fence excludes config.archiving even when reject_unavailable=False.
+    assert '{"archiving": true}' in FENCE_TAKES_WORKSPACES
+    executed_sql: list[str] = []
+
+    class _FenceCur:
+        async def execute(self, sql: str, _params: Any = None) -> None:
+            executed_sql.append(sql)
+
+        async def fetchone(self) -> Any:
+            return None
+
+    class _FenceConn:
+        @asynccontextmanager
+        async def transaction(self):
+            yield self
+
+    @asynccontextmanager
+    async def _alloc(_cid: str, *, conn: Any = None):
+        yield _FenceConn()
+
+    @asynccontextmanager
+    async def _cur(_conn: Any):
+        yield _FenceCur()
+
+    monkeypatch.setattr(ws_db, "folder_allocation", _alloc)
+    monkeypatch.setattr(ws_db, "_ws_cursor", _cur)
+    monkeypatch.setattr(ws_db, "lock_user_writes", create_autospec(_REAL_LOCK_USER_WRITES, return_value=None))
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace_dir_names_for_computer",
+        create_autospec(_REAL_GET_WORKSPACE_DIR_NAMES_FOR_COMPUTER, return_value=set()),
+    )
+    monkeypatch.setattr(ws_db, "get_computer", create_autospec(get_computer, return_value=archiving_daytona))
+    inserted = await ws_db.create_workspace_on_computer(
+        USER_ID, "NVDA", CLOUD_1, reject_unavailable=False
+    )
+    assert inserted is None
+    insert_sql = [s for s in executed_sql if "INSERT INTO workspaces" in s]
+    assert insert_sql and FENCE_TAKES_WORKSPACES in insert_sql[0]
+
+    # 5. _settle_machine_stop clears config.archiving atomically when leaving 'stopping'.
+    settle_status_mock = create_autospec(
+        update_computer_status,
+        return_value=stopped_daytona,
+    )
+    monkeypatch.setattr(_machines, "update_computer_status", settle_status_mock)
+    cm._revoke_computer_tokens = create_autospec(cm._revoke_computer_tokens, return_value=None)
+    cm._revoke_livefs = create_autospec(cm._revoke_livefs, return_value=None)
+    await cm._settle_machine_stop(CLOUD_1, "stopped")
+    settle_status_mock.assert_awaited_once_with(
+        CLOUD_1,
+        "stopped",
+        expected="stopping",
+        drop_config_key="archiving",
+    )

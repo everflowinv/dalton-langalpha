@@ -48,9 +48,20 @@ def is_duplicate_name(new: str, existing: str) -> bool:
     if new.strip().casefold() == existing.strip().casefold():
         return True
     # --- DALTON-HOOK(cos-settings-tools): begin ---
-    # Align proposal-time duplicate detection with Phase 1/Phase 2 canonical
-    # ticker keys (e.g. ``00700`` vs ``700.HK`` / ``0700.HK``, ``600519`` vs
-    # ``600519.SH``, ``BRK-B`` vs ``BRK.B``) without folding non-ticker names.
+    # Align proposal-time duplicate detection with Phase 1/Phase 2 folder-key
+    # and canonical ticker rules (e.g. ``Q3/Q4`` vs ``Q3-Q4``, ``Research  Notes``
+    # vs ``Research Notes``, ``00700`` vs ``700.HK``, ``BRK-B`` vs ``BRK.B``)
+    # without folding non-ticker Unicode variants like ``计划①`` vs ``计划1``.
+    from src.server.database.workspace_names import (
+        WorkspaceNameInvalid,
+        workspace_name_key,
+    )
+
+    try:
+        if workspace_name_key(new) == workspace_name_key(existing):
+            return True
+    except WorkspaceNameInvalid:
+        pass
     from src.dalton.coverage.identity import canonical_workspace_ticker_key
 
     new_key = canonical_workspace_ticker_key(new)

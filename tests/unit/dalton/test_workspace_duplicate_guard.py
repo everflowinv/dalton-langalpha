@@ -97,6 +97,9 @@ def _asked(confirm: Any) -> dict:
         ("600519.ss", "600519.SH", True),
         ("计划①", "计划1", False),          # not tickers: no symbol fold
         ("Research Notes", "research notes", True),
+        ("Research  Notes", "Research Notes", True),
+        ("Q3/Q4", "Q3-Q4", True),
+        ("Q3\\Q4", "Q3-Q4", True),
         ("Research", "Research Notes", False),
         ("META", "Meta Platforms", False),
     ],

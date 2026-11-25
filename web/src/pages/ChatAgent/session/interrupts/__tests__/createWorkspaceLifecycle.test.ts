@@ -632,4 +632,72 @@ describe('create_workspace 4-state lifecycle: live vs history parity', () => {
     ).toBe(false);
     expect(strayPending).toHaveLength(1);
   });
+
+  it('restores original submitting create_workspace card to pending on re-emitted interrupt_id without duplicate rendering', () => {
+    let liveMessages: ChatMessage[] = [makeAssistant('a-1'), makeAssistant('a-2')];
+    const armed: PendingInterrupt[] = [];
+    const liveRt = {
+      renderedInterruptIdsRef: { current: new Set<string>() },
+      currentRunIdRef: { current: 'run-1' },
+      pause: { arm: vi.fn((p: PendingInterrupt) => armed.push(p)) },
+      setMessages: (updater: ChatMessage[] | ((prev: ChatMessage[]) => ChatMessage[])) => {
+        liveMessages = typeof updater === 'function' ? updater(liveMessages) : updater;
+      },
+    } as unknown as StreamRuntime;
+    const refs = {
+      contentOrderCounterRef: { current: 0 },
+    } as unknown as StreamProcessorRefs;
+
+    // 1. Initial live interrupt renders card on a-1.
+    projectLiveInterrupt(liveRt, makeInterruptEvent(), 'a-1', refs);
+    const firstMsg = liveMessages[0] as AssistantMessage;
+    expect(firstMsg.workspaceProposals?.['intr-cw-1']?.status).toBe('pending');
+    expect(firstMsg.contentSegments?.filter((s) => s.type === 'create_workspace')).toHaveLength(1);
+
+    // 2. User clicks Approve -> card moves to submitting; resume run fails before consuming interrupt.
+    liveMessages = [
+      {
+        ...firstMsg,
+        workspaceProposals: {
+          'intr-cw-1': { ...firstMsg.workspaceProposals!['intr-cw-1'], status: 'submitting' },
+        },
+      },
+      liveMessages[1],
+    ];
+
+    // 3. /retry re-emits the same interrupt_id on a new assistant bubble (a-2).
+    liveRt.currentRunIdRef.current = 'run-2';
+    projectLiveInterrupt(liveRt, makeInterruptEvent(), 'a-2', refs);
+
+    const restoredFirst = liveMessages[0] as AssistantMessage;
+    const secondMsg = liveMessages[1] as AssistantMessage;
+    expect(restoredFirst.workspaceProposals?.['intr-cw-1']?.status).toBe('pending');
+    expect(restoredFirst.contentSegments?.filter((s) => s.type === 'create_workspace')).toHaveLength(1);
+    // Duplicate rendering on the retry bubble stays suppressed.
+    expect(secondMsg.contentSegments?.filter((s) => s.type === 'create_workspace')).toHaveLength(0);
+    expect(secondMsg.workspaceProposals?.['intr-cw-1']).toBeUndefined();
+    expect(armed).toHaveLength(2);
+    expect(armed[1]).toMatchObject({
+      type: 'create_workspace',
+      interruptId: 'intr-cw-1',
+      proposalId: 'intr-cw-1',
+      toolCallId: 'tc-cw-1',
+      runId: 'run-2',
+    });
+
+    // Legacy card without tool_call_id stays failed even if re-emitted.
+    const legacyEvent: SSEEvent = {
+      event: 'interrupt',
+      interrupt_id: 'intr-legacy-1',
+      turn_index: 0,
+      action_requests: [{ type: 'create_workspace', workspace_name: 'OLD' }],
+    };
+    projectLiveInterrupt(liveRt, legacyEvent, 'a-1', refs);
+    projectLiveInterrupt(liveRt, legacyEvent, 'a-2', refs);
+    expect((liveMessages[0] as AssistantMessage).workspaceProposals?.['intr-legacy-1']).toMatchObject({
+      status: 'failed',
+      failure_code: 'scope_changed',
+    });
+    expect((liveMessages[1] as AssistantMessage).workspaceProposals?.['intr-legacy-1']).toBeUndefined();
+  });
 });

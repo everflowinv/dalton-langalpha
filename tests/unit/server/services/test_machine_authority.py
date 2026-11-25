@@ -839,7 +839,13 @@ class TestArchiveClaim(_Base):
 
         @asynccontextmanager
         async def detached(*_args, **_kwargs):
-            status.assert_awaited_once_with(COMPUTER_ID, "stopping", expected="stopped")
+            # DALTON-HOOK(cos-settings-tools): archive claim stamps config.archiving=True under the stopping CAS
+            status.assert_awaited_once_with(
+                COMPUTER_ID,
+                "stopping",
+                expected="stopped",
+                merge_config={"archiving": True},
+            )
             yield runtime
 
         manager._detached_runtime = detached
@@ -852,7 +858,11 @@ class TestArchiveClaim(_Base):
                 await manager._archive_machine(COMPUTER_ID)
                 runtime.archive.assert_awaited_once()
                 assert status.await_args_list[-1].args == (COMPUTER_ID, "stopped")
-                assert status.await_args_list[-1].kwargs == {"expected": "stopping"}
+                # DALTON-HOOK(cos-settings-tools): settling the stop drops config.archiving
+                assert status.await_args_list[-1].kwargs == {
+                    "expected": "stopping",
+                    "drop_config_key": "archiving",
+                }
             else:
                 with pytest.raises(RuntimeError, match="Computer changed"):
                     await manager._archive_machine(COMPUTER_ID)

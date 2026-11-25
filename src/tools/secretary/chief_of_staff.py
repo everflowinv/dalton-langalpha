@@ -80,43 +80,38 @@ async def chief_of_staff_workspaces(
     skip_coverage_suggestion: bool = False,
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> Command:
-    """List the user's and colleagues' shared workspaces, create, update, or delete a workspace, or list/read/copy/write files in a workspace.
+    """List the user's and colleagues' shared workspaces, create/update/delete a workspace, or list/read/copy/write files in a workspace.
 
-    Use "list_files", "read_file", and "write_file" to inspect or update files in a colleague's
-    shared workspace (which does not share this computer's filesystem); use "write_file" only
-    when the workspace's access is "rw". "read_file" returns text only — for a binary file
-    (Excel, PDF, images) use "copy_file" to copy it into Home, then send it from there or link
-    it by the returned folder_path.
-    Limits: "copy_file" copies binary Office (.xlsx, .docx, .pptx, .xls, .doc;
-    legacy .ppt is refused because embedded VBA macros cannot be inspected — ask
-    the owner to save as .pptx first), PDF (.pdf), and image (.png, .jpg, .jpeg,
-    .gif, .webp, .bmp, .tiff) files up to 50 MB, as well as strict UTF-8 text
-    files (.md, .markdown, .txt, .csv, .tsv, .json, .jsonl, .yaml, .yml, .py,
-    .sql, .html, .xml, .log) up to 5 MB; archives, pickle/database, audio/video,
-    and other file types are refused.
-    Colleague-shared workspaces are read according to their shared access level; dispatching
-    into one with delegate_to_analyst is allowed only when colleague dispatch is enabled for
-    this deployment and the workspace's access is "rw" (follow the current access returned by
-    the tool). Otherwise, create a workspace of the user's own and hand off to its analyst.
+    For colleague-shared workspaces (separate filesystem): use "list_files"/"read_file" (text only),
+    "copy_file" to copy binaries (Excel, PDF, images) into Home or another own workspace before
+    sending or linking via folder_path, and "write_file" only when access is "rw".
+    Limits: "copy_file" allows Office (.xlsx, .docx, .pptx, .xls, .doc; legacy .ppt is refused —
+    ask the owner to save as .pptx), PDF (.pdf), and images (.png, .jpg, .jpeg, .gif, .webp, .bmp,
+    .tiff) up to 50 MB, plus strict UTF-8 text (.md, .markdown, .txt, .csv, .tsv, .json, .jsonl,
+    .yaml, .yml, .py, .sql, .html, .xml, .log) up to 5 MB; all other types (archives,
+    pickle/database, audio/video) are refused.
+    Dispatching into a colleague-shared workspace via delegate_to_analyst requires colleague
+    dispatch enabled and "rw" access (follow current access returned by this tool); otherwise
+    create the user's own workspace first.
 
     Args:
-        action: "list", "create", "update", "delete", "list_files", "read_file", "copy_file", or "write_file". Call "delete" only when the user explicitly asks; verify the workspace name first and wait for confirmation.
-        name: Workspace name; required for "create", optional for "update" (omit on "update" to keep the current name; at least one of name or description is required). Renaming a workspace also changes its folder name on its computer; Home cannot be renamed.
-        description: Workspace description (up to 1,000 characters); optional for "create" and "update" (omit on "update" to keep the current description).
-        workspace_id: Target workspace ID; required for "update", "delete", "list_files", "read_file", "copy_file", and "write_file". Home cannot be deleted.
-        computer: Optional target computer for "create": pass a computer display name from `<activity>` or `manage_workspaces(action="list")`, its full UUID, or an 8+ character unique prefix. Omit to use the primary computer (or create a new hosted cloud primary computer on first setup when supported). Own machines always show a confirmation card.
-        path: Relative directory or file path INSIDE workspace_id's own folder (sources/x.md, not DASH/sources/x.md); optional prefix for "list_files", required for "read_file", "copy_file" and "write_file". Workspace folders sit beside Home (../<folder>), never inside it — a path starting with a workspace folder name is refused, because it would silently land in the wrong workspace.
-        content: Full UTF-8 text to write; required for "write_file" (requires "rw" access).
-        dest_path: Where "copy_file" lands the file, relative to the destination's folder; default shared/<filename>.
-        dest_workspace_id: Destination for "copy_file" other than Home; must be one of the user's own workspaces.
-        allow_duplicate_company: Only for "create" when the user explicitly confirms creating another workspace after a `company_workspace_exists` refusal; default False.
-        coverage_kind: Optional for "create": "company", "sector", or "none" (default "none"). When "company" or "sector", automatically registers and binds a team coverage unit to the new workspace (internal/admin members only).
-        ticker: Optional stock ticker for "create" when `coverage_kind="company"` (e.g. "NVDA", "0700.HK"; leave empty for unlisted companies or sectors).
-        display_name: Optional company or sector display name for "create" when `coverage_kind` is "company" or "sector"; defaults to `name`.
-        skip_coverage_suggestion: Only for "create" when retrying after a `coverage_suggestion` response and the user explicitly declines registering a coverage unit; default False.
+        action: "list", "create", "update", "delete", "list_files", "read_file", "copy_file", or "write_file". Use "delete" only on explicit user request after verifying the name and waiting for confirmation.
+        name: Workspace name; required for "create", optional for "update" (omit to keep current; "update" needs name or description). Renaming also changes its folder name on its computer; Home cannot be renamed.
+        description: Optional description (up to 1,000 chars) for "create"/"update" (omit on "update" to keep current).
+        workspace_id: Target workspace ID; required for "update", "delete", and file actions. Home cannot be deleted.
+        computer: Optional target computer for "create": display name from `<activity>` or `manage_workspaces(action="list")`, full UUID, or unique 8+ char prefix. Omit for primary computer (or first-time cloud primary setup when supported). Own machines always show a confirmation card.
+        path: Relative path inside workspace_id's own folder (e.g. sources/x.md, never prefixed with a workspace folder name); optional prefix for "list_files", required for "read_file", "copy_file", and "write_file".
+        content: Full UTF-8 text for "write_file" (requires "rw" access).
+        dest_path: Destination path for "copy_file", relative to destination folder (default shared/<filename>).
+        dest_workspace_id: Optional destination workspace for "copy_file" (default Home); must be one of the user's own workspaces.
+        allow_duplicate_company: For "create" only: set True only after explicit user confirmation following a `company_workspace_exists` refusal (default False).
+        coverage_kind: Optional for "create": "company", "sector", or "none" (default). When "company"/"sector", registers and binds a team coverage unit (internal/admin only).
+        ticker: Optional stock ticker for "create" with `coverage_kind="company"` (e.g. "NVDA", "0700.HK"; omit for unlisted companies or sectors).
+        display_name: Optional company/sector display name for "create" when `coverage_kind` is "company"/"sector" (defaults to `name`).
+        skip_coverage_suggestion: For "create" only: set True when retrying after `coverage_suggestion` and the user explicitly declines registering a coverage unit (default False).
 
     Returns:
-        Workspace rows with id/folder/computer/access for "list", new id with `folder_path`/`folder_ready` (verify `folder_path` exists and `folder_ready` is true before copying into it) and `coverage_unit` for "create", updated metadata for "update", or file paths/content/destination size for file actions.
+        Workspace rows (id/folder/computer/access) for "list"; new id with `folder_path`/`folder_ready` (verify `folder_path` exists and `folder_ready` is true before copying into it) and `coverage_unit` for "create"; updated metadata for "update"; or file paths/content/size for file actions.
     """
     # DALTON-HOOK(workspace-folder-ready): the create result's folder fields are documented above.
     # DALTON-HOOK(cos-settings-tools): support manage_workspaces(action="update").

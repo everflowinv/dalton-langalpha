@@ -46,7 +46,7 @@ from ptc_agent.agent.middleware.steering import SteeringMiddleware
 from ptc_agent.agent.middleware.wakeups import WakeupCancelNoticeMiddleware
 from ptc_agent.core.claude_code_clis import CliQueue
 from src.llms.claude_code import ClaudeCodeTarget
-from src.tools.secretary._commands import HANDOFF_TOOL_NAME
+from src.tools.secretary._commands import puts_card  # DALTON-HOOK(cos-settings-tools)
 from src.tools.secretary.approvals import StandingApprovalMiddleware
 from src.tools.wakeups import quiet
 
@@ -63,7 +63,8 @@ def waits_for_user(orders: frozenset[str]):
     names the tools that place one) or a hand-off's card."""
 
     def waits(name: str, args: Mapping[str, Any]) -> bool:
-        return name in (ask_user.TOOL_NAME, HANDOFF_TOOL_NAME) or name in orders
+        # DALTON-HOOK(cos-settings-tools): route server-side CoS card calls (e.g. manage_workspaces create) to the resumable held node so approval_snapshots are persisted before interrupt
+        return name == ask_user.TOOL_NAME or puts_card(name, args) or name in orders
 
     return waits
 

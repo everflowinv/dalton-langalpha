@@ -210,6 +210,7 @@ async def test_each_setting_covers_only_its_own_action(other_preference, monkeyp
         _call("delegate_to_analyst", "handoff", question="q", workspace_id="ws-1"),
     ])
 
+    # DALTON-HOOK(cos-settings-tools): verify persisted create snapshot alongside preapproved_calls
     assert update["preapproved_calls"] == ["create"]
     assert update["approval_snapshots"]["create"]["computer_id"] == "c-cloud-1"
 

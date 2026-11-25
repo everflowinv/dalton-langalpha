@@ -228,6 +228,12 @@ class WorkspaceManager(ComputerManager):
             computer = await self.ensure_primary_computer(
                 user_id, default_name=name, resource_tier=resource_tier
             )
+            if (computer.get("config") or {}).get("archiving"):
+                if verify_snapshot:
+                    raise ApprovalScopeChangedError("情况已变化，请重新发起")
+                raise ComputerArchivingError(
+                    "This computer is currently being archived and cannot accept new workspaces."
+                )
         # Never had a sandbox and one is being built. A workspace placed on it
         # now would make its first request wait out that build, so it waits here.
         if computer.get("status") in (

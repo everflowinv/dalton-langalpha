@@ -84,8 +84,9 @@ export function ProposalCard({
 
       {/* DALTON-HOOK(team-sharing): a colleague's read-only thread passes no
           action handlers; the card shows the proposal without action buttons */}
+      {/* --- DALTON-HOOK(cos-settings-tools): begin --- */}
+      {/* Wrap buttons cleanly with >=36px touch height on narrow viewports and disable during submitting */}
       {(onApprove || onReject || approveAlways) && (
-        // DALTON-HOOK(cos-settings-tools): wrap buttons cleanly with >=36px touch height on narrow viewports
         <div className="pt-3 flex flex-wrap items-center gap-2">
           <button
             type="button"
@@ -121,6 +122,7 @@ export function ProposalCard({
           </button>
         </div>
       )}
+      {/* --- DALTON-HOOK(cos-settings-tools): end --- */}
     </ResolveSwap>
   );
 }

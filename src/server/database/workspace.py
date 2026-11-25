@@ -934,7 +934,6 @@ async def create_workspace_on_computer(
                     # (computer_name, computer_kind) under the FOR SHARE row lock.
                     extra_fence = (
                         "\n                                  AND status <> 'error'"
-                        "\n                                  AND NOT COALESCE(config, '{}'::jsonb) @> '{\"archiving\": true}'::jsonb"
                         "\n                                  AND (provider_ref IS NOT NULL OR status NOT IN ('creating', 'starting'))"
                         if reject_unavailable
                         else ""
@@ -1339,18 +1338,11 @@ async def check_duplicate_snapshot_unchanged(
     ) -> bool:
         if is_duplicate_name(target, candidate):
             return True
-        if target_ticker_key is not None:
-            cand_key = (
-                normalize_ticker_key(candidate)
-                if candidate_is_ticker
-                else canonical_workspace_ticker_key(candidate)
-            )
+        if candidate_is_ticker and target_ticker_key is not None:
+            cand_key = normalize_ticker_key(candidate)
             if cand_key is not None and cand_key == target_ticker_key:
                 return True
-        try:
-            return workspace_name_key(target) == workspace_name_key(candidate)
-        except WorkspaceNameInvalid:
-            return False
+        return False
 
     candidates_list = list(verified_company_candidates) if verified_company_candidates else []
 

@@ -720,7 +720,12 @@ class MachineLifecycleMixin:
             await self._revoke_computer_tokens(computer_id)
             await self._revoke_livefs(computer_id)
         if (
-            await update_computer_status(computer_id, status, expected="stopping")
+            await update_computer_status(
+                computer_id,
+                status,
+                expected="stopping",
+                drop_config_key="archiving",  # DALTON-HOOK(cos-settings-tools)
+            )
             is None
         ):
             logger.info(
@@ -752,7 +757,10 @@ class MachineLifecycleMixin:
         if not computer.get("provider_ref"):
             raise RuntimeError("No sandbox associated with this computer")
         claimed = await update_computer_status(
-            computer_id, ComputerStatus.STOPPING, expected=ComputerStatus.STOPPED
+            computer_id,
+            ComputerStatus.STOPPING,
+            expected=ComputerStatus.STOPPED,
+            merge_config={"archiving": True},  # DALTON-HOOK(cos-settings-tools)
         )
         if claimed is None:
             raise RuntimeError("Computer changed while preparing archive; retry")
