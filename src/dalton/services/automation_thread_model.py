@@ -242,13 +242,17 @@ def _extract_execution_id_from_metadata(meta: Mapping[str, Any] | None) -> str |
 
 async def get_run_model_and_system_only(
     run_row: Mapping[str, Any] | None,
-) -> tuple[str | None, bool]:
+) -> tuple[str | None, bool | None]:
     """Read ``(model_name, system_only)`` from a single run row and its execution snapshot.
 
     Uses the execution link stored in ``run_row["metadata"]`` (falling back to
     ``_get_execution_for_run_id`` with that same run's id when metadata omits the
     link) so both the model name and ``llm_model_system_only`` always come from
     the same run.
+
+    Returns ``(run_model, None)`` when reading or hydrating the execution
+    snapshot fails, so callers know the flag was not resolved and can let
+    handoff retry rather than locking in ``False``.
     """
     if not isinstance(run_row, Mapping):
         return None, False
@@ -270,23 +274,31 @@ async def get_run_model_and_system_only(
     except RuntimeError as exc:
         if "pool" not in str(exc).lower():
             raise
+        return run_model, None
     except Exception:
         logger.debug(
             "[AUTOMATION_THREAD_MODEL] Failed reading execution snapshot for run handoff",
             exc_info=True,
         )
+        return run_model, None
     if exec_row is None:
         return run_model, False
-    try:
-        exec_row = await _hydrate_execution_snapshot(exec_row) or exec_row
-    except RuntimeError as exc:
-        if "pool" not in str(exc).lower():
-            raise
-    except Exception:
-        logger.debug(
-            "[AUTOMATION_THREAD_MODEL] Failed hydrating execution snapshot for run handoff",
-            exc_info=True,
-        )
+    if exec_row.get("snapshot_taken") is False:
+        try:
+            hydrated = await _hydrate_execution_snapshot(exec_row)
+        except RuntimeError as exc:
+            if "pool" not in str(exc).lower():
+                raise
+            return run_model, None
+        except Exception:
+            logger.debug(
+                "[AUTOMATION_THREAD_MODEL] Failed hydrating execution snapshot for run handoff",
+                exc_info=True,
+            )
+            return run_model, None
+        if hydrated is None or hydrated.get("snapshot_taken") is not True:
+            return run_model, None
+        exec_row = hydrated
     if run_model is None and exec_row.get("llm_model"):
         run_model = str(exec_row["llm_model"]).strip() or None
     return run_model, bool(exec_row.get("llm_model_system_only"))
@@ -825,16 +837,18 @@ async def _resolve_automation_notification_context(
     if target_exec is None:
         return None, None, None, False, False, None
 
-    try:
-        target_exec = await _hydrate_execution_snapshot(target_exec)
-    except Exception:
-        logger.warning(
-            f"[AUTOMATION_THREAD_MODEL] Failed hydrating execution snapshot "
-            f"for thread={thread_id} execution_id={target_exec.get('automation_execution_id')}",
-            exc_info=True,
-        )
-    if target_exec is None:
-        return None, None, None, False, False, None
+    if target_exec.get("snapshot_taken") is False:
+        try:
+            target_exec = await _hydrate_execution_snapshot(target_exec)
+        except Exception as exc:
+            logger.warning(
+                f"[AUTOMATION_THREAD_MODEL] Failed hydrating execution snapshot "
+                f"for thread={thread_id} execution_id={target_exec.get('automation_execution_id')}",
+                exc_info=True,
+            )
+            raise _automation_model_unreadable() from exc
+        if target_exec is None or target_exec.get("snapshot_taken") is not True:
+            raise _automation_model_unreadable()
 
     inherited_system_only = bool(target_exec.get("llm_model_system_only"))
     is_hitl_automation = match_kind == "hitl_resume_run"
@@ -857,11 +871,7 @@ async def _resolve_automation_notification_context(
     source: str | None = None
     effort_configured = False
     inherited_effort: str | None = None
-    has_exec_snapshot = (
-        target_exec.get("snapshot_taken") is True
-        or "llm_model" in target_exec
-        or "reasoning_effort" in target_exec
-    )
+    has_exec_snapshot = target_exec.get("snapshot_taken") is True
     if has_exec_snapshot:
         target_exec = {**target_exec, "_has_exec_snapshot": True}
     if has_exec_snapshot:
@@ -965,20 +975,17 @@ async def _resolve_automation_notification_context(
             f"execution_id={exec_id} via={match_kind}",
             exc_info=True,
         )
-        if fallback_eligible:
-            # Confirmed link: keep the execution's model and its fallback rules.
-            return (
-                target_exec,
-                chosen_model,
-                None,
-                fallback_eligible,
-                effort_configured,
-                inherited_effort,
-            )
-        # Inferred link only: the previous behavior, default resolution, while preserving system_only.
-        if inherited_system_only:
-            return target_exec, None, None, False, False, None
-        return None, None, None, False, False, None
+        # Execution link is already confirmed (any match_kind): keep target_exec and
+        # chosen_model so callers never drop the execution link or fall back to composer,
+        # thread, or account-default models.
+        return (
+            target_exec,
+            chosen_model,
+            None,
+            fallback_eligible,
+            effort_configured,
+            inherited_effort,
+        )
 
     prefs_for_resolve = (
         {
@@ -990,6 +997,24 @@ async def _resolve_automation_notification_context(
         else prefs
     )
     if not model_resolves(prefs_for_resolve, chosen_model):
+        if has_exec_snapshot:
+            # Snapshot pinned an explicit model: do NOT silently downgrade to account default.
+            # Pass chosen_model through normal turn resolution so subscription fallback (when
+            # eligible) or the standard model-unavailable refusal handles it identically to
+            # an ordinary turn requesting an unavailable model.
+            logger.warning(
+                f"[AUTOMATION_THREAD_MODEL] Snapshot model {chosen_model!r} for thread={thread_id} "
+                f"execution_id={exec_id} source={source} via={match_kind} is unavailable in catalog; "
+                f"keeping pinned model for standard refusal/fallback"
+            )
+            return (
+                target_exec,
+                chosen_model,
+                prefs,
+                fallback_eligible,
+                effort_configured,
+                inherited_effort,
+            )
         logger.warning(
             f"[AUTOMATION_THREAD_MODEL] Model {chosen_model!r} for thread={thread_id} "
             f"execution_id={exec_id} source={source} via={match_kind} is unavailable; "
@@ -1357,9 +1382,9 @@ async def resolve_turn_config_with_automation_inheritance(
                     reason=detail.get("type"),
                     exc_to_raise=exc,
                 )
-            if not _is_unservable_refusal(exc):
+            if (target_exec and target_exec.get("_has_exec_snapshot")) or not _is_unservable_refusal(exc):
                 raise
-        elif not _is_unservable_refusal(exc):
+        elif (target_exec and target_exec.get("_has_exec_snapshot")) or not _is_unservable_refusal(exc):
             raise
         reason = exc.detail.get("type") if isinstance(exc.detail, dict) else None
         logger.warning(

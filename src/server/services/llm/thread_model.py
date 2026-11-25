@@ -192,8 +192,12 @@ def extract_pending_model_handoff(row: Any) -> dict[str, Any] | None:
 # DALTON-HOOK(cos-settings-tools): inspect latest attempt's actual model and execution-level system-only flag from the same run row
 async def _read_latest_run_identity(
     thread_id: str,
-) -> tuple[str | None, bool, bool]:
-    """Return ``(latest_run_model, prev_system_only, run_found)`` from one run row and its execution snapshot."""
+) -> tuple[str | None, bool | None, str | None, bool]:
+    """Return ``(latest_run_model, prev_system_only, latest_run_id, run_found)`` from one run row and its execution snapshot.
+
+    ``prev_system_only`` is ``None`` when the execution snapshot could not be
+    read, signalling handoff to re-read rather than locking in ``False``.
+    """
     try:
         from src.dalton.services.automation_thread_model import (
             get_run_model_and_system_only,
@@ -207,12 +211,35 @@ async def _read_latest_run_identity(
             thread_id,
             exc_info=True,
         )
-        return None, False, False
+        return None, None, None, False
     if not isinstance(latest, Mapping):
-        return None, False, False
+        return None, False, None, False
+    latest_run_id = str(latest.get("conversation_response_id") or "").strip() or None
     # DALTON-HOOK(cos-settings-tools): derive model and system_only atomically from the same run row
     latest_model, prev_system_only = await get_run_model_and_system_only(latest)
-    return latest_model, prev_system_only, True
+    return latest_model, prev_system_only, latest_run_id, True
+
+
+# DALTON-HOOK(cos-settings-tools): resolve running_model's system-only flag by the current in-progress run_id alone
+async def _read_run_system_only_by_id(run_id: str | None) -> bool | None:
+    if not run_id:
+        return None
+    try:
+        from src.dalton.services.automation_thread_model import (
+            get_run_model_and_system_only,
+        )
+
+        _, sys_only = await get_run_model_and_system_only(
+            {"conversation_response_id": str(run_id).strip()}
+        )
+        return sys_only
+    except Exception:
+        logger.debug(
+            "running run system-only read failed for run_id %s",
+            run_id,
+            exc_info=True,
+        )
+        return None
 
 
 @dataclass(frozen=True)
@@ -226,8 +253,8 @@ class ThreadModelSwitchPlan:
     model: str | None
     changed: bool
     pending_candidate_models: tuple[str, ...] = ()
-    # DALTON-HOOK(cos-settings-tools): (model, system_only) pairs captured from each run for deferred/immediate handoff
-    pending_candidate_sources: tuple[tuple[str, bool], ...] = ()
+    # DALTON-HOOK(cos-settings-tools): (model, system_only) pairs captured from each run for deferred/immediate handoff (None means re-read at handoff)
+    pending_candidate_sources: tuple[tuple[str, bool | None], ...] = ()
     source_system_only: bool | None = None
 
 
@@ -252,6 +279,7 @@ async def prepare_thread_model_switch(
     model_pref: dict[str, Any] | None = None,
     short_circuit_default: bool = False,
     running_model: str | None = None,
+    running_run_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
 ) -> ThreadModelSwitchPlan:
     """Validate ``model`` (None returns to account default) and workspace rules
     before persisting ``llm_model``.
@@ -287,13 +315,14 @@ async def prepare_thread_model_switch(
     ws_id = str(meta["workspace_id"]) if meta and meta.get("workspace_id") else None
 
     # DALTON-HOOK(cos-settings-tools): compare (model, system_only) against the latest run's actual model and execution flag so switching from a system-only execution to a same-named custom model still runs handoff
-    latest_run_model, prev_system_only, latest_run_found = (
+    latest_run_model, prev_system_only, latest_run_id, latest_run_found = (
         await _read_latest_run_identity(thread_id)
     )
 
     if (
         meta is not None
-        and (switched_from, prev_system_only) == (model, False)
+        and (prev_system_only is False or not latest_run_found)
+        and switched_from == model
         and (latest_run_model is None or latest_run_model == model)
     ):
         return ThreadModelSwitchPlan(
@@ -358,37 +387,58 @@ async def prepare_thread_model_switch(
     # built with (an automation override may have compacted with it). The hand-off
     # tries each, so none of them has to be guessed right.
     candidates: list[str] = []
-    # DALTON-HOOK(cos-settings-tools): preserve per-run (model, system_only) candidate pairs so deferred handoff never borrows a newer run's flag
-    candidate_sources: list[tuple[str, bool]] = []
+    # DALTON-HOOK(cos-settings-tools): preserve per-run (model, system_only) candidate pairs deduplicated by (model, system_only) so legacy False and newer True same-name candidates both survive
+    candidate_sources: list[tuple[str, bool | None]] = []
     if isinstance(existing_pending, dict):
         listed_sources = existing_pending.get("candidate_sources")
+        existing_source_models: set[str] = set()
         if isinstance(listed_sources, list):
             for entry in listed_sources:
                 if isinstance(entry, dict) and entry.get("model"):
-                    candidate_sources.append(
-                        (str(entry["model"]), bool(entry.get("system_only")))
-                    )
+                    m_name = str(entry["model"])
+                    raw_sys = entry.get("system_only")
+                    sys_flag = None if raw_sys is None else bool(raw_sys)
+                    candidate_sources.append((m_name, sys_flag))
+                    existing_source_models.add(m_name)
+        legacy_models: list[str] = []
         listed = existing_pending.get("candidate_models")
         if isinstance(listed, list):
-            candidates.extend(str(m) for m in listed if m)
+            for m in listed:
+                if m:
+                    s = str(m)
+                    candidates.append(s)
+                    legacy_models.append(s)
         for key in ("previous_model", "alt_previous_model"):
             if existing_pending.get(key):
-                candidates.append(str(existing_pending[key]))
+                s = str(existing_pending[key])
+                candidates.append(s)
+                legacy_models.append(s)
+        # Any legacy candidate model lacking an entry in candidate_sources is non-system-only (False).
+        for m in legacy_models:
+            if m not in existing_source_models:
+                candidate_sources.append((m, False))
     # DALTON-HOOK(cos-settings-tools): order candidates oldest -> newest (latest_run_model before running_model, without trailing switched_from)
     for m in (pending_prev, latest_run_model, running_model):
         if m:
             candidates.append(str(m))
-    if latest_run_found:
-        for m in (latest_run_model, running_model):
-            if m:
-                candidate_sources.append((str(m), bool(prev_system_only)))
-        if not candidate_sources and pending_prev:
-            candidate_sources.append((str(pending_prev), bool(prev_system_only)))
+    if latest_run_found and latest_run_model:
+        candidate_sources.append((str(latest_run_model), prev_system_only))
+    if running_model:
+        # DALTON-HOOK(cos-settings-tools): resolve running_model's flag from its own run_id (never borrow another run's prev_system_only; None triggers re-read at handoff)
+        if running_run_id and latest_run_id and str(running_run_id).strip() == latest_run_id:
+            running_sys_only: bool | None = prev_system_only
+        elif running_run_id:
+            running_sys_only = await _read_run_system_only_by_id(running_run_id)
+        else:
+            running_sys_only = None
+        candidate_sources.append((str(running_model), running_sys_only))
+    if not candidate_sources and latest_run_found and pending_prev:
+        candidate_sources.append((str(pending_prev), prev_system_only))
     seen: set[str] = set()
     unique = [m for m in candidates if not (m in seen or seen.add(m))]
     # Drop the oldest when full: the newest turn is the likeliest summary writer.
     pending_candidates = tuple(unique[-MAX_HANDOFF_CANDIDATE_MODELS:])
-    seen_src: set[tuple[str, bool]] = set()
+    seen_src: set[tuple[str, bool | None]] = set()
     unique_sources = [
         pair for pair in candidate_sources if not (pair in seen_src or seen_src.add(pair))
     ]
@@ -442,8 +492,8 @@ class PendingModelHandoffContext:
     current_model: str | None
     version: str | None
     candidate_models: tuple[str, ...] = ()
-    # DALTON-HOOK(cos-settings-tools): per-run (model, system_only) pairs persisted at switch time
-    candidate_sources: tuple[tuple[str, bool], ...] = ()
+    # DALTON-HOOK(cos-settings-tools): per-run (model, system_only) pairs persisted at switch time (None means re-read at handoff)
+    candidate_sources: tuple[tuple[str, bool | None], ...] = ()
 
 
 async def read_pending_model_handoff_context(
@@ -480,7 +530,10 @@ async def read_pending_model_handoff_context(
     # DALTON-HOOK(cos-settings-tools): hydrate per-run (model, system_only) pairs from pending marker
     raw_sources = pending.get("candidate_sources")
     parsed_sources = tuple(
-        (str(entry["model"]), bool(entry.get("system_only")))
+        (
+            str(entry["model"]),
+            None if entry.get("system_only") is None else bool(entry.get("system_only")),
+        )
         for entry in (raw_sources if isinstance(raw_sources, list) else ())
         if isinstance(entry, dict) and entry.get("model")
     )
@@ -512,7 +565,7 @@ def build_pending_model_handoff_marker(
     user_id: str,
     version: str | None = None,
     candidate_models: tuple[str, ...] | list[str] = (),
-    candidate_sources: tuple[tuple[str, bool], ...] | list[tuple[str, bool]] = (),  # DALTON-HOOK(cos-settings-tools)
+    candidate_sources: tuple[tuple[str, bool | None], ...] | list[tuple[str, bool | None]] = (),  # DALTON-HOOK(cos-settings-tools)
 ) -> dict[str, Any]:
     """Build a versioned pending-handoff metadata payload."""
     marker: dict[str, Any] = {
@@ -525,7 +578,10 @@ def build_pending_model_handoff_marker(
     # DALTON-HOOK(cos-settings-tools): store per-run (model, system_only) pairs alongside candidate_models
     if candidate_sources:
         marker["candidate_sources"] = [
-            {"model": str(model), "system_only": bool(sys_only)}
+            {
+                "model": str(model),
+                "system_only": None if sys_only is None else bool(sys_only),
+            }
             for model, sys_only in candidate_sources
             if model
         ]
@@ -624,6 +680,7 @@ async def switch_thread_model(
     model_pref: dict[str, Any] | None = None,
     short_circuit_default: bool = False,
     running_model: str | None = None,
+    running_run_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
 ) -> ThreadModelSwitchResult:
     """Validate ``model`` (None returns to account default), persist
     ``llm_model`` on ``thread_id``, and either run hand-off immediately or
@@ -636,6 +693,7 @@ async def switch_thread_model(
         model_pref=model_pref,
         short_circuit_default=short_circuit_default,
         running_model=running_model,
+        running_run_id=running_run_id,
     )
     if not plan.changed:
         return ThreadModelSwitchResult(

@@ -494,6 +494,7 @@ async def _resolver(
     *,
     ignore_custom_models: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
     latest_attempt: Any = _UNSET_LATEST,  # DALTON-HOOK(cos-settings-tools)
+    strict_system_only: bool = False,  # DALTON-HOOK(cos-settings-tools)
 ):
     """``thread_resolver`` for a call between turns, which no composer
     started, so the thread's row sets its effort and fast mode, and its
@@ -520,7 +521,15 @@ async def _resolver(
     if ignore_custom_models is not None:
         effective_ignore_custom = bool(ignore_custom_models)
     elif isinstance(latest, Mapping):
-        _, effective_ignore_custom = await get_run_model_and_system_only(latest)
+        _, resolved_sys = await get_run_model_and_system_only(latest)
+        if resolved_sys is None:
+            if strict_system_only:
+                raise RuntimeError(
+                    f"Failed reading execution system-only flag for thread {thread_id}"
+                )
+            effective_ignore_custom = False
+        else:
+            effective_ignore_custom = bool(resolved_sys)
     else:
         effective_ignore_custom = False
     return thread_resolver(
@@ -989,13 +998,17 @@ async def _hand_off_config(
     if summary is None:
         return None
     meta, route = await thread_route(thread_id, user_id)
-    # DALTON-HOOK(cos-settings-tools): bind source_system_only captured from the same run; legacy candidates without snapshot metadata (None) resolve as non-system-only (False) and never borrow a newer run's flag
+    # DALTON-HOOK(cos-settings-tools): bind source_system_only captured from the same run; None means switch-time read failed so re-read strictly (failing closed for retry)
     resolve = await _resolver(
         user_id,
         thread_id,
         meta,
         route,
-        ignore_custom_models=bool(source_system_only),
+        **(
+            {"ignore_custom_models": source_system_only}
+            if source_system_only is not None
+            else {"strict_system_only": True}
+        ),
     )
     try:
         # DALTON-HOOK(cos-settings-tools): resolve the newly switched-to model under the owner's own selection (not previous run's system-only flag)

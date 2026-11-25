@@ -74,13 +74,17 @@ async def inspect_hand_off(
         return "not_needed", None
     try:
         meta, route = await thread_route(thread_id, user_id)
-        # DALTON-HOOK(cos-settings-tools): bind source_system_only captured from the same run; legacy candidates without snapshot metadata (None) resolve as non-system-only (False) and never borrow a newer run's flag
+        # DALTON-HOOK(cos-settings-tools): bind source_system_only captured from the same run; None means switch-time read failed so re-read strictly (returning retryable_failure if DB still fails)
         resolve = await _resolver(
             user_id,
             thread_id,
             meta,
             route,
-            ignore_custom_models=bool(source_system_only),
+            **(
+                {"ignore_custom_models": source_system_only}
+                if source_system_only is not None
+                else {"strict_system_only": True}
+            ),
         )
     except Exception:
         logger.warning(f"[handoff] thread {thread_id}: switch not read", exc_info=True)
@@ -265,21 +269,29 @@ async def run_pending_model_handoff(
         else:
             # Try every model that may have written the owed summary; the first
             # that finds something to hand off is the source.
-            # DALTON-HOOK(cos-settings-tools): use persisted per-run (model, system_only) pairs so deferred handoff never borrows a newer run's flag
+            # DALTON-HOOK(cos-settings-tools): deduplicate candidates by (model, system_only) so legacy False and newer same-name True candidates are both tried; pure legacy markers resolve as non-system-only (False)
+            source_pairs: list[tuple[str | None, bool | None]] = []
+            seen_pairs: set[tuple[str | None, bool | None]] = set()
             if ctx.candidate_sources:
-                source_pairs: list[tuple[str | None, bool | None]] = [
-                    (m, sys_only) for m, sys_only in ctx.candidate_sources
-                ]
-                covered_models = {m for m, _ in source_pairs}
+                covered_models: set[str] = set()
+                for m, sys_only in ctx.candidate_sources:
+                    pair: tuple[str | None, bool | None] = (m, sys_only)
+                    if pair not in seen_pairs:
+                        source_pairs.append(pair)
+                        seen_pairs.add(pair)
+                    if m:
+                        covered_models.add(m)
                 for m in ctx.candidate_models:
-                    if m and m not in covered_models:
-                        source_pairs.append((m, None))
+                    if m and m not in covered_models and (m, False) not in seen_pairs:
+                        source_pairs.append((m, False))
+                        seen_pairs.add((m, False))
                         covered_models.add(m)
             else:
-                source_pairs = [
-                    (m, None)
-                    for m in (list(ctx.candidate_models) or [ctx.previous_model])
-                ]
+                for m in (list(ctx.candidate_models) or [ctx.previous_model]):
+                    pair = (m, False)
+                    if pair not in seen_pairs:
+                        source_pairs.append(pair)
+                        seen_pairs.add(pair)
             source, source_sys_only = source_pairs[0]
             pre_status = "not_needed"
             saw_retryable = False

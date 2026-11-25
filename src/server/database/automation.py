@@ -1273,6 +1273,7 @@ async def claim_price_firing(automation_id: str, server_id: str) -> Optional[str
                     exec_llm_model = None
                     exec_reasoning_effort = None
                     exec_system_only = False
+                # DALTON-HOOK(cos-settings-tools): insert pending price-firing execution with frozen snapshot + snapshot_taken=TRUE
                 await cur.execute("""
                     INSERT INTO automation_executions (
                         automation_execution_id, automation_id,

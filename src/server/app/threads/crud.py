@@ -749,10 +749,13 @@ async def update_thread_endpoint(
 
                 _latest_attempt = await _runs_lifecycle.get_latest_attempt(thread_id)
                 if isinstance(_latest_attempt, dict):
-                    prev_run_resolved = True
-                    latest_run_model, prev_system_only = (
+                    _resolved_model, _resolved_sys = (
                         await get_run_model_and_system_only(_latest_attempt)
                     )
+                    latest_run_model = _resolved_model
+                    if _resolved_sys is not None:
+                        prev_system_only = _resolved_sys
+                        prev_run_resolved = True
             except Exception:
                 # DALTON-HOOK(cos-settings-tools): tolerate unavailable run ledger in unit/fallback paths
                 logger.debug(

@@ -510,6 +510,7 @@ async def begin_execution_if_not_deleted(
                                              AND {unit_lead_expr} = {auto_owner_expr}
                                            LIMIT 1
                                        ) AS stamp_unit_version,
+                                       -- DALTON-HOOK(cos-settings-tools): capture automation config for lazy rolling-upgrade snapshot backfill
                                        a.llm_model AS auto_llm_model,
                                        a.reasoning_effort AS auto_reasoning_effort,
                                        COALESCE((a.metadata->>'llm_model_system_only')::boolean, FALSE) AS auto_system_only
@@ -549,6 +550,7 @@ async def begin_execution_if_not_deleted(
                                     started_at = %s,
                                     coverage_unit_id = t.stamp_unit_id,
                                     coverage_unit_version = t.stamp_unit_version,
+                                    -- DALTON-HOOK(cos-settings-tools): lazily snapshot rolling-upgrade rows (snapshot_taken=FALSE) and freeze
                                     llm_model = CASE WHEN e.snapshot_taken THEN e.llm_model ELSE t.auto_llm_model END,
                                     reasoning_effort = CASE WHEN e.snapshot_taken THEN e.reasoning_effort ELSE t.auto_reasoning_effort END,
                                     llm_model_system_only = CASE WHEN e.snapshot_taken THEN e.llm_model_system_only ELSE t.auto_system_only END,
