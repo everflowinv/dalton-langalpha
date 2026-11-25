@@ -106,13 +106,26 @@ class SubagentContext:
             return True
         if source == user_models.ModelSource.SYSTEM:
             provider = entry.get("provider")
-            if LLM.get_model_config().get_provider_info(provider).get("access_type") != "oauth":
+            mc = LLM.get_model_config()
+            provider_info = mc.get_provider_info(provider) if provider else {}
+            # DALTON-HOOK(team-model-catalog): check catalog-defined variant availability via
+            # its bound credential row instead of calling platform_key_configured() (which constructs
+            # an unauthenticated LLM client and raises CatalogVariantSecurityError -> HTTP 500).
+            if provider_info.get("catalog_defined") is True:
+                from src.dalton.services.team_model_catalog.transport import (
+                    has_valid_catalog_variant_binding_async,
+                )
+
+                return await has_valid_catalog_variant_binding_async(
+                    provider, prov_info=provider_info
+                )
+            if provider_info.get("access_type") != "oauth":
                 if platform_key_configured(name):
                     return True
                 if not self.is_byok:
                     return False
                 found, _ = await walk_byok_candidates(
-                    self.user_id, provider, LLM.get_model_config(), _byok_cache=self._byok_cache
+                    self.user_id, provider, mc, _byok_cache=self._byok_cache
                 )
                 return found is not None
             if provider not in self.oauth_accounts:

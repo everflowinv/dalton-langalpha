@@ -34,6 +34,13 @@ def _running_model(config: Any) -> str | None:
     return value or None
 
 
+def _running_run_id(config: Any) -> str | None:
+    """The current turn's run_id (``run_id`` in configurable)."""
+    cfg = (config or {}).get("configurable") or {}
+    value = str(cfg.get("run_id") or "").strip()
+    return value or None
+
+
 def _steer_belongs_to_turn(
     message: BaseMessage,
     run_id: str | None,
@@ -353,6 +360,7 @@ def create_thread_model_tools() -> list[BaseTool]:
             return f"切换模型失败：模型 {display_label} 在当前服务中未启用。可选模型：{candidates}。"
 
         try:
+            running_run_id = _running_run_id(config)
             result = await switch_thread_model(
                 user_id,
                 thread_id,
@@ -361,6 +369,7 @@ def create_thread_model_tools() -> list[BaseTool]:
                 model_pref=pref,
                 short_circuit_default=True,
                 running_model=_running_model(config),
+                **({"running_run_id": running_run_id} if running_run_id else {}),
             )
         except HTTPException as exc:
             detail = exc.detail

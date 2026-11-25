@@ -1743,6 +1743,13 @@
       "comment": "Subscription cash cost is 0. Gemini 4 Neon became generally available on 2026-11-18 (Gemini API release notes); list price $3 input / $0.15 cached input / $15 output per million tokens, flat across the 1,048,576-token context window; output defaults to 65,536 tokens. Four thinking levels (low, medium, high, xhigh), all listed by the Antigravity subscription on 2026-11-19."
     }
   },
+  "curated_setup_defaults": [
+    "gemini-4-neon-high-oauth",
+    "gemini-4-carbon-medium-oauth",
+    "claude-opus-5-5-oauth",
+    "gpt-6.2-astra-oauth",
+    "gpt-6.2-sol-oauth"
+  ],
   "retired": [
     {
       "key": "grok-4.6-oauth",

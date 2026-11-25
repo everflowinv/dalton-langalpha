@@ -339,6 +339,15 @@ async def update_company_agent(
         _retain_protected_migration_metadata(locked_row, effective_kwargs)
         if not prepared.update_kwargs:
             return
+        from src.dalton.services.team_model_catalog.service import (
+            assert_model_not_retired_under_lock,
+        )
+
+        effective_model = effective_kwargs.get("llm_model", locked_row.get("llm_model"))
+        if effective_model and "llm_model" in prepared.update.model_fields_set:
+            await assert_model_not_retired_under_lock(
+                locked_conn, str(effective_model), field="llm_model"
+            )
         await lifecycle.recheck_locked_automation_update(
             user_id=COMPANY_SYSTEM_USER_ID,
             update=prepared.update,
@@ -353,32 +362,53 @@ async def update_company_agent(
             locked_conn=locked_conn,
         )
 
+    updates_model = (
+        "llm_model" in prepared.update.model_fields_set
+        or "llm_model" in prepared.update_kwargs
+    )
     record_history = bool(prepared.update_kwargs)
-    with automation_history_context(
-        actor_user_id=principal.user_id,
-        action="update",
-        expected_config_version=version,
-        record_history=record_history,
-        locked_row_reconciler=_reconcile,
-        prelocked_pref_row={},
-    ):
-        try:
+    from src.dalton.database.team_model_catalog import (
+        acquire_catalog_shared_lock,
+        is_conversation_db_pool_open,
+    )
+    from src.server.database.pool import get_db_connection
+
+    async def _call_update(write_conn: Any) -> dict[str, Any] | None:
+        with automation_history_context(
+            actor_user_id=principal.user_id,
+            action="update",
+            expected_config_version=version,
+            record_history=record_history,
+            locked_row_reconciler=_reconcile,
+            prelocked_pref_row={},
+        ):
             if prepared.update_kwargs:
                 return await auto_db.update_automation(
                     automation_id,
                     COMPANY_SYSTEM_USER_ID,
-                    conn=conn,
+                    conn=write_conn,
                     **prepared.update_kwargs,
                 )
             return await auto_db.update_automation(
                 automation_id,
                 COMPANY_SYSTEM_USER_ID,
-                conn=conn,
+                conn=write_conn,
             )
-        except lifecycle.AutomationRefusal as exc:
-            if exc.field == "reasoning_effort":
-                raise HTTPException(status_code=422, detail=str(exc)) from None
-            raise
+
+    try:
+        if conn is not None:
+            if updates_model or hasattr(conn, "execute"):
+                await acquire_catalog_shared_lock(conn)
+            return await _call_update(conn)
+        if updates_model and is_conversation_db_pool_open():
+            async with get_db_connection() as db_conn, db_conn.transaction():
+                await acquire_catalog_shared_lock(db_conn)
+                return await _call_update(db_conn)
+        return await _call_update(None)
+    except lifecycle.AutomationRefusal as exc:
+        if exc.field == "reasoning_effort":
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        raise
 
 
 async def pause_company_agent(

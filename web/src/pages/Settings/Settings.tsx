@@ -101,13 +101,18 @@ function Settings() {
   const deniedMessage = locationState?.deniedMessage;
   const { isLoading: isUserLoading } = useUser();
   const { isLoading: isPrefsLoading } = usePreferences();
-  const daltonVisibility = useDaltonSettingsVisibility();
+  // DALTON-HOOK(settings-reorg): force-revalidate caller identity whenever opening a Team Management section
+  const requestedSection = resolveRequestedSection(searchParams, hash);
+  const requestedMeta: SectionMeta | undefined = requestedSection ? SECTIONS[requestedSection] : undefined;
+  const isTeamManagementSection = Boolean(requestedMeta?.minTier);
+  const daltonVisibility = useDaltonSettingsVisibility({
+    revalidateOnOpen: true,
+    open: isTeamManagementSection,
+  });
   const { t } = useTranslation();
 
   // DALTON-HOOK(settings-reorg): hold skeleton while tier/coverage permission resolves; redirect unauthorized direct visits cleanly using unified visibility
   // DALTON-HOOK(standalone-core): hold lightweight skeleton only during Core build initial capability fetch
-  const requestedSection = resolveRequestedSection(searchParams, hash);
-  const requestedMeta: SectionMeta | undefined = requestedSection ? SECTIONS[requestedSection] : undefined;
   const awaitingTier = Boolean(requestedMeta?.minTier && daltonVisibility.callerTierPending);
   const awaitingCoverage = Boolean(requestedMeta?.coverageUnitsOnly && daltonVisibility.coverageUnitsPending);
   const awaitingCapabilities = Boolean(daltonVisibility.capabilitiesLoading);

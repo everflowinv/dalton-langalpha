@@ -382,7 +382,11 @@ export function useArtifactPublishing() {
   });
   const unshare = useMutation({
     mutationFn: (artifactId: string) => unshareArtifact(artifactId),
-    onSuccess: settle,
+    // DALTON-HOOK(monitors): unsharing a file atomically downgrades any linked public monitor on the backend, so invalidate daltonMonitors alongside artifacts and shareLinks
+    onSuccess: (artifact) => {
+      settle(artifact);
+      void qc.invalidateQueries({ queryKey: queryKeys.daltonMonitors.all });
+    },
   });
   const keepUpdated = useMutation({
     mutationFn: ({ artifactId, on }: { artifactId: string; on: boolean }) => setArtifactKeepUpdated(artifactId, on),

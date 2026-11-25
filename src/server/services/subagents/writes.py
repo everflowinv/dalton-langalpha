@@ -288,6 +288,58 @@ async def prepare_save(
     return PreparedSave(ctx.user_id, name, version, kind, patch, seed)
 
 
+async def _validate_subagent_model_under_lock(
+    conn: Any,
+    user_id: str,
+    model_name: str,
+    *,
+    ctx: SubagentContext | None = None,
+) -> None:
+    """DALTON-HOOK(team-model-catalog): re-verify written subagent model against live compiled catalog under the held catalog shared lock."""
+    from fastapi import HTTPException
+
+    from src.dalton.services.team_model_catalog.service import (
+        assert_model_not_retired_under_lock,
+    )
+
+    try:
+        compiled = await assert_model_not_retired_under_lock(
+            conn,
+            model_name,
+            field="model",
+            user_id=user_id,
+            model_pref=ctx.model_pref if ctx is not None else None,
+            allow_custom=True,
+        )
+    except HTTPException as exc:
+        detail = exc.detail
+        msg = (
+            str(detail.get("message"))
+            if isinstance(detail, Mapping) and detail.get("message")
+            else str(detail or f"Model '{model_name}' is not available.")
+        )
+        raise SubagentInvalid([FieldError("model", msg)]) from None
+
+    if ctx is not None and compiled is not None:
+        from src.llms.llm import LLM as LLMFactory
+
+        # Ensure model_on_plan evaluates against the live in-lock compiled catalog.
+        prev_mc = LLMFactory._model_config
+        LLMFactory._model_config = compiled.model_config
+        try:
+            if not await ctx.model_on_plan(model_name):
+                raise SubagentInvalid([
+                    FieldError(
+                        "model",
+                        f"{model_name} isn't on your plan. Add your own key for its provider, "
+                        "or pick another model.",
+                    )
+                ])
+        finally:
+            if prev_mc is not None and getattr(prev_mc, "catalog_revision", None) == compiled.revision:
+                LLMFactory._model_config = prev_mc
+
+
 async def apply_save(
     prepared: PreparedSave,
     found: Subagents,
@@ -295,6 +347,8 @@ async def apply_save(
     *,
     updated_by: str,
     thread_id: str | None = None,
+    # DALTON-HOOK(team-model-catalog): optional caller SubagentContext for in-lock model re-validation
+    ctx: SubagentContext | None = None,
 ) -> dict[str, Any] | None:
     """Make ``prepared`` on ``conn``, whose transaction holds the user's lock
     and read ``found`` under it: the row it leaves, None for a base reset to
@@ -329,11 +383,31 @@ async def apply_save(
             if row is not None:
                 await delete_user_subagent(user_id, name, conn=conn)
             return None
+        # DALTON-HOOK(team-model-catalog): re-verify model under held catalog shared lock before write
+        written_model = new_fields.get("model")
+        if (
+            isinstance(written_model, str)
+            and written_model.strip()
+            and "model" in prepared.patch
+        ):
+            await _validate_subagent_model_under_lock(
+                conn, user_id, written_model.strip(), ctx=ctx
+            )
         return await upsert_user_subagent(
             user_id, name, kind="override", base_key=base.key, fields=new_fields,
             updated_by=updated_by, updated_thread_id=thread_id, conn=conn,
         )
     new_fields, instructions, roles = _custom_parts(*start, prepared.patch)
+    # DALTON-HOOK(team-model-catalog): re-verify model under held catalog shared lock before write
+    written_model = new_fields.get("model")
+    if (
+        isinstance(written_model, str)
+        and written_model.strip()
+        and (prepared.version is None or "model" in prepared.patch)
+    ):
+        await _validate_subagent_model_under_lock(
+            conn, user_id, written_model.strip(), ctx=ctx
+        )
     return await upsert_user_subagent(
         user_id, name, kind="custom", fields=new_fields, instructions=instructions, roles=roles,
         updated_by=updated_by, updated_thread_id=thread_id, conn=conn,
@@ -364,7 +438,14 @@ async def save_subagent(
     )
     async with get_db_connection() as conn, conn.transaction():
         await lock_user_subagents(user_id, conn=conn)
-        await apply_save(prepared, await read_subagents(user_id, conn=conn), conn, updated_by="user")
+        # DALTON-HOOK(team-model-catalog): pass ctx so apply_save re-validates model under catalog shared lock
+        await apply_save(
+            prepared,
+            await read_subagents(user_id, conn=conn),
+            conn,
+            updated_by="user",
+            ctx=ctx,
+        )
     _, after = await list_subagents(user_id, ctx=ctx)
     saved = next((v for v in after if v["name"] == name), None)
     if saved is None:

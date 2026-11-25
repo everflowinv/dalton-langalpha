@@ -12,6 +12,7 @@ import {
   ChannelDeliveryError,
   type SendCardImageInput,
 } from "./channels/adapter.js";
+import { FEISHU_CARD_MAX_BYTES } from "./channels/feishu/format.js";
 import {
   abortableRetrySleep,
   DELIVERY_CLAIM_503_INITIAL_DELAY_MS,
@@ -44,6 +45,7 @@ import {
   extractSafeLogErrorFields,
   sanitizeLogErrorCode,
 } from "./shared/logger.js";
+import { rewriteSandboxLinks } from "./shared/sandbox-links.js";
 import type { ChannelPlatform } from "./types.js";
 
 const MAX_ARTIFACT_BYTES = 20 * 1024 * 1024;
@@ -93,6 +95,74 @@ function isPlainRecord(val: unknown): val is Record<string, unknown> {
 
 function isSupportedChannelPlatform(val: unknown): val is ChannelPlatform {
   return typeof val === "string" && SUPPORTED_PLATFORMS.has(val);
+}
+
+function rewriteFeishuCardMarkdownValue(
+  value: unknown,
+  webBaseUrl: string,
+  threadId: string | null,
+): { value: unknown; changed: boolean } {
+  if (Array.isArray(value)) {
+    let changed = false;
+    const next = value.map((item) => {
+      const res = rewriteFeishuCardMarkdownValue(item, webBaseUrl, threadId);
+      if (res.changed) changed = true;
+      return res.value;
+    });
+    return { value: changed ? next : value, changed };
+  }
+  if (!isPlainRecord(value)) {
+    return { value, changed: false };
+  }
+  const tag = typeof value.tag === "string" ? value.tag.toLowerCase() : "";
+  let changed = false;
+  const out: Record<string, unknown> = { ...value };
+  if (
+    (tag === "markdown" || tag === "lark_md") &&
+    typeof out.content === "string" &&
+    out.content.length > 0
+  ) {
+    const rewritten = rewriteSandboxLinks(out.content, webBaseUrl, threadId);
+    if (rewritten !== out.content) {
+      out.content = rewritten;
+      changed = true;
+    }
+  }
+  for (const key of ["body", "elements", "columns", "text", "extra", "fields"]) {
+    if (key in out) {
+      const res = rewriteFeishuCardMarkdownValue(out[key], webBaseUrl, threadId);
+      if (res.changed) {
+        out[key] = res.value;
+        changed = true;
+      }
+    }
+  }
+  return { value: changed ? out : value, changed };
+}
+
+function rewriteFeishuCardLinksWithinBudget(
+  card: Record<string, unknown>,
+  webBaseUrl: string,
+  threadId: string | null,
+): Record<string, unknown> {
+  const withLinks = rewriteFeishuCardMarkdownValue(card, webBaseUrl, threadId);
+  if (!withLinks.changed) {
+    return card;
+  }
+  const candidate = withLinks.value as Record<string, unknown>;
+  if (Buffer.byteLength(JSON.stringify(candidate), "utf8") <= FEISHU_CARD_MAX_BYTES) {
+    return candidate;
+  }
+  if (threadId) {
+    const degraded = rewriteFeishuCardMarkdownValue(card, webBaseUrl, null);
+    if (degraded.changed) {
+      const fallback = degraded.value as Record<string, unknown>;
+      if (Buffer.byteLength(JSON.stringify(fallback), "utf8") <= FEISHU_CARD_MAX_BYTES) {
+        return fallback;
+      }
+    }
+  }
+  return card;
 }
 
 function computeSha256Hex(buf: Buffer): string {
@@ -402,6 +472,7 @@ function validateDataTaskClaimResponse(
 export interface DataTaskNotificationServiceOptions {
   backend: BackendClient;
   adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
+  webBaseUrl?: string;
   mode?: "incoming" | "outgoing";
   queueTaskTimeoutMs?: number;
   retryDelayFn?: (ms: number, signal?: AbortSignal) => Promise<boolean>;
@@ -432,6 +503,7 @@ export interface AuthorizedPlanDeliveryOptions {
 export class DataTaskNotificationService {
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
+  private readonly webBaseUrl: string;
   private readonly mode: "incoming" | "outgoing";
   private readonly queue: SequentialQueue;
   private readonly logger = createSubsystemLogger("data-task-notifications");
@@ -453,6 +525,7 @@ export class DataTaskNotificationService {
   constructor(options: DataTaskNotificationServiceOptions) {
     this.backend = options.backend;
     this.adapters = options.adapters;
+    this.webBaseUrl = (options.webBaseUrl ?? "").trim().replace(/\/+$/, "");
     this.mode = options.mode ?? "incoming";
     this.onWeixinAccountRotated = options.onWeixinAccountRotated;
     this.retryDelayFn = options.retryDelayFn ?? abortableRetrySleep;
@@ -1366,13 +1439,21 @@ export class DataTaskNotificationService {
 
       const usePlainFeishu =
         item.kind === "text" && item.plain === true && platform === "feishu";
+      const outboundItemText =
+        item.kind === "feishu_card" || !item.text
+          ? ""
+          : rewriteSandboxLinks(
+              item.text,
+              this.webBaseUrl,
+              plan.thread_id ?? null,
+            );
       const textChunks =
         item.kind === "feishu_card"
           ? []
-          : item.text
+          : outboundItemText
             ? usePlainFeishu
-              ? readyAdapter.splitTextMessageChunks!(item.text)
-              : readyAdapter.splitTextChunks(item.text)
+              ? readyAdapter.splitTextMessageChunks!(outboundItemText)
+              : readyAdapter.splitTextChunks(outboundItemText)
             : [];
       const totalChunks = item.kind === "feishu_card" ? 1 : textChunks.length;
       const hasNonEmptyText =
@@ -1749,10 +1830,15 @@ export class DataTaskNotificationService {
         }
 
         try {
+          const outboundCard = rewriteFeishuCardLinksWithinBudget(
+            item.card,
+            this.webBaseUrl,
+            plan.thread_id ?? null,
+          );
           const sendRes = await readyAdapter.sendCard!({
             targetAddress,
             recipientPlatformUserId,
-            card: item.card,
+            card: outboundCard,
             images: cardImages,
           });
           const filesStatus = item.images.map((img) => ({

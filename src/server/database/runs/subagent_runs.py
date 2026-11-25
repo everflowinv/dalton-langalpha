@@ -153,8 +153,11 @@ async def start_task_run(
     spending_run_id: Optional[str] = None,
     model_override: Optional[str] = None,
     effort_override: Optional[str] = None,
+    actual_model_key: Optional[str] = None,  # DALTON-HOOK(team-model-catalog)
+    is_custom_model: Optional[bool] = None,  # DALTON-HOOK(team-model-catalog)
     workflow_driver: bool = False,  # DALTON-HOOK(budget)
     workflow_driver_run_id: Optional[str] = None,  # DALTON-HOOK(budget)
+    catalog_snapshot: Optional[Dict[str, Any]] = None,  # DALTON-HOOK(team-model-catalog)
     conn=None,
 ) -> Dict[str, Any]:
     """The task-run START transaction: task upsert + in_progress run row +
@@ -197,6 +200,11 @@ async def start_task_run(
         **({"model": model} if model else {}),
         **({"model_override": model_override} if model_override else {}),
         **({"effort_override": effort_override} if effort_override else {}),
+        **(
+            {"actual_model_key": actual_model_key.strip()}
+            if isinstance(actual_model_key, str) and actual_model_key.strip()
+            else {}
+        ),  # DALTON-HOOK(team-model-catalog)
         **({"claude_code": True} if claude_code else {}),
         **(STORED_TURN if stored_token else {}),
         **({CLI_COMPUTER: cli_computer} if cli_computer else {}),
@@ -207,6 +215,93 @@ async def start_task_run(
             else {}
         ),  # DALTON-HOOK(budget)
     }
+
+    # DALTON-HOOK(team-model-catalog): resolve personal-vs-team model classification and build
+    # effective_catalog_snapshot before acquiring the write connection/transaction so
+    # user_models.classify_model never checks out a second pool connection while holding the
+    # ledger connection or workspace lock; persist a valid empty snapshot with
+    # excluded_custom_keys when all keys are personal custom models so backfill never rewrites
+    # them with team catalog routes.
+    if catalog_snapshot is not None and "effective_catalog_snapshot" not in facts:
+        facts["catalog_revision"] = int(catalog_snapshot.get("catalog_revision") or 0)
+        facts["effective_catalog_snapshot"] = dict(catalog_snapshot)
+    elif "effective_catalog_snapshot" not in facts:
+        from src.dalton.services.team_model_catalog.snapshot import (
+            _extract_model_key_value,
+            build_effective_catalog_snapshot,
+        )
+
+        sub_models = list(
+            dict.fromkeys(
+                mk
+                for raw_m in (actual_model_key, model, model_override)
+                if (mk := _extract_model_key_value(raw_m))
+            )
+        )
+        if sub_models:
+            try:
+                filtered_models: list[str]
+                excluded_custom_keys: list[str]
+                # DALTON-HOOK(team-model-catalog): honor caller-supplied actual resolved model
+                # source (from subagent client build, post-models.allowed filtering) instead of
+                # re-reading unfiltered preferences via classify_model; preserve R11 lookup when
+                # omitted.
+                if is_custom_model is True:
+                    filtered_models = []
+                    excluded_custom_keys = list(sub_models)
+                elif is_custom_model is False:
+                    filtered_models = list(sub_models)
+                    excluded_custom_keys = []
+                else:
+                    sub_user_id: Optional[str] = None
+                    async with _ledger_connection(conn) as lookup_conn:
+                        async with lookup_conn.cursor(row_factory=dict_row) as cur:
+                            await cur.execute(
+                                """
+                                SELECT COALESCE(
+                                    (SELECT r.user_id
+                                     FROM conversation_responses r
+                                     WHERE r.conversation_response_id = %s::uuid),
+                                    (SELECT w.user_id
+                                     FROM conversation_threads t
+                                     JOIN workspaces w ON w.workspace_id = t.workspace_id
+                                     WHERE t.conversation_thread_id = %s)
+                                ) AS user_id
+                                """,
+                                (spending_run, thread_id),
+                            )
+                            user_row = await cur.fetchone()
+                            if user_row and user_row.get("user_id"):
+                                sub_user_id = str(user_row["user_id"])
+
+                    filtered_models = list(sub_models)
+                    excluded_custom_keys = []
+                    if sub_user_id:
+                        from src.server.services.llm import user_models
+
+                        filtered_models = []
+                        for mk in sub_models:
+                            src_kind, _ = await user_models.classify_model(
+                                sub_user_id, mk
+                            )
+                            if src_kind == user_models.ModelSource.CUSTOM:
+                                excluded_custom_keys.append(mk)
+                            else:
+                                filtered_models.append(mk)
+
+                if filtered_models or excluded_custom_keys:
+                    snap = build_effective_catalog_snapshot(
+                        filtered_models,
+                        excluded_custom_keys=excluded_custom_keys or None,
+                    )
+                    if snap and (snap.get("models") or excluded_custom_keys):
+                        facts["catalog_revision"] = snap["catalog_revision"]
+                        facts["effective_catalog_snapshot"] = snap
+            except Exception as _sub_snap_exc:
+                logger.debug(
+                    "[subagent_runs] catalog snapshot build skipped: %s",
+                    _sub_snap_exc,
+                )
 
     try:
         async with _ledger_connection(conn) as conn:

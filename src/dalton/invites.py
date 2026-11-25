@@ -228,12 +228,20 @@ async def get_user_tier(user_id: str | None, *, conn: Any = None) -> str:
 
 async def require_pm_for_invites(user_id: str | None) -> tuple[str, str]:
     """Verify caller is an authenticated internal member (`admin` or `internal`)."""
+    from src.dalton.auth_guards import (
+        raise_external_member_forbidden,
+        raise_invites_disabled_in_oss,
+    )
+    from src.dalton.settings import is_dalton_single_user_oss_mode
+
     uid = str(user_id or "").strip()
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
+    if is_dalton_single_user_oss_mode():
+        raise_invites_disabled_in_oss("单人模式下无需使用团队邀请")
     tier = await get_user_tier(uid)
     if tier not in ("admin", "internal"):
-        raise HTTPException(status_code=403, detail="仅内部成员可管理邀请链接")
+        raise_external_member_forbidden("仅内部成员可管理邀请链接")
     return uid, tier
 
 
@@ -488,10 +496,9 @@ async def create_invite_for_pm(
                 detail="邀请等级仅支持 external、internal 或 admin",
             )
         if target_tier != "external" and caller_tier != "admin":
-            raise HTTPException(
-                status_code=403,
-                detail="仅管理员可创建内部成员或管理员邀请链接",
-            )
+            from src.dalton.auth_guards import raise_admin_required
+
+            raise_admin_required("仅管理员可创建内部成员或管理员邀请链接")
     else:
         _require_invite_supabase_config()
         target_tier = "external"
@@ -977,6 +984,11 @@ async def redeem_invite_token(
     password: str,
 ) -> dict[str, Any]:
     """Redeem a single-use invite token (local single-transaction in ``local`` mode, Supabase two-phase otherwise)."""
+    from src.dalton.auth_guards import raise_invites_disabled_in_oss
+    from src.dalton.settings import is_dalton_single_user_oss_mode
+
+    if is_dalton_single_user_oss_mode():
+        raise_invites_disabled_in_oss("单人模式下无需使用团队邀请")
     if is_dalton_local_auth_enabled():
         return await _redeem_invite_token_local(
             token=token,

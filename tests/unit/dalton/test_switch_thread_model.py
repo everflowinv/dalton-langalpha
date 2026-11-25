@@ -740,7 +740,9 @@ async def test_run_pending_model_handoff_executes_and_clears_marker():
         outcome = await thread_model_handoff.run_pending_model_handoff(THREAD_ID)
 
     assert outcome == "completed"
-    handoff_spy.assert_awaited_once_with(THREAD_ID, USER_ID, "claude-sonnet-5-5")
+    handoff_spy.assert_awaited_once_with(
+        THREAD_ID, USER_ID, "claude-sonnet-5-5", source_system_only=False
+    )
     clear_spy.assert_awaited_once_with(
         THREAD_ID,
         thread_model_svc.PENDING_MODEL_HANDOFF_KEY,
@@ -1258,7 +1260,9 @@ async def test_pending_handoff_uses_marker_previous_model_after_patch_switch():
         outcome = await thread_model_handoff.run_pending_model_handoff(THREAD_ID)
 
     assert outcome == "completed"
-    deferred_handoff_spy.assert_awaited_once_with(THREAD_ID, USER_ID, "m-a")
+    deferred_handoff_spy.assert_awaited_once_with(
+        THREAD_ID, USER_ID, "m-a", source_system_only=False
+    )
     clear_spy.assert_awaited_once_with(
         THREAD_ID,
         thread_model_svc.PENDING_MODEL_HANDOFF_KEY,
@@ -1319,7 +1323,9 @@ async def test_pending_handoff_falls_back_to_alt_source_when_primary_has_nothing
         outcome = await thread_model_handoff.run_pending_model_handoff(THREAD_ID)
 
     assert outcome == "completed"
-    handoff_spy.assert_awaited_once_with(THREAD_ID, USER_ID, "gpt-6.2-sol")
+    handoff_spy.assert_awaited_once_with(
+        THREAD_ID, USER_ID, "gpt-6.2-sol", source_system_only=False
+    )
     clear_spy.assert_awaited_once_with(
         THREAD_ID,
         thread_model_svc.PENDING_MODEL_HANDOFF_KEY,
@@ -1380,7 +1386,9 @@ async def test_pending_handoff_tries_next_candidate_when_first_is_retryable():
         outcome = await thread_model_handoff.run_pending_model_handoff(THREAD_ID)
 
     assert outcome == "completed"
-    handoff_spy.assert_awaited_once_with(THREAD_ID, USER_ID, "gpt-6.2-sol")
+    handoff_spy.assert_awaited_once_with(
+        THREAD_ID, USER_ID, "gpt-6.2-sol", source_system_only=False
+    )
 
 
 @pytest.mark.asyncio

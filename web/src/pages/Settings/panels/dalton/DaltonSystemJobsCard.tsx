@@ -4,9 +4,8 @@ import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { Disclosure } from '@/components/ui/Disclosure';
 import { useLocale } from '@/hooks/useLocale';
-import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { useCapabilities } from '@/hooks/useCapabilities';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { formatTimestamp } from '@/lib/format';
 import type { DaltonSystemJobItem, DaltonSystemJobScope } from '@/pages/Settings/utils/daltonApi';
 import { useDaltonSystemJobs } from '../../hooks/useOpenClaw';
@@ -58,9 +57,8 @@ export function DaltonSystemJobsCard({
 } = {}) {
   const { t } = useTranslation();
   const locale = useLocale();
-  const { isPm, callerTier } = useTeamCredentials();
+  const { isAdmin } = useCallerIdentity();
   const { hasCapability } = useCapabilities();
-  const isAdmin = callerTier === 'admin' || (!isDaltonAuth && isPm);
   const showOpsJobs = isAdmin && hasCapability('data_jobs');
 
   const jobsQuery = useDaltonSystemJobs(true);

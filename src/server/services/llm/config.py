@@ -909,6 +909,37 @@ async def resolve_llm_config(
         if reads is not None:
             await cancel_and_join(reads)
 
+    # DALTON-HOOK(team-model-catalog): compare the live-resolved route against the
+    # interrupted run's snapshot BEFORE check_model_available / resolve_clients so any
+    # route/provider/credential/billing change refuses with 400 catalog_route_changed.
+    from contextlib import nullcontext
+
+    verified_resume_route = None
+    if slot == "primary":
+        from src.dalton.services.team_model_catalog.snapshot import (
+            bind_verified_resume_variant_binding,
+            get_active_resume_verify_target,
+            resolve_live_route_fingerprint,
+            verify_resume_route,
+        )
+
+        resume_target = get_active_resume_verify_target()
+        if resume_target is not None:
+            live_route = await resolve_live_route_fingerprint(
+                selection.effective_model,
+                user_id=user_id,
+                model_pref=model_pref,
+                ignore_custom_models=ignore_custom_models,
+            )
+            await verify_resume_route(
+                resume_target.run_id,
+                live_route,
+                thread_id=resume_target.thread_id or thread_id,
+                is_subagent=False,
+                run_row=resume_target.run_row,
+            )
+            verified_resume_route = live_route
+
     # The saved prefs, not the view: attribution asks whether the refused name
     # is one the user saved, and a dropped role may be that name.
     user_defined = await check_model_available(
@@ -943,16 +974,23 @@ async def resolve_llm_config(
     # language review, dedup) keep their own; models with no reasoning ladder are untouched.
     if slot == "background" and request_model is None and reasoning_effort is None:
         reasoning_effort = background_default_effort(model_pref, selection.effective_model)
-    await resolve_clients(
-        config, user_id, selection.effective_model, model_pref, roles,
-        is_byok=is_byok, thread_id=thread_id,
-        reasoning_effort=reasoning_effort,
-        fast_mode=fast_mode,
-        user_defined=user_defined,
-        policy=policy,
-        # DALTON-HOOK(workspace-dedup): forward ignore_custom_models only when requested.
-        **({"ignore_custom_models": True} if ignore_custom_models else {}),
-    )
+    # DALTON-HOOK(team-model-catalog): pin the verified catalog-variant binding across
+    # resolve_clients so a credential rotation/deletion in the TOCTOU window refuses with 400.
+    with (
+        bind_verified_resume_variant_binding(verified_resume_route)
+        if verified_resume_route is not None
+        else nullcontext()
+    ):
+        await resolve_clients(
+            config, user_id, selection.effective_model, model_pref, roles,
+            is_byok=is_byok, thread_id=thread_id,
+            reasoning_effort=reasoning_effort,
+            fast_mode=fast_mode,
+            user_defined=user_defined,
+            policy=policy,
+            # DALTON-HOOK(workspace-dedup): forward ignore_custom_models only when requested.
+            **({"ignore_custom_models": True} if ignore_custom_models else {}),
+        )
     # DALTON-HOOK(subagent-model-pin): only inspect subagents compiled for this
     # turn's role on the primary slot.
     demote_clientless(config, role=role, slot=slot)

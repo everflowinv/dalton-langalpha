@@ -19,7 +19,7 @@ Verifies the full Batch 3 surface under Standalone Core (`auth: oss`):
      (disabled platform skill removed, active Core + user skills preserved).
    - Zero proprietary terms in Core system/subagent prompts, static `<data_map>`,
      and `AutomationsBackend` README.
-   - All 29 Core-visible Dalton skills, `langalpha-doc`, `dalton-evidence`,
+   - All 30 Core-visible Dalton skills, `langalpha-doc`, `dalton-evidence`,
      live `list_skills()` descriptions, and all 6 workflows assemble cleanly
      with zero proprietary terms and pass `compile_check()` / `json.loads()`.
    - Core default coverage roster is empty; `share_pages.unavailable_page()`
@@ -351,7 +351,7 @@ def check_skills_and_workflows() -> dict[str, Any]:
         for name in dalton_registry.DALTON_SKILL_DEFINITIONS
         if dalton_registry.is_dalton_skill_enabled(name)
     )
-    assert len(enabled_skills) == 29, f"Expected 29 Core skills, got {len(enabled_skills)}"
+    assert len(enabled_skills) == 30, f"Expected 30 Core skills, got {len(enabled_skills)}"
     assert "dalton-13f-tracker" not in enabled_skills
     assert "dalton-bullbear-tracker" not in enabled_skills
 

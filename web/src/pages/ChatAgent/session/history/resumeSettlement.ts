@@ -8,7 +8,14 @@
 import type { AssistantMessage, ChatMessage } from '@/types/chat';
 import { handleHistoryToolCallResult } from './historyHandlers';
 import type { SSEEvent, HistoryInterruptInfo, PairState } from '../types';
-import { resolvePendingHistoryInterrupt, setCardStatus, setCardFields, settleProposalFromResult } from '../interrupts/buckets';
+import {
+  resolvePendingHistoryInterrupt,
+  setCardStatus,
+  setCardFields,
+  // DALTON-HOOK(cos-settings-tools): settle submitting workspace cards by tool_call_id in replay
+  settleLiveProposalFromResult,
+  settleProposalFromResult,
+} from '../interrupts/buckets';
 import {
   batchToolApprovalFields,
   readHitlDecisions,
@@ -138,6 +145,40 @@ export function settleResumedInterrupts(
       }
     }
   }
+
+  // --- DALTON-HOOK(cos-settings-tools): begin ---
+  // Settle create_workspace cards whose interrupt was already consumed by a
+  // resume turn so a reload while submitting shows "submitting" (never
+  // clickable pending buttons) until tool_call_result finalizes the outcome.
+  {
+    const resumedIds = event.metadata?.hitl_interrupt_ids as string[] | undefined;
+    const hitlAnswers = event.metadata?.hitl_answers as Record<string, unknown> | undefined;
+    const content = typeof event.content === 'string' ? event.content.trim() : '';
+    const batched = (resumedIds?.length || 0) > 1;
+    if (Array.isArray(resumedIds) && pendingHistoryInterrupts.length > 0) {
+      for (const interruptId of resumedIds) {
+        const idx = pendingHistoryInterrupts.findIndex(
+          (p) =>
+            p.type === 'create_workspace'
+            && p.interruptId === interruptId
+            && !!p.toolCallId,
+        );
+        if (idx === -1) continue;
+        const [matched] = pendingHistoryInterrupts.splice(idx, 1);
+        const answer = hitlAnswers ? hitlAnswers[interruptId] : undefined;
+        const rejected = answer === null || (answer === undefined && !!content && !batched);
+        rt.setMessages((prev) =>
+          setCardStatus(
+            prev,
+            'workspaceProposals',
+            matched.proposalId!,
+            rejected ? 'rejected' : 'submitting',
+          ),
+        );
+      }
+    }
+  }
+  // --- DALTON-HOOK(cos-settings-tools): end ---
 }
 
 /** Mark the resume cards of steered tasks "Updated". */
@@ -210,6 +251,10 @@ export function applyHistoryToolResult({ event, assistantMessageId, pairState, p
   }
 
   // Resolve pending create_workspace, start_question, ptc_agent, or secretary action interrupt from tool_call_result
-  settleProposalFromResult(pending, event.tool_call_id as string | undefined, event, setMessages);
+  const settled = settleProposalFromResult(pending, event.tool_call_id as string | undefined, event, setMessages);
+  // DALTON-HOOK(cos-settings-tools): finalize submitting workspace/secretary cards already marked by hitl_interrupt_ids
+  if (!settled && event.tool_call_id) {
+    setMessages((prev) => settleLiveProposalFromResult(prev, event.tool_call_id as string, event));
+  }
 }
 

@@ -351,6 +351,8 @@ def is_forbidden_for_roles(model_key: str | None) -> bool:
 
 def annotate_model_metadata_tool_calling(
     metadata: dict[str, Any],
+    *,
+    dalton_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Attach evidence-backed ``tool_calling`` booleans to ``/api/v1/models`` metadata.
 
@@ -388,7 +390,15 @@ def annotate_model_metadata_tool_calling(
             out[model_key] = entry
             continue
 
-        cap = resolved_cap.get(model_key)
+        cap: Any = None
+        if isinstance(dalton_meta, dict):
+            dm_entry = dalton_meta.get(model_key)
+            if isinstance(dm_entry, dict) and isinstance(dm_entry.get("tool_calling"), bool):
+                cap = dm_entry["tool_calling"]
+            elif isinstance(smoke_checks, dict) and smoke_checks.get("N3") == "pass":
+                cap = True
+        else:
+            cap = resolved_cap.get(model_key)
         if isinstance(cap, bool):
             updated = dict(entry)
             updated["tool_calling"] = cap

@@ -36,6 +36,7 @@ const h = vi.hoisted(() => ({
   callerTier: 'admin' as string | null,
   callerTierPending: false,
   callerTierError: false,
+  isConfirming: false,
   isPm: true,
 }));
 
@@ -68,6 +69,18 @@ vi.mock('@/config/daltonAuth', () => ({
 
 vi.mock('@/hooks/useTeamCredentials', () => ({
   TEAM_SHARED_CREDENTIALS_HINT: '',
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: h.isDaltonAuth ? 'team' : 'off',
+    enabled: h.isDaltonAuth,
+    holder_user_id: null,
+    credential_user_id: 'u-1',
+    is_pm: h.isPm,
+    can_disconnect: h.callerTier === 'admin' || (!h.isDaltonAuth && h.isPm),
+    can_invite: h.callerTier === 'admin' || h.callerTier === 'internal',
+    caller_tier: h.callerTier,
+    colleague_sharing_enabled: h.isDaltonAuth,
+    auth_mode: h.isDaltonAuth ? 'local' : 'oss',
+  })),
   useTeamCredentials: () => ({
     isShared: h.isDaltonAuth,
     canManage: h.callerTier === 'admin' || (!h.isDaltonAuth && h.isPm),
@@ -78,6 +91,49 @@ vi.mock('@/hooks/useTeamCredentials', () => ({
     callerTierPending: h.callerTierPending,
     callerTierError: h.callerTierError,
   }),
+}));
+
+vi.mock('@/hooks/useCallerIdentity', () => ({
+  useCallerIdentity: () => {
+    const buildSnapshot = () => {
+      const isSingleUserOss = !h.isDaltonAuth && h.isPm && !h.callerTierError && !h.callerTierPending;
+      const rawTier = isSingleUserOss ? 'admin' : h.callerTier;
+      const ready =
+        !h.callerTierPending &&
+        !h.callerTierError &&
+        (rawTier === 'admin' || rawTier === 'internal' || rawTier === 'external');
+      const tier = ready ? rawTier : 'unknown';
+      const isAdmin = ready && tier === 'admin';
+      const isInternal = ready && (tier === 'admin' || tier === 'internal');
+      return {
+        tier,
+        status: h.callerTierPending ? 'loading' : ready ? 'ready' : 'error',
+        authMode: isSingleUserOss ? 'oss' : ready ? 'local' : null,
+        isPlatform: false,
+        isKnown: ready,
+        isConfirming: h.callerTierPending || h.isConfirming,
+        isMultiUserAuth: h.isDaltonAuth && ready,
+        isSingleUserOss,
+        isAdmin,
+        isInternal,
+        isExternal: ready && tier === 'external',
+        canActAsOwner: isInternal,
+        canPublishPublic: isAdmin,
+        canInvite: !isSingleUserOss && isInternal,
+        isTeamCredentialsShared: h.isDaltonAuth,
+        canManageCredentials: isAdmin,
+        isPm: h.isPm,
+        colleagueSharingEnabled: false,
+      };
+    };
+    const snapshot = buildSnapshot();
+    return {
+      ...snapshot,
+      getLatestIdentity: () => buildSnapshot(),
+      isConfirmingNow: () => buildSnapshot().isConfirming,
+      revalidate: vi.fn(async () => undefined),
+    };
+  },
 }));
 
 vi.mock('react-i18next', () => ({
@@ -228,6 +284,7 @@ describe('DaltonDiscordChannelsCard', () => {
     h.callerTier = 'admin';
     h.callerTierPending = false;
     h.callerTierError = false;
+    h.isConfirming = false;
     h.isPm = true;
   });
 
@@ -742,28 +799,13 @@ describe('DaltonDiscordChannelsCard', () => {
     );
     expect(await screen.findByTestId('dalton-discord-channels-card')).toBeInTheDocument();
 
-    // 3. OSS local mode (isDaltonAuth=false, isPm=true, callerTier=null):
-    // must follow backend bindings user_tier rather than treating local user as admin
-    const ossClientNonAdmin = new QueryClient({
+    // 3. Single-user OSS mode (isDaltonAuth=false, isPm=true): useCallerIdentity grants single-user admin
+    const ossClientAdmin = new QueryClient({
       defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     });
     h.isDaltonAuth = false;
     h.callerTier = null;
     h.isPm = true;
-    h.fetchBindings.mockResolvedValue(makeBindings({ user_tier: 'external' }));
-    render(
-      <QueryClientProvider client={ossClientNonAdmin}>
-        <DaltonTeamOpsPanel />
-      </QueryClientProvider>,
-    );
-    await waitFor(() => {
-      expect(h.fetchBindings).toHaveBeenCalled();
-    });
-    expect(screen.queryAllByTestId('dalton-discord-channels-card')).toHaveLength(1); // only previous Dalton-auth admin render
-
-    const ossClientAdmin = new QueryClient({
-      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-    });
     h.fetchBindings.mockResolvedValue(makeBindings({ user_tier: 'admin' }));
     render(
       <QueryClientProvider client={ossClientAdmin}>
@@ -775,101 +817,125 @@ describe('DaltonDiscordChannelsCard', () => {
     });
   });
 
-  it('falls back to /channels/bindings user_tier when /credentials/status fails or omits caller_tier, and respects mismatched tiers', async () => {
+  it('fails closed without falling back to /channels/bindings user_tier when identity fails or is non-admin', async () => {
     const createClient = () =>
       new QueryClient({
         defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
       });
 
-    // 1. /credentials/status failed (callerTierError=true, callerTier=null), while /channels/bindings returns admin
+    // 1. /credentials/status failed (callerTierError=true, callerTier=null), even if /channels/bindings returns admin -> fail closed
     h.isDaltonAuth = true;
     h.userId = 'u-admin';
     h.callerTier = null;
     h.callerTierError = true;
     h.callerTierPending = false;
+    h.fetchBindings.mockClear();
     h.fetchBindings.mockResolvedValue(makeBindings({ user_tier: 'admin' }));
 
-    const fallbackClient = createClient();
-    const { result: errFallbackHook } = renderHook(() => useDaltonSettingsVisibility(), {
+    const failClosedClient = createClient();
+    const { result: errHook } = renderHook(() => useDaltonSettingsVisibility(), {
       wrapper: ({ children }) => (
-        <QueryClientProvider client={fallbackClient}>{children}</QueryClientProvider>
+        <QueryClientProvider client={failClosedClient}>{children}</QueryClientProvider>
       ),
     });
 
-    await waitFor(() => {
-      expect(errFallbackHook.current.callerTier).toBe('admin');
-      expect(errFallbackHook.current.discordChannelsAdmin).toBe(true);
-    });
-    expect(tierSatisfies(errFallbackHook.current.callerTier, SECTIONS.teamChannels.minTier)).toBe(true);
-    expect(searchableSettings(false, errFallbackHook.current).map((e) => e.anchor)).toContain(
+    expect(errHook.current.callerTier).toBeNull();
+    expect(errHook.current.discordChannelsAdmin).toBe(false);
+    expect(tierSatisfies(errHook.current.callerTier, SECTIONS.teamChannels.minTier)).toBe(false);
+    expect(searchableSettings(false, errHook.current).map((e) => e.anchor)).not.toContain(
       'dalton-discord-channels',
     );
+    expect(h.fetchBindings).not.toHaveBeenCalled();
 
-    render(
-      <QueryClientProvider client={fallbackClient}>
+    const { container: errContainer } = render(
+      <QueryClientProvider client={failClosedClient}>
         <DaltonTeamOpsPanel />
       </QueryClientProvider>,
     );
-    expect(await screen.findByTestId('dalton-discord-channels-card')).toBeInTheDocument();
+    expect(errContainer.querySelector('[data-testid="dalton-discord-channels-card"]')).toBeNull();
 
-    // 2. /credentials/status omits caller_tier (callerTierError=false, callerTier=null), while /channels/bindings returns admin
-    h.callerTier = null;
-    h.callerTierError = false;
-    const missingTierClient = createClient();
-    const { result: missingTierHook } = renderHook(() => useDaltonSettingsVisibility(), {
-      wrapper: ({ children }) => (
-        <QueryClientProvider client={missingTierClient}>{children}</QueryClientProvider>
-      ),
-    });
-
-    await waitFor(() => {
-      expect(missingTierHook.current.callerTier).toBe('admin');
-      expect(missingTierHook.current.discordChannelsAdmin).toBe(true);
-    });
-
-    // 3. Mismatch: /credentials/status says admin, /channels/bindings says internal -> fail closed for card & search
-    h.callerTier = 'admin';
-    h.callerTierError = false;
-    h.fetchBindings.mockResolvedValue(makeBindings({ user_tier: 'internal' }));
-    const mismatchAdminClient = createClient();
-    const { result: mismatchAdminHook } = renderHook(() => useDaltonSettingsVisibility(), {
-      wrapper: ({ children }) => (
-        <QueryClientProvider client={mismatchAdminClient}>{children}</QueryClientProvider>
-      ),
-    });
-
-    await waitFor(() => {
-      expect(mismatchAdminHook.current.discordChannelsAdmin).toBe(false);
-    });
-    expect(searchableSettings(false, mismatchAdminHook.current).map((e) => e.anchor)).not.toContain(
-      'dalton-discord-channels',
-    );
-
-    const { container: mismatchContainer } = render(
-      <QueryClientProvider client={mismatchAdminClient}>
-        <DaltonTeamOpsPanel />
-      </QueryClientProvider>,
-    );
-    await waitFor(() => {
-      expect(
-        mismatchContainer.querySelector('[data-testid="dalton-discord-channels-card"]'),
-      ).toBeNull();
-    });
-
-    // 4. Mismatch: /credentials/status says internal, /channels/bindings says admin -> do not escalate card/search
+    // 2. Identity says internal even if /channels/bindings returns admin -> stays internal, never escalates
     h.callerTier = 'internal';
     h.callerTierError = false;
     h.fetchBindings.mockResolvedValue(makeBindings({ user_tier: 'admin' }));
-    const mismatchInternalClient = createClient();
-    const { result: mismatchInternalHook } = renderHook(() => useDaltonSettingsVisibility(), {
+    const internalClient = createClient();
+    const { result: internalHook } = renderHook(() => useDaltonSettingsVisibility(), {
       wrapper: ({ children }) => (
-        <QueryClientProvider client={mismatchInternalClient}>{children}</QueryClientProvider>
+        <QueryClientProvider client={internalClient}>{children}</QueryClientProvider>
       ),
     });
 
-    await waitFor(() => {
-      expect(mismatchInternalHook.current.callerTier).toBe('internal');
-      expect(mismatchInternalHook.current.discordChannelsAdmin).toBe(false);
+    expect(internalHook.current.callerTier).toBe('internal');
+    expect(internalHook.current.discordChannelsAdmin).toBe(false);
+  });
+
+  it('disables add/rename controls during isConfirming and blocks mutations when getLatestIdentity() downgrades before save', async () => {
+    h.isConfirming = true;
+    h.fetchBindings.mockResolvedValue(makeBindings());
+
+    const { unmount } = renderCard();
+    expect(await screen.findByTestId('dalton-discord-channel-id-input')).toBeDisabled();
+    expect(screen.getByTestId('dalton-discord-channel-add-btn')).toBeDisabled();
+    expect(screen.getByTestId('dalton-discord-channel-rename-1528743490555740230')).toBeDisabled();
+    unmount();
+
+    // If identity downgrades while verify is in flight, runChannelMutation blocks the mutation synchronously.
+    h.isConfirming = false;
+    let resolveVerify!: (res: DaltonDiscordChannelVerifyResponse) => void;
+    h.verifyChannel.mockImplementationOnce(
+      () =>
+        new Promise<DaltonDiscordChannelVerifyResponse>((resolve) => {
+          resolveVerify = resolve;
+        }),
+    );
+
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
     });
+    const view = render(
+      <QueryClientProvider client={client}>
+        <DaltonDiscordChannelsCard />
+      </QueryClientProvider>,
+    );
+    fireEvent.change(await screen.findByTestId('dalton-discord-channel-id-input'), {
+      target: { value: '1481256083589697566' },
+    });
+    fireEvent.click(screen.getByTestId('dalton-discord-channel-add-btn'));
+    await waitFor(() => expect(h.verifyChannel).toHaveBeenCalledTimes(1));
+
+    // Identity starts confirming / downgrades before verify resolves.
+    h.isConfirming = true;
+    resolveVerify({
+      ok: true,
+      verified: true,
+      reason: null,
+      channel_id: '1481256083589697566',
+      channel_name: 'research-reports',
+      detail: null,
+    });
+
+    await waitFor(() =>
+      expect(screen.getByTestId('dalton-discord-channel-add-btn')).toHaveTextContent(
+        'dalton.discordChannels.addButton',
+      ),
+    );
+    expect(screen.getByTestId('dalton-discord-channel-add-btn')).toBeDisabled();
+    expect(h.mutateDiscordChannel).not.toHaveBeenCalled();
+
+    // Stale rename save click after identity downgrades is also blocked synchronously.
+    h.isConfirming = false;
+    view.rerender(
+      <QueryClientProvider client={client}>
+        <DaltonDiscordChannelsCard />
+      </QueryClientProvider>,
+    );
+    fireEvent.click(screen.getByTestId('dalton-discord-channel-rename-1528743490555740230'));
+    fireEvent.change(
+      screen.getByTestId('dalton-discord-channel-rename-input-1528743490555740230'),
+      { target: { value: 'New Name' } },
+    );
+    h.callerTier = 'internal';
+    fireEvent.click(screen.getByTestId('dalton-discord-channel-rename-save-1528743490555740230'));
+    expect(h.mutateDiscordChannel).not.toHaveBeenCalled();
   });
 });

@@ -408,6 +408,14 @@ export interface WorkspaceProposalState {
   duplicate_workspace_id?: string;
   duplicate_workspace_name?: string;
   duplicate_check_unavailable?: boolean;
+  // DALTON-HOOK(cos-settings-tools): confirmation snapshot fields, tool_call_id correlation, and failure info
+  computer_id?: string | null;
+  computer_name?: string | null;
+  computer_is_own_machine?: boolean;
+  bootstrap_cloud_primary?: boolean;
+  tool_call_id?: string;
+  failure_code?: string;
+  failure_error?: string;
   interruptId?: string;
 }
 
@@ -459,6 +467,10 @@ export interface SecretaryActionProposalState {
   workspace_id?: string;
   workspace_name?: string | null;
   thread_id?: string;
+  // DALTON-HOOK(cos-settings-tools): tool_call_id correlation and failure info
+  tool_call_id?: string;
+  failure_code?: string;
+  failure_error?: string;
   interruptId?: string;
 }
 

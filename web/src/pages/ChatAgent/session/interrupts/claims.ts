@@ -145,6 +145,10 @@ export function claimedCardFields(
       ? { status: 'skipped' }
       : { status: 'answered', answer: typeof claim.answer === 'string' ? claim.answer : null };
   }
+  // DALTON-HOOK(cos-settings-tools): keep create/archive cards in 'submitting' until tool_call_result confirms outcome
+  if (type === 'create_workspace' || type === 'archive_workspace') {
+    return { status: verdict === 'approved' ? 'submitting' : 'rejected' };
+  }
   // Every proposal family and tool approval share the one pair of names.
   return { status: verdict };
 }

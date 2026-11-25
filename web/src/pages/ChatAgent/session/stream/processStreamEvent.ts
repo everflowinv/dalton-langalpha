@@ -58,7 +58,8 @@ import { SCHEDULE_WAKEUP, wakeTurnOpener, withLiveWakeRow } from '../wakeupEvent
 import type {
   SSEEvent, StreamProcessorRefs, ModelStatus,
 } from '../types';
-import { setCardFields, settleProposalFromResult } from '../interrupts/buckets';
+// DALTON-HOOK(cos-settings-tools): import settleLiveProposalFromResult for live 4-state settlement by tool_call_id
+import { setCardFields, settleLiveProposalFromResult, settleProposalFromResult } from '../interrupts/buckets';
 import { projectLiveInterrupt } from '../interrupts/fromLiveEvent';
 import { BrowserUseWatch } from './browserUse';
 import type { StreamRuntime } from '../runtime';
@@ -1225,6 +1226,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       if (unresolvedList) {
         settleProposalFromResult(unresolvedList, event.tool_call_id as string | undefined, event, rt.setMessages);
       }
+      // DALTON-HOOK(cos-settings-tools): settle live submitting/pending workspace & secretary cards by tool_call_id
+      rt.setMessages((prev) => settleLiveProposalFromResult(prev, event.tool_call_id as string | undefined, event));
 
       const toolCallId = event.tool_call_id as string;
 

@@ -6,8 +6,8 @@ import { useInfiniteQuery, useQuery, useQueryClient, type QueryClient } from '@t
 import { SwapCell } from '@/components/ui/crossfade';
 import { apiErrorStatus } from '@/api/errors';
 import { useAuth } from '@/contexts/AuthContext';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { useHomeTimezone } from '@/hooks/useHomeTimezone';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
 import { ListError, ListSkeleton } from '@/components/mcp/McpPrimitives';
 import { queryKeys } from '@/lib/queryKeys';
@@ -193,7 +193,8 @@ function laterConflictVersion(
 export default function Automations() {
   const { t } = useTranslation();
   const { userId } = useAuth();
-  const { callerTier, callerTierPending, callerTierError } = useTeamCredentials();
+  const identity = useCallerIdentity();
+  const callerTierPending = identity.status === 'loading';
   const { automations, loading, loaded, error } = useAutomations();
   const lastCount = useLastShape('automations.count', loaded ? automations.length : null);
   const {
@@ -263,12 +264,13 @@ export default function Automations() {
     manageSettled.current = false;
   }
 
+  // DALTON-HOOK(company-automations): hide company automation views from external members based on caller identity
   const manageOn = view === 'manage';
   // External members never see the company group. Wait for the tier before asking, so that
   // request is not sent and then hidden. A failed credentials read is the same: hide the group
-  // and skip both company requests until a later read says internal or admin. An unset tier
-  // with no error is OSS mode, which still asks.
-  const companyHiddenByTier = callerTier === 'external' || Boolean(callerTierError);
+  // and skip both company requests until a later read says internal or admin. Platform and
+  // single-user OSS modes resolve as internal and still ask.
+  const companyHiddenByTier = !identity.isInternal;
   const companyReadsOn = manageOn && !callerTierPending && !companyHiddenByTier;
   const companyQuery = useAutomationReadList({
     scope: 'company',

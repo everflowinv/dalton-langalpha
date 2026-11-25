@@ -950,6 +950,13 @@ def is_dalton_supabase_auth_enabled() -> bool:
     return app_settings.HOST_MODE == "oss" and get_dalton_auth_mode() == "supabase"
 
 
+def is_dalton_single_user_oss_mode() -> bool:
+    """显式单人回环模式：HOST_MODE == 'oss' 且 DALTON_AUTH_MODE == 'oss'。"""
+    from src.config import settings as app_settings
+
+    return app_settings.HOST_MODE == "oss" and get_dalton_auth_mode() == "oss"
+
+
 def is_dalton_auth_enabled() -> bool:
     """Whether Dalton multi-user authentication (``supabase`` or ``local``) is active in OSS mode."""
     return is_dalton_supabase_auth_enabled() or is_dalton_local_auth_enabled()
@@ -981,11 +988,7 @@ def is_dalton_multiuser_auth_enabled() -> bool:
     Used for public share link & artifact publish role checks independent of
     the colleague workspace sharing capability switch.
     """
-    if is_dalton_supabase_auth_enabled():
-        return True
-    from src.config import settings as app_settings
-
-    return app_settings.HOST_MODE == "oss" and get_dalton_auth_mode() == "local"
+    return is_dalton_supabase_auth_enabled() or is_dalton_local_auth_enabled()
 
 
 def get_disabled_providers() -> set[str]:
@@ -1202,6 +1205,11 @@ def get_internal_service_token() -> str:
     return os.getenv("INTERNAL_SERVICE_TOKEN", "").strip()
 
 
+def get_dalton_transcription_token() -> str:
+    """Return ``DALTON_TRANSCRIPTION_TOKEN`` from environment (empty string if unset)."""
+    return os.getenv("DALTON_TRANSCRIPTION_TOKEN", "").strip()
+
+
 def get_dalton_transcription_ticket_secret() -> str:
     """Return ``DALTON_TRANSCRIPTION_TICKET_SECRET`` from environment (empty string if unset)."""
     return os.getenv("DALTON_TRANSCRIPTION_TICKET_SECRET", "").strip()
@@ -1234,8 +1242,9 @@ def managed_secret_token_values() -> tuple[str, ...]:
     """Non-empty values of the management tokens that must never reach a sandbox.
 
     ``DALTON_BRIDGE_ADMIN_TOKEN`` (the host bridge's admin credential),
-    ``INTERNAL_SERVICE_TOKEN`` (the backend's service-to-service credential), and
-    ``DALTON_TRANSCRIPTION_TICKET_SECRET`` (the transcription ticket signing secret).
+    ``INTERNAL_SERVICE_TOKEN`` (the backend's service-to-service credential),
+    ``DALTON_TRANSCRIPTION_TICKET_SECRET`` (the transcription ticket signing secret),
+    and ``DALTON_TRANSCRIPTION_TOKEN`` (the standalone transcription service token).
     Any may be unset; only the non-empty ones are checked, so one missing
     never disables the others' scrub.
     """
@@ -1245,6 +1254,7 @@ def managed_secret_token_values() -> tuple[str, ...]:
             get_dalton_bridge_admin_token(),
             get_internal_service_token(),
             get_dalton_transcription_ticket_secret(),
+            get_dalton_transcription_token(),
         )
         if t
     )
@@ -1489,6 +1499,135 @@ def sanitize_mcp_client_config_server(
             entry["args"] = []
 
     return entry
+
+
+def has_explicit_transcription_service_url() -> bool:
+    """Return True when ``DALTON_TRANSCRIPTION_SERVICE_URL`` is explicitly configured."""
+    explicit = os.getenv("DALTON_TRANSCRIPTION_SERVICE_URL", "").strip()
+    return bool(explicit and not (explicit.startswith("${") and explicit.endswith("}")))
+
+
+def resolve_connector_env_defaults(
+    profile: DeploymentProfile | None = None,
+) -> dict[str, str]:
+    """Return deployment-profile default service URLs for split connector services.
+
+    - ``DeploymentProfile.CORE``: standalone Compose service DNS name on ``core_internal`` / ``sandbox-net``.
+    - ``DeploymentProfile.EVERFLOW``: legacy host bridge (`:8960`) until cutover explicitly sets
+      ``DALTON_TRANSCRIPTION_SERVICE_URL`` + ``DALTON_TRANSCRIPTION_TOKEN`` in ``.env``.
+    """
+    active = resolve_profile() if profile is None else profile
+    if active is DeploymentProfile.CORE:
+        return {
+            "DALTON_TRANSCRIPTION_SERVICE_URL": "http://transcription:8965",
+        }
+    return {
+        "DALTON_TRANSCRIPTION_SERVICE_URL": "http://host.docker.internal:8960",
+    }
+
+
+def get_dalton_transcription_service_url(host: str | None = None) -> str:
+    """Return the transcription service base URL, or ``""`` when transcription capability is off."""
+    from urllib.parse import urlparse, urlunparse
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.TRANSCRIPTION):
+        return ""
+    profile = resolve_profile()
+    in_docker = os.path.exists("/.dockerenv")
+    def _normalize_endpoint_url(
+        raw_url: str,
+        *,
+        default_host: str,
+        rewrite_loopback_in_docker: bool,
+    ) -> str:
+        expanded = raw_url.replace("{HOST_IP}", default_host).rstrip("/")
+        parsed = urlparse(expanded)
+        if parsed.scheme and parsed.hostname:
+            if host is not None:
+                target_host = host
+            elif (
+                rewrite_loopback_in_docker
+                and in_docker
+                and parsed.hostname.lower() in ("127.0.0.1", "localhost", "::1")
+            ):
+                target_host = HOST_IP or "host.docker.internal"
+            else:
+                target_host = None
+            if target_host:
+                host_part = (
+                    f"[{target_host}]"
+                    if ":" in target_host and not target_host.startswith("[")
+                    else target_host
+                )
+                netloc = f"{host_part}:{parsed.port}" if parsed.port else host_part
+                return urlunparse(
+                    (
+                        parsed.scheme,
+                        netloc,
+                        parsed.path,
+                        parsed.params,
+                        parsed.query,
+                        parsed.fragment,
+                    )
+                ).rstrip("/")
+        return expanded
+
+    if has_explicit_transcription_service_url():
+        explicit = os.getenv("DALTON_TRANSCRIPTION_SERVICE_URL", "").strip()
+        default_host = host or (HOST_IP if in_docker else "127.0.0.1") or "127.0.0.1"
+        return _normalize_endpoint_url(
+            explicit,
+            default_host=default_host,
+            rewrite_loopback_in_docker=profile is DeploymentProfile.EVERFLOW,
+        )
+
+    if profile is DeploymentProfile.EVERFLOW:
+        # Before cutover, follow the exact legacy bridge URL resolution rules
+        # (`DALTON_BRIDGE_URL` -> `DALTON_RESEARCHDATA_URL` origin -> `DALTON_BRIDGE_PORT`)
+        # so deployments using a custom bridge port keep working without hardcoding `:8960`.
+        fallback_host = host or HOST_IP or "host.docker.internal"
+        explicit_bridge = os.getenv("DALTON_BRIDGE_URL", "").strip()
+        if explicit_bridge and not (
+            explicit_bridge.startswith("${") and explicit_bridge.endswith("}")
+        ):
+            bridge_default_host = (
+                host or (HOST_IP if in_docker else "127.0.0.1") or "127.0.0.1"
+            )
+            return _normalize_endpoint_url(
+                explicit_bridge,
+                default_host=bridge_default_host,
+                rewrite_loopback_in_docker=True,
+            )
+        raw_rd_url = os.getenv("DALTON_RESEARCHDATA_URL", "").strip()
+        if raw_rd_url and not (raw_rd_url.startswith("${") and raw_rd_url.endswith("}")):
+            expanded_rd = raw_rd_url.replace("{HOST_IP}", fallback_host)
+            origin = _extract_bridge_origin_from_url(expanded_rd, host_override=host)
+            if origin:
+                return _normalize_endpoint_url(
+                    origin,
+                    default_host=fallback_host,
+                    rewrite_loopback_in_docker=True,
+                )
+
+    defaults = resolve_connector_env_defaults(profile)
+    default_url = defaults["DALTON_TRANSCRIPTION_SERVICE_URL"]
+    if profile is DeploymentProfile.EVERFLOW:
+        default_port = "8960"
+        port = os.getenv("DALTON_BRIDGE_PORT", default_port).strip() or default_port
+    else:
+        default_port = "8965"
+        port = os.getenv("DALTON_TRANSCRIPTION_PORT", default_port).strip() or default_port
+    if host is not None:
+        host_part = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        return f"http://{host_part}:{port}"
+    if profile is DeploymentProfile.EVERFLOW and not in_docker and HOST_IP:
+        return f"http://{HOST_IP}:{port}"
+    if port != default_port:
+        parsed_def = urlparse(default_url)
+        if parsed_def.scheme and parsed_def.hostname:
+            return f"{parsed_def.scheme}://{parsed_def.hostname}:{port}"
+    return default_url.rstrip("/")
 
 
 def get_dalton_bridge_base_url(host: str | None = None) -> str:

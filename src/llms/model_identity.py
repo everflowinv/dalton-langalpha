@@ -57,6 +57,26 @@ def catalog_model(client: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+# DALTON-HOOK(team-model-catalog): report whether a built client came from a
+# personal custom model config without mutating LLM.get_llm()'s metadata keys.
+def client_is_custom_model(client: Any) -> bool | None:
+    """Whether a built LLM client came from a personal custom model.
+
+    Returns ``True`` when stamped ``is_custom_model=True`` (``LLM.from_custom_config``),
+    ``False`` when built by ``LLM.get_llm()`` (carries ``manifest_model`` or
+    ``billing_type``) without ``is_custom_model=True``, and ``None`` when the
+    client carries no factory metadata (e.g. a bare test stub or ``None``).
+    """
+    metadata = getattr(client, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    if "is_custom_model" in metadata:
+        return bool(metadata["is_custom_model"])
+    if metadata.get("manifest_model") or metadata.get("billing_type"):
+        return False
+    return None
+
+
 def client_effort(client: Any) -> str | None:
     """The reasoning level a built client sends, as ``LLM.get_llm()`` stamped
     it: stepped down from the request where the model's ladder is shorter, so

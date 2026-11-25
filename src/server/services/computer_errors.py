@@ -196,6 +196,16 @@ class ComputerPreparingError(RuntimeError):
     """
 
 
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+class ComputerArchivingError(RuntimeError):
+    """The computer is currently being archived and cannot accept new workspaces."""
+
+
+class ApprovalScopeChangedError(RuntimeError):
+    """The confirmed target computer or workspace scope changed before execution."""
+# --- DALTON-HOOK(cos-settings-tools): end ---
+
+
 class ComputerRemovalRefused(RuntimeError):
     """The computer stays, for a reason its owner can act on.
 

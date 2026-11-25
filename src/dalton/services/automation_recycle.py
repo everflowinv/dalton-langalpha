@@ -741,11 +741,18 @@ async def restore_automation(
     """Restore one soft-deleted automation. None when the owner filter misses."""
     from src.dalton.autonomy.classification import is_managed_unit_automation
     from src.dalton.coverage.units import lock_and_assert_managed_unit_write_allowed
+    from src.dalton.database.team_model_catalog import acquire_catalog_shared_lock
+    from src.dalton.services.team_model_catalog.service import (
+        assert_model_not_retired_under_lock,
+    )
     from src.dalton.settings import is_coverage_units_enabled
 
     units_on = (not company) and is_coverage_units_enabled()
     async with get_db_connection(conn) as db:
         async with db.transaction():
+            # Outermost catalog shared lock (before coverage units, prefs, and automation row lock)
+            if hasattr(db, "execute"):
+                await acquire_catalog_shared_lock(db)
             pref_owner = owner_user_id or COMPANY_SYSTEM_USER_ID
             pre_unit_ws: str | None = None
             if units_on:
@@ -801,6 +808,21 @@ async def restore_automation(
             current = int(row.get("config_version") or 1)
             if expected_config_version != current:
                 _version_conflict(expected_config_version, current)
+            if row.get("llm_model"):
+                restore_pref_bag = (
+                    prefs.get("model_preference")
+                    if isinstance(prefs, Mapping)
+                    and isinstance(prefs.get("model_preference"), Mapping)
+                    else None
+                )
+                await assert_model_not_retired_under_lock(
+                    db,
+                    row.get("llm_model"),
+                    field="llm_model",
+                    user_id=str(row.get("user_id") or pref_owner) if not company else None,
+                    model_pref=restore_pref_bag,
+                    allow_custom=(not company),
+                )
             desired = str(row.get("pre_delete_desired_status") or "paused")
             if desired not in ("active", "paused"):
                 desired = "paused"
@@ -959,11 +981,18 @@ async def rollback_automation(
     cache_user_id: str | None = None
     from src.dalton.autonomy.classification import is_managed_unit_automation
     from src.dalton.coverage.units import lock_and_assert_managed_unit_write_allowed
+    from src.dalton.database.team_model_catalog import acquire_catalog_shared_lock
+    from src.dalton.services.team_model_catalog.service import (
+        assert_model_not_retired_under_lock,
+    )
     from src.dalton.settings import is_coverage_units_enabled
 
     units_on = (not company) and is_coverage_units_enabled()
     async with get_db_connection(conn) as db:
         async with db.transaction():
+            # Outermost catalog shared lock (before coverage units, prefs, and automation row lock)
+            if hasattr(db, "execute"):
+                await acquire_catalog_shared_lock(db)
             pref_owner = owner_user_id or COMPANY_SYSTEM_USER_ID
             pre_unit_ws: str | None = None
             if units_on:
@@ -1049,6 +1078,15 @@ async def rollback_automation(
 
             snap_custom = custom_model_names(dict(pref_bag)) if pref_bag else frozenset()
             snapshot = _require_complete_snapshot(raw_snapshot, custom_models=snap_custom)
+            if snapshot.get("llm_model"):
+                await assert_model_not_retired_under_lock(
+                    db,
+                    snapshot.get("llm_model"),
+                    field="llm_model",
+                    user_id=str(row.get("user_id") or pref_owner) if not company else None,
+                    model_pref=pref_bag,
+                    allow_custom=(not company),
+                )
             if str(row.get("scope") or "") == "company":
                 snapshot["delivery_config"] = {}
             trigger = str(snapshot["trigger_type"])

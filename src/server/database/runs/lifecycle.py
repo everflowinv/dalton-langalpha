@@ -596,6 +596,36 @@ async def start_run(
                         conn=conn,
                     )
 
+                # DALTON-HOOK(team-model-catalog): persist turn-scoped effective_catalog_snapshot
+                # (including pricing, modalities, reasoning, fixed route, bound_base_url & key_fingerprint)
+                run_metadata = dict(metadata or {})
+                if "effective_catalog_snapshot" not in run_metadata:
+                    try:
+                        from src.dalton.services.team_model_catalog.snapshot import (
+                            build_effective_catalog_snapshot,
+                        )
+
+                        snap_candidates: list[str] = []
+                        if run_metadata.get("model_source") != "custom":
+                            for mk_field in ("model", "llm_model", "main_model"):
+                                val = run_metadata.get(mk_field)
+                                if isinstance(val, str) and val.strip():
+                                    snap_candidates.append(val.strip())
+                        fb_list = run_metadata.get("fallback_models")
+                        if isinstance(fb_list, list):
+                            snap_candidates.extend(
+                                str(x).strip() for x in fb_list if isinstance(x, str) and x.strip()
+                            )
+                        if snap_candidates:
+                            snap = build_effective_catalog_snapshot(snap_candidates)
+                            if snap and snap.get("models"):
+                                run_metadata["catalog_revision"] = snap["catalog_revision"]
+                                run_metadata["effective_catalog_snapshot"] = snap
+                    except Exception as _snap_exc:
+                        logger.debug(
+                            "[turn_lifecycle] catalog snapshot build skipped: %s", _snap_exc
+                        )
+
                 async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute(
                         """
@@ -611,7 +641,7 @@ async def start_run(
                             run_id,
                             thread_id,
                             turn_index,
-                            SafeJson(metadata or {}),
+                            SafeJson(run_metadata),  # DALTON-HOOK(team-model-catalog)
                             created_at,
                             attempt_no,
                             retry_of_run_id,

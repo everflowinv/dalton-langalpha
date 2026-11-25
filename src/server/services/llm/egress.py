@@ -39,13 +39,16 @@ import httpx2
 import openai
 from fastapi import HTTPException
 
-from src.llms.llm import CONNECTION_PARAM_KEYS, ENDPOINT_PARAM_KEYS, param_levels
+from src.llms.llm import CONNECTION_PARAM_KEYS, ENDPOINT_PARAM_KEYS, LLM, param_levels
 from src.server.utils.egress_guard import (
     EgressBlockedError,
     EgressResolutionError,
     resolve_public_ips,
     resolve_public_ips_sync,
 )
+
+# DALTON-HOOK(team-model-catalog): track unmodified LLM.get_model_config so operator endpoint checks avoid sync DB I/O
+_DEFAULT_GET_MODEL_CONFIG_FUNC = LLM.get_model_config.__func__
 
 PRIVATE_ADDRESS = "it points to a private or reserved address. Use a public URL."
 UNRESOLVED = "its host could not be resolved. Check the URL."
@@ -128,13 +131,39 @@ def is_operator_endpoint(url: str) -> bool:
 
     if is_operator_allowlisted_endpoint(url):
         return True
-    from src.llms.llm import LLM
+    # DALTON-HOOK(team-model-catalog): resolve providers without sync DB/socket I/O on MainThread;
+    # catalog-defined variants are never operator endpoints so in-memory/static manifest suffices.
+    from src.dalton.llm.overlay import (
+        _has_disk_overlay_test_override,
+        _in_upstream_raw_manifest_test,
+    )
+
+    if (
+        getattr(LLM.get_model_config, "__func__", None) is not _DEFAULT_GET_MODEL_CONFIG_FUNC
+        or _in_upstream_raw_manifest_test()
+        or _has_disk_overlay_test_override()
+    ):
+        mc = LLM.get_model_config()
+    else:
+        from src.dalton.services.team_model_catalog.compiled import (
+            get_cached_compiled_catalog_no_io,
+            get_compiled_catalog_sync,
+        )
+
+        cached = get_cached_compiled_catalog_no_io()
+        if cached is not None and cached.model_config is not None:
+            mc = cached.model_config
+        elif LLM._model_config is not None:
+            mc = LLM._model_config
+        else:
+            mc = get_compiled_catalog_sync(allow_db=False).model_config
 
     return any(
         info.get("base_url") == url
         and not info.get("platform")
+        and info.get("catalog_defined") is not True  # DALTON-HOOK(team-model-catalog): exclude catalog variants from operator endpoint exemption
         and info.get("access_type") != "local"
-        for info in LLM.get_model_config().flat_providers.values()
+        for info in mc.flat_providers.values()
     )
 
 

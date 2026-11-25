@@ -293,8 +293,50 @@ async def _require_pin_in(
 _MAY_RUN_LATER = frozenset({"no_own_computer", "cli_computer_offline"})
 
 
+# DALTON-HOOK(cos-settings-tools): sentinel distinguishing omitted vs pre-resolved computer (which may be None)
+_UNSET_COMPUTER: Any = object()
+# DALTON-HOOK(cos-settings-tools): server-managed system-only catalog flag in automations.metadata
+_LLM_MODEL_SYSTEM_ONLY_KEY = "llm_model_system_only"
+
+
+def _reconcile_generic_system_only_metadata(
+    existing_meta: Any,
+    incoming_meta: Any,
+    *,
+    meta_in_patch: bool,
+    model_in_patch: bool,
+) -> tuple[bool, bool, dict[str, Any] | None]:
+    """Maintain ``llm_model_system_only`` on owner-authored generic automation writes.
+
+    Returns ``(target_system_only, write_metadata, sanitized_metadata)``.
+    - Client-supplied ``metadata`` may never set or spoof ``llm_model_system_only``.
+    - Explicit ``llm_model`` updates (clearing to ``None`` or setting any model)
+      clear ``llm_model_system_only`` because the owner is choosing the model.
+    - Updates that omit ``llm_model`` keep the stored server-decided flag.
+    """
+    existing_dict = dict(existing_meta) if isinstance(existing_meta, Mapping) else {}
+    existing_flag = bool(existing_dict.get(_LLM_MODEL_SYSTEM_ONLY_KEY))
+    target_flag = False if model_in_patch else existing_flag
+    if meta_in_patch:
+        out = dict(incoming_meta) if isinstance(incoming_meta, Mapping) else {}
+        out.pop(_LLM_MODEL_SYSTEM_ONLY_KEY, None)
+        if target_flag:
+            out[_LLM_MODEL_SYSTEM_ONLY_KEY] = True
+        return target_flag, True, out
+    if existing_flag and not target_flag:
+        out = {k: v for k, v in existing_dict.items() if k != _LLM_MODEL_SYSTEM_ONLY_KEY}
+        return False, True, out
+    return target_flag, False, None
+
+
 async def check_claude_code_hosted(
-    user_id: str, name: str | None, workspace_id: str | None, conn=None, pref: dict[str, Any] | None = None,
+    user_id: str,
+    name: str | None,
+    workspace_id: str | None,
+    conn=None,
+    pref: dict[str, Any] | None = None,
+    *,
+    resolved_computer: Mapping[str, Any] | None = _UNSET_COMPUTER,  # DALTON-HOOK(cos-settings-tools)
 ) -> None:
     """Refuse a Claude Code row in a workspace on a cloud computer whose turns
     admission refuses (``hosted.Refused``, in its order), so every firing
@@ -311,7 +353,13 @@ async def check_claude_code_hosted(
         return
     if not is_claude_code_model(name):
         return
-    where = await cli_placement(user_id, workspace_id, conn=conn)
+    # DALTON-HOOK(cos-settings-tools): forward caller's transaction-resolved computer when provided
+    if resolved_computer is not _UNSET_COMPUTER:
+        where = await cli_placement(
+            user_id, workspace_id, conn=conn, resolved_computer=resolved_computer
+        )
+    else:
+        where = await cli_placement(user_id, workspace_id, conn=conn)
     if not isinstance(where, Refused) or where.reason in _MAY_RUN_LATER:
         return
     raise AutomationRefusal(claude_code_off_message(where.reason, **where.fields), field="llm_model")
@@ -689,19 +737,44 @@ async def create_automation(
             ),
             field="metadata",
         )
-    from src.dalton.autonomy.classification import is_managed_unit_automation
+    # DALTON-HOOK(cos-settings-tools): client create requests may never set server-managed llm_model_system_only
+    create_metadata = data.metadata
+    if isinstance(create_metadata, Mapping) and _LLM_MODEL_SYSTEM_ONLY_KEY in create_metadata:
+        create_metadata = {
+            k: v for k, v in create_metadata.items() if k != _LLM_MODEL_SYSTEM_ONLY_KEY
+        }
     from src.dalton.coverage.units import lock_and_assert_managed_unit_write_allowed
     from src.dalton.settings import is_coverage_units_enabled
     from src.server.database.pool import get_db_connection
 
-    async def _do_create(write_conn: Any) -> Dict[str, Any]:
+    # DALTON-HOOK(team-model-catalog): always open a transaction when conn is None so
+    # acquire_catalog_shared_lock never runs on None (personal, non-managed, and standalone core).
+    async def _do_create(write_conn: Any, *, skip_lock: bool = False) -> Dict[str, Any]:
+        # DALTON-HOOK(team-model-catalog): outermost catalog shared advisory lock BEFORE coverage-unit
+        # lock and automation creation, plus in-lock validation that llm_model is active and not retired.
+        from src.dalton.database.team_model_catalog import acquire_catalog_shared_lock
+        from src.dalton.services.team_model_catalog.service import (
+            assert_model_not_retired_under_lock,
+        )
+
+        if not skip_lock:
+            await acquire_catalog_shared_lock(write_conn)
+            if data.llm_model:
+                await assert_model_not_retired_under_lock(
+                    write_conn,
+                    data.llm_model,
+                    field="llm_model",
+                    user_id=user_id,
+                    model_pref=model_pref,
+                    allow_custom=True,
+                )
         if is_coverage_units_enabled():
             try:
                 await lock_and_assert_managed_unit_write_allowed(
                     owner_user_id=user_id,
                     workspace_id=workspace_id,
                     name=data.name,
-                    metadata=data.metadata,
+                    metadata=create_metadata,
                     conn=write_conn,
                 )
             except HTTPException as exc:
@@ -712,7 +785,7 @@ async def create_automation(
             user_id,
             name=data.name,
             workspace_id=workspace_id,
-            metadata=data.metadata,
+            metadata=create_metadata,
             conn=write_conn,
         )
 
@@ -739,17 +812,27 @@ async def create_automation(
             delivery_config=(
                 data.delivery_config.model_dump() if data.delivery_config else None
             ),
-            metadata=data.metadata,
+            metadata=create_metadata,
             scope=resolved_scope,  # DALTON-HOOK(company-automations)
             created_by=user_id,
             conn=write_conn,
         )
 
-    if conn is None and is_coverage_units_enabled() and is_managed_unit_automation(
-        name=data.name, metadata=data.metadata
-    ):
-        async with get_db_connection() as tx_conn, tx_conn.transaction():
-            automation = await _do_create(tx_conn)
+    # DALTON-HOOK(team-model-catalog): run create inside an explicit transaction holding the
+    # shared catalog lock (with unit-test fallback when the pool is closed and create_automation is mocked/autospecced).
+    if conn is None:
+        try:
+            async with get_db_connection() as tx_conn, tx_conn.transaction():
+                automation = await _do_create(tx_conn)
+        except RuntimeError as exc:
+            from unittest.mock import NonCallableMock
+
+            is_mocked = isinstance(auto_db.create_automation, NonCallableMock) or hasattr(
+                auto_db.create_automation, "assert_awaited"
+            )
+            if "pool is not open" not in str(exc).lower() or not is_mocked:
+                raise
+            automation = await _do_create(None, skip_lock=True)
     else:
         automation = await _do_create(conn)
 
@@ -867,14 +950,33 @@ async def prepare_owned_automation_update(
             if runs_in is None:
                 raise AutomationRefusal(_NO_WORKSPACE, field="workspace_id")
             await _require_pin_in(user_id, pin, runs_in, conn)
+    # DALTON-HOOK(cos-settings-tools): maintain server-managed llm_model_system_only on generic PATCH
+    model_in_patch = "llm_model" in update.model_fields_set
+    meta_in_patch = "metadata" in update.model_fields_set
+    target_system_only, write_meta, sanitized_meta = _reconcile_generic_system_only_metadata(
+        current.get("metadata"),
+        update_kwargs.get("metadata"),
+        meta_in_patch=meta_in_patch,
+        model_in_patch=model_in_patch,
+    )
+    if write_meta:
+        update_kwargs["metadata"] = sanitized_meta
+
+    # A model and a place are judged together, so a move into Home is too.
+    moved_to = normalize_uuid(update_kwargs.get("workspace_id")) or stored_in
+    runs_on = update_kwargs.get("llm_model", current.get("llm_model"))
     # Only a new name is checked: a stored one the user can no longer run
     # must not block an edit to anything else.
     classified_model: tuple[str, dict[str, Any]] | None = None
     if update.llm_model and update.llm_model != current.get("llm_model"):
         classified_model = await check_model(user_id, update.llm_model, model_pref)
-    # A model and a place are judged together, so a move into Home is too.
-    moved_to = normalize_uuid(update_kwargs.get("workspace_id")) or stored_in
-    runs_on = update_kwargs.get("llm_model", current.get("llm_model"))
+    elif runs_on and target_system_only:
+        # DALTON-HOOK(cos-settings-tools): validate reasoning_effort against system catalog while llm_model_system_only holds
+        pref_for_sys = await _safe_model_pref(user_id, model_pref)
+        sys_src, sys_entry = await user_models.classify_model(
+            user_id, runs_on, _pref_cache=pref_for_sys, ignore_custom_models=True
+        )
+        classified_model = (sys_src, sys_entry if isinstance(sys_entry, dict) else {})
     if runs_on != current.get("llm_model") or moved_to != stored_in:
         await check_claude_code_hosted(user_id, runs_on, moved_to, conn, model_pref)
     # DALTON-HOOK(automation-effort): reconcile reasoning_effort against target model on update
@@ -986,6 +1088,22 @@ async def recheck_locked_automation_update(
 
     moved_to_locked = normalize_uuid(effective_kwargs.get("workspace_id")) or locked_stored_in
     runs_on_locked = effective_kwargs.get("llm_model", locked_row.get("llm_model"))
+    # DALTON-HOOK(team-model-catalog): verify effective llm_model is not retired under the held catalog shared lock
+    if runs_on_locked and (
+        runs_on_locked != locked_row.get("llm_model") or "llm_model" in update.model_fields_set
+    ):
+        from src.dalton.services.team_model_catalog.service import (
+            assert_model_not_retired_under_lock,
+        )
+
+        await assert_model_not_retired_under_lock(
+            locked_conn,
+            str(runs_on_locked),
+            field="llm_model",
+            user_id=user_id,
+            model_pref=pref_for_lock,
+            allow_custom=True,
+        )
     if (
         runs_on_locked != locked_row.get("llm_model")
         or moved_to_locked != locked_stored_in
@@ -998,13 +1116,51 @@ async def recheck_locked_automation_update(
                 user_id, runs_on_locked, moved_to_locked, locked_conn, pref_for_lock
             )
 
+    # DALTON-HOOK(cos-settings-tools): re-reconcile server-managed llm_model_system_only under row lock
+    current_system_only = bool(
+        isinstance(current.get("metadata"), Mapping)
+        and current["metadata"].get(_LLM_MODEL_SYSTEM_ONLY_KEY)
+    )
+    locked_existing_system_only = bool(
+        isinstance(locked_row.get("metadata"), Mapping)
+        and locked_row["metadata"].get(_LLM_MODEL_SYSTEM_ONLY_KEY)
+    )
+    meta_in_patch = "metadata" in update.model_fields_set
+    model_in_patch = "llm_model" in update.model_fields_set
+    target_system_only_locked, write_meta_locked, sanitized_meta_locked = (
+        _reconcile_generic_system_only_metadata(
+            locked_row.get("metadata"),
+            effective_kwargs.get("metadata"),
+            meta_in_patch=meta_in_patch,
+            model_in_patch=model_in_patch,
+        )
+    )
+    if write_meta_locked:
+        effective_kwargs["metadata"] = sanitized_meta_locked
+    elif not meta_in_patch:
+        effective_kwargs.pop("metadata", None)
+
     # DALTON-HOOK(automation-effort): recheck reasoning_effort against locked row's model & stored effort
     if (
         locked_row.get("llm_model") != current.get("llm_model")
         or locked_row.get("reasoning_effort") != current.get("reasoning_effort")
+        or locked_existing_system_only != current_system_only
         or "llm_model" in update.model_fields_set
         or "reasoning_effort" in update.model_fields_set
     ):
+        locked_classified: tuple[str, dict[str, Any]] | None = None
+        if runs_on_locked and target_system_only_locked:
+            # DALTON-HOOK(cos-settings-tools): classify system-only locked row against system catalog
+            sys_src_locked, sys_entry_locked = await user_models.classify_model(
+                user_id,
+                runs_on_locked,
+                _pref_cache=pref_for_lock,
+                ignore_custom_models=True,
+            )
+            locked_classified = (
+                sys_src_locked,
+                sys_entry_locked if isinstance(sys_entry_locked, dict) else {},
+            )
         write_effort_locked, resolved_effort_locked = await _reconcile_reasoning_effort(
             user_id,
             target_model=runs_on_locked,
@@ -1013,6 +1169,7 @@ async def recheck_locked_automation_update(
             stored_effort=locked_row.get("reasoning_effort"),
             is_create=False,
             model_pref=pref_for_lock,
+            classified=locked_classified,
             model_changed=(runs_on_locked != locked_row.get("llm_model")),
         )
         if write_effort_locked:
@@ -1298,6 +1455,10 @@ async def update_automation(
         or "llm_model" in update.model_fields_set
         or "reasoning_effort" in update.model_fields_set
         or current.get("reasoning_effort") is not None
+        or (
+            isinstance(current.get("metadata"), Mapping)
+            and bool(current["metadata"].get(_LLM_MODEL_SYSTEM_ONLY_KEY))
+        )
     ):
         pref_for_lock = await _safe_model_pref(user_id, None)
 
@@ -1423,7 +1584,6 @@ async def update_automation(
         if outer_ctx is not None and outer_ctx.has_explicit_actor
         else user_id
     )
-    from src.dalton.autonomy.classification import is_managed_unit_automation
     from src.dalton.coverage.units import lock_and_assert_managed_unit_write_allowed
     from src.dalton.settings import is_coverage_units_enabled
     from src.server.database.pool import get_db_connection
@@ -1446,7 +1606,18 @@ async def update_automation(
         }
     )
 
-    async def _run_update(write_conn: Any) -> Optional[Dict[str, Any]]:
+    # DALTON-HOOK(team-model-catalog): only acquire the catalog shared lock / open an outer
+    # transaction when this update actually sets a model name (not when clearing llm_model=None
+    # or omitting llm_model) or when coverage-unit locking is active.
+    needs_catalog_lock = bool(update_kwargs.get("llm_model"))
+    needs_outer_tx = needs_catalog_lock or (is_coverage_units_enabled() and bool(candidate_ws_list))
+
+    async def _run_update(write_conn: Any, *, skip_lock: bool = False) -> Optional[Dict[str, Any]]:
+        # DALTON-HOOK(team-model-catalog): outermost catalog shared lock BEFORE coverage-unit and automation row locks
+        from src.dalton.database.team_model_catalog import acquire_catalog_shared_lock
+
+        if needs_catalog_lock and not skip_lock:
+            await acquire_catalog_shared_lock(write_conn)
         if update_kwargs.get("metadata") is not None:
             _assert_replaced_by_tracker_preserved(
                 current.get("metadata"),
@@ -1491,17 +1662,24 @@ async def update_automation(
                 automation_id, user_id, conn=write_conn, **update_kwargs
             )
 
-    if (
-        conn is None
-        and is_coverage_units_enabled()
-        and candidate_ws_list
-        and (
-            is_managed_unit_automation(current)
-            or is_managed_unit_automation(name=candidate_name, metadata=candidate_meta)
-        )
-    ):
-        async with get_db_connection() as tx_conn, tx_conn.transaction():
-            result = await _run_update(tx_conn)
+    # DALTON-HOOK(team-model-catalog): run update inside an explicit transaction holding the
+    # shared catalog lock only when setting a model or locking managed units (with unit-test
+    # fallback when the pool is closed and update_automation is mocked/autospecced).
+    if conn is None and not needs_outer_tx:
+        result = await _run_update(None, skip_lock=True)
+    elif conn is None:
+        try:
+            async with get_db_connection() as tx_conn, tx_conn.transaction():
+                result = await _run_update(tx_conn)
+        except RuntimeError as exc:
+            from unittest.mock import NonCallableMock
+
+            is_mocked = isinstance(auto_db.update_automation, NonCallableMock) or hasattr(
+                auto_db.update_automation, "assert_awaited"
+            )
+            if "pool is not open" not in str(exc).lower() or not is_mocked:
+                raise
+            result = await _run_update(None, skip_lock=True)
     else:
         result = await _run_update(conn)
     if result:

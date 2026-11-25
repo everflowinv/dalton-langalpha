@@ -28,6 +28,7 @@ import { parseFragment, type FileLocation, type OpenFileHandler } from '../utils
 import FileHeaderActions from './FileHeaderActions';
 import { useDownloadState, workspaceDownloadKey } from '../utils/downloadNotice';
 import { withCopy } from '@/i18n'; // DALTON-HOOK(monitors)
+import { useCallerIdentity } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(external-share-guard)
 import './FilePanel.css';
 
 const ExportPreviewModal = React.lazy(() => import('./ExportPreviewModal'));
@@ -335,22 +336,32 @@ function FilePanel({
   // from the DB mirror: an rw colleague is no more the workspace's owner than
   // a ro one, so the owner's file grant would only be refused. The owner
   // alone (and never an external member) gets the owner access.
-  // DALTON-HOOK(external-share-guard): an external member is no artifact
-  // owner either — the publish entry and comment UI stay hidden.
+  // DALTON-HOOK(external-share-guard): an external, unknown-tier, or revalidating member is
+  // not granted owner artifact write/comment controls until identity is confirmed.
+  const identity = useCallerIdentity();
+  const effectiveCallerTier =
+    callerTier !== null && callerTier !== undefined
+      ? callerTier
+      : identity.isPlatform
+        ? null
+        : identity.status === 'ready' && !identity.isConfirming
+          ? identity.tier
+          : 'unknown';
+  const isNonOwnerTier = effectiveCallerTier === 'external' || effectiveCallerTier === 'unknown';
   const access = useMemo<PanelAccess>(
     () => (servePrefix
       ? { kind: 'share', servePrefix }
-      : teamReadOnly || callerTier === 'external'
+      : teamReadOnly || isNonOwnerTier
         ? { kind: 'readOnly', ...(teamReadOnly ? { mirror: true } : {}) }
         : readOnly || !workspaceId
           ? { kind: 'readOnly' }
           : { kind: 'owner' }),
-    [servePrefix, readOnly, teamReadOnly, workspaceId, callerTier],
+    [servePrefix, readOnly, teamReadOnly, workspaceId, isNonOwnerTier],
   );
   // DALTON-HOOK(monitors): external members cannot use comment/public-share UI,
-  // but in their own editable workspace they can publish 'own' monitors.
+  // but in their own editable workspace they can publish 'own' monitors; unknown tier waits fail-closed.
   const canPublishMonitor =
-    !servePrefix && !teamReadOnly && !readOnly && !threadReadOnly && !!workspaceId;
+    !servePrefix && !teamReadOnly && !readOnly && !threadReadOnly && !!workspaceId && effectiveCallerTier !== 'unknown';
 
   const { body, loading: fileLoading, error: readError, readAt, refetch } = useFileBody({
     cache, path: selectedFile, workspaceStatus: wsData?.status,
@@ -997,9 +1008,13 @@ function FilePanel({
               readFileFullFn={readFileFullFn}
               access={access}
               openPublish={fileComments.openPublish}
-              // DALTON-HOOK(external-share-guard): external members may stop a
-              // public link but never start one.
-              openUnshareOnly={callerTier === 'external' ? (path) => setUnshareTarget(path) : null}
+              // DALTON-HOOK(external-share-guard): allow workspace owners (including internal/admin and
+              // external/unknown-tier callers) to stop a public link or historical public monitor from the header.
+              openUnshareOnly={
+                !servePrefix && !teamReadOnly && !readOnly && !!workspaceId
+                  ? (path) => setUnshareTarget(path)
+                  : null
+              }
               artifactDoc={fileComments.doc ?? (readOnlyHtmlDoc.tabId === activeTab.id ? readOnlyHtmlDoc.path : null)}
               // DALTON-HOOK(mobile-web): allow mobile HTML More menu to open a linked in-frame document as its own tab
               onOpenDocAsTab={(docPath) => { void openFileAt(docPath, { pin: true }); }}

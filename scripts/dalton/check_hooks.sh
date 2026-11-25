@@ -478,6 +478,10 @@ ALLOWED_HOOKS=(
   # Per-automation reasoning_effort field (d042), shared write/snapshot/file paths,
   # executor/continuation/wakeup/fallback inheritance, and MoreOptions effort selector.
   "automation-effort"
+  # Team model catalog (d051): versioned DB catalog overlay, turn effective_catalog_snapshot
+  # persistence/backfill, catalog variant credential isolation & Fake-IP/HeldTransport egress
+  # guard, outermost retire advisory lock ordering, and catalog revision headers.
+  "team-model-catalog"
   # Prompt audit v2 & CoS audit v2 wording/copy fixes across upstream templates,
   # backend READMEs, tool descriptions, and langalpha-doc.
   "prompt-audit-text"
@@ -498,6 +502,8 @@ ALLOWED_HOOKS=(
   # BrowserViewer touch scroll + on-demand keyboard button.
   # Mobile web P1: compact top bar, bottom bar overflow, coarse-pointer Enter, phone More menu, publish/share/settings layouts.
   "mobile-web"
+  # Channel sandbox link rewriting: preserve validated ?redirect= deep links across login in App.tsx.
+  "channel-links"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

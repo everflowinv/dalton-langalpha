@@ -18,6 +18,7 @@ import {
   extractSafeLogErrorFields,
   sanitizeLogErrorCode,
 } from "./shared/logger.js";
+import { rewriteSandboxLinks } from "./shared/sandbox-links.js";
 import {
   type AgentSendFileOutcome,
   type AgentSendFileRef,
@@ -143,6 +144,7 @@ export interface FirstCurrentDeliveryInfo {
 export class DeliveryService {
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
+  private readonly webBaseUrl: string;
   private readonly logger = createSubsystemLogger("delivery-service");
   private readonly retryDelayFn: (
     ms: number,
@@ -169,6 +171,7 @@ export class DeliveryService {
   constructor(options: {
     backend: BackendClient;
     adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
+    webBaseUrl?: string;
     onFirstCurrentDelivery?: (info: FirstCurrentDeliveryInfo) => void;
     onWeixinAccountRotated?: (info: {
       accountId?: string | null;
@@ -181,6 +184,7 @@ export class DeliveryService {
   }) {
     this.backend = options.backend;
     this.adapters = options.adapters;
+    this.webBaseUrl = (options.webBaseUrl ?? "").trim().replace(/\/+$/, "");
     this.onWeixinAccountRotated = options.onWeixinAccountRotated;
     this.retryDelayFn = options.retryDelayFn ?? abortableRetrySleep;
     this.preflightRetryMaxElapsedMs =
@@ -440,13 +444,30 @@ export class DeliveryService {
       };
     }
 
+    const outboundText = hasNonEmptyText
+      ? rewriteSandboxLinks(rawText, this.webBaseUrl, options.threadId)
+      : rawText;
+    const hasOutboundText = outboundText.trim().length > 0;
+
+    if (!hasOutboundText && files.length === 0) {
+      return {
+        status: "failed",
+        code: null,
+        address: options.target ?? null,
+        current: options.target === undefined || options.target === null,
+        duplicate: false,
+        message: "Both text and files are empty; nothing to send.",
+        files: [],
+      };
+    }
+
     // Preliminary chunk count (refined once platform is known from I-6)
     const preliminaryPlat = this.inferPlatform(options.platform, options.target);
     const preliminaryAdapter = preliminaryPlat ? this.adapters.get(preliminaryPlat) : undefined;
-    const preliminaryChunks = hasNonEmptyText
+    const preliminaryChunks = hasOutboundText
       ? preliminaryAdapter
-        ? preliminaryAdapter.splitTextChunks(rawText)
-        : [rawText]
+        ? preliminaryAdapter.splitTextChunks(outboundText)
+        : [outboundText]
       : [];
 
     let claim: I6AuthorizeAndClaimResponse;
@@ -462,8 +483,8 @@ export class DeliveryService {
         platform: preliminaryPlat ?? options.platform ?? null,
         target: options.target ?? null,
         inbound_message_id: options.inboundMessageId ?? null,
-        has_non_empty_text: hasNonEmptyText,
-        total_chunks: Math.max(preliminaryChunks.length, hasNonEmptyText ? 1 : 0),
+        has_non_empty_text: hasOutboundText,
+        total_chunks: Math.max(preliminaryChunks.length, hasOutboundText ? 1 : 0),
         source_scope_key: options.sourceScopeKey ?? options.threadScopeKey ?? null,
         source_generation: options.sourceGeneration ?? null,
         activity_origin: options.activityOrigin ?? null,
@@ -625,7 +646,7 @@ export class DeliveryService {
       return failResp;
     }
 
-    const chunks = hasNonEmptyText ? adapter.splitTextChunks(rawText) : [];
+    const chunks = hasOutboundText ? adapter.splitTextChunks(outboundText) : [];
     const totalChunks = chunks.length;
     if (totalChunks !== preliminaryChunks.length) {
       await recordProgress({

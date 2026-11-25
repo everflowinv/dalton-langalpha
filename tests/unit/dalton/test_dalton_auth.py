@@ -939,7 +939,7 @@ class TestSwitchOnDaltonSupabaseAuth:
             "_settle_against_branch",
             create_autospec(
                 msg_mod._settle_against_branch,
-                side_effect=lambda _tid, r, _uid: r,
+                side_effect=lambda _tid, r, _uid, **_kw: r,
             ),
         )
         monkeypatch.setattr(setup_mod, "agent_config", object(), raising=False)

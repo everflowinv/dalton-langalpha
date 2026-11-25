@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, create_autospec  # DALTON-HOOK(team-model-catalog)
 from uuid import UUID
 
 import pytest
@@ -93,6 +93,16 @@ def db(monkeypatch) -> FakeAutomationsDb:
     monkeypatch.setattr(lifecycle, "settings", MagicMock(AUTOMATION_WEBHOOK_URL="https://hooks.example.com/x"))
     monkeypatch.setattr(lifecycle, "user_models", models)
     monkeypatch.setattr(lifecycle, "get_configured_llm_models", lambda: {"vendor": ["model-b", "model-a"]})
+    # DALTON-HOOK(team-model-catalog): align in-lock catalog check with this fixture's synthetic
+    # model catalog ("model-a", "model-b", "my-local") so FakeAutomationsDb tests stay self-contained
+    # without hitting the real disk manifest (unknown models are still refused by check_model above).
+    from src.dalton.services.team_model_catalog import service as tmc_service
+
+    monkeypatch.setattr(
+        tmc_service,
+        "assert_model_not_retired_under_lock",
+        create_autospec(tmc_service.assert_model_not_retired_under_lock, return_value=None),
+    )
     for name in ("create_automation", "update_automation", "pause_automation", "resume_automation"):
         monkeypatch.setattr(lifecycle, name, AsyncMock(wraps=getattr(lifecycle, name)))
     return db

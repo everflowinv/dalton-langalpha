@@ -774,7 +774,11 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
         *,
         parsed: Document | None = None,
     ) -> None:
-        """Acquire ``dalton_coverage_units FOR SHARE`` in sorted order before ``file.lock``."""
+        """Acquire catalog shared lock and ``dalton_coverage_units FOR SHARE`` in sorted order before ``file.lock``."""
+        # DALTON-HOOK(team-model-catalog): outermost catalog shared lock before coverage-unit and user-automation locks
+        from src.dalton.database.team_model_catalog import acquire_catalog_shared_lock
+
+        await acquire_catalog_shared_lock(conn)
         from uuid import UUID
 
         from src.dalton.autonomy.classification import is_managed_unit_automation
@@ -823,6 +827,10 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
             await get_active_unit_by_workspace(ws_id, conn=conn, for_share=True)
 
     async def lock(self, user_id: str, conn: Any) -> None:
+        # DALTON-HOOK(team-model-catalog): ensure outermost catalog shared lock is held before lock_user_automations
+        from src.dalton.database.team_model_catalog import acquire_catalog_shared_lock
+
+        await acquire_catalog_shared_lock(conn)
         await auto_db.lock_user_automations(user_id, conn=conn)
 
     async def parse(self, user_id: str, call: CallContext, content: str, served: str | None) -> Document:

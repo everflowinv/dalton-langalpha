@@ -97,7 +97,7 @@ class CapabilityId(StrEnum):
     TMTB = "tmtb"  # TMT 总结库（依赖 researchdata_bridge）
     FUNDA_AI = "funda_ai"  # FUNDA AI 研究库（依赖 researchdata_bridge）
     FEISHU_DOCS = "feishu_docs"  # 飞书文档/知识空间读写（依赖 researchdata_bridge）
-    TRANSCRIPTION = "transcription"  # 语音转写（依赖 researchdata_bridge + 转写专用存储）
+    TRANSCRIPTION = "transcription"  # 语音转写（独立转写服务 + 转写专用存储）
     CHANNEL_GATEWAY = "channel_gateway"  # 多渠道网关总开关
     CHANNEL_FEISHU = "channel_feishu"  # 飞书卡片与群绑定（依赖 channel_gateway）
     CHANNEL_DISCORD = "channel_discord"  # Discord 频道与私信（依赖 channel_gateway）
@@ -195,8 +195,8 @@ _RAW_CAPABILITY_SPECS: tuple[CapabilitySpec, ...] = (
     ),
     CapabilitySpec(
         id=CapabilityId.TRANSCRIPTION,
-        description="语音转写（依赖 researchdata_bridge + 转写专用存储）",
-        depends_on=(CapabilityId.RESEARCHDATA_BRIDGE,),
+        description="语音转写（独立转写服务 + 转写专用存储）",
+        depends_on=(),
         everflow_default=False,
         core_default=False,
         legacy_env_vars=("DALTON_TRANSCRIPTION_ENABLED",),
@@ -875,6 +875,7 @@ BACKGROUND_LOOP_REGISTRY: Mapping[str, CapabilityId | None] = MappingProxyType(
         "dalton-transcription-reconcile": CapabilityId.TRANSCRIPTION,
         "dalton-data-task-scheduler": CapabilityId.DATA_JOBS,
         "dalton-chat-upload-cleanup": CORE_CAPABILITY,
+        "dalton-team-model-catalog-follow": CORE_CAPABILITY,
         # Filtered by filter_reconnectable_builtin_mcp (skips disabled servers like researchdata)
         "mcp-builtin-reconnect": CORE_CAPABILITY,
         # Upstream core platform background tasks & services
@@ -915,6 +916,22 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("router.py", "sync_native_models_endpoint"): CapabilityId.NATIVE_OAUTH_SYNC,
         ("router.py", "retire_native_models_endpoint"): CapabilityId.NATIVE_OAUTH_SYNC,
         ("router.py", "restore_native_models_endpoint"): CapabilityId.NATIVE_OAUTH_SYNC,
+        # Team Model Catalog (d051, CORE_CAPABILITY for both Everflow and Standalone Core)
+        ("router.py", "get_team_models_catalog_endpoint"): CORE_CAPABILITY,
+        ("router.py", "create_team_model_endpoint"): CORE_CAPABILITY,
+        ("router.py", "create_team_provider_variant_endpoint"): CORE_CAPABILITY,
+        ("router.py", "update_team_provider_variant_endpoint"): CORE_CAPABILITY,
+        ("router.py", "update_team_curated_setup_endpoint"): CORE_CAPABILITY,
+        ("router.py", "list_team_model_revisions_endpoint"): CORE_CAPABILITY,
+        ("router.py", "get_team_model_revision_endpoint"): CORE_CAPABILITY,
+        ("router.py", "rollback_team_models_endpoint"): CORE_CAPABILITY,
+        ("router.py", "test_call_team_model_endpoint"): CORE_CAPABILITY,
+        ("router.py", "resolve_team_legacy_import_endpoint"): CORE_CAPABILITY,
+        ("router.py", "update_team_model_endpoint"): CORE_CAPABILITY,
+        ("router.py", "set_team_model_visibility_endpoint"): CORE_CAPABILITY,
+        ("router.py", "retire_team_model_endpoint"): CORE_CAPABILITY,
+        ("router.py", "restore_team_model_endpoint"): CORE_CAPABILITY,
+        ("router.py", "restore_team_model_default_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_providers_status_endpoint"): CORE_CAPABILITY,
         ("router.py", "probe_provider_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_available_models_endpoint"): CORE_CAPABILITY,
@@ -932,8 +949,8 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("router.py", "update_workspace_settings_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_user_sharing_settings_endpoint"): CORE_CAPABILITY,
         ("router.py", "update_user_sharing_settings_endpoint"): CapabilityId.COLLEAGUE_SHARING,
-        ("router.py", "get_user_settings_endpoint"): CORE_CAPABILITY,
-        ("router.py", "update_user_settings_endpoint"): CORE_CAPABILITY,
+        ("router.py", "get_user_settings_endpoint"): CapabilityId.CONVERSATION_ARCHIVE,
+        ("router.py", "update_user_settings_endpoint"): CapabilityId.CONVERSATION_ARCHIVE,
         ("router.py", "get_team_credentials_status_endpoint"): CORE_CAPABILITY,
         ("router.py", "list_knowledge_versions_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_knowledge_version_endpoint"): CORE_CAPABILITY,

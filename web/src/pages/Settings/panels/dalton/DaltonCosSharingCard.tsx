@@ -1,8 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { api } from '@/api/client';
+import { apiErrorDetail, formatApiErrorDetail, isForbiddenError, isNotFoundError } from '@/api/errors';
 import { isDaltonAuth } from '@/config/daltonAuth';
-import { hasRequiredCapability, type CapabilityId } from '@/hooks/useCapabilities';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
+import { hasRequiredCapability, useCapabilities, type CapabilityId } from '@/hooks/useCapabilities';
 import { queryKeys } from '@/lib/queryKeys';
 import { SettingRow } from '@/pages/Settings/components/SettingsLayout';
 import { ToggleSwitch } from '@/components/ui/switch';
@@ -86,10 +88,17 @@ export function DaltonCosSharingCard({
 }) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const identity = useCallerIdentity();
+  const { hasCapability } = useCapabilities();
+  const colleagueSharingEnabled = ctx?.capabilities
+    ? hasRequiredCapability(ctx.capabilities, 'colleague_sharing')
+    : hasCapability('colleague_sharing');
+  const allowed =
+    colleagueSharingEnabled &&
+    identity.isInternal &&
+    (ctx ? canShowDaltonCosSharingCard(ctx) : true);
 
-  const { data, isLoading, error } = useUserCosSharingQuery(
-    ctx ? canShowDaltonCosSharingCard(ctx) : true,
-  );
+  const { data, isLoading, error } = useUserCosSharingQuery(allowed);
 
   const mutation = useMutation({
     mutationFn: (payload: { cos_rw_enabled: boolean }) =>
@@ -98,14 +107,28 @@ export function DaltonCosSharingCard({
       queryClient.setQueryData(queryKeys.dalton.userSharing(), updated);
       void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.team() });
     },
+    onError: (err) => {
+      if (isForbiddenError(err)) {
+        void identity.revalidate();
+      }
+      if (isNotFoundError(err)) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.capabilities() });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.userSharing() });
+      }
+    },
   });
 
-  if (data?.colleague_dispatch_enabled === false || data?.caller_tier === 'external') {
+  if (
+    !allowed ||
+    data?.colleague_dispatch_enabled === false ||
+    isNotFoundError(error) ||
+    isNotFoundError(mutation.error)
+  ) {
     return null;
   }
 
   const enabled = data?.cos_rw_enabled === true;
-  const canEdit = data?.can_edit !== false;
+  const canEdit = data?.can_edit !== false && identity.status === 'ready' && !identity.isConfirming;
   const notices = [
     t('dalton.cosSharing.notice1'),
     t('dalton.cosSharing.notice2'),
@@ -113,7 +136,17 @@ export function DaltonCosSharingCard({
   ];
 
   const handleToggle = (checked: boolean) => {
-    if (isLoading || mutation.isPending || !canEdit) return;
+    const latest = identity.getLatestIdentity();
+    if (
+      isLoading ||
+      mutation.isPending ||
+      !canEdit ||
+      latest.isConfirming ||
+      latest.status !== 'ready' ||
+      !latest.isInternal
+    ) {
+      return;
+    }
     mutation.mutate({ cos_rw_enabled: checked });
   };
 
@@ -139,9 +172,11 @@ export function DaltonCosSharingCard({
       }
       below={
         <div className="space-y-2 mt-2">
-          {mutation.isError && (
+          {mutation.isError && !isNotFoundError(mutation.error) && (
             <DaltonInlineNotice tone="error" testId="dalton-cos-sharing-error">
-              {t('dalton.common.saveFailed')}
+              {isForbiddenError(mutation.error) && apiErrorDetail(mutation.error) != null
+                ? formatApiErrorDetail(mutation.error)
+                : t('dalton.common.saveFailed')}
             </DaltonInlineNotice>
           )}
           <DaltonInlineNotice tone="info">

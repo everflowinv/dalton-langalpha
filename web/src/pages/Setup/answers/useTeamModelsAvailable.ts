@@ -8,6 +8,7 @@ import { isDaltonAuth } from '@/config/daltonAuth';
 import type { DaltonDeploymentProfile } from '@/config/daltonSetup';
 import { AuthContext } from '@/contexts/AuthContext';
 import type { ConfiguredProvider } from '@/hooks/useConfiguredProviders';
+import { fetchTeamCredentialsStatus } from '@/hooks/useTeamCredentials';
 import { queryKeys } from '@/lib/queryKeys';
 import type { AccountPolicy } from '@/types/api';
 
@@ -65,7 +66,7 @@ function useDaltonTeamModelsAvailableImpl(
 
   const creds = useQuery({
     queryKey: queryKeys.dalton.credentialsStatus(userId),
-    queryFn: async () => (await api.get<{ enabled?: boolean }>('/api/v1/dalton/credentials/status')).data,
+    queryFn: fetchTeamCredentialsStatus,
     enabled: active,
     staleTime: 5 * 60_000,
     retry: false,

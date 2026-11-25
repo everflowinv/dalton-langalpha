@@ -24,8 +24,21 @@ let teamCredsMock = {
 vi.mock('@/config/daltonAuth', () => ({
   isDaltonAuth: true,
 }));
+// DALTON-HOOK(team-credentials): export shared fetchTeamCredentialsStatus alongside useTeamCredentials mock
 vi.mock('@/hooks/useTeamCredentials', () => ({
   TEAM_SHARED_CREDENTIALS_HINT: 'team hint',
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: teamCredsMock.isShared ? 'team' : 'off',
+    enabled: teamCredsMock.isShared,
+    holder_user_id: null,
+    credential_user_id: 'u-1',
+    is_pm: teamCredsMock.isPm,
+    can_disconnect: teamCredsMock.canDisconnect,
+    can_invite: teamCredsMock.canInvite,
+    caller_tier: 'admin',
+    colleague_sharing_enabled: false,
+    auth_mode: 'oss',
+  })),
   useTeamCredentials: () => teamCredsMock,
 }));
 vi.mock('@/components/modelAccess/SubscriptionSummary', () => ({

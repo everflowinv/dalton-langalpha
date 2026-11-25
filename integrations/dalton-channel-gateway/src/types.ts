@@ -111,7 +111,7 @@ export function buildSurfaceRules(platform: ChannelPlatform): string {
     `The user is chatting with you from ${platform}.`,
     `- Keep replies concise and mobile-friendly.`,
     `- To send files (charts, PDFs, spreadsheets, reports) or extra messages into this conversation, call \`send_message(text=..., files=[...])\` with \`target\` omitted.`,
-    `- Do NOT paste local sandbox paths expecting the user to open them; attach the file via \`send_message(files=[...])\`.`,
+    `- When referencing a workspace file in text, write a Markdown link with a workspace-relative path such as [Report](results/report.md). The channel rewrites it into a web link that requires sign-in when a reachable web URL is configured; paths inside code blocks or backticks are sent as-is. When the user needs the file directly in this chat, attach it via \`send_message(files=[...])\`.`,
     `- Avoid wide Markdown tables (> 4 columns); use bullet lists or attach a file.`,
     `</surface_rules>`,
   ].join("\n");

@@ -17,8 +17,21 @@ const h = vi.hoisted(() => ({
   validModelNames: new Set<string>(),
 }));
 
+// DALTON-HOOK(team-credentials): export shared fetchTeamCredentialsStatus alongside useTeamCredentials mock
 vi.mock('@/hooks/useTeamCredentials', () => ({
   TEAM_SHARED_CREDENTIALS_HINT: '',
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: 'team',
+    enabled: true,
+    holder_user_id: null,
+    credential_user_id: 'u-1',
+    is_pm: h.canInvite,
+    can_disconnect: h.canInvite,
+    can_invite: h.canInvite,
+    caller_tier: h.callerTier !== undefined ? h.callerTier : (h.canInvite ? 'admin' : null),
+    colleague_sharing_enabled: false,
+    auth_mode: h.daltonAuth ? 'local' : 'oss',
+  })),
   useTeamCredentials: () => ({
     isShared: true,
     canDisconnect: h.canInvite,
@@ -29,6 +42,48 @@ vi.mock('@/hooks/useTeamCredentials', () => ({
     callerTierPending: false,
     callerTierError: false,
   }),
+}));
+// DALTON-HOOK(settings-section): mirror test identity state for Settings components migrated to useCallerIdentity
+vi.mock('@/hooks/useCallerIdentity', () => ({
+  useCallerIdentity: () => {
+    const tier =
+      h.platformMode
+        ? 'admin'
+        : h.callerTier !== undefined
+          ? (h.callerTier ?? 'unknown')
+          : h.canInvite
+            ? 'admin'
+            : 'unknown';
+    const ready = h.platformMode || tier === 'admin' || tier === 'internal' || tier === 'external';
+    const isAdmin = h.platformMode || tier === 'admin';
+    const isInternal = h.platformMode || tier === 'admin' || tier === 'internal';
+    const snapshot = {
+      tier: ready ? tier : 'unknown',
+      status: ready ? 'ready' : 'error',
+      authMode: h.platformMode ? 'platform' : 'local',
+      isPlatform: h.platformMode,
+      isKnown: ready,
+      isConfirming: false,
+      isMultiUserAuth: !h.platformMode && h.daltonAuth,
+      isSingleUserOss: false,
+      isAdmin,
+      isInternal,
+      isExternal: ready && tier === 'external',
+      canActAsOwner: isInternal,
+      canPublishPublic: isAdmin,
+      canInvite: h.canInvite,
+      isTeamCredentialsShared: true,
+      canManageCredentials: h.canInvite,
+      isPm: h.canInvite,
+      colleagueSharingEnabled: false,
+    };
+    return {
+      ...snapshot,
+      getLatestIdentity: () => snapshot,
+      isConfirmingNow: () => false,
+      revalidate: vi.fn(async () => undefined),
+    };
+  },
 }));
 
 vi.mock('@/config/hostMode', () => ({

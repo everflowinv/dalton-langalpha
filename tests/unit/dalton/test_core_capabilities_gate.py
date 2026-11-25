@@ -378,7 +378,6 @@ class TestCapabilityRegistry:
             CapabilityId.TMTB,
             CapabilityId.FUNDA_AI,
             CapabilityId.FEISHU_DOCS,
-            CapabilityId.TRANSCRIPTION,
         )
         for child in bridge_children:
             monkeypatch.setenv(CAPABILITY_SPECS[child].env_var, "true")
@@ -392,9 +391,16 @@ class TestCapabilityRegistry:
         )
         assert effective_capabilities() == frozenset()
 
+        # Batch 2: TRANSCRIPTION is decoupled from RESEARCHDATA_BRIDGE, requiring only
+        # its own switch + dedicated ASR storage.
+        monkeypatch.setenv("DALTON_CAP_TRANSCRIPTION", "true")
+        caps_transcription_only = effective_capabilities()
+        assert caps_transcription_only == frozenset({CapabilityId.TRANSCRIPTION})
+
         monkeypatch.setenv("DALTON_CAP_RESEARCHDATA_BRIDGE", "true")
         caps = effective_capabilities()
         assert CapabilityId.RESEARCHDATA_BRIDGE in caps
+        assert CapabilityId.TRANSCRIPTION in caps
         for child in bridge_children:
             assert child in caps
 
@@ -991,7 +997,8 @@ class TestDaltonRoutesRegistrationGate:
             "updated_at": None,
         }
 
-        # 4. Supabase auth enabled while colleague_sharing is off -> caller_tier resolved via get_user_tier
+        # 4. Multi-user auth (Supabase or local) enabled while colleague_sharing is off -> caller_tier resolved via get_user_tier
+        monkeypatch.setattr(dalton_settings_mod, "is_dalton_auth_enabled", lambda: True)
         monkeypatch.setattr(dalton_settings_mod, "is_dalton_supabase_auth_enabled", lambda: True)
 
         async def _fake_require_team_reader(_uid: str) -> None:
@@ -1239,9 +1246,8 @@ class TestSetupBackgroundLoopsGate:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Core: data_jobs, transcription reconcile, and researchdata MCP reconnect all off
+        # Core: data_jobs, default transcription reconcile, and researchdata MCP reconnect all off
         _clean_cap_env(monkeypatch, app_env="core")
-        monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
         monkeypatch.setattr(
             svc_transcriptions,
             "is_transcription_storage_configured",
@@ -1254,6 +1260,12 @@ class TestSetupBackgroundLoopsGate:
         assert svc_transcriptions.is_transcription_reconciliation_enabled() is False
         assert filter_reconnectable_builtin_mcp({"researchdata"}) == set()
         assert filter_reconnectable_builtin_mcp({"researchdata", "firecrawl"}) == {"firecrawl"}
+
+        # Batch 2: enabling transcription + storage in Core activates reconciliation without bridge
+        monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
+        assert svc_transcriptions.is_transcription_reconciliation_enabled() is True
+        monkeypatch.setenv("DALTON_CAP_TRANSCRIPTION", "false")
+        assert svc_transcriptions.is_transcription_reconciliation_enabled() is False
 
         # Everflow: disabling each loop's registered capability stops that loop
         _enable_all_capabilities(monkeypatch)
@@ -1552,21 +1564,31 @@ class TestSetupBackgroundLoopsGate:
         assert "dalton-transcription-reconcile" in names_no_dj
         assert "mcp-builtin-reconnect" in names_no_dj
 
-        # 4) Disable RESEARCHDATA_BRIDGE only -> researchdata-only mcp-builtin-reconnect does NOT launch
+        # 4) Disable RESEARCHDATA_BRIDGE only -> researchdata-only mcp-builtin-reconnect does NOT launch;
+        #    TRANSCRIPTION is decoupled from RESEARCHDATA_BRIDGE (§6.3), so transcription reconcile still launches.
         _enable_all_capabilities(monkeypatch)
         monkeypatch.setenv("DALTON_CAP_RESEARCHDATA_BRIDGE", "false")
         names_no_bridge = await _run_lifespan()
         assert "mcp-builtin-reconnect" not in names_no_bridge
-        assert "dalton-transcription-reconcile" not in names_no_bridge
+        assert "dalton-transcription-reconcile" in names_no_bridge
         assert "dalton-data-task-scheduler" in names_no_bridge
 
-        # 5) Core profile -> none of the 3 launch
+        # 5) Core profile (default) -> none of the 3 launch
         _clean_cap_env(monkeypatch, app_env="core")
-        monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
         names_core = await _run_lifespan()
         assert "dalton-transcription-reconcile" not in names_core
         assert "dalton-data-task-scheduler" not in names_core
         assert "mcp-builtin-reconnect" not in names_core
+
+        # 6) Core profile with explicit transcription enabled + storage -> only transcription reconcile launches (§6.3)
+        monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
+        names_core_asr = await _run_lifespan()
+        assert "dalton-transcription-reconcile" in names_core_asr
+        assert "dalton-data-task-scheduler" not in names_core_asr
+        assert "mcp-builtin-reconnect" not in names_core_asr
+        monkeypatch.setenv("DALTON_CAP_TRANSCRIPTION", "false")
+        names_core_asr_off = await _run_lifespan()
+        assert "dalton-transcription-reconcile" not in names_core_asr_off
 
 
 # ---------------------------------------------------------------------------
@@ -2633,12 +2655,12 @@ class TestBatch3BackendTextAndSkillGates:
         _clean_cap_env(monkeypatch, app_env="core")
         core_caps = frozenset()
 
-        # All 29 Core-visible Dalton skills assemble cleanly with 0 proprietary hits
+        # All 30 Core-visible Dalton skills assemble cleanly with 0 proprietary hits
         core_skills = sorted(
             name for name in dr_mod.DALTON_SKILL_DEFINITIONS
             if dr_mod.is_dalton_skill_enabled(name)
         )
-        assert len(core_skills) == 29
+        assert len(core_skills) == 30
         assert "dalton-13f-tracker" not in core_skills
         assert "dalton-bullbear-tracker" not in core_skills
 

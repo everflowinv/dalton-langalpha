@@ -158,7 +158,7 @@ class TestSkillCapabilityInterceptionAndPrune:
             for p in dalton_reg_mod.DALTON_SKILLS_DIR.iterdir()
             if p.is_dir() and not p.name.startswith(".")
         }
-        assert len(disk_skills) == 51
+        assert len(disk_skills) == 52
         assert set(dalton_reg_mod.DALTON_SKILL_CAPABILITY_MAP.keys()) == disk_skills
 
         for name, req in dalton_reg_mod.DALTON_SKILL_CAPABILITY_MAP.items():

@@ -104,6 +104,8 @@ class SubagentRunCoordinator:
         spending_run_id: Optional[str] = None,
         model_override: Optional[str] = None,
         effort_override: Optional[str] = None,
+        actual_model_key: Optional[str] = None,  # DALTON-HOOK(team-model-catalog)
+        is_custom_model: Optional[bool] = None,  # DALTON-HOOK(team-model-catalog)
         workflow_driver: bool = False,  # DALTON-HOOK(budget)
         workflow_driver_run_id: Optional[str] = None,  # DALTON-HOOK(budget)
     ) -> str:
@@ -181,6 +183,16 @@ class SubagentRunCoordinator:
                 spending_run_id=spending_run_id,
                 model_override=model_override,
                 effort_override=effort_override,
+                **(
+                    {"actual_model_key": actual_model_key}
+                    if isinstance(actual_model_key, str) and actual_model_key.strip()
+                    else {}
+                ),  # DALTON-HOOK(team-model-catalog)
+                **(
+                    {"is_custom_model": is_custom_model}
+                    if is_custom_model is not None
+                    else {}
+                ),  # DALTON-HOOK(team-model-catalog)
                 **({"workflow_driver": True} if workflow_driver else {}),  # DALTON-HOOK(budget)
                 **(
                     {"workflow_driver_run_id": workflow_driver_run_id}

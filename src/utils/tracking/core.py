@@ -194,9 +194,10 @@ class PricingResolver:
         """Return `(notional_card, is_subscription)` for a call record."""
         from src.dalton.llm.notional_pricing import (
             build_notional_price_index,
-            is_subscription_model,
             resolve_notional_card,
         )
+        from src.dalton.services.team_model_catalog.billing import resolve_model_billing
+        from src.llms.pricing_utils import resolve_pricing_identity
 
         model_name = record["model_name"]
         billing_type = record.get("billing_type", "platform")
@@ -206,25 +207,36 @@ class PricingResolver:
         if cache_key in self._notional_resolved:
             return self._notional_resolved[cache_key]
 
-        is_sub = is_subscription_model(
+        # DALTON-HOOK(team-model-catalog): resolve nominal card from active turn snapshot when bound
+        from src.dalton.services.team_model_catalog.snapshot import lookup_snapshot_notional
+
+        snap_hit, snap_notional, snap_is_sub = lookup_snapshot_notional(
             model_name,
-            billing_type,
             pricing_model_id=stamped_id,
             pricing_provider=stamped_provider,
         )
-        if is_sub and stamped_id and stamped_provider and billing_type != "oauth":
-            from src.llms.llm import LLM
+        if snap_hit:
+            self._notional_resolved[cache_key] = (snap_notional, snap_is_sub)
+            return self._notional_resolved[cache_key]
 
-            provider_info = LLM.get_model_config().get_provider_info(stamped_provider)
-            access_type = provider_info.get("access_type", "api_key")
-            # DALTON-HOOK(notional-pricing): use the stamped cash card for custom
-            # API-key routes; coding subscriptions retain their nominal accounting.
-            if (
-                access_type not in ("oauth", "coding_plan")
-                and stamped_provider != "z-ai-cn-coding"
-                and self.card_for(record)[0] is not None
-            ):
-                is_sub = False
+        if stamped_id:
+            eff_provider, eff_model_id = stamped_provider, stamped_id
+        else:
+            eff_provider, eff_model_id = resolve_pricing_identity(
+                model_name, billing_type=billing_type
+            )
+
+        # DALTON-HOOK(team-model-catalog): unified subscription billing check (shared across
+        # save validation, live pricing, snapshots, and between-turn settlement).
+        is_sub = (
+            resolve_model_billing(
+                model_key=model_name,
+                provider=eff_provider,
+                model_id=eff_model_id,
+                billing_type=billing_type,
+            )
+            == "subscription"
+        )
         notional_card: Optional[Dict[str, Any]] = None
         if is_sub:
             if self._notional_index is None:
@@ -267,7 +279,20 @@ class PricingResolver:
                 model_name, billing_type=billing_type
             )
 
-        pricing = find_model_pricing(pricing_id, provider=provider)
+        # DALTON-HOOK(team-model-catalog): prefer active turn effective_catalog_snapshot rates when bound,
+        # and forward model_key to real find_model_pricing so model-level subscription routes agree
+        # identically between in-turn (with snapshot) and between-turn (without snapshot) settlement.
+        from src.dalton.services.team_model_catalog.snapshot import lookup_snapshot_pricing
+
+        snap_hit, snap_pricing = lookup_snapshot_pricing(
+            model_name, provider, model_id=pricing_id
+        )
+        if snap_hit:
+            pricing = snap_pricing
+        elif getattr(find_model_pricing, "_accepts_model_key", False) is True:
+            pricing = find_model_pricing(pricing_id, provider=provider, model_key=model_name)
+        else:
+            pricing = find_model_pricing(pricing_id, provider=provider)
         listed = pricing is not None
 
         if pricing is None:

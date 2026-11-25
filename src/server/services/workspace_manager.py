@@ -63,6 +63,8 @@ from src.server.models.computer import ComputerRemoveResponse, ComputerStatus
 from src.server.services.computer_usage.events import note_start_failure
 from src.server.services.path_lock_coordination import STOP_HEARTBEAT_UNAVAILABLE_RECOVERY_S
 from src.server.services.computer_errors import (
+    ApprovalScopeChangedError,  # DALTON-HOOK(cos-settings-tools)
+    ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
     ComputerNotFoundError,
     ComputerPreparingError,
     ComputerRemovalRefused,
@@ -145,6 +147,17 @@ class WorkspaceManager(ComputerManager):
         config: Optional[Dict[str, Any]] = None,
         resource_tier: Optional[str] = None,
         computer_id: Optional[str] = None,
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        bootstrap_cloud_primary: bool = False,
+        verify_snapshot: bool = False,
+        expected_computer_name: Optional[str] = None,
+        expected_computer_kind: Optional[str] = None,
+        check_duplicate_snapshot: bool = False,
+        expected_duplicate_workspace_id: Optional[str] = None,
+        expected_duplicate_workspace_name: Optional[str] = None,
+        verified_company_candidates: Optional[Any] = None,
+        check_colleague_duplicate: bool = False,
+        # --- DALTON-HOOK(cos-settings-tools): end ---
     ) -> Dict[str, Any]:
         """Create a project on the user's computer and return it straight away.
 
@@ -175,41 +188,110 @@ class WorkspaceManager(ComputerManager):
         # Before a first computer is minted for a name that cannot be stored.
         name = checked_workspace_name(name)
         chosen = computer_id is not None
-        if chosen:
-            computer = await self._chosen_computer(user_id, computer_id)
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        if bootstrap_cloud_primary:
+            if chosen:
+                raise ApprovalScopeChangedError("情况已变化，请重新发起")
+            computer = await self.bootstrap_cloud_primary_computer(
+                user_id,
+                default_name=name,
+                resource_tier=resource_tier,
+                expected_kind=expected_computer_kind,
+                check_duplicate_snapshot=bool(verify_snapshot and check_duplicate_snapshot),
+                workspace_name=name,
+                expected_duplicate_workspace_id=expected_duplicate_workspace_id,
+                expected_duplicate_workspace_name=expected_duplicate_workspace_name,
+                verified_company_candidates=verified_company_candidates if verify_snapshot else None,
+                check_colleague_duplicate=bool(verify_snapshot and check_colleague_duplicate),
+            )
+        elif chosen:
+            try:
+                computer = await self._chosen_computer(user_id, computer_id)
+            except (ComputerNotFoundError, ComputerArchivingError):
+                if verify_snapshot:
+                    raise ApprovalScopeChangedError("情况已变化，请重新发起") from None
+                raise
+            if verify_snapshot:
+                if computer.get("status") == ComputerStatus.ERROR:
+                    raise ApprovalScopeChangedError("情况已变化，请重新发起")
+                if (
+                    expected_computer_kind is not None
+                    and str(computer.get("kind") or "") != expected_computer_kind
+                ):
+                    raise ApprovalScopeChangedError("情况已变化，请重新发起")
+                if expected_computer_name is not None:
+                    from src.tools.secretary.utils import spoken_computer_name
+
+                    if spoken_computer_name(computer.get("name")) != expected_computer_name:
+                        raise ApprovalScopeChangedError("情况已变化，请重新发起")
         else:
             computer = await self.ensure_primary_computer(
                 user_id, default_name=name, resource_tier=resource_tier
             )
+            if (computer.get("config") or {}).get("archiving"):
+                if verify_snapshot:
+                    raise ApprovalScopeChangedError("情况已变化，请重新发起")
+                raise ComputerArchivingError(
+                    "This computer is currently being archived and cannot accept new workspaces."
+                )
         # Never had a sandbox and one is being built. A workspace placed on it
         # now would make its first request wait out that build, so it waits here.
         if computer.get("status") in (
             ComputerStatus.CREATING,
             ComputerStatus.STARTING,
         ) and not computer.get("provider_ref"):
+            if verify_snapshot:
+                raise ApprovalScopeChangedError("情况已变化，请重新发起")
             raise ComputerPreparingError("Computer is still being prepared")
         computer_id = str(computer["computer_id"])
 
         # DALTON-HOOK(colleague-access): strip pending_outbound_confirm on create when colleague sharing auth is enabled
         _owned_config_keys = server_owned_config_keys()
-        workspace = await create_workspace_on_computer(
-            user_id,
-            name,
-            computer_id,
-            description=description,
-            config={
+        create_kwargs: Dict[str, Any] = {
+            "description": description,
+            "config": {
                 key: value
                 for key, value in (config or {}).items()
                 if key not in _owned_config_keys
             },
+        }
+        if verify_snapshot or bootstrap_cloud_primary:
+            create_kwargs["reject_unavailable"] = True
+        if verify_snapshot and not bootstrap_cloud_primary:
+            if expected_computer_name is not None:
+                create_kwargs["expected_computer_name"] = expected_computer_name
+            if expected_computer_kind is not None:
+                create_kwargs["expected_computer_kind"] = expected_computer_kind
+        if verify_snapshot and check_duplicate_snapshot:
+            create_kwargs["check_duplicate_snapshot"] = True
+            if expected_duplicate_workspace_id is not None:
+                create_kwargs["expected_duplicate_workspace_id"] = (
+                    expected_duplicate_workspace_id
+                )
+            if expected_duplicate_workspace_name is not None:
+                create_kwargs["expected_duplicate_workspace_name"] = (
+                    expected_duplicate_workspace_name
+                )
+            if verified_company_candidates is not None:
+                create_kwargs["verified_company_candidates"] = verified_company_candidates
+            if check_colleague_duplicate:
+                create_kwargs["check_colleague_duplicate"] = True
+        workspace = await create_workspace_on_computer(
+            user_id,
+            name,
+            computer_id,
+            **create_kwargs,
         )
         if workspace is None:
+            if verify_snapshot or bootstrap_cloud_primary:
+                raise ApprovalScopeChangedError("情况已变化，请重新发起")
             if chosen:
                 raise ComputerNotFoundError("Computer not found")
             raise RuntimeError(
                 f"Computer {computer_id} was gone before workspace {name!r} "
                 "could be created on it"
             )
+        # --- DALTON-HOOK(cos-settings-tools): end ---
 
         workspace_id = str(workspace["workspace_id"])
         await self.resolve_binding(workspace_id, workspace=workspace)
@@ -234,6 +316,11 @@ class WorkspaceManager(ComputerManager):
             or (computer.get("config") or {}).get("retire_when_empty")
         ):
             raise ComputerNotFoundError("Computer not found")
+        # DALTON-HOOK(cos-settings-tools): refuse creating a workspace on an archiving computer
+        if (computer.get("config") or {}).get("archiving"):
+            raise ComputerArchivingError(
+                "This computer is currently being archived and cannot accept new workspaces."
+            )
         return computer
 
     async def get_session_for_workspace(

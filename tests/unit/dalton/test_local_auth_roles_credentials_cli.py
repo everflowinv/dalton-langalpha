@@ -124,6 +124,17 @@ class FakeRolesAndCliDB:
                         db.oauth_deleted.append((p[0], p[1]))
                         return cur
 
+                    if (
+                        "SELECT user_id, tier FROM dalton_user_roles "
+                        "WHERE tier = 'admin' OR user_id = %s"
+                    ) in sql:
+                        target_uid = p[0] if p else None
+                        cur._rows = [
+                            {"user_id": uid, "tier": row["tier"]}
+                            for uid, row in sorted(db.roles.items(), key=lambda kv: kv[0])
+                            if row["tier"] == "admin" or uid == target_uid
+                        ]
+                        return cur
                     if "SELECT user_id FROM dalton_user_roles WHERE tier = 'admin'" in sql:
                         cur._rows = [
                             {"user_id": uid}

@@ -566,14 +566,26 @@ async def astream_ptc_workflow(
                 # moves the standalone path onto the ordering production has.
                 if config is None:
                     # DALTON-HOOK(automation-subscription-fallback): resolve LLM config with automation subscription fallback
+                    # DALTON-HOOK(team-model-catalog): bind resume_verify_scope on standalone/automation refire so verify_resume_route runs before client build
+                    from contextlib import nullcontext
+
                     from src.dalton.services.automation_subscription_fallback import (
                         resolve_ptc_turn_llm_config,
                     )
-
-                    config, run_metadata = await resolve_ptc_turn_llm_config(
-                        setup.agent_config, user_id, request, is_byok=is_byok, thread_id=thread_id,
-                        workspace_id=workspace_id, identity=identity, role=route.role, run_metadata=run_metadata,
+                    from src.dalton.services.team_model_catalog.snapshot import (
+                        resume_verify_scope,
                     )
+
+                    _resume_src_id = getattr(request, "resume_of_run_id", None)
+                    with (
+                        resume_verify_scope(str(_resume_src_id), thread_id=thread_id)
+                        if _resume_src_id
+                        else nullcontext()
+                    ):
+                        config, run_metadata = await resolve_ptc_turn_llm_config(
+                            setup.agent_config, user_id, request, is_byok=is_byok, thread_id=thread_id,
+                            workspace_id=workspace_id, identity=identity, role=route.role, run_metadata=run_metadata,
+                        )
 
                 # Persist query start
                 feedback_action = None
@@ -805,6 +817,22 @@ async def astream_ptc_workflow(
                         # Per attempt, since a retry or an automation's turn may
                         # run another model than the turn's query row recorded.
                         **({"llm_model": effective_model} if effective_model else {}),
+                        # DALTON-HOOK(team-model-catalog): mark personal custom-model runs so START
+                        # snapshots never confuse a personal model with a same-name team catalog model.
+                        **(
+                            {"model_source": "custom"}
+                            if isinstance(
+                                getattr(getattr(config, "llm_client", None), "metadata", None), dict
+                            )
+                            and config.llm_client.metadata.get("is_custom_model")
+                            else {}
+                        ),
+                        # DALTON-HOOK(team-model-catalog): include configured fallback_models so turn START snapshot covers fallbacks
+                        **(
+                            {"fallback_models": list(config.llm.fallback)}
+                            if config and getattr(config, "llm", None) and getattr(config.llm, "fallback", None)
+                            else {}
+                        ),
                         **firing,
                         **home.run_metadata(),
                         **identity.stamp(run_metadata),
@@ -1044,45 +1072,53 @@ async def astream_ptc_workflow(
         # The user's other computers this turn's calls run on, which its end
         # backs up beside its own.
         reached_computers: set[str] = set()
+        # DALTON-HOOK(team-model-catalog): bind persisted turn snapshot across graph construction so
+        # lazily built clients/middlewares honor snapshotted provider routes & parameters.
+        from contextlib import nullcontext
+
+        from src.dalton.services.team_model_catalog.snapshot import bind_catalog_snapshot
+
+        _graph_snap = getattr(run_handle, "catalog_snapshot", None)
         # DALTON-HOOK(colleague-dispatch): strip Task/schedule_wakeup on post-revocation tail turn
-        ptc_graph = await build_ptc_graph_with_session(
-            session=session,
-            config=config,
-            # Optional structural gate: builds the agent without
-            # Task/TaskOutput. Task report-back turns don't set it (they
-            # need TaskOutput to fetch the result); their re-announce
-            # recursion is handled by the outbox's ledger arbitration.
-            disable_subagents=bool(request.disable_subagents),
-            operation_callback=None,
-            # I2: the run's fenced session-bound saver when the WriterGuard
-            # is active; the global pooled saver otherwise.
-            checkpointer=run_handle.checkpointer,
-            background_registry=background_registry,
-            # I2 (2.4e): the guard doubles as the task-namespace fence —
-            # each background subagent takes exclusive N(thread, task:id) on
-            # the run's pinned session before it may write.
-            namespace_owner=run_handle.guard,
-            **inputs.build_kwargs(),
-            **(
-                {"tail_turn_no_new_work": True}
-                if tail_turn_no_new_work
-                else {}
-            ),
-            order_ledger=order_ledger_for_turn(
-                user_id=user_id,
-                workspace_id=workspace_id,
-                thread_id=thread_id,
-                run_id=run_id,
-                turn_index=run_handle.turn_index,
-            ),
-            turn_context=turn_context,
-            # A port, not a value: the switch can flip mid-turn from any
-            # worker, so the agent re-reads the row on every call.
-            subagent_switch=partial(read_thread_subagents_allowed, thread_id),
-            window_coverage=partial(runs_held, thread_id),
-            cancel_notices=ThreadCancelNotices(thread_id, turn_context.tool_timezone),
-            reached_computers=reached_computers,
-        )
+        with bind_catalog_snapshot(_graph_snap) if _graph_snap is not None else nullcontext():
+            ptc_graph = await build_ptc_graph_with_session(
+                session=session,
+                config=config,
+                # Optional structural gate: builds the agent without
+                # Task/TaskOutput. Task report-back turns don't set it (they
+                # need TaskOutput to fetch the result); their re-announce
+                # recursion is handled by the outbox's ledger arbitration.
+                disable_subagents=bool(request.disable_subagents),
+                operation_callback=None,
+                # I2: the run's fenced session-bound saver when the WriterGuard
+                # is active; the global pooled saver otherwise.
+                checkpointer=run_handle.checkpointer,
+                background_registry=background_registry,
+                # I2 (2.4e): the guard doubles as the task-namespace fence —
+                # each background subagent takes exclusive N(thread, task:id) on
+                # the run's pinned session before it may write.
+                namespace_owner=run_handle.guard,
+                **inputs.build_kwargs(),
+                **(
+                    {"tail_turn_no_new_work": True}
+                    if tail_turn_no_new_work
+                    else {}
+                ),
+                order_ledger=order_ledger_for_turn(
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    turn_index=run_handle.turn_index,
+                ),
+                turn_context=turn_context,
+                # A port, not a value: the switch can flip mid-turn from any
+                # worker, so the agent re-reads the row on every call.
+                subagent_switch=partial(read_thread_subagents_allowed, thread_id),
+                window_coverage=partial(runs_held, thread_id),
+                cancel_notices=ThreadCancelNotices(thread_id, turn_context.tool_timezone),
+                reached_computers=reached_computers,
+            )
 
         _mark_phase("graph_build")
 
@@ -1410,6 +1446,12 @@ async def astream_ptc_workflow(
                     min_age_s=TURN_MEASURE_MIN_INTERVAL_SECONDS,
                 )
 
+        # DALTON-HOOK(team-model-catalog): bind persisted turn effective_catalog_snapshot across
+        # the entire background workflow task (LLM client rebuilds, MultimodalStripMiddleware, credit gate).
+        from src.dalton.services.team_model_catalog.snapshot import (
+            run_with_catalog_snapshot,
+        )
+
         # Start workflow in background with event buffering
         await manager.start_run(
             thread_id=thread_id,
@@ -1417,23 +1459,26 @@ async def astream_ptc_workflow(
             # The project is bound outermost, in the run's own task: a graph
             # node runs in a task created from the caller's context, so a
             # ContextVar set inside the graph would not reach the next node.
-            workflow_generator=run_with_project(
-                project,
-                run_with_credit_gate(
-                    credit_gate,
-                    # A Mac the turn runs on stays out of idle sleep until the
-                    # turn ends, between its calls as well as in them.
-                    held_awake(
-                        lambda: getattr(getattr(session, "sandbox", None), "runtime", None),
-                        # Relay sessions for direct tools open and close with the
-                        # run, in the run's task, not with this request's generator.
-                        direct_mcp.drive(
-                            handler.stream_workflow(
-                                graph=ptc_graph,
-                                input_state=input_state,
-                                config=graph_config,
-                                settled_results=cancelled_calls,
-                            )
+            workflow_generator=run_with_catalog_snapshot(
+                getattr(run_handle, "catalog_snapshot", None),
+                run_with_project(
+                    project,
+                    run_with_credit_gate(
+                        credit_gate,
+                        # A Mac the turn runs on stays out of idle sleep until the
+                        # turn ends, between its calls as well as in them.
+                        held_awake(
+                            lambda: getattr(getattr(session, "sandbox", None), "runtime", None),
+                            # Relay sessions for direct tools open and close with the
+                            # run, in the run's task, not with this request's generator.
+                            direct_mcp.drive(
+                                handler.stream_workflow(
+                                    graph=ptc_graph,
+                                    input_state=input_state,
+                                    config=graph_config,
+                                    settled_results=cancelled_calls,
+                                )
+                            ),
                         ),
                     ),
                 ),

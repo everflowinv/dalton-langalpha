@@ -406,6 +406,16 @@ async def test_off_legacy_first_read_still_cuts_v1(
 
 @pytest.mark.asyncio
 async def test_off_unshare_still_allowed(owner_routes, monkeypatch) -> None:
+    from src.dalton import settings as dalton_settings
+
+    orig_is_dalton_enabled = dalton_settings.is_dalton_enabled
+
+    # When Dalton is disabled, routes delegate directly to upstream artifacts_db.unshare.
+    monkeypatch.setattr(
+        dalton_settings,
+        "is_dalton_enabled",
+        create_autospec(orig_is_dalton_enabled, return_value=False),
+    )
     unshare = create_autospec(
         owner_routes.db.unshare,
         return_value=dataclasses.replace(owner_routes.artifact, shared_at=None),
@@ -416,6 +426,29 @@ async def test_off_unshare_still_allowed(owner_routes, monkeypatch) -> None:
         )
     assert response.shared is False
     unshare.assert_awaited_once()
+
+    # When Dalton is enabled, routes atomically unshare and downgrade any public monitor.
+    monkeypatch.setattr(
+        dalton_settings,
+        "is_dalton_enabled",
+        create_autospec(orig_is_dalton_enabled, return_value=True),
+    )
+    unshare_with_mon = create_autospec(
+        owner_routes.db.unshare_artifact_and_downgrade_public_monitor,
+        return_value=dataclasses.replace(owner_routes.artifact, shared_at=None),
+    )
+    with patch.object(
+        owner_routes.db,
+        "unshare_artifact_and_downgrade_public_monitor",
+        unshare_with_mon,
+    ):
+        response_dalton = await owner_routes.records.unshare_artifact(
+            ARTIFACT_ID, x_user_id="u-owner-1"
+        )
+    assert response_dalton.shared is False
+    unshare_with_mon.assert_awaited_once_with(
+        user_id="u-owner-1", artifact_id=ARTIFACT_ID
+    )
 
 
 # --- switch off/on: the send route's HTTP 409 (real client) -----------------

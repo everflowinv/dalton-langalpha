@@ -62,6 +62,18 @@ vi.mock('@/config/supportLinks', async (importOriginal) => ({
 }));
 
 vi.mock('@/hooks/useTeamCredentials', () => ({
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: h.isShared ? 'team' : 'off',
+    enabled: h.isShared,
+    holder_user_id: null,
+    credential_user_id: 'u-ext-1',
+    is_pm: h.isPm,
+    can_disconnect: h.canManage,
+    can_invite: h.canManage,
+    caller_tier: h.callerTier,
+    colleague_sharing_enabled: false,
+    auth_mode: 'local',
+  })),
   useTeamCredentials: () => ({
     isShared: h.isShared,
     canDisconnect: h.canManage,

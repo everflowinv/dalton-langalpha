@@ -92,6 +92,7 @@ from src.server.database.artifacts.records import (
     set_left_out,
     stop_keeping,
     unshare,
+    unshare_artifact_and_downgrade_public_monitor,  # DALTON-HOOK(monitors)
 )
 from src.server.database.artifacts.versions import (
     KEEP_UPDATED_VERSIONS,
@@ -191,5 +192,6 @@ __all__ = [
     "stop_keeping",
     "unbind",
     "unshare",
+    "unshare_artifact_and_downgrade_public_monitor",  # DALTON-HOOK(monitors)
     "update_comment",
 ]

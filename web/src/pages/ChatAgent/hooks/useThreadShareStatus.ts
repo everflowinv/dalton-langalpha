@@ -3,9 +3,15 @@ import { useQuery, useQueryClient, type QueryClient } from '@tanstack/react-quer
 import { authSessionCheck } from '@/lib/authResets';
 import { queryKeys } from '@/lib/queryKeys';
 import { patchThreadShared } from '@/lib/threadListCache';
-import type { ThreadShareStatus } from '@/types/api';
+import type { ThreadSharePermissions, ThreadShareStatus } from '@/types/api';
 import { updateThreadSharing } from '../utils/api';
 import { threadShareQuery } from '../utils/threadQueries';
+
+// DALTON-HOOK(external-share-guard): stopping a thread share sends `{ is_shared: false }` without permissions
+export interface ThreadShareUpdateBody {
+  is_shared: boolean;
+  permissions?: ThreadSharePermissions;
+}
 
 /**
  * A thread's public-link status, the one entry the chat header and every share
@@ -27,13 +33,14 @@ export function useThreadShareStatus(threadId: string, { refetchOnMount }: { ref
  * still in flight started before the change, so it is cancelled rather than
  * let land over it; an answer that arrives after a sign-out is dropped.
  */
+// DALTON-HOOK(external-share-guard): allow stopping a thread share with `{ is_shared: false }` without overwriting `permissions`
 export async function saveThreadSharing(
   queryClient: QueryClient,
   threadId: string,
-  body: Pick<ThreadShareStatus, 'is_shared' | 'permissions'>,
+  body: ThreadShareUpdateBody,
 ): Promise<void> {
   const sameSession = authSessionCheck();
-  const result: ThreadShareStatus = await updateThreadSharing(threadId, body);
+  const result: ThreadShareStatus = await updateThreadSharing(threadId, body as unknown as Record<string, unknown>);
   if (!sameSession()) return;
   const queryKey = queryKeys.threads.share(threadId);
   await queryClient.cancelQueries({ queryKey });

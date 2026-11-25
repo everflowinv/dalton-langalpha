@@ -46,6 +46,8 @@ import { useStreamFollow } from '../../ChatAgent/components/chatView/transcriptF
 import { useTranscriptFollow } from '../../ChatAgent/components/chatView/useTranscriptFollow';
 // DALTON-HOOK(team-sharing): read-only access check for the seen cursor
 import { useTeamReadOnly } from '../../ChatAgent/components/dalton/TeamSharing';
+// DALTON-HOOK(external-share-guard): unified caller identity for publish gating
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { useActiveThreadPublisher } from '@/lib/threadLifecycle/useActiveThreadPublisher';
 import { appendPathSuffix, getPreviewUrl, previewFailure, summarizeThread, offloadThread, type NextSummary } from '../../ChatAgent/utils/api';
 import { attachmentSendParts, countContextAttachments, type AttachmentMeta } from '../../ChatAgent/utils/fileUpload';
@@ -771,9 +773,10 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const { onPublishFile, dialog: publishDialog } = usePublishFile(activeWorkspaceId);
   // DALTON-HOOK(external-share-guard)/(team-sharing): the market transcript's
   // file cards offer Publish to the workspace's own owner only — a colleague
-  // (rw or ro) or an external member gets no entry; the server refuses them.
+  // (rw or ro) or an external/unknown member gets no entry; the server refuses them.
+  const identity = useCallerIdentity();
   const publishAllowed =
-    !teamReadOnly.isColleague && teamReadOnly.callerTier !== 'external';
+    !teamReadOnly.isColleague && identity.canActAsOwner && !identity.isConfirming;
   const messageActions = useMemo<MessageActions>(() => ({
     onOpenSubagentTask: stableOpenSubagentTask,
     onToolCallDetailClick: stableToolCallDetail,

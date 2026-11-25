@@ -11,7 +11,7 @@ import os
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src.dalton.budget.service import (
@@ -302,6 +302,376 @@ async def restore_native_models_endpoint(
 
 
 # ---------------------------------------------------------------------------
+# Team Model Catalog (d051): versioned DB catalog admin & rollback API
+# ---------------------------------------------------------------------------
+
+
+def _raise_catalog_http(exc: Exception) -> None:
+    from pydantic import ValidationError as PydanticValidationError
+
+    from src.dalton.services.team_model_catalog.constants import CatalogError
+
+    if isinstance(exc, CatalogError):
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.to_http_detail()
+        ) from exc
+    if isinstance(exc, PydanticValidationError):
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(include_url=False, include_context=False, include_input=False),
+        ) from exc
+    raise exc
+
+
+async def _require_catalog_admin(user_id: str) -> None:
+    _require_dalton_enabled()
+    from src.dalton.credentials import require_catalog_admin_async
+
+    await require_catalog_admin_async(user_id)
+
+
+def _stamp_catalog_revision_header(response: Response, payload: dict[str, Any]) -> dict[str, Any]:
+    from src.dalton.services.team_model_catalog.constants import CATALOG_REVISION_HEADER
+
+    rev = payload.get("revision")
+    if rev is not None:
+        response.headers[CATALOG_REVISION_HEADER] = str(rev)
+    return payload
+
+
+@router.get("/team-models")
+@handle_api_exceptions("get team model catalog", logger)
+async def get_team_models_catalog_endpoint(
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import get_team_catalog_overview
+
+    try:
+        return _stamp_catalog_revision_header(response, await get_team_catalog_overview())
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models")
+@handle_api_exceptions("create team catalog model", logger)
+async def create_team_model_endpoint(
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import create_catalog_model
+    from src.dalton.services.team_model_catalog.validation import CatalogModelUpsertInput
+
+    try:
+        parsed = CatalogModelUpsertInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response, await create_catalog_model(actor_user_id=user_id, data=parsed)
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models/provider-variants")
+@handle_api_exceptions("create team catalog provider variant", logger)
+async def create_team_provider_variant_endpoint(
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import upsert_provider_variant
+    from src.dalton.services.team_model_catalog.validation import ProviderVariantUpsertInput
+
+    try:
+        parsed = ProviderVariantUpsertInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response,
+            await upsert_provider_variant(actor_user_id=user_id, data=parsed, is_update=False),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.put("/team-models/provider-variants/{provider_slug}")
+@handle_api_exceptions("update team catalog provider variant", logger)
+async def update_team_provider_variant_endpoint(
+    provider_slug: str,
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import upsert_provider_variant
+    from src.dalton.services.team_model_catalog.validation import ProviderVariantUpsertInput
+
+    try:
+        merged = {**body, "provider_slug": provider_slug}
+        parsed = ProviderVariantUpsertInput.model_validate(merged)
+        return _stamp_catalog_revision_header(
+            response,
+            await upsert_provider_variant(actor_user_id=user_id, data=parsed, is_update=True),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.put("/team-models/curated")
+@handle_api_exceptions("update team catalog curated setup", logger)
+async def update_team_curated_setup_endpoint(
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import update_curated_setup
+    from src.dalton.services.team_model_catalog.validation import CuratedSetupUpdateInput
+
+    try:
+        parsed = CuratedSetupUpdateInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response, await update_curated_setup(actor_user_id=user_id, data=parsed)
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.get("/team-models/revisions")
+@handle_api_exceptions("list team model catalog revisions", logger)
+async def list_team_model_revisions_endpoint(
+    response: Response,
+    user_id: CurrentUserId,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import list_revisions_view
+
+    return _stamp_catalog_revision_header(
+        response, await list_revisions_view(limit=limit, offset=offset)
+    )
+
+
+@router.get("/team-models/revisions/{revision}")
+@handle_api_exceptions("get team model catalog revision", logger)
+async def get_team_model_revision_endpoint(
+    revision: int,
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.database.team_model_catalog import get_catalog_revision
+    from src.dalton.services.team_model_catalog.compiled import get_compiled_catalog_async
+    from src.dalton.services.team_model_catalog.constants import CATALOG_REVISION_HEADER
+
+    row = await get_catalog_revision(revision)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "revision_not_found", "message": f"Revision {revision} not found."},
+        )
+    compiled = await get_compiled_catalog_async()
+    response.headers[CATALOG_REVISION_HEADER] = str(compiled.revision)
+    return {"current_revision": compiled.revision, "revision_record": row}
+
+
+@router.post("/team-models/rollback")
+@handle_api_exceptions("rollback team model catalog", logger)
+async def rollback_team_models_endpoint(
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import rollback_catalog
+    from src.dalton.services.team_model_catalog.validation import CatalogRollbackInput
+
+    try:
+        parsed = CatalogRollbackInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response, await rollback_catalog(actor_user_id=user_id, data=parsed)
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models/test-call")
+@handle_api_exceptions("test call team catalog model", logger)
+async def test_call_team_model_endpoint(
+    body: dict[str, Any],
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import run_catalog_test_call
+    from src.dalton.services.team_model_catalog.validation import CatalogTestCallInput
+
+    try:
+        parsed = CatalogTestCallInput.model_validate(body)
+        return await run_catalog_test_call(actor_user_id=user_id, data=parsed)
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models/legacy-import/resolve")
+@handle_api_exceptions("resolve legacy native overlay import", logger)
+async def resolve_team_legacy_import_endpoint(
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.legacy_import import resolve_legacy_import
+    from src.dalton.services.team_model_catalog.validation import LegacyImportResolveInput
+
+    try:
+        parsed = LegacyImportResolveInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response,
+            await resolve_legacy_import(
+                actor_user_id=user_id,
+                action=parsed.action,
+                persist_known_retired=parsed.persist_known_retired,
+                expected_revision=parsed.expected_revision,
+                comment=parsed.comment,
+            ),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.put("/team-models/{model_key}")
+@handle_api_exceptions("update team catalog model", logger)
+async def update_team_model_endpoint(
+    model_key: str,
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import update_catalog_model
+    from src.dalton.services.team_model_catalog.validation import CatalogModelUpsertInput
+
+    try:
+        parsed = CatalogModelUpsertInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response,
+            await update_catalog_model(actor_user_id=user_id, model_key=model_key, data=parsed),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models/{model_key}/visibility")
+@handle_api_exceptions("set team catalog model visibility", logger)
+async def set_team_model_visibility_endpoint(
+    model_key: str,
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import set_catalog_model_visibility
+    from src.dalton.services.team_model_catalog.validation import ModelVisibilityInput
+
+    try:
+        parsed = ModelVisibilityInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response,
+            await set_catalog_model_visibility(
+                actor_user_id=user_id, model_key=model_key, data=parsed
+            ),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models/{model_key}/retire")
+@handle_api_exceptions("retire team catalog model", logger)
+async def retire_team_model_endpoint(
+    model_key: str,
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import retire_catalog_model
+    from src.dalton.services.team_model_catalog.validation import ModelRetireInput
+
+    try:
+        parsed = ModelRetireInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response,
+            await retire_catalog_model(actor_user_id=user_id, model_key=model_key, data=parsed),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models/{model_key}/restore")
+@handle_api_exceptions("restore team catalog model", logger)
+async def restore_team_model_endpoint(
+    model_key: str,
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import restore_catalog_model
+    from src.dalton.services.team_model_catalog.validation import ModelRestoreInput
+
+    try:
+        parsed = ModelRestoreInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response,
+            await restore_catalog_model(actor_user_id=user_id, model_key=model_key, data=parsed),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models/{model_key}/restore-default")
+@handle_api_exceptions("restore team catalog model factory default", logger)
+async def restore_team_model_default_endpoint(
+    model_key: str,
+    response: Response,
+    user_id: CurrentUserId,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import restore_factory_default_model
+    from src.dalton.services.team_model_catalog.validation import ModelRestoreInput
+
+    try:
+        parsed = ModelRestoreInput.model_validate(body or {})
+        return _stamp_catalog_revision_header(
+            response,
+            await restore_factory_default_model(
+                actor_user_id=user_id,
+                model_key=model_key,
+                expected_revision=parsed.expected_revision,
+                comment=parsed.comment,
+            ),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+# ---------------------------------------------------------------------------
 # P0N.8: Native Model Provider Status, Probe & Available Models
 # ---------------------------------------------------------------------------
 
@@ -418,7 +788,7 @@ async def list_team_workspaces_endpoint(
     from src.dalton.access_tiers import get_user_tier
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
-        is_dalton_supabase_auth_enabled,
+        is_dalton_auth_enabled,
     )
 
     if not has_capability(CapabilityId.COLLEAGUE_SHARING):
@@ -427,7 +797,7 @@ async def list_team_workspaces_endpoint(
             raise HTTPException(status_code=401, detail="Authentication required")
         caller_tier = (
             await get_user_tier(uid)
-            if is_dalton_supabase_auth_enabled()
+            if is_dalton_auth_enabled()
             else "internal"
         )
         return {
@@ -530,6 +900,9 @@ async def get_workspace_sharing_endpoint(
             "web_access": "hidden",
             "is_home": True,
             "can_edit": False,
+            "can_edit_web_access": False,
+            "can_edit_cos_access": False,
+            "can_edit_team_memory": False,
             "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
             "updated_by": None,
             "updated_at": None,
@@ -542,6 +915,23 @@ async def get_workspace_sharing_endpoint(
         and owner_id
     ):
         effective_owner_tier = await classify_owner_tier(owner_id)
+
+    if is_dalton_auth_enabled() and effective_owner_tier == "unknown":
+        if owner_id != uid:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        sharing = await get_workspace_sharing(str(ws["workspace_id"]))
+        return {
+            **sharing,
+            "cos_access": "hidden",
+            "is_home": False,
+            "can_edit": False,
+            "can_edit_web_access": False,
+            "can_edit_cos_access": False,
+            "can_edit_team_memory": False,
+            "owner_external": False,
+            "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
+        }
+
     owner_external = effective_owner_tier == "external"
 
     if owner_external:
@@ -557,6 +947,9 @@ async def get_workspace_sharing_endpoint(
                 "cos_access": "hidden",
                 "is_home": False,
                 "can_edit": False,
+                "can_edit_web_access": False,
+                "can_edit_cos_access": False,
+                "can_edit_team_memory": False,
                 "owner_external": True,
                 "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
             }
@@ -566,6 +959,9 @@ async def get_workspace_sharing_endpoint(
             "cos_access": "hidden",
             "is_home": False,
             "can_edit": True,
+            "can_edit_web_access": True,
+            "can_edit_cos_access": False,
+            "can_edit_team_memory": False,
             "owner_external": True,
             "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
         }
@@ -591,6 +987,9 @@ async def get_workspace_sharing_endpoint(
         **sharing,
         "is_home": False,
         "can_edit": can_edit,
+        "can_edit_web_access": can_edit,
+        "can_edit_cos_access": can_edit,
+        "can_edit_team_memory": can_edit,
         "owner_external": False,
         "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
     }
@@ -607,8 +1006,8 @@ async def update_workspace_sharing_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     require_capability(CapabilityId.COLLEAGUE_SHARING)
-    from src.server.database.home_workspace import is_home_stand_in_row, is_reserved_row
     from src.dalton.access_tiers import is_admin_user
+    from src.dalton.auth_guards import raise_external_member_forbidden
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
         is_dalton_auth_enabled,
@@ -621,6 +1020,7 @@ async def update_workspace_sharing_endpoint(
         upsert_workspace_sharing,
     )
     from src.server.database import workspace as ws_db
+    from src.server.database.home_workspace import is_home_stand_in_row, is_reserved_row
 
     uid = str(user_id or "").strip()
     if not uid:
@@ -676,6 +1076,12 @@ async def update_workspace_sharing_endpoint(
         from src.dalton.access_tiers import classify_owner_tier
 
         effective_owner_tier = await classify_owner_tier(owner_id)
+
+    if is_dalton_auth_enabled() and effective_owner_tier == "unknown":
+        if owner_id != uid:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        raise_external_member_forbidden("无法确认成员等级，暂不可修改工作区共享设置")
+
     owner_external = effective_owner_tier == "external"
     if owner_external:
         if owner_id != uid:
@@ -690,10 +1096,7 @@ async def update_workspace_sharing_endpoint(
                 detail="Only workspace owner may modify sharing settings",
             )
         if body.cos_access is not None:
-            raise HTTPException(
-                status_code=403,
-                detail="外部成员不能开启或修改研究总监访问权限",
-            )
+            raise_external_member_forbidden("外部成员不能开启或修改研究总监访问权限")
 
     if not can_edit_workspace_sharing(ws, uid):
         raise HTTPException(
@@ -736,6 +1139,9 @@ async def update_workspace_sharing_endpoint(
         **({"cos_access": "hidden"} if owner_external else {}),
         "is_home": False,
         "can_edit": True,
+        "can_edit_web_access": True,
+        "can_edit_cos_access": not owner_external,
+        "can_edit_team_memory": not owner_external,
         "owner_external": owner_external,
         "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
     }
@@ -751,6 +1157,7 @@ async def get_workspace_settings_endpoint(
     from src.dalton.settings import is_dalton_auth_enabled
     from src.dalton.sharing import (
         can_edit_workspace_settings,
+        can_edit_workspace_sharing,
         get_workspace_settings,
         get_workspace_sharing,
         require_team_reader,
@@ -798,6 +1205,9 @@ async def get_workspace_settings_endpoint(
             "team_memory_enabled": False,
             "is_home": True,
             "can_edit": False,
+            "can_edit_web_access": False,
+            "can_edit_cos_access": False,
+            "can_edit_team_memory": False,
             "owner_external": False,
             "updated_by": None,
             "updated_at": None,
@@ -810,27 +1220,51 @@ async def get_workspace_settings_endpoint(
         and owner_id
     ):
         effective_owner_tier = await classify_owner_tier(owner_id)
+
+    if is_dalton_auth_enabled() and effective_owner_tier == "unknown":
+        if owner_id != uid:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        return {
+            "workspace_id": str(ws["workspace_id"]),
+            "team_memory_enabled": False,
+            "is_home": False,
+            "can_edit": False,
+            "can_edit_web_access": False,
+            "can_edit_cos_access": False,
+            "can_edit_team_memory": False,
+            "owner_external": False,
+            "updated_by": None,
+            "updated_at": None,
+        }
+
     owner_external = effective_owner_tier == "external"
 
     if owner_external:
         if owner_id != uid:
+            if not has_capability(CapabilityId.COLLEAGUE_SHARING):
+                raise HTTPException(status_code=404, detail="Workspace not found")
             if ws.get("status") in ("unbound", "deleted"):
                 raise HTTPException(status_code=404, detail="Workspace not found")
             await require_team_reader(owner_id)
             sharing = await get_workspace_sharing(str(ws["workspace_id"]))
             if sharing.get("web_access") == "hidden":
                 raise HTTPException(status_code=404, detail="Workspace not found")
+        is_owner = owner_id == uid
         return {
             "workspace_id": str(ws["workspace_id"]),
             "team_memory_enabled": False,
             "is_home": False,
             "can_edit": False,
+            "can_edit_web_access": is_owner,
+            "can_edit_cos_access": False,
+            "can_edit_team_memory": False,
             "owner_external": True,
             "updated_by": None,
             "updated_at": None,
         }
 
     can_edit = can_edit_workspace_settings(ws, uid, owner_external=owner_external)
+    can_edit_sh = can_edit_workspace_sharing(ws, uid)
     if not can_edit:
         if is_dalton_auth_enabled():
             await require_workspace_access(
@@ -851,6 +1285,9 @@ async def get_workspace_settings_endpoint(
         **settings_row,
         "is_home": False,
         "can_edit": can_edit,
+        "can_edit_web_access": can_edit_sh,
+        "can_edit_cos_access": can_edit_sh,
+        "can_edit_team_memory": can_edit,
         "owner_external": False,
     }
 
@@ -863,6 +1300,7 @@ async def update_workspace_settings_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     from src.dalton.access_tiers import classify_owner_tier, get_user_tier, is_admin_user
+    from src.dalton.auth_guards import raise_external_member_forbidden
     from src.dalton.settings import is_dalton_auth_enabled
     from src.dalton.sharing import (
         can_edit_workspace_settings,
@@ -919,18 +1357,25 @@ async def update_workspace_settings_endpoint(
         and owner_id
     ):
         effective_owner_tier = await classify_owner_tier(owner_id)
+
+    if is_dalton_auth_enabled() and effective_owner_tier == "unknown":
+        if owner_id != uid:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        raise_external_member_forbidden("无法确认成员等级，暂不可修改工作区设置")
+
     owner_external = effective_owner_tier == "external"
     if owner_external:
         if owner_id != uid:
+            if not has_capability(CapabilityId.COLLEAGUE_SHARING):
+                raise HTTPException(status_code=404, detail="Workspace not found")
             if ws.get("status") in ("unbound", "deleted"):
                 raise HTTPException(status_code=404, detail="Workspace not found")
             await require_team_reader(owner_id)
             sharing = await get_workspace_sharing(str(ws["workspace_id"]))
             if sharing.get("web_access") == "hidden":
                 raise HTTPException(status_code=404, detail="Workspace not found")
-        raise HTTPException(
-            status_code=403,
-            detail="Only internal workspace owner may modify workspace settings",
+        raise_external_member_forbidden(
+            "Only internal workspace owner may modify workspace settings"
         )
 
     if not can_edit_workspace_settings(ws, uid, owner_external=owner_external):
@@ -948,6 +1393,9 @@ async def update_workspace_settings_endpoint(
         **saved,
         "is_home": False,
         "can_edit": True,
+        "can_edit_web_access": True,
+        "can_edit_cos_access": True,
+        "can_edit_team_memory": True,
         "owner_external": False,
     }
 
@@ -962,7 +1410,7 @@ async def get_user_sharing_settings_endpoint(
     from src.dalton.access_tiers import get_user_tier
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
-        is_dalton_supabase_auth_enabled,
+        is_dalton_auth_enabled,
     )
     from src.dalton.sharing import get_user_cos_sharing, require_team_reader
 
@@ -971,7 +1419,7 @@ async def get_user_sharing_settings_endpoint(
         raise HTTPException(status_code=401, detail="Authentication required")
 
     if not has_capability(CapabilityId.COLLEAGUE_SHARING):
-        if is_dalton_supabase_auth_enabled():
+        if is_dalton_auth_enabled():
             await require_team_reader(uid)
             caller_tier = await get_user_tier(uid)
         else:
@@ -986,7 +1434,7 @@ async def get_user_sharing_settings_endpoint(
             "updated_at": None,
         }
 
-    if is_dalton_supabase_auth_enabled():
+    if is_dalton_auth_enabled():
         await require_team_reader(uid)
         caller_tier = await get_user_tier(uid)
         if caller_tier == "external":
@@ -1022,9 +1470,10 @@ async def update_user_sharing_settings_endpoint(
 ) -> dict[str, Any]:
     require_capability(CapabilityId.COLLEAGUE_SHARING)
     from src.dalton.access_tiers import get_user_tier
+    from src.dalton.auth_guards import raise_external_member_forbidden
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
-        is_dalton_supabase_auth_enabled,
+        is_dalton_auth_enabled,
     )
     from src.dalton.sharing import require_team_reader, upsert_user_cos_sharing
 
@@ -1032,13 +1481,12 @@ async def update_user_sharing_settings_endpoint(
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    if is_dalton_supabase_auth_enabled():
+    if is_dalton_auth_enabled():
         await require_team_reader(uid)
         caller_tier = await get_user_tier(uid)
         if caller_tier == "external":
-            raise HTTPException(
-                status_code=403,
-                detail="外部成员的工作区不对其他人的研究总监开放，无需此项设置",
+            raise_external_member_forbidden(
+                "外部成员的工作区不对其他人的研究总监开放，无需此项设置"
             )
     else:
         caller_tier = "internal"
@@ -1054,13 +1502,17 @@ async def update_user_sharing_settings_endpoint(
     }
 
 
-@router.get("/user-settings")
+@router.get(
+    "/user-settings",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CONVERSATION_ARCHIVE))],
+)
 @handle_api_exceptions("get user team memory settings", logger)
 async def get_user_settings_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.CONVERSATION_ARCHIVE)
     from src.dalton.access_tiers import get_user_tier
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.settings import is_dalton_auth_enabled
     from src.dalton.sharing import (
         get_user_team_memory_settings,
         require_team_reader,
@@ -1070,7 +1522,7 @@ async def get_user_settings_endpoint(
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    if is_dalton_supabase_auth_enabled():
+    if is_dalton_auth_enabled():
         await require_team_reader(uid)
         caller_tier = await get_user_tier(uid)
         if caller_tier == "external":
@@ -1092,14 +1544,19 @@ async def get_user_settings_endpoint(
     }
 
 
-@router.put("/user-settings")
+@router.put(
+    "/user-settings",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CONVERSATION_ARCHIVE))],
+)
 @handle_api_exceptions("update user team memory settings", logger)
 async def update_user_settings_endpoint(
     body: UserSettingsUpdateRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.CONVERSATION_ARCHIVE)
     from src.dalton.access_tiers import get_user_tier
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.auth_guards import raise_external_member_forbidden
+    from src.dalton.settings import is_dalton_auth_enabled
     from src.dalton.sharing import (
         require_team_reader,
         upsert_user_team_memory_settings,
@@ -1109,14 +1566,11 @@ async def update_user_settings_endpoint(
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    if is_dalton_supabase_auth_enabled():
+    if is_dalton_auth_enabled():
         await require_team_reader(uid)
         caller_tier = await get_user_tier(uid)
         if caller_tier == "external":
-            raise HTTPException(
-                status_code=403,
-                detail="外部成员不提供团队记忆设置",
-            )
+            raise_external_member_forbidden("外部成员不提供团队记忆设置")
     else:
         caller_tier = "internal"
 
@@ -1143,12 +1597,23 @@ async def get_team_credentials_status_endpoint(
         is_team_credential_sharing_enabled,
     )
     from src.dalton.invites import get_user_tier
-    from src.dalton.settings import get_dalton_config, is_dalton_sharing_auth_enabled
+    from src.dalton.settings import (
+        get_dalton_auth_mode,
+        get_dalton_config,
+        is_dalton_sharing_auth_enabled,
+        is_dalton_single_user_oss_mode,
+    )
 
     cfg = get_dalton_config()
     enabled = is_team_credential_sharing_enabled()
     can_disconnect = is_credential_admin(user_id)
-    caller_tier = await get_user_tier(user_id)
+    auth_mode = get_dalton_auth_mode()
+    if is_dalton_single_user_oss_mode():
+        caller_tier = "admin"
+        can_invite = False
+    else:
+        caller_tier = await get_user_tier(user_id)
+        can_invite = caller_tier in ("admin", "internal")
     return {
         "sharing": cfg.credentials.sharing,
         "enabled": enabled,
@@ -1156,8 +1621,9 @@ async def get_team_credentials_status_endpoint(
         "credential_user_id": credential_user_id(user_id),
         "is_pm": can_disconnect,
         "can_disconnect": can_disconnect,
-        "can_invite": caller_tier in ("admin", "internal"),
+        "can_invite": can_invite,
         "caller_tier": caller_tier,
+        "auth_mode": auth_mode,
         "colleague_sharing_enabled": is_dalton_sharing_auth_enabled(),
     }
 
@@ -1392,6 +1858,16 @@ async def put_dalton_automation_endpoint(
         for nullable_key in ("llm_model", "reasoning_effort"):
             if nullable_key in extra_fields and extra_fields[nullable_key] is None and nullable_key not in spec:
                 spec = {**spec, nullable_key: None}
+        if "llm_model" in spec and isinstance(spec["llm_model"], str):
+            cleaned_model = spec["llm_model"].strip()
+            spec = {
+                **spec,
+                "llm_model": (
+                    None
+                    if cleaned_model.lower() in ("", "default", "clear")
+                    else cleaned_model
+                ),
+            }
     if (
         isinstance(spec, dict)
         and "automation_id" in raw_body_dict
@@ -2463,8 +2939,12 @@ async def redeem_invite_endpoint(
     body: InviteRedeemRequest,
     request: Request = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
+    from src.dalton.auth_guards import raise_invites_disabled_in_oss
     from src.dalton.invites import enforce_invite_rate_limit, redeem_invite_token
+    from src.dalton.settings import is_dalton_single_user_oss_mode
 
+    if is_dalton_single_user_oss_mode():
+        raise_invites_disabled_in_oss("单人模式下无需使用团队邀请")
     await enforce_invite_rate_limit(request, action="redeem")
     return await redeem_invite_token(
         token=body.token,

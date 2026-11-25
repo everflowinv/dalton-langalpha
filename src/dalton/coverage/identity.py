@@ -156,6 +156,23 @@ def _extract_ticker_from_text(raw: str | None) -> str | None:
     return None
 
 
+def canonical_workspace_ticker_key(raw: str | None) -> str | None:
+    """Return ``normalize_ticker_key(raw)`` when ``raw`` is a clean ticker shape, else None.
+
+    Shared by lock-free company dedup (Phase 1) and locked workspace-create
+    recheck (Phase 2) so ``700.HK``, ``0700.HK``, and ``00700`` (as well as
+    ``600519.SH``/``600519.SS`` and ``BRK-B``/``BRK.B``) fold to the exact same
+    canonical ticker key without misclassifying ordinary names (e.g.
+    ``"腾讯控股"`` or ``"AI Infrastructure"``).
+    """
+    cleaned = str(raw or "").strip()
+    if not cleaned or cleaned.lower() == "home" or "_" in cleaned:
+        return None
+    if not _CLEAN_TICKER_RE.match(cleaned):
+        return None
+    return normalize_ticker_key(cleaned)
+
+
 def ticker_from_automation_rows(
     workspace_id: str,
     rows: list[Mapping[str, Any]] | None,

@@ -26,6 +26,18 @@ vi.mock('@/config/daltonAuth', () => ({
 }));
 
 vi.mock('@/hooks/useTeamCredentials', () => ({
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: h.isShared ? 'team' : 'off',
+    enabled: h.isShared,
+    holder_user_id: null,
+    credential_user_id: 'u-1',
+    is_pm: true,
+    can_disconnect: true,
+    can_invite: true,
+    caller_tier: 'admin',
+    colleague_sharing_enabled: true,
+    auth_mode: h.isDaltonAuth ? 'local' : 'oss',
+  })),
   useTeamCredentials: () => ({
     isShared: h.isShared,
     canDisconnect: true,

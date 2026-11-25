@@ -712,6 +712,13 @@ class MultimodalStripMiddleware(AgentMiddleware):
         # it describes only the model it was configured for — a fallback is a
         # different model and has to be judged on its own manifest entry.
         overrides = self.custom_modalities if stamped == self.model_name else None
+        # DALTON-HOOK(team-model-catalog): honor active turn effective_catalog_snapshot input_modalities
+        if overrides is None:
+            from src.dalton.services.team_model_catalog.snapshot import lookup_snapshot_modalities
+
+            snap_mods = lookup_snapshot_modalities(stamped)
+            if snap_mods is not None:
+                return stamped, snap_mods
         return stamped, get_input_modalities(stamped, custom_modalities=overrides)
 
     def receives(self, model: Any) -> Callable[[Any], bool]:

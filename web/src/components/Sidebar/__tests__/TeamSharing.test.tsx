@@ -3,6 +3,7 @@ import { render, screen, fireEvent, act, waitFor } from '@testing-library/react'
 import { QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router';
 import { renderWithProviders, renderHookWithProviders, createTestQueryClient } from '@/test/utils';
+import { LOCAL_USER_ID } from '@/config/localUser';
 import { queryKeys } from '@/lib/queryKeys';
 import { workspaceDetailQuery } from '@/pages/ChatAgent/utils/workspaceQueries';
 import { createEditDraftStore } from '@/pages/ChatAgent/hooks/utils/editDrafts';
@@ -48,11 +49,18 @@ vi.mock('@/components/ui/dropdown-menu', () => ({
 
 const mockDaltonAuth = vi.hoisted(() => ({ isDaltonAuth: true }));
 
-vi.mock('@/config/daltonAuth', () => ({
-  get isDaltonAuth() {
-    return mockDaltonAuth.isDaltonAuth;
-  },
-}));
+vi.mock('@/config/daltonAuth', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/config/daltonAuth')>();
+  return {
+    ...actual,
+    get isDaltonAuth() {
+      return mockDaltonAuth.isDaltonAuth;
+    },
+    get DALTON_AUTH_MODE() {
+      return mockDaltonAuth.isDaltonAuth ? 'local' : 'oss';
+    },
+  };
+});
 
 const mockApiGet = vi.hoisted(() => vi.fn());
 const mockApiPost = vi.hoisted(() => vi.fn());
@@ -310,6 +318,7 @@ import {
   TeamReadOnlyBanner,
   TeamReadOnlyComposer,
   useTeamReadOnly,
+  useTeamWorkspaces,
   type TeamWorkspacesResponse,
 } from '@/pages/ChatAgent/components/dalton/TeamSharing';
 import { WorkspaceSharingModal } from '@/pages/ChatAgent/components/dalton/WorkspaceSharingModal';
@@ -398,6 +407,19 @@ const SAMPLE_TEAM_RESPONSE: TeamWorkspacesResponse = {
   ],
 };
 
+const SAMPLE_INTERNAL_CREDS = {
+  sharing: 'team' as const,
+  enabled: true,
+  holder_user_id: null,
+  credential_user_id: LOCAL_USER_ID,
+  is_pm: false,
+  can_disconnect: false,
+  can_invite: true,
+  caller_tier: 'internal' as const,
+  colleague_sharing_enabled: true,
+  auth_mode: 'local' as const,
+};
+
 describe('Dalton Team Sharing', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -406,7 +428,12 @@ describe('Dalton Team Sharing', () => {
     mockGrantResult.data = undefined;
     mockShareLinkResult.data = undefined;
     mockMessages.current = [];
-    mockApiGet.mockResolvedValue({ data: SAMPLE_TEAM_RESPONSE });
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/v1/dalton/credentials/status') {
+        return Promise.resolve({ data: SAMPLE_INTERNAL_CREDS });
+      }
+      return Promise.resolve({ data: SAMPLE_TEAM_RESPONSE });
+    });
     mockApiPost.mockResolvedValue({ data: {} });
     Element.prototype.scrollTo = vi.fn();
   });
@@ -419,6 +446,7 @@ describe('Dalton Team Sharing', () => {
     });
 
     const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID), SAMPLE_INTERNAL_CREDS);
     queryClient.setQueryData(queryKeys.workspaces.team(), SAMPLE_TEAM_RESPONSE);
 
     renderWithProviders(<TeamWorkspacesSection currentWorkspaceId={null} />, {
@@ -1210,6 +1238,42 @@ describe('Dalton Team Sharing', () => {
     }
   });
 
+  // DALTON-HOOK(external-member-perms): cached team lists grant write access only to a confirmed internal member.
+  it('keeps a cached rw colleague workspace read-only for an external caller', () => {
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID), {
+      ...SAMPLE_INTERNAL_CREDS,
+      caller_tier: 'external' as const,
+    });
+    queryClient.setQueryData(queryKeys.workspaces.team(), {
+      caller_tier: 'internal',
+      members: [
+        {
+          user_id: 'u-richard',
+          email: 'richard.lu@dalton.test',
+          display_name: 'Richard Lu',
+          workspaces: [
+            {
+              workspace_id: 'ws-rw-cached',
+              user_id: 'u-richard',
+              owner_name: 'Richard Lu',
+              owner_email: 'richard.lu@dalton.test',
+              name: 'Cached RW',
+              status: 'running',
+              access: 'rw',
+              web_access: 'rw',
+              cos_access: 'rw',
+            },
+          ],
+        },
+      ],
+    } as TeamWorkspacesResponse);
+    const { result } = renderHookWithProviders(() => useTeamReadOnly('ws-rw-cached'), { queryClient });
+    expect(result.current.isColleague).toBe(true);
+    expect(result.current.access).toBe('ro');
+    expect(result.current.canWriteFiles).toBe(false);
+  });
+
   it('supports 3-state useTeamReadOnly (owner / rw / ro) and renders access badges in TeamWorkspacesSection', async () => {
     const { default: i18n } = await import('@/i18n');
     await i18n.changeLanguage('zh-CN');
@@ -1218,6 +1282,7 @@ describe('Dalton Team Sharing', () => {
     });
 
     const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID), SAMPLE_INTERNAL_CREDS);
     const teamWithLevels: TeamWorkspacesResponse = {
       caller_tier: 'internal',
       members: [
@@ -1332,6 +1397,7 @@ describe('Dalton Team Sharing', () => {
     });
     const wsId = '11111111-1111-4111-8111-111111111111';
     const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID), SAMPLE_INTERNAL_CREDS);
     queryClient.setQueryData(queryKeys.dalton.sharing(wsId), {
       workspace_id: wsId,
       cos_access: 'ro',
@@ -1405,6 +1471,10 @@ describe('Dalton Team Sharing', () => {
     const webRw = screen.getByTestId('sharing-web-rw');
     const webRo = screen.getByTestId('sharing-web-ro');
     const webHidden = screen.getByTestId('sharing-web-hidden');
+
+    await waitFor(() => {
+      expect(webRw).not.toBeDisabled();
+    });
 
     expect(webHidden).toHaveAttribute('aria-pressed', 'true');
     expect(webRw).toHaveAttribute('aria-pressed', 'false');
@@ -1495,6 +1565,11 @@ describe('Dalton Team Sharing', () => {
 
   it('does not render team section when caller_tier is external', () => {
     const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID), {
+      ...SAMPLE_INTERNAL_CREDS,
+      caller_tier: 'external',
+      can_invite: false,
+    });
     queryClient.setQueryData(queryKeys.workspaces.team(), {
       ...SAMPLE_TEAM_RESPONSE,
       caller_tier: 'external',
@@ -1520,8 +1595,17 @@ describe('Dalton Team Sharing', () => {
   });
 
   it('does not render team section when the team query fails', async () => {
-    mockApiGet.mockRejectedValueOnce(new Error('network down'));
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/v1/dalton/credentials/status') {
+        return Promise.resolve({ data: SAMPLE_INTERNAL_CREDS });
+      }
+      if (url === '/api/v1/dalton/workspaces/team') {
+        return Promise.reject(new Error('network down'));
+      }
+      return Promise.resolve({ data: {} });
+    });
     const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID), SAMPLE_INTERNAL_CREDS);
 
     renderWithProviders(<TeamWorkspacesSection currentWorkspaceId={null} />, {
       queryClient,
@@ -1543,7 +1627,19 @@ describe('Dalton Team Sharing', () => {
     onTestFinished(async () => {
       await i18n.changeLanguage('en-US');
     });
+    const externalCreds = {
+      ...SAMPLE_INTERNAL_CREDS,
+      caller_tier: 'external' as const,
+      can_invite: false,
+    };
+    mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/v1/dalton/credentials/status') {
+        return Promise.resolve({ data: externalCreds });
+      }
+      return Promise.resolve({ data: SAMPLE_TEAM_RESPONSE });
+    });
     const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID), externalCreds);
     queryClient.setQueryData(queryKeys.dalton.sharing('ws-ext-1'), {
       workspace_id: 'ws-ext-1',
       cos_access: 'hidden',
@@ -1580,6 +1676,9 @@ describe('Dalton Team Sharing', () => {
     expect(screen.getByTestId('sharing-web-fieldset')).toBeInTheDocument();
 
     const webRo = screen.getByTestId('sharing-web-ro');
+    await waitFor(() => {
+      expect(webRo).not.toBeDisabled();
+    });
     fireEvent.click(webRo);
     expect(webRo).toHaveAttribute('aria-pressed', 'true');
 
@@ -2085,18 +2184,26 @@ describe('Dalton Team Sharing', () => {
     unmountWsColleague();
   });
 
-  it('gates TeamWorkspacesSection visibility on colleague_sharing capability while keeping /workspaces/team query timing unchanged', async () => {
-    const neutralTeamResp: TeamWorkspacesResponse = {
-      members: [],
+  it('gates TeamWorkspacesSection visibility and /workspaces/team query on colleague_sharing capability and internal identity', async () => {
+    const internalCreds = {
+      sharing: 'team',
+      enabled: true,
       caller_tier: 'internal',
-      colleague_dispatch_enabled: false,
+      colleague_sharing_enabled: true,
+      auth_mode: 'local',
+      is_pm: false,
+      can_disconnect: false,
+      can_invite: true,
     };
 
-    // 1. Core profile: capabilities loaded without colleague_sharing + neutral 200 -> section hidden, query still sent.
+    // 1. Core profile: capabilities loaded without colleague_sharing -> section hidden and /workspaces/team skipped.
     mockApiGet.mockReset();
     mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/v1/dalton/credentials/status') {
+        return Promise.resolve({ data: internalCreds });
+      }
       if (url === '/api/v1/dalton/workspaces/team') {
-        return Promise.resolve({ data: neutralTeamResp });
+        return Promise.resolve({ data: SAMPLE_TEAM_RESPONSE });
       }
       return Promise.resolve({ data: { profile: 'core', capabilities: [] } });
     });
@@ -2110,17 +2217,21 @@ describe('Dalton Team Sharing', () => {
       queryClient: coreClient,
     });
     await waitFor(() => {
-      expect(mockApiGet).toHaveBeenCalledWith('/api/v1/dalton/workspaces/team');
+      expect(mockApiGet).toHaveBeenCalledWith(
+        '/api/v1/dalton/credentials/status',
+        expect.anything(),
+      );
     });
-    await waitFor(() => {
-      expect(coreClient.getQueryData(queryKeys.workspaces.team())).toEqual(neutralTeamResp);
-    });
+    expect(mockApiGet).not.toHaveBeenCalledWith('/api/v1/dalton/workspaces/team');
     expect(screen.queryByTestId('team-workspaces-section')).toBeNull();
     coreView.unmount();
 
-    // 2. Capabilities include colleague_sharing -> section renders normally, query sent.
+    // 2. Capabilities include colleague_sharing + internal caller -> section renders normally, query sent.
     mockApiGet.mockClear();
     mockApiGet.mockImplementation((url: string) => {
+      if (url === '/api/v1/dalton/credentials/status') {
+        return Promise.resolve({ data: internalCreds });
+      }
       if (url === '/api/v1/dalton/workspaces/team') {
         return Promise.resolve({ data: SAMPLE_TEAM_RESPONSE });
       }
@@ -2139,11 +2250,14 @@ describe('Dalton Team Sharing', () => {
     expect(mockApiGet).toHaveBeenCalledWith('/api/v1/dalton/workspaces/team');
     enabledView.unmount();
 
-    // 3. Everflow build with capabilities still pending -> section renders normally on first paint, query sent.
+    // 3. Everflow build with capabilities still pending + internal caller -> section renders on first paint, query sent.
     mockApiGet.mockClear();
     mockApiGet.mockImplementation((url: string) => {
       if (url === '/api/v1/dalton/capabilities') {
         return new Promise(() => {});
+      }
+      if (url === '/api/v1/dalton/credentials/status') {
+        return Promise.resolve({ data: internalCreds });
       }
       if (url === '/api/v1/dalton/workspaces/team') {
         return Promise.resolve({ data: SAMPLE_TEAM_RESPONSE });
@@ -2157,5 +2271,40 @@ describe('Dalton Team Sharing', () => {
     expect(await screen.findByTestId('team-workspaces-section')).toBeInTheDocument();
     expect(mockApiGet).toHaveBeenCalledWith('/api/v1/dalton/workspaces/team');
     pendingView.unmount();
+  });
+
+  it('starts no background queries in useTeamReadOnly or useTeamWorkspaces when inactive', () => {
+    mockApiGet.mockClear();
+
+    // 1. workspaceId is null under Dalton auth -> no capabilities, credentials, or team fetches.
+    const qcNoWs = createTestQueryClient();
+    const noWsView = renderHookWithProviders(() => useTeamReadOnly(null, null), {
+      queryClient: qcNoWs,
+    });
+    expect(noWsView.result.current.access).toBe('owner');
+    expect(qcNoWs.isFetching()).toBe(0);
+    expect(mockApiGet).not.toHaveBeenCalled();
+    noWsView.unmount();
+
+    // 2. isDaltonAuth is false with a workspaceId -> no capabilities, credentials, or team fetches.
+    mockDaltonAuth.isDaltonAuth = false;
+    const qcNoAuth = createTestQueryClient();
+    const noAuthView = renderHookWithProviders(() => useTeamReadOnly('ws-1', null), {
+      queryClient: qcNoAuth,
+    });
+    expect(noAuthView.result.current.access).toBe('owner');
+    expect(qcNoAuth.isFetching()).toBe(0);
+    expect(mockApiGet).not.toHaveBeenCalled();
+    noAuthView.unmount();
+
+    // 3. useTeamWorkspaces(false) -> no capabilities, credentials, or team fetches.
+    mockDaltonAuth.isDaltonAuth = true;
+    const qcDisabled = createTestQueryClient();
+    const disabledView = renderHookWithProviders(() => useTeamWorkspaces(false), {
+      queryClient: qcDisabled,
+    });
+    expect(qcDisabled.isFetching()).toBe(0);
+    expect(mockApiGet).not.toHaveBeenCalled();
+    disabledView.unmount();
   });
 });

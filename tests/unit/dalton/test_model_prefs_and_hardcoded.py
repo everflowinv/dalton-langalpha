@@ -53,6 +53,7 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     ("llm/notional_pricing.py", "-oauth"): "Nominal pricing model reference normalization",
     ("llm/notional_pricing.py", "{candidate}-oauth"): "Nominal pricing model reference normalization",
     ("llm/notional_pricing.py", "{identity}-oauth"): "Nominal pricing model reference normalization",
+    ("services/team_model_catalog/billing.py", "{mid}-oauth"): "Legacy bare-id subscription suffix probe in resolve_model_billing",
     # The Grok key Dalton pins to its own xai-oauth line
     # (PINNED_OVERLAY_MODEL_KEYS; upstream grew same-named entry on grok-oauth).
     ("llm/overlay.py", "grok-4.7-oauth"): "Pinned overlay route key",

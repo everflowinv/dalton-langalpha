@@ -26,6 +26,18 @@ vi.mock('@/pages/ChatAgent/utils/api/workspaces', async (importOriginal) => ({
   getHomeWorkspace: home.getHomeWorkspace,
 }));
 vi.mock('@/hooks/useTeamCredentials', () => ({
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: 'off',
+    enabled: false,
+    holder_user_id: null,
+    credential_user_id: 'u-1',
+    is_pm: true,
+    can_disconnect: true,
+    can_invite: false,
+    caller_tier: credentials.callerTier,
+    colleague_sharing_enabled: false,
+    auth_mode: 'local',
+  })),
   useTeamCredentials: () => ({
     isShared: false,
     canDisconnect: true,
@@ -35,6 +47,42 @@ vi.mock('@/hooks/useTeamCredentials', () => ({
     callerTier: credentials.callerTier,
     callerTierPending: credentials.callerTierPending,
   }),
+}));
+vi.mock('@/hooks/useCallerIdentity', () => ({
+  useCallerIdentity: () => {
+    const status = credentials.callerTierPending ? 'loading' : 'ready';
+    const tier = credentials.callerTierPending
+      ? 'unknown'
+      : (credentials.callerTier ?? 'admin');
+    const isAdmin = status === 'ready' && tier === 'admin';
+    const isInternal = status === 'ready' && (tier === 'admin' || tier === 'internal');
+    const snapshot = {
+      tier,
+      status,
+      authMode: 'local',
+      isPlatform: false,
+      isKnown: status === 'ready',
+      isConfirming: status === 'loading',
+      isMultiUserAuth: true,
+      isSingleUserOss: false,
+      isAdmin,
+      isInternal,
+      isExternal: status === 'ready' && tier === 'external',
+      canActAsOwner: isInternal,
+      canPublishPublic: isAdmin,
+      canInvite: false,
+      isTeamCredentialsShared: false,
+      canManageCredentials: true,
+      isPm: true,
+      colleagueSharingEnabled: false,
+    };
+    return {
+      ...snapshot,
+      getLatestIdentity: () => snapshot,
+      isConfirmingNow: () => snapshot.isConfirming,
+      revalidate: vi.fn(async () => undefined),
+    };
+  },
 }));
 vi.mock('@/contexts/AuthContext', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/contexts/AuthContext')>();

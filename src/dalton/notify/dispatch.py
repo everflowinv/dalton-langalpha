@@ -5432,6 +5432,8 @@ async def on_automation_settled(
             "category": classification.category,
             "source": "automation_completion",
         }
+        if thread_id and str(thread_id).strip():
+            base_payload_record["thread_id"] = str(thread_id).strip()
         eff_unit_id = clean_stamped_unit_id or active_unit_id
         if eff_unit_id:
             base_payload_record["coverage_unit_id"] = eff_unit_id

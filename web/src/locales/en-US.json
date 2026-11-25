@@ -1009,7 +1009,12 @@
     "sharedOn": "Shared {{date}}",
     "stop": "Stop",
     "signInForChart": "Sign in to open the live chart.",
-    "statusLoadFailed": "Couldn't load the sharing settings."
+    "statusLoadFailed": "Couldn't load the sharing settings.",
+    "confirmingIdentity": "Confirming account permissions…",
+    "identityFailed": "Couldn't confirm account permissions. Please retry.",
+    "externalReadOnlyHint": "External members can only manage existing shares.",
+    "externalStopOnlyHint": "Use the switch above to stop sharing this conversation.",
+    "updateFailed": "Couldn't update sharing settings. Please try again."
   },
   "shareLink": {
     "title": "Share {{file}}",
@@ -1877,12 +1882,19 @@
     "createWorkspaceCard": {
       "title": "Create workspace",
       "create": "Create",
-      "decline": "Decline",
+      "creating": "Creating...",
+      "decline": "Cancel",
       "created": "Workspace created: {{name}}",
+      "createdOnComputer": "Workspace created on {{computer}}: {{name}}",
       "createdStatus": "Workspace created",
-      "declined": "Workspace creation declined",
+      "declined": "Workspace creation cancelled",
+      "targetComputer": "Target computer: {{computer}}",
+      "newCloudComputer": "New hosted cloud computer",
+      "scopeChanged": "Conditions changed. Please start again.",
+      "failed": "Failed to create workspace",
+      "failedWithReason": "Failed to create workspace: {{reason}}",
       "alwaysApprove": "Always allow",
-      "alwaysApproveHint": "Create this and later workspaces without asking. Turn it off in Settings.",
+      "alwaysApproveHint": "Create this and later workspaces on cloud computers without asking. Turn it off in Settings.",
       "duplicateExists": "You already have a similar workspace: {{duplicate}}. You can use it instead of creating a duplicate.",
       "duplicateUnknown": "Could not confirm whether you already have a workspace with this name or ticker."
     },

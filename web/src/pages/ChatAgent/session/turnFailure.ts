@@ -100,6 +100,17 @@ export function readTurnFailure(err: unknown, { t, standing, workspaceId }: {
     return answer({ message: t(BUSY_REFUSAL_KEYS[errorInfo.code]), kind: 'notice' }, false);
   }
   const worded = typeof errorInfo?.message === 'string' && errorInfo.message ? errorInfo.message : null;
+  // DALTON-HOOK(team-model-catalog): surface compare-and-reject resume refusal as a clear notice banner
+  // so the user can send a fresh message under the updated team model catalog configuration.
+  if (errorInfo?.type === 'catalog_route_changed' || errorInfo?.code === 'catalog_route_changed') {
+    return answer(
+      {
+        message: worded || '这个回合中断期间团队模型配置发生了变化，请重新发送消息',
+        kind: 'notice',
+      },
+      true,
+    );
+  }
   // A Claude Code turn the server cannot run says what to change, and a
   // retry meets the same refusal. Without a working token, the change is
   // one the user makes in Settings. A Claude plan's limit is worded where it

@@ -1,19 +1,14 @@
-"""Native-subscription model check/sync/retire/status service.
+"""Native-subscription model check/sync/retire/restore/status service.
 
-`check` fetches every native provider's model list with the team credential's
-token and returns the diff without writing anything. `sync` applies the models
-the PM selected from the last succeeded check to the runtime overlay
-(`var/dalton/catalog/native_sync_overlay.json`) — add-only, atomic, and followed
-by the same local cache invalidation OpenClaw sync uses, so every worker picks
-the new catalog up through the overlay stamp. `retire`/`restore` manage the
-overlay's `retired` list (hide/unhide in the merged catalog) under the same
-lock; a model referenced by any setting, preference, subagent, or automation is
-refused. Nothing here schedules itself, auto-syncs, auto-restores, or touches
-default model settings.
+Batch 1 (team-model-catalog d051) converges reads & writes onto PostgreSQL
+``dalton_team_model_catalog`` / ``dalton_team_model_catalog_revisions`` under
+the exclusive catalog advisory lock while preserving ``dalton_openclaw_sync_runs``
+history records for the Settings card.
 """
 
 from __future__ import annotations
 
+import copy
 import inspect
 import logging
 from datetime import datetime, timezone
@@ -30,24 +25,36 @@ from src.dalton.database.native_sync import (
     try_acquire_native_sync_lock,
 )
 from src.dalton.database.provider_events import sanitize_error_text
+from src.dalton.database.team_model_catalog import (
+    acquire_catalog_exclusive_lock,
+    fetch_legacy_retired_history,
+    get_catalog_row,
+    save_catalog_revision,
+)
 from src.dalton.llm.native_catalog import (
     NATIVE_LISTING_PROVIDERS,
     NATIVE_SYNC_OVERLAY_PATH,
     build_native_diff,
     build_overlay_entries,
     collect_native_listings,
-    load_native_sync_overlay,
-    load_retired_models,
     read_retired_keys_strict,
-    retired_key_set,
-    retire_native_models,
-    restore_native_models,
-    write_native_sync_overlay,
 )
-from src.dalton.llm.overlay import load_dalton_meta
 from src.dalton.services import model_references
 from src.dalton.services.model_references import ReferenceSourceUnavailable
-from src.dalton.services.openclaw_admin import _invalidate_local_worker_model_caches
+from src.dalton.services.team_model_catalog.compiled import (
+    cache_compiled_catalog,
+    compile_catalog_from_payload,
+    get_compiled_catalog_async,
+)
+from src.dalton.services.team_model_catalog.constants import CATALOG_SCHEMA
+from src.dalton.services.team_model_catalog.follow import (
+    invalidate_catalog_redis_caches,
+    publish_catalog_changed,
+)
+from src.dalton.services.team_model_catalog.legacy_import import (
+    extract_disk_legacy_retired_readonly,
+)
+from src.dalton.services.team_model_catalog.validation import trial_compile_and_validate_catalog
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
@@ -60,13 +67,7 @@ def _utcnow_iso() -> str:
 
 
 async def _collect_reference_map(*, strict: bool = False) -> dict[str, list[str]]:
-    """Merge every reference source into `{model_key: [source, ...]}`.
-
-    Lenient (the check's "in use" display): a source that cannot be read is
-    logged and skipped. Strict (retire): the first unreadable source raises
-    `ReferenceSourceUnavailable`, because a model must not be hidden while any
-    source that could be holding a reference to it is a question mark.
-    """
+    """Merge every reference source into `{model_key: [source, ...]}`."""
     merged: dict[str, list[str]] = {}
     for source, collect in (
         ("agent_config", model_references.agent_config_refs),
@@ -113,7 +114,7 @@ def _listing_rows(succeeded_check: dict[str, Any] | None) -> list[dict[str, Any]
 
 
 async def run_native_check(*, user_id: str) -> dict[str, Any]:
-    """Fetch all native listings and diff them against the merged catalog. No writes."""
+    """Fetch all native listings and diff them against the DB-backed merged catalog. No writes."""
     async with get_db_connection() as conn:
         locked = await try_acquire_native_sync_lock(conn)
         if not locked:
@@ -126,16 +127,20 @@ async def run_native_check(*, user_id: str) -> dict[str, Any]:
             try:
                 listings = await collect_native_listings(user_id)
 
-                from src.llms.llm import LLM
-
-                llm_config = LLM.get_model_config().llm_config or {}
+                compiled = await get_compiled_catalog_async(conn=conn)
+                llm_config = compiled.model_config.llm_config or {}
                 awaiting_keys = {
                     key
-                    for key, meta in load_dalton_meta().items()
+                    for key, meta in (compiled.dalton_meta or {}).items()
                     if isinstance(meta, dict) and meta.get("awaiting_release")
                 }
+                all_retired = set(
+                    compiled.factory_retired_keys
+                    | compiled.readonly_legacy_retired_keys
+                    | compiled.team_retired_keys
+                )
                 diff = build_native_diff(
-                    listings, llm_config, retired_key_set(), awaiting_release_keys=awaiting_keys
+                    listings, llm_config, all_retired, awaiting_release_keys=awaiting_keys
                 )
 
                 provider_rows = [
@@ -165,11 +170,6 @@ async def run_native_check(*, user_id: str) -> dict[str, Any]:
                     if p["status"] == "error"
                 ]
 
-                # No provider succeeding (or answering anything parseable)
-                # means this check proved nothing: record it failed so the last
-                # succeeded check keeps feeding the card and a confirm-sync.
-                # This run's own provider errors ride its diff; the succeeded
-                # check's diff stays untouched.
                 if counts["providers_ok"] == 0:
                     message = "；".join(warnings) or "没有任何供应商返回可用模型列表"
                     await finish_native_sync_run(
@@ -206,6 +206,7 @@ async def run_native_check(*, user_id: str) -> dict[str, Any]:
                 return {
                     "run_id": run_id,
                     "checked_at": _utcnow_iso(),
+                    "catalog_revision": compiled.revision,
                     "providers": provider_rows,
                     "diff": {
                         "added": diff["added"],
@@ -231,12 +232,15 @@ async def run_native_check(*, user_id: str) -> dict[str, Any]:
 
 
 async def run_native_sync(*, user_id: str, model_keys: list[str]) -> dict[str, Any]:
-    """Apply selected `model_keys` from the last succeeded check to the runtime overlay."""
+    """Apply selected `model_keys` from the last succeeded check into ``dalton_team_model_catalog``."""
     if not model_keys:
         raise HTTPException(
             status_code=422,
             detail={"code": "empty_selection", "message": "未选择要加入的模型。"},
         )
+
+    committed_compiled = None
+    committed_rev: int | None = None
 
     async with get_db_connection() as conn:
         locked = await try_acquire_native_sync_lock(conn)
@@ -246,12 +250,8 @@ async def run_native_sync(*, user_id: str, model_keys: list[str]) -> dict[str, A
                 detail={"code": "sync_in_progress", "message": _NATIVE_CHECK_LOCK_BUSY_MESSAGE},
             )
         try:
-            # The lock is held before the check is read (same rule as retire):
-            # neither a retire nor another confirm can swap the selection basis
-            # under this sync. previously_retired is re-judged from the live
-            # retire list, since a retire may have landed after the check.
             last_check = await fetch_last_succeeded_native_check(conn=conn)
-            check_diff = ((last_check or {}).get("diff") or {})
+            check_diff = (last_check or {}).get("diff") or {}
             added_by_key = {
                 str(item.get("suggested_key")): item for item in check_diff.get("added") or []
             }
@@ -279,58 +279,163 @@ async def run_native_sync(*, user_id: str, model_keys: list[str]) -> dict[str, A
                         ],
                     },
                 )
-            # The retire list is read loud: an unreadable overlay answering
-            # "nothing retired" would let this sync re-add a retired model.
-            try:
-                live_retired = read_retired_keys_strict()
-            except ValueError:
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "code": "retired_list_unreadable",
-                        "message": "已下线名单读取失败，无法校验所选模型；请检查运行时 overlay 文件后重试。",
-                    },
-                )
-            previously_retired = [
-                k
-                for k in model_keys
-                if k in live_retired or added_by_key[k].get("previously_retired")
+
+            flagged_retired = [
+                k for k in model_keys if added_by_key[k].get("previously_retired")
             ]
-            if previously_retired:
-                # The overlay merge hides retired keys, so syncing one would
-                # write an entry the catalog then filters out. Restore it
-                # first instead.
+            if flagged_retired:
                 raise HTTPException(
                     status_code=409,
                     detail={
                         "code": "previously_retired",
                         "message": "以下模型之前已下线、上游重新出现；如需恢复请在“已下线的模型”中点恢复：",
-                        "models": previously_retired,
+                        "models": flagged_retired,
+                    },
+                )
+
+            # Pre-flight fail-closed check before creating a sync run row:
+            # missing catalog row, failed legacy import, unreadable pending legacy file,
+            # or a key retired since the last check must reject without polluting run history.
+            cat_preview = await get_catalog_row(conn=conn)
+            if cat_preview is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "retired_list_unreadable",
+                        "message": "无法读取团队模型目录的已下线名单（dalton_team_model_catalog 缺失），已拒绝同步。",
+                    },
+                )
+            if cat_preview["legacy_sync_import_status"] == "failed":
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "legacy_overlay_import_failed",
+                        "message": "旧目录文件导入失败，已暂停原生模型同步写入；请先在团队模型目录中完成修复（重试导入或确认放弃旧文件）。",
+                    },
+                )
+            pending_disk_retired: set[str] = set()
+            if cat_preview["legacy_sync_import_status"] == "pending":
+                try:
+                    pending_disk_retired = read_retired_keys_strict()
+                except Exception as exc:
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "code": "retired_list_unreadable",
+                            "message": "无法读取旧同步文件的已下线名单，已拒绝同步；请先检查或修复旧目录文件。",
+                        },
+                    ) from exc
+
+            preview_compiled = compile_catalog_from_payload(
+                cat_preview["payload"],
+                revision=int(cat_preview["revision"]),
+                legacy_sync_import_status=cat_preview["legacy_sync_import_status"],
+                last_known_legacy_retired=cat_preview["last_known_legacy_retired"],
+            )
+            preview_retired = (
+                preview_compiled.factory_retired_keys
+                | preview_compiled.readonly_legacy_retired_keys
+                | preview_compiled.team_retired_keys
+                | pending_disk_retired
+            )
+            previously_retired_preview = [k for k in model_keys if k in preview_retired]
+            if previously_retired_preview:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "previously_retired",
+                        "message": "以下模型之前已下线、上游重新出现；如需恢复请在“已下线的模型”中点恢复：",
+                        "models": previously_retired_preview,
                     },
                 )
 
             run_id = await create_native_sync_run(started_by=user_id, kind="sync", conn=conn)
             try:
-                from src.dalton.llm.overlay import load_dalton_meta
-                from src.llms.llm import LLM
+                async with conn.transaction():
+                    await acquire_catalog_exclusive_lock(conn)
+                    cat_row = await get_catalog_row(conn=conn, for_update=True)
+                    if cat_row is None:
+                        raise HTTPException(
+                            status_code=503,
+                            detail={
+                                "code": "retired_list_unreadable",
+                                "message": "无法读取团队模型目录的已下线名单（dalton_team_model_catalog 缺失），已拒绝同步。",
+                            },
+                        )
+                    # §2.6 #3: lock native sync writes while legacy import is in 'failed' state
+                    if cat_row["legacy_sync_import_status"] == "failed":
+                        raise HTTPException(
+                            status_code=503,
+                            detail={
+                                "code": "legacy_overlay_import_failed",
+                                "message": "旧目录文件导入失败，已暂停原生模型同步写入；请先在团队模型目录中完成修复（重试导入或确认放弃旧文件）。",
+                            },
+                        )
 
-                llm_config = LLM.get_model_config().llm_config or {}
-                selected = [added_by_key[k] for k in model_keys]
-                models_out, meta_out = build_overlay_entries(
-                    selected, llm_config, load_dalton_meta()
-                )
-                skipped = [k for k in model_keys if k not in models_out]
-                applied_keys = sorted(models_out)
-                stamp: str | None = None
-                if models_out:
-                    # Writing the file is what every worker sees: each one re-stats
-                    # the overlay sources (throttled to 1 stat / 2s) and rebuilds
-                    # its model config when the stamp moves; the local cache clear
-                    # just makes the worker that served this request immediate.
-                    stamp = write_native_sync_overlay(
-                        models_out, meta_out, added_keys=applied_keys
+                    cur_rev = int(cat_row["revision"])
+                    current_compiled = compile_catalog_from_payload(
+                        cat_row["payload"],
+                        revision=cur_rev,
+                        legacy_sync_import_status=cat_row["legacy_sync_import_status"],
+                        last_known_legacy_retired=cat_row["last_known_legacy_retired"],
                     )
-                    _invalidate_local_worker_model_caches()
+                    live_retired = (
+                        current_compiled.factory_retired_keys
+                        | current_compiled.readonly_legacy_retired_keys
+                        | current_compiled.team_retired_keys
+                        | pending_disk_retired
+                    )
+                    previously_retired = [
+                        k
+                        for k in model_keys
+                        if k in live_retired or added_by_key[k].get("previously_retired")
+                    ]
+                    if previously_retired:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "previously_retired",
+                                "message": "以下模型之前已下线、上游重新出现；如需恢复请在“已下线的模型”中点恢复：",
+                                "models": previously_retired,
+                            },
+                        )
+
+                    llm_config = current_compiled.model_config.llm_config or {}
+                    selected = [added_by_key[k] for k in model_keys]
+                    models_out, meta_out = build_overlay_entries(
+                        selected, llm_config, current_compiled.dalton_meta
+                    )
+                    skipped = [k for k in model_keys if k not in models_out]
+                    applied_keys = sorted(models_out)
+                    stamp: str | None = None
+                    if models_out:
+                        next_payload = copy.deepcopy(cat_row["payload"])
+                        next_payload["schema"] = CATALOG_SCHEMA
+                        dst_models = next_payload.setdefault("models", {})
+                        dst_meta = next_payload.setdefault("dalton_meta", {})
+                        for mk, mv in models_out.items():
+                            dst_models.setdefault(mk, copy.deepcopy(mv))
+                        for mk, mv in meta_out.items():
+                            dst_meta.setdefault(mk, copy.deepcopy(mv))
+                        committed_compiled = trial_compile_and_validate_catalog(
+                            next_payload,
+                            revision=cur_rev + 1,
+                            legacy_sync_import_status=cat_row["legacy_sync_import_status"],
+                            last_known_legacy_retired=cat_row["last_known_legacy_retired"],
+                        )
+                        saved = await save_catalog_revision(
+                            conn,
+                            expected_revision=cur_rev,
+                            action="native_sync",
+                            target_keys=applied_keys,
+                            payload=next_payload,
+                            diff_summary={"added_keys": applied_keys, "skipped_keys": skipped},
+                            side_effects=[],
+                            actor_user_id=user_id,
+                            comment="NativeModelsCard sync",
+                        )
+                        committed_rev = int(saved["catalog"]["revision"])
+                        stamp = f"db:rev:{committed_rev}"
 
                 await finish_native_sync_run(
                     run_id=run_id,
@@ -340,14 +445,13 @@ async def run_native_sync(*, user_id: str, model_keys: list[str]) -> dict[str, A
                     overlay_stamp=stamp,
                     conn=conn,
                 )
-                return {
-                    "run_id": run_id,
-                    "applied": bool(applied_keys),
-                    "added_keys": applied_keys,
-                    "skipped_keys": skipped,
-                    "synced_at": _utcnow_iso(),
-                }
-            except HTTPException:
+            except HTTPException as exc:
+                await finish_native_sync_run(
+                    run_id=run_id,
+                    status="failed",
+                    error=str(exc.detail),
+                    conn=conn,
+                )
                 raise
             except Exception as exc:
                 err = sanitize_error_text(exc)
@@ -361,23 +465,32 @@ async def run_native_sync(*, user_id: str, model_keys: list[str]) -> dict[str, A
         finally:
             await release_native_sync_lock(conn)
 
+    if committed_compiled is not None and committed_rev is not None:
+        cache_compiled_catalog(committed_compiled)
+        await publish_catalog_changed(committed_rev)
+        await invalidate_catalog_redis_caches(
+            actor_user_id=user_id, compiled=committed_compiled
+        )
+    return {
+        "run_id": run_id,
+        "applied": bool(applied_keys),
+        "added_keys": applied_keys,
+        "skipped_keys": skipped,
+        "catalog_revision": committed_rev,
+        "synced_at": _utcnow_iso(),
+    }
+
 
 async def run_native_retire(*, user_id: str, model_keys: list[str]) -> dict[str, Any]:
-    """Hide selected deprecated models by adding them to the overlay's `retired` list.
-
-    A key must appear in the last succeeded check's deprecated list (retire is
-    not a way to hide arbitrary models). A referenced model is refused with its
-    reference locations; the rest still retire. Nothing is deleted — the model
-    entry stays in the overlay/upstream, so a restore brings it straight back.
-    The reference check is strict: any unreadable source rejects the whole
-    retire, because a hidden model with a dangling reference breaks every turn
-    that tries it.
-    """
+    """Retire selected deprecated models into ``dalton_team_model_catalog`` under exclusive lock."""
     if not model_keys:
         raise HTTPException(
             status_code=422,
             detail={"code": "empty_selection", "message": "未选择要下线的模型。"},
         )
+
+    committed_compiled = None
+    committed_rev: int | None = None
 
     async with get_db_connection() as conn:
         locked = await try_acquire_native_sync_lock(conn)
@@ -389,62 +502,97 @@ async def run_native_retire(*, user_id: str, model_keys: list[str]) -> dict[str,
         try:
             run_id = await create_native_sync_run(started_by=user_id, kind="retire", conn=conn)
             try:
-                # The lock is held before the check is read: a check running
-                # beside this retire cannot swap the deprecated list under us.
                 last_check = await fetch_last_succeeded_native_check(conn=conn)
                 deprecated_by_key = {
                     str(item.get("key")): item
                     for item in (((last_check or {}).get("diff") or {}).get("deprecated") or [])
                 }
 
-                try:
-                    refs = await _collect_reference_map(strict=True)
-                except ReferenceSourceUnavailable as exc:
-                    # The exception text (file paths, driver errors, anything a
-                    # source leaked) never reaches the client or the run row
-                    # unsanitized; the client gets a fixed sentence and the
-                    # source name, the run row the sanitized cause.
-                    await finish_native_sync_run(
-                        run_id=run_id,
-                        status="failed",
-                        error=f"reference_check_failed: {sanitize_error_text(exc)}",
-                        conn=conn,
-                    )
-                    raise HTTPException(
-                        status_code=503,
-                        detail={
-                            "error": "reference_check_failed",
-                            "source": exc.source,
-                            "message": f"引用检查失败（{exc.source}），已拒绝下线；请稍后重试或查看服务端日志。",
-                        },
-                    ) from exc.cause
+                retired_at = _utcnow_iso()
+                async with conn.transaction():
+                    await acquire_catalog_exclusive_lock(conn)
+                    try:
+                        refs = await _collect_reference_map(strict=True)
+                    except ReferenceSourceUnavailable as exc:
+                        raise HTTPException(
+                            status_code=503,
+                            detail={
+                                "error": "reference_check_failed",
+                                "source": exc.source,
+                                "message": f"引用检查失败（{exc.source}），已拒绝下线；请稍后重试或查看服务端日志。",
+                            },
+                        ) from exc.cause
 
-                already_retired = retired_key_set()
-                results: list[dict[str, Any]] = []
-                records: list[dict[str, Any]] = []
-                for key in model_keys:
-                    if key not in deprecated_by_key:
-                        results.append({"key": key, "status": "not_deprecated"})
-                        continue
-                    in_use_by = sorted(set(refs.get(key, [])))
-                    if in_use_by:
-                        results.append({"key": key, "status": "in_use", "in_use_by": in_use_by})
-                        continue
-                    results.append({"key": key, "status": "retired"})
-                    if key not in already_retired:
-                        records.append(
-                            {
-                                "key": key,
-                                "provider": str(deprecated_by_key[key].get("provider") or ""),
-                                "retired_at": _utcnow_iso(),
-                                "retired_by": user_id,
-                            }
+                    cat_row = await get_catalog_row(conn=conn, for_update=True)
+                    if cat_row is None:
+                        raise HTTPException(
+                            status_code=503,
+                            detail={
+                                "code": "catalog_unavailable",
+                                "error": "catalog_unavailable",
+                                "message": "团队模型目录未初始化（缺少 dalton_team_model_catalog 基线行），已拒绝下线。",
+                            },
                         )
+                    cur_rev = int(cat_row["revision"])
+                    current_compiled = compile_catalog_from_payload(
+                        cat_row["payload"],
+                        revision=cur_rev,
+                        legacy_sync_import_status=cat_row["legacy_sync_import_status"],
+                        last_known_legacy_retired=cat_row["last_known_legacy_retired"],
+                    )
 
-                stamp: str | None = None
-                if records:
-                    stamp = retire_native_models(records)
-                    _invalidate_local_worker_model_caches()
+                    already_retired = (
+                        current_compiled.factory_retired_keys
+                        | current_compiled.readonly_legacy_retired_keys
+                        | current_compiled.team_retired_keys
+                    )
+                    results: list[dict[str, Any]] = []
+                    records: list[dict[str, Any]] = []
+                    for key in model_keys:
+                        if key not in deprecated_by_key:
+                            results.append({"key": key, "status": "not_deprecated"})
+                            continue
+                        in_use_by = sorted(set(refs.get(key, [])))
+                        if in_use_by:
+                            results.append({"key": key, "status": "in_use", "in_use_by": in_use_by})
+                            continue
+                        results.append({"key": key, "status": "retired"})
+                        if key not in already_retired:
+                            records.append(
+                                {
+                                    "key": key,
+                                    "provider": str(deprecated_by_key[key].get("provider") or ""),
+                                    "retired_at": retired_at,
+                                    "retired_by": user_id,
+                                }
+                            )
+
+                    stamp: str | None = None
+                    if records:
+                        next_payload = copy.deepcopy(cat_row["payload"])
+                        next_payload["schema"] = CATALOG_SCHEMA
+                        retired_list = list(next_payload.get("retired") or [])
+                        retired_list.extend(records)
+                        next_payload["retired"] = retired_list
+                        committed_compiled = trial_compile_and_validate_catalog(
+                            next_payload,
+                            revision=cur_rev + 1,
+                            legacy_sync_import_status=cat_row["legacy_sync_import_status"],
+                            last_known_legacy_retired=cat_row["last_known_legacy_retired"],
+                        )
+                        saved = await save_catalog_revision(
+                            conn,
+                            expected_revision=cur_rev,
+                            action="native_retire",
+                            target_keys=sorted(r["key"] for r in records),
+                            payload=next_payload,
+                            diff_summary={"kind": "retire", "results": results},
+                            side_effects=[],
+                            actor_user_id=user_id,
+                            comment="NativeModelsCard retire",
+                        )
+                        committed_rev = int(saved["catalog"]["revision"])
+                        stamp = f"db:rev:{committed_rev}"
 
                 counts = {
                     "retired": sum(1 for r in results if r["status"] == "retired"),
@@ -459,13 +607,13 @@ async def run_native_retire(*, user_id: str, model_keys: list[str]) -> dict[str,
                     overlay_stamp=stamp,
                     conn=conn,
                 )
-                return {
-                    "run_id": run_id,
-                    "results": results,
-                    "retired_keys": sorted(r["key"] for r in records),
-                    "retired_at": _utcnow_iso(),
-                }
-            except HTTPException:
+            except HTTPException as exc:
+                await finish_native_sync_run(
+                    run_id=run_id,
+                    status="failed",
+                    error=f"retire_rejected: {sanitize_error_text(str(exc.detail))}",
+                    conn=conn,
+                )
                 raise
             except Exception as exc:
                 err = sanitize_error_text(exc)
@@ -479,14 +627,32 @@ async def run_native_retire(*, user_id: str, model_keys: list[str]) -> dict[str,
         finally:
             await release_native_sync_lock(conn)
 
+    if committed_compiled is not None and committed_rev is not None:
+        cache_compiled_catalog(committed_compiled)
+        await publish_catalog_changed(committed_rev)
+        await invalidate_catalog_redis_caches(
+            actor_user_id=user_id, compiled=committed_compiled
+        )
+    return {
+        "run_id": run_id,
+        "results": results,
+        "retired_keys": sorted(r["key"] for r in records),
+        "catalog_revision": committed_rev,
+        "retired_at": retired_at,
+    }
+
 
 async def run_native_restore(*, user_id: str, model_keys: list[str]) -> dict[str, Any]:
-    """Unhide retired models by removing their keys from the overlay's `retired` list."""
+    """Unhide retired models from ``dalton_team_model_catalog`` (refuses readonly legacy keys 409)."""
     if not model_keys:
         raise HTTPException(
             status_code=422,
             detail={"code": "empty_selection", "message": "未选择要恢复的模型。"},
         )
+
+    committed_compiled = None
+    committed_rev: int | None = None
+
     async with get_db_connection() as conn:
         locked = await try_acquire_native_sync_lock(conn)
         if not locked:
@@ -497,9 +663,100 @@ async def run_native_restore(*, user_id: str, model_keys: list[str]) -> dict[str
         try:
             run_id = await create_native_sync_run(started_by=user_id, kind="restore", conn=conn)
             try:
-                stamp, restored_keys = restore_native_models(list(model_keys))
-                if restored_keys:
-                    _invalidate_local_worker_model_caches()
+                async with conn.transaction():
+                    await acquire_catalog_exclusive_lock(conn)
+                    cat_row = await get_catalog_row(conn=conn, for_update=True)
+                    if cat_row is None:
+                        raise HTTPException(
+                            status_code=503,
+                            detail={
+                                "code": "catalog_unavailable",
+                                "error": "catalog_unavailable",
+                                "message": "团队模型目录未初始化（缺少 dalton_team_model_catalog 基线行），已拒绝恢复。",
+                            },
+                        )
+                    cur_rev = int(cat_row["revision"])
+
+                    extra_readonly: set[str] = set()
+                    if cat_row["legacy_sync_import_status"] == "failed":
+                        extra_readonly |= extract_disk_legacy_retired_readonly()
+                        try:
+                            extra_readonly |= await fetch_legacy_retired_history(conn=conn)
+                        except Exception:
+                            pass
+
+                    current_compiled = compile_catalog_from_payload(
+                        cat_row["payload"],
+                        revision=cur_rev,
+                        legacy_sync_import_status=cat_row["legacy_sync_import_status"],
+                        last_known_legacy_retired=cat_row["last_known_legacy_retired"],
+                        extra_readonly_legacy_retired=extra_readonly,
+                    )
+
+                    # §2.2 Step C & §2.6 #3: readonly legacy keys cannot be restored until import resolved
+                    locked_legacy = [
+                        k for k in model_keys if k in current_compiled.readonly_legacy_retired_keys
+                    ]
+                    if locked_legacy:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "code": "legacy_retired_locked_until_import_resolved",
+                                "models": locked_legacy,
+                                "message": "以下模型属于导入失败期间的只读遗产退役集，需先执行重试导入或确认放弃旧文件后才可恢复。",
+                            },
+                        )
+
+                    factory_locked = [
+                        k for k in model_keys if k in current_compiled.factory_retired_keys
+                    ]
+                    if factory_locked:
+                        raise HTTPException(
+                            status_code=400,
+                            detail={
+                                "code": "factory_retired_immutable",
+                                "models": factory_locked,
+                                "message": "出厂硬退役模型不可恢复。",
+                            },
+                        )
+
+                    req_set = set(model_keys)
+                    next_payload = copy.deepcopy(cat_row["payload"])
+                    next_payload["schema"] = CATALOG_SCHEMA
+                    existing_retired = list(next_payload.get("retired") or [])
+                    remaining: list[dict[str, Any]] = []
+                    restored_keys: list[str] = []
+                    for rec in existing_retired:
+                        rkey = str(rec.get("key") or "") if isinstance(rec, dict) else ""
+                        if rkey and rkey in req_set:
+                            restored_keys.append(rkey)
+                        else:
+                            remaining.append(rec)
+                    restored_keys = sorted(set(restored_keys))
+
+                    stamp: str | None = None
+                    if restored_keys:
+                        next_payload["retired"] = remaining
+                        committed_compiled = trial_compile_and_validate_catalog(
+                            next_payload,
+                            revision=cur_rev + 1,
+                            legacy_sync_import_status=cat_row["legacy_sync_import_status"],
+                            last_known_legacy_retired=cat_row["last_known_legacy_retired"],
+                        )
+                        saved = await save_catalog_revision(
+                            conn,
+                            expected_revision=cur_rev,
+                            action="native_restore",
+                            target_keys=restored_keys,
+                            payload=next_payload,
+                            diff_summary={"restored_keys": restored_keys},
+                            side_effects=[],
+                            actor_user_id=user_id,
+                            comment="NativeModelsCard restore",
+                        )
+                        committed_rev = int(saved["catalog"]["revision"])
+                        stamp = f"db:rev:{committed_rev}"
+
                 results = [
                     {"key": k, "status": "restored" if k in restored_keys else "not_retired"}
                     for k in model_keys
@@ -512,13 +769,10 @@ async def run_native_restore(*, user_id: str, model_keys: list[str]) -> dict[str
                     overlay_stamp=stamp,
                     conn=conn,
                 )
-                return {
-                    "run_id": run_id,
-                    "results": results,
-                    "restored_keys": restored_keys,
-                    "restored_at": _utcnow_iso(),
-                }
-            except HTTPException:
+            except HTTPException as exc:
+                await finish_native_sync_run(
+                    run_id=run_id, status="failed", error=str(exc.detail), conn=conn
+                )
                 raise
             except Exception as exc:
                 err = sanitize_error_text(exc)
@@ -532,43 +786,70 @@ async def run_native_restore(*, user_id: str, model_keys: list[str]) -> dict[str
         finally:
             await release_native_sync_lock(conn)
 
+    if committed_compiled is not None and committed_rev is not None:
+        cache_compiled_catalog(committed_compiled)
+        await publish_catalog_changed(committed_rev)
+        await invalidate_catalog_redis_caches(
+            actor_user_id=user_id, compiled=committed_compiled
+        )
+    return {
+        "run_id": run_id,
+        "results": results,
+        "restored_keys": restored_keys,
+        "catalog_revision": committed_rev,
+        "restored_at": _utcnow_iso(),
+    }
+
 
 async def get_native_status() -> dict[str, Any]:
-    """Last check/sync runs and per-provider rows — reads stored results only, no fetch.
-
-    The diff and provider rows come from the last SUCCEEDED check; the most
-    recent run (any status) only timestamps "上次检查". A failed check keeps its
-    own provider errors in its run row and never displaces the good diff.
-    """
+    """Last check/sync runs, per-provider rows, and DB-backed retired models (no fetch)."""
     last_check, last_sync = await fetch_recent_native_runs()
     last_succeeded = await fetch_last_succeeded_native_check()
-    overlay = load_native_sync_overlay()
-    overlay_meta = (overlay or {}).get("meta") or {}
-    check_diff = ((last_succeeded or {}).get("diff") or {})
-    retired = load_retired_models()
-    retired_keys = {str(item.get("key")) for item in retired}
-    # The stored diff is a snapshot from check time; keys a later sync already
-    # added are part of the catalog now, so they stop counting as "new".
-    from src.llms.llm import LLM
+    compiled = await get_compiled_catalog_async()
+    cat_row = await get_catalog_row()
+    check_diff = (last_succeeded or {}).get("diff") or {}
 
-    llm_config = LLM.get_model_config().llm_config or {}
+    retired: list[dict[str, Any]] = []
+    seen_retired: set[str] = set()
+    for rec in compiled.payload.get("retired") or []:
+        if isinstance(rec, dict) and rec.get("key"):
+            rkey = str(rec["key"])
+            seen_retired.add(rkey)
+            retired.append(
+                {
+                    **rec,
+                    "readonly_legacy": rkey in compiled.readonly_legacy_retired_keys,
+                }
+            )
+    for rkey in sorted(compiled.readonly_legacy_retired_keys):
+        if rkey not in seen_retired:
+            seen_retired.add(rkey)
+            retired.append({"key": rkey, "provider": "", "readonly_legacy": True})
+
+    all_retired_keys = (
+        compiled.factory_retired_keys
+        | compiled.readonly_legacy_retired_keys
+        | compiled.team_retired_keys
+    )
+    llm_config = compiled.model_config.llm_config or {}
     pending_added = [
-        {**item, "previously_retired": str(item.get("suggested_key")) in retired_keys}
+        {**item, "previously_retired": str(item.get("suggested_key")) in all_retired_keys}
         for item in check_diff.get("added") or []
         if str(item.get("suggested_key")) not in llm_config
     ]
-    # Retired models are already out of the merged catalog, so the stored diff's
-    # deprecated list may lag one check behind — drop anything since retired.
     pending_deprecated = [
         item
         for item in check_diff.get("deprecated") or []
-        if str(item.get("key")) not in retired_keys
+        if str(item.get("key")) not in all_retired_keys
     ]
     return {
         "providers": _listing_rows(last_succeeded),
         "last_check": last_check,
         "last_succeeded_check": last_succeeded,
         "last_sync": last_sync,
+        "catalog_revision": compiled.revision,
+        "legacy_sync_import_status": compiled.legacy_sync_import_status,
+        "legacy_sync_import_error": (cat_row or {}).get("legacy_sync_import_error"),
         "diff": {
             "added": pending_added,
             "deprecated": pending_deprecated,
@@ -576,9 +857,10 @@ async def get_native_status() -> dict[str, Any]:
         },
         "retired": retired,
         "overlay": {
-            "exists": bool(overlay),
-            "generated_at": overlay_meta.get("generated_at"),
-            "model_count": overlay_meta.get("model_count") or len((overlay or {}).get("models") or {}),
+            "exists": bool(compiled.payload.get("models")),
+            "generated_at": (cat_row or {}).get("updated_at"),
+            "model_count": len(compiled.payload.get("models") or {}),
             "path": str(NATIVE_SYNC_OVERLAY_PATH),
+            "storage": "postgresql:dalton_team_model_catalog",
         },
     }

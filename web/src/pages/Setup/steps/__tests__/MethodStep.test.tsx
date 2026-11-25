@@ -40,9 +40,21 @@ vi.mock('@/hooks/useUpdatePreferences', () => ({
   useUpdatePreferences: () => ({ mutateAsync: vi.fn() }),
 }));
 vi.mock('@/hooks/useAllModels', () => ({ useAllModels: () => ({ metadata: {} }) }));
-// DALTON-HOOK(team-credentials): the step reads the shared-credential hint and PM disconnect guard
+// DALTON-HOOK(team-credentials): the step reads the shared-credential hint, status fetcher, and PM disconnect guard
 vi.mock('@/hooks/useTeamCredentials', () => ({
   TEAM_SHARED_CREDENTIALS_HINT: '',
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: 'off',
+    enabled: false,
+    holder_user_id: null,
+    credential_user_id: 'u-1',
+    is_pm: true,
+    can_disconnect: true,
+    can_invite: false,
+    caller_tier: 'admin',
+    colleague_sharing_enabled: false,
+    auth_mode: 'oss',
+  })),
   useTeamCredentials: () => ({ isShared: false, canDisconnect: true, canManage: true, isPm: true, canInvite: false }),
 }));
 

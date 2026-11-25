@@ -2376,10 +2376,15 @@ async def test_list_system_jobs_hides_unreadable_transferred_and_external_sector
     """Item 2: transferred hidden sector unit is skipped BEFORE get_tracking_status via HTTP & tool;
     demoted non-internal former lead also sees no sector units."""
     from fastapi import HTTPException
+    from src.config import settings as app_settings
     import src.dalton.autonomy.system_jobs as sj
     from src.dalton import sharing as sharing_mod
     from src.dalton.database import coverage_units as cu_db
 
+    # Exercise Supabase multi-user roster checks (single-user OSS mode treats the sole local
+    # user as 'admin' per external-member-permissions Decision 8).
+    monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
     monkeypatch.setenv("DALTON_COVERAGE_UNITS_ENABLED", "1")
     monkeypatch.setattr(
         sj,

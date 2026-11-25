@@ -1,6 +1,8 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import { NO_STANDING, type AccountStanding } from '@/lib/accountRules';
+// DALTON-HOOK(team-model-catalog): unadmitted refusal bubbles keep turn indexes aligned.
+import { projectTurns } from '../../components/messageList/turnProjection';
 import { readTurnFailure } from '../turnFailure';
 
 const t = (key: string, opts?: Record<string, unknown>) => (opts ? `${key}:${String(opts.name)}` : key);
@@ -40,5 +42,44 @@ describe('readTurnFailure', () => {
     expect(failure(undefined, { status: 500 })).toEqual({ banner: null, answered: false, holdsDraft: false, reread: null });
     expect(failure({ message: 'Try later.' }, { status: 500 }).banner).toBe('Try later.');
     expect(failure({ type: 'service_unavailable' }, { status: 503 }).banner).toBeNull();
+  });
+
+  // DALTON-HOOK(team-model-catalog): verify catalog_route_changed surfaces the resume notice cleanly
+  it('meets catalog_route_changed as an answered notice banner so the user can resend', () => {
+    const msg = '这个回合中断期间团队模型配置发生了变化，请重新发送消息';
+    expect(
+      failure({ type: 'catalog_route_changed', code: 'catalog_route_changed', message: msg }, { status: 400 }),
+    ).toEqual({
+      banner: { message: msg, kind: 'notice' },
+      answered: true,
+      holdsDraft: false,
+      reread: null,
+    });
+    expect(failure({ code: 'catalog_route_changed' }, { status: 400 })).toEqual({
+      banner: { message: msg, kind: 'notice' },
+      answered: true,
+      holdsDraft: false,
+      reread: null,
+    });
+  });
+
+  // DALTON-HOOK(team-model-catalog): verify an unadmitted catalog_route_changed bubble does not advance turnIndex
+  it('keeps local turnIndex aligned when a refused catalog_route_changed bubble is marked unadmitted', () => {
+    const projected = projectTurns([
+      { id: 'u-0', role: 'user', content: 'first' },
+      { id: 'a-0', role: 'assistant', content: 'reply 0' },
+      // Refused HITL/checkpoint resume placeholder settled with unadmitted: true
+      { id: 'assistant-hitl-1', role: 'assistant', content: '', unadmitted: true },
+      // User's next fresh send must take turnIndex 1 (not 2)
+      { id: 'u-1', role: 'user', content: 'fresh resend' },
+      { id: 'a-1', role: 'assistant', content: 'reply 1' },
+    ]);
+    expect(projected.map((m) => [m.message.id, m.turnIndex])).toEqual([
+      ['u-0', 0],
+      ['a-0', 0],
+      ['assistant-hitl-1', null],
+      ['u-1', 1],
+      ['a-1', 1],
+    ]);
   });
 });

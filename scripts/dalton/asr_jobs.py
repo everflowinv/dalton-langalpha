@@ -2296,7 +2296,13 @@ class AsrJobManager:
         worker: RealAsrWorker | FakeAsrWorker | None = None,
         atomic_write_fn: Callable[..., bool] | None = None,
         usage_ledger_path: Path | None = None,
+        owner_lock: Any | None = None,
     ) -> None:
+        if owner_lock is not None and not getattr(owner_lock, "is_held", False):
+            raise RuntimeError(
+                "AsrOwnerLock must be acquired before constructing AsrJobManager"
+            )
+        self.owner_lock = owner_lock
         self.jobs_dir = Path(jobs_dir)
         env_usage = os.environ.get("DALTON_ASR_USAGE_FILE", "").strip()
         self.usage_ledger_path = (
@@ -2323,6 +2329,26 @@ class AsrJobManager:
             self.recover_incomplete_jobs()
         except RuntimeError:
             pass
+
+    def active_job_ids(self) -> list[str]:
+        """Return sorted job IDs currently executing in background tasks."""
+        return sorted(
+            jid for jid, task in self._tasks.items() if task is not None and not task.done()
+        )
+
+    async def shutdown(self, *, grace_s: float = 5.0) -> None:
+        """Wait briefly for active tasks, then cancel remaining ones cleanly without marking them cancelled."""
+        running = [t for t in self._tasks.values() if t is not None and not t.done()]
+        if not running:
+            return
+        if grace_s > 0:
+            _done, pending = await asyncio.wait(running, timeout=float(grace_s))
+            running = list(pending)
+        if running:
+            for task in running:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
 
     def recover_incomplete_jobs(self) -> list[str]:
         """Scan `jobs_dir` and resume any non-terminal (`RECOVERABLE_JOB_STATUSES`, including `indeterminate`) jobs interrupted by a prior process exit."""

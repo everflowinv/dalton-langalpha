@@ -283,8 +283,7 @@ async def classify_model(
         if custom_cm:
             return ModelSource.CUSTOM, custom_cm
 
-    mc = LLMFactory.get_model_config()
-    system_info = mc.get_model_config(model_name)
+    system_info = LLMFactory.get_model_config().get_model_config(model_name)
     if system_info:
         return ModelSource.SYSTEM, system_info
 

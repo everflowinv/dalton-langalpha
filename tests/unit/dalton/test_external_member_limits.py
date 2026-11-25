@@ -821,6 +821,8 @@ class TestWikiIngestRefusal:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A raising users-table lookup resolves to external -> refusal (fail closed)."""
+        _enable_dalton_auth(monkeypatch, patch_users=False)
+
         # Do NOT patch get_user_tier here: the real one must swallow the error.
         async def _raise_get_user(uid: str) -> dict[str, Any] | None:
             raise RuntimeError("db down")
@@ -1121,6 +1123,7 @@ class TestUnknownOwnerTier:
     ) -> None:
         from src.dalton.access_tiers import classify_owner_tier
 
+        _enable_dalton_auth(monkeypatch, patch_users=False)
         real_get_user = user_db.get_user
 
         async def _raise_get_user(uid: str) -> dict[str, Any] | None:

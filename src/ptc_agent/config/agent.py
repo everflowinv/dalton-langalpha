@@ -425,6 +425,11 @@ class RunOn:
     claude_code: Admitted | None = None
     claude_code_model: str | None = None
     ask: TaskAsk = TaskAsk()
+    # DALTON-HOOK(team-model-catalog): carry the subagent's actual catalog model key even when
+    # card_model returns None (e.g. subagent shares API model_id with main turn on another route),
+    # and whether the built client resolved to a personal custom model (None when unknown).
+    actual_model_key: str | None = None
+    is_custom_model: bool | None = None
 
     def admission_kwargs(self) -> dict[str, Any]:
         """The run ledger's ``start_task_run`` facts."""
@@ -435,6 +440,16 @@ class RunOn:
             "stored_token": bool(admitted is not None and admitted.saved),
             "claude_code_model": self.claude_code_model,
             "cli_computer": admitted.cli_computer if admitted is not None else None,
+            **(
+                {"actual_model_key": self.actual_model_key}
+                if isinstance(self.actual_model_key, str) and self.actual_model_key.strip()
+                else {}
+            ),
+            **(
+                {"is_custom_model": self.is_custom_model}
+                if self.is_custom_model is not None
+                else {}
+            ),  # DALTON-HOOK(team-model-catalog)
             **self.ask.facts(),
         }
 
@@ -458,6 +473,7 @@ class TaskModel:
     model: SubagentModel | None = None
     claude_code: Admitted | None = None
     effort: str | None = None
+    is_custom_model: bool | None = None  # DALTON-HOOK(team-model-catalog)
 
     @property
     def on_claude_code(self) -> bool:
@@ -469,6 +485,10 @@ class TaskModel:
             model=self.model,
             claude_code=self.claude_code,
             claude_code_model=self.client.model if self.on_claude_code else None,
+            # DALTON-HOOK(team-model-catalog): persist final resolved model key (post-effort mapping)
+            # and actual resolved model source (personal custom vs catalog).
+            actual_model_key=self.name or None,
+            is_custom_model=self.is_custom_model,
         )
 
 

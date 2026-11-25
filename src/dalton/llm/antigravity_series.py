@@ -194,17 +194,33 @@ def build_antigravity_series_catalog(
     *,
     default_efforts: Mapping[str, str] | None = None,
     dalton_yaml_path: Path | None = None,
+    series_overrides: Mapping[str, Any] | None = None,
+    dalton_meta: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Aggregate visible built-in ``antigravity-oauth`` entries by series prefix."""
+    """Aggregate visible built-in ``antigravity-oauth`` entries by series prefix.
+
+    Honors catalog ``series_overrides`` (per-series ``default_effort`` / ``display_name``)
+    and ``dalton_meta.<key>.series`` when provided (§5.2 #2).
+    """
     llm_config = _extract_llm_config(model_config)
     if not llm_config:
         return []
 
-    efforts_map = (
+    efforts_map = dict(
         default_efforts
         if default_efforts is not None
         else load_dalton_series_default_efforts(dalton_yaml_path=dalton_yaml_path)
     )
+    overrides = series_overrides if isinstance(series_overrides, Mapping) else {}
+    for s_prefix, s_cfg in overrides.items():
+        if isinstance(s_cfg, Mapping):
+            ov_eff = s_cfg.get("default_effort")
+            if isinstance(ov_eff, str) and ov_eff in REASONING_LEVELS:
+                efforts_map[str(s_prefix)] = ov_eff
+        elif isinstance(s_cfg, str) and s_cfg in REASONING_LEVELS:
+            efforts_map[str(s_prefix)] = s_cfg
+
+    meta_map = dalton_meta if isinstance(dalton_meta, Mapping) else {}
 
     grouped: dict[str, dict[str, str]] = {}
     for key, entry in llm_config.items():
@@ -218,6 +234,11 @@ def build_antigravity_series_catalog(
         if parsed is None:
             continue
         series_prefix, effort = parsed
+        meta_entry = meta_map.get(key)
+        if isinstance(meta_entry, Mapping) and isinstance(meta_entry.get("series"), str):
+            explicit_series = meta_entry["series"].strip()
+            if explicit_series:
+                series_prefix = explicit_series
         if effort is None:
             continue
         grouped.setdefault(series_prefix, {})[effort] = key
@@ -233,7 +254,13 @@ def build_antigravity_series_catalog(
             efforts,
             default_efforts=efforts_map,
         )
-        display_name = format_series_display_name(series_prefix)
+        ov_cfg = overrides.get(series_prefix)
+        custom_display = (
+            str(ov_cfg.get("display_name") or "").strip()
+            if isinstance(ov_cfg, Mapping)
+            else ""
+        )
+        display_name = custom_display or format_series_display_name(series_prefix)
         entry = AntigravitySeriesEntry(
             series_id=f"{ANTIGRAVITY_PROVIDER}:{series_prefix}",
             series_prefix=series_prefix,

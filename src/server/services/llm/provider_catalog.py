@@ -3,7 +3,7 @@ by ``GET /api/v1/models``. Built once per process: the manifest is static."""
 
 from __future__ import annotations
 
-import functools
+from typing import Any  # DALTON-HOOK(team-model-catalog)
 
 
 def _base_url(info: dict) -> str | None:
@@ -12,19 +12,10 @@ def _base_url(info: dict) -> str | None:
     return (info.get("base_url") or "").replace("{HOST_IP}", HOST_IP) or None
 
 
-@functools.lru_cache(maxsize=1)
-def provider_catalog() -> list[dict]:
-    """Wizard-visible providers.
-
-    A provider is wizard-visible if it has no parent_provider (a root brand),
-    or its access_type differs from its parent's. Region variants (same
-    access_type, different region) are attached as ``region_variants`` on the
-    parent's entry so the wizard can show an inline region toggle.
-    """
+def build_provider_catalog(config) -> list[dict]:
+    """DALTON-HOOK(team-model-catalog): build wizard-visible provider catalog from a pinned ModelConfig."""
     from src.config.settings import HOST_MODE
-    from src.llms.llm import LLM
 
-    config = LLM.get_model_config()
     flat = config.flat_providers
 
     # Another API of a connection, saved under by a model served on it.
@@ -103,18 +94,50 @@ def provider_catalog() -> list[dict]:
     return catalog
 
 
-@functools.lru_cache(maxsize=1)
-def key_candidates() -> dict[str, dict]:
-    """Where a turn looks for each provider's stored key, so the client can
-    tell which saved models the user's own keys serve without re-deriving the
-    walk: ``slugs`` in ``byok_candidates`` order, ``shared`` the ones whose
-    key the vendor issues as one with the provider's. A key under another slug
-    serves it only when saved with a base URL; a custom model takes any.
+# DALTON-HOOK(team-model-catalog): key provider_catalog and key_candidates caches to the live
+# ModelConfig instance/revision so team catalog updates invalidate immediately within the worker
+# while preserving `.cache_clear()` compatibility for callers and tests.
+_PROVIDER_CATALOG_CACHE: tuple[Any, list[dict]] | None = None
+_KEY_CANDIDATES_CACHE: tuple[Any, dict[str, dict]] | None = None
+
+
+def _clear_provider_catalog_cache() -> None:
+    global _PROVIDER_CATALOG_CACHE
+    _PROVIDER_CATALOG_CACHE = None
+
+
+def _clear_key_candidates_cache() -> None:
+    global _KEY_CANDIDATES_CACHE
+    _KEY_CANDIDATES_CACHE = None
+
+
+def provider_catalog() -> list[dict]:
+    """Wizard-visible providers.
+
+    A provider is wizard-visible if it has no parent_provider (a root brand),
+    or its access_type differs from its parent's. Region variants (same
+    access_type, different region) are attached as ``region_variants`` on the
+    parent's entry so the wizard can show an inline region toggle.
     """
+    global _PROVIDER_CATALOG_CACHE
     from src.llms.llm import LLM
-    from src.server.services.llm.byok import byok_candidates
 
     mc = LLM.get_model_config()
+    cached = _PROVIDER_CATALOG_CACHE
+    if cached is not None and cached[0] is mc:
+        return cached[1]
+    result = build_provider_catalog(mc)
+    _PROVIDER_CATALOG_CACHE = (mc, result)
+    return result
+
+
+provider_catalog.cache_clear = _clear_provider_catalog_cache  # type: ignore[attr-defined]
+
+
+def build_key_candidates(mc) -> dict[str, dict]:
+    """DALTON-HOOK(team-model-catalog): build key_candidates map from a pinned ModelConfig."""
+    from src.server.services.llm.byok import byok_candidates
+
     out = {}
     for key, info in mc.flat_providers.items():
         if info.get("platform") or info.get("access_type") == "oauth":
@@ -122,3 +145,25 @@ def key_candidates() -> dict[str, dict]:
         slugs = byok_candidates(key, mc)
         out[key] = {"slugs": slugs, "shared": [s for s in slugs if mc.shares_api_key(key, s)]}
     return out
+
+
+def key_candidates() -> dict[str, dict]:
+    """Where a turn looks for each provider's stored key, so the client can
+    tell which saved models the user's own keys serve without re-deriving the
+    walk: ``slugs`` in ``byok_candidates`` order, ``shared`` the ones whose
+    key the vendor issues as one with the provider's. A key under another slug
+    serves it only when saved with a base URL; a custom model takes any.
+    """
+    global _KEY_CANDIDATES_CACHE
+    from src.llms.llm import LLM
+
+    mc = LLM.get_model_config()
+    cached = _KEY_CANDIDATES_CACHE
+    if cached is not None and cached[0] is mc:
+        return cached[1]
+    result = build_key_candidates(mc)
+    _KEY_CANDIDATES_CACHE = (mc, result)
+    return result
+
+
+key_candidates.cache_clear = _clear_key_candidates_cache  # type: ignore[attr-defined]

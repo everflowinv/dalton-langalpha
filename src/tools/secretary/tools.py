@@ -89,6 +89,9 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
                 row["path"] = path
             if placement.computers:
                 row["computer"] = placement.computer(ws)
+                # DALTON-HOOK(cos-settings-tools): expose computer_id for multi-computer disambiguation
+                if ws.get("computer_id"):
+                    row["computer_id"] = str(ws["computer_id"])
             if machine := placement.machine(ws):
                 row["machine"] = machine
             rows.append(row)
@@ -197,7 +200,14 @@ async def _folder_ready_result(
     try:
         binding = await manager.resolve_binding(workspace_id)
     except Exception as e:
-        logger.warning(f"Could not resolve the folder path for {workspace_id}: {e}")
+        # DALTON-HOOK(cos-settings-tools): structured whitelisted error logging without raw exception text
+        logger.warning(
+            "folder_ready_error stage=%s workspace_id=%s computer_id=%s exc_type=%s",
+            "resolve_binding",
+            workspace_id,
+            computer_id,
+            type(e).__name__,
+        )
     if binding is None:
         # Display-only path from the same default math the file routes use;
         # never a root to build on.
@@ -210,7 +220,11 @@ async def _folder_ready_result(
                     result["folder_path"] = str(path)
             except Exception as e:
                 logger.warning(
-                    f"Could not compute the folder path for {workspace_id}: {e}"
+                    "folder_ready_error stage=%s workspace_id=%s computer_id=%s exc_type=%s",
+                    "work_dir_for",
+                    workspace_id,
+                    computer_id,
+                    type(e).__name__,
                 )
         return result
 
@@ -227,7 +241,13 @@ async def _folder_ready_result(
         home = await _get_workspace(get_home_workspace_id(user_id))
         home_computer_id = str((home or {}).get("computer_id") or "")
     except Exception as e:
-        logger.warning(f"Could not read Home's computer for user {user_id}: {e}")
+        logger.warning(
+            "folder_ready_error stage=%s workspace_id=%s computer_id=%s exc_type=%s",
+            "home_lookup",
+            workspace_id,
+            computer_id,
+            type(e).__name__,
+        )
         return result
     if home_computer_id != computer_id:
         return result
@@ -248,7 +268,11 @@ async def _folder_ready_result(
         )
     except Exception as e:
         logger.warning(
-            f"Could not derive the sandbox folder path for {workspace_id}: {e}"
+            "folder_ready_error stage=%s workspace_id=%s computer_id=%s exc_type=%s",
+            "sandbox_layout",
+            workspace_id,
+            computer_id,
+            type(e).__name__,
         )
         return result
     result["folder_path"] = folder_path
@@ -275,12 +299,44 @@ async def _folder_ready_result(
                 "folder_path": folder_path,
             }
         logger.warning(
-            f"Folder for {workspace_id} was not confirmed at {folder_path}"
+            "folder_ready_error stage=%s workspace_id=%s computer_id=%s",
+            "verify_dir",
+            workspace_id,
+            computer_id,
         )
     except Exception as e:
-        logger.warning(f"Could not create the folder for {workspace_id}: {e}")
+        logger.warning(
+            "folder_ready_error stage=%s workspace_id=%s computer_id=%s exc_type=%s",
+            "mkdir_dir",
+            workspace_id,
+            computer_id,
+            type(e).__name__,
+        )
     return result
 # --- DALTON-HOOK(workspace-folder-ready): end ---
+
+
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+def _is_resuming_interrupt() -> bool:
+    """Return True when the active LangGraph task already carries a resume
+    payload for ``interrupt()``, so ``hitl_confirm`` consumes the answer
+    before any pre-interrupt checks can preempt it."""
+    try:
+        from langgraph._internal._constants import CONFIG_KEY_SCRATCHPAD
+        from langgraph.config import get_config
+
+        scratchpad = get_config().get("configurable", {}).get(CONFIG_KEY_SCRATCHPAD)
+        if scratchpad is None:
+            return False
+        if getattr(scratchpad, "resume", None):
+            return True
+        get_null_resume = getattr(scratchpad, "get_null_resume", None)
+        if callable(get_null_resume) and get_null_resume(False) is not None:
+            return True
+    except Exception:
+        return False
+    return False
+# --- DALTON-HOOK(cos-settings-tools): end ---
 
 
 async def workspaces_create(
@@ -289,6 +345,9 @@ async def workspaces_create(
     description: str | None,
     tool_call_id: str,
     preapproved: bool = False,
+    # DALTON-HOOK(cos-settings-tools): optional target computer and frozen confirmation snapshot
+    computer: str | None = None,
+    snapshot: dict[str, Any] | None = None,
     # DALTON-HOOK(workspace-dedup): allow bypassing company dedup when user explicitly confirms
     allow_duplicate_company: bool = False,
     # DALTON-HOOK(workspace-dedup): optional coverage unit auto-registration fields
@@ -299,14 +358,72 @@ async def workspaces_create(
 ) -> Command:
     """Create a new workspace, once the user confirms unless ``preapproved``.
 
-    ``preapproved`` is the record frozen when the model proposed the call, so
-    on resume the user's answer to the card is what runs. The duplicate read
-    below only writes the card's copy: whether to ask was already decided.
+    ``preapproved`` and ``snapshot`` are frozen when the model proposed the
+    call, so on resume the user's answer to the card runs strictly against the
+    persisted snapshot without re-resolving the target computer.
     """
     if not name:
         return error_command(
             "name is required for create action", tool_call_id
         )
+
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    # When invoked directly with an explicit ``computer`` outside the middleware,
+    # resolve once before prompting; when ``snapshot`` came from thread state,
+    # read only that snapshot (both before interrupt and on resume).
+    from src.tools.secretary.approvals import build_create_workspace_snapshot
+
+    if snapshot is None and computer is not None and computer.strip():
+        snapshot = await build_create_workspace_snapshot(
+            user_id,
+            {
+                "id": tool_call_id,
+                "name": "manage_workspaces",
+                "args": {
+                    "action": "create",
+                    "name": name,
+                    "description": description,
+                    "computer": computer,
+                },
+            },
+        )
+    # Own machines always require per-call confirmation, even if preapproved was passed.
+    if snapshot is not None and snapshot.get("computer_is_own_machine"):
+        preapproved = False
+    snapshot_computer_id = (
+        snapshot.get("computer_id") if snapshot is not None else None
+    )
+    snapshot_bootstrap = bool(
+        snapshot is not None and snapshot.get("bootstrap_cloud_primary")
+    )
+    snapshot_computer_name = (
+        snapshot.get("computer_name") if snapshot is not None else None
+    )
+    snapshot_computer_kind = (
+        snapshot.get("computer_kind") if snapshot is not None else None
+    )
+    # Include preapproved metadata on ALL failure / early-return results (including
+    # company_workspace_exists and coverage_suggestion) so the frontend renders a
+    # failed CreateWorkspaceCard on the standing-approval path.
+    preapproved_meta: dict[str, Any] = {}
+    if preapproved:
+        preapproved_meta = {
+            "preapproved": True,
+            "workspace_name": name,
+            "workspace_description": description or "",
+        }
+        if snapshot_computer_name:
+            preapproved_meta["computer_name"] = snapshot_computer_name
+        if snapshot_bootstrap:
+            preapproved_meta["bootstrap_cloud_primary"] = True
+    if snapshot is not None and snapshot.get("precheck_error"):
+        return error_command(
+            str(snapshot["precheck_error"]),
+            tool_call_id,
+            code=str(snapshot.get("precheck_error_code") or "precheck_failed"),
+            **preapproved_meta,
+        )
+    # --- DALTON-HOOK(cos-settings-tools): end ---
 
     # --- DALTON-HOOK(workspace-dedup): begin ---
     from src.dalton.coverage.dedup import find_existing_company_workspace
@@ -315,10 +432,16 @@ async def workspaces_create(
     raw_coverage_kind = str(coverage_kind or "").strip().lower()
     requested_coverage = raw_coverage_kind not in ("", "none", "other")
     coverage_active: bool | None = None
-    if requested_coverage:
-        coverage_active = await is_workspace_coverage_registration_active(user_id)
-    wants_coverage = bool(requested_coverage and coverage_active)
-    if not allow_duplicate_company:
+
+    async def _ensure_coverage_active() -> bool:
+        nonlocal coverage_active
+        if coverage_active is None:
+            coverage_active = await is_workspace_coverage_registration_active(user_id)
+        return bool(coverage_active)
+
+    async def _check_company_dedup() -> Command | None:
+        if allow_duplicate_company:
+            return None
         dup = None
         try:
             dup = await find_existing_company_workspace(
@@ -334,6 +457,7 @@ async def workspaces_create(
             suggestion = dup.suggestion_payload()
             if suggestion is not None:
                 extra_fields["suggestion"] = suggestion
+            # DALTON-HOOK(cos-settings-tools): include preapproved metadata on early return
             return error_command(
                 dup.message,
                 tool_call_id,
@@ -341,16 +465,15 @@ async def workspaces_create(
                 message=dup.message,
                 matches=dup.matches_payload(),
                 **extra_fields,
+                **preapproved_meta,
             )
         if (
             dup is not None
             and dup.suggestion is not None
-            and not wants_coverage
+            and not (requested_coverage and await _ensure_coverage_active())
             and not skip_coverage_suggestion
         ):
-            if coverage_active is None:
-                coverage_active = await is_workspace_coverage_registration_active(user_id)
-            if coverage_active:
+            if await _ensure_coverage_active():
                 suggestion = dup.suggestion_payload()
                 kind_label = (
                     "公司" if dup.suggestion.coverage_kind == "company" else "行业"
@@ -365,27 +488,78 @@ async def workspaces_create(
                     "请按 suggestion 带上 coverage_kind / ticker / display_name 重新新建以自动登记覆盖单元，"
                     "或在用户明确不要登记时传 skip_coverage_suggestion=True。"
                 )
+                # DALTON-HOOK(cos-settings-tools): include preapproved metadata on early return
                 return error_command(
                     msg,
                     tool_call_id,
                     code="coverage_suggestion",
                     message=msg,
                     suggestion=suggestion,
+                    **preapproved_meta,
                 )
+        return None
+
+    # DALTON-HOOK(cos-settings-tools): on interrupt resume, read the interrupt
+    # answer first so a server-stamped scope_changed or user decline is never
+    # preempted by a fresh company dedup check.
+    resuming = (not preapproved) and _is_resuming_interrupt()
+    if not resuming:
+        early_dedup = await _check_company_dedup()
+        if early_dedup is not None:
+            return early_dedup
     # --- DALTON-HOOK(workspace-dedup): end ---
 
     if not preapproved:
-        holder, confirmed = await duplicate_workspace(user_id, name)
-        payload = {
-            "workspace_name": name,
-            "workspace_description": description or "",
-        }
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        if snapshot is not None:
+            dup_id = snapshot.get("duplicate_workspace_id")
+            dup_name = snapshot.get("duplicate_workspace_name")
+            holder = (
+                {"workspace_id": dup_id, "name": dup_name}
+                if dup_id is not None
+                else None
+            )
+            confirmed = not bool(snapshot.get("duplicate_check_unavailable"))
+            payload: dict[str, Any] = {
+                "tool_call_id": tool_call_id,
+                "workspace_name": snapshot.get("workspace_name") or name,
+                "workspace_description": (
+                    snapshot["workspace_description"]
+                    if snapshot.get("workspace_description") is not None
+                    else (description or "")
+                ),
+                "computer_id": snapshot.get("computer_id"),
+                "computer_name": snapshot.get("computer_name"),
+                "computer_is_own_machine": bool(snapshot.get("computer_is_own_machine")),
+                "bootstrap_cloud_primary": bool(snapshot.get("bootstrap_cloud_primary")),
+            }
+        else:
+            holder, confirmed = await duplicate_workspace(user_id, name)
+            payload = {
+                "tool_call_id": tool_call_id,
+                "workspace_name": name,
+                "workspace_description": description or "",
+            }
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         if holder is not None:
             payload["duplicate_workspace_name"] = holder.get("name")
             payload["duplicate_workspace_id"] = str(holder.get("workspace_id"))
         elif not confirmed:
             payload["duplicate_check_unavailable"] = True
         approved, response = hitl_confirm("create_workspace", payload)
+
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        # Server-stamped scope_changed consumes the interrupt and settles the
+        # card to a terminal failure state (including pre-upgrade cards with no
+        # persisted snapshot).
+        if isinstance(response, dict) and response.get("scope_changed"):
+            return error_command(
+                "情况已变化，请重新发起",
+                tool_call_id,
+                code="scope_changed",
+                message_status="error",
+            )
+        # --- DALTON-HOOK(cos-settings-tools): end ---
 
         if not approved:
             # DALTON-HOOK(workspace-duplicate-guard): the decline names the
@@ -399,6 +573,8 @@ async def workspaces_create(
                     "instead of creating a duplicate"
                 )
             return decline_routing_command(declined, response, tool_call_id)
+
+    wants_coverage = bool(requested_coverage and await _ensure_coverage_active())  # DALTON-HOOK(workspace-dedup)
 
     # --- DALTON-HOOK(workspace-dedup): begin ---
     if allow_duplicate_company:
@@ -430,23 +606,115 @@ async def workspaces_create(
         WorkspaceNameInvalid,
         WorkspaceNameTaken,
     )
-    from src.server.services.computer_errors import ComputerPreparingError
+    from src.server.services.computer_errors import (
+        ApprovalScopeChangedError,  # DALTON-HOOK(cos-settings-tools)
+        ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
+        ComputerNotFoundError,  # DALTON-HOOK(cos-settings-tools)
+        ComputerPreparingError,
+        ProviderNotOffered,  # DALTON-HOOK(cos-settings-tools)
+    )
 
     try:
         from src.server.services.workspace_manager import WorkspaceManager
 
         workspace_manager = WorkspaceManager.get_instance()
-        workspace = await workspace_manager.create_workspace(
-            user_id=user_id,
-            name=name,
-            description=description,
-        )
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        if snapshot is not None:
+            # Two-phase duplicate verification:
+            # Phase 1 (lock-free, after approval and before acquiring write
+            # locks): run full company workspace dedup (LLM + colleague
+            # visibility). Any undisclosed match or unavailable check aborts
+            # immediately with scope_changed without holding any DB lock.
+            verified_company_candidates = None
+            check_colleague_duplicate = False
+            if not preapproved and not allow_duplicate_company:
+                from src.dalton.coverage.dedup import (
+                    recheck_company_workspace_before_create,
+                )
+
+                expected_dup_id = (
+                    str(snapshot["duplicate_workspace_id"])
+                    if snapshot.get("duplicate_workspace_id") is not None
+                    else None
+                )
+                recheck = await recheck_company_workspace_before_create(
+                    user_id,
+                    name,
+                    channel="cos",
+                    expected_duplicate_workspace_id=expected_dup_id,
+                )
+                if recheck.status != "clear":
+                    return error_command(
+                        "情况已变化，请重新发起",
+                        tool_call_id,
+                        code="scope_changed",
+                        message_status="error",
+                        **preapproved_meta,
+                    )
+                if recheck.active:
+                    verified_company_candidates = recheck.checked_candidates
+                    check_colleague_duplicate = recheck.check_colleague_workspaces
+
+            create_kwargs: dict[str, Any] = {
+                "user_id": user_id,
+                "name": name,
+                "description": description,
+                "verify_snapshot": True,
+                "check_duplicate_snapshot": True,
+            }
+            if verified_company_candidates is not None:
+                create_kwargs["verified_company_candidates"] = verified_company_candidates
+            if check_colleague_duplicate:
+                create_kwargs["check_colleague_duplicate"] = True
+            if snapshot.get("duplicate_workspace_id") is not None:
+                create_kwargs["expected_duplicate_workspace_id"] = str(
+                    snapshot["duplicate_workspace_id"]
+                )
+                if snapshot.get("duplicate_workspace_name") is not None:
+                    create_kwargs["expected_duplicate_workspace_name"] = str(
+                        snapshot["duplicate_workspace_name"]
+                    )
+            if snapshot_computer_kind is not None:
+                create_kwargs["expected_computer_kind"] = str(snapshot_computer_kind)
+            if snapshot_bootstrap:
+                create_kwargs["bootstrap_cloud_primary"] = True
+            elif snapshot_computer_id is not None:
+                create_kwargs["computer_id"] = str(snapshot_computer_id)
+                if snapshot_computer_name is not None:
+                    create_kwargs["expected_computer_name"] = str(
+                        snapshot_computer_name
+                    )
+            else:
+                return error_command(
+                    "情况已变化，请重新发起",
+                    tool_call_id,
+                    code="scope_changed",
+                    message_status="error",
+                    **preapproved_meta,
+                )
+            workspace = await workspace_manager.create_workspace(**create_kwargs)
+        else:
+            workspace = await workspace_manager.create_workspace(
+                user_id=user_id,
+                name=name,
+                description=description,
+            )
+        # --- DALTON-HOOK(cos-settings-tools): end ---
 
         result = {
             "success": True,
             "workspace_id": str(workspace["workspace_id"]),
             "workspace_name": workspace["name"],
         }
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        if snapshot is not None:
+            if workspace.get("computer_id"):
+                result["computer_id"] = str(workspace["computer_id"])
+            if snapshot_computer_name:
+                result["computer_name"] = snapshot_computer_name
+            if snapshot_bootstrap:
+                result["bootstrap_cloud_primary"] = True
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         # --- DALTON-HOOK(workspace-dedup): begin ---
         if wants_coverage:
             from src.dalton.coverage.units import auto_register_workspace_coverage_unit
@@ -489,18 +757,66 @@ async def workspaces_create(
                 f"Its workspace_id is {e.workspace_id}: use that workspace, "
                 "or create this one under a different name."
             )
-        return error_command(f"{e} {hint}", tool_call_id)
+        # DALTON-HOOK(cos-settings-tools): carry preapproved metadata on failure
+        return error_command(f"{e} {hint}", tool_call_id, **preapproved_meta)
     except WorkspaceNameInvalid as e:
-        return error_command(str(e), tool_call_id)
+        # DALTON-HOOK(cos-settings-tools): carry preapproved metadata on failure
+        return error_command(str(e), tool_call_id, **preapproved_meta)
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    except ApprovalScopeChangedError:
+        return error_command(
+            "情况已变化，请重新发起",
+            tool_call_id,
+            code="scope_changed",
+            message_status="error",
+            **preapproved_meta,
+        )
+    except (ComputerNotFoundError, ComputerArchivingError):
+        if snapshot is not None:
+            return error_command(
+                "情况已变化，请重新发起",
+                tool_call_id,
+                code="scope_changed",
+                message_status="error",
+                **preapproved_meta,
+            )
+        return error_command(
+            "failed to create workspace", tool_call_id, **preapproved_meta
+        )
+    except ProviderNotOffered:
+        return error_command(
+            "当前部署默认提供商不支持自动创建托管云端主电脑，请指定已有电脑或联系管理员配置托管云端提供商。",
+            tool_call_id,
+            code="provider_not_offered",
+            **preapproved_meta,
+        )
+    # --- DALTON-HOOK(cos-settings-tools): end ---
     except ComputerPreparingError:
+        if snapshot is not None:
+            # DALTON-HOOK(cos-settings-tools): snapshot target changed to preparing state
+            return error_command(
+                "情况已变化，请重新发起",
+                tool_call_id,
+                code="scope_changed",
+                message_status="error",
+                **preapproved_meta,
+            )
         return error_command(
             "The user's computer is still being prepared, so no workspace can "
             "be created on it yet. Tell the user to try again once it is ready.",
             tool_call_id,
+            **preapproved_meta,
         )
     except Exception as e:
-        logger.error(f"Failed to create workspace: {e}")
-        return error_command("failed to create workspace", tool_call_id)
+        # DALTON-HOOK(cos-settings-tools): log only whitelisted fields without raw exception text
+        logger.error(
+            "workspace_create_failed computer_id=%s exc_type=%s",
+            snapshot_computer_id or "",
+            type(e).__name__,
+        )
+        return error_command(
+            "failed to create workspace", tool_call_id, **preapproved_meta
+        )
 
 
 # --- DALTON-HOOK(cos-settings-tools): begin ---
@@ -561,7 +877,12 @@ async def workspaces_update(
     except HTTPException as exc:
         return error_command(_http_error_message(exc), tool_call_id)
     except Exception as e:
-        logger.error(f"Failed to verify workspace access for update: {e}")
+        logger.error(
+            "workspace_update_failed stage=%s workspace_id=%s exc_type=%s",
+            "verify_access",
+            workspace_id,
+            type(e).__name__,
+        )
         return error_command("failed to update workspace", tool_call_id)
 
     reserved = is_reserved_row(workspace)
@@ -611,7 +932,12 @@ async def workspaces_update(
             tool_call_id,
         )
     except Exception as e:
-        logger.error(f"Failed to update workspace {workspace_id}: {e}")
+        logger.error(
+            "workspace_update_failed stage=%s workspace_id=%s exc_type=%s",
+            "db_update",
+            workspace_id,
+            type(e).__name__,
+        )
         return error_command("failed to update workspace", tool_call_id)
 # --- DALTON-HOOK(cos-settings-tools): end ---
 

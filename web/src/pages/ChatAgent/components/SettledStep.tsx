@@ -1,12 +1,13 @@
 import React, { useId, useState } from 'react';
-import { Check, Circle, X } from 'lucide-react';
+import { AlertCircle, Check, Circle, X } from 'lucide-react'; // DALTON-HOOK(cos-settings-tools)
 import { Disclosure } from '@/components/ui/Disclosure';
 import { FoldChevron } from './decisionCardMotion';
 import { announceAnchoredToggle } from '../utils/anchoredToggle';
 
 /** `none` is a question nobody answered, which only an older thread's plan
  *  can be now. */
-export type SettledVerdict = 'approved' | 'rejected' | 'none';
+// DALTON-HOOK(cos-settings-tools): add 'failed' verdict for execution failures including scope_changed
+export type SettledVerdict = 'approved' | 'rejected' | 'failed' | 'none';
 
 /**
  * What is left of a review once it has been answered: one line in the
@@ -50,6 +51,8 @@ export function SettledStep({
   const bodyId = useId();
   const approved = verdict === 'approved';
   const rejected = verdict === 'rejected';
+  // DALTON-HOOK(cos-settings-tools): distinct failed visual state
+  const failed = verdict === 'failed';
   return (
     <div data-testid={testId} {...(order ? { 'data-order': 'true' } : {})}>
       <button
@@ -62,6 +65,8 @@ export function SettledStep({
         <FoldChevron open={!collapsed} />
         {icon ?? (approved ? (
           <Check className="h-4 w-4 shrink-0" style={{ color: 'var(--color-accent-light)' }} />
+        ) : failed ? (
+          <AlertCircle className="h-4 w-4 shrink-0" style={{ color: 'var(--color-loss)' }} />
         ) : rejected ? (
           <X className="h-4 w-4 shrink-0" style={{ color: 'var(--color-text-tertiary)' }} />
         ) : (
@@ -69,7 +74,13 @@ export function SettledStep({
         ))}
         <span
           className="text-sm truncate"
-          style={{ color: approved ? 'var(--color-text-tertiary)' : 'var(--color-text-quaternary)' }}
+          style={{
+            color: approved
+              ? 'var(--color-text-tertiary)'
+              : failed
+                ? 'var(--color-loss)'
+                : 'var(--color-text-quaternary)',
+          }}
         >
           {label}
         </span>

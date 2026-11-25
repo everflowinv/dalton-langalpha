@@ -6,6 +6,7 @@ doubles — no real network, no real credentials.
 
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 import pathlib
@@ -48,7 +49,9 @@ def _isolated_native_sync_overlay(tmp_path, monkeypatch):
     directory (a symlinked checkout), where real retirements would hide keys
     these tests expect."""
     import src.dalton.llm.overlay as overlay_mod
+    from src.dalton.services.team_model_catalog.compiled import reset_catalog_caches_for_tests
 
+    reset_catalog_caches_for_tests()
     path = tmp_path / "native_sync_overlay.json"
     monkeypatch.setattr(nc, "NATIVE_SYNC_OVERLAY_PATH", path)
     monkeypatch.setattr(overlay_mod, "NATIVE_SYNC_OVERLAY_PATH", path)
@@ -57,7 +60,10 @@ def _isolated_native_sync_overlay(tmp_path, monkeypatch):
         "OVERLAY_SOURCES",
         [(name, path if name == "native_sync" else src) for name, src in overlay_mod.OVERLAY_SOURCES],
     )
-    return path
+    try:
+        yield path
+    finally:
+        reset_catalog_caches_for_tests()
 
 
 def test_overlay_sources_merge_order_is_native_then_native_sync():
@@ -872,27 +878,101 @@ def test_native_catalog_diff_marks_upstream_reappearance_of_retired_model():
 
 
 
-def _make_fake_db(monkeypatch: pytest.MonkeyPatch, *, lock_acquired: bool = True):
-    """Patch `module.get_db_connection` with a create_autospec-backed fake pool."""
+def _make_fake_db(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    lock_acquired: bool = True,
+    catalog_payload: dict[str, Any] | None = None,
+    catalog_revision: int = 0,
+    legacy_sync_import_status: str = "pending",
+    last_known_legacy_retired: list[str] | None = None,
+    catalog_row_missing: bool = False,
+):
+    """Patch `module.get_db_connection` with a create_autospec-backed fake pool.
+
+    Emulates both ``dalton_openclaw_sync_runs`` and the Batch 1
+    ``dalton_team_model_catalog`` / ``dalton_team_model_catalog_revisions``
+    singleton row & CAS revision updates in memory.
+    """
+    from src.dalton.services.team_model_catalog.constants import (
+        CATALOG_SCHEMA,
+        compute_payload_sha256,
+    )
+
     executed: list[tuple[str, Any]] = []
+    init_payload = (
+        copy.deepcopy(catalog_payload)
+        if catalog_payload is not None
+        else {"schema": CATALOG_SCHEMA}
+    )
+    init_payload.setdefault("schema", CATALOG_SCHEMA)
+    catalog_state: dict[str, Any] | None = (
+        None
+        if catalog_row_missing
+        else {
+            "singleton_id": 1,
+            "revision": int(catalog_revision),
+            "schema_version": 1,
+            "payload": init_payload,
+            "payload_sha256": compute_payload_sha256(init_payload),
+            "legacy_sync_import_status": legacy_sync_import_status,
+            "legacy_sync_imported_at": None,
+            "legacy_sync_import_error": None,
+            "last_known_legacy_retired": list(last_known_legacy_retired or []),
+            "updated_by": "system:migration",
+            "updated_at": "2026-10-23T00:00:00+00:00",
+        }
+    )
 
     cur = create_autospec(AsyncCursor, instance=True)
 
     async def _execute(query: Any, params: Any = None, **kwargs: Any) -> Any:
-        executed.append((str(query), params))
+        sql = str(query)
+        executed.append((sql, params))
+        if "UPDATE dalton_team_model_catalog" in sql and catalog_state is not None and params:
+            raw_payload = params[1].obj if hasattr(params[1], "obj") else params[1]
+            catalog_state["revision"] = int(params[0])
+            catalog_state["payload"] = copy.deepcopy(raw_payload)
+            catalog_state["payload_sha256"] = str(params[2])
+            catalog_state["legacy_sync_import_status"] = str(params[3])
+            catalog_state["legacy_sync_import_error"] = params[5]
+            catalog_state["last_known_legacy_retired"] = list(params[6] or [])
+            catalog_state["updated_by"] = str(params[7])
         return cur
 
     cur.execute.side_effect = _execute
 
     async def _fetchone() -> dict[str, Any] | None:
-        sql = executed[-1][0] if executed else ""
+        sql, params = executed[-1] if executed else ("", None)
         if "pg_try_advisory_lock" in sql:
             return {"locked": lock_acquired}
         if "RETURNING run_id" in sql:
             return {"run_id": uuid.uuid4()}
+        if "FROM dalton_team_model_catalog" in sql or "UPDATE dalton_team_model_catalog" in sql:
+            return copy.deepcopy(catalog_state) if catalog_state is not None else None
+        if "INSERT INTO dalton_team_model_catalog_revisions" in sql and params:
+            diff_val = params[5].obj if hasattr(params[5], "obj") else (params[5] or {})
+            se_val = params[6].obj if hasattr(params[6], "obj") else (params[6] or [])
+            return {
+                "revision": int(params[0]),
+                "action": str(params[1]),
+                "target_keys": list(params[2] or []),
+                "payload_sha256": str(params[4]),
+                "diff_summary": copy.deepcopy(diff_val),
+                "side_effects": copy.deepcopy(se_val),
+                "comment": params[7],
+                "restored_from": params[8],
+                "actor_user_id": str(params[9]),
+                "actor_label": params[10],
+                "created_at": "2026-10-23T00:00:00+00:00",
+            }
         return None
 
+    async def _fetchall() -> list[dict[str, Any]]:
+        return []
+
     cur.fetchone.side_effect = _fetchone
+    cur.fetchall.side_effect = _fetchall
 
     conn = create_autospec(AsyncConnection, instance=True)
 
@@ -900,7 +980,13 @@ def _make_fake_db(monkeypatch: pytest.MonkeyPatch, *, lock_acquired: bool = True
     async def _cursor_cm(*args: Any, **kwargs: Any):
         yield cur
 
+    @asynccontextmanager
+    async def _tx_cm(*args: Any, **kwargs: Any):
+        yield
+
     conn.cursor.side_effect = _cursor_cm
+    conn.transaction.side_effect = _tx_cm
+    conn.execute.side_effect = _execute
 
     @asynccontextmanager
     async def _get_db(_conn=None):
@@ -908,6 +994,7 @@ def _make_fake_db(monkeypatch: pytest.MonkeyPatch, *, lock_acquired: bool = True
 
     fake_pool = create_autospec(na.get_db_connection, side_effect=_get_db)
     fake_pool.mock_conn = conn  # so tests can assert which connection was used
+    fake_pool.catalog_state = catalog_state
     return executed, fake_pool
 
 
@@ -952,8 +1039,8 @@ async def test_native_model_check_all_failed_records_failed_run(monkeypatch):
     executed, fake_db = _make_fake_db(monkeypatch)
     monkeypatch.setattr(na, "get_db_connection", fake_db)
     monkeypatch.setattr(na, "_collect_reference_map", create_autospec(na._collect_reference_map, return_value={}))
-    write_spy = create_autospec(write_native_sync_overlay, return_value="0:0")
-    monkeypatch.setattr(na, "write_native_sync_overlay", write_spy)
+    save_spy = create_autospec(na.save_catalog_revision)
+    monkeypatch.setattr(na, "save_catalog_revision", save_spy)
     monkeypatch.setattr(
         na,
         "collect_native_listings",
@@ -973,15 +1060,16 @@ async def test_native_model_check_all_failed_records_failed_run(monkeypatch):
     failed_rows = diffs[0].get("providers") or []
     assert {row["status"] for row in failed_rows} == {"error", "unsupported"}
     assert "added" not in diffs[0]
-    write_spy.assert_not_called()
+    save_spy.assert_not_called()
+    assert not any("UPDATE dalton_team_model_catalog" in sql for sql, _ in executed)
 
 
 @pytest.mark.asyncio
 async def test_native_model_check_ok_records_run_and_in_use_refs(monkeypatch):
     executed, fake_db = _make_fake_db(monkeypatch)
     monkeypatch.setattr(na, "get_db_connection", fake_db)
-    write_spy = create_autospec(write_native_sync_overlay, return_value="0:0")
-    monkeypatch.setattr(na, "write_native_sync_overlay", write_spy)
+    save_spy = create_autospec(na.save_catalog_revision)
+    monkeypatch.setattr(na, "save_catalog_revision", save_spy)
 
     listings = _error_only_listings()
     listings["xai-oauth"] = ProviderListing(
@@ -1015,7 +1103,8 @@ async def test_native_model_check_ok_records_run_and_in_use_refs(monkeypatch):
     ]
     # Matched entries stay in the catalog without a usage note.
     assert "grok-4.7-oauth" not in deprecated_by_key
-    write_spy.assert_not_called()
+    save_spy.assert_not_called()
+    assert not any("UPDATE dalton_team_model_catalog" in sql for sql, _ in executed)
     assert _recorded_statuses(executed) == ["succeeded"]
 
 
@@ -1605,13 +1694,17 @@ async def test_reference_map_lenient_skips_unavailable_sources(monkeypatch):
 async def test_native_model_retire_rejects_when_reference_source_unavailable(
     monkeypatch, tmp_path, failing, source_label
 ):
-    """Strict mode: any unreadable source rejects the whole retire, no overlay write."""
+    """Strict mode: any unreadable source rejects the whole retire, no catalog write."""
     from fastapi import HTTPException
 
     executed, fake_db = _make_fake_db(monkeypatch)
     monkeypatch.setattr(na, "get_db_connection", fake_db)
-    invalidate_spy = create_autospec(na._invalidate_local_worker_model_caches, return_value=None)
-    monkeypatch.setattr(na, "_invalidate_local_worker_model_caches", invalidate_spy)
+    cache_spy = create_autospec(na.cache_compiled_catalog, return_value=None)
+    publish_spy = create_autospec(na.publish_catalog_changed, return_value=None)
+    invalidate_spy = create_autospec(na.invalidate_catalog_redis_caches, return_value=None)
+    monkeypatch.setattr(na, "cache_compiled_catalog", cache_spy)
+    monkeypatch.setattr(na, "publish_catalog_changed", publish_spy)
+    monkeypatch.setattr(na, "invalidate_catalog_redis_caches", invalidate_spy)
 
     overlay_path = tmp_path / "native_sync_overlay.json"
     monkeypatch.setattr(nc, "NATIVE_SYNC_OVERLAY_PATH", overlay_path)
@@ -1620,7 +1713,7 @@ async def test_native_model_retire_rejects_when_reference_source_unavailable(
         "run_id": "00000000-0000-0000-0000-0000000000f9",
         "diff": {
             "deprecated": [
-                {"provider": "xai-oauth", "key": "grok-4.3-oauth", "model_id": "grok-4.3"}
+                {"provider": "xai-oauth", "key": "grok-4.7-build-fast-oauth", "model_id": "grok-4.7-build-fast"}
             ]
         },
     }
@@ -1632,13 +1725,16 @@ async def test_native_model_retire_rejects_when_reference_source_unavailable(
     _stub_all_reference_sources(monkeypatch, failing=failing)
 
     with pytest.raises(HTTPException) as exc_info:
-        await na.run_native_retire(user_id="pm-user", model_keys=["grok-4.3-oauth"])
+        await na.run_native_retire(user_id="pm-user", model_keys=["grok-4.7-build-fast-oauth"])
 
     assert exc_info.value.status_code == 503
     assert exc_info.value.detail["error"] == "reference_check_failed"
     assert exc_info.value.detail["source"] == source_label
-    # Rejected before any write: no overlay file, no cache invalidation.
+    # Rejected before any write: no catalog update, no overlay file, no cache invalidation.
     assert not overlay_path.exists()
+    assert not any("UPDATE dalton_team_model_catalog" in sql for sql, _ in executed)
+    cache_spy.assert_not_called()
+    publish_spy.assert_not_called()
     invalidate_spy.assert_not_called()
     # The attempt is recorded failed, and the kind written at create survives it.
     assert _recorded_statuses(executed) == ["failed"]
@@ -1723,13 +1819,17 @@ async def test_native_model_retire_reads_last_check_after_lock(monkeypatch, tmp_
     """The deprecated list is read only once the advisory lock is held."""
     executed, fake_db = _make_fake_db(monkeypatch)
     monkeypatch.setattr(na, "get_db_connection", fake_db)
+    monkeypatch.setattr(na, "publish_catalog_changed", create_autospec(na.publish_catalog_changed, return_value=None))
+    monkeypatch.setattr(
+        na, "invalidate_catalog_redis_caches", create_autospec(na.invalidate_catalog_redis_caches, return_value=None)
+    )
     monkeypatch.setattr(nc, "NATIVE_SYNC_OVERLAY_PATH", tmp_path / "native_sync_overlay.json")
 
     last_check = {
         "run_id": "00000000-0000-0000-0000-0000000000fa",
         "diff": {
             "deprecated": [
-                {"provider": "xai-oauth", "key": "grok-4.3-oauth", "model_id": "grok-4.3"}
+                {"provider": "xai-oauth", "key": "grok-4.7-build-fast-oauth", "model_id": "grok-4.7-build-fast"}
             ]
         },
     }
@@ -1752,16 +1852,20 @@ async def test_native_model_retire_reads_last_check_after_lock(monkeypatch, tmp_
     )
     _stub_all_reference_sources(monkeypatch)
 
-    result = await na.run_native_retire(user_id="pm-user", model_keys=["grok-4.3-oauth"])
-    assert result["retired_keys"] == ["grok-4.3-oauth"]
+    result = await na.run_native_retire(user_id="pm-user", model_keys=["grok-4.7-build-fast-oauth"])
+    assert result["retired_keys"] == ["grok-4.7-build-fast-oauth"]
 
 
 @pytest.mark.asyncio
 async def test_native_model_sync_applies_selected_keys_add_only(monkeypatch, tmp_path):
     executed, fake_db = _make_fake_db(monkeypatch)
     monkeypatch.setattr(na, "get_db_connection", fake_db)
-    invalidate_spy = create_autospec(na._invalidate_local_worker_model_caches, return_value=None)
-    monkeypatch.setattr(na, "_invalidate_local_worker_model_caches", invalidate_spy)
+    cache_spy = create_autospec(na.cache_compiled_catalog, return_value=None)
+    publish_spy = create_autospec(na.publish_catalog_changed, return_value=None)
+    invalidate_spy = create_autospec(na.invalidate_catalog_redis_caches, return_value=None)
+    monkeypatch.setattr(na, "cache_compiled_catalog", cache_spy)
+    monkeypatch.setattr(na, "publish_catalog_changed", publish_spy)
+    monkeypatch.setattr(na, "invalidate_catalog_redis_caches", invalidate_spy)
 
     overlay_path = tmp_path / "native_sync_overlay.json"
     monkeypatch.setattr(nc, "NATIVE_SYNC_OVERLAY_PATH", overlay_path)
@@ -1809,11 +1913,22 @@ async def test_native_model_sync_applies_selected_keys_add_only(monkeypatch, tmp
     result = await na.run_native_sync(user_id="pm-user", model_keys=["claude-bravo-6-0-oauth"])
     assert result["applied"] is True
     assert result["added_keys"] == ["claude-bravo-6-0-oauth"]
-    invalidate_spy.assert_called_once()
+    assert result["catalog_revision"] == 1
+    cache_spy.assert_called_once()
+    publish_spy.assert_awaited_once_with(1)
+    invalidate_spy.assert_awaited_once()
 
-    data = json.loads(overlay_path.read_text(encoding="utf-8"))
-    assert "claude-bravo-6-0-oauth" in data["models"]
-    assert data["models"]["claude-bravo-6-0-oauth"]["model_id"] == "claude-bravo-6-0"
+    saved_payload = fake_db.catalog_state["payload"]
+    assert "claude-bravo-6-0-oauth" in saved_payload["models"]
+    assert saved_payload["models"]["claude-bravo-6-0-oauth"]["model_id"] == "claude-bravo-6-0"
+    assert not overlay_path.exists()
+
+    # Add-only: re-syncing the same already-present key skips it without bumping revision.
+    second = await na.run_native_sync(user_id="pm-user", model_keys=["claude-bravo-6-0-oauth"])
+    assert second["applied"] is False
+    assert second["added_keys"] == []
+    assert second["skipped_keys"] == ["claude-bravo-6-0-oauth"]
+    assert fake_db.catalog_state["revision"] == 1
 
 
 @pytest.mark.asyncio
@@ -1851,21 +1966,16 @@ async def test_native_model_sync_rejects_previously_retired(monkeypatch, tmp_pat
     assert exc_info.value.detail["code"] == "previously_retired"
     assert _recorded_statuses(executed) == []
 
-    # The stored flag is not the only signal: a retire that landed after the
-    # check is caught by re-reading the live retire list inside the lock.
-    overlay_path = tmp_path / "native_sync_overlay.json"
-    monkeypatch.setattr(nc, "NATIVE_SYNC_OVERLAY_PATH", overlay_path)
-    retire_native_models(
-        [
-            {
-                "key": "grok-4.9-oauth",
-                "provider": "xai-oauth",
-                "retired_at": "2026-10-23T00:00:00Z",
-                "retired_by": "pm-user",
-            }
-        ],
-        path=overlay_path,
-    )
+    # The stored flag is not the only signal: a retire that landed in PostgreSQL
+    # after the check is caught by re-reading the live DB retire list inside the lock.
+    fake_db.catalog_state["payload"]["retired"] = [
+        {
+            "key": "grok-4.9-oauth",
+            "provider": "xai-oauth",
+            "retired_at": "2026-10-23T00:00:00Z",
+            "retired_by": "pm-user",
+        }
+    ]
     fresh_check = {
         "run_id": "00000000-0000-0000-0000-0000000000ef",
         "diff": {
@@ -1892,6 +2002,7 @@ async def test_native_model_sync_rejects_previously_retired(monkeypatch, tmp_pat
     assert exc_live.value.status_code == 409
     assert exc_live.value.detail["code"] == "previously_retired"
     assert exc_live.value.detail["models"] == ["grok-4.9-oauth"]
+    assert _recorded_statuses(executed) == []
 
 
 @pytest.mark.parametrize("overlay_content", ["not json {", "[]\n"], ids=["corrupt", "not_object"])
@@ -1899,10 +2010,10 @@ async def test_native_model_sync_rejects_previously_retired(monkeypatch, tmp_pat
 async def test_native_model_sync_rejects_when_retired_list_unreadable(
     monkeypatch, tmp_path, overlay_content
 ):
-    """A broken overlay must not read as "nothing retired" and let a sync through."""
+    """A broken legacy overlay (or failed legacy import) must not read as "nothing retired"."""
     from fastapi import HTTPException
 
-    executed, fake_db = _make_fake_db(monkeypatch)
+    executed, fake_db = _make_fake_db(monkeypatch, legacy_sync_import_status="pending")
     monkeypatch.setattr(na, "get_db_connection", fake_db)
     overlay_path = tmp_path / "native_sync_overlay.json"
     overlay_path.write_text(overlay_content, encoding="utf-8")
@@ -1938,13 +2049,25 @@ async def test_native_model_sync_rejects_when_retired_list_unreadable(
     assert _recorded_statuses(executed) == []
     assert overlay_path.read_text(encoding="utf-8") == overlay_content
 
+    # Once startup legacy import marks 'failed', sync is also blocked 503 without creating a run row.
+    fake_db.catalog_state["legacy_sync_import_status"] = "failed"
+    with pytest.raises(HTTPException) as exc_failed:
+        await na.run_native_sync(user_id="pm-user", model_keys=["grok-4.9-oauth"])
+    assert exc_failed.value.status_code == 503
+    assert exc_failed.value.detail["code"] == "legacy_overlay_import_failed"
+    assert _recorded_statuses(executed) == []
+
 
 @pytest.mark.asyncio
 async def test_native_model_retire_per_key_results_and_overlay_write(monkeypatch, tmp_path):
     executed, fake_db = _make_fake_db(monkeypatch)
     monkeypatch.setattr(na, "get_db_connection", fake_db)
-    invalidate_spy = create_autospec(na._invalidate_local_worker_model_caches, return_value=None)
-    monkeypatch.setattr(na, "_invalidate_local_worker_model_caches", invalidate_spy)
+    cache_spy = create_autospec(na.cache_compiled_catalog, return_value=None)
+    publish_spy = create_autospec(na.publish_catalog_changed, return_value=None)
+    invalidate_spy = create_autospec(na.invalidate_catalog_redis_caches, return_value=None)
+    monkeypatch.setattr(na, "cache_compiled_catalog", cache_spy)
+    monkeypatch.setattr(na, "publish_catalog_changed", publish_spy)
+    monkeypatch.setattr(na, "invalidate_catalog_redis_caches", invalidate_spy)
 
     overlay_path = tmp_path / "native_sync_overlay.json"
     monkeypatch.setattr(nc, "NATIVE_SYNC_OVERLAY_PATH", overlay_path)
@@ -1959,7 +2082,7 @@ async def test_native_model_retire_per_key_results_and_overlay_write(monkeypatch
                 "diff": {
                     "deprecated": [
                         {"provider": "codex-oauth", "key": "gpt-5.3-codex-spark-oauth", "model_id": "gpt-5.3-codex-spark"},
-                        {"provider": "xai-oauth", "key": "grok-4.3-oauth", "model_id": "grok-4.3"},
+                        {"provider": "xai-oauth", "key": "grok-4.7-build-fast-oauth", "model_id": "grok-4.7-build-fast"},
                     ]
                 },
             },
@@ -1976,29 +2099,33 @@ async def test_native_model_retire_per_key_results_and_overlay_write(monkeypatch
 
     result = await na.run_native_retire(
         user_id="pm-user",
-        model_keys=["grok-4.3-oauth", "gpt-5.3-codex-spark-oauth", "not-deprecated-oauth"],
+        model_keys=["grok-4.7-build-fast-oauth", "gpt-5.3-codex-spark-oauth", "not-deprecated-oauth"],
     )
 
     by_key = {r["key"]: r for r in result["results"]}
-    assert by_key["grok-4.3-oauth"]["status"] == "retired"
+    assert by_key["grok-4.7-build-fast-oauth"]["status"] == "retired"
     assert by_key["gpt-5.3-codex-spark-oauth"]["status"] == "in_use"
     assert by_key["gpt-5.3-codex-spark-oauth"]["in_use_by"] == [
         "agent_config.llm.name",
         "user:u1:preferred_model",
     ]
     assert by_key["not-deprecated-oauth"]["status"] == "not_deprecated"
-    assert result["retired_keys"] == ["grok-4.3-oauth"]
+    assert result["retired_keys"] == ["grok-4.7-build-fast-oauth"]
+    assert result["catalog_revision"] == 1
 
-    data = json.loads(overlay_path.read_text(encoding="utf-8"))
-    assert data["retired"] == [
+    saved_payload = fake_db.catalog_state["payload"]
+    assert saved_payload["retired"] == [
         {
-            "key": "grok-4.3-oauth",
+            "key": "grok-4.7-build-fast-oauth",
             "provider": "xai-oauth",
             "retired_at": result["retired_at"],
             "retired_by": "pm-user",
         }
     ]
-    invalidate_spy.assert_called_once()
+    assert not overlay_path.exists()
+    cache_spy.assert_called_once()
+    publish_spy.assert_awaited_once_with(1)
+    invalidate_spy.assert_awaited_once()
     assert _recorded_statuses(executed) == ["succeeded"]
     diffs = _recorded_diffs(executed)
     assert diffs[-1]["kind"] == "retire"
@@ -2013,46 +2140,68 @@ async def test_native_model_retire_lock_busy_returns_409(monkeypatch):
     monkeypatch.setattr(na, "get_db_connection", fake_db)
 
     with pytest.raises(HTTPException) as exc_info:
-        await na.run_native_retire(user_id="pm-user", model_keys=["grok-4.3-oauth"])
+        await na.run_native_retire(user_id="pm-user", model_keys=["grok-4.7-build-fast-oauth"])
     assert exc_info.value.status_code == 409
 
 
 @pytest.mark.asyncio
 async def test_native_model_restore_removes_retired_records(monkeypatch, tmp_path):
-    executed, fake_db = _make_fake_db(monkeypatch)
-    monkeypatch.setattr(na, "get_db_connection", fake_db)
-    invalidate_spy = create_autospec(na._invalidate_local_worker_model_caches, return_value=None)
-    monkeypatch.setattr(na, "_invalidate_local_worker_model_caches", invalidate_spy)
+    from fastapi import HTTPException
 
-    overlay_path = tmp_path / "native_sync_overlay.json"
-    retire_native_models(
-        [
-            {
-                "key": "grok-4.3-oauth",
-                "provider": "xai-oauth",
-                "retired_at": "2026-10-23T00:00:00Z",
-                "retired_by": "pm-user",
-            }
-        ],
-        path=overlay_path,
+    executed, fake_db = _make_fake_db(
+        monkeypatch,
+        catalog_revision=1,
+        legacy_sync_import_status="imported",
+        catalog_payload={
+            "retired": [
+                {
+                    "key": "grok-4.7-build-fast-oauth",
+                    "provider": "xai-oauth",
+                    "retired_at": "2026-10-23T00:00:00Z",
+                    "retired_by": "pm-user",
+                }
+            ]
+        },
     )
-    monkeypatch.setattr(nc, "NATIVE_SYNC_OVERLAY_PATH", overlay_path)
+    monkeypatch.setattr(na, "get_db_connection", fake_db)
+    cache_spy = create_autospec(na.cache_compiled_catalog, return_value=None)
+    publish_spy = create_autospec(na.publish_catalog_changed, return_value=None)
+    invalidate_spy = create_autospec(na.invalidate_catalog_redis_caches, return_value=None)
+    monkeypatch.setattr(na, "cache_compiled_catalog", cache_spy)
+    monkeypatch.setattr(na, "publish_catalog_changed", publish_spy)
+    monkeypatch.setattr(na, "invalidate_catalog_redis_caches", invalidate_spy)
 
     result = await na.run_native_restore(
-        user_id="pm-user", model_keys=["grok-4.3-oauth", "never-retired-oauth"]
+        user_id="pm-user", model_keys=["grok-4.7-build-fast-oauth", "never-retired-oauth"]
     )
 
     by_key = {r["key"]: r for r in result["results"]}
-    assert by_key["grok-4.3-oauth"]["status"] == "restored"
+    assert by_key["grok-4.7-build-fast-oauth"]["status"] == "restored"
     assert by_key["never-retired-oauth"]["status"] == "not_retired"
-    assert result["restored_keys"] == ["grok-4.3-oauth"]
+    assert result["restored_keys"] == ["grok-4.7-build-fast-oauth"]
+    assert result["catalog_revision"] == 2
 
-    data = json.loads(overlay_path.read_text(encoding="utf-8"))
-    assert data["retired"] == []
-    invalidate_spy.assert_called_once()
+    assert fake_db.catalog_state["payload"]["retired"] == []
+    cache_spy.assert_called_once()
+    publish_spy.assert_awaited_once_with(2)
+    invalidate_spy.assert_awaited_once()
     assert _recorded_statuses(executed) == ["succeeded"]
     diffs = _recorded_diffs(executed)
     assert diffs[-1]["kind"] == "restore"
+
+    # Factory-retired keys cannot be restored (400).
+    with pytest.raises(HTTPException) as exc_factory:
+        await na.run_native_restore(user_id="pm-user", model_keys=["grok-4.3-oauth"])
+    assert exc_factory.value.status_code == 400
+    assert exc_factory.value.detail["code"] == "factory_retired_immutable"
+
+    # Readonly legacy retired keys cannot be restored while import status is 'failed' (409).
+    fake_db.catalog_state["legacy_sync_import_status"] = "failed"
+    fake_db.catalog_state["last_known_legacy_retired"] = ["grok-4.7-build-fast-oauth"]
+    with pytest.raises(HTTPException) as exc_legacy:
+        await na.run_native_restore(user_id="pm-user", model_keys=["grok-4.7-build-fast-oauth"])
+    assert exc_legacy.value.status_code == 409
+    assert exc_legacy.value.detail["code"] == "legacy_retired_locked_until_import_resolved"
 
 
 @pytest.mark.asyncio
@@ -2175,21 +2324,52 @@ async def test_native_model_status_keeps_succeeded_diff_after_failed_check(monke
         "fetch_last_succeeded_native_check",
         create_autospec(na.fetch_last_succeeded_native_check, return_value=succeeded_run),
     )
-    # Patch the names the service actually resolves, and pin the catalog so a model
-    # already present locally cannot hide the expected "added" entry. The retired
-    # list is pinned empty too: whatever overlay this machine has must not leak in.
-    monkeypatch.setattr(
-        na, "load_native_sync_overlay", create_autospec(nc.load_native_sync_overlay, return_value=None)
-    )
-    monkeypatch.setattr(
-        na, "load_retired_models", create_autospec(na.load_retired_models, return_value=[])
-    )
-    from src.llms.llm import LLM, ModelConfig
+    # Patch the Batch 1 DB-backed catalog entry points so the local environment's
+    # catalog cannot hide the expected "added" / "deprecated" entries.
+    from src.dalton.services.team_model_catalog.compiled import CompiledCatalog
+    from src.dalton.services.team_model_catalog.constants import CATALOG_SCHEMA
+    from src.llms.llm import ModelConfig
 
     fixed_cfg = create_autospec(ModelConfig, instance=True)
     fixed_cfg.llm_config = {}
+    empty_compiled = CompiledCatalog(
+        revision=0,
+        payload_sha256="empty",
+        overlay_stamp="test",
+        oauth_sync_enabled=True,
+        legacy_sync_import_status="not_applicable",
+        legacy_retired_fingerprint="none",
+        model_config=fixed_cfg,
+        dalton_meta={},
+        notional_price_index={},
+        task_costs=None,
+        antigravity_series=[],
+        provider_variants={},
+        variant_bound_urls={},
+        factory_retired_keys=frozenset(),
+        readonly_legacy_retired_keys=frozenset(),
+        team_retired_keys=frozenset(),
+        curated_setup=None,
+        payload={"schema": CATALOG_SCHEMA},
+    )
     monkeypatch.setattr(
-        LLM, "get_model_config", create_autospec(LLM.get_model_config, return_value=fixed_cfg)
+        na,
+        "get_compiled_catalog_async",
+        create_autospec(na.get_compiled_catalog_async, return_value=empty_compiled),
+    )
+    monkeypatch.setattr(
+        na,
+        "get_catalog_row",
+        create_autospec(
+            na.get_catalog_row,
+            return_value={
+                "revision": 0,
+                "payload": {"schema": CATALOG_SCHEMA},
+                "legacy_sync_import_status": "not_applicable",
+                "legacy_sync_import_error": None,
+                "updated_at": None,
+            },
+        ),
     )
 
     status = await na.get_native_status()

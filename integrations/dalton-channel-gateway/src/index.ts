@@ -22,6 +22,7 @@ export * from "./shared/dedupe.js";
 export * from "./shared/keyed-queue.js";
 export * from "./shared/logger.js";
 export * from "./shared/safe-fetch.js";
+export * from "./shared/sandbox-links.js";
 export * from "./shared/text.js";
 export * from "./shared/workspace-download.js";
 export * from "./shared/workspace-upload.js";

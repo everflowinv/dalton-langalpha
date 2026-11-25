@@ -201,6 +201,11 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
     provider: Optional[str] = None,
     *,
     _warn_on_miss: bool = True,
+    # DALTON-HOOK(team-model-catalog): allow callers (e.g. ModelConfig.get_model_metadata)
+    # to pass a pinned compiled ModelConfig instead of re-reading the live global catalog,
+    # and optionally pass the manifest model_key for unified subscription billing resolution.
+    model_config: Any = None,
+    model_key: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Find pricing information for a model with provider-aware lookup and fallback strategies.
@@ -241,14 +246,29 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
         >>> find_model_pricing("gpt-5-0905", provider="openai")  # Version fallback
         {'input': 1.25, 'output': 10.0, ...}  # Falls back to gpt-5 pricing
     """
-    from .llm import LLM
+    # DALTON-HOOK(team-model-catalog): honor active turn effective_catalog_snapshot before live manifest
+    # (skip ambient turn snapshot when caller explicitly pinned a compiled model_config for /api/v1/models)
+    if model_config is None:
+        from src.dalton.services.team_model_catalog.snapshot import lookup_snapshot_pricing
 
-    try:
-        model_config = LLM.get_model_config()
-        manifest = model_config.manifest
-    except Exception as e:
-        logger.warning(f"Failed to load model manifest for pricing lookup: {e}")
-        return None
+        snap_hit, snap_pricing = lookup_snapshot_pricing(
+            model_key or model_name,
+            provider,
+            model_id=model_name if model_key else None,
+        )
+        if snap_hit:
+            return snap_pricing
+
+        from .llm import LLM
+
+        try:
+            model_config = LLM.get_model_config()
+            manifest = model_config.manifest
+        except Exception as e:
+            logger.warning(f"Failed to load model manifest for pricing lookup: {e}")
+            return None
+    else:
+        manifest = getattr(model_config, "manifest", None)
 
     if not manifest or 'models' not in manifest:
         logger.warning("Model manifest is empty or missing 'models' key")
@@ -265,49 +285,73 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
 
     model_name_normalized = _normalize(model_name)
 
+    # DALTON-HOOK(team-model-catalog): unified subscription billing check before searching cash cards
+    # so provider-level AND model-level dalton_meta.billing="subscription" agree between live & snapshot
+    # pricing (preserving z-ai-cn-coding explicit $0.0 manifest cards, upstream raw-manifest tests,
+    # and upstream OAuth parent list-rate inheritance when called without model_key).
+    from src.dalton.llm.overlay import _in_upstream_raw_manifest_test
+    from src.dalton.services.team_model_catalog.billing import resolve_model_billing
+
+    in_raw_manifest_test = _in_upstream_raw_manifest_test()
+    resolved_prov_for_billing = provider
+    if not resolved_prov_for_billing and model_config is not None:
+        exact_cfg = (getattr(model_config, "llm_config", None) or {}).get(model_key or model_name)
+        if isinstance(exact_cfg, dict):
+            resolved_prov_for_billing = exact_cfg.get("provider")
+
+    is_upstream_oauth_parent_lookup = model_key is None and provider in (
+        "claude-oauth",
+        "codex-oauth",
+        "grok-oauth",
+    )
+    is_zai_coding = resolved_prov_for_billing == "z-ai-cn-coding"
+    if not in_raw_manifest_test and not is_upstream_oauth_parent_lookup:
+        is_sub_route = (
+            resolve_model_billing(
+                model_key=model_key,
+                provider=provider,
+                model_id=model_name,
+                model_config=model_config,
+            )
+            == "subscription"
+        )
+        if is_sub_route and not is_zai_coding:
+            logger.debug(
+                f"Subscription route (provider={resolved_prov_for_billing!r}, model={model_name[:_LOGGED_NAME_MAX_LEN]!r}): "
+                "billed by subscription, skipping token pricing lookup"
+            )
+            return {"pricing_type": "subscription"}
+
     # Determine which providers to search (provider → parent → global)
+    # DALTON-HOOK(team-model-catalog): resolve own provider (exact+alias -> normalized)
+    # before falling back to parent provider, matching snapshot._extract_cash_pricing_card.
+    provider_scoped = False
     if provider:
         providers_to_search = []
         if provider in manifest['models']:
             providers_to_search.append((provider, manifest['models'][provider]))
-        # Fall back to parent provider's pricing if available
+        # Fall back to parent provider's pricing if available (non-subscription only)
         parent = model_config.get_parent_provider(provider)
         if parent != provider and parent in manifest['models']:
             providers_to_search.append((parent, manifest['models'][parent]))
             logger.debug(f"Including parent provider '{parent}' in pricing search for '{provider}'")
         if not providers_to_search:
-            # DALTON-HOOK(llm-overlay): subscription providers (explicitly marked
-            # billing: "subscription") are billed by seat, not per token — do not
-            # fall through to unrelated providers or warn on missing rates.
-            if is_subscription_provider(provider=provider, model_config=model_config):
-                logger.debug(
-                    f"Subscription provider {provider!r} for model {model_name[:_LOGGED_NAME_MAX_LEN]!r}: "
-                    "billed by subscription, skipping token pricing lookup"
-                )
-                from src.dalton.llm.overlay import _in_upstream_raw_manifest_test
-
-                if _in_upstream_raw_manifest_test():
-                    return None
-                return {"pricing_type": "subscription"}
             # Neither provider nor parent has models listed, search all
             providers_to_search = list(manifest['models'].items())
             logger.debug(f"Provider '{provider}' and parent not found in manifest, searching all providers")
         else:
+            provider_scoped = True
             logger.debug(f"Searching for '{model_name}' in provider(s): {[p for p, _ in providers_to_search]}")
     else:
         # Global search across all providers
         providers_to_search = list(manifest['models'].items())
 
-    # STEP 1 & 2: Exact ID and alias matching (case-insensitive)
-    for prov, models in providers_to_search:
+    def _match_exact_or_alias(prov: str, models: list) -> Optional[Dict[str, Any]]:
         for model in models:
-            # Check exact ID match (case-insensitive)
             model_id = model.get('id', '')
             if model_id.lower() == model_name_lower:
                 logger.debug(f"Found pricing for '{model_name}' via exact ID match in provider '{prov}'")
                 return model.get('pricing')
-
-            # Check aliases (case-insensitive)
             aliases = model.get('alias', [])
             if isinstance(aliases, list):
                 for alias in aliases:
@@ -317,9 +361,10 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
                             f"(model_id: {model_id}) in provider '{prov}'"
                         )
                         return model.get('pricing')
+        return None
 
-    # STEP 2.5: Normalized matching (dots ↔ hyphens)
-    for prov, models in providers_to_search:
+    # DALTON-HOOK(team-model-catalog): alias lookup returns before normalized matching.
+    def _match_normalized(prov: str, models: list) -> Optional[Dict[str, Any]]:
         for model in models:
             model_id = model.get('id', '')
             if _normalize(model_id) == model_name_normalized:
@@ -328,7 +373,6 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
                     f"(model_id: {model_id}) in provider '{prov}'"
                 )
                 return model.get('pricing')
-
             aliases = model.get('alias', [])
             if isinstance(aliases, list):
                 for alias in aliases:
@@ -338,6 +382,27 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
                             f"(model_id: {model_id}) in provider '{prov}'"
                         )
                         return model.get('pricing')
+        return None
+
+    if provider_scoped:
+        # Provider-scoped search: check own provider (exact+alias -> normalized) BEFORE parent.
+        for prov, models in providers_to_search:
+            hit = _match_exact_or_alias(prov, models)
+            if hit is not None:
+                return hit
+            hit = _match_normalized(prov, models)
+            if hit is not None:
+                return hit
+    else:
+        # Global search: exact+alias across all providers before normalized fallback.
+        for prov, models in providers_to_search:
+            hit = _match_exact_or_alias(prov, models)
+            if hit is not None:
+                return hit
+        for prov, models in providers_to_search:
+            hit = _match_normalized(prov, models)
+            if hit is not None:
+                return hit
 
     # On an unstamped record this name is the vendor's own string, which can carry
     # newlines and forge a log record downstream, so every line below quotes and
@@ -351,8 +416,15 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
             f"No exact match for {safe_name}, trying base model '{base_model}' "
             f"(extracted via pattern matching)"
         )
-        # Recursive lookup with base model (keep same provider context)
-        pricing = find_model_pricing(base_model, provider, _warn_on_miss=False)
+        # Recursive lookup with base model (keep same provider context & pinned model_config)
+        # DALTON-HOOK(team-model-catalog): forward pinned model_config and model_key across recursive base-model fallback
+        pricing = find_model_pricing(
+            base_model,
+            provider,
+            _warn_on_miss=False,
+            model_config=model_config,
+            model_key=model_key,
+        )
         if pricing:
             logger.warning(
                 f"Using pricing for base model '{base_model}' for snapshot version {safe_name}. "
@@ -363,17 +435,17 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
         else:
             logger.debug(f"Base model '{base_model}' also not found in manifest")
 
-    # DALTON-HOOK(llm-overlay): subscription providers (billing: "subscription")
-    # do not bill per token; downgrade missing-card log to DEBUG and return
-    # upstream's pricing_type="subscription" marker. Only check the resolved provider.
-    resolved_provider = provider
-    if not resolved_provider and model_config is not None:
-        exact_cfg = (getattr(model_config, "llm_config", None) or {}).get(model_name)
-        if isinstance(exact_cfg, dict):
-            resolved_provider = exact_cfg.get("provider")
-    if is_subscription_provider(provider=resolved_provider, model_config=model_config):
+    # DALTON-HOOK(llm-overlay): subscription routes (billing: "subscription" or coding plan
+    # without a $0.0 card) do not bill per token; downgrade missing-card log to DEBUG and
+    # return upstream's pricing_type="subscription" marker.
+    if not is_upstream_oauth_parent_lookup and resolve_model_billing(
+        model_key=model_key,
+        provider=resolved_prov_for_billing,
+        model_id=model_name,
+        model_config=model_config,
+    ) == "subscription":
         logger.debug(
-            f"Subscription model {safe_name} (provider: {resolved_provider!r}) has no per-token "
+            f"Subscription model {safe_name} (provider: {resolved_prov_for_billing!r}) has no per-token "
             "pricing card; billed by subscription."
         )
         from src.dalton.llm.overlay import _in_upstream_raw_manifest_test
@@ -403,6 +475,11 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
     return None
 
 
+# DALTON-HOOK(team-model-catalog): marker read by core.py so real find_model_pricing receives
+# model_key while 2-arg test stubs in upstream tests keep their exact call signature.
+find_model_pricing._accepts_model_key = True  # type: ignore[attr-defined]
+
+
 def _representative_rate(
     pricing: Dict[str, Any],
     flat_key: str,
@@ -427,7 +504,11 @@ def _representative_rate(
 
 
 def get_list_rates(
-    model_name: str, provider: Optional[str] = None
+    model_name: str,
+    provider: Optional[str] = None,
+    *,
+    # DALTON-HOOK(team-model-catalog): allow pinning the compiled ModelConfig for version-aligned /api/v1/models
+    model_config: Any = None,
 ) -> Optional[Tuple[float, float]]:
     """Representative (input, output) USD per 1M tokens, or None when unpriced.
 
@@ -435,7 +516,12 @@ def get_list_rates(
     aliases, tiered rates). One source for the price the picker prints and the
     estimate its cost marks fall back on, so the two cannot disagree.
     """
-    pricing = find_model_pricing(model_name, provider)
+    # DALTON-HOOK(team-model-catalog): only forward model_config when explicitly pinned so 2-arg test stubs keep working
+    pricing = (
+        find_model_pricing(model_name, provider, model_config=model_config)
+        if model_config is not None
+        else find_model_pricing(model_name, provider)
+    )
     if not pricing:
         return None
     pin = _representative_rate(pricing, 'input', 'input_tiers')
@@ -1122,8 +1208,13 @@ def calculate_total_cost(
     if pricing is None and (model_name or provider):
         if model_name:
             pricing = find_model_pricing(model_name, provider=provider)
-        elif is_subscription_provider(provider=provider):
-            pricing = {"pricing_type": "subscription"}
+        else:
+            from src.dalton.services.team_model_catalog.billing import resolve_model_billing
+
+            if provider not in ("claude-oauth", "codex-oauth") and resolve_model_billing(
+                provider=provider
+            ) == "subscription":
+                pricing = {"pricing_type": "subscription"}
 
     if isinstance(pricing, dict) and pricing.get("pricing_type") == "subscription":
         return {

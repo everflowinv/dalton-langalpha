@@ -1,7 +1,6 @@
 import { useTranslation } from 'react-i18next';
-import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { useCapabilities } from '@/hooks/useCapabilities';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { useProviderStatus } from '../../hooks/useProviderStatus';
 import { NativeModelsCard } from './NativeModelsCard';
 import { ProviderRow } from './ProviderRow';
@@ -16,9 +15,8 @@ import {
 /** Team provider health dashboard + model catalog sync section (admin view in Team Models). */
 export function ProviderStatusCard() {
   const { t } = useTranslation();
-  const { isPm, callerTier } = useTeamCredentials();
+  const { isAdmin } = useCallerIdentity();
   const { hasCapability } = useCapabilities();
-  const isAdmin = callerTier === 'admin' || (!isDaltonAuth && isPm);
   const showNativeModels = hasCapability('native_oauth_sync');
   const statusQuery = useProviderStatus(true);
 

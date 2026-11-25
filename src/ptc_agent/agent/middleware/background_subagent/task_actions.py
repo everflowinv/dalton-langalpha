@@ -748,19 +748,28 @@ async def _handle_resume(
                 return refusal
         # Before the fence, so a refused model holds nothing once the claim
         # drops on the way out.
+        # DALTON-HOOK(team-model-catalog): compare the live-resolved subagent route against the
+        # interrupted predecessor run's persisted snapshot via verify_resume_route BEFORE
+        # _resolve_model constructs any LLM client.
+        from fastapi import HTTPException
+
+        from src.dalton.services.team_model_catalog.constants import (
+            CATALOG_ROUTE_CHANGED_CODE,
+            CATALOG_ROUTE_CHANGED_MESSAGE,
+        )
+        from src.dalton.services.team_model_catalog.snapshot import (
+            _extract_primary_model_key_from_run,
+            resolve_live_route_fingerprint,
+            verify_resume_route,
+        )
+
+        pred_row: dict[str, Any] | None = prior_run
         try:
             # DALTON-HOOK(subagent-resume): reuse the latest row already read
             # during orphan arbitration instead of hitting the ledger twice
             # before acquiring the fence.
-            if ask.complete:
-                runs = ask
-            else:
-                last_ask = (
-                    TaskAsk.from_facts(prior_run.get("replay_facts") or {})
-                    if prior_run is not None
-                    else await _last_ask(mw, task)
-                )
-                runs = ask.over(last_ask)
+            if pred_row is None and mw.registry.run_ledger is not None:
+                pred_row = await _read_latest_run(mw, task)
         except Exception:
             logger.warning("latest run read failed", task_id=task.task_id, exc_info=True)
             return _refusal(
@@ -768,7 +777,70 @@ async def _handle_resume(
                 "just now. Try again.",
                 tool_call_id,
             )
-        override = await _resolve_model(mw, runs, task.subagent_type) if runs else None
+
+        if ask.complete:
+            runs = ask
+        else:
+            last_ask = (
+                TaskAsk.from_facts(pred_row.get("replay_facts") or {})
+                if pred_row is not None
+                else (task.ask or TaskAsk())
+            )
+            runs = ask.over(last_ask)
+
+        verified_subagent_route = None
+        if pred_row is not None:
+            if mw.task_models is not None and hasattr(mw.task_models, "effective_model_key"):
+                live_model_key = await mw.task_models.effective_model_key(
+                    runs, task.subagent_type
+                )
+            else:
+                # DALTON-HOOK(team-model-catalog): tolerate test-double task_models without _own_model
+                own_model_fn = getattr(mw.task_models, "_own_model", None)
+                live_model_key = (
+                    runs.model.strip()
+                    if runs and runs.model
+                    else (
+                        own_model_fn(task.subagent_type)
+                        if callable(own_model_fn)
+                        else (_extract_primary_model_key_from_run(pred_row, is_subagent=True) or "")
+                    )
+                )
+            tm_user_id = getattr(mw.task_models, "_user_id", None)
+            tm_model_pref = getattr(mw.task_models, "_model_pref", None)
+            try:
+                live_route = await resolve_live_route_fingerprint(
+                    live_model_key,
+                    user_id=tm_user_id,
+                    model_pref=tm_model_pref,
+                )
+                await verify_resume_route(
+                    str(pred_row.get("task_run_id") or "") or None,
+                    live_route,
+                    is_subagent=True,
+                    run_row=pred_row,
+                )
+                verified_subagent_route = live_route
+            except HTTPException as exc:
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                code = str(
+                    detail.get("code") or detail.get("type") or CATALOG_ROUTE_CHANGED_CODE
+                )
+                msg = str(detail.get("message") or CATALOG_ROUTE_CHANGED_MESSAGE)
+                return _refusal(f"Error: [{code}] {msg}", tool_call_id)
+
+        from contextlib import nullcontext
+
+        from src.dalton.services.team_model_catalog.snapshot import (
+            bind_verified_resume_variant_binding,
+        )
+
+        with (
+            bind_verified_resume_variant_binding(verified_subagent_route)
+            if verified_subagent_route is not None
+            else nullcontext()
+        ):
+            override = await _resolve_model(mw, runs, task.subagent_type) if runs else None
         if isinstance(override, TaskModelRefused):
             # DALTON-HOOK(computer-cli-tokens-off): omit `la models list` when CLI tokens are off.
             from src.dalton.settings import is_computer_cli_tokens_enabled

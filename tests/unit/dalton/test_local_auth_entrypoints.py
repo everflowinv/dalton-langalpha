@@ -692,6 +692,11 @@ class TestUnifiedBackendEntrypoints:
         )
         other_hdr = {"Authorization": f"Bearer {other_token}"}
 
+        from src.dalton import sharing as dalton_sharing
+
+        tier_spy = create_autospec(dalton_sharing.get_user_tier, return_value="internal")
+        monkeypatch.setattr(dalton_sharing, "get_user_tier", tier_spy)
+
         mock_meta = create_autospec(
             conv_db.get_thread_auth_meta,
             return_value={"user_id": TEST_USER_ID, "workspace_owner_id": TEST_USER_ID, "workspace_id": "ws1"},
@@ -719,6 +724,11 @@ class TestUnifiedBackendEntrypoints:
         )
         monkeypatch.setattr(msg_mod, "get_replay_thread_data", mock_replay)
         assert client.get("/api/v1/threads/t1/messages/replay", headers=other_hdr).status_code == 403
+
+        # External member receives 404 (not 403) on both foreign stream and replay routes
+        tier_spy.return_value = "external"
+        assert client.get("/api/v1/threads/t1/messages/stream", headers=other_hdr).status_code == 404
+        assert client.get("/api/v1/threads/t1/messages/replay", headers=other_hdr).status_code == 404
 
 
 class TestConditionalLocalRouterRegistration:

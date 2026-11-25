@@ -54,7 +54,7 @@ def validate_custom_models(
 
     valid_providers = {
         k for k, v in mc.flat_providers.items()
-        if not v.get("platform")
+        if not v.get("platform") and v.get("catalog_defined") is not True  # DALTON-HOOK(team-model-catalog): disallow personal custom models on catalog variants
     }
     if custom_providers:
         valid_providers.update(
@@ -105,6 +105,19 @@ def validate_custom_models(
             raise HTTPException(
                 status_code=400,
                 detail=f"custom_models[{idx}]: provider must be a non-empty string",
+            )
+
+        # DALTON-HOOK(team-model-catalog): reject personal custom models targeting a catalog-defined variant
+        if mc.get_provider_info(provider).get("catalog_defined") is True:
+            from src.dalton.services.team_model_catalog.transport import (
+                check_custom_model_against_catalog_variants,
+            )
+
+            check_custom_model_against_catalog_variants(
+                resolved_provider=provider,
+                resolved_base_url=None,
+                mc=mc,
+                model_name=name,
             )
 
         if provider not in valid_providers and (name, provider) not in kept:
@@ -300,6 +313,46 @@ async def refuse_custom_model_endpoints(
                             "team credential sharing is enabled."
                         ),
                     )
+    # DALTON-HOOK(team-model-catalog): check every personal custom model's resolved provider &
+    # resolved base_url (including inherited holder/user saved base_url & parameter URLs)
+    # against all catalog-defined provider variants' bound_base_url.
+    from src.dalton.services.team_model_catalog.transport import (
+        check_custom_model_against_catalog_variants,
+        get_catalog_variant_bound_urls,
+    )
+    from src.llms.llm import LLM as _LLMFactory
+
+    _mc = _LLMFactory.get_model_config()
+    if get_catalog_variant_bound_urls(_mc):
+        saved_base_urls: dict[str, str] = {}
+        if user_id:
+            try:
+                from src.server.database.api_keys import get_user_api_keys
+
+                key_info = await get_user_api_keys(user_id)
+                saved_base_urls = {
+                    str(k): str(v).strip()
+                    for k, v in (key_info.get("base_urls") or {}).items()
+                    if isinstance(v, str) and v.strip()
+                }
+            except Exception:
+                saved_base_urls = {}
+        for _idx, cm in enumerate(custom_models):
+            if not isinstance(cm, dict):
+                continue
+            prov = str(cm.get("provider") or "").strip()
+            inherited_url = saved_base_urls.get(prov)
+            if not inherited_url and prov:
+                parent_prov = _mc.get_parent_provider(prov)
+                inherited_url = saved_base_urls.get(parent_prov)
+            check_custom_model_against_catalog_variants(
+                resolved_provider=prov,
+                resolved_base_url=inherited_url,
+                parameter_urls=egress.parameter_urls(cm.get("parameters")),
+                mc=_mc,
+                model_name=str(cm.get("name") or ""),
+            )
+
     if not egress.enforced():
         return
     to_check: list[tuple[int, str]] = []
@@ -371,7 +424,10 @@ def validate_custom_providers(
         check_shared_team_creds = uses_shared_team_credential(user_id)
 
     mc = LLM.get_model_config()
-    builtin = set(mc.get_byok_eligible_providers())
+    builtin = {
+        p for p in mc.get_byok_eligible_providers()
+        if mc.get_provider_info(p).get("catalog_defined") is not True  # DALTON-HOOK(team-model-catalog): exclude catalog variants from personal custom_providers
+    }
     name_re = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$")
     seen: set[str] = set()
 

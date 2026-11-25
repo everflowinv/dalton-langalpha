@@ -124,61 +124,86 @@ async def _persist_takes(
     for take in claimed:
         task, records = take.task, take.records
         try:
-            usage_service = UsagePersistenceService(
-                thread_id=thread_id,
-                workspace_id=workspace_id,
-                user_id=recorded_as,
+            # DALTON-HOOK(team-model-catalog): bind subagent_runs.replay_facts['effective_catalog_snapshot']
+            # during task usage settlement (falling back to any already-active turn snapshot).
+            from contextlib import nullcontext
+
+            from src.dalton.database.team_model_catalog import (
+                is_conversation_db_pool_open,
             )
-            await usage_service.track_llm_usage(records)
-
-            if take.tool_usage:
-                usage_service.record_tool_usage_batch(take.tool_usage)
-
-            # track_llm_usage([]) initializes _token_usage to a zeroed
-            # dict, so tool-only tasks still get stamped; None only on its
-            # internal cost-calculation error path, where skipping is the
-            # documented is_byok fallback contract.
-            if usage_service._token_usage is not None:
-                usage_service._token_usage["task_id"] = task.task_id
-                usage_service._token_usage["agent_id"] = task.agent_id
-                usage_service._token_usage["subagent_type"] = task.subagent_type
-                # DALTON-HOOK(budget): stamp exact task_run_id on task usage
-                # rows so budget reconciliation can verify per-run usage
-                # completeness instead of trusting usage_settled_at alone.
-                if take.settle_run_id:
-                    usage_service._token_usage["task_run_id"] = str(take.settle_run_id)
-
-            # DALTON-HOOK(subagent-usage-status): the resolved terminal state
-            # rides the row (completed only when the run really completed).
-            run_status = ledger_statuses.get(take.settle_run_id or "")
-            status = terminal_status.get(run_status or "", "completed")
-
-            # settle_task_run_id makes the usage insert and the ledger's
-            # billing-settle stamp one transaction; on failure (False) the
-            # row stays countable for the recovery sweep to degraded-settle.
-            persisted = await usage_service.persist_usage(
-                response_id=response_id,
-                msg_type="task",
-                status=status,  # DALTON-HOOK(subagent-usage-status)
-                is_byok=is_byok,
-                settle_task_run_id=take.settle_run_id,
+            from src.dalton.services.team_model_catalog.snapshot import (
+                bind_catalog_snapshot,
+                get_active_catalog_snapshot,
+                load_run_catalog_snapshot,
             )
-            if not persisted:
-                # The records left task memory before this call, so a swallowed
-                # False loses them outright: the ledger row stays countable for
-                # the sweep to degraded-settle, but no billing row will ever be
-                # written for this task. Counting it as persisted would report
-                # the loss as a success.
-                logger.error(
-                    "[SubagentUsage] usage persist reported failure for task "
-                    "%s in thread_id=%s; %d record(s) are unrecoverable",
-                    task.task_id,
-                    thread_id,
-                    len(records),
+
+            task_snap = None
+            if take.settle_run_id and is_conversation_db_pool_open():
+                try:
+                    task_snap = await load_run_catalog_snapshot(
+                        str(take.settle_run_id), is_subagent=True
+                    )
+                except Exception:
+                    task_snap = None
+            if task_snap is None:
+                task_snap = get_active_catalog_snapshot()
+
+            with bind_catalog_snapshot(task_snap) if task_snap is not None else nullcontext():
+                usage_service = UsagePersistenceService(
+                    thread_id=thread_id,
+                    workspace_id=workspace_id,
+                    user_id=recorded_as,
                 )
-                continue
-            persisted_count += 1
-            persisted_records += len(records)
+                await usage_service.track_llm_usage(records)
+
+                if take.tool_usage:
+                    usage_service.record_tool_usage_batch(take.tool_usage)
+
+                # track_llm_usage([]) initializes _token_usage to a zeroed
+                # dict, so tool-only tasks still get stamped; None only on its
+                # internal cost-calculation error path, where skipping is the
+                # documented is_byok fallback contract.
+                if usage_service._token_usage is not None:
+                    usage_service._token_usage["task_id"] = task.task_id
+                    usage_service._token_usage["agent_id"] = task.agent_id
+                    usage_service._token_usage["subagent_type"] = task.subagent_type
+                    # DALTON-HOOK(budget): stamp exact task_run_id on task usage
+                    # rows so budget reconciliation can verify per-run usage
+                    # completeness instead of trusting usage_settled_at alone.
+                    if take.settle_run_id:
+                        usage_service._token_usage["task_run_id"] = str(take.settle_run_id)
+
+                # DALTON-HOOK(subagent-usage-status): the resolved terminal state
+                # rides the row (completed only when the run really completed).
+                run_status = ledger_statuses.get(take.settle_run_id or "")
+                status = terminal_status.get(run_status or "", "completed")
+
+                # settle_task_run_id makes the usage insert and the ledger's
+                # billing-settle stamp one transaction; on failure (False) the
+                # row stays countable for the recovery sweep to degraded-settle.
+                persisted = await usage_service.persist_usage(
+                    response_id=response_id,
+                    msg_type="task",
+                    status=status,  # DALTON-HOOK(subagent-usage-status)
+                    is_byok=is_byok,
+                    settle_task_run_id=take.settle_run_id,
+                )
+                if not persisted:
+                    # The records left task memory before this call, so a swallowed
+                    # False loses them outright: the ledger row stays countable for
+                    # the sweep to degraded-settle, but no billing row will ever be
+                    # written for this task. Counting it as persisted would report
+                    # the loss as a success.
+                    logger.error(
+                        "[SubagentUsage] usage persist reported failure for task "
+                        "%s in thread_id=%s; %d record(s) are unrecoverable",
+                        task.task_id,
+                        thread_id,
+                        len(records),
+                    )
+                    continue
+                persisted_count += 1
+                persisted_records += len(records)
 
         except Exception as e:
             logger.error(

@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input';
 // confirm dialog, which would pull its animation library onto first load.
 import { TOOLBAR_CHIP_CLASS, toolbarChipStyle } from '@/components/dalton/primitives/DaltonToolbarPill';
 import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { useCapabilities } from '@/hooks/useCapabilities';
 import { useLocale } from '@/hooks/useLocale';
 import { useUser } from '@/hooks/useUser';
@@ -62,10 +63,17 @@ export async function fetchTeamWorkspaces(): Promise<TeamWorkspacesResponse> {
 }
 
 export function useTeamWorkspaces(enabled = true) {
+  const identity = useCallerIdentity({ enabled });
+  const { hasCapability } = useCapabilities({ enabled });
   return useQuery({
     queryKey: queryKeys.workspaces.team(),
     queryFn: fetchTeamWorkspaces,
-    enabled: isDaltonAuth && enabled,
+    enabled:
+      enabled &&
+      !identity.isPlatform &&
+      (isDaltonAuth || identity.isMultiUserAuth) &&
+      identity.isInternal &&
+      hasCapability('colleague_sharing'),
     staleTime: 60_000,
     retry: false,
   });
@@ -98,13 +106,15 @@ export function useTeamReadOnly(
 ): TeamReadOnlyState {
   const location = useLocation();
   const queryClient = useQueryClient();
-  const { user: currentUser } = useUser({ enabled: Boolean(workspaceId) && isDaltonAuth });
-  const { data: teamData } = useTeamWorkspaces(Boolean(workspaceId));
-  const callerTier =
-    teamData?.caller_tier ??
-    queryClient.getQueryData<{ caller_tier?: string | null }>(queryKeys.dalton.userSharing())
-      ?.caller_tier ??
-    null;
+  const teamAccessActive = Boolean(workspaceId) && isDaltonAuth;
+  const identity = useCallerIdentity({ enabled: teamAccessActive });
+  const { user: currentUser } = useUser({ enabled: teamAccessActive });
+  const { data: teamData } = useTeamWorkspaces(teamAccessActive);
+  const callerTier = identity.isPlatform
+    ? null
+    : identity.status === 'ready'
+      ? identity.tier
+      : 'unknown';
 
   if (!isDaltonAuth || !workspaceId) {
     return {
@@ -139,6 +149,15 @@ export function useTeamReadOnly(
 
   const effectiveAccess = workspaceRecord?.effective_web_access ?? null;
   const isThreadOnly = effectiveAccess === 'thread_only';
+  // DALTON-HOOK(external-member-perms): the workspace record's effective access is computed by the
+  // server for this caller; cached team lists and route state grant write access only to a caller
+  // confirmed as an internal member or admin.
+  const confirmedTeamWriter =
+    identity.status === 'ready' && (identity.isInternal || identity.isAdmin);
+  const writeModeFor = (rawAccess: string | null | undefined): TeamAccessMode =>
+    !isThreadOnly && rawAccess === 'rw' && (effectiveAccess === 'rw' || confirmedTeamWriter)
+      ? 'rw'
+      : 'ro';
 
   const members = teamData?.members ?? [];
   for (const member of members) {
@@ -156,7 +175,7 @@ export function useTeamReadOnly(
         matched.access ||
         navState?.teamAccess ||
         'ro';
-      const mode: TeamAccessMode = !isThreadOnly && rawAccess === 'rw' ? 'rw' : 'ro';
+      const mode: TeamAccessMode = writeModeFor(rawAccess);
       return {
         access: mode,
         isColleague: true,
@@ -184,7 +203,7 @@ export function useTeamReadOnly(
       (effectiveAccess === 'rw' || effectiveAccess === 'ro' ? effectiveAccess : null) ||
       navState?.teamAccess ||
       'ro';
-    const mode: TeamAccessMode = !isThreadOnly && rawAccess === 'rw' ? 'rw' : 'ro';
+    const mode: TeamAccessMode = writeModeFor(rawAccess);
     return {
       access: mode,
       isColleague: true,
@@ -199,7 +218,7 @@ export function useTeamReadOnly(
   }
 
   if (navState?.isTeamReadOnly) {
-    const mode: TeamAccessMode = !isThreadOnly && navState.teamAccess === 'rw' ? 'rw' : 'ro';
+    const mode: TeamAccessMode = writeModeFor(navState.teamAccess);
     return {
       access: mode,
       isColleague: true,
@@ -265,8 +284,9 @@ export function TeamWorkspacesSection({
   const { t } = useTranslation();
   const locale = useLocale();
   const navigate = useNavigate();
-  const { data } = useTeamWorkspaces();
-  const { hasCapability } = useCapabilities();
+  const { data } = useTeamWorkspaces(isDaltonAuth);
+  const identity = useCallerIdentity({ enabled: isDaltonAuth });
+  const { hasCapability } = useCapabilities({ enabled: isDaltonAuth });
   const [sectionExpanded, setSectionExpanded] = useState(true);
   const [expandedMembers, setExpandedMembers] = useState<Set<string>>(() => new Set());
 
@@ -291,7 +311,8 @@ export function TeamWorkspacesSection({
   // the section stays hidden rather than flashing a placeholder.
   if (
     !hasCapability('colleague_sharing') ||
-    (data?.caller_tier !== 'internal' && data?.caller_tier !== 'admin')
+    !identity.isInternal ||
+    !data
   ) {
     return null;
   }

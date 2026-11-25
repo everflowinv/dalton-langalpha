@@ -20,6 +20,11 @@ Verifies:
 9. Private/loopback/metadata custom model URLs are refused (400) for both member
    and admin, while the operator-allowlisted fake-llm endpoint (required, never
    skipped) returns HTTP 200 with expected fake model output.
+10. External member permissions and unauthenticated credentials status (401):
+    unauthenticated `/api/v1/dalton/credentials/status` returns 401; invited
+    `external` member is gated across file audience, thread read/status/share,
+    user settings, workspace settings, and monitor publish with expected
+    403/404 statuses and structured `detail.code`.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ import socket
 import ssl
 import struct
 import sys
+import uuid
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
@@ -209,11 +215,16 @@ def _check_unauthenticated_surface(ctx: _lib.ComposeContext) -> None:
         f"Expected 401 on edge /users/me with service headers, got {resp_svc.status}",
     )
 
-    # 2. No token -> 401
+    # 2. No token -> 401 (including /dalton/credentials/status for missing VITE_DALTON_AUTH check)
     resp_anon = _lib.http_request("GET", f"{base}/api/v1/users/me")
     _assert(
         resp_anon.status == 401,
         f"Expected 401 on unauthenticated /users/me, got {resp_anon.status}",
+    )
+    resp_creds_anon = _lib.http_request("GET", f"{base}/api/v1/dalton/credentials/status")
+    _assert(
+        resp_creds_anon.status == 401,
+        f"Expected 401 on unauthenticated /api/v1/dalton/credentials/status, got {resp_creds_anon.status}",
     )
 
     # 3. Malformed / invalid Bearer token -> 401
@@ -662,7 +673,7 @@ def _check_tiered_invites_and_password_change(
 
 def _check_dual_user_isolation(
     ctx: _lib.ComposeContext, admin_token: str, member_token: str
-) -> None:
+) -> str:
     base = ctx.edge_url.rstrip("/")
     admin_headers = {"Authorization": f"Bearer {admin_token}"}
     member_headers = {"Authorization": f"Bearer {member_token}"}
@@ -703,6 +714,332 @@ def _check_dual_user_isolation(
         member_get.status in (403, 404),
         f"Expected 403/404 when member fetches admin workspace, got {member_get.status}",
     )
+    return admin_ws_id
+
+
+def _assert_forbidden_code(resp: _lib.HttpResponse, expected_code: str, context: str) -> None:
+    _assert(
+        resp.status == 403,
+        f"{context}: expected HTTP 403, got {resp.status}: {resp.text}",
+    )
+    detail = resp.json().get("detail")
+    _assert(
+        isinstance(detail, dict) and detail.get("code") == expected_code,
+        f"{context}: expected detail.code={expected_code!r}, got {detail!r}",
+    )
+
+
+def _check_external_member_permissions(
+    ctx: _lib.ComposeContext,
+    admin_uid: str,
+    admin_ws_id: str,
+    ext_token: str,
+    ext_uid: str,
+) -> None:
+    """Verify invited `external` member gates across audience, threads, settings, and monitors."""
+    base = ctx.edge_url.rstrip("/")
+    ext_headers = {"Authorization": f"Bearer {ext_token}"}
+
+    # 1. Authenticated /credentials/status reports local mode + external tier + can_invite=False
+    ext_creds = _lib.http_request(
+        "GET", f"{base}/api/v1/dalton/credentials/status", headers=ext_headers
+    )
+    _assert(
+        ext_creds.status == 200,
+        f"Expected 200 on external /credentials/status, got {ext_creds.status}: {ext_creds.text}",
+    )
+    creds_data = ext_creds.json()
+    _assert(
+        creds_data.get("caller_tier") == "external"
+        and creds_data.get("auth_mode") == "local"
+        and creds_data.get("can_invite") is False,
+        f"Unexpected external /credentials/status payload: {creds_data}",
+    )
+
+    # 2. File audience: external member cannot change artifact audience (public or organization)
+    fake_artifact_id = str(uuid.uuid4())
+    for audience in ("public", "organization"):
+        aud_resp = _lib.http_request(
+            "PUT",
+            f"{base}/api/v1/artifacts/{fake_artifact_id}/audience",
+            headers=ext_headers,
+            json_body={"audience": audience},
+        )
+        _assert_forbidden_code(
+            aud_resp,
+            "external_member_forbidden",
+            f"External PUT /artifacts/{{id}}/audience ({audience})",
+        )
+
+    # 3. Create external workspace + seed threads in admin and external workspaces
+    ext_ws_resp = _lib.http_request(
+        "POST",
+        f"{base}/api/v1/workspaces",
+        headers=ext_headers,
+        json_body={"name": f"External Own WS {secrets.token_hex(3)}"},
+    )
+    _assert(
+        ext_ws_resp.status in (200, 201),
+        f"Expected 200/201 creating external workspace, got {ext_ws_resp.status}: {ext_ws_resp.text}",
+    )
+    ext_ws_id = str(ext_ws_resp.json().get("workspace_id") or "")
+    _assert(bool(ext_ws_id), f"Missing workspace_id in external create response: {ext_ws_resp.text}")
+
+    def _seed_thread(ws_id: str, owner_uid: str, title: str) -> str:
+        tid = ctx.psql_query(
+            f"""
+            INSERT INTO conversation_threads
+                (workspace_id, user_id, title, current_status, thread_index)
+            SELECT '{ws_id}', '{owner_uid}', '{title}', 'completed',
+                   COALESCE(MAX(thread_index), -1) + 1
+            FROM conversation_threads
+            WHERE workspace_id = '{ws_id}'
+            RETURNING conversation_thread_id;
+            """
+        )
+        _assert(bool(tid), f"Failed to seed thread in workspace {ws_id}")
+        return tid
+
+    admin_tid = _seed_thread(admin_ws_id, admin_uid, "b4-admin-thread")
+    ext_tid = _seed_thread(ext_ws_id, ext_uid, "b4-ext-thread")
+
+    # 4. Thread read, status, and share isolation (admin thread -> 404; own thread -> read 200, share on -> 403, share off -> 200)
+    for label, method, path, body in (
+        ("External GET admin thread", "GET", f"/api/v1/threads/{admin_tid}", None),
+        ("External GET admin thread status", "GET", f"/api/v1/threads/{admin_tid}/status", None),
+        ("External GET admin thread share", "GET", f"/api/v1/threads/{admin_tid}/share", None),
+        (
+            "External POST admin thread share",
+            "POST",
+            f"/api/v1/threads/{admin_tid}/share",
+            {"is_shared": True},
+        ),
+    ):
+        resp = _lib.http_request(method, f"{base}{path}", headers=ext_headers, json_body=body)
+        _assert(
+            resp.status == 404,
+            f"{label}: expected 404, got {resp.status}: {resp.text}",
+        )
+
+    own_read = _lib.http_request("GET", f"{base}/api/v1/threads/{ext_tid}", headers=ext_headers)
+    _assert(own_read.status == 200, f"Expected 200 reading own thread, got {own_read.status}: {own_read.text}")
+    own_status = _lib.http_request(
+        "GET", f"{base}/api/v1/threads/{ext_tid}/status", headers=ext_headers
+    )
+    _assert(
+        own_status.status == 200,
+        f"Expected 200 reading own thread status, got {own_status.status}: {own_status.text}",
+    )
+
+    own_share_on = _lib.http_request(
+        "POST",
+        f"{base}/api/v1/threads/{ext_tid}/share",
+        headers=ext_headers,
+        json_body={"is_shared": True},
+    )
+    _assert_forbidden_code(
+        own_share_on,
+        "external_member_forbidden",
+        "External POST own thread share (is_shared=True)",
+    )
+
+    # Prepare an already-shared external own thread (simulating pre-demotion historical share),
+    # confirm the public share link works before stopping, then send the legacy stop-share payload
+    # carrying permissions={"audience": "organization"} and verify:
+    # (a) is_shared becomes False, (b) share link returns 404, (c) original audience="public" is kept.
+    ext_share_token = f"b4ext{secrets.token_hex(8)}"
+    ctx.psql_exec(
+        f"""
+        UPDATE conversation_threads
+           SET is_shared = TRUE,
+               share_token = '{ext_share_token}',
+               shared_at = NOW(),
+               share_permissions = '{{"allow_files": false, "allow_download": false, "audience": "public"}}'::jsonb
+         WHERE conversation_thread_id = '{ext_tid}'::uuid;
+        """
+    )
+    public_before = _lib.http_request("GET", f"{base}/api/v1/public/shared/{ext_share_token}")
+    _assert(
+        public_before.status == 200 and public_before.json().get("thread_id") == ext_tid,
+        f"Expected seeded external shared link to be accessible (200) before stop, "
+        f"got {public_before.status}: {public_before.text}",
+    )
+
+    own_share_off = _lib.http_request(
+        "POST",
+        f"{base}/api/v1/threads/{ext_tid}/share",
+        headers=ext_headers,
+        json_body={"is_shared": False, "permissions": {"audience": "organization"}},
+    )
+    _assert(
+        own_share_off.status == 200,
+        f"Expected 200 stopping own thread share, got {own_share_off.status}: {own_share_off.text}",
+    )
+    share_off_data = own_share_off.json()
+    _assert(
+        share_off_data.get("is_shared") is False
+        and share_off_data.get("share_token") is None
+        and (share_off_data.get("permissions") or {}).get("audience") == "public",
+        f"Unexpected stop-share response payload (expected is_shared=False & audience='public'): "
+        f"{share_off_data}",
+    )
+
+    share_after_get = _lib.http_request(
+        "GET", f"{base}/api/v1/threads/{ext_tid}/share", headers=ext_headers
+    )
+    _assert(
+        share_after_get.status == 200
+        and share_after_get.json().get("is_shared") is False
+        and (share_after_get.json().get("permissions") or {}).get("audience") == "public",
+        f"Expected persisted is_shared=False & audience='public' after stop, "
+        f"got {share_after_get.status}: {share_after_get.text}",
+    )
+    stored_audience = ctx.psql_query(
+        f"SELECT COALESCE(share_permissions->>'audience', '<missing>') FROM conversation_threads "
+        f"WHERE conversation_thread_id = '{ext_tid}';"
+    ).strip()
+    _assert(
+        stored_audience == "public",
+        f"Expected stored share_permissions.audience to stay 'public' after stop, got {stored_audience!r}",
+    )
+    public_after = _lib.http_request("GET", f"{base}/api/v1/public/shared/{ext_share_token}")
+    _assert(
+        public_after.status == 404,
+        f"Expected stopped external share link to return 404, got {public_after.status}: {public_after.text}",
+    )
+
+    # 5. User settings: neutral 200 on /sharing/user-settings (colleague_sharing off); 404 on disabled writes & /user-settings
+    sharing_user_get = _lib.http_request(
+        "GET", f"{base}/api/v1/dalton/sharing/user-settings", headers=ext_headers
+    )
+    _assert(
+        sharing_user_get.status == 200,
+        f"Expected 200 neutral on GET /sharing/user-settings, got {sharing_user_get.status}: {sharing_user_get.text}",
+    )
+    su_data = sharing_user_get.json()
+    _assert(
+        su_data.get("caller_tier") == "external"
+        and su_data.get("can_edit") is False
+        and su_data.get("colleague_dispatch_enabled") is False,
+        f"Unexpected external GET /sharing/user-settings payload: {su_data}",
+    )
+    sharing_user_put = _lib.http_request(
+        "PUT",
+        f"{base}/api/v1/dalton/sharing/user-settings",
+        headers=ext_headers,
+        json_body={"cos_rw_enabled": True},
+    )
+    _assert(
+        sharing_user_put.status == 404,
+        f"Expected 404 on PUT /sharing/user-settings in Core, got {sharing_user_put.status}: {sharing_user_put.text}",
+    )
+    user_settings_get = _lib.http_request(
+        "GET", f"{base}/api/v1/dalton/user-settings", headers=ext_headers
+    )
+    _assert(
+        user_settings_get.status == 404,
+        f"Expected 404 on GET /user-settings when conversation_archive is off, got {user_settings_get.status}",
+    )
+    user_settings_put = _lib.http_request(
+        "PUT",
+        f"{base}/api/v1/dalton/user-settings",
+        headers=ext_headers,
+        json_body={"home_team_memory_enabled": True},
+    )
+    _assert(
+        user_settings_put.status == 404,
+        f"Expected 404 on PUT /user-settings when conversation_archive is off, got {user_settings_put.status}",
+    )
+
+    # 6. Workspace settings & sharing: own PUT /settings -> 403 external_member_forbidden; admin workspace -> 404
+    ext_ws_settings_get = _lib.http_request(
+        "GET", f"{base}/api/v1/dalton/workspaces/{ext_ws_id}/settings", headers=ext_headers
+    )
+    _assert(
+        ext_ws_settings_get.status == 200,
+        f"Expected 200 on external own GET /workspaces/{{id}}/settings, got {ext_ws_settings_get.status}: {ext_ws_settings_get.text}",
+    )
+    ws_st = ext_ws_settings_get.json()
+    _assert(
+        ws_st.get("owner_external") is True
+        and ws_st.get("can_edit") is False
+        and ws_st.get("can_edit_web_access") is True
+        and ws_st.get("can_edit_cos_access") is False
+        and ws_st.get("can_edit_team_memory") is False,
+        f"Unexpected external own GET /workspaces/{{id}}/settings payload: {ws_st}",
+    )
+    ext_ws_settings_put = _lib.http_request(
+        "PUT",
+        f"{base}/api/v1/dalton/workspaces/{ext_ws_id}/settings",
+        headers=ext_headers,
+        json_body={"team_memory_enabled": True},
+    )
+    _assert_forbidden_code(
+        ext_ws_settings_put,
+        "external_member_forbidden",
+        "External PUT own /workspaces/{id}/settings",
+    )
+    ext_ws_sharing_get = _lib.http_request(
+        "GET", f"{base}/api/v1/dalton/workspaces/{ext_ws_id}/sharing", headers=ext_headers
+    )
+    _assert(
+        ext_ws_sharing_get.status == 200 and ext_ws_sharing_get.json().get("can_edit") is False,
+        f"Expected 200 neutral on external own GET /workspaces/{{id}}/sharing, got {ext_ws_sharing_get.status}: {ext_ws_sharing_get.text}",
+    )
+    ext_ws_sharing_put = _lib.http_request(
+        "PUT",
+        f"{base}/api/v1/dalton/workspaces/{ext_ws_id}/sharing",
+        headers=ext_headers,
+        json_body={"cos_access": "ro"},
+    )
+    _assert(
+        ext_ws_sharing_put.status == 404,
+        f"Expected 404 on PUT /workspaces/{{id}}/sharing in Core, got {ext_ws_sharing_put.status}",
+    )
+
+    for label, method, path, body in (
+        (
+            "External GET admin workspace settings",
+            "GET",
+            f"/api/v1/dalton/workspaces/{admin_ws_id}/settings",
+            None,
+        ),
+        (
+            "External PUT admin workspace settings",
+            "PUT",
+            f"/api/v1/dalton/workspaces/{admin_ws_id}/settings",
+            {"team_memory_enabled": True},
+        ),
+        (
+            "External GET admin workspace sharing",
+            "GET",
+            f"/api/v1/dalton/workspaces/{admin_ws_id}/sharing",
+            None,
+        ),
+    ):
+        resp = _lib.http_request(method, f"{base}{path}", headers=ext_headers, json_body=body)
+        _assert(
+            resp.status == 404,
+            f"{label}: expected 404, got {resp.status}: {resp.text}",
+        )
+
+    # 7. Monitor publish: external member cannot publish non-own visibilities (public / company)
+    for visibility in ("public", "company"):
+        mon_resp = _lib.http_request(
+            "POST",
+            f"{base}/api/v1/dalton/monitors",
+            headers=ext_headers,
+            json_body={
+                "workspace_id": ext_ws_id,
+                "path": "report.html",
+                "visibility": visibility,
+            },
+        )
+        _assert_forbidden_code(
+            mon_resp,
+            "external_member_forbidden",
+            f"External POST /dalton/monitors (visibility={visibility})",
+        )
 
 
 def _check_member_llm_egress(
@@ -804,11 +1141,12 @@ def main() -> int:
     )
 
     _check_unauthenticated_surface(ctx)
-    admin_token, _admin_uid, _admin_email = _check_bootstrap_and_sessions(ctx)
-    _internal_token, _internal_uid, ext_token, _ext_uid = _check_tiered_invites_and_password_change(
+    admin_token, admin_uid, _admin_email = _check_bootstrap_and_sessions(ctx)
+    _internal_token, _internal_uid, ext_token, ext_uid = _check_tiered_invites_and_password_change(
         ctx, admin_token
     )
-    _check_dual_user_isolation(ctx, admin_token, ext_token)
+    admin_ws_id = _check_dual_user_isolation(ctx, admin_token, ext_token)
+    _check_external_member_permissions(ctx, admin_uid, admin_ws_id, ext_token, ext_uid)
     _check_member_llm_egress(ctx, admin_token, ext_token)
     print("b4_local_auth: PASS")
     return 0

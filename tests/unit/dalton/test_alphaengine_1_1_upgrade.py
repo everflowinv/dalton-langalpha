@@ -658,7 +658,8 @@ def test_collect_cursor_pagination_continues_past_empty_page_and_caps_at_5_pages
     assert saved_item["institution_meeting_flag"] == 1
     assert saved_item["personal_meeting_flag"] == 0
 
-    # Scenario B: 5 pages all return 0 new items with has_more=True -> stops at 5 pages, marks incomplete, blocks short-circuit
+    # Scenario B: every page returns 0 new items with has_more=True -> the window scan and the per-day rescans
+    # stay within the per-query request budget, the run is marked incomplete and short-circuit is blocked
     ae_calls_b = 0
 
     def _fake_bridge_5pages_has_more(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
@@ -685,7 +686,7 @@ def test_collect_cursor_pagination_continues_past_empty_page_and_caps_at_5_pages
     internal_b, ae_b = collect_mod.collect_internal_and_ae(
         meta=meta, since="2026-10-21", until="2026-10-24", seen=set(), skip_ae=False
     )
-    assert ae_calls_b == 5
+    assert collect_mod.MAX_CURSOR_PAGES < ae_calls_b <= collect_mod.MAX_AE_REQUESTS_PER_QUERY
     assert internal_b["status"]["alphaengine"]["incomplete"] is True
     assert internal_b["status"]["alphaengine"]["completed"] is False
     assert internal_b["status"]["alphaengine"]["status"] == "incomplete"

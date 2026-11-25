@@ -140,6 +140,11 @@ class _Firing:
     # The computer a computer token's run now was checked to run on; its
     # turn's START refuses any other (``admission.refuse_moved_off``).
     checked_computer_id: Optional[str] = None
+    # DALTON-HOOK(cos-settings-tools): immutable execution-level model config snapshot frozen at execution creation
+    llm_model: Optional[str] = None
+    reasoning_effort: Optional[str] = None
+    llm_model_system_only: bool = False
+    has_model_snapshot: bool = False
     workspace_owner_id: Optional[str] = None
     route: Optional[TurnRoute] = None
     thread_id: Optional[str] = None
@@ -913,6 +918,8 @@ class AutomationExecutor:
         user_id: str,
         llm_model: str | None,
         stored_effort: str | None,
+        system_only: bool = False,  # DALTON-HOOK(cos-settings-tools)
+        has_snapshot: bool = False,  # DALTON-HOOK(cos-settings-tools)
     ) -> str | None:
         from src.dalton.llm.antigravity_series import ANTIGRAVITY_PROVIDER
         from src.dalton.services import automation_thread_model
@@ -920,7 +927,8 @@ class AutomationExecutor:
         from src.server.services.llm import user_models
 
         effective_effort: str | None = stored_effort
-        if thread_id:
+        # DALTON-HOOK(cos-settings-tools): when the execution row carries a frozen snapshot, never overwrite its reasoning_effort from run history
+        if thread_id and not has_snapshot:
             try:
                 (
                     _first_model,
@@ -947,10 +955,15 @@ class AutomationExecutor:
                     effective_effort = prior_effort
 
         # DALTON-HOOK(automation-effort): ignore stale column values when the automation runs a built-in Antigravity model
+        # DALTON-HOOK(cos-settings-tools): classify against system catalog only when llm_model_system_only is set
         if effective_effort is not None and llm_model:
             is_builtin_antigravity = False
             try:
-                source, entry = await user_models.classify_model(user_id, llm_model)
+                source, entry = await user_models.classify_model(
+                    user_id,
+                    llm_model,
+                    **({"ignore_custom_models": True} if system_only else {}),
+                )
                 is_builtin_antigravity = (
                     source == user_models.ModelSource.SYSTEM
                     and isinstance(entry, dict)
@@ -1047,19 +1060,53 @@ class AutomationExecutor:
             # DALTON-HOOK(automation-effort): stamp two-state reasoning_effort on first-turn run metadata
             # and forward automation reasoning_effort into ChatRequest (preserving prior first-turn effort on
             # restart redispatch and ignoring stale column values on built-in Antigravity models).
+            # DALTON-HOOK(cos-settings-tools): use immutable execution-level model config snapshot (frozen on automation_executions at creation)
+            use_snapshot = bool(getattr(firing, "has_model_snapshot", False))
+            exec_llm_model = (
+                getattr(firing, "llm_model", None)
+                if use_snapshot
+                else automation.get("llm_model")
+            )
+            exec_stored_effort = (
+                getattr(firing, "reasoning_effort", None)
+                if use_snapshot
+                else automation.get("reasoning_effort")
+            )
+            system_only = bool(getattr(firing, "llm_model_system_only", False))
             effective_effort = await self._resolve_turn_reasoning_effort(
                 execution_id=execution_id,
                 thread_id=firing.thread_id,
                 user_id=user_id,
-                llm_model=automation.get("llm_model"),
-                stored_effort=automation.get("reasoning_effort"),
+                llm_model=exec_llm_model,
+                stored_effort=exec_stored_effort,
+                system_only=system_only,
+                has_snapshot=use_snapshot,
             )
             run_metadata["automation_reasoning_effort_configured"] = True
             run_metadata["automation_reasoning_effort"] = effective_effort
+            # DALTON-HOOK(team-model-catalog): when refiring an interrupted automation execution
+            # (FiringRunsAgain), pass its prior run_id so ptc_run verifies the live route against
+            # the interrupted run's snapshot before building any LLM client.
+            refire_source_run_id: str | None = None
+            try:
+                from src.server.database.runs import lifecycle as _auto_tl_db
+
+                _prior_attempt = await _auto_tl_db.get_latest_attempt(firing.thread_id)
+                if _prior_attempt is not None:
+                    _prior_meta = _prior_attempt.get("metadata") or {}
+                    if str(_prior_meta.get("automation_execution_id") or "") == str(execution_id):
+                        refire_source_run_id = (
+                            str(_prior_attempt.get("conversation_response_id") or "").strip()
+                            or None
+                        )
+            except Exception:
+                refire_source_run_id = None
+            # DALTON-HOOK(cos-settings-tools): dispatch ChatRequest from execution snapshot
             request = ChatRequest(
                 workspace_id=firing.workspace_id,
                 messages=[ChatMessage(role="user", content=instruction)],
-                llm_model=automation.get("llm_model"),
+                llm_model=exec_llm_model,
+                llm_model_system_only=system_only,
                 reasoning_effort=effective_effort,
                 additional_context=additional_context,
                 origin=ThreadOrigin(
@@ -1068,6 +1115,8 @@ class AutomationExecutor:
                     name=(automation.get("name") or "").strip() or None,
                 ),
                 checked_computer_id=firing.checked_computer_id,
+                # DALTON-HOOK(team-model-catalog): carry prior run_id on automation refire for compare-and-reject resume verification
+                resume_of_run_id=refire_source_run_id,
             )
             # Generate run_id locally: automations don't pass through the
             # HTTP handler that normally creates it. Per-turn keying for
@@ -1249,9 +1298,40 @@ class AutomationExecutor:
                 return
             handed_thread = started.get("conversation_thread_id")
             checked = started.get("checked_computer_id")
+            # DALTON-HOOK(cos-settings-tools): read immutable model config snapshot from the execution row (lazily backfilling rolling-upgrade rows with snapshot_taken=False)
+            if started.get("snapshot_taken") is False:
+                hydrated_snap = await exec_db.ensure_execution_snapshot(execution_id)
+                if hydrated_snap is not None:
+                    started = {**started, **hydrated_snap}
+            has_exec_snapshot = (
+                started.get("snapshot_taken") is True
+                or "llm_model" in started
+                or "reasoning_effort" in started
+                or "llm_model_system_only" in started
+            )
+            exec_llm_model = (
+                started.get("llm_model")
+                if "llm_model" in started
+                else automation.get("llm_model")
+            )
+            exec_reasoning_effort = (
+                started.get("reasoning_effort")
+                if "reasoning_effort" in started
+                else automation.get("reasoning_effort")
+            )
+            exec_system_only = (
+                bool(started["llm_model_system_only"])
+                if "llm_model_system_only" in started
+                else bool((automation.get("metadata") or {}).get("llm_model_system_only"))
+            )
+            # DALTON-HOOK(cos-settings-tools): attach frozen execution snapshot to _Firing
             firing = _Firing(
                 automation=automation,
                 checked_computer_id=str(checked) if checked else None,
+                llm_model=exec_llm_model,
+                reasoning_effort=exec_reasoning_effort,
+                llm_model_system_only=exec_system_only,
+                has_model_snapshot=has_exec_snapshot,
                 late=await late_note(automation, started),
             )
         except BaseException:

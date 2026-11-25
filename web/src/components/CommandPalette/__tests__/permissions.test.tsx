@@ -35,7 +35,69 @@ const state = vi.hoisted(() => ({
   searchThreads: [] as Array<Record<string, unknown>>,
 }));
 
-vi.mock('@/config/daltonAuth', () => ({ isDaltonAuth: true }));
+vi.mock('@/config/daltonAuth', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/config/daltonAuth')>();
+  return {
+    ...actual,
+    isDaltonAuth: true,
+    DALTON_AUTH_MODE: 'local' as const,
+  };
+});
+// DALTON-HOOK(external-share-guard): drive CommandPalette useCallerIdentity and colleague_sharing capability from test state
+vi.mock('@/hooks/useCapabilities', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/useCapabilities')>();
+  return {
+    ...actual,
+    useCapabilities: () => ({
+      profile: 'everflow' as const,
+      capabilities: actual.EVERFLOW_DEFAULT_CAPABILITY_SET,
+      hasCapability: () => true,
+      brandName: 'Everflow',
+      fingerprint: null,
+      tickerLogosEnabled: true,
+      isLoading: false,
+      isLoaded: true,
+      isCoreBuild: false,
+      isEverflowBuild: true,
+    }),
+  };
+});
+vi.mock('@/hooks/useCallerIdentity', () => ({
+  useCallerIdentity: () => {
+    const loading = state.teamLoading && !state.teamData;
+    const rawTier = state.teamData?.caller_tier;
+    const ready = !loading && (rawTier === 'admin' || rawTier === 'internal' || rawTier === 'external');
+    const tier = ready ? rawTier : 'unknown';
+    const isAdmin = ready && tier === 'admin';
+    const isInternal = ready && (tier === 'admin' || tier === 'internal');
+    const snapshot = {
+      tier,
+      status: loading ? 'loading' : ready ? 'ready' : 'error',
+      authMode: ready ? 'local' : null,
+      isPlatform: false,
+      isKnown: ready,
+      isConfirming: loading,
+      isMultiUserAuth: ready,
+      isSingleUserOss: false,
+      isAdmin,
+      isInternal,
+      isExternal: ready && tier === 'external',
+      canActAsOwner: isInternal,
+      canPublishPublic: isAdmin,
+      canInvite: isInternal,
+      isTeamCredentialsShared: true,
+      canManageCredentials: isAdmin,
+      isPm: isAdmin,
+      colleagueSharingEnabled: Boolean(state.teamData?.colleague_dispatch_enabled ?? true),
+    };
+    return {
+      ...snapshot,
+      getLatestIdentity: () => snapshot,
+      isConfirmingNow: () => snapshot.isConfirming,
+      revalidate: vi.fn(async () => undefined),
+    };
+  },
+}));
 vi.mock('@/hooks/useUser', () => ({
   useUser: () => ({ user: state.user, isLoading: state.userLoading, isError: false }),
 }));

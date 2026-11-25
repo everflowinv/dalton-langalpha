@@ -90,6 +90,7 @@ from src.server.models.workspace_move import WorkspaceMoveOut, WorkspaceMoveRequ
 from src.server.app.computers import accept_workspace_move
 from src.server.services.workspace_move import move_error_detail, move_from_row
 from src.server.services.computer_errors import (
+    ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
     ComputerNotFoundError,
     ComputerPreparingError,
     NeedsComputer,
@@ -415,6 +416,11 @@ async def create_workspace(
     except ComputerPreparingError as e:
         raise HTTPException(
             status_code=409, detail={"code": "computer_preparing", "message": str(e)}
+        ) from None
+    # DALTON-HOOK(cos-settings-tools): surface archiving computer conflict as 409 instead of 500
+    except ComputerArchivingError as e:
+        raise HTTPException(
+            status_code=409, detail={"code": "computer_archiving", "message": str(e)}
         ) from None
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

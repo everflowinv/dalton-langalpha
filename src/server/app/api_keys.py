@@ -13,14 +13,19 @@ Endpoints:
 import logging
 from typing import Dict, Literal, Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Response  # DALTON-HOOK(team-model-catalog): emit X-Dalton-Catalog-Revision header
 from pydantic import BaseModel, field_validator
 
 from src.config.env import HOST_IP
 from src.server.services.llm import key_probe
 from src.server.services.llm.config import deployment_key, deployment_local_provider
 from src.server.services.llm.egress import EndpointRefused
-from src.server.services.llm.provider_catalog import key_candidates, provider_catalog
+from src.server.services.llm.provider_catalog import (
+    build_key_candidates,
+    build_provider_catalog,
+    key_candidates,
+    provider_catalog,
+)  # DALTON-HOOK(team-model-catalog): derive provider_catalog/key_candidates from pinned compiled ModelConfig
 from src.server.utils.api import CurrentUserId
 from src.utils.cache.throttle import throttle
 from src.server.database.api_keys import (
@@ -49,28 +54,35 @@ router = APIRouter(tags=["API Keys"])
 _BYOK_PROVIDERS_CACHE: list[str] | None = None
 
 
+def _active_model_config():
+    """DALTON-HOOK(team-model-catalog): read active CompiledCatalog, honoring test patches on ModelConfig."""
+    from src.llms.llm import LLM, ModelConfig
+
+    if not isinstance(ModelConfig, type):
+        return ModelConfig()
+    return LLM.get_model_config()
+
+
 def _get_supported_providers() -> list[str]:
-    """BYOK-eligible connections from the LLM manifest (cached at module level).
+    """BYOK-eligible connections from the active CompiledCatalog (DALTON-HOOK(team-model-catalog)).
 
     A gateway's route is one API of its connection and takes the gateway's
     key, so it is no connection of its own: listed, a deployment key would
     show as one plan row per API, and a key saved under one would be a second
     key for the same connection.
     """
-    global _BYOK_PROVIDERS_CACHE
-    if _BYOK_PROVIDERS_CACHE is None:
-        from src.llms.llm import ModelConfig
-
-        config = ModelConfig()
-        _BYOK_PROVIDERS_CACHE = [p for p in config.get_byok_eligible_providers() if config.connection_of(p) == p]
-    return _BYOK_PROVIDERS_CACHE
+    config = _active_model_config()
+    return [
+        p
+        for p in config.get_byok_eligible_providers()
+        if config.connection_of(p) == p
+        and config.get_provider_info(p).get("catalog_defined") is not True
+    ]
 
 
 def _get_provider_info_map() -> dict[str, dict]:
     """Get display names, access_type, and brand_key for BYOK-eligible providers."""
-    from src.llms.llm import ModelConfig
-
-    config = ModelConfig()
+    config = _active_model_config()  # DALTON-HOOK(team-model-catalog): use active CompiledCatalog instead of raw ModelConfig()
     info_map = {}
     for p in _get_supported_providers():
         info = config.get_provider_info(p)
@@ -162,9 +174,7 @@ def _withdrawn_rows(keys: dict, base_urls: dict, *, listed: set[str]) -> list[di
     custom provider built on one: nothing can use it, but it is the user's
     secret, so it is listed for them to remove (``DELETE`` takes it). An empty
     manifest is a load failure, not a catalog with nothing in it."""
-    from src.llms.llm import ModelConfig
-
-    known = ModelConfig().flat_providers
+    known = _active_model_config().flat_providers  # DALTON-HOOK(team-model-catalog): read active CompiledCatalog
     if not known:
         return []
     return [
@@ -316,11 +326,13 @@ def _get_allowed_providers(custom_providers: list) -> set[str]:
     Excludes platform variants (system-only proxy routes), and a gateway's
     routes, whose key is the gateway's (``_get_supported_providers``).
     """
-    from src.llms.llm import ModelConfig
-    config = ModelConfig()
+    config = _active_model_config()  # DALTON-HOOK(team-model-catalog): read active CompiledCatalog & exclude catalog variants
     allowed = {
         name for name, info in config.flat_providers.items()
-        if info.get("access_type") != "oauth" and not info.get("platform") and config.connection_of(name) == name
+        if info.get("access_type") != "oauth"
+        and not info.get("platform")
+        and info.get("catalog_defined") is not True
+        and config.connection_of(name) == name
     }
     for cp in custom_providers:
         allowed.add(cp["name"])
@@ -526,6 +538,18 @@ async def test_api_key(body: TestApiKeyRequest, user_id: CurrentUserId):
 
     # Validate provider against known providers (all flat providers + custom)
     mc = LLMFactory.get_model_config()
+    # DALTON-HOOK(team-model-catalog): reject /api/v1/keys/test when targeting a catalog-defined
+    # variant or any URL overlapping a catalog variant's bound_base_url (use admin test-call instead).
+    from src.dalton.services.team_model_catalog.transport import (
+        check_custom_model_against_catalog_variants,
+    )
+
+    check_custom_model_against_catalog_variants(
+        resolved_provider=body.provider,
+        resolved_base_url=body.base_url,
+        mc=mc,
+        model_name=body.model or body.provider,
+    )
     custom_providers = await _get_custom_providers(user_id)
     provider_info = mc.get_provider_info(body.provider)
     custom = next((cp for cp in custom_providers if cp["name"] == body.provider), None)
@@ -747,7 +771,7 @@ async def list_endpoint_models(body: EndpointModelsRequest, user_id: CurrentUser
 
 
 @router.get("/api/v1/models")
-async def list_models():
+async def list_models(response: Response):
     """
     List all configured LLM models grouped by parent provider.
 
@@ -765,14 +789,37 @@ async def list_models():
         resolve_min_tier,
     )
 
+    # DALTON-HOOK(team-model-catalog): confirm live PG catalog revision on every GET /api/v1/models,
+    # expose X-Dalton-Catalog-Revision header, and serve version-aligned curated setup candidates.
+    from src.dalton.services.team_model_catalog.compiled import get_compiled_catalog_async
+    from src.dalton.services.team_model_catalog.constants import CATALOG_REVISION_HEADER
+    from src.dalton.services.team_model_catalog.service import derive_curated_setup_for_catalog
+
+    compiled_catalog = await get_compiled_catalog_async()
+    prev_rev = getattr(LLM._model_config, "catalog_revision", None)
+    if LLM._model_config is None or prev_rev != compiled_catalog.revision:
+        LLM._model_config = compiled_catalog.model_config
+        provider_catalog.cache_clear()
+        key_candidates.cache_clear()
+    response.headers[CATALOG_REVISION_HEADER] = str(compiled_catalog.revision)
+    curated_setup_fields = derive_curated_setup_for_catalog(compiled_catalog)
+
     # DALTON-HOOK(catalog-cache): clear provider catalog caches when the OpenClaw overlay changes
     from src.dalton.llm.overlay import overlay_changed
     if LLM._model_config is None or overlay_changed(getattr(LLM._model_config, "overlay_stamp", None)):
         provider_catalog.cache_clear()
         key_candidates.cache_clear()
 
-    models = get_configured_llm_models()
-    config = LLM.get_model_config()
+    # DALTON-HOOK(team-model-catalog): derive models list directly from compiled_catalog.model_config
+    # so X-Dalton-Catalog-Revision header and response body always match atomically
+    # (honoring unit tests that replace src.llms.llm.LLM with a mock class).
+    llm_is_mocked = not isinstance(LLM, type)
+    config = LLM.get_model_config() if llm_is_mocked else compiled_catalog.model_config
+    models = (
+        get_configured_llm_models()
+        if llm_is_mocked
+        else get_configured_llm_models(model_config=config)
+    )
     from ptc_agent.config.agent import COMPACTION_PROFILES
     from src.server.services.llm.config import system_default_models
 
@@ -805,9 +852,12 @@ async def list_models():
             for provider, model_list in models.items()
         },
         # DALTON-HOOK(standalone-core): mark text-only models so core setup excludes non-tool models
+        # DALTON-HOOK(team-model-catalog): pass compiled_catalog.dalton_meta so metadata aligns with X-Dalton-Catalog-Revision
         "model_metadata": __import__(
             "src.dalton.llm.role_policy", fromlist=["annotate_model_metadata_tool_calling"]
-        ).annotate_model_metadata_tool_calling(config.get_model_metadata()),
+        ).annotate_model_metadata_tool_calling(
+            config.get_model_metadata(), dalton_meta=compiled_catalog.dalton_meta
+        ),
         "system_defaults": {
             # One source with the default-model reassignment on preference
             # writes, so "threads on the old default" means what the composer showed.
@@ -830,16 +880,19 @@ async def list_models():
         },
         "compaction_profiles": COMPACTION_PROFILES,
         # model_metadata's task_cost values are multiples of this model at this level.
-        "task_cost_baseline": task_cost_baseline(),
+        # DALTON-HOOK(team-model-catalog): derive task_cost_baseline, provider_catalog & key_candidates
+        # from the same compiled_catalog as X-Dalton-Catalog-Revision.
+        "task_cost_baseline": task_cost_baseline(costs=compiled_catalog.task_costs),
         "search_providers": search_providers,
-        "provider_catalog": provider_catalog(),
-        "key_candidates": key_candidates(),
+        "provider_catalog": build_provider_catalog(config),
+        "key_candidates": build_key_candidates(config),
         # A pick from a gateway's list is tuned as the built-in it matched.
         "gateway_index": gateway_index(config),
         # DALTON-HOOK(antigravity-series): expose Antigravity series grouping & centralized default efforts
-        "antigravity_series": __import__(
-            "src.dalton.llm.antigravity_series", fromlist=["build_antigravity_series_catalog"]
-        ).build_antigravity_series_catalog(config),
+        # DALTON-HOOK(team-model-catalog): serve compiled catalog series, revision & version-aligned setup candidates
+        "antigravity_series": compiled_catalog.antigravity_series,
+        "catalog_revision": compiled_catalog.revision,
+        **curated_setup_fields,
         # DALTON-HOOK(standalone-core): expose deployment profile (everflow vs core) for setup wizard gating
         "dalton_profile": __import__(
             "src.dalton.profile", fromlist=["resolve_profile"]

@@ -11,7 +11,11 @@
 
 import {
   convertMarkdownTables,
+  degradeOversizedLink,
+  findAtomicLinkSpans,
   findCodeRegions,
+  findSpanStraddling,
+  splitLogicalLinesPreservingLinks,
   truncateUtf16Safe,
   type MarkdownTableMode,
 } from "../../shared/text.js";
@@ -45,21 +49,28 @@ export function findGraphemeChunkEnd(text: string, start: number, maxEnd: number
 }
 
 /**
- * Converts `__bold__` to `**bold**` outside code regions. Discord renders
- * `__` as underline, so this preserves the author's bold intent.
+ * Converts `__bold__` to `**bold**` outside code regions and link targets.
+ * Discord renders `__` as underline, so this preserves the author's bold intent
+ * without mangling double underscores in URLs or file paths (e.g. `a__b__c.md`).
  */
 export function normalizeDiscordBold(markdown: string): string {
   if (!markdown.includes("__")) return markdown;
   const regions = findCodeRegions(markdown);
-  const isInCode = (pos: number): boolean => regions.some((r) => pos >= r.start && pos < r.end);
+  const linkSpans = findAtomicLinkSpans(markdown);
+  const isProtected = (pos: number): boolean =>
+    regions.some((r) => pos >= r.start && pos < r.end) ||
+    linkSpans.some((s) => pos >= s.destStart && pos < s.destEnd);
   let out = "";
   let i = 0;
   while (i < markdown.length) {
-    if (!isInCode(i) && markdown.startsWith("__", i)) {
+    if (!isProtected(i) && markdown.startsWith("__", i)) {
       const close = markdown.indexOf("__", i + 2);
-      if (close > i + 2 && !isInCode(close)) {
+      if (close > i + 2 && !isProtected(close)) {
         const inner = markdown.slice(i + 2, close);
-        if (inner.trim().length > 0 && !inner.includes("\n\n")) {
+        const crossesProtected =
+          regions.some((r) => r.start < close && r.end > i + 2) ||
+          linkSpans.some((s) => s.destStart < close && s.destEnd > i + 2);
+        if (!crossesProtected && inner.trim().length > 0 && !inner.includes("\n\n")) {
           out += `**${inner}**`;
           i = close + 2;
           continue;
@@ -76,40 +87,78 @@ export function renderDiscordMarkdown(markdown: string, tableMode: MarkdownTable
   return normalizeDiscordBold(convertMarkdownTables(markdown, tableMode));
 }
 
-function splitOverlong(text: string, limit: number): string[] {
+function splitOverlong(text: string, limit: number, inCodeFence = false): string[] {
   const pieces: string[] = [];
-  let start = 0;
-  while (start < text.length) {
-    const end = findGraphemeChunkEnd(text, start, start + limit);
-    const piece = text.slice(start, end > start ? end : start + 1);
+  let rest = text;
+  while (rest.length > 0) {
+    if (rest.length <= limit) {
+      pieces.push(rest);
+      break;
+    }
+    const linkSpans = inCodeFence ? [] : findAtomicLinkSpans(rest);
+    let end = findGraphemeChunkEnd(rest, 0, limit);
+    if (end <= 0) end = 1;
+    const straddling = findSpanStraddling(linkSpans, end);
+    if (straddling) {
+      if (straddling.start > 0) {
+        end = straddling.start;
+      } else {
+        const degraded = degradeOversizedLink(straddling);
+        if (degraded !== null && degraded.length < straddling.end) {
+          rest = degraded + rest.slice(straddling.end);
+          continue;
+        }
+      }
+    }
+    const piece = rest.slice(0, end);
     if (piece) pieces.push(piece);
-    start += piece.length || 1;
+    rest = rest.slice(piece.length || 1);
   }
   return pieces;
 }
 
-function splitOverlongGraphemeLine(line: string, step: number): string[] {
+function splitOverlongGraphemeLine(line: string, step: number, inCodeFence = false): string[] {
   const out: string[] = [];
-  let start = 0;
-  while (start < line.length) {
-    if (line.length - start <= step) {
-      out.push(line.slice(start));
+  let rest = line;
+  while (rest.length > 0) {
+    if (rest.length <= step) {
+      out.push(rest);
       break;
     }
-    const graphemeEnd = findGraphemeChunkEnd(line, start, start + step);
-    const window = line.slice(start, graphemeEnd);
-    const wsIdx = Math.max(window.lastIndexOf(" "), window.lastIndexOf("\t"));
+    const linkSpans = inCodeFence ? [] : findAtomicLinkSpans(rest);
+    const graphemeEnd = findGraphemeChunkEnd(rest, 0, step);
+    const window = rest.slice(0, graphemeEnd);
+    let wsIdx = Math.max(window.lastIndexOf(" "), window.lastIndexOf("\t"));
+    while (wsIdx > Math.floor(step * 0.5) && findSpanStraddling(linkSpans, wsIdx)) {
+      wsIdx = Math.max(
+        window.lastIndexOf(" ", wsIdx - 1),
+        window.lastIndexOf("\t", wsIdx - 1),
+      );
+    }
     if (wsIdx > Math.floor(step * 0.5)) {
       out.push(window.slice(0, wsIdx));
-      start += wsIdx + 1;
-      while (start < line.length && (line[start] === " " || line[start] === "\t")) {
-        start += 1;
+      let nextStart = wsIdx + 1;
+      while (nextStart < rest.length && (rest[nextStart] === " " || rest[nextStart] === "\t")) {
+        nextStart += 1;
       }
-    } else {
-      const end = graphemeEnd > start ? graphemeEnd : start + 1;
-      out.push(line.slice(start, end));
-      start = end;
+      rest = rest.slice(nextStart);
+      continue;
     }
+    let end = graphemeEnd > 0 ? graphemeEnd : 1;
+    const straddling = findSpanStraddling(linkSpans, end);
+    if (straddling) {
+      if (straddling.start > 0) {
+        end = straddling.start;
+      } else {
+        const degraded = degradeOversizedLink(straddling);
+        if (degraded !== null && degraded.length < straddling.end) {
+          rest = degraded + rest.slice(straddling.end);
+          continue;
+        }
+      }
+    }
+    out.push(rest.slice(0, end));
+    rest = rest.slice(end);
   }
   return out;
 }
@@ -157,7 +206,7 @@ export function chunkDiscordText(text: string, opts: { maxChars?: number } = {})
   const rendered = renderDiscordMarkdown(text).replace(/\r\n/g, "\n");
   if (rendered.length <= limit) return [rendered];
 
-  const lines = rendered.split("\n");
+  const lines = splitLogicalLinesPreservingLinks(rendered);
   const chunks: string[] = [];
   let buf = "";
   let openFence: OpenDiscordFence | null = null;
@@ -201,15 +250,16 @@ export function chunkDiscordText(text: string, opts: { maxChars?: number } = {})
       const prefix = openFence !== null ? `${openFence.openLine}\n` : "";
       const lineReserve = closeReserve(openFence);
       if (prefix.length + lineReserve >= limit) {
+        const wasInFence = openFence !== null;
         openFence = null;
-        for (const piece of splitOverlong(line, limit)) {
+        for (const piece of splitOverlong(line, limit, wasInFence)) {
           chunks.push(piece);
         }
         continue;
       }
       if (prefix.length + line.length + lineReserve > limit) {
         const step = Math.max(1, limit - prefix.length - lineReserve);
-        const pieces = splitOverlongGraphemeLine(line, step);
+        const pieces = splitOverlongGraphemeLine(line, step, openFence !== null);
         if (openFence !== null) {
           const closer = `\n${openFence.closeLine}`;
           for (let i = 0; i < pieces.length - 1; i++) {
