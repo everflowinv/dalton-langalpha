@@ -39,6 +39,16 @@ _UNSET = object()
 # ---------------------------------------------------------------------------
 
 
+def _is_real_pg_connection(conn: Any) -> bool:
+    """Return True when ``conn`` is a live psycopg connection rather than an in-memory test fake."""
+    try:
+        import psycopg
+
+        return isinstance(conn, (psycopg.AsyncConnection, psycopg.Connection))
+    except Exception:
+        return False
+
+
 async def acquire_catalog_shared_lock(conn: Any) -> None:
     """Acquire transaction-scoped shared advisory lock on ``dalton_team_model_catalog``.
 
@@ -46,8 +56,14 @@ async def acquire_catalog_shared_lock(conn: Any) -> None:
     (before coverage-unit ``FOR SHARE`` locks and before ``lock_user_automations`` /
     ``lock_user_subagents`` / ``overrides_locked``) to guarantee deadlock-free
     ordering against exclusive catalog retire/rollback transactions.
+
+    No-op when the conversation DB pool is closed and ``conn`` is not a live
+    psycopg connection (e.g. upstream unit-test in-memory fakes without a team
+    model catalog database).
     """
     if conn is None:
+        return
+    if not is_conversation_db_pool_open() and not _is_real_pg_connection(conn):
         return
     if hasattr(conn, "cursor"):
         async with conn.cursor() as cur:

@@ -37,7 +37,7 @@ _PROVIDERS_JSON_PATH = _MANIFEST_DIR / "providers.json"
 _TASK_COSTS_JSON_PATH = _MANIFEST_DIR / "task_costs.json"
 
 _CACHE_LOCK = threading.RLock()
-_COMPILED_BY_REVISION: OrderedDict[tuple[int, str, bool, str], "CompiledCatalog"] = OrderedDict()
+_COMPILED_BY_REVISION: OrderedDict[tuple[int, str, bool, str, bool], "CompiledCatalog"] = OrderedDict()
 _HIGHEST_PREWARMED_REVISION: int = -1
 
 # Narrow routing/connection keys locked on PINNED_OVERLAY_MODEL_KEYS (e.g. grok-4.7-oauth).
@@ -77,6 +77,7 @@ class CompiledCatalog:
     curated_setup: list[str] | None
     payload: dict[str, Any] = field(default_factory=dict)
     factory_model_keys: frozenset[str] = field(default_factory=frozenset)
+    from_db: bool = True
 
 
 def deep_merge_patch_with_null_delete(target: dict[str, Any], patch: Mapping[str, Any]) -> None:
@@ -432,6 +433,7 @@ def compile_catalog_from_payload(
     native_overlay_override: Mapping[str, Any] | None = None,
     upstream_models_override: Mapping[str, Any] | None = None,
     upstream_providers_override: Mapping[str, Any] | None = None,
+    from_db: bool = True,
 ) -> CompiledCatalog:
     """Compile the complete 3-layer ``CompiledCatalog`` for ``payload`` at ``revision``."""
     from src.dalton.llm.antigravity_series import build_antigravity_series_catalog
@@ -641,6 +643,7 @@ def compile_catalog_from_payload(
         curated_setup=curated_setup,
         payload=normalized_payload,
         factory_model_keys=factory_available_keys,
+        from_db=from_db,
     )
 
 
@@ -652,13 +655,14 @@ def cache_compiled_catalog(compiled: CompiledCatalog) -> None:
         compiled.overlay_stamp,
         compiled.oauth_sync_enabled,
         compiled.legacy_retired_fingerprint,
+        compiled.from_db,
     )
     with _CACHE_LOCK:
         _COMPILED_BY_REVISION[cache_key] = compiled
         _COMPILED_BY_REVISION.move_to_end(cache_key)
         while len(_COMPILED_BY_REVISION) > COMPILED_CATALOG_CACHE_MAXSIZE:
             _COMPILED_BY_REVISION.popitem(last=False)
-        if compiled.revision > _HIGHEST_PREWARMED_REVISION:
+        if compiled.from_db and compiled.revision > _HIGHEST_PREWARMED_REVISION:
             _HIGHEST_PREWARMED_REVISION = compiled.revision
 
 
@@ -707,8 +711,10 @@ def _get_cached(
     overlay_stamp: str,
     oauth_sync_enabled: bool,
     legacy_fp: str,
+    *,
+    from_db: bool = True,
 ) -> CompiledCatalog | None:
-    cache_key = (revision, overlay_stamp, oauth_sync_enabled, legacy_fp)
+    cache_key = (revision, overlay_stamp, oauth_sync_enabled, legacy_fp, from_db)
     with _CACHE_LOCK:
         found = _COMPILED_BY_REVISION.get(cache_key)
         if found is not None:
@@ -754,7 +760,7 @@ async def get_compiled_catalog_async(
     if head is None:
         legacy_fp = _compute_retired_fingerprint("not_applicable", [])
         if not force_reload:
-            cached = _get_cached(0, stamp, oauth_on, legacy_fp)
+            cached = _get_cached(0, stamp, oauth_on, legacy_fp, from_db=False)
             if cached is not None:
                 return cached
         compiled = compile_catalog_from_payload(
@@ -762,6 +768,7 @@ async def get_compiled_catalog_async(
             revision=0,
             oauth_sync_enabled=oauth_on,
             legacy_sync_import_status="not_applicable",
+            from_db=False,
         )
         cache_compiled_catalog(compiled)
         return compiled
@@ -778,7 +785,7 @@ async def get_compiled_catalog_async(
     legacy_fp = _compute_retired_fingerprint(status, known_retired, extra_readonly)
 
     if not force_reload:
-        cached = _get_cached(rev, stamp, oauth_on, legacy_fp)
+        cached = _get_cached(rev, stamp, oauth_on, legacy_fp, from_db=True)
         if cached is not None:
             return cached
 
@@ -786,7 +793,7 @@ async def get_compiled_catalog_async(
     if row is None:
         fallback_fp = _compute_retired_fingerprint("not_applicable", [])
         if not force_reload:
-            cached = _get_cached(0, stamp, oauth_on, fallback_fp)
+            cached = _get_cached(0, stamp, oauth_on, fallback_fp, from_db=False)
             if cached is not None:
                 return cached
         compiled = compile_catalog_from_payload(
@@ -794,6 +801,7 @@ async def get_compiled_catalog_async(
             revision=0,
             oauth_sync_enabled=oauth_on,
             legacy_sync_import_status="not_applicable",
+            from_db=False,
         )
         cache_compiled_catalog(compiled)
         return compiled
@@ -868,7 +876,7 @@ def get_compiled_catalog_sync(
                 return in_mem
         legacy_fp = _compute_retired_fingerprint("not_applicable", [])
         if not force_reload:
-            cached = _get_cached(0, stamp, oauth_on, legacy_fp)
+            cached = _get_cached(0, stamp, oauth_on, legacy_fp, from_db=False)
             if cached is not None:
                 return cached
         compiled = compile_catalog_from_payload(
@@ -876,6 +884,7 @@ def get_compiled_catalog_sync(
             revision=0,
             oauth_sync_enabled=oauth_on,
             legacy_sync_import_status="not_applicable",
+            from_db=False,
         )
         cache_compiled_catalog(compiled)
         return compiled
@@ -887,7 +896,7 @@ def get_compiled_catalog_sync(
     legacy_fp = _compute_retired_fingerprint(status, known_retired, extra_readonly)
 
     if not force_reload:
-        cached = _get_cached(rev, stamp, oauth_on, legacy_fp)
+        cached = _get_cached(rev, stamp, oauth_on, legacy_fp, from_db=True)
         if cached is not None:
             return cached
 
@@ -895,7 +904,7 @@ def get_compiled_catalog_sync(
     if row is None:
         fallback_fp = _compute_retired_fingerprint("not_applicable", [])
         if not force_reload:
-            cached = _get_cached(0, stamp, oauth_on, fallback_fp)
+            cached = _get_cached(0, stamp, oauth_on, fallback_fp, from_db=False)
             if cached is not None:
                 return cached
         compiled = compile_catalog_from_payload(
@@ -903,6 +912,7 @@ def get_compiled_catalog_sync(
             revision=0,
             oauth_sync_enabled=oauth_on,
             legacy_sync_import_status="not_applicable",
+            from_db=False,
         )
         cache_compiled_catalog(compiled)
         return compiled

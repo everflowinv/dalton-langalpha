@@ -135,6 +135,8 @@ async def assert_model_not_retired_under_lock(
     if not cleaned:
         return None
     compiled = await get_compiled_catalog_async(conn=conn)
+    if not compiled.from_db:
+        return None
     # Personal custom models/providers shadow team catalog names (matching classify_model);
     # check them BEFORE team retirement checks so retiring a team model never blocks a user's
     # same-name custom model or custom provider.

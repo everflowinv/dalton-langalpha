@@ -75,21 +75,36 @@ async def _validate_plugin_subagent_models_under_lock(
     plans: list[AgentPlan],
     *,
     conn: Any,
+    check_overrides: bool = True,
 ) -> None:
     """DALTON-HOOK(team-model-catalog): validate each plugin subagent's effective model (including user override) under the held catalog shared lock."""
+    plans_with_model = [
+        plan
+        for plan in plans
+        if plan.skip_code is None and str((plan.fields or {}).get("model") or "").strip()
+    ]
+    if not plans_with_model:
+        return
+
+    from src.dalton.services.team_model_catalog.compiled import (
+        get_compiled_catalog_async,
+    )
     from src.dalton.services.team_model_catalog.service import (
         assert_model_not_retired_under_lock,
     )
     from src.server.database.plugin_subagents import plugin_key
 
-    overrides_by_base: dict[str, dict[str, Any]] = {}
-    for row in await list_user_subagents(user_id, conn=conn):
-        if row.get("kind") == "override" and row.get("base_key"):
-            overrides_by_base[str(row["base_key"])] = dict(row.get("fields") or {})
+    compiled = await get_compiled_catalog_async(conn=conn)
+    if not compiled.from_db:
+        return
 
-    for plan in plans:
-        if plan.skip_code is not None:
-            continue
+    overrides_by_base: dict[str, dict[str, Any]] = {}
+    if check_overrides:
+        for row in await list_user_subagents(user_id, conn=conn):
+            if row.get("kind") == "override" and row.get("base_key"):
+                overrides_by_base[str(row["base_key"])] = dict(row.get("fields") or {})
+
+    for plan in plans_with_model:
         base_model = (plan.fields or {}).get("model")
         ov_fields = overrides_by_base.get(plugin_key(plugin_name, plan.name)) or {}
         eff_model = ov_fields.get("model") if "model" in ov_fields else base_model
@@ -116,10 +131,6 @@ async def relink_subagents(user_id: str, plugin_id: str, plugin_name: str) -> No
             for r in rows
         ]
         linked_plans = await _linked(user_id, plugin_id, plugin_name, plans, conn=conn)
-        # DALTON-HOOK(team-model-catalog): re-verify effective models under catalog shared lock
-        await _validate_plugin_subagent_models_under_lock(
-            user_id, plugin_name, linked_plans, conn=conn
-        )
         for row, plan in zip(rows, linked_plans):
             if plan.fields != row["fields"]:
                 await replace_plugin_subagent(user_id, plugin_id, plan.row, plan.text, conn=conn)
@@ -210,7 +221,9 @@ async def install_subagents(
             )
         plans = await _linked(user_id, plugin_id, plugin_name, plans, conn=conn)
         # DALTON-HOOK(team-model-catalog): validate plugin subagent models under catalog shared lock
-        await _validate_plugin_subagent_models_under_lock(user_id, plugin_name, plans, conn=conn)
+        await _validate_plugin_subagent_models_under_lock(
+            user_id, plugin_name, plans, conn=conn, check_overrides=False
+        )
         await fan_out_subagents(user_id, plugin_id, plans, report, conn=conn)
 
 

@@ -795,12 +795,14 @@ async def _handle_resume(
                     runs, task.subagent_type
                 )
             else:
+                # DALTON-HOOK(team-model-catalog): tolerate test-double task_models without _own_model
+                own_model_fn = getattr(mw.task_models, "_own_model", None)
                 live_model_key = (
                     runs.model.strip()
                     if runs and runs.model
                     else (
-                        mw.task_models._own_model(task.subagent_type)
-                        if mw.task_models is not None
+                        own_model_fn(task.subagent_type)
+                        if callable(own_model_fn)
                         else (_extract_primary_model_key_from_run(pred_row, is_subagent=True) or "")
                     )
                 )
