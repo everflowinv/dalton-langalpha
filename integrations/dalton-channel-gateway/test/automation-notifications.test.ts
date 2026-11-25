@@ -197,10 +197,12 @@ describe("automation notification gateway route", () => {
     }
   });
 
-  it("rewrites sandbox links in text automation notifications before chunking", async () => {
+  it("rewrites sandbox links in text and Feishu card automation notifications using plan.thread_id or plain-text fallback", async () => {
     const backend = createMockBackend();
     const discord = new FakeChannelAdapter("discord");
-    const planWithSandboxLinks: DataTaskAuthorizePlanResponse = {
+    const feishu = new FakeChannelAdapter("feishu");
+    const threadId = "11111111-2222-3333-4444-555555555555";
+    const planWithoutThread: DataTaskAuthorizePlanResponse = {
       ...discordPlan(),
       items: [
         {
@@ -211,35 +213,79 @@ describe("automation notification gateway route", () => {
         },
       ],
     };
-    vi.mocked(backend.authorizeAutomationNotificationPlan).mockResolvedValueOnce(
-      planWithSandboxLinks,
-    );
-    vi.mocked(backend.authorizeAndClaimDelivery).mockResolvedValueOnce(
-      claimed("discord", "discord:@me", "123456789012345678"),
-    );
+    const planWithThread: DataTaskAuthorizePlanResponse = {
+      ...discordPlan(),
+      thread_id: threadId,
+      items: [
+        {
+          item_index: 0,
+          delivery_key: `automation_notify:${DELIVERY_ID}:item:0`,
+          kind: "text",
+          text: "自动任务完成：[报告](results/daily.md)",
+        },
+      ],
+    };
+    const feishuCardWithThread: DataTaskAuthorizePlanResponse = {
+      ...feishuPlan(),
+      thread_id: threadId,
+      items: [
+        {
+          item_index: 0,
+          delivery_key: `automation_notify:${DELIVERY_ID}:item:0`,
+          kind: "feishu_card",
+          card: {
+            schema: "2.0",
+            header: { title: { tag: "plain_text", content: "日报" }, template: "blue" },
+            body: {
+              elements: [
+                { tag: "markdown", content: "详情见 [日报](results/daily.md)" },
+              ],
+            },
+          },
+          images: [],
+        },
+      ],
+    };
+    vi.mocked(backend.authorizeAutomationNotificationPlan)
+      .mockResolvedValueOnce(planWithoutThread)
+      .mockResolvedValueOnce(planWithThread)
+      .mockResolvedValueOnce(feishuCardWithThread);
+    vi.mocked(backend.authorizeAndClaimDelivery)
+      .mockResolvedValueOnce(claimed("discord", "discord:@me", "123456789012345678"))
+      .mockResolvedValueOnce(claimed("discord", "discord:@me", "123456789012345678"))
+      .mockResolvedValueOnce(claimed("feishu", FEISHU_TARGET, "ou_analyst_a"));
 
     const app = appFor(
       backend,
-      new Map<ChannelPlatform, ChannelAdapter>([["discord", discord]]),
+      new Map<ChannelPlatform, ChannelAdapter>([
+        ["discord", discord],
+        ["feishu", feishu],
+      ]),
       { WEB_BASE_URL: "https://app.ginlix.ai" },
     );
     const { host, port } = await app.start();
     try {
-      const res = await fetch(
-        `http://${host}:${port}/internal/automation-notifications`,
-        {
+      const url = `http://${host}:${port}/internal/automation-notifications`;
+      for (let i = 0; i < 3; i += 1) {
+        const res = await fetch(url, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             "X-Service-Token": TEST_SERVICE_TOKEN,
           },
           body: JSON.stringify({ delivery_id: DELIVERY_ID }),
-        },
-      );
-      expect(res.status).toBe(200);
+        });
+        expect(res.status).toBe(200);
+      }
       expect(discord.sentTexts.map((item) => item.text)).toEqual([
         "自动任务完成：报告（在网页工作区查看：results/daily.md），路径 data/out.csv",
+        `自动任务完成：[报告](https://app.ginlix.ai/chat/t/${threadId}?file=results%2Fdaily.md)`,
       ]);
+      expect(feishu.sentCards).toHaveLength(1);
+      const sentBody = (feishu.sentCards[0]?.card as { body?: { elements?: Array<{ content?: string }> } }).body;
+      expect(sentBody?.elements?.[0]?.content).toBe(
+        `详情见 [日报](https://app.ginlix.ai/chat/t/${threadId}?file=results%2Fdaily.md)`,
+      );
     } finally {
       await app.stop();
     }

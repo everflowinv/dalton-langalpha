@@ -603,3 +603,5 @@ web/src/components/ui/__tests__/chat-input.mobileEnterAndPicker.test.tsx
 web/src/pages/ChatAgent/components/viewers/html/comments/__tests__/CommentComposer.mobileEnter.test.tsx
 web/src/pages/ChatAgent/components/__tests__/MobileP1Surfaces.test.tsx
 web/e2e/mobile-p1-layout.spec.js
+# Channel sandbox link rewriting: unauthenticated deep-link login redirect & agentPaths parity tests (DALTON-HOOK(channel-links)).
+web/src/__tests__/App.deepLinkAuthRedirect.test.tsx

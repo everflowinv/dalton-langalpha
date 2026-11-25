@@ -548,6 +548,11 @@ async def decide_automation_notification_plan(
         "recipient_id": parsed["recipient_id"],
         "items": [item],
     }
+    thread_id = str(
+        payload.get("thread_id") or payload.get("conversation_thread_id") or ""
+    ).strip()
+    if thread_id:
+        plan["thread_id"] = thread_id
     return plan
 
 

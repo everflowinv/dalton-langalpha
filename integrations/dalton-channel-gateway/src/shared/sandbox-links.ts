@@ -3,10 +3,18 @@
  * into sign-in-protected web deep links (or plain-text hints when no public
  * web URL or conversation thread is available).
  *
- * Keeps fenced code blocks and inline code spans untouched, preserves external
- * http(s) links, strips unroutable localhost preview links to plain text, and
- * normalizes bare sandbox absolute paths in prose to workspace-relative paths.
+ * Uses CommonMark + GFM table AST parsing (`mdast-util-from-markdown`) so
+ * fenced blocks (including inside blockquotes and lists), unterminated quoted
+ * fences, 4-space indented code blocks, inline code, reference link
+ * definitions, titled links, escaped characters, autolinks, and nested images
+ * follow Markdown semantics. Preserves rooted sandbox/machine paths in `?file=`
+ * so the web frontend's `agentPaths` router resolves workspace folders, sibling
+ * workspaces, and custom/former computer roots identically to web clicks.
  */
+
+import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmTableFromMarkdown } from "mdast-util-gfm-table";
+import { gfmTable } from "micromark-extension-gfm-table";
 
 /**
  * Stock sandbox root prefixes (rootless form, trailing slash).
@@ -22,8 +30,8 @@ export const SANDBOX_ROOT_PREFIXES = [
 const MAX_LINK_LABEL_LEN = 512;
 const MAX_LINK_DEST_LEN = 4096;
 
-const FENCE_OPEN_RE = /^ {0,3}(`{3,}|~{3,})/;
-const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
+const MARKDOWN_EXTENSIONS = [gfmTable()];
+const MDAST_EXTENSIONS = [gfmTableFromMarkdown()];
 
 const escapeRe = (value: string): string =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -34,14 +42,11 @@ const SANDBOX_ROOTS_ALTERNATION = SANDBOX_ROOT_PREFIXES.map((root) =>
 
 /** Matches `/home/workspace/`, `home/workspace/`, `/home/daytona/`, `home/daytona/`. */
 const SANDBOX_ROOT_RE = new RegExp(
-  `^/?(?:${SANDBOX_ROOTS_ALTERNATION})(?:/|$)`,
+  `^/?(${SANDBOX_ROOTS_ALTERNATION})(?:/|$)`,
 );
 
-/** Matches `file:///home/workspace/...` or `file:///home/daytona/...`. */
-const FILE_SANDBOX_PROTO_RE = new RegExp(
-  `^file://(?=/(?:${SANDBOX_ROOTS_ALTERNATION})(?:/|$))`,
-  "i",
-);
+/** Matches `file:///...` (triple-slash local file URI). */
+const FILE_TRIPLE_SLASH_RE = /^file:\/\/(?=\/)/i;
 
 /**
  * Matches bare absolute sandbox prefixes in prose (optional `file://` +
@@ -55,25 +60,97 @@ const BARE_SANDBOX_PREFIX_RE = new RegExp(
 /** Characters that indicate a preceding URL/path rather than a standalone bare path. */
 const BARE_PATH_PRECEDING_BLOCK_RE = /[A-Za-z0-9._~:/%-]/;
 
+const BARE_PROSE_HTTP_URL_RE =
+  /https?:\/\/[^\s<>"'`()[\]{}，。；：、！？（）【】《》「」『』“”‘’]+/gi;
+
 const WSREF_RE = /^\/?__wsref__\/([A-Za-z0-9][A-Za-z0-9_-]{0,127})\/(.+)$/;
 
 /** Matches `name.ext:42`, `name.ext:40-55`, `name.ext:42:7` (extension must contain a letter). */
 const LINE_SUFFIX_RE =
   /(\.(?=[A-Za-z0-9]{0,7}[A-Za-z])[A-Za-z0-9]{1,8}):\d+(?:-\d+|:\d+)?$/;
 
-/** Relative filename must have a non-dot stem before `.` and a 1–8 char extension containing a letter. */
+/** Filename must have a non-dot stem before `.` and a 1–8 char extension containing a letter. */
 const FILE_EXT_BASENAME_RE =
   /^[^/]*[^/.]\.(?=[A-Za-z0-9]{0,7}[A-Za-z])[A-Za-z0-9]{1,8}$/;
 
+/** Common web domain TLDs that are not workspace file extensions, used to reject bare single-segment hostnames like `example.com`. */
+const COMMON_HOST_TLDS = new Set([
+  "com",
+  "org",
+  "net",
+  "edu",
+  "gov",
+  "mil",
+  "int",
+  "io",
+  "co",
+  "ai",
+  "app",
+  "dev",
+  "cn",
+  "hk",
+  "tw",
+  "sg",
+  "jp",
+  "kr",
+  "uk",
+  "de",
+  "fr",
+  "au",
+  "ca",
+  "us",
+  "eu",
+  "br",
+  "nl",
+  "se",
+  "ch",
+  "it",
+  "es",
+  "ru",
+  "xyz",
+  "info",
+  "biz",
+  "me",
+  "cc",
+  "gg",
+  "site",
+  "online",
+  "tech",
+  "cloud",
+  "pro",
+  "top",
+  "club",
+  "news",
+  "media",
+  "live",
+  "store",
+  "shop",
+  "finance",
+  "capital",
+  "fund",
+  "group",
+  "ltd",
+  "inc",
+]);
+
 const BARE_LOCALHOST_PORT_RE =
-  /^(?:localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\]|0\.0\.0\.0):\d+(?:[/?#].*)?$/i;
+  /^(?:(?:[A-Za-z0-9-]+\.)*localhost\.?|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\]|0\.0\.0\.0):\d+(?:[/?#].*)?$/i;
 
 const TRAILING_QUOTED_TITLE_RE =
   /[ \t]+(?:"[^"\n]{0,512}"|'[^'\n]{0,512}')$/;
 
-interface Span {
-  text: string;
-  code: boolean;
+interface MdastNode {
+  type: string;
+  url?: string;
+  title?: string | null;
+  alt?: string | null;
+  identifier?: string;
+  label?: string | null;
+  children?: MdastNode[];
+  position?: {
+    start?: { offset?: number };
+    end?: { offset?: number };
+  };
 }
 
 interface ParsedMarkdownLink {
@@ -85,94 +162,40 @@ interface ParsedMarkdownLink {
 type DestinationClassification =
   | { kind: "keep" }
   | { kind: "local_preview" }
-  | { kind: "workspace_file"; relPath: string; workspaceId?: string };
+  | {
+      kind: "workspace_file";
+      /** Path placed in `?file=` (preserves rooted form so frontend `agentPaths` resolves workspace/sibling/custom roots). */
+      deepLinkPath: string;
+      /** Human-readable path shown in plain-text fallback hints (strips stock sandbox root). */
+      displayPath: string;
+      workspaceId?: string;
+    };
 
-function closesFence(line: string, opener: string): boolean {
-  const match = FENCE_CLOSE_RE.exec(line.replace(/\r?\n$/, ""));
-  return (
-    match !== null &&
-    match[1]![0] === opener[0] &&
-    match[1]!.length >= opener.length
-  );
+interface TextSegmentAction {
+  start: number;
+  end: number;
+  kind: "edit" | "protect";
+  replacement?: string;
+  clampToCursor?: boolean;
 }
 
-function splitLines(text: string): string[] {
-  const lines: string[] = [];
-  let start = 0;
-  for (
-    let end = text.indexOf("\n");
-    end !== -1;
-    end = text.indexOf("\n", start)
-  ) {
-    lines.push(text.slice(start, end + 1));
-    start = end + 1;
-  }
-  if (start < text.length) {
-    lines.push(text.slice(start));
-  }
-  return lines;
-}
-
-function pushSpan(spans: Span[], text: string, code: boolean): void {
-  if (!text) return;
-  const last = spans[spans.length - 1];
-  if (last && last.code === code) {
-    last.text += text;
-  } else {
-    spans.push({ text, code });
-  }
-}
-
-function splitFences(content: string): Span[] {
-  const lines = splitLines(content);
-  const spans: Span[] = [];
-  let opener: string | null = null;
-
-  for (const line of lines) {
-    if (opener === null) {
-      const open = FENCE_OPEN_RE.exec(line);
-      if (open) {
-        opener = open[1]!;
-        pushSpan(spans, line, true);
-      } else {
-        pushSpan(spans, line, false);
-      }
-      continue;
-    }
-    pushSpan(spans, line, true);
-    if (closesFence(line, opener)) {
-      opener = null;
-    }
-  }
-  return spans;
-}
-
-function findClosingBacktickRun(
-  text: string,
-  from: number,
-  length: number,
-  limit = text.length,
-): number {
-  let i = from;
-  while (i < limit) {
-    if (text[i] !== "`") {
-      i += 1;
-      continue;
-    }
-    let run = 0;
-    while (i + run < limit && text[i + run] === "`") {
-      run += 1;
-    }
-    if (run === length) {
-      return i;
-    }
-    i += run;
-  }
-  return -1;
+interface DefinitionInfo {
+  start: number;
+  end: number;
+  identifier: string;
+  rawLabel: string;
+  url: string;
+  title: string | null;
+  classification: DestinationClassification;
+  referencedCount: number;
 }
 
 function isLocalHostname(rawHostname: string): boolean {
-  const host = rawHostname.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  const host = rawHostname
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.+$/, "");
   if (!host) return true;
   if (
     host === "localhost" ||
@@ -222,6 +245,10 @@ function isLocalPreviewUrl(dest: string): boolean {
   }
 }
 
+function neutralizeLocalUrl(url: string): string {
+  return url.trim().replace(/^https?:\/\//i, "");
+}
+
 function decodeOnce(value: string): string {
   try {
     return decodeURIComponent(value);
@@ -230,35 +257,72 @@ function decodeOnce(value: string): string {
   }
 }
 
-function encodeFileParam(relPath: string): string {
-  return encodeURIComponent(relPath).replace(/[()]/g, (ch) =>
-    ch === "(" ? "%28" : "%29",
-  );
+/**
+ * Encodes the `?file=` query parameter using `URLSearchParams` rules (so `+`
+ * becomes `%2B` and parens become `%28`/`%29`), replacing space `+` with `%20`
+ * for clean Markdown links. Round-trips identically through frontend
+ * `URLSearchParams.get("file")` (`useFileDeepLink.ts`) and matches `fileHref`
+ * (`CommandPalette/rows.ts`).
+ */
+function encodeFileParam(filePath: string): string {
+  return new URLSearchParams({ file: filePath })
+    .toString()
+    .slice("file=".length)
+    .replace(/\+/g, "%20");
 }
 
 /**
- * Normalizes a workspace-relative path: drops `.` and empty segments, folds `..`.
- * Returns `null` if the path escapes the workspace root (`..` at root) or collapses to empty.
+ * Normalizes path segments: drops `.` and empty segments, folds `..`.
+ * When `allowSingleLeadingClimb` is true, permits at most one leading `../`
+ * (for sibling workspace folder references such as `../NVDA/results/report.md`,
+ * matching `agentPaths.ts:141,346`); deeper climbs return `null`.
  */
-function normalizeRelativePath(raw: string): string | null {
+function normalizePathSegments(
+  raw: string,
+  options: { allowSingleLeadingClimb?: boolean } = {},
+): string | null {
   const isDir = raw.endsWith("/");
   const segments: string[] = [];
+  let leadingClimbs = 0;
+
   for (const seg of raw.split("/")) {
     if (seg === "" || seg === ".") continue;
     if (seg === "..") {
-      if (segments.length === 0) {
-        return null;
+      if (segments.length > 0 && segments[segments.length - 1] !== "..") {
+        segments.pop();
+        continue;
       }
-      segments.pop();
-      continue;
+      if (options.allowSingleLeadingClimb && leadingClimbs === 0) {
+        leadingClimbs += 1;
+        segments.push("..");
+        continue;
+      }
+      return null;
     }
     segments.push(seg);
   }
+
   if (segments.length === 0) {
+    return null;
+  }
+  if (leadingClimbs > 0 && segments.length < 2) {
     return null;
   }
   const joined = segments.join("/");
   return isDir ? `${joined}/` : joined;
+}
+
+function hasFileExtension(pathStr: string): boolean {
+  const baseName = pathStr.split("/").pop() ?? "";
+  return FILE_EXT_BASENAME_RE.test(baseName);
+}
+
+function isBareSingleSegmentHostname(pathStr: string): boolean {
+  if (pathStr.includes("/")) return false;
+  const dot = pathStr.lastIndexOf(".");
+  if (dot <= 0) return false;
+  const ext = pathStr.slice(dot + 1).toLowerCase();
+  return COMMON_HOST_TLDS.has(ext);
 }
 
 function classifyLinkDestination(rawDest: string): DestinationClassification {
@@ -277,48 +341,83 @@ function classifyLinkDestination(rawDest: string): DestinationClassification {
     const workspaceId = wsMatch[1]!;
     let inner = wsMatch[2]!.replace(/[?#].*$/, "");
     inner = inner.replace(LINE_SUFFIX_RE, "$1");
-    inner = inner.replace(FILE_SANDBOX_PROTO_RE, "");
+    inner = inner.replace(FILE_TRIPLE_SLASH_RE, "");
     const leadingStripped = inner.replace(/^\/+/, "");
     const rootMatch = SANDBOX_ROOT_RE.exec(leadingStripped);
     const withoutRoot = rootMatch
       ? leadingStripped.slice(rootMatch[0].length)
       : leadingStripped;
-    const relPath = normalizeRelativePath(decodeOnce(withoutRoot));
+    const relPath = normalizePathSegments(decodeOnce(withoutRoot));
     if (!relPath) {
       return { kind: "keep" };
     }
-    return { kind: "workspace_file", relPath, workspaceId };
+    return {
+      kind: "workspace_file",
+      deepLinkPath: relPath,
+      displayPath: relPath,
+      workspaceId,
+    };
   }
 
-  // 2. `file://` URLs: only rewrite sandbox roots (e.g. `file:///home/workspace/...`)
+  // 2. `file://` URLs: unwrap `file://` when followed by `/`
   let candidate = dest;
   let unwrappedFileProto = false;
   if (/^file:/i.test(candidate)) {
-    if (!FILE_SANDBOX_PROTO_RE.test(candidate)) {
+    if (!FILE_TRIPLE_SLASH_RE.test(candidate)) {
       return { kind: "keep" };
     }
-    candidate = candidate.replace(FILE_SANDBOX_PROTO_RE, "");
+    candidate = candidate.replace(FILE_TRIPLE_SLASH_RE, "");
     unwrappedFileProto = true;
   }
 
-  // 3. Sandbox-rooted paths (`/home/workspace/x`, `/home/daytona/x`, `home/workspace/x`)
+  // 3. Stock sandbox-rooted paths (`/home/workspace/...`, `/home/daytona/...`, `home/workspace/...`)
+  //    Preserve the rooted form in `deepLinkPath` so frontend `computeAgentArtifactRouting`
+  //    folds off the workspace's own folder (e.g. `Research/`) or routes to a sibling workspace
+  //    (e.g. `NVDA/`) identically to web clicks (`agentPaths.ts:120,340,861`).
   const strippedForRoot = candidate
     .replace(/[?#].*$/, "")
     .replace(LINE_SUFFIX_RE, "$1");
   const sandboxRootMatch = SANDBOX_ROOT_RE.exec(strippedForRoot);
   if (sandboxRootMatch) {
+    const rootName = sandboxRootMatch[1]!;
     const rest = strippedForRoot.slice(sandboxRootMatch[0].length);
-    const relPath = normalizeRelativePath(decodeOnce(rest));
+    const relPath = normalizePathSegments(decodeOnce(rest));
     if (!relPath) {
       return { kind: "keep" };
     }
-    return { kind: "workspace_file", relPath };
+    return {
+      kind: "workspace_file",
+      deepLinkPath: `/${rootName}/${relPath}`,
+      displayPath: relPath,
+    };
+  }
+
+  // 4. Custom/former computer root absolute file paths (e.g. `/home/someone/langalpha/Research/report.md`,
+  //    `/srv/old/Research/report.md`, `file:///Users/alice/langalpha/Research/report.md`).
+  //    Matches `filePaths.ts:138-163`: requires a file extension on the basename so web app routes
+  //    (`/settings`, `/chat/t/123`) and extensionless system paths (`/etc/passwd`) are untouched.
+  if (candidate.startsWith("/") && !candidate.startsWith("//")) {
+    const rawAbs = strippedForRoot;
+    const decodedAbs = decodeOnce(rawAbs);
+    if (decodedAbs.endsWith("/") || decodedAbs.includes(":")) {
+      return { kind: "keep" };
+    }
+    const normAbs = normalizePathSegments(decodedAbs);
+    if (!normAbs || !hasFileExtension(normAbs)) {
+      return { kind: "keep" };
+    }
+    const rootedPath = `/${normAbs}`;
+    return {
+      kind: "workspace_file",
+      deepLinkPath: rootedPath,
+      displayPath: rootedPath,
+    };
   }
   if (unwrappedFileProto) {
     return { kind: "keep" };
   }
 
-  // 4. Relative paths with extension and no protocol
+  // 5. Reject external schemes, protocol-relative URLs, anchors, queries, `www.`, emails, and colons
   const hasLine =
     LINE_SUFFIX_RE.test(candidate) && !/^[a-z][a-z0-9+.-]*:\/\//i.test(candidate);
   if (!hasLine && /^[a-z][a-z0-9+.-]*:/i.test(candidate)) {
@@ -326,10 +425,10 @@ function classifyLinkDestination(rawDest: string): DestinationClassification {
   }
   if (
     candidate.startsWith("//") ||
-    candidate.startsWith("/") ||
     candidate.startsWith("#") ||
     candidate.startsWith("?") ||
-    /^www\./i.test(candidate)
+    /^www\./i.test(candidate) ||
+    candidate.includes("@")
   ) {
     return { kind: "keep" };
   }
@@ -338,18 +437,119 @@ function classifyLinkDestination(rawDest: string): DestinationClassification {
     .replace(/[?#].*$/, "")
     .replace(LINE_SUFFIX_RE, "$1");
   const decodedRel = decodeOnce(rawRel);
-  if (decodedRel.endsWith("/")) {
+  if (decodedRel.endsWith("/") || decodedRel.includes(":")) {
     return { kind: "keep" };
   }
-  const relPath = normalizeRelativePath(decodedRel);
-  if (!relPath) {
+
+  const explicitDotSlash =
+    decodedRel.startsWith("./") || decodedRel.startsWith("../");
+  const relPath = normalizePathSegments(decodedRel, {
+    allowSingleLeadingClimb: true,
+  });
+  if (!relPath || !hasFileExtension(relPath)) {
     return { kind: "keep" };
   }
-  const baseName = relPath.split("/").pop() ?? "";
-  if (!FILE_EXT_BASENAME_RE.test(baseName)) {
+  if (!explicitDotSlash && isBareSingleSegmentHostname(relPath)) {
     return { kind: "keep" };
   }
-  return { kind: "workspace_file", relPath };
+  return {
+    kind: "workspace_file",
+    deepLinkPath: relPath,
+    displayPath: relPath,
+  };
+}
+
+function buildDeepLinkUrl(
+  classification: Extract<DestinationClassification, { kind: "workspace_file" }>,
+  publicWebBaseUrl: string,
+  normalizedThreadId: string,
+): string {
+  if (classification.workspaceId) {
+    return `${publicWebBaseUrl}/chat/${encodeURIComponent(classification.workspaceId)}?file=${encodeFileParam(classification.deepLinkPath)}`;
+  }
+  return `${publicWebBaseUrl}/chat/t/${encodeURIComponent(normalizedThreadId)}?file=${encodeFileParam(classification.deepLinkPath)}`;
+}
+
+function formatWorkspaceFileLink(
+  label: string,
+  classification: Extract<DestinationClassification, { kind: "workspace_file" }>,
+  publicWebBaseUrl: string | null,
+  normalizedThreadId: string | null,
+): string {
+  if (publicWebBaseUrl && normalizedThreadId) {
+    const url = buildDeepLinkUrl(
+      classification,
+      publicWebBaseUrl,
+      normalizedThreadId,
+    );
+    return `[${label || classification.displayPath}](${url})`;
+  }
+  const hint = `（在网页工作区查看：${classification.displayPath}）`;
+  return label ? `${label}${hint}` : hint;
+}
+
+function findClosingBacktickRun(
+  text: string,
+  from: number,
+  length: number,
+  limit = text.length,
+): number {
+  let i = from;
+  while (i < limit) {
+    if (text[i] !== "`") {
+      i += 1;
+      continue;
+    }
+    let run = 0;
+    while (i + run < limit && text[i + run] === "`") {
+      run += 1;
+    }
+    if (run === length) {
+      return i;
+    }
+    i += run;
+  }
+  return -1;
+}
+
+function findMatchingBracketClose(
+  text: string,
+  bracketOpen: number,
+  limit: number,
+): number {
+  let i = bracketOpen + 1;
+  let depth = 0;
+  while (i < limit) {
+    const ch = text[i]!;
+    if (ch === "\\" && i + 1 < limit) {
+      i += 2;
+      continue;
+    }
+    if (ch === "`") {
+      let run = 0;
+      while (i + run < limit && text[i + run] === "`") {
+        run += 1;
+      }
+      const close = findClosingBacktickRun(text, i + run, run, limit);
+      i = close !== -1 ? close + run : i + run;
+      continue;
+    }
+    if (ch === "[") {
+      depth += 1;
+      i += 1;
+      continue;
+    }
+    if (ch === "]") {
+      if (depth === 0) {
+        return i;
+      }
+      depth -= 1;
+      i += 1;
+      continue;
+    }
+    i += 1;
+  }
+  return -1;
 }
 
 function skipOptionalTitleAndClosingParen(
@@ -403,7 +603,12 @@ function skipOptionalTitleAndClosingParen(
   return pos < lineEnd && text[pos] === ")" ? pos : -1;
 }
 
-function parseMarkdownLinkAt(
+/**
+ * Fallback parser for agent-emitted links whose bare destination contains
+ * unescaped spaces (e.g. `[季报](results/中文 报告 (1).pdf)`), which CommonMark
+ * leaves as plain text rather than `link` AST nodes.
+ */
+function parseSpacedMarkdownLinkAt(
   text: string,
   start: number,
   lineEnd: number,
@@ -415,47 +620,12 @@ function parseMarkdownLinkAt(
   }
 
   const labelLimit = Math.min(lineEnd, bracketOpen + 1 + MAX_LINK_LABEL_LEN);
-  let i = bracketOpen + 1;
-  let bracketDepth = 0;
-  let bracketClose = -1;
-
-  while (i < labelLimit) {
-    const ch = text[i]!;
-    if (ch === "\\" && i + 1 < labelLimit) {
-      i += 2;
-      continue;
-    }
-    if (ch === "`") {
-      let run = 0;
-      while (i + run < labelLimit && text[i + run] === "`") {
-        run += 1;
-      }
-      const close = findClosingBacktickRun(text, i + run, run, labelLimit);
-      if (close !== -1) {
-        i = close + run;
-        continue;
-      }
-      i += run;
-      continue;
-    }
-    if (ch === "[") {
-      bracketDepth += 1;
-      i += 1;
-      continue;
-    }
-    if (ch === "]") {
-      if (bracketDepth === 0) {
-        bracketClose = i;
-        break;
-      }
-      bracketDepth -= 1;
-      i += 1;
-      continue;
-    }
-    i += 1;
-  }
-
-  if (bracketClose === -1 || bracketClose + 1 >= lineEnd || text[bracketClose + 1] !== "(") {
+  const bracketClose = findMatchingBracketClose(text, bracketOpen, labelLimit);
+  if (
+    bracketClose === -1 ||
+    bracketClose + 1 >= lineEnd ||
+    text[bracketClose + 1] !== "("
+  ) {
     return null;
   }
 
@@ -468,7 +638,6 @@ function parseMarkdownLinkAt(
     return null;
   }
 
-  // Angle-bracketed destination: `(<...>)`
   if (text[pos] === "<") {
     const destLimit = Math.min(lineEnd, pos + 1 + MAX_LINK_DEST_LEN);
     let j = pos + 1;
@@ -487,13 +656,9 @@ function parseMarkdownLinkAt(
       }
       j += 1;
     }
-    if (gt === -1) {
-      return null;
-    }
+    if (gt === -1) return null;
     const closeParen = skipOptionalTitleAndClosingParen(text, gt + 1, lineEnd);
-    if (closeParen === -1) {
-      return null;
-    }
+    if (closeParen === -1) return null;
     return {
       end: closeParen + 1,
       label,
@@ -501,7 +666,6 @@ function parseMarkdownLinkAt(
     };
   }
 
-  // Bare destination: `(...)`, allowing balanced nested parens and optional quoted title
   const destLimit = Math.min(lineEnd, pos + MAX_LINK_DEST_LEN);
   let j = pos;
   let parenDepth = 0;
@@ -577,32 +741,55 @@ function replaceBareSandboxPaths(prose: string): string {
   );
 }
 
-function formatWorkspaceFileLink(
-  label: string,
-  relPath: string,
-  workspaceId: string | undefined,
-  publicWebBaseUrl: string | null,
-  normalizedThreadId: string | null,
-): string {
-  if (publicWebBaseUrl) {
-    if (workspaceId) {
-      const url = `${publicWebBaseUrl}/chat/${encodeURIComponent(workspaceId)}?file=${encodeFileParam(relPath)}`;
-      return `[${label || relPath}](${url})`;
+/**
+ * Processes plain prose (outside code and outside Markdown links):
+ * 1. Keeps full external `http(s)://...` URLs verbatim (protecting query params
+ *    such as `?path=/home/workspace/report.md`).
+ * 2. Neutralizes bare `http(s)://localhost...` / `127.0.0.1` / `localhost.` URLs
+ *    to plain text while preserving the address text.
+ * 3. Strips stock sandbox prefixes from bare absolute paths in non-URL text.
+ */
+function rewritePlainProse(prose: string): string {
+  if (!prose) return prose;
+  const out: string[] = [];
+  let cursor = 0;
+
+  for (const match of prose.matchAll(BARE_PROSE_HTTP_URL_RE)) {
+    const start = match.index ?? 0;
+    let url = match[0]!;
+    while (url.length > 0 && /[.,;:!?]$/.test(url)) {
+      if (
+        url.endsWith(".") &&
+        /^https?:\/\/(?:[A-Za-z0-9-]+\.)*localhost\.$/i.test(url)
+      ) {
+        break;
+      }
+      url = url.slice(0, -1);
     }
-    if (normalizedThreadId) {
-      const url = `${publicWebBaseUrl}/chat/t/${encodeURIComponent(normalizedThreadId)}?file=${encodeFileParam(relPath)}`;
-      return `[${label || relPath}](${url})`;
+    const end = start + url.length;
+    if (start > cursor) {
+      out.push(replaceBareSandboxPaths(prose.slice(cursor, start)));
     }
+    if (isLocalPreviewUrl(url)) {
+      out.push(neutralizeLocalUrl(url));
+    } else {
+      out.push(url);
+    }
+    cursor = end;
   }
-  const hint = `（在网页工作区查看：${relPath}）`;
-  return label ? `${label}${hint}` : hint;
+
+  if (cursor < prose.length) {
+    out.push(replaceBareSandboxPaths(prose.slice(cursor)));
+  }
+  return out.join("");
 }
 
-function rewriteProseBlock(
-  block: string,
+function rewriteUnprotectedGap(
+  gap: string,
   publicWebBaseUrl: string | null,
   normalizedThreadId: string | null,
 ): string {
+  if (!gap) return gap;
   const out: string[] = [];
   let proseStart = 0;
   let i = 0;
@@ -611,23 +798,23 @@ function rewriteProseBlock(
 
   const flushProse = (until: number): void => {
     if (until > proseStart) {
-      out.push(replaceBareSandboxPaths(block.slice(proseStart, until)));
+      out.push(rewritePlainProse(gap.slice(proseStart, until)));
     }
   };
 
-  while (i < block.length) {
-    const ch = block[i]!;
+  while (i < gap.length) {
+    const ch = gap[i]!;
 
     // Inline code span: preserve verbatim
     if (ch === "`") {
       let run = 0;
-      while (i + run < block.length && block[i + run] === "`") {
+      while (i + run < gap.length && gap[i + run] === "`") {
         run += 1;
       }
-      const close = findClosingBacktickRun(block, i + run, run);
+      const close = findClosingBacktickRun(gap, i + run, run);
       if (close !== -1) {
         flushProse(i);
-        out.push(block.slice(i, close + run));
+        out.push(gap.slice(i, close + run));
         i = close + run;
         proseStart = i;
         continue;
@@ -636,17 +823,20 @@ function rewriteProseBlock(
       continue;
     }
 
-    // Potential markdown link `[...](...)` or image `![...](...)`
-    if (ch === "[" || (ch === "!" && i + 1 < block.length && block[i + 1] === "[")) {
+    // Spaced-destination markdown link/image fallback
+    if (
+      ch === "[" ||
+      (ch === "!" && i + 1 < gap.length && gap[i + 1] === "[")
+    ) {
       if (currentLineEnd < i) {
-        const nl = block.indexOf("\n", i);
-        currentLineEnd = nl === -1 ? block.length : nl;
+        const nl = gap.indexOf("\n", i);
+        currentLineEnd = nl === -1 ? gap.length : nl;
       }
       if (nextCloseBracket < i) {
-        nextCloseBracket = block.indexOf("]", i);
+        nextCloseBracket = gap.indexOf("]", i);
       }
       if (nextCloseBracket !== -1 && nextCloseBracket < currentLineEnd) {
-        const parsed = parseMarkdownLinkAt(block, i, currentLineEnd);
+        const parsed = parseSpacedMarkdownLinkAt(gap, i, currentLineEnd);
         if (parsed) {
           const classified = classifyLinkDestination(parsed.dest);
           flushProse(i);
@@ -656,14 +846,13 @@ function rewriteProseBlock(
             out.push(
               formatWorkspaceFileLink(
                 parsed.label,
-                classified.relPath,
-                classified.workspaceId,
+                classified,
                 publicWebBaseUrl,
                 normalizedThreadId,
               ),
             );
           } else {
-            out.push(block.slice(i, parsed.end));
+            out.push(gap.slice(i, parsed.end));
           }
           i = parsed.end;
           proseStart = i;
@@ -675,8 +864,84 @@ function rewriteProseBlock(
     i += 1;
   }
 
-  flushProse(block.length);
+  flushProse(gap.length);
   return out.join("");
+}
+
+function getNodeOffsets(node: MdastNode): { start: number; end: number } | null {
+  const start = node.position?.start?.offset;
+  const end = node.position?.end?.offset;
+  if (typeof start !== "number" || typeof end !== "number" || end <= start) {
+    return null;
+  }
+  return { start, end };
+}
+
+function extractRawBracketLabel(
+  text: string,
+  start: number,
+  end: number,
+  isImage: boolean,
+): { label: string; bracketClose: number } | null {
+  const bracketOpen = isImage ? start + 1 : start;
+  if (bracketOpen >= end || text[bracketOpen] !== "[") {
+    return null;
+  }
+  const close = findMatchingBracketClose(text, bracketOpen, end);
+  if (close === -1) {
+    return null;
+  }
+  return {
+    label: text.slice(bracketOpen + 1, close),
+    bracketClose: close,
+  };
+}
+
+function formatDefinitionTitle(title: string | null): string {
+  if (!title) return "";
+  const escaped = title.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+  return ` "${escaped}"`;
+}
+
+function expandRemovedDefinitionBounds(
+  text: string,
+  start: number,
+  end: number,
+): { start: number; end: number } {
+  const atLineStart = start === 0 || text[start - 1] === "\n";
+  if (atLineStart) {
+    if (text.startsWith("\r\n", end)) {
+      return { start, end: end + 2 };
+    }
+    if (text[end] === "\n") {
+      return { start, end: end + 1 };
+    }
+    if (end === text.length && start > 0) {
+      if (start >= 2 && text[start - 2] === "\r" && text[start - 1] === "\n") {
+        return { start: start - 2, end };
+      }
+      if (text[start - 1] === "\n") {
+        return { start: start - 1, end };
+      }
+    }
+  }
+  return { start, end };
+}
+
+function hasRewriteableSandboxImageDescendant(node: MdastNode): boolean {
+  if (!Array.isArray(node.children)) return false;
+  for (const child of node.children) {
+    if (child.type === "image" && typeof child.url === "string") {
+      const cls = classifyLinkDestination(child.url);
+      if (cls.kind === "workspace_file" || cls.kind === "local_preview") {
+        return true;
+      }
+    }
+    if (hasRewriteableSandboxImageDescendant(child)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -691,14 +956,434 @@ export function rewriteSandboxLinks(
   if (!text || typeof text !== "string") {
     return text;
   }
+  // Fast path: no URL/path punctuation at all (also short-circuits pathological bracket runs).
+  if (!text.includes("/") && !text.includes(":") && !text.includes(".")) {
+    return text;
+  }
+
   const publicWebBaseUrl = normalizePublicWebBaseUrl(webBaseUrl);
   const normalizedThreadId = (threadId ?? "").trim() || null;
 
-  return splitFences(text)
-    .map((span) =>
-      span.code
-        ? span.text
-        : rewriteProseBlock(span.text, publicWebBaseUrl, normalizedThreadId),
-    )
-    .join("");
+  const tree = fromMarkdown(text, {
+    extensions: MARKDOWN_EXTENSIONS,
+    mdastExtensions: MDAST_EXTENSIONS,
+  }) as unknown as MdastNode;
+
+  // Pass 1: collect all reference link definitions and count their references.
+  const definitionsById = new Map<string, DefinitionInfo>();
+  const collectDefinitions = (node: MdastNode): void => {
+    if (node.type === "code" || node.type === "inlineCode") {
+      return;
+    }
+    if (node.type === "definition") {
+      const offsets = getNodeOffsets(node);
+      const id = (node.identifier ?? "").toLowerCase();
+      if (offsets && id && !definitionsById.has(id)) {
+        const extracted = extractRawBracketLabel(
+          text,
+          offsets.start,
+          offsets.end,
+          false,
+        );
+        const url = typeof node.url === "string" ? node.url : "";
+        definitionsById.set(id, {
+          start: offsets.start,
+          end: offsets.end,
+          identifier: id,
+          rawLabel: extracted?.label ?? node.label ?? id,
+          url,
+          title: typeof node.title === "string" ? node.title : null,
+          classification: classifyLinkDestination(url),
+          referencedCount: 0,
+        });
+      }
+      return;
+    }
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) {
+        collectDefinitions(child);
+      }
+    }
+  };
+  collectDefinitions(tree);
+
+  if (definitionsById.size > 0) {
+    const countRefs = (node: MdastNode): void => {
+      if (node.type === "code" || node.type === "inlineCode") {
+        return;
+      }
+      if (node.type === "linkReference" || node.type === "imageReference") {
+        const id = (node.identifier ?? "").toLowerCase();
+        const def = definitionsById.get(id);
+        if (def) {
+          def.referencedCount += 1;
+        }
+      }
+      if (Array.isArray(node.children)) {
+        for (const child of node.children) {
+          countRefs(child);
+        }
+      }
+    };
+    countRefs(tree);
+  }
+
+  // Pass 2: walk AST top-down and record non-overlapping edits and protected ranges.
+  const actions: TextSegmentAction[] = [];
+
+  const visit = (node: MdastNode, insideOuterLink: boolean): void => {
+    const offsets = getNodeOffsets(node);
+
+    if (node.type === "code") {
+      if (offsets) {
+        actions.push({ start: offsets.start, end: offsets.end, kind: "protect" });
+      }
+      return;
+    }
+
+    if (node.type === "inlineCode") {
+      if (offsets) {
+        // Leave `[` + inlineCode + `](` uncovered so the spaced-destination link
+        // fallback can rewrite links like `[`Q3 报告.md`](/home/workspace/Q3 报告.md)`.
+        const isSpacedLinkLabel =
+          offsets.start > 0 &&
+          text[offsets.start - 1] === "[" &&
+          text[offsets.end] === "]" &&
+          text[offsets.end + 1] === "(";
+        if (!isSpacedLinkLabel) {
+          actions.push({ start: offsets.start, end: offsets.end, kind: "protect" });
+        }
+      }
+      return;
+    }
+
+    if (node.type === "definition") {
+      if (!offsets) return;
+      const id = (node.identifier ?? "").toLowerCase();
+      const info = definitionsById.get(id);
+      if (!info || info.start !== offsets.start) {
+        actions.push({ start: offsets.start, end: offsets.end, kind: "protect" });
+        return;
+      }
+      if (info.classification.kind === "keep") {
+        actions.push({ start: offsets.start, end: offsets.end, kind: "protect" });
+        return;
+      }
+      if (info.classification.kind === "workspace_file") {
+        if (publicWebBaseUrl && normalizedThreadId) {
+          const deepUrl = buildDeepLinkUrl(
+            info.classification,
+            publicWebBaseUrl,
+            normalizedThreadId,
+          );
+          actions.push({
+            start: offsets.start,
+            end: offsets.end,
+            kind: "edit",
+            replacement: `[${info.rawLabel}]: ${deepUrl}${formatDefinitionTitle(info.title)}`,
+          });
+        } else if (info.referencedCount > 0) {
+          const bounds = expandRemovedDefinitionBounds(
+            text,
+            offsets.start,
+            offsets.end,
+          );
+          actions.push({
+            start: bounds.start,
+            end: bounds.end,
+            kind: "edit",
+            replacement: "",
+            clampToCursor: true,
+          });
+        } else {
+          actions.push({
+            start: offsets.start,
+            end: offsets.end,
+            kind: "edit",
+            replacement: `${info.rawLabel}（在网页工作区查看：${info.classification.displayPath}）`,
+          });
+        }
+        return;
+      }
+      // local_preview definition
+      if (info.referencedCount > 0) {
+        const bounds = expandRemovedDefinitionBounds(
+          text,
+          offsets.start,
+          offsets.end,
+        );
+        actions.push({
+          start: bounds.start,
+          end: bounds.end,
+          kind: "edit",
+          replacement: "",
+          clampToCursor: true,
+        });
+      } else {
+        actions.push({
+          start: offsets.start,
+          end: offsets.end,
+          kind: "edit",
+          replacement: neutralizeLocalUrl(info.url),
+        });
+      }
+      return;
+    }
+
+    if (node.type === "linkReference" || node.type === "imageReference") {
+      if (!offsets) return;
+      const isImage = node.type === "imageReference";
+      const id = (node.identifier ?? "").toLowerCase();
+      const info = definitionsById.get(id);
+      if (!info || info.classification.kind === "keep") {
+        if (!isImage && hasRewriteableSandboxImageDescendant(node)) {
+          const extracted = extractRawBracketLabel(
+            text,
+            offsets.start,
+            offsets.end,
+            false,
+          );
+          if (Array.isArray(node.children)) {
+            for (const child of node.children) {
+              visit(child, true);
+            }
+          }
+          if (extracted) {
+            actions.push({
+              start: extracted.bracketClose,
+              end: offsets.end,
+              kind: "protect",
+            });
+          }
+          return;
+        }
+        actions.push({ start: offsets.start, end: offsets.end, kind: "protect" });
+        return;
+      }
+      const extracted = extractRawBracketLabel(
+        text,
+        offsets.start,
+        offsets.end,
+        isImage,
+      );
+      const refLabel = extracted?.label ?? node.alt ?? node.label ?? "";
+      if (info.classification.kind === "workspace_file") {
+        if (publicWebBaseUrl && normalizedThreadId) {
+          if (isImage) {
+            // Convert `![alt][id]` -> `[alt][id]` so it renders as a clickable link reference
+            actions.push({
+              start: offsets.start,
+              end: offsets.end,
+              kind: "edit",
+              replacement: text.slice(offsets.start + 1, offsets.end),
+            });
+          } else {
+            actions.push({ start: offsets.start, end: offsets.end, kind: "protect" });
+          }
+        } else {
+          actions.push({
+            start: offsets.start,
+            end: offsets.end,
+            kind: "edit",
+            replacement: formatWorkspaceFileLink(
+              refLabel,
+              info.classification,
+              null,
+              null,
+            ),
+          });
+        }
+        return;
+      }
+      // local_preview reference
+      actions.push({
+        start: offsets.start,
+        end: offsets.end,
+        kind: "edit",
+        replacement: refLabel,
+      });
+      return;
+    }
+
+    if (node.type === "link") {
+      if (!offsets) return;
+      const url = typeof node.url === "string" ? node.url : "";
+      const classification = classifyLinkDestination(url);
+      const isAutolink =
+        text[offsets.start] === "<" && text[offsets.end - 1] === ">";
+
+      if (classification.kind === "local_preview") {
+        if (isAutolink) {
+          actions.push({
+            start: offsets.start,
+            end: offsets.end,
+            kind: "edit",
+            replacement: neutralizeLocalUrl(url),
+          });
+        } else {
+          const extracted = extractRawBracketLabel(
+            text,
+            offsets.start,
+            offsets.end,
+            false,
+          );
+          actions.push({
+            start: offsets.start,
+            end: offsets.end,
+            kind: "edit",
+            replacement: extracted?.label ?? "",
+          });
+        }
+        return;
+      }
+
+      if (classification.kind === "workspace_file") {
+        const extracted = isAutolink
+          ? null
+          : extractRawBracketLabel(text, offsets.start, offsets.end, false);
+        const label = extracted?.label ?? "";
+        actions.push({
+          start: offsets.start,
+          end: offsets.end,
+          kind: "edit",
+          replacement: formatWorkspaceFileLink(
+            label,
+            classification,
+            publicWebBaseUrl,
+            normalizedThreadId,
+          ),
+        });
+        return;
+      }
+
+      // External / kept link: check for nested sandbox images such as `[![chart](/home/workspace/fig.png)](https://...)`
+      if (!isAutolink && hasRewriteableSandboxImageDescendant(node)) {
+        const extracted = extractRawBracketLabel(
+          text,
+          offsets.start,
+          offsets.end,
+          false,
+        );
+        if (Array.isArray(node.children)) {
+          for (const child of node.children) {
+            visit(child, true);
+          }
+        }
+        if (extracted) {
+          actions.push({
+            start: extracted.bracketClose,
+            end: offsets.end,
+            kind: "protect",
+          });
+        }
+        return;
+      }
+
+      actions.push({ start: offsets.start, end: offsets.end, kind: "protect" });
+      return;
+    }
+
+    if (node.type === "image") {
+      if (!offsets) return;
+      const url = typeof node.url === "string" ? node.url : "";
+      const classification = classifyLinkDestination(url);
+      if (classification.kind === "keep") {
+        actions.push({ start: offsets.start, end: offsets.end, kind: "protect" });
+        return;
+      }
+      const extracted = extractRawBracketLabel(
+        text,
+        offsets.start,
+        offsets.end,
+        true,
+      );
+      const label = extracted?.label ?? node.alt ?? "";
+      if (classification.kind === "local_preview") {
+        actions.push({
+          start: offsets.start,
+          end: offsets.end,
+          kind: "edit",
+          replacement: label,
+        });
+        return;
+      }
+      if (insideOuterLink) {
+        // Cannot nest `[a](u1)` inside `[...](u2)`; keep alt text (or path) cleanly.
+        actions.push({
+          start: offsets.start,
+          end: offsets.end,
+          kind: "edit",
+          replacement: label || classification.displayPath,
+        });
+        return;
+      }
+      actions.push({
+        start: offsets.start,
+        end: offsets.end,
+        kind: "edit",
+        replacement: formatWorkspaceFileLink(
+          label,
+          classification,
+          publicWebBaseUrl,
+          normalizedThreadId,
+        ),
+      });
+      return;
+    }
+
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) {
+        visit(child, insideOuterLink);
+      }
+    }
+  };
+
+  visit(tree, false);
+
+  actions.sort((a, b) => a.start - b.start || b.end - a.end);
+
+  // Pass 3: assemble final string, running spaced-link & bare-prose passes only on gaps.
+  const out: string[] = [];
+  let cursor = 0;
+
+  for (const action of actions) {
+    if (action.start < cursor) {
+      if (action.clampToCursor && action.end > cursor) {
+        if (action.kind === "edit") {
+          out.push(action.replacement ?? "");
+        } else {
+          out.push(text.slice(cursor, action.end));
+        }
+        cursor = action.end;
+      }
+      continue;
+    }
+    if (action.start > cursor) {
+      out.push(
+        rewriteUnprotectedGap(
+          text.slice(cursor, action.start),
+          publicWebBaseUrl,
+          normalizedThreadId,
+        ),
+      );
+    }
+    if (action.kind === "edit") {
+      out.push(action.replacement ?? "");
+    } else {
+      out.push(text.slice(action.start, action.end));
+    }
+    cursor = action.end;
+  }
+
+  if (cursor < text.length) {
+    out.push(
+      rewriteUnprotectedGap(
+        text.slice(cursor),
+        publicWebBaseUrl,
+        normalizedThreadId,
+      ),
+    );
+  }
+
+  return out.join("");
 }

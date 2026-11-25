@@ -227,12 +227,25 @@ function CallbackRoute() {
  * it left with stands in. Read once: `App` clears that note once signed in.
  */
 function RootRedirect() {
-  const [redirectTo] = useState(() =>
-    inAppPath(new URLSearchParams(window.location.search).get('redirect') ?? hostedSignInReturn())
-  );
+  // DALTON-HOOK(channel-links): read router search and navigate inside SPA so post-login redirect restores deep links (?file=...)
+  const { search } = useLocation();
+  const [redirectTo] = useState(() => {
+    const raw =
+      new URLSearchParams(search).get('redirect') ??
+      new URLSearchParams(window.location.search).get('redirect') ??
+      hostedSignInReturn();
+    const safe = inAppPath(raw);
+    if (!safe) return null;
+    try {
+      const parsed = new URL(safe, 'http://in-app.invalid');
+      if (parsed.pathname === APP_ENTRY_PATH) return null;
+    } catch {
+      return null;
+    }
+    return safe;
+  });
   if (redirectTo) {
-    window.location.href = redirectTo;
-    return null;
+    return <Navigate to={redirectTo} replace />;
   }
   return <Navigate to="/dashboard" replace />;
 }
@@ -468,8 +481,15 @@ function AppearanceSync() {
 
 function App() {
   const { isLoggedIn, isInitialized, userId, needsBootstrap } = useAuth(); // DALTON-HOOK(standalone-core): route unbootstrapped local deployments to /setup/admin
+  // DALTON-HOOK(channel-links): preserve validated in-app deep link (?redirect=) across login redirect
+  const location = useLocation();
+  const requestedPath = inAppPath(`${location.pathname}${location.search}${location.hash}`);
+  const loginEntryWithRedirect =
+    requestedPath && requestedPath !== APP_ENTRY_PATH
+      ? `${APP_ENTRY_PATH}?redirect=${encodeURIComponent(requestedPath)}`
+      : APP_ENTRY_PATH;
   const unauthenticatedTarget =
-    isDaltonLocalAuth && needsBootstrap ? '/setup/admin' : APP_ENTRY_PATH;
+    isDaltonLocalAuth && needsBootstrap ? '/setup/admin' : loginEntryWithRedirect;
 
   useEffect(() => setSentryUser(isLoggedIn ? userId : null), [isLoggedIn, userId]);
 

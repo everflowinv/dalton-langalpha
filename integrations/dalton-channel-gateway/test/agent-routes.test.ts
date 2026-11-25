@@ -452,7 +452,7 @@ describe("Nine `/agent/*` Endpoints & Permission Enforcement (§1.2.1 ~ §1.2.7,
     ].join("\n");
 
     const expectedPublic = [
-      `详见 [季报](https://app.ginlix.ai/chat/t/${THREAD_ID}?file=results%2FQ3%20%E6%8A%A5%E5%91%8A.md) 与 [外部](https://example.com/a)。`,
+      `详见 [季报](https://app.ginlix.ai/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2FQ3%20%E6%8A%A5%E5%91%8A.md) 与 [外部](https://example.com/a)。`,
       `跨区：[附图](https://app.ginlix.ai/chat/${WORKSPACE_ID}?file=charts%2Ffig.png)，预览：看板。`,
       "裸路径：data/raw.csv，代码：`/home/workspace/keep.py`。",
     ].join("\n");
