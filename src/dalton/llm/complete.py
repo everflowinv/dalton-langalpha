@@ -119,17 +119,14 @@ def resolve_model_billing_and_provider(model_key: str) -> tuple[str, str]:
     if not key:
         return "platform", "unknown"
 
-    if key.endswith("-oauth"):
-        return "oauth", _resolve_provider_for_model(key, "oauth")
+    from src.dalton.services.team_model_catalog.billing import resolve_model_billing
 
     try:
         meta = load_dalton_meta() or {}
-        m_meta = meta.get(key)
-        if isinstance(m_meta, dict) and m_meta.get("billing") == "subscription":
-            return "oauth", _resolve_provider_for_model(key, "oauth")
     except Exception:
-        pass
-
+        meta = {}
+    if resolve_model_billing(model_key=key, dalton_meta=meta) == "subscription":
+        return "oauth", _resolve_provider_for_model(key, "oauth")
     return "platform", _resolve_provider_for_model(key, "platform")
 
 
@@ -222,7 +219,7 @@ async def _resolve_model_pricing_identity(
     if not key:
         return billing_type, provider, None, None
 
-    from src.llms.pricing_utils import is_subscription_provider, resolve_pricing_identity
+    from src.llms.pricing_utils import resolve_pricing_identity
 
     if user_id:
         try:
@@ -258,16 +255,18 @@ async def _resolve_model_pricing_identity(
                     if parent_prov:
                         pricing_provider = parent_prov
 
+                from src.dalton.services.team_model_catalog.billing import resolve_model_billing
+
                 sub_route = llm_clients.subscription_route(key, mc, custom_entry=routed_entry)
                 if (
                     sub_route is not None
-                    or is_subscription_provider(provider=pricing_provider, model_config=mc)
-                    or _is_subscription_model(
-                        key,
-                        "",
-                        pricing_model_id=pricing_model_id,
-                        pricing_provider=pricing_provider,
+                    or resolve_model_billing(
+                        model_key=key,
+                        provider=pricing_provider,
+                        model_id=pricing_model_id,
+                        model_config=mc,
                     )
+                    == "subscription"
                 ):
                     resolved_billing = "oauth"
                 else:
@@ -1506,8 +1505,20 @@ async def _dalton_complete_impl(
             raise_on_error=raise_on_error,
         )
 
-    # 2. Budget admission check for cash models (`billing_type != 'oauth'`)
-    if billing_type != "oauth" and not skip_journal:
+    # 2. Budget admission check for cash models (unified via resolve_model_billing)
+    from src.dalton.services.team_model_catalog.billing import resolve_model_billing
+
+    is_subscription_call = (
+        billing_type == "oauth"
+        or resolve_model_billing(
+            model_key=effective_model,
+            provider=pricing_provider or (provider if provider != "unknown" else None),
+            model_id=pricing_model_id,
+            billing_type=billing_type,
+        )
+        == "subscription"
+    )
+    if not is_subscription_call and not skip_journal:
         try:
             admitted, err_kind, err_msg = await _check_cash_budget_admission(
                 eff_user_id,

@@ -4579,3 +4579,687 @@ class TestR5Fixes:
         assert "tool_calling" not in annotated["gpt-test"]
         assert annotated["explicit-false"]["tool_calling"] is False
         assert annotated["smoke-fail-model"]["tool_calling"] is False
+
+
+# ---------------------------------------------------------------------------
+# Batch 1 r6: mixed-route billing, subagent dict model, personal model shadow,
+# shared pricing preservation, and dalton_complete unified billing regressions
+# ---------------------------------------------------------------------------
+
+
+class TestR6Fixes:
+    """Regressions for Batch 1 r6 review findings."""
+
+    def test_r6_1_mixed_cash_and_subscription_on_same_route_rejected_and_legacy_mixed_uses_own_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.billing import resolve_model_billing
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.dalton.services.team_model_catalog.snapshot import (
+            bind_catalog_snapshot,
+            build_effective_catalog_snapshot,
+        )
+        from src.dalton.services.team_model_catalog.validation import (
+            trial_compile_and_validate_catalog,
+        )
+        from src.llms.llm import LLM as LLMFactory
+        from src.utils.tracking.core import calculate_cost_from_per_call_records
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        # 1) Adding a subscription model on the same (openai, gpt-test) route as existing cash model gpt-test is rejected (400)
+        mixed_payload = {
+            "schema": CATALOG_SCHEMA,
+            "models": {
+                "gpt-test-sub": {
+                    "model_id": "gpt-test",
+                    "provider": "openai",
+                    "display_name": "GPT Test Sub",
+                    "visible": True,
+                }
+            },
+            "dalton_meta": {
+                "gpt-test-sub": {
+                    "billing": "subscription",
+                    "tool_calling": True,
+                    "notional_pricing": {"input": 2.0, "output": 8.0, "cached_input": 0.2},
+                }
+            },
+        }
+        with pytest.raises(CatalogValidationError) as exc_info:
+            trial_compile_and_validate_catalog(mixed_payload, revision=70)
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.code == "mixed_route_billing_conflict"
+        assert "gpt-test" in str(exc_info.value)
+        assert "gpt-test-sub" in str(exc_info.value)
+
+        # 2) Legacy mixed data already in catalog: each model settles strictly by its OWN key
+        legacy_compiled = compile_catalog_from_payload(mixed_payload, revision=71)
+        cache_compiled_catalog(legacy_compiled)
+        orig_get_compiled = compiled_mod.get_compiled_catalog_sync
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_compiled, return_value=legacy_compiled),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", legacy_compiled.model_config)
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_dalton_meta",
+            lambda *a, **kw: legacy_compiled.dalton_meta,
+        )
+
+        assert (
+            resolve_model_billing(
+                model_key="gpt-test",
+                provider="openai",
+                model_id="gpt-test",
+                model_config=legacy_compiled.model_config,
+                dalton_meta=legacy_compiled.dalton_meta,
+            )
+            == "cash"
+        )
+        assert (
+            resolve_model_billing(
+                model_key="gpt-test-sub",
+                provider="openai",
+                model_id="gpt-test",
+                model_config=legacy_compiled.model_config,
+                dalton_meta=legacy_compiled.dalton_meta,
+            )
+            == "subscription"
+        )
+
+        # Snapshot containing BOTH mixed keys must still settle gpt-test as cash and gpt-test-sub as subscription
+        mixed_snap = build_effective_catalog_snapshot(
+            ["gpt-test", "gpt-test-sub"], compiled=legacy_compiled
+        )
+        cash_record = {
+            "model_name": "gpt-test",
+            "served_model": "gpt-test",
+            "pricing_model_id": "gpt-test",
+            "pricing_provider": "openai",
+            "billing_type": "platform",
+            "usage": {"input_tokens": 1_000_000, "output_tokens": 100_000, "cached_tokens": 0},
+        }
+        sub_record = {
+            "model_name": "gpt-test-sub",
+            "served_model": "gpt-test",
+            "pricing_model_id": "gpt-test",
+            "pricing_provider": "openai",
+            "billing_type": "platform",
+            "usage": {"input_tokens": 1_000_000, "output_tokens": 100_000, "cached_tokens": 0},
+        }
+
+        cash_live = calculate_cost_from_per_call_records([cash_record])
+        sub_live = calculate_cost_from_per_call_records([sub_record])
+        with bind_catalog_snapshot(mixed_snap):
+            cash_snap = calculate_cost_from_per_call_records([cash_record])
+            sub_snap = calculate_cost_from_per_call_records([sub_record])
+
+        assert cash_live["platform_cost"] > 0.0
+        assert cash_live["notional_cost"] == 0.0
+        assert cash_snap["platform_cost"] == pytest.approx(cash_live["platform_cost"])
+        assert cash_snap["notional_cost"] == 0.0
+        assert sub_live["platform_cost"] == 0.0
+        assert sub_live["notional_cost"] > 0.0
+        assert sub_snap["platform_cost"] == 0.0
+        assert sub_snap["notional_cost"] == pytest.approx(sub_live["notional_cost"])
+
+    def test_r6_2_subagent_own_config_dict_model_persists_snapshot_and_recovers_original_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.dalton.services.team_model_catalog.snapshot import (
+            _extract_candidate_models_from_run,
+            _extract_model_key_value,
+            build_effective_catalog_snapshot,
+            load_run_recovery_context,
+        )
+        from src.llms.llm import LLM as LLMFactory
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        payload = {
+            "schema": CATALOG_SCHEMA,
+            "providers": {
+                "provider_variants": {
+                    "openai": {
+                        "var-sub-a": {
+                            "parent_provider": "openai",
+                            "display_name": "Sub Var A",
+                            "sdk": "openai",
+                            "billing": "cash",
+                            "base_url": "https://sub-a.example.com/v1",
+                        }
+                    }
+                },
+                "models": {
+                    "var-sub-a": [
+                        {"id": "sub-a-id", "name": "Sub A", "pricing": {"input": 1.0, "output": 2.0}}
+                    ]
+                },
+            },
+            "models": {
+                "sub-model-a": {
+                    "model_id": "sub-a-id",
+                    "provider": "var-sub-a",
+                    "display_name": "Sub Model A",
+                    "visible": True,
+                }
+            },
+            "dalton_meta": {"sub-model-a": {"billing": "cash", "tool_calling": True}},
+        }
+        compiled = compile_catalog_from_payload(payload, revision=80)
+        cache_compiled_catalog(compiled)
+        orig_get_compiled = compiled_mod.get_compiled_catalog_sync
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_compiled, return_value=compiled),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", compiled.model_config)
+
+        # card_model produces dict {"id": "sub-model-a", "provider": "var-sub-a"} when Task() omits model
+        dict_model = {"id": "sub-model-a", "provider": "var-sub-a"}
+        assert _extract_model_key_value(dict_model) == "sub-model-a"
+
+        # 1) First-write snapshot extraction handles SubagentModel dict (model_override=None)
+        sub_models = [mk for raw_m in (None, dict_model) if (mk := _extract_model_key_value(raw_m))]
+        assert sub_models == ["sub-model-a"]
+        snap = build_effective_catalog_snapshot(
+            sub_models,
+            compiled=compiled,
+            variant_credentials={
+                "var-sub-a": {
+                    "bound_base_url": "https://sub-a.example.com/v1",
+                    "canonical_bound_url": "https://sub-a.example.com/v1",
+                    "key_fingerprint": "fp-sub-a",
+                }
+            },
+        )
+        assert "sub-model-a" in snap["models"]
+        assert snap["models"]["sub-model-a"]["key_fingerprint"] == "fp-sub-a"
+
+        # 2) Recovery context extracts model_key from replay_facts.model.id + carries fp-sub-a
+        row_with_snap = {
+            "task_run_id": "44444444-4444-4444-4444-444444444444",
+            "thread_id": "thread-r6-2",
+            "replay_facts": {
+                "model": dict_model,
+                "effective_catalog_snapshot": snap,
+            },
+        }
+        assert _extract_candidate_models_from_run(row_with_snap) == ["sub-model-a"]
+        ctx = asyncio.run(
+            load_run_recovery_context(
+                run_id="44444444-4444-4444-4444-444444444444",
+                is_subagent=True,
+                run_row=row_with_snap,
+                enforce_capabilities=True,
+            )
+        )
+        assert ctx is not None
+        assert ctx.model_key == "sub-model-a"
+        assert ctx.client_params is not None
+        assert ctx.client_params.provider == "var-sub-a"
+        assert ctx.client_params.key_fingerprint == "fp-sub-a"
+
+    def test_r6_3_recovery_bound_snapshot_ignores_newly_added_same_name_personal_custom_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.dalton.services.team_model_catalog.snapshot import (
+            bind_recovery_context,
+            build_effective_catalog_snapshot,
+            load_run_recovery_context,
+        )
+        from src.llms import llm as llm_mod
+        from src.llms.llm import LLM as LLMFactory
+        from src.server.services.llm import clients as llm_clients
+        from src.server.services.llm import user_models
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        payload = {
+            "schema": CATALOG_SCHEMA,
+            "providers": {
+                "provider_variants": {
+                    "openai": {
+                        "team-var-x": {
+                            "parent_provider": "openai",
+                            "display_name": "Team Var X",
+                            "sdk": "openai",
+                            "billing": "cash",
+                            "base_url": "https://team-x.example.com/v1",
+                        }
+                    }
+                },
+                "models": {
+                    "team-var-x": [
+                        {"id": "x-id", "name": "X", "pricing": {"input": 1.0, "output": 2.0}}
+                    ]
+                },
+            },
+            "models": {
+                "team-model-x": {
+                    "model_id": "x-id",
+                    "provider": "team-var-x",
+                    "display_name": "Team Model X",
+                    "visible": True,
+                }
+            },
+            "dalton_meta": {"team-model-x": {"billing": "cash", "tool_calling": True}},
+        }
+        compiled = compile_catalog_from_payload(payload, revision=90)
+        cache_compiled_catalog(compiled)
+        orig_get_compiled = compiled_mod.get_compiled_catalog_sync
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_compiled, return_value=compiled),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", compiled.model_config)
+
+        snap = build_effective_catalog_snapshot(
+            ["team-model-x"],
+            compiled=compiled,
+            variant_credentials={
+                "team-var-x": {
+                    "bound_base_url": "https://team-x.example.com/v1",
+                    "canonical_bound_url": "https://team-x.example.com/v1",
+                    "key_fingerprint": "fp-x",
+                }
+            },
+        )
+        row = {
+            "conversation_response_id": "55555555-5555-5555-5555-555555555555",
+            "conversation_thread_id": "thread-r6-3",
+            "metadata": {
+                "llm_model": "team-model-x",
+                "effective_catalog_snapshot": snap,
+            },
+        }
+        ctx = asyncio.run(
+            load_run_recovery_context(
+                run_id="55555555-5555-5555-5555-555555555555",
+                thread_id="thread-r6-3",
+                is_subagent=False,
+                run_row=row,
+                enforce_capabilities=True,
+            )
+        )
+        assert ctx is not None
+
+        # User adds a same-name personal custom_models entry pointing at a personal OpenAI route
+        pref_with_same_name_custom = {
+            "custom_models": [
+                {
+                    "name": "team-model-x",
+                    "model_id": "gpt-test",
+                    "provider": "openai",
+                    "display_name": "Personal Hijack",
+                }
+            ]
+        }
+
+        # Outside recovery, classify_model sees custom model; INSIDE recovery, team snapshot wins
+        src_normal, cfg_normal = asyncio.run(
+            user_models.classify_model(
+                "u-1", "team-model-x", _pref_cache=pref_with_same_name_custom
+            )
+        )
+        assert src_normal == user_models.ModelSource.CUSTOM
+        assert cfg_normal["provider"] == "openai"
+
+        seen_cred_slugs: list[str] = []
+        created_kwargs: list[dict[str, Any]] = []
+
+        async def _fake_get_cred(
+            slug: str, conn: Any = None, *, decrypt: bool = True
+        ) -> dict[str, Any]:
+            seen_cred_slugs.append(slug)
+            return {
+                "provider_slug": slug,
+                "api_key": "sk-team-x",
+                "bound_base_url": "https://team-x.example.com/v1",
+                "canonical_bound_url": "https://team-x.example.com/v1",
+                "key_fingerprint": "fp-x",
+            }
+
+        def _fake_create_llm(model: str, **kwargs: Any) -> Any:
+            created_kwargs.append({"model": model, **kwargs})
+            return SimpleNamespace(model=model, base_url=kwargs.get("base_url"))
+
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_provider_credential",
+            create_autospec(tmc_db.get_catalog_provider_credential, side_effect=_fake_get_cred),
+        )
+        orig_create_llm = llm_mod.create_llm
+        monkeypatch.setattr(
+            llm_mod,
+            "create_llm",
+            create_autospec(orig_create_llm, side_effect=_fake_create_llm),
+        )
+
+        with bind_recovery_context(ctx):
+            src_rec, cfg_rec = asyncio.run(
+                user_models.classify_model(
+                    "u-1", "team-model-x", _pref_cache=pref_with_same_name_custom
+                )
+            )
+            assert src_rec == user_models.ModelSource.SYSTEM
+            assert cfg_rec["provider"] == "team-var-x"
+
+            client = asyncio.run(
+                llm_clients.resolve_byok_llm_client(
+                    "u-1",
+                    "team-model-x",
+                    is_byok=True,
+                    _pref_cache=pref_with_same_name_custom,
+                )
+            )
+            assert client is not None
+            assert client.base_url == "https://team-x.example.com/v1"
+
+        assert seen_cred_slugs == ["team-var-x"]
+        assert len(created_kwargs) == 1
+        assert created_kwargs[0]["base_url"] == "https://team-x.example.com/v1"
+
+    def test_r6_4_clearing_subscription_pricing_preserves_shared_pricing_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import copy
+
+        from src.dalton.services.team_model_catalog import service as tmc_service
+        from src.dalton.services.team_model_catalog.service import update_catalog_model
+        from src.dalton.services.team_model_catalog.validation import CatalogModelUpsertInput
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        # Two subscription models sharing the same (sub-shared-var, shared-card-id) pricing card & override
+        db_state = {
+            "revision": 10,
+            "payload": {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "provider_variants": {
+                        "openai": {
+                            "sub-shared-var": {
+                                "parent_provider": "openai",
+                                "display_name": "Shared Sub Var",
+                                "sdk": "openai",
+                                "billing": "subscription",
+                                "base_url": "https://sub-shared.example.com/v1",
+                            }
+                        }
+                    },
+                    "models": {
+                        "sub-shared-var": [
+                            {
+                                "id": "shared-card-id",
+                                "name": "Shared Card",
+                                "pricing": {"input": 5.0, "output": 15.0},
+                            }
+                        ]
+                    },
+                    "model_overrides": {
+                        "sub-shared-var": {
+                            "shared-card-id": {"pricing": {"input": 6.0, "output": 18.0}}
+                        }
+                    },
+                },
+                "models": {
+                    "sub-model-1": {
+                        "model_id": "shared-card-id",
+                        "provider": "sub-shared-var",
+                        "display_name": "Sub Model 1",
+                        "visible": True,
+                    },
+                    "sub-model-2": {
+                        "model_id": "shared-card-id",
+                        "provider": "sub-shared-var",
+                        "display_name": "Sub Model 2",
+                        "visible": True,
+                    },
+                },
+                "dalton_meta": {
+                    "sub-model-1": {
+                        "billing": "subscription",
+                        "tool_calling": True,
+                        "notional_pricing": {"input": 5.0, "output": 15.0},
+                    },
+                    "sub-model-2": {
+                        "billing": "subscription",
+                        "tool_calling": True,
+                        "notional_pricing": {"input": 5.0, "output": 15.0},
+                    },
+                },
+            },
+            "payload_sha256": "sha10",
+            "legacy_sync_import_status": "not_applicable",
+            "last_known_legacy_retired": [],
+        }
+
+        class _FakeConn:
+            @asynccontextmanager
+            async def transaction(self):
+                yield
+
+        @asynccontextmanager
+        async def _fake_get_db(_conn=None):
+            yield _FakeConn()
+
+        async def _fake_get_row(conn: Any = None, *, for_update: bool = False) -> dict[str, Any]:
+            return copy.deepcopy(db_state)
+
+        async def _fake_save(
+            conn: Any,
+            *,
+            expected_revision: int,
+            action: str,
+            target_keys: list[str],
+            payload: dict[str, Any],
+            diff_summary: dict[str, Any],
+            side_effects: list[dict[str, Any]],
+            actor_user_id: str,
+            comment: str | None = None,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            db_state["revision"] = expected_revision + 1
+            db_state["payload"] = copy.deepcopy(payload)
+            return {
+                "catalog": {"revision": db_state["revision"]},
+                "revision_record": {"revision": db_state["revision"], "action": action},
+            }
+
+        monkeypatch.setattr(tmc_service, "get_db_connection", _fake_get_db)
+        monkeypatch.setattr(
+            tmc_service,
+            "acquire_catalog_exclusive_lock",
+            create_autospec(tmc_service.acquire_catalog_exclusive_lock),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "get_catalog_row",
+            create_autospec(tmc_service.get_catalog_row, side_effect=_fake_get_row),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "save_catalog_revision",
+            create_autospec(tmc_service.save_catalog_revision, side_effect=_fake_save),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "publish_catalog_changed",
+            create_autospec(tmc_service.publish_catalog_changed),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "invalidate_catalog_redis_caches",
+            create_autospec(tmc_service.invalidate_catalog_redis_caches),
+        )
+
+        # Clearing pricing=None on sub-model-1 must NOT delete the shared pricing card or its override
+        res = asyncio.run(
+            update_catalog_model(
+                actor_user_id="admin-1",
+                model_key="sub-model-1",
+                data=CatalogModelUpsertInput(pricing=None, expected_revision=10),
+            )
+        )
+        assert res["revision"] == 11
+        saved_provs = db_state["payload"]["providers"]
+        assert len(saved_provs["models"]["sub-shared-var"]) == 1
+        assert saved_provs["model_overrides"]["sub-shared-var"]["shared-card-id"] == {
+            "pricing": {"input": 6.0, "output": 18.0}
+        }
+
+    def test_r6_5_dalton_complete_provider_level_subscription_skips_cash_budget_check(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.llm import complete as complete_mod
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.llms.llm import LLM as LLMFactory
+        from src.server.services.llm import user_models
+
+        orig_get_pref = user_models.get_model_preference
+        monkeypatch.setattr(
+            user_models,
+            "get_model_preference",
+            create_autospec(orig_get_pref, return_value={}),
+        )
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        # Provider-level billing="subscription", model_key has NO -oauth suffix and NO dalton_meta.billing
+        payload = {
+            "schema": CATALOG_SCHEMA,
+            "providers": {
+                "provider_variants": {
+                    "openai": {
+                        "corp-sub-var": {
+                            "parent_provider": "openai",
+                            "display_name": "Corp Sub Variant",
+                            "sdk": "openai",
+                            "billing": "subscription",
+                            "base_url": "https://corp-sub.example.com/v1",
+                        }
+                    }
+                }
+            },
+            "models": {
+                "corp-sub-plain-key": {
+                    "model_id": "corp-sub-1",
+                    "provider": "corp-sub-var",
+                    "display_name": "Corp Sub Plain",
+                    "visible": True,
+                }
+            },
+            "dalton_meta": {
+                "corp-sub-plain-key": {
+                    "tool_calling": True,
+                    "notional_pricing": {"input": 2.0, "output": 8.0},
+                }
+            },
+        }
+        compiled = compile_catalog_from_payload(payload, revision=95)
+        cache_compiled_catalog(compiled)
+        orig_get_compiled = compiled_mod.get_compiled_catalog_sync
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_compiled, return_value=compiled),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", compiled.model_config)
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_dalton_meta",
+            lambda *a, **kw: compiled.dalton_meta,
+        )
+
+        b_type, prov = complete_mod.resolve_model_billing_and_provider("corp-sub-plain-key")
+        assert b_type == "oauth"
+        assert prov == "corp-sub-var"
+
+        # Even if cash budget is exhausted, dalton_complete skips _check_cash_budget_admission
+        orig_budget_check = complete_mod._check_cash_budget_admission
+        budget_mock = create_autospec(
+            orig_budget_check,
+            return_value=(False, "budget_exhausted", "今日现金额度已用完"),
+        )
+        monkeypatch.setattr(complete_mod, "_check_cash_budget_admission", budget_mock)
+        orig_inspect = complete_mod.inspect_journal_state
+        monkeypatch.setattr(
+            complete_mod,
+            "inspect_journal_state",
+            create_autospec(orig_inspect, return_value=("proceed", None)),
+        )
+        orig_claim = complete_mod.claim_journal_invocation
+        monkeypatch.setattr(
+            complete_mod,
+            "claim_journal_invocation",
+            create_autospec(orig_claim, return_value=("in_flight", {"attempt": 1})),
+        )
+
+        res = asyncio.run(
+            complete_mod.dalton_complete(
+                user_id="u-1",
+                purpose="test_sub_budget",
+                user_prompt="ping",
+                model="corp-sub-plain-key",
+            )
+        )
+        assert budget_mock.call_count == 0
+        assert res.status != "budget_exhausted"

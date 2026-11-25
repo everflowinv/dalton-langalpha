@@ -616,4 +616,51 @@ def trial_compile_and_validate_catalog(
             extra={"conflicts": conflicts},
         )
 
+    # Disallow mixing cash and subscription models on the same (provider, norm_id(model_id)) route.
+    from src.dalton.services.team_model_catalog.billing import resolve_model_billing
+
+    route_groups: dict[tuple[str, str], dict[str, list[str]]] = {}
+    for key, entry in (mc.llm_config or {}).items():
+        if not isinstance(entry, Mapping):
+            continue
+        prov = str(entry.get("provider") or "").strip()
+        mid = str(entry.get("model_id") or key).strip()
+        if not prov or not mid:
+            continue
+        b_kind = resolve_model_billing(
+            model_key=str(key),
+            provider=prov,
+            model_id=mid,
+            model_config=mc,
+            provider_info=mc.get_provider_info(prov),
+            dalton_meta=compiled.dalton_meta,
+            dalton_meta_entry=compiled.dalton_meta.get(str(key)),
+        )
+        route_groups.setdefault((prov.lower(), norm_id(mid)), {"cash": [], "subscription": []})[
+            b_kind
+        ].append(str(key))
+
+    mixed_conflicts: list[dict[str, Any]] = []
+    for (prov_low, mid_norm), bucket in route_groups.items():
+        if bucket["cash"] and bucket["subscription"]:
+            mixed_conflicts.append(
+                {
+                    "provider": prov_low,
+                    "normalized_model_id": mid_norm,
+                    "cash_models": sorted(bucket["cash"]),
+                    "subscription_models": sorted(bucket["subscription"]),
+                }
+            )
+    if mixed_conflicts:
+        summary = "; ".join(
+            f"{c['provider']}/{c['normalized_model_id']}: cash={c['cash_models']} vs "
+            f"subscription={c['subscription_models']}"
+            for c in mixed_conflicts
+        )
+        raise CatalogValidationError(
+            "mixed_route_billing_conflict",
+            f"Cannot mix cash and subscription models on the same (provider, model_id) route: {summary}",
+            extra={"conflicts": mixed_conflicts},
+        )
+
     return compiled

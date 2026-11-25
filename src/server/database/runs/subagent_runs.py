@@ -241,13 +241,14 @@ async def start_task_run(
                 elif "effective_catalog_snapshot" not in facts:
                     try:
                         from src.dalton.services.team_model_catalog.snapshot import (
+                            _extract_model_key_value,
                             build_effective_catalog_snapshot,
                         )
 
                         sub_models = [
-                            str(m).strip()
-                            for m in (model_override, model)
-                            if isinstance(m, str) and m.strip()
+                            mk
+                            for raw_m in (model_override, model)
+                            if (mk := _extract_model_key_value(raw_m))
                         ]
                         if sub_models:
                             snap = build_effective_catalog_snapshot(sub_models)

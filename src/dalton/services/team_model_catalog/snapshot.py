@@ -356,6 +356,17 @@ def extract_snapshot_client_params(
     )
 
 
+def _extract_model_key_value(val: Any) -> str | None:
+    """Extract a model key string from either a scalar key or a ``SubagentModel`` dict ``{"id": ...}``."""
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    if isinstance(val, Mapping):
+        inner = val.get("id")
+        if isinstance(inner, str) and inner.strip():
+            return inner.strip()
+    return None
+
+
 def _extract_primary_model_key_from_run(
     run_row: Mapping[str, Any],
     *,
@@ -372,13 +383,13 @@ def _extract_primary_model_key_from_run(
     )
     if isinstance(container, Mapping):
         for fname in field_order:
-            val = container.get(fname)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
+            extracted = _extract_model_key_value(container.get(fname))
+            if extracted:
+                return extracted
     for fname in field_order:
-        val = run_row.get(fname)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
+        extracted = _extract_model_key_value(run_row.get(fname))
+        if extracted:
+            return extracted
     if isinstance(snapshot, Mapping):
         models = snapshot.get("models")
         if isinstance(models, Mapping) and len(models) == 1:
@@ -705,6 +716,7 @@ def build_effective_catalog_snapshot(
 
     models_out: dict[str, dict[str, Any]] = {}
     by_identity: dict[str, dict[str, Any]] = {}
+    ambiguous_identities: set[str] = set()
     variants_out: dict[str, dict[str, Any]] = {}
 
     unique_keys = [str(k).strip() for k in model_keys if str(k or "").strip()]
@@ -814,7 +826,8 @@ def build_effective_catalog_snapshot(
 
         models_out[key] = snap_entry
         if provider and model_id:
-            by_identity[_identity_key(provider, model_id)] = {
+            id_key = _identity_key(provider, model_id)
+            id_record = {
                 "model_key": key,
                 "provider": provider,
                 "model_id": model_id,
@@ -822,6 +835,15 @@ def build_effective_catalog_snapshot(
                 "pricing": cash_card,
                 "notional_card": notional_card,
             }
+            if id_key in ambiguous_identities:
+                pass
+            elif id_key in by_identity and by_identity[id_key].get("billing") != billing:
+                # Two entries with conflicting billing on the same (provider, model_id): drop
+                # from unkeyed by_identity so callers must match their own model_key in models.
+                by_identity.pop(id_key, None)
+                ambiguous_identities.add(id_key)
+            else:
+                by_identity[id_key] = id_record
 
     return {
         "schema": TURN_SNAPSHOT_SCHEMA,
@@ -859,8 +881,21 @@ def _find_snapshot_entry(
 ) -> Mapping[str, Any] | None:
     if not isinstance(snapshot, Mapping):
         return None
-    by_identity = snapshot.get("by_identity")
     want_id = model_id or model_name
+    models = snapshot.get("models")
+    # 1) Always match the caller's own model_key first (so legacy mixed-billing snapshots never
+    # let a sibling entry on the same (provider, model_id) override the caller's own key).
+    if isinstance(models, Mapping):
+        if model_name and isinstance(models.get(model_name), Mapping):
+            cand = models[model_name]
+            if _entry_matches_request(cand, provider=provider, model_id=model_id):
+                return cand
+        if model_id and isinstance(models.get(model_id), Mapping):
+            cand = models[model_id]
+            if _entry_matches_request(cand, provider=provider, model_id=model_id):
+                return cand
+    # 2) Unkeyed / alias fallback via by_identity, then unambiguous route scan in models.
+    by_identity = snapshot.get("by_identity")
     if provider and want_id and isinstance(by_identity, Mapping):
         for key_candidate in (
             _identity_key(provider, want_id),
@@ -872,22 +907,17 @@ def _find_snapshot_entry(
                 hit, provider=provider, model_id=want_id
             ):
                 return hit
-    models = snapshot.get("models")
-    if isinstance(models, Mapping):
-        if model_name and isinstance(models.get(model_name), Mapping):
-            cand = models[model_name]
-            if _entry_matches_request(cand, provider=provider, model_id=model_id):
-                return cand
-        if model_id and isinstance(models.get(model_id), Mapping):
-            cand = models[model_id]
-            if _entry_matches_request(cand, provider=provider, model_id=model_id):
-                return cand
-        if provider and want_id:
-            for item in models.values():
-                if isinstance(item, Mapping) and _entry_matches_request(
-                    item, provider=provider, model_id=want_id
-                ):
-                    return item
+    if isinstance(models, Mapping) and provider and want_id:
+        matches = [
+            item
+            for item in models.values()
+            if isinstance(item, Mapping)
+            and _entry_matches_request(item, provider=provider, model_id=want_id)
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if matches and len({str(m.get("billing") or "") for m in matches}) == 1:
+            return matches[0]
     return None
 
 
@@ -1198,18 +1228,18 @@ def _extract_candidate_models_from_run(
         if not isinstance(container, Mapping):
             continue
         for field_name in ("model", "llm_model", "model_override", "main_model"):
-            val = container.get(field_name)
-            if isinstance(val, str) and val.strip():
-                keys.append(val.strip())
+            extracted = _extract_model_key_value(container.get(field_name))
+            if extracted:
+                keys.append(extracted)
         fallbacks = container.get("fallback_models")
         if isinstance(fallbacks, list):
             for fb in fallbacks:
                 if isinstance(fb, str) and fb.strip():
                     keys.append(fb.strip())
     for field_name in ("model", "llm_model"):
-        val = run_row.get(field_name)
-        if isinstance(val, str) and val.strip():
-            keys.append(val.strip())
+        extracted = _extract_model_key_value(run_row.get(field_name))
+        if extracted:
+            keys.append(extracted)
     return list(dict.fromkeys(keys))
 
 

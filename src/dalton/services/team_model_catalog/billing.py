@@ -207,40 +207,70 @@ def resolve_model_billing(
         except Exception:
             meta_map = {}
 
+    # 1) When the caller's own model_key matched a catalog entry on this route, decide strictly
+    # from that key's own dalton_meta (never letting another key on the same (provider, model_id)
+    # route override a cash model to subscription, even on legacy mixed data).
+    if mk_is_authoritative and mk_entry is not None:
+        for cand in (matched_mk, mk):
+            if not cand:
+                continue
+            dm = meta_map.get(cand)
+            if not isinstance(dm, Mapping):
+                continue
+            dm_billing = str(dm.get("billing") or "").strip().lower()
+            if dm_billing == "subscription":
+                return "subscription"
+            if dm_billing == "cash":
+                return "cash"
+        if _is_oauth_name(mk) or _is_oauth_name(mid):
+            return "subscription"
+        return "cash"
+
     route_keys = (
         _find_matching_keys_by_route(llm_cfg, provider=eff_prov, model_id=mid)
         if eff_prov and mid
         else []
     )
-    candidate_meta_keys: list[str] = []
-    if mk_is_authoritative:
-        for cand in (matched_mk, mk):
-            if cand and cand not in candidate_meta_keys:
-                candidate_meta_keys.append(cand)
-    elif mk_entry is None and mk and not route_keys and mk in meta_map:
-        # Model key is absent from current llm_cfg (e.g. retired mid-flight before settlement)
-        # and (eff_prov, mid) does not conflict with another catalog route: honor its explicit
-        # dalton_meta entry so subscription billing still matches the run snapshot.
-        candidate_meta_keys.append(mk)
-    for route_key in route_keys:
-        if route_key not in candidate_meta_keys:
-            candidate_meta_keys.append(route_key)
-    if mid and not mk and not eff_prov:
-        if mid not in candidate_meta_keys:
-            candidate_meta_keys.append(mid)
 
-    saw_cash = False
-    for cand in candidate_meta_keys:
-        dm = meta_map.get(cand)
-        if not isinstance(dm, Mapping):
-            continue
-        dm_billing = str(dm.get("billing") or "").strip().lower()
-        if dm_billing == "subscription":
+    # 2) Model key absent from current llm_cfg (e.g. validation of a new model, or retired
+    # mid-flight before settlement): honor explicit dalton_meta[mk] when route does not conflict.
+    if mk and (mk_is_authoritative or (mk_entry is None and not route_keys)) and mk in meta_map:
+        dm = meta_map.get(mk)
+        if isinstance(dm, Mapping):
+            dm_billing = str(dm.get("billing") or "").strip().lower()
+            if dm_billing == "subscription":
+                return "subscription"
+            if dm_billing == "cash":
+                return "cash"
+
+    # 3) No authoritative model_key matched: fall back to route-level lookup only when
+    # unambiguous (all matching keys on (provider, norm_id(model_id)) agree on subscription;
+    # on legacy mixed cash+subscription routes, never let a sibling subscription key zero out cash).
+    if route_keys:
+        route_billings: set[str] = set()
+        for rk in route_keys:
+            dm = meta_map.get(rk)
+            dm_billing = (
+                str(dm.get("billing") or "").strip().lower()
+                if isinstance(dm, Mapping)
+                else ""
+            )
+            if dm_billing == "subscription" or _is_oauth_name(rk):
+                route_billings.add("subscription")
+            else:
+                route_billings.add("cash")
+        if route_billings == {"subscription"}:
             return "subscription"
-        if dm_billing == "cash":
-            saw_cash = True
-    if saw_cash:
         return "cash"
+
+    if mid and not mk and not eff_prov:
+        dm = meta_map.get(mid)
+        if isinstance(dm, Mapping):
+            dm_billing = str(dm.get("billing") or "").strip().lower()
+            if dm_billing == "subscription":
+                return "subscription"
+            if dm_billing == "cash":
+                return "cash"
 
     # OAuth suffix fallback on authoritative model_key or explicit model_id
     if (mk_is_authoritative and _is_oauth_name(mk)) or _is_oauth_name(mid):
