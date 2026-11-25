@@ -9,12 +9,18 @@ import math
 from datetime import date, datetime, timezone
 from typing import Any
 
-from src.dalton.conversations.embedder import embed_query_via_bridge
+from src.dalton.conversations.embedder import (
+    embed_query,
+    embed_query_via_bridge,
+    is_embed_via_bridge_enabled,
+)
 from src.dalton.database import conversations as db_conv
 from src.dalton.database.conversations import build_card_search_text
+from src.dalton.embeddings.metadata import EmbeddingMetadataMismatchError
 from src.dalton.settings import get_dalton_settings
 
 logger = logging.getLogger(__name__)
+_ORIG_EMBED_QUERY_VIA_BRIDGE = embed_query_via_bridge
 
 RRF_K = 60
 
@@ -256,7 +262,12 @@ async def hybrid_search_conversations(
 
     q_vec = query_embedding
     if q_vec is None:
-        q_vec = await embed_query_via_bridge(query)
+        if embed_query_via_bridge is not _ORIG_EMBED_QUERY_VIA_BRIDGE:
+            q_vec = await embed_query_via_bridge(query)
+        elif is_embed_via_bridge_enabled():
+            q_vec = await embed_query_via_bridge(query, conn=conn)
+        else:
+            q_vec = await embed_query(query, conn=conn)
 
     dense_hits: list[dict[str, Any]] = []
     if q_vec:
@@ -270,6 +281,8 @@ async def hybrid_search_conversations(
                 limit=candidate_k,
                 conn=conn,
             )
+        except EmbeddingMetadataMismatchError:
+            raise
         except Exception as exc:
             logger.warning("[dalton.conversations.search] dense search arm failed: %s", exc)
 

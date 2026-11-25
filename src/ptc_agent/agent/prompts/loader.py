@@ -94,16 +94,21 @@ class PromptLoader:
             **kwargs,  # User can override date if needed
         }
         # DALTON-HOOK(team-memory-toggle): static prompt and data map follow deployment/tier availability and main-agent role only (never subagents, external/company tiers, or personal toggle)
-        # DALTON-HOOK(standalone-core): inject deployment capabilities & brand name for conditional prompt rendering
+        # DALTON-HOOK(standalone-core): inject deployment capabilities, ops_jobs_enabled, & brand name for conditional prompt rendering
         from src.dalton.access_tiers import is_internal_tier
         from src.dalton.capabilities import CapabilityId, effective_capabilities
-        from src.dalton.settings import get_brand_name
+        from src.dalton.profile import DeploymentProfile, resolve_profile
+        from src.dalton.settings import get_brand_name, is_dalton_enabled
 
         active_caps = effective_capabilities()
         context.setdefault("brand_name", get_brand_name())
         context.setdefault(
             "researchdata_bridge_enabled",
             CapabilityId.RESEARCHDATA_BRIDGE in active_caps,
+        )
+        context.setdefault(
+            "ops_jobs_enabled",
+            is_dalton_enabled() and resolve_profile() is DeploymentProfile.EVERFLOW,
         )
         context.setdefault(
             "data_jobs_enabled",
