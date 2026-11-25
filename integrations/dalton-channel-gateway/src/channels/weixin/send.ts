@@ -1,6 +1,10 @@
 // Portions adapted from @tencent-weixin/openclaw-weixin (MIT License, Copyright (c) 2026 Tencent).
 
 import { randomBytes } from "node:crypto";
+import {
+  isLeaseSafetyMarginPauseError,
+  isStaleGatewayEpochError,
+} from "../../gateway-lease.js";
 import type { HostIpResolver } from "../../shared/safe-fetch.js";
 import {
   ChannelDeliveryError,
@@ -55,15 +59,18 @@ export function normalizeRecipientUserId(
 }
 
 export interface WeixinUploadedAccount {
+  accountId?: string;
   botId: string;
   botGeneration: number;
 }
 
 export interface WeixinRefreshedSendContext {
+  accountId?: string;
   contextToken: string;
   botToken: string;
   botId: string;
   botGeneration: number;
+  baseUrl?: string;
 }
 
 export interface WeixinSendContext {
@@ -75,11 +82,15 @@ export interface WeixinSendContext {
   timeoutMs?: number;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
+  dispatcher?: unknown;
   allowedApiDomains?: readonly string[];
   allowedCdnDomains?: readonly string[];
   resolveHostIps?: HostIpResolver;
   checkResolvedIps?: boolean;
+  /** Synchronous lease check invoked after DNS resolution and immediately before HTTP dispatch (Round 3 Decision #1). */
+  assertLeaseValid?: () => void;
   onSessionExpired?: (err: WeixinApiError) => Promise<void> | void;
+  onBusinessError?: (err: WeixinApiError) => Promise<void> | void;
   /** Account that owned the CDN upload. Checked again before sendmessage. */
   uploadedBy?: WeixinUploadedAccount;
   /**
@@ -110,7 +121,19 @@ function isUncertainDispatchedResult(err: WeixinApiError): boolean {
 async function classifyAndThrowSendMessageError(
   err: unknown,
   onSessionExpired?: (err: WeixinApiError) => Promise<void> | void,
+  onBusinessError?: (err: WeixinApiError) => Promise<void> | void,
 ): Promise<never> {
+  if (isStaleGatewayEpochError(err)) {
+    throw err;
+  }
+  if (isLeaseSafetyMarginPauseError(err)) {
+    throw new ChannelDeliveryError(err.message, {
+      outcome: "failed",
+      code: "unavailable",
+      retryable: true,
+      denyCode: err.code,
+    });
+  }
   if (err instanceof ChannelDeliveryError) {
     throw err;
   }
@@ -130,6 +153,13 @@ async function classifyAndThrowSendMessageError(
         outcome: "rate_limited",
         code: "rate_limited",
         retryAfterMs: err.retryAfterMs,
+      });
+    }
+    if (err.kind === "business_error") {
+      await onBusinessError?.(err);
+      throw new ChannelDeliveryError(err.message, {
+        outcome: "failed",
+        code: "unavailable",
       });
     }
     if (isUncertainDispatchedResult(err)) {
@@ -159,6 +189,17 @@ async function classifyAndThrowUploadStageError(
   err: unknown,
   onSessionExpired?: (err: WeixinApiError) => Promise<void> | void,
 ): Promise<never> {
+  if (isStaleGatewayEpochError(err)) {
+    throw err;
+  }
+  if (isLeaseSafetyMarginPauseError(err)) {
+    throw new ChannelDeliveryError(err.message, {
+      outcome: "failed",
+      code: "unavailable",
+      retryable: true,
+      denyCode: err.code,
+    });
+  }
   if (err instanceof ChannelDeliveryError) {
     throw err;
   }
@@ -246,9 +287,11 @@ export async function sendWeixinTextMessage(
       timeoutMs: ctx.timeoutMs,
       signal: ctx.signal,
       fetchImpl: ctx.fetchImpl,
+      dispatcher: ctx.dispatcher,
       allowedDomains: ctx.allowedApiDomains,
       resolveHostIps: ctx.resolveHostIps,
       checkResolvedIps: ctx.checkResolvedIps,
+      assertLeaseValid: ctx.assertLeaseValid,
     });
     const rawMsgId = resp.message_id ?? resp.msg_id;
     return {
@@ -259,7 +302,11 @@ export async function sendWeixinTextMessage(
       resolvedAddress: "weixin:@me",
     };
   } catch (err) {
-    return classifyAndThrowSendMessageError(err, ctx.onSessionExpired);
+    return classifyAndThrowSendMessageError(
+      err,
+      ctx.onSessionExpired,
+      ctx.onBusinessError,
+    );
   }
 }
 
@@ -317,10 +364,12 @@ export async function sendWeixinMediaAttachment(
       mediaType: uploadMediaType,
       signal: ctx.signal,
       fetchImpl: ctx.fetchImpl,
+      dispatcher: ctx.dispatcher,
       allowedDomains: ctx.allowedApiDomains,
       allowedCdnDomains: ctx.allowedCdnDomains,
       resolveHostIps: ctx.resolveHostIps,
       checkResolvedIps: ctx.checkResolvedIps,
+      assertLeaseValid: ctx.assertLeaseValid,
     });
   } catch (err) {
     return classifyAndThrowUploadStageError(err, ctx.onSessionExpired);
@@ -328,6 +377,7 @@ export async function sendWeixinMediaAttachment(
 
   let outboundContextToken = contextToken;
   let outboundBotToken = botToken;
+  let outboundBaseUrl = ctx.baseUrl;
   if (ctx.refreshAfterUpload) {
     const refreshed = await ctx.refreshAfterUpload();
     const uploadedBy = ctx.uploadedBy;
@@ -335,7 +385,10 @@ export async function sendWeixinMediaAttachment(
       !refreshed ||
       (uploadedBy !== undefined &&
         (refreshed.botId !== uploadedBy.botId ||
-          refreshed.botGeneration !== uploadedBy.botGeneration))
+          refreshed.botGeneration !== uploadedBy.botGeneration ||
+          (uploadedBy.accountId !== undefined &&
+            refreshed.accountId !== undefined &&
+            refreshed.accountId !== uploadedBy.accountId)))
     ) {
       throw new ChannelDeliveryError(
         "Weixin account changed during file upload; the uploaded file was not sent.",
@@ -358,6 +411,16 @@ export async function sendWeixinMediaAttachment(
     }
     outboundContextToken = nextToken;
     outboundBotToken = nextBotToken;
+    if (refreshed.baseUrl?.trim()) {
+      outboundBaseUrl = refreshed.baseUrl.trim();
+    }
+  }
+
+  if (ctx.signal?.aborted) {
+    throw new ChannelDeliveryError("Weixin media send aborted before sendmessage", {
+      outcome: "failed",
+      code: "unavailable",
+    });
   }
 
   const mediaItem: MessageItem = isVerifiedImage
@@ -400,15 +463,17 @@ export async function sendWeixinMediaAttachment(
 
   try {
     const resp = await sendWeixinMessage({
-      baseUrl: ctx.baseUrl,
+      baseUrl: outboundBaseUrl,
       botToken: outboundBotToken,
       body: req,
       timeoutMs: ctx.timeoutMs,
       signal: ctx.signal,
       fetchImpl: ctx.fetchImpl,
+      dispatcher: ctx.dispatcher,
       allowedDomains: ctx.allowedApiDomains,
       resolveHostIps: ctx.resolveHostIps,
       checkResolvedIps: ctx.checkResolvedIps,
+      assertLeaseValid: ctx.assertLeaseValid,
     });
     const rawMsgId = resp.message_id ?? resp.msg_id;
     return {
@@ -420,6 +485,10 @@ export async function sendWeixinMediaAttachment(
       reason: null,
     };
   } catch (err) {
-    return classifyAndThrowSendMessageError(err, ctx.onSessionExpired);
+    return classifyAndThrowSendMessageError(
+      err,
+      ctx.onSessionExpired,
+      ctx.onBusinessError,
+    );
   }
 }

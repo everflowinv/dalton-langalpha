@@ -272,10 +272,23 @@ export interface WeixinPersistedAttachmentMeta {
 
 export interface WeixinQrPublicResult {
   session_key: string;
-  status: "wait" | "scaned" | "verify_code" | "confirmed" | "expired";
+  status:
+    | "wait"
+    | "scaned"
+    | "verify_code"
+    | "confirmed"
+    | "expired"
+    | "superseded";
   qrcode_url?: string;
   qrcode_img_content?: string;
   expires_at?: string;
+  login_version?: number;
+  account_id?: string | null;
+  account_status?: string | null;
+  accounts_revision?: number | null;
+  pending_verification?: boolean;
+  revoked?: boolean;
+  code?: string | null;
   ilink_bot_id?: string | null;
   ilink_user_id?: string | null;
   ilink_username?: string | null;

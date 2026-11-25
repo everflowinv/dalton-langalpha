@@ -6,6 +6,12 @@ import { vi } from "vitest";
 import type {
   BackendClient,
   DispatchLivenessRunInfo,
+  GatewayLeaseAcquireRequest,
+  GatewayLeaseAcquireResponse,
+  GatewayLeaseHeartbeatRequest,
+  GatewayLeaseHeartbeatResponse,
+  GatewayLeaseReleaseRequest,
+  GatewayLeaseReleaseResponse,
   I1RegisterAndResolveRequest,
   I1RegisterAndResolveResponse,
   I2BindCodeConsumeRequest,
@@ -28,14 +34,22 @@ import type {
   I8AutomationRunFinishResponse,
   I8AutomationRunStartRequest,
   I8AutomationRunStartResponse,
-  I9WeixinStateGetResponse,
-  I9WeixinStatePutRequest,
-  I9WeixinStatePutResponse,
   SseEvent,
   SseOrErrorResponse,
   ThreadMessageDispatchPayload,
   ThreadRetryPayload,
   ThreadStatusInfo,
+  WeixinAccountCursorUpdateRequest,
+  WeixinAccountCursorUpdateResponse,
+  WeixinAccountDetailResponse,
+  WeixinAccountsReconcileResponse,
+  WeixinAccountStatusUpdateRequest,
+  WeixinAccountStatusUpdateResponse,
+  WeixinLoginSessionGetResponse,
+  WeixinLoginSessionPatchRequest,
+  WeixinLoginSessionPatchResponse,
+  WeixinPreflightSendRequest,
+  WeixinPreflightSendResponse,
 } from "../src/backend-client.js";
 import { FakeChannelAdapter } from "../src/channels/fake-adapter.js";
 import {
@@ -159,6 +173,8 @@ export type MockBackend = BackendClient &
   Required<
     Pick<
       BackendClient,
+      | "setGatewayEpoch"
+      | "setOnStaleGatewayEpoch"
       | "authorizeDataTaskNotificationPlan"
       | "authorizeAutomationNotificationPlan"
       | "downloadDataTaskRunArtifact"
@@ -248,14 +264,6 @@ export function createMockBackend(): MockBackend {
   const defaultI8FinishClaim = loadFixtureKey<I8AutomationRunFinishResponse>(
     "i8_automation_runs.json",
     "finish_claim_finishing",
-  );
-  const defaultI9Unconfigured = loadFixtureKey<I9WeixinStateGetResponse>(
-    "i9_weixin_state.json",
-    "get_unconfigured",
-  );
-  const defaultI9PutSaved = loadFixtureKey<I9WeixinStatePutResponse>(
-    "i9_weixin_state.json",
-    "put_saved",
   );
   const defaultReplaySinglePage = loadFixtureKey<
     Array<{ event: string; data: Record<string, unknown> }>
@@ -477,6 +485,7 @@ export function createMockBackend(): MockBackend {
         lastUpdate?.status === "sent" &&
         (req.delivery_key.startsWith("notice:partial:") ||
           req.delivery_key.endsWith(":command") ||
+          req.delivery_key.endsWith(":merged_forward_unsupported") ||
           (req.delivery_key.startsWith("fallback:") &&
             prevClaimForKey &&
             (req.inbound_message_id ?? null) ===
@@ -518,7 +527,15 @@ export function createMockBackend(): MockBackend {
         discord_body_phase: remembered.phase,
         thread_scope_key: resolvedThreadScopeKey,
         is_current: isCurrent,
+        delivery_attempt: 1,
+        weixin_account_id:
+          plat === "weixin"
+            ? "00000000-0000-4000-8000-000000000001"
+            : null,
+        weixin_bot_id: plat === "weixin" ? "bot_1" : null,
+        weixin_bot_generation: plat === "weixin" ? 1 : null,
         weixin_context_token: plat === "weixin" ? "ctx_tok_123" : null,
+        weixin_context_token_version: plat === "weixin" ? 1 : null,
       };
     },
   );
@@ -526,11 +543,17 @@ export function createMockBackend(): MockBackend {
   const updateDeliveryProgress = vi.fn(
     async (
       req: I7DeliveriesProgressRequest,
+      _options?: { platform?: string | null },
     ): Promise<I7DeliveriesProgressResponse> => ({
       ...structuredClone(defaultI7DeliverySent),
       ok: true,
       delivery_key: req.delivery_key,
       status: req.status ?? "in_flight",
+      outcome: req.outcome ?? req.status ?? null,
+      sent_chunks: req.sent_chunks ?? 0,
+      total_chunks: req.total_chunks ?? 0,
+      platform_message_ids: req.platform_message_ids ?? [],
+      files_status: req.files_status ?? [],
       sent_to_current_count:
         req.status === "sent" || req.status === "partial" ? 1 : 0,
       ...(() => {
@@ -694,7 +717,48 @@ export function createMockBackend(): MockBackend {
     },
   );
 
+  let currentGatewayEpoch: number | null = null;
+  let staleEpochHandler: ((err: import("../src/gateway-lease.js").StaleGatewayEpochError) => void) | null = null;
+
   const mock: MockBackend = {
+    setGatewayEpoch: vi.fn((epoch: number | null) => {
+      currentGatewayEpoch = epoch;
+    }),
+    getGatewayEpoch: vi.fn(() => currentGatewayEpoch),
+    setOnStaleGatewayEpoch: vi.fn((handler) => {
+      staleEpochHandler = handler;
+      void staleEpochHandler;
+    }),
+
+    acquireGatewayLease: vi.fn(
+      async (
+        req: GatewayLeaseAcquireRequest,
+      ): Promise<GatewayLeaseAcquireResponse> => ({
+        granted: true,
+        epoch: 1,
+        expires_at: new Date(Date.now() + req.ttl_seconds * 1000).toISOString(),
+      }),
+    ),
+
+    heartbeatGatewayLease: vi.fn(
+      async (
+        req: GatewayLeaseHeartbeatRequest,
+      ): Promise<GatewayLeaseHeartbeatResponse> => ({
+        ok: true,
+        epoch: req.epoch,
+        expires_at: new Date(Date.now() + req.ttl_seconds * 1000).toISOString(),
+      }),
+    ),
+
+    releaseGatewayLease: vi.fn(
+      async (
+        _req: GatewayLeaseReleaseRequest,
+      ): Promise<GatewayLeaseReleaseResponse> => ({
+        ok: true,
+        released: true,
+      }),
+    ),
+
     get progressUpdates() {
       return updateInboundProgress.mock.calls.map(([req]) => req);
     },
@@ -867,21 +931,118 @@ export function createMockBackend(): MockBackend {
       }),
     ),
 
-    getWeixinState: vi.fn(
-      async (): Promise<I9WeixinStateGetResponse> =>
-        structuredClone(defaultI9Unconfigured),
+    reconcileWeixinAccounts: vi.fn(
+      async (
+        sinceRevision?: number | null,
+      ): Promise<WeixinAccountsReconcileResponse> => ({
+        changed: sinceRevision !== 1,
+        enabled: true,
+        allow_external: false,
+        max_concurrent_accounts: 50,
+        accounts_revision: 1,
+        accounts: [],
+      }),
     ),
 
-    putWeixinState: vi.fn(
+    getWeixinAccountDetail: vi.fn(
+      async (accountId: string): Promise<WeixinAccountDetailResponse> => ({
+        account_id: accountId,
+        user_id: USER_ID,
+        ilink_bot_id: "bot_1",
+        ilink_user_id: "wx_alice",
+        bot_token: "bot_token_mock",
+        base_url: "https://ilinkai.weixin.qq.com",
+        cdn_base_url: "https://novac2c.cdn.weixin.qq.com/c2c",
+        bot_generation: 1,
+        status: "active",
+        weixin_context_token: "ctx_tok_123",
+        weixin_context_token_version: 1,
+      }),
+    ),
+
+    updateWeixinAccountCursor: vi.fn(
       async (
-        req: I9WeixinStatePutRequest,
-      ): Promise<I9WeixinStatePutResponse> => ({
-        ...structuredClone(defaultI9PutSaved),
-        ilink_bot_id: req.ilink_bot_id ?? defaultI9PutSaved.ilink_bot_id,
-        owner_user_id: req.owner_user_id ?? USER_ID,
-        base_url: req.base_url ?? defaultI9PutSaved.base_url,
-        get_updates_buf: req.get_updates_buf ?? "",
-        status: req.status ?? "active",
+        _accountId: string,
+        req: WeixinAccountCursorUpdateRequest,
+      ): Promise<WeixinAccountCursorUpdateResponse> => ({
+        ok: true,
+        updated: true,
+        bot_generation: req.expected_bot_generation,
+        get_updates_buf: req.get_updates_buf,
+        status: "active",
+      }),
+    ),
+
+    updateWeixinAccountStatus: vi.fn(
+      async (
+        _accountId: string,
+        _req: WeixinAccountStatusUpdateRequest,
+      ): Promise<WeixinAccountStatusUpdateResponse> => ({
+        ok: true,
+        updated: true,
+        accounts_revision: 2,
+      }),
+    ),
+
+    getWeixinLoginSession: vi.fn(
+      async (sessionKey: string): Promise<WeixinLoginSessionGetResponse> => ({
+        session_key: sessionKey,
+        user_id: USER_ID,
+        login_version: 2,
+        expected_bot_generation: 0,
+        status: "wait",
+        qrcode: "qr_token_default",
+        qrcode_img_content: "https://ilinkai.weixin.qq.com/qr/default",
+        redirect_base_url: "https://ilinkai.weixin.qq.com",
+        expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+      }),
+    ),
+
+    patchWeixinLoginSession: vi.fn(
+      async (
+        sessionKey: string,
+        req: WeixinLoginSessionPatchRequest,
+      ): Promise<WeixinLoginSessionPatchResponse> => ({
+        ok: true,
+        revoked: false,
+        session_key: sessionKey,
+        status: req.action === "confirm" ? "confirmed" : (req.status ?? "wait"),
+        login_version: (req.expected_login_version ?? 1) + 1,
+        expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+        ...(req.action === "confirm"
+          ? {
+              account_id: "00000000-0000-4000-8000-000000000001",
+              account_status: "active",
+              ilink_bot_id: req.ilink_bot_id ?? "bot_1",
+              ilink_user_id: req.ilink_user_id ?? "wx_alice",
+              ilink_username: req.ilink_username ?? "Alice",
+              connected: true,
+              already_connected: false,
+              bot_generation: (req.expected_bot_generation ?? 0) + 1,
+              accounts_revision: 2,
+            }
+          : {}),
+      }),
+    ),
+
+    preflightWeixinSend: vi.fn(
+      async (
+        _deliveryKey: string,
+        req: WeixinPreflightSendRequest,
+      ): Promise<WeixinPreflightSendResponse> => ({
+        authorized: true,
+        decision: "allow",
+        retryable: false,
+        chunk_index: req.chunk_index,
+        account_id: "00000000-0000-4000-8000-000000000001",
+        ilink_bot_id: "bot_1",
+        bot_generation: 1,
+        bot_token: "bot_token_mock",
+        base_url: "https://ilinkai.weixin.qq.com",
+        cdn_base_url: "https://novac2c.cdn.weixin.qq.com/c2c",
+        recipient_id: "wx_alice",
+        weixin_context_token: "ctx_tok_123",
+        weixin_context_token_version: 1,
       }),
     ),
 
@@ -993,6 +1154,9 @@ export interface TestHarness {
 export function createTestHarness(options?: {
   nowFn?: () => number;
   backoffDelayFn?: (ms: number) => Promise<void>;
+  retryDelayFn?: (ms: number, signal?: AbortSignal) => Promise<boolean>;
+  preflightRetryMaxElapsedMs?: number;
+  claim503MaxAttempts?: number;
   busyThreadMaxWaitMs?: number;
   statusFeedback?: StatusFeedbackConfig;
   env?: NodeJS.ProcessEnv;
@@ -1004,7 +1168,6 @@ export function createTestHarness(options?: {
     INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
     DALTON_BACKEND_URL: "http://127.0.0.1:8000",
     WEB_BASE_URL: "https://app.ginlix.ai",
-    DALTON_WEIXIN_CACHE_DIR: join(tempDir, "weixin"),
     ...(options?.env ?? {}),
   });
   const config: GatewayConfig = options?.statusFeedback
@@ -1024,6 +1187,10 @@ export function createTestHarness(options?: {
     backend,
     adapters,
     backoffDelayFn: options?.backoffDelayFn ?? (async () => undefined),
+    retryDelayFn:
+      options?.retryDelayFn ?? (async (_ms, signal) => !signal?.aborted),
+    preflightRetryMaxElapsedMs: options?.preflightRetryMaxElapsedMs,
+    claim503MaxAttempts: options?.claim503MaxAttempts,
     busyThreadMaxWaitMs: options?.busyThreadMaxWaitMs,
     nowFn: options?.nowFn,
   });

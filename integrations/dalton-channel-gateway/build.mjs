@@ -11,7 +11,7 @@ await build({
   entryPoints: [resolve(here, "src/main.ts")],
   outfile: out,
   bundle: true,
-  external: ["@larksuiteoapi/node-sdk"],
+  external: ["@larksuiteoapi/node-sdk", "undici"],
   platform: "node",
   target: "node22",
   format: "esm",

@@ -11,6 +11,7 @@ import {
   DataTaskNotificationService,
   type ExecutionStateTracker,
 } from "./data-task-notifications.js";
+import { isStaleGatewayEpochError } from "./gateway-lease.js";
 import { createSequentialQueue, type SequentialQueue } from "./shared/keyed-queue.js";
 
 const UUID_RE =
@@ -147,6 +148,9 @@ export class AutomationNotificationService {
         },
       };
     } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        throw err;
+      }
       const uncertain = tracker.claimedAnyItem || tracker.itemsSent > 0;
       const message =
         err instanceof Error && err.message
