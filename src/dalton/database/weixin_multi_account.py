@@ -2423,10 +2423,14 @@ async def get_weixin_login_session(
                     shaped = _shape_confirmed_result(confirmed)
                     shaped["connected"] = True
                     shaped["already_connected"] = True
+                    live_account_status = str(acc["status"]) if acc is not None else None
+                    if live_account_status:
+                        shaped["account_status"] = live_account_status
                     return {
                         "session_key": cleaned_key,
                         "user_id": str(row["user_id"]),
                         "status": "confirmed",
+                        "account_status": live_account_status,
                         "login_version": int(row["login_version"]),
                         "expires_at": _iso(expires_at),
                         "confirmed_result": shaped,
@@ -4570,3 +4574,112 @@ async def notify_gateway_weixin_accounts_sync(
             type(exc).__name__,
         )
     return None
+
+
+async def verify_weixin_upload_headers(
+    *,
+    request: Any,
+    user_id: str,
+    conn: Any = None,
+) -> None:
+    """R13 (Gateway R6 companion): Verify Weixin account generation & gateway epoch
+    before writing uploaded workspace files to sandbox disk.
+
+    Activated ONLY when ``X-Weixin-Account-Id`` or ``X-Weixin-Bot-Generation`` is present
+    (Feishu / Discord / Web uploads that omit these headers are untouched).
+    Raises:
+        409 ``stale_gateway_epoch`` when ``X-Gateway-Epoch`` is missing/invalid/stale;
+        409 ``weixin_bot_generation_superseded`` when the account was unbound, belongs to
+            another user, is inactive, or its ``bot_generation`` differs from the header;
+        400 when ``X-Weixin-Account-Id`` or ``X-Weixin-Bot-Generation`` is malformed.
+    """
+    headers = getattr(request, "headers", None)
+    if headers is None:
+        return
+    raw_aid = str(headers.get("X-Weixin-Account-Id") or "").strip()
+    raw_gen = str(headers.get("X-Weixin-Bot-Generation") or "").strip()
+    raw_epoch = str(headers.get("X-Gateway-Epoch") or "").strip()
+
+    if not raw_aid and not raw_gen:
+        return
+
+    require_channel_platform_capability("weixin")
+
+    norm_aid = normalize_uuid(raw_aid) if raw_aid else None
+    if not norm_aid:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_weixin_upload_headers",
+                "message": "X-Weixin-Account-Id must be a valid UUID.",
+            },
+        )
+    try:
+        req_gen = int(raw_gen)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_weixin_upload_headers",
+                "message": "X-Weixin-Bot-Generation must be a positive integer.",
+            },
+        ) from None
+    if req_gen < 1:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "invalid_weixin_upload_headers",
+                "message": "X-Weixin-Bot-Generation must be a positive integer.",
+            },
+        )
+
+    req_epoch: int | None = None
+    if raw_epoch:
+        try:
+            req_epoch = int(raw_epoch)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "stale_gateway_epoch",
+                    "message": "Invalid X-Gateway-Epoch header.",
+                },
+            ) from None
+
+    clean_uid = str(user_id or "").strip()
+    async with get_db_connection(conn) as owned_conn:
+        async with owned_conn.transaction():
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await verify_gateway_epoch_in_tx(
+                    cur,
+                    req_epoch,
+                    required=True,
+                    platform="weixin",
+                )
+                await cur.execute(
+                    """
+                    SELECT account_id::text AS account_id,
+                           user_id,
+                           status,
+                           bot_generation
+                    FROM dalton_channel_weixin_accounts
+                    WHERE account_id = %s::uuid
+                    FOR KEY SHARE
+                    """,
+                    (norm_aid,),
+                )
+                acc = await cur.fetchone()
+                if (
+                    acc is None
+                    or str(acc.get("user_id") or "").strip() != clean_uid
+                    or str(acc.get("status") or "").strip().lower()
+                    not in ("active", "pending_verification")
+                    or int(acc.get("bot_generation") or 0) != req_gen
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "weixin_bot_generation_superseded",
+                            "message": "Weixin account was unbound or rotated before file upload.",
+                        },
+                    )

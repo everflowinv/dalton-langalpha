@@ -10414,6 +10414,15 @@ async def _update_delivery_progress_once(
                 }
 
 
+class _InboundProgressRetryWithPlatform(Exception):
+    """Internal control-flow signal: roll back and restart I-7 on the main path
+    once a late-committed thread_watch reveals the authoritative platform."""
+
+    def __init__(self, resolved_platform: str) -> None:
+        super().__init__(resolved_platform)
+        self.resolved_platform = resolved_platform
+
+
 async def update_inbound_progress(
     *,
     platform: str | None = None,
@@ -10441,34 +10450,56 @@ async def update_inbound_progress(
     conn: Any = None,
 ) -> dict[str, Any]:
     """I-7 (2): Update inbound event, session pending_interrupt, thread_watches, and background_runs."""
-    return await _run_tx_with_retry(
-        "update_inbound_progress",
-        conn,
-        lambda c: _update_inbound_progress_once(
-            platform=platform,
-            message_id=message_id,
-            status=status,
-            thread_id=thread_id,
-            run_id=run_id,
-            turn_index=turn_index,
-            request_key=request_key,
-            retry_request_key=retry_request_key,
-            resubmitted_request_key=resubmitted_request_key,
-            steered_into_run_id=steered_into_run_id,
-            fallback_pending=fallback_pending,
-            uploaded_attachments=uploaded_attachments,
-            raw_payload=raw_payload,
-            raw_payload_patch=raw_payload_patch,
-            command_effect_status=command_effect_status,
-            command_reply_pending=command_reply_pending,
-            command_result=command_result,
-            session_interrupt_update=session_interrupt_update,
-            background_run=background_run,
-            thread_watch=thread_watch,
-            gateway_epoch=gateway_epoch,
-            require_gateway_epoch=require_gateway_epoch,
-            conn=c,
-        ),
+    forced_si_platform: str | None = None
+    for attempt in range(2):
+        try:
+            return await _run_tx_with_retry(
+                "update_inbound_progress",
+                conn,
+                lambda c, _fp=forced_si_platform: _update_inbound_progress_once(
+                    platform=platform,
+                    message_id=message_id,
+                    status=status,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    turn_index=turn_index,
+                    request_key=request_key,
+                    retry_request_key=retry_request_key,
+                    resubmitted_request_key=resubmitted_request_key,
+                    steered_into_run_id=steered_into_run_id,
+                    fallback_pending=fallback_pending,
+                    uploaded_attachments=uploaded_attachments,
+                    raw_payload=raw_payload,
+                    raw_payload_patch=raw_payload_patch,
+                    command_effect_status=command_effect_status,
+                    command_reply_pending=command_reply_pending,
+                    command_result=command_result,
+                    session_interrupt_update=session_interrupt_update,
+                    background_run=background_run,
+                    thread_watch=thread_watch,
+                    gateway_epoch=gateway_epoch,
+                    require_gateway_epoch=require_gateway_epoch,
+                    forced_si_platform=_fp,
+                    conn=c,
+                ),
+            )
+        except _InboundProgressRetryWithPlatform as retry_exc:
+            if attempt == 0:
+                forced_si_platform = retry_exc.resolved_platform
+                continue
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "platform_mismatch",
+                    "message": "Concurrent thread_watch platform changed during retry.",
+                },
+            ) from None
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "code": "platform_mismatch",
+            "message": "Concurrent thread_watch platform changed during retry.",
+        },
     )
 
 
@@ -10496,6 +10527,7 @@ async def _update_inbound_progress_once(
     thread_watch: dict[str, Any] | None = None,
     gateway_epoch: int | None = None,
     require_gateway_epoch: bool = False,
+    forced_si_platform: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     effective_run_id = str(run_id).strip() if run_id else None
@@ -10736,6 +10768,18 @@ async def _update_inbound_progress_once(
                                 return str(in_p["platform"]).strip().lower()
                     return None
 
+                # R13 (Codex #6): Always check target thread_id persisted platform even when
+                # updating ONLY dalton_channel_inbound_events (no thread_watch / interrupt / bg_run),
+                # enforcing Weixin X-Gateway-Epoch and rejecting cross-platform attachment (409).
+                norm_top_tid = normalize_uuid(thread_id) if thread_id else None
+                if norm_top_tid:
+                    db_top_tid_plat = await _lookup_persisted_thread_platform(
+                        norm_top_tid, effective_run_id
+                    )
+                    await _enforce_db_platform(
+                        db_top_tid_plat, cleaned_p, "inbound_event"
+                    )
+
                 # Pre-check thread_watch, session_interrupt_update, and background_run DB platforms
                 resolved_tw_plat: str | None = None
                 if thread_watch:
@@ -10765,6 +10809,12 @@ async def _update_inbound_progress_once(
                     db_si_plat = await _lookup_persisted_thread_platform(
                         pre_si_tid, str(pre_si_rid).strip() if pre_si_rid else None
                     )
+                    if forced_si_platform is not None:
+                        if db_si_plat is not None and db_si_plat != forced_si_platform:
+                            _reject_platform_mismatch(
+                                f"Concurrent thread_watch platform changed to {db_si_plat!r} during retry."
+                            )
+                        db_si_plat = db_si_plat or forced_si_platform
                     resolved_si_plat = await _enforce_db_platform(
                         db_si_plat, pre_si_req_plat, "session_interrupt_update"
                     )
@@ -10808,7 +10858,57 @@ async def _update_inbound_progress_once(
                         (f"dalton_inbound:{cleaned_p}:{cleaned_mid}",),
                     )
 
-                # 1. Lock & update dalton_channel_session_generations FIRST (before inbound_events / watches / background_runs)
+                # 0b. R13 (Codex #2): Align Weixin FK lock order with unbind_weixin_account
+                # (weixin_accounts FOR KEY SHARE -> session_generations FOR UPDATE ->
+                # thread_watches FOR UPDATE -> background_runs). Acquire FOR KEY SHARE on
+                # target Weixin accounts BEFORE locking session_generations so first-write
+                # INSERT INTO thread_watches / background_runs (FK fk_dalton_watches_wx_account)
+                # never deadlocks with concurrent unbind_weixin_account.
+                wx_lock_aids: set[str] = set()
+                wx_lock_uids: set[str] = set()
+                if thread_watch:
+                    eff_tw_p = (
+                        resolved_tw_plat
+                        or str(thread_watch.get("platform") or "").strip().lower()
+                    )
+                    if eff_tw_p == "weixin":
+                        tw_u = str(thread_watch.get("dalton_user_id") or "").strip()
+                        if tw_u:
+                            wx_lock_uids.add(tw_u)
+                        tw_a = normalize_uuid(thread_watch.get("weixin_account_id"))
+                        if tw_a:
+                            wx_lock_aids.add(tw_a)
+                if background_run:
+                    eff_bg_p = (
+                        resolved_bg_plat
+                        or str(background_run.get("platform") or "").strip().lower()
+                    )
+                    if eff_bg_p == "weixin":
+                        bg_u = str(background_run.get("dalton_user_id") or "").strip()
+                        if bg_u:
+                            wx_lock_uids.add(bg_u)
+                        bg_a = normalize_uuid(background_run.get("weixin_account_id"))
+                        if bg_a:
+                            wx_lock_aids.add(bg_a)
+                if session_interrupt_update:
+                    eff_si_p = (
+                        resolved_si_plat
+                        or str(session_interrupt_update.get("platform") or "").strip().lower()
+                    )
+                    if eff_si_p == "weixin":
+                        si_u = str(session_interrupt_update.get("dalton_user_id") or "").strip()
+                        if si_u:
+                            wx_lock_uids.add(si_u)
+                for lock_aid in sorted(wx_lock_aids):
+                    await _lock_weixin_account_for_key_share_in_tx(
+                        cur, account_id=lock_aid
+                    )
+                for lock_uid in sorted(wx_lock_uids):
+                    await _lock_weixin_account_for_key_share_in_tx(
+                        cur, user_id=lock_uid
+                    )
+
+                # 1. Lock & update dalton_channel_session_generations FIRST (after Weixin account lock, before inbound_events / watches / background_runs)
                 watch_interrupt_patch: tuple[str, Any] | None = None
                 session_is_current_for_interrupt: bool | None = None
                 if session_interrupt_update:
@@ -10832,10 +10932,11 @@ async def _update_inbound_progress_once(
                         or None
                     )
                     si_plat = resolved_si_plat or si_req_plat
-                    # R12 (Codex #4): Never KeyError/500 when session_interrupt_update omits
-                    # platform and pre-check found none; lock watch row by thread_id to read
-                    # platform, and return 400 when still unresolvable.
-                    si_skip_session_write = False
+                    # R12/R13 (Codex #4, #5 / Grok low): Never KeyError/500 when
+                    # session_interrupt_update omits platform and pre-check found none.
+                    # Lock watch row by thread_id: if a late-committed watch is found, roll back
+                    # this tx and restart ONCE on the full main path (account -> session -> watch);
+                    # if still missing, return 400 missing_platform (or 409 if already retried).
                     if not si_plat:
                         if si_expected_tid:
                             await cur.execute(
@@ -10849,300 +10950,298 @@ async def _update_inbound_progress_once(
                             )
                             late_tw = await cur.fetchone()
                             if late_tw and late_tw.get("platform"):
-                                si_plat = await _enforce_db_platform(
-                                    late_tw["platform"],
-                                    None,
-                                    "session_interrupt_update",
-                                )
-                                # Watch row is already locked FOR UPDATE; avoid inverting
-                                # session -> watch lock order by patching watch only.
-                                si_skip_session_write = True
-                        if not si_plat:
-                            raise HTTPException(
-                                status_code=400,
-                                detail={
-                                    "code": "missing_platform",
-                                    "message": "session_interrupt_update requires a resolvable platform.",
-                                },
+                                late_plat = str(late_tw["platform"]).strip().lower()
+                                raise _InboundProgressRetryWithPlatform(late_plat)
+                        if forced_si_platform is not None:
+                            _reject_platform_mismatch(
+                                "Concurrent thread_watch disappeared during platform retry."
                             )
-                    if si_skip_session_write and si_expected_tid:
-                        watch_interrupt_patch = (si_expected_tid, si_val)
-                    else:
-                        si_scope = str(session_interrupt_update["scope_key"]).strip()
-                        si_uid = str(session_interrupt_update["dalton_user_id"]).strip()
-                        reject_company_system_auth(si_uid)
-                        si_expected_gen = session_interrupt_update.get("generation")
-                        if (
-                            si_expected_gen is None
-                            and isinstance(si_val, dict)
-                            and si_val.get("generation") is not None
-                        ):
-                            si_expected_gen = int(si_val["generation"])
-                        si_expected_rid = (
-                            session_interrupt_update.get("run_id")
-                            or (si_val.get("run_id") if isinstance(si_val, dict) else None)
-                            or effective_run_id
-                            or (
-                                background_run.get("run_id")
-                                if isinstance(background_run, dict)
-                                else None
-                            )
+                        raise HTTPException(
+                            status_code=400,
+                            detail={
+                                "code": "missing_platform",
+                                "message": "session_interrupt_update requires a resolvable platform.",
+                            },
                         )
-                        si_expected_iid = session_interrupt_update.get("interrupt_id") or (
-                            si_val.get("interrupt_id")
-                            if isinstance(si_val, dict)
+
+                    si_scope = str(session_interrupt_update["scope_key"]).strip()
+                    si_uid = str(session_interrupt_update["dalton_user_id"]).strip()
+                    reject_company_system_auth(si_uid)
+                    si_expected_gen = session_interrupt_update.get("generation")
+                    if (
+                        si_expected_gen is None
+                        and isinstance(si_val, dict)
+                        and si_val.get("generation") is not None
+                    ):
+                        si_expected_gen = int(si_val["generation"])
+                    si_expected_rid = (
+                        session_interrupt_update.get("run_id")
+                        or (si_val.get("run_id") if isinstance(si_val, dict) else None)
+                        or effective_run_id
+                        or (
+                            background_run.get("run_id")
+                            if isinstance(background_run, dict)
                             else None
                         )
+                    )
+                    si_expected_iid = session_interrupt_update.get("interrupt_id") or (
+                        si_val.get("interrupt_id")
+                        if isinstance(si_val, dict)
+                        else None
+                    )
 
-                        # Pre-read persisted source (without FOR UPDATE) to validate generation and scope before locking session
-                        persisted_src: dict[str, Any] | None = None
-                        if cleaned_p and cleaned_mid:
-                            await cur.execute(
-                                """
-                                SELECT * FROM dalton_channel_inbound_events
-                                WHERE platform = %s AND message_id = %s
-                                """,
-                                (cleaned_p, cleaned_mid),
-                            )
-                            in_src = await cur.fetchone()
-                            if in_src:
-                                persisted_src = dict(in_src)
-                        if persisted_src is None and (si_expected_rid or si_expected_tid):
-                            src_clauses: list[str] = ["dalton_user_id = %s"]
-                            src_params: list[Any] = [si_uid]
-                            if si_expected_rid:
-                                src_clauses.append("run_id = %s")
-                                src_params.append(str(si_expected_rid))
-                            if si_expected_tid:
-                                src_clauses.append("thread_id = %s")
-                                src_params.append(si_expected_tid)
-                            await cur.execute(
-                                f"""
-                                SELECT dalton_user_id, platform, chat_address AS target_address,
-                                       thread_scope_key, workspace_id, session_generation,
-                                       external_thread_id, raw_payload, thread_id, run_id
-                                FROM dalton_channel_inbound_events
-                                WHERE {" AND ".join(src_clauses)}
-                                ORDER BY created_at DESC
-                                LIMIT 1
-                                """,
-                                tuple(src_params),
-                            )
-                            in_by_rt = await cur.fetchone()
-                            if in_by_rt:
-                                persisted_src = dict(in_by_rt)
-                        if (
-                            (
-                                persisted_src is None
-                                or persisted_src.get("session_generation") is None
-                            )
-                            and si_expected_tid
-                        ):
-                            await cur.execute(
-                                """
-                                SELECT dalton_user_id, platform, target_address,
-                                       scope_key, generation, thread_id
-                                FROM dalton_channel_thread_watches
-                                WHERE thread_id = %s
-                                """,
-                                (si_expected_tid,),
-                            )
-                            w_src = await cur.fetchone()
-                            if w_src:
-                                persisted_src = dict(w_src)
-
-                        src_plat_ok = True
-                        src_uid_ok = True
-                        src_scope_ok = True
-                        persisted_gen_val: int | None = None
-                        if persisted_src is not None:
-                            reject_company_system_auth(persisted_src.get("dalton_user_id"))
-                            p_plat = str(persisted_src.get("platform") or "").strip().lower()
-                            p_uid = str(persisted_src.get("dalton_user_id") or "").strip()
-                            p_scope = str(
-                                persisted_src.get("thread_scope_key")
-                                or persisted_src.get("scope_key")
-                                or ""
-                            ).strip()
-                            src_plat_ok = not p_plat or p_plat == si_plat
-                            src_uid_ok = not p_uid or p_uid == si_uid
-                            src_scope_ok = not p_scope or p_scope == si_scope
-                            if persisted_src.get("session_generation") is not None:
-                                persisted_gen_val = int(persisted_src["session_generation"])
-                            elif persisted_src.get("generation") is not None:
-                                persisted_gen_val = int(persisted_src["generation"])
-                            elif (
-                                isinstance(persisted_src.get("raw_payload"), dict)
-                                and persisted_src["raw_payload"].get("generation")
-                                is not None
-                            ):
-                                persisted_gen_val = int(
-                                    persisted_src["raw_payload"]["generation"]
-                                )
-                            elif persisted_src.get("external_thread_id") and ":gen:" in str(
-                                persisted_src["external_thread_id"]
-                            ):
-                                gen_s = (
-                                    str(persisted_src["external_thread_id"])
-                                    .rsplit(":gen:", 1)[-1]
-                                    .strip()
-                                )
-                                if gen_s.isdigit():
-                                    persisted_gen_val = int(gen_s)
-
-                        s_row, _, s_db_now = await _lock_or_create_session_row(
-                            cur,
-                            platform=si_plat,
-                            scope_key=si_scope,
-                            dalton_user_id=si_uid,
+                    # Pre-read persisted source (without FOR UPDATE) to validate generation and scope before locking session
+                    persisted_src: dict[str, Any] | None = None
+                    if cleaned_p and cleaned_mid:
+                        await cur.execute(
+                            """
+                            SELECT * FROM dalton_channel_inbound_events
+                            WHERE platform = %s AND message_id = %s
+                            """,
+                            (cleaned_p, cleaned_mid),
                         )
-                        # R12 (Codex #2 / Grok high): Acquire FOR UPDATE directly on
-                        # dalton_channel_thread_watches AFTER locking session_generations
-                        # (strict session -> watch order matching unbind_weixin_account,
-                        # and no FOR SHARE -> FOR UPDATE lock upgrade), then verify DB
-                        # platform and lease epoch before updating session_generations.
+                        in_src = await cur.fetchone()
+                        if in_src:
+                            persisted_src = dict(in_src)
+                    if persisted_src is None and (si_expected_rid or si_expected_tid):
+                        src_clauses: list[str] = ["dalton_user_id = %s"]
+                        src_params: list[Any] = [si_uid]
+                        if si_expected_rid:
+                            src_clauses.append("run_id = %s")
+                            src_params.append(str(si_expected_rid))
                         if si_expected_tid:
-                            await cur.execute(
-                                """
-                                SELECT platform FROM dalton_channel_thread_watches
-                                WHERE thread_id = %s
-                                FOR UPDATE
-                                """,
-                                (si_expected_tid,),
-                            )
-                            live_si_tw = await cur.fetchone()
-                            if live_si_tw and live_si_tw.get("platform"):
-                                si_plat = (
-                                    await _enforce_db_platform(
-                                        live_si_tw["platform"],
-                                        si_plat,
-                                        "session_interrupt_update",
-                                    )
-                                    or si_plat
-                                )
-                        cur_s_gen = int(s_row.get("generation") or 1)
-                        cur_s_int = s_row.get("pending_interrupt")
-                        is_s_expired = (
-                            _is_session_expired(
-                                s_row.get("last_conversation_activity_at"), s_db_now
-                            )
-                            and s_row.get("override_workspace_id") is not None
+                            src_clauses.append("thread_id = %s")
+                            src_params.append(si_expected_tid)
+                        await cur.execute(
+                            f"""
+                            SELECT dalton_user_id, platform, chat_address AS target_address,
+                                   thread_scope_key, workspace_id, session_generation,
+                                   external_thread_id, raw_payload, thread_id, run_id
+                            FROM dalton_channel_inbound_events
+                            WHERE {" AND ".join(src_clauses)}
+                            ORDER BY created_at DESC
+                            LIMIT 1
+                            """,
+                            tuple(src_params),
                         )
+                        in_by_rt = await cur.fetchone()
+                        if in_by_rt:
+                            persisted_src = dict(in_by_rt)
+                    if (
+                        (
+                            persisted_src is None
+                            or persisted_src.get("session_generation") is None
+                        )
+                        and si_expected_tid
+                    ):
+                        await cur.execute(
+                            """
+                            SELECT dalton_user_id, platform, target_address,
+                                   scope_key, generation, thread_id
+                            FROM dalton_channel_thread_watches
+                            WHERE thread_id = %s
+                            """,
+                            (si_expected_tid,),
+                        )
+                        w_src = await cur.fetchone()
+                        if w_src:
+                            persisted_src = dict(w_src)
 
-                        # Resolve authoritative generation for interrupt check (never allow None to match by default)
-                        eff_expected_gen: int | None = None
-                        gen_conflict = False
-                        if (
-                            si_expected_gen is not None
-                            and persisted_gen_val is not None
-                            and int(si_expected_gen) != persisted_gen_val
-                        ):
-                            gen_conflict = True
-                        elif persisted_gen_val is not None and persisted_gen_val > 0:
-                            eff_expected_gen = persisted_gen_val
+                    src_plat_ok = True
+                    src_uid_ok = True
+                    src_scope_ok = True
+                    persisted_gen_val: int | None = None
+                    if persisted_src is not None:
+                        reject_company_system_auth(persisted_src.get("dalton_user_id"))
+                        p_plat = str(persisted_src.get("platform") or "").strip().lower()
+                        p_uid = str(persisted_src.get("dalton_user_id") or "").strip()
+                        p_scope = str(
+                            persisted_src.get("thread_scope_key")
+                            or persisted_src.get("scope_key")
+                            or ""
+                        ).strip()
+                        src_plat_ok = not p_plat or p_plat == si_plat
+                        src_uid_ok = not p_uid or p_uid == si_uid
+                        src_scope_ok = not p_scope or p_scope == si_scope
+                        if persisted_src.get("session_generation") is not None:
+                            persisted_gen_val = int(persisted_src["session_generation"])
+                        elif persisted_src.get("generation") is not None:
+                            persisted_gen_val = int(persisted_src["generation"])
                         elif (
-                            si_expected_gen is not None
-                            and int(si_expected_gen) > 0
-                            and (
-                                persisted_src is not None
-                                or (
-                                    isinstance(thread_watch, dict)
-                                    and normalize_uuid(thread_watch.get("thread_id"))
-                                    == si_expected_tid
-                                    and str(thread_watch.get("dalton_user_id") or "").strip()
-                                    == si_uid
-                                    and str(thread_watch.get("platform") or "")
-                                    .strip()
-                                    .lower()
-                                    == si_plat
-                                    and str(thread_watch.get("scope_key") or "").strip()
-                                    == si_scope
-                                    and int(thread_watch.get("generation") or 0)
-                                    == int(si_expected_gen)
-                                )
-                                or (
-                                    si_val is None
-                                    and isinstance(cur_s_int, dict)
-                                    and (
-                                        si_expected_iid is not None
-                                        or si_expected_rid is not None
-                                        or si_expected_tid is not None
-                                    )
-                                )
-                            )
+                            isinstance(persisted_src.get("raw_payload"), dict)
+                            and persisted_src["raw_payload"].get("generation")
+                            is not None
                         ):
-                            eff_expected_gen = int(si_expected_gen)
+                            persisted_gen_val = int(
+                                persisted_src["raw_payload"]["generation"]
+                            )
+                        elif persisted_src.get("external_thread_id") and ":gen:" in str(
+                            persisted_src["external_thread_id"]
+                        ):
+                            gen_s = (
+                                str(persisted_src["external_thread_id"])
+                                .rsplit(":gen:", 1)[-1]
+                                .strip()
+                            )
+                            if gen_s.isdigit():
+                                persisted_gen_val = int(gen_s)
 
-                        gen_matches_current = (
-                            not is_s_expired
-                            and not gen_conflict
-                            and src_plat_ok
-                            and src_uid_ok
-                            and src_scope_ok
-                            and eff_expected_gen is not None
-                            and eff_expected_gen == cur_s_gen
+                    s_row, _, s_db_now = await _lock_or_create_session_row(
+                        cur,
+                        platform=si_plat,
+                        scope_key=si_scope,
+                        dalton_user_id=si_uid,
+                    )
+                    # R12/R13 (Codex #2, #5 / Grok high): Acquire FOR UPDATE directly on
+                    # dalton_channel_thread_watches AFTER locking account + session_generations
+                    # (strict account -> session -> watch order matching unbind_weixin_account),
+                    # then verify DB platform and lease epoch before updating session_generations.
+                    if si_expected_tid:
+                        await cur.execute(
+                            """
+                            SELECT platform FROM dalton_channel_thread_watches
+                            WHERE thread_id = %s
+                            FOR UPDATE
+                            """,
+                            (si_expected_tid,),
                         )
-                        session_is_current_for_interrupt = gen_matches_current
+                        live_si_tw = await cur.fetchone()
+                        if live_si_tw and live_si_tw.get("platform"):
+                            si_plat = (
+                                await _enforce_db_platform(
+                                    live_si_tw["platform"],
+                                    si_plat,
+                                    "session_interrupt_update",
+                                )
+                                or si_plat
+                            )
+                        elif forced_si_platform is not None:
+                            _reject_platform_mismatch(
+                                "Concurrent thread_watch disappeared during platform retry."
+                            )
+                    cur_s_gen = int(s_row.get("generation") or 1)
+                    cur_s_int = s_row.get("pending_interrupt")
+                    is_s_expired = (
+                        _is_session_expired(
+                            s_row.get("last_conversation_activity_at"), s_db_now
+                        )
+                        and s_row.get("override_workspace_id") is not None
+                    )
 
-                        should_update_session_int = False
-                        if si_val is not None:
-                            if gen_matches_current:
-                                should_update_session_int = True
-                        else:
-                            if (
-                                gen_matches_current
+                    # Resolve authoritative generation for interrupt check (never allow None to match by default)
+                    eff_expected_gen: int | None = None
+                    gen_conflict = False
+                    if (
+                        si_expected_gen is not None
+                        and persisted_gen_val is not None
+                        and int(si_expected_gen) != persisted_gen_val
+                    ):
+                        gen_conflict = True
+                    elif persisted_gen_val is not None and persisted_gen_val > 0:
+                        eff_expected_gen = persisted_gen_val
+                    elif (
+                        si_expected_gen is not None
+                        and int(si_expected_gen) > 0
+                        and (
+                            persisted_src is not None
+                            or (
+                                isinstance(thread_watch, dict)
+                                and normalize_uuid(thread_watch.get("thread_id"))
+                                == si_expected_tid
+                                and str(thread_watch.get("dalton_user_id") or "").strip()
+                                == si_uid
+                                and str(thread_watch.get("platform") or "")
+                                .strip()
+                                .lower()
+                                == si_plat
+                                and str(thread_watch.get("scope_key") or "").strip()
+                                == si_scope
+                                and int(thread_watch.get("generation") or 0)
+                                == int(si_expected_gen)
+                            )
+                            or (
+                                si_val is None
                                 and isinstance(cur_s_int, dict)
                                 and (
                                     si_expected_iid is not None
                                     or si_expected_rid is not None
                                     or si_expected_tid is not None
                                 )
-                            ):
-                                should_update_session_int = True
-                                if (
-                                    cur_s_int.get("generation") is not None
-                                    and int(cur_s_int["generation"]) != cur_s_gen
-                                ):
-                                    should_update_session_int = False
-                                elif (
-                                    si_expected_iid
-                                    and cur_s_int.get("interrupt_id")
-                                    and str(cur_s_int["interrupt_id"])
-                                    != str(si_expected_iid)
-                                ):
-                                    should_update_session_int = False
-                                elif (
-                                    si_expected_rid
-                                    and cur_s_int.get("run_id")
-                                    and str(cur_s_int["run_id"])
-                                    != str(si_expected_rid)
-                                ):
-                                    should_update_session_int = False
-                                elif (
-                                    si_expected_tid
-                                    and cur_s_int.get("thread_id")
-                                    and normalize_uuid(cur_s_int["thread_id"])
-                                    != si_expected_tid
-                                ):
-                                    should_update_session_int = False
-
-                        if should_update_session_int:
-                            await cur.execute(
-                                """
-                                UPDATE dalton_channel_session_generations
-                                SET pending_interrupt = %s,
-                                    updated_at = NOW()
-                                WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
-                                """,
-                                (
-                                    Jsonb(si_val) if si_val is not None else None,
-                                    si_plat,
-                                    si_scope,
-                                    si_uid,
-                                ),
                             )
-                        if si_expected_tid:
-                            watch_interrupt_patch = (si_expected_tid, si_val)
+                        )
+                    ):
+                        eff_expected_gen = int(si_expected_gen)
+
+                    gen_matches_current = (
+                        not is_s_expired
+                        and not gen_conflict
+                        and src_plat_ok
+                        and src_uid_ok
+                        and src_scope_ok
+                        and eff_expected_gen is not None
+                        and eff_expected_gen == cur_s_gen
+                    )
+                    session_is_current_for_interrupt = gen_matches_current
+
+                    should_update_session_int = False
+                    if si_val is not None:
+                        if gen_matches_current:
+                            should_update_session_int = True
+                    else:
+                        if (
+                            gen_matches_current
+                            and isinstance(cur_s_int, dict)
+                            and (
+                                si_expected_iid is not None
+                                or si_expected_rid is not None
+                                or si_expected_tid is not None
+                            )
+                        ):
+                            should_update_session_int = True
+                            if (
+                                cur_s_int.get("generation") is not None
+                                and int(cur_s_int["generation"]) != cur_s_gen
+                            ):
+                                should_update_session_int = False
+                            elif (
+                                si_expected_iid
+                                and cur_s_int.get("interrupt_id")
+                                and str(cur_s_int["interrupt_id"])
+                                != str(si_expected_iid)
+                            ):
+                                should_update_session_int = False
+                            elif (
+                                si_expected_rid
+                                and cur_s_int.get("run_id")
+                                and str(cur_s_int["run_id"])
+                                != str(si_expected_rid)
+                            ):
+                                should_update_session_int = False
+                            elif (
+                                si_expected_tid
+                                and cur_s_int.get("thread_id")
+                                and normalize_uuid(cur_s_int["thread_id"])
+                                != si_expected_tid
+                            ):
+                                should_update_session_int = False
+
+                    if should_update_session_int:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_session_generations
+                            SET pending_interrupt = %s,
+                                updated_at = NOW()
+                            WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
+                            """,
+                            (
+                                Jsonb(si_val) if si_val is not None else None,
+                                si_plat,
+                                si_scope,
+                                si_uid,
+                            ),
+                        )
+                    if si_expected_tid:
+                        watch_interrupt_patch = (si_expected_tid, si_val)
 
                 # If command_effect_status == 'done' is being reported for a pending_cancel command row,
                 # lock session row first and update activity ONLY on the first valid transition pending_cancel -> done

@@ -1010,13 +1010,12 @@ probe_service_health_once() {
       if [[ -z "$gw_token" ]]; then
         return 1
       fi
-      # R12 (Codex #6): Verify gateway readiness (not just HTTP port bind):
-      # 1) GET /health with X-Service-Token must return 2xx with ok!=false;
-      # 2) If /health returns a boolean `ready` field, require `ready === true`;
-      # 3) Otherwise fall back to read-only GET /agent/settings and require HTTP 200
-      #    (rejecting 503 gateway_starting while lease/recovery/account sync finishes).
+      # R13 (Codex #1 / Grok high): Gateway readiness is signaled solely by GET /health
+      # returning HTTP 200 with JSON `{"ok": true, "ready": true}` (startup snapshot applied
+      # and write gate open). Missing `ready` or `ready: false` is treated as not ready until
+      # timeout; do not fall back to /agent/settings.
       DALTON_HEALTH_TOKEN="$gw_token" compose_cmd_timeout 10 exec -T -e DALTON_HEALTH_TOKEN channel-gateway sh -c \
-        'if [ -z "${DALTON_HEALTH_TOKEN:-}" ]; then exit 1; fi; if command -v node >/dev/null 2>&1; then node -e "const base=process.argv[1]; const hdr={\"X-Service-Token\": process.env.DALTON_HEALTH_TOKEN || \"\"}; (async()=>{const r=await fetch(base+\"/health\",{headers:hdr}); if(!r.ok) process.exit(1); let d={}; try{d=await r.json();}catch{} if(d&&d.ok===false) process.exit(1); if(typeof d.ready===\"boolean\") process.exit(d.ready?0:1); const r2=await fetch(base+\"/agent/settings\",{headers:hdr}); process.exit(r2.status===200?0:1);})().catch(()=>process.exit(1));" "$1"; elif command -v curl >/dev/null 2>&1; then body="$(curl -sf -H "X-Service-Token: ${DALTON_HEALTH_TOKEN}" "$1/health")" || exit 1; compact="$(printf "%s" "$body" | tr -d " \t\r\n")"; case "$compact" in *\"ok\":false*|*\"ready\":false*) exit 1 ;; *\"ready\":true*) exit 0 ;; esac; code="$(curl -s -o /dev/null -w "%{http_code}" -H "X-Service-Token: ${DALTON_HEALTH_TOKEN}" "$1/agent/settings")" || exit 1; [ "$code" = "200" ]; else exit 1; fi' \
+        'if [ -z "${DALTON_HEALTH_TOKEN:-}" ]; then exit 1; fi; if command -v node >/dev/null 2>&1; then node -e "const base=process.argv[1]; const hdr={\"X-Service-Token\": process.env.DALTON_HEALTH_TOKEN || \"\"}; (async()=>{const r=await fetch(base+\"/health\",{headers:hdr}); if(!r.ok) process.exit(1); const d=await r.json(); process.exit(d&&d.ok===true&&d.ready===true?0:1);})().catch(()=>process.exit(1));" "$1"; elif command -v curl >/dev/null 2>&1; then body="$(curl -sf -H "X-Service-Token: ${DALTON_HEALTH_TOKEN}" "$1/health")" || exit 1; compact="$(printf "%s" "$body" | tr -d " \t\r\n")"; case "$compact" in *\"ok\":true*\"ready\":true*|*\"ready\":true*\"ok\":true*) exit 0 ;; *) exit 1 ;; esac; else exit 1; fi' \
         _ "http://127.0.0.1:${gw_port}" >/dev/null 2>&1
       ;;
     *)

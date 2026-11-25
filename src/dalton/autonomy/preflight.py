@@ -41,6 +41,7 @@ from src.dalton.coverage import (
 )
 from src.dalton.database import watch as watch_db
 from src.dalton.llm.assist import assist_json
+from src.dalton.notify.channel_transport import GATEWAY_DELIVERY_READ_TIMEOUT_S
 from src.dalton.settings import get_dalton_settings
 
 logger = logging.getLogger(__name__)
@@ -2659,8 +2660,6 @@ async def preflight_check(
         probe_progress["wake_log_pending"] = False
     return result
 
-
-from src.dalton.notify.channel_transport import GATEWAY_DELIVERY_READ_TIMEOUT_S
 
 # R12 (Codex #3 / Grok med): Preflight retry scan must allow a full gateway delivery
 # read (>= GATEWAY_DELIVERY_READ_TIMEOUT_S = 240s) plus DB finalization headroom (4s).

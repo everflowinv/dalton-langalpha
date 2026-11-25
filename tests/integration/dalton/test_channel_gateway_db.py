@@ -8764,13 +8764,42 @@ async def test_r11_data_task_and_automation_failed_reclaim_vs_unbind_zero_deadlo
             )
             assert ub_det["ok"] is True
 
-        # 2. Concurrent race: 5 rounds each for data_task and automation_notify vs unbind_weixin_account
-        for r_idx in range(5):
-            for mode in ("data_task", "automation_notify"):
+        # 2. Controlled lock-interleaved concurrent race using pg_stat_activity:
+        #    Round 0: Hold advisory/row gate so reclaim starts FIRST and unbind blocks on
+        #    reclaim's FOR KEY SHARE lock (verifying actual contention via pg_blocking_pids),
+        #    guaranteeing reclaim genuinely executes (claim_status == 'claimed') during the race!
+        #    Rounds 1..4: Race concurrently with alternating launch order; zero 40P01 deadlocks.
+        async def _wait_for_lock_waiter(
+            holder_cur: Any,
+            waiter_task: asyncio.Task[Any],
+            timeout_s: float = 8.0,
+        ) -> None:
+            deadline = asyncio.get_running_loop().time() + timeout_s
+            while True:
+                assert not waiter_task.done(), (
+                    f"waiter finished before blocking: {waiter_task.exception()!r}"
+                )
+                await holder_cur.execute(
+                    """
+                    SELECT pid FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND pid <> pg_backend_pid()
+                      AND pg_backend_pid() = ANY(pg_blocking_pids(pid))
+                    """
+                )
+                if await holder_cur.fetchall():
+                    return
+                assert asyncio.get_running_loop().time() < deadline, (
+                    "Timed out waiting for concurrent task to block on held DB lock"
+                )
+                await asyncio.sleep(0.02)
+
+        for mode in ("data_task", "automation_notify"):
+            claimed_in_concurrent_race = 0
+            for r_idx in range(5):
                 aid, run_or_deliv_id, dkey, target_str = await _seed_failed_reclaim_case(
                     mode, f"r{r_idx}"
                 )
-                start_evt = asyncio.Event()
 
                 async def _targets(_uid: str | None, t: str = target_str) -> list[str]:
                     return [t]
@@ -8781,7 +8810,6 @@ async def test_r11_data_task_and_automation_failed_reclaim_vs_unbind_zero_deadlo
                     dk: str = dkey,
                     t: str = target_str,
                 ) -> dict[str, Any]:
-                    await start_evt.wait()
                     if m == "data_task":
                         return await dt_db.authorize_and_claim_data_task_delivery(
                             delivery_key=dk,
@@ -8809,26 +8837,74 @@ async def test_r11_data_task_and_automation_failed_reclaim_vs_unbind_zero_deadlo
                     )
 
                 async def _do_unbind(a_arg: str = aid) -> dict[str, Any]:
-                    await start_evt.wait()
                     return await wx_db.unbind_weixin_account(
                         account_id=a_arg,
                         operator_user_id=user_a,
                         action="member_unbind",
                     )
 
-                if r_idx % 2 == 0:
+                if r_idx == 0:
+                    # Deterministic lock-contention round: hold FOR UPDATE on the delivery row
+                    # while reclaim acquires weixin_accounts FOR KEY SHARE and blocks on the
+                    # delivery row, then launch unbind so unbind blocks on reclaim's FOR KEY SHARE
+                    # (verified via pg_stat_activity / pg_blocking_pids), then release!
                     t_c = asyncio.create_task(_do_reclaim())
-                    t_u = asyncio.create_task(_do_unbind())
+                    t_u: asyncio.Task[Any] | None = None
+                    try:
+                        async with pool.connection() as gate_conn:
+                            async with gate_conn.transaction():
+                                async with gate_conn.cursor() as gate_cur:
+                                    await gate_cur.execute(
+                                        """
+                                        SELECT delivery_key
+                                        FROM dalton_channel_deliveries
+                                        WHERE delivery_key = %s
+                                        FOR UPDATE
+                                        """,
+                                        (dkey,),
+                                    )
+                                    # Wait until reclaim has acquired weixin_accounts FOR KEY SHARE
+                                    # and is actively blocked waiting on our delivery row FOR UPDATE
+                                    await _wait_for_lock_waiter(gate_cur, t_c)
+                                    # Now launch unbind; it must wait on reclaim's FOR KEY SHARE
+                                    t_u = asyncio.create_task(_do_unbind())
+                                    await asyncio.sleep(0.05)
+                        claim_res, unbind_res = await asyncio.gather(t_c, t_u)
+                    finally:
+                        if not t_c.done():
+                            t_c.cancel()
+                        if t_u is not None and not t_u.done():
+                            t_u.cancel()
                 else:
-                    t_u = asyncio.create_task(_do_unbind())
-                    t_c = asyncio.create_task(_do_reclaim())
-                await asyncio.sleep(0)
-                start_evt.set()
-                claim_res, unbind_res = await asyncio.gather(t_c, t_u)
+                    start_evt = asyncio.Event()
+
+                    async def _gated_reclaim() -> dict[str, Any]:
+                        await start_evt.wait()
+                        return await _do_reclaim()
+
+                    async def _gated_unbind() -> dict[str, Any]:
+                        await start_evt.wait()
+                        return await _do_unbind()
+
+                    if r_idx % 2 == 0:
+                        t_c = asyncio.create_task(_gated_reclaim())
+                        t_u = asyncio.create_task(_gated_unbind())
+                    else:
+                        t_u = asyncio.create_task(_gated_unbind())
+                        t_c = asyncio.create_task(_gated_reclaim())
+                    await asyncio.sleep(0)
+                    start_evt.set()
+                    claim_res, unbind_res = await asyncio.gather(t_c, t_u)
+
                 assert unbind_res["ok"] is True
                 assert claim_res["claim_status"] in ("claimed", "denied")
-                if claim_res["claim_status"] == "denied":
+                if claim_res["claim_status"] == "claimed":
+                    claimed_in_concurrent_race += 1
+                else:
                     assert claim_res["code"] == "not_linked", f"{mode} r{r_idx}: {claim_res}"
+            assert claimed_in_concurrent_race >= 1, (
+                f"{mode}: expected at least 1 concurrent round to genuinely execute reclaim (claimed)"
+            )
     finally:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -9303,6 +9379,288 @@ async def test_r12_i7_interrupt_vs_unbind_zero_deadlock_foreign_run_and_i8_finis
                 await cur.execute(
                     "DELETE FROM dalton_channel_automation_runs WHERE execution_id = %s::uuid",
                     (exec_id,),
+                )
+                await cur.execute("DELETE FROM dalton_channel_gateway_lease WHERE singleton_id = 1")
+
+
+@pytest.mark.asyncio
+async def test_r13_first_write_watch_vs_unbind_inbound_thread_check_upload_guard_and_login_status_real_pg(
+    db_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real PG (R13 Codex #2, #6 + Gateway R6 companion):
+    1) First-write Weixin thread_watch (watch row does NOT exist beforehand!) +
+       session_interrupt_update with valid epoch races concurrently against
+       unbind_weixin_account across 5 rounds with ZERO 40P01 deadlocks
+       (account FOR KEY SHARE -> session FOR UPDATE -> watch INSERT);
+    2) Inbound-event-only update on an existing Feishu inbound_event carrying a top-level
+       thread_id pointing to a Weixin conversation_threads row rejects without epoch
+       (409 stale_gateway_epoch) and with epoch (409 platform_mismatch), leaving thread_id NULL;
+    3) verify_weixin_upload_headers allows valid account/gen/epoch, skips non-Weixin uploads,
+       and rejects stale epoch (409 stale_gateway_epoch) and unbound/rotated account
+       (409 weixin_bot_generation_superseded);
+    4) Confirmed login session GET directly returns live `account_status`.
+    """
+    from fastapi import HTTPException
+    from starlette.datastructures import Headers
+    from types import SimpleNamespace
+
+    prefix = db_env["prefix"]
+    user_a = db_env["user_a"]
+    ws_a1 = db_env["ws_a1"]
+    pool: AsyncConnectionPool = db_env["pool"]
+    monkeypatch.setenv("DALTON_PM_USER_IDS", user_a)
+    monkeypatch.setenv("DALTON_ALLOWED_EMAILS", f"{user_a}@example.com")
+
+    lease = await wx_db.acquire_gateway_lease(instance_id=f"{prefix}_r13_gw")
+    epoch = int(lease["epoch"])
+
+    tid_wx_in = str(uuid4())
+    feishu_mid = f"{prefix}_r13_feishu_in_only"
+    db_env["cleanup_thread_ids"].append(tid_wx_in)
+
+    try:
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE dalton_channel_weixin_config SET enabled = TRUE, allow_external = TRUE WHERE singleton_id = 1"
+                    )
+
+        # 1. Watch row does NOT exist beforehand: first-write I-7 (session_interrupt_update +
+        #    thread_watch) with valid epoch vs unbind_weixin_account across 5 rounds -> ZERO 40P01
+        for r_idx in range(5):
+            bot_id = f"{prefix}_r13_fw_bot_{r_idx}@im.wechat"
+            wx_uid = f"{prefix}_r13_fw_u_{r_idx}@im.wechat"
+            scope = f"dm:{wx_uid}"
+            tid_new = str(uuid4())
+            db_env["cleanup_thread_ids"].append(tid_new)
+
+            s = await wx_db.start_weixin_login_session(user_id=user_a)
+            await wx_db.patch_weixin_login_session(
+                session_key=s["session_key"],
+                gateway_epoch=epoch,
+                action="save_qr",
+                qrcode=f"{prefix}-fw-{r_idx}",
+            )
+            c = await wx_db.patch_weixin_login_session(
+                session_key=s["session_key"],
+                gateway_epoch=epoch,
+                action="confirm",
+                expected_login_version=2,
+                ilink_bot_id=bot_id,
+                bot_token=f"tok-{uuid4().hex}",
+                ilink_user_id=wx_uid,
+            )
+            aid = c["account_id"]
+            gen = int(c["bot_generation"])
+
+            # Verify confirmed login session GET carries live account_status (Item 9b)
+            if r_idx == 0:
+                sess_info = await wx_db.get_weixin_login_session(
+                    session_key=s["session_key"]
+                )
+                assert sess_info["status"] == "confirmed"
+                assert sess_info["account_status"] == c["account_status"]
+                assert sess_info["confirmed_result"]["account_status"] == c["account_status"]
+
+                # Verify upload guard allows active account + matching gen + valid epoch (Item 9a)
+                await wx_db.verify_weixin_upload_headers(
+                    request=SimpleNamespace(
+                        headers=Headers(
+                            {
+                                "X-Weixin-Account-Id": aid,
+                                "X-Weixin-Bot-Generation": str(gen),
+                                "X-Gateway-Epoch": str(epoch),
+                            }
+                        )
+                    ),
+                    user_id=user_a,
+                )
+                # Stale epoch rejected 409 stale_gateway_epoch
+                with pytest.raises(HTTPException) as exc_up_ep:
+                    await wx_db.verify_weixin_upload_headers(
+                        request=SimpleNamespace(
+                            headers=Headers(
+                                {
+                                    "X-Weixin-Account-Id": aid,
+                                    "X-Weixin-Bot-Generation": str(gen),
+                                    "X-Gateway-Epoch": str(epoch + 99),
+                                }
+                            )
+                        ),
+                        user_id=user_a,
+                    )
+                assert exc_up_ep.value.status_code == 409
+                assert exc_up_ep.value.detail["code"] == "stale_gateway_epoch"
+                # Wrong generation rejected 409 weixin_bot_generation_superseded
+                with pytest.raises(HTTPException) as exc_up_gen:
+                    await wx_db.verify_weixin_upload_headers(
+                        request=SimpleNamespace(
+                            headers=Headers(
+                                {
+                                    "X-Weixin-Account-Id": aid,
+                                    "X-Weixin-Bot-Generation": str(gen + 1),
+                                    "X-Gateway-Epoch": str(epoch),
+                                }
+                            )
+                        ),
+                        user_id=user_a,
+                    )
+                assert exc_up_gen.value.status_code == 409
+                assert exc_up_gen.value.detail["code"] == "weixin_bot_generation_superseded"
+                # Non-Weixin upload (no Weixin headers) passes untouched
+                await wx_db.verify_weixin_upload_headers(
+                    request=SimpleNamespace(headers=Headers({})),
+                    user_id=user_a,
+                )
+
+            # Seed session row only; intentionally DO NOT pre-create dalton_channel_thread_watches!
+            async with pool.connection() as conn:
+                async with conn.transaction():
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            INSERT INTO dalton_channel_session_generations (
+                                platform, scope_key, dalton_user_id, generation
+                            )
+                            VALUES ('weixin', %s, %s, 1)
+                            ON CONFLICT (platform, scope_key, dalton_user_id) DO NOTHING
+                            """,
+                            (scope, user_a),
+                        )
+
+            start_evt = asyncio.Event()
+
+            async def _do_first_write(
+                tid_arg: str = tid_new, sc_arg: str = scope, idx: int = r_idx
+            ) -> dict[str, Any]:
+                await start_evt.wait()
+                return await cg_db.update_inbound_progress(
+                    session_interrupt_update={
+                        "platform": "weixin",
+                        "thread_id": tid_arg,
+                        "scope_key": sc_arg,
+                        "dalton_user_id": user_a,
+                        "generation": 1,
+                        "pending_interrupt": {"interrupt_id": f"fw-{idx}", "q": "ok?"},
+                    },
+                    thread_watch={
+                        "thread_id": tid_arg,
+                        "dalton_user_id": user_a,
+                        "platform": "weixin",
+                        "target_address": "weixin:@me",
+                        "scope_key": sc_arg,
+                        "generation": 1,
+                        "watch_active": True,
+                    },
+                    gateway_epoch=epoch,
+                    require_gateway_epoch=True,
+                )
+
+            async def _do_unbind(a_arg: str = aid) -> dict[str, Any]:
+                await start_evt.wait()
+                return await wx_db.unbind_weixin_account(
+                    account_id=a_arg,
+                    operator_user_id=user_a,
+                    action="member_unbind",
+                )
+
+            if r_idx % 2 == 0:
+                t_fw = asyncio.create_task(_do_first_write())
+                t_u = asyncio.create_task(_do_unbind())
+            else:
+                t_u = asyncio.create_task(_do_unbind())
+                t_fw = asyncio.create_task(_do_first_write())
+            await asyncio.sleep(0)
+            start_evt.set()
+            fw_res, ub_res = await asyncio.gather(t_fw, t_u)
+            assert fw_res["ok"] is True
+            assert ub_res["ok"] is True
+
+            # After unbind, upload guard MUST reject the unbound account with 409
+            if r_idx == 0:
+                with pytest.raises(HTTPException) as exc_up_ub:
+                    await wx_db.verify_weixin_upload_headers(
+                        request=SimpleNamespace(
+                            headers=Headers(
+                                {
+                                    "X-Weixin-Account-Id": aid,
+                                    "X-Weixin-Bot-Generation": str(gen),
+                                    "X-Gateway-Epoch": str(epoch),
+                                }
+                            )
+                        ),
+                        user_id=user_a,
+                    )
+                assert exc_up_ub.value.status_code == 409
+                assert exc_up_ub.value.detail["code"] == "weixin_bot_generation_superseded"
+
+        # 2. Inbound-event-only update on existing Feishu inbound row + Weixin thread_id (Item 6)
+        async with pool.connection() as conn:
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        INSERT INTO conversation_threads (
+                            conversation_thread_id, workspace_id, user_id,
+                            current_status, thread_index, platform, created_at, updated_at
+                        )
+                        VALUES (%s::uuid, %s::uuid, %s, 'completed', 0, 'weixin', NOW(), NOW())
+                        """,
+                        (tid_wx_in, ws_a1, user_a),
+                    )
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_channel_inbound_events (
+                            platform, message_id, request_key, dalton_user_id,
+                            chat_type, chat_address, thread_scope_key, status, raw_payload
+                        )
+                        VALUES (
+                            'feishu', %s, %s::uuid, %s,
+                            'dm', 'feishu:@me', 'dm:ou_r13', 'accepted', '{}'::jsonb
+                        )
+                        """,
+                        (feishu_mid, str(uuid4()), user_a),
+                    )
+
+        with pytest.raises(HTTPException) as exc_in_ep:
+            await cg_db.update_inbound_progress(
+                platform="feishu",
+                message_id=feishu_mid,
+                thread_id=tid_wx_in,
+                status="streaming",
+                gateway_epoch=None,
+                require_gateway_epoch=True,
+            )
+        assert exc_in_ep.value.status_code == 409
+        assert exc_in_ep.value.detail["code"] == "stale_gateway_epoch"
+
+        with pytest.raises(HTTPException) as exc_in_mm:
+            await cg_db.update_inbound_progress(
+                platform="feishu",
+                message_id=feishu_mid,
+                thread_id=tid_wx_in,
+                status="streaming",
+                gateway_epoch=epoch,
+                require_gateway_epoch=True,
+            )
+        assert exc_in_mm.value.status_code == 409
+        assert exc_in_mm.value.detail["code"] == "platform_mismatch"
+
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT thread_id FROM dalton_channel_inbound_events WHERE platform = 'feishu' AND message_id = %s",
+                    (feishu_mid,),
+                )
+                in_row = await cur.fetchone()
+                assert in_row is not None and in_row["thread_id"] is None
+    finally:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM dalton_channel_inbound_events WHERE platform = 'feishu' AND message_id = %s",
+                    (feishu_mid,),
                 )
                 await cur.execute("DELETE FROM dalton_channel_gateway_lease WHERE singleton_id = 1")
 

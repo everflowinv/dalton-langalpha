@@ -897,7 +897,8 @@ def test_r10_recovery_health_check_probes_crawler_and_gateway_health_endpoints(
         assert "exec -T crawler curl -sf http://127.0.0.1:8100/health" in trace_txt
         assert "exec -T -e DALTON_HEALTH_TOKEN channel-gateway sh -c" in trace_txt
         assert "http://127.0.0.1:8962" in trace_txt
-        assert "/health" in trace_txt and "/agent/settings" in trace_txt
+        assert "/health" in trace_txt and "ready" in trace_txt
+        assert "/agent/settings" not in trace_txt
         if expect_ok:
             assert "ALREADY restored the pre-upgrade release files" in res.stderr
             assert "health_ok=0" not in res.stderr
@@ -1009,13 +1010,14 @@ def test_r11_gateway_health_auth_and_normal_upgrade_probes_crawler_and_gateway(
         assert expect_tag in res_fail.stderr, f"{case_name}: {res_fail.stderr}"
 
     # 3. Execute the exact channel-gateway sh -c readiness probe from upgrade.sh in both
-    #    the curl fallback branch and the node branch without opening network sockets
+    #    the curl branch and the node branch without opening network sockets
     #    (unit tests run under pytest-socket):
-    #    - missing/wrong token -> fail
-    #    - /health {"ok":true,"ready":false} -> fail (still starting)
-    #    - /health {"ok":true,"ready":true} -> pass
-    #    - /health {"ok":true} (no ready field) + /agent/settings 503 gateway_starting -> fail
-    #    - /health {"ok":true} (no ready field) + /agent/settings 200 -> pass
+    #    - probe MUST NOT fall back to /agent/settings;
+    #    - missing/wrong token -> fail;
+    #    - /health {"ok":true,"ready":false} -> fail (still starting, continues polling);
+    #    - /health {"ok":true} (missing ready field) -> fail (treated as not ready until timeout);
+    #    - /health {"ok":false,"ready":true} -> fail;
+    #    - /health {"ok":true,"ready":true} -> pass.
     script_src = _UPGRADE_SCRIPT.read_text(encoding="utf-8")
     m_probe = _re.search(
         r"exec -T -e DALTON_HEALTH_TOKEN channel-gateway sh -c \\\n\s+'([^']+)'",
@@ -1023,11 +1025,12 @@ def test_r11_gateway_health_auth_and_normal_upgrade_probes_crawler_and_gateway(
     )
     assert m_probe is not None, "Expected channel-gateway sh -c readiness probe in upgrade.sh"
     probe_snippet = m_probe.group(1)
+    assert "/agent/settings" not in probe_snippet
 
     base_url = "http://127.0.0.1:8962"
     base_probe_env = {k: v for k, v in os.environ.items() if k != "DALTON_HEALTH_TOKEN"}
 
-    # 3a. curl fallback branch (PATH contains fake curl + /usr/bin for tr, NO node)
+    # 3a. curl branch (PATH contains fake curl + /usr/bin for tr, NO node)
     curl_bin = tmp_path / "probe-curl-bin"
     curl_bin.mkdir()
     tr_bin = Path("/usr/bin/tr")
@@ -1039,18 +1042,10 @@ def test_r11_gateway_health_auth_and_normal_upgrade_probes_crawler_and_gateway(
 set -euo pipefail
 hdr=""
 target=""
-write_code=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -H)
       hdr="${{2:-}}"
-      shift 2
-      ;;
-    -o)
-      shift 2
-      ;;
-    -w)
-      write_code=1
       shift 2
       ;;
     -sf|-s|-f)
@@ -1063,19 +1058,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 if [[ "$hdr" != "X-Service-Token: {secret_tok}" ]]; then
-  if [[ "$write_code" -eq 1 ]]; then echo "401"; exit 0; fi
   exit 22
 fi
 if [[ "$target" == "{base_url}/health" ]]; then
   printf '%s' "${{FAKE_HEALTH_BODY:-}}"
   exit "${{FAKE_HEALTH_RC:-0}}"
-fi
-if [[ "$target" == "{base_url}/agent/settings" ]]; then
-  if [[ "$write_code" -eq 1 ]]; then
-    echo "${{FAKE_SETTINGS_CODE:-200}}"
-    exit 0
-  fi
-  exit 0
 fi
 exit 22
 """,
@@ -1087,9 +1074,10 @@ exit 22
         ("missing-token", {}, False),
         ("wrong-token", {"DALTON_HEALTH_TOKEN": "wrong-token", "FAKE_HEALTH_BODY": '{"ok":true,"ready":true}'}, False),
         ("health-ready-false", {"DALTON_HEALTH_TOKEN": secret_tok, "FAKE_HEALTH_BODY": '{"ok": true, "ready": false}'}, False),
+        ("health-missing-ready", {"DALTON_HEALTH_TOKEN": secret_tok, "FAKE_HEALTH_BODY": '{"ok": true}'}, False),
+        ("health-ok-false", {"DALTON_HEALTH_TOKEN": secret_tok, "FAKE_HEALTH_BODY": '{"ok": false, "ready": true}'}, False),
         ("health-ready-true", {"DALTON_HEALTH_TOKEN": secret_tok, "FAKE_HEALTH_BODY": '{"ok": true, "ready": true}'}, True),
-        ("health-no-ready-settings-503", {"DALTON_HEALTH_TOKEN": secret_tok, "FAKE_HEALTH_BODY": '{"ok": true}', "FAKE_SETTINGS_CODE": "503"}, False),
-        ("health-no-ready-settings-200", {"DALTON_HEALTH_TOKEN": secret_tok, "FAKE_HEALTH_BODY": '{"ok": true}', "FAKE_SETTINGS_CODE": "200"}, True),
+        ("health-ready-true-reversed-keys", {"DALTON_HEALTH_TOKEN": secret_tok, "FAKE_HEALTH_BODY": '{"ready": true, "ok": true}'}, True),
     ):
         r_c = subprocess.run(
             ["/bin/sh", "-c", probe_snippet, "_", base_url],
@@ -1100,7 +1088,7 @@ exit 22
         )
         assert (r_c.returncode == 0) is expect_ok, f"curl branch {label}: rc={r_c.returncode} err={r_c.stderr}"
 
-    # 3b. node branch (PATH has fake node; verifies JS checks /health ready + /agent/settings 200 fallback)
+    # 3b. node branch (PATH has fake node; verifies JS checks /health ok===true && ready===true only)
     node_bin = tmp_path / "probe-node-bin"
     node_bin.mkdir()
     fake_node = node_bin / "node"
@@ -1111,7 +1099,8 @@ if [[ "${{1:-}}" != "-e" ]]; then exit 2; fi
 js="${{2:-}}"
 target="${{3:-}}"
 if [[ "$js" != *"X-Service-Token"* || "$js" != *"DALTON_HEALTH_TOKEN"* ]]; then exit 3; fi
-if [[ "$js" != *"/health"* || "$js" != *"ready"* || "$js" != *"/agent/settings"* ]]; then exit 5; fi
+if [[ "$js" != *"/health"* || "$js" != *"ready===true"* ]]; then exit 5; fi
+if [[ "$js" == *"/agent/settings"* ]]; then exit 6; fi
 if [[ "$target" != "{base_url}" ]]; then exit 4; fi
 if [[ "${{DALTON_HEALTH_TOKEN:-}}" != "{secret_tok}" ]]; then exit 1; fi
 exit 0
@@ -1136,6 +1125,53 @@ exit 0
         check=False,
     )
     assert r_node_good.returncode == 0, r_node_good.stderr
+
+    # 3c. Verify upgrade.sh polling behavior: ready:false -> keeps polling and times out;
+    #     ready:false on attempt 1 then ready:true on attempt 2 -> succeeds!
+    poll_dir = tmp_path / "poll-ready-transition"
+    poll_dir.mkdir()
+    poll_count_file = poll_dir / "gw_health_calls"
+    poll_count_file.write_text("0", encoding="utf-8")
+    w_p, r_p, fb_p, _ = _make_fake_env(
+        poll_dir,
+        compose_services="postgres\nredis\nbackend\ncrawler\nchannel-gateway\nedge\n",
+        running_services="postgres\nredis\nbackend\ncrawler\nchannel-gateway\nedge\n",
+        drain_counts=("0",),
+        migrate_rc=0,
+        service_token=secret_tok,
+        expected_gateway_token=secret_tok,
+    )
+    # Patch fake docker so attempt 1 fails (simulating ready:false) and attempt 2 succeeds (ready:true)
+    fd_path = fb_p / "docker"
+    fd_src = fd_path.read_text(encoding="utf-8")
+    fd_src = fd_src.replace(
+        "exit 0\n        fi\n        exit 0",
+        f'c="$(cat "{poll_count_file}")"\nc=$((c + 1))\necho "$c" > "{poll_count_file}"\nif [[ "$c" -lt 2 ]]; then exit 1; fi\nexit 0\n        fi\n        exit 0',
+        1,
+    )
+    fd_path.write_text(fd_src, encoding="utf-8")
+    res_poll = subprocess.run(
+        [
+            "bash",
+            str(_UPGRADE_SCRIPT),
+            "--work-dir",
+            str(w_p),
+            "--release-dir",
+            str(r_p),
+            "--skip-build",
+        ],
+        env={
+            **os.environ,
+            "PATH": f"{fb_p}:{os.environ['PATH']}",
+            "DALTON_POST_UPGRADE_HEALTH_RETRIES": "3",
+            "DALTON_POST_UPGRADE_HEALTH_SLEEP_S": "0",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_poll.returncode == 0, res_poll.stderr
+    assert int(poll_count_file.read_text(encoding="utf-8").strip()) == 2
 
 
 
