@@ -592,8 +592,16 @@ async def finish_run(
     if thread_id:
         body["thread_id"] = str(thread_id)
     if status == "completed" and final_text and final_text.strip():
-        if len(final_text) > _FINAL_TEXT_CHARS:
-            final_text = final_text[: _FINAL_TEXT_CHARS - 1] + "…"
+        # DALTON-HOOK(standalone-core): rewrite same-origin /monitors/... links and avoid cutting mid-link when truncating for channel-gateway fallback delivery
+        from src.dalton.notify.dispatch import (
+            rewrite_monitor_links_for_external,
+            truncate_preserving_markdown_links,
+        )
+
+        final_text = truncate_preserving_markdown_links(
+            rewrite_monitor_links_for_external(final_text),
+            _FINAL_TEXT_CHARS,
+        )
         body["final_text"] = final_text
     try:
         answer = await messaging.gateway_request(

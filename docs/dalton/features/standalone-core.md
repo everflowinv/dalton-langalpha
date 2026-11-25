@@ -171,8 +171,10 @@ flowchart LR
 
 1. **获取干净发行包（或克隆仓库后导出干净目录）**
    ```bash
-   # 客户交付场景直接解压干净源码发行包；开发验证场景从当前提交导出干净包：
-   tar xzf dalton-core-<version>.tar.gz && cd dalton-core-<version>
+   # 客户交付场景直接解压干净源码发行包（包内带单一顶层目录 dalton-core-<短提交号>/）：
+   tar xzf dalton-core-<version>.tar.gz && cd dalton-core-<短提交号>
+   # 也可直接解压到固定部署目录：
+   # mkdir -p /opt/dalton && tar -xzf dalton-core-<version>.tar.gz --strip-components=1 -C /opt/dalton && cd /opt/dalton
    ```
 2. **运行初始化脚本（自动体检环境并生成全套随机密钥）**
    ```bash
@@ -181,13 +183,17 @@ flowchart LR
    - 校验 Docker Engine（≥ 28.0，确保宿主机 `127.0.0.1` 回环端口发布不被同二层网络邻机访问）、Docker Compose（≥ v2.24.4）、内存（建议 ≥ 8 GB）与磁盘（≥ 30 GB），打印 `docker.sock` 独占主机安全提示（默认一台主机部署一套核心栈）；
    - 自动用 `openssl rand -hex 32` 生成数据库密码、Redis 密码、MinIO 密钥、`INTERNAL_SERVICE_TOKEN`、`BYOK_ENCRYPTION_KEY`、本地登录签名密钥 `JWT_SIGNING_SECRET` 及带 24 小时有效期的管理员自举口令 `BOOTSTRAP_SETUP_TOKEN`；
    - 提示填入 `DOMAIN`（公网域名走 ACME〔自动证书管理环境协议〕自动签发 HTTPS 证书；企业内网域名可指定自有 TLS 证书；填 `localhost` 时仅绑定本机回环 `127.0.0.1:8088` 供单机试用）。
-3. **一键拉起核心服务栈**
+3. **单次构建并拉起核心服务栈**
    ```bash
+   # 从 .env 读取 init.sh 写入的 COMPOSE_PROJECT_NAME，确保与 backup.sh / upgrade.sh 指向同一项目
+   PROJECT_NAME="$(python3 -c 'import re; m=[re.match(r"^\s*(?:export\s+)?COMPOSE_PROJECT_NAME\s*[=:]\s*[\"'"'"']?([^\"'"'"'#\s]+)", l) for l in open(".env")]; vals=[x.group(1) for x in m if x]; print(vals[-1] if vals else "")')"
+   test -n "$PROJECT_NAME"
    # 仅叠加基础编排与自包含的 docker-compose.core.yml（无需引用 docker-compose.dalton.yml）
-   docker compose -f docker-compose.yml -f docker-compose.core.yml up -d --build
+   env -u VITE_DALTON_AUTH docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env build
+   docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d
    ```
    - 先运行 `postgres`（`scripts/dalton/Dockerfile.postgres`）、`redis`、由 `docker-compose.core.yml` 完整定义的 `minio` 与桶初始化，再由一次性 `migrate` 容器串行跑完上游与 Dalton 双链 `head` 迁移，随后启动接入 `sandbox-net` 的双进程 `backend`、`crawler` 以及挂载核心 `deploy/standalone/Caddyfile` 与静态 `/srv` 的 `edge`。
-   - **切换认证模式后需重建 `edge`**：`VITE_DALTON_AUTH` 作为普通构建参数（`ARG`）在前端构建期注入并参与构建缓存计算；修改 `.env` 中的 `DALTON_AUTH_MODE` / `VITE_DALTON_AUTH`（例如从 `oss` 切到 `local`）后，须执行 `docker compose -f docker-compose.yml -f docker-compose.core.yml up -d --build edge` 重建 `edge` 镜像与容器，使前端同步切换认证模式。
+   - **切换认证模式后需重建 `edge`**：`VITE_DALTON_AUTH` 作为普通构建参数（`ARG`）在前端构建期注入并参与构建缓存计算；修改 `.env` 中的 `DALTON_AUTH_MODE` / `VITE_DALTON_AUTH`（例如从 `oss` 切到 `local`）后，须执行 `env -u VITE_DALTON_AUTH docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env build edge && docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d` 重建 `edge` 镜像与容器，使前端同步切换认证模式。
 4. **浏览器创建首个管理员并发起第一次研究对话**
    - 打开 `https://<DOMAIN>`（或本机 SSH 端口转发 `http://127.0.0.1:8088`），在 `/setup/admin` 页面输入终端打印的一次性自举口令、管理员邮箱/用户名与登录密码完成建号（口令当即永久作废）；
    - 在引导页填入任意模型 API Key（或已加入管理员白名单的内网模型网关地址 + Key），新建工作区、上传财报或 CSV 数据文件、完成带沙箱计算的首轮流式问答。

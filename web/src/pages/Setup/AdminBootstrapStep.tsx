@@ -244,7 +244,7 @@ export default function AdminBootstrapStep() {
               minLength={MIN_ADMIN_PASSWORD_LEN}
               required
             />
-            <PasswordStrength password={password} />
+            <PasswordStrength password={password} minLength={MIN_ADMIN_PASSWORD_LEN} />
           </div>
 
           <div className="login-page__field">

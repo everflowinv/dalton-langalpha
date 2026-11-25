@@ -54,13 +54,15 @@ sudo usermod -aG docker "$USER"
 
 ### 第 1 步：解压发行包
 
-将获取到的发行压缩包上传到服务器并解压至部署目录（以下以 `/opt/dalton` 为例）：
+发行压缩包内自带单一顶层目录 `dalton-core-<短提交号>/`。将压缩包上传到服务器后，使用 `--strip-components=1` 展开到目标部署目录（以下以 `/opt/dalton` 为例）：
 
 ```bash
 mkdir -p /opt/dalton
-tar -xzf dalton-core-<version>.tar.gz -C /opt/dalton
+tar -xzf dalton-core-<version>.tar.gz --strip-components=1 -C /opt/dalton
 cd /opt/dalton
 ```
+
+直接执行 `tar -xzf dalton-core-<version>.tar.gz` 时，文件会解出到当前目录下的 `dalton-core-<短提交号>/` 子目录中。
 
 ### 第 2 步：运行初始化脚本
 
@@ -80,6 +82,8 @@ bash scripts/standalone/init.sh --domain localhost
 bash scripts/standalone/init.sh --domain localhost --tls-mode internal
 ```
 
+需要在本机回环 HTTP 模式下试用多用户登录与管理员创建时，先按 §4.1 修改 `.env`，再执行第 4 步构建与启动，一次完成前端镜像编译。
+
 首次构建代码沙箱镜像通常需要 20–40 分钟。若希望先完成配置再另行构建沙箱镜像，可附加 `--skip-sandbox-build`，随后手动执行：
 
 ```bash
@@ -96,9 +100,9 @@ make config
 
 也可先启动服务，再在浏览器首次引导页中配置模型密钥（详见第 5 节）。
 
-### 第 4 步：启动核心服务栈并核验状态
+### 第 4 步：构建镜像、启动核心服务栈并核验状态
 
-为避免被当前 shell 中导出的 `COMPOSE_PROJECT_NAME` / `COMPOSE_FILE` 等变量劫持到其他部署实例，本手册所有 `docker compose` 命令均显式指定 `-p <项目名> -f <文件>... --env-file .env`，其中 `<项目名>` 从当前目录 `.env` 的 `COMPOSE_PROJECT_NAME` 读取（默认由 `init.sh` 写入 `dalton-core`，不读 shell 环境变量）：
+为确保所有命令始终作用于当前部署实例，本手册所有 `docker compose` 命令均显式指定 `-p <项目名> -f <文件>... --env-file .env`，其中 `<项目名>` 从当前目录 `.env` 的 `COMPOSE_PROJECT_NAME` 读取（`init.sh` 默认按部署目录名写入，部署在 `/opt/dalton` 时默认为 `dalton`）。构建命令前附加 `env -u VITE_DALTON_AUTH`，确保 Compose 直接使用 `.env` 中的认证模式而不受当前 shell 环境变量干扰。先执行 `build` 单次构建后端、边缘网关与数据库镜像（`crawler`、`migrate`、`minio-init` 共用 `backend` 构建出的 `dalton-core-backend:local`），再执行 `up -d` 启动全套服务：
 
 ```bash
 cd /opt/dalton
@@ -106,9 +110,11 @@ PROJECT_NAME="$(python3 -c 'import re; m=[re.match(r"^\s*(?:export\s+)?COMPOSE_P
 test -n "$PROJECT_NAME"
 
 # 回环 HTTP 模式
+env -u VITE_DALTON_AUTH docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env build
 docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d
 
 # 启用 HTTPS 模式（IPv6 回环替换为 deploy/standalone/docker-compose.tls.ipv6.yml）
+env -u VITE_DALTON_AUTH docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env build
 docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d
 ```
 
@@ -139,6 +145,7 @@ docker volume ls --filter name=dalton-caddy-data
 
 ```bash
 bash scripts/standalone/init.sh --domain localhost
+env -u VITE_DALTON_AUTH docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env build
 docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d
 ```
 
@@ -151,15 +158,18 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -
 ```bash
 # 企业内网域名或 IPv4 局域网 IP（显式传入 --tls-mode internal，监听 0.0.0.0:80 与 0.0.0.0:443）
 bash scripts/standalone/init.sh --domain dalton.corp.example.com --tls-mode internal
-docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --build
+env -u VITE_DALTON_AUTH docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env build
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d
 
 # 纯 IPv6 内网主机名（传入 --bind '[::]'，监听 [::]:80 与 [::]:443，使用 IPv6 叠加文件）
 bash scripts/standalone/init.sh --domain dalton.corp.example.com --tls-mode internal --bind '[::]'
-docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env up -d --build
+env -u VITE_DALTON_AUTH docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env build
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env up -d
 
 # 本机回环 HTTPS（绑定 127.0.0.1:18080 与 127.0.0.1:18443，HTTP 跳转自动携带 18443 端口并启用 HSTS）
 bash scripts/standalone/init.sh --domain localhost --tls-mode internal
-docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --build
+env -u VITE_DALTON_AUTH docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env build
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d
 ```
 
 启动 `edge` 后，导出 Caddy 内部 CA（证书颁发机构）根证书并导入客户端或操作系统的受信任根证书库：
@@ -178,7 +188,8 @@ bash scripts/standalone/init.sh \
   --domain dalton.corp.internal \
   --tls-mode custom \
   --tls-cert-dir /etc/dalton/certs
-docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --build
+env -u VITE_DALTON_AUTH docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env build
+docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d
 ```
 
 > **自有证书备份与健康探测**：`backup.sh` 仅归档 Caddy 的 `/data` 卷，请单独做好 `DALTON_TLS_CERT_DIR`（含 `cert.pem` 与 `key.pem`）的备份与恢复。若证书由企业内部 CA 签发，在执行 `restore.sh` 和 `upgrade.sh` 时传入 `--ca-file <企业CA根证书.pem>` 完成 HTTPS 校验。
@@ -193,11 +204,13 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -
    ```bash
    # 标准公网部署（配置 A 记录，按 IPv4 绑定 0.0.0.0 并使用默认 IPv4 叠加文件）
    bash scripts/standalone/init.sh --domain dalton.example.com
-   docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --build
+   env -u VITE_DALTON_AUTH docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env build
+   docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d
 
    # 纯 IPv6 主机（仅配置 AAAA 记录，传 --bind '[::]' 并使用 IPv6 叠加文件）
    bash scripts/standalone/init.sh --domain dalton.example.com --bind '[::]'
-   docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env up -d --build
+   env -u VITE_DALTON_AUTH docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env build
+   docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env up -d
    ```
 
 ---
@@ -208,25 +221,28 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -
 
 ### 4.1 启用本地多用户账号模式
 
-- **从本机回环试用切到域名 HTTPS 与本地登录（推荐）**：先执行 `init.sh --domain …` 更新域名、TLS 模式、监听地址与本地登录配置，再携带对应的 TLS 叠加文件整套重建并启动服务：
+- **从本机回环试用切到域名 HTTPS 与本地登录（推荐）**：先执行 `init.sh --domain …` 更新域名、TLS 模式、监听地址与本地登录配置，再携带对应的 TLS 叠加文件先 `build` 后 `up -d` 启动服务：
   ```bash
   # 示例：公网域名自动 HTTPS（内网域名加 --tls-mode internal；纯 IPv6 主机加 --bind '[::]'）
   bash scripts/standalone/init.sh --domain dalton.example.com
 
   # IPv4 HTTPS：附加 deploy/standalone/docker-compose.tls.yml
-  docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --build
+  env -u VITE_DALTON_AUTH docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env build
+  docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env up -d
 
   # IPv6 HTTPS：附加 deploy/standalone/docker-compose.tls.ipv6.yml
-  docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env up -d --build
+  env -u VITE_DALTON_AUTH docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env build
+  docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env up -d
   ```
-- **在本机回环 HTTP 模式下单独启用本地登录**：在 `.env` 中写入以下两项，然后使用两个基础编排文件整套重建并启动服务：
+- **在本机回环 HTTP 模式下单独启用本地登录**：在 `.env` 中写入以下两项，然后使用两个基础编排文件先 `build` 后 `up -d` 启动服务：
   ```dotenv
   DALTON_AUTH_MODE=local
   VITE_DALTON_AUTH=local
   ```
   ```bash
   # 本机回环 HTTP（仅使用 docker-compose.yml 与 docker-compose.core.yml）
-  docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d --build
+  env -u VITE_DALTON_AUTH docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env build
+  docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d
   ```
 
 ### 4.2 创建首位管理员
@@ -235,8 +251,8 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -
    ```bash
    grep '^BOOTSTRAP_SETUP_TOKEN=' .env
    ```
-2. 浏览器访问 `https://<您的域名>/setup/admin`。
-3. 填入自举口令、管理员邮箱、用户名与登录密码（长度至少 10 位）并提交。
+2. 浏览器访问 `https://<您的域名>/setup/admin`（本机回环 HTTP 试用模式访问 `http://127.0.0.1:8088/setup/admin`）。
+3. 填入自举口令、管理员邮箱、用户名与登录密码（长度至少 10 个字符）并提交。
 4. 创建成功后，系统在同一数据库事务中写入管理员账号、角色与团队凭据持有人记录，并关闭自举入口（后续访问返回 `409 Conflict`）。
 
 ### 4.3 管理员运维命令行工具
@@ -259,7 +275,7 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -
 
 ### 4.4 邀请团队成员
 
-首位管理员登录后，进入网页 **设置 → 团队管理** 生成带有成员等级（内部成员 `internal` / 外部成员 `external`）的一次性邀请链接（默认 7 天有效）。受邀成员打开链接设置密码即可完成注册。
+首位管理员登录后，进入网页 **设置 → 团队管理 → 成员与权限**，在角色下拉框中选择 **内部成员（`internal`）**、**外部成员（`external`，默认选中）** 或 **管理员（`admin`）**，点击生成一次性邀请链接（默认 7 天有效）。受邀成员打开链接设置密码（至少 10 个字符）即可完成注册。
 
 ---
 
@@ -306,12 +322,34 @@ DALTON_OPERATOR_LLM_ENDPOINTS=https://llm-gateway.corp.internal/v1
 
 `scripts/standalone/backup.sh` 在服务在线运行时完成以下四项归档，并执行 `pg_restore --list` 校验、MinIO 流式分块打包与 `SHA256SUMS`（安全散列算法 256 位校验清单）生成：
 
-1. PostgreSQL 逻辑备份 `postgres.dump`（单一事务快照，同时包含上游与 Dalton 两条迁移链）；
-2. MinIO 对象归档 `minio-objects.tar.gz`（按块流式读写并增量计算逐文件 SHA-256，保留 `ContentType`，同时在清单中记录有效桶名与键前缀）：v1 仅支持**单一对象存储服务**——脚本按应用实际生效的配置加载逻辑（结合 `agent_config.yaml` 默认值与 `.env`）分别解析聊天上传、ASR 与通用存储，只要指向不同的存储服务（例如聊天上传走 MinIO，而通用存储通过 `S3_BUCKET_NAME` 指向默认 AWS S3 或 OSS），`backup.sh` 与 `restore.sh` 都会直接报错退出；
+1. PostgreSQL 逻辑备份 `postgres.dump`（单一事务快照，包含上游与 Dalton 两条迁移链，以及已同步入库的工作区文件内容 `workspace_files`——默认未启用通用对象存储时，单个 100 MiB 以内的工作区文件直接保存在 PostgreSQL 中）；
+2. MinIO 对象归档 `minio-objects.tar.gz`（保存对话输入框上传的附件 `chat-uploads`，并在启用通用对象存储时保存存放在对象存储中的部分工作区文件内容；按块流式读写并增量计算逐文件 SHA-256，保留 `ContentType`，同时在清单中记录有效桶名与键前缀。默认配置下仅通过工作区文件面板上传 100 MiB 以内文档时，文件内容保存在 `postgres.dump` 中，MinIO 对象数为 `0` 属于正常情况）：v1 仅支持**单一对象存储服务**——脚本按应用实际生效的配置加载逻辑（结合 `agent_config.yaml` 默认值与 `.env`）分别解析聊天上传、ASR 与通用存储，指向不同存储服务时 `backup.sh` 与 `restore.sh` 会报错退出；
 3. Caddy 证书与内部 CA 数据归档 `caddy-data.tar.gz`；
 4. `.env` 密钥文件：传入 `--env-passphrase-file` 时使用 OpenSSL AES-256-CBC + PBKDF2（参数写入 `manifest.json`，整体完整性由 `SHA256SUMS` 校验）加密生成 `env.enc`。
 
-> **一致性与私钥保管边界**：
+> **迁移与正式备份前的操作顺序**：
+> 1. **在文件面板执行「备份文件到数据库」并处理未备份项**：确认正在运行的对话轮次已经结束；打开各工作区右侧文件面板，点击「备份文件到数据库」，等待完成后处理完未备份清单中除大文件（超过 100 MiB）以外的所有项。文件面板中的未备份清单仅展示前 5 条路径，全部大文件的完整复制清单在第 2 步通过 `find` 命令获取。
+> 2. **停止计算机前，以 `find` 输出的全部大文件（超过 100 MiB）为清单逐项拷出并比对字节数**：在默认数据库内联存储模式下，沙箱中超过 100 MiB 的生成文件保留在沙箱容器磁盘 `/home/workspace/<工作区目录>/<原相对路径>` 中。趁计算机仍在运行时先用 `docker ps -a` 找出沙箱容器，把容器名写入带引号的变量 `C` 并用 `find` 列出全部大文件，随后按清单每项赋值给 `SRC` 与 `DST`，执行单条 `&&` 串联命令完成复制与字节数比对，看到「一致」再处理下一个文件：
+>    ```bash
+>    # 1. 列出全部沙箱容器（按名称前缀匹配，包含旧镜像与已停止容器）
+>    docker ps -a --filter name=langalpha-sandbox- --format '{{.Names}}\t{{.Status}}'
+>
+>    # 2. 将目标沙箱容器名写入带引号的变量 C，并列出容器内全部超过 100 MiB 的文件（作为完整复制清单）
+>    C='<沙箱容器名>'
+>    docker exec "$C" find /home/workspace -type f -size +100M -print
+>
+>    # 3. 按第 2 步输出的每条路径依次赋值给 SRC 与 DST，完成复制并比对两端字节数（看到「一致」再处理下一个文件）
+>    SRC='<容器内路径>'
+>    DST='<宿主机目标路径>'
+>    mkdir -p "$(dirname "$DST")" && docker cp "$C:$SRC" "$DST" && SRC_BYTES=$(docker exec "$C" stat -c %s "$SRC") && DST_BYTES=$(stat -c %s "$DST") && test -n "$SRC_BYTES" && test "$SRC_BYTES" = "$DST_BYTES" && echo "一致：$SRC_BYTES 字节"
+>    # 示例：
+>    # SRC='/home/workspace/nvda-research/output/model_data.parquet'
+>    # DST="/var/backups/dalton/sandbox-large-files/$C/nvda-research/output/model_data.parquet"
+>
+>    # 若容器已停止，可按容器名拷出整棵 /home/workspace 目录留档：
+>    # mkdir -p "/var/backups/dalton/sandbox-large-files/$C" && docker cp "$C:/home/workspace" "/var/backups/dalton/sandbox-large-files/$C/workspace"
+>    ```
+> 3. **随后停止计算机并执行 `backup.sh`**：完成第 1 步入库确认以及第 2 步全部大文件的拷出与字节数核对后，再停止对应计算机并执行 `scripts/standalone/backup.sh` 完成全量备份。
 > - **在线一致性窗口与备份期对象核对**：数据库 `postgres.dump` 是单一时刻的一致快照，MinIO 对象枚举紧随其后执行。枚举完对象后，`backup.sh` 会立即核对数据库快照（`postgres.dump`）里所有**已完成**（非 `uploading`）的聊天上传记录，确认每一条的 `object_key` 都在本次对象归档里；只要有缺失，`backup.sh` 会直接失败、列出缺失的键并提示“可能是备份期间有清理任务运行，请重新备份”（不会发布不完整的备份目录）。对于备份时尚未完成的分片上传（状态为 `uploading` 的记录，本来就还没有最终对象），`backup.sh` 与 `restore.sh` 核对引用时都会跳过，`restore.sh` 会在输出中列出跳过了多少条；其他已完成记录在恢复后若仍有对象缺失，`restore.sh` 会直接失败退出并提示在线备份的时间窗口。
 > - **私钥保护**：`caddy-data.tar.gz` 包含 Caddy 的 TLS 私钥与内部 CA 私钥，同步至异地备份存储时请对整个备份目录采取加密与最小权限控制。使用 `custom` 模式时，请同时单独备份 `DALTON_TLS_CERT_DIR`。
 
@@ -528,7 +566,7 @@ Batch 1（`#480`）的旧部署目录中**尚未包含** `scripts/standalone/bac
 ```bash
 # 1. 先解压新版本发行包到临时目录
 mkdir -p /tmp/dalton-core-new
-tar -xzf /tmp/dalton-core-<new-version>.tar.gz -C /tmp/dalton-core-new
+tar -xzf /tmp/dalton-core-<new-version>.tar.gz --strip-components=1 -C /tmp/dalton-core-new
 
 # 2. 使用新包里的 backup.sh 对旧目录执行升级前完整备份（PostgreSQL + MinIO + Caddy + .env）
 cd /tmp/dalton-core-new
@@ -611,7 +649,51 @@ DALTON_MINIO_IMAGE=public.ecr.aws/chainguard/minio@sha256:e70b2b1e74d79457f80871
 docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d minio
 ```
 
-### 7.2 公网 HTTPS 证书签发失败
+### 7.2 拉取 Docker Hub 镜像被限流（429）
+
+在共享出口 IP 的云主机上构建沙箱镜像或服务镜像时，若遇到 Docker Hub 匿名拉取返回 `429 Too Many Requests`，可通过以下任一方式获得稳定拉取配额：
+
+- **方式 A：登录 Docker Hub 账号**
+  ```bash
+  docker login
+  ```
+- **方式 B：在 `/etc/docker/daemon.json` 中添加或补充 `registry-mirrors` 字段**
+  1. 若 `/etc/docker/daemon.json` 已存在，先备份原文件：
+     ```bash
+     [ -f /etc/docker/daemon.json ] && sudo cp /etc/docker/daemon.json /etc/docker/daemon.json.bak
+     ```
+  2. 用编辑器打开 `/etc/docker/daemon.json`（文件不存在时直接新建），保留已有配置项并加入或补充 `"registry-mirrors"` 字段：
+     ```bash
+     sudo nano /etc/docker/daemon.json
+     ```
+     合并后的完整示例（保留已有字段并将镜像源追加到 `"registry-mirrors"`；新建文件时只保留 `"registry-mirrors"` 一项即可）：
+     ```json
+     {
+       "log-driver": "json-file",
+       "registry-mirrors": [
+         "https://mirror.gcr.io"
+       ]
+     }
+     ```
+     如企业内部部署了自建镜像代理（例如 Harbor / Nexus），将上述地址替换为内网镜像源即可。
+  3. 保存后先用 Python 检查 `/etc/docker/daemon.json` 的 JSON 语法与顶层对象结构：
+     ```bash
+     sudo python3 -c 'import json, sys; sys.exit(None if isinstance(json.load(open(sys.argv[1])), dict) else "JSON 顶层必须是对象")' /etc/docker/daemon.json
+     ```
+  4. 确认上一步退出码为 `0` 后，再执行下一步重启 Docker 并验证基础镜像拉取：
+     ```bash
+     sudo systemctl daemon-reload
+     sudo systemctl restart docker
+     docker pull ubuntu:24.04
+     ```
+
+配额恢复后，重新构建代码沙箱镜像（或重跑 `init.sh`）：
+
+```bash
+docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest .
+```
+
+### 7.3 公网 HTTPS 证书签发失败
 
 1. 核对域名解析是否已生效：`dig +short <您的域名>` 返回本机公网 IP。
 2. 核对宿主机防火墙（`ufw` / `firewalld`）与云安全组均已放行入站 TCP 80 和 443 端口。
@@ -621,7 +703,7 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -
    docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -f deploy/standalone/docker-compose.tls.yml --env-file .env logs --tail=100 edge
    ```
 
-### 7.3 首次对话等待时间较长
+### 7.4 首次对话等待时间较长
 
 首次运行代码分析需要本地存在 `langalpha-sandbox:latest` 镜像。检查镜像是否已提前构建：
 
@@ -631,7 +713,7 @@ docker image inspect langalpha-sandbox:latest >/dev/null && echo "已就绪"
 
 若尚未构建，提前执行 `docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest .` 即可消除首次对话的构建等待。
 
-### 7.4 自举口令过期或输错次数超限
+### 7.5 自举口令过期或输错次数超限
 
 在服务器执行 `reissue-bootstrap-token` 重置失败计数并生成新的 24 小时有效口令：
 
@@ -640,7 +722,7 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -
   uv run --no-sync python -m src.dalton.auth.cli reissue-bootstrap-token
 ```
 
-### 7.5 管理员忘记密码
+### 7.6 管理员忘记密码
 
 在服务器执行 `reset-password` 交互式设置新密码（命令同时撤销所有旧会话）：
 
@@ -649,11 +731,11 @@ docker compose -p <项目名> -f docker-compose.yml -f docker-compose.core.yml -
   uv run --no-sync python -m src.dalton.auth.cli reset-password --email <管理员邮箱>
 ```
 
-### 7.6 提示无法访问 `/var/run/docker.sock`
+### 7.7 提示无法访问 `/var/run/docker.sock`
 
 确认当前部署账号已加入 `docker` 组并重新登录终端，或将 Rootless Docker 套接字路径写入 `.env` 中的 `DOCKER_HOST_SOCKET` 后重启 `backend`。
 
-### 7.7 磁盘空间增长较快
+### 7.8 磁盘空间增长较快
 
 定期检查未使用的旧容器镜像与已退出沙箱资源：
 
@@ -663,3 +745,7 @@ docker image prune -f
 ```
 
 同时通过 `backup.sh --retain <N>` 控制本机保留份数，并将历史备份转存至异地存储。
+
+### 7.9 浏览器开发者工具出现 `/api/v1/claude-code/setup` 返回 404
+
+核心安装默认关闭 Claude Code 运行时，浏览器开发者工具里 `/api/v1/claude-code/setup` 返回 404 属于正常情况，照常使用系统即可。

@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input';
 // confirm dialog, which would pull its animation library onto first load.
 import { TOOLBAR_CHIP_CLASS, toolbarChipStyle } from '@/components/dalton/primitives/DaltonToolbarPill';
 import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { useLocale } from '@/hooks/useLocale';
 import { useUser } from '@/hooks/useUser';
 import { shortMonthDay } from '@/lib/format';
@@ -265,6 +266,7 @@ export function TeamWorkspacesSection({
   const locale = useLocale();
   const navigate = useNavigate();
   const { data } = useTeamWorkspaces();
+  const { hasCapability } = useCapabilities();
   const [sectionExpanded, setSectionExpanded] = useState(true);
   const [expandedMembers, setExpandedMembers] = useState<Set<string>>(() => new Set());
 
@@ -287,7 +289,10 @@ export function TeamWorkspacesSection({
   // Render only for confirmed internal/admin callers: external members are
   // fully isolated, and while the tier is still loading (or the query failed)
   // the section stays hidden rather than flashing a placeholder.
-  if (data?.caller_tier !== 'internal' && data?.caller_tier !== 'admin') {
+  if (
+    !hasCapability('colleague_sharing') ||
+    (data?.caller_tier !== 'internal' && data?.caller_tier !== 'admin')
+  ) {
     return null;
   }
 

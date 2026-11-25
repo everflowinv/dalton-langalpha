@@ -8,8 +8,22 @@
 #   bash scripts/standalone/package_release.sh --ref HEAD --include-ci --output /tmp/dist --report /tmp/scan.txt
 set -euo pipefail
 
+export COPYFILE_DISABLE=1
+
+TAR_VERSION_STR="$(tar --version 2>&1 || true)"
+TAR_CREATE_FLAGS=()
+TAR_EXTRACT_FLAGS=()
+if [[ "$TAR_VERSION_STR" == *bsdtar* || "$TAR_VERSION_STR" == *libarchive* ]]; then
+  TAR_CREATE_FLAGS=(--no-xattrs --no-mac-metadata --no-fflags)
+  TAR_EXTRACT_FLAGS=(--no-xattrs --no-mac-metadata --no-fflags)
+elif [[ "$TAR_VERSION_STR" == *"GNU tar"* ]]; then
+  TAR_CREATE_FLAGS=(--no-xattrs)
+  TAR_EXTRACT_FLAGS=(--no-xattrs)
+fi
+
 CALLER_PWD="$PWD"
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 GIT_REF="HEAD"
 OUTPUT_DIR=""
 OUTPUT_SET=0
@@ -148,6 +162,8 @@ if ! git rev-parse --verify "${GIT_REF}^{commit}" >/dev/null 2>&1; then
 fi
 
 COMMIT_SHA="$(git rev-parse "${GIT_REF}^{commit}")"
+SHORT_SHA="${COMMIT_SHA:0:9}"
+RELEASE_TOP_DIR="dalton-core-${SHORT_SHA}"
 
 # Explicit allowlist of paths required to build and run Standalone Core.
 # Proprietary / Everflow-only paths are excluded by omission:
@@ -272,7 +288,7 @@ trap cleanup EXIT
 EXPORT_ROOT="${STAGE_DIR}/release"
 mkdir -p "$EXPORT_ROOT"
 
-git archive --format=tar "$COMMIT_SHA" -- "${ARCHIVE_PATHS[@]}" | tar -xf - -C "$EXPORT_ROOT"
+git archive --format=tar "$COMMIT_SHA" -- "${ARCHIVE_PATHS[@]}" | tar ${TAR_EXTRACT_FLAGS[@]+"${TAR_EXTRACT_FLAGS[@]}"} -xf - -C "$EXPORT_ROOT"
 
 # Defense-in-depth post-extract denylist inside allowlisted parent directories
 # (e.g. `web/`, `src/`). Never touches the working tree.
@@ -344,7 +360,7 @@ if [[ -n "$OUTPUT_DIR_ABS" ]]; then
   out_base="$(basename "$OUTPUT_DIR_ABS")"
   mkdir -p "$out_parent"
   SIBLING_TMP="$(mktemp -d "${out_parent}/.${out_base}.tmp.XXXXXX")"
-  tar -cf - -C "$EXPORT_ROOT" . | tar -xf - -C "$SIBLING_TMP"
+  tar ${TAR_CREATE_FLAGS[@]+"${TAR_CREATE_FLAGS[@]}"} -cf - -C "$EXPORT_ROOT" . | tar ${TAR_EXTRACT_FLAGS[@]+"${TAR_EXTRACT_FLAGS[@]}"} -xf - -C "$SIBLING_TMP"
   if [[ -e "$OUTPUT_DIR_ABS" || -L "$OUTPUT_DIR_ABS" ]]; then
     echo "ERROR: Output directory already exists: ${OUTPUT_DIR_ABS}" >&2
     exit 1
@@ -356,6 +372,12 @@ fi
 
 if [[ -n "$TAR_PATH" ]]; then
   mkdir -p "$(dirname "$TAR_PATH")"
-  tar -czf "$TAR_PATH" -C "$EXPORT_ROOT" .
-  echo "[package_release] Wrote clean release tarball: ${TAR_PATH}"
+  TAR_STAGE_DIR="${STAGE_DIR}/${RELEASE_TOP_DIR}"
+  mv "$EXPORT_ROOT" "$TAR_STAGE_DIR"
+  tar ${TAR_CREATE_FLAGS[@]+"${TAR_CREATE_FLAGS[@]}"} -czf "$TAR_PATH" -C "$STAGE_DIR" "$RELEASE_TOP_DIR"
+  if ! python3 "${SCRIPT_DIR}/verify_release_tarball.py" --expected-top-dir "$RELEASE_TOP_DIR" "$TAR_PATH"; then
+    rm -f "$TAR_PATH"
+    exit 1
+  fi
+  echo "[package_release] Wrote clean release tarball: ${TAR_PATH} (top-level dir: ${RELEASE_TOP_DIR}/)"
 fi

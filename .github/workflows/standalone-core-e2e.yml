@@ -72,14 +72,81 @@ jobs:
           docker system prune -af --volumes || true
           df -h
 
-      - name: Export clean standalone release directory (with CI harness)
+      - name: Package, verify, build, and start-check customer release tarball
+        env:
+          INSTALL_BROWSER_CRAWLER: "false"
         run: |
+          set -euo pipefail
           mkdir -p /tmp/standalone-artifacts
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          EXPECTED_TOP_DIR="dalton-core-${COMMIT_SHA:0:9}"
+          bash scripts/standalone/package_release.sh \
+            --ref HEAD \
+            --tar /tmp/dalton-core-customer.tar.gz \
+            --report /tmp/standalone-artifacts/release-scan-report.txt
+          python3 scripts/standalone/verify_release_tarball.py \
+            --expected-top-dir "${EXPECTED_TOP_DIR}" \
+            /tmp/dalton-core-customer.tar.gz
+          mkdir -p /tmp/dalton-core-customer-dist
+          tar -xzf /tmp/dalton-core-customer.tar.gz --strip-components=1 -C /tmp/dalton-core-customer-dist
+          test -f /tmp/dalton-core-customer-dist/docker-compose.core.yml
+          test -f /tmp/dalton-core-customer-dist/.release_git_sha
+          test ! -e /tmp/dalton-core-customer-dist/docker-compose.ci.yml
+          test ! -e /tmp/dalton-core-customer-dist/tests/standalone
+          (
+            cd /tmp/dalton-core-customer-dist
+            bash scripts/standalone/init.sh --non-interactive --domain localhost --skip-sandbox-build
+            PROJECT_NAME="dalton-customer-smoke"
+            BUILD_GIT_SHA="$(cat .release_git_sha)"
+            export BUILD_GIT_SHA
+            export BUILD_GIT_DIRTY="false"
+            cleanup_customer_stack() {
+              docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env down -v --remove-orphans || true
+            }
+            trap cleanup_customer_stack EXIT
+            env -u VITE_DALTON_AUTH docker compose \
+              -p "${PROJECT_NAME}" \
+              -f docker-compose.yml \
+              -f docker-compose.core.yml \
+              --env-file .env \
+              build --build-arg INSTALL_BROWSER_CRAWLER=false
+            docker compose \
+              -p "${PROJECT_NAME}" \
+              -f docker-compose.yml \
+              -f docker-compose.core.yml \
+              --env-file .env \
+              up -d
+            for i in $(seq 1 60); do
+              if docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T backend curl -sf http://127.0.0.1:8000/health >/dev/null 2>&1 \
+                && curl -sf http://127.0.0.1:8088/api/v1/dalton/capabilities >/dev/null 2>&1; then
+                echo "[customer-smoke] Customer release tarball built and passed health check."
+                break
+              fi
+              if [[ "$i" -eq 60 ]]; then
+                docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env ps -a || true
+                docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env logs --tail=100 || true
+                exit 1
+              fi
+              sleep 2
+            done
+          )
+
+      - name: Package, verify, and extract CI test tarball (with CI harness)
+        run: |
+          COMMIT_SHA="$(git rev-parse HEAD)"
+          EXPECTED_TOP_DIR="dalton-core-${COMMIT_SHA:0:9}"
           bash scripts/standalone/package_release.sh \
             --ref HEAD \
             --include-ci \
-            --output /tmp/dalton-core-dist \
-            --report /tmp/standalone-artifacts/release-scan-report.txt
+            --tar /tmp/dalton-core-ci-test.tar.gz
+          python3 scripts/standalone/verify_release_tarball.py \
+            --expected-top-dir "${EXPECTED_TOP_DIR}" \
+            /tmp/dalton-core-ci-test.tar.gz
+          mkdir -p /tmp/dalton-core-dist
+          tar -xzf /tmp/dalton-core-ci-test.tar.gz --strip-components=1 -C /tmp/dalton-core-dist
+          test -f /tmp/dalton-core-dist/docker-compose.core.yml
+          test -f /tmp/dalton-core-dist/docker-compose.ci.yml
+          test -f /tmp/dalton-core-dist/.release_git_sha
 
       - name: Initialize standalone core environment
         working-directory: /tmp/dalton-core-dist
@@ -121,6 +188,8 @@ jobs:
 
       - name: "Run standalone acceptance checks (auth: oss)"
         working-directory: /tmp/dalton-core-dist
+        env:
+          STANDALONE_RELEASE_TAR: /tmp/dalton-core-ci-test.tar.gz
         run: |
           bash tests/standalone/run_checks.sh \
             --auth oss \
@@ -131,6 +200,8 @@ jobs:
 
       - name: "Run standalone acceptance checks (auth: local)"
         working-directory: /tmp/dalton-core-dist
+        env:
+          STANDALONE_RELEASE_TAR: /tmp/dalton-core-ci-test.tar.gz
         run: |
           bash tests/standalone/run_checks.sh \
             --auth local \

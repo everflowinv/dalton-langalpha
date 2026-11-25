@@ -12,6 +12,7 @@ import { ToggleSwitch } from '@/components/ui/switch';
 // confirm dialog, which would pull its animation library onto first load.
 import { DaltonInlineNotice } from '@/components/dalton/primitives/DaltonStatusBadge';
 import { TOOLBAR_CHIP_CLASS, toolbarChipStyle } from '@/components/dalton/primitives/DaltonToolbarPill';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { queryKeys } from '@/lib/queryKeys';
 import { cn } from '@/lib/utils';
 import {
@@ -130,12 +131,19 @@ export function WorkspaceSharingModal({
   const [draftWeb, setDraftWeb] = useState<WorkspaceAccessLevel>('hidden');
   const [draftTeamMemory, setDraftTeamMemory] = useState<boolean | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const { hasCapability } = useCapabilities();
 
   if (open && draftTeamMemory === null && settingsData !== undefined) {
     setDraftTeamMemory(settingsData.team_memory_enabled === true);
   }
 
-  if (!workspaceId || isError || (isLoading && !data) || data?.is_home) {
+  if (
+    !hasCapability('colleague_sharing') ||
+    !workspaceId ||
+    isError ||
+    (isLoading && !data) ||
+    data?.is_home
+  ) {
     return null;
   }
 

@@ -103,6 +103,7 @@
     "strengthFair": "中等",
     "strengthStrong": "强",
     "reqLength": "至少 8 个字符",
+    "reqLengthMin": "至少 {{count}} 个字符",
     "reqLetter": "包含字母",
     "reqNumber": "包含数字",
     "setNewPassword": "设置新密码",
@@ -2156,6 +2157,12 @@
       "noBrokerage": "我们来设置我的投资画像。",
       "modifyPreferences": "我想回顾并更新我的偏好设置。"
     },
+    "daltonCore": {
+      "title": "设置我的资料",
+      "description": "研究总监将了解你关注的标的、投资风格与回答偏好，让后续分析更贴合你的习惯。点击下方按钮后才会发起首条对话。",
+      "startButton": "开始设置",
+      "skipButton": "直接进入主界面"
+    },
     "welcome": {
       "skip": "跳过",
       "cancel": "取消",
@@ -3052,6 +3059,7 @@
       "maxOutputInvalid": "请输入 token 数，如 8K。"
     },
     "teamManagedByAdmin": "团队共用凭据由管理员管理。如需连接或更换模型凭据，请联系管理员。",
+    "teamSharedCredentialsHint": "团队共用：在这里连接后全队都能使用",
     "antigravity": {
       "name": "Google Antigravity",
       "intro": "连接 Google Antigravity 订阅（Google One AI / Antigravity 套餐），使用其中的 Gemini、Claude 和 GPT-OSS 模型。",
