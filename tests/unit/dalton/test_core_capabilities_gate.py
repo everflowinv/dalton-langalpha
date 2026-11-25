@@ -1563,21 +1563,31 @@ class TestSetupBackgroundLoopsGate:
         assert "dalton-transcription-reconcile" in names_no_dj
         assert "mcp-builtin-reconnect" in names_no_dj
 
-        # 4) Disable RESEARCHDATA_BRIDGE only -> researchdata-only mcp-builtin-reconnect does NOT launch
+        # 4) Disable RESEARCHDATA_BRIDGE only -> researchdata-only mcp-builtin-reconnect does NOT launch;
+        #    TRANSCRIPTION is decoupled from RESEARCHDATA_BRIDGE (§6.3), so transcription reconcile still launches.
         _enable_all_capabilities(monkeypatch)
         monkeypatch.setenv("DALTON_CAP_RESEARCHDATA_BRIDGE", "false")
         names_no_bridge = await _run_lifespan()
         assert "mcp-builtin-reconnect" not in names_no_bridge
-        assert "dalton-transcription-reconcile" not in names_no_bridge
+        assert "dalton-transcription-reconcile" in names_no_bridge
         assert "dalton-data-task-scheduler" in names_no_bridge
 
-        # 5) Core profile -> none of the 3 launch
+        # 5) Core profile (default) -> none of the 3 launch
         _clean_cap_env(monkeypatch, app_env="core")
-        monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
         names_core = await _run_lifespan()
         assert "dalton-transcription-reconcile" not in names_core
         assert "dalton-data-task-scheduler" not in names_core
         assert "mcp-builtin-reconnect" not in names_core
+
+        # 6) Core profile with explicit transcription enabled + storage -> only transcription reconcile launches (§6.3)
+        monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
+        names_core_asr = await _run_lifespan()
+        assert "dalton-transcription-reconcile" in names_core_asr
+        assert "dalton-data-task-scheduler" not in names_core_asr
+        assert "mcp-builtin-reconnect" not in names_core_asr
+        monkeypatch.setenv("DALTON_CAP_TRANSCRIPTION", "false")
+        names_core_asr_off = await _run_lifespan()
+        assert "dalton-transcription-reconcile" not in names_core_asr_off
 
 
 # ---------------------------------------------------------------------------

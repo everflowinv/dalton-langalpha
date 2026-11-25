@@ -52,13 +52,10 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
-# Ensure sibling modules and repo root are importable regardless of cwd
+# Ensure sibling `source_identity.py` is importable regardless of cwd
 _SCRIPT_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _SCRIPT_DIR.parents[1]
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
 
 import asr_jobs  # noqa: E402
 import alphaengine_search_cache as _ae_cache  # noqa: E402
@@ -66,11 +63,55 @@ import bridge_subprocess_env  # noqa: E402
 import seed_asr_client  # noqa: E402
 import log_redaction as _log_redaction  # noqa: E402
 import source_identity  # noqa: E402
-from src.dalton.transcription_service.owner_lock import (  # noqa: E402
-    AsrOwnerLock,
-    OwnerLockBusyError,
-    resolve_owner_lock_timeout_s,
-)
+
+
+def _load_asr_owner_lock_module() -> Any:
+    """Load ``owner_lock.py`` without requiring the backend ``src`` package.
+
+    The host bridge runs under the system interpreter, where backend
+    dependencies (or ``src``) may be absent or blocked. Reuse the canonical
+    ``src.dalton.transcription_service.owner_lock`` module when ``src`` is
+    importable (preserving exception identity in tests), and otherwise load the
+    stdlib-only file directly via ``importlib.util``.
+    """
+    canonical_name = "src.dalton.transcription_service.owner_lock"
+    existing = sys.modules.get(canonical_name)
+    if existing is not None:
+        return existing
+
+    if "src" not in sys.modules or sys.modules["src"] is not None:
+        try:
+            import importlib
+
+            return importlib.import_module(canonical_name)
+        except ImportError:
+            pass
+
+    fallback_name = "_dalton_bridge_asr_owner_lock"
+    cached = sys.modules.get(fallback_name)
+    if cached is not None:
+        return cached
+
+    import importlib.util
+
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "dalton"
+        / "transcription_service"
+        / "owner_lock.py"
+    )
+    spec = importlib.util.spec_from_file_location(fallback_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[fallback_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(fallback_name, None)
+        raise
+    return module
 
 
 class BridgeAsrDisabledError(RuntimeError):
@@ -1509,7 +1550,9 @@ class BridgeConfig:
             os.environ.get("DALTON_BRIDGE_ASR_DISABLED", "").strip().lower()
             in ("1", "true", "yes", "on")
         )
-        self.asr_lock_timeout_s: float = resolve_owner_lock_timeout_s()
+        self.asr_lock_timeout_s: float = (
+            _load_asr_owner_lock_module().resolve_owner_lock_timeout_s()
+        )
         try:
             self.wiki_ingest_timeout_s: float = max(
                 5.0,
@@ -8143,7 +8186,7 @@ class ResearchDataBridge:
         self._alphaengine_cache: _ae_cache.AlphaEngineSearchCache | None = None
         self._inflight_searches: dict[str, dict[str, Any]] = {}
         self._singleflight_runners: dict[int, dict[str, Any]] = {}
-        self._asr_owner_lock: AsrOwnerLock | None = None
+        self._asr_owner_lock: Any | None = None
         self._asr_draining: bool = False
         if not getattr(cfg, "admin_token", ""):
             logger.warning(
@@ -19128,9 +19171,14 @@ class ResearchDataBridge:
                 existing_lock = None
             lock = existing_lock
             if lock is None or not lock.is_held:
-                lock = AsrOwnerLock(jobs_dir, service_name="researchdata-bridge")
+                owner_lock_mod = _load_asr_owner_lock_module()
+                lock = owner_lock_mod.AsrOwnerLock(jobs_dir, service_name="researchdata-bridge")
                 timeout_s = float(
-                    getattr(self.cfg, "asr_lock_timeout_s", resolve_owner_lock_timeout_s())
+                    getattr(
+                        self.cfg,
+                        "asr_lock_timeout_s",
+                        owner_lock_mod.resolve_owner_lock_timeout_s(),
+                    )
                 )
                 lock.acquire(timeout_s=timeout_s)
                 self._asr_owner_lock = lock
@@ -19201,7 +19249,7 @@ class ResearchDataBridge:
             return blocked
         try:
             mgr = self._asr_job_manager()
-        except OwnerLockBusyError as exc:
+        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
             return 503, {
                 "ok": False,
                 "error_code": "asr_owner_lock_busy",
@@ -19218,7 +19266,7 @@ class ResearchDataBridge:
             return blocked
         try:
             mgr = self._asr_job_manager()
-        except OwnerLockBusyError as exc:
+        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
             return 503, {
                 "ok": False,
                 "error_code": "asr_owner_lock_busy",
@@ -19235,7 +19283,7 @@ class ResearchDataBridge:
             return blocked
         try:
             mgr = self._asr_job_manager()
-        except OwnerLockBusyError as exc:
+        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
             return 503, {
                 "ok": False,
                 "error_code": "asr_owner_lock_busy",
@@ -19252,7 +19300,7 @@ class ResearchDataBridge:
             return blocked
         try:
             mgr = self._asr_job_manager()
-        except OwnerLockBusyError as exc:
+        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
             return 503, {
                 "ok": False,
                 "error_code": "asr_owner_lock_busy",
@@ -19269,7 +19317,7 @@ class ResearchDataBridge:
             return blocked
         try:
             mgr = self._asr_job_manager()
-        except OwnerLockBusyError as exc:
+        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
             return 503, {
                 "ok": False,
                 "error_code": "asr_owner_lock_busy",
@@ -19286,7 +19334,7 @@ class ResearchDataBridge:
             return blocked
         try:
             mgr = self._asr_job_manager()
-        except OwnerLockBusyError as exc:
+        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
             return 503, {
                 "ok": False,
                 "error_code": "asr_owner_lock_busy",
@@ -26422,7 +26470,7 @@ async def main() -> None:
     else:
         try:
             bridge._asr_job_manager().recover_incomplete_jobs()
-        except OwnerLockBusyError as exc:
+        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
             logger.error("Startup ASR owner lock busy (skipping recovery): %s", exc)
         except Exception as exc:
             logger.warning("Startup ASR job recovery warning: %s", type(exc).__name__)

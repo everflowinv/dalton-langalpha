@@ -102,6 +102,7 @@ def _make_bridge(
     cfg.asr_fake_delay_s = delay_s
     cfg.asr_fake_text = fixed_text
     cfg.asr_fake_fail_category = fail_category
+    cfg.asr_worker_mode = "fake"
     cfg.asr_disabled = asr_disabled
     cfg.asr_lock_timeout_s = lock_timeout_s
     return rb.ResearchDataBridge(cfg)
@@ -218,49 +219,48 @@ async def test_owner_lock_blocks_before_asr_job_manager_construct_and_recovery(
     assert bridge._asr_owner_lock is not None and bridge._asr_owner_lock.is_held
 
     mgr_spy = create_autospec(ts_jobs.AsrJobManager)
-    monkeypatch.setattr(ts_app, "AsrJobManager", mgr_spy)
-
     cfg = ts_app.TranscriptionServiceConfig(
         jobs_dir=jobs_dir,
         token="ts-secret-token",
         worker_mode="fake",
         lock_timeout_s=0.05,
     )
-    runtime = ts_app.TranscriptionRuntime(cfg, worker=ts_jobs.FakeAsrWorker())
-    with pytest.raises(ts_lock.OwnerLockBusyError) as exc_a:
-        runtime.startup()
-    assert f"holder_pid={os.getpid()}" in str(exc_a.value)
-    assert "holder_service=researchdata-bridge" in str(exc_a.value)
-    mgr_spy.assert_not_called()
-    assert runtime.manager is None
+    with monkeypatch.context() as mp:
+        mp.setattr(ts_app, "AsrJobManager", mgr_spy)
+        runtime = ts_app.TranscriptionRuntime(cfg, worker=ts_jobs.FakeAsrWorker())
+        with pytest.raises(ts_lock.OwnerLockBusyError) as exc_a:
+            runtime.startup()
+        assert f"holder_pid={os.getpid()}" in str(exc_a.value)
+        assert "holder_service=researchdata-bridge" in str(exc_a.value)
+        mgr_spy.assert_not_called()
+        assert runtime.manager is None
     await bridge.close()
 
     # Case B: Standalone service holds `.owner.lock` -> legacy bridge fails BEFORE constructing AsrJobManager
-    monkeypatch.undo()
     runtime2 = ts_app.TranscriptionRuntime(cfg, worker=ts_jobs.FakeAsrWorker())
     runtime2.startup()
     assert runtime2.owner_lock is not None and runtime2.owner_lock.is_held
 
     legacy_mgr_spy = create_autospec(legacy_asr_jobs.AsrJobManager)
-    monkeypatch.setattr(legacy_asr_jobs, "AsrJobManager", legacy_mgr_spy)
+    with monkeypatch.context() as mp:
+        mp.setattr(legacy_asr_jobs, "AsrJobManager", legacy_mgr_spy)
+        bridge2 = _make_bridge(tmp_path, jobs_dir=jobs_dir, lock_timeout_s=0.05)
+        with pytest.raises(ts_lock.OwnerLockBusyError) as exc_b:
+            bridge2._asr_job_manager()
+        assert "holder_service=dalton-transcription" in str(exc_b.value)
+        legacy_mgr_spy.assert_not_called()
 
-    bridge2 = _make_bridge(tmp_path, jobs_dir=jobs_dir, lock_timeout_s=0.05)
-    with pytest.raises(ts_lock.OwnerLockBusyError) as exc_b:
-        bridge2._asr_job_manager()
-    assert "holder_service=dalton-transcription" in str(exc_b.value)
-    legacy_mgr_spy.assert_not_called()
-
-    # Bridge HTTP endpoint surfaces 503 with lock busy diagnostic instead of constructing manager
-    code_503, resp_503 = await _send_bridge_http(
-        bridge2,
-        "GET",
-        "/transcriptions/job_any",
-        {"Authorization": f"Bearer {bridge2.cfg.admin_token}"},
-    )
-    assert code_503 == 503
-    assert resp_503["error_code"] == "asr_owner_lock_busy"
-    assert "holder_service=dalton-transcription" in resp_503["error"]
-    legacy_mgr_spy.assert_not_called()
+        # Bridge HTTP endpoint surfaces 503 with lock busy diagnostic instead of constructing manager
+        code_503, resp_503 = await _send_bridge_http(
+            bridge2,
+            "GET",
+            "/transcriptions/job_any",
+            {"Authorization": f"Bearer {bridge2.cfg.admin_token}"},
+        )
+        assert code_503 == 503
+        assert resp_503["error_code"] == "asr_owner_lock_busy"
+        assert "holder_service=dalton-transcription" in resp_503["error"]
+        legacy_mgr_spy.assert_not_called()
 
     await bridge2.close()
     await runtime2.shutdown()
@@ -789,12 +789,15 @@ async def test_cutover_bridge_to_standalone_preserves_history_inflight_download_
     await bridge_slow.handle_transcription_submit(_sample_submit_payload("job_inflight_c"))
     await bridge_slow.handle_transcription_submit(_sample_submit_payload("job_cancel_d"))
     mgr_slow = bridge_slow._asr_job_manager()
-    for _ in range(30):
+    for _ in range(50):
         sc = mgr_slow.read_state("job_inflight_c")
         sd = mgr_slow.read_state("job_cancel_d")
         if sc and sc.get("status") == "transcribing" and sd and sd.get("status") == "transcribing":
             break
         await asyncio.sleep(0.01)
+    else:
+        pytest.fail("In-flight jobs C/D did not enter transcribing on legacy bridge before drain")
+    assert sd is not None and sd.get("provider_request_ids")
 
     # Drain legacy bridge and shut down cleanly -> marks C and D interrupted (not cancelled) and releases .owner.lock
     bridge_slow.set_asr_draining(True)

@@ -220,14 +220,22 @@ class AsrOwnerLock:
         if fd is None:
             return
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
         except OSError:
             pass
         finally:
             try:
-                os.close(fd)
+                if os is not None:
+                    os.close(fd)
             except OSError:
                 pass
+
+    def __del__(self) -> None:
+        try:
+            self.release()
+        except Exception:
+            pass
 
     def __enter__(self) -> AsrOwnerLock:
         self.acquire()

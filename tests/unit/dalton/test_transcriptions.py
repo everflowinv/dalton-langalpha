@@ -70,6 +70,7 @@ def _make_test_bridge(
     cfg.asr_fake_delay_s = delay_s
     cfg.asr_fake_text = fixed_text
     cfg.asr_fake_fail_category = fail_category
+    cfg.asr_worker_mode = "fake"
     return rb.ResearchDataBridge(cfg)
 
 
