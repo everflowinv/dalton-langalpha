@@ -11,6 +11,7 @@ import { cn } from '@/lib/utils';
 import { SharedGoneNotice } from '@/components/sharedWorkspaces/SharedGoneNotice';
 import { leaveGoneWorkspace } from '@/lib/sharedGone';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(mobile-web)
 // DALTON-HOOK(colleague-dispatch): read current user to gate thread card actions
 import { useUser } from '@/hooks/useUser';
 import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
@@ -136,6 +137,9 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
   // DALTON-HOOK(team-sharing): detect read-only colleague workspace
   const teamReadOnly = useTeamReadOnly(workspaceId, wsData);
   // DALTON-HOOK(colleague-dispatch): resolve per-thread ownership in gallery
+  // DALTON-HOOK(mobile-web): gate mobile WorkspaceSharingModal on colleague_sharing capability
+  const { hasCapability } = useCapabilities({ enabled: isMobile });
+  const colleagueSharingReady = hasCapability('colleague_sharing');
   const { user: currentUser } = useUser();
   const { data: teamData } = useTeamWorkspaces(isDaltonAuth);
   // Shared with others in the organization: said under its name, with its
@@ -790,16 +794,19 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
               {/* DALTON-HOOK(coverage-tracking): company workspace auto-tracking toggle */}
               {/* DALTON-HOOK(workspace-sharing-settings): company workspace sharing settings modal */}
               {/* DALTON-HOOK(wiki-ingest): workspace auto-ingest switch (workspaces.config) */}
+              {/* DALTON-HOOK(mobile-web): gate mobile WorkspaceSharingModal on confirmed colleague_sharing capability */}
               {!isHome && workspaceId && (
                 <div className="mt-3 flex flex-wrap items-center justify-center gap-2">
                   <WorkspaceTrackingToggle
                     workspaceId={workspaceId}
                     readOnly={teamReadOnly.isColleague}
                   />
-                  <WorkspaceSharingModal
-                    workspaceId={workspaceId}
-                    readOnly={teamReadOnly.isColleague}
-                  />
+                  {(!isMobile || colleagueSharingReady) && (
+                    <WorkspaceSharingModal
+                      workspaceId={workspaceId}
+                      readOnly={teamReadOnly.isColleague}
+                    />
+                  )}
                   <AutoIngestToggle
                     workspaceId={workspaceId}
                     readOnly={teamReadOnly.isColleague}

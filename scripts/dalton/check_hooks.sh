@@ -493,6 +493,7 @@ ALLOWED_HOOKS=(
   # Mobile web P0 fixes: standalone auth scroll, sheet/modal visual-viewport keyboard avoidance,
   # FilePanel touch gesture/z-index/row-menu fixes, InlineWidget mobile bar/fullscreen, and
   # BrowserViewer touch scroll + on-demand keyboard button.
+  # Mobile web P1: compact top bar, bottom bar overflow, coarse-pointer Enter, phone More menu, publish/share/settings layouts.
   "mobile-web"
 )
 

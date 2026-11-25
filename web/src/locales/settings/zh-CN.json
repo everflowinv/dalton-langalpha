@@ -457,6 +457,8 @@
   "timezoneDesc": "日期和时间按此时区显示。",
   "desktopGroup": "桌面应用",
   "helpGroup": "帮助",
+  "helpDocs": "使用文档与更新",
+  "helpDocsDesc": "查看使用指南、新功能与更新日志。",
   "displayGroup": "显示",
   "themeDesc": "浅色或深色。自动则跟随系统设置。",
   "fontSizeDesc": "在此设备上缩放整个应用的文字。",

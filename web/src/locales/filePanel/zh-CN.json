@@ -196,6 +196,7 @@
   "pdfPageNumbers": "页码",
   "pdfScale": "缩放",
   "openInNewTab": "在新标签页打开",
+  "openReportInTab": "以单独标签打开此报告",
   "fullscreen": "全屏",
   "exitFullscreen": "退出全屏",
   "downloadAsHtml": "下载为 HTML",

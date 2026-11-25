@@ -94,3 +94,40 @@
   max-width: 30%;
   padding-right: 9px;
 }
+
+/* DALTON-HOOK(mobile-web): touch back & cancel controls inside mobile palette field */
+.command-palette-mobile-back {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  color: var(--color-text-secondary);
+  cursor: pointer;
+}
+.command-palette-mobile-back:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+.command-palette-mobile-cancel {
+  flex-shrink: 0;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: var(--color-text-secondary);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.command-palette-mobile-cancel:hover {
+  color: var(--color-text-primary);
+  background: var(--color-bg-hover);
+}
+@media (max-width: 767px) {
+  .command-palette-field {
+    gap: 8px;
+    padding: 12px 12px;
+  }
+}

@@ -9,6 +9,11 @@ import NavDisplayOptions from '../NavDisplayOptions';
 import { useNavTreeProps, type NavTreeAgents } from '../../hooks/useNavTreeProps';
 import { useWorkspaceLabel } from '@/hooks/useWorkspaceLabel';
 import type { NavWorkspace } from '../../hooks/useNavigationData';
+// DALTON-HOOK(mobile-web): mount Dalton coverage tree & team shared workspaces in the mobile drawer
+import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCapabilities } from '@/hooks/useCapabilities';
+import { CoverageTreeSection } from '../dalton/CoverageTreeSection';
+import { TeamWorkspacesSection } from '../dalton/TeamSharing';
 
 interface MobileNavDrawerProps {
   visible: boolean;
@@ -103,6 +108,20 @@ export function MobileNavDrawer({ visible, onMinimize, isActive, workspaceId, th
     </>
   ), [onMinimize, t]);
 
+  // DALTON-HOOK(mobile-web): gate mobile drawer team workspaces section on colleague_sharing capability
+  const { hasCapability } = useCapabilities();
+  const colleagueSharingReady = hasCapability('colleague_sharing');
+
+  // DALTON-HOOK(mobile-web): memoize Dalton trailing sections for NavigationPanel
+  const extraSections = useMemo(() => (
+    <>
+      <CoverageTreeSection currentWorkspaceId={workspaceId} onNavigate={onMinimize} />
+      {isDaltonAuth && colleagueSharingReady && (
+        <TeamWorkspacesSection currentWorkspaceId={workspaceId} onNavigate={onMinimize} />
+      )}
+    </>
+  ), [workspaceId, onMinimize, colleagueSharingReady]);
+
   return (
     <>
       {/* Dimmed backdrop behind the drawer */}
@@ -146,6 +165,8 @@ export function MobileNavDrawer({ visible, onMinimize, isActive, workspaceId, th
             >
               <NavigationPanel
                 headerActions={headerActions}
+                // DALTON-HOOK(mobile-web): coverage tree & team workspaces trailing sections
+                extraSections={extraSections}
                 isActive={isActive}
                 {...navTreeProps}
                 {...picks}

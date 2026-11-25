@@ -443,7 +443,7 @@ export function DaltonDiscordChannelsCard() {
               aria-label={t('dalton.discordChannels.channelIdPlaceholder')}
               placeholder={t('dalton.discordChannels.channelIdPlaceholder')}
               data-testid="dalton-discord-channel-id-input"
-              className="h-8 w-72 text-xs font-mono"
+              className="h-9 md:h-8 w-full md:w-72 text-xs font-mono"
             />
             <Input
               value={nameInput}
@@ -452,7 +452,7 @@ export function DaltonDiscordChannelsCard() {
               aria-label={t('dalton.discordChannels.namePlaceholder')}
               placeholder={t('dalton.discordChannels.namePlaceholder')}
               data-testid="dalton-discord-channel-name-input"
-              className="h-8 w-48 text-xs"
+              className="h-9 md:h-8 w-full md:w-48 text-xs"
             />
             <Button
               type="submit"
@@ -491,12 +491,12 @@ export function DaltonDiscordChannelsCard() {
                   testId={`dalton-discord-channel-row-${item.channelId}`}
                   title={displayTitle}
                   meta={
-                    <span className="font-mono">
+                    <span className="font-mono max-md:break-all">
                       {t('dalton.discordChannels.channelIdLabel')}: {item.channelId}
                     </span>
                   }
                   trailing={
-                    <div className="flex items-center gap-2">
+                    <div className="flex max-md:flex-wrap items-center gap-2">
                       <Button
                         type="button"
                         variant="ghost"
@@ -547,7 +547,7 @@ export function DaltonDiscordChannelsCard() {
                             setEditingName('');
                           }
                         }}
-                        className="h-8 w-56 text-xs"
+                        className="h-9 md:h-8 w-full md:w-56 text-xs"
                       />
                       <Button
                         type="button"
