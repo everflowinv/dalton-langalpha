@@ -1,9 +1,9 @@
-# 渠道第二阶段设计方案（飞书 / Discord / 个人微信，r5 第 1 批定稿版）
+# 渠道第二阶段设计方案（飞书 / Discord / 个人微信，r6 第 1 批代码级收口版）
 
 > **基线分支**：`docs/channel-phase2`（基于 `dalton/main` `305400a37`）  
-> **前置分支**：`fix/channel-sandbox-links`（`lanes/41`，工作区沙箱路径改写登录深链）、`feat/external-member-perms-final`（外部成员服务端权限守卫）  
+> **前置分支**：`fix/channel-sandbox-links`（`lanes/41`，已合入 `src/shared/sandbox-links.ts` 工作区沙箱路径改写登录深链）、`feat/external-member-perms-final`（外部成员服务端权限守卫）  
 > **关联文档**：`docs/dalton/features/standalone-core.md`、`docs/dalton/features/external-member-permissions.md`（前置分支 `feat/external-member-perms-final` 新增）、`docs/dalton/features/weixin-multi-account.md`、`docs/dalton/features/cos-delivery-confirmation.md`  
-> **文档状态**：r5 版（**第 1 批已定稿并进入开发**；第 2–4 批保留设计并附「开发前设计复核清单」，轮到对应批次开发前对照当时代码复核收口；第七章方案待用户最终确认）
+> **文档状态**：r6 版（**第 1 批已完成代码级收口并直接进入开发**；第 2–4 批保留设计并附「开发前设计复核清单」，轮到对应批次开发前对照当时代码复核收口；第七章方案待用户最终确认）
 
 ---
 
@@ -31,7 +31,7 @@
   - [4.2 外部成员发起交互时的权限范围](#42-外部成员发起交互时的权限范围)
   - [4.3 私聊自动附带文件的双路径白名单与配额过滤规则](#43-私聊自动附带文件的双路径白名单与配额过滤规则)
 - [五、数据库变更设计（Dalton 迁移链）](#五数据库变更设计dalton-迁移链)
-  - [5.1 群聊机器人话题登记表与飞书回复去重字段（第 1 批新增）](#51-群聊机器人话题登记表与飞书回复去重字段第-1-批新增)
+  - [5.1 群聊机器人话题登记表 `dalton_channel_bot_topics`（第 1 批新增）](#51-群聊机器人话题登记表-dalton_channel_bot_topics第-1-批新增)
   - [5.2 渠道交互令牌表与中断恢复竞争表（第 3 批新增）](#52-渠道交互令牌表与中断恢复竞争表第-3-批新增)
   - [5.3 Discord 右键研判草稿与可重试派发表 `dalton_channel_context_menu_drafts`（第 4 批新增）](#53-discord-右键研判草稿与可重试派发表-dalton_channel_context_menu_drafts第-4-批新增)
   - [5.4 存量表边界、迁移链顺接与滚动升级回退方案](#54-存量表边界迁移链顺接与滚动升级回退方案)
@@ -50,9 +50,9 @@
 
 本设计聚焦收窄后的渠道第二阶段五项交付内容（按 4 个批次推进，其中**第 1 批现已定稿并直接进入开发**，第 2–4 批在启动开发前先完成 §6.2 对应批次的设计复核清单）：
 
-1. **② 群聊自动开话题与发起人免 `@` 追问（第 1 批，已定稿）**：在飞书群与 Discord 频道顶层 `@机器人` 提问时自动开启独立话题或 Thread（子区，Discord 频道内的独立讨论串），话题发起人在该话题内直接发送消息即可连续对话。
+1. **② 群聊自动开话题与发起人免 `@` 追问（第 1 批，已定稿）**：在飞书群与 Discord 频道顶层 `@机器人` 提问时，首轮由网关直接创建独立话题或 Thread（子区，Discord 频道内的独立讨论串）并锁定 `canonical_scope_key`，话题发起人在该话题内直接发送消息即可连续对话，后续轮次统一按已登记平台话题号 `external_topic_id` 投递回同一话题。
 2. **②a 系统看盘图表图层转图片附网页交互链接（第 2 批）**：将系统内置渲染页承载的看盘图表图层（`chart_layer`，页面仅消费后端行情数据与强校验图层结构化数据）渲染为高清 PNG（便携式网络图形无损图片格式），**仅在发起人本人私聊中**随回答发出并附上网页交互版登录深链；群聊与频道会话以及自定义交互组件（`ShowWidget` / `html_widget`）统一输出网页交互版登录深链。
-3. **②b 私聊回答生成文件自动附带与链接收尾（第 1 批，已定稿）**：在发起人与机器人的私聊会话中，自动附带本轮工具写入本人自有工作区、通过类型白名单与排除规则、且发送前核对仍在本轮写入记录内并满足文件修改时间早于或等于本轮运行结束时间的可交付文件（超出条件时改为发送网页登录深链）；群聊与频道会话以及 `.html`（HTML，HyperText Markup Language，超文本标记语言）网页报告统一输出网页登录深链；同时完成 `lanes/41` 留待本批处理的引用式链接展开、自动化报告与数据任务通知携带会话与工作区编号生成深链、自动化完成摘要改写并保留工作区文件链接三项改造。
+3. **②b 私聊回答生成文件自动附带与链接收尾（第 1 批，已定稿）**：在发起人与机器人的私聊会话中，工具写入本人自有工作区成功时同步在 `turn_deliverables` 记录当次 `FileStamp`（`size`、`mtime`、`ctime`、`inode`）与内容 SHA-256 哈希；下载接口按已授权 `delivery_key` 在 PostgreSQL 核对运行归属、私聊类型、实际收件人与当前有效平台绑定（个人微信复用账号 ID、机器人代数及上传后复核），并通过 `read_contained_sandbox_file_versioned`（离线回退核对 `workspace_files.sandbox_modified_at` 与 `content_hash` / `blob_sha256`）确认当前文件版本与哈希一致后随私聊发出（版本缺失或存在差异时发网页登录深链）；私聊附件独立于正文发送状态结算并按已确认 `files_status` 去重；群聊与频道会话（含 `/agent/send` 显式传入的 `files`）及 `.html`（HTML，HyperText Markup Language，超文本标记语言）网页报告统一转为网页登录深链；同时扩展已合入的 `src/shared/sandbox-links.ts` 完成引用式链接分片前展开、`workspaceId` 回退，以及后端通知摘要剥离前深链改写与报告入库前改写。
 4. **③ 可交互卡片与单中断单操作原生按钮（第 3 批）**：将澄清提问卡片升级为原生单选按钮、下拉框或弹窗输入；对命中「单中断、单操作」明确允许清单的 L1 / L2 确认操作提供渠道原生按钮（群内 L1 与 L2 卡片统一仅展示动作名称与网页 / 私聊或私密卡确认入口，完整参数放入飞书发起人私聊卡或 Discord 私密详情卡）；通过 `begin_run(in_start=...)` 同事务提交准入状态与恢复运行（强制核对恰好更新 1 行 `pending_dispatch`），保持行内 `request_key` 与 `begin_run` 使用的请求键严格一致，并由后端恢复任务统一回收超时未准入行及运行已取消/失败的网页未确认记录；其余操作及额度暂停（`credit_pause`）沿用网页端与现有文字入口。
 5. **④ 机器人快捷菜单与 Discord 消息右键研判（第 4 批）**：提供飞书单聊输入框快捷菜单、Discord `/workspace` 下拉切换菜单与消息右键命令「转入 `<品牌名>` 研判」（首次派发与重启恢复共用实时权限检查与原消息实时重读）。
 
@@ -106,6 +106,12 @@
 6. **群话题全员免 `@` 开关与按核验结果细分的研报发布渠道审批**：
    - **归入后续原因**：保障群聊人际讨论秩序，并确保正式研报数字核验明细经浏览器完整审阅后再发布；本阶段固定执行「话题内仅发起人免 `@`」与「正式研报发布（`publish_approval`）固定网页端确认」。
    - **后续开启前提**：落地群级管理员可配置的免 `@` 触发策略开关，以及面向零疑问研报草稿的移动端精简核验摘要规范。
+7. **网关重启后未结算建帖回复的平台历史回执核实与自动补发**：
+   - **归入后续原因**：飞书话题内跟帖回复的 `root_id` 与 `parent_id` 均指向话题根消息，且话题历史接口涉及多页翻页与跨重启 `I-6` / `I-7` 状态衔接；第 1 批重启时未结算的首条回复沿用现有保护行为（启动恢复将其标为 `status = 'unknown'` 并保持单次发送，用户在网页端查看完整回答；Discord 已落库 `confirmed_thread_address` 且处于 `discord_body_phase = 'before_body'` 的既有续发规则保持不变）。
+   - **后续开启前提**：结合网关租约 `epoch`、`delivery_attempt`、持久化的待发首片摘要及飞书/Discord 话题历史分页对账机制，支持重启后精确核实平台回执并从断点补发。
+8. **非发起人在群话题内显式 `@机器人` 时自动附带话题首楼与被回复消息上下文**：
+   - **归入后续原因**：跨成员在他人发起的话题内 `@机器人` 时，首楼与被回复消息可能包含长文本或附件，需单独约定拉取范围、截断预算与入站结构化字段；第 1 批中其他已绑定内部成员或管理员在话题内 `@机器人` 时，按现有群内 `@` 行为触发其本人会话并传入当前消息内容。
+   - **后续开启前提**：明确话题首楼与被回复消息的拉取边界、长度截断规则、入站载荷字段及工作区上下文隔离策略。
 
 ---
 
@@ -115,9 +121,9 @@
 
 | 功能项 | 飞书（Feishu）实现与降级 | Discord 实现与降级 | 个人微信（Weixin iLink）实现与降级 |
 | --- | --- | --- | --- |
-| **② 群聊开话题与发起人免 `@` 追问** | 前置开启 `im:message.group_msg` 与 `im:message:readonly` 权限；群顶层 `@` 回复预落库去重 `uuid` 与发送时间戳，以 `reply_in_thread: true` 创建话题（`omt_xxx`），登记后清除负缓存；未知回执按回复目标、发送者、发送时间与待发首片内容精确核实并同事务记录平台消息 ID、分片状态与话题映射，50 分钟去重窗内无候选回执才带原 `uuid` 重试，结果含糊或超期未确认保持未知态；原消息撤回（`230011`/`231003`/`230110`）回退普通群消息 | 频道顶层 `@` 分离会话键与父频道投递地址，首轮在父频道从原消息建公开子区，确认地址沿用 `discord:<guild>/<parent>:thread:<thread>`，按父频道核验权限；权限或活跃子区满额（`50013`/`160006`/`160007`）回退父频道引用回复，原消息已删除（`10008`）发无引用简短提示 | 面向单聊（`weixin:@me`），群消息记为 `weixin_group_unsupported` 归档略过；单聊直接连续收发 |
+| **② 群聊开话题与发起人免 `@` 追问** | 前置开启 `im:message.group_msg` 与 `im:message:readonly` 权限；群顶层 `@` 首轮由网关强制以 `reply_in_thread: true` 创建话题（`omt_xxx`），`canonical_scope_key` 固定为 `chat:<chat_id>:topic:<om_root>`（已有话题内 `@` 沿用 `chat:<chat_id>:thread:<omt_xxx>`），登记 `dalton_channel_bot_topics` 并清除负缓存；后轮出站按表内 `external_topic_id` 带 `reply_in_thread: true` 投递；重启时未结算首条回复沿用现有行为标 `unknown`（网页查看完整回答）；原消息撤回（`230011`/`231003`/`230110`）回退普通群消息 | 频道顶层 `@` 首轮由网关强制在父频道从原消息建公开子区，`canonical_scope_key` 固定为 `chat:<guild>/<parent>:topic:<msg>`（已有子区内 `@` 沿用 `chat:<guild>/<parent>:thread:<thread>`），确认地址沿用 `discord:<guild>/<parent>:thread:<thread>` 并登记 `dalton_channel_bot_topics`；后轮出站按表内 `external_topic_id` 先 `ensureThreadUnarchived` 再发入该子区，按父频道核验权限；权限或活跃子区满额（`50013`/`160006`/`160007`）回退父频道引用回复，原消息已删除（`10008`）发无引用简短提示；重启未确认建帖沿用现有 `unknown` 保护 | 面向单聊（`weixin:@me`），群消息记为 `weixin_group_unsupported` 归档略过；单聊直接连续收发 |
 | **②a 系统看盘图表转图片** | **发起人私聊**：针对系统 `chart_layer` 生成 Schema 2.0（飞书第二代交互卡片规范）卡片，内嵌从 Dalton 对象存储拉取的高清 PNG（`tag: "img"`）+ 底部 `open_url` 按钮 `[打开网页交互版]`（超 10 MB〔兆字节〕自动使用 1x 缩放或转 WebP〔高压缩率网页图片格式〕）；**群聊/话题**、`ShowWidget` 或存储/渲染器未就绪时统一发网页登录深链 | **发起人私聊**：针对系统 `chart_layer` 以 `multipart/form-data`（多部分表单上传格式）附带高清 PNG + `ActionRow`（操作组件行容器）`Link Button`（外链按钮）`[打开网页交互版]`；**群频道/子区**、`ShowWidget` 或存储/渲染器未就绪时统一发网页登录深链 | **发起人私聊**：针对系统 `chart_layer` 在正文后追加加密上传的 `IMAGE` 图片消息，公网地址可达时附纯文本交互深链；`ShowWidget` 或存储/渲染器未就绪时发文字与深链 |
-| **②b 私聊本轮文件附带与深链** | **发起人私聊**：限本轮工具写入本人自有工作区的确认文件（`turn_deliverables`），发送前经双路径白名单并核对仍在本轮写入记录内且文件修改时间早于或等于本轮运行结束时间后，≤10 MB 图片走 `im.image.create`，≤20 MB 文档/表格走 `im.file.create`；**群聊**、`.html` 报告及超出条件文件统一发网页登录深链 | **发起人私聊**：限本轮工具写入本人自有工作区、仍在本轮写入记录内且文件修改时间早于或等于本轮运行结束时间的 ≤20 MB 合规文件作为私聊附件发送（整轮 ≤50 MB，最多 5 个）；**群频道/子区**、`.html` 报告及超出条件文件统一发网页登录深链 | **发起人私聊**：限本轮工具写入本人自有工作区、仍在本轮写入记录内且文件修改时间早于或等于本轮运行结束时间的合规文件（≤20 MB，单轮最多 3 个），经 AES-128-ECB（128 位高级加密标准电子密码本模式，`src/channels/weixin/cdn.ts`）加密上传 CDN（内容分发网络）作为 `IMAGE`/`FILE` 发送；其余发网页登录深链 |
+| **②b 私聊本轮文件附带与深链** | **发起人私聊**：限本轮工具写入本人自有工作区的确认文件（`turn_deliverables` 记录写入时 `FileStamp` 与内容 SHA-256），按已授权 `delivery_key` 在 PostgreSQL 核对运行、私聊类型、收件人与当前有效绑定，并经双路径白名单及 `read_contained_sandbox_file_versioned`（离线核对 `workspace_files` 备份）确认版本/哈希一致后，≤10 MB 图片走 `im.image.create`、≤20 MB 文档/表格走 `im.file.create`；私聊附件独立结算并按 `files_status` 去重；**群聊（含显式 `send_message(files=...)`）**、`.html` 报告及版本差异/缺失文件统一发网页登录深链 | **发起人私聊**：限本轮工具写入本人自有工作区、通过 `delivery_key` 收件人与绑定核验且当前 `FileStamp`/哈希一致的 ≤20 MB 合规文件作为私聊附件发送（整轮 ≤50 MB，最多 5 个），独立于正文结算并按 `files_status` 去重；**群频道/子区（含显式 `send_message(files=...)`）**、`.html` 报告及版本差异/缺失文件统一发网页登录深链 | **发起人私聊**：限本轮工具写入本人自有工作区、通过 `delivery_key` 微信账号 ID/机器人代数核验（含上传后复核）且当前 `FileStamp`/哈希一致的合规文件（≤20 MB，单轮最多 3 个），经 AES-128-ECB（128 位高级加密标准电子密码本模式，`src/channels/weixin/cdn.ts`）加密上传 CDN（内容分发网络）作为 `IMAGE`/`FILE` 发送；其余发网页登录深链 |
 | **③ 提问与单中断单操作按钮** | 所有交互卡常驻独立网页入口；L0 提问渲染按钮组或 `form` 表单；**私聊** L1/L2 发完整参数确认卡（L2 附二次确认框）；**群聊 L1 与 L2 一致**：群卡只显示动作名称与网页入口，完整参数与按钮发往发起人飞书私聊；`credit_pause` 保持文字/网页入口，L3 发网页入口 | 所有交互卡常驻独立网页入口；L0 渲染 `Button` / `StringSelect` + `Modal`；**私聊** L1/L2 发完整参数按钮卡；**群频道/子区 L1 与 L2 一致**：群卡只显示动作名称、网页入口与 `[查看详情并确认]` 门禁按钮，点击签发短期令牌返回 `flags: 64` Ephemeral（仅点击者可见临时消息）详情卡；凭证过期或 L3 给网页入口 | L0 输出数字编号列表供直接回复；`credit_pause` 沿用现有回复 `继续` / `/stop` 文字入口与网页入口；其余确认统一发送动作说明与网页端确认深链 |
 | **④ 快捷菜单与右键研判** | 订阅 `application.bot.menu_v6` 响应单聊输入框上方 4 个固定菜单（返回研究总监、切换工作区卡片、新建对话、停止任务），保留 v7 `/` 命令 | 升级无参 `/workspace` 返回下拉切换菜单；注册消息右键命令（`type = 3`）「转入 `<品牌名>` 研判」，首次同步弹 `Modal`，首次派发与重启恢复共用实时权限检查与原消息实时重读，核验公开目的地可见范围与发帖权，未通过核验时终止并提示重新操作 | 在 `/help` 与扫码成功欢迎语列出快捷指令，发送 `/workspace` 返回编号列表供回复切换 |
 
@@ -125,56 +131,59 @@
 
 ### 2.2 功能 ②：群聊 `@机器人` 自动开话题与话题内免 `@` 继续对话
 
-#### （1）飞书实现、前置权限、入站精确过滤与去重期回执恢复
+#### （1）飞书实现、前置权限、入站精确过滤与话题出站路由
 
 1. **平台权限前置条件（`im:message.group_msg` 与 `im:message:readonly`）**：
-   - 飞书群内接收未显式 `@机器人` 的话题跟帖消息，依赖飞书开放平台应用开启群消息权限 **`im:message.group_msg`**（获取群组中所有消息）；未知回执恢复拉取话题历史消息依赖应用具备 **`im:message:readonly`**（获取单聊、群组消息）权限，两项权限发布应用版本审批生效并在测试群完成 `im.message.list(container_id_type="thread")` 实测验证，列为第 1 批上线前置条件。
-   - 在权限生效前的过渡期内，群顶层 `@机器人` 自动创建话题以及在话题内继续通过 `@机器人` 追问均正常运作并归入同一话题会话。
-2. **入站前置过滤与负缓存即时清除（持久化和下载附件前直接略过无关消息）**：
+   - 飞书群内接收未显式 `@机器人` 的话题跟帖消息，依赖飞书开放平台应用开启群消息权限 **`im:message.group_msg`**（获取群组中所有消息）；建话题首条回复后通过 `getMessageFeishu`（`src/channels/feishu/send.ts:731`，调用 `im.message.get`）读取回复消息所属 `thread_id`（`omt_xxx`）依赖 **`im:message:readonly`**（获取单聊、群组消息）权限，两项权限发布应用版本审批生效列为第 1 批上线前置条件。
+   - 在权限生效前的过渡期内，群顶层 `@机器人` 自动创建话题以及在话题内继续通过 `@机器人` 追问均正常运作并归入对应会话。
+2. **入站前置过滤、`canonical_scope_key` 保持与负缓存即时清除**：
    - 开启 `im:message.group_msg` 后，飞书长连接（`src/channels/feishu/monitor.ts`）在调用 `getMessageFeishu`、`downloadMessageResourceFeishu` 或后端 `I-1`（`register-and-resolve`）之前执行两步内存快速筛选：
-     - **按实际话题标识 `thread_id` 精确匹配免 `@` 跟帖**：飞书普通群中对某条消息执行主聊区普通引用回复（`reply_in_thread: false`）时，消息仅携带 `root_id` 而 `thread_id` 为空。因此，凡群消息未 `@机器人` 且 `message.thread_id` 为空，直接在内存中作为主聊区普通发言略过（零落库、零下载、零后端请求）；
-     - 当群消息未 `@机器人` 且携带非空 `message.thread_id`（`omt_xxx`）时，先查网关内存 LRU（Least Recently Used，最近最少使用缓存，分别维护已登记机器人话题正缓存与短时效非机器人话题负缓存），缓存未命中时调用轻量只读接口 `/internal/topics/lookup`（**新增**，按 `(platform='feishu', chat_address, external_topic_id=message.thread_id)` 精确查询）。当命中已登记机器人话题且 `senderOpenId === initiatorPlatformUserId`（话题发起人本人，见第七章定案 1）时，将 `event.threadScopeKey` 归一为已登记的 `canonical_scope_key` 并置 `event.isGroupTrigger = true` 进入后续流程；其余情形直接在内存中略过。
-   - **话题登记成功时清除负缓存**：当用户在已有普通话题内先做日常交流（此时该 `omt_xxx` 记入短时效负缓存），随后在该话题内首次 `@机器人` 提问并写入 `dalton_channel_bot_topics` 时，网关与 `I-1` / `I-7` 回执处理同步清除该 `(chat_address, external_topic_id)` 的负缓存条目并写入正缓存，使发起人紧接着发出的免 `@` 追问立即生效。
-3. **普通群顶层 `@` 自动创建话题、去重窗口约束与只读回执核实恢复**：
-   - 在普通群中，用户首次顶层 `@机器人` 发送消息 `om_root`（无 `thread_id`）时，飞书适配器 `src/channels/feishu/inbound-parse.ts` 与 `src/channels/feishu/targets.ts` 将初始 `threadScopeKey` 构造为 `chat:<chat_id>:topic:<om_root>`；在话题群或已有话题中 `@机器人`（自带 `message.thread_id = omt_xxx`），`threadScopeKey` 为 `chat:<chat_id>:thread:<omt_xxx>`。
-   - **首次回复稳定 `uuid` 预落库与 1 小时去重期限规则**：首条建话题回复发出前，网关按 `delivery_key` 派生确定性飞书回复幂等键 `reply_uuid = UUIDv5(DALTON_FEISHU_REPLY_NAMESPACE, delivery_key)`，并通过 `I-7`（`deliveries/progress`）预先写入 `dalton_channel_deliveries.feishu_reply_uuid` 与首次发往飞书的时间戳 `feishu_reply_dispatched_at`（**新增可空列**，见 §5.1）。`src/channels/feishu/send.ts` 调用 `client.im.message.reply` 时传入 `reply_in_thread: true` 与 `uuid: reply_uuid`。
-   - **未知结果时的只读精确回执核实与超期保护**：飞书开放平台对 `im.message.reply` 同一 `uuid` 的服务端去重承诺窗口为 **1 小时**。当首条回复请求遇到超时、连接中断、响应缺失 `message_id`（`send.ts:482`）或网关在保存话题回执前退出重启时，恢复流程按以下顺序处理：
-     1) **优先按四要素只读核实本次首片回执**：先调用 `getMessageFeishu(om_root)`（`im.message.get`，`send.ts:731`）读取根消息最新详情（若本来已在已知 `omt_xxx` 话题内回复则直接使用该 `omt_xxx`）；当存在非空 `thread_id`（`omt_xxx`）时，调用飞书 `im.message.list`（`container_id_type = "thread"`, `container_id = omt_xxx`）检索话题历史，并同时核对候选消息满足四项条件：**① 发送者为当前机器人应用（`sender.sender_type === "app"` 且 `sender.id` 匹配本应用）；② 回复目标匹配本次触发消息（`parent_id === replyToMessageId`，顶层开帖时即 `om_root`，区分同一话题内针对其他 `@` 消息发出的机器人回复）；③ 消息创建时间 `create_time` 晚于或等于本次预落库的 `feishu_reply_dispatched_at`（预留 `5 秒` 时钟容差）；④ 消息类型与解析后的正文内容匹配本次待发送的首个分片**。当唯一命中本次首片回复时，提取其 `message_id` 与 `omt_xxx` 直接进入下方同事务落库流程；若话题内存在多条疑似候选难以唯一区分、或历史查询返回权限/服务异常使核实结果含糊，直接将投递状态置为结果未知保护态（`status = "unknown"`）并暂停自动补发；
-     2) **去重有效期内带原 `uuid` 重试**：仅当只读核实明确确认根消息尚未生成话题（`thread_id` 为空）或话题内尚无满足上述条件的机器人回复，且当前时间距 `feishu_reply_dispatched_at` **在 `50 分钟` 以内**（预留 10 分钟时钟与网络余量，处于飞书 1 小时 `uuid` 去重窗口内）时，携带同一 `uuid: reply_uuid` 重试首片 `im.message.reply`，拿到 `first_reply_message_id` 后调用 `getMessageFeishu(first_reply_message_id)` 读取 `omt_xxx`；
-     3) **超期未确认保持未知保护态**：当距 `feishu_reply_dispatched_at` **已超过 `50 分钟`** 仍未确认平台回执时，投递记录保持结果未知保护态（`status = "unknown"`），交由人工核查或网页端查看，避免跨过飞书 1 小时去重期后重复建帖。
-   - **同事务持久化分片进度与话题映射**：确认 `first_reply_message_id` 与 `external_topic_id = omt_xxx` 后，网关通过 `I-7` 在**同一数据库事务**内原子更新 `dalton_channel_deliveries` 的 `platform_message_ids`、`sent_chunks = 1`、对应 `status`（单分片回复直接推进为 `'sent'`，多分片回复置为 `'partial'` / 保持 `'in_flight'` 从第 2 片续发）以及新增表 **`dalton_channel_bot_topics`** 的 `bot_topic_registration` 记录，收到响应后立即清除该 `omt_xxx` 负缓存，并保持 `dalton_channel_deliveries.confirmed_thread_address` 专供 Discord 使用。同轮后续文本分片均通过 `dalton_channel_bot_topics` 以 `reply_in_thread: true` 投递至同一话题。
-   - 话题发起人在已登记话题内直接发送 `/new`、`/stop`、`/workspace`、`/main` 斜杠指令同样免 `@` 生效。
+     - **按实际话题标识 `thread_id` 精确匹配免 `@` 跟帖**：飞书普通群中主聊区普通引用回复（`reply_in_thread: false`）仅携带 `root_id` 而 `thread_id` 为空；凡群消息未 `@机器人` 且 `message.thread_id` 为空，直接在内存中作为主聊区普通发言略过（零落库、零下载、零后端请求）；
+     - 当群消息未 `@机器人` 且携带非空 `message.thread_id`（`omt_xxx`）时，先查网关内存 LRU（Least Recently Used，最近最少使用缓存，分别维护已登记机器人话题正缓存与短时效非机器人话题负缓存），未命中时调用轻量只读接口 `/internal/topics/lookup`（**新增**，`match_mode: "inbound_followup"`，按 `(platform='feishu', chat_address, external_topic_id=message.thread_id)` 精确查询）。当命中已登记机器人话题且 `senderOpenId === initiatorPlatformUserId`（话题发起人本人，见第七章定案 1）时，**直接采用表内已锁定的 `canonical_scope_key` 作为 `event.threadScopeKey`（保持触发轮生成的 `chat:<chat_id>:topic:<om_root>` 或 `chat:<chat_id>:thread:<omt_xxx>` 原值，跳过 `buildDaltonFeishuThreadScopeKey` `src/channels/feishu/targets.ts:317` 向另一种 `:thread:` 键的重拼）**，在入站事件上记录 `externalTopicId = message.thread_id` 并置 `event.isGroupTrigger = true`；其余未 `@` 情形直接在内存中略过。
+   - **话题内显式 `@机器人` 与指令路由**：话题发起人在已登记话题内显式 `@机器人` 或直接发送 `/new`、`/stop`、`/workspace`、`/main` 斜杠指令时，同样复用表内同一 `canonical_scope_key`（斜杠指令免 `@` 生效）；群内其他已绑定的内部成员或管理员在该话题内显式 `@机器人` 时，按现有群内 `@` 规则触发其本人会话（`threadScopeKey` 保持 `chat:<chat_id>:thread:<omt_xxx>`，仅传入当前 `@` 消息内容，见 §7 定案 1）。
+   - **话题登记成功时清除负缓存**：当用户在普通话题内首次 `@机器人` 提问并写入 `dalton_channel_bot_topics` 时，网关收到 `I-1` 或 `I-7` 响应后同步清除该 `(chat_address, external_topic_id)` 的负缓存条目并写入正缓存，使发起人紧接着发出的免 `@` 追问立即生效。
+3. **顶层 `@` 首轮网关强制建话题、后轮按 `external_topic_id` 出站投递与重启保护**：
+   - **`canonical_scope_key` 确定规则**：普通群顶层 `@机器人` 发送消息 `om_root`（`message.thread_id` 为空）时，`src/channels/feishu/inbound-parse.ts` 与 `src/channels/feishu/targets.ts` 将初始 `threadScopeKey`（即登记时的 `canonical_scope_key`）构造为 `chat:<chat_id>:topic:<om_root>`；已在平台现有话题内首次 `@机器人`（自带 `message.thread_id = omt_xxx`）时，`canonical_scope_key` 沿用现有 `chat:<chat_id>:thread:<omt_xxx>`。
+   - **顶层 `@` 首轮由网关强制建话题（独立于模型 `new_thread`）**：当触发入站为群顶层 `@`（`:topic:` 作用域且尚未登记话题）时，网关在 `src/orchestrator.ts` 与 `src/delivery-service.ts` 对该回合首条发往当前群会话的出站投递（涵盖模型 `send_message` 与回合结束 `fallback`）直接置位建话题标志，无需等待模型传入 `new_thread=true`。`FeishuChannelAdapter.sendTextChunk`（`src/channels/feishu/monitor.ts:878`）及 `sendMessageFeishu` / `sendStructuredCardFeishu`（`src/channels/feishu/send.ts:609`）向 `im.message.reply` 传入 `reply_in_thread: true`（附按 `${delivery_key}:${chunk_index}` 派生的确定性幂等 `uuid`），从响应或 `getMessageFeishu(first_reply_message_id)` 取得 `omt_xxx` 后，通过 `I-7`（`deliveries/progress`）在同一数据库事务内更新 `platform_message_ids`、`sent_chunks` 并登记 `dalton_channel_bot_topics`（锁定 `canonical_scope_key`、`external_topic_id = omt_xxx`、`root_message_id = om_root` 与 `first_reply_message_id`），收到响应后立即清除该 `omt_xxx` 负缓存。
+   - **同轮后续分片与后轮出站统一按 `dalton_channel_bot_topics.external_topic_id` 投递**：已登记话题的同轮后续分片，以及后续轮次的实时回复、断线回放（`deliverReplayFallback`）、后台唤醒/命令回报（`consumeBackgroundRunStream`）与当前会话 `send_message`，统一按表内 `external_topic_id` 投递进该飞书话题——携带当前轮触发消息 `replyToMessageId` 时对该入站消息调用 `im.message.reply(..., reply_in_thread: true)`；无当前触发消息的分片、回放或后台回报通过 `I-6` 返回的话题信息或 `/internal/topics/lookup`（`match_mode: "outbound_delivery"`，按 `canonical_scope_key` 查询）取得 `first_reply_message_id`（或 `root_message_id`）并以 `reply_in_thread: true` 回复，始终落在同一 `omt_xxx` 话题内。
+   - **重启与未知回执沿用现有 `unknown` 行为**：单次请求超时或响应缺失 `message_id`（`send.ts:482`）时按现有流程记为 `status = "unknown"`；网关在结算前退出重启时，沿用 `src/dalton/database/channel_gateway.py:12856` 现有启动恢复行为将未结算的 `in_flight` 投递标为 `status = 'unknown', error_code = 'gateway_restarted'`（保持单次发送，用户可在网页端查看完整回答；重启后拉取平台历史核实回执并自动补发归入 §1.4 后续演进）。
 4. **原消息撤回与建话题受限回退**：
-   - 调整 `src/channels/feishu/send.ts:531` 的 `sendReplyOrFallbackDirect`：当首轮建话题请求在去重窗内收到确定性撤回或限制错误（飞书错误码 `230011`、`231003`、`230110` 或群设置限制创建话题）时，自动回退调用 `im.message.create`（携带确定性去重 `uuid`）在群内发送回答，保持 `dalton_channel_bot_topics` 仅记录已成功创建的话题。
+   - 调整 `src/channels/feishu/send.ts:531, 587, 595` 的 `sendReplyOrFallbackDirect`：当首轮建话题请求收到确定性撤回或群设置限制错误（飞书错误码 `230011`、`231003`、`230110`）时，自动回退调用 `im.message.create` 在群内发送回答，保持 `dalton_channel_bot_topics` 仅记录已成功创建的话题。
 
-#### （2）Discord 实现、子区地址规范与父频道权限核验
+#### （2）Discord 实现、子区出站路由与父频道权限核验
 
-1. **会话键与已确认子区地址严格对齐 `I-7` 现有格式**：
-   - 在已登记的服务器文字频道（`GuildText = 0`）或公告频道（`GuildAnnouncement = 5`）收到顶层 `<@botId>` 消息时，Discord 适配器 `src/channels/discord/inbound.ts` 将逻辑会话键 `threadScopeKey` 构造为 `chat:<guildId>/<channelId>:topic:<messageId>`（采用 `:topic:` 前缀标识顶层新开会话），同时保持初始出站 `targetAddress` 为父频道地址 `discord:<guildId>/<channelId>`，并标记 `inboundInExistingThread: false`。
-   - 改造 `src/channels/discord/send.ts` 的 `sendMessageDiscord`：当 `params.newThread === true` 且 `confirmedThreadAddress` 为空时，对父频道 `parsed.channelId` 调用 `src/channels/discord/threading.ts` 的 `createThreadDiscord`（子区名称取清洗后的用户问题首行，按 UTF-16〔16 位统一码字符编码〕安全截断至 `100` 字符以内，自动归档时长 `60` 分钟）。
-   - `createThreadDiscord` 确认子区创建成功后，沿用现有 `src/dalton/database/channel_gateway.py:7926, 8018`（`_DISCORD_CONFIRMED_THREAD`）格式，通过 `onConfirmedThread` 写入 **`dalton_channel_deliveries.confirmed_thread_address = "discord:<guildId>/<parentChannelId>:thread:<threadId>"`** 及 `discord_body_phase`，同步通过 `I-7` 将 `(platform='discord', chat_address='discord:<guildId>/<parentChannelId>', external_topic_id=thread.id, root_message_id=messageId, canonical_scope_key)` 写入 `dalton_channel_bot_topics` 并清除该子区负缓存；落库确认后再向新子区发送首条消息与后续文本分片。
-   - **子区投递权限统一按父频道登记与用户渠道设置核验**：服务端在核验 Discord 子区投递或后续交互权限（含 `I-6` 及确认卡片门禁校验）时，凡遇到匹配 `_DISCORD_CONFIRMED_THREAD`（`discord:<guild>/<parent>:thread:<thread>`）的子区地址，统一提取其父频道地址 `discord:<guild>/<parent>` 传入 `src/dalton/database/channel_gateway.py:529` 的 `_verify_group_target_deliverable`，核验 `dalton_channel_chat_bindings` 父频道登记与发起人 `dalton_channel_user_settings.apps.discord.chats` 配置，同时以完整子区地址绑定当次实际投递目标；若建帖失败回退至父频道，则直接按父频道 `discord:<guild>/<parent>` 核验。
-   - 论坛频道（`GuildForum = 15`）与媒体频道（`GuildMedia = 16`）内的帖子本身为子区（`type = 11`，`inboundInExistingThread: true`），直接在该子区内回复并以父频道地址作为 `chat_address` 登记 `dalton_channel_bot_topics`（清除负缓存）。
-2. **子区内发起人免 `@` 继续对话**：
-   - Discord 适配器 `src/channels/discord/index.ts` 收到子区消息（`type = 10 / 11 / 12`）且未包含 `<@botId>` 时，解析父频道地址 `discord:<guildId>/<parentChannelId>` 后先查内存话题缓存，未命中则调用 `/internal/topics/lookup` 按 `(platform='discord', chat_address='discord:<guildId>/<parentChannelId>', external_topic_id=channel.id)` 查询 `dalton_channel_bot_topics`；当确认为已登记机器人子区且发送者为子区发起人（`author.id === initiatorPlatformUserId`）时，将 `threadScopeKey` 归一为表内 `canonical_scope_key` 并置 `isGroupTrigger = true`；回复前若子区已自动归档，`ensureThreadUnarchived` 自动解封。其余子区的未 `@` 消息在入站前直接略过。
-3. **建帖失败分类回退与未知结果复用**：
-   - **确定性建帖拒绝回退**：复用 `src/channels/discord/threading.ts` 的 `isDefiniteThreadPostFailure`（HTTP 4xx 确定性错误）：
+1. **`canonical_scope_key` 锁定、首轮网关强制建子区与后轮子区投递**：
+   - **入站 `canonical_scope_key` 确定规则**：在已登记的服务器文字频道（`GuildText = 0`）或公告频道（`GuildAnnouncement = 5`）收到顶层 `<@botId>` 消息时，Discord 适配器 `src/channels/discord/inbound.ts` 将逻辑会话键 `threadScopeKey`（即登记时的 `canonical_scope_key`）构造为 `chat:<guildId>/<channelId>:topic:<messageId>`，保持初始出站 `targetAddress` 为父频道地址 `discord:<guildId>/<channelId>`；已在平台现有子区（`type = 10 / 11 / 12`，含论坛 `GuildForum = 15` 与媒体频道 `GuildMedia = 16` 下的帖子子区 `11`）内首次 `<@botId>` 时，`canonical_scope_key` 沿用现有 `chat:<guildId>/<parentChannelId>:thread:<threadId>`，并以父频道地址作为 `chat_address` 登记 `dalton_channel_bot_topics`。
+   - **顶层 `@` 首轮由网关强制建子区（独立于模型 `new_thread`）**：当触发入站为频道顶层 `@`（`:topic:` 作用域且尚未登记子区）时，网关在 `src/orchestrator.ts` 与 `src/delivery-service.ts` 对该回合首条发往当前频道会话的出站投递直接打开建子区标志，无需等待模型传入 `new_thread=true`。在 `src/channels/discord/send.ts` 中，`threadIdFromScopeKey`（`:64-68`）仅用于解析 `:thread:` 作用域键；对于 `:topic:` 作用域键，首轮在 `confirmedThreadAddress` 与已登记 `external_topic_id` 均为空时对父频道 `parsed.channelId` 调用 `src/channels/discord/threading.ts` 的 `createThreadDiscord`（子区名称取清洗后的用户问题首行，按 UTF-16〔16 位统一码字符编码〕安全截断至 `100` 字符以内，自动归档时长 `60` 分钟）。
+   - **确认子区落库与后轮按 `external_topic_id` 投递**：
+     - 首轮 `createThreadDiscord` 创建成功后，沿用现有 `src/dalton/database/channel_gateway.py:7993`（`_DISCORD_CONFIRMED_THREAD`）格式，通过 `onConfirmedThread` 在 `I-7` 同事务写入 `confirmed_thread_address = "discord:<guildId>/<parentChannelId>:thread:<threadId>"`、`discord_body_phase = 'before_body'`，并同步将 `(platform='discord', chat_address='discord:<guildId>/<parentChannelId>', external_topic_id=thread.id, root_message_id=messageId, canonical_scope_key)` 写入 `dalton_channel_bot_topics`、清除该子区负缓存，随后向新子区发送首条消息与同轮后续分片；
+     - **后轮出站路由**：同一话题后续轮次（含发起人免 `@` 跟帖、发起人在子区内显式 `@`、断线回放、后台唤醒/命令回报及当前会话 `send_message`）统一按 `dalton_channel_bot_topics.external_topic_id` 投递——网关通过入站关联、`I-6` 当前会话授权返回或 `/internal/topics/lookup`（按 `canonical_scope_key` 查询）取得 `external_topic_id`，在 `sendMessageDiscord` 中先调用 `getDiscordChannel(rest, external_topic_id)` 与 `ensureThreadUnarchived(rest, channel)`（`threading.ts:148`）确保已自动归档的子区解封，再将消息发入该 `external_topic_id` 子区。
+   - **子区投递权限统一按父频道登记与用户渠道设置核验**：服务端在核验 Discord 子区投递或后续交互权限（含 `I-6` 及确认卡片门禁校验）时，凡遇到匹配 `_DISCORD_CONFIRMED_THREAD`（`discord:<guild>/<parent>:thread:<thread>`）或投递至已登记 `external_topic_id` 的子区目标，统一提取其父频道地址 `discord:<guild>/<parent>` 传入 `src/dalton/database/channel_gateway.py:529` 的 `_verify_group_target_deliverable`，核验 `dalton_channel_chat_bindings` 父频道登记与发起人 `dalton_channel_user_settings.apps.discord.chats` 配置；若首轮建帖失败回退至父频道，则直接按父频道 `discord:<guild>/<parent>` 核验。
+2. **子区内发起人免 `@` 继续对话与非发起人 `@` 分流**：
+   - Discord 适配器 `src/channels/discord/index.ts`（Gateway 连接已声明 `MessageContent = 32768` 意图，见 `src/channels/discord/gateway.ts:21`）收到子区消息（`type = 10 / 11 / 12`）且未包含 `<@botId>` 时，解析父频道地址 `discord:<guildId>/<parentChannelId>` 后先查内存话题缓存，未命中则调用 `/internal/topics/lookup`（`match_mode: "inbound_followup"`）按 `(platform='discord', chat_address='discord:<guildId>/<parentChannelId>', external_topic_id=channel.id)` 查询 `dalton_channel_bot_topics`；当确认为已登记机器人子区且发送者为子区发起人（`author.id === initiatorPlatformUserId`）时，**直接采用表内 `canonical_scope_key` 作为 `threadScopeKey`（跳过 `buildDiscordThreadScopeKey` `src/channels/discord/inbound.ts:134` 向 `:thread:` 的重拼）**，保留 `externalTopicId = channel.id` 并置 `isGroupTrigger = true`；其余未 `@` 子区消息在入站前直接略过。
+   - 子区发起人在已登记子区内发送斜杠命令或显式 `<@botId>` 时同样复用表内 `canonical_scope_key`；其他已绑定的内部成员或管理员在该子区内显式 `<@botId>` 时，按现有群内 `@` 规则触发其本人会话（`chat:<guildId>/<parentChannelId>:thread:<channel.id>`，仅含当前消息）并在该子区内回复。
+3. **建帖失败分类回退与重启保护**：
+   - **确定性建帖拒绝回退**：复用 `src/channels/discord/threading.ts` 的确定性 HTTP 4xx 错误分类：
      - 当缺少 `CREATE_PUBLIC_THREADS` 权限（`403` / Discord 错误码 `50013`）或活跃子区数量达到上限（`400` / Discord 错误码 `160006` 或 `160007`）且原消息仍在时，自动回退在已授权父频道携带 `message_reference: { message_id: replyToMessageId }` 引用回复；
      - 当原触发消息已被删除（`404` / Discord 错误码 `10008`）时，省略 `message_reference`，在已授权父频道发送一条简短完成提示（附网页会话登录深链），正常结案。
-   - **超时与 5xx 结果未知保护**：当建帖请求遇到网络超时、连接中断或 HTTP 5xx 时，沿用 `threading.ts` 现有的 `adoptUnconfirmedThread(() => findThreadStartedFromMessage(...))` 查找复用与 `outcome: "unknown"` 持久化重试机制，确保同一回复在唯一目标位置发出。
+   - **超时、5xx 与网关重启保护**：建帖请求在同次尝试中遇到网络超时、连接中断或 HTTP 5xx 时，沿用 `threading.ts` 现有的同次查找复用与 `outcome: "unknown"` 保护；网关重启时沿用现有 `channel_gateway.py:8544, 12856` 语义（已落库 `confirmed_thread_address` 且 `discord_body_phase = 'before_body'` 的投递按既有流程续发正文，其余在途未结算投递标为 `status = 'unknown'` 并保持单次发送，用户在网页端查看完整回答）。
 
-#### （3）接口契约与群会话代数失效同步
+#### （3）接口契约、登记归属锁定与群会话代数失效同步
 
 - **扩展 `POST /api/v1/dalton/channels/internal/inbound/register-and-resolve`（`I-1`，已有端点新增可选字段）**：
   - 请求体新增可选字段：`external_topic_id?: string | null`、`root_message_id?: string | null`。
-  - 当 `external_topic_id` 非空且 `(platform, chat_address, external_topic_id)` 命中 `dalton_channel_bot_topics` 时，后端在事务内将 `scope_key` 归一为表内 `canonical_scope_key` 并刷新 `last_active_at`；当用户在已有话题内首次显式 `@机器人` 触发时，同事务登记话题并返回 `topic_newly_registered: boolean` 供网关即时清除负缓存；响应新增返回 `resolved_scope_key: string` 与 `topic_initiator_platform_user_id: string | null`。
-- **扩展 `POST /api/v1/dalton/channels/internal/deliveries/progress`（`I-7`，已有端点新增可选字段）**：
-  - 请求体新增可选字段 `feishu_reply_uuid?: string | null`、`feishu_reply_dispatched_at?: string | null` 与 `bot_topic_registration?: { external_topic_id: string; root_message_id?: string | null; first_reply_message_id?: string | null; canonical_scope_key: string; initiator_platform_user_id: string }`：发往飞书前先持久化 `feishu_reply_uuid` 与 `feishu_reply_dispatched_at`；首条回复确认话题或经只读回执核实确认首片后，在同一数据库事务内更新 `platform_message_ids`、`sent_chunks`、对应 `status` 并以 `INSERT ... ON CONFLICT DO UPDATE` 写入 `dalton_channel_bot_topics`，网关收到成功响应后同步清除该话题负缓存。
+  - 当 `external_topic_id` 非空且 `(platform, chat_address, external_topic_id)` 命中 `dalton_channel_bot_topics` 时：若 `platform_user_id == initiator_platform_user_id`（发起人本人），后端在事务内将会话键固定为表内 `canonical_scope_key` 并刷新 `last_active_at`；若为其他成员显式 `@机器人`，保持该成员自身的 `chat:<id>:thread:<external_topic_id>` 会话键并仅刷新 `last_active_at`（表内原 `initiator_*` 与 `canonical_scope_key` 保持不变）。
+  - 当用户在未登记的普通已有话题内首次显式 `@机器人` 触发（且该子区并非另一名成员正在建帖的顶层根消息子区，如 Discord `external_topic_id` 对应 `dalton_channel_inbound_events` 中他人顶层入站 `message_id` 时交由原顶层触发轮登记发起人）时，同事务以 `canonical_scope_key = chat:<id>:thread:<external_topic_id>` 登记 `dalton_channel_bot_topics` 并返回 `topic_newly_registered: boolean` 供网关即时清除负缓存；响应新增返回 `resolved_scope_key: string`、`external_topic_id: string | null` 与 `topic_initiator_platform_user_id: string | null`。
+- **扩展 `I-6`（`authorize-and-claim`）与 `I-7`（`deliveries/progress`）（维持现有投递状态机不变）**：
+  - `I-6` 在解析当前群会话投递（`ex_scope_key` / `resolved_thread_scope_key` 命中 `dalton_channel_bot_topics.canonical_scope_key`）时，响应顺带返回已登记的 `external_topic_id: string | null` 与 `first_reply_message_id: string | null`，供实时回复、回放、后台回报与当前会话 `send_message` 直接定位目标话题；
+  - `I-7` 请求体新增可选字段 `bot_topic_registration?: { external_topic_id: string; root_message_id?: string | null; first_reply_message_id?: string | null; canonical_scope_key: string; initiator_platform_user_id: string }`：在投递处于 `in_flight` 确认飞书首片回执或确认 Discord 子区地址时，于同一数据库事务内写入 `dalton_channel_bot_topics`（`ON CONFLICT (platform, chat_address, external_topic_id) DO UPDATE` 仅更新 `last_active_at` 并补全可空的 `first_reply_message_id` / `root_message_id`，首次写入的 `canonical_scope_key` 与 `initiator_*` 保持固定），网关收到成功响应后同步清除该话题负缓存。
 - **新增 `POST /api/v1/dalton/channels/internal/topics/lookup`（新增端点，路由登记 `CapabilityId.CHANNEL_GATEWAY` 并调用 `require_channel_platform_capability(platform)`）**：
-  - 请求：`{ platform: "feishu" | "discord", chat_address: string, external_topic_id?: string | null, root_message_id?: string | null, match_mode: "inbound_followup" | "outbound_delivery" }`（入站免 `@` 跟帖固定使用 `inbound_followup` 并按非空 `external_topic_id` 匹配；出站分片补发使用 `outbound_delivery`，支持按 `external_topic_id` 或 `root_message_id` 查询已建话题回执）；
-  - 响应：`{ found: boolean, canonical_scope_key: string | null, external_topic_id: string | null, first_reply_message_id: string | null, initiator_platform_user_id: string | null, initiator_dalton_user_id: string | null }`。
+  - 请求：`{ platform: "feishu" | "discord", chat_address: string, match_mode: "inbound_followup" | "outbound_delivery", external_topic_id?: string | null, canonical_scope_key?: string | null, root_message_id?: string | null }`：
+    - `inbound_followup`：供入站免 `@` 跟帖按非空 `(platform, chat_address, external_topic_id)` 精确查询已登记话题的 `canonical_scope_key` 与发起人身份；
+    - `outbound_delivery`：供后轮出站与分片发送优先按 `(platform, chat_address, canonical_scope_key)`（同时兼容按 `external_topic_id` 或 `root_message_id`）精确查询平台话题号 `external_topic_id` 与 `first_reply_message_id`；
+  - 响应：`{ found: boolean, canonical_scope_key: string | null, external_topic_id: string | null, root_message_id: string | null, first_reply_message_id: string | null, initiator_platform_user_id: string | null, initiator_dalton_user_id: string | null }`。
 - **群会话代数失效覆盖 `:topic:` 作用域**：
-  - 同步更新 `src/dalton/database/channel_gateway.py:4086-4122` 的 `_advance_group_chat_generations_in_tx` 及群解绑清理逻辑，将匹配条件扩展为 `scope_key = 'chat:' || %s OR scope_key LIKE 'chat:' || %s || ':thread:%%' OR scope_key LIKE 'chat:' || %s || ':topic:%%'`，使群绑定移除或重置时同步推进全部 `:thread:` 与 `:topic:` 话题会话代数并清理挂起中断。
+  - 同步更新 `src/dalton/database/channel_gateway.py:4086-4122` 的 `_advance_group_chat_generations_in_tx`（以及 `execute_session_command` 在已登记话题内按归一后 `canonical_scope_key` 执行 `/new`、`/stop`、`/workspace`、`/main`）与群解绑清理逻辑，将匹配条件扩展为 `scope_key = 'chat:' || %s OR scope_key LIKE 'chat:' || %s || ':thread:%%' OR scope_key LIKE 'chat:' || %s || ':topic:%%'`，使群绑定移除或重置时同步推进全部 `:thread:` 与 `:topic:` 话题会话代数并清理挂起中断。
 
 ---
 
@@ -219,42 +228,52 @@
 
 ### 2.4 功能 ②b：私聊回答生成文件自动附带与 `lanes/41` 链接收尾事项
 
-#### （1）仅限发起人私聊的本轮写入产物自动附带与修改时间核对
+#### （1）发起人私聊产物版本与收件人核验、独立结算去重及群聊文件统一转深链
 
-1. **自动附带范围限定于发起人与机器人的私聊（`chat_type == 'dm'`）**：
-   - **发起人本人私聊（飞书私聊、Discord 私聊、个人微信私聊）**：接收人即为已验证绑定的会话发起人 `dalton_user_id` 本人。当本回合运行于发起人**本人自有工作区**（`workspace.user_id == dalton_user_id` 且 `is_run_outbound_blocked == False`）时，自动附带本轮工具写入记录中通过发送前修改时间核对的合规可交付文件。
-   - **群聊与频道会话（`chat_type == 'group'`）**：回复中涉及的工作区文件统一改写或附加为需登录鉴权的网页深链，由群成员点击后经服务端登录与工作区权限校验查看。
-2. **以本轮工具写入记录为准持久化 `turn_deliverables`（新增）**：
-   - 自动附带候选严格限定为本轮运行通过文件写入工具写入本人自有工作区的文件（排除工作区历史旧文件与同一工作区其他回合写入的文件）。
+1. **私聊附件与群聊深链边界（含 `/agent/send` 显式发送统一拦截）**：
+   - **发起人本人私聊（飞书私聊、Discord 私聊、个人微信私聊）**：接收人须经 PostgreSQL 核验为原私聊会话发起人当前有效绑定的本人账号；当本回合运行于发起人**本人自有工作区**（`workspace.user_id == dalton_user_id` 且非共享持有者，`is_run_outbound_blocked == False`）时，通过写入版本/哈希比对与文件校验的可交付文件随私聊发出。
+   - **群聊与频道会话统一输出网页登录深链（覆盖显式 `send_message(files=[...])`）**：在 `src/delivery-service.ts` 的 `executeDelivery`（衔接 `src/agent-routes.ts:81` `POST /agent/send`）通过 `I-6` 取得实际授权投递目标 `targetAddress` 后统一判定——凡实际投递目标为群聊或频道/子区（非 `_is_dm_address` 私聊目标），`options.files` 中的全部文件直接在网关内转换为需登录鉴权的网页深链行并入待发文本（零文件下载、零平台上传），并在 `files_status` 中记录为 `{ path, status: "linked", reason: "group_target_deep_link" }`，由群成员点击后经服务端登录与工作区权限校验查看。
+2. **`turn_deliverables` 在工具写入成功时记录 `FileStamp` 与内容 SHA-256（新增）**：
+   - 自动附带候选严格限定为本轮运行通过文件写入工具写入本人自有工作区的确认文件（排除工作区历史旧文件与同一工作区其他回合或外部进程写入的文件）。
    - 在渠道私聊回合（`has_capability(CapabilityId.CHANNEL_GATEWAY)` 为真且工作区属主为发起人本人）执行以下记录流程（标注 `DALTON-HOOK(channel-deliverables)`）：
-     - 在 `src/server/handlers/chat/ptc_run.py:1056` 构建图实例时，为本回合主工作区 `SandboxBackend` 注入按 `(thread_id, run_id, workspace_id)` 隔离的写入记录回调 `operation_callback`（衔接 `src/ptc_agent/agent/tools/file_ops.py:447, 524` 的 `Write`、`Edit` 成功回调）；
-     - 每次本轮工具成功写入本工作区文件时，同步校验该路径通过 §4.3 双路径白名单（原始相对路径与沙箱解析符号链接后的 `realpath` 均落在当前工作区根目录之内，命中可交付文档/表格/演示文稿/图片扩展名且避开排除目录与排除后缀），将规范化相对路径记入本轮内存清单；
-     - 回合结算在 `finalize_run`（`src/server/database/runs/lifecycle.py:776`）提交运行终态及结束时间戳（`metadata->>'dalton_finalized_at'` / `usage_settled_at`）并写入 `event: run_end`（`src/server/services/runs/stream_writer.py` 与 `src/server/services/runs/sse_producer.py`）前，当 `is_run_outbound_blocked == False` 时，将该清单去重固化至 `conversation_responses.metadata` 的 `turn_deliverables: Array<{ workspace_id: string; path: string }>`。
+     - 在 `src/server/handlers/chat/ptc_run.py:1056` 构建图实例时，为本回合主工作区 `SandboxBackend` 注入按 `(thread_id, run_id, workspace_id)` 隔离的写入记录回调 `operation_callback`（衔接 `src/ptc_agent/agent/tools/file_ops.py:447, 524` 的 `Write`、`Edit` 成功回调及 `src/ptc_agent/agent/backends/sandbox.py:331`）；
+     - 每次本轮工具成功写入本工作区文件且通过 §4.3 双路径白名单（原始相对路径与沙箱解析符号链接后的 `realpath` 均落在当前工作区根目录之内，命中可交付扩展名且避开排除目录与排除后缀）时，立即读取当次写入后的沙箱 `FileStamp`（`src/ptc_agent/core/sandbox/file_version.py:55`：`size`、`mtime`、`ctime`、`inode` 及按沙箱自身时钟判定的 `settled`）并计算原始写入内容 SHA-256 哈希（回调直接持有写入内容字节时直接对写入字节计算 SHA-256，否则取当次版本化读取返回的原始字节计算 SHA-256）；同一回合内对同一路径多次调用工具写入时，按规范化相对路径更新为本回合最后一次成功写入的版本记录；
+     - 回合结算在 `finalize_run`（`src/server/database/runs/lifecycle.py:776`）提交运行终态并写入 `event: run_end`（`src/server/services/runs/stream_writer.py` 与 `src/server/services/runs/sse_producer.py`）前，当 `is_run_outbound_blocked == False` 时，将该清单固化至 `conversation_responses.metadata` 的 `turn_deliverables: Array<{ workspace_id: string; path: string; size: number; sha256: string; stamp: { size: number; mtime: string; ctime: string; inode: string } | null; stamp_settled: boolean }>`。
      - 实时流终点事件 `event: run_end` 与断线回放接口 `GET /api/v1/threads/{thread_id}/messages/replay`（`src/server/app/threads/messaging.py:1376`）**读取同一份持久化 `turn_deliverables` 清单**。
-3. **私聊附件发送前修改时间核对、读取接口与配额规则**：
-   - 在私聊回合结算时，网关从本轮持久化 `turn_deliverables` 中按「最终回复正文（围栏代码块与行内代码之外）显式点名的文件优先 -> 其余本轮工具新写文件次之」排序选取候选文件（剔除本轮已由 `send_message(files=[...])` 显式发出的文件）：
-     - **服务端读取与本轮结束时间核对**：在 `src/dalton/app/channels_router.py` 新增内部私聊产物读取端点 `GET /api/v1/dalton/channels/internal/deliverables/download`（**新增**，路由登记 `CapabilityId.CHANNEL_GATEWAY` 并按请求参数 `platform` 调用 `require_channel_platform_capability(platform)`，接收 `thread_id`、`run_id`、`workspace_id`、`path`、`platform`）：
-       1) 查询 `conversation_responses` 中 `(conversation_thread_id = thread_id, conversation_response_id = run_id)` 运行记录与目标 `workspaces` 行，确认工作区属主为发起人本人（`workspace.user_id == user_id` 且非共享持有者）、`is_run_row_outbound_blocked == False`、规范化 `(workspace_id, path)` **仍位于本轮运行记录持久化的 `turn_deliverables` 清单内**，并读取本轮运行记录的结束时间 `run_ended_at`（以 `conversation_responses` 持久化的结束时间为准：`COALESCE((metadata->>'dalton_finalized_at')::timestamptz, usage_settled_at, created_at + execution_time * INTERVAL '1 second')`）；
-       2) 复用工作区文件读取链路（在线沙箱调用 `read_contained_sandbox_file_versioned` 同步获取文件内容与 `FileStamp.mtime` 修改时间，沙箱离线回退数据库备份时读取 `workspace_files` 的 `mtime_epoch` 修改时间，并对 UTF-8 文本执行一致的凭据脱敏）完成 §4.3 双路径白名单检查，**核对文件当前修改时间早于或等于本轮运行记录结束时间（`file_mtime <= run_ended_at`）**；
-       3) 由于接收人即为工作区属主与发起人本人，文件版本差异仅关系到内容新旧而不涉及跨人越权：当文件满足上述条件且通过文件头魔数与体积配额检查（单文件 `≤ 20 MB`；飞书内联图片 `≤ 10 MB`，`10–20 MB` 图片走 `im.file.create` 文件消息；飞书/Discord 私聊单轮自动附带最多 `5` 个、个人微信单轮最多 `3` 个；整轮总附件 `≤ 50 MB`）时返回字节流随私聊回复发出；当同一工作区后续回合已覆盖同名文件使 `file_mtime > run_ended_at`、路径不在本轮 `turn_deliverables` 记录内、文件已移除或缺少有效时间戳时，接口返回 `409 deliverable_superseded`（或 `404`），网关自动改为在私聊回复中附上网页登录深链。
-     - `.html` / `.htm` 网页报告、跨工作区引用（`__wsref__/<workspaceId>/<path>`）、同事共享工作区文件以及超出体积/数量配额或已被后续回合改写的文件，统一在回复中展示需登录鉴权的网页预览深链：`📎 <文件名> — 请前往网页查看：<登录深链>`。
+3. **私聊附件独立结算、`files_status` 去重、收件人核验与版本比对下载接口**：
+   - **私聊附件结算独立于正文是否已发送，并按已确认 `files_status` 去重**：
+     - 在网关 `src/orchestrator.ts`（覆盖实时流 `:5285`、断线回放 `:6866` 与后台运行结算 `:8350`）中，私聊 `turn_deliverables` 自动附带作为独立结算步骤执行，与 `settleTurnFallbackAndPartialNotice`（`:10004`）中 `sentToCurrentCount === 0` 的正文补发分支解耦：无论本轮正文已由 `/agent/send` 发出（`sent_to_current_count > 0`）还是由 `fallback:${runId}` 发出，只要当前私聊回合存在待处理的 `turn_deliverables`，均以确定性投递键 `deliverables:${runId}` 走 `I-6` 认领与 `I-7` 进度结算；
+     - 选取候选文件前，查询 PostgreSQL `dalton_channel_deliveries` 中该 `run_id` 下已确认发往当前会话（`is_current = TRUE`）的 `files_status`，将状态已为 `"sent"` 或 `"linked"`（以及存在 `"unknown"` 未决状态）的同路径文件去重剔除，剩余候选按「最终回复正文（围栏代码块与行内代码之外）显式点名的文件优先 -> 其余本轮工具新写文件次之」排序发送。
+   - **内部下载接口 `GET /api/v1/dalton/channels/internal/deliverables/download` 的收件人核验与版本比对**：
+     - 在 `src/dalton/app/channels_router.py` 新增该内部端点（路由登记 `CapabilityId.CHANNEL_GATEWAY`，携带 `X-Service-Token` 与 `X-Gateway-Epoch` 请求头，接收查询参数 `delivery_key`、`delivery_attempt`、`workspace_id`、`path`）：
+       1) **按已授权 `delivery_key` 定位原入站记录并核验实际收件人与当前有效绑定**：
+          - 从 PostgreSQL `dalton_channel_deliveries` 读取 `delivery_key` 对应投递行，先按行内 `platform` 调用 `require_channel_platform_capability(platform)` 并校验网关租约 `epoch`，核对 `status == 'in_flight'`、`delivery_attempt` 匹配当前尝试、`kind IN ('agent_send', 'fallback')`、`is_current == TRUE` 且 `_is_dm_address(platform, target_address)`（`src/dalton/database/channel_gateway.py:6670`）为真；
+          - 以投递行的 `(user_id, thread_id, run_id)` 关联查询原入站记录 `dalton_channel_inbound_events`（后台回报回合关联 `dalton_channel_background_runs`）、`conversation_responses` 与 `workspaces`，确认原触发会话 `chat_type == 'dm'`、会话代数 `session_generation` 有效、运行归属同一 `user_id`、工作区为发起人本人自有工作区（`workspace.user_id == user_id` 且非共享持有者）且 `is_run_row_outbound_blocked == False`；
+          - **核对当前有效平台绑定与实际收件人一致**：飞书与 Discord 查询 `dalton_channel_identities` 确认 `(user_id, platform)` 当前仍有效绑定且 `platform_user_id` 与原入站私聊发送者（实际收件人）完全一致、成员在册状态有效；个人微信复用 `src/dalton/database/weixin_multi_account.py:3973`（`preflight_weixin_send`）完整核验——核对投递行锁定的 `weixin_account_id`、`weixin_bot_generation`、`weixin_recipient_id` 与当前活跃 `dalton_channel_weixin_accounts` 行的 `account_id`、`bot_generation`、`ilink_user_id`、`user_id` 及有效 `context_token` 完全一致，并在网关将文件上传至微信 CDN 后继续执行 `src/channels/weixin/send.ts:381` 的 `refreshAfterUpload` 二次预检复核（确认上传期间 `accountId`、`botId` 与 `botGeneration` 保持不变后才发出媒体消息）。收件人、私聊类型或绑定核验未通过时返回 `403 deliverable_recipient_denied`（或对应账号变动拒绝码），终止文件发送。
+       2) **比对当前文件 `FileStamp` / 内容哈希（与数据库时间戳解耦）**：
+          - 确认规范化 `(workspace_id, path)` 位于本轮 `conversation_responses.metadata->'turn_deliverables'` 清单内且具备记录的 `sha256` 与 `size`；
+          - **在线沙箱读取**：调用 `src/server/services/workspace_file_containment.py:585` 的 `read_contained_sandbox_file_versioned` 完成双路径包含校验并取得当前原始字节、`FileStamp` 及沙箱自身时钟判定的 `settled`；核对读取期间文件未被并发改写（`read.stamp` 非空）、原始字节长度与 `sha256` 严格等于 `turn_deliverables` 记录值，且当记录含 `stamp` 时当前 `read.stamp`（`size`、`mtime`、`ctime`、`inode`）一致；
+          - **离线备份回退**：当沙箱已停止回退数据库备份时，查询 `src/server/database/workspace_file.py:354`（`workspace_files` 表）的 `sandbox_modified_at`、`file_size` 与 `content_hash` / `blob_sha256` 及备份原始字节（`http_file_bytes`），核对 `file_size`、`content_hash` / `blob_sha256`（及原始字节 SHA-256）与 `turn_deliverables.sha256` 一致，且 `sandbox_modified_at` 微秒时间戳与记录的 `stamp.mtime` 对齐；
+          - **版本一致后脱敏返回，缺失或差异统一转登录深链**：原始字节通过上述版本与哈希核对后，对 UTF-8 文本执行一致的凭据脱敏（`redact_bytes`），并通过文件头魔数与体积配额检查（单文件 `≤ 20 MB`；飞书内联图片 `≤ 10 MB`，`10–20 MB` 图片走 `im.file.create` 文件消息；飞书/Discord 私聊单轮自动附带最多 `5` 个、个人微信单轮最多 `3` 个；整轮总附件 `≤ 50 MB`）后返回字节流；凡版本记录缺失、文件不存在、读取中途被改写、或当前 `FileStamp` / 内容哈希（含离线 `sandbox_modified_at` / `content_hash` / `blob_sha256`）与记录存在差异时，接口返回 `409 deliverable_version_mismatch`（或 `404`），网关将该文件改为在私聊回复中附上网页登录深链。
+     - `.html` / `.htm` 网页报告、跨工作区引用（`__wsref__/<workspaceId>/<path>`）、同事共享工作区文件以及超出体积/数量配额或版本不一致的文件，统一在回复中展示需登录鉴权的网页预览深链：`📎 <文件名> — 请前往网页查看：<登录深链>`。
 4. **渠道提示词同步说明**：
-   - 更新网关 `src/types.ts` 的 `buildSurfaceRules`：清晰说明在个人私聊中，通过 `Write` / `Edit` 在本工作区写入并在回复正文中用工作区相对路径引用的合规文档、表格或图片会自动附带文件并附网页登录深链（由代码脚本生成的合规文件如需在私聊作为附件发出，可调用 `send_message(files=[...])` 指定相对路径）；在群聊与频道中，使用工作区相对路径引用文件会自动改写为网页登录深链供成员登录后查看。合入前执行提示词语言审查。
+   - 更新网关 `src/types.ts` 的 `buildSurfaceRules`：说明在个人私聊中，通过 `Write` / `Edit` 在本工作区写入并在回复正文中用工作区相对路径引用的合规文档、表格或图片会自动附带文件并附网页登录深链（由代码脚本生成的合规文件如需在私聊作为附件发出，可调用 `send_message(files=[...])` 指定相对路径）；在群聊与频道中，引用工作区相对路径或通过 `send_message` 指定文件均统一输出网页登录深链供成员登录后查看。合入前执行提示词语言审查。
 
 #### （2）纳入 `lanes/41` 推迟的三项链接收尾改造
 
-1. **Markdown（轻量级纯文本标记语法）引用式链接展开与跨工作区目标保留**：
-   - 在 `src/sandbox-links.ts`（前置分支 `lanes/41` 新增，跳过围栏代码块与行内代码）新增引用式链接解析器：提取正文中的链接定义行 `[ref]: destination "optional title"`（标签长度上限 `512` 字符）。
-   - **完整复用 `lanes/41` 的路径分类、编码与降级规则**：当 `destination` 为跨工作区引用 `__wsref__/<targetWorkspaceId>/<path>` 时，保留目标工作区标识并改写为 `${WEB_BASE_URL}/chat/${targetWorkspaceId}?file=${encodedPath}`；当命中本回合工作区路径时改写为 `${WEB_BASE_URL}/chat/t/${threadId}?file=${encodedPath}`（无 `threadId` 但有 `workspaceId` 时生成 `/chat/${workspaceId}?file=${encodedPath}`）；将正文中引用的 `[文字][ref]`、`[ref][]` 原地展开为标准内联链接 `[文字](深链)`，兼容飞书富文本与微信文本过滤器。
+1. **扩展已合入 `src/shared/sandbox-links.ts` 的 `rewriteSandboxLinks`（分片前展开引用式链接并增加 `workspaceId`）**：
+   - 直接在已合入的 `integrations/dalton-channel-gateway/src/shared/sandbox-links.ts` 现有 `rewriteSandboxLinks`（基于 mdast 语法树，保留围栏代码块与行内代码跳过、以及有根路径 `deepLinkPath` 编码逻辑）上原地扩展，复用同一套解析与路径分类管线：
+     - **增加可选 `workspaceId` 参数**：扩展签名为 `rewriteSandboxLinks(text, webBaseUrl, threadId?, workspaceId?)`；当命中本工作区路径时，有 `threadId` 生成 `${WEB_BASE_URL}/chat/t/${threadId}?file=${encodedPath}`，缺少 `threadId` 但有 `workspaceId` 时生成 `${WEB_BASE_URL}/chat/${workspaceId}?file=${encodedPath}`；当目标为跨工作区引用 `__wsref__/<targetWorkspaceId>/<path>` 时，保留目标工作区标识生成 `${WEB_BASE_URL}/chat/${targetWorkspaceId}?file=${encodedPath}`；
+     - **分片前将引用式链接展开为内联深链**：对语法树识别出的工作区 `linkReference` 与 `imageReference`（完整覆盖简写 `[ref]`、折叠 `[ref][]` 与完整 `[文字][ref]` 三种 Markdown 引用式写法），在消息文本分片（`splitTextChunks`）之前直接原地展开为标准内联深链 `[显示文字](深链)`（公网地址未配置/回环或缺少会话与工作区标识时展开为纯文本显示名），并将对应的工作区 `[ref]: destination` 定义行同步改写为深链或直接删除，确保长消息分片后每片内联链接均完整可点且兼容飞书富文本与微信文本过滤。
 2. **自动化报告与数据任务通知全链路透传会话/工作区编号及服务端卡片前置改写**：
-   - **已保存报告卡片入库校验前改写**：`src/dalton/database/automation_reports.py:1121-1167` 的 `_validate_card` / `_scan_string` 在报告提交保存阶段即校验卡片字段并拦截相对路径与本地引用。因此在报告提交准备阶段（`lock_report_execution` `:1407` 已锁定取出 `automation_executions.conversation_thread_id` 与 `automations.workspace_id`），先调用后端 `rewrite_workspace_links_for_external` 将卡片正文与受支持链接字段中的合规工作区路径（含 `__wsref__` 与引用式链接）改写为 `https://...` 登录深链（公网地址为回环或未配置时转为纯文件名文本），再执行现有的 `_validate_card` 安全扫描（继续拦截原始 `file://`、`IMG:` 或宿主机敏感路径）。
+   - **已保存报告卡片入库校验前改写**：在 `src/dalton/database/automation_reports.py` 的 `submit_automation_report`（`:795`）完成 `lock_report_execution`（`:1407`，已取出 `automation_executions.conversation_thread_id` 与 `automations.workspace_id`）之后、调用 `prepare_automation_report_content`（`:570`）及 `_validate_card` / `_scan_string`（`:1121-1167`）之前，先调用后端 `rewrite_workspace_links_for_external` 将卡片正文与受支持链接字段中的合规工作区路径（含 `__wsref__` 与 `[ref]` / `[ref][]` / `[文字][ref]` 引用式链接）改写为 `https://...` 登录深链；当公网地址为本机回环或未配置时，卡片 Markdown 正文中的工作区链接转为纯文件名文本，卡片结构化链接控件（含 `_URL_KEYS` 字段）若指向工作区相对路径则移除跳转动作或转为普通文本元素，随后执行 `_validate_card` 安全扫描（继续拦截原始 `file://`、`IMG:` 或宿主机敏感路径）。
    - **报告与通知授权响应全量透传已有 `thread_id` 与 `workspace_id`**：
      - 在 `src/dalton/database/automation_notifications.py` 的 `decide_automation_notification_plan`（`:406`）中关联查询 `automation_executions.conversation_thread_id` 与 `automations.workspace_id`，在返回计划顶层新增 `thread_id: string | null` 与 `workspace_id: string | null`；
-     - 在 `src/dalton/database/automation_reports.py` 的 `authorize_saved_report_target`（`:2872`）及 `src/dalton/database/data_task_notifications.py` 的 `_authorized_target_from_report`（`:396`）与统一授权出口 `authorize_data_task_notification_plan`（`:1247`，`plan_payload` `:1335`）中同步透传 `thread_id: string | null` 与 `workspace_id: string | null`（自动化报告分支填入执行关联的 `conversation_thread_id` 与 `workspace_id`；独立宿主机脚本任务 `dalton_data_runs` 运行在会话与工作区之外，两字段返回 `null`）。网关 `src/automation-notifications.ts` 与 `src/data-task-notifications.ts` 将收到的 `threadId` 与 `workspaceId` 传入 `sandbox-links.ts` 统一完成文本与卡片段落深链改写。
+     - 在 `src/dalton/database/automation_reports.py` 的 `authorize_saved_report_target`（`:2872`）及 `src/dalton/database/data_task_notifications.py` 的 `_authorized_target_from_report`（`:396`）与统一授权出口 `authorize_data_task_notification_plan`（`:1247`，`plan_payload` `:1335`）中同步透传 `thread_id: string | null` 与 `workspace_id: string | null`（自动化报告分支填入执行关联的 `conversation_thread_id` 与 `workspace_id`；独立宿主机脚本任务 `dalton_data_runs` 运行在会话与工作区之外，两字段返回 `null`）。网关 `src/automation-notifications.ts` 与 `src/data-task-notifications.ts` 将收到的 `threadId` 与 `workspaceId` 传入 `src/shared/sandbox-links.ts` 的 `rewriteSandboxLinks` 统一完成深链改写。
    - **脚本数据任务监控看板链接**：在 `src/dalton/database/data_task_notifications.py` 中，当 `CapabilityId.CHANNEL_GATEWAY` 与 `CapabilityId.DATA_JOBS` 同时启用、任务已在 `src/dalton/monitors/data_job_registry.py` 绑定监控看板、公网地址已配置且通过 `src/dalton/monitors/permissions.py` 受众可见性校验时，在 `plan_payload` 中附带 `monitor_url`（新增字段）供卡片底部生成「查看监控面板」链接；宿主机本地路径统一展示为纯文件名文本。
-3. **自动化完成摘要保留并改写工作区文件链接**：
-   - 在 `src/dalton/notify/dispatch.py`（现行 `_strip_non_http_markdown_links` 位于 `:705`）新增 `rewrite_workspace_links_for_external(text, *, public_base, thread_id=None, workspace_id=None)`（**新增函数**）：在构造自动化完成通知摘要卡片与纯文本时，复用同一路径分类器将合规工作区文件链接（含引用式链接与 `__wsref__`）改写为对应登录深链；当 `public_base` 未配置或命中排除目录时转为纯文本标签。
-   - 同步调整 `dispatch.py` 的 `_truncate_section_body`（`:845`）与 `_truncate_line_at_punct`（`:792`）：按链接的可见显示文字长度计入摘要字数预算，并通过 `truncate_preserving_markdown_links`（`:672`）保持截断位置落在完整链接边界之外。
+3. **Python 端按同一套分类实现外发链接改写，并在 `dispatch.py` 剥离链接前替换**：
+   - 在 `src/dalton/notify/dispatch.py` 按与网关 `src/shared/sandbox-links.ts` **同一套路径分类、排除目录、`__wsref__` 解析、引用式链接（`[ref]`、`[ref][]`、`[文字][ref]`）展开及 `deepLinkPath` 编码规则**独立实现 `rewrite_workspace_links_for_external(text, *, public_base, thread_id=None, workspace_id=None)`（**新增函数**）：当 `public_base` 可达时将合规工作区链接改写为对应登录深链，当 `public_base` 未配置/回环或命中排除目录时转为纯文本标签。
+   - **在剥离非 HTTP 链接前先行替换**：在 `dispatch.py` 的 `extract_summary_lines`（`:957`）与 `extract_card_sections`（`:1089`）（及调用二者的 `format_notify_message` 等通知构造入口透传 `thread_id`、`workspace_id`）中，**先调用 `rewrite_workspace_links_for_external` 将工作区链接替换为 `https://...` 深链，再执行现有的 `_strip_non_http_markdown_links`（`:705`）剥离其余本地引用**；同步调整 `_truncate_section_body`（`:845`）与 `_truncate_line_at_punct`（`:792`）按链接可见文字计入摘要字数预算，并通过 `truncate_preserving_markdown_links`（`:672`）保持截断位置落在完整链接边界之外。
 
 ---
 
@@ -448,9 +467,9 @@
      1) **路径、`thread_id` 与本运行持久化清单匹配**：`snapshot_key` 严格匹配路径正则，路径中的快照 `thread_id` 与本次运行所属 `conversation_thread_id` 一致，快照位于对应 `(thread_id, run_id)` 持久化的 `chart_snapshots` 清单内，且对象字节 `sha256` 与清单一致；
      2) **同事工作区受限轮次守卫**：检查该运行在 PostgreSQL 中的权威状态 `is_run_row_outbound_blocked`（`src/dalton/colleague_outbound_guard.py:418`）为 `False`；受限分析师轮次只输出网页登录深链；
      3) **发起人当前绑定本人私聊核验**：核对请求传入的 `target_address` 为私聊地址，且属于该 `thread_id` 发起人当前有效绑定的本人私聊目标（飞书本人 `open_id`、Discord 本人 `user_id`、个人微信当前活跃绑定账号本人单聊），并按该平台通过 `require_channel_platform_capability` 校验；核对未通过时改由网关发送网页交互登录深链。
-2. **私聊本轮文件自动附带（②b）与群聊深链边界**：
-   - **自动附带文件严格限发起人与机器人的私聊（`chat_type == 'dm'`）**：当接收人为发起人 `dalton_user_id` 本人、回合工作区属主为发起人本人（`workspace.user_id == dalton_user_id`）、`is_run_outbound_blocked == False`、文件路径仍位于本轮运行记录持久化的 `turn_deliverables` 清单内、**发送前读取到的文件修改时间早于或等于本轮运行记录结束时间（`file_mtime <= run_ended_at`）**，且通过 §4.3 双路径白名单、魔数与配额校验时，作为私聊原生附件发出；超出任一条件时自动改发网页登录深链。
-   - **群聊与频道会话统一输出网页登录深链**：群聊与频道回复中的全部工作区文档、表格、报告及跨工作区引用（`__wsref__/<workspaceId>/<path>`）统一输出需登录鉴权的网页深链。
+2. **私聊本轮文件附带（②b）的收件人、版本核验与群聊统一深链边界**：
+   - **附件外发严格限经 PostgreSQL 核验的发起人本人私聊（`chat_type == 'dm'`）**：`/internal/deliverables/download` 以已授权的 `delivery_key` 及 `delivery_attempt` 定位原入站记录，在数据库内核对运行归属、私聊类型、实际收件人与当前有效绑定（飞书/Discord 核对 `dalton_channel_identities` 当前绑定同一用户与同一收件 `platform_user_id`；个人微信复用 `weixin_account_id`、`bot_generation` 及上传 CDN 后 `refreshAfterUpload` 复核），同时确认工作区为本人自有工作区、`is_run_row_outbound_blocked == False`、路径位于本轮 `turn_deliverables` 内，且**当前通过 `read_contained_sandbox_file_versioned` 读取到的 `FileStamp` 与原始字节 SHA-256（离线备份核对 `workspace_files.sandbox_modified_at` 与 `content_hash` / `blob_sha256`）与写入时记录一致**；满足全部条件并通过 §4.3 双路径白名单、凭据脱敏、魔数与配额校验后作为私聊原生附件发出，版本缺失或差异时统一改发网页登录深链。
+   - **群聊与频道会话（含 `/agent/send` 显式传入的 `files`）统一输出网页登录深链**：群聊与频道回复中的全部工作区文档、表格、报告、跨工作区引用（`__wsref__/<workspaceId>/<path>`）以及模型显式调用 `send_message(files=[...])` 发往群目标的文件，在网关取得实际授权目标后统一输出需登录鉴权的网页深链。
 3. **群聊交互卡片可见字段白名单（覆盖 L0–L3）**：
    - **群内 L1、L2、L3 确认卡（统一最小可见字段）**：群聊与频道内发出的确认卡片只包含**固定本地化动作名称**与**确认跳转入口**（飞书群内为 `[前往网页端核对并确认]` 外链及已发私聊提示；Discord 群内为 `[查看详情并确认]` 门禁按钮与 `[前往网页端核对并确认]` 外链）；工作区名称、派发问题、任务名称、个人私信目标地址、群推送地址及工具参数全部仅在飞书发起人私聊卡、Discord `flags: 64` 私密详情卡或登录后的网页端展示。
    - **群内 L0 澄清提问卡**：当 `is_run_outbound_blocked == False` 时，展示提问文本、选项标签、交互控件与 `[前往网页端查看]` 按钮；当 `is_run_outbound_blocked == True` 时，群内仅展示「需要补充确认问题」通用提示与 `[前往网页端查看]` 外链入口。
@@ -482,8 +501,8 @@
 3. **排除目录与排除后缀清单（原始路径或 `realpath` 任一命中即改发深链）**：
    - **排除目录与隐藏项**：`.agents/`、`_internal/`、`uploads/`、`.git/`、`node_modules/`、`__pycache__/`、`.venv/`、`.pytest_cache/`、以 `.` 开头的隐藏文件或隐藏目录（如 `.env`、`.env.*`、`.DS_Store`），以及含 `..` 或控制字符的路径。
    - **排除后缀**：`.html`、`.htm`、`.svg`、`.py`、`.sh`、`.bash`、`.zsh`、`.js`、`.mjs`、`.cjs`、`.ts`、`.tsx`、`.jsx`、`.sql`、`.ipynb`、`.r`、`.go`、`.rs`、`.json`、`.jsonl`、`.yaml`、`.yml`、`.toml`、`.ini`、`.cfg`、`.conf`、`.lock`、`.log`、`.pem`、`.key`、`.crt`、`.parquet`、`.feather`、`.arrow`、`.pkl`、`.pickle`、`.db`、`.sqlite`、`.sqlite3`、`.duckdb`、`.h5`、`.npz`、`.zip`、`.tar`、`.gz`、`.tgz`、`.7z`。
-4. **发送前修改时间、本轮记录归属、文件魔数与体积配额校验**：
-   - 发送前由 `/internal/deliverables/download` 核对文件仍在本轮运行记录 `turn_deliverables` 内，且文件修改时间早于或等于本轮运行记录结束时间（`file_mtime <= run_ended_at`）；同时在上传渠道前核验二进制文件头魔数（如 PDF `%PDF-`、PNG/JPEG/GIF/WebP/BMP 魔数）与体积配额：单文件 `≤ 20 MB`（飞书内联图片 `≤ 10 MB`，`10–20 MB` 图片走 `im.file.create`），整轮合计 `≤ 50 MB`，飞书/Discord 私聊单轮自动附带最多 `5` 个、个人微信私聊单轮最多 `3` 个；超出条件或配额的文件统一附上网页登录深链。
+4. **发送前收件人核验、写入版本/哈希比对、文件魔数与体积配额校验**：
+   - 发送前由 `/internal/deliverables/download` 按已授权 `delivery_key` 核验私聊收件人与当前有效绑定，并通过 `read_contained_sandbox_file_versioned`（离线回退读 `workspace_files.sandbox_modified_at` 与 `content_hash` / `blob_sha256`）核对当前文件 `FileStamp` 与原始字节 SHA-256 同本轮 `turn_deliverables` 记录一致；同时在上传渠道前核验二进制文件头魔数（如 PDF `%PDF-`、PNG/JPEG/GIF/WebP/BMP 魔数）与体积配额：单文件 `≤ 20 MB`（飞书内联图片 `≤ 10 MB`，`10–20 MB` 图片走 `im.file.create`），整轮合计 `≤ 50 MB`，飞书/Discord 私聊单轮自动附带最多 `5` 个、个人微信私聊单轮最多 `3` 个；版本缺失或不一致及超出配额的文件统一附上网页登录深链。
 
 ---
 
@@ -491,36 +510,31 @@
 
 所有数据库变更均写入 Dalton Alembic（数据库表结构版本迁移工具）迁移链 `src/dalton/migrations/versions/`。当前 `dalton/main` 头节点为 `d052`（`d052_embedding_metadata_and_dimension.py`），具体迁移版本号在各批开发合入时顺接当时的唯一 `head` 确定。全部迁移遵循纯增量建表与可空列扩展（`SET LOCAL lock_timeout = '5s'`），共新增 **4 张自有表**（第 1 批 1 张、第 2 批 0 张、第 3 批 2 张、第 4 批 1 张）：
 
-### 5.1 群聊机器人话题登记表与飞书回复去重字段（第 1 批新增）
+### 5.1 群聊机器人话题登记表 `dalton_channel_bot_topics`（第 1 批新增）
 
-1. **群聊机器人话题登记表 `dalton_channel_bot_topics`（新增）**：持久化飞书自动创建的话题（`omt_xxx`、根消息 `om_xxx` 与首条回复 `first_reply_message_id`）及 Discord 自动创建的子区（`chat_address` 固定存父频道地址 `discord:<guild>/<parent>`）：
+持久化飞书自动创建或首次在话题内触发的话题（`omt_xxx`、根消息 `om_xxx` 与首条回复 `first_reply_message_id`）及 Discord 公开子区（`chat_address` 固定存父频道地址 `discord:<guild>/<parent>`），锁定触发轮的 `canonical_scope_key` 与发起人归属，并支撑后轮出站按 `canonical_scope_key` 查询平台话题号 `external_topic_id`：
 
 ```sql
 CREATE TABLE IF NOT EXISTS dalton_channel_bot_topics (
     platform VARCHAR(32) NOT NULL,                    -- 'feishu' | 'discord'
     chat_address VARCHAR(255) NOT NULL,               -- 如 'feishu:oc_xxx' | 'discord:<guild>/<parent>'
-    external_topic_id VARCHAR(255) NOT NULL,          -- 飞书 omt_xxx 或 Discord thread_id（入站免 @ 仅按此列精确匹配）
-    root_message_id VARCHAR(255) NULL,                -- 触发开帖的原消息 ID，供出站同轮分片补发与回执核实定位
+    external_topic_id VARCHAR(255) NOT NULL,          -- 飞书 omt_xxx 或 Discord thread_id（入站免 @ 按此列匹配，后轮出站按此列投递）
+    root_message_id VARCHAR(255) NULL,                -- 顶层触发开帖的原消息 ID
     first_reply_message_id VARCHAR(255) NULL,         -- 首条成功落入话题的回复消息 ID
-    canonical_scope_key VARCHAR(255) NOT NULL,        -- 归一后的会话 scope_key
-    initiator_dalton_user_id VARCHAR(255) NOT NULL,   -- 话题发起人 Dalton user_id
-    initiator_platform_user_id VARCHAR(255) NOT NULL, -- 话题发起人平台 ID (open_id / user.id)
+    canonical_scope_key VARCHAR(255) NOT NULL,        -- 固定为触发轮的 chat:<id>:topic:<根消息> 或已有话题 chat:<id>:thread:<平台话题号>
+    initiator_dalton_user_id VARCHAR(255) NOT NULL,   -- 话题发起人 Dalton user_id（首次登记后保持固定）
+    initiator_platform_user_id VARCHAR(255) NOT NULL, -- 话题发起人平台 ID (open_id / user.id，首次登记后保持固定)
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_active_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (platform, chat_address, external_topic_id)
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_dalton_channel_bot_topics_scope
+    ON dalton_channel_bot_topics (platform, chat_address, canonical_scope_key);
+
 CREATE INDEX IF NOT EXISTS idx_dalton_channel_bot_topics_root
     ON dalton_channel_bot_topics (platform, chat_address, root_message_id)
     WHERE root_message_id IS NOT NULL;
-```
-
-2. **`dalton_channel_deliveries` 新增飞书去重窗口追踪可空列（对齐 `d036` 纯增量模式）**：
-
-```sql
-ALTER TABLE dalton_channel_deliveries
-    ADD COLUMN IF NOT EXISTS feishu_reply_uuid VARCHAR(64) NULL,
-    ADD COLUMN IF NOT EXISTS feishu_reply_dispatched_at TIMESTAMPTZ NULL;
 ```
 
 ### 5.2 渠道交互令牌表与中断恢复竞争表（第 3 批新增）
@@ -660,10 +674,11 @@ CREATE INDEX IF NOT EXISTS idx_dalton_channel_ctx_drafts_pending
 ### 5.4 存量表边界、迁移链顺接与滚动升级回退方案
 
 1. **存量表职责边界（逐项对照代码核实）**：
-   - `dalton_channel_deliveries.confirmed_thread_address` 与 `discord_body_phase`（`d036_discord_confirmed_thread.py`、`channel_gateway.py:7993`）：保持专用于 Discord 两阶段建帖确认，子区地址统一使用 `discord:<guild>/<parent>:thread:<thread>`；新增可空列 `feishu_reply_uuid` 与 `feishu_reply_dispatched_at` 记录飞书首轮建话题回复去重窗口，飞书已确认话题回执存入 `dalton_channel_bot_topics`。
-   - `dalton_channel_deliveries.files_status`（`d030_channel_gateway.py`）：继续记录私聊出站附件投递状态。
+   - `dalton_channel_deliveries` 的 `confirmed_thread_address`、`discord_body_phase`、`delivery_attempt`（`d036_discord_confirmed_thread.py`、`channel_gateway.py:7993`）与微信绑定列 `weixin_account_id`、`weixin_bot_id`、`weixin_bot_generation`、`weixin_recipient_id`（`d049_weixin_multi_account.py`）：保持现有结构与重启恢复将未结算 `in_flight` 行置为 `status = 'unknown'` 的规则不变；飞书与 Discord 已登记话题统一存入 `dalton_channel_bot_topics`；私聊附件下载按 `delivery_key` 与 `delivery_attempt` 从本表关联原入站记录核验实际收件人与当前有效绑定。
+   - `dalton_channel_deliveries.files_status`（`d030_channel_gateway.py`）：记录出站文件状态（含私聊已发送 `"sent"` 与群目标或超限转深链 `"linked"`），并供私聊自动附件独立结算时按已确认记录去重。
+   - `workspace_files`（`src/server/database/workspace_file.py:354`）：沙箱离线回退时，私聊产物下载按表内 `sandbox_modified_at`、`file_size` 与 `content_hash` / `blob_sha256` 核对写入版本。
    - `dalton_notify_deliveries`（`src/dalton/database/automation_reports.py:307`）、`automations`、`automation_executions`：在报告保存前改写合规工作区链接，并在通知与报告授权接口中透传 `automations.workspace_id` 与 `automation_executions.conversation_thread_id`。
-   - `dalton_channel_inbound_events`、`dalton_channel_session_generations`、`dalton_channel_gateway_lease`（`d049_weixin_multi_account.py`）：本阶段新增网关内部写接口同样纳入部署级租约 `epoch` 校验体系。
+   - `dalton_channel_inbound_events`、`dalton_channel_session_generations`、`dalton_channel_gateway_lease`（`d049_weixin_multi_account.py`）：本阶段新增网关内部写接口与私聊附件下载核验同样纳入部署级租约 `epoch` 校验体系。
 2. **标准启用顺序与分批有序排水回退流程**：
    - **每批上线顺序**：① 执行纯增量 Alembic 迁移 → ② 部署新版后端（新增请求与响应字段设为可选向后兼容，迁移后至网关重启前旧网关正常收发） → ③ 部署并重启新版渠道网关 → ④ 应用对应批次的平台后台配置或执行一次 `dalton-native-commands` 命令同步。
    - **分批有序停用与回退顺序**（数据库保留增量新表与可空列，先在后端停接新提交、处理完已接收记录至终态后再切回旧版本）：
@@ -681,14 +696,14 @@ CREATE INDEX IF NOT EXISTS idx_dalton_channel_ctx_drafts_pending
 
 ```mermaid
 flowchart LR
-    B1["第 1 批（已定稿，直接开发）：② + ②b<br/>群聊开话题与精确回执核实<br/>私聊修改时间核对附带 + lanes/41 收尾"] --> B2["第 2 批（开发前先过复核清单）：②a<br/>系统 chart_layer 私聊转 PNG<br/>异步预取行情 + Postgres 并发锁"]
+    B1["第 1 批（已定稿，直接开发）：② + ②b<br/>群聊强制建话题与 external_topic_id 路由<br/>私聊版本/收件人核验 + 链接收尾"] --> B2["第 2 批（开发前先过复核清单）：②a<br/>系统 chart_layer 私聊转 PNG<br/>异步预取行情 + Postgres 并发锁"]
     B2 --> B3["第 3 批（开发前先过复核清单）：③<br/>单中断单操作卡片与群内统一脱敏<br/>in_start 单行校验 + 恢复回收"]
     B3 --> B4["第 4 批（开发前先过复核清单）：④<br/>飞书快捷菜单 + Discord 下拉切换<br/>Discord 右键共用实时核验与重读"]
 ```
 
 | 批次 | 推进状态 | 覆盖范围 | 数据库迁移（顺接合入时 `head`） | 平台后台配置变更 | 预估工作量 | 前置依赖 |
 | --- | --- | --- | --- | --- | --- | --- |
-| **第 1 批** | **已定稿，直接进入开发** | **②** 群聊自动开话题、飞书 50 分钟去重窗与四要素只读回执核实（同事务记录分片状态与话题）、Discord `discord:<guild>/<parent>:thread:<thread>` 子区地址与父频道鉴权、发起人按 `thread_id` 免 `@` 及负缓存清理 + **②b** 发起人私聊本轮写入文件自动附带（发送前核对仍在写入记录且修改时间早于或等于本轮结束时间；群聊与 `.html` 统一发登录深链）+ `lanes/41` 三项链接收尾 | 新增 `dalton_channel_bot_topics` 表；`dalton_channel_deliveries` 新增 `feishu_reply_uuid`、`feishu_reply_dispatched_at` 可空列 | 飞书后台开启 `im:message.group_msg` 与 `im:message:readonly` 权限并发布应用版本 | **4–5 人日** | `fix/channel-sandbox-links`（`lanes/41`）与 `feat/external-member-perms-final` 合入 |
+| **第 1 批** | **已定稿，直接进入开发** | **②** 群聊顶层 `@` 网关强制建话题、锁定 `canonical_scope_key`、后轮按 `dalton_channel_bot_topics.external_topic_id` 出站投递、Discord 父频道鉴权、发起人免 `@` 跟帖与负缓存清理（重启未结算首条回复沿用 `unknown`）+ **②b** 私聊 `turn_deliverables` 记录 `FileStamp` 与内容哈希、按 `delivery_key` 核验收件人与有效绑定（微信含上传后复核）、私聊附件独立结算与 `files_status` 去重、群目标 `files` 统一转登录深链 + 扩展 `src/shared/sandbox-links.ts` 与后端摘要前置改写 | 新增 `dalton_channel_bot_topics` 表 | 飞书后台开启 `im:message.group_msg` 与 `im:message:readonly` 权限并发布应用版本；Discord 确认开启 `MESSAGE_CONTENT` 意图 | **4–5 人日** | `fix/channel-sandbox-links`（`lanes/41`）与 `feat/external-member-perms-final` 合入 |
 | **第 2 批** | **开发前先过复核清单（2 条）** | **②a** 系统 `chart_layer`（主循环异步预取行情 + 同步闭包供给 + Postgres 顾问锁控制全局并发）转高清 PNG，**仅在发起人本人私聊发送图片 + 网页交互深链**；群聊与 `ShowWidget` 统一发网页登录深链 | 无 | 无（复用现有私聊图片上传权限） | **2–3 人日** | 第 1 批 + 完成第 2 批复核清单 |
 | **第 3 批** | **开发前先过复核清单（6 条）** | **③** `AskUserQuestion` 原生按钮/表单 + 单中断单操作 L1/L2 原生按钮（群内 L1/L2 统一只显示动作名称与确认入口）+ `begin_run(in_start=...)` 恰好更新 1 行校验、行内 `request_key` 对齐 `begin_run`、超时未准入及已取消/失败 `web` 行回收 | 新增 `dalton_channel_action_tokens` 与 `dalton_channel_interrupt_resumes` 表 | 飞书后台开启长连接回调 `card.action.trigger` 并发布应用版本；Discord 复用现有连接 | **4–5 人日** | 第 2 批 + 完成第 3 批复核清单 |
 | **第 4 批** | **开发前先过复核清单（4 条）** | **④** 飞书单聊菜单 + Discord `/workspace` 下拉切换 + Discord 右键「转入 `<品牌名>` 研判」（首次与重启共用实时权限核验及原消息重读、公开目的地可见范围与发帖权核验、`--revoke-context-menu`） | 新增 `dalton_channel_context_menu_drafts` 表 | 飞书配置机器人菜单并订阅 `application.bot.menu_v6` 发布版本；Discord 执行 `dalton-native-commands` 同步 | **3–4 人日** | 第 3 批 + 完成第 4 批复核清单 |
@@ -700,37 +715,44 @@ flowchart LR
 #### 第 1 批（已定稿，直接进入开发）：群聊自动开话题免 `@`（②）+ 私聊本轮产物自动附带与链接收尾（②b）
 
 - **实施范围与关键契约（可直接按此编码）**：
-  1. **数据库迁移**：在 `src/dalton/migrations/versions/` 顺接当时 `dalton/main` 唯一 `head` 新增纯增量迁移（`SET LOCAL lock_timeout = '5s'`），创建 `dalton_channel_bot_topics` 表及 `idx_dalton_channel_bot_topics_root` 索引，并为 `dalton_channel_deliveries` 增加可空列 `feishu_reply_uuid VARCHAR(64)` 与 `feishu_reply_dispatched_at TIMESTAMPTZ`（§5.1）。
+  1. **数据库迁移**：在 `src/dalton/migrations/versions/` 顺接当时 `dalton/main` 唯一 `head` 新增纯增量迁移（`SET LOCAL lock_timeout = '5s'`），创建 `dalton_channel_bot_topics` 表、`idx_dalton_channel_bot_topics_scope` 唯一索引及 `idx_dalton_channel_bot_topics_root` 索引（§5.1）。
   2. **能力门控与内部端点**：
      - 在 `src/dalton/capabilities.py` 的 `DALTON_ROUTE_CAPABILITY_REGISTRY` 为新增路由 `/api/v1/dalton/channels/internal/topics/lookup` 与 `/api/v1/dalton/channels/internal/deliverables/download` 登记 `CapabilityId.CHANNEL_GATEWAY`；各端点处理函数在从请求参数或数据库记录取得 `platform` 后统一调用 `require_channel_platform_capability(platform)` 校验对应平台子能力；
-     - 在 `src/dalton/app/channels_router.py` 与 `src/dalton/database/channel_gateway.py` 扩展 `I-1`（`external_topic_id`、`root_message_id`、`resolved_scope_key`、`topic_initiator_platform_user_id`、`topic_newly_registered`）与 `I-7`（预写 `feishu_reply_uuid` / `feishu_reply_dispatched_at`；确认首片回执后同事务更新 `platform_message_ids`、`sent_chunks`、`status` 并写入 `dalton_channel_bot_topics`）；更新 `_advance_group_chat_generations_in_tx` 覆盖 `:topic:` 会话作用域；更新 Discord `I-6` 群投递核验对 `discord:<guild>/<parent>:thread:<thread>` 提取父频道调用 `_verify_group_target_deliverable`；
-     - 实现 `GET /api/v1/dalton/channels/internal/deliverables/download`：核验工作区属主为发起人本人、`is_run_row_outbound_blocked == False`、请求路径仍在 `conversation_responses.metadata->'turn_deliverables'` 清单内，读取本轮运行记录结束时间 `run_ended_at`（`COALESCE((metadata->>'dalton_finalized_at')::timestamptz, usage_settled_at, created_at + execution_time * INTERVAL '1 second')`），结合双路径白名单读取文件内容与修改时间（在线沙箱取 `FileStamp.mtime`，离线备份取 `mtime_epoch`），核对 `file_mtime <= run_ended_at`、UTF-8 凭据脱敏、魔数与 `≤ 20 MB` 体积配额后返回字节流；条件未满足时返回 `409 deliverable_superseded`（或 `404`），由网关改发网页登录深链。
+     - 在 `src/dalton/app/channels_router.py` 与 `src/dalton/database/channel_gateway.py` 扩展 `I-1`（支持 `external_topic_id`、`root_message_id`，对发起人保持表内 `canonical_scope_key`，对其他成员保持其本人会话且首次登记锁定 `initiator_*`，返回 `resolved_scope_key`、`external_topic_id`、`topic_initiator_platform_user_id`、`topic_newly_registered`）、`I-6`（当前群会话命中 `dalton_channel_bot_topics` 时返回 `external_topic_id` 与 `first_reply_message_id`；Discord 子区目标提取父频道调用 `_verify_group_target_deliverable`）与 `I-7`（维持现有投递状态机与启动 `unknown` 恢复规则不变，在 `in_flight` 确认首片或确认 Discord 子区时同事务写入 `dalton_channel_bot_topics`）；实现 `/internal/topics/lookup` 支持按 `external_topic_id`（入站）及按 `canonical_scope_key`（出站）查询平台话题号；更新 `_advance_group_chat_generations_in_tx` 覆盖 `:topic:` 会话作用域；
+     - 实现 `GET /api/v1/dalton/channels/internal/deliverables/download`：以已授权 `delivery_key` 与 `delivery_attempt` 在 PostgreSQL 定位投递记录与原入站记录（`dalton_channel_inbound_events` / `dalton_channel_background_runs`），核对运行、私聊类型、工作区属主本人、`is_run_row_outbound_blocked == False`、实际收件人与当前有效平台绑定（微信复用 `preflight_weixin_send` 的 `weixin_account_id`、`bot_generation` 与 `context_token` 校验）；通过 `read_contained_sandbox_file_versioned` 读取在线文件当前 `FileStamp` 与原始字节 SHA-256（沙箱离线回退核对 `workspace_files.sandbox_modified_at`、`file_size` 与 `content_hash` / `blob_sha256`）并与本轮 `turn_deliverables` 记录比对，一致后执行 UTF-8 凭据脱敏、魔数与 `≤ 20 MB` 配额校验返回字节流；版本缺失或不一致返回 `409 deliverable_version_mismatch`（或 `404`）由网关改发网页登录深链，收件人或绑定核验拒绝返回 `403`。
   3. **上游运行钩子（统一标注 `DALTON-HOOK(channel-deliverables)` 并登记 `scripts/dalton/check_hooks.sh`）**：
-     - `src/server/handlers/chat/ptc_run.py`：在 `has_capability(CapabilityId.CHANNEL_GATEWAY)` 为真且为本人自有工作区私聊回合时，为主工作区 `SandboxBackend` 注入按 `(thread_id, run_id, workspace_id)` 隔离的 `Write` / `Edit` 成功回调，经 §4.3 双路径白名单筛选记录相对路径；
-     - `src/server/database/runs/lifecycle.py`、`src/server/services/runs/sse_producer.py` 与 `src/server/services/runs/stream_writer.py`：在 `is_run_outbound_blocked == False` 时将去重后的 `turn_deliverables` 在 `finalize_run` 随结束时间一并固化进 `conversation_responses.metadata` 并随 `run_end` 输出；
+     - `src/server/handlers/chat/ptc_run.py`、`src/ptc_agent/agent/tools/file_ops.py`、`src/ptc_agent/agent/backends/sandbox.py`：在 `has_capability(CapabilityId.CHANNEL_GATEWAY)` 为真且为本人自有工作区私聊回合时，为主工作区 `SandboxBackend` 注入按 `(thread_id, run_id, workspace_id)` 隔离的 `Write` / `Edit` 成功回调，经 §4.3 双路径白名单筛选后记录当次写入的 `FileStamp`（`size`、`mtime`、`ctime`、`inode`、`settled`）与原始字节 `sha256`；
+     - `src/server/database/runs/lifecycle.py`、`src/server/services/runs/sse_producer.py` 与 `src/server/services/runs/stream_writer.py`：在 `is_run_outbound_blocked == False` 时将本轮最后写入版本的 `turn_deliverables` 在 `finalize_run` 固化进 `conversation_responses.metadata` 并随 `run_end` 输出；
      - `src/server/app/threads/messaging.py`：`/messages/replay` 在 `CHANNEL_GATEWAY` 开启时返回运行持久化的 `turn_deliverables`。
-  4. **渠道网关与 `lanes/41` 三项链接收尾**：
-     - 飞书端（`inbound-parse.ts`、`targets.ts`、`send.ts`、`monitor.ts`）：入站内存过滤仅放行显式 `@` 或携带非空 `message.thread_id` 且命中已登记话题发起人的消息，登记话题时即时清除负缓存；首轮建话题预落库 `reply_uuid` 与时间戳，未知回执按「应用发送者 + `parent_id` 回复目标 + 发送时间 + 待发首片内容」四要素只读精确核实并同事务更新分片进度与话题，含糊或超 50 分钟保持 `unknown` 状态，50 分钟内确认无回执才带原 `uuid` 重试；撤回错误码（`230011`/`231003`/`230110`）回退普通群消息；
-     - Discord 端（`inbound.ts`、`index.ts`、`send.ts`、`threading.ts`）：顶层 `@` 使用 `:topic:` 会话键并在父频道建公开子区，确认地址保持 `discord:<guild>/<parent>:thread:<thread>`，子区内发起人免 `@` 追问，权限/满额（`50013`/`160006`/`160007`）回退父频道引用回复，原消息删除（`10008`）发无引用简短提示；
-     - 私聊附件投递与提示词（`orchestrator.ts`、`delivery-service.ts`、`backend-client.ts`、`types.ts`）：私聊结算按正文显式引用优先顺序通过 `/internal/deliverables/download` 拉取合规附件发送（飞书/Discord 最多 5 个、微信最多 3 个，整轮 `≤ 50 MB`），收到 `409 deliverable_superseded`、超配额、`.html` 报告或群聊会话统一发送网页登录深链；同步更新 `buildSurfaceRules` 并完成提示词语言审查；
-     - `lanes/41` 链接收尾（`src/sandbox-links.ts`、`automation-notifications.ts`、`data-task-notifications.ts`、`src/dalton/notify/dispatch.py`、`automation_notifications.py`、`automation_reports.py`、`data_task_notifications.py`）：完成引用式链接原地展开（保留 `__wsref__` 目标工作区）、`automation_reports` 入库 `_validate_card` 前改写工作区链接、报告与通知授权接口全链路透传 `thread_id` / `workspace_id`（脚本数据任务透传 `null` 并按 `CHANNEL_GATEWAY` + `DATA_JOBS` 及看板权限输出 `monitor_url`）、以及 `dispatch.py` 摘要链接改写与完整链接边界截断。
+  4. **渠道网关与链接收尾**：
+     - 飞书端（`inbound-parse.ts`、`targets.ts`、`send.ts`、`monitor.ts`）：入站内存过滤放行显式 `@` 或携带非空 `message.thread_id` 且命中已登记话题发起人的消息，发起人消息直接复用表内 `canonical_scope_key`，登记话题时清除负缓存；顶层 `@` 首轮由网关强制以 `reply_in_thread: true` 建话题并同事务登记 `dalton_channel_bot_topics`，后轮出站统一按表内 `external_topic_id` 带 `reply_in_thread: true` 投递；重启时未结算首条回复沿用现有行为标 `unknown`；撤回错误码（`230011`/`231003`/`230110`）回退普通群消息；
+     - Discord 端（`inbound.ts`、`index.ts`、`send.ts`、`threading.ts`）：顶层 `@` 固定 `:topic:` 会话键并由网关首轮强制在父频道建公开子区，确认地址保持 `discord:<guild>/<parent>:thread:<thread>` 并登记 `dalton_channel_bot_topics`；`threadIdFromScopeKey` 仅解析 `:thread:` 键，`:topic:` 后轮出站按表内 `external_topic_id` 先 `ensureThreadUnarchived` 再发入子区；子区内发起人免 `@` 追问复用同一 `canonical_scope_key`；权限/满额（`50013`/`160006`/`160007`）回退父频道引用回复，原消息删除（`10008`）发无引用简短提示；
+     - 群目标文件转深链与私聊附件独立结算（`agent-routes.ts`、`delivery-service.ts`、`orchestrator.ts`、`backend-client.ts`、`channels/weixin/send.ts`、`types.ts`）：`DeliveryService` 在 `I-6` 取得实际目标后将群/频道目标的 `files` 统一转为网页登录深链（记 `files_status` 为 `"linked"`）；私聊自动附件以 `deliverables:${runId}` 独立于正文是否已发送执行结算，按已确认 `files_status` 去重，调用 `/internal/deliverables/download` 拉取（微信沿用 `refreshAfterUpload` 上传后复核），收到 `409 deliverable_version_mismatch`、超配额或 `.html` 报告统一发送网页登录深链；更新 `buildSurfaceRules` 并过提示词语言审查；
+     - 链接收尾（`src/shared/sandbox-links.ts`、`automation-notifications.ts`、`data-task-notifications.ts`、`src/dalton/notify/dispatch.py`、`automation_notifications.py`、`automation_reports.py`、`data_task_notifications.py`）：扩展现有 `rewriteSandboxLinks` 在分片前将 `[ref]`、`[ref][]`、`[文字][ref]` 展开为内联深链、定义行改为深链或删除、增加 `workspaceId` 参数支持 `/chat/${workspaceId}?file=` 并保留 `__wsref__`；Python 端按同一套分类实现 `rewrite_workspace_links_for_external`，在 `dispatch.py` 的 `extract_summary_lines` 与 `extract_card_sections` 剥离链接之前先行替换，并在 `automation_reports.py` 的 `lock_report_execution` 之后、`_validate_card` 之前改写报告内容与卡片链接；报告与通知授权接口全链路透传 `thread_id` / `workspace_id`（脚本任务按 `CHANNEL_GATEWAY` + `DATA_JOBS` 及看板权限输出 `monitor_url`）。
 - **主要改动文件清单**：
   - **后端 Dalton 文件**：`src/dalton/migrations/versions/d05X_channel_bot_topics.py`（**新增**）、`src/dalton/app/channels_router.py`、`src/dalton/capabilities.py`、`src/dalton/database/channel_gateway.py`、`src/dalton/notify/dispatch.py`、`src/dalton/database/automation_notifications.py`、`src/dalton/database/automation_reports.py`、`src/dalton/database/data_task_notifications.py`、`scripts/dalton/check_hooks.sh`、`scripts/dalton/dalton_paths.txt`（如需补登记）。
-  - **后端上游文件（均加 `DALTON-HOOK(channel-deliverables)`）**：`src/server/handlers/chat/ptc_run.py`、`src/server/database/runs/lifecycle.py`、`src/server/services/runs/sse_producer.py`、`src/server/services/runs/stream_writer.py`、`src/server/app/threads/messaging.py`。
-  - **网关文件**：`src/sandbox-links.ts`、`src/types.ts`、`src/config.ts`、`src/backend-client.ts`、`src/orchestrator.ts`、`src/delivery-service.ts`、`src/data-task-notifications.ts`、`src/automation-notifications.ts`、飞书端 `inbound-parse.ts` / `targets.ts` / `send.ts` / `monitor.ts`、Discord 端 `inbound.ts` / `index.ts` / `send.ts` / `threading.ts`。
+  - **后端上游文件（均加 `DALTON-HOOK(channel-deliverables)`）**：`src/server/handlers/chat/ptc_run.py`、`src/ptc_agent/agent/tools/file_ops.py`、`src/ptc_agent/agent/backends/sandbox.py`、`src/server/database/runs/lifecycle.py`、`src/server/services/runs/sse_producer.py`、`src/server/services/runs/stream_writer.py`、`src/server/app/threads/messaging.py`。
+  - **网关文件**：`src/shared/sandbox-links.ts`、`src/agent-routes.ts`、`src/types.ts`、`src/config.ts`、`src/backend-client.ts`、`src/orchestrator.ts`、`src/delivery-service.ts`、`src/data-task-notifications.ts`、`src/automation-notifications.ts`、飞书端 `inbound-parse.ts` / `targets.ts` / `send.ts` / `monitor.ts`、Discord 端 `inbound.ts` / `index.ts` / `send.ts` / `threading.ts`、微信端 `send.ts`（复用上传后复核）。
 - **测试覆盖（Vitest〔TypeScript 单元测试框架〕+ `pytest`〔Python 单元测试框架〕）**：
-  1. **飞书话题、四要素精确回执核实、同事务分片登记与负缓存清理**：验证顶层 `@` 预写 `feishu_reply_uuid` 与 `feishu_reply_dispatched_at` 并以 `reply_in_thread: true` 建帖；模拟响应缺失 `message_id` 或 `I-7` 前进程退出，**重点覆盖同一话题内已存在其他 `@机器人` 历史回复的场景**，验证按回复目标 `parent_id`、机器人发送者、时间戳与待发首片内容精确识别本次回复（结果含糊时保持 `status = 'unknown'`），确认后在同一数据库事务内记录 `platform_message_ids`、`sent_chunks`、投递 `status` 与 `dalton_channel_bot_topics`；验证 50 分钟内确认无回执才带原 `uuid` 重试、超过 50 分钟保持 `unknown` 状态；验证主聊区仅带 `root_id`（缺省 `thread_id`）的普通引用回复在入站前略过；验证普通话题命中负缓存后 `@机器人` 登记时立即清除负缓存，紧接着发起人免 `@` 跟帖正常触发；原消息撤回（`230011`/`231003`）回退普通群消息；群会话失效覆盖 `:topic:` 作用域。
-  2. **Discord 子区地址规范、父频道鉴权与分类回退**：验证 `confirmed_thread_address` 采用 `discord:<guild>/<parent>:thread:<thread>` 通过 `I-7` 校验，且仅登记父频道时按父频道通过 `_verify_group_target_deliverable` 授权（回退父频道时按父频道授权）；验证 `403`/`50013` 与 `160006`/`160007` 回退父频道引用回复、原消息已删除（`404`/`10008`）发无引用简短提示、超时与 5xx 保持 `adoptUnconfirmedThread` 查找复用。
-  3. **通知与报告全链路深链及平台子能力门禁**：引用式链接展开并保留 `__wsref__` 目标工作区深链；`automation_reports` 保存阶段在 `_validate_card` 前完成工作区相对链接改写并通过卡片校验；`authorize_saved_report_target` 与 `authorize_data_task_notification_plan` 准确透传报告的 `thread_id` 与 `workspace_id`（宿主机脚本任务返回 `null` 并按 `DATA_JOBS` 门控输出 `monitor_url`）；验证单独关闭对应渠道子能力（`CHANNEL_FEISHU` / `CHANNEL_DISCORD` / `CHANNEL_WEIXIN`）时 `/internal/topics/lookup` 与 `/internal/deliverables/download` 返回 `404`。
-  4. **私聊本轮文件自动附带、双回合写同名文件修改时间核对与群聊深链隔离**：
-     - 验证发起人本人私聊附带本轮 `Write`/`Edit` 写入记录中的双路径白名单文件（排除工作区历史旧文件、隐藏/排除路径、符号链接越界路径、同事受限轮次及 `.html` 报告）；
-     - **专项测试「同一工作区的两个回合先后写入同名文件」**：模拟回合 A 写入 `report.pdf` 并完成结算（记录回合 A 的 `run_ended_at` 与 `turn_deliverables`），在回合 A 渠道私聊下载附件前，回合 B 在同一工作区覆盖写入同名 `report.pdf`（使文件修改时间晚于回合 A 的 `run_ended_at`），验证回合 A 调用 `/internal/deliverables/download` 检测到 `file_mtime > run_ended_at` 返回 `409 deliverable_superseded` 并自动改发网页登录深链，而回合 B 结算时核对 `file_mtime <= 回合 B run_ended_at` 通过并正常附带最新 `report.pdf`；
-     - 验证飞书群与 Discord 频道/子区统一发送网页登录深链。
+  1. **话题首轮强制建帖、`canonical_scope_key` 锁定、后轮按 `external_topic_id` 出站路由与重启 `unknown` 行为**：
+     - 验证飞书与 Discord 顶层 `@` 首轮由网关强制创建话题/公开子区（无需模型传 `new_thread`），`canonical_scope_key` 固定为触发轮的 `chat:<id>:topic:<根消息>`（已在现有话题/子区内 `@` 时沿用 `chat:<id>:thread:<平台话题号>`）；
+     - 验证后续入站（发起人免 `@` 跟帖、发起人在话题内显式 `@`、话题内 `/stop` 等指令）保持同一 `canonical_scope_key`；后轮实时回复、断线回放、后台回报与当前会话 `send_message` 通过 `dalton_channel_bot_topics.external_topic_id` 及 `/internal/topics/lookup`（按 `canonical_scope_key` 查询）准确发入该话题/子区（飞书对当前入站消息带 `reply_in_thread: true`，Discord 先 `ensureThreadUnarchived` 再发进该子区，`threadIdFromScopeKey` 仅解析 `:thread:` 键）；
+     - 验证其他已绑定内部成员在话题内显式 `@机器人` 触发其本人会话，且 `I-1` 先于 `I-7` 并发进入时原话题发起人与 `canonical_scope_key` 保持不变；
+     - 验证主聊区仅带 `root_id`（缺省 `thread_id`）的普通引用略过、普通话题命中负缓存后首次 `@` 即时清负缓存、飞书撤回（`230011`/`231003`/`230110`）与 Discord `50013`/`160006`/`160007`/`10008` 分类回退、群会话失效覆盖 `:topic:`，以及网关重启时未结算的首条回复沿用现有行为标为 `status = 'unknown'` 且保持单次发送。
+  2. **私聊附件 `FileStamp` 与内容哈希版本比对（在线沙箱与离线备份）**：
+     - 验证 `turn_deliverables` 在 `Write`/`Edit` 写入成功时记录 `FileStamp`（`size`、`mtime`、`ctime`、`inode`）与内容 SHA-256，在线下载通过 `read_contained_sandbox_file_versioned`、离线回退通过 `workspace_files.sandbox_modified_at` 与 `content_hash` / `blob_sha256` 比对一致并脱敏后发出；
+     - **专项覆盖三类改写与离线旧备份场景**：① **保 `mtime` 覆写**（写入后用 `cp -p` 或 `touch -r` 覆写同路径保留原 `mtime`）；② **结算前同路径再写**（回合 `finalize_run` 结算前被脚本覆盖或同一时钟步未 `settled` 改写，以及同回合工具连续两次写同路径保留最后一次工具版本）；③ **两轮交错写入同名文件**与**沙箱停止后 `workspace_files` 停留在旧版本备份**——验证版本缺失或不一致时均返回 `409 deliverable_version_mismatch` 并统一只发网页登录深链。
+  3. **私聊附件收件人核验、群显式发送转深链与私聊附件独立结算去重**：
+     - **收件人核验专项**：覆盖**目标误传**（以群投递或跨目标 `is_current=false` 的 `delivery_key` 请求下载）、**运行期间用户解绑或重绑平台账号**、以及**个人微信文件上传 CDN 期间切换或重登机器人账号**（验证 `preflight_weixin_send` 与 `refreshAfterUpload` 拦截且停止发送）；
+     - **群显式发送与私聊独立结算专项**：覆盖**群内或向群目标调用 `send_message(files=[...])`** 在取得实际目标后统一将 `files` 转为网页登录深链（零文件下载上传），以及**私聊先通过 `send_message` 发送正文、随后在回合结算时独立补发自动附件**并按已确认 `files_status` 精确去重。
+  4. **`src/shared/sandbox-links.ts` 扩展、Python 摘要前置改写与平台子能力门禁**：
+     - 验证 `rewriteSandboxLinks` 在分片前将 `[ref]`、`[ref][]`、`[文字][ref]` 展开为内联深链、定义行改为深链或删除、无 `threadId` 时通过 `workspaceId` 生成 `/chat/${workspaceId}?file=` 并保留 `__wsref__` 目标工作区；
+     - 验证 Python `rewrite_workspace_links_for_external` 在 `dispatch.py` 的 `extract_summary_lines` 与 `extract_card_sections` 剥离链接前完成深链替换；验证 `automation_reports` 在有公网地址与回环地址两种配置下均通过 `_validate_card` 保存并投递；验证单独关闭渠道子能力（`CHANNEL_FEISHU` / `CHANNEL_DISCORD` / `CHANNEL_WEIXIN`）时 `/internal/topics/lookup` 与 `/internal/deliverables/download` 返回 `404`。
 - **上线验收标准**：
-  - 飞书开放平台应用已开启 `im:message.group_msg` 与 `im:message:readonly` 权限并在测试群验证 `im.message.list(container_id_type="thread")` 可正常读回话题消息；
-  - 飞书群与 Discord 频道 `@机器人` 自动创建话题/子区，发起人免 `@` 连续追问顺畅生效，已有话题存在其他机器人回复或回执异常时精确恢复并保持单次建帖；
-  - 发起人私聊准确收到本轮写入且未经后续回合覆盖的合规文件，同名文件被后续回合改写时平稳转为登录深链，群聊统一输出登录深链；
-  - `DALTON_PROFILE=core` 与 `test_core_capabilities_gate.py`、`bash scripts/dalton/check_hooks.sh --strict` 全部通过。
+  - 飞书开放平台应用已开启 `im:message.group_msg` 与 `im:message:readonly` 权限并发布生效，Discord 机器人后台已开启 `MESSAGE_CONTENT` 意图；
+  - 飞书群与 Discord 频道顶层 `@机器人` 首轮自动创建话题/子区，发起人免 `@` 多轮连续追问、回放与后台回报均稳定落在同一话题/子区内，重启时未结算首条回复保持 `unknown` 单次发送；
+  - 发起人私聊准确收到通过收件人绑定核验及 `FileStamp`/哈希比对的本轮合规文件（含先发正文再结算附件场景），保 `mtime` 覆写、交错写入、群聊（含显式 `send_message(files=...)`）统一输出网页登录深链；
+  - `DALTON_PROFILE=core` 默认关闭态门禁测试 `test_core_capabilities_gate.py` 与 `bash scripts/dalton/check_hooks.sh --strict` 全部通过。
 
 ---
 
@@ -813,7 +835,7 @@ flowchart LR
 > **定案说明**：以下三项交互与治理方案已按第一轮设计默认方案定案，正文各章节已统一按此口径编写，**待用户最终确认**。
 
 1. **群聊机器人话题内「免 `@` 继续对话」的触发人范围（功能 ②）**
-   - **已定方案**：话题内**仅话题发起人本人**（且消息携带实际话题标识 `thread_id`）免 `@` 直接连续追问；群内其他已绑定的内部成员或管理员在该话题内需要向机器人提问时，通过显式 `@机器人` 触发其本人工作区会话（自动附带话题首楼与被回复消息作为上下文），保证群友在话题楼内的人际讨论自然顺畅。
+   - **已定方案**：话题内**仅话题发起人本人**（且消息携带实际话题标识 `thread_id` / 子区频道 ID）免 `@` 直接连续追问，并全程沿用触发轮锁定的 `canonical_scope_key`；第 1 批中，群内其他已绑定的内部成员或管理员在该话题内向机器人提问时，通过显式 `@机器人` 触发其本人会话（与现有群内 `@` 行为一致，仅传入当前消息内容，保证群友在话题楼内的人际讨论自然顺畅；自动附带话题首楼与被回复消息上下文归入 §1.4 后续演进事项）。
 
 2. **Discord 右键消息「转入 `<品牌名>` 研判」的默认回复去向（功能 ④）**
    - **已定方案**：点击右键菜单后同步弹出轻量输入框（可填写补充研判问题，由 PostgreSQL 草稿记录源频道与目标消息标识）；当源消息位于已授权公开 Dalton 频道（或其公开子区）时提供投递位置选择项且**默认选中「发到我的机器人私聊」**（可选「在所属公开频道新建子区讨论」），其余频道与私有子区固定发往本人私聊；首次提交与重启恢复共用实时源权限核验、公开目的地权限核验与原消息实时重读，无法核验时终止派发并提示重新操作；回合创建后向点击者返回私密网页深链，私信受限时通过仅点击者可见响应提示网页查看入口。
