@@ -727,8 +727,9 @@ async def update_thread_endpoint(
         if "archived" in provided and request.archived is not None:
             updates["archived"] = request.archived
         switched_from: str | None = None
-        prev_system_only = False
+        prev_system_only: bool | None = False  # DALTON-HOOK(cos-settings-tools)
         latest_run_model: str | None = None
+        latest_run_id: str | None = None  # DALTON-HOOK(cos-settings-tools)
         prev_run_resolved = False  # DALTON-HOOK(cos-settings-tools)
         if "llm_model" in provided:
             # null returns the thread to the account default; a name has to
@@ -740,7 +741,7 @@ async def update_thread_endpoint(
             updates["llm_model"] = request.llm_model
             prev_thread_meta = await get_thread_auth_meta(thread_id) or {}
             switched_from = prev_thread_meta.get("llm_model")
-            # DALTON-HOOK(cos-settings-tools): resolve previous run's actual model and execution snapshot atomically from the same run row for handoff
+            # DALTON-HOOK(cos-settings-tools): resolve previous run's actual model, run_id, and execution snapshot atomically from the same run row; keep prev_system_only=None on real read failure so same-name switches still trigger handoff
             try:
                 from src.dalton.services.automation_thread_model import (
                     get_run_model_and_system_only,
@@ -748,16 +749,38 @@ async def update_thread_endpoint(
                 from src.server.database.runs import lifecycle as _runs_lifecycle
 
                 _latest_attempt = await _runs_lifecycle.get_latest_attempt(thread_id)
-                if isinstance(_latest_attempt, dict):
+                if _latest_attempt is None:
+                    prev_system_only = False
+                    prev_run_resolved = True
+                elif isinstance(_latest_attempt, dict):
+                    latest_run_id = (
+                        str(_latest_attempt.get("conversation_response_id") or "").strip()
+                        or None
+                    )
                     _resolved_model, _resolved_sys = (
                         await get_run_model_and_system_only(_latest_attempt)
                     )
                     latest_run_model = _resolved_model
-                    if _resolved_sys is not None:
-                        prev_system_only = _resolved_sys
-                        prev_run_resolved = True
+                    prev_system_only = _resolved_sys
+                    prev_run_resolved = _resolved_sys is not None
+            except RuntimeError as _exc:
+                # DALTON-HOOK(cos-settings-tools): keep False only when DB pool is uninitialized/unopened in isolated unit tests; real DB errors stay None
+                _err_msg = str(_exc).lower()
+                if "not initialized" in _err_msg or "not open" in _err_msg:
+                    prev_system_only = False
+                    prev_run_resolved = False
+                else:
+                    prev_system_only = None
+                    prev_run_resolved = False
+                logger.debug(
+                    "latest run read for handoff identity failed on thread %s",
+                    thread_id,
+                    exc_info=True,
+                )
             except Exception:
-                # DALTON-HOOK(cos-settings-tools): tolerate unavailable run ledger in unit/fallback paths
+                # DALTON-HOOK(cos-settings-tools): real DB/timeout failure leaves prev_system_only=None so same-name switches do not skip handoff
+                prev_system_only = None
+                prev_run_resolved = False
                 logger.debug(
                     "latest run read for handoff identity failed on thread %s",
                     thread_id,
@@ -871,16 +894,19 @@ async def update_thread_endpoint(
             if to_claude_code:
                 item.brief_handoff = await brief_on_switch(thread_id, x_user_id, updates["llm_model"])
             else:
-                # DALTON-HOOK(cos-settings-tools): pass the previous run's actual model and execution system-only flag captured from the same run to summary handoff
+                # DALTON-HOOK(cos-settings-tools): pass the previous run's actual model and execution system-only flag captured from the same run, or forward source_run_id + strict_system_only=True on read failure
+                _handoff_kwargs: dict[str, object] = {}
+                if prev_run_resolved:
+                    _handoff_kwargs["source_system_only"] = prev_system_only
+                elif prev_system_only is None:
+                    _handoff_kwargs["strict_system_only"] = True
+                    if latest_run_id:
+                        _handoff_kwargs["source_run_id"] = latest_run_id
                 item.summary_handoff = await hand_off_on_switch(
                     thread_id,
                     x_user_id,
                     _handoff_source,
-                    **(
-                        {"source_system_only": prev_system_only}
-                        if prev_run_resolved
-                        else {}
-                    ),
+                    **_handoff_kwargs,
                 )
         return item
 

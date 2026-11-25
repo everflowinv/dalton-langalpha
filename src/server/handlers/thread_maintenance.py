@@ -495,6 +495,7 @@ async def _resolver(
     ignore_custom_models: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
     latest_attempt: Any = _UNSET_LATEST,  # DALTON-HOOK(cos-settings-tools)
     strict_system_only: bool = False,  # DALTON-HOOK(cos-settings-tools)
+    source_run_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
 ):
     """``thread_resolver`` for a call between turns, which no composer
     started, so the thread's row sets its effort and fast mode, and its
@@ -512,14 +513,36 @@ async def _resolver(
         try:
             latest = await tl_db.get_latest_attempt(thread_id)
         except Exception:
+            # DALTON-HOOK(cos-settings-tools): propagate latest-attempt DB failure when strict_system_only is True and no source_run_id/ignore_custom_models was supplied
+            if strict_system_only and ignore_custom_models is None and not source_run_id:
+                raise
             logger.debug("latest run read failed for thread %s", thread_id, exc_info=True)
             latest = None
     else:
         latest = latest_attempt
     latest_meta = (latest or {}).get("metadata") or {}
-    # DALTON-HOOK(cos-settings-tools): read execution-level system-only flag from the same run row's execution snapshot
+    # DALTON-HOOK(cos-settings-tools): read execution-level system-only flag from source_run_id (when supplied) or the same latest run row, failing closed when strict_system_only=True
     if ignore_custom_models is not None:
         effective_ignore_custom = bool(ignore_custom_models)
+    elif source_run_id:
+        try:
+            _, resolved_sys = await get_run_model_and_system_only(
+                {"conversation_response_id": str(source_run_id).strip()}
+            )
+        except Exception as exc:
+            if strict_system_only:
+                raise RuntimeError(
+                    f"Failed reading execution system-only flag for run {source_run_id} on thread {thread_id}"
+                ) from exc
+            resolved_sys = None
+        if resolved_sys is None:
+            if strict_system_only:
+                raise RuntimeError(
+                    f"Failed reading execution system-only flag for run {source_run_id} on thread {thread_id}"
+                )
+            effective_ignore_custom = False
+        else:
+            effective_ignore_custom = bool(resolved_sys)
     elif isinstance(latest, Mapping):
         _, resolved_sys = await get_run_model_and_system_only(latest)
         if resolved_sys is None:
@@ -938,6 +961,8 @@ async def hand_off_on_switch(
     previous_model: str | None,
     *,
     source_system_only: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
+    source_run_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
+    strict_system_only: bool = False,  # DALTON-HOOK(cos-settings-tools)
 ) -> bool:
     """When a switch from ``previous_model`` (None for the account default)
     leaves the thread on a model that cannot read the summary its provider
@@ -954,13 +979,15 @@ async def hand_off_on_switch(
     try:
         # Checked again under the fence; asked first so a switch with nothing
         # to hand off never holds the thread.
-        # DALTON-HOOK(cos-settings-tools): forward source_system_only from the same run that supplied previous_model
+        # DALTON-HOOK(cos-settings-tools): forward source_system_only, source_run_id, and strict_system_only from the same run that supplied previous_model
         if (
             await _hand_off_config(
                 thread_id,
                 user_id,
                 previous_model,
                 source_system_only=source_system_only,
+                source_run_id=source_run_id,
+                strict_system_only=strict_system_only,
             )
             is None
         ):
@@ -976,6 +1003,8 @@ async def hand_off_on_switch(
             previous_model,
             started,
             source_system_only=source_system_only,
+            source_run_id=source_run_id,
+            strict_system_only=strict_system_only,
         ),
         name=f"handoff_{thread_id[:8]}",
     )
@@ -988,6 +1017,8 @@ async def _hand_off_config(
     model: str | None,
     *,
     source_system_only: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
+    source_run_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
+    strict_system_only: bool = False,  # DALTON-HOOK(cos-settings-tools)
 ):
     """The config ``model`` runs under on the thread and the thread's route,
     when the summary is still to hand off, the thread's model cannot read it,
@@ -998,7 +1029,7 @@ async def _hand_off_config(
     if summary is None:
         return None
     meta, route = await thread_route(thread_id, user_id)
-    # DALTON-HOOK(cos-settings-tools): bind source_system_only captured from the same run; None means switch-time read failed so re-read strictly (failing closed for retry)
+    # DALTON-HOOK(cos-settings-tools): bind source_system_only captured from the same run; when None, re-read via source_run_id (or latest run) respecting strict_system_only
     resolve = await _resolver(
         user_id,
         thread_id,
@@ -1007,8 +1038,9 @@ async def _hand_off_config(
         **(
             {"ignore_custom_models": source_system_only}
             if source_system_only is not None
-            else {"strict_system_only": True}
+            else ({"strict_system_only": True} if strict_system_only else {})
         ),
+        **({"source_run_id": source_run_id} if source_run_id else {}),
     )
     try:
         # DALTON-HOOK(cos-settings-tools): resolve the newly switched-to model under the owner's own selection (not previous run's system-only flag)
@@ -1042,6 +1074,8 @@ async def _hand_off(
     started: asyncio.Future,
     *,
     source_system_only: bool | None = None,  # DALTON-HOOK(cos-settings-tools)
+    source_run_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
+    strict_system_only: bool = False,  # DALTON-HOOK(cos-settings-tools)
 ) -> None:
     """``model``, the one the thread was on, writes out the summary only its
     provider can read (``HandOff``), in place of the digest; ``started`` is
@@ -1060,6 +1094,8 @@ async def _hand_off(
                 user_id,
                 model,
                 source_system_only=source_system_only,
+                source_run_id=source_run_id,
+                strict_system_only=strict_system_only,
             )
             if target is None:
                 return

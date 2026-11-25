@@ -494,6 +494,7 @@ async def _handle_send_message(
     raw_request: Request | None = None,
     *,
     retry_of_run_id: str | None = None,
+    retry_source_execution_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
 ):
     """Shared logic for both POST /threads/messages and POST /threads/{id}/messages.
 
@@ -816,6 +817,12 @@ async def _handle_send_message(
             from_service=from_service,
             is_server_retry=is_server_retry,
             retry_of_run_id=retry_of_run_id,
+            # DALTON-HOOK(cos-settings-tools): forward already-read execution id from /retry so snapshot lookup failures fail closed with 503
+            **(
+                {"retry_source_execution_id": retry_source_execution_id}
+                if retry_source_execution_id
+                else {}
+            ),
             resolve=resolve,
             flagged_subscription=flagged_subscription,
             on_fallback=fallback_records.append,
@@ -2020,6 +2027,14 @@ async def retry_thread(
                 status_code=404, detail=f"Thread {thread_id} has no runs to retry"
             )
         latest_run_id = str(latest["conversation_response_id"])
+        # DALTON-HOOK(cos-settings-tools): capture linked execution id from the already-read latest attempt so /retry fails closed if snapshot lookup later fails
+        from src.dalton.services.automation_thread_model import (
+            _extract_execution_id_from_metadata,
+        )
+
+        retry_source_execution_id = _extract_execution_id_from_metadata(
+            latest.get("metadata")
+        )
         if access.is_shared:
             await refuse_others_retry(latest_run_id, auth.user_id)
         if body and body.run_id and body.run_id != latest_run_id:
@@ -2101,8 +2116,18 @@ async def retry_thread(
         request = request.model_copy(update={"checked_computer_id": checked})
     # Retry provenance travels as a route-internal parameter, never in the
     # body.
+    # DALTON-HOOK(cos-settings-tools): forward linked execution id when present so /retry fails closed on snapshot lookup error
     return await _handle_send_message(
-        request, auth, thread_id, raw_request, retry_of_run_id=latest_run_id
+        request,
+        auth,
+        thread_id,
+        raw_request,
+        retry_of_run_id=latest_run_id,
+        **(
+            {"retry_source_execution_id": retry_source_execution_id}
+            if retry_source_execution_id
+            else {}
+        ),
     )
 
 

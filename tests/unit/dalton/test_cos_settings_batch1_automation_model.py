@@ -4743,11 +4743,18 @@ async def test_r6_handoff_uses_same_run_snapshot_across_concurrent_new_run_for_w
         previous_model: str | None,
         *,
         source_system_only: bool | None = None,
+        source_run_id: str | None = None,
+        strict_system_only: bool = False,
     ) -> bool:
         # Simulate a brand-new non-system-only run completing right before _hand_off_config!
         latest_box["row"] = run2_owner
         cfg = await maint_mod._hand_off_config(
-            tid, uid, previous_model, source_system_only=source_system_only
+            tid,
+            uid,
+            previous_model,
+            source_system_only=source_system_only,
+            source_run_id=source_run_id,
+            strict_system_only=strict_system_only,
         )
         return cfg is not None
 
@@ -4798,7 +4805,13 @@ async def test_r6_handoff_uses_same_run_snapshot_across_concurrent_new_run_for_w
         running_run_id=run1_sys["conversation_response_id"],
     )
     marker = thread_state["metadata"][thread_model_mod.PENDING_MODEL_HANDOFF_KEY]
-    assert marker["candidate_sources"] == [{"model": "gpt-5.4", "system_only": True}]
+    assert marker["candidate_sources"] == [
+        {
+            "model": "gpt-5.4",
+            "system_only": True,
+            "run_id": run1_sys["conversation_response_id"],
+        }
+    ]
 
     # Now run2_owner completes before run_pending_model_handoff runs!
     latest_box["row"] = run2_owner
@@ -4812,11 +4825,18 @@ async def test_r6_handoff_uses_same_run_snapshot_across_concurrent_new_run_for_w
         model: str | None,
         *,
         source_system_only: bool | None = None,
+        source_run_id: str | None = None,
     ):
         nonlocal inspect_calls
         inspect_calls += 1
         if inspect_calls == 1:
-            return await orig_inspect(tid, uid, model, source_system_only=source_system_only)
+            return await orig_inspect(
+                tid,
+                uid,
+                model,
+                source_system_only=source_system_only,
+                source_run_id=source_run_id,
+            )
         return "not_needed", None
 
     monkeypatch.setattr(
@@ -6382,7 +6402,13 @@ async def test_r9_web_patch_read_failure_returns_none_and_lets_handoff_reread_or
         ThreadUpdateRequest(llm_model="gemini-2.5-pro"),
         x_user_id=OWNER,
     )
-    assert handoff_kwargs == [{"prev_model": "gpt-5.4"}]
+    assert handoff_kwargs == [
+        {
+            "prev_model": "gpt-5.4",
+            "strict_system_only": True,
+            "source_run_id": run_sys["conversation_response_id"],
+        }
+    ]
     assert "source_system_only" not in handoff_kwargs[0]
 
     # (3) inspect_hand_off with source_system_only=None returns retryable_failure when DB read still fails
@@ -6404,3 +6430,696 @@ async def test_r9_web_patch_read_failure_returns_none_and_lets_handoff_reread_or
     )
     status, payload = await handoff_mod.inspect_hand_off(THREAD_ID, OWNER, "gpt-5.4")
     assert (status, payload) == ("retryable_failure", None)
+
+
+# =========================================================================
+# Round 10 (narrowed) unit tests
+# =========================================================================
+
+
+@pytest.mark.asyncio
+async def test_r10_web_retry_and_explicit_execution_lookup_timeout_fail_closed_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 10 Decision 1 (codex high 1, grok suspect 2):
+    1) HTTP POST /api/v1/threads/{id}/retry on a failed run carrying automation_execution_id
+       fails closed with HTTP 503 (automation_model_unavailable) when _get_execution_for_run_id
+       times out — never starting the workflow or falling back to composer model/effort.
+    2) Explicit server turn carrying automation_execution_id fails closed with HTTP 503 when
+       _get_execution_by_id times out — never calling resolve or on_automation_context."""
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from src.server.app.threads import messaging as msg_mod
+    from src.server.dependencies import cli_approval, principal as principal_mod, usage_limits
+    from src.server.handlers import chat as chat_handlers, checkpoint_handler
+    from src.server.services import turn_runtime
+    from src.server.services.runs import pending_input as pending_input_mod
+    from src.server.services.shared_workspaces.turn import TurnIdentity as SharedTurnIdentity
+
+    app = FastAPI()
+    app.include_router(msg_mod.router)
+
+    async def _fake_limit(uid: str):
+        return usage_limits.ChatAuthResult(
+            user_id=uid,
+            is_byok=False,
+            has_oauth=False,
+            access_tier=1,
+            burst_slot_id="slot-r10",
+            own_subscriptions=False,
+        )
+
+    app.dependency_overrides[principal_mod._RUN] = lambda: principal_mod.Principal(
+        user_id=OWNER, auth="session"
+    )
+    app.dependency_overrides[usage_limits.chat_limiter] = lambda: _fake_limit
+
+    monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
+    monkeypatch.setattr("src.dalton.auth.is_dalton_supabase_auth_enabled", lambda: False)
+    monkeypatch.setattr("src.dalton.settings.get_dalton_auth_mode", lambda: "oss")
+    monkeypatch.setattr("src.server.app.setup.agent_config", SimpleNamespace())
+    monkeypatch.setattr(
+        cli_approval,
+        "admit_retry",
+        create_autospec(cli_approval.admit_retry, return_value=None),
+    )
+    monkeypatch.setattr(
+        msg_mod,
+        "_assert_stream_transport_ready",
+        create_autospec(msg_mod._assert_stream_transport_ready, return_value=None),
+    )
+    monkeypatch.setattr(
+        msg_mod,
+        "get_thread_auth_meta",
+        create_autospec(
+            msg_mod.get_thread_auth_meta,
+            return_value={"user_id": OWNER, "workspace_id": WS, "llm_model": "claude-sonnet-4-6"},
+        ),
+    )
+    monkeypatch.setattr(
+        msg_mod,
+        "_settle_against_branch",
+        create_autospec(msg_mod._settle_against_branch, side_effect=lambda _t, req, _u: req),
+    )
+    monkeypatch.setattr(
+        "src.dalton.sharing.resolve_colleague_turn_admission",
+        create_autospec(
+            __import__(
+                "src.dalton.sharing", fromlist=["resolve_colleague_turn_admission"]
+            ).resolve_colleague_turn_admission,
+            return_value=({"workspace_id": WS, "user_id": OWNER, "computer_id": COMP_1}, "web", False),
+        ),
+    )
+    route = TurnRoute(workspace_id=WS, owner_id=OWNER, role="analyst")
+    monkeypatch.setattr(
+        turn_runtime,
+        "turn_route",
+        create_autospec(turn_runtime.turn_route, return_value=route),
+    )
+    monkeypatch.setattr(
+        TurnRoute,
+        "bind",
+        create_autospec(TurnRoute.bind, return_value=route),
+    )
+    monkeypatch.setattr(
+        SharedTurnIdentity,
+        "of",
+        create_autospec(
+            SharedTurnIdentity.of,
+            return_value=SharedTurnIdentity(sender=OWNER, owner=OWNER, recorded_as=OWNER),
+        ),
+    )
+    monkeypatch.setattr(
+        usage_limits,
+        "release_burst_slot",
+        create_autospec(usage_limits.release_burst_slot, return_value=None),
+    )
+    monkeypatch.setattr(
+        checkpoint_handler,
+        "get_retry_checkpoint",
+        create_autospec(checkpoint_handler.get_retry_checkpoint, return_value="cp-r10-1"),
+    )
+    monkeypatch.setattr(
+        pending_input_mod,
+        "retried_wake_fields",
+        create_autospec(pending_input_mod.retried_wake_fields, return_value={}),
+    )
+
+    failed_run_id = "99999999-9999-4999-8999-999999999910"
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_latest_attempt",
+        create_autospec(
+            runs_lifecycle_db.get_latest_attempt,
+            return_value={
+                "conversation_response_id": failed_run_id,
+                "turn_index": 1,
+                "status": "error",
+                "error_message": "transient_failure",
+                "metadata": {"automation_execution_id": EXEC_ID},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_run_id",
+        create_autospec(
+            atm_mod._get_execution_for_run_id,
+            side_effect=TimeoutError("db pool timeout on execution lookup"),
+        ),
+    )
+    resolve_spy = create_autospec(llm_config_mod.resolve_llm_config)
+    monkeypatch.setattr(llm_config_mod, "resolve_llm_config", resolve_spy)
+    workflow_spy = create_autospec(chat_handlers.astream_ptc_workflow)
+    monkeypatch.setattr(chat_handlers, "astream_ptc_workflow", workflow_spy)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/api/v1/threads/{THREAD_ID}/retry",
+            json={
+                "workspace_id": WS,
+                "llm_model": "owner-composer-model",
+                "reasoning_effort": "high",
+            },
+        )
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["type"] == "automation_model_unavailable"
+    resolve_spy.assert_not_awaited()
+    workflow_spy.assert_not_called()
+
+    # (2) Explicit server turn carrying automation_execution_id also fails closed with 503 on lookup timeout
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_by_id",
+        create_autospec(
+            atm_mod._get_execution_by_id,
+            side_effect=TimeoutError("db timeout reading explicit execution"),
+        ),
+    )
+    resolve_called: list[str | None] = []
+
+    async def _never_resolve(model_name: str | None, **_kw: Any):
+        resolve_called.append(model_name)
+        return SimpleNamespace()
+
+    ctx_captured: list[dict[str, Any]] = []
+    explicit_req = SimpleNamespace(
+        workspace_id=WS,
+        messages=[],
+        query_type="system",
+        platform=None,
+        hitl_response=None,
+        automation_execution_id=EXEC_ID,
+    )
+    with pytest.raises(HTTPException) as exc_srv:
+        await atm_mod.resolve_turn_config_with_automation_inheritance(
+            user_id=OWNER,
+            thread_id=THREAD_ID,
+            request=explicit_req,
+            requested_model=None,
+            held_model="owner-thread-model",
+            from_service=True,
+            resolve=_never_resolve,
+            on_automation_context=ctx_captured.append,
+        )
+    assert exc_srv.value.status_code == 503
+    assert exc_srv.value.detail["type"] == "automation_model_unavailable"
+    assert resolve_called == []
+    assert ctx_captured == []
+
+
+@pytest.mark.asyncio
+async def test_r10_deferred_handoff_rereads_exact_candidate_run_id_never_borrowing_newer_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 10 Decision 2 (codex medium 2, grok medium 1):
+    When switch-time lookup for system-only run r1 times out, pending marker stores
+    (model, system_only=None) with run_id=r1. Even after a newer ordinary run r2 (False)
+    is appended to the thread:
+    1) Deferred handoff re-reads r1 specifically (never borrowing r2's False) and resolves
+       the candidate under system-only catalog (ignore_custom_models=True).
+    2) If re-reading r1 still times out, inspect_hand_off returns retryable_failure and
+       run_pending_model_handoff keeps the pending marker intact."""
+    from src.dalton.database import model_switch as dalton_ms_db
+    from src.llms import provider_compaction as pc_mod
+    from src.server.handlers import thread_maintenance as maint_mod
+    from src.server.handlers import thread_model_handoff as handoff_mod
+    from src.server.services import account as account_mod
+    from src.server.services import thread_agent as ta_mod
+    from src.server.services.llm import thread_model as thread_model_mod
+
+    run1_sys_id = "33333333-3333-4333-8333-3333333333a1"
+    run2_normal_id = "33333333-3333-4333-8333-3333333333a2"
+    run1_row = {
+        "conversation_response_id": run1_sys_id,
+        "metadata": {"llm_model": "claude-sonnet-4-6", "automation_execution_id": EXEC_ID},
+    }
+    run2_row = {
+        "conversation_response_id": run2_normal_id,
+        "metadata": {"llm_model": "gpt-6.2-sol"},
+    }
+
+    orig_get_latest = runs_lifecycle_db.get_latest_attempt
+    orig_get_run_sys = atm_mod.get_run_model_and_system_only
+    orig_get_meta = thread_model_mod.threads_read.get_thread_auth_meta
+
+    # Switch happens right after r1 while r1's execution lookup times out -> (model, None) + run_id=r1
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_latest_attempt",
+        create_autospec(orig_get_latest, return_value=run1_row),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "get_run_model_and_system_only",
+        create_autospec(
+            orig_get_run_sys,
+            return_value=("claude-sonnet-4-6", None),
+        ),
+    )
+    monkeypatch.setattr(
+        thread_model_mod,
+        "require_selectable_model",
+        create_autospec(thread_model_mod.require_selectable_model, return_value=None),
+    )
+    monkeypatch.setattr(
+        thread_model_mod.threads_read,
+        "get_thread_auth_meta",
+        create_autospec(
+            orig_get_meta,
+            return_value={
+                "user_id": OWNER,
+                "workspace_id": WS,
+                "llm_model": "claude-sonnet-4-6",
+                "metadata": {},
+            },
+        ),
+    )
+    plan = await thread_model_mod.prepare_thread_model_switch(
+        OWNER,
+        THREAD_ID,
+        "claude-sonnet-4-6",
+    )
+    assert plan.changed is True
+    assert plan.pending_candidate_sources == (("claude-sonnet-4-6", None),)
+    assert plan.pending_candidate_source_run_ids == (run1_sys_id,)
+
+    marker = thread_model_mod.build_pending_model_handoff_marker(
+        previous_model=plan.pending_previous_model,
+        user_id=OWNER,
+        version="ver-r10-rid",
+        candidate_models=plan.pending_candidate_models,
+        candidate_sources=plan.pending_candidate_sources,
+        candidate_source_run_ids=plan.pending_candidate_source_run_ids,
+    )
+    assert marker["candidate_sources"] == [
+        {"model": "claude-sonnet-4-6", "system_only": None, "run_id": run1_sys_id}
+    ]
+
+    # Later, a newer normal run r2 becomes the thread's latest attempt
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_latest_attempt",
+        create_autospec(orig_get_latest, return_value=run2_row),
+    )
+    monkeypatch.setattr(
+        thread_model_mod.threads_read,
+        "get_thread_auth_meta",
+        create_autospec(
+            orig_get_meta,
+            return_value={
+                "user_id": OWNER,
+                "workspace_id": WS,
+                "llm_model": "claude-sonnet-4-6",
+                "metadata": {thread_model_mod.PENDING_MODEL_HANDOFF_KEY: marker},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        thread_model_mod,
+        "next_turn_runs_claude_code",
+        create_autospec(thread_model_mod.next_turn_runs_claude_code, return_value=False),
+    )
+    monkeypatch.setattr(
+        maint_mod,
+        "_summary_to_hand_off",
+        create_autospec(maint_mod._summary_to_hand_off, return_value=object()),
+    )
+    monkeypatch.setattr(
+        maint_mod,
+        "thread_route",
+        create_autospec(
+            maint_mod.thread_route,
+            return_value=(
+                {"conversation_thread_id": THREAD_ID, "workspace_id": WS, "llm_model": "claude-sonnet-4-6"},
+                TurnRoute(workspace_id=WS, owner_id=OWNER, role="analyst"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        maint_mod.TurnIdentity,
+        "of",
+        create_autospec(
+            maint_mod.TurnIdentity.of,
+            return_value=TurnIdentity(sender=OWNER, owner=OWNER, recorded_as=OWNER),
+        ),
+    )
+    monkeypatch.setattr(
+        account_mod,
+        "own_access",
+        create_autospec(account_mod.own_access, return_value=SimpleNamespace(api_keys=False)),
+    )
+
+    queried_run_ids: list[str] = []
+
+    async def _read_by_run(run_row: dict[str, Any] | None):
+        rid = str((run_row or {}).get("conversation_response_id") or "")
+        queried_run_ids.append(rid)
+        if rid == run1_sys_id:
+            return "claude-sonnet-4-6", True
+        return "gpt-6.2-sol", False
+
+    monkeypatch.setattr(
+        atm_mod,
+        "get_run_model_and_system_only",
+        create_autospec(orig_get_run_sys, side_effect=_read_by_run),
+    )
+
+    resolver_flags: list[bool] = []
+
+    def _fake_thread_resolver(*_a: Any, **kw: Any):
+        base_ignore = bool(kw.get("ignore_custom_models", False))
+        resolver_flags.append(base_ignore)
+
+        async def _res(model_name: str | None, *, ignore_custom_models_override: bool | None = None):
+            eff_ignore = base_ignore if ignore_custom_models_override is None else bool(ignore_custom_models_override)
+            client_tag = f"sys:{model_name}" if eff_ignore else f"custom:{model_name}"
+            return SimpleNamespace(get_llm_client=lambda _c=client_tag: _c)
+
+        return _res
+
+    monkeypatch.setattr(
+        ta_mod,
+        "thread_resolver",
+        create_autospec(ta_mod.thread_resolver, side_effect=_fake_thread_resolver),
+    )
+    # Only the system-catalog client can replay the summary; owner's custom same-name client cannot.
+    monkeypatch.setattr(
+        pc_mod,
+        "replays",
+        create_autospec(pc_mod.replays, side_effect=lambda _s, client: client == "sys:claude-sonnet-4-6"),
+    )
+
+    status_ok, _ = await handoff_mod.inspect_hand_off(
+        THREAD_ID, OWNER, "claude-sonnet-4-6", source_run_id=run1_sys_id
+    )
+    assert status_ok == "ready"
+    assert queried_run_ids == [run1_sys_id]
+    assert resolver_flags == [True]
+
+    # (2) If re-reading r1 still times out -> retryable_failure and marker is NOT cleared
+    monkeypatch.setattr(
+        atm_mod,
+        "get_run_model_and_system_only",
+        create_autospec(
+            orig_get_run_sys,
+            side_effect=TimeoutError("r1 execution lookup still timing out"),
+        ),
+    )
+    clear_spy = create_autospec(dalton_ms_db.clear_thread_metadata_key, return_value=True)
+    monkeypatch.setattr(dalton_ms_db, "clear_thread_metadata_key", clear_spy)
+
+    outcome_fail = await handoff_mod.run_pending_model_handoff(THREAD_ID, user_id=OWNER)
+    assert outcome_fail == "retryable_failure"
+    clear_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_r10_handoff_strict_system_only_propagates_get_latest_attempt_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 10 Decision 2 (grok suspect 1):
+    When source_system_only is None and no source_run_id is recorded, a get_latest_attempt
+    timeout under strict_system_only=True MUST NOT be swallowed into False — inspect_hand_off
+    returns retryable_failure and run_pending_model_handoff keeps the pending marker."""
+    from src.dalton.database import model_switch as dalton_ms_db
+    from src.server.handlers import thread_maintenance as maint_mod
+    from src.server.handlers import thread_model_handoff as handoff_mod
+    from src.server.services.llm import thread_model as thread_model_mod
+
+    marker = thread_model_mod.build_pending_model_handoff_marker(
+        previous_model="claude-sonnet-4-6",
+        user_id=OWNER,
+        version="ver-r10-latest-timeout",
+        candidate_models=("claude-sonnet-4-6",),
+        candidate_sources=(("claude-sonnet-4-6", None),),
+    )
+    monkeypatch.setattr(
+        thread_model_mod.threads_read,
+        "get_thread_auth_meta",
+        create_autospec(
+            thread_model_mod.threads_read.get_thread_auth_meta,
+            return_value={
+                "user_id": OWNER,
+                "workspace_id": WS,
+                "llm_model": "claude-sonnet-4-6",
+                "metadata": {thread_model_mod.PENDING_MODEL_HANDOFF_KEY: marker},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        thread_model_mod,
+        "next_turn_runs_claude_code",
+        create_autospec(thread_model_mod.next_turn_runs_claude_code, return_value=False),
+    )
+    monkeypatch.setattr(
+        maint_mod,
+        "_summary_to_hand_off",
+        create_autospec(maint_mod._summary_to_hand_off, return_value=object()),
+    )
+    monkeypatch.setattr(
+        maint_mod,
+        "thread_route",
+        create_autospec(
+            maint_mod.thread_route,
+            return_value=(
+                {"conversation_thread_id": THREAD_ID, "workspace_id": WS, "llm_model": "claude-sonnet-4-6"},
+                TurnRoute(workspace_id=WS, owner_id=OWNER, role="analyst"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_latest_attempt",
+        create_autospec(
+            runs_lifecycle_db.get_latest_attempt,
+            side_effect=TimeoutError("latest attempt read timed out"),
+        ),
+    )
+    clear_spy = create_autospec(dalton_ms_db.clear_thread_metadata_key, return_value=True)
+    monkeypatch.setattr(dalton_ms_db, "clear_thread_metadata_key", clear_spy)
+
+    status, payload = await handoff_mod.inspect_hand_off(THREAD_ID, OWNER, "claude-sonnet-4-6")
+    assert (status, payload) == ("retryable_failure", None)
+
+    outcome = await handoff_mod.run_pending_model_handoff(THREAD_ID, user_id=OWNER)
+    assert outcome == "retryable_failure"
+    clear_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_r10_default_short_circuit_does_not_skip_when_prev_system_only_is_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 10 Decision 3 (grok medium 2):
+    When thread llm_model is None, target equals effective_default_model, and reading the
+    previous run's execution flag fails (None), prepare_thread_model_switch with
+    short_circuit_default=True MUST return changed=True and record (model, None) + run_id."""
+    from src.server.services.llm import thread_model as thread_model_mod
+
+    run_id = "33333333-3333-4333-8333-3333333333b1"
+    monkeypatch.setattr(
+        thread_model_mod,
+        "require_selectable_model",
+        create_autospec(thread_model_mod.require_selectable_model, return_value=None),
+    )
+    monkeypatch.setattr(
+        thread_model_mod.threads_read,
+        "get_thread_auth_meta",
+        create_autospec(
+            thread_model_mod.threads_read.get_thread_auth_meta,
+            return_value={
+                "user_id": OWNER,
+                "workspace_id": WS,
+                "llm_model": None,
+                "metadata": {},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_latest_attempt",
+        create_autospec(
+            runs_lifecycle_db.get_latest_attempt,
+            return_value={
+                "conversation_response_id": run_id,
+                "metadata": {"llm_model": "claude-sonnet-4-6", "automation_execution_id": EXEC_ID},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "get_run_model_and_system_only",
+        create_autospec(
+            atm_mod.get_run_model_and_system_only,
+            return_value=("claude-sonnet-4-6", None),
+        ),
+    )
+    monkeypatch.setattr(
+        thread_model_mod,
+        "effective_default_model",
+        create_autospec(
+            thread_model_mod.effective_default_model,
+            return_value="claude-sonnet-4-6",
+        ),
+    )
+
+    plan = await thread_model_mod.prepare_thread_model_switch(
+        OWNER,
+        THREAD_ID,
+        "claude-sonnet-4-6",
+        model_pref={"preferred_model": "claude-sonnet-4-6"},
+        short_circuit_default=True,
+    )
+    assert plan.changed is True
+    assert plan.pending_candidate_sources == (("claude-sonnet-4-6", None),)
+    assert plan.pending_candidate_source_run_ids == (run_id,)
+    assert plan.source_system_only is None
+    assert plan.source_run_id == run_id
+
+
+@pytest.mark.asyncio
+async def test_r10_web_patch_same_name_switch_triggers_strict_handoff_on_read_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 10 Decision 4 (codex low 3, grok low 1):
+    When a thread ran a same-named model under a system-only execution and reading that
+    execution's flag times out on web PATCH /threads/{id} with the same model name,
+    crud.update_thread_endpoint MUST NOT skip handoff — it calls hand_off_on_switch with
+    source_run_id and strict_system_only=True (and also on get_latest_attempt timeout)."""
+    from src.server.app.threads import crud as crud_mod
+    from src.server.database.conversation import threads_read, threads_write
+    from src.server.handlers import thread_maintenance as maint_mod
+    from src.server.models.conversation import ThreadUpdateRequest
+    from src.server.services.llm import thread_model as thread_model_mod
+
+    run_id = "33333333-3333-4333-8333-3333333333c1"
+    run_same_name = {
+        "conversation_response_id": run_id,
+        "metadata": {"llm_model": "claude-sonnet-4-6", "automation_execution_id": EXEC_ID},
+    }
+    monkeypatch.setattr(
+        crud_mod,
+        "_authorize_thread_write",
+        create_autospec(
+            crud_mod._authorize_thread_write,
+            return_value=SimpleNamespace(is_shared=False, org_id=None),
+        ),
+    )
+    monkeypatch.setattr(
+        crud_mod,
+        "require_selectable_model",
+        create_autospec(crud_mod.require_selectable_model, return_value=None),
+    )
+    monkeypatch.setattr(
+        crud_mod,
+        "get_thread_auth_meta",
+        create_autospec(
+            threads_read.get_thread_auth_meta,
+            return_value={"workspace_id": WS, "llm_model": "claude-sonnet-4-6", "user_id": OWNER},
+        ),
+    )
+    monkeypatch.setattr(
+        crud_mod,
+        "update_thread_fields",
+        create_autospec(
+            threads_write.update_thread_fields,
+            return_value={
+                "conversation_thread_id": THREAD_ID,
+                "workspace_id": WS,
+                "user_id": OWNER,
+                "thread_index": 1,
+                "title": "t",
+                "current_status": "idle",
+                "subagents_allowed": True,
+                "msg_type": "ptc",
+                "llm_model": "claude-sonnet-4-6",
+                "is_pinned": False,
+                "archived": False,
+                "is_shared": False,
+                "created_at": datetime.now(UTC),
+                "updated_at": datetime.now(UTC),
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        thread_model_mod,
+        "next_turn_runs_claude_code",
+        create_autospec(thread_model_mod.next_turn_runs_claude_code, return_value=False),
+    )
+
+    orig_get_latest = runs_lifecycle_db.get_latest_attempt
+    orig_hand_off = maint_mod.hand_off_on_switch
+
+    # (a) Execution snapshot lookup times out -> (model, None) -> same-name PATCH triggers strict handoff with source_run_id
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_latest_attempt",
+        create_autospec(orig_get_latest, return_value=run_same_name),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_by_id",
+        create_autospec(
+            atm_mod._get_execution_by_id,
+            side_effect=TimeoutError("execution snapshot lookup timed out"),
+        ),
+    )
+    calls_a: list[dict[str, Any]] = []
+
+    async def _cap_a(tid: str, uid: str, prev_model: str | None, **kw: Any) -> bool:
+        calls_a.append({"prev_model": prev_model, **kw})
+        return True
+
+    monkeypatch.setattr(
+        maint_mod,
+        "hand_off_on_switch",
+        create_autospec(orig_hand_off, side_effect=_cap_a),
+    )
+    item_a = await crud_mod.update_thread_endpoint(
+        THREAD_ID,
+        ThreadUpdateRequest(llm_model="claude-sonnet-4-6"),
+        x_user_id=OWNER,
+    )
+    assert item_a.summary_handoff is True
+    assert calls_a == [
+        {
+            "prev_model": "claude-sonnet-4-6",
+            "strict_system_only": True,
+            "source_run_id": run_id,
+        }
+    ]
+
+    # (b) get_latest_attempt itself times out (non-'not initialized' error) -> same-name PATCH still triggers strict handoff
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_latest_attempt",
+        create_autospec(
+            orig_get_latest,
+            side_effect=TimeoutError("latest attempt timed out"),
+        ),
+    )
+    calls_b: list[dict[str, Any]] = []
+
+    async def _cap_b(tid: str, uid: str, prev_model: str | None, **kw: Any) -> bool:
+        calls_b.append({"prev_model": prev_model, **kw})
+        return True
+
+    monkeypatch.setattr(
+        maint_mod,
+        "hand_off_on_switch",
+        create_autospec(orig_hand_off, side_effect=_cap_b),
+    )
+    item_b = await crud_mod.update_thread_endpoint(
+        THREAD_ID,
+        ThreadUpdateRequest(llm_model="claude-sonnet-4-6"),
+        x_user_id=OWNER,
+    )
+    assert item_b.summary_handoff is True
+    assert calls_b == [
+        {
+            "prev_model": "claude-sonnet-4-6",
+            "strict_system_only": True,
+        }
+    ]

@@ -766,6 +766,7 @@ async def _resolve_automation_notification_context(
     from_service: bool,
     is_server_retry: bool = False,
     retry_of_run_id: str | None = None,
+    retry_source_execution_id: str | None = None,
     allow_running_fallback: bool = True,
     resolve_model: bool = True,
 ) -> tuple[
@@ -790,6 +791,11 @@ async def _resolve_automation_notification_context(
     if normalize_uuid(thread_id) is None:
         return None, None, None, False, False, None
 
+    known_execution_id = (
+        (normalize_uuid(retry_source_execution_id) if retry_source_execution_id else None)
+        or _explicit_execution_id(request)
+        or _delivery_execution_id(request)
+    )
     target_exec: dict[str, Any] | None = None
     match_kind = "none"
     try:
@@ -827,7 +833,16 @@ async def _resolve_automation_notification_context(
                     retry_of_run_id=retry_of_run_id,
                     allow_running_fallback=allow_running_fallback,
                 )
-    except Exception:
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if known_execution_id is not None:
+            logger.warning(
+                f"[AUTOMATION_THREAD_MODEL] Failed resolving confirmed execution "
+                f"{known_execution_id} for thread={thread_id}; refusing turn",
+                exc_info=True,
+            )
+            raise _automation_model_unreadable() from exc
         logger.warning(
             f"[AUTOMATION_THREAD_MODEL] Failed resolving source execution "
             f"for thread={thread_id}; falling back to default resolution",
@@ -1121,6 +1136,7 @@ async def resolve_turn_config_with_automation_inheritance(
     from_service: bool,
     is_server_retry: bool = False,
     retry_of_run_id: str | None = None,
+    retry_source_execution_id: str | None = None,
     resolve: Callable[..., Awaitable[Any]],
     flagged_subscription: tuple[Any, str | None] | None = None,
     on_fallback: Callable[[dict[str, Any]], None] | None = None,
@@ -1169,6 +1185,7 @@ async def resolve_turn_config_with_automation_inheritance(
             from_service=from_service,
             is_server_retry=is_server_retry,
             retry_of_run_id=retry_of_run_id,
+            retry_source_execution_id=retry_source_execution_id,
             allow_running_fallback=(flagged_subscription is None),
             resolve_model=(requested_model is None),
         )
