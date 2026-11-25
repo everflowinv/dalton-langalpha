@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import posixpath
 from collections.abc import Awaitable, Callable, Sequence
@@ -533,6 +534,8 @@ async def update_monitor_settings_tx(
     require_publishing_enabled_fn: Callable[[], None] | None = None,
     verify_public_authority: Callable[[str], Awaitable[None]] | None = None,
     resolve_caller_tier: Callable[[str], Awaitable[str]] | None = None,
+    reject_external_non_own_existing: bool = False,
+    public_approver_id: str | None = None,
 ) -> MonitorRecord:
     """Update only explicitly provided monitor fields under lock, authorize in lock, and sync share_links atomically."""
     clean_members: list[str] | None = (
@@ -540,7 +543,6 @@ async def update_monitor_settings_tx(
         if member_user_ids is not None
         else None
     )
-    tier_lookup = resolve_caller_tier or get_user_tier
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -550,7 +552,7 @@ async def update_monitor_settings_tx(
                 await cur.execute(
                     """
                     SELECT title, category, sort_order, visibility, keep_updated,
-                           published_seq, owner_user_id, source_kind
+                           published_seq, owner_user_id, source_kind, source_ref, slug
                       FROM dalton_monitors
                      WHERE monitor_id = %s::uuid
                        FOR UPDATE
@@ -565,31 +567,88 @@ async def update_monitor_settings_tx(
                 was_public = cur_visibility == "public"
                 locked_owner = str(row["owner_user_id"])
                 locked_source_kind: MonitorSourceKind = row["source_kind"]
-                caller_tier = await tier_lookup(caller_id)
+                next_visibility: MonitorVisibility = (
+                    visibility if visibility is not None else cur_visibility
+                )
+                from src.dalton.settings import is_dalton_local_auth_enabled
+
+                approver_uid: str | None = None
+                if locked_source_kind == "data_job" and next_visibility == "public":
+                    approver_uid = str(public_approver_id or "").strip() or None
+                    if approver_uid is None and row.get("source_ref") is not None:
+                        from src.dalton.monitors.data_job_registry import (
+                            get_registered_monitor_binding_by_slug,
+                        )
+
+                        binding = get_registered_monitor_binding_by_slug(
+                            str(row.get("source_ref") or ""),
+                            str(row.get("slug") or ""),
+                        )
+                        if binding is not None and binding.approved_by_admin_user_id:
+                            approver_uid = (
+                                binding.approved_by_admin_user_id.strip() or None
+                            )
+
+                cur_conn = getattr(cur, "connection", None)
+                live_tiers: dict[str, str] = {}
+                if resolve_caller_tier is not None and (
+                    resolve_caller_tier is not get_user_tier
+                    or not is_dalton_local_auth_enabled()
+                ):
+                    caller_tier = await _call_with_optional_conn(
+                        resolve_caller_tier, caller_id, conn=cur_conn
+                    )
+                else:
+                    lock_candidates = [caller_id, locked_owner]
+                    if approver_uid is not None:
+                        lock_candidates.append(approver_uid)
+                    uids_to_lock = sorted(
+                        {
+                            str(u).strip()
+                            for u in lock_candidates
+                            if u
+                            and str(u).strip()
+                            and not is_company_system_user(str(u).strip())
+                        }
+                    )
+                    for uid in uids_to_lock:
+                        live_tiers[uid] = await _resolve_live_tier_in_cur(cur, uid)
+                    caller_tier = (
+                        "company"
+                        if is_company_system_user(caller_id)
+                        else live_tiers.get(str(caller_id).strip(), "external")
+                    )
                 if not can_manage_monitor_fields(
                     owner_user_id=locked_owner,
                     visibility=cur_visibility,
                     caller_id=caller_id,
                     caller_tier=caller_tier,
                 ):
-                    raise HTTPException(
-                        status_code=403,
-                        detail="只有面板所有者或管理员可修改设置",
+                    from src.dalton.auth_guards import raise_external_member_forbidden
+
+                    raise_external_member_forbidden("只有面板所有者或管理员可修改设置")
+
+                if (
+                    reject_external_non_own_existing
+                    and caller_tier == "external"
+                    and cur_visibility != "own"
+                ):
+                    from src.dalton.auth_guards import raise_external_member_forbidden
+
+                    raise_external_member_forbidden(
+                        "外部成员发布监控面板时只能选择“仅自己”可见"
                     )
 
-                next_visibility: MonitorVisibility = (
-                    visibility if visibility is not None else cur_visibility
-                )
                 if caller_tier == "external" and next_visibility != "own":
-                    raise HTTPException(
-                        status_code=403,
-                        detail="外部成员发布监控面板时只能选择“仅自己”可见",
+                    from src.dalton.auth_guards import raise_external_member_forbidden
+
+                    raise_external_member_forbidden(
+                        "外部成员发布监控面板时只能选择“仅自己”可见"
                     )
                 if not was_public and next_visibility == "public" and caller_tier != "admin":
-                    raise HTTPException(
-                        status_code=403,
-                        detail="只有管理员可以将监控面板设为公开链接",
-                    )
+                    from src.dalton.auth_guards import raise_admin_required
+
+                    raise_admin_required("只有管理员可以将监控面板设为公开链接")
 
                 next_title = (
                     title.strip() if title is not None and title.strip() else str(row["title"])
@@ -632,7 +691,46 @@ async def update_monitor_settings_tx(
                     if require_publishing_enabled_fn is not None:
                         require_publishing_enabled_fn()
                 if next_visibility == "public" and verify_public_authority is not None:
-                    await verify_public_authority(effective_owner)
+                    if locked_source_kind == "data_job":
+                        if (
+                            is_dalton_local_auth_enabled()
+                            and approver_uid is not None
+                            and approver_uid in live_tiers
+                            and live_tiers[approver_uid] != "admin"
+                        ):
+                            from src.dalton.monitors.service import (
+                                PUBLIC_PERMISSION_LOST_MESSAGE,
+                                PublicAuthorityLostError,
+                            )
+
+                            raise PublicAuthorityLostError(
+                                PUBLIC_PERMISSION_LOST_MESSAGE
+                            )
+                        await _call_with_optional_conn(
+                            verify_public_authority, effective_owner, conn=cur_conn
+                        )
+                    elif is_dalton_local_auth_enabled():
+                        if not is_company_system_user(effective_owner):
+                            eff_key = str(effective_owner).strip()
+                            eff_tier = (
+                                caller_tier
+                                if eff_key == str(caller_id).strip()
+                                else live_tiers.get(eff_key)
+                                or await _resolve_live_tier_in_cur(cur, eff_key)
+                            )
+                            if eff_tier != "admin":
+                                from src.dalton.monitors.service import (
+                                    PUBLIC_PERMISSION_LOST_MESSAGE,
+                                    PublicAuthorityLostError,
+                                )
+
+                                raise PublicAuthorityLostError(
+                                    PUBLIC_PERMISSION_LOST_MESSAGE
+                                )
+                    else:
+                        await _call_with_optional_conn(
+                            verify_public_authority, effective_owner, conn=cur_conn
+                        )
 
                 acl_changed = (
                     cur_visibility != next_visibility
@@ -692,6 +790,60 @@ async def update_monitor_settings_tx(
     if loaded is None:
         raise LookupError(f"Monitor {monitor_id} not found")
     return loaded
+
+
+def _signature_accepts_conn(fn: Any) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return False
+    return "conn" in sig.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+
+
+def _accepts_conn_kwarg(fn: Any) -> bool:
+    side_effect = getattr(fn, "side_effect", None)
+    if callable(side_effect):
+        return _signature_accepts_conn(side_effect)
+    return _signature_accepts_conn(fn)
+
+
+async def _call_with_optional_conn(
+    fn: Callable[..., Awaitable[Any]], arg: str, *, conn: Any
+) -> Any:
+    if conn is not None and _accepts_conn_kwarg(fn):
+        return await fn(arg, conn=conn)
+    return await fn(arg)
+
+
+async def _resolve_live_tier_in_cur(cur: Any, user_id: str) -> str:
+    """Resolve user tier inside an active transaction cursor (`FOR SHARE` on `dalton_user_roles` in `local` mode)."""
+    from collections.abc import Mapping
+
+    from src.dalton.monitors import permissions as monitor_perms
+    from src.dalton.settings import is_dalton_local_auth_enabled
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        return "external"
+    if is_company_system_user(uid):
+        return "company"
+    if is_dalton_local_auth_enabled():
+        await cur.execute(
+            "SELECT tier FROM dalton_user_roles WHERE user_id = %s FOR SHARE",
+            (uid,),
+        )
+        row = await cur.fetchone()
+        if row:
+            raw_tier = row["tier"] if isinstance(row, Mapping) else row[0]
+            tier = str(raw_tier or "").strip().lower()
+            if tier in ("admin", "internal", "external"):
+                return tier
+        return "external"
+    return await _call_with_optional_conn(
+        monitor_perms.get_user_tier, uid, conn=getattr(cur, "connection", None)
+    )
 
 
 async def commit_monitor_publish_tx(
@@ -754,8 +906,50 @@ async def commit_monitor_publish_tx(
                     (artifact_id,),
                 )
                 existing = await cur.fetchone()
-                if share_public and verify_public_authority is not None:
-                    await verify_public_authority(monitor_owner_id)
+                if is_company_system_user(monitor_owner_id) or source_kind == "data_job":
+                    if share_public and verify_public_authority is not None:
+                        await _call_with_optional_conn(
+                            verify_public_authority,
+                            monitor_owner_id,
+                            conn=getattr(cur, "connection", None),
+                        )
+                else:
+                    from src.dalton.auth_guards import raise_external_member_forbidden
+                    from src.dalton.monitors.permissions import (
+                        EXTERNAL_MONITOR_PUBLISH_FORBIDDEN_MESSAGE,
+                        require_monitor_publish_visibility,
+                    )
+                    from src.dalton.settings import is_dalton_local_auth_enabled
+
+                    live_tier = await _resolve_live_tier_in_cur(cur, monitor_owner_id)
+                    if (
+                        existing is not None
+                        and live_tier == "external"
+                        and existing["visibility"] != "own"
+                    ):
+                        raise_external_member_forbidden(
+                            EXTERNAL_MONITOR_PUBLISH_FORBIDDEN_MESSAGE
+                        )
+                    if live_tier == "external" and visibility != "own":
+                        require_monitor_publish_visibility(live_tier, visibility)
+                    if share_public and verify_public_authority is not None:
+                        if is_dalton_local_auth_enabled():
+                            if live_tier != "admin":
+                                from src.dalton.monitors.service import (
+                                    PUBLIC_PERMISSION_LOST_MESSAGE,
+                                    PublicAuthorityLostError,
+                                )
+
+                                raise PublicAuthorityLostError(
+                                    PUBLIC_PERMISSION_LOST_MESSAGE
+                                )
+                        else:
+                            await _call_with_optional_conn(
+                                verify_public_authority,
+                                monitor_owner_id,
+                                conn=getattr(cur, "connection", None),
+                            )
+                    require_monitor_publish_visibility(live_tier, visibility)
 
                 if existing is None:
                     await cur.execute(
@@ -919,16 +1113,116 @@ async def _cut_and_finalize_monitor_in_cur(
     left_out_files: list[str] | None = None,
     run_id: str | None = None,
     new_owner_user_id: str | None = None,
+    caller_user_id: str | None = None,
     verify_public_authority: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[MonitorRecord, PublishResult]:
     """Verify authority, unshare if downgraded, cut artifact version, and update monitor state."""
     artifact_id = locked.artifact_id
-    live_visibility = str(row["visibility"])
-    effective_owner = new_owner_user_id or str(row["owner_user_id"])
+    live_visibility: MonitorVisibility = row["visibility"]
+    locked_owner = str(row["owner_user_id"])
+    locked_source_kind = str(row.get("source_kind") or "workspace")
     share_public = live_visibility == "public"
+    effective_owner = locked_owner
 
-    if share_public and verify_public_authority is not None:
-        await verify_public_authority(effective_owner)
+    cur_conn = getattr(cur, "connection", None)
+    if locked_source_kind == "data_job" or (
+        is_company_system_user(new_owner_user_id or locked_owner)
+        and caller_user_id is None
+    ):
+        effective_owner = new_owner_user_id or locked_owner
+        if share_public and verify_public_authority is not None:
+            await _call_with_optional_conn(
+                verify_public_authority, effective_owner, conn=cur_conn
+            )
+    else:
+        from src.dalton.auth_guards import raise_external_member_forbidden
+        from src.dalton.monitors.permissions import (
+            can_manage_monitor_fields,
+            require_monitor_publish_visibility,
+        )
+        from src.dalton.settings import is_dalton_local_auth_enabled
+
+        # Lock involved role rows in deterministic ascending user_id order to match set_user_role.
+        uids_to_lock = sorted(
+            {
+                str(u).strip()
+                for u in (caller_user_id, new_owner_user_id, locked_owner)
+                if u and str(u).strip()
+            }
+        )
+        live_tiers: dict[str, str] = {}
+        for uid in uids_to_lock:
+            live_tiers[uid] = await _resolve_live_tier_in_cur(cur, uid)
+
+        if caller_user_id is not None:
+            caller_uid = str(caller_user_id)
+            caller_tier = live_tiers[caller_uid]
+            if not can_manage_monitor_fields(
+                owner_user_id=locked_owner,
+                visibility=live_visibility,
+                caller_id=caller_uid,
+                caller_tier=caller_tier,
+            ):
+                raise_external_member_forbidden("无权重新发布此监控面板")
+            if new_owner_user_id is not None and str(new_owner_user_id) != locked_owner:
+                if not (
+                    share_public
+                    and locked_source_kind == "workspace"
+                    and caller_tier == "admin"
+                ):
+                    raise_external_member_forbidden("无权重新发布此监控面板")
+                effective_owner = str(new_owner_user_id)
+            if caller_tier == "external" and live_visibility != "own":
+                require_monitor_publish_visibility(
+                    caller_tier,
+                    live_visibility,
+                )
+            if share_public and verify_public_authority is not None:
+                if is_dalton_local_auth_enabled():
+                    if caller_tier != "admin":
+                        from src.dalton.monitors.service import (
+                            PUBLIC_PERMISSION_LOST_MESSAGE,
+                            PublicAuthorityLostError,
+                        )
+
+                        raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
+                else:
+                    await _call_with_optional_conn(
+                        verify_public_authority, caller_uid, conn=cur_conn
+                    )
+            require_monitor_publish_visibility(
+                caller_tier,
+                live_visibility,
+            )
+        elif new_owner_user_id is not None and str(new_owner_user_id) != locked_owner:
+            raise_external_member_forbidden("无权重新发布此监控面板")
+
+        if not is_company_system_user(effective_owner) and (
+            caller_user_id is None or str(effective_owner) != str(caller_user_id)
+        ):
+            live_tier = live_tiers[str(effective_owner)]
+            if live_tier == "external" and live_visibility != "own":
+                require_monitor_publish_visibility(
+                    live_tier,
+                    live_visibility,
+                )
+            if share_public and verify_public_authority is not None:
+                if is_dalton_local_auth_enabled():
+                    if live_tier != "admin":
+                        from src.dalton.monitors.service import (
+                            PUBLIC_PERMISSION_LOST_MESSAGE,
+                            PublicAuthorityLostError,
+                        )
+
+                        raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
+                else:
+                    await _call_with_optional_conn(
+                        verify_public_authority, effective_owner, conn=cur_conn
+                    )
+            require_monitor_publish_visibility(
+                live_tier,
+                live_visibility,
+            )
 
     if read_basis is not None:
         read_basis.check(locked)
@@ -999,6 +1293,7 @@ async def commit_monitor_version_tx(
     left_out_files: list[str] | None = None,
     run_id: str | None = None,
     new_owner_user_id: str | None = None,
+    caller_user_id: str | None = None,
     verify_public_authority: Callable[[str], Awaitable[None]] | None = None,
     check_pending_outbound_confirm: bool = False,
     reject_if_pending_outbound_confirm: bool = False,
@@ -1015,6 +1310,7 @@ async def commit_monitor_version_tx(
                     SELECT monitor_id::text AS monitor_id,
                            visibility,
                            owner_user_id,
+                           source_kind,
                            title,
                            published_seq
                       FROM dalton_monitors
@@ -1067,6 +1363,7 @@ async def commit_monitor_version_tx(
                     left_out_files=left_out_files,
                     run_id=run_id,
                     new_owner_user_id=new_owner_user_id,
+                    caller_user_id=caller_user_id,
                     verify_public_authority=verify_public_authority,
                 )
     return loaded, result, False
@@ -1252,7 +1549,16 @@ async def delete_monitor_tx(
                 row = await cur.fetchone()
                 if row is None:
                     return False
-                caller_tier = await tier_lookup(caller_id)
+                from src.dalton.settings import is_dalton_local_auth_enabled
+
+                if (
+                    resolve_caller_tier is None or resolve_caller_tier is get_user_tier
+                ) and is_dalton_local_auth_enabled():
+                    caller_tier = await _resolve_live_tier_in_cur(cur, caller_id)
+                else:
+                    caller_tier = await _call_with_optional_conn(
+                        tier_lookup, caller_id, conn=getattr(cur, "connection", None)
+                    )
                 if not can_manage_monitor_fields(
                     owner_user_id=str(row["owner_user_id"]),
                     visibility=row["visibility"],

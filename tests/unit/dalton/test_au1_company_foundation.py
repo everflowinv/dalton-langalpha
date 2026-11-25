@@ -399,6 +399,12 @@ async def test_company_tier_and_no_workspace_sharing_expansion(
     # is_internal_or_admin remains strictly human internal/admin only.
     assert await access_tiers.is_internal_or_admin(COMPANY_SYSTEM_USER_ID) is False
 
+    # Exercise Supabase multi-user roster tier checks (single-user OSS mode short-circuits
+    # non-company users to 'admin' per external-member-permissions Decision 8).
+    from src.config import settings as app_settings
+
+    monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
     monkeypatch.setattr(
         access_tiers,
         "is_invite_pm",

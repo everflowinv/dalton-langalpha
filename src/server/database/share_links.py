@@ -216,12 +216,28 @@ async def set_private(code: str) -> Optional[ShareLink]:
 
 
 async def list_shared(workspace_id: str) -> list[ShareLink]:
+    # DALTON-HOOK(monitors): include historical public monitor artifacts with
+    # shared_at IS NULL when Dalton is enabled, reusing full {_COLUMNS}.
+    from src.dalton.settings import is_dalton_enabled
+
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                f"SELECT {_COLUMNS} FROM share_links l "
-                "WHERE l.workspace_id = %s AND l.shared_at IS NOT NULL "
-                "ORDER BY l.shared_at DESC",
-                (workspace_id,),
-            )
+            if not is_dalton_enabled():
+                await cur.execute(
+                    f"SELECT {_COLUMNS} FROM share_links l "
+                    "WHERE l.workspace_id = %s AND l.shared_at IS NOT NULL "
+                    "ORDER BY l.shared_at DESC",
+                    (workspace_id,),
+                )
+            else:
+                await cur.execute(
+                    f"SELECT {_COLUMNS} "
+                    "FROM share_links l "
+                    "LEFT JOIN dalton_monitors m "
+                    "  ON m.artifact_id = l.artifact_id AND m.visibility = 'public' "
+                    "WHERE l.workspace_id = %s "
+                    "  AND (l.shared_at IS NOT NULL OR m.monitor_id IS NOT NULL) "
+                    "ORDER BY COALESCE(l.shared_at, m.updated_at, l.created_at) DESC",
+                    (workspace_id,),
+                )
             return [_link(r) for r in await cur.fetchall()]

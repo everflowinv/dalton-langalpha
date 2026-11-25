@@ -950,6 +950,13 @@ def is_dalton_supabase_auth_enabled() -> bool:
     return app_settings.HOST_MODE == "oss" and get_dalton_auth_mode() == "supabase"
 
 
+def is_dalton_single_user_oss_mode() -> bool:
+    """显式单人回环模式：HOST_MODE == 'oss' 且 DALTON_AUTH_MODE == 'oss'。"""
+    from src.config import settings as app_settings
+
+    return app_settings.HOST_MODE == "oss" and get_dalton_auth_mode() == "oss"
+
+
 def is_dalton_auth_enabled() -> bool:
     """Whether Dalton multi-user authentication (``supabase`` or ``local``) is active in OSS mode."""
     return is_dalton_supabase_auth_enabled() or is_dalton_local_auth_enabled()
@@ -981,11 +988,7 @@ def is_dalton_multiuser_auth_enabled() -> bool:
     Used for public share link & artifact publish role checks independent of
     the colleague workspace sharing capability switch.
     """
-    if is_dalton_supabase_auth_enabled():
-        return True
-    from src.config import settings as app_settings
-
-    return app_settings.HOST_MODE == "oss" and get_dalton_auth_mode() == "local"
+    return is_dalton_supabase_auth_enabled() or is_dalton_local_auth_enabled()
 
 
 def get_disabled_providers() -> set[str]:

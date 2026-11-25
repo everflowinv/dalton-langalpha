@@ -10,6 +10,7 @@ from unittest.mock import create_autospec
 import pytest
 
 import src.dalton.settings as settings_mod
+from src.config import settings as app_settings
 from src.dalton.access_tiers import get_user_tier
 from src.server.database import user as user_db
 
@@ -21,6 +22,8 @@ EXTERNAL_USER_ID = "33333333-3333-4333-8333-333333333333"
 @pytest.fixture(autouse=True)
 def _roster(monkeypatch: pytest.MonkeyPatch):
     settings_mod.get_dalton_config.cache_clear()
+    monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
     monkeypatch.setenv("DALTON_PM_USER_IDS", PM_USER_ID)
     monkeypatch.setenv(
         "DALTON_ALLOWED_EMAILS", "internal@example.com,pm@example.com"

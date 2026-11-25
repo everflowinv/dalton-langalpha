@@ -297,9 +297,10 @@ async def _dalton_external_outside(
     """Under Dalton auth, whether an external member is asking about a thread
     that is not theirs in their own workspace: such a thread answers 404 like
     no thread, so its id says nothing (the rule ``require_thread_owner`` keeps)."""
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    # DALTON-HOOK(colleague-dispatch): check external member isolation under both supabase and local auth
+    from src.dalton.settings import is_dalton_multiuser_auth_enabled
 
-    if not is_dalton_supabase_auth_enabled():
+    if not is_dalton_multiuser_auth_enabled():
         return False
     from src.dalton.sharing import get_user_tier
 

@@ -496,6 +496,8 @@ def classify_owner_tier_sync(owner_id: str | None, owner_email: Any = None) -> O
         return "unknown"
     if is_company_system_user(uid):
         return "company"
+    if dalton_settings.is_dalton_single_user_oss_mode():
+        return "admin"
     if is_dalton_local_auth_enabled():
         role = _fetch_local_role_sync(uid)
         return role if role in ("admin", "internal", "external") else "unknown"
@@ -519,6 +521,8 @@ async def get_user_tier(user_id: str | None, *, conn: Any = None) -> UserTier:
         return "external"
     if is_company_system_user(uid):
         return "company"
+    if dalton_settings.is_dalton_single_user_oss_mode():
+        return "admin"
     if is_dalton_local_auth_enabled():
         try:
             from src.dalton.auth.roles import get_user_role
@@ -598,6 +602,8 @@ async def classify_owner_tier(owner_id: str | None, *, conn: Any = None) -> Owne
         return "unknown"
     if is_company_system_user(uid):
         return "company"
+    if dalton_settings.is_dalton_single_user_oss_mode():
+        return "admin"
     if is_dalton_local_auth_enabled():
         try:
             from src.dalton.auth.roles import get_user_role
@@ -660,6 +666,8 @@ async def classify_owner_tiers_batch(
             continue
         if is_company_system_user(uid):
             result[uid] = "company"
+        elif dalton_settings.is_dalton_single_user_oss_mode():
+            result[uid] = "admin"
         else:
             to_query.append(uid)
     if not to_query:

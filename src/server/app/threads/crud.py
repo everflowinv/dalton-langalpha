@@ -310,11 +310,11 @@ async def list_threads(
 async def get_thread(thread_id: str, x_user_id: ReadUserId):
     """Get thread metadata. Used by frontend to resolve workspaceId from threadId."""
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.settings import is_dalton_multiuser_auth_enabled
     from src.server.database.shared_workspaces import is_holder
 
     access = None
-    if is_dalton_supabase_auth_enabled():
+    if is_dalton_multiuser_auth_enabled():
         from src.dalton.sharing import require_thread_access
         from src.server.database.conversation import get_thread_auth_meta
 

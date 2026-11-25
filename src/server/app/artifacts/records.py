@@ -268,10 +268,10 @@ async def _require_admin_for_public_publish(user_id: str) -> None:
     if not is_dalton_multiuser_auth_enabled() and tier_fn is _default_get_user_tier:
         return
     if await tier_fn(user_id) != "admin":
-        raise HTTPException(
-            status_code=403,
-            detail="仅管理员可公开分享文件，请通过监控面板发布",
-        )
+        # DALTON-HOOK(monitors): return unified structured 403 payload for non-admin public publish
+        from src.dalton.auth_guards import raise_admin_required
+
+        raise_admin_required("仅管理员可公开分享文件，请通过监控面板发布")
 
 
 async def _workspace_path(
@@ -367,10 +367,13 @@ async def set_artifact_kept(
     refused leaves the record as it was.
     """
     artifact, access = await reached(artifact_id, x_user_id)
-    # DALTON-HOOK(monitors): enabling kept on an already-public artifact widens
-    # automatic cuts to all walked dependencies; require an active admin.
-    if body.kept and artifact.shared:
-        await _require_admin_for_public_publish(x_user_id)
+    if body.kept:
+        # DALTON-HOOK(external-share-guard): external members cannot enable kept auto-versioning
+        await _require_non_external_for_publish(x_user_id)
+        # DALTON-HOOK(monitors): enabling kept on an already-public artifact widens
+        # automatic cuts to all walked dependencies; require an active admin.
+        if artifact.shared:
+            await _require_admin_for_public_publish(x_user_id)
     with db_errors(), _snapshot_errors():
         if body.kept:
             artifact = await snapshot.keep(
@@ -425,6 +428,8 @@ async def bind_artifact(
     # DALTON-HOOK(artifact-publishing-off): no new comment settings while the
     # deployment keeps file comments off; DELETE stays open (cleanup).
     _refuse_publishing_disabled()
+    # DALTON-HOOK(external-share-guard): external members cannot bind comment threads
+    await _require_non_external_for_publish(x_user_id)
     _, access = await reached(artifact_id, x_user_id)
     with db_errors():
         artifact = await artifacts_db.bind(
@@ -440,6 +445,8 @@ async def bind_artifact(
 async def unbind_artifact(
     artifact_id: str, x_user_id: CurrentUserId
 ) -> ArtifactResponse:
+    # DALTON-HOOK(external-share-guard): external members cannot unbind comment threads
+    await _require_non_external_for_publish(x_user_id)
     _, access = await reached(artifact_id, x_user_id)
     with db_errors():
         artifact = await artifacts_db.unbind(
@@ -638,6 +645,14 @@ async def set_audience(
     shared link is turning on a public link (``public_links``). Holds on every
     visitor's next request; a member's grant opens nothing once the link opens
     to anyone, and an anonymous one nothing once it opens to members."""
+    # DALTON-HOOK(artifact-publishing-off): changing link audience is part of the
+    # publish surface — refused while publishing is disabled.
+    _refuse_publishing_disabled()
+    # DALTON-HOOK(external-share-guard): external members cannot change share audience
+    await _require_non_external_for_publish(x_user_id)
+    # DALTON-HOOK(monitors): setting public audience requires admin in Dalton multi-user mode
+    if body.audience == PUBLIC:
+        await _require_admin_for_public_publish(x_user_id)
     artifact, access = await reached(artifact_id, x_user_id)
     owner_id = access.owner_id
     await refuse_link_change(access)
@@ -677,9 +692,17 @@ async def unshare_artifact(
     _, access = await reached(artifact_id, x_user_id)
     await refuse_link_change(access)
     with db_errors():
-        artifact = await artifacts_db.unshare(
-            user_id=access.owner_id, artifact_id=path_id(artifact_id)
-        )
+        # DALTON-HOOK(monitors): atomically downgrade any public monitor to 'own' when unsharing
+        from src.dalton.settings import is_dalton_enabled
+
+        if is_dalton_enabled():
+            artifact = await artifacts_db.unshare_artifact_and_downgrade_public_monitor(
+                user_id=access.owner_id, artifact_id=path_id(artifact_id)
+            )
+        else:
+            artifact = await artifacts_db.unshare(
+                user_id=access.owner_id, artifact_id=path_id(artifact_id)
+            )
     snapshot.record_unshared(x_user_id, artifact)
     return await _changed(access.owner_id, artifact, x_user_id)
 

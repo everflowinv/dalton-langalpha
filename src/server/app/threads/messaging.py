@@ -37,8 +37,6 @@ from src.server.services.shared_workspaces.access import (
     ThreadWatch,
     thread_access,
 )
-
-_DEFAULT_THREAD_ACCESS = thread_access
 from src.server.services.shared_workspaces.turn import TurnIdentity
 from src.server.services.shared_workspaces.viewer import name_steer_senders, name_turn_senders
 from src.server.database.shared_workspaces import is_holder
@@ -70,6 +68,8 @@ from src.observability import (
 from src.server.app import setup
 
 from ._deps import SSE_HEADERS, _get_service_token, _track_task, logger, router
+
+_DEFAULT_THREAD_ACCESS = thread_access  # DALTON-HOOK(colleague-dispatch)
 
 
 def _automation_configurable(request: ChatRequest) -> Optional[dict]:
@@ -1447,10 +1447,10 @@ async def replay_thread_messages(
             is_non_owner_reader = False
         else:
             # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-            from src.dalton.settings import is_dalton_supabase_auth_enabled
+            from src.dalton.settings import is_dalton_multiuser_auth_enabled
 
             is_non_owner_reader = False
-            if is_dalton_supabase_auth_enabled():
+            if is_dalton_multiuser_auth_enabled():
                 from src.dalton.sharing import require_thread_access
 
                 # DALTON-HOOK(colleague-dispatch): pass both thread owner_id and workspace_owner_id to require_thread_access.
@@ -1607,10 +1607,10 @@ async def get_thread_status(
             await thread_access(thread_id, x_user_id, meta=meta)
     else:
         # --- DALTON-HOOK(team-sharing): begin ---
-        from src.dalton.settings import is_dalton_supabase_auth_enabled
+        from src.dalton.settings import is_dalton_multiuser_auth_enabled
 
         is_non_owner_reader = False
-        if is_dalton_supabase_auth_enabled():
+        if is_dalton_multiuser_auth_enabled():
             from src.dalton.sharing import require_thread_reader
 
             # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id to require_thread_reader.

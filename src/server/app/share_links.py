@@ -84,10 +84,10 @@ async def require_non_external_for_share(user_id: str | None) -> None:
     if not multiuser_on and tier_fn is _default_get_user_tier:
         return
     if await tier_fn(user_id) == "external":
-        raise HTTPException(
-            status_code=403,
-            detail=EXTERNAL_SHARE_FORBIDDEN_DETAIL,
-        )
+        # DALTON-HOOK(external-share-guard): return unified structured 403 payload
+        from src.dalton.auth_guards import raise_external_member_forbidden
+
+        raise_external_member_forbidden(EXTERNAL_SHARE_FORBIDDEN_DETAIL)
 
 router = APIRouter(prefix="/api/v1/workspaces", tags=["Share Links"])
 owner_router = APIRouter(prefix="/api/v1/share-links", tags=["Share Links"])
@@ -220,9 +220,17 @@ async def update_share_link(
             )
         await refuse_link_change(access)
         try:
-            artifact = await artifacts_db.unshare(
-                user_id=owner_id, artifact_id=link.artifact_id or ""
-            )
+            # DALTON-HOOK(monitors): atomically downgrade any public monitor to 'own' when unsharing
+            from src.dalton.settings import is_dalton_enabled
+
+            if is_dalton_enabled():
+                artifact = await artifacts_db.unshare_artifact_and_downgrade_public_monitor(
+                    user_id=owner_id, artifact_id=link.artifact_id or ""
+                )
+            else:
+                artifact = await artifacts_db.unshare(
+                    user_id=owner_id, artifact_id=link.artifact_id or ""
+                )
         except artifacts_db.ArtifactNotFound:
             raise HTTPException(status_code=404, detail="Share link not found") from None
         record_unshared(x_user_id, artifact)

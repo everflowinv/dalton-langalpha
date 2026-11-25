@@ -3463,9 +3463,12 @@ def test_outbound_deliveries_progress_steers_recover_automation_and_weixin(
 
     # §3.1 (2): Admin overview restricts non-admin with 403; personal QR start is open to team members
     channel_test_env["current_web_user"]["user_id"] = "u-alice"
-    assert (
-        client.get("/api/v1/dalton/channels/weixin/admin/overview").status_code == 403
-    )
+    r_admin_denied = client.get("/api/v1/dalton/channels/weixin/admin/overview")
+    assert r_admin_denied.status_code == 403
+    assert r_admin_denied.json()["detail"] == {
+        "code": "admin_required",
+        "message": "Only admin users can manage team Weixin channel settings.",
+    }
 
     async def _fake_proxy(
         method: str, subpath: str, *, user_id: str, **kwargs: Any
