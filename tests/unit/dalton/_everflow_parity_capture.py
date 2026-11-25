@@ -495,7 +495,7 @@ def _collect_dalton_skills_visibility() -> dict[str, dict[str, Any]]:
     disk_skills = sorted(
         p.name for p in DALTON_SKILLS_DIR.iterdir() if p.is_dir() and not p.name.startswith(".")
     )
-    assert len(disk_skills) == 51, f"Expected 51 Dalton skills on disk, got {len(disk_skills)}"
+    assert len(disk_skills) == 52, f"Expected 52 Dalton skills on disk, got {len(disk_skills)}"
     assert sorted(DALTON_SKILL_DEFINITIONS) == disk_skills
 
     enabled_registry = get_skill_registry()
@@ -517,11 +517,11 @@ def _collect_dalton_skills_visibility() -> dict[str, dict[str, Any]]:
 
 
 def _assemble_all_dalton_skills_fulltext() -> str:
-    """Assemble full text of all 51 Dalton skills from repo dirs only (never ~/.ptc-agent)."""
+    """Assemble full text of all 52 Dalton skills from repo dirs only (never ~/.ptc-agent)."""
     disk_skills = sorted(
         p.name for p in DALTON_SKILLS_DIR.iterdir() if p.is_dir() and not p.name.startswith(".")
     )
-    assert len(disk_skills) == 51
+    assert len(disk_skills) == 52
     repo_skill_dirs = [str(DALTON_SKILLS_DIR)]
 
     sections: list[str] = []
