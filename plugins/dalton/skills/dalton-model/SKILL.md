@@ -36,6 +36,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 **第 2 步　读材料**
 - 公司最近的年报和季报（美股年报 10-K、季报 10-Q、外国发行人年报 20-F，或港股、A 股定期报告）：分部披露、KPI、管理层指引、股东回报计划。
+- 公司历次业绩新闻稿和业绩会给出的季度 / 全年指引，以及之后的实际值：记进模型的指引记录（做法见 `forecast-rules.md`「管理层指引」），用来判断公司给指引偏保守还是偏乐观。
 - 主要卖方报告或模型：他们拆哪些驱动、市场在争论什么、一致预期大概在哪里。
 - 维护原模型时：读懂原模型的工作表结构、哪些行是公式、用什么驱动预测、哪些地方相互勾稽、格式习惯。
 
@@ -51,14 +52,14 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - 重算公式：运行 `python3 .agents/skills/xlsx/scripts/recalc.py <新版本模型路径>` 重算并回写缓存值（只读核查原模型时复制到临时文件重算）。
 - 扫描核对：运行 `python3 .agents/skills/dalton-model/scripts/model_scan.py <新版本模型路径>`，逐条检查输出的预测期数字常数、可能的期间错配、外部链接与插件函数、`#REF!`（断裂引用错误）、循环引用及重算错误。属问题的修改模型并重新重算；属合理建模处理的在变更记录写明原因。
 - 自己再核对几件事：年度 = 季度汇总是否成立；集团利润与分部之和能否对上（对不上的差额是什么）；现金和股本的滚存是否连贯；EPS 与净利润、股数是否一致。
-- 基础检查：金额单位一致（千还是百万）、币种一致（人民币报表与美元 ADS EPS 的换算）、每股还是每 ADS；估值页（如有）的目标年份、倍数对应的 EPS、净现金已指向更新后的预测。
+- 基础检查：金额单位一致（千还是百万）、币种一致（人民币报表与美元 ADS〔美国存托股〕EPS 的换算）、每股普通股还是每份 ADS；估值页（如有）的目标年份、倍数对应的 EPS、净现金已指向更新后的预测。
 
 **第 6 步　对照一致预期与卖方预测**（读取 `.agents/skills/dalton-model/references/sanity-check.md`）
 
 **第 7 步　交付**
 - 保存新版本至 `model/`（如 `model/PDD-model-v03.xlsx`；行业整本按原文件名递增版本或日期）。
-- 登记新版本：先调用 `knowledge_read(doc="models")` 取 `latest_version_no` 作为 `base_version`（无记录时传 `null`），再调用 `knowledge_update(doc="models", ...)` 登记新版本（字段遵循 `dalton-knowledge` 的模型登记 schema：`versions[]` 追加条目，必填 `id`〔形如 `v03`〕、`path`〔形如 `model/PDD-model-v03.xlsx`〕、`created_at`、`reason`，可附 `recalculated` 与 `key_outputs`，并将 `current` 指向新版本 `id`）。`python3 .agents/skills/dalton-model/scripts/model_style.py lineage ...` 写出的 `model_lineage.json` 只是附加的普通记录（记录输入输出路径与哈希），不代替知识层登记。
-  - `knowledge_update(doc="models", base_version=..., ops=[...])` 的 `ops` 形状：`[{"op": "append", "path": "/versions", "value": {"id": "v03", "path": "model/PDD-model-v03.xlsx", "created_at": "...", "reason": "...", "recalculated": true}}, {"op": "set", "path": "/current", "value": "v03"}]`；工作区第一次登记模型（`knowledge_read` 显示还没有 `models` 文档）时，改用一条 `create`：`base_version=null`，`ops=[{"op": "create", "path": "/", "value": {"schema_version": 1, "versions": [{...第一版条目...}], "current": "v01"}}]`（字段名以 `dalton-knowledge` 的模型 schema 为准）（完整操作语法与写入样例见 `.agents/skills/dalton-knowledge/SKILL.md` 与 `.agents/skills/dalton-knowledge/references/structured-write-example.md`）。
+- 登记新版本：先调用 `knowledge_read(doc="models")` 取 `latest_version_no` 作为 `base_version`（无记录时传 `null`），再调用 `knowledge_update(doc="models", ...)` 登记新版本（字段遵循 `dalton-knowledge` 的模型登记数据结构（schema）：`versions[]` 追加条目，必填 `id`〔形如 `v03`〕、`path`〔形如 `model/PDD-model-v03.xlsx`〕、`created_at`、`reason`，可附 `recalculated` 与 `key_outputs`，并将 `current` 指向新版本 `id`）。`python3 .agents/skills/dalton-model/scripts/model_style.py lineage ...` 写出的 `model_lineage.json` 只是附加的普通记录（记录输入输出路径与哈希），不代替知识层登记。
+  - `knowledge_update(doc="models", base_version=..., ops=[...])` 的 `ops` 形状：`[{"op": "append", "path": "/versions", "value": {"id": "v03", "path": "model/PDD-model-v03.xlsx", "created_at": "...", "reason": "...", "recalculated": true}}, {"op": "set", "path": "/current", "value": "v03"}]`；工作区第一次登记模型（`knowledge_read` 显示还没有 `models` 文档）时，改用一条 `create`：`base_version=null`，`ops=[{"op": "create", "path": "/", "value": {"schema_version": 1, "versions": [{...第一版条目...}], "current": "v01"}}]`（完整操作语法与写入样例见 `.agents/skills/dalton-knowledge/SKILL.md` 与 `.agents/skills/dalton-knowledge/references/structured-write-example.md`）。
 - 更新变更记录（无 `README & Changelog` 工作表时新建并放在最前面）：写明版本号、日期、所基于的原模型文件、补充的实际值、新增期间、修改的关键驱动假设及理由、结构调整、与一致预期的主要差异及理由、扫描提示中保留不改的重要条目及原因。
 - 回复用户时用几句话说清：关键预测（收入、利润、EPS）、和上一版相比变了什么、和一致预期差在哪里。
 

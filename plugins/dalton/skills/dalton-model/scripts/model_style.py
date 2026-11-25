@@ -983,12 +983,14 @@ def _count_media_by_ext(media_paths: list[str]) -> dict[str, int]:
 
 
 def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str, Any]:
-    """Compare OOXML package parts and per-sheet XML extensions between two workbooks.
+    """Compare OOXML part paths and per-sheet XML rule counts between two workbooks.
 
-    Read-only advisory tool: reports removed and added media/drawings/charts/
-    externalLinks/``<extLst>``/x14 conditional formatting/data validations/sparklines
-    separately without cancelling additions against removals, and lists drawing/media
-    parts by their original zip paths (``xl/drawings/...``, ``xl/media/...``).
+    Read-only advisory tool: compares package/sheet part paths (media, drawings,
+    charts, externalLinks, pivot tables, slicers, comments, VBA) and per-sheet
+    rule counts (``<extLst>``, x14 conditional formatting, data validations,
+    sparklines) separately without cancelling additions against removals.
+    Equal-count rule replacements on the same sheet and content changes inside an
+    unchanged part path are outside the scope of this comparison.
     """
     p_orig = Path(orig_path)
     p_new = Path(new_path)
@@ -1115,16 +1117,25 @@ def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str
     affected_by_type: dict[str, list[str]] = defaultdict(list)
     added_sheets_by_type: dict[str, list[str]] = defaultdict(list)
 
+    removed_media_set = set(pkg_parts_removed.get("media", ()))
+    removed_drawings_set = set(pkg_parts_removed.get("drawings", ()))
+    removed_charts_set = set(pkg_parts_removed.get("charts", ()))
+    removed_pivots_set = set(pkg_parts_removed.get("pivot_tables", ()))
+    added_media_set = set(pkg_parts_added.get("media", ()))
+    added_drawings_set = set(pkg_parts_added.get("drawings", ()))
+    added_charts_set = set(pkg_parts_added.get("charts", ()))
+    added_pivots_set = set(pkg_parts_added.get("pivot_tables", ()))
+
     for title in inv_orig["sheet_order"]:
         os_i = orig_sheets[title]
         if title not in new_sheets:
-            if os_i["media"]:
+            if set(os_i["media"]) & removed_media_set:
                 affected_by_type["media"].append(title)
-            if os_i["drawings"]:
+            if set(os_i["drawings"]) & removed_drawings_set:
                 affected_by_type["drawings"].append(title)
-            if os_i["charts"]:
+            if set(os_i["charts"]) & removed_charts_set:
                 affected_by_type["charts"].append(title)
-            if os_i["pivots"]:
+            if set(os_i["pivots"]) & removed_pivots_set:
                 affected_by_type["pivot_tables"].append(title)
             if os_i["has_extlst"]:
                 affected_by_type["extlst"].append(title)
@@ -1234,13 +1245,13 @@ def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str
 
     for title in sheets_added:
         ns_i = new_sheets[title]
-        if ns_i["media"]:
+        if set(ns_i["media"]) & added_media_set:
             added_sheets_by_type["media"].append(title)
-        if ns_i["drawings"]:
+        if set(ns_i["drawings"]) & added_drawings_set:
             added_sheets_by_type["drawings"].append(title)
-        if ns_i["charts"]:
+        if set(ns_i["charts"]) & added_charts_set:
             added_sheets_by_type["charts"].append(title)
-        if ns_i["pivots"]:
+        if set(ns_i["pivots"]) & added_pivots_set:
             added_sheets_by_type["pivot_tables"].append(title)
         if ns_i["has_extlst"]:
             added_sheets_by_type["extlst"].append(title)
@@ -1265,7 +1276,8 @@ def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str
         return f"{shown} 等共 {len(parts)} 个" if len(parts) > limit else shown
 
     summary_clauses: list[str] = []
-    if pkg_losses.get("media") or affected_by_type.get("media"):
+    media_lost_cnt = pkg_losses.get("media") or sum(s.get("media_lost", 0) for s in sheet_losses)
+    if media_lost_cnt > 0:
         removed_media = pkg_parts_removed.get("media") or sorted(
             {p for s in sheet_losses for p in s.get("media_removed", ())}
         )
@@ -1275,31 +1287,30 @@ def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str
         inner = "；".join(p for p in (ext_txt, parts_txt) if p)
         detail = f"（{inner}）" if inner else ""
         sh_txt = _fmt_sheets(affected_by_type.get("media", []))
-        cnt = pkg_losses.get("media") or sum(s.get("media_lost", 0) for s in sheet_losses)
-        summary_clauses.append(f"嵌入图片减少 {cnt} 张{detail}" + (f"，{sh_txt}" if sh_txt else ""))
-    if pkg_losses.get("drawings") or affected_by_type.get("drawings"):
+        summary_clauses.append(f"嵌入图片减少 {media_lost_cnt} 张{detail}" + (f"，{sh_txt}" if sh_txt else ""))
+    drawings_lost_cnt = pkg_losses.get("drawings") or sum(s.get("drawings_lost", 0) for s in sheet_losses)
+    if drawings_lost_cnt > 0:
         removed_drawings = pkg_parts_removed.get("drawings") or sorted(
             {p for s in sheet_losses for p in s.get("drawings_removed", ())}
         )
         parts_txt = _fmt_parts(removed_drawings)
         detail = f"（{parts_txt}）" if parts_txt else ""
         sh_txt = _fmt_sheets(affected_by_type.get("drawings", []))
-        cnt = pkg_losses.get("drawings") or sum(s.get("drawings_lost", 0) for s in sheet_losses)
-        summary_clauses.append(f"绘图部件减少 {cnt} 个{detail}" + (f"，{sh_txt}" if sh_txt else ""))
-    if pkg_losses.get("charts") or affected_by_type.get("charts"):
+        summary_clauses.append(f"绘图部件减少 {drawings_lost_cnt} 个{detail}" + (f"，{sh_txt}" if sh_txt else ""))
+    charts_lost_cnt = pkg_losses.get("charts") or sum(s.get("charts_lost", 0) for s in sheet_losses)
+    if charts_lost_cnt > 0:
         removed_charts = pkg_parts_removed.get("charts") or sorted(
             {p for s in sheet_losses for p in s.get("charts_removed", ())}
         )
         parts_txt = _fmt_parts(removed_charts)
         detail = f"（{parts_txt}）" if parts_txt else "（xl/charts）"
         sh_txt = _fmt_sheets(affected_by_type.get("charts", []))
-        cnt = pkg_losses.get("charts") or sum(s.get("charts_lost", 0) for s in sheet_losses)
-        summary_clauses.append(f"图表减少 {cnt} 个{detail}" + (f"，{sh_txt}" if sh_txt else ""))
-    if pkg_losses.get("x14_cf_total") or affected_by_type.get("x14_conditional_formatting"):
+        summary_clauses.append(f"图表减少 {charts_lost_cnt} 个{detail}" + (f"，{sh_txt}" if sh_txt else ""))
+    x14_lost_cnt = pkg_losses.get("x14_cf_total") or sum(s.get("x14_cf_lost", 0) for s in sheet_losses)
+    if x14_lost_cnt > 0:
         sh_list = affected_by_type.get("x14_conditional_formatting", [])
-        n_rules = pkg_losses.get("x14_cf_total", len(sh_list))
         sh_txt = _fmt_sheets(sh_list)
-        summary_clauses.append(f"扩展条件格式（x14）减少 {n_rules} 处" + (f"，{sh_txt}" if sh_txt else ""))
+        summary_clauses.append(f"扩展条件格式（x14）减少 {x14_lost_cnt} 处" + (f"，{sh_txt}" if sh_txt else ""))
     elif pkg_losses.get("sheets_with_extlst") or affected_by_type.get("extlst"):
         sh_list = affected_by_type.get("extlst", [])
         sh_txt = _fmt_sheets(sh_list)
@@ -1310,10 +1321,10 @@ def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str
     if pkg_losses.get("sparklines_total"):
         sh_txt = _fmt_sheets(affected_by_type.get("sparklines", []))
         summary_clauses.append(f"迷你图（sparkline）减少 {pkg_losses['sparklines_total']} 组" + (f"，{sh_txt}" if sh_txt else ""))
-    if pkg_losses.get("pivot_tables") or affected_by_type.get("pivot_tables"):
-        cnt = pkg_losses.get("pivot_tables") or sum(s.get("pivots_lost", 0) for s in sheet_losses)
+    pivots_lost_cnt = pkg_losses.get("pivot_tables") or sum(s.get("pivots_lost", 0) for s in sheet_losses)
+    if pivots_lost_cnt > 0:
         sh_txt = _fmt_sheets(affected_by_type.get("pivot_tables", []))
-        summary_clauses.append(f"数据透视表减少 {cnt} 个" + (f"，{sh_txt}" if sh_txt else ""))
+        summary_clauses.append(f"数据透视表减少 {pivots_lost_cnt} 个" + (f"，{sh_txt}" if sh_txt else ""))
     if pkg_losses.get("slicers"):
         summary_clauses.append(f"切片器减少 {pkg_losses['slicers']} 个")
     if pkg_losses.get("threaded_comments"):
@@ -1326,7 +1337,8 @@ def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str
         summary_clauses.append(f"原工作表被移除：{'、'.join(sheets_removed)}")
 
     addition_clauses: list[str] = []
-    if pkg_additions.get("media") or added_sheets_by_type.get("media"):
+    media_added_cnt = pkg_additions.get("media") or sum(s.get("media_added", 0) for s in sheet_additions)
+    if media_added_cnt > 0:
         added_media = pkg_parts_added.get("media") or sorted(
             {p for s in sheet_additions for p in s.get("media_added_parts", ())}
         )
@@ -1336,31 +1348,30 @@ def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str
         inner = "；".join(p for p in (ext_txt, parts_txt) if p)
         detail = f"（{inner}）" if inner else ""
         sh_txt = _fmt_sheets(added_sheets_by_type.get("media", []))
-        cnt = pkg_additions.get("media") or sum(s.get("media_added", 0) for s in sheet_additions)
-        addition_clauses.append(f"嵌入图片新增 {cnt} 张{detail}" + (f"，{sh_txt}" if sh_txt else ""))
-    if pkg_additions.get("drawings") or added_sheets_by_type.get("drawings"):
+        addition_clauses.append(f"嵌入图片新增 {media_added_cnt} 张{detail}" + (f"，{sh_txt}" if sh_txt else ""))
+    drawings_added_cnt = pkg_additions.get("drawings") or sum(s.get("drawings_added", 0) for s in sheet_additions)
+    if drawings_added_cnt > 0:
         added_drawings = pkg_parts_added.get("drawings") or sorted(
             {p for s in sheet_additions for p in s.get("drawings_added_parts", ())}
         )
         parts_txt = _fmt_parts(added_drawings)
         detail = f"（{parts_txt}）" if parts_txt else ""
         sh_txt = _fmt_sheets(added_sheets_by_type.get("drawings", []))
-        cnt = pkg_additions.get("drawings") or sum(s.get("drawings_added", 0) for s in sheet_additions)
-        addition_clauses.append(f"绘图部件新增 {cnt} 个{detail}" + (f"，{sh_txt}" if sh_txt else ""))
-    if pkg_additions.get("charts") or added_sheets_by_type.get("charts"):
+        addition_clauses.append(f"绘图部件新增 {drawings_added_cnt} 个{detail}" + (f"，{sh_txt}" if sh_txt else ""))
+    charts_added_cnt = pkg_additions.get("charts") or sum(s.get("charts_added", 0) for s in sheet_additions)
+    if charts_added_cnt > 0:
         added_charts = pkg_parts_added.get("charts") or sorted(
             {p for s in sheet_additions for p in s.get("charts_added_parts", ())}
         )
         parts_txt = _fmt_parts(added_charts)
         detail = f"（{parts_txt}）" if parts_txt else "（xl/charts）"
         sh_txt = _fmt_sheets(added_sheets_by_type.get("charts", []))
-        cnt = pkg_additions.get("charts") or sum(s.get("charts_added", 0) for s in sheet_additions)
-        addition_clauses.append(f"图表新增 {cnt} 个{detail}" + (f"，{sh_txt}" if sh_txt else ""))
-    if pkg_additions.get("x14_cf_total") or added_sheets_by_type.get("x14_conditional_formatting"):
+        addition_clauses.append(f"图表新增 {charts_added_cnt} 个{detail}" + (f"，{sh_txt}" if sh_txt else ""))
+    x14_added_cnt = pkg_additions.get("x14_cf_total") or sum(s.get("x14_cf_added", 0) for s in sheet_additions)
+    if x14_added_cnt > 0:
         sh_list = added_sheets_by_type.get("x14_conditional_formatting", [])
-        n_rules = pkg_additions.get("x14_cf_total", len(sh_list))
         sh_txt = _fmt_sheets(sh_list)
-        addition_clauses.append(f"扩展条件格式（x14）新增 {n_rules} 处" + (f"，{sh_txt}" if sh_txt else ""))
+        addition_clauses.append(f"扩展条件格式（x14）新增 {x14_added_cnt} 处" + (f"，{sh_txt}" if sh_txt else ""))
     elif pkg_additions.get("sheets_with_extlst") or added_sheets_by_type.get("extlst"):
         sh_list = added_sheets_by_type.get("extlst", [])
         sh_txt = _fmt_sheets(sh_list)
@@ -1371,10 +1382,10 @@ def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str
     if pkg_additions.get("sparklines_total"):
         sh_txt = _fmt_sheets(added_sheets_by_type.get("sparklines", []))
         addition_clauses.append(f"迷你图（sparkline）新增 {pkg_additions['sparklines_total']} 组" + (f"，{sh_txt}" if sh_txt else ""))
-    if pkg_additions.get("pivot_tables") or added_sheets_by_type.get("pivot_tables"):
-        cnt = pkg_additions.get("pivot_tables") or sum(s.get("pivots_added", 0) for s in sheet_additions)
+    pivots_added_cnt = pkg_additions.get("pivot_tables") or sum(s.get("pivots_added", 0) for s in sheet_additions)
+    if pivots_added_cnt > 0:
         sh_txt = _fmt_sheets(added_sheets_by_type.get("pivot_tables", []))
-        addition_clauses.append(f"数据透视表新增 {cnt} 个" + (f"，{sh_txt}" if sh_txt else ""))
+        addition_clauses.append(f"数据透视表新增 {pivots_added_cnt} 个" + (f"，{sh_txt}" if sh_txt else ""))
     if pkg_additions.get("slicers"):
         addition_clauses.append(f"切片器新增 {pkg_additions['slicers']} 个")
     if pkg_additions.get("threaded_comments"):
@@ -1388,12 +1399,14 @@ def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str
 
     has_losses = bool(summary_clauses)
     has_additions = bool(addition_clauses)
+    scope_note = "（仅比较部件路径和各表的规则数量；数量相同的规则替换、同一部件内的内容变化超出比较范围。）"
     if has_losses:
-        summary = "部件对比发现新文件相对原文件有以下减少：" + "；".join(summary_clauses) + "。"
+        summary = "部件路径与各表规则数量对比发现新文件相对原文件有以下减少：" + "；".join(summary_clauses) + "。"
     else:
-        summary = "部件对比完成：新文件未发现图片、绘图、图表、扩展条件格式（<extLst>/x14）、数据验证或其他关键部件丢失。"
+        summary = "部件路径与各表规则数量对比完成：未发现图片、绘图、图表、扩展条件格式（<extLst>/x14）、数据验证或其他关键部件的路径缺失或数量减少。"
     if addition_clauses:
         summary += " 新增部分：" + "；".join(addition_clauses) + "。"
+    summary += scope_note
 
     return {
         "status": "ok",

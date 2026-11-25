@@ -10,10 +10,10 @@
 2. **新建模型或找不到参照**：用下表的默认格式。
 
 `.agents/skills/dalton-model/scripts/model_style.py` 提供两类工具：
-- 命令行提取格式画像：`python3 .agents/skills/dalton-model/scripts/model_style.py profile <原模型.xlsx> --out style_profile.json`，输出全表默认摘要与各工作表观察到的 `fonts_observed`、`fills_observed`、`section_fills`、`header_fill`、`blocks`（各分节标题行号与底色）等。维护原表时，先用 `profile` 输出的 `blocks` 找到原表同类标题行，再用 `clone_period_column_style` 或直接复制参照单元格的完整样式；画像中的 `section_styles` 仅按已知颜色提供默认配色，保留原表自定义分节用途时以 `blocks` 和参照单元格为准。
+- 命令行提取格式画像：`python3 .agents/skills/dalton-model/scripts/model_style.py profile <原模型.xlsx> --out style_profile.json`，输出全表默认摘要与各工作表观察到的 `fonts_observed`、`fills_observed`、`section_fills`、`header_fill`、`blocks`（各分节标题行号与底色）等。维护原模型时，先用 `profile` 输出的 `blocks` 找到当前工作表同类分节标题行，再用 `clone_period_column_style` 或直接复制参照单元格的完整样式；画像中的 `section_styles` 只识别基金默认的三种分节底色，原工作表使用了其他自定义分节颜色时，直接复制 `blocks` 中同类标题格的样式。
 - Python 写入辅助：
   - `clone_period_column_style(ws, src_col, dst_col)`：维护原模型时，把同类期间列的完整样式（含字体、填充、边框、对齐、数字格式、保护属性与列宽）复制到新增列。
-  - `apply_cell_style(cell, role, ..., profile=None, sheet_name=None)`：按 `role` 写格式（传入 `profile` 时采用画像中的字体、字号、表头色与假设样式，以及按已知默认色映射的 `section_styles`；未传画像时用基金默认格式）。
+  - `apply_cell_style`（参数 `cell`、`role`，可选 `profile`、`sheet_name`）：按 `role` 写格式（传入 `profile` 时采用画像中的字体、字号、表头色与假设样式，以及按已知默认色映射的 `section_styles`；未传画像时用基金默认格式）。
 
 `apply_cell_style` 支持的 `role` 名称与对应单元格类型：
 
@@ -21,13 +21,13 @@
 |---|---|---|
 | `"header"` | 第 1 行期间表头与 A1 单位格 | 亮蓝底白字加粗；A1 左对齐，期间列右对齐 |
 | `"historical_actual"` | 历史实际值 | 蓝字、无底色、无边框 |
-| `"historical_estimate"` | 历史估算值 | 蓝字；`hist_est_variant="yellow"` 为浅米黄带细虚线框，`"gray"` 为浅灰 `EDEDED` 无框 |
-| `"driver_assumption"` | 预测驱动假设、**管理层指引等直接输入的金额** | 蓝字、浅米黄底 `FFFFC8`、四边极细虚线（`hair`）边框；百分比传 `is_percent=True` |
+| `"historical_estimate"` | 历史估算值 | 蓝字；`hist_est_variant="yellow"` 为浅米黄底配四边极细点虚线框，`"gray"` 为浅灰 `EDEDED` 无框 |
+| `"driver_assumption"` | 预测驱动假设、**管理层指引等直接输入的金额** | 蓝字、浅米黄底 `FFFFC8`、四边极细点虚线边框（openpyxl〔Python 表格读写库〕边框样式 `hair`）；百分比传 `is_percent=True` |
 | `"external_input"` | 外部静态参考输入（如一致预期对照列、参考股价/汇率） | 蓝字、无底色、无边框 |
 | `"formula"`（或其他未单列值如 `"financial_output"`） | 同表公式、跨表引用、衍生比率、小计/合计 | 配合 `is_link=True`（跨表绿字）、`is_ratio=True`（衍生比率斜体）、`is_total=True`（加粗） |
 | `"source_note"` | 最右备注列的来源和说明 | 红字、无底色 |
 | `"target_price"` | 目标价结果 | 深红加粗 |
-| `"sec_report"` / `"sec_segment"` / `"sec_submodel"` | 报表级 / 分部与 Non-GAAP / 业务子模型分节标题 | 分别对应浅蓝 / 棕色白字 / 桃色分节条 |
+| `"sec_report"` / `"sec_segment"` / `"sec_submodel"` | 报表级 / 分部与 Non-GAAP（非公认会计准则）/ 业务子模型分节标题 | 分别对应浅蓝 / 棕色白字 / 桃色分节条 |
 
 ## 单元格格式表（默认）
 
@@ -36,7 +36,7 @@
 | 单元格类型 | 字色 | 底色 | 字形 | 边框 | 数字格式 | 例子 |
 |---|---|---|---|---|---|---|
 | 历史实际值（公司披露、手工录入） | 蓝 `0000FF` | 无 | 正常 | 无 | 金额格式 | 2Q26 收入 `103,980` |
-| 历史估算（未披露拆分、推算值） | 蓝 `0000FF` | 浅米黄 `FFFFC8` 或浅灰 `EDEDED`（维护原模型时沿用原表浅灰主题色） | 金额正常 / 百分比斜体 | 浅米黄配四边极细点虚线（openpyxl 边框样式 `hair`） | 按指标选金额或百分比格式 | 估算的历史 take rate（货币化率）`3.85%`，备注列 `<GS 1117` |
+| 历史估算（未披露拆分、推算值） | 蓝 `0000FF` | 浅米黄 `FFFFC8` 或浅灰 `EDEDED`（维护原模型时沿用原表浅灰主题色） | 金额正常 / 百分比斜体 | 浅米黄底配四边极细点虚线（`hair`） | 按指标选金额或百分比格式 | 估算的历史 take rate（货币化率）`3.85%`，备注列 `<GS 1117` |
 | 预测驱动假设（增速、take rate、利润率、费用率、税率） | 蓝 `0000FF` | 浅米黄 `FFFFC8` | 百分比斜体；金额正常 | 四边极细点虚线（`hair`） | `0.0%` 或金额格式 | 3Q26E GMV 增速 `12.0%`；`=AZ21+0.3%` 也是驱动假设 |
 | 管理层指引等直接输入的金额（`role="driver_assumption"`） | 蓝 `0000FF` | 浅米黄 `FFFFC8` | 正常 | 四边极细点虚线（`hair`） | 金额格式 | 2027E CapEx（资本开支）指引 `10,000`，备注列写来源 |
 | 同表公式（预测金额、合计、勾稽） | 黑 `000000` | 无 | 正常 | 无 | 金额格式 | `=BA20*BA21` |
@@ -74,7 +74,7 @@
 - **期间标签**：新建模型用历史年度 `2025`、预测年度 `2026E`，历史季度 `2Q26`、预测季度 `3Q26E`。维护原模型时按当前工作表已有表头格式顺延（例如 `2026Q3E`；同一工作簿里不同工作表写法不同时各自沿用）。
 - **分节标题**：新建模型只给 A 列单个单元格涂底色；维护原模型时，涂色范围和各层级配色均沿用当前工作表已有分节。新建模型的默认配色：
   - 报表级（Income statement〔利润表〕、Cash flow statement〔现金流量表〕、Balance sheet〔资产负债表〕、Other disclosure〔其他披露〕）：浅蓝 `99CCFF`，黑字加粗；
-  - Non-GAAP（非公认会计准则）、分部报告、子公司块（例如 JD Health）：棕色 `993300`，白字加粗；
+  - Non-GAAP、分部报告、子公司块（例如 JD Health）：棕色 `993300`，白字加粗；
   - 业务子模型块（例如 Temu、3P、1P）：桃色 `FFCC99`，黑字加粗。
 
 ## 版面

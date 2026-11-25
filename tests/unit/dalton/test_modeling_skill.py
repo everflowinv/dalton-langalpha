@@ -171,7 +171,7 @@ def test_dalton_model_three_capability_combinations_assembly() -> None:
     conv_core = read_assembled_text(conventions_md, capabilities=core_caps)
     assert ".agents/skills/dalton-model/SKILL.md" in conv_core
     est_line = [ln for ln in conv_core.splitlines() if "**卖方一致预期" in ln][0]
-    assert "yf_analysis.get_revenue_estimates" in est_line
+    assert "`yf_analysis`" in est_line and "get_revenue_estimates" in est_line
     assert "yf_fundamentals" not in est_line
     assert "FMP" in est_line
 
@@ -702,6 +702,62 @@ def test_model_style_parts_diff_separates_additions_and_removals_by_part_path(
     assert "xl/drawings/drawing2.xml" in rep["summary"]
     assert "xl/media/image1.png" in rep["summary"]
     assert "xl/media/image2.png" in rep["summary"]
+
+
+def test_model_style_parts_diff_renamed_sheet_with_chart_omits_zero_part_deltas(
+    tmp_path: Path,
+) -> None:
+    drawing_rel_type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing"
+    chart_rel_type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/chart"
+
+    shared_extra = {
+        "xl/drawings/drawing1.xml": b'<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>',
+        "xl/drawings/_rels/drawing1.xml.rels": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            f'<Relationship Id="rId1" Type="{chart_rel_type}" Target="../charts/chart1.xml"/>'
+            "</Relationships>"
+        ).encode("utf-8"),
+        "xl/charts/chart1.xml": b'<c:chartSpace xmlns:c="http://schemas.openxmlformats.org/drawingml/2006/chart"/>',
+    }
+
+    orig = tmp_path / "chart_orig.xlsx"
+    new = tmp_path / "chart_renamed.xlsx"
+
+    _write_minimal_xlsx_zip(
+        orig,
+        sheet_specs=[
+            {"name": "ModelOld", "rels": [(drawing_rel_type, "../drawings/drawing1.xml")]},
+        ],
+        extra_parts=shared_extra,
+    )
+    _write_minimal_xlsx_zip(
+        new,
+        sheet_specs=[
+            {"name": "ModelNew", "rels": [(drawing_rel_type, "../drawings/drawing1.xml")]},
+        ],
+        extra_parts=shared_extra,
+    )
+
+    rep = ms.diff_workbook_parts(orig, new)
+    assert rep["status"] == "ok"
+    assert rep["sheets_removed"] == ["ModelOld"]
+    assert rep["sheets_added"] == ["ModelNew"]
+    assert rep["package_losses"] == {}
+    assert rep["package_additions"] == {}
+    assert rep["affected_sheets_by_type"] == {}
+    assert rep["added_sheets_by_type"] == {}
+    assert "ModelOld" in rep["summary"]
+    assert "ModelNew" in rep["summary"]
+    assert "0 个" not in rep["summary"]
+    assert "0 张" not in rep["summary"]
+    assert "绘图部件减少" not in rep["summary"]
+    assert "图表减少" not in rep["summary"]
+    assert "绘图部件新增" not in rep["summary"]
+    assert "图表新增" not in rep["summary"]
+    assert "部件路径和各表的规则数量" in rep["summary"]
+    assert "数量相同的规则替换" in rep["summary"]
+    assert "同一部件内的内容变化" in rep["summary"]
 
 
 def test_model_lineage_ordinary_bookkeeping_record(tmp_path: Path) -> None:
