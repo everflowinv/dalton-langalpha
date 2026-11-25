@@ -10,6 +10,8 @@ interface ConfirmDialogProps {
   title: string;
   message: string;
   confirmLabel?: string;
+  // DALTON-HOOK(external-share-guard): disable confirm action when parent permission check is confirming or locked
+  confirmDisabled?: boolean;
   onConfirm?: () => void | Promise<void>;
   onOpenChange?: (open: boolean) => void;
   /** Open on the confirm button, so Enter confirms as a native confirm() does. */
@@ -22,13 +24,15 @@ interface ConfirmDialogProps {
 /**
  * Reusable confirmation dialog. Uses color tokens only.
  */
-function ConfirmDialog({ open, title, message, confirmLabel, onConfirm, onOpenChange, focusConfirm = false, surface = 'elevated' }: ConfirmDialogProps) {
+// DALTON-HOOK(external-share-guard): disable confirm action when parent permission check is confirming or locked
+function ConfirmDialog({ open, title, message, confirmLabel, confirmDisabled = false, onConfirm, onOpenChange, focusConfirm = false, surface = 'elevated' }: ConfirmDialogProps) {
   const { t } = useTranslation();
   const confirmRef = React.useRef<HTMLButtonElement>(null);
   // Radix hands focus back to a Dialog.Trigger, and this dialog opens from
   // state without one, so it hands focus back to what held it itself.
   const returnFocusRef = React.useRef<HTMLElement | null>(null);
   const handleConfirm = async () => {
+    if (confirmDisabled) return; // DALTON-HOOK(external-share-guard): guard confirm while disabled
     if (onConfirm) await onConfirm();
     onOpenChange?.(false);
   };
@@ -71,8 +75,10 @@ function ConfirmDialog({ open, title, message, confirmLabel, onConfirm, onOpenCh
           <button
             ref={confirmRef}
             type="button"
+            // DALTON-HOOK(external-share-guard): disable confirm action when parent permission check is confirming or locked
+            disabled={Boolean(confirmDisabled)}
             onClick={handleConfirm}
-            className="px-4 py-1.5 rounded text-sm font-medium hover:opacity-90"
+            className="px-4 py-1.5 rounded text-sm font-medium hover:opacity-90 disabled:opacity-50 disabled:pointer-events-none"
             style={{ backgroundColor: 'var(--color-btn-primary-bg)', color: 'var(--color-btn-primary-text)' }}
           >
             {confirmLabel || t('common.delete')}

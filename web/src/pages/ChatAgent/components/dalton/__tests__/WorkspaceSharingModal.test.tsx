@@ -812,4 +812,79 @@ describe('WorkspaceSharingModal', () => {
       '外部成员无权修改团队记忆',
     );
   });
+
+  it('syncs unedited sharing drafts when /sharing retry succeeds inside an open modal, avoiding spurious sharing PATCH or overwriting cos_access', async () => {
+    const retriedSharing: WorkspaceSharingResponse = {
+      ...STABLE_OWN_SHARING,
+      cos_access: 'hidden',
+      web_access: 'ro',
+      colleague_dispatch_enabled: false,
+      can_edit: true,
+    };
+    const updatedSettings: WorkspaceSettingsResponse = {
+      ...STABLE_OWN_SETTINGS,
+      team_memory_enabled: true,
+    };
+    const updatedSharing: WorkspaceSharingResponse = {
+      ...retriedSharing,
+      web_access: 'rw',
+    };
+
+    h.fetchWorkspaceSharing
+      .mockRejectedValueOnce(new Error('sharing unavailable'))
+      .mockResolvedValueOnce(retriedSharing);
+    h.fetchWorkspaceSettings.mockResolvedValue(STABLE_OWN_SETTINGS);
+    h.updateWorkspaceSettings.mockResolvedValueOnce(updatedSettings);
+    h.updateWorkspaceSharing.mockResolvedValueOnce(updatedSharing);
+
+    const queryClient = createTestQueryClient();
+    renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, { queryClient });
+
+    // Modal can open even when /sharing failed initially (Team Memory loaded + sharing error shown).
+    const trigger = await screen.findByTestId('workspace-sharing-button');
+    fireEvent.click(trigger);
+    expect(await screen.findByTestId('workspace-sharing-load-error')).toBeInTheDocument();
+
+    // Retry /sharing -> drafts must initialize from server response ({ cos: 'hidden', web: 'ro' }).
+    fireEvent.click(screen.getByTestId('workspace-sharing-load-retry'));
+    await waitFor(() => {
+      expect(screen.getByTestId('sharing-cos-hidden')).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByTestId('sharing-web-ro')).toHaveAttribute('aria-pressed', 'true');
+    });
+
+    // Toggling only Team Memory and saving must NOT send a sharing PATCH.
+    fireEvent.click(screen.getByTestId('workspace-team-memory-switch'));
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+    await waitFor(() => {
+      expect(h.updateWorkspaceSettings).toHaveBeenCalledWith(WS_OWN, {
+        team_memory_enabled: true,
+      });
+    });
+    expect(h.updateWorkspaceSharing).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+
+    // Reopen with initial /sharing failure again, retry to { cos: 'hidden', web: 'ro' },
+    // edit only web_access -> 'rw', and verify cos_access stays 'hidden' (never overwritten to 'ro').
+    queryClient.removeQueries({ queryKey: queryKeys.dalton.sharing(WS_OWN) });
+    h.fetchWorkspaceSharing
+      .mockRejectedValueOnce(new Error('sharing unavailable again'))
+      .mockResolvedValueOnce(retriedSharing);
+
+    fireEvent.click(screen.getByTestId('workspace-sharing-button'));
+    expect(await screen.findByTestId('workspace-sharing-load-error')).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId('workspace-sharing-load-retry'));
+    await waitFor(() => {
+      expect(screen.getByTestId('sharing-cos-hidden')).toHaveAttribute('aria-pressed', 'true');
+      expect(screen.getByTestId('sharing-web-ro')).toHaveAttribute('aria-pressed', 'true');
+    });
+
+    fireEvent.click(screen.getByTestId('sharing-web-rw'));
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+    await waitFor(() => {
+      expect(h.updateWorkspaceSharing).toHaveBeenCalledWith(WS_OWN, {
+        cos_access: 'hidden',
+        web_access: 'rw',
+      });
+    });
+  });
 });

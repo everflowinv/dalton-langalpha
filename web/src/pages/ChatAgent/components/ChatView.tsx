@@ -220,11 +220,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const workspaceName = (isHome ? t('agents.chiefOfStaff') : workspaceRecord?.name) || initialWorkspaceName || '';
   // DALTON-HOOK(team-sharing): detect read-only colleague workspace/thread
   const teamReadOnly = useTeamReadOnly(workspaceId, workspaceRecord);
-  // DALTON-HOOK(external-share-guard): unified caller identity for publish and file panel gating
+  // DALTON-HOOK(external-share-guard): unified caller identity for publish and file panel gating; fail closed to unknown while confirming
   const identity = useCallerIdentity();
   const resolvedCallerTier = identity.isPlatform
     ? null
-    : (identity.status === 'ready' ? identity.tier : 'unknown');
+    : (identity.status === 'ready' && !identity.isConfirming ? identity.tier : 'unknown');
   // DALTON-HOOK(mobile-web): gate WorkspaceSharingModal entry when either colleague_sharing or conversation_archive is enabled
   const { hasCapability } = useCapabilities();
   const workspaceSharingEntryReady =

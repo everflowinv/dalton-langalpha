@@ -14,17 +14,10 @@ import type { AccountPolicy } from '@/types/api';
 
 function fetchCredentialsStatus(context?: { signal?: AbortSignal }) {
   const mod = teamCredentialsModule as Partial<typeof teamCredentialsModule>;
-  if (
-    'fetchTeamCredentialsStatus' in mod &&
-    typeof mod.fetchTeamCredentialsStatus === 'function'
-  ) {
+  if (typeof mod.fetchTeamCredentialsStatus === 'function') {
     return mod.fetchTeamCredentialsStatus(context);
   }
-  return api
-    .get<{ enabled?: boolean }>('/api/v1/dalton/credentials/status', {
-      signal: context?.signal,
-    })
-    .then((r) => r.data);
+  return Promise.resolve({ enabled: false });
 }
 
 export interface TeamModelsAvailability {

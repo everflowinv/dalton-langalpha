@@ -216,6 +216,47 @@ describe('DaltonInvitesCard', () => {
     expect(h.revokeInvite).not.toHaveBeenCalled();
   });
 
+  it('disables the confirm button inside an already-open revoke dialog when isConfirming turns true', async () => {
+    h.fetchInvites.mockResolvedValue({
+      invites: [
+        {
+          invite_id: 'inv-open-dialog',
+          status: 'pending',
+          created_at: '2026-11-10T00:00:00Z',
+          expires_at: '2026-11-17T00:00:00Z',
+        },
+      ],
+      active_count: 1,
+      max_active: 20,
+    });
+
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    const { rerender } = render(
+      <QueryClientProvider client={client}>
+        <DaltonInvitesCard />
+      </QueryClientProvider>,
+    );
+
+    const revokeBtn = await screen.findByTestId('dalton-invite-revoke-inv-open-dialog');
+    fireEvent.click(revokeBtn);
+    const confirmBtns = await screen.findAllByRole('button', { name: 'auth.invites.revoke' });
+    const dialogConfirmBtn = confirmBtns[confirmBtns.length - 1];
+    expect(dialogConfirmBtn).toBeEnabled();
+
+    h.isConfirming = true;
+    rerender(
+      <QueryClientProvider client={client}>
+        <DaltonInvitesCard />
+      </QueryClientProvider>,
+    );
+
+    expect(dialogConfirmBtn).toBeDisabled();
+    fireEvent.click(dialogConfirmBtn);
+    expect(h.revokeInvite).not.toHaveBeenCalled();
+  });
+
   it('shows server detail only for 403 errors and falls back to saveFailed for non-403 errors with detail', async () => {
     h.fetchInvites.mockResolvedValue({ invites: [], active_count: 0, max_active: 20 });
     h.createInvite

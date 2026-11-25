@@ -137,11 +137,11 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
   const isHome = isHomeWorkspace(wsData);
   // DALTON-HOOK(team-sharing): detect read-only colleague workspace
   const teamReadOnly = useTeamReadOnly(workspaceId, wsData);
-  // DALTON-HOOK(external-share-guard): unified caller identity for gallery thread/file permissions
+  // DALTON-HOOK(external-share-guard): unified caller identity for gallery thread/file permissions; fail closed to unknown while confirming
   const identity = useCallerIdentity();
   const resolvedCallerTier = identity.isPlatform
     ? null
-    : (identity.status === 'ready' ? identity.tier : 'unknown');
+    : (identity.status === 'ready' && !identity.isConfirming ? identity.tier : 'unknown');
   // DALTON-HOOK(colleague-dispatch): resolve per-thread ownership in gallery
   // DALTON-HOOK(mobile-web): gate WorkspaceSharingModal on colleague_sharing or conversation_archive capability
   const { hasCapability } = useCapabilities();

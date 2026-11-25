@@ -115,6 +115,10 @@ vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
   return {
     ...orig,
     getWorkspace: vi.fn<typeof orig.getWorkspace>(),
+    listWorkspaceFiles: vi.fn<typeof orig.listWorkspaceFiles>(async () => ({
+      files: ['results/report.html'],
+      from: { kind: 'live' },
+    })),
     readWorkspaceFile: answer,
     readWorkspaceFileFull: answer as unknown as typeof orig.readWorkspaceFileFull,
     writeWorkspaceFile: vi.fn<typeof orig.writeWorkspaceFile>(),
@@ -201,6 +205,7 @@ import {
 import { toast } from '@/components/ui/use-toast';
 import { getMonitorByArtifact, publishMonitor, updateMonitor } from '@/pages/Monitors/api';
 import FilePanel from '../FilePanel';
+import { usePanelFiles } from '../chatView/usePanelFiles';
 import { fileTarget } from '../filePanel/types';
 import PublishDialog from '../PublishDialog';
 
@@ -1097,5 +1102,72 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
     const stopBtn = await screen.findByRole('button', { name: /Stop sharing|Unshare/i });
     expect(stopBtn).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Publish' })).toBeNull();
+  });
+
+  it('usePanelFiles -> FilePanel production callerTier path drops owner comment/pin/publish on the same tick isConfirming flips true, while keeping stop-share for public monitors and shared files', async () => {
+    tierState.callerTier = 'admin';
+    tierState.status = 'ready';
+    tierState.isConfirming = false;
+    mockFind.mockResolvedValue({ ...ARTIFACT, shared: false });
+    mockGetMonitor.mockResolvedValue({
+      monitor_id: 'mon-pub',
+      slug: 'pub-slug',
+      artifact_id: ARTIFACT.artifact_id,
+      workspace_id: 'ws-1',
+      title: 'Public Monitor',
+      category: 'other',
+      visibility: 'public',
+      published_seq: 1,
+      keep_updated: false,
+      member_user_ids: [],
+    } as never);
+
+    function PanelHarness({ filePath }: { filePath: string }) {
+      const { panelAccess } = usePanelFiles({
+        isHome: false,
+        workspaceId: 'ws-1',
+        includeSystem: false,
+      });
+      return (
+        <FilePanel
+          workspaceId="ws-1"
+          onClose={() => {}}
+          files={[filePath]}
+          target={fileTarget(filePath, {}, 1)}
+          onTargetHandled={() => {}}
+          {...panelAccess}
+        />
+      );
+    }
+
+    const { rerender, unmount } = renderWithProviders(
+      <PanelHarness filePath="results/report.html" />,
+    );
+
+    // Ready admin sees owner controls: Publish, Comment, and Pin to dashboard.
+    expect(await screen.findByRole('button', { name: 'Publish' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Comment' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Set as dashboard' })).toBeInTheDocument();
+
+    // Same-tick revalidation: status stays 'ready' with cached 'admin', isConfirming flips true.
+    tierState.isConfirming = true;
+    rerender(<PanelHarness filePath="results/report.html" />);
+
+    expect(screen.queryByRole('button', { name: 'Publish' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Comment' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Set as dashboard' })).toBeNull();
+    expect(await screen.findByRole('button', { name: /Stop sharing|Unshare/i })).toBeInTheDocument();
+    unmount();
+
+    // Also verify existing public shared file (without public monitor) retains stop-share during isConfirming.
+    tierState.isConfirming = true;
+    mockFind.mockResolvedValue({ ...ARTIFACT, shared: true });
+    mockGetMonitor.mockResolvedValue(null);
+
+    renderWithProviders(<PanelHarness filePath="results/report.html" />);
+    expect(await screen.findByRole('button', { name: /Stop sharing|Unshare/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Publish' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Comment' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Set as dashboard' })).toBeNull();
   });
 });

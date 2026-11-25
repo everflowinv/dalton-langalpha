@@ -139,12 +139,24 @@ export function WorkspaceSharingModal({
 
   const [draftCos, setDraftCos] = useState<WorkspaceAccessLevel>('ro');
   const [draftWeb, setDraftWeb] = useState<WorkspaceAccessLevel>('hidden');
+  const [cosEdited, setCosEdited] = useState(false);
+  const [webEdited, setWebEdited] = useState(false);
   const [draftTeamMemory, setDraftTeamMemory] = useState<boolean | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
 
   const data = sharingCapable ? sharingQuery.data : undefined;
   const settingsData =
     teamMemoryCapable && identity.isInternal ? settingsQuery.data : undefined;
+  const sharingReady = sharingCapable && data !== undefined && !sharingQuery.isError;
+
+  if (open && sharingReady) {
+    if (!cosEdited && draftCos !== data.cos_access) {
+      setDraftCos(data.cos_access);
+    }
+    if (!webEdited && draftWeb !== data.web_access) {
+      setDraftWeb(data.web_access);
+    }
+  }
 
   if (open && draftTeamMemory === null && settingsData !== undefined) {
     setDraftTeamMemory(settingsData.team_memory_enabled === true);
@@ -159,7 +171,6 @@ export function WorkspaceSharingModal({
     return null;
   }
 
-  const sharingReady = sharingCapable && data !== undefined && !sharingQuery.isError;
   const settingsLoaded = settingsData !== undefined && !settingsQuery.isError;
   const ownerExternal = (data?.owner_external ?? settingsData?.owner_external) === true;
 
@@ -228,6 +239,8 @@ export function WorkspaceSharingModal({
 
   const handleOpen = () => {
     setSaveError(null);
+    setCosEdited(false);
+    setWebEdited(false);
     if (cosAccess !== null) {
       setDraftCos(cosAccess);
     }
@@ -473,7 +486,10 @@ export function WorkspaceSharingModal({
                         </legend>
                         <SegmentedControl<WorkspaceAccessLevel>
                           value={draftCos}
-                          onChange={setDraftCos}
+                          onChange={(value) => {
+                            setCosEdited(true);
+                            setDraftCos(value);
+                          }}
                           labelledBy={cosLegendId}
                           disabled={!canEditCosAccess || isPending}
                           options={ACCESS_OPTIONS.map((opt) => ({
@@ -499,7 +515,10 @@ export function WorkspaceSharingModal({
                     </legend>
                     <SegmentedControl<WorkspaceAccessLevel>
                       value={draftWeb}
-                      onChange={setDraftWeb}
+                      onChange={(value) => {
+                        setWebEdited(true);
+                        setDraftWeb(value);
+                      }}
                       labelledBy={webLegendId}
                       disabled={!canEditWebAccess || isPending}
                       options={ACCESS_OPTIONS.map((opt) => ({

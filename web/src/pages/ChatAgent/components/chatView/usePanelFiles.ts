@@ -35,13 +35,13 @@ export function usePanelFiles({
   callerTier?: string | null;
 }) {
   const identity = useCallerIdentity();
-  // DALTON-HOOK(external-share-guard): fail closed while caller identity is loading/error; external and unknown members cannot create public file share links
+  // DALTON-HOOK(external-share-guard): fail closed while caller identity is loading/error/confirming; external and unknown members cannot create public file share links
   const effectiveCallerTier =
     callerTier !== undefined && callerTier !== null
       ? callerTier
       : identity.isPlatform
         ? null
-        : identity.status === 'ready'
+        : identity.status === 'ready' && !identity.isConfirming
           ? identity.tier
           : 'unknown';
   const canShareByTier =
