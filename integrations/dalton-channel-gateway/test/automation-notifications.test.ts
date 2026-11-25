@@ -197,6 +197,54 @@ describe("automation notification gateway route", () => {
     }
   });
 
+  it("rewrites sandbox links in text automation notifications before chunking", async () => {
+    const backend = createMockBackend();
+    const discord = new FakeChannelAdapter("discord");
+    const planWithSandboxLinks: DataTaskAuthorizePlanResponse = {
+      ...discordPlan(),
+      items: [
+        {
+          item_index: 0,
+          delivery_key: `automation_notify:${DELIVERY_ID}:item:0`,
+          kind: "text",
+          text: "自动任务完成：[报告](/home/workspace/results/daily.md)，路径 /home/workspace/data/out.csv",
+        },
+      ],
+    };
+    vi.mocked(backend.authorizeAutomationNotificationPlan).mockResolvedValueOnce(
+      planWithSandboxLinks,
+    );
+    vi.mocked(backend.authorizeAndClaimDelivery).mockResolvedValueOnce(
+      claimed("discord", "discord:@me", "123456789012345678"),
+    );
+
+    const app = appFor(
+      backend,
+      new Map<ChannelPlatform, ChannelAdapter>([["discord", discord]]),
+      { WEB_BASE_URL: "https://app.ginlix.ai" },
+    );
+    const { host, port } = await app.start();
+    try {
+      const res = await fetch(
+        `http://${host}:${port}/internal/automation-notifications`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "X-Service-Token": TEST_SERVICE_TOKEN,
+          },
+          body: JSON.stringify({ delivery_id: DELIVERY_ID }),
+        },
+      );
+      expect(res.status).toBe(200);
+      expect(discord.sentTexts.map((item) => item.text)).toEqual([
+        "自动任务完成：报告（在网页工作区查看：results/daily.md），路径 data/out.csv",
+      ]);
+    } finally {
+      await app.stop();
+    }
+  });
+
   it("fails a Feishu card when the adapter has no sendCard and does not send text", async () => {
     const backend = createMockBackend();
     vi.mocked(backend.authorizeAutomationNotificationPlan).mockResolvedValueOnce(

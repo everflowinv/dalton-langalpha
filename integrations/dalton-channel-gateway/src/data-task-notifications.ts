@@ -44,6 +44,7 @@ import {
   extractSafeLogErrorFields,
   sanitizeLogErrorCode,
 } from "./shared/logger.js";
+import { rewriteSandboxLinks } from "./shared/sandbox-links.js";
 import type { ChannelPlatform } from "./types.js";
 
 const MAX_ARTIFACT_BYTES = 20 * 1024 * 1024;
@@ -402,6 +403,7 @@ function validateDataTaskClaimResponse(
 export interface DataTaskNotificationServiceOptions {
   backend: BackendClient;
   adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
+  webBaseUrl?: string;
   mode?: "incoming" | "outgoing";
   queueTaskTimeoutMs?: number;
   retryDelayFn?: (ms: number, signal?: AbortSignal) => Promise<boolean>;
@@ -432,6 +434,7 @@ export interface AuthorizedPlanDeliveryOptions {
 export class DataTaskNotificationService {
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
+  private readonly webBaseUrl: string;
   private readonly mode: "incoming" | "outgoing";
   private readonly queue: SequentialQueue;
   private readonly logger = createSubsystemLogger("data-task-notifications");
@@ -453,6 +456,7 @@ export class DataTaskNotificationService {
   constructor(options: DataTaskNotificationServiceOptions) {
     this.backend = options.backend;
     this.adapters = options.adapters;
+    this.webBaseUrl = (options.webBaseUrl ?? "").trim().replace(/\/+$/, "");
     this.mode = options.mode ?? "incoming";
     this.onWeixinAccountRotated = options.onWeixinAccountRotated;
     this.retryDelayFn = options.retryDelayFn ?? abortableRetrySleep;
@@ -1366,13 +1370,21 @@ export class DataTaskNotificationService {
 
       const usePlainFeishu =
         item.kind === "text" && item.plain === true && platform === "feishu";
+      const outboundItemText =
+        item.kind === "feishu_card" || !item.text
+          ? ""
+          : rewriteSandboxLinks(
+              item.text,
+              this.webBaseUrl,
+              plan.thread_id ?? null,
+            );
       const textChunks =
         item.kind === "feishu_card"
           ? []
-          : item.text
+          : outboundItemText
             ? usePlainFeishu
-              ? readyAdapter.splitTextMessageChunks!(item.text)
-              : readyAdapter.splitTextChunks(item.text)
+              ? readyAdapter.splitTextMessageChunks!(outboundItemText)
+              : readyAdapter.splitTextChunks(outboundItemText)
             : [];
       const totalChunks = item.kind === "feishu_card" ? 1 : textChunks.length;
       const hasNonEmptyText =

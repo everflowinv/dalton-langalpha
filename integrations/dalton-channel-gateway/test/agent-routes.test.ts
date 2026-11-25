@@ -443,4 +443,80 @@ describe("Nine `/agent/*` Endpoints & Permission Enforcement (§1.2.1 ~ §1.2.7,
       },
     ]);
   });
+
+  it("rewrites sandbox links before chunking across Feishu, Discord, and Weixin deliveries and falls back on localhost WEB_BASE_URL", async () => {
+    const sampleText = [
+      "详见 [季报](/home/workspace/results/Q3 报告.md) 与 [外部](https://example.com/a)。",
+      `跨区：[附图](__wsref__/${WORKSPACE_ID}/charts/fig.png)，预览：[看板](http://localhost:8000/app)。`,
+      "裸路径：/home/daytona/data/raw.csv，代码：`/home/workspace/keep.py`。",
+    ].join("\n");
+
+    const expectedPublic = [
+      `详见 [季报](https://app.ginlix.ai/chat/t/${THREAD_ID}?file=results%2FQ3%20%E6%8A%A5%E5%91%8A.md) 与 [外部](https://example.com/a)。`,
+      `跨区：[附图](https://app.ginlix.ai/chat/${WORKSPACE_ID}?file=charts%2Ffig.png)，预览：看板。`,
+      "裸路径：data/raw.csv，代码：`/home/workspace/keep.py`。",
+    ].join("\n");
+
+    // 1. Feishu via POST /agent/send
+    const feishuSend = await h.app.agentRoutes.handleAgentSend(USER_ID, {
+      thread_id: THREAD_ID,
+      run_id: RUN_ID,
+      tool_call_id: "tc_links_feishu",
+      turn_platform: "feishu",
+      target: "feishu:@me",
+      text: sampleText,
+    });
+    expect(feishuSend.status).toBe(200);
+    expect(feishuSend.data.status).toBe("sent");
+    expect(h.feishuAdapter.sentTexts.at(-1)?.text).toBe(expectedPublic);
+
+    // 2. Discord via DeliveryService fallback path
+    const discordFallback = await h.app.deliveryService.executeDelivery({
+      deliveryKey: `fallback:${RUN_ID}:discord-links`,
+      kind: "fallback",
+      userId: USER_ID,
+      threadId: THREAD_ID,
+      runId: RUN_ID,
+      platform: "discord",
+      target: "discord:@me",
+      text: sampleText,
+    });
+    expect(discordFallback.status).toBe("sent");
+    expect(h.discordAdapter.sentTexts.at(-1)?.text).toBe(expectedPublic);
+
+    // 3. Weixin via DeliveryService fallback path
+    const weixinFallback = await h.app.deliveryService.executeDelivery({
+      deliveryKey: `fallback:${RUN_ID}:weixin-links`,
+      kind: "fallback",
+      userId: USER_ID,
+      threadId: THREAD_ID,
+      runId: RUN_ID,
+      platform: "weixin",
+      target: "weixin:@me",
+      text: sampleText,
+    });
+    expect(weixinFallback.status).toBe("sent");
+    expect(h.weixinAdapter.sentTexts.at(-1)?.text).toBe(expectedPublic);
+
+    // 4. Localhost WEB_BASE_URL degrades links to plain-text workspace hints
+    const localHarness = createTestHarness({
+      env: { WEB_BASE_URL: "http://localhost:5173" },
+    });
+    try {
+      const localRes = await localHarness.app.agentRoutes.handleAgentSend(USER_ID, {
+        thread_id: THREAD_ID,
+        run_id: RUN_ID,
+        tool_call_id: "tc_links_local",
+        turn_platform: "feishu",
+        target: "feishu:@me",
+        text: "查看 [报告](/home/workspace/results/report.md) 与 [预览](http://127.0.0.1:8000/)。",
+      });
+      expect(localRes.data.status).toBe("sent");
+      expect(localHarness.feishuAdapter.sentTexts.at(-1)?.text).toBe(
+        "查看 报告（在网页工作区查看：results/report.md） 与 预览。",
+      );
+    } finally {
+      await localHarness.cleanup();
+    }
+  });
 });
