@@ -5007,7 +5007,7 @@ describe("Round 6 Fixes (Codex R5 + Grok R5)", () => {
         sentCmd.cmd,
       );
       expect(committedCursors).toContain("cursor_after_help");
-      expect(h.backend.commitWeixinCursor).toHaveBeenCalledWith(
+      expect(h.backend.updateWeixinAccountCursor).toHaveBeenCalledWith(
         "wx_acc_1",
         expect.objectContaining({
           get_updates_buf: "cursor_after_help",
@@ -5090,6 +5090,21 @@ describe("Round 6 Fixes (Codex R5 + Grok R5)", () => {
         return { status: "running" };
       });
 
+      h.weixinAdapter.setAttachment("old_file_1", {
+        content: Buffer.from("old-gen-content"),
+        filename: "old.pdf",
+        mimeType: "application/pdf",
+      });
+      h.weixinAdapter.setAttachment("new_file_2", {
+        content: Buffer.from("new-gen-content"),
+        filename: "new.pdf",
+        mimeType: "application/pdf",
+      });
+      const newUploadDone = defer<void>();
+      vi.mocked(h.backend.uploadWorkspaceFile).mockImplementation(async () => {
+        newUploadDone.resolve();
+      });
+
       const oldGenEvent: InboundChannelEvent = {
         ...weixinDm("bot_1:rot_old_att", "old gen file"),
         weixinAccountId: "wx_acc_1",
@@ -5097,7 +5112,7 @@ describe("Round 6 Fixes (Codex R5 + Grok R5)", () => {
         weixinBotGeneration: 1,
         attachments: [
           {
-            fileKey: "old_file_1",
+            id: "old_file_1",
             filename: "old.pdf",
             mimeType: "application/pdf",
             sizeBytes: 128,
@@ -5111,7 +5126,7 @@ describe("Round 6 Fixes (Codex R5 + Grok R5)", () => {
         weixinBotGeneration: 2,
         attachments: [
           {
-            fileKey: "new_file_2",
+            id: "new_file_2",
             filename: "new.pdf",
             mimeType: "application/pdf",
             sizeBytes: 128,
@@ -5134,8 +5149,11 @@ describe("Round 6 Fixes (Codex R5 + Grok R5)", () => {
       releaseStartGen1.resolve();
       releaseStartGen2.resolve();
       await Promise.all([oldTask, newTask]);
+      await waitBounded(newUploadDone.promise, "new gen attachment uploaded");
+      // Allow any competing old-gen microtasks to settle so we verify gen 1 never retries or uploads
+      await new Promise((r) => setTimeout(r, 25));
 
-      // Only gen 2 uploaded; gen 1 was aborted before download/upload
+      // Only gen 2 uploaded; gen 1 was aborted before download/upload and did not re-launch
       expect(h.backend.uploadWorkspaceFile).toHaveBeenCalledTimes(1);
       expect(h.backend.uploadWorkspaceFile).toHaveBeenCalledWith(
         USER_ID,
@@ -5358,12 +5376,12 @@ describe("Round 6 Fixes (Codex R5 + Grok R5)", () => {
         status: "authorized",
         run_id: runUuid,
         owner_user_id: USER_ID,
-        owner_platform_user_id: "wx_user_1@im.wechat",
+        owner_platform_user_id: "wx_alice",
         platform: "weixin",
         target_kind: "dm",
         requested_target: "weixin:@me",
         canonical_target_address: "weixin:@me",
-        recipient_id: "wx_user_1@im.wechat",
+        recipient_id: "wx_alice",
         items: [
           {
             item_index: 0,
@@ -5397,7 +5415,7 @@ describe("Round 6 Fixes (Codex R5 + Grok R5)", () => {
           bot_generation: 1,
           bot_token: "tok_1",
           base_url: "https://ilinkai.weixin.qq.com",
-          recipient_id: "wx_user_1@im.wechat",
+          recipient_id: "wx_alice",
           weixin_context_token: `ctx_${dk}`,
           weixin_context_token_version: 1,
         };
@@ -5437,6 +5455,17 @@ describe("Round 6 Fixes (Codex R5 + Grok R5)", () => {
         body: expect.objectContaining({ code: "invalid_reconcile_snapshot" }),
       });
     }
+
+    // >= 400 HTTP statuses pass through as-is (never rewritten to 502 invalid_reconcile_snapshot)
+    const errHttp = new HttpBackendClient({
+      baseUrl: "http://127.0.0.1:8000",
+      serviceToken: TEST_SERVICE_TOKEN,
+      fetchImpl: async () => new Response("", { status: 404 }),
+    });
+    errHttp.setGatewayEpoch(1);
+    await expect(errHttp.reconcileWeixinAccounts(null)).rejects.toMatchObject({
+      status: 404,
+    });
 
     // 2) Full gateway startup blocks `/agent/send` with 503 `gateway_starting` while reconcile returns `{}`
     const badSnapshotHit = defer<void>();
@@ -5786,8 +5815,10 @@ describe("Round 6 Fixes (Codex R5 + Grok R5)", () => {
     );
     expect(ctor).toBeNull();
     expect(loggedLines).toHaveLength(1);
-    expect(loggedLines[0]).toContain('"error_code":"unknown_error"');
+    expect(loggedLines[0]).toContain('"error_code":"Error"');
     expect(loggedLines[0]).not.toContain('"error_name"');
+    expect(loggedLines[0]).not.toContain("ERR_MODULE_NOT_FOUND");
     expect(loggedLines[0]).not.toContain("/secret/path");
+    expect(loggedLines[0]).not.toContain("Cannot find package");
   });
 });

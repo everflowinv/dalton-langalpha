@@ -2072,21 +2072,42 @@ export class HttpBackendClient implements BackendClient {
     sinceRevision?: number | null,
     options?: { signal?: AbortSignal },
   ): Promise<WeixinAccountsReconcileResponse> {
-    const { status, data } = await this.jsonRequest<WeixinAccountsReconcileResponse>(
-      "POST",
-      "/api/v1/dalton/channels/internal/weixin/accounts/reconcile",
-      {
-        body:
-          sinceRevision !== undefined && sinceRevision !== null
-            ? { since_revision: sinceRevision }
-            : {},
-        timeoutMs: 15_000,
-        signal: options?.signal,
-        includeGatewayEpoch: true,
-        strictJson: true,
-        operationLabel: "weixin/accounts/reconcile",
-      },
-    );
+    let status: number;
+    let data: WeixinAccountsReconcileResponse;
+    try {
+      const res = await this.jsonRequest<WeixinAccountsReconcileResponse>(
+        "POST",
+        "/api/v1/dalton/channels/internal/weixin/accounts/reconcile",
+        {
+          body:
+            sinceRevision !== undefined && sinceRevision !== null
+              ? { since_revision: sinceRevision }
+              : {},
+          timeoutMs: 15_000,
+          signal: options?.signal,
+          includeGatewayEpoch: true,
+          strictJson: true,
+          operationLabel: "weixin/accounts/reconcile",
+        },
+      );
+      status = res.status;
+      data = res.data;
+    } catch (err) {
+      // R6 #4: Normalize empty body / malformed JSON on 2xx responses from `strictJson`
+      // to 502 `invalid_reconcile_snapshot`; preserve >= 400 (and 409 stale epoch / 3xx / network) as-is.
+      if (
+        err instanceof BackendHttpError &&
+        err.status >= 200 &&
+        err.status < 300
+      ) {
+        throw new BackendHttpError(
+          "weixin/accounts/reconcile returned invalid snapshot payload",
+          502,
+          { code: "invalid_reconcile_snapshot" },
+        );
+      }
+      throw err;
+    }
     if (status >= 400) {
       throw new BackendHttpError(
         `weixin/accounts/reconcile failed (${status})`,

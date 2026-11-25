@@ -36,6 +36,18 @@ import {
   WEIXIN_ROTATION_DENY_CODES,
 } from "./delivery-service.js";
 import { isStaleGatewayEpochError } from "./gateway-lease.js";
+
+/**
+ * Internal signal that a Weixin inbound attachment task was intentionally aborted
+ * (e.g. account rotation / superseded generation / shutdown) and MUST NOT be
+ * re-launched via `recoverDetachedInboundTurn`.
+ */
+class WeixinAttachmentAbortedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WeixinAttachmentAbortedError";
+  }
+}
 import { ProcessingFeedbackCoordinator } from "./processing-feedback.js";
 import {
   createSubsystemLogger,
@@ -674,7 +686,10 @@ export class ChannelGatewayOrchestrator {
       try {
         await runTurn();
       } catch (err) {
-        if (isStaleGatewayEpochError(err)) {
+        if (
+          isStaleGatewayEpochError(err) ||
+          err instanceof WeixinAttachmentAbortedError
+        ) {
           return;
         }
         try {
@@ -2319,14 +2334,16 @@ export class ChannelGatewayOrchestrator {
         return;
       }
       if (this.shuttingDown || weixinTaskController.signal.aborted) {
-        throw new Error(`Weixin attachment task aborted before ${stage}`);
+        throw new WeixinAttachmentAbortedError(
+          `Weixin attachment task aborted before ${stage}`,
+        );
       }
       if (
         typeof adapter.isWeixinAccountGenerationActive === "function" &&
         !adapter.isWeixinAccountGenerationActive(event)
       ) {
         weixinTaskController.abort();
-        throw new Error(
+        throw new WeixinAttachmentAbortedError(
           `Weixin account rotated or inactive before ${stage}`,
         );
       }
@@ -2404,6 +2421,11 @@ export class ChannelGatewayOrchestrator {
               })
             : await adapter.downloadAttachment(desc, event);
         } catch (err) {
+          if (weixinTaskController?.signal.aborted) {
+            throw new WeixinAttachmentAbortedError(
+              "Weixin attachment download aborted due to account rotation or shutdown",
+            );
+          }
           if (err instanceof SafeFetchError && err.code === "size_exceeded") {
             return {
               ok: false,
@@ -2475,6 +2497,11 @@ export class ChannelGatewayOrchestrator {
                   errCode,
                 );
               }
+            }
+            if (weixinTaskController.signal.aborted) {
+              throw new WeixinAttachmentAbortedError(
+                "Weixin attachment upload aborted due to account rotation or shutdown",
+              );
             }
             throw uploadErr;
           }
