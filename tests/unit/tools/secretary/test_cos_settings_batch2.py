@@ -3476,10 +3476,7 @@ async def test_claude_code_create_workspace_persists_snapshot_pauses_and_resumes
     manage_workspaces(action='create') via puts_card so the call goes through
     StandingApprovalMiddleware.after_model (saving approval_snapshots) -> held
     -> interrupt(), and resumes cleanly after approval without an active CLI."""
-    from typing import Annotated
-
     from langchain.agents import create_agent
-    from langchain.tools import InjectedState
     from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
     from langchain_core.messages import AIMessage, ToolMessage
     from langchain_core.tools import tool
@@ -3495,7 +3492,6 @@ async def test_claude_code_create_workspace_persists_snapshot_pauses_and_resumes
     from src.dalton.coverage.dedup import CompanyDedupRecheckSnapshot
     from src.llms.claude_code import ClaudeTurnFailed
     from src.llms.llm import create_llm
-    from src.tools.secretary._commands import InjectedToolCallId
     from src.tools.secretary.approvals import approval_snapshot, preapproved
 
     # 1. waits_for_user + BeforeTool defer manage_workspaces(action="create"),
