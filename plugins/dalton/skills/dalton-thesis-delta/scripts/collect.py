@@ -182,8 +182,30 @@ def tracker_paths(workspace_dir: Path) -> dict[str, Path]:
     }
 
 
+DEFAULT_AE_SEARCH_IN = "title"
+
+
+def _load_skill_default_thresholds() -> dict[str, Any]:
+    raw = load_json(DEFAULT_THRESHOLDS_PATH, {})
+    return raw if isinstance(raw, dict) else {}
+
+
+def _alphaengine_capability_enabled(skill_cfg: dict[str, Any] | None = None) -> bool:
+    """Whether the deployment's ``alphaengine`` capability is on for this skill.
+
+    Read from the backend-assembled ``config/default-thresholds.json``
+    (neutral flag ``_skip_sellside_library``), mirroring
+    ``dalton-bullbear-tracker``'s backend-assembled config channel while
+    keeping Core-visible config free of proprietary source names.
+    """
+    cfg = _load_skill_default_thresholds() if skill_cfg is None else skill_cfg
+    if isinstance(cfg, dict) and cfg.get("_skip_sellside_library") is True:
+        return False
+    return True
+
+
 def load_thresholds(workspace_dir: Path) -> dict[str, Any]:
-    base = load_json(DEFAULT_THRESHOLDS_PATH, {
+    raw_base = load_json(DEFAULT_THRESHOLDS_PATH, {
         "eps_fy1_vs_last_pct": 1.0,
         "eps_fy1_vs_7d_pct": 2.0,
         "rev_fy1_or_q1_vs_last_pct": 0.7,
@@ -193,6 +215,11 @@ def load_thresholds(workspace_dir: Path) -> dict[str, Any]:
         "price_5d_pct": 8.0,
         "any_new_sec_filing": True,
     })
+    base = (
+        {k: v for k, v in raw_base.items() if k != "_skip_sellside_library"}
+        if isinstance(raw_base, dict)
+        else {}
+    )
     override_p = tracker_paths(workspace_dir)["thresholds"]
     override = load_json(override_p, {})
     if isinstance(override, dict):
@@ -209,6 +236,7 @@ def resolve_company_meta(ticker: str, workspace_dir: Path) -> dict[str, Any]:
         "aliases": [t],
         "benchmark": "QQQ",
         "sec_forms": list(DEFAULT_SEC_FORMS),
+        "ae_search_in": DEFAULT_AE_SEARCH_IN,
     }
     comp_json = load_json(tracker_paths(workspace_dir)["company_json"], {})
     if isinstance(comp_json, dict):
@@ -218,9 +246,10 @@ def resolve_company_meta(ticker: str, workspace_dir: Path) -> dict[str, Any]:
             meta["benchmark"] = str(comp_json["benchmarks"][0])
         if isinstance(comp_json.get("aliases"), list) and comp_json["aliases"]:
             meta["aliases"] = [str(a) for a in comp_json["aliases"]]
-        raw_search_in = str(comp_json.get("ae_search_in") or comp_json.get("search_in") or "").strip()
-        if raw_search_in:
-            meta["ae_search_in"] = raw_search_in
+        if "ae_search_in" in comp_json:
+            meta["ae_search_in"] = str(comp_json.get("ae_search_in") or "").strip()
+        elif "search_in" in comp_json:
+            meta["ae_search_in"] = str(comp_json.get("search_in") or "").strip()
 
     # 尝试从 coverage.yaml 补充
     cov_candidates = [
@@ -927,7 +956,12 @@ def build_internal_route_request(
     if route == "alphaengine":
         ae_start = (date.fromisoformat(since) - timedelta(days=AE_LOOKBACK_DAYS)).isoformat()
         ae_params: dict[str, Any] = {"sort": "relevance"}
-        search_in = _normalize_ae_search_in(meta.get("ae_search_in") or meta.get("search_in"))
+        if "ae_search_in" in meta:
+            search_in = _normalize_ae_search_in(meta.get("ae_search_in"))
+        elif "search_in" in meta:
+            search_in = _normalize_ae_search_in(meta.get("search_in"))
+        else:
+            search_in = DEFAULT_AE_SEARCH_IN
         if search_in:
             ae_params["search_in"] = search_in
         return (
@@ -1248,6 +1282,33 @@ def summarize_source_failures(
     return failures
 
 
+def _has_ae_skipped_backlog(
+    internal_data: dict[str, Any] | None,
+    ae_data: dict[str, Any] | None,
+) -> bool:
+    """判断本轮 AlphaEngine 是否发生积压跳跃（须披露跳过日期段，不走静默短路）。"""
+    int_status = (internal_data or {}).get("status") or {}
+    if isinstance(int_status, dict):
+        ae_st = int_status.get("alphaengine")
+        if isinstance(ae_st, dict):
+            if isinstance(ae_st.get("skipped_backlog"), dict):
+                return True
+            st_state = ae_st.get("ae_state")
+            if isinstance(st_state, dict) and isinstance(st_state.get("skipped_backlog"), dict):
+                return True
+    ae_status = (ae_data or {}).get("status") or []
+    if isinstance(ae_status, list):
+        for st in ae_status:
+            if not isinstance(st, dict):
+                continue
+            if isinstance(st.get("skipped_backlog"), dict):
+                return True
+            st_state = st.get("ae_state")
+            if isinstance(st_state, dict) and isinstance(st_state.get("skipped_backlog"), dict):
+                return True
+    return False
+
+
 def can_short_circuit(
     *,
     auto_flags: list[str],
@@ -1256,8 +1317,10 @@ def can_short_circuit(
     sec_data: dict[str, Any],
     consensus_data: dict[str, Any] | None = None,
 ) -> bool:
-    """短路判断：要求所有来源（含一致预期）都 ok:true 且完整，auto_flags 为空，且所有来源都是 0 新增。"""
+    """短路判断：要求所有来源（含一致预期）都 ok:true 且完整、未跳过积压，auto_flags 为空，且所有来源都是 0 新增。"""
     if summarize_source_failures(internal_data, ae_data, sec_data, consensus_data):
+        return False
+    if _has_ae_skipped_backlog(internal_data, ae_data):
         return False
     if auto_flags:
         return False
@@ -1704,10 +1767,11 @@ def _collect_alphaengine_window(
         err_msg = full_scan.get("error")
         if ok and incomplete:
             lookback_start = _day_shift(until, -AE_LOOKBACK_DAYS)
+            same_day_cap_items = full_window_budget * AE_PAGE_LIMIT
             detail = str(full_scan.get("incomplete_reason") or f"已用完翻页预算（{full_window_budget} 页）")
             if full_scan.get("early_exit") or full_scan.get("budget_exhausted"):
                 incomplete_reason: str | None = (
-                    f"未完成: {lookback_start}–{until} 窗口超过 {cap_items} 条"
+                    f"未完成: {lookback_start}–{until} 窗口超过 {full_window_budget} 页（{same_day_cap_items} 条）上限"
                     f"（同日重跑 {AE_LOOKBACK_DAYS} 天回看窗口未扫完：{detail}），"
                     f"覆盖边界维持 {orig_covered}"
                 )
@@ -1779,21 +1843,31 @@ def _collect_alphaengine_window(
     # 预算极紧（总请求上限 <= 2）时跳过整段扫描与 3 天回看，把全部预算直接投入逐日推进，
     # 保证只要有 >= 1 次预算就至少推进一天且不因回看挤占而漏文档或卡死。
     tight_budget = round_cap <= 2
+    need_lookback_and_single = page_limit + single_day_cap
+    single_day_skip_lookback = (start == until) and (round_cap < need_lookback_and_single)
     full_scan: dict[str, Any] | None = None
+    full_items: list[dict[str, Any]] = []
 
     if not tight_budget:
         # 第一步：整段扫描 [start - 3 天, until]。
         # 待扫不止 1 天时预算为 min(MAX_CURSOR_PAGES - 1, round_cap - 1)，确保按日阶段至少留 1 次请求；
         # 首页 total_upstream 超出 step1_budget * AE_PAGE_LIMIT（整段预算绝不可能扫完）即立即转第二步。
-        # 待扫仅 1 天（start == until）时整段窗口即首子窗口 [start - 3, start]，直接给满单日预算。
-        step1_budget = max(1, min(page_limit - 1, round_cap - 1)) if start < until else single_day_cap
-        early_limit = (step1_budget * AE_PAGE_LIMIT) if start < until else None
+        # 待扫仅 1 天（start == until）时，仅当本轮预算足以兼顾「回看窗口 + 单日重扫」才带回看，
+        # 否则直接扫单日 [start, start]，保证只有单日扫描能推进或记录 partial_days。
+        if start < until:
+            step1_budget = max(1, min(page_limit - 1, round_cap - 1))
+            step1_lookback = AE_LOOKBACK_DAYS
+            early_limit: int | None = step1_budget * AE_PAGE_LIMIT
+        else:
+            step1_budget = single_day_cap
+            step1_lookback = 0 if single_day_skip_lookback else AE_LOOKBACK_DAYS
+            early_limit = None
         full_items, full_scan = _scan_alphaengine_pages(
             meta,
             start,
             until,
             budget=step1_budget,
-            lookback_days=AE_LOOKBACK_DAYS,
+            lookback_days=step1_lookback,
             early_exit_total_limit=early_limit,
         )
         items.extend(full_items)
@@ -1849,14 +1923,13 @@ def _collect_alphaengine_window(
         covered = until
     elif full_scan is None or (full_scan["ok"] and not full_scan["stale"]):
         if not tight_budget and full_scan is not None and start == until:
-            # 仅 1 个待扫日且整段窗口 [start - 3, start] 用完预算：有余量则单日 [start, start] 重扫；
-            # 若本轮预算已全部耗尽在 [start - 3, start]（如 round_cap <= page_limit），按超限推进防止卡死。
             if full_scan["budget_exhausted"]:
-                if round_cap - pages_total > 0:
+                if not single_day_skip_lookback:
+                    # 多日回看窗口 [start - 3, start] 绝不推进或记 partial_days，必须由 [start, start] 单日重扫决定
                     _rescan_single_day(start, (_day_shift(start, -AE_LOOKBACK_DAYS), start))
                 else:
                     covered = start
-                    partial_days.append((start, len(_dedupe_ae_items(items))))
+                    partial_days.append((start, len(_dedupe_ae_items(full_items))))
             else:
                 detail = str(full_scan.get("incomplete_reason") or "未用完翻页预算即停止")
                 stopped_day = (start, detail)
@@ -1873,10 +1946,15 @@ def _collect_alphaengine_window(
                     round_cap_hit = True
                     round_cap_resume_day = sub_until
                     break
-                # 预算极紧（总预算 <= 2）或仅剩 1 次请求且尚未推进任何一天时，去掉回看直接扫单日 [P, P]，
-                # 避免已覆盖的回看日吃掉最后 1 次请求导致边界停滞。
-                eff_lookback = 0 if (sub_lookback > 0 and (tight_budget or (remaining < 2 and covered == boundary))) else sub_lookback
-                day_budget = min(page_limit, remaining)
+                # 仅当剩余预算足够「回看窗口 + 单日重扫」时才扫 [P-3, P]，否则跳过回看直接扫单日 [P, P]，
+                # 确保只有单日扫描能推进 P 或记录 P 的 partial_days。
+                use_lookback = (
+                    sub_lookback > 0
+                    and not tight_budget
+                    and remaining >= need_lookback_and_single
+                )
+                eff_lookback = sub_lookback if use_lookback else 0
+                day_budget = page_limit if use_lookback else min(page_limit, remaining)
                 d_items, d_scan = _scan_alphaengine_pages(
                     meta,
                     sub_since,
@@ -1896,24 +1974,34 @@ def _collect_alphaengine_window(
                 if d_scan["completed"]:
                     covered = max(covered, sub_until)
                     continue
+                if eff_lookback > 0:
+                    # 多日回看窗口 [P-3, P] 未扫完时绝不推进 P 或记 partial_days；
+                    # 用完预算后改为单日 [P, P] 重扫，其余异常停在 P 之前。
+                    if d_scan["budget_exhausted"]:
+                        outer_win = (_day_shift(sub_since, -eff_lookback), sub_until)
+                        if _rescan_single_day(sub_until, outer_win):
+                            continue
+                        break
+                    detail = str(
+                        d_scan.get("incomplete_reason")
+                        or f"回看窗口 {_day_shift(sub_since, -eff_lookback)}–{sub_until} 未扫完"
+                    )
+                    stopped_day = (sub_until, detail)
+                    break
                 if d_scan["budget_exhausted"] and day_budget < single_day_cap:
                     if round_had_full_cursor_err:
                         detail = str(d_scan.get("incomplete_reason") or f"单日 {sub_until} 未扫完")
                         stopped_day = (sub_until, detail)
                     elif covered == boundary:
-                        # 本轮尚未推进任何一天、无游标异常且用尽本轮剩余全部预算：推进该日防止跨轮卡死
+                        # 本轮尚未推进任何一天、无游标异常且单日扫描用尽本轮剩余全部预算：推进该日防止跨轮卡死
                         covered = max(covered, sub_until)
                         partial_days.append((sub_until, len(_dedupe_ae_items(d_items))))
+                        continue
                     else:
                         round_cap_hit = True
                         round_cap_resume_day = sub_until
                     break
                 if d_scan["budget_exhausted"] and day_budget >= single_day_cap:
-                    if eff_lookback > 0:
-                        outer_win = (_day_shift(sub_since, -eff_lookback), sub_until)
-                        if _rescan_single_day(sub_until, outer_win):
-                            continue
-                        break
                     covered = max(covered, sub_until)
                     partial_days.append((sub_until, len(_dedupe_ae_items(d_items))))
                     continue
@@ -2229,18 +2317,19 @@ def collect_internal_and_ae(
                     "snippet": (r.get("snippet") or "")[:600],
                 }
 
-    if skip_ae:
-        # 本轮没跑 AE：把归一化后的覆盖边界原样带回 commit，旧 cursor 一律丢弃
-        # （旧格式状态首次迁移时固化由旧 until 或 resume.window.since 推出的边界，不得写 null）。
+    if skip_ae or not _alphaengine_capability_enabled():
+        # 本轮没跑 AE（--no-ae 或部署关闭了 alphaengine 能力）：把归一化后的覆盖边界原样带回 commit，
+        # 旧 cursor 一律丢弃（旧格式状态首次迁移时固化由旧 until 或 resume.window.since 推出的边界，不得写 null）。
+        skip_reason = "--no-ae" if skip_ae else "capability_disabled"
         skipped_state = {
             "ran": False,
             "covered_until": _normalize_ae_boundary(ae_covered_until, ae_resume, since),
             "resume": None,
         }
-        ae_status.append({"skipped": "--no-ae", "ok": True, "ae_state": skipped_state})
+        ae_status.append({"skipped": skip_reason, "ok": True, "ae_state": skipped_state})
         internal_status["alphaengine"] = {
             "ok": True,
-            "skipped": "--no-ae",
+            "skipped": skip_reason,
             "status": "skipped",
             "ae_state": skipped_state,
         }
@@ -2478,7 +2567,7 @@ def render_packet_md(pk: dict[str, Any]) -> str:
             )
         )
         lines.append(
-            f"- **更早的积压已跳过**：{backlog_note}（本轮实际从 {actual_start} 起扫）"
+            f"- **更早的积压已跳过**：{backlog_note}（逐日采集起点：{actual_start}）"
         )
     if isinstance(ae_st_entry, dict) and _is_source_status_incomplete(ae_st_entry):
         covered_str = (
@@ -2709,7 +2798,8 @@ def _validate_ae_state(
     pk: dict[str, Any],
     prev_last_run: dict[str, Any] | None = None,
 ) -> str | None:
-    """校验 commit 前的 AlphaEngine 状态，放行多日推进（含 partial_days）与积压跳跃。
+    """校验 commit 前的 AlphaEngine 状态，放行多日推进（含 partial_days）与积压跳跃，
+    拒绝日期关系矛盾或凭 has_more=false 把未完成窗口推进到终点的数据包；保留旧格式兼容。
 
     返回合法性错误字符串，或 None 表示通过。
     """
@@ -2721,6 +2811,7 @@ def _validate_ae_state(
     pk_until = _coerce_iso_day(pk.get("until"))
     if not pk_until:
         return None
+    pk_since = _coerce_iso_day(pk.get("since"))
     covered = _migrate_ae_covered_until(
         raw_ae_state.get("covered_until"),
         raw_ae_state.get("resume"),
@@ -2729,18 +2820,13 @@ def _validate_ae_state(
     if covered and covered > pk_until and (not prev_covered or covered > prev_covered):
         return f"ae_state.covered_until（{covered}）晚于数据包窗口终点（{pk_until}）"
 
-    partial_days = raw_ae_state.get("partial_days")
-    if partial_days is not None:
-        if not isinstance(partial_days, list):
-            return "ae_state.partial_days 必须是列表"
-        for item in partial_days:
-            day = _coerce_iso_day(item)
-            if not day or day > pk_until:
-                return f"ae_state.partial_days 包含非法日期：{item!r}"
-
     int_status = pk.get("internal_status") if isinstance(pk.get("internal_status"), dict) else {}
     ae_st = int_status.get("alphaengine") if isinstance(int_status.get("alphaengine"), dict) else {}
-    skipped_backlog = raw_ae_state.get("skipped_backlog") or ae_st.get("skipped_backlog")
+
+    skipped_backlog = raw_ae_state.get("skipped_backlog")
+    if skipped_backlog is None:
+        skipped_backlog = ae_st.get("skipped_backlog")
+    skip_until: str | None = None
     if skipped_backlog is not None:
         if not isinstance(skipped_backlog, dict):
             return "ae_state.skipped_backlog 必须是对象"
@@ -2748,6 +2834,81 @@ def _validate_ae_state(
         skip_until = _coerce_iso_day(skipped_backlog.get("until"))
         if not skip_since or not skip_until or skip_since > skip_until or skip_until >= pk_until:
             return f"ae_state.skipped_backlog 日期区间非法：{skipped_backlog!r}"
+        if raw_ae_state.get("ran") is False:
+            return "未推进覆盖边界（ran=false）的 AE 状态不能包含 skipped_backlog"
+        if not covered or skip_until >= covered:
+            return f"ae_state.skipped_backlog 终点（{skip_until}）必须早于 covered_until（{covered}）"
+
+    # 待采窗口下界：有积压跳跃时为 skip_until + 1；否则取 prev_covered + 1 与 pk_since 的较早者（兼容回看/补采）
+    lower_candidates: list[str] = []
+    if skip_until is not None:
+        lower_candidates.append(_day_shift(skip_until, 1))
+    else:
+        if prev_covered:
+            lower_candidates.append(_day_shift(prev_covered, 1))
+        if pk_since:
+            lower_candidates.append(pk_since)
+    lower_bound = min(lower_candidates) if lower_candidates else None
+
+    raw_partial = raw_ae_state.get("partial_days")
+    if raw_partial is None and "partial_days" in ae_st:
+        raw_partial = ae_st.get("partial_days")
+    partial_days: list[str] = []
+    if raw_partial is not None:
+        if not isinstance(raw_partial, list):
+            return "ae_state.partial_days 必须是列表"
+        for item in raw_partial:
+            day = _coerce_iso_day(item)
+            if not day or day > pk_until:
+                return f"ae_state.partial_days 包含非法日期：{item!r}"
+            if not covered or day > covered:
+                return f"ae_state.partial_days（{day}）不能晚于 covered_until（{covered}）"
+            if skip_until is not None and day <= skip_until:
+                return f"ae_state.partial_days（{day}）不能落在 skipped_backlog 区间内"
+            if lower_bound is not None and day < lower_bound:
+                return f"ae_state.partial_days（{day}）早于本轮窗口起点（{lower_bound}）"
+            partial_days.append(day)
+
+    # 校验未完成窗口不得非正常推进至 pk_until（保留对不含 internal_status.alphaengine 的旧格式包兼容）
+    if ae_st and not ae_st.get("skipped"):
+        st_incomplete = (
+            ae_st.get("ok") is False
+            or ae_st.get("completed") is False
+            or ae_st.get("incomplete") is True
+        )
+        if not st_incomplete and partial_days:
+            return "完成的 AE 状态不能包含 partial_days"
+        if st_incomplete and covered == pk_until and (not prev_covered or covered > prev_covered):
+            reason = str(ae_st.get("incomplete_reason") or "")
+            stop_markers = (
+                "未扫日期",
+                "留待下一轮",
+                "取数失败",
+                "窗口未扫完",
+                "过期缓存",
+                "游标失效重扫后",
+            )
+            no_stop_markers = not any(m in reason for m in stop_markers)
+            clean_ok = (
+                ae_st.get("ok") is True
+                and not ae_st.get("error")
+                and not ae_st.get("stale")
+                and no_stop_markers
+            )
+            has_partial_field = ("partial_days" in raw_ae_state) or ("partial_days" in ae_st)
+            allow_partial_advance = clean_ok and (
+                (
+                    bool(partial_days)
+                    and "当天超过翻页上限，只取了前" in reason
+                    and (pk_until in partial_days or ae_st.get("has_more") is False)
+                )
+                or (
+                    not has_partial_field
+                    and "超过翻页上限" in reason
+                )
+            )
+            if not allow_partial_advance:
+                return "未完成的 AE 查询不能把 covered_until 推进到数据包窗口终点"
     return None
 
 

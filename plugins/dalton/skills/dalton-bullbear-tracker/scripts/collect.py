@@ -757,9 +757,9 @@ def load_research_config() -> dict[str, Any]:
     data = cfg_mod.load_validated_config(TICKER, skill_dir=SKILL_DIR)
     if data is None:
         raise CollectError("unsupported_ticker", f"不支持的 ticker：{TICKER or '空'}")
-    if _is_legacy_four_verbatim(TICKER):
-        return _filter_legacy_config(data)
-    return data
+    cfg = _filter_legacy_config(data) if _is_legacy_four_verbatim(TICKER) else data
+    _parse_ae_queries(cfg)
+    return cfg
 
 
 def load_company(workspace: Path) -> dict[str, Any]:
@@ -2069,12 +2069,15 @@ def _normalize_ae_search_in(raw: Any) -> str | None:
 def _parse_ae_queries(cfg: dict[str, Any]) -> list[tuple[str, str | None]]:
     """解析固定查询列表，兼容纯字符串与 ``{"query": ..., "search_in": ...}`` 对象。
 
-    状态始终以查询词文本为键；``search_in`` 非空时（例如 ``"title"``）透传到 ``params.search_in``。
+    状态始终以查询词文本为键；配置中出现重复查询词时直接报配置错误，避免同一查询词
+    重复计算请求预算并覆盖彼此状态。``search_in`` 非空时（例如 ``"title"``）透传到
+    ``params.search_in``。
     """
     max_searches = int(cfg.get("ae_max_searches") or 2)
     fallback_search_in = cfg.get("ae_search_in")
     out: list[tuple[str, str | None]] = []
-    for raw in (cfg.get("ae_queries") or [])[:max_searches]:
+    seen_queries: set[str] = set()
+    for raw in cfg.get("ae_queries") or []:
         if isinstance(raw, dict):
             query = str(raw.get("query") or "").strip()
             if not query:
@@ -2088,8 +2091,11 @@ def _parse_ae_queries(cfg: dict[str, Any]) -> list[tuple[str, str | None]]:
                 search_in = _normalize_ae_search_in(fallback_search_in.get(query))
             else:
                 search_in = _normalize_ae_search_in(fallback_search_in)
+        if query in seen_queries:
+            raise CollectError("duplicate_ae_query", f"ae_queries 包含重复查询词：{query}")
+        seen_queries.add(query)
         out.append((query, search_in))
-    return out
+    return out[:max_searches]
 
 
 def _format_ae_backlog_note(
@@ -2511,10 +2517,17 @@ def collect_alphaengine(
 
         multi_day = (not same_day_rerun) and (pending_start < end)
         tight_budget = (not same_day_rerun) and (round_cap <= 2)
+        need_lookback_and_single = page_limit + single_day_cap
+        single_day_skip_lookback = (
+            (not same_day_rerun)
+            and (not multi_day)
+            and (round_cap < need_lookback_and_single)
+        )
+        skip_lookback = tight_budget or single_day_skip_lookback
         if not same_day_rerun and not multi_day:
-            # 单个待采日时，常规预算窗口为 [待采日 - AE_LOOKBACK_DAYS, until]；
-            # 预算极紧（<= 2 次）时直接扫 [待采日, 待采日]，避免已覆盖回看日挤占预算。
-            start = pending_start if tight_budget else _day_shift(pending_start, -AE_LOOKBACK_DAYS)
+            # 单个待采日时，仅当本轮预算足以兼顾「回看窗口 + 单日重扫」才带回看，
+            # 否则跳过回看直接扫 [待采日, 待采日]，确保只有单日扫描能推进或记 partial_days。
+            start = pending_start if skip_lookback else _day_shift(pending_start, -AE_LOOKBACK_DAYS)
             if start > end:
                 start = end
         elif tight_budget:
@@ -2531,14 +2544,25 @@ def collect_alphaengine(
         full_scan: dict[str, Any] | None = None
 
         if not tight_budget:
-            step1_budget = max(1, min(page_limit - 1, round_cap - 1)) if multi_day else single_day_cap
-            early_limit = (step1_budget * AE_LIMIT) if multi_day else None
+            if multi_day:
+                step1_budget = max(1, min(page_limit - 1, round_cap - 1))
+                step1_max_requests = max(1, round_cap - 1)
+                early_limit: int | None = step1_budget * AE_LIMIT
+            elif not same_day_rerun and start < end:
+                # 单个待采日且带回看：保留至少 single_day_cap 次给单日重扫 [P, P]
+                step1_budget = page_limit
+                step1_max_requests = max(page_limit, round_cap - single_day_cap)
+                early_limit = None
+            else:
+                step1_budget = single_day_cap
+                step1_max_requests = round_cap
+                early_limit = None
             full_scan = _scan_ae_pages(
                 query,
                 start,
                 end,
                 budget=step1_budget,
-                max_requests=round_cap,
+                max_requests=step1_max_requests,
                 early_exit_total_limit=early_limit,
                 search_in=search_in,
             )
@@ -2596,7 +2620,8 @@ def collect_alphaengine(
         elif full_scan is None or (full_scan["ok"] and not full_scan["stale"]):
             if not tight_budget and full_scan is not None and not same_day_rerun and not multi_day:
                 if full_scan["budget_exhausted"]:
-                    if start < end and (round_cap - pages_total) > 0:
+                    if start < end:
+                        # 多日回看窗口 [P-3, P] 绝不推进 P 或记 partial_days，必须由 [P, P] 单日重扫决定
                         _rescan_single_day(end, (start, end))
                     else:
                         deduped_full = _g._dedupe_ae_items(full_scan["items"])
@@ -2607,7 +2632,7 @@ def collect_alphaengine(
                         if not full_scan["cursor_exhausted"] and not full_scan.get("cursor_error"):
                             round_cap_hit = True
                             round_cap_resume_day = end
-                    else:
+                    elif not full_scan["cursor_exhausted"] and not full_scan.get("cursor_error"):
                         _rescan_single_day(end, None)
             elif tight_budget or multi_day:
                 if pages_total >= round_cap:
@@ -2624,18 +2649,24 @@ def collect_alphaengine(
                             round_cap_hit = True
                             round_cap_resume_day = sub_end
                             break
-                        eff_start = (
-                            sub_end
-                            if (sub_start < sub_end and (tight_budget or (remaining_round < 2 and covered == carried_covered)))
-                            else sub_start
+                        use_lookback = (
+                            sub_start < sub_end
+                            and not tight_budget
+                            and remaining_round >= need_lookback_and_single
                         )
-                        day_budget = min(page_limit, remaining_round)
+                        eff_start = sub_start if use_lookback else sub_end
+                        day_budget = page_limit if use_lookback else min(page_limit, remaining_round)
+                        scan_max_requests = (
+                            max(day_budget, remaining_round - single_day_cap)
+                            if use_lookback
+                            else remaining_round
+                        )
                         d_scan = _scan_ae_pages(
                             query,
                             eff_start,
                             sub_end,
                             budget=day_budget,
-                            max_requests=remaining_round,
+                            max_requests=scan_max_requests,
                             search_in=search_in,
                         )
                         raw_items.extend(d_scan["items"])
@@ -2646,6 +2677,14 @@ def collect_alphaengine(
                         if d_scan["completed"]:
                             covered = max(covered, sub_end) if covered else sub_end
                             continue
+                        if eff_start < sub_end:
+                            # 多日回看窗口 [P-3, P] 未扫完时绝不推进 P 或记 partial_days；
+                            # 用完单窗口预算后交由 [P, P] 单日重扫决定，其余异常停在 P 之前。
+                            if d_scan["budget_exhausted"]:
+                                if _rescan_single_day(sub_end, (eff_start, sub_end)):
+                                    continue
+                                break
+                            break
                         if (
                             d_scan["hit_page_cap"]
                             and day_budget < single_day_cap
@@ -2656,15 +2695,11 @@ def collect_alphaengine(
                                 deduped_day = _g._dedupe_ae_items(d_scan["items"])
                                 covered = max(covered, sub_end) if covered else sub_end
                                 partial_days.append((sub_end, len(deduped_day)))
-                            else:
-                                round_cap_hit = True
-                                round_cap_resume_day = sub_end
+                                continue
+                            round_cap_hit = True
+                            round_cap_resume_day = sub_end
                             break
                         if d_scan["budget_exhausted"] and day_budget >= single_day_cap:
-                            if eff_start < sub_end:
-                                if _rescan_single_day(sub_end, (eff_start, sub_end)):
-                                    continue
-                                break
                             deduped_day = _g._dedupe_ae_items(d_scan["items"])
                             covered = max(covered, sub_end) if covered else sub_end
                             partial_days.append((sub_end, len(deduped_day)))
@@ -2719,7 +2754,7 @@ def collect_alphaengine(
             bool(last_scan["has_more"]) or hit_page_cap or round_cap_hit or last_cursor_exhausted
         )
 
-        if complete and carried_covered and start > carried_covered and effective_skipped_backlog is None and not tight_budget:
+        if complete and carried_covered and start > carried_covered and effective_skipped_backlog is None and not skip_lookback:
             complete = False
             covered = carried_covered
             error: str | None = "窗口起点晚于已覆盖日期，未推进覆盖"
@@ -3819,6 +3854,14 @@ def _validate_ae_state(state: dict[str, Any], last_run: dict[str, Any] | None = 
     queries = state.get("queries")
     if not isinstance(queries, list):
         raise CollectError("bad_ae_state", f"{ae_state_key()}.queries 必须是列表")
+    _stop_markers = (
+        "未覆盖日期：",
+        "未覆盖回看窗口：",
+        "留待下一轮",
+        "游标失效",
+        "缓存结果",
+        "未扫完",
+    )
     for row in queries:
         if not isinstance(row, dict) or not isinstance(row.get("query"), str):
             raise CollectError("bad_ae_state", "AE 查询状态缺少 query")
@@ -3827,7 +3870,22 @@ def _validate_ae_state(state: dict[str, Any], last_run: dict[str, Any] | None = 
             raise CollectError("bad_ae_state", "AE 查询状态缺少 window")
         start = parse_day(str(window.get("start")), "ae.window.start")
         end = parse_day(str(window.get("end")), "ae.window.end")
+        if start > end:
+            raise CollectError("bad_ae_state", "AE 窗口起点晚于终点")
+
+        covered = row.get("covered_until")
+        is_complete = row.get("complete") is True
+        if is_complete:
+            if covered != end:
+                raise CollectError("ae_covered_until_mismatch", "完成的 AE 查询只能把 covered_until 记到本窗口终点")
+            covered_day: str | None = end
+        elif covered not in (None, ""):
+            covered_day = parse_day(str(covered), "ae.covered_until")
+        else:
+            covered_day = None
+
         skipped_backlog = row.get("skipped_backlog")
+        skip_until: str | None = None
         if skipped_backlog is not None:
             if not isinstance(skipped_backlog, dict):
                 raise CollectError("bad_ae_state", "AE skipped_backlog 必须是对象")
@@ -3835,38 +3893,53 @@ def _validate_ae_state(state: dict[str, Any], last_run: dict[str, Any] | None = 
             skip_until = parse_day(str(skipped_backlog.get("until")), "ae.skipped_backlog.until")
             if skip_since > skip_until or skip_until >= end:
                 raise CollectError("bad_ae_state", "AE skipped_backlog 日期区间非法")
+            if covered_day is None or skip_until >= covered_day:
+                raise CollectError("bad_ae_state", "AE skipped_backlog 终点必须早于 covered_until")
+
         partial_days_raw = row.get("partial_days")
         partial_days: list[str] = []
         if partial_days_raw is not None:
             if not isinstance(partial_days_raw, list):
                 raise CollectError("bad_ae_state", "AE partial_days 必须是列表")
+            if is_complete and partial_days_raw:
+                raise CollectError("bad_ae_state", "完成的 AE 查询不能包含 partial_days")
             for raw_day in partial_days_raw:
                 parsed_day = parse_day(str(raw_day), "ae.partial_days")
+                if parsed_day < start:
+                    raise CollectError("ae_incomplete_advanced", "AE partial_days 不能早于窗口起点")
                 if parsed_day > end:
                     raise CollectError("ae_incomplete_advanced", "AE partial_days 不能晚于窗口终点")
+                if covered_day is None or parsed_day > covered_day:
+                    raise CollectError("ae_incomplete_advanced", "AE partial_days 不能晚于 covered_until")
+                if skip_until is not None and parsed_day <= skip_until:
+                    raise CollectError("bad_ae_state", "AE partial_days 不能落在 skipped_backlog 区间内")
                 partial_days.append(parsed_day)
-        covered = row.get("covered_until")
-        if row.get("complete") is True:
-            if covered != end:
-                raise CollectError("ae_covered_until_mismatch", "完成的 AE 查询只能把 covered_until 记到本窗口终点")
-        elif covered not in (None, ""):
-            covered_day = parse_day(str(covered), "ae.covered_until")
+
+        if not is_complete and covered_day is not None:
             # 同一天重新采集未完成时，保留已经提交的覆盖日期；单日或连续多日正常用完单日
             # 翻页预算越过窗口终点（含先跳过积压后推进至终点）时，允许 covered_until 记为 end。
             # 从更早的覆盖日非正常抬到本窗口终点，或超过终点，仍然拒绝。
             err_text = str(row.get("error") or "")
-            allow_partial_day_advance = row.get("ok") is True and (
-                (bool(partial_days) and (end in partial_days or row.get("has_more") is False))
+            no_stop_markers = not any(m in err_text for m in _stop_markers)
+            clean_single_day_advance = (
+                row.get("ok") is True
+                and not row.get("stale")
+                and not row.get("hit_page_cap")
+                and row.get("cursor") in (None, "")
+                and no_stop_markers
+            )
+            allow_partial_day_advance = clean_single_day_advance and (
+                (
+                    bool(partial_days)
+                    and "当天超过翻页上限，只取了前" in err_text
+                    and (end in partial_days or row.get("has_more") is False)
+                )
                 or (
-                    not partial_days
+                    "partial_days" not in row
                     and (
                         f"{end} 当天超过翻页上限，只取了前" in err_text
                         or f"{end} 超过翻页上限，只取了前" in err_text
-                        or (
-                            "当天超过翻页上限，只取了前" in err_text
-                            and "未覆盖日期：" not in err_text
-                            and "未覆盖回看窗口：" not in err_text
-                        )
+                        or "当天超过翻页上限，只取了前" in err_text
                     )
                 )
             )
@@ -3876,8 +3949,6 @@ def _validate_ae_state(state: dict[str, Any], last_run: dict[str, Any] | None = 
                 and not allow_partial_day_advance
             ):
                 raise CollectError("ae_incomplete_advanced", "未完成的 AE 查询不能把覆盖日期推进到窗口终点")
-        if start > end:
-            raise CollectError("bad_ae_state", "AE 窗口起点晚于终点")
 
 
 def _snapshot_for_commit(workspace: Path, packet: dict[str, Any]) -> str:

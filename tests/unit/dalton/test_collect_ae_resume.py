@@ -406,7 +406,8 @@ def test_large_total_upstream_keeps_page1_future_day_doc_and_dedupes_returned(
 
     assert len(reqs) == 5
     assert (reqs[0]["start"], reqs[0]["end"]) == ("2026-11-09", "2026-11-17")
-    assert (reqs[1]["start"], reqs[1]["end"]) == ("2026-11-09", "2026-11-12")
+    # 剩 4 次请求不足「回看窗口 + 单日重扫」，首日跳过回看直接扫单日 [11-12, 11-12]
+    assert (reqs[1]["start"], reqs[1]["end"]) == ("2026-11-12", "2026-11-12")
     assert (reqs[3]["start"], reqs[3]["end"]) == ("2026-11-13", "2026-11-13")
 
     st = internal["status"]["alphaengine"]
@@ -481,8 +482,7 @@ def test_multi_round_catchup_zero_loss_when_lookback_fits(
 def test_lookback_late_report_on_page4_not_lost_when_splitting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """探测页全已见且总量超限转按日；按日首子窗口 [start - 3, start] 含回看日期，第 4 页迟到研报不丢。"""
-    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", 5)
+    """探测页全已见且总量超限转按日；默认预算充足时按日首子窗口 [start - 3, start] 含回看日期，第 4 页迟到研报不丢。"""
     docs_by_day = {
         "2026-11-09": ["seen-1"],
         "2026-11-10": ["seen-2", "seen-3", "late-report-1110"],
@@ -505,12 +505,11 @@ def test_lookback_late_report_on_page4_not_lost_when_splitting(
         ae_covered_until="2026-11-11",
     )
 
-    assert len(reqs) == 5
     assert (reqs[0]["start"], reqs[0]["end"]) == ("2026-11-09", "2026-11-14")
-    assert all((r["start"], r["end"]) == ("2026-11-09", "2026-11-12") for r in reqs[1:])
+    assert all((r["start"], r["end"]) == ("2026-11-09", "2026-11-12") for r in reqs[1:5])
     assert "alphaengine:late-report-1110" in ae["new"]
     st = internal["status"]["alphaengine"]
-    assert st["ae_state"] == {"ran": True, "covered_until": "2026-11-12", "resume": None}
+    assert st["ae_state"] == {"ran": True, "covered_until": "2026-11-14", "resume": None}
     assert "越过" not in (st.get("incomplete_reason") or "")
 
 
@@ -1215,7 +1214,7 @@ def test_packet_md_discloses_actual_start_day_on_skipped_backlog() -> None:
     md = collect_mod.render_packet_md(pk)
     assert "更早的积压已跳过" in md
     assert "2026-11-02 至 2026-11-14" in md
-    assert "实际从 2026-11-15 起扫" in md
+    assert "逐日采集起点：2026-11-15" in md
     assert "当前覆盖边界为 2026-11-15" in md
     assert "不得当作" in md
 
@@ -1668,3 +1667,322 @@ def test_tight_budget_1_or_2_requests_advances_every_round_without_loss(
         assert cov2 == "2026-11-14"
         assert got2 == expected_two
         assert r2 == 3
+
+
+# ------------------------------------------- 11. r2 收口：单日扫描门禁 / 提交校验 / 短路 / 标题默认 / 文案 / 能力门控
+
+
+@pytest.mark.parametrize("budget", [3, 5, 6])
+@pytest.mark.parametrize("multi_day", [False, True])
+def test_low_budget_3_5_6_with_crowded_lookback_never_stalls_or_misattributes_partial_day(
+    monkeypatch: pytest.MonkeyPatch,
+    budget: int,
+    multi_day: bool,
+) -> None:
+    """预算 3/5/6 次，回看日 101 篇排在前面、待采日仅 1 篇：跳过回看直接扫单日 [P, P]，
+    既不卡住也不把回看日文档记为当天 partial_days。"""
+    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", budget)
+    docs_by_day: dict[str, list[str]] = {
+        "2026-11-10": [f"lookback-{i}" for i in range(1, 102)],
+        "2026-11-12": ["target-12"],
+    }
+    until = "2026-11-12"
+    if multi_day:
+        docs_by_day["2026-11-13"] = ["target-13"]
+        until = "2026-11-13"
+
+    reqs = _install_date_range_urlopen(
+        monkeypatch,
+        docs_by_day,
+        page_size=20,
+        total_upstream_mode="exact",
+    )
+    internal, ae = collect_mod.collect_internal_and_ae(
+        _META,
+        since="2026-11-12",
+        until=until,
+        seen=set(),
+        ae_covered_until="2026-11-11",
+    )
+    st = internal["status"]["alphaengine"]
+    assert st["ok"] is True
+    assert 1 <= st["pages"] == len(reqs) <= budget
+    assert ("2026-11-12", "2026-11-12") in [(r["start"], r["end"]) for r in reqs]
+    assert st["ae_state"]["covered_until"] == until
+    assert st["completed"] is True
+    assert "partial_days" not in st
+    assert "partial_days" not in st["ae_state"]
+    assert "alphaengine:target-12" in ae["new"]
+    if multi_day:
+        assert "alphaengine:target-13" in ae["new"]
+
+
+def test_validate_ae_state_accepts_valid_and_legacy_rejects_contradictions() -> None:
+    """_validate_ae_state 放行合法多日推进/积压跳跃/旧格式数据包，拒绝日期关系矛盾与伪造 has_more=false。"""
+    prev = {"until": "2026-11-11", "ae_covered_until": "2026-11-11"}
+
+    # (1) 合法：多日推进 + partial_days + skipped_backlog 均满足关系
+    valid_pk = {
+        "since": "2026-11-12",
+        "until": "2026-11-24",
+        "ae_state": {
+            "ran": True,
+            "covered_until": "2026-11-24",
+            "resume": None,
+            "partial_days": ["2026-11-21"],
+            "skipped_backlog": {"since": "2026-11-12", "until": "2026-11-20"},
+        },
+        "internal_status": {
+            "alphaengine": {
+                "ok": True,
+                "completed": False,
+                "incomplete": True,
+                "has_more": False,
+                "partial_days": ["2026-11-21"],
+                "incomplete_reason": (
+                    "未完成: 2026-11-21 当天超过翻页上限，只取了前 100 条，"
+                    "保留已取结果，并将覆盖边界越过推进至 2026-11-24"
+                ),
+            }
+        },
+    }
+    assert collect_mod._validate_ae_state(valid_pk, prev) is None
+
+    # (2) 合法：旧格式数据包（无 partial_days 字段、无 internal_status.alphaengine）兼容放行
+    legacy_pk = {
+        "since": "2026-11-12",
+        "until": "2026-11-14",
+        "ae_state": {"ran": True, "covered_until": "2026-11-14", "resume": None},
+    }
+    assert collect_mod._validate_ae_state(legacy_pk, prev) is None
+
+    # (3) 拒绝：partial_days 早于窗口起点
+    early_partial = json.loads(json.dumps(valid_pk))
+    early_partial["ae_state"].pop("skipped_backlog")
+    early_partial["ae_state"]["partial_days"] = ["2026-11-10"]
+    assert collect_mod._validate_ae_state(early_partial, prev) is not None
+
+    # (4) 拒绝：partial_days 晚于 covered_until
+    late_partial = json.loads(json.dumps(valid_pk))
+    late_partial["ae_state"]["covered_until"] = "2026-11-22"
+    late_partial["ae_state"]["partial_days"] = ["2026-11-23"]
+    assert collect_mod._validate_ae_state(late_partial, prev) is not None
+
+    # (5) 拒绝：skipped_backlog 终点晚于或等于 covered_until
+    late_skip = json.loads(json.dumps(valid_pk))
+    late_skip["ae_state"]["covered_until"] = "2026-11-20"
+    late_skip["ae_state"]["partial_days"] = []
+    assert collect_mod._validate_ae_state(late_skip, prev) is not None
+
+    # (6) 拒绝：未完成窗口凭 has_more=false 把 covered_until 推到终点（无合法单日超限说明或含未扫日期）
+    forged_has_more = {
+        "since": "2026-11-12",
+        "until": "2026-11-15",
+        "ae_state": {
+            "ran": True,
+            "covered_until": "2026-11-15",
+            "resume": None,
+            "partial_days": ["2026-11-12"],
+        },
+        "internal_status": {
+            "alphaengine": {
+                "ok": True,
+                "completed": False,
+                "incomplete": True,
+                "has_more": False,
+                "partial_days": ["2026-11-12"],
+                "incomplete_reason": (
+                    "未完成: 2026-11-12 当天超过翻页上限，只取了前 100 条；"
+                    "本轮请求次数已用完，2026-11-13 起留待下一轮，未扫日期 2026-11-13 至 2026-11-15 留待下一轮续采"
+                ),
+            }
+        },
+    }
+    assert collect_mod._validate_ae_state(forged_has_more, prev) is not None
+
+
+def test_skipped_backlog_disables_short_circuit_even_when_zero_new() -> None:
+    """发生积压跳跃时即使近期窗口扫完且 0 新增，short_circuit_eligible 必须为 False，避免静默提交无新增。"""
+    internal_data = {
+        "status": {
+            "alphaengine": {
+                "ok": True,
+                "completed": True,
+                "incomplete": False,
+                "skipped_backlog": {"since": "2026-11-12", "until": "2026-11-20"},
+                "ae_state": {
+                    "ran": True,
+                    "covered_until": "2026-11-24",
+                    "resume": None,
+                    "skipped_backlog": {"since": "2026-11-12", "until": "2026-11-20"},
+                },
+            }
+        },
+        "new": {},
+    }
+    ae_data = {"status": [internal_data["status"]["alphaengine"]], "new": {}}
+    sec_data = {"status": [], "new": {}}
+    assert collect_mod.summarize_source_failures(internal_data, ae_data, sec_data) == []
+    assert (
+        collect_mod.can_short_circuit(
+            auto_flags=[],
+            internal_data=internal_data,
+            ae_data=ae_data,
+            sec_data=sec_data,
+        )
+        is False
+    )
+
+
+def test_default_search_in_is_title_and_explicit_empty_reverts_to_full_text(
+    tmp_path: Path,
+) -> None:
+    """公司名查询缺省用 search_in='title'；在 company.json 里显式设为空字符串改回全文检索。"""
+    (tmp_path / "data").mkdir(parents=True)
+    (tmp_path / "data" / "company.json").write_text(
+        json.dumps({"ticker": "META", "name": "Meta Platforms"}),
+        encoding="utf-8",
+    )
+    meta_default = collect_mod.resolve_company_meta("META", tmp_path)
+    assert meta_default["ae_search_in"] == "title"
+    _tool, req_default = collect_mod.build_internal_route_request(
+        "alphaengine", meta_default, "2026-11-12", "2026-11-14"
+    )
+    assert req_default["params"]["search_in"] == "title"
+
+    (tmp_path / "data" / "company.json").write_text(
+        json.dumps({"ticker": "META", "name": "Meta Platforms", "ae_search_in": ""}),
+        encoding="utf-8",
+    )
+    meta_full = collect_mod.resolve_company_meta("META", tmp_path)
+    assert meta_full["ae_search_in"] == ""
+    _tool2, req_full = collect_mod.build_internal_route_request(
+        "alphaengine", meta_full, "2026-11-12", "2026-11-14"
+    )
+    assert "search_in" not in req_full["params"]
+
+
+def test_same_day_rerun_overflow_wording_matches_actual_4_page_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """同日重跑 4 页预算、total_upstream=81 时不出现「超过 100 条」与「共 81 条」矛盾。"""
+    _install_scripted_urlopen(
+        monkeypatch,
+        [_ae_page(["d1"], cursor="c1", has_more=True, total_upstream=81)],
+    )
+    internal, _ae = collect_mod.collect_internal_and_ae(
+        _META,
+        since="2026-11-14",
+        until="2026-11-15",
+        seen=set(),
+        ae_covered_until="2026-11-15",
+    )
+    reason = str(internal["status"]["alphaengine"].get("incomplete_reason") or "")
+    assert "超过 100 条" not in reason
+    assert "4 页（80 条）" in reason
+    assert "共 81 条" in reason
+
+
+@pytest.mark.parametrize(
+    "cap_mode",
+    ["bridge_on_ae_off", "core_both_off"],
+)
+def test_thesis_delta_alphaengine_capability_gating_in_skill_and_collect(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cap_mode: str,
+) -> None:
+    """核心形态（研究数据桥开+AE关 / 两者都关）：SKILL.md 隐去 AE 说明，
+    default-thresholds.json 用中性标记关闭 AE 且通过核心安装专有词门禁，
+    collect.py 自动跳过 AlphaEngine 不发请求不报错；Everflow 形态原样不变。"""
+    from src.dalton.capabilities import CapabilityId
+    from src.dalton.content_assembly import (
+        assemble_json_text,
+        assemble_markdown_text,
+        read_assembled_text,
+    )
+
+    proprietary_blacklist = (
+        "researchdata",
+        "alphaengine",
+        "guidepoint",
+        "sales-notes",
+        "tmtb",
+        "funda-ai",
+        "feishu",
+        "weixin",
+        "seed-asr",
+        "dalton-13f-tracker",
+        "everflow",
+    )
+
+    skill_dir = REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-thesis-delta"
+    skill_md_path = skill_dir / "SKILL.md"
+    raw_md = skill_md_path.read_text(encoding="utf-8")
+
+    everflow_caps = frozenset(CapabilityId) - {CapabilityId.TRANSCRIPTION}
+    if cap_mode == "bridge_on_ae_off":
+        target_caps = frozenset({CapabilityId.RESEARCHDATA_BRIDGE})
+    else:
+        target_caps = frozenset()
+
+    md_everflow = assemble_markdown_text(raw_md, path=skill_md_path, capabilities=everflow_caps)
+    md_target = assemble_markdown_text(raw_md, path=skill_md_path, capabilities=target_caps)
+    assert "DALTON_CAP" not in md_everflow and "DALTON_CAP" not in md_target
+    assert "--no-ae" not in md_everflow
+    assert 'route="alphaengine"' in md_everflow
+    assert 'route="alphaengine"' not in md_target
+    if cap_mode == "bridge_on_ae_off":
+        assert "--no-ae" in md_target
+    else:
+        assert "scripts/collect.py" not in md_target
+        # 完整核心形态下，技能内全部装配文件零专有词泄漏（与 test_core_capabilities_gate 同口径）
+        for fp in sorted(skill_dir.rglob("*")):
+            if not fp.is_file() or fp.suffix.lower() not in (".md", ".txt", ".json", ".yaml", ".yml"):
+                continue
+            assembled = read_assembled_text(fp, capabilities=target_caps)
+            assert "DALTON_CAP" not in assembled, f"Unresolved marker in {fp}"
+            lowered = assembled.lower()
+            hits = [term for term in proprietary_blacklist if term in lowered]
+            assert not hits, f"Core skill {fp.name} leaked proprietary terms: {hits}"
+
+    # default-thresholds.json 装配：Everflow 逐字不变；AE 关闭时仅写入中性布尔键，零专有词
+    thr_path = skill_dir / "config" / "default-thresholds.json"
+    raw_thr = thr_path.read_text(encoding="utf-8")
+    assert assemble_json_text(raw_thr, path=thr_path, capabilities=everflow_caps) == raw_thr
+    assembled_thr = assemble_json_text(raw_thr, path=thr_path, capabilities=target_caps)
+    assert json.loads(assembled_thr)["_skip_sellside_library"] is True
+    assert not [term for term in proprietary_blacklist if term in assembled_thr.lower()]
+
+    fake_thr = tmp_path / "default-thresholds.json"
+    fake_thr.write_text(assembled_thr, encoding="utf-8")
+    monkeypatch.setattr(collect_mod, "DEFAULT_THRESHOLDS_PATH", fake_thr)
+
+    loaded_thr = collect_mod.load_thresholds(tmp_path)
+    assert "_skip_sellside_library" not in loaded_thr
+
+    called_routes: list[str] = []
+
+    def _fake_bridge(tool_name: str, req_args: dict[str, Any], timeout: int = 60) -> dict[str, Any]:
+        called_routes.append(str(req_args.get("route") or ""))
+        assert req_args.get("route") != "alphaengine"
+        return {"ok": True, "data": {"results": [], "status": "ok"}}
+
+    monkeypatch.setattr(
+        collect_mod,
+        "call_bridge_jsonrpc",
+        create_autospec(collect_mod.call_bridge_jsonrpc, side_effect=_fake_bridge),
+    )
+    internal, ae = collect_mod.collect_internal_and_ae(
+        _META,
+        since="2026-11-12",
+        until="2026-11-14",
+        seen=set(),
+        skip_ae=False,
+        ae_covered_until="2026-11-11",
+    )
+    assert "alphaengine" not in called_routes
+    assert internal["status"]["alphaengine"]["ok"] is True
+    assert internal["status"]["alphaengine"]["skipped"] == "capability_disabled"
+    assert ae["new"] == {}
+    assert collect_mod.summarize_source_failures(internal, ae, {"status": [], "new": {}}) == []

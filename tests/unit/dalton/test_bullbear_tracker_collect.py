@@ -7337,5 +7337,181 @@ def test_ae_tight_budget_1_or_2_requests_advances_every_round_without_loss(
     assert rounds == (5 if budget == 1 else 3)
 
 
+@pytest.mark.parametrize("budget", [3, 5, 6])
+@pytest.mark.parametrize("multi_day", [False, True])
+def test_ae_low_budget_3_5_6_with_crowded_lookback_never_stalls_or_misattributes_partial_day(
+    monkeypatch: pytest.MonkeyPatch,
+    budget: int,
+    multi_day: bool,
+) -> None:
+    """预算 3/5/6 次，回看日 101 篇排在前面、待采日仅 1 篇：跳过回看直接扫单日 [P, P]，
+    既不卡住也不把回看日文档记为当天 partial_days。"""
+    cfg = collect_mod.load_research_config()
+    first, second = cfg["ae_queries"]
+    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", budget)
+
+    docs_by_day: dict[str, list[str]] = {
+        "2026-11-10": [f"lookback-{i}" for i in range(1, 102)],
+        "2026-11-12": ["target-12"],
+    }
+    until = "2026-11-12"
+    if multi_day:
+        docs_by_day["2026-11-13"] = ["target-13"]
+        until = "2026-11-13"
+
+    q1_windows: list[tuple[str, str]] = []
+    cursors: dict[str, int] = {}
+    seq = {"n": 0}
+
+    def bridge(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        if arguments["query"] == second:
+            return {"ok": True, "data": {"results": [], "has_more": False}}
+        s = str(arguments["start"])
+        e = str(arguments["end"])
+        q1_windows.append((s, e))
+        cur = (arguments.get("params") or {}).get("cursor")
+        offset = cursors[str(cur)] if cur is not None else 0
+        matched = [(d, did) for d in sorted(docs_by_day) if s <= d <= e for did in docs_by_day[d]]
+        chunk = matched[offset : offset + 20]
+        nxt = offset + len(chunk)
+        has_more = nxt < len(matched)
+        next_cur = None
+        if has_more:
+            seq["n"] += 1
+            next_cur = f"ae1:c{seq['n']}"
+            cursors[next_cur] = nxt
+        return {
+            "ok": True,
+            "data": {
+                "results": [
+                    {"doc_id": f"alphaengine:{did}", "title": f"Microsoft {did}", "companies": ["Microsoft"], "publish_time": d}
+                    for d, did in chunk
+                ],
+                "has_more": has_more,
+                "cursor": next_cur,
+                "total_upstream": len(matched),
+            },
+        }
+
+    _patch_bridge(monkeypatch, bridge)
+    last_run = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": q, "complete": True, "covered_until": "2026-11-11", "ok": True, "window": {"start": "2026-11-08", "end": "2026-11-11"}}
+                for q in (first, second)
+            ]
+        }
+    }
+    ae, state = collect_mod.collect_alphaengine(cfg, "2026-11-12", until, set(), last_run)
+    row = {r["query"]: r for r in state["queries"]}[first]
+    assert 1 <= len(q1_windows) <= budget
+    assert ("2026-11-12", "2026-11-12") in q1_windows
+    assert row["ok"] is True and row["complete"] is True
+    assert row["covered_until"] == until
+    assert "partial_days" not in row
+    assert "alphaengine:target-12" in ae["new"]
+    if multi_day:
+        assert "alphaengine:target-13" in ae["new"]
 
 
+def test_ae_validate_state_accepts_valid_and_legacy_rejects_contradictions() -> None:
+    """_validate_ae_state 放行合法多日推进/积压跳跃/旧格式数据包，拒绝矛盾 partial_days/skipped_backlog 与伪造 has_more=false。"""
+    last_run = {
+        "msft_ae_state": {
+            "queries": [
+                {"query": "Microsoft", "complete": True, "covered_until": "2026-11-11", "ok": True, "window": {"start": "2026-11-08", "end": "2026-11-11"}}
+            ]
+        }
+    }
+
+    # (1) 合法：多日推进 + partial_days + skipped_backlog 均合法
+    valid_row = {
+        "query": "Microsoft",
+        "window": {"start": "2026-11-18", "end": "2026-11-24"},
+        "cursor": None,
+        "has_more": False,
+        "complete": False,
+        "covered_until": "2026-11-24",
+        "ok": True,
+        "partial_days": ["2026-11-21"],
+        "skipped_backlog": {"since": "2026-11-12", "until": "2026-11-20"},
+        "error": "2026-11-21 当天超过翻页上限，只取了前 100 条，覆盖边界已推进至 2026-11-24",
+    }
+    collect_mod._validate_ae_state({"queries": [valid_row]}, last_run)
+
+    # (2) 合法：旧格式数据包（无 partial_days 字段）保留兼容
+    legacy_row = {
+        "query": "Microsoft",
+        "window": {"start": "2026-11-08", "end": "2026-11-12"},
+        "cursor": None,
+        "has_more": True,
+        "complete": False,
+        "covered_until": "2026-11-12",
+        "ok": True,
+        "error": "2026-11-12 超过翻页上限，只取了前 100 条，覆盖边界已推进至 2026-11-12",
+    }
+    collect_mod._validate_ae_state({"queries": [legacy_row]}, last_run)
+
+    # (3) 拒绝：partial_days 早于窗口起点
+    early_partial = {**valid_row, "partial_days": ["2026-11-17"]}
+    early_partial.pop("skipped_backlog")
+    with pytest.raises(collect_mod.CollectError):
+        collect_mod._validate_ae_state({"queries": [early_partial]}, last_run)
+
+    # (4) 拒绝：partial_days 晚于 covered_until
+    late_partial = {**valid_row, "covered_until": "2026-11-22", "partial_days": ["2026-11-23"]}
+    with pytest.raises(collect_mod.CollectError):
+        collect_mod._validate_ae_state({"queries": [late_partial]}, last_run)
+
+    # (5) 拒绝：skipped_backlog 晚于或等于 covered_until
+    late_skip = {**valid_row, "covered_until": "2026-11-20", "partial_days": []}
+    with pytest.raises(collect_mod.CollectError):
+        collect_mod._validate_ae_state({"queries": [late_skip]}, last_run)
+
+    # (6) 拒绝：凭 has_more=false 把未完成窗口推进到终点（含停止/未覆盖提示或无单日超限说明）
+    forged_has_more = {
+        "query": "Microsoft",
+        "window": {"start": "2026-11-08", "end": "2026-11-15"},
+        "cursor": None,
+        "has_more": False,
+        "complete": False,
+        "covered_until": "2026-11-15",
+        "ok": True,
+        "partial_days": ["2026-11-12"],
+        "error": "2026-11-12 当天超过翻页上限，只取了前 100 条；本轮请求次数已用完，2026-11-13 起留待下一轮，未覆盖日期：2026-11-13 至 2026-11-15",
+    }
+    with pytest.raises(collect_mod.CollectError) as exc_info:
+        collect_mod._validate_ae_state({"queries": [forged_has_more]}, last_run)
+    assert exc_info.value.status == "ae_incomplete_advanced"
+
+    forged_no_err = {**forged_has_more, "error": "本轮未扫完"}
+    with pytest.raises(collect_mod.CollectError) as exc_info2:
+        collect_mod._validate_ae_state({"queries": [forged_no_err]}, last_run)
+    assert exc_info2.value.status == "ae_incomplete_advanced"
+
+
+def test_duplicate_ae_queries_rejected_on_config_load(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """配置中同一查询词出现两次（如一条全文、一条标题）在配置加载与解析时均报错。"""
+    dup_cfg = {
+        "ticker": "META",
+        "ae_max_searches": 2,
+        "ae_queries": [
+            "Meta Platforms",
+            {"query": "Meta Platforms", "search_in": "title"},
+        ],
+    }
+    with pytest.raises(collect_mod.CollectError) as exc_info:
+        collect_mod._parse_ae_queries(dup_cfg)
+    assert exc_info.value.status == "duplicate_ae_query"
+
+    cfg_mod = collect_mod._load_tracker_config()
+    monkeypatch.setattr(
+        cfg_mod,
+        "load_validated_config",
+        create_autospec(cfg_mod.load_validated_config, return_value=dup_cfg),
+    )
+    with pytest.raises(collect_mod.CollectError) as exc_load:
+        collect_mod.load_research_config()
+    assert exc_load.value.status == "duplicate_ae_query"
