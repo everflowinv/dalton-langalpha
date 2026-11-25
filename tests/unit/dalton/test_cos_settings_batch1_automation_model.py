@@ -5176,7 +5176,7 @@ async def test_r7_deferred_handoff_earlier_candidate_uses_its_own_run_snapshot_a
 
 
 def test_r7_d050_migration_sql_contains_backfill_and_downgrade() -> None:
-    """Round 7 (grok R5 high): offline Alembic SQL generation for d046 -> d050 and d050 -> d046
+    """Round 7 (grok R5 high): offline Alembic SQL generation for d052 -> d050 and d050 -> d052
     produces valid DDL + backfill UPDATE from earliest run metadata / automations config + DROP."""
     import io
     from pathlib import Path
@@ -5201,7 +5201,7 @@ def test_r7_d050_migration_sql_contains_backfill_and_downgrade() -> None:
                 command.downgrade(cfg, rev_range, sql=True)
         return buf.getvalue()
 
-    up_sql = _render_sql("upgrade", "d046:d050")
+    up_sql = _render_sql("upgrade", "d052:d050")
     assert "ALTER TABLE automation_executions" in up_sql
     assert "ADD COLUMN IF NOT EXISTS llm_model TEXT" in up_sql
     assert "ADD COLUMN IF NOT EXISTS reasoning_effort VARCHAR(16)" in up_sql
@@ -5216,7 +5216,7 @@ def test_r7_d050_migration_sql_contains_backfill_and_downgrade() -> None:
     assert "automation_reasoning_effort_configured" in up_sql
     assert "a.metadata->>'llm_model_system_only'" in up_sql
 
-    down_sql = _render_sql("downgrade", "d050:d046")
+    down_sql = _render_sql("downgrade", "d050:d052")
     assert "DROP COLUMN IF EXISTS snapshot_taken" in down_sql
     assert "DROP COLUMN IF EXISTS llm_model_system_only" in down_sql
     assert "DROP COLUMN IF EXISTS reasoning_effort" in down_sql
