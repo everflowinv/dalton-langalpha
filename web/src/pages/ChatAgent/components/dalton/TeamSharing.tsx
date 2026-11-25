@@ -63,8 +63,8 @@ export async function fetchTeamWorkspaces(): Promise<TeamWorkspacesResponse> {
 }
 
 export function useTeamWorkspaces(enabled = true) {
-  const identity = useCallerIdentity();
-  const { hasCapability } = useCapabilities();
+  const identity = useCallerIdentity({ enabled });
+  const { hasCapability } = useCapabilities({ enabled });
   return useQuery({
     queryKey: queryKeys.workspaces.team(),
     queryFn: fetchTeamWorkspaces,
@@ -106,9 +106,10 @@ export function useTeamReadOnly(
 ): TeamReadOnlyState {
   const location = useLocation();
   const queryClient = useQueryClient();
-  const identity = useCallerIdentity();
-  const { user: currentUser } = useUser({ enabled: Boolean(workspaceId) && isDaltonAuth });
-  const { data: teamData } = useTeamWorkspaces(Boolean(workspaceId));
+  const teamAccessActive = Boolean(workspaceId) && isDaltonAuth;
+  const identity = useCallerIdentity({ enabled: teamAccessActive });
+  const { user: currentUser } = useUser({ enabled: teamAccessActive });
+  const { data: teamData } = useTeamWorkspaces(teamAccessActive);
   const callerTier = identity.isPlatform
     ? null
     : identity.status === 'ready'
@@ -274,9 +275,9 @@ export function TeamWorkspacesSection({
   const { t } = useTranslation();
   const locale = useLocale();
   const navigate = useNavigate();
-  const { data } = useTeamWorkspaces();
-  const identity = useCallerIdentity();
-  const { hasCapability } = useCapabilities();
+  const { data } = useTeamWorkspaces(isDaltonAuth);
+  const identity = useCallerIdentity({ enabled: isDaltonAuth });
+  const { hasCapability } = useCapabilities({ enabled: isDaltonAuth });
   const [sectionExpanded, setSectionExpanded] = useState(true);
   const [expandedMembers, setExpandedMembers] = useState<Set<string>>(() => new Set());
 

@@ -65,6 +65,12 @@ export interface CallerIdentity extends CallerIdentitySnapshot {
 
 export interface UseCallerIdentityOptions {
   /**
+   * When false, does not start network fetches or revalidation for
+   * `/credentials/status` while still reading any cached snapshot from
+   * `queryClient`. Defaults to true.
+   */
+  enabled?: boolean;
+  /**
    * When true (alongside `open !== false`), triggers `revalidate()` on mount /
    * open and on window return-to-foreground (`visibilitychange` / `focus`),
    * plus silent 60s background refresh while open.
@@ -365,6 +371,7 @@ function useSafeAuthUserId(): string | null {
 }
 
 export function useCallerIdentity(options?: UseCallerIdentityOptions): CallerIdentity {
+  const enabled = options?.enabled ?? true;
   const contextClient = useContext(QueryClientContext);
   const queryClient = contextClient ?? FALLBACK_QUERY_CLIENT;
   const userId = useSafeAuthUserId();
@@ -383,6 +390,7 @@ export function useCallerIdentity(options?: UseCallerIdentityOptions): CallerIde
   const isMisconfiguredSupabase =
     !isPlatformIdentityMode && daltonAuthMode === 'supabase' && !hasAuthEnv;
   const isSensitiveOpen =
+    enabled &&
     !isPlatformIdentityMode &&
     !isMisconfiguredSupabase &&
     Boolean(options?.revalidateOnOpen) &&
@@ -395,6 +403,7 @@ export function useCallerIdentity(options?: UseCallerIdentityOptions): CallerIde
   const keyId = useMemo(() => keyIdOf(queryKey), [queryKey]);
 
   const queryEnabled =
+    enabled &&
     !isPlatformIdentityMode &&
     !isMisconfiguredSupabase &&
     contextClient !== undefined &&
@@ -439,7 +448,7 @@ export function useCallerIdentity(options?: UseCallerIdentityOptions): CallerIde
   );
 
   const revalidate = useCallback(async (): Promise<void> => {
-    if (isPlatformIdentityMode || isMisconfiguredSupabase || contextClient === undefined || !userId) {
+    if (!enabled || isPlatformIdentityMode || isMisconfiguredSupabase || contextClient === undefined || !userId) {
       return;
     }
     const entry = getRevalidationEntry(queryClient, keyId, true);
@@ -465,6 +474,7 @@ export function useCallerIdentity(options?: UseCallerIdentityOptions): CallerIde
       }
     }
   }, [
+    enabled,
     isPlatformIdentityMode,
     isMisconfiguredSupabase,
     contextClient,
