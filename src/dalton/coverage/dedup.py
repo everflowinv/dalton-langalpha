@@ -39,7 +39,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -51,7 +51,9 @@ from pydantic import BaseModel
 from src.dalton.access_tiers import get_user_tier
 from src.dalton.coverage.identity import (
     _extract_ticker_from_text,
+    canonical_workspace_ticker_key,
     is_historical_duplicate_workspace,
+    normalize_ticker_key,
 )
 from src.dalton.credentials import get_team_credential_holder_id
 from src.dalton.database.coverage_units import _norm_uuid
@@ -270,8 +272,7 @@ def _safe_workspace_name_key(raw: str | None) -> str | None:
 
 
 def _is_internal_team_owner(owner_id: str | None, owner_email: Any) -> bool:
-    tier = sharing_mod._classify_owner_row_tier(owner_id, owner_email)
-    return tier in ("admin", "internal")
+    return sharing_mod.is_internal_team_owner(owner_id, owner_email)
 
 
 def _resolve_display_name(
@@ -1223,6 +1224,7 @@ async def _judge_candidates_with_llm(
     is_external: bool = False,
     skip_journal: bool = False,
     suggestion_out: list[DedupCoverageSuggestion] | None = None,
+    partial_failure_out: list[Exception] | None = None,
 ) -> list[tuple[_CandidateEntry, str, str]]:
     """Run parallel batched LLM matching under a shared 15s deadline."""
     if not entries:
@@ -1296,6 +1298,8 @@ async def _judge_candidates_with_llm(
             suggestion_out.append(best_suggestion)
 
     if failed_exc is not None:
+        if partial_failure_out is not None:
+            partial_failure_out.append(failed_exc)
         logger.warning(
             "Company workspace dedup partial batch failure (%s, succeeded=%d/%d, workspace_count=%d)",
             type(failed_exc).__name__,
@@ -1329,6 +1333,14 @@ async def _judge_candidates_with_llm(
 async def _refresh_live_hits(
     hits: list[tuple[_CandidateEntry, str, str]],
     *,
+    raw_name: str | None = None,
+    uid: str | None = None,
+    is_external: bool = False,
+    partial_failure_out: list[Exception] | None = None,
+    unverified_downgraded_out: list[
+        tuple[_CandidateEntry, dict[str, Any], str, str]
+    ]
+    | None = None,
     conn: Any = None,
 ) -> list[tuple[_CandidateEntry, dict[str, Any] | None, str, str]]:
     """Re-query hit workspaces and unit bindings after LLM return, releasing conn before permission checks."""
@@ -1368,13 +1380,13 @@ async def _refresh_live_hits(
                         continue
                     unit_state_by_id.setdefault(uid_row, dict(row))
                     u_row = unit_state_by_id[uid_row]
-                    u_kind = str(u_row.get("kind") or "company").strip().lower()
-                    u_status = str(
-                        u_row.get("status") if "status" in u_row else "active"
-                    ).strip().lower()
+                    # --- DALTON-HOOK(cos-settings-tools): begin ---
+                    # Still load live workspace status when bound unit is archived/rebound so an
+                    # active matching workspace (e.g. '00700') is preserved as an unclassified match.
                     bound_ws = _norm_uuid(u_row.get("workspace_id"))
-                    if bound_ws and u_kind == "company" and u_status == "active":
+                    if bound_ws:
                         ws_ids.add(bound_ws)
+                    # --- DALTON-HOOK(cos-settings-tools): end ---
 
             if ws_ids:
                 await cur.execute(
@@ -1429,17 +1441,40 @@ async def _refresh_live_hits(
                     }
 
     raw_refreshed: list[tuple[_CandidateEntry, dict[str, Any] | None, str, str]] = []
+    downgraded_hits: list[tuple[_CandidateEntry, dict[str, Any], str, str]] = []
     for entry, conf, reason in hits:
         if entry.unit_id:
             u_row = unit_state_by_id.get(entry.unit_id)
-            if u_row is None:
-                continue
-            u_kind = str(u_row.get("kind") or "company").strip().lower()
+            u_kind = str((u_row or {}).get("kind") or "company").strip().lower()
             u_status = str(
-                u_row.get("status") if "status" in u_row else "active"
+                (u_row or {}).get("status") if (u_row is not None and "status" in u_row) else "active"
             ).strip().lower()
-            if u_kind != "company" or u_status != "active":
+            if u_row is None or u_kind != "company" or u_status != "active":
+                # --- DALTON-HOOK(cos-settings-tools): begin ---
+                # Unit missing/archived: drop the coverage unit, and stage its still-live
+                # workspace for self-match verification against ``raw_name`` after releasing conn.
+                fallback_ws_id = entry.ws_id
+                fresh_ws = live_ws_by_id.get(fallback_ws_id) if fallback_ws_id else None
+                if fresh_ws is None:
+                    continue
+                updated_entry = replace(
+                    entry,
+                    is_unit=False,
+                    unit_id=None,
+                    ws_id=fallback_ws_id,
+                    unbound_unit=False,
+                    workspace_name=fresh_ws["name"],
+                    owner_name=fresh_ws.get("owner_name") or entry.owner_name,
+                    lead_analyst_name=None,
+                    ticker=entry.doc_ticker,
+                    unit_ticker=None,
+                    doc_ticker=entry.doc_ticker,
+                    unit_display_name=None,
+                    ws_row=fresh_ws,
+                )
+                downgraded_hits.append((updated_entry, fresh_ws, conf, reason))
                 continue
+                # --- DALTON-HOOK(cos-settings-tools): end ---
 
             lead_uid = str(
                 u_row.get("lead_analyst_user_id") or u_row.get("owner_user_id") or ""
@@ -1509,6 +1544,74 @@ async def _refresh_live_hits(
             ws_row=fresh_ws,
         )
         raw_refreshed.append((updated_entry, fresh_ws, conf, reason))
+
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    # Re-verify workspaces whose bound coverage unit archived/rebound after releasing conn,
+    # so unrelated workspaces (e.g. "行业笔记") that only matched via the unit are dropped.
+    if downgraded_hits:
+        cleaned_query = str(raw_name or "").strip()
+        if not cleaned_query:
+            raw_refreshed.extend(downgraded_hits)
+        else:
+            from src.tools.secretary.approvals import is_duplicate_name
+
+            target_ticker_key = canonical_workspace_ticker_key(cleaned_query)
+            need_rejudge: list[tuple[_CandidateEntry, dict[str, Any], str, str]] = []
+            for upd_entry, f_ws, c_conf, r_reason in downgraded_hits:
+                fresh_ws_name = str(f_ws.get("name") or "").strip()
+                ws_ticker_key = canonical_workspace_ticker_key(fresh_ws_name)
+                doc_ticker_key = normalize_ticker_key(upd_entry.doc_ticker)
+                if is_duplicate_name(cleaned_query, fresh_ws_name) or (
+                    target_ticker_key is not None
+                    and (
+                        ws_ticker_key == target_ticker_key
+                        or doc_ticker_key == target_ticker_key
+                    )
+                ):
+                    raw_refreshed.append((upd_entry, f_ws, c_conf, r_reason))
+                else:
+                    need_rejudge.append((upd_entry, f_ws, c_conf, r_reason))
+
+            if need_rejudge:
+                rejudge_by_ws = {
+                    e.ws_id: f_ws for e, f_ws, _, _ in need_rejudge if e.ws_id
+                }
+                before_failures = (
+                    len(partial_failure_out) if partial_failure_out is not None else 0
+                )
+                try:
+                    re_hits = await _judge_candidates_with_llm(
+                        uid=uid or "",
+                        raw_name=cleaned_query,
+                        entries=[e for e, _, _, _ in need_rejudge],
+                        is_external=is_external,
+                        partial_failure_out=partial_failure_out,
+                    )
+                    matched_re_ws_ids: set[str] = set()
+                    for re_entry, re_conf, re_reason in re_hits:
+                        f_ws = rejudge_by_ws.get(re_entry.ws_id or "")
+                        if f_ws is not None:
+                            if re_entry.ws_id:
+                                matched_re_ws_ids.add(re_entry.ws_id)
+                            raw_refreshed.append((re_entry, f_ws, re_conf, re_reason))
+                    if (
+                        unverified_downgraded_out is not None
+                        and partial_failure_out is not None
+                        and len(partial_failure_out) > before_failures
+                    ):
+                        for item in need_rejudge:
+                            if item[0].ws_id not in matched_re_ws_ids:
+                                unverified_downgraded_out.append(item)
+                except Exception as exc:
+                    if partial_failure_out is not None:
+                        partial_failure_out.append(exc)
+                    if unverified_downgraded_out is not None:
+                        unverified_downgraded_out.extend(need_rejudge)
+                    logger.warning(
+                        "Company dedup downgraded workspace recheck failed (%s)",
+                        type(exc).__name__,
+                    )
+    # --- DALTON-HOOK(cos-settings-tools): end ---
 
     # Deduplicate after refreshing bindings (e.g. a previously unbound unit bound
     # to a workspace that was also matched in the same batch/run).
@@ -1637,7 +1740,29 @@ async def _find_matches(
     # Re-verify live workspace/unit status and bindings after LLM return, release DB
     # connection before permission checks, check read access across ALL live hits,
     # and truncate to MAX_DUPLICATE_MATCHES afterwards.
-    all_live_hits = await _refresh_live_hits(hits, conn=conn)
+    recheck_failures: list[Exception] = []
+    unverified_downgraded: list[tuple[_CandidateEntry, dict[str, Any], str, str]] = []
+    all_live_hits = await _refresh_live_hits(
+        hits,
+        raw_name=raw_name,
+        uid=uid,
+        is_external=(caller_tier == "external"),
+        partial_failure_out=recheck_failures,
+        unverified_downgraded_out=unverified_downgraded,
+        conn=conn,
+    )
+    if recheck_failures and not all_live_hits and unverified_downgraded:
+        # Downgraded live workspace re-verification failed: cannot confirm the
+        # live workspace is unrelated, so keep the downgraded live candidate(s)
+        # instead of silently dropping them to allow creation.
+        seen_unverified_ws: set[str] = set()
+        for upd_entry, f_ws, c_conf, r_reason in unverified_downgraded:
+            ws_key_id = str(f_ws.get("workspace_id") or upd_entry.ws_id or "").strip()
+            if ws_key_id and ws_key_id in seen_unverified_ws:
+                continue
+            if ws_key_id:
+                seen_unverified_ws.add(ws_key_id)
+            all_live_hits.append((upd_entry, f_ws, c_conf, r_reason))
     if not all_live_hits:
         if suggestion_out:
             return DuplicateMatch(
@@ -1671,8 +1796,309 @@ async def _find_matches(
         message=message,
         matches=tuple(resolved),
         matched_workspace_ids=tuple(matched_ids),
-        suggestion=suggestion_out[0] if (suggestion_out and all_hits_readable) else None,
+        suggestion=(
+            suggestion_out[0]
+            if (suggestion_out and all_hits_readable and not recheck_failures)
+            else None
+        ),
     )
+
+
+@dataclass(frozen=True)
+class CompanyDedupRecheckSnapshot:
+    """Result of the lock-free Phase 1 company duplicate recheck executed after
+    user approval and before acquiring ``lock_user_writes``.
+
+    - ``status == "clear"``: no undisclosed duplicate matched; ``checked_candidates``
+      holds ``(workspace_id, workspace_name, unit_ticker)`` tuples for deterministic
+      drift verification inside the write lock.
+    - ``status == "matched"``: one or more undisclosed duplicates matched
+      (``matched_workspace_ids`` names the matched workspace IDs).
+    - ``status == "unavailable"``: tier lookup, candidate read, LLM call, or
+      payload parse failed, so duplicate freedom could not be confirmed.
+    """
+
+    status: Literal["clear", "matched", "unavailable"]
+    matched_workspace_ids: tuple[str, ...] = ()
+    has_unbound_or_unreadable_match: bool = False
+    checked_candidates: tuple[tuple[str, str, str | None], ...] = ()
+    active: bool = True
+    check_colleague_workspaces: bool = False
+
+
+async def recheck_company_workspace_before_create(
+    user_id: str | None,
+    name: str | None,
+    *,
+    channel: str = "cos",
+    expected_duplicate_workspace_id: str | None = None,
+) -> CompanyDedupRecheckSnapshot:
+    """Run lock-free company dedup (Phase 1) after confirmation approval.
+
+    Never holds a DB lock while awaiting ``dalton_complete`` / budget / journal
+    queries. Distinguishes explicit duplicate matches (with their workspace IDs)
+    from check failures (``status="unavailable"``), and returns the observed
+    candidate list for deterministic Phase 2 verification inside the lock.
+    """
+    if not is_coverage_units_enabled() or not is_dalton_supabase_auth_enabled():
+        return CompanyDedupRecheckSnapshot(status="clear", active=False)
+
+    cleaned_channel = str(channel or "cos").strip().lower()
+    if cleaned_channel not in ("web", "cos"):
+        raise ValueError(f"Unsupported channel: {channel!r}")
+
+    uid = str(user_id or "").strip()
+    raw_name = str(name or "").strip()
+    if not uid or not raw_name:
+        return CompanyDedupRecheckSnapshot(status="clear", active=False)
+
+    stats = {"workspace_count": 0}
+    try:
+        caller_tier = await _resolve_caller_tier(uid)
+        if caller_tier == "company":
+            return CompanyDedupRecheckSnapshot(status="clear", active=False)
+        check_colleagues = caller_tier != "external"
+        early_exit, entries = await _collect_candidates(
+            uid,
+            raw_name,
+            caller_tier=caller_tier,
+            stats=stats,
+        )
+        checked_candidates = tuple(
+            (entry.ws_id, entry.workspace_name, normalize_ticker_key(entry.unit_ticker))
+            for entry in entries
+            if entry.ws_id
+        )
+        if early_exit:
+            return CompanyDedupRecheckSnapshot(
+                status="matched",
+                has_unbound_or_unreadable_match=True,
+                checked_candidates=checked_candidates,
+                check_colleague_workspaces=check_colleagues,
+            )
+        if not entries:
+            return CompanyDedupRecheckSnapshot(
+                status="clear",
+                checked_candidates=(),
+                check_colleague_workspaces=check_colleagues,
+            )
+
+        target_ticker_key = canonical_workspace_ticker_key(raw_name)
+
+        async def _deterministic_ticker_match_snapshot(
+            *,
+            checked_hits: Sequence[tuple[_CandidateEntry, str, str]] = (),
+            live_hits: Sequence[
+                tuple[_CandidateEntry, dict[str, Any] | None, str, str]
+            ] = (),
+        ) -> CompanyDedupRecheckSnapshot | None:
+            if target_ticker_key is None:
+                return None
+
+            live_by_unit_id: dict[
+                str, tuple[_CandidateEntry, dict[str, Any] | None]
+            ] = {}
+            live_by_ws_id: dict[
+                str, tuple[_CandidateEntry, dict[str, Any] | None]
+            ] = {}
+            for live_entry, fresh_ws, _conf, _reason in live_hits:
+                if live_entry.unit_id:
+                    live_by_unit_id[live_entry.unit_id] = (live_entry, fresh_ws)
+                live_ws_id = str(
+                    (fresh_ws or {}).get("workspace_id") or live_entry.ws_id or ""
+                ).strip()
+                if live_ws_id:
+                    live_by_ws_id[live_ws_id] = (live_entry, fresh_ws)
+
+            dead_unit_ids = {
+                hit_entry.unit_id
+                for hit_entry, _conf, _reason in checked_hits
+                if hit_entry.unit_id and hit_entry.unit_id not in live_by_unit_id
+            }
+            dead_ws_ids = {
+                hit_entry.ws_id
+                for hit_entry, _conf, _reason in checked_hits
+                if hit_entry.ws_id and hit_entry.ws_id not in live_by_ws_id
+            }
+
+            confirmed_pairs: list[tuple[_CandidateEntry, dict[str, Any] | None]] = []
+            to_verify: list[tuple[_CandidateEntry, str, str]] = []
+            for entry in entries:
+                entry_ws_id = entry.ws_id
+                if (
+                    expected_duplicate_workspace_id is not None
+                    and entry_ws_id is not None
+                    and entry_ws_id == expected_duplicate_workspace_id
+                ):
+                    continue
+                unit_key = normalize_ticker_key(entry.unit_ticker)
+                name_key = canonical_workspace_ticker_key(entry.workspace_name)
+                if unit_key != target_ticker_key and name_key != target_ticker_key:
+                    continue
+                if entry.unit_id and entry.unit_id in dead_unit_ids:
+                    if not entry_ws_id or entry_ws_id in dead_ws_ids or name_key != target_ticker_key:
+                        continue
+                    ws_only_entry = replace(
+                        entry,
+                        is_unit=False,
+                        unit_id=None,
+                        unbound_unit=False,
+                        unit_ticker=None,
+                        unit_display_name=None,
+                    )
+                    if entry_ws_id in live_by_ws_id:
+                        confirmed_pairs.append(live_by_ws_id[entry_ws_id])
+                    else:
+                        to_verify.append((ws_only_entry, "high", "deterministic_ticker_match"))
+                    continue
+                if entry_ws_id and entry_ws_id in dead_ws_ids:
+                    continue
+                if entry.unit_id and entry.unit_id in live_by_unit_id:
+                    confirmed_pairs.append(live_by_unit_id[entry.unit_id])
+                    continue
+                if entry_ws_id and entry_ws_id in live_by_ws_id:
+                    confirmed_pairs.append(live_by_ws_id[entry_ws_id])
+                    continue
+                to_verify.append((entry, "high", "deterministic_ticker_match"))
+
+            if to_verify:
+                refreshed_det = await _refresh_live_hits(to_verify)
+                for live_entry, fresh_ws, _conf, _reason in refreshed_det:
+                    confirmed_pairs.append((live_entry, fresh_ws))
+
+            det_ids: list[str] = []
+            det_unbound = False
+            for live_entry, fresh_ws in confirmed_pairs:
+                live_ws_id = (
+                    str(
+                        (fresh_ws or {}).get("workspace_id")
+                        or live_entry.ws_id
+                        or ""
+                    ).strip()
+                    or None
+                )
+                if (
+                    expected_duplicate_workspace_id is not None
+                    and live_ws_id is not None
+                    and live_ws_id == expected_duplicate_workspace_id
+                ):
+                    continue
+                live_unit_key = normalize_ticker_key(live_entry.unit_ticker)
+                live_name_key = canonical_workspace_ticker_key(
+                    live_entry.workspace_name
+                )
+                if (
+                    live_unit_key != target_ticker_key
+                    and live_name_key != target_ticker_key
+                ):
+                    continue
+                if live_ws_id:
+                    if live_ws_id not in det_ids:
+                        det_ids.append(live_ws_id)
+                if live_entry.unbound_unit or not live_ws_id:
+                    det_unbound = True
+            if det_ids or det_unbound:
+                return CompanyDedupRecheckSnapshot(
+                    status="matched",
+                    matched_workspace_ids=tuple(det_ids),
+                    has_unbound_or_unreadable_match=det_unbound,
+                    checked_candidates=checked_candidates,
+                    check_colleague_workspaces=check_colleagues,
+                )
+            return None
+
+        partial_failures: list[Exception] = []
+        hits = await _judge_candidates_with_llm(
+            uid=uid,
+            raw_name=raw_name,
+            entries=entries,
+            stats=stats,
+            is_external=(caller_tier == "external"),
+            partial_failure_out=partial_failures,
+        )
+        if not hits:
+            det_match = await _deterministic_ticker_match_snapshot()
+            if det_match is not None:
+                return det_match
+            if partial_failures:
+                return CompanyDedupRecheckSnapshot(status="unavailable")
+            return CompanyDedupRecheckSnapshot(
+                status="clear",
+                checked_candidates=checked_candidates,
+                check_colleague_workspaces=check_colleagues,
+            )
+
+        all_live_hits = await _refresh_live_hits(
+            hits,
+            raw_name=raw_name,
+            uid=uid,
+            is_external=(caller_tier == "external"),
+            partial_failure_out=partial_failures,
+        )
+        if not all_live_hits:
+            det_match = await _deterministic_ticker_match_snapshot(
+                checked_hits=hits,
+                live_hits=all_live_hits,
+            )
+            if det_match is not None:
+                return det_match
+            if partial_failures:
+                return CompanyDedupRecheckSnapshot(status="unavailable")
+            return CompanyDedupRecheckSnapshot(
+                status="clear",
+                checked_candidates=checked_candidates,
+                check_colleague_workspaces=check_colleagues,
+            )
+
+        matched_ids: list[str] = []
+        has_unbound_or_unreadable = False
+        for entry, fresh_ws, _conf, _reason in all_live_hits:
+            cand, ws_id = await _resolve_live_hit_candidate(
+                uid,
+                entry,
+                fresh_ws,
+                channel=cleaned_channel,
+            )
+            if ws_id:
+                if ws_id not in matched_ids:
+                    matched_ids.append(ws_id)
+            if cand.unbound_unit or not cand.workspace_id:
+                has_unbound_or_unreadable = True
+
+        has_undisclosed = (
+            expected_duplicate_workspace_id is None
+            or has_unbound_or_unreadable
+            or any(mid != expected_duplicate_workspace_id for mid in matched_ids)
+            or not matched_ids
+        )
+        if has_undisclosed:
+            return CompanyDedupRecheckSnapshot(
+                status="matched",
+                matched_workspace_ids=tuple(matched_ids),
+                has_unbound_or_unreadable_match=has_unbound_or_unreadable,
+                checked_candidates=checked_candidates,
+                check_colleague_workspaces=check_colleagues,
+            )
+        det_match = await _deterministic_ticker_match_snapshot(
+            checked_hits=hits,
+            live_hits=all_live_hits,
+        )
+        if det_match is not None:
+            return det_match
+        if partial_failures:
+            return CompanyDedupRecheckSnapshot(status="unavailable")
+        return CompanyDedupRecheckSnapshot(
+            status="clear",
+            checked_candidates=checked_candidates,
+            check_colleague_workspaces=check_colleagues,
+        )
+    except Exception as exc:
+        logger.warning(
+            "Lock-free company workspace dedup recheck unavailable (%s, workspace_count=%d)",
+            type(exc).__name__,
+            stats["workspace_count"],
+        )
+        return CompanyDedupRecheckSnapshot(status="unavailable")
 
 
 async def find_existing_company_workspace(

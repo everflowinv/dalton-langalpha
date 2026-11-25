@@ -36,15 +36,19 @@ UserTier = Literal["admin", "internal", "external", "company"]
 # Strict owner-side classification: "unknown" means the roster lookup failed
 # or found no user row, so no isolation rule may be applied to the resource.
 OwnerTier = Literal["admin", "internal", "external", "company", "unknown"]
+TeamMemberStatus = Literal["active", "removed", "lookup_error"]
 
 __all__ = [
     "COMPANY_SYSTEM_EMAIL",
     "COMPANY_SYSTEM_USER_ID",
     "OwnerTier",
+    "TeamMemberStatus",
     "UserTier",
+    "check_team_member_status_live",
     "classify_owner_tier",
     "classify_owner_tier_sync",
     "classify_owner_tiers_batch",
+    "evaluate_weixin_member_access",
     "get_primary_admin_user_id",
     "get_primary_admin_user_id_sync",
     "get_user_tier",
@@ -385,6 +389,122 @@ async def is_team_member_user(
     )
 
 
+async def check_team_member_status_live(
+    user_id: str | None,
+    *,
+    email: str | None = None,
+    conn: Any = None,
+) -> TeamMemberStatus:
+    """Three-state live roster check (``active`` | ``removed`` | ``lookup_error``).
+
+    Preserves database/lookup failures as ``"lookup_error"`` instead of collapsing
+    them into ``False`` (unlike ``is_team_member`` / ``_fetch_db_member_emails_live``),
+    so callers never revoke active channel bindings on transient DB outages.
+
+    - ``local`` auth mode: checks ``dalton_user_roles`` via ``get_user_role``.
+    - Everflow / Supabase mode: checks ``DALTON_ALLOWED_EMAILS ∪ dalton_members``;
+      in-memory allowlist match short-circuits as ``"active"`` before touching DB.
+    """
+    uid = str(user_id or "").strip()
+    if not uid or is_company_system_user(uid):
+        return "removed"
+
+    if is_dalton_local_auth_enabled():
+        try:
+            from src.dalton.auth.roles import get_user_role
+
+            role = (
+                await get_user_role(uid, conn=conn)
+                if conn is not None
+                else await get_user_role(uid)
+            )
+            if role in ("admin", "internal", "external"):
+                return "active"
+            return "removed"
+        except Exception as exc:
+            logger.warning(
+                "check_team_member_status_live local role lookup failed for user_id=%s: %s",
+                uid,
+                type(exc).__name__,
+            )
+            return "lookup_error"
+
+    resolved_email = str(email or "").strip().lower()
+    if not resolved_email:
+        try:
+            from src.server.database.user import get_user
+
+            user = (
+                await get_user(uid, conn=conn)
+                if conn is not None
+                else await get_user(uid)
+            )
+        except Exception as exc:
+            logger.warning(
+                "check_team_member_status_live get_user failed for user_id=%s: %s",
+                uid,
+                type(exc).__name__,
+            )
+            return "lookup_error"
+        resolved_email = str((user or {}).get("email") or "").strip().lower()
+    if not resolved_email:
+        return "removed"
+
+    if resolved_email in get_dalton_allowed_emails():
+        return "active"
+
+    try:
+        from src.dalton.database.members import get_member_by_email
+
+        member_row = (
+            await get_member_by_email(resolved_email, conn=conn)
+            if conn is not None
+            else await get_member_by_email(resolved_email)
+        )
+        return "active" if member_row is not None else "removed"
+    except Exception as exc:
+        logger.warning(
+            "check_team_member_status_live member DB lookup failed for user_id=%s: %s",
+            uid,
+            type(exc).__name__,
+        )
+        return "lookup_error"
+
+
+def evaluate_weixin_member_access(
+    user_tier: str | None,
+    *,
+    channel_enabled: bool,
+    db_allow_external: bool | None,
+) -> tuple[bool, str | None]:
+    """Evaluate per-tier Weixin channel access (§3.1 (2), D15).
+
+    1. Deployment capability ``channel_weixin`` and runtime ``channel_enabled``
+       govern all tiers.
+    2. ``admin`` and ``internal`` are always allowed once the channel is enabled
+       (independent of ``allow_external``).
+    3. ``external`` is gated by ``db_allow_external`` when non-None, else
+       ``get_dalton_config().weixin.allow_external``.
+    """
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.CHANNEL_WEIXIN) or not bool(channel_enabled):
+        return False, "weixin_channel_disabled"
+    tier = str(user_tier or "").strip().lower()
+    if tier in ("admin", "internal"):
+        return True, None
+    if tier == "external":
+        eff_ext = (
+            bool(db_allow_external)
+            if db_allow_external is not None
+            else bool(dalton_settings.get_dalton_config().weixin.allow_external)
+        )
+        if eff_ext:
+            return True, None
+        return False, "external_access_disabled"
+    return False, "member_not_allowed"
+
+
 def classify_owner_tier_sync(owner_id: str | None, owner_email: Any = None) -> OwnerTier:
     """Synchronous strict owner-tier classification for list loops (fail closed to ``unknown``)."""
     uid = str(owner_id or "").strip()
@@ -392,6 +512,8 @@ def classify_owner_tier_sync(owner_id: str | None, owner_email: Any = None) -> O
         return "unknown"
     if is_company_system_user(uid):
         return "company"
+    if dalton_settings.is_dalton_single_user_oss_mode():
+        return "admin"
     if is_dalton_local_auth_enabled():
         role = _fetch_local_role_sync(uid)
         return role if role in ("admin", "internal", "external") else "unknown"
@@ -415,6 +537,8 @@ async def get_user_tier(user_id: str | None, *, conn: Any = None) -> UserTier:
         return "external"
     if is_company_system_user(uid):
         return "company"
+    if dalton_settings.is_dalton_single_user_oss_mode():
+        return "admin"
     if is_dalton_local_auth_enabled():
         try:
             from src.dalton.auth.roles import get_user_role
@@ -494,6 +618,8 @@ async def classify_owner_tier(owner_id: str | None, *, conn: Any = None) -> Owne
         return "unknown"
     if is_company_system_user(uid):
         return "company"
+    if dalton_settings.is_dalton_single_user_oss_mode():
+        return "admin"
     if is_dalton_local_auth_enabled():
         try:
             from src.dalton.auth.roles import get_user_role
@@ -556,6 +682,8 @@ async def classify_owner_tiers_batch(
             continue
         if is_company_system_user(uid):
             result[uid] = "company"
+        elif dalton_settings.is_dalton_single_user_oss_mode():
+            result[uid] = "admin"
         else:
             to_query.append(uid)
     if not to_query:

@@ -1134,9 +1134,28 @@ class RunSSEProducer:
         interrupt_obj = event_data["__interrupt__"][0]
 
         # Log interrupt trigger
-        logger.debug(f"[INTERRUPT_TRIGGER] thread_id={self.thread_id} interrupt_id={interrupt_obj.id}")
-        logger.debug(f"[INTERRUPT_VALUE] value={interrupt_obj.value}")
-        logger.debug(f"[INTERRUPT_FULL] event_data={event_data}")
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        # Log only whitelisted fields (never dump raw interrupt_obj.value or full event_data)
+        _raw_val = interrupt_obj.value
+        _raw_reqs = (
+            _raw_val.get("action_requests", [])
+            if isinstance(_raw_val, dict)
+            else (_raw_val if isinstance(_raw_val, list) else [])
+        )
+        _action_types = [
+            req.get("type")
+            for req in _raw_reqs
+            if isinstance(req, dict) and req.get("type")
+        ]
+        logger.debug(
+            "[INTERRUPT_TRIGGER] thread_id=%s interrupt_id=%s kind=%s action_count=%d action_types=%s",
+            self.thread_id,
+            interrupt_obj.id,
+            _raw_val.get("kind") if isinstance(_raw_val, dict) else None,
+            len(_raw_reqs),
+            _action_types,
+        )
+        # --- DALTON-HOOK(cos-settings-tools): end ---
 
         # Extract action requests from interrupt value
         # HITL middleware provides action_requests with tool call info and description

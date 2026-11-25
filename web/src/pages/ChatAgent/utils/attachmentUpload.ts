@@ -22,7 +22,7 @@ import {
   whileOpen,
   type UploadProgress,
 } from './partUpload';
-import { stagedFilesOf, type AttachmentMeta } from './fileUpload';
+import { inferImageMimeType, stagedFilesOf, type AttachmentMeta } from './fileUpload'; // DALTON-HOOK(mobile-web)
 
 export interface AttachmentUploadOptions {
   onProgress?: (progress: UploadProgress) => void;
@@ -58,7 +58,8 @@ export async function uploadAttachment(
     beginAttachment({
       name: file.name,
       size: file.size,
-      mime_type: file.type || 'application/octet-stream',
+      // DALTON-HOOK(mobile-web): upload untyped .heic/.heif photos with image/heic or image/heif MIME type
+      mime_type: inferImageMimeType(file) || 'application/octet-stream',
       ...(workspaceId ? { workspace_id: workspaceId } : {}),
     }),
     signal,

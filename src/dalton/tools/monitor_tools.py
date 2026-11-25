@@ -155,6 +155,11 @@ def _translate_http_error(exc: HTTPException, *, path: str | None = None, slug: 
         if code == "too_many_bytes":
             limit = detail.get("limit")
             return f"页面及依赖文件总大小超过上限（{limit} 字节）。" if limit else "页面及依赖文件总大小超过上限。"
+        msg_field = str(detail.get("message") or "").strip()
+        if exc.status_code == 403 and msg_field:
+            if not msg_field.startswith("权限不足"):
+                return f"权限不足：{msg_field}"
+            return msg_field
         return f"操作失败：{json.dumps(detail, ensure_ascii=False)}"
 
     msg = str(detail or "").strip()

@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input';
 // confirm dialog, which would pull its animation library onto first load.
 import { TOOLBAR_CHIP_CLASS, toolbarChipStyle } from '@/components/dalton/primitives/DaltonToolbarPill';
 import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { useCapabilities } from '@/hooks/useCapabilities';
 import { useLocale } from '@/hooks/useLocale';
 import { useUser } from '@/hooks/useUser';
@@ -62,10 +63,17 @@ export async function fetchTeamWorkspaces(): Promise<TeamWorkspacesResponse> {
 }
 
 export function useTeamWorkspaces(enabled = true) {
+  const identity = useCallerIdentity();
+  const { hasCapability } = useCapabilities();
   return useQuery({
     queryKey: queryKeys.workspaces.team(),
     queryFn: fetchTeamWorkspaces,
-    enabled: isDaltonAuth && enabled,
+    enabled:
+      enabled &&
+      !identity.isPlatform &&
+      (isDaltonAuth || identity.isMultiUserAuth) &&
+      identity.isInternal &&
+      hasCapability('colleague_sharing'),
     staleTime: 60_000,
     retry: false,
   });
@@ -98,13 +106,14 @@ export function useTeamReadOnly(
 ): TeamReadOnlyState {
   const location = useLocation();
   const queryClient = useQueryClient();
+  const identity = useCallerIdentity();
   const { user: currentUser } = useUser({ enabled: Boolean(workspaceId) && isDaltonAuth });
   const { data: teamData } = useTeamWorkspaces(Boolean(workspaceId));
-  const callerTier =
-    teamData?.caller_tier ??
-    queryClient.getQueryData<{ caller_tier?: string | null }>(queryKeys.dalton.userSharing())
-      ?.caller_tier ??
-    null;
+  const callerTier = identity.isPlatform
+    ? null
+    : identity.status === 'ready'
+      ? identity.tier
+      : 'unknown';
 
   if (!isDaltonAuth || !workspaceId) {
     return {
@@ -266,6 +275,7 @@ export function TeamWorkspacesSection({
   const locale = useLocale();
   const navigate = useNavigate();
   const { data } = useTeamWorkspaces();
+  const identity = useCallerIdentity();
   const { hasCapability } = useCapabilities();
   const [sectionExpanded, setSectionExpanded] = useState(true);
   const [expandedMembers, setExpandedMembers] = useState<Set<string>>(() => new Set());
@@ -291,7 +301,8 @@ export function TeamWorkspacesSection({
   // the section stays hidden rather than flashing a placeholder.
   if (
     !hasCapability('colleague_sharing') ||
-    (data?.caller_tier !== 'internal' && data?.caller_tier !== 'admin')
+    !identity.isInternal ||
+    !data
   ) {
     return null;
   }

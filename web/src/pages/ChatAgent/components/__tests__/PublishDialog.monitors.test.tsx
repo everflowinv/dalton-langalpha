@@ -2,15 +2,54 @@ import React from 'react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { act, fireEvent, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { ApiError } from '@/api/client';
 import { renderWithProviders } from '@/test/utils';
 import { runAuthResets } from '@/lib/authResets';
 import { queryKeys } from '@/lib/queryKeys';
+import type { CallerIdentity, CallerIdentitySnapshot } from '@/hooks/useCallerIdentity';
 import type { Artifact, ArtifactStatus, Workspace } from '@/types/api';
 
 const tierState = vi.hoisted(() => ({
-  callerTier: 'internal' as 'external' | 'internal' | 'admin',
+  callerTier: 'internal' as 'external' | 'internal' | 'admin' | 'unknown',
+  status: 'ready' as 'loading' | 'ready' | 'error',
+  isConfirming: false,
   colleagueSharingEnabled: true,
   isMobile: false,
+  revalidate: vi.fn(async () => undefined),
+}));
+
+function buildIdentitySnapshot(): CallerIdentitySnapshot {
+  const ready = tierState.status === 'ready' && tierState.callerTier !== 'unknown';
+  const tier = ready ? tierState.callerTier : 'unknown';
+  return {
+    tier,
+    status: tierState.status,
+    authMode: ready ? 'local' : null,
+    isPlatform: false,
+    isKnown: ready,
+    isConfirming: tierState.isConfirming,
+    isMultiUserAuth: ready,
+    isSingleUserOss: false,
+    isAdmin: ready && tier === 'admin',
+    isInternal: ready && (tier === 'admin' || tier === 'internal'),
+    isExternal: ready && tier === 'external',
+    canActAsOwner: ready && (tier === 'admin' || tier === 'internal'),
+    canPublishPublic: ready && tier === 'admin',
+    canInvite: ready && (tier === 'admin' || tier === 'internal'),
+    isTeamCredentialsShared: true,
+    canManageCredentials: ready && tier === 'admin',
+    isPm: ready && tier === 'admin',
+    colleagueSharingEnabled: tierState.colleagueSharingEnabled,
+  };
+}
+
+vi.mock('@/hooks/useCallerIdentity', () => ({
+  useCallerIdentity: (): CallerIdentity => ({
+    ...buildIdentitySnapshot(),
+    getLatestIdentity: () => buildIdentitySnapshot(),
+    isConfirmingNow: () => tierState.isConfirming,
+    revalidate: tierState.revalidate,
+  }),
 }));
 
 vi.mock('@/hooks/useIsMobile', () => ({
@@ -28,11 +67,28 @@ const workspaceState = vi.hoisted(() => ({
   requestedIds: [] as Array<string | null | undefined>,
 }));
 
-vi.mock('@/config/daltonAuth', () => ({
-  isDaltonAuth: true,
-}));
+vi.mock('@/config/daltonAuth', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/config/daltonAuth')>();
+  return {
+    ...actual,
+    isDaltonAuth: true,
+    DALTON_AUTH_MODE: 'local' as const,
+  };
+});
 
 vi.mock('@/hooks/useTeamCredentials', () => ({
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: 'team',
+    enabled: true,
+    holder_user_id: null,
+    credential_user_id: 'u-1',
+    is_pm: tierState.callerTier === 'admin',
+    can_disconnect: tierState.callerTier === 'admin',
+    can_invite: tierState.callerTier !== 'external',
+    caller_tier: tierState.callerTier,
+    colleague_sharing_enabled: tierState.colleagueSharingEnabled,
+    auth_mode: 'local',
+  })),
   useTeamCredentials: () => ({
     isShared: true,
     canDisconnect: tierState.callerTier === 'admin',
@@ -71,6 +127,10 @@ vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
   return {
     ...orig,
     getWorkspace: vi.fn<typeof orig.getWorkspace>(),
+    listWorkspaceFiles: vi.fn<typeof orig.listWorkspaceFiles>(async () => ({
+      files: ['results/report.html'],
+      from: { kind: 'live' },
+    })),
     readWorkspaceFile: answer,
     readWorkspaceFileFull: answer as unknown as typeof orig.readWorkspaceFileFull,
     writeWorkspaceFile: vi.fn<typeof orig.writeWorkspaceFile>(),
@@ -152,10 +212,13 @@ import {
   ensureArtifact,
   findArtifact,
   getArtifactStatus,
+  setArtifactFileLeftOut,
   unshareArtifact,
 } from '@/pages/ChatAgent/utils/api/artifacts';
-import { getMonitorByArtifact, publishMonitor } from '@/pages/Monitors/api';
+import { toast } from '@/components/ui/use-toast';
+import { getMonitorByArtifact, publishMonitor, updateMonitor } from '@/pages/Monitors/api';
 import FilePanel from '../FilePanel';
+import { usePanelFiles } from '../chatView/usePanelFiles';
 import { fileTarget } from '../filePanel/types';
 import PublishDialog from '../PublishDialog';
 
@@ -163,6 +226,7 @@ const mockGetWorkspace = vi.mocked(getWorkspace);
 const mockFind = vi.mocked(findArtifact);
 const mockEnsure = vi.mocked(ensureArtifact);
 const mockStatus = vi.mocked(getArtifactStatus);
+const mockSetLeftOut = vi.mocked(setArtifactFileLeftOut);
 const mockUnshare = vi.mocked(unshareArtifact);
 const mockGetMonitor = vi.mocked(getMonitorByArtifact);
 const mockPublishMonitor = vi.mocked(publishMonitor);
@@ -199,6 +263,9 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     runAuthResets();
+    tierState.callerTier = 'internal';
+    tierState.status = 'ready';
+    tierState.isConfirming = false;
     tierState.colleagueSharingEnabled = true;
     workspaceState.data = {
       status: 'running',
@@ -346,7 +413,7 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
     });
   });
 
-  it('non-admin opening an existing public monitor sees downgrade hint, and non-monitor shared file keeps Unshare button', async () => {
+  it('non-admin opening an existing public monitor must explicitly reselect visibility before updating, keeps Unshare visible, and non-monitor shared file keeps Unshare button', async () => {
     tierState.callerTier = 'internal';
     mockGetMonitor.mockResolvedValue({
       monitor_id: 'm-pub',
@@ -380,8 +447,19 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
       <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
     );
     expect(
-      await screen.findByText('You do not have public link permission; publishing will set visibility to Company.'),
+      await screen.findByText('This monitor currently uses a public link. Select a visibility scope before updating.'),
     ).toBeInTheDocument();
+    const updateBtn = screen.getByRole('button', { name: 'Update' });
+    expect(updateBtn).toBeDisabled();
+    // Normal mode also exposes Unshare for an existing public monitor.
+    expect(screen.getByRole('button', { name: 'Unshare' })).toBeEnabled();
+
+    // Explicitly selecting Company re-enables Update and submits company visibility.
+    await userEvent.click(screen.getByRole('button', { name: 'Company' }));
+    await waitFor(() => expect(updateBtn).toBeEnabled());
+    await userEvent.click(updateBtn);
+    await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(1));
+    expect(mockPublishMonitor.mock.calls[0][0]).toMatchObject({ visibility: 'company' });
     unmount();
 
     // Non-monitor shared legacy artifact keeps Unshare button
@@ -721,5 +799,492 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
         value: originalMatchMedia,
       });
     }
+  });
+
+  it('clears public selection on live admin -> internal downgrade without rebounding to existing public monitor', async () => {
+    tierState.callerTier = 'admin';
+    tierState.status = 'ready';
+    tierState.isConfirming = false;
+    vi.mocked(getMonitorByArtifact).mockResolvedValue({
+      monitor_id: 'mon-pub',
+      slug: 'pub-slug',
+      artifact_id: ARTIFACT.artifact_id,
+      workspace_id: 'ws-1',
+      title: 'Public Monitor',
+      category: 'other',
+      visibility: 'public',
+      published_seq: 1,
+      keep_updated: false,
+      member_user_ids: [],
+    } as never);
+
+    const { rerender } = renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+
+    const updateBtn = await screen.findByRole('button', { name: 'Update' });
+    await waitFor(() => expect(updateBtn).toBeEnabled());
+
+    // Live downgrade admin -> internal while dialog is open.
+    tierState.callerTier = 'internal';
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Update' })).toBeDisabled();
+    });
+    expect(screen.queryByRole('button', { name: /Public|公开/i })).toBeNull();
+    // Selecting company explicitly re-enables Update.
+    await userEvent.click(screen.getByRole('button', { name: /Company|全公司/i }));
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Update' })).toBeEnabled());
+  });
+
+  it('blocks external owner republish on non-own monitor and offers standalone downgrade-to-own action', async () => {
+    tierState.callerTier = 'external';
+    tierState.status = 'ready';
+    tierState.isConfirming = false;
+    vi.mocked(getMonitorByArtifact).mockResolvedValue({
+      monitor_id: 'mon-co',
+      slug: 'co-slug',
+      artifact_id: ARTIFACT.artifact_id,
+      workspace_id: 'ws-1',
+      title: 'Company Monitor',
+      category: 'other',
+      visibility: 'company',
+      published_seq: 1,
+      keep_updated: false,
+      member_user_ids: [],
+    } as never);
+    vi.mocked(updateMonitor).mockResolvedValue({
+      monitor: {
+        monitor_id: 'mon-co',
+        slug: 'co-slug',
+        artifact_id: ARTIFACT.artifact_id,
+        workspace_id: 'ws-1',
+        title: 'Company Monitor',
+        category: 'other',
+        visibility: 'own',
+        published_seq: 1,
+        keep_updated: false,
+        member_user_ids: [],
+      },
+    } as never);
+
+    renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+
+    const downgradeBtn = await screen.findByRole('button', { name: /Change to Only me|改为仅自己可见/i });
+    expect(screen.getByRole('button', { name: 'Update' })).toBeDisabled();
+    // External caller never sees copy link button or footer monitor link.
+    expect(screen.queryByRole('button', { name: /^Copy$/i })).toBeNull();
+    expect(screen.queryByRole('link')).toBeNull();
+
+    await userEvent.click(downgradeBtn);
+    await waitFor(() =>
+      expect(updateMonitor).toHaveBeenCalledWith('co-slug', { visibility: 'own', member_user_ids: [] }),
+    );
+    expect(publishMonitor).not.toHaveBeenCalled();
+  });
+
+  it('unshareOnly uniquely calls POST /artifacts/{id}/unshare, invalidates 3 cache groups, hides link/copy, and stays clickable while confirming', async () => {
+    tierState.callerTier = 'unknown';
+    tierState.status = 'loading';
+    tierState.isConfirming = true;
+    vi.mocked(getMonitorByArtifact).mockResolvedValue({
+      monitor_id: 'mon-pub',
+      slug: 'pub-slug',
+      artifact_id: ARTIFACT.artifact_id,
+      workspace_id: 'ws-1',
+      title: 'Admin Taken Over Monitor',
+      category: 'other',
+      visibility: 'public',
+      published_seq: 1,
+      keep_updated: false,
+      member_user_ids: [],
+    } as never);
+    vi.mocked(unshareArtifact).mockResolvedValue({
+      ...ARTIFACT,
+      shared: false,
+      latest_seq: 1,
+    });
+
+    const { queryClient } = renderWithProviders(
+      <PublishDialog open unshareOnly workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+    const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries');
+
+    const unshareBtn = await screen.findByRole('button', { name: /Unshare|停止分享/i });
+    expect(unshareBtn).toBeEnabled();
+    expect(screen.queryByRole('button', { name: /^Copy$/i })).toBeNull();
+    expect(screen.queryByRole('link')).toBeNull();
+
+    await userEvent.click(unshareBtn);
+    await waitFor(() => expect(unshareArtifact).toHaveBeenCalledWith(ARTIFACT.artifact_id));
+    expect(unshareArtifact).toHaveBeenCalledTimes(1);
+    const keys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
+    expect(keys).toContainEqual(queryKeys.daltonMonitors.all);
+    expect(keys).toContainEqual(queryKeys.artifacts.pathsIn('ws-1'));
+    expect(keys).toContainEqual(queryKeys.shareLinks.byWorkspace('ws-1'));
+  });
+
+  it('displays formatted 403 detail and triggers revalidate() on publish 403', async () => {
+    tierState.callerTier = 'internal';
+    tierState.status = 'ready';
+    tierState.isConfirming = false;
+    tierState.revalidate.mockClear();
+    vi.mocked(toast).mockClear();
+    vi.mocked(publishMonitor).mockRejectedValueOnce(
+      new ApiError('Request failed with status code 403', 'ERR_BAD_REQUEST', {
+        status: 403,
+        statusText: 'Forbidden',
+        headers: {},
+        data: {
+          detail: { code: 'external_member_forbidden', message: '外部成员无法发布公司监控' },
+        },
+      }),
+    );
+
+    renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+    const publishBtn = await screen.findByRole('button', { name: 'Publish' });
+    await waitFor(() => expect(publishBtn).toBeEnabled());
+    await userEvent.click(publishBtn);
+
+    await waitFor(() => expect(tierState.revalidate).toHaveBeenCalledTimes(1));
+    expect(toast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        description: '外部成员无法发布公司监控',
+        variant: 'destructive',
+      }),
+    );
+  });
+
+  it('fails closed when existing monitor query is pending or errors so external members cannot publish over an unknown monitor', async () => {
+    tierState.callerTier = 'external';
+    tierState.status = 'ready';
+    tierState.isConfirming = false;
+
+    let rejectMonitor!: (err: Error) => void;
+    mockGetMonitor
+      .mockImplementationOnce(
+        () =>
+          new Promise((_, reject) => {
+            rejectMonitor = reject;
+          }),
+      )
+      .mockResolvedValueOnce(null);
+
+    renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+
+    // While existingMonitorQuery is pending, Publish stays disabled.
+    const publishBtn = await screen.findByRole('button', { name: 'Publish' });
+    await waitFor(() => expect(mockGetMonitor).toHaveBeenCalledTimes(1));
+    expect(publishBtn).toBeDisabled();
+
+    // When existingMonitorQuery errors, Publish stays disabled and a retryable error banner shows.
+    act(() => {
+      rejectMonitor(new Error('monitor lookup failed'));
+    });
+    expect(await screen.findByText('Failed to load monitors')).toBeInTheDocument();
+    expect(publishBtn).toBeDisabled();
+
+    // Retrying and resolving null re-enables Publish.
+    await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(publishBtn).toBeEnabled());
+  });
+
+  it('hides keep_updated for external members, forces keep_updated=false on publish, and blocks stale toggleKeep closures', async () => {
+    tierState.callerTier = 'external';
+    tierState.status = 'ready';
+    tierState.isConfirming = false;
+    mockEnsure.mockResolvedValue({ ...ARTIFACT, keep_updated: true });
+    mockGetMonitor.mockResolvedValue({
+      monitor_id: 'mon-own',
+      slug: 'own-slug',
+      artifact_id: ARTIFACT.artifact_id,
+      workspace_id: 'ws-1',
+      title: 'Own Monitor',
+      category: 'other',
+      visibility: 'own',
+      published_seq: 1,
+      keep_updated: true,
+      member_user_ids: [],
+    } as never);
+
+    const { unmount } = renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+
+    const updateBtn = await screen.findByRole('button', { name: 'Update' });
+    await waitFor(() => expect(updateBtn).toBeEnabled());
+    expect(screen.queryByRole('switch', { name: 'Auto-update when files change' })).toBeNull();
+
+    await userEvent.click(updateBtn);
+    await waitFor(() => expect(mockPublishMonitor).toHaveBeenCalledTimes(1));
+    expect(mockPublishMonitor.mock.calls[0][0]).toMatchObject({
+      visibility: 'own',
+      keep_updated: false,
+    });
+    unmount();
+
+    // Stale internal closure downgraded to external synchronously before click cannot toggle keep_updated.
+    tierState.callerTier = 'internal';
+    vi.mocked(updateMonitor).mockClear();
+    renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+    const keepSwitch = await screen.findByRole('switch', { name: 'Auto-update when files change' });
+    await waitFor(() => expect(keepSwitch).toBeEnabled());
+
+    tierState.callerTier = 'external';
+    fireEvent.click(keepSwitch);
+    expect(updateMonitor).not.toHaveBeenCalled();
+  });
+
+  it('hides selectable link box during isConfirming, keeps normal-mode Unshare clickable, and prevents footer monitor link click on stale identity', async () => {
+    tierState.callerTier = 'internal';
+    tierState.status = 'ready';
+    tierState.isConfirming = true;
+    mockGetMonitor.mockResolvedValue({
+      monitor_id: 'mon-pub',
+      slug: 'pub-slug',
+      artifact_id: ARTIFACT.artifact_id,
+      workspace_id: 'ws-1',
+      title: 'Public Monitor',
+      category: 'other',
+      visibility: 'public',
+      published_seq: 1,
+      keep_updated: false,
+      member_user_ids: [],
+    } as never);
+    mockUnshare.mockResolvedValue({ ...ARTIFACT, shared: false, latest_seq: 1 });
+
+    const { rerender } = renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+
+    const unshareBtn = await screen.findByRole('button', { name: 'Unshare' });
+    expect(unshareBtn).toBeEnabled();
+    expect(screen.queryByRole('button', { name: /^Copy$/i })).toBeNull();
+    expect(screen.queryByText(/\/m\/pub-slug/)).toBeNull();
+    expect(screen.queryByRole('link')).toBeNull();
+
+    await userEvent.click(unshareBtn);
+    await waitFor(() => expect(mockUnshare).toHaveBeenCalledWith(ARTIFACT.artifact_id));
+
+    // When settled, footer link renders; if identity flips to confirming before click, click is prevented.
+    tierState.isConfirming = false;
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    const footerLink = await screen.findByRole('link', { name: /Open in new window/i });
+    tierState.isConfirming = true;
+    const clickEvent = new MouseEvent('click', { bubbles: true, cancelable: true });
+    footerLink.dispatchEvent(clickEvent);
+    expect(clickEvent.defaultPrevented).toBe(true);
+  });
+
+  it('FilePanel treats isConfirming with status=ready as unknown tier, hiding owner publish while keeping stop-share for public monitors', async () => {
+    tierState.callerTier = 'admin';
+    tierState.status = 'ready';
+    tierState.isConfirming = true;
+    mockFind.mockResolvedValue({ ...ARTIFACT, shared: false });
+    mockGetMonitor.mockResolvedValue({
+      monitor_id: 'mon-pub',
+      slug: 'pub-slug',
+      artifact_id: ARTIFACT.artifact_id,
+      workspace_id: 'ws-1',
+      title: 'Public Monitor',
+      category: 'other',
+      visibility: 'public',
+      published_seq: 1,
+      keep_updated: false,
+      member_user_ids: [],
+    } as never);
+
+    renderWithProviders(
+      <FilePanel
+        workspaceId="ws-1"
+        onClose={() => {}}
+        files={['results/report.html']}
+        target={fileTarget('results/report.html', {}, 1)}
+        onTargetHandled={() => {}}
+      />,
+    );
+
+    const stopBtn = await screen.findByRole('button', { name: /Stop sharing|Unshare/i });
+    expect(stopBtn).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Publish' })).toBeNull();
+  });
+
+  it('usePanelFiles -> FilePanel production callerTier path drops owner comment/pin/publish on the same tick isConfirming flips true, while keeping stop-share for public monitors and shared files', async () => {
+    tierState.callerTier = 'admin';
+    tierState.status = 'ready';
+    tierState.isConfirming = false;
+    mockFind.mockResolvedValue({ ...ARTIFACT, shared: false });
+    mockGetMonitor.mockResolvedValue({
+      monitor_id: 'mon-pub',
+      slug: 'pub-slug',
+      artifact_id: ARTIFACT.artifact_id,
+      workspace_id: 'ws-1',
+      title: 'Public Monitor',
+      category: 'other',
+      visibility: 'public',
+      published_seq: 1,
+      keep_updated: false,
+      member_user_ids: [],
+    } as never);
+
+    function PanelHarness({ filePath }: { filePath: string }) {
+      const { panelAccess } = usePanelFiles({
+        isHome: false,
+        workspaceId: 'ws-1',
+        includeSystem: false,
+      });
+      return (
+        <FilePanel
+          workspaceId="ws-1"
+          onClose={() => {}}
+          files={[filePath]}
+          target={fileTarget(filePath, {}, 1)}
+          onTargetHandled={() => {}}
+          {...panelAccess}
+        />
+      );
+    }
+
+    const { rerender, unmount } = renderWithProviders(
+      <PanelHarness filePath="results/report.html" />,
+    );
+
+    // Ready admin sees owner controls: Publish, Comment, and Pin to dashboard.
+    expect(await screen.findByRole('button', { name: 'Publish' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Comment' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Set as dashboard' })).toBeInTheDocument();
+
+    // Same-tick revalidation: status stays 'ready' with cached 'admin', isConfirming flips true.
+    tierState.isConfirming = true;
+    rerender(<PanelHarness filePath="results/report.html" />);
+
+    expect(screen.queryByRole('button', { name: 'Publish' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Comment' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Set as dashboard' })).toBeNull();
+    expect(await screen.findByRole('button', { name: /Stop sharing|Unshare/i })).toBeInTheDocument();
+    unmount();
+
+    // Also verify existing public shared file (without public monitor) retains stop-share during isConfirming.
+    tierState.isConfirming = true;
+    mockFind.mockResolvedValue({ ...ARTIFACT, shared: true });
+    mockGetMonitor.mockResolvedValue(null);
+
+    renderWithProviders(<PanelHarness filePath="results/report.html" />);
+    expect(await screen.findByRole('button', { name: /Stop sharing|Unshare/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Publish' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Comment' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Set as dashboard' })).toBeNull();
+  });
+
+  it('disables file inclusion checkboxes during identity revalidation and for external members, and triggers revalidate with formatted 403 toast on left-out 403', async () => {
+    tierState.callerTier = 'internal';
+    tierState.status = 'ready';
+    tierState.isConfirming = false;
+    mockStatus.mockResolvedValue({
+      ...STATUS,
+      files: [
+        ...STATUS.files,
+        { path: 'results/notes.md', size: 128, reason: 'markdown', optional: true },
+      ],
+    });
+    mockSetLeftOut.mockReset();
+
+    const { rerender } = renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+
+    const checkbox = await screen.findByRole('checkbox', { name: /notes\.md/i });
+    expect(checkbox).toBeEnabled();
+
+    // Revalidation starts: checkbox disables and clicking does not issue POST /left-out.
+    tierState.isConfirming = true;
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    expect(screen.getByRole('checkbox', { name: /notes\.md/i })).toBeDisabled();
+    fireEvent.click(screen.getByRole('checkbox', { name: /notes\.md/i }));
+    expect(mockSetLeftOut).not.toHaveBeenCalled();
+
+    // External owner: checkbox stays disabled and cannot issue POST /left-out.
+    tierState.isConfirming = false;
+    tierState.callerTier = 'external';
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    expect(screen.getByRole('checkbox', { name: /notes\.md/i })).toBeDisabled();
+    fireEvent.click(screen.getByRole('checkbox', { name: /notes\.md/i }));
+    expect(mockSetLeftOut).not.toHaveBeenCalled();
+
+    // Internal owner encounters a 403 race on POST /left-out -> revalidates identity and shows server detail.
+    tierState.callerTier = 'internal';
+    tierState.revalidate.mockClear();
+    vi.mocked(toast).mockClear();
+    mockSetLeftOut.mockRejectedValueOnce(
+      new ApiError('Request failed with status code 403', 'ERR_BAD_REQUEST', {
+        status: 403,
+        statusText: 'Forbidden',
+        headers: {},
+        data: { detail: { code: 'external_member_forbidden', message: '外部成员无法修改发布文件列表' } },
+      }),
+    );
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    const enabledBox = screen.getByRole('checkbox', { name: /notes\.md/i });
+    expect(enabledBox).toBeEnabled();
+    fireEvent.click(enabledBox);
+
+    await waitFor(() => expect(mockSetLeftOut).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(tierState.revalidate).toHaveBeenCalledTimes(1));
+    expect(toast).toHaveBeenCalledWith({
+      description: '外部成员无法修改发布文件列表',
+      variant: 'destructive',
+    });
+  });
+
+  it('disables public confirmation button without closing dialog and disables member selection list while identity is confirming', async () => {
+    tierState.callerTier = 'admin';
+    tierState.status = 'ready';
+    tierState.isConfirming = false;
+
+    const { rerender } = renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+
+    // 1. Switch to "members" visibility and verify member button disables during revalidation.
+    const membersOption = await screen.findByRole('button', { name: /Selected colleagues|指定同事/i });
+    await userEvent.click(membersOption);
+    const bobBtn = await screen.findByRole('button', { name: /Bob/i });
+    expect(bobBtn).toBeEnabled();
+    expect(bobBtn).toHaveAttribute('aria-pressed', 'false');
+
+    tierState.isConfirming = true;
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    expect(screen.getByRole('button', { name: /Bob/i })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: /Bob/i }));
+    expect(screen.getByRole('button', { name: /Bob/i })).toHaveAttribute('aria-pressed', 'false');
+
+    // 2. Switch to "public" when settled, open ConfirmDialog, then start revalidation.
+    tierState.isConfirming = false;
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    await userEvent.click(screen.getByRole('button', { name: /Public|公开/i }));
+    const publishBtn = screen.getByRole('button', { name: 'Publish' });
+    await waitFor(() => expect(publishBtn).toBeEnabled());
+    await userEvent.click(publishBtn);
+
+    const confirmBtn = await screen.findByRole('button', { name: /Publish publicly|确认公开/i });
+    expect(confirmBtn).toBeEnabled();
+
+    tierState.isConfirming = true;
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    const disabledConfirmBtn = screen.getByRole('button', { name: /Publish publicly|确认公开/i });
+    expect(disabledConfirmBtn).toBeDisabled();
+    fireEvent.click(disabledConfirmBtn);
+    expect(mockPublishMonitor).not.toHaveBeenCalled();
+    // Dialog remains open rather than dismissing on a blocked confirm click.
+    expect(screen.getByRole('button', { name: /Publish publicly|确认公开/i })).toBeInTheDocument();
   });
 });

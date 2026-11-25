@@ -123,6 +123,18 @@ vi.mock('@/hooks/useHomeWorkspace', () => ({
   homeWorkspaceQuery: () => ({ queryKey: ['home'], queryFn: h.home }),
 }));
 vi.mock('@/hooks/useTeamCredentials', () => ({
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: 'team',
+    enabled: true,
+    holder_user_id: null,
+    credential_user_id: 'u-ext',
+    is_pm: false,
+    can_disconnect: false,
+    can_invite: false,
+    caller_tier: 'external',
+    colleague_sharing_enabled: false,
+    auth_mode: 'local',
+  })),
   useTeamCredentials: () => ({
     isShared: true,
     canDisconnect: false,

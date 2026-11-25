@@ -13,7 +13,13 @@
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { gfmTableFromMarkdown } from "mdast-util-gfm-table";
 import { gfmTable } from "micromark-extension-gfm-table";
-import { chunkMarkdownTextWithMode, type ChunkMode } from "../../shared/text.js";
+import {
+  chunkMarkdownTextWithMode,
+  degradeOversizedLink,
+  findAtomicLinkSpans,
+  findSpanStraddling,
+  type ChunkMode,
+} from "../../shared/text.js";
 import { splitTextByLimit } from "../adapter.js";
 
 export const FEISHU_POST_MAX_BYTES = 30_720;
@@ -462,6 +468,19 @@ export function chunkFeishuMarkdownByEnvelope(
     if (!segment || options.fits(segment)) {
       return segment ? [segment] : [];
     }
+    // If a single atomic Markdown link on its own exceeds the envelope, degrade it
+    // to plain text + relative path before retrying.
+    const segmentLinks = findAtomicLinkSpans(segment);
+    if (
+      segmentLinks.length > 0 &&
+      segmentLinks[0]!.start === 0 &&
+      !options.fits(segment.slice(0, segmentLinks[0]!.end))
+    ) {
+      const degraded = degradeOversizedLink(segmentLinks[0]!);
+      if (degraded !== null && degraded.length < segmentLinks[0]!.end) {
+        return splitOversizedSegment(degraded + segment.slice(segmentLinks[0]!.end));
+      }
+    }
     let currentLimit = Math.max(1, Math.min(initialLimit, segment.length - 1));
     while (currentLimit >= 1) {
       const candidates = chunkMarkdownTextWithMode(
@@ -516,6 +535,17 @@ export function chunkFeishuMarkdownByEnvelope(
     const prevCode = segment.charCodeAt(splitAt - 1);
     if (splitAt > 1 && prevCode >= 0xd800 && prevCode <= 0xdbff) {
       splitAt -= 1;
+    }
+    const straddling = findSpanStraddling(segmentLinks, splitAt);
+    if (straddling) {
+      if (straddling.start > 0) {
+        splitAt = straddling.start;
+      } else {
+        const degraded = degradeOversizedLink(straddling);
+        if (degraded !== null && degraded.length < straddling.end) {
+          return splitOversizedSegment(degraded + segment.slice(straddling.end));
+        }
+      }
     }
     while (splitAt > 1 && !options.fits(segment.slice(0, splitAt))) {
       splitAt -= 1;

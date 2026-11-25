@@ -66,21 +66,47 @@ export function useInterruptAnswers({
   // The card names its own bucket because the slot may hold another family's
   // interrupt when several are pending, and a click on one card must never
   // settle a different one (a delete_thread, say).
-  const decidePendingProposal = useCallback((bucket: ProposalBucket, verdict: 'approve' | 'reject') => {
+  // --- DALTON-HOOK(cos-settings-tools): begin ---
+  // Wait for tool_call_result on approve when correlated by tool_call_id
+  const decidePendingProposal = useCallback((
+    bucket: ProposalBucket,
+    verdict: 'approve' | 'reject',
+    proposal?: Record<string, unknown>,
+  ) => {
     if (!pendingInterrupt || PROPOSAL_DATA_KEY_MAP[pendingInterrupt.type] !== bucket) return;
-    const { proposalId, interruptId } = pendingInterrupt;
-    setMessages((prev) => setCardStatus(prev, bucket, proposalId!, verdict === 'approve' ? 'approved' : 'rejected'));
-    resumeWithHitlResponse({ [interruptId!]: { decisions: [{ type: verdict }] } });
+    const proposalId = (typeof proposal?.proposalId === 'string' && proposal.proposalId)
+      ? proposal.proposalId
+      : pendingInterrupt.proposalId;
+    const interruptId = (typeof proposal?.interruptId === 'string' && proposal.interruptId)
+      ? proposal.interruptId
+      : pendingInterrupt.interruptId;
+    const nextStatus = verdict === 'approve'
+      ? (bucket === 'workspaceProposals' ? 'submitting' : 'approved')
+      : 'rejected';
+    setMessages((prev) => setCardFields(prev, bucket, proposalId!, {
+      status: nextStatus,
+      failure_code: undefined,
+      failure_error: undefined,
+    }));
+    const decision: HitlDecisionBody = { type: verdict };
+    resumeWithHitlResponse({ [interruptId!]: { decisions: [decision] } });
   }, [pendingInterrupt, setMessages, resumeWithHitlResponse]);
 
   const proposalHandlers = useMemo(() => ({
-    handleApproveCreateWorkspace: () => decidePendingProposal('workspaceProposals', 'approve'),
-    handleRejectCreateWorkspace: () => decidePendingProposal('workspaceProposals', 'reject'),
-    handleApproveStartQuestion: () => decidePendingProposal('questionProposals', 'approve'),
-    handleRejectStartQuestion: () => decidePendingProposal('questionProposals', 'reject'),
-    handleApproveSecretaryAction: () => decidePendingProposal('secretaryActionProposals', 'approve'),
-    handleRejectSecretaryAction: () => decidePendingProposal('secretaryActionProposals', 'reject'),
+    handleApproveCreateWorkspace: (proposal?: Record<string, unknown>) =>
+      decidePendingProposal('workspaceProposals', 'approve', proposal),
+    handleRejectCreateWorkspace: (proposal?: Record<string, unknown>) =>
+      decidePendingProposal('workspaceProposals', 'reject', proposal),
+    handleApproveStartQuestion: (proposal?: Record<string, unknown>) =>
+      decidePendingProposal('questionProposals', 'approve', proposal),
+    handleRejectStartQuestion: (proposal?: Record<string, unknown>) =>
+      decidePendingProposal('questionProposals', 'reject', proposal),
+    handleApproveSecretaryAction: (proposal?: Record<string, unknown>) =>
+      decidePendingProposal('secretaryActionProposals', 'approve', proposal),
+    handleRejectSecretaryAction: (proposal?: Record<string, unknown>) =>
+      decidePendingProposal('secretaryActionProposals', 'reject', proposal),
   }), [decidePendingProposal]);
+  // --- DALTON-HOOK(cos-settings-tools): end ---
 
   // The clicked PTC card supplies its own proposal and interrupt ids, for the
   // same reason the board exists.

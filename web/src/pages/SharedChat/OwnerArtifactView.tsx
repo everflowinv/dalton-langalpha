@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
-import { FileDown, Link2, MoreHorizontal, RefreshCw } from 'lucide-react'; // DALTON-HOOK(mobile-web)
+import { useQuery } from '@tanstack/react-query'; // DALTON-HOOK(monitors)
+import { FileDown, Link2, Link2Off, MoreHorizontal, RefreshCw } from 'lucide-react'; // DALTON-HOOK(mobile-web)
 import { useTranslation } from 'react-i18next';
 import { useSearchParams } from 'react-router';
 import { Button } from '@/components/ui/button'; // DALTON-HOOK(mobile-web)
@@ -10,19 +11,21 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'; // DALTON-HOOK(mobile-web)
 import { toast } from '@/components/ui/use-toast';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(external-share-guard)
 import { useEnsureArtifact } from '@/hooks/useArtifact';
 import { useIsMobile } from '@/hooks/useIsMobile'; // DALTON-HOOK(mobile-web)
+import { queryKeys } from '@/lib/queryKeys'; // DALTON-HOOK(monitors)
 import { ThreadLifecycleFeed } from '@/lib/threadLifecycle/ThreadLifecycleFeed';
+import { getMonitorByArtifact, type MonitorSummary } from '@/pages/Monitors/api'; // DALTON-HOOK(monitors)
 import PublishDialog from '../ChatAgent/components/PublishDialog';
 import {
   useArtifactVersionView, versionReducer, type VersionAction, type VersionStore,
 } from '../ChatAgent/components/filePanel/useArtifactVersionView';
+import HtmlViewer from '../ChatAgent/components/viewers/HtmlViewer'; // DALTON-HOOK(external-share-guard)
 import { ArtifactFrames } from '../ChatAgent/components/viewers/html/ArtifactFrames';
 import { ArtifactVersionPicker } from '../ChatAgent/components/viewers/html/ArtifactVersionPicker';
 import { CommentTools } from '../ChatAgent/components/viewers/html/comments/CommentTools';
 import { useCommentUi } from '../ChatAgent/components/viewers/html/comments/useCommentUi';
-// DALTON-HOOK(external-share-guard): the caller's tier hides publish
-import { useTeamReadOnly } from '../ChatAgent/components/dalton/TeamSharing';
 import { exportServedPdf } from '../ChatAgent/components/viewers/html/useHtmlActions';
 import { buildServeUrl } from '../ChatAgent/components/viewers/html/wsfilesUrl';
 import { shareLinkHref } from '../ChatAgent/utils/api/shareLinks';
@@ -79,12 +82,28 @@ export default function OwnerArtifactView({ code, metadata }: {
   const versionStore = useAddressVersionStore();
   const versionView = useArtifactVersionView(workspaceId, path, versionStore);
   const [reloads, setReloads] = useState(0);
-  const [publishOpen, setPublishOpen] = useState(false);
+  // DALTON-HOOK(external-share-guard): allow opening dedicated unshareOnly dialog independently of publish permission state
+  const [dialogMode, setDialogMode] = useState<'publish' | 'unshare' | null>(null);
   const [pdfBusy, setPdfBusy] = useState(false);
   const ui = useCommentUi();
-  // DALTON-HOOK(external-share-guard): the caller's Dalton tier, for hiding
-  // the publish entry below.
-  const { callerTier } = useTeamReadOnly(workspaceId);
+  // DALTON-HOOK(external-share-guard): external and unknown callers lose CommentTools and use a read-only frame; publish stays gated on confirmed identity while stop-sharing stays available for active shares and public monitors
+  const identity = useCallerIdentity();
+  const canUseOwnerComments = identity.canActAsOwner && !identity.isConfirming;
+  const canShowPublish = identity.isKnown;
+  const publishDisabled = identity.status !== 'ready' || identity.isConfirming;
+  const artifactId = versionView.record?.artifact_id ?? metadata.artifact_id ?? '';
+  const { data: existingMonitor } = useQuery<MonitorSummary | null>({
+    queryKey: queryKeys.daltonMonitors.byArtifact(artifactId),
+    queryFn: () => getMonitorByArtifact(artifactId),
+    enabled: Boolean(artifactId),
+    staleTime: 30_000,
+    retry: false,
+  });
+  const isArtifactShared = versionView.record
+    ? Boolean(versionView.record.shared)
+    : Boolean(metadata.shared);
+  const hasPublicMonitor = existingMonitor?.visibility === 'public';
+  const canShowUnshareOnly = isArtifactShared || hasPublicMonitor;
   const ensureArtifact = useEnsureArtifact();
 
   // No panel on this page, so a linked file opens on its own, as a link does:
@@ -116,6 +135,8 @@ export default function OwnerArtifactView({ code, metadata }: {
         openUrl: shareLinkHref(code),
         printHint: t('filePanel:pdfPrintHint'),
         generatingHint: t('filePanel:pdfGenerating'),
+        // DALTON-HOOK(mobile-web): pass WeChat external-browser download guidance
+        wechatHint: t('filePanel:wechatOpenInBrowserHint'),
       });
     } finally {
       setPdfBusy(false);
@@ -130,13 +151,22 @@ export default function OwnerArtifactView({ code, metadata }: {
         name={name}
         actions={(
           <>
-            <CommentTools tabId={VIEW_ID} workspaceId={workspaceId} path={path} ui={ui} variant="bar" modeDisabled={versionView.version !== null} />
-            <ArtifactVersionPicker view={versionView} variant="bar" />
+            {/* DALTON-HOOK(external-share-guard): hide CommentTools and version picker for external or unknown callers */}
+            {canUseOwnerComments && (
+              <>
+                <CommentTools tabId={VIEW_ID} workspaceId={workspaceId} path={path} ui={ui} variant="bar" modeDisabled={versionView.version !== null} />
+                <ArtifactVersionPicker view={versionView} variant="bar" />
+              </>
+            )}
             {/* DALTON-HOOK(mobile-web): fold secondary reload/PDF actions into an overflow menu on phones */}
             {isMobile ? (
               <>
-                {callerTier !== 'external' && (
-                  <ShareTopBarAction icon={Link2} label={t('artifact.publish')} onClick={() => setPublishOpen(true)} />
+                {/* DALTON-HOOK(external-share-guard): standalone stop-share entry stays enabled for shared files and historical public monitors even while identity is unknown/confirming */}
+                {canShowUnshareOnly && (
+                  <ShareTopBarAction icon={Link2Off} label={t('artifact.unshareOnly')} onClick={() => setDialogMode('unshare')} />
+                )}
+                {canShowPublish && (
+                  <ShareTopBarAction icon={Link2} label={t('artifact.publish')} onClick={() => setDialogMode('publish')} disabled={publishDisabled} />
                 )}
                 <DropdownMenu modal={false}>
                   <DropdownMenuTrigger asChild>
@@ -167,31 +197,55 @@ export default function OwnerArtifactView({ code, metadata }: {
               <>
                 <ShareTopBarAction icon={RefreshCw} label={t('filePanel:reloadPage')} onClick={() => setReloads((n) => n + 1)} />
                 <ShareTopBarAction icon={FileDown} label={t('filePanel:saveAsPdf')} onClick={() => void savePdf()} disabled={pdfBusy} />
-                {/* DALTON-HOOK(external-share-guard): an external member reads their
-                    own /a/ page but may not publish from it — the server refuses;
-                    the entry stays hidden rather than failing after the click. */}
-                {callerTier !== 'external' && (
-                  <ShareTopBarAction icon={Link2} label={t('artifact.publish')} onClick={() => setPublishOpen(true)} />
+                {/* DALTON-HOOK(external-share-guard): standalone stop-share entry stays enabled for shared files and historical public monitors even while identity is unknown/confirming */}
+                {canShowUnshareOnly && (
+                  <ShareTopBarAction icon={Link2Off} label={t('artifact.unshareOnly')} onClick={() => setDialogMode('unshare')} />
+                )}
+                {/* DALTON-HOOK(external-share-guard): publish entry follows confirmed identity (disabled while unknown/confirming) */}
+                {canShowPublish && (
+                  <ShareTopBarAction icon={Link2} label={t('artifact.publish')} onClick={() => setDialogMode('publish')} disabled={publishDisabled} />
                 )}
               </>
             )}
           </>
         )}
       />
-      <PublishDialog open={publishOpen} workspaceId={workspaceId} path={path} onClose={() => setPublishOpen(false)} />
-      <div className="share-content">
-        <ArtifactFrames
-          // The agent's edits reach the page on a reload: no panel here reads
-          // the file's bytes to notice them.
-          revision={`r${reloads}`}
-          fileName={name}
+      {dialogMode !== null && (
+        <PublishDialog
+          open
           workspaceId={workspaceId}
-          filePath={path}
-          prefix={frameBase}
-          view={{ tabId: VIEW_ID, ui, active: true, versionView }}
-          onOpenLink={openLink}
-          anchor={anchor}
+          path={path}
+          unshareOnly={dialogMode === 'unshare'}
+          onClose={() => setDialogMode(null)}
         />
+      )}
+      <div className="share-content">
+        {/* DALTON-HOOK(external-share-guard): external and unknown callers render in a read-only ViewFrame without comment layer */}
+        {canUseOwnerComments ? (
+          <ArtifactFrames
+            // The agent's edits reach the page on a reload: no panel here reads
+            // the file's bytes to notice them.
+            revision={`r${reloads}`}
+            fileName={name}
+            workspaceId={workspaceId}
+            filePath={path}
+            prefix={frameBase}
+            view={{ tabId: VIEW_ID, ui, active: true, versionView }}
+            onOpenLink={openLink}
+            anchor={anchor}
+          />
+        ) : (
+          <HtmlViewer
+            key={`ro-${reloads}`}
+            content=""
+            fileName={name}
+            workspaceId={workspaceId}
+            filePath={path}
+            servePrefix={frameBase}
+            anchor={anchor}
+            onOpenLink={openLink}
+          />
+        )}
       </div>
     </div>
   );

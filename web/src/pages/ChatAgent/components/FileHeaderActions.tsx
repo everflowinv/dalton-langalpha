@@ -1,5 +1,5 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { useQueryClient } from '@tanstack/react-query'; // DALTON-HOOK(mobile-web)
+import React, { useContext, useEffect, useRef, useState } from 'react';
+import { QueryClient, QueryClientContext, useQuery, useQueryClient } from '@tanstack/react-query'; // DALTON-HOOK(mobile-web)
 // DALTON-HOOK(external-share-guard): Link2Off for the external member's stop-only entry
 // DALTON-HOOK(mobile-web): ArrowUp, ChevronDown, History, House, MoreHorizontal, MessageSquare, MessageSquarePlus, RefreshCw for complete mobile HTML report menu
 import { ArrowUp, ChevronDown, Code2, Download, Eye, ExternalLink, FileDown, History, House, Link2, Link2Off, MessageSquare, MessageSquarePlus, MoreHorizontal, Pencil, Pin, PinOff, RefreshCw, Settings2, X, Undo2, Redo2, FileDiff, FileText, Check, Clipboard } from 'lucide-react';
@@ -27,10 +27,13 @@ import { shortMonthDay } from '@/lib/format'; // DALTON-HOOK(mobile-web)
 import { cn } from '@/lib/utils';
 import { fileExtension, isHtmlFile } from '../utils/filePaths';
 import { useDownloadState, workspaceDownloadKey } from '../utils/downloadNotice';
-import { exportServedPdf } from './viewers/html/useHtmlActions';
+import { exportServedPdf, isWeChatBrowser } from './viewers/html/useHtmlActions'; // DALTON-HOOK(mobile-web)
 import { useServedHtml } from './viewers/html/useServedHtml';
 // DALTON-HOOK(mobile-web): sharedSeq, useArtifactComments for mobile HTML More menu
 import { artifactPathKey, sharedSeq, useArtifactBinding, useArtifactByPath, useArtifactComments } from '@/hooks/useArtifact';
+// DALTON-HOOK(monitors): inspect bound monitor visibility so historical public monitors show stop-share entry
+import { queryKeys } from '@/lib/queryKeys';
+import { getMonitorByArtifact, type MonitorSummary } from '@/pages/Monitors/api';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 import { openComments } from './artifactComments/commentModel'; // DALTON-HOOK(mobile-web)
 import { queuedBatches, refusalReason, sendBatches } from './artifactComments/commentSends'; // DALTON-HOOK(mobile-web)
@@ -43,6 +46,10 @@ import { OUTCOME_MS, summarizeSendAllOutcome } from './viewers/html/comments/Com
 import type { CommentUi } from './viewers/html/comments/useCommentUi'; // DALTON-HOOK(mobile-web)
 
 const PDF_SCALE_CHOICES = [0.8, 1, 1.25];
+// DALTON-HOOK(monitors): inert fallback client for tests that render FileHeaderActions without QueryClientProvider
+const FALLBACK_MONITOR_QUERY_CLIENT = new QueryClient({
+  defaultOptions: { queries: { enabled: false, retry: false } },
+});
 
 // --- File type detection helpers ---
 
@@ -239,12 +246,25 @@ function FileHeaderActions({
     access,
   );
   // DALTON-HOOK(external-share-guard): the record behind the selected file,
-  // read only where the unshare-only entry can show (external members).
+  // read when the stop-share entry can show (non-owners for any public share, or owners for historical public monitors).
+  const contextClient = useContext(QueryClientContext);
+  const monitorQueryClient = contextClient ?? FALLBACK_MONITOR_QUERY_CLIENT;
   const root = useWorkspaceFolders()?.rootDir;
+  const unsharePath = access.kind === 'owner' && artifactDoc ? artifactDoc : selectedFile;
   const { data: unshareRecord } = useArtifactByPath(
     openUnshareOnly ? workspaceId : null,
-    openUnshareOnly ? selectedFile : null,
+    openUnshareOnly ? unsharePath : null,
     { root },
+  );
+  // DALTON-HOOK(monitors): also surface stop-share entry when a historical public monitor is attached even if artifact.shared is false
+  const { data: unshareMonitor } = useQuery<MonitorSummary | null>(
+    {
+      queryKey: queryKeys.daltonMonitors.byArtifact(unshareRecord?.artifact_id ?? ''),
+      queryFn: () => getMonitorByArtifact(unshareRecord!.artifact_id),
+      enabled: Boolean(contextClient && openUnshareOnly && unshareRecord?.artifact_id),
+      retry: false,
+    },
+    monitorQueryClient,
   );
 
   const handleExportHtmlPdf = async () => {
@@ -261,6 +281,8 @@ function FileHeaderActions({
         openUrl: served.openUrl,
         printHint: t('filePanel:pdfPrintHint'),
         generatingHint: t('filePanel:pdfGenerating'),
+        // DALTON-HOOK(mobile-web): pass WeChat external-browser download guidance
+        wechatHint: t('filePanel:wechatOpenInBrowserHint'),
         scale: pdfScale,
         pageNumbers: pdfPageNumbers,
         branding: pdfBranding,
@@ -342,14 +364,21 @@ function FileHeaderActions({
 
   // One handler for every save in this menu. Four sites carried this same body
   // before, which is four places a new one could copy without the guard above.
-  const download = () => triggerDownloadFn(workspaceId, selectedFile).catch((err: unknown) => {
-    console.error('[FileHeaderActions] Download failed:', err);
-    // A save is the whole interaction: nothing opens, nothing navigates, and the
-    // browser shows no file. Without this the menu item is indistinguishable
-    // from a dead one. A toast rather than an inline error, because the document
-    // the reader is looking at is still fine and should stay on screen.
-    toast({ description: t('filePanel:downloadFailed'), variant: 'destructive' });
-  });
+  // DALTON-HOOK(mobile-web): prompt to open in external browser when downloading inside WeChat built-in browser
+  const download = () => {
+    if (isWeChatBrowser()) {
+      toast({ description: t('filePanel:wechatOpenInBrowserHint') });
+      return;
+    }
+    triggerDownloadFn(workspaceId, selectedFile).catch((err: unknown) => {
+      console.error('[FileHeaderActions] Download failed:', err);
+      // A save is the whole interaction: nothing opens, nothing navigates, and the
+      // browser shows no file. Without this the menu item is indistinguishable
+      // from a dead one. A toast rather than an inline error, because the document
+      // the reader is looking at is still fine and should stay on screen.
+      toast({ description: t('filePanel:downloadFailed'), variant: 'destructive' });
+    });
+  };
 
   const isMd = isMarkdownFile(selectedFile, fileMime);
   const isHtml = isHtmlFile(selectedFile);
@@ -463,13 +492,20 @@ function FileHeaderActions({
     );
   };
 
+  // DALTON-HOOK(monitors): include historical public monitors alongside active public artifact links;
+  // for owner panels show the dedicated stop-share entry when artifact.shared is false but a historical public monitor exists.
+  const hasHistoricalPublicMonitor =
+    !unshareRecord?.shared && unshareMonitor?.visibility === 'public';
   // DALTON-HOOK(mobile-web): compute visibility flags once and share them across both desktop toolbar and mobile HTML overflow menu
   const actions = resolveHeaderActionFlags({
     isHtml,
     access,
     onToggleHtmlSource,
     openUnshareOnly,
-    unshareShared: Boolean(unshareRecord?.shared),
+    unshareShared:
+      access.kind === 'owner'
+        ? hasHistoricalPublicMonitor
+        : Boolean(unshareRecord?.shared || unshareMonitor?.visibility === 'public'),
     openPublish,
     openUrl,
     canDownload,
@@ -534,11 +570,10 @@ function FileHeaderActions({
               {htmlSource ? <Eye className="h-4 w-4" /> : <Code2 className="h-4 w-4" />}
             </button>
           )}
-          {/* DALTON-HOOK(external-share-guard): an external member stops an
-              already-public link; nothing to publish, nothing to keep updated. */}
+          {/* DALTON-HOOK(external-share-guard): stop an already-public link or historical public monitor. */}
           {actions.showUnshareOnly && openUnshareOnly && (
             <button
-              onClick={() => openUnshareOnly(selectedFile)}
+              onClick={() => openUnshareOnly(unsharePath ?? selectedFile)}
               className="file-panel-icon-btn"
               title={t('artifact.unshareOnly')}
               aria-label={t('artifact.unshareOnly')}
@@ -581,7 +616,8 @@ function FileHeaderActions({
             <DropdownMenu modal={false}>
               <DropdownMenuTrigger asChild>
                 <button
-                  className="file-panel-icon-btn"
+                  // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on non-HTML file header actions
+                  className="file-panel-icon-btn tap-target"
                   aria-label={t('filePanel:downloadOptions') ?? 'Download options'}
                 >
                   <Download className="h-4 w-4" />
@@ -596,7 +632,7 @@ function FileHeaderActions({
           {actions.showEdit && (
             <button
               onClick={onStartEdit}
-              className="file-panel-icon-btn"
+              className="file-panel-icon-btn tap-target"
               title={t('filePanel:editFile')}
             >
               <Pencil className="h-4 w-4" />
@@ -623,10 +659,23 @@ function useArtifactMenuState({
   fallbackArtifact?: import('@/types/api').Artifact | null;
 }) {
   const { t } = useTranslation();
+  const contextClient = useContext(QueryClientContext);
+  const monitorQueryClient = contextClient ?? FALLBACK_MONITOR_QUERY_CLIENT;
   const root = useWorkspaceFolders()?.rootDir;
   const { data: queriedArtifact } = useArtifactByPath(enabled ? workspaceId : null, enabled ? path : null, { root });
   const artifact = queriedArtifact ?? fallbackArtifact;
   const artifactId = artifact?.artifact_id ?? null;
+  // DALTON-HOOK(monitors): read attached monitor so owner Manage label recognizes historical public monitors even when artifact.shared is false
+  const { data: artifactMonitor } = useQuery<MonitorSummary | null>(
+    {
+      queryKey: queryKeys.daltonMonitors.byArtifact(artifactId ?? ''),
+      queryFn: () => getMonitorByArtifact(artifactId!),
+      enabled: Boolean(contextClient && enabled && artifactId),
+      retry: false,
+    },
+    monitorQueryClient,
+  );
+  const hasPublicMonitor = artifactMonitor?.visibility === 'public';
   const sender = useArtifactCommentSender();
   const { besideThreadId } = sender;
   const { choices, canBind, targetFor } = useCommentDestinations(
@@ -665,6 +714,7 @@ function useArtifactMenuState({
   return {
     artifact,
     artifactId,
+    hasPublicMonitor,
     sender,
     targetFor,
     goesLine,
@@ -702,7 +752,8 @@ function ArtifactMenu({ workspaceId, path, onPublish }: {
       <DropdownMenuContent align="end" sideOffset={4} className="min-w-56 max-w-72">
         <DropdownMenuItem onSelect={() => onPublish(path)}>
           <Link2 className="h-3.5 w-3.5" />
-          {menu.artifact?.shared ? t('artifact.manage') : t('artifact.publishEllipsis')}
+          {/* DALTON-HOOK(monitors): show Manage label for active shares and historical public monitors */}
+          {menu.artifact?.shared || menu.hasPublicMonitor ? t('artifact.manage') : t('artifact.publishEllipsis')}
         </DropdownMenuItem>
         {(menu.goesLine || menu.showBind || menu.showUnbind) && <DropdownMenuSeparator />}
         {menu.goesLine && (
@@ -1128,7 +1179,7 @@ function MobileHtmlOverflowMenu({
           {!isLinkedDoc && actions.showPublish && openPublish && (
             <DropdownMenuItem onSelect={() => openPublish(selectedFile)} data-testid="file-header-mobile-publish">
               <Link2 className="h-3.5 w-3.5" />
-              {actions.showOwnerArtifactMenu && menu.artifact?.shared ? t('artifact.manage') : t('artifact.publishEllipsis')}
+              {actions.showOwnerArtifactMenu && (menu.artifact?.shared || menu.hasPublicMonitor) ? t('artifact.manage') : t('artifact.publishEllipsis')}
             </DropdownMenuItem>
           )}
           {!isLinkedDoc && actions.showOwnerArtifactMenu && menu.goesLine && (

@@ -80,34 +80,60 @@ export function projectLiveInterrupt(
     const proposalId = event.interrupt_id || `workspace-${Date.now()}`;
     const proposalData = actionRequests[0];
     const order = eventOrder(event, () => ++refs.contentOrderCounterRef.current);
+    // DALTON-HOOK(cos-settings-tools): pre-upgrade create_workspace cards without tool_call_id settle directly as scope_changed
+    const hasToolCallId = typeof proposalData.tool_call_id === 'string' && proposalData.tool_call_id.length > 0;
 
+    // --- DALTON-HOOK(cos-settings-tools): begin ---
+    // A re-raised create_workspace interrupt (e.g. failed resume + /retry)
+    // means the pause was never consumed while the original card is stuck in
+    // `submitting`. Restore the originally rendered card by interrupt_id back
+    // to `pending` and continue suppressing duplicate rendering on this bubble.
     rt.setMessages((prev) =>
-      updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
-        ...msg,
-        contentSegments: appendCardSegment(msg.contentSegments, { type: 'create_workspace', proposalId, order }),
-        workspaceProposals: {
-          ...(msg.workspaceProposals || {}),
-          [proposalId]: {
-            workspace_name: proposalData.workspace_name,
-            workspace_description: proposalData.workspace_description,
-            // DALTON-HOOK(workspace-duplicate-guard): name the workspace this create would duplicate
-            duplicate_workspace_id: proposalData.duplicate_workspace_id,
-            duplicate_workspace_name: proposalData.duplicate_workspace_name,
-            duplicate_check_unavailable: proposalData.duplicate_check_unavailable,
-            interruptId: event.interrupt_id,
-            status: 'pending',
-          },
-        },
-        isStreaming: false,
-      }; })
+      interruptAlreadyRendered
+        ? (hasToolCallId ? setCardStatus(prev, 'workspaceProposals', proposalId, 'pending') : prev)
+        : updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
+            ...msg,
+            contentSegments: appendCardSegment(msg.contentSegments, { type: 'create_workspace', proposalId, order }),
+            workspaceProposals: {
+              ...(msg.workspaceProposals || {}),
+              [proposalId]: {
+                workspace_name: proposalData.workspace_name,
+                workspace_description: proposalData.workspace_description,
+                // DALTON-HOOK(workspace-duplicate-guard): name the workspace this create would duplicate
+                duplicate_workspace_id: proposalData.duplicate_workspace_id,
+                duplicate_workspace_name: proposalData.duplicate_workspace_name,
+                duplicate_check_unavailable: proposalData.duplicate_check_unavailable,
+                // DALTON-HOOK(cos-settings-tools): confirmation snapshot fields, tool_call_id, and legacy scope_changed terminal state
+                computer_id: proposalData.computer_id,
+                computer_name: proposalData.computer_name,
+                computer_is_own_machine: proposalData.computer_is_own_machine,
+                bootstrap_cloud_primary: proposalData.bootstrap_cloud_primary,
+                tool_call_id: proposalData.tool_call_id,
+                interruptId: event.interrupt_id,
+                status: hasToolCallId ? 'pending' : 'failed',
+                ...(hasToolCallId
+                  ? {}
+                  : {
+                      failure_code: 'scope_changed',
+                      failure_error: '情况已变化，请重新发起',
+                    }),
+              },
+            },
+            isStreaming: false,
+          }; })
     );
+    // --- DALTON-HOOK(cos-settings-tools): end ---
 
-    arm({
-      type: 'create_workspace',
-      interruptId: event.interrupt_id,
-      assistantMessageId,
-      proposalId,
-    });
+    // DALTON-HOOK(cos-settings-tools): do not arm legacy cards lacking tool_call_id
+    if (hasToolCallId) {
+      arm({
+        type: 'create_workspace',
+        interruptId: event.interrupt_id,
+        assistantMessageId,
+        proposalId,
+        toolCallId: proposalData.tool_call_id,
+      });
+    }
   } else if (actionType === 'start_question') {
     // --- Start question interrupt ---
     const proposalId = event.interrupt_id || `question-start-${Date.now()}`;
@@ -192,6 +218,8 @@ export function projectLiveInterrupt(
             workspace_id: proposalData.workspace_id,
             workspace_name: proposalData.workspace_name,
             thread_id: proposalData.thread_id,
+            // DALTON-HOOK(cos-settings-tools): carry tool_call_id for secretary cards
+            tool_call_id: proposalData.tool_call_id,
             interruptId: event.interrupt_id,
             status: 'pending',
           },
@@ -205,6 +233,7 @@ export function projectLiveInterrupt(
       interruptId: event.interrupt_id,
       assistantMessageId,
       proposalId,
+      toolCallId: proposalData.tool_call_id,
     });
   } else if (actionType === 'credit_pause') {
     // --- Credit pause interrupt ---

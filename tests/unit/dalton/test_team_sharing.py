@@ -595,6 +595,7 @@ class TestReadEndpointsAllowColleagues:
         replay_rows = ThreadRows(
             thread_id=thread_id,
             owner_id="u-richard",
+            workspace_owner_id="u-richard",
             thread={
                 "conversation_thread_id": thread_id,
                 "workspace_id": ws["workspace_id"],
@@ -1170,6 +1171,7 @@ class TestWriteEndpointsRejectColleagues:
         # 2. Route-level send_thread_message to an existing colleague thread -> 403
         auth_meta_mock.return_value = {
             "user_id": "u-richard",
+            "workspace_owner_id": "u-richard",
             "is_shared": False,
             "msg_type": "ptc",
             "workspace_id": ws["workspace_id"],
@@ -1219,11 +1221,17 @@ class TestWriteEndpointsRejectColleagues:
         assert exc_del.value.status_code == 403
 
         # Upload file -> 403
+        from starlette.requests import Request as StarletteRequest
+
+        plain_req = StarletteRequest(
+            {"type": "http", "method": "POST", "path": "/upload", "headers": []}
+        )
         fake_upload = create_autospec(UploadFile, instance=True)
         with pytest.raises(HTTPException) as exc_up:
             await ws_files_crud.upload_workspace_file(
                 ws["workspace_id"],
                 x_user_id="u-chao",
+                request=plain_req,
                 path="results/new.txt",
                 file=fake_upload,
             )
@@ -2923,6 +2931,10 @@ class TestAccessTierInternalGate:
         from src.dalton import access_tiers as tiers_mod
         from src.server.database import user as user_db
 
+        # Exercise Supabase multi-user roster checks (single-user OSS mode treats the sole local
+        # user as 'admin' per external-member-permissions Decision 8).
+        monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
+        monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
         monkeypatch.setattr(
             tiers_mod, "get_dalton_allowed_emails", lambda: frozenset({"internal@firm.com"})
         )

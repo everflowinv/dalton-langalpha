@@ -1,13 +1,27 @@
-import type { BackendClient } from "../backend-client.js";
+import type {
+  BackendClient,
+  WeixinPreflightAuthorizedData,
+  WeixinPreflightSendResponse,
+} from "../backend-client.js";
+import type { GatewayLeaseManager } from "../gateway-lease.js";
+import {
+  degradeOversizedLink,
+  findAtomicLinkSpans,
+  findSpanStraddling,
+} from "../shared/text.js";
 import type {
   AvailableChatItem,
   ChannelPlatform,
   InboundAttachmentDescriptor,
   InboundChannelEvent,
   NativeInteractionEvent,
+  OneTimeWeixinReplyEnvelope,
 } from "../types.js";
 
-export type ChannelErrorOutcome = "failed" | "unknown" | "rate_limited";
+export type ChannelErrorOutcome =
+  | "failed"
+  | "unknown"
+  | "rate_limited";
 export type ChannelErrorCode =
   | "target_not_found"
   | "rate_limited"
@@ -18,6 +32,9 @@ export class ChannelDeliveryError extends Error {
   readonly outcome: ChannelErrorOutcome;
   readonly code: ChannelErrorCode;
   readonly retryAfterMs?: number;
+  readonly retryable?: boolean;
+  readonly denyCode?: string;
+  readonly errorDetail?: string;
 
   constructor(
     message: string,
@@ -25,6 +42,9 @@ export class ChannelDeliveryError extends Error {
       outcome: ChannelErrorOutcome;
       code: ChannelErrorCode;
       retryAfterMs?: number;
+      retryable?: boolean;
+      denyCode?: string;
+      errorDetail?: string;
     },
   ) {
     super(message);
@@ -32,6 +52,9 @@ export class ChannelDeliveryError extends Error {
     this.outcome = options.outcome;
     this.code = options.code;
     this.retryAfterMs = options.retryAfterMs;
+    this.retryable = options.retryable;
+    this.denyCode = options.denyCode;
+    this.errorDetail = options.errorDetail;
   }
 }
 
@@ -61,6 +84,13 @@ export interface SendTextChunkOptions {
   onConfirmedThread?: (confirmed: { address: string }) => Promise<void>;
   weixinContextToken?: string | null;
   inboundMessageId?: string | null;
+  /** Claim attempt generation from I-6 (used by Weixin `preflight-send`). */
+  deliveryAttempt?: number;
+  /** Authoritative Weixin preflight credentials for this exact chunk send. */
+  weixinPreflight?: WeixinPreflightAuthorizedData | null;
+  weixinAccountId?: string | null;
+  /** Optional abort signal created before preflight to cancel on lease loss or account change. */
+  signal?: AbortSignal;
 }
 
 export interface SendTextChunkResult {
@@ -76,8 +106,17 @@ export interface SendFileOptions {
   content: Buffer;
   mimeType: string;
   threadScopeKey?: string | null;
+  deliveryKey?: string | null;
+  deliveryAttempt?: number;
   weixinContextToken?: string | null;
   inboundMessageId?: string | null;
+  /** Authoritative Weixin preflight credentials before CDN upload. */
+  weixinPreflight?: WeixinPreflightAuthorizedData | null;
+  /** Called right after CDN upload and immediately before `sendmessage` to re-verify account authorization. */
+  refreshWeixinPreflight?: () => Promise<WeixinPreflightSendResponse>;
+  weixinAccountId?: string | null;
+  /** Optional abort signal created before preflight to cancel on lease loss or account change. */
+  signal?: AbortSignal;
 }
 
 export interface SendFileResult {
@@ -178,6 +217,7 @@ export interface WeixinQrStartResult {
   status?: string;
   expires_at?: string;
   message?: string;
+  login_version?: number;
 }
 
 export interface WeixinQrWaitResult {
@@ -190,8 +230,16 @@ export interface WeixinQrWaitResult {
     | "verify_code"
     | "need_verify"
     | "need_verifycode"
+    | "superseded"
     | "error";
   connected?: boolean;
+  already_connected?: boolean;
+  account_id?: string | null;
+  account_status?: string | null;
+  accounts_revision?: number | null;
+  pending_verification?: boolean;
+  revoked?: boolean;
+  code?: string | null;
   ilink_bot_id?: string | null;
   ilink_user_id?: string | null;
   ilink_username?: string | null;
@@ -322,6 +370,7 @@ export interface ChannelAdapter {
   downloadAttachment(
     descriptor: InboundAttachmentDescriptor,
     event: InboundChannelEvent,
+    options?: { signal?: AbortSignal },
   ): Promise<DownloadedAttachment>;
 
   /**
@@ -341,9 +390,76 @@ export interface ChannelAdapter {
     purpose: string;
   }): Promise<CheckTargetLiveResult>;
 
-  /** Optional Weixin iLink QR login methods (§1.5 #4, §4.4). */
+  /** Optional Weixin iLink multi-account & QR login methods (§3.1 ~ §3.5). */
   setBackendClient?(client: BackendClient): void;
-  startQrLogin?(options: { userId: string }): Promise<WeixinQrStartResult>;
+  setLeaseManager?(lease: GatewayLeaseManager): void;
+  /**
+   * Loads and applies the initial managed account snapshot BEFORE the gateway lifts
+   * startup write gating and before long-polling starts (R4 #5).
+   */
+  prepareStartupSnapshot?(): Promise<void>;
+  /**
+   * Synchronously abort every in-flight network request (sendmessage, CDN upload,
+   * QR login, long-poll loops) without waiting for handlers to settle (D1 / §3.2).
+   */
+  abortAllInFlight?(): void;
+  /**
+   * Runs a Weixin preflight + send operation under a tracked AbortSignal registered BEFORE
+   * `preflight-send` is called (Round 3 Decision #2), so lease loss or account invalidation
+   * during preflight immediately aborts before `sendmessage` / CDN upload.
+   */
+  runWithAccountOperationSignal?<T>(
+    accountId: string | null | undefined,
+    fn: (ctx: {
+      signal: AbortSignal;
+      attachAccount: (id: string | null | undefined) => void;
+    }) => Promise<T>,
+  ): Promise<T>;
+  /** Restart any pollable Weixin account monitors that exited transiently (e.g. brief lease dip). */
+  ensurePollableMonitorsRunning?(): void;
+  /**
+   * Returns true iff the Weixin account referenced by `event` is still present,
+   * pollable, and matches the exact `ilinkBotId` + `botGeneration` in the current snapshot.
+   */
+  isWeixinAccountGenerationActive?(
+    event: Pick<
+      InboundChannelEvent,
+      "weixinAccountId" | "weixinBotId" | "weixinBotGeneration"
+    >,
+  ): boolean;
+  onWeixinAccountInvalidated?(
+    handler: (info: {
+      accountId: string;
+      reason: string;
+      activeBotGeneration?: number;
+      includeSameGeneration?: boolean;
+    }) => void,
+  ): void;
+  hasAppliedStartupSnapshot?(): boolean;
+  /**
+   * Resolves to `true` once an authoritative startup/reconcile snapshot from the current
+   * backend has been applied (or immediately when no backend is configured), or `false`
+   * if aborted, stopped, or lease-expired before a snapshot is applied.
+   */
+  waitForStartupSnapshot?(signal?: AbortSignal): Promise<boolean>;
+  triggerAccountsSync?(
+    targetRevision?: number | null,
+    reason?: string,
+  ): Promise<{ ok: boolean; accepted_revision: number }>;
+  /**
+   * D16 one-time Weixin reply using inbound `context_token` directly without `preflight-send`.
+   * Deduplicated by `dedupeKey` in process memory so retries do not duplicate the notice.
+   */
+  sendOneTimeReply?(
+    envelope: OneTimeWeixinReplyEnvelope,
+    dedupeKey?: string,
+  ): Promise<{ sent: boolean; duplicate?: boolean; messageId?: string }>;
+  startQrLogin?(options: {
+    userId: string;
+    sessionKey?: string;
+    loginVersion?: number;
+    expectedBotGeneration?: number;
+  }): Promise<WeixinQrStartResult>;
   waitQrLogin?(options: {
     userId: string;
     sessionKey: string;
@@ -366,7 +482,9 @@ export interface ChannelAdapter {
 }
 
 /**
- * Default Markdown-aware chunk splitter respecting `maxChunkChars`.
+ * Default Markdown-aware chunk splitter respecting `maxChunkChars`, keeping
+ * Markdown links intact across chunk boundaries and degrading oversized single
+ * links to plain-text workspace hints.
  */
 export function splitTextByLimit(text: string, maxChunkChars: number): string[] {
   if (!text) return [];
@@ -375,11 +493,25 @@ export function splitTextByLimit(text: string, maxChunkChars: number): string[] 
   const chunks: string[] = [];
   let remaining = text;
   while (remaining.length > maxChunkChars) {
-    let splitIdx = remaining.lastIndexOf("\n", maxChunkChars);
-    if (splitIdx <= 0 || splitIdx < Math.floor(maxChunkChars * 0.4)) {
-      splitIdx = remaining.lastIndexOf(" ", maxChunkChars);
+    const linkSpans = findAtomicLinkSpans(remaining);
+    const minPreferred = Math.floor(maxChunkChars * 0.4);
+
+    const findSafeDelimiter = (delim: string): number => {
+      let idx = remaining.lastIndexOf(delim, maxChunkChars);
+      while (idx > 0 && idx >= minPreferred) {
+        if (!findSpanStraddling(linkSpans, idx)) {
+          return idx;
+        }
+        idx = remaining.lastIndexOf(delim, idx - 1);
+      }
+      return -1;
+    };
+
+    let splitIdx = findSafeDelimiter("\n");
+    if (splitIdx <= 0) {
+      splitIdx = findSafeDelimiter(" ");
     }
-    if (splitIdx <= 0 || splitIdx < Math.floor(maxChunkChars * 0.4)) {
+    if (splitIdx <= 0) {
       splitIdx = maxChunkChars;
       // A hard cut must not split a surrogate pair (emoji etc.).
       const before = remaining.charCodeAt(splitIdx - 1);
@@ -387,6 +519,20 @@ export function splitTextByLimit(text: string, maxChunkChars: number): string[] 
         splitIdx -= 1;
       }
     }
+
+    const straddling = findSpanStraddling(linkSpans, splitIdx);
+    if (straddling) {
+      if (straddling.start > 0) {
+        splitIdx = straddling.start;
+      } else {
+        const degraded = degradeOversizedLink(straddling);
+        if (degraded !== null && degraded.length < straddling.end) {
+          remaining = degraded + remaining.slice(straddling.end);
+          continue;
+        }
+      }
+    }
+
     chunks.push(remaining.slice(0, splitIdx));
     remaining = remaining.slice(splitIdx).replace(/^\n/, "");
   }

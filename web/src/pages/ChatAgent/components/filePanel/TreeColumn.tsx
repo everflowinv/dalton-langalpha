@@ -148,7 +148,8 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
               ) : (
                 <button
                   onClick={selection.handleDelete}
-                  className="file-panel-icon-btn"
+                  // DALTON-HOOK(mobile-web): expand coarse-pointer touch targets on file tree toolbar icon buttons
+                  className="file-panel-icon-btn tap-target"
                   title={t('filePanel:deleteSelected')}
                   disabled={selection.selectedPaths.size === 0 || selection.deleteLoading}
                   style={selection.selectedPaths.size > 0 ? { color: 'var(--color-icon-danger)' } : undefined}
@@ -156,7 +157,7 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
                   <Trash2 className="h-4 w-4" />
                 </button>
               )}
-              <button onClick={selection.exitSelectMode} className="file-panel-icon-btn" title={t('filePanel:cancelSelection')}>
+              <button onClick={selection.exitSelectMode} className="file-panel-icon-btn tap-target" title={t('filePanel:cancelSelection')}>
                 <X className="h-4 w-4" />
               </button>
             </>
@@ -166,7 +167,7 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
                 <>
                   <button
                     onClick={enterSelectMode}
-                    className="file-panel-icon-btn"
+                    className="file-panel-icon-btn tap-target"
                     title={t('filePanel:selectFiles')}
                     disabled={filter.listedFiles.length === 0}
                   >
@@ -175,7 +176,7 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
                   {props.onCancelUpload ? (
                     <button
                       onClick={props.onCancelUpload}
-                      className="file-panel-icon-btn"
+                      className="file-panel-icon-btn tap-target"
                       title={t('filePanel:cancelUpload')}
                       aria-label={t('filePanel:cancelUpload')}
                     >
@@ -184,7 +185,7 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
                   ) : (
                     <button
                       onClick={props.onUpload}
-                      className="file-panel-icon-btn"
+                      className="file-panel-icon-btn tap-target"
                       title={t('filePanel:uploadFile')}
                       disabled={props.uploadDisabled}
                     >
@@ -192,11 +193,11 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
                     </button>
                   )}
                   {backup.canBackUp && (
-                    <button onClick={backup.handleBackup} className="file-panel-icon-btn" title={t('filePanel:backupFiles')} disabled={backup.backingUp}>
+                    <button onClick={backup.handleBackup} className="file-panel-icon-btn tap-target" title={t('filePanel:backupFiles')} disabled={backup.backingUp}>
                       <HardDrive className={`h-4 w-4 ${backup.backingUp ? 'animate-pulse' : ''}`} />
                     </button>
                   )}
-                  <button onClick={props.onRefreshFiles} className="file-panel-icon-btn" title={t('filePanel:refresh')}>
+                  <button onClick={props.onRefreshFiles} className="file-panel-icon-btn tap-target" title={t('filePanel:refresh')}>
                     {props.filesLoading ? <Loader size={16} className="text-current" /> : <RefreshCw className="h-4 w-4" />}
                   </button>
                 </>
@@ -214,7 +215,7 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
                 }}
               >
                 <button
-                  className="file-panel-icon-btn"
+                  className="file-panel-icon-btn tap-target"
                   title={t('filePanel:sortFiles')}
                   aria-label={t('filePanel:sortFiles')}
                   aria-haspopup="menu"
@@ -253,7 +254,7 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
               )}
               {props.onOpenSettings && (
                 <button
-                  className="file-panel-icon-btn"
+                  className="file-panel-icon-btn tap-target"
                   onClick={props.onOpenSettings}
                   title={props.workspaceName || t('chat.workspaceSettings')}
                 >
@@ -288,7 +289,8 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
               <button
                 type="button"
                 onClick={filter.clearSearch}
-                className="file-panel-icon-btn"
+                // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on clear search button
+                className="file-panel-icon-btn tap-target"
                 title={t('filePanel:clearSearch')}
                 aria-label={t('filePanel:clearSearch')}
                 style={{ margin: '-0.25rem' }}
@@ -326,7 +328,7 @@ export function TreeColumn(props: TreeColumnProps): React.ReactElement {
         {props.scopeDir != null && (
           <div className="file-panel-tree-scope">
             <span className="truncate">{props.scopeDir ? `${props.scopeDir}/` : '/'}</span>
-            <button type="button" onClick={props.onClearScope} className="file-panel-icon-btn" title={t('filePanel:backToAllFiles')}>
+            <button type="button" onClick={props.onClearScope} className="file-panel-icon-btn tap-target" title={t('filePanel:backToAllFiles')}>
               <X className="h-3 w-3" />
             </button>
           </div>

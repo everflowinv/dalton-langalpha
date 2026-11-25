@@ -1,8 +1,11 @@
 """Dalton OpenClaw conversation archive package (`source_type='conversation'`)."""
 
 from src.dalton.conversations.embedder import (
+    embed_query,
     embed_query_via_bridge,
+    embed_texts,
     embed_texts_via_bridge,
+    is_embed_via_bridge_enabled,
 )
 from src.dalton.conversations.extractor import (
     EXTRACTION_RESPONSE_SCHEMA,
@@ -48,8 +51,11 @@ __all__ = [
     "compute_content_hash",
     "compute_recency_decay",
     "deduplicate_candidate_cards",
+    "embed_query",
     "embed_query_via_bridge",
+    "embed_texts",
     "embed_texts_via_bridge",
+    "is_embed_via_bridge_enabled",
     "enforce_speaker_and_agent_citation",
     "expand_event_chunks",
     "extract_segment_cards",

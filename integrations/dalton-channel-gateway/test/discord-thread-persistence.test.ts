@@ -500,6 +500,8 @@ async function inspectDelivery(
 
 function detailCode(data: unknown): string | undefined {
   if (!data || typeof data !== "object") return undefined;
+  const topCode = (data as { code?: unknown }).code;
+  if (typeof topCode === "string" && topCode.length > 0) return topCode;
   const detail = (data as { detail?: unknown }).detail;
   if (!detail || typeof detail !== "object") return undefined;
   const code = (detail as { code?: unknown }).code;
@@ -560,14 +562,22 @@ describe.skipIf(suite === "feishu")("confirmed Discord thread persistence (d036)
           baseUrl: harness.baseUrl,
           serviceToken: boot.service_token,
         });
-        const freshDelivery = () =>
-          deliveryFor(
-            new HttpBackendClient({
-              baseUrl: harness.baseUrl,
-              serviceToken: boot.service_token,
-            }),
-            world.rest,
-          );
+        const leaseInstanceId = `discord-thread-persist-${boot.prefix}`;
+        const lease = await client.acquireGatewayLease({
+          instance_id: leaseInstanceId,
+          ttl_seconds: 180,
+        });
+        expect(lease.granted).toBe(true);
+        client.setGatewayEpoch(lease.epoch);
+        try {
+        const freshDelivery = () => {
+          const freshClient = new HttpBackendClient({
+            baseUrl: harness.baseUrl,
+            serviceToken: boot.service_token,
+          });
+          freshClient.setGatewayEpoch(lease.epoch);
+          return deliveryFor(freshClient, world.rest);
+        };
         const postProgress = async (body: Record<string, unknown>) => {
           const response = await fetch(
             `${harness.baseUrl}/api/v1/dalton/channels/internal/deliveries/progress`,
@@ -1043,6 +1053,14 @@ describe.skipIf(suite === "feishu")("confirmed Discord thread persistence (d036)
         expect(deniedRow.target_address).toBe(boot.parent_addr);
         expect(deniedRow.confirmed_thread_address).toBe(progressAddress);
         expect(deniedRow.discord_body_phase).toBe("dispatching");
+      } finally {
+        await client
+          .releaseGatewayLease({
+            instance_id: leaseInstanceId,
+            epoch: lease.epoch,
+          })
+          .catch(() => undefined);
+      }
       } finally {
         await harness.stop();
       }

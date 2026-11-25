@@ -139,7 +139,11 @@ EXPLICIT_PROPRIETARY_ROUTE_PREFIXES: tuple[str, ...] = (
 _CLEAR_CAP_ENV_VARS: tuple[str, ...] = (
     "APP_ENV",
     "DALTON_PROFILE",
+    "DALTON_HOST_PLATFORM",
     "DALTON_ENABLED",
+    "DALTON_EMBED_VIA_BRIDGE",
+    "DALTON_OPS_JOBS_VIA_BRIDGE",
+    "DALTON_OPS_STATUS_FILE",
     "DALTON_RESEARCHDATA_URL",
     "DALTON_BRIDGE_URL",
     "DALTON_BRIDGE_TOKEN",
@@ -364,6 +368,7 @@ class TestCapabilityRegistry:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         _clean_cap_env(monkeypatch, app_env="core")
+        monkeypatch.setenv("DALTON_HOST_PLATFORM", "macos")
 
         bridge_children = (
             CapabilityId.ALPHAENGINE,
@@ -440,6 +445,38 @@ class TestCapabilityRegistry:
         _clean_cap_env(monkeypatch, app_env="dalton")
         fp_everflow = capabilities_fingerprint()
         assert fp_everflow != fp_core_1
+
+    def test_host_platform_exclusively_gates_alphaengine_independent_of_sys_platform(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Batch 1 (§7.1 #1): DALTON_HOST_PLATFORM=macos|linux alone gates alphaengine; sys.platform has zero effect."""
+        import sys
+        from src.dalton.capabilities import resolve_host_platform
+
+        _clean_cap_env(monkeypatch, app_env="dalton")
+        monkeypatch.setenv("DALTON_HOST_PLATFORM", "macos")
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert resolve_host_platform() == "macos"
+        assert has_capability(CapabilityId.ALPHAENGINE) is True
+
+        monkeypatch.setenv("DALTON_HOST_PLATFORM", "linux")
+        monkeypatch.setattr(sys, "platform", "darwin")
+        assert resolve_host_platform() == "linux"
+        assert has_capability(CapabilityId.ALPHAENGINE) is False
+
+        # Core profile with bridge + alphaengine explicitly on still requires DALTON_HOST_PLATFORM=macos
+        _clean_cap_env(monkeypatch, app_env="core")
+        monkeypatch.setenv("DALTON_CAP_RESEARCHDATA_BRIDGE", "true")
+        monkeypatch.setenv("DALTON_CAP_ALPHAENGINE", "true")
+        monkeypatch.setattr(sys, "platform", "darwin")
+        assert resolve_host_platform() == "linux"
+        assert has_capability(CapabilityId.ALPHAENGINE) is False
+
+        monkeypatch.setenv("DALTON_HOST_PLATFORM", "macos")
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert resolve_host_platform() == "macos"
+        assert has_capability(CapabilityId.ALPHAENGINE) is True
 
 
 # ---------------------------------------------------------------------------
@@ -954,7 +991,8 @@ class TestDaltonRoutesRegistrationGate:
             "updated_at": None,
         }
 
-        # 4. Supabase auth enabled while colleague_sharing is off -> caller_tier resolved via get_user_tier
+        # 4. Multi-user auth (Supabase or local) enabled while colleague_sharing is off -> caller_tier resolved via get_user_tier
+        monkeypatch.setattr(dalton_settings_mod, "is_dalton_auth_enabled", lambda: True)
         monkeypatch.setattr(dalton_settings_mod, "is_dalton_supabase_auth_enabled", lambda: True)
 
         async def _fake_require_team_reader(_uid: str) -> None:
@@ -2283,6 +2321,97 @@ class TestBackendCapabilityPruning:
         assert seen_urls == [f"{get_dalton_channel_gateway_url()}/internal/weixin/qrcode/start"]
 
     @pytest.mark.asyncio
+    async def test_channel_weixin_disabled_blocks_weixin_routes_omits_bindings_and_preserves_other_settings(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """§3.1 (2) & §7.1: with channel_weixin=off, /weixin/* 404s, /bindings & I-4 omit weixin, /settings preserves DB weixin key."""
+        _clean_cap_env(monkeypatch, app_env="dalton")
+        monkeypatch.setenv("DALTON_CAP_CHANNEL_WEIXIN", "false")
+        monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", "s" * 40)
+        client = TestClient(_make_dalton_test_app())
+        svc_hdr = {"X-Service-Token": "s" * 40, "X-Gateway-Epoch": "1"}
+
+        # 1) All dedicated /weixin/* web & internal routes return 404
+        for method, path, body in (
+            ("GET", "/api/v1/dalton/channels/weixin/admin/overview", None),
+            ("PUT", "/api/v1/dalton/channels/weixin/admin/config", {"enabled": True}),
+            ("DELETE", "/api/v1/dalton/channels/weixin/admin/accounts/00000000-0000-0000-0000-000000000001", None),
+            ("DELETE", "/api/v1/dalton/channels/weixin/admin/users/u-1/weixin", None),
+            ("POST", "/api/v1/dalton/channels/weixin/qrcode/start", None),
+            ("POST", "/api/v1/dalton/channels/internal/weixin/accounts/reconcile", {}),
+            ("GET", "/api/v1/dalton/channels/internal/weixin/accounts/00000000-0000-0000-0000-000000000001", None),
+        ):
+            r = client.request(method, path, headers=svc_hdr, json=body)
+            assert r.status_code == 404, f"{method} {path} returned {r.status_code}"
+
+        # 2) Shared platform routes reject platform=weixin with 404 (including unbind & I-1/I-3)
+        assert client.post("/api/v1/dalton/channels/bind-codes", json={"platform": "weixin"}).status_code == 404
+        assert client.delete("/api/v1/dalton/channels/bindings/weixin").status_code == 404
+        assert (
+            client.post(
+                "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+                headers=svc_hdr,
+                json={
+                    "platform": "weixin",
+                    "platform_user_id": "wx1",
+                    "chat_address": "weixin:@me",
+                    "thread_scope_key": "dm:wx1",
+                    "message_id": "m1",
+                },
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                "/api/v1/dalton/channels/internal/bind-code/consume",
+                headers=svc_hdr,
+                json={"action": "unbind", "platform": "weixin", "user_id": "u-1"},
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(
+                "/api/v1/dalton/channels/internal/session/command",
+                headers=svc_hdr,
+                json={
+                    "cmd": "help",
+                    "platform": "weixin",
+                    "platform_user_id": "wx1",
+                    "scope_key": "dm:wx1",
+                    "message_id": "m2",
+                },
+            ).status_code
+            == 404
+        )
+
+        # 3) GET /bindings omits weixin keys completely when channel_weixin=off
+        monkeypatch.setattr(
+            channels_router_mod,
+            "get_channel_internal_state",
+            create_autospec(
+                channels_router_mod.get_channel_internal_state,
+                return_value={
+                    "user_id": "u-1",
+                    "user_tier": "internal",
+                    "home_workspace_id": "00000000-0000-0000-0000-000000000009",
+                    "identities": {
+                        "feishu": {"platform_user_id": "ou_1", "platform_username": "A"},
+                    },
+                    "settings": {"version": "1", "apps": {"feishu": {"preferred": "feishu:@me"}}},
+                    "chat_bindings": [],
+                },
+            ),
+        )
+        r_bindings = client.get("/api/v1/dalton/channels/bindings")
+        assert r_bindings.status_code == 200
+        body = r_bindings.json()
+        assert "weixin" not in body["bindings"]
+        assert "weixin" not in body["identities"]
+        assert "weixin_account" not in body
+        assert "feishu" in body["bindings"]
+
+    @pytest.mark.asyncio
     async def test_post_bridge_notify_checks_per_target_without_dual_master_gate(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -2505,12 +2634,12 @@ class TestBatch3BackendTextAndSkillGates:
         _clean_cap_env(monkeypatch, app_env="core")
         core_caps = frozenset()
 
-        # All 29 Core-visible Dalton skills assemble cleanly with 0 proprietary hits
+        # All 30 Core-visible Dalton skills assemble cleanly with 0 proprietary hits
         core_skills = sorted(
             name for name in dr_mod.DALTON_SKILL_DEFINITIONS
             if dr_mod.is_dalton_skill_enabled(name)
         )
-        assert len(core_skills) == 29
+        assert len(core_skills) == 30
         assert "dalton-13f-tracker" not in core_skills
         assert "dalton-bullbear-tracker" not in core_skills
 

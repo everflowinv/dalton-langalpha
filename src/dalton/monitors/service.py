@@ -13,8 +13,16 @@ from typing import Any
 
 from fastapi import HTTPException
 
+from psycopg.rows import dict_row
+
 from src.config.env import PREVIEW_PROXY_FRAME_ANCESTORS
 from src.dalton.access_tiers import get_user_tier
+from src.dalton.auth_guards import (
+    ADMIN_REQUIRED_CODE,
+    forbidden_detail,
+    raise_admin_required,
+    raise_external_member_forbidden,
+)
 from src.dalton.capabilities import CapabilityId, has_capability
 from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID, is_company_system_user
 from src.dalton.monitors import db as monitor_db
@@ -43,10 +51,12 @@ from src.dalton.monitors.models import (
     is_valid_slug,
 )
 from src.dalton.monitors.permissions import (
+    EXTERNAL_MONITOR_PUBLISH_FORBIDDEN_MESSAGE,
     can_manage_monitor_fields,
     can_view_monitor,
     is_monitor_capability_enabled,
     require_monitor_capability,
+    require_monitor_publish_visibility,
     require_monitor_view,
     validate_publish_permissions,
 )
@@ -87,6 +97,7 @@ from src.server.services.workspace_files import (
 )
 
 logger = logging.getLogger(__name__)
+_REAL_GET_USER_TIER = get_user_tier
 
 
 def _require_publishing_enabled() -> None:
@@ -139,8 +150,11 @@ async def _resolve_workspace_owner_id(monitor: MonitorRecord) -> str:
     return monitor.owner_user_id
 
 
-async def _verify_user_is_admin(user_id: str) -> None:
-    if await get_user_tier(user_id) != "admin":
+async def _verify_user_is_admin(user_id: str, *, conn: Any = None) -> None:
+    tier = await monitor_db._call_with_optional_conn(
+        get_user_tier, user_id, conn=conn
+    )
+    if tier != "admin":
         raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
 
 
@@ -173,6 +187,7 @@ async def cut_monitor_version(
     run_id: str | None = None,
     artifact: Any | None = None,
     new_owner_user_id: str | None = None,
+    caller_user_id: str | None = None,
     verify_public_authority: Any = None,
     check_pending_outbound_confirm: bool = False,
     reject_if_pending_outbound_confirm: bool = False,
@@ -192,6 +207,7 @@ async def cut_monitor_version(
         left_out_files=left_out_files,
         run_id=run_id,
         new_owner_user_id=new_owner_user_id,
+        caller_user_id=caller_user_id,
         verify_public_authority=verify_public_authority,
         check_pending_outbound_confirm=check_pending_outbound_confirm,
         reject_if_pending_outbound_confirm=reject_if_pending_outbound_confirm,
@@ -240,10 +256,21 @@ def _translate_snapshot_error(exc: Exception) -> HTTPException:
     if isinstance(exc, VersionMoved):
         return HTTPException(status_code=409, detail={"code": "version_moved"})
     if isinstance(exc, PublicAuthorityLostError):
-        return HTTPException(status_code=403, detail=str(exc))
+        return HTTPException(
+            status_code=403,
+            detail=forbidden_detail(ADMIN_REQUIRED_CODE, str(exc)),
+        )
     if isinstance(exc, HTTPException):
         return exc
     return HTTPException(status_code=500, detail=str(exc))
+
+
+def _extract_publish_failure_message(exc: Exception) -> str:
+    if isinstance(exc, HTTPException) and isinstance(exc.detail, dict):
+        msg = str(exc.detail.get("message") or "").strip()
+        if msg:
+            return msg
+    return str(exc)
 
 
 async def _build_monitor_detail_payload(
@@ -385,6 +412,8 @@ async def get_monitor_by_artifact(
     monitor = await monitor_db.get_monitor_by_artifact_id(artifact_id)
     if monitor is None or not is_monitor_capability_enabled(monitor):
         return None
+    if str(viewer_id or "").strip() == monitor.owner_user_id:
+        return serialize_monitor(monitor, can_manage=True)
     await require_monitor_view(monitor, viewer_id)
     tier = await get_user_tier(viewer_id)
     return serialize_monitor(monitor, can_manage=_can_manage_monitor(monitor, viewer_id, tier))
@@ -446,7 +475,9 @@ async def publish_workspace_monitor(
         assert existing is not None
         tier = await get_user_tier(caller_id)
         if not _can_manage_monitor(existing, caller_id, tier):
-            raise HTTPException(status_code=403, detail="无权修改此监控面板")
+            raise_external_member_forbidden("无权修改此监控面板")
+        if tier == "external" and existing.visibility != "own":
+            raise_external_member_forbidden(EXTERNAL_MONITOR_PUBLISH_FORBIDDEN_MESSAGE)
         updated_downgraded = await monitor_db.update_monitor_settings_tx(
             existing.monitor_id,
             artifact_id=existing.artifact_id,
@@ -459,6 +490,7 @@ async def publish_workspace_monitor(
             keep_updated=payload.keep_updated,
             member_user_ids=members if payload.visibility == "members" else [],
             resolve_caller_tier=get_user_tier,
+            reject_external_non_own_existing=True,
         )
         detail = await _build_monitor_detail_payload(updated_downgraded, viewer_id=caller_id)
         detail["cut"] = False
@@ -467,7 +499,9 @@ async def publish_workspace_monitor(
     if existing is not None:
         tier = await get_user_tier(caller_id)
         if not _can_manage_monitor(existing, caller_id, tier):
-            raise HTTPException(status_code=403, detail="无权修改此监控面板")
+            raise_external_member_forbidden("无权修改此监控面板")
+        if tier == "external" and existing.visibility != "own":
+            raise_external_member_forbidden(EXTERNAL_MONITOR_PUBLISH_FORBIDDEN_MESSAGE)
         slug = existing.slug
     else:
         if payload.slug is not None:
@@ -533,7 +567,8 @@ async def publish_workspace_monitor(
 
         if existing is not None and not isinstance(exc, WorkspaceAutoPublishPaused):
             await monitor_db.record_monitor_publish_failure(
-                existing.monitor_id, error_message=str(exc)
+                existing.monitor_id,
+                error_message=_extract_publish_failure_message(exc),
             )
         raise _translate_snapshot_error(exc) from None
 
@@ -567,7 +602,7 @@ async def update_monitor_settings(
 
     tier = await get_user_tier(caller_id)
     if not _can_manage_monitor(monitor, caller_id, tier):
-        raise HTTPException(status_code=403, detail="只有面板所有者或管理员可修改设置")
+        raise_external_member_forbidden("只有面板所有者或管理员可修改设置")
 
     validated_members: list[str] | None = None
     if payload.visibility is not None or payload.member_user_ids is not None:
@@ -575,22 +610,17 @@ async def update_monitor_settings(
             # Validate caller tier against explicit visibility change; if member_user_ids
             # was omitted when keeping/setting 'members', check existing/locked members inside tx.
             if tier == "external" and payload.visibility != "own":
-                raise HTTPException(
-                    status_code=403,
-                    detail="外部成员发布监控面板时只能选择“仅自己”可见",
+                raise_external_member_forbidden(
+                    "外部成员发布监控面板时只能选择“仅自己”可见"
                 )
             if payload.visibility == "public" and tier != "admin":
-                raise HTTPException(
-                    status_code=403,
-                    detail="只有管理员可以将监控面板设为公开链接",
-                )
+                raise_admin_required("只有管理员可以将监控面板设为公开链接")
             if payload.visibility == "public" and monitor.visibility != "public":
                 _require_publishing_enabled()
         if payload.member_user_ids is not None:
             if tier == "external" and payload.member_user_ids:
-                raise HTTPException(
-                    status_code=403,
-                    detail="外部成员发布监控面板时只能选择“仅自己”可见",
+                raise_external_member_forbidden(
+                    "外部成员发布监控面板时只能选择“仅自己”可见"
                 )
             if payload.visibility == "members" or (
                 payload.visibility is None and payload.member_user_ids
@@ -606,6 +636,35 @@ async def update_monitor_settings(
     next_title = (payload.title or "").strip() or None if payload.title is not None else None
     workspace_owner_id = await _resolve_workspace_owner_id(monitor)
 
+    async def _verify_data_job_patch_approver(_owner_id: str, *, conn: Any = None) -> None:
+        binding = get_registered_monitor_binding_by_slug(
+            monitor.source_ref or "", monitor.slug
+        )
+        if binding is None:
+            raise PublicAuthorityLostError("公开数据任务监控必须在登记表中指定审批管理员")
+        await _verify_data_job_public_approver(
+            binding,
+            is_existing_public=(monitor.visibility == "public"),
+            conn=conn,
+        )
+
+    verify_fn = (
+        _verify_data_job_patch_approver
+        if monitor.source_kind == "data_job"
+        else _verify_user_is_admin
+    )
+
+    patch_binding = (
+        get_registered_monitor_binding_by_slug(monitor.source_ref or "", monitor.slug)
+        if monitor.source_kind == "data_job"
+        else None
+    )
+    patch_approver_id = (
+        (patch_binding.approved_by_admin_user_id or "").strip() or None
+        if patch_binding is not None
+        else None
+    )
+
     try:
         updated = await monitor_db.update_monitor_settings_tx(
             monitor.monitor_id,
@@ -619,11 +678,12 @@ async def update_monitor_settings(
             keep_updated=payload.keep_updated,
             member_user_ids=validated_members,
             require_publishing_enabled_fn=_require_publishing_enabled,
-            verify_public_authority=_verify_user_is_admin,
+            verify_public_authority=verify_fn,
             resolve_caller_tier=get_user_tier,
+            public_approver_id=patch_approver_id,
         )
     except PublicAuthorityLostError as exc:
-        raise HTTPException(status_code=403, detail=str(exc)) from None
+        raise_admin_required(str(exc))
 
     return await _build_monitor_detail_payload(updated, viewer_id=caller_id)
 
@@ -643,14 +703,31 @@ async def republish_workspace_monitor(
     require_monitor_capability(monitor)
     tier = await get_user_tier(caller_id)
     if not _can_manage_monitor(monitor, caller_id, tier):
-        raise HTTPException(status_code=403, detail="无权重新发布此监控面板")
+        raise_external_member_forbidden("无权重新发布此监控面板")
     if monitor.source_kind != "workspace":
         raise HTTPException(status_code=400, detail="数据任务面板请由数据任务触发更新")
+    if tier == "external" and monitor.visibility != "own":
+        try:
+            require_monitor_publish_visibility(tier, monitor.visibility)
+        except HTTPException as exc:
+            await monitor_db.record_monitor_publish_failure(
+                monitor.monitor_id,
+                error_message=_extract_publish_failure_message(exc),
+            )
+            raise
     if monitor.visibility == "public" and tier != "admin":
         await monitor_db.record_monitor_publish_failure(
             monitor.monitor_id, error_message=PUBLIC_PERMISSION_LOST_MESSAGE
         )
-        raise HTTPException(status_code=403, detail=PUBLIC_PERMISSION_LOST_MESSAGE)
+        raise_admin_required(PUBLIC_PERMISSION_LOST_MESSAGE)
+    try:
+        require_monitor_publish_visibility(tier, monitor.visibility)
+    except HTTPException as exc:
+        await monitor_db.record_monitor_publish_failure(
+            monitor.monitor_id,
+            error_message=_extract_publish_failure_message(exc),
+        )
+        raise
 
     workspace_owner_id = await _resolve_workspace_owner_id(monitor)
     artifact = await artifacts_db.get_artifact(
@@ -686,6 +763,7 @@ async def republish_workspace_monitor(
             loaded_files=[e.path for e in snap.entries if e.reason == REASON_LOADED],
             left_out_files=[e.path for e in snap.left_out],
             new_owner_user_id=takeover_owner,
+            caller_user_id=caller_id,
             verify_public_authority=_verify_user_is_admin,
             reject_if_pending_outbound_confirm=reject_if_pending_outbound_confirm,
         )
@@ -694,7 +772,8 @@ async def republish_workspace_monitor(
 
         if not isinstance(exc, WorkspaceAutoPublishPaused):
             await monitor_db.record_monitor_publish_failure(
-                monitor.monitor_id, error_message=str(exc)
+                monitor.monitor_id,
+                error_message=_extract_publish_failure_message(exc),
             )
         raise _translate_snapshot_error(exc) from None
 
@@ -793,9 +872,12 @@ async def republish_workspace_monitors_after_turn(*, workspace_id: str) -> None:
                 )
                 continue
         try:
-            if monitor.visibility == "public":
-                if await get_user_tier(monitor.owner_user_id) != "admin":
-                    raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
+            owner_tier = await get_user_tier(monitor.owner_user_id)
+            if owner_tier == "external" and monitor.visibility != "own":
+                require_monitor_publish_visibility(owner_tier, monitor.visibility)
+            if monitor.visibility == "public" and owner_tier != "admin":
+                raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
+            require_monitor_publish_visibility(owner_tier, monitor.visibility)
             artifact = await artifacts_db.get_artifact(
                 monitor.artifact_id, user_id=workspace_owner_id
             )
@@ -834,7 +916,8 @@ async def republish_workspace_monitors_after_turn(*, workspace_id: str) -> None:
                 exc_info=True,
             )
             await monitor_db.record_monitor_publish_failure(
-                monitor.monitor_id, error_message=str(exc)
+                monitor.monitor_id,
+                error_message=_extract_publish_failure_message(exc),
             )
 
 
@@ -842,6 +925,7 @@ async def _verify_data_job_public_approver(
     binding: MonitorDataJobBinding,
     *,
     is_existing_public: bool = False,
+    conn: Any = None,
 ) -> None:
     approver = (binding.approved_by_admin_user_id or "").strip()
     if not approver:
@@ -851,7 +935,21 @@ async def _verify_data_job_public_approver(
             else "公开数据任务监控必须在登记表中指定审批管理员"
         )
         raise PublicAuthorityLostError(detail)
-    if await get_user_tier(approver) != "admin":
+    from src.dalton.settings import is_dalton_local_auth_enabled
+
+    if (
+        is_dalton_local_auth_enabled()
+        and conn is not None
+        and get_user_tier is _REAL_GET_USER_TIER
+        and hasattr(conn, "cursor")
+    ):
+        async with conn.cursor(row_factory=dict_row) as cur:
+            approver_tier = await monitor_db._resolve_live_tier_in_cur(cur, approver)
+    else:
+        approver_tier = await monitor_db._call_with_optional_conn(
+            get_user_tier, approver, conn=conn
+        )
+    if approver_tier != "admin":
         raise PublicAuthorityLostError(PUBLIC_PERMISSION_LOST_MESSAGE)
 
 
@@ -996,8 +1094,10 @@ async def _republish_single_binding(
                     ),
                 )
 
-    async def _verify_job_public_in_tx(_owner_id: str) -> None:
-        await _verify_data_job_public_approver(binding, is_existing_public=True)
+    async def _verify_job_public_in_tx(_owner_id: str, *, conn: Any = None) -> None:
+        await _verify_data_job_public_approver(
+            binding, is_existing_public=True, conn=conn
+        )
 
     monitor = existing
     try:

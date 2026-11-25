@@ -165,6 +165,8 @@ function CommentPin({
             tabIndex={offView ? -1 : undefined}
             onClick={onClick}
           >
+            {/* DALTON-HOOK(mobile-web): dedicated touch hit-area child so .tap-target::after does not collide with .page-comment-pin::after unread dot */}
+            <span className="page-comment-pin-hit tap-target" aria-hidden="true" />
             <span className="page-comment-pin-disc">
               <PinFace number={comment.number} working={working} label={t('pageViewer:comments.working')} size={11} />
             </span>

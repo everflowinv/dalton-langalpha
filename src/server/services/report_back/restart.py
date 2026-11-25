@@ -71,6 +71,8 @@ class OwedResume:
     automation_execution_id: Optional[str] = None
     # DALTON-HOOK(team-model-catalog): interrupted run id for server-side compare-and-reject verification on resume
     source_run_id: Optional[str] = None
+    # DALTON-HOOK(cos-settings-tools): interrupted run id so restart resume distinguishes automation continuations from normal user turns
+    interrupted_run_id: Optional[str] = None
 
     @property
     def report_source(self) -> None:
@@ -119,6 +121,9 @@ def resume_turn(owed: OwedResume, request_key: str) -> tuple[str, dict]:
         # DALTON-HOOK(team-model-catalog): pass server-only source_run_id so /messages loads effective_catalog_snapshot authoritatively from DB
         if owed.source_run_id:
             body["resume_of_run_id"] = owed.source_run_id
+        # DALTON-HOOK(cos-settings-tools): carry interrupted run id so non-automation resumes never borrow unrelated running executions
+        if owed.interrupted_run_id:
+            body["restart_from_run_id"] = owed.interrupted_run_id
         return route, body
     body = {
         "run_id": owed.retry_run_id,
@@ -213,7 +218,8 @@ async def resume_verdict(job: Mapping[str, Any]) -> OwedResume | NotOwed | NotYe
         tasks=tuple(tasks),
         retry_run_id=retry_run_id,
         automation_execution_id=execution_id or None,
-        source_run_id=(str(run_id) if interrupted else None),
+        source_run_id=(str(run_id) if interrupted else None),  # DALTON-HOOK(team-model-catalog)
+        interrupted_run_id=str(run_id),  # DALTON-HOOK(cos-settings-tools)
     )
 
 

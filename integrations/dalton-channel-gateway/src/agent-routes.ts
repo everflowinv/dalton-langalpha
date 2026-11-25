@@ -63,8 +63,18 @@ export class AgentRoutesHandler {
     body: AgentSendRequest,
   ): Promise<{ status: number; data: AgentSendResponse }> {
     const deliveryKey = DeliveryService.makeAgentSendDeliveryKey(body);
-    const hasExplicitTarget =
-      typeof body.target === "string" && body.target.trim().length > 0;
+    const trimmedTarget =
+      typeof body.target === "string" ? body.target.trim() : "";
+    const hasExplicitTarget = trimmedTarget.length > 0;
+    const explicitTargetPrefix = hasExplicitTarget
+      ? trimmedTarget.split(":", 1)[0]?.trim().toLowerCase() ?? ""
+      : "";
+    const effectivePlatform =
+      explicitTargetPrefix === "feishu" ||
+      explicitTargetPrefix === "discord" ||
+      explicitTargetPrefix === "weixin"
+        ? explicitTargetPrefix
+        : (body.turn_platform ?? null);
     const isAutomationSend =
       typeof body.automation_execution_id === "string" &&
       body.automation_execution_id.trim().length > 0;
@@ -75,7 +85,7 @@ export class AgentRoutesHandler {
       threadId: body.thread_id,
       runId: body.run_id,
       automationExecutionId: body.automation_execution_id ?? null,
-      platform: body.turn_platform ?? null,
+      platform: effectivePlatform,
       target: body.target ?? null,
       text: body.text ?? "",
       files: body.files ?? [],

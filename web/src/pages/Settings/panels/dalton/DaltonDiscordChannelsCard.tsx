@@ -2,9 +2,10 @@ import { useState, type FormEvent } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Pencil, Plus } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { apiErrorDetail, apiErrorReason, apiErrorStatus, formatApiErrorDetail } from '@/api/errors';
+import { apiErrorDetail, apiErrorReason, apiErrorStatus, formatApiErrorDetail, isForbiddenError } from '@/api/errors';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { queryKeys } from '@/lib/queryKeys';
 import {
   fetchDaltonChannelBindings,
@@ -184,6 +185,7 @@ interface NoticeState {
 export function DaltonDiscordChannelsCard() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
+  const identity = useCallerIdentity();
 
   const [channelInput, setChannelInput] = useState('');
   const [nameInput, setNameInput] = useState('');
@@ -195,10 +197,11 @@ export function DaltonDiscordChannelsCard() {
   const bindingsQuery = useQuery({
     queryKey: queryKeys.dalton.channelBindings(),
     queryFn: fetchDaltonChannelBindings,
+    enabled: identity.isAdmin,
     retry: false,
   });
 
-  if (bindingsQuery.data && bindingsQuery.data.user_tier !== 'admin') {
+  if (!identity.isAdmin) {
     return null;
   }
 
@@ -248,10 +251,17 @@ export function DaltonDiscordChannelsCard() {
     });
   }
 
+  const canWriteChannels =
+    identity.status === 'ready' && !identity.isConfirming && identity.isAdmin;
+
   const runChannelMutation = async (
     payload: { action: 'add' | 'rename'; channel_id: string; name?: string | null },
     successNotice?: NoticeState | null,
   ): Promise<boolean> => {
+    const latest = identity.getLatestIdentity();
+    if (latest.isConfirming || latest.status !== 'ready' || !latest.isAdmin) {
+      return false;
+    }
     try {
       await mutateDaltonDiscordChannel({
         ...payload,
@@ -263,6 +273,9 @@ export function DaltonDiscordChannelsCard() {
       }
       return true;
     } catch (err: unknown) {
+      if (isForbiddenError(err)) {
+        void identity.revalidate();
+      }
       const code = extractErrorCode(err);
       if (isVersionConflictError(err, code)) {
         setNotice({
@@ -283,6 +296,8 @@ export function DaltonDiscordChannelsCard() {
 
   const handleAdd = async (e: FormEvent) => {
     e.preventDefault();
+    const latest = identity.getLatestIdentity();
+    if (latest.isConfirming || latest.status !== 'ready' || !latest.isAdmin) return;
     if (submitting || !bindingsQuery.data) return;
     setNotice(null);
 
@@ -375,6 +390,8 @@ export function DaltonDiscordChannelsCard() {
   };
 
   const handleRenameSubmit = async (item: DiscordChannelListItem) => {
+    const latest = identity.getLatestIdentity();
+    if (latest.isConfirming || latest.status !== 'ready' || !latest.isAdmin) return;
     if (submitting || !bindingsQuery.data) return;
     const trimmedName = editingName.trim();
     if (!trimmedName) {
@@ -439,7 +456,7 @@ export function DaltonDiscordChannelsCard() {
             <Input
               value={channelInput}
               onChange={(e) => setChannelInput(e.target.value)}
-              disabled={submitting}
+              disabled={submitting || !canWriteChannels}
               aria-label={t('dalton.discordChannels.channelIdPlaceholder')}
               placeholder={t('dalton.discordChannels.channelIdPlaceholder')}
               data-testid="dalton-discord-channel-id-input"
@@ -448,7 +465,7 @@ export function DaltonDiscordChannelsCard() {
             <Input
               value={nameInput}
               onChange={(e) => setNameInput(e.target.value)}
-              disabled={submitting}
+              disabled={submitting || !canWriteChannels}
               aria-label={t('dalton.discordChannels.namePlaceholder')}
               placeholder={t('dalton.discordChannels.namePlaceholder')}
               data-testid="dalton-discord-channel-name-input"
@@ -459,7 +476,7 @@ export function DaltonDiscordChannelsCard() {
               variant="outline"
               size="sm"
               className="h-8 gap-1 text-xs"
-              disabled={submitting || !channelInput.trim()}
+              disabled={submitting || !canWriteChannels || !channelInput.trim()}
               data-testid="dalton-discord-channel-add-btn"
             >
               <Plus className="h-3.5 w-3.5" />
@@ -502,7 +519,7 @@ export function DaltonDiscordChannelsCard() {
                         variant="ghost"
                         size="sm"
                         className="h-8 gap-1 text-xs"
-                        disabled={submitting}
+                        disabled={submitting || !canWriteChannels}
                         onClick={() => {
                           setEditingAddr(item.chatAddress);
                           setEditingName(item.name);
@@ -534,7 +551,7 @@ export function DaltonDiscordChannelsCard() {
                       <Input
                         value={editingName}
                         onChange={(e) => setEditingName(e.target.value)}
-                        disabled={submitting}
+                        disabled={submitting || !canWriteChannels}
                         aria-label={t('dalton.discordChannels.namePlaceholder')}
                         placeholder={t('dalton.discordChannels.namePlaceholder')}
                         data-testid={`dalton-discord-channel-rename-input-${item.channelId}`}
@@ -554,7 +571,7 @@ export function DaltonDiscordChannelsCard() {
                         variant="outline"
                         size="sm"
                         className="h-8 text-xs"
-                        disabled={submitting}
+                        disabled={submitting || !canWriteChannels}
                         onClick={() => void handleRenameSubmit(item)}
                         data-testid={`dalton-discord-channel-rename-save-${item.channelId}`}
                       >

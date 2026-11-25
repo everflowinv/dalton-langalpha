@@ -34,7 +34,7 @@ from src.server.utils.error_sanitization import (
     single_line,
 )
 from src.server.utils.http_headers import content_disposition
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse  # DALTON-HOOK(weixin-multi-account)
 
 from src.server.database.home_workspace import is_unbound
 from src.server.database.computer import get_computer
@@ -96,20 +96,6 @@ from src.server.services.workspace_files import (
     to_client_path,
 )
 
-# DALTON-HOOK(chat-large-upload): bridge legacy crud.owner_work_dir and crud.owner_layout test patches
-_DEFAULT_OWNER_LAYOUT = owner_layout
-_DEFAULT_OWNER_WORK_DIR = owner_work_dir
-
-
-def _resolve_owner_work_dir(workspace: dict[str, Any]) -> str:
-    fn = owner_work_dir if owner_work_dir is not _DEFAULT_OWNER_WORK_DIR else _shared.owner_work_dir
-    return fn(workspace)
-
-
-def _resolve_owner_layout(workspace: dict[str, Any]) -> Any:
-    fn = owner_layout if owner_layout is not _DEFAULT_OWNER_LAYOUT else _shared.owner_layout
-    return fn(workspace)
-
 from . import _shared
 from ._shared import (
     RoutePaths,
@@ -144,6 +130,20 @@ from .backup_reads import (
     read_from_backup,
 )
 from src.server.services.warm_files import warm_sandbox
+
+# DALTON-HOOK(chat-large-upload): bridge legacy crud.owner_work_dir and crud.owner_layout test patches
+_DEFAULT_OWNER_LAYOUT = owner_layout
+_DEFAULT_OWNER_WORK_DIR = owner_work_dir
+
+
+def _resolve_owner_work_dir(workspace: dict[str, Any]) -> str:
+    fn = owner_work_dir if owner_work_dir is not _DEFAULT_OWNER_WORK_DIR else _shared.owner_work_dir
+    return fn(workspace)
+
+
+def _resolve_owner_layout(workspace: dict[str, Any]) -> Any:
+    fn = owner_layout if owner_layout is not _DEFAULT_OWNER_LAYOUT else _shared.owner_layout
+    return fn(workspace)
 
 logger = logging.getLogger(__name__)
 
@@ -1487,16 +1487,17 @@ async def workspace_file_download_url(
     return await files_from(workspace_id, workspace, live, backup, away_ok=backup_ok)
 
 
-@router.post("/{workspace_id}/files/upload")
+@router.post("/{workspace_id}/files/upload", response_model=None)  # DALTON-HOOK(weixin-multi-account)
 async def upload_workspace_file(
     workspace_id: str,
     x_user_id: CurrentUserId,
+    request: Request,
     path: str | None = Query(
         None,
         description="Destination path (virtual or absolute). Defaults to filename.",
     ),
     file: UploadFile = File(...),
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """Upload a file to the workspace's live sandbox."""
 
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
@@ -1505,6 +1506,57 @@ async def upload_workspace_file(
     is_non_owner = not is_shared_ws and workspace.get("user_id") != x_user_id
     sandbox_owner_id = x_user_id if is_shared_ws else str(workspace.get("user_id") or x_user_id)
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
+
+    # --- DALTON-HOOK(weixin-multi-account): begin ---
+    import contextlib
+    import posixpath
+    from uuid import uuid4
+    from src.dalton.database.weixin_multi_account import (
+        has_weixin_upload_headers,
+        verify_weixin_upload_headers,
+    )
+
+    def _weixin_bash_cmd_ok(res: Any) -> bool:
+        if res is False:
+            return False
+        if isinstance(res, dict):
+            if res.get("success") is False:
+                return False
+            if res.get("exit_code") not in (None, 0):
+                return False
+            if res.get("returncode") not in (None, 0):
+                return False
+        return True
+
+    def _weixin_guard_error_response(exc: HTTPException) -> JSONResponse | None:
+        if (
+            exc.status_code in (400, 409)
+            and isinstance(exc.detail, dict)
+            and "code" in exc.detail
+        ):
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={
+                    "code": str(exc.detail["code"]),
+                    "message": str(exc.detail.get("message") or ""),
+                },
+            )
+        return None
+
+    async def _check_weixin_upload_guard() -> JSONResponse | None:
+        try:
+            await verify_weixin_upload_headers(request=request, user_id=x_user_id)
+        except HTTPException as exc:
+            resp = _weixin_guard_error_response(exc)
+            if resp is not None:
+                return resp
+            raise
+        return None
+
+    guard_resp = await _check_weixin_upload_guard()
+    if guard_resp is not None:
+        return guard_resp
+    # --- DALTON-HOOK(weixin-multi-account): end ---
 
     if served_from_mirror(workspace.get("status")):
         raise not_running_for_upload(workspace)
@@ -1548,8 +1600,81 @@ async def upload_workspace_file(
         # holds at once, the way the relay bounds its own.
         async with held_bytes_budget().hold(file.size):
             content = await read_capped(file, upload_cap)
-            # ``aupload_file_bytes`` takes this path's write lock for the write itself.
-            ok = await sandbox.aupload_file_bytes(normalized, content)
+            # --- DALTON-HOOK(weixin-multi-account): begin ---
+            if has_weixin_upload_headers(request):
+                lock_path = (
+                    sandbox.normalize_path(normalized)
+                    if hasattr(sandbox, "normalize_path")
+                    else normalized
+                )
+                lock_cm = (
+                    sandbox.path_write_lock(lock_path)
+                    if hasattr(sandbox, "path_write_lock")
+                    else contextlib.nullcontext()
+                )
+                async with lock_cm:
+                    # 1. Re-verify inside the target path's write lock before staging any bytes
+                    guard_resp = await _check_weixin_upload_guard()
+                    if guard_resp is not None:
+                        return guard_resp
+                    parent_dir = posixpath.dirname(normalized)
+                    tmp_name = f".dalton-wx-upload-{uuid4().hex}.tmp"
+                    staged_path = (
+                        f"{parent_dir}/{tmp_name}" if parent_dir else tmp_name
+                    )
+                    ok = await sandbox.aupload_file_bytes(staged_path, content)
+                    if ok:
+                        published = False
+                        try:
+                            # 2. Re-verify inside the same write lock BEFORE publishing to target path
+                            post_guard_resp = await _check_weixin_upload_guard()
+                            if post_guard_resp is not None:
+                                return post_guard_resp
+                            # 3. Atomically publish staged file to target path inside the same write lock
+                            try:
+                                mv_res = await sandbox.execute_bash_command(
+                                    f"[ ! -d {shlex.quote(normalized)} ] && mv -f {shlex.quote(staged_path)} {shlex.quote(normalized)}"
+                                )
+                                if _weixin_bash_cmd_ok(mv_res):
+                                    published = True
+                                else:
+                                    logger.warning(
+                                        "Failed to publish staged Weixin upload (%s -> %s): %r",
+                                        logged_path(staged_path),
+                                        logged_path(normalized),
+                                        mv_res,
+                                    )
+                                    ok = False
+                            except Exception as mv_exc:
+                                logger.warning(
+                                    "Failed to publish staged Weixin upload (%s -> %s): %s",
+                                    logged_path(staged_path),
+                                    logged_path(normalized),
+                                    mv_exc,
+                                )
+                                ok = False
+                        finally:
+                            if not published:
+                                try:
+                                    rm_res = await sandbox.execute_bash_command(
+                                        f"rm -f {shlex.quote(staged_path)}"
+                                    )
+                                    if not _weixin_bash_cmd_ok(rm_res):
+                                        logger.warning(
+                                            "Failed to clean up staged Weixin upload (%s): %r",
+                                            logged_path(staged_path),
+                                            rm_res,
+                                        )
+                                except Exception as cleanup_exc:
+                                    logger.warning(
+                                        "Failed to clean up staged Weixin upload (%s): %s",
+                                        logged_path(staged_path),
+                                        cleanup_exc,
+                                    )
+            else:
+                # ``aupload_file_bytes`` takes this path's write lock for the write itself.
+                ok = await sandbox.aupload_file_bytes(normalized, content)
+            # --- DALTON-HOOK(weixin-multi-account): end ---
     if not ok:
         raise HTTPException(status_code=500, detail="Upload failed")
 

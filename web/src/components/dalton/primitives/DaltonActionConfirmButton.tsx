@@ -49,6 +49,7 @@ export function DaltonActionConfirmButton({
     cancelLabel ?? t('dalton.common.cancel', { defaultValue: '取消' });
 
   const handleConfirm = async () => {
+    if (disabled || busy) return;
     setConfirming(false);
     await onConfirm();
   };
@@ -59,7 +60,7 @@ export function DaltonActionConfirmButton({
         message={confirmMessage}
         confirmLabel={confirmLabel ?? label}
         cancelLabel={resolvedCancelLabel}
-        pending={busy}
+        pending={Boolean(disabled || busy)}
         onConfirm={handleConfirm}
         onCancel={() => setConfirming(false)}
       />
@@ -87,6 +88,7 @@ export function DaltonActionConfirmButton({
           title={confirmTitle}
           message={confirmMessage}
           confirmLabel={confirmLabel ?? label}
+          confirmDisabled={Boolean(disabled || busy)}
           onConfirm={handleConfirm}
           onOpenChange={setConfirming}
         />

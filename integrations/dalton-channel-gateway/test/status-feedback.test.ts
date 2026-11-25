@@ -28,6 +28,7 @@ import type { SseEvent } from "../src/backend-client.js";
 import type { SubsystemLogger } from "../src/shared/logger.js";
 import type { InboundChannelEvent } from "../src/types.js";
 import {
+  createMockBackend,
   createTestHarness,
   loadFixtureKey,
   makeSseEvents,
@@ -2459,6 +2460,163 @@ describe("WeixinChannelAdapter processing status feedback", () => {
         TypingStatus.TYPING,
         TypingStatus.CANCEL,
       ]);
+    }
+  });
+
+  it("isolates bot_token, base_url, and typing_ticket cache across multiple Weixin accounts (#499)", async () => {
+    const calls: Array<{
+      host: string;
+      endpoint: string;
+      auth: string;
+      body: Record<string, unknown>;
+    }> = [];
+    const backend = createMockBackend();
+    vi.mocked(backend.reconcileWeixinAccounts).mockResolvedValue({
+      changed: true,
+      enabled: true,
+      allow_external: false,
+      max_concurrent_accounts: 50,
+      accounts_revision: 1,
+      accounts: [
+        {
+          account_id: "00000000-0000-4000-8000-00000000000a",
+          user_id: "user_A",
+          ilink_bot_id: "bot_A",
+          ilink_user_id: "wx_user_A",
+          prev_ilink_user_id: null,
+          ilink_username: null,
+          bot_token: "token_A",
+          base_url: "https://ilinkai.weixin.qq.com",
+          cdn_base_url: "https://novac2c.cdn.weixin.qq.com/c2c",
+          get_updates_buf: "",
+          status: "active",
+          bot_generation: 1,
+          last_inbound_at: null,
+          updated_at: "2026-01-01T00:00:00.000Z",
+        },
+        {
+          account_id: "00000000-0000-4000-8000-00000000000b",
+          user_id: "user_B",
+          ilink_bot_id: "bot_B",
+          ilink_user_id: "wx_user_B",
+          prev_ilink_user_id: null,
+          ilink_username: null,
+          bot_token: "token_B",
+          base_url: "https://sz.ilinkai.weixin.qq.com",
+          cdn_base_url: "https://novac2c.cdn.weixin.qq.com/c2c",
+          get_updates_buf: "",
+          status: "active",
+          bot_generation: 2,
+          last_inbound_at: null,
+          updated_at: "2026-01-01T00:00:00.000Z",
+        },
+      ],
+    });
+
+    const adapter = new WeixinChannelAdapter({
+      backend,
+      allowedApiDomains: ["ilinkai.weixin.qq.com", "weixin.qq.com"],
+      checkResolvedIps: false,
+      staggerDelayMs: 0,
+      staggerJitterMs: 0,
+      fetchImpl: async (input, init) => {
+        const parsed = new URL(String(input));
+        const endpoint = parsed.pathname.replace(/^\/+/, "");
+        const headers = (init?.headers ?? {}) as Record<string, string>;
+        const auth = headers.Authorization ?? headers.authorization ?? "";
+        const body = init?.body
+          ? (JSON.parse(String(init.body)) as Record<string, unknown>)
+          : {};
+        if (endpoint === "ilink/bot/getupdates") {
+          return jsonResponse({ ret: 0, msgs: [], get_updates_buf: "" });
+        }
+        calls.push({ host: parsed.host, endpoint, auth, body });
+        if (endpoint === "ilink/bot/getconfig") {
+          return jsonResponse({
+            ret: 0,
+            typing_ticket: auth.includes("token_A") ? "ticket_A" : "ticket_B",
+          });
+        }
+        return jsonResponse({ ret: 0 });
+      },
+    });
+    adapter.onInboundEvent(async () => undefined);
+    await adapter.start();
+
+    try {
+      const hA = adapter.beginProcessingFeedback({
+        event: {
+          platform: "weixin",
+          platformUserId: "wx_user_A",
+          chatType: "dm",
+          chatAddress: "weixin:@me",
+          chatId: "wx_user_A",
+          threadScopeKey: "dm:wx_user_A",
+          messageId: "bot_A:1",
+          text: "Hi from A",
+          weixinAccountId: "00000000-0000-4000-8000-00000000000a",
+          weixinBotId: "bot_A",
+          weixinBotGeneration: 1,
+          weixinContextToken: "ctx_A",
+        },
+      });
+      const hB = adapter.beginProcessingFeedback({
+        event: {
+          platform: "weixin",
+          platformUserId: "wx_user_B",
+          chatType: "dm",
+          chatAddress: "weixin:@me",
+          chatId: "wx_user_B",
+          threadScopeKey: "dm:wx_user_B",
+          messageId: "bot_B:1",
+          text: "Hi from B",
+          weixinAccountId: "00000000-0000-4000-8000-00000000000b",
+          weixinBotId: "bot_B",
+          weixinBotGeneration: 2,
+          weixinContextToken: "ctx_B",
+        },
+      });
+      await flushAsync(40);
+      await hA!.settle("done");
+      await hB!.settle("done");
+
+      const callsA = calls.filter((c) => c.auth === "Bearer token_A");
+      const callsB = calls.filter((c) => c.auth === "Bearer token_B");
+      expect(callsA.map((c) => c.endpoint)).toEqual([
+        "ilink/bot/getconfig",
+        "ilink/bot/sendtyping",
+        "ilink/bot/sendtyping",
+      ]);
+      expect(callsA.every((c) => c.host === "ilinkai.weixin.qq.com")).toBe(true);
+      expect(callsA[1]!.body).toMatchObject({
+        ilink_user_id: "wx_user_A",
+        typing_ticket: "ticket_A",
+        status: TypingStatus.TYPING,
+      });
+      expect(callsA[2]!.body).toMatchObject({
+        ilink_user_id: "wx_user_A",
+        typing_ticket: "ticket_A",
+        status: TypingStatus.CANCEL,
+      });
+
+      expect(callsB.map((c) => c.endpoint)).toEqual([
+        "ilink/bot/getconfig",
+        "ilink/bot/sendtyping",
+        "ilink/bot/sendtyping",
+      ]);
+      expect(callsB.every((c) => c.host === "sz.ilinkai.weixin.qq.com")).toBe(true);
+      expect(callsB[1]!.body).toMatchObject({
+        ilink_user_id: "wx_user_B",
+        typing_ticket: "ticket_B",
+        status: TypingStatus.TYPING,
+      });
+      expect(callsB[2]!.body).toMatchObject({
+        ilink_user_id: "wx_user_B",
+        typing_ticket: "ticket_B",
+        status: TypingStatus.CANCEL,
+      });
+    } finally {
+      await adapter.stop();
     }
   });
 });

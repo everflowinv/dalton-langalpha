@@ -788,7 +788,7 @@ async def list_team_workspaces_endpoint(
     from src.dalton.access_tiers import get_user_tier
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
-        is_dalton_supabase_auth_enabled,
+        is_dalton_auth_enabled,
     )
 
     if not has_capability(CapabilityId.COLLEAGUE_SHARING):
@@ -797,7 +797,7 @@ async def list_team_workspaces_endpoint(
             raise HTTPException(status_code=401, detail="Authentication required")
         caller_tier = (
             await get_user_tier(uid)
-            if is_dalton_supabase_auth_enabled()
+            if is_dalton_auth_enabled()
             else "internal"
         )
         return {
@@ -900,6 +900,9 @@ async def get_workspace_sharing_endpoint(
             "web_access": "hidden",
             "is_home": True,
             "can_edit": False,
+            "can_edit_web_access": False,
+            "can_edit_cos_access": False,
+            "can_edit_team_memory": False,
             "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
             "updated_by": None,
             "updated_at": None,
@@ -912,6 +915,23 @@ async def get_workspace_sharing_endpoint(
         and owner_id
     ):
         effective_owner_tier = await classify_owner_tier(owner_id)
+
+    if is_dalton_auth_enabled() and effective_owner_tier == "unknown":
+        if owner_id != uid:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        sharing = await get_workspace_sharing(str(ws["workspace_id"]))
+        return {
+            **sharing,
+            "cos_access": "hidden",
+            "is_home": False,
+            "can_edit": False,
+            "can_edit_web_access": False,
+            "can_edit_cos_access": False,
+            "can_edit_team_memory": False,
+            "owner_external": False,
+            "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
+        }
+
     owner_external = effective_owner_tier == "external"
 
     if owner_external:
@@ -927,6 +947,9 @@ async def get_workspace_sharing_endpoint(
                 "cos_access": "hidden",
                 "is_home": False,
                 "can_edit": False,
+                "can_edit_web_access": False,
+                "can_edit_cos_access": False,
+                "can_edit_team_memory": False,
                 "owner_external": True,
                 "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
             }
@@ -936,6 +959,9 @@ async def get_workspace_sharing_endpoint(
             "cos_access": "hidden",
             "is_home": False,
             "can_edit": True,
+            "can_edit_web_access": True,
+            "can_edit_cos_access": False,
+            "can_edit_team_memory": False,
             "owner_external": True,
             "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
         }
@@ -961,6 +987,9 @@ async def get_workspace_sharing_endpoint(
         **sharing,
         "is_home": False,
         "can_edit": can_edit,
+        "can_edit_web_access": can_edit,
+        "can_edit_cos_access": can_edit,
+        "can_edit_team_memory": can_edit,
         "owner_external": False,
         "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
     }
@@ -977,8 +1006,8 @@ async def update_workspace_sharing_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     require_capability(CapabilityId.COLLEAGUE_SHARING)
-    from src.server.database.home_workspace import is_home_stand_in_row, is_reserved_row
     from src.dalton.access_tiers import is_admin_user
+    from src.dalton.auth_guards import raise_external_member_forbidden
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
         is_dalton_auth_enabled,
@@ -991,6 +1020,7 @@ async def update_workspace_sharing_endpoint(
         upsert_workspace_sharing,
     )
     from src.server.database import workspace as ws_db
+    from src.server.database.home_workspace import is_home_stand_in_row, is_reserved_row
 
     uid = str(user_id or "").strip()
     if not uid:
@@ -1046,6 +1076,12 @@ async def update_workspace_sharing_endpoint(
         from src.dalton.access_tiers import classify_owner_tier
 
         effective_owner_tier = await classify_owner_tier(owner_id)
+
+    if is_dalton_auth_enabled() and effective_owner_tier == "unknown":
+        if owner_id != uid:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        raise_external_member_forbidden("无法确认成员等级，暂不可修改工作区共享设置")
+
     owner_external = effective_owner_tier == "external"
     if owner_external:
         if owner_id != uid:
@@ -1060,10 +1096,7 @@ async def update_workspace_sharing_endpoint(
                 detail="Only workspace owner may modify sharing settings",
             )
         if body.cos_access is not None:
-            raise HTTPException(
-                status_code=403,
-                detail="外部成员不能开启或修改研究总监访问权限",
-            )
+            raise_external_member_forbidden("外部成员不能开启或修改研究总监访问权限")
 
     if not can_edit_workspace_sharing(ws, uid):
         raise HTTPException(
@@ -1106,6 +1139,9 @@ async def update_workspace_sharing_endpoint(
         **({"cos_access": "hidden"} if owner_external else {}),
         "is_home": False,
         "can_edit": True,
+        "can_edit_web_access": True,
+        "can_edit_cos_access": not owner_external,
+        "can_edit_team_memory": not owner_external,
         "owner_external": owner_external,
         "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
     }
@@ -1121,6 +1157,7 @@ async def get_workspace_settings_endpoint(
     from src.dalton.settings import is_dalton_auth_enabled
     from src.dalton.sharing import (
         can_edit_workspace_settings,
+        can_edit_workspace_sharing,
         get_workspace_settings,
         get_workspace_sharing,
         require_team_reader,
@@ -1168,6 +1205,9 @@ async def get_workspace_settings_endpoint(
             "team_memory_enabled": False,
             "is_home": True,
             "can_edit": False,
+            "can_edit_web_access": False,
+            "can_edit_cos_access": False,
+            "can_edit_team_memory": False,
             "owner_external": False,
             "updated_by": None,
             "updated_at": None,
@@ -1180,27 +1220,51 @@ async def get_workspace_settings_endpoint(
         and owner_id
     ):
         effective_owner_tier = await classify_owner_tier(owner_id)
+
+    if is_dalton_auth_enabled() and effective_owner_tier == "unknown":
+        if owner_id != uid:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        return {
+            "workspace_id": str(ws["workspace_id"]),
+            "team_memory_enabled": False,
+            "is_home": False,
+            "can_edit": False,
+            "can_edit_web_access": False,
+            "can_edit_cos_access": False,
+            "can_edit_team_memory": False,
+            "owner_external": False,
+            "updated_by": None,
+            "updated_at": None,
+        }
+
     owner_external = effective_owner_tier == "external"
 
     if owner_external:
         if owner_id != uid:
+            if not has_capability(CapabilityId.COLLEAGUE_SHARING):
+                raise HTTPException(status_code=404, detail="Workspace not found")
             if ws.get("status") in ("unbound", "deleted"):
                 raise HTTPException(status_code=404, detail="Workspace not found")
             await require_team_reader(owner_id)
             sharing = await get_workspace_sharing(str(ws["workspace_id"]))
             if sharing.get("web_access") == "hidden":
                 raise HTTPException(status_code=404, detail="Workspace not found")
+        is_owner = owner_id == uid
         return {
             "workspace_id": str(ws["workspace_id"]),
             "team_memory_enabled": False,
             "is_home": False,
             "can_edit": False,
+            "can_edit_web_access": is_owner,
+            "can_edit_cos_access": False,
+            "can_edit_team_memory": False,
             "owner_external": True,
             "updated_by": None,
             "updated_at": None,
         }
 
     can_edit = can_edit_workspace_settings(ws, uid, owner_external=owner_external)
+    can_edit_sh = can_edit_workspace_sharing(ws, uid)
     if not can_edit:
         if is_dalton_auth_enabled():
             await require_workspace_access(
@@ -1221,6 +1285,9 @@ async def get_workspace_settings_endpoint(
         **settings_row,
         "is_home": False,
         "can_edit": can_edit,
+        "can_edit_web_access": can_edit_sh,
+        "can_edit_cos_access": can_edit_sh,
+        "can_edit_team_memory": can_edit,
         "owner_external": False,
     }
 
@@ -1233,6 +1300,7 @@ async def update_workspace_settings_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     from src.dalton.access_tiers import classify_owner_tier, get_user_tier, is_admin_user
+    from src.dalton.auth_guards import raise_external_member_forbidden
     from src.dalton.settings import is_dalton_auth_enabled
     from src.dalton.sharing import (
         can_edit_workspace_settings,
@@ -1289,18 +1357,25 @@ async def update_workspace_settings_endpoint(
         and owner_id
     ):
         effective_owner_tier = await classify_owner_tier(owner_id)
+
+    if is_dalton_auth_enabled() and effective_owner_tier == "unknown":
+        if owner_id != uid:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        raise_external_member_forbidden("无法确认成员等级，暂不可修改工作区设置")
+
     owner_external = effective_owner_tier == "external"
     if owner_external:
         if owner_id != uid:
+            if not has_capability(CapabilityId.COLLEAGUE_SHARING):
+                raise HTTPException(status_code=404, detail="Workspace not found")
             if ws.get("status") in ("unbound", "deleted"):
                 raise HTTPException(status_code=404, detail="Workspace not found")
             await require_team_reader(owner_id)
             sharing = await get_workspace_sharing(str(ws["workspace_id"]))
             if sharing.get("web_access") == "hidden":
                 raise HTTPException(status_code=404, detail="Workspace not found")
-        raise HTTPException(
-            status_code=403,
-            detail="Only internal workspace owner may modify workspace settings",
+        raise_external_member_forbidden(
+            "Only internal workspace owner may modify workspace settings"
         )
 
     if not can_edit_workspace_settings(ws, uid, owner_external=owner_external):
@@ -1318,6 +1393,9 @@ async def update_workspace_settings_endpoint(
         **saved,
         "is_home": False,
         "can_edit": True,
+        "can_edit_web_access": True,
+        "can_edit_cos_access": True,
+        "can_edit_team_memory": True,
         "owner_external": False,
     }
 
@@ -1332,7 +1410,7 @@ async def get_user_sharing_settings_endpoint(
     from src.dalton.access_tiers import get_user_tier
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
-        is_dalton_supabase_auth_enabled,
+        is_dalton_auth_enabled,
     )
     from src.dalton.sharing import get_user_cos_sharing, require_team_reader
 
@@ -1341,7 +1419,7 @@ async def get_user_sharing_settings_endpoint(
         raise HTTPException(status_code=401, detail="Authentication required")
 
     if not has_capability(CapabilityId.COLLEAGUE_SHARING):
-        if is_dalton_supabase_auth_enabled():
+        if is_dalton_auth_enabled():
             await require_team_reader(uid)
             caller_tier = await get_user_tier(uid)
         else:
@@ -1356,7 +1434,7 @@ async def get_user_sharing_settings_endpoint(
             "updated_at": None,
         }
 
-    if is_dalton_supabase_auth_enabled():
+    if is_dalton_auth_enabled():
         await require_team_reader(uid)
         caller_tier = await get_user_tier(uid)
         if caller_tier == "external":
@@ -1392,9 +1470,10 @@ async def update_user_sharing_settings_endpoint(
 ) -> dict[str, Any]:
     require_capability(CapabilityId.COLLEAGUE_SHARING)
     from src.dalton.access_tiers import get_user_tier
+    from src.dalton.auth_guards import raise_external_member_forbidden
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
-        is_dalton_supabase_auth_enabled,
+        is_dalton_auth_enabled,
     )
     from src.dalton.sharing import require_team_reader, upsert_user_cos_sharing
 
@@ -1402,13 +1481,12 @@ async def update_user_sharing_settings_endpoint(
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    if is_dalton_supabase_auth_enabled():
+    if is_dalton_auth_enabled():
         await require_team_reader(uid)
         caller_tier = await get_user_tier(uid)
         if caller_tier == "external":
-            raise HTTPException(
-                status_code=403,
-                detail="外部成员的工作区不对其他人的研究总监开放，无需此项设置",
+            raise_external_member_forbidden(
+                "外部成员的工作区不对其他人的研究总监开放，无需此项设置"
             )
     else:
         caller_tier = "internal"
@@ -1424,13 +1502,17 @@ async def update_user_sharing_settings_endpoint(
     }
 
 
-@router.get("/user-settings")
+@router.get(
+    "/user-settings",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CONVERSATION_ARCHIVE))],
+)
 @handle_api_exceptions("get user team memory settings", logger)
 async def get_user_settings_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.CONVERSATION_ARCHIVE)
     from src.dalton.access_tiers import get_user_tier
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.settings import is_dalton_auth_enabled
     from src.dalton.sharing import (
         get_user_team_memory_settings,
         require_team_reader,
@@ -1440,7 +1522,7 @@ async def get_user_settings_endpoint(
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    if is_dalton_supabase_auth_enabled():
+    if is_dalton_auth_enabled():
         await require_team_reader(uid)
         caller_tier = await get_user_tier(uid)
         if caller_tier == "external":
@@ -1462,14 +1544,19 @@ async def get_user_settings_endpoint(
     }
 
 
-@router.put("/user-settings")
+@router.put(
+    "/user-settings",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CONVERSATION_ARCHIVE))],
+)
 @handle_api_exceptions("update user team memory settings", logger)
 async def update_user_settings_endpoint(
     body: UserSettingsUpdateRequest,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
+    require_capability(CapabilityId.CONVERSATION_ARCHIVE)
     from src.dalton.access_tiers import get_user_tier
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.auth_guards import raise_external_member_forbidden
+    from src.dalton.settings import is_dalton_auth_enabled
     from src.dalton.sharing import (
         require_team_reader,
         upsert_user_team_memory_settings,
@@ -1479,14 +1566,11 @@ async def update_user_settings_endpoint(
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    if is_dalton_supabase_auth_enabled():
+    if is_dalton_auth_enabled():
         await require_team_reader(uid)
         caller_tier = await get_user_tier(uid)
         if caller_tier == "external":
-            raise HTTPException(
-                status_code=403,
-                detail="外部成员不提供团队记忆设置",
-            )
+            raise_external_member_forbidden("外部成员不提供团队记忆设置")
     else:
         caller_tier = "internal"
 
@@ -1513,12 +1597,23 @@ async def get_team_credentials_status_endpoint(
         is_team_credential_sharing_enabled,
     )
     from src.dalton.invites import get_user_tier
-    from src.dalton.settings import get_dalton_config, is_dalton_sharing_auth_enabled
+    from src.dalton.settings import (
+        get_dalton_auth_mode,
+        get_dalton_config,
+        is_dalton_sharing_auth_enabled,
+        is_dalton_single_user_oss_mode,
+    )
 
     cfg = get_dalton_config()
     enabled = is_team_credential_sharing_enabled()
     can_disconnect = is_credential_admin(user_id)
-    caller_tier = await get_user_tier(user_id)
+    auth_mode = get_dalton_auth_mode()
+    if is_dalton_single_user_oss_mode():
+        caller_tier = "admin"
+        can_invite = False
+    else:
+        caller_tier = await get_user_tier(user_id)
+        can_invite = caller_tier in ("admin", "internal")
     return {
         "sharing": cfg.credentials.sharing,
         "enabled": enabled,
@@ -1526,8 +1621,9 @@ async def get_team_credentials_status_endpoint(
         "credential_user_id": credential_user_id(user_id),
         "is_pm": can_disconnect,
         "can_disconnect": can_disconnect,
-        "can_invite": caller_tier in ("admin", "internal"),
+        "can_invite": can_invite,
         "caller_tier": caller_tier,
+        "auth_mode": auth_mode,
         "colleague_sharing_enabled": is_dalton_sharing_auth_enabled(),
     }
 
@@ -1762,6 +1858,16 @@ async def put_dalton_automation_endpoint(
         for nullable_key in ("llm_model", "reasoning_effort"):
             if nullable_key in extra_fields and extra_fields[nullable_key] is None and nullable_key not in spec:
                 spec = {**spec, nullable_key: None}
+        if "llm_model" in spec and isinstance(spec["llm_model"], str):
+            cleaned_model = spec["llm_model"].strip()
+            spec = {
+                **spec,
+                "llm_model": (
+                    None
+                    if cleaned_model.lower() in ("", "default", "clear")
+                    else cleaned_model
+                ),
+            }
     if (
         isinstance(spec, dict)
         and "automation_id" in raw_body_dict
@@ -2833,8 +2939,12 @@ async def redeem_invite_endpoint(
     body: InviteRedeemRequest,
     request: Request = None,  # type: ignore[assignment]
 ) -> dict[str, Any]:
+    from src.dalton.auth_guards import raise_invites_disabled_in_oss
     from src.dalton.invites import enforce_invite_rate_limit, redeem_invite_token
+    from src.dalton.settings import is_dalton_single_user_oss_mode
 
+    if is_dalton_single_user_oss_mode():
+        raise_invites_disabled_in_oss("单人模式下无需使用团队邀请")
     await enforce_invite_rate_limit(request, action="redeem")
     return await redeem_invite_token(
         token=body.token,

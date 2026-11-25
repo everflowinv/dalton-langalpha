@@ -149,13 +149,19 @@ async def set_user_role(
     async def _run(db_conn: Any) -> dict[str, Any]:
         async with db_conn.cursor(row_factory=dict_row) as cur:
             if norm_tier != "admin":
-                # Lock all current admin rows to serialize concurrent demotions.
+                # Lock all current admin rows and target row in deterministic C-collation
+                # ascending order to remain deadlock-free with monitor FOR SHARE locks.
                 await cur.execute(
-                    "SELECT user_id FROM dalton_user_roles "
-                    "WHERE tier = 'admin' ORDER BY user_id ASC FOR UPDATE"
+                    "SELECT user_id, tier FROM dalton_user_roles "
+                    'WHERE tier = \'admin\' OR user_id = %s ORDER BY user_id COLLATE "C" ASC FOR UPDATE',
+                    (uid,),
                 )
                 admin_rows = await cur.fetchall()
-                admin_ids = {str(r["user_id"]).strip() for r in admin_rows}
+                admin_ids = {
+                    str(r["user_id"]).strip()
+                    for r in admin_rows
+                    if str(r.get("tier") or "").strip().lower() == "admin"
+                }
                 if uid in admin_ids and len(admin_ids) <= 1:
                     raise LastAdminProtectedError()
                 await cur.execute(
@@ -204,11 +210,16 @@ async def delete_user_role(user_id: str, *, conn: Any = None) -> bool:
     async def _run(db_conn: Any) -> bool:
         async with db_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                "SELECT user_id FROM dalton_user_roles "
-                "WHERE tier = 'admin' ORDER BY user_id ASC FOR UPDATE"
+                "SELECT user_id, tier FROM dalton_user_roles "
+                'WHERE tier = \'admin\' OR user_id = %s ORDER BY user_id COLLATE "C" ASC FOR UPDATE',
+                (uid,),
             )
             admin_rows = await cur.fetchall()
-            admin_ids = {str(r["user_id"]).strip() for r in admin_rows}
+            admin_ids = {
+                str(r["user_id"]).strip()
+                for r in admin_rows
+                if str(r.get("tier") or "").strip().lower() == "admin"
+            }
             if uid in admin_ids and len(admin_ids) <= 1:
                 raise LastAdminProtectedError()
             await cur.execute(
@@ -224,6 +235,16 @@ async def delete_user_role(user_id: str, *, conn: Any = None) -> bool:
                 (uid,),
             )
             deleted = await cur.fetchone()
+            if deleted is not None:
+                from src.dalton.database.weixin_multi_account import (
+                    revoke_weixin_account_on_member_removed_in_tx,
+                )
+
+                await revoke_weixin_account_on_member_removed_in_tx(
+                    cur,
+                    user_id=uid,
+                    operator_user_id="system:roster-reconciler",
+                )
             return deleted is not None
 
     if conn is not None:

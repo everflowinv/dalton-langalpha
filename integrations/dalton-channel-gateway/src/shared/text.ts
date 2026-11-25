@@ -9,9 +9,285 @@
  * Design §4.1 (`src/shared/text.ts`).
  */
 
+import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmTableFromMarkdown } from "mdast-util-gfm-table";
+import { gfmTable } from "micromark-extension-gfm-table";
+
+export interface MdastNode {
+  type: string;
+  url?: string;
+  title?: string | null;
+  alt?: string | null;
+  identifier?: string;
+  label?: string | null;
+  children?: MdastNode[];
+  position?: {
+    start?: { offset?: number };
+    end?: { offset?: number };
+  };
+}
+
+const MARKDOWN_EXTENSIONS = [gfmTable()];
+const MDAST_EXTENSIONS = [gfmTableFromMarkdown()];
+
+/**
+ * Shared Markdown AST parser (CommonMark + GFM tables) used by both the
+ * sandbox-link rewriter and outbound channel chunkers so link/code spans match.
+ */
+export function parseChannelMarkdown(text: string): MdastNode {
+  return fromMarkdown(text, {
+    extensions: MARKDOWN_EXTENSIONS,
+    mdastExtensions: MDAST_EXTENSIONS,
+  }) as unknown as MdastNode;
+}
+
 export interface CodeRegion {
   start: number;
   end: number;
+}
+
+export interface AtomicLinkSpan {
+  start: number;
+  end: number;
+  isMarkdownLink: boolean;
+  label: string;
+  destStart: number;
+  destEnd: number;
+  dest: string;
+}
+
+const BARE_HTTP_URL_RE =
+  /https?:\/\/[^\s<>"'`()[\]{}，。；：、！？（）【】《》「」『』“”‘’]+/gi;
+
+const STOCK_SANDBOX_PREFIX_RE = /^\/?(?:home\/workspace|home\/daytona)\//;
+
+function findBracketCloseUnbounded(
+  text: string,
+  bracketOpen: number,
+  limit: number,
+): number {
+  let i = bracketOpen + 1;
+  let bracketDepth = 0;
+  while (i < limit) {
+    const ch = text[i]!;
+    if (ch === "\\" && i + 1 < limit) {
+      i += 2;
+      continue;
+    }
+    if (ch === "`") {
+      let run = 0;
+      while (i + run < limit && text[i + run] === "`") run += 1;
+      let k = i + run;
+      let foundClose = -1;
+      while (k < limit) {
+        if (text[k] !== "`") {
+          k += 1;
+          continue;
+        }
+        let closeRun = 0;
+        while (k + closeRun < limit && text[k + closeRun] === "`") {
+          closeRun += 1;
+        }
+        if (closeRun === run) {
+          foundClose = k;
+          break;
+        }
+        k += closeRun;
+      }
+      i = foundClose !== -1 ? foundClose + run : i + run;
+      continue;
+    }
+    if (ch === "[") {
+      bracketDepth += 1;
+      i += 1;
+      continue;
+    }
+    if (ch === "]") {
+      if (bracketDepth === 0) {
+        return i;
+      }
+      bracketDepth -= 1;
+      i += 1;
+      continue;
+    }
+    i += 1;
+  }
+  return -1;
+}
+
+/**
+ * Finds atomic Markdown links (`[label](url)`, `![alt](url)`, including long
+ * and multiline labels) and bare `http(s)://...` URLs outside Markdown AST code
+ * nodes so chunkers never split mid-link and never degrade code blocks, and
+ * formatters (such as Discord `__` bold conversion) never mangle URLs.
+ */
+export function findAtomicLinkSpans(text: string): AtomicLinkSpan[] {
+  if (!text) return [];
+  if (!text.includes("[") && !text.includes("<") && !/https?:\/\//i.test(text)) {
+    return [];
+  }
+
+  const tree = parseChannelMarkdown(text);
+  const codeRanges: CodeRegion[] = [];
+  const spans: AtomicLinkSpan[] = [];
+
+  const visit = (node: MdastNode): void => {
+    const start = node.position?.start?.offset;
+    const end = node.position?.end?.offset;
+    const hasOffsets = typeof start === "number" && typeof end === "number" && end > start;
+
+    if (node.type === "code" || node.type === "inlineCode") {
+      if (hasOffsets) {
+        codeRanges.push({ start, end });
+      }
+      return;
+    }
+
+    if ((node.type === "link" || node.type === "image") && hasOffsets) {
+      const isAutolink =
+        node.type === "link" && text[start] === "<" && text[end - 1] === ">";
+      if (isAutolink) {
+        const url = typeof node.url === "string" ? node.url : text.slice(start + 1, end - 1);
+        spans.push({
+          start,
+          end,
+          isMarkdownLink: false,
+          label: url,
+          destStart: start,
+          destEnd: end,
+          dest: url,
+        });
+        return;
+      }
+
+      const bracketOpen = node.type === "image" && text[start] === "!" ? start + 1 : start;
+      const bracketClose =
+        bracketOpen < end && text[bracketOpen] === "["
+          ? findBracketCloseUnbounded(text, bracketOpen, end)
+          : -1;
+      const label =
+        bracketClose !== -1
+          ? text.slice(bracketOpen + 1, bracketClose)
+          : (node.alt ?? "");
+      const hasInlineParens =
+        bracketClose !== -1 &&
+        bracketClose + 1 < end &&
+        text[bracketClose + 1] === "(" &&
+        text[end - 1] === ")";
+      const destStart = hasInlineParens ? bracketClose + 2 : start;
+      const destEnd = hasInlineParens ? end - 1 : end;
+      const dest =
+        typeof node.url === "string"
+          ? node.url
+          : text.slice(destStart, destEnd).trim();
+      spans.push({
+        start,
+        end,
+        isMarkdownLink: true,
+        label,
+        destStart,
+        destEnd,
+        dest,
+      });
+      return;
+    }
+
+    if (Array.isArray(node.children)) {
+      for (const child of node.children) {
+        visit(child);
+      }
+    }
+  };
+
+  visit(tree);
+
+  // Also protect bare http(s):// URLs outside AST code nodes and Markdown links.
+  for (const match of text.matchAll(BARE_HTTP_URL_RE)) {
+    const start = match.index ?? 0;
+    let raw = match[0]!;
+    while (raw.length > 0 && /[.,;:!?]$/.test(raw)) {
+      raw = raw.slice(0, -1);
+    }
+    const end = start + raw.length;
+    if (end <= start) continue;
+    const inCode = codeRanges.some((r) => start >= r.start && start < r.end);
+    const inLink = spans.some((s) => start >= s.start && start < s.end);
+    if (!inCode && !inLink) {
+      spans.push({
+        start,
+        end,
+        isMarkdownLink: false,
+        label: raw,
+        destStart: start,
+        destEnd: end,
+        dest: raw,
+      });
+    }
+  }
+
+  spans.sort((a, b) => a.start - b.start);
+  return spans;
+}
+
+/**
+ * Splits `text` on `\n`, keeping newlines that fall strictly inside an atomic
+ * Markdown link span (e.g. multiline link labels `[line1\nline2](url)`) inside
+ * the same logical unit so line-oriented chunkers never split a multiline link.
+ */
+export function splitLogicalLinesPreservingLinks(text: string): string[] {
+  if (!text.includes("\n")) return [text];
+  const spans = findAtomicLinkSpans(text);
+  if (spans.length === 0) return text.split("\n");
+  const lines: string[] = [];
+  let start = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === "\n" && !findSpanStraddling(spans, i)) {
+      lines.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  lines.push(text.slice(start));
+  return lines;
+}
+
+/**
+ * Degrades an oversized Markdown file deep link (when a single link exceeds the
+ * channel's chunk limit) into plain text + workspace-relative path hint.
+ */
+export function degradeOversizedLink(span: AtomicLinkSpan): string | null {
+  if (!span.isMarkdownLink) {
+    return null;
+  }
+  const urlStr = stripTitleFromUrl(span.dest).replace(/^<|>$/g, "");
+  try {
+    const parsed = new URL(urlStr);
+    const fileParam = parsed.searchParams.get("file");
+    if (fileParam) {
+      const displayPath = fileParam.replace(STOCK_SANDBOX_PREFIX_RE, "");
+      const hint = `（在网页工作区查看：${displayPath}）`;
+      return span.label ? `${span.label}${hint}` : hint;
+    }
+  } catch {
+    // Non-URL link destination: fall back to label below
+  }
+  return span.label || null;
+}
+
+/**
+ * Finds the atomic link span strictly straddling `cutIndex` (`span.start < cutIndex < span.end`),
+ * or `null` if `cutIndex` is at a safe boundary.
+ */
+export function findSpanStraddling(
+  spans: readonly AtomicLinkSpan[],
+  cutIndex: number,
+): AtomicLinkSpan | null {
+  for (const span of spans) {
+    if (span.start >= cutIndex) break;
+    if (span.start < cutIndex && cutIndex < span.end) {
+      return span;
+    }
+  }
+  return null;
 }
 
 export type ChunkMode = "length" | "newline";
@@ -157,11 +433,15 @@ export function chunkByParagraph(
   while (remaining.length > limit) {
     const window = remaining.slice(0, limit);
     const codeRegions = findCodeRegions(remaining);
+    const linkSpans = findAtomicLinkSpans(remaining);
 
     const findSafeBreak = (pattern: string): number => {
       let idx = window.lastIndexOf(pattern);
       while (idx > 0) {
-        if (!isInsideCode(idx, codeRegions)) {
+        if (
+          !isInsideCode(idx, codeRegions) &&
+          !findSpanStraddling(linkSpans, idx)
+        ) {
           return idx;
         }
         idx = window.lastIndexOf(pattern, idx - 1);
@@ -178,7 +458,7 @@ export function chunkByParagraph(
     }
 
     if (breakIdx <= 0) {
-      breakIdx = window.lastIndexOf(" ");
+      breakIdx = findSafeBreak(" ");
       skipLen = 1;
     }
 
@@ -186,6 +466,20 @@ export function chunkByParagraph(
       const safeSlice = truncateUtf16Safe(window, limit);
       breakIdx = safeSlice.length || limit;
       skipLen = 0;
+    }
+
+    const straddling = findSpanStraddling(linkSpans, breakIdx);
+    if (straddling) {
+      if (straddling.start > 0) {
+        breakIdx = straddling.start;
+        skipLen = 0;
+      } else {
+        const degraded = degradeOversizedLink(straddling);
+        if (degraded !== null && degraded.length < straddling.end) {
+          remaining = degraded + remaining.slice(straddling.end);
+          continue;
+        }
+      }
     }
 
     const head = remaining.slice(0, breakIdx);
@@ -221,7 +515,7 @@ export function chunkTextForOutbound(text: string, maxChars: number): string[] {
   }
 
   const results: string[] = [];
-  const lines = text.split("\n");
+  const lines = splitLogicalLinesPreservingLinks(text);
   let current = "";
   let activeFence: {
     openLine: string;
@@ -256,9 +550,24 @@ export function chunkTextForOutbound(text: string, maxChars: number): string[] {
     const step = Math.max(1, limit - fenceOverhead);
     let rest = lineToSplit;
     while (rest.length > step) {
+      const linkSpans = activeFence ? [] : findAtomicLinkSpans(rest);
       let piece = truncateUtf16Safe(rest, step);
       if (!piece) {
         piece = rest.slice(0, Math.min(rest.length, 2));
+      }
+      if (!activeFence) {
+        const straddling = findSpanStraddling(linkSpans, piece.length);
+        if (straddling) {
+          if (straddling.start > 0) {
+            piece = rest.slice(0, straddling.start);
+          } else {
+            const degraded = degradeOversizedLink(straddling);
+            if (degraded !== null && degraded.length < straddling.end) {
+              rest = degraded + rest.slice(straddling.end);
+              continue;
+            }
+          }
+        }
       }
       if (activeFence) {
         results.push(

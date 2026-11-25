@@ -141,6 +141,11 @@ class HITLResponse(BaseModel):
         default=None,
         description="Verdict per order attempt id, for an order_approval interrupt",
     )
+    # DALTON-HOOK(cos-settings-tools): server-stamped marker to consume stale/mismatched confirm interrupts
+    scope_changed: bool = Field(
+        default=False,
+        description="Server-only flag stamped when confirmation snapshot is missing or changed",
+    )
 
 
 REJECTED_WITH_FEEDBACK = "User rejected this action with the following feedback: "
@@ -491,6 +496,18 @@ class ChatRequest(BaseModel):
         default=None,
         description="Run id this request is an attempt-chain retry of. "
         "Internal use only; ignored when supplied by clients.",
+    )
+    # DALTON-HOOK(cos-settings-tools): server-stamped flag forcing system-catalog model resolution (ignores owner custom_models)
+    llm_model_system_only: bool = Field(
+        default=False,
+        description="Server-stamped flag for cross-user managed automation turns; "
+        "ignores owner custom_models/custom_providers during LLM resolution.",
+    )
+    # DALTON-HOOK(cos-settings-tools): server-stamped run id of the interrupted run being resumed after deployment restart
+    restart_from_run_id: Optional[str] = Field(
+        default=None,
+        description="Server-stamped interrupted run id carried by restart_resume turns so "
+        "ordinary user turns never borrow an unrelated running automation execution.",
     )
 
     # Interrupt/resume support (HITL)

@@ -234,7 +234,11 @@ function hasCdnReference(media: CDNMedia | undefined): media is CDNMedia {
   return hasParam || hasFullUrl;
 }
 
+export const WEIXIN_MIXED_UNSUPPORTED_NOTE =
+  "[系统注：此消息还包含暂不支持解析的微信特殊条目]";
+
 export interface ParseWeixinInboundOptions {
+  accountId?: string;
   ilinkBotId: string;
   botGeneration: number;
   /** Context order is `msg.seq` only. This field is not a sequence. */
@@ -245,6 +249,7 @@ export function parseWeixinInboundMessage(
   msg: WeixinMessage,
   opts: ParseWeixinInboundOptions,
 ): InboundChannelEvent {
+  const accountId = opts.accountId?.trim() || undefined;
   const ilinkBotId =
     (opts.ilinkBotId || "weixin:unconfigured").trim() || "weixin:unconfigured";
   const botGeneration = opts.botGeneration >= 1 ? opts.botGeneration : 1;
@@ -276,11 +281,13 @@ export function parseWeixinInboundMessage(
       commandText: "",
       isGroupTrigger: false,
       attachments: [],
+      ...(accountId ? { weixinAccountId: accountId } : {}),
       weixinBotId: ilinkBotId,
       weixinBotGeneration: botGeneration,
       ...(contextSeq !== undefined ? { weixinContextSeq: contextSeq } : {}),
       rawPayload: {
         platform_user_id: fromUserId || "unknown_user",
+        ...(accountId ? { weixin_account_id: accountId } : {}),
         ilink_bot_id: ilinkBotId,
         bot_generation: botGeneration,
         raw_message_id: rawMessageId ?? null,
@@ -303,11 +310,13 @@ export function parseWeixinInboundMessage(
       text: "",
       commandText: "",
       attachments: [],
+      ...(accountId ? { weixinAccountId: accountId } : {}),
       weixinBotId: ilinkBotId,
       weixinBotGeneration: botGeneration,
       ...(contextSeq !== undefined ? { weixinContextSeq: contextSeq } : {}),
       rawPayload: {
         platform_user_id: fromUserId,
+        ...(accountId ? { weixin_account_id: accountId } : {}),
         ilink_bot_id: ilinkBotId,
         bot_generation: botGeneration,
         raw_message_id: rawMessageId ?? null,
@@ -320,6 +329,7 @@ export function parseWeixinInboundMessage(
   const textSegments: string[] = [];
   const attachments: InboundAttachmentDescriptor[] = [];
   const persistedAttachments: WeixinPersistedAttachmentMeta[] = [];
+  const unsupportedItemTypes: number[] = [];
   let voiceWithoutTranscription = false;
   let inlineQuote: { replyToId?: string; quotedText?: string } = {};
 
@@ -447,16 +457,33 @@ export function parseWeixinInboundMessage(
       }
       continue;
     }
+
+    // Any other item type (e.g. merged-forward, mini-program, unknown type) is recorded
+    // as numeric iLink item type codes per contract §5.1 (`int[]`).
+    if (typeof item.type === "number" && Number.isFinite(item.type)) {
+      const itemTypeCode = Math.trunc(item.type);
+      if (!unsupportedItemTypes.includes(itemTypeCode)) {
+        unsupportedItemTypes.push(itemTypeCode);
+      }
+    }
   }
 
   const userText = textSegments.join("\n").trim();
   const formattedQuote = inlineQuote.quotedText
     ? `> [引用] ${inlineQuote.quotedText}`
     : "";
-  const combinedModelText =
+  const baseModelText =
     formattedQuote && userText
       ? `${formattedQuote}\n\n${userText}`
       : formattedQuote || userText;
+  const hasSupportedContent =
+    baseModelText.length > 0 || attachments.length > 0 || voiceWithoutTranscription;
+  const combinedModelText =
+    unsupportedItemTypes.length > 0 && hasSupportedContent
+      ? baseModelText
+        ? `${baseModelText}\n${WEIXIN_MIXED_UNSUPPORTED_NOTE}`
+        : WEIXIN_MIXED_UNSUPPORTED_NOTE
+      : baseModelText;
 
   const contextToken =
     typeof msg.context_token === "string" && msg.context_token.trim().length > 0
@@ -474,13 +501,19 @@ export function parseWeixinInboundMessage(
     text: combinedModelText,
     commandText: userText,
     attachments,
+    ...(accountId ? { weixinAccountId: accountId } : {}),
     ...(contextToken ? { weixinContextToken: contextToken } : {}),
     weixinBotId: ilinkBotId,
     weixinBotGeneration: botGeneration,
     ...(contextSeq !== undefined ? { weixinContextSeq: contextSeq } : {}),
+    ...(persistedAttachments.length > 0
+      ? { weixinMediaMeta: persistedAttachments }
+      : {}),
+    ...(unsupportedItemTypes.length > 0 ? { unsupportedItemTypes } : {}),
     ...(voiceWithoutTranscription ? { voiceWithoutTranscription: true } : {}),
     rawPayload: {
       platform_user_id: fromUserId,
+      ...(accountId ? { weixin_account_id: accountId } : {}),
       ilink_bot_id: ilinkBotId,
       bot_generation: botGeneration,
       raw_message_id: rawMessageId,
@@ -500,6 +533,9 @@ export function parseWeixinInboundMessage(
           }
         : {}),
       ...(voiceWithoutTranscription ? { voice_without_transcription: true } : {}),
+      ...(unsupportedItemTypes.length > 0
+        ? { unsupported_item_types: unsupportedItemTypes }
+        : {}),
       ...(persistedAttachments.length > 0
         ? {
             attachments: persistedAttachments,
@@ -511,8 +547,8 @@ export function parseWeixinInboundMessage(
 }
 
 /**
- * Reconstruct a persisted attachment metadata record from `event.rawPayload`
- * by attachment ID (or fallback to single attachment).
+ * Reconstruct a persisted attachment metadata record, prioritizing
+ * `event.weixinMediaMeta` / `raw.decrypted_weixin_attachments` over legacy `raw_payload` fields.
  */
 export function resolvePersistedAttachmentMeta(
   descriptor: InboundAttachmentDescriptor,
@@ -520,6 +556,12 @@ export function resolvePersistedAttachmentMeta(
 ): WeixinPersistedAttachmentMeta | undefined {
   const raw = event.rawPayload as Record<string, unknown> | undefined;
   const candidates: unknown[] = [];
+  if (Array.isArray(event.weixinMediaMeta)) {
+    candidates.push(...event.weixinMediaMeta);
+  }
+  if (Array.isArray(raw?.decrypted_weixin_attachments)) {
+    candidates.push(...raw!.decrypted_weixin_attachments);
+  }
   if (Array.isArray(raw?.weixin_attachments)) {
     candidates.push(...raw!.weixin_attachments);
   }

@@ -96,6 +96,7 @@ EXPLICIT_PROPRIETARY_SKILLS: frozenset[str] = frozenset(
 _CLEAR_ENV_VARS: tuple[str, ...] = (
     "APP_ENV",
     "DALTON_PROFILE",
+    "DALTON_HOST_PLATFORM",
     "DALTON_ENABLED",
     "DALTON_RESEARCHDATA_URL",
     "DALTON_BRIDGE_URL",
@@ -157,7 +158,7 @@ class TestSkillCapabilityInterceptionAndPrune:
             for p in dalton_reg_mod.DALTON_SKILLS_DIR.iterdir()
             if p.is_dir() and not p.name.startswith(".")
         }
-        assert len(disk_skills) == 51
+        assert len(disk_skills) == 52
         assert set(dalton_reg_mod.DALTON_SKILL_CAPABILITY_MAP.keys()) == disk_skills
 
         for name, req in dalton_reg_mod.DALTON_SKILL_CAPABILITY_MAP.items():
@@ -677,6 +678,7 @@ class TestDataMapD046AndFiltering:
         assert "未接直连，切勿以为已核查。" in rendered_static
 
         # Partial capability: bridge + alphaengine only -> alt_data names ONLY alphaengine
+        monkeypatch.setenv("DALTON_HOST_PLATFORM", "macos")
         monkeypatch.setenv("DALTON_CAP_RESEARCHDATA_BRIDGE", "true")
         monkeypatch.setenv("DALTON_CAP_ALPHAENGINE", "true")
         partial_routes = [r["id"] for r in map_builder.merge_catalog_routes(catalog_routes=None)]

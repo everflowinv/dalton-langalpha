@@ -325,6 +325,73 @@ def _build_card_insert_params(
     )
 
 
+def _is_mock_connection(conn: Any) -> bool:
+    if conn is None:
+        return False
+    from unittest.mock import NonCallableMock
+
+    return isinstance(conn, NonCallableMock)
+
+
+async def _ensure_archive_embedding_ready_for_write(
+    *,
+    db_conn: Any,
+    vec_len: int,
+) -> None:
+    """Align ``dalton_conversation_cards.embedding``/HNSW index and verify locked metadata before writing vectors."""
+    from src.dalton.embeddings.config import (
+        is_embed_via_bridge_enabled,
+        resolve_embedding_config,
+    )
+    from src.dalton.embeddings.metadata import (
+        EmbeddingDimensionMismatchError,
+        ensure_conversation_embedding_schema,
+        get_embedding_metadata,
+        is_metadata_db_unavailable_error,
+    )
+
+    if is_embed_via_bridge_enabled():
+        try:
+            locked = await get_embedding_metadata(conn=db_conn)
+        except Exception as exc:
+            if is_metadata_db_unavailable_error(exc):
+                return
+            raise
+        if locked is not None:
+            if vec_len != locked.dimensions:
+                raise EmbeddingDimensionMismatchError(
+                    f"Archive embedding vector has {vec_len} dimensions, "
+                    f"but conversation archive is locked to {locked.dimensions}"
+                )
+            return
+        cfg = resolve_embedding_config()
+        if vec_len != cfg.dimensions:
+            raise EmbeddingDimensionMismatchError(
+                f"Archive embedding vector has {vec_len} dimensions, "
+                f"expected configured {cfg.dimensions}"
+            )
+        try:
+            await ensure_conversation_embedding_schema(cfg, conn=db_conn)
+        except Exception as exc:
+            if is_metadata_db_unavailable_error(exc):
+                return
+            raise
+        return
+
+    cfg = resolve_embedding_config()
+    if vec_len != cfg.dimensions:
+        raise EmbeddingDimensionMismatchError(
+            f"Archive embedding vector has {vec_len} dimensions, "
+            f"expected configured {cfg.dimensions}"
+        )
+    try:
+        await ensure_conversation_embedding_schema(cfg, conn=db_conn)
+    except Exception as exc:
+        if is_metadata_db_unavailable_error(exc):
+            return
+        raise
+
+
 async def insert_cards_batch(
     cards: list[dict[str, Any]],
     *,
@@ -340,6 +407,20 @@ async def insert_cards_batch(
         return 0, 0, []
 
     from src.dalton.conversations.extractor import compute_batch_supersedes
+
+    non_empty_vecs = [
+        v for v in (embeddings or []) if isinstance(v, list) and len(v) > 0
+    ]
+    first_vec_len = len(non_empty_vecs[0]) if non_empty_vecs else None
+    if first_vec_len is not None and any(len(v) != first_vec_len for v in non_empty_vecs[1:]):
+        from src.dalton.embeddings.metadata import EmbeddingDimensionMismatchError
+
+        raise EmbeddingDimensionMismatchError(
+            "Inconsistent embedding vector dimensions within a single insert_cards_batch call"
+        )
+    should_ensure_embedding_schema = first_vec_len is not None and (
+        conn is None or not _is_mock_connection(conn)
+    )
 
     insert_sql = f"""
         INSERT INTO dalton_conversation_cards (
@@ -372,6 +453,11 @@ async def insert_cards_batch(
     )
 
     async with get_db_connection(conn) as db_conn:
+        if should_ensure_embedding_schema and first_vec_len is not None:
+            await _ensure_archive_embedding_ready_for_write(
+                db_conn=db_conn,
+                vec_len=first_vec_len,
+            )
         async with db_conn.transaction():
             async with db_conn.cursor(row_factory=dict_row) as cur:
                 existing_active: list[dict[str, Any]] = []
@@ -529,29 +615,73 @@ async def search_cards_dense(
     since: str | date | None = None,
     speaker_role: str | None = None,
     limit: int = 40,
+    dimensions: int | None = None,
     conn: Any = None,
 ) -> list[dict[str, Any]]:
-    """Vector similarity search arm using pgvector HNSW (`halfvec(3072)` cosine distance)."""
+    """Vector similarity search arm using pgvector HNSW (``halfvec(<dim>)`` cosine distance).
+
+    Supports both legacy Everflow 3072-d and Standalone Core 1536-d indexes by
+    reading the locked dimension from ``dalton_embedding_metadata`` (or explicit
+    ``dimensions``) and failing fast on any dimension mismatch.
+    """
+    from src.dalton.embeddings.config import MAX_EMBEDDING_DIMENSIONS
+    from src.dalton.embeddings.metadata import (
+        EmbeddingDimensionMismatchError,
+        get_embedding_metadata,
+        is_metadata_db_unavailable_error,
+    )
+
     vec_lit = _format_vector_literal(query_embedding)
     if not vec_lit:
         return []
+    q_dim = len(query_embedding)
+    if q_dim < 1 or q_dim > MAX_EMBEDDING_DIMENSIONS:
+        raise EmbeddingDimensionMismatchError(
+            f"Query embedding dimension {q_dim} out of supported range 1..{MAX_EMBEDDING_DIMENSIONS}"
+        )
+
     where_sql, filter_params = _build_search_filter_clauses(
         tickers=tickers,
         types=types,
         since=since,
         speaker_role=speaker_role,
     )
-    sql = f"""
-        SELECT {_CARD_SELECT_COLS},
-               (1.0 - ((embedding::halfvec(3072)) <=> (%s::vector::halfvec(3072)))) AS dense_score
-        FROM dalton_conversation_cards
-        WHERE {where_sql}
-          AND embedding IS NOT NULL
-        ORDER BY (embedding::halfvec(3072)) <=> (%s::vector::halfvec(3072)) ASC
-        LIMIT %s
-    """
-    params = [vec_lit, *filter_params, vec_lit, int(limit)]
     async with get_db_connection(conn) as db_conn:
+        if dimensions is not None:
+            if isinstance(dimensions, bool) or not isinstance(dimensions, int) or not (1 <= dimensions <= MAX_EMBEDDING_DIMENSIONS):
+                raise EmbeddingDimensionMismatchError(
+                    f"Invalid explicit dimensions={dimensions!r}; expected int in 1..{MAX_EMBEDDING_DIMENSIONS}"
+                )
+            eff_dim = dimensions
+        else:
+            locked_meta = None
+            try:
+                locked_meta = await get_embedding_metadata(conn=db_conn)
+            except Exception as exc:
+                if is_metadata_db_unavailable_error(exc):
+                    logger.debug(
+                        "[dalton.database.conversations] dalton_embedding_metadata lookup skipped (%s)",
+                        type(exc).__name__,
+                    )
+                else:
+                    raise
+            eff_dim = locked_meta.dimensions if locked_meta is not None else q_dim
+
+        if q_dim != eff_dim:
+            raise EmbeddingDimensionMismatchError(
+                f"Query embedding has {q_dim} dimensions, but conversation archive is locked to {eff_dim}"
+            )
+
+        sql = f"""
+            SELECT {_CARD_SELECT_COLS},
+                   (1.0 - ((embedding::halfvec({eff_dim})) <=> (%s::vector::halfvec({eff_dim})))) AS dense_score
+            FROM dalton_conversation_cards
+            WHERE {where_sql}
+              AND embedding IS NOT NULL
+            ORDER BY (embedding::halfvec({eff_dim})) <=> (%s::vector::halfvec({eff_dim})) ASC
+            LIMIT %s
+        """
+        params = [vec_lit, *filter_params, vec_lit, int(limit)]
         async with db_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(sql, params)
             rows = await cur.fetchall()

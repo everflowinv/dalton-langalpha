@@ -19,11 +19,16 @@ export function WorkspaceCreatedSlip({
   name,
   workspaceId: createdId,
   description,
+  // DALTON-HOOK(cos-settings-tools): show target computer name on preapproved workspace creation slip
+  computerName,
+  bootstrapCloudPrimary,
 }: {
   name: string;
   /** The id the create printed; a rename keeps it, a name may move on. */
   workspaceId?: string;
   description?: string;
+  computerName?: string;
+  bootstrapCloudPrimary?: boolean;
 }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -31,6 +36,9 @@ export function WorkspaceCreatedSlip({
   const workspaceId = useCreatedWorkspace(createdId);
   const metaId = useId();
   const title = <span className={cn(RUN_TITLE, 'block')}>{name}</span>;
+  const computerLabel = bootstrapCloudPrimary
+    ? t('chat.createWorkspaceCard.newCloudComputer')
+    : computerName;
 
   return (
     <div data-testid="workspace-created" className={cn(RUN_ROW, RUN_FOCUS, workspaceId && RUN_HOVER)}>
@@ -51,6 +59,10 @@ export function WorkspaceCreatedSlip({
         ) : title}
         <span id={metaId} className={RUN_DETAIL}>
           <RunStatus words={t('chat.createWorkspaceCard.createdStatus')} />
+          {/* DALTON-HOOK(cos-settings-tools): show target computer name on preapproved slip */}
+          {computerLabel && (
+            <RunPart><span title={computerLabel} className="min-w-0 truncate">{computerLabel}</span></RunPart>
+          )}
           {description && <RunPart><span title={description} className="min-w-0 truncate">{description}</span></RunPart>}
         </span>
       </span>

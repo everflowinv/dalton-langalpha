@@ -6,9 +6,8 @@ import { Disclosure } from '@/components/ui/Disclosure';
 import { Input } from '@/components/ui/input';
 import { Select } from '@/components/ui/select';
 import TimezonePicker from '@/components/TimezonePicker';
-import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { useLocale } from '@/hooks/useLocale';
-import { useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { useAllWorkspaces } from '@/hooks/useAllWorkspaces';
 import { formatTimestamp } from '@/lib/format';
 import {
@@ -43,8 +42,7 @@ function formatUsd(n: number | null | undefined): string {
 export function DaltonBudgetCard() {
   const { t } = useTranslation();
   const locale = useLocale();
-  const { isPm, callerTier } = useTeamCredentials();
-  const isAdmin = callerTier === 'admin' || (!isDaltonAuth && isPm);
+  const { isAdmin } = useCallerIdentity();
 
   const budgetQuery = useDaltonBudget(true);
   const todayQuery = useDaltonBudgetToday(true);

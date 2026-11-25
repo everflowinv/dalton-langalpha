@@ -210,7 +210,11 @@
         "claude-opus-5-5-oauth"
       ]
     },
-    "timezone": "Asia/Shanghai"
+    "timezone": "Asia/Shanghai",
+    "weixin": {
+      "allow_external": true,
+      "max_concurrent_accounts": 200
+    }
   },
   "dalton_skills_visibility": {
     "dalton-13f-tracker": {
@@ -504,6 +508,17 @@
       "in_list_skills": true,
       "in_sandbox": true,
       "requires": []
+    },
+    "dalton-model": {
+      "command": "dalton-model",
+      "enabled_in_registry": true,
+      "hidden": false,
+      "in_list_skills": true,
+      "in_sandbox": true,
+      "requires": [
+        "dalton-conventions",
+        "research-conventions"
+      ]
     },
     "dalton-onboarding": {
       "command": null,

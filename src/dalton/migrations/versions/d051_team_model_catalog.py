@@ -15,7 +15,7 @@ Creates the four Dalton-owned tables specified in
   (populated in Batch 3).
 
 Revision ID: d051
-Revises: d046
+Revises: d050
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "d051"
-down_revision: str | None = "d046"
+down_revision: str | None = "d050"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

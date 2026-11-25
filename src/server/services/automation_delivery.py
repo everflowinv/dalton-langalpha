@@ -46,6 +46,7 @@ from typing import Any, Dict, Literal, Optional, Union
 
 import httpx
 
+from src.dalton.notify.channel_transport import GATEWAY_DELIVERY_READ_TIMEOUT_S  # DALTON-HOOK(dalton-notify)
 from src.tools.messaging import tools as messaging
 
 logger = logging.getLogger(__name__)
@@ -65,10 +66,15 @@ _START_TIMEOUT = httpx.Timeout(20.0, connect=5.0)
 #: The wait before a start's second ask, after a first that got no answer or
 #: found the service briefly unavailable.
 START_RETRY_DELAY = 1.0
-# A finish posts to every chat the run didn't reach. It runs in a hook outbox
-# job, or in a settle's tail, which shutdown waits on for about one webhook's
-# timeout.
-_FINISH_TIMEOUT = httpx.Timeout(15.0, connect=5.0)
+# A finish posts to every chat the run didn't reach (and may wait on gateway
+# Weixin preflight retries within the shared budget).
+_FINISH_TIMEOUT = httpx.Timeout(
+    connect=5.0,
+    write=10.0,
+    pool=10.0,
+    read=float(GATEWAY_DELIVERY_READ_TIMEOUT_S),
+)  # DALTON-HOOK(dalton-notify)
+_FINISH_TOTAL_TIMEOUT_S = float(GATEWAY_DELIVERY_READ_TIMEOUT_S) + 15.0  # DALTON-HOOK(dalton-notify)
 
 # What a fallback carries: the same cap ``send_message`` puts on a message.
 _FINAL_TEXT_CHARS = messaging.MAX_TEXT_CHARS
@@ -604,12 +610,24 @@ async def finish_run(
         )
         body["final_text"] = final_text
     try:
-        answer = await messaging.gateway_request(
-            "POST",
-            f"/agent/automation-runs/{execution_id}/finish",
-            user_id=automation["user_id"],
-            timeout=_FINISH_TIMEOUT,
-            body=body,
+        answer = await asyncio.wait_for(
+            messaging.gateway_request(
+                "POST",
+                f"/agent/automation-runs/{execution_id}/finish",
+                user_id=automation["user_id"],
+                timeout=_FINISH_TIMEOUT,
+                body=body,
+            ),
+            timeout=_FINISH_TOTAL_TIMEOUT_S,
+        )  # DALTON-HOOK(dalton-notify)
+    except asyncio.TimeoutError:  # DALTON-HOOK(dalton-notify)
+        logger.warning(
+            f"[AUTOMATION_DELIVERY] Finish timed out after {_FINISH_TOTAL_TIMEOUT_S}s: "
+            f"execution_id={execution_id}"
+        )
+        return Finish(
+            _unconfirmed(automation, targets, "Gateway finish request timed out."),
+            retry=True,
         )
     except messaging.GatewayError as e:
         logger.warning(

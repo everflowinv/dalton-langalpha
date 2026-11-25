@@ -1,4 +1,4 @@
-"""FastAPI router for CH-1 Channel Gateway internal persistence (`I-1` ~ `I-9`, §1.4) and Web management (§1.5).
+"""FastAPI router for Dalton Channel Gateway internal persistence (§3.1) and Web management.
 
 Mounted under `/api/v1/dalton` via `src/dalton/app/router.py`.
 """
@@ -10,16 +10,17 @@ import os
 from typing import Any
 from urllib.parse import parse_qsl, urlparse
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.config import env
-from src.dalton.access_tiers import get_user_tier
+from src.dalton.access_tiers import get_user_tier, is_admin_user
 from src.dalton.auth import is_dalton_service_request
 from src.dalton.capabilities import (
     CapabilityId,
+    has_capability,
     require_capability,
     require_capability_dep,
     require_channel_platform_capability,
@@ -32,7 +33,6 @@ from src.dalton.database.channel_gateway import (
     execute_session_command,
     finish_automation_run,
     get_channel_internal_state,
-    get_weixin_state,
     reconcile_steer,
     recover_channel_state,
     register_and_resolve_inbound,
@@ -40,8 +40,10 @@ from src.dalton.database.channel_gateway import (
     update_delivery_progress,
     update_inbound_progress,
     update_user_channel_settings,
-    upsert_weixin_state,
 )
+from src.dalton.database import weixin_multi_account as wx_db
+from src.dalton.database.weixin_multi_account import StaleGatewayEpochError
+from src.dalton.settings import redact_weixin_secrets
 from src.server.utils.api import CurrentUserId
 
 logger = logging.getLogger(__name__)
@@ -54,12 +56,12 @@ channels_router = APIRouter(
 
 _GATEWAY_PROXY_TIMEOUT = httpx.Timeout(45.0, connect=5.0)
 _ADMIN_ONLY_WEIXIN_DETAIL = (
-    "Only admin users can connect or replace the shared Weixin bot."
+    "Only admin users can manage team Weixin channel settings."
 )
 
 
 def require_channel_service_token(request: Request) -> None:
-    """Validate `X-Service-Token` header via `is_dalton_service_request` (§1.1 #2)."""
+    """Validate `X-Service-Token` header via `is_dalton_service_request`."""
     sent = request.headers.get("X-Service-Token", "")
     configured = os.getenv("INTERNAL_SERVICE_TOKEN") or getattr(
         env, "INTERNAL_SERVICE_TOKEN", ""
@@ -70,6 +72,44 @@ def require_channel_service_token(request: Request) -> None:
         raise HTTPException(
             status_code=401, detail="Invalid or missing X-Service-Token"
         )
+
+
+def _parse_gateway_epoch(
+    request: Request,
+    *,
+    required: bool = False,
+) -> int | None:
+    """Parse `X-Gateway-Epoch` header; raise `StaleGatewayEpochError` (409) when malformed or required-and-missing."""
+    raw = request.headers.get("X-Gateway-Epoch")
+    if raw is None or not str(raw).strip():
+        if required:
+            raise StaleGatewayEpochError("Missing X-Gateway-Epoch header")
+        return None
+    try:
+        val = int(str(raw).strip())
+    except ValueError as exc:
+        raise StaleGatewayEpochError("Invalid X-Gateway-Epoch header") from exc
+    if val <= 0:
+        raise StaleGatewayEpochError("Invalid X-Gateway-Epoch header")
+    return val
+
+
+def _is_readonly_session_command(
+    *,
+    cmd: str | None,
+    message_id: str | None,
+    is_internal_query: bool = False,
+) -> bool:
+    """Server-authoritative check for read-only I-3 session queries (never trust `is_internal_query` alone)."""
+    cleaned_cmd = str(cmd or "").strip().lower()
+    cleaned_mid = str(message_id or "").strip()
+    return cleaned_cmd == "workspace_list" and not cleaned_mid and bool(is_internal_query)
+
+
+def _handle_structured_http_error(exc: HTTPException) -> JSONResponse:
+    if isinstance(exc.detail, dict) and "code" in exc.detail:
+        return JSONResponse(status_code=exc.status_code, content=exc.detail)
+    raise exc
 
 
 def _resolve_internal_user_id(
@@ -128,6 +168,66 @@ def _reject_nested_company_user_ids(*containers: dict[str, Any] | None) -> None:
 # ---------------------------------------------------------------------------
 
 
+class GatewayLeaseAcquireRequest(BaseModel):
+    instance_id: str = Field(min_length=1, max_length=255)
+    ttl_seconds: int = Field(default=45, ge=5, le=300)
+
+
+class GatewayLeaseHeartbeatRequest(BaseModel):
+    instance_id: str = Field(min_length=1, max_length=255)
+    epoch: int = Field(ge=1)
+    ttl_seconds: int = Field(default=45, ge=5, le=300)
+
+
+class GatewayLeaseReleaseRequest(BaseModel):
+    instance_id: str = Field(min_length=1, max_length=255)
+    epoch: int = Field(ge=1)
+
+
+class WeixinAccountsReconcileRequest(BaseModel):
+    since_revision: int | None = None
+
+
+class WeixinAccountCursorRequest(BaseModel):
+    expected_bot_generation: int
+    expected_ilink_bot_id: str
+    expected_get_updates_buf: str | None = None
+    get_updates_buf: str
+
+
+class WeixinAccountStatusRequest(BaseModel):
+    action: str
+    expected_bot_generation: int
+    expected_ilink_bot_id: str
+    error_code: str | None = None
+    recipient_platform_user_id: str | None = None
+    expected_token_version: int | None = None
+
+
+class WeixinLoginSessionPatchRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    action: str
+    expected_login_version: int | None = None
+    expected_bot_generation: int | None = None
+    status: str | None = None
+    qrcode: str | None = None
+    qrcode_img_content: str | None = None
+    redirect_base_url: str | None = None
+    expires_in_seconds: int | None = None
+    ilink_bot_id: str | None = None
+    bot_token: str | None = None
+    base_url: str | None = None
+    cdn_base_url: str | None = None
+    ilink_user_id: str | None = None
+    ilink_username: str | None = None
+
+
+class PreflightSendRequest(BaseModel):
+    delivery_attempt: int | None = None
+    chunk_index: int | None = None
+
+
 class InboundRegisterResolveRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -139,10 +239,13 @@ class InboundRegisterResolveRequest(BaseModel):
     message_id: str
     request_key: str | None = None
     raw_payload: dict[str, Any] = Field(default_factory=dict)
+    weixin_account_id: str | None = None
     weixin_context_token: str | None = None
     weixin_bot_id: str | None = None
     weixin_bot_generation: int | None = None
     weixin_context_seq: int | None = None
+    weixin_media_meta: list[Any] | None = None
+    unsupported_item_types: list[Any] | None = None
 
 
 class BindCodeConsumeRequest(BaseModel):
@@ -153,6 +256,7 @@ class BindCodeConsumeRequest(BaseModel):
     platform_user_id: str | None = None
     platform_username: str | None = None
     platform_tenant_key: str | None = None
+    weixin_account_id: str | None = None
     weixin_context_token: str | None = None
     weixin_bot_id: str | None = None
     weixin_bot_generation: int | None = None
@@ -186,11 +290,13 @@ class SessionCommandRequest(BaseModel):
     message_id: str | None = None
     request_key: str | None = None
     raw_payload: dict[str, Any] | None = None
+    weixin_account_id: str | None = None
     weixin_context_token: str | None = None
     weixin_bot_id: str | None = None
     weixin_bot_generation: int | None = None
     weixin_context_source: str | None = None
     weixin_context_seq: int | None = None
+    command_arg: str | None = None
     is_internal_query: bool = False
     native_interaction: bool = False
     native_ack_status: str | None = None
@@ -246,6 +352,7 @@ class DeliveryProgressRequest(BaseModel):
     files_status: list[Any] | None = None
     first_response_json: dict[str, Any] | None = None
     status: str | None = None
+    outcome: str | None = None
     error_code: str | None = None
     error_message: str | None = None
     confirmed_thread_address: str | None = None
@@ -307,33 +414,6 @@ class AutomationRunFinishRequest(BaseModel):
     mark_finished: bool = False
 
 
-class WeixinStatePutRequest(BaseModel):
-    ilink_bot_id: str | None = None
-    owner_user_id: str | None = None
-    bot_token: str | None = None
-    base_url: str | None = None
-    cdn_base_url: str | None = None
-    get_updates_buf: str | None = None
-    status: str | None = None
-    ilink_user_id: str | None = None
-    ilink_username: str | None = None
-    expected_bot_generation: int | None = None
-    expected_ilink_bot_id: str | None = None
-    expected_get_updates_buf: str | None = None
-    login_action: str | None = None
-    login_session_action: str | None = None
-    login_session_key: str | None = None
-    login_owner_user_id: str | None = None
-    expected_login_version: int | None = None
-    login_version: int | None = None
-    login_status: str | None = None
-    login_qrcode: str | None = None
-    login_qrcode_img_content: str | None = None
-    login_redirect_base_url: str | None = None
-    login_expires_in_seconds: int | None = None
-    login_expires_at: str | None = None
-
-
 class BindCodeCreateRequest(BaseModel):
     platform: str
 
@@ -343,32 +423,37 @@ class WeixinVerifyCodeRequest(BaseModel):
     verify_code: str
 
 
+class WeixinAdminConfigPutRequest(BaseModel):
+    enabled: bool | None = None
+    allow_external: bool | None = None
+
+
+class WeixinAdminUnbindRequest(BaseModel):
+    reason: str | None = None
+    note: str | None = None
+
+
 _WEIXIN_QR_PUBLIC_WHITELIST: tuple[str, ...] = (
     "session_key",
     "status",
     "qrcode_url",
     "qrcode_img_content",
     "expires_at",
+    "account_id",
     "ilink_bot_id",
     "ilink_user_id",
+    "masked_ilink_user_id",
     "ilink_username",
     "bot_generation",
+    "accounts_revision",
     "connected",
     "already_connected",
+    "pending_verification",
     "verify_code_accepted",
     "need_rescan",
+    "revoked",
+    "code",
     "message",
-)
-
-_WEIXIN_BOT_PUBLIC_WHITELIST: tuple[str, ...] = (
-    "configured",
-    "status",
-    "ilink_bot_id",
-    "owner_user_id",
-    "ilink_user_id",
-    "ilink_username",
-    "bot_generation",
-    "updated_at",
 )
 
 _FORBIDDEN_URL_PARAM_KEYS: frozenset[str] = frozenset(
@@ -427,19 +512,263 @@ def _shape_public_weixin_qr_response(raw: dict[str, Any]) -> dict[str, Any]:
                         out[key] = sanitized
                 else:
                     out[key] = val.strip()
+        elif key == "message" and isinstance(val, str):
+            out[key] = redact_weixin_secrets(val)
         else:
             out[key] = val
     return out
 
 
-def _shape_public_weixin_bot_state(raw: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not isinstance(raw, dict):
-        return None
-    return {key: raw.get(key) for key in _WEIXIN_BOT_PUBLIC_WHITELIST if key in raw}
+# ---------------------------------------------------------------------------
+# §3.1 (1) Gateway Lease Endpoints
+# ---------------------------------------------------------------------------
+
+
+@channels_router.post(
+    "/internal/gateway-lease/acquire",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_gateway_lease_acquire_endpoint(
+    body: GatewayLeaseAcquireRequest,
+) -> dict[str, Any]:
+    """Acquire or renew the single-instance gateway lease."""
+    return await wx_db.acquire_gateway_lease(
+        instance_id=body.instance_id,
+        ttl_seconds=body.ttl_seconds,
+    )
+
+
+@channels_router.post(
+    "/internal/gateway-lease/heartbeat",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_gateway_lease_heartbeat_endpoint(
+    body: GatewayLeaseHeartbeatRequest,
+) -> Any:
+    """Extend an active gateway lease; returns HTTP 409 `stale_gateway_epoch` if lost."""
+    try:
+        return await wx_db.heartbeat_gateway_lease(
+            instance_id=body.instance_id,
+            epoch=body.epoch,
+            ttl_seconds=body.ttl_seconds,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/gateway-lease/release",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_gateway_lease_release_endpoint(
+    body: GatewayLeaseReleaseRequest,
+) -> dict[str, Any]:
+    """Voluntarily release the gateway lease on clean shutdown."""
+    return await wx_db.release_gateway_lease(
+        instance_id=body.instance_id,
+        epoch=body.epoch,
+    )
 
 
 # ---------------------------------------------------------------------------
-# §1.4 Internal Persistence Endpoints (I-1 ~ I-9)
+# §3.1 (1) Weixin Multi-Account Internal Endpoints
+# ---------------------------------------------------------------------------
+
+
+@channels_router.post(
+    "/internal/weixin/accounts/reconcile",
+    dependencies=[
+        Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN)),
+        Depends(require_channel_service_token),
+    ],
+)
+async def internal_weixin_accounts_reconcile_endpoint(
+    body: WeixinAccountsReconcileRequest,
+    request: Request,
+) -> Any:
+    """15s / sync-triggered reconcile: evaluate roster/switches and return full snapshot when changed."""
+    try:
+        epoch = _parse_gateway_epoch(request, required=True)
+        return await wx_db.reconcile_weixin_accounts(
+            gateway_epoch=int(epoch or 0),
+            since_revision=body.since_revision,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.get(
+    "/internal/weixin/accounts/{account_id}",
+    dependencies=[
+        Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN)),
+        Depends(require_channel_service_token),
+    ],
+)
+async def internal_weixin_account_detail_endpoint(
+    account_id: str,
+    recipient_platform_user_id: str | None = Query(default=None),
+    inbound_message_id: str | None = Query(default=None),
+) -> Any:
+    """Read-only account detail with decrypted `bot_token` and optional `context_token`."""
+    try:
+        return await wx_db.get_weixin_account_detail(
+            account_id=account_id,
+            recipient_platform_user_id=recipient_platform_user_id,
+            inbound_message_id=inbound_message_id,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/weixin/accounts/{account_id}/cursor",
+    dependencies=[
+        Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN)),
+        Depends(require_channel_service_token),
+    ],
+)
+async def internal_weixin_account_cursor_endpoint(
+    account_id: str,
+    body: WeixinAccountCursorRequest,
+    request: Request,
+) -> Any:
+    """Advance per-account `get_updates_buf` cursor with epoch, bot_generation, and cursor CAS."""
+    try:
+        epoch = _parse_gateway_epoch(request, required=True)
+        return await wx_db.update_weixin_account_cursor(
+            account_id=account_id,
+            gateway_epoch=int(epoch or 0),
+            expected_bot_generation=body.expected_bot_generation,
+            expected_ilink_bot_id=body.expected_ilink_bot_id,
+            expected_get_updates_buf=body.expected_get_updates_buf,
+            get_updates_buf=body.get_updates_buf,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/weixin/accounts/{account_id}/status",
+    dependencies=[
+        Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN)),
+        Depends(require_channel_service_token),
+    ],
+)
+async def internal_weixin_account_status_endpoint(
+    account_id: str,
+    body: WeixinAccountStatusRequest,
+    request: Request,
+) -> Any:
+    """Mark session expired, context_token stale (version CAS), or reset corrupt cursor."""
+    try:
+        epoch = _parse_gateway_epoch(request, required=True)
+        return await wx_db.update_weixin_account_status(
+            account_id=account_id,
+            gateway_epoch=int(epoch or 0),
+            action=body.action,
+            expected_bot_generation=body.expected_bot_generation,
+            expected_ilink_bot_id=body.expected_ilink_bot_id,
+            error_code=body.error_code,
+            recipient_platform_user_id=body.recipient_platform_user_id,
+            expected_token_version=body.expected_token_version,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.get(
+    "/internal/weixin/login-sessions/{session_key}",
+    dependencies=[
+        Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN)),
+        Depends(require_channel_service_token),
+    ],
+)
+async def internal_weixin_login_session_get_endpoint(
+    session_key: str,
+) -> Any:
+    """Read login session (with decrypted qrcode for gateway polling) and re-check confirmed validity."""
+    try:
+        return await wx_db.get_weixin_login_session(
+            session_key=session_key,
+            include_qrcode=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.patch(
+    "/internal/weixin/login-sessions/{session_key}",
+    dependencies=[
+        Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN)),
+        Depends(require_channel_service_token),
+    ],
+)
+async def internal_weixin_login_session_patch_endpoint(
+    session_key: str,
+    body: WeixinLoginSessionPatchRequest,
+    request: Request,
+) -> Any:
+    """Conditional `save_qr` / `update` / `confirm` on a QR login session (with `X-Gateway-Epoch`)."""
+    try:
+        epoch = _parse_gateway_epoch(request, required=True)
+        res = await wx_db.patch_weixin_login_session(
+            session_key=session_key,
+            gateway_epoch=int(epoch or 0),
+            action=body.action,
+            expected_login_version=body.expected_login_version,
+            expected_bot_generation=body.expected_bot_generation,
+            status=body.status,
+            qrcode=body.qrcode,
+            qrcode_img_content=body.qrcode_img_content,
+            redirect_base_url=body.redirect_base_url,
+            expires_in_seconds=body.expires_in_seconds,
+            ilink_bot_id=body.ilink_bot_id,
+            bot_token=body.bot_token,
+            base_url=body.base_url,
+            cdn_base_url=body.cdn_base_url,
+            ilink_user_id=body.ilink_user_id,
+            ilink_username=body.ilink_username,
+        )
+        if (
+            str(body.action or "").strip().lower() == "confirm"
+            and res.get("ok")
+            and res.get("accounts_revision") is not None
+        ):
+            await wx_db.notify_gateway_weixin_accounts_sync(
+                accounts_revision=int(res["accounts_revision"]),
+                reason="account_confirmed",
+            )
+        return res
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.post(
+    "/internal/deliveries/{delivery_key}/preflight-send",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_deliveries_preflight_send_endpoint(
+    delivery_key: str,
+    body: PreflightSendRequest,
+    request: Request,
+) -> Any:
+    """Real-time re-authorization before every iLink outbound chunk / media upload / sendmessage."""
+    try:
+        # R7 (Decision #8): Do NOT parse X-Gateway-Epoch before platform capability check;
+        # disabled capability must return 404 even when the header is missing or malformed.
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        return await wx_db.preflight_weixin_send(
+            delivery_key=delivery_key,
+            gateway_epoch=raw_epoch,
+            delivery_attempt=body.delivery_attempt,
+            chunk_index=body.chunk_index,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# Shared Internal Persistence Endpoints (I-1 ~ I-8)
 # ---------------------------------------------------------------------------
 
 
@@ -450,28 +779,38 @@ def _shape_public_weixin_bot_state(raw: dict[str, Any] | None) -> dict[str, Any]
 async def internal_inbound_register_and_resolve_endpoint(
     body: InboundRegisterResolveRequest,
     request: Request,
-) -> dict[str, Any]:
+) -> Any:
     """I-1: Idempotently register inbound event and resolve user, tier, workspace, and generation."""
+    require_channel_platform_capability(body.platform)
     _resolve_optional_internal_user_id(
         request,
         getattr(body, "user_id", None),
         getattr(body, "dalton_user_id", None),
     )
     _reject_nested_company_user_ids(body.raw_payload)
-    return await register_and_resolve_inbound(
-        platform=body.platform,
-        platform_user_id=body.platform_user_id,
-        chat_type=body.chat_type,
-        chat_address=body.chat_address,
-        thread_scope_key=body.thread_scope_key,
-        message_id=body.message_id,
-        request_key=body.request_key,
-        raw_payload=body.raw_payload,
-        weixin_context_token=body.weixin_context_token,
-        weixin_bot_id=body.weixin_bot_id,
-        weixin_bot_generation=body.weixin_bot_generation,
-        weixin_context_seq=body.weixin_context_seq,
-    )
+    try:
+        epoch = _parse_gateway_epoch(request, required=False)
+        return await register_and_resolve_inbound(
+            platform=body.platform,
+            platform_user_id=body.platform_user_id,
+            chat_type=body.chat_type,
+            chat_address=body.chat_address,
+            thread_scope_key=body.thread_scope_key,
+            message_id=body.message_id,
+            request_key=body.request_key,
+            raw_payload=body.raw_payload,
+            weixin_account_id=body.weixin_account_id,
+            weixin_context_token=body.weixin_context_token,
+            weixin_bot_id=body.weixin_bot_id,
+            weixin_bot_generation=body.weixin_bot_generation,
+            weixin_context_seq=body.weixin_context_seq,
+            weixin_media_meta=body.weixin_media_meta,
+            unsupported_item_types=body.unsupported_item_types,
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
 
 
 @channels_router.post(
@@ -481,34 +820,40 @@ async def internal_inbound_register_and_resolve_endpoint(
 async def internal_bind_code_consume_endpoint(
     body: BindCodeConsumeRequest,
     request: Request,
-) -> dict[str, Any]:
+) -> Any:
     """I-2: Consume a bind code (or revoke on group leak) or unbind a platform."""
-    if str(body.action or "").strip().lower() != "unbind":
-        require_channel_platform_capability(body.platform)
+    require_channel_platform_capability(body.platform)
     eff_uid = _resolve_optional_internal_user_id(
         request,
         body.user_id,
         getattr(body, "dalton_user_id", None),
     )
-    return await consume_bind_code_or_unbind(
-        action=body.action,
-        platform=body.platform,
-        platform_user_id=body.platform_user_id,
-        platform_username=body.platform_username,
-        platform_tenant_key=body.platform_tenant_key,
-        weixin_context_token=body.weixin_context_token,
-        weixin_bot_id=body.weixin_bot_id,
-        weixin_bot_generation=body.weixin_bot_generation,
-        inbound_message_id=body.inbound_message_id,
-        code=body.code,
-        is_group=body.is_group,
-        user_id=eff_uid,
-        message_id=body.message_id,
-        chat_type=body.chat_type,
-        chat_address=body.chat_address,
-        scope_key=body.scope_key,
-        request_key=body.request_key,
-    )
+    try:
+        epoch = _parse_gateway_epoch(request, required=False)
+        return await consume_bind_code_or_unbind(
+            action=body.action,
+            platform=body.platform,
+            platform_user_id=body.platform_user_id,
+            platform_username=body.platform_username,
+            platform_tenant_key=body.platform_tenant_key,
+            weixin_account_id=body.weixin_account_id,
+            weixin_context_token=body.weixin_context_token,
+            weixin_bot_id=body.weixin_bot_id,
+            weixin_bot_generation=body.weixin_bot_generation,
+            inbound_message_id=body.inbound_message_id,
+            code=body.code,
+            is_group=body.is_group,
+            user_id=eff_uid,
+            message_id=body.message_id,
+            chat_type=body.chat_type,
+            chat_address=body.chat_address,
+            scope_key=body.scope_key,
+            request_key=body.request_key,
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
 
 
 @channels_router.post(
@@ -518,8 +863,9 @@ async def internal_bind_code_consume_endpoint(
 async def internal_session_command_endpoint(
     body: SessionCommandRequest,
     request: Request,
-) -> dict[str, Any]:
-    """I-3: Execute `/workspace`, `/main`, `/<workspace>`, `/new`, or `/stop` session command."""
+) -> Any:
+    """I-3: Execute session commands (`/workspace`, `/main`, `/new`, `/stop`)."""
+    require_channel_platform_capability(body.platform)
     eff_uid = _resolve_optional_internal_user_id(
         request,
         body.dalton_user_id,
@@ -531,33 +877,47 @@ async def internal_session_command_endpoint(
             status_code=400,
             detail="dalton_user_id, X-User-Id, or platform_user_id is required",
         )
-    return await execute_session_command(
-        cmd=body.cmd,
-        platform=body.platform,
-        dalton_user_id=eff_uid,
-        platform_user_id=body.platform_user_id,
-        chat_type=body.chat_type,
-        chat_address=body.chat_address,
-        chat_id=body.chat_id,
-        chat_name=body.chat_name,
-        scope_key=body.scope_key,
-        workspace_id=body.workspace_id,
-        workspace_query=body.workspace_query,
-        target_kind=body.target_kind,
-        external_thread_id=body.external_thread_id,
-        message_id=body.message_id,
-        request_key=body.request_key,
-        raw_payload=body.raw_payload,
-        weixin_context_token=body.weixin_context_token,
-        weixin_bot_id=body.weixin_bot_id,
-        weixin_bot_generation=body.weixin_bot_generation,
-        weixin_context_source=body.weixin_context_source,
-        weixin_context_seq=body.weixin_context_seq,
-        is_internal_query=body.is_internal_query,
-        native_interaction=body.native_interaction,
-        native_ack_status=body.native_ack_status,
-        native_reply_status=body.native_reply_status,
-    )
+    try:
+        is_readonly = _is_readonly_session_command(
+            cmd=body.cmd,
+            message_id=body.message_id,
+            is_internal_query=bool(body.is_internal_query),
+        )
+        require_epoch = not is_readonly
+        epoch = _parse_gateway_epoch(request, required=False)
+        return await execute_session_command(
+            cmd=body.cmd,
+            platform=body.platform,
+            dalton_user_id=eff_uid,
+            platform_user_id=body.platform_user_id,
+            chat_type=body.chat_type,
+            chat_address=body.chat_address,
+            chat_id=body.chat_id,
+            chat_name=body.chat_name,
+            scope_key=body.scope_key,
+            workspace_id=body.workspace_id,
+            workspace_query=body.workspace_query,
+            target_kind=body.target_kind,
+            external_thread_id=body.external_thread_id,
+            message_id=body.message_id,
+            request_key=body.request_key,
+            raw_payload=body.raw_payload,
+            weixin_account_id=body.weixin_account_id,
+            weixin_context_token=body.weixin_context_token,
+            weixin_bot_id=body.weixin_bot_id,
+            weixin_bot_generation=body.weixin_bot_generation,
+            weixin_context_source=body.weixin_context_source,
+            weixin_context_seq=body.weixin_context_seq,
+            command_arg=body.command_arg,
+            is_internal_query=is_readonly,
+            native_interaction=body.native_interaction,
+            native_ack_status=body.native_ack_status,
+            native_reply_status=body.native_reply_status,
+            gateway_epoch=epoch,
+            require_gateway_epoch=require_epoch,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
 
 
 @channels_router.get(
@@ -573,6 +933,8 @@ async def internal_state_endpoint(
     external_thread_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
     """I-4: Query user tier, home_workspace_id, identities, settings, chat_bindings, and current conversation."""
+    if platform:
+        require_channel_platform_capability(platform)
     eff_uid = _resolve_internal_user_id(request, user_id)
     return await get_channel_internal_state(
         user_id=eff_uid,
@@ -613,9 +975,7 @@ async def internal_settings_put_endpoint(
             automation_output_update=auto_upd,
         )
     except HTTPException as exc:
-        if isinstance(exc.detail, dict) and "code" in exc.detail:
-            return JSONResponse(status_code=exc.status_code, content=exc.detail)
-        raise
+        return _handle_structured_http_error(exc)
 
 
 @channels_router.post(
@@ -625,30 +985,36 @@ async def internal_settings_put_endpoint(
 async def internal_deliveries_authorize_and_claim_endpoint(
     body: AuthorizeAndClaimDeliveryRequest,
     request: Request,
-) -> dict[str, Any]:
+) -> Any:
     """I-6: Authorize outbound delivery target and atomically claim `in_flight` slot."""
     eff_uid = _resolve_optional_internal_user_id(
         request,
         body.user_id,
         getattr(body, "dalton_user_id", None),
     )
-    return await authorize_and_claim_delivery(
-        delivery_key=body.delivery_key,
-        kind=body.kind,
-        user_id=eff_uid,
-        thread_id=body.thread_id,
-        run_id=body.run_id,
-        execution_id=body.execution_id,
-        automation_execution_id=body.automation_execution_id,
-        platform=body.platform,
-        target=body.target,
-        inbound_message_id=body.inbound_message_id,
-        has_non_empty_text=body.has_non_empty_text,
-        total_chunks=body.total_chunks,
-        source_scope_key=body.source_scope_key,
-        source_generation=body.source_generation,
-        activity_origin=body.activity_origin,
-    )
+    try:
+        epoch = _parse_gateway_epoch(request, required=False)
+        return await authorize_and_claim_delivery(
+            delivery_key=body.delivery_key,
+            kind=body.kind,
+            user_id=eff_uid,
+            thread_id=body.thread_id,
+            run_id=body.run_id,
+            execution_id=body.execution_id,
+            automation_execution_id=body.automation_execution_id,
+            platform=body.platform,
+            target=body.target,
+            inbound_message_id=body.inbound_message_id,
+            has_non_empty_text=body.has_non_empty_text,
+            total_chunks=body.total_chunks,
+            source_scope_key=body.source_scope_key,
+            source_generation=body.source_generation,
+            activity_origin=body.activity_origin,
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
 
 
 @channels_router.post(
@@ -658,27 +1024,34 @@ async def internal_deliveries_authorize_and_claim_endpoint(
 async def internal_deliveries_progress_endpoint(
     body: DeliveryProgressRequest,
     request: Request,
-) -> dict[str, Any]:
+) -> Any:
     """I-7 (1): Update chunk/file progress and status on `dalton_channel_deliveries`."""
     _resolve_optional_internal_user_id(
         request,
         getattr(body, "user_id", None),
         getattr(body, "dalton_user_id", None),
     )
-    return await update_delivery_progress(
-        delivery_key=body.delivery_key,
-        sent_chunks=body.sent_chunks,
-        total_chunks=body.total_chunks,
-        platform_message_ids=body.platform_message_ids,
-        files_status=body.files_status,
-        first_response_json=body.first_response_json,
-        status=body.status,
-        error_code=body.error_code,
-        error_message=body.error_message,
-        confirmed_thread_address=body.confirmed_thread_address,
-        discord_body_phase=body.discord_body_phase,
-        delivery_attempt=body.delivery_attempt,
-    )
+    try:
+        epoch = _parse_gateway_epoch(request, required=False)
+        return await update_delivery_progress(
+            delivery_key=body.delivery_key,
+            sent_chunks=body.sent_chunks,
+            total_chunks=body.total_chunks,
+            platform_message_ids=body.platform_message_ids,
+            files_status=body.files_status,
+            first_response_json=body.first_response_json,
+            status=body.status,
+            outcome=body.outcome,
+            error_code=body.error_code,
+            error_message=body.error_message,
+            confirmed_thread_address=body.confirmed_thread_address,
+            discord_body_phase=body.discord_body_phase,
+            delivery_attempt=body.delivery_attempt,
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
 
 
 @channels_router.post(
@@ -688,8 +1061,14 @@ async def internal_deliveries_progress_endpoint(
 async def internal_inbound_progress_endpoint(
     body: InboundProgressRequest,
     request: Request,
-) -> dict[str, Any]:
+) -> Any:
     """I-7 (2): Update inbound event progress, pending_interrupt, background_runs, and thread_watches."""
+    if body.platform:
+        require_channel_platform_capability(body.platform)
+    elif isinstance(body.thread_watch, dict) and body.thread_watch.get("platform"):
+        require_channel_platform_capability(str(body.thread_watch.get("platform")))
+    elif isinstance(body.session_interrupt_update, dict) and body.session_interrupt_update.get("platform"):
+        require_channel_platform_capability(str(body.session_interrupt_update.get("platform")))
     _resolve_optional_internal_user_id(
         request,
         getattr(body, "user_id", None),
@@ -702,28 +1081,34 @@ async def internal_inbound_progress_endpoint(
         body.raw_payload,
         body.raw_payload_patch,
     )
-    return await update_inbound_progress(
-        platform=body.platform,
-        message_id=body.message_id,
-        status=body.status,
-        thread_id=body.thread_id,
-        run_id=body.run_id,
-        turn_index=body.turn_index,
-        request_key=body.request_key,
-        retry_request_key=body.retry_request_key,
-        resubmitted_request_key=body.resubmitted_request_key,
-        steered_into_run_id=body.steered_into_run_id,
-        fallback_pending=body.fallback_pending,
-        command_effect_status=body.command_effect_status,
-        command_reply_pending=body.command_reply_pending,
-        command_result=body.command_result,
-        uploaded_attachments=body.uploaded_attachments,
-        raw_payload=body.raw_payload,
-        raw_payload_patch=body.raw_payload_patch,
-        session_interrupt_update=body.session_interrupt_update,
-        background_run=body.background_run,
-        thread_watch=body.thread_watch,
-    )
+    try:
+        epoch = _parse_gateway_epoch(request, required=False)
+        return await update_inbound_progress(
+            platform=body.platform,
+            message_id=body.message_id,
+            status=body.status,
+            thread_id=body.thread_id,
+            run_id=body.run_id,
+            turn_index=body.turn_index,
+            request_key=body.request_key,
+            retry_request_key=body.retry_request_key,
+            resubmitted_request_key=body.resubmitted_request_key,
+            steered_into_run_id=body.steered_into_run_id,
+            fallback_pending=body.fallback_pending,
+            command_effect_status=body.command_effect_status,
+            command_reply_pending=body.command_reply_pending,
+            command_result=body.command_result,
+            uploaded_attachments=body.uploaded_attachments,
+            raw_payload=body.raw_payload,
+            raw_payload_patch=body.raw_payload_patch,
+            session_interrupt_update=body.session_interrupt_update,
+            background_run=body.background_run,
+            thread_watch=body.thread_watch,
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
 
 
 @channels_router.post(
@@ -733,18 +1118,25 @@ async def internal_inbound_progress_endpoint(
 async def internal_steers_reconcile_endpoint(
     body: SteerReconcileRequest,
     request: Request,
-) -> dict[str, Any]:
+) -> Any:
     """I-7 (3): Reconcile `hook_outbox` steer outcome with `conversation_responses.status`."""
+    require_channel_platform_capability(body.platform)
     _resolve_optional_internal_user_id(
         request,
         getattr(body, "user_id", None),
         getattr(body, "dalton_user_id", None),
     )
-    return await reconcile_steer(
-        platform=body.platform,
-        message_id=body.message_id,
-        run_id=body.run_id,
-    )
+    try:
+        epoch = _parse_gateway_epoch(request, required=False)
+        return await reconcile_steer(
+            platform=body.platform,
+            message_id=body.message_id,
+            run_id=body.run_id,
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
 
 
 @channels_router.get(
@@ -755,10 +1147,19 @@ async def internal_recover_endpoint(
     request: Request,
     mode: str = Query(default="startup"),
     thread_id: str | None = Query(default=None),
-) -> dict[str, Any]:
+) -> Any:
     """I-7 (4): Recover channel gateway state on `startup` or `watch_reconnect`."""
     _resolve_optional_internal_user_id(request)
-    return await recover_channel_state(mode=mode, thread_id=thread_id)
+    try:
+        epoch = _parse_gateway_epoch(request, required=False)
+        return await recover_channel_state(
+            mode=mode,
+            thread_id=thread_id,
+            gateway_epoch=epoch,
+            require_gateway_epoch=True,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
 
 
 @channels_router.post(
@@ -805,76 +1206,8 @@ async def internal_automation_runs_finish_endpoint(
     )
 
 
-@channels_router.get(
-    "/internal/weixin-state",
-    dependencies=[
-        Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN)),
-        Depends(require_channel_service_token),
-    ],
-)
-async def internal_weixin_state_get_endpoint(
-    request: Request,
-    include_token: bool = Query(default=True),
-    recipient_platform_user_id: str | None = Query(default=None),
-    inbound_message_id: str | None = Query(default=None),
-) -> dict[str, Any]:
-    """I-9 (1): Read singleton Weixin state with decrypted `bot_token`."""
-    _resolve_optional_internal_user_id(request)
-    return await get_weixin_state(
-        include_token=include_token,
-        recipient_platform_user_id=recipient_platform_user_id,
-        inbound_message_id=inbound_message_id,
-    )
-
-
-@channels_router.put(
-    "/internal/weixin-state",
-    dependencies=[
-        Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN)),
-        Depends(require_channel_service_token),
-    ],
-)
-async def internal_weixin_state_put_endpoint(
-    body: WeixinStatePutRequest,
-    request: Request,
-) -> dict[str, Any]:
-    """I-9 (2): Upsert singleton Weixin state with `pgp_sym_encrypt`."""
-    _resolve_optional_internal_user_id(
-        request,
-        body.owner_user_id,
-        body.login_owner_user_id,
-        getattr(body, "user_id", None),
-    )
-    return await upsert_weixin_state(
-        ilink_bot_id=body.ilink_bot_id,
-        owner_user_id=body.owner_user_id,
-        bot_token=body.bot_token,
-        base_url=body.base_url,
-        cdn_base_url=body.cdn_base_url,
-        get_updates_buf=body.get_updates_buf,
-        status=body.status,
-        ilink_user_id=body.ilink_user_id,
-        ilink_username=body.ilink_username,
-        expected_bot_generation=body.expected_bot_generation,
-        expected_ilink_bot_id=body.expected_ilink_bot_id,
-        expected_get_updates_buf=body.expected_get_updates_buf,
-        login_action=body.login_action,
-        login_session_action=body.login_session_action,
-        login_session_key=body.login_session_key,
-        login_owner_user_id=body.login_owner_user_id,
-        expected_login_version=body.expected_login_version,
-        login_version=body.login_version,
-        login_status=body.login_status,
-        login_qrcode=body.login_qrcode,
-        login_qrcode_img_content=body.login_qrcode_img_content,
-        login_redirect_base_url=body.login_redirect_base_url,
-        login_expires_in_seconds=body.login_expires_in_seconds,
-        login_expires_at=body.login_expires_at,
-    )
-
-
 # ---------------------------------------------------------------------------
-# §1.5 Web Frontend Channel Management Endpoints (4 Groups)
+# §3.1 (2) Web Frontend Channel Management Endpoints
 # ---------------------------------------------------------------------------
 
 
@@ -882,9 +1215,17 @@ async def internal_weixin_state_put_endpoint(
 async def web_create_bind_code_endpoint(
     body: BindCodeCreateRequest,
     user_id: CurrentUserId,
-) -> dict[str, Any]:
-    """§1.5 (1): Generate a 10-minute `DLT-XXXX-XXXX` bind code for the current user."""
+) -> Any:
+    """Generate a 10-minute `DLT-XXXX-XXXX` bind code (Feishu/Discord only; Weixin uses QR login)."""
     require_channel_platform_capability(body.platform)
+    if str(body.platform or "").strip().lower() == "weixin":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "weixin_uses_qr_login",
+                "message": "个人微信现已改为扫码直接连接，不再使用绑定码。",
+            },
+        )
     return await create_bind_code(user_id=user_id, platform=body.platform)
 
 
@@ -892,7 +1233,8 @@ async def web_create_bind_code_endpoint(
 async def web_get_bindings_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    """§1.5 (2): Return user's bindings across Feishu/Discord/Weixin and (for admin) global Weixin bot status."""
+    """Return user's bindings across enabled platforms; omits Weixin keys when `channel_weixin` is off."""
+    weixin_cap = has_capability(CapabilityId.CHANNEL_WEIXIN)
     state = await get_channel_internal_state(user_id=user_id, include_secrets=False)
     identities = {
         p: {
@@ -901,9 +1243,12 @@ async def web_get_bindings_endpoint(
             if k not in ("weixin_context_token", "encrypted_weixin_context_token")
         }
         for p, info in state["identities"].items()
+        if p != "weixin" or weixin_cap
     }
     bindings: dict[str, dict[str, Any]] = {}
     for p in SUPPORTED_PLATFORMS:
+        if p == "weixin" and not weixin_cap:
+            continue
         info = identities.get(p)
         if info:
             bindings[p] = {
@@ -922,12 +1267,7 @@ async def web_get_bindings_endpoint(
                 "updated_at": None,
             }
 
-    weixin_bot = None
-    if state["user_tier"] == "admin":
-        raw_wx_bot = await get_weixin_state(include_token=False)
-        weixin_bot = _shape_public_weixin_bot_state(raw_wx_bot)
-
-    return {
+    resp: dict[str, Any] = {
         "user_id": state["user_id"],
         "user_tier": state["user_tier"],
         "home_workspace_id": state["home_workspace_id"],
@@ -935,8 +1275,26 @@ async def web_get_bindings_endpoint(
         "identities": identities,
         "settings": state["settings"],
         "chat_bindings": state["chat_bindings"],
-        "weixin_bot": weixin_bot,
     }
+    if weixin_cap:
+        wx_view = await wx_db.get_member_weixin_binding_view(
+            user_id=user_id,
+            user_tier=str(state.get("user_tier") or "external"),
+        )
+        resp["weixin_account"] = wx_view
+        if wx_view.get("linked"):
+            bindings["weixin"] = {
+                "linked": True,
+                "platform": "weixin",
+                "account_id": wx_view.get("account_id"),
+                "status": wx_view.get("status"),
+                "platform_user_id": wx_view.get("ilink_user_id"),
+                "masked_ilink_user_id": wx_view.get("masked_ilink_user_id"),
+                "platform_username": wx_view.get("ilink_username"),
+                "has_usable_context_token": wx_view.get("has_usable_context_token"),
+                "updated_at": wx_view.get("updated_at"),
+            }
+    return resp
 
 
 @channels_router.put("/settings")
@@ -969,9 +1327,7 @@ async def web_put_channel_settings_endpoint(
             automation_output_update=auto_upd,
         )
     except HTTPException as exc:
-        if isinstance(exc.detail, dict) and "code" in exc.detail:
-            return JSONResponse(status_code=exc.status_code, content=exc.detail)
-        raise
+        return _handle_structured_http_error(exc)
 
 
 @channels_router.post(
@@ -983,12 +1339,11 @@ async def web_mutate_discord_channel_endpoint(
     user_id: CurrentUserId,
 ) -> Any:
     """Admin-only single-entry mutation (add/rename) for `apps.discord.chats`."""
+    from src.dalton.auth_guards import raise_admin_required
+
     tier = await get_user_tier(user_id)
     if tier != "admin":
-        raise HTTPException(
-            status_code=403,
-            detail="Only admin users can manage Discord channels.",
-        )
+        raise_admin_required("Only admin users can manage Discord channels.")
     cleaned_action = str(body.action or "").strip().lower()
     if cleaned_action == "remove":
         return JSONResponse(
@@ -1009,22 +1364,36 @@ async def web_mutate_discord_channel_endpoint(
             },
         )
     except HTTPException as exc:
-        if isinstance(exc.detail, dict) and "code" in exc.detail:
-            return JSONResponse(status_code=exc.status_code, content=exc.detail)
-        raise
+        return _handle_structured_http_error(exc)
 
 
 @channels_router.delete("/bindings/{platform}")
 async def web_delete_binding_endpoint(
     platform: str,
     user_id: CurrentUserId,
-) -> dict[str, Any]:
-    """§1.5 (3): Unbind platform account from Web UI (reuses `I-2` `action: "unbind"`)."""
+) -> Any:
+    """Unbind platform account from Web UI (checks platform capability)."""
     cleaned_platform = str(platform or "").strip().lower()
     if cleaned_platform not in SUPPORTED_PLATFORMS:
         raise HTTPException(
             status_code=400, detail=f"Unsupported platform: {platform!r}"
         )
+    require_channel_platform_capability(cleaned_platform)
+    if cleaned_platform == "weixin":
+        try:
+            res = await wx_db.unbind_weixin_account(
+                target_user_id=user_id,
+                operator_user_id=user_id,
+                action="member_unbind",
+            )
+            if res.get("accounts_revision") is not None:
+                await wx_db.notify_gateway_weixin_accounts_sync(
+                    accounts_revision=int(res["accounts_revision"]),
+                    reason="member_unbind",
+                )
+            return res
+        except HTTPException as exc:
+            return _handle_structured_http_error(exc)
     return await consume_bind_code_or_unbind(
         action="unbind",
         platform=cleaned_platform,
@@ -1033,10 +1402,116 @@ async def web_delete_binding_endpoint(
 
 
 async def _require_weixin_admin(user_id: str) -> str:
-    tier = await get_user_tier(user_id)
-    if tier != "admin":
-        raise HTTPException(status_code=403, detail=_ADMIN_ONLY_WEIXIN_DETAIL)
+    from src.dalton.auth_guards import raise_admin_required
+
+    if not await is_admin_user(user_id):
+        raise_admin_required(_ADMIN_ONLY_WEIXIN_DETAIL)
     return user_id
+
+
+_PUBLIC_WEIXIN_QR_ERROR_MAP: dict[str, tuple[int, str, dict[str, Any]]] = {
+    "session_revoked": (
+        409,
+        "登录会话已被撤销，请重新获取二维码。",
+        {"revoked": True, "need_rescan": True},
+    ),
+    "login_session_revoked": (
+        409,
+        "登录会话已被撤销，请重新获取二维码。",
+        {"revoked": True, "need_rescan": True},
+    ),
+    "session_expired": (
+        409,
+        "二维码已过期，请重新获取二维码。",
+        {"need_rescan": True},
+    ),
+    "qr_expired": (
+        409,
+        "二维码已过期，请重新获取二维码。",
+        {"need_rescan": True},
+    ),
+    "invalid_verify_code": (
+        400,
+        "验证码无效，请核对后重新输入。",
+        {},
+    ),
+    "verify_code_expired": (
+        409,
+        "验证码已过期，请重新扫码连接。",
+        {"need_rescan": True},
+    ),
+    "ilink_user_already_bound": (
+        409,
+        "该微信号已绑定其他团队成员账号，无法重复绑定。",
+        {},
+    ),
+    "weixin_capacity_full": (
+        409,
+        "团队微信并发连接数已达上限，请联系管理员处理。",
+        {},
+    ),
+    "weixin_channel_disabled": (
+        403,
+        "个人微信渠道当前已关闭。",
+        {},
+    ),
+    "external_access_disabled": (
+        403,
+        "管理员当前未向外部成员开放个人微信渠道。",
+        {},
+    ),
+    "member_not_in_roster": (
+        403,
+        "当前账号不在团队成员名册中，无法连接个人微信。",
+        {},
+    ),
+    "roster_lookup_error": (
+        503,
+        "成员名册查询暂时异常，请稍后重试。",
+        {},
+    ),
+    "stale_bot_generation": (
+        409,
+        "原连接已被其他扫码更新，请重新获取二维码。",
+        {"need_rescan": True},
+    ),
+    "stale_gateway_epoch": (
+        503,
+        "微信网关正在切换中，请稍后重试。",
+        {},
+    ),
+    "gateway_unreachable": (
+        503,
+        "微信网关暂时不可用，请稍后重试。",
+        {},
+    ),
+}
+
+
+def _build_public_weixin_qr_error(
+    raw_code: str | None,
+    upstream_status: int,
+) -> HTTPException:
+    """Build a fixed Chinese public QR error strictly from known error codes (never echo gateway `detail`)."""
+    cleaned_code = str(raw_code or "").strip().lower()
+    if cleaned_code in _PUBLIC_WEIXIN_QR_ERROR_MAP:
+        status_code, msg, extra = _PUBLIC_WEIXIN_QR_ERROR_MAP[cleaned_code]
+        return HTTPException(
+            status_code=status_code,
+            detail={
+                "code": cleaned_code,
+                "message": msg,
+                **extra,
+            },
+        )
+    safe_status = 503 if upstream_status >= 500 else (409 if upstream_status == 409 else 400)
+    return HTTPException(
+        status_code=safe_status,
+        detail={
+            "code": "weixin_qr_gateway_error",
+            "message": "微信扫码服务暂时异常，请稍后重试。",
+        },
+    )
 
 
 async def _proxy_to_gateway_weixin(
@@ -1052,10 +1527,7 @@ async def _proxy_to_gateway_weixin(
     require_capability(CapabilityId.CHANNEL_GATEWAY, CapabilityId.CHANNEL_WEIXIN)
     base_url = get_dalton_channel_gateway_url().strip().rstrip("/")
     if not base_url:
-        raise HTTPException(
-            status_code=503,
-            detail="Channel gateway URL is not configured",
-        )
+        raise _build_public_weixin_qr_error("gateway_unreachable", 503)
     token = (
         os.getenv("INTERNAL_SERVICE_TOKEN")
         or getattr(env, "INTERNAL_SERVICE_TOKEN", "")
@@ -1076,22 +1548,22 @@ async def _proxy_to_gateway_weixin(
                 json=json_body,
             )
     except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=503,
-            detail=f"Channel gateway is unreachable: {exc}",
-        ) from exc
+        raise _build_public_weixin_qr_error("gateway_unreachable", 503) from exc
 
     if resp.status_code >= 400:
+        err_code: str | None = None
         try:
             err_data = resp.json()
-            detail = (
-                err_data.get("detail")
-                or err_data.get("message")
-                or f"Gateway error ({resp.status_code})"
-            )
+            if isinstance(err_data, dict):
+                if isinstance(err_data.get("code"), str):
+                    err_code = err_data["code"]
+                elif isinstance(err_data.get("detail"), dict) and isinstance(
+                    err_data["detail"].get("code"), str
+                ):
+                    err_code = err_data["detail"]["code"]
         except Exception:
-            detail = f"Gateway error ({resp.status_code})"
-        raise HTTPException(status_code=resp.status_code, detail=detail)
+            err_code = None
+        raise _build_public_weixin_qr_error(err_code, resp.status_code)
 
     return resp.json()
 
@@ -1102,16 +1574,27 @@ async def _proxy_to_gateway_weixin(
 )
 async def web_weixin_qrcode_start_endpoint(
     user_id: CurrentUserId,
-) -> dict[str, Any]:
-    """§1.5 (4a): Admin-only endpoint to start Weixin iLink Bot QR code login."""
-    await _require_weixin_admin(user_id)
-    raw = await _proxy_to_gateway_weixin(
-        "POST",
-        "/internal/weixin/qrcode/start",
-        user_id=user_id,
-    )
-    await _require_weixin_admin(user_id)
-    return _shape_public_weixin_qr_response(raw)
+) -> Any:
+    """Start personal Weixin QR login: pre-writes `starting` session before calling gateway (D14)."""
+    try:
+        start_res = await wx_db.start_weixin_login_session(user_id=user_id)
+        raw = await _proxy_to_gateway_weixin(
+            "POST",
+            "/internal/weixin/qrcode/start",
+            user_id=user_id,
+            json_body={
+                "session_key": start_res["session_key"],
+                "user_id": user_id,
+                "login_version": start_res["login_version"],
+                "expected_bot_generation": start_res.get("expected_bot_generation"),
+            },
+        )
+        shaped = _shape_public_weixin_qr_response(raw)
+        if "session_key" not in shaped:
+            shaped["session_key"] = start_res["session_key"]
+        return shaped
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
 
 
 @channels_router.get(
@@ -1121,17 +1604,50 @@ async def web_weixin_qrcode_start_endpoint(
 async def web_weixin_qrcode_wait_endpoint(
     user_id: CurrentUserId,
     session_key: str = Query(..., min_length=1),
-) -> dict[str, Any]:
-    """§1.5 (4b): Admin-only endpoint to poll Weixin QR code login status."""
-    await _require_weixin_admin(user_id)
-    raw = await _proxy_to_gateway_weixin(
-        "GET",
-        "/internal/weixin/qrcode/wait",
-        user_id=user_id,
-        params={"session_key": session_key},
-    )
-    await _require_weixin_admin(user_id)
-    return _shape_public_weixin_qr_response(raw)
+) -> Any:
+    """Poll personal Weixin QR login status (verifies ownership & D7 confirmed validity)."""
+    try:
+        sess = await wx_db.get_weixin_login_session(
+            session_key=session_key,
+            user_id=user_id,
+            include_qrcode=False,
+        )
+        st = str(sess.get("status") or "")
+        if st == "confirmed" and sess.get("connected") is True:
+            confirmed = sess.get("confirmed_result") or {}
+            return _shape_public_weixin_qr_response(
+                {
+                    "session_key": session_key,
+                    "status": "confirmed",
+                    "connected": True,
+                    "already_connected": True,
+                    "account_id": confirmed.get("account_id"),
+                    "bot_generation": confirmed.get("bot_generation"),
+                    "accounts_revision": confirmed.get("accounts_revision"),
+                }
+            )
+        if st in ("superseded", "expired", "failed"):
+            return _shape_public_weixin_qr_response(
+                {
+                    "session_key": session_key,
+                    "status": st,
+                    "connected": False,
+                    "revoked": st == "superseded",
+                    "need_rescan": True,
+                    "message": "登录会话已失效，请重新获取二维码。"
+                    if st != "superseded"
+                    else "登录会话已被撤销，请重新获取二维码。",
+                }
+            )
+        raw = await _proxy_to_gateway_weixin(
+            "GET",
+            "/internal/weixin/qrcode/wait",
+            user_id=user_id,
+            params={"session_key": session_key},
+        )
+        return _shape_public_weixin_qr_response(raw)
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
 
 
 @channels_router.post(
@@ -1141,17 +1657,141 @@ async def web_weixin_qrcode_wait_endpoint(
 async def web_weixin_qrcode_verify_code_endpoint(
     body: WeixinVerifyCodeRequest,
     user_id: CurrentUserId,
-) -> dict[str, Any]:
-    """§1.5 (4c): Admin-only endpoint to submit phone verification code during Weixin QR login."""
+) -> Any:
+    """Submit phone verification code during personal Weixin QR login."""
+    try:
+        sess = await wx_db.get_weixin_login_session(
+            session_key=body.session_key,
+            user_id=user_id,
+            include_qrcode=False,
+        )
+        st = str(sess.get("status") or "")
+        if st in ("superseded", "expired", "failed"):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "code": "session_revoked" if st == "superseded" else "session_expired",
+                    "status": st,
+                    "revoked": st == "superseded",
+                    "need_rescan": True,
+                    "message": "登录会话已失效，请重新获取二维码。",
+                },
+            )
+        raw = await _proxy_to_gateway_weixin(
+            "POST",
+            "/internal/weixin/qrcode/verify-code",
+            user_id=user_id,
+            json_body={
+                "session_key": body.session_key,
+                "verify_code": body.verify_code,
+            },
+        )
+        return _shape_public_weixin_qr_response(raw)
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+# ---------------------------------------------------------------------------
+# §3.1 (2) Admin Weixin Management Endpoints
+# ---------------------------------------------------------------------------
+
+
+@channels_router.get(
+    "/weixin/admin/overview",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN))],
+)
+async def web_weixin_admin_overview_endpoint(
+    user_id: CurrentUserId,
+) -> Any:
+    """Admin overview: switches, slot usage, gateway lease, masked member states, and latest 50 audits."""
     await _require_weixin_admin(user_id)
-    raw = await _proxy_to_gateway_weixin(
-        "POST",
-        "/internal/weixin/qrcode/verify-code",
-        user_id=user_id,
-        json_body={
-            "session_key": body.session_key,
-            "verify_code": body.verify_code,
-        },
+    return await wx_db.get_weixin_admin_overview()
+
+
+@channels_router.put(
+    "/weixin/admin/config",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN))],
+)
+async def web_weixin_admin_config_put_endpoint(
+    body: WeixinAdminConfigPutRequest,
+    user_id: CurrentUserId,
+) -> Any:
+    """Admin update of `enabled` / `allow_external` switches with unified account re-evaluation."""
+    await _require_weixin_admin(user_id)
+    try:
+        res = await wx_db.update_weixin_admin_config(
+            operator_user_id=user_id,
+            enabled=body.enabled,
+            allow_external=body.allow_external,
+        )
+        if res.get("accounts_revision") is not None:
+            await wx_db.notify_gateway_weixin_accounts_sync(
+                accounts_revision=int(res["accounts_revision"]),
+                reason="admin_config_updated",
+            )
+        return res
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+def _format_admin_unbind_reason(body: WeixinAdminUnbindRequest | None) -> str:
+    return wx_db.validate_admin_unbind_reason(
+        body.reason if body is not None else None,
+        note=body.note if body is not None else None,
     )
+
+
+@channels_router.delete(
+    "/weixin/admin/accounts/{account_id}",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN))],
+)
+async def web_weixin_admin_delete_account_endpoint(
+    account_id: str,
+    user_id: CurrentUserId,
+    body: WeixinAdminUnbindRequest | None = Body(default=None),
+) -> Any:
+    """Admin unbind a bound Weixin account by `account_id` with audit reason."""
     await _require_weixin_admin(user_id)
-    return _shape_public_weixin_qr_response(raw)
+    try:
+        res = await wx_db.unbind_weixin_account(
+            account_id=account_id,
+            operator_user_id=user_id,
+            action="admin_unbind",
+            reason=_format_admin_unbind_reason(body),
+        )
+        if res.get("accounts_revision") is not None:
+            await wx_db.notify_gateway_weixin_accounts_sync(
+                accounts_revision=int(res["accounts_revision"]),
+                reason="admin_unbind",
+            )
+        return res
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.delete(
+    "/weixin/admin/users/{target_user_id}/weixin",
+    dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN))],
+)
+async def web_weixin_admin_delete_user_weixin_endpoint(
+    target_user_id: str,
+    user_id: CurrentUserId,
+    body: WeixinAdminUnbindRequest | None = Body(default=None),
+) -> Any:
+    """Admin unbind/revoke by `target_user_id` (also revokes `starting`/`wait` sessions with no account)."""
+    await _require_weixin_admin(user_id)
+    try:
+        res = await wx_db.unbind_weixin_account(
+            target_user_id=target_user_id,
+            operator_user_id=user_id,
+            action="admin_unbind",
+            reason=_format_admin_unbind_reason(body),
+        )
+        if res.get("accounts_revision") is not None:
+            await wx_db.notify_gateway_weixin_accounts_sync(
+                accounts_revision=int(res["accounts_revision"]),
+                reason="admin_unbind",
+            )
+        return res
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)

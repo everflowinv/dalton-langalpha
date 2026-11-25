@@ -418,6 +418,8 @@ export interface SafeFetchOptions {
   headers?: Record<string, string>;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
+  /** Optional undici-compatible dispatcher (connection pool Agent) passed through to Node fetch. */
+  dispatcher?: unknown;
 }
 
 export interface SafeFetchRequestOptions {
@@ -431,6 +433,8 @@ export interface SafeFetchRequestOptions {
   timeoutMs?: number;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
+  /** Optional undici-compatible dispatcher (connection pool Agent) passed through to Node fetch. */
+  dispatcher?: unknown;
   maxRedirects?: number;
   maxBytes?: number;
 }
@@ -631,13 +635,17 @@ export async function safeFetchResponse(
 
       let response: Response;
       try {
-        response = await fetchFn(currentUrl.toString(), {
+        const requestInit: RequestInit & { dispatcher?: unknown } = {
           method,
           headers: effectiveHeaders,
           body: body as BodyInit | undefined,
           redirect: "manual",
           signal: controller.signal,
-        });
+          ...(options.dispatcher !== undefined
+            ? { dispatcher: options.dispatcher }
+            : {}),
+        };
+        response = await fetchFn(currentUrl.toString(), requestInit);
       } catch (error) {
         if (controller.signal.aborted) {
           throw new SafeFetchError(
@@ -815,12 +823,16 @@ export async function safeFetchBuffer(
         currentUrl.origin,
       );
       try {
-        response = await fetchFn(currentUrl.toString(), {
+        const requestInit: RequestInit & { dispatcher?: unknown } = {
           method: "GET",
           headers: effectiveHeaders,
           redirect: "manual",
           signal: controller.signal,
-        });
+          ...(options.dispatcher !== undefined
+            ? { dispatcher: options.dispatcher }
+            : {}),
+        };
+        response = await fetchFn(currentUrl.toString(), requestInit);
       } catch (error) {
         if (controller.signal.aborted) {
           throw new SafeFetchError(

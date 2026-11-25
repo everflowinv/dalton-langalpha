@@ -23,9 +23,12 @@ FENCE_LIVE_WORKSPACE = "status NOT IN ('deleted', 'unbound')"
 
 
 def _takes_workspaces(c: str) -> str:
+    # DALTON-HOOK(cos-settings-tools): exclude computers actively being archived from accepting new workspaces
     return (
         f"({c}is_primary OR NOT COALESCE({c}config, '{{}}'::jsonb)"
         " @> '{\"retire_when_empty\": true}'::jsonb)"
+        f" AND NOT COALESCE({c}config, '{{}}'::jsonb)"
+        " @> '{\"archiving\": true}'::jsonb"
     )
 
 

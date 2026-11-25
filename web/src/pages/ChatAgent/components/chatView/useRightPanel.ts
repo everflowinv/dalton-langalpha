@@ -37,6 +37,7 @@ export function useRightPanel({
   isMobile,
   workspaceId,
   folders = null,
+  foldersReady = true, // DALTON-HOOK(channel-links): wait for folder queries before consuming rooted ?file= deep links
   threadId,
   isActive,
   containerRef,
@@ -63,6 +64,8 @@ export function useRightPanel({
   /** The workspace's folder, those a rename moved it out of, which older
    *  turns' paths still name, and the other workspaces on its computer. */
   folders?: ComputerFolders | null;
+  // DALTON-HOOK(channel-links): whether folder/sibling queries have settled for rooted ?file= deep links
+  foldersReady?: boolean;
   /** The conversation a MarketView page opened from here resumes. */
   threadId?: string | null;
   isActive: boolean;
@@ -417,7 +420,8 @@ export function useRightPanel({
 
   // The ?file= link opens the file panel at that file. Only the visible
   // ChatView reads it (ChatAgent keeps cached hidden instances).
-  useFileDeepLink(isActive, workspaceId, handleOpenFileFromChat);
+  // DALTON-HOOK(channel-links): pass foldersReady so rooted/sibling ?file= deep links wait for folder metadata
+  useFileDeepLink(isActive, workspaceId, handleOpenFileFromChat, foldersReady);
 
   // Resolve preview URL: always pass command so the backend can start the
   // server if the port is idle (common for history sessions where the

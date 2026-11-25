@@ -37,8 +37,6 @@ from src.server.services.shared_workspaces.access import (
     ThreadWatch,
     thread_access,
 )
-
-_DEFAULT_THREAD_ACCESS = thread_access
 from src.server.services.shared_workspaces.turn import TurnIdentity
 from src.server.services.shared_workspaces.viewer import name_steer_senders, name_turn_senders
 from src.server.database.shared_workspaces import is_holder
@@ -70,6 +68,8 @@ from src.observability import (
 from src.server.app import setup
 
 from ._deps import SSE_HEADERS, _get_service_token, _track_task, logger, router
+
+_DEFAULT_THREAD_ACCESS = thread_access  # DALTON-HOOK(colleague-dispatch)
 
 
 def _automation_configurable(request: ChatRequest) -> Optional[dict]:
@@ -262,6 +262,8 @@ class AdmittedTurn:
     thread_id: str
     body: ChatRequest
     auth: ChatAuthResult
+    # DALTON-HOOK(cos-settings-tools): preserve caller Principal for web-only HITL confirmation verification
+    principal: Principal | None = None
 
 
 async def _admit(
@@ -284,6 +286,7 @@ async def _admit(
         thread_id=thread_id or str(uuid4()),
         body=body,
         auth=await limit(principal.user_id),
+        principal=principal,  # DALTON-HOOK(cos-settings-tools)
     )
 
 
@@ -325,7 +328,10 @@ async def send_new_thread_message(
     The server creates a new thread_id and returns it in SSE events.
     If external_thread_id + platform are provided, resolves to an existing thread first.
     """
-    return await _handle_send_message(turn.body, turn.auth, turn.thread_id, raw_request)
+    # DALTON-HOOK(cos-settings-tools): pass Principal for web-only HITL confirmation verification
+    return await _handle_send_message(
+        turn.body, turn.auth, turn.thread_id, raw_request, principal=turn.principal
+    )
 
 
 @router.post("/{thread_id}/messages")
@@ -335,7 +341,10 @@ async def send_thread_message(
     """
     Send a message to an existing thread. Returns an SSE stream.
     """
-    return await _handle_send_message(turn.body, turn.auth, turn.thread_id, raw_request)
+    # DALTON-HOOK(cos-settings-tools): pass Principal for web-only HITL confirmation verification
+    return await _handle_send_message(
+        turn.body, turn.auth, turn.thread_id, raw_request, principal=turn.principal
+    )
 
 
 def _is_service_request(raw_request: Request | None) -> bool:
@@ -383,6 +392,8 @@ _SERVER_ONLY_FIELDS = (
     "checked_computer_id",
     # DALTON-HOOK(team-model-catalog): strip resume_of_run_id on any non-service request
     "resume_of_run_id",
+    "llm_model_system_only",  # DALTON-HOOK(cos-settings-tools)
+    "restart_from_run_id",  # DALTON-HOOK(cos-settings-tools)
 )
 
 
@@ -395,8 +406,24 @@ def _client_body(request: ChatRequest, raw_request: Request) -> ChatRequest:
     """
     if _is_service_request(raw_request):
         return request
-    cleared = {name: None for name in _SERVER_ONLY_FIELDS if getattr(request, name)}
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    # Reset boolean llm_model_system_only to False rather than None, and strip
+    # server-only scope_changed flags from client-supplied hitl_response entries.
+    cleared = {
+        name: (False if name == "llm_model_system_only" else None)
+        for name in _SERVER_ONLY_FIELDS
+        if getattr(request, name)
+    }
+    if request.hitl_response and any(
+        getattr(entry, "scope_changed", False)
+        for entry in request.hitl_response.values()
+    ):
+        cleared["hitl_response"] = {
+            iid: entry.model_copy(update={"scope_changed": False})
+            for iid, entry in request.hitl_response.items()
+        }
     return request.model_copy(update=cleared) if cleared else request
+    # --- DALTON-HOOK(cos-settings-tools): end ---
 
 
 async def _reject_duplicate_request(
@@ -454,7 +481,14 @@ async def _reject_duplicate_request(
 
 
 async def _settle_against_branch(
-    thread_id: str, request: ChatRequest, user_id: str
+    thread_id: str,
+    request: ChatRequest,
+    user_id: str,
+    *,
+    # DALTON-HOOK(cos-settings-tools): caller context for web-only HITL confirmation verification
+    principal: Principal | None = None,
+    raw_request: Request | None = None,
+    thread_meta: dict | None = None,
 ) -> ChatRequest:
     """A fork or HITL answer checked against the thread's branch.
 
@@ -471,7 +505,14 @@ async def _settle_against_branch(
         if request.fork_from_turn is not None and request.checkpoint_id:
             return await settle_fork_request(thread_id, request)
         if request.hitl_response:
-            return await settle_resume_request(thread_id, request)
+            # DALTON-HOOK(cos-settings-tools): pass principal, raw_request, thread_meta for authenticity verification
+            return await settle_resume_request(
+                thread_id,
+                request,
+                principal=principal,
+                raw_request=raw_request,
+                thread_meta=thread_meta,
+            )
         return request
     except HTTPException as refused:
         if refused.status_code == 409 and request.request_key:
@@ -492,6 +533,8 @@ async def _handle_send_message(
     # DALTON-HOOK(team-model-catalog): route-internal source run row & explicit retry checkpoint for compare-and-reject resume verification
     resume_source_run: dict | None = None,
     retry_checkpoint_id: str | None = None,
+    principal: Principal | None = None,  # DALTON-HOOK(cos-settings-tools)
+    retry_source_execution_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
 ):
     """Shared logic for both POST /threads/messages and POST /threads/{id}/messages.
 
@@ -601,6 +644,12 @@ async def _handle_send_message(
                     from_service=from_service,
                     is_server_retry=is_server_retry,
                     retry_of_run_id=retry_of_run_id,
+                    # DALTON-HOOK(cos-settings-tools): enforce known_execution_id from /retry on flagged-subscription gate
+                    **(
+                        {"known_execution_id": retry_source_execution_id}
+                        if retry_source_execution_id
+                        else {}
+                    ),
                 ):
                     flagged_subscription = (subscription, flagged["last_error_code"])
                 else:
@@ -649,7 +698,40 @@ async def _handle_send_message(
         # later reader (the truncation, the regenerate's turn, the prior-turn
         # read) takes it from the request, so it is settled here, once, with
         # the branch tip it was read off for START to hold it to.
-        request = await _settle_against_branch(thread_id, request, user_id)
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        # Reject requests that combine branch edit/fork with an HITL resume so
+        # no caller can bypass settle_resume_request confirmation verification.
+        if request.hitl_response and request.fork_from_turn is not None:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "invalid_request",
+                    "message": "Cannot combine branch edit/fork with hitl_response.",
+                },
+            )
+        # Always clear server-only scope_changed before settle_resume_request.
+        if request.hitl_response and any(
+            getattr(entry, "scope_changed", False)
+            for entry in request.hitl_response.values()
+        ):
+            request = request.model_copy(
+                update={
+                    "hitl_response": {
+                        iid: entry.model_copy(update={"scope_changed": False})
+                        for iid, entry in request.hitl_response.items()
+                    }
+                }
+            )
+        # Pass principal, raw_request, thread_meta for confirmation authenticity
+        request = await _settle_against_branch(
+            thread_id,
+            request,
+            user_id,
+            principal=principal,
+            raw_request=raw_request,
+            thread_meta=thread_meta,
+        )
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         if is_holder(owner_id):
             from src.server.handlers.checkpoint_handler import first_turn_replaced
 
@@ -786,6 +868,8 @@ async def _handle_send_message(
             reasoning_effort=getattr(request, "reasoning_effort", None),
             fast_mode=getattr(request, "fast_mode", None),
             enabled_subagents=request.subagents_enabled,
+            # DALTON-HOOK(cos-settings-tools): forward execution-level system-catalog flag on server firing requests
+            **({"ignore_custom_models": True} if getattr(request, "llm_model_system_only", False) else {}),
         )
 
         # A report-back or a channel message has nobody at a client to
@@ -918,11 +1002,20 @@ async def _handle_send_message(
                 from_service=from_service,
                 is_server_retry=is_server_retry,
                 retry_of_run_id=retry_of_run_id,
+                # DALTON-HOOK(cos-settings-tools): forward already-read execution id from /retry so snapshot lookup failures fail closed with 503
+                **(
+                    {"retry_source_execution_id": retry_source_execution_id}
+                    if retry_source_execution_id
+                    else {}
+                ),
                 resolve=resolve,
                 flagged_subscription=flagged_subscription,
                 on_fallback=fallback_records.append,
                 on_automation_context=automation_run_ctx.update,
             )
+        # DALTON-HOOK(cos-settings-tools): HITL resume and web /retry of an automation execution use the execution snapshot and must not stamp the composer's selected model onto the thread
+        if (request.hitl_response or retry_of_run_id) and automation_run_ctx.get("automation_source_execution_id"):
+            named_model = None
 
         # is_byok is True only when the stamped credential_source confirms the user
         # supplied their own key (OAUTH or BYOK), not merely that a client object exists.
@@ -1559,10 +1652,10 @@ async def replay_thread_messages(
             is_non_owner_reader = False
         else:
             # --- DALTON-HOOK(workspace-sharing-settings): begin ---
-            from src.dalton.settings import is_dalton_supabase_auth_enabled
+            from src.dalton.settings import is_dalton_multiuser_auth_enabled
 
             is_non_owner_reader = False
-            if is_dalton_supabase_auth_enabled():
+            if is_dalton_multiuser_auth_enabled():
                 from src.dalton.sharing import require_thread_access
 
                 # DALTON-HOOK(colleague-dispatch): pass both thread owner_id and workspace_owner_id to require_thread_access.
@@ -1719,10 +1812,10 @@ async def get_thread_status(
             await thread_access(thread_id, x_user_id, meta=meta)
     else:
         # --- DALTON-HOOK(team-sharing): begin ---
-        from src.dalton.settings import is_dalton_supabase_auth_enabled
+        from src.dalton.settings import is_dalton_multiuser_auth_enabled
 
         is_non_owner_reader = False
-        if is_dalton_supabase_auth_enabled():
+        if is_dalton_multiuser_auth_enabled():
             from src.dalton.sharing import require_thread_reader
 
             # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id to require_thread_reader.
@@ -2119,6 +2212,14 @@ async def retry_thread(
                 status_code=404, detail=f"Thread {thread_id} has no runs to retry"
             )
         latest_run_id = str(latest["conversation_response_id"])
+        # DALTON-HOOK(cos-settings-tools): capture linked execution id from the already-read latest attempt so /retry fails closed if snapshot lookup later fails
+        from src.dalton.services.automation_thread_model import (
+            _extract_execution_id_from_metadata,
+        )
+
+        retry_source_execution_id = _extract_execution_id_from_metadata(
+            latest.get("metadata")
+        )
         if access.is_shared:
             await refuse_others_retry(latest_run_id, auth.user_id)
         if body and body.run_id and body.run_id != latest_run_id:
@@ -2205,6 +2306,7 @@ async def retry_thread(
     # Retry provenance travels as a route-internal parameter, never in the
     # body.
     # DALTON-HOOK(team-model-catalog): forward retried DB row & explicit retry checkpoint so _handle_send_message runs verify_resume_route on the right run before client build
+    # DALTON-HOOK(cos-settings-tools): forward linked execution id when present so /retry fails closed on snapshot lookup error
     return await _handle_send_message(
         request,
         auth,
@@ -2215,6 +2317,11 @@ async def retry_thread(
         **(
             {"retry_checkpoint_id": explicit_retry_checkpoint_id}
             if explicit_retry_checkpoint_id
+            else {}
+        ),
+        **(
+            {"retry_source_execution_id": retry_source_execution_id}
+            if retry_source_execution_id
             else {}
         ),
     )

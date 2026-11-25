@@ -27,6 +27,8 @@ export default function ShareThreadDialog({ target, onClose }: ShareThreadDialog
               key={shown.threadId}
               threadId={shown.threadId}
               workspaceId={shown.workspaceId}
+              // DALTON-HOOK(external-share-guard): drive open/visibility/focus identity revalidation
+              open={!!target}
               Heading={DialogTitle}
             />
           </div>

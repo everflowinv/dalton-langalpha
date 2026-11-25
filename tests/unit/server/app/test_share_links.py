@@ -12,14 +12,16 @@ owner's workspaces and for no one else's.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, create_autospec, patch  # DALTON-HOOK(monitors): create_autospec for Dalton unshare tests
 
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+from src.dalton import settings as dalton_settings  # DALTON-HOOK(monitors): spec target for is_dalton_enabled
 from src.server.app.share_links import owner_router as share_link_owner_router
 from src.server.app.share_links import router as share_links_router
+from src.server.database import artifacts as artifacts_db  # DALTON-HOOK(monitors): spec target for unshare helpers
 from src.server.database.artifacts import Artifact, ArtifactNotFound
 from src.server.database.share_links import ShareLink
 from src.server.utils.api import get_current_user_id
@@ -41,6 +43,9 @@ _OWNED_DBWS = "src.server.services.workspace_files.db_get_workspace"
 _GET_LINK = f"{_M}.get_link"
 _CREATE = f"{_M}.artifacts_db.ensure_artifact"
 _UNSHARE = f"{_M}.artifacts_db.unshare"
+# DALTON-HOOK(monitors): verify unshare routes dispatch to atomic monitor downgrade when Dalton is enabled
+_UNSHARE_DALTON = f"{_M}.artifacts_db.unshare_artifact_and_downgrade_public_monitor"
+_DALTON_ENABLED = "src.dalton.settings.is_dalton_enabled"
 _CHANGED = f"{_M}.publish_artifact_change"
 _SET_PRIVATE = f"{_M}.set_private"
 _AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -129,18 +134,38 @@ async def test_patch_share_on_a_file_link_points_to_publish(client):
     unshare.assert_not_awaited()
 
 
-async def test_patch_stop_on_a_file_link_unshares_its_artifact(client):
+# DALTON-HOOK(monitors): parametrize file unshare across Dalton disabled/enabled paths
+@pytest.mark.parametrize("dalton_enabled", [False, True])
+async def test_patch_stop_on_a_file_link_unshares_its_artifact(client, dalton_enabled):
     shared = _link(files=("report.html",), shared_at=_AT)
+    target = _UNSHARE_DALTON if dalton_enabled else _UNSHARE
+    other = _UNSHARE if dalton_enabled else _UNSHARE_DALTON
+    target_fn = (
+        artifacts_db.unshare_artifact_and_downgrade_public_monitor
+        if dalton_enabled
+        else artifacts_db.unshare
+    )
+    other_fn = (
+        artifacts_db.unshare
+        if dalton_enabled
+        else artifacts_db.unshare_artifact_and_downgrade_public_monitor
+    )
     with (
+        patch(
+            _DALTON_ENABLED,
+            create_autospec(dalton_settings.is_dalton_enabled, return_value=dalton_enabled),
+        ),
         patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
         patch(_GET_LINK, AsyncMock(side_effect=[shared, _link()])),
-        patch(_UNSHARE, AsyncMock(return_value=_artifact())) as unshare,
+        patch(target, create_autospec(target_fn, return_value=_artifact())) as unshare,
+        patch(other, create_autospec(other_fn)) as unused_unshare,
         patch(_CHANGED, AsyncMock()) as changed,
         patch(_SET_PRIVATE, AsyncMock()) as set_private,
     ):
         resp = await client.patch(f"{_BASE}/{_CODE}", json={"shared": False})
     assert resp.status_code == 200
     unshare.assert_awaited_once_with(user_id=_OWNER, artifact_id=_ARTIFACT)
+    unused_unshare.assert_not_awaited()
     changed.assert_awaited_once_with(_OWNER, _artifact())
     set_private.assert_not_awaited()
     body = resp.json()
@@ -149,11 +174,23 @@ async def test_patch_stop_on_a_file_link_unshares_its_artifact(client):
     assert body["artifact_id"] == _ARTIFACT
 
 
-async def test_patch_stop_on_a_record_gone_since_is_404(client):
+# DALTON-HOOK(monitors): parametrize missing artifact unshare across Dalton disabled/enabled paths
+@pytest.mark.parametrize("dalton_enabled", [False, True])
+async def test_patch_stop_on_a_record_gone_since_is_404(client, dalton_enabled):
+    target = _UNSHARE_DALTON if dalton_enabled else _UNSHARE
+    target_fn = (
+        artifacts_db.unshare_artifact_and_downgrade_public_monitor
+        if dalton_enabled
+        else artifacts_db.unshare
+    )
     with (
+        patch(
+            _DALTON_ENABLED,
+            create_autospec(dalton_settings.is_dalton_enabled, return_value=dalton_enabled),
+        ),
         patch(_OWNED_DBWS, AsyncMock(return_value=_workspace())),
         patch(_GET_LINK, AsyncMock(return_value=_link())),
-        patch(_UNSHARE, AsyncMock(side_effect=ArtifactNotFound(_ARTIFACT))),
+        patch(target, create_autospec(target_fn, side_effect=ArtifactNotFound(_ARTIFACT))),
     ):
         resp = await client.patch(f"{_BASE}/{_CODE}", json={"shared": False})
     assert resp.status_code == 404

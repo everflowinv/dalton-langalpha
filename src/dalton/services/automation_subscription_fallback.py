@@ -109,10 +109,23 @@ def build_flagged_subscription_error(
     raise AssertionError("raise_oauth_reauth_required must raise HTTPException")
 
 
+def _strip_custom_models(prefs: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a shallow copy of *prefs* without user custom models/providers."""
+    if not (prefs.get("custom_models") or prefs.get("custom_providers")):
+        return dict(prefs)
+    return {
+        k: v
+        for k, v in prefs.items()
+        if k not in ("custom_models", "custom_providers")
+    }
+
+
 async def _subscription_provider_for_model(
     user_id: str,
     model_name: str,
     prefs: dict[str, Any],
+    *,
+    ignore_custom_models: bool = False,
 ) -> str | None:
     """Return the subscription provider ID serving *model_name*, or ``None``."""
     try:
@@ -120,7 +133,10 @@ async def _subscription_provider_for_model(
 
         mc = LLMFactory.get_model_config()
         source, entry = await user_models.classify_model(
-            user_id, model_name, _pref_cache=prefs
+            user_id,
+            model_name,
+            _pref_cache=prefs,
+            **({"ignore_custom_models": True} if ignore_custom_models else {}),
         )
         route = subscription_route(
             model_name,
@@ -212,6 +228,7 @@ async def resolve_with_subscription_fallback(
     exc_to_raise: BaseException,
     model_resolves_fn: Callable[[dict[str, Any], str], bool] = model_resolves,
     failed_subject: str | None = None,
+    ignore_custom_models: bool = False,
 ) -> tuple[Any, dict[str, Any]]:
     """Try each usable fallback model not on *failed_provider*.
 
@@ -231,9 +248,14 @@ async def resolve_with_subscription_fallback(
     if not isinstance(candidates, list) or not candidates:
         raise exc_to_raise
 
+    filter_prefs = _strip_custom_models(prefs) if ignore_custom_models else prefs
+
     if not failed_provider and original_model:
         failed_provider = await _subscription_provider_for_model(
-            user_id, original_model, prefs
+            user_id,
+            original_model,
+            filter_prefs,
+            **({"ignore_custom_models": True} if ignore_custom_models else {}),
         )
 
     seen: set[str] = set()
@@ -247,12 +269,15 @@ async def resolve_with_subscription_fallback(
 
         if original_model and candidate == original_model:
             continue
-        if not model_resolves_fn(prefs, candidate):
+        if not model_resolves_fn(filter_prefs, candidate):
             continue
 
         if failed_provider:
             cand_provider = await _subscription_provider_for_model(
-                user_id, candidate, prefs
+                user_id,
+                candidate,
+                filter_prefs,
+                **({"ignore_custom_models": True} if ignore_custom_models else {}),
             )
             if cand_provider == failed_provider:
                 continue
@@ -363,6 +388,7 @@ async def resolve_automation_turn_llm_config(
     workspace_id: str | None = None,
     identity: Any = None,
     role: Any = "analyst",
+    ignore_custom_models: bool = False,
 ) -> tuple[Any, dict[str, Any] | None]:
     """Resolve an automation first turn's LLM config with subscription fallback."""
     async def _resolve(model_name: str | None) -> Any:
@@ -378,6 +404,7 @@ async def resolve_automation_turn_llm_config(
             workspace_id=workspace_id,
             identity=identity,
             role=role,
+            ignore_custom_models=ignore_custom_models,
         )
 
     with capture_resolved_effective_model() as captured_model:
@@ -389,11 +416,12 @@ async def resolve_automation_turn_llm_config(
             prefs = await load_fallback_prefs_or_reraise(
                 user_id, exc, context=f"user={user_id}"
             )
+            default_prefs = _strip_custom_models(prefs) if ignore_custom_models else prefs
             original_model = (
                 (captured_model[-1] if captured_model else None)
                 or extract_rejected_model_from_exc(exc)
                 or request_model
-                or thread_model.effective_default_model(prefs)
+                or thread_model.effective_default_model(default_prefs)
             )
             detail = exc.detail if isinstance(exc.detail, dict) else {}
             return await resolve_with_subscription_fallback(
@@ -404,6 +432,7 @@ async def resolve_automation_turn_llm_config(
                 reason=detail.get("type"),
                 resolve_candidate=_resolve,
                 exc_to_raise=exc,
+                ignore_custom_models=ignore_custom_models,
             )
 
 
@@ -420,6 +449,7 @@ async def resolve_ptc_turn_llm_config(
     run_metadata: dict[str, Any] | None = None,
 ) -> tuple[Any, dict[str, Any] | None]:
     """Resolve LLM config for ``ptc_run`` with automation subscription fallback when eligible."""
+    ignore_custom = bool(getattr(request, "llm_model_system_only", False))
     if is_automation_executor_turn(request, run_metadata):
         config, fallback_record = await resolve_automation_turn_llm_config(
             base_config,
@@ -433,6 +463,7 @@ async def resolve_ptc_turn_llm_config(
             workspace_id=workspace_id,
             identity=identity,
             role=role,
+            ignore_custom_models=ignore_custom,
         )
         if fallback_record is not None:
             run_metadata = {
@@ -453,6 +484,7 @@ async def resolve_ptc_turn_llm_config(
         workspace_id=workspace_id,
         identity=identity,
         role=role,
+        ignore_custom_models=ignore_custom,
     )
     return config, run_metadata
 

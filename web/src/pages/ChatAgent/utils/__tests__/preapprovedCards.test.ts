@@ -159,9 +159,28 @@ describe('preapprovedCard', () => {
     expect(preapprovedCard('ptc_agent', { question: 'Q' }, { content: result })).toBeNull();
   });
 
-  it('returns null for a workspace creation approved in advance that did not succeed', () => {
-    const result = JSON.stringify({ success: false, preapproved: true, workspace_name: 'New Workspace' });
-    expect(preapprovedCard('manage_workspaces', { action: 'create' }, { content: result })).toBeNull();
+  // DALTON-HOOK(cos-settings-tools): failed preapproved workspace creation renders a failed card
+  it('builds a failed create_workspace proposal for a workspace creation approved in advance that did not succeed', () => {
+    const result = JSON.stringify({
+      success: false,
+      preapproved: true,
+      workspace_name: 'New Workspace',
+      workspace_description: 'A fresh workspace',
+      computer_name: 'Cloud Primary',
+      code: 'scope_changed',
+      error: '情况已变化，请重新发起',
+    });
+    expect(preapprovedCard('manage_workspaces', { action: 'create' }, { content: result })).toEqual({
+      type: 'create_workspace',
+      proposal: {
+        status: 'failed',
+        workspace_name: 'New Workspace',
+        workspace_description: 'A fresh workspace',
+        computer_name: 'Cloud Primary',
+        failure_code: 'scope_changed',
+        failure_error: '情况已变化，请重新发起',
+      },
+    });
   });
 
   it('returns null for non-JSON content', () => {

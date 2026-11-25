@@ -1487,6 +1487,11 @@ async def test_settlement_clears_retrying_flag_when_stopping_retries_without_rep
         create_autospec(outbox_db.merge_job_payload, side_effect=_fake_merge),
     )
     monkeypatch.setattr(
+        outbox_db,
+        "owns_claimed_job",
+        create_autospec(outbox_db.owns_claimed_job, return_value=True),
+    )
+    monkeypatch.setattr(
         automation_settlement,
         "get_db_connection",
         create_autospec(automation_settlement.get_db_connection, side_effect=_fake_conn),

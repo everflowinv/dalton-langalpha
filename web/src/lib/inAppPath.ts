@@ -15,6 +15,8 @@ const IN_APP_BASE = 'http://in-app.invalid';
  */
 export function inAppPath(raw: string | null): string | null {
   if (!raw || !raw.startsWith('/')) return null;
+  // DALTON-HOOK(channel-links): reject protocol-relative (//) and backslash (/\) prefixes before URL resolution
+  if (raw.startsWith('//') || raw.startsWith('/\\')) return null;
   let url: URL;
   try {
     url = new URL(raw, IN_APP_BASE);

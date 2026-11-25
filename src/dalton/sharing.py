@@ -35,22 +35,10 @@ from src.dalton.settings import (
     get_dalton_settings,
     is_colleague_dispatch_enabled,
     is_dalton_local_auth_enabled,
+    is_dalton_multiuser_auth_enabled,
     is_dalton_sharing_auth_enabled,
     is_dalton_supabase_auth_enabled as _default_is_dalton_supabase_auth_enabled,
 )
-
-is_dalton_supabase_auth_enabled = _default_is_dalton_supabase_auth_enabled
-
-
-def _sharing_auth_enabled() -> bool:
-    """Colleague workspace sharing gate: requires CapabilityId.COLLEAGUE_SHARING + sharing auth."""
-    from src.dalton.capabilities import CapabilityId, has_capability
-
-    if not has_capability(CapabilityId.COLLEAGUE_SHARING):
-        return False
-    if is_dalton_supabase_auth_enabled is not _default_is_dalton_supabase_auth_enabled:
-        return bool(is_dalton_supabase_auth_enabled())
-    return is_dalton_sharing_auth_enabled()
 from src.server.database import conversation as conv_db
 from src.server.database import user as user_db
 from src.server.database import workspace as ws_db
@@ -63,6 +51,27 @@ from src.server.database.home_workspace import (
 )
 from src.server.database.pool import get_db_connection
 from src.server.utils import api as auth_api
+
+is_dalton_supabase_auth_enabled = _default_is_dalton_supabase_auth_enabled
+
+
+def _multiuser_auth_enabled() -> bool:
+    """Return True when Dalton multi-user auth (`supabase` or `local`) is active."""
+    if is_dalton_supabase_auth_enabled is not _default_is_dalton_supabase_auth_enabled:
+        return bool(is_dalton_supabase_auth_enabled()) or is_dalton_local_auth_enabled()
+    return is_dalton_multiuser_auth_enabled()
+
+
+def _sharing_auth_enabled() -> bool:
+    """Colleague workspace sharing gate: requires CapabilityId.COLLEAGUE_SHARING + sharing auth."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.COLLEAGUE_SHARING):
+        return False
+    if is_dalton_supabase_auth_enabled is not _default_is_dalton_supabase_auth_enabled:
+        return bool(is_dalton_supabase_auth_enabled())
+    return is_dalton_sharing_auth_enabled()
+
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +144,34 @@ def _classify_owner_row_tier(owner_id: str | None, owner_email: Any) -> str:
         return "external"
     except Exception:
         return "unknown"
+
+
+def is_internal_team_owner(
+    owner_id: str | None,
+    owner_email: Any,
+    *,
+    local_internal_user_ids: set[str] | None = None,
+) -> bool:
+    """Return True when ``owner_id``/``owner_email`` belongs to the internal team.
+
+    Shared by lock-free company dedup (Phase 1) and locked workspace-create
+    recheck (Phase 2) so both apply the exact same internal-colleague rule:
+    - In Supabase auth mode, delegates to ``_classify_owner_row_tier``
+      (configured PM user IDs and ``DALTON_ALLOWED_EMAILS`` only — never
+      ``dalton_members``, which also holds invited external members).
+    - In local auth mode, when ``local_internal_user_ids`` is pre-loaded from
+      ``dalton_user_roles`` on the active transaction cursor, classifies with
+      that set and the same ``is_company_system_user`` exclusion so an async
+      savepoint never opens a second connection; otherwise delegates to
+      ``_classify_owner_row_tier``.
+    """
+    if local_internal_user_ids is not None:
+        uid = str(owner_id or "").strip()
+        if not uid or is_company_system_user(uid):
+            return False
+        return uid in local_internal_user_ids
+    tier = _classify_owner_row_tier(owner_id, owner_email)
+    return tier in ("admin", "internal")
 
 
 def _display_name(name: str | None, email: str | None) -> str:
@@ -1049,7 +1086,15 @@ async def _guard_thread_not_foreign_home_stand_in(
             ws_obj
             and (is_home_row(ws_obj) or bool(ws_obj.get("is_home")))
         ) or is_home_id(ws_owner_for_check, ws_id_for_check):
-            raise HTTPException(status_code=404, detail="Thread not found")
+            if _multiuser_auth_enabled():
+                owner_tier = (
+                    await classify_owner_tier(ws_owner_for_check, conn=conn)
+                    if conn is not None
+                    else await classify_owner_tier(ws_owner_for_check)
+                )
+                if owner_tier in ("external", "unknown"):
+                    raise HTTPException(status_code=404, detail="Thread not found")
+            raise HTTPException(status_code=403, detail="Forbidden")
 
 
 async def _resolve_thread_workspace_for_guard(
@@ -1389,7 +1434,7 @@ async def require_thread_access(
         raise ValueError(f"Unsupported need: {need!r}")
     cleaned_channel = str(channel or "web").strip().lower()
 
-    if not _sharing_auth_enabled():
+    if not _multiuser_auth_enabled() and not _sharing_auth_enabled():
         if owner_id is not None:
             if owner_id != uid:
                 raise HTTPException(status_code=403, detail="Forbidden")
@@ -1411,17 +1456,14 @@ async def require_thread_access(
         )
         return uid
 
-    if conn is not None:
-        await require_team_reader(uid, conn=conn)
-    else:
-        await require_team_reader(uid)
-
     meta: dict[str, Any] | None = None
     resolved_workspace_id = workspace_id
-    if resolved_workspace_id is None or (
-        owner_id is None and workspace_owner_id is None
-    ):
-        meta = await conv_db.get_thread_auth_meta(thread_id, conn=conn)
+    if resolved_workspace_id is None or owner_id is None or workspace_owner_id is None:
+        meta = (
+            await conv_db.get_thread_auth_meta(thread_id, conn=conn)
+            if conn is not None
+            else await conv_db.get_thread_auth_meta(thread_id)
+        )
         if resolved_workspace_id is None:
             if not meta or not meta.get("workspace_id"):
                 raise HTTPException(status_code=404, detail="Thread not found")
@@ -1443,11 +1485,54 @@ async def require_thread_access(
         )
         or ""
     ).strip()
+    if not thread_owner:
+        if meta is None:
+            meta = (
+                await conv_db.get_thread_auth_meta(thread_id, conn=conn)
+                if conn is not None
+                else await conv_db.get_thread_auth_meta(thread_id)
+            )
+        if not meta:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        thread_owner = str(
+            meta.get("thread_user_id") or meta.get("user_id") or ""
+        ).strip()
+        if not ws_owner:
+            ws_owner = str(meta.get("workspace_owner_id") or "").strip()
+
+    if _multiuser_auth_enabled():
+        if uid != thread_owner or (ws_owner and ws_owner != uid):
+            caller_tier = (
+                await get_user_tier(uid, conn=conn)
+                if conn is not None
+                else await get_user_tier(uid)
+            )
+            if caller_tier == "external":
+                raise HTTPException(status_code=404, detail="Thread not found")
+
+    if not _sharing_auth_enabled():
+        if uid == thread_owner and (not ws_owner or ws_owner == uid):
+            return thread_owner
+        await _guard_thread_not_foreign_home_stand_in(
+            thread_id,
+            uid,
+            workspace_id=resolved_workspace_id,
+            workspace_owner_id=ws_owner,
+            meta=meta,
+            conn=conn,
+        )
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    if conn is not None:
+        await require_team_reader(uid, conn=conn)
+    else:
+        await require_team_reader(uid)
 
     is_colleague_thread = bool(
         thread_owner
         and ws_owner
         and thread_owner != ws_owner
+        and _sharing_auth_enabled()
         and is_colleague_dispatch_enabled()
     )
 
@@ -1455,13 +1540,6 @@ async def require_thread_access(
     #    Read access is exempt from workspace revocation/deletion only on the web channel;
     #    Chief of Staff ('cos') still requires workspace access on 'cos'.
     if is_colleague_thread and uid == thread_owner:
-        caller_tier = (
-            await get_user_tier(uid, conn=conn)
-            if conn is not None
-            else await get_user_tier(uid)
-        )
-        if caller_tier == "external":
-            raise HTTPException(status_code=404, detail="Thread not found")
         if cleaned_need == "read" and cleaned_channel == "web":
             # Check workspace ownership and Home / stand-in status before the web
             # thread-initiator fast path, covering any pre-existing cross-user thread.

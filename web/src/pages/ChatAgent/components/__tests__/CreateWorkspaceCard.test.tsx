@@ -69,3 +69,96 @@ describe('CreateWorkspaceCard: always allow', () => {
     expect(screen.getByText('chat.createWorkspaceCard.decline').closest('button')).toBeDisabled();
   });
 });
+
+// DALTON-HOOK(cos-settings-tools): Batch 2 snapshot display, own-machine hiding, and 4-state rendering
+describe('CreateWorkspaceCard: target computer & 4-state lifecycle', () => {
+  it('displays the target computer name and hides Always allow for own machines', () => {
+    renderWithProviders(
+      <CreateWorkspaceCard
+        proposalData={{
+          ...PENDING,
+          computer_id: 'comp-mac-1',
+          computer_name: 'My Mac Studio',
+          computer_is_own_machine: true,
+        }}
+        onApprove={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('chat.createWorkspaceCard.targetComputer')).toBeInTheDocument();
+    expect(screen.queryByText('chat.createWorkspaceCard.alwaysApprove')).not.toBeInTheDocument();
+    expect(screen.getByText('chat.createWorkspaceCard.create')).toBeInTheDocument();
+    expect(screen.getByText('chat.createWorkspaceCard.decline')).toBeInTheDocument();
+  });
+
+  it('keeps buttons disabled in submitting state until tool result settles', () => {
+    renderWithProviders(
+      <CreateWorkspaceCard
+        proposalData={{
+          ...PENDING,
+          status: 'submitting',
+          computer_name: 'Cloud Box',
+          computer_is_own_machine: false,
+        }}
+        onApprove={vi.fn()}
+        onReject={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('chat.createWorkspaceCard.creating').closest('button')).toBeDisabled();
+    expect(screen.getByText('chat.createWorkspaceCard.alwaysApprove').closest('button')).toBeDisabled();
+    expect(screen.getByText('chat.createWorkspaceCard.decline').closest('button')).toBeDisabled();
+  });
+
+  it('renders approved, rejected, and failed (scope_changed) settled states distinctly', () => {
+    const { rerender } = renderWithProviders(
+      <CreateWorkspaceCard
+        proposalData={{
+          ...PENDING,
+          status: 'approved',
+          computer_name: 'Cloud Box',
+        }}
+      />,
+    );
+    expect(screen.getByTestId('proposal-settled')).toBeInTheDocument();
+    expect(screen.getByText('chat.createWorkspaceCard.createdOnComputer')).toBeInTheDocument();
+
+    rerender(
+      <CreateWorkspaceCard
+        proposalData={{
+          ...PENDING,
+          status: 'rejected',
+          computer_name: 'Cloud Box',
+        }}
+      />,
+    );
+    expect(screen.getByText('chat.createWorkspaceCard.declined')).toBeInTheDocument();
+
+    rerender(
+      <CreateWorkspaceCard
+        proposalData={{
+          ...PENDING,
+          status: 'failed',
+          computer_name: 'Cloud Box',
+          failure_code: 'scope_changed',
+          failure_error: '情况已变化，请重新发起',
+        }}
+      />,
+    );
+    expect(screen.getByText('chat.createWorkspaceCard.scopeChanged')).toBeInTheDocument();
+  });
+
+  it('uses newCloudComputer label when bootstrap_cloud_primary is true', () => {
+    renderWithProviders(
+      <CreateWorkspaceCard
+        proposalData={{
+          ...PENDING,
+          status: 'approved',
+          bootstrap_cloud_primary: true,
+        }}
+      />,
+    );
+    expect(screen.getByText('chat.createWorkspaceCard.createdOnComputer')).toBeInTheDocument();
+  });
+});

@@ -1,4 +1,5 @@
 import type { SessionCommandTargetKind } from "./commands.js";
+import type { WeixinPersistedAttachmentMeta } from "./channels/weixin/types.js";
 
 export type ChannelPlatform = "feishu" | "discord" | "weixin";
 
@@ -110,7 +111,7 @@ export function buildSurfaceRules(platform: ChannelPlatform): string {
     `The user is chatting with you from ${platform}.`,
     `- Keep replies concise and mobile-friendly.`,
     `- To send files (charts, PDFs, spreadsheets, reports) or extra messages into this conversation, call \`send_message(text=..., files=[...])\` with \`target\` omitted.`,
-    `- Do NOT paste local sandbox paths expecting the user to open them; attach the file via \`send_message(files=[...])\`.`,
+    `- When referencing a workspace file in text, write a Markdown link with a workspace-relative path such as [Report](results/report.md). The channel rewrites it into a web link that requires sign-in when a reachable web URL is configured; paths inside code blocks or backticks are sent as-is. When the user needs the file directly in this chat, attach it via \`send_message(files=[...])\`.`,
     `- Avoid wide Markdown tables (> 4 columns); use bullet lists or attach a file.`,
     `</surface_rules>`,
   ].join("\n");
@@ -222,6 +223,8 @@ export interface InboundChannelEvent {
   isGroupTrigger?: boolean;
   /** Inbound attachments on this message. */
   attachments?: InboundAttachmentDescriptor[];
+  /** Weixin `account_id` (`dalton_weixin_accounts.id`) when `platform === "weixin"`. */
+  weixinAccountId?: string;
   /** Weixin `context_token` when `platform === "weixin"`. */
   weixinContextToken?: string;
   /** Stable Weixin `ilink_bot_id` when `platform === "weixin"`. */
@@ -230,10 +233,27 @@ export interface InboundChannelEvent {
   weixinBotGeneration?: number;
   /** Protocol `seq` for Weixin context ordering. Platform time stays on `create_time_ms`. */
   weixinContextSeq?: number;
+  /** Weixin media decryption metadata sent separately to backend so backend encrypts it at rest. */
+  weixinMediaMeta?: WeixinPersistedAttachmentMeta[];
+  /** Unsupported iLink item type codes (e.g. merged-forward) observed on this inbound message (contract §5.1 int[]). */
+  unsupportedItemTypes?: number[];
   /** True when a Weixin voice message had no server-side text transcription. */
   voiceWithoutTranscription?: boolean;
   /** Arbitrary platform payload saved in `raw_payload`. */
   rawPayload?: Record<string, unknown>;
+}
+
+/**
+ * D16 one-time Weixin reply returned by backend after conflict auto-unbind or `/unbind` (contract §0 / §5.1).
+ * Dispatched directly with the inbound message's `context_token` without `preflight-send`.
+ */
+export interface OneTimeWeixinReplyEnvelope {
+  bot_token: string;
+  base_url: string;
+  ilink_bot_id: string;
+  recipient_id: string;
+  context_token: string;
+  text: string;
 }
 
 export type NativeInteractionAckOutcome = "acknowledged" | "failed" | "unknown";
@@ -346,7 +366,7 @@ export interface AgentSendRequest {
 
 export interface AgentSendFileOutcome {
   path: string;
-  status: "sent" | "linked" | "failed";
+  status: "sent" | "linked" | "failed" | "unknown";
   reason: string | null;
 }
 

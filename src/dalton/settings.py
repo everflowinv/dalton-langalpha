@@ -11,6 +11,7 @@ import hmac
 import ipaddress
 import logging
 import os
+import re
 import uuid
 from functools import lru_cache
 from pathlib import Path
@@ -417,6 +418,13 @@ class DaltonNetworkConfig(BaseModel):
         return normalized
 
 
+class DaltonWeixinConfig(BaseModel):
+    """Multi-account personal Weixin channel defaults (overridable via DB config / env)."""
+
+    allow_external: bool = True
+    max_concurrent_accounts: int = Field(default=200, ge=1, le=5000)
+
+
 class DaltonConfig(BaseModel):
     """Root Dalton behavioral configuration loaded from ``src/dalton/dalton.yaml``."""
 
@@ -457,6 +465,7 @@ class DaltonConfig(BaseModel):
         default_factory=DaltonConversationsConfig
     )
     network: DaltonNetworkConfig = Field(default_factory=DaltonNetworkConfig)
+    weixin: DaltonWeixinConfig = Field(default_factory=DaltonWeixinConfig)
 
 
 def _parse_env_pm_user_ids() -> list[str] | None:
@@ -941,6 +950,13 @@ def is_dalton_supabase_auth_enabled() -> bool:
     return app_settings.HOST_MODE == "oss" and get_dalton_auth_mode() == "supabase"
 
 
+def is_dalton_single_user_oss_mode() -> bool:
+    """显式单人回环模式：HOST_MODE == 'oss' 且 DALTON_AUTH_MODE == 'oss'。"""
+    from src.config import settings as app_settings
+
+    return app_settings.HOST_MODE == "oss" and get_dalton_auth_mode() == "oss"
+
+
 def is_dalton_auth_enabled() -> bool:
     """Whether Dalton multi-user authentication (``supabase`` or ``local``) is active in OSS mode."""
     return is_dalton_supabase_auth_enabled() or is_dalton_local_auth_enabled()
@@ -972,11 +988,7 @@ def is_dalton_multiuser_auth_enabled() -> bool:
     Used for public share link & artifact publish role checks independent of
     the colleague workspace sharing capability switch.
     """
-    if is_dalton_supabase_auth_enabled():
-        return True
-    from src.config import settings as app_settings
-
-    return app_settings.HOST_MODE == "oss" and get_dalton_auth_mode() == "local"
+    return is_dalton_supabase_auth_enabled() or is_dalton_local_auth_enabled()
 
 
 def get_disabled_providers() -> set[str]:
@@ -1253,6 +1265,72 @@ def redact_managed_tokens(text: Any) -> Any:
     for token in managed_secret_token_values():
         text = text.replace(token, "***")
     return text
+
+
+_WEIXIN_SECRET_KEYS: frozenset[str] = frozenset(
+    {
+        "bot_token",
+        "encrypted_bot_token",
+        "context_token",
+        "weixin_context_token",
+        "encrypted_weixin_context_token",
+        "qrcode",
+        "login_qrcode",
+        "encrypted_qrcode",
+        "qrcode_img_content",
+        "login_qrcode_img_content",
+        "verify_code",
+        "aes_key",
+        "aeskey",
+        "encrypt_query_param",
+        "cdn_key",
+        "weixin_media_meta",
+        "encrypted_weixin_media_meta",
+        "access_token",
+        "secret",
+        "password",
+    }
+)
+
+_WEIXIN_SECRET_KV_RE = re.compile(
+    r"""(?i)(?:"|')?\b(bot_token|context_token|weixin_context_token|qrcode|login_qrcode|verify_code|aes_?key|encrypt_query_param|access_token|x-service-token)\b(?:"|')?(\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,&;}\]]+)"""
+)
+
+
+def get_weixin_max_concurrent_accounts() -> int:
+    """Return the single-gateway max concurrent Weixin poller slot cap (default 200)."""
+    raw = os.getenv("DALTON_WEIXIN_MAX_CONCURRENT_ACCOUNTS", "").strip()
+    if raw:
+        try:
+            parsed = int(raw)
+            if 1 <= parsed <= 5000:
+                return parsed
+        except ValueError:
+            logger.warning(
+                "Invalid DALTON_WEIXIN_MAX_CONCURRENT_ACCOUNTS=%r; falling back to config default.",
+                raw,
+            )
+    return int(get_dalton_config().weixin.max_concurrent_accounts)
+
+
+def redact_weixin_secrets(value: Any) -> Any:
+    """Recursively redact Weixin credentials, QR tickets, verify codes, and CDN keys for logs."""
+    if isinstance(value, str):
+        scrubbed = redact_managed_tokens(value)
+        return _WEIXIN_SECRET_KV_RE.sub(r"\1\2***", scrubbed)
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            if str(k).strip().lower() in _WEIXIN_SECRET_KEYS:
+                out[k] = "***"
+            else:
+                out[k] = redact_weixin_secrets(v)
+        return out
+    if isinstance(value, list):
+        return [redact_weixin_secrets(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_weixin_secrets(item) for item in value)
+    return value
 
 
 def sanitize_sandbox_env_vars(

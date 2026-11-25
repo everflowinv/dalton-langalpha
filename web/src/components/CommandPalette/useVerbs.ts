@@ -5,6 +5,8 @@ import { useChatRoute } from '@/components/Sidebar/useChatRoute';
 import { toast } from '@/components/ui/use-toast';
 import { isDaltonAuth } from '@/config/daltonAuth'; // DALTON-HOOK(colleague-dispatch)
 import { useAllWorkspaces } from '@/hooks/useAllWorkspaces';
+import { useCallerIdentity } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(external-share-guard)
+import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(colleague-dispatch)
 // DALTON-HOOK(global-search): resolve home workspace when opening memo results
 import { homeWorkspaceQuery, resolveChatWorkspace, useHomeWorkspaceId } from '@/hooks/useHomeWorkspace';
 import { useLocale } from '@/hooks/useLocale';
@@ -33,10 +35,13 @@ import type { Workspace } from '@/types/api';
 import { fileHref, type Names, type NewWork, type ThreadRef, type Verbs } from './rows';
 
 /**
- * DALTON-HOOK(colleague-dispatch): Subscribe to user identity and team
+ * DALTON-HOOK(colleague-dispatch): Subscribe to unified caller identity and team
  * workspaces so palette permissions stay reactive instead of reading a stale cache snapshot.
  */
 export function usePaletteAccess() {
+  const identity = useCallerIdentity();
+  const { hasCapability } = useCapabilities();
+  const colleagueSharingEnabled = hasCapability('colleague_sharing');
   const { user: currentUser, isLoading: userLoading } = useUser({ enabled: isDaltonAuth });
   const {
     data: teamData,
@@ -45,20 +50,29 @@ export function usePaletteAccess() {
     isFetching: teamFetching,
   } = useTeamWorkspaces(isDaltonAuth);
   const currentUserId = isDaltonAuth ? (currentUser?.user_id ?? null) : undefined;
-  const callerTier = isDaltonAuth ? (teamData?.caller_tier ?? null) : undefined;
+  // DALTON-HOOK(external-share-guard): source caller tier from useCallerIdentity instead of /workspaces/team
+  const callerTier = identity.isPlatform
+    ? undefined
+    : identity.status === 'ready'
+      ? identity.tier
+      : 'unknown';
   const access = useNavAccessContext(currentUserId, callerTier);
+  const teamQueryActive =
+    !identity.isPlatform &&
+    (isDaltonAuth || identity.isMultiUserAuth) &&
+    identity.isInternal &&
+    colleagueSharingEnabled;
   const permissionsLoading =
-    isDaltonAuth &&
+    !identity.isPlatform &&
     Boolean(
-      userLoading ||
-        teamPending ||
-        teamLoading ||
-        (!teamData && teamFetching),
+      identity.status === 'loading' ||
+        (isDaltonAuth && userLoading) ||
+        (teamQueryActive && (teamPending || teamLoading || (!teamData && teamFetching))),
     );
 
   const teamWorkspaceById = new Map<string, Workspace>();
-  // DALTON-HOOK(external-share-guard): do not surface colleague workspaces while loading or for external members.
-  if (!permissionsLoading && teamData?.caller_tier !== 'external') {
+  // DALTON-HOOK(external-share-guard): do not surface colleague workspaces while loading, for external/unknown members, or when colleague_sharing is off.
+  if (!permissionsLoading && identity.isInternal && colleagueSharingEnabled) {
     for (const member of teamData?.members ?? []) {
       if (currentUser?.user_id && member.user_id === currentUser.user_id) continue;
       for (const ws of member.workspaces) {

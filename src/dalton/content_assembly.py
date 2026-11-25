@@ -431,6 +431,21 @@ def assemble_json_text(
             doc["sources"] = sources_copy
             return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
+    if path_str.endswith("/dalton-thesis-delta/config/default-thresholds.json") or (
+        path_str == "dalton-thesis-delta/config/default-thresholds.json"
+    ):
+        bridge_on = CapabilityId.RESEARCHDATA_BRIDGE in active_caps
+        ae_on = CapabilityId.ALPHAENGINE in active_caps
+        if bridge_on and ae_on:
+            return text
+        doc = json.loads(text)
+        if isinstance(doc, dict):
+            # Core-visible skill config must stay free of proprietary source names;
+            # inject a neutral boolean flag read by collect.py (same backend-assembled
+            # config channel as dalton-bullbear-tracker).
+            doc["_skip_sellside_library"] = True
+            return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
+
     return text
 
 

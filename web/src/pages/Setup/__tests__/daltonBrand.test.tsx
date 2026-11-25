@@ -77,6 +77,18 @@ vi.mock('@/hooks/useAccount', async () => {
 
 vi.mock('@/hooks/useTeamCredentials', () => ({
   TEAM_SHARED_CREDENTIALS_HINT: '团队共用：在这里连接后全队都能使用',
+  fetchTeamCredentialsStatus: vi.fn(async () => ({
+    sharing: 'off',
+    enabled: false,
+    holder_user_id: null,
+    credential_user_id: 'u-ext-1',
+    is_pm: false,
+    can_disconnect: true,
+    can_invite: false,
+    caller_tier: null,
+    colleague_sharing_enabled: false,
+    auth_mode: 'oss',
+  })),
   useTeamCredentials: () => ({
     isShared: false,
     canDisconnect: true,

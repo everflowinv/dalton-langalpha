@@ -1,22 +1,44 @@
-"""Container-side client for the host `researchdata_bridge` `/embed` endpoint.
+"""Conversation archive embedding client (backend direct default + bridge rollback switch).
 
-Dalton containers never hold `GEMINI_API_KEY`; all embedding calls route over
-`host.docker.internal` to `scripts/dalton/researchdata_bridge.py` (`POST /embed`
-authenticated via request headers), which delegates to the host embedding
-configuration (`gemini-embedding-2-preview` label, called as `gemini-embedding-2`,
-3072 dimensions).
+By default, embedding calls run directly in the backend via
+``src.dalton.embeddings`` (Gemini / OpenAI, honoring ``dalton_embedding_metadata``
+and separating stored ``model_label`` from upstream ``api_model_name``).
+
+Setting ``DALTON_EMBED_VIA_BRIDGE=true`` activates emergency rollback to the
+legacy host ``researchdata_bridge`` ``POST /embed`` endpoint.
 """
 
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import logging
+import os
 import re
 import urllib.error
 import urllib.request
 from typing import Any
 
+from src.dalton.embeddings import (
+    DEFAULT_EVERFLOW_PROVIDER,
+    DEFAULT_TASK_TYPE_DOC,
+    DEFAULT_TASK_TYPE_QUERY,
+    EmbeddingConfig,
+    EmbeddingMetadata,
+    EmbeddingMetadataMismatchError,
+    embed_query_direct,
+    embed_texts_direct,
+    ensure_conversation_embedding_schema,
+    get_embedding_metadata,
+    is_embed_via_bridge_enabled,
+    is_metadata_db_unavailable_error,
+    resolve_embedding_config,
+    validate_bridge_embedding_match,
+    validate_bridge_task_types,
+    validate_embedding_metadata_match,
+    validate_embedding_task_type,
+)
 from src.dalton.settings import (
     get_dalton_bridge_admin_token,
     get_dalton_bridge_embed_url,
@@ -181,27 +203,250 @@ async def embed_texts_via_bridge(
     return all_vecs, model_used
 
 
+async def _read_locked_metadata_if_available(
+    *,
+    conn: Any = None,
+) -> EmbeddingMetadata | None:
+    """Read locked ``dalton_embedding_metadata`` when the DB pool/table is available.
+
+    Only swallows ``UndefinedTable`` or an uninitialized test pool; never swallows
+    ``EmbeddingMetadataMismatchError`` or unexpected database errors.
+    """
+    try:
+        return await get_embedding_metadata(conn=conn)
+    except Exception as exc:
+        if is_metadata_db_unavailable_error(exc):
+            logger.debug(
+                "[dalton.conversations.embed] metadata lookup skipped (db unavailable: %s)",
+                type(exc).__name__,
+            )
+            return None
+        raise
+
+
+async def _ensure_embedding_schema_if_available(
+    cfg: EmbeddingConfig,
+    *,
+    conn: Any = None,
+) -> EmbeddingMetadata | None:
+    """Align column/HNSW index and lock ``dalton_embedding_metadata`` when DB is available."""
+    try:
+        return await ensure_conversation_embedding_schema(cfg, conn=conn)
+    except EmbeddingMetadataMismatchError:
+        raise
+    except Exception as exc:
+        if is_metadata_db_unavailable_error(exc):
+            logger.debug(
+                "[dalton.conversations.embed] schema ensure skipped (db unavailable: %s)",
+                type(exc).__name__,
+            )
+            return None
+        raise
+
+
+async def _ensure_bridge_compatible_before_call(
+    *,
+    task_type_override: str | None = None,
+    conn: Any = None,
+) -> EmbeddingMetadata | None:
+    """Validate that locked metadata (or effective config when unlocked) matches legacy bridge constraints.
+
+    Rejects bridge usage before sending any HTTP request when provider or doc/query
+    task types deviate from the legacy Gemini ``RETRIEVAL_DOCUMENT`` /
+    ``RETRIEVAL_QUERY`` contract.
+    """
+    locked = await _read_locked_metadata_if_available(conn=conn)
+    env_doc = str(os.getenv("DALTON_EMBEDDING_TASK_TYPE_DOC") or "").strip().upper()
+    env_query = str(os.getenv("DALTON_EMBEDDING_TASK_TYPE_QUERY") or "").strip().upper()
+
+    if locked is not None:
+        if locked.provider != DEFAULT_EVERFLOW_PROVIDER:
+            raise EmbeddingMetadataMismatchError(
+                f"Bridge embedding provider mismatch for scope={locked.scope!r}: "
+                f"bridge={DEFAULT_EVERFLOW_PROVIDER!r} != locked={locked.provider!r}"
+            )
+        validate_bridge_task_types(
+            task_type_doc=locked.task_type_doc,
+            task_type_query=locked.task_type_query,
+            scope=locked.scope,
+        )
+        eff_doc = (
+            str(task_type_override).strip().upper()
+            if task_type_override is not None
+            else (env_doc or locked.task_type_doc)
+        )
+        eff_query = env_query or locked.task_type_query
+        validate_bridge_task_types(
+            task_type_doc=eff_doc,
+            task_type_query=eff_query,
+            scope=locked.scope,
+        )
+        return locked
+
+    cfg = resolve_embedding_config()
+    eff_doc = (
+        str(task_type_override).strip().upper()
+        if task_type_override is not None
+        else cfg.task_type_doc
+    )
+    validate_bridge_task_types(
+        task_type_doc=eff_doc,
+        task_type_query=cfg.task_type_query,
+    )
+    return None
+
+
+async def _embed_query_via_bridge_with_model(
+    query: str,
+    *,
+    timeout_s: float = 60.0,
+    embed_url: str | None = None,
+    bridge_token: str | None = None,
+    conn: Any = None,
+) -> tuple[list[float] | None, str | None]:
+    """Embed a single query via bridge, validating task types, model & dimensions against locked metadata."""
+    q = (query or "").strip()
+    if not q:
+        return None, None
+    locked = await _ensure_bridge_compatible_before_call(conn=conn)
+    try:
+        vecs, model_used = await embed_texts_via_bridge(
+            [q],
+            task_type=DEFAULT_TASK_TYPE_QUERY,
+            timeout_s=timeout_s,
+            embed_url=embed_url,
+            bridge_token=bridge_token,
+            retry=False,
+        )
+    except EmbeddingMetadataMismatchError:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "[dalton.conversations.embed] query embed unavailable (%s); falling back to keyword arm",
+            type(exc).__name__,
+        )
+        return None, None
+
+    vec = vecs[0] if vecs else None
+    if vec is not None:
+        if locked is None:
+            locked = await _read_locked_metadata_if_available(conn=conn)
+        if locked is not None:
+            validate_bridge_embedding_match(
+                model_used,
+                len(vec),
+                locked,
+                task_type_doc=DEFAULT_TASK_TYPE_DOC,
+                task_type_query=DEFAULT_TASK_TYPE_QUERY,
+            )
+    return vec, model_used
+
+
 async def embed_query_via_bridge(
     query: str,
     *,
     timeout_s: float = 60.0,
     embed_url: str | None = None,
     bridge_token: str | None = None,
+    conn: Any = None,
 ) -> list[float] | None:
     """Embed a single search query via the host bridge (`task_type='RETRIEVAL_QUERY'`)."""
+    vec, _ = await _embed_query_via_bridge_with_model(
+        query,
+        timeout_s=timeout_s,
+        embed_url=embed_url,
+        bridge_token=bridge_token,
+        conn=conn,
+    )
+    return vec
+
+
+async def embed_texts(
+    texts: list[str],
+    *,
+    task_type: str | None = None,
+    timeout_s: float = 120.0,
+    retry: bool = True,
+    conn: Any = None,
+) -> tuple[list[list[float]], str]:
+    """Embed ``texts`` via direct backend client, or via host bridge when ``DALTON_EMBED_VIA_BRIDGE=true``."""
+    if is_embed_via_bridge_enabled():
+        locked = await _ensure_bridge_compatible_before_call(
+            task_type_override=task_type,
+            conn=conn,
+        )
+        vecs, model_used = await embed_texts_via_bridge(
+            texts,
+            task_type=DEFAULT_TASK_TYPE_DOC,
+            timeout_s=timeout_s,
+            retry=retry,
+        )
+        if locked is None:
+            locked = await _read_locked_metadata_if_available(conn=conn)
+        if locked is not None:
+            vec_len = len(vecs[0]) if vecs else None
+            validate_bridge_embedding_match(
+                model_used,
+                vec_len,
+                locked,
+                task_type_doc=DEFAULT_TASK_TYPE_DOC,
+                task_type_query=DEFAULT_TASK_TYPE_QUERY,
+            )
+        return vecs, model_used
+
+    cfg = resolve_embedding_config()
+    eff_task_type = validate_embedding_task_type(
+        cfg.task_type_doc if task_type is None else task_type,
+        provider=cfg.provider,
+        source="task_type",
+    )
+    effective_cfg = (
+        cfg if eff_task_type == cfg.task_type_doc else replace(cfg, task_type_doc=eff_task_type)
+    )
+    locked = await _read_locked_metadata_if_available(conn=conn)
+    if locked is not None:
+        validate_embedding_metadata_match(effective_cfg, locked)
+    vecs, model_label = await embed_texts_direct(
+        texts,
+        task_type=eff_task_type,
+        config=effective_cfg,
+        timeout_s=timeout_s,
+        retry=retry,
+    )
+    if texts:
+        await _ensure_embedding_schema_if_available(effective_cfg, conn=conn)
+    return vecs, model_label
+
+
+async def embed_query(
+    query: str,
+    *,
+    timeout_s: float = 60.0,
+    conn: Any = None,
+) -> list[float] | None:
+    """Embed a single search query via direct backend client (or bridge rollback switch)."""
     q = (query or "").strip()
     if not q:
         return None
+    if is_embed_via_bridge_enabled():
+        return await embed_query_via_bridge(q, timeout_s=timeout_s, conn=conn)
+
+    cfg = resolve_embedding_config()
+    locked = await _read_locked_metadata_if_available(conn=conn)
+    if locked is not None:
+        validate_embedding_metadata_match(cfg, locked)
     try:
-        vecs, _ = await embed_texts_via_bridge(
-            [q],
-            task_type="RETRIEVAL_QUERY",
+        return await embed_query_direct(
+            q,
+            config=cfg,
             timeout_s=timeout_s,
-            embed_url=embed_url,
-            bridge_token=bridge_token,
             retry=False,
         )
-        return vecs[0] if vecs else None
+    except EmbeddingMetadataMismatchError:
+        raise
     except Exception as exc:
-        logger.warning("[dalton.conversations.embed] query embed unavailable (%s); falling back to keyword arm", type(exc).__name__)
+        logger.warning(
+            "[dalton.conversations.embed] direct query embed unavailable (%s); falling back to keyword arm",
+            type(exc).__name__,
+        )
         return None

@@ -28,6 +28,8 @@ import { isDesktopShell } from '@/lib/desktop';
 import { isImeComposing } from '@/lib/ime';
 // DALTON-HOOK(colleague-dispatch): read cached user and team workspace permissions for sidebar row gating
 import { queryKeys } from '@/lib/queryKeys';
+// DALTON-HOOK(external-share-guard): unified caller identity for nav row gating
+import { useCallerIdentity } from '@/hooks/useCallerIdentity';
 import { cn } from '@/lib/utils';
 import { HoverCard, HoverCardContent, HoverCardTrigger } from '../../../components/ui/hover-card';
 import { mediumDate, relativeTime } from '@/lib/format';
@@ -297,7 +299,8 @@ export function AgentRow({ agent, isSelected, isMobile, onSelectAgent, onRemoveA
         <button
           data-nav-key={`agent:${agent.id}:remove`}
           onClick={(e) => { e.stopPropagation(); onRemoveAgent?.(agent.id); }}
-          className={`shrink-0 p-0 bg-transparent border-none cursor-pointer transition-opacity ${isMobile ? 'opacity-60' : 'opacity-0 group-hover:opacity-100'}`}
+          // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on subagent remove icon
+          className={`tap-target shrink-0 p-0 bg-transparent border-none cursor-pointer transition-opacity ${isMobile ? 'opacity-60' : 'opacity-0 group-hover:opacity-100'}`}
           title={t('nav.removeAgent')}
         >
           <X className="h-3 w-3" style={{ color: 'var(--color-text-tertiary)' }} />
@@ -373,7 +376,10 @@ export function resolveNavWorkspacePermissions(
       (wsOwnerId && currentUserId && wsOwnerId !== currentUserId) ||
       matchedTeamWs,
   );
-  const isIsolatedExternal = Boolean(callerTier === 'external' && isColleagueWorkspace);
+  // DALTON-HOOK(external-share-guard): treat unknown caller tier fail-closed alongside external on colleague workspaces
+  const isIsolatedExternal = Boolean(
+    (callerTier === 'external' || callerTier === 'unknown') && isColleagueWorkspace,
+  );
   if (isIsolatedExternal) {
     return {
       isColleagueWorkspace: true,
@@ -448,8 +454,9 @@ export function resolveNavThreadPermissions(
         wsOwnerId &&
         effectiveThreadOwnerId !== wsOwnerId),
   );
+  // DALTON-HOOK(external-share-guard): treat unknown caller tier fail-closed alongside external on colleague/foreign threads
   const isIsolatedExternal = Boolean(
-    callerTier === 'external' &&
+    (callerTier === 'external' || callerTier === 'unknown') &&
       (isColleagueWorkspace ||
         isForeignThread ||
         (wsOwnerId && (!currentUserId || wsOwnerId !== currentUserId)) ||
@@ -518,18 +525,20 @@ export function resolveNavThreadPermissions(
     isDispatcherOwnThread: false,
     isIsolatedExternal: false,
     canMutateThread: true,
-    // DALTON-HOOK(external-share-guard): external members cannot start public thread sharing, only close an existing share
-    canShareThread: callerTier === 'external' ? Boolean(thread?.is_shared) : true,
+    // DALTON-HOOK(external-share-guard): external and unknown-tier members cannot start public thread sharing, only close an existing share
+    canShareThread: callerTier === 'external' || callerTier === 'unknown' ? Boolean(thread?.is_shared) : true,
     canCopyOrOpen: true,
   };
 }
 
 // DALTON-HOOK(colleague-dispatch): the command palette reads the same cached caller and team permissions as the sidebar
+// DALTON-HOOK(external-share-guard): default callerTier comes from useCallerIdentity instead of /workspaces/team
 export function useNavAccessContext(
   currentUserIdProp?: string | null,
   callerTierProp?: string | null,
 ): NavAccessContext {
   const queryClient = useContext(QueryClientContext);
+  const identity = useCallerIdentity();
   const cachedUser = queryClient?.getQueryData<User | { user?: User }>(queryKeys.user.me());
   const resolvedUser = (
     cachedUser && typeof cachedUser === 'object' && 'user' in cachedUser
@@ -539,11 +548,16 @@ export function useNavAccessContext(
   const cachedTeam = queryClient?.getQueryData<TeamWorkspacesResponse>(
     queryKeys.workspaces.team(),
   );
+  const resolvedIdentityTier = identity.isPlatform
+    ? null
+    : identity.status === 'ready'
+      ? identity.tier
+      : 'unknown';
   return {
     currentUserId:
       currentUserIdProp !== undefined ? currentUserIdProp : (resolvedUser?.user_id ?? null),
     callerTier:
-      callerTierProp !== undefined ? callerTierProp : (cachedTeam?.caller_tier ?? null),
+      callerTierProp !== undefined ? callerTierProp : resolvedIdentityTier,
     colleagueDispatchEnabled: cachedTeam?.colleague_dispatch_enabled,
     teamMembers: cachedTeam?.members,
   };
@@ -764,7 +778,8 @@ function ThreadTreeRowImpl({
           <HoverCardTrigger asChild>
             <ContextMenuTrigger asChild disabled={renaming || !canOpenMenu}>
               <div
-                className={`nav-panel-row group relative ${isCurrentThread ? 'nav-panel-row-active' : ''}${menuOpen ? ' is-menu-open' : ''}`}
+                // DALTON-HOOK(mobile-web): mark thread rows so touch layout shows inline actions and hides resting pins
+                className={`nav-panel-row nav-panel-thread-row group relative ${isCurrentThread ? 'nav-panel-row-active' : ''}${menuOpen ? ' is-menu-open' : ''}`}
                 style={{ paddingLeft: 28 }}
                 onClick={activateRow}
               >
@@ -801,7 +816,8 @@ function ThreadTreeRowImpl({
                       type="button"
                       data-nav-key={`thread:${tid}:agents`}
                       onClick={(e) => { e.stopPropagation(); onToggleThread(tid); }}
-                      className={`shrink-0 flex items-center p-0 bg-transparent border-none cursor-pointer ${isMobile ? '' : 'opacity-0 group-hover:opacity-100 transition-opacity'}`}
+                      // DALTON-HOOK(mobile-web): size coarse-pointer touch target on thread agents toggle to 36px and keep visible on touch tablets without hover
+                      className={`nav-panel-action-btn nav-panel-agents-toggle tap-target shrink-0 flex items-center justify-center p-0 bg-transparent border-none cursor-pointer ${isMobile ? '' : 'opacity-0 group-hover:opacity-100 transition-opacity'}`}
                       aria-label={t(isExpanded ? 'nav.collapseAgents' : 'nav.expandAgents')}
                     >
                       <ChevronRight
@@ -817,20 +833,23 @@ function ThreadTreeRowImpl({
                   {isPinned && !isMobile && (
                     <Pin
                       aria-hidden
-                      className={`h-3 w-3 ${colleague || sharedMark ? '' : 'ml-auto '}shrink-0 transition-opacity group-hover:opacity-0`}
+                      // DALTON-HOOK(mobile-web): hide resting pin marker when touch row actions stay visible inline
+                      className={`nav-panel-resting-pin h-3 w-3 ${colleague || sharedMark ? '' : 'ml-auto '}shrink-0 transition-opacity group-hover:opacity-0`}
                       fill="currentColor"
                       style={{ color: 'var(--color-text-quaternary)' }}
                     />
                   )}
                   {/* DALTON-HOOK(colleague-dispatch): gate hover pin and archive buttons by thread permission */}
+                  {/* DALTON-HOOK(mobile-web): non-overlapping touch action cluster on mobile and coarse pointers */}
                   {(effectivePinThread || effectiveArchiveThread) && (
-                    <div className={isMobile ? 'flex items-center gap-0.5 ml-auto shrink-0' : 'nav-panel-row-actions'}>
+                    <div className={isMobile ? 'nav-panel-row-actions-mobile nav-panel-row-action-pair flex items-center gap-0.5 ml-auto shrink-0' : 'nav-panel-row-actions nav-panel-row-action-pair'}>
                       {effectivePinThread && (
                         <button
                           type="button"
                           data-nav-key={`thread:${tid}:pin`}
                           onClick={(e) => { e.stopPropagation(); effectivePinThread(wsId, tid, !isPinned); }}
-                          className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-bg-hover) press"
+                          // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on thread pin button without overlapping archive
+                          className="nav-panel-action-btn tap-target flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-bg-hover) press"
                           title={isPinned ? t('nav.unpinThread') : t('nav.pinThread')}
                           aria-label={isPinned ? t('nav.unpinThread') : t('nav.pinThread')}
                         >
@@ -848,7 +867,8 @@ function ThreadTreeRowImpl({
                           type="button"
                           data-nav-key={`thread:${tid}:archive`}
                           onClick={(e) => { e.stopPropagation(); effectiveArchiveThread(wsId, tid); }}
-                          className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-bg-hover) press"
+                          // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on thread archive button without overlapping pin
+                          className="nav-panel-action-btn tap-target flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-bg-hover) press"
                           title={t('nav.archiveThread')}
                           aria-label={t('nav.archiveThread')}
                         >
@@ -1053,7 +1073,8 @@ function WorkspaceTreeRowImpl({
           <ContextMenuTrigger asChild disabled={!showWsMenu || isRenaming}>
             <div
               data-nav-key="header"
-              className={`nav-panel-row group${menuOpen ? ' is-menu-open' : ''}`}
+              // DALTON-HOOK(mobile-web): mark workspace rows so touch inline action layout does not alter coverage-tree sector rows
+              className={`nav-panel-row nav-panel-workspace-row group${menuOpen ? ' is-menu-open' : ''}`}
               style={{ paddingLeft: 10, position: 'relative' }}
               onClick={handleRowClick}
               {...(isRenaming ? {} : dragHandleProps)}
@@ -1096,7 +1117,7 @@ function WorkspaceTreeRowImpl({
                       // DALTON-HOOK(ui-unify): bracketed chip in Terminal style
                       data-bracket="chip"
                       title={coverageChip}
-                      className="shrink-0 max-w-32 truncate rounded-full border px-1.5 py-0.5 text-[10px]"
+                      className="nav-panel-coverage-chip shrink-0 max-w-32 truncate rounded-full border px-1.5 py-0.5 text-[10px]"
                       style={{ borderColor: 'var(--color-border-muted)', color: 'var(--color-text-tertiary)' }}
                     >
                       {coverageChip}
@@ -1110,7 +1131,7 @@ function WorkspaceTreeRowImpl({
                   {/* Chevron + row actions float over the name's tail on hover
                       (as thread rows do), so the name keeps the full row width
                       instead of truncating around controls that are not showing. */}
-                  <div className={isMobile ? `flex items-center gap-0.5 ${unreadMark ? '' : 'ml-auto '}shrink-0` : 'nav-panel-row-actions'}>
+                  <div className={isMobile ? `nav-panel-row-actions-mobile flex items-center gap-0.5 ${unreadMark ? '' : 'ml-auto '}shrink-0` : 'nav-panel-row-actions'}>
                     <span className="shrink-0 flex items-center">
                       <ChevronRight
                         className={`${CHEVRON_CLASS}${isExpanded ? ' rotate-90' : ''}`}
@@ -1121,14 +1142,15 @@ function WorkspaceTreeRowImpl({
                         Hover-revealed on desktop, always shown on touch.
                         DALTON-HOOK(colleague-dispatch): gate new-thread and workspace options menu */}
                     {(effectiveNewThread || showWsMenu) && (
-                      <div className="flex items-center gap-0.5 shrink-0">
+                      <div className="nav-panel-row-action-pair flex items-center gap-0.5 shrink-0">
                         {effectiveNewThread && (
                           <button
                             type="button"
                             data-nav-key="new-thread"
                             onPointerDown={(e) => e.stopPropagation()}
                             onClick={(e) => { e.stopPropagation(); effectiveNewThread(wsId); }}
-                            className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-border-muted)"
+                            // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on workspace new-thread button without overlapping options
+                            className="nav-panel-action-btn tap-target flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-border-muted)"
                             title={t('nav.newThread')}
                             aria-label={t('nav.newThread')}
                           >
@@ -1143,7 +1165,8 @@ function WorkspaceTreeRowImpl({
                                 data-nav-key="options"
                                 onPointerDown={(e) => e.stopPropagation()}
                                 onClick={(e) => e.stopPropagation()}
-                                className="flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-border-muted)"
+                                // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on workspace options trigger without overlapping new-thread
+                                className="nav-panel-action-btn tap-target flex items-center justify-center p-0.5 rounded bg-transparent border-none cursor-pointer hover:bg-(--color-border-muted)"
                                 title={t('workspace.options')}
                                 aria-label={t('workspace.options')}
                               >
