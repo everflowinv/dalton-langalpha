@@ -4778,11 +4778,14 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
     assert sent_3 == 0
     assert connect_record["started"] is True
     assert connect_record["cancelled"] is False
+    # R12 (Codex #3 / Grok med): Gateway HTTP read timeout is floored to
+    # GATEWAY_DELIVERY_READ_TIMEOUT_S (240s) even when remaining scan budget is smaller,
+    # while connect timeout remains capped at 5.0s.
     assert connect_record["timeout"] == {
-        "connect": pytest.approx(2.5),
-        "read": pytest.approx(2.5),
-        "write": pytest.approx(2.5),
-        "pool": pytest.approx(2.5),
+        "connect": pytest.approx(5.0),
+        "read": pytest.approx(ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S),
+        "write": pytest.approx(ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S),
+        "pool": pytest.approx(ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S),
     }
     assert db_row["status"] == "failed"
     assert db_row["error_code"] == "ConnectTimeout"
@@ -4912,10 +4915,10 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
     assert db_row["attempt_count"] == 2
 
     # -------------------------------------------------------------------------
-    # 5. `preflight.decide` reserves explicit headroom (`max_duration_s=26.0` inside `timeout=30.0`)
+    # 5. `preflight.decide` reserves explicit headroom above GATEWAY_DELIVERY_READ_TIMEOUT_S (240s)
     # -------------------------------------------------------------------------
-    assert preflight_mod.PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S == 30.0
-    assert preflight_mod.PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S == 26.0
+    assert preflight_mod.PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S == ct_mod.GATEWAY_DELIVERY_READ_TIMEOUT_S + 10.0
+    assert preflight_mod.PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S == preflight_mod.PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S + 4.0
     assert (
         preflight_mod.PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S
         - preflight_mod.PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S
@@ -4945,7 +4948,7 @@ async def test_retry_remaining_budget_and_native_request_timeout_classification(
     assert observed_retry_kwargs == [
         {
             "limit": 5,
-            "max_duration_s": 26.0,
+            "max_duration_s": preflight_mod.PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S,
         }
     ]
 

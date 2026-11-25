@@ -7,7 +7,9 @@
 ## 0. 公共约定
 
 - **路由前缀**：除特别标明「后端 → 网关」外，全部挂载于 `/api/v1/dalton/channels/internal/*`。
-- **服务鉴权**：全部内部接口要求请求头 `X-Service-Token: <INTERNAL_SERVICE_TOKEN>`（不匹配返回 `401`）。所有接口均不接受用户 JWT。网关 `GET /health` 同样要求 `X-Service-Token`。
+- **服务鉴权与网关就绪探活**：全部内部接口要求请求头 `X-Service-Token: <INTERNAL_SERVICE_TOKEN>`（不匹配返回 `401`）。所有接口均不接受用户 JWT。
+  - 网关 `GET /health` 同样要求 `X-Service-Token`，用于区分「进程已监听」与「业务已就绪」：返回 `200 {"ok": true, "ready": bool, ...}`，其中 `ready: true` 表示已完成租约获取、启动恢复与账号快照加载、不再对业务请求返回 `503 gateway_starting`。
+  - 独立部署升级脚本（`scripts/standalone/upgrade.sh`）探活以**业务就绪**为准：优先检查 `/health` 的 `ready` 布尔字段（`ready: false` 视为未就绪继续轮询）；若网关版本未返回 `ready` 字段，则追加探测只读接口 `GET /agent/settings` 并要求返回 `200`（`503 gateway_starting` 视为未就绪）。
 - **能力门控**：总能力 `CapabilityId.CHANNEL_GATEWAY` 关闭时全部返回 `404`；微信专属接口及目标平台解析为 `weixin` 的共享接口额外要求 `CapabilityId.CHANNEL_WEIXIN` 开启（关闭返回 `404`）。
 - **错误响应格式**：结构化错误返回 JSON `{"code": "<error_code>", "message": "<human_message>", ...}`（HTTP `400`/`401`/`403`/`404`/`409`/`422`/`503`）。
 - **`X-Gateway-Epoch` 租约围栏规则（集中于 `verify_gateway_epoch_in_tx`）**：
@@ -308,8 +310,10 @@
 - **网关进程内退避重试上限与后端调用超时协同常量**：
   - **单次投递预检重试总时长上限**：固定为 **`180s`（3 分钟，后端常量 `WEIXIN_PREFLIGHT_RETRY_BUDGET_SECONDS = 180`）**，整笔投递（跨全部分片与附件）共享该总预算（指数退避如 2s → 4s → 8s → 16s → 30s 封顶），后端不落库暂缓状态、投递行保持 `in_flight`；超预算仍未恢复时，网关通过 I-7 上报终态 `status: "failed"`（若已有部分分段送出则按既有分段语义上报 `partial` 或 `unknown`）。
   - **网关实际取值**：网关常量 `WEIXIN_PREFLIGHT_RETRY_MAX_ELAPSED_MS = 35000`（35s），在上述 180s 上限之内；重试用尽时 I-7 的 `error_code` 填最后一次可重试的根因（如 `roster_lookup_error`），并附可选字段 `error_detail: "preflight_deadline_exceeded"`。后端 I-7 请求模型允许额外字段，当前只记录 `error_code`。
-  - **后端调用网关读超时（严格大于 `180s` 并留 60s 余量）**：
-    - `src/dalton/notify/channel_transport.py`：`GATEWAY_DELIVERY_READ_TIMEOUT_S = 240.0`（`post_data_task_gateway_notify`、`post_automation_gateway_notify` 默认读超时 `max(240.0, get_notify_http_timeout_s() * 2.5)`）
+  - **后端调用网关读超时（统一共享下限 `GATEWAY_DELIVERY_READ_TIMEOUT_S = 240.0`，严格大于 `180s` 契约上限与 `35s` 网关实际期限并留足余量）**：
+    - `src/dalton/notify/channel_transport.py`：共享常量 `WEIXIN_PREFLIGHT_RETRY_BUDGET_SECONDS = 180`、`GATEWAY_DELIVERY_READ_TIMEOUT_S = 240.0` 及 `resolve_gateway_delivery_read_timeout_s(timeout_s)`；`dispatch_data_task_target_via_gateway`、`post_data_task_gateway_notify`、`post_automation_gateway_notify` 无论调用方是否显式传入更短的 `timeout_s`，实际读超时一律满足 `>= 240.0s`（未传时为 `max(240.0, get_notify_http_timeout_s() * 2.5)`）；
+    - `src/dalton/notify/dispatch.py`：自动化报告发送（`_report_dispatch_timeout_s` / `dispatch_automation_report`）与失败补发循环（`retry_failed_notify_deliveries`，默认 `max_duration_s = 250.0`）对网关调用的显式 `timeout_s` 与外层 `asyncio.wait_for` 均以 `resolve_gateway_delivery_read_timeout_s(...)` 抬升至 `>= 240.0s`；
+    - `src/dalton/autonomy/preflight.py`：预检触发的补发扫描预算 `PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S = 250.0`、外层 `PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S = 254.0`（保留 `4.0s` DB 落账余量）；
     - `src/tools/messaging/tools.py`：`_SEND_TIMEOUT = httpx.Timeout(240.0, connect=5.0)`
 - **错误**：`404`（能力关闭）、`409 stale_gateway_epoch`
 
@@ -351,7 +355,11 @@
 
 ### 6.4 I-7 (2)：`POST /internal/inbound/progress`
 
-- **请求头**：`X-Service-Token`；**平台以数据库实际记录为准**——首次写入时按 `dalton_channel_thread_watches (FOR SHARE)` → `dalton_channel_background_runs (FOR SHARE)` → `dalton_channel_inbound_events (by thread_id/run_id)` → **`conversation_threads.platform (FOR SHARE)`**（及 `conversation_responses JOIN conversation_threads FOR SHARE OF ct`）顺序推导权威平台，仅在以上均未命中且 `(platform, message_id)` 不与目标 `thread_id`/`run_id` 冲突时才参考该入站行，避免无关飞书入站记录掩盖已持久化的微信线程。仅传 `session_interrupt_update` 时亦先对 `dalton_channel_thread_watches` 取 `FOR UPDATE` 读出库内平台再校验微信 `X-Gateway-Epoch` 与平台一致性；写入在 `ON CONFLICT DO UPDATE` 上附加 `WHERE <table>.platform = EXCLUDED.platform`，微信行并发冲突一律返回 `409 platform_mismatch` 或 `409 stale_gateway_epoch` 并回滚整笔事务。飞书 / Discord 合法请求可省略 `X-Gateway-Epoch`。
+- **请求头**：`X-Service-Token`；**平台以数据库实际记录为准，加锁顺序严格为「会话 → 监听」**——
+  - 预检查不对 `dalton_channel_thread_watches` / `dalton_channel_background_runs` 取锁，避免与 `unbind_weixin_account`（`session_generations → thread_watches`）或并发写升锁形成死锁；
+  - 首次写入按 `dalton_channel_thread_watches (无锁)` → **`conversation_threads.platform (FOR SHARE)`** → `dalton_channel_inbound_events (by thread_id)` → `dalton_channel_background_runs / inbound_events / conversation_responses (仅采用 thread_id 等于请求目标线程的记录)` 顺序推导权威平台，最后仅在 `(platform, message_id)` 已明确绑定到目标 `thread_id`/`run_id` 时才参考（绝不采用另一线程的运行或未绑定入站行）；
+  - 写入 `session_interrupt_update` 时先通过 `_lock_or_create_session_row` 锁 `dalton_channel_session_generations (FOR UPDATE)`，再对 `dalton_channel_thread_watches` 取 `FOR UPDATE` 并核对库内平台与微信 `X-Gateway-Epoch`；若仅提交 `session_interrupt_update` 且省略 `platform`、预查未命中，则按 `thread_id` 锁监听行读取平台，仍读不到返回 `400 missing_platform`（不再 `500`）；
+  - 写入在 `ON CONFLICT DO UPDATE` 上附加 `WHERE <table>.platform = EXCLUDED.platform`，微信行并发冲突一律返回 `409 platform_mismatch` 或 `409 stale_gateway_epoch` 并回滚整笔事务。飞书 / Discord 合法请求可省略 `X-Gateway-Epoch`。
 - **请求体**：`platform?`, `message_id?`, `status?`, `thread_id?`, `run_id?`, `turn_index?`, `request_key?`, `retry_request_key?`, `resubmitted_request_key?`, `steered_into_run_id?`, `fallback_pending?`, `uploaded_attachments?`, `raw_payload?`, `raw_payload_patch?`, `command_effect_status?`, `command_reply_pending?`, `command_result?`, `session_interrupt_update?`, `background_run?`, `thread_watch?`
 - **响应 `200`**：
   ```json
@@ -365,7 +373,7 @@
     "session_is_current_for_interrupt": "bool | null"
   }
   ```
-- **错误**：`409 stale_gateway_epoch`、`409 {"code": "platform_mismatch", "message": "..."}`
+- **错误**：`400`（如仅提交 `session_interrupt_update` 且无法解析 `platform` 返回 `400 missing_platform`）、`409 stale_gateway_epoch`、`409 {"code": "platform_mismatch", "message": "..."}`
 
 ### 6.5 I-7 (3)：`POST /internal/steers/reconcile`
 
@@ -429,5 +437,5 @@
       ]
     }
     ```
-    （新登记的运行初始状态为 `"registered"`；`mark_finished: false` 首次认领时将状态置为 `"finishing"` 并在每个 `targets[i]` 上标记 `agent_sent: bool`；`mark_finished: true` 时收敛为 `"finished"`）
+    （新登记的运行初始状态为 `"registered"`；`mark_finished: false` 首次认领时将状态置为 `"finishing"` 并在每个 `targets[i]` 上标记 `agent_sent: bool`；`mark_finished: true` 时无论是否携带 `targets` 均收敛为 `"finished"`〔省略 `targets` 时保留库内已有 `targets`〕；已处于 `"finished"` 的运行永远不会被改回 `"finishing"`）
   - **错误**：`404`（未知 `execution_id`）
