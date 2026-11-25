@@ -6,7 +6,7 @@ Standalone script (stdlib + openpyxl + lxml only) runnable inside a sandbox with
 
 Provides only mechanical utilities (no rigid cell-role or business-rule judgments):
 - Default Dalton financial modeling style constants and cell styling helpers
-- Adjacent period column style cloning
+- Adjacent period column style cloning (including protection, skipping MergedCell)
 - Existing workbook style profile extraction (with fallback to defaults)
 - Knowledge-layer period string normalization (e.g. ``2026E`` -> ``FY2026``)
 - Plain bookkeeping record helper for ``model_lineage.json``
@@ -32,6 +32,7 @@ import zipfile
 
 from lxml import etree
 import openpyxl
+from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import column_index_from_string, get_column_letter
 
@@ -120,6 +121,18 @@ _Q_FIRST_RE = re.compile(r"^\s*Q?([1-4])Q\s*['\-/\s]?(\d{2}|\d{4})\s*([AEFP])?\s
 _Q_PREFIX_RE = re.compile(r"^\s*Q([1-4])\s*['\-/\s]?(\d{2}|\d{4})\s*([AEFP])?\s*$", re.IGNORECASE)
 _Y_FIRST_Q_RE = re.compile(r"^\s*(?:FY|CY)?\s*(\d{2}|\d{4})\s*['\-/\s]?Q([1-4])\s*([AEFP])?\s*$", re.IGNORECASE)
 _ANNUAL_RE = re.compile(r"^\s*(?:FY|CY)?\s*'?((?:19|20)\d{2}|\d{2})\s*([AEFP])?\s*$", re.IGNORECASE)
+
+
+def _iter_stored_cells(ws: Any) -> list[tuple[int, int, Any]]:
+    """Iterate only cells actually stored in an openpyxl worksheet (avoids sparse explosion)."""
+    raw = getattr(ws, "_cells", None)
+    if isinstance(raw, dict):
+        return [(r, c, cell) for (r, c), cell in sorted(raw.items())]
+    out: list[tuple[int, int, Any]] = []
+    for row in ws.iter_rows():
+        for cell in row:
+            out.append((cell.row, cell.column, cell))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +300,27 @@ def normalize_period_for_knowledge(raw_label: Any) -> str | None:
 # ---------------------------------------------------------------------------
 
 
+def _default_section_styles() -> dict[str, dict[str, str]]:
+    return {
+        "sec_report": {"fill_color": SEC_REPORT_FILL, "font_color": FORMULA_FONT},
+        "sec_segment": {"fill_color": SEC_SEGMENT_FILL, "font_color": SEC_SEGMENT_FONT},
+        "sec_submodel": {"fill_color": SEC_SUBMODEL_FILL, "font_color": FORMULA_FONT},
+    }
+
+
+def _build_section_styles_from_observed(
+    observed_pairs: list[tuple[str, str]],
+) -> dict[str, dict[str, str]]:
+    """Map observed column-A section (fill_rgb, font_rgb) pairs onto section roles."""
+    styles = _default_section_styles()
+    if not observed_pairs:
+        return styles
+    roles = ("sec_report", "sec_segment", "sec_submodel")
+    for role, (fill_rgb, font_rgb) in zip(roles, observed_pairs):
+        styles[role] = {"fill_color": fill_rgb, "font_color": font_rgb}
+    return styles
+
+
 def default_style_profile() -> dict[str, Any]:
     """Return the default style profile (used for new models or profiler fallback)."""
     return {
@@ -310,6 +344,7 @@ def default_style_profile() -> dict[str, Any]:
             },
             "historical_estimate_fills": [HIST_EST_FILL_GRAY, HIST_EST_FILL_YELLOW],
             "section_fills": [SEC_REPORT_FILL, SEC_SEGMENT_FILL, SEC_SUBMODEL_FILL],
+            "section_styles": _default_section_styles(),
             "number_formats": [FMT_INT, FMT_DEC1, FMT_DEC2, FMT_PCT, FMT_PCT2, FMT_PP, FMT_MULT],
             "gridlines_hidden": True,
         },
@@ -326,8 +361,10 @@ def _top_mode(counts: dict[str, int], min_samples: int = 3) -> str | None:
 def profile_workbook_style(xlsx_path: str | Path) -> dict[str, Any]:
     """Extract observed styles per sheet & block from an existing workbook.
 
-    Falls back cleanly to ``default_style_profile()`` if the file cannot be read,
-    so callers always receive a usable profile dict.
+    Iterates only actually stored cells (sparse-safe) and records observed
+    dominant English/Chinese fonts, header fill/font, section bar styles, and
+    number formats. Falls back cleanly to ``default_style_profile()`` if the
+    file cannot be read.
     """
     path = Path(xlsx_path)
     if not path.is_file():
@@ -344,12 +381,17 @@ def profile_workbook_style(xlsx_path: str | Path) -> dict[str, Any]:
         return prof
 
     g_fonts: dict[str, int] = {}
+    g_fonts_en: dict[str, int] = {}
+    g_fonts_zh: dict[str, int] = {}
     g_sizes: dict[str, int] = {}
     g_fills: dict[str, int] = {}
+    g_header_fills: dict[str, int] = {}
+    g_header_fonts: dict[str, int] = {}
     g_num_font_colors: dict[str, int] = {}
     g_link_colors: dict[str, int] = {}
     g_assump_fills: dict[str, int] = {}
     g_assump_borders: dict[str, int] = {}
+    g_sec_pairs_counts: dict[tuple[str, str], int] = {}
     g_nfmts: set[str] = set()
 
     sheet_overrides: dict[str, Any] = {}
@@ -357,66 +399,84 @@ def profile_workbook_style(xlsx_path: str | Path) -> dict[str, Any]:
     for ws in wb.worksheets:
         state = ws.sheet_state or "visible"
         s_fonts: dict[str, int] = {}
+        s_fonts_en: dict[str, int] = {}
+        s_fonts_zh: dict[str, int] = {}
         s_sizes: dict[str, int] = {}
         s_fills: set[str] = set()
+        s_header_fills: dict[str, int] = {}
+        s_header_fonts: dict[str, int] = {}
         s_nfmts: set[str] = set()
         s_section_fills: list[str] = []
+        s_sec_pairs: list[tuple[str, str]] = []
         blocks: list[dict[str, Any]] = []
         non_empty = 0
         formula_count = 0
         numeric_count = 0
 
         if state == "visible":
-            for row_cells in ws.iter_rows():
-                r_idx = row_cells[0].row
-                c1 = row_cells[0]
-                c1_fill = get_cell_fill_rgb(c1, palette)
-                if c1_fill and isinstance(c1.value, str) and c1.value.strip() and r_idx > 1:
-                    if c1_fill not in s_section_fills:
-                        s_section_fills.append(c1_fill)
+            for r_idx, c_idx, cell in _iter_stored_cells(ws):
+                v = cell.value
+                if v is None or (isinstance(v, str) and not v.strip()):
+                    continue
+                non_empty += 1
+
+                fl_rgb = get_cell_fill_rgb(cell, palette)
+                fn_rgb = get_cell_font_rgb(cell, palette)
+
+                if c_idx == 1 and fl_rgb and isinstance(v, str) and v.strip() and r_idx > 1:
+                    if fl_rgb not in s_section_fills:
+                        s_section_fills.append(fl_rgb)
+                        s_sec_pairs.append((fl_rgb, fn_rgb))
+                    g_sec_pairs_counts[(fl_rgb, fn_rgb)] = g_sec_pairs_counts.get((fl_rgb, fn_rgb), 0) + 1
                     if len(blocks) < 40:
                         blocks.append({
                             "row": r_idx,
-                            "title": c1.value.strip()[:80],
-                            "section_fill": c1_fill,
+                            "title": v.strip()[:80],
+                            "section_fill": fl_rgb,
+                            "section_font": fn_rgb,
                         })
 
-                for cell in row_cells:
-                    v = cell.value
-                    if v is None or (isinstance(v, str) and not v.strip()):
-                        continue
-                    non_empty += 1
-                    f = cell.font
-                    if f and f.name:
-                        s_fonts[f.name] = s_fonts.get(f.name, 0) + 1
-                        g_fonts[f.name] = g_fonts.get(f.name, 0) + 1
-                    if f and f.size is not None:
-                        sz = str(float(f.size))
-                        s_sizes[sz] = s_sizes.get(sz, 0) + 1
-                        g_sizes[sz] = g_sizes.get(sz, 0) + 1
-                    fl_rgb = get_cell_fill_rgb(cell, palette)
-                    if fl_rgb:
-                        s_fills.add(fl_rgb)
-                        g_fills[fl_rgb] = g_fills.get(fl_rgb, 0) + 1
-                    fn_rgb = get_cell_font_rgb(cell, palette)
-                    nf = str(cell.number_format or "General")
-                    s_nfmts.add(nf)
-                    g_nfmts.add(nf)
+                if r_idx == 1 and fl_rgb:
+                    s_header_fills[fl_rgb] = s_header_fills.get(fl_rgb, 0) + 1
+                    g_header_fills[fl_rgb] = g_header_fills.get(fl_rgb, 0) + 1
+                    s_header_fonts[fn_rgb] = s_header_fonts.get(fn_rgb, 0) + 1
+                    g_header_fonts[fn_rgb] = g_header_fonts.get(fn_rgb, 0) + 1
 
-                    if isinstance(v, str) and v.startswith("="):
-                        formula_count += 1
-                        if "!" in v and fn_rgb != FORMULA_FONT:
-                            g_link_colors[fn_rgb] = g_link_colors.get(fn_rgb, 0) + 1
-                    elif isinstance(v, (int, float)) and not isinstance(v, bool):
-                        numeric_count += 1
-                        if fl_rgb is None and r_idx > 1:
-                            g_num_font_colors[fn_rgb] = g_num_font_colors.get(fn_rgb, 0) + 1
-                        elif fl_rgb and fn_rgb == ACTUAL_FONT:
-                            g_assump_fills[fl_rgb] = g_assump_fills.get(fl_rgb, 0) + 1
-                            b = cell.border
-                            if b and b.left and b.left.style:
-                                bs = b.left.style
-                                g_assump_borders[bs] = g_assump_borders.get(bs, 0) + 1
+                f = cell.font
+                if f and f.name:
+                    s_fonts[f.name] = s_fonts.get(f.name, 0) + 1
+                    g_fonts[f.name] = g_fonts.get(f.name, 0) + 1
+                    if isinstance(v, str) and _ZH_CHAR_RE.search(v):
+                        s_fonts_zh[f.name] = s_fonts_zh.get(f.name, 0) + 1
+                        g_fonts_zh[f.name] = g_fonts_zh.get(f.name, 0) + 1
+                    else:
+                        s_fonts_en[f.name] = s_fonts_en.get(f.name, 0) + 1
+                        g_fonts_en[f.name] = g_fonts_en.get(f.name, 0) + 1
+                if f and f.size is not None:
+                    sz = str(float(f.size))
+                    s_sizes[sz] = s_sizes.get(sz, 0) + 1
+                    g_sizes[sz] = g_sizes.get(sz, 0) + 1
+                if fl_rgb:
+                    s_fills.add(fl_rgb)
+                    g_fills[fl_rgb] = g_fills.get(fl_rgb, 0) + 1
+                nf = str(cell.number_format or "General")
+                s_nfmts.add(nf)
+                g_nfmts.add(nf)
+
+                if isinstance(v, str) and v.startswith("="):
+                    formula_count += 1
+                    if "!" in v and fn_rgb != FORMULA_FONT:
+                        g_link_colors[fn_rgb] = g_link_colors.get(fn_rgb, 0) + 1
+                elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                    numeric_count += 1
+                    if fl_rgb is None and r_idx > 1:
+                        g_num_font_colors[fn_rgb] = g_num_font_colors.get(fn_rgb, 0) + 1
+                    elif fl_rgb and fn_rgb == ACTUAL_FONT:
+                        g_assump_fills[fl_rgb] = g_assump_fills.get(fl_rgb, 0) + 1
+                        b = cell.border
+                        if b and b.left and b.left.style:
+                            bs = b.left.style
+                            g_assump_borders[bs] = g_assump_borders.get(bs, 0) + 1
 
         if state != "visible":
             sheet_type = "hidden_sheet"
@@ -434,12 +494,16 @@ def profile_workbook_style(xlsx_path: str | Path) -> dict[str, Any]:
             for k, dim in ws.column_dimensions.items()
             if dim.width is not None
         }
-        sheet_overrides[ws.title] = {
+        sheet_ov: dict[str, Any] = {
             "sheet_type": sheet_type,
             "sheet_state": state,
             "non_empty_cells": non_empty,
             "formula_cells": formula_count,
             "dominant_font_size": float(dom_size_str) if dom_size_str else None,
+            "dominant_font_en": _top_mode(s_fonts_en, min_samples=1),
+            "dominant_font_zh": _top_mode(s_fonts_zh, min_samples=1),
+            "header_fill": _top_mode(s_header_fills, min_samples=1),
+            "header_font_color": _top_mode(s_header_fonts, min_samples=1),
             "fonts_observed": sorted(s_fonts.keys()),
             "fills_observed": sorted(s_fills),
             "section_fills": s_section_fills,
@@ -449,12 +513,22 @@ def profile_workbook_style(xlsx_path: str | Path) -> dict[str, Any]:
             "sample_col_widths": dict(list(col_widths.items())[:15]),
             "blocks": blocks,
         }
+        if s_sec_pairs:
+            sheet_ov["section_styles"] = _build_section_styles_from_observed(s_sec_pairs)
+        sheet_overrides[ws.title] = sheet_ov
 
     dom_global_size_str = _top_mode(g_sizes, min_samples=1)
+    top_sec_pairs = [
+        pair for pair, _ in sorted(g_sec_pairs_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    ]
     defaults = default_style_profile()["workbook_defaults"]
     defaults.update({
+        "dominant_font_en": _top_mode(g_fonts_en, min_samples=1) or FONT_EN,
+        "dominant_font_zh": _top_mode(g_fonts_zh, min_samples=1) or FONT_ZH,
         "allowed_fonts": sorted(set(ALLOWED_DEFAULT_FONTS) | {k for k, v in g_fonts.items() if v >= 5}),
         "dominant_font_size": float(dom_global_size_str) if dom_global_size_str else float(FONT_SIZE),
+        "header_fill": _top_mode(g_header_fills, min_samples=1) or HEADER_FILL,
+        "header_font_color": _top_mode(g_header_fonts, min_samples=1) or HEADER_FONT,
         "actual_font_color": _top_mode(g_num_font_colors) or ACTUAL_FONT,
         "link_font_color": _top_mode(g_link_colors) or LINK_FONT,
         "assumption_style": {
@@ -462,6 +536,8 @@ def profile_workbook_style(xlsx_path: str | Path) -> dict[str, Any]:
             "fill_color": _top_mode(g_assump_fills) or ASSUMP_FILL,
             "border_style": _top_mode(g_assump_borders) or ASSUMP_BORDER,
         },
+        "section_fills": [p[0] for p in top_sec_pairs[:3]] or defaults["section_fills"],
+        "section_styles": _build_section_styles_from_observed(top_sec_pairs),
         "number_formats": sorted(g_nfmts) or defaults["number_formats"],
     })
 
@@ -479,11 +555,16 @@ def profile_workbook_style(xlsx_path: str | Path) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _pick_font_name(value: Any, profile: dict[str, Any] | None = None) -> str:
+def _pick_font_name(
+    value: Any,
+    profile: dict[str, Any] | None = None,
+    sheet_name: str | None = None,
+) -> str:
     wb_def = (profile or {}).get("workbook_defaults") or {}
+    sh_ov = ((profile or {}).get("sheet_overrides") or {}).get(sheet_name or "", {})
     if isinstance(value, str) and _ZH_CHAR_RE.search(value):
-        return wb_def.get("dominant_font_zh") or FONT_ZH
-    return wb_def.get("dominant_font_en") or FONT_EN
+        return sh_ov.get("dominant_font_zh") or wb_def.get("dominant_font_zh") or FONT_ZH
+    return sh_ov.get("dominant_font_en") or wb_def.get("dominant_font_en") or FONT_EN
 
 
 def apply_cell_style(
@@ -499,12 +580,28 @@ def apply_cell_style(
     number_format: str | None = None,
     hist_est_variant: str = "yellow",
 ) -> None:
-    """Apply Dalton default style (or extracted workbook profile) to an openpyxl cell."""
+    """Apply Dalton default style (or extracted workbook profile) to an openpyxl cell.
+
+    Supported ``role`` values:
+    - ``"header"``: period header row / A1 unit cell (uses profile header fill/font when given).
+    - ``"historical_actual"``: reported historical actual (blue font, no fill/border).
+    - ``"historical_estimate"``: historical estimate (``hist_est_variant="yellow"`` or ``"gray"``).
+    - ``"driver_assumption"``: forecast driver assumptions AND direct management guidance amounts
+      (blue font, pale yellow fill, hair border).
+    - ``"external_input"``: static reference input without assumption fill/border (blue font).
+    - ``"source_note"``: rightmost source/notes column (red font).
+    - ``"target_price"``: valuation target price output (dark red bold).
+    - ``"sec_report"`` / ``"sec_segment"`` / ``"sec_submodel"``: section bar headers
+      (uses profile ``section_styles`` when given).
+    - ``"formula"`` (or any other value such as ``"financial_output"``): same-sheet formula
+      (black), cross-sheet link (``is_link=True``, green), derived ratio (``is_ratio=True``,
+      italic), subtotal/total (``is_total=True``, bold).
+    """
     active = profile or default_style_profile()
     wb_def = active.get("workbook_defaults") or {}
     sh_ov = (active.get("sheet_overrides") or {}).get(sheet_name or "", {})
     font_size = sh_ov.get("dominant_font_size") or wb_def.get("dominant_font_size") or FONT_SIZE
-    font_name = _pick_font_name(cell.value, active)
+    font_name = _pick_font_name(cell.value, active, sheet_name)
 
     assump_cfg = wb_def.get("assumption_style") or {}
     assump_font_col = assump_cfg.get("font_color") or ASSUMP_FONT
@@ -512,8 +609,10 @@ def apply_cell_style(
     assump_border = assump_cfg.get("border_style") or ASSUMP_BORDER
 
     if role == "header":
-        cell.font = Font(name=font_name, size=font_size, bold=True, color=HEADER_FONT)
-        cell.fill = PatternFill(fill_type="solid", fgColor=HEADER_FILL)
+        hdr_fill = sh_ov.get("header_fill") or wb_def.get("header_fill") or HEADER_FILL
+        hdr_font = sh_ov.get("header_font_color") or wb_def.get("header_font_color") or HEADER_FONT
+        cell.font = Font(name=font_name, size=font_size, bold=True, color=hdr_font)
+        cell.fill = PatternFill(fill_type="solid", fgColor=hdr_fill)
         cell.border = Border()
         cell.alignment = Alignment(horizontal="left" if cell.column == 1 else "right")
     elif role == "historical_actual":
@@ -548,30 +647,40 @@ def apply_cell_style(
         side = Side(style=assump_border, color="000000")
         cell.border = Border(left=side, right=side, top=side, bottom=side)
     elif role == "external_input":
-        cell.font = Font(name=font_name, size=font_size, bold=is_total, italic=is_percent, color=ACTUAL_FONT)
+        col = wb_def.get("actual_font_color") or ACTUAL_FONT
+        cell.font = Font(name=font_name, size=font_size, bold=is_total, italic=is_percent, color=col)
         cell.fill = PatternFill(fill_type=None)
         cell.border = Border()
     elif role == "source_note":
-        cell.font = Font(name=font_name, size=font_size, color=SOURCE_NOTE_FONT)
+        col = wb_def.get("source_note_font_color") or SOURCE_NOTE_FONT
+        cell.font = Font(name=font_name, size=font_size, color=col)
         cell.fill = PatternFill(fill_type=None)
         cell.border = Border()
     elif role == "target_price":
-        cell.font = Font(name=font_name, size=font_size, bold=True, color=TARGET_PRICE_FONT)
+        col = wb_def.get("target_price_font_color") or TARGET_PRICE_FONT
+        cell.font = Font(name=font_name, size=font_size, bold=True, color=col)
         cell.fill = PatternFill(fill_type=None)
         cell.border = Border()
     elif role in ("sec_report", "sec_segment", "sec_submodel"):
-        if role == "sec_report":
-            cell.font = Font(name=font_name, size=font_size, bold=True, color=FORMULA_FONT)
-            cell.fill = PatternFill(fill_type="solid", fgColor=SEC_REPORT_FILL)
-        elif role == "sec_segment":
-            cell.font = Font(name=font_name, size=font_size, bold=True, color=SEC_SEGMENT_FONT)
-            cell.fill = PatternFill(fill_type="solid", fgColor=SEC_SEGMENT_FILL)
-        else:
-            cell.font = Font(name=font_name, size=font_size, bold=True, color=FORMULA_FONT)
-            cell.fill = PatternFill(fill_type="solid", fgColor=SEC_SUBMODEL_FILL)
+        sh_sec = (sh_ov.get("section_styles") or {}).get(role)
+        wb_sec = (wb_def.get("section_styles") or {}).get(role)
+        default_sec = _default_section_styles()[role]
+        sec_cfg = sh_sec or wb_sec or default_sec
+        cell.font = Font(
+            name=font_name,
+            size=font_size,
+            bold=True,
+            color=sec_cfg.get("font_color") or default_sec["font_color"],
+        )
+        cell.fill = PatternFill(
+            fill_type="solid",
+            fgColor=sec_cfg.get("fill_color") or default_sec["fill_color"],
+        )
         cell.border = Border()
     else:
-        color = (wb_def.get("link_font_color") or LINK_FONT) if is_link else FORMULA_FONT
+        color = (wb_def.get("link_font_color") or LINK_FONT) if is_link else (
+            wb_def.get("formula_font_color") or FORMULA_FONT
+        )
         cell.font = Font(name=font_name, size=font_size, bold=is_total, italic=is_ratio, color=color)
         cell.fill = PatternFill(fill_type=None)
         cell.border = Border()
@@ -591,7 +700,10 @@ def clone_period_column_style(
     copy_width: bool = True,
     copy_outline: bool = False,
 ) -> None:
-    """Clone cell styles and column width from an adjacent period column."""
+    """Clone full cell styles (including protection) and column width from a period column.
+
+    Skips destination cells that are non-top-left ``MergedCell`` instances.
+    """
     src_idx = column_index_from_string(src_col) if isinstance(src_col, str) else src_col
     dst_idx = column_index_from_string(dst_col) if isinstance(dst_col, str) else dst_col
     src_ltr = get_column_letter(src_idx)
@@ -601,11 +713,14 @@ def clone_period_column_style(
     for r in range(1, end_row + 1):
         sc = ws.cell(r, src_idx)
         dc = ws.cell(r, dst_idx)
+        if isinstance(dc, MergedCell):
+            continue
         if sc.has_style:
             dc.font = copy.copy(sc.font)
             dc.fill = copy.copy(sc.fill)
             dc.border = copy.copy(sc.border)
             dc.alignment = copy.copy(sc.alignment)
+            dc.protection = copy.copy(sc.protection)
             dc.number_format = sc.number_format
 
     if copy_width and src_ltr in ws.column_dimensions:
