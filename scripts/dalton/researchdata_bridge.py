@@ -64,6 +64,59 @@ import seed_asr_client  # noqa: E402
 import log_redaction as _log_redaction  # noqa: E402
 import source_identity  # noqa: E402
 
+
+def _load_asr_owner_lock_module() -> Any:
+    """Load ``owner_lock.py`` without requiring the backend ``src`` package.
+
+    The host bridge runs under the system interpreter, where backend
+    dependencies (or ``src``) may be absent or blocked. Reuse the canonical
+    ``src.dalton.transcription_service.owner_lock`` module when ``src`` is
+    importable (preserving exception identity in tests), and otherwise load the
+    stdlib-only file directly via ``importlib.util``.
+    """
+    canonical_name = "src.dalton.transcription_service.owner_lock"
+    existing = sys.modules.get(canonical_name)
+    if existing is not None:
+        return existing
+
+    if "src" not in sys.modules or sys.modules["src"] is not None:
+        try:
+            import importlib
+
+            return importlib.import_module(canonical_name)
+        except ImportError:
+            pass
+
+    fallback_name = "_dalton_bridge_asr_owner_lock"
+    cached = sys.modules.get(fallback_name)
+    if cached is not None:
+        return cached
+
+    import importlib.util
+
+    module_path = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "dalton"
+        / "transcription_service"
+        / "owner_lock.py"
+    )
+    spec = importlib.util.spec_from_file_location(fallback_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[fallback_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(fallback_name, None)
+        raise
+    return module
+
+
+class BridgeAsrDisabledError(RuntimeError):
+    """Raised when legacy bridge ASR endpoints are disabled via ``DALTON_BRIDGE_ASR_DISABLED``."""
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] researchdata_bridge: %(message)s",
@@ -1492,6 +1545,13 @@ class BridgeConfig:
         )
         self.asr_worker_mode: str = (
             os.environ.get("DALTON_ASR_WORKER_MODE", "auto").strip().lower() or "auto"
+        )
+        self.asr_disabled: bool = (
+            os.environ.get("DALTON_BRIDGE_ASR_DISABLED", "").strip().lower()
+            in ("1", "true", "yes", "on")
+        )
+        self.asr_lock_timeout_s: float = (
+            _load_asr_owner_lock_module().resolve_owner_lock_timeout_s()
         )
         try:
             self.wiki_ingest_timeout_s: float = max(
@@ -8126,6 +8186,8 @@ class ResearchDataBridge:
         self._alphaengine_cache: _ae_cache.AlphaEngineSearchCache | None = None
         self._inflight_searches: dict[str, dict[str, Any]] = {}
         self._singleflight_runners: dict[int, dict[str, Any]] = {}
+        self._asr_owner_lock: Any | None = None
+        self._asr_draining: bool = False
         if not getattr(cfg, "admin_token", ""):
             logger.warning(
                 "DALTON_BRIDGE_ADMIN_TOKEN is not set (checked env and ~/.config/dalton/researchdata-bridge.env); "
@@ -9118,7 +9180,7 @@ class ResearchDataBridge:
         return limiter
 
     async def close(self) -> None:
-        """Cancel and await any pending shared AlphaEngine search tasks on shutdown."""
+        """Cancel and await pending shared tasks, shut down ASR manager cleanly, and release ``.owner.lock``."""
         inflight = getattr(self, "_inflight_searches", None)
         runners = getattr(self, "_singleflight_runners", None)
         tasks_by_id: dict[int, asyncio.Task[Any]] = {}
@@ -9133,6 +9195,19 @@ class ResearchDataBridge:
                 store.clear()
         if tasks_by_id:
             await asyncio.gather(*tasks_by_id.values(), return_exceptions=True)
+
+        asr_mgr = getattr(self, "_asr_mgr_instance", None)
+        if asr_mgr is not None:
+            shutdown_fn = getattr(asr_mgr, "shutdown", None)
+            if callable(shutdown_fn):
+                try:
+                    await shutdown_fn(grace_s=0.0)
+                except Exception as exc:
+                    logger.warning("Bridge ASR shutdown warning: %s", type(exc).__name__)
+            self._asr_mgr_instance = None
+        self._asr_startup_lock_failed = False
+        self._asr_startup_lock_error = None
+        self.release_asr_owner_lock()
 
     @staticmethod
     def _parse_alphaengine_or_transcript_response(
@@ -19036,80 +19111,282 @@ class ResearchDataBridge:
             return Path(audit_file).parent / "asr_jobs"
         return _SCRIPT_DIR.parents[1] / "var" / "dalton" / "asr_jobs"
 
+    def is_asr_disabled(self) -> bool:
+        """Return True when bridge ASR is disabled via ``DALTON_BRIDGE_ASR_DISABLED``."""
+        if getattr(self.cfg, "asr_disabled", False):
+            return True
+        return os.environ.get("DALTON_BRIDGE_ASR_DISABLED", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    def is_asr_draining(self) -> bool:
+        """Return True when bridge ASR intake is draining (rejects new submit/retry with 503)."""
+        return bool(getattr(self, "_asr_draining", False))
+
+    def release_asr_owner_lock(self) -> None:
+        """Release ``<DALTON_ASR_JOBS_DIR>/.owner.lock`` if held by this bridge instance."""
+        lock = getattr(self, "_asr_owner_lock", None)
+        self._asr_owner_lock = None
+        if lock is not None:
+            lock.release()
+
+    def asr_drain_status(self) -> dict[str, Any]:
+        """Return current bridge ASR disabled/drain/lock/active-jobs status."""
+        mgr = getattr(self, "_asr_mgr_instance", None)
+        active = mgr.active_job_ids() if mgr is not None and hasattr(mgr, "active_job_ids") else []
+        lock = getattr(self, "_asr_owner_lock", None)
+        lock_held = bool(lock is not None and lock.is_held)
+        lock_pid = lock.metadata.pid if lock is not None and lock.metadata is not None else None
+        disabled = self.is_asr_disabled()
+        draining = self.is_asr_draining()
+        return {
+            "ok": True,
+            "disabled": disabled,
+            "draining": draining,
+            "owner_lock_held": lock_held,
+            "owner_lock_pid": lock_pid,
+            "active_jobs": len(active),
+            "active_job_ids": active,
+            "ready_for_handoff": bool((draining or disabled) and len(active) == 0),
+        }
+
+    def set_asr_draining(self, draining: bool = True) -> dict[str, Any]:
+        """Toggle bridge ASR drain mode (stops new submit/retry while letting active jobs finish)."""
+        self._asr_draining = bool(draining)
+        return self.asr_drain_status()
+
     def _asr_job_manager(self) -> asr_jobs.AsrJobManager:
+        if self.is_asr_disabled():
+            raise BridgeAsrDisabledError(
+                "Bridge ASR is disabled via DALTON_BRIDGE_ASR_DISABLED=true"
+            )
         mgr = getattr(self, "_asr_mgr_instance", None)
         jobs_dir = self._asr_jobs_dir().expanduser()
         if mgr is None or mgr.jobs_dir != jobs_dir:
-            custom_worker = getattr(self, "_asr_custom_worker", None)
-            mode = (
-                str(getattr(self.cfg, "asr_worker_mode", "auto") or "auto")
-                .strip()
-                .lower()
-            )
-            fake_text = getattr(self.cfg, "asr_fake_text", None)
-            fake_fail = getattr(self.cfg, "asr_fake_fail_category", None)
-            if custom_worker is not None:
-                worker: asr_jobs.RealAsrWorker | asr_jobs.FakeAsrWorker = custom_worker
-            elif mode == "real" or (
-                mode == "auto"
-                and seed_asr_client.SeedAsrCredentials.is_configured()
-                and fake_text is None
-                and fake_fail is None
-            ):
-                worker = asr_jobs.RealAsrWorker(
+            existing_lock = getattr(self, "_asr_owner_lock", None)
+            if existing_lock is not None and existing_lock.jobs_dir != jobs_dir.resolve():
+                existing_lock.release()
+                self._asr_owner_lock = None
+                existing_lock = None
+            lock = existing_lock
+            if lock is None or not lock.is_held:
+                owner_lock_mod = _load_asr_owner_lock_module()
+                lock = owner_lock_mod.AsrOwnerLock(jobs_dir, service_name="researchdata-bridge")
+                timeout_s = float(
+                    getattr(
+                        self.cfg,
+                        "asr_lock_timeout_s",
+                        owner_lock_mod.resolve_owner_lock_timeout_s(),
+                    )
+                )
+                lock.acquire(timeout_s=timeout_s)
+                self._asr_owner_lock = lock
+            try:
+                custom_worker = getattr(self, "_asr_custom_worker", None)
+                mode = (
+                    str(getattr(self.cfg, "asr_worker_mode", "auto") or "auto")
+                    .strip()
+                    .lower()
+                )
+                fake_text = getattr(self.cfg, "asr_fake_text", None)
+                fake_fail = getattr(self.cfg, "asr_fake_fail_category", None)
+                if custom_worker is not None:
+                    worker: asr_jobs.RealAsrWorker | asr_jobs.FakeAsrWorker = custom_worker
+                elif mode == "real" or (
+                    mode == "auto"
+                    and seed_asr_client.SeedAsrCredentials.is_configured()
+                    and fake_text is None
+                    and fake_fail is None
+                ):
+                    worker = asr_jobs.RealAsrWorker(
+                        jobs_dir,
+                        atomic_write_fn=_atomic_write_json_locked,
+                    )
+                else:
+                    worker_cfg = asr_jobs.FakeAsrWorkerConfig(
+                        delay_s=float(getattr(self.cfg, "asr_fake_delay_s", 0.02) or 0.0),
+                        fixed_text=fake_text,
+                        fail_category=fake_fail,
+                    )
+                    worker = asr_jobs.FakeAsrWorker(worker_cfg)
+                mgr = asr_jobs.AsrJobManager(
                     jobs_dir,
+                    worker=worker,
                     atomic_write_fn=_atomic_write_json_locked,
+                    owner_lock=lock,
                 )
-            else:
-                worker_cfg = asr_jobs.FakeAsrWorkerConfig(
-                    delay_s=float(getattr(self.cfg, "asr_fake_delay_s", 0.02) or 0.0),
-                    fixed_text=fake_text,
-                    fail_category=fake_fail,
-                )
-                worker = asr_jobs.FakeAsrWorker(worker_cfg)
-            mgr = asr_jobs.AsrJobManager(
-                jobs_dir,
-                worker=worker,
-                atomic_write_fn=_atomic_write_json_locked,
-            )
+            except BaseException:
+                self.release_asr_owner_lock()
+                raise
             self._asr_mgr_instance = mgr
         return mgr
+
+    def initialize_asr_on_startup(self) -> list[str]:
+        """Acquire ``.owner.lock`` and recover incomplete ASR jobs at bridge startup.
+
+        When ``.owner.lock`` is held by another owner, marks startup lock acquisition
+        as failed so subsequent requests return 503 instead of acquiring the lock
+        lazily on a request path.
+        """
+        if self.is_asr_disabled():
+            logger.info(
+                "Bridge ASR disabled (DALTON_BRIDGE_ASR_DISABLED=true); "
+                "skipping .owner.lock acquisition and AsrJobManager startup recovery"
+            )
+            return []
+        try:
+            resumed = self._asr_job_manager().recover_incomplete_jobs()
+            self._asr_startup_lock_failed = False
+            self._asr_startup_lock_error = None
+            return resumed
+        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
+            self._asr_startup_lock_failed = True
+            self._asr_startup_lock_error = str(exc)
+            logger.error("Startup ASR owner lock busy (skipping recovery): %s", exc)
+            return []
+        except Exception as exc:
+            logger.warning("Startup ASR job recovery warning: %s", type(exc).__name__)
+            return []
+
+    def _asr_existing_locked_manager(self) -> asr_jobs.AsrJobManager | None:
+        """Return the existing ``AsrJobManager`` only when this bridge already holds ``.owner.lock``."""
+        mgr = getattr(self, "_asr_mgr_instance", None)
+        lock = getattr(self, "_asr_owner_lock", None)
+        jobs_dir = self._asr_jobs_dir().expanduser()
+        if (
+            mgr is not None
+            and mgr.jobs_dir == jobs_dir
+            and lock is not None
+            and lock.is_held
+        ):
+            return mgr
+        return None
+
+    def _asr_unavailable_response(
+        self, *, intake: bool = False
+    ) -> tuple[int, dict[str, Any]] | None:
+        if self.is_asr_disabled():
+            return 503, {
+                "ok": False,
+                "error_code": "asr_disabled",
+                "error": "Bridge ASR is disabled (DALTON_BRIDGE_ASR_DISABLED=true)",
+            }
+        if intake and self.is_asr_draining():
+            return 503, {
+                "ok": False,
+                "error_code": "asr_draining",
+                "draining": True,
+                "error": "Bridge ASR is draining and not accepting new jobs",
+            }
+        return None
+
+    def _get_asr_manager_for_request(
+        self, *, intake: bool
+    ) -> tuple[asr_jobs.AsrJobManager | None, tuple[int, dict[str, Any]] | None]:
+        """Resolve an ``AsrJobManager`` for a request without acquiring a new lock during drain or after startup lock failure."""
+        blocked = self._asr_unavailable_response(intake=intake)
+        if blocked is not None:
+            return None, blocked
+
+        startup_lock_failed = bool(getattr(self, "_asr_startup_lock_failed", False))
+        if self.is_asr_draining() or startup_lock_failed:
+            existing = self._asr_existing_locked_manager()
+            if existing is not None:
+                return existing, None
+            if startup_lock_failed:
+                return None, (
+                    503,
+                    {
+                        "ok": False,
+                        "error_code": "asr_owner_lock_busy",
+                        "error": getattr(self, "_asr_startup_lock_error", None)
+                        or "Bridge ASR did not acquire .owner.lock at startup",
+                    },
+                )
+            return None, (
+                503,
+                {
+                    "ok": False,
+                    "error_code": "asr_not_ready",
+                    "draining": True,
+                    "error": "Bridge ASR is draining without an active locked job manager",
+                },
+            )
+
+        try:
+            return self._asr_job_manager(), None
+        except _load_asr_owner_lock_module().OwnerLockBusyError as exc:
+            return None, (
+                503,
+                {
+                    "ok": False,
+                    "error_code": "asr_owner_lock_busy",
+                    "error": str(exc),
+                },
+            )
 
     async def handle_transcription_submit(
         self, body: dict[str, Any]
     ) -> tuple[int, dict[str, Any]]:
         """Handle ``POST /transcriptions`` (admin token required; accounting identity from ``caller``)."""
-        return await self._asr_job_manager().submit_job(body)
+        mgr, err = self._get_asr_manager_for_request(intake=True)
+        if err is not None:
+            return err
+        assert mgr is not None
+        return await mgr.submit_job(body)
 
     async def handle_transcription_status(
         self, job_id: str
     ) -> tuple[int, dict[str, Any]]:
         """Handle ``GET /transcriptions/{id}``."""
-        return await self._asr_job_manager().get_job(job_id)
+        mgr, err = self._get_asr_manager_for_request(intake=False)
+        if err is not None:
+            return err
+        assert mgr is not None
+        return await mgr.get_job(job_id)
 
     async def handle_transcription_result(
         self, job_id: str
     ) -> tuple[int, dict[str, Any]]:
         """Handle ``GET /transcriptions/{id}/result``."""
-        return await self._asr_job_manager().get_job_result(job_id)
+        mgr, err = self._get_asr_manager_for_request(intake=False)
+        if err is not None:
+            return err
+        assert mgr is not None
+        return await mgr.get_job_result(job_id)
 
     async def handle_transcription_raw_result(
         self, job_id: str
     ) -> tuple[int, dict[str, Any] | Path]:
         """Handle ``GET /transcriptions/{id}/result/raw`` (streams bridge ``raw_response.json``)."""
-        return await self._asr_job_manager().get_job_raw_result(job_id)
+        mgr, err = self._get_asr_manager_for_request(intake=False)
+        if err is not None:
+            return err
+        assert mgr is not None
+        return await mgr.get_job_raw_result(job_id)
 
     async def handle_transcription_retry(
         self, job_id: str, body: dict[str, Any] | None = None
     ) -> tuple[int, dict[str, Any]]:
         """Handle ``POST /transcriptions/{id}/retry``."""
-        return await self._asr_job_manager().retry_job(job_id, body)
+        mgr, err = self._get_asr_manager_for_request(intake=True)
+        if err is not None:
+            return err
+        assert mgr is not None
+        return await mgr.retry_job(job_id, body)
 
     async def handle_transcription_cancel(
         self, job_id: str, body: dict[str, Any] | None = None
     ) -> tuple[int, dict[str, Any]]:
         """Handle ``POST /transcriptions/{id}/cancel``."""
-        return await self._asr_job_manager().cancel_job(job_id, body)
+        mgr, err = self._get_asr_manager_for_request(intake=False)
+        if err is not None:
+            return err
+        assert mgr is not None
+        return await mgr.cancel_job(job_id, body)
 
     # ------------------------------------------------------------------
     # DALTON-HOOK(data-jobs): Host data task runner (T1 / T29, §2.3 item 3)
@@ -23375,6 +23652,7 @@ def _managed_host_secret_token_values() -> tuple[str, ...]:
             os.environ.get("DALTON_BRIDGE_ADMIN_TOKEN", "").strip(),
             os.environ.get("INTERNAL_SERVICE_TOKEN", "").strip(),
             os.environ.get("DALTON_TRANSCRIPTION_TICKET_SECRET", "").strip(),
+            os.environ.get("DALTON_TRANSCRIPTION_TOKEN", "").strip(),
         )
         if t
     )
@@ -25448,6 +25726,7 @@ async def _handle_client(
                 "alphaengine_search_circuit_breaker": bridge._get_ae_search_breaker().snapshot(),
                 "xreach": await bridge.probe_xreach_version(),
                 "tmeet": await bridge.probe_tmeet_version(),
+                "asr": bridge.asr_drain_status(),
             }
             await _send_http(writer, 200, "OK", health_payload)
             return
@@ -25771,6 +26050,42 @@ async def _handle_client(
         # normal MCP token gets 403; accounting identity comes from the backend's
         # trusted `caller` payload, never from sandbox X-Dalton-* headers).
         if path == "/transcriptions" or path.startswith("/transcriptions/"):
+            if path == "/transcriptions/drain":
+                if method == "GET":
+                    await _send_http(writer, 200, "OK", bridge.asr_drain_status())
+                    return
+                if method != "POST":
+                    await _send_http(
+                        writer, 405, "Method Not Allowed", {"ok": False, "error": "Method Not Allowed"}
+                    )
+                    return
+                drain_flag = True
+                if body_bytes.strip():
+                    try:
+                        parsed_drain = json.loads(body_bytes.decode("utf-8"))
+                        if not isinstance(parsed_drain, dict):
+                            raise ValueError("Expected JSON object")
+                        if "drain" in parsed_drain:
+                            drain_flag = bool(parsed_drain["drain"])
+                    except Exception:
+                        await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
+                        return
+                await _send_http(writer, 200, "OK", bridge.set_asr_draining(drain_flag))
+                return
+
+            if bridge.is_asr_disabled():
+                await _send_http(
+                    writer,
+                    503,
+                    "Service Unavailable",
+                    {
+                        "ok": False,
+                        "error_code": "asr_disabled",
+                        "error": "Bridge ASR is disabled (DALTON_BRIDGE_ASR_DISABLED=true)",
+                    },
+                )
+                return
+
             if path == "/transcriptions":
                 if method != "POST":
                     await _send_http(
@@ -25791,6 +26106,7 @@ async def _handle_client(
                     403: "Forbidden",
                     404: "Not Found",
                     409: "Conflict",
+                    503: "Service Unavailable",
                 }.get(code, "Bad Gateway")
                 await _send_http(writer, code, status_label, payload)
                 return
@@ -25809,6 +26125,7 @@ async def _handle_client(
                     200: "OK",
                     400: "Bad Request",
                     404: "Not Found",
+                    503: "Service Unavailable",
                 }.get(code, "Bad Gateway")
                 await _send_http(writer, code, status_label, payload)
                 return
@@ -25826,6 +26143,7 @@ async def _handle_client(
                     400: "Bad Request",
                     404: "Not Found",
                     409: "Conflict",
+                    503: "Service Unavailable",
                 }.get(code, "Bad Gateway")
                 await _send_http(writer, code, status_label, payload)
                 return
@@ -25843,6 +26161,7 @@ async def _handle_client(
                     400: "Bad Request",
                     404: "Not Found",
                     409: "Conflict",
+                    503: "Service Unavailable",
                 }.get(code, "Bad Gateway")
                 if code == 200 and isinstance(raw_payload_or_path, Path):
                     await _send_http_file(writer, 200, "OK", raw_payload_or_path)
@@ -25882,6 +26201,7 @@ async def _handle_client(
                     400: "Bad Request",
                     404: "Not Found",
                     409: "Conflict",
+                    503: "Service Unavailable",
                 }.get(code, "Bad Gateway")
                 await _send_http(writer, code, status_label, payload)
                 return
@@ -26188,10 +26508,7 @@ async def main() -> None:
             type(exc).__name__,
             getattr(exc, "exit_code", None),
         )
-    try:
-        bridge._asr_job_manager().recover_incomplete_jobs()
-    except Exception as exc:
-        logger.warning("Startup ASR job recovery warning: %s", type(exc).__name__)
+    bridge.initialize_asr_on_startup()
     # DALTON-HOOK(data-jobs): recover host runner state and stop leftover process groups before serving (§2.3 item 3)
     try:
         await bridge.recover_host_runner_state_on_startup()
