@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mechanical Excel style helpers, workbook style profiler, and lineage recorder.
+"""Mechanical Excel style helpers, workbook style profiler, parts-diff, and lineage recorder.
 
 Standalone script (stdlib + openpyxl + lxml only) runnable inside a sandbox with
 ``python -I`` or imported by model build/update scripts.
@@ -8,23 +8,29 @@ Provides only mechanical utilities (no rigid cell-role or business-rule judgment
 - Default Dalton financial modeling style constants and cell styling helpers
 - Adjacent period column style cloning (including protection, skipping MergedCell)
 - Existing workbook style profile extraction (with fallback to defaults)
+- Read-only OOXML package parts diff (``parts-diff``) to detect dropped media,
+  drawings, charts, external links, ``<extLst>`` / x14 conditional formatting,
+  data validations, and sparklines
 - Knowledge-layer period string normalization (e.g. ``2026E`` -> ``FY2026``)
 - Plain bookkeeping record helper for ``model_lineage.json``
 
 CLI usage:
     python model_style.py profile <workbook.xlsx> [--out style_profile.json]
+    python model_style.py parts-diff <orig.xlsx> <new.xlsx> [--out parts_diff.json]
     python model_style.py lineage --file <model_lineage.json> --output <out.xlsx> [--baseline <base.xlsx>] [--profile <profile.json>]
 """
 
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 import colorsys
 import copy
 from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import posixpath
 import re
 import sys
 from typing import Any
@@ -89,7 +95,11 @@ DEFAULT_SPACER_COL_WIDTH = 1.2
 
 ALLOWED_DEFAULT_FONTS: tuple[str, ...] = (FONT_EN, FONT_ZH)
 
-# OOXML theme parsing constants
+# OOXML namespaces & parsing constants
+_SML_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+_REL_DOC_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_X14_NS = "http://schemas.microsoft.com/office/spreadsheetml/2009/9/main"
 _DRAWING_MAIN_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 _XML_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
 _THEME_SLOTS = (
@@ -106,6 +116,11 @@ _INDEXED_COLORS: dict[int, str | None] = {
     0: "000000", 1: "FFFFFF", 2: "FF0000", 3: "00FF00", 4: "0000FF",
     5: "FFFF00", 8: "000000", 9: "FFFFFF", 10: "FF0000", 12: "0000FF",
     17: "008000", 22: "C0C0C0", 23: "808080", 64: None, 65: None,
+}
+_KNOWN_SECTION_FILL_TO_ROLE: dict[str, str] = {
+    SEC_REPORT_FILL: "sec_report",
+    SEC_SEGMENT_FILL: "sec_segment",
+    SEC_SUBMODEL_FILL: "sec_submodel",
 }
 
 _HEX6_RE = re.compile(r"^[0-9A-F]{6}$")
@@ -311,13 +326,18 @@ def _default_section_styles() -> dict[str, dict[str, str]]:
 def _build_section_styles_from_observed(
     observed_pairs: list[tuple[str, str]],
 ) -> dict[str, dict[str, str]]:
-    """Map observed column-A section (fill_rgb, font_rgb) pairs onto section roles."""
+    """Map observed column-A section colors to roles ONLY by known default fill match.
+
+    Unrecognized custom section fills are NOT assigned to fixed roles by order;
+    they remain in ``section_fills`` and ``blocks`` for the caller to pick explicitly.
+    """
     styles = _default_section_styles()
-    if not observed_pairs:
-        return styles
-    roles = ("sec_report", "sec_segment", "sec_submodel")
-    for role, (fill_rgb, font_rgb) in zip(roles, observed_pairs):
-        styles[role] = {"fill_color": fill_rgb, "font_color": font_rgb}
+    seen_roles: set[str] = set()
+    for fill_rgb, font_rgb in observed_pairs:
+        role = _KNOWN_SECTION_FILL_TO_ROLE.get(fill_rgb.upper())
+        if role is not None and role not in seen_roles:
+            styles[role] = {"fill_color": fill_rgb.upper(), "font_color": font_rgb.upper()}
+            seen_roles.add(role)
     return styles
 
 
@@ -362,9 +382,11 @@ def profile_workbook_style(xlsx_path: str | Path) -> dict[str, Any]:
     """Extract observed styles per sheet & block from an existing workbook.
 
     Iterates only actually stored cells (sparse-safe) and records observed
-    dominant English/Chinese fonts, header fill/font, section bar styles, and
-    number formats. Falls back cleanly to ``default_style_profile()`` if the
-    file cannot be read.
+    dominant English/Chinese fonts, header fill/font, section bar fills/blocks,
+    and number formats. Known default section colors map to their corresponding
+    roles; unrecognized section fills stay in ``section_fills`` and ``blocks``
+    for explicit selection. Falls back cleanly to ``default_style_profile()``
+    if the file cannot be read.
     """
     path = Path(xlsx_path)
     if not path.is_file():
@@ -521,6 +543,11 @@ def profile_workbook_style(xlsx_path: str | Path) -> dict[str, Any]:
     top_sec_pairs = [
         pair for pair, _ in sorted(g_sec_pairs_counts.items(), key=lambda kv: (-kv[1], kv[0]))
     ]
+    observed_sec_fills: list[str] = []
+    for fl, _ in top_sec_pairs:
+        if fl not in observed_sec_fills:
+            observed_sec_fills.append(fl)
+
     defaults = default_style_profile()["workbook_defaults"]
     defaults.update({
         "dominant_font_en": _top_mode(g_fonts_en, min_samples=1) or FONT_EN,
@@ -536,7 +563,7 @@ def profile_workbook_style(xlsx_path: str | Path) -> dict[str, Any]:
             "fill_color": _top_mode(g_assump_fills) or ASSUMP_FILL,
             "border_style": _top_mode(g_assump_borders) or ASSUMP_BORDER,
         },
-        "section_fills": [p[0] for p in top_sec_pairs[:3]] or defaults["section_fills"],
+        "section_fills": observed_sec_fills or defaults["section_fills"],
         "section_styles": _build_section_styles_from_observed(top_sec_pairs),
         "number_formats": sorted(g_nfmts) or defaults["number_formats"],
     })
@@ -592,7 +619,7 @@ def apply_cell_style(
     - ``"source_note"``: rightmost source/notes column (red font).
     - ``"target_price"``: valuation target price output (dark red bold).
     - ``"sec_report"`` / ``"sec_segment"`` / ``"sec_submodel"``: section bar headers
-      (uses profile ``section_styles`` when given).
+      (uses matched known-default ``section_styles`` from profile, or default constants).
     - ``"formula"`` (or any other value such as ``"financial_output"``): same-sheet formula
       (black), cross-sheet link (``is_link=True``, green), derived ratio (``is_ratio=True``,
       italic), subtotal/total (``is_total=True``, bold).
@@ -734,7 +761,361 @@ def clone_period_column_style(
 
 
 # ---------------------------------------------------------------------------
-# 6. Plain Model Lineage Bookkeeping (`model_lineage.json`)
+# 6. Read-Only OOXML Parts Diff (`parts-diff`)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_rel_target(base_part: str, target: str) -> str:
+    """Resolve a relative OOXML relationship Target against ``base_part``."""
+    t = target.replace("\\", "/")
+    if t.startswith("/"):
+        return posixpath.normpath(t.lstrip("/"))
+    base_dir = posixpath.dirname(base_part)
+    return posixpath.normpath(posixpath.join(base_dir, t))
+
+
+def _rels_path_for(part: str) -> str:
+    d = posixpath.dirname(part)
+    b = posixpath.basename(part)
+    return f"{d}/_rels/{b}.rels" if d else f"_rels/{b}.rels"
+
+
+def _read_rels(zf: zipfile.ZipFile, part: str, name_set: set[str]) -> dict[str, tuple[str, str]]:
+    """Return ``{rId: (rel_type, resolved_target)}`` for ``part``."""
+    rp = _rels_path_for(part)
+    if rp not in name_set:
+        return {}
+    out: dict[str, tuple[str, str]] = {}
+    try:
+        root = etree.fromstring(zf.read(rp), _XML_PARSER)
+    except Exception:
+        return out
+    for rel in root.iter(f"{{{_PKG_REL_NS}}}Relationship"):
+        rid = rel.get("Id") or ""
+        rtype = rel.get("Type") or ""
+        target = rel.get("Target") or ""
+        if not rid or not target:
+            continue
+        if (rel.get("TargetMode") or "").lower() == "external":
+            continue
+        out[rid] = (rtype, _resolve_rel_target(part, target))
+    return out
+
+
+def _inspect_workbook_parts(xlsx_path: Path) -> dict[str, Any]:
+    """Read-only zip/XML inventory of OOXML parts and per-sheet attachments."""
+    with zipfile.ZipFile(xlsx_path, "r") as zf:
+        names = sorted(zf.namelist())
+        name_set = set(names)
+
+        media = [n for n in names if n.startswith("xl/media/") and not n.endswith("/")]
+        media_by_ext: dict[str, int] = defaultdict(int)
+        for m in media:
+            ext = Path(m).suffix.lower().lstrip(".") or "unknown"
+            media_by_ext[ext] += 1
+
+        drawings = [n for n in names if n.startswith("xl/drawings/") and n.endswith(".xml")]
+        charts = [n for n in names if n.startswith("xl/charts/") and n.endswith(".xml")]
+        ext_links = [n for n in names if n.startswith("xl/externalLinks/") and n.endswith(".xml")]
+        pivots = [n for n in names if n.startswith("xl/pivotTables/") and n.endswith(".xml")]
+        slicers = [n for n in names if n.startswith("xl/slicers/") and n.endswith(".xml")]
+        threaded_comments = [n for n in names if n.startswith("xl/threadedComments/") and n.endswith(".xml")]
+        has_vba = "xl/vbaProject.bin" in name_set
+
+        # Map worksheet XML parts to worksheet titles via workbook.xml + rels
+        wb_rels = _read_rels(zf, "xl/workbook.xml", name_set)
+        sheet_order: list[str] = []
+        sheet_info: dict[str, dict[str, Any]] = {}
+
+        if "xl/workbook.xml" in name_set:
+            try:
+                wb_root = etree.fromstring(zf.read("xl/workbook.xml"), _XML_PARSER)
+            except Exception:
+                wb_root = None
+            if wb_root is not None:
+                for sh_el in wb_root.iter(f"{{{_SML_NS}}}sheet"):
+                    title = sh_el.get("name") or ""
+                    rid = sh_el.get(f"{{{_REL_DOC_NS}}}id") or ""
+                    if not title or rid not in wb_rels:
+                        continue
+                    sh_part = wb_rels[rid][1]
+                    if sh_part not in name_set:
+                        continue
+                    sheet_order.append(title)
+
+                    # Trace drawings, media, charts, pivots attached to this sheet
+                    sh_rels = _read_rels(zf, sh_part, name_set)
+                    sh_drawings: set[str] = set()
+                    sh_charts: set[str] = set()
+                    sh_media: set[str] = set()
+                    sh_pivots: set[str] = set()
+                    for _, tgt in sh_rels.values():
+                        if tgt.startswith("xl/drawings/") and tgt.endswith(".xml"):
+                            sh_drawings.add(tgt)
+                            for _, dtgt in _read_rels(zf, tgt, name_set).values():
+                                if dtgt.startswith("xl/media/"):
+                                    sh_media.add(dtgt)
+                                elif dtgt.startswith("xl/charts/") and dtgt.endswith(".xml"):
+                                    sh_charts.add(dtgt)
+                        elif tgt.startswith("xl/charts/") and tgt.endswith(".xml"):
+                            sh_charts.add(tgt)
+                        elif tgt.startswith("xl/pivotTables/") and tgt.endswith(".xml"):
+                            sh_pivots.add(tgt)
+
+                    sh_media_by_ext: dict[str, int] = defaultdict(int)
+                    for m in sh_media:
+                        ext = Path(m).suffix.lower().lstrip(".") or "unknown"
+                        sh_media_by_ext[ext] += 1
+
+                    # Inspect worksheet XML for <extLst>, x14 conditional formatting, data validations, sparklines
+                    has_extlst = False
+                    ext_uris: list[str] = []
+                    x14_cf_count = 0
+                    dv_count = 0
+                    sparkline_count = 0
+                    try:
+                        sh_root = etree.fromstring(zf.read(sh_part), _XML_PARSER)
+                        for el in sh_root.iter():
+                            tag = el.tag if isinstance(el.tag, str) else ""
+                            if tag.endswith("}extLst") or tag == "extLst":
+                                has_extlst = True
+                            elif tag.endswith("}ext") or tag == "ext":
+                                uri = el.get("uri")
+                                if uri and uri not in ext_uris:
+                                    ext_uris.append(uri)
+                            elif tag == f"{{{_X14_NS}}}conditionalFormatting":
+                                x14_cf_count += 1
+                            elif tag in (f"{{{_SML_NS}}}dataValidation", f"{{{_X14_NS}}}dataValidation"):
+                                dv_count += 1
+                            elif tag == f"{{{_X14_NS}}}sparklineGroup":
+                                sparkline_count += 1
+                    except Exception:
+                        pass
+
+                    sheet_info[title] = {
+                        "part": sh_part,
+                        "media": sorted(sh_media),
+                        "media_count": len(sh_media),
+                        "media_by_ext": dict(sorted(sh_media_by_ext.items())),
+                        "drawings_count": len(sh_drawings),
+                        "charts_count": len(sh_charts),
+                        "pivots_count": len(sh_pivots),
+                        "has_extlst": has_extlst,
+                        "ext_uris": sorted(ext_uris),
+                        "x14_cf_count": x14_cf_count,
+                        "data_validations_count": dv_count,
+                        "sparklines_count": sparkline_count,
+                    }
+
+    return {
+        "package_counts": {
+            "media": len(media),
+            "media_by_ext": dict(sorted(media_by_ext.items())),
+            "drawings": len(drawings),
+            "charts": len(charts),
+            "external_links": len(ext_links),
+            "pivot_tables": len(pivots),
+            "slicers": len(slicers),
+            "threaded_comments": len(threaded_comments),
+            "vba_project": 1 if has_vba else 0,
+            "sheets_with_extlst": sum(1 for v in sheet_info.values() if v["has_extlst"]),
+            "sheets_with_x14_cf": sum(1 for v in sheet_info.values() if v["x14_cf_count"] > 0),
+            "x14_cf_total": sum(v["x14_cf_count"] for v in sheet_info.values()),
+            "data_validations_total": sum(v["data_validations_count"] for v in sheet_info.values()),
+            "sparklines_total": sum(v["sparklines_count"] for v in sheet_info.values()),
+        },
+        "sheet_order": sheet_order,
+        "sheets": sheet_info,
+    }
+
+
+def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str, Any]:
+    """Compare OOXML package parts and per-sheet XML extensions between two workbooks.
+
+    Read-only advisory tool: reports lost media/drawings/charts/externalLinks/
+    ``<extLst>``/x14 conditional formatting/data validations/sparklines and
+    affected sheet names without failing or blocking delivery.
+    """
+    p_orig = Path(orig_path)
+    p_new = Path(new_path)
+    if not p_orig.is_file():
+        return {"status": "error", "message": f"Original file not found: {p_orig}"}
+    if not p_new.is_file():
+        return {"status": "error", "message": f"New file not found: {p_new}"}
+
+    try:
+        inv_orig = _inspect_workbook_parts(p_orig)
+    except Exception as exc:
+        return {"status": "error", "message": f"Failed to read original workbook zip: {exc}"}
+    try:
+        inv_new = _inspect_workbook_parts(p_new)
+    except Exception as exc:
+        return {"status": "error", "message": f"Failed to read new workbook zip: {exc}"}
+
+    oc = inv_orig["package_counts"]
+    nc = inv_new["package_counts"]
+
+    # Package-level loss counts
+    pkg_losses: dict[str, int] = {}
+    for key in (
+        "media",
+        "drawings",
+        "charts",
+        "external_links",
+        "pivot_tables",
+        "slicers",
+        "threaded_comments",
+        "vba_project",
+        "sheets_with_extlst",
+        "sheets_with_x14_cf",
+        "x14_cf_total",
+        "data_validations_total",
+        "sparklines_total",
+    ):
+        diff = int(oc.get(key, 0)) - int(nc.get(key, 0))
+        if diff > 0:
+            pkg_losses[key] = diff
+
+    media_ext_losses: dict[str, int] = {}
+    for ext, cnt in (oc.get("media_by_ext") or {}).items():
+        new_cnt = (nc.get("media_by_ext") or {}).get(ext, 0)
+        if cnt > new_cnt:
+            media_ext_losses[ext] = cnt - new_cnt
+
+    orig_sheets = inv_orig["sheets"]
+    new_sheets = inv_new["sheets"]
+    sheets_removed = [s for s in inv_orig["sheet_order"] if s not in new_sheets]
+    sheets_added = [s for s in inv_new["sheet_order"] if s not in orig_sheets]
+
+    sheet_losses: list[dict[str, Any]] = []
+    affected_by_type: dict[str, list[str]] = defaultdict(list)
+
+    for title in inv_orig["sheet_order"]:
+        if title not in new_sheets:
+            continue
+        os_i = orig_sheets[title]
+        ns_i = new_sheets[title]
+        loss: dict[str, Any] = {}
+
+        if os_i["media_count"] > ns_i["media_count"]:
+            ext_d = {
+                ext: cnt - ns_i["media_by_ext"].get(ext, 0)
+                for ext, cnt in os_i["media_by_ext"].items()
+                if cnt > ns_i["media_by_ext"].get(ext, 0)
+            }
+            loss["media_lost"] = os_i["media_count"] - ns_i["media_count"]
+            if ext_d:
+                loss["media_ext_lost"] = ext_d
+            affected_by_type["media"].append(title)
+
+        if os_i["drawings_count"] > ns_i["drawings_count"]:
+            loss["drawings_lost"] = os_i["drawings_count"] - ns_i["drawings_count"]
+            affected_by_type["drawings"].append(title)
+
+        if os_i["charts_count"] > ns_i["charts_count"]:
+            loss["charts_lost"] = os_i["charts_count"] - ns_i["charts_count"]
+            affected_by_type["charts"].append(title)
+
+        if os_i["pivots_count"] > ns_i["pivots_count"]:
+            loss["pivots_lost"] = os_i["pivots_count"] - ns_i["pivots_count"]
+            affected_by_type["pivot_tables"].append(title)
+
+        if os_i["has_extlst"] and not ns_i["has_extlst"]:
+            loss["extlst_lost"] = True
+            affected_by_type["extlst"].append(title)
+        elif set(os_i["ext_uris"]) - set(ns_i["ext_uris"]):
+            loss["ext_uris_lost"] = sorted(set(os_i["ext_uris"]) - set(ns_i["ext_uris"]))
+            affected_by_type["extlst"].append(title)
+
+        if os_i["x14_cf_count"] > ns_i["x14_cf_count"]:
+            loss["x14_cf_lost"] = os_i["x14_cf_count"] - ns_i["x14_cf_count"]
+            affected_by_type["x14_conditional_formatting"].append(title)
+
+        if os_i["data_validations_count"] > ns_i["data_validations_count"]:
+            loss["data_validations_lost"] = os_i["data_validations_count"] - ns_i["data_validations_count"]
+            affected_by_type["data_validations"].append(title)
+
+        if os_i["sparklines_count"] > ns_i["sparklines_count"]:
+            loss["sparklines_lost"] = os_i["sparklines_count"] - ns_i["sparklines_count"]
+            affected_by_type["sparklines"].append(title)
+
+        if loss:
+            sheet_losses.append({"sheet": title, **loss})
+
+    def _fmt_sheets(sh_list: list[str]) -> str:
+        if not sh_list:
+            return ""
+        shown = "、".join(sh_list[:8])
+        suffix = f" 等共 {len(sh_list)} 张表" if len(sh_list) > 8 else f"（共 {len(sh_list)} 张表）"
+        return f"涉及 {shown}{suffix}"
+
+    summary_clauses: list[str] = []
+    if pkg_losses.get("media"):
+        ext_txt = "、".join(f"{cnt} 张 {ext.upper()}" for ext, cnt in sorted(media_ext_losses.items()))
+        detail = f"（{ext_txt}）" if ext_txt else ""
+        sh_txt = _fmt_sheets(affected_by_type.get("media", []))
+        summary_clauses.append(f"嵌入图片减少 {pkg_losses['media']} 张{detail}" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_losses.get("drawings"):
+        sh_txt = _fmt_sheets(affected_by_type.get("drawings", []))
+        summary_clauses.append(f"绘图对象（xl/drawings）减少 {pkg_losses['drawings']} 个" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_losses.get("charts"):
+        sh_txt = _fmt_sheets(affected_by_type.get("charts", []))
+        summary_clauses.append(f"图表（xl/charts）减少 {pkg_losses['charts']} 个" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_losses.get("x14_cf_total") or affected_by_type.get("x14_conditional_formatting"):
+        sh_list = affected_by_type.get("x14_conditional_formatting", [])
+        n_rules = pkg_losses.get("x14_cf_total", len(sh_list))
+        sh_txt = _fmt_sheets(sh_list)
+        summary_clauses.append(f"扩展条件格式（x14）减少 {n_rules} 处" + (f"，{sh_txt}" if sh_txt else ""))
+    elif pkg_losses.get("sheets_with_extlst") or affected_by_type.get("extlst"):
+        sh_list = affected_by_type.get("extlst", [])
+        sh_txt = _fmt_sheets(sh_list)
+        summary_clauses.append(f"工作表扩展节点（<extLst>）减少" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_losses.get("data_validations_total"):
+        sh_txt = _fmt_sheets(affected_by_type.get("data_validations", []))
+        summary_clauses.append(f"数据验证减少 {pkg_losses['data_validations_total']} 条" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_losses.get("sparklines_total"):
+        sh_txt = _fmt_sheets(affected_by_type.get("sparklines", []))
+        summary_clauses.append(f"迷你图（sparkline）减少 {pkg_losses['sparklines_total']} 组" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_losses.get("pivot_tables"):
+        summary_clauses.append(f"数据透视表减少 {pkg_losses['pivot_tables']} 个")
+    if pkg_losses.get("slicers"):
+        summary_clauses.append(f"切片器减少 {pkg_losses['slicers']} 个")
+    if pkg_losses.get("threaded_comments"):
+        summary_clauses.append(f"线索批注（threadedComments）减少 {pkg_losses['threaded_comments']} 处")
+    if pkg_losses.get("vba_project"):
+        summary_clauses.append("VBA 宏工程（vbaProject.bin）丢失")
+    if pkg_losses.get("external_links"):
+        summary_clauses.append(f"外部链接部件（xl/externalLinks）减少 {pkg_losses['external_links']} 个（若为主动清理外链则属预期）")
+    if sheets_removed:
+        summary_clauses.append(f"原工作表被移除：{'、'.join(sheets_removed)}")
+
+    has_losses = bool(summary_clauses)
+    if has_losses:
+        summary = "部件对比发现新文件相对原文件有以下减少：" + "；".join(summary_clauses) + "。"
+    else:
+        summary = "部件对比完成：新文件未发现图片、绘图、图表、扩展条件格式（<extLst>/x14）、数据验证或其他关键部件丢失。"
+    if sheets_added:
+        summary += f" 新增工作表：{'、'.join(sheets_added)}。"
+
+    return {
+        "status": "ok",
+        "orig_file": str(p_orig),
+        "new_file": str(p_new),
+        "has_losses": has_losses,
+        "summary": summary,
+        "orig_counts": oc,
+        "new_counts": nc,
+        "package_losses": pkg_losses,
+        "media_ext_losses": media_ext_losses,
+        "sheets_removed": sheets_removed,
+        "sheets_added": sheets_added,
+        "affected_sheets_by_type": dict(affected_by_type),
+        "sheet_losses": sheet_losses,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7. Plain Model Lineage Bookkeeping (`model_lineage.json`)
 # ---------------------------------------------------------------------------
 
 
@@ -792,19 +1173,27 @@ def load_model_lineage(lineage_path: str | Path) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# 7. CLI Entrypoint
+# 8. CLI Entrypoint
 # ---------------------------------------------------------------------------
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Mechanical Excel style profiler and model_lineage.json recorder."
+        description="Mechanical Excel style profiler, parts-diff tool, and model_lineage.json recorder."
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_prof = sub.add_parser("profile", help="Extract observed style profile JSON from an existing workbook")
     p_prof.add_argument("workbook", help="Source .xlsx workbook (read-only)")
     p_prof.add_argument("--out", help="Optional output JSON path")
+
+    p_diff = sub.add_parser(
+        "parts-diff",
+        help="Compare OOXML parts (media, drawings, charts, externalLinks, <extLst>/x14, data validations) between two workbooks",
+    )
+    p_diff.add_argument("orig_workbook", help="Original baseline .xlsx workbook (read-only)")
+    p_diff.add_argument("new_workbook", help="New/edited .xlsx workbook (read-only)")
+    p_diff.add_argument("--out", help="Optional output JSON path")
 
     p_lin = sub.add_parser("lineage", help="Record input/output paths, hashes, and timestamp in model_lineage.json")
     p_lin.add_argument("--file", required=True, help="Path to model_lineage.json")
@@ -837,6 +1226,23 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(text)
         return 0
+
+    if args.cmd == "parts-diff":
+        diff = diff_workbook_parts(args.orig_workbook, args.new_workbook)
+        text = json.dumps(diff, indent=2, ensure_ascii=False)
+        if args.out and diff.get("status") == "ok":
+            out_p = Path(args.out)
+            out_p.parent.mkdir(parents=True, exist_ok=True)
+            out_p.write_text(text + "\n", encoding="utf-8")
+            print(json.dumps({
+                "status": "ok",
+                "out": str(out_p),
+                "has_losses": diff.get("has_losses", False),
+                "summary": diff.get("summary", ""),
+            }, ensure_ascii=False))
+        else:
+            print(text)
+        return 0 if diff.get("status") == "ok" else 1
 
     if args.cmd == "lineage":
         res = record_model_lineage(

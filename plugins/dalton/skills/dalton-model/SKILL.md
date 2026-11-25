@@ -51,12 +51,14 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - 重算公式：运行 `python3 .agents/skills/xlsx/scripts/recalc.py <新版本模型路径>` 重算并回写缓存值（只读核查原模型时复制到临时文件重算）。
 - 扫描核对：运行 `python3 .agents/skills/dalton-model/scripts/model_scan.py <新版本模型路径>`，逐条检查输出的预测期数字常数、可能的期间错配、外部链接与插件函数、`#REF!`（断裂引用错误）、循环引用及重算错误。属问题的修改模型并重新重算；属合理建模处理的在变更记录写明原因。
 - 自己再核对几件事：年度 = 季度汇总是否成立；集团利润与分部之和能否对上（对不上的差额是什么）；现金和股本的滚存是否连贯；EPS 与净利润、股数是否一致。
+- 基础检查：金额单位一致（千还是百万）、币种一致（人民币报表与美元 ADS EPS 的换算）、每股还是每 ADS；估值页（如有）的目标年份、倍数对应的 EPS、净现金已指向更新后的预测。
 
 **第 6 步　对照一致预期与卖方预测**（读取 `.agents/skills/dalton-model/references/sanity-check.md`）
 
 **第 7 步　交付**
 - 保存新版本至 `model/`（如 `model/PDD-model-v03.xlsx`；行业整本按原文件名递增版本或日期）。
 - 登记新版本：先调用 `knowledge_read(doc="models")` 取 `latest_version_no` 作为 `base_version`（无记录时传 `null`），再调用 `knowledge_update(doc="models", ...)` 登记新版本（字段遵循 `dalton-knowledge` 的模型登记 schema：`versions[]` 追加条目，必填 `id`〔形如 `v03`〕、`path`〔形如 `model/PDD-model-v03.xlsx`〕、`created_at`、`reason`，可附 `recalculated` 与 `key_outputs`，并将 `current` 指向新版本 `id`）。`python3 .agents/skills/dalton-model/scripts/model_style.py lineage ...` 写出的 `model_lineage.json` 只是附加的普通记录（记录输入输出路径与哈希），不代替知识层登记。
+  - `knowledge_update(doc="models", base_version=..., ops=[...])` 的 `ops` 形状：`[{"op": "append", "path": "/versions", "value": {"id": "v03", "path": "model/PDD-model-v03.xlsx", "created_at": "...", "reason": "...", "recalculated": true}}, {"op": "set", "path": "/current", "value": "v03"}]`（完整操作语法与写入样例见 `.agents/skills/dalton-knowledge/SKILL.md` 与 `.agents/skills/dalton-knowledge/references/structured-write-example.md`）。
 - 更新变更记录（无 `README & Changelog` 工作表时新建并放在最前面）：写明版本号、日期、所基于的原模型文件、补充的实际值、新增期间、修改的关键驱动假设及理由、结构调整、与一致预期的主要差异及理由、扫描提示中保留不改的重要条目及原因。
 - 回复用户时用几句话说清：关键预测（收入、利润、EPS）、和上一版相比变了什么、和一致预期差在哪里。
 
@@ -70,6 +72,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 | 偏离一致预期没检查 | 2028E 净利润明显高于一致预期，没有说明来源 | 拆差异来源，确认有依据再保留，并写理由 |
 | 集团和分部脱节 | 集团营业利润单独预测，与分部营业利润之和对不上 | 集团营业利润 = 分部之和 + 总部及抵销（单列），或在对不上时写明差额 |
 | 现金和股本不联动 | 净现金很多却没有利息收入增长；回购了但股数不变 | 利息随现金滚存；回购和股权激励改变股数（见 `.agents/skills/dalton-model/references/forecast-rules.md` 净现金公司示例） |
+| 一次性项目混进了基数 | 某年有大额裁员费用或税务补提，下一年直接按那年的利润率或税率外推 | 历史期把一次性项目单列，用扣除后的正常化水平作驱动参照；已知的未来一次性项目单独一行（见 `forecast-rules.md` 一次性项目一节） |
+| 收购贡献混进内生增长 | 去年完成收购，今年收入增速 40%，直接按 40% 外推 | 拆出内生增长和收购贡献分别预测；协同效应按公司披露单列；待交割的交易按预计交割时间和支付方式处理现金、债务、股数（见 `forecast-rules.md` 收购与出售一节） |
 | 外部插件公式留在模型里 | Capital IQ、Bloomberg（第三方金融终端插件）公式在无插件环境下显示 `#NAME?`（函数名无法识别错误） | 在单独输入格填入带来源和日期的数值，原单元格用公式引用该输入格 |
 
 ## 参考文件

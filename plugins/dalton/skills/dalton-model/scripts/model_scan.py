@@ -27,14 +27,16 @@ Advisory categories reported:
        External workbook links, broken defined names, third-party plugin functions
        (Capital IQ, BQL, BDH, BDP, RTD, WEBSERVICE), broken #REF! tokens
        (including inside IFERROR), and circular references (iterate=True or
-       dependency cycles). Repetitive package parts, defined names, and per-sheet
-       plugin clusters are summarized with counts and representative items so every
-       finding subtype stays visible.
+       dependency cycles). Subtypes are summarized and interleaved fairly so
+       external parts, #REF!, circular references, and plugins all remain visible
+       within ``max_items``.
     4. recalc_errors
        Excel formula error values (#DIV/0!, #REF!, #NAME?, #VALUE!, #N/A, #NUM!,
-       #NULL!, #SPILL!, #CALC!, #ERROR!) summarized per (sheet, error_code) with
-       counts and representative coordinates. Falls back to existing cached error
-       values whenever --recalc is skipped, fails, or times out.
+       #NULL!, #SPILL!, #CALC!, #ERROR!) summarized per (sheet, error_code) and
+       interleaved across error codes (non-#NAME? prioritized). Distinguishes
+       complete vs partial (``incomplete``) recalc, preserves upstream total
+       error counts / error_summary / truncation, and retains cached errors
+       whenever recalc is partial, skipped, fails, or times out.
 """
 
 from __future__ import annotations
@@ -63,6 +65,7 @@ _REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _XML_PARSER = etree.XMLParser(resolve_entities=False, no_network=True)
 
 _ERROR_RE = re.compile(r"^#(?:N/A|[A-Z0-9/]+[!?])$")
+_EXCEL_STR_RE = re.compile(r'"(?:""|[^"])*"')
 _PLUGIN_FUNC_RE = re.compile(
     r"(?:_xll\.ciqfunctions|\bCIQ\s*\(|\bBQL\s*\(|\bBDH\s*\(|\bBDP\s*\(|\bRTD\s*\(|\bWEBSERVICE\s*\()",
     re.IGNORECASE,
@@ -85,6 +88,11 @@ _Y_FIRST_Q_RE = re.compile(r"^\s*(?:FY|CY)?\s*(\d{2}|\d{4})\s*['\-/\s]?Q([1-4])\
 _ANNUAL_RE = re.compile(r"^\s*(?:FY|CY)?\s*'?((?:19|20)\d{2}|\d{2})\s*([AEFP])?\s*$", re.IGNORECASE)
 
 _EXAMPLE_LIMIT = 5
+
+
+def _strip_excel_string_literals(expr: str) -> str:
+    """Replace double-quoted Excel string literals with empty quotes."""
+    return _EXCEL_STR_RE.sub('""', expr)
 
 
 def _iter_stored_cells(ws: Any) -> list[tuple[int, int, Any]]:
@@ -122,11 +130,18 @@ def _detect_plugin_function(formula: str) -> str | None:
     try:
         tokens = Tokenizer(formula).items
     except Exception:
-        m_plug = _PLUGIN_FUNC_RE.search(formula)
+        cleaned = _strip_excel_string_literals(formula)
+        m_plug = _PLUGIN_FUNC_RE.search(cleaned)
         if not m_plug:
             return None
         tag = m_plug.group(0).upper().replace("(", "").strip()
-        return "CIQ" if "CIQ" in tag else tag
+        if "CIQ" in tag:
+            return "CIQ"
+        if "BQL" in tag:
+            return "BQL"
+        if "BDH" in tag:
+            return "BDH"
+        return tag
 
     for tok in tokens:
         if tok.type == Token.FUNC and tok.subtype == Token.OPEN:
@@ -215,7 +230,8 @@ def _has_external_operand(expr: str) -> bool:
     try:
         tokens = Tokenizer(expr if expr.startswith("=") else "=" + expr).items
     except Exception:
-        return False
+        cleaned = _strip_excel_string_literals(expr)
+        return "[" in cleaned and "!" in cleaned
     for tok in tokens:
         if tok.type == Token.OPERAND and tok.subtype == Token.RANGE and "!" in tok.value:
             if "[" in tok.value.rsplit("!", 1)[0]:
@@ -229,7 +245,8 @@ def _has_ref_error(expr: str) -> bool:
     try:
         tokens = Tokenizer(expr if expr.startswith("=") else "=" + expr).items
     except Exception:
-        return "#REF!" in expr.upper()
+        cleaned = _strip_excel_string_literals(expr)
+        return "#REF!" in cleaned.upper()
     return any(
         tok.type == Token.OPERAND
         and tok.subtype in (Token.ERROR, Token.RANGE)
@@ -432,12 +449,19 @@ def _run_recalc_on_copy(
     src_path: Path,
     recalc_script: Path,
     timeout: int = 120,
-) -> tuple[list[dict[str, Any]], str, bool]:
+) -> tuple[list[dict[str, Any]], str, str, dict[str, Any]]:
     """Copy workbook to a temp dir, run recalc.py on the copy, and collect error cells.
 
-    Returns ``(errors, note, recalc_succeeded)``.
+    Returns ``(errors, note, recalc_state, meta)`` where ``recalc_state`` is one of
+    ``"complete"``, ``"incomplete"``, or ``"failed"``.
     """
     errors: list[dict[str, Any]] = []
+    empty_meta: dict[str, Any] = {
+        "total_errors": 0,
+        "error_summary": {},
+        "upstream_truncated": False,
+        "unmatched": 0,
+    }
     with tempfile.TemporaryDirectory(prefix="model_scan_recalc_") as td:
         copy_path = Path(td) / src_path.name
         shutil.copy2(src_path, copy_path)
@@ -453,20 +477,23 @@ def _run_recalc_on_copy(
             return (
                 errors,
                 f"recalc_timeout: recalc.py 超时（{timeout}s），已回退报告原文件现有缓存错误",
-                False,
+                "failed",
+                empty_meta,
             )
         except OSError as exc:
             return (
                 errors,
                 f"recalc_failed: 无法启动 recalc.py（{exc}），已回退报告原文件现有缓存错误",
-                False,
+                "failed",
+                empty_meta,
             )
 
         if not proc.stdout.strip():
             return (
                 errors,
                 f"recalc_failed: rc={proc.returncode} {proc.stderr.strip()[:200]}（已回退报告现有缓存错误）",
-                False,
+                "failed",
+                empty_meta,
             )
         try:
             res = json.loads(proc.stdout)
@@ -474,15 +501,17 @@ def _run_recalc_on_copy(
             return (
                 errors,
                 f"recalc_unparseable_output: {proc.stdout.strip()[:200]}（已回退报告现有缓存错误）",
-                False,
+                "failed",
+                empty_meta,
             )
 
-        status = res.get("status", "unknown")
+        status = str(res.get("status", "unknown"))
         if status == "error":
             return (
                 errors,
                 f"recalc_declined: {res.get('message', 'unknown error')}（已回退报告现有缓存错误）",
-                False,
+                "failed",
+                empty_meta,
             )
 
         for err in res.get("errors") or []:
@@ -494,8 +523,40 @@ def _run_recalc_on_copy(
                 "reason": f"重算后出现错误值 {err_code}",
                 "formula": str(err.get("formula", ""))[:80],
             })
-        note = f"recalc_ok (engine={res.get('engine')}, status={status}, total_errors={res.get('total_errors', len(errors))})"
-        return errors, note, True
+
+        raw_summary = res.get("error_summary")
+        err_summary = {
+            str(k).strip(): int(v)
+            for k, v in (raw_summary.items() if isinstance(raw_summary, dict) else ())
+            if int(v) > 0
+        }
+        total_errors = int(res.get("total_errors", len(errors)) or 0)
+        unmatched = int(res.get("unmatched", 0) or 0)
+        upstream_truncated = bool(res.get("truncated")) or total_errors > len(errors)
+        meta = {
+            "status": status,
+            "engine": res.get("engine"),
+            "total_errors": total_errors,
+            "error_summary": err_summary,
+            "upstream_truncated": upstream_truncated,
+            "unmatched": unmatched,
+        }
+
+        if status == "incomplete":
+            note = (
+                f"recalc_partial (engine={res.get('engine')}, status=incomplete, "
+                f"unmatched={unmatched}, total_errors={total_errors})："
+                "部分公式未能重算，已合并保留原文件现有缓存错误提示"
+            )
+            return errors, note, "incomplete", meta
+
+        note = (
+            f"recalc_ok (engine={res.get('engine')}, status={status}, "
+            f"total_errors={total_errors}"
+            + (f", upstream_truncated=true, listed={len(errors)}" if upstream_truncated else "")
+            + ")"
+        )
+        return errors, note, "complete", meta
 
 
 def _round_robin_pick(
@@ -527,35 +588,55 @@ def _summarize_recalc_errors(
     sheet_order: dict[str, int],
     max_items: int,
     source_label: str,
-) -> tuple[list[dict[str, Any]], bool]:
-    """Summarize errors per (sheet, error_code), prioritizing non-#NAME? errors."""
+    upstream_error_summary: dict[str, int] | None = None,
+    upstream_truncated: bool = False,
+) -> tuple[list[dict[str, Any]], bool, dict[str, int]]:
+    """Summarize errors per (sheet, error_code) and interleave across error codes.
+
+    Non-``#NAME?`` error codes are prioritized ahead of ``#NAME?``. Any error code
+    present in ``upstream_error_summary`` whose detail cells were cut off by
+    upstream truncation is preserved as an explicit summary row so no error type
+    is silently dropped.
+    """
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    listed_code_counts: dict[str, int] = defaultdict(int)
     for err in raw_errors:
         sh = str(err.get("sheet", ""))
         code = str(err.get("error", "")).strip() or "#ERROR!"
         grouped[(sh, code)].append(err)
+        listed_code_counts[code] += 1
 
-    ordered_keys = sorted(
+    # Merge upstream error_summary counts so totals per error code stay exact
+    code_counts: dict[str, int] = dict(listed_code_counts)
+    unlisted_code_rows: dict[str, dict[str, Any]] = {}
+    if upstream_error_summary:
+        for code, u_cnt in upstream_error_summary.items():
+            listed = listed_code_counts.get(code, 0)
+            code_counts[code] = max(listed, u_cnt)
+            if listed == 0 and u_cnt > 0:
+                unlisted_code_rows[code] = {
+                    "sheet": "<recalc_summary>",
+                    "cell": f"上游汇总 {u_cnt} 处（明细截断未返回坐标）",
+                    "error": code,
+                    "count": u_cnt,
+                    "reason": (
+                        f"上游重算汇总报告 {u_cnt} 处 {code} 错误"
+                        f"（上游仅返回前 {len(raw_errors)} 条明细，该错误类型坐标被截断）"
+                    ),
+                }
+
+    # Build per-error-code lists (each list sorted by sheet order), then round-robin across codes
+    by_code: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for (sh, code) in sorted(
         grouped.keys(),
-        key=lambda kv: (
-            1 if kv[1].upper() == "#NAME?" else 0,
-            sheet_order.get(kv[0], 10**6),
-            kv[0],
-            kv[1],
-        ),
-    )
-
-    out: list[dict[str, Any]] = []
-    for sh, code in ordered_keys:
-        if len(out) >= max_items:
-            break
+        key=lambda kv: (sheet_order.get(kv[0], 10**6), kv[0], kv[1]),
+    ):
         rows = grouped[(sh, code)]
         if len(rows) == 1:
-            one = dict(rows[0])
-            out.append(one)
+            by_code[code].append(dict(rows[0]))
         else:
             ex_cells = [r["cell"] for r in rows[:_EXAMPLE_LIMIT]]
-            out.append({
+            by_code[code].append({
                 "sheet": sh,
                 "cell": f"{ex_cells[0]} 等 {len(rows)} 格",
                 "error": code,
@@ -564,8 +645,27 @@ def _summarize_recalc_errors(
                 "reason": f"该表共 {len(rows)} 处{source_label}错误值 {code}，代表单元格：{', '.join(ex_cells)}",
                 "formula": rows[0].get("formula", ""),
             })
-    truncated = len(ordered_keys) > len(out)
-    return out, truncated
+    for code, row in unlisted_code_rows.items():
+        by_code[code].append(row)
+
+    ordered_codes = sorted(
+        by_code.keys(),
+        key=lambda c: (1 if c.upper() == "#NAME?" else 0, c),
+    )
+    code_groups = [by_code[c] for c in ordered_codes]
+    total_groups = sum(len(g) for g in code_groups)
+    picked = _round_robin_pick(code_groups, max_items)
+    # Sort selected items cleanly: non-#NAME? first, then sheet order
+    picked.sort(
+        key=lambda it: (
+            1 if str(it.get("error", "")).upper() == "#NAME?" else 0,
+            sheet_order.get(str(it.get("sheet", "")), 10**6),
+            str(it.get("sheet", "")),
+            str(it.get("error", "")),
+        )
+    )
+    truncated = upstream_truncated or (total_groups > len(picked))
+    return picked, truncated, dict(sorted(code_counts.items()))
 
 
 def scan_workbook(
@@ -597,6 +697,9 @@ def scan_workbook(
 
     ext_summary_items: list[dict[str, Any]] = []
     ext_raw_count = 0
+    ext_parts_count = 0
+    dn_ext_count = 0
+    dn_ref_count = 0
 
     # 1. Package-level external links check (summarized into 1 entry for parts)
     has_external_links = False
@@ -606,6 +709,7 @@ def scan_workbook(
             ext_xmls = sorted(n for n in names if n.startswith("xl/externalLinks/") and n.endswith(".xml"))
             if ext_xmls:
                 has_external_links = True
+                ext_parts_count = len(ext_xmls)
                 ext_raw_count += len(ext_xmls)
                 ex_parts = ext_xmls[:_EXAMPLE_LIMIT]
                 ext_summary_items.append({
@@ -650,8 +754,9 @@ def scan_workbook(
             dn_ref_list.append((scope, name, expr))
 
     if dn_ext_list:
-        ext_raw_count += len(dn_ext_list)
-        if len(dn_ext_list) == 1:
+        dn_ext_count = len(dn_ext_list)
+        ext_raw_count += dn_ext_count
+        if dn_ext_count == 1:
             sc, nm, ex = dn_ext_list[0]
             ext_summary_items.append({
                 "sheet": f"definedName({sc})",
@@ -664,16 +769,17 @@ def scan_workbook(
             ex_names = [f"{sc}:{nm}" for sc, nm, _ in dn_ext_list[:_EXAMPLE_LIMIT]]
             ext_summary_items.append({
                 "sheet": "<definedNames>",
-                "cell": f"{dn_ext_list[0][1]} 等 {len(dn_ext_list)} 个",
+                "cell": f"{dn_ext_list[0][1]} 等 {dn_ext_count} 个",
                 "kind": "defined_name_external",
-                "count": len(dn_ext_list),
+                "count": dn_ext_count,
                 "examples": ex_names,
-                "reason": f"共 {len(dn_ext_list)} 个命名区域指向外部工作簿，代表项：{', '.join(ex_names)}",
+                "reason": f"共 {dn_ext_count} 个命名区域指向外部工作簿，代表项：{', '.join(ex_names)}",
             })
 
     if dn_ref_list:
-        ext_raw_count += len(dn_ref_list)
-        if len(dn_ref_list) == 1:
+        dn_ref_count = len(dn_ref_list)
+        ext_raw_count += dn_ref_count
+        if dn_ref_count == 1:
             sc, nm, ex = dn_ref_list[0]
             ext_summary_items.append({
                 "sheet": f"definedName({sc})",
@@ -686,11 +792,11 @@ def scan_workbook(
             ex_names = [f"{sc}:{nm}" for sc, nm, _ in dn_ref_list[:_EXAMPLE_LIMIT]]
             ext_summary_items.append({
                 "sheet": "<definedNames>",
-                "cell": f"{dn_ref_list[0][1]} 等 {len(dn_ref_list)} 个",
+                "cell": f"{dn_ref_list[0][1]} 等 {dn_ref_count} 个",
                 "kind": "defined_name_ref",
-                "count": len(dn_ref_list),
+                "count": dn_ref_count,
                 "examples": ex_names,
-                "reason": f"共 {len(dn_ref_list)} 个命名区域含断裂引用 #REF!，代表项：{', '.join(ex_names)}",
+                "reason": f"共 {dn_ref_count} 个命名区域含断裂引用 #REF!，代表项：{', '.join(ex_names)}",
             })
 
     # 3. Circular references
@@ -731,8 +837,6 @@ def scan_workbook(
 
         stored = _iter_stored_cells(ws)
         non_empty_cells = 0
-        sheet_formulas = 0
-        sheet_numerics = 0
         row_label_cache: dict[int, str] = {}
 
         for r_idx, c_idx, cell in stored:
@@ -747,8 +851,6 @@ def scan_workbook(
 
             expr = _extract_formula_text(val)
             if expr is not None:
-                sheet_formulas += 1
-
                 # External link in formula (always checked, even on/above header row)
                 if _has_external_operand(expr):
                     has_external_links = True
@@ -828,7 +930,7 @@ def scan_workbook(
                                 "formula": expr[:80],
                             })
 
-                # Always collect existing cached error value (used unless --recalc succeeds)
+                # Always collect existing cached error value (used unless complete --recalc succeeds)
                 cv = _get_stored_cell_value(ws_v, r_idx, c_idx)
                 if isinstance(cv, str) and _ERROR_RE.match(cv.strip()):
                     err_code = cv.strip()
@@ -841,7 +943,6 @@ def scan_workbook(
                     })
 
             elif isinstance(val, (int, float)) and not isinstance(val, bool):
-                sheet_numerics += 1
                 if below_header and pinfo is not None and pinfo.get("is_forecast"):
                     if r_idx not in row_label_cache:
                         row_label_cache[r_idx] = _row_label(ws, r_idx)
@@ -873,11 +974,9 @@ def scan_workbook(
                     "formula": "",
                 })
 
-        # Track visible content sheets where no period header was detected in rows 1..5
-        if hdr_row is None and ws.sheet_state == "visible":
-            is_blank_divider = sheet_formulas == 0 and sheet_numerics == 0 and non_empty_cells <= 2
-            if not is_blank_divider:
-                sheets_without_period_header.append(ws.title)
+        # Any non-empty visible sheet without a period header in rows 1..5 is listed for review
+        if hdr_row is None and ws.sheet_state == "visible" and non_empty_cells > 0:
+            sheets_without_period_header.append(ws.title)
 
         n_un = len(fc_by_sheet_unstyled.get(ws.title, []))
         n_fi = len(fc_by_sheet_filled.get(ws.title, []))
@@ -918,7 +1017,8 @@ def scan_workbook(
     pm_picked.sort(key=lambda it: sheet_order.get(it["sheet"], 10**6))
     pm_truncated = pm_raw_count > len(pm_picked)
 
-    # Assemble external_or_broken_or_circular with every subtype visible
+    # Assemble external_or_broken_or_circular via round-robin across distinct subtypes
+    # so no single subtype (e.g. 50 circular refs) can crowd out external parts, #REF!, or plugins
     formula_ext_summarized: list[dict[str, Any]] = []
     for sh in wb_f.sheetnames:
         rows = formula_ext_by_sheet.get(sh)
@@ -958,7 +1058,6 @@ def scan_workbook(
                 "formula": rows[0].get("formula", ""),
             })
 
-    # Keep #REF! formula cells individually when moderate, or cap per sheet with summary
     formula_ref_display: list[dict[str, Any]] = []
     ref_by_sheet: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for it in formula_ref_items:
@@ -981,51 +1080,133 @@ def scan_workbook(
                 "reason": f"该表另有 {len(rows) - _EXAMPLE_LIMIT} 个公式包含断裂引用 #REF!",
             })
 
-    ext_all_display = (
-        circular_items
-        + formula_ref_display
-        + ext_summary_items
-        + formula_ext_summarized
-        + plugin_summarized
+    subtype_groups = [
+        grp
+        for grp in (
+            ext_summary_items,
+            formula_ref_display,
+            circular_items,
+            formula_ext_summarized,
+            plugin_summarized,
+        )
+        if grp
+    ]
+    total_ext_display = sum(len(g) for g in subtype_groups)
+    ext_items = _round_robin_pick(subtype_groups, max_items)
+    _kind_order = {
+        "circular_reference": 0,
+        "formula_ref_error": 1,
+        "formula_ref_error_more": 2,
+        "external_link_parts": 3,
+        "workbook_external_references": 4,
+        "defined_name_external": 5,
+        "defined_name_ref": 6,
+        "formula_external_link": 7,
+        "plugin_formula": 8,
+    }
+    ext_items.sort(
+        key=lambda it: (
+            _kind_order.get(str(it.get("kind", "")), 99),
+            sheet_order.get(str(it.get("sheet", "")), 10**6),
+        )
     )
-    ext_items = ext_all_display[:max_items]
-    ext_truncated = len(ext_all_display) > len(ext_items)
+    ext_truncated = total_ext_display > len(ext_items)
 
-    # 5. Optional recalculation on disposable copy (--recalc), with fallback to cached errors
+    external_breakdown = {
+        "external_link_parts": ext_parts_count,
+        "defined_name_external": dn_ext_count,
+        "defined_name_ref": dn_ref_count,
+        "circular_references": len(circular_items),
+        "formula_ref_errors": len(formula_ref_items),
+        "formula_external_links": sum(len(v) for v in formula_ext_by_sheet.values()),
+        "plugin_formulas": sum(plugin_counts.values()),
+    }
+
+    # 5. Optional recalculation on disposable copy (--recalc), distinguishing complete vs partial
     recalc_ran = False
+    recalc_complete = False
+    recalc_status = "not_requested"
     recalc_note = "未运行重算（仅扫描原文件现有缓存；如需重算副本请加 --recalc）"
     raw_error_rows = cached_error_rows
     error_source_label = "缓存"
+    upstream_error_summary: dict[str, int] | None = None
+    upstream_truncated = False
+    reported_total_errors = len(cached_error_rows)
 
     if recalc:
         if has_external_links:
+            recalc_status = "skipped_external_links"
             recalc_note = "已跳过重算：工作簿含外部链接，recalc.py 默认拒绝含外链文件，已回退报告原文件现有缓存错误"
         else:
             rscript = _locate_recalc_script(recalc_script)
             if rscript is None:
+                recalc_status = "skipped_no_script"
                 recalc_note = "未找到 recalc.py，已跳过重算并回退报告原文件现有缓存错误"
             else:
-                recalc_errs, recalc_note, recalc_ok = _run_recalc_on_copy(path, rscript)
-                if recalc_ok:
+                recalc_errs, recalc_note, recalc_state, recalc_meta = _run_recalc_on_copy(path, rscript)
+                recalc_status = recalc_state
+                if recalc_state == "complete":
                     recalc_ran = True
+                    recalc_complete = True
                     error_source_label = "重算"
-                    raw_error_rows = [
+                    filtered_recalc = [
                         err for err in recalc_errs
                         if not target_sheets or err.get("sheet") in target_sheets
                     ]
+                    raw_error_rows = filtered_recalc
+                    if target_sheets is None:
+                        upstream_error_summary = recalc_meta.get("error_summary") or None
+                        upstream_truncated = bool(recalc_meta.get("upstream_truncated"))
+                        reported_total_errors = max(
+                            len(filtered_recalc),
+                            int(recalc_meta.get("total_errors", 0) or 0),
+                        )
+                    else:
+                        reported_total_errors = len(filtered_recalc)
+                elif recalc_state == "incomplete":
+                    recalc_ran = True
+                    recalc_complete = False
+                    error_source_label = "部分重算+缓存"
+                    filtered_recalc = [
+                        err for err in recalc_errs
+                        if not target_sheets or err.get("sheet") in target_sheets
+                    ]
+                    merged: list[dict[str, Any]] = list(filtered_recalc)
+                    seen_keys = {
+                        (str(e.get("sheet", "")), str(e.get("cell", "")), str(e.get("error", "")))
+                        for e in merged
+                    }
+                    for ce in cached_error_rows:
+                        k = (str(ce.get("sheet", "")), str(ce.get("cell", "")), str(ce.get("error", "")))
+                        if k not in seen_keys:
+                            merged.append(ce)
+                            seen_keys.add(k)
+                    raw_error_rows = merged
+                    if target_sheets is None:
+                        upstream_error_summary = recalc_meta.get("error_summary") or None
+                        upstream_truncated = bool(recalc_meta.get("upstream_truncated"))
+                        reported_total_errors = max(
+                            len(merged),
+                            int(recalc_meta.get("total_errors", 0) or 0),
+                        )
+                    else:
+                        reported_total_errors = len(merged)
 
-    err_items, err_truncated = _summarize_recalc_errors(
+    err_items, err_truncated, error_code_counts = _summarize_recalc_errors(
         raw_error_rows,
         sheet_order=sheet_order,
         max_items=max_items,
         source_label=error_source_label,
+        upstream_error_summary=upstream_error_summary,
+        upstream_truncated=upstream_truncated,
     )
+    reported_total_errors = max(reported_total_errors, sum(error_code_counts.values()))
 
     totals = {
         "forecast_constants": fc_raw_count,
         "possible_period_mismatch": pm_raw_count,
         "external_or_broken_or_circular": ext_raw_count,
-        "recalc_errors": len(raw_error_rows),
+        "recalc_errors": reported_total_errors,
     }
 
     summary_parts = [
@@ -1035,6 +1216,8 @@ def scan_workbook(
         f"外链/插件/#REF!/循环引用 {totals['external_or_broken_or_circular']} 处",
         f"{error_source_label}错误值 {totals['recalc_errors']} 处。",
     ]
+    if recalc_status == "incomplete":
+        summary_parts.append("注意：本次为部分重算（incomplete），已同时保留原文件现有缓存错误。")
     if hidden_sheets_scanned:
         summary_parts.append(f"显式指定扫描的隐藏工作表：{', '.join(hidden_sheets_scanned)}。")
     if sheets_without_period_header:
@@ -1050,8 +1233,12 @@ def scan_workbook(
         "sheets_scanned": sheets_scanned,
         "sheets_without_period_header": sheets_without_period_header,
         "recalc_ran": recalc_ran,
+        "recalc_complete": recalc_complete,
+        "recalc_status": recalc_status,
         "recalc_note": recalc_note,
         "plugin_formula_counts": dict(sorted(plugin_counts.items())),
+        "external_breakdown": external_breakdown,
+        "error_code_counts": error_code_counts,
         "forecast_constants_by_sheet": fc_summary_by_sheet,
         "summary": " ".join(summary_parts),
         "counts": totals,

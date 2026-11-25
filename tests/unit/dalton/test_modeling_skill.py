@@ -64,6 +64,9 @@ PROPRIETARY_BLACKLIST: tuple[str, ...] = (
     "基金 wiki",
 )
 
+#: The real function, captured at import so every stub specs it even after another test patched it.
+_REAL_SUBPROCESS_RUN = subprocess.run
+
 
 def _load_script(name: str, path: Path) -> Any:
     if str(SCRIPTS_DIR) not in sys.path:
@@ -310,7 +313,9 @@ def test_model_style_profile_applies_observed_styles_and_fallback(tmp_path: Path
     c_new_zh = ws_new.cell(2, 2, "利润表")
     ms.apply_cell_style(c_new_zh, "sec_report", profile=prof, sheet_name="Model")
     assert c_new_zh.font.name == "微软雅黑"
-    assert c_new_zh.fill.fgColor.rgb.endswith("D9E1F2")
+    # Unrecognized custom section fill D9E1F2 stays in section_fills/blocks instead of overwriting sec_report
+    assert c_new_zh.fill.fgColor.rgb.endswith(ms.SEC_REPORT_FILL)
+    assert "D9E1F2" in prof["workbook_defaults"]["section_fills"]
 
     # Without profile, apply_cell_style falls back cleanly to defaults
     c_def_hdr = ws_new.cell(1, 3, "2028E")
@@ -329,6 +334,135 @@ def test_model_style_profile_applies_observed_styles_and_fallback(tmp_path: Path
     corrupt_prof = ms.profile_workbook_style(corrupt)
     assert corrupt_prof["source"] == "default"
     assert "fallback_reason" in corrupt_prof
+
+
+def test_model_style_section_colors_match_known_defaults_not_order(tmp_path: Path) -> None:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Model - Futu"
+    # Peach (FFCC99) appears BEFORE light blue (99CCFF), plus an unknown custom color (D9E1F2)
+    c1 = ws.cell(2, 1, "Brokerage submodel")
+    c1.fill = PatternFill(fill_type="solid", fgColor="FFCC99")
+    c1.font = Font(name="Arial", size=8, bold=True, color="000000")
+    c2 = ws.cell(4, 1, "Income statement")
+    c2.fill = PatternFill(fill_type="solid", fgColor="99CCFF")
+    c2.font = Font(name="Arial", size=8, bold=True, color="000000")
+    c3 = ws.cell(6, 1, "Custom block")
+    c3.fill = PatternFill(fill_type="solid", fgColor="D9E1F2")
+    c3.font = Font(name="Arial", size=8, bold=True, color="1F4E79")
+
+    xlsx = tmp_path / "sections.xlsx"
+    wb.save(xlsx)
+
+    prof = ms.profile_workbook_style(xlsx)
+    sh = prof["sheet_overrides"]["Model - Futu"]
+    assert sh["section_fills"] == ["FFCC99", "99CCFF", "D9E1F2"]
+    assert sh["section_styles"]["sec_report"]["fill_color"] == "99CCFF"
+    assert sh["section_styles"]["sec_submodel"]["fill_color"] == "FFCC99"
+    assert sh["section_styles"]["sec_segment"]["fill_color"] == "993300"
+
+    wb_out = openpyxl.Workbook()
+    ws_out = wb_out.active
+    c_rep = ws_out.cell(1, 1, "Brokerage business")
+    ms.apply_cell_style(c_rep, "sec_report", profile=prof, sheet_name="Model - Futu")
+    assert c_rep.fill.fgColor.rgb.endswith("99CCFF")
+    c_sub = ws_out.cell(2, 1, "Sub block")
+    ms.apply_cell_style(c_sub, "sec_submodel", profile=prof, sheet_name="Model - Futu")
+    assert c_sub.fill.fgColor.rgb.endswith("FFCC99")
+
+
+def test_model_style_parts_diff_detects_dropped_media_and_x14_after_openpyxl_roundtrip(
+    tmp_path: Path,
+) -> None:
+    orig = tmp_path / "orig.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Model"
+    ws["A1"] = "Revenue"
+    ws["B1"] = 100
+    ws2 = wb.create_sheet("Summary")
+    ws2["A1"] = "Note"
+    wb.save(orig)
+
+    # Inject an EMF media image + drawing rel + x14 conditional formatting extLst into Model (sheet1.xml)
+    with zipfile.ZipFile(orig, "r") as zf:
+        infos = zf.infolist()
+        payload = {i.filename: zf.read(i.filename) for i in infos}
+
+    sheet1_xml = payload["xl/worksheets/sheet1.xml"].decode("utf-8")
+    x14_block = (
+        '<drawing r:id="rId1"/>'
+        '<extLst>'
+        '<ext uri="{78C0D931-6437-407d-A8EE-F0AAD7539E65}" '
+        'xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main">'
+        '<x14:conditionalFormattings>'
+        '<x14:conditionalFormatting><x14:cfRule type="dataBar"/></x14:conditionalFormatting>'
+        '</x14:conditionalFormattings>'
+        '</ext>'
+        '</extLst>'
+    )
+    sheet1_xml = sheet1_xml.replace(
+        "<worksheet ",
+        '<worksheet xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" ',
+        1,
+    ) if "xmlns:r=" not in sheet1_xml else sheet1_xml
+    sheet1_xml = sheet1_xml.replace("</worksheet>", x14_block + "</worksheet>")
+    payload["xl/worksheets/sheet1.xml"] = sheet1_xml.encode("utf-8")
+    payload["xl/worksheets/_rels/sheet1.xml.rels"] = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rId1" '
+        b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" '
+        b'Target="../drawings/drawing1.xml"/>'
+        b'</Relationships>'
+    )
+    payload["xl/drawings/drawing1.xml"] = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>'
+    )
+    payload["xl/drawings/_rels/drawing1.xml.rels"] = (
+        b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        b'<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        b'<Relationship Id="rId1" '
+        b'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" '
+        b'Target="../media/image1.emf"/>'
+        b'</Relationships>'
+    )
+    payload["xl/media/image1.emf"] = b"FAKE-EMF-BYTES"
+
+    with zipfile.ZipFile(orig, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for fn, raw in payload.items():
+            zout.writestr(fn, raw)
+
+    # Identical workbook diff reports no losses and exit 0
+    same = ms.diff_workbook_parts(orig, orig)
+    assert same["status"] == "ok"
+    assert same["has_losses"] is False
+
+    # Roundtrip with openpyxl AND insert README & Changelog at index 0 (shifting sheet XML numbers)
+    edited = tmp_path / "edited.xlsx"
+    wb_rt = openpyxl.load_workbook(orig)
+    wb_rt.create_sheet("README & Changelog", 0)
+    wb_rt.save(edited)
+
+    proc = subprocess.run(
+        [sys.executable, "-I", str(SCRIPTS_DIR / "model_style.py"), "parts-diff", str(orig), str(edited)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, f"parts-diff must exit 0 even with losses: {proc.stderr}"
+    rep = json.loads(proc.stdout)
+    assert rep["status"] == "ok"
+    assert rep["has_losses"] is True
+    assert rep["package_losses"]["media"] == 1
+    assert rep["media_ext_losses"]["emf"] == 1
+    assert rep["package_losses"]["drawings"] == 1
+    assert rep["package_losses"]["x14_cf_total"] == 1
+    assert "Model" in rep["affected_sheets_by_type"]["media"]
+    assert "Model" in rep["affected_sheets_by_type"]["x14_conditional_formatting"]
+    assert "README & Changelog" in rep["sheets_added"]
+    assert "EMF" in rep["summary"] and "x14" in rep["summary"] and "Model" in rep["summary"]
 
 
 def test_model_lineage_ordinary_bookkeeping_record(tmp_path: Path) -> None:
@@ -556,8 +690,7 @@ def test_model_scan_recalc_locator_copy_contract_and_timeout_fallback(
             stderr="",
         )
 
-    real_run = subprocess.run  # capture before patching; the module object is shared
-    mock_run_ok = create_autospec(real_run, side_effect=_fake_ok_run)
+    mock_run_ok = create_autospec(_REAL_SUBPROCESS_RUN, side_effect=_fake_ok_run)
     monkeypatch.setattr(mscan.subprocess, "run", mock_run_ok)
 
     rep_ok = mscan.scan_workbook(p, recalc=True)
@@ -573,7 +706,7 @@ def test_model_scan_recalc_locator_copy_contract_and_timeout_fallback(
     def _fake_timeout_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         raise subprocess.TimeoutExpired(cmd=cmd, timeout=120)
 
-    mock_run_timeout = create_autospec(real_run, side_effect=_fake_timeout_run)
+    mock_run_timeout = create_autospec(_REAL_SUBPROCESS_RUN, side_effect=_fake_timeout_run)
     monkeypatch.setattr(mscan.subprocess, "run", mock_run_timeout)
 
     rep_to = mscan.scan_workbook(p, recalc=True)
@@ -582,6 +715,155 @@ def test_model_scan_recalc_locator_copy_contract_and_timeout_fallback(
     assert "超时" in rep_to["recalc_note"]
     assert rep_to["counts"]["recalc_errors"] == 1
     assert any(it["cell"] == "B1" and "#DIV/0!" in it["reason"] for it in rep_to["items"]["recalc_errors"])
+
+
+def test_model_scan_recalc_incomplete_and_upstream_truncation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(REPO_ROOT)
+    p = tmp_path / "partial_and_trunc.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Model"
+    ws["A1"] = "=1/0"
+    ws["A2"] = '=1+"x"'
+    wb.save(p)
+    _inject_cached_errors_and_ext_parts(p, cell_errors={"A1": "#DIV/0!", "A2": "#VALUE!"})
+
+    # Case A: upstream returns status="incomplete" -> partial recalc merges cached errors
+    def _fake_incomplete(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout=json.dumps({
+                "status": "incomplete",
+                "engine": "ironcalc",
+                "unmatched": 3,
+                "total_errors": 1,
+                "error_summary": {"#DIV/0!": 1},
+                "errors": [{"sheet": "Model", "cell": "A1", "error": "#DIV/0!", "formula": "=1/0"}],
+                "truncated": False,
+            }),
+            stderr="",
+        )
+
+    monkeypatch.setattr(mscan.subprocess, "run", create_autospec(_REAL_SUBPROCESS_RUN, side_effect=_fake_incomplete))
+    rep_inc = mscan.scan_workbook(p, recalc=True)
+    assert rep_inc["status"] == "ok"
+    assert rep_inc["recalc_ran"] is True
+    assert rep_inc["recalc_complete"] is False
+    assert rep_inc["recalc_status"] == "incomplete"
+    assert "incomplete" in rep_inc["recalc_note"]
+    assert "部分重算" in rep_inc["summary"]
+    err_codes = {it["error"] for it in rep_inc["items"]["recalc_errors"]}
+    assert "#DIV/0!" in err_codes and "#VALUE!" in err_codes
+
+    # Case B: upstream truncates at 100 errors (100 #DIV/0! listed, 1 #REF! only in error_summary)
+    listed_100 = [
+        {"sheet": "Model", "cell": f"B{i}", "error": "#DIV/0!", "formula": "=1/0"}
+        for i in range(1, 101)
+    ]
+
+    def _fake_truncated(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout=json.dumps({
+                "status": "errors_found",
+                "engine": "ironcalc",
+                "unmatched": 0,
+                "total_errors": 101,
+                "error_summary": {"#DIV/0!": 100, "#REF!": 1},
+                "errors": listed_100,
+                "truncated": True,
+            }),
+            stderr="",
+        )
+
+    monkeypatch.setattr(mscan.subprocess, "run", create_autospec(_REAL_SUBPROCESS_RUN, side_effect=_fake_truncated))
+    rep_tr = mscan.scan_workbook(p, recalc=True)
+    assert rep_tr["status"] == "ok"
+    assert rep_tr["recalc_complete"] is True
+    assert rep_tr["counts"]["recalc_errors"] == 101
+    assert rep_tr["truncated"]["recalc_errors"] is True
+    assert rep_tr["error_code_counts"] == {"#DIV/0!": 100, "#REF!": 1}
+    assert any(it.get("error") == "#REF!" for it in rep_tr["items"]["recalc_errors"])
+
+
+def test_model_scan_subtype_quotas_dynamic_array_strings_and_short_text_headerless(
+    tmp_path: Path,
+) -> None:
+    p = tmp_path / "quotas_and_lows.xlsx"
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Main"
+    # 55 separate circular cycles (A1<->B1 ... A55<->B55)
+    for r in range(1, 56):
+        ws.cell(r, 1, f"=B{r}+1")
+        ws.cell(r, 2, f"=A{r}+1")
+    # 1 formula #REF! + 1 BQL plugin + dynamic-array string literal edge cases
+    ws["D1"] = "=IFERROR(#REF!,0)"
+    ws["D2"] = '=BQL("BABA US Equity","PX_LAST")'
+    ws["D3"] = '=IFERROR(A1#,"CIQ(")'
+    ws["D4"] = '=IFERROR(A1#,"#REF!")'
+    ws["D5"] = '=IFERROR(A1#+#REF!,"ok")'
+
+    # Visible sheet with only 2 text cells (must still appear in sheets_without_period_header)
+    ws_txt = wb.create_sheet("CoverNotes")
+    ws_txt["A1"] = "Model Overview"
+    ws_txt["A2"] = "Updated 2026-11-25"
+
+    # 50 sheets with #DIV/0! + 1 sheet with #REF! (max_items=50 must still show #REF!)
+    err_targets: list[tuple[str, str, str]] = []
+    for i in range(1, 51):
+        s = wb.create_sheet(f"S{i:02d}")
+        s["A1"] = "=1/0"
+        err_targets.append((f"xl/worksheets/sheet{i + 2}.xml", "A1", "#DIV/0!"))
+    s_ref = wb.create_sheet("S51_Ref")
+    s_ref["A1"] = "=NA()"
+    err_targets.append(("xl/worksheets/sheet53.xml", "A1", "#REF!"))
+
+    wb.save(p)
+    # Patch cached errors into all 51 sheets + 1 externalLink part
+    with zipfile.ZipFile(p, "r") as zf:
+        infos = zf.infolist()
+        payload = {i.filename: zf.read(i.filename) for i in infos}
+    for xml_path, ref_cell, code in err_targets:
+        root = etree.fromstring(payload[xml_path], ms._XML_PARSER)
+        for c_el in root.iter(f"{{{mscan._SML}}}c"):
+            if (c_el.get("r") or "").upper() == ref_cell:
+                c_el.set("t", "e")
+                v_el = c_el.find(f"{{{mscan._SML}}}v")
+                if v_el is None:
+                    v_el = etree.SubElement(c_el, f"{{{mscan._SML}}}v")
+                v_el.text = code
+        payload[xml_path] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    with zipfile.ZipFile(p, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for info in infos:
+            zout.writestr(info.filename, payload[info.filename])
+        zout.writestr("xl/externalLinks/externalLink1.xml", b'<?xml version="1.0"?><externalLink/>')
+
+    rep = mscan.scan_workbook(p, max_items=50)
+    assert rep["status"] == "ok"
+
+    # Every subtype present in external_or_broken_or_circular despite 55 circular cycles
+    ext_kinds = {it.get("kind") for it in rep["items"]["external_or_broken_or_circular"]}
+    assert {"circular_reference", "external_link_parts", "formula_ref_error", "plugin_formula"} <= ext_kinds
+    # Dynamic array string literals ignored; real #REF! in D5 detected
+    assert "CIQ" not in rep["plugin_formula_counts"]
+    assert rep["plugin_formula_counts"].get("BQL") == 1
+    ref_cells = {it.get("cell") for it in rep["items"]["external_or_broken_or_circular"] if it.get("kind") == "formula_ref_error"}
+    assert "D1" in ref_cells and "D5" in ref_cells and "D4" not in ref_cells
+
+    # Sheet 51's #REF! is NOT crowded out by 50 sheets of #DIV/0!
+    err_items = rep["items"]["recalc_errors"]
+    assert any(it.get("sheet") == "S51_Ref" and it.get("error") == "#REF!" for it in err_items)
+    assert any(it.get("error") == "#DIV/0!" for it in err_items)
+    assert rep["truncated"]["recalc_errors"] is True
+
+    # Short 2-cell visible text sheet IS listed in sheets_without_period_header
+    assert "CoverNotes" in rep["sheets_without_period_header"]
 
 
 def test_model_scan_recalc_from_repo_root_real_cli(tmp_path: Path) -> None:
