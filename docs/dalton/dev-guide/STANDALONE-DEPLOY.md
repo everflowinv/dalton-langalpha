@@ -377,9 +377,11 @@ docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core
 docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env --profile transcription exec -T transcription \
   curl -sf http://127.0.0.1:8965/healthz
 
-# 确认后端能力列表已包含 transcription
+# 使用已登录用户的访问令牌确认后端能力列表已包含 transcription
+# （可通过浏览器登录后的会话令牌，或调用 POST /api/v1/dalton/auth/local/login 获取 access_token）
+ACCESS_TOKEN='<已登录用户的访问令牌>'
 docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T backend \
-  curl -sf http://127.0.0.1:8000/api/v1/dalton/capabilities
+  curl -sf -H "Authorization: Bearer ${ACCESS_TOKEN}" http://127.0.0.1:8000/api/v1/dalton/capabilities
 ```
 
 `healthz` 返回 `owner_lock_held: true`、`ffmpeg_available: true`、`ffprobe_available: true`，且能力列表中出现 `transcription` 即表示就绪。停服维护前可先向 `POST http://127.0.0.1:8965/transcriptions/drain` 发送停止接单信号，等待 `active_jobs` 归零后再重启容器。

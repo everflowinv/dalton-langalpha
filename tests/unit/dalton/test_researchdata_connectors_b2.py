@@ -67,6 +67,7 @@ if str(BRIDGE_DIR) not in sys.path:
     sys.path.insert(0, str(BRIDGE_DIR))
 
 import asr_jobs as legacy_asr_jobs  # noqa: E402
+import bridge_subprocess_env  # noqa: E402
 import researchdata_bridge as rb  # noqa: E402
 
 
@@ -1529,6 +1530,7 @@ def test_deployment_configs_ffmpeg_entrypoint_networks_launchd_and_minio_init(
     assert "env_file" not in minio_s3_svc
     assert set(minio_s3_svc["networks"]) == {"core_internal", "sandbox-net"}
     assert "http://minio:9000" in minio_s3_svc["command"]
+    assert "--change-host-header=false" in minio_s3_svc["command"]
 
     env_core_example = (REPO_ROOT / ".env.core.example").read_text(encoding="utf-8")
     assert "DALTON_TRANSCRIPTION_S3_PUBLIC_ENDPOINT=http://minio-s3:9000" in env_core_example
@@ -1608,3 +1610,836 @@ def test_deployment_configs_ffmpeg_entrypoint_networks_launchd_and_minio_init(
         timeout=30,
     )
     assert proc.returncode == 0, f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+
+
+# ---------------------------------------------------------------------------
+# 9. r4: pre-startup config validation, legacy bridge URL parity, and switch
+#        script failure branches (Codex + Grok r2 review items)
+# ---------------------------------------------------------------------------
+
+
+def _valid_seed_asr_env() -> dict[str, str]:
+    return {
+        "DALTON_ASR_WORKER_MODE": "auto",
+        "SEED_ASR_APP_ID": "seed-app-secret-1234",
+        "SEED_ASR_ACCESS_KEY": "seed-access-secret-5678",
+        "VOLC_TOS_AK": "tos-ak-secret-abcd",
+        "VOLC_TOS_SK": "tos-sk-secret-efgh",
+        "VOLC_TOS_BUCKET": "dalton-seed-asr-bucket",
+        "DALTON_ASR_STORAGE_ENDPOINT_URL": "http://127.0.0.1:9000",
+        "DALTON_ASR_STORAGE_BUCKET_NAME": "transcriptions",
+        "DALTON_ASR_STORAGE_ACCESS_KEY_ID": "minio-ak-secret-1111",
+        "DALTON_ASR_STORAGE_SECRET_ACCESS_KEY": "minio-sk-secret-2222",
+    }
+
+
+@pytest.mark.asyncio
+async def test_standalone_service_misconfigured_skips_lock_and_recovery_and_reports_missing_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Missing any required adapter config or ffmpeg/ffprobe must skip `.owner.lock` & recovery and report status=misconfigured without leaking values."""
+
+    def _seed_incomplete_job(jobs_dir: Path, job_id: str) -> Path:
+        job_dir = jobs_dir / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        state_path = job_dir / "state.json"
+        state_path.write_text(
+            json.dumps(
+                {
+                    "job_id": job_id,
+                    "status": "transcribing",
+                    "stage": "transcribing",
+                    "attempt": 1,
+                    "caller": {"user_id": "u-1", "workspace_id": "ws-1", "thread_id": "th-1"},
+                    "source_object_key": f"transcriptions/ws-1/{job_id}/source/a.m4a",
+                    "source_size_bytes": 1024,
+                    "source_sha256": "a" * 64,
+                }
+            ),
+            encoding="utf-8",
+        )
+        return state_path
+
+    # Case 1: Missing one required Seed-ASR credential (VOLC_TOS_BUCKET)
+    jobs_dir_1 = tmp_path / "jobs_missing_tos_bucket"
+    state_1 = _seed_incomplete_job(jobs_dir_1, "job_inflight_seed")
+    env_missing_bucket = _valid_seed_asr_env()
+    env_missing_bucket.pop("VOLC_TOS_BUCKET")
+
+    mgr_spy = create_autospec(ts_jobs.AsrJobManager)
+    with monkeypatch.context() as mp:
+        mp.setattr(ts_app, "AsrJobManager", mgr_spy)
+        mp.setattr(ts_registry, "is_binary_available", lambda _name, _pref=None: True)
+        cfg1 = ts_app.TranscriptionServiceConfig(
+            jobs_dir=jobs_dir_1,
+            token="ts-misconfig-tok",
+            worker_mode="auto",
+            lock_timeout_s=0.1,
+        )
+        app1 = ts_app.create_app(config=cfg1, environ=env_missing_bucket)
+        resumed1 = app1.state.runtime.startup()
+        try:
+            assert resumed1 == []
+            mgr_spy.assert_not_called()
+            assert app1.state.runtime.owner_lock is None
+            assert not (jobs_dir_1 / ".owner.lock").exists()
+            # Incomplete job on disk MUST remain untouched (never marked failed)
+            assert json.loads(state_1.read_text(encoding="utf-8"))["status"] == "transcribing"
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app1), base_url="http://test"
+            ) as client:
+                hz = await client.get("/healthz")
+                assert hz.status_code == 200
+                body = hz.json()
+                assert body["status"] == "misconfigured"
+                assert body["ok"] is False
+                assert body["misconfigured"] is True
+                assert body["owner_lock_held"] is False
+                assert "VOLC_TOS_BUCKET" in body["missing_config"]
+                # Never leak configured secret values in /healthz
+                for secret_val in (
+                    "seed-app-secret-1234",
+                    "seed-access-secret-5678",
+                    "tos-ak-secret-abcd",
+                    "tos-sk-secret-efgh",
+                    "minio-ak-secret-1111",
+                    "minio-sk-secret-2222",
+                ):
+                    assert secret_val not in hz.text
+
+                sub = await client.post(
+                    "/transcriptions",
+                    headers={"Authorization": "Bearer ts-misconfig-tok"},
+                    json=_sample_submit_payload("job_should_reject"),
+                )
+                assert sub.status_code == 503
+                assert sub.json()["error_code"] == "service_misconfigured"
+                assert "VOLC_TOS_BUCKET" in sub.json()["missing_config"]
+        finally:
+            await app1.state.runtime.shutdown()
+
+    # Case 2: All Seed-ASR & storage credentials present, but ffmpeg is missing
+    jobs_dir_2 = tmp_path / "jobs_missing_ffmpeg"
+    state_2 = _seed_incomplete_job(jobs_dir_2, "job_inflight_ffmpeg")
+    mgr_spy_2 = create_autospec(ts_jobs.AsrJobManager)
+    with monkeypatch.context() as mp:
+        mp.setattr(ts_app, "AsrJobManager", mgr_spy_2)
+        mp.setattr(
+            ts_registry,
+            "is_binary_available",
+            lambda name, _pref=None: name != "ffmpeg",
+        )
+        cfg2 = ts_app.TranscriptionServiceConfig(
+            jobs_dir=jobs_dir_2,
+            token="ts-misconfig-tok",
+            worker_mode="seed_asr",
+            lock_timeout_s=0.1,
+        )
+        app2 = ts_app.create_app(config=cfg2, environ=_valid_seed_asr_env())
+        resumed2 = app2.state.runtime.startup()
+        try:
+            assert resumed2 == []
+            mgr_spy_2.assert_not_called()
+            assert not (jobs_dir_2 / ".owner.lock").exists()
+            assert json.loads(state_2.read_text(encoding="utf-8"))["status"] == "transcribing"
+
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app2), base_url="http://test"
+            ) as client:
+                hz2 = await client.get("/healthz")
+                assert hz2.status_code == 200
+                assert hz2.json()["status"] == "misconfigured"
+                assert hz2.json()["missing_config"] == ["ffmpeg"]
+                assert hz2.json()["owner_lock_held"] is False
+        finally:
+            await app2.state.runtime.shutdown()
+
+    # Case 3: Missing storage endpoint URL
+    jobs_dir_3 = tmp_path / "jobs_missing_storage_ep"
+    _seed_incomplete_job(jobs_dir_3, "job_inflight_ep")
+    env_missing_ep = _valid_seed_asr_env()
+    env_missing_ep.pop("DALTON_ASR_STORAGE_ENDPOINT_URL")
+    with monkeypatch.context() as mp:
+        mp.setattr(ts_registry, "is_binary_available", lambda _name, _pref=None: True)
+        val3 = ts_registry.validate_worker_startup_config(
+            mode="seed_asr", environ=env_missing_ep
+        )
+        assert val3.ok is False
+        assert "DALTON_ASR_STORAGE_ENDPOINT_URL" in val3.missing_config
+
+
+@pytest.mark.asyncio
+async def test_everflow_pre_cutover_transcription_url_respects_installer_custom_port_and_bridge_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pre-cutover Everflow follows DALTON_BRIDGE_URL / DALTON_RESEARCHDATA_URL (e.g. installer custom port) instead of hardcoding :8960."""
+    bridge_env_path = tmp_path / "researchdata-bridge.env"
+    repo_env_path = tmp_path / ".env"
+
+    meta = bridge_subprocess_env.merge_bridge_and_repo_env_files(
+        bridge_env_path=bridge_env_path,
+        repo_env_path=repo_env_path,
+        default_port="9123",
+        default_python_bin=sys.executable,
+    )
+    assert meta["port"] == 9123
+
+    _, repo_vals = bridge_subprocess_env.parse_env_file_strict(repo_env_path)
+    assert repo_vals["DALTON_RESEARCHDATA_URL"] == "http://host.docker.internal:9123/mcp"
+    assert "DALTON_BRIDGE_PORT" not in repo_vals
+
+    monkeypatch.setenv("APP_ENV", "dalton")
+    monkeypatch.setenv("DALTON_PROFILE", "everflow")
+    monkeypatch.setenv("DALTON_ENABLED", "true")
+    monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
+    monkeypatch.delenv("DALTON_CAP_TRANSCRIPTION", raising=False)
+    monkeypatch.delenv("DALTON_TRANSCRIPTION_SERVICE_URL", raising=False)
+    monkeypatch.delenv("DALTON_TRANSCRIPTION_TOKEN", raising=False)
+    monkeypatch.delenv("DALTON_BRIDGE_URL", raising=False)
+    monkeypatch.delenv("DALTON_BRIDGE_PORT", raising=False)
+    for k, v in repo_vals.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(dalton_settings, "HOST_IP", "")
+    monkeypatch.setattr(
+        svc_transcriptions,
+        "is_transcription_storage_configured",
+        create_autospec(tstore.is_transcription_storage_configured, return_value=True),
+    )
+
+    assert dalton_settings.get_dalton_transcription_service_url() == "http://host.docker.internal:9123"
+
+    captured_urls: list[str] = []
+
+    def _mock_handler(request: httpx.Request) -> httpx.Response:
+        captured_urls.append(str(request.url))
+        return httpx.Response(200, json={"ok": True, "job": {"job_id": "j-port", "status": "succeeded"}})
+
+    real_async_client = httpx.AsyncClient
+
+    def _patched_client(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = httpx.MockTransport(_mock_handler)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(svc_transcriptions.httpx, "AsyncClient", _patched_client)
+    code, _ = await svc_transcriptions.call_bridge_get_transcription("j-port")
+    assert code == 200
+    assert captured_urls == ["http://host.docker.internal:9123/transcriptions/j-port"]
+
+    # Explicit DALTON_BRIDGE_URL takes precedence over DALTON_RESEARCHDATA_URL before cutover
+    monkeypatch.setenv("DALTON_BRIDGE_URL", "http://host.docker.internal:9222/")
+    assert dalton_settings.get_dalton_transcription_service_url() == "http://host.docker.internal:9222"
+
+
+# ---------------------------------------------------------------------------
+# Helpers & failure-branch tests for switch_transcription_service.sh (Item 9)
+# ---------------------------------------------------------------------------
+
+SWITCH_SCRIPT = REPO_ROOT / "scripts" / "dalton" / "ops" / "prod" / "switch_transcription_service.sh"
+
+
+def _build_switch_script_harness(
+    tmp_path: Path,
+    *,
+    stub_config: dict[str, Any],
+    bridge_jobs_dir: Path | None = None,
+    bridge_usage_file: Path | None = None,
+    ts_jobs_dir: Path | None = None,
+    ts_usage_file: Path | None = None,
+    ts_env_overrides: dict[str, str] | None = None,
+    omit_ts_env_keys: tuple[str, ...] = (),
+    include_ffmpeg: bool = True,
+    seed_history: bool = True,
+) -> dict[str, Any]:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(parents=True, exist_ok=True)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    state_dir = tmp_path / "stub_state"
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg_path = state_dir / "stub_config.json"
+    cfg_path.write_text(json.dumps(stub_config), encoding="utf-8")
+    launchctl_log = log_dir / "launchctl.log"
+    curl_log = log_dir / "curl.log"
+    docker_log = log_dir / "docker.log"
+
+    # Stub ffmpeg / ffprobe
+    for binary in ("ffmpeg", "ffprobe"):
+        if include_ffmpeg:
+            bpath = fake_bin / binary
+            bpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            bpath.chmod(0o755)
+
+    # Stub launchctl
+    launchctl_stub = fake_bin / "launchctl"
+    launchctl_stub.write_text(
+        f"""#!{sys.executable}
+import json, pathlib, sys
+cfg = json.loads(pathlib.Path({str(cfg_path)!r}).read_text(encoding="utf-8"))
+log_p = pathlib.Path({str(launchctl_log)!r})
+args = sys.argv[1:]
+with log_p.open("a", encoding="utf-8") as fh:
+    fh.write(json.dumps(args) + "\\n")
+sub = args[0] if args else ""
+target = args[-1] if args else ""
+lc = cfg.get("launchctl", {{}})
+if sub == "print":
+    spec = lc.get("print", {{}}).get(target)
+    if spec is None:
+        # Match by label suffix if domain differs
+        for k, v in lc.get("print", {{}}).items():
+            if target.endswith(k):
+                spec = v
+                break
+    if spec is None:
+        sys.exit(1)
+    if isinstance(spec, dict):
+        if spec.get("stdout"):
+            sys.stdout.write(str(spec["stdout"]))
+        sys.exit(int(spec.get("rc", 0)))
+    sys.exit(0 if spec else 1)
+if sub == "kickstart":
+    for k, rc in lc.get("kickstart_rc", {{}}).items():
+        if target.endswith(k):
+            sys.exit(int(rc))
+    sys.exit(0)
+if sub == "bootstrap":
+    sys.exit(int(lc.get("bootstrap_rc", 0)))
+if sub == "bootout":
+    sys.exit(int(lc.get("bootout_rc", 0)))
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    launchctl_stub.chmod(0o755)
+
+    # Stub curl
+    curl_stub = fake_bin / "curl"
+    curl_stub.write_text(
+        f"""#!{sys.executable}
+import json, pathlib, sys
+cfg = json.loads(pathlib.Path({str(cfg_path)!r}).read_text(encoding="utf-8"))
+log_p = pathlib.Path({str(curl_log)!r})
+counter_p = pathlib.Path({str(state_dir / 'curl_counts.json')!r})
+args = sys.argv[1:]
+method = "GET"
+out_file = None
+write_fmt = None
+url = ""
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == "-X" and i + 1 < len(args):
+        method = args[i + 1].upper()
+        i += 2
+    elif a == "-o" and i + 1 < len(args):
+        out_file = args[i + 1]
+        i += 2
+    elif a == "-w" and i + 1 < len(args):
+        write_fmt = args[i + 1]
+        i += 2
+    elif a in ("-H", "-d") and i + 1 < len(args):
+        i += 2
+    elif a.startswith("-"):
+        i += 1
+    else:
+        url = a
+        i += 1
+
+with log_p.open("a", encoding="utf-8") as fh:
+    fh.write(json.dumps({{"method": method, "url": url}}) + "\\n")
+
+counts = json.loads(counter_p.read_text(encoding="utf-8")) if counter_p.exists() else {{}}
+key = f"{{method}} {{url}}"
+idx = int(counts.get(key, 0))
+counts[key] = idx + 1
+counter_p.write_text(json.dumps(counts), encoding="utf-8")
+
+routes = cfg.get("curl", {{}})
+entry = routes.get(key)
+if entry is None:
+    # fallback match by suffix
+    for rk, rv in routes.items():
+        if rk.startswith(method + " ") and url.endswith(rk.split(" ", 1)[1]):
+            entry = rv
+            break
+
+if isinstance(entry, list):
+    spec = entry[min(idx, len(entry) - 1)] if entry else {{"rc": 22}}
+elif isinstance(entry, dict):
+    spec = entry
+else:
+    spec = {{"rc": 7, "http_code": "000", "body": ""}}
+
+rc = int(spec.get("rc", 0))
+body = spec.get("body", "")
+if isinstance(body, (dict, list)):
+    body = json.dumps(body)
+http_code = str(spec.get("http_code", "200" if rc == 0 else "000"))
+
+if out_file is not None:
+    if out_file != "/dev/null":
+        pathlib.Path(out_file).write_text(str(body), encoding="utf-8")
+elif rc == 0 and body:
+    sys.stdout.write(str(body))
+
+if write_fmt is not None:
+    sys.stdout.write(http_code)
+
+sys.exit(rc)
+""",
+        encoding="utf-8",
+    )
+    curl_stub.chmod(0o755)
+
+    # Stub docker
+    docker_stub = fake_bin / "docker"
+    docker_stub.write_text(
+        f"""#!{sys.executable}
+import json, pathlib, sys
+pathlib.Path({str(docker_log)!r}).open("a", encoding="utf-8").write(json.dumps(sys.argv[1:]) + "\\n")
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    docker_stub.chmod(0o755)
+
+    default_jobs_dir = tmp_path / "asr_jobs"
+    eff_ts_jobs = ts_jobs_dir or default_jobs_dir
+    eff_ts_jobs.mkdir(parents=True, exist_ok=True)
+    eff_bridge_jobs = bridge_jobs_dir or eff_ts_jobs
+    eff_bridge_jobs.mkdir(parents=True, exist_ok=True)
+
+    if seed_history:
+        hist_dir = eff_ts_jobs / "job_hist_01"
+        hist_dir.mkdir(parents=True, exist_ok=True)
+        (hist_dir / "state.json").write_text(
+            json.dumps({"job_id": "job_hist_01", "status": "succeeded"}),
+            encoding="utf-8",
+        )
+
+    eff_ts_usage = ts_usage_file or (eff_ts_jobs / "asr_usage.jsonl")
+
+    bridge_env_file = tmp_path / "researchdata-bridge.env"
+    bridge_lines = [
+        "DALTON_BRIDGE_ADMIN_TOKEN=bridge-admin-stub-token",
+        f"DALTON_ASR_JOBS_DIR={eff_bridge_jobs}",
+    ]
+    if bridge_usage_file is not None:
+        bridge_lines.append(f"DALTON_ASR_USAGE_FILE={bridge_usage_file}")
+    bridge_env_file.write_text("\n".join(bridge_lines) + "\n", encoding="utf-8")
+
+    ts_env_dict = _valid_seed_asr_env()
+    ts_env_dict["DALTON_TRANSCRIPTION_TOKEN"] = "ts-stub-token-32bytes"
+    if ts_env_overrides:
+        ts_env_dict.update(ts_env_overrides)
+    for k in omit_ts_env_keys:
+        ts_env_dict.pop(k, None)
+    ts_env_file = tmp_path / "transcription.env"
+    ts_env_file.write_text(
+        "\n".join(f"{k}={v}" for k, v in ts_env_dict.items()) + "\n",
+        encoding="utf-8",
+    )
+
+    repo_env_file = tmp_path / "repo.env"
+    initial_repo_env = "DALTON_EXISTING_KEY=keep-original\n"
+    repo_env_file.write_text(initial_repo_env, encoding="utf-8")
+
+    launch_agents = tmp_path / "LaunchAgents"
+    launch_agents.mkdir(parents=True, exist_ok=True)
+
+    ts_plist = launch_agents / "com.dalton.transcription.plist"
+    with ts_plist.open("wb") as fh:
+        plistlib.dump(
+            {
+                "Label": "com.dalton.transcription",
+                "ProgramArguments": [sys.executable, "-m", "src.dalton.transcription_service"],
+                "WorkingDirectory": str(REPO_ROOT),
+                "EnvironmentVariables": {
+                    "PATH": str(fake_bin),
+                    "DALTON_ASR_JOBS_DIR": str(eff_ts_jobs),
+                    "DALTON_ASR_USAGE_FILE": str(eff_ts_usage),
+                    "DALTON_TRANSCRIPTION_ENV_FILE": str(ts_env_file),
+                },
+            },
+            fh,
+        )
+
+    bridge_plist = launch_agents / "com.dalton.researchdata-bridge.plist"
+    with bridge_plist.open("wb") as fh:
+        plistlib.dump(
+            {
+                "Label": "com.dalton.researchdata-bridge",
+                "ProgramArguments": [
+                    sys.executable,
+                    str(REPO_ROOT / "scripts" / "dalton" / "researchdata_bridge.py"),
+                ],
+                "WorkingDirectory": str(REPO_ROOT),
+                "EnvironmentVariables": {
+                    "PATH": str(fake_bin),
+                    "DALTON_BRIDGE_ENV_FILE": str(bridge_env_file),
+                },
+            },
+            fh,
+        )
+
+    env = {
+        "PATH": f"{fake_bin}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+        "HOME": str(tmp_path / "home"),
+        "DALTON_BRIDGE_ENV_FILE": str(bridge_env_file),
+        "DALTON_TRANSCRIPTION_ENV_FILE": str(ts_env_file),
+        "DALTON_REPO_ENV_FILE": str(repo_env_file),
+        "DALTON_LAUNCH_AGENTS_DIR": str(launch_agents),
+        "DALTON_TRANSCRIPTION_PYTHON_BIN": sys.executable,
+        "DALTON_DRAIN_POLL_INTERVAL_S": "0.1",
+        "DALTON_HEALTH_POLL_INTERVAL_S": "0",
+        "DALTON_HEALTH_POLL_ATTEMPTS": "2",
+    }
+
+    return {
+        "env": env,
+        "repo_env_file": repo_env_file,
+        "initial_repo_env": initial_repo_env,
+        "bridge_env_file": bridge_env_file,
+        "launchctl_log": launchctl_log,
+        "curl_log": curl_log,
+        "docker_log": docker_log,
+    }
+
+
+def _read_jsonl_log(path: Path) -> list[Any]:
+    if not path.is_file():
+        return []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_switch_script_precheck_fails_on_path_mismatch_and_misconfigured_adapter(
+    tmp_path: Path,
+) -> None:
+    """--check and --switch must fail before draining old bridge when paths diverge or adapter/ffmpeg config is missing."""
+    # Case 1: Same jobs_dir, different DALTON_ASR_USAGE_FILE
+    h1 = _build_switch_script_harness(
+        tmp_path / "usage_mismatch",
+        stub_config={},
+        bridge_usage_file=tmp_path / "usage_mismatch" / "bridge_usage.jsonl",
+        ts_usage_file=tmp_path / "usage_mismatch" / "ts_usage.jsonl",
+    )
+    for flag in ("--check", "--switch"):
+        proc = subprocess.run(
+            ["bash", str(SWITCH_SCRIPT), flag],
+            env=h1["env"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode != 0
+        assert "DALTON_ASR_USAGE_FILE mismatch" in proc.stderr
+        assert h1["repo_env_file"].read_text(encoding="utf-8") == h1["initial_repo_env"]
+    # --switch must NOT have drained the legacy bridge
+    assert not any(
+        entry.get("method") == "POST" and "/transcriptions/drain" in entry.get("url", "")
+        for entry in _read_jsonl_log(h1["curl_log"])
+    )
+
+    # Case 2: Different DALTON_ASR_JOBS_DIR
+    h2 = _build_switch_script_harness(
+        tmp_path / "jobs_mismatch",
+        stub_config={},
+        bridge_jobs_dir=tmp_path / "jobs_mismatch" / "bridge_jobs",
+        ts_jobs_dir=tmp_path / "jobs_mismatch" / "ts_jobs",
+    )
+    proc2 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--switch"],
+        env=h2["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc2.returncode != 0
+    assert "DALTON_ASR_JOBS_DIR mismatch" in proc2.stderr
+    assert h2["repo_env_file"].read_text(encoding="utf-8") == h2["initial_repo_env"]
+    assert _read_jsonl_log(h2["curl_log"]) == []
+
+    # Case 3: Missing one required Seed-ASR credential (VOLC_TOS_BUCKET)
+    h3 = _build_switch_script_harness(
+        tmp_path / "missing_seed_key",
+        stub_config={},
+        omit_ts_env_keys=("VOLC_TOS_BUCKET",),
+    )
+    proc3 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--switch"],
+        env=h3["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc3.returncode != 0
+    assert "VOLC_TOS_BUCKET" in proc3.stderr
+    assert h3["repo_env_file"].read_text(encoding="utf-8") == h3["initial_repo_env"]
+    assert _read_jsonl_log(h3["curl_log"]) == []
+
+    # Case 4: Missing ffmpeg / ffprobe in LaunchAgent PATH
+    h4 = _build_switch_script_harness(
+        tmp_path / "missing_ffmpeg",
+        stub_config={},
+        include_ffmpeg=False,
+    )
+    proc4 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--switch"],
+        env=h4["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc4.returncode != 0
+    assert "ffmpeg" in proc4.stderr and "ffprobe" in proc4.stderr
+    assert h4["repo_env_file"].read_text(encoding="utf-8") == h4["initial_repo_env"]
+    assert _read_jsonl_log(h4["curl_log"]) == []
+
+
+def test_switch_script_launchctl_failures_print_recovery_and_leave_repo_env_untouched(
+    tmp_path: Path,
+) -> None:
+    """launchctl kickstart/bootstrap failures during --switch must print safe recovery commands and never mutate repo .env."""
+    base_curl = {
+        "POST http://127.0.0.1:8960/transcriptions/drain": {"rc": 0, "body": {"ok": True, "draining": True}},
+        "GET http://127.0.0.1:8960/transcriptions/drain": {"rc": 0, "body": {"ok": True, "active_jobs": 0}},
+        "GET http://127.0.0.1:8960/healthz": {
+            "rc": 0,
+            "body": {"ok": True, "asr": {"disabled": True, "owner_lock_held": False}},
+        },
+        "GET http://127.0.0.1:8960/transcriptions/health-probe": {"rc": 0, "http_code": "503", "body": {}},
+    }
+
+    # Case 1: Step 2 bridge kickstart fails
+    h1 = _build_switch_script_harness(
+        tmp_path / "bridge_kickstart_fail",
+        stub_config={
+            "curl": base_curl,
+            "launchctl": {"kickstart_rc": {"com.dalton.researchdata-bridge": 1}},
+        },
+    )
+    p1 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--switch"],
+        env=h1["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p1.returncode != 0
+    assert "Recovery Commands" in p1.stderr
+    assert "launchctl bootout" in p1.stderr
+    assert "bootout" in p1.stderr and "|| true" not in p1.stderr
+    assert "fcntl.flock" in p1.stderr
+    assert h1["repo_env_file"].read_text(encoding="utf-8") == h1["initial_repo_env"]
+
+    # Case 2: Step 3 bootstrap fails (new service not yet loaded)
+    h2 = _build_switch_script_harness(
+        tmp_path / "ts_bootstrap_fail",
+        stub_config={
+            "curl": base_curl,
+            "launchctl": {"print": {}, "bootstrap_rc": 5},
+        },
+    )
+    p2 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--switch"],
+        env=h2["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p2.returncode != 0
+    assert "launchctl bootstrap failed" in p2.stderr
+    assert "Recovery Commands" in p2.stderr
+    assert "|| true" not in p2.stderr
+    assert h2["repo_env_file"].read_text(encoding="utf-8") == h2["initial_repo_env"]
+
+    # Case 3: Step 3 kickstart fails (new service already loaded)
+    h3 = _build_switch_script_harness(
+        tmp_path / "ts_kickstart_fail",
+        stub_config={
+            "curl": base_curl,
+            "launchctl": {
+                "print": {"com.dalton.transcription": {"rc": 0, "stdout": "state = running\npid = 4242\n"}},
+                "kickstart_rc": {"com.dalton.transcription": 113},
+            },
+        },
+    )
+    p3 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--switch"],
+        env=h3["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p3.returncode != 0
+    assert "launchctl kickstart failed" in p3.stderr
+    assert "Recovery Commands" in p3.stderr
+    assert h3["repo_env_file"].read_text(encoding="utf-8") == h3["initial_repo_env"]
+
+
+def test_switch_script_rollback_inflight_guard_and_launchctl_failure(tmp_path: Path) -> None:
+    """--rollback must refuse bootout when LaunchAgent is running and /healthz fails or drain times out, and report status on kickstart failure."""
+    # Case 1: LaunchAgent running + /healthz curl fails -> abort WITHOUT bootout, untouched .env & bridge.env
+    h1 = _build_switch_script_harness(
+        tmp_path / "rollback_healthz_fail",
+        stub_config={
+            "launchctl": {
+                "print": {"com.dalton.transcription": {"rc": 0, "stdout": "state = running\npid = 9001\n"}},
+            },
+            "curl": {
+                "GET http://127.0.0.1:8965/healthz": {"rc": 7, "http_code": "000", "body": ""},
+            },
+        },
+    )
+    initial_bridge_env = h1["bridge_env_file"].read_text(encoding="utf-8")
+    p1 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--rollback"],
+        env=h1["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p1.returncode != 0
+    assert "refusing to bootout" in p1.stderr
+    assert "=== Paths ===" in p1.stderr
+    lc_calls_1 = _read_jsonl_log(h1["launchctl_log"])
+    assert not any(call and call[0] == "bootout" for call in lc_calls_1)
+    assert h1["repo_env_file"].read_text(encoding="utf-8") == h1["initial_repo_env"]
+    assert h1["bridge_env_file"].read_text(encoding="utf-8") == initial_bridge_env
+
+    # Case 2: LaunchAgent running + /healthz ok + active_jobs stays 1 -> drain times out WITHOUT bootout
+    h2 = _build_switch_script_harness(
+        tmp_path / "rollback_drain_timeout",
+        stub_config={
+            "launchctl": {
+                "print": {"com.dalton.transcription": {"rc": 0, "stdout": "state = running\npid = 9002\n"}},
+            },
+            "curl": {
+                "GET http://127.0.0.1:8965/healthz": {
+                    "rc": 0,
+                    "body": {"ok": True, "status": "ok", "disabled": False, "active_jobs": 1},
+                },
+                "POST http://127.0.0.1:8965/transcriptions/drain": {
+                    "rc": 0,
+                    "body": {"ok": True, "draining": True, "active_jobs": 1},
+                },
+                "GET http://127.0.0.1:8965/transcriptions/drain": {
+                    "rc": 0,
+                    "body": {"ok": True, "draining": True, "active_jobs": 1},
+                },
+            },
+        },
+    )
+    p2 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--rollback", "--wait-seconds", "1"],
+        env=h2["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p2.returncode != 0
+    assert "Timed out" in p2.stderr
+    assert '"drain":false' in p2.stderr
+    lc_calls_2 = _read_jsonl_log(h2["launchctl_log"])
+    assert not any(call and call[0] == "bootout" for call in lc_calls_2)
+    assert h2["repo_env_file"].read_text(encoding="utf-8") == h2["initial_repo_env"]
+
+    # Case 3: Step 2 bridge kickstart fails after successful drain & bootout -> status snapshot + untouched repo .env
+    h3 = _build_switch_script_harness(
+        tmp_path / "rollback_bridge_kickstart_fail",
+        stub_config={
+            "launchctl": {
+                "print": {"com.dalton.transcription": {"rc": 0, "stdout": "state = running\npid = 9003\n"}},
+                "bootout_rc": 0,
+                "kickstart_rc": {"com.dalton.researchdata-bridge": 3},
+            },
+            "curl": {
+                "GET http://127.0.0.1:8965/healthz": [
+                    {"rc": 0, "body": {"ok": True, "status": "ok", "disabled": False, "active_jobs": 0}},
+                    {"rc": 7, "http_code": "000", "body": ""},
+                ],
+                "POST http://127.0.0.1:8965/transcriptions/drain": {
+                    "rc": 0,
+                    "body": {"ok": True, "draining": True, "active_jobs": 0},
+                },
+                "GET http://127.0.0.1:8965/transcriptions/drain": {
+                    "rc": 0,
+                    "body": {"ok": True, "draining": True, "active_jobs": 0},
+                },
+            },
+        },
+    )
+    p3 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--rollback"],
+        env=h3["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p3.returncode != 0
+    assert "launchctl kickstart failed" in p3.stderr
+    assert "=== Paths ===" in p3.stderr
+    assert h3["repo_env_file"].read_text(encoding="utf-8") == h3["initial_repo_env"]
+
+
+def test_switch_script_drain_poll_tolerates_transient_curl_failure_and_hints_on_timeout(
+    tmp_path: Path,
+) -> None:
+    """drain_and_wait retries transient curl poll failures until --wait-seconds and prints recovery/cancel guidance on timeout."""
+    # Case 1: Transient poll failure followed by active_jobs=0 succeeds
+    h1 = _build_switch_script_harness(
+        tmp_path / "drain_transient_ok",
+        stub_config={
+            "curl": {
+                "POST http://127.0.0.1:8960/transcriptions/drain": {
+                    "rc": 0,
+                    "body": {"ok": True, "draining": True, "active_jobs": 1},
+                },
+                "GET http://127.0.0.1:8960/transcriptions/drain": [
+                    {"rc": 7, "http_code": "000", "body": ""},
+                    {"rc": 0, "body": {"ok": True, "draining": True, "active_jobs": 0}},
+                ],
+            }
+        },
+    )
+    p1 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--drain-bridge", "--wait-seconds", "5"],
+        env=h1["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p1.returncode == 0, f"stderr:\n{p1.stderr}"
+    assert "curl failed while polling" in p1.stderr
+    assert "ready for handoff (active_jobs=0)" in p1.stdout
+
+    # Case 2: Persistent poll curl failure times out after --wait-seconds and hints how to re-run or cancel drain
+    h2 = _build_switch_script_harness(
+        tmp_path / "drain_poll_timeout",
+        stub_config={
+            "curl": {
+                "POST http://127.0.0.1:8960/transcriptions/drain": {
+                    "rc": 0,
+                    "body": {"ok": True, "draining": True, "active_jobs": 1},
+                },
+                "GET http://127.0.0.1:8960/transcriptions/drain": {
+                    "rc": 7,
+                    "http_code": "000",
+                    "body": "",
+                },
+            }
+        },
+    )
+    p2 = subprocess.run(
+        ["bash", str(SWITCH_SCRIPT), "--drain-bridge", "--wait-seconds", "1"],
+        env=h2["env"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert p2.returncode != 0
+    assert "Timed out after 1s" in p2.stderr
+    assert "re-run this script (--drain-bridge)" in p2.stderr
+    assert '"drain":false' in p2.stderr

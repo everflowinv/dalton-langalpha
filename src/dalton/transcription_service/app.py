@@ -50,7 +50,7 @@ from .owner_lock import (
     resolve_owner_lock_timeout_s,
 )
 from .worker_base import AsrWorkerProtocol, is_binary_available
-from .worker_registry import resolve_worker
+from .worker_registry import resolve_worker, validate_worker_startup_config
 
 logger = logging.getLogger("dalton-transcription")
 
@@ -162,12 +162,23 @@ class TranscriptionRuntime:
         self._owner_lock: AsrOwnerLock | None = None
         self._manager: AsrJobManager | None = None
         self._draining: bool = False
+        self._misconfigured: bool = False
+        self._missing_config: list[str] = []
+        self._expected_adapter: str = ""
         self._started: bool = False
         self._installed_usr1: bool = False
 
     @property
     def disabled(self) -> bool:
         return bool(self.config.disabled)
+
+    @property
+    def misconfigured(self) -> bool:
+        return bool(self._misconfigured)
+
+    @property
+    def missing_config(self) -> tuple[str, ...]:
+        return tuple(self._missing_config)
 
     @property
     def draining(self) -> bool:
@@ -228,17 +239,26 @@ class TranscriptionRuntime:
             if self._owner_lock and self._owner_lock.metadata
             else None
         )
-        status = "disabled" if self.disabled else ("draining" if self._draining else "ok")
+        if self.disabled:
+            status = "disabled"
+        elif self._misconfigured:
+            status = "misconfigured"
+        elif self._draining:
+            status = "draining"
+        else:
+            status = "ok"
         worker_name = (
             getattr(self._manager.worker, "worker_name", type(self._manager.worker).__name__)
             if self._manager is not None
-            else "none"
+            else ("unconfigured" if self._misconfigured else "none")
         )
         return {
-            "ok": True,
+            "ok": not self._misconfigured,
             "service": "dalton-transcription",
             "status": status,
             "disabled": self.disabled,
+            "misconfigured": self._misconfigured,
+            "missing_config": list(self._missing_config),
             "draining": self._draining,
             "owner_lock_held": lock_held,
             "owner_lock_pid": lock_pid,
@@ -251,9 +271,10 @@ class TranscriptionRuntime:
         }
 
     def startup(self) -> list[str]:
-        """Acquire ``.owner.lock`` first, then construct ``AsrJobManager`` and recover jobs.
+        """Validate worker config, acquire ``.owner.lock``, then construct ``AsrJobManager`` and recover jobs.
 
-        When ``config.disabled`` is True, skips lock acquisition and manager construction.
+        When ``config.disabled`` is True or required adapter configuration / binaries are
+        missing, skips lock acquisition, manager construction, and job recovery.
         Raises :class:`OwnerLockBusyError` before constructing ``AsrJobManager`` if the
         lock is held by another owner.
         """
@@ -266,6 +287,28 @@ class TranscriptionRuntime:
             )
             self._started = True
             return []
+
+        validation = validate_worker_startup_config(
+            mode=self.config.worker_mode,
+            custom_worker=self._custom_worker,
+            environ=self._environ,
+        )
+        if not validation.ok:
+            self._misconfigured = True
+            self._missing_config = list(validation.missing_config)
+            self._expected_adapter = validation.adapter
+            self._started = True
+            logger.error(
+                "dalton-transcription startup blocked (status=misconfigured, adapter=%s): "
+                "missing required configuration: %s; skipping .owner.lock and job recovery",
+                validation.adapter,
+                ", ".join(self._missing_config),
+            )
+            return []
+
+        self._misconfigured = False
+        self._missing_config = []
+        self._expected_adapter = validation.adapter
 
         lock = AsrOwnerLock(
             self.config.jobs_dir,
@@ -332,6 +375,9 @@ class TranscriptionRuntime:
             self._owner_lock.release()
             self._owner_lock = None
         self._manager = None
+        self._misconfigured = False
+        self._missing_config = []
+        self._expected_adapter = ""
         self._started = False
 
 
@@ -389,6 +435,20 @@ def create_app(
                     "ok": False,
                     "error_code": "service_disabled",
                     "error": "Transcription service is disabled (DALTON_TRANSCRIPTION_DISABLED=true)",
+                },
+            )
+        if rt.misconfigured:
+            missing = list(rt.missing_config)
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "ok": False,
+                    "error_code": "service_misconfigured",
+                    "missing_config": missing,
+                    "error": (
+                        "Transcription service is misconfigured; missing required configuration: "
+                        + ", ".join(missing)
+                    ),
                 },
             )
         if intake and rt.draining:

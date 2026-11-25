@@ -20,14 +20,17 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import shutil
 import sys
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from .jobs import FakeAsrWorker, FakeAsrWorkerConfig, atomic_write_json_locked
 from .whisper_worker import OpenAICompatibleWhisperWorker, WhisperWorkerConfig
-from .worker_base import AsrWorkerProtocol
+from .worker_base import AsrWorkerProtocol, is_binary_available
 
 logger = logging.getLogger("dalton-transcription")
 
@@ -127,15 +130,308 @@ def load_worker_factory_from_spec(spec: str) -> WorkerFactory:
     return factory
 
 
-def _seed_asr_env_configured(environ: Mapping[str, str]) -> bool:
-    required = (
-        "SEED_ASR_APP_ID",
-        "SEED_ASR_ACCESS_KEY",
-        "VOLC_TOS_AK",
-        "VOLC_TOS_SK",
-        "VOLC_TOS_BUCKET",
+SEED_ASR_REQUIRED_ENV_KEYS: tuple[str, ...] = (
+    "SEED_ASR_APP_ID",
+    "SEED_ASR_ACCESS_KEY",
+    "VOLC_TOS_AK",
+    "VOLC_TOS_SK",
+    "VOLC_TOS_BUCKET",
+)
+
+_SEED_ASR_HINT_KEYS: tuple[str, ...] = (
+    *SEED_ASR_REQUIRED_ENV_KEYS,
+    "VOLC_TOS_ENDPOINT",
+    "VOLC_TOS_REGION",
+)
+
+_WHISPER_HINT_KEYS: tuple[str, ...] = (
+    "DALTON_WHISPER_API_BASE_URL",
+    "DALTON_WHISPER_API_KEY",
+    "DALTON_WHISPER_ALLOW_NO_AUTH",
+)
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+@dataclass(frozen=True)
+class WorkerStartupValidation:
+    """Result of pre-startup validation for the active transcription worker."""
+
+    ok: bool
+    worker_mode: str
+    adapter: str
+    missing_config: tuple[str, ...] = ()
+
+
+def _is_valid_http_url(raw: str) -> bool:
+    cleaned = str(raw or "").strip()
+    if not cleaned or any(ch.isspace() for ch in cleaned):
+        return False
+    parsed = urlparse(cleaned)
+    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
+
+
+def _is_valid_tos_endpoint(raw: str) -> bool:
+    cleaned = str(raw or "").strip()
+    if not cleaned or any(ch.isspace() for ch in cleaned):
+        return False
+    candidate = cleaned if "://" in cleaned else f"https://{cleaned}"
+    parsed = urlparse(candidate)
+    return parsed.scheme in ("http", "https") and bool(parsed.hostname)
+
+
+def _has_builtin_seed_asr_script() -> bool:
+    repo_root = Path(__file__).resolve().parents[3]
+    return (repo_root / "scripts" / "dalton" / "asr_jobs.py").is_file()
+
+
+def _check_binary_available(
+    name: str,
+    env: Mapping[str, str],
+    *,
+    use_env_path: bool,
+) -> bool:
+    if use_env_path and "PATH" in env:
+        return shutil.which(name, path=str(env.get("PATH") or "")) is not None
+    return is_binary_available(name)
+
+
+def _missing_source_storage_keys(env: Mapping[str, str]) -> list[str]:
+    missing: list[str] = []
+    endpoint = str(
+        env.get("DALTON_ASR_STORAGE_ENDPOINT_URL")
+        or env.get("STORAGE_ENDPOINT_URL")
+        or env.get("S3_ENDPOINT_URL")
+        or ""
+    ).strip()
+    if not _is_valid_http_url(endpoint):
+        missing.append("DALTON_ASR_STORAGE_ENDPOINT_URL")
+    bucket = str(
+        env.get("DALTON_ASR_STORAGE_BUCKET_NAME")
+        or env.get("STORAGE_BUCKET_NAME")
+        or env.get("S3_BUCKET_NAME")
+        or ""
+    ).strip()
+    if not bucket:
+        missing.append("DALTON_ASR_STORAGE_BUCKET_NAME")
+    ak = str(
+        env.get("DALTON_ASR_STORAGE_ACCESS_KEY_ID")
+        or env.get("STORAGE_ACCESS_KEY_ID")
+        or env.get("MINIO_ROOT_USER")
+        or env.get("AWS_ACCESS_KEY_ID")
+        or ""
+    ).strip()
+    if not ak:
+        missing.append("DALTON_ASR_STORAGE_ACCESS_KEY_ID")
+    sk = str(
+        env.get("DALTON_ASR_STORAGE_SECRET_ACCESS_KEY")
+        or env.get("STORAGE_SECRET_ACCESS_KEY")
+        or env.get("MINIO_ROOT_PASSWORD")
+        or env.get("AWS_SECRET_ACCESS_KEY")
+        or ""
+    ).strip()
+    if not sk:
+        missing.append("DALTON_ASR_STORAGE_SECRET_ACCESS_KEY")
+    return missing
+
+
+def _missing_seed_asr_keys(env: Mapping[str, str], *, factory_spec: str) -> list[str]:
+    missing: list[str] = [
+        k for k in SEED_ASR_REQUIRED_ENV_KEYS if not str(env.get(k) or "").strip()
+    ]
+    raw_tos_ep = str(env.get("VOLC_TOS_ENDPOINT") or "").strip()
+    if raw_tos_ep and not _is_valid_tos_endpoint(raw_tos_ep):
+        missing.append("VOLC_TOS_ENDPOINT")
+    if (
+        "seed_asr" not in _WORKER_FACTORIES
+        and not factory_spec
+        and not _has_builtin_seed_asr_script()
+    ):
+        missing.append("seed_asr_adapter")
+    missing.extend(_missing_source_storage_keys(env))
+    return missing
+
+
+def _missing_whisper_keys(env: Mapping[str, str]) -> list[str]:
+    missing: list[str] = []
+    allow_no_auth = str(env.get("DALTON_WHISPER_ALLOW_NO_AUTH") or "").strip().lower() in _TRUTHY
+    raw_base = str(env.get("DALTON_WHISPER_API_BASE_URL") or "").strip()
+    effective_base = raw_base or "https://api.openai.com/v1"
+    if allow_no_auth and not raw_base:
+        missing.append("DALTON_WHISPER_API_BASE_URL")
+    elif not _is_valid_http_url(effective_base):
+        missing.append("DALTON_WHISPER_API_BASE_URL")
+
+    api_key = str(
+        env.get("DALTON_WHISPER_API_KEY") or env.get("OPENAI_API_KEY") or ""
+    ).strip()
+    if not allow_no_auth and not api_key:
+        missing.append("DALTON_WHISPER_API_KEY")
+    missing.extend(_missing_source_storage_keys(env))
+    return missing
+
+
+def _missing_binaries(env: Mapping[str, str], *, use_env_path: bool) -> list[str]:
+    missing: list[str] = []
+    for binary in ("ffmpeg", "ffprobe"):
+        if not _check_binary_available(binary, env, use_env_path=use_env_path):
+            missing.append(binary)
+    return missing
+
+
+def _dedupe_names(names: list[str]) -> tuple[str, ...]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for name in names:
+        if name and name not in seen:
+            seen.add(name)
+            out.append(name)
+    return tuple(out)
+
+
+def validate_worker_startup_config(
+    *,
+    mode: str | None = None,
+    custom_worker: AsrWorkerProtocol | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> WorkerStartupValidation:
+    """Validate required adapter config and ``ffmpeg``/``ffprobe`` before lock/recovery.
+
+    Returns only missing configuration key names (never secret values).
+    """
+    env = os.environ if environ is None else environ
+    use_env_path = environ is not None
+    eff_mode = (
+        str(mode if mode is not None else env.get("DALTON_ASR_WORKER_MODE", "auto"))
+        .strip()
+        .lower()
+        or "auto"
     )
-    return all(bool(str(environ.get(k) or "").strip()) for k in required)
+
+    if custom_worker is not None:
+        return WorkerStartupValidation(
+            ok=True,
+            worker_mode=eff_mode,
+            adapter=str(getattr(custom_worker, "worker_name", type(custom_worker).__name__)),
+        )
+
+    if eff_mode == "fake":
+        return WorkerStartupValidation(ok=True, worker_mode="fake", adapter="fake")
+
+    factory_spec = str(env.get("DALTON_ASR_WORKER_FACTORY") or "").strip()
+
+    if eff_mode == "whisper":
+        missing = _missing_whisper_keys(env) + _missing_binaries(env, use_env_path=use_env_path)
+        deduped = _dedupe_names(missing)
+        return WorkerStartupValidation(
+            ok=not deduped,
+            worker_mode=eff_mode,
+            adapter="whisper",
+            missing_config=deduped,
+        )
+
+    if eff_mode in ("seed_asr", "real"):
+        missing = _missing_seed_asr_keys(env, factory_spec=factory_spec) + _missing_binaries(
+            env, use_env_path=use_env_path
+        )
+        deduped = _dedupe_names(missing)
+        return WorkerStartupValidation(
+            ok=not deduped,
+            worker_mode=eff_mode,
+            adapter="seed_asr",
+            missing_config=deduped,
+        )
+
+    if eff_mode == "custom":
+        missing: list[str] = []
+        if not factory_spec:
+            missing.append("DALTON_ASR_WORKER_FACTORY")
+        else:
+            try:
+                load_worker_factory_from_spec(factory_spec)
+            except Exception:
+                missing.append("DALTON_ASR_WORKER_FACTORY")
+        missing.extend(_missing_binaries(env, use_env_path=use_env_path))
+        deduped = _dedupe_names(missing)
+        return WorkerStartupValidation(
+            ok=not deduped,
+            worker_mode=eff_mode,
+            adapter="custom",
+            missing_config=deduped,
+        )
+
+    if eff_mode in _WORKER_FACTORIES:
+        missing = _missing_binaries(env, use_env_path=use_env_path)
+        deduped = _dedupe_names(missing)
+        return WorkerStartupValidation(
+            ok=not deduped,
+            worker_mode=eff_mode,
+            adapter=eff_mode,
+            missing_config=deduped,
+        )
+
+    if eff_mode != "auto":
+        return WorkerStartupValidation(
+            ok=False,
+            worker_mode=eff_mode,
+            adapter="unknown",
+            missing_config=("DALTON_ASR_WORKER_MODE",),
+        )
+
+    # Auto mode: determine the intended adapter before taking `.owner.lock` or recovering jobs.
+    if factory_spec:
+        missing = []
+        try:
+            load_worker_factory_from_spec(factory_spec)
+        except Exception:
+            missing.append("DALTON_ASR_WORKER_FACTORY")
+        missing.extend(_missing_binaries(env, use_env_path=use_env_path))
+        deduped = _dedupe_names(missing)
+        return WorkerStartupValidation(
+            ok=not deduped,
+            worker_mode=eff_mode,
+            adapter="custom",
+            missing_config=deduped,
+        )
+
+    if env.get("DALTON_ASR_FAKE_TEXT") or str(env.get("DALTON_ASR_FAKE_FAIL_CATEGORY") or "").strip():
+        return WorkerStartupValidation(ok=True, worker_mode=eff_mode, adapter="fake")
+
+    has_seed_hint = any(str(env.get(k) or "").strip() for k in _SEED_ASR_HINT_KEYS)
+    has_whisper_hint = any(str(env.get(k) or "").strip() for k in _WHISPER_HINT_KEYS)
+    prefer_seed_asr = (
+        "seed_asr" in _WORKER_FACTORIES
+        or has_seed_hint
+        or (
+            _has_builtin_seed_asr_script()
+            and not has_whisper_hint
+            and not WhisperWorkerConfig.is_configured(env)
+        )
+    )
+    if prefer_seed_asr:
+        missing = _missing_seed_asr_keys(env, factory_spec="") + _missing_binaries(
+            env, use_env_path=use_env_path
+        )
+        deduped = _dedupe_names(missing)
+        return WorkerStartupValidation(
+            ok=not deduped,
+            worker_mode=eff_mode,
+            adapter="seed_asr",
+            missing_config=deduped,
+        )
+
+    missing = _missing_whisper_keys(env) + _missing_binaries(env, use_env_path=use_env_path)
+    deduped = _dedupe_names(missing)
+    return WorkerStartupValidation(
+        ok=not deduped,
+        worker_mode=eff_mode,
+        adapter="whisper",
+        missing_config=deduped,
+    )
+
+
+def _seed_asr_env_configured(environ: Mapping[str, str]) -> bool:
+    return all(bool(str(environ.get(k) or "").strip()) for k in SEED_ASR_REQUIRED_ENV_KEYS)
 
 
 def _try_build_builtin_seed_asr_worker(
@@ -278,11 +574,14 @@ def resolve_worker(
 
 
 __all__ = [
+    "SEED_ASR_REQUIRED_ENV_KEYS",
     "UnconfiguredAsrWorker",
     "WorkerFactory",
+    "WorkerStartupValidation",
     "list_registered_worker_factories",
     "load_worker_factory_from_spec",
     "register_worker_factory",
     "resolve_worker",
     "unregister_worker_factory",
+    "validate_worker_startup_config",
 ]

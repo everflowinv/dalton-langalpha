@@ -1532,16 +1532,19 @@ def get_dalton_transcription_service_url(host: str | None = None) -> str:
         return ""
     profile = resolve_profile()
     in_docker = os.path.exists("/.dockerenv")
-    if has_explicit_transcription_service_url():
-        explicit = os.getenv("DALTON_TRANSCRIPTION_SERVICE_URL", "").strip()
-        default_host = host or (HOST_IP if in_docker else "127.0.0.1") or "127.0.0.1"
-        expanded = explicit.replace("{HOST_IP}", default_host).rstrip("/")
+    def _normalize_endpoint_url(
+        raw_url: str,
+        *,
+        default_host: str,
+        rewrite_loopback_in_docker: bool,
+    ) -> str:
+        expanded = raw_url.replace("{HOST_IP}", default_host).rstrip("/")
         parsed = urlparse(expanded)
         if parsed.scheme and parsed.hostname:
             if host is not None:
                 target_host = host
             elif (
-                profile is DeploymentProfile.EVERFLOW
+                rewrite_loopback_in_docker
                 and in_docker
                 and parsed.hostname.lower() in ("127.0.0.1", "localhost", "::1")
             ):
@@ -1566,6 +1569,43 @@ def get_dalton_transcription_service_url(host: str | None = None) -> str:
                     )
                 ).rstrip("/")
         return expanded
+
+    if has_explicit_transcription_service_url():
+        explicit = os.getenv("DALTON_TRANSCRIPTION_SERVICE_URL", "").strip()
+        default_host = host or (HOST_IP if in_docker else "127.0.0.1") or "127.0.0.1"
+        return _normalize_endpoint_url(
+            explicit,
+            default_host=default_host,
+            rewrite_loopback_in_docker=profile is DeploymentProfile.EVERFLOW,
+        )
+
+    if profile is DeploymentProfile.EVERFLOW:
+        # Before cutover, follow the exact legacy bridge URL resolution rules
+        # (`DALTON_BRIDGE_URL` -> `DALTON_RESEARCHDATA_URL` origin -> `DALTON_BRIDGE_PORT`)
+        # so deployments using a custom bridge port keep working without hardcoding `:8960`.
+        fallback_host = host or HOST_IP or "host.docker.internal"
+        explicit_bridge = os.getenv("DALTON_BRIDGE_URL", "").strip()
+        if explicit_bridge and not (
+            explicit_bridge.startswith("${") and explicit_bridge.endswith("}")
+        ):
+            bridge_default_host = (
+                host or (HOST_IP if in_docker else "127.0.0.1") or "127.0.0.1"
+            )
+            return _normalize_endpoint_url(
+                explicit_bridge,
+                default_host=bridge_default_host,
+                rewrite_loopback_in_docker=True,
+            )
+        raw_rd_url = os.getenv("DALTON_RESEARCHDATA_URL", "").strip()
+        if raw_rd_url and not (raw_rd_url.startswith("${") and raw_rd_url.endswith("}")):
+            expanded_rd = raw_rd_url.replace("{HOST_IP}", fallback_host)
+            origin = _extract_bridge_origin_from_url(expanded_rd, host_override=host)
+            if origin:
+                return _normalize_endpoint_url(
+                    origin,
+                    default_host=fallback_host,
+                    rewrite_loopback_in_docker=True,
+                )
 
     defaults = resolve_connector_env_defaults(profile)
     default_url = defaults["DALTON_TRANSCRIPTION_SERVICE_URL"]

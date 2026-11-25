@@ -3,20 +3,23 @@
 #
 # Implements docs/dalton/features/researchdata-connectors.md §6.3 cutover & rollback sequence:
 #   Switch:
-#     0. Pre-check installed plist, repository venv Python deps, and historical job sample.
+#     0. Pre-check installed plist, two-sided jobs_dir & usage_file parity, repository venv
+#        Python deps, enabled ASR adapter config + ffmpeg/ffprobe availability, and historical job sample.
 #     1. Drain old bridge ASR (`POST /transcriptions/drain`), poll until `active_jobs == 0`.
 #     2. Set `DALTON_BRIDGE_ASR_DISABLED=true` in bridge env, restart bridge, verify `.owner.lock` released & 503.
 #     3. Start `com.dalton.transcription` (`:8965`) on identical `DALTON_ASR_JOBS_DIR` & `DALTON_ASR_USAGE_FILE`,
-#        verify `/healthz` reports `owner_lock_held: true`, verify auth with `DALTON_TRANSCRIPTION_TOKEN`,
+#        verify `/healthz` reports `status=ok`, `owner_lock_held=true`, `ffmpeg_available=true`,
+#        `ffprobe_available=true`, verify auth with `DALTON_TRANSCRIPTION_TOKEN`,
 #        and verify querying a completed historical job succeeds. Fail closed without touching `.env` or backend.
 #     4. Update repo `.env` (`DALTON_TRANSCRIPTION_SERVICE_URL` + `DALTON_TRANSCRIPTION_TOKEN`) and recreate backend:
 #        `docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --no-deps backend` (E16).
 #   Rollback:
-#     1. Drain `com.dalton.transcription` (`POST :8965/transcriptions/drain`), poll until `active_jobs == 0`,
-#        stop `com.dalton.transcription` (`launchctl bootout`, failing fast on error) and verify process stopped
-#        (or draining with active_jobs=0 and lock released) and `.owner.lock` is released.
-#     2. Set `DALTON_BRIDGE_ASR_DISABLED=false` in bridge env, restart bridge, verify bridge `/healthz` reports
-#        `asr.disabled: false` and `asr.owner_lock_held: true`, and verify bridge auth passes.
+#     1. Check whether `com.dalton.transcription` LaunchAgent is running; while running, require `/healthz`
+#        and drain (`active_jobs == 0`) to succeed BEFORE `launchctl bootout` (abort without bootout if
+#        `/healthz` fails while process is running); fail fast on `bootout` error and verify `.owner.lock` released.
+#     2. Set `DALTON_BRIDGE_ASR_DISABLED=false` in bridge env, restart bridge (failing fast with status snapshot
+#        on `launchctl` error), verify bridge `/healthz` reports `asr.disabled: false` and `asr.owner_lock_held: true`,
+#        and verify bridge auth passes.
 #     3. Restore repo `.env` transcription settings and recreate backend via `docker compose ... up -d --no-deps backend`.
 #
 # Usage:
@@ -37,7 +40,11 @@ REPO_ENV_FILE="${DALTON_REPO_ENV_FILE:-$REPO_ROOT/.env}"
 LAUNCH_AGENTS_DIR="${DALTON_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 BRIDGE_LABEL="com.dalton.researchdata-bridge"
 TRANSCRIPTION_LABEL="com.dalton.transcription"
-TRANSCRIPTION_PLIST="${LAUNCH_AGENTS_DIR}/${TRANSCRIPTION_LABEL}.plist"
+BRIDGE_PLIST="${DALTON_BRIDGE_PLIST:-${LAUNCH_AGENTS_DIR}/${BRIDGE_LABEL}.plist}"
+TRANSCRIPTION_PLIST="${DALTON_TRANSCRIPTION_PLIST:-${LAUNCH_AGENTS_DIR}/${TRANSCRIPTION_LABEL}.plist}"
+DRAIN_POLL_INTERVAL_S="${DALTON_DRAIN_POLL_INTERVAL_S:-2}"
+HEALTH_POLL_INTERVAL_S="${DALTON_HEALTH_POLL_INTERVAL_S:-1}"
+HEALTH_POLL_ATTEMPTS="${DALTON_HEALTH_POLL_ATTEMPTS:-20}"
 WAIT_SECONDS=120
 DRY_RUN=0
 ALLOW_EMPTY_HISTORY=0
@@ -48,7 +55,8 @@ usage() {
 Usage: switch_transcription_service.sh <action> [options]
 
 Actions (pick one):
-  --check           Inspect bridge/service healthz, .owner.lock holder, path parity, and venv Python deps
+  --check           Inspect bridge/service healthz, .owner.lock holder, two-sided path parity,
+                    venv Python deps, and transcription adapter + ffmpeg/ffprobe readiness
   --drain-bridge    Drain legacy bridge ASR intake and wait for active_jobs == 0
   --drain-service   Drain standalone dalton-transcription intake and wait for active_jobs == 0
   --switch          Run full §6.3 cutover (bridge -> dalton-transcription -> recreate backend)
@@ -208,6 +216,86 @@ check_transcription_python() {
   return 0
 }
 
+check_transcription_runtime_config() {
+  local py_bin
+  py_bin="$(resolve_transcription_python)"
+  if [[ ! -x "$py_bin" ]]; then
+    echo "ERROR: Cannot verify transcription adapter config: Python binary not executable ($py_bin)." >&2
+    return 1
+  fi
+  "$py_bin" - "$REPO_ROOT" "$TRANSCRIPTION_PLIST" "$TRANSCRIPTION_ENV_FILE" <<'PY'
+import os
+import plistlib
+import sys
+from pathlib import Path
+
+repo_root = Path(sys.argv[1]).resolve()
+plist_path = Path(sys.argv[2])
+env_file_path = Path(sys.argv[3])
+
+for p in (str(repo_root), str(repo_root / "src")):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+from src.dalton.transcription_service.worker_registry import validate_worker_startup_config
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    vals: dict[str, str] = {}
+    if not path.is_file():
+        return vals
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        if k:
+            vals[k] = v
+    return vals
+
+plist_env: dict[str, str] = {}
+if plist_path.is_file():
+    try:
+        with plist_path.open("rb") as fh:
+            data = plistlib.load(fh)
+        raw_env = data.get("EnvironmentVariables") or {}
+        if isinstance(raw_env, dict):
+            for k, v in raw_env.items():
+                sv = str(v or "").strip()
+                if sv and not any(tok in sv for tok in ("__PYTHON_BIN__", "__REPO__", "__HOME__", "__LOG_DIR__")):
+                    plist_env[str(k)] = sv
+    except Exception:
+        pass
+
+# Match src/dalton/transcription_service/__main__.py precedence:
+# explicit process env (plist EnvironmentVariables) overrides env file.
+merged_env = parse_env_file(env_file_path)
+merged_env.update(plist_env)
+if "PATH" not in merged_env and os.environ.get("PATH"):
+    merged_env["PATH"] = os.environ["PATH"]
+
+validation = validate_worker_startup_config(environ=merged_env)
+if not validation.ok:
+    missing_csv = ", ".join(validation.missing_config)
+    print(
+        f"ERROR: Transcription runtime pre-check failed (adapter={validation.adapter}, "
+        f"worker_mode={validation.worker_mode}): missing required configuration: {missing_csv}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+print(
+    f"TRANSCRIPTION_ADAPTER:  OK (adapter={validation.adapter}, "
+    f"worker_mode={validation.worker_mode}, ffmpeg=OK, ffprobe=OK)"
+)
+PY
+}
+
 check_plist_installed() {
   if [[ ! -f "$TRANSCRIPTION_PLIST" ]]; then
     echo "ERROR: Missing installed plist: ${TRANSCRIPTION_PLIST} (install from scripts/dalton/launchd/com.dalton.transcription.plist.template)" >&2
@@ -220,37 +308,136 @@ check_plist_installed() {
   return 0
 }
 
-resolve_jobs_dir() {
-  if [[ -n "${DALTON_ASR_JOBS_DIR:-}" ]]; then
-    echo "$DALTON_ASR_JOBS_DIR"
-    return 0
-  fi
-  local from_env
-  from_env="$(read_env_key "$TRANSCRIPTION_ENV_FILE" DALTON_ASR_JOBS_DIR)"
-  if [[ -n "$from_env" ]]; then
-    echo "$from_env"
-    return 0
-  fi
-  if [[ -f "$TRANSCRIPTION_PLIST" ]]; then
-    local from_plist
-    from_plist="$(python3 - "$TRANSCRIPTION_PLIST" <<'PY'
-import plistlib, sys
-try:
-    with open(sys.argv[1], "rb") as fh:
-        data = plistlib.load(fh)
-    val = str((data.get("EnvironmentVariables") or {}).get("DALTON_ASR_JOBS_DIR") or "").strip()
-    if val and "__REPO__" not in val:
-        print(val)
-except Exception:
-    pass
+resolve_side_paths() {
+  local side="$1"
+  local plist_file="$2"
+  local env_file="$3"
+  python3 - "$side" "$plist_file" "$env_file" "$REPO_ROOT" "${DALTON_ASR_JOBS_DIR:-}" "${DALTON_ASR_USAGE_FILE:-}" <<'PY'
+import os
+import plistlib
+import sys
+from pathlib import Path
+
+side, plist_raw, env_raw, repo_raw, shell_jobs, shell_usage = sys.argv[1:7]
+plist_path = Path(plist_raw)
+env_path = Path(env_raw)
+repo_root = Path(repo_raw).resolve()
+
+PLACEHOLDERS = ("__PYTHON_BIN__", "__REPO__", "__REPO_ROOT__", "__HOME__", "__LOG_DIR__")
+
+def is_placeholder(val: str) -> bool:
+    return any(tok in val for tok in PLACEHOLDERS)
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    vals: dict[str, str] = {}
+    if not path.is_file():
+        return vals
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+            v = v[1:-1]
+        if k:
+            vals[k] = v
+    return vals
+
+plist_env: dict[str, str] = {}
+service_repo = repo_root
+if plist_path.is_file():
+    try:
+        with plist_path.open("rb") as fh:
+            data = plistlib.load(fh)
+        raw_env = data.get("EnvironmentVariables") or {}
+        if isinstance(raw_env, dict):
+            for k, v in raw_env.items():
+                sv = str(v or "").strip()
+                if sv and not is_placeholder(sv):
+                    plist_env[str(k)] = sv
+        if side == "bridge":
+            prog_args = data.get("ProgramArguments") or []
+            if len(prog_args) >= 2:
+                script_cand = str(prog_args[1] or "").strip()
+                if script_cand and not is_placeholder(script_cand):
+                    sp = Path(script_cand).expanduser()
+                    if sp.name == "researchdata_bridge.py" and len(sp.parents) >= 3:
+                        service_repo = sp.parents[2]
+        else:
+            wd = str(data.get("WorkingDirectory") or "").strip()
+            if wd and not is_placeholder(wd):
+                service_repo = Path(wd).expanduser()
+    except Exception:
+        pass
+
+env_vals = parse_env_file(env_path)
+
+# Startup precedence matches both services: plist EnvironmentVariables > service env file > default.
+jobs_raw = (
+    plist_env.get("DALTON_ASR_JOBS_DIR")
+    or env_vals.get("DALTON_ASR_JOBS_DIR")
+    or shell_jobs.strip()
+    or str(service_repo / "var" / "dalton" / "asr_jobs")
+)
+jobs_path = Path(jobs_raw).expanduser()
+if not jobs_path.is_absolute():
+    jobs_path = service_repo / jobs_path
+jobs_norm = os.path.realpath(str(jobs_path))
+
+usage_raw = (
+    plist_env.get("DALTON_ASR_USAGE_FILE")
+    or env_vals.get("DALTON_ASR_USAGE_FILE")
+    or shell_usage.strip()
+    or str(Path(jobs_norm) / "asr_usage.jsonl")
+)
+usage_path = Path(usage_raw).expanduser()
+if not usage_path.is_absolute():
+    usage_path = service_repo / usage_path
+usage_norm = os.path.realpath(str(usage_path))
+
+print(jobs_norm)
+print(usage_norm)
 PY
-)"
-    if [[ -n "$from_plist" ]]; then
-      echo "$from_plist"
-      return 0
-    fi
+}
+
+resolve_jobs_dir() {
+  local side_lines
+  side_lines="$(resolve_side_paths "transcription" "$TRANSCRIPTION_PLIST" "$TRANSCRIPTION_ENV_FILE")"
+  echo "$side_lines" | sed -n '1p'
+}
+
+check_path_parity() {
+  local b_out t_out b_jobs b_usage t_jobs t_usage
+  b_out="$(resolve_side_paths "bridge" "$BRIDGE_PLIST" "$BRIDGE_ENV_FILE")"
+  t_out="$(resolve_side_paths "transcription" "$TRANSCRIPTION_PLIST" "$TRANSCRIPTION_ENV_FILE")"
+  b_jobs="$(printf '%s\n' "$b_out" | sed -n '1p')"
+  b_usage="$(printf '%s\n' "$b_out" | sed -n '2p')"
+  t_jobs="$(printf '%s\n' "$t_out" | sed -n '1p')"
+  t_usage="$(printf '%s\n' "$t_out" | sed -n '2p')"
+
+  local ok=1
+  if [[ "$b_jobs" != "$t_jobs" ]]; then
+    echo "ERROR: DALTON_ASR_JOBS_DIR mismatch between legacy bridge and standalone transcription service:" >&2
+    echo "       legacy bridge:            $b_jobs" >&2
+    echo "       standalone transcription: $t_jobs" >&2
+    ok=0
   fi
-  echo "${REPO_ROOT}/var/dalton/asr_jobs"
+  if [[ "$b_usage" != "$t_usage" ]]; then
+    echo "ERROR: DALTON_ASR_USAGE_FILE mismatch between legacy bridge and standalone transcription service:" >&2
+    echo "       legacy bridge:            $b_usage" >&2
+    echo "       standalone transcription: $t_usage" >&2
+    ok=0
+  fi
+  if [[ "$ok" -ne 1 ]]; then
+    echo "       Align both LaunchAgent plists and env files so jobs dir and usage file match before cutover." >&2
+    return 1
+  fi
+  echo "PATH_PARITY:            OK (jobs_dir=$t_jobs, usage_file=$t_usage)"
+  return 0
 }
 
 find_completed_job_id() {
@@ -309,42 +496,76 @@ http_get_to_file() {
   fi
 }
 
+launchagent_state() {
+  local target="$1"
+  local out=""
+  if ! out="$(launchctl print "$target" 2>/dev/null)"; then
+    echo "unloaded"
+    return 0
+  fi
+  if printf '%s\n' "$out" | grep -qiE 'state[[:space:]]*=[[:space:]]*not running' \
+    && ! printf '%s\n' "$out" | grep -qiE 'pid[[:space:]]*=[[:space:]]*[0-9]+'; then
+    echo "loaded_stopped"
+    return 0
+  fi
+  echo "running"
+}
+
 drain_and_wait() {
   local base_url="$1"
   local token="$2"
   local label="$3"
   if [[ -z "$token" ]]; then
     echo "ERROR: Missing admin/service token for $label ($base_url)" >&2
-    exit 1
+    return 1
   fi
   echo "[$label] Sending POST $base_url/transcriptions/drain ..."
   if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "[dry-run] curl -sf -X POST -H 'Authorization: Bearer <redacted>' $base_url/transcriptions/drain"
     return 0
   fi
-  curl -sf -X POST \
+  if ! curl -sf -X POST \
     -H "Authorization: Bearer ${token}" \
     -H "Content-Type: application/json" \
     -d '{"drain":true}' \
-    "${base_url}/transcriptions/drain"
+    "${base_url}/transcriptions/drain"; then
+    echo >&2
+    echo "ERROR: [$label] Failed to initiate drain via POST ${base_url}/transcriptions/drain." >&2
+    echo "       Re-run this script (${ACTION}) once $label is reachable, or cancel drain with:" >&2
+    echo "       curl -sf -X POST -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' -d '{\"drain\":false}' ${base_url}/transcriptions/drain" >&2
+    return 1
+  fi
   echo
 
   local deadline=$(( $(date +%s) + WAIT_SECONDS ))
+  local last_state="unknown"
   while true; do
-    local resp
-    resp="$(curl -sf -H "Authorization: Bearer ${token}" "${base_url}/transcriptions/drain")"
-    local active
-    active="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("active_jobs", -1))' "$resp")"
-    echo "[$label] drain status: active_jobs=${active}"
-    if [[ "$active" == "0" ]]; then
-      echo "[$label] ready for handoff (active_jobs=0)."
-      return 0
+    local resp=""
+    if resp="$(curl -sf -H "Authorization: Bearer ${token}" "${base_url}/transcriptions/drain" 2>/dev/null)"; then
+      local active=""
+      if active="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(d.get("active_jobs", -1))' "$resp" 2>/dev/null)"; then
+        last_state="active_jobs=${active}"
+        echo "[$label] drain status: active_jobs=${active}"
+        if [[ "$active" == "0" ]]; then
+          echo "[$label] ready for handoff (active_jobs=0)."
+          return 0
+        fi
+      else
+        last_state="invalid_response"
+        echo "[$label] WARNING: GET ${base_url}/transcriptions/drain returned non-JSON response; retrying until timeout..." >&2
+      fi
+    else
+      last_state="poll_curl_failed"
+      echo "[$label] WARNING: curl failed while polling ${base_url}/transcriptions/drain; retrying until timeout..." >&2
     fi
     if [[ "$(date +%s)" -ge "$deadline" ]]; then
-      echo "ERROR: Timed out after ${WAIT_SECONDS}s waiting for $label active_jobs to reach 0 (still ${active})." >&2
-      exit 1
+      echo "ERROR: Timed out after ${WAIT_SECONDS}s waiting for $label active_jobs to reach 0 (last state: ${last_state})." >&2
+      echo "       $label remains in draining mode. To continue waiting, re-run this script (${ACTION});" >&2
+      echo "       to cancel drain and resume intake, run:" >&2
+      echo "       curl -sf -X POST -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' -d '{\"drain\":false}' ${base_url}/transcriptions/drain" >&2
+      return 1
     fi
-    sleep 2
+    sleep "$DRAIN_POLL_INTERVAL_S"
   done
 }
 
@@ -357,13 +578,21 @@ run_cmd() {
 }
 
 show_status_snapshot() {
-  local jobs_dir
-  jobs_dir="$(resolve_jobs_dir)"
-  local lock_file="${jobs_dir}/.owner.lock"
+  local b_out t_out b_jobs b_usage t_jobs t_usage lock_file
+  b_out="$(resolve_side_paths "bridge" "$BRIDGE_PLIST" "$BRIDGE_ENV_FILE")"
+  t_out="$(resolve_side_paths "transcription" "$TRANSCRIPTION_PLIST" "$TRANSCRIPTION_ENV_FILE")"
+  b_jobs="$(printf '%s\n' "$b_out" | sed -n '1p')"
+  b_usage="$(printf '%s\n' "$b_out" | sed -n '2p')"
+  t_jobs="$(printf '%s\n' "$t_out" | sed -n '1p')"
+  t_usage="$(printf '%s\n' "$t_out" | sed -n '2p')"
+  lock_file="${t_jobs}/.owner.lock"
   echo "=== Paths ==="
-  echo "REPO_ROOT:              $REPO_ROOT"
-  echo "DALTON_ASR_JOBS_DIR:    $jobs_dir"
-  echo "OWNER_LOCK_FILE:        $lock_file"
+  echo "REPO_ROOT:                    $REPO_ROOT"
+  echo "BRIDGE_ASR_JOBS_DIR:          $b_jobs"
+  echo "TRANSCRIPTION_ASR_JOBS_DIR:   $t_jobs"
+  echo "BRIDGE_ASR_USAGE_FILE:        $b_usage"
+  echo "TRANSCRIPTION_ASR_USAGE_FILE: $t_usage"
+  echo "OWNER_LOCK_FILE:              $lock_file"
   if [[ -f "$lock_file" ]]; then
     echo "--- .owner.lock metadata ---"
     cat "$lock_file"
@@ -379,28 +608,63 @@ show_status_snapshot() {
 }
 
 print_switch_failure_recovery() {
+  local jobs_dir lock_file
+  jobs_dir="$(resolve_jobs_dir)"
+  lock_file="${jobs_dir}/.owner.lock"
   echo >&2
   echo "=== Current Service Status (repo .env and backend container were left unchanged) ===" >&2
   show_status_snapshot >&2
   echo >&2
-  echo "=== Recovery Commands (re-enable legacy bridge ASR intake) ===" >&2
+  echo "=== Recovery Commands (stop new service, confirm lock released, then re-enable legacy bridge) ===" >&2
   cat >&2 <<EOF
-  1. Stop standalone transcription service (if loaded):
-       launchctl bootout "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}" || true
-  2. Re-enable legacy bridge ASR in ${BRIDGE_ENV_FILE} and restart bridge:
-       python3 -c 'import pathlib; p=pathlib.Path("${BRIDGE_ENV_FILE}"); lines=[l for l in (p.read_text().splitlines() if p.exists() else []) if not l.strip().startswith("DALTON_BRIDGE_ASR_DISABLED=")]; lines.append("DALTON_BRIDGE_ASR_DISABLED=false"); p.write_text("\n".join(lines)+"\n")'
-       launchctl kickstart -k "${GUI_DOMAIN}/${BRIDGE_LABEL}"
-  3. Verify legacy bridge holds .owner.lock and accepts requests:
+  1. If ${TRANSCRIPTION_LABEL} is loaded, stop it (stop here if bootout fails):
+       if launchctl print "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}" >/dev/null 2>&1; then launchctl bootout "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}"; fi
+  2. Confirm standalone service is stopped and ${lock_file} is released before touching the bridge:
+       ! launchctl print "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}" >/dev/null 2>&1 && ! curl -sf "${TRANSCRIPTION_URL}/healthz" >/dev/null 2>&1 && python3 -c 'import fcntl,os,sys; p=sys.argv[1]; sys.exit(0) if not os.path.exists(p) else None; fh=open(p,"a+"); fcntl.flock(fh.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB); fcntl.flock(fh.fileno(),fcntl.LOCK_UN)' "${lock_file}"
+  3. Only after steps 1 and 2 succeed, re-enable legacy bridge ASR in ${BRIDGE_ENV_FILE} and restart bridge:
+       python3 -c 'import pathlib,sys; p=pathlib.Path(sys.argv[1]); lines=[l for l in (p.read_text().splitlines() if p.exists() else []) if not l.strip().startswith("DALTON_BRIDGE_ASR_DISABLED=")]; lines.append("DALTON_BRIDGE_ASR_DISABLED=false"); p.write_text("\n".join(lines)+"\n")' "${BRIDGE_ENV_FILE}" && launchctl kickstart -k "${GUI_DOMAIN}/${BRIDGE_LABEL}"
+  4. Verify legacy bridge holds .owner.lock and accepts requests:
        curl -sf "${BRIDGE_URL}/healthz" | python3 -m json.tool
   (Or run: bash scripts/dalton/ops/prod/switch_transcription_service.sh --rollback)
 EOF
 }
 
+resolve_bridge_port() {
+  local port
+  port="$(read_env_key "$BRIDGE_ENV_FILE" DALTON_BRIDGE_PORT)"
+  if [[ -n "$port" ]]; then
+    echo "$port"
+    return 0
+  fi
+  python3 - "$BRIDGE_URL" <<'PY'
+from urllib.parse import urlparse
+import sys
+p = urlparse(sys.argv[1])
+print(p.port or 8960)
+PY
+}
+
 show_check() {
+  local check_failed=0
   show_status_snapshot
   echo
+  echo "=== Path Parity ==="
+  if ! check_path_parity; then
+    check_failed=1
+  fi
+  echo
   echo "=== Transcription Python Runtime ==="
-  check_transcription_python
+  if ! check_transcription_python; then
+    check_failed=1
+  fi
+  echo
+  echo "=== Transcription Adapter & Binary Pre-Check ==="
+  if ! check_transcription_runtime_config; then
+    check_failed=1
+  fi
+  if [[ "$check_failed" -ne 0 ]]; then
+    exit 1
+  fi
 }
 
 BRIDGE_ADMIN_TOKEN="${DALTON_BRIDGE_ADMIN_TOKEN:-$(read_env_key "$BRIDGE_ENV_FILE" DALTON_BRIDGE_ADMIN_TOKEN)}"
@@ -412,10 +676,10 @@ case "$ACTION" in
     show_check
     ;;
   --drain-bridge)
-    drain_and_wait "$BRIDGE_URL" "$BRIDGE_ADMIN_TOKEN" "researchdata-bridge"
+    drain_and_wait "$BRIDGE_URL" "$BRIDGE_ADMIN_TOKEN" "researchdata-bridge" || exit 1
     ;;
   --drain-service)
-    drain_and_wait "$TRANSCRIPTION_URL" "$TRANSCRIPTION_TOKEN" "dalton-transcription"
+    drain_and_wait "$TRANSCRIPTION_URL" "$TRANSCRIPTION_TOKEN" "dalton-transcription" || exit 1
     ;;
   --switch)
     if [[ -z "$TRANSCRIPTION_TOKEN" ]]; then
@@ -426,7 +690,9 @@ case "$ACTION" in
     SAMPLE_JOB_ID="$(find_completed_job_id "$JOBS_DIR")"
     if [[ "$DRY_RUN" -eq 0 ]]; then
       check_plist_installed
+      check_path_parity
       check_transcription_python
+      check_transcription_runtime_config
       if [[ -z "$SAMPLE_JOB_ID" && "$ALLOW_EMPTY_HISTORY" -eq 0 ]]; then
         echo "ERROR: No completed historical job (status=succeeded) found under ${JOBS_DIR}." >&2
         echo "       Verify DALTON_ASR_JOBS_DIR parity before cutover, or pass --allow-empty-history for a brand-new directory." >&2
@@ -435,14 +701,18 @@ case "$ACTION" in
     fi
 
     echo "=== Step 1/4: Drain legacy bridge ASR ==="
-    drain_and_wait "$BRIDGE_URL" "$BRIDGE_ADMIN_TOKEN" "researchdata-bridge"
+    drain_and_wait "$BRIDGE_URL" "$BRIDGE_ADMIN_TOKEN" "researchdata-bridge" || exit 1
 
     echo "=== Step 2/4: Disable legacy bridge ASR and restart bridge to release .owner.lock ==="
     upsert_env_key "$BRIDGE_ENV_FILE" "DALTON_BRIDGE_ASR_DISABLED" "true"
-    run_cmd launchctl kickstart -k "${GUI_DOMAIN}/${BRIDGE_LABEL}"
+    if ! run_cmd launchctl kickstart -k "${GUI_DOMAIN}/${BRIDGE_LABEL}"; then
+      echo "ERROR: launchctl kickstart failed for ${GUI_DOMAIN}/${BRIDGE_LABEL} after writing DALTON_BRIDGE_ASR_DISABLED=true." >&2
+      print_switch_failure_recovery
+      exit 1
+    fi
     if [[ "$DRY_RUN" -eq 0 ]]; then
       bridge_disabled_ok=0
-      for _ in $(seq 1 15); do
+      for _ in $(seq 1 "$HEALTH_POLL_ATTEMPTS"); do
         if bhz="$(curl -sf "${BRIDGE_URL}/healthz" 2>/dev/null)"; then
           if python3 - "$bhz" <<'PY'
 import json, sys
@@ -455,7 +725,7 @@ PY
             break
           fi
         fi
-        sleep 1
+        sleep "$HEALTH_POLL_INTERVAL_S"
       done
       if [[ "$bridge_disabled_ok" -ne 1 ]]; then
         echo "ERROR: Legacy bridge did not confirm asr.disabled=true and owner_lock_held=false after restart." >&2
@@ -473,14 +743,22 @@ PY
 
     echo "=== Step 3/4: Start standalone com.dalton.transcription (:8965) and verify lock, auth, and historical read ==="
     if launchctl print "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}" >/dev/null 2>&1; then
-      run_cmd launchctl kickstart -k "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}"
+      if ! run_cmd launchctl kickstart -k "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}"; then
+        echo "ERROR: launchctl kickstart failed for ${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}." >&2
+        print_switch_failure_recovery
+        exit 1
+      fi
     else
-      run_cmd launchctl bootstrap "${GUI_DOMAIN}" "${TRANSCRIPTION_PLIST}"
+      if ! run_cmd launchctl bootstrap "${GUI_DOMAIN}" "${TRANSCRIPTION_PLIST}"; then
+        echo "ERROR: launchctl bootstrap failed for ${GUI_DOMAIN} (${TRANSCRIPTION_PLIST})." >&2
+        print_switch_failure_recovery
+        exit 1
+      fi
     fi
     if [[ "$DRY_RUN" -eq 0 ]]; then
       service_lock_ok=0
       last_hz=""
-      for _ in $(seq 1 20); do
+      for _ in $(seq 1 "$HEALTH_POLL_ATTEMPTS"); do
         if hz="$(curl -sf "${TRANSCRIPTION_URL}/healthz" 2>/dev/null)"; then
           last_hz="$hz"
           if python3 - "$hz" <<'PY'
@@ -489,7 +767,11 @@ d = json.loads(sys.argv[1])
 ok = (
     d.get("owner_lock_held") is True
     and d.get("disabled") is False
+    and d.get("misconfigured") is not True
     and d.get("status") == "ok"
+    and d.get("ffmpeg_available") is True
+    and d.get("ffprobe_available") is True
+    and d.get("worker_name") not in (None, "", "none", "unconfigured")
 )
 sys.exit(0 if ok else 1)
 PY
@@ -499,10 +781,10 @@ PY
             break
           fi
         fi
-        sleep 1
+        sleep "$HEALTH_POLL_INTERVAL_S"
       done
       if [[ "$service_lock_ok" -ne 1 ]]; then
-        echo "ERROR: dalton-transcription did not report status=ok and owner_lock_held=true within 20s (last healthz: ${last_hz:-unreachable})." >&2
+        echo "ERROR: dalton-transcription did not report status=ok, configured worker, ffmpeg/ffprobe available, and owner_lock_held=true (last healthz: ${last_hz:-unreachable})." >&2
         print_switch_failure_recovery
         exit 1
       fi
@@ -580,22 +862,82 @@ PY
     JOBS_DIR="$(resolve_jobs_dir)"
 
     echo "=== Step 1/3: Drain and stop standalone com.dalton.transcription ==="
-    if ts_hz="$(curl -sf "${TRANSCRIPTION_URL}/healthz" 2>/dev/null)"; then
-      ts_disabled="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("disabled", False))' "$ts_hz" 2>/dev/null || echo "False")"
-      if [[ "$ts_disabled" != "True" ]]; then
+    ts_agent_state="$(launchagent_state "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}")"
+    if [[ "$ts_agent_state" == "running" ]]; then
+      if [[ "$DRY_RUN" -eq 0 ]]; then
+        if ! ts_hz="$(curl -sf "${TRANSCRIPTION_URL}/healthz" 2>/dev/null)"; then
+          echo "ERROR: LaunchAgent ${TRANSCRIPTION_LABEL} is still running, but ${TRANSCRIPTION_URL}/healthz failed; refusing to bootout while in-flight jobs cannot be verified." >&2
+          show_status_snapshot >&2
+          exit 1
+        fi
+        ts_skip_drain="$(python3 - "$ts_hz" <<'PY'
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    print("INVALID")
+    sys.exit(0)
+if not isinstance(d, dict):
+    print("INVALID")
+    sys.exit(0)
+disabled = d.get("disabled") is True
+misconfigured_idle = (
+    d.get("misconfigured") is True
+    and d.get("owner_lock_held") is False
+    and d.get("active_jobs", -1) == 0
+)
+print("SKIP" if (disabled or misconfigured_idle) else "DRAIN")
+PY
+)"
+        if [[ "$ts_skip_drain" == "INVALID" ]]; then
+          echo "ERROR: LaunchAgent ${TRANSCRIPTION_LABEL} returned invalid JSON on ${TRANSCRIPTION_URL}/healthz; refusing to bootout." >&2
+          show_status_snapshot >&2
+          exit 1
+        fi
+        if [[ "$ts_skip_drain" == "DRAIN" ]]; then
+          if ! drain_and_wait "$TRANSCRIPTION_URL" "$TRANSCRIPTION_TOKEN" "dalton-transcription"; then
+            show_status_snapshot >&2
+            exit 1
+          fi
+        fi
+      else
         drain_and_wait "$TRANSCRIPTION_URL" "$TRANSCRIPTION_TOKEN" "dalton-transcription"
       fi
-    fi
-    if launchctl print "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}" >/dev/null 2>&1; then
       if ! run_cmd launchctl bootout "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}"; then
         echo "ERROR: launchctl bootout failed for ${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}; aborting rollback before modifying .env or backend." >&2
         show_status_snapshot >&2
         exit 1
       fi
+    elif [[ "$ts_agent_state" == "loaded_stopped" ]]; then
+      if [[ "$DRY_RUN" -eq 0 ]] && ts_hz="$(curl -sf "${TRANSCRIPTION_URL}/healthz" 2>/dev/null)"; then
+        ts_disabled="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("disabled", False))' "$ts_hz" 2>/dev/null || echo "False")"
+        if [[ "$ts_disabled" != "True" ]]; then
+          if ! drain_and_wait "$TRANSCRIPTION_URL" "$TRANSCRIPTION_TOKEN" "dalton-transcription"; then
+            show_status_snapshot >&2
+            exit 1
+          fi
+        fi
+      fi
+      if ! run_cmd launchctl bootout "${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}"; then
+        echo "ERROR: launchctl bootout failed for ${GUI_DOMAIN}/${TRANSCRIPTION_LABEL}; aborting rollback before modifying .env or backend." >&2
+        show_status_snapshot >&2
+        exit 1
+      fi
+    else
+      if [[ "$DRY_RUN" -eq 0 ]] && ts_hz="$(curl -sf "${TRANSCRIPTION_URL}/healthz" 2>/dev/null)"; then
+        ts_disabled="$(python3 -c 'import json,sys; print(json.loads(sys.argv[1]).get("disabled", False))' "$ts_hz" 2>/dev/null || echo "False")"
+        if [[ "$ts_disabled" != "True" ]]; then
+          if ! drain_and_wait "$TRANSCRIPTION_URL" "$TRANSCRIPTION_TOKEN" "dalton-transcription"; then
+            show_status_snapshot >&2
+            exit 1
+          fi
+        fi
+      fi
     fi
+
     if [[ "$DRY_RUN" -eq 0 ]]; then
       service_stopped_ok=0
-      for _ in $(seq 1 15); do
+      for _ in $(seq 1 "$HEALTH_POLL_ATTEMPTS"); do
         if ts_check_hz="$(curl -sf "${TRANSCRIPTION_URL}/healthz" 2>/dev/null)"; then
           if python3 - "$ts_check_hz" <<'PY'
 import json, sys
@@ -619,7 +961,7 @@ PY
             break
           fi
         fi
-        sleep 1
+        sleep "$HEALTH_POLL_INTERVAL_S"
       done
       if [[ "$service_stopped_ok" -ne 1 ]]; then
         echo "ERROR: Standalone dalton-transcription has not stopped or released .owner.lock; aborting rollback before enabling legacy bridge or modifying .env." >&2
@@ -631,11 +973,15 @@ PY
 
     echo "=== Step 2/3: Re-enable legacy bridge ASR and verify .owner.lock re-acquired ==="
     upsert_env_key "$BRIDGE_ENV_FILE" "DALTON_BRIDGE_ASR_DISABLED" "false"
-    run_cmd launchctl kickstart -k "${GUI_DOMAIN}/${BRIDGE_LABEL}"
+    if ! run_cmd launchctl kickstart -k "${GUI_DOMAIN}/${BRIDGE_LABEL}"; then
+      echo "ERROR: launchctl kickstart failed for ${GUI_DOMAIN}/${BRIDGE_LABEL}; repo .env and backend container were left unchanged." >&2
+      show_status_snapshot >&2
+      exit 1
+    fi
     if [[ "$DRY_RUN" -eq 0 ]]; then
       bridge_ready_ok=0
       last_bhz=""
-      for _ in $(seq 1 20); do
+      for _ in $(seq 1 "$HEALTH_POLL_ATTEMPTS"); do
         if bhz="$(curl -sf "${BRIDGE_URL}/healthz" 2>/dev/null)"; then
           last_bhz="$bhz"
           if python3 - "$bhz" <<'PY'
@@ -654,10 +1000,10 @@ PY
             break
           fi
         fi
-        sleep 1
+        sleep "$HEALTH_POLL_INTERVAL_S"
       done
       if [[ "$bridge_ready_ok" -ne 1 ]]; then
-        echo "ERROR: Legacy bridge did not report asr.disabled=false and asr.owner_lock_held=true within 20s (last healthz: ${last_bhz:-unreachable})." >&2
+        echo "ERROR: Legacy bridge did not report asr.disabled=false and asr.owner_lock_held=true (last healthz: ${last_bhz:-unreachable})." >&2
         echo "       Repo .env and backend container were left unchanged." >&2
         show_status_snapshot >&2
         exit 1
@@ -699,7 +1045,8 @@ PY
     fi
 
     echo "=== Step 3/3: Restore .env to bridge endpoint and recreate backend container (E16) ==="
-    upsert_env_key "$REPO_ENV_FILE" "DALTON_TRANSCRIPTION_SERVICE_URL" "http://host.docker.internal:8960"
+    BRIDGE_PORT="$(resolve_bridge_port)"
+    upsert_env_key "$REPO_ENV_FILE" "DALTON_TRANSCRIPTION_SERVICE_URL" "http://host.docker.internal:${BRIDGE_PORT}"
     upsert_env_key "$REPO_ENV_FILE" "DALTON_TRANSCRIPTION_TOKEN" "$BRIDGE_ADMIN_TOKEN"
     run_cmd bash -c "cd '$REPO_ROOT' && docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d --no-deps backend"
     echo "Rollback completed."
