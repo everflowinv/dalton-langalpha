@@ -521,28 +521,48 @@ async def _resolver(
     else:
         latest = latest_attempt
     latest_meta = (latest or {}).get("metadata") or {}
-    # DALTON-HOOK(cos-settings-tools): read execution-level system-only flag from source_run_id (when supplied) or the same latest run row, failing closed when strict_system_only=True
+    # DALTON-HOOK(cos-settings-tools): read execution-level system-only flag from source_run_id (fetching full run row via get_run) or the same latest run row, failing closed when strict_system_only=True
     if ignore_custom_models is not None:
         effective_ignore_custom = bool(ignore_custom_models)
     elif source_run_id:
+        norm_source_run_id = str(source_run_id).strip()
         try:
-            _, resolved_sys = await get_run_model_and_system_only(
-                {"conversation_response_id": str(source_run_id).strip()}
-            )
+            run_row = await tl_db.get_run(norm_source_run_id)
         except Exception as exc:
             if strict_system_only:
                 raise RuntimeError(
-                    f"Failed reading execution system-only flag for run {source_run_id} on thread {thread_id}"
+                    f"Failed reading source run {norm_source_run_id} on thread {thread_id}"
                 ) from exc
-            resolved_sys = None
-        if resolved_sys is None:
+            logger.debug(
+                "source run read failed for run %s on thread %s",
+                norm_source_run_id,
+                thread_id,
+                exc_info=True,
+            )
+            run_row = None
+        if not isinstance(run_row, Mapping):
             if strict_system_only:
                 raise RuntimeError(
-                    f"Failed reading execution system-only flag for run {source_run_id} on thread {thread_id}"
+                    f"Source run {norm_source_run_id} not found for thread {thread_id}"
                 )
             effective_ignore_custom = False
         else:
-            effective_ignore_custom = bool(resolved_sys)
+            try:
+                _, resolved_sys = await get_run_model_and_system_only(run_row)
+            except Exception as exc:
+                if strict_system_only:
+                    raise RuntimeError(
+                        f"Failed reading execution system-only flag for run {norm_source_run_id} on thread {thread_id}"
+                    ) from exc
+                resolved_sys = None
+            if resolved_sys is None:
+                if strict_system_only:
+                    raise RuntimeError(
+                        f"Failed reading execution system-only flag for run {norm_source_run_id} on thread {thread_id}"
+                    )
+                effective_ignore_custom = False
+            else:
+                effective_ignore_custom = bool(resolved_sys)
     elif isinstance(latest, Mapping):
         _, resolved_sys = await get_run_model_and_system_only(latest)
         if resolved_sys is None:

@@ -282,6 +282,8 @@ async def get_run_model_and_system_only(
         )
         return run_model, None
     if exec_row is None:
+        if exec_id is not None:
+            return run_model, None
         return run_model, False
     if exec_row.get("snapshot_taken") is False:
         try:
@@ -850,6 +852,12 @@ async def _resolve_automation_notification_context(
         )
         return None, None, None, False, False, None
     if target_exec is None:
+        if known_execution_id is not None:
+            logger.warning(
+                f"[AUTOMATION_THREAD_MODEL] Confirmed execution {known_execution_id} "
+                f"not found (0 rows) for thread={thread_id}; refusing turn"
+            )
+            raise _automation_model_unreadable()
         return None, None, None, False, False, None
 
     if target_exec.get("snapshot_taken") is False:

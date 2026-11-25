@@ -6770,6 +6770,14 @@ async def test_r10_deferred_handoff_rereads_exact_candidate_run_id_never_borrowi
         "own_access",
         create_autospec(account_mod.own_access, return_value=SimpleNamespace(api_keys=False)),
     )
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_run",
+        create_autospec(
+            runs_lifecycle_db.get_run,
+            side_effect=lambda rid: dict(run1_row) if str(rid) == run1_sys_id else None,
+        ),
+    )
 
     queried_run_ids: list[str] = []
 
@@ -7123,3 +7131,348 @@ async def test_r10_web_patch_same_name_switch_triggers_strict_handoff_on_read_ti
             "strict_system_only": True,
         }
     ]
+
+
+# =========================================================================
+# Round 11 (narrowed) unit tests
+# =========================================================================
+
+
+@pytest.mark.asyncio
+async def test_r11_web_retry_with_known_execution_id_zero_rows_fails_closed_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 11 Decision 1 (codex high 1):
+    When a historical run carries automation_execution_id in metadata (e.g. its execution row
+    was cascade-deleted by recycle-bin cleanup) and _get_execution_for_run_id normally returns
+    None (0 rows, no exception), web POST /api/v1/threads/{id}/retry with composer llm_model
+    and reasoning_effort MUST fail closed with HTTP 503 (automation_model_unavailable) — never
+    starting the workflow or falling back to composer/thread models."""
+    from fastapi import FastAPI
+    from httpx import ASGITransport, AsyncClient
+
+    from src.server.app.threads import messaging as msg_mod
+    from src.server.dependencies import cli_approval, principal as principal_mod, usage_limits
+    from src.server.handlers import chat as chat_handlers, checkpoint_handler
+    from src.server.services import turn_runtime
+    from src.server.services.runs import pending_input as pending_input_mod
+    from src.server.services.shared_workspaces.turn import TurnIdentity as SharedTurnIdentity
+
+    app = FastAPI()
+    app.include_router(msg_mod.router)
+
+    async def _fake_limit(uid: str):
+        return usage_limits.ChatAuthResult(
+            user_id=uid,
+            is_byok=False,
+            has_oauth=False,
+            access_tier=1,
+            burst_slot_id="slot-r11",
+            own_subscriptions=False,
+        )
+
+    app.dependency_overrides[principal_mod._RUN] = lambda: principal_mod.Principal(
+        user_id=OWNER, auth="session"
+    )
+    app.dependency_overrides[usage_limits.chat_limiter] = lambda: _fake_limit
+
+    monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
+    monkeypatch.setattr("src.dalton.auth.is_dalton_supabase_auth_enabled", lambda: False)
+    monkeypatch.setattr("src.dalton.settings.get_dalton_auth_mode", lambda: "oss")
+    monkeypatch.setattr("src.server.app.setup.agent_config", SimpleNamespace())
+    monkeypatch.setattr(
+        cli_approval,
+        "admit_retry",
+        create_autospec(cli_approval.admit_retry, return_value=None),
+    )
+    monkeypatch.setattr(
+        msg_mod,
+        "_assert_stream_transport_ready",
+        create_autospec(msg_mod._assert_stream_transport_ready, return_value=None),
+    )
+    monkeypatch.setattr(
+        msg_mod,
+        "get_thread_auth_meta",
+        create_autospec(
+            msg_mod.get_thread_auth_meta,
+            return_value={"user_id": OWNER, "workspace_id": WS, "llm_model": "claude-sonnet-4-6"},
+        ),
+    )
+    monkeypatch.setattr(
+        msg_mod,
+        "_settle_against_branch",
+        create_autospec(msg_mod._settle_against_branch, side_effect=lambda _t, req, _u: req),
+    )
+    monkeypatch.setattr(
+        "src.dalton.sharing.resolve_colleague_turn_admission",
+        create_autospec(
+            __import__(
+                "src.dalton.sharing", fromlist=["resolve_colleague_turn_admission"]
+            ).resolve_colleague_turn_admission,
+            return_value=({"workspace_id": WS, "user_id": OWNER, "computer_id": COMP_1}, "web", False),
+        ),
+    )
+    route = TurnRoute(workspace_id=WS, owner_id=OWNER, role="analyst")
+    monkeypatch.setattr(
+        turn_runtime,
+        "turn_route",
+        create_autospec(turn_runtime.turn_route, return_value=route),
+    )
+    monkeypatch.setattr(
+        TurnRoute,
+        "bind",
+        create_autospec(TurnRoute.bind, return_value=route),
+    )
+    monkeypatch.setattr(
+        SharedTurnIdentity,
+        "of",
+        create_autospec(
+            SharedTurnIdentity.of,
+            return_value=SharedTurnIdentity(sender=OWNER, owner=OWNER, recorded_as=OWNER),
+        ),
+    )
+    monkeypatch.setattr(
+        usage_limits,
+        "release_burst_slot",
+        create_autospec(usage_limits.release_burst_slot, return_value=None),
+    )
+    monkeypatch.setattr(
+        checkpoint_handler,
+        "get_retry_checkpoint",
+        create_autospec(checkpoint_handler.get_retry_checkpoint, return_value="cp-r11-1"),
+    )
+    monkeypatch.setattr(
+        pending_input_mod,
+        "retried_wake_fields",
+        create_autospec(pending_input_mod.retried_wake_fields, return_value={}),
+    )
+
+    failed_run_id = "99999999-9999-4999-8999-999999999911"
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_latest_attempt",
+        create_autospec(
+            runs_lifecycle_db.get_latest_attempt,
+            return_value={
+                "conversation_response_id": failed_run_id,
+                "turn_index": 1,
+                "status": "error",
+                "error_message": "transient_failure",
+                "metadata": {"automation_execution_id": EXEC_ID},
+            },
+        ),
+    )
+    # Normal zero-row return (None), NOT an exception
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_run_id",
+        create_autospec(atm_mod._get_execution_for_run_id, return_value=None),
+    )
+    resolve_spy = create_autospec(llm_config_mod.resolve_llm_config)
+    monkeypatch.setattr(llm_config_mod, "resolve_llm_config", resolve_spy)
+    workflow_spy = create_autospec(chat_handlers.astream_ptc_workflow)
+    monkeypatch.setattr(chat_handlers, "astream_ptc_workflow", workflow_spy)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/api/v1/threads/{THREAD_ID}/retry",
+            json={
+                "workspace_id": WS,
+                "llm_model": "owner-composer-model",
+                "reasoning_effort": "high",
+            },
+        )
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["type"] == "automation_model_unavailable"
+    resolve_spy.assert_not_awaited()
+    workflow_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_r11_handoff_source_run_id_missing_row_or_purged_execution_vs_confirmed_normal_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 11 Decision 2 (codex medium 2):
+    When deferred handoff re-reads an unresolved candidate via source_run_id under strict_system_only=True:
+    1) If tl_db.get_run(source_run_id) returns None (missing run row), run_pending_model_handoff
+       returns retryable_failure and keeps the pending marker (never treating 0 rows as False).
+    2) If tl_db.get_run(source_run_id) returns a run row with metadata.automation_execution_id
+       whose execution row was purged (_get_execution_by_id returns None), get_run_model_and_system_only
+       returns (run_model, None), and run_pending_model_handoff returns retryable_failure and keeps
+       the pending marker.
+    3) If tl_db.get_run(source_run_id) returns an existing run row WITHOUT automation_execution_id
+       in metadata and _get_execution_for_run_id returns None, get_run_model_and_system_only
+       confirms (run_model, False) and allows normal handoff evaluation to complete and clear marker."""
+    from src.dalton.database import model_switch as dalton_ms_db
+    from src.llms import provider_compaction as pc_mod
+    from src.server.handlers import thread_maintenance as maint_mod
+    from src.server.handlers import thread_model_handoff as handoff_mod
+    from src.server.services import account as account_mod
+    from src.server.services import thread_agent as ta_mod
+    from src.server.services.llm import thread_model as thread_model_mod
+
+    cand_run_id = "33333333-3333-4333-8333-3333333333d1"
+    newer_run_row = {
+        "conversation_response_id": "33333333-3333-4333-8333-3333333333d2",
+        "metadata": {"llm_model": "gpt-6.2-sol"},
+    }
+    marker = thread_model_mod.build_pending_model_handoff_marker(
+        previous_model="claude-sonnet-4-6",
+        user_id=OWNER,
+        version="ver-r11-source-run",
+        candidate_models=("claude-sonnet-4-6",),
+        candidate_sources=(("claude-sonnet-4-6", None),),
+        candidate_source_run_ids=(cand_run_id,),
+    )
+
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_latest_attempt",
+        create_autospec(runs_lifecycle_db.get_latest_attempt, return_value=newer_run_row),
+    )
+    monkeypatch.setattr(
+        thread_model_mod.threads_read,
+        "get_thread_auth_meta",
+        create_autospec(
+            thread_model_mod.threads_read.get_thread_auth_meta,
+            return_value={
+                "user_id": OWNER,
+                "workspace_id": WS,
+                "llm_model": "claude-sonnet-4-6",
+                "metadata": {thread_model_mod.PENDING_MODEL_HANDOFF_KEY: marker},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        thread_model_mod,
+        "next_turn_runs_claude_code",
+        create_autospec(thread_model_mod.next_turn_runs_claude_code, return_value=False),
+    )
+    monkeypatch.setattr(
+        maint_mod,
+        "_summary_to_hand_off",
+        create_autospec(maint_mod._summary_to_hand_off, return_value=object()),
+    )
+    monkeypatch.setattr(
+        maint_mod,
+        "thread_route",
+        create_autospec(
+            maint_mod.thread_route,
+            return_value=(
+                {"conversation_thread_id": THREAD_ID, "workspace_id": WS, "llm_model": "claude-sonnet-4-6"},
+                TurnRoute(workspace_id=WS, owner_id=OWNER, role="analyst"),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        maint_mod.TurnIdentity,
+        "of",
+        create_autospec(
+            maint_mod.TurnIdentity.of,
+            return_value=TurnIdentity(sender=OWNER, owner=OWNER, recorded_as=OWNER),
+        ),
+    )
+    monkeypatch.setattr(
+        account_mod,
+        "own_access",
+        create_autospec(account_mod.own_access, return_value=SimpleNamespace(api_keys=False)),
+    )
+
+    orig_get_run = runs_lifecycle_db.get_run
+    orig_get_exec_by_id = atm_mod._get_execution_by_id
+    orig_get_exec_for_run = atm_mod._get_execution_for_run_id
+    orig_clear_meta = dalton_ms_db.clear_thread_metadata_key
+
+    # Case 1: tl_db.get_run(cand_run_id) returns None (missing run row) -> retryable_failure, keep marker
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_run",
+        create_autospec(orig_get_run, return_value=None),
+    )
+    clear_spy_1 = create_autospec(orig_clear_meta, return_value=True)
+    monkeypatch.setattr(dalton_ms_db, "clear_thread_metadata_key", clear_spy_1)
+
+    outcome_1 = await handoff_mod.run_pending_model_handoff(THREAD_ID, user_id=OWNER)
+    assert outcome_1 == "retryable_failure"
+    clear_spy_1.assert_not_awaited()
+
+    # Case 2: run row exists with metadata.automation_execution_id, but execution row was purged (None)
+    run_with_purged_exec = {
+        "conversation_response_id": cand_run_id,
+        "metadata": {
+            "llm_model": "claude-sonnet-4-6",
+            "automation_execution_id": EXEC_ID,
+        },
+    }
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_run",
+        create_autospec(orig_get_run, return_value=run_with_purged_exec),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_by_id",
+        create_autospec(orig_get_exec_by_id, return_value=None),
+    )
+    model_2, sys_2 = await atm_mod.get_run_model_and_system_only(run_with_purged_exec)
+    assert (model_2, sys_2) == ("claude-sonnet-4-6", None)
+
+    clear_spy_2 = create_autospec(orig_clear_meta, return_value=True)
+    monkeypatch.setattr(dalton_ms_db, "clear_thread_metadata_key", clear_spy_2)
+    outcome_2 = await handoff_mod.run_pending_model_handoff(THREAD_ID, user_id=OWNER)
+    assert outcome_2 == "retryable_failure"
+    clear_spy_2.assert_not_awaited()
+
+    # Case 3: run row exists WITHOUT automation_execution_id in metadata and _get_execution_for_run_id returns None
+    run_confirmed_normal = {
+        "conversation_response_id": cand_run_id,
+        "metadata": {"llm_model": "claude-sonnet-4-6"},
+    }
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "get_run",
+        create_autospec(orig_get_run, return_value=run_confirmed_normal),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "_get_execution_for_run_id",
+        create_autospec(orig_get_exec_for_run, return_value=None),
+    )
+    model_3, sys_3 = await atm_mod.get_run_model_and_system_only(run_confirmed_normal)
+    assert (model_3, sys_3) == ("claude-sonnet-4-6", False)
+
+    resolver_flags_3: list[bool] = []
+
+    def _fake_thread_resolver(*_a: Any, **kw: Any):
+        base_ignore = bool(kw.get("ignore_custom_models", False))
+        resolver_flags_3.append(base_ignore)
+
+        async def _res(model_name: str | None, *, ignore_custom_models_override: bool | None = None):
+            eff_ignore = base_ignore if ignore_custom_models_override is None else bool(ignore_custom_models_override)
+            client_tag = f"sys:{model_name}" if eff_ignore else f"custom:{model_name}"
+            return SimpleNamespace(get_llm_client=lambda _c=client_tag: _c)
+
+        return _res
+
+    monkeypatch.setattr(
+        ta_mod,
+        "thread_resolver",
+        create_autospec(ta_mod.thread_resolver, side_effect=_fake_thread_resolver),
+    )
+    # Normal custom client can already replay the summary -> not_needed and clears marker
+    monkeypatch.setattr(
+        pc_mod,
+        "replays",
+        create_autospec(pc_mod.replays, return_value=True),
+    )
+    clear_spy_3 = create_autospec(orig_clear_meta, return_value=True)
+    monkeypatch.setattr(dalton_ms_db, "clear_thread_metadata_key", clear_spy_3)
+
+    outcome_3 = await handoff_mod.run_pending_model_handoff(THREAD_ID, user_id=OWNER)
+    assert outcome_3 == "not_needed"
+    assert resolver_flags_3 == [False]
+    clear_spy_3.assert_awaited_once_with(
+        THREAD_ID,
+        thread_model_mod.PENDING_MODEL_HANDOFF_KEY,
+        expected_version="ver-r11-source-run",
+    )
