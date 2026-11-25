@@ -18,6 +18,10 @@ def byok_candidates(provider: str, mc) -> list[str]:
     Whether a key found here may serve the model is ``key_fits``'s call, since
     it depends on what was saved with the key.
     """
+    # DALTON-HOOK(team-model-catalog): catalog-defined provider variants never accept
+    # user/holder BYOK keys (they use dedicated bound credentials in dalton_catalog_provider_credentials).
+    if mc.get_provider_info(provider).get("catalog_defined"):
+        return []
     # DALTON-HOOK(team-credentials): coding-plan variants only accept a key
     # stored under their own slug, so one plan's quota never pays for a
     # sibling's models.
@@ -49,6 +53,12 @@ def key_fits(provider: str, holder: str, *, has_base_url: bool, mc) -> bool:
     and rejects it. A base URL saved with the key lifts that, since it wins over
     the model's endpoint, so the key goes where the user pointed it.
     """
+    # DALTON-HOOK(team-model-catalog): never allow any BYOK key (even with has_base_url=True)
+    # to serve a catalog-defined provider variant.
+    if mc.get_provider_info(provider).get("catalog_defined") or mc.get_provider_info(holder).get(
+        "catalog_defined"
+    ):
+        return False
     return has_base_url or mc.shares_api_key(provider, holder)
 
 

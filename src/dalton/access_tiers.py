@@ -50,6 +50,8 @@ __all__ = [
     "get_user_tier",
     "is_admin_user",
     "is_admin_user_sync",
+    "is_catalog_admin",
+    "is_catalog_admin_async",
     "is_internal_or_admin",
     "is_internal_tier",
     "is_team_member_user",
@@ -225,6 +227,20 @@ def is_admin_user_sync(
             type(exc).__name__,
         )
         return False
+
+
+def is_catalog_admin(user_id: str | None) -> bool:
+    """Delegate to the unified 3-auth-mode catalog admin guard (``local``/``supabase``/``oss``)."""
+    from src.dalton.credentials import is_catalog_admin as _cred_is_catalog_admin
+
+    return _cred_is_catalog_admin(user_id)
+
+
+async def is_catalog_admin_async(user_id: str | None, *, conn: Any = None) -> bool:
+    """Async counterpart of :func:`is_catalog_admin`."""
+    from src.dalton.credentials import is_catalog_admin_async as _cred_is_catalog_admin_async
+
+    return await _cred_is_catalog_admin_async(user_id, conn=conn)
 
 
 async def list_admin_user_ids(

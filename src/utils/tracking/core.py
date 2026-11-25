@@ -206,6 +206,18 @@ class PricingResolver:
         if cache_key in self._notional_resolved:
             return self._notional_resolved[cache_key]
 
+        # DALTON-HOOK(team-model-catalog): resolve nominal card from active turn snapshot when bound
+        from src.dalton.services.team_model_catalog.snapshot import lookup_snapshot_notional
+
+        snap_hit, snap_notional, snap_is_sub = lookup_snapshot_notional(
+            model_name,
+            pricing_model_id=stamped_id,
+            pricing_provider=stamped_provider,
+        )
+        if snap_hit:
+            self._notional_resolved[cache_key] = (snap_notional, snap_is_sub)
+            return self._notional_resolved[cache_key]
+
         is_sub = is_subscription_model(
             model_name,
             billing_type,
@@ -267,7 +279,16 @@ class PricingResolver:
                 model_name, billing_type=billing_type
             )
 
-        pricing = find_model_pricing(pricing_id, provider=provider)
+        # DALTON-HOOK(team-model-catalog): prefer active turn effective_catalog_snapshot rates when bound
+        from src.dalton.services.team_model_catalog.snapshot import lookup_snapshot_pricing
+
+        snap_hit, snap_pricing = lookup_snapshot_pricing(
+            model_name, provider, model_id=pricing_id
+        )
+        if snap_hit:
+            pricing = snap_pricing
+        else:
+            pricing = find_model_pricing(pricing_id, provider=provider)
         listed = pricing is not None
 
         if pricing is None:

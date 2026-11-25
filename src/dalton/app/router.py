@@ -11,7 +11,7 @@ import os
 import time
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from src.dalton.budget.service import (
@@ -299,6 +299,376 @@ async def restore_native_models_endpoint(
     require_capability(CapabilityId.NATIVE_OAUTH_SYNC)
     _require_pm_user(user_id)
     return await run_native_restore(user_id=user_id, model_keys=body.keys)
+
+
+# ---------------------------------------------------------------------------
+# Team Model Catalog (d051): versioned DB catalog admin & rollback API
+# ---------------------------------------------------------------------------
+
+
+def _raise_catalog_http(exc: Exception) -> None:
+    from pydantic import ValidationError as PydanticValidationError
+
+    from src.dalton.services.team_model_catalog.constants import CatalogError
+
+    if isinstance(exc, CatalogError):
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.to_http_detail()
+        ) from exc
+    if isinstance(exc, PydanticValidationError):
+        raise HTTPException(
+            status_code=422,
+            detail=exc.errors(include_url=False, include_context=False, include_input=False),
+        ) from exc
+    raise exc
+
+
+async def _require_catalog_admin(user_id: str) -> None:
+    _require_dalton_enabled()
+    from src.dalton.credentials import require_catalog_admin_async
+
+    await require_catalog_admin_async(user_id)
+
+
+def _stamp_catalog_revision_header(response: Response, payload: dict[str, Any]) -> dict[str, Any]:
+    from src.dalton.services.team_model_catalog.constants import CATALOG_REVISION_HEADER
+
+    rev = payload.get("revision")
+    if rev is not None:
+        response.headers[CATALOG_REVISION_HEADER] = str(rev)
+    return payload
+
+
+@router.get("/team-models")
+@handle_api_exceptions("get team model catalog", logger)
+async def get_team_models_catalog_endpoint(
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import get_team_catalog_overview
+
+    try:
+        return _stamp_catalog_revision_header(response, await get_team_catalog_overview())
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models")
+@handle_api_exceptions("create team catalog model", logger)
+async def create_team_model_endpoint(
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import create_catalog_model
+    from src.dalton.services.team_model_catalog.validation import CatalogModelUpsertInput
+
+    try:
+        parsed = CatalogModelUpsertInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response, await create_catalog_model(actor_user_id=user_id, data=parsed)
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models/provider-variants")
+@handle_api_exceptions("create team catalog provider variant", logger)
+async def create_team_provider_variant_endpoint(
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import upsert_provider_variant
+    from src.dalton.services.team_model_catalog.validation import ProviderVariantUpsertInput
+
+    try:
+        parsed = ProviderVariantUpsertInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response,
+            await upsert_provider_variant(actor_user_id=user_id, data=parsed, is_update=False),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.put("/team-models/provider-variants/{provider_slug}")
+@handle_api_exceptions("update team catalog provider variant", logger)
+async def update_team_provider_variant_endpoint(
+    provider_slug: str,
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import upsert_provider_variant
+    from src.dalton.services.team_model_catalog.validation import ProviderVariantUpsertInput
+
+    try:
+        merged = {**body, "provider_slug": provider_slug}
+        parsed = ProviderVariantUpsertInput.model_validate(merged)
+        return _stamp_catalog_revision_header(
+            response,
+            await upsert_provider_variant(actor_user_id=user_id, data=parsed, is_update=True),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.put("/team-models/curated")
+@handle_api_exceptions("update team catalog curated setup", logger)
+async def update_team_curated_setup_endpoint(
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import update_curated_setup
+    from src.dalton.services.team_model_catalog.validation import CuratedSetupUpdateInput
+
+    try:
+        parsed = CuratedSetupUpdateInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response, await update_curated_setup(actor_user_id=user_id, data=parsed)
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.get("/team-models/revisions")
+@handle_api_exceptions("list team model catalog revisions", logger)
+async def list_team_model_revisions_endpoint(
+    response: Response,
+    user_id: CurrentUserId,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import list_revisions_view
+
+    return _stamp_catalog_revision_header(
+        response, await list_revisions_view(limit=limit, offset=offset)
+    )
+
+
+@router.get("/team-models/revisions/{revision}")
+@handle_api_exceptions("get team model catalog revision", logger)
+async def get_team_model_revision_endpoint(
+    revision: int,
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.database.team_model_catalog import get_catalog_revision
+    from src.dalton.services.team_model_catalog.compiled import get_compiled_catalog_async
+    from src.dalton.services.team_model_catalog.constants import CATALOG_REVISION_HEADER
+
+    row = await get_catalog_revision(revision)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "revision_not_found", "message": f"Revision {revision} not found."},
+        )
+    compiled = await get_compiled_catalog_async()
+    response.headers[CATALOG_REVISION_HEADER] = str(compiled.revision)
+    return {"current_revision": compiled.revision, "revision_record": row}
+
+
+@router.post("/team-models/rollback")
+@handle_api_exceptions("rollback team model catalog", logger)
+async def rollback_team_models_endpoint(
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import rollback_catalog
+    from src.dalton.services.team_model_catalog.validation import CatalogRollbackInput
+
+    try:
+        parsed = CatalogRollbackInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response, await rollback_catalog(actor_user_id=user_id, data=parsed)
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models/test-call")
+@handle_api_exceptions("test call team catalog model", logger)
+async def test_call_team_model_endpoint(
+    body: dict[str, Any],
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import run_catalog_test_call
+    from src.dalton.services.team_model_catalog.validation import CatalogTestCallInput
+
+    try:
+        parsed = CatalogTestCallInput.model_validate(body)
+        return await run_catalog_test_call(actor_user_id=user_id, data=parsed)
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models/legacy-import/resolve")
+@handle_api_exceptions("resolve legacy native overlay import", logger)
+async def resolve_team_legacy_import_endpoint(
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.legacy_import import resolve_legacy_import
+    from src.dalton.services.team_model_catalog.validation import LegacyImportResolveInput
+
+    try:
+        parsed = LegacyImportResolveInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response,
+            await resolve_legacy_import(
+                actor_user_id=user_id,
+                action=parsed.action,
+                persist_known_retired=parsed.persist_known_retired,
+                expected_revision=parsed.expected_revision,
+                comment=parsed.comment,
+            ),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.put("/team-models/{model_key}")
+@handle_api_exceptions("update team catalog model", logger)
+async def update_team_model_endpoint(
+    model_key: str,
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import update_catalog_model
+    from src.dalton.services.team_model_catalog.validation import CatalogModelUpsertInput
+
+    try:
+        parsed = CatalogModelUpsertInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response,
+            await update_catalog_model(actor_user_id=user_id, model_key=model_key, data=parsed),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models/{model_key}/visibility")
+@handle_api_exceptions("set team catalog model visibility", logger)
+async def set_team_model_visibility_endpoint(
+    model_key: str,
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import set_catalog_model_visibility
+    from src.dalton.services.team_model_catalog.validation import ModelVisibilityInput
+
+    try:
+        parsed = ModelVisibilityInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response,
+            await set_catalog_model_visibility(
+                actor_user_id=user_id, model_key=model_key, data=parsed
+            ),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models/{model_key}/retire")
+@handle_api_exceptions("retire team catalog model", logger)
+async def retire_team_model_endpoint(
+    model_key: str,
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import retire_catalog_model
+    from src.dalton.services.team_model_catalog.validation import ModelRetireInput
+
+    try:
+        parsed = ModelRetireInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response,
+            await retire_catalog_model(actor_user_id=user_id, model_key=model_key, data=parsed),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models/{model_key}/restore")
+@handle_api_exceptions("restore team catalog model", logger)
+async def restore_team_model_endpoint(
+    model_key: str,
+    body: dict[str, Any],
+    response: Response,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import restore_catalog_model
+    from src.dalton.services.team_model_catalog.validation import ModelRestoreInput
+
+    try:
+        parsed = ModelRestoreInput.model_validate(body)
+        return _stamp_catalog_revision_header(
+            response,
+            await restore_catalog_model(actor_user_id=user_id, model_key=model_key, data=parsed),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
+
+
+@router.post("/team-models/{model_key}/restore-default")
+@handle_api_exceptions("restore team catalog model factory default", logger)
+async def restore_team_model_default_endpoint(
+    model_key: str,
+    response: Response,
+    user_id: CurrentUserId,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    await _require_catalog_admin(user_id)
+    from src.dalton.services.team_model_catalog.service import restore_factory_default_model
+    from src.dalton.services.team_model_catalog.validation import ModelRestoreInput
+
+    try:
+        parsed = ModelRestoreInput.model_validate(body or {})
+        return _stamp_catalog_revision_header(
+            response,
+            await restore_factory_default_model(
+                actor_user_id=user_id,
+                model_key=model_key,
+                expected_revision=parsed.expected_revision,
+                comment=parsed.comment,
+            ),
+        )
+    except Exception as exc:
+        _raise_catalog_http(exc)
+        raise
 
 
 # ---------------------------------------------------------------------------

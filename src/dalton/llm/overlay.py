@@ -34,10 +34,22 @@ OVERLAY_SOURCES: list[tuple[str, Path]] = [
     ("native_sync", NATIVE_SYNC_OVERLAY_PATH),
 ]
 
+_DEFAULT_NATIVE_SYNC_OVERLAY_PATH: Path = NATIVE_SYNC_OVERLAY_PATH
+_DEFAULT_OVERLAY_SOURCES: tuple[tuple[str, Path], ...] = tuple(OVERLAY_SOURCES)
+
 _LAST_STAT_AT: float = 0.0
 _LAST_STAMP: str | None = None
 _LAST_STAMP_OAUTH_ON: bool | None = None
+_LAST_STAMP_SOURCES: tuple[tuple[str, Path], ...] | None = None
 _STAT_TTL_SECONDS: float = 2.0
+
+
+def _has_disk_overlay_test_override() -> bool:
+    """Return True when a test redirected ``NATIVE_SYNC_OVERLAY_PATH`` or ``OVERLAY_SOURCES``."""
+    return (
+        NATIVE_SYNC_OVERLAY_PATH != _DEFAULT_NATIVE_SYNC_OVERLAY_PATH
+        or tuple(OVERLAY_SOURCES) != _DEFAULT_OVERLAY_SOURCES
+    )
 
 
 def _is_native_oauth_sync_enabled() -> bool:
@@ -186,7 +198,7 @@ def _stat_part(path: Path) -> str:
 
 def current_overlay_stamp(path: Path | None = None, *, force: bool = False) -> str | None:
     """Return combined stamp `'native:<mtime>:<size>|native_sync:<…>'` (throttled to 1 stat / 2s)."""
-    global _LAST_STAT_AT, _LAST_STAMP, _LAST_STAMP_OAUTH_ON
+    global _LAST_STAT_AT, _LAST_STAMP, _LAST_STAMP_OAUTH_ON, _LAST_STAMP_SOURCES
     if path is not None:
         part = _stat_part(path)
         return None if part == "-" else part
@@ -195,15 +207,18 @@ def current_overlay_stamp(path: Path | None = None, *, force: bool = False) -> s
         return None
 
     oauth_on = _is_native_oauth_sync_enabled()
+    cur_sources = tuple(OVERLAY_SOURCES)
     now = time.monotonic()
     if (
         not force
         and _LAST_STAMP_OAUTH_ON == oauth_on
+        and _LAST_STAMP_SOURCES == cur_sources
         and (now - _LAST_STAT_AT) < _STAT_TTL_SECONDS
     ):
         return _LAST_STAMP
     _LAST_STAT_AT = now
     _LAST_STAMP_OAUTH_ON = oauth_on
+    _LAST_STAMP_SOURCES = cur_sources
 
     if not oauth_on:
         _LAST_STAMP = f"native_generic:{_stat_part(NATIVE_OVERLAY_PATH)}"
@@ -618,23 +633,73 @@ def apply_model_overlay(
     return stamp
 
 
-def load_dalton_meta() -> dict[str, dict[str, Any]]:
-    """Return merged `dalton_meta` across `native_overlay.json` and the native-sync runtime overlay (P0N.1)."""
-    meta: dict[str, dict[str, Any]] = {}
+def load_dalton_meta(
+    *,
+    catalog_revision: int | None = None,
+    db_payload: dict[str, Any] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Return deep-merged ``dalton_meta`` across ``native_overlay.json`` and Layer 3 DB catalog.
+
+    Supports explicit ``null`` deletion of optional subkeys (e.g. clearing ``notional_ref``
+    when switching to inline ``notional_pricing``), excludes final retired keys, and strips
+    ``*-oauth`` keys whenever ``CapabilityId.NATIVE_OAUTH_SYNC`` is disabled (§2.2 #1).
+    """
+    from src.dalton.services.team_model_catalog.compiled import (
+        deep_merge_patch_with_null_delete,
+        get_compiled_catalog_sync,
+    )
+
     oauth_on = _is_native_oauth_sync_enabled()
+
+    if (
+        db_payload is None
+        and catalog_revision is None
+        and not _in_upstream_raw_manifest_test()
+        and not _has_disk_overlay_test_override()
+    ):
+        try:
+            compiled = get_compiled_catalog_sync()
+            if compiled is not None and isinstance(compiled.dalton_meta, dict):
+                return copy.deepcopy(compiled.dalton_meta)
+        except Exception as exc:
+            logger.debug("CompiledCatalog dalton_meta read skipped; falling back to disk: %s", exc)
+
+    meta: dict[str, dict[str, Any]] = {}
+    retired_keys: set[str] = set()
 
     def _merge_meta_block(source: dict[str, Any] | None) -> None:
         if not isinstance(source, dict):
             return
+        for rec in source.get("retired") or []:
+            if isinstance(rec, dict) and rec.get("key"):
+                retired_keys.add(str(rec["key"]).strip())
         raw_meta = source.get("dalton_meta") or {}
         if isinstance(raw_meta, dict):
             for k, v in raw_meta.items():
-                if not oauth_on and _is_oauth_model_key(str(k)):
+                key_str = str(k)
+                if not oauth_on and _is_oauth_model_key(key_str):
                     continue
                 if isinstance(v, dict):
-                    meta[str(k)] = copy.deepcopy(v)
+                    if key_str not in meta:
+                        meta[key_str] = {}
+                    deep_merge_patch_with_null_delete(meta[key_str], v)
 
     _merge_meta_block(load_overlay_data(NATIVE_OVERLAY_PATH))
-    if oauth_on:
-        _merge_meta_block(load_overlay_data(NATIVE_SYNC_OVERLAY_PATH))
+    if db_payload is not None:
+        _merge_meta_block(db_payload)
+    elif oauth_on:
+        if NATIVE_SYNC_OVERLAY_PATH != _DEFAULT_NATIVE_SYNC_OVERLAY_PATH:
+            sync_path: Path | None = NATIVE_SYNC_OVERLAY_PATH
+        elif tuple(OVERLAY_SOURCES) != _DEFAULT_OVERLAY_SOURCES:
+            sync_path = next(
+                (src for name, src in OVERLAY_SOURCES if name == "native_sync"),
+                None,
+            )
+        else:
+            sync_path = NATIVE_SYNC_OVERLAY_PATH
+        if sync_path is not None:
+            _merge_meta_block(load_overlay_data(sync_path))
+
+    for rk in retired_keys:
+        meta.pop(rk, None)
     return meta

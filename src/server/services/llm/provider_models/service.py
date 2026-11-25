@@ -113,6 +113,20 @@ async def _resolve_credential(user_id: str, provider: str, mc) -> Credential:
             token_headers=subscription.request_headers(token),
         )
 
+    # DALTON-HOOK(team-model-catalog): catalog-defined variants use exclusively their
+    # dedicated bound credential in dalton_catalog_provider_credentials (never BYOK or env_key).
+    if mc.get_provider_info(provider).get("catalog_defined"):
+        from src.dalton.database.team_model_catalog import get_catalog_provider_credential
+
+        cat_cred = await get_catalog_provider_credential(provider, decrypt=True)
+        if not cat_cred or not cat_cred.get("api_key"):
+            raise NotConnected(provider)
+        return Credential(
+            api_key=str(cat_cred["api_key"]),
+            holder=f"catalog_variant:{provider}",
+            base_url=str(cat_cred["bound_base_url"]),
+        )
+
     from src.server.services.llm.byok import walk_byok_candidates
     from src.server.services.llm.config import deployment_key
 
@@ -282,11 +296,29 @@ async def available_models(user_id: str, provider: str, *, refresh: bool = False
     catalog_read = asyncio.create_task(_gateway_catalog(info))
     try:
         # A list on a base URL the user saved goes out as a key test does.
-        # DALTON-HOOK(standalone-core): route through address-based pinned egress transport in core local auth
-        try:
-            transport = await egress.user_endpoint_transport(cred.base_url)
-        except egress.EndpointRefused as e:
-            raise ListFetchError(ENDPOINT_REFUSED) from e
+        # DALTON-HOOK(team-model-catalog): catalog-defined variants always send model list
+        # fetches through CatalogVariantTransport (Fake-IP DoH / HeldTransport + bound URL check).
+        if info.get("catalog_defined"):
+            from src.dalton.database.team_model_catalog import get_catalog_provider_credential
+            from src.dalton.services.team_model_catalog.transport import (
+                make_catalog_variant_http_transport,
+            )
+
+            cat_meta = await get_catalog_provider_credential(provider, decrypt=False)
+            if not cat_meta:
+                raise ListFetchError(ENDPOINT_REFUSED)
+            transport = make_catalog_variant_http_transport(
+                provider_slug=provider,
+                bound_base_url=str(cat_meta["bound_base_url"]),
+                expected_key_fingerprint=str(cat_meta["key_fingerprint"]),
+                verify_db_binding=True,
+            )
+        else:
+            # DALTON-HOOK(standalone-core): route through address-based pinned egress transport in core local auth
+            try:
+                transport = await egress.user_endpoint_transport(cred.base_url)
+            except egress.EndpointRefused as e:
+                raise ListFetchError(ENDPOINT_REFUSED) from e
         models = normalize(req.shape, await fetch_list(req, transport=transport))
     except ListFetchError as e:
         catalog = await catalog_read

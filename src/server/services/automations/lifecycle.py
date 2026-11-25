@@ -695,6 +695,16 @@ async def create_automation(
     from src.server.database.pool import get_db_connection
 
     async def _do_create(write_conn: Any) -> Dict[str, Any]:
+        # DALTON-HOOK(team-model-catalog): outermost catalog shared advisory lock BEFORE coverage-unit
+        # lock and automation creation, plus in-lock validation that llm_model is not retired.
+        from src.dalton.database.team_model_catalog import acquire_catalog_shared_lock
+        from src.dalton.services.team_model_catalog.service import (
+            assert_model_not_retired_under_lock,
+        )
+
+        await acquire_catalog_shared_lock(write_conn)
+        if data.llm_model:
+            await assert_model_not_retired_under_lock(write_conn, data.llm_model, field="llm_model")
         if is_coverage_units_enabled():
             try:
                 await lock_and_assert_managed_unit_write_allowed(
@@ -986,6 +996,17 @@ async def recheck_locked_automation_update(
 
     moved_to_locked = normalize_uuid(effective_kwargs.get("workspace_id")) or locked_stored_in
     runs_on_locked = effective_kwargs.get("llm_model", locked_row.get("llm_model"))
+    # DALTON-HOOK(team-model-catalog): verify effective llm_model is not retired under the held catalog shared lock
+    if runs_on_locked and (
+        runs_on_locked != locked_row.get("llm_model") or "llm_model" in update.model_fields_set
+    ):
+        from src.dalton.services.team_model_catalog.service import (
+            assert_model_not_retired_under_lock,
+        )
+
+        await assert_model_not_retired_under_lock(
+            locked_conn, str(runs_on_locked), field="llm_model"
+        )
     if (
         runs_on_locked != locked_row.get("llm_model")
         or moved_to_locked != locked_stored_in
@@ -1447,6 +1468,10 @@ async def update_automation(
     )
 
     async def _run_update(write_conn: Any) -> Optional[Dict[str, Any]]:
+        # DALTON-HOOK(team-model-catalog): outermost catalog shared lock BEFORE coverage-unit and automation row locks
+        from src.dalton.database.team_model_catalog import acquire_catalog_shared_lock
+
+        await acquire_catalog_shared_lock(write_conn)
         if update_kwargs.get("metadata") is not None:
             _assert_replaced_by_tracker_preserved(
                 current.get("metadata"),

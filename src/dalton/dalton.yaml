@@ -58,6 +58,9 @@ network:
     - "https://1.1.1.1/dns-query"
     - "https://dns.google/resolve"
 
+price_watch:
+  enabled: true
+
 models:
   disabled_providers: []     # Provider kill switch (P0N.8, L17). Example: ["muse-oauth"]
   # Single source of truth for Dalton auxiliary task (assist) model defaults

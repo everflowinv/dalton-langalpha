@@ -241,6 +241,13 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
         >>> find_model_pricing("gpt-5-0905", provider="openai")  # Version fallback
         {'input': 1.25, 'output': 10.0, ...}  # Falls back to gpt-5 pricing
     """
+    # DALTON-HOOK(team-model-catalog): honor active turn effective_catalog_snapshot before live manifest
+    from src.dalton.services.team_model_catalog.snapshot import lookup_snapshot_pricing
+
+    snap_hit, snap_pricing = lookup_snapshot_pricing(model_name, provider)
+    if snap_hit:
+        return snap_pricing
+
     from .llm import LLM
 
     try:

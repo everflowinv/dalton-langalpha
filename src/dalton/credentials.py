@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 TEAM_CREDENTIAL_DISCONNECT_FORBIDDEN_DETAIL = "团队共用凭据只能由管理员断开"
 TEAM_CREDENTIAL_WRITE_FORBIDDEN_DETAIL = "团队共用凭据只能由管理员设置"
 TEAM_CREDENTIAL_BASE_URL_FORBIDDEN_DETAIL = "团队共用密钥的地址只能由凭据持有人修改"
+TEAM_CATALOG_ADMIN_FORBIDDEN_DETAIL = "团队模型目录只能由管理员修改"
 TEAM_CREDENTIAL_DB_UNAVAILABLE_DETAIL = (
     "Database unavailable while verifying team credential permissions"
 )
@@ -331,6 +332,77 @@ def require_credential_holder(user_id: str) -> None:
         )
 
 
+def is_catalog_admin(user_id: str | None) -> bool:
+    """Unified 3-auth-mode catalog admin predicate (§3.1 #1).
+
+    - ``local`` auth mode: live PG check on ``dalton_user_roles.tier == 'admin'``
+      (raises HTTP 503 on DB error, fail-closed).
+    - ``supabase`` auth mode: ``user_id`` in ``DALTON_PM_USER_IDS``.
+    - ``oss`` loopback trial mode: authenticated non-empty user that is not
+      ``COMPANY_SYSTEM_USER_ID`` is the local owner and treated as ``admin``.
+    """
+    from src.dalton.company_identity import is_company_system_user
+    from src.dalton.settings import get_dalton_auth_mode
+
+    uid = str(user_id or "").strip()
+    if not uid or is_company_system_user(uid):
+        return False
+    mode = get_dalton_auth_mode()
+    if mode == "local" or is_dalton_local_auth_enabled():
+        return _fetch_local_is_admin_sync(uid)
+    if mode == "supabase" or is_dalton_supabase_auth_enabled():
+        return uid in set(get_configured_pm_user_ids())
+    # DALTON_AUTH_MODE=oss (local loopback owner trial mode)
+    return mode == "oss"
+
+
+async def is_catalog_admin_async(user_id: str | None, *, conn: Any = None) -> bool:
+    """Async counterpart of :func:`is_catalog_admin` (fail-closed 503 on DB error in local mode)."""
+    from src.dalton.company_identity import is_company_system_user
+    from src.dalton.settings import get_dalton_auth_mode
+
+    uid = str(user_id or "").strip()
+    if not uid or is_company_system_user(uid):
+        return False
+    mode = get_dalton_auth_mode()
+    if mode == "local" or is_dalton_local_auth_enabled():
+        from src.dalton.auth.roles import get_user_role
+
+        try:
+            return await get_user_role(uid, conn=conn) == "admin"
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Async catalog admin role lookup failed (fail-closed 503): %s",
+                type(exc).__name__,
+            )
+            raise HTTPException(
+                status_code=503, detail=TEAM_CREDENTIAL_DB_UNAVAILABLE_DETAIL
+            ) from exc
+    if mode == "supabase" or is_dalton_supabase_auth_enabled():
+        return uid in set(get_configured_pm_user_ids())
+    return mode == "oss"
+
+
+def require_catalog_admin(user_id: str | None) -> None:
+    """Raise HTTP 403 when ``user_id`` is not authorized to administer the team model catalog."""
+    if not is_catalog_admin(user_id):
+        raise HTTPException(
+            status_code=403,
+            detail=TEAM_CATALOG_ADMIN_FORBIDDEN_DETAIL,
+        )
+
+
+async def require_catalog_admin_async(user_id: str | None, *, conn: Any = None) -> None:
+    """Async guard raising HTTP 403 when ``user_id`` cannot administer the team model catalog."""
+    if not await is_catalog_admin_async(user_id, conn=conn):
+        raise HTTPException(
+            status_code=403,
+            detail=TEAM_CATALOG_ADMIN_FORBIDDEN_DETAIL,
+        )
+
+
 def is_base_url_blocked_exception(exc: BaseException) -> bool:
     """Return True when ``exc`` is a 400 HTTPException with ``detail['type'] == 'base_url_blocked'``."""
     return (
@@ -524,6 +596,18 @@ def enforce_shared_byok_endpoint_policy(
         if isinstance(base_url, str) and base_url.strip()
         else (None if base_url is None else base_url)
     )
+    # Reject any personal custom model whose effective resolved endpoint lands on a
+    # catalog-defined provider variant's bound_base_url (even when inherited from holder).
+    if custom_config is not None:
+        from src.dalton.services.team_model_catalog.transport import (
+            check_custom_model_against_catalog_variants,
+        )
+
+        check_custom_model_against_catalog_variants(
+            resolved_provider=holding_provider or str(custom_config.get("provider") or ""),
+            resolved_base_url=effective_base_url,
+            model_name=model_name,
+        )
     if effective_base_url != expected_base_url:
         _raise_shared_key_endpoint_refused(
             f"Model '{model_name}' uses a team-shared API key and can only connect to "

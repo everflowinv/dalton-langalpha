@@ -37,6 +37,10 @@ async def lock_user_subagents(user_id: str, *, conn) -> None:
     racing it finds the base gone rather than outliving it."""
     from src.server.database.sql_fences import advisory_key
 
+    # DALTON-HOOK(team-model-catalog): acquire catalog shared advisory lock BEFORE user_subagents/overrides lock
+    from src.dalton.database.team_model_catalog import acquire_catalog_shared_lock
+
+    await acquire_catalog_shared_lock(conn)
     await conn.execute(
         "SELECT pg_advisory_xact_lock(%s)", (advisory_key("user_subagents", user_id),)
     )

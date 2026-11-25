@@ -427,6 +427,27 @@ async def resolve_byok_llm_client(
         _pref_cache=_pref_cache,
         **({"ignore_custom_models": True} if ignore_custom_models else {}),
     )
+    # DALTON-HOOK(team-model-catalog): system models on catalog-defined variants use ONLY their
+    # dedicated bound credential & CatalogVariantTransport (never BYOK holder keys or env_key).
+    if source == ModelSource.SYSTEM and isinstance(config_entry, dict):
+        sys_provider = str(config_entry.get("provider") or "")
+        if sys_provider and mc.get_provider_info(sys_provider).get("catalog_defined"):
+            from src.dalton.services.team_model_catalog.transport import (
+                resolve_catalog_variant_binding_async,
+            )
+
+            binding = await resolve_catalog_variant_binding_async(sys_provider)
+            return create_llm(
+                model_name,
+                api_key=binding["api_key"],
+                base_url=binding["bound_base_url"],
+                reasoning_effort=reasoning_effort,
+                cache_key=cache_key,
+                egress_transport=binding["egress_transport"],
+                follow_redirects=False,
+                _catalog_credential_source=binding["credential_source"],
+                **_tier_kwargs(service_tier, sys_provider),
+            )
     route = await byok_key(
         user_id,
         model_name,
@@ -494,9 +515,29 @@ async def resolve_byok_llm_client(
             )
         return None
 
+    # DALTON-HOOK(team-model-catalog): reject personal custom models whose resolved provider
+    # OR resolved base_url (including holder's saved base_url or parameter URLs) overlaps a
+    # catalog-defined provider variant.
+    if route.custom_config is not None:
+        from src.dalton.services.team_model_catalog.transport import (
+            check_custom_model_against_catalog_variants,
+        )
+        from . import egress as _egress_mod
+
+        check_custom_model_against_catalog_variants(
+            resolved_provider=route.provider,
+            resolved_base_url=route.base_url,
+            parameter_urls=_egress_mod.parameter_urls(route.custom_config.get("parameters")),
+            mc=mc,
+            model_name=model_name,
+        )
+
     if is_shared_team_cred:
         holder_id = credential_user_id(user_id)
-        is_manifest_holding = bool(route.holding and mc.get_provider_info(route.holding))
+        holding_info = mc.get_provider_info(route.holding) if route.holding else {}
+        is_manifest_holding = bool(
+            route.holding and holding_info and not holding_info.get("catalog_defined")
+        )  # DALTON-HOOK(team-model-catalog): exclude catalog variants from trusted manifest_base_url
         holder_cp_config = (
             await user_models.get_custom_provider_config(holder_id, route.holding)
             if route.custom_config is not None and route.holding

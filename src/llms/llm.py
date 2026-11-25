@@ -62,7 +62,30 @@ class ModelConfig:
         # DALTON-HOOK(llm-overlay): merge the generated OpenClaw catalog without editing upstream manifests
         from src.dalton.llm.overlay import apply_model_overlay
         self.overlay_stamp = apply_model_overlay(self.llm_config, self.manifest)
+        self.catalog_revision: int = 0  # DALTON-HOOK(team-model-catalog)
+        self.task_costs_override: Any = None  # DALTON-HOOK(team-model-catalog)
+        self._init_derived_indexes()
 
+    @classmethod
+    def from_compiled(
+        cls,
+        *,
+        llm_config: dict[str, Any],
+        manifest: dict[str, Any],
+        overlay_stamp: str | None = None,
+        catalog_revision: int = 0,
+    ) -> "ModelConfig":
+        """DALTON-HOOK(team-model-catalog): build ModelConfig directly from compiled 3-layer dicts."""
+        obj = cls.__new__(cls)
+        obj.llm_config = llm_config
+        obj.manifest = manifest
+        obj.overlay_stamp = overlay_stamp
+        obj.catalog_revision = int(catalog_revision)
+        obj.task_costs_override = None
+        obj._init_derived_indexes()
+        return obj
+
+    def _init_derived_indexes(self) -> None:
         # Flatten grouped provider_config into a flat dict for downstream access.
         # Raw self.manifest stays pristine for grouped UI views.
         self._flat_providers = self._flatten_providers(
@@ -127,6 +150,15 @@ class ModelConfig:
                 if vkey != group_key:
                     # setdefault: a variant may declare an explicit parent_provider
                     merged.setdefault("parent_provider", group_key)
+                # DALTON-HOOK(team-model-catalog): strip inherited parent env_key/api_key/models_url/platform
+                # on catalog-defined variants so they never inherit deployment env credentials.
+                if overrides.get("catalog_defined") or merged.get("catalog_defined"):
+                    merged.pop("env_key", None)
+                    merged.pop("api_key", None)
+                    merged.pop("models_url", None)
+                    merged.pop("platform", None)
+                    merged["catalog_defined"] = True
+                    merged["own_api_key"] = True
                 flat[vkey] = merged
 
             if not has_self_variant:
@@ -431,7 +463,12 @@ class ModelConfig:
             # What a typical benchmark task costs at each level the model
             # offers, against a baseline model (see task_costs.py), else the
             # estimate its list price gives on the same scale.
-            costs = task_cost(self._task_cost_key(model_name, model_info, provider_info), efforts)
+            # DALTON-HOOK(team-model-catalog): honor compiled catalog task_costs override when present.
+            costs = task_cost(
+                self._task_cost_key(model_name, model_info, provider_info),
+                efforts,
+                costs=getattr(self, "task_costs_override", None),
+            )
             if costs is not None:
                 entry["task_cost"] = costs
             else:
@@ -657,8 +694,27 @@ class LLM:
     @classmethod
     def get_model_config(cls) -> ModelConfig:
         """Get or create the model configuration singleton."""
+        # DALTON-HOOK(team-model-catalog): resolve PG-confirmed revision's CompiledCatalog
+        # (unless running upstream raw manifest integrity tests or a disk-overlay test override).
+        from src.dalton.llm.overlay import (
+            _has_disk_overlay_test_override,
+            _in_upstream_raw_manifest_test,
+            overlay_changed,
+        )
+
+        if not _in_upstream_raw_manifest_test() and not _has_disk_overlay_test_override():
+            try:
+                from src.dalton.services.team_model_catalog.compiled import (
+                    get_compiled_catalog_sync,
+                )
+
+                compiled = get_compiled_catalog_sync()
+                if compiled is not None and compiled.model_config is not None:
+                    cls._model_config = compiled.model_config
+                    return compiled.model_config
+            except Exception as exc:
+                logger.debug("CompiledCatalog lookup fell back to local ModelConfig: %s", exc)
         # DALTON-HOOK(llm-overlay): rebuild when the overlay file changed (re-sync button)
-        from src.dalton.llm.overlay import overlay_changed
         if cls._model_config is None or overlay_changed(getattr(cls._model_config, "overlay_stamp", None)):
             cls._model_config = ModelConfig()
         return cls._model_config
@@ -673,6 +729,8 @@ class LLM:
         egress_transport: Callable[[str], Any] | None = None,
         # DALTON-HOOK(team-credentials): disable HTTP redirects on shared-key clients when False.
         follow_redirects: bool = True,
+        # DALTON-HOOK(team-model-catalog): explicit credential source tag for catalog-defined variants.
+        _catalog_credential_source: str | None = None,
         **override_params,
     ):
         """
@@ -695,6 +753,7 @@ class LLM:
         """
         self.egress_transport = egress_transport
         self.follow_redirects = follow_redirects
+        self._catalog_credential_source = _catalog_credential_source  # DALTON-HOOK(team-model-catalog)
         self.model_config = self.get_model_config()
         spec = (
             model
@@ -799,6 +858,22 @@ class LLM:
         self.default_headers = self.provider_info.get("default_headers")
         self._merge_additional_betas(spec.additional_betas)
 
+        # DALTON-HOOK(team-model-catalog): construct-time security invariant for catalog-defined variants.
+        if self.provider_info.get("catalog_defined"):
+            from src.dalton.services.team_model_catalog.transport import (
+                enforce_catalog_variant_construction,
+            )
+
+            enforce_catalog_variant_construction(
+                provider=self.provider,
+                provider_info=self.provider_info,
+                base_url=self.base_url,
+                egress_transport=self.egress_transport,
+                follow_redirects=self.follow_redirects,
+                credential_source=self._catalog_credential_source,
+                api_key_override=self.api_key_override,
+            )
+
     def _merge_additional_betas(self, additional_betas: list[str] | None) -> None:
         """Merge model-level additional_betas into the anthropic-beta header."""
         if not additional_betas:
@@ -820,6 +895,9 @@ class LLM:
         egress_transport: Callable[[str], Any] | None = None,
         # DALTON-HOOK(team-credentials): disable HTTP redirects on shared-key clients when False.
         follow_redirects: bool = True,
+        # DALTON-HOOK(team-model-catalog): explicit credential source tag & admin test-call flag.
+        _catalog_credential_source: str | None = None,
+        _allow_catalog_variant_test_call: bool = False,
         **override_params,
     ):
         """
@@ -845,13 +923,35 @@ class LLM:
         Returns:
             A LangChain chat model instance.
         """
+        mc = cls.get_model_config()
+        # DALTON-HOOK(team-model-catalog): personal custom models cannot target catalog-defined variants or their bound_base_url.
+        if not _allow_catalog_variant_test_call:
+            from src.dalton.services.team_model_catalog.transport import (
+                check_custom_model_against_catalog_variants,
+            )
+            from src.server.services.llm.egress import parameter_urls
+
+            resolved_provider = str(config.get("provider") or "")
+            resolved_url = (
+                base_url_override
+                if base_url_override is not _UNSET
+                else mc.get_provider_info(resolved_provider).get("base_url")
+            )
+            check_custom_model_against_catalog_variants(
+                resolved_provider=resolved_provider,
+                resolved_base_url=resolved_url,
+                parameter_urls=parameter_urls(config.get("parameters")),
+                mc=mc,
+                model_name=str(config.get("name") or config.get("model_id") or ""),
+            )
         instance = cls(
-            ModelSpec.from_custom(config, cls.get_model_config()),
+            ModelSpec.from_custom(config, mc),
             api_key=api_key,
             base_url_override=base_url_override,
             reasoning_effort=reasoning_effort,
             egress_transport=egress_transport,
             follow_redirects=follow_redirects,  # DALTON-HOOK(team-credentials)
+            _catalog_credential_source=_catalog_credential_source,  # DALTON-HOOK(team-model-catalog)
             **override_params,
         )
         return instance.get_llm(cache_key=cache_key)
@@ -887,6 +987,21 @@ class LLM:
         # DALTON-HOOK(provider-kill-switch): refuse providers disabled in Dalton config (L17)
         from src.dalton.llm.providers import ensure_provider_enabled
         ensure_provider_enabled(self.provider)
+        # DALTON-HOOK(team-model-catalog): re-verify catalog-defined variant invariants before SDK client build.
+        if self.provider_info.get("catalog_defined"):
+            from src.dalton.services.team_model_catalog.transport import (
+                enforce_catalog_variant_construction,
+            )
+
+            enforce_catalog_variant_construction(
+                provider=self.provider,
+                provider_info=self.provider_info,
+                base_url=self.base_url,
+                egress_transport=self.egress_transport,
+                follow_redirects=self.follow_redirects,
+                credential_source=self._catalog_credential_source,
+                api_key_override=self.api_key_override,
+            )
         # A provider that routes and caches by conversation names the header it
         # reads the thread from (OpenCode Go's ``x-opencode-session``). It
         # refuses a request without one, so a call outside any thread (a title,
@@ -1526,6 +1641,24 @@ def create_llm(
     Returns:
         A LangChain chat model instance
     """
+    # DALTON-HOOK(team-model-catalog): auto-bind dedicated catalog variant credentials &
+    # CatalogVariantTransport on direct create_llm calls (zero env_key fallback).
+    if "_catalog_credential_source" not in kwargs:
+        mc = LLM.get_model_config()
+        m_cfg = mc.get_model_config(model) if isinstance(model, str) else None
+        prov = str(m_cfg.get("provider") or "") if isinstance(m_cfg, dict) else ""
+        if prov and mc.get_provider_info(prov).get("catalog_defined"):
+            from src.dalton.services.team_model_catalog.transport import (
+                resolve_catalog_variant_binding_sync,
+            )
+
+            binding = resolve_catalog_variant_binding_sync(prov)
+            api_key = binding["api_key"]
+            base_url = binding["bound_base_url"]
+            kwargs["egress_transport"] = binding["egress_transport"]
+            kwargs["follow_redirects"] = False
+            kwargs["_catalog_credential_source"] = binding["credential_source"]
+
     instance = LLM(
         model,
         api_key=api_key,

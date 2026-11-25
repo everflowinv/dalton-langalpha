@@ -53,6 +53,32 @@ class LLMService:
         self._agent_config = agent_config
         self._logger = logger or logging.getLogger(__name__)
 
+    async def _build_system_client(
+        self, model_name: str, *, reasoning_effort: str | None = None
+    ) -> Any:
+        """DALTON-HOOK(team-model-catalog): resolve catalog-defined variants asynchronously via bound credentials."""
+        from src.llms.llm import LLM as LLMFactory
+
+        mc = LLMFactory.get_model_config()
+        m_cfg = mc.get_model_config(model_name)
+        prov = str(m_cfg.get("provider") or "") if isinstance(m_cfg, dict) else ""
+        if prov and mc.get_provider_info(prov).get("catalog_defined"):
+            from src.dalton.services.team_model_catalog.transport import (
+                resolve_catalog_variant_binding_async,
+            )
+
+            binding = await resolve_catalog_variant_binding_async(prov)
+            return create_llm(
+                model_name,
+                api_key=binding["api_key"],
+                base_url=binding["bound_base_url"],
+                reasoning_effort=reasoning_effort,
+                egress_transport=binding["egress_transport"],
+                follow_redirects=False,
+                _catalog_credential_source=binding["credential_source"],
+            )
+        return create_llm(model_name, reasoning_effort=reasoning_effort)
+
     async def complete(
         self,
         *,
@@ -92,7 +118,8 @@ class LLMService:
                 if slot == "background" and request_model is None and reasoning_effort is None
                 else reasoning_effort
             )
-            llm = create_llm(model_name, reasoning_effort=effort)
+            # DALTON-HOOK(team-model-catalog): system calls on catalog-defined variants use dedicated bound credentials + CatalogVariantTransport (zero env_key).
+            llm = await self._build_system_client(model_name, reasoning_effort=effort)
         else:
             resolved_config = await resolve_llm_config(
                 base_config=self._agent_config,
@@ -110,8 +137,11 @@ class LLMService:
             effective_model = slot_model(resolved_config.llm, slot)
             if llm is None:
                 # No BYOK / OAuth configured and no reasoning override — fall
-                # back to a platform-keyed client on the resolved model name.
-                llm = create_llm(effective_model, reasoning_effort=reasoning_effort)
+                # back to a platform-keyed (or catalog-variant-bound) client.
+                # DALTON-HOOK(team-model-catalog): bind dedicated variant credential if catalog_defined.
+                llm = await self._build_system_client(
+                    effective_model, reasoning_effort=reasoning_effort
+                )
             if resolved_config.credential_source not in (
                 CredentialSource.OAUTH,
                 CredentialSource.BYOK,

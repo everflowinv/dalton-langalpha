@@ -254,6 +254,8 @@ _dalton_transcription_reconcile_task: asyncio.Task | None = None
 _dalton_data_task_scheduler_task: asyncio.Task | None = None
 # DALTON-HOOK(chat-large-upload): hold strong reference to periodic chat upload cleanup task
 _dalton_chat_upload_cleanup_task: asyncio.Task | None = None
+# DALTON-HOOK(team-model-catalog): hold strong reference to catalog prewarm follower task
+_dalton_team_catalog_follow_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
@@ -269,7 +271,8 @@ async def lifespan(app: FastAPI):
         _dalton_health_startup_task, \
         _dalton_transcription_reconcile_task, \
         _dalton_data_task_scheduler_task, \
-        _dalton_chat_upload_cleanup_task
+        _dalton_chat_upload_cleanup_task, \
+        _dalton_team_catalog_follow_task
 
     # Configure logging based on environment settings (first thing on startup)
     configure_logging()
@@ -955,6 +958,24 @@ async def lifespan(app: FastAPI):
             name="dalton-chat-upload-cleanup",
         )
 
+    # DALTON-HOOK(team-model-catalog): run one-time legacy native_sync_overlay.json import under
+    # exclusive advisory lock and start Redis Pub/Sub + 60s PG poll catalog prewarm follower.
+    if get_dalton_settings().enabled:
+        try:
+            from src.dalton.services.team_model_catalog.legacy_import import (
+                run_startup_legacy_sync_import,
+            )
+
+            await run_startup_legacy_sync_import()
+        except Exception as exc:
+            logger.warning(f"Team model catalog startup legacy import skipped/failed: {exc}")
+        from src.dalton.services.team_model_catalog.follow import run_catalog_follow_loop
+
+        _dalton_team_catalog_follow_task = asyncio.create_task(
+            run_catalog_follow_loop(),
+            name="dalton-team-model-catalog-follow",
+        )
+
     # A built-in remote server still down after boot's retry budget is retried
     # in the background, so this worker heals when it answers instead of
     # serving without its tools until a restart. Last, so nothing above can
@@ -1007,6 +1028,11 @@ async def lifespan(app: FastAPI):
         _dalton_chat_upload_cleanup_task.cancel()
         await asyncio.gather(_dalton_chat_upload_cleanup_task, return_exceptions=True)
         _dalton_chat_upload_cleanup_task = None
+    # DALTON-HOOK(team-model-catalog): cancel catalog prewarm follower task on shutdown
+    if _dalton_team_catalog_follow_task is not None:
+        _dalton_team_catalog_follow_task.cancel()
+        await asyncio.gather(_dalton_team_catalog_follow_task, return_exceptions=True)
+        _dalton_team_catalog_follow_task = None
     # Awaited, so a warm-up stopped midway releases its lock while Redis is
     # still open; a lock left to expire skips the warm-up of a quick restart.
     # The refreshes go after it, since the warm-up can start them.

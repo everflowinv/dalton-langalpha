@@ -15,6 +15,8 @@ from typing import Any, Callable
 
 import src.dalton.llm.overlay as _overlay_mod
 
+_DEFAULT_LOAD_DALTON_META = _overlay_mod.load_dalton_meta
+
 logger = logging.getLogger(__name__)
 
 _FALLBACK_OAUTH_CARDS: dict[str, dict[str, float]] = {
@@ -118,12 +120,305 @@ def normalize_notional_card(card: dict[str, Any] | None) -> dict[str, Any] | Non
     return {"input": in_f, "output": out_f, "cached_input": cache_f}
 
 
+def notional_pair_key(provider: str | None, model_id: str | None) -> str:
+    """Canonical ``(pricing_provider.lower(), norm_id(pricing_model_id))`` index key (§2.2 #1)."""
+    prov = str(provider or "").strip().lower()
+    mid = str(model_id or "").strip().lower().replace(".", "-")
+    return f"{prov}\0{mid}"
+
+
+def _canonical_card_signature(card: dict[str, Any] | None) -> str:
+    """Deterministic comparable signature of rate fields on a normalized notional card."""
+    import json
+
+    if not isinstance(card, dict):
+        return ""
+    rate_fields = {
+        k: v
+        for k, v in card.items()
+        if k
+        in (
+            "input",
+            "output",
+            "cached_input",
+            "cache_5m",
+            "cache_1h",
+            "input_tiers",
+            "output_tiers",
+            "tier_matrix",
+            "input_pricing_mode",
+            "output_pricing_mode",
+        )
+    }
+    return json.dumps(rate_fields, sort_keys=True, separators=(",", ":"))
+
+
+def _lookup_pricing_in_model_config(
+    model_config: Any,
+    ref_id: str,
+) -> dict[str, Any] | None:
+    """Resolve a pricing card for ``ref_id`` directly from ``model_config`` without re-entering ``LLM.get_model_config()``."""
+    llm_cfg = getattr(model_config, "llm_config", None) or {}
+    manifest = getattr(model_config, "manifest", None) or {}
+    manifest_models = manifest.get("models") if isinstance(manifest, dict) else None
+    if not isinstance(manifest_models, dict):
+        return None
+
+    ref_lower = ref_id.strip().lower()
+    ref_prov: str | None = None
+    ref_pricing_id = ref_id.strip()
+
+    if isinstance(llm_cfg, dict):
+        for k, entry in llm_cfg.items():
+            if isinstance(entry, dict) and str(k).lower() == ref_lower:
+                ref_prov = str(entry.get("system_provider") or entry.get("provider") or "").strip() or None
+                ref_pricing_id = str(entry.get("model_id") or ref_id).strip()
+                break
+        else:
+            for entry in llm_cfg.values():
+                if isinstance(entry, dict) and str(entry.get("model_id") or "").lower() == ref_lower:
+                    ref_prov = str(entry.get("system_provider") or entry.get("provider") or "").strip() or None
+                    ref_pricing_id = ref_id.strip()
+                    break
+
+    def _search_cards(cards: Any, target: str) -> dict[str, Any] | None:
+        if not isinstance(cards, list):
+            return None
+        t_low = target.lower()
+        t_norm = t_low.replace(".", "-")
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            cid = str(card.get("id") or "")
+            if cid.lower() == t_low or cid.lower().replace(".", "-") == t_norm:
+                pricing = card.get("pricing")
+                if isinstance(pricing, dict):
+                    return pricing
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            aliases = card.get("alias") or []
+            if isinstance(aliases, list):
+                for alias in aliases:
+                    al = str(alias).lower()
+                    if al == t_low or al.replace(".", "-") == t_norm:
+                        pricing = card.get("pricing")
+                        if isinstance(pricing, dict):
+                            return pricing
+        return None
+
+    candidate_ids = [ref_pricing_id] if ref_pricing_id == ref_id else [ref_pricing_id, ref_id]
+    search_providers: list[str] = []
+    if ref_prov:
+        search_providers.append(ref_prov)
+        get_parent = getattr(model_config, "get_parent_provider", None)
+        if callable(get_parent):
+            parent = get_parent(ref_prov)
+            if parent and parent != ref_prov:
+                search_providers.append(str(parent))
+
+    for target in candidate_ids:
+        for prov in search_providers:
+            hit = _search_cards(manifest_models.get(prov), target)
+            if hit is not None:
+                return hit
+        for prov_cards in manifest_models.values():
+            hit = _search_cards(prov_cards, target)
+            if hit is not None:
+                return hit
+    return None
+
+
+def _resolve_meta_entry_notional_card(
+    key: str,
+    meta_entry: dict[str, Any],
+    *,
+    resolved_so_far: dict[str, dict[str, Any]],
+    model_config: Any = None,
+) -> dict[str, Any] | None:
+    np = meta_entry.get("notional_pricing")
+    if isinstance(np, dict):
+        return normalize_notional_card(np)
+    if meta_entry.get("notional_ref"):
+        ref_id = str(meta_entry["notional_ref"])
+        if ref_id in resolved_so_far:
+            return copy.deepcopy(resolved_so_far[ref_id])
+        raw_card: dict[str, Any] | None = None
+        if model_config is not None:
+            raw_card = _lookup_pricing_in_model_config(model_config, ref_id)
+        else:
+            from src.llms.pricing_utils import find_model_pricing, resolve_pricing_identity
+
+            ref_prov, ref_pricing_id = resolve_pricing_identity(ref_id)
+            raw_card = find_model_pricing(ref_pricing_id, provider=ref_prov)
+            if raw_card is None and ref_pricing_id != ref_id:
+                raw_card = find_model_pricing(ref_id)
+        if isinstance(raw_card, dict):
+            return normalize_notional_card(raw_card)
+    return None
+
+
+def check_notional_pricing_ambiguity(
+    *,
+    model_config: Any,
+    dalton_meta: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Detect active models sharing ``(provider.lower(), norm_id(model_id))`` with conflicting notional rates.
+
+    Returns a list of conflict descriptors (empty when unambiguous). Used by pre-save
+    validation to raise ``400 ambiguous_notional_pricing`` (§2.2 #1).
+    """
+    llm_cfg = getattr(model_config, "llm_config", None) or {}
+    resolved_cards: dict[str, dict[str, Any]] = {}
+    for key, meta_entry in dalton_meta.items():
+        if not isinstance(meta_entry, dict):
+            continue
+        card = _resolve_meta_entry_notional_card(
+            key, meta_entry, resolved_so_far=resolved_cards, model_config=model_config
+        )
+        if card is not None:
+            resolved_cards[str(key)] = card
+
+    by_pair: dict[tuple[str, str], list[tuple[str, str, dict[str, Any]]]] = {}
+    for key, entry in llm_cfg.items():
+        if not isinstance(entry, dict):
+            continue
+        prov = str(entry.get("provider") or "").strip().lower()
+        mid = str(entry.get("model_id") or "").strip()
+        if not prov or not mid:
+            continue
+        card = resolved_cards.get(str(key))
+        if card is None:
+            continue
+        norm_mid = mid.lower().replace(".", "-")
+        sig = _canonical_card_signature(card)
+        by_pair.setdefault((prov, norm_mid), []).append((str(key), sig, card))
+
+    conflicts: list[dict[str, Any]] = []
+    for (prov, norm_mid), rows in sorted(by_pair.items()):
+        unique_sigs = {sig for _, sig, _ in rows}
+        if len(unique_sigs) > 1:
+            conflicts.append(
+                {
+                    "provider": prov,
+                    "normalized_model_id": norm_mid,
+                    "model_keys": sorted(k for k, _, _ in rows),
+                }
+            )
+    return conflicts
+
+
+def _is_cash_bare_key(
+    mid: str,
+    *,
+    dalton_meta: dict[str, Any],
+    llm_cfg: dict[str, Any] | None = None,
+) -> bool:
+    """Return True when bare ``mid`` corresponds to an active cash PAYG model."""
+    meta = dalton_meta.get(mid)
+    if isinstance(meta, dict):
+        billing = str(meta.get("billing") or "").strip().lower()
+        if billing == "cash":
+            return True
+        if billing == "subscription":
+            return False
+    if isinstance(llm_cfg, dict):
+        entry = llm_cfg.get(mid)
+        if isinstance(entry, dict):
+            prov = str(entry.get("provider") or "").strip().lower()
+            if (
+                not mid.endswith("-oauth")
+                and prov != "z-ai-cn-coding"
+                and not prov.endswith("-oauth")
+            ):
+                return True
+    return False
+
+
+def build_notional_price_index_for_catalog(
+    *,
+    model_config: Any,
+    dalton_meta: dict[str, dict[str, Any]],
+    oauth_sync_enabled: bool = True,
+) -> dict[str, dict[str, Any]]:
+    """Build notional price index keyed primarily by ``(provider.lower(), norm_id(model_id))``
+    plus exact ``model_key`` secondary keys and unambiguous bare ``model_id`` keys (§2.2 #1)."""
+    out: dict[str, dict[str, Any]] = {}
+    bare_mid_candidates: dict[str, list[tuple[str, str, dict[str, Any]]]] = {}
+    llm_cfg = getattr(model_config, "llm_config", None) or {}
+
+    def _record_bare_mid(mid: str, card: dict[str, Any]) -> None:
+        cleaned = mid.strip()
+        if not cleaned or _is_cash_bare_key(
+            cleaned, dalton_meta=dalton_meta, llm_cfg=llm_cfg
+        ):
+            return
+        norm_mid = cleaned.lower().replace(".", "-")
+        bare_mid_candidates.setdefault(norm_mid, []).append(
+            (cleaned, _canonical_card_signature(card), card)
+        )
+
+    for key, meta_entry in dalton_meta.items():
+        if not isinstance(meta_entry, dict):
+            continue
+        card = _resolve_meta_entry_notional_card(
+            str(key), meta_entry, resolved_so_far=out, model_config=model_config
+        )
+        if card is None:
+            continue
+        out[str(key)] = card
+        m_entry = llm_cfg.get(str(key))
+        if isinstance(m_entry, dict):
+            prov = str(m_entry.get("provider") or "").strip()
+            mid = str(m_entry.get("model_id") or "").strip()
+            if prov and mid:
+                out[notional_pair_key(prov, mid)] = card
+            if mid:
+                _record_bare_mid(mid, card)
+
+    if oauth_sync_enabled:
+        for k, fallback_card in _FALLBACK_OAUTH_CARDS.items():
+            already_present = k in out
+            fb_card = dict(fallback_card)
+            out.setdefault(k, fb_card)
+            m_entry = llm_cfg.get(k)
+            if isinstance(m_entry, dict):
+                prov = str(m_entry.get("provider") or "").strip()
+                mid = str(m_entry.get("model_id") or "").strip()
+                if prov and mid:
+                    out.setdefault(notional_pair_key(prov, mid), dict(fallback_card))
+                if mid and not already_present:
+                    _record_bare_mid(mid, fb_card)
+
+    for rows in bare_mid_candidates.values():
+        unique_sigs = {sig for _, sig, _ in rows}
+        if len(unique_sigs) == 1:
+            for exact_mid, _, card in rows:
+                out.setdefault(exact_mid, card)
+    return out
+
+
 def build_notional_price_index(
     overlay_loader: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Build `{model_key_or_ref: normalized_notional_card}` for subscription/OAuth models."""
+    """Build notional price index with ``(provider, norm_id(model_id))`` primary keys, ``model_key`` and unambiguous bare ``model_id`` fallback."""
+    if (
+        overlay_loader is None
+        and _overlay_mod.load_dalton_meta is _DEFAULT_LOAD_DALTON_META
+        and not _overlay_mod._has_disk_overlay_test_override()
+    ):
+        try:
+            from src.dalton.services.team_model_catalog.compiled import get_compiled_catalog_sync
+
+            compiled = get_compiled_catalog_sync()
+            if compiled is not None and isinstance(compiled.notional_price_index, dict):
+                return copy.deepcopy(compiled.notional_price_index)
+        except Exception:
+            pass
+
     loader = overlay_loader or _overlay_mod.load_overlay_data
     out: dict[str, dict[str, Any]] = {}
+    bare_mid_candidates: dict[str, list[tuple[str, str, dict[str, Any]]]] = {}
 
     try:
         from src.llms.pricing_utils import find_model_pricing, resolve_pricing_identity
@@ -154,11 +449,27 @@ def build_notional_price_index(
                 out[str(key)] = card
                 m_entry = native_models.get(key) if isinstance(native_models, dict) else None
                 if isinstance(m_entry, dict) and m_entry.get("model_id"):
-                    mid = str(m_entry["model_id"])
-                    if (dalton_meta.get(mid) or {}).get("billing") != "cash":
-                        out.setdefault(mid, card)
+                    mid = str(m_entry["model_id"]).strip()
+                    prov = str(m_entry.get("provider") or "").strip()
+                    if prov and mid:
+                        out[notional_pair_key(prov, mid)] = card
+                    if mid and not _is_cash_bare_key(
+                        mid,
+                        dalton_meta=dalton_meta,
+                        llm_cfg=native_models if isinstance(native_models, dict) else None,
+                    ):
+                        norm_mid = mid.lower().replace(".", "-")
+                        bare_mid_candidates.setdefault(norm_mid, []).append(
+                            (mid, _canonical_card_signature(card), card)
+                        )
     except Exception as exc:
         logger.debug("[DaltonNotional] build_notional_price_index dalton_meta lookup skipped: %s", exc)
+
+    for rows in bare_mid_candidates.values():
+        unique_sigs = {sig for _, sig, _ in rows}
+        if len(unique_sigs) == 1:
+            for exact_mid, _, card in rows:
+                out.setdefault(exact_mid, card)
 
     for k, fallback_card in _FALLBACK_OAUTH_CARDS.items():
         out.setdefault(k, dict(fallback_card))
@@ -208,14 +519,42 @@ def resolve_notional_card(
     index: dict[str, dict[str, Any]] | None = None,
     overlay_loader: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
-    """Resolve the normalized nominal pricing card for a model or stamped pricing id."""
+    """Resolve the normalized nominal pricing card by ``(provider, norm_id(model_id))`` or ``model_key``.
+
+    Checks the active turn's ``effective_catalog_snapshot`` first when bound (§2.4).
+    """
+    if index is None and overlay_loader is None:
+        from src.dalton.services.team_model_catalog.snapshot import lookup_snapshot_notional
+
+        snap_hit, snap_card, _ = lookup_snapshot_notional(
+            model_name,
+            pricing_model_id=pricing_model_id,
+            pricing_provider=pricing_provider,
+        )
+        if snap_hit:
+            return snap_card
+
     idx = index if index is not None else build_notional_price_index(overlay_loader=overlay_loader)
     if pricing_model_id and pricing_provider:
+        # Primary lookup: exact normalized (provider, norm_id(model_id)) pair key (§2.2 #1)
+        pkey = notional_pair_key(pricing_provider, pricing_model_id)
+        if pkey in idx:
+            return copy.deepcopy(idx[pkey])
+        if model_name and model_name in idx:
+            return copy.deepcopy(idx[model_name])
         from src.llms.pricing_utils import resolve_pricing_identity
 
-        identity = (pricing_provider, pricing_model_id)
+        want_prov = pricing_provider.strip().lower()
+        want_norm = pricing_model_id.strip().lower().replace(".", "-")
         for candidate, card in idx.items():
-            if resolve_pricing_identity(candidate, billing_type="byok") == identity:
+            if "\0" in candidate:
+                continue
+            c_prov, c_id = resolve_pricing_identity(candidate, billing_type="byok")
+            if (
+                c_prov
+                and c_prov.strip().lower() == want_prov
+                and c_id.strip().lower().replace(".", "-") == want_norm
+            ):
                 return copy.deepcopy(card)
         return None
     identity = pricing_model_id or model_name

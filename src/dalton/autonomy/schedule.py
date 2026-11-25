@@ -98,6 +98,11 @@ async def user_automations_lock(user_id: str, *, conn: Any = None):
     prelock_ws = _prelock_unit_workspace.get()
     try:
         async with inproc_lock, get_db_connection() as db_conn, db_conn.transaction():
+            # Outermost catalog shared advisory lock BEFORE coverage-unit FOR SHARE
+            # and BEFORE auto_db.lock_user_automations (§2.7 #3 deadlock-free order).
+            from src.dalton.database.team_model_catalog import acquire_catalog_shared_lock
+
+            await acquire_catalog_shared_lock(db_conn)
             if prelock_ws:
                 from src.dalton.database.coverage_units import get_active_unit_by_workspace
                 from src.dalton.settings import is_coverage_units_enabled
@@ -1412,7 +1417,7 @@ async def schedule_dalton_automation_helper(
             async def _reconcile_locked_effort(
                 locked_row: Mapping[str, Any],
                 effective_kwargs: dict[str, Any],
-                _locked_conn: Any,
+                locked_conn: Any,
             ) -> None:
                 locked_model = locked_row.get("llm_model")
                 locked_effort = locked_row.get("reasoning_effort")
@@ -1421,6 +1426,14 @@ async def schedule_dalton_automation_helper(
                     if "llm_model" in effective_kwargs
                     else locked_model
                 )
+                if model_in_spec and final_model:
+                    from src.dalton.services.team_model_catalog.service import (
+                        assert_model_not_retired_under_lock,
+                    )
+
+                    await assert_model_not_retired_under_lock(
+                        locked_conn, str(final_model), field="llm_model"
+                    )
                 if not (effort_in_spec or model_in_spec or locked_effort is not None):
                     return
                 write_eff, reconciled_eff = await _reconcile_reasoning_effort(
@@ -1553,6 +1566,14 @@ async def schedule_dalton_automation_helper(
                 conn=active_conn,
             )
             create_llm_model = spec_llm_model if model_in_spec else None
+            if create_llm_model and active_conn is not None:
+                from src.dalton.services.team_model_catalog.service import (
+                    assert_model_not_retired_under_lock,
+                )
+
+                await assert_model_not_retired_under_lock(
+                    active_conn, str(create_llm_model), field="llm_model"
+                )
             try:
                 _, create_reasoning_effort = await _reconcile_reasoning_effort(
                     task_owner,

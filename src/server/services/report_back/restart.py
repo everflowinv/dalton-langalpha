@@ -69,6 +69,8 @@ class OwedResume:
     retry_run_id: Optional[str] = None
     # DALTON-HOOK(automation-subscription-fallback): interrupted turn's automation execution id
     automation_execution_id: Optional[str] = None
+    # DALTON-HOOK(team-model-catalog): persisted/backfilled turn catalog snapshot for cross-deploy resume
+    catalog_snapshot: Optional[Mapping[str, Any]] = None
 
     @property
     def report_source(self) -> None:
@@ -114,12 +116,17 @@ def resume_turn(owed: OwedResume, request_key: str) -> tuple[str, dict]:
         # DALTON-HOOK(automation-subscription-fallback): carry interrupted execution link on restart resume
         if owed.automation_execution_id:
             body["automation_delivery"] = {"id": owed.automation_execution_id}
+        # DALTON-HOOK(team-model-catalog): propagate effective_catalog_snapshot to resumed turn
+        if owed.catalog_snapshot:
+            body["effective_catalog_snapshot"] = dict(owed.catalog_snapshot)
         return route, body
     body = {
         "run_id": owed.retry_run_id,
         "workspace_id": owed.workspace_id,
         "request_key": request_key,
     }
+    if owed.catalog_snapshot:  # DALTON-HOOK(team-model-catalog): carry snapshot on /retry resume
+        body["effective_catalog_snapshot"] = dict(owed.catalog_snapshot)
     if owed.tasks:
         body["additional_context"] = [
             {"type": "directive", "content": owed.stopped_tasks_notice(also=False)}
@@ -200,6 +207,24 @@ async def resume_verdict(job: Mapping[str, Any]) -> OwedResume | NotOwed | NotYe
         if retry_run_id is not None and state.get("run_user_id")
         else str(state["user_id"])
     )
+    # DALTON-HOOK(team-model-catalog): load persisted snapshot or conditionally backfill pre-feature legacy run
+    catalog_snapshot = None
+    try:
+        from src.dalton.services.team_model_catalog.snapshot import (
+            ensure_run_catalog_snapshot,
+        )
+
+        catalog_snapshot = await ensure_run_catalog_snapshot(
+            {**dict(state), "conversation_response_id": str(run_id)},
+            is_subagent=False,
+        )
+    except Exception as _snap_err:
+        logger.warning(
+            "[RESTART_RESUME] Failed to ensure catalog snapshot for run=%s: %s",
+            run_id,
+            type(_snap_err).__name__,
+        )
+
     return OwedResume(
         user_id=resume_user_id,
         workspace_id=str(state["workspace_id"]),
@@ -207,6 +232,7 @@ async def resume_verdict(job: Mapping[str, Any]) -> OwedResume | NotOwed | NotYe
         tasks=tuple(tasks),
         retry_run_id=retry_run_id,
         automation_execution_id=execution_id or None,
+        catalog_snapshot=catalog_snapshot,
     )
 
 

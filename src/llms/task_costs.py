@@ -50,6 +50,8 @@ from typing import Any, Optional, Sequence
 logger = logging.getLogger(__name__)
 
 TASK_COSTS_PATH = Path(__file__).parent / "manifest" / "task_costs.json"
+# DALTON-HOOK(team-model-catalog): remember shipped path so explicit file overrides bypass compiled catalog
+_DEFAULT_TASK_COSTS_PATH = TASK_COSTS_PATH
 
 #: The key for a figure measured without naming a reasoning level.
 ANY_EFFORT = "any"
@@ -166,6 +168,10 @@ def _read_json(path: Path) -> Any:
     return None
 
 
+# DALTON-HOOK(team-model-catalog): remember default JSON reader so test overrides bypass compiled catalog
+_DEFAULT_READ_JSON = _read_json
+
+
 @lru_cache(maxsize=1)
 def _shipped() -> Optional[TaskCosts]:
     """The shipped file, read and parsed once per process, or None with a
@@ -179,6 +185,24 @@ def _shipped() -> Optional[TaskCosts]:
     return parse_task_costs(_read_json(TASK_COSTS_PATH))
 
 
+def _active_task_costs() -> Optional[TaskCosts]:
+    """DALTON-HOOK(team-model-catalog): prefer compiled team catalog task_costs overlay over shipped JSON."""
+    if TASK_COSTS_PATH != _DEFAULT_TASK_COSTS_PATH or _read_json is not _DEFAULT_READ_JSON:
+        return _shipped()
+    try:
+        from src.dalton.llm.overlay import _in_upstream_raw_manifest_test
+
+        if not _in_upstream_raw_manifest_test():
+            from src.dalton.services.team_model_catalog.compiled import get_compiled_catalog_sync
+
+            compiled = get_compiled_catalog_sync()
+            if compiled is not None and compiled.task_costs is not None:
+                return compiled.task_costs
+    except Exception:
+        pass
+    return _shipped()
+
+
 def task_cost_baseline() -> Optional[dict[str, str]]:
     """The model and level every relative figure is a multiple of, or None.
 
@@ -186,7 +210,7 @@ def task_cost_baseline() -> Optional[dict[str, str]]:
     present only when its figures are usable, so the baseline and the figures
     never disagree about whether there are any.
     """
-    shipped = _shipped()
+    shipped = _active_task_costs()
     return dict(shipped.baseline) if shipped is not None else None
 
 
@@ -233,7 +257,8 @@ def task_cost(
     ``costs`` defaults to the shipped file, read once.
     """
     if costs is None:
-        costs = _shipped()
+        # DALTON-HOOK(team-model-catalog): resolve compiled catalog task_costs overlay when active
+        costs = _active_task_costs()
     if costs is None:
         return None
     figures = costs.relative.get(model_name)

@@ -69,6 +69,34 @@ async def _linked(
     )
 
 
+async def _validate_plugin_subagent_models_under_lock(
+    user_id: str,
+    plugin_name: str,
+    plans: list[AgentPlan],
+    *,
+    conn: Any,
+) -> None:
+    """DALTON-HOOK(team-model-catalog): validate each plugin subagent's effective model (including user override) under the held catalog shared lock."""
+    from src.dalton.services.team_model_catalog.service import (
+        assert_model_not_retired_under_lock,
+    )
+    from src.server.database.plugin_subagents import plugin_key
+
+    overrides_by_base: dict[str, dict[str, Any]] = {}
+    for row in await list_user_subagents(user_id, conn=conn):
+        if row.get("kind") == "override" and row.get("base_key"):
+            overrides_by_base[str(row["base_key"])] = dict(row.get("fields") or {})
+
+    for plan in plans:
+        if plan.skip_code is not None:
+            continue
+        base_model = (plan.fields or {}).get("model")
+        ov_fields = overrides_by_base.get(plugin_key(plugin_name, plan.name)) or {}
+        eff_model = ov_fields.get("model") if "model" in ov_fields else base_model
+        if eff_model:
+            await assert_model_not_retired_under_lock(conn, str(eff_model), field="model")
+
+
 async def relink_subagents(user_id: str, plugin_id: str, plugin_name: str) -> None:
     """Link the plugin's stored subagents to servers that landed after them.
 
@@ -85,7 +113,12 @@ async def relink_subagents(user_id: str, plugin_id: str, plugin_name: str) -> No
             )
             for r in rows
         ]
-        for row, plan in zip(rows, await _linked(user_id, plugin_id, plugin_name, plans, conn=conn)):
+        linked_plans = await _linked(user_id, plugin_id, plugin_name, plans, conn=conn)
+        # DALTON-HOOK(team-model-catalog): re-verify effective models under catalog shared lock
+        await _validate_plugin_subagent_models_under_lock(
+            user_id, plugin_name, linked_plans, conn=conn
+        )
+        for row, plan in zip(rows, linked_plans):
             if plan.fields != row["fields"]:
                 await replace_plugin_subagent(user_id, plugin_id, plan.row, plan.text, conn=conn)
 
@@ -174,6 +207,8 @@ async def install_subagents(
                 f"plugin={plugin_name} overrides={cleared}"
             )
         plans = await _linked(user_id, plugin_id, plugin_name, plans, conn=conn)
+        # DALTON-HOOK(team-model-catalog): validate plugin subagent models under catalog shared lock
+        await _validate_plugin_subagent_models_under_lock(user_id, plugin_name, plans, conn=conn)
         await fan_out_subagents(user_id, plugin_id, plans, report, conn=conn)
 
 
@@ -194,10 +229,12 @@ async def reconcile_subagents(
     it or diffs against the bases it leaves.
     """
     async with overrides_locked(user_id) as conn:
-        incoming = {
-            p.name: p
-            for p in await _linked(user_id, plugin_id, plugin_name, plans, conn=conn)
-        }
+        linked_incoming = await _linked(user_id, plugin_id, plugin_name, plans, conn=conn)
+        # DALTON-HOOK(team-model-catalog): validate reconciled plugin subagent models (with overrides) under catalog shared lock
+        await _validate_plugin_subagent_models_under_lock(
+            user_id, plugin_name, linked_incoming, conn=conn
+        )
+        incoming = {p.name: p for p in linked_incoming}
         owned = {
             r["name"]: r
             for r in await list_plugin_subagents(user_id, plugin_id, conn=conn)

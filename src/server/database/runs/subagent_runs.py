@@ -232,6 +232,27 @@ async def start_task_run(
                     # It runs where the turn that started it does.
                     facts.update(await _stand_in_fact(conn, parent_run_id))
 
+                # DALTON-HOOK(team-model-catalog): persist subagent effective_catalog_snapshot in replay_facts
+                if "effective_catalog_snapshot" not in facts:
+                    try:
+                        from src.dalton.services.team_model_catalog.snapshot import (
+                            build_effective_catalog_snapshot,
+                        )
+
+                        sub_models = [
+                            str(m).strip()
+                            for m in (model_override, model)
+                            if isinstance(m, str) and m.strip()
+                        ]
+                        if sub_models:
+                            snap = build_effective_catalog_snapshot(sub_models)
+                            facts["catalog_revision"] = snap["catalog_revision"]
+                            facts["effective_catalog_snapshot"] = snap
+                    except Exception as _sub_snap_exc:
+                        logger.debug(
+                            "[subagent_runs] catalog snapshot build skipped: %s", _sub_snap_exc
+                        )
+
                 async with conn.cursor() as cur:
                     await cur.execute(
                         """
