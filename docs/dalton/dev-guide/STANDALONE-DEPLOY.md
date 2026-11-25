@@ -312,6 +312,71 @@ DALTON_OPERATOR_LLM_ENDPOINTS=https://llm-gateway.corp.internal/v1
 | `BRAND_NAME` / `VITE_BRAND_NAME` | 自定义站点与智能体品牌名 | 默认 `Dalton` |
 | `DALTON_TIMEZONE` | 部署默认时区与预算日结时区（如 `Asia/Shanghai`） | 默认 `UTC` |
 
+### 5.4 可选能力：独立语音转写服务（`--profile transcription`）与对象存储初始化
+
+核心版内置开源语音转写服务 `transcription`（`python -m src.dalton.transcription_service`，监听容器内 `8965` 端口，镜像自带 `ffmpeg` 与 `ffprobe`，支持任意 OpenAI 兼容 Whisper 接口），通过 Compose `transcription` profile 按需开启，同时接入 `core_internal` 与 `sandbox-net` 网络。
+
+#### 第 1 步：准备专有对象存储与服务凭据
+
+在 `.env` 中生成独立管理凭据与票据签名密钥，并配置转写专用对象存储（以下示例复用内置 MinIO，也可替换为任意兼容 S3 的私有存储桶）：
+
+```bash
+# 生成独立管理凭据与票据签名密钥
+openssl rand -hex 32  # 填入 DALTON_TRANSCRIPTION_TOKEN
+openssl rand -hex 32  # 填入 DALTON_TRANSCRIPTION_TICKET_SECRET
+```
+
+在 `.env` 中写入以下配置（按实际 MinIO 凭据与 Whisper 服务地址填写）：
+
+```dotenv
+DALTON_TRANSCRIPTION_ENABLED=1
+DALTON_TRANSCRIPTION_SERVICE_URL=http://transcription:8965
+DALTON_TRANSCRIPTION_TOKEN=<随机32字节十六进制>
+DALTON_TRANSCRIPTION_TICKET_SECRET=<随机32字节十六进制>
+
+# 转写专用对象存储（私有桶；复用内置 MinIO 时填写与 MINIO_ROOT_USER / MINIO_ROOT_PASSWORD 一致的凭据）
+DALTON_ASR_STORAGE_ENDPOINT_URL=http://minio:9000
+DALTON_ASR_STORAGE_BUCKET_NAME=transcriptions
+DALTON_ASR_STORAGE_ACCESS_KEY_ID=<对象存储 Access Key>
+DALTON_ASR_STORAGE_SECRET_ACCESS_KEY=<对象存储 Secret Key>
+DALTON_ASR_STORAGE_REGION=us-east-1
+DALTON_ASR_STORAGE_ADDRESSING_STYLE=path
+# 若使用外部 S3 且沙箱与后端使用不同访问端点，可设置 DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL
+
+# OpenAI 兼容 Whisper 接口（可指向 OpenAI、自建 faster-whisper-server 或企业网关）
+DALTON_WHISPER_API_BASE_URL=https://api.openai.com/v1
+DALTON_WHISPER_API_KEY=<Whisper API Key，留空时回退 OPENAI_API_KEY>
+DALTON_WHISPER_MODEL=whisper-1
+```
+
+#### 第 2 步：初始化私有转写存储桶并启动服务
+
+复用内置 MinIO 时，运行一次 `minio-init` 即可幂等创建私有桶 `transcriptions` 并清空匿名策略；使用外部 S3 时，请提前在云控制台创建同名的私有存储桶并授予 `DALTON_ASR_STORAGE_ACCESS_KEY_ID` 读写权限。随后携带 `--profile transcription` 启动转写服务并重建 `backend` 使新 `.env` 生效：
+
+```bash
+cd /opt/dalton
+# 1. 初始化私有转写存储桶（复用内置 MinIO 时执行）
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env run --rm minio-init
+
+# 2. 启动 transcription 服务（使用 dalton-asr-jobs 持久化卷）并重建 backend
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env --profile transcription up -d transcription
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d --no-deps backend
+```
+
+#### 第 3 步：核验服务健康与能力状态
+
+```bash
+# 确认转写服务已持有排他锁且 ffmpeg / ffprobe 就绪
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env --profile transcription exec -T transcription \
+  curl -sf http://127.0.0.1:8965/healthz
+
+# 确认后端能力列表已包含 transcription
+docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core.yml --env-file .env exec -T backend \
+  curl -sf http://127.0.0.1:8000/api/v1/dalton/capabilities
+```
+
+`healthz` 返回 `owner_lock_held: true`、`ffmpeg_available: true`、`ffprobe_available: true`，且能力列表中出现 `transcription` 即表示就绪。停服维护前可先向 `POST http://127.0.0.1:8965/transcriptions/drain` 发送停止接单信号，等待 `active_jobs` 归零后再重启容器。
+
 ---
 
 ## 6. 备份、恢复与平滑升级

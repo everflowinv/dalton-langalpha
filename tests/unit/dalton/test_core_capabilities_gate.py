@@ -378,7 +378,6 @@ class TestCapabilityRegistry:
             CapabilityId.TMTB,
             CapabilityId.FUNDA_AI,
             CapabilityId.FEISHU_DOCS,
-            CapabilityId.TRANSCRIPTION,
         )
         for child in bridge_children:
             monkeypatch.setenv(CAPABILITY_SPECS[child].env_var, "true")
@@ -392,9 +391,16 @@ class TestCapabilityRegistry:
         )
         assert effective_capabilities() == frozenset()
 
+        # Batch 2: TRANSCRIPTION is decoupled from RESEARCHDATA_BRIDGE, requiring only
+        # its own switch + dedicated ASR storage.
+        monkeypatch.setenv("DALTON_CAP_TRANSCRIPTION", "true")
+        caps_transcription_only = effective_capabilities()
+        assert caps_transcription_only == frozenset({CapabilityId.TRANSCRIPTION})
+
         monkeypatch.setenv("DALTON_CAP_RESEARCHDATA_BRIDGE", "true")
         caps = effective_capabilities()
         assert CapabilityId.RESEARCHDATA_BRIDGE in caps
+        assert CapabilityId.TRANSCRIPTION in caps
         for child in bridge_children:
             assert child in caps
 
@@ -1239,9 +1245,8 @@ class TestSetupBackgroundLoopsGate:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Core: data_jobs, transcription reconcile, and researchdata MCP reconnect all off
+        # Core: data_jobs, default transcription reconcile, and researchdata MCP reconnect all off
         _clean_cap_env(monkeypatch, app_env="core")
-        monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
         monkeypatch.setattr(
             svc_transcriptions,
             "is_transcription_storage_configured",
@@ -1254,6 +1259,12 @@ class TestSetupBackgroundLoopsGate:
         assert svc_transcriptions.is_transcription_reconciliation_enabled() is False
         assert filter_reconnectable_builtin_mcp({"researchdata"}) == set()
         assert filter_reconnectable_builtin_mcp({"researchdata", "firecrawl"}) == {"firecrawl"}
+
+        # Batch 2: enabling transcription + storage in Core activates reconciliation without bridge
+        monkeypatch.setenv("DALTON_TRANSCRIPTION_ENABLED", "1")
+        assert svc_transcriptions.is_transcription_reconciliation_enabled() is True
+        monkeypatch.setenv("DALTON_CAP_TRANSCRIPTION", "false")
+        assert svc_transcriptions.is_transcription_reconciliation_enabled() is False
 
         # Everflow: disabling each loop's registered capability stops that loop
         _enable_all_capabilities(monkeypatch)

@@ -241,6 +241,43 @@ services:
     networks:
       - core_internal
 
+  transcription:
+    profiles: ["transcription"]
+    image: ${DALTON_BACKEND_IMAGE:-dalton-core-backend:local}
+    # Bypass /docker_entrypoint.sh so only the one-shot `migrate` service runs Alembic migrations.
+    entrypoint: ["/usr/bin/tini", "-s", "--"]
+    command:
+      - /bin/sh
+      - -c
+      - |
+        export DALTON_ASR_STORAGE_ACCESS_KEY_ID="$${DALTON_ASR_STORAGE_ACCESS_KEY_ID:-$${MINIO_ROOT_USER:-}}"
+        export DALTON_ASR_STORAGE_SECRET_ACCESS_KEY="$${DALTON_ASR_STORAGE_SECRET_ACCESS_KEY:-$${MINIO_ROOT_PASSWORD:-}}"
+        exec uv run --no-sync python -m src.dalton.transcription_service
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # ptc_agent lives under src/; set it explicitly instead of relying on the venv .pth.
+      PYTHONPATH: /app/src
+      APP_ENV: core
+      DALTON_PROFILE: core
+      DALTON_TRANSCRIPTION_HOST: 0.0.0.0
+      DALTON_TRANSCRIPTION_PORT: "8965"
+      DALTON_ASR_JOBS_DIR: /var/lib/dalton/asr_jobs
+      DALTON_ASR_STORAGE_ENDPOINT_URL: ${DALTON_ASR_STORAGE_ENDPOINT_URL:-http://minio:9000}
+      DALTON_ASR_STORAGE_REGION: ${DALTON_ASR_STORAGE_REGION:-us-east-1}
+      DALTON_ASR_STORAGE_ADDRESSING_STYLE: ${DALTON_ASR_STORAGE_ADDRESSING_STYLE:-path}
+    volumes:
+      - dalton-asr-jobs:/var/lib/dalton/asr_jobs
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8965/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - core_internal
+      - sandbox-net
+
   ssh-gateway:
     # !override drops upstream docker-compose.yml's shell-interpolated BYOK_ENCRYPTION_KEY
     # so ssh-gateway and backend always share the exact same key from `env_file: .env`.
@@ -317,5 +354,6 @@ networks:
 volumes:
   dalton-minio-data:
   dalton-backend-var:
+  dalton-asr-jobs:
   dalton-caddy-data:
   dalton-caddy-config:

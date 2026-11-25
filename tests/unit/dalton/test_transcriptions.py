@@ -472,7 +472,8 @@ async def test_bridge_asr_jobs_disk_persistence_restart_recovery_and_failure_ret
     assert state_file.is_file()
     assert result_file.is_file()
 
-    # Simulate bridge process restart by constructing a brand-new `ResearchDataBridge` pointing at the same `tmp_path`
+    # Simulate bridge process restart: old process exits (releasing `.owner.lock`), then a brand-new `ResearchDataBridge` starts on the same `tmp_path`
+    await bridge1.close()
     bridge2 = _make_test_bridge(tmp_path, delay_s=0.01)
     code_st2, body_st2 = await bridge2.handle_transcription_status("asr_persist0001")
     assert code_st2 == 200
@@ -486,6 +487,7 @@ async def test_bridge_asr_jobs_disk_persistence_restart_recovery_and_failure_ret
     assert body_res2["caller"]["user_id"] == "u-analyst-1"
 
     # Configurable failure mode (`fail_category`) -> `queued -> transcribing -> failed`, then retry succeeds
+    await bridge2.close()
     bridge_fail = _make_test_bridge(
         tmp_path, delay_s=0.01, fail_category="asr_upstream_timeout"
     )
@@ -510,18 +512,21 @@ async def test_bridge_asr_jobs_disk_persistence_restart_recovery_and_failure_ret
     assert code_fres == 409
 
     # Retry on a healthy bridge instance (`fail_category=None`) recovers the failed job to `succeeded`
-    code_retry, _ = await bridge2.handle_transcription_retry(
+    await bridge_fail.close()
+    bridge3 = _make_test_bridge(tmp_path, delay_s=0.01)
+    code_retry, _ = await bridge3.handle_transcription_retry(
         "asr_failretry01",
         {"caller": {"user_id": "u-analyst-1", "workspace_id": "ws-alpha"}},
     )
     assert code_retry == 200
     for _ in range(50):
-        _, r_st = await bridge2.handle_transcription_status("asr_failretry01")
+        _, r_st = await bridge3.handle_transcription_status("asr_failretry01")
         if r_st["job"]["status"] == "succeeded":
             break
         await asyncio.sleep(0.01)
     else:
         pytest.fail("Retried job did not reach succeeded")
+    await bridge3.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1485,7 +1490,8 @@ async def test_fix4_bridge_process_exit_cancellation_marks_interrupted_and_resum
     assert interrupted_state["interrupted"] is True
     assert interrupted_state["completed_at"] is None
 
-    # Restart bridge (new instance with fast delay_s=0.01): job automatically recovers and finishes to `succeeded`
+    # Restart bridge: old bridge releases `.owner.lock` on exit, then new instance recovers job to `succeeded`
+    await bridge1.close()
     bridge2 = _make_test_bridge(
         tmp_path, delay_s=0.01, fixed_text="进程重启后自动恢复完成的转写文本。"
     )
@@ -1504,6 +1510,7 @@ async def test_fix4_bridge_process_exit_cancellation_marks_interrupted_and_resum
     code_res, body_res = await bridge2.handle_transcription_result("asr_shutdown01")
     assert code_res == 200
     assert body_res["result"]["text"] == "进程重启后自动恢复完成的转写文本。"
+    await bridge2.close()
 
 
 @pytest.mark.asyncio

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for Everflow standalone Dalton Transcription service (127.0.0.1:8965).
+  Uses the exact same DALTON_ASR_JOBS_DIR (<repo>/var/dalton/asr_jobs) and
+  DALTON_ASR_USAGE_FILE (<repo>/var/dalton/asr_jobs/asr_usage.jsonl) as the legacy
+  researchdata_bridge.py so historical and in-flight jobs carry over across cutover/rollback.
+
+  Install to ~/Library/LaunchAgents/com.dalton.transcription.plist:
+    1. Replace __PYTHON_BIN__, __REPO__, __HOME__, and __LOG_DIR__ with host paths.
+    2. Create ~/.config/dalton/transcription.env (mode 0600) with:
+         DALTON_TRANSCRIPTION_TOKEN=<random 32-byte hex>
+         DALTON_ASR_STORAGE_ENDPOINT_URL=http://127.0.0.1:9000
+         DALTON_ASR_STORAGE_BUCKET_NAME=<bucket>
+         DALTON_ASR_STORAGE_ACCESS_KEY_ID=<ak>
+         DALTON_ASR_STORAGE_SECRET_ACCESS_KEY=<sk>
+         SEED_ASR_APP_ID=...
+         SEED_ASR_ACCESS_KEY=...
+         VOLC_TOS_AK=...
+         VOLC_TOS_SK=...
+         VOLC_TOS_BUCKET=...
+    3. Load with: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.transcription.plist
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dalton.transcription</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>-m</string>
+        <string>src.dalton.transcription_service</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>PYTHONPATH</key>
+        <string>__REPO__/src:__REPO__</string>
+        <key>DALTON_HOST_PLATFORM</key>
+        <string>macos</string>
+        <key>DALTON_TRANSCRIPTION_HOST</key>
+        <string>127.0.0.1</string>
+        <key>DALTON_TRANSCRIPTION_PORT</key>
+        <string>8965</string>
+        <key>DALTON_ASR_JOBS_DIR</key>
+        <string>__REPO__/var/dalton/asr_jobs</string>
+        <key>DALTON_ASR_USAGE_FILE</key>
+        <string>__REPO__/var/dalton/asr_jobs/asr_usage.jsonl</string>
+        <key>DALTON_TRANSCRIPTION_ENV_FILE</key>
+        <string>__HOME__/.config/dalton/transcription.env</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__LOG_DIR__/dalton-transcription.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_DIR__/dalton-transcription.err.log</string>
+</dict>
+</plist>
