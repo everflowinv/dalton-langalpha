@@ -95,14 +95,6 @@ export function DaltonHomeTeamMemoryCard({
     },
     onError: (err) => {
       inFlightRef.current = false;
-      if (isForbiddenError(err)) {
-        void identity.revalidate();
-      }
-      setSaveError(
-        isForbiddenError(err) && apiErrorDetail(err) != null
-          ? formatApiErrorDetail(err)
-          : t('dalton.common.saveFailed'),
-      );
       if (optimisticNextRef.current !== null) {
         queryClient.setQueryData(queryKeys.dalton.userSettings(), {
           ...(data ?? {}),
@@ -110,10 +102,24 @@ export function DaltonHomeTeamMemoryCard({
         });
         optimisticNextRef.current = null;
       }
+      if (isForbiddenError(err)) {
+        void identity.revalidate();
+      }
+      if (isNotFoundError(err)) {
+        setSaveError(null);
+        void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.capabilities() });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.userSettings() });
+        return;
+      }
+      setSaveError(
+        isForbiddenError(err) && apiErrorDetail(err) != null
+          ? formatApiErrorDetail(err)
+          : t('dalton.common.saveFailed'),
+      );
     },
   });
 
-  if (!allowed || isNotFoundError(error)) {
+  if (!allowed || isNotFoundError(error) || isNotFoundError(mutation.error)) {
     return null;
   }
 

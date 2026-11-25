@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/api/client';
+import { queryKeys } from '@/lib/queryKeys';
 import {
   DaltonHomeTeamMemoryCard,
   type UserTeamMemorySettings,
@@ -79,11 +80,14 @@ function renderWithQueryClient() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
-    <QueryClientProvider client={client}>
-      <DaltonHomeTeamMemoryCard />
-    </QueryClientProvider>,
-  );
+  return {
+    client,
+    ...render(
+      <QueryClientProvider client={client}>
+        <DaltonHomeTeamMemoryCard />
+      </QueryClientProvider>,
+    ),
+  };
 }
 
 describe('DaltonHomeTeamMemoryCard', () => {
@@ -230,5 +234,42 @@ describe('DaltonHomeTeamMemoryCard', () => {
       expect(screen.queryByTestId('dalton-home-team-memory-card')).not.toBeInTheDocument(),
     );
     expect(screen.queryByText('dalton.common.loadFailed')).toBeNull();
+  });
+
+  it('reverts optimistic toggle, hides card without saveFailed, and invalidates capabilities and userSettings when PUT /user-settings returns 404', async () => {
+    const notFound = new ApiError('Request failed with status code 404', 'ERR_BAD_REQUEST', {
+      status: 404,
+      statusText: 'Not Found',
+      headers: {},
+      data: { detail: 'Capability disabled' },
+    });
+    h.get
+      .mockResolvedValueOnce({
+        data: {
+          user_id: 'u-1',
+          home_team_memory_enabled: false,
+          can_edit: true,
+          caller_tier: 'internal',
+        },
+      })
+      .mockRejectedValueOnce(notFound);
+    h.put.mockRejectedValueOnce(notFound);
+
+    const { client } = renderWithQueryClient();
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries');
+    const toggle = await screen.findByRole('switch');
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(h.put).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.queryByTestId('dalton-home-team-memory-card')).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId('dalton-home-team-memory-error')).toBeNull();
+    expect(
+      client.getQueryData<UserTeamMemorySettings>(queryKeys.dalton.userSettings())
+        ?.home_team_memory_enabled,
+    ).toBe(false);
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.dalton.capabilities() });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.dalton.userSettings() });
   });
 });

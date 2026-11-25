@@ -1,7 +1,8 @@
-import { screen } from '@testing-library/react';
+import { fireEvent, screen } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { renderWithProviders } from '@/test/utils';
 import type { CallerIdentity, CallerIdentitySnapshot } from '@/hooks/useCallerIdentity';
+import type { MonitorSummary } from '@/pages/Monitors/api';
 import type { SharedOwnerFileMetadata } from '../api';
 
 const h = vi.hoisted(() => ({
@@ -25,6 +26,14 @@ const h = vi.hoisted(() => ({
     isPm: false,
     colleagueSharingEnabled: true,
   } as CallerIdentitySnapshot,
+  record: {
+    artifact_id: 'art-1',
+    code: 'c1',
+    path: 'results/report.html',
+    shared: false,
+    latest_seq: 1,
+  },
+  monitor: null as MonitorSummary | null,
 }));
 
 vi.mock('@/hooks/useCallerIdentity', () => ({
@@ -44,13 +53,19 @@ vi.mock('@/lib/threadLifecycle/ThreadLifecycleFeed', () => ({
   ThreadLifecycleFeed: () => null,
 }));
 
+vi.mock('@/pages/Monitors/api', () => ({
+  getMonitorByArtifact: vi.fn(async () => h.monitor),
+}));
+
 vi.mock('../../ChatAgent/components/PublishDialog', () => ({
-  default: () => <div data-testid="publish-dialog" />,
+  default: ({ unshareOnly }: { unshareOnly?: boolean }) => (
+    <div data-testid="publish-dialog" data-unshare-only={String(Boolean(unshareOnly))} />
+  ),
 }));
 
 vi.mock('../../ChatAgent/components/filePanel/useArtifactVersionView', () => ({
   useArtifactVersionView: () => ({
-    record: { artifact_id: 'art-1', code: 'c1', path: 'results/report.html', shared: false, latest_seq: 1 },
+    record: h.record,
     version: null,
     versions: [],
     onView: vi.fn(),
@@ -96,6 +111,14 @@ function setIdentity(overrides: Partial<CallerIdentitySnapshot>) {
 
 describe('OwnerArtifactView permissions', () => {
   beforeEach(() => {
+    h.record = {
+      artifact_id: 'art-1',
+      code: 'c1',
+      path: 'results/report.html',
+      shared: false,
+      latest_seq: 1,
+    };
+    h.monitor = null;
     setIdentity({
       tier: 'internal',
       status: 'ready',
@@ -150,5 +173,61 @@ describe('OwnerArtifactView permissions', () => {
     expect(screen.queryByTestId('comment-tools')).toBeNull();
     expect(screen.queryByTestId('owner-artifact-frames')).toBeNull();
     expect(screen.getByTestId('readonly-html-viewer')).toBeInTheDocument();
+  });
+
+  it('keeps standalone stop-sharing action enabled for shared files and historical public monitors during identity error and revalidation, opening unshareOnly PublishDialog', async () => {
+    // 1. Shared file with identity query error: Publish is hidden, standalone stop-sharing stays enabled and opens unshareOnly dialog.
+    h.record = { ...h.record, shared: true };
+    setIdentity({
+      tier: 'unknown',
+      status: 'error',
+      isKnown: false,
+      isConfirming: false,
+      isInternal: false,
+      isExternal: false,
+      canActAsOwner: false,
+    });
+    const view1 = renderWithProviders(
+      <OwnerArtifactView code="c1" metadata={{ ...METADATA, shared: true }} />,
+    );
+    expect(screen.queryByRole('button', { name: /^Publish$/i })).toBeNull();
+    const stopBtn1 = screen.getByRole('button', { name: /Stop sharing|Unshare/i });
+    expect(stopBtn1).toBeEnabled();
+    fireEvent.click(stopBtn1);
+    expect(screen.getByTestId('publish-dialog')).toHaveAttribute('data-unshare-only', 'true');
+    view1.unmount();
+
+    // 2. Historical public monitor (shared=false, monitor.visibility='public') while identity is confirming:
+    // Publish is disabled, standalone stop-sharing stays enabled and opens unshareOnly dialog.
+    h.record = { ...h.record, shared: false };
+    h.monitor = {
+      monitor_id: 'mon-pub',
+      slug: 'pub-slug',
+      artifact_id: 'art-1',
+      workspace_id: 'ws-1',
+      title: 'Public Monitor',
+      category: 'other',
+      visibility: 'public',
+      published_seq: 1,
+      keep_updated: false,
+      member_user_ids: [],
+    } as unknown as MonitorSummary;
+    setIdentity({
+      tier: 'admin',
+      status: 'ready',
+      isKnown: true,
+      isConfirming: true,
+      isAdmin: true,
+      isInternal: true,
+      isExternal: false,
+      canActAsOwner: true,
+      canPublishPublic: true,
+    });
+    renderWithProviders(<OwnerArtifactView code="c1" metadata={METADATA} />);
+    expect(screen.getByRole('button', { name: /^Publish$/i })).toBeDisabled();
+    const stopBtn2 = await screen.findByRole('button', { name: /Stop sharing|Unshare/i });
+    expect(stopBtn2).toBeEnabled();
+    fireEvent.click(stopBtn2);
+    expect(screen.getByTestId('publish-dialog')).toHaveAttribute('data-unshare-only', 'true');
   });
 });

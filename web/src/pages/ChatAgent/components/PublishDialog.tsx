@@ -27,7 +27,7 @@ import { useIsMobile } from '@/hooks/useIsMobile'; // DALTON-HOOK(mobile-web)
 import { isCoarsePointer } from '@/lib/dalton/pointer'; // DALTON-HOOK(mobile-web)
 import { useLocale } from '@/hooks/useLocale';
 import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(colleague-access): gate auto-publish pause tracking on colleague_sharing capability
-import { useCallerIdentity } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(external-share-guard)
+import { useCallerIdentity, type CallerIdentity } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(external-share-guard)
 import { useWorkspace } from '@/hooks/useWorkspace'; // DALTON-HOOK(colleague-access): read workspace auto-publish pause state & token
 import {
   useArtifactPublishing,
@@ -161,7 +161,7 @@ type Outcome =
   /** Published, but the files were as the latest version left them. */
   | { kind: 'unchanged'; seq: number };
 
-function FileRow({ artifactId, entry, added, leftOut, gutter, locked }: {
+function FileRow({ artifactId, entry, added, leftOut, gutter, locked, identity, onLeftOutError }: {
   artifactId: string;
   entry: ShareFileEntry;
   /** Read by the file now but in no version yet: what an Update would add. */
@@ -170,8 +170,11 @@ function FileRow({ artifactId, entry, added, leftOut, gutter, locked }: {
   leftOut: boolean;
   /** Some row of the list has a box, so the names line up past it. */
   gutter: boolean;
-  /** A publish is under way with the list as it stands. */
+  /** A publish is under way with the list as it stands, or identity cannot edit. */
   locked: boolean;
+  // DALTON-HOOK(external-share-guard): verify latest identity synchronously and reuse dialog error handling for left-out toggles
+  identity: CallerIdentity;
+  onLeftOutError: (err: unknown) => void;
 }) {
   const { t } = useTranslation();
   const locale = useLocale();
@@ -197,14 +200,27 @@ function FileRow({ artifactId, entry, added, leftOut, gutter, locked }: {
             {leftOut || entry.optional ? (
               <input
                 type="checkbox"
-                className="h-3.5 w-3.5 shrink-0 cursor-pointer accent-(--color-accent-primary)"
+                className="h-3.5 w-3.5 shrink-0 cursor-pointer accent-(--color-accent-primary) disabled:cursor-not-allowed"
                 aria-label={t('publish:includeFile', { file: name })}
                 checked={!out}
                 disabled={locked || toggle.isPending}
-                onChange={(e) => toggle.mutate(
-                  { path: entry.path, leftOut: !e.target.checked },
-                  { onError: () => toast({ description: t('publish:leftOutFailed'), variant: 'destructive' }) },
-                )}
+                onChange={(e) => {
+                  // DALTON-HOOK(external-share-guard): block left-out writes while identity is unconfirmed/confirming or non-owner
+                  const latest = identity.getLatestIdentity();
+                  if (
+                    locked ||
+                    latest.isConfirming ||
+                    latest.status !== 'ready' ||
+                    latest.isExternal ||
+                    !latest.canActAsOwner
+                  ) {
+                    return;
+                  }
+                  toggle.mutate(
+                    { path: entry.path, leftOut: !e.target.checked },
+                    { onError: onLeftOutError },
+                  );
+                }}
               />
             ) : gutter && <span aria-hidden className="w-3.5 shrink-0" />}
             {/* The folder gives way first: rows cut from the end would all read as
@@ -323,7 +339,7 @@ function VersionList({ artifactId }: { artifactId: string | undefined }) {
 }
 
 /** The review list: exactly what a publish sends. */
-function ReviewList({ artifactId, heading, status, files, added, failure, failed, fetching, locked, onRetry }: {
+function ReviewList({ artifactId, heading, status, files, added, failure, failed, fetching, locked, identity, onLeftOutError, onRetry }: {
   artifactId: string;
   /** Null while the status is read. */
   heading: string | null;
@@ -335,6 +351,9 @@ function ReviewList({ artifactId, heading, status, files, added, failure, failed
   failed: boolean;
   fetching: boolean;
   locked: boolean;
+  // DALTON-HOOK(external-share-guard): forward unified identity & error handler to file checkboxes
+  identity: CallerIdentity;
+  onLeftOutError: (err: unknown) => void;
   onRetry: () => void;
 }) {
   const { t } = useTranslation();
@@ -389,6 +408,8 @@ function ReviewList({ artifactId, heading, status, files, added, failure, failed
                   leftOut={leftOut.includes(entry)}
                   gutter={gutter}
                   locked={locked}
+                  identity={identity}
+                  onLeftOutError={onLeftOutError}
                 />
               ))}
             </ul>
@@ -925,7 +946,18 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
   };
 
   // DALTON-HOOK(monitors): keep toggleMember helper alongside monitor keep-updated controls
+  // DALTON-HOOK(external-share-guard): ignore member selection changes while identity is unconfirmed/confirming or busy
   const toggleMember = (memberId: string) => {
+    const latest = identity.getLatestIdentity();
+    if (
+      busy ||
+      latest.isConfirming ||
+      latest.status !== 'ready' ||
+      latest.isExternal ||
+      !latest.canActAsOwner
+    ) {
+      return;
+    }
     const next = effectiveMembers.includes(memberId)
       ? effectiveMembers.filter((id) => id !== memberId)
       : [...effectiveMembers, memberId];
@@ -1244,8 +1276,9 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
                           key={member.user_id}
                           type="button"
                           onClick={() => toggleMember(member.user_id)}
+                          disabled={busy || isIdentityBlocked || externalNeedsDowngrade}
                           aria-pressed={selected}
-                          className="flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left text-xs hover:bg-(--color-bg-hover)"
+                          className="flex w-full items-center justify-between gap-2 px-2.5 py-1.5 text-left text-xs hover:bg-(--color-bg-hover) disabled:opacity-50 disabled:cursor-not-allowed"
                           style={{ color: 'var(--color-text-primary)' }}
                         >
                           <span className="truncate">{labelText}</span>
@@ -1395,6 +1428,7 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
         )}
 
         {/* DALTON-HOOK(monitors): submit monitor review list and version note via send() */}
+        {/* DALTON-HOOK(external-share-guard): lock file inclusion checkboxes during identity revalidation or without owner edit rights */}
         {!unshareOnly && !recordFailed && !blocking && !blocked && (
           <ReviewList
             artifactId={artifact?.artifact_id ?? ''}
@@ -1403,7 +1437,9 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
             files={files}
             added={added}
             failure={listFailure}
-            locked={busy}
+            locked={busy || isIdentityBlocked || isExternal || !identity.canActAsOwner}
+            identity={identity}
+            onLeftOutError={(err) => failed(err, t('publish:leftOutFailed'))}
             failed={statusQuery.isError || scout.failed}
             fetching={statusQuery.isFetching}
             onRetry={() => (scout.failed ? scout.retry() : void statusQuery.refetch())}
@@ -1478,12 +1514,14 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
       </div>
 
       {/* DALTON-HOOK(monitors): confirm dialog for public monitor link exposure */}
+      {/* DALTON-HOOK(external-share-guard): disable public publish confirmation while identity is unknown/confirming */}
       <ConfirmDialog
         open={publicConfirmOpen}
         onOpenChange={setPublicConfirmOpen}
         title={t('monitors:dialog.publicConfirmTitle')}
         message={t('monitors:dialog.publicConfirmMessage')}
         confirmLabel={t('monitors:dialog.publicConfirmButton')}
+        confirmDisabled={isIdentityBlocked || busy}
         onConfirm={executeMonitorPublish}
       />
     </>

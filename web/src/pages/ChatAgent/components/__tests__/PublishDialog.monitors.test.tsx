@@ -212,6 +212,7 @@ import {
   ensureArtifact,
   findArtifact,
   getArtifactStatus,
+  setArtifactFileLeftOut,
   unshareArtifact,
 } from '@/pages/ChatAgent/utils/api/artifacts';
 import { toast } from '@/components/ui/use-toast';
@@ -225,6 +226,7 @@ const mockGetWorkspace = vi.mocked(getWorkspace);
 const mockFind = vi.mocked(findArtifact);
 const mockEnsure = vi.mocked(ensureArtifact);
 const mockStatus = vi.mocked(getArtifactStatus);
+const mockSetLeftOut = vi.mocked(setArtifactFileLeftOut);
 const mockUnshare = vi.mocked(unshareArtifact);
 const mockGetMonitor = vi.mocked(getMonitorByArtifact);
 const mockPublishMonitor = vi.mocked(publishMonitor);
@@ -1181,5 +1183,108 @@ describe('PublishDialog 4-tier monitor visibility (Checklist 8)', () => {
     expect(screen.queryByRole('button', { name: 'Publish' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Comment' })).toBeNull();
     expect(screen.queryByRole('button', { name: 'Set as dashboard' })).toBeNull();
+  });
+
+  it('disables file inclusion checkboxes during identity revalidation and for external members, and triggers revalidate with formatted 403 toast on left-out 403', async () => {
+    tierState.callerTier = 'internal';
+    tierState.status = 'ready';
+    tierState.isConfirming = false;
+    mockStatus.mockResolvedValue({
+      ...STATUS,
+      files: [
+        ...STATUS.files,
+        { path: 'results/notes.md', size: 128, reason: 'markdown', optional: true },
+      ],
+    });
+    mockSetLeftOut.mockReset();
+
+    const { rerender } = renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+
+    const checkbox = await screen.findByRole('checkbox', { name: /notes\.md/i });
+    expect(checkbox).toBeEnabled();
+
+    // Revalidation starts: checkbox disables and clicking does not issue POST /left-out.
+    tierState.isConfirming = true;
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    expect(screen.getByRole('checkbox', { name: /notes\.md/i })).toBeDisabled();
+    fireEvent.click(screen.getByRole('checkbox', { name: /notes\.md/i }));
+    expect(mockSetLeftOut).not.toHaveBeenCalled();
+
+    // External owner: checkbox stays disabled and cannot issue POST /left-out.
+    tierState.isConfirming = false;
+    tierState.callerTier = 'external';
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    expect(screen.getByRole('checkbox', { name: /notes\.md/i })).toBeDisabled();
+    fireEvent.click(screen.getByRole('checkbox', { name: /notes\.md/i }));
+    expect(mockSetLeftOut).not.toHaveBeenCalled();
+
+    // Internal owner encounters a 403 race on POST /left-out -> revalidates identity and shows server detail.
+    tierState.callerTier = 'internal';
+    tierState.revalidate.mockClear();
+    vi.mocked(toast).mockClear();
+    mockSetLeftOut.mockRejectedValueOnce(
+      new ApiError('Request failed with status code 403', 'ERR_BAD_REQUEST', {
+        status: 403,
+        statusText: 'Forbidden',
+        headers: {},
+        data: { detail: { code: 'external_member_forbidden', message: '外部成员无法修改发布文件列表' } },
+      }),
+    );
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    const enabledBox = screen.getByRole('checkbox', { name: /notes\.md/i });
+    expect(enabledBox).toBeEnabled();
+    fireEvent.click(enabledBox);
+
+    await waitFor(() => expect(mockSetLeftOut).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(tierState.revalidate).toHaveBeenCalledTimes(1));
+    expect(toast).toHaveBeenCalledWith({
+      description: '外部成员无法修改发布文件列表',
+      variant: 'destructive',
+    });
+  });
+
+  it('disables public confirmation button without closing dialog and disables member selection list while identity is confirming', async () => {
+    tierState.callerTier = 'admin';
+    tierState.status = 'ready';
+    tierState.isConfirming = false;
+
+    const { rerender } = renderWithProviders(
+      <PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />,
+    );
+
+    // 1. Switch to "members" visibility and verify member button disables during revalidation.
+    const membersOption = await screen.findByRole('button', { name: /Selected colleagues|指定同事/i });
+    await userEvent.click(membersOption);
+    const bobBtn = await screen.findByRole('button', { name: /Bob/i });
+    expect(bobBtn).toBeEnabled();
+    expect(bobBtn).toHaveAttribute('aria-pressed', 'false');
+
+    tierState.isConfirming = true;
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    expect(screen.getByRole('button', { name: /Bob/i })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: /Bob/i }));
+    expect(screen.getByRole('button', { name: /Bob/i })).toHaveAttribute('aria-pressed', 'false');
+
+    // 2. Switch to "public" when settled, open ConfirmDialog, then start revalidation.
+    tierState.isConfirming = false;
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    await userEvent.click(screen.getByRole('button', { name: /Public|公开/i }));
+    const publishBtn = screen.getByRole('button', { name: 'Publish' });
+    await waitFor(() => expect(publishBtn).toBeEnabled());
+    await userEvent.click(publishBtn);
+
+    const confirmBtn = await screen.findByRole('button', { name: /Publish publicly|确认公开/i });
+    expect(confirmBtn).toBeEnabled();
+
+    tierState.isConfirming = true;
+    rerender(<PublishDialog open workspaceId="ws-1" path="results/report.html" onClose={() => {}} />);
+    const disabledConfirmBtn = screen.getByRole('button', { name: /Publish publicly|确认公开/i });
+    expect(disabledConfirmBtn).toBeDisabled();
+    fireEvent.click(disabledConfirmBtn);
+    expect(mockPublishMonitor).not.toHaveBeenCalled();
+    // Dialog remains open rather than dismissing on a blocked confirm click.
+    expect(screen.getByRole('button', { name: /Publish publicly|确认公开/i })).toBeInTheDocument();
   });
 });

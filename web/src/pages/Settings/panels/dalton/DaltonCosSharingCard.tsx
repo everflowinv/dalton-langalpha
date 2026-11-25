@@ -111,10 +111,19 @@ export function DaltonCosSharingCard({
       if (isForbiddenError(err)) {
         void identity.revalidate();
       }
+      if (isNotFoundError(err)) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.capabilities() });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.userSharing() });
+      }
     },
   });
 
-  if (!allowed || data?.colleague_dispatch_enabled === false || isNotFoundError(error)) {
+  if (
+    !allowed ||
+    data?.colleague_dispatch_enabled === false ||
+    isNotFoundError(error) ||
+    isNotFoundError(mutation.error)
+  ) {
     return null;
   }
 
@@ -163,7 +172,7 @@ export function DaltonCosSharingCard({
       }
       below={
         <div className="space-y-2 mt-2">
-          {mutation.isError && (
+          {mutation.isError && !isNotFoundError(mutation.error) && (
             <DaltonInlineNotice tone="error" testId="dalton-cos-sharing-error">
               {isForbiddenError(mutation.error) && apiErrorDetail(mutation.error) != null
                 ? formatApiErrorDetail(mutation.error)

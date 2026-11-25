@@ -124,6 +124,7 @@ export function WorkspaceSharingModal({
   compact?: boolean;
 }): React.ReactElement | null {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const titleId = useId();
   const cosLegendId = useId();
   const webLegendId = useId();
@@ -147,21 +148,33 @@ export function WorkspaceSharingModal({
   const [cosEdited, setCosEdited] = useState(false);
   const [webEdited, setWebEdited] = useState(false);
   const [draftTeamMemory, setDraftTeamMemory] = useState<boolean | null>(null);
+  const [teamMemoryEdited, setTeamMemoryEdited] = useState(false);
+  const [sharingWriteNotFound, setSharingWriteNotFound] = useState(false);
+  const [settingsWriteNotFound, setSettingsWriteNotFound] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
 
-  const data = sharingCapable ? sharingQuery.data : undefined;
+  useEffect(() => {
+    setSharingWriteNotFound(false);
+    setSettingsWriteNotFound(false);
+  }, [workspaceId]);
+
+  const data = sharingCapable && !sharingWriteNotFound ? sharingQuery.data : undefined;
   const settingsData =
-    teamMemoryCapable && identity.isInternal && !readOnly ? settingsQuery.data : undefined;
-  const sharingReady = sharingCapable && data !== undefined && !sharingQuery.isError;
+    teamMemoryCapable && identity.isInternal && !readOnly && !settingsWriteNotFound
+      ? settingsQuery.data
+      : undefined;
+  const sharingReady =
+    sharingCapable && data !== undefined && !sharingQuery.isError && !sharingWriteNotFound;
   const sharingNotFound =
-    sharingCapable && sharingQuery.isError && isNotFoundError(sharingQuery.error);
-  const settingsLoaded = settingsData !== undefined && !settingsQuery.isError;
+    sharingCapable &&
+    (sharingWriteNotFound || (sharingQuery.isError && isNotFoundError(sharingQuery.error)));
+  const settingsLoaded =
+    settingsData !== undefined && !settingsQuery.isError && !settingsWriteNotFound;
   const settingsNotFound =
     teamMemoryCapable &&
     identity.isInternal &&
     !readOnly &&
-    settingsQuery.isError &&
-    isNotFoundError(settingsQuery.error);
+    (settingsWriteNotFound || (settingsQuery.isError && isNotFoundError(settingsQuery.error)));
 
   if (open && sharingReady) {
     if (!cosEdited && draftCos !== data.cos_access) {
@@ -172,8 +185,11 @@ export function WorkspaceSharingModal({
     }
   }
 
-  if (open && draftTeamMemory === null && settingsLoaded) {
-    setDraftTeamMemory(settingsData.team_memory_enabled === true);
+  if (open && settingsLoaded) {
+    const serverTeamMemory = settingsData.team_memory_enabled === true;
+    if (!teamMemoryEdited && draftTeamMemory !== serverTeamMemory) {
+      setDraftTeamMemory(serverTeamMemory);
+    }
   }
 
   const hiddenByContext =
@@ -267,6 +283,9 @@ export function WorkspaceSharingModal({
     setSaveError(null);
     setCosEdited(false);
     setWebEdited(false);
+    setTeamMemoryEdited(false);
+    setSharingWriteNotFound(false);
+    setSettingsWriteNotFound(false);
     if (cosAccess !== null) {
       setDraftCos(cosAccess);
     }
@@ -308,12 +327,18 @@ export function WorkspaceSharingModal({
       !readOnly &&
       !ownerExternal;
 
-    const webChanged = latestCanEditWeb && webAccess !== null && draftWeb !== webAccess;
+    const webChanged =
+      webEdited && latestCanEditWeb && webAccess !== null && draftWeb !== webAccess;
     const cosChanged =
-      latestCanEditCos && !dispatchEnabled && cosAccess !== null && draftCos !== cosAccess;
+      cosEdited &&
+      latestCanEditCos &&
+      !dispatchEnabled &&
+      cosAccess !== null &&
+      draftCos !== cosAccess;
     const sharingChanged = webChanged || cosChanged;
 
     const teamMemoryChanged =
+      teamMemoryEdited &&
       latestCanEditTeamMemory &&
       draftTeamMemory !== null &&
       draftTeamMemory !== (settingsData.team_memory_enabled === true);
@@ -326,40 +351,82 @@ export function WorkspaceSharingModal({
       return;
     }
 
-    const tasks: Promise<unknown>[] = [];
+    const tasks: Array<{ kind: 'sharing' | 'settings'; promise: Promise<unknown> }> = [];
     if (sharingChanged) {
-      tasks.push(
-        mutation.mutateAsync(
+      tasks.push({
+        kind: 'sharing',
+        promise: mutation.mutateAsync(
           latestCanEditCos && !dispatchEnabled
             ? { cos_access: draftCos, web_access: draftWeb }
             : { web_access: draftWeb },
         ),
-      );
+      });
     }
     if (teamMemoryChanged) {
-      tasks.push(
-        settingsMutation.mutateAsync({
+      tasks.push({
+        kind: 'settings',
+        promise: settingsMutation.mutateAsync({
           team_memory_enabled: draftTeamMemory,
         }),
-      );
+      });
     }
 
-    const results = await Promise.allSettled(tasks);
-    const rejections = results.filter(
-      (r): r is PromiseRejectedResult => r.status === 'rejected',
-    );
+    const results = await Promise.allSettled(tasks.map((task) => task.promise));
+    const rejections = results
+      .map((res, idx) =>
+        res.status === 'rejected' ? { kind: tasks[idx].kind, reason: res.reason } : null,
+      )
+      .filter((r): r is { kind: 'sharing' | 'settings'; reason: unknown } => r !== null);
+
     if (rejections.length > 0) {
-      if (rejections.some((r) => isForbiddenError(r.reason))) {
-        void identity.revalidate();
+      const notFoundRejections = rejections.filter((r) => isNotFoundError(r.reason));
+      const otherRejections = rejections.filter((r) => !isNotFoundError(r.reason));
+
+      let sharingHiddenBy404 = false;
+      let settingsHiddenBy404 = false;
+      if (notFoundRejections.length > 0) {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.capabilities() });
+        for (const rej of notFoundRejections) {
+          if (rej.kind === 'sharing') {
+            sharingHiddenBy404 = true;
+            setCosEdited(false);
+            setWebEdited(false);
+            setSharingWriteNotFound(true);
+            void queryClient.invalidateQueries({
+              queryKey: queryKeys.dalton.sharing(workspaceId),
+            });
+          } else {
+            settingsHiddenBy404 = true;
+            setTeamMemoryEdited(false);
+            setSettingsWriteNotFound(true);
+            void queryClient.invalidateQueries({
+              queryKey: queryKeys.dalton.workspaceSettings(workspaceId),
+            });
+          }
+        }
       }
-      const forbiddenWithDetail = rejections.find(
-        (r) => isForbiddenError(r.reason) && apiErrorDetail(r.reason) != null,
-      );
-      setSaveError(
-        forbiddenWithDetail
-          ? formatApiErrorDetail(forbiddenWithDetail.reason)
-          : t('dalton.teamMemory.saveFailed', '设置保存失败，请稍后重试'),
-      );
+
+      if (otherRejections.length > 0) {
+        if (otherRejections.some((r) => isForbiddenError(r.reason))) {
+          void identity.revalidate();
+        }
+        const forbiddenWithDetail = otherRejections.find(
+          (r) => isForbiddenError(r.reason) && apiErrorDetail(r.reason) != null,
+        );
+        setSaveError(
+          forbiddenWithDetail
+            ? formatApiErrorDetail(forbiddenWithDetail.reason)
+            : t('dalton.teamMemory.saveFailed', '设置保存失败，请稍后重试'),
+        );
+        return;
+      }
+
+      const hasRemainingSection =
+        (showSharingSection && !sharingHiddenBy404) ||
+        (showTeamMemorySection && !settingsHiddenBy404);
+      if (!hasRemainingSection) {
+        setOpen(false);
+      }
       return;
     }
     setOpen(false);
@@ -677,6 +744,7 @@ export function WorkspaceSharingModal({
                     testId="workspace-team-memory-switch"
                     onChange={() => {
                       if (isTeamMemoryDisabled) return;
+                      setTeamMemoryEdited(true);
                       setDraftTeamMemory(
                         (prev) =>
                           !(

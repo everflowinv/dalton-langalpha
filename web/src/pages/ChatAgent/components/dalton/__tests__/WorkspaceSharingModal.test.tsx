@@ -1004,4 +1004,115 @@ describe('WorkspaceSharingModal', () => {
       expect(screen.queryByTestId('workspace-sharing-button')).toBeNull();
     });
   });
+
+  it('syncs unedited Team Memory switch when query refreshes and omits Team Memory PUT when only web_access is modified', async () => {
+    const enabledSettings: WorkspaceSettingsResponse = {
+      ...STABLE_OWN_SETTINGS,
+      team_memory_enabled: true,
+    };
+    const disabledSettings: WorkspaceSettingsResponse = {
+      ...STABLE_OWN_SETTINGS,
+      team_memory_enabled: false,
+    };
+    const updatedSharing: WorkspaceSharingResponse = {
+      ...STABLE_OWN_SHARING,
+      web_access: 'rw',
+    };
+    h.fetchWorkspaceSharing.mockResolvedValue(STABLE_OWN_SHARING);
+    h.fetchWorkspaceSettings.mockResolvedValue(enabledSettings);
+    h.updateWorkspaceSharing.mockResolvedValueOnce(updatedSharing);
+
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.sharing(WS_OWN), STABLE_OWN_SHARING);
+    queryClient.setQueryData(queryKeys.dalton.workspaceSettings(WS_OWN), enabledSettings);
+
+    renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, { queryClient });
+
+    fireEvent.click(screen.getByTestId('workspace-sharing-button'));
+    expect(screen.getByTestId('workspace-team-memory-switch')).toHaveAttribute(
+      'aria-checked',
+      'true',
+    );
+
+    // Simulate another tab turning off Team Memory and this tab receiving the refreshed query data.
+    queryClient.setQueryData(queryKeys.dalton.workspaceSettings(WS_OWN), disabledSettings);
+    await waitFor(() => {
+      expect(screen.getByTestId('workspace-team-memory-switch')).toHaveAttribute(
+        'aria-checked',
+        'false',
+      );
+    });
+
+    // Edit only web_access and save: must NOT write stale Team Memory value back to true.
+    fireEvent.click(screen.getByTestId('sharing-web-rw'));
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+
+    await waitFor(() => {
+      expect(h.updateWorkspaceSharing).toHaveBeenCalledWith(WS_OWN, { web_access: 'rw' });
+    });
+    expect(h.updateWorkspaceSettings).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+  });
+
+  it('handles PUT 404 without saveFailed by invalidating capabilities/settings, hiding the disabled section, and closing when no section remains', async () => {
+    const notFound = new ApiError('Request failed with status code 404', 'ERR_BAD_REQUEST', {
+      status: 404,
+      statusText: 'Not Found',
+      headers: {},
+      data: { detail: 'Capability disabled' },
+    });
+
+    // 1. Both sections visible: PUT /sharing returns 404 while Team Memory remains usable -> hides sharing section without saveFailed and invalidates queries.
+    h.updateWorkspaceSharing.mockRejectedValueOnce(notFound);
+    h.fetchWorkspaceSharing.mockRejectedValueOnce(notFound);
+    const clientBoth = createTestQueryClient();
+    clientBoth.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'everflow',
+      capabilities: ['colleague_sharing', 'conversation_archive'],
+      ticker_logos: true,
+    });
+    clientBoth.setQueryData(queryKeys.dalton.sharing(WS_OWN), STABLE_OWN_SHARING);
+    clientBoth.setQueryData(queryKeys.dalton.workspaceSettings(WS_OWN), STABLE_OWN_SETTINGS);
+    const invBoth = vi.spyOn(clientBoth, 'invalidateQueries');
+
+    const view1 = renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, {
+      queryClient: clientBoth,
+    });
+    fireEvent.click(screen.getByTestId('workspace-sharing-button'));
+    fireEvent.click(screen.getByTestId('sharing-web-rw'));
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('sharing-web-fieldset')).toBeNull();
+    });
+    expect(screen.queryByTestId('workspace-sharing-save-error')).toBeNull();
+    expect(screen.getByTestId('workspace-team-memory-section')).toBeInTheDocument();
+    expect(invBoth).toHaveBeenCalledWith({ queryKey: queryKeys.dalton.capabilities() });
+    expect(invBoth).toHaveBeenCalledWith({ queryKey: queryKeys.dalton.sharing(WS_OWN) });
+    view1.unmount();
+
+    // 2. Only sharing section visible: PUT /sharing returns 404 -> closes modal without saveFailed and hides entry.
+    h.updateWorkspaceSharing.mockRejectedValueOnce(notFound);
+    h.fetchWorkspaceSharing.mockRejectedValueOnce(notFound);
+    const clientSharingOnly = createTestQueryClient();
+    clientSharingOnly.setQueryData(queryKeys.dalton.capabilities(), {
+      profile: 'everflow',
+      capabilities: ['colleague_sharing'],
+      ticker_logos: true,
+    });
+    clientSharingOnly.setQueryData(queryKeys.dalton.sharing(WS_OWN), STABLE_OWN_SHARING);
+
+    renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, {
+      queryClient: clientSharingOnly,
+    });
+    fireEvent.click(screen.getByTestId('workspace-sharing-button'));
+    fireEvent.click(screen.getByTestId('sharing-web-rw'));
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+      expect(screen.queryByTestId('workspace-sharing-button')).toBeNull();
+    });
+    expect(screen.queryByTestId('workspace-sharing-save-error')).toBeNull();
+  });
 });

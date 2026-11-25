@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '@/api/client';
+import { queryKeys } from '@/lib/queryKeys';
 import { DaltonCosSharingCard, type UserCosSharingSettings } from '../DaltonCosSharingCard';
 
 const h = vi.hoisted(() => ({
@@ -74,11 +75,14 @@ function renderWithQueryClient() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  return render(
-    <QueryClientProvider client={client}>
-      <DaltonCosSharingCard />
-    </QueryClientProvider>,
-  );
+  return {
+    client,
+    ...render(
+      <QueryClientProvider client={client}>
+        <DaltonCosSharingCard />
+      </QueryClientProvider>,
+    ),
+  };
 }
 
 describe('DaltonCosSharingCard', () => {
@@ -239,5 +243,47 @@ describe('DaltonCosSharingCard', () => {
       expect(screen.queryByTestId('dalton-cos-sharing-card')).not.toBeInTheDocument(),
     );
     expect(screen.queryByText('dalton.common.loadFailed')).toBeNull();
+  });
+
+  it('hides card without saveFailed and invalidates capabilities and userSharing when PUT /sharing/user-settings returns 404', async () => {
+    const notFound = new ApiError('Request failed with status code 404', 'ERR_BAD_REQUEST', {
+      status: 404,
+      statusText: 'Not Found',
+      headers: {},
+      data: { detail: 'Capability disabled' },
+    });
+    h.get
+      .mockResolvedValueOnce({
+        data: {
+          user_id: 'u-1',
+          cos_rw_enabled: false,
+          can_edit: true,
+          colleague_dispatch_enabled: true,
+          caller_tier: 'internal',
+        },
+      })
+      .mockResolvedValueOnce({
+        data: {
+          user_id: 'u-1',
+          cos_rw_enabled: false,
+          can_edit: false,
+          colleague_dispatch_enabled: false,
+          caller_tier: 'internal',
+        },
+      });
+    h.put.mockRejectedValueOnce(notFound);
+
+    const { client } = renderWithQueryClient();
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries');
+    const toggle = await screen.findByRole('switch');
+
+    fireEvent.click(toggle);
+    await waitFor(() => expect(h.put).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.queryByTestId('dalton-cos-sharing-card')).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId('dalton-cos-sharing-error')).toBeNull();
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.dalton.capabilities() });
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.dalton.userSharing() });
   });
 });
