@@ -909,6 +909,7 @@ function PublishReview({ open, workspaceId, path, busyRef, onClose, unshareOnly 
     }
   };
 
+  // DALTON-HOOK(monitors): stopping a share also refreshes monitor, path and share-link queries.
   const stop = () => {
     if (!artifact || busy) return;
     setOutcome((prev) => (prev?.kind === 'unchanged' ? null : prev));
