@@ -39,7 +39,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -1760,11 +1760,44 @@ async def recheck_company_workspace_before_create(
 
         target_ticker_key = canonical_workspace_ticker_key(raw_name)
 
-        def _deterministic_ticker_match_snapshot() -> CompanyDedupRecheckSnapshot | None:
+        async def _deterministic_ticker_match_snapshot(
+            *,
+            checked_hits: Sequence[tuple[_CandidateEntry, str, str]] = (),
+            live_hits: Sequence[
+                tuple[_CandidateEntry, dict[str, Any] | None, str, str]
+            ] = (),
+        ) -> CompanyDedupRecheckSnapshot | None:
             if target_ticker_key is None:
                 return None
-            det_ids: list[str] = []
-            det_unbound = False
+
+            live_by_unit_id: dict[
+                str, tuple[_CandidateEntry, dict[str, Any] | None]
+            ] = {}
+            live_by_ws_id: dict[
+                str, tuple[_CandidateEntry, dict[str, Any] | None]
+            ] = {}
+            for live_entry, fresh_ws, _conf, _reason in live_hits:
+                if live_entry.unit_id:
+                    live_by_unit_id[live_entry.unit_id] = (live_entry, fresh_ws)
+                live_ws_id = str(
+                    (fresh_ws or {}).get("workspace_id") or live_entry.ws_id or ""
+                ).strip()
+                if live_ws_id:
+                    live_by_ws_id[live_ws_id] = (live_entry, fresh_ws)
+
+            dead_unit_ids = {
+                hit_entry.unit_id
+                for hit_entry, _conf, _reason in checked_hits
+                if hit_entry.unit_id and hit_entry.unit_id not in live_by_unit_id
+            }
+            dead_ws_ids = {
+                hit_entry.ws_id
+                for hit_entry, _conf, _reason in checked_hits
+                if hit_entry.ws_id and hit_entry.ws_id not in live_by_ws_id
+            }
+
+            confirmed_pairs: list[tuple[_CandidateEntry, dict[str, Any] | None]] = []
+            to_verify: list[tuple[_CandidateEntry, str, str]] = []
             for entry in entries:
                 entry_ws_id = entry.ws_id
                 if (
@@ -1777,10 +1810,53 @@ async def recheck_company_workspace_before_create(
                 name_key = canonical_workspace_ticker_key(entry.workspace_name)
                 if unit_key != target_ticker_key and name_key != target_ticker_key:
                     continue
-                if entry_ws_id:
-                    if entry_ws_id not in det_ids:
-                        det_ids.append(entry_ws_id)
-                if entry.unbound_unit or not entry_ws_id:
+                if entry.unit_id and entry.unit_id in dead_unit_ids:
+                    continue
+                if entry_ws_id and entry_ws_id in dead_ws_ids:
+                    continue
+                if entry.unit_id and entry.unit_id in live_by_unit_id:
+                    confirmed_pairs.append(live_by_unit_id[entry.unit_id])
+                    continue
+                if entry_ws_id and entry_ws_id in live_by_ws_id:
+                    confirmed_pairs.append(live_by_ws_id[entry_ws_id])
+                    continue
+                to_verify.append((entry, "high", "deterministic_ticker_match"))
+
+            if to_verify:
+                refreshed_det = await _refresh_live_hits(to_verify)
+                for live_entry, fresh_ws, _conf, _reason in refreshed_det:
+                    confirmed_pairs.append((live_entry, fresh_ws))
+
+            det_ids: list[str] = []
+            det_unbound = False
+            for live_entry, fresh_ws in confirmed_pairs:
+                live_ws_id = (
+                    str(
+                        (fresh_ws or {}).get("workspace_id")
+                        or live_entry.ws_id
+                        or ""
+                    ).strip()
+                    or None
+                )
+                if (
+                    expected_duplicate_workspace_id is not None
+                    and live_ws_id is not None
+                    and live_ws_id == expected_duplicate_workspace_id
+                ):
+                    continue
+                live_unit_key = normalize_ticker_key(live_entry.unit_ticker)
+                live_name_key = canonical_workspace_ticker_key(
+                    live_entry.workspace_name
+                )
+                if (
+                    live_unit_key != target_ticker_key
+                    and live_name_key != target_ticker_key
+                ):
+                    continue
+                if live_ws_id:
+                    if live_ws_id not in det_ids:
+                        det_ids.append(live_ws_id)
+                if live_entry.unbound_unit or not live_ws_id:
                     det_unbound = True
             if det_ids or det_unbound:
                 return CompanyDedupRecheckSnapshot(
@@ -1802,7 +1878,7 @@ async def recheck_company_workspace_before_create(
             partial_failure_out=partial_failures,
         )
         if not hits:
-            det_match = _deterministic_ticker_match_snapshot()
+            det_match = await _deterministic_ticker_match_snapshot()
             if det_match is not None:
                 return det_match
             if partial_failures:
@@ -1815,7 +1891,10 @@ async def recheck_company_workspace_before_create(
 
         all_live_hits = await _refresh_live_hits(hits)
         if not all_live_hits:
-            det_match = _deterministic_ticker_match_snapshot()
+            det_match = await _deterministic_ticker_match_snapshot(
+                checked_hits=hits,
+                live_hits=all_live_hits,
+            )
             if det_match is not None:
                 return det_match
             if partial_failures:
@@ -1855,7 +1934,10 @@ async def recheck_company_workspace_before_create(
                 checked_candidates=checked_candidates,
                 check_colleague_workspaces=check_colleagues,
             )
-        det_match = _deterministic_ticker_match_snapshot()
+        det_match = await _deterministic_ticker_match_snapshot(
+            checked_hits=hits,
+            live_hits=all_live_hits,
+        )
         if det_match is not None:
             return det_match
         if partial_failures:

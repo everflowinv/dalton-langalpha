@@ -27,7 +27,10 @@ from src.server.database.computer import (
     update_computer_status,
 )
 from src.server.database.user import get_user, get_user_preferences
-from src.server.database.workspace import get_workspaces_for_user
+from src.server.database.workspace import (
+    get_live_workspace_names as _REAL_GET_LIVE_WORKSPACE_NAMES,
+    get_workspaces_for_user,
+)
 from src.server.services.computer_errors import (
     ApprovalScopeChangedError,
     ComputerArchivingError,
@@ -2308,3 +2311,504 @@ async def test_workspace_manager_bootstrap_keeps_new_primary_computer_if_insert_
 
     assert bootstrap_mock.await_args.kwargs["check_duplicate_snapshot"] is True
     assert bootstrap_mock.await_args.kwargs["workspace_name"] == "700.HK"
+
+
+@pytest.mark.asyncio
+async def test_lock_free_company_dedup_archived_00700_unit_never_returns_matched(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 10 (Codex R9 #1): when a 00700 coverage unit is active during
+    candidate collection, matched by the LLM, and archived before
+    _refresh_live_hits runs, deterministic ticker matching must not re-count the
+    archived unit as status='matched':
+    - all batches succeed -> status='clear'
+    - another batch fails to parse -> status='unavailable'
+    - LLM returns empty hits while unit becomes archived -> live verification
+      drops it and returns status='clear'."""
+    from contextlib import asynccontextmanager
+
+    from src.dalton.coverage import dedup as dedup_mod
+    from src.dalton.coverage.dedup import (
+        DedupLlmResult,
+        DedupMatchItem,
+        recheck_company_workspace_before_create,
+    )
+
+    unit_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    baba_ws_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    unit_state = {"status": "active"}
+    extra_workspaces: list[dict[str, Any]] = []
+
+    def _unit_row() -> dict[str, Any]:
+        return {
+            "unit_id": unit_id,
+            "kind": "company",
+            "status": unit_state["status"],
+            "owner_user_id": USER_ID,
+            "lead_analyst_user_id": USER_ID,
+            "display_name": "腾讯控股",
+            "workspace_id": None,
+            "ticker": "00700",
+            "unit_updated_at": None,
+            "unit_created_at": None,
+            "workspace_name": None,
+            "workspace_owner_id": None,
+            "workspace_status": None,
+            "is_home_stand_in": False,
+            "is_historical_duplicate": False,
+            "workspace_last_activity_at": None,
+            "workspace_updated_at": None,
+            "workspace_created_at": None,
+            "owner_name": "Alice",
+            "owner_email": "alice@team.com",
+            "unit_owner_email": "alice@team.com",
+            "lead_name": "Alice",
+            "lead_email": "alice@team.com",
+        }
+
+    class _ArchivedUnitCursor:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            text = " ".join(sql.split())
+            if "FROM dalton_coverage_units" in text:
+                row = _unit_row()
+                if isinstance(params, tuple) and params and isinstance(params[0], list):
+                    wanted = set(params[0])
+                    self._rows = [row] if unit_id in wanted else []
+                else:
+                    self._rows = [row] if row["status"] == "active" else []
+                return
+            if "FROM workspaces w" in text:
+                if isinstance(params, tuple) and params and isinstance(params[0], list):
+                    wanted = set(params[0])
+                    self._rows = [
+                        dict(r) for r in extra_workspaces if r["workspace_id"] in wanted
+                    ]
+                else:
+                    self._rows = [dict(r) for r in extra_workspaces]
+                return
+            self._rows = []
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._rows)
+
+    class _ArchivedUnitConn:
+        def cursor(self, **_kwargs):
+            return _ArchivedUnitCursor()
+
+    @asynccontextmanager
+    async def _use_conn(c=None):
+        yield c or _ArchivedUnitConn()
+
+    monkeypatch.setattr(dedup_mod, "get_db_connection", _use_conn)
+    monkeypatch.setattr(dedup_mod, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "get_user_tier",
+        create_autospec(
+            lambda _uid: None,
+            side_effect=lambda *_a, **_kw: _async_val("internal"),
+        ),
+    )
+    monkeypatch.setattr(dedup_mod, "_is_internal_team_owner", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_model",
+        create_autospec(dedup_mod.resolve_assist_model, return_value="gpt-4o-mini"),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_fallback_models",
+        create_autospec(dedup_mod.resolve_assist_fallback_models, return_value=[]),
+    )
+    monkeypatch.setattr(dedup_mod, "model_requires_user_oauth", lambda _m: False)
+
+    # Case 1: All batches succeed; LLM matches the 00700 unit, which becomes
+    # archived while waiting for the LLM -> must return status='clear'.
+    async def _llm_hits_then_archives(**_kwargs):
+        unit_state["status"] = "archived"
+        return SimpleNamespace(
+            ok=True,
+            data=DedupLlmResult(
+                matches=[
+                    DedupMatchItem(
+                        id="c1", confidence="high", reason="00700 is Tencent"
+                    )
+                ]
+            ),
+        )
+
+    monkeypatch.setattr(dedup_mod, "dalton_complete", _llm_hits_then_archives)
+    unit_state["status"] = "active"
+    res_clear = await recheck_company_workspace_before_create(
+        USER_ID, "700.HK", channel="cos"
+    )
+    assert res_clear.status == "clear"
+    assert res_clear.matched_workspace_ids == ()
+    assert res_clear.has_unbound_or_unreadable_match is False
+
+    # Case 2: Another batch fails to parse while batch 1 hits the 00700 unit
+    # that becomes archived before _refresh_live_hits -> must return 'unavailable'
+    # (never 'matched').
+    extra_workspaces.append(
+        {
+            "workspace_id": baba_ws_id,
+            "user_id": USER_ID,
+            "name": "BABA",
+            "status": "stopped",
+            "owner_name": "Alice",
+            "owner_email": "alice@team.com",
+            "is_home_stand_in": False,
+            "is_historical_duplicate": False,
+            "last_activity_at": None,
+            "updated_at": None,
+            "created_at": None,
+        }
+    )
+    monkeypatch.setattr(dedup_mod, "DEDUP_BATCH_SIZE", 1)
+
+    async def _llm_batch_hit_archive_and_parse_fail(**kwargs):
+        prompt = str(kwargs.get("user_prompt") or "")
+        if "00700" in prompt:
+            unit_state["status"] = "archived"
+            return SimpleNamespace(
+                ok=True,
+                data=DedupLlmResult(
+                    matches=[
+                        DedupMatchItem(
+                            id="c1", confidence="high", reason="00700 is Tencent"
+                        )
+                    ]
+                ),
+            )
+        # Second batch returns malformed payload (missing `data`) -> parse failure.
+        return SimpleNamespace(ok=True, parsed=DedupLlmResult(matches=[]))
+
+    monkeypatch.setattr(
+        dedup_mod, "dalton_complete", _llm_batch_hit_archive_and_parse_fail
+    )
+    unit_state["status"] = "active"
+    res_unavail = await recheck_company_workspace_before_create(
+        USER_ID, "700.HK", channel="cos"
+    )
+    assert res_unavail.status == "unavailable"
+    assert res_unavail.matched_workspace_ids == ()
+    assert res_unavail.has_unbound_or_unreadable_match is False
+
+    # Case 3: LLM misses the 00700 unit while it becomes archived -> deterministic
+    # fallback verifies live status via DB and drops the archived unit -> 'clear'.
+    extra_workspaces.clear()
+
+    async def _llm_empty_then_archives(**_kwargs):
+        unit_state["status"] = "archived"
+        return SimpleNamespace(ok=True, data=DedupLlmResult(matches=[]))
+
+    monkeypatch.setattr(dedup_mod, "dalton_complete", _llm_empty_then_archives)
+    unit_state["status"] = "active"
+    res_empty_clear = await recheck_company_workspace_before_create(
+        USER_ID, "700.HK", channel="cos"
+    )
+    assert res_empty_clear.status == "clear"
+    assert res_empty_clear.matched_workspace_ids == ()
+    assert res_empty_clear.has_unbound_or_unreadable_match is False
+
+
+@pytest.mark.asyncio
+async def test_own_00700_workspace_listed_on_card_and_approved_700hk_creates_without_scope_changed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 10 (Codex R9 #2): when the caller already owns a live workspace
+    named '00700' and proposes creating '700.HK':
+    - proposal snapshot (duplicate_workspace / is_duplicate_name) recognizes
+      '00700' via canonical_workspace_ticker_key and binds
+      duplicate_workspace_id / duplicate_workspace_name (withholding standing
+      auto-approval and listing '00700' on the confirmation card);
+    - after the user explicitly approves creating another workspace, lock-free
+      Phase 1 excludes expected_duplicate_workspace_id and returns 'clear',
+      in-lock Phase 2 accepts the disclosed expected duplicate, and INSERT
+      succeeds instead of deadlocking with scope_changed."""
+    from contextlib import asynccontextmanager
+
+    from langgraph.checkpoint.memory import InMemorySaver
+    from langgraph.graph import END, START, MessagesState, StateGraph
+    from langgraph.types import Command as LGCommand
+
+    from src.dalton import sharing as sharing_mod
+    from src.dalton.coverage import dedup as dedup_mod
+    from src.dalton.coverage.dedup import DedupLlmResult
+    from src.server.database import workspace as ws_db
+    from src.tools.secretary.approvals import (
+        _snapshot_allows_standing_create,
+        build_create_workspace_snapshot,
+        is_duplicate_name,
+    )
+    from src.tools.secretary.tools import workspaces_create
+
+    assert is_duplicate_name("700.HK", "00700") is True
+    assert is_duplicate_name("00700", "700.HK") is True
+    assert is_duplicate_name("计划①", "计划1") is False
+
+    own_ws_id = "44444444-4444-4444-4444-444444444444"
+    healthy_computer = _computer_row(
+        CLOUD_1, name="Cloud Primary", kind="docker", is_primary=True
+    )
+    live_workspaces = [
+        {
+            "workspace_id": own_ws_id,
+            "user_id": USER_ID,
+            "name": "00700",
+            "status": "stopped",
+            "owner_name": "Alice",
+            "owner_email": "alice@team.com",
+            "unit_ticker": None,
+            "is_home_stand_in": False,
+            "is_historical_duplicate": False,
+            "last_activity_at": None,
+            "updated_at": None,
+            "created_at": None,
+        }
+    ]
+    inserts = {"count": 0}
+    recheck_results: list[Any] = []
+
+    class _Own00700Cursor:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            text = " ".join(sql.split())
+            if "INSERT INTO workspaces" in text:
+                inserts["count"] += 1
+                self._rows = [
+                    {
+                        "workspace_id": WS_1,
+                        "user_id": USER_ID,
+                        "name": "700.HK",
+                        "description": "Tencent HK",
+                        "computer_id": CLOUD_1,
+                        "dir_name": "700.HK",
+                        "status": "stopped",
+                    }
+                ]
+                return
+            if "FROM computers" in text:
+                self._rows = [dict(healthy_computer)]
+                return
+            if "SELECT dir_name FROM workspaces" in text:
+                self._rows = [{"dir_name": "00700"}]
+                return
+            if "FROM workspaces w" in text:
+                if isinstance(params, tuple) and params and isinstance(params[0], list):
+                    wanted = set(params[0])
+                    self._rows = [
+                        dict(r) for r in live_workspaces if r["workspace_id"] in wanted
+                    ]
+                else:
+                    self._rows = [dict(r) for r in live_workspaces]
+                return
+            if (
+                "FROM workspaces" in text
+                and isinstance(params, dict)
+                and "user_id" in params
+            ):
+                uid_filter = str(params["user_id"])
+                self._rows = [
+                    {"workspace_id": r["workspace_id"], "name": r["name"]}
+                    for r in live_workspaces
+                    if r["user_id"] == uid_filter
+                ]
+                return
+            self._rows = []
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._rows)
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            return self._rows[0] if self._rows else None
+
+    class _Own00700Conn:
+        def cursor(self, **_kwargs):
+            return _Own00700Cursor()
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+    @asynccontextmanager
+    async def _use_conn(conn=None):
+        yield conn or _Own00700Conn()
+
+    @asynccontextmanager
+    async def _use_folder_alloc(_cid: str, conn=None):
+        yield conn or _Own00700Conn()
+
+    async def _noop_lock(_cur, _uid: str) -> None:
+        return None
+
+    orig_recheck = dedup_mod.recheck_company_workspace_before_create
+
+    async def _spy_recheck(*args, **kwargs):
+        res = await orig_recheck(*args, **kwargs)
+        recheck_results.append(res)
+        return res
+
+    real_ws_mgr = object.__new__(WorkspaceManager)
+    real_ws_mgr.resolve_binding = create_autospec(
+        real_ws_mgr.resolve_binding, return_value=None
+    )
+    monkeypatch.setattr(
+        "src.server.services.workspace_manager.WorkspaceManager.get_instance",
+        create_autospec(WorkspaceManager.get_instance, return_value=real_ws_mgr),
+    )
+    monkeypatch.setattr(
+        "src.server.database.computer.get_primary_computer",
+        create_autospec(
+            lambda _uid: None,
+            side_effect=lambda *_a, **_kw: _async_val(dict(healthy_computer)),
+        ),
+    )
+    monkeypatch.setattr(
+        "src.server.services.workspace_manager.get_computer",
+        create_autospec(
+            lambda _cid: None,
+            side_effect=lambda *_a, **_kw: _async_val(dict(healthy_computer)),
+        ),
+    )
+    monkeypatch.setattr(
+        ws_db,
+        "get_computer",
+        create_autospec(
+            lambda _cid, conn=None: None,
+            side_effect=lambda *_a, **_kw: _async_val(dict(healthy_computer)),
+        ),
+    )
+    monkeypatch.setattr(
+        "src.server.database.workspace.get_live_workspace_names",
+        create_autospec(
+            _REAL_GET_LIVE_WORKSPACE_NAMES,
+            return_value=[{"workspace_id": own_ws_id, "name": "00700"}],
+        ),
+    )
+    monkeypatch.setattr(ws_db, "get_db_connection", _use_conn)
+    monkeypatch.setattr(ws_db, "folder_allocation", _use_folder_alloc)
+    monkeypatch.setattr(ws_db, "lock_user_writes", _noop_lock)
+    monkeypatch.setattr(
+        ws_db,
+        "start_new_workspace_selection",
+        create_autospec(ws_db.start_new_workspace_selection, return_value=None),
+    )
+    monkeypatch.setattr(
+        "src.tools.secretary.tools._folder_ready_result",
+        create_autospec(
+            _folder_ready_result,
+            return_value={"folder_ready": False, "folder_path": None},
+        ),
+    )
+    monkeypatch.setattr(dedup_mod, "recheck_company_workspace_before_create", _spy_recheck)
+    monkeypatch.setattr(dedup_mod, "get_db_connection", _use_conn)
+    monkeypatch.setattr(dedup_mod, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr("src.dalton.settings.is_dalton_local_auth_enabled", lambda: False)
+    monkeypatch.setattr(sharing_mod, "is_dalton_local_auth_enabled", lambda: False)
+    monkeypatch.setattr(
+        sharing_mod,
+        "get_dalton_allowed_emails",
+        lambda: frozenset({"alice@team.com"}),
+    )
+    monkeypatch.setattr(sharing_mod, "is_invite_pm", lambda _u: False)
+    monkeypatch.setattr(sharing_mod, "is_company_system_user", lambda _u: False)
+    monkeypatch.setattr(
+        dedup_mod,
+        "get_user_tier",
+        create_autospec(
+            lambda _uid: None,
+            side_effect=lambda *_a, **_kw: _async_val("internal"),
+        ),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_model",
+        create_autospec(dedup_mod.resolve_assist_model, return_value="gpt-4o-mini"),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_fallback_models",
+        create_autospec(dedup_mod.resolve_assist_fallback_models, return_value=[]),
+    )
+    # LLM returns empty matches (mirrors the exact scenario where only the
+    # deterministic canonical ticker key links '700.HK' and '00700').
+    monkeypatch.setattr(
+        dedup_mod,
+        "dalton_complete",
+        lambda **_kw: _async_val(SimpleNamespace(ok=True, data=DedupLlmResult(matches=[]))),
+    )
+    monkeypatch.setattr(dedup_mod, "model_requires_user_oauth", lambda _m: False)
+
+    # Proposal phase: snapshot identifies '00700' and withholds standing auto-approval.
+    call = {
+        "id": "call-own-00700",
+        "name": "manage_workspaces",
+        "args": {"action": "create", "name": "700.HK", "description": "Tencent HK"},
+    }
+    snap = await build_create_workspace_snapshot(USER_ID, call)
+    assert snap is not None
+    assert snap["duplicate_workspace_id"] == own_ws_id
+    assert snap["duplicate_workspace_name"] == "00700"
+    assert _snapshot_allows_standing_create(snap) is False
+
+    async def _tool_node(_state: MessagesState):
+        return await workspaces_create(
+            USER_ID,
+            "700.HK",
+            "Tencent HK",
+            "call-own-00700",
+            preapproved=False,
+            snapshot=snap,
+        )
+
+    builder = StateGraph(MessagesState)
+    builder.add_node("create", _tool_node)
+    builder.add_edge(START, "create")
+    builder.add_edge("create", END)
+
+    graph = builder.compile(checkpointer=InMemorySaver())
+    cfg = {"configurable": {"thread_id": "lg-own-00700-700hk"}}
+
+    # Confirmation card lists '00700' as duplicate_workspace_id / duplicate_workspace_name.
+    paused = await graph.ainvoke({"messages": []}, config=cfg)
+    assert "__interrupt__" in paused
+    intr = paused["__interrupt__"][0]
+    card_req = intr.value["action_requests"][0]
+    assert card_req["type"] == "create_workspace"
+    assert card_req["duplicate_workspace_id"] == own_ws_id
+    assert card_req["duplicate_workspace_name"] == "00700"
+
+    # User explicitly approves creating another workspace -> Phase 1 excludes
+    # own_ws_id and returns 'clear', Phase 2 matches expected duplicate and
+    # INSERT succeeds (never scope_changed).
+    resumed = await graph.ainvoke(
+        LGCommand(resume={intr.id: {"decisions": [{"type": "approve"}]}}),
+        config=cfg,
+    )
+    assert len(recheck_results) == 1
+    assert recheck_results[0].status == "clear"
+    assert inserts["count"] == 1
+    tool_msg = resumed["messages"][-1]
+    body = json.loads(tool_msg.content)
+    assert body["success"] is True
+    assert body["workspace_name"] == "700.HK"
