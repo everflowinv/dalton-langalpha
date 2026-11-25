@@ -515,6 +515,11 @@ export class WeixinQrLoginManager {
         allowedDomains: this.allowedApiDomains,
         message: "Waiting for WeChat account status confirmation.",
       });
+    // R8 #7 (Codex Medium #7, Grok Low #2): If a confirmed session lacks `bot_generation`,
+    // we cannot verify that the queried account detail belongs to this confirmation -> wait/retry.
+    if (botGeneration === null) {
+      return buildRetryableWaitResponse();
+    }
     let accountStatus: string | null =
       (typeof session.account_status === "string" &&
         session.account_status.trim()) ||
@@ -529,8 +534,7 @@ export class WeixinQrLoginManager {
         const detail = await this.backend.getWeixinAccountDetail(accountId);
         const detailStatus =
           detail && typeof detail.status === "string" ? detail.status.trim() : "";
-        const generationMatches =
-          botGeneration === null || detail?.bot_generation === botGeneration;
+        const generationMatches = detail?.bot_generation === botGeneration;
         if (!detailStatus || !generationMatches) {
           return buildRetryableWaitResponse();
         }
@@ -541,6 +545,39 @@ export class WeixinQrLoginManager {
         }
         return buildRetryableWaitResponse();
       }
+    }
+    // R8 #7: Only `active` or `pending_verification` counts as connected.
+    // `expired` / `disabled` (or any other non-active status) return the existing terminal failure
+    // shapes (`expired` / `superseded`, `connected: false`), NEVER `connected: true`.
+    if (accountStatus === "expired") {
+      return shapePublicQrWaitResponse({
+        sessionKey: session.session_key,
+        status: "expired",
+        connected: false,
+        accountId,
+        accountStatus,
+        botGeneration,
+        expiresAt: session.expires_at,
+        message: "WeChat account session has expired; please scan again.",
+      });
+    }
+    if (accountStatus !== "active" && accountStatus !== "pending_verification") {
+      const safe = resolveSafeQrError(
+        accountStatus === "disabled" ? "channel_disabled" : "login_session_revoked",
+        "login_session_revoked",
+      );
+      return shapePublicQrWaitResponse({
+        sessionKey: session.session_key,
+        status: "superseded",
+        connected: false,
+        revoked: true,
+        code: safe.code,
+        accountId,
+        accountStatus,
+        botGeneration,
+        expiresAt: session.expires_at,
+        message: safe.message,
+      });
     }
     const ilinkBotId =
       (typeof session.ilink_bot_id === "string" && session.ilink_bot_id.trim()) ||

@@ -465,8 +465,9 @@ export class ChannelGatewayOrchestrator {
   }
 
   /**
-   * R7 #3 (Grok High): Marks a superseded Weixin inbound message as terminal `failed`
-   * so startup recovery does not replay it indefinitely. Failures are logged with
+   * R7 #3 & R8 #4: Marks a superseded Weixin inbound message as terminal `failed`
+   * and persists the failure reason via the contract §6.4 `raw_payload_patch` field
+   * (no invented top-level field on I-7 inbound progress). Failures are logged with
    * whitelisted error fields only.
    */
   private async markWeixinInboundSuperseded(
@@ -478,8 +479,10 @@ export class ChannelGatewayOrchestrator {
         platform,
         message_id: messageId,
         status: "failed",
-        error_code: "weixin_bot_generation_superseded",
         fallback_pending: false,
+        raw_payload_patch: {
+          error_code: "weixin_bot_generation_superseded",
+        },
       });
     } catch (err) {
       if (isStaleGatewayEpochError(err)) {
@@ -618,10 +621,8 @@ export class ChannelGatewayOrchestrator {
     });
 
     // D16 one-time reply (e.g. conflict auto-unbind) — send directly with inbound context_token without preflight.
+    // R8 #1: Do not blindly cancel attachments here; `dispatchOneTimeWeixinReply` triggers snapshot sync.
     if (event.platform === "weixin" && resolved.one_time_weixin_reply) {
-      this.cancelInboundUploadsForAccount(
-        event.weixinAccountId ?? resolved.weixin_account_id,
-      );
       await this.dispatchOneTimeWeixinReply(
         resolved.one_time_weixin_reply,
         `onetime:${event.platform}:${event.messageId}`,
@@ -1395,8 +1396,8 @@ export class ChannelGatewayOrchestrator {
 
     // Weixin `/unbind` invokes I-2 directly with all 4 required identity fields (Batch A contract)
     // and delivers D16 `one_time_weixin_reply` directly with inbound `context_token`.
+    // R8 #1: Do NOT cancel in-flight attachments before I-2 succeeds; let snapshot sync drive cancellation.
     if (event.platform === "weixin" && parsedCmd.kind === "unbind") {
-      this.cancelInboundUploadsForAccount(event.weixinAccountId);
       const res = await this.backend.consumeBindCode({
         action: "unbind",
         platform: "weixin",
@@ -1923,8 +1924,8 @@ export class ChannelGatewayOrchestrator {
       this.isNativeInteractionEvent(event.rawPayload, cmdRes);
 
     // D16 one-time reply on session command (e.g. conflict auto-unbind).
+    // R8 #1: Let snapshot sync (triggered inside `dispatchOneTimeWeixinReply`) drive cancellation.
     if (event.platform === "weixin" && cmdRes.one_time_weixin_reply) {
-      this.cancelInboundUploadsForAccount(event.weixinAccountId);
       await this.dispatchOneTimeWeixinReply(
         cmdRes.one_time_weixin_reply,
         `onetime:${event.platform}:${event.messageId}:cmd_${cmd}`,
@@ -2666,8 +2667,12 @@ export class ChannelGatewayOrchestrator {
           message_id: event.messageId,
           uploaded_attachments: [...uploaded],
         });
+        // R8 #3 (Codex High #3): Re-check cancellation after I-7 progress save returns
+        // so a rotation arriving during the final progress write never returns `ok: true`.
+        assertWeixinAttachmentTaskActive("post_progress_save");
       }
 
+      assertWeixinAttachmentTaskActive("attachment_complete");
       return { ok: true, uploaded };
     } catch (err) {
       if (

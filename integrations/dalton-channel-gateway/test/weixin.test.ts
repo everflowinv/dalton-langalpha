@@ -6269,13 +6269,15 @@ describe("Round 7 Fixes (Codex R6 + Grok R6)", () => {
       // R7 #4: ONLY 1 I-1 registration (no recovery replay)
       expect(h1.backend.registerAndResolveInbound).toHaveBeenCalledTimes(1);
       expect(h1.backend.uploadWorkspaceFile).not.toHaveBeenCalled();
-      // R7 #3: terminal failed written with error_code
+      // R7 #3 & R8 #4: terminal failed written with reason persisted via contract §6.4 `raw_payload_patch`
       expect(h1.backend.updateInboundProgress).toHaveBeenCalledWith(
         expect.objectContaining({
           platform: "weixin",
           message_id: "bot_1:m_sup_ws_err",
           status: "failed",
-          error_code: "weixin_bot_generation_superseded",
+          raw_payload_patch: expect.objectContaining({
+            error_code: "weixin_bot_generation_superseded",
+          }),
         }),
       );
     } finally {
@@ -6430,7 +6432,9 @@ describe("Round 7 Fixes (Codex R6 + Grok R6)", () => {
           platform: "weixin",
           message_id: "bot_1:m_recover_sup",
           status: "failed",
-          error_code: "weixin_bot_generation_superseded",
+          raw_payload_patch: expect.objectContaining({
+            error_code: "weixin_bot_generation_superseded",
+          }),
         }),
       );
     } finally {
@@ -7008,5 +7012,616 @@ describe("Round 7 Fixes (Codex R6 + Grok R6)", () => {
     } finally {
       await h.cleanup();
     }
+  });
+});
+
+describe("Round 8 Fixes (Codex R7 + Grok R7)", () => {
+  it("R8 #1: failed old-gen /unbind does NOT cancel active-gen attachment or write terminal failed", async () => {
+    const h = createTestHarness();
+    const wsEntered = defer<void>();
+    const releaseWs = defer<void>();
+    const uploadDone = defer<void>();
+
+    try {
+      h.weixinAdapter.setAttachment("att_r8_unbind", {
+        content: Buffer.from("current-gen-data"),
+        filename: "keep.pdf",
+        mimeType: "application/pdf",
+      });
+      vi.mocked(h.backend.registerAndResolveInbound).mockResolvedValueOnce({
+        existing_status: null,
+        linked: true,
+        allowed: true,
+        dalton_user_id: USER_ID,
+        workspace_id: HOME_WS_ID,
+        workspace_status: "stopped",
+        workspace_owner_id: USER_ID,
+        thread_id: "thread_r8_unbind",
+        external_thread_id: null,
+        request_key: "rk_r8_unbind",
+        retry_request_key: null,
+        resubmitted_request_key: null,
+        steered_into_run_id: null,
+        run_id: null,
+        turn_index: null,
+        generation: 2,
+        fallback_pending: false,
+        sent_to_current_count: 0,
+        uploaded_attachments: [],
+        raw_payload: {},
+        pending_interrupt: null,
+      });
+      vi.mocked(h.backend.startWorkspace).mockImplementationOnce(async () => {
+        wsEntered.resolve();
+        await releaseWs.promise;
+        return { status: "running" };
+      });
+      vi.mocked(h.backend.uploadWorkspaceFile).mockImplementationOnce(async () => {
+        uploadDone.resolve();
+      });
+
+      // Gen-2 attachment starts waiting on startWorkspace
+      await h.weixinAdapter.emitInbound({
+        ...weixinDm("bot_2:m_gen2_keep", "keep my file"),
+        weixinAccountId: "wx_acc_1",
+        weixinBotId: "bot_2",
+        weixinBotGeneration: 2,
+        attachments: [
+          { id: "att_r8_unbind", filename: "keep.pdf", mimeType: "application/pdf" },
+        ],
+      });
+      await waitBounded(wsEntered.promise, "gen-2 startWorkspace entered");
+
+      // Old-gen /unbind arrives and I-2 consumeBindCode fails with 503
+      vi.mocked(h.backend.consumeBindCode).mockRejectedValueOnce(
+        new BackendHttpError("roster unavailable", 503, {
+          code: "roster_lookup_error",
+        }),
+      );
+      await expect(
+        h.weixinAdapter.emitInbound({
+          ...weixinDm("bot_1:m_old_unbind", "/unbind"),
+          weixinAccountId: "wx_acc_1",
+          weixinBotId: "bot_1",
+          weixinBotGeneration: 1,
+        }),
+      ).rejects.toBeInstanceOf(BackendHttpError);
+
+      // Release startWorkspace: gen-2 attachment MUST complete upload and NOT be marked terminal failed!
+      releaseWs.resolve();
+      await waitBounded(uploadDone.promise, "gen-2 attachment uploaded after failed /unbind");
+      await new Promise((r) => setTimeout(r, 25));
+
+      expect(h.backend.uploadWorkspaceFile).toHaveBeenCalledTimes(1);
+      const failedUpdates = vi
+        .mocked(h.backend.updateInboundProgress)
+        .mock.calls.filter(([u]) => u.status === "failed");
+      expect(failedUpdates).toHaveLength(0);
+    } finally {
+      releaseWs.resolve();
+      await h.cleanup();
+    }
+  });
+
+  it("R8 #2: single snapshot removing A (hung monitor) and rotating B invalidates B's old generation BEFORE A's monitor exits", async () => {
+    const backend = createMockBackend();
+    const lease = new GatewayLeaseManager({
+      backend,
+      ttlSeconds: 45,
+      heartbeatIntervalMs: 60_000,
+    });
+    const pollAEntered = defer<void>();
+    const releasePollA = defer<void>();
+    const pollBEntered = defer<void>();
+
+    const wxAdapter = new WeixinChannelAdapter({
+      backend,
+      leaseManager: lease,
+      staggerDelayMs: 0,
+      staggerJitterMs: 0,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      allowedCdnDomains: ["novac2c.cdn.weixin.qq.com"],
+      checkResolvedIps: false,
+      fetchImpl: async (_url, init) => {
+        const auth = new Headers(init?.headers).get("Authorization") ?? "";
+        if (auth.includes("tok_A")) {
+          pollAEntered.resolve();
+          // Intentionally ignore abort so stopAccountMonitor(A) stays suspended
+          await releasePollA.promise;
+          throw new Error("monitor A finally exited");
+        }
+        if (auth.includes("tok_B_v1")) {
+          pollBEntered.resolve();
+        }
+        return await new Promise((_res, rej) => {
+          init?.signal?.addEventListener("abort", () => rej(new Error("aborted")), {
+            once: true,
+          });
+        });
+      },
+    });
+
+    vi.mocked(backend.reconcileWeixinAccounts)
+      .mockResolvedValueOnce({
+        changed: true,
+        enabled: true,
+        allow_external: false,
+        max_concurrent_accounts: 50,
+        accounts_revision: 1,
+        accounts: [
+          makeAccountSnapshot({
+            account_id: "acc_A",
+            ilink_bot_id: "bot_A",
+            bot_token: "tok_A",
+            bot_generation: 1,
+          }),
+          makeAccountSnapshot({
+            account_id: "acc_B",
+            ilink_bot_id: "bot_B_v1",
+            bot_token: "tok_B_v1",
+            bot_generation: 1,
+          }),
+        ],
+      })
+      .mockResolvedValueOnce({
+        changed: true,
+        enabled: true,
+        allow_external: false,
+        max_concurrent_accounts: 50,
+        accounts_revision: 2,
+        accounts: [
+          // acc_A removed; acc_B rotated to gen 2
+          makeAccountSnapshot({
+            account_id: "acc_B",
+            ilink_bot_id: "bot_B_v2",
+            bot_token: "tok_B_v2",
+            bot_generation: 2,
+          }),
+        ],
+      });
+
+    const app = createGatewayApp({
+      config: loadConfig({
+        GATEWAY_HOST: "127.0.0.1",
+        GATEWAY_PORT: "0",
+        INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+        DALTON_WEIXIN_ENABLED: "true",
+      }),
+      backend,
+      adapters: new Map<ChannelPlatform, WeixinChannelAdapter>([
+        ["weixin", wxAdapter],
+      ]),
+      leaseManager: lease,
+      enableLease: true,
+    });
+
+    try {
+      await app.start();
+      await waitBounded(pollAEntered.promise, "monitor A entered");
+      await waitBounded(pollBEntered.promise, "monitor B entered");
+
+      // Apply snapshot 2: A's monitor is hung, so reconcileNow suspends awaiting stopAccountMonitor(A)
+      const reconcileTask = wxAdapter.reconcileNow("remove_A_rotate_B");
+      await new Promise((r) => setTimeout(r, 20));
+
+      // BEFORE A's monitor exits, B's old gen-1 MUST already be invalidated!
+      const oldBEvent: InboundChannelEvent = {
+        ...weixinDm("bot_B_v1:m_stale_b", "stale B attachment"),
+        weixinAccountId: "acc_B",
+        weixinBotId: "bot_B_v1",
+        weixinBotGeneration: 1,
+        attachments: [
+          { id: "att_b_stale", filename: "b_old.pdf", mimeType: "application/pdf" },
+        ],
+      };
+      expect(wxAdapter.isWeixinAccountGenerationActive(oldBEvent)).toBe(false);
+
+      vi.mocked(backend.registerAndResolveInbound).mockResolvedValueOnce({
+        existing_status: null,
+        linked: true,
+        allowed: true,
+        dalton_user_id: USER_ID,
+        workspace_id: HOME_WS_ID,
+        workspace_status: "running",
+        workspace_owner_id: USER_ID,
+        thread_id: "thread_b_stale",
+        external_thread_id: null,
+        request_key: "rk_b_stale",
+        retry_request_key: null,
+        resubmitted_request_key: null,
+        steered_into_run_id: null,
+        run_id: null,
+        turn_index: null,
+        generation: 1,
+        fallback_pending: false,
+        sent_to_current_count: 0,
+        uploaded_attachments: [],
+        raw_payload: {},
+        pending_interrupt: null,
+      });
+
+      await app.orchestrator.handleInboundEvent(oldBEvent);
+      await new Promise((r) => setTimeout(r, 25));
+      expect(backend.uploadWorkspaceFile).not.toHaveBeenCalled();
+
+      releasePollA.resolve();
+      await waitBounded(reconcileTask, "reconcile finished after monitor A exited");
+      expect(
+        wxAdapter.isWeixinAccountGenerationActive({
+          weixinAccountId: "acc_B",
+          weixinBotId: "bot_B_v2",
+          weixinBotGeneration: 2,
+        }),
+      ).toBe(true);
+    } finally {
+      releasePollA.resolve();
+      await app.stop();
+    }
+  });
+
+  it("R8 #3 & #4: cancellation during final attachment I-7 progress write rejects ok:true, blocks turn dispatch, and persists reason in raw_payload_patch", async () => {
+    const h = createTestHarness();
+    const progressEntered = defer<void>();
+    const releaseProgress = defer<void>();
+    const terminalFailedWritten = defer<Record<string, unknown>>();
+
+    try {
+      h.weixinAdapter.setAttachment("att_r8_prog", {
+        content: Buffer.from("last-file"),
+        filename: "final.pdf",
+        mimeType: "application/pdf",
+      });
+      vi.mocked(h.backend.registerAndResolveInbound).mockResolvedValueOnce({
+        existing_status: null,
+        linked: true,
+        allowed: true,
+        dalton_user_id: USER_ID,
+        workspace_id: HOME_WS_ID,
+        workspace_status: "running",
+        workspace_owner_id: USER_ID,
+        thread_id: "thread_r8_prog",
+        external_thread_id: null,
+        request_key: "rk_r8_prog",
+        retry_request_key: null,
+        resubmitted_request_key: null,
+        steered_into_run_id: null,
+        run_id: null,
+        turn_index: null,
+        generation: 1,
+        fallback_pending: false,
+        sent_to_current_count: 0,
+        uploaded_attachments: [],
+        raw_payload: {},
+        pending_interrupt: null,
+      });
+
+      // Hold the attachment I-7 updateInboundProgress open so we can cancel while it is in flight
+      vi.mocked(h.backend.updateInboundProgress).mockImplementation(async (req) => {
+        if (req.uploaded_attachments && req.uploaded_attachments.length > 0) {
+          progressEntered.resolve();
+          await releaseProgress.promise;
+        }
+        if (req.status === "failed") {
+          terminalFailedWritten.resolve(req as unknown as Record<string, unknown>);
+        }
+        return {
+          ok: true,
+          run_id: null,
+          has_in_flight_current_text: false,
+          has_unknown_current_text: false,
+          has_in_flight_or_unknown_current_text: false,
+          sent_to_current_count: 0,
+          session_is_current_for_interrupt: null,
+        };
+      });
+
+      await h.weixinAdapter.emitInbound({
+        ...weixinDm("bot_1:m_cancel_in_progress_save", "analyze final file"),
+        weixinAccountId: "wx_acc_1",
+        weixinBotId: "bot_1",
+        weixinBotGeneration: 1,
+        attachments: [
+          { id: "att_r8_prog", filename: "final.pdf", mimeType: "application/pdf" },
+        ],
+      });
+      await waitBounded(progressEntered.promise, "final I-7 uploaded_attachments entered");
+
+      // Trigger generation rotation while final I-7 save is in flight
+      h.weixinAdapter.emitWeixinAccountInvalidated({
+        accountId: "wx_acc_1",
+        reason: "generation_or_credentials_changed",
+        activeBotGeneration: 2,
+      });
+      releaseProgress.resolve();
+
+      const terminalReq = await waitBounded(
+        terminalFailedWritten.promise,
+        "superseded inbound marked failed after progress save",
+      );
+      // Turn MUST NOT be dispatched on superseded generation!
+      expect(h.backend.createThreadMessages).not.toHaveBeenCalled();
+      // R8 #4: Failure reason persisted via contract §6.4 `raw_payload_patch` (no unlisted top-level `error_code`)
+      expect(terminalReq).toMatchObject({
+        platform: "weixin",
+        message_id: "bot_1:m_cancel_in_progress_save",
+        status: "failed",
+        fallback_pending: false,
+        raw_payload_patch: {
+          error_code: "weixin_bot_generation_superseded",
+        },
+      });
+      expect("error_code" in terminalReq).toBe(false);
+    } finally {
+      releaseProgress.resolve();
+      await h.cleanup();
+    }
+  });
+
+  it("R8 #5: reconcile enforces full §2.1 account schema and rejects malformed snapshots without deleting active accounts or cancelling uploads", async () => {
+    const validSnap = makeAccountSnapshot({
+      account_id: "acc_keep_r8",
+      ilink_bot_id: "bot_keep",
+      bot_token: "tok_keep",
+      bot_generation: 1,
+    });
+    const invalidEntries: unknown[] = [
+      // Missing `ilink_user_id`
+      (() => {
+        const { ilink_user_id: _omit, ...rest } = validSnap;
+        return rest;
+      })(),
+      // Missing `cdn_base_url`
+      (() => {
+        const { cdn_base_url: _omit, ...rest } = validSnap;
+        return rest;
+      })(),
+      // `updated_at` is an object instead of string | null
+      { ...validSnap, updated_at: { bad: true } },
+      // `status` not in contract §2.1 enum ("active" | "pending_verification")
+      { ...validSnap, status: "expired" },
+      { ...validSnap, status: "typo_active" },
+    ];
+
+    let idx = 0;
+    const rawHttp = new HttpBackendClient({
+      baseUrl: "http://127.0.0.1:8000",
+      serviceToken: TEST_SERVICE_TOKEN,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            changed: true,
+            enabled: true,
+            allow_external: false,
+            max_concurrent_accounts: 50,
+            accounts_revision: 2,
+            accounts: [invalidEntries[idx++]],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    });
+    rawHttp.setGatewayEpoch(1);
+
+    for (let i = 0; i < invalidEntries.length; i += 1) {
+      await expect(rawHttp.reconcileWeixinAccounts(1)).rejects.toMatchObject({
+        status: 502,
+        body: expect.objectContaining({ code: "invalid_reconcile_snapshot" }),
+      });
+    }
+
+    // Adapter with an already-active account: receiving a bad-status snapshot MUST reject before
+    // applyAccountSnapshots, retaining the active account and NOT firing invalidation!
+    const backend = createMockBackend();
+    vi.mocked(backend.reconcileWeixinAccounts)
+      .mockResolvedValueOnce({
+        changed: true,
+        enabled: true,
+        allow_external: false,
+        max_concurrent_accounts: 50,
+        accounts_revision: 1,
+        accounts: [validSnap],
+      })
+      .mockResolvedValueOnce({
+        changed: true,
+        enabled: true,
+        allow_external: false,
+        max_concurrent_accounts: 50,
+        accounts_revision: 2,
+        accounts: [{ ...validSnap, status: "typo_status" }],
+      });
+
+    const invalidations: Array<{ accountId: string; reason: string }> = [];
+    const wxAdapter = new WeixinChannelAdapter({
+      backend,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+    });
+    wxAdapter.onWeixinAccountInvalidated((info) => invalidations.push(info));
+
+    await wxAdapter.prepareStartupSnapshot();
+    expect(wxAdapter.getManagedAccounts()).toHaveLength(1);
+
+    await wxAdapter.reconcileNow("bad_status_snapshot");
+    expect(wxAdapter.getManagedAccounts()).toHaveLength(1);
+    expect(wxAdapter.getManagedAccounts()[0]?.accountId).toBe("acc_keep_r8");
+    expect(invalidations).toHaveLength(0);
+  });
+
+  it("R8 #6: initial changed=false does NOT mark ready, setBackendClient resets hasAppliedSnapshot, and startup 404 marks ready", async () => {
+    // 1) Initial reconcile returning changed=false is rejected and keeps ready=false until changed=true arrives
+    const backend = createMockBackend();
+    let calls = 0;
+    vi.mocked(backend.reconcileWeixinAccounts).mockImplementation(async (sinceRev) => {
+      calls += 1;
+      expect(sinceRev).toBeNull();
+      if (calls === 1) {
+        return {
+          changed: false,
+          enabled: true,
+          allow_external: false,
+          max_concurrent_accounts: 50,
+          accounts_revision: 5,
+          accounts: [],
+        };
+      }
+      return {
+        changed: true,
+        enabled: true,
+        allow_external: false,
+        max_concurrent_accounts: 50,
+        accounts_revision: 5,
+        accounts: [],
+      };
+    });
+
+    const adapter = new WeixinChannelAdapter({
+      backend,
+      startupSnapshotRetryMs: 10,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+    });
+    // Single reconcile pass with changed=false must leave hasAppliedStartupSnapshot === false
+    await adapter.reconcileNow("initial_changed_false");
+    expect(adapter.hasAppliedStartupSnapshot()).toBe(false);
+
+    // prepareStartupSnapshot retries with since_revision=null and succeeds on changed=true
+    await adapter.prepareStartupSnapshot();
+    expect(calls).toBe(2);
+    expect(adapter.hasAppliedStartupSnapshot()).toBe(true);
+
+    // 2) Adapter constructed with standalone local token resets hasAppliedSnapshot when setBackendClient is called
+    const localAdapter = new WeixinChannelAdapter({
+      botToken: "local_tok",
+      ilinkBotId: "local_bot",
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+    });
+    expect(localAdapter.hasAppliedStartupSnapshot()).toBe(true);
+
+    const wiredBackend = createMockBackend();
+    localAdapter.setBackendClient(wiredBackend);
+    expect(localAdapter.hasAppliedStartupSnapshot()).toBe(false);
+    await localAdapter.prepareStartupSnapshot();
+    expect(localAdapter.hasAppliedStartupSnapshot()).toBe(true);
+
+    // 3) Startup 404 (Weixin routes unmounted in deployment) marks hasAppliedStartupSnapshot=true
+    const backend404 = createMockBackend();
+    vi.mocked(backend404.reconcileWeixinAccounts).mockRejectedValueOnce(
+      new BackendHttpError("Not found", 404, { detail: "Not found" }),
+    );
+    const adapter404 = new WeixinChannelAdapter({
+      backend: backend404,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+    });
+    await adapter404.prepareStartupSnapshot();
+    expect(adapter404.hasAppliedStartupSnapshot()).toBe(true);
+  });
+
+  it("R8 #7: confirmed QR session returns wait when bot_generation missing, failure shape on expired/disabled, and connected only on active/pending_verification", async () => {
+    const qrBackend = createMockBackend();
+    const qrMgr = new WeixinQrLoginManager({
+      backend: qrBackend,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+    });
+
+    // 1) Confirmed session missing bot_generation -> retryable wait, connected: false
+    vi.mocked(qrBackend.getWeixinLoginSession).mockResolvedValueOnce({
+      session_key: "sess_no_gen",
+      user_id: USER_ID,
+      status: "confirmed",
+      login_version: 2,
+      expected_bot_generation: 1,
+      target_account_id: "wx_acc_nogen",
+      connected: true,
+      already_connected: false,
+      confirmed_result: {
+        account_id: "wx_acc_nogen",
+        ilink_bot_id: "bot_nogen",
+      },
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const resNoGen = await qrMgr.waitQrLogin(USER_ID, "sess_no_gen");
+    expect(resNoGen.status).toBe("wait");
+    expect(resNoGen.connected).toBe(false);
+    expect(qrBackend.getWeixinAccountDetail).not.toHaveBeenCalled();
+
+    const makeConfirmedWithGen = (sessionKey: string): WeixinLoginSessionGetResponse => ({
+      session_key: sessionKey,
+      user_id: USER_ID,
+      status: "confirmed",
+      login_version: 2,
+      expected_bot_generation: 1,
+      target_account_id: "wx_acc_r8_qr",
+      connected: true,
+      already_connected: false,
+      confirmed_result: {
+        account_id: "wx_acc_r8_qr",
+        ilink_bot_id: "bot_r8",
+        bot_generation: 2,
+        accounts_revision: 11,
+      },
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    });
+
+    // 2) Detail matches generation=2 but status is "expired" -> failure shape (`expired`), connected: false
+    vi.mocked(qrBackend.getWeixinLoginSession).mockResolvedValueOnce(
+      makeConfirmedWithGen("sess_detail_expired"),
+    );
+    vi.mocked(qrBackend.getWeixinAccountDetail).mockResolvedValueOnce({
+      account_id: "wx_acc_r8_qr",
+      user_id: USER_ID,
+      ilink_bot_id: "bot_r8",
+      ilink_user_id: null,
+      bot_token: "tok_exp",
+      base_url: "https://ilinkai.weixin.qq.com",
+      bot_generation: 2,
+      status: "expired",
+      get_updates_buf: "",
+    });
+    const resExpired = await qrMgr.waitQrLogin(USER_ID, "sess_detail_expired");
+    expect(resExpired.status).toBe("expired");
+    expect(resExpired.connected).toBe(false);
+
+    // 3) Detail matches generation=2 but status is "disabled" -> failure shape (`superseded`, revoked: true), connected: false
+    vi.mocked(qrBackend.getWeixinLoginSession).mockResolvedValueOnce(
+      makeConfirmedWithGen("sess_detail_disabled"),
+    );
+    vi.mocked(qrBackend.getWeixinAccountDetail).mockResolvedValueOnce({
+      account_id: "wx_acc_r8_qr",
+      user_id: USER_ID,
+      ilink_bot_id: "bot_r8",
+      ilink_user_id: null,
+      bot_token: "tok_dis",
+      base_url: "https://ilinkai.weixin.qq.com",
+      bot_generation: 2,
+      status: "disabled",
+      get_updates_buf: "",
+    });
+    const resDisabled = await qrMgr.waitQrLogin(USER_ID, "sess_detail_disabled");
+    expect(resDisabled.status).toBe("superseded");
+    expect(resDisabled.connected).toBe(false);
+    expect(resDisabled.revoked).toBe(true);
+
+    // 4) Detail matches generation=2 and status is "active" -> confirmed, connected: true, pending_verification: false
+    vi.mocked(qrBackend.getWeixinLoginSession).mockResolvedValueOnce(
+      makeConfirmedWithGen("sess_detail_active"),
+    );
+    vi.mocked(qrBackend.getWeixinAccountDetail).mockResolvedValueOnce({
+      account_id: "wx_acc_r8_qr",
+      user_id: USER_ID,
+      ilink_bot_id: "bot_r8",
+      ilink_user_id: "wx_alice",
+      bot_token: "tok_act",
+      base_url: "https://ilinkai.weixin.qq.com",
+      bot_generation: 2,
+      status: "active",
+      get_updates_buf: "",
+    });
+    const resActive = await qrMgr.waitQrLogin(USER_ID, "sess_detail_active");
+    expect(resActive.status).toBe("confirmed");
+    expect(resActive.connected).toBe(true);
+    expect(resActive.account_status).toBe("active");
+    expect(resActive.pending_verification).toBe(false);
   });
 });

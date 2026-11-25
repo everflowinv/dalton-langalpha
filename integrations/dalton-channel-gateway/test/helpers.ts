@@ -929,8 +929,10 @@ export function createMockBackend(): MockBackend {
     ),
 
     reconcileWeixinAccounts: vi.fn(
-      async (): Promise<WeixinAccountsReconcileResponse> => ({
-        changed: false,
+      async (
+        sinceRevision?: number | null,
+      ): Promise<WeixinAccountsReconcileResponse> => ({
+        changed: sinceRevision !== 1,
         enabled: true,
         allow_external: false,
         max_concurrent_accounts: 50,

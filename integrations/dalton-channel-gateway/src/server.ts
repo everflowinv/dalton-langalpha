@@ -360,6 +360,9 @@ export function createGatewayApp(options: {
         return;
       }
 
+      // R7 #6 & R8 #6: `ready` is true only when shutdown has not begun, write routes are open,
+      // and any backend-attached Weixin adapter has applied a real initial snapshot (or confirmed
+      // HTTP 404 meaning Weixin routes are unmounted in this deployment).
       const isGatewayReady = (): boolean => {
         if (stopInProgress) {
           return false;

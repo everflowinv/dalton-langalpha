@@ -153,6 +153,8 @@ export interface ManagedWeixinAccount {
   botGeneration: number;
   /** Latest bot_generation observed in an authoritative reconcile snapshot (updated before awaiting old monitor stop, R7 #2). */
   latestSnapshotGeneration: number;
+  /** True while credentials/botId/baseUrl changed at the same generation and old monitor is still stopping (R8 #2). */
+  credentialsInvalidated?: boolean;
   getUpdatesBuf: string;
   status: string;
   monitorController: AbortController | null;
@@ -298,7 +300,14 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   }
 
   setBackendClient(backend: BackendClient): void {
+    const backendChanged = this.backend !== backend;
     this.backend = backend;
+    if (backendChanged) {
+      // R8 #6 (Codex Medium #6): Attaching a backend to a standalone adapter (or switching backends)
+      // invalidates any prior snapshot; the adapter MUST fetch a real backend reconcile snapshot before ready.
+      this.hasAppliedSnapshot = false;
+      this.lastRevision = null;
+    }
     this.initQrManager(backend);
   }
 
@@ -905,10 +914,12 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           current.ilinkBotId === capturedBotId
         ) {
           current.status = "expired";
-          this.accountInvalidatedHandler?.({
-            accountId: capturedAccountId,
-            reason: "session_expired",
-          });
+          if (!this.backend) {
+            this.accountInvalidatedHandler?.({
+              accountId: capturedAccountId,
+              reason: "session_expired",
+            });
+          }
         }
       },
       onRateLimited: (err) =>
@@ -1063,8 +1074,14 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
       this.backendEnabled = true;
       if (!resp.changed) {
+        // R8 #6 (Codex Medium #6): An initial reconcile (no prior local revision) MUST NOT
+        // accept `changed: false` as a real snapshot; fail so startup retries for a full snapshot.
         if (this.lastRevision === null) {
-          this.lastRevision = resp.accounts_revision;
+          throw new BackendHttpError(
+            "Weixin initial reconcile returned changed=false without a prior snapshot",
+            502,
+            { code: "invalid_reconcile_snapshot" },
+          );
         }
         this.hasAppliedSnapshot = true;
         // Decision #12: self-heal any pollable monitor whose coroutine exited
@@ -1090,7 +1107,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         return;
       }
       if (err instanceof BackendHttpError && err.status === 404) {
-        // Layer 2 disabled: backend Weixin routes unmounted -> stop all pollers, probe every 5m.
+        // Layer 2 disabled: backend Weixin routes are unmounted in this deployment.
+        // Per contract §0 / R8 #6, startup 404 counts as snapshot-ready (`hasAppliedSnapshot = true`)
+        // so `/health` reports `ready: true` for non-Weixin deployments while probing every 5m.
         this.backendNotFound404 = true;
         this.backendEnabled = false;
         this.lastRevision = null;
@@ -1185,9 +1204,13 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     const pollable = pollableRaw.slice(0, this.maxConcurrentAccounts);
     const desiredIds = new Set(pollable.map((s) => s.account_id));
 
-    // 1. Stop & remove accounts no longer in the pollable snapshot.
-    // Decision #10 & R7 #1: mark inactive, abort in-flight, and cancel ALL attachment tasks
-    // for the removed account BEFORE awaiting monitor shutdown.
+    // =========================================================================
+    // Phase 1 (100% SYNCHRONOUS, BEFORE ANY `await`): R8 #2 (Codex High #2)
+    // Compute the full snapshot diff upfront and immediately invalidate EVERY
+    // removed AND rotated account in the snapshot so a hung monitor on account A
+    // can never delay invalidation of account B.
+    // =========================================================================
+    const removedEntries: Array<[string, ManagedWeixinAccount]> = [];
     for (const [accountId, existing] of [...this.accounts.entries()]) {
       if (!desiredIds.has(accountId)) {
         existing.status = "inactive";
@@ -1196,13 +1219,56 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           accountId,
           reason: "removed_or_inactive",
         });
-        await this.stopAccountMonitor(existing);
-        this.accounts.delete(accountId);
-        this.clearTypingCacheForAccount(accountId);
+        removedEntries.push([accountId, existing]);
       }
     }
 
-    // 2. Diff remaining / new accounts and collect those needing monitor start.
+    const preInvalidatedRotatedIds = new Set<string>();
+    const defaultBaseTrimmed = (
+      this.opts.baseUrl || ILINK_DEFAULT_BASE_URL
+    )
+      .trim()
+      .replace(/\/+$/, "");
+    for (const snap of pollable) {
+      const existing = this.accounts.get(snap.account_id);
+      if (!existing) continue;
+      const prelimBase = (snap.base_url?.trim() || defaultBaseTrimmed)
+        .trim()
+        .replace(/\/+$/, "");
+      const existingBase = existing.baseUrl.trim().replace(/\/+$/, "");
+      const syncCredsChanged =
+        existing.ilinkBotId !== snap.ilink_bot_id ||
+        existing.botGeneration !== snap.bot_generation ||
+        existing.botToken !== snap.bot_token ||
+        existingBase !== prelimBase;
+      if (syncCredsChanged) {
+        existing.latestSnapshotGeneration = Math.max(
+          existing.latestSnapshotGeneration,
+          snap.bot_generation,
+        );
+        if (snap.bot_generation <= existing.botGeneration) {
+          existing.credentialsInvalidated = true;
+        }
+        this.abortAccountInFlight(snap.account_id);
+        this.accountInvalidatedHandler?.({
+          accountId: snap.account_id,
+          reason: "generation_or_credentials_changed",
+          activeBotGeneration: snap.bot_generation,
+        });
+        preInvalidatedRotatedIds.add(snap.account_id);
+      }
+    }
+
+    // =========================================================================
+    // Phase 2 (ASYNC): Stop removed/rotated monitors, resolve base URLs, and
+    // install new credentials.
+    // =========================================================================
+    for (const [accountId, existing] of removedEntries) {
+      await this.stopAccountMonitor(existing);
+      this.accounts.delete(accountId);
+      this.clearTypingCacheForAccount(accountId);
+    }
+
     const toStart: ManagedWeixinAccount[] = [];
     for (const snap of pollable) {
       if (startMonitors && !this.started) return;
@@ -1217,25 +1283,28 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       const existing = this.accounts.get(snap.account_id);
       if (existing) {
         const credentialsChanged =
+          preInvalidatedRotatedIds.has(snap.account_id) ||
           existing.ilinkBotId !== snap.ilink_bot_id ||
           existing.botGeneration !== snap.bot_generation ||
           existing.botToken !== snap.bot_token ||
           existing.baseUrl !== safeBaseUrl;
 
         if (credentialsChanged) {
-          // R7 #2 (Codex High #1): Immediately mark old generation superseded via
-          // `latestSnapshotGeneration` and notify attachment cancellation BEFORE awaiting
-          // the old monitor's exit; replace credentials/botGeneration after monitor stops.
-          existing.latestSnapshotGeneration = Math.max(
-            existing.latestSnapshotGeneration,
-            snap.bot_generation,
-          );
-          this.abortAccountInFlight(snap.account_id);
-          this.accountInvalidatedHandler?.({
-            accountId: snap.account_id,
-            reason: "generation_or_credentials_changed",
-            activeBotGeneration: snap.bot_generation,
-          });
+          if (!preInvalidatedRotatedIds.has(snap.account_id)) {
+            existing.latestSnapshotGeneration = Math.max(
+              existing.latestSnapshotGeneration,
+              snap.bot_generation,
+            );
+            if (snap.bot_generation <= existing.botGeneration) {
+              existing.credentialsInvalidated = true;
+            }
+            this.abortAccountInFlight(snap.account_id);
+            this.accountInvalidatedHandler?.({
+              accountId: snap.account_id,
+              reason: "generation_or_credentials_changed",
+              activeBotGeneration: snap.bot_generation,
+            });
+          }
           await this.stopAccountMonitor(existing);
           this.clearTypingCacheForAccount(snap.account_id);
           existing.userId = snap.user_id;
@@ -1246,6 +1315,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           existing.cdnBaseUrl = cdnBaseUrl;
           existing.botGeneration = snap.bot_generation;
           existing.latestSnapshotGeneration = snap.bot_generation;
+          existing.credentialsInvalidated = false;
           existing.getUpdatesBuf = snap.get_updates_buf ?? "";
           existing.status = snap.status;
           toStart.push(existing);
@@ -1276,6 +1346,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           cdnBaseUrl,
           botGeneration: snap.bot_generation,
           latestSnapshotGeneration: snap.bot_generation,
+          credentialsInvalidated: false,
           getUpdatesBuf: snap.get_updates_buf ?? "",
           status: snap.status,
           monitorController: null,
@@ -1463,23 +1534,29 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     botGeneration: number,
     err?: WeixinApiError,
   ): Promise<void> {
-    const existing = this.accounts.get(accountId);
-    if (
-      existing &&
-      existing.ilinkBotId === ilinkBotId &&
-      existing.botGeneration === botGeneration
-    ) {
-      this.abortAccountInFlight(accountId);
-      existing.status = "expired";
-      existing.monitorController?.abort();
-      this.accountInvalidatedHandler?.({
-        accountId,
-        reason: "session_expired",
-      });
-    }
-    if (!this.backend || !accountId || !ilinkBotId) {
+    if (!this.backend) {
+      // Standalone mode without backend reconcile: invalidate locally.
+      const existing = this.accounts.get(accountId);
+      if (
+        existing &&
+        existing.ilinkBotId === ilinkBotId &&
+        existing.botGeneration === botGeneration
+      ) {
+        this.abortAccountInFlight(accountId);
+        existing.status = "expired";
+        existing.monitorController?.abort();
+        this.accountInvalidatedHandler?.({
+          accountId,
+          reason: "session_expired",
+        });
+      }
       return;
     }
+    if (!accountId || !ilinkBotId) {
+      return;
+    }
+    // R8 #1: Report session expiry to backend and trigger snapshot sync;
+    // do NOT blindly cancel attachments before authoritative snapshot confirms removal/rotation.
     try {
       const statusRes = await this.backend.updateWeixinAccountStatus(accountId, {
         action: "mark_session_expired",
@@ -1487,15 +1564,18 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         expected_ilink_bot_id: ilinkBotId,
         error_code: String(err?.errcode ?? err?.ret ?? -14),
       });
-      if (statusRes?.stale_generation) {
-        // R7 #1: `stale_generation` does not tell us the active generation; only sync snapshot.
-        void this.triggerAccountsSync(undefined, "status_stale_generation");
-      }
+      void this.triggerAccountsSync(
+        statusRes?.accounts_revision ?? undefined,
+        statusRes?.stale_generation
+          ? "status_stale_generation"
+          : "session_expired",
+      );
     } catch (statusErr) {
       if (isStaleGatewayEpochError(statusErr)) {
         this.leaseManager?.notifyLeaseLost("send_status_stale_epoch", statusErr);
         throw statusErr;
       }
+      void this.triggerAccountsSync(undefined, "session_expired");
     }
   }
 
@@ -1562,7 +1642,10 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       if (!byId) {
         return undefined;
       }
-      if (byId.botGeneration < byId.latestSnapshotGeneration) {
+      if (
+        byId.credentialsInvalidated ||
+        byId.botGeneration < byId.latestSnapshotGeneration
+      ) {
         return undefined;
       }
       if (reqBotId && byId.ilinkBotId !== reqBotId) {
@@ -1580,6 +1663,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     if (reqBotId) {
       for (const acc of this.accounts.values()) {
         if (
+          !acc.credentialsInvalidated &&
           acc.botGeneration >= acc.latestSnapshotGeneration &&
           acc.ilinkBotId === reqBotId &&
           (reqGen === undefined ||
