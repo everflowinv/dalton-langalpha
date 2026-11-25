@@ -340,43 +340,35 @@ def test_missing_or_low_total_upstream_still_advances_every_round(
     total_upstream_mode: str,
 ) -> None:
     """total_upstream 缺失或偏低（等于首页条数）的多日多页窗口：整段最多用 4 次请求、
-    至少留 1 次给按日阶段；连续两轮每轮都至少推进一天，每轮请求 <= 5。"""
+    随后按日切分在一轮请求预算内推进全部待采日。"""
     docs_by_day = {
         "2026-11-12": ["d12-1", "d12-2"],
         "2026-11-13": ["d13-1", "d13-2"],
         "2026-11-14": ["d14-1", "d14-2"],
         "2026-11-15": ["d15-1", "d15-2"],
     }
-    covered = "2026-11-11"
-    seen: set[str] = set()
-
-    for _round in range(2):
-        reqs = _install_date_range_urlopen(
-            monkeypatch,
-            docs_by_day,
-            page_size=1,
-            total_upstream_mode=total_upstream_mode,
-        )
-        internal, ae = collect_mod.collect_internal_and_ae(
-            _META,
-            since="2026-11-12",
-            until="2026-11-15",
-            seen=seen,
-            ae_covered_until=covered,
-        )
-        st = internal["status"]["alphaengine"]
-        assert st["ok"] is True
-        assert st["pages"] <= collect_mod.MAX_CURSOR_PAGES
-        assert len(reqs) == st["pages"]
-        # 整段最多 4 次，第 5 次切入按日阶段
-        assert len(reqs) == 5
-        assert reqs[4]["end"] < "2026-11-15"
-        new_cov = st["ae_state"]["covered_until"]
-        assert new_cov > covered
-        assert st["ae_state"]["ran"] is True
-        assert st["ae_state"]["resume"] is None
-        seen |= set(ae["new"])
-        covered = new_cov
+    reqs = _install_date_range_urlopen(
+        monkeypatch,
+        docs_by_day,
+        page_size=1,
+        total_upstream_mode=total_upstream_mode,
+    )
+    internal, ae = collect_mod.collect_internal_and_ae(
+        _META,
+        since="2026-11-12",
+        until="2026-11-15",
+        seen=set(),
+        ae_covered_until="2026-11-11",
+    )
+    st = internal["status"]["alphaengine"]
+    assert st["ok"] is True
+    assert st["completed"] is True
+    assert st["pages"] <= collect_mod.MAX_AE_REQUESTS_PER_QUERY
+    assert len(reqs) == st["pages"] == 4 + 2 * 4
+    # 整段最多 4 次，第 5 次切入按日阶段
+    assert reqs[4]["end"] == "2026-11-12"
+    assert st["ae_state"] == {"ran": True, "covered_until": "2026-11-15", "resume": None}
+    assert len(ae["new"]) == 8
 
 
 # ------------------------------------------- 2. total_upstream 很大：保留第 1 页后期文档 + 去重
@@ -388,6 +380,7 @@ def test_large_total_upstream_keeps_page1_future_day_doc_and_dedupes_returned(
     """total_upstream 很大时第 1 页后转按日：第 1 页包含一篇本轮按日阶段推进不到的后期
     日期文档（2026-11-17-hot）及一篇重叠文档（2026-11-12-p1），断言后期文档入包
     （删掉 items.extend(full_items) 必败）且 returned 按 doc_id 去重，总请求 <= 5。"""
+    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", 5)
     days = [f"2026-11-{d:02d}" for d in range(12, 18)]
     docs_by_day = {day: [f"{day}-p1", f"{day}-p2"] for day in days}
     reqs = _install_date_range_urlopen(
@@ -437,14 +430,15 @@ def test_large_total_upstream_keeps_page1_future_day_doc_and_dedupes_returned(
 def test_multi_round_catchup_zero_loss_when_lookback_fits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """7 天 × 每天 1 页（整段超上限，[start - 3, start] <= 4 页）：多轮推进无漏文档，终轮 completed=True。"""
-    days = [f"2026-11-{d:02d}" for d in range(11, 18)]
+    """6 天（距离 5 天，不触发积压跳过）× 每天 1 页（总预算压到 5 次）：多轮推进无漏文档，终轮 completed=True。"""
+    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", 5)
+    days = [f"2026-11-{d:02d}" for d in range(12, 18)]
     docs_by_day = {day: [f"{day}-doc"] for day in days}
     expected = {f"alphaengine:{day}-doc" for day in days}
 
     seen: set[str] = set()
     collected: set[str] = set()
-    covered = "2026-11-10"
+    covered = "2026-11-11"
     until = "2026-11-17"
     rounds = 0
 
@@ -459,14 +453,14 @@ def test_multi_round_catchup_zero_loss_when_lookback_fits(
         )
         internal, ae = collect_mod.collect_internal_and_ae(
             _META,
-            since="2026-11-11",
+            since="2026-11-12",
             until=until,
             seen=seen,
             ae_covered_until=covered,
         )
         st = internal["status"]["alphaengine"]
         assert st["ok"] is True
-        assert st["pages"] <= collect_mod.MAX_CURSOR_PAGES
+        assert st["pages"] <= collect_mod.MAX_AE_REQUESTS_PER_QUERY
         assert st["ae_state"]["resume"] is None
         new_cov = st["ae_state"]["covered_until"]
         assert new_cov > covered
@@ -488,6 +482,7 @@ def test_lookback_late_report_on_page4_not_lost_when_splitting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """探测页全已见且总量超限转按日；按日首子窗口 [start - 3, start] 含回看日期，第 4 页迟到研报不丢。"""
+    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", 5)
     docs_by_day = {
         "2026-11-09": ["seen-1"],
         "2026-11-10": ["seen-2", "seen-3", "late-report-1110"],
@@ -519,13 +514,14 @@ def test_lookback_late_report_on_page4_not_lost_when_splitting(
     assert "越过" not in (st.get("incomplete_reason") or "")
 
 
-# ------------------------------------------- 4. 单日 4 页完整扫完；单日 8 页越过；已推进后遇大日停边界
+# ------------------------------------------- 4. 单日 4 页完整扫完；单日 8 页重扫越过并继续；预算紧时停边界
 
 
 def test_single_day_4_pages_completes_cleanly_within_remaining_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """剩 4 页预算时单日 4 页完整扫完不越过。"""
+    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", 5)
     docs_by_day = {
         "2026-11-12": ["d12-1", "d12-2", "d12-3", "d12-4"],
         "2026-11-13": ["d13-1", "d13-2", "d13-3"],
@@ -552,12 +548,13 @@ def test_single_day_4_pages_completes_cleanly_within_remaining_budget(
 def test_single_day_8_pages_advances_past_day_and_names_date(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """单日 8 页超出剩余全部预算：收下部分结果、越过该日、incomplete_reason 写明日期。"""
+    """单日 8 页超出单窗口预算：[11-09, 11-12] 满 5 页后改为单日 [11-12, 11-12] 重扫，
+    单日也满 5 页后越过 11-12 并继续扫完 11-13，incomplete_reason 写明日期。"""
     docs_by_day = {
         "2026-11-12": [f"d12-{i}" for i in range(1, 9)],
         "2026-11-13": ["d13-1"],
     }
-    _install_date_range_urlopen(monkeypatch, docs_by_day, page_size=1, total_upstream_mode="large")
+    reqs = _install_date_range_urlopen(monkeypatch, docs_by_day, page_size=1, total_upstream_mode="large")
 
     internal, ae = collect_mod.collect_internal_and_ae(
         _META,
@@ -571,17 +568,22 @@ def test_single_day_8_pages_advances_past_day_and_names_date(
     assert st["ok"] is True
     assert st["completed"] is False
     assert st["incomplete"] is True
-    assert st["pages"] == 5
-    assert st["ae_state"] == {"ran": True, "covered_until": "2026-11-12", "resume": None}
-    assert "2026-11-12" in (st.get("incomplete_reason") or "")
+    # 1 次整段早退 + 5 次 [11-09, 11-12] + 5 次单日重扫 [11-12, 11-12] + 1 次 [11-13, 11-13] = 12
+    assert st["pages"] == 12
+    assert any((r["start"], r["end"]) == ("2026-11-12", "2026-11-12") for r in reqs)
+    assert st["ae_state"]["ran"] is True
+    assert st["ae_state"]["covered_until"] == "2026-11-13"
+    assert st["ae_state"]["partial_days"] == ["2026-11-12"]
+    assert "2026-11-12 当天超过翻页上限，只取了前 5 条" in (st.get("incomplete_reason") or "")
     assert "越过" in (st.get("incomplete_reason") or "")
-    assert len(ae["new"]) == 4
+    assert "alphaengine:d13-1" in ae["new"]
 
 
 def test_heavy_second_day_after_advancing_stops_at_advanced_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """本轮已推进一天后遇到大日：停在已推进边界，不越过第 2 天。"""
+    """本轮总预算耗尽在第二天中途时：停在已推进边界，不越过未给满单窗口预算的第 2 天。"""
+    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", 5)
     docs_by_day = {
         "2026-11-12": ["d12-1", "d12-2"],
         "2026-11-13": ["d13-1", "d13-2", "d13-3", "d13-4"],
@@ -869,6 +871,7 @@ def test_full_window_cursor_expiry_preserved_in_cross_day_summary(
 ) -> None:
     """整段跨日路径中整段末页游标失效、按日阶段用剩 1 次完成首日：
     error 为 None，且汇总 incomplete_reason 保留具体游标失效原因。"""
+    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", 5)
     # start=11-12, until=11-14（多日，整段预算 4）：
     # 第 1-3 页成功，第 4 页 c3 游标失效；剩 1 页扫首子窗口 [11-09, 11-12] 完成（covered=11-12 < 11-14）
     _install_scripted_urlopen(
@@ -900,7 +903,7 @@ def test_full_window_cursor_expiry_preserved_in_cross_day_summary(
     assert "E_CURSOR_EXPIRED" in (st.get("incomplete_reason") or "")
 
 
-# ------------------------------------------- 7. 首次运行 & 7 天积压截断（截断当天不漏）
+# ------------------------------------------- 7. 首次运行 & 5 天积压截断（跳到 until - 3）
 
 
 def test_first_run_inclusive_since_does_not_skip_start_day(
@@ -922,7 +925,7 @@ def test_first_run_inclusive_since_does_not_skip_start_day(
 
     assert (reqs[0]["start"], reqs[0]["end"]) == ("2026-11-11", "2026-11-17")
     assert (reqs[1]["start"], reqs[1]["end"]) == ("2026-11-11", "2026-11-14")
-    assert last_run["ae_covered_until"] == "2026-11-15"
+    assert last_run["ae_covered_until"] == "2026-11-17"
     assert last_run["ae_resume"] is None
     seen = set(json.loads((tmp_path / "research" / "tracker" / "seen.json").read_text(encoding="utf-8")))
     assert {"alphaengine:d14-1", "alphaengine:d14-2"} <= seen
@@ -931,13 +934,14 @@ def test_first_run_inclusive_since_does_not_skip_start_day(
 def test_20_day_backlog_cap_includes_cutoff_day_doc_and_only_writes_when_ran(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """积压 20 天（covered_until=11-01，until=11-21）：跳至 11-15（until - 6），
-    在截断当天 2026-11-15 放一篇文档断言不漏；失败轮（ran=False）不写 skipped_backlog。"""
+    """积压 20 天（covered_until=11-01，until=11-21）：跳至 11-18（until - 3），
+    在截断当天 2026-11-18 放一篇文档断言不漏；失败轮（ran=False）不写 skipped_backlog。"""
     docs_by_day = {
         "2026-11-05": ["old-skipped-doc"],
-        "2026-11-15": ["cutoff-day-1115-doc", "cutoff-day-1115-doc2"],
-        "2026-11-16": ["d16-1", "d16-2"],
+        "2026-11-18": ["cutoff-day-1118-doc", "cutoff-day-1118-doc2"],
+        "2026-11-19": ["d19-1", "d19-2"],
         "2026-11-20": ["d20-1", "d20-2"],
+        "2026-11-21": ["d21-1"],
     }
     reqs_ok = _install_date_range_urlopen(
         monkeypatch,
@@ -953,14 +957,16 @@ def test_20_day_backlog_cap_includes_cutoff_day_doc_and_only_writes_when_ran(
         seen=set(),
         ae_covered_until="2026-11-01",
     )
-    assert (reqs_ok[0]["start"], reqs_ok[0]["end"]) == ("2026-11-12", "2026-11-21")
-    assert (reqs_ok[1]["start"], reqs_ok[1]["end"]) == ("2026-11-12", "2026-11-15")
-    assert "alphaengine:cutoff-day-1115-doc" in ae_ok["new"]
-    assert "alphaengine:cutoff-day-1115-doc2" in ae_ok["new"]
+    assert (reqs_ok[0]["start"], reqs_ok[0]["end"]) == ("2026-11-15", "2026-11-21")
+    assert (reqs_ok[1]["start"], reqs_ok[1]["end"]) == ("2026-11-15", "2026-11-18")
+    assert "alphaengine:cutoff-day-1118-doc" in ae_ok["new"]
+    assert "alphaengine:cutoff-day-1118-doc2" in ae_ok["new"]
     assert "alphaengine:old-skipped-doc" not in ae_ok["new"]
     st_ok = internal_ok["status"]["alphaengine"]
-    assert st_ok["ae_state"] == {"ran": True, "covered_until": "2026-11-16", "resume": None}
-    assert st_ok["skipped_backlog"] == {"since": "2026-11-02", "until": "2026-11-14"}
+    assert st_ok["ae_state"]["ran"] is True
+    assert st_ok["ae_state"]["covered_until"] == "2026-11-21"
+    assert st_ok["skipped_backlog"] == {"since": "2026-11-02", "until": "2026-11-17"}
+    assert "AlphaEngine 积压超过 5 天，已跳过 2026-11-02 至 2026-11-17" in st_ok["note"]
 
     # 首页失败（ran=False）：边界维持 11-01，不写 skipped_backlog
     _install_scripted_urlopen(
@@ -1219,6 +1225,7 @@ def test_day_phase_first_page_bypasses_bridge_cache_and_still_advances(
 ) -> None:
     """整段用满 4 次仍未扫完后，按日阶段首页带 fresh=True 穿透 bridge 缓存，
     剩下的 1 次请求也能扫完首个子窗口并推进一天。"""
+    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", 5)
     pages = [
         _ae_page([f"w{i}"], cursor=f"wc{i}", has_more=True) for i in range(1, 5)
     ] + [_ae_page(["day1"], cursor=None, has_more=False, publish_time="2026-11-12")]
@@ -1269,6 +1276,7 @@ def test_round_level_cursor_restart_keeps_boundary_when_day_phase_runs_short(
 ) -> None:
     """整段阶段发生过游标失效重扫、按日阶段只剩 1 次请求且首个子窗口仍有更多页时，
     剩余预算是被重扫吃掉的：不越过首个子窗口，边界不动，并保留游标失效原因。"""
+    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", 5)
     pages = [
         _ae_page(["w1"], cursor="dead", has_more=True),
         # "dead" 失效后带 fresh=True 从首页重扫
@@ -1300,6 +1308,7 @@ def test_cursor_expiry_on_last_window_request_keeps_boundary_without_restart(
 ) -> None:
     """整段第 4 次请求游标失效（已无重扫预算）后，按日阶段的 1 次请求未扫完首个子窗口：
     本轮发生过游标失效，边界不动，汇总写明游标失效原因。"""
+    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", 5)
     pages = [
         _ae_page(["w1"], cursor="c1", has_more=True),
         _ae_page(["w2"], cursor="c2", has_more=True),
@@ -1394,3 +1403,268 @@ def test_day_phase_stale_copy_keeps_window_summary(
     doc = ae["new"]["alphaengine:dup"]
     assert "正常摘要" in str(doc)
     assert internal["status"]["alphaengine"]["ae_state"]["covered_until"] == "2026-11-11"
+
+
+# ------------------------------------------- 10. 单日重扫 / 多日推进 / 积压跳跃 / 预算续扫 / search_in
+
+
+def test_consecutive_over_cap_days_advance_in_single_round(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """连续多个超限日（11-12、11-13、11-14 各 8 页 > 5 页）在一轮内依次推进，并可通过 commit 校验。"""
+    docs_by_day = {
+        "2026-11-12": [f"d12-{i}" for i in range(1, 9)],
+        "2026-11-13": [f"d13-{i}" for i in range(1, 9)],
+        "2026-11-14": [f"d14-{i}" for i in range(1, 9)],
+    }
+    reqs = _install_date_range_urlopen(monkeypatch, docs_by_day, page_size=1, total_upstream_mode="large")
+    _patch_snapshot(monkeypatch)
+    _freeze_now(monkeypatch, 2026, 11, 14, 23, 0)
+
+    tracker = tmp_path / "research" / "tracker"
+    tracker.mkdir(parents=True)
+    (tracker / "last_run.json").write_text(
+        json.dumps({"ticker": "DASH", "until": "2026-11-11", "ae_covered_until": "2026-11-11"}),
+        encoding="utf-8",
+    )
+    last_run = _run_collect_commit(monkeypatch, tmp_path, "multi-cap")
+
+    assert any((r["start"], r["end"]) == ("2026-11-12", "2026-11-12") for r in reqs)
+    assert any((r["start"], r["end"]) == ("2026-11-13", "2026-11-13") for r in reqs)
+    assert any((r["start"], r["end"]) == ("2026-11-14", "2026-11-14") for r in reqs)
+    assert last_run["ae_covered_until"] == "2026-11-14"
+    pkt = json.loads((tracker / "multi-cap" / "packet.json").read_text(encoding="utf-8"))
+    st = pkt["internal_status"]["alphaengine"]
+    assert st["partial_days"] == ["2026-11-12", "2026-11-13", "2026-11-14"]
+    for d in ("2026-11-12", "2026-11-13", "2026-11-14"):
+        assert f"{d} 当天超过翻页上限，只取了前 5 条" in (st.get("incomplete_reason") or "")
+
+
+def test_lookback_crowded_subwindow_rescans_single_day_and_advances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """[P-3, P] 前 5 页全为回看日文档（无 P 日文档）时改为单日 [P, P] 重扫并越过 P，不再卡死。"""
+    docs_by_day = {
+        "2026-11-09": [f"old-{i}" for i in range(1, 9)],
+        "2026-11-12": ["sat-doc"],
+        "2026-11-13": ["sun-doc"],
+    }
+    reqs = _install_date_range_urlopen(monkeypatch, docs_by_day, page_size=1, total_upstream_mode="large")
+
+    internal, ae = collect_mod.collect_internal_and_ae(
+        _META,
+        since="2026-11-12",
+        until="2026-11-13",
+        seen=set(),
+        ae_covered_until="2026-11-11",
+    )
+
+    st = internal["status"]["alphaengine"]
+    windows = [(r["start"], r["end"]) for r in reqs]
+    assert windows.count(("2026-11-09", "2026-11-12")) == 5
+    assert ("2026-11-12", "2026-11-12") in windows
+    assert ("2026-11-13", "2026-11-13") in windows
+    assert st["ok"] is True and st["completed"] is True
+    assert st["ae_state"] == {"ran": True, "covered_until": "2026-11-13", "resume": None}
+    assert {"alphaengine:sat-doc", "alphaengine:sun-doc"} <= set(ae["new"])
+
+
+def test_13_day_backlog_jumps_to_until_minus_3_and_writes_note(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """积压 13 天（covered_until=11-11, until=11-24）跳到 until-3（11-21），备注写明跳过段且可提交。"""
+    docs_by_day = {
+        "2026-11-15": ["skipped-doc"],
+        "2026-11-21": ["kept-21"],
+        "2026-11-24": ["kept-24"],
+    }
+    reqs = _install_date_range_urlopen(monkeypatch, docs_by_day, page_size=20, total_upstream_mode="exact")
+    _patch_snapshot(monkeypatch)
+    _freeze_now(monkeypatch, 2026, 11, 24, 22, 17)
+
+    tracker = tmp_path / "research" / "tracker"
+    tracker.mkdir(parents=True)
+    (tracker / "last_run.json").write_text(
+        json.dumps({"ticker": "DASH", "until": "2026-11-11", "ae_covered_until": "2026-11-11"}),
+        encoding="utf-8",
+    )
+    last_run = _run_collect_commit(monkeypatch, tmp_path, "backlog-13")
+
+    expected_note = "AlphaEngine 积压超过 5 天，已跳过 2026-11-12 至 2026-11-20，未逐日采集；需要时可按标题检索补看"
+    assert (reqs[0]["start"], reqs[0]["end"]) == ("2026-11-18", "2026-11-24")
+    assert last_run["ae_covered_until"] == "2026-11-24"
+    pkt = json.loads((tracker / "backlog-13" / "packet.json").read_text(encoding="utf-8"))
+    st = pkt["internal_status"]["alphaengine"]
+    assert st["skipped_backlog"] == {"since": "2026-11-12", "until": "2026-11-20"}
+    assert st["note"] == expected_note
+    md = (tracker / "backlog-13" / "packet.md").read_text(encoding="utf-8")
+    assert expected_note in md
+    assert "alphaengine:skipped-doc" not in pkt["alphaengine"]["new"]
+    assert {"alphaengine:kept-21", "alphaengine:kept-24"} <= set(pkt["alphaengine"]["new"])
+
+
+def test_round_budget_exhausted_midway_stops_and_resumes_next_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """默认预算为 40；预算在中间某天用完时停在那一天并写入备注，下一轮从那天继续。"""
+    assert collect_mod.MAX_AE_REQUESTS_PER_QUERY == 40
+    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", 16)
+    docs_by_day = {
+        "2026-11-12": [f"d12-{i}" for i in range(1, 9)],
+        "2026-11-13": [f"d13-{i}" for i in range(1, 9)],
+        "2026-11-14": ["d14-1"],
+        "2026-11-15": ["d15-1"],
+    }
+    _install_date_range_urlopen(monkeypatch, docs_by_day, page_size=1, total_upstream_mode="large")
+    internal1, _ae1 = collect_mod.collect_internal_and_ae(
+        _META,
+        since="2026-11-12",
+        until="2026-11-15",
+        seen=set(),
+        ae_covered_until="2026-11-11",
+    )
+    st1 = internal1["status"]["alphaengine"]
+    assert st1["pages"] == 16
+    assert st1["ae_state"]["covered_until"] == "2026-11-13"
+    assert "本轮请求次数已用完，2026-11-14 起留待下一轮" in (st1.get("incomplete_reason") or "")
+
+    # 下一轮从 2026-11-14 继续完成 11-14 与 11-15
+    reqs2 = _install_date_range_urlopen(monkeypatch, docs_by_day, page_size=10, total_upstream_mode="exact")
+    internal2, ae2 = collect_mod.collect_internal_and_ae(
+        _META,
+        since="2026-11-14",
+        until="2026-11-15",
+        seen=set(),
+        ae_covered_until="2026-11-13",
+    )
+    st2 = internal2["status"]["alphaengine"]
+    assert (reqs2[0]["start"], reqs2[0]["end"]) == ("2026-11-11", "2026-11-15")
+    assert st2["completed"] is True
+    assert st2["ae_state"]["covered_until"] == "2026-11-15"
+    assert {"alphaengine:d14-1", "alphaengine:d15-1"} <= set(ae2["new"])
+
+
+def test_search_in_config_forwarded_to_alphaengine_params(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """meta / company.json 中的 ae_search_in 配置透传到 AlphaEngine 请求的 params.search_in（含翻页续页）。"""
+    (tmp_path / "data").mkdir(parents=True)
+    (tmp_path / "data" / "company.json").write_text(
+        json.dumps({"ticker": "META", "name": "Meta Platforms", "ae_search_in": "title"}),
+        encoding="utf-8",
+    )
+    meta = collect_mod.resolve_company_meta("META", tmp_path)
+    assert meta["ae_search_in"] == "title"
+
+    reqs = _install_scripted_urlopen(
+        monkeypatch,
+        [
+            _ae_page(["m1"], cursor="c1", has_more=True),
+            _ae_page(["m2"], cursor=None, has_more=False),
+        ],
+    )
+    internal, ae = collect_mod.collect_internal_and_ae(
+        meta,
+        since="2026-11-14",
+        until="2026-11-15",
+        seen=set(),
+        ae_covered_until="2026-11-13",
+    )
+    assert len(reqs) == 2
+    assert reqs[0]["params"] == {"sort": "relevance", "search_in": "title", "fresh": True}
+    assert reqs[1]["params"] == {"sort": "relevance", "search_in": "title", "cursor": "c1"}
+    assert internal["status"]["alphaengine"]["completed"] is True
+    assert set(ae["new"]) == {"alphaengine:m1", "alphaengine:m2"}
+
+
+@pytest.mark.parametrize("budget", [1, 2])
+def test_tight_budget_1_or_2_requests_advances_every_round_without_loss(
+    monkeypatch: pytest.MonkeyPatch,
+    budget: int,
+) -> None:
+    """预算只够 1–2 次请求时，整段扫描与回看让位给逐日扫描，连续多轮每轮都推进且最终无漏文档。"""
+    monkeypatch.setattr(collect_mod, "MAX_AE_REQUESTS_PER_QUERY", budget)
+    days = [f"2026-11-{d:02d}" for d in range(12, 17)]
+    docs_by_day = {day: [f"{day}-doc"] for day in days}
+    expected = {f"alphaengine:{day}-doc" for day in days}
+
+    seen: set[str] = set()
+    collected: set[str] = set()
+    covered = "2026-11-11"
+    until = "2026-11-16"
+    rounds = 0
+
+    while True:
+        rounds += 1
+        assert rounds <= len(days)
+        reqs = _install_date_range_urlopen(
+            monkeypatch,
+            docs_by_day,
+            page_size=1,
+            total_upstream_mode="large",
+        )
+        internal, ae = collect_mod.collect_internal_and_ae(
+            _META,
+            since="2026-11-12",
+            until=until,
+            seen=seen,
+            ae_covered_until=covered,
+        )
+        st = internal["status"]["alphaengine"]
+        assert st["ok"] is True
+        assert 1 <= st["pages"] == len(reqs) <= budget
+        assert st["ae_state"]["resume"] is None
+        new_cov = st["ae_state"]["covered_until"]
+        assert new_cov > covered
+        assert not (set(ae["new"]) & seen)
+        seen |= set(ae["new"])
+        collected |= set(ae["new"])
+        covered = new_cov
+        if st["completed"]:
+            break
+
+    assert covered == until
+    assert collected == expected
+    assert rounds == (5 if budget == 1 else 3)
+
+    if budget == 2:
+        # 每天 2 页、预算 2 次：每轮恰好扫完 1 天，3 轮无漏
+        two_page_days = ["2026-11-12", "2026-11-13", "2026-11-14"]
+        docs_two = {d: [f"{d}-p1", f"{d}-p2"] for d in two_page_days}
+        expected_two = {f"alphaengine:{d}-p{i}" for d in two_page_days for i in (1, 2)}
+        seen2: set[str] = set()
+        got2: set[str] = set()
+        cov2 = "2026-11-11"
+        r2 = 0
+        while True:
+            r2 += 1
+            assert r2 <= 3
+            reqs2 = _install_date_range_urlopen(
+                monkeypatch,
+                docs_two,
+                page_size=1,
+                total_upstream_mode="large",
+            )
+            internal2, ae2 = collect_mod.collect_internal_and_ae(
+                _META,
+                since="2026-11-12",
+                until="2026-11-14",
+                seen=seen2,
+                ae_covered_until=cov2,
+            )
+            st2 = internal2["status"]["alphaengine"]
+            assert st2["ok"] is True
+            assert len(reqs2) == 2
+            new_cov2 = st2["ae_state"]["covered_until"]
+            assert new_cov2 > cov2
+            seen2 |= set(ae2["new"])
+            got2 |= set(ae2["new"])
+            cov2 = new_cov2
+            if st2["completed"]:
+                break
+        assert cov2 == "2026-11-14"
+        assert got2 == expected_two
+        assert r2 == 3
