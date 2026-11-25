@@ -2467,10 +2467,10 @@ wait_gateway_health() {{
 
 
 @pytest.mark.parametrize("with_workspace_file", [True, False])
-def test_gateway_staging_copies_pnpm_workspace_file_when_present(
+def test_gateway_staging_has_pnpm_build_approvals_with_or_without_source_file(
     tmp_path: Path, with_workspace_file: bool
 ) -> None:
-    """pnpm 10+ needs the build-script approvals in pnpm-workspace.yaml; older revisions lack the file."""
+    """pnpm 11+ needs build-script approvals; revisions without pnpm-workspace.yaml get the default rules."""
     repo = tmp_path / "repo"
     gw = repo / "integrations/dalton-channel-gateway"
     (gw / "src").mkdir(parents=True)
@@ -2480,7 +2480,7 @@ def test_gateway_staging_copies_pnpm_workspace_file_when_present(
     (gw / "tsconfig.json").write_text("{}\n")
     (gw / "src/main.ts").write_text("export const v = 1;\n")
     if with_workspace_file:
-        (gw / "pnpm-workspace.yaml").write_text("allowBuilds:\n  esbuild: true\n")
+        (gw / "pnpm-workspace.yaml").write_text("allowBuilds:\n  esbuild: true\n  protobufjs: false\n")
 
     trace = tmp_path / "pnpm.trace"
     fake_bin = tmp_path / "bin"
@@ -2509,4 +2509,8 @@ def test_gateway_staging_copies_pnpm_workspace_file_when_present(
         env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
     )
     assert "rc=0" in res.stdout, res.stdout + res.stderr
-    assert trace.read_text().strip() == ("ws=yes" if with_workspace_file else "ws=no")
+    assert trace.read_text().strip() == "ws=yes"
+    staging = Path(res.stdout.split("staging=", 1)[1].strip())
+    staged_cfg = (staging / "pnpm-workspace.yaml").read_text()
+    assert "esbuild: true" in staged_cfg
+    assert "protobufjs: false" in staged_cfg
