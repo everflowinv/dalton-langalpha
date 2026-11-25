@@ -456,6 +456,7 @@ def capabilities_fingerprint(
 
 def get_capabilities_payload() -> dict[str, Any]:
     """Build the read-only ``GET /api/v1/dalton/capabilities`` response payload."""
+    from src.config.env import GINLIX_DATA_ENABLED
     from src.dalton.settings import get_brand_name
 
     profile = resolve_profile()
@@ -469,6 +470,7 @@ def get_capabilities_payload() -> dict[str, Any]:
         "brand": {
             "name": brand_name,
         },
+        "ticker_logos": bool(GINLIX_DATA_ENABLED),
     }
 
 
@@ -863,12 +865,14 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("router.py", "upsert_task_cap_endpoint"): CORE_CAPABILITY,
         ("router.py", "delete_task_cap_endpoint"): CORE_CAPABILITY,
         ("router.py", "get_budget_today_endpoint"): CORE_CAPABILITY,
-        ("router.py", "list_team_workspaces_endpoint"): CapabilityId.COLLEAGUE_SHARING,
-        ("router.py", "get_workspace_sharing_endpoint"): CapabilityId.COLLEAGUE_SHARING,
+        # Read-only sharing GET endpoints return 200 neutral payloads when colleague_sharing is off;
+        # write endpoints (PUT) remain gated by CapabilityId.COLLEAGUE_SHARING (404 when off).
+        ("router.py", "list_team_workspaces_endpoint"): CORE_CAPABILITY,
+        ("router.py", "get_workspace_sharing_endpoint"): CORE_CAPABILITY,
         ("router.py", "update_workspace_sharing_endpoint"): CapabilityId.COLLEAGUE_SHARING,
         ("router.py", "get_workspace_settings_endpoint"): CORE_CAPABILITY,
         ("router.py", "update_workspace_settings_endpoint"): CORE_CAPABILITY,
-        ("router.py", "get_user_sharing_settings_endpoint"): CapabilityId.COLLEAGUE_SHARING,
+        ("router.py", "get_user_sharing_settings_endpoint"): CORE_CAPABILITY,
         ("router.py", "update_user_sharing_settings_endpoint"): CapabilityId.COLLEAGUE_SHARING,
         ("router.py", "get_user_settings_endpoint"): CORE_CAPABILITY,
         ("router.py", "update_user_settings_endpoint"): CORE_CAPABILITY,

@@ -57,3 +57,14 @@
      white flashed against the dark surface during load. */
   background: var(--color-bg-page);
 }
+
+/* DALTON-HOOK(mobile-web): disable 1.15x zoom and tighten side padding on mobile so effective width stays >= 360px on 390px screens */
+@media (max-width: 767px) {
+  .html-fullscreen-frame-pad {
+    padding: 6px 2px max(8px, env(safe-area-inset-bottom));
+  }
+
+  .html-fullscreen-frame-pad > .html-fullscreen-frame {
+    zoom: 1;
+  }
+}

@@ -84,24 +84,24 @@ export interface SectionMeta {
  */
 export const SECTIONS = {
   // Personal settings
-  account: { labelKey: 'settings.section.account', descKey: 'settings.sectionDesc.account', icon: CircleUser },
-  preferences: { labelKey: 'settings.section.preferences', descKey: 'settings.sectionDesc.preferences', icon: PieChart },
-  general: { labelKey: 'settings.section.general', descKey: 'settings.sectionDesc.general', icon: SlidersHorizontal },
-  chat: { labelKey: 'settings.section.chat', descKey: 'settings.sectionDesc.chat', icon: MessageSquare },
+  account: { labelKey: 'settings:section.account', descKey: 'settings:sectionDesc.account', icon: CircleUser },
+  preferences: { labelKey: 'settings:section.preferences', descKey: 'settings:sectionDesc.preferences', icon: PieChart },
+  general: { labelKey: 'settings:section.general', descKey: 'settings:sectionDesc.general', icon: SlidersHorizontal },
+  chat: { labelKey: 'settings:section.chat', descKey: 'settings:sectionDesc.chat', icon: MessageSquare },
   // The glyph the workspace gallery's computer menu names them by.
-  computers: { labelKey: 'settings.section.computers', descKey: 'settings.definition.computers', icon: Server },
-  model: { labelKey: 'settings.section.model', descKey: 'settings.sectionDesc.model', icon: Cpu },
-  server: { labelKey: 'settings.section.server', descKey: 'settings.definition.server', icon: ServerCog, selfHostedOnly: true },
-  budget: { labelKey: 'settings.section.budget', descKey: 'settings.sectionDesc.budget', icon: Wallet },
-  integrations: { labelKey: 'settings.section.integrations', descKey: 'settings.sectionDesc.integrations', icon: Plug },
-  coverage: { labelKey: 'settings.section.coverage', descKey: 'settings.sectionDesc.coverage', icon: Layers, coverageUnitsOnly: true },
+  computers: { labelKey: 'settings:section.computers', descKey: 'settings:definition.computers', icon: Server },
+  model: { labelKey: 'settings:section.model', descKey: 'settings:sectionDesc.model', icon: Cpu },
+  server: { labelKey: 'settings:section.server', descKey: 'settings:definition.server', icon: ServerCog, selfHostedOnly: true },
+  budget: { labelKey: 'settings:section.budget', descKey: 'settings:sectionDesc.budget', icon: Wallet },
+  integrations: { labelKey: 'settings:section.integrations', descKey: 'settings:sectionDesc.integrations', icon: Plug },
+  coverage: { labelKey: 'settings:section.coverage', descKey: 'settings:sectionDesc.coverage', icon: Layers, coverageUnitsOnly: true },
   // Team Management settings
-  teamModels: { labelKey: 'settings.section.teamModels', descKey: 'settings.sectionDesc.teamModels', icon: ServerCog, minTier: 'admin' },
-  teamMembers: { labelKey: 'settings.section.teamMembers', descKey: 'settings.sectionDesc.teamMembers', icon: Users, minTier: 'internal', daltonAuthOnly: true },
-  teamChannels: { labelKey: 'settings.section.teamChannels', descKey: 'settings.sectionDesc.teamChannels', icon: Bot, minTier: 'internal' },
+  teamModels: { labelKey: 'settings:section.teamModels', descKey: 'settings:sectionDesc.teamModels', icon: ServerCog, minTier: 'admin' },
+  teamMembers: { labelKey: 'settings:section.teamMembers', descKey: 'settings:sectionDesc.teamMembers', icon: Users, minTier: 'internal', daltonAuthOnly: true },
+  teamChannels: { labelKey: 'settings:section.teamChannels', descKey: 'settings:sectionDesc.teamChannels', icon: Bot, minTier: 'internal' },
   // Upstream stubs retained as permanently hidden sections
-  trading: { labelKey: 'settings.section.trading', descKey: 'settings.definition.trading', icon: CandlestickChart },
-  experiments: { labelKey: 'settings.section.experiments', descKey: 'settings.definition.experiments', icon: FlaskConical },
+  trading: { labelKey: 'settings:section.trading', descKey: 'settings:definition.trading', icon: CandlestickChart },
+  experiments: { labelKey: 'settings:section.experiments', descKey: 'settings:definition.experiments', icon: FlaskConical },
 } satisfies Record<string, SectionMeta>;
 
 export type Section = keyof typeof SECTIONS;
@@ -163,11 +163,11 @@ export function sectionShown(
 
 export const GROUPS: readonly { labelKey: string; sections: readonly Section[] }[] = [
   {
-    labelKey: 'settings.group.personal',
+    labelKey: 'settings:group.personal',
     sections: ['account', 'preferences', 'general', 'chat', 'computers', 'model', 'server', 'budget', 'integrations', 'coverage'],
   },
   {
-    labelKey: 'settings.group.team',
+    labelKey: 'settings:group.team',
     sections: ['teamModels', 'teamMembers', 'teamChannels'],
   },
 ];
@@ -193,62 +193,62 @@ export interface SettingEntry {
 }
 
 export const SETTINGS = {
-  photo: { section: 'account', anchor: 'photo', labelKey: 'settings.photo', descKey: 'settings.photoDesc' },
-  name: { section: 'account', anchor: 'name', labelKey: 'common.name', descKey: 'settings.nameDesc' },
-  email: { section: 'account', anchor: 'email', labelKey: 'common.email', descKey: 'settings.emailCannotBeChanged' },
-  logout: { section: 'account', anchor: 'sign-out', labelKey: 'settings.logout', descKey: 'settings.logoutDesc' },
+  photo: { section: 'account', anchor: 'photo', labelKey: 'settings:photo', descKey: 'settings:photoDesc' },
+  name: { section: 'account', anchor: 'name', labelKey: 'common.name', descKey: 'settings:nameDesc' },
+  email: { section: 'account', anchor: 'email', labelKey: 'common.email', descKey: 'settings:emailCannotBeChanged' },
+  logout: { section: 'account', anchor: 'sign-out', labelKey: 'account.logout', descKey: 'settings:logoutDesc' },
 
-  investingAnswers: { section: 'preferences', anchor: 'investing-profile', labelKey: 'settings.investingAnswers', descKey: 'settings.preferencesDesc' },
-  resetPreferences: { section: 'preferences', anchor: 'reset-preferences', labelKey: 'settings.resetPreferences', descKey: 'settings.resetPreferencesDesc' },
+  investingAnswers: { section: 'preferences', anchor: 'investing-profile', labelKey: 'settings:investingAnswers', descKey: 'settings:preferencesDesc' },
+  resetPreferences: { section: 'preferences', anchor: 'reset-preferences', labelKey: 'settings:resetPreferences', descKey: 'settings:resetPreferencesDesc' },
 
-  language: { section: 'general', anchor: 'language', labelKey: 'settings.locale', descKey: 'settings.localeDesc' },
-  timezone: { section: 'general', anchor: 'timezone', labelKey: 'settings.timezone', descKey: 'settings.timezoneDesc' },
-  linkTarget: { section: 'general', anchor: 'link-target', labelKey: 'settings.shareLinkOpen', descKey: 'settings.shareLinkOpenDesc', desktopOnly: true },
+  language: { section: 'general', anchor: 'language', labelKey: 'settings:locale', descKey: 'settings:localeDesc' },
+  timezone: { section: 'general', anchor: 'timezone', labelKey: 'settings:timezone', descKey: 'settings:timezoneDesc' },
+  linkTarget: { section: 'general', anchor: 'link-target', labelKey: 'settings:shareLinkOpen', descKey: 'settings:shareLinkOpenDesc', desktopOnly: true },
   guides: { section: 'general', anchor: 'guides', labelKey: 'onboarding.settings.sectionTitle', descKey: 'onboarding.settings.description' },
-  theme: { section: 'general', anchor: 'theme', labelKey: 'settings.themeMode', descKey: 'settings.themeDesc', alsoKeys: ['settings.theme'] },
-  fontSize: { section: 'general', anchor: 'font-size', labelKey: 'settings.fontSize', descKey: 'settings.fontSizeDesc' },
-  cardStyle: { section: 'general', anchor: 'card-style', labelKey: 'settings.cardStyle', descKey: 'settings.cardStyleDesc', keywords: '卡片样式 card style' },
-  notifyTurn: { section: 'general', anchor: 'notify-turn', labelKey: 'settings.desktop.notifyTurn', descKey: 'settings.desktop.notifyTurnDesc', desktopOnly: true, alsoKeys: ['settings.desktop.notificationsGroup'] },
-  notifyNeedsInput: { section: 'general', anchor: 'notify-needs-input', labelKey: 'settings.desktop.notifyNeedsInput', descKey: 'settings.desktop.notifyNeedsInputDesc', desktopOnly: true, alsoKeys: ['settings.desktop.notificationsGroup'] },
-  notifyWakeup: { section: 'general', anchor: 'notify-wakeup', labelKey: 'settings.desktop.notifyWakeup', descKey: 'settings.desktop.notifyWakeupDesc', desktopOnly: true, alsoKeys: ['settings.desktop.notificationsGroup'] },
-  notifyAutomation: { section: 'general', anchor: 'notify-automation', labelKey: 'settings.desktop.notifyAutomation', descKey: 'settings.desktop.notifyAutomationDesc', desktopOnly: true, alsoKeys: ['settings.desktop.notificationsGroup'] },
-  notifyStarted: { section: 'general', anchor: 'notify-started', labelKey: 'settings.desktop.notifyStarted', descKey: 'settings.desktop.notifyStartedDesc', desktopOnly: true, alsoKeys: ['settings.desktop.notificationsGroup'] },
-  menubarIcon: { section: 'general', anchor: 'menubar-icon', labelKey: 'settings.desktop.menubarIcon', descKey: 'settings.desktop.menubarIconDesc', desktopOnly: true, alsoKeys: ['settings.desktop.shortcut', 'settings.desktop.keepRunning', 'settings.desktop.openAtLogin'] },
-  menubarItems: { section: 'general', anchor: 'menubar-items', labelKey: 'settings.desktop.menubarItems', descKey: 'settings.desktop.menubarItemsDesc', desktopOnly: true, alsoKeys: ['settings.desktop.menubarStyle', 'settings.desktop.menubarStyleRotate', 'settings.desktop.menubarStyleSide', 'settings.desktop.addSymbol'] },
-  menubarShow: { section: 'general', anchor: 'menubar-show', labelKey: 'settings.desktop.menubarShow', descKey: 'settings.desktop.menubarShowDesc', desktopOnly: true, alsoKeys: ['settings.desktop.menubarGroup'] },
-  menubarExtendedHours: { section: 'general', anchor: 'menubar-extended-hours', labelKey: 'settings.desktop.menubarExtended', descKey: 'settings.desktop.menubarExtendedDesc', desktopOnly: true, alsoKeys: ['settings.desktop.menubarGroup'] },
-  panelSections: { section: 'general', anchor: 'panel-sections', labelKey: 'settings.desktop.panelSections', descKey: 'settings.desktop.panelSectionsDesc', desktopOnly: true, alsoKeys: ['settings.desktop.panelGroup'] },
-  panelTiles: { section: 'general', anchor: 'panel-tiles', labelKey: 'settings.desktop.panelTiles', descKey: 'settings.desktop.panelTilesDesc', desktopOnly: true, alsoKeys: ['settings.desktop.panelGroup'] },
-  panelWatchlist: { section: 'general', anchor: 'panel-watchlist', labelKey: 'settings.desktop.panelWatchlist', descKey: 'settings.desktop.panelWatchlistDesc', desktopOnly: true, alsoKeys: ['settings.desktop.panelGroup'] },
+  theme: { section: 'general', anchor: 'theme', labelKey: 'settings:themeMode', descKey: 'settings:themeDesc', alsoKeys: ['settings:theme'] },
+  fontSize: { section: 'general', anchor: 'font-size', labelKey: 'settings:fontSize', descKey: 'settings:fontSizeDesc' },
+  cardStyle: { section: 'general', anchor: 'card-style', labelKey: 'settings:cardStyle', descKey: 'settings:cardStyleDesc', keywords: '卡片样式 card style' },
+  notifyTurn: { section: 'general', anchor: 'notify-turn', labelKey: 'settings:desktop.notifyTurn', descKey: 'settings:desktop.notifyTurnDesc', desktopOnly: true, alsoKeys: ['settings:desktop.notificationsGroup'] },
+  notifyNeedsInput: { section: 'general', anchor: 'notify-needs-input', labelKey: 'settings:desktop.notifyNeedsInput', descKey: 'settings:desktop.notifyNeedsInputDesc', desktopOnly: true, alsoKeys: ['settings:desktop.notificationsGroup'] },
+  notifyWakeup: { section: 'general', anchor: 'notify-wakeup', labelKey: 'settings:desktop.notifyWakeup', descKey: 'settings:desktop.notifyWakeupDesc', desktopOnly: true, alsoKeys: ['settings:desktop.notificationsGroup'] },
+  notifyAutomation: { section: 'general', anchor: 'notify-automation', labelKey: 'settings:desktop.notifyAutomation', descKey: 'settings:desktop.notifyAutomationDesc', desktopOnly: true, alsoKeys: ['settings:desktop.notificationsGroup'] },
+  notifyStarted: { section: 'general', anchor: 'notify-started', labelKey: 'settings:desktop.notifyStarted', descKey: 'settings:desktop.notifyStartedDesc', desktopOnly: true, alsoKeys: ['settings:desktop.notificationsGroup'] },
+  menubarIcon: { section: 'general', anchor: 'menubar-icon', labelKey: 'settings:desktop.menubarIcon', descKey: 'settings:desktop.menubarIconDesc', desktopOnly: true, alsoKeys: ['settings:desktop.shortcut', 'settings:desktop.keepRunning', 'settings:desktop.openAtLogin'] },
+  menubarItems: { section: 'general', anchor: 'menubar-items', labelKey: 'settings:desktop.menubarItems', descKey: 'settings:desktop.menubarItemsDesc', desktopOnly: true, alsoKeys: ['settings:desktop.menubarStyle', 'settings:desktop.menubarStyleRotate', 'settings:desktop.menubarStyleSide', 'settings:desktop.addSymbol'] },
+  menubarShow: { section: 'general', anchor: 'menubar-show', labelKey: 'settings:desktop.menubarShow', descKey: 'settings:desktop.menubarShowDesc', desktopOnly: true, alsoKeys: ['settings:desktop.menubarGroup'] },
+  menubarExtendedHours: { section: 'general', anchor: 'menubar-extended-hours', labelKey: 'settings:desktop.menubarExtended', descKey: 'settings:desktop.menubarExtendedDesc', desktopOnly: true, alsoKeys: ['settings:desktop.menubarGroup'] },
+  panelSections: { section: 'general', anchor: 'panel-sections', labelKey: 'settings:desktop.panelSections', descKey: 'settings:desktop.panelSectionsDesc', desktopOnly: true, alsoKeys: ['settings:desktop.panelGroup'] },
+  panelTiles: { section: 'general', anchor: 'panel-tiles', labelKey: 'settings:desktop.panelTiles', descKey: 'settings:desktop.panelTilesDesc', desktopOnly: true, alsoKeys: ['settings:desktop.panelGroup'] },
+  panelWatchlist: { section: 'general', anchor: 'panel-watchlist', labelKey: 'settings:desktop.panelWatchlist', descKey: 'settings:desktop.panelWatchlistDesc', desktopOnly: true, alsoKeys: ['settings:desktop.panelGroup'] },
 
-  turnDisplay: { section: 'chat', anchor: 'stream-reasoning', labelKey: 'settings.turnDisplay', descKey: 'settings.turnDisplayDesc' },
-  streamingMode: { section: 'chat', anchor: 'response-delivery', labelKey: 'settings.streamingMode', descKey: 'settings.streamingModeDesc' },
-  toolCallLayout: { section: 'chat', anchor: 'tool-calls', labelKey: 'settings.toolCallLayout', descKey: 'settings.toolCallLayoutDesc' },
-  turnEndScroll: { section: 'chat', anchor: 'turn-end', labelKey: 'settings.turnEndScroll', descKey: 'settings.turnEndScrollDesc' },
-  composerTray: { section: 'chat', anchor: 'composer-tray', labelKey: 'settings.composerTray', descKey: 'settings.composerTrayDesc' },
-  voiceInput: { section: 'chat', anchor: 'voice-input', labelKey: 'settings.voiceInput', descKey: 'settings.voiceInputDesc' },
+  turnDisplay: { section: 'chat', anchor: 'stream-reasoning', labelKey: 'settings:turnDisplay', descKey: 'settings:turnDisplayDesc' },
+  streamingMode: { section: 'chat', anchor: 'response-delivery', labelKey: 'settings:streamingMode', descKey: 'settings:streamingModeDesc' },
+  toolCallLayout: { section: 'chat', anchor: 'tool-calls', labelKey: 'settings:toolCallLayout', descKey: 'settings:toolCallLayoutDesc' },
+  turnEndScroll: { section: 'chat', anchor: 'turn-end', labelKey: 'settings:turnEndScroll', descKey: 'settings:turnEndScrollDesc' },
+  composerTray: { section: 'chat', anchor: 'composer-tray', labelKey: 'settings:composerTray', descKey: 'settings:composerTrayDesc' },
+  voiceInput: { section: 'chat', anchor: 'voice-input', labelKey: 'settings:voiceInput', descKey: 'settings:voiceInputDesc' },
   // DALTON-HOOK(settings-section): bilingual search keywords for artifacts & output settings
-  commentDestination: { section: 'chat', anchor: 'comment-destination', labelKey: 'settings.artifacts.destination', descKey: 'settings.artifacts.destinationDesc', keywords: '评论去向 comment destination' },
-  commentEnter: { section: 'chat', anchor: 'comment-enter', labelKey: 'settings.artifacts.enter', descKey: 'settings.artifacts.enterDesc', keywords: '评论 回车 comment enter' },
-  artifactAnswers: { section: 'chat', anchor: 'artifact-answers', labelKey: 'settings.artifacts.answers', descKey: 'settings.artifacts.answersDesc', keywords: '评论 回答 artifact answers' },
-  outputFormat: { section: 'chat', anchor: 'output-format', labelKey: 'settings.outputFormat', descKey: 'settings.outputFormatDesc', keywords: '输出格式 output format' },
-  researchDepth: { section: 'chat', anchor: 'research-depth', labelKey: 'settings.researchDepth', descKey: 'settings.researchDepthDesc' },
-  reachingOut: { section: 'chat', anchor: 'reaching-out', labelKey: 'settings.reachingOut', descKey: 'settings.reachingOutDesc' },
-  subagents: { section: 'chat', anchor: 'subagents', labelKey: 'settings.subagentsDefault', descKey: 'settings.subagentsDefaultDesc' },
-  ownContext: { section: 'chat', anchor: 'own-context', labelKey: 'settings.ownContext', descKey: 'settings.ownContextDesc', feature: 'shared_workspaces_member_context' },
-  approveHandoffs: { section: 'chat', anchor: 'approve-handoffs', labelKey: 'settings.autoApproveHandoffs', descKey: 'settings.autoApproveHandoffsDesc' },
-  approveWorkspaces: { section: 'chat', anchor: 'approve-workspaces', labelKey: 'settings.autoApproveWorkspaceCreation', descKey: 'settings.autoApproveWorkspaceCreationDesc' },
-  searchProvider: { section: 'chat', anchor: 'search-provider', labelKey: 'settings.searchProvider', descKey: 'settings.searchProviderDesc', alsoKeys: ['settings.searchDepth'] },
-  daltonCosSharing: { section: 'chat', anchor: 'dalton-cos-sharing', labelKey: 'settings.dalton.cosSharingLabel', descKey: 'settings.dalton.cosSharingDesc', keywords: '研究总监 工作区协同共享 允许同事的研究总监向我的工作区派活 chief of staff sharing colleague dispatch', visibleWhen: canShowDaltonCosSharingCard },
+  commentDestination: { section: 'chat', anchor: 'comment-destination', labelKey: 'settings:artifacts.destination', descKey: 'settings:artifacts.destinationDesc', keywords: '评论去向 comment destination' },
+  commentEnter: { section: 'chat', anchor: 'comment-enter', labelKey: 'settings:artifacts.enter', descKey: 'settings:artifacts.enterDesc', keywords: '评论 回车 comment enter' },
+  artifactAnswers: { section: 'chat', anchor: 'artifact-answers', labelKey: 'settings:artifacts.answers', descKey: 'settings:artifacts.answersDesc', keywords: '评论 回答 artifact answers' },
+  outputFormat: { section: 'chat', anchor: 'output-format', labelKey: 'settings:outputFormat', descKey: 'settings:outputFormatDesc', keywords: '输出格式 output format' },
+  researchDepth: { section: 'chat', anchor: 'research-depth', labelKey: 'settings:researchDepth', descKey: 'settings:researchDepthDesc' },
+  reachingOut: { section: 'chat', anchor: 'reaching-out', labelKey: 'settings:reachingOut', descKey: 'settings:reachingOutDesc' },
+  subagents: { section: 'chat', anchor: 'subagents', labelKey: 'settings:subagentsDefault', descKey: 'settings:subagentsDefaultDesc' },
+  ownContext: { section: 'chat', anchor: 'own-context', labelKey: 'settings:ownContext', descKey: 'settings:ownContextDesc', feature: 'shared_workspaces_member_context' },
+  approveHandoffs: { section: 'chat', anchor: 'approve-handoffs', labelKey: 'settings:autoApproveHandoffs', descKey: 'settings:autoApproveHandoffsDesc' },
+  approveWorkspaces: { section: 'chat', anchor: 'approve-workspaces', labelKey: 'settings:autoApproveWorkspaceCreation', descKey: 'settings:autoApproveWorkspaceCreationDesc' },
+  searchProvider: { section: 'chat', anchor: 'search-provider', labelKey: 'settings:searchProvider', descKey: 'settings:searchProviderDesc', alsoKeys: ['settings:searchDepth'] },
+  daltonCosSharing: { section: 'chat', anchor: 'dalton-cos-sharing', labelKey: 'settings:dalton.cosSharingLabel', descKey: 'settings:dalton.cosSharingDesc', keywords: '研究总监 工作区协同共享 允许同事的研究总监向我的工作区派活 chief of staff sharing colleague dispatch', capability: 'colleague_sharing', visibleWhen: canShowDaltonCosSharingCard },
   // DALTON-HOOK(team-memory-toggle): Home Team Memory user-level setting entry
   // DALTON-HOOK(standalone-core): gate Home Team Memory on conversation_archive
-  daltonHomeTeamMemory: { section: 'chat', anchor: 'dalton-home-team-memory', labelKey: 'settings.dalton.homeTeamMemoryLabel', descKey: 'settings.dalton.homeTeamMemoryDesc', keywords: '团队记忆 团队历史研究记录 对话记录 team memory conversation archive', capability: 'conversation_archive', visibleWhen: canShowDaltonHomeTeamMemoryCard },
+  daltonHomeTeamMemory: { section: 'chat', anchor: 'dalton-home-team-memory', labelKey: 'settings:dalton.homeTeamMemoryLabel', descKey: 'settings:dalton.homeTeamMemoryDesc', keywords: '团队记忆 团队历史研究记录 对话记录 team memory conversation archive', capability: 'conversation_archive', visibleWhen: canShowDaltonHomeTeamMemoryCard },
   // A machine's own settings are in the Computers panel each row opens, so
   // the list is what a search for one of them lands on.
   computers: {
     section: 'computers',
     anchor: 'computers',
-    labelKey: 'settings.computers.list',
+    labelKey: 'settings:computers.list',
     descKey: 'computer.computersDesc',
     alsoKeys: [
       'computer.card.spec',
@@ -262,57 +262,57 @@ export const SETTINGS = {
   },
   newComputer: { section: 'computers', anchor: 'new-computer', labelKey: 'computer.newComputer' },
   modelAccess: { section: 'model', anchor: 'model-access', labelKey: 'modelAccess.title', descKey: 'modelAccess.description' },
-  defaultModels: { section: 'model', anchor: 'default-models', labelKey: 'settings.defaultModels', descKey: 'settings.defaultModelsDesc', keywords: '系统默认模型 默认模型 default models' },
-  defaultModelScope: { section: 'model', anchor: 'default-model-scope', labelKey: 'settings.defaultModelChange.scopeLabel', descKey: 'settings.defaultModelChange.scopeDesc' },
-  quickAccess: { section: 'model', anchor: 'quick-access', labelKey: 'settings.starredModels', descKey: 'settings.starredModelsDesc' },
-  modelDetail: { section: 'model', anchor: 'model-detail', labelKey: 'settings.modelTuning.showAdvanced', descKey: 'settings.modelTuning.showAdvancedDesc' },
-  accountDefaults: { section: 'model', anchor: 'account-defaults', labelKey: 'settings.modelTuning.sectionDefaults', advanced: true },
-  perModel: { section: 'model', anchor: 'per-model', labelKey: 'settings.modelTuning.perModel', descKey: 'settings.modelTuning.perModelDesc', advanced: true },
-  routing: { section: 'model', anchor: 'routing', labelKey: 'settings.modelTuning.sectionRouting', descKey: 'settings.fallbackModels', advanced: true, keywords: '模型路由 备选模型 fallback routing' },
-  agentLocation: { section: 'server', anchor: 'agent-location', labelKey: 'settings.server.location', descKey: 'settings.server.locationDesc' },
-  marketDataKeys: { section: 'server', anchor: 'market-data', labelKey: 'setup.services.marketData', descKey: 'settings.server.marketDataDesc' },
-  webSearchKeys: { section: 'server', anchor: 'web-search', labelKey: 'setup.services.webSearch', descKey: 'settings.server.webSearchDesc' },
+  defaultModels: { section: 'model', anchor: 'default-models', labelKey: 'settings:defaultModels', descKey: 'settings:defaultModelsDesc', keywords: '系统默认模型 默认模型 default models' },
+  defaultModelScope: { section: 'model', anchor: 'default-model-scope', labelKey: 'settings:defaultModelChange.scopeLabel', descKey: 'settings:defaultModelChange.scopeDesc' },
+  quickAccess: { section: 'model', anchor: 'quick-access', labelKey: 'settings:starredModels', descKey: 'settings:starredModelsDesc' },
+  modelDetail: { section: 'model', anchor: 'model-detail', labelKey: 'settings:modelTuning.showAdvanced', descKey: 'settings:modelTuning.showAdvancedDesc' },
+  accountDefaults: { section: 'model', anchor: 'account-defaults', labelKey: 'settings:modelTuning.sectionDefaults', advanced: true },
+  perModel: { section: 'model', anchor: 'per-model', labelKey: 'settings:modelTuning.perModel', descKey: 'settings:modelTuning.perModelDesc', advanced: true },
+  routing: { section: 'model', anchor: 'routing', labelKey: 'settings:modelTuning.sectionRouting', descKey: 'settings:fallbackModels', advanced: true, keywords: '模型路由 备选模型 fallback routing' },
+  agentLocation: { section: 'server', anchor: 'agent-location', labelKey: 'settings:server.location', descKey: 'settings:server.locationDesc' },
+  marketDataKeys: { section: 'server', anchor: 'market-data', labelKey: 'setup:services.marketData', descKey: 'settings:server.marketDataDesc' },
+  webSearchKeys: { section: 'server', anchor: 'web-search', labelKey: 'setup:services.webSearch', descKey: 'settings:server.webSearchDesc' },
   // DALTON-HOOK(settings-section): register Dalton model routing under Personal -> Models advanced disclosure
-  daltonRouting: { section: 'model', anchor: 'dalton-routing', labelKey: 'settings.modelTuning.daltonHeading', descKey: 'settings.dalton.routingDesc', advanced: true, keywords: '后台任务模型 模型路由 核验 审校 复核 model routing audit reviewer assist extract' },
-  daltonAuditModel: { section: 'model', anchor: 'dalton-audit-model', labelKey: 'settings.modelTuning.daltonAuditModel', descKey: 'settings.modelTuning.daltonAuditModelDesc', advanced: true, keywords: '数据核验模型 审计模型 figure audit model' },
-  daltonLanguageModel: { section: 'model', anchor: 'dalton-language-model', labelKey: 'settings.modelTuning.daltonLanguageModel', descKey: 'settings.modelTuning.daltonLanguageModelDesc', advanced: true, keywords: '文字审校模型 语言审查模型 language review model' },
-  daltonAuditFallbackModels: { section: 'model', anchor: 'dalton-audit-fallback-models', labelKey: 'settings.modelTuning.daltonAuditFallbackModels', descKey: 'settings.modelTuning.daltonAuditFallbackModelsDesc', advanced: true, keywords: '数据核验备用模型 figure audit fallback models' },
-  daltonAuditTimeout: { section: 'model', anchor: 'dalton-audit-timeout', labelKey: 'settings.modelTuning.daltonAuditTimeoutS', descKey: 'settings.modelTuning.daltonAuditTimeoutSDesc', advanced: true, keywords: '单次核验超时 核验超时 figure audit timeout' },
-  daltonAssistModel: { section: 'model', anchor: 'dalton-assist-model', labelKey: 'settings.modelTuning.daltonAssistModel', descKey: 'settings.modelTuning.daltonAssistModelDesc', advanced: true, keywords: '轻量后台任务模型 辅助模型 auxiliary task model assist' },
-  daltonAssistFallbackModels: { section: 'model', anchor: 'dalton-assist-fallback-models', labelKey: 'settings.modelTuning.daltonAssistFallbackModels', descKey: 'settings.modelTuning.daltonAssistFallbackModelsDesc', advanced: true, keywords: '轻量后台任务备用模型 auxiliary task fallback models' },
-  daltonReviewerModels: { section: 'model', anchor: 'dalton-reviewer-models', labelKey: 'settings.modelTuning.daltonReviewerModels', descKey: 'settings.modelTuning.daltonReviewerModelsDesc', advanced: true, keywords: '独立复核候选模型 审稿模型 independent reviewer candidates' },
+  daltonRouting: { section: 'model', anchor: 'dalton-routing', labelKey: 'settings:modelTuning.daltonHeading', descKey: 'settings:dalton.routingDesc', advanced: true, keywords: '后台任务模型 模型路由 核验 审校 复核 model routing audit reviewer assist extract' },
+  daltonAuditModel: { section: 'model', anchor: 'dalton-audit-model', labelKey: 'settings:modelTuning.daltonAuditModel', descKey: 'settings:modelTuning.daltonAuditModelDesc', advanced: true, keywords: '数据核验模型 审计模型 figure audit model' },
+  daltonLanguageModel: { section: 'model', anchor: 'dalton-language-model', labelKey: 'settings:modelTuning.daltonLanguageModel', descKey: 'settings:modelTuning.daltonLanguageModelDesc', advanced: true, keywords: '文字审校模型 语言审查模型 language review model' },
+  daltonAuditFallbackModels: { section: 'model', anchor: 'dalton-audit-fallback-models', labelKey: 'settings:modelTuning.daltonAuditFallbackModels', descKey: 'settings:modelTuning.daltonAuditFallbackModelsDesc', advanced: true, keywords: '数据核验备用模型 figure audit fallback models' },
+  daltonAuditTimeout: { section: 'model', anchor: 'dalton-audit-timeout', labelKey: 'settings:modelTuning.daltonAuditTimeoutS', descKey: 'settings:modelTuning.daltonAuditTimeoutSDesc', advanced: true, keywords: '单次核验超时 核验超时 figure audit timeout' },
+  daltonAssistModel: { section: 'model', anchor: 'dalton-assist-model', labelKey: 'settings:modelTuning.daltonAssistModel', descKey: 'settings:modelTuning.daltonAssistModelDesc', advanced: true, keywords: '轻量后台任务模型 辅助模型 auxiliary task model assist' },
+  daltonAssistFallbackModels: { section: 'model', anchor: 'dalton-assist-fallback-models', labelKey: 'settings:modelTuning.daltonAssistFallbackModels', descKey: 'settings:modelTuning.daltonAssistFallbackModelsDesc', advanced: true, keywords: '轻量后台任务备用模型 auxiliary task fallback models' },
+  daltonReviewerModels: { section: 'model', anchor: 'dalton-reviewer-models', labelKey: 'settings:modelTuning.daltonReviewerModels', descKey: 'settings:modelTuning.daltonReviewerModelsDesc', advanced: true, keywords: '独立复核候选模型 审稿模型 independent reviewer candidates' },
   // DALTON-HOOK(standalone-core): gate archive extraction, channels, native sync, and Feishu scopes on capabilities
-  daltonExtractModel: { section: 'model', anchor: 'dalton-extract-model', labelKey: 'settings.modelTuning.daltonExtractModel', descKey: 'settings.modelTuning.daltonExtractModelDesc', advanced: true, keywords: '研究记忆整理模型 对话归档抽卡模型 conversation archive extraction model', capability: 'conversation_archive' },
+  daltonExtractModel: { section: 'model', anchor: 'dalton-extract-model', labelKey: 'settings:modelTuning.daltonExtractModel', descKey: 'settings:modelTuning.daltonExtractModelDesc', advanced: true, keywords: '研究记忆整理模型 对话归档抽卡模型 conversation archive extraction model', capability: 'conversation_archive' },
 
-  plan: { section: 'budget', anchor: 'plan', labelKey: 'settings.planUsage.plan', descKey: 'settings.planUsage.planDesc', visibleWhen: () => isPlatformMode },
-  usage: { section: 'budget', anchor: 'usage', labelKey: 'settings.planUsage.usage', descKey: 'settings.planUsage.usageDesc', visibleWhen: () => isPlatformMode },
-  billing: { section: 'budget', anchor: 'billing', labelKey: 'settings.planUsage.billing', descKey: 'settings.planUsage.billingDesc', visibleWhen: () => isPlatformMode },
-  daltonBudget: { section: 'budget', anchor: 'dalton-budget', labelKey: 'settings.dalton.budgetLabel', descKey: 'settings.dalton.budgetDesc', keywords: '预算 每日预算 花费上限 USD 额度 调额 daily budget spending limit' },
+  plan: { section: 'budget', anchor: 'plan', labelKey: 'settings:planUsage.plan', descKey: 'settings:planUsage.planDesc', visibleWhen: () => isPlatformMode },
+  usage: { section: 'budget', anchor: 'usage', labelKey: 'settings:planUsage.usage', descKey: 'settings:planUsage.usageDesc', visibleWhen: () => isPlatformMode },
+  billing: { section: 'budget', anchor: 'billing', labelKey: 'settings:planUsage.billing', descKey: 'settings:planUsage.billingDesc', visibleWhen: () => isPlatformMode },
+  daltonBudget: { section: 'budget', anchor: 'dalton-budget', labelKey: 'settings:dalton.budgetLabel', descKey: 'settings:dalton.budgetDesc', keywords: '预算 每日预算 花费上限 USD 额度 调额 daily budget spending limit' },
 
   // DALTON-HOOK(settings-section): personal messaging channels and push targets live together in Messaging & Channels
-  daltonNotifyTargets: { section: 'integrations', anchor: 'dalton-notify-targets', labelKey: 'settings.dalton.notifyTargetsLabel', descKey: 'settings.dalton.notifyTargetsDesc', keywords: '通知目标 飞书 Discord 自动推送 消息提醒 notify targets feishu discord 推送总开关 总开关 飞书提醒 推送开关', capability: ['channel_feishu', 'channel_discord'] },
-  daltonChannelBindings: { section: 'integrations', anchor: 'dalton-channel-bindings', labelKey: 'settings.dalton.channelBindingsLabel', descKey: 'settings.dalton.channelBindingsDesc', keywords: '飞书 Discord 账号绑定 绑定码 私聊 机器人 bind code feishu discord account', capability: ['channel_feishu', 'channel_discord'] },
-  daltonWeixinBind: { section: 'integrations', anchor: 'dalton-weixin-bind', labelKey: 'settings.dalton.weixinBindLabel', descKey: 'settings.dalton.weixinBindDesc', keywords: '微信 我的微信 绑定 个人微信 wechat weixin bind', capability: 'channel_weixin' },
-  chatApps: { section: 'integrations', anchor: 'chat-apps', labelKey: 'settings.integrations.chatApps', descKey: 'settings.integrations.chatAppsDesc', visibleWhen: () => isPlatformMode },
+  daltonNotifyTargets: { section: 'integrations', anchor: 'dalton-notify-targets', labelKey: 'settings:dalton.notifyTargetsLabel', descKey: 'settings:dalton.notifyTargetsDesc', keywords: '通知目标 飞书 Discord 自动推送 消息提醒 notify targets feishu discord 推送总开关 总开关 飞书提醒 推送开关', capability: ['channel_feishu', 'channel_discord'] },
+  daltonChannelBindings: { section: 'integrations', anchor: 'dalton-channel-bindings', labelKey: 'settings:dalton.channelBindingsLabel', descKey: 'settings:dalton.channelBindingsDesc', keywords: '飞书 Discord 账号绑定 绑定码 私聊 机器人 bind code feishu discord account', capability: ['channel_feishu', 'channel_discord'] },
+  daltonWeixinBind: { section: 'integrations', anchor: 'dalton-weixin-bind', labelKey: 'settings:dalton.weixinBindLabel', descKey: 'settings:dalton.weixinBindDesc', keywords: '微信 我的微信 绑定 个人微信 wechat weixin bind', capability: 'channel_weixin' },
+  chatApps: { section: 'integrations', anchor: 'chat-apps', labelKey: 'settings:integrations.chatApps', descKey: 'settings:integrations.chatAppsDesc', visibleWhen: () => isPlatformMode },
   // DALTON-HOOK(settings-reorg): match runtime platform-only visibility in search & palette
-  connectedApps: { section: 'integrations', anchor: 'connected-apps', labelKey: 'settings.integrations.connectedApps', descKey: 'settings.integrations.connectedAppsDesc', visibleWhen: () => isPlatformMode },
+  connectedApps: { section: 'integrations', anchor: 'connected-apps', labelKey: 'settings:integrations.connectedApps', descKey: 'settings:integrations.connectedAppsDesc', visibleWhen: () => isPlatformMode },
 
-  daltonCoverage: { section: 'coverage', anchor: 'dalton-coverage', labelKey: 'settings.dalton.coverageLabel', descKey: 'settings.dalton.coverageDesc', keywords: '覆盖结构 行业 独立公司 绑定工作区 未归类工作区 coverage sector company' },
+  daltonCoverage: { section: 'coverage', anchor: 'dalton-coverage', labelKey: 'settings:dalton.coverageLabel', descKey: 'settings:dalton.coverageDesc', keywords: '覆盖结构 行业 独立公司 绑定工作区 未归类工作区 coverage sector company' },
 
-  daltonProviders: { section: 'teamModels', anchor: 'dalton-providers', labelKey: 'settings.dalton.providersLabel', descKey: 'settings.dalton.providersDesc', keywords: '团队凭据 模型与数据源状态 团队共享凭据 供应商 team credentials provider status' },
+  daltonProviders: { section: 'teamModels', anchor: 'dalton-providers', labelKey: 'settings:dalton.providersLabel', descKey: 'settings:dalton.providersDesc', keywords: '团队凭据 模型与数据源状态 团队共享凭据 供应商 team credentials provider status' },
   daltonNativeModels: { section: 'teamModels', anchor: 'dalton-native-models', labelKey: 'dalton.nativeModels.title', descKey: 'dalton.nativeModels.footnote', keywords: '模型目录同步 同步模型 退役模型 model catalog sync', capability: 'native_oauth_sync' },
 
-  daltonInvites: { section: 'teamMembers', anchor: 'dalton-invites', labelKey: 'settings.dalton.invitesLabel', descKey: 'settings.dalton.invitesDesc', keywords: '团队邀请 成员权限 邀请链接 team invites allowlist', visibleWhen: canShowDaltonInviteAdminCard },
-  daltonFeishuScopes: { section: 'teamMembers', anchor: 'dalton-feishu-scopes', labelKey: 'settings.dalton.feishuScopesLabel', descKey: 'settings.dalton.feishuScopesDesc', keywords: '飞书读取权限 飞书授权 文档 知识库 多维表格 feishu read scopes', capability: 'feishu_docs', visibleWhen: canShowDaltonFeishuScopesCard },
+  daltonInvites: { section: 'teamMembers', anchor: 'dalton-invites', labelKey: 'settings:dalton.invitesLabel', descKey: 'settings:dalton.invitesDesc', keywords: '团队邀请 成员权限 邀请链接 team invites allowlist', visibleWhen: canShowDaltonInviteAdminCard },
+  daltonFeishuScopes: { section: 'teamMembers', anchor: 'dalton-feishu-scopes', labelKey: 'settings:dalton.feishuScopesLabel', descKey: 'settings:dalton.feishuScopesDesc', keywords: '飞书读取权限 飞书授权 文档 知识库 多维表格 feishu read scopes', capability: 'feishu_docs', visibleWhen: canShowDaltonFeishuScopesCard },
 
   // DALTON-HOOK(standalone-core): gate team channel cards on respective channel capabilities
-  daltonWeixinBot: { section: 'teamChannels', anchor: 'dalton-weixin-bot', labelKey: 'settings.dalton.weixinBotLabel', descKey: 'settings.dalton.weixinBotDesc', keywords: '团队微信机器人 微信扫码 wechat bot qr', capability: 'channel_weixin', visibleWhen: (ctx) => ctx?.callerTier === 'admin' },
-  daltonFeishuGroups: { section: 'teamChannels', anchor: 'dalton-feishu-groups', labelKey: 'settings.dalton.feishuGroupsLabel', descKey: 'settings.dalton.feishuGroupsDesc', keywords: '飞书群 团队群 群聊绑定 feishu groups', capability: 'channel_feishu' },
-  daltonDiscordChannels: { section: 'teamChannels', anchor: 'dalton-discord-channels', labelKey: 'settings.dalton.discordChannelsLabel', descKey: 'settings.dalton.discordChannelsDesc', keywords: 'Discord 频道 团队频道 群报告 频道绑定 discord channels', capability: 'channel_discord', visibleWhen: canShowDaltonDiscordChannelsCard },
-  daltonSystemJobs: { section: 'teamChannels', anchor: 'dalton-system-jobs', labelKey: 'settings.dalton.systemJobsLabel', descKey: 'settings.dalton.systemJobsDesc', keywords: '自动巡检 团队公共任务 知识库同步 研报增量扫描 公司近况巡检 system jobs cron', capability: 'data_jobs' },
+  daltonWeixinBot: { section: 'teamChannels', anchor: 'dalton-weixin-bot', labelKey: 'settings:dalton.weixinBotLabel', descKey: 'settings:dalton.weixinBotDesc', keywords: '团队微信机器人 微信扫码 wechat bot qr', capability: 'channel_weixin', visibleWhen: (ctx) => ctx?.callerTier === 'admin' },
+  daltonFeishuGroups: { section: 'teamChannels', anchor: 'dalton-feishu-groups', labelKey: 'settings:dalton.feishuGroupsLabel', descKey: 'settings:dalton.feishuGroupsDesc', keywords: '飞书群 团队群 群聊绑定 feishu groups', capability: 'channel_feishu' },
+  daltonDiscordChannels: { section: 'teamChannels', anchor: 'dalton-discord-channels', labelKey: 'settings:dalton.discordChannelsLabel', descKey: 'settings:dalton.discordChannelsDesc', keywords: 'Discord 频道 团队频道 群报告 频道绑定 discord channels', capability: 'channel_discord', visibleWhen: canShowDaltonDiscordChannelsCard },
+  daltonSystemJobs: { section: 'teamChannels', anchor: 'dalton-system-jobs', labelKey: 'settings:dalton.systemJobsLabel', descKey: 'settings:dalton.systemJobsDesc', keywords: '自动巡检 团队公共任务 知识库同步 研报增量扫描 公司近况巡检 system jobs cron', capability: 'data_jobs' },
 
-  tradingPermission: { section: 'trading', anchor: TRADING_PERMISSION_ANCHOR, labelKey: 'settings.tradingPermission.title', descKey: 'settings.tradingPermission.desc' },
-  experiments: { section: 'experiments', anchor: 'experiments', labelKey: 'settings.experiments', descKey: 'settings.experimentsIntro' },
+  tradingPermission: { section: 'trading', anchor: TRADING_PERMISSION_ANCHOR, labelKey: 'settings:tradingPermission.title', descKey: 'settings:tradingPermission.desc' },
+  experiments: { section: 'experiments', anchor: 'experiments', labelKey: 'settings:experiments', descKey: 'settings:experimentsIntro' },
 } satisfies Record<string, SettingEntry>;
 
 const ENTRIES: readonly SettingEntry[] = Object.values(SETTINGS);
@@ -387,6 +387,36 @@ const LEGACY_SECTIONS: Record<string, Section> = {
   'team-channels': 'teamChannels',
 };
 
+// DALTON-HOOK(standalone-core): resolve capability-aware section subtitle so disabled integrations never appear
+export function sectionDescKey(
+  section: Section,
+  ctx?: DaltonSettingVisibilityContext | null,
+): string {
+  if (section === 'teamMembers' && !hasRequiredCapability(ctx?.capabilities, 'feishu_docs')) {
+    return 'settings:sectionDesc.teamMembersCore';
+  }
+  if (section === 'teamModels' && !hasRequiredCapability(ctx?.capabilities, 'native_oauth_sync')) {
+    return 'settings:sectionDesc.teamModelsCore';
+  }
+  if (section === 'teamChannels') {
+    const hasWeixin = hasRequiredCapability(ctx?.capabilities, 'channel_weixin');
+    const hasFeishu = hasRequiredCapability(ctx?.capabilities, 'channel_feishu');
+    const hasDiscord = hasRequiredCapability(ctx?.capabilities, 'channel_discord');
+    const hasDataJobs = hasRequiredCapability(ctx?.capabilities, 'data_jobs');
+    if (hasWeixin && hasFeishu && hasDataJobs) {
+      return SECTIONS.teamChannels.descKey;
+    }
+    const suffix = [
+      hasWeixin ? 'Weixin' : '',
+      hasFeishu ? 'Feishu' : '',
+      hasDiscord ? 'Discord' : '',
+      hasDataJobs ? 'DataJobs' : '',
+    ].join('');
+    return suffix ? `settings:sectionDesc.teamChannels${suffix}` : 'settings:sectionDesc.teamChannelsCore';
+  }
+  return SECTIONS[section].descKey;
+}
+
 // DALTON-HOOK(standalone-core): resolve capability-aware setting label so disabled channel names never appear in search results or CommandPalette
 export function settingLabelKey(
   entry: SettingEntry,
@@ -395,8 +425,8 @@ export function settingLabelKey(
   if (entry.anchor === 'dalton-channel-bindings') {
     const canFeishu = hasRequiredCapability(ctx?.capabilities, 'channel_feishu');
     const canDiscord = hasRequiredCapability(ctx?.capabilities, 'channel_discord');
-    if (canFeishu && !canDiscord) return 'settings.dalton.channelBindingsLabelFeishu';
-    if (!canFeishu && canDiscord) return 'settings.dalton.channelBindingsLabelDiscord';
+    if (canFeishu && !canDiscord) return 'settings:dalton.channelBindingsLabelFeishu';
+    if (!canFeishu && canDiscord) return 'settings:dalton.channelBindingsLabelDiscord';
   }
   return entry.labelKey;
 }
@@ -418,9 +448,9 @@ export function settingSearchText(
     if (canDiscord) channelTokens.push('Discord discord');
     if (entry.anchor === 'dalton-channel-bindings') {
       if (canFeishu && !canDiscord) {
-        descKey = 'settings.dalton.channelBindingsDescFeishu';
+        descKey = 'settings:dalton.channelBindingsDescFeishu';
       } else if (!canFeishu && canDiscord) {
-        descKey = 'settings.dalton.channelBindingsDescDiscord';
+        descKey = 'settings:dalton.channelBindingsDescDiscord';
       }
     }
     keywords =

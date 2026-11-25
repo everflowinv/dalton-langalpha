@@ -201,19 +201,19 @@ describe('describeRun & polling across all five delivery states', () => {
   it('classifies delivered, failed, partial_failed, retrying, and none without altering status', () => {
     expect(RUN_ALL_FAILED.status).toBe('completed');
 
-    expect(describeRun(RUN_DELIVERED).ui.labelKey).toBe('automation.runCompleted');
+    expect(describeRun(RUN_DELIVERED).ui.labelKey).toBe('automation:runCompleted');
     expect(describeRun(RUN_DELIVERED).deliveryStatus).toBe('delivered');
     expect(isDeliverySettling(RUN_DELIVERED, true)).toBe(false);
 
-    expect(describeRun(RUN_ALL_FAILED).ui.labelKey).toBe('automation.runCompletedDeliveryFailed');
+    expect(describeRun(RUN_ALL_FAILED).ui.labelKey).toBe('automation:runCompletedDeliveryFailed');
     expect(describeRun(RUN_ALL_FAILED).ui.danger).toBe(true);
     expect(isDeliverySettling(RUN_ALL_FAILED, true)).toBe(false);
 
-    expect(describeRun(RUN_PARTIAL_FAILED).ui.labelKey).toBe('automation.runCompletedPartialDeliveryFailed');
+    expect(describeRun(RUN_PARTIAL_FAILED).ui.labelKey).toBe('automation:runCompletedPartialDeliveryFailed');
     expect(describeRun(RUN_PARTIAL_FAILED).ui.danger).toBe(true);
     expect(isDeliverySettling(RUN_PARTIAL_FAILED, true)).toBe(false);
 
-    expect(describeRun(RUN_RETRYING).ui.labelKey).toBe('automation.runCompletedDelivering');
+    expect(describeRun(RUN_RETRYING).ui.labelKey).toBe('automation:runCompletedDelivering');
     expect(describeRun(RUN_RETRYING).ui.danger).toBeFalsy();
     const retryingAt = Date.parse(RUN_RETRYING.completed_at!);
     expect(isDeliverySettling(RUN_RETRYING, false, retryingAt + 30_000)).toBe(true);
@@ -238,7 +238,7 @@ describe('describeRun & polling across all five delivery states', () => {
     expect(resolveExecutionDelivery(refusedRun, refusedAt + 10_000)?.status).toBe('failed');
     expect(isDeliverySettling(refusedRun, true, refusedAt + 10_000)).toBe(false);
 
-    expect(describeRun(RUN_NO_DELIVERY).ui.labelKey).toBe('automation.runCompleted');
+    expect(describeRun(RUN_NO_DELIVERY).ui.labelKey).toBe('automation:runCompleted');
     expect(describeRun(RUN_NO_DELIVERY).deliveryStatus).toBeNull();
   });
 });

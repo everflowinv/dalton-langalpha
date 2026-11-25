@@ -1,11 +1,23 @@
+import { useRef } from 'react'; // DALTON-HOOK(mobile-web)
 import { useLocation, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { Search } from 'lucide-react'; // DALTON-HOOK(global-search)
+import { MoreHorizontal, Search } from 'lucide-react'; // DALTON-HOOK(global-search) DALTON-HOOK(mobile-web)
 import { useCommandPalette } from '@/components/CommandPalette/CommandPaletteProvider'; // DALTON-HOOK(global-search)
-import { SETTINGS_ITEM } from '../nav/navItems';
+// DALTON-HOOK(mobile-web): use Radix DropdownMenu so "More" gets arrow-key roving focus, Escape, and aria-haspopup natively
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import { SETTINGS_ITEM, type NavItem } from '../nav/navItems';
 import { useNavActive } from '../nav/useNavActive';
 import { useNavItems } from '../nav/useNavItems';
 import './BottomTabBar.css';
+
+// DALTON-HOOK(mobile-web): cap bottom bar to 4 core tabs + "More" overflow so every button clears >= 44px on 390px phones
+const PRIMARY_WITH_DASHBOARD = new Set(['/dashboard', '/chat', '/automations', '/monitors']);
+const PRIMARY_DALTON_MODE = new Set(['/chat', '/automations', '/monitors', '/settings']);
 
 export default function BottomTabBar() {
   const { t } = useTranslation();
@@ -13,9 +25,26 @@ export default function BottomTabBar() {
   const location = useLocation();
   const isActive = useNavActive();
   const palette = useCommandPalette(); // DALTON-HOOK(global-search)
+  // DALTON-HOOK(mobile-web): anchor CommandPalette return-focus to the persistent More trigger when Search is launched from the menu
+  const moreTriggerRef = useRef<HTMLButtonElement>(null);
+  const openingPaletteRef = useRef(false);
   // Settings rides at the end of whichever primary items this user can see.
   const navItems = useNavItems();
   const menuItems = [...navItems, SETTINGS_ITEM];
+  const hasDashboard = menuItems.some((item) => item.key === '/dashboard');
+  const primaryKeys = hasDashboard ? PRIMARY_WITH_DASHBOARD : PRIMARY_DALTON_MODE;
+  const primaryItems: NavItem[] = [];
+  const overflowItems: NavItem[] = [];
+  for (const item of menuItems) {
+    if (primaryKeys.has(item.key) && primaryItems.length < 4) {
+      primaryItems.push(item);
+    } else {
+      overflowItems.push(item);
+    }
+  }
+  const hasMoreMenu = overflowItems.length > 0 || Boolean(palette);
+  const moreActive = overflowItems.some((item) => isActive(item));
+
   const handleItemClick = (path: string) => {
     if (location.pathname === path) return;
     navigate(path);
@@ -24,7 +53,7 @@ export default function BottomTabBar() {
   return (
     <div className="bottom-tab-bar">
       <div className="bottom-tab-bar-pill">
-        {menuItems.map((item) => {
+        {primaryItems.map((item) => {
           const Icon = item.icon;
           const active = isActive(item);
 
@@ -40,17 +69,73 @@ export default function BottomTabBar() {
             </button>
           );
         })}
-        {/* DALTON-HOOK(global-search): mobile search button opens Command Palette */}
-        <button
-          type="button"
-          className="bottom-tab-item"
-          onClick={() => palette?.open()}
-          onPointerDown={palette?.preload}
-          aria-label={t('palette.search')}
-          title={t('palette.search')}
-        >
-          <Search className="bottom-tab-item-icon" />
-        </button>
+        {/* DALTON-HOOK(mobile-web): overflow secondary nav items and global search into a Radix DropdownMenu */}
+        {hasMoreMenu && (
+          <DropdownMenu modal={false}>
+            <DropdownMenuTrigger asChild>
+              <button
+                ref={moreTriggerRef}
+                type="button"
+                className={`bottom-tab-item ${moreActive ? 'active' : ''}`}
+                aria-label={t('common.more', 'More')}
+                aria-current={moreActive ? 'page' : undefined}
+                data-testid="bottom-tab-more"
+              >
+                <MoreHorizontal className="bottom-tab-item-icon" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              side="top"
+              align="end"
+              sideOffset={12}
+              className="w-48 p-1.5"
+              data-testid="bottom-tab-more-menu"
+              onCloseAutoFocus={(e) => {
+                // DALTON-HOOK(mobile-web): let CommandPalette claim focus when launched from Search; palette restores to moreTriggerRef on close
+                if (openingPaletteRef.current) {
+                  openingPaletteRef.current = false;
+                  e.preventDefault();
+                }
+              }}
+            >
+              {overflowItems.map((item) => {
+                const Icon = item.icon;
+                const active = isActive(item);
+                return (
+                  <DropdownMenuItem
+                    key={item.key}
+                    className="min-h-11 gap-2.5 px-2.5 py-2 text-sm"
+                    style={{
+                      color: active ? 'var(--color-text-primary)' : 'var(--color-text-secondary)',
+                      fontWeight: active ? 600 : 400,
+                    }}
+                    onSelect={() => handleItemClick(item.key)}
+                    aria-current={active ? 'page' : undefined}
+                  >
+                    <Icon className="h-4 w-4 shrink-0" />
+                    <span className="truncate">{t(item.labelKey)}</span>
+                  </DropdownMenuItem>
+                );
+              })}
+              {/* DALTON-HOOK(global-search): mobile search action inside More menu opens Command Palette */}
+              {palette && (
+                <DropdownMenuItem
+                  className="min-h-11 gap-2.5 px-2.5 py-2 text-sm"
+                  style={{ color: 'var(--color-text-secondary)' }}
+                  onSelect={() => {
+                    openingPaletteRef.current = true;
+                    palette.open(undefined, { returnFocusTo: moreTriggerRef.current });
+                  }}
+                  onPointerDown={palette.preload}
+                  aria-label={t('palette.search')}
+                >
+                  <Search className="h-4 w-4 shrink-0" />
+                  <span className="truncate">{t('palette.search')}</span>
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
+        )}
       </div>
     </div>
   );

@@ -3,13 +3,15 @@ import { clientOs, type ClientOs } from '@/lib/clientOs';
 import { focusWithoutRing } from '@/lib/inputModality';
 import { PREFIXES } from './prefixes';
 import type { Kind } from './types';
+import { withCopy } from '@/i18n';
 
 // Off the entry chunk: nothing of the palette is needed until it opens. A
 // palette whose code cannot load (offline, or a deploy removed it, which
 // index.html's preload listener reports) closes again rather than taking the
 // app down with it, and the next open asks for the code afresh: a lazy
 // component keeps whatever its one load gave it, so a new one is made.
-const loadPalette = () => import('./CommandPalette');
+// DALTON-HOOK(i18n): CommandPalette reaches McpPrimitives ('mcp') in Dalton chunk graph
+const loadPalette = withCopy(() => import('./CommandPalette'), ['marketView', 'mcp', 'settings', 'setup']);
 interface PaletteProps {
   open: boolean;
   onClose: () => void;
@@ -37,8 +39,13 @@ export interface PaletteStart {
   kind: Kind;
 }
 
+// DALTON-HOOK(mobile-web): allow callers whose trigger unmounts (e.g. DropdownMenu item) to specify a persistent return-focus element
+export interface PaletteOpenOptions {
+  returnFocusTo?: HTMLElement | null;
+}
+
 interface CommandPaletteControls {
-  open: (start?: PaletteStart) => void;
+  open: (start?: PaletteStart, options?: PaletteOpenOptions) => void;
   close: () => void;
   isOpen: boolean;
   /** Fetches the palette's code ahead of the first open, for a pointer resting on its button. */
@@ -101,23 +108,36 @@ export function CommandPaletteProvider({ children }: { children: ReactNode }) {
   // cancelled, and beforeinput for it is not cancellable in every browser).
   const standInRef = useRef<HTMLInputElement>(null);
   const composingRef = useRef(false);
-  const setOpen = useCallback((next: boolean, first = '') => {
+  // DALTON-HOOK(mobile-web): honor explicit returnFocusTo when opening from an ephemeral menu item
+  const setOpen = useCallback((next: boolean, first = '', returnFocusTo?: HTMLElement | null) => {
     const was = document.activeElement;
-    if (next && !isOpenRef.current && was instanceof HTMLElement && was !== standInRef.current && !was.closest('.command-palette')) {
-      returnToRef.current = was === document.body ? null : was;
+    if (next && !isOpenRef.current) {
+      if (returnFocusTo) {
+        returnToRef.current = returnFocusTo;
+      } else if (was instanceof HTMLElement && was !== standInRef.current && !was.closest('.command-palette')) {
+        returnToRef.current = was === document.body ? null : was;
+      }
     }
+    const wasBuffering = bufferingRef.current;
     isOpenRef.current = next;
     bufferingRef.current = next;
     if (next) setTyped(first);
     setIsOpen(next);
     // Closed before the palette took focus (Escape on a cold open, code that
-    // failed to load): the stand-in hands focus back itself.
-    if (!next && was === standInRef.current) {
-      standInRef.current!.value = '';
+    // failed to load): hand focus back from here (covers both ⌘K stand-in
+    // focus and menu opens whose item unmounted onto document.body).
+    // DALTON-HOOK(mobile-web): restore returnToRef when closed during lazy load after an ephemeral menu item unmounted
+    const focusLostToBody = !was || was === document.body || !(was instanceof HTMLElement) || !was.isConnected;
+    if (!next && (was === standInRef.current || (wasBuffering && focusLostToBody))) {
+      if (standInRef.current) standInRef.current.value = '';
       focusWithoutRing(returnToRef.current);
     }
   }, []);
-  const open = useCallback((start?: PaletteStart) => setOpen(true, start ? PREFIXES[start.kind] : ''), [setOpen]);
+  const open = useCallback(
+    (start?: PaletteStart, options?: PaletteOpenOptions) =>
+      setOpen(true, start ? PREFIXES[start.kind] : '', options?.returnFocusTo),
+    [setOpen],
+  );
   const close = useCallback(() => setOpen(false), [setOpen]);
   const preload = useCallback(() => void loadPalette().catch(() => {}), []);
   const returnFocus = useCallback(() => returnToRef.current, []);

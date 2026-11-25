@@ -179,7 +179,7 @@ export function ProviderRow({
         </div>
       }
       trailing={
-        <div className="flex items-center gap-1.5">
+        <div className="flex flex-wrap items-center gap-1.5">
           {!item.configured && item.billing === 'subscription' && (
             <Link
               to={bindAccountPath}

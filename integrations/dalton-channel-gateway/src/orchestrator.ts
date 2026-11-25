@@ -6,6 +6,7 @@ import {
   type DeliveryActivityOrigin,
   type I1RegisterAndResolveResponse,
   type I3SessionCommandResponse,
+  type I7InboundProgressResponse,
   type I9WeixinStateGetResponse,
   type RecoverAutomationRunRow,
   type RecoverBackgroundRunRow,
@@ -19,6 +20,7 @@ import {
   type ThreadWakeupItem,
 } from "./backend-client.js";
 import type { ChannelAdapter } from "./channels/adapter.js";
+import type { StatusFeedbackConfig } from "./config.js";
 import {
   expiredBindCodeUsage,
   missingBindCodeUsage,
@@ -27,8 +29,10 @@ import {
   type ParsedSlashCommand,
 } from "./commands.js";
 import type { DeliveryService } from "./delivery-service.js";
+import { ProcessingFeedbackCoordinator } from "./processing-feedback.js";
 import {
   ACTIVE_WAKEUP_STATES,
+  type AgentSendResponse,
   type AskUserQuestionItem,
   buildSurfaceRules,
   type ChannelPlatform,
@@ -154,6 +158,169 @@ function confirmationFields(value: object): {
   };
 }
 
+
+/** Chinese names for the actions that only the web app can confirm. */
+const WEB_ONLY_ACTION_LABELS: Record<string, string> = {
+  create_workspace: "新建工作区",
+  delete_workspace: "删除工作区",
+  delete_thread: "删除对话",
+  ptc_agent: "把任务交给工作区分析师",
+  dalton_notify_set_route: "设置通知去向",
+  dalton_notify_add_personal_target: "添加个人通知目标",
+  dalton_notify_test: "发送测试通知",
+  // Order governance & brokerage trading tools (`order_governance.py`, `brokerage_capabilities.py`)
+  order_approval: "订单操作",
+  place_order: "下单",
+  submit_order: "下单",
+  trading_order_place: "下单",
+  place_equity_order: "下单",
+  place_option_order: "下单",
+  place_crypto_order: "下单",
+  place_advanced_order: "下单",
+  crypto_account_create_order: "下单",
+  sim_trade_input_order: "下单",
+  create_order_instruction: "下单",
+  modify_order: "改单",
+  replace_order: "改单",
+  trading_order_replace: "改单",
+  crypto_account_modify_order: "改单",
+  sim_trade_modify_order: "改单",
+  cancel_order: "撤单",
+  trading_order_cancel: "撤单",
+  cancel_equity_order: "撤单",
+  cancel_option_order: "撤单",
+  cancel_crypto_order: "撤单",
+  cancel_advanced_order: "撤单",
+  cancel_option_exercise: "撤单",
+  crypto_account_cancel_order: "撤单",
+  sim_trade_cancel_order: "撤单",
+  delete_order_instruction: "撤单",
+  decline_trade_approval: "撤单",
+  exercise_option: "期权行权",
+  trading_order_confirm: "确认订单",
+  answer_order_question: "确认订单",
+  approval: "一项操作",
+};
+
+const GENERIC_WEB_ONLY_WRAPPER_KINDS = new Set<string>([
+  "web_only_approval",
+  "order_approval",
+  "approval",
+]);
+
+function lookupWebOnlyActionLabel(rawAction: string | undefined): string | null {
+  const cleaned = rawAction?.trim();
+  if (!cleaned) return null;
+  if (WEB_ONLY_ACTION_LABELS[cleaned]) {
+    return WEB_ONLY_ACTION_LABELS[cleaned]!;
+  }
+  const lower = cleaned.toLowerCase();
+  if (WEB_ONLY_ACTION_LABELS[lower]) {
+    return WEB_ONLY_ACTION_LABELS[lower]!;
+  }
+  // Handle MCP-namespaced tool names like `ibkr__submit_order` or `broker.cancel_order`.
+  const suffixMatch = /(?:__|[./:])([a-z0-9_]+)$/i.exec(lower);
+  if (suffixMatch?.[1] && WEB_ONLY_ACTION_LABELS[suffixMatch[1]]) {
+    return WEB_ONLY_ACTION_LABELS[suffixMatch[1]]!;
+  }
+  return null;
+}
+
+function extractActionNameFromRequest(req: InterruptActionRequest | undefined): string | undefined {
+  if (!req || typeof req !== "object") return undefined;
+  for (const candidate of [req.name, req.tool, req.action, req.type]) {
+    if (typeof candidate === "string" && candidate.trim().length > 0) {
+      return candidate.trim();
+    }
+  }
+  return undefined;
+}
+
+function resolveWebOnlyApprovalActionType(params: {
+  payloadActionType?: string;
+  rawKind?: string;
+  actionRequests?: InterruptActionRequest[];
+  reviewConfigs?: unknown[];
+}): string | undefined {
+  const payloadActionType = params.payloadActionType?.trim() || undefined;
+  const rawKind = params.rawKind?.trim() || undefined;
+  const requests = params.actionRequests ?? [];
+
+  const requestNames: string[] = [];
+  for (const req of requests) {
+    const name = extractActionNameFromRequest(req);
+    if (name) requestNames.push(name);
+  }
+  if (requestNames.length === 0 && Array.isArray(params.reviewConfigs)) {
+    for (const cfg of params.reviewConfigs) {
+      if (
+        cfg &&
+        typeof cfg === "object" &&
+        typeof (cfg as { action_name?: unknown }).action_name === "string"
+      ) {
+        const name = (cfg as { action_name: string }).action_name.trim();
+        if (name) requestNames.push(name);
+      }
+    }
+  }
+
+  // Prefer explicit non-wrapper `payload.action_type` if provided.
+  if (
+    payloadActionType &&
+    !GENERIC_WEB_ONLY_WRAPPER_KINDS.has(payloadActionType.toLowerCase())
+  ) {
+    return payloadActionType;
+  }
+
+  if (requestNames.length > 0) {
+    const resolvedLabels = requestNames.map((n) => lookupWebOnlyActionLabel(n));
+    const nonNullLabels = resolvedLabels.filter((l): l is string => l !== null);
+    if (nonNullLabels.length === requestNames.length) {
+      const uniqueLabels = new Set(nonNullLabels);
+      if (uniqueLabels.size === 1) {
+        return requestNames[0];
+      }
+      // Multiple distinct actions inside one order_approval batch -> fall back to `order_approval`.
+      if (
+        rawKind?.toLowerCase() === "order_approval" ||
+        payloadActionType?.toLowerCase() === "order_approval"
+      ) {
+        return "order_approval";
+      }
+    }
+    if (resolvedLabels[0] !== null) {
+      return requestNames[0];
+    }
+    // Unknown specific tool inside an `order_approval` interrupt -> show "订单操作".
+    if (
+      rawKind?.toLowerCase() === "order_approval" ||
+      payloadActionType?.toLowerCase() === "order_approval"
+    ) {
+      return "order_approval";
+    }
+    return requestNames[0];
+  }
+
+  return payloadActionType ?? rawKind;
+}
+
+/** The confirmation-only prompt a chat shows: which action, and where to confirm it. */
+export function webOnlyApprovalText(
+  actionType: string | undefined,
+  link: string,
+  actionRequests?: InterruptActionRequest[],
+): string {
+  const effectiveActionType = resolveWebOnlyApprovalActionType({
+    payloadActionType: actionType,
+    actionRequests,
+  });
+  const label =
+    lookupWebOnlyActionLabel(effectiveActionType) ??
+    lookupWebOnlyActionLabel(actionType) ??
+    "一项操作";
+  return `「${label}」需要在网页上确认，请打开：${link}`;
+}
+
 export class ChannelGatewayOrchestrator {
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
@@ -164,6 +331,7 @@ export class ChannelGatewayOrchestrator {
   private readonly backoffDelayFn: (ms: number) => Promise<void>;
   private readonly busyThreadMaxWaitMs: number;
   private readonly nowFn: () => number;
+  private readonly processingFeedback: ProcessingFeedbackCoordinator;
   private shuttingDown = false;
 
   readonly activeWatches = new Map<string, ActiveWatchHandle>();
@@ -178,6 +346,7 @@ export class ChannelGatewayOrchestrator {
     agentRoutes: AgentRoutesHandler;
     webBaseUrl: string;
     weixinCacheDir: string;
+    statusFeedback?: StatusFeedbackConfig;
     backoffDelayFn?: (ms: number) => Promise<void>;
     busyThreadMaxWaitMs?: number;
     nowFn?: () => number;
@@ -194,6 +363,13 @@ export class ChannelGatewayOrchestrator {
     this.busyThreadMaxWaitMs =
       options.busyThreadMaxWaitMs ?? DEFAULT_BUSY_THREAD_MAX_WAIT_MS;
     this.nowFn = options.nowFn ?? (() => Date.now());
+    this.processingFeedback = new ProcessingFeedbackCoordinator({
+      adapters: options.adapters,
+      config: options.statusFeedback,
+    });
+    this.deliveryService.addFirstCurrentDeliveryListener((info) => {
+      this.processingFeedback.onFirstCurrentDelivery(info);
+    });
 
     for (const adapter of this.adapters.values()) {
       adapter.onInboundEvent(async (event) => {
@@ -360,6 +536,7 @@ export class ChannelGatewayOrchestrator {
     runTurn: () => Promise<void>,
   ): Promise<void> {
     const turnPromise = (async () => {
+      let recoveryFailed = false;
       try {
         await runTurn();
       } catch {
@@ -368,7 +545,14 @@ export class ChannelGatewayOrchestrator {
         } catch {
           // The inbound row keeps its last persisted state, so a later
           // recovery pass can query and replay with the same request key.
+          // Do not stamp a permanent failure reaction while startup recovery may still deliver.
+          recoveryFailed = true;
         }
+      } finally {
+        this.processingFeedback.settleMessage(
+          event,
+          recoveryFailed ? "failed" : "done",
+        );
       }
     })();
 
@@ -513,6 +697,11 @@ export class ChannelGatewayOrchestrator {
       return;
     }
 
+    // Step 2c: Start best-effort processing status feedback (non-blocking, in-memory only).
+    // When `recoverDetachedInboundTurn` re-enters this method for the same message,
+    // `begin()` reuses the still-active handle without adding a duplicate reaction.
+    this.processingFeedback.begin(event);
+
     // Step 3: Upload attachments to workspace if present (§1.3.1)
     let uploadedAttachments: UploadedAttachmentRecord[] =
       resolved.uploaded_attachments ?? [];
@@ -534,7 +723,7 @@ export class ChannelGatewayOrchestrator {
           message_id: event.messageId,
           status: "failed",
         });
-        await this.sendNoticeDelivery({
+        const noticeOutcome = await this.sendNoticeDeliveryOutcome({
           deliveryKey: `notice:${event.platform}:${event.messageId}:attachment_err`,
           userId,
           platform: event.platform,
@@ -544,6 +733,10 @@ export class ChannelGatewayOrchestrator {
           replyToMessageId: event.messageId,
           threadScopeKey: event.threadScopeKey,
         });
+        this.processingFeedback.settleMessage(
+          event,
+          noticeOutcome.definitiveFailure ? "delivery_failed" : "failed",
+        );
         return;
       }
       uploadedAttachments = uploadOutcome.uploaded;
@@ -1993,7 +2186,7 @@ export class ChannelGatewayOrchestrator {
         message_id: event.messageId,
         status: "completed",
       });
-      await this.sendNoticeDelivery({
+      const noticeOutcome = await this.sendNoticeDeliveryOutcome({
         deliveryKey: `notice:${event.platform}:${event.messageId}:web_approval`,
         userId,
         threadId,
@@ -2001,10 +2194,18 @@ export class ChannelGatewayOrchestrator {
         platform: event.platform,
         target: event.chatAddress,
         inboundMessageId: event.messageId,
-        text: `This action (${pendingInterrupt.action_type ?? "approval"}) requires confirmation in the web app: ${threadUrl}`,
+        text: webOnlyApprovalText(
+          pendingInterrupt.action_type,
+          threadUrl,
+          pendingInterrupt.action_requests,
+        ),
         replyToMessageId: event.messageId,
         threadScopeKey: event.threadScopeKey,
       });
+      this.processingFeedback.settleMessage(
+        event,
+        noticeOutcome.definitiveFailure ? "delivery_failed" : "interrupted",
+      );
       return true;
     }
 
@@ -2488,6 +2689,7 @@ export class ChannelGatewayOrchestrator {
           credit_steer_state: "resubmitted",
         },
       });
+      this.processingFeedback.reopenForResubmit(event);
       await this.dispatchConversationTurn({
         event,
         userId,
@@ -2590,6 +2792,12 @@ export class ChannelGatewayOrchestrator {
           credit_steer_state: "consumed",
         },
       });
+      // When `!replaySettled`, `fallback_pending: true` remains for watch/startup recovery,
+      // so clear processing indicator cleanly without stamping a permanent failure emoji.
+      this.processingFeedback.settleMessage(
+        event,
+        replaySettled ? "done" : "failed",
+      );
       return;
     }
 
@@ -2610,6 +2818,7 @@ export class ChannelGatewayOrchestrator {
           credit_steer_state: "resubmitted",
         },
       });
+      this.processingFeedback.reopenForResubmit(event);
       await this.dispatchConversationTurn({
         event,
         userId,
@@ -2644,7 +2853,7 @@ export class ChannelGatewayOrchestrator {
           credit_steer_state: "steered",
         },
       });
-      await this.sendNoticeDelivery({
+      const noticeOutcome = await this.sendNoticeDeliveryOutcome({
         deliveryKey: `notice:${event.platform}:${event.messageId}:steer_queued`,
         userId,
         threadId,
@@ -2656,6 +2865,11 @@ export class ChannelGatewayOrchestrator {
         replyToMessageId: event.messageId,
         threadScopeKey: event.threadScopeKey,
       });
+      // Row stays in recovery set (`status: "steered"`), so never stamp permanent failure emoji.
+      this.processingFeedback.settleMessage(
+        event,
+        noticeOutcome.ok ? "done" : "failed",
+      );
       return;
     }
 
@@ -2669,7 +2883,7 @@ export class ChannelGatewayOrchestrator {
           credit_steer_state: "failed",
         },
       });
-      await this.sendNoticeDelivery({
+      const noticeOutcome = await this.sendNoticeDeliveryOutcome({
         deliveryKey: `notice:${event.platform}:${event.messageId}:credit_returned_steer`,
         userId,
         threadId,
@@ -2681,6 +2895,10 @@ export class ChannelGatewayOrchestrator {
         replyToMessageId: event.messageId,
         threadScopeKey: event.threadScopeKey,
       });
+      this.processingFeedback.settleMessage(
+        event,
+        noticeOutcome.definitiveFailure ? "delivery_failed" : "failed",
+      );
     }
   }
 
@@ -3074,6 +3292,7 @@ export class ChannelGatewayOrchestrator {
       // Steer duplicate (`steered: true` or `outcome == "steered"`)
       if (detail.steered === true || outcome === "steered") {
         const steeredRunId = conflictRunId ?? resolved.steered_into_run_id;
+        this.processingFeedback.bindRun(event, steeredRunId, "steered");
         await this.backend.updateInboundProgress({
           platform: event.platform,
           message_id: event.messageId,
@@ -3122,6 +3341,7 @@ export class ChannelGatewayOrchestrator {
           PUBLIC_LIVE_STATUSES.has(outcome)) &&
         conflictThreadId
       ) {
+        this.processingFeedback.bindRun(event, conflictRunId, "primary");
         await this.backend.updateInboundProgress({
           platform: event.platform,
           message_id: event.messageId,
@@ -3148,7 +3368,7 @@ export class ChannelGatewayOrchestrator {
           outcome === "interrupted") &&
         conflictThreadId
       ) {
-        await this.deliverReplayFallback({
+        const replayOk = await this.deliverReplayFallback({
           userId,
           threadId: conflictThreadId,
           runId: conflictRunId,
@@ -3159,6 +3379,10 @@ export class ChannelGatewayOrchestrator {
           scopeKey: event.threadScopeKey,
           generation: resolved.generation,
         });
+        this.processingFeedback.settleMessage(
+          event,
+          replayOk ? "done" : "failed",
+        );
         return;
       }
 
@@ -3216,7 +3440,7 @@ export class ChannelGatewayOrchestrator {
           status: "failed",
           fallback_pending: false,
         });
-        await this.sendNoticeDelivery({
+        const noticeOutcome = await this.sendNoticeDeliveryOutcome({
           deliveryKey: `notice:${event.platform}:${event.messageId}:dup_${outcome}`,
           userId,
           threadId: conflictThreadId,
@@ -3228,6 +3452,10 @@ export class ChannelGatewayOrchestrator {
           replyToMessageId: event.messageId,
           threadScopeKey: event.threadScopeKey,
         });
+        this.processingFeedback.settleMessage(
+          event,
+          noticeOutcome.definitiveFailure ? "delivery_failed" : "failed",
+        );
         return;
       }
 
@@ -3239,6 +3467,7 @@ export class ChannelGatewayOrchestrator {
           conflictRunId,
         );
         if (PUBLIC_LIVE_STATUSES.has(runState)) {
+          this.processingFeedback.bindRun(event, conflictRunId, "primary");
           await this.attachToLiveStreamOrReplay({
             userId,
             threadId: conflictThreadId,
@@ -3250,7 +3479,7 @@ export class ChannelGatewayOrchestrator {
           return;
         }
         if (PUBLIC_REPLAY_NEEDED_STATUSES.has(runState)) {
-          await this.deliverReplayFallback({
+          const replayOk = await this.deliverReplayFallback({
             userId,
             threadId: conflictThreadId,
             runId: conflictRunId,
@@ -3261,6 +3490,10 @@ export class ChannelGatewayOrchestrator {
             scopeKey: event.threadScopeKey,
             generation: resolved.generation,
           });
+          this.processingFeedback.settleMessage(
+            event,
+            replayOk ? "done" : "failed",
+          );
           return;
         }
       }
@@ -3271,6 +3504,10 @@ export class ChannelGatewayOrchestrator {
         status: "failed",
         fallback_pending: false,
       });
+      // `duplicate_request` arrived with no run metadata / unresolved run state and
+      // no error notice was attempted: outcome is uncertain, so clear processing
+      // feedback without stamping a permanent failure emoji.
+      this.processingFeedback.settleMessage(event, "failed");
       return;
     }
 
@@ -3547,7 +3784,7 @@ export class ChannelGatewayOrchestrator {
           status: "failed",
           fallback_pending: false,
         });
-        await this.sendNoticeDelivery({
+        const noticeOutcome = await this.sendNoticeDeliveryOutcome({
           deliveryKey: `notice:${event.platform}:${event.messageId}:admission_${reason}`,
           userId,
           threadId: conflictThreadId,
@@ -3558,6 +3795,10 @@ export class ChannelGatewayOrchestrator {
           replyToMessageId: event.messageId,
           threadScopeKey: event.threadScopeKey,
         });
+        this.processingFeedback.settleMessage(
+          event,
+          noticeOutcome.definitiveFailure ? "delivery_failed" : "failed",
+        );
         return;
       }
     }
@@ -3589,7 +3830,7 @@ export class ChannelGatewayOrchestrator {
         status: "failed",
         fallback_pending: false,
       });
-      await this.sendNoticeDelivery({
+      const noticeOutcome = await this.sendNoticeDeliveryOutcome({
         deliveryKey: `notice:${event.platform}:${event.messageId}:capacity_limit`,
         userId,
         threadId: conflictThreadId,
@@ -3602,6 +3843,10 @@ export class ChannelGatewayOrchestrator {
         replyToMessageId: event.messageId,
         threadScopeKey: event.threadScopeKey,
       });
+      this.processingFeedback.settleMessage(
+        event,
+        noticeOutcome.definitiveFailure ? "delivery_failed" : "failed",
+      );
       return;
     }
 
@@ -3653,7 +3898,7 @@ export class ChannelGatewayOrchestrator {
       status: "failed",
       fallback_pending: false,
     });
-    await this.sendNoticeDelivery({
+    const noticeOutcome = await this.sendNoticeDeliveryOutcome({
       deliveryKey: `notice:${event.platform}:${event.messageId}:err_${status}`,
       userId,
       threadId: conflictThreadId,
@@ -3664,6 +3909,10 @@ export class ChannelGatewayOrchestrator {
       replyToMessageId: event.messageId,
       threadScopeKey: event.threadScopeKey,
     });
+    this.processingFeedback.settleMessage(
+      event,
+      noticeOutcome.definitiveFailure ? "delivery_failed" : "failed",
+    );
   }
 
   // =========================================================================
@@ -3740,6 +3989,7 @@ export class ChannelGatewayOrchestrator {
         if (typeof payload.run_id === "string") {
           steeredIntoRunId = payload.run_id;
         }
+        this.processingFeedback.bindRun(event, steeredIntoRunId, "steered");
         await this.backend.updateInboundProgress({
           platform: event.platform,
           message_id: event.messageId,
@@ -3774,6 +4024,9 @@ export class ChannelGatewayOrchestrator {
         }
         if (typeof payload.run_id === "string") {
           currentRunId = payload.run_id;
+        }
+        if (currentRunId) {
+          this.processingFeedback.bindRun(event, currentRunId, "primary");
         }
         if (typeof payload.turn_index === "number") {
           currentTurnIndex = payload.turn_index;
@@ -3907,6 +4160,9 @@ export class ChannelGatewayOrchestrator {
         if (typeof payload.run_id === "string") {
           currentRunId = payload.run_id;
         }
+        if (currentRunId) {
+          this.processingFeedback.bindRun(event, currentRunId, "primary");
+        }
         if (currentThreadId && currentRunId) {
           const intDelivered = await this.handleInterruptEvent({
             payload,
@@ -3920,7 +4176,10 @@ export class ChannelGatewayOrchestrator {
             generation: resolved.generation,
             inboundMessageId: event.messageId,
           });
-          if (!intDelivered) {
+          if (intDelivered) {
+            this.processingFeedback.settleMessage(event, "interrupted");
+            this.processingFeedback.settleRun(currentRunId, "interrupted");
+          } else {
             interruptDeliveryFailed = true;
           }
         }
@@ -4169,7 +4428,11 @@ export class ChannelGatewayOrchestrator {
         return false;
       }
 
-      await this.backend.updateInboundProgress({
+      const inFlightWaitPromise =
+        this.deliveryService.hasInFlightCurrentDelivery(currentRunId)
+          ? this.deliveryService.waitForInFlightCurrentDeliveries(currentRunId)
+          : null;
+      const errProg = await this.backend.updateInboundProgress({
         platform: event.platform,
         message_id: event.messageId,
         status: "failed",
@@ -4181,7 +4444,7 @@ export class ChannelGatewayOrchestrator {
           : typeof streamErrorDetail.error === "string"
             ? streamErrorDetail.error
             : "An error occurred while processing your message.";
-      await this.sendNoticeDelivery({
+      const noticeOutcome = await this.sendNoticeDeliveryOutcome({
         deliveryKey: `notice:${event.platform}:${event.messageId}:stream_err`,
         userId,
         threadId: currentThreadId,
@@ -4193,6 +4456,13 @@ export class ChannelGatewayOrchestrator {
         replyToMessageId: event.messageId,
         threadScopeKey: event.threadScopeKey,
       });
+      await this.settleTerminalTurnErrorFeedback({
+        event,
+        currentRunId,
+        progress: errProg,
+        noticeOutcome,
+        inFlightWaitPromise,
+      });
       return false;
     }
 
@@ -4203,13 +4473,17 @@ export class ChannelGatewayOrchestrator {
         runEndOutcome === "failed" ||
         runEndOutcome === "cancelled")
     ) {
-      await this.backend.updateInboundProgress({
+      const inFlightWaitPromise =
+        this.deliveryService.hasInFlightCurrentDelivery(currentRunId)
+          ? this.deliveryService.waitForInFlightCurrentDeliveries(currentRunId)
+          : null;
+      const endProg = await this.backend.updateInboundProgress({
         platform: event.platform,
         message_id: event.messageId,
         status: "failed",
         fallback_pending: false,
       });
-      await this.sendNoticeDelivery({
+      const noticeOutcome = await this.sendNoticeDeliveryOutcome({
         deliveryKey: `notice:${event.platform}:${event.messageId}:run_end_${runEndOutcome}`,
         userId,
         threadId: currentThreadId,
@@ -4220,6 +4494,13 @@ export class ChannelGatewayOrchestrator {
         text: `The run ended with status "${runEndOutcome}".`,
         replyToMessageId: event.messageId,
         threadScopeKey: event.threadScopeKey,
+      });
+      await this.settleTerminalTurnErrorFeedback({
+        event,
+        currentRunId,
+        progress: endProg,
+        noticeOutcome,
+        inFlightWaitPromise,
       });
       return false;
     }
@@ -4263,11 +4544,14 @@ export class ChannelGatewayOrchestrator {
           deferFinalCompletion: params.deferFinalCompletion,
         });
         if (replaySettled) {
+          this.processingFeedback.settleMessage(event, "done");
+          this.processingFeedback.settleRun(currentRunId, "done");
           await this.evaluateWatchCloseConditions(userId, currentThreadId);
           return true;
         }
       }
-      // Keep inbound row in the recovery set (`dispatched` / `received` with `fallback_pending: true`)
+      // Keep inbound row in the recovery set (`dispatched` / `received` with `fallback_pending: true`).
+      // Delivery may still be `in_flight`/`unknown` or recovered later, so clear cleanly without a failure emoji.
       if (!progressRecorded) {
         await this.backend.updateInboundProgress({
           platform: event.platform,
@@ -4279,6 +4563,8 @@ export class ChannelGatewayOrchestrator {
           fallback_pending: true,
         });
       }
+      this.processingFeedback.settleMessage(event, "failed");
+      this.processingFeedback.settleRunPrimary(currentRunId, "failed");
       return false;
     }
 
@@ -4325,6 +4611,13 @@ export class ChannelGatewayOrchestrator {
         activityOrigin: params.isAttachedStream ? "replay" : "conversation",
         deferFinalCompletion: params.deferFinalCompletion,
       });
+      const outcome = settled ? "done" : "failed";
+      this.processingFeedback.settleMessage(event, outcome);
+      if (settled) {
+        this.processingFeedback.settleRun(currentRunId, outcome);
+      } else {
+        this.processingFeedback.settleRunPrimary(currentRunId, outcome);
+      }
       return settled;
     }
 
@@ -4386,6 +4679,13 @@ export class ChannelGatewayOrchestrator {
         activityOrigin: "replay",
         deferFinalCompletion: params.deferFinalCompletion,
       });
+      const outcome = settled ? "done" : "failed";
+      this.processingFeedback.settleMessage(event, outcome);
+      if (settled) {
+        this.processingFeedback.settleRun(currentRunId, outcome);
+      } else {
+        this.processingFeedback.settleRunPrimary(currentRunId, outcome);
+      }
       return settled;
     }
 
@@ -4456,6 +4756,23 @@ export class ChannelGatewayOrchestrator {
         await this.evaluateWatchCloseConditions(userId, currentThreadId);
       }
     }
+    // When `fallbackDeliveryFailed` or `interruptDeliveryFailed` occurs here,
+    // `fallback_pending: true` is persisted and `ActiveWatchHandle` / startup recovery
+    // will retry delivery; never stamp a permanent failure emoji on a recoverable path.
+    const finalFeedbackOutcome =
+      fallbackDeliveryFailed || interruptDeliveryFailed
+        ? "failed"
+        : sawInterrupt
+          ? "interrupted"
+          : "done";
+    if (!params.deferFinalCompletion || keepFallbackPending) {
+      this.processingFeedback.settleMessage(event, finalFeedbackOutcome);
+      if (keepFallbackPending) {
+        this.processingFeedback.settleRunPrimary(currentRunId, finalFeedbackOutcome);
+      } else {
+        this.processingFeedback.settleRun(currentRunId, finalFeedbackOutcome);
+      }
+    }
     return !keepFallbackPending;
   }
 
@@ -4509,7 +4826,9 @@ export class ChannelGatewayOrchestrator {
                 generation: resolved.generation,
                 inboundMessageId: event.messageId,
               });
-              if (!intOk) {
+              if (intOk) {
+                this.processingFeedback.settleMessage(event, "interrupted");
+              } else {
                 attachedInterruptDeliveryFailed = true;
               }
             }
@@ -4606,6 +4925,10 @@ export class ChannelGatewayOrchestrator {
         status: "completed",
         fallback_pending: !replaySettled,
       });
+      this.processingFeedback.settleMessage(
+        event,
+        replaySettled ? "done" : "failed",
+      );
       return;
     }
 
@@ -4626,6 +4949,7 @@ export class ChannelGatewayOrchestrator {
         message_id: event.messageId,
         resubmitted_request_key: resubmitKey,
       });
+      this.processingFeedback.reopenForResubmit(event);
       await this.dispatchConversationTurn({
         event,
         userId,
@@ -4657,7 +4981,7 @@ export class ChannelGatewayOrchestrator {
         steered_into_run_id: steeredIntoRunId,
         fallback_pending: false,
       });
-      await this.sendNoticeDelivery({
+      const noticeOutcome = await this.sendNoticeDeliveryOutcome({
         deliveryKey: `notice:${event.platform}:${event.messageId}:steer_queued`,
         userId,
         threadId,
@@ -4669,6 +4993,10 @@ export class ChannelGatewayOrchestrator {
         replyToMessageId: event.messageId,
         threadScopeKey: event.threadScopeKey,
       });
+      this.processingFeedback.settleMessage(
+        event,
+        noticeOutcome.ok ? "done" : "failed",
+      );
       return;
     }
 
@@ -4679,7 +5007,7 @@ export class ChannelGatewayOrchestrator {
         status: "failed",
         fallback_pending: false,
       });
-      await this.sendNoticeDelivery({
+      const noticeOutcome = await this.sendNoticeDeliveryOutcome({
         deliveryKey: `notice:${event.platform}:${event.messageId}:returned_steer`,
         userId,
         threadId,
@@ -4691,6 +5019,10 @@ export class ChannelGatewayOrchestrator {
         replyToMessageId: event.messageId,
         threadScopeKey: event.threadScopeKey,
       });
+      this.processingFeedback.settleMessage(
+        event,
+        noticeOutcome.definitiveFailure ? "delivery_failed" : "failed",
+      );
       return;
     }
   }
@@ -6249,6 +6581,23 @@ export class ChannelGatewayOrchestrator {
                     ? firstAction.question
                     : undefined;
 
+    const resolvedActionType =
+      kind === "web_only_approval"
+        ? resolveWebOnlyApprovalActionType({
+            payloadActionType:
+              typeof payload.action_type === "string"
+                ? payload.action_type
+                : undefined,
+            rawKind,
+            actionRequests,
+            reviewConfigs: Array.isArray(payload.review_configs)
+              ? payload.review_configs
+              : undefined,
+          }) ?? rawKind
+        : typeof payload.action_type === "string"
+          ? payload.action_type
+          : rawKind;
+
     const pendingState: PendingInterruptState = {
       interrupt_id: interruptId,
       kind,
@@ -6256,8 +6605,7 @@ export class ChannelGatewayOrchestrator {
       thread_id: threadId,
       run_id: runId,
       turn_index: turnIndex,
-      action_type:
-        typeof payload.action_type === "string" ? payload.action_type : rawKind,
+      action_type: resolvedActionType,
       ...(actionRequests.length > 0 ? { action_requests: actionRequests } : {}),
       questions: extractedQuestions,
       prompt: promptTextFromPayload,
@@ -6315,7 +6663,11 @@ export class ChannelGatewayOrchestrator {
   ): string {
     const threadLink = `${this.webBaseUrl}/chat/t/${state.thread_id}`;
     if (state.kind === "web_only_approval") {
-      return `Action requires confirmation in the web UI (${state.action_type ?? "approval"}): ${threadLink}`;
+      return webOnlyApprovalText(
+        state.action_type,
+        threadLink,
+        state.action_requests,
+      );
     }
     if (state.kind === "credit_pause") {
       const baseText =
@@ -8620,16 +8972,30 @@ export class ChannelGatewayOrchestrator {
         request_key: row.request_key,
         raw_payload: row.raw_payload ?? {},
       });
-      await this.executeRegisteredInboundTurn(syntheticEvent, {
-        ...reresolved,
-        pending_interrupt:
-          reresolved.pending_interrupt ?? syntheticResolved.pending_interrupt,
-        uploaded_attachments:
-          reresolved.uploaded_attachments &&
-          reresolved.uploaded_attachments.length > 0
-            ? reresolved.uploaded_attachments
-            : (row.uploaded_attachments ?? []),
-      });
+      let threw = false;
+      try {
+        await this.executeRegisteredInboundTurn(syntheticEvent, {
+          ...reresolved,
+          pending_interrupt:
+            reresolved.pending_interrupt ?? syntheticResolved.pending_interrupt,
+          uploaded_attachments:
+            reresolved.uploaded_attachments &&
+            reresolved.uploaded_attachments.length > 0
+              ? reresolved.uploaded_attachments
+              : (row.uploaded_attachments ?? []),
+        });
+      } catch (err) {
+        threw = true;
+        throw err;
+      } finally {
+        // Mirror `launchInboundTurn`'s safety net: on uncaught error during startup
+        // recovery, outcome is uncertain, so clear processing feedback without stamping
+        // a permanent failure emoji.
+        this.processingFeedback.settleMessage(
+          syntheticEvent,
+          threw ? "failed" : "done",
+        );
+      }
     }
   }
 
@@ -8905,6 +9271,7 @@ export class ChannelGatewayOrchestrator {
 
   async stopAllWatches(): Promise<void> {
     this.shuttingDown = true;
+    this.processingFeedback.settleAll("failed");
     for (const handle of this.activeWatches.values()) {
       handle.abortController.abort();
     }
@@ -9045,7 +9412,7 @@ export class ChannelGatewayOrchestrator {
     });
   }
 
-  private async sendNoticeDelivery(options: {
+  private async sendNoticeDeliveryOutcome(options: {
     deliveryKey: string;
     userId: string;
     threadId?: string | null;
@@ -9059,7 +9426,7 @@ export class ChannelGatewayOrchestrator {
     sourceScopeKey?: string | null;
     sourceGeneration?: number | null;
     activityOrigin?: DeliveryActivityOrigin | null;
-  }): Promise<boolean> {
+  }): Promise<{ ok: boolean; definitiveFailure: boolean }> {
     const res = await this.deliveryService.executeDelivery({
       deliveryKey: options.deliveryKey,
       kind: "notice",
@@ -9077,7 +9444,108 @@ export class ChannelGatewayOrchestrator {
       sourceGeneration: options.sourceGeneration ?? null,
       activityOrigin: options.activityOrigin ?? "none",
     });
-    return res.status === "sent" || res.status === "partial";
+    return {
+      ok: res.status === "sent" || res.status === "partial",
+      definitiveFailure: res.status === "failed",
+    };
+  }
+
+  /**
+   * Settles processing feedback after a non-conflict SSE `error` or terminal
+   * `run_end` (`error` / `failed` / `cancelled`). When a current-conversation
+   * content delivery for `currentRunId` is still in-flight, waits for its final
+   * outcome before settling so a successful or uncertain delivery is never
+   * stamped with `delivery_failed`. A cancelled or failed turn only clears the
+   * processing marker: the user already sees the cancellation or the error
+   * notice, and several bodies can still be settling at that moment, so a
+   * failure mark here could land on a reply that later arrives.
+   */
+  private async settleTerminalTurnErrorFeedback(params: {
+    event: InboundChannelEvent;
+    currentRunId: string | null;
+    progress: I7InboundProgressResponse | null | undefined;
+    noticeOutcome: { ok: boolean; definitiveFailure: boolean };
+    inFlightWaitPromise: Promise<AgentSendResponse[]> | null;
+  }): Promise<void> {
+    const { event, currentRunId, progress, noticeOutcome, inFlightWaitPromise } =
+      params;
+
+    if ((progress?.sent_to_current_count ?? 0) > 0) {
+      this.processingFeedback.settleMessage(event, "done");
+      this.processingFeedback.settleRun(currentRunId, "done");
+      return;
+    }
+
+    const collectedOutcomes: AgentSendResponse[] = [];
+    if (inFlightWaitPromise) {
+      collectedOutcomes.push(...(await inFlightWaitPromise));
+    }
+    if (this.deliveryService.hasInFlightCurrentDelivery(currentRunId)) {
+      collectedOutcomes.push(
+        ...(await this.deliveryService.waitForInFlightCurrentDeliveries(
+          currentRunId,
+        )),
+      );
+    }
+
+    if (collectedOutcomes.length > 0) {
+      const currentOutcomes = collectedOutcomes.filter((r) => r.current);
+      if (
+        currentOutcomes.some(
+          (r) => r.status === "sent" || r.status === "partial",
+        )
+      ) {
+        this.processingFeedback.settleMessage(event, "done");
+        this.processingFeedback.settleRun(currentRunId, "done");
+        return;
+      }
+      if (
+        currentOutcomes.some((r) => r.status === "unknown") ||
+        Boolean(progress?.has_unknown_current_text)
+      ) {
+        this.processingFeedback.settleMessage(event, "failed");
+        this.processingFeedback.settleRun(currentRunId, "failed");
+        return;
+      }
+      // Every tracked in-flight current delivery ended in definitive failure (or was non-current).
+      const failOutcome = "failed";
+      this.processingFeedback.settleMessage(event, failOutcome);
+      this.processingFeedback.settleRunPrimary(currentRunId, failOutcome);
+      this.processingFeedback.settleRun(currentRunId, "failed");
+      return;
+    }
+
+    if (progress?.has_in_flight_or_unknown_current_text) {
+      this.processingFeedback.settleMessage(event, "failed");
+      this.processingFeedback.settleRun(currentRunId, "failed");
+      return;
+    }
+
+    const failOutcome = "failed";
+    this.processingFeedback.settleMessage(event, failOutcome);
+    // Do not stamp permanent failure emoji on steered follow-ups whose reconcileSteer
+    // may still resubmit them or send their own notice.
+    this.processingFeedback.settleRunPrimary(currentRunId, failOutcome);
+    this.processingFeedback.settleRun(currentRunId, "failed");
+  }
+
+  private async sendNoticeDelivery(options: {
+    deliveryKey: string;
+    userId: string;
+    threadId?: string | null;
+    runId?: string | null;
+    platform: ChannelPlatform;
+    target: string;
+    inboundMessageId?: string | null;
+    text: string;
+    replyToMessageId?: string | null;
+    threadScopeKey?: string | null;
+    sourceScopeKey?: string | null;
+    sourceGeneration?: number | null;
+    activityOrigin?: DeliveryActivityOrigin | null;
+  }): Promise<boolean> {
+    const outcome = await this.sendNoticeDeliveryOutcome(options);
+    return outcome.ok;
   }
 
   private async sendDirectAdapterNotice(

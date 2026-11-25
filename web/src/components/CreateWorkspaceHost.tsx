@@ -1,4 +1,4 @@
-import { Suspense, createContext, lazy, useCallback, useContext, useState, useSyncExternalStore, type ReactNode } from 'react';
+import { Suspense, createContext, lazy, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from 'react';
 import { useNavigate } from 'react-router';
 import { useIsMutating } from '@tanstack/react-query';
 // DALTON-HOOK(settings-reorg): mount ComputersDialogHost lazily in place when a Dalton page without its own host opens the Computers dialog.
@@ -8,9 +8,15 @@ import { useComputersPanel, usePageComputersHostMounted } from '@/pages/ChatAgen
 import { CREATE_COMPUTER_MUTATION_KEY } from '@/pages/ChatAgent/hooks/useComputers';
 import { useCreateWorkspace } from '@/pages/ChatAgent/hooks/useCreateWorkspace';
 import type { Workspace } from '@/types/api';
+import { withCopy } from '@/i18n';
 
-const CreateWorkspaceModal = lazy(() => import('@/pages/ChatAgent/components/CreateWorkspaceModal'));
-const ComputersDialogHost = lazy(() => import('@/pages/ChatAgent/components/ComputersDialogHost'));
+const CreateWorkspaceModal = lazy(withCopy(() => import('@/pages/ChatAgent/components/CreateWorkspaceModal'), [
+  'filePanel',
+]));
+// DALTON-HOOK(settings-reorg): fallback Computers host for pages without their own ComputersDialogHost.
+const ComputersDialogHost = lazy(withCopy(() => import('@/pages/ChatAgent/components/ComputersDialogHost'), [
+  'filePanel', 'settings', 'setup',
+]));
 
 const OpenCreateWorkspace = createContext<(() => void) | null>(null);
 
@@ -49,7 +55,29 @@ export function CreateWorkspaceHost({ children }: { children: ReactNode }) {
   const navigate = useNavigate();
   const createWorkspace = useCreateWorkspace();
   const [open, setOpen] = useState(false);
-  const openDialog = useCallback(() => setOpen(true), []);
+  // DALTON-HOOK(mobile-web): Safari does not focus a button on click, and the dialog mounts only once open,
+  // so the host remembers the last pressed control and hands it to the dialog as the place to return focus.
+  // Only a press just before this open counts, so a shortcut never sends focus to an older, unrelated click.
+  const lastPressedRef = useRef<{ el: HTMLElement; at: number } | null>(null);
+  const [opener, setOpener] = useState<HTMLElement | null>(null);
+  useEffect(() => {
+    const onPointerDown = (e: PointerEvent) => {
+      const el = e.target instanceof Element
+        ? e.target.closest<HTMLElement>('button, a[href], [role="button"]')
+        : null;
+      lastPressedRef.current = el ? { el, at: e.timeStamp } : null;
+    };
+    document.addEventListener('pointerdown', onPointerDown, true);
+    return () => document.removeEventListener('pointerdown', onPointerDown, true);
+  }, []);
+  const openDialog = useCallback(() => {
+    const focused = document.activeElement;
+    const pressed = lastPressedRef.current;
+    lastPressedRef.current = null;
+    const recentPress = pressed && performance.now() - pressed.at < 1000 ? pressed.el : null;
+    setOpener(focused instanceof HTMLElement && focused !== document.body ? focused : recentPress);
+    setOpen(true);
+  }, []);
   const openCreated = useCallback(
     (ws: Workspace) => navigate(`/chat/${ws.workspace_id}`, { state: { workspaceName: ws.name, workspaceStatus: null } }),
     [navigate],
@@ -60,7 +88,7 @@ export function CreateWorkspaceHost({ children }: { children: ReactNode }) {
       {children}
       {open && (
         <Suspense fallback={null}>
-          <CreateWorkspaceModal isOpen onClose={() => setOpen(false)} onCreate={createWorkspace} onComplete={openCreated} />
+          <CreateWorkspaceModal isOpen returnFocusTo={opener} onClose={() => setOpen(false)} onCreate={createWorkspace} onComplete={openCreated} />
         </Suspense>
       )}
       {/* DALTON-HOOK(settings-reorg): render ComputersDialogHost in place on pages without their own host */}

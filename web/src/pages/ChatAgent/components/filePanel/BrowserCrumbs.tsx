@@ -16,9 +16,9 @@ import { useBrowserViewState } from './useBrowserView';
 type Step = Exclude<BrowserNavigation['action'], 'open'>;
 
 const STEPS: readonly { action: Step; labelKey: string; label: string; Icon: LucideIcon }[] = [
-  { action: 'back', labelKey: 'filePanel.browser.back', label: 'Back', Icon: ArrowLeft },
-  { action: 'forward', labelKey: 'filePanel.browser.forward', label: 'Forward', Icon: ArrowRight },
-  { action: 'reload', labelKey: 'filePanel.browser.reload', label: 'Reload', Icon: RotateCw },
+  { action: 'back', labelKey: 'filePanel:browser.back', label: 'Back', Icon: ArrowLeft },
+  { action: 'forward', labelKey: 'filePanel:browser.forward', label: 'Forward', Icon: ArrowRight },
+  { action: 'reload', labelKey: 'filePanel:browser.reload', label: 'Reload', Icon: RotateCw },
 ];
 
 /**
@@ -58,14 +58,15 @@ export function BrowserCrumbs({
   // A page on the computer itself is somewhere else in the person's own browser.
   const address = shown ? showAddress(shown) : null;
   const outside = !!address && !address.local;
-  const openOutside = t('filePanel.browser.openOutside', 'Open in your browser');
+  const openOutside = t('filePanel:browser.openOutside', 'Open in your browser');
   return (
     <div className="file-panel-crumbs">
       {STEPS.map(({ action, labelKey, label, Icon }) => (
         <button
           key={action}
           type="button"
-          className="file-panel-icon-btn shrink-0"
+          // DALTON-HOOK(mobile-web): expand touch hit area for back/forward/reload buttons on coarse pointers
+          className="file-panel-icon-btn tap-target shrink-0"
           title={t(labelKey, label)}
           aria-label={t(labelKey, label)}
           disabled={!steering || stepping}
@@ -93,7 +94,7 @@ export function BrowserCrumbs({
           onClick={() => (holding ? view.releaseControl() : view.takeControl())}
         >
           {!holding && <Hand className="h-3 w-3" aria-hidden="true" />}
-          {t(holding ? 'filePanel.browser.releaseControl' : 'filePanel.browser.takeControl')}
+          {t(holding ? 'filePanel:browser.releaseControl' : 'filePanel:browser.takeControl')}
         </Button>
       )}
       {outside && (

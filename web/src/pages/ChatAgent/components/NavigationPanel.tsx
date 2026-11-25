@@ -27,16 +27,21 @@ import { WorkspaceTreeRow, WorkspaceDragChip } from './NavigationRows';
 import type { ThreadsData } from './NavigationRows';
 import { useArchiveThreadConfirm } from './threadArchiveAction';
 import { useThreadDeleteConfirm } from './threadDeleteAction';
-import ShareThreadDialog, { type ShareThreadTarget } from './ShareThreadDialog';
+import type { ShareThreadTarget } from './ShareThreadDialog';
 import { NavTreeContext, useNavTreeKit, type DragGate } from './navTreeKit';
 import { isThreadRemoved } from '@/lib/deletedThreads';
 import { useAccount } from '@/hooks/useAccount';
 import type { SharedWorkspaceEntry } from '@/types/sharedWorkspaces';
 import type { SharedNavRow } from './sharedNavRows';
+import { withCopy } from '@/i18n';
+import { MountOnceOpen } from '@/components/MountOnceOpen';
 import './NavigationPanel.css';
 
 // Lazy: the tree is on every page, and the panel opens only from a shared row's menu.
 const MembersDialog = lazy(() => import('@/components/sharedWorkspaces/MembersDialog').then((m) => ({ default: m.MembersDialog })));
+// Lazy for the same reason: it opens only from a thread's menu, and its panel
+// brings the share-link and artifact code with it.
+const ShareThreadDialog = lazy(withCopy(() => import('./ShareThreadDialog'), ['filePanel']));
 
 interface NavigationPanelProps {
   /** Whether this panel's host ChatView is the visible one. Up to 5 ChatViews
@@ -79,6 +84,8 @@ interface NavigationPanelProps {
   /** The organization's workspaces the person is in, drawn as a second group
    *  after their own; absent with shared workspaces off or none to show. */
   sharedWorkspaces?: SharedWorkspaceEntry[];
+  // DALTON-HOOK(mobile-web): optional trailing sections mounted inside the mobile drawer's scroll container
+  extraSections?: React.ReactNode;
 }
 
 /**
@@ -164,6 +171,7 @@ function NavigationPanel({
   onDeleteThread,
   headerActions,
   sharedWorkspaces,
+  extraSections, // DALTON-HOOK(mobile-web)
 }: NavigationPanelProps) {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
@@ -534,12 +542,16 @@ function NavigationPanel({
           )}
           </TreeRoot>
           </NavTreeContext>
+          {/* DALTON-HOOK(mobile-web): trailing sections (coverage tree & team workspaces) in MobileNavDrawer */}
+          {extraSections}
         </div>
       </div>
       {wsActions.dialogs}
       {archiveDialog}
       {deleteDialog}
-      <ShareThreadDialog target={shareTarget} onClose={() => setShareTarget(null)} />
+      <MountOnceOpen open={!!shareTarget}>
+        <ShareThreadDialog target={shareTarget} onClose={() => setShareTarget(null)} />
+      </MountOnceOpen>
       {peopleEntry && (
         <Suspense fallback={null}>
           <MembersDialog

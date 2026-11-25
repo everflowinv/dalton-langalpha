@@ -11,6 +11,7 @@ import { Input } from '@/components/ui/input';
 // confirm dialog, which would pull its animation library onto first load.
 import { TOOLBAR_CHIP_CLASS, toolbarChipStyle } from '@/components/dalton/primitives/DaltonToolbarPill';
 import { isDaltonAuth } from '@/config/daltonAuth';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { useLocale } from '@/hooks/useLocale';
 import { useUser } from '@/hooks/useUser';
 import { shortMonthDay } from '@/lib/format';
@@ -256,13 +257,16 @@ const CHEVRON_CLASS = 'h-3.5 w-3.5 transition-transform duration-fold';
  */
 export function TeamWorkspacesSection({
   currentWorkspaceId,
+  onNavigate,
 }: {
   currentWorkspaceId?: string | null;
+  onNavigate?: () => void;
 }): React.ReactElement | null {
   const { t } = useTranslation();
   const locale = useLocale();
   const navigate = useNavigate();
   const { data } = useTeamWorkspaces();
+  const { hasCapability } = useCapabilities();
   const [sectionExpanded, setSectionExpanded] = useState(true);
   const [expandedMembers, setExpandedMembers] = useState<Set<string>>(() => new Set());
 
@@ -285,7 +289,10 @@ export function TeamWorkspacesSection({
   // Render only for confirmed internal/admin callers: external members are
   // fully isolated, and while the tier is still loading (or the query failed)
   // the section stays hidden rather than flashing a placeholder.
-  if (data?.caller_tier !== 'internal' && data?.caller_tier !== 'admin') {
+  if (
+    !hasCapability('colleague_sharing') ||
+    (data?.caller_tier !== 'internal' && data?.caller_tier !== 'admin')
+  ) {
     return null;
   }
 
@@ -309,7 +316,7 @@ export function TeamWorkspacesSection({
         <div className="sidebar-section-actions">
           <button
             type="button"
-            className="nav-panel-dismiss-btn sidebar-section-action-btn"
+            className="nav-panel-dismiss-btn sidebar-section-action-btn tap-target"
             onClick={() => setSectionExpanded((v) => !v)}
             aria-label={t('dalton.sharing.teamSectionTitle')}
           >
@@ -384,7 +391,7 @@ export function TeamWorkspacesSection({
                             key={ws.workspace_id}
                             type="button"
                             data-testid={`team-workspace-item-${ws.workspace_id}`}
-                            onClick={() =>
+                            onClick={() => {
                               navigate(`/chat/${ws.workspace_id}`, {
                                 state: {
                                   workspaceName: ws.name,
@@ -394,8 +401,9 @@ export function TeamWorkspacesSection({
                                   teamOwnerName: displayLabel,
                                   teamOwnerEmail: member.email,
                                 },
-                              })
-                            }
+                              });
+                              onNavigate?.();
+                            }}
                             className={cn(
                               'nav-panel-row w-full text-left',
                               active && 'nav-panel-row-active',
@@ -458,7 +466,7 @@ export function TeamWorkspacesSection({
 export function TeamReadOnlyBanner({
   ownerName,
   access = 'ro',
-  compact: _compact = false,
+  compact = false,
 }: {
   ownerName: string | null;
   access?: TeamAccessMode;
@@ -474,12 +482,17 @@ export function TeamReadOnlyBanner({
   return (
     <div
       data-testid="team-readonly-banner"
+      data-compact={compact ? 'true' : undefined}
       role="status"
-      className={TOOLBAR_CHIP_CLASS}
+      title={label}
+      className={cn(
+        TOOLBAR_CHIP_CLASS,
+        compact && 'h-6 max-w-full min-w-0 px-2 text-[11px]',
+      )}
       style={toolbarChipStyle('neutral')}
     >
       <Lock className="h-3 w-3 shrink-0" />
-      <span>{label}</span>
+      <span className={compact ? 'truncate' : undefined}>{label}</span>
     </div>
   );
 }

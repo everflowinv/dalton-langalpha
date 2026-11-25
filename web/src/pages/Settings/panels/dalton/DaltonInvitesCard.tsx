@@ -156,7 +156,7 @@ export function DaltonInvitesCard({
       layout="padded"
       bodyClassName="space-y-3"
       action={
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2 min-w-0 max-w-full">
           {typeof maxActive === 'number' && (
             <DaltonStatusBadge
               tone="neutral"
@@ -173,7 +173,7 @@ export function DaltonInvitesCard({
               value={selectedTier}
               onChange={(e) => setSelectedTier(e.target.value as DaltonInviteTier)}
               disabled={createMutation.isPending}
-              className="h-8 rounded-md border px-2 text-xs"
+              className="h-9 md:h-8 max-w-full rounded-md border px-2 text-xs"
               style={{
                 backgroundColor: 'var(--color-bg-card)',
                 borderColor: 'var(--color-border-muted)',
@@ -189,7 +189,7 @@ export function DaltonInvitesCard({
             type="button"
             variant="outline"
             size="sm"
-            className="h-8 gap-1.5 text-xs"
+            className="h-9 md:h-8 gap-1.5 text-xs"
             disabled={createMutation.isPending}
             onClick={() => createMutation.mutate(canPickTier ? selectedTier : undefined)}
             data-testid="dalton-invites-generate"
@@ -267,8 +267,8 @@ export function DaltonInvitesCard({
                   />
                 }
                 title={
-                  <span className="inline-flex items-center gap-2">
-                    <span className="font-mono text-xs">{item.invite_id.slice(0, 12)}</span>
+                  <span className="inline-flex flex-wrap items-center gap-2 min-w-0">
+                    <span className="font-mono text-xs max-md:break-all">{item.invite_id.slice(0, 12)}</span>
                     {isDaltonLocalAuth && tierLabel(item.tier) && (
                       <DaltonStatusBadge tone="neutral" label={tierLabel(item.tier)!} />
                     )}

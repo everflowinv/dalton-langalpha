@@ -15,7 +15,7 @@ import { useUser } from '@/hooks/useUser';
 import { getCurrentUser } from '@/pages/Dashboard/utils/api';
 import { RemoveAccessDialog } from '@/components/modelAccess/RemoveAccessDialog';
 import { BrandMark } from '@/pages/ChatAgent/components/mcp/BrandMark';
-import { llmProviderArt } from '@/lib/brandArt';
+import { llmProviderArt } from '@/lib/providerArt';
 import { SUBSCRIPTIONS } from '@/api/oauth';
 import type { AccessType } from '@/components/model/types';
 import type { AccountPolicy } from '@/types/api';
@@ -29,7 +29,7 @@ import { RowButton, StepLoadFailed } from '../answers/parts';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
 // DALTON-HOOK(team-credentials): team-shared credentials hint & PM disconnect guard
 import { isDaltonAuth } from '@/config/daltonAuth';
-import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
+import { useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
 import { useAccount } from '@/hooks/useAccount';
 import { methodAllowed } from '@/lib/accountRules';
 import { OwnAccessNote } from '@/components/organization/OwnAccessNote';
@@ -50,9 +50,9 @@ const markOf = (p: { provider: string; brand_key?: string | null }) =>
  */
 // DALTON-HOOK(dalton-setup): omit Claude Code copy from OAuth method description in Dalton
 const METHODS: Array<{ id: Method; titleKey: string; descKey: string }> = [
-  { id: 'oauth', titleKey: 'setup.methodOAuth', descKey: isDaltonBuild ? 'setup.methodOAuthDescDalton' : 'setup.methodOAuthDesc' },
-  { id: 'api_key', titleKey: 'setup.methodApiKey', descKey: 'setup.methodApiKeyDesc' },
-  ...(isPlatformMode ? [] : [{ id: 'local' as const, titleKey: 'setup.methodLocal', descKey: 'setup.methodLocalDesc' }]),
+  { id: 'oauth', titleKey: 'setup:methodOAuth', descKey: isDaltonBuild ? 'setup:methodOAuthDescDalton' : 'setup:methodOAuthDesc' },
+  { id: 'api_key', titleKey: 'setup:methodApiKey', descKey: 'setup:methodApiKeyDesc' },
+  ...(isPlatformMode ? [] : [{ id: 'local' as const, titleKey: 'setup:methodLocal', descKey: 'setup:methodLocalDesc' }]),
 ];
 
 function MethodMark({ method }: { method: Method }) {
@@ -108,7 +108,7 @@ function ConnectedSummary({
           ))}
         </span>
         <span className="flex-1 text-sm font-medium" style={{ color: 'var(--color-text-primary)' }}>
-          {t('setup.providersConnected', { count: providers.length })}
+          {t('setup:providersConnected', { count: providers.length })}
         </span>
         <span className="inline-flex items-center gap-1 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
           {t('modelAccess.manage')}
@@ -137,10 +137,10 @@ function ConnectedSummary({
                   color: 'var(--color-text-tertiary)',
                 }}
               >
-                {p.access_type === 'oauth' ? t('setup.oauthBadge')
-                  : p.access_type === 'local' ? t('setup.localBadge')
-                  : p.access_type === 'coding_plan' ? t('setup.codingPlanBadge')
-                  : t('setup.apiKeyBadge')}
+                {p.access_type === 'oauth' ? t('setup:oauthBadge')
+                  : p.access_type === 'local' ? t('setup:localBadge')
+                  : p.access_type === 'coding_plan' ? t('setup:codingPlanBadge')
+                  : t('setup:apiKeyBadge')}
               </span>
               {/* The deployment's own key or server: nothing of the user's to remove.
                   DALTON-HOOK(team-credentials): and a non-PM team member never
@@ -152,7 +152,7 @@ function ConnectedSummary({
                   className="text-xs shrink-0 px-2 py-1 rounded transition-colors hover:opacity-80"
                   style={{ color: 'var(--color-loss)' }}
                 >
-                  {p.access_type === 'oauth' ? t('setup.disconnectProvider') : t('setup.removeProvider')}
+                  {p.access_type === 'oauth' ? t('setup:disconnectProvider') : t('setup:removeProvider')}
                 </button>
               )}
             </li>
@@ -222,7 +222,7 @@ export default function MethodStep() {
 
   const handleRedeemInvitation = useCallback(async () => {
     if (!invitationCode.trim()) {
-      setInvitationError(t('setup.invitationErrorEmpty'));
+      setInvitationError(t('setup:invitationErrorEmpty'));
       return;
     }
 
@@ -246,9 +246,9 @@ export default function MethodStep() {
       const detail = err?.response?.data?.detail;
 
       if (status === 404) {
-        setInvitationError(t('setup.invitationErrorInvalid'));
+        setInvitationError(t('setup:invitationErrorInvalid'));
       } else if (status === 410) {
-        setInvitationError(t('setup.invitationErrorExpired'));
+        setInvitationError(t('setup:invitationErrorExpired'));
       } else if (status === 409) {
         // 409 = this user already redeemed the code — they have access.
         // Treat same as successful redemption: grant local access + navigate.
@@ -261,9 +261,9 @@ export default function MethodStep() {
       } else if (typeof detail === 'string') {
         setInvitationError(detail);
       } else if (detail && typeof detail === 'object' && 'message' in detail) {
-        setInvitationError(detail.message || t('setup.invitationErrorGeneric'));
+        setInvitationError(detail.message || t('setup:invitationErrorGeneric'));
       } else {
-        setInvitationError(t('setup.invitationErrorGeneric'));
+        setInvitationError(t('setup:invitationErrorGeneric'));
       }
     } finally {
       setRedeemingInvitation(false);
@@ -283,23 +283,23 @@ export default function MethodStep() {
     <div>
       <WizardStepHeader
         titleId={headingId}
-        title={canSkip ? t('setup.addAnotherProviderHeading') : t('setup.methodTitle')}
-        helper={canSkip ? t('setup.addMoreProviders') : t('setup.methodSubtitle')}
+        title={canSkip ? t('setup:addAnotherProviderHeading') : t('setup:methodTitle')}
+        helper={canSkip ? t('setup:addMoreProviders') : t('setup:methodSubtitle')}
       />
       <div className="flex flex-col gap-4 sm:gap-6">
       {/* DALTON-HOOK(dalton-setup): inline load-failure notice with retry for admins / sharing-off users while preserving connect entries */}
       {readFailed && effectiveCanManage && (
         <div data-testid="setup-load-failed">
           <FlowFailure
-            title={t('setup.answers.loadFailed')}
-            action={<RowButton onClick={team.retry}>{t('setup.answers.tryAgain')}</RowButton>}
+            title={t('setup:answers.loadFailed')}
+            action={<RowButton onClick={team.retry}>{t('setup:answers.tryAgain')}</RowButton>}
           />
         </div>
       )}
       {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
       {isDaltonAuth && isTeamShared && !teamManagedByAdmin && (
         <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-          {TEAM_SHARED_CREDENTIALS_HINT}
+          {t('modelAccess.teamSharedCredentialsHint')}
         </p>
       )}
       {teamManagedByAdmin && (
@@ -314,9 +314,9 @@ export default function MethodStep() {
           className="shell-box flex items-center justify-between gap-3 px-4 py-3"
         >
           <p className="text-sm" style={{ color: 'var(--color-text-secondary)' }}>
-            {t('setup.answers.default.teamModelsEmpty')}
+            {t('setup:answers.default.teamModelsEmpty')}
           </p>
-          <RowButton onClick={team.retry}>{t('setup.answers.tryAgain')}</RowButton>
+          <RowButton onClick={team.retry}>{t('setup:answers.tryAgain')}</RowButton>
         </div>
       )}
       {/* Configured providers banner (visible when looping back) */}
@@ -371,7 +371,7 @@ export default function MethodStep() {
               className="inline-flex items-center gap-1.5 text-sm font-medium transition-colors self-start text-(--color-text-secondary) hover:text-(--color-text-primary)"
             >
               <Ticket className="h-4 w-4" />
-              {t('setup.invitationCodeLink')}
+              {t('setup:invitationCodeLink')}
             </button>
           ) : (
             <div className="shell-box flex flex-col gap-3 p-4">
@@ -379,7 +379,7 @@ export default function MethodStep() {
                 className="text-sm font-medium"
                 style={{ color: 'var(--color-text-primary)' }}
               >
-                {t('setup.invitationCodeLabel')}
+                {t('setup:invitationCodeLabel')}
               </label>
               <div className="flex gap-2">
                 <Input
@@ -388,7 +388,7 @@ export default function MethodStep() {
                     setInvitationCode(e.target.value);
                     setInvitationError(null);
                   }}
-                  placeholder={t('setup.invitationCodePlaceholder')}
+                  placeholder={t('setup:invitationCodePlaceholder')}
                   className="flex-1"
                   autoComplete="off"
                   spellCheck={false}
@@ -404,10 +404,10 @@ export default function MethodStep() {
                       <span aria-hidden="true" className="mr-1.5 shrink-0">
                         <Loader size={16} className="text-current" />
                       </span>
-                      {t('setup.redeeming')}
+                      {t('setup:redeeming')}
                     </>
                   ) : (
-                    t('setup.redeem')
+                    t('setup:redeem')
                   )}
                 </Button>
               </div>
@@ -425,7 +425,7 @@ export default function MethodStep() {
                 className="text-xs self-start"
                 style={{ color: 'var(--color-text-tertiary)' }}
               >
-                {t('setup.chooseMethodInstead')}
+                {t('setup:chooseMethodInstead')}
               </button>
             </div>
           )}
@@ -435,7 +435,7 @@ export default function MethodStep() {
       </div>
 
       <SetupFooter
-        skip={canSkip ? { label: t('setup.skipToModels'), onClick: handleSkipToDefaults } : null}
+        skip={canSkip ? { label: t('setup:skipToModels'), onClick: handleSkipToDefaults } : null}
         primary={null}
       />
     </div>

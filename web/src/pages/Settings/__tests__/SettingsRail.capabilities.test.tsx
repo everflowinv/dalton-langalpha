@@ -18,6 +18,7 @@ vi.mock('@/hooks/useCapabilities', async (importOriginal) => {
         actual.hasRequiredCapability(mockCapabilities, req),
       brandName: 'Dalton',
       fingerprint: 'test-fp',
+      tickerLogosEnabled: false,
       isLoading: false,
       isLoaded: true,
       isCoreBuild: true,

@@ -13,7 +13,7 @@ import { SetupFooter } from '../../SetupFooter';
 import { useProviderConnected, type LocationState } from './shared';
 // DALTON-HOOK(team-credentials): team-shared credentials hint
 import { isDaltonAuth } from '@/config/daltonAuth';
-import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
+import { useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
 
 /**
  * A provider of the user's own is not in the catalog. Its key is edited as a
@@ -102,22 +102,22 @@ function KeyStep({ state, form, fields, option, place }: {
           <ProviderTitle
             name={displayName}
             markProvider={place?.group.markProvider ?? entry.provider}
-            title={t('setup.connectTitle', { provider: displayName })}
+            title={t('setup:connectTitle', { provider: displayName })}
             size="md"
           />
         }
         helper={
           form.local
-            ? t('setup.localServerDesc')
+            ? t('setup:localServerDesc')
             : entry.access_type === 'coding_plan'
-              ? t('setup.codingPlanDesc')
-              : t('setup.apiKeyInputDesc')
+              ? t('setup:codingPlanDesc')
+              : t('setup:apiKeyInputDesc')
         }
       />
       {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
       {isDaltonAuth && isTeamShared && !teamManagedByAdmin && (
         <p className="text-xs -mt-3 mb-4" style={{ color: 'var(--color-text-tertiary)' }}>
-          {TEAM_SHARED_CREDENTIALS_HINT}
+          {t('modelAccess.teamSharedCredentialsHint')}
         </p>
       )}
       {teamManagedByAdmin && (
@@ -128,12 +128,12 @@ function KeyStep({ state, form, fields, option, place }: {
       {/* DALTON-HOOK(team-credentials): hide API key inputs and save action for non-PM members under team sharing */}
       {!teamManagedByAdmin && <div className="flex flex-col gap-4">{fields}</div>}
       <SetupFooter
-        back={{ label: t('setup.back'), onClick: handleBack }}
+        back={{ label: t('setup:back'), onClick: handleBack }}
         primary={
           teamManagedByAdmin
             ? null
             : {
-                label: form.saving ? t('setup.saving') : t('setup.continue'),
+                label: form.saving ? t('setup:saving') : t('setup:continue'),
                 onClick: handleSave,
                 disabled: !form.canSave,
                 busy: form.saving,

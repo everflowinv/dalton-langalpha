@@ -27,11 +27,12 @@ import { cn } from '@/lib/utils';
 import { parseFragment, type FileLocation, type OpenFileHandler } from '../utils/fileLocation';
 import FileHeaderActions from './FileHeaderActions';
 import { useDownloadState, workspaceDownloadKey } from '../utils/downloadNotice';
+import { withCopy } from '@/i18n'; // DALTON-HOOK(monitors)
 import './FilePanel.css';
 
 const ExportPreviewModal = React.lazy(() => import('./ExportPreviewModal'));
 // DALTON-HOOK(external-share-guard): the external member's stop-only dialog.
-const PublishDialog = React.lazy(() => import('./PublishDialog'));
+const PublishDialog = React.lazy(withCopy(() => import('./PublishDialog'), ['monitors']));
 
 import type { ContextPayload } from '@/components/ui/chat-input.types';
 import type { ApiAdapter, ChartTabSpec, PanelAccess, PanelTarget } from './filePanel/types';
@@ -225,6 +226,8 @@ function FilePanel({
 }: FilePanelProps): React.ReactElement {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
+  // DALTON-HOOK(mobile-web): only the currently visible mobile FilePanel elevates its own portaled overlays (hidden cached ChatViews stay at base z-index)
+  const mobileOverlayActive = isMobile && isActive !== false;
   const panelRef = useRef<HTMLDivElement>(null);
   // The tree waits for the measurement: rendered docked before it, a narrow
   // panel painted the column for a frame and then animated it shut.
@@ -276,6 +279,8 @@ function FilePanel({
   // A share has no workspace id of its own, so its bodies are scoped to this
   // mount: two shares open at once must not read each other's bytes.
   const mountId = useId();
+  // DALTON-HOOK(mobile-web): stable menu id linking per-row ⋯ buttons (aria-controls) to FileContextMenu
+  const contextMenuId = `${mountId}-file-menu`;
   const scope = workspaceId || `adapter:${mountId}`;
   const readers = useMemo(
     () => ({
@@ -355,6 +360,10 @@ function FilePanel({
 
   const { selectionTooltip, selectionComposing, beginReply, dismissSelection, contentWrapperRef, contextMenu, setContextMenu, handleEditorTextSelect, handleAddSelectionContext, askAboutWords } =
     useSelectionContext({ selectedFile, fileContent, onAddContext });
+  // DALTON-HOOK(mobile-web): switching chats hides this panel without a pointer press outside, so its open file menu closes here
+  useEffect(() => {
+    if (isActive === false) setContextMenu(null);
+  }, [isActive, setContextMenu]);
   const commentUi = useCommentUi(onAddContext ? askAboutWords : null);
   // DALTON-HOOK(team-sharing): no comment layer, docked comment box or publish
   // entry beside a read-only thread (teamReadOnly covers a colleague's
@@ -385,6 +394,22 @@ function FilePanel({
   // for a link they already made public.
   const [unshareTarget, setUnshareTarget] = useState<string | null>(null);
   const [pageCounts, setPageCounts] = useState<Record<string, number>>({});
+  // DALTON-HOOK(mobile-web): track the document shown inside a read-only HTML ViewFrame
+  // (e.g. external member preview) so in-frame links to B collapse mobile More to "Open in its own tab".
+  const [readOnlyHtmlDoc, setReadOnlyHtmlDoc] = useState<{ tabId: string; path: string | null }>({
+    tabId: activeTab.id,
+    path: null,
+  });
+  const handleReadOnlyHtmlDocChange = useCallback(
+    (docPath: string | null) => {
+      setReadOnlyHtmlDoc((prev) =>
+        prev.tabId === activeTab.id && prev.path === docPath
+          ? prev
+          : { tabId: activeTab.id, path: docPath },
+      );
+    },
+    [activeTab.id],
+  );
 
   // DALTON-HOOK(multi-file-upload): uploadStatus carries the batch position
   // ("第 i / 共 n 个") shown above the bar while a serial multi-file upload runs
@@ -617,14 +642,25 @@ function FilePanel({
     selectedFile ? workspaceDownloadKey(workspaceId, selectedFile) : null,
   );
   const contextMenuDownloadState = useDownloadState(
-    contextMenu ? workspaceDownloadKey(workspaceId, contextMenu.filePath) : null,
+    contextMenu && contextMenu.kind !== 'dir' ? workspaceDownloadKey(workspaceId, contextMenu.filePath) : null,
   );
   const handleDownloadSelected = canDownload && selectedFile ? () => downloads.download(selectedFile) : undefined;
   const handleDownloadInFallback = canDownload && selectedFile ? () => downloads.downloadQuietly(selectedFile) : undefined;
 
   const handleContextMenuAction = useCallback((action: FileMenuAction, filePath: string) => {
+    const dirFiles = contextMenu?.dirFiles ?? [];
     setContextMenu(null);
-    if (action === 'add-context' && onAddContext) {
+    // DALTON-HOOK(mobile-web): handle directory-row menu actions (expand/collapse, select folder files, download folder files)
+    if (action === 'toggle-dir') {
+      filter.toggleDir(filePath);
+    } else if (action === 'select-dir') {
+      if (!readOnly && dirFiles.length > 0) {
+        selection.setSelectMode(true);
+        selection.toggleDirSelect(dirFiles);
+      }
+    } else if (action === 'download-dir') {
+      if (canDownload && dirFiles.length > 0) void downloads.downloadMany(dirFiles);
+    } else if (action === 'add-context' && onAddContext) {
       tabs.openFile(filePath, { pin: true });
       onAddContext({ kind: 'file', path: filePath });
     } else if (action === 'add-to-memo') {
@@ -639,7 +675,7 @@ function FilePanel({
     } else if (action === 'download-many') {
       void downloads.downloadMany([...selection.selectedPaths]);
     }
-  }, [onAddContext, teamReadOnly, handleAddToMemo, openFileAt, downloads, selection.selectedPaths, setContextMenu, tabs]);
+  }, [contextMenu, filter, readOnly, canDownload, onAddContext, teamReadOnly, handleAddToMemo, openFileAt, downloads, selection, setContextMenu, tabs]);
 
   /**
    * Coming back to a tab whose file the agent has rewritten re-reads it. The
@@ -676,7 +712,7 @@ function FilePanel({
   // same guard is handed down to the tool tabs, whose result views carry links
   // off the route.
   const askDiscard = useCallback((discard: () => void) => ask(
-    { title: t('filePanel.discardTitle'), message: t('filePanel.discardUnsaved'), confirmLabel: t('filePanel.discard') },
+    { title: t('filePanel:discardTitle'), message: t('filePanel:discardUnsaved'), confirmLabel: t('filePanel:discard') },
     discard,
   ), [ask, t]);
 
@@ -818,10 +854,10 @@ function FilePanel({
   const meta = useMemo(() => {
     if (!selectedFile || !body) return null;
     const pages = pageCounts[selectedFile];
-    if (body.mime === 'pdf') return pages ? t('filePanel.metaPages', { count: pages }) : null;
+    if (body.mime === 'pdf') return pages ? t('filePanel:metaPages', { count: pages }) : null;
     if (body.content == null) return null;
     const lines = countLines(body.content);
-    return body.truncated ? t('filePanel.metaFirstLines', { count: lines }) : t('filePanel.metaLines', { count: lines });
+    return body.truncated ? t('filePanel:metaFirstLines', { count: lines }) : t('filePanel:metaLines', { count: lines });
   }, [selectedFile, body, pageCounts, t]);
 
   /** Opening a running app from the tree: the tab it already has, or a new one. */
@@ -839,17 +875,17 @@ function FilePanel({
   const liveViews: PanelLauncher[] = readOnly ? [] : [
     {
       key: 'chart',
-      label: t('filePanel.chartTab'),
+      label: t('filePanel:chartTab'),
       icon: CandlestickChart,
       open: () => { cancelPending(); tabs.openChart({ symbol: lastChartSymbol(workspaceId, { persist: persistStrip }) }); },
     },
-    ...(browserView && workspaceId && browserHere ? [{ key: 'browser', label: t('filePanel.browserTab'), icon: Globe, open: () => { cancelPending(); tabs.openBrowser(); } }] : []),
+    ...(browserView && workspaceId && browserHere ? [{ key: 'browser', label: t('filePanel:browserTab'), icon: Globe, open: () => { cancelPending(); tabs.openBrowser(); } }] : []),
   ];
 
   // Pinned above the tree's listing: the reader's stores, then the live views.
   const pinned: PanelLauncher[] = [
-    ...(stores ? [{ key: 'memory', label: t('filePanel.tabs.memory'), icon: BookMarked, open: openMemory }] : []),
-    ...(viewInMemo ? [{ key: 'memo', label: t('filePanel.tabs.memo'), icon: ScrollText, open: viewInMemo }] : []),
+    ...(stores ? [{ key: 'memory', label: t('filePanel:tabs.memory'), icon: BookMarked, open: openMemory }] : []),
+    ...(viewInMemo ? [{ key: 'memo', label: t('filePanel:tabs.memo'), icon: ScrollText, open: viewInMemo }] : []),
     ...liveViews,
   ];
 
@@ -863,9 +899,9 @@ function FilePanel({
   // it already has.
   const newTabMenu: NewTabMenu = {
     kinds: [
-      { key: 'files', label: t('filePanel.files'), icon: FolderTree, open: newTab },
+      { key: 'files', label: t('filePanel:files'), icon: FolderTree, open: newTab },
       ...liveViews,
-      ...(openStatus ? [{ key: 'status', label: t('filePanel.tabs.status'), icon: Activity, open: openStatus }] : []),
+      ...(openStatus ? [{ key: 'status', label: t('filePanel:tabs.status'), icon: Activity, open: openStatus }] : []),
     ],
     apps: previews.previews.map((app) => ({
       key: `app:${app.port}`, label: app.title || `:${app.port}`, icon: LayoutDashboard, open: () => openPreviewTab(app.port),
@@ -943,8 +979,9 @@ function FilePanel({
           chip={focus.chip && (
             <FocusChip state={focus.chip} onJump={focus.jump} onDismiss={() => { focus.dismiss(); tabs.clearLocation(activeTab.id); }} />
           )}
-          artifact={fileComments.crumbs}
-          tools={fileComments.tools}
+          // DALTON-HOOK(mobile-web): fold HTML version/update, comment, dashboard pin, and publish/bind actions into the mobile More menu using the same fileComments visibility conditions as desktop crumbs
+          artifact={isMobile && viewer === 'html' && !edit.isEditing ? null : fileComments.crumbs}
+          tools={isMobile && viewer === 'html' && !edit.isEditing ? null : fileComments.tools}
           actions={(
             <FileHeaderActions
               selectedFile={selectedFile}
@@ -963,7 +1000,9 @@ function FilePanel({
               // DALTON-HOOK(external-share-guard): external members may stop a
               // public link but never start one.
               openUnshareOnly={callerTier === 'external' ? (path) => setUnshareTarget(path) : null}
-              artifactDoc={fileComments.doc}
+              artifactDoc={fileComments.doc ?? (readOnlyHtmlDoc.tabId === activeTab.id ? readOnlyHtmlDoc.path : null)}
+              // DALTON-HOOK(mobile-web): allow mobile HTML More menu to open a linked in-frame document as its own tab
+              onOpenDocAsTab={(docPath) => { void openFileAt(docPath, { pin: true }); }}
               htmlSource={htmlView.source}
               // Only where the viewer is up to switch: not while loading, nor on an error card.
               onToggleHtmlSource={viewer === 'html' && !fileLoading && !fileError ? () => setHtmlSource((v) => !v) : null}
@@ -977,6 +1016,19 @@ function FilePanel({
               saveError={edit.saveError}
               onSave={edit.handleSave}
               onCancelEdit={edit.handleCancelEdit}
+              // DALTON-HOOK(mobile-web): expose comment, queued-send, pin-as-dashboard, version controls, and readAt inside the mobile HTML More menu whenever desktop crumbs would render them
+              mobileHtmlTools={
+                isMobile && viewer === 'html' && !edit.isEditing && fileComments.tools && fileComments.path && comments
+                  ? {
+                      tabId: activeTab.id,
+                      ui: comments,
+                      threadId,
+                      versionView: fileComments.view?.versionView ?? null,
+                      modeDisabled: fileComments.view?.versionView.version !== null || htmlView.source,
+                      readAt: readAt ?? null,
+                    }
+                  : null
+              }
             />
           )}
         />
@@ -985,7 +1037,7 @@ function FilePanel({
       {uploadStatus && (
         // DALTON-HOOK(multi-file-upload): which file of the batch is up now
         <p className="px-3 pt-2 pb-1.5 text-xs" style={{ color: 'var(--color-text-secondary)' }}>
-          {t('filePanel.uploadingNth', {
+          {t('filePanel:uploadingNth', {
             current: uploadStatus.current,
             total: uploadStatus.total,
             name: uploadStatus.fileName,
@@ -1034,7 +1086,7 @@ function FilePanel({
           {canDropHere && isDragOver && (
             <div className="file-panel-drag-overlay">
               <Upload className="h-8 w-8" style={{ color: 'var(--color-accent-primary)' }} />
-              <span>{t('filePanel.dropToUpload')}</span>
+              <span>{t('filePanel:dropToUpload')}</span>
             </div>
           )}
           {/* Still mounted under a full tree, at no width: the running apps'
@@ -1042,13 +1094,15 @@ function FilePanel({
           <div className="file-panel-viewer">
             {/* font-content only while reading a file: the tree stays on the UI font. */}
             <div className={`file-panel-content${selectedFile ? ' font-content' : ''}`} ref={contentWrapperRef}>
-              <ImageReply surfaceRef={contentWrapperRef} enabled={!!onAddContext && isActive !== false} paused={!!selectionTooltip || commentUi.modeTab === activeTab.id} agentName={agentName} onAddContext={onAddContext} />
+              {/* DALTON-HOOK(mobile-web): tag portaled ImageReply and SelectionQuote with mobileOverlayActive so only this active mobile FilePanel's overlays elevate */}
+              <ImageReply surfaceRef={contentWrapperRef} enabled={!!onAddContext && isActive !== false} paused={!!selectionTooltip || commentUi.modeTab === activeTab.id} mobileOverlay={mobileOverlayActive} agentName={agentName} onAddContext={onAddContext} />
               {selectionTooltip && selectedFile && (
                 <SelectionQuote
                   key={selectionTooltip.id}
                   anchor={selectionTooltip}
                   composing={selectionComposing}
                   hidden={!onAddContext || isActive === false}
+                  mobileOverlay={mobileOverlayActive}
                   boundsRef={contentWrapperRef}
                   label={t('context.quote.from', { name: selectionSourceName(selectionTooltip.path ?? selectedFile, selectionTooltip) })}
                   placeholder={agentName ? t('context.quote.reply', { name: agentName }) : t('context.quote.replyGeneric')}
@@ -1112,6 +1166,8 @@ function FilePanel({
                   teamReadOnly,
                   htmlSource: htmlView.source,
                   htmlArtifact: fileComments.view,
+                  // DALTON-HOOK(mobile-web): track shown doc path in read-only HTML ViewFrame
+                  onHtmlDocChange: handleReadOnlyHtmlDocChange,
                   comments: fileComments.target,
                 }}
                 onPageCount={onPageCount}
@@ -1149,6 +1205,8 @@ function FilePanel({
               onAddContext={onAddContext}
               setContextMenu={setContextMenu}
               activeContextPath={contextMenu?.filePath ?? null}
+              // DALTON-HOOK(mobile-web): link per-row ⋯ buttons to FileContextMenu via aria-controls
+              contextMenuId={contextMenuId}
               readOnly={readOnly}
               uploadDisabled={uploadProgress !== null || uploadSaving}
               onUpload={() => fileInputRef.current?.click()}
@@ -1171,19 +1229,24 @@ function FilePanel({
       {/* DALTON-HOOK(multi-file-upload): multi-select picker */}
       <input ref={fileInputRef} type="file" multiple className="hidden" onChange={handleFileInputChange} />
 
-      {contextMenu && (
+      {/* DALTON-HOOK(mobile-web): a cached, hidden panel never shows its file menu over another chat */}
+      {contextMenu && isActive !== false && (
         <FileContextMenu
+          // DALTON-HOOK(mobile-web): stable menu id and directory select capability
+          id={contextMenuId}
           menu={contextMenu}
           onAction={handleContextMenuAction}
           onClose={() => setContextMenu(null)}
           canAddContext={!!onAddContext}
           // DALTON-HOOK(team-sharing): hide Add to Memo in colleague mirror mode
-          memoState={!teamReadOnly && memos && memoMimeForName(contextMenu.filePath)
+          memoState={contextMenu.kind !== 'dir' && !teamReadOnly && memos && memoMimeForName(contextMenu.filePath)
             ? (memoedMap.has(contextMenu.filePath) ? 'present' : 'absent')
             : null}
           canDownload={canDownload}
+          canSelectDir={!readOnly}
+          mobileOverlay={mobileOverlayActive}
           downloadState={contextMenuDownloadState}
-          selectedCount={selection.selectedPaths.has(contextMenu.filePath) ? selection.selectedPaths.size : 0}
+          selectedCount={contextMenu.kind !== 'dir' && selection.selectedPaths.has(contextMenu.filePath) ? selection.selectedPaths.size : 0}
         />
       )}
 

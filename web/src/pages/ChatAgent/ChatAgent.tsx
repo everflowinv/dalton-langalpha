@@ -22,10 +22,8 @@ import { useCloseComputersOnLeave } from './hooks/computerPanelStore';
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { useWorkspace } from '@/hooks/useWorkspace';
 import { useTeamReadOnly } from './components/dalton/TeamSharing';
+import { ThreadGallery, WorkspaceGallery } from './galleries';
 import './ChatAgent.css';
-
-const WorkspaceGallery = React.lazy(() => import('./components/WorkspaceGallery'));
-const ThreadGallery = React.lazy(() => import('./components/ThreadGallery'));
 
 // Cache key format used by useChatViewCache — `${workspaceId}-${threadId}`.
 // Only needed by cache.updateKey() calls; the resolvingRef below is keyed by

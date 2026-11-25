@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, type KeyboardEvent } from 'react';
+import { useEffect, useId, useMemo, useRef, useSyncExternalStore, type CSSProperties, type KeyboardEvent } from 'react'; // DALTON-HOOK(mobile-web)
 import { useTranslation } from 'react-i18next';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { useIsMobile } from '@/hooks/useIsMobile';
@@ -40,12 +40,32 @@ interface CommandPaletteProps {
  * kind (`$ / # " @ >`), and Tab on a workspace or thread to that place.
  * Pinned near the top so it grows downward without the field moving.
  */
+// DALTON-HOOK(mobile-web): read visualViewport height via useSyncExternalStore so the mobile palette shrinks above the soft keyboard
+function subscribeVisualViewport(cb: () => void): () => void {
+  const vp = typeof window !== 'undefined' ? window.visualViewport : null;
+  if (!vp) return () => {};
+  vp.addEventListener('resize', cb);
+  vp.addEventListener('scroll', cb);
+  return () => {
+    vp.removeEventListener('resize', cb);
+    vp.removeEventListener('scroll', cb);
+  };
+}
+function getVisualViewportHeight(): number | null {
+  return typeof window !== 'undefined' && window.visualViewport ? window.visualViewport.height : null;
+}
+
 export default function CommandPalette({ open, onClose, typed, returnFocus }: CommandPaletteProps) {
   const { t } = useTranslation();
+  const isMobile = useIsMobile(); // DALTON-HOOK(mobile-web)
   // Radix hands focus back only to a Dialog.Trigger, which the palette has
   // none of, so it hands it back itself, to where its host saw it last.
   const returnRef = useRef<HTMLElement | null>(null);
   const { archiveThread, dialog: archiveConfirm } = useArchiveThread();
+  const visualVh = useSyncExternalStore(subscribeVisualViewport, getVisualViewportHeight, () => null);
+  const mobileStyle = open && isMobile && visualVh != null
+    ? ({ '--command-palette-vh': `${visualVh}px` } as CSSProperties)
+    : undefined;
 
   return (
     <>
@@ -53,6 +73,8 @@ export default function CommandPalette({ open, onClose, typed, returnFocus }: Co
         <DialogContent
           variant="command"
           className="command-palette"
+          // DALTON-HOOK(mobile-web): cap mobile height to visualViewport
+          style={mobileStyle}
           onOpenAutoFocus={(e) => {
             returnRef.current = returnFocus();
             // ⌘K opens a place to type, not a walk through the page with the
@@ -74,7 +96,8 @@ export default function CommandPalette({ open, onClose, typed, returnFocus }: Co
             // back out of a row's actions or a view before it closes. Radix
             // hears the key first, on the document's capture phase, so the
             // field could not stop it from there.
-            if (isImeComposing(e) || (e.target as Element | null)?.closest?.('.command-palette-field')) e.preventDefault();
+            // DALTON-HOOK(mobile-web): only defer Escape to the text input itself so Escape on mobile Back/Cancel buttons closes cleanly
+            if (isImeComposing(e) || (e.target as Element | null)?.matches?.('.command-palette-field input')) e.preventDefault();
           }}
         >
           <DialogTitle className="sr-only">{t('palette.title')}</DialogTitle>
@@ -228,6 +251,8 @@ function PaletteBody({ open, onClose, typed, archiveThread }: BodyProps) {
       onClose();
       if (next !== value.trim()) save(next);
     } else if (e.key === 'Tab') {
+      // DALTON-HOOK(mobile-web): let Tab/Shift+Tab reach mobile Back/Cancel buttons instead of trapping focus in the input
+      if (isMobile) return;
       e.preventDefault();
       e.stopPropagation();
       if (e.shiftKey) dispatch({ type: 'endEdit' });
@@ -265,6 +290,8 @@ function PaletteBody({ open, onClose, typed, archiveThread }: BodyProps) {
       if (actionsOf || frames.length > 1) back();
       else onClose();
     } else if (e.key === 'Tab') {
+      // DALTON-HOOK(mobile-web): on mobile, allow Tab/Shift+Tab to move between search input and Back/Cancel buttons
+      if (isMobile) return;
       // Focus stays in the field whatever Tab does: the dialog's own trap
       // would hand it to whatever else in the dialog takes focus.
       e.preventDefault();
@@ -318,6 +345,14 @@ function PaletteBody({ open, onClose, typed, archiveThread }: BodyProps) {
         maxLength={editing?.maxLength}
         chips={chips}
         onLeave={() => dispatch(editing ? { type: 'endEdit' } : { type: 'leave' })}
+        // DALTON-HOOK(mobile-web): explicit touch back & cancel controls on mobile
+        onBack={isMobile && (editing || actionsOf || frames.length > 1)
+          ? () => {
+              if (editing) dispatch({ type: 'endEdit' });
+              else back();
+            }
+          : undefined}
+        onCancel={isMobile ? onClose : undefined}
         trailing={trailing}
         busy={view.rowsPending || view.serverMayLead || view.pending || (!!waiting && placePending)}
         combobox={{

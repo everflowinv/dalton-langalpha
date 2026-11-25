@@ -239,6 +239,8 @@ async def _demote_unservable(
 def subagent_roles(
     roster: ResolvedSubagents, model_pref: dict, turn_model: str | None,
     *, role: AgentRole = "analyst",
+    # DALTON-HOOK(antigravity-series): enforce deployment/org model policy on mapped Antigravity variants
+    policy: Policy | None = None,
 ) -> list[LLMRole]:
     """A client role for each subagent ``role`` compiles that pins a model or an effort.
 
@@ -247,15 +249,53 @@ def subagent_roles(
     effort: a copy of the main client cannot carry it, because a level is
     turned into request parameters when a client is built.
     """
+    # DALTON-HOOK(antigravity-series): map subagent definition reasoning_effort on
+    # built-in Antigravity models to the closest allowed series variant instead of
+    # forwarding raw reasoning_effort, and preserve follow_effort for fallback to main_model.
+    from src.dalton.llm.antigravity_series import (
+        ANTIGRAVITY_PROVIDER,
+        resolve_antigravity_effort_model,
+    )
+    from src.llms.llm import LLM as LLMFactory
+
+    mc = LLMFactory.get_model_config()
+    allowed_fn = (
+        (lambda m: policy_refuses(policy, model_pref, m) is None)
+        if policy is not None
+        else None
+    )
     roles: list[LLMRole] = []
     for defn in roster.for_role(role):
         effort = defn.reasoning_effort
         runs = defn.model or (turn_model if effort else None)
         if runs:
+            entry = mc.get_model_config(runs) if not user_models.custom_model(model_pref, runs) else None
+            is_builtin_antigravity = (
+                isinstance(entry, dict) and entry.get("provider") == ANTIGRAVITY_PROVIDER
+            )
+            if is_builtin_antigravity and effort:
+                mapped = resolve_antigravity_effort_model(
+                    runs, effort, model_config=mc, allowed_filter=allowed_fn
+                )
+                if mapped is not None:
+                    runs = mapped[0]
+            if policy is not None and policy_refuses(policy, model_pref, runs) is not None:
+                logger.warning(
+                    "[CHAT] Subagent %r resolved to %r which policy refuses; skipping role client",
+                    defn.name, runs,
+                )
+                continue
+            role_effort = (
+                None
+                if is_builtin_antigravity
+                else (effort or resolve_tuning(model_pref, runs).reasoning_effort)
+            )
             roles.append(LLMRole(
                 f"subagent:{defn.name}", runs,
-                reasoning_effort=effort or resolve_tuning(model_pref, runs).reasoning_effort,
-                effort_follows=bool(effort), own_client=True,
+                reasoning_effort=role_effort,
+                effort_follows=bool(effort),
+                follow_effort=effort if effort else None,
+                own_client=True,
                 # DALTON-HOOK(subagent-model-pin): a pinned model with no client
                 # must not run on a silent copy of the main client;
                 # demote_clientless turns it into Inherit and says so.

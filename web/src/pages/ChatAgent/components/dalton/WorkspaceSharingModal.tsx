@@ -3,7 +3,7 @@ import React, { useId, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { AlertTriangle, Share2 } from 'lucide-react';
+import { AlertTriangle, Share2, Users } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ModalShell } from '@/components/ui/ModalShell';
 import { SegmentedControl } from '@/components/ui/segmented-control';
@@ -12,6 +12,7 @@ import { ToggleSwitch } from '@/components/ui/switch';
 // confirm dialog, which would pull its animation library onto first load.
 import { DaltonInlineNotice } from '@/components/dalton/primitives/DaltonStatusBadge';
 import { TOOLBAR_CHIP_CLASS, toolbarChipStyle } from '@/components/dalton/primitives/DaltonToolbarPill';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { queryKeys } from '@/lib/queryKeys';
 import { cn } from '@/lib/utils';
 import {
@@ -109,7 +110,7 @@ export function useUpdateWorkspaceSettings(workspaceId: string) {
 export function WorkspaceSharingModal({
   workspaceId,
   readOnly = false,
-  compact: _compact = false,
+  compact = false,
 }: {
   workspaceId: string;
   readOnly?: boolean;
@@ -130,12 +131,19 @@ export function WorkspaceSharingModal({
   const [draftWeb, setDraftWeb] = useState<WorkspaceAccessLevel>('hidden');
   const [draftTeamMemory, setDraftTeamMemory] = useState<boolean | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const { hasCapability } = useCapabilities();
 
   if (open && draftTeamMemory === null && settingsData !== undefined) {
     setDraftTeamMemory(settingsData.team_memory_enabled === true);
   }
 
-  if (!workspaceId || isError || (isLoading && !data) || data?.is_home) {
+  if (
+    !hasCapability('colleague_sharing') ||
+    !workspaceId ||
+    isError ||
+    (isLoading && !data) ||
+    data?.is_home
+  ) {
     return null;
   }
 
@@ -226,20 +234,30 @@ export function WorkspaceSharingModal({
     <div
       className="inline-flex items-center relative"
       data-testid="workspace-sharing-control"
+      data-compact={compact ? 'true' : undefined}
     >
       <button
         type="button"
         onClick={handleOpen}
         data-testid="workspace-sharing-button"
+        data-compact={compact ? 'true' : undefined}
         className={cn(
           TOOLBAR_CHIP_CLASS,
           'press cursor-pointer hover:bg-(--color-bg-subtle)',
+          compact && 'tap-target w-8 justify-center px-0',
         )}
         style={toolbarChipStyle('neutral')}
         title={t('dalton.sharing.title')}
+        aria-label={compact ? t('dalton.sharing.title') : undefined}
       >
-        <Share2 className="h-3.5 w-3.5 shrink-0 opacity-75" />
-        <span>{t('dalton.sharing.title')}</span>
+        {compact ? (
+          <Users className="h-3.5 w-3.5 shrink-0 opacity-75" aria-hidden="true" />
+        ) : (
+          <>
+            <Share2 className="h-3.5 w-3.5 shrink-0 opacity-75" />
+            <span>{t('dalton.sharing.title')}</span>
+          </>
+        )}
       </button>
 
       {open &&

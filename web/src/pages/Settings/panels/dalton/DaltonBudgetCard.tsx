@@ -162,7 +162,7 @@ export function DaltonBudgetCard() {
       layout="padded"
       bodyClassName="space-y-5"
       action={
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2 min-w-0">
           {today && (
             <DaltonStatusBadge
               dot
@@ -236,7 +236,7 @@ export function DaltonBudgetCard() {
                   setDailyCapInput(e.target.value);
                   setBudgetSaved(false);
                 }}
-                className="w-36 h-8 text-xs tabular-nums"
+                className="w-full md:w-36 h-9 md:h-8 text-xs tabular-nums"
               />
             </SettingRow>
 
@@ -257,7 +257,7 @@ export function DaltonBudgetCard() {
                   setDefaultTaskCapInput(e.target.value);
                   setBudgetSaved(false);
                 }}
-                className="w-36 h-8 text-xs tabular-nums"
+                className="w-full md:w-36 h-9 md:h-8 text-xs tabular-nums"
               />
             </SettingRow>
 
@@ -271,7 +271,7 @@ export function DaltonBudgetCard() {
                   setTimezoneInput(tz);
                   setBudgetSaved(false);
                 }}
-                className="w-56"
+                className="w-full md:w-56"
               />
             </SettingRow>
           </div>
@@ -324,7 +324,7 @@ export function DaltonBudgetCard() {
                   onChange={(e) => setSelectedWorkspaceId(e.target.value)}
                   aria-label={t('dalton.budget.workspaceSelectPlaceholder')}
                   data-testid="dalton-budget-workspace-select"
-                  className="w-56 text-xs"
+                  className="w-full md:w-56 h-9 md:h-8 text-xs"
                 >
                   <option value="">{t('dalton.budget.workspaceSelectPlaceholder')}</option>
                   {workspaces.map((ws) => (
@@ -342,7 +342,7 @@ export function DaltonBudgetCard() {
                   value={wsCapInput}
                   onChange={(e) => setWsCapInput(e.target.value)}
                   data-testid="dalton-budget-workspace-cap-input"
-                  className="h-8 w-44 text-xs tabular-nums"
+                  className="h-9 md:h-8 w-full md:w-44 text-xs tabular-nums"
                 />
 
                 <Button
@@ -371,7 +371,7 @@ export function DaltonBudgetCard() {
                       key={`${cap.scope_kind}:${cap.scope_id}`}
                       title={displayName}
                       trailing={
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                           <span
                             className="text-xs font-medium tabular-nums"
                             style={{ color: 'var(--color-text-secondary)' }}

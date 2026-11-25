@@ -840,6 +840,204 @@ class TestDaltonRoutesRegistrationGate:
             resp = client.post(path)
             assert resp.status_code == 404, f"Core POST {path} returned {resp.status_code}"
 
+    def test_readonly_sharing_gets_return_neutral_200_when_disabled_and_writes_stay_404(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Read-only sharing GETs return neutral 200 without touching sharing tables when colleague_sharing is off."""
+        from src.dalton import settings as dalton_settings_mod
+        from src.server.database import workspace as ws_db_mod
+
+        _clean_cap_env(monkeypatch, app_env="core")
+        _install_no_outbound_http_guard(monkeypatch)
+        assert has_capability(CapabilityId.COLLEAGUE_SHARING) is False
+
+        async def _forbid_table_read(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("Sharing table helper must not be called when colleague_sharing is off")
+
+        monkeypatch.setattr(sharing_mod, "list_team_workspaces", _forbid_table_read)
+        monkeypatch.setattr(sharing_mod, "get_workspace_sharing", _forbid_table_read)
+        monkeypatch.setattr(sharing_mod, "get_user_cos_sharing", _forbid_table_read)
+        monkeypatch.setattr(dalton_settings_mod, "is_dalton_auth_enabled", lambda: False)
+        monkeypatch.setattr(dalton_settings_mod, "is_dalton_supabase_auth_enabled", lambda: False)
+
+        async def _fake_is_admin(_uid: str, **_kw: Any) -> bool:
+            return False
+
+        monkeypatch.setattr(access_tiers_mod, "is_admin_user", _fake_is_admin)
+
+        workspaces_by_id: dict[str, dict[str, Any]] = {
+            "ws-own": {"workspace_id": "ws-own", "user_id": "test-user-1", "status": "running"},
+            "ws-home": {
+                "workspace_id": "ws-home",
+                "user_id": "test-user-1",
+                "status": "running",
+                "is_home": True,
+            },
+            "ws-other": {"workspace_id": "ws-other", "user_id": "other-user-2", "status": "running"},
+        }
+
+        async def _fake_get_workspace(ws_id: str) -> dict[str, Any] | None:
+            return workspaces_by_id.get(ws_id)
+
+        monkeypatch.setattr(ws_db_mod, "get_workspace", _fake_get_workspace)
+
+        client = TestClient(_make_dalton_test_app("test-user-1"))
+
+        # 0. DALTON_ENABLED=false overrides repo default YAML and makes all 3 GETs return 404
+        for env_name in ("core", "dalton"):
+            _clean_cap_env(monkeypatch, app_env=env_name)
+            monkeypatch.setenv("DALTON_ENABLED", "false")
+            for path in (
+                "/api/v1/dalton/workspaces/team",
+                "/api/v1/dalton/workspaces/ws-own/sharing",
+                "/api/v1/dalton/sharing/user-settings",
+            ):
+                resp_disabled = client.get(path)
+                assert resp_disabled.status_code == 404, (
+                    f"Expected 404 for GET {path} when DALTON_ENABLED=false ({env_name}), got {resp_disabled.status_code}"
+                )
+                assert resp_disabled.json()["detail"] == "Dalton mode disabled"
+
+        # Restore Core with explicit DALTON_ENABLED=true and colleague_sharing off -> 200 neutral
+        _clean_cap_env(monkeypatch, app_env="core")
+        monkeypatch.setenv("DALTON_ENABLED", "true")
+        assert has_capability(CapabilityId.COLLEAGUE_SHARING) is False
+
+        # 1. GET /workspaces/team -> 200 neutral (non-Supabase -> caller_tier="internal")
+        resp_team = client.get("/api/v1/dalton/workspaces/team")
+        assert resp_team.status_code == 200, resp_team.text
+        assert resp_team.json() == {
+            "members": [],
+            "caller_tier": "internal",
+            "colleague_dispatch_enabled": False,
+        }
+
+        # 2. GET /workspaces/{id}/sharing -> 200 neutral for own workspace & own Home, 404 for others/missing
+        resp_own = client.get("/api/v1/dalton/workspaces/ws-own/sharing")
+        assert resp_own.status_code == 200, resp_own.text
+        assert resp_own.json() == {
+            "workspace_id": "ws-own",
+            "cos_access": "hidden",
+            "web_access": "hidden",
+            "is_home": False,
+            "can_edit": False,
+            "owner_external": False,
+            "colleague_dispatch_enabled": False,
+            "updated_by": None,
+            "updated_at": None,
+        }
+
+        resp_home = client.get("/api/v1/dalton/workspaces/ws-home/sharing")
+        assert resp_home.status_code == 200, resp_home.text
+        assert resp_home.json()["is_home"] is True
+        assert resp_home.json()["can_edit"] is False
+
+        resp_other = client.get("/api/v1/dalton/workspaces/ws-other/sharing")
+        assert resp_other.status_code == 404
+        assert resp_other.json()["detail"] == "Workspace not found"
+
+        resp_missing = client.get("/api/v1/dalton/workspaces/ws-missing/sharing")
+        assert resp_missing.status_code == 404
+        assert resp_missing.json()["detail"] == "Workspace not found"
+
+        # 3. GET /sharing/user-settings -> 200 neutral (non-Supabase -> caller_tier="internal")
+        resp_user = client.get("/api/v1/dalton/sharing/user-settings")
+        assert resp_user.status_code == 200, resp_user.text
+        assert resp_user.json() == {
+            "user_id": "test-user-1",
+            "cos_rw_enabled": False,
+            "cos_access": "hidden",
+            "can_edit": False,
+            "caller_tier": "internal",
+            "colleague_dispatch_enabled": False,
+            "updated_at": None,
+        }
+
+        # 4. Supabase auth enabled while colleague_sharing is off -> caller_tier resolved via get_user_tier
+        monkeypatch.setattr(dalton_settings_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+
+        async def _fake_require_team_reader(_uid: str) -> None:
+            return None
+
+        async def _fake_get_user_tier(_uid: str) -> str:
+            return "external"
+
+        monkeypatch.setattr(sharing_mod, "require_team_reader", _fake_require_team_reader)
+        monkeypatch.setattr(access_tiers_mod, "get_user_tier", _fake_get_user_tier)
+
+        resp_team_sb = client.get("/api/v1/dalton/workspaces/team")
+        assert resp_team_sb.status_code == 200
+        assert resp_team_sb.json() == {
+            "members": [],
+            "caller_tier": "external",
+            "colleague_dispatch_enabled": False,
+        }
+
+        resp_user_sb = client.get("/api/v1/dalton/sharing/user-settings")
+        assert resp_user_sb.status_code == 200
+        assert resp_user_sb.json()["caller_tier"] == "external"
+        assert resp_user_sb.json()["can_edit"] is False
+        assert resp_user_sb.json()["colleague_dispatch_enabled"] is False
+
+        # 5. Write endpoints remain 404 when colleague_sharing is off
+        resp_put_ws = client.put(
+            "/api/v1/dalton/workspaces/ws-own/sharing",
+            json={"web_access": "ro"},
+        )
+        assert resp_put_ws.status_code == 404
+
+        resp_put_user = client.put(
+            "/api/v1/dalton/sharing/user-settings",
+            json={"cos_rw_enabled": True},
+        )
+        assert resp_put_user.status_code == 404
+
+        # 6. When colleague_sharing is enabled, all 3 GETs preserve normal sharing reads
+        _clean_cap_env(monkeypatch, app_env="dalton")
+        monkeypatch.setattr(dalton_settings_mod, "is_dalton_auth_enabled", lambda: False)
+        monkeypatch.setattr(dalton_settings_mod, "is_dalton_supabase_auth_enabled", lambda: False)
+        monkeypatch.setattr(dalton_settings_mod, "is_colleague_dispatch_enabled", lambda: True)
+
+        async def _fake_list_team(_uid: str) -> list[dict[str, Any]]:
+            return [{"user_id": "u-2", "workspaces": []}]
+
+        async def _fake_get_ws_sharing(ws_id: str) -> dict[str, Any]:
+            return {
+                "workspace_id": ws_id,
+                "cos_access": "ro",
+                "web_access": "rw",
+                "updated_by": "test-user-1",
+                "updated_at": None,
+            }
+
+        async def _fake_get_user_cos(_uid: str) -> dict[str, Any]:
+            return {
+                "user_id": _uid,
+                "cos_rw_enabled": True,
+                "cos_access": "rw",
+                "updated_at": None,
+            }
+
+        monkeypatch.setattr(sharing_mod, "list_team_workspaces", _fake_list_team)
+        monkeypatch.setattr(sharing_mod, "get_workspace_sharing", _fake_get_ws_sharing)
+        monkeypatch.setattr(sharing_mod, "get_user_cos_sharing", _fake_get_user_cos)
+
+        resp_team_on = client.get("/api/v1/dalton/workspaces/team")
+        assert resp_team_on.status_code == 200
+        assert resp_team_on.json()["members"] == [{"user_id": "u-2", "workspaces": []}]
+        assert resp_team_on.json()["colleague_dispatch_enabled"] is True
+
+        resp_ws_on = client.get("/api/v1/dalton/workspaces/ws-own/sharing")
+        assert resp_ws_on.status_code == 200
+        assert resp_ws_on.json()["web_access"] == "rw"
+        assert resp_ws_on.json()["can_edit"] is True
+
+        resp_user_on = client.get("/api/v1/dalton/sharing/user-settings")
+        assert resp_user_on.status_code == 200
+        assert resp_user_on.json()["cos_rw_enabled"] is True
+        assert resp_user_on.json()["can_edit"] is True
+
     def test_capabilities_endpoint_in_core_and_everflow(
         self,
         monkeypatch: pytest.MonkeyPatch,

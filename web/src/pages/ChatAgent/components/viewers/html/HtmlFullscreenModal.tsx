@@ -35,7 +35,8 @@ export default function HtmlFullscreenModal(props: HtmlFullscreenModalProps) {
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         variant="centered"
-        className="html-fullscreen-modal w-[95vw]! h-[90vh]! max-h-[90vh]! p-0! overflow-hidden! max-w-[940px]!"
+        // DALTON-HOOK(mobile-web): full-bleed borderless fullscreen dialog on mobile (<768px) while preserving desktop classes
+        className="html-fullscreen-modal w-[100vw]! md:w-[95vw]! h-[100dvh]! md:h-[90vh]! max-h-[100dvh]! md:max-h-[90vh]! max-md:rounded-none! max-md:border-0! p-0! overflow-hidden! max-w-[100vw]! md:max-w-[940px]!"
         aria-describedby={undefined}
       >
         <DialogTitle className="sr-only">{title}</DialogTitle>
@@ -59,7 +60,7 @@ export default function HtmlFullscreenModal(props: HtmlFullscreenModalProps) {
               srcDoc={srcDoc}
               sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
               className="html-fullscreen-frame"
-              title={title || t('filePanel.fullscreen')}
+              title={title || t('filePanel:fullscreen')}
               // A srcDoc bakes the theme in at build time, and this one is
               // built once when the widget mounts inline, while the dialog
               // creates a fresh document from it on every open. Between those

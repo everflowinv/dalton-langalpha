@@ -94,10 +94,10 @@ export default function ManageView({
       <h2 className="title-font automation-form-title">
         {t(
           form.kind === 'script'
-            ? 'automation.editAutomation'
+            ? 'automation:editAutomation'
             : form.props.original
-              ? 'automation.editAutomation'
-              : 'automation.newAutomation',
+              ? 'automation:editAutomation'
+              : 'automation:newAutomation',
         )}
       </h2>
       <SwapCell as="div" className="items-start" swapKey={String(form.key)}>
@@ -139,9 +139,9 @@ export default function ManageView({
       />
     )
   ) : selection.kind === 'forbidden' ? (
-    <p className="automations-quiet-note">{t('automation.detailForbidden')}</p>
+    <p className="automations-quiet-note">{t('automation:detailForbidden')}</p>
   ) : selection.kind === 'missing' ? (
-    <p className="automations-quiet-note">{t(selection.runId ? 'automation.runLinkNotFound' : 'automation.notFound')}</p>
+    <p className="automations-quiet-note">{t(selection.runId ? 'automation:runLinkNotFound' : 'automation:notFound')}</p>
   ) : selection.kind === 'loading' ? (
     <ListSkeleton rows={4} />
   ) : null;

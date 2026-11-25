@@ -24,6 +24,7 @@ from src.dalton.budget.service import (
 from src.dalton.capabilities import (
     CapabilityId,
     get_capabilities_payload,
+    has_capability,
     require_capability,
     require_capability_dep,
 )
@@ -40,7 +41,7 @@ from src.dalton.services.provider_status import (
     get_providers_status,
     probe_provider,
 )
-from src.dalton.settings import get_dalton_settings
+from src.dalton.settings import get_dalton_settings, is_dalton_enabled
 from src.server.utils.api import CurrentUserId, handle_api_exceptions
 
 logger = logging.getLogger(__name__)
@@ -407,17 +408,34 @@ async def get_budget_today_endpoint(user_id: CurrentUserId) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-@router.get(
-    "/workspaces/team",
-    dependencies=[Depends(require_capability_dep(CapabilityId.COLLEAGUE_SHARING))],
-)
+@router.get("/workspaces/team")
 @handle_api_exceptions("list team workspaces", logger)
 async def list_team_workspaces_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    require_capability(CapabilityId.COLLEAGUE_SHARING)
+    if not is_dalton_enabled():
+        raise HTTPException(status_code=404, detail="Dalton mode disabled")
     from src.dalton.access_tiers import get_user_tier
-    from src.dalton.settings import is_colleague_dispatch_enabled
+    from src.dalton.settings import (
+        is_colleague_dispatch_enabled,
+        is_dalton_supabase_auth_enabled,
+    )
+
+    if not has_capability(CapabilityId.COLLEAGUE_SHARING):
+        uid = str(user_id or "").strip()
+        if not uid:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        caller_tier = (
+            await get_user_tier(uid)
+            if is_dalton_supabase_auth_enabled()
+            else "internal"
+        )
+        return {
+            "members": [],
+            "caller_tier": caller_tier,
+            "colleague_dispatch_enabled": False,
+        }
+
     from src.dalton.sharing import list_team_workspaces
 
     members = await list_team_workspaces(user_id)
@@ -430,16 +448,14 @@ async def list_team_workspaces_endpoint(
     }
 
 
-@router.get(
-    "/workspaces/{workspace_id}/sharing",
-    dependencies=[Depends(require_capability_dep(CapabilityId.COLLEAGUE_SHARING))],
-)
+@router.get("/workspaces/{workspace_id}/sharing")
 @handle_api_exceptions("get workspace sharing settings", logger)
 async def get_workspace_sharing_endpoint(
     workspace_id: str,
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    require_capability(CapabilityId.COLLEAGUE_SHARING)
+    if not is_dalton_enabled():
+        raise HTTPException(status_code=404, detail="Dalton mode disabled")
     from src.server.database.home_workspace import is_home_stand_in_row, is_reserved_row
     from src.dalton.access_tiers import classify_owner_tier, get_user_tier, is_admin_user
     from src.dalton.settings import (
@@ -470,6 +486,21 @@ async def get_workspace_sharing_endpoint(
     if is_home_stand_in_row(ws) and owner_id != uid:
         raise HTTPException(status_code=404, detail="Workspace not found")
     is_home = is_reserved_row(ws) or bool(ws.get("is_home"))
+
+    if not has_capability(CapabilityId.COLLEAGUE_SHARING):
+        if owner_id != uid:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        return {
+            "workspace_id": str(ws["workspace_id"]),
+            "cos_access": "hidden",
+            "web_access": "hidden",
+            "is_home": is_home,
+            "can_edit": False,
+            "owner_external": False,
+            "colleague_dispatch_enabled": False,
+            "updated_by": None,
+            "updated_at": None,
+        }
 
     # Classify the owner exactly once per request, before the Home branch and
     # any can_edit decision, so isolation and the owner_external flag can
@@ -921,15 +952,13 @@ async def update_workspace_settings_endpoint(
     }
 
 
-@router.get(
-    "/sharing/user-settings",
-    dependencies=[Depends(require_capability_dep(CapabilityId.COLLEAGUE_SHARING))],
-)
+@router.get("/sharing/user-settings")
 @handle_api_exceptions("get user cos sharing settings", logger)
 async def get_user_sharing_settings_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    require_capability(CapabilityId.COLLEAGUE_SHARING)
+    if not is_dalton_enabled():
+        raise HTTPException(status_code=404, detail="Dalton mode disabled")
     from src.dalton.access_tiers import get_user_tier
     from src.dalton.settings import (
         is_colleague_dispatch_enabled,
@@ -940,6 +969,22 @@ async def get_user_sharing_settings_endpoint(
     uid = str(user_id or "").strip()
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
+
+    if not has_capability(CapabilityId.COLLEAGUE_SHARING):
+        if is_dalton_supabase_auth_enabled():
+            await require_team_reader(uid)
+            caller_tier = await get_user_tier(uid)
+        else:
+            caller_tier = "internal"
+        return {
+            "user_id": uid,
+            "cos_rw_enabled": False,
+            "cos_access": "hidden",
+            "can_edit": False,
+            "caller_tier": caller_tier,
+            "colleague_dispatch_enabled": False,
+            "updated_at": None,
+        }
 
     if is_dalton_supabase_auth_enabled():
         await require_team_reader(uid)

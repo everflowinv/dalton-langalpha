@@ -210,7 +210,7 @@ _EXCLUDED_AUTO_RE = re.compile(
 _SECTION_HEADING_RE = re.compile(r"^\s*#{2,4}\s+(.+?)\s*$")
 _LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
 _MD_LINK_RE = re.compile(
-    r"(!?)\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)(?:\s+[\"'][^\"']*[\"'])?\)"
+    r"(!?)\[((?:\\[\[\]]|[^\[\]]|\[[^\[\]]*\])+)\]\(([^()\s]*(?:\([^()]*\)[^()\s]*)*)(?:\s+[\"'][^\"']*[\"'])?\)"
 )
 _CJK_SENTENCE_END_PUNCT = frozenset("。！？；")
 _ASCII_SENTENCE_END_PUNCT = frozenset(".!?;")
@@ -614,8 +614,97 @@ async def populate_automation_notify_state(
             setattr(resp, "dalton_notify_route_targets", None)
 
 
+def _unescape_markdown_label(label: str) -> str:
+    return label.replace("\\[", "[").replace("\\]", "]").replace("\\\\", "\\")
+
+
+def rewrite_monitor_links_for_external(text: str) -> str:
+    """Rewrite same-origin ``/monitors/...`` markdown links for external channel delivery.
+
+    When a public app URL is configured (``DALTON_FRONTEND_URL`` / ``PUBLIC_APP_URL`` /
+    ``FRONTEND_URL``, including single-origin Standalone Core where it matches
+    ``SERVER_BASE_URL``), expands ``[label](/monitors/slug)`` into an absolute
+    ``[label](https://.../monitors/slug)`` link. When no public URL is configured,
+    preserves both the link title and path text as ``label (/monitors/slug)``.
+    """
+    from src.dalton.settings import get_dalton_public_app_url
+
+    public_base = get_dalton_public_app_url()
+
+    def _replace(match: re.Match[str]) -> str:
+        bang, label, target = (
+            match.group(1),
+            match.group(2),
+            match.group(3).strip(),
+        )
+        if bang or not target.startswith("/monitors/"):
+            return match.group(0)
+        if public_base:
+            return f"[{label}]({public_base}{target})"
+        clean_label = _unescape_markdown_label(label)
+        return f"{clean_label} ({target})"
+
+    return _MD_LINK_RE.sub(_replace, text)
+
+
+def _utf16_len(text: str) -> int:
+    """Return the UTF-16 code unit length of ``text`` (matches JavaScript ``String.length``)."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _slice_by_utf16(text: str, max_utf16: int) -> str:
+    """Return the longest whole-codepoint prefix of ``text`` within ``max_utf16`` UTF-16 code units."""
+    if max_utf16 <= 0:
+        return ""
+    if _utf16_len(text) <= max_utf16:
+        return text
+    used = 0
+    for idx, ch in enumerate(text):
+        width = 2 if ord(ch) > 0xFFFF else 1
+        if used + width > max_utf16:
+            return text[:idx]
+        used += width
+    return text
+
+
+def truncate_preserving_markdown_links(text: str, max_chars: int) -> str:
+    """Truncate ``text`` to at most ``max_chars`` UTF-16 code units without cutting inside a markdown link."""
+    if max_chars <= 0:
+        return ""
+    if _utf16_len(text) <= max_chars:
+        return text
+    budget = max_chars - 1
+    cut = len(_slice_by_utf16(text, budget))
+    spanning: re.Match[str] | None = None
+    for match in _MD_LINK_RE.finditer(text):
+        if match.start() >= cut:
+            break
+        if match.start() < cut < match.end():
+            spanning = match
+            break
+    if spanning is not None:
+        if text[: spanning.start()].strip():
+            prefix = text[: spanning.start()].rstrip()
+            return prefix + "…"
+        # Oversized link at the start of the message: keep its plain title text (within budget)
+        # rather than slicing inside the markdown link syntax or URL.
+        label = _unescape_markdown_label(spanning.group(2)).strip()
+        if not label:
+            return "…"
+        sliced_label = _slice_by_utf16(label, budget)
+        prefix = sliced_label.rstrip() or sliced_label
+        return prefix + "…"
+    prefix = text[:cut].rstrip()
+    if not prefix and cut > 0:
+        prefix = text[:cut]
+    return prefix + "…"
+
+
 def _strip_non_http_markdown_links(text: str) -> str:
-    """Replace markdown links pointing to sandbox/local/relative paths with their plain link text, keeping http(s) links."""
+    """Keep http(s) links, expand ``/monitors/...`` links to the configured public URL (or title + path), and strip other relative/local links."""
+    from src.dalton.settings import get_dalton_public_app_url
+
+    public_base = get_dalton_public_app_url()
 
     def _replace(match: re.Match[str]) -> str:
         bang, label, target = (
@@ -625,6 +714,11 @@ def _strip_non_http_markdown_links(text: str) -> str:
         )
         if not bang and re.match(r"^https?://", target, re.IGNORECASE):
             return match.group(0)
+        if not bang and target.startswith("/monitors/"):
+            if public_base:
+                return f"[{label}]({public_base}{target})"
+            clean_label = _unescape_markdown_label(label)
+            return f"{clean_label} ({target})"
         return label
 
     return _MD_LINK_RE.sub(_replace, text)

@@ -29,9 +29,9 @@ type MacRowKind = 'pair' | 'update' | 'continue';
 
 /** The Mac row by why it shows: what it says, and where its button goes. */
 const MAC_ROW: Record<MacRowKind, { detail: string; action?: { to: string; label: string } }> = {
-  pair: { detail: 'setup.answers.computer.macDesktop', action: { to: '/setup/this-mac', label: 'setup.answers.computer.pairThisMac' } },
-  update: { detail: 'setup.answers.computer.macUpdateApp' },
-  continue: { detail: S + '.mac.noteBrowser', action: { to: '/setup/mac', label: 'setup.answers.computer.continueOnMac' } },
+  pair: { detail: 'setup:answers.computer.macDesktop', action: { to: '/setup/this-mac', label: 'setup:answers.computer.pairThisMac' } },
+  update: { detail: 'setup:answers.computer.macUpdateApp' },
+  continue: { detail: S + '.mac.noteBrowser', action: { to: '/setup/mac', label: 'setup:answers.computer.continueOnMac' } },
 };
 
 function macRowKind(inApp: boolean, thisMac: { offered: boolean; added: boolean | null | undefined }, takesRemoteControl: boolean): MacRowKind | null {
@@ -115,11 +115,11 @@ export default function ComputerStep() {
       {flow.first && flow.answers && <AnswersStrip answers={flow.answers} teamModelsAvailable={!!flow.facts?.teamModelsAvailable} />}
       <WizardStepHeader
         titleId={headingId}
-        title={t(isDaltonBuild && !sshOffered ? 'setup.answers.computer.cloudReadyTitle' : 'setup.answers.computer.title')}
+        title={t(isDaltonBuild && !sshOffered ? 'setup:answers.computer.cloudReadyTitle' : 'setup:answers.computer.title')}
         helper={t(
           isDaltonBuild && !sshOffered
-            ? 'setup.answers.computer.cloudReadyLead'
-            : claudeCode ? 'setup.answers.computer.leadClaudeCode' : 'setup.answers.computer.lead',
+            ? 'setup:answers.computer.cloudReadyLead'
+            : claudeCode ? 'setup:answers.computer.leadClaudeCode' : 'setup:answers.computer.lead',
         )}
       />
       <div className="flex flex-col gap-5">
@@ -141,12 +141,12 @@ export default function ComputerStep() {
         {isDaltonBuild ? (
           /* DALTON-HOOK(dalton-setup): managed cloud computer default; SSH tucked into Advanced when offered */
           <>
-            <Group title={t('setup.answers.use.serverComputer')}>
+            <Group title={t('setup:answers.use.serverComputer')}>
               <AccessRow
                 testId="setup-computer-cloud"
                 icon={<Cloud />}
-                name={t('setup.answers.computer.cloudReadyRow')}
-                detail={t('setup.answers.computer.cloudReadyDetail')}
+                name={t('setup:answers.computer.cloudReadyRow')}
+                detail={t('setup:answers.computer.cloudReadyDetail')}
                 status="connected"
               />
             </Group>
@@ -160,7 +160,7 @@ export default function ComputerStep() {
                   aria-expanded={advancedSshOpen}
                 >
                   <ChevronRight className={`h-3 w-3 transition-transform ${advancedSshOpen ? 'rotate-90' : ''}`} />
-                  {t('setup.answers.computer.advancedSsh')}
+                  {t('setup:answers.computer.advancedSsh')}
                 </button>
                 {advancedSshOpen && <div className="mt-3">{sshRow}</div>}
               </div>
@@ -186,20 +186,20 @@ export default function ComputerStep() {
       {/* DALTON-HOOK(dalton-setup): hide SSH notes and default Continue to cloud in Dalton */}
       {(!isDaltonBuild || (sshOffered && advancedSshOpen)) && (
         <>
-          <SetupNote icon={<AlertTriangle />}>{t('setup.answers.computer.accountNote')}</SetupNote>
-          <SetupNote icon={<Laptop />}>{t('setup.answers.computer.onlineNote')}</SetupNote>
+          <SetupNote icon={<AlertTriangle />}>{t('setup:answers.computer.accountNote')}</SetupNote>
+          <SetupNote icon={<Laptop />}>{t('setup:answers.computer.onlineNote')}</SetupNote>
         </>
       )}
-      {(flow.finishFailed || cloudSwitchFailed) && <StepError>{t('setup.answers.saveFailed')}</StepError>}
+      {(flow.finishFailed || cloudSwitchFailed) && <StepError>{t('setup:answers.saveFailed')}</StepError>}
       <SetupFooter
-        back={flow.back ? { label: t('setup.back'), onClick: flow.back } : null}
+        back={flow.back ? { label: t('setup:back'), onClick: flow.back } : null}
         primary={flow.ownComputers.length > 0 ? {
-          label: t('setup.continue'),
+          label: t('setup:continue'),
           onClick: () => void flow.finish(),
           disabled: flow.finishing,
           busy: flow.finishing,
         } : isDaltonBuild ? {
-          label: t('setup.continue'),
+          label: t('setup:continue'),
           onClick: continueOnCloud,
           disabled: isUpdating,
           busy: isUpdating,

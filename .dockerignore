@@ -43,3 +43,7 @@ web/playwright.config.js
 # the test factories dropped above, so the image's `tsc -b` cannot resolve them.
 web/src/**/__preview__/
 web/*-preview.html
+
+# DALTON-HOOK(standalone-core): exclude macOS AppleDouble and Finder metadata from Docker build contexts (including docs-site)
+**/._*
+**/.DS_Store

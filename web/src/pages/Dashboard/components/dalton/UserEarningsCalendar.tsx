@@ -63,10 +63,10 @@ export function EarningsScopeTabs({
       size="compact"
       value={scope}
       onChange={onScopeChange}
-      label={t('dashboard.widgets.earningsCalendar.title')}
+      label={t('dashboard:widgets.earningsCalendar.title')}
       options={[
-        { value: 'mine', label: t('dashboard.earningsCalendarCard.tabMine') },
-        { value: 'market', label: t('dashboard.earningsCalendarCard.tabMarket') },
+        { value: 'mine', label: t('dashboard:earningsCalendarCard.tabMine') },
+        { value: 'market', label: t('dashboard:earningsCalendarCard.tabMarket') },
       ]}
     />
   );
@@ -89,21 +89,21 @@ export function UserEarningsBadges({ item }: UserEarningsBadgesProps) {
   let statusTone: DaltonStatusTone = 'neutral';
 
   if (rawStatus === 'reported' || rawDateStatus === 'reported') {
-    statusLabel = t('dashboard.earningsCalendarCard.statusReported');
+    statusLabel = t('dashboard:earningsCalendarCard.statusReported');
   } else if (rawStatus === 'confirmed' || rawDateStatus === 'confirmed') {
-    statusLabel = t('dashboard.earningsCalendarCard.statusConfirmed');
+    statusLabel = t('dashboard:earningsCalendarCard.statusConfirmed');
     statusTone = 'success';
   } else if (rawStatus === 'pending' || rawDateStatus === 'estimated') {
-    statusLabel = t('dashboard.earningsCalendarCard.statusPending');
+    statusLabel = t('dashboard:earningsCalendarCard.statusPending');
     statusTone = 'warning';
   }
 
   const rawTiming = String(item.timing || '').toUpperCase();
   const timingLabel =
     rawTiming === 'BMO'
-      ? t('dashboard.earningsCalendarCard.timingBMO')
+      ? t('dashboard:earningsCalendarCard.timingBMO')
       : rawTiming === 'AMC'
-        ? t('dashboard.earningsCalendarCard.timingAMC')
+        ? t('dashboard:earningsCalendarCard.timingAMC')
         : '';
 
   if (!isCore && !isWatch && !statusLabel && !timingLabel) {
@@ -115,8 +115,8 @@ export function UserEarningsBadges({ item }: UserEarningsBadgesProps) {
       {(isCore || isWatch) && (
         <TagBadge soft={isWatch}>
           {isCore
-            ? t('dashboard.earningsCalendarCard.tierCore')
-            : t('dashboard.earningsCalendarCard.tierWatch')}
+            ? t('dashboard:earningsCalendarCard.tierCore')
+            : t('dashboard:earningsCalendarCard.tierWatch')}
         </TagBadge>
       )}
       {statusLabel && (

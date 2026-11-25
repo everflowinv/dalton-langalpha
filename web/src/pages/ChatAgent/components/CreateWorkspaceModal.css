@@ -37,6 +37,31 @@
   }
 }
 
+/* DALTON-HOOK(mobile-web): align modal to visualViewport (height + offsetTop + bottom offset), keep header/close button sticky on scroll, and respect safe-area inset on mobile */
+@media (max-width: 767px) {
+  .cwm-overlay {
+    padding-top: var(--visual-viewport-offset-top, 0px);
+    padding-bottom: var(--visual-viewport-bottom-offset, var(--keyboard-overlap, 0px));
+  }
+
+  .cwm-modal {
+    max-height: min(90dvh, calc(var(--visual-viewport-height, 100dvh) - 1rem));
+    padding-top: 0;
+    padding-bottom: max(24px, env(safe-area-inset-bottom));
+    /* Keeps a field focused near the top from scrolling under the sticky header. */
+    scroll-padding-top: 4.5rem;
+  }
+
+  .cwm-header {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    margin: 0 -24px 20px;
+    padding: 20px 24px 12px;
+    background-color: var(--color-shell-float, var(--color-bg-elevated));
+  }
+}
+
 /* ---- Header ---- */
 .cwm-header {
   display: flex;

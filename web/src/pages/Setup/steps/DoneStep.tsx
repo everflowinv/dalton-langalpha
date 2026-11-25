@@ -62,16 +62,16 @@ export default function DoneStep() {
   const modelPref = modelPrefs(preferences);
   const primaryModel = modelPref.preferred_model
     ? modelName(modelPref.preferred_model)
-    : t('setup.notSet');
+    : t('setup:notSet');
   const backgroundModel = modelPref.preferred_background_model
     ? modelName(modelPref.preferred_background_model)
-    : t('setup.notSet');
+    : t('setup:notSet');
   // DALTON-HOOK(dalton-setup): when team sharing is active in Dalton, reflect actual available team models rather than shared API key records
   const providerLabel = isDaltonBuild && team.shared
-    ? (team.available ? t('setup.teamSharedProvider') : t('setup.notConfigured'))
+    ? (team.available ? t('setup:teamSharedProvider') : t('setup:notConfigured'))
     : configuredProviderNames.length > 0
       ? configuredProviderNames.join(', ')
-      : t('setup.notConfigured');
+      : t('setup:notConfigured');
 
   // ---------------------------------------------------------------------------
   // Render
@@ -85,7 +85,7 @@ export default function DoneStep() {
         className="mb-4 h-12 w-12"
         style={{ color: 'var(--color-success)' }}
       />
-      <WizardStepHeader titleId={headingId} title={t('setup.doneTitle')} helper={t('setup.doneSummary')} />
+      <WizardStepHeader titleId={headingId} title={t('setup:doneTitle')} helper={t('setup:doneSummary')} />
 
       {/* Summary card */}
       <div
@@ -96,7 +96,7 @@ export default function DoneStep() {
         }}
       >
         <div className="flex flex-col divide-y" style={{ borderColor: 'var(--color-border-default)' }}>
-          <SummaryRow label={t('setup.providerLabel')} value={providerLabel} />
+          <SummaryRow label={t('setup:providerLabel')} value={providerLabel} />
           <SummaryRow label={copy.default.summary} value={primaryModel} />
           <SummaryRow label={copy.background.summary} value={backgroundModel} />
         </div>
@@ -107,11 +107,11 @@ export default function DoneStep() {
         // the app, so the setup that sent the user here would never resume.
         skip={
           welcomeOffer && !hasReturn
-            ? { label: t('setup.personalizeLink'), onClick: () => welcomeOffer.open({ replace: true }) }
+            ? { label: t('setup:personalizeLink'), onClick: () => welcomeOffer.open({ replace: true }) }
             : null
         }
         primary={{
-          label: hasReturn ? t('setup.continue') : t('setup.goToDashboard'),
+          label: hasReturn ? t('setup:continue') : t('setup:goToDashboard'),
           onClick: handlePrimary,
         }}
       />

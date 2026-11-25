@@ -42,7 +42,8 @@ interface CommentToolsProps {
 const BAR_BUTTON = 'h-[30px] gap-1.5 px-2 text-xs sm:px-2.5';
 const NONE: [] = [];
 /** How long Send all's outcome stays in the toolbar before the queue, if any, comes back. */
-const OUTCOME_MS = 6000;
+// DALTON-HOOK(mobile-web): shared with MobileHtmlOverflowMenu for role="status" outcome announcements
+export const OUTCOME_MS = 6000;
 
 /** A new number rises in from below as the old one lifts out. */
 const ROLL = { y: 4 };
@@ -140,10 +141,10 @@ function Counts({ open, unread, bar }: { open: number; unread: number; bar: bool
         <Grow key="unread" space={space}>
           <CountBadge
             className="page-comment-unread-badge"
-            text={t('pageViewer.comments.unreadBadge', { count: unread })}
+            text={t('pageViewer:comments.unreadBadge', { count: unread })}
             count={unread}
             fold={bar ? BAR_FOLD : undefined}
-            title={t('pageViewer.comments.unreadTitle', { count: unread })}
+            title={t('pageViewer:comments.unreadTitle', { count: unread })}
           />
         </Grow>
       )}
@@ -162,7 +163,9 @@ interface SendAllOutcome {
   refused: string | null;
 }
 
-function summarize(t: TFunction, locale: string, outcomes: readonly BatchOutcome[], besideThreadId: string | null): SendAllOutcome {
+// DALTON-HOOK(mobile-web): export outcome formatter so mobile overflow menu announces the same status sentence
+// eslint-disable-next-line react-refresh/only-export-components
+export function summarizeSendAllOutcome(t: TFunction, locale: string, outcomes: readonly BatchOutcome[], besideThreadId: string | null): SendAllOutcome {
   const parts: string[] = [];
   let refused = 0;
   // A destination's full batches went to one thread, so they read as one share.
@@ -180,21 +183,21 @@ function summarize(t: TFunction, locale: string, outcomes: readonly BatchOutcome
   }
   for (const { first: { batch, threadId }, count } of went.values()) {
     if (threadId === besideThreadId) {
-      parts.push(t('pageViewer.comments.sentAllPartHere', { count }));
+      parts.push(t('pageViewer:comments.sentAllPartHere', { count }));
     } else if ('newThreadIn' in batch.to) {
-      parts.push(t('pageViewer.comments.sentAllPartNew', { count }));
+      parts.push(t('pageViewer:comments.sentAllPartNew', { count }));
     } else {
       // A comment whose thread was archived names that one, not this.
       const title = batch.comments.find((c) => c.thread_id === threadId)?.thread_title?.trim();
       const thread = title
         ? (went.size > 1 ? oneLine(title, THREAD_CHARS) : title)
-        : t('pageViewer.comments.untitledThread');
-      parts.push(t('pageViewer.comments.sentAllPart', { count, thread }));
+        : t('pageViewer:comments.untitledThread');
+      parts.push(t('pageViewer:comments.sentAllPart', { count, thread }));
     }
   }
   return {
-    sent: parts.length > 0 ? t('pageViewer.comments.sentAll', { parts: formatList(parts, locale) }) : null,
-    refused: refused > 0 ? t('pageViewer.comments.notSentCount', { count: refused }) : null,
+    sent: parts.length > 0 ? t('pageViewer:comments.sentAll', { parts: formatList(parts, locale) }) : null,
+    refused: refused > 0 ? t('pageViewer:comments.notSentCount', { count: refused }) : null,
   };
 }
 
@@ -241,7 +244,8 @@ function SendAll({ comments, artifactId, workspaceId, docPath, sends, bar }: {
     setOutcome(null);
     void sendBatches(batches, { sender, sends, reasonOf: (err) => refusalReason(t, err, true) }).then((outcomes) => {
       setBusy(false);
-      setOutcome(summarize(t, locale, outcomes, sender.besideThreadId));
+      // DALTON-HOOK(mobile-web): shared outcome formatter with MobileHtmlOverflowMenu
+      setOutcome(summarizeSendAllOutcome(t, locale, outcomes, sender.besideThreadId));
       refreshArtifactComments(queryClient, [{ artifactId, workspaceId }], ALL);
     });
   };
@@ -261,7 +265,7 @@ function SendAll({ comments, artifactId, workspaceId, docPath, sends, bar }: {
                   {outcome.sent && <Check className="h-3.5 w-3.5 shrink-0" style={{ color: 'var(--color-accent-primary)' }} />}
                   {/* Where room is short it keeps one word, or the row's other actions are pushed out. */}
                   {outcome.sent && <span className={cn('min-w-0 truncate', fold.words)}>{outcome.sent}</span>}
-                  {outcome.sent && !outcome.refused && <span className={fold.number}>{t('pageViewer.comments.sentShort')}</span>}
+                  {outcome.sent && !outcome.refused && <span className={fold.number}>{t('pageViewer:comments.sentShort')}</span>}
                   {outcome.sent && outcome.refused && <span className={cn('shrink-0', fold.words)}>·</span>}
                   {outcome.refused && (
                     <span className="shrink-0" style={{ color: 'var(--color-icon-danger)' }}>{outcome.refused}</span>
@@ -271,10 +275,10 @@ function SendAll({ comments, artifactId, workspaceId, docPath, sends, bar }: {
                 <span className="page-comment-queue" data-bar={bar || undefined}>
                   <CountBadge
                     className="page-comment-queue-count"
-                    text={t('pageViewer.comments.queuedBadge', { count: queued.length })}
+                    text={t('pageViewer:comments.queuedBadge', { count: queued.length })}
                     count={queued.length}
                     fold={fold}
-                    title={t('pageViewer.comments.queuedTitle')}
+                    title={t('pageViewer:comments.queuedTitle')}
                   />
                   <Button
                     type="button"
@@ -283,8 +287,8 @@ function SendAll({ comments, artifactId, workspaceId, docPath, sends, bar }: {
                     // Held while the sends go, without the faded look of a control that cannot act.
                     aria-disabled={busy || undefined}
                     // Its name where its words fold away.
-                    aria-label={busy ? t('pageViewer.comments.sending') : t('pageViewer.comments.sendAll')}
-                    title={t('pageViewer.comments.sendAllTitle', { count: queued.length })}
+                    aria-label={busy ? t('pageViewer:comments.sending') : t('pageViewer:comments.sendAll')}
+                    title={t('pageViewer:comments.sendAllTitle', { count: queued.length })}
                     onClick={sendAll}
                   >
                     <InPlaceSwap
@@ -293,13 +297,13 @@ function SendAll({ comments, artifactId, workspaceId, docPath, sends, bar }: {
                       from={(
                         <>
                           <ArrowUp className="h-3 w-3" aria-hidden />
-                          <span className={fold.words}>{t('pageViewer.comments.sendAll')}</span>
+                          <span className={fold.words}>{t('pageViewer:comments.sendAll')}</span>
                         </>
                       )}
                       to={(
                         <>
                           <SendingGlyph on={busy} />
-                          <span className={fold.words}>{t('pageViewer.comments.sending')}</span>
+                          <span className={fold.words}>{t('pageViewer:comments.sending')}</span>
                         </>
                       )}
                     />
@@ -334,9 +338,9 @@ export function CommentTools({
   const unread = comments ? unreadComments(comments) : 0;
   const mode = ui.modeTab === tabId && !modeDisabled;
   const listOpen = ui.listTab === tabId;
-  const openLabel = t('pageViewer.comments.listLabel', { count: open });
+  const openLabel = t('pageViewer:comments.listLabel', { count: open });
   const listLabel = unread > 0
-    ? t('pageViewer.comments.listLabelUnread', { label: openLabel, unread: t('pageViewer.comments.unreadTitle', { count: unread }) })
+    ? t('pageViewer:comments.listLabelUnread', { label: openLabel, unread: t('pageViewer:comments.unreadTitle', { count: unread }) })
     : openLabel;
   const counts = comments && <Counts open={open} unread={unread} bar={variant === 'bar'} />;
   const sendAll = comments && artifact && (
@@ -365,11 +369,11 @@ export function CommentTools({
           className={cn(BAR_BUTTON, mode && 'border border-(--color-btn-primary-bg)')}
           aria-pressed={mode}
           aria-keyshortcuts="C"
-          aria-label={t('pageViewer.comments.comment')}
-          title={modeTitle ?? t('pageViewer.comments.modeTitle')}
+          aria-label={t('pageViewer:comments.comment')}
+          title={modeTitle ?? t('pageViewer:comments.modeTitle')}
         >
           <MessageSquarePlus className="h-3.5 w-3.5" />
-          <span className="hidden sm:inline">{t('pageViewer.comments.comment')}</span>
+          <span className="hidden sm:inline">{t('pageViewer:comments.comment')}</span>
         </Button>
         <Button
           type="button"
@@ -399,10 +403,12 @@ export function CommentTools({
         className={cn('page-comment-mode-btn press shrink-0', mode && 'is-on')}
         aria-pressed={mode}
         aria-keyshortcuts="C"
-        title={modeTitle ?? t('pageViewer.comments.modeTitle')}
+        // DALTON-HOOK(mobile-web): preserve accessible name when the text label hides on narrow phones
+        aria-label={t('pageViewer:comments.comment')}
+        title={modeTitle ?? t('pageViewer:comments.modeTitle')}
       >
         <MessageSquarePlus className="h-3.5 w-3.5" />
-        <span>{t('pageViewer.comments.comment')}</span>
+        <span>{t('pageViewer:comments.comment')}</span>
       </button>
       <button
         type="button"

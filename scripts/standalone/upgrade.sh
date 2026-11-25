@@ -724,10 +724,10 @@ fi
 # Step 4: Build, migrate, rolling-replace services, converge with `up -d`, and verify health
 info "4/4 Building, migrating, replacing services, and verifying health..."
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
-  info "Building updated service images (migrate, backend, crawler, edge)..."
+  info "Building updated service images (backend, edge)..."
   IMAGES_BUILT=1
   build_sha="${NEW_RELEASE_SHA:-standalone}"
-  compose_cmd build --build-arg "BUILD_GIT_SHA=${build_sha}" --build-arg "BUILD_GIT_DIRTY=false" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} migrate backend crawler edge
+  compose_cmd build --build-arg "BUILD_GIT_SHA=${build_sha}" --build-arg "BUILD_GIT_DIRTY=false" ${BUILD_ARGS[@]+"${BUILD_ARGS[@]}"} backend edge
   ok "Updated images built."
 else
   info "Skipping image build (--skip-build)."

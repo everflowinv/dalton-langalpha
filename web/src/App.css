@@ -68,6 +68,10 @@ html.desktop-mac .app-main .chrome-drag-strip {
 }
 
 @media (max-width: 767px) {
+  /* DALTON-HOOK(mobile-web): include safe-area-inset-bottom in bottom tab bar reservation */
+  :root {
+    --bottom-tab-height: calc(64px + max(12px, env(safe-area-inset-bottom)));
+  }
   .app-layout {
     height: 100vh;
     height: 100dvh;

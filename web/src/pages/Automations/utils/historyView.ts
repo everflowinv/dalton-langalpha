@@ -2,32 +2,32 @@
 import type { AutomationFieldChange, AutomationHistoryEntry } from '@/types/automation';
 
 const FIELD_KEYS: Record<string, string> = {
-  name: 'automation.fieldName',
-  description: 'automation.fieldDescription',
-  desired_status: 'automation.fieldDesiredStatus',
-  trigger_type: 'automation.fieldTriggerType',
-  cron_expression: 'automation.fieldCron',
-  cron_expr: 'automation.fieldCron',
-  once_run_at: 'automation.fieldOnceRunAt',
-  trigger_config: 'automation.fieldTriggerConfig',
-  timezone: 'automation.fieldTimezone',
-  instruction: 'automation.fieldInstruction',
-  workspace_id: 'automation.fieldWorkspace',
-  llm_model: 'automation.fieldModel',
+  name: 'automation:fieldName',
+  description: 'automation:fieldDescription',
+  desired_status: 'automation:fieldDesiredStatus',
+  trigger_type: 'automation:fieldTriggerType',
+  cron_expression: 'automation:fieldCron',
+  cron_expr: 'automation:fieldCron',
+  once_run_at: 'automation:fieldOnceRunAt',
+  trigger_config: 'automation:fieldTriggerConfig',
+  timezone: 'automation:fieldTimezone',
+  instruction: 'automation:fieldInstruction',
+  workspace_id: 'automation:fieldWorkspace',
+  llm_model: 'automation:fieldModel',
   // DALTON-HOOK(automation-effort): history label for reasoning_effort
-  reasoning_effort: 'automation.fieldReasoningEffort',
-  additional_context: 'automation.fieldContext',
-  thread_strategy: 'automation.fieldThread',
-  conversation_thread_id: 'automation.fieldThreadId',
-  max_failures: 'automation.fieldMaxFailures',
-  notify_enabled: 'automation.fieldNotify',
-  notify_routes: 'automation.fieldNotifyRoutes',
-  delivery_config: 'automation.fieldDelivery',
-  enabled: 'automation.fieldEnabled',
-  paused_by_user: 'automation.fieldPaused',
-  cos_mode: 'automation.fieldCosMode',
-  notify_storage_mode: 'automation.fieldNotifyStorage',
-  status: 'automation.fieldStatus',
+  reasoning_effort: 'automation:fieldReasoningEffort',
+  additional_context: 'automation:fieldContext',
+  thread_strategy: 'automation:fieldThread',
+  conversation_thread_id: 'automation:fieldThreadId',
+  max_failures: 'automation:fieldMaxFailures',
+  notify_enabled: 'automation:fieldNotify',
+  notify_routes: 'automation:fieldNotifyRoutes',
+  delivery_config: 'automation:fieldDelivery',
+  enabled: 'automation:fieldEnabled',
+  paused_by_user: 'automation:fieldPaused',
+  cos_mode: 'automation:fieldCosMode',
+  notify_storage_mode: 'automation:fieldNotifyStorage',
+  status: 'automation:fieldStatus',
 };
 
 const SUMMARY_FIELDS = [
@@ -64,26 +64,26 @@ export function fieldLabelKey(field: string): string | null {
 export function historyActionKey(action: string): string | null {
   switch (action) {
     case 'create':
-      return 'automation.actionCreate';
+      return 'automation:actionCreate';
     case 'update':
-      return 'automation.actionUpdate';
+      return 'automation:actionUpdate';
     case 'rollback':
-      return 'automation.actionRollback';
+      return 'automation:actionRollback';
     case 'delete':
-      return 'automation.actionDelete';
+      return 'automation:actionDelete';
     case 'restore':
-      return 'automation.actionRestore';
+      return 'automation:actionRestore';
     case 'resume':
-      return 'automation.actionResume';
+      return 'automation:actionResume';
     case 'pause':
-      return 'automation.actionPause';
+      return 'automation:actionPause';
     case 'maintenance_pause_stale_binding':
-      return 'automation.actionMaintenancePause';
+      return 'automation:actionMaintenancePause';
     // DALTON-HOOK(automation-effort): label for Opus medium backfill audit action
     case 'backfill_opus_medium':
-      return 'automation.actionBackfillOpusMedium';
+      return 'automation:actionBackfillOpusMedium';
     case 'seed':
-      return 'automation.actionSeed';
+      return 'automation:actionSeed';
     default:
       return null;
   }

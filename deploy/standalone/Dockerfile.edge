@@ -57,6 +57,7 @@ RUN pnpm install --frozen-lockfile
 COPY docs-site/astro.config.mjs ./
 COPY docs-site/src/ src/
 COPY docs-site/public/ public/
+RUN find src public \( -name '._*' -o -name '.DS_Store' \) -delete
 # The docs build hook checks the app's help links against these frontend files
 # (docs-site/src/integrations/site-artifacts.mjs reads them from <repo>/web).
 COPY web/src/config/supportLinks.ts /web/src/config/supportLinks.ts

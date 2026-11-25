@@ -586,6 +586,20 @@ tests/fakes/
 tests/standalone/
 # Standalone Core Batch 6: third-party open-source attribution notice.
 NOTICE
+# sync12 (#863): Dalton-only deferred copy namespace for lazy Monitors routes (/monitors, /m/:slug).
+web/src/locales/monitors/
 # Shared chats replay inline widgets (DALTON-HOOK(shared-widgets)).
 web/src/pages/SharedChat/__tests__/SharedChatView.widgets.test.tsx
 web/src/pages/ChatAgent/components/viewers/__tests__/InlineWidget.exports.test.tsx
+# Mobile web P0 fixes unit and Playwright E2E tests (DALTON-HOOK(mobile-web)).
+web/src/lib/__tests__/visualViewport.mobile.test.ts
+web/src/pages/ChatAgent/components/__tests__/CreateWorkspaceModal.mobile.test.tsx
+web/src/pages/ChatAgent/components/filePanel/__tests__/DirectoryNode.mobile.test.tsx
+web/src/pages/ChatAgent/components/viewers/__tests__/BrowserViewer.mobile.test.tsx
+web/e2e/mobile-p0.spec.js
+# Mobile web P1 usability tests (DALTON-HOOK(mobile-web)).
+web/src/components/BottomTabBar/__tests__/BottomTabBar.mobile.test.tsx
+web/src/components/ui/__tests__/chat-input.mobileEnterAndPicker.test.tsx
+web/src/pages/ChatAgent/components/viewers/html/comments/__tests__/CommentComposer.mobileEnter.test.tsx
+web/src/pages/ChatAgent/components/__tests__/MobileP1Surfaces.test.tsx
+web/e2e/mobile-p1-layout.spec.js

@@ -9,6 +9,7 @@ import { useTranslation } from 'react-i18next';
 import { MessageSelectionQuote } from './selectionQuote/MessageSelectionQuote';
 import { ArrowLeft, PanelRight, Menu, Users } from 'lucide-react';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(mobile-web)
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useLatestRef } from '@/hooks/useLatestRef';
 import { ScrollArea } from '../../../components/ui/scroll-area';
@@ -112,7 +113,8 @@ import { DockTurnStatus } from './chatView/DockTurnStatus';
 import { QueuedCommentDeck } from './artifactComments/QueuedCommentDeck';
 import { useTrayFold } from './chatView/useTrayFold';
 import { ErrorBanner } from '@/components/ui/error-banner';
-import { motion, AnimatePresence, type PanInfo } from '@/lib/framer';
+// DALTON-HOOK(mobile-web): PanInfo no longer needed after disabling content-area drag-to-close on mobile FilePanel
+import { motion, AnimatePresence } from '@/lib/framer';
 import { DURATION, EASE_COLLAPSE, SPRING_FOLD, TWEEN } from '@/lib/motion';
 import { MobileBottomSheet } from '@/components/ui/mobile-bottom-sheet';
 import { preloadableLazy } from '@/lib/lazyWithMotion';
@@ -121,7 +123,8 @@ import { preloadableLazy } from '@/lib/lazyWithMotion';
 
 // Preloadable: a lazy panel suspends on its first render even with its code
 // in, and its boundary's 300ms reveal throttle left a preloaded panel blank.
-const FilePanel = preloadableLazy(() => import('./FilePanel'));
+// DALTON-HOOK(monitors): FilePanel reaches PublishDialog ('monitors')
+const FilePanel = preloadableLazy(withCopy(() => import('./FilePanel'), ['monitors', 'publish', 'vault']));
 const loadFilePanel = FilePanel.preload;
 // The panel opens on the fold spring, which leaves the chat's edge almost
 // where it was for the first frames, and shuts on the collapse curve, as a
@@ -174,6 +177,7 @@ import { useForkThread } from './chatView/useForkThread';
 import { ForkedFromLink } from './chatView/ForkedFromLink';
 import { ThreadPrivacyRow } from './chatView/threadPrivacy';
 import { useThreadPrivacy } from './chatView/useThreadPrivacy';
+import { withCopy } from '@/i18n';
 
 
 // Clears the composer floating over the transcript's bottom edge (its height
@@ -215,6 +219,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const workspaceName = (isHome ? t('agents.chiefOfStaff') : workspaceRecord?.name) || initialWorkspaceName || '';
   // DALTON-HOOK(team-sharing): detect read-only colleague workspace/thread
   const teamReadOnly = useTeamReadOnly(workspaceId, workspaceRecord);
+  // DALTON-HOOK(mobile-web): gate compact colleague sharing entry on colleague_sharing capability
+  const { hasCapability } = useCapabilities({ enabled: isMobile });
+  const colleagueSharingReady = hasCapability('colleague_sharing');
   // DALTON-HOOK(colleague-dispatch): current user for thread ownership check
   const { user: currentUser } = useUser({ enabled: Boolean(workspaceId) });
 
@@ -1201,7 +1208,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     handleToggleFilePanel,
     handleFilesLeaveGuardChange,
     handleActiveTabKindChange,
-    activeTabKind,
+    // DALTON-HOOK(mobile-web): activeTabKind no longer needed for mobile FilePanel drag toggle
     leaveFiles,
     handleOpenPreview,
     handleBrowserUse,
@@ -1365,7 +1372,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         // A card's Download is the whole interaction: nothing opens, nothing
         // navigates, and the browser shows no save. Without this the click is
         // indistinguishable from a dead button.
-        toast({ description: t('filePanel.downloadFailed'), variant: 'destructive' });
+        toast({ description: t('filePanel:downloadFailed'), variant: 'destructive' });
         return false;
       }
     });
@@ -1821,49 +1828,53 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             It already spans the titlebar and is mostly empty, so the shell gets
             a full-width band at no layout cost; the buttons in it opt out
             through the global no-drag rule. */}
-        <div data-chrome="drag" data-handoff="header" className="flex items-center justify-between px-4 py-2 border-b min-w-0 shrink-0" style={{ borderColor: 'var(--color-border-muted)', cursor: isMobile ? 'pointer' : undefined }} onClick={handleTopBarTap}>
-          <div className="flex items-center gap-4 min-w-0 shrink">
-            <button
-              onClick={() => {
-                if (activeAgentId !== 'main') {
-                  // Workflow-owned children step up to their run's view;
-                  // everything else returns to the main chat.
-                  handleSelectAgent(activeAgent?.ownerTaskId ?? 'main');
-                } else if (state?.fromThreadId) {
-                  // Back to the thread that dispatched this PTC thread.
-                  openDispatcher(state.fromThreadId);
-                } else {
-                  intentionalExitRef.current = true;
-                  onBack();
-                }
-              }}
-              className="p-2 rounded-md transition-colors shrink-0"
-              style={{ color: 'var(--color-text-primary)' }}
-              title={
-                activeAgentId !== 'main'
-                  ? activeAgent?.ownerTaskId
-                    ? t('chat.backToWorkflow', 'Back to workflow')
-                    : t('chat.backToMain', 'Back to main')
-                  : state?.fromThreadId
-                    ? t('agents.backToChiefOfStaff')
-                    : t('workspace.backToThreads')
-              }
-              onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'; }}
-              onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = ''; }}
-            >
-              <ArrowLeft className="h-5 w-5" />
-            </button>
-            {isMobile && (
+        {/* DALTON-HOOK(mobile-web): tighten horizontal padding/gaps on phones while keeping adjacent 44px tap-targets non-overlapping */}
+        <div data-chrome="drag" data-handoff="header" className={cn('flex items-center justify-between py-2 border-b min-w-0 shrink-0', isMobile ? 'px-2 gap-2' : 'px-4')} style={{ borderColor: 'var(--color-border-muted)', cursor: isMobile ? 'pointer' : undefined }} onClick={handleTopBarTap}>
+          <div className={cn('flex items-center min-w-0', isMobile ? 'gap-2 flex-1' : 'gap-4 shrink')}>
+            {/* DALTON-HOOK(mobile-web): 12px gap between 32px Back & Drawer buttons keeps their 44px tap-targets edge-to-edge without overlap */}
+            <div className={cn('flex items-center shrink-0', isMobile && 'gap-3')}>
               <button
-                onClick={() => setNavPanelVisible(true)}
-                className="p-2 rounded-md transition-colors shrink-0"
+                onClick={() => {
+                  if (activeAgentId !== 'main') {
+                    // Workflow-owned children step up to their run's view;
+                    // everything else returns to the main chat.
+                    handleSelectAgent(activeAgent?.ownerTaskId ?? 'main');
+                  } else if (state?.fromThreadId) {
+                    // Back to the thread that dispatched this PTC thread.
+                    openDispatcher(state.fromThreadId);
+                  } else {
+                    intentionalExitRef.current = true;
+                    onBack();
+                  }
+                }}
+                className={cn('rounded-md transition-colors shrink-0', isMobile ? 'p-1.5 tap-target' : 'p-2')}
                 style={{ color: 'var(--color-text-primary)' }}
-                title={t('sidebar.menu')}
+                title={
+                  activeAgentId !== 'main'
+                    ? activeAgent?.ownerTaskId
+                      ? t('chat.backToWorkflow', 'Back to workflow')
+                      : t('chat.backToMain', 'Back to main')
+                    : state?.fromThreadId
+                      ? t('agents.backToChiefOfStaff')
+                      : t('workspace.backToThreads')
+                }
+                onMouseEnter={(e) => { e.currentTarget.style.backgroundColor = 'var(--color-border-muted)'; }}
+                onMouseLeave={(e) => { e.currentTarget.style.backgroundColor = ''; }}
               >
-                <Menu className="h-5 w-5" />
+                <ArrowLeft className="h-5 w-5" />
               </button>
-            )}
-            <h1 className="title-font text-[length:var(--cs-text-heading,1rem)] leading-6 font-semibold tracking-[var(--cs-title-track,-0.01em)] whitespace-nowrap truncate" style={{ color: 'var(--color-text-primary)' }}>
+              {isMobile && (
+                <button
+                  onClick={() => setNavPanelVisible(true)}
+                  className="p-1.5 tap-target rounded-md transition-colors shrink-0"
+                  style={{ color: 'var(--color-text-primary)' }}
+                  title={t('sidebar.menu')}
+                >
+                  <Menu className="h-5 w-5" />
+                </button>
+              )}
+            </div>
+            <h1 className="title-font text-[length:var(--cs-text-heading,1rem)] leading-6 font-semibold tracking-[var(--cs-title-track,-0.01em)] whitespace-nowrap truncate min-w-0" style={{ color: 'var(--color-text-primary)' }}>
               {/* The bar's tap is a pointer's shortcut, and a bar holding buttons
                   cannot be one. The title is the same action as a real control,
                   named by the words on it, with what it does as its description. */}
@@ -1874,8 +1885,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
               ) : (workspaceName || t('thread.workspace'))}
             </h1>
             {/* DALTON-HOOK(workspace-sharing-settings): display colleague access banner in top bar */}
-            {teamReadOnly.isColleague && (
-              <TeamReadOnlyBanner ownerName={teamReadOnly.ownerName} access={teamReadOnly.access} compact />
+            {/* DALTON-HOOK(mobile-web): move TeamReadOnlyBanner below top bar on mobile */}
+            {teamReadOnly.isColleague && !isMobile && (
+              <TeamReadOnlyBanner ownerName={teamReadOnly.ownerName} access={teamReadOnly.access} />
             )}
             {activeAgentId === 'main' && (
               <ForkedFromLink threadId={currentThreadId} onOpen={leaveToThread} />
@@ -1887,22 +1899,38 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             ) : null}
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className={cn('flex items-center', isMobile ? 'gap-2 shrink-0' : 'gap-2')}>
             {/* DALTON-HOOK(coverage-tracking): company workspace auto-tracking toggle in thread top bar */}
             {/* DALTON-HOOK(workspace-sharing-settings): company workspace sharing settings modal in thread top bar */}
+            {/* DALTON-HOOK(mobile-web): desktop uses a Fragment (zero empty wrapper gap); phones group compact controls with gap-2.5 empty:hidden and gate sharing on confirmed colleague_sharing */}
             {!isHome && workspaceId && (
-              <>
-                <WorkspaceTrackingToggle
-                  workspaceId={workspaceId}
-                  readOnly={teamReadOnly.isColleague}
-                  compact
-                />
-                <WorkspaceSharingModal
-                  workspaceId={workspaceId}
-                  readOnly={teamReadOnly.isColleague}
-                  compact
-                />
-              </>
+              isMobile ? (
+                <div className="flex items-center shrink-0 gap-2.5 empty:hidden">
+                  <WorkspaceTrackingToggle
+                    workspaceId={workspaceId}
+                    readOnly={teamReadOnly.isColleague}
+                    compact
+                  />
+                  {colleagueSharingReady && (
+                    <WorkspaceSharingModal
+                      workspaceId={workspaceId}
+                      readOnly={teamReadOnly.isColleague}
+                      compact
+                    />
+                  )}
+                </div>
+              ) : (
+                <>
+                  <WorkspaceTrackingToggle
+                    workspaceId={workspaceId}
+                    readOnly={teamReadOnly.isColleague}
+                  />
+                  <WorkspaceSharingModal
+                    workspaceId={workspaceId}
+                    readOnly={teamReadOnly.isColleague}
+                  />
+                </>
+              )
             )}
             {/* A phone has no sidebar search row and, mostly, no ⌘K. */}
             {isMobile && <PaletteSearchButton />}
@@ -1923,7 +1951,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 onPointerEnter={() => { void loadFilePanel(); }}
                 onFocus={() => { void loadFilePanel(); }}
                 aria-pressed={rightPanelType === 'file'}
-                className={cn('transition-colors hover:bg-(--color-border-muted)', isMobile ? 'p-2 rounded-md' : 'p-1.5 -mr-2 rounded-[4px]')}
+                className={cn('transition-colors hover:bg-(--color-border-muted)', isMobile ? 'p-1.5 tap-target rounded-md' : 'p-1.5 -mr-2 rounded-[4px]')}
                 style={{ color: 'var(--color-text-primary)' }}
                 title={t('chat.workspaceFiles')}
                 aria-label={t('chat.workspaceFiles')}
@@ -1933,6 +1961,13 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             )}
           </div>
         </div>
+
+        {/* DALTON-HOOK(mobile-web): dedicated sub-row for colleague access banner on phones */}
+        {isMobile && teamReadOnly.isColleague && (
+          <div className="px-3 py-1.5 border-b min-w-0 shrink-0" style={{ borderColor: 'var(--color-border-muted)' }}>
+            <TeamReadOnlyBanner ownerName={teamReadOnly.ownerName} access={teamReadOnly.access} compact />
+          </div>
+        )}
 
         {privacy && activeAgentId === 'main' && <ThreadPrivacyRow privacy={privacy} isMobile={isMobile} />}
         {shareDialog}
@@ -2347,18 +2382,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             animate={{ x: 0 }}
             transition={TWEEN.enter}
             onAnimationComplete={onSheetLanded}
-            // A chart pans with the same rightward swipe, so a chart tab closes by its button.
-            drag={activeTabKind === 'chart' ? false : 'x'}
-            dragConstraints={{ left: 0, right: 0 }}
-            dragElastic={{ left: 0, right: 0.5 }}
-            onDragEnd={(_: unknown, info: PanInfo) => {
-              if (info.velocity.x > 300 || info.offset.x > 120) {
-                leaveFiles(() => {
-                  setRightPanelType(null);
-                  popPanelHistory();
-                });
-              }
-            }}
+            // DALTON-HOOK(mobile-web): disable content-area horizontal drag-to-close so wide tables, PDFs, HTML reports and browser views pan freely; close via top back button or browser back
             className="flex overflow-hidden mobile-panel-overlay"
             style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, zIndex: 30, backgroundColor: 'var(--color-bg-page)' }}
           >

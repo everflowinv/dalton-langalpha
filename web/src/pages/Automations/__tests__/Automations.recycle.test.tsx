@@ -243,21 +243,21 @@ describe('modification history and rollback', () => {
     renderAt('/automations?view=manage');
     fireEvent.click(await screen.findByRole('button', { name: /Desk brief/ }));
     const pane = inspector('Desk brief');
-    fireEvent.click(await pane.findByRole('tab', { name: label('automation.modificationHistory') }));
-    const list = await pane.findByRole('list', { name: label('automation.modificationHistory') });
+    fireEvent.click(await pane.findByRole('tab', { name: label('automation:modificationHistory') }));
+    const list = await pane.findByRole('list', { name: label('automation:modificationHistory') });
     const items = versionRows(list);
     expect(items.map((item) => item.textContent?.match(/v\d+/)?.[0])).toEqual(['v4', 'v3', 'v2']);
-    expect(items[0]).toHaveTextContent(label('automation.historyCurrent'));
-    expect(items[1]).not.toHaveTextContent(label('automation.historyCurrent'));
-    expect(items[2]).not.toHaveTextContent(label('automation.historyCurrent'));
-    expect(items[0]).toHaveTextContent(label('automation.actionUpdate'));
+    expect(items[0]).toHaveTextContent(label('automation:historyCurrent'));
+    expect(items[1]).not.toHaveTextContent(label('automation:historyCurrent'));
+    expect(items[2]).not.toHaveTextContent(label('automation:historyCurrent'));
+    expect(items[0]).toHaveTextContent(label('automation:actionUpdate'));
     expect(items[0]).toHaveTextContent('user-9');
     expect(items[0]).toHaveTextContent(
-      label('automation.historyChange', { field: label('automation.fieldCron'), old: '0 6 * * *', next: '0 7 * * *' }),
+      label('automation:historyChange', { field: label('automation:fieldCron'), old: '0 6 * * *', next: '0 7 * * *' }),
     );
-    expect(items[1]).toHaveTextContent(label('automation.actionRollback'));
-    expect(items[2]).toHaveTextContent(label('automation.actionCreate'));
-    expect(pane.getAllByRole('button', { name: label('automation.rollbackButton', { version: 3 }) }).length).toBeGreaterThan(0);
+    expect(items[1]).toHaveTextContent(label('automation:actionRollback'));
+    expect(items[2]).toHaveTextContent(label('automation:actionCreate'));
+    expect(pane.getAllByRole('button', { name: label('automation:rollbackButton', { version: 3 }) }).length).toBeGreaterThan(0);
   });
 
   it('rolls back to the previous version and refreshes after a conflict', async () => {
@@ -265,23 +265,23 @@ describe('modification history and rollback', () => {
     renderAt('/automations?view=manage&id=co-agent');
     expect(await screen.findByRole('heading', { level: 2, name: 'Desk brief' })).toBeInTheDocument();
     const pane = inspector('Desk brief');
-    const rollback = () => pane.getAllByRole('button', { name: label('automation.rollbackButton', { version: 3 }) })[0];
+    const rollback = () => pane.getAllByRole('button', { name: label('automation:rollbackButton', { version: 3 }) })[0];
     fireEvent.click(await waitFor(() => rollback()));
     const dialog = await screen.findByRole('dialog');
     expect(within(dialog).getByRole('list')).toHaveTextContent('0 6 * * *');
-    expect(within(dialog).getByText(label('automation.rollbackConfirm', { version: 3 }))).toBeInTheDocument();
+    expect(within(dialog).getByText(label('automation:rollbackConfirm', { version: 3 }))).toBeInTheDocument();
     const historyCalls = vi.mocked(api.listAutomationHistory).mock.calls.length;
     const detailCalls = vi.mocked(api.getAutomationRead).mock.calls.length;
-    fireEvent.click(within(dialog).getByRole('button', { name: label('automation.rollbackSubmit') }));
+    fireEvent.click(within(dialog).getByRole('button', { name: label('automation:rollbackSubmit') }));
     await waitFor(() => expect(api.rollbackAutomation).toHaveBeenCalledWith('co-agent', 3, 6));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     expect(toast).not.toHaveBeenCalled();
 
     vi.mocked(api.rollbackAutomation).mockRejectedValueOnce(httpError(409, 'stale version'));
     fireEvent.click(rollback());
-    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label('automation.rollbackSubmit') }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label('automation:rollbackSubmit') }));
     await waitFor(() =>
-      expect(toast).toHaveBeenCalledWith(expect.objectContaining({ description: label('automation.versionConflict') })),
+      expect(toast).toHaveBeenCalledWith(expect.objectContaining({ description: label('automation:versionConflict') })),
     );
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     await waitFor(() => expect(vi.mocked(api.listAutomationHistory).mock.calls.length).toBeGreaterThan(historyCalls));
@@ -304,13 +304,13 @@ describe('modification history and rollback', () => {
     renderAt('/automations?view=manage');
     expect(await screen.findByRole('heading', { level: 2, name: 'Close prices' })).toBeInTheDocument();
     const pane = inspector('Close prices');
-    fireEvent.click(await pane.findByRole('tab', { name: label('automation.modificationHistory') }));
-    const list = await pane.findByRole('list', { name: label('automation.modificationHistory') });
+    fireEvent.click(await pane.findByRole('tab', { name: label('automation:modificationHistory') }));
+    const list = await pane.findByRole('list', { name: label('automation:modificationHistory') });
     const items = within(list).getAllByRole('listitem');
     expect(items[0]).toHaveTextContent('v5');
-    expect(items[0]).toHaveTextContent(label('automation.historyCurrent'));
-    fireEvent.click(pane.getAllByRole('button', { name: label('automation.rollbackButton', { version: 4 }) })[0]);
-    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label('automation.rollbackSubmit') }));
+    expect(items[0]).toHaveTextContent(label('automation:historyCurrent'));
+    fireEvent.click(pane.getAllByRole('button', { name: label('automation:rollbackButton', { version: 4 }) })[0]);
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label('automation:rollbackSubmit') }));
     await waitFor(() => expect(api.rollbackAutomation).toHaveBeenCalledWith('data:prices', 4, 5));
   });
 
@@ -331,12 +331,12 @@ describe('modification history and rollback', () => {
     renderAt('/automations?view=manage&id=co-agent');
     expect(await screen.findByRole('heading', { level: 2, name: 'Desk brief' })).toBeInTheDocument();
     const pane = inspector('Desk brief');
-    fireEvent.click(await pane.findByRole('tab', { name: label('automation.modificationHistory') }));
-    const list = await pane.findByRole('list', { name: label('automation.modificationHistory') });
+    fireEvent.click(await pane.findByRole('tab', { name: label('automation:modificationHistory') }));
+    const list = await pane.findByRole('list', { name: label('automation:modificationHistory') });
     const items = versionRows(list);
-    expect(items[0]).toHaveTextContent(label('automation.actionPause'));
-    expect(items[1]).toHaveTextContent(label('automation.actionMaintenancePause'));
-    expect(items[2]).toHaveTextContent(label('automation.actionSeed'));
+    expect(items[0]).toHaveTextContent(label('automation:actionPause'));
+    expect(items[1]).toHaveTextContent(label('automation:actionMaintenancePause'));
+    expect(items[2]).toHaveTextContent(label('automation:actionSeed'));
     expect(items[3]).toHaveTextContent('custom_action');
   });
 
@@ -371,12 +371,12 @@ describe('modification history and rollback', () => {
     renderAt('/automations?view=manage&id=co-agent');
     expect(await screen.findByRole('heading', { level: 2, name: 'Desk brief' })).toBeInTheDocument();
     const pane = inspector('Desk brief');
-    const rollback = () => pane.getAllByRole('button', { name: label('automation.rollbackButton', { version: 3 }) })[0];
+    const rollback = () => pane.getAllByRole('button', { name: label('automation:rollbackButton', { version: 3 }) })[0];
     fireEvent.click(await waitFor(() => rollback()));
     const dialog = await screen.findByRole('dialog');
-    const submit = () => within(dialog).getByRole('button', { name: label('automation.rollbackSubmit') });
+    const submit = () => within(dialog).getByRole('button', { name: label('automation:rollbackSubmit') });
     expect(submit()).toBeDisabled();
-    expect(within(dialog).getByText(label('automation.rollbackSnapshotLoading'))).toBeInTheDocument();
+    expect(within(dialog).getByText(label('automation:rollbackSnapshotLoading'))).toBeInTheDocument();
     expect(within(dialog).queryByText('0 6 * * *')).not.toBeInTheDocument();
     releaseLater();
     await waitFor(() => expect(submit()).toBeEnabled());
@@ -399,10 +399,10 @@ describe('modification history and rollback', () => {
     renderAt('/automations?view=manage&id=co-agent');
     expect(await screen.findByRole('heading', { level: 2, name: 'Desk brief' })).toBeInTheDocument();
     const pane = inspector('Desk brief');
-    fireEvent.click(await waitFor(() => pane.getAllByRole('button', { name: label('automation.rollbackButton', { version: 1 }) })[0]));
+    fireEvent.click(await waitFor(() => pane.getAllByRole('button', { name: label('automation:rollbackButton', { version: 1 }) })[0]));
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByRole('button', { name: label('automation.rollbackSubmit') })).toBeDisabled();
-    expect(within(dialog).getByText(label('automation.rollbackSnapshotMissing', { version: 1 }))).toBeInTheDocument();
+    expect(within(dialog).getByRole('button', { name: label('automation:rollbackSubmit') })).toBeDisabled();
+    expect(within(dialog).getByText(label('automation:rollbackSnapshotMissing', { version: 1 }))).toBeInTheDocument();
     expect(api.rollbackAutomation).not.toHaveBeenCalled();
   });
 
@@ -421,10 +421,10 @@ describe('modification history and rollback', () => {
     renderAt('/automations?view=manage&id=co-agent');
     expect(await screen.findByRole('heading', { level: 2, name: 'Desk brief' })).toBeInTheDocument();
     const pane = inspector('Desk brief');
-    fireEvent.click(await waitFor(() => pane.getAllByRole('button', { name: label('automation.rollbackButton', { version: 3 }) })[0]));
+    fireEvent.click(await waitFor(() => pane.getAllByRole('button', { name: label('automation:rollbackButton', { version: 3 }) })[0]));
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByText(label('automation.rollbackVersionOnly', { version: 3 }))).toBeInTheDocument();
-    expect(within(dialog).getByRole('button', { name: label('automation.rollbackSubmit') })).toBeEnabled();
+    expect(within(dialog).getByText(label('automation:rollbackVersionOnly', { version: 3 }))).toBeInTheDocument();
+    expect(within(dialog).getByRole('button', { name: label('automation:rollbackSubmit') })).toBeEnabled();
   });
 });
 
@@ -462,10 +462,10 @@ describe('recycle bin', () => {
     renderAt('/automations?view=manage');
     fireEvent.click(await screen.findByRole('button', { name: /Close prices/ }));
     const pane = inspector('Close prices');
-    fireEvent.click(await pane.findByRole('button', { name: label('automation.moveToRecycle') }));
+    fireEvent.click(await pane.findByRole('button', { name: label('automation:moveToRecycle') }));
     const dialog = await screen.findByRole('dialog');
-    expect(within(dialog).getByText(label('automation.recycleConfirm', { name: 'Close prices' }))).toBeInTheDocument();
-    fireEvent.click(within(dialog).getByRole('button', { name: label('automation.moveToRecycle') }));
+    expect(within(dialog).getByText(label('automation:recycleConfirm', { name: 'Close prices' }))).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole('button', { name: label('automation:moveToRecycle') }));
     await waitFor(() => expect(api.deleteAutomation).toHaveBeenCalledWith('data:prices', 5));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
   });
@@ -477,11 +477,11 @@ describe('recycle bin', () => {
     expect(await screen.findByRole('heading', { level: 2, name: 'Morning note' })).toBeInTheDocument();
     const pane = inspector('Morning note');
     const detailCalls = vi.mocked(api.getAutomationRead).mock.calls.length;
-    fireEvent.click(await pane.findByRole('button', { name: label('automation.moveToRecycle') }));
-    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label('automation.moveToRecycle') }));
+    fireEvent.click(await pane.findByRole('button', { name: label('automation:moveToRecycle') }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label('automation:moveToRecycle') }));
     await waitFor(() => expect(api.deleteAutomation).toHaveBeenCalledWith('me-1', 4));
     await waitFor(() =>
-      expect(toast).toHaveBeenCalledWith(expect.objectContaining({ description: label('automation.versionConflict') })),
+      expect(toast).toHaveBeenCalledWith(expect.objectContaining({ description: label('automation:versionConflict') })),
     );
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     await waitFor(() => expect(vi.mocked(api.getAutomationRead).mock.calls.length).toBeGreaterThan(detailCalls));
@@ -490,8 +490,8 @@ describe('recycle bin', () => {
   it('lists only deleted rows from include_deleted and offers restore alone', async () => {
     serve();
     renderAt('/automations?view=manage');
-    const personal = await screen.findByRole('region', { name: label('automation.groupMine') });
-    const toggle = await within(personal).findByRole('button', { name: label('automation.recycleBin', { total: 1 }) });
+    const personal = await screen.findByRole('region', { name: label('automation:groupMine') });
+    const toggle = await within(personal).findByRole('button', { name: label('automation:recycleBin', { total: 1 }) });
     expect(api.listAutomationReads).toHaveBeenCalledWith({
       scope: 'personal',
       includeDeleted: true,
@@ -505,39 +505,39 @@ describe('recycle bin', () => {
     expect(within(personal).queryByRole('button', { name: /Morning note/ })).not.toBeInTheDocument();
     fireEvent.click(within(personal).getByRole('button', { name: /Old morning/ }));
     const pane = inspector('Old morning');
-    expect(pane.getByRole('button', { name: label('automation.restoreTask') })).toBeEnabled();
-    expect(pane.queryByRole('button', { name: label('automation.runNow') })).not.toBeInTheDocument();
-    expect(pane.queryByRole('button', { name: label('automation.edit') })).not.toBeInTheDocument();
-    expect(pane.queryByRole('button', { name: label('automation.pause') })).not.toBeInTheDocument();
-    expect(pane.queryByRole('button', { name: label('automation.moveToRecycle') })).not.toBeInTheDocument();
-    expect(pane.queryByRole('button', { name: label('automation.rollbackButton', { version: 1 }) })).not.toBeInTheDocument();
+    expect(pane.getByRole('button', { name: label('automation:restoreTask') })).toBeEnabled();
+    expect(pane.queryByRole('button', { name: label('automation:runNow') })).not.toBeInTheDocument();
+    expect(pane.queryByRole('button', { name: label('automation:edit') })).not.toBeInTheDocument();
+    expect(pane.queryByRole('button', { name: label('automation:pause') })).not.toBeInTheDocument();
+    expect(pane.queryByRole('button', { name: label('automation:moveToRecycle') })).not.toBeInTheDocument();
+    expect(pane.queryByRole('button', { name: label('automation:rollbackButton', { version: 1 }) })).not.toBeInTheDocument();
   });
 
   it('restores a deleted task and leaves the bin after a conflict still open', async () => {
     serve();
     renderAt('/automations?view=manage');
-    const personal = await screen.findByRole('region', { name: label('automation.groupMine') });
-    fireEvent.click(await within(personal).findByRole('button', { name: label('automation.recycleBin', { total: 1 }) }));
+    const personal = await screen.findByRole('region', { name: label('automation:groupMine') });
+    fireEvent.click(await within(personal).findByRole('button', { name: label('automation:recycleBin', { total: 1 }) }));
     fireEvent.click(await within(personal).findByRole('button', { name: /Old morning/ }));
-    fireEvent.click(inspector('Old morning').getByRole('button', { name: label('automation.restoreTask') }));
+    fireEvent.click(inspector('Old morning').getByRole('button', { name: label('automation:restoreTask') }));
     await waitFor(() => expect(api.restoreAutomation).toHaveBeenCalledWith('me-old', 8));
     await waitFor(() => expect(within(personal).queryByRole('button', { name: /Old morning/ })).not.toBeInTheDocument());
     await waitFor(() => expect(screen.queryByRole('heading', { level: 2, name: 'Old morning' })).not.toBeInTheDocument());
-    expect(within(personal).getByRole('button', { name: label('automation.recycleBin', { total: 1 }) })).toHaveAttribute(
+    expect(within(personal).getByRole('button', { name: label('automation:recycleBin', { total: 1 }) })).toHaveAttribute(
       'aria-pressed',
       'false',
     );
 
-    fireEvent.click(within(personal).getByRole('button', { name: label('automation.recycleBin', { total: 1 }) }));
+    fireEvent.click(within(personal).getByRole('button', { name: label('automation:recycleBin', { total: 1 }) }));
     fireEvent.click(await within(personal).findByRole('button', { name: /Old morning/ }));
     vi.mocked(api.restoreAutomation).mockRejectedValueOnce(httpError(409, 'stale version'));
     const reads = vi.mocked(api.listAutomationReads).mock.calls.length;
-    fireEvent.click(inspector('Old morning').getByRole('button', { name: label('automation.restoreTask') }));
+    fireEvent.click(inspector('Old morning').getByRole('button', { name: label('automation:restoreTask') }));
     await waitFor(() =>
-      expect(toast).toHaveBeenCalledWith(expect.objectContaining({ description: label('automation.versionConflict') })),
+      expect(toast).toHaveBeenCalledWith(expect.objectContaining({ description: label('automation:versionConflict') })),
     );
-    expect(inspector('Old morning').getByRole('button', { name: label('automation.restoreTask') })).toBeInTheDocument();
-    expect(within(personal).getByRole('button', { name: label('automation.recycleBin', { total: 1 }) })).toHaveAttribute(
+    expect(inspector('Old morning').getByRole('button', { name: label('automation:restoreTask') })).toBeInTheDocument();
+    expect(within(personal).getByRole('button', { name: label('automation:recycleBin', { total: 1 }) })).toHaveAttribute(
       'aria-pressed',
       'true',
     );
@@ -556,9 +556,9 @@ describe('scope in the URL', () => {
     });
     vi.mocked(api.getAutomationRead).mockResolvedValue({ data: desk } as never);
     renderAt('/automations?scope=company');
-    const company = await screen.findByRole('region', { name: label('automation.groupCompany') });
+    const company = await screen.findByRole('region', { name: label('automation:groupCompany') });
     expect(company).toHaveAttribute('aria-current', 'true');
-    expect(screen.getByRole('region', { name: label('automation.groupMine') })).not.toHaveAttribute('aria-current');
+    expect(screen.getByRole('region', { name: label('automation:groupMine') })).not.toHaveAttribute('aria-current');
     expect(await screen.findByRole('heading', { level: 2, name: 'Desk brief' })).toBeInTheDocument();
   });
 
@@ -578,10 +578,10 @@ describe('scope in the URL', () => {
       </>,
       { route: '/automations?scope=company' },
     );
-    const personal = await screen.findByRole('region', { name: label('automation.groupMine') });
+    const personal = await screen.findByRole('region', { name: label('automation:groupMine') });
     await waitFor(() => expect(personal).toHaveAttribute('aria-current', 'true'));
-    expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument();
-    expect(screen.queryByText(label('automation.companyUnavailable'))).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: label('automation:groupCompany') })).not.toBeInTheDocument();
+    expect(screen.queryByText(label('automation:companyUnavailable'))).not.toBeInTheDocument();
     expect(screen.queryByText(secret)).not.toBeInTheDocument();
     await waitFor(() => expect(screen.getByTestId('search').textContent).toContain('scope=personal'));
     expect(screen.getByTestId('search').textContent).toContain('view=manage');
@@ -598,7 +598,7 @@ describe('scope in the URL', () => {
     });
     renderAt('/automations?view=manage');
     expect(await screen.findByRole('button', { name: /Morning note/ })).toBeInTheDocument();
-    expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: label('automation:groupCompany') })).not.toBeInTheDocument();
     expect(api.listAutomationReads).not.toHaveBeenCalledWith(expect.objectContaining({ scope: 'company' }));
     expect(api.listAutomationReads).toHaveBeenCalledWith(
       expect.objectContaining({ scope: 'personal', includeDeleted: true, limit: 50, offset: 0 }),
@@ -610,7 +610,7 @@ describe('scope in the URL', () => {
     renderAt('/automations?view=manage');
     await waitFor(() => expect(api.listAutomationReads).toHaveBeenCalledWith(expect.objectContaining({ scope: 'personal' })));
     expect(api.listAutomationReads).not.toHaveBeenCalledWith(expect.objectContaining({ scope: 'company' }));
-    expect(screen.queryByRole('region', { name: label('automation.groupCompany') })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: label('automation:groupCompany') })).not.toBeInTheDocument();
   });
 });
 
@@ -662,31 +662,31 @@ describe('selecting the same task from the recycle bin', () => {
     const queryClient = stickyClient();
     renderWithProviders(<Automations />, { route: '/automations?view=manage', queryClient });
     const region = () => screen.getByRole('region', { name: label(groupKey) });
-    const bin = (total: number) => within(region()).getByRole('button', { name: label('automation.recycleBin', { total }) });
+    const bin = (total: number) => within(region()).getByRole('button', { name: label('automation:recycleBin', { total }) });
 
-    fireEvent.click(await within(await screen.findByRole('region', { name: label(groupKey) })).findByRole('button', { name: label('automation.recycleBin', { total: 0 }) }));
-    expect(within(region()).getByText(label('automation.recycleEmpty'))).toBeInTheDocument();
-    expect(within(region()).queryByText(label('automation.scopeEmpty'))).not.toBeInTheDocument();
+    fireEvent.click(await within(await screen.findByRole('region', { name: label(groupKey) })).findByRole('button', { name: label('automation:recycleBin', { total: 0 }) }));
+    expect(within(region()).getByText(label('automation:recycleEmpty'))).toBeInTheDocument();
+    expect(within(region()).queryByText(label('automation:scopeEmpty'))).not.toBeInTheDocument();
     fireEvent.click(bin(0));
 
     fireEvent.click(await within(region()).findByRole('button', { name: new RegExp(name) }));
     expect(await screen.findByRole('heading', { level: 2, name })).toBeInTheDocument();
-    expect(inspector(name).getByRole('button', { name: label('automation.edit') })).toBeInTheDocument();
-    expect(inspector(name).queryByRole('button', { name: label('automation.restoreTask') })).not.toBeInTheDocument();
+    expect(inspector(name).getByRole('button', { name: label('automation:edit') })).toBeInTheDocument();
+    expect(inspector(name).queryByRole('button', { name: label('automation:restoreTask') })).not.toBeInTheDocument();
     if (scope === 'personal') {
-      expect(inspector(name).getByRole('button', { name: label('automation.runNow') })).toBeInTheDocument();
+      expect(inspector(name).getByRole('button', { name: label('automation:runNow') })).toBeInTheDocument();
     }
     await waitFor(() =>
       expect(queryClient.getQueryData(queryKeys.automations.readDetail('user-1', id))).toMatchObject({ automation_id: id }),
     );
 
-    fireEvent.click(inspector(name).getByRole('button', { name: label('automation.moveToRecycle') }));
-    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label('automation.moveToRecycle') }));
+    fireEvent.click(inspector(name).getByRole('button', { name: label('automation:moveToRecycle') }));
+    fireEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: label('automation:moveToRecycle') }));
     await waitFor(() => expect(api.deleteAutomation).toHaveBeenCalledWith(id, version));
     await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
     await waitFor(() => expect(queryClient.getQueryData(queryKeys.automations.readDetail('user-1', id))).toBeUndefined());
     await waitFor(() => expect(screen.queryByRole('heading', { level: 2, name })).not.toBeInTheDocument());
-    await within(region()).findByRole('button', { name: label('automation.recycleBin', { total: 1 }) });
+    await within(region()).findByRole('button', { name: label('automation:recycleBin', { total: 1 }) });
 
     queryClient.setQueryData(queryKeys.automations.readDetail('user-1', id), liveRow);
     fireEvent.click(bin(1));
@@ -698,23 +698,23 @@ describe('selecting the same task from the recycle bin', () => {
     fireEvent.click(await within(region()).findByRole('button', { name: new RegExp(name) }));
     await waitFor(() => expect(screen.getAllByRole('heading', { level: 2, name })).toHaveLength(1));
     const deletedPane = inspector(name);
-    expect(deletedPane.getByRole('button', { name: label('automation.restoreTask') })).toBeEnabled();
+    expect(deletedPane.getByRole('button', { name: label('automation:restoreTask') })).toBeEnabled();
     expect(deletedPane.getByText(/user-2/)).toBeInTheDocument();
-    expect(deletedPane.queryByRole('button', { name: label('automation.runNow') })).not.toBeInTheDocument();
-    expect(deletedPane.queryByRole('button', { name: label('automation.edit') })).not.toBeInTheDocument();
-    expect(deletedPane.queryByRole('button', { name: label('automation.pause') })).not.toBeInTheDocument();
-    expect(deletedPane.queryByRole('button', { name: label('automation.moveToRecycle') })).not.toBeInTheDocument();
+    expect(deletedPane.queryByRole('button', { name: label('automation:runNow') })).not.toBeInTheDocument();
+    expect(deletedPane.queryByRole('button', { name: label('automation:edit') })).not.toBeInTheDocument();
+    expect(deletedPane.queryByRole('button', { name: label('automation:pause') })).not.toBeInTheDocument();
+    expect(deletedPane.queryByRole('button', { name: label('automation:moveToRecycle') })).not.toBeInTheDocument();
     expect(runsForTask()).toBe(runsBefore);
 
-    fireEvent.click(deletedPane.getByRole('button', { name: label('automation.restoreTask') }));
+    fireEvent.click(deletedPane.getByRole('button', { name: label('automation:restoreTask') }));
     await waitFor(() => expect(api.restoreAutomation).toHaveBeenCalledWith(id, version));
-    await within(region()).findByRole('button', { name: label('automation.recycleBin', { total: 0 }) });
+    await within(region()).findByRole('button', { name: label('automation:recycleBin', { total: 0 }) });
     expect(bin(0)).toHaveAttribute('aria-pressed', 'false');
     await waitFor(() => expect(screen.getAllByRole('heading', { level: 2, name })).toHaveLength(1));
-    await waitFor(() => expect(inspector(name).queryByRole('button', { name: label('automation.restoreTask') })).not.toBeInTheDocument());
-    expect(inspector(name).getByRole('button', { name: label('automation.edit') })).toBeInTheDocument();
+    await waitFor(() => expect(inspector(name).queryByRole('button', { name: label('automation:restoreTask') })).not.toBeInTheDocument());
+    expect(inspector(name).getByRole('button', { name: label('automation:edit') })).toBeInTheDocument();
     if (scope === 'personal') {
-      expect(inspector(name).getByRole('button', { name: label('automation.runNow') })).toBeInTheDocument();
+      expect(inspector(name).getByRole('button', { name: label('automation:runNow') })).toBeInTheDocument();
     }
     expect(within(region()).getByRole('button', { name: new RegExp(name) })).toBeInTheDocument();
   }
@@ -723,7 +723,7 @@ describe('selecting the same task from the recycle bin', () => {
     await deleteThenRestore(
       'personal',
       agent({ automation_id: 'me-1', name: 'Morning note', scope: 'personal', config_version: 4 }),
-      'automation.groupMine',
+      'automation:groupMine',
       4,
     );
   });
@@ -732,7 +732,7 @@ describe('selecting the same task from the recycle bin', () => {
     await deleteThenRestore(
       'company',
       script({ automation_id: 'data:prices', name: 'Close prices', config_version: 5 }),
-      'automation.groupCompany',
+      'automation:groupCompany',
       5,
     );
   });

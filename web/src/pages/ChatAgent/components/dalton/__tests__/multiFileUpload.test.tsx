@@ -16,7 +16,7 @@ vi.mock('react-i18next', () => ({
     // reasons). Keys without an entry come through unchanged, as before.
     t: (key: string, opts?: Record<string, unknown>) => {
       const templates: Record<string, string> = {
-        'filePanel.uploadFailedSummary': '{{count}} 个文件上传失败：{{details}}',
+        'filePanel:uploadFailedSummary': '{{count}} 个文件上传失败：{{details}}',
       };
       const template = templates[key] ?? key;
       if (!opts) return template;
