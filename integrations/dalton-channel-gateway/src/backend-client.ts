@@ -573,6 +573,7 @@ export interface I7InboundProgressRequest {
   platform?: string;
   message_id?: string;
   status?: InboundEventStatus;
+  error_code?: string | null;
   thread_id?: string | null;
   run_id?: string | null;
   turn_index?: number | null;
@@ -843,7 +844,7 @@ export interface WeixinAccountSnapshot {
 export interface WeixinAccountsReconcileResponse {
   changed: boolean;
   enabled: boolean;
-  allow_external?: boolean;
+  allow_external: boolean | null;
   max_concurrent_accounts: number;
   accounts_revision: number;
   accounts: WeixinAccountSnapshot[];
@@ -1131,7 +1132,8 @@ export interface WorkspaceUploadWeixinContext {
 
 /**
  * Validates required fields of a `POST /internal/weixin/accounts/reconcile` response
- * (contract §2.1 / R6 #4). Rejects empty objects, missing booleans/revisions, or non-array accounts.
+ * (contract §2.1 / R6 #4 / R7 #5). Rejects empty objects, missing top-level fields
+ * (including `allow_external`), non-array `accounts`, and malformed account entries.
  */
 export function isValidWeixinAccountsReconcileResponse(
   val: unknown,
@@ -1141,6 +1143,9 @@ export function isValidWeixinAccountsReconcileResponse(
   }
   const rec = val as Record<string, unknown>;
   if (typeof rec.enabled !== "boolean" || typeof rec.changed !== "boolean") {
+    return false;
+  }
+  if (typeof rec.allow_external !== "boolean" && rec.allow_external !== null) {
     return false;
   }
   if (
@@ -1159,6 +1164,44 @@ export function isValidWeixinAccountsReconcileResponse(
   }
   if (!Array.isArray(rec.accounts)) {
     return false;
+  }
+  for (const item of rec.accounts) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return false;
+    }
+    const acc = item as Record<string, unknown>;
+    if (
+      typeof acc.account_id !== "string" ||
+      acc.account_id.trim().length === 0 ||
+      typeof acc.user_id !== "string" ||
+      typeof acc.ilink_bot_id !== "string" ||
+      acc.ilink_bot_id.trim().length === 0 ||
+      typeof acc.bot_token !== "string" ||
+      acc.bot_token.trim().length === 0 ||
+      typeof acc.base_url !== "string" ||
+      typeof acc.get_updates_buf !== "string" ||
+      typeof acc.status !== "string" ||
+      acc.status.trim().length === 0 ||
+      typeof acc.bot_generation !== "number" ||
+      !Number.isInteger(acc.bot_generation) ||
+      acc.bot_generation < 0
+    ) {
+      return false;
+    }
+    if (
+      acc.ilink_user_id !== undefined &&
+      acc.ilink_user_id !== null &&
+      typeof acc.ilink_user_id !== "string"
+    ) {
+      return false;
+    }
+    if (
+      acc.cdn_base_url !== undefined &&
+      acc.cdn_base_url !== null &&
+      typeof acc.cdn_base_url !== "string"
+    ) {
+      return false;
+    }
   }
   return true;
 }
@@ -1539,10 +1582,18 @@ export class HttpBackendClient implements BackendClient {
         );
       }
       if (resp.status >= 400) {
+        let errBody: unknown = null;
+        if (text.trim()) {
+          try {
+            errBody = JSON.parse(text);
+          } catch {
+            errBody = { message: text };
+          }
+        }
         throw new BackendHttpError(
           `${label} failed (${resp.status})`,
           resp.status,
-          null,
+          errBody,
         );
       }
       if (!text.trim()) {
@@ -2567,27 +2618,30 @@ export class HttpBackendClient implements BackendClient {
     });
     if (!resp.ok) {
       const errText = await resp.text();
-      if (resp.status === 409 && errText.trim()) {
-        try {
-          const parsedErr = JSON.parse(errText);
-          this.checkStaleGatewayEpoch(resp.status, parsedErr, url.pathname);
-        } catch (err) {
-          if (err instanceof StaleGatewayEpochError) {
-            throw err;
+      if (weixinContext) {
+        if (resp.status === 409 && errText.trim()) {
+          try {
+            const parsedErr = JSON.parse(errText);
+            this.checkStaleGatewayEpoch(resp.status, parsedErr, url.pathname);
+          } catch (err) {
+            if (err instanceof StaleGatewayEpochError) {
+              throw err;
+            }
           }
         }
+        throw new BackendHttpError(
+          `uploadWorkspaceFile failed (${resp.status}): ${errText}`,
+          resp.status,
+          (() => {
+            try {
+              return errText ? JSON.parse(errText) : null;
+            } catch {
+              return { message: errText };
+            }
+          })(),
+        );
       }
-      throw new BackendHttpError(
-        `uploadWorkspaceFile failed (${resp.status}): ${errText}`,
-        resp.status,
-        (() => {
-          try {
-            return errText ? JSON.parse(errText) : null;
-          } catch {
-            return { message: errText };
-          }
-        })(),
-      );
+      throw new Error(`uploadWorkspaceFile failed (${resp.status}): ${errText}`);
     }
   }
 

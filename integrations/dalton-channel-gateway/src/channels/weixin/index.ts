@@ -151,6 +151,8 @@ export interface ManagedWeixinAccount {
   baseUrl: string;
   cdnBaseUrl: string;
   botGeneration: number;
+  /** Latest bot_generation observed in an authoritative reconcile snapshot (updated before awaiting old monitor stop, R7 #2). */
+  latestSnapshotGeneration: number;
   getUpdatesBuf: string;
   status: string;
   monitorController: AbortController | null;
@@ -282,6 +284,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         baseUrl: (opts.baseUrl || ILINK_DEFAULT_BASE_URL).trim(),
         cdnBaseUrl: (opts.cdnBaseUrl || ILINK_DEFAULT_CDN_BASE_URL).trim(),
         botGeneration: opts.botGeneration ?? 1,
+        latestSnapshotGeneration: opts.botGeneration ?? 1,
         getUpdatesBuf: "",
         status: "active",
         monitorController: null,
@@ -427,6 +430,14 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
   isReadyForOutbound(): boolean {
     return this.isConfigured();
+  }
+
+  /**
+   * R7 #6: Reports whether the adapter has applied an authoritative initial snapshot
+   * from backend (or has no backend configured). Used by `GET /health` `ready` check.
+   */
+  hasAppliedStartupSnapshot(): boolean {
+    return !this.backend || this.hasAppliedSnapshot;
   }
 
   getActiveAccountCount(): number {
@@ -902,13 +913,8 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       },
       onRateLimited: (err) =>
         this.recordRateLimitAndComputeDelay(capturedAccountId, err),
-      onAccountGenerationSuperseded: ({ accountId, activeBotGeneration }) => {
-        this.abortAccountInFlight(accountId);
-        this.accountInvalidatedHandler?.({
-          accountId,
-          reason: "monitor_generation_superseded",
-          activeBotGeneration,
-        });
+      onAccountGenerationSuperseded: () => {
+        // R7 #1: Only trigger snapshot sync; snapshot application drives generation-aware cancellation.
         void this.triggerAccountsSync(
           undefined,
           "monitor_generation_superseded",
@@ -1024,7 +1030,6 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
       if (!resp.enabled) {
         this.backendEnabled = false;
-        this.hasAppliedSnapshot = true;
         this.lastRevision = resp.accounts_revision;
         if (this.accounts.size > 0) {
           this.logger.info(
@@ -1037,28 +1042,31 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           );
           const removedIds = [...this.accounts.keys()];
           for (const accountId of removedIds) {
+            const acc = this.accounts.get(accountId);
+            if (acc) {
+              acc.status = "disabled";
+            }
             this.abortAccountInFlight(accountId);
-          }
-          await this.stopAllAccountMonitors();
-          this.accounts.clear();
-          this.typingTicketCache.clear();
-          this.typingSeqByUser.clear();
-          for (const accountId of removedIds) {
             this.accountInvalidatedHandler?.({
               accountId,
               reason: "feature_disabled",
             });
           }
+          await this.stopAllAccountMonitors();
+          this.accounts.clear();
+          this.typingTicketCache.clear();
+          this.typingSeqByUser.clear();
         }
+        this.hasAppliedSnapshot = true;
         return;
       }
 
       this.backendEnabled = true;
       if (!resp.changed) {
-        this.hasAppliedSnapshot = true;
         if (this.lastRevision === null) {
           this.lastRevision = resp.accounts_revision;
         }
+        this.hasAppliedSnapshot = true;
         // Decision #12: self-heal any pollable monitor whose coroutine exited
         // (e.g. after a transient lease dip) even when accounts_revision did not change.
         if (options?.startMonitors !== false) {
@@ -1067,10 +1075,10 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         return;
       }
 
-      this.lastRevision = resp.accounts_revision;
       await this.applyAccountSnapshots(resp.accounts ?? [], {
         startMonitors: options?.startMonitors,
       });
+      this.lastRevision = resp.accounts_revision;
     } catch (err) {
       if (isStaleGatewayEpochError(err)) {
         this.abortAllInFlight();
@@ -1085,22 +1093,24 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         // Layer 2 disabled: backend Weixin routes unmounted -> stop all pollers, probe every 5m.
         this.backendNotFound404 = true;
         this.backendEnabled = false;
-        this.hasAppliedSnapshot = true;
         this.lastRevision = null;
         const removedIds = [...this.accounts.keys()];
         for (const accountId of removedIds) {
+          const acc = this.accounts.get(accountId);
+          if (acc) {
+            acc.status = "disabled";
+          }
           this.abortAccountInFlight(accountId);
-        }
-        await this.stopAllAccountMonitors();
-        this.accounts.clear();
-        this.typingTicketCache.clear();
-        this.typingSeqByUser.clear();
-        for (const accountId of removedIds) {
           this.accountInvalidatedHandler?.({
             accountId,
             reason: "routes_disabled_404",
           });
         }
+        await this.stopAllAccountMonitors();
+        this.accounts.clear();
+        this.typingTicketCache.clear();
+        this.typingSeqByUser.clear();
+        this.hasAppliedSnapshot = true;
         this.logger.info(
           "Weixin multi-account backend endpoint returned 404; pausing pollers and probing periodically",
           {
@@ -1154,9 +1164,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     options?: { startMonitors?: boolean },
   ): Promise<void> {
     const startMonitors = options?.startMonitors !== false && this.started;
-    this.hasAppliedSnapshot = true;
     const pollableRaw = snapshots.filter(
       (s) =>
+        Boolean(s) &&
         isPollableAccountStatus(s.status) &&
         Boolean(s.account_id?.trim()) &&
         Boolean(s.ilink_bot_id?.trim()) &&
@@ -1176,17 +1186,19 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     const desiredIds = new Set(pollable.map((s) => s.account_id));
 
     // 1. Stop & remove accounts no longer in the pollable snapshot.
-    // Decision #10: abort all in-flight sends/uploads for the account BEFORE deleting it.
+    // Decision #10 & R7 #1: mark inactive, abort in-flight, and cancel ALL attachment tasks
+    // for the removed account BEFORE awaiting monitor shutdown.
     for (const [accountId, existing] of [...this.accounts.entries()]) {
       if (!desiredIds.has(accountId)) {
+        existing.status = "inactive";
         this.abortAccountInFlight(accountId);
-        await this.stopAccountMonitor(existing);
-        this.accounts.delete(accountId);
-        this.clearTypingCacheForAccount(accountId);
         this.accountInvalidatedHandler?.({
           accountId,
           reason: "removed_or_inactive",
         });
+        await this.stopAccountMonitor(existing);
+        this.accounts.delete(accountId);
+        this.clearTypingCacheForAccount(accountId);
       }
     }
 
@@ -1211,8 +1223,19 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           existing.baseUrl !== safeBaseUrl;
 
         if (credentialsChanged) {
-          // Decision #10: abort all in-flight requests using old credentials BEFORE applying new ones.
+          // R7 #2 (Codex High #1): Immediately mark old generation superseded via
+          // `latestSnapshotGeneration` and notify attachment cancellation BEFORE awaiting
+          // the old monitor's exit; replace credentials/botGeneration after monitor stops.
+          existing.latestSnapshotGeneration = Math.max(
+            existing.latestSnapshotGeneration,
+            snap.bot_generation,
+          );
           this.abortAccountInFlight(snap.account_id);
+          this.accountInvalidatedHandler?.({
+            accountId: snap.account_id,
+            reason: "generation_or_credentials_changed",
+            activeBotGeneration: snap.bot_generation,
+          });
           await this.stopAccountMonitor(existing);
           this.clearTypingCacheForAccount(snap.account_id);
           existing.userId = snap.user_id;
@@ -1222,19 +1245,19 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           existing.baseUrl = safeBaseUrl;
           existing.cdnBaseUrl = cdnBaseUrl;
           existing.botGeneration = snap.bot_generation;
+          existing.latestSnapshotGeneration = snap.bot_generation;
           existing.getUpdatesBuf = snap.get_updates_buf ?? "";
           existing.status = snap.status;
-          this.accountInvalidatedHandler?.({
-            accountId: snap.account_id,
-            reason: "generation_or_credentials_changed",
-            activeBotGeneration: snap.bot_generation,
-          });
           toStart.push(existing);
         } else {
           existing.userId = snap.user_id;
           existing.ilinkUserId = snap.ilink_user_id ?? null;
           existing.cdnBaseUrl = cdnBaseUrl;
           existing.status = snap.status;
+          existing.latestSnapshotGeneration = Math.max(
+            existing.latestSnapshotGeneration,
+            snap.bot_generation,
+          );
           if (!existing.getUpdatesBuf && snap.get_updates_buf) {
             existing.getUpdatesBuf = snap.get_updates_buf;
           }
@@ -1252,6 +1275,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           baseUrl: safeBaseUrl,
           cdnBaseUrl,
           botGeneration: snap.bot_generation,
+          latestSnapshotGeneration: snap.bot_generation,
           getUpdatesBuf: snap.get_updates_buf ?? "",
           status: snap.status,
           monitorController: null,
@@ -1261,6 +1285,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         toStart.push(created);
       }
     }
+
+    // R7 #5 (Codex Medium #4): Only mark snapshot applied AFTER the full snapshot diff succeeds.
+    this.hasAppliedSnapshot = true;
 
     // 3. Staggered startup (<= 10 accounts/sec + 0..500ms jitter) when starting multiple pollers (§3.4).
     if (!startMonitors) {
@@ -1379,12 +1406,6 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   private async handleConfirmedAccount(
     confirmed: ConfirmedWeixinAccount,
   ): Promise<void> {
-    this.abortAccountInFlight(confirmed.accountId);
-    this.accountInvalidatedHandler?.({
-      accountId: confirmed.accountId,
-      reason: "qr_confirmed",
-      activeBotGeneration: confirmed.botGeneration,
-    });
     if (this.backend && this.started) {
       await this.triggerAccountsSync(
         confirmed.accountsRevision ?? undefined,
@@ -1395,6 +1416,16 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     const safeBaseUrl = await this.resolveSafeBaseUrl(confirmed.baseUrl);
     const existing = this.accounts.get(confirmed.accountId);
     if (existing) {
+      existing.latestSnapshotGeneration = Math.max(
+        existing.latestSnapshotGeneration,
+        confirmed.botGeneration,
+      );
+      this.abortAccountInFlight(confirmed.accountId);
+      this.accountInvalidatedHandler?.({
+        accountId: confirmed.accountId,
+        reason: "qr_confirmed",
+        activeBotGeneration: confirmed.botGeneration,
+      });
       await this.stopAccountMonitor(existing);
       this.clearTypingCacheForAccount(confirmed.accountId);
     }
@@ -1411,13 +1442,16 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         ILINK_DEFAULT_CDN_BASE_URL
       ).trim(),
       botGeneration: confirmed.botGeneration,
+      latestSnapshotGeneration: confirmed.botGeneration,
       getUpdatesBuf: confirmed.getUpdatesBuf ?? "",
       status: confirmed.accountStatus ?? "active",
       monitorController: null,
       monitorTask: null,
     };
-    this.hasAppliedSnapshot = true;
     this.accounts.set(confirmed.accountId, next);
+    if (!this.backend) {
+      this.hasAppliedSnapshot = true;
+    }
     if (this.started) {
       this.startAccountMonitor(next);
     }
@@ -1454,11 +1488,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         error_code: String(err?.errcode ?? err?.ret ?? -14),
       });
       if (statusRes?.stale_generation) {
-        this.abortAccountInFlight(accountId);
-        this.accountInvalidatedHandler?.({
-          accountId,
-          reason: "status_stale_generation",
-        });
+        // R7 #1: `stale_generation` does not tell us the active generation; only sync snapshot.
         void this.triggerAccountsSync(undefined, "status_stale_generation");
       }
     } catch (statusErr) {
@@ -1491,11 +1521,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         },
       );
       if (statusRes?.stale_generation) {
-        this.abortAccountInFlight(preflight.account_id);
-        this.accountInvalidatedHandler?.({
-          accountId: preflight.account_id,
-          reason: "token_status_stale_generation",
-        });
+        // R7 #1: `stale_generation` does not tell us the active generation; only sync snapshot.
         void this.triggerAccountsSync(undefined, "token_status_stale_generation");
       }
     } catch (statusErr) {
@@ -1536,10 +1562,16 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       if (!byId) {
         return undefined;
       }
+      if (byId.botGeneration < byId.latestSnapshotGeneration) {
+        return undefined;
+      }
       if (reqBotId && byId.ilinkBotId !== reqBotId) {
         return undefined;
       }
-      if (reqGen !== undefined && byId.botGeneration !== reqGen) {
+      if (
+        reqGen !== undefined &&
+        (byId.botGeneration !== reqGen || reqGen < byId.latestSnapshotGeneration)
+      ) {
         return undefined;
       }
       return byId;
@@ -1548,8 +1580,11 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     if (reqBotId) {
       for (const acc of this.accounts.values()) {
         if (
+          acc.botGeneration >= acc.latestSnapshotGeneration &&
           acc.ilinkBotId === reqBotId &&
-          (reqGen === undefined || acc.botGeneration === reqGen)
+          (reqGen === undefined ||
+            (acc.botGeneration === reqGen &&
+              reqGen >= acc.latestSnapshotGeneration))
         ) {
           return acc;
         }

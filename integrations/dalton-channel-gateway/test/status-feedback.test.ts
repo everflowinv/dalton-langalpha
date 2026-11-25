@@ -2474,6 +2474,7 @@ describe("WeixinChannelAdapter processing status feedback", () => {
     vi.mocked(backend.reconcileWeixinAccounts).mockResolvedValue({
       changed: true,
       enabled: true,
+      allow_external: false,
       max_concurrent_accounts: 50,
       accounts_revision: 1,
       accounts: [

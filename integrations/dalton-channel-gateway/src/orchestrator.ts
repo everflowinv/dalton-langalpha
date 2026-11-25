@@ -37,21 +37,31 @@ import {
 } from "./delivery-service.js";
 import { isStaleGatewayEpochError } from "./gateway-lease.js";
 
+type WeixinAttachmentAbortReason = "shutdown" | "superseded";
+
 /**
  * Internal signal that a Weixin inbound attachment task was intentionally aborted
  * (e.g. account rotation / superseded generation / shutdown) and MUST NOT be
  * re-launched via `recoverDetachedInboundTurn`.
  */
 class WeixinAttachmentAbortedError extends Error {
-  constructor(message: string) {
-    super(message);
+  readonly reason: WeixinAttachmentAbortReason;
+
+  constructor(
+    message: string,
+    reason: WeixinAttachmentAbortReason,
+    options?: { cause?: unknown },
+  ) {
+    super(message, options);
     this.name = "WeixinAttachmentAbortedError";
+    this.reason = reason;
   }
 }
 import { ProcessingFeedbackCoordinator } from "./processing-feedback.js";
 import {
   createSubsystemLogger,
   extractSafeLogErrorFields,
+  sanitizeLogErrorCode,
 } from "./shared/logger.js";
 import {
   ACTIVE_WAKEUP_STATES,
@@ -364,7 +374,11 @@ export class ChannelGatewayOrchestrator {
   private readonly logger = createSubsystemLogger("orchestrator");
   private readonly activeInboundUploadControllers = new Map<
     AbortController,
-    { accountId?: string; botGeneration?: number }
+    {
+      accountId?: string;
+      botGeneration?: number;
+      abortReason?: WeixinAttachmentAbortReason;
+    }
   >();
   private startupRecoveryPromise: Promise<void> | null = null;
 
@@ -414,9 +428,11 @@ export class ChannelGatewayOrchestrator {
   }
 
   /**
-   * R6 #2 (Codex High #1): Cancels in-flight Weixin inbound attachment tasks for an account.
-   * When `activeBotGeneration` is known, only older/mismatched generations are aborted so
-   * newly arrived tasks on the active generation continue unimpeded.
+   * R6 #2 & R7 #1: Cancels in-flight Weixin inbound attachment tasks for an account.
+   * Only driven by authoritative snapshot application:
+   * - When `activeBotGeneration` is provided (rotation/credentials change), only strictly older
+   *   generations (`botGeneration < activeBotGeneration`) are aborted.
+   * - When `activeBotGeneration` is omitted (account removed/disabled), all tasks for the account are aborted.
    */
   cancelInboundUploadsForAccount(
     accountId: string | null | undefined,
@@ -429,21 +445,55 @@ export class ChannelGatewayOrchestrator {
       if (
         typeof activeBotGeneration === "number" &&
         typeof meta.botGeneration === "number" &&
-        meta.botGeneration === activeBotGeneration
+        meta.botGeneration >= activeBotGeneration
       ) {
         continue;
       }
+      meta.abortReason = "superseded";
       ctrl.abort();
       this.activeInboundUploadControllers.delete(ctrl);
     }
   }
 
   private notifyWeixinAccountRotation(
-    accountId: string | null | undefined,
+    _accountId: string | null | undefined,
     reason: string,
   ): void {
-    this.cancelInboundUploadsForAccount(accountId);
+    // R7 #1: Rotation hints without an authoritative snapshot generation only trigger
+    // accounts sync; snapshot application performs generation-aware cancellation.
     void this.adapters.get("weixin")?.triggerAccountsSync?.(undefined, reason);
+  }
+
+  /**
+   * R7 #3 (Grok High): Marks a superseded Weixin inbound message as terminal `failed`
+   * so startup recovery does not replay it indefinitely. Failures are logged with
+   * whitelisted error fields only.
+   */
+  private async markWeixinInboundSuperseded(
+    platform: ChannelPlatform,
+    messageId: string,
+  ): Promise<void> {
+    try {
+      await this.backend.updateInboundProgress({
+        platform,
+        message_id: messageId,
+        status: "failed",
+        error_code: "weixin_bot_generation_superseded",
+        fallback_pending: false,
+      });
+    } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        return;
+      }
+      this.logger.warn(
+        "Failed to mark superseded Weixin inbound event as terminal failed",
+        {
+          platform,
+          message_id: messageId,
+          ...extractSafeLogErrorFields(err),
+        },
+      );
+    }
   }
 
   /**
@@ -452,7 +502,8 @@ export class ChannelGatewayOrchestrator {
    */
   abortAllActiveInboundUploads(): void {
     this.shuttingDown = true;
-    for (const ctrl of [...this.activeInboundUploadControllers.keys()]) {
+    for (const [ctrl, meta] of [...this.activeInboundUploadControllers.entries()]) {
+      meta.abortReason = "shutdown";
       ctrl.abort();
     }
     this.activeInboundUploadControllers.clear();
@@ -686,16 +737,33 @@ export class ChannelGatewayOrchestrator {
       try {
         await runTurn();
       } catch (err) {
-        if (
-          isStaleGatewayEpochError(err) ||
-          err instanceof WeixinAttachmentAbortedError
-        ) {
+        if (isStaleGatewayEpochError(err)) {
+          return;
+        }
+        if (err instanceof WeixinAttachmentAbortedError) {
+          if (err.reason === "superseded") {
+            recoveryFailed = true;
+            await this.markWeixinInboundSuperseded(
+              event.platform,
+              event.messageId,
+            );
+          }
           return;
         }
         try {
           await this.recoverDetachedInboundTurn(event);
         } catch (retryErr) {
           if (isStaleGatewayEpochError(retryErr)) {
+            return;
+          }
+          if (retryErr instanceof WeixinAttachmentAbortedError) {
+            if (retryErr.reason === "superseded") {
+              recoveryFailed = true;
+              await this.markWeixinInboundSuperseded(
+                event.platform,
+                event.messageId,
+              );
+            }
             return;
           }
           // The inbound row keeps its last persisted state, so a later
@@ -1175,18 +1243,21 @@ export class ChannelGatewayOrchestrator {
   }
 
   /**
-   * R6 #1 (Grok Critical, Codex High #2): Weixin `/bind` usage and invalid-command hints
-   * register the inbound via I-1 (`register-and-resolve`, NEVER I-3 `cmd: "help"`, which
-   * is not in the contract allowlist) to verify epoch, account generation, roster, and
-   * upsert `context_token`, then deliver fixed gateway-generated text through I-6 + `preflight-send`.
+   * R6 #1 & R7 #7: Weixin `/bind` usage and invalid-command hints register the inbound via I-1
+   * (`register-and-resolve`, NEVER I-3 `cmd: "help"`) and deliver fixed gateway-generated text
+   * through I-6 + `preflight-send`.
+   * Retryable I-1 registration failures (5xx, 503 `roster_lookup_error`, 408/429, network/timeout)
+   * propagate to `WeixinMonitor` so the cursor does NOT advance; explicit 4xx rejections are logged
+   * with whitelisted error fields and allow the cursor to advance.
    */
   private async sendWeixinCommandHintViaPreflight(
     event: InboundChannelEvent,
     noticeKey: string,
     text: string,
   ): Promise<void> {
+    let resolved: I1RegisterAndResolveResponse;
     try {
-      const resolved = await this.backend.registerAndResolveInbound({
+      resolved = await this.backend.registerAndResolveInbound({
         platform: "weixin",
         platform_user_id: event.platformUserId,
         chat_type: event.chatType,
@@ -1204,10 +1275,34 @@ export class ChannelGatewayOrchestrator {
         weixin_bot_generation: event.weixinBotGeneration ?? null,
         weixin_context_seq: event.weixinContextSeq ?? null,
       });
+    } catch (err) {
+      if (isStaleGatewayEpochError(err)) {
+        throw err;
+      }
+      const isExplicitNonRetryable4xx =
+        err instanceof BackendHttpError &&
+        err.status >= 400 &&
+        err.status < 500 &&
+        err.status !== 408 &&
+        err.status !== 429;
+      if (!isExplicitNonRetryable4xx) {
+        // Retryable registration failure (5xx, 503 roster_lookup_error, timeout, network):
+        // bubble up to WeixinMonitor so cursor is NOT committed.
+        throw err;
+      }
+      this.logger.warn(
+        "Weixin command hint registration rejected with 4xx; advancing cursor",
+        {
+          account_id: event.weixinAccountId ?? null,
+          message_id: event.messageId,
+          ...extractSafeLogErrorFields(err),
+        },
+      );
+      return;
+    }
+
+    try {
       if (resolved.one_time_weixin_reply) {
-        this.cancelInboundUploadsForAccount(
-          event.weixinAccountId ?? resolved.weixin_account_id,
-        );
         await this.dispatchOneTimeWeixinReply(
           resolved.one_time_weixin_reply,
           `onetime:${event.platform}:${event.messageId}:hint`,
@@ -1235,7 +1330,7 @@ export class ChannelGatewayOrchestrator {
           {
             account_id: event.weixinAccountId ?? null,
             message_id: event.messageId,
-            deny_reason: resolved.deny_reason ?? null,
+            deny_reason: sanitizeLogErrorCode(resolved.deny_reason),
           },
         );
         return;
@@ -2319,15 +2414,29 @@ export class ChannelGatewayOrchestrator {
     // Feishu / Discord paths remain completely untouched.
     const weixinTaskController =
       event.platform === "weixin" ? new AbortController() : null;
-    if (weixinTaskController) {
+    const weixinTaskMeta: {
+      accountId?: string;
+      botGeneration?: number;
+      abortReason?: WeixinAttachmentAbortReason;
+    } | null = weixinTaskController
+      ? {
+          accountId: event.weixinAccountId,
+          botGeneration: event.weixinBotGeneration,
+        }
+      : null;
+    if (weixinTaskController && weixinTaskMeta) {
       if (this.shuttingDown) {
+        weixinTaskMeta.abortReason = "shutdown";
         weixinTaskController.abort();
       }
-      this.activeInboundUploadControllers.set(weixinTaskController, {
-        accountId: event.weixinAccountId,
-        botGeneration: event.weixinBotGeneration,
-      });
+      this.activeInboundUploadControllers.set(
+        weixinTaskController,
+        weixinTaskMeta,
+      );
     }
+
+    const resolveAbortReason = (): WeixinAttachmentAbortReason =>
+      weixinTaskMeta?.abortReason ?? (this.shuttingDown ? "shutdown" : "superseded");
 
     const assertWeixinAttachmentTaskActive = (stage: string): void => {
       if (!weixinTaskController) {
@@ -2336,15 +2445,20 @@ export class ChannelGatewayOrchestrator {
       if (this.shuttingDown || weixinTaskController.signal.aborted) {
         throw new WeixinAttachmentAbortedError(
           `Weixin attachment task aborted before ${stage}`,
+          resolveAbortReason(),
         );
       }
       if (
         typeof adapter.isWeixinAccountGenerationActive === "function" &&
         !adapter.isWeixinAccountGenerationActive(event)
       ) {
+        if (weixinTaskMeta) {
+          weixinTaskMeta.abortReason = "superseded";
+        }
         weixinTaskController.abort();
         throw new WeixinAttachmentAbortedError(
           `Weixin account rotated or inactive before ${stage}`,
+          "superseded",
         );
       }
     };
@@ -2424,6 +2538,8 @@ export class ChannelGatewayOrchestrator {
           if (weixinTaskController?.signal.aborted) {
             throw new WeixinAttachmentAbortedError(
               "Weixin attachment download aborted due to account rotation or shutdown",
+              resolveAbortReason(),
+              { cause: err },
             );
           }
           if (err instanceof SafeFetchError && err.code === "size_exceeded") {
@@ -2496,11 +2612,18 @@ export class ChannelGatewayOrchestrator {
                   event.weixinAccountId,
                   errCode,
                 );
+                throw new WeixinAttachmentAbortedError(
+                  `Weixin attachment upload rejected (${errCode})`,
+                  "superseded",
+                  { cause: uploadErr },
+                );
               }
             }
             if (weixinTaskController.signal.aborted) {
               throw new WeixinAttachmentAbortedError(
                 "Weixin attachment upload aborted due to account rotation or shutdown",
+                resolveAbortReason(),
+                { cause: uploadErr },
               );
             }
             throw uploadErr;
@@ -2546,6 +2669,24 @@ export class ChannelGatewayOrchestrator {
       }
 
       return { ok: true, uploaded };
+    } catch (err) {
+      if (
+        err instanceof WeixinAttachmentAbortedError ||
+        isStaleGatewayEpochError(err)
+      ) {
+        throw err;
+      }
+      // R7 #4 (Codex Medium #3): If this task was cancelled while awaiting workspace readiness
+      // (`ensureHomeWorkspace` / `startWorkspace`) or any step, honor the cancellation even when
+      // the underlying workspace request rejects, so `launchInboundTurn` does NOT enter recovery.
+      if (weixinTaskController?.signal.aborted) {
+        throw new WeixinAttachmentAbortedError(
+          "Weixin attachment task aborted before completion",
+          resolveAbortReason(),
+          { cause: err },
+        );
+      }
+      throw err;
     } finally {
       if (weixinTaskController) {
         this.activeInboundUploadControllers.delete(weixinTaskController);
@@ -9490,6 +9631,27 @@ export class ChannelGatewayOrchestrator {
               : (row.uploaded_attachments ?? []),
         });
       } catch (err) {
+        if (
+          err instanceof WeixinAttachmentAbortedError &&
+          err.reason === "superseded"
+        ) {
+          threw = true;
+          await this.markWeixinInboundSuperseded(row.platform, row.message_id);
+          return;
+        }
+        if (
+          row.platform === "weixin" &&
+          err instanceof BackendHttpError &&
+          err.status === 409
+        ) {
+          const bodyObj = err.body as { code?: unknown } | null;
+          const errCode = typeof bodyObj?.code === "string" ? bodyObj.code : "";
+          if (errCode === "weixin_bot_generation_superseded") {
+            threw = true;
+            await this.markWeixinInboundSuperseded(row.platform, row.message_id);
+            return;
+          }
+        }
         threw = true;
         throw err;
       } finally {

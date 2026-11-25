@@ -221,14 +221,12 @@ export function createGatewayApp(options: {
     wxInitial.setBackendClient(backend);
   }
 
-  let orchestrator!: ChannelGatewayOrchestrator;
   const onWeixinAccountRotated = (info: {
     accountId?: string | null;
     reason: string;
   }): void => {
-    if (orchestrator) {
-      orchestrator.cancelInboundUploadsForAccount(info.accountId);
-    }
+    // R7 #1: Rotation hints without an authoritative snapshot generation only trigger
+    // accounts sync; actual attachment cancellation is driven exclusively by snapshot application.
     void adapters.get("weixin")?.triggerAccountsSync?.(undefined, info.reason);
   };
 
@@ -267,7 +265,7 @@ export function createGatewayApp(options: {
     deliveryService,
     webBaseUrl: config.webBaseUrl,
   });
-  orchestrator = new ChannelGatewayOrchestrator({
+  const orchestrator = new ChannelGatewayOrchestrator({
     backend,
     adapters,
     deliveryService,
@@ -362,8 +360,25 @@ export function createGatewayApp(options: {
         return;
       }
 
+      const isGatewayReady = (): boolean => {
+        if (stopInProgress) {
+          return false;
+        }
+        if (shouldUseLease && !leaseReady) {
+          return false;
+        }
+        const wxAdapter = adapters.get("weixin");
+        if (
+          wxAdapter?.hasAppliedStartupSnapshot &&
+          !wxAdapter.hasAppliedStartupSnapshot()
+        ) {
+          return false;
+        }
+        return true;
+      };
+
       if (method === "GET" && pathname === "/health") {
-        sendJson(res, 200, { ok: true });
+        sendJson(res, 200, { ok: true, ready: isGatewayReady() });
         return;
       }
 

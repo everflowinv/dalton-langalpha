@@ -499,22 +499,47 @@ export class WeixinQrLoginManager {
       (typeof confirmed.account_id === "string" && confirmed.account_id.trim()) ||
       session.target_account_id ||
       null;
+    const botGeneration =
+      typeof session.bot_generation === "number"
+        ? session.bot_generation
+        : typeof confirmed.bot_generation === "number"
+          ? confirmed.bot_generation
+          : null;
+    const buildRetryableWaitResponse = (): WeixinQrPublicWaitResponse =>
+      shapePublicQrWaitResponse({
+        sessionKey: session.session_key,
+        status: "wait",
+        connected: false,
+        expiresAt: session.expires_at,
+        qrcodeImgContent: sessionQrImage(session),
+        allowedDomains: this.allowedApiDomains,
+        message: "Waiting for WeChat account status confirmation.",
+      });
     let accountStatus: string | null =
       (typeof session.account_status === "string" &&
         session.account_status.trim()) ||
       (typeof confirmed.account_status === "string" &&
         confirmed.account_status.trim()) ||
       null;
-    if (!accountStatus && accountId) {
+    if (!accountStatus) {
+      if (!accountId) {
+        return buildRetryableWaitResponse();
+      }
       try {
         const detail = await this.backend.getWeixinAccountDetail(accountId);
-        if (detail && typeof detail.status === "string" && detail.status.trim()) {
-          accountStatus = detail.status.trim();
+        const detailStatus =
+          detail && typeof detail.status === "string" ? detail.status.trim() : "";
+        const generationMatches =
+          botGeneration === null || detail?.bot_generation === botGeneration;
+        if (!detailStatus || !generationMatches) {
+          return buildRetryableWaitResponse();
         }
+        accountStatus = detailStatus;
       } catch (err) {
         if (isStaleGatewayEpochError(err) || isLeaseSafetyMarginPauseError(err)) {
           throw err;
         }
+        return buildRetryableWaitResponse();
       }
     }
     const ilinkBotId =
@@ -532,12 +557,6 @@ export class WeixinQrLoginManager {
       (typeof confirmed.ilink_username === "string"
         ? confirmed.ilink_username
         : null);
-    const botGeneration =
-      typeof session.bot_generation === "number"
-        ? session.bot_generation
-        : typeof confirmed.bot_generation === "number"
-          ? confirmed.bot_generation
-          : null;
     const accountsRevision =
       typeof session.accounts_revision === "number"
         ? session.accounts_revision

@@ -429,6 +429,7 @@ export interface ChannelAdapter {
       activeBotGeneration?: number;
     }) => void,
   ): void;
+  hasAppliedStartupSnapshot?(): boolean;
   triggerAccountsSync?(
     targetRevision?: number | null,
     reason?: string,
