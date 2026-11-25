@@ -584,4 +584,39 @@ describe('useCallerIdentity', () => {
     });
     expect(result.current.getLatestIdentity().tier).toBe('external');
   });
+
+  it('skips network fetches and revalidation when enabled is false while still reading cached identity', async () => {
+    const emptyClient = makeClient();
+    const emptyView = renderHook(
+      () => useCallerIdentity({ enabled: false, revalidateOnOpen: true, open: true }),
+      { wrapper: wrapperOf(emptyClient) },
+    );
+
+    expect(mockApiGet).not.toHaveBeenCalled();
+    expect(emptyClient.isFetching()).toBe(0);
+    expect(emptyView.result.current.status).toBe('loading');
+    expect(emptyView.result.current.isInternal).toBe(false);
+
+    await act(async () => {
+      await emptyView.result.current.revalidate();
+    });
+    expect(mockApiGet).not.toHaveBeenCalled();
+    expect(emptyClient.isFetching()).toBe(0);
+    emptyView.unmount();
+
+    const cachedClient = makeClient();
+    cachedClient.setQueryData(
+      queryKeys.dalton.credentialsStatus('u-1'),
+      makeStatus({ caller_tier: 'admin', is_pm: true, can_invite: true }),
+    );
+    const cachedView = renderHook(() => useCallerIdentity({ enabled: false }), {
+      wrapper: wrapperOf(cachedClient),
+    });
+
+    expect(mockApiGet).not.toHaveBeenCalled();
+    expect(cachedClient.isFetching()).toBe(0);
+    expect(cachedView.result.current.status).toBe('ready');
+    expect(cachedView.result.current.tier).toBe('admin');
+    expect(cachedView.result.current.isAdmin).toBe(true);
+  });
 });

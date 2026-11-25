@@ -318,6 +318,7 @@ import {
   TeamReadOnlyBanner,
   TeamReadOnlyComposer,
   useTeamReadOnly,
+  useTeamWorkspaces,
   type TeamWorkspacesResponse,
 } from '@/pages/ChatAgent/components/dalton/TeamSharing';
 import { WorkspaceSharingModal } from '@/pages/ChatAgent/components/dalton/WorkspaceSharingModal';
@@ -1235,6 +1236,42 @@ describe('Dalton Team Sharing', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // DALTON-HOOK(external-member-perms): cached team lists grant write access only to a confirmed internal member.
+  it('keeps a cached rw colleague workspace read-only for an external caller', () => {
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID), {
+      ...SAMPLE_INTERNAL_CREDS,
+      caller_tier: 'external' as const,
+    });
+    queryClient.setQueryData(queryKeys.workspaces.team(), {
+      caller_tier: 'internal',
+      members: [
+        {
+          user_id: 'u-richard',
+          email: 'richard.lu@dalton.test',
+          display_name: 'Richard Lu',
+          workspaces: [
+            {
+              workspace_id: 'ws-rw-cached',
+              user_id: 'u-richard',
+              owner_name: 'Richard Lu',
+              owner_email: 'richard.lu@dalton.test',
+              name: 'Cached RW',
+              status: 'running',
+              access: 'rw',
+              web_access: 'rw',
+              cos_access: 'rw',
+            },
+          ],
+        },
+      ],
+    } as TeamWorkspacesResponse);
+    const { result } = renderHookWithProviders(() => useTeamReadOnly('ws-rw-cached'), { queryClient });
+    expect(result.current.isColleague).toBe(true);
+    expect(result.current.access).toBe('ro');
+    expect(result.current.canWriteFiles).toBe(false);
   });
 
   it('supports 3-state useTeamReadOnly (owner / rw / ro) and renders access badges in TeamWorkspacesSection', async () => {
@@ -2234,5 +2271,40 @@ describe('Dalton Team Sharing', () => {
     expect(await screen.findByTestId('team-workspaces-section')).toBeInTheDocument();
     expect(mockApiGet).toHaveBeenCalledWith('/api/v1/dalton/workspaces/team');
     pendingView.unmount();
+  });
+
+  it('starts no background queries in useTeamReadOnly or useTeamWorkspaces when inactive', () => {
+    mockApiGet.mockClear();
+
+    // 1. workspaceId is null under Dalton auth -> no capabilities, credentials, or team fetches.
+    const qcNoWs = createTestQueryClient();
+    const noWsView = renderHookWithProviders(() => useTeamReadOnly(null, null), {
+      queryClient: qcNoWs,
+    });
+    expect(noWsView.result.current.access).toBe('owner');
+    expect(qcNoWs.isFetching()).toBe(0);
+    expect(mockApiGet).not.toHaveBeenCalled();
+    noWsView.unmount();
+
+    // 2. isDaltonAuth is false with a workspaceId -> no capabilities, credentials, or team fetches.
+    mockDaltonAuth.isDaltonAuth = false;
+    const qcNoAuth = createTestQueryClient();
+    const noAuthView = renderHookWithProviders(() => useTeamReadOnly('ws-1', null), {
+      queryClient: qcNoAuth,
+    });
+    expect(noAuthView.result.current.access).toBe('owner');
+    expect(qcNoAuth.isFetching()).toBe(0);
+    expect(mockApiGet).not.toHaveBeenCalled();
+    noAuthView.unmount();
+
+    // 3. useTeamWorkspaces(false) -> no capabilities, credentials, or team fetches.
+    mockDaltonAuth.isDaltonAuth = true;
+    const qcDisabled = createTestQueryClient();
+    const disabledView = renderHookWithProviders(() => useTeamWorkspaces(false), {
+      queryClient: qcDisabled,
+    });
+    expect(qcDisabled.isFetching()).toBe(0);
+    expect(mockApiGet).not.toHaveBeenCalled();
+    disabledView.unmount();
   });
 });
