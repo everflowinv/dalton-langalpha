@@ -991,7 +991,8 @@ class TestDaltonRoutesRegistrationGate:
             "updated_at": None,
         }
 
-        # 4. Supabase auth enabled while colleague_sharing is off -> caller_tier resolved via get_user_tier
+        # 4. Multi-user auth (Supabase or local) enabled while colleague_sharing is off -> caller_tier resolved via get_user_tier
+        monkeypatch.setattr(dalton_settings_mod, "is_dalton_auth_enabled", lambda: True)
         monkeypatch.setattr(dalton_settings_mod, "is_dalton_supabase_auth_enabled", lambda: True)
 
         async def _fake_require_team_reader(_uid: str) -> None:

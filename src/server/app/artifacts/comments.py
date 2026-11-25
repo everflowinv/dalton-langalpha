@@ -50,6 +50,14 @@ def _refuse_comments_disabled() -> None:
         )
 
 
+# DALTON-HOOK(external-share-guard): external members cannot create, reply to,
+# or update artifact comments under Dalton multi-user auth.
+async def _require_non_external_for_comments(user_id: str) -> None:
+    from src.server.app.share_links import require_non_external_for_share
+
+    await require_non_external_for_share(user_id)
+
+
 async def _shown(
     access: Access, caller: str, comments: Sequence[Comment]
 ) -> list[CommentResponse]:
@@ -145,6 +153,7 @@ async def create_comment(
     artifact_id: str, body: CreateCommentRequest, x_user_id: CurrentUserId
 ) -> CommentResponse:
     _refuse_comments_disabled()  # DALTON-HOOK(artifact-publishing-off)
+    await _require_non_external_for_comments(x_user_id)  # DALTON-HOOK(external-share-guard)
     artifact, access = await reached(artifact_id, x_user_id)
     owner_id = access.owner_id
     with db_errors():
@@ -179,6 +188,7 @@ async def add_comment_message(
 ) -> CommentResponse:
     """The owner writes again on a comment, which reopens it if resolved."""
     _refuse_comments_disabled()  # DALTON-HOOK(artifact-publishing-off)
+    await _require_non_external_for_comments(x_user_id)  # DALTON-HOOK(external-share-guard)
     artifact, access = await reached(artifact_id, x_user_id)
     owner_id = access.owner_id
     comment_id = path_id(comment_id, "Comment")
@@ -209,6 +219,7 @@ async def update_comment(
     """Queue a comment for a thread, drop it back to a note, move it to another
     thread's queue, resolve or reopen it."""
     _refuse_comments_disabled()  # DALTON-HOOK(artifact-publishing-off)
+    await _require_non_external_for_comments(x_user_id)  # DALTON-HOOK(external-share-guard)
     artifact, access = await reached(artifact_id, x_user_id)
     owner_id = access.owner_id
     comment_id = path_id(comment_id, "Comment")

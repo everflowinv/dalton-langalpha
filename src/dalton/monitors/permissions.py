@@ -12,11 +12,19 @@ from collections.abc import Collection, Sequence
 from fastapi import HTTPException
 
 from src.dalton.access_tiers import get_user_tier
+from src.dalton.auth_guards import (
+    raise_admin_required,
+    raise_external_member_forbidden,
+)
 from src.dalton.capabilities import CapabilityId, has_capability
 from src.dalton.company_identity import is_company_system_user
 from src.dalton.monitors.models import MonitorRecord, MonitorVisibility
 
 COMPANY_TIERS = frozenset({"admin", "internal"})
+EXTERNAL_MONITOR_PUBLISH_FORBIDDEN_MESSAGE = (
+    "外部成员发布或更新监控面板前须先将可见性降为「仅自己」"
+)
+ADMIN_PUBLIC_MONITOR_REQUIRED_MESSAGE = "只有管理员可以将监控面板设为公开链接"
 
 
 def is_monitor_capability_enabled(monitor: MonitorRecord) -> bool:
@@ -109,6 +117,21 @@ async def require_monitor_view(
         raise HTTPException(status_code=403, detail="无权访问此监控面板")
 
 
+def require_monitor_publish_visibility(
+    tier: str,
+    visibility: MonitorVisibility,
+) -> None:
+    """Enforce caller/owner tier against target monitor visibility.
+
+    - External members may only publish or cut versions with ``visibility == 'own'``.
+    - Only ``admin`` members may publish or cut versions with ``visibility == 'public'``.
+    """
+    if tier == "external" and visibility != "own":
+        raise_external_member_forbidden(EXTERNAL_MONITOR_PUBLISH_FORBIDDEN_MESSAGE)
+    if visibility == "public" and tier != "admin":
+        raise_admin_required(ADMIN_PUBLIC_MONITOR_REQUIRED_MESSAGE)
+
+
 async def validate_publish_permissions(
     *,
     caller_id: str,
@@ -120,18 +143,7 @@ async def validate_publish_permissions(
     Returns normalized deduplicated ``member_user_ids`` (empty unless ``visibility == 'members'``).
     """
     tier = await get_user_tier(caller_id)
-
-    if tier == "external" and visibility != "own":
-        raise HTTPException(
-            status_code=403,
-            detail="外部成员发布监控面板时只能选择“仅自己”可见",
-        )
-
-    if visibility == "public" and tier != "admin":
-        raise HTTPException(
-            status_code=403,
-            detail="只有管理员可以将监控面板设为公开链接",
-        )
+    require_monitor_publish_visibility(tier, visibility)
 
     if visibility != "members":
         return []

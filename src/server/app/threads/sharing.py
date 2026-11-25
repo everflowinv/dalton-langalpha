@@ -23,7 +23,10 @@ from src.server.models.conversation import (
     SharePermissions,
 )
 from src.dalton.access_tiers import get_user_tier as _default_get_user_tier
-from src.dalton.settings import is_dalton_supabase_auth_enabled
+from src.dalton.settings import (
+    is_dalton_multiuser_auth_enabled as _default_is_dalton_multiuser_auth_enabled,
+    is_dalton_supabase_auth_enabled as _default_is_dalton_supabase_auth_enabled,
+)
 from src.server.database.conversation import (
     get_thread_by_id,
     update_thread_sharing,
@@ -39,32 +42,44 @@ from src.server.services.share_audience import (
 )
 from src.server.services.shared_workspaces import access as shared_access
 from src.server.services.shared_workspaces.share_out import refuse_link_change
+from ._deps import router
 
 # DALTON-HOOK(external-share-guard): external members cannot enable public thread sharing
 EXTERNAL_SHARE_FORBIDDEN_DETAIL = "外部成员不能创建公开分享链接"
 get_user_tier = _default_get_user_tier
+is_dalton_supabase_auth_enabled = _default_is_dalton_supabase_auth_enabled
+is_dalton_multiuser_auth_enabled = _default_is_dalton_multiuser_auth_enabled
 
 
-async def _require_non_external_for_share(user_id: str | None) -> None:
-    """Reject external members from enabling public thread sharing."""
+def _resolve_tier_fn():
     from src.dalton import access_tiers as _access_tiers
     from src.dalton import sharing as _dalton_sharing
 
     if get_user_tier is not _default_get_user_tier:
-        tier_fn = get_user_tier
-    elif _access_tiers.get_user_tier is not _default_get_user_tier:
-        tier_fn = _access_tiers.get_user_tier
-    elif _dalton_sharing.get_user_tier is not _default_get_user_tier:
-        tier_fn = _dalton_sharing.get_user_tier
-    else:
-        tier_fn = _default_get_user_tier
-    if not is_dalton_supabase_auth_enabled() and tier_fn is _default_get_user_tier:
+        return get_user_tier
+    if _access_tiers.get_user_tier is not _default_get_user_tier:
+        return _access_tiers.get_user_tier
+    if _dalton_sharing.get_user_tier is not _default_get_user_tier:
+        return _dalton_sharing.get_user_tier
+    return _default_get_user_tier
+
+
+def _is_multiuser_auth_active() -> bool:
+    # DALTON-HOOK(colleague-dispatch): enable thread sharing guards across both supabase and local modes
+    if is_dalton_supabase_auth_enabled is not _default_is_dalton_supabase_auth_enabled:
+        return bool(is_dalton_supabase_auth_enabled()) or is_dalton_multiuser_auth_enabled()
+    return is_dalton_multiuser_auth_enabled()
+
+
+async def _require_non_external_for_share(user_id: str | None) -> None:
+    """Reject external members from enabling public thread sharing."""
+    tier_fn = _resolve_tier_fn()
+    if not _is_multiuser_auth_active() and tier_fn is _default_get_user_tier:
         return
     if await tier_fn(user_id) == "external":
-        raise HTTPException(
-            status_code=403,
-            detail=EXTERNAL_SHARE_FORBIDDEN_DETAIL,
-        )
+        from src.dalton.auth_guards import raise_external_member_forbidden
+
+        raise_external_member_forbidden(EXTERNAL_SHARE_FORBIDDEN_DETAIL)
 
 
 # DALTON-HOOK(monitors): enabling public thread sharing with workspace files
@@ -74,28 +89,13 @@ PUBLIC_THREAD_FILES_FORBIDDEN_DETAIL = "仅管理员可开启附带工作区文�
 
 async def _require_admin_for_share_files(user_id: str | None) -> None:
     """Reject non-admin users from enabling public thread sharing with workspace file access."""
-    from src.dalton import access_tiers as _access_tiers
-    from src.dalton import sharing as _dalton_sharing
-
-    if get_user_tier is not _default_get_user_tier:
-        tier_fn = get_user_tier
-    elif _access_tiers.get_user_tier is not _default_get_user_tier:
-        tier_fn = _access_tiers.get_user_tier
-    elif _dalton_sharing.get_user_tier is not _default_get_user_tier:
-        tier_fn = _dalton_sharing.get_user_tier
-    else:
-        tier_fn = _default_get_user_tier
-    if not is_dalton_supabase_auth_enabled() and tier_fn is _default_get_user_tier:
+    tier_fn = _resolve_tier_fn()
+    if not _is_multiuser_auth_active() and tier_fn is _default_get_user_tier:
         return
     if await tier_fn(user_id) != "admin":
-        raise HTTPException(
-            status_code=403,
-            detail=PUBLIC_THREAD_FILES_FORBIDDEN_DETAIL,
-        )
+        from src.dalton.auth_guards import raise_admin_required
 
-
-
-from ._deps import router
+        raise_admin_required(PUBLIC_THREAD_FILES_FORBIDDEN_DETAIL)
 
 
 # =============================================================================
@@ -157,7 +157,7 @@ async def _authorize_thread_share(thread_id: str, user_id: str):
     from src.server.services.membership import teams_door_open
     from src.server.services.shared_workspaces.access import Access
 
-    if not is_dalton_supabase_auth_enabled():
+    if not _is_multiuser_auth_active():
         return await shared_access.thread_access(thread_id, user_id)
     if teams_door_open():
         from src.server.database.conversation import get_thread_auth_meta
@@ -188,30 +188,49 @@ async def update_thread_share(
     thread = await get_thread_by_id(thread_id)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
-    chosen = (
-        request.permissions.audience
-        if request.permissions is not None
-        and "audience" in request.permissions.model_fields_set
-        else thread_audience(_perms(thread.get("share_permissions")))
-    )
-    if chosen == ORGANIZATION:
-        if request.permissions is not None and "audience" in request.permissions.model_fields_set:
-            await require_members_audience(owner_id)
-    elif request.is_shared:
-        await refuse_public_link_of(owner_id)
 
     # DALTON-HOOK(colleague-dispatch): public thread sharing requires owning both thread and workspace
-    if is_dalton_supabase_auth_enabled():
+    if _is_multiuser_auth_active():
         ws_owner = thread.get("workspace_owner_id")
         if ws_owner and str(ws_owner) != str(x_user_id):
             raise HTTPException(status_code=403, detail="Forbidden")
+
+    # DALTON-HOOK(external-share-guard): external members cannot enable public
+    # thread sharing regardless of requested audience; when stopping sharing
+    # (is_shared=False), ignore any accompanying permissions payload so legacy
+    # frontend requests can cleanly turn off sharing without hitting 403.
+    if request.is_shared:
+        await _require_non_external_for_share(x_user_id)
+        effective_req_permissions = request.permissions
+    else:
+        tier_fn = _resolve_tier_fn()
+        if (
+            (_is_multiuser_auth_active() or tier_fn is not _default_get_user_tier)
+            and await tier_fn(x_user_id) == "external"
+        ):
+            effective_req_permissions = None
+        else:
+            effective_req_permissions = request.permissions
+
+    chosen = (
+        effective_req_permissions.audience
+        if effective_req_permissions is not None
+        and "audience" in effective_req_permissions.model_fields_set
+        else thread_audience(_perms(thread.get("share_permissions")))
+    )
+    if chosen == ORGANIZATION:
+        if (
+            effective_req_permissions is not None
+            and "audience" in effective_req_permissions.model_fields_set
+        ):
+            await require_members_audience(owner_id)
+    elif request.is_shared:
+        await refuse_public_link_of(owner_id)
 
     # Build update kwargs
     kwargs: dict = {"is_shared": request.is_shared}
 
     if request.is_shared:
-        # DALTON-HOOK(external-share-guard): external members cannot enable public thread sharing
-        await _require_non_external_for_share(x_user_id)
         kwargs["shared_at"] = datetime.now(timezone.utc)
 
     # Merge permissions: start from existing, overlay provided fields
@@ -219,11 +238,14 @@ async def update_thread_share(
     if isinstance(existing_perms, str):
         existing_perms = json.loads(existing_perms)
 
-    if request.permissions is not None:
+    if effective_req_permissions is not None and effective_req_permissions.model_fields_set:
         # ``exclude_unset``: a request that speaks only about the flags must not
         # silently widen a token scoped to one report back to the whole
         # workspace, which a defaulted ``root_path`` of "" would do.
-        merged = {**existing_perms, **request.permissions.model_dump(exclude_unset=True)}
+        merged = {
+            **existing_perms,
+            **effective_req_permissions.model_dump(exclude_unset=True),
+        }
         # Enforce: download requires files
         if merged.get("allow_download") and not merged.get("allow_files"):
             merged["allow_files"] = True
@@ -267,9 +289,7 @@ async def get_thread_share(thread_id: str, x_user_id: CurrentUserId):
         raise HTTPException(status_code=404, detail="Thread not found")
 
     # DALTON-HOOK(colleague-dispatch): public thread sharing requires owning both thread and workspace
-    from src.dalton.settings import is_dalton_supabase_auth_enabled
-
-    if is_dalton_supabase_auth_enabled():
+    if _is_multiuser_auth_active():
         ws_owner = thread.get("workspace_owner_id")
         if ws_owner and str(ws_owner) != str(x_user_id):
             raise HTTPException(status_code=403, detail="Forbidden")

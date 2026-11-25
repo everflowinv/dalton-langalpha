@@ -473,6 +473,43 @@ async def unshare(*, user_id: str, artifact_id: str) -> Artifact:
     )
 
 
+# DALTON-HOOK(monitors): atomically lock share_links -> dalton_monitors,
+# downgrade any public monitor on this artifact to 'own' (+1 acl_revision),
+# and unshare share_links (+1 revision) in the same transaction.
+async def unshare_artifact_and_downgrade_public_monitor(
+    *, user_id: str, artifact_id: str
+) -> Artifact:
+    """Atomically unshare ``artifact_id`` and downgrade any public Dalton monitor to ``own``."""
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await lock_owned(cur, user_id=user_id, artifact_id=artifact_id)
+                await cur.execute(
+                    """
+                    SELECT monitor_id::text AS monitor_id, visibility
+                      FROM dalton_monitors
+                     WHERE artifact_id = %s::uuid
+                       FOR UPDATE
+                    """,
+                    (artifact_id,),
+                )
+                mon = await cur.fetchone()
+                if mon is not None and mon.get("visibility") == "public":
+                    await cur.execute(
+                        """
+                        UPDATE dalton_monitors
+                           SET visibility = 'own',
+                               acl_revision = acl_revision + 1,
+                               updated_at = NOW()
+                         WHERE monitor_id = %s::uuid
+                        """,
+                        (mon["monitor_id"],),
+                    )
+                return await unshare_in_cur(
+                    cur, user_id=user_id, artifact_id=artifact_id
+                )
+
+
 async def set_audience(
     *, user_id: str, artifact_id: str, audience: str | None
 ) -> Artifact:

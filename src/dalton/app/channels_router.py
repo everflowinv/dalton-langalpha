@@ -1339,12 +1339,11 @@ async def web_mutate_discord_channel_endpoint(
     user_id: CurrentUserId,
 ) -> Any:
     """Admin-only single-entry mutation (add/rename) for `apps.discord.chats`."""
+    from src.dalton.auth_guards import raise_admin_required
+
     tier = await get_user_tier(user_id)
     if tier != "admin":
-        raise HTTPException(
-            status_code=403,
-            detail="Only admin users can manage Discord channels.",
-        )
+        raise_admin_required("Only admin users can manage Discord channels.")
     cleaned_action = str(body.action or "").strip().lower()
     if cleaned_action == "remove":
         return JSONResponse(
@@ -1403,8 +1402,10 @@ async def web_delete_binding_endpoint(
 
 
 async def _require_weixin_admin(user_id: str) -> str:
+    from src.dalton.auth_guards import raise_admin_required
+
     if not await is_admin_user(user_id):
-        raise HTTPException(status_code=403, detail=_ADMIN_ONLY_WEIXIN_DETAIL)
+        raise_admin_required(_ADMIN_ONLY_WEIXIN_DETAIL)
     return user_id
 
 

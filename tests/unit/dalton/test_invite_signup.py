@@ -46,6 +46,8 @@ def _reset_caches_and_redis(monkeypatch: pytest.MonkeyPatch):
     invites_mod.invalidate_team_members_cache()
     dalton_auth._auth_settings_cache = None
     dalton_auth._verified_token_identity.set(None)
+    monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
     monkeypatch.setenv("DALTON_PM_USER_IDS", PM_USER_ID)
     monkeypatch.setenv("SUPABASE_URL", "https://example.supabase.co")
     monkeypatch.setenv("SUPABASE_SECRET_KEY", SECRET_KEY_VALUE)
@@ -122,6 +124,10 @@ async def test_invite_create_list_revoke_fragment_url_and_no_token_in_route_path
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Only PM can create/list/revoke; link uses `/invite#<token>`; routes never put token in path; revoke 404/409."""
+    monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    settings_mod.get_dalton_config.cache_clear()
+
     # Verify route paths never contain `{token}` and check/redeem are POST body endpoints
     route_paths = {getattr(r, "path", "") for r in dalton_router.router.routes}
     assert "/api/v1/dalton/invites/check" in route_paths
@@ -332,6 +338,7 @@ async def test_invite_create_list_revoke_fragment_url_and_no_token_in_route_path
     assert cred_status_unset["is_pm"] is True  # main branch behavior when sharing is off
     assert cred_status_unset["can_invite"] is False  # explicit DALTON_PM_USER_IDS required
 
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
     monkeypatch.setenv("DALTON_PM_USER_IDS", PM_USER_ID)
     settings_mod.get_dalton_config.cache_clear()
     cred_status_pm = await dalton_router.get_team_credentials_status_endpoint(
@@ -354,6 +361,9 @@ async def test_missing_supabase_secret_key_returns_clear_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When `SUPABASE_SECRET_KEY` is missing, both create and redeem return 503 `邀请注册未配置`."""
+    monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    settings_mod.get_dalton_config.cache_clear()
     monkeypatch.delenv("SUPABASE_SECRET_KEY", raising=False)
 
     with pytest.raises(HTTPException) as exc_create:
@@ -2292,6 +2302,14 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
         artifacts_db,
         "unshare",
         create_autospec(artifacts_db.unshare, return_value=artifact_ext),
+    )
+    monkeypatch.setattr(
+        artifacts_db,
+        "unshare_artifact_and_downgrade_public_monitor",
+        create_autospec(
+            artifacts_db.unshare_artifact_and_downgrade_public_monitor,
+            return_value=artifact_ext,
+        ),
     )
     monkeypatch.setattr(
         share_links_app,
