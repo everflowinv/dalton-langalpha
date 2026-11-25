@@ -69,6 +69,8 @@ class OwedResume:
     retry_run_id: Optional[str] = None
     # DALTON-HOOK(automation-subscription-fallback): interrupted turn's automation execution id
     automation_execution_id: Optional[str] = None
+    # DALTON-HOOK(cos-settings-tools): interrupted run id so restart resume distinguishes automation continuations from normal user turns
+    interrupted_run_id: Optional[str] = None
 
     @property
     def report_source(self) -> None:
@@ -114,6 +116,9 @@ def resume_turn(owed: OwedResume, request_key: str) -> tuple[str, dict]:
         # DALTON-HOOK(automation-subscription-fallback): carry interrupted execution link on restart resume
         if owed.automation_execution_id:
             body["automation_delivery"] = {"id": owed.automation_execution_id}
+        # DALTON-HOOK(cos-settings-tools): carry interrupted run id so non-automation resumes never borrow unrelated running executions
+        if owed.interrupted_run_id:
+            body["restart_from_run_id"] = owed.interrupted_run_id
         return route, body
     body = {
         "run_id": owed.retry_run_id,
@@ -207,6 +212,7 @@ async def resume_verdict(job: Mapping[str, Any]) -> OwedResume | NotOwed | NotYe
         tasks=tuple(tasks),
         retry_run_id=retry_run_id,
         automation_execution_id=execution_id or None,
+        interrupted_run_id=str(run_id),  # DALTON-HOOK(cos-settings-tools)
     )
 
 

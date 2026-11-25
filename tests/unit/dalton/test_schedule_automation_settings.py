@@ -52,7 +52,7 @@ def test_dalton_schedule_automation_docstring_matches_contract() -> None:
     sched = _schedule_tool()
     desc = sched.description or ""
     fields = sched.args_schema.model_fields if sched.args_schema else {}
-    assert "llm_model" not in desc and "llm_model" not in fields
+    assert "llm_model" in desc and "llm_model" in fields
     assert "max_failures" not in desc and "max_failures" not in fields
     assert 'trigger_type: "cron" or "once"' in desc
     assert '"price"' not in desc

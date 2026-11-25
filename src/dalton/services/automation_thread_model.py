@@ -27,6 +27,27 @@ First-turn model resolution rules:
 - If that first turn still has no ``llm_model``, fall back to the automation's
   configured ``llm_model``.
 
+Execution model-config snapshot rules:
+- ``automation_executions`` stores an immutable model-config snapshot
+  (``llm_model``, ``reasoning_effort``, ``llm_model_system_only``), stamped
+  once in the same transaction that creates the execution row from the same
+  read of ``automations`` and never modified afterward.
+- Every dispatch and continuation turn (initial firing, post-wait dispatch,
+  HITL resume, wakeup, command/subagent/task report, server retry, deployment
+  restart resume via ``automation_delivery`` / ``restart_from_run_id`` /
+  ``/retry``, ``running_thread``, and web retry of an automation run) first
+  resolves its execution via the execution-link rules, then uses that execution
+  row's three snapshot fields directly. HITL resumes of an automation execution
+  ignore the web composer's submitted model/effort and the thread's stored
+  model.
+- When no execution can be determined (including user-started commands,
+  subagents, wakeups, restart resumes of ordinary user runs, or non-automation
+  runs), the turn is treated as a normal non-managed owner turn
+  (``llm_model_system_only = False``).
+- Editing an automation's configuration after an execution starts only affects
+  future executions created after the edit; in-flight executions keep the
+  snapshot frozen at creation.
+
 Fallback rules:
 - If the inherited model cannot be served (``_UNSERVABLE_REFUSALS``), catch the
   refusal, log a warning, and re-run ``thread_model.resolve_turn_config`` with
@@ -130,6 +151,7 @@ async def _get_execution_by_id(
     sql = """
         SELECT e.automation_execution_id, e.automation_id, e.status,
                e.conversation_thread_id, e.started_at, e.created_at,
+               e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken,
                a.user_id, a.thread_strategy
         FROM automation_executions e
         JOIN automations a ON a.automation_id = e.automation_id
@@ -146,6 +168,21 @@ async def _get_execution_by_id(
             await cur.execute(sql, (execution_id,))
             row = await cur.fetchone()
             return dict(row) if row else None
+
+
+async def _hydrate_execution_snapshot(
+    exec_row: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Lazily snapshot a rolling-upgrade execution row when ``snapshot_taken`` is False."""
+    if exec_row is None or exec_row.get("snapshot_taken") is not False:
+        return exec_row
+    raw_exec_id = str(exec_row.get("automation_execution_id") or "").strip()
+    if not raw_exec_id or normalize_uuid(raw_exec_id) is None:
+        return exec_row
+    hydrated = await exec_db.ensure_execution_snapshot(raw_exec_id)
+    if hydrated is None:
+        return exec_row
+    return {**exec_row, **hydrated}
 
 
 def _response_execution_id_sql(alias: str) -> str:
@@ -169,6 +206,7 @@ async def _get_execution_for_run_id(run_id: str) -> dict[str, Any] | None:
                 f"""
                 SELECT e.automation_execution_id, e.automation_id, e.status,
                        e.conversation_thread_id, e.started_at, e.created_at,
+                       e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken,
                        a.user_id
                 FROM conversation_responses r
                 JOIN automation_executions e
@@ -184,6 +222,171 @@ async def _get_execution_for_run_id(run_id: str) -> dict[str, Any] | None:
             return dict(row) if row else None
 
 
+def _extract_execution_id_from_metadata(meta: Mapping[str, Any] | None) -> str | None:
+    """Extract the linked execution UUID from a ``conversation_responses.metadata`` dict."""
+    if not isinstance(meta, Mapping):
+        return None
+    for key in ("automation_execution_id", "automation_source_execution_id"):
+        raw = meta.get(key)
+        if isinstance(raw, str) and raw.strip():
+            norm = normalize_uuid(raw.strip())
+            if norm is not None:
+                return norm
+    delivery = meta.get("automation_delivery")
+    if isinstance(delivery, Mapping):
+        raw_id = delivery.get("id")
+        if isinstance(raw_id, str) and raw_id.strip():
+            return normalize_uuid(raw_id.strip().split(".", 1)[0])
+    return None
+
+
+async def get_run_model_and_system_only(
+    run_row: Mapping[str, Any] | None,
+) -> tuple[str | None, bool | None]:
+    """Read ``(model_name, system_only)`` from a single run row and its execution snapshot.
+
+    Uses the execution link stored in ``run_row["metadata"]`` (falling back to
+    ``_get_execution_for_run_id`` with that same run's id when metadata omits the
+    link) so both the model name and ``llm_model_system_only`` always come from
+    the same run.
+
+    Returns ``(run_model, None)`` when reading or hydrating the execution
+    snapshot fails, so callers know the flag was not resolved and can let
+    handoff retry rather than locking in ``False``.
+    """
+    if not isinstance(run_row, Mapping):
+        return None, False
+    meta = run_row.get("metadata")
+    run_model = (
+        str(meta.get("llm_model") or "").strip() or None
+        if isinstance(meta, Mapping)
+        else None
+    )
+    exec_id = _extract_execution_id_from_metadata(meta)
+    exec_row: dict[str, Any] | None = None
+    try:
+        if exec_id is not None:
+            exec_row = await _get_execution_by_id(exec_id)
+        else:
+            raw_run_id = str(run_row.get("conversation_response_id") or "").strip()
+            if raw_run_id and normalize_uuid(raw_run_id) is not None:
+                exec_row = await _get_execution_for_run_id(raw_run_id)
+    except RuntimeError as exc:
+        if "pool" not in str(exc).lower():
+            raise
+        return run_model, None
+    except Exception:
+        logger.debug(
+            "[AUTOMATION_THREAD_MODEL] Failed reading execution snapshot for run handoff",
+            exc_info=True,
+        )
+        return run_model, None
+    if exec_row is None:
+        if exec_id is not None:
+            return run_model, None
+        return run_model, False
+    if exec_row.get("snapshot_taken") is False:
+        try:
+            hydrated = await _hydrate_execution_snapshot(exec_row)
+        except RuntimeError as exc:
+            if "pool" not in str(exc).lower():
+                raise
+            return run_model, None
+        except Exception:
+            logger.debug(
+                "[AUTOMATION_THREAD_MODEL] Failed hydrating execution snapshot for run handoff",
+                exc_info=True,
+            )
+            return run_model, None
+        if hydrated is None or hydrated.get("snapshot_taken") is not True:
+            return run_model, None
+        exec_row = hydrated
+    if run_model is None and exec_row.get("llm_model"):
+        run_model = str(exec_row["llm_model"]).strip() or None
+    return run_model, bool(exec_row.get("llm_model_system_only"))
+
+
+async def get_run_execution_system_only(run_id: str | None) -> bool:
+    """Return the execution-level ``llm_model_system_only`` flag for ``run_id``.
+
+    Returns ``False`` when ``run_id`` is missing, does not belong to any
+    automation execution, or cannot be read (treated as a non-managed owner turn).
+    """
+    if not run_id or normalize_uuid(str(run_id)) is None:
+        return False
+    try:
+        exec_row = await _get_execution_for_run_id(str(run_id))
+    except RuntimeError as exc:
+        if "pool" in str(exc).lower():
+            return False
+        raise
+    except Exception:
+        logger.debug(
+            "[AUTOMATION_THREAD_MODEL] Failed reading execution system-only flag for run_id=%s",
+            run_id,
+            exc_info=True,
+        )
+        return False
+    return bool(exec_row.get("llm_model_system_only")) if exec_row else False
+
+
+async def _get_hitl_interrupt_run_id(thread_id: str, request: Any) -> str | None:
+    """Resolve the ``run_id`` of the checkpoint holding the pending HITL interrupt.
+
+    Follows the same checkpoint walk as ``report_back.notify_turn._card_waits`` so a
+    subsequent failed or cancelled attempt that never wrote a new graph step cannot
+    mask the run that originally produced the pending interrupt card.
+    """
+    if normalize_uuid(thread_id) is None:
+        return None
+    from src.server.utils.checkpoint_helpers import (
+        build_checkpoint_config,
+        get_checkpointer,
+        interrupt_records,
+        turn_base_checkpoint_id,
+    )
+
+    try:
+        checkpointer = get_checkpointer()
+    except (HTTPException, RuntimeError):
+        return None
+    except Exception:
+        logger.debug(
+            "[AUTOMATION_THREAD_MODEL] Checkpointer unavailable for HITL interrupt lookup on thread=%s",
+            thread_id,
+            exc_info=True,
+        )
+        return None
+
+    try:
+        base = getattr(request, "checkpoint_id", None) or await turn_base_checkpoint_id(
+            checkpointer, thread_id
+        )
+        cp = await checkpointer.aget_tuple(build_checkpoint_config(thread_id, base))
+        while cp is not None and (cp.metadata or {}).get("source") == "update":
+            if cp.parent_config is None:
+                return None
+            parent = await checkpointer.aget_tuple(cp.parent_config)
+            if parent is None or (
+                parent.checkpoint["versions_seen"] != cp.checkpoint["versions_seen"]
+            ):
+                return None
+            cp = parent
+        if cp is None or not interrupt_records(cp.pending_writes):
+            return None
+        raw_run_id = (cp.metadata or {}).get("run_id")
+        if not raw_run_id:
+            return None
+        return normalize_uuid(str(raw_run_id).strip())
+    except Exception:
+        logger.debug(
+            "[AUTOMATION_THREAD_MODEL] Failed reading pending HITL interrupt run_id for thread=%s",
+            thread_id,
+            exc_info=True,
+        )
+        return None
+
+
 async def _get_execution_for_command(
     thread_id: str, command_id: str
 ) -> dict[str, Any] | None:
@@ -194,6 +397,7 @@ async def _get_execution_for_command(
                 f"""
                 SELECT e.automation_execution_id, e.automation_id, e.status,
                        e.conversation_thread_id, e.started_at, e.created_at,
+                       e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken,
                        a.user_id
                 FROM command_runs cr
                 JOIN conversation_responses pr
@@ -232,6 +436,7 @@ async def _get_execution_for_task(
                 f"""
                 SELECT e.automation_execution_id, e.automation_id, e.status,
                        e.conversation_thread_id, e.started_at, e.created_at,
+                       e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken,
                        a.user_id
                 FROM subagent_runs sr
                 JOIN conversation_responses pr
@@ -254,6 +459,7 @@ _EXPLICIT_EXECUTION_MATCH_KINDS = frozenset(
         "retry_run",
         "execution_id",
         "automation_delivery",
+        "restart_resume_run",
         "report_source",
         "wakeup_creator_run",
     }
@@ -306,37 +512,100 @@ def _explicit_execution_id(request: Any) -> str | None:
     return normalize_uuid(raw.strip())
 
 
+def _restart_from_run_id(request: Any) -> str | None:
+    raw = getattr(request, "restart_from_run_id", None)
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    return normalize_uuid(raw.strip())
+
+
+def _execution_id_matches(
+    exec_row: Mapping[str, Any] | None,
+    expected_execution_id: str,
+) -> bool:
+    if exec_row is None:
+        return False
+    expected = normalize_uuid(expected_execution_id)
+    if expected is None:
+        return False
+    actual = normalize_uuid(str(exec_row.get("automation_execution_id") or ""))
+    return actual == expected
+
+
 async def _resolve_source_execution(
     request: Any,
     *,
     thread_id: str,
     retry_of_run_id: str | None = None,
+    known_execution_id: str | None = None,
     allow_running_fallback: bool = True,
 ) -> tuple[dict[str, Any] | None, str]:
     """Resolve the execution this notification turn belongs to.
 
     Explicit source hints (``retry_of_run_id``, explicit execution id, handoff
-    ``automation_delivery``/``automation_earlier_runs``, ``report_source``
-    for ``command_report``/``task``, and ``wakeups.created_by_run_id`` for
-    ``wakeup``) take precedence over falling back to the thread's latest
-    ``running`` execution.
+    ``automation_delivery``/``automation_earlier_runs``, ``restart_from_run_id``,
+    ``report_source`` for ``command_report``/``task``, and
+    ``wakeups.created_by_run_id`` for ``wakeup``) take precedence over falling
+    back to the thread's latest ``running`` execution. When
+    ``known_execution_id`` is provided, every matched row is verified against it
+    and resolution never falls through to unrelated fallback lookups.
     """
+    norm_known_exec_id = (
+        normalize_uuid(known_execution_id)
+        if known_execution_id is not None
+        else None
+    )
+    if known_execution_id is not None and norm_known_exec_id is None:
+        return None, "none"
+
     if retry_of_run_id:
         exec_row = await _get_execution_for_run_id(str(retry_of_run_id))
         if exec_row is not None:
+            if norm_known_exec_id is not None and not _execution_id_matches(
+                exec_row, norm_known_exec_id
+            ):
+                return None, "none"
             return exec_row, "retry_run"
 
     explicit_exec_id = _explicit_execution_id(request)
     if explicit_exec_id:
+        if norm_known_exec_id is not None and explicit_exec_id != norm_known_exec_id:
+            return None, "none"
         exec_row = await _get_execution_by_id(explicit_exec_id)
-        if exec_row is not None:
+        if exec_row is not None and (
+            norm_known_exec_id is None
+            or _execution_id_matches(exec_row, norm_known_exec_id)
+        ):
             return exec_row, "execution_id"
+        return None, "none"
 
     delivery_exec_id = _delivery_execution_id(request)
     if delivery_exec_id:
+        if norm_known_exec_id is not None and delivery_exec_id != norm_known_exec_id:
+            return None, "none"
         exec_row = await _get_execution_by_id(delivery_exec_id)
-        if exec_row is not None:
+        if exec_row is not None and (
+            norm_known_exec_id is None
+            or _execution_id_matches(exec_row, norm_known_exec_id)
+        ):
             return exec_row, "automation_delivery"
+        return None, "none"
+
+    if norm_known_exec_id is not None:
+        exec_row = await _get_execution_by_id(norm_known_exec_id)
+        if _execution_id_matches(exec_row, norm_known_exec_id):
+            return exec_row, "execution_id"
+        return None, "none"
+
+    restart_run_id = _restart_from_run_id(request)
+    if restart_run_id:
+        exec_row = await _get_execution_for_run_id(restart_run_id)
+        if exec_row is not None:
+            return exec_row, "restart_resume_run"
+        # A deployment restart resume naming an interrupted run that does not
+        # belong to any automation execution (i.e. an ordinary user turn) must
+        # never borrow an unrelated running automation execution on the thread.
+        return None, "none"
 
     source = getattr(request, "report_source", None)
     if source is not None:
@@ -354,6 +623,10 @@ async def _resolve_source_execution(
             exec_row = await _get_execution_for_command(thread_id, str(command_id))
             if exec_row is not None:
                 return exec_row, "report_source"
+            # Explicit command report whose parent run does not belong to any
+            # automation execution (e.g. a user-started command) must not borrow
+            # an unrelated running automation execution on the thread.
+            return None, "none"
         elif kind == "task" and (task_run_id or task_id):
             exec_row = await _get_execution_for_task(
                 thread_id,
@@ -362,6 +635,7 @@ async def _resolve_source_execution(
             )
             if exec_row is not None:
                 return exec_row, "report_source"
+            return None, "none"
 
     if getattr(request, "query_type", None) == "wakeup":
         wakeup_ids = extract_wakeup_notice_ids(request)
@@ -376,6 +650,12 @@ async def _resolve_source_execution(
                 # any automation execution (e.g. a user turn's wakeup): refuse
                 # falling back to an unrelated running execution on the thread.
                 return None, "none"
+
+    if retry_of_run_id:
+        # Retrying an explicit run that has no execution link (and whose restored
+        # report_source / wakeup notices matched no execution) must not borrow
+        # an unrelated running execution on the same thread.
+        return None, "none"
 
     if not allow_running_fallback:
         return None, "none"
@@ -395,9 +675,6 @@ async def _get_execution_first_turn_settings(
     Reads the earliest ``conversation_responses`` row for this execution
     (``turn_index ASC, attempt_no ASC``) so idempotent ``conversation_queries``
     upserts on retries cannot overwrite the first turn's recorded effort.
-    ``effort_configured=True`` distinguishes a first turn explicitly configured
-    with ``reasoning_effort=None`` from a pre-d042 in-flight execution whose
-    first turn had no effort metadata.
     """
     exec_id = str(execution["automation_execution_id"])
     exec_thread_id = str(execution.get("conversation_thread_id") or fallback_thread_id)
@@ -476,6 +753,9 @@ async def _get_execution_first_turn_settings(
             )
 
 
+_DEFAULT_GET_FIRST_TURN_SETTINGS = _get_execution_first_turn_settings
+
+
 async def _get_execution_first_turn_llm_model(
     execution: Mapping[str, Any],
     *,
@@ -512,6 +792,20 @@ def _accepts_effort_override(resolve: Callable[..., Awaitable[Any]]) -> bool:
     return False
 
 
+def _accepts_ignore_custom_models_override(resolve: Callable[..., Awaitable[Any]]) -> bool:
+    try:
+        sig = inspect.signature(resolve)
+    except (TypeError, ValueError):
+        return False
+    for name, param in sig.parameters.items():
+        if (
+            name == "ignore_custom_models_override"
+            or param.kind == inspect.Parameter.VAR_KEYWORD
+        ):
+            return True
+    return False
+
+
 async def _resolve_automation_notification_context(
     *,
     user_id: str,
@@ -520,6 +814,7 @@ async def _resolve_automation_notification_context(
     from_service: bool,
     is_server_retry: bool = False,
     retry_of_run_id: str | None = None,
+    retry_source_execution_id: str | None = None,
     allow_running_fallback: bool = True,
     resolve_model: bool = True,
 ) -> tuple[
@@ -538,118 +833,215 @@ async def _resolve_automation_notification_context(
         is_server_retry=is_server_retry,
     )
     is_user_retry = bool(retry_of_run_id) and not is_server_turn
-    if not is_server_turn and not is_user_retry:
+    is_hitl_resume = bool(getattr(request, "hitl_response", None))
+    if not is_server_turn and not is_user_retry and not is_hitl_resume:
         return None, None, None, False, False, None
     if normalize_uuid(thread_id) is None:
         return None, None, None, False, False, None
 
+    known_execution_id = (
+        (normalize_uuid(retry_source_execution_id) if retry_source_execution_id else None)
+        or _explicit_execution_id(request)
+        or _delivery_execution_id(request)
+    )
+    target_exec: dict[str, Any] | None = None
+    match_kind = "none"
     try:
         if is_user_retry:
             exec_row = await _get_execution_for_run_id(str(retry_of_run_id))
+            if (
+                exec_row is None
+                and known_execution_id is None
+                and getattr(request, "query_type", None) == "wakeup"
+            ):
+                wakeup_ids = extract_wakeup_notice_ids(request)
+                if wakeup_ids:
+                    for creator_run_id in await _get_wakeup_creator_run_ids(
+                        thread_id, wakeup_ids
+                    ):
+                        exec_row = await _get_execution_for_run_id(creator_run_id)
+                        if exec_row is not None:
+                            break
             target_exec = exec_row
             match_kind = "user_retry_run" if exec_row is not None else "none"
+        elif is_hitl_resume and not is_server_turn:
+            interrupt_run_id = await _get_hitl_interrupt_run_id(thread_id, request)
+            if interrupt_run_id:
+                exec_row = await _get_execution_for_run_id(interrupt_run_id)
+                target_exec = exec_row
+                match_kind = "hitl_resume_run" if exec_row is not None else "none"
         else:
-            target_exec, match_kind = await _resolve_source_execution(
-                request,
-                thread_id=thread_id,
-                retry_of_run_id=retry_of_run_id,
-                allow_running_fallback=allow_running_fallback,
+            hitl_exec_mismatch = False
+            if is_hitl_resume:
+                interrupt_run_id = await _get_hitl_interrupt_run_id(thread_id, request)
+                if interrupt_run_id:
+                    exec_row = await _get_execution_for_run_id(interrupt_run_id)
+                    if exec_row is not None:
+                        if known_execution_id is not None and not _execution_id_matches(
+                            exec_row, known_execution_id
+                        ):
+                            hitl_exec_mismatch = True
+                        else:
+                            target_exec = exec_row
+                            match_kind = "hitl_resume_run"
+            if target_exec is None and not hitl_exec_mismatch:
+                target_exec, match_kind = await _resolve_source_execution(
+                    request,
+                    thread_id=thread_id,
+                    retry_of_run_id=retry_of_run_id,
+                    known_execution_id=known_execution_id,
+                    allow_running_fallback=allow_running_fallback,
+                )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        if known_execution_id is not None:
+            logger.warning(
+                f"[AUTOMATION_THREAD_MODEL] Failed resolving confirmed execution "
+                f"{known_execution_id} for thread={thread_id}; refusing turn",
+                exc_info=True,
             )
-    except Exception:
+            raise _automation_model_unreadable() from exc
         logger.warning(
             f"[AUTOMATION_THREAD_MODEL] Failed resolving source execution "
             f"for thread={thread_id}; falling back to default resolution",
             exc_info=True,
         )
         return None, None, None, False, False, None
+    if known_execution_id is not None:
+        resolved_exec_id = (
+            normalize_uuid(str(target_exec.get("automation_execution_id") or ""))
+            if target_exec is not None
+            else None
+        )
+        if target_exec is None or resolved_exec_id != known_execution_id:
+            logger.warning(
+                f"[AUTOMATION_THREAD_MODEL] Confirmed execution {known_execution_id} "
+                f"not found or mismatched (resolved={resolved_exec_id}) for thread={thread_id}; refusing turn"
+            )
+            raise _automation_model_unreadable()
     if target_exec is None:
         return None, None, None, False, False, None
 
+    if target_exec.get("snapshot_taken") is False:
+        try:
+            target_exec = await _hydrate_execution_snapshot(target_exec)
+        except Exception as exc:
+            logger.warning(
+                f"[AUTOMATION_THREAD_MODEL] Failed hydrating execution snapshot "
+                f"for thread={thread_id} execution_id={target_exec.get('automation_execution_id')}",
+                exc_info=True,
+            )
+            raise _automation_model_unreadable() from exc
+        if target_exec is None or target_exec.get("snapshot_taken") is not True:
+            raise _automation_model_unreadable()
+
+    inherited_system_only = bool(target_exec.get("llm_model_system_only"))
+    is_hitl_automation = match_kind == "hitl_resume_run"
     fallback_eligible = is_server_turn and match_kind in _EXPLICIT_EXECUTION_MATCH_KINDS
-    confirmed_source = fallback_eligible or match_kind == "user_retry_run"
-    if confirmed_source and not fallback_eligible:
-        target_exec = {**target_exec, "_effort_source_confirmed": True}
-    explicit_request_model = getattr(request, "llm_model", None)
-    explicit_request_effort = getattr(request, "reasoning_effort", None)
-    need_model = bool(is_server_turn and resolve_model and not explicit_request_model)
-    need_effort = bool(confirmed_source and explicit_request_effort is None)
-    if not need_model and not need_effort:
-        return target_exec, None, None, fallback_eligible, False, None
+    # Every continuation linked to an automation execution (including web /retry,
+    # HITL confirm, server retry, wakeup, report, restart resume, and running_thread)
+    # uses the execution's frozen snapshot for model, reasoning effort, and
+    # llm_model_system_only — ignoring composer inputs and thread settings.
+    target_exec = {
+        **target_exec,
+        "_effort_source_confirmed": True,
+        "_execution_snapshot_override": True,
+        **({"_provenance_source_confirmed": True, "_hitl_automation_override": True} if is_hitl_automation else {}),
+    }
+    need_model = True
+    need_effort = True
 
     exec_id = str(target_exec["automation_execution_id"])
     chosen_model: str | None = None
     source: str | None = None
     effort_configured = False
     inherited_effort: str | None = None
-    try:
-        if _get_execution_first_turn_llm_model is not _DEFAULT_GET_FIRST_TURN_LLM_MODEL:
-            first_model = await _get_execution_first_turn_llm_model(
-                target_exec, fallback_thread_id=thread_id
-            )
-            first_effort_configured = bool(first_model)
-            first_effort = None
-        else:
-            (
-                first_model,
-                first_effort_configured,
-                first_effort,
-            ) = await _get_execution_first_turn_settings(
-                target_exec, fallback_thread_id=thread_id
-            )
-        if need_model and first_model:
-            chosen_model = first_model
-            source = "first_turn"
-        if confirmed_source and first_effort_configured:
+    has_exec_snapshot = target_exec.get("snapshot_taken") is True
+    if has_exec_snapshot:
+        target_exec = {**target_exec, "_has_exec_snapshot": True}
+    if has_exec_snapshot:
+        raw_snap_model = target_exec.get("llm_model")
+        if need_model and raw_snap_model:
+            chosen_model = str(raw_snap_model).strip() or None
+            if chosen_model:
+                source = "execution_snapshot"
+        if need_effort:
             effort_configured = True
-            inherited_effort = first_effort
+            raw_snap_effort = target_exec.get("reasoning_effort")
+            inherited_effort = str(raw_snap_effort).strip() if raw_snap_effort else None
+    else:
+        try:
+            if _get_execution_first_turn_llm_model is not _DEFAULT_GET_FIRST_TURN_LLM_MODEL:
+                first_model = await _get_execution_first_turn_llm_model(
+                    target_exec, fallback_thread_id=thread_id
+                )
+                first_effort_configured = bool(first_model)
+                first_effort = None
+            else:
+                (
+                    first_model,
+                    first_effort_configured,
+                    first_effort,
+                ) = await _get_execution_first_turn_settings(
+                    target_exec, fallback_thread_id=thread_id
+                )
+            if need_model and first_model:
+                chosen_model = first_model
+                source = "first_turn"
+            if need_effort and first_effort_configured:
+                effort_configured = True
+                inherited_effort = first_effort
 
-        need_db_model = need_model and not chosen_model
-        need_db_effort = need_effort and not effort_configured
-        if need_db_model or need_db_effort:
-            try:
-                automation = await auto_db.get_automation_including_deleted(
-                    str(target_exec["automation_id"]),
-                    target_exec.get("user_id"),
-                )
-            except Exception:
-                if need_db_model:
-                    raise
-                logger.warning(
-                    f"[AUTOMATION_THREAD_MODEL] Failed reading automation effort config for "
-                    f"thread={thread_id} execution_id={exec_id} via={match_kind}",
-                    exc_info=True,
-                )
-                automation = None
-            if automation:
-                if need_db_model:
-                    cfg_model = automation.get("llm_model")
-                    if cfg_model:
-                        chosen_model = str(cfg_model)
-                        source = "automation_config"
-                if need_db_effort:
-                    effort_configured = True
-                    cfg_effort = automation.get("reasoning_effort")
-                    inherited_effort = str(cfg_effort) if cfg_effort else None
-    except Exception:
-        logger.warning(
-            f"[AUTOMATION_THREAD_MODEL] Failed reading execution settings for thread={thread_id} "
-            f"execution_id={exec_id} via={match_kind}",
-            exc_info=True,
-        )
-        if not need_model:
-            return target_exec, None, None, fallback_eligible, False, None
-        if fallback_eligible:
-            # Keep the confirmed link; the caller stops the turn if nothing else names
-            # a model (it must not run on the account default instead).
-            return (
-                {**target_exec, "_model_read_failed": True},
-                None,
-                None,
-                fallback_eligible,
-                False,
-                None,
+            need_db_model = need_model and not chosen_model
+            need_db_effort = need_effort and not effort_configured
+            if need_db_model or need_db_effort:
+                try:
+                    automation = await auto_db.get_automation_including_deleted(
+                        str(target_exec["automation_id"]),
+                        target_exec.get("user_id"),
+                    )
+                except Exception:
+                    if need_db_model:
+                        raise
+                    logger.warning(
+                        f"[AUTOMATION_THREAD_MODEL] Failed reading automation effort config for "
+                        f"thread={thread_id} execution_id={exec_id} via={match_kind}",
+                        exc_info=True,
+                    )
+                    automation = None
+                if automation:
+                    if need_db_model:
+                        cfg_model = automation.get("llm_model")
+                        if cfg_model:
+                            chosen_model = str(cfg_model)
+                            source = "automation_config"
+                    if need_db_effort:
+                        effort_configured = True
+                        cfg_effort = automation.get("reasoning_effort")
+                        inherited_effort = str(cfg_effort) if cfg_effort else None
+        except Exception:
+            logger.warning(
+                f"[AUTOMATION_THREAD_MODEL] Failed reading execution settings for thread={thread_id} "
+                f"execution_id={exec_id} via={match_kind}",
+                exc_info=True,
             )
-        return None, None, None, False, False, None
+            if not need_model:
+                return target_exec, None, None, fallback_eligible, False, None
+            if fallback_eligible:
+                # Keep the confirmed link; the caller stops the turn if nothing else names
+                # a model (it must not run on the account default instead).
+                return (
+                    {**target_exec, "_model_read_failed": True},
+                    None,
+                    None,
+                    fallback_eligible,
+                    False,
+                    None,
+                )
+            if inherited_system_only or is_hitl_automation:
+                return target_exec, None, None, False, False, None
+            return None, None, None, False, False, None
 
     if not chosen_model:
         return (
@@ -669,20 +1061,46 @@ async def _resolve_automation_notification_context(
             f"execution_id={exec_id} via={match_kind}",
             exc_info=True,
         )
-        if fallback_eligible:
-            # Confirmed link: keep the execution's model and its fallback rules.
+        # Execution link is already confirmed (any match_kind): keep target_exec and
+        # chosen_model so callers never drop the execution link or fall back to composer,
+        # thread, or account-default models.
+        return (
+            target_exec,
+            chosen_model,
+            None,
+            fallback_eligible,
+            effort_configured,
+            inherited_effort,
+        )
+
+    prefs_for_resolve = (
+        {
+            k: v
+            for k, v in prefs.items()
+            if k not in ("custom_models", "custom_providers")
+        }
+        if inherited_system_only
+        else prefs
+    )
+    if not model_resolves(prefs_for_resolve, chosen_model):
+        if has_exec_snapshot:
+            # Snapshot pinned an explicit model: do NOT silently downgrade to account default.
+            # Pass chosen_model through normal turn resolution so subscription fallback (when
+            # eligible) or the standard model-unavailable refusal handles it identically to
+            # an ordinary turn requesting an unavailable model.
+            logger.warning(
+                f"[AUTOMATION_THREAD_MODEL] Snapshot model {chosen_model!r} for thread={thread_id} "
+                f"execution_id={exec_id} source={source} via={match_kind} is unavailable in catalog; "
+                f"keeping pinned model for standard refusal/fallback"
+            )
             return (
                 target_exec,
                 chosen_model,
-                None,
+                prefs,
                 fallback_eligible,
                 effort_configured,
                 inherited_effort,
             )
-        # Inferred link only: the previous behavior, default resolution.
-        return None, None, None, False, False, None
-
-    if not model_resolves(prefs, chosen_model):
         logger.warning(
             f"[AUTOMATION_THREAD_MODEL] Model {chosen_model!r} for thread={thread_id} "
             f"execution_id={exec_id} source={source} via={match_kind} is unavailable; "
@@ -789,6 +1207,7 @@ async def resolve_turn_config_with_automation_inheritance(
     from_service: bool,
     is_server_retry: bool = False,
     retry_of_run_id: str | None = None,
+    retry_source_execution_id: str | None = None,
     resolve: Callable[..., Awaitable[Any]],
     flagged_subscription: tuple[Any, str | None] | None = None,
     on_fallback: Callable[[dict[str, Any]], None] | None = None,
@@ -810,16 +1229,18 @@ async def resolve_turn_config_with_automation_inheritance(
     fallback_eligible = False
     effort_configured = False
     inherited_effort: str | None = None
+    is_server_turn = _is_server_notification_turn(
+        request,
+        from_service=from_service,
+        retry_of_run_id=retry_of_run_id,
+        is_server_retry=is_server_retry,
+    )
     if (
         requested_model is None
         or flagged_subscription is not None
         or bool(retry_of_run_id)
-        or _is_server_notification_turn(
-            request,
-            from_service=from_service,
-            retry_of_run_id=retry_of_run_id,
-            is_server_retry=is_server_retry,
-        )
+        or bool(getattr(request, "hitl_response", None))
+        or is_server_turn
     ):
         (
             target_exec,
@@ -835,41 +1256,75 @@ async def resolve_turn_config_with_automation_inheritance(
             from_service=from_service,
             is_server_retry=is_server_retry,
             retry_of_run_id=retry_of_run_id,
-            allow_running_fallback=(requested_model is None and flagged_subscription is None),
+            retry_source_execution_id=retry_source_execution_id,
+            allow_running_fallback=(flagged_subscription is None),
             resolve_model=(requested_model is None),
         )
 
-    confirmed_for_context = target_exec is not None and (
-        fallback_eligible or bool(target_exec.get("_effort_source_confirmed"))
+    inherited_system_only = bool(
+        getattr(request, "llm_model_system_only", False)
+        or (target_exec is not None and target_exec.get("llm_model_system_only"))
     )
-    if confirmed_for_context and on_automation_context is not None:
-        exec_id = target_exec.get("automation_execution_id")
-        if exec_id:
-            # Stamp automation_source_execution_id (NOT automation_execution_id) so
-            # restart recovery never mistakes a wakeup/continuation/retry run for a
-            # scheduler-refirable firing turn while still preserving provenance.
-            ctx_meta: dict[str, Any] = {
-                "automation_source_execution_id": str(exec_id),
-            }
-            if effort_configured:
-                ctx_meta["automation_reasoning_effort_configured"] = True
-                ctx_meta["automation_reasoning_effort"] = inherited_effort
+    use_execution_snapshot = bool(
+        target_exec is not None and target_exec.get("_execution_snapshot_override")
+    )
+    confirmed_for_context = target_exec is not None and (
+        use_execution_snapshot
+        or fallback_eligible
+        or bool(target_exec.get("_effort_source_confirmed"))
+    )
+    if on_automation_context is not None:
+        ctx_meta: dict[str, Any] = {}
+        if target_exec is not None:
+            exec_id = target_exec.get("automation_execution_id")
+            if exec_id:
+                # Always stamp automation_source_execution_id (NOT automation_execution_id)
+                # whenever an execution is matched — including running_thread with
+                # llm_model_system_only=False — so subsequent wakeups, reports, retries,
+                # and HITL resumes link back to this execution's snapshot.
+                ctx_meta["automation_source_execution_id"] = str(exec_id)
+                if confirmed_for_context and effort_configured:
+                    ctx_meta["automation_reasoning_effort_configured"] = True
+                    ctx_meta["automation_reasoning_effort"] = inherited_effort
+        if ctx_meta:
             on_automation_context(ctx_meta)
 
-    explicit_request_effort = getattr(request, "reasoning_effort", None)
     apply_effort_override = (
         confirmed_for_context
         and effort_configured
-        and explicit_request_effort is None
         and _accepts_effort_override(resolve)
     )
-    if apply_effort_override:
+    apply_system_only_override = (
+        inherited_system_only and _accepts_ignore_custom_models_override(resolve)
+    )
+    if apply_effort_override or apply_system_only_override:
         async def _effective_resolve(model_name: str | None) -> Any:
-            return await resolve(
-                model_name, reasoning_effort_override=inherited_effort
-            )
+            extra_kw: dict[str, Any] = {}
+            if apply_effort_override:
+                extra_kw["reasoning_effort_override"] = inherited_effort
+            if apply_system_only_override:
+                extra_kw["ignore_custom_models_override"] = True
+            return await resolve(model_name, **extra_kw)
     else:
         _effective_resolve = resolve
+
+    # Once a continuation is linked to an automation execution, its model and
+    # reasoning effort come solely from the execution snapshot — ignoring
+    # composer inputs and thread-stored model (a NULL snapshot llm_model
+    # inherits the account default model, never the thread's stored model).
+    effective_requested_model = None if use_execution_snapshot else requested_model
+    effective_held_model = (
+        None
+        if (
+            use_execution_snapshot
+            and target_exec is not None
+            and (
+                target_exec.get("_has_exec_snapshot")
+                or target_exec.get("_hitl_automation_override")
+            )
+        )
+        else held_model
+    )
 
     async def _try_subscription_fallback(
         *,
@@ -888,10 +1343,19 @@ async def resolve_turn_config_with_automation_inheritance(
                 context=f"user={user_id} thread={thread_id}",
             )
         )
+        default_pref_map = (
+            {
+                k: v
+                for k, v in pref_map.items()
+                if k not in ("custom_models", "custom_providers")
+            }
+            if inherited_system_only
+            else pref_map
+        )
         orig = (
             None
             if failed_subject is not None
-            else (original_model or thread_model.effective_default_model(pref_map))
+            else (original_model or thread_model.effective_default_model(default_pref_map))
         )
         cfg, record = await resolve_with_subscription_fallback(
             user_id=user_id,
@@ -903,6 +1367,7 @@ async def resolve_turn_config_with_automation_inheritance(
             exc_to_raise=exc_to_raise,
             model_resolves_fn=model_resolves,
             failed_subject=failed_subject,
+            ignore_custom_models=inherited_system_only,
         )
         if target_exec and target_exec.get("automation_execution_id"):
             record = {
@@ -941,16 +1406,16 @@ async def resolve_turn_config_with_automation_inheritance(
             fallback_eligible
             and target_exec
             and target_exec.get("_model_read_failed")
-            and not requested_model
-            and not held_model
+            and not effective_requested_model
+            and not effective_held_model
         ):
             raise _automation_model_unreadable()
         if not fallback_eligible:
             return await thread_model.resolve_turn_config(
                 user_id,
                 thread_id,
-                named=requested_model,
-                held=held_model,
+                named=effective_requested_model,
+                held=effective_held_model,
                 fall_back=from_service,
                 resolve=_effective_resolve,
             )
@@ -959,8 +1424,8 @@ async def resolve_turn_config_with_automation_inheritance(
                 return await thread_model.resolve_turn_config(
                     user_id,
                     thread_id,
-                    named=requested_model,
-                    held=held_model,
+                    named=effective_requested_model,
+                    held=effective_held_model,
                     fall_back=False,
                     resolve=_tracked_resolve,
                 )
@@ -971,7 +1436,7 @@ async def resolve_turn_config_with_automation_inheritance(
                 rejected_model = (
                     (captured_model[-1] if captured_model else None)
                     or extract_rejected_model_from_exc(exc)
-                    or (attempted_models[-1] if attempted_models else requested_model)
+                    or (attempted_models[-1] if attempted_models else effective_requested_model)
                 )
                 return await _try_subscription_fallback(
                     original_model=rejected_model,
@@ -986,7 +1451,7 @@ async def resolve_turn_config_with_automation_inheritance(
                 user_id,
                 thread_id,
                 named=inherited_model,
-                held=held_model,
+                held=effective_held_model,
                 fall_back=False if fallback_eligible else from_service,
                 resolve=_tracked_resolve,
             )
@@ -1005,9 +1470,9 @@ async def resolve_turn_config_with_automation_inheritance(
                     reason=detail.get("type"),
                     exc_to_raise=exc,
                 )
-            if not _is_unservable_refusal(exc):
+            if (target_exec and target_exec.get("_has_exec_snapshot")) or not _is_unservable_refusal(exc):
                 raise
-        elif not _is_unservable_refusal(exc):
+        elif (target_exec and target_exec.get("_has_exec_snapshot")) or not _is_unservable_refusal(exc):
             raise
         reason = exc.detail.get("type") if isinstance(exc.detail, dict) else None
         logger.warning(
@@ -1019,7 +1484,7 @@ async def resolve_turn_config_with_automation_inheritance(
             user_id,
             thread_id,
             named=None,
-            held=held_model,
+            held=effective_held_model,
             fall_back=from_service,
             resolve=_effective_resolve,
         )

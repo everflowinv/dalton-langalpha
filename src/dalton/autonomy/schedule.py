@@ -565,6 +565,523 @@ def build_global_director_specs(
     ]
 
 
+_OWNER_CUSTOM_MODEL_LABEL = "所有者自定义模型"
+_LLM_MODEL_SYSTEM_ONLY_KEY = "llm_model_system_only"
+_UNSET_RESOLVED_COMPUTER: Any = object()
+
+
+def _configured_system_model_names() -> list[str]:
+    """Return sorted system-catalog model names from the deployment manifest."""
+    from src.server.services.automations.lifecycle import get_configured_llm_models
+
+    return sorted({n for group in get_configured_llm_models().values() for n in group})
+
+
+def _owner_custom_names(owner_pref: Mapping[str, Any] | None) -> set[str]:
+    """Return all custom model and custom provider names defined by *owner_pref*."""
+    from src.llms.preferences import custom_model_names
+
+    pref = dict(owner_pref) if isinstance(owner_pref, Mapping) else {}
+    names = set(custom_model_names(pref))
+    providers = pref.get("custom_providers")
+    if isinstance(providers, list):
+        for cp in providers:
+            if (
+                isinstance(cp, Mapping)
+                and isinstance(cp.get("name"), str)
+                and cp["name"].strip()
+            ):
+                names.add(cp["name"].strip())
+    return names
+
+
+def _is_effective_system_model(
+    model_name: str | None,
+    owner_pref: Mapping[str, Any] | None,
+    *,
+    system_only: bool,
+) -> bool:
+    """Return True when *model_name* resolves to an effective system-catalog model."""
+    if not model_name:
+        return True
+    if model_name not in set(_configured_system_model_names()):
+        return False
+    if system_only:
+        return True
+    return model_name not in _owner_custom_names(owner_pref)
+
+
+def _mask_private_model_in_error(
+    message: str,
+    model_name: str | None,
+    *,
+    owner_pref: Mapping[str, Any] | None,
+    system_only: bool,
+) -> str:
+    """Replace an owner's private/shadowed custom model name in cross-user refusal text."""
+    if model_name and not _is_effective_system_model(
+        model_name, owner_pref, system_only=system_only
+    ):
+        return message.replace(model_name, _OWNER_CUSTOM_MODEL_LABEL)
+    return message
+
+
+def _apply_system_only_metadata(
+    meta: Mapping[str, Any] | None,
+    *,
+    model_in_spec: bool,
+    final_model: str | None,
+    cross_user: bool,
+    existing_meta: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Maintain the server-protected ``llm_model_system_only`` metadata marker."""
+    out = dict(meta or {})
+    out.pop(_LLM_MODEL_SYSTEM_ONLY_KEY, None)
+    if model_in_spec:
+        if final_model is not None and cross_user:
+            out[_LLM_MODEL_SYSTEM_ONLY_KEY] = True
+    elif isinstance(existing_meta, Mapping) and bool(
+        existing_meta.get(_LLM_MODEL_SYSTEM_ONLY_KEY)
+    ):
+        out[_LLM_MODEL_SYSTEM_ONLY_KEY] = True
+    return out
+
+
+async def _check_managed_automation_model(
+    task_owner: str,
+    model_name: str,
+    pref: dict[str, Any] | None,
+    *,
+    cross_user: bool,
+    via_rest: bool = False,
+) -> tuple[str, dict[str, Any]]:
+    """Validate *model_name* for a managed automation write.
+
+    Cross-user writes (``effective_actor_id != task_owner``) accept system-catalog
+    models only and never reveal any user's custom models in refusal messages.
+    """
+    from src.server.services.automations import lifecycle
+    from src.server.services.llm import user_models
+
+    if cross_user:
+        configured = _configured_system_model_names()
+        source, entry = await user_models.classify_model(
+            task_owner,
+            model_name,
+            _pref_cache=pref,
+            ignore_custom_models=True,
+        )
+        if model_name in configured and source == user_models.ModelSource.SYSTEM:
+            return source, entry if isinstance(entry, dict) else {}
+        raise lifecycle.AutomationRefusal(
+            f'unknown model {model_name!r}; pass "" to clear and use the user\'s default, '
+            f"or one of: {', '.join(configured)}",
+            field="llm_model",
+        )
+    try:
+        return await lifecycle.check_model(task_owner, model_name, pref)
+    except lifecycle.AutomationRefusal as exc:
+        if not via_rest and "use null for the user's default" in str(exc):
+            raise lifecycle.AutomationRefusal(
+                str(exc).replace(
+                    "use null for the user's default",
+                    'pass "" to clear and use the user\'s default',
+                ),
+                field=exc.field,
+            ) from None
+        raise
+
+
+async def _check_active_admin_in_tx(actor_id: str, *, conn: Any = None) -> bool:
+    """Re-verify whether *actor_id* is an active admin/PM (on *conn* when in local auth)."""
+    from src.dalton.access_tiers import is_admin_user
+    from src.dalton.autonomy.system_jobs import is_pm_user
+    from src.dalton.settings import is_dalton_local_auth_enabled
+
+    if is_dalton_local_auth_enabled():
+        return await is_admin_user(actor_id, include_config_defaults=True, conn=conn)
+    return is_pm_user(actor_id)
+
+
+async def _read_workspace_computer_snapshot(
+    task_owner: str,
+    ws_id: str | None,
+    *,
+    is_home: bool,
+    conn: Any = None,
+) -> tuple[str | None, bool]:
+    """Read ``(snapshot_computer_id, snapshot_available)`` outside the write lock."""
+    from src.server.database.computer import get_computer_for_workspace
+    from src.server.services.home_placement import home_turn_computer
+    from src.server.utils.pg_sanitize import normalize_uuid
+
+    if conn is not None and not _conn_supports_sql_locks(conn):
+        return None, False
+    try:
+        if is_home:
+            comp, _ = await home_turn_computer(task_owner, conn=conn)
+        elif ws_id and normalize_uuid(ws_id) is not None:
+            comp = await get_computer_for_workspace(ws_id, conn=conn)
+        else:
+            return None, False
+    except RuntimeError as exc:
+        if "pool" in str(exc).lower():
+            return None, False
+        raise
+    comp_id = (
+        str(comp["computer_id"])
+        if isinstance(comp, Mapping) and comp.get("computer_id")
+        else None
+    )
+    return comp_id, True
+
+
+def _conn_supports_sql_locks(conn: Any) -> bool:
+    """Return True when *conn* is a psycopg AsyncConnection (real or cursor-configured autospec)."""
+    from unittest.mock import NonCallableMock
+
+    from psycopg import AsyncConnection
+
+    if conn is None or not isinstance(conn, AsyncConnection):
+        return False
+    cursor_attr = getattr(conn, "cursor", None)
+    if not callable(cursor_attr):
+        return False
+    if isinstance(conn, NonCallableMock):
+        return getattr(cursor_attr, "side_effect", None) is not None
+    return True
+
+
+def _make_schedule_refusal(
+    message: str,
+    *,
+    field: str = "workspace_id",
+    code: str | None = None,
+) -> Exception:
+    from src.server.services.automations.lifecycle import AutomationRefusal
+
+    exc = AutomationRefusal(message, field=field)
+    if code is not None:
+        setattr(exc, "schedule_error_code", code)
+    return exc
+
+
+async def _lock_and_verify_workspace_placement(
+    locked_conn: Any,
+    *,
+    task_owner: str,
+    locked_ws_id: str | None,
+    is_home: bool,
+    snapshot_computer_id: str | None,
+    snapshot_available: bool,
+) -> tuple[dict[str, Any] | None, Any]:
+    """Lock ``computers`` then ``workspaces`` (``FOR SHARE``) until commit and verify binding.
+
+    Follows the same table lock order as ``workspace_move`` and ``archive``
+    (``computers ORDER BY computer_id`` -> ``workspaces ORDER BY workspace_id``).
+    For ``Home``, determines ``home_turn_computer(task_owner, conn=locked_conn)``
+    once under the locks so both binding verification and ``check_claude_code_hosted``
+    use the exact same computer.
+    """
+    if not _conn_supports_sql_locks(locked_conn):
+        return None, _UNSET_RESOLVED_COMPUTER
+
+    from psycopg.rows import dict_row
+
+    from src.server.database.home_workspace import (
+        get_home_stand_in_id,
+        get_home_workspace_id,
+    )
+    from src.server.database.sql_fences import COMPUTER_COLS, workspace_move_fences
+    from src.server.services.home_placement import home_turn_computer
+    from src.server.utils.pg_sanitize import normalize_uuid
+
+    if is_home:
+        home_id = get_home_workspace_id(task_owner)
+        stand_in_id = get_home_stand_in_id(task_owner)
+        norm_locked_ws = normalize_uuid(locked_ws_id) if locked_ws_id else None
+        async with locked_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT {COMPUTER_COLS}
+                FROM computers
+                WHERE user_id = %(user_id)s AND status <> 'deleted'
+                ORDER BY computer_id
+                FOR SHARE
+                """,
+                {"user_id": task_owner},
+            )
+            await cur.fetchall()
+            if norm_locked_ws and norm_locked_ws not in (home_id, stand_in_id):
+                await cur.execute(
+                    """
+                    SELECT workspace_id, user_id, computer_id, status, config
+                    FROM workspaces
+                    WHERE workspace_id IN (%(home_id)s, %(stand_in_id)s, %(locked_ws_id)s)
+                      AND status <> 'deleted'
+                    ORDER BY workspace_id
+                    FOR SHARE
+                    """,
+                    {
+                        "home_id": home_id,
+                        "stand_in_id": stand_in_id,
+                        "locked_ws_id": norm_locked_ws,
+                    },
+                )
+            else:
+                await cur.execute(
+                    """
+                    SELECT workspace_id, user_id, computer_id, status, config
+                    FROM workspaces
+                    WHERE workspace_id IN (%(home_id)s, %(stand_in_id)s)
+                      AND status <> 'deleted'
+                    ORDER BY workspace_id
+                    FOR SHARE
+                    """,
+                    {"home_id": home_id, "stand_in_id": stand_in_id},
+                )
+            locked_ws_rows = [dict(r) for r in (await cur.fetchall() or ())]
+        resolved_computer, _is_stand_in = await home_turn_computer(
+            task_owner, conn=locked_conn
+        )
+        resolved_comp_id = (
+            str(resolved_computer["computer_id"])
+            if isinstance(resolved_computer, Mapping)
+            and resolved_computer.get("computer_id")
+            else None
+        )
+        if snapshot_available and resolved_comp_id != snapshot_computer_id:
+            raise _make_schedule_refusal("情况已变化，请重新发起", field="workspace_id")
+        target_ws_key = norm_locked_ws or home_id
+        matched_ws = next(
+            (
+                r
+                for r in locked_ws_rows
+                if str(r.get("workspace_id") or "").lower() == str(target_ws_key).lower()
+            ),
+            None,
+        )
+        if norm_locked_ws is not None and matched_ws is None:
+            raise _make_schedule_refusal("情况已变化，请重新发起", field="workspace_id")
+        return matched_ws, resolved_computer
+
+    norm_ws = normalize_uuid(locked_ws_id) if locked_ws_id else None
+    if norm_ws is None:
+        raise _make_schedule_refusal("情况已变化，请重新发起", field="workspace_id")
+
+    async with locked_conn.cursor(row_factory=dict_row) as cur:
+        target_comp_id = (
+            normalize_uuid(snapshot_computer_id) if snapshot_computer_id else None
+        )
+        if target_comp_id is None:
+            await cur.execute(
+                """
+                SELECT computer_id
+                FROM workspaces
+                WHERE workspace_id = %(workspace_id)s AND status <> 'deleted'
+                """,
+                {"workspace_id": norm_ws},
+            )
+            pre_row = await cur.fetchone()
+            if pre_row and pre_row.get("computer_id"):
+                target_comp_id = str(pre_row["computer_id"])
+        locked_comp_row: dict[str, Any] | None = None
+        if target_comp_id is not None:
+            await cur.execute(
+                f"""
+                SELECT {COMPUTER_COLS}
+                FROM computers
+                WHERE computer_id = %(computer_id)s AND status <> 'deleted'
+                ORDER BY computer_id
+                FOR SHARE
+                """,
+                {"computer_id": target_comp_id},
+            )
+            comp_raw = await cur.fetchone()
+            locked_comp_row = dict(comp_raw) if comp_raw else None
+        await cur.execute(
+            """
+            SELECT w.workspace_id, w.user_id, w.computer_id, w.status, w.config
+            FROM workspaces w
+            WHERE w.workspace_id = %(workspace_id)s AND w.status <> 'deleted'
+            ORDER BY w.workspace_id
+            FOR SHARE
+            """,
+            {"workspace_id": norm_ws},
+        )
+        ws_raw = await cur.fetchone()
+        if ws_raw is None:
+            raise _make_schedule_refusal("情况已变化，请重新发起", field="workspace_id")
+        # Recheck active workspace moves in a separate statement AFTER acquiring
+        # FOR SHARE on workspaces so READ COMMITTED takes a fresh snapshot that
+        # observes any workspace_moves row committed while waiting on the lock.
+        await cur.execute(
+            f"""
+            SELECT {workspace_move_fences("%(workspace_id)s::uuid")} AS move_fenced
+            """,
+            {"workspace_id": norm_ws},
+        )
+        fence_raw = await cur.fetchone()
+    locked_ws_row = dict(ws_raw)
+    if fence_raw and fence_raw.get("move_fenced"):
+        raise _make_schedule_refusal("情况已变化，请重新发起", field="workspace_id")
+    actual_comp_id = (
+        str(locked_ws_row["computer_id"]) if locked_ws_row.get("computer_id") else None
+    )
+    if snapshot_available and actual_comp_id != snapshot_computer_id:
+        raise _make_schedule_refusal("情况已变化，请重新发起", field="workspace_id")
+    if actual_comp_id is not None and (
+        locked_comp_row is None
+        or str(locked_comp_row.get("computer_id") or "") != actual_comp_id
+    ):
+        raise _make_schedule_refusal("情况已变化，请重新发起", field="workspace_id")
+    return locked_ws_row, locked_comp_row
+
+
+async def _recheck_operator_authorization_in_tx(
+    locked_conn: Any,
+    *,
+    effective_actor_id: str,
+    task_owner: str,
+    role: str,
+    saved_name: str,
+    saved_metadata: Mapping[str, Any] | None,
+    locked_ws_id: str | None,
+    locked_ws_row: Mapping[str, Any] | None,
+    locked_row: Mapping[str, Any] | None,
+    is_home: bool,
+    units_on: bool,
+    auth_on: bool,
+) -> None:
+    """Re-verify operator authorization inside the locked transaction."""
+    sql_conn = locked_conn if _conn_supports_sql_locks(locked_conn) else None
+
+    home_job_names = {str(s["name"]) for s in build_global_director_specs()}
+    if is_home or saved_name in home_job_names:
+        if role != "chief_of_staff":
+            raise _make_schedule_refusal(
+                "公司分析师只能操作当前工作区的任务，禁止操作 Home 全局任务。",
+                field="workspace_id",
+                code="forbidden_scope",
+            )
+        if saved_name == "dalton-earnings-calendar":
+            if effective_actor_id != task_owner:
+                raise _make_schedule_refusal(
+                    "只有任务本人可以修改自己的财报日历任务。",
+                    field="workspace_id",
+                    code="forbidden_pm",
+                )
+        elif not await _check_active_admin_in_tx(effective_actor_id, conn=sql_conn):
+            raise _make_schedule_refusal(
+                "只有 PM 用户可以修改或启停 Home 全局任务。",
+                field="workspace_id",
+                code="forbidden_pm",
+            )
+        if is_home:
+            return
+
+    if sql_conn is None:
+        return
+
+    from src.dalton.access_tiers import classify_owner_tier
+    from src.dalton.autonomy.classification import is_managed_unit_automation_for_unit
+    from src.dalton.database.coverage_units import get_active_unit_by_workspace
+    from src.dalton.sharing import ColleagueAccessRevokedError, require_workspace_access
+
+    if units_on and locked_ws_id:
+        locked_unit = await get_active_unit_by_workspace(
+            locked_ws_id, conn=sql_conn, for_share=True
+        )
+        is_unit_managed = locked_unit is not None and (
+            (
+                locked_row is not None
+                and is_managed_unit_automation_for_unit(locked_row, unit=locked_unit)
+            )
+            or is_managed_unit_automation_for_unit(
+                name=saved_name,
+                metadata=dict(saved_metadata or {}),
+                unit=locked_unit,
+            )
+        )
+        if is_unit_managed and locked_unit is not None:
+            locked_lead = str(
+                locked_unit.get("lead_analyst_user_id")
+                or locked_unit.get("owner_user_id")
+                or ""
+            ).strip()
+            if locked_lead and locked_lead != task_owner:
+                raise _make_schedule_refusal(
+                    f"工作区 {locked_ws_id} 已绑定覆盖单元，当前主分析师已变更为 {locked_lead}，请重试。",
+                    field="workspace_id",
+                    code="not_unit_lead_analyst",
+                )
+            ws_owner = str((locked_ws_row or {}).get("user_id") or "").strip()
+            actor_is_pm = False
+            if effective_actor_id != locked_lead:
+                actor_is_pm = bool(
+                    auth_on
+                    and await _check_active_admin_in_tx(
+                        effective_actor_id, conn=sql_conn
+                    )
+                )
+                if not actor_is_pm:
+                    raise _make_schedule_refusal(
+                        f"工作区 {locked_ws_id} 已绑定覆盖单元，受管自动任务 {saved_name} "
+                        f"仅可由当前主分析师或 PM 修改。",
+                        field="workspace_id",
+                        code="not_unit_lead_analyst",
+                    )
+            elif ws_owner and ws_owner != effective_actor_id:
+                actor_is_pm = bool(
+                    auth_on
+                    and await _check_active_admin_in_tx(
+                        effective_actor_id, conn=sql_conn
+                    )
+                )
+            if locked_ws_row is not None and ws_owner and ws_owner != effective_actor_id:
+                if actor_is_pm:
+                    owner_tier = await classify_owner_tier(ws_owner, conn=sql_conn)
+                    if owner_tier in ("unknown", "external"):
+                        raise _make_schedule_refusal(
+                            "情况已变化，请重新发起", field="workspace_id"
+                        )
+                try:
+                    await require_workspace_access(
+                        dict(locked_ws_row),
+                        effective_actor_id,
+                        channel="web",
+                        need="read" if actor_is_pm else "write",
+                        conn=sql_conn,
+                    )
+                except (HTTPException, ColleagueAccessRevokedError):
+                    raise _make_schedule_refusal(
+                        "情况已变化，请重新发起", field="workspace_id"
+                    ) from None
+            return
+        if effective_actor_id != task_owner:
+            raise _make_schedule_refusal(
+                f"工作区 {locked_ws_id} 的覆盖单元已解绑或归档，请刷新后重试。",
+                field="workspace_id",
+                code="unit_unbound",
+            )
+
+    if locked_ws_row is not None:
+        ws_owner = str(locked_ws_row.get("user_id") or "").strip()
+        if ws_owner and ws_owner != effective_actor_id:
+            try:
+                await require_workspace_access(
+                    dict(locked_ws_row),
+                    effective_actor_id,
+                    channel="web",
+                    need="write",
+                    conn=sql_conn,
+                )
+            except (HTTPException, ColleagueAccessRevokedError):
+                raise _make_schedule_refusal(
+                    "情况已变化，请重新发起", field="workspace_id"
+                ) from None
+
+
 async def schedule_dalton_automation_helper(
     name: str | None = None,
     spec: dict[str, Any] | None = None,
@@ -625,6 +1142,28 @@ async def schedule_dalton_automation_helper(
         "deleted_by",
     ):
         merged_spec.pop(_protected_key, None)
+    if isinstance(merged_spec.get("metadata"), Mapping):
+        sanitized_spec_meta = dict(merged_spec["metadata"])
+        sanitized_spec_meta.pop(_LLM_MODEL_SYSTEM_ONLY_KEY, None)
+        merged_spec["metadata"] = sanitized_spec_meta
+
+    from src.dalton.services.company_automations import (
+        automation_history_context,
+        get_current_history_context,
+    )
+
+    outer_hist_ctx = get_current_history_context()
+    effective_actor_id = (
+        str(actor_user_id).strip()
+        if actor_user_id is not None and str(actor_user_id).strip()
+        else (
+            str(outer_hist_ctx.actor_user_id).strip()
+            if outer_hist_ctx is not None
+            and outer_hist_ctx.has_explicit_actor
+            and outer_hist_ctx.actor_user_id
+            else user_id
+        )
+    )
     resolved_action = str(action or merged_spec.get("action") or "upsert").strip().lower()
     resolved_name = str(name or merged_spec.get("name") or "").strip()
     target_auto_id = str(merged_spec.get("automation_id") or "").strip()
@@ -773,30 +1312,46 @@ async def schedule_dalton_automation_helper(
             name_prefix="dalton-",
             conn=conn,
         )
-        dalton_rows = [
-            {
-                "automation_id": str(r.get("automation_id")),
-                "name": r.get("name"),
-                "trigger_type": r.get("trigger_type"),
-                "cron_expression": r.get("cron_expression"),
-                "next_run_at": str(r.get("next_run_at") or ""),
-                "status": r.get("status"),
-                "llm_model": r.get("llm_model"),
-                "reasoning_effort": r.get("reasoning_effort"),
-            }
-            for r in rows
-            if str(r.get("name") or "").startswith("dalton-")
-            and (not ws_id or str(r.get("workspace_id") or "") == str(ws_id))
-        ]
+        is_cross_user_list = list_owner != effective_actor_id
+        list_owner_pref: dict[str, Any] | None = None
+        if is_cross_user_list:
+            from src.server.services.automations.lifecycle import _safe_model_pref
+
+            list_owner_pref = await _safe_model_pref(list_owner, None)
+        dalton_rows = []
+        for r in rows:
+            if not str(r.get("name") or "").startswith("dalton-"):
+                continue
+            if ws_id and str(r.get("workspace_id") or "") != str(ws_id):
+                continue
+            raw_llm = r.get("llm_model")
+            row_meta = r.get("metadata") if isinstance(r.get("metadata"), Mapping) else {}
+            display_llm = raw_llm
+            if is_cross_user_list and raw_llm:
+                if not _is_effective_system_model(
+                    str(raw_llm),
+                    list_owner_pref,
+                    system_only=bool(row_meta.get(_LLM_MODEL_SYSTEM_ONLY_KEY)),
+                ):
+                    display_llm = _OWNER_CUSTOM_MODEL_LABEL
+            dalton_rows.append(
+                {
+                    "automation_id": str(r.get("automation_id")),
+                    "name": r.get("name"),
+                    "trigger_type": r.get("trigger_type"),
+                    "cron_expression": r.get("cron_expression"),
+                    "next_run_at": str(r.get("next_run_at") or ""),
+                    "status": r.get("status"),
+                    "llm_model": display_llm,
+                    "reasoning_effort": r.get("reasoning_effort"),
+                }
+            )
         return {"ok": True, "count": len(dalton_rows), "automations": dalton_rows}
 
     if not resolved_name:
         return {"ok": False, "error": "缺少自动任务名称 `name`。"}
 
-    if resolved_name in home_job_names:
-        is_home_target = True
-
-    if is_home_target:
+    if is_home_target or resolved_name in home_job_names:
         if role != "chief_of_staff":
             return {
                 "ok": False,
@@ -930,6 +1485,22 @@ async def schedule_dalton_automation_helper(
             or is_managed_unit_automation(name=resolved_name, metadata=eff_meta_check)
         )
     )
+
+    pref_for_lock: dict[str, Any] | None = None
+    snapshot_computer_id: str | None = None
+    snapshot_available = False
+    if resolved_action == "upsert":
+        from src.server.services.automations.lifecycle import _safe_model_pref
+
+        pref_for_lock = await _safe_model_pref(task_owner, None)
+        snapshot_computer_id, snapshot_available = (
+            await _read_workspace_computer_snapshot(
+                task_owner,
+                ws_id,
+                is_home=is_home_target,
+                conn=conn,
+            )
+        )
 
     async with _user_automations_lock_for_write(
         task_owner,
@@ -1085,24 +1656,6 @@ async def schedule_dalton_automation_helper(
                         "message": "只有 PM 用户可以修改或启停 Home 全局任务。",
                     }
 
-        from src.dalton.services.company_automations import (
-            automation_history_context,
-            get_current_history_context,
-        )
-
-        outer_hist_ctx = get_current_history_context()
-        effective_actor_id = (
-            str(actor_user_id).strip()
-            if actor_user_id is not None and str(actor_user_id).strip()
-            else (
-                str(outer_hist_ctx.actor_user_id).strip()
-                if outer_hist_ctx is not None
-                and outer_hist_ctx.has_explicit_actor
-                and outer_hist_ctx.actor_user_id
-                else user_id
-            )
-        )
-
         if resolved_action in ("pause", "resume"):
             if not existing:
                 return {"ok": False, "error": f"未找到任务 `{resolved_name}`"}
@@ -1147,6 +1700,11 @@ async def schedule_dalton_automation_helper(
                 effective_kwargs: dict[str, Any],
                 _locked_conn: Any,
             ) -> None:
+                from psycopg.rows import dict_row
+
+                from src.server.database.home_workspace import is_home_id
+                from src.server.utils.pg_sanitize import normalize_uuid
+
                 locked_view = dict(locked_row) if isinstance(locked_row, Mapping) else {}
                 # The row may have moved to another workspace between the
                 # unlocked read that matched it and this lock; a move takes it
@@ -1158,6 +1716,60 @@ async def schedule_dalton_automation_helper(
                     raise AutomationRefusal(
                         f"任务 `{resolved_name}` 已移到其他工作区，请刷新后重试。"
                     )
+                locked_ws_id = str(locked_view.get("workspace_id") or "").strip() or None
+                locked_name = str(locked_view.get("name") or resolved_name)
+                locked_is_home = bool(
+                    not locked_ws_id
+                    or is_home_id(task_owner, locked_ws_id)
+                    or (is_home_target and _ws_key(locked_ws_id) == _ws_key(ws_id))
+                )
+                locked_ws_row: dict[str, Any] | None = None
+                if _conn_supports_sql_locks(_locked_conn) and not locked_is_home:
+                    norm_locked_ws = normalize_uuid(locked_ws_id) if locked_ws_id else None
+                    if norm_locked_ws is None:
+                        raise _make_schedule_refusal(
+                            "情况已变化，请重新发起", field="workspace_id"
+                        )
+                    async with _locked_conn.cursor(row_factory=dict_row) as cur:
+                        await cur.execute(
+                            """
+                            SELECT workspace_id, user_id, computer_id, status, config
+                            FROM workspaces
+                            WHERE workspace_id = %(workspace_id)s AND status <> 'deleted'
+                            ORDER BY workspace_id
+                            FOR SHARE
+                            """,
+                            {"workspace_id": norm_locked_ws},
+                        )
+                        ws_raw = await cur.fetchone()
+                    if ws_raw is None:
+                        raise _make_schedule_refusal(
+                            "情况已变化，请重新发起", field="workspace_id"
+                        )
+                    locked_ws_row = dict(ws_raw)
+                locked_meta_for_auth = (
+                    effective_kwargs.get("metadata")
+                    if isinstance(effective_kwargs.get("metadata"), Mapping)
+                    else (
+                        locked_view.get("metadata")
+                        if isinstance(locked_view.get("metadata"), Mapping)
+                        else {}
+                    )
+                )
+                await _recheck_operator_authorization_in_tx(
+                    _locked_conn,
+                    effective_actor_id=effective_actor_id,
+                    task_owner=task_owner,
+                    role=role,
+                    saved_name=locked_name,
+                    saved_metadata=locked_meta_for_auth,
+                    locked_ws_id=locked_ws_id,
+                    locked_ws_row=locked_ws_row,
+                    locked_row=locked_view,
+                    is_home=locked_is_home,
+                    units_on=units_on,
+                    auth_on=auth_on,
+                )
                 if not locked_view.get("trigger_type"):
                     locked_view["trigger_type"] = (
                         "cron" if locked_view.get("cron_expression") else "price"
@@ -1190,9 +1802,16 @@ async def schedule_dalton_automation_helper(
                         **conn_kw,
                     )
             except AutomationRefusal as exc:
+                explicit_code = getattr(exc, "schedule_error_code", None)
+                if isinstance(explicit_code, str) and explicit_code:
+                    err_code = explicit_code
+                elif exc.field == "workspace_id":
+                    err_code = "workspace_changed"
+                else:
+                    err_code = str(exc)
                 return {
                     "ok": False,
-                    "error": str(exc),
+                    "error": err_code,
                     "message": str(exc),
                 }
             return {
@@ -1244,14 +1863,20 @@ async def schedule_dalton_automation_helper(
         if resolved_ticker and not meta.get("ticker"):
             meta["ticker"] = str(resolved_ticker).upper()
 
+        from src.server.database.home_workspace import is_home_id
         from src.server.services.automations.lifecycle import (
             AutomationRefusal,
             _assert_replaced_by_tracker_preserved,
             _reconcile_reasoning_effort,
             _replaced_by_tracker_refusal,
-            _safe_model_pref,
+            check_claude_code_hosted,
         )
+        from src.server.services.llm import user_models
 
+        cross_user = effective_actor_id != task_owner
+        pref_for_effort: dict[str, Any] = (
+            pref_for_lock if isinstance(pref_for_lock, dict) else {}
+        )
         effort_in_spec = "reasoning_effort" in merged_spec
         raw_effort_spec = merged_spec.get("reasoning_effort")
         if isinstance(raw_effort_spec, str):
@@ -1260,11 +1885,43 @@ async def schedule_dalton_automation_helper(
         model_in_spec = "llm_model" in merged_spec
         spec_llm_model = merged_spec.get("llm_model")
         if isinstance(spec_llm_model, str):
-            spec_llm_model = spec_llm_model.strip() or None
-        # Load user model_pref before DB writes if model or effort reconciliation needs it.
-        pref_for_effort: dict[str, Any] | None = None
-        if effort_in_spec or model_in_spec or existing is None:
-            pref_for_effort = await _safe_model_pref(task_owner, None)
+            cleaned_spec_model = spec_llm_model.strip()
+            spec_llm_model = (
+                None
+                if cleaned_spec_model.lower() in ("", "default", "clear")
+                else cleaned_spec_model
+            )
+
+        def _handle_schedule_refusal(
+            exc: AutomationRefusal,
+            *,
+            model_name: str | None,
+            system_only: bool,
+        ) -> dict[str, Any]:
+            msg = str(exc)
+            if cross_user and exc.field == "reasoning_effort":
+                msg = _mask_private_model_in_error(
+                    msg,
+                    model_name,
+                    owner_pref=pref_for_effort,
+                    system_only=system_only,
+                )
+            if via_rest:
+                raise AutomationRefusal(msg, field=exc.field) from None
+            explicit_code = getattr(exc, "schedule_error_code", None)
+            if isinstance(explicit_code, str) and explicit_code:
+                err_code = explicit_code
+            elif exc.field == "llm_model":
+                err_code = "invalid_llm_model"
+            elif exc.field == "workspace_id":
+                err_code = "workspace_changed"
+            else:
+                err_code = "invalid_reasoning_effort"
+            return {
+                "ok": False,
+                "error": err_code,
+                "message": msg,
+            }
 
         if existing:
             if (replaced_refusal := _replaced_by_tracker_refusal(existing)) is not None:
@@ -1292,6 +1949,18 @@ async def schedule_dalton_automation_helper(
             for mk, mv in list(merged_meta.items()):
                 if mv is None and mk != "replaced_by_tracker":
                     merged_meta.pop(mk, None)
+
+            target_model_for_effort = (
+                spec_llm_model if model_in_spec else existing.get("llm_model")
+            )
+            merged_meta = _apply_system_only_metadata(
+                merged_meta,
+                model_in_spec=model_in_spec,
+                final_model=target_model_for_effort,
+                cross_user=cross_user,
+                existing_meta=existing_meta,
+            )
+            target_system_only = bool(merged_meta.get(_LLM_MODEL_SYSTEM_ONLY_KEY))
 
             old_rp = existing_meta.get("report_profile")
             new_rp = merged_meta.get("report_profile")
@@ -1342,41 +2011,19 @@ async def schedule_dalton_automation_helper(
             elif next_dt is not None and (not existing_is_paused or explicit_status == "active"):
                 patch["next_run_at"] = next_dt
             if rp_changed and report_profile_change is not None:
-                merged_meta = dict(report_profile_change.after_metadata)
-            if merged_meta or rp_changed:
+                merged_meta = _apply_system_only_metadata(
+                    dict(report_profile_change.after_metadata),
+                    model_in_spec=model_in_spec,
+                    final_model=target_model_for_effort,
+                    cross_user=cross_user,
+                    existing_meta=existing_meta,
+                )
+            if merged_meta or rp_changed or merged_meta != existing_meta:
                 patch["metadata"] = merged_meta
             if explicit_status:
                 patch["status"] = explicit_status
             if model_in_spec:
                 patch["llm_model"] = spec_llm_model
-            target_model_for_effort = (
-                patch["llm_model"] if model_in_spec else existing.get("llm_model")
-            )
-            if effort_in_spec or model_in_spec or existing.get("reasoning_effort") is not None:
-                try:
-                    write_effort, reconciled_effort = await _reconcile_reasoning_effort(
-                        task_owner,
-                        target_model=target_model_for_effort,
-                        effort_set=effort_in_spec,
-                        raw_effort=raw_effort_spec,
-                        stored_effort=existing.get("reasoning_effort"),
-                        is_create=False,
-                        model_pref=pref_for_effort,
-                        model_changed=(
-                            model_in_spec
-                            and target_model_for_effort != existing.get("llm_model")
-                        ),
-                    )
-                except AutomationRefusal as exc:
-                    if via_rest:
-                        raise
-                    return {
-                        "ok": False,
-                        "error": "invalid_reasoning_effort",
-                        "message": str(exc),
-                    }
-                if write_effort:
-                    patch["reasoning_effort"] = reconciled_effort
             saved_workspace_id = (
                 patch["workspace_id"]
                 if "workspace_id" in patch
@@ -1392,6 +2039,63 @@ async def schedule_dalton_automation_helper(
                 if "metadata" in patch
                 else existing.get("metadata")
             )
+
+            try:
+                pre_classified: tuple[str, dict[str, Any]] | None = None
+                if model_in_spec and target_model_for_effort is not None:
+                    pre_classified = await _check_managed_automation_model(
+                        task_owner,
+                        target_model_for_effort,
+                        pref_for_effort,
+                        cross_user=cross_user,
+                        via_rest=via_rest,
+                    )
+                elif target_model_for_effort and target_system_only:
+                    sys_src, sys_entry = await user_models.classify_model(
+                        task_owner,
+                        target_model_for_effort,
+                        _pref_cache=pref_for_effort,
+                        ignore_custom_models=True,
+                    )
+                    pre_classified = (
+                        sys_src,
+                        sys_entry if isinstance(sys_entry, dict) else {},
+                    )
+                if not _conn_supports_sql_locks(active_conn) and (
+                    model_in_spec
+                    or target_model_for_effort != existing.get("llm_model")
+                ):
+                    await check_claude_code_hosted(
+                        task_owner,
+                        target_model_for_effort,
+                        str(saved_workspace_id) if saved_workspace_id else None,
+                        active_conn,
+                        pref_for_effort,
+                    )
+                if effort_in_spec or model_in_spec or existing.get("reasoning_effort") is not None:
+                    write_effort, reconciled_effort = await _reconcile_reasoning_effort(
+                        task_owner,
+                        target_model=target_model_for_effort,
+                        effort_set=effort_in_spec,
+                        raw_effort=raw_effort_spec,
+                        stored_effort=existing.get("reasoning_effort"),
+                        is_create=False,
+                        model_pref=pref_for_effort,
+                        classified=pre_classified,
+                        model_changed=(
+                            model_in_spec
+                            and target_model_for_effort != existing.get("llm_model")
+                        ),
+                    )
+                    if write_effort:
+                        patch["reasoning_effort"] = reconciled_effort
+            except AutomationRefusal as exc:
+                return _handle_schedule_refusal(
+                    exc,
+                    model_name=target_model_for_effort,
+                    system_only=target_system_only,
+                )
+
             patch["scope"] = await resolve_automation_scope_for_write(
                 task_owner,
                 name=saved_name,
@@ -1409,11 +2113,43 @@ async def schedule_dalton_automation_helper(
                 if report_profile_change is not None
                 else None
             )
-            async def _reconcile_locked_effort(
+            locked_failure_ctx: dict[str, Any] = {
+                "model": target_model_for_effort,
+                "system_only": target_system_only,
+            }
+
+            async def _reconcile_locked_upsert(
                 locked_row: Mapping[str, Any],
                 effective_kwargs: dict[str, Any],
                 _locked_conn: Any,
             ) -> None:
+                if _ws_key(locked_row.get("workspace_id")) != _ws_key(
+                    existing.get("workspace_id")
+                ):
+                    raise _make_schedule_refusal(
+                        "情况已变化，请重新发起", field="workspace_id"
+                    )
+                locked_ws_id = str(locked_row.get("workspace_id") or "").strip() or None
+                locked_name = str(
+                    effective_kwargs.get("name")
+                    or locked_row.get("name")
+                    or saved_name
+                )
+                locked_is_home = bool(
+                    not locked_ws_id
+                    or is_home_id(task_owner, locked_ws_id)
+                    or (is_home_target and _ws_key(locked_ws_id) == _ws_key(ws_id))
+                )
+                locked_ws_row, resolved_computer = (
+                    await _lock_and_verify_workspace_placement(
+                        _locked_conn,
+                        task_owner=task_owner,
+                        locked_ws_id=locked_ws_id,
+                        is_home=locked_is_home,
+                        snapshot_computer_id=snapshot_computer_id,
+                        snapshot_available=snapshot_available,
+                    )
+                )
                 locked_model = locked_row.get("llm_model")
                 locked_effort = locked_row.get("reasoning_effort")
                 final_model = (
@@ -1421,6 +2157,86 @@ async def schedule_dalton_automation_helper(
                     if "llm_model" in effective_kwargs
                     else locked_model
                 )
+                locked_existing_meta = (
+                    dict(locked_row.get("metadata") or {})
+                    if isinstance(locked_row.get("metadata"), Mapping)
+                    else {}
+                )
+                base_meta = (
+                    effective_kwargs["metadata"]
+                    if isinstance(effective_kwargs.get("metadata"), Mapping)
+                    else locked_existing_meta
+                )
+                final_meta = _apply_system_only_metadata(
+                    base_meta,
+                    model_in_spec=model_in_spec,
+                    final_model=final_model,
+                    cross_user=cross_user,
+                    existing_meta=locked_existing_meta,
+                )
+                if "metadata" in effective_kwargs or final_meta != locked_existing_meta:
+                    effective_kwargs["metadata"] = final_meta
+                final_system_only = bool(final_meta.get(_LLM_MODEL_SYSTEM_ONLY_KEY))
+                locked_failure_ctx["model"] = final_model
+                locked_failure_ctx["system_only"] = final_system_only
+
+                await _recheck_operator_authorization_in_tx(
+                    _locked_conn,
+                    effective_actor_id=effective_actor_id,
+                    task_owner=task_owner,
+                    role=role,
+                    saved_name=locked_name,
+                    saved_metadata=final_meta,
+                    locked_ws_id=locked_ws_id,
+                    locked_ws_row=locked_ws_row,
+                    locked_row=locked_row,
+                    is_home=locked_is_home,
+                    units_on=units_on,
+                    auth_on=auth_on,
+                )
+
+                locked_classified: tuple[str, dict[str, Any]] | None = None
+                if model_in_spec and final_model is not None:
+                    locked_classified = await _check_managed_automation_model(
+                        task_owner,
+                        final_model,
+                        pref_for_effort,
+                        cross_user=cross_user,
+                        via_rest=via_rest,
+                    )
+                elif final_model and final_system_only:
+                    sys_src, sys_entry = await user_models.classify_model(
+                        task_owner,
+                        final_model,
+                        _pref_cache=pref_for_effort,
+                        ignore_custom_models=True,
+                    )
+                    locked_classified = (
+                        sys_src,
+                        sys_entry if isinstance(sys_entry, dict) else {},
+                    )
+
+                if model_in_spec or final_model != locked_model:
+                    if resolved_computer is not _UNSET_RESOLVED_COMPUTER:
+                        await check_claude_code_hosted(
+                            task_owner,
+                            final_model,
+                            locked_ws_id,
+                            _locked_conn,
+                            pref_for_effort,
+                            resolved_computer=resolved_computer,
+                        )
+                    elif _conn_supports_sql_locks(_locked_conn) or (
+                        final_model != existing.get("llm_model")
+                    ):
+                        await check_claude_code_hosted(
+                            task_owner,
+                            final_model,
+                            locked_ws_id,
+                            _locked_conn,
+                            pref_for_effort,
+                        )
+
                 if not (effort_in_spec or model_in_spec or locked_effort is not None):
                     return
                 write_eff, reconciled_eff = await _reconcile_reasoning_effort(
@@ -1431,6 +2247,7 @@ async def schedule_dalton_automation_helper(
                     stored_effort=locked_effort,
                     is_create=False,
                     model_pref=pref_for_effort,
+                    classified=locked_classified,
                     model_changed=(model_in_spec and final_model != locked_model),
                 )
                 if write_eff:
@@ -1443,7 +2260,7 @@ async def schedule_dalton_automation_helper(
                     actor_user_id=effective_actor_id,
                     action=effective_update_action,
                     skip_if_unchanged=True,
-                    locked_row_reconciler=_reconcile_locked_effort,
+                    locked_row_reconciler=_reconcile_locked_upsert,
                     report_delivery_audit=report_audit_payload,
                 ):
                     updated = await auto_db.update_automation(
@@ -1453,13 +2270,11 @@ async def schedule_dalton_automation_helper(
                         **patch,
                     )
             except AutomationRefusal as exc:
-                if via_rest:
-                    raise
-                return {
-                    "ok": False,
-                    "error": "invalid_reasoning_effort",
-                    "message": str(exc),
-                }
+                return _handle_schedule_refusal(
+                    exc,
+                    model_name=locked_failure_ctx["model"],
+                    system_only=bool(locked_failure_ctx["system_only"]),
+                )
             updated_row = updated or existing
             sync_failed_warning: str | None = None
             if report_profile_change is not None:
@@ -1513,6 +2328,13 @@ async def schedule_dalton_automation_helper(
             ):
                 meta["unit_id"] = str(unit["unit_id"])
             clean_meta = {k: v for k, v in meta.items() if v is not None}
+            create_llm_model = spec_llm_model if model_in_spec else None
+            clean_meta = _apply_system_only_metadata(
+                clean_meta,
+                model_in_spec=model_in_spec,
+                final_model=create_llm_model,
+                cross_user=cross_user,
+            )
             create_report_change = None
             if "report_profile" in clean_meta:
                 from src.dalton.services.report_delivery import (
@@ -1541,10 +2363,16 @@ async def schedule_dalton_automation_helper(
                         raise
                     return {"ok": False, "error": exc.code, "message": exc.message}
             create_meta = (
-                dict(create_report_change.after_metadata)
+                _apply_system_only_metadata(
+                    dict(create_report_change.after_metadata),
+                    model_in_spec=model_in_spec,
+                    final_model=create_llm_model,
+                    cross_user=cross_user,
+                )
                 if create_report_change is not None
                 else clean_meta
             )
+            create_system_only = bool(create_meta.get(_LLM_MODEL_SYSTEM_ONLY_KEY))
             resolved_scope = await resolve_automation_scope_for_write(
                 task_owner,
                 name=resolved_name,
@@ -1552,8 +2380,57 @@ async def schedule_dalton_automation_helper(
                 metadata=create_meta,
                 conn=active_conn,
             )
-            create_llm_model = spec_llm_model if model_in_spec else None
             try:
+                create_ws_row, create_resolved_computer = (
+                    await _lock_and_verify_workspace_placement(
+                        active_conn,
+                        task_owner=task_owner,
+                        locked_ws_id=ws_id,
+                        is_home=is_home_target,
+                        snapshot_computer_id=snapshot_computer_id,
+                        snapshot_available=snapshot_available,
+                    )
+                )
+                await _recheck_operator_authorization_in_tx(
+                    active_conn,
+                    effective_actor_id=effective_actor_id,
+                    task_owner=task_owner,
+                    role=role,
+                    saved_name=resolved_name,
+                    saved_metadata=create_meta,
+                    locked_ws_id=ws_id,
+                    locked_ws_row=create_ws_row,
+                    locked_row=None,
+                    is_home=is_home_target,
+                    units_on=units_on,
+                    auth_on=auth_on,
+                )
+                create_classified: tuple[str, dict[str, Any]] | None = None
+                if model_in_spec and create_llm_model is not None:
+                    create_classified = await _check_managed_automation_model(
+                        task_owner,
+                        create_llm_model,
+                        pref_for_effort,
+                        cross_user=cross_user,
+                        via_rest=via_rest,
+                    )
+                if create_resolved_computer is not _UNSET_RESOLVED_COMPUTER:
+                    await check_claude_code_hosted(
+                        task_owner,
+                        create_llm_model,
+                        ws_id,
+                        active_conn,
+                        pref_for_effort,
+                        resolved_computer=create_resolved_computer,
+                    )
+                else:
+                    await check_claude_code_hosted(
+                        task_owner,
+                        create_llm_model,
+                        ws_id,
+                        active_conn,
+                        pref_for_effort,
+                    )
                 _, create_reasoning_effort = await _reconcile_reasoning_effort(
                     task_owner,
                     target_model=create_llm_model,
@@ -1562,15 +2439,14 @@ async def schedule_dalton_automation_helper(
                     stored_effort=None,
                     is_create=True,
                     model_pref=pref_for_effort,
+                    classified=create_classified,
                 )
             except AutomationRefusal as exc:
-                if via_rest:
-                    raise
-                return {
-                    "ok": False,
-                    "error": "invalid_reasoning_effort",
-                    "message": str(exc),
-                }
+                return _handle_schedule_refusal(
+                    exc,
+                    model_name=create_llm_model,
+                    system_only=create_system_only,
+                )
             create_kw: dict[str, Any] = dict(conn_kw)
             if explicit_status and explicit_status != "active":
                 create_kw["status"] = explicit_status

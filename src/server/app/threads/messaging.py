@@ -381,6 +381,8 @@ _SERVER_ONLY_FIELDS = (
     "steer_job_id",
     "artifact_comments",
     "checked_computer_id",
+    "llm_model_system_only",  # DALTON-HOOK(cos-settings-tools)
+    "restart_from_run_id",  # DALTON-HOOK(cos-settings-tools)
 )
 
 
@@ -393,7 +395,12 @@ def _client_body(request: ChatRequest, raw_request: Request) -> ChatRequest:
     """
     if _is_service_request(raw_request):
         return request
-    cleared = {name: None for name in _SERVER_ONLY_FIELDS if getattr(request, name)}
+    # DALTON-HOOK(cos-settings-tools): reset boolean llm_model_system_only to False rather than None
+    cleared = {
+        name: (False if name == "llm_model_system_only" else None)
+        for name in _SERVER_ONLY_FIELDS
+        if getattr(request, name)
+    }
     return request.model_copy(update=cleared) if cleared else request
 
 
@@ -487,6 +494,7 @@ async def _handle_send_message(
     raw_request: Request | None = None,
     *,
     retry_of_run_id: str | None = None,
+    retry_source_execution_id: str | None = None,  # DALTON-HOOK(cos-settings-tools)
 ):
     """Shared logic for both POST /threads/messages and POST /threads/{id}/messages.
 
@@ -781,6 +789,8 @@ async def _handle_send_message(
             reasoning_effort=getattr(request, "reasoning_effort", None),
             fast_mode=getattr(request, "fast_mode", None),
             enabled_subagents=request.subagents_enabled,
+            # DALTON-HOOK(cos-settings-tools): forward execution-level system-catalog flag on server firing requests
+            **({"ignore_custom_models": True} if getattr(request, "llm_model_system_only", False) else {}),
         )
 
         # A report-back or a channel message has nobody at a client to
@@ -797,6 +807,7 @@ async def _handle_send_message(
 
         fallback_records: list[dict[str, object]] = []
         automation_run_ctx: dict[str, object] = {}
+
         config = await resolve_turn_config_with_automation_inheritance(
             user_id=user_id,
             thread_id=thread_id,
@@ -806,11 +817,20 @@ async def _handle_send_message(
             from_service=from_service,
             is_server_retry=is_server_retry,
             retry_of_run_id=retry_of_run_id,
+            # DALTON-HOOK(cos-settings-tools): forward already-read execution id from /retry so snapshot lookup failures fail closed with 503
+            **(
+                {"retry_source_execution_id": retry_source_execution_id}
+                if retry_source_execution_id
+                else {}
+            ),
             resolve=resolve,
             flagged_subscription=flagged_subscription,
             on_fallback=fallback_records.append,
             on_automation_context=automation_run_ctx.update,
         )
+        # DALTON-HOOK(cos-settings-tools): HITL resume and web /retry of an automation execution use the execution snapshot and must not stamp the composer's selected model onto the thread
+        if (request.hitl_response or retry_of_run_id) and automation_run_ctx.get("automation_source_execution_id"):
+            named_model = None
 
         # is_byok is True only when the stamped credential_source confirms the user
         # supplied their own key (OAUTH or BYOK), not merely that a client object exists.
@@ -2007,6 +2027,14 @@ async def retry_thread(
                 status_code=404, detail=f"Thread {thread_id} has no runs to retry"
             )
         latest_run_id = str(latest["conversation_response_id"])
+        # DALTON-HOOK(cos-settings-tools): capture linked execution id from the already-read latest attempt so /retry fails closed if snapshot lookup later fails
+        from src.dalton.services.automation_thread_model import (
+            _extract_execution_id_from_metadata,
+        )
+
+        retry_source_execution_id = _extract_execution_id_from_metadata(
+            latest.get("metadata")
+        )
         if access.is_shared:
             await refuse_others_retry(latest_run_id, auth.user_id)
         if body and body.run_id and body.run_id != latest_run_id:
@@ -2088,8 +2116,18 @@ async def retry_thread(
         request = request.model_copy(update={"checked_computer_id": checked})
     # Retry provenance travels as a route-internal parameter, never in the
     # body.
+    # DALTON-HOOK(cos-settings-tools): forward linked execution id when present so /retry fails closed on snapshot lookup error
     return await _handle_send_message(
-        request, auth, thread_id, raw_request, retry_of_run_id=latest_run_id
+        request,
+        auth,
+        thread_id,
+        raw_request,
+        retry_of_run_id=latest_run_id,
+        **(
+            {"retry_source_execution_id": retry_source_execution_id}
+            if retry_source_execution_id
+            else {}
+        ),
     )
 
 
