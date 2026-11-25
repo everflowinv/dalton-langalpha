@@ -412,7 +412,10 @@ async def test_update_workspace_name(ws_mock_db, mock_cursor):
     from src.server.database.workspace import update_workspace
 
     row = _workspace_row(name="Renamed")
-    mock_cursor.fetchone.return_value = row
+    # DALTON-HOOK(cos-settings-tools): the rename guard reads the current owner and name first,
+    # then the live sibling names, before the UPDATE.
+    mock_cursor.fetchone.side_effect = [_workspace_row(name="Old name"), row]
+    mock_cursor.fetchall.return_value = []
 
     result = await update_workspace("ws-1", name="Renamed")
 
