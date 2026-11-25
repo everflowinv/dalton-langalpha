@@ -231,10 +231,18 @@ class PricingResolver:
             access_type = provider_info.get("access_type", "api_key")
             # DALTON-HOOK(notional-pricing): use the stamped cash card for custom
             # API-key routes; coding subscriptions retain their nominal accounting.
+            # DALTON-HOOK(team-model-catalog): subscription catalog variants (billing="subscription")
+            # and subscription pricing markers keep nominal accounting too.
+            card_resolved = self.card_for(record)[0]
             if (
                 access_type not in ("oauth", "coding_plan")
                 and stamped_provider != "z-ai-cn-coding"
-                and self.card_for(record)[0] is not None
+                and provider_info.get("billing") != "subscription"
+                and card_resolved is not None
+                and not (
+                    isinstance(card_resolved, dict)
+                    and card_resolved.get("pricing_type") == "subscription"
+                )
             ):
                 is_sub = False
         notional_card: Optional[Dict[str, Any]] = None

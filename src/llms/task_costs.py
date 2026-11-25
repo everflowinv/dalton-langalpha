@@ -203,14 +203,15 @@ def _active_task_costs() -> Optional[TaskCosts]:
     return _shipped()
 
 
-def task_cost_baseline() -> Optional[dict[str, str]]:
+def task_cost_baseline(costs: Optional[TaskCosts] = None) -> Optional[dict[str, str]]:
     """The model and level every relative figure is a multiple of, or None.
 
     ``{"model": <manifest key>, "effort": <level>}`` from the shipped file,
     present only when its figures are usable, so the baseline and the figures
     never disagree about whether there are any.
     """
-    shipped = _active_task_costs()
+    # DALTON-HOOK(team-model-catalog): honor explicitly passed compiled TaskCosts instead of re-reading live catalog
+    shipped = costs if costs is not None else _active_task_costs()
     return dict(shipped.baseline) if shipped is not None else None
 
 

@@ -7,7 +7,7 @@ import re
 from collections.abc import Mapping
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from src.dalton.capabilities import CapabilityId, has_capability
 from src.dalton.credentials import (
@@ -177,6 +177,15 @@ class ModelRetireInput(BaseModel):
     clear_subagent_model: bool = False
     expected_revision: int | None = None
     comment: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="after")
+    def _reject_conflicting_subagent_options(self) -> "ModelRetireInput":
+        if self.clear_subagent_model and self.successor_model and self.successor_model.strip():
+            raise CatalogValidationError(
+                "conflicting_retire_options",
+                "clear_subagent_model=true cannot be combined with successor_model.",
+            )
+        return self
 
 
 class ModelRestoreInput(BaseModel):
@@ -372,6 +381,25 @@ def validate_provider_variant_input(
     return cleaned_url, canonical_bound
 
 
+def _pricing_card_has_nonzero_rate(card: Mapping[str, Any]) -> bool:
+    for field_name in ("input", "output", "cached_input", "cache_read", "cache_5m", "cache_1h"):
+        val = card.get(field_name)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and float(val) > 0.0:
+            return True
+    for tiers_key in ("input_tiers", "output_tiers"):
+        tiers = card.get(tiers_key)
+        if not isinstance(tiers, list):
+            continue
+        for tier in tiers:
+            if not isinstance(tier, Mapping):
+                continue
+            for tf in ("rate", "cached_input", "cache_read"):
+                val = tier.get(tf)
+                if isinstance(val, (int, float)) and not isinstance(val, bool) and float(val) > 0.0:
+                    return True
+    return False
+
+
 def validate_model_fields(
     *,
     model_key: str,
@@ -379,6 +407,7 @@ def validate_model_fields(
     pricing_card: Mapping[str, Any] | None,
     dalton_meta_entry: Mapping[str, Any] | None,
     provider_info: Mapping[str, Any],
+    pricing_explicit: bool = False,
 ) -> None:
     """Validate naming, numeric bounds, ratings, modalities, and reasoning surface for one model."""
     if not _MODEL_KEY_RE.match(model_key):
@@ -456,17 +485,30 @@ def validate_model_fields(
             raise CatalogValidationError("invalid_reasoning_surface", str(exc)) from exc
 
     # Pricing numbers & billing consistency
-    billing = str(
-        (dalton_meta_entry or {}).get("billing")
-        or provider_info.get("billing")
-        or (
-            "subscription"
-            if _is_oauth_model_key(provider.lower()) or provider == "z-ai-cn-coding"
-            else "cash"
+    prov_billing = str(provider_info.get("billing") or "").strip().lower()
+    meta_billing = str((dalton_meta_entry or {}).get("billing") or "").strip().lower()
+    if prov_billing == "subscription" and meta_billing == "cash":
+        raise CatalogValidationError(
+            "invalid_billing",
+            f"Model {model_key!r} on subscription provider {provider!r} cannot override billing to 'cash'.",
         )
+    is_subscription_route = (
+        prov_billing == "subscription"
+        or meta_billing == "subscription"
+        or _is_oauth_model_key(provider.lower())
+        or provider == "z-ai-cn-coding"
     )
+    billing = "subscription" if is_subscription_route else "cash"
     if pricing_card is not None:
         validate_pricing_card_numbers(pricing_card, f"pricing.{model_key}")
+        if is_subscription_route and (
+            pricing_explicit or _pricing_card_has_nonzero_rate(pricing_card)
+        ):
+            raise CatalogValidationError(
+                "subscription_cash_pricing_forbidden",
+                f"Subscription-billed model {model_key!r} cannot configure cash pricing rates; "
+                "use dalton_meta.notional_pricing instead.",
+            )
     elif billing == "cash":
         raise CatalogValidationError(
             "missing_cash_pricing",

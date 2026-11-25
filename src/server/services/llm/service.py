@@ -57,9 +57,10 @@ class LLMService:
         self, model_name: str, *, reasoning_effort: str | None = None
     ) -> Any:
         """DALTON-HOOK(team-model-catalog): resolve catalog-defined variants asynchronously via bound credentials."""
+        from src.dalton.services.team_model_catalog.snapshot import overlay_model_config_with_snapshot
         from src.llms.llm import LLM as LLMFactory
 
-        mc = LLMFactory.get_model_config()
+        mc = overlay_model_config_with_snapshot(LLMFactory.get_model_config())
         m_cfg = mc.get_model_config(model_name)
         prov = str(m_cfg.get("provider") or "") if isinstance(m_cfg, dict) else ""
         if prov and mc.get_provider_info(prov).get("catalog_defined"):
@@ -67,7 +68,7 @@ class LLMService:
                 resolve_catalog_variant_binding_async,
             )
 
-            binding = await resolve_catalog_variant_binding_async(prov)
+            binding = await resolve_catalog_variant_binding_async(prov, model_key=model_name)
             return create_llm(
                 model_name,
                 api_key=binding["api_key"],

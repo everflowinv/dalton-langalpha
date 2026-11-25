@@ -12,19 +12,10 @@ def _base_url(info: dict) -> str | None:
     return (info.get("base_url") or "").replace("{HOST_IP}", HOST_IP) or None
 
 
-@functools.lru_cache(maxsize=1)
-def provider_catalog() -> list[dict]:
-    """Wizard-visible providers.
-
-    A provider is wizard-visible if it has no parent_provider (a root brand),
-    or its access_type differs from its parent's. Region variants (same
-    access_type, different region) are attached as ``region_variants`` on the
-    parent's entry so the wizard can show an inline region toggle.
-    """
+def build_provider_catalog(config) -> list[dict]:
+    """DALTON-HOOK(team-model-catalog): build wizard-visible provider catalog from a pinned ModelConfig."""
     from src.config.settings import HOST_MODE
-    from src.llms.llm import LLM
 
-    config = LLM.get_model_config()
     flat = config.flat_providers
 
     # Another API of a connection, saved under by a model served on it.
@@ -104,6 +95,33 @@ def provider_catalog() -> list[dict]:
 
 
 @functools.lru_cache(maxsize=1)
+def provider_catalog() -> list[dict]:
+    """Wizard-visible providers.
+
+    A provider is wizard-visible if it has no parent_provider (a root brand),
+    or its access_type differs from its parent's. Region variants (same
+    access_type, different region) are attached as ``region_variants`` on the
+    parent's entry so the wizard can show an inline region toggle.
+    """
+    from src.llms.llm import LLM
+
+    return build_provider_catalog(LLM.get_model_config())
+
+
+def build_key_candidates(mc) -> dict[str, dict]:
+    """DALTON-HOOK(team-model-catalog): build key_candidates map from a pinned ModelConfig."""
+    from src.server.services.llm.byok import byok_candidates
+
+    out = {}
+    for key, info in mc.flat_providers.items():
+        if info.get("platform") or info.get("access_type") == "oauth":
+            continue
+        slugs = byok_candidates(key, mc)
+        out[key] = {"slugs": slugs, "shared": [s for s in slugs if mc.shares_api_key(key, s)]}
+    return out
+
+
+@functools.lru_cache(maxsize=1)
 def key_candidates() -> dict[str, dict]:
     """Where a turn looks for each provider's stored key, so the client can
     tell which saved models the user's own keys serve without re-deriving the
@@ -112,13 +130,5 @@ def key_candidates() -> dict[str, dict]:
     serves it only when saved with a base URL; a custom model takes any.
     """
     from src.llms.llm import LLM
-    from src.server.services.llm.byok import byok_candidates
 
-    mc = LLM.get_model_config()
-    out = {}
-    for key, info in mc.flat_providers.items():
-        if info.get("platform") or info.get("access_type") == "oauth":
-            continue
-        slugs = byok_candidates(key, mc)
-        out[key] = {"slugs": slugs, "shared": [s for s in slugs if mc.shares_api_key(key, s)]}
-    return out
+    return build_key_candidates(LLM.get_model_config())

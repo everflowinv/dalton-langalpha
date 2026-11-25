@@ -20,6 +20,7 @@ shift an in-flight turn's rates, capabilities, or credential binding check.
 from __future__ import annotations
 
 import copy
+import json
 import logging
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from contextlib import aclosing, contextmanager, suppress
@@ -30,6 +31,7 @@ from src.dalton.llm.egress_policy import canonical_url_key
 from src.dalton.services.team_model_catalog.constants import (
     TURN_SNAPSHOT_SCHEMA,
     norm_id,
+    normalize_cash_pricing_card,
 )
 
 logger = logging.getLogger(__name__)
@@ -127,8 +129,70 @@ async def load_run_catalog_snapshot(
     return await ensure_run_catalog_snapshot(dict(row), is_subagent=is_subagent, conn=conn)
 
 
+_SNAPSHOT_PROVIDER_INFO_KEYS = (
+    "sdk",
+    "access_type",
+    "billing",
+    "base_url",
+    "use_response_api",
+    "use_previous_response_id",
+    "prompt_cache_key",
+    "default_headers",
+    "session_header",
+    "parent_provider",
+    "catalog_defined",
+    "own_api_key",
+    "env_key",
+)
+
+
+def serialize_catalog_snapshot(snapshot: Mapping[str, Any]) -> str:
+    """Serialize ``snapshot`` with the shared PG-safe JSON encoder (identical across first-write and backfill)."""
+    from src.server.utils.pg_sanitize import _safe_dumps
+
+    return _safe_dumps(snapshot)
+
+
 def _identity_key(provider: str | None, model_id: str | None) -> str:
+    """Lossless JSON-safe identity key for ``(provider.lower(), norm_id(model_id))`` (no NUL bytes)."""
+    return json.dumps(
+        [str(provider or "").strip().lower(), norm_id(model_id)],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def _legacy_nul_identity_key(provider: str | None, model_id: str | None) -> str:
     return f"{str(provider or '').strip().lower()}\0{norm_id(model_id)}"
+
+
+def _legacy_stripped_identity_key(provider: str | None, model_id: str | None) -> str:
+    return f"{str(provider or '').strip().lower()}{norm_id(model_id)}"
+
+
+def _snapshot_provider_info_subset(
+    prov_info: Mapping[str, Any] | None,
+    *,
+    is_catalog_variant: bool,
+    bound_base_url: str | None = None,
+) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if isinstance(prov_info, Mapping):
+        for k in _SNAPSHOT_PROVIDER_INFO_KEYS:
+            if is_catalog_variant and k == "env_key":
+                continue
+            val = prov_info.get(k)
+            if val is not None:
+                out[k] = copy.deepcopy(val)
+    if is_catalog_variant:
+        out["catalog_defined"] = True
+        out["own_api_key"] = True
+        out.pop("env_key", None)
+        out.pop("models_url", None)
+        out.pop("platform", None)
+        if bound_base_url:
+            out["base_url"] = bound_base_url
+    return out
 
 
 def _extract_cash_pricing_card(
@@ -157,14 +221,16 @@ def _extract_cash_pricing_card(
             cid = str(card.get("id") or "")
             if cid.lower() == model_id.lower() or norm_id(cid) == target_norm:
                 pricing = card.get("pricing")
-                return copy.deepcopy(dict(pricing)) if isinstance(pricing, Mapping) else None
+                return normalize_cash_pricing_card(pricing) if isinstance(pricing, Mapping) else None
             aliases = card.get("alias") or []
             if isinstance(aliases, list):
                 for alias in aliases:
                     if str(alias).lower() == model_id.lower() or norm_id(str(alias)) == target_norm:
                         pricing = card.get("pricing")
                         return (
-                            copy.deepcopy(dict(pricing)) if isinstance(pricing, Mapping) else None
+                            normalize_cash_pricing_card(pricing)
+                            if isinstance(pricing, Mapping)
+                            else None
                         )
     return None
 
@@ -211,15 +277,13 @@ def build_effective_catalog_snapshot(
         is_catalog_variant = bool(prov_info.get("catalog_defined"))
 
         meta_entry = meta_map.get(key) if isinstance(meta_map.get(key), Mapping) else {}
-        billing = str(
-            (meta_entry or {}).get("billing")
-            or prov_info.get("billing")
-            or (
-                "subscription"
-                if _is_oauth_model_key(provider.lower()) or provider == "z-ai-cn-coding"
-                else "cash"
-            )
+        is_sub = (
+            str(prov_info.get("billing") or "").strip().lower() == "subscription"
+            or str((meta_entry or {}).get("billing") or "").strip().lower() == "subscription"
+            or _is_oauth_model_key(provider.lower())
+            or provider == "z-ai-cn-coding"
         )
+        billing = "subscription" if is_sub else "cash"
         cash_card = (
             None
             if billing == "subscription"
@@ -237,6 +301,14 @@ def build_effective_catalog_snapshot(
             modalities = ["text"]
 
         params = entry.get("parameters") if isinstance(entry.get("parameters"), Mapping) else {}
+        extra_body = (
+            entry.get("extra_body") if isinstance(entry.get("extra_body"), Mapping) else {}
+        )
+        additional_betas = (
+            list(entry.get("additional_betas"))
+            if isinstance(entry.get("additional_betas"), list)
+            else []
+        )
         max_output = params.get("max_tokens") or params.get("max_output_tokens")
 
         bound_base_url: str | None = None
@@ -252,11 +324,19 @@ def build_effective_catalog_snapshot(
                 )
             if cred and cred.get("key_fingerprint"):
                 key_fingerprint = str(cred["key_fingerprint"])
+
+        snap_prov_info = _snapshot_provider_info_subset(
+            prov_info,
+            is_catalog_variant=is_catalog_variant,
+            bound_base_url=bound_base_url,
+        )
+        if is_catalog_variant:
             variants_out[provider] = {
                 "provider_slug": provider,
                 "bound_base_url": bound_base_url,
                 "canonical_bound_url": canonical_bound,
                 "key_fingerprint": key_fingerprint,
+                "provider_info": copy.deepcopy(snap_prov_info),
             }
 
         snap_entry: dict[str, Any] = {
@@ -270,11 +350,20 @@ def build_effective_catalog_snapshot(
             "context": entry.get("context"),
             "max_output": max_output,
             "compaction_profile": entry.get("compaction_profile"),
+            "parameters": copy.deepcopy(dict(params)),
+            "extra_body": copy.deepcopy(dict(extra_body)),
             "reasoning": copy.deepcopy(entry.get("reasoning"))
             if isinstance(entry.get("reasoning"), Mapping)
             else None,
             "catalog_defined": is_catalog_variant,
+            "provider_info": snap_prov_info,
         }
+        if additional_betas:
+            snap_entry["additional_betas"] = additional_betas
+        if entry.get("system_provider") is not None:
+            snap_entry["system_provider"] = entry.get("system_provider")
+        if entry.get("use_response_api") is not None:
+            snap_entry["use_response_api"] = entry.get("use_response_api")
         if is_catalog_variant:
             snap_entry["bound_base_url"] = bound_base_url
             snap_entry["canonical_bound_url"] = canonical_bound
@@ -300,6 +389,24 @@ def build_effective_catalog_snapshot(
     }
 
 
+def _entry_matches_request(
+    entry: Mapping[str, Any],
+    *,
+    provider: str | None = None,
+    model_id: str | None = None,
+) -> bool:
+    """Verify ``entry`` matches the actual requested ``provider`` and ``model_id`` when specified."""
+    if provider:
+        entry_prov = str(entry.get("provider") or "").strip().lower()
+        if entry_prov != provider.strip().lower():
+            return False
+    if model_id:
+        entry_mid = norm_id(str(entry.get("model_id") or ""))
+        if entry_mid != norm_id(model_id):
+            return False
+    return True
+
+
 def _find_snapshot_entry(
     snapshot: Mapping[str, Any] | None,
     *,
@@ -310,28 +417,235 @@ def _find_snapshot_entry(
     if not isinstance(snapshot, Mapping):
         return None
     by_identity = snapshot.get("by_identity")
-    if provider and (model_id or model_name) and isinstance(by_identity, Mapping):
-        hit = by_identity.get(_identity_key(provider, model_id or model_name))
-        if isinstance(hit, Mapping):
-            return hit
+    want_id = model_id or model_name
+    if provider and want_id and isinstance(by_identity, Mapping):
+        for key_candidate in (
+            _identity_key(provider, want_id),
+            _legacy_nul_identity_key(provider, want_id),
+            _legacy_stripped_identity_key(provider, want_id),
+        ):
+            hit = by_identity.get(key_candidate)
+            if isinstance(hit, Mapping) and _entry_matches_request(
+                hit, provider=provider, model_id=want_id
+            ):
+                return hit
     models = snapshot.get("models")
     if isinstance(models, Mapping):
         if model_name and isinstance(models.get(model_name), Mapping):
-            return models[model_name]
+            cand = models[model_name]
+            if _entry_matches_request(cand, provider=provider, model_id=model_id):
+                return cand
         if model_id and isinstance(models.get(model_id), Mapping):
-            return models[model_id]
-        if provider and (model_id or model_name):
-            want_prov = provider.strip().lower()
-            want_norm = norm_id(model_id or model_name)
+            cand = models[model_id]
+            if _entry_matches_request(cand, provider=provider, model_id=model_id):
+                return cand
+        if provider and want_id:
             for item in models.values():
-                if not isinstance(item, Mapping):
-                    continue
-                if (
-                    str(item.get("provider") or "").strip().lower() == want_prov
-                    and norm_id(str(item.get("model_id") or "")) == want_norm
+                if isinstance(item, Mapping) and _entry_matches_request(
+                    item, provider=provider, model_id=want_id
                 ):
                     return item
     return None
+
+
+def lookup_snapshot_model_entry(
+    model_key: str,
+    *,
+    snapshot: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Return the persisted model snapshot entry for ``model_key``, or ``None`` if absent."""
+    snap = snapshot if snapshot is not None else get_active_catalog_snapshot()
+    if not isinstance(snap, Mapping):
+        return None
+    models = snap.get("models")
+    if isinstance(models, Mapping):
+        hit = models.get(model_key)
+        if isinstance(hit, Mapping):
+            return copy.deepcopy(dict(hit))
+    return None
+
+
+class SnapshotModelConfig:
+    """Read-only ``ModelConfig`` overlay honoring persisted turn/resume ``effective_catalog_snapshot``.
+
+    Ensures client construction, credential-route selection, and multimodal capability
+    checks during an active or resumed turn follow the snapshotted provider, model_id,
+    request parameters, and catalog variant metadata rather than drifting to live catalog
+    edits. Never mutates the underlying process-wide ``ModelConfig``.
+    """
+
+    def __init__(self, base: Any, snapshot: Mapping[str, Any]) -> None:
+        self._base = base
+        self._snapshot = snapshot
+
+    def _snap_model_entry(self, model_name: str) -> dict[str, Any] | None:
+        models = self._snapshot.get("models")
+        if not isinstance(models, Mapping):
+            return None
+        raw = models.get(model_name)
+        if not isinstance(raw, Mapping):
+            return None
+        snap_provider = str(raw.get("provider") or "").strip()
+        snap_model_id = str(raw.get("model_id") or model_name).strip()
+        live_entry = self._base.get_model_config(model_name)
+        same_live_route = (
+            isinstance(live_entry, Mapping)
+            and str(live_entry.get("provider") or "").strip() == snap_provider
+        )
+        out: dict[str, Any] = copy.deepcopy(dict(live_entry)) if same_live_route else {}
+        out["provider"] = snap_provider
+        out["model_id"] = snap_model_id
+        if "parameters" in raw and isinstance(raw.get("parameters"), Mapping):
+            out["parameters"] = copy.deepcopy(dict(raw["parameters"]))
+        elif not same_live_route:
+            out["parameters"] = {}
+        if "extra_body" in raw and isinstance(raw.get("extra_body"), Mapping):
+            out["extra_body"] = copy.deepcopy(dict(raw["extra_body"]))
+        elif not same_live_route:
+            out["extra_body"] = {}
+        if "additional_betas" in raw and isinstance(raw.get("additional_betas"), list):
+            out["additional_betas"] = list(raw["additional_betas"])
+        elif not same_live_route:
+            out.pop("additional_betas", None)
+        if "system_provider" in raw:
+            out["system_provider"] = raw.get("system_provider")
+        elif not same_live_route:
+            out.pop("system_provider", None)
+        if "use_response_api" in raw:
+            out["use_response_api"] = raw.get("use_response_api")
+        elif not same_live_route:
+            out.pop("use_response_api", None)
+        if raw.get("reasoning") is not None:
+            out["reasoning"] = copy.deepcopy(raw["reasoning"])
+        elif "reasoning" in raw:
+            out.pop("reasoning", None)
+        if raw.get("context") is not None:
+            out["context"] = raw["context"]
+        if isinstance(raw.get("input_modalities"), list) and raw["input_modalities"]:
+            out["input_modalities"] = list(raw["input_modalities"])
+        if raw.get("compaction_profile") is not None:
+            out["compaction_profile"] = raw["compaction_profile"]
+        return out
+
+    def _snap_provider_overlay(self, provider: str) -> dict[str, Any] | None:
+        prov = str(provider or "").strip()
+        if not prov:
+            return None
+        variants = self._snapshot.get("variants")
+        if isinstance(variants, Mapping):
+            v_entry = variants.get(prov)
+            if isinstance(v_entry, Mapping):
+                pinfo = (
+                    copy.deepcopy(dict(v_entry["provider_info"]))
+                    if isinstance(v_entry.get("provider_info"), Mapping)
+                    else {}
+                )
+                pinfo["catalog_defined"] = True
+                pinfo["own_api_key"] = True
+                pinfo.pop("env_key", None)
+                pinfo.pop("models_url", None)
+                pinfo.pop("platform", None)
+                if v_entry.get("bound_base_url"):
+                    pinfo["base_url"] = str(v_entry["bound_base_url"])
+                return pinfo
+        models = self._snapshot.get("models")
+        if isinstance(models, Mapping):
+            for m_entry in models.values():
+                if not isinstance(m_entry, Mapping):
+                    continue
+                if str(m_entry.get("provider") or "").strip() != prov:
+                    continue
+                pinfo = (
+                    copy.deepcopy(dict(m_entry["provider_info"]))
+                    if isinstance(m_entry.get("provider_info"), Mapping)
+                    else {}
+                )
+                if m_entry.get("catalog_defined"):
+                    pinfo["catalog_defined"] = True
+                    pinfo["own_api_key"] = True
+                    pinfo.pop("env_key", None)
+                    pinfo.pop("models_url", None)
+                    pinfo.pop("platform", None)
+                    if m_entry.get("bound_base_url"):
+                        pinfo["base_url"] = str(m_entry["bound_base_url"])
+                return pinfo or None
+        return None
+
+    def get_model_config(self, model_id: str) -> dict[str, Any] | None:
+        snap_entry = self._snap_model_entry(model_id)
+        if snap_entry is not None:
+            return snap_entry
+        return self._base.get_model_config(model_id)
+
+    def get_provider_info(self, provider: str) -> dict[str, Any]:
+        live_info = self._base.get_provider_info(provider)
+        overlay = self._snap_provider_overlay(provider)
+        if overlay is None:
+            return live_info
+        merged = copy.deepcopy(dict(live_info)) if isinstance(live_info, Mapping) else {}
+        merged.update(overlay)
+        if overlay.get("catalog_defined"):
+            merged.pop("env_key", None)
+            merged.pop("models_url", None)
+            merged.pop("platform", None)
+        return merged
+
+    def get_parent_provider(self, provider: str) -> str:
+        info = self.get_provider_info(provider)
+        return str(info.get("parent_provider", provider))
+
+    def get_input_modalities(self, model_name: str) -> list[str]:
+        entry = self.get_model_config(model_name)
+        if not entry:
+            return ["text"]
+        return list(entry.get("input_modalities") or ["text"])
+
+    @property
+    def llm_config(self) -> dict[str, Any]:
+        merged = dict(getattr(self._base, "llm_config", None) or {})
+        models = self._snapshot.get("models")
+        if isinstance(models, Mapping):
+            for key in models:
+                snap_entry = self._snap_model_entry(str(key))
+                if snap_entry is not None:
+                    merged[str(key)] = snap_entry
+        return merged
+
+    @property
+    def flat_providers(self) -> dict[str, Any]:
+        merged = dict(getattr(self._base, "flat_providers", None) or {})
+        seen: set[str] = set()
+        variants = self._snapshot.get("variants")
+        if isinstance(variants, Mapping):
+            seen.update(str(k) for k in variants)
+        models = self._snapshot.get("models")
+        if isinstance(models, Mapping):
+            for item in models.values():
+                if isinstance(item, Mapping) and item.get("provider"):
+                    seen.add(str(item["provider"]))
+        for prov in seen:
+            info = self.get_provider_info(prov)
+            if info:
+                merged[prov] = info
+        return merged
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._base, name)
+
+
+def overlay_model_config_with_snapshot(
+    live_mc: Any,
+    snapshot: Mapping[str, Any] | None = None,
+) -> Any:
+    """Return a snapshot-overlaid ``ModelConfig`` view when an active snapshot is bound."""
+    snap = snapshot if snapshot is not None else get_active_catalog_snapshot()
+    if not isinstance(snap, Mapping) or not isinstance(snap.get("models"), Mapping) or not snap["models"]:
+        return live_mc
+    if isinstance(live_mc, SnapshotModelConfig):
+        if live_mc._snapshot is snap:
+            return live_mc
+        live_mc = live_mc._base
+    return SnapshotModelConfig(live_mc, snap)
 
 
 def lookup_snapshot_pricing(
@@ -346,10 +660,10 @@ def lookup_snapshot_pricing(
     entry = _find_snapshot_entry(snap, model_name=model_name, provider=provider, model_id=model_id)
     if entry is None:
         return False, None
-    if str(entry.get("billing") or "") == "subscription" and not entry.get("pricing"):
+    if str(entry.get("billing") or "").strip().lower() == "subscription":
         return True, {"pricing_type": "subscription"}
     pricing = entry.get("pricing")
-    return True, (copy.deepcopy(dict(pricing)) if isinstance(pricing, Mapping) else None)
+    return True, (normalize_cash_pricing_card(pricing) if isinstance(pricing, Mapping) else None)
 
 
 def lookup_snapshot_notional(

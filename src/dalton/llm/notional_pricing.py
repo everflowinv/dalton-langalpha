@@ -488,10 +488,13 @@ def is_subscription_model(
         return True
     if pricing_model_id and pricing_model_id.endswith("-oauth"):
         return True
-    if pricing_provider and (
-        pricing_provider == "z-ai-cn-coding" or pricing_provider.endswith("-oauth")
-    ):
-        return True
+    if pricing_provider:
+        if pricing_provider == "z-ai-cn-coding" or pricing_provider.endswith("-oauth"):
+            return True
+        from src.llms.pricing_utils import is_subscription_provider
+
+        if is_subscription_provider(provider=pricing_provider):
+            return True
 
     dalton_meta = _overlay_mod.load_dalton_meta() or {}
     for candidate in (model_name, pricing_model_id):

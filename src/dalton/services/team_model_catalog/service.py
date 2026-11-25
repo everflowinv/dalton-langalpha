@@ -50,6 +50,7 @@ from src.dalton.services.team_model_catalog.constants import (
     CatalogValidationError,
     empty_catalog_payload,
     norm_id,
+    normalize_cash_pricing_card,
 )
 from src.dalton.services.team_model_catalog.follow import (
     invalidate_catalog_redis_caches,
@@ -696,10 +697,11 @@ def _build_pricing_card_dict(
         meta_fields.update(data.pricing_meta.model_dump(exclude_none=True))
     if meta_fields.get("source_kind") == "estimated" and "estimated" not in meta_fields:
         meta_fields["estimated"] = True
+    normalized_pricing = normalize_cash_pricing_card(raw_pricing) or {}
     card: dict[str, Any] = {
         "id": model_id,
         "name": display_name,
-        "pricing": raw_pricing,
+        "pricing": normalized_pricing,
     }
     if data.alias:
         card["alias"] = list(data.alias)
@@ -794,6 +796,7 @@ async def create_catalog_model(
                 pricing_card=pricing_dict,
                 dalton_meta_entry=dm_entry,
                 provider_info=prov_info,
+                pricing_explicit=(data.pricing is not None),
             )
 
             next_payload = copy.deepcopy(row["payload"])
@@ -933,6 +936,7 @@ async def update_catalog_model(
                 pricing_card=pricing_for_check,
                 dalton_meta_entry=merged_meta,
                 provider_info=prov_info,
+                pricing_explicit=(data.pricing is not None),
             )
 
             next_payload = copy.deepcopy(row["payload"])
@@ -952,7 +956,7 @@ async def update_catalog_model(
                     for mf in ("source_kind", "estimated", "source", "source_url", "verified_at", "note"):
                         if mf in raw_p:
                             pm_extra[mf] = raw_p.pop(mf)
-                    card_patch["pricing"] = raw_p
+                    card_patch["pricing"] = normalize_cash_pricing_card(raw_p) or {}
                     if pm_extra:
                         card_patch["pricing_meta"] = pm_extra
                 if data.pricing_meta is not None:
@@ -1125,6 +1129,11 @@ async def restore_factory_default_model(
                 last_known_legacy_retired=row["last_known_legacy_retired"],
             )
             factory_entry = factory_compiled.model_config.get_model_config(key)
+            if factory_entry is None:
+                raise CatalogValidationError(
+                    "not_a_factory_model",
+                    f"Model {key!r} has no factory default definition and cannot be restored to factory default.",
+                )
             cur_entry = cur_compiled.model_config.get_model_config(key)
 
             candidate_providers: set[str] = set()
@@ -1460,10 +1469,21 @@ async def _validate_and_replace_references_in_tx(
             extra={"bundled_plugin_subagents": refs["bundled_plugin_subagents"]},
         )
 
+    successor = (
+        str(successor_model).strip()
+        if successor_model is not None and str(successor_model).strip()
+        else None
+    )
+    if clear_subagent_model and successor:
+        raise CatalogValidationError(
+            "conflicting_retire_options",
+            "clear_subagent_model=true cannot be combined with successor_model.",
+        )
+
     need_automation_replace = bool(refs["automations"])
     need_subagent_replace = bool(refs["user_subagents"] or refs["plugin_subagents"])
 
-    if (need_automation_replace or (need_subagent_replace and not clear_subagent_model)) and not successor_model:
+    if (need_automation_replace or (need_subagent_replace and not clear_subagent_model)) and not successor:
         raise CatalogConflictError(
             "model_in_use",
             f"Model {retired_key!r} is still referenced by active automations or subagents; "
@@ -1479,7 +1499,6 @@ async def _validate_and_replace_references_in_tx(
             },
         )
 
-    successor = str(successor_model).strip() if successor_model else None
     if successor:
         if successor == retired_key:
             raise CatalogValidationError(
@@ -1490,6 +1509,16 @@ async def _validate_and_replace_references_in_tx(
                 "invalid_successor",
                 f"successor_model {successor!r} is not active in the target catalog.",
             )
+
+    # Single shared replacement plan used by BOTH owner validation and transactional writes.
+    subagent_target_model: str | None = None if clear_subagent_model else successor
+    replace_automations_with_successor = bool(successor and refs["automations"])
+    replace_subagents_with_successor = bool(
+        subagent_target_model and (refs["user_subagents"] or refs["plugin_subagents"])
+    )
+    replace_user_prefs_with_successor = bool(
+        migrate_user_defaults and successor and refs["user_preferences"]
+    )
 
     from src.llms.model_spec import clamp_reasoning_effort, reasoning_block
     from src.server.database import automation as auto_db
@@ -1504,7 +1533,7 @@ async def _validate_and_replace_references_in_tx(
     # Canonical lock order (strictly AFTER catalog exclusive lock, matching automation.py):
     #   1. user_preferences (sorted user_id) -> 2. automations (sorted user_id, automation_id) -> 3. user_subagents (sorted user_id)
     pref_lock_users: set[str] = {str(a["user_id"]) for a in refs["automations"]}
-    if migrate_user_defaults and successor:
+    if replace_user_prefs_with_successor:
         pref_lock_users.update(str(u["user_id"]) for u in refs["user_preferences"])
 
     locked_prefs: dict[str, dict[str, Any]] = {}
@@ -1515,11 +1544,13 @@ async def _validate_and_replace_references_in_tx(
 
     # Per-owner account model policy & credential availability check for successor_model
     if successor:
-        owners_receiving_successor: set[str] = {str(a["user_id"]) for a in refs["automations"]}
-        if not clear_subagent_model:
+        owners_receiving_successor: set[str] = set()
+        if replace_automations_with_successor:
+            owners_receiving_successor.update(str(a["user_id"]) for a in refs["automations"])
+        if replace_subagents_with_successor:
             owners_receiving_successor.update(str(r["user_id"]) for r in refs["user_subagents"])
             owners_receiving_successor.update(str(r["user_id"]) for r in refs["plugin_subagents"])
-        if migrate_user_defaults:
+        if replace_user_prefs_with_successor:
             owners_receiving_successor.update(str(u["user_id"]) for u in refs["user_preferences"])
         for uid in sorted(owners_receiving_successor):
             await _validate_successor_for_owner(
@@ -1531,7 +1562,7 @@ async def _validate_and_replace_references_in_tx(
             )
 
     # 1. Optional one-click migration of user_preferences default slots (FIRST, while user_preferences is locked, BEFORE automations)
-    if migrate_user_defaults and successor and refs["user_preferences"]:
+    if replace_user_prefs_with_successor:
         successor_entry = post_compiled.model_config.get_model_config(successor) or {}
         rb = reasoning_block(successor_entry)
         efforts = rb.get("efforts") or []
@@ -1669,12 +1700,12 @@ async def _validate_and_replace_references_in_tx(
 
     for us in refs["user_subagents"]:
         new_fields = copy.deepcopy(us["fields"])
-        if clear_subagent_model and not successor:
+        if subagent_target_model is None:
             new_fields.pop("model", None)
             after_model = None
         else:
-            new_fields["model"] = successor
-            after_model = successor
+            new_fields["model"] = subagent_target_model
+            after_model = subagent_target_model
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
@@ -1701,12 +1732,12 @@ async def _validate_and_replace_references_in_tx(
 
     for ps in refs["plugin_subagents"]:
         new_fields = copy.deepcopy(ps["fields"])
-        if clear_subagent_model and not successor:
+        if subagent_target_model is None:
             new_fields.pop("model", None)
             after_model = None
         else:
-            new_fields["model"] = successor
-            after_model = successor
+            new_fields["model"] = subagent_target_model
+            after_model = subagent_target_model
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
@@ -2014,14 +2045,16 @@ def resolve_chained_side_effect_target(
     current_value: Mapping[str, Any] | None = None,
     version_kind: str = "config_version",
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Resolve the single atomic restoration target across a contiguous chain ``[e_k, ..., e_1]``.
+    """Resolve the atomic restoration target across a contiguous chain ``[e_k, ..., e_1]``.
 
     - If ``current_version != e_k.after_<version_kind>`` (or for ``updated_at`` rows,
-      ``current_value != e_k.after``): user edited the row after the last catalog
-      replacement -> return ``(None, "user_modified_after_last_replacement")``.
-    - Otherwise walk backward from ``e_k`` to ``e_1`` while adjacent hops satisfy
-      ``e_i.before_<version_kind> == e_{i-1}.after_<version_kind>`` (zero user edits
-      between catalog replacements) and return ``(earliest_contiguous.before, None)``!
+      any field in ``e_k.after`` drifted from ``current_value``): user edited the row
+      after the last catalog replacement -> return ``(None, "user_modified_after_last_replacement")``.
+    - Otherwise walk backward from ``e_k`` to ``e_1`` checking row-level version/timestamp
+      continuity (and per-field continuity for overlapping or untouched fields across hops),
+      then apply every contiguous hop's ``before`` map in reverse chronological order so
+      successive catalog changes touching different fields of the same row (e.g.
+      ``preferred_model`` then ``flash_model``) are all restored atomically.
     """
     if not chain_newest_first:
         return None, "empty_chain"
@@ -2035,29 +2068,54 @@ def resolve_chained_side_effect_target(
     else:
         if str(current_version or "") != str(newest.get(after_key) or ""):
             return None, "user_modified_after_last_replacement"
-        if current_value is not None and dict(current_value) != dict(newest.get("after") or {}):
-            return None, "user_modified_after_last_replacement"
+        if current_value is not None:
+            newest_after = dict(newest.get("after") or {})
+            for fk, expected_after in newest_after.items():
+                if current_value.get(fk) != expected_after:
+                    return None, "user_modified_after_last_replacement"
 
-    # Walk backward across contiguous catalog rewrites (e.g. C <- B <- A)
-    earliest = newest
+    # Walk backward across contiguous catalog rewrites (e.g. C <- B <- A, or multi-field pref hops)
+    contiguous_newest_first: list[dict[str, Any]] = [newest]
+    expected_before_by_field: dict[str, Any] = dict(newest.get("before") or {})
     for prev_hop in chain_newest_first[1:]:
+        later_hop = contiguous_newest_first[-1]
         if version_kind == "config_version":
             contiguous = (
-                earliest.get(before_key) is not None
+                later_hop.get(before_key) is not None
                 and prev_hop.get(after_key) is not None
-                and int(earliest[before_key]) == int(prev_hop[after_key])
+                and int(later_hop[before_key]) == int(prev_hop[after_key])
             )
         else:
-            contiguous = (
-                str(earliest.get(before_key) or "") == str(prev_hop.get(after_key) or "")
-                and dict(earliest.get("before") or {}) == dict(prev_hop.get("after") or {})
+            ts_contiguous = str(later_hop.get(before_key) or "") == str(
+                prev_hop.get(after_key) or ""
             )
+            if not ts_contiguous:
+                contiguous = False
+            else:
+                prev_after = dict(prev_hop.get("after") or {})
+                fields_ok = True
+                for fk, prev_after_val in prev_after.items():
+                    if fk in expected_before_by_field:
+                        if expected_before_by_field[fk] != prev_after_val:
+                            fields_ok = False
+                            break
+                    elif current_value is not None and fk in current_value:
+                        if current_value[fk] != prev_after_val:
+                            fields_ok = False
+                            break
+                contiguous = fields_ok
         if not contiguous:
-            # User intervened between prev_hop and earliest; stop at earliest.before
+            # User intervened between prev_hop and later_hop; stop at later_hop
             break
-        earliest = prev_hop
+        contiguous_newest_first.append(prev_hop)
+        for fk, old_val in (prev_hop.get("before") or {}).items():
+            expected_before_by_field[fk] = old_val
 
-    return dict(earliest.get("before") or {}), None
+    restored: dict[str, Any] = {}
+    for hop in contiguous_newest_first:
+        for fk, old_val in (hop.get("before") or {}).items():
+            restored[fk] = old_val
+    return restored, None
 
 
 async def rollback_catalog(
@@ -2237,9 +2295,12 @@ async def rollback_catalog(
                     continue
                 mp = copy.deepcopy(prow.get("model_preference") or {})
                 ap = copy.deepcopy(prow.get("agent_preference") or {})
-                newest_after = hops_newest_first[0].get("after") or {}
+                all_paths: set[str] = set()
+                for hop in hops_newest_first:
+                    all_paths.update((hop.get("after") or {}).keys())
+                    all_paths.update((hop.get("before") or {}).keys())
                 cur_vals: dict[str, Any] = {}
-                for path in newest_after:
+                for path in sorted(all_paths):
                     if path.startswith("model_preference."):
                         cur_vals[path] = mp.get(path.split(".", 1)[1])
                     elif path.startswith("agent_preference.subagent_models."):
@@ -2256,14 +2317,31 @@ async def rollback_catalog(
                         {"kind": "user_preference", "id": eid, "user_id": eid, "reason": skip_reason}
                     )
                     continue
+                actual_before: dict[str, Any] = {}
+                actual_after: dict[str, Any] = {}
                 for path, old_val in restore_before.items():
                     if old_val and old_val not in target_active_models:
                         continue
                     if path.startswith("model_preference."):
-                        mp[path.split(".", 1)[1]] = old_val
+                        slot = path.split(".", 1)[1]
+                        actual_before[path] = mp.get(slot)
+                        mp[slot] = old_val
+                        actual_after[path] = old_val
                     elif path.startswith("agent_preference.subagent_models."):
                         sname = path.split(".", 2)[2]
+                        actual_before[path] = (ap.get("subagent_models") or {}).get(sname)
                         ap.setdefault("subagent_models", {})[sname] = old_val
+                        actual_after[path] = old_val
+                if not actual_after:
+                    skipped_user_modified.append(
+                        {
+                            "kind": "user_preference",
+                            "id": eid,
+                            "user_id": eid,
+                            "reason": "target_model_unavailable_in_target_revision",
+                        }
+                    )
+                    continue
                 async with conn.cursor(row_factory=dict_row) as cur:
                     await cur.execute(
                         """
@@ -2282,8 +2360,8 @@ async def rollback_catalog(
                         "kind": "user_preference",
                         "id": eid,
                         "user_id": eid,
-                        "before": cur_vals,
-                        "after": restore_before,
+                        "before": actual_before,
+                        "after": actual_after,
                         "before_updated_at": _ts_str(prow.get("updated_at")),
                         "after_updated_at": _ts_str(upd["updated_at"]),
                     }

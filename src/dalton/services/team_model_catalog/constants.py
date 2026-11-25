@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+from collections.abc import Mapping
 from typing import Any
 
 CATALOG_SCHEMA = "dalton-team-model-catalog/1"
@@ -51,6 +53,47 @@ def norm_id(value: str | None) -> str:
     Lowercases, strips surrounding whitespace, and maps ``'.'`` to ``'-'``.
     """
     return str(value or "").strip().lower().replace(".", "-")
+
+
+def normalize_cash_pricing_card(card: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    """Normalize ``cache_read`` alias to ``cached_input`` at top level and inside ``input_tiers``.
+
+    ``get_input_cost`` in ``src/llms/pricing_utils.py`` reads ``cache_hit`` /
+    ``cached_input`` (and per-tier ``cached_input``). Normalizing ``cache_read``
+    on catalog write, compile, and snapshot build ensures cache-read tokens are
+    always priced instead of billing at 0.
+    """
+    if not isinstance(card, Mapping):
+        return None
+    out = copy.deepcopy(dict(card))
+    if "cache_read" in out:
+        cr = out.pop("cache_read")
+        if out.get("cached_input") is None and cr is not None:
+            out["cached_input"] = cr
+    if "cached_input" in out and out["cached_input"] is None:
+        out.pop("cached_input", None)
+    tiers = out.get("input_tiers")
+    if isinstance(tiers, list):
+        norm_tiers: list[Any] = []
+        for tier in tiers:
+            if isinstance(tier, Mapping):
+                t = dict(tier)
+                if "cache_read" in t:
+                    tcr = t.pop("cache_read")
+                    if t.get("cached_input") is None and tcr is not None:
+                        t["cached_input"] = tcr
+                if "cached_input" in t and t["cached_input"] is None:
+                    t.pop("cached_input", None)
+                norm_tiers.append(t)
+            else:
+                norm_tiers.append(tier)
+        out["input_tiers"] = norm_tiers
+    off_peak = out.get("off_peak")
+    if isinstance(off_peak, Mapping):
+        norm_off = normalize_cash_pricing_card(off_peak)
+        if norm_off is not None:
+            out["off_peak"] = norm_off
+    return out
 
 
 def compute_payload_sha256(payload: dict[str, Any]) -> str:

@@ -11,7 +11,6 @@ All SQL for the team model catalog lives here (never in routers or services):
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
@@ -28,6 +27,7 @@ from src.dalton.services.team_model_catalog.constants import (
 )
 from src.server.database.encryption import get_encryption_key as _get_encryption_key
 from src.server.database.pool import get_db_connection, get_db_connection_string
+from src.server.utils.pg_sanitize import SafeJson
 
 logger = logging.getLogger(__name__)
 
@@ -717,7 +717,9 @@ async def backfill_run_catalog_snapshot(
     """Conditionally persist ``effective_catalog_snapshot`` only when currently absent."""
     if not run_id or not isinstance(snapshot, dict):
         return False
-    payload_json = json.dumps(snapshot, ensure_ascii=False)
+    # Share the exact same SafeJson (_safe_dumps) serializer as first-write paths
+    # (lifecycle.py / subagent_runs.py) so keys and JSONB encoding never diverge.
+    payload_bind = SafeJson(snapshot)
     async with get_db_connection(conn) as db:
         async with db.cursor() as cur:
             if is_subagent:
@@ -737,7 +739,7 @@ async def backfill_run_catalog_snapshot(
                     """,
                     (
                         int(snapshot.get("catalog_revision") or 0),
-                        payload_json,
+                        payload_bind,
                         str(run_id),
                     ),
                 )
@@ -758,7 +760,7 @@ async def backfill_run_catalog_snapshot(
                     """,
                     (
                         int(snapshot.get("catalog_revision") or 0),
-                        payload_json,
+                        payload_bind,
                         str(run_id),
                     ),
                 )

@@ -731,7 +731,10 @@ class TestCatalogVariantIsolationAndTransport:
             captured_requests.append(req)
             return httpx.Response(200, json={"ok": True})
 
-        mock_inner.handle_async_request = AsyncMock(side_effect=_fake_handle_async)
+        mock_inner.handle_async_request = AsyncMock(
+            spec=httpx.AsyncBaseTransport.handle_async_request,
+            side_effect=_fake_handle_async,
+        )
 
         async def _fake_doh_public(host: str, addrs: list[str], is_blocked):
             assert not is_blocked("93.184.216.34")
@@ -1023,32 +1026,39 @@ class TestChainedRollbackAndLegacyImport:
         async def _fake_get_db(_conn=None):
             yield _FakeConn()
 
+        from src.dalton.services.team_model_catalog import service as tmc_service
+
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.service.get_db_connection", _fake_get_db
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.service.acquire_catalog_exclusive_lock",
-            AsyncMock(),
+            create_autospec(tmc_service.acquire_catalog_exclusive_lock),
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.service.get_catalog_row",
-            AsyncMock(
+            create_autospec(
+                tmc_service.get_catalog_row,
                 return_value={
                     "revision": 2,
                     "payload": payload_c2,
                     "payload_sha256": "sha2",
                     "legacy_sync_import_status": "not_applicable",
                     "last_known_legacy_retired": [],
-                }
+                },
             ),
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.service.get_catalog_revision",
-            AsyncMock(return_value={"revision": 1, "payload": payload_t1}),
+            create_autospec(
+                tmc_service.get_catalog_revision,
+                return_value={"revision": 1, "payload": payload_t1},
+            ),
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.service.list_catalog_provider_credentials",
-            AsyncMock(
+            create_autospec(
+                tmc_service.list_catalog_provider_credentials,
                 return_value={
                     "corp-gw": {
                         "provider_slug": "corp-gw",
@@ -1056,7 +1066,7 @@ class TestChainedRollbackAndLegacyImport:
                         "canonical_bound_url": "https://corp.example.com:443/v2",
                         "key_fingerprint": "sk-...2222",
                     }
-                }
+                },
             ),
         )
         monkeypatch.setattr(
@@ -1124,23 +1134,27 @@ class TestChainedRollbackAndLegacyImport:
         async def _fake_get_db(_conn=None):
             yield _FakeConn()
 
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.services.team_model_catalog import service as tmc_service
+
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.service.get_db_connection", _fake_get_db
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.service.acquire_catalog_exclusive_lock",
-            AsyncMock(),
+            create_autospec(tmc_service.acquire_catalog_exclusive_lock),
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.service.get_catalog_row",
-            AsyncMock(
+            create_autospec(
+                tmc_service.get_catalog_row,
                 return_value={
                     "revision": 1,
                     "payload": {"schema": CATALOG_SCHEMA, "retired": [{"key": "model-a"}]},
                     "payload_sha256": "sha1",
                     "legacy_sync_import_status": "failed",
                     "last_known_legacy_retired": ["model-a"],
-                }
+                },
             ),
         )
         monkeypatch.setattr(
@@ -1149,7 +1163,7 @@ class TestChainedRollbackAndLegacyImport:
         )
         monkeypatch.setattr(
             "src.dalton.database.team_model_catalog.fetch_legacy_retired_history",
-            AsyncMock(return_value=set()),
+            create_autospec(tmc_db.fetch_legacy_retired_history, return_value=set()),
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.compiled._load_json_dict",
@@ -1199,20 +1213,22 @@ class TestChainedRollbackAndLegacyImport:
         async def _fake_get_db(_conn=None):
             yield _FakeConn()
 
+        from src.dalton.services.team_model_catalog import legacy_import as legacy_import_mod
+
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.legacy_import.get_db_connection", _fake_get_db
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.legacy_import.acquire_catalog_exclusive_lock",
-            AsyncMock(),
+            create_autospec(legacy_import_mod.acquire_catalog_exclusive_lock),
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.legacy_import.publish_catalog_changed",
-            AsyncMock(),
+            create_autospec(legacy_import_mod.publish_catalog_changed),
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.legacy_import.invalidate_catalog_redis_caches",
-            AsyncMock(),
+            create_autospec(legacy_import_mod.invalidate_catalog_redis_caches),
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.compiled._load_json_dict",
@@ -1247,7 +1263,8 @@ class TestChainedRollbackAndLegacyImport:
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.legacy_import.get_catalog_row",
-            AsyncMock(
+            create_autospec(
+                legacy_import_mod.get_catalog_row,
                 return_value={
                     "revision": 0,
                     "payload": {"schema": CATALOG_SCHEMA},
@@ -1255,16 +1272,17 @@ class TestChainedRollbackAndLegacyImport:
                     "legacy_sync_import_status": "pending",
                     "legacy_sync_imported_at": None,
                     "last_known_legacy_retired": [],
-                }
+                },
             ),
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.legacy_import.save_catalog_revision",
-            AsyncMock(
+            create_autospec(
+                legacy_import_mod.save_catalog_revision,
                 return_value={
                     "catalog": {"revision": 1, "legacy_sync_import_status": "imported"},
                     "revision_record": {"revision": 1},
-                }
+                },
             ),
         )
         orig_archive = __import__(
@@ -1296,11 +1314,13 @@ class TestChainedRollbackAndLegacyImport:
 
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.legacy_import.has_legacy_native_sync_history",
-            AsyncMock(return_value=True),
+            create_autospec(legacy_import_mod.has_legacy_native_sync_history, return_value=True),
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.legacy_import.fetch_legacy_retired_history",
-            AsyncMock(return_value={"model-a"}),
+            create_autospec(
+                legacy_import_mod.fetch_legacy_retired_history, return_value={"model-a"}
+            ),
         )
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.legacy_import.update_legacy_import_state_only",
@@ -1337,9 +1357,11 @@ class TestChainedRollbackAndLegacyImport:
             {"schema": CATALOG_SCHEMA, "retired": [{"key": "model-b", "provider": "openai"}]},
             revision=2,
         )
+        from src.dalton.services.team_model_catalog import service as tmc_service
+
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.service.get_compiled_catalog_async",
-            AsyncMock(return_value=cat_retired),
+            create_autospec(tmc_service.get_compiled_catalog_async, return_value=cat_retired),
         )
         with pytest.raises(HTTPException) as ret_exc:
             asyncio.run(assert_model_not_retired_under_lock(_FakeConn(), "model-b"))
@@ -2560,3 +2582,1151 @@ class TestR2Fixes:
         )
         assert hit is True
         assert snap_p == {"pricing_type": "subscription"}
+
+
+# ---------------------------------------------------------------------------
+# Group 7: R4 regression tests covering all 10 R2 review fixes
+# ---------------------------------------------------------------------------
+
+
+class TestR4Fixes:
+    def test_r4_1_snapshot_identity_keys_json_lossless_and_legacy_compat(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.services.team_model_catalog.snapshot import (
+            _identity_key,
+            lookup_snapshot_pricing,
+            serialize_catalog_snapshot,
+        )
+        from src.server.utils.pg_sanitize import SafeJson
+
+        cat = _compile_test_catalog({"schema": CATALOG_SCHEMA}, revision=3)
+        snap = build_effective_catalog_snapshot(["gpt-test"], compiled=cat)
+
+        # 1. Identity key is JSON-lossless (no NUL byte, no \u0000 escape)
+        expected_key = _identity_key("openai", "gpt-test")
+        assert "\x00" not in expected_key
+        assert expected_key in snap["by_identity"]
+
+        serialized = serialize_catalog_snapshot(snap)
+        safe_serialized = SafeJson(snap).dumps(snap)
+        assert serialized == safe_serialized
+        assert "\\u0000" not in serialized
+        assert "\x00" not in serialized
+        round_tripped = json.loads(serialized)
+        assert expected_key in round_tripped["by_identity"]
+
+        # 2. Backfill path binds via SafeJson (same serializer as first-write lifecycle/subagent_runs)
+        captured_params: list[Any] = []
+
+        class _FakeCur:
+            rowcount = 1
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def execute(self, sql: str, params: Any = None) -> None:
+                captured_params.append(params)
+
+        class _FakeConn:
+            def cursor(self, *args, **kwargs):
+                return _FakeCur()
+
+        @asynccontextmanager
+        async def _fake_get_db(conn=None):
+            yield conn or _FakeConn()
+
+        monkeypatch.setattr(tmc_db, "get_db_connection", _fake_get_db)
+        wrote = asyncio.run(
+            tmc_db.backfill_run_catalog_snapshot(
+                "11111111-1111-4111-8111-111111111111", snap, is_subagent=False
+            )
+        )
+        assert wrote is True
+        assert len(captured_params) == 1
+        assert isinstance(captured_params[0][1], SafeJson)
+        assert captured_params[0][1].dumps(snap) == safe_serialized
+
+        # 3. Reading remains backward-compatible with legacy NUL and SafeJson-stripped keys
+        entry_val = dict(snap["by_identity"][expected_key])
+        legacy_nul_snap = {
+            "schema": snap["schema"],
+            "catalog_revision": 3,
+            "models": {},
+            "by_identity": {"openai\x00gpt-test": entry_val},
+            "variants": {},
+        }
+        legacy_stripped_snap = {
+            "schema": snap["schema"],
+            "catalog_revision": 3,
+            "models": {},
+            "by_identity": {"openaigpt-test": entry_val},
+            "variants": {},
+        }
+        for legacy_snap in (legacy_nul_snap, legacy_stripped_snap):
+            hit, pricing = lookup_snapshot_pricing(
+                "gpt-test", "openai", model_id="gpt-test", snapshot=legacy_snap
+            )
+            assert hit is True
+            assert pricing is not None and pricing["input"] == 2.0
+
+    def test_r4_2_resumed_turn_uses_snapshot_route_params_fingerprint_and_pricing_guard(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.services.team_model_catalog.snapshot import lookup_snapshot_pricing
+        from src.dalton.services.team_model_catalog.transport import (
+            resolve_catalog_variant_binding_async,
+        )
+        from src.llms.llm import LLM, create_llm
+        from src.server.services.llm import user_models
+
+        # Revision 1: team-m1 routes to variant-a (model_id="m-a", temperature=0.2, input=$2)
+        cat_a = _compile_test_catalog(
+            {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "provider_variants": {
+                        "openai": {
+                            "variant-a": {
+                                "display_name": "Variant A",
+                                "sdk": "openai",
+                                "access_type": "api_key",
+                                "billing": "cash",
+                                "base_url": "https://a.example.com/v1",
+                            }
+                        }
+                    },
+                    "models": {
+                        "variant-a": [
+                            {"id": "m-a", "pricing": {"input": 2.0, "output": 8.0}}
+                        ]
+                    },
+                },
+                "models": {
+                    "team-m1": {
+                        "model_id": "m-a",
+                        "provider": "variant-a",
+                        "display_name": "Team M1",
+                        "visible": True,
+                        "parameters": {"temperature": 0.2, "max_tokens": 4096},
+                    }
+                },
+            },
+            revision=1,
+        )
+        fp_a = make_key_fingerprint("sk-variant-a-1111")
+        snap_a = build_effective_catalog_snapshot(
+            ["team-m1"],
+            compiled=cat_a,
+            variant_credentials={
+                "variant-a": {
+                    "bound_base_url": "https://a.example.com/v1",
+                    "canonical_bound_url": "https://a.example.com:443/v1",
+                    "key_fingerprint": fp_a,
+                }
+            },
+        )
+
+        # Revision 2 (live catalog after interruption): team-m1 moved to variant-b (model_id="m-b", temp=0.9)
+        cat_b = _compile_test_catalog(
+            {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "provider_variants": {
+                        "openai": {
+                            "variant-b": {
+                                "display_name": "Variant B",
+                                "sdk": "openai",
+                                "access_type": "api_key",
+                                "billing": "cash",
+                                "base_url": "https://b.example.com/v1",
+                            }
+                        }
+                    },
+                    "models": {
+                        "variant-b": [
+                            {"id": "m-b", "pricing": {"input": 20.0, "output": 80.0}}
+                        ]
+                    },
+                },
+                "models": {
+                    "team-m1": {
+                        "model_id": "m-b",
+                        "provider": "variant-b",
+                        "display_name": "Team M1",
+                        "visible": True,
+                        "parameters": {"temperature": 0.9, "max_tokens": 8192},
+                    }
+                },
+            },
+            revision=2,
+        )
+        monkeypatch.setattr(LLM, "get_model_config", classmethod(lambda cls: cat_b.model_config))
+
+        # 1. Under bound snapshot, classify_model & LLM construction keep snapshot route (variant-a, m-a, temp=0.2)
+        with bind_catalog_snapshot(snap_a):
+            source, cfg = asyncio.run(
+                user_models.classify_model("u-1", "team-m1", _pref_cache={})
+            )
+            assert source == user_models.ModelSource.SYSTEM
+            assert cfg["provider"] == "variant-a"
+            assert cfg["model_id"] == "m-a"
+            assert cfg["parameters"]["temperature"] == 0.2
+
+            # Credential binding resolves variant-a (not variant-b) and checks fp_a!
+            factory_a = make_catalog_variant_transport_factory(
+                provider_slug="variant-a",
+                bound_base_url="https://a.example.com/v1",
+                expected_key_fingerprint=fp_a,
+                verify_db_binding=False,
+            )
+            llm_obj = LLM(
+                "team-m1",
+                api_key="sk-variant-a-1111",
+                base_url_override="https://a.example.com/v1",
+                egress_transport=factory_a,
+                follow_redirects=False,
+                _catalog_credential_source=catalog_variant_source_tag("variant-a"),
+            )
+            assert llm_obj.provider == "variant-a"
+            assert llm_obj.model == "m-a"
+            assert llm_obj.parameters["temperature"] == 0.2
+            assert llm_obj.base_url == "https://a.example.com/v1"
+
+            # Rotating variant-a's key causes create_llm("team-m1") to revoke against variant-a's snapshot fp
+            rotated_fp_a = make_key_fingerprint("sk-variant-a-rotated-9999")
+            monkeypatch.setattr(
+                tmc_db,
+                "get_catalog_provider_credential_sync",
+                create_autospec(
+                    tmc_db.get_catalog_provider_credential_sync,
+                    side_effect=lambda slug, decrypt=True: (
+                        {
+                            "provider_slug": "variant-a",
+                            "api_key": "sk-variant-a-rotated-9999",
+                            "bound_base_url": "https://a.example.com/v1",
+                            "canonical_bound_url": "https://a.example.com:443/v1",
+                            "key_fingerprint": rotated_fp_a,
+                        }
+                        if slug == "variant-a"
+                        else {
+                            "provider_slug": "variant-b",
+                            "api_key": "sk-variant-b-2222",
+                            "bound_base_url": "https://b.example.com/v1",
+                            "canonical_bound_url": "https://b.example.com:443/v1",
+                            "key_fingerprint": make_key_fingerprint("sk-variant-b-2222"),
+                        }
+                    ),
+                ),
+            )
+            with pytest.raises(CatalogVariantCredentialRevokedError) as rev_exc:
+                create_llm("team-m1")
+            assert "variant-a" in str(rev_exc.value)
+
+            # Direct call attempting to bind variant-b for model_key="team-m1" under snap_a is rejected
+            with pytest.raises(CatalogVariantCredentialRevokedError):
+                asyncio.run(
+                    resolve_catalog_variant_binding_async("variant-b", model_key="team-m1")
+                )
+
+        # 2. Snapshot pricing lookup rejects mismatched (provider, model_id) even when model_key matches
+        hit_wrong_prov, p_wrong_prov = lookup_snapshot_pricing(
+            "team-m1", provider="variant-b", model_id="m-b", snapshot=snap_a
+        )
+        assert hit_wrong_prov is False and p_wrong_prov is None
+
+        hit_wrong_id, p_wrong_id = lookup_snapshot_pricing(
+            "team-m1", provider="variant-a", model_id="m-b", snapshot=snap_a
+        )
+        assert hit_wrong_id is False and p_wrong_id is None
+
+        hit_ok, p_ok = lookup_snapshot_pricing(
+            "team-m1", provider="variant-a", model_id="m-a", snapshot=snap_a
+        )
+        assert hit_ok is True and p_ok is not None and p_ok["input"] == 2.0
+
+    def test_r4_3_subscription_variant_rejects_cash_pricing_and_settles_identically(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.team_model_catalog.validation import validate_model_fields
+        from src.llms.llm import LLM
+        from src.llms.pricing_utils import find_model_pricing
+        from src.utils.tracking.core import calculate_cost_from_per_call_records
+
+        # 1. Save-time validation rejects cash rates on a subscription provider
+        with pytest.raises(CatalogValidationError) as exc_info:
+            validate_model_fields(
+                model_key="acme-sub-m1",
+                model_entry={"provider": "acme-sub", "model_id": "m-sub"},
+                pricing_card={"input": 2.0, "output": 8.0},
+                dalton_meta_entry={
+                    "billing": "subscription",
+                    "notional_pricing": {"input": 2.0, "output": 8.0},
+                },
+                provider_info={"sdk": "openai", "billing": "subscription"},
+                pricing_explicit=True,
+            )
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.code == "subscription_cash_pricing_forbidden"
+
+        # 2. Even if a legacy payload contains a cash card under a subscription variant,
+        # live lookup and snapshot lookup BOTH return subscription billing -> identical $0 cash settlement.
+        cat = _compile_test_catalog(
+            {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "provider_variants": {
+                        "openai": {
+                            "acme-sub": {
+                                "display_name": "Acme Sub",
+                                "sdk": "openai",
+                                "access_type": "api_key",
+                                "billing": "subscription",
+                                "base_url": "https://sub.example.com/v1",
+                            }
+                        }
+                    },
+                    "models": {
+                        "acme-sub": [
+                            {"id": "m-sub", "pricing": {"input": 2.0, "output": 8.0}}
+                        ]
+                    },
+                },
+                "models": {
+                    "acme-sub-m1": {
+                        "model_id": "m-sub",
+                        "provider": "acme-sub",
+                        "display_name": "Acme Sub M1",
+                        "visible": True,
+                    }
+                },
+                "dalton_meta": {
+                    "acme-sub-m1": {
+                        "billing": "subscription",
+                        "notional_pricing": {"input": 2.0, "output": 8.0},
+                    }
+                },
+            },
+            revision=7,
+        )
+        monkeypatch.setattr(LLM, "get_model_config", classmethod(lambda cls: cat.model_config))
+        monkeypatch.setattr(
+            "src.dalton.llm.notional_pricing.build_notional_price_index",
+            lambda **kw: cat.notional_price_index,
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_dalton_meta",
+            lambda *a, **kw: cat.dalton_meta,
+        )
+
+        assert find_model_pricing("m-sub", provider="acme-sub") == {"pricing_type": "subscription"}
+
+        snap = build_effective_catalog_snapshot(
+            ["acme-sub-m1"],
+            compiled=cat,
+            variant_credentials={
+                "acme-sub": {
+                    "bound_base_url": "https://sub.example.com/v1",
+                    "canonical_bound_url": "https://sub.example.com:443/v1",
+                    "key_fingerprint": make_key_fingerprint("sk-sub-9999"),
+                }
+            },
+        )
+        record = {
+            "model_name": "acme-sub-m1",
+            "usage": {
+                "input_tokens": 1_000_000,
+                "output_tokens": 100_000,
+                "cached_tokens": 0,
+                "cache_5m_tokens": 0,
+                "cache_1h_tokens": 0,
+            },
+            "billing_type": "platform",
+            "pricing_model_id": "m-sub",
+            "pricing_provider": "acme-sub",
+        }
+        settled_live = calculate_cost_from_per_call_records([record])
+        with bind_catalog_snapshot(snap):
+            settled_snap = calculate_cost_from_per_call_records([record])
+
+        assert settled_live["total_cost"] == 0.0
+        assert settled_snap["total_cost"] == 0.0
+        assert settled_live["total_cost"] == settled_snap["total_cost"]
+        assert settled_live["notional_cost"] == pytest.approx(2.8)
+        assert settled_snap["notional_cost"] == pytest.approx(2.8)
+
+    def test_r4_4_cache_read_normalized_to_cached_input_for_flat_and_tiered_settlement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.team_model_catalog.service import _build_pricing_card_dict
+        from src.dalton.services.team_model_catalog.validation import (
+            CatalogModelUpsertInput,
+            PricingCardInput,
+            PricingTierInput,
+        )
+        from src.llms.llm import LLM
+        from src.llms.pricing_utils import calculate_total_cost
+
+        # 1. Flat card with ONLY cache_read (no cached_input)
+        flat_input = CatalogModelUpsertInput(
+            model_key="cache-flat",
+            model_id="cache-flat",
+            provider="openai",
+            pricing=PricingCardInput(input=3.0, output=15.0, cache_read=0.3),
+        )
+        built_flat = _build_pricing_card_dict("cache-flat", "Cache Flat", flat_input)
+        assert built_flat is not None
+        assert "cache_read" not in built_flat["pricing"]
+        assert built_flat["pricing"]["cached_input"] == 0.3
+
+        # 2. Tiered card with ONLY per-tier cache_read
+        tiered_input = CatalogModelUpsertInput(
+            model_key="cache-tiered",
+            model_id="cache-tiered",
+            provider="openai",
+            pricing=PricingCardInput(
+                output=15.0,
+                input_tiers=[
+                    PricingTierInput(max_tokens=200_000, rate=3.0, cache_read=0.3),
+                    PricingTierInput(max_tokens=None, rate=6.0, cache_read=0.6),
+                ],
+                input_pricing_mode="input_dependent",
+            ),
+        )
+        built_tiered = _build_pricing_card_dict("cache-tiered", "Cache Tiered", tiered_input)
+        assert built_tiered is not None
+        assert built_tiered["pricing"]["input_tiers"][0]["cached_input"] == 0.3
+        assert "cache_read" not in built_tiered["pricing"]["input_tiers"][0]
+        assert built_tiered["pricing"]["input_tiers"][1]["cached_input"] == 0.6
+
+        # 3. Compile directly from raw payload with cache_read (even without _build_pricing_card_dict)
+        cat = _compile_test_catalog(
+            {
+                "schema": CATALOG_SCHEMA,
+                "models": {
+                    "cache-flat": {
+                        "model_id": "cache-flat",
+                        "provider": "openai",
+                        "display_name": "Cache Flat",
+                        "visible": True,
+                    },
+                    "cache-tiered": {
+                        "model_id": "cache-tiered",
+                        "provider": "openai",
+                        "display_name": "Cache Tiered",
+                        "visible": True,
+                    },
+                },
+                "providers": {
+                    "models": {
+                        "openai": [
+                            {
+                                "id": "cache-flat",
+                                "pricing": {"input": 3.0, "output": 15.0, "cache_read": 0.3},
+                            },
+                            {
+                                "id": "cache-tiered",
+                                "pricing": {
+                                    "output": 15.0,
+                                    "input_pricing_mode": "input_dependent",
+                                    "input_tiers": [
+                                        {"max_tokens": 200_000, "rate": 3.0, "cache_read": 0.3},
+                                        {"max_tokens": None, "rate": 6.0, "cache_read": 0.6},
+                                    ],
+                                },
+                            },
+                        ]
+                    }
+                },
+            },
+            revision=8,
+        )
+        monkeypatch.setattr(LLM, "get_model_config", classmethod(lambda cls: cat.model_config))
+        snap = build_effective_catalog_snapshot(["cache-flat", "cache-tiered"], compiled=cat)
+
+        # 1M total input (500k cached + 500k fresh) + 0 output -> 0.5*3 + 0.5*0.3 = 1.65
+        for ctx_cm in (bind_catalog_snapshot(None), bind_catalog_snapshot(snap)):
+            with ctx_cm:
+                res_flat = calculate_total_cost(
+                    input_tokens=1_000_000,
+                    cached_tokens=500_000,
+                    output_tokens=0,
+                    model_name="cache-flat",
+                    provider="openai",
+                )
+                assert res_flat["breakdown"]["cached_input"]["cost"] == pytest.approx(0.15)
+                assert res_flat["total_cost"] == pytest.approx(1.65)
+
+                # Tiered (>200k prompt -> tier 1: rate 6.0, cached_input 0.6):
+                # 250k total (100k cached + 150k fresh) -> 0.15*6.0 + 0.1*0.6 = 0.96
+                res_tiered = calculate_total_cost(
+                    input_tokens=250_000,
+                    cached_tokens=100_000,
+                    output_tokens=0,
+                    model_name="cache-tiered",
+                    provider="openai",
+                )
+                assert res_tiered["breakdown"]["cached_input"]["cost"] == pytest.approx(0.06)
+                assert res_tiered["total_cost"] == pytest.approx(0.96)
+
+    def test_r4_5_automation_rollback_and_recycle_restore_lock_and_reject_retired_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from datetime import datetime, timezone
+
+        from src.dalton.database import automation_recycle as recycle_db
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.services import automation_recycle as recycle_svc
+        from src.dalton.services.team_model_catalog import service as tmc_service
+
+        events: list[str] = []
+        cat_retired = _compile_test_catalog(
+            {"schema": CATALOG_SCHEMA, "retired": [{"key": "model-a", "provider": "openai"}]},
+            revision=4,
+        )
+
+        class _TxConn:
+            @asynccontextmanager
+            async def transaction(self):
+                events.append("tx_enter")
+                yield
+                events.append("tx_exit")
+
+            async def execute(self, sql: str, params: Any = None) -> None:
+                events.append(f"exec:{sql[:28]}")
+
+        @asynccontextmanager
+        async def _fake_get_db(conn=None):
+            yield _TxConn()
+
+        async def _fake_shared_lock(conn: Any) -> None:
+            events.append("catalog_shared_lock")
+
+        async def _fake_lock_row(aid: str, *, owner_user_id: str | None, conn: Any):
+            events.append("lock_automation")
+            return current_row["row"]
+
+        update_mock = create_autospec(recycle_db.update_automation_recycle, return_value=True)
+        monkeypatch.setattr("src.dalton.settings.is_coverage_units_enabled", lambda: False)
+        monkeypatch.setattr(recycle_svc, "get_db_connection", _fake_get_db)
+        monkeypatch.setattr(
+            tmc_db,
+            "acquire_catalog_shared_lock",
+            create_autospec(tmc_db.acquire_catalog_shared_lock, side_effect=_fake_shared_lock),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "get_compiled_catalog_async",
+            create_autospec(tmc_service.get_compiled_catalog_async, return_value=cat_retired),
+        )
+        monkeypatch.setattr(
+            recycle_db,
+            "lock_automation_for_recycle",
+            create_autospec(recycle_db.lock_automation_for_recycle, side_effect=_fake_lock_row),
+        )
+        monkeypatch.setattr(recycle_db, "update_automation_recycle", update_mock)
+
+        # Case A: recycle bin restore of a soft-deleted automation pinned to retired model-a
+        current_row: dict[str, Any] = {
+            "row": {
+                "automation_id": "22222222-2222-4222-8222-222222222222",
+                "user_id": "u-1",
+                "config_version": 2,
+                "active_version": 2,
+                "audit_history": [],
+                "deleted_at": datetime(2026, 11, 25, tzinfo=timezone.utc),
+                "scope": "personal",
+                "status": "paused",
+                "pre_delete_desired_status": "active",
+                "trigger_type": "cron",
+                "cron_expression": "0 9 * * *",
+                "timezone": "UTC",
+                "llm_model": "model-a",
+                "file_name": "a.json",
+            }
+        }
+        with pytest.raises(HTTPException) as restore_exc:
+            asyncio.run(
+                recycle_svc.restore_automation(
+                    "22222222-2222-4222-8222-222222222222",
+                    actor_user_id="u-1",
+                    expected_config_version=2,
+                    owner_user_id="u-1",
+                    company=False,
+                    prelocked_pref_row={},
+                )
+            )
+        assert restore_exc.value.status_code == 400
+        assert restore_exc.value.detail["code"] == "model_retired"
+        assert events.index("catalog_shared_lock") < events.index("lock_automation")
+        assert update_mock.call_count == 0
+
+        # Case B: rollback to historical snapshot referencing retired model-a
+        events.clear()
+        snap_v1 = {
+            "name": "Morning",
+            "description": None,
+            "trigger_type": "cron",
+            "cron_expression": "0 9 * * *",
+            "once_run_at": None,
+            "timezone": "UTC",
+            "instruction": "check",
+            "workspace_id": None,
+            "llm_model": "model-a",
+            "reasoning_effort": None,
+            "additional_context": None,
+            "thread_strategy": "new",
+            "conversation_thread_id": None,
+            "max_failures": 3,
+            "trigger_config": {},
+            "delivery_config": {},
+            "notify_enabled": False,
+            "notify_routes": [],
+            "desired_status": "active",
+        }
+        snap_v2 = {**snap_v1, "llm_model": "model-c"}
+        current_row["row"] = {
+            "automation_id": "22222222-2222-4222-8222-222222222222",
+            "user_id": "u-1",
+            "config_version": 2,
+            "active_version": 2,
+            "audit_history": [
+                {"version": 1, "prev_version": None, "snapshot": snap_v1},
+                {"version": 2, "prev_version": 1, "snapshot": snap_v2},
+            ],
+            "deleted_at": None,
+            "scope": "personal",
+            "status": "active",
+            "trigger_type": "cron",
+            "cron_expression": "0 9 * * *",
+            "timezone": "UTC",
+            "llm_model": "model-c",
+            "file_name": "a.json",
+        }
+        with pytest.raises(HTTPException) as rb_exc:
+            asyncio.run(
+                recycle_svc.rollback_automation(
+                    "22222222-2222-4222-8222-222222222222",
+                    actor_user_id="u-1",
+                    expected_config_version=2,
+                    target_version=1,
+                    owner_user_id="u-1",
+                    company=False,
+                    prelocked_pref_row={},
+                )
+            )
+        assert rb_exc.value.status_code == 400
+        assert rb_exc.value.detail["code"] == "model_retired"
+        assert events.index("catalog_shared_lock") < events.index("lock_automation")
+        assert update_mock.call_count == 0
+
+    def test_r4_6_batch_retire_rejects_conflicting_clear_subagent_and_successor_400(
+        self,
+    ) -> None:
+        from src.dalton.services.team_model_catalog.service import (
+            _validate_and_replace_references_in_tx,
+        )
+        from src.dalton.services.team_model_catalog.validation import ModelRetireInput
+
+        # 1. Pydantic input model raises 400 CatalogValidationError
+        with pytest.raises(CatalogValidationError) as exc1:
+            ModelRetireInput(clear_subagent_model=True, successor_model="gpt-test")
+        assert exc1.value.status_code == 400
+        assert exc1.value.code == "conflicting_retire_options"
+
+        # 2. Service replacement guard raises the same 400 even if called directly
+        cat = _compile_test_catalog({"schema": CATALOG_SCHEMA}, revision=2)
+        refs = {
+            "agent_config": {},
+            "dalton_settings": {},
+            "bundled_plugin_subagents": {},
+            "plugin_subagents": [],
+            "user_subagents": [
+                {
+                    "user_subagent_id": "33333333-3333-4333-8333-333333333333",
+                    "user_id": "u-1",
+                    "name": "researcher",
+                    "model": "model-a",
+                    "fields": {"model": "model-a"},
+                    "updated_at": "2026-11-25T00:00:00Z",
+                }
+            ],
+            "automations": [],
+            "user_preferences": [],
+        }
+        with pytest.raises(CatalogValidationError) as exc2:
+            asyncio.run(
+                _validate_and_replace_references_in_tx(
+                    object(),
+                    retired_key="model-a",
+                    successor_model="gpt-test",
+                    refs=refs,
+                    post_compiled=cat,
+                    clear_subagent_model=True,
+                )
+            )
+        assert exc2.value.status_code == 400
+        assert exc2.value.code == "conflicting_retire_options"
+
+    def test_r4_7_subagent_settings_and_platform_key_configured_use_variant_binding_no_500(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from ptc_agent.agent.subagents.merge import BaseSubagent
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.llms.llm import LLM, platform_key_configured
+        from src.server.app import subagents as subagents_router
+        from src.server.database import user_subagents as us_db
+        from src.server.services.subagents import context as sub_ctx_mod
+        from src.server.services.subagents import writes as sub_writes_mod
+
+        cat = _compile_test_catalog(
+            {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "provider_variants": {
+                        "openai": {
+                            "corp-gw": {
+                                "display_name": "Corp GW",
+                                "sdk": "openai",
+                                "access_type": "api_key",
+                                "billing": "cash",
+                                "base_url": "https://corp-llm.example.com/v1",
+                            }
+                        }
+                    },
+                    "models": {
+                        "corp-gw": [
+                            {"id": "corp-m1", "pricing": {"input": 1.0, "output": 3.0}}
+                        ]
+                    },
+                },
+                "models": {
+                    "corp-model": {
+                        "model_id": "corp-m1",
+                        "provider": "corp-gw",
+                        "display_name": "Corp Model",
+                        "visible": True,
+                    }
+                },
+            },
+            revision=5,
+        )
+        monkeypatch.setattr(LLM, "get_model_config", classmethod(lambda cls: cat.model_config))
+
+        # Bound credential present -> True without constructing LLM
+        bound_row = {
+            "provider_slug": "corp-gw",
+            "bound_base_url": "https://corp-llm.example.com/v1",
+            "canonical_bound_url": "https://corp-llm.example.com:443/v1",
+            "key_fingerprint": make_key_fingerprint("sk-corp-1234"),
+        }
+        orig_get_cred_sync = tmc_db.get_catalog_provider_credential_sync
+        orig_get_cred_async = tmc_db.get_catalog_provider_credential
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_provider_credential_sync",
+            create_autospec(orig_get_cred_sync, return_value=bound_row),
+        )
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_provider_credential",
+            create_autospec(orig_get_cred_async, return_value=bound_row),
+        )
+
+        assert platform_key_configured("corp-model") is True
+
+        # Missing credential -> False (never raises CatalogVariantSecurityError!)
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_provider_credential_sync",
+            create_autospec(orig_get_cred_sync, return_value=None),
+        )
+        assert platform_key_configured("corp-model") is False
+
+        # SubagentContext.model_has_key & GET /subagents list endpoint succeed (200) after saving variant model
+        from datetime import datetime, timezone
+
+        from ptc_agent.agent.subagents.definition import SubagentDefinition
+
+        async def _always_allow(_tier: int) -> bool:
+            return True
+
+        base = BaseSubagent(
+            key="builtin:research",
+            definition=SubagentDefinition(
+                name="research",
+                description="Research assistant",
+                role_prompt="Research well.",
+                tools=["web_search"],
+            ),
+        )
+        ctx = sub_ctx_mod.SubagentContext(
+            user_id="u-1",
+            bases={"research": base},
+            offered=("research",),
+            model_pref={},
+            is_byok=True,
+            permits=_always_allow,
+            search_provider="tavily",
+            search_depth="basic",
+            skills=frozenset(),
+            connectors=(),
+            brokerages_connected=False,
+            oauth_accounts={},
+        )
+        assert asyncio.run(ctx.model_has_key("corp-model")) is True
+
+        saved_rows = [
+            {
+                "name": "research",
+                "kind": "override",
+                "base_key": "builtin:research",
+                "fields": {"model": "corp-model"},
+                "updated_at": datetime(2026, 11, 25, 10, 0, tzinfo=timezone.utc),
+            }
+        ]
+        monkeypatch.setattr(
+            sub_writes_mod,
+            "load_context",
+            create_autospec(sub_writes_mod.load_context, return_value=ctx),
+        )
+        monkeypatch.setattr(
+            us_db,
+            "list_user_subagents",
+            create_autospec(us_db.list_user_subagents, return_value=saved_rows),
+        )
+        monkeypatch.setattr(
+            sub_writes_mod,
+            "attach_titles",
+            create_autospec(sub_writes_mod.attach_titles),
+        )
+        monkeypatch.setattr(
+            ctx,
+            "model_on_plan",
+            create_autospec(ctx.model_on_plan, return_value=True),
+        )
+
+        resp = asyncio.run(subagents_router.get_subagents(user_id="u-1"))
+        assert resp["subagents"]
+        research_view = next(v for v in resp["subagents"] if v["name"] == "research")
+        assert research_view["model"] == "corp-model"
+        assert not any(
+            p.get("code") == "model_unavailable" for p in research_view.get("problems") or []
+        )
+
+    def test_r4_8_chained_rollback_restores_different_preference_fields(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.team_model_catalog import service as tmc_service
+        from src.server.database import user as user_db
+
+        # Hop 1 retires preferred_model: model-a -> model-c (T0 -> T1)
+        # Hop 2 retires flash_model: model-b -> gpt-test (T1 -> T2) without user editing in between
+        hop1 = {
+            "kind": "user_preference",
+            "id": "u-1",
+            "user_id": "u-1",
+            "before": {"model_preference.preferred_model": "model-a"},
+            "after": {"model_preference.preferred_model": "model-c"},
+            "before_updated_at": "2026-11-25T10:00:00Z",
+            "after_updated_at": "2026-11-25T10:01:00Z",
+        }
+        hop2 = {
+            "kind": "user_preference",
+            "id": "u-1",
+            "user_id": "u-1",
+            "before": {"model_preference.flash_model": "model-b"},
+            "after": {"model_preference.flash_model": "gpt-test"},
+            "before_updated_at": "2026-11-25T10:01:00Z",
+            "after_updated_at": "2026-11-25T10:02:00Z",
+        }
+        target, reason = resolve_chained_side_effect_target(
+            [hop2, hop1],
+            current_version="2026-11-25T10:02:00Z",
+            current_value={
+                "model_preference.preferred_model": "model-c",
+                "model_preference.flash_model": "gpt-test",
+            },
+            version_kind="updated_at",
+        )
+        assert reason is None
+        assert target == {
+            "model_preference.preferred_model": "model-a",
+            "model_preference.flash_model": "model-b",
+        }
+
+        # End-to-end rollback_catalog writes both fields and records actual_before / actual_after
+        written_mp: list[dict[str, Any]] = []
+
+        class _FakeCur:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def execute(self, sql: str, params: Any = None) -> None:
+                if "UPDATE user_preferences" in sql and params:
+                    written_mp.append(dict(params[0].obj))
+
+            async def fetchone(self):
+                return {"updated_at": "2026-11-25T10:03:00Z"}
+
+        class _FakeConn:
+            @asynccontextmanager
+            async def transaction(self):
+                yield
+
+            def cursor(self, *args, **kwargs):
+                return _FakeCur()
+
+        @asynccontextmanager
+        async def _fake_get_db(_conn=None):
+            yield _FakeConn()
+
+        monkeypatch.setattr(tmc_service, "get_db_connection", _fake_get_db)
+        monkeypatch.setattr(
+            tmc_service,
+            "acquire_catalog_exclusive_lock",
+            create_autospec(tmc_service.acquire_catalog_exclusive_lock),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "get_catalog_row",
+            create_autospec(
+                tmc_service.get_catalog_row,
+                return_value={
+                    "revision": 2,
+                    "payload": {
+                        "schema": CATALOG_SCHEMA,
+                        "retired": [{"key": "model-a"}, {"key": "model-b"}],
+                    },
+                    "payload_sha256": "sha2",
+                    "legacy_sync_import_status": "not_applicable",
+                    "last_known_legacy_retired": [],
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "get_catalog_revision",
+            create_autospec(
+                tmc_service.get_catalog_revision,
+                return_value={"revision": 0, "payload": {"schema": CATALOG_SCHEMA}},
+            ),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "list_catalog_provider_credentials",
+            create_autospec(tmc_service.list_catalog_provider_credentials, return_value={}),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "list_revisions_between",
+            create_autospec(
+                tmc_service.list_revisions_between,
+                return_value=[
+                    {"revision": 1, "side_effects": [hop1]},
+                    {"revision": 2, "side_effects": [hop2]},
+                ],
+            ),
+        )
+        monkeypatch.setattr(
+            user_db,
+            "lock_user_preferences",
+            create_autospec(
+                user_db.lock_user_preferences,
+                return_value={
+                    "user_id": "u-1",
+                    "model_preference": {
+                        "preferred_model": "model-c",
+                        "flash_model": "gpt-test",
+                    },
+                    "agent_preference": {},
+                    "updated_at": "2026-11-25T10:02:00Z",
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            user_db,
+            "invalidate_user_prefs_cache",
+            create_autospec(user_db.invalidate_user_prefs_cache),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "save_catalog_revision",
+            create_autospec(
+                tmc_service.save_catalog_revision,
+                return_value={
+                    "catalog": {"revision": 3},
+                    "revision_record": {"revision": 3},
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "publish_catalog_changed",
+            create_autospec(tmc_service.publish_catalog_changed),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "invalidate_catalog_redis_caches",
+            create_autospec(tmc_service.invalidate_catalog_redis_caches),
+        )
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr("src.dalton.llm.overlay._is_native_oauth_sync_enabled", lambda: False)
+
+        res = asyncio.run(
+            rollback_catalog(
+                actor_user_id="admin-1",
+                data=CatalogRollbackInput(target_revision=0, expected_revision=2),
+            )
+        )
+        assert len(written_mp) == 1
+        assert written_mp[0]["preferred_model"] == "model-a"
+        assert written_mp[0]["flash_model"] == "model-b"
+        assert len(res["restored_tasks"]) == 1
+        assert res["restored_tasks"][0]["before"] == {
+            "model_preference.preferred_model": "model-c",
+            "model_preference.flash_model": "gpt-test",
+        }
+        assert res["restored_tasks"][0]["after"] == {
+            "model_preference.preferred_model": "model-a",
+            "model_preference.flash_model": "model-b",
+        }
+
+    def test_r4_9_models_endpoint_pricing_and_metadata_pinned_to_compiled_catalog_revision(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi import Response
+
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.llms.llm import LLM
+        from src.server.app import api_keys as api_keys_router
+
+        cat_v1 = _compile_test_catalog(
+            {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "model_overrides": {
+                        "openai": {"gpt-test": {"pricing": {"input": 2.0, "output": 8.0}}}
+                    }
+                },
+            },
+            revision=1,
+        )
+        cat_v2 = _compile_test_catalog(
+            {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "model_overrides": {
+                        "openai": {"gpt-test": {"pricing": {"input": 9.0, "output": 27.0}}}
+                    }
+                },
+            },
+            revision=2,
+        )
+
+        # Switch live global LLM.get_model_config() to v2 while calling metadata on v1
+        monkeypatch.setattr(LLM, "get_model_config", classmethod(lambda cls: cat_v2.model_config))
+        v1_meta = cat_v1.model_config.get_model_metadata()
+        assert v1_meta["gpt-test"]["pricing"] == {"input": 2.0, "output": 8.0}
+
+        # Also test GET /api/v1/models: header revision=1 must match body pricing (2.0 / 8.0)
+        # even if global live catalog already flipped to revision=2 (9.0 / 27.0)
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_async",
+            create_autospec(compiled_mod.get_compiled_catalog_async, return_value=cat_v1),
+        )
+        resp = Response()
+        body = asyncio.run(api_keys_router.list_models(resp))
+        assert resp.headers["X-Dalton-Catalog-Revision"] == "1"
+        assert body["catalog_revision"] == 1
+        assert body["model_metadata"]["gpt-test"]["pricing"] == {"input": 2.0, "output": 8.0}
+
+    def test_r4_10_restore_factory_default_rejects_non_factory_key_400_without_partial_cleanup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.team_model_catalog import service as tmc_service
+        from src.dalton.services.team_model_catalog.service import restore_factory_default_model
+
+        class _FakeConn:
+            @asynccontextmanager
+            async def transaction(self):
+                yield
+
+        @asynccontextmanager
+        async def _fake_get_db(_conn=None):
+            yield _FakeConn()
+
+        payload = {
+            "schema": CATALOG_SCHEMA,
+            "models": {
+                "team-only-model": {
+                    "model_id": "team-only-1",
+                    "provider": "openai",
+                    "display_name": "Team Only",
+                    "visible": True,
+                }
+            },
+            "dalton_meta": {"team-only-model": {"billing": "cash", "tool_calling": True}},
+            "task_costs": {"bounds": {"team-only-model": {"model": "gpt-test", "times": 1.0}}},
+        }
+        save_mock = create_autospec(tmc_service.save_catalog_revision)
+        monkeypatch.setattr(tmc_service, "get_db_connection", _fake_get_db)
+        monkeypatch.setattr(
+            tmc_service,
+            "acquire_catalog_exclusive_lock",
+            create_autospec(tmc_service.acquire_catalog_exclusive_lock),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "get_catalog_row",
+            create_autospec(
+                tmc_service.get_catalog_row,
+                return_value={
+                    "revision": 3,
+                    "payload": payload,
+                    "payload_sha256": "sha3",
+                    "legacy_sync_import_status": "not_applicable",
+                    "last_known_legacy_retired": [],
+                },
+            ),
+        )
+        monkeypatch.setattr(tmc_service, "save_catalog_revision", save_mock)
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        with pytest.raises(CatalogValidationError) as exc_info:
+            asyncio.run(
+                restore_factory_default_model(
+                    actor_user_id="admin-1",
+                    model_key="team-only-model",
+                    expected_revision=3,
+                )
+            )
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.code == "not_a_factory_model"
+        assert save_mock.call_count == 0
+        # Original payload left completely untouched (no partial cleanup of dalton_meta or task_costs)
+        assert "team-only-model" in payload["dalton_meta"]
+        assert "team-only-model" in payload["task_costs"]["bounds"]

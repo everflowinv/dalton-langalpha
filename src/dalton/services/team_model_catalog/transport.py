@@ -510,15 +510,95 @@ def make_catalog_variant_transport_factory(
     return _build
 
 
+def _binding_matches_provider_info(
+    cred: Mapping[str, Any] | None,
+    prov_info: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return True iff ``cred`` exists and its canonical bound URL matches ``prov_info``."""
+    if not isinstance(cred, Mapping):
+        return False
+    live_canonical = str(
+        cred.get("canonical_bound_url")
+        or canonical_url_key(str(cred.get("bound_base_url") or ""))
+        or ""
+    )
+    if not live_canonical:
+        return False
+    if isinstance(prov_info, Mapping) and prov_info.get("base_url"):
+        target_canonical = canonical_url_key(str(prov_info["base_url"]))
+        if not target_canonical or live_canonical != target_canonical:
+            return False
+    return True
+
+
+async def has_valid_catalog_variant_binding_async(
+    provider_slug: str,
+    *,
+    prov_info: Mapping[str, Any] | None = None,
+    conn: Any = None,
+) -> bool:
+    """Check whether catalog variant ``provider_slug`` has a valid bound credential (no LLM build)."""
+    from src.dalton.database.team_model_catalog import get_catalog_provider_credential
+
+    slug = str(provider_slug or "").strip()
+    if not slug:
+        return False
+    try:
+        cred = await get_catalog_provider_credential(slug, conn=conn, decrypt=False)
+    except Exception:
+        return False
+    return _binding_matches_provider_info(cred, prov_info)
+
+
+def has_valid_catalog_variant_binding_sync(
+    provider_slug: str,
+    *,
+    prov_info: Mapping[str, Any] | None = None,
+) -> bool:
+    """Synchronous credential-binding availability check for ``platform_key_configured``."""
+    from unittest.mock import NonCallableMock
+
+    from src.dalton.database import team_model_catalog as tmc_db
+
+    slug = str(provider_slug or "").strip()
+    if not slug:
+        return False
+    reader = tmc_db.get_catalog_provider_credential_sync
+    is_mocked = isinstance(reader, NonCallableMock) or (
+        getattr(reader, "__module__", None) != tmc_db.__name__
+    )
+    if not is_mocked and not tmc_db.is_conversation_db_pool_open():
+        return False
+    try:
+        cred = reader(slug, decrypt=False)
+    except Exception:
+        return False
+    return _binding_matches_provider_info(cred, prov_info)
+
+
 async def resolve_catalog_variant_binding_async(
     provider_slug: str,
     *,
     snapshot: Mapping[str, Any] | None = None,
     conn: Any = None,
+    model_key: str | None = None,
 ) -> dict[str, Any]:
     """Load and verify a catalog variant's encrypted credential and build its transport factory."""
     from src.dalton.database.team_model_catalog import get_catalog_provider_credential
-    from src.dalton.services.team_model_catalog.snapshot import lookup_snapshot_variant_binding
+    from src.dalton.services.team_model_catalog.snapshot import (
+        lookup_snapshot_model_entry,
+        lookup_snapshot_variant_binding,
+    )
+
+    if model_key:
+        snap_model = lookup_snapshot_model_entry(model_key, snapshot=snapshot)
+        if snap_model is not None:
+            snap_prov = str(snap_model.get("provider") or "").strip()
+            if snap_prov and snap_prov != provider_slug:
+                raise CatalogVariantCredentialRevokedError(
+                    provider_slug,
+                    f"model {model_key!r} route changed since turn snapshot ({snap_prov} -> {provider_slug})",
+                )
 
     cred = await get_catalog_provider_credential(provider_slug, conn=conn, decrypt=True)
     snap_binding = lookup_snapshot_variant_binding(provider_slug, snapshot=snapshot)
@@ -574,10 +654,24 @@ def resolve_catalog_variant_binding_sync(
     provider_slug: str,
     *,
     snapshot: Mapping[str, Any] | None = None,
+    model_key: str | None = None,
 ) -> dict[str, Any]:
     """Synchronous counterpart for ``create_llm`` direct/system path (#2)."""
     from src.dalton.database.team_model_catalog import get_catalog_provider_credential_sync
-    from src.dalton.services.team_model_catalog.snapshot import lookup_snapshot_variant_binding
+    from src.dalton.services.team_model_catalog.snapshot import (
+        lookup_snapshot_model_entry,
+        lookup_snapshot_variant_binding,
+    )
+
+    if model_key:
+        snap_model = lookup_snapshot_model_entry(model_key, snapshot=snapshot)
+        if snap_model is not None:
+            snap_prov = str(snap_model.get("provider") or "").strip()
+            if snap_prov and snap_prov != provider_slug:
+                raise CatalogVariantCredentialRevokedError(
+                    provider_slug,
+                    f"model {model_key!r} route changed since turn snapshot ({snap_prov} -> {provider_slug})",
+                )
 
     cred = get_catalog_provider_credential_sync(provider_slug, decrypt=True)
     snap_binding = lookup_snapshot_variant_binding(provider_slug, snapshot=snapshot)

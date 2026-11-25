@@ -26,6 +26,7 @@ from src.dalton.services.team_model_catalog.constants import (
     compute_payload_sha256,
     empty_catalog_payload,
     norm_id,
+    normalize_cash_pricing_card,
 )
 
 logger = logging.getLogger(__name__)
@@ -223,15 +224,24 @@ def _merge_db_payload_layer(
             for p_name, p_list in prov_models.items():
                 if not isinstance(p_list, list):
                     continue
+                normalized_list: list[Any] = []
+                for raw_item in p_list:
+                    if isinstance(raw_item, Mapping):
+                        c_item = copy.deepcopy(dict(raw_item))
+                        if isinstance(c_item.get("pricing"), Mapping):
+                            c_item["pricing"] = normalize_cash_pricing_card(c_item["pricing"])
+                        normalized_list.append(c_item)
+                    else:
+                        normalized_list.append(copy.deepcopy(raw_item))
                 existing_cards = target_models.get(p_name)
                 if not isinstance(existing_cards, list):
-                    target_models[p_name] = copy.deepcopy(p_list)
+                    target_models[p_name] = normalized_list
                     continue
                 by_norm: dict[str, dict[str, Any]] = {}
                 for card in existing_cards:
                     if isinstance(card, dict) and card.get("id"):
                         by_norm[norm_id(str(card["id"]))] = card
-                for item in p_list:
+                for item in normalized_list:
                     if not isinstance(item, Mapping):
                         continue
                     item_id = str(item.get("id") or "").strip()
@@ -244,6 +254,10 @@ def _merge_db_payload_layer(
                             item_id,
                         )
                         _deep_merge_patch(by_norm[n_id], dict(item))
+                        if isinstance(by_norm[n_id].get("pricing"), Mapping):
+                            by_norm[n_id]["pricing"] = normalize_cash_pricing_card(
+                                by_norm[n_id]["pricing"]
+                            )
                     else:
                         cloned = copy.deepcopy(dict(item))
                         existing_cards.append(cloned)
@@ -281,7 +295,12 @@ def _merge_db_payload_layer(
                             card_id,
                         )
                         continue
-                    _deep_merge_patch(card, dict(patch))
+                    patch_copy = copy.deepcopy(dict(patch))
+                    if isinstance(patch_copy.get("pricing"), Mapping):
+                        patch_copy["pricing"] = normalize_cash_pricing_card(patch_copy["pricing"])
+                    _deep_merge_patch(card, patch_copy)
+                    if isinstance(card.get("pricing"), Mapping):
+                        card["pricing"] = normalize_cash_pricing_card(card["pricing"])
 
     # 4. Models (with §7.2 upgrade same-name promotion by key.lower())
     key_lower_map = {str(k).lower(): str(k) for k in llm_config}

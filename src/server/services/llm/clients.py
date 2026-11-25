@@ -418,8 +418,11 @@ async def resolve_byok_llm_client(
         return None
 
     from src.llms.llm import LLM as LLMFactory, create_llm, create_llm_from_custom
+    # DALTON-HOOK(team-model-catalog): overlay active turn snapshot onto ModelConfig so resumed turns
+    # keep the snapshotted provider route and verify credential bindings against the original route.
+    from src.dalton.services.team_model_catalog.snapshot import overlay_model_config_with_snapshot
 
-    mc = LLMFactory.get_model_config()
+    mc = overlay_model_config_with_snapshot(LLMFactory.get_model_config())
     # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to classify_model and byok_key
     source, config_entry = await user_models.classify_model(
         user_id,
@@ -436,7 +439,9 @@ async def resolve_byok_llm_client(
                 resolve_catalog_variant_binding_async,
             )
 
-            binding = await resolve_catalog_variant_binding_async(sys_provider)
+            binding = await resolve_catalog_variant_binding_async(
+                sys_provider, model_key=model_name
+            )
             return create_llm(
                 model_name,
                 api_key=binding["api_key"],

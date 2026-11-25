@@ -20,7 +20,12 @@ from src.config.env import HOST_IP
 from src.server.services.llm import key_probe
 from src.server.services.llm.config import deployment_key, deployment_local_provider
 from src.server.services.llm.egress import EndpointRefused
-from src.server.services.llm.provider_catalog import key_candidates, provider_catalog
+from src.server.services.llm.provider_catalog import (
+    build_key_candidates,
+    build_provider_catalog,
+    key_candidates,
+    provider_catalog,
+)  # DALTON-HOOK(team-model-catalog): derive provider_catalog/key_candidates from pinned compiled ModelConfig
 from src.server.utils.api import CurrentUserId
 from src.utils.cache.throttle import throttle
 from src.server.database.api_keys import (
@@ -838,9 +843,12 @@ async def list_models(response: Response):
             for provider, model_list in models.items()
         },
         # DALTON-HOOK(standalone-core): mark text-only models so core setup excludes non-tool models
+        # DALTON-HOOK(team-model-catalog): pass compiled_catalog.dalton_meta so metadata aligns with X-Dalton-Catalog-Revision
         "model_metadata": __import__(
             "src.dalton.llm.role_policy", fromlist=["annotate_model_metadata_tool_calling"]
-        ).annotate_model_metadata_tool_calling(config.get_model_metadata()),
+        ).annotate_model_metadata_tool_calling(
+            config.get_model_metadata(), dalton_meta=compiled_catalog.dalton_meta
+        ),
         "system_defaults": {
             # One source with the default-model reassignment on preference
             # writes, so "threads on the old default" means what the composer showed.
@@ -863,10 +871,12 @@ async def list_models(response: Response):
         },
         "compaction_profiles": COMPACTION_PROFILES,
         # model_metadata's task_cost values are multiples of this model at this level.
-        "task_cost_baseline": task_cost_baseline(),
+        # DALTON-HOOK(team-model-catalog): derive task_cost_baseline, provider_catalog & key_candidates
+        # from the same compiled_catalog as X-Dalton-Catalog-Revision.
+        "task_cost_baseline": task_cost_baseline(costs=compiled_catalog.task_costs),
         "search_providers": search_providers,
-        "provider_catalog": provider_catalog(),
-        "key_candidates": key_candidates(),
+        "provider_catalog": build_provider_catalog(config),
+        "key_candidates": build_key_candidates(config),
         # A pick from a gateway's list is tuned as the built-in it matched.
         "gateway_index": gateway_index(config),
         # DALTON-HOOK(antigravity-series): expose Antigravity series grouping & centralized default efforts

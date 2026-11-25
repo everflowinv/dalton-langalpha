@@ -358,11 +358,17 @@ class ModelConfig:
     def _baseline_list_rates(self) -> Optional[tuple[float, float]]:
         """The task-cost baseline model's list rates, which an estimate is
         a multiple of, or None without a baseline or a price for it."""
-        baseline = task_cost_baseline()
+        # DALTON-HOOK(team-model-catalog): derive baseline & rates from this ModelConfig instance
+        # (and its task_costs_override), never re-reading the live global catalog.
+        baseline = task_cost_baseline(costs=getattr(self, "task_costs_override", None))
         info = self.llm_config.get(baseline["model"]) if baseline else None
         if not info:
             return None
-        return get_list_rates(info.get("model_id", baseline["model"]), info.get("provider"))
+        return get_list_rates(
+            info.get("model_id", baseline["model"]),
+            info.get("provider"),
+            model_config=self,
+        )
 
     def listed_models(self) -> list[tuple[str, dict[str, Any]]]:
         """The rows the catalog lists: the visible ones, a Claude Code row only
@@ -454,7 +460,13 @@ class ModelConfig:
                 entry["native_compaction"] = native
             # List rates, USD per 1M tokens, read live from providers.json so
             # they follow every price change.
-            rates = get_list_rates(model_info.get("model_id", model_name), provider)
+            # DALTON-HOOK(team-model-catalog): resolve list rates from this ModelConfig instance
+            # so GET /api/v1/models pricing matches X-Dalton-Catalog-Revision atomically.
+            rates = get_list_rates(
+                model_info.get("model_id", model_name),
+                provider,
+                model_config=self,
+            )
             if rates is not None:
                 entry["pricing"] = {
                     "input": round(rates[0], 4),
@@ -711,13 +723,23 @@ class LLM:
                 compiled = get_compiled_catalog_sync()
                 if compiled is not None and compiled.model_config is not None:
                     cls._model_config = compiled.model_config
-                    return compiled.model_config
+                    # DALTON-HOOK(team-model-catalog): overlay active turn snapshot (never mutating cls._model_config)
+                    from src.dalton.services.team_model_catalog.snapshot import (
+                        overlay_model_config_with_snapshot,
+                    )
+
+                    return overlay_model_config_with_snapshot(compiled.model_config)
             except Exception as exc:
                 logger.debug("CompiledCatalog lookup fell back to local ModelConfig: %s", exc)
         # DALTON-HOOK(llm-overlay): rebuild when the overlay file changed (re-sync button)
         if cls._model_config is None or overlay_changed(getattr(cls._model_config, "overlay_stamp", None)):
             cls._model_config = ModelConfig()
-        return cls._model_config
+        # DALTON-HOOK(team-model-catalog): overlay active turn snapshot (never mutating cls._model_config)
+        from src.dalton.services.team_model_catalog.snapshot import (
+            overlay_model_config_with_snapshot,
+        )
+
+        return overlay_model_config_with_snapshot(cls._model_config)
 
     def __init__(
         self,
@@ -754,7 +776,12 @@ class LLM:
         self.egress_transport = egress_transport
         self.follow_redirects = follow_redirects
         self._catalog_credential_source = _catalog_credential_source  # DALTON-HOOK(team-model-catalog)
-        self.model_config = self.get_model_config()
+        # DALTON-HOOK(team-model-catalog): ensure active turn/resume snapshot overlays model route & parameters
+        from src.dalton.services.team_model_catalog.snapshot import (
+            overlay_model_config_with_snapshot,
+        )
+
+        self.model_config = overlay_model_config_with_snapshot(self.get_model_config())
         spec = (
             model
             if isinstance(model, ModelSpec)
@@ -1642,9 +1669,14 @@ def create_llm(
         A LangChain chat model instance
     """
     # DALTON-HOOK(team-model-catalog): auto-bind dedicated catalog variant credentials &
-    # CatalogVariantTransport on direct create_llm calls (zero env_key fallback).
+    # CatalogVariantTransport on direct create_llm calls (zero env_key fallback), honoring
+    # any active turn/resume effective_catalog_snapshot route & credential fingerprint.
     if "_catalog_credential_source" not in kwargs:
-        mc = LLM.get_model_config()
+        from src.dalton.services.team_model_catalog.snapshot import (
+            overlay_model_config_with_snapshot,
+        )
+
+        mc = overlay_model_config_with_snapshot(LLM.get_model_config())
         m_cfg = mc.get_model_config(model) if isinstance(model, str) else None
         prov = str(m_cfg.get("provider") or "") if isinstance(m_cfg, dict) else ""
         if prov and mc.get_provider_info(prov).get("catalog_defined"):
@@ -1652,7 +1684,7 @@ def create_llm(
                 resolve_catalog_variant_binding_sync,
             )
 
-            binding = resolve_catalog_variant_binding_sync(prov)
+            binding = resolve_catalog_variant_binding_sync(prov, model_key=model)
             api_key = binding["api_key"]
             base_url = binding["bound_base_url"]
             kwargs["egress_transport"] = binding["egress_transport"]
@@ -1675,6 +1707,19 @@ def create_llm(
 def platform_key_configured(model_name: str) -> bool:
     """Whether the deployment holds a key for a catalog model, the one
     ``create_llm`` reads when no override is passed."""
+    # DALTON-HOOK(team-model-catalog): check catalog-defined variant availability via bound
+    # credential metadata instead of constructing an unauthenticated LLM client.
+    mc = LLM.get_model_config()
+    m_cfg = mc.get_model_config(model_name)
+    if isinstance(m_cfg, dict):
+        prov = str(m_cfg.get("provider") or "").strip()
+        prov_info = mc.get_provider_info(prov) if prov else {}
+        if prov_info.get("catalog_defined"):
+            from src.dalton.services.team_model_catalog.transport import (
+                has_valid_catalog_variant_binding_sync,
+            )
+
+            return has_valid_catalog_variant_binding_sync(prov, prov_info=prov_info)
     try:
         LLM(model_name)._resolve_api_key()
     except MissingProviderKeyError:

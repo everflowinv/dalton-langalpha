@@ -1050,45 +1050,53 @@ async def astream_ptc_workflow(
         # The user's other computers this turn's calls run on, which its end
         # backs up beside its own.
         reached_computers: set[str] = set()
+        # DALTON-HOOK(team-model-catalog): bind persisted turn snapshot across graph construction so
+        # lazily built clients/middlewares honor snapshotted provider routes & parameters.
+        from contextlib import nullcontext
+
+        from src.dalton.services.team_model_catalog.snapshot import bind_catalog_snapshot
+
+        _graph_snap = getattr(run_handle, "catalog_snapshot", None)
         # DALTON-HOOK(colleague-dispatch): strip Task/schedule_wakeup on post-revocation tail turn
-        ptc_graph = await build_ptc_graph_with_session(
-            session=session,
-            config=config,
-            # Optional structural gate: builds the agent without
-            # Task/TaskOutput. Task report-back turns don't set it (they
-            # need TaskOutput to fetch the result); their re-announce
-            # recursion is handled by the outbox's ledger arbitration.
-            disable_subagents=bool(request.disable_subagents),
-            operation_callback=None,
-            # I2: the run's fenced session-bound saver when the WriterGuard
-            # is active; the global pooled saver otherwise.
-            checkpointer=run_handle.checkpointer,
-            background_registry=background_registry,
-            # I2 (2.4e): the guard doubles as the task-namespace fence —
-            # each background subagent takes exclusive N(thread, task:id) on
-            # the run's pinned session before it may write.
-            namespace_owner=run_handle.guard,
-            **inputs.build_kwargs(),
-            **(
-                {"tail_turn_no_new_work": True}
-                if tail_turn_no_new_work
-                else {}
-            ),
-            order_ledger=order_ledger_for_turn(
-                user_id=user_id,
-                workspace_id=workspace_id,
-                thread_id=thread_id,
-                run_id=run_id,
-                turn_index=run_handle.turn_index,
-            ),
-            turn_context=turn_context,
-            # A port, not a value: the switch can flip mid-turn from any
-            # worker, so the agent re-reads the row on every call.
-            subagent_switch=partial(read_thread_subagents_allowed, thread_id),
-            window_coverage=partial(runs_held, thread_id),
-            cancel_notices=ThreadCancelNotices(thread_id, turn_context.tool_timezone),
-            reached_computers=reached_computers,
-        )
+        with bind_catalog_snapshot(_graph_snap) if _graph_snap is not None else nullcontext():
+            ptc_graph = await build_ptc_graph_with_session(
+                session=session,
+                config=config,
+                # Optional structural gate: builds the agent without
+                # Task/TaskOutput. Task report-back turns don't set it (they
+                # need TaskOutput to fetch the result); their re-announce
+                # recursion is handled by the outbox's ledger arbitration.
+                disable_subagents=bool(request.disable_subagents),
+                operation_callback=None,
+                # I2: the run's fenced session-bound saver when the WriterGuard
+                # is active; the global pooled saver otherwise.
+                checkpointer=run_handle.checkpointer,
+                background_registry=background_registry,
+                # I2 (2.4e): the guard doubles as the task-namespace fence —
+                # each background subagent takes exclusive N(thread, task:id) on
+                # the run's pinned session before it may write.
+                namespace_owner=run_handle.guard,
+                **inputs.build_kwargs(),
+                **(
+                    {"tail_turn_no_new_work": True}
+                    if tail_turn_no_new_work
+                    else {}
+                ),
+                order_ledger=order_ledger_for_turn(
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    turn_index=run_handle.turn_index,
+                ),
+                turn_context=turn_context,
+                # A port, not a value: the switch can flip mid-turn from any
+                # worker, so the agent re-reads the row on every call.
+                subagent_switch=partial(read_thread_subagents_allowed, thread_id),
+                window_coverage=partial(runs_held, thread_id),
+                cancel_notices=ThreadCancelNotices(thread_id, turn_context.tool_timezone),
+                reached_computers=reached_computers,
+            )
 
         _mark_phase("graph_build")
 

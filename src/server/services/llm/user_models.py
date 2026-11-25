@@ -283,7 +283,10 @@ async def classify_model(
         if custom_cm:
             return ModelSource.CUSTOM, custom_cm
 
-    mc = LLMFactory.get_model_config()
+    # DALTON-HOOK(team-model-catalog): honor bound turn effective_catalog_snapshot when classifying system models
+    from src.dalton.services.team_model_catalog.snapshot import overlay_model_config_with_snapshot
+
+    mc = overlay_model_config_with_snapshot(LLMFactory.get_model_config())
     system_info = mc.get_model_config(model_name)
     if system_info:
         return ModelSource.SYSTEM, system_info
