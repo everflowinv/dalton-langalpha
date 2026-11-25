@@ -257,8 +257,8 @@ async def _resolve_model_pricing_identity(
                     )
                 except Exception:
                     byok_route = None
-                if byok_route is not None and isinstance(byok_route[2], dict):
-                    routed_entry = byok_route[2]
+                if byok_route is not None and isinstance(byok_route.custom_config, dict):
+                    routed_entry = byok_route.custom_config
                 elif entry_provider:
                     cp_cfg = await user_models.get_custom_provider_config(user_id, entry_provider)
                     if cp_cfg and isinstance(cp_cfg.get("parent_provider"), str):

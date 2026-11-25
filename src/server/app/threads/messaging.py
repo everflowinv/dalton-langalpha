@@ -489,8 +489,9 @@ async def _handle_send_message(
     raw_request: Request | None = None,
     *,
     retry_of_run_id: str | None = None,
-    # DALTON-HOOK(team-model-catalog): route-internal source run row for compare-and-reject resume verification
+    # DALTON-HOOK(team-model-catalog): route-internal source run row & explicit retry checkpoint for compare-and-reject resume verification
     resume_source_run: dict | None = None,
+    retry_checkpoint_id: str | None = None,
 ):
     """Shared logic for both POST /threads/messages and POST /threads/{id}/messages.
 
@@ -816,7 +817,34 @@ async def _handle_send_message(
             and not request.hitl_response
         )
         if retry_of_run_id:
-            resume_verify_run_id = str(retry_of_run_id)
+            if retry_checkpoint_id and thread_id:
+                from src.server.handlers.checkpoint_handler import (
+                    resolve_checkpoint_resume_run_id,
+                )
+
+                try:
+                    cp_owner_run_id = await resolve_checkpoint_resume_run_id(
+                        thread_id, retry_checkpoint_id
+                    )
+                except Exception as _cp_load_err:
+                    logger.warning(
+                        "[PTC_CHAT] Failed to resolve checkpoint owner for retry verification on thread=%s: %s",
+                        thread_id,
+                        type(_cp_load_err).__name__,
+                    )
+                    raise HTTPException(
+                        status_code=503,
+                        detail={
+                            "type": "resume_verification_unavailable",
+                            "code": "resume_verification_unavailable",
+                            "message": "暂时无法校验该回合的模型配置，请稍后重试。",
+                        },
+                    ) from _cp_load_err
+                resume_verify_run_id = cp_owner_run_id
+                if cp_owner_run_id != str(retry_of_run_id):
+                    resume_verify_row = None
+            else:
+                resume_verify_run_id = str(retry_of_run_id)
         elif from_service and getattr(request, "resume_of_run_id", None):
             resume_verify_run_id = str(request.resume_of_run_id)
         elif (request.hitl_response or is_direct_checkpoint_resume) and thread_id:
@@ -2130,6 +2158,7 @@ async def retry_thread(
             workspace_id = str(thread_record.get("workspace_id", ""))
 
         pending = read_pending_input(latest)
+        explicit_retry_checkpoint_id: str | None = None  # DALTON-HOOK(team-model-catalog)
         if pending is not None and not pending.replay:
             # No checkpoint holds the failed message (a new thread's first
             # send has none at all), so a replay would answer the turn
@@ -2144,12 +2173,15 @@ async def retry_thread(
             explicit_checkpoint_id = (body.checkpoint_id if body else None) or (
                 pending.checkpoint_id if pending else None
             )
+            resolved_checkpoint_id = await get_retry_checkpoint(
+                thread_id, explicit_checkpoint_id
+            )
+            if body and body.checkpoint_id:  # DALTON-HOOK(team-model-catalog)
+                explicit_retry_checkpoint_id = resolved_checkpoint_id
             request = ChatRequest(
                 workspace_id=workspace_id,
                 messages=[],
-                checkpoint_id=await get_retry_checkpoint(
-                    thread_id, explicit_checkpoint_id
-                ),
+                checkpoint_id=resolved_checkpoint_id,
                 subagents_enabled=(latest.get("metadata") or {}).get(
                     "subagents_enabled"
                 ),
@@ -2172,7 +2204,7 @@ async def retry_thread(
         request = request.model_copy(update={"checked_computer_id": checked})
     # Retry provenance travels as a route-internal parameter, never in the
     # body.
-    # DALTON-HOOK(team-model-catalog): forward retried DB row so _handle_send_message runs verify_resume_route before client build
+    # DALTON-HOOK(team-model-catalog): forward retried DB row & explicit retry checkpoint so _handle_send_message runs verify_resume_route on the right run before client build
     return await _handle_send_message(
         request,
         auth,
@@ -2180,6 +2212,11 @@ async def retry_thread(
         raw_request,
         retry_of_run_id=latest_run_id,
         resume_source_run=latest,
+        **(
+            {"retry_checkpoint_id": explicit_retry_checkpoint_id}
+            if explicit_retry_checkpoint_id
+            else {}
+        ),
     )
 
 

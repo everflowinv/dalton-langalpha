@@ -6888,11 +6888,12 @@ class TestR8Fixes:
             "byok_key",
             create_autospec(
                 llm_clients.byok_key,
-                return_value=(
-                    {"api_key": "k-coding"},
-                    "https://z-ai-cn-coding.example.com/v1",
-                    {**custom_entry, "provider": "z-ai-cn-coding"},
-                    "z-ai-cn-coding",
+                return_value=llm_clients.OwnKeyRoute(
+                    key={"api_key": "k-coding"},
+                    base_url="https://z-ai-cn-coding.example.com/v1",
+                    provider="z-ai-cn-coding",
+                    custom_config={**custom_entry, "provider": "z-ai-cn-coding"},
+                    holding="z-ai-cn-coding",
                 ),
             ),
         )
@@ -6906,3 +6907,650 @@ class TestR8Fixes:
         assert eff_prov == "z-ai-cn-coding"
         assert eff_mid == "glm-5"
         assert eff_pprov == "z-ai-cn-coding"
+
+    def test_r9_1_subagent_personal_custom_model_shadowing_team_catalog_not_rejected_on_resume(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        from langchain_core.messages import ToolMessage
+
+        from ptc_agent.agent.middleware.background_subagent import task_actions
+        from ptc_agent.config.agent import TaskAsk, TaskModelRefused
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.llms.llm import LLM as LLMFactory
+        from src.server.database import workspace as ws_db
+        from src.server.database.runs import subagent_runs
+        from src.server.services.llm import user_models
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        payload = {
+            "schema": CATALOG_SCHEMA,
+            "providers": {
+                "provider_variants": {
+                    "openai": {
+                        "sub-team-gw": {
+                            "parent_provider": "openai",
+                            "display_name": "Sub Team GW",
+                            "sdk": "openai",
+                            "billing": "cash",
+                            "base_url": "https://sub-team-gw.example.com/v1",
+                        }
+                    }
+                },
+                "models": {
+                    "sub-team-gw": [
+                        {
+                            "id": "team-shared-id",
+                            "name": "Team Shared",
+                            "pricing": {"input": 1.0, "output": 2.0},
+                        }
+                    ]
+                },
+            },
+            "models": {
+                "shared-alias": {
+                    "model_id": "team-shared-id",
+                    "provider": "sub-team-gw",
+                    "display_name": "Shared Alias",
+                    "visible": True,
+                }
+            },
+            "dalton_meta": {"shared-alias": {"billing": "cash", "tool_calling": True}},
+        }
+        cat = compile_catalog_from_payload(payload, revision=170)
+        cache_compiled_catalog(cat)
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(compiled_mod.get_compiled_catalog_sync, return_value=cat),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", cat.model_config)
+        monkeypatch.setattr(
+            tmc_db,
+            "list_catalog_provider_credentials_sync",
+            create_autospec(
+                tmc_db.list_catalog_provider_credentials_sync,
+                return_value={
+                    "sub-team-gw": {
+                        "provider_slug": "sub-team-gw",
+                        "bound_base_url": "https://sub-team-gw.example.com/v1",
+                        "canonical_bound_url": "https://sub-team-gw.example.com:443/v1",
+                        "key_fingerprint": "fp-sub-team",
+                    }
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_provider_credential",
+            create_autospec(
+                tmc_db.get_catalog_provider_credential,
+                return_value={
+                    "provider_slug": "sub-team-gw",
+                    "bound_base_url": "https://sub-team-gw.example.com/v1",
+                    "canonical_bound_url": "https://sub-team-gw.example.com:443/v1",
+                    "key_fingerprint": "fp-sub-team",
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            ws_db,
+            "lock_run_workspace",
+            create_autospec(ws_db.lock_run_workspace, return_value=None),
+        )
+
+        personal_entry = {
+            "name": "shared-alias",
+            "provider": "openai",
+            "model_id": "gpt-personal-only",
+            "base_url": "https://personal.example.com/v1",
+        }
+        team_entry = cat.model_config.get_model_config("shared-alias")
+
+        async def _fake_classify(
+            uid: str,
+            model_name: str,
+            _pref_cache: dict[str, Any] | None = None,
+            ignore_custom_models: bool = False,
+        ) -> tuple[str, dict[str, Any]]:
+            if not ignore_custom_models and uid == "u-personal" and model_name == "shared-alias":
+                return user_models.ModelSource.CUSTOM, personal_entry
+            if model_name == "shared-alias" and isinstance(team_entry, dict):
+                return user_models.ModelSource.SYSTEM, team_entry
+            return user_models.ModelSource.UNKNOWN, {}
+
+        monkeypatch.setattr(
+            user_models,
+            "classify_model",
+            create_autospec(user_models.classify_model, side_effect=_fake_classify),
+        )
+
+        active_user = {"uid": "u-personal"}
+
+        class _FakeCursor:
+            def __init__(self) -> None:
+                self._next_row: dict[str, Any] | None = None
+
+            async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+                if "AS user_id" in sql:
+                    self._next_row = {"user_id": active_user["uid"]}
+                elif "INSERT INTO subagent_runs" in sql:
+                    facts_bind = params[8]
+                    facts_dict = (
+                        dict(facts_bind.obj)
+                        if facts_bind is not None and hasattr(facts_bind, "obj")
+                        else {}
+                    )
+                    self._next_row = {
+                        "task_run_id": params[0],
+                        "thread_id": params[1],
+                        "task_id": params[2],
+                        "replay_facts": facts_dict,
+                        "user_id": active_user["uid"],
+                    }
+                else:
+                    self._next_row = None
+
+            async def fetchone(self) -> dict[str, Any] | None:
+                return self._next_row
+
+        class _FakeConn:
+            @asynccontextmanager
+            async def transaction(self) -> Any:
+                yield self
+
+            @asynccontextmanager
+            async def cursor(self, **_kw: Any) -> Any:
+                yield _FakeCursor()
+
+        # 1) Personal custom model shadowing team catalog model -> no team catalog snapshot written
+        row_personal = asyncio.run(
+            subagent_runs.start_task_run(
+                task_run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+                thread_id="thread-r9-1",
+                task_id="task-r9-personal",
+                cause="init",
+                actual_model_key="shared-alias",
+                model={"id": "shared-alias", "display_name": "Shared Alias"},
+                model_override="shared-alias",
+                conn=_FakeConn(),
+            )
+        )
+        assert "effective_catalog_snapshot" not in row_personal["replay_facts"]
+        assert "catalog_revision" not in row_personal["replay_facts"]
+
+        # 2) Control: user without personal shadow resolves to team catalog -> snapshot IS written
+        active_user["uid"] = "u-team"
+        row_team = asyncio.run(
+            subagent_runs.start_task_run(
+                task_run_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa2",
+                thread_id="thread-r9-1",
+                task_id="task-r9-team",
+                cause="init",
+                actual_model_key="shared-alias",
+                model={"id": "shared-alias", "display_name": "Shared Alias"},
+                model_override="shared-alias",
+                conn=_FakeConn(),
+            )
+        )
+        team_snap = row_team["replay_facts"].get("effective_catalog_snapshot")
+        assert isinstance(team_snap, dict)
+        assert "shared-alias" in (team_snap.get("models") or {})
+
+        # 3) Resuming u-personal's subagent with unchanged personal custom model is NOT rejected
+        sentinel_refusal = TaskModelRefused(
+            message="sentinel-reached-resolve-model", reason="sentinel"
+        )
+        resolve_spy = create_autospec(task_actions._resolve_model, return_value=sentinel_refusal)
+        monkeypatch.setattr(task_actions, "_resolve_model", resolve_spy)
+        monkeypatch.setattr(
+            task_actions,
+            "_read_latest_run",
+            create_autospec(task_actions._read_latest_run, return_value=row_personal),
+        )
+
+        fake_task = SimpleNamespace(
+            task_id="task-r9-personal",
+            display_id="Task-task-r9-personal",
+            subagent_type="research",
+            is_pending=False,
+            cancelled=False,
+            terminal_status=None,
+            asyncio_task=None,
+            result=None,
+            ask=TaskAsk(model="shared-alias"),
+            lock=asyncio.Lock(),
+        )
+
+        async def _resolve_ok_task(*_a: Any, **_kw: Any) -> Any:
+            return fake_task
+
+        fake_mw = SimpleNamespace(
+            _resolve_or_error=_resolve_ok_task,
+            subagent_types={"research"},
+            _resume_claims=set(),
+            registry=SimpleNamespace(
+                get_by_id=lambda tid: fake_task if tid == "task-r9-personal" else None,
+                run_ledger=object(),
+            ),
+            task_models=SimpleNamespace(
+                _own_model=lambda _st: "shared-alias",
+                _user_id="u-personal",
+                _model_pref={"custom_models": [personal_entry]},
+            ),
+            namespace_owner=None,
+        )
+        fake_request = SimpleNamespace(
+            tool_call={
+                "id": "tc-r9-personal",
+                "args": {"action": "resume", "task_id": "task-r9-personal"},
+            },
+            state={},
+        )
+
+        res = asyncio.run(
+            task_actions._handle_resume(
+                fake_mw,
+                fake_request,
+                handler=lambda _req: None,
+                target_task_id="task-r9-personal",
+                subagent_type=None,
+                description="resume personal shadow",
+                prompt="continue",
+                args={"action": "resume", "task_id": "task-r9-personal"},
+                parent_thread_id="thread-r9-1",
+                tool_call_id="tc-r9-personal",
+                current_run_id="parent-run-r9-1",
+                ask=TaskAsk(),
+            )
+        )
+        assert isinstance(res, ToolMessage)
+        assert resolve_spy.call_count == 1
+        assert "sentinel" in str(res.content)
+
+    def test_r9_2_retry_explicit_checkpoint_verifies_checkpoint_owner_and_default_verifies_failed_run(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services import automation_thread_model as atm_mod
+        from src.dalton.services.team_model_catalog import snapshot as snap_mod
+        from src.dalton.services.team_model_catalog.snapshot import (
+            RouteFingerprint,
+            get_active_resume_verify_target,
+            verify_resume_route,
+        )
+        from src.dalton import sharing as sharing_mod
+        from src.server.app import setup as setup_mod
+        from src.server.app.threads import messaging
+        from src.server.database.conversation import queries as queries_db
+        from src.server.database.runs import lifecycle as tl_db
+        from src.server.dependencies import cli_approval
+        from src.server.dependencies.principal import Principal
+        from src.server.dependencies.usage_limits import ChatAuthResult
+        from src.server.handlers import checkpoint_handler as ch_mod
+        from src.server.models.chat import ChatRequest
+        from src.server.models.workflow import RetryRequest
+        from src.server.services import turn_runtime as tr_mod
+        from src.server.services.runs import admission as adm_mod
+        from src.server.services.runs import pending_input as pi_mod
+        from src.server.services.shared_workspaces.access import Access
+        from src.server.services.shared_workspaces.turn import TurnIdentity
+
+        failed_run_2 = {
+            "conversation_response_id": "22222222-2222-4222-8222-222222222222",
+            "conversation_thread_id": "thread-r9-retry",
+            "turn_index": 2,
+            "status": "error",
+            "metadata": {"llm_model": "model-new"},
+        }
+        failed_run_2_pending_raw = {
+            **failed_run_2,
+            "metadata": {
+                "llm_model": "model-new",
+                "pending_input": {"checkpoint_id": "cp-fork", "replay": False},
+            },
+        }
+        auth = ChatAuthResult(
+            user_id="u-r9-retry",
+            is_byok=False,
+            has_oauth=True,
+            access_tier=0,
+            burst_slot_id="slot-r9",
+        )
+
+        # Part A: retry_thread forwards retry_checkpoint_id ONLY when body.checkpoint_id is
+        # explicitly given in the checkpoint-replay branch (not on default retry or raw-input rerun).
+        mock_scope = create_autospec(adm_mod.RunScope, instance=True)
+        monkeypatch.setattr(
+            adm_mod,
+            "RunScope",
+            create_autospec(adm_mod.RunScope, return_value=mock_scope),
+        )
+        monkeypatch.setattr(
+            cli_approval,
+            "admit_retry",
+            create_autospec(cli_approval.admit_retry, return_value=None),
+        )
+        monkeypatch.setattr(
+            messaging,
+            "thread_access",
+            create_autospec(messaging.thread_access, return_value=Access("u-r9-retry")),
+        )
+        monkeypatch.setattr(
+            messaging,
+            "_assert_stream_transport_ready",
+            create_autospec(messaging._assert_stream_transport_ready, return_value=None),
+        )
+        monkeypatch.setattr(
+            ch_mod,
+            "get_retry_checkpoint",
+            create_autospec(
+                ch_mod.get_retry_checkpoint,
+                side_effect=lambda _tid, cp=None: cp or "cp-auto-latest",
+            ),
+        )
+        monkeypatch.setattr(
+            pi_mod,
+            "retried_wake_fields",
+            create_autospec(pi_mod.retried_wake_fields, return_value={}),
+        )
+        monkeypatch.setattr(
+            queries_db,
+            "get_query_at_turn",
+            create_autospec(
+                queries_db.get_query_at_turn,
+                return_value={"content": "retry raw input", "type": "user", "metadata": {}},
+            ),
+        )
+
+        async def _limit_fn(_uid: str) -> ChatAuthResult:
+            return auth
+
+        orig_handle_send = messaging._handle_send_message
+        send_spy = create_autospec(orig_handle_send, return_value="ok")
+        monkeypatch.setattr(messaging, "_handle_send_message", send_spy)
+
+        # A1) Explicit body.checkpoint_id -> forwards retry_checkpoint_id="cp-run-1"
+        real_get_latest_attempt = tl_db.get_latest_attempt
+        monkeypatch.setattr(
+            tl_db,
+            "get_latest_attempt",
+            create_autospec(real_get_latest_attempt, return_value=failed_run_2),
+        )
+        asyncio.run(
+            messaging.retry_thread(
+                "thread-r9-retry",
+                Principal("u-r9-retry", "session"),
+                _limit_fn,
+                RetryRequest(workspace_id="ws-r9", checkpoint_id="cp-run-1"),
+            )
+        )
+        assert send_spy.call_args.kwargs["retry_of_run_id"] == failed_run_2["conversation_response_id"]
+        assert send_spy.call_args.kwargs["resume_source_run"] == failed_run_2
+        assert send_spy.call_args.kwargs["retry_checkpoint_id"] == "cp-run-1"
+
+        # A2) No explicit body.checkpoint_id -> omits retry_checkpoint_id
+        send_spy.reset_mock()
+        asyncio.run(
+            messaging.retry_thread(
+                "thread-r9-retry",
+                Principal("u-r9-retry", "session"),
+                _limit_fn,
+                RetryRequest(workspace_id="ws-r9"),
+            )
+        )
+        assert send_spy.call_args.kwargs["retry_of_run_id"] == failed_run_2["conversation_response_id"]
+        assert send_spy.call_args.kwargs["resume_source_run"] == failed_run_2
+        assert "retry_checkpoint_id" not in send_spy.call_args.kwargs
+
+        # A3) Raw-input resubmit (pending_input.replay=False) -> omits retry_checkpoint_id even if body carries one
+        send_spy.reset_mock()
+        monkeypatch.setattr(
+            tl_db,
+            "get_latest_attempt",
+            create_autospec(real_get_latest_attempt, return_value=failed_run_2_pending_raw),
+        )
+        asyncio.run(
+            messaging.retry_thread(
+                "thread-r9-retry",
+                Principal("u-r9-retry", "session"),
+                _limit_fn,
+                RetryRequest(workspace_id="ws-r9", checkpoint_id="cp-run-1"),
+            )
+        )
+        assert send_spy.call_args.kwargs["retry_of_run_id"] == failed_run_2_pending_raw["conversation_response_id"]
+        assert send_spy.call_args.kwargs["resume_source_run"] == failed_run_2_pending_raw
+        assert "retry_checkpoint_id" not in send_spy.call_args.kwargs
+
+        # Part B: _handle_send_message resolves checkpoint owner via resolve_checkpoint_resume_run_id
+        # when retry_checkpoint_id is set, and validates failed run when omitted.
+        monkeypatch.setattr(messaging, "_handle_send_message", orig_handle_send)
+        monkeypatch.setattr(
+            messaging,
+            "get_thread_auth_meta",
+            create_autospec(
+                messaging.get_thread_auth_meta,
+                return_value={
+                    "user_id": "u-r9-retry",
+                    "workspace_id": "ws-r9",
+                    "workspace_owner_id": "u-r9-retry",
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            messaging,
+            "_settle_against_branch",
+            create_autospec(
+                messaging._settle_against_branch,
+                side_effect=lambda _tid, r, _uid: r,
+            ),
+        )
+        monkeypatch.setattr(setup_mod, "agent_config", object(), raising=False)
+        monkeypatch.setattr(
+            sharing_mod,
+            "resolve_colleague_turn_admission",
+            create_autospec(
+                sharing_mod.resolve_colleague_turn_admission,
+                return_value=({"workspace_id": "ws-r9", "user_id": "u-r9-retry"}, "web", False),
+            ),
+        )
+        mock_route = create_autospec(tr_mod.TurnRoute, instance=True)
+        mock_route.workspace_id = "ws-r9"
+        mock_route.owner_id = "u-r9-retry"
+        mock_route.role = "analyst"
+        monkeypatch.setattr(
+            tr_mod,
+            "turn_route",
+            create_autospec(tr_mod.turn_route, return_value=mock_route),
+        )
+        mock_identity = create_autospec(TurnIdentity, instance=True)
+        monkeypatch.setattr(
+            TurnIdentity,
+            "of",
+            create_autospec(TurnIdentity.of, return_value=mock_identity),
+        )
+
+        captured_targets: list[Any] = []
+
+        async def _capture_target(*_a: Any, **_kw: Any) -> Any:
+            captured_targets.append(get_active_resume_verify_target())
+            raise HTTPException(status_code=418, detail="captured_resume_target")
+
+        monkeypatch.setattr(
+            atm_mod,
+            "resolve_turn_config_with_automation_inheritance",
+            create_autospec(
+                atm_mod.resolve_turn_config_with_automation_inheritance,
+                side_effect=_capture_target,
+            ),
+        )
+
+        run_1_id = "11111111-1111-4111-8111-111111111111"
+        real_resolve_checkpoint_resume_run_id = ch_mod.resolve_checkpoint_resume_run_id
+        resolve_cp_spy = create_autospec(
+            real_resolve_checkpoint_resume_run_id,
+            return_value=run_1_id,
+        )
+        monkeypatch.setattr(ch_mod, "resolve_checkpoint_resume_run_id", resolve_cp_spy)
+
+        # B1) Explicit retry_checkpoint_id="cp-run-1" -> verifies Run 1 (clears Run 2 row)
+        with pytest.raises(HTTPException) as exc_b1:
+            asyncio.run(
+                messaging._handle_send_message(
+                    ChatRequest(workspace_id="ws-r9", messages=[], checkpoint_id="cp-run-1"),
+                    auth,
+                    "thread-r9-retry",
+                    retry_of_run_id=failed_run_2["conversation_response_id"],
+                    resume_source_run=failed_run_2,
+                    retry_checkpoint_id="cp-run-1",
+                )
+            )
+        assert exc_b1.value.status_code == 418
+        resolve_cp_spy.assert_awaited_once_with("thread-r9-retry", "cp-run-1")
+        target_b1 = captured_targets[-1]
+        assert target_b1 is not None
+        assert target_b1.run_id == run_1_id
+        assert target_b1.run_row is None
+
+        # Verify that running verify_resume_route against target_b1 compares Run 1's snapshot
+        # (and rejects when Run 1's catalog route changed, even though failed Run 2 did not).
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+        cat_r1 = compile_catalog_from_payload(
+            {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "provider_variants": {
+                        "openai": {
+                            "r9-gw": {
+                                "parent_provider": "openai",
+                                "display_name": "R9 GW",
+                                "sdk": "openai",
+                                "billing": "cash",
+                                "base_url": "https://r9-gw.example.com/v1",
+                            }
+                        }
+                    },
+                    "models": {
+                        "r9-gw": [
+                            {"id": "r9-id-v1", "name": "R9 V1", "pricing": {"input": 1.0, "output": 2.0}}
+                        ]
+                    },
+                },
+                "models": {
+                    "r9-team-model": {
+                        "model_id": "r9-id-v1",
+                        "provider": "r9-gw",
+                        "display_name": "R9 Team Model",
+                        "visible": True,
+                    }
+                },
+                "dalton_meta": {"r9-team-model": {"billing": "cash", "tool_calling": True}},
+            },
+            revision=171,
+        )
+        snap_r1 = build_effective_catalog_snapshot(
+            ["r9-team-model"],
+            compiled=cat_r1,
+            variant_credentials={
+                "r9-gw": {
+                    "bound_base_url": "https://r9-gw.example.com/v1",
+                    "canonical_bound_url": "https://r9-gw.example.com:443/v1",
+                    "key_fingerprint": "fp-r9-v1",
+                }
+            },
+        )
+        run_1_row = {
+            "conversation_response_id": run_1_id,
+            "conversation_thread_id": "thread-r9-retry",
+            "metadata": {
+                "llm_model": "r9-team-model",
+                "effective_catalog_snapshot": snap_r1,
+            },
+        }
+        monkeypatch.setattr(
+            snap_mod,
+            "_fetch_persisted_run_row",
+            create_autospec(snap_mod._fetch_persisted_run_row, return_value=run_1_row),
+        )
+        with pytest.raises(HTTPException) as exc_route_changed:
+            asyncio.run(
+                verify_resume_route(
+                    target_b1.run_id,
+                    RouteFingerprint(
+                        model_key="r9-team-model",
+                        provider="r9-gw",
+                        model_id="r9-id-v2-mutated",
+                        bound_base_url="https://r9-gw.example.com:443/v1",
+                        key_fingerprint="fp-r9-v1",
+                        billing="cash",
+                    ),
+                    thread_id=target_b1.thread_id,
+                    is_subagent=False,
+                    run_row=target_b1.run_row,
+                )
+            )
+        assert exc_route_changed.value.status_code == 400
+        assert exc_route_changed.value.detail["code"] == "catalog_route_changed"
+
+        # B2) Default retry (no retry_checkpoint_id) -> validates failed Run 2 without querying checkpointer
+        resolve_cp_spy.reset_mock()
+        with pytest.raises(HTTPException) as exc_b2:
+            asyncio.run(
+                messaging._handle_send_message(
+                    ChatRequest(workspace_id="ws-r9", messages=[], checkpoint_id="cp-auto-latest"),
+                    auth,
+                    "thread-r9-retry",
+                    retry_of_run_id=failed_run_2["conversation_response_id"],
+                    resume_source_run=failed_run_2,
+                )
+            )
+        assert exc_b2.value.status_code == 418
+        assert resolve_cp_spy.await_count == 0
+        target_b2 = captured_targets[-1]
+        assert target_b2 is not None
+        assert target_b2.run_id == failed_run_2["conversation_response_id"]
+        assert target_b2.run_row == failed_run_2
+
+        # B3) Checkpointer lookup failure on explicit retry checkpoint -> fail closed with HTTP 503
+        monkeypatch.setattr(
+            ch_mod,
+            "resolve_checkpoint_resume_run_id",
+            create_autospec(
+                real_resolve_checkpoint_resume_run_id,
+                side_effect=RuntimeError("checkpointer unavailable"),
+            ),
+        )
+        with pytest.raises(HTTPException) as exc_b3:
+            asyncio.run(
+                messaging._handle_send_message(
+                    ChatRequest(workspace_id="ws-r9", messages=[], checkpoint_id="cp-run-1"),
+                    auth,
+                    "thread-r9-retry",
+                    retry_of_run_id=failed_run_2["conversation_response_id"],
+                    resume_source_run=failed_run_2,
+                    retry_checkpoint_id="cp-run-1",
+                )
+            )
+        assert exc_b3.value.status_code == 503
+        assert exc_b3.value.detail["code"] == "resume_verification_unavailable"

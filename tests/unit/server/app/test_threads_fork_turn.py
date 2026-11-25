@@ -282,6 +282,12 @@ async def test_an_unstarted_regenerate_runs_as_the_turn_its_row_stored(
 
 
 _TURN_BASE = "src.server.handlers.checkpoint_handler.turn_base_checkpoint_id"
+# DALTON-HOOK(team-model-catalog): real signature for the resume owner lookup double.
+from unittest.mock import create_autospec  # noqa: E402
+from src.server.handlers.checkpoint_handler import (  # noqa: E402
+    resolve_checkpoint_resume_run_id as _resolve_owner,
+)
+from src.server.database.runs.lifecycle import get_latest_attempt as _latest_attempt  # noqa: E402
 _BRANCH_READ = "src.server.database.conversation.threads_read.get_thread_branch_read"
 _ANSWER = {
     "messages": [],
@@ -318,6 +324,15 @@ async def test_an_answer_on_the_threads_branch_resumes():
         patch(_BRANCH_READ, AsyncMock(return_value=_branch_read(7))),
         patch(_TURN_BASE, AsyncMock(return_value=None)),
         patch("src.server.handlers.checkpoint_handler.get_checkpointer"),
+        # DALTON-HOOK(team-model-catalog): the resume route check reads the checkpoint's owning run.
+        patch(
+            "src.server.handlers.checkpoint_handler.resolve_checkpoint_resume_run_id",
+            create_autospec(_resolve_owner, return_value=None),
+        ),
+        patch(
+            "src.server.database.runs.lifecycle.get_latest_attempt",
+            create_autospec(_latest_attempt, return_value=None),
+        ),
     ):
         resp, workflow = await _post({**_ANSWER, "resume_run_horizon": 99})
 
