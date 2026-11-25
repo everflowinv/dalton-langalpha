@@ -7426,6 +7426,9 @@ describe("Round 8 Fixes (Codex R7 + Grok R7)", () => {
       // Invalid ISO-8601 `last_inbound_at` / `updated_at`
       { ...validSnap, last_inbound_at: "not-a-timestamp" },
       { ...validSnap, updated_at: "2026-02-30T00:00:00Z" },
+      { ...validSnap, updated_at: "2026-11-25T13:00:00" },
+      { ...validSnap, updated_at: "2026-11-25 13:00:00Z" },
+      { ...validSnap, last_inbound_at: "2026-11-25T13:00:00+25:00" },
       // `updated_at` is an object instead of string | null
       { ...validSnap, updated_at: { bad: true } },
       // `status` not in contract §2.1 enum ("active" | "pending_verification")
@@ -8476,6 +8479,540 @@ describe("Round 9 Fixes (Codex R8 + Grok R8)", () => {
       });
       await startTask.catch(() => undefined);
       await app.stop();
+    }
+  });
+});
+
+describe("Round 10 Fixes (Codex R9 + Grok R9)", () => {
+  it("R10 #1: setBackendClient invalidates Phase 1 credentialsInvalidated left by old backend so new backend's unchanged credentials keep same-gen attachments active", async () => {
+    const oldBackend = createMockBackend();
+    const newBackend = createMockBackend();
+    const accId = "00000000-0000-4000-8000-000000001001";
+    const origSnap = makeAccountSnapshot({
+      account_id: accId,
+      ilink_bot_id: "bot_r10_1",
+      bot_token: "tok_orig",
+      bot_generation: 1,
+      base_url: "https://sz.ilinkai.weixin.qq.com",
+    });
+
+    // Old backend: 1st snapshot installs tok_orig; 2nd snapshot rotates to tok_old_backend_new at same generation (1)
+    vi.mocked(oldBackend.reconcileWeixinAccounts)
+      .mockResolvedValueOnce({
+        changed: true,
+        enabled: true,
+        allow_external: false,
+        max_concurrent_accounts: 50,
+        accounts_revision: 1,
+        accounts: [origSnap],
+      })
+      .mockResolvedValueOnce({
+        changed: true,
+        enabled: true,
+        allow_external: false,
+        max_concurrent_accounts: 50,
+        accounts_revision: 2,
+        accounts: [
+          {
+            ...origSnap,
+            bot_token: "tok_old_backend_new",
+          },
+        ],
+      });
+
+    // New backend confirms the pre-switch original credentials (`tok_orig`) are still valid
+    vi.mocked(newBackend.reconcileWeixinAccounts).mockResolvedValue({
+      changed: true,
+      enabled: true,
+      allow_external: false,
+      max_concurrent_accounts: 50,
+      accounts_revision: 10,
+      accounts: [origSnap],
+    });
+
+    let pauseDnsOnSecondReconcile = false;
+    const dnsEntered = defer<void>();
+    const releaseDns = defer<void>();
+
+    const lease = new GatewayLeaseManager({
+      backend: oldBackend,
+      ttlSeconds: 45,
+      heartbeatIntervalMs: 60_000,
+    });
+    const wxAdapter = new WeixinChannelAdapter({
+      backend: oldBackend,
+      leaseManager: lease,
+      staggerDelayMs: 0,
+      staggerJitterMs: 0,
+      allowedApiDomains: ["ilinkai.weixin.qq.com", "weixin.qq.com"],
+      allowedCdnDomains: ["novac2c.cdn.weixin.qq.com"],
+      checkResolvedIps: true,
+      resolveHostIps: async () => {
+        if (pauseDnsOnSecondReconcile) {
+          dnsEntered.resolve();
+          await releaseDns.promise;
+        }
+        return ["1.1.1.1"];
+      },
+      fetchImpl: async (_url, init) =>
+        await new Promise((_res, rej) => {
+          init?.signal?.addEventListener("abort", () => rej(new Error("aborted")), {
+            once: true,
+          });
+        }),
+    });
+
+    const app = createGatewayApp({
+      config: loadConfig({
+        GATEWAY_HOST: "127.0.0.1",
+        GATEWAY_PORT: "0",
+        INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+        DALTON_WEIXIN_ENABLED: "true",
+      }),
+      backend: oldBackend,
+      adapters: new Map<ChannelPlatform, WeixinChannelAdapter>([
+        ["weixin", wxAdapter],
+      ]),
+      leaseManager: lease,
+      enableLease: true,
+    });
+
+    const turnDispatched = defer<void>();
+    try {
+      await app.start();
+      expect(wxAdapter.hasAppliedStartupSnapshot()).toBe(true);
+
+      // Trigger oldBackend's 2nd reconcile: Phase 1 sets credentialsInvalidated = true,
+      // then Phase 2 pauses inside resolveSafeBaseUrl -> resolveHostIps
+      pauseDnsOnSecondReconcile = true;
+      const oldReconcileTask = wxAdapter.reconcileNow("old_backend_same_gen_rotate");
+      await waitBounded(dnsEntered.promise, "oldBackend Phase 2 paused in resolveSafeBaseUrl");
+
+      // While oldBackend is paused in Phase 2, switch to newBackend!
+      pauseDnsOnSecondReconcile = false;
+      wxAdapter.setBackendClient(newBackend);
+      releaseDns.resolve();
+      await waitBounded(
+        oldReconcileTask,
+        "oldBackend reconcile exited and newBackend reconcile completed",
+      );
+
+      // Ensure newBackend snapshot is applied
+      if (!wxAdapter.hasAppliedStartupSnapshot()) {
+        await wxAdapter.reconcileNow("new_backend_confirm_orig");
+      }
+      expect(wxAdapter.hasAppliedStartupSnapshot()).toBe(true);
+      expect(wxAdapter.getManagedAccounts()[0]?.status).toBe("active");
+      expect(
+        wxAdapter.isWeixinAccountGenerationActive({
+          weixinAccountId: accId,
+          weixinBotId: "bot_r10_1",
+          weixinBotGeneration: 1,
+        }),
+      ).toBe(true);
+
+      // Now send a same-generation inbound attachment -> MUST NOT be rejected as superseded!
+      vi.spyOn(wxAdapter, "downloadAttachment").mockImplementation(async (desc) => ({
+        content: Buffer.from("r10-1-valid-pdf"),
+        filename: desc.filename,
+        mimeType: desc.mimeType,
+      }));
+      vi.mocked(oldBackend.registerAndResolveInbound).mockResolvedValueOnce({
+        existing_status: null,
+        linked: true,
+        allowed: true,
+        dalton_user_id: USER_ID,
+        workspace_id: HOME_WS_ID,
+        workspace_status: "running",
+        workspace_owner_id: USER_ID,
+        thread_id: "thread_r10_1",
+        external_thread_id: null,
+        request_key: "rk_r10_1",
+        retry_request_key: null,
+        resubmitted_request_key: null,
+        steered_into_run_id: null,
+        run_id: null,
+        turn_index: null,
+        generation: 1,
+        fallback_pending: false,
+        sent_to_current_count: 0,
+        uploaded_attachments: [],
+        raw_payload: {},
+        pending_interrupt: null,
+      });
+      vi.mocked(oldBackend.appendThreadMessages).mockImplementationOnce(async () => {
+        turnDispatched.resolve();
+        return {
+          status: 200,
+          isSse: true,
+          events: (async function* () {
+            yield {
+              event: "turn_completed",
+              data: JSON.stringify({ run_id: "run_r10_1", turn_index: 1 }),
+            };
+          })(),
+        };
+      });
+
+      await app.orchestrator.handleInboundEvent({
+        ...weixinDm("bot_r10_1:m_after_switch", "valid attachment after switch"),
+        weixinAccountId: accId,
+        weixinBotId: "bot_r10_1",
+        weixinBotGeneration: 1,
+        attachments: [
+          { id: "att_r10_1", filename: "ok.pdf", mimeType: "application/pdf" },
+        ],
+      });
+      await waitBounded(
+        turnDispatched.promise,
+        "same-gen attachment uploaded and turn dispatched after backend switch",
+      );
+      expect(oldBackend.uploadWorkspaceFile).toHaveBeenCalledTimes(1);
+      const failedCalls = vi
+        .mocked(oldBackend.updateInboundProgress)
+        .mock.calls.filter(([u]) => u.status === "failed");
+      expect(failedCalls).toHaveLength(0);
+    } finally {
+      releaseDns.resolve();
+      await app.stop();
+    }
+  });
+
+  it("R10 #2: setBackendClient during staggered monitor startup prevents queued second account from polling with old snapshot credentials", async () => {
+    const oldBackend = createMockBackend();
+    const newBackend = createMockBackend();
+    const acc1Id = "00000000-0000-4000-8000-000000001021";
+    const acc2Id = "00000000-0000-4000-8000-000000001022";
+
+    vi.mocked(oldBackend.reconcileWeixinAccounts).mockResolvedValueOnce({
+      changed: true,
+      enabled: true,
+      allow_external: false,
+      max_concurrent_accounts: 50,
+      accounts_revision: 1,
+      accounts: [
+        makeAccountSnapshot({
+          account_id: acc1Id,
+          ilink_bot_id: "bot_stagger_1",
+          bot_token: "tok_stagger_1",
+          bot_generation: 1,
+        }),
+        makeAccountSnapshot({
+          account_id: acc2Id,
+          ilink_bot_id: "bot_stagger_2",
+          bot_token: "tok_stagger_2",
+          bot_generation: 1,
+        }),
+      ],
+    });
+
+    // Hold newBackend's reconcile pending so no new snapshot has arrived yet
+    const releaseNewBackend = defer<WeixinAccountsReconcileResponse>();
+    vi.mocked(newBackend.reconcileWeixinAccounts).mockImplementation(
+      async () => await releaseNewBackend.promise,
+    );
+
+    const lease = new GatewayLeaseManager({
+      backend: oldBackend,
+      ttlSeconds: 45,
+      heartbeatIntervalMs: 60_000,
+    });
+    await lease.acquireUntilGranted();
+
+    const acc1FirstPoll = defer<void>();
+    let acc2PollCalls = 0;
+
+    const wxAdapter = new WeixinChannelAdapter({
+      backend: oldBackend,
+      leaseManager: lease,
+      staggerDelayMs: 80,
+      staggerJitterMs: 0,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+      fetchImpl: async (_url, init) => {
+        const auth = headerValue(init, "authorization");
+        if (auth === "Bearer tok_stagger_1") {
+          acc1FirstPoll.resolve();
+        }
+        if (auth === "Bearer tok_stagger_2") {
+          acc2PollCalls += 1;
+        }
+        return await new Promise((_res, rej) => {
+          init?.signal?.addEventListener("abort", () => rej(new Error("aborted")), {
+            once: true,
+          });
+        });
+      },
+    });
+    wxAdapter.onInboundEvent(async () => undefined);
+
+    try {
+      await wxAdapter.prepareStartupSnapshot();
+      const startTask = wxAdapter.start();
+      await waitBounded(acc1FirstPoll.promise, "account 1 started polling");
+
+      // While account 2 is waiting in stagger sleep (80ms), switch to newBackend!
+      wxAdapter.setBackendClient(newBackend);
+      await waitBounded(startTask, "stagger drain exited immediately on backend switch");
+
+      // Wait well past staggerDelayMs (140ms > 80ms) while newBackend hasn't returned a snapshot
+      await new Promise((r) => setTimeout(r, 140));
+
+      // Account 2 MUST NEVER have issued getupdates using oldBackend's credentials!
+      expect(acc2PollCalls).toBe(0);
+      const acc2State = wxAdapter
+        .getManagedAccounts()
+        .find((a) => a.accountId === acc2Id);
+      expect(acc2State?.polling).toBe(false);
+    } finally {
+      releaseNewBackend.resolve({
+        changed: true,
+        enabled: true,
+        allow_external: false,
+        max_concurrent_accounts: 50,
+        accounts_revision: 2,
+        accounts: [],
+      });
+      await wxAdapter.stop();
+      await lease.stopAndRelease();
+    }
+  });
+
+  it("R10 #3: when checkResolvedIps is true and resolveSafeBaseUrl falls back to defaultBase, subsequent snapshot with same custom base_url does NOT cancel in-flight same-gen attachment", async () => {
+    const backend = createMockBackend();
+    const lease = new GatewayLeaseManager({
+      backend,
+      ttlSeconds: 45,
+      heartbeatIntervalMs: 60_000,
+    });
+    const accId = "00000000-0000-4000-8000-000000001003";
+    const snapWithCustomHost = makeAccountSnapshot({
+      account_id: accId,
+      ilink_bot_id: "bot_r10_3",
+      bot_token: "tok_r10_3",
+      bot_generation: 1,
+      base_url: "https://sz.ilinkai.weixin.qq.com",
+    });
+
+    vi.mocked(backend.reconcileWeixinAccounts)
+      .mockResolvedValueOnce({
+        changed: true,
+        enabled: true,
+        allow_external: false,
+        max_concurrent_accounts: 50,
+        accounts_revision: 1,
+        accounts: [snapWithCustomHost],
+      })
+      .mockResolvedValueOnce({
+        changed: true,
+        enabled: true,
+        allow_external: false,
+        max_concurrent_accounts: 50,
+        accounts_revision: 2,
+        accounts: [{ ...snapWithCustomHost }],
+      });
+
+    const invalidations: Array<{ accountId: string; reason: string }> = [];
+    const seenPollHosts: string[] = [];
+    const firstPollStarted = defer<void>();
+    const wxAdapter = new WeixinChannelAdapter({
+      backend,
+      leaseManager: lease,
+      baseUrl: "https://ilinkai.weixin.qq.com",
+      staggerDelayMs: 0,
+      staggerJitterMs: 0,
+      allowedApiDomains: ["ilinkai.weixin.qq.com", "weixin.qq.com"],
+      allowedCdnDomains: ["novac2c.cdn.weixin.qq.com"],
+      checkResolvedIps: true,
+      resolveHostIps: async (host) => {
+        if (host === "sz.ilinkai.weixin.qq.com") {
+          throw new Error("Simulated DNS resolution failure for sz host");
+        }
+        return ["1.1.1.1"];
+      },
+      fetchImpl: async (url, init) => {
+        const urlStr = String(url);
+        if (!urlStr.includes("getupdates")) {
+          return makeJsonResponse({ ret: 0 });
+        }
+        seenPollHosts.push(new URL(urlStr).host);
+        firstPollStarted.resolve();
+        return await new Promise((_res, rej) => {
+          init?.signal?.addEventListener("abort", () => rej(new Error("aborted")), {
+            once: true,
+          });
+        });
+      },
+    });
+
+    const app = createGatewayApp({
+      config: loadConfig({
+        GATEWAY_HOST: "127.0.0.1",
+        GATEWAY_PORT: "0",
+        INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+        DALTON_WEIXIN_ENABLED: "true",
+      }),
+      backend,
+      adapters: new Map<ChannelPlatform, WeixinChannelAdapter>([
+        ["weixin", wxAdapter],
+      ]),
+      leaseManager: lease,
+      enableLease: true,
+    });
+
+    const origCancel = app.orchestrator.cancelInboundUploadsForAccount.bind(
+      app.orchestrator,
+    );
+    vi.spyOn(app.orchestrator, "cancelInboundUploadsForAccount").mockImplementation(
+      (accountId, activeBotGeneration, options) => {
+        invalidations.push({
+          accountId: accountId ?? "",
+          reason: "generation_or_credentials_changed",
+        });
+        origCancel(accountId, activeBotGeneration, options);
+      },
+    );
+
+    const progEntered = defer<void>();
+    const releaseProg = defer<void>();
+    const turnDispatched = defer<void>();
+
+    try {
+      await app.start();
+      await waitBounded(
+        firstPollStarted.promise,
+        "initial poll started with fallback defaultBase",
+      );
+      // Snapshot 1 fell back to defaultBase ("https://ilinkai.weixin.qq.com") due to DNS error
+      expect(seenPollHosts[0]).toBe("ilinkai.weixin.qq.com");
+
+      vi.spyOn(wxAdapter, "downloadAttachment").mockImplementation(async (desc) => ({
+        content: Buffer.from("r10-3-pdf"),
+        filename: desc.filename,
+        mimeType: desc.mimeType,
+      }));
+      vi.mocked(backend.registerAndResolveInbound).mockResolvedValueOnce({
+        existing_status: null,
+        linked: true,
+        allowed: true,
+        dalton_user_id: USER_ID,
+        workspace_id: HOME_WS_ID,
+        workspace_status: "running",
+        workspace_owner_id: USER_ID,
+        thread_id: "thread_r10_3",
+        external_thread_id: null,
+        request_key: "rk_r10_3",
+        retry_request_key: null,
+        resubmitted_request_key: null,
+        steered_into_run_id: null,
+        run_id: null,
+        turn_index: null,
+        generation: 1,
+        fallback_pending: false,
+        sent_to_current_count: 0,
+        uploaded_attachments: [],
+        raw_payload: {},
+        pending_interrupt: null,
+      });
+      vi.mocked(backend.updateInboundProgress).mockImplementation(async (req) => {
+        if (req.uploaded_attachments && req.uploaded_attachments.length > 0) {
+          progEntered.resolve();
+          await releaseProg.promise;
+        }
+        return {
+          ok: true,
+          run_id: null,
+          has_in_flight_current_text: false,
+          has_unknown_current_text: false,
+          has_in_flight_or_unknown_current_text: false,
+          sent_to_current_count: 0,
+          session_is_current_for_interrupt: null,
+        };
+      });
+      vi.mocked(backend.appendThreadMessages).mockImplementationOnce(async () => {
+        turnDispatched.resolve();
+        return {
+          status: 200,
+          isSse: true,
+          events: (async function* () {
+            yield {
+              event: "turn_completed",
+              data: JSON.stringify({ run_id: "run_r10_3", turn_index: 1 }),
+            };
+          })(),
+        };
+      });
+
+      // Start an in-flight attachment and pause it inside final I-7 updateInboundProgress
+      await app.orchestrator.handleInboundEvent({
+        ...weixinDm("bot_r10_3:m_dns_fallback", "attachment during dns fallback"),
+        weixinAccountId: accId,
+        weixinBotId: "bot_r10_3",
+        weixinBotGeneration: 1,
+        attachments: [
+          { id: "att_r10_3", filename: "dns.pdf", mimeType: "application/pdf" },
+        ],
+      });
+      await waitBounded(progEntered.promise, "attachment entered final I-7");
+
+      // Reconcile Snapshot 2 with the exact same `base_url: "https://sz.ilinkai.weixin.qq.com"`
+      await wxAdapter.reconcileNow("repeat_custom_base_url_with_dns_fallback");
+      expect(invalidations).toHaveLength(0);
+
+      releaseProg.resolve();
+      await waitBounded(
+        turnDispatched.promise,
+        "attachment survived repeated DNS-fallback snapshot and dispatched turn",
+      );
+      const failedCalls = vi
+        .mocked(backend.updateInboundProgress)
+        .mock.calls.filter(([u]) => u.status === "failed");
+      expect(failedCalls).toHaveLength(0);
+    } finally {
+      releaseProg.resolve();
+      await app.stop();
+    }
+  });
+
+  it("R10 #4: rejects timestamps missing timezone offset, using space separator, or with out-of-range offset hours/minutes with 502 invalid_reconcile_snapshot", async () => {
+    const baseSnap = makeAccountSnapshot({
+      account_id: "00000000-0000-4000-8000-000000001004",
+    });
+    const badTimestamps = [
+      "2026-11-25T13:00:00",
+      "2026-11-25 13:00:00Z",
+      "2026-11-25T13:00:00+25:00",
+      "2026-11-25T13:00:00-00:60",
+    ];
+    let idx = 0;
+    const rawHttp = new HttpBackendClient({
+      baseUrl: "http://127.0.0.1:8000",
+      serviceToken: TEST_SERVICE_TOKEN,
+      fetchImpl: async () =>
+        new Response(
+          JSON.stringify({
+            changed: true,
+            enabled: true,
+            allow_external: false,
+            max_concurrent_accounts: 50,
+            accounts_revision: 1,
+            accounts: [
+              {
+                ...baseSnap,
+                updated_at: badTimestamps[idx++],
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+    });
+    rawHttp.setGatewayEpoch(1);
+
+    for (let i = 0; i < badTimestamps.length; i += 1) {
+      await expect(rawHttp.reconcileWeixinAccounts(null)).rejects.toMatchObject({
+        status: 502,
+        body: expect.objectContaining({ code: "invalid_reconcile_snapshot" }),
+      });
     }
   });
 });

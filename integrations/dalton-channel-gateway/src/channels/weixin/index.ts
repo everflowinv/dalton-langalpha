@@ -149,12 +149,16 @@ export interface ManagedWeixinAccount {
   ilinkUserId: string | null;
   botToken: string;
   baseUrl: string;
+  /** Normalized `base_url` from the last applied snapshot before DNS fallback (R10 #3). */
+  snapshotBaseUrl?: string;
   cdnBaseUrl: string;
   botGeneration: number;
   /** Latest bot_generation observed in an authoritative reconcile snapshot (updated before awaiting old monitor stop, R7 #2). */
   latestSnapshotGeneration: number;
   /** True while credentials/botId/baseUrl changed at the same generation and old monitor is still stopping (R8 #2). */
   credentialsInvalidated?: boolean;
+  /** Backend generation (`this.backendGeneration`) that set `credentialsInvalidated = true` (R10 #1). */
+  credentialsInvalidatedBackendGen?: number | null;
   getUpdatesBuf: string;
   status: string;
   monitorController: AbortController | null;
@@ -327,9 +331,12 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         ilinkUserId: null,
         botToken: initialToken,
         baseUrl: (opts.baseUrl || ILINK_DEFAULT_BASE_URL).trim(),
+        snapshotBaseUrl: this.normalizeBaseUrlSync(opts.baseUrl),
         cdnBaseUrl: (opts.cdnBaseUrl || ILINK_DEFAULT_CDN_BASE_URL).trim(),
         botGeneration: opts.botGeneration ?? 1,
         latestSnapshotGeneration: opts.botGeneration ?? 1,
+        credentialsInvalidated: false,
+        credentialsInvalidatedBackendGen: null,
         getUpdatesBuf: "",
         status: "active",
         monitorController: null,
@@ -346,14 +353,22 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     const backendChanged = this.backend !== backend;
     this.backend = backend;
     if (backendChanged) {
-      // R8 #6 & R9 #4 (Codex Medium #4): Attaching or switching a backend invalidates any prior
-      // snapshot and bumps `backendGeneration` so an in-flight reconcile from the old backend
-      // is aborted/discarded and can NEVER mark `hasAppliedSnapshot = true`.
+      // R8 #6, R9 #4 & R10 #1/#2: Attaching or switching a backend invalidates any prior
+      // snapshot, bumps `backendGeneration`, aborts in-flight reconcile & staggered startup
+      // queues from the old backend, and clears any un-finalized Phase 1 invalidation flags.
       this.backendGeneration += 1;
       this.hasAppliedSnapshot = false;
       this.lastRevision = null;
       this.backendReconcileAbortController.abort();
       this.backendReconcileAbortController = new AbortController();
+      this.pendingStaggerIds.length = 0;
+      this.pendingStaggerSet.clear();
+      this.staggerDrainTask = null;
+      for (const acc of this.accounts.values()) {
+        acc.credentialsInvalidated = false;
+        acc.credentialsInvalidatedBackendGen = null;
+        acc.latestSnapshotGeneration = acc.botGeneration;
+      }
       if (this.reconcileInFlight) {
         this.reconcilePending = true;
       }
@@ -1188,6 +1203,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       await this.applyAccountSnapshots(resp.accounts ?? [], {
         startMonitors: options?.startMonitors,
         isCurrentBackend,
+        expectedBackendGen,
       });
       if (!isCurrentBackend()) {
         return;
@@ -1286,9 +1302,15 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
   private async applyAccountSnapshots(
     snapshots: readonly WeixinAccountSnapshot[],
-    options?: { startMonitors?: boolean; isCurrentBackend?: () => boolean },
+    options?: {
+      startMonitors?: boolean;
+      isCurrentBackend?: () => boolean;
+      expectedBackendGen?: number;
+    },
   ): Promise<void> {
     const isCurrentBackend = options?.isCurrentBackend ?? (() => true);
+    const expectedBackendGen =
+      options?.expectedBackendGen ?? this.backendGeneration;
     if (!isCurrentBackend()) return;
     const startMonitors = options?.startMonitors !== false && this.started;
     const pollableRaw = snapshots.filter(
@@ -1313,7 +1335,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     const desiredIds = new Set(pollable.map((s) => s.account_id));
 
     // =========================================================================
-    // Phase 1 (100% SYNCHRONOUS, BEFORE ANY `await`): R8 #2 & R9 #2
+    // Phase 1 (100% SYNCHRONOUS, BEFORE ANY `await`): R8 #2, R9 #2, R10 #1/#3
     // Compute the full snapshot diff upfront and immediately invalidate EVERY
     // removed AND rotated account in the snapshot so a hung monitor on account A
     // can never delay invalidation of account B.
@@ -1335,10 +1357,13 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     for (const snap of pollable) {
       const existing = this.accounts.get(snap.account_id);
       if (!existing) continue;
-      // R9 #2 (Codex High #2): Use identical URL normalization in Phase 1 and Phase 2
-      // so hostname case differences (e.g. `HTTPS://ILINKAI.WEIXIN.QQ.COM`) never trigger false invalidation.
+      // R9 #2 & R10 #3: Compare normalized `snap.base_url` against `existing.snapshotBaseUrl`
+      // (the normalized snapshot source URL from the previous pass) so a custom `base_url`
+      // that fell back to `defaultBase` on DNS check does not falsely trigger Phase 1
+      // invalidation on subsequent identical snapshots.
       const prelimBase = this.normalizeBaseUrlSync(snap.base_url);
-      const existingBase = this.normalizeBaseUrlSync(existing.baseUrl);
+      const existingBase =
+        existing.snapshotBaseUrl ?? this.normalizeBaseUrlSync(existing.baseUrl);
       const syncCredsChanged =
         existing.ilinkBotId !== snap.ilink_bot_id ||
         existing.botGeneration !== snap.bot_generation ||
@@ -1353,6 +1378,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         );
         if (isSameGenCredChange) {
           existing.credentialsInvalidated = true;
+          existing.credentialsInvalidatedBackendGen = expectedBackendGen;
         }
         this.abortAccountInFlight(snap.account_id);
         this.accountInvalidatedHandler?.({
@@ -1381,6 +1407,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       if (startMonitors && !this.started) return;
       if (this.reconcileAbortController?.signal.aborted) return;
       if (!isCurrentBackend()) return;
+      const normalizedSnapBaseUrl = this.normalizeBaseUrlSync(snap.base_url);
       const safeBaseUrl = await this.resolveSafeBaseUrl(snap.base_url);
       if (!isCurrentBackend()) return;
       const cdnBaseUrl = (
@@ -1409,6 +1436,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
             );
             if (isSameGenCredChange) {
               existing.credentialsInvalidated = true;
+              existing.credentialsInvalidatedBackendGen = expectedBackendGen;
             }
             this.abortAccountInFlight(snap.account_id);
             this.accountInvalidatedHandler?.({
@@ -1426,22 +1454,24 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           existing.ilinkUserId = snap.ilink_user_id ?? null;
           existing.botToken = snap.bot_token;
           existing.baseUrl = safeBaseUrl;
+          existing.snapshotBaseUrl = normalizedSnapBaseUrl;
           existing.cdnBaseUrl = cdnBaseUrl;
           existing.botGeneration = snap.bot_generation;
           existing.latestSnapshotGeneration = snap.bot_generation;
           existing.credentialsInvalidated = false;
+          existing.credentialsInvalidatedBackendGen = null;
           existing.getUpdatesBuf = snap.get_updates_buf ?? "";
           existing.status = snap.status;
           toStart.push(existing);
         } else {
           existing.userId = snap.user_id;
           existing.ilinkUserId = snap.ilink_user_id ?? null;
+          existing.snapshotBaseUrl = normalizedSnapBaseUrl;
           existing.cdnBaseUrl = cdnBaseUrl;
           existing.status = snap.status;
-          existing.latestSnapshotGeneration = Math.max(
-            existing.latestSnapshotGeneration,
-            snap.bot_generation,
-          );
+          existing.credentialsInvalidated = false;
+          existing.credentialsInvalidatedBackendGen = null;
+          existing.latestSnapshotGeneration = snap.bot_generation;
           if (!existing.getUpdatesBuf && snap.get_updates_buf) {
             existing.getUpdatesBuf = snap.get_updates_buf;
           }
@@ -1457,10 +1487,12 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           ilinkUserId: snap.ilink_user_id ?? null,
           botToken: snap.bot_token,
           baseUrl: safeBaseUrl,
+          snapshotBaseUrl: normalizedSnapBaseUrl,
           cdnBaseUrl,
           botGeneration: snap.bot_generation,
           latestSnapshotGeneration: snap.bot_generation,
           credentialsInvalidated: false,
+          credentialsInvalidatedBackendGen: null,
           getUpdatesBuf: snap.get_updates_buf ?? "",
           status: snap.status,
           monitorController: null,
@@ -1483,10 +1515,11 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   }
 
   /**
-   * Single shared staggered monitor-start queue (§3.4 / R5 #4 / R6 #5).
+   * Single shared staggered monitor-start queue (§3.4 / R5 #4 / R6 #5 / R10 #2).
    * Used by preloaded `start()`, `applyAccountSnapshots()`, and `ensurePollableMonitorsRunning()`
    * so concurrent sync nudges (`changed: false` or `changed: true`) never launch remaining
-   * accounts simultaneously.
+   * accounts simultaneously, and switching backends immediately invalidates queued starts
+   * from the previous backend generation.
    */
   private enqueueMonitorsStaggered(
     accounts: readonly ManagedWeixinAccount[],
@@ -1510,74 +1543,112 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       return this.staggerDrainTask;
     }
 
+    const expectedBackend = this.backend;
+    const expectedBackendGen = this.backendGeneration;
+    const backendSignal = this.backendReconcileAbortController.signal;
+    const isStaggerBackendCurrent = (): boolean =>
+      this.backend === expectedBackend &&
+      this.backendGeneration === expectedBackendGen &&
+      !backendSignal.aborted &&
+      (!this.backend || this.hasAppliedSnapshot);
+
     const drainTask = (async () => {
-      const signal = this.reconcileAbortController?.signal;
-      while (this.pendingStaggerIds.length > 0) {
-        if (
-          !this.started ||
-          signal?.aborted ||
-          !this.backendEnabled ||
-          this.backendNotFound404 ||
-          (this.leaseManager && !this.leaseManager.isLeaseLocallyValid())
-        ) {
-          this.pendingStaggerIds.length = 0;
-          this.pendingStaggerSet.clear();
-          return;
-        }
-        const accountId = this.pendingStaggerIds.shift()!;
-        this.pendingStaggerSet.delete(accountId);
-        const acc = this.accounts.get(accountId);
-        if (
-          !acc ||
-          acc.monitorTask ||
-          !isPollableAccountStatus(acc.status) ||
-          !acc.botToken ||
-          !acc.ilinkBotId
-        ) {
-          continue;
-        }
-        if (
-          this.lastMonitorStartAtMs !== null &&
-          (this.staggerDelayMs > 0 || this.staggerJitterMs > 0)
-        ) {
-          const jitter =
-            this.staggerJitterMs > 0
-              ? Math.floor(Math.random() * this.staggerJitterMs)
-              : 0;
-          const targetAtMs =
-            this.lastMonitorStartAtMs + this.staggerDelayMs + jitter;
-          const waitMs = targetAtMs - this.nowFn();
-          if (waitMs > 0) {
-            const ok = await sleepWithAbort(waitMs, signal);
-            if (!ok) {
+      const shutdownSignal = this.reconcileAbortController?.signal;
+      const combinedController = new AbortController();
+      const onAbort = () => combinedController.abort();
+      if (shutdownSignal?.aborted || backendSignal.aborted) {
+        combinedController.abort();
+      } else {
+        shutdownSignal?.addEventListener("abort", onAbort, { once: true });
+        backendSignal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      try {
+        while (this.pendingStaggerIds.length > 0) {
+          if (!isStaggerBackendCurrent()) {
+            return;
+          }
+          if (
+            !this.started ||
+            shutdownSignal?.aborted ||
+            !this.backendEnabled ||
+            this.backendNotFound404 ||
+            (this.leaseManager && !this.leaseManager.isLeaseLocallyValid())
+          ) {
+            if (this.backendGeneration === expectedBackendGen) {
               this.pendingStaggerIds.length = 0;
               this.pendingStaggerSet.clear();
-              return;
+            }
+            return;
+          }
+          const accountId = this.pendingStaggerIds.shift()!;
+          this.pendingStaggerSet.delete(accountId);
+          const acc = this.accounts.get(accountId);
+          if (
+            !acc ||
+            acc.monitorTask ||
+            !isPollableAccountStatus(acc.status) ||
+            !acc.botToken ||
+            !acc.ilinkBotId
+          ) {
+            continue;
+          }
+          if (
+            this.lastMonitorStartAtMs !== null &&
+            (this.staggerDelayMs > 0 || this.staggerJitterMs > 0)
+          ) {
+            const jitter =
+              this.staggerJitterMs > 0
+                ? Math.floor(Math.random() * this.staggerJitterMs)
+                : 0;
+            const targetAtMs =
+              this.lastMonitorStartAtMs + this.staggerDelayMs + jitter;
+            const waitMs = targetAtMs - this.nowFn();
+            if (waitMs > 0) {
+              const ok = await sleepWithAbort(waitMs, combinedController.signal);
+              if (!isStaggerBackendCurrent()) {
+                return;
+              }
+              if (!ok) {
+                if (this.backendGeneration === expectedBackendGen) {
+                  this.pendingStaggerIds.length = 0;
+                  this.pendingStaggerSet.clear();
+                }
+                return;
+              }
             }
           }
+          if (!isStaggerBackendCurrent()) {
+            return;
+          }
+          if (
+            !this.started ||
+            shutdownSignal?.aborted ||
+            !this.backendEnabled ||
+            this.backendNotFound404 ||
+            (this.leaseManager && !this.leaseManager.isLeaseLocallyValid())
+          ) {
+            if (this.backendGeneration === expectedBackendGen) {
+              this.pendingStaggerIds.length = 0;
+              this.pendingStaggerSet.clear();
+            }
+            return;
+          }
+          const latest = this.accounts.get(accountId);
+          if (
+            latest &&
+            !latest.monitorTask &&
+            isPollableAccountStatus(latest.status) &&
+            latest.botToken &&
+            latest.ilinkBotId
+          ) {
+            this.startAccountMonitor(latest);
+            this.lastMonitorStartAtMs = this.nowFn();
+          }
         }
-        if (
-          !this.started ||
-          signal?.aborted ||
-          !this.backendEnabled ||
-          this.backendNotFound404 ||
-          (this.leaseManager && !this.leaseManager.isLeaseLocallyValid())
-        ) {
-          this.pendingStaggerIds.length = 0;
-          this.pendingStaggerSet.clear();
-          return;
-        }
-        const latest = this.accounts.get(accountId);
-        if (
-          latest &&
-          !latest.monitorTask &&
-          isPollableAccountStatus(latest.status) &&
-          latest.botToken &&
-          latest.ilinkBotId
-        ) {
-          this.startAccountMonitor(latest);
-          this.lastMonitorStartAtMs = this.nowFn();
-        }
+      } finally {
+        shutdownSignal?.removeEventListener("abort", onAbort);
+        backendSignal.removeEventListener("abort", onAbort);
       }
     })().finally(() => {
       if (this.staggerDrainTask === drainTask) {
@@ -1622,6 +1693,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       ilinkUserId: confirmed.ilinkUserId ?? null,
       botToken: confirmed.botToken,
       baseUrl: safeBaseUrl,
+      snapshotBaseUrl: this.normalizeBaseUrlSync(confirmed.baseUrl),
       cdnBaseUrl: (
         confirmed.cdnBaseUrl ||
         this.opts.cdnBaseUrl ||
@@ -1629,6 +1701,8 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       ).trim(),
       botGeneration: confirmed.botGeneration,
       latestSnapshotGeneration: confirmed.botGeneration,
+      credentialsInvalidated: false,
+      credentialsInvalidatedBackendGen: null,
       getUpdatesBuf: confirmed.getUpdatesBuf ?? "",
       status: confirmed.accountStatus ?? "active",
       monitorController: null,
@@ -1741,6 +1815,16 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     return Boolean(account && isPollableAccountStatus(account.status));
   }
 
+  private isAccountCredentialsInvalidatedForCurrentBackend(
+    acc: ManagedWeixinAccount,
+  ): boolean {
+    return Boolean(
+      acc.credentialsInvalidated &&
+        (acc.credentialsInvalidatedBackendGen == null ||
+          acc.credentialsInvalidatedBackendGen === this.backendGeneration),
+    );
+  }
+
   /**
    * Decision #10: strictly match account_id, ilink_bot_id, and bot_generation.
    * Never fall back to a different account or generation when identity fields are present.
@@ -1758,7 +1842,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         return undefined;
       }
       if (
-        byId.credentialsInvalidated ||
+        this.isAccountCredentialsInvalidatedForCurrentBackend(byId) ||
         byId.botGeneration < byId.latestSnapshotGeneration
       ) {
         return undefined;
@@ -1778,7 +1862,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     if (reqBotId) {
       for (const acc of this.accounts.values()) {
         if (
-          !acc.credentialsInvalidated &&
+          !this.isAccountCredentialsInvalidatedForCurrentBackend(acc) &&
           acc.botGeneration >= acc.latestSnapshotGeneration &&
           acc.ilinkBotId === reqBotId &&
           (reqGen === undefined ||

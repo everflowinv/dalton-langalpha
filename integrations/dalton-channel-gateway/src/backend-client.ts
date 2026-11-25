@@ -1133,7 +1133,7 @@ const WEIXIN_ACCOUNT_UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const ISO_8601_TIMESTAMP_RE =
-  /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|([+-]\d{2}):?(\d{2}))?$/i;
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,9})?(?:Z|([+-])(\d{2}):(\d{2}))$/;
 
 function isValidIso8601Timestamp(v: unknown): v is string {
   if (typeof v !== "string") return false;
@@ -1157,6 +1157,13 @@ function isValidIso8601Timestamp(v: unknown): v is string {
     second > 59
   ) {
     return false;
+  }
+  if (match[7] !== undefined) {
+    const tzHour = Number(match[8]);
+    const tzMinute = Number(match[9]);
+    if (tzHour > 23 || tzMinute > 59) {
+      return false;
+    }
   }
   const utcDate = new Date(Date.UTC(year, month - 1, day));
   if (
