@@ -1,6 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from 'vitest';
 import { NO_STANDING, type AccountStanding } from '@/lib/accountRules';
+// DALTON-HOOK(team-model-catalog): unadmitted refusal bubbles keep turn indexes aligned.
 import { projectTurns } from '../../components/messageList/turnProjection';
 import { readTurnFailure } from '../turnFailure';
 
