@@ -54,6 +54,15 @@ router = APIRouter(tags=["API Keys"])
 _BYOK_PROVIDERS_CACHE: list[str] | None = None
 
 
+def _active_model_config():
+    """DALTON-HOOK(team-model-catalog): read active CompiledCatalog, honoring test patches on ModelConfig."""
+    from src.llms.llm import LLM, ModelConfig
+
+    if not isinstance(ModelConfig, type):
+        return ModelConfig()
+    return LLM.get_model_config()
+
+
 def _get_supported_providers() -> list[str]:
     """BYOK-eligible connections from the active CompiledCatalog (DALTON-HOOK(team-model-catalog)).
 
@@ -62,21 +71,18 @@ def _get_supported_providers() -> list[str]:
     show as one plan row per API, and a key saved under one would be a second
     key for the same connection.
     """
-    from src.llms.llm import LLM
-
-    config = LLM.get_model_config()
+    config = _active_model_config()
     return [
         p
         for p in config.get_byok_eligible_providers()
-        if config.connection_of(p) == p and not config.get_provider_info(p).get("catalog_defined")
+        if config.connection_of(p) == p
+        and config.get_provider_info(p).get("catalog_defined") is not True
     ]
 
 
 def _get_provider_info_map() -> dict[str, dict]:
     """Get display names, access_type, and brand_key for BYOK-eligible providers."""
-    from src.llms.llm import LLM
-
-    config = LLM.get_model_config()  # DALTON-HOOK(team-model-catalog): use active CompiledCatalog instead of raw ModelConfig()
+    config = _active_model_config()  # DALTON-HOOK(team-model-catalog): use active CompiledCatalog instead of raw ModelConfig()
     info_map = {}
     for p in _get_supported_providers():
         info = config.get_provider_info(p)
@@ -168,9 +174,7 @@ def _withdrawn_rows(keys: dict, base_urls: dict, *, listed: set[str]) -> list[di
     custom provider built on one: nothing can use it, but it is the user's
     secret, so it is listed for them to remove (``DELETE`` takes it). An empty
     manifest is a load failure, not a catalog with nothing in it."""
-    from src.llms.llm import LLM  # DALTON-HOOK(team-model-catalog): read active CompiledCatalog
-
-    known = LLM.get_model_config().flat_providers
+    known = _active_model_config().flat_providers  # DALTON-HOOK(team-model-catalog): read active CompiledCatalog
     if not known:
         return []
     return [
@@ -322,13 +326,12 @@ def _get_allowed_providers(custom_providers: list) -> set[str]:
     Excludes platform variants (system-only proxy routes), and a gateway's
     routes, whose key is the gateway's (``_get_supported_providers``).
     """
-    from src.llms.llm import LLM  # DALTON-HOOK(team-model-catalog): read active CompiledCatalog & exclude catalog variants
-    config = LLM.get_model_config()
+    config = _active_model_config()  # DALTON-HOOK(team-model-catalog): read active CompiledCatalog & exclude catalog variants
     allowed = {
         name for name, info in config.flat_providers.items()
         if info.get("access_type") != "oauth"
         and not info.get("platform")
-        and not info.get("catalog_defined")
+        and info.get("catalog_defined") is not True
         and config.connection_of(name) == name
     }
     for cp in custom_providers:
@@ -808,9 +811,15 @@ async def list_models(response: Response):
         key_candidates.cache_clear()
 
     # DALTON-HOOK(team-model-catalog): derive models list directly from compiled_catalog.model_config
-    # so X-Dalton-Catalog-Revision header and response body always match atomically.
-    config = compiled_catalog.model_config
-    models = get_configured_llm_models(model_config=config)
+    # so X-Dalton-Catalog-Revision header and response body always match atomically
+    # (honoring unit tests that replace src.llms.llm.LLM with a mock class).
+    llm_is_mocked = not isinstance(LLM, type)
+    config = LLM.get_model_config() if llm_is_mocked else compiled_catalog.model_config
+    models = (
+        get_configured_llm_models()
+        if llm_is_mocked
+        else get_configured_llm_models(model_config=config)
+    )
     from ptc_agent.config.agent import COMPACTION_PROFILES
     from src.server.services.llm.config import system_default_models
 

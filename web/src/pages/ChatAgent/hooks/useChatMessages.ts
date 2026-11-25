@@ -3684,13 +3684,28 @@ export function useChatMessages(
           updateMessage(prev, assistantMessageId, (msg) => finalizeAssistantMessage(msg, wasInterruptedRef.current ? 'paused' : 'completed'))
         );
       } else {
-        console.error('[HITL] Error resuming turn:', err);
-        const { banner } = meetRefusal(err);
-        if (banner !== null) setMessageError(banner);
-        setMessages((prev) =>
-          updateMessage(prev, assistantMessageId, (msg) =>
-            failAssistantMessage(msg, { message: 'Failed to resume this turn. Please try again.' }))
-        );
+        // DALTON-HOOK(team-model-catalog): on catalog_route_changed, surface the notice banner,
+        // clear the stale HITL pause card (pauseGone = true), and settle the empty assistant bubble
+        // so the composer unlocks for the user to send a fresh message.
+        const errInfo = errObj.errorInfo as { type?: unknown; code?: unknown } | undefined;
+        const isCatalogRouteChanged =
+          errInfo?.type === 'catalog_route_changed' || errInfo?.code === 'catalog_route_changed';
+        if (isCatalogRouteChanged) {
+          pauseGone = true;
+          const { banner } = meetRefusal(err);
+          if (banner !== null) setMessageError(banner);
+          setMessages((prev) =>
+            updateMessage(prev, assistantMessageId, (msg) => finalizeAssistantMessage(msg, 'completed'))
+          );
+        } else {
+          console.error('[HITL] Error resuming turn:', err);
+          const { banner } = meetRefusal(err);
+          if (banner !== null) setMessageError(banner);
+          setMessages((prev) =>
+            updateMessage(prev, assistantMessageId, (msg) =>
+              failAssistantMessage(msg, { message: 'Failed to resume this turn. Please try again.' }))
+          );
+        }
       }
     } finally {
       // A refusal, abort or stop leaves `admitted` false: restore the interrupt
@@ -4168,15 +4183,29 @@ export function useChatMessages(
         return;
       }
       admission?.unadmit();
-      console.error('[streamFromCheckpoint] Error:', err);
+      // DALTON-HOOK(team-model-catalog): on catalog_route_changed (e.g. /retry after catalog mutation),
+      // surface the notice banner and settle the empty bubble without stacking a generic retry fault.
+      const ckptErrInfo = (err as Record<string, unknown>)?.errorInfo as
+        | { type?: unknown; code?: unknown }
+        | undefined;
+      const isCatalogRouteChanged =
+        ckptErrInfo?.type === 'catalog_route_changed' ||
+        ckptErrInfo?.code === 'catalog_route_changed';
       const { banner } = meetRefusal(err);
       // A resend's comments wait with the reason, as its first send's did.
       ended = { refused: banner };
       if (banner !== null) setMessageError(banner);
-      setMessages((prev) =>
-        updateMessage(prev, assistantMessageId, (msg) =>
-          failAssistantMessage(msg, { message: 'Failed to process request. Please try again.' }))
-      );
+      if (isCatalogRouteChanged) {
+        setMessages((prev) =>
+          updateMessage(prev, assistantMessageId, (msg) => finalizeAssistantMessage(msg, 'completed'))
+        );
+      } else {
+        console.error('[streamFromCheckpoint] Error:', err);
+        setMessages((prev) =>
+          updateMessage(prev, assistantMessageId, (msg) =>
+            failAssistantMessage(msg, { message: 'Failed to process request. Please try again.' }))
+        );
+      }
     } finally {
       requestKeys.settle(requestKey, ended);
       // DALTON-HOOK(composer-drafts): this attempt ended without the server

@@ -169,25 +169,15 @@ class TaskModelGate:
     async def resolve(
         self, ask: TaskAsk, subagent_type: str
     ) -> TaskModel | TaskModelRefused | None:
-        # DALTON-HOOK(team-model-catalog): when a subagent resume binds a predecessor snapshot
-        # covering this model, always build a fresh client from the snapshot rather than
-        # reusing the live-compiled subagent graph or turn-level live client cache.
-        from src.dalton.services.team_model_catalog.snapshot import (
-            get_active_catalog_snapshot,
-        )
-
         own = self._own_model(subagent_type)
         name = own if ask.model is None else ask.model.strip()
-        active_snap = get_active_catalog_snapshot()
-        snap_models = active_snap.get("models") if isinstance(active_snap, dict) else None
-        in_active_snapshot = isinstance(snap_models, dict) and name in snap_models
-        if name == own and ask.effort is None and not in_active_snapshot:
+        if name == own and ask.effort is None:
             return None
         key = (subagent_type, name, ask.effort)
-        if not in_active_snapshot and key in self._resolved:
+        if key in self._resolved:
             return self._resolved[key]
         picked = await self._resolve(name, subagent_type, ask.effort, own=name == own)
-        if isinstance(picked, TaskModel) and not in_active_snapshot:
+        if isinstance(picked, TaskModel):
             self._resolved[key] = picked
         return picked
 

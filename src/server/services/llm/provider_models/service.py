@@ -117,7 +117,7 @@ async def _resolve_credential(user_id: str, provider: str, mc) -> Credential:
 
     # DALTON-HOOK(team-model-catalog): catalog-defined variants use exclusively their
     # dedicated bound credential in dalton_catalog_provider_credentials (never BYOK or env_key).
-    if mc.get_provider_info(provider).get("catalog_defined"):
+    if mc.get_provider_info(provider).get("catalog_defined") is True:
         from src.dalton.database.team_model_catalog import get_catalog_provider_credential
 
         cat_cred = await get_catalog_provider_credential(provider, decrypt=True)
@@ -302,7 +302,7 @@ async def available_models(user_id: str, provider: str, *, refresh: bool = False
         # DALTON-HOOK(team-model-catalog): catalog-defined variants always send model list
         # fetches through CatalogVariantTransport (Fake-IP DoH / HeldTransport + bound URL check),
         # using bound_base_url & key_fingerprint from the SAME credential read that built req.
-        if info.get("catalog_defined"):
+        if info.get("catalog_defined") is True:
             from src.dalton.services.team_model_catalog.constants import make_key_fingerprint
             from src.dalton.services.team_model_catalog.transport import (
                 make_catalog_variant_http_transport,

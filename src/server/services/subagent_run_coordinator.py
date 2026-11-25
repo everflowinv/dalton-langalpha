@@ -133,8 +133,6 @@ class SubagentRunCoordinator:
         task_run_id = str(uuid.uuid4())
         predecessor_run_id: Optional[str] = None
         start_checkpoint_id: Optional[str] = None
-        # DALTON-HOOK(team-model-catalog): carry predecessor effective_catalog_snapshot across subagent resume
-        inherited_subagent_snapshot: Optional[Dict[str, Any]] = None
 
         if cause == "resume":
             pred = await self.get_latest_run(task_id)
@@ -144,27 +142,6 @@ class SubagentRunCoordinator:
                 # partitions namespace-wide private channels across
                 # resumes without a checkpointer read at spawn time.
                 start_checkpoint_id = pred.get("final_checkpoint_id")
-                try:
-                    from src.dalton.services.team_model_catalog.snapshot import (
-                        load_run_recovery_context,
-                    )
-
-                    recovery_ctx = await load_run_recovery_context(
-                        run_id=predecessor_run_id,
-                        is_subagent=True,
-                        run_row=pred,
-                        explicit_model_key=model_override,
-                        enforce_capabilities=False,
-                    )
-                    inherited_subagent_snapshot = (
-                        recovery_ctx.snapshot if recovery_ctx is not None else None
-                    )
-                except Exception as _sub_snap_err:
-                    logger.warning(
-                        "[subagent_coordinator] Failed to load recovery context for resumed task %s: %s",
-                        task_id,
-                        type(_sub_snap_err).__name__,
-                    )
             # pred is None for a pre-ledger task resumed after the ledger
             # shipped: the upsert adopts it with an unchained first run.
 
@@ -210,11 +187,6 @@ class SubagentRunCoordinator:
                     if workflow_driver_run_id
                     else {}
                 ),  # DALTON-HOOK(budget)
-                **(
-                    {"catalog_snapshot": inherited_subagent_snapshot}
-                    if inherited_subagent_snapshot is not None
-                    else {}
-                ),  # DALTON-HOOK(team-model-catalog)
             )
         except sr_db.ClaudeCodeCapError as e:
             from src.server.services.claude_code.hosted import cli_cap_refusal

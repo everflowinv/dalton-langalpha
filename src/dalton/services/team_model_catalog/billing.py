@@ -101,8 +101,7 @@ def resolve_model_billing(
     1. Explicit ``snapshot`` entry (when ``snapshot`` is supplied and matches the route).
     2. Call-level ``billing_type == "oauth"``.
     3. Provider-level rules: ``provider_info.billing == "subscription"``,
-       ``provider == "z-ai-cn-coding"``, ``provider_info.access_type == "coding_plan"``,
-       or OAuth provider suffix (``*-oauth``).
+       ``provider == "z-ai-cn-coding"``, or OAuth provider suffix (``*-oauth``).
     4. Model-level ``dalton_meta[key].billing`` (explicit ``"subscription"`` or ``"cash"``),
        or OAuth model key/id suffix (``*-oauth``), scoped strictly to the actual route so a
        custom BYOK alias reusing a subscription display name on a cash route still bills as cash.
@@ -179,11 +178,9 @@ def resolve_model_billing(
         eff_pinfo = {}
 
     prov_billing = str(eff_pinfo.get("billing") or "").strip().lower()
-    prov_access = str(eff_pinfo.get("access_type") or "").strip().lower()
     if (
         prov_billing == "subscription"
         or eff_prov == "z-ai-cn-coding"
-        or prov_access == "coding_plan"
         or _is_oauth_name(eff_prov)
     ):
         return "subscription"
@@ -255,7 +252,11 @@ def resolve_model_billing(
                 if isinstance(dm, Mapping)
                 else ""
             )
-            if dm_billing == "subscription" or _is_oauth_name(rk):
+            if dm_billing == "subscription":
+                route_billings.add("subscription")
+            elif dm_billing == "cash":
+                route_billings.add("cash")
+            elif _is_oauth_name(rk):
                 route_billings.add("subscription")
             else:
                 route_billings.add("cash")

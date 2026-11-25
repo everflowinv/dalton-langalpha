@@ -161,7 +161,7 @@ def is_operator_endpoint(url: str) -> bool:
     return any(
         info.get("base_url") == url
         and not info.get("platform")
-        and not info.get("catalog_defined")  # DALTON-HOOK(team-model-catalog): exclude catalog variants from operator endpoint exemption
+        and info.get("catalog_defined") is not True  # DALTON-HOOK(team-model-catalog): exclude catalog variants from operator endpoint exemption
         and info.get("access_type") != "local"
         for info in mc.flat_providers.values()
     )

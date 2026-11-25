@@ -20,7 +20,7 @@ def byok_candidates(provider: str, mc) -> list[str]:
     """
     # DALTON-HOOK(team-model-catalog): catalog-defined provider variants never accept
     # user/holder BYOK keys (they use dedicated bound credentials in dalton_catalog_provider_credentials).
-    if mc.get_provider_info(provider).get("catalog_defined"):
+    if mc.get_provider_info(provider).get("catalog_defined") is True:
         return []
     # DALTON-HOOK(team-credentials): coding-plan variants only accept a key
     # stored under their own slug, so one plan's quota never pays for a
@@ -55,8 +55,9 @@ def key_fits(provider: str, holder: str, *, has_base_url: bool, mc) -> bool:
     """
     # DALTON-HOOK(team-model-catalog): never allow any BYOK key (even with has_base_url=True)
     # to serve a catalog-defined provider variant.
-    if mc.get_provider_info(provider).get("catalog_defined") or mc.get_provider_info(holder).get(
-        "catalog_defined"
+    if (
+        mc.get_provider_info(provider).get("catalog_defined") is True
+        or mc.get_provider_info(holder).get("catalog_defined") is True
     ):
         return False
     return has_base_url or mc.shares_api_key(provider, holder)

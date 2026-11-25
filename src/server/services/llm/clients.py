@@ -418,11 +418,8 @@ async def resolve_byok_llm_client(
         return None
 
     from src.llms.llm import LLM as LLMFactory, create_llm, create_llm_from_custom
-    # DALTON-HOOK(team-model-catalog): overlay active turn snapshot onto ModelConfig so resumed turns
-    # keep the snapshotted provider route and verify credential bindings against the original route.
-    from src.dalton.services.team_model_catalog.snapshot import overlay_model_config_with_snapshot
 
-    mc = overlay_model_config_with_snapshot(LLMFactory.get_model_config())
+    mc = LLMFactory.get_model_config()
     # DALTON-HOOK(workspace-dedup): forward ignore_custom_models to classify_model and byok_key
     source, config_entry = await user_models.classify_model(
         user_id,
@@ -434,7 +431,7 @@ async def resolve_byok_llm_client(
     # dedicated bound credential & CatalogVariantTransport (never BYOK holder keys or env_key).
     if source == ModelSource.SYSTEM and isinstance(config_entry, dict):
         sys_provider = str(config_entry.get("provider") or "")
-        if sys_provider and mc.get_provider_info(sys_provider).get("catalog_defined"):
+        if sys_provider and mc.get_provider_info(sys_provider).get("catalog_defined") is True:
             from src.dalton.services.team_model_catalog.transport import (
                 resolve_catalog_variant_binding_async,
             )
@@ -541,7 +538,7 @@ async def resolve_byok_llm_client(
         holder_id = credential_user_id(user_id)
         holding_info = mc.get_provider_info(route.holding) if route.holding else {}
         is_manifest_holding = bool(
-            route.holding and holding_info and not holding_info.get("catalog_defined")
+            route.holding and holding_info and holding_info.get("catalog_defined") is not True
         )  # DALTON-HOOK(team-model-catalog): exclude catalog variants from trusted manifest_base_url
         holder_cp_config = (
             await user_models.get_custom_provider_config(holder_id, route.holding)

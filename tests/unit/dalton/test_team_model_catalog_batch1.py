@@ -1535,7 +1535,7 @@ class TestR2Fixes:
         assert update_conns == [tx_conn]
         assert events == ["tx_enter", "catalog_shared_lock", "db_update", "tx_exit"]
 
-    def test_r2_2_snapshot_authoritative_server_binding_across_resume_retry_and_settlement(
+    def test_r2_2_snapshot_authoritative_server_binding_and_in_flight_settlement(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from fastapi import Request
@@ -1557,7 +1557,6 @@ class TestR2Fixes:
             workspace_id="ws-1",
             interrupted=True,
             source_run_id="run-old-1",
-            catalog_snapshot={"schema": "dalton-turn-catalog-snapshot/1", "models": {}},
         )
         route_msg, body_msg = resume_turn(owed_msg, "req-key-1")
         assert route_msg == "messages"
@@ -1570,7 +1569,6 @@ class TestR2Fixes:
             interrupted=True,
             retry_run_id="run-old-2",
             source_run_id="run-old-2",
-            catalog_snapshot={"schema": "dalton-turn-catalog-snapshot/1", "models": {}},
         )
         route_retry, body_retry = resume_turn(owed_retry, "req-key-2")
         assert route_retry == "retry"
@@ -1754,7 +1752,8 @@ class TestR2Fixes:
         # Must settle using snap_v1 ($1 + $2 = $3), NOT live cat_v2 ($50 + $100 = $150)
         assert captured_costs == [pytest.approx(3.0, rel=1e-6)]
 
-        # 5. SubagentRunCoordinator resume inherits predecessor replay_facts['effective_catalog_snapshot']
+        # 5. SubagentRunCoordinator resume chains predecessor_run_id without inheriting stale snapshot
+        #    (under r7 compare-and-reject, verified resumes record a fresh live snapshot at START).
         recorded_sub_kwargs: dict[str, Any] = {}
 
         async def _fake_start_task_run(**kw: Any) -> dict[str, Any]:
@@ -1794,7 +1793,9 @@ class TestR2Fixes:
             ),
         )
         asyncio.run(sub_coord.start_task_run(task_id="t1", cause="resume"))
-        assert recorded_sub_kwargs["catalog_snapshot"] == snap_v1
+        assert recorded_sub_kwargs["predecessor_run_id"] == "prev-task-run-1"
+        assert recorded_sub_kwargs["start_checkpoint_id"] == "cp-1"
+        assert "catalog_snapshot" not in recorded_sub_kwargs
 
     def test_r2_3_retire_and_rollback_preserve_automation_audit_history_and_canonical_lock_order(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2674,18 +2675,25 @@ class TestR4Fixes:
             assert hit is True
             assert pricing is not None and pricing["input"] == 2.0
 
-    def test_r4_2_resumed_turn_uses_snapshot_route_params_fingerprint_and_pricing_guard(
+    def test_r4_2_verify_resume_route_rejects_mutated_route_and_snapshot_pricing_checks_route(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from src.dalton.database import team_model_catalog as tmc_db
-        from src.dalton.services.team_model_catalog.snapshot import lookup_snapshot_pricing
+        from src.dalton.services.team_model_catalog.constants import (
+            CATALOG_ROUTE_CHANGED_CODE,
+            CATALOG_ROUTE_CHANGED_MESSAGE,
+        )
+        from src.dalton.services.team_model_catalog.snapshot import (
+            lookup_snapshot_pricing,
+            resolve_live_route_fingerprint,
+            verify_resume_route,
+        )
         from src.dalton.services.team_model_catalog.transport import (
             resolve_catalog_variant_binding_async,
         )
-        from src.llms.llm import LLM, create_llm
-        from src.server.services.llm import user_models
+        from src.llms.llm import LLM
 
-        # Revision 1: team-m1 routes to variant-a (model_id="m-a", temperature=0.2, input=$2)
+        # Revision 1: team-m1 routes to variant-a (model_id="m-a", input=$2)
         cat_a = _compile_test_catalog(
             {
                 "schema": CATALOG_SCHEMA,
@@ -2732,7 +2740,7 @@ class TestR4Fixes:
             },
         )
 
-        # Revision 2 (live catalog after interruption): team-m1 moved to variant-b (model_id="m-b", temp=0.9)
+        # Revision 2 (live catalog after interruption): team-m1 moved to variant-b (model_id="m-b")
         cat_b = _compile_test_catalog(
             {
                 "schema": CATALOG_SCHEMA,
@@ -2767,68 +2775,53 @@ class TestR4Fixes:
             revision=2,
         )
         monkeypatch.setattr(LLM, "get_model_config", classmethod(lambda cls: cat_b.model_config))
-
-        # 1. Under bound snapshot, classify_model & LLM construction keep snapshot route (variant-a, m-a, temp=0.2)
-        with bind_catalog_snapshot(snap_a):
-            source, cfg = asyncio.run(
-                user_models.classify_model("u-1", "team-m1", _pref_cache={})
-            )
-            assert source == user_models.ModelSource.SYSTEM
-            assert cfg["provider"] == "variant-a"
-            assert cfg["model_id"] == "m-a"
-            assert cfg["parameters"]["temperature"] == 0.2
-
-            # Credential binding resolves variant-a (not variant-b) and checks fp_a!
-            factory_a = make_catalog_variant_transport_factory(
-                provider_slug="variant-a",
-                bound_base_url="https://a.example.com/v1",
-                expected_key_fingerprint=fp_a,
-                verify_db_binding=False,
-            )
-            llm_obj = LLM(
-                "team-m1",
-                api_key="sk-variant-a-1111",
-                base_url_override="https://a.example.com/v1",
-                egress_transport=factory_a,
-                follow_redirects=False,
-                _catalog_credential_source=catalog_variant_source_tag("variant-a"),
-            )
-            assert llm_obj.provider == "variant-a"
-            assert llm_obj.model == "m-a"
-            assert llm_obj.parameters["temperature"] == 0.2
-            assert llm_obj.base_url == "https://a.example.com/v1"
-
-            # Rotating variant-a's key causes create_llm("team-m1") to revoke against variant-a's snapshot fp
-            rotated_fp_a = make_key_fingerprint("sk-variant-a-rotated-9999")
-            monkeypatch.setattr(
-                tmc_db,
-                "get_catalog_provider_credential_sync",
-                create_autospec(
-                    tmc_db.get_catalog_provider_credential_sync,
-                    side_effect=lambda slug, decrypt=True: (
-                        {
-                            "provider_slug": "variant-a",
-                            "api_key": "sk-variant-a-rotated-9999",
-                            "bound_base_url": "https://a.example.com/v1",
-                            "canonical_bound_url": "https://a.example.com:443/v1",
-                            "key_fingerprint": rotated_fp_a,
-                        }
-                        if slug == "variant-a"
-                        else {
-                            "provider_slug": "variant-b",
-                            "api_key": "sk-variant-b-2222",
-                            "bound_base_url": "https://b.example.com/v1",
-                            "canonical_bound_url": "https://b.example.com:443/v1",
-                            "key_fingerprint": make_key_fingerprint("sk-variant-b-2222"),
-                        }
-                    ),
+        fp_b = make_key_fingerprint("sk-variant-b-2222")
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_provider_credential",
+            create_autospec(
+                tmc_db.get_catalog_provider_credential,
+                side_effect=lambda slug, conn=None, decrypt=True: (
+                    {
+                        "provider_slug": "variant-b",
+                        "api_key": "sk-variant-b-2222",
+                        "bound_base_url": "https://b.example.com/v1",
+                        "canonical_bound_url": "https://b.example.com:443/v1",
+                        "key_fingerprint": fp_b,
+                    }
+                    if slug == "variant-b"
+                    else None
                 ),
-            )
-            with pytest.raises(CatalogVariantCredentialRevokedError) as rev_exc:
-                create_llm("team-m1")
-            assert "variant-a" in str(rev_exc.value)
+            ),
+        )
 
-            # Direct call attempting to bind variant-b for model_key="team-m1" under snap_a is rejected
+        # 1. Under compare-and-reject, live resolution sees variant-b (no snapshot client overlay)
+        #    and verify_resume_route refuses with 400 catalog_route_changed.
+        live_route = asyncio.run(resolve_live_route_fingerprint("team-m1"))
+        assert live_route.provider == "variant-b"
+        assert live_route.model_id == "m-b"
+        interrupted_row = {
+            "conversation_response_id": "11111111-1111-4111-8111-111111111112",
+            "conversation_thread_id": "thread-r4-2",
+            "metadata": {
+                "llm_model": "team-m1",
+                "effective_catalog_snapshot": snap_a,
+            },
+        }
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(
+                verify_resume_route(
+                    "11111111-1111-4111-8111-111111111112",
+                    live_route,
+                    run_row=interrupted_row,
+                )
+            )
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["code"] == CATALOG_ROUTE_CHANGED_CODE
+        assert exc_info.value.detail["message"] == CATALOG_ROUTE_CHANGED_MESSAGE
+
+        # Direct in-flight call attempting to bind variant-b for model_key="team-m1" under snap_a is still rejected
+        with bind_catalog_snapshot(snap_a):
             with pytest.raises(CatalogVariantCredentialRevokedError):
                 asyncio.run(
                     resolve_catalog_variant_binding_async("variant-b", model_key="team-m1")
@@ -3740,7 +3733,7 @@ class TestR4Fixes:
 class TestR5Fixes:
     """Regressions for Batch 1 r5 root-cause consolidation fixes."""
 
-    def test_r5_1_main_turn_resume_keeps_original_model_after_default_changes_a_to_b(
+    def test_r5_1_main_turn_resume_rejects_when_default_changes_a_to_b(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from types import SimpleNamespace
@@ -3748,10 +3741,14 @@ class TestR5Fixes:
         from ptc_agent.config import LLMConfig
         from src.dalton.services.team_model_catalog import compiled as compiled_mod
         from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.dalton.services.team_model_catalog.constants import (
+            CATALOG_ROUTE_CHANGED_CODE,
+            CATALOG_ROUTE_CHANGED_MESSAGE,
+        )
         from src.dalton.services.team_model_catalog.snapshot import (
-            bind_recovery_context,
             build_effective_catalog_snapshot,
-            load_run_recovery_context,
+            resolve_live_route_fingerprint,
+            verify_resume_route,
         )
         from src.llms.llm import LLM as LLMFactory
         from src.server.services.llm.config import select_model
@@ -3818,57 +3815,52 @@ class TestR5Fixes:
             },
         }
 
-        ctx = asyncio.run(
-            load_run_recovery_context(
-                run_id="11111111-1111-1111-1111-111111111111",
-                thread_id="thread-r5-1",
-                is_subagent=False,
-                run_row=interrupted_row,
-                enforce_capabilities=True,
-            )
-        )
-        assert ctx is not None
-        assert ctx.model_key == "model-a"
-        assert ctx.snapshot is not None
-        assert ctx.client_params is not None
-        assert ctx.client_params.provider == "openai"
-        assert ctx.client_params.model_id == "gpt-a"
-        assert ctx.client_params.parameters["max_tokens"] == 4096
-
-        # User changes account default from model-a -> model-b before restart resume
+        # Account default changes from model-a -> model-b before restart resume:
+        # select_model resolves live default model-b, and verify_resume_route rejects with 400.
         cfg = SimpleNamespace(llm=LLMConfig(name="model-b"), llm_client=None)
-        with bind_recovery_context(ctx):
-            selection = select_model(
-                cfg,
-                {"preferred_model": "model-b"},
-                slot="primary",
-                request_model=None,
+        selection = select_model(
+            cfg,
+            {"preferred_model": "model-b"},
+            slot="primary",
+            request_model=None,
+        )
+        assert selection.effective_model == "model-b"
+        live_route = asyncio.run(resolve_live_route_fingerprint(selection.effective_model))
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(
+                verify_resume_route(
+                    "11111111-1111-1111-1111-111111111111",
+                    live_route,
+                    thread_id="thread-r5-1",
+                    run_row=interrupted_row,
+                )
             )
-            assert selection.effective_model == "model-a"
-            assert LLMFactory.get_model_config().get_model_config("model-a")["model_id"] == "gpt-a"
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["code"] == CATALOG_ROUTE_CHANGED_CODE
+        assert exc_info.value.detail["message"] == CATALOG_ROUTE_CHANGED_MESSAGE
 
-    def test_r5_2_subagent_resume_binds_snapshot_before_client_build_and_verifies_variant_a_credential(
+    def test_r5_2_subagent_resume_verifies_route_before_client_build_and_refuses_mutated_variant(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import copy
         import inspect
         from types import SimpleNamespace
 
+        from langchain_core.messages import ToolMessage
+
         from ptc_agent.agent.middleware.background_subagent import task_actions
-        from ptc_agent.agent.middleware.background_subagent.subagent import SubAgentMiddleware
-        from ptc_agent.config.agent import TaskAsk, TaskModel
+        from ptc_agent.config.agent import TaskAsk
         from src.dalton.database import team_model_catalog as tmc_db
         from src.dalton.services.team_model_catalog import compiled as compiled_mod
-        from src.dalton.services.team_model_catalog import transport as tmc_transport
         from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.dalton.services.team_model_catalog.constants import (
+            CATALOG_ROUTE_CHANGED_CODE,
+            CATALOG_ROUTE_CHANGED_MESSAGE,
+        )
         from src.dalton.services.team_model_catalog.snapshot import (
-            bind_recovery_context,
             build_effective_catalog_snapshot,
-            get_active_catalog_snapshot,
-            load_run_recovery_context,
         )
         from src.llms.llm import LLM as LLMFactory
-        from src.server.services.llm.task_model import TaskModelGate
 
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.compiled._load_json_dict",
@@ -3945,6 +3937,31 @@ class TestR5Fixes:
         )
         monkeypatch.setattr(LLMFactory, "_model_config", compiled_rev2.model_config)
 
+        async def _fake_get_cred(
+            slug: str, conn: Any = None, *, decrypt: bool = True
+        ) -> dict[str, Any]:
+            if slug == "var-b":
+                return {
+                    "provider_slug": "var-b",
+                    "bound_base_url": "https://var-b.example.com/v1",
+                    "canonical_bound_url": "https://var-b.example.com/v1",
+                    "key_fingerprint": "fp-b",
+                }
+            return {
+                "provider_slug": "var-a",
+                "bound_base_url": "https://var-a.example.com/v1",
+                "canonical_bound_url": "https://var-a.example.com/v1",
+                "key_fingerprint": "fp-a",
+            }
+
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_provider_credential",
+            create_autospec(
+                tmc_db.get_catalog_provider_credential, side_effect=_fake_get_cred
+            ),
+        )
+
         # Prior subagent run row ran on team-shared under rev1 snapshot
         prior_subagent_row = {
             "task_run_id": "22222222-2222-2222-2222-222222222222",
@@ -3957,118 +3974,76 @@ class TestR5Fixes:
             },
         }
 
-        # Verify load_run_recovery_context extracts var-a + fp-a
-        ctx = asyncio.run(
-            load_run_recovery_context(
-                run_id="22222222-2222-2222-2222-222222222222",
-                is_subagent=True,
-                run_row=prior_subagent_row,
-                enforce_capabilities=True,
-            )
-        )
-        assert ctx is not None
-        assert ctx.model_key == "team-shared"
-        assert ctx.client_params is not None
-        assert ctx.client_params.provider == "var-a"
-        assert ctx.client_params.model_id == "m-a"
-        assert ctx.client_params.key_fingerprint == "fp-a"
-
-        # Verify binding snapshot BEFORE _resolve_model resolves var-a and verifies fp-a (not var-b)
-        checked_providers: list[str] = []
-
-        async def _fake_get_cred(
-            slug: str, conn: Any = None, *, decrypt: bool = True
-        ) -> dict[str, Any]:
-            checked_providers.append(slug)
-            if slug == "var-a":
-                return {
-                    "provider_slug": "var-a",
-                    "api_key": "sk-var-a",
-                    "bound_base_url": "https://var-a.example.com/v1",
-                    "canonical_bound_url": "https://var-a.example.com/v1",
-                    "key_fingerprint": "fp-a",
-                }
-            return {
-                "provider_slug": "var-b",
-                "api_key": "sk-var-b",
-                "bound_base_url": "https://var-b.example.com/v1",
-                "canonical_bound_url": "https://var-b.example.com/v1",
-                "key_fingerprint": "fp-b",
-            }
-
+        resolve_model_spy = create_autospec(task_actions._resolve_model)
+        monkeypatch.setattr(task_actions, "_resolve_model", resolve_model_spy)
         monkeypatch.setattr(
-            tmc_db,
-            "get_catalog_provider_credential",
-            create_autospec(
-                tmc_db.get_catalog_provider_credential, side_effect=_fake_get_cred
-            ),
+            task_actions,
+            "_read_latest_run",
+            create_autospec(task_actions._read_latest_run, return_value=prior_subagent_row),
         )
 
-        # Inside bind_recovery_context (exact pattern used by task_actions._handle_resume before _resolve_model):
-        with bind_recovery_context(ctx):
-            assert get_active_catalog_snapshot() is ctx.snapshot
-            mc_snap = LLMFactory.get_model_config()
-            assert mc_snap.get_model_config("team-shared")["provider"] == "var-a"
-            binding = asyncio.run(
-                tmc_transport.resolve_catalog_variant_binding_async(
-                    mc_snap.get_model_config("team-shared")["provider"],
-                    model_key="team-shared",
-                )
+        fake_task = SimpleNamespace(
+            task_id="sub-1",
+            display_id="Task-sub-1",
+            subagent_type="research",
+            is_pending=False,
+            cancelled=False,
+            terminal_status=None,
+            asyncio_task=None,
+            result=None,
+            ask=TaskAsk(model="team-shared"),
+            lock=asyncio.Lock(),
+        )
+
+        async def _resolve_task(*_a: Any, **_kw: Any) -> Any:
+            return fake_task
+
+        fake_mw = SimpleNamespace(
+            _resolve_or_error=_resolve_task,
+            subagent_types={"research"},
+            _resume_claims=set(),
+            registry=SimpleNamespace(
+                get_by_id=lambda tid: fake_task if tid == "sub-1" else None,
+                run_ledger=object(),
+            ),
+            task_models=SimpleNamespace(
+                _own_model=lambda _st: "team-shared",
+                _user_id="u-1",
+                _model_pref={},
+            ),
+            namespace_owner=None,
+        )
+        fake_request = SimpleNamespace(
+            tool_call={"id": "tc-sub-1", "args": {"action": "resume", "task_id": "sub-1"}},
+            state={},
+        )
+
+        result = asyncio.run(
+            task_actions._handle_resume(
+                fake_mw,
+                fake_request,
+                handler=lambda _req: None,
+                target_task_id="sub-1",
+                subagent_type=None,
+                description="resume sub-1",
+                prompt="continue",
+                args={"action": "resume", "task_id": "sub-1"},
+                parent_thread_id="thread-r5-2",
+                tool_call_id="tc-sub-1",
+                current_run_id="parent-run-1",
+                ask=TaskAsk(),
             )
-            assert binding["bound_base_url"] == "https://var-a.example.com/v1"
-        assert checked_providers == ["var-a"]
+        )
+        assert isinstance(result, ToolMessage)
+        assert result.status == "error"
+        assert CATALOG_ROUTE_CHANGED_CODE in str(result.content)
+        assert CATALOG_ROUTE_CHANGED_MESSAGE in str(result.content)
+        # _resolve_model must NEVER be called when verify_resume_route rejects!
+        assert resolve_model_spy.call_count == 0
 
-        # Verify TaskModelGate.resolve bypasses live cache & own-model short-circuit under bound snapshot
-        live_client_b = SimpleNamespace(name="client-b")
-        snap_client_a = SimpleNamespace(name="client-a")
-        gate = object.__new__(TaskModelGate)
-        gate._resolved = {
-            ("research", "team-shared", None): TaskModel(
-                name="team-shared",
-                display_name="Team Shared",
-                client=live_client_b,
-                guidance="",
-                model="team-shared",
-            )
-        }
-        gate._own_model = lambda _st: "team-shared"
-        seen_in_resolve: list[str] = []
-
-        async def _fake_gate_resolve(name: str, subagent_type: str, effort: str | None, *, own: bool):
-            seen_in_resolve.append(LLMFactory.get_model_config().get_model_config(name)["provider"])
-            return TaskModel(
-                name=name,
-                display_name="Team Shared",
-                client=snap_client_a,
-                guidance="",
-                model=name,
-            )
-
-        gate._resolve = _fake_gate_resolve
-        with bind_recovery_context(ctx):
-            picked = asyncio.run(gate.resolve(TaskAsk(model="team-shared"), "research"))
-        assert isinstance(picked, TaskModel)
-        assert picked.client is snap_client_a
-        assert seen_in_resolve == ["var-a"]
-        # Live cache must NOT be overwritten by the snapshot client
-        assert gate._resolved[("research", "team-shared", None)].client is live_client_b
-
-        # Verify SubAgentMiddleware._graph_on compiles fresh under snapshot instead of hitting live _model_graphs
-        sub_mw = object.__new__(SubAgentMiddleware)
-        live_graph_b = SimpleNamespace(tag="graph-b")
-        sub_mw._model_graphs = {("research", "team-shared", None, None): live_graph_b}
-        sub_mw._claude_code_on = None
-        compiled_clients: list[Any] = []
-        sub_mw._compile_on = lambda _st, on: (compiled_clients.append(on.client) or SimpleNamespace(tag="compiled-a"))
-        sub_mw._build_graph = lambda g, claude_code=None: g
-        with bind_recovery_context(ctx):
-            graph_a = sub_mw._graph_on("research", picked)
-        assert graph_a.tag == "compiled-a"
-        assert compiled_clients == [snap_client_a]
-        assert sub_mw._model_graphs[("research", "team-shared", None, None)] is live_graph_b
-        # Confirm task_actions._handle_resume references load_run_recovery_context before _resolve_model
+        # Confirm task_actions._handle_resume calls verify_resume_route before _resolve_model
         src_text = inspect.getsource(task_actions._handle_resume)
-        assert src_text.index("load_run_recovery_context") < src_text.index("_resolve_model")
+        assert src_text.index("verify_resume_route") < src_text.index("_resolve_model")
 
     def test_r5_3_model_level_subscription_on_cash_provider_settles_identically_with_and_without_snapshot(
         self, monkeypatch: pytest.MonkeyPatch
@@ -4371,13 +4346,18 @@ class TestR5Fixes:
     def test_r5_5_disabling_native_oauth_sync_rejects_resuming_oauth_model(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from src.dalton import capabilities as cap_mod
-        from src.dalton.capabilities import CapabilityId
-        from src.dalton.services.team_model_catalog.snapshot import (
-            SnapshotModelConfig,
-            build_effective_catalog_snapshot,
-            load_run_recovery_context,
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.dalton.services.team_model_catalog.constants import (
+            CATALOG_ROUTE_CHANGED_CODE,
+            CATALOG_ROUTE_CHANGED_MESSAGE,
         )
+        from src.dalton.services.team_model_catalog.snapshot import (
+            build_effective_catalog_snapshot,
+            resolve_live_route_fingerprint,
+            verify_resume_route,
+        )
+        from src.llms.llm import LLM as LLMFactory
 
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.compiled._load_json_dict",
@@ -4397,30 +4377,21 @@ class TestR5Fixes:
         snap = build_effective_catalog_snapshot(["grok-4.7-oauth"], compiled=compiled_on)
         assert "grok-4.7-oauth" in snap["models"]
 
-        # Disable NATIVE_OAUTH_SYNC capability
-        orig_has_cap = cap_mod.has_capability
-        monkeypatch.setattr(
-            cap_mod,
-            "has_capability",
-            create_autospec(
-                orig_has_cap,
-                side_effect=lambda cid, *a, **kw: False
-                if cid == CapabilityId.NATIVE_OAUTH_SYNC
-                else orig_has_cap(cid, *a, **kw),
-            ),
-        )
-
+        # Disable NATIVE_OAUTH_SYNC capability: live catalog drops grok-4.7-oauth
         compiled_off = compile_catalog_from_payload(
             {"schema": CATALOG_SCHEMA}, revision=51, oauth_sync_enabled=False
         )
         assert compiled_off.model_config.get_model_config("grok-4.7-oauth") is None
+        cache_compiled_catalog(compiled_off)
+        orig_get_compiled = compiled_mod.get_compiled_catalog_sync
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_compiled, return_value=compiled_off),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", compiled_off.model_config)
 
-        # SnapshotModelConfig must NOT expose the stripped OAuth model or provider
-        snap_mc = SnapshotModelConfig(compiled_off.model_config, snap)
-        assert snap_mc.get_model_config("grok-4.7-oauth") is None
-        assert snap_mc._snap_provider_overlay("xai-oauth") is None
-
-        # load_run_recovery_context refuses resume with exact same 400 model_removed as a normal request
+        # Live route is empty (model removed from catalog) -> verify_resume_route refuses with 400 catalog_route_changed
         interrupted_oauth_row = {
             "conversation_response_id": "33333333-3333-3333-3333-333333333333",
             "conversation_thread_id": "thread-r5-5",
@@ -4429,119 +4400,20 @@ class TestR5Fixes:
                 "effective_catalog_snapshot": snap,
             },
         }
+        live_route = asyncio.run(resolve_live_route_fingerprint("grok-4.7-oauth"))
+        assert live_route.provider == ""
         with pytest.raises(HTTPException) as exc_info:
             asyncio.run(
-                load_run_recovery_context(
-                    run_id="33333333-3333-3333-3333-333333333333",
+                verify_resume_route(
+                    "33333333-3333-3333-3333-333333333333",
+                    live_route,
                     thread_id="thread-r5-5",
-                    is_subagent=False,
                     run_row=interrupted_oauth_row,
-                    enforce_capabilities=True,
                 )
             )
         assert exc_info.value.status_code == 400
-        assert isinstance(exc_info.value.detail, dict)
-        assert exc_info.value.detail["type"] == "model_removed"
-
-    def test_r5_6_legacy_snapshot_max_output_preserved_when_live_catalog_changes(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from src.dalton.services.team_model_catalog.constants import TURN_SNAPSHOT_SCHEMA
-        from src.dalton.services.team_model_catalog.snapshot import (
-            SnapshotModelConfig,
-            extract_snapshot_client_params,
-        )
-
-        monkeypatch.setattr(
-            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
-            lambda p: _base_upstream_models()
-            if "models.json" in str(p)
-            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
-        )
-        monkeypatch.setattr(
-            "src.dalton.llm.overlay.load_overlay_data",
-            lambda path=None: _base_native_overlay(),
-        )
-
-        # Live catalog updated gpt-test max_tokens to 8192 and added a gemini model with max_output_tokens=16384
-        payload = {
-            "schema": CATALOG_SCHEMA,
-            "model_overrides": {
-                "gpt-test": {"parameters": {"max_tokens": 8192, "temperature": 0.3}},
-            },
-            "providers": {
-                "provider_variants": {
-                    "openai": {
-                        "gem-var": {
-                            "parent_provider": "openai",
-                            "display_name": "Gemini Var",
-                            "sdk": "gemini",
-                            "billing": "cash",
-                            "base_url": "https://gem.example.com/v1",
-                        }
-                    }
-                },
-                "models": {
-                    "gem-var": [{"id": "gem-1", "name": "G1", "pricing": {"input": 1.0, "output": 2.0}}]
-                },
-            },
-            "models": {
-                "gem-model": {
-                    "model_id": "gem-1",
-                    "provider": "gem-var",
-                    "display_name": "Gem Model",
-                    "visible": True,
-                    "parameters": {"max_output_tokens": 16384},
-                }
-            },
-            "dalton_meta": {"gem-model": {"billing": "cash", "tool_calling": True}},
-        }
-        compiled = compile_catalog_from_payload(payload, revision=60)
-        live_mc = compiled.model_config
-
-        # Legacy snapshot (pre-r4): stores max_output without a parameters dict
-        legacy_snap = {
-            "schema": TURN_SNAPSHOT_SCHEMA,
-            "catalog_revision": 1,
-            "models": {
-                "gpt-test": {
-                    "model_key": "gpt-test",
-                    "provider": "openai",
-                    "model_id": "gpt-test",
-                    "billing": "cash",
-                    "max_output": 4096,
-                },
-                "gem-model": {
-                    "model_key": "gem-model",
-                    "provider": "gem-var",
-                    "model_id": "gem-1",
-                    "billing": "cash",
-                    "max_output": 2048,
-                    "provider_info": {"sdk": "gemini"},
-                },
-            },
-            "by_identity": {},
-            "variants": {},
-        }
-
-        # OpenAI model translates legacy max_output -> parameters.max_tokens=4096 (preserving other live params)
-        cp_openai = extract_snapshot_client_params(
-            "gpt-test", legacy_snap, base_model_config=live_mc
-        )
-        assert cp_openai is not None
-        assert cp_openai.parameters["max_tokens"] == 4096
-        assert cp_openai.parameters["temperature"] == 0.3
-
-        snap_mc = SnapshotModelConfig(live_mc, legacy_snap)
-        assert snap_mc.get_model_config("gpt-test")["parameters"]["max_tokens"] == 4096
-
-        # Gemini SDK model translates legacy max_output -> parameters.max_output_tokens=2048
-        cp_gem = extract_snapshot_client_params(
-            "gem-model", legacy_snap, base_model_config=live_mc
-        )
-        assert cp_gem is not None
-        assert cp_gem.parameters["max_output_tokens"] == 2048
-        assert snap_mc.get_model_config("gem-model")["parameters"]["max_output_tokens"] == 2048
+        assert exc_info.value.detail["code"] == CATALOG_ROUTE_CHANGED_CODE
+        assert exc_info.value.detail["message"] == CATALOG_ROUTE_CHANGED_MESSAGE
 
     def test_r5_7_model_list_tool_calling_null_does_not_backfill_stale_process_cache(
         self, monkeypatch: pytest.MonkeyPatch
@@ -4715,16 +4587,19 @@ class TestR6Fixes:
         assert sub_snap["platform_cost"] == 0.0
         assert sub_snap["notional_cost"] == pytest.approx(sub_live["notional_cost"])
 
-    def test_r6_2_subagent_own_config_dict_model_persists_snapshot_and_recovers_original_model(
+    def test_r6_2_subagent_dict_model_snapshot_extraction_and_verify_resume_route(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from src.dalton.services.team_model_catalog import compiled as compiled_mod
         from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.dalton.services.team_model_catalog.constants import CATALOG_ROUTE_CHANGED_CODE
         from src.dalton.services.team_model_catalog.snapshot import (
+            RouteFingerprint,
             _extract_candidate_models_from_run,
             _extract_model_key_value,
+            _extract_primary_model_key_from_run,
             build_effective_catalog_snapshot,
-            load_run_recovery_context,
+            verify_resume_route,
         )
         from src.llms.llm import LLM as LLMFactory
 
@@ -4800,7 +4675,8 @@ class TestR6Fixes:
         assert "sub-model-a" in snap["models"]
         assert snap["models"]["sub-model-a"]["key_fingerprint"] == "fp-sub-a"
 
-        # 2) Recovery context extracts model_key from replay_facts.model.id + carries fp-sub-a
+        # 2) verify_resume_route extracts model_key from replay_facts.model.id:
+        #    passes when unchanged, refuses when credential rotates.
         row_with_snap = {
             "task_run_id": "44444444-4444-4444-4444-444444444444",
             "thread_id": "thread-r6-2",
@@ -4810,37 +4686,64 @@ class TestR6Fixes:
             },
         }
         assert _extract_candidate_models_from_run(row_with_snap) == ["sub-model-a"]
-        ctx = asyncio.run(
-            load_run_recovery_context(
-                run_id="44444444-4444-4444-4444-444444444444",
-                is_subagent=True,
-                run_row=row_with_snap,
-                enforce_capabilities=True,
-            )
+        assert (
+            _extract_primary_model_key_from_run(row_with_snap, is_subagent=True, snapshot=snap)
+            == "sub-model-a"
         )
-        assert ctx is not None
-        assert ctx.model_key == "sub-model-a"
-        assert ctx.client_params is not None
-        assert ctx.client_params.provider == "var-sub-a"
-        assert ctx.client_params.key_fingerprint == "fp-sub-a"
+        matching_route = RouteFingerprint(
+            model_key="sub-model-a",
+            provider="var-sub-a",
+            model_id="sub-a-id",
+            bound_base_url="https://sub-a.example.com/v1",
+            key_fingerprint="fp-sub-a",
+            billing="cash",
+        )
+        assert (
+            asyncio.run(
+                verify_resume_route(
+                    "44444444-4444-4444-4444-444444444444",
+                    matching_route,
+                    is_subagent=True,
+                    run_row=row_with_snap,
+                )
+            )
+            is None
+        )
+        rotated_route = RouteFingerprint(
+            model_key="sub-model-a",
+            provider="var-sub-a",
+            model_id="sub-a-id",
+            bound_base_url="https://sub-a.example.com/v1",
+            key_fingerprint="fp-sub-a-rotated",
+            billing="cash",
+        )
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(
+                verify_resume_route(
+                    "44444444-4444-4444-4444-444444444444",
+                    rotated_route,
+                    is_subagent=True,
+                    run_row=row_with_snap,
+                )
+            )
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["code"] == CATALOG_ROUTE_CHANGED_CODE
 
-    def test_r6_3_recovery_bound_snapshot_ignores_newly_added_same_name_personal_custom_model(
+    def test_r6_3_resume_rejects_newly_added_same_name_personal_custom_model_shadow(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from types import SimpleNamespace
-
-        from src.dalton.database import team_model_catalog as tmc_db
         from src.dalton.services.team_model_catalog import compiled as compiled_mod
         from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
-        from src.dalton.services.team_model_catalog.snapshot import (
-            bind_recovery_context,
-            build_effective_catalog_snapshot,
-            load_run_recovery_context,
+        from src.dalton.services.team_model_catalog.constants import (
+            CATALOG_ROUTE_CHANGED_CODE,
+            CATALOG_ROUTE_CHANGED_MESSAGE,
         )
-        from src.llms import llm as llm_mod
+        from src.dalton.services.team_model_catalog.snapshot import (
+            build_effective_catalog_snapshot,
+            resolve_live_route_fingerprint,
+            verify_resume_route,
+        )
         from src.llms.llm import LLM as LLMFactory
-        from src.server.services.llm import clients as llm_clients
-        from src.server.services.llm import user_models
 
         monkeypatch.setattr(
             "src.dalton.services.team_model_catalog.compiled._load_json_dict",
@@ -4912,16 +4815,6 @@ class TestR6Fixes:
                 "effective_catalog_snapshot": snap,
             },
         }
-        ctx = asyncio.run(
-            load_run_recovery_context(
-                run_id="55555555-5555-5555-5555-555555555555",
-                thread_id="thread-r6-3",
-                is_subagent=False,
-                run_row=row,
-                enforce_capabilities=True,
-            )
-        )
-        assert ctx is not None
 
         # User adds a same-name personal custom_models entry pointing at a personal OpenAI route
         pref_with_same_name_custom = {
@@ -4935,69 +4828,49 @@ class TestR6Fixes:
             ]
         }
 
-        # Outside recovery, classify_model sees custom model; INSIDE recovery, team snapshot wins
-        src_normal, cfg_normal = asyncio.run(
-            user_models.classify_model(
-                "u-1", "team-model-x", _pref_cache=pref_with_same_name_custom
+        live_route = asyncio.run(
+            resolve_live_route_fingerprint(
+                "team-model-x",
+                user_id="u-1",
+                model_pref=pref_with_same_name_custom,
             )
         )
-        assert src_normal == user_models.ModelSource.CUSTOM
-        assert cfg_normal["provider"] == "openai"
-
-        seen_cred_slugs: list[str] = []
-        created_kwargs: list[dict[str, Any]] = []
-
-        async def _fake_get_cred(
-            slug: str, conn: Any = None, *, decrypt: bool = True
-        ) -> dict[str, Any]:
-            seen_cred_slugs.append(slug)
-            return {
-                "provider_slug": slug,
-                "api_key": "sk-team-x",
-                "bound_base_url": "https://team-x.example.com/v1",
-                "canonical_bound_url": "https://team-x.example.com/v1",
-                "key_fingerprint": "fp-x",
-            }
-
-        def _fake_create_llm(model: str, **kwargs: Any) -> Any:
-            created_kwargs.append({"model": model, **kwargs})
-            return SimpleNamespace(model=model, base_url=kwargs.get("base_url"))
-
-        monkeypatch.setattr(
-            tmc_db,
-            "get_catalog_provider_credential",
-            create_autospec(tmc_db.get_catalog_provider_credential, side_effect=_fake_get_cred),
-        )
-        orig_create_llm = llm_mod.create_llm
-        monkeypatch.setattr(
-            llm_mod,
-            "create_llm",
-            create_autospec(orig_create_llm, side_effect=_fake_create_llm),
-        )
-
-        with bind_recovery_context(ctx):
-            src_rec, cfg_rec = asyncio.run(
-                user_models.classify_model(
-                    "u-1", "team-model-x", _pref_cache=pref_with_same_name_custom
+        assert live_route.provider == "openai"
+        assert live_route.model_id == "gpt-test"
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(
+                verify_resume_route(
+                    "55555555-5555-5555-5555-555555555555",
+                    live_route,
+                    thread_id="thread-r6-3",
+                    run_row=row,
                 )
             )
-            assert src_rec == user_models.ModelSource.SYSTEM
-            assert cfg_rec["provider"] == "team-var-x"
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["code"] == CATALOG_ROUTE_CHANGED_CODE
+        assert exc_info.value.detail["message"] == CATALOG_ROUTE_CHANGED_MESSAGE
 
-            client = asyncio.run(
-                llm_clients.resolve_byok_llm_client(
-                    "u-1",
-                    "team-model-x",
-                    is_byok=True,
-                    _pref_cache=pref_with_same_name_custom,
+        # Conversely, if the original run itself was a personal custom model (no team snapshot entry),
+        # resuming without change proceeds cleanly.
+        personal_row = {
+            "conversation_response_id": "55555555-5555-5555-5555-555555555556",
+            "conversation_thread_id": "thread-r6-3",
+            "metadata": {
+                "llm_model": "team-model-x",
+                "model_source": "custom",
+            },
+        }
+        assert (
+            asyncio.run(
+                verify_resume_route(
+                    "55555555-5555-5555-5555-555555555556",
+                    live_route,
+                    thread_id="thread-r6-3",
+                    run_row=personal_row,
                 )
             )
-            assert client is not None
-            assert client.base_url == "https://team-x.example.com/v1"
-
-        assert seen_cred_slugs == ["team-var-x"]
-        assert len(created_kwargs) == 1
-        assert created_kwargs[0]["base_url"] == "https://team-x.example.com/v1"
+            is None
+        )
 
     def test_r6_4_clearing_subscription_pricing_preserves_shared_pricing_override(
         self, monkeypatch: pytest.MonkeyPatch
@@ -5263,3 +5136,987 @@ class TestR6Fixes:
         )
         assert budget_mock.call_count == 0
         assert res.status != "budget_exhausted"
+
+
+# ---------------------------------------------------------------------------
+# Batch 1 r7: compare-and-reject resume guard (verify_resume_route) +
+# R6 billing-only fixes (-oauth suffix explicit cash & alias pricing: null)
+# ---------------------------------------------------------------------------
+
+
+class TestR7Fixes:
+    """Regressions for Batch 1 r7 compare-and-reject resume guard and R6 billing fixes."""
+
+    def test_r7_1_verify_resume_route_allows_unchanged_and_legacy_and_rejects_each_field_change(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.services.team_model_catalog.constants import (
+            CATALOG_ROUTE_CHANGED_CODE,
+            CATALOG_ROUTE_CHANGED_MESSAGE,
+        )
+        from src.dalton.services.team_model_catalog.snapshot import (
+            RouteFingerprint,
+            build_effective_catalog_snapshot,
+            verify_resume_route,
+        )
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        cat = compile_catalog_from_payload(
+            {
+                "schema": CATALOG_SCHEMA,
+                "providers": {
+                    "provider_variants": {
+                        "openai": {
+                            "var-r7": {
+                                "parent_provider": "openai",
+                                "display_name": "Var R7",
+                                "sdk": "openai",
+                                "billing": "cash",
+                                "base_url": "https://r7.example.com/v1",
+                            }
+                        }
+                    },
+                    "models": {
+                        "var-r7": [
+                            {"id": "r7-id", "name": "R7", "pricing": {"input": 1.0, "output": 2.0}}
+                        ]
+                    },
+                },
+                "models": {
+                    "r7-model": {
+                        "model_id": "r7-id",
+                        "provider": "var-r7",
+                        "display_name": "R7 Model",
+                        "visible": True,
+                    }
+                },
+                "dalton_meta": {"r7-model": {"billing": "cash", "tool_calling": True}},
+            },
+            revision=101,
+        )
+        snap = build_effective_catalog_snapshot(
+            ["r7-model"],
+            compiled=cat,
+            variant_credentials={
+                "var-r7": {
+                    "bound_base_url": "https://r7.example.com/v1",
+                    "canonical_bound_url": "https://r7.example.com:443/v1",
+                    "key_fingerprint": "fp-r7-1",
+                }
+            },
+        )
+        run_row = {
+            "conversation_response_id": "77777777-7777-4777-8777-777777777771",
+            "conversation_thread_id": "thread-r7-1",
+            "metadata": {"llm_model": "r7-model", "effective_catalog_snapshot": snap},
+        }
+        baseline = RouteFingerprint(
+            model_key="r7-model",
+            provider="var-r7",
+            model_id="r7-id",
+            bound_base_url="https://r7.example.com/v1",
+            key_fingerprint="fp-r7-1",
+            billing="cash",
+        )
+        # 1) Unchanged route proceeds cleanly
+        assert (
+            asyncio.run(
+                verify_resume_route(
+                    "77777777-7777-4777-8777-777777777771", baseline, run_row=run_row
+                )
+            )
+            is None
+        )
+
+        # 2) Every one of the 6 route fingerprint fields triggers 400 catalog_route_changed
+        mutations = [
+            ("model_key", RouteFingerprint(model_key="other-model", provider="var-r7", model_id="r7-id", bound_base_url="https://r7.example.com/v1", key_fingerprint="fp-r7-1", billing="cash")),
+            ("provider", RouteFingerprint(model_key="r7-model", provider="var-r7-new", model_id="r7-id", bound_base_url="https://r7.example.com/v1", key_fingerprint="fp-r7-1", billing="cash")),
+            ("model_id", RouteFingerprint(model_key="r7-model", provider="var-r7", model_id="r7-id-v2", bound_base_url="https://r7.example.com/v1", key_fingerprint="fp-r7-1", billing="cash")),
+            ("bound_base_url", RouteFingerprint(model_key="r7-model", provider="var-r7", model_id="r7-id", bound_base_url="https://other.example.com/v1", key_fingerprint="fp-r7-1", billing="cash")),
+            ("key_fingerprint", RouteFingerprint(model_key="r7-model", provider="var-r7", model_id="r7-id", bound_base_url="https://r7.example.com/v1", key_fingerprint="fp-r7-rotated", billing="cash")),
+            ("billing", RouteFingerprint(model_key="r7-model", provider="var-r7", model_id="r7-id", bound_base_url="https://r7.example.com/v1", key_fingerprint="fp-r7-1", billing="subscription")),
+        ]
+        for field_name, mutated_route in mutations:
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    verify_resume_route(
+                        "77777777-7777-4777-8777-777777777771",
+                        mutated_route,
+                        run_row=run_row,
+                    )
+                )
+            assert exc_info.value.status_code == 400
+            detail = exc_info.value.detail
+            assert isinstance(detail, dict)
+            assert detail["type"] == CATALOG_ROUTE_CHANGED_CODE
+            assert detail["code"] == CATALOG_ROUTE_CHANGED_CODE
+            assert detail["message"] == CATALOG_ROUTE_CHANGED_MESSAGE
+            assert field_name in detail["diffs"]
+
+        # 3) Legacy run with no persisted effective_catalog_snapshot continues unchanged
+        legacy_row = {
+            "conversation_response_id": "77777777-7777-4777-8777-777777777772",
+            "conversation_thread_id": "thread-r7-1",
+            "metadata": {"llm_model": "r7-model"},
+        }
+        assert (
+            asyncio.run(
+                verify_resume_route(
+                    "77777777-7777-4777-8777-777777777772",
+                    mutations[1][1],
+                    run_row=legacy_row,
+                )
+            )
+            is None
+        )
+
+    def test_r7_2_main_turn_resolve_llm_config_verifies_resume_route_before_client_build(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import copy
+        from types import SimpleNamespace
+
+        from ptc_agent.config import LLMConfig
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.dalton.services.team_model_catalog.constants import (
+            CATALOG_ROUTE_CHANGED_CODE,
+            CATALOG_ROUTE_CHANGED_MESSAGE,
+        )
+        from src.dalton.services.team_model_catalog.snapshot import (
+            build_effective_catalog_snapshot,
+            resume_verify_scope,
+        )
+        from src.llms.llm import LLM as LLMFactory
+        from src.server.services.account import Policy
+        from src.server.services.llm import config as llm_config_mod
+        from src.server.services.llm import user_models
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        payload_v1 = {
+            "schema": CATALOG_SCHEMA,
+            "providers": {
+                "provider_variants": {
+                    "openai": {
+                        "gw-a": {
+                            "parent_provider": "openai",
+                            "display_name": "GW A",
+                            "sdk": "openai",
+                            "billing": "cash",
+                            "base_url": "https://gw-a.example.com/v1",
+                        },
+                        "gw-b": {
+                            "parent_provider": "openai",
+                            "display_name": "GW B",
+                            "sdk": "openai",
+                            "billing": "cash",
+                            "base_url": "https://gw-b.example.com/v1",
+                        },
+                    }
+                },
+                "models": {
+                    "gw-a": [{"id": "m-1", "name": "M1", "pricing": {"input": 1.0, "output": 2.0}}],
+                    "gw-b": [{"id": "m-1", "name": "M1", "pricing": {"input": 1.0, "output": 2.0}}],
+                },
+            },
+            "models": {
+                "team-r7": {
+                    "model_id": "m-1",
+                    "provider": "gw-a",
+                    "display_name": "Team R7",
+                    "visible": True,
+                }
+            },
+            "dalton_meta": {"team-r7": {"billing": "cash", "tool_calling": True}},
+        }
+        cat_v1 = compile_catalog_from_payload(payload_v1, revision=110)
+        snap_v1 = build_effective_catalog_snapshot(
+            ["team-r7"],
+            compiled=cat_v1,
+            variant_credentials={
+                "gw-a": {
+                    "bound_base_url": "https://gw-a.example.com/v1",
+                    "canonical_bound_url": "https://gw-a.example.com:443/v1",
+                    "key_fingerprint": "fp-gw-a",
+                }
+            },
+        )
+        interrupted_row = {
+            "conversation_response_id": "88888888-8888-4888-8888-888888888881",
+            "conversation_thread_id": "thread-r7-2",
+            "metadata": {"llm_model": "team-r7", "effective_catalog_snapshot": snap_v1},
+        }
+        legacy_row = {
+            "conversation_response_id": "88888888-8888-4888-8888-888888888882",
+            "conversation_thread_id": "thread-r7-2",
+            "metadata": {"llm_model": "team-r7"},
+        }
+
+        class _FakeAgentConfig:
+            def __init__(self) -> None:
+                self.llm = LLMConfig(name="team-r7")
+                self.llm_client = None
+                self.claude_code = False
+                self.claude_code_admitted = None
+                self.claude_code_pins = None
+                self.prompt_guidance = ""
+                self.subagents = SimpleNamespace(resolved=None)
+                self.search_api = "tavily"
+                self.search_depth = "basic"
+
+            def model_copy(self, *, deep: bool = False):
+                return copy.deepcopy(self)
+
+        monkeypatch.setattr(
+            llm_config_mod,
+            "require_policy",
+            create_autospec(llm_config_mod.require_policy, return_value=Policy()),
+        )
+        monkeypatch.setattr(
+            user_models,
+            "get_model_preference",
+            create_autospec(user_models.get_model_preference, return_value={}),
+        )
+        monkeypatch.setattr(
+            llm_config_mod,
+            "gate_models_by_plan",
+            create_autospec(
+                llm_config_mod.gate_models_by_plan,
+                side_effect=lambda _bc, _uid, mp, _rm, **kw: mp,
+            ),
+        )
+        monkeypatch.setattr(
+            llm_config_mod,
+            "load_user_context",
+            create_autospec(llm_config_mod.load_user_context),
+        )
+        monkeypatch.setattr(
+            llm_config_mod,
+            "default_to_first_allowed",
+            create_autospec(llm_config_mod.default_to_first_allowed),
+        )
+        monkeypatch.setattr(
+            llm_config_mod,
+            "apply_compaction",
+            create_autospec(llm_config_mod.apply_compaction),
+        )
+        monkeypatch.setattr(
+            llm_config_mod,
+            "gate_capabilities",
+            create_autospec(llm_config_mod.gate_capabilities),
+        )
+        monkeypatch.setattr(
+            llm_config_mod,
+            "check_model_available",
+            create_autospec(llm_config_mod.check_model_available, return_value=False),
+        )
+        monkeypatch.setattr(
+            llm_config_mod,
+            "subagent_roles",
+            create_autospec(llm_config_mod.subagent_roles, return_value=[]),
+        )
+        monkeypatch.setattr(
+            llm_config_mod,
+            "turn_roster",
+            create_autospec(llm_config_mod.turn_roster, return_value=SimpleNamespace()),
+        )
+        monkeypatch.setattr(
+            llm_config_mod,
+            "demote_clientless",
+            create_autospec(llm_config_mod.demote_clientless),
+        )
+        monkeypatch.setattr(
+            llm_config_mod,
+            "subagent_models",
+            create_autospec(llm_config_mod.subagent_models, return_value={}),
+        )
+        resolve_clients_spy = create_autospec(llm_config_mod.resolve_clients)
+        monkeypatch.setattr(llm_config_mod, "resolve_clients", resolve_clients_spy)
+
+        cred_state: dict[str, dict[str, Any]] = {
+            "gw-a": {
+                "provider_slug": "gw-a",
+                "bound_base_url": "https://gw-a.example.com/v1",
+                "canonical_bound_url": "https://gw-a.example.com:443/v1",
+                "key_fingerprint": "fp-gw-a",
+            },
+            "gw-b": {
+                "provider_slug": "gw-b",
+                "bound_base_url": "https://gw-b.example.com/v1",
+                "canonical_bound_url": "https://gw-b.example.com:443/v1",
+                "key_fingerprint": "fp-gw-b",
+            },
+        }
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_provider_credential",
+            create_autospec(
+                tmc_db.get_catalog_provider_credential,
+                side_effect=lambda slug, conn=None, decrypt=True: cred_state.get(slug),
+            ),
+        )
+
+        # Case A: unchanged live catalog -> verify_resume_route passes and resolve_clients IS called
+        cache_compiled_catalog(cat_v1)
+        orig_get_compiled = compiled_mod.get_compiled_catalog_sync
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_compiled, return_value=cat_v1),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", cat_v1.model_config)
+        with resume_verify_scope(
+            "88888888-8888-4888-8888-888888888881",
+            thread_id="thread-r7-2",
+            run_row=interrupted_row,
+        ):
+            asyncio.run(
+                llm_config_mod.resolve_llm_config(
+                    _FakeAgentConfig(),
+                    "u-1",
+                    request_model="team-r7",
+                    is_byok=False,
+                    thread_id="thread-r7-2",
+                    user_facing=False,
+                )
+            )
+        assert resolve_clients_spy.call_count == 1
+
+        # Case B: provider changed gw-a -> gw-b -> 400 catalog_route_changed BEFORE resolve_clients
+        resolve_clients_spy.reset_mock()
+        payload_v2 = copy.deepcopy(payload_v1)
+        payload_v2["models"]["team-r7"]["provider"] = "gw-b"
+        cat_v2 = compile_catalog_from_payload(payload_v2, revision=111)
+        cache_compiled_catalog(cat_v2)
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_compiled, return_value=cat_v2),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", cat_v2.model_config)
+        with resume_verify_scope(
+            "88888888-8888-4888-8888-888888888881",
+            thread_id="thread-r7-2",
+            run_row=interrupted_row,
+        ):
+            with pytest.raises(HTTPException) as exc_prov:
+                asyncio.run(
+                    llm_config_mod.resolve_llm_config(
+                        _FakeAgentConfig(),
+                        "u-1",
+                        request_model="team-r7",
+                        is_byok=False,
+                        thread_id="thread-r7-2",
+                        user_facing=False,
+                    )
+                )
+        assert exc_prov.value.status_code == 400
+        assert exc_prov.value.detail["code"] == CATALOG_ROUTE_CHANGED_CODE
+        assert exc_prov.value.detail["message"] == CATALOG_ROUTE_CHANGED_MESSAGE
+        assert resolve_clients_spy.call_count == 0
+
+        # Case C: legacy run without snapshot proceeds even after catalog change
+        with resume_verify_scope(
+            "88888888-8888-4888-8888-888888888882",
+            thread_id="thread-r7-2",
+            run_row=legacy_row,
+        ):
+            asyncio.run(
+                llm_config_mod.resolve_llm_config(
+                    _FakeAgentConfig(),
+                    "u-1",
+                    request_model="team-r7",
+                    is_byok=False,
+                    thread_id="thread-r7-2",
+                    user_facing=False,
+                )
+            )
+        assert resolve_clients_spy.call_count == 1
+
+    def test_r7_3_all_resume_entry_points_bind_resume_verify_scope(self) -> None:
+        import inspect
+
+        from src.server.app.threads import messaging
+        from src.server.handlers.chat import ptc_run
+        from src.server.services import automation_executor
+        from src.server.services.llm import config as llm_config_mod
+
+        msg_src = inspect.getsource(messaging._handle_send_message)
+        assert "resume_verify_scope" in msg_src
+        assert "retry_of_run_id" in msg_src
+        assert "resume_of_run_id" in msg_src
+        assert "request.hitl_response" in msg_src
+        assert msg_src.index("resume_verify_scope") < msg_src.index(
+            "await resolve_turn_config_with_automation_inheritance("
+        )
+
+        retry_src = inspect.getsource(messaging.retry_thread)
+        assert "resume_source_run=latest" in retry_src
+
+        cfg_src = inspect.getsource(llm_config_mod.resolve_llm_config)
+        assert "await verify_resume_route(" in cfg_src
+        assert cfg_src.index("await verify_resume_route(") < cfg_src.index("await resolve_clients(")
+
+        ptc_src = inspect.getsource(ptc_run.astream_ptc_workflow)
+        assert "resume_verify_scope" in ptc_src
+
+        auto_src = inspect.getsource(automation_executor.AutomationExecutor._run_turn)
+        assert "resume_of_run_id" in auto_src
+
+    def test_r7_4_subagent_resume_allows_unchanged_and_legacy_without_snapshot(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from types import SimpleNamespace
+
+        from langchain_core.messages import ToolMessage
+
+        from ptc_agent.agent.middleware.background_subagent import task_actions
+        from ptc_agent.config.agent import TaskAsk, TaskModelRefused
+        from src.dalton.database import team_model_catalog as tmc_db
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.dalton.services.team_model_catalog.snapshot import (
+            build_effective_catalog_snapshot,
+        )
+        from src.llms.llm import LLM as LLMFactory
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        payload = {
+            "schema": CATALOG_SCHEMA,
+            "providers": {
+                "provider_variants": {
+                    "openai": {
+                        "sub-gw": {
+                            "parent_provider": "openai",
+                            "display_name": "Sub GW",
+                            "sdk": "openai",
+                            "billing": "cash",
+                            "base_url": "https://sub-gw.example.com/v1",
+                        }
+                    }
+                },
+                "models": {
+                    "sub-gw": [
+                        {"id": "sub-1", "name": "Sub 1", "pricing": {"input": 1.0, "output": 2.0}}
+                    ]
+                },
+            },
+            "models": {
+                "sub-ok": {
+                    "model_id": "sub-1",
+                    "provider": "sub-gw",
+                    "display_name": "Sub OK",
+                    "visible": True,
+                }
+            },
+            "dalton_meta": {"sub-ok": {"billing": "cash", "tool_calling": True}},
+        }
+        cat = compile_catalog_from_payload(payload, revision=120)
+        cache_compiled_catalog(cat)
+        orig_get_compiled = compiled_mod.get_compiled_catalog_sync
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_compiled, return_value=cat),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", cat.model_config)
+        monkeypatch.setattr(
+            tmc_db,
+            "get_catalog_provider_credential",
+            create_autospec(
+                tmc_db.get_catalog_provider_credential,
+                return_value={
+                    "provider_slug": "sub-gw",
+                    "bound_base_url": "https://sub-gw.example.com/v1",
+                    "canonical_bound_url": "https://sub-gw.example.com:443/v1",
+                    "key_fingerprint": "fp-sub-ok",
+                },
+            ),
+        )
+        snap = build_effective_catalog_snapshot(
+            ["sub-ok"],
+            compiled=cat,
+            variant_credentials={
+                "sub-gw": {
+                    "bound_base_url": "https://sub-gw.example.com/v1",
+                    "canonical_bound_url": "https://sub-gw.example.com:443/v1",
+                    "key_fingerprint": "fp-sub-ok",
+                }
+            },
+        )
+
+        # Sentinel TaskModelRefused stops _handle_resume right after _resolve_model is invoked
+        sentinel_refusal = TaskModelRefused(
+            message="sentinel-reached-resolve-model", reason="sentinel"
+        )
+        resolve_spy = create_autospec(task_actions._resolve_model, return_value=sentinel_refusal)
+        monkeypatch.setattr(task_actions, "_resolve_model", resolve_spy)
+
+        fake_task = SimpleNamespace(
+            task_id="sub-ok-1",
+            display_id="Task-sub-ok-1",
+            subagent_type="research",
+            is_pending=False,
+            cancelled=False,
+            terminal_status=None,
+            asyncio_task=None,
+            result=None,
+            ask=TaskAsk(model="sub-ok"),
+            lock=asyncio.Lock(),
+        )
+
+        async def _resolve_ok_task(*_a: Any, **_kw: Any) -> Any:
+            return fake_task
+
+        fake_mw = SimpleNamespace(
+            _resolve_or_error=_resolve_ok_task,
+            subagent_types={"research"},
+            _resume_claims=set(),
+            registry=SimpleNamespace(
+                get_by_id=lambda tid: fake_task if tid == "sub-ok-1" else None,
+                run_ledger=object(),
+            ),
+            task_models=SimpleNamespace(
+                _own_model=lambda _st: "sub-ok",
+                _user_id="u-1",
+                _model_pref={},
+            ),
+            namespace_owner=None,
+        )
+        fake_request = SimpleNamespace(
+            tool_call={"id": "tc-ok-1", "args": {"action": "resume", "task_id": "sub-ok-1"}},
+            state={},
+        )
+
+        # 1) Unchanged route passes verify_resume_route and reaches _resolve_model
+        row_ok = {
+            "task_run_id": "99999999-9999-4999-8999-999999999991",
+            "thread_id": "thread-r7-4",
+            "status": "completed",
+            "replay_facts": {
+                "model_override": "sub-ok",
+                "effective_catalog_snapshot": snap,
+            },
+        }
+        orig_read_latest = task_actions._read_latest_run
+        monkeypatch.setattr(
+            task_actions,
+            "_read_latest_run",
+            create_autospec(orig_read_latest, return_value=row_ok),
+        )
+        res1 = asyncio.run(
+            task_actions._handle_resume(
+                fake_mw,
+                fake_request,
+                handler=lambda _req: None,
+                target_task_id="sub-ok-1",
+                subagent_type=None,
+                description="resume sub-ok-1",
+                prompt="continue",
+                args={"action": "resume", "task_id": "sub-ok-1"},
+                parent_thread_id="thread-r7-4",
+                tool_call_id="tc-ok-1",
+                current_run_id="parent-run-ok-1",
+                ask=TaskAsk(),
+            )
+        )
+        assert isinstance(res1, ToolMessage)
+        assert resolve_spy.call_count == 1
+        assert "sentinel" in str(res1.content)
+
+        # 2) Legacy run without snapshot passes verify_resume_route and reaches _resolve_model
+        resolve_spy.reset_mock()
+        row_legacy = {
+            "task_run_id": "99999999-9999-4999-8999-999999999992",
+            "thread_id": "thread-r7-4",
+            "status": "completed",
+            "replay_facts": {"model_override": "sub-ok"},
+        }
+        monkeypatch.setattr(
+            task_actions,
+            "_read_latest_run",
+            create_autospec(orig_read_latest, return_value=row_legacy),
+        )
+        res2 = asyncio.run(
+            task_actions._handle_resume(
+                fake_mw,
+                fake_request,
+                handler=lambda _req: None,
+                target_task_id="sub-ok-1",
+                subagent_type=None,
+                description="resume sub-ok-1 legacy",
+                prompt="continue",
+                args={"action": "resume", "task_id": "sub-ok-1"},
+                parent_thread_id="thread-r7-4",
+                tool_call_id="tc-ok-2",
+                current_run_id="parent-run-ok-2",
+                ask=TaskAsk(),
+            )
+        )
+        assert isinstance(res2, ToolMessage)
+        assert resolve_spy.call_count == 1
+        assert "sentinel" in str(res2.content)
+
+    def test_r7_5_oauth_suffix_with_explicit_cash_billing_enforces_cash_budget_on_route_lookup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from src.dalton.llm import complete as complete_mod
+        from src.dalton.services.team_model_catalog import compiled as compiled_mod
+        from src.dalton.services.team_model_catalog.billing import resolve_model_billing
+        from src.dalton.services.team_model_catalog.compiled import cache_compiled_catalog
+        from src.llms.llm import LLM as LLMFactory
+        from src.server.services.llm import user_models
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        # Sole catalog entry on (openai, m-cash-route) has -oauth suffix AND explicit dalton_meta.billing="cash"
+        payload = {
+            "schema": CATALOG_SCHEMA,
+            "providers": {
+                "models": {
+                    "openai": [
+                        {
+                            "id": "m-cash-route",
+                            "name": "Cash Route",
+                            "pricing": {"input": 2.0, "output": 8.0},
+                        }
+                    ]
+                }
+            },
+            "models": {
+                "team-cash-oauth": {
+                    "model_id": "m-cash-route",
+                    "provider": "openai",
+                    "display_name": "Team Cash OAuth Named",
+                    "visible": True,
+                }
+            },
+            "dalton_meta": {
+                "team-cash-oauth": {
+                    "billing": "cash",
+                    "tool_calling": True,
+                }
+            },
+        }
+        cat = compile_catalog_from_payload(payload, revision=130, oauth_sync_enabled=True)
+        cache_compiled_catalog(cat)
+        orig_get_compiled = compiled_mod.get_compiled_catalog_sync
+        monkeypatch.setattr(
+            compiled_mod,
+            "get_compiled_catalog_sync",
+            create_autospec(orig_get_compiled, return_value=cat),
+        )
+        monkeypatch.setattr(LLMFactory, "_model_config", cat.model_config)
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_dalton_meta",
+            lambda *a, **kw: cat.dalton_meta,
+        )
+
+        # Route-level lookup from a differently-named personal custom model must resolve to "cash", NOT "subscription"
+        assert (
+            resolve_model_billing(
+                model_key="my-personal-alias",
+                provider="openai",
+                model_id="m-cash-route",
+                model_config=cat.model_config,
+                dalton_meta=cat.dalton_meta,
+            )
+            == "cash"
+        )
+
+        # dalton_complete with personal custom model on (openai, m-cash-route) enforces cash budget admission!
+        pref_with_custom = {
+            "custom_models": [
+                {
+                    "name": "my-personal-alias",
+                    "provider": "openai",
+                    "model_id": "m-cash-route",
+                    "display_name": "My Personal Alias",
+                }
+            ]
+        }
+        monkeypatch.setattr(
+            user_models,
+            "get_model_preference",
+            create_autospec(user_models.get_model_preference, return_value=pref_with_custom),
+        )
+        budget_spy = create_autospec(
+            complete_mod._check_cash_budget_admission,
+            return_value=(False, "budget_exhausted", "今日现金额度已用完"),
+        )
+        monkeypatch.setattr(complete_mod, "_check_cash_budget_admission", budget_spy)
+        monkeypatch.setattr(
+            complete_mod,
+            "inspect_journal_state",
+            create_autospec(complete_mod.inspect_journal_state, return_value=("proceed", None)),
+        )
+        monkeypatch.setattr(
+            complete_mod,
+            "claim_journal_invocation",
+            create_autospec(
+                complete_mod.claim_journal_invocation,
+                return_value=("in_flight", {"attempt": 1}),
+            ),
+        )
+
+        res = asyncio.run(
+            complete_mod.dalton_complete(
+                user_id="u-1",
+                purpose="test_cash_oauth_suffix_budget",
+                user_prompt="ping",
+                model="my-personal-alias",
+            )
+        )
+        assert budget_spy.call_count == 1
+        assert res.ok is False
+        assert res.status == "budget_exhausted"
+
+    def test_r7_6_alias_referenced_cash_card_cleared_on_pricing_null_when_unshared_and_kept_when_shared(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import copy
+
+        from src.dalton.services.team_model_catalog import service as tmc_service
+        from src.dalton.services.team_model_catalog.service import update_catalog_model
+        from src.dalton.services.team_model_catalog.validation import CatalogModelUpsertInput
+
+        monkeypatch.setattr(
+            "src.dalton.services.team_model_catalog.compiled._load_json_dict",
+            lambda p: _base_upstream_models()
+            if "models.json" in str(p)
+            else (_base_upstream_providers() if "providers.json" in str(p) else {}),
+        )
+        monkeypatch.setattr(
+            "src.dalton.llm.overlay.load_overlay_data",
+            lambda path=None: _base_native_overlay(),
+        )
+
+        def _make_state(*, with_second_model: bool) -> dict[str, Any]:
+            models_dict: dict[str, Any] = {
+                "alias-model-1": {
+                    "model_id": "card-canon",
+                    "provider": "var-alias",
+                    "display_name": "Alias Model 1",
+                    "visible": True,
+                }
+            }
+            meta_dict: dict[str, Any] = {
+                "alias-model-1": {"billing": "cash", "tool_calling": True}
+            }
+            if with_second_model:
+                models_dict["alias-model-2"] = {
+                    "model_id": "card-canon",
+                    "provider": "var-alias",
+                    "display_name": "Alias Model 2",
+                    "visible": True,
+                }
+                meta_dict["alias-model-2"] = {
+                    "billing": "subscription",
+                    "tool_calling": True,
+                    "notional_pricing": {"input": 3.0, "output": 9.0},
+                }
+            return {
+                "revision": 15,
+                "payload": {
+                    "schema": CATALOG_SCHEMA,
+                    "providers": {
+                        "provider_variants": {
+                            "openai": {
+                                "var-alias": {
+                                    "parent_provider": "openai",
+                                    "display_name": "Var Alias",
+                                    "sdk": "openai",
+                                    "billing": "cash",
+                                    "base_url": "https://var-alias.example.com/v1",
+                                }
+                            }
+                        },
+                        "models": {
+                            "var-alias": [
+                                {
+                                    "id": "card-canon",
+                                    "alias": ["card-alias"],
+                                    "name": "Canon Card",
+                                    "pricing": {"input": 3.0, "output": 9.0},
+                                }
+                            ]
+                        },
+                    },
+                    "models": models_dict,
+                    "dalton_meta": meta_dict,
+                },
+                "payload_sha256": "sha15",
+                "legacy_sync_import_status": "not_applicable",
+                "last_known_legacy_retired": [],
+            }
+
+        class _FakeConn:
+            @asynccontextmanager
+            async def transaction(self):
+                yield
+
+        @asynccontextmanager
+        async def _fake_get_db(_conn=None):
+            yield _FakeConn()
+
+        orig_get_row = tmc_service.get_catalog_row
+        orig_save = tmc_service.save_catalog_revision
+        monkeypatch.setattr(tmc_service, "get_db_connection", _fake_get_db)
+        monkeypatch.setattr(
+            tmc_service,
+            "acquire_catalog_exclusive_lock",
+            create_autospec(tmc_service.acquire_catalog_exclusive_lock),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "publish_catalog_changed",
+            create_autospec(tmc_service.publish_catalog_changed),
+        )
+        monkeypatch.setattr(
+            tmc_service,
+            "invalidate_catalog_redis_caches",
+            create_autospec(tmc_service.invalidate_catalog_redis_caches),
+        )
+
+        # Case A: sole user changes model_id to alias "card-alias", switches to subscription + pricing=None
+        state_a = _make_state(with_second_model=False)
+
+        async def _get_row_a(conn: Any = None, *, for_update: bool = False) -> dict[str, Any]:
+            return copy.deepcopy(state_a)
+
+        async def _save_a(
+            conn: Any,
+            *,
+            expected_revision: int,
+            action: str,
+            target_keys: list[str],
+            payload: dict[str, Any],
+            diff_summary: dict[str, Any],
+            side_effects: list[dict[str, Any]],
+            actor_user_id: str,
+            comment: str | None = None,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            state_a["revision"] = expected_revision + 1
+            state_a["payload"] = copy.deepcopy(payload)
+            return {
+                "catalog": {"revision": state_a["revision"]},
+                "revision_record": {"revision": state_a["revision"], "action": action},
+            }
+
+        monkeypatch.setattr(
+            tmc_service, "get_catalog_row", create_autospec(orig_get_row, side_effect=_get_row_a)
+        )
+        monkeypatch.setattr(
+            tmc_service, "save_catalog_revision", create_autospec(orig_save, side_effect=_save_a)
+        )
+        res_a = asyncio.run(
+            update_catalog_model(
+                actor_user_id="admin-1",
+                model_key="alias-model-1",
+                data=CatalogModelUpsertInput(
+                    model_id="card-alias",
+                    pricing=None,
+                    dalton_meta={
+                        "billing": "subscription",
+                        "notional_pricing": {"input": 3.0, "output": 9.0},
+                    },
+                    expected_revision=15,
+                ),
+            )
+        )
+        assert res_a["revision"] == 16
+        assert "var-alias" not in (state_a["payload"].get("providers", {}).get("models") or {})
+
+        # Case B: another model still references canonical "card-canon" -> card must be preserved
+        state_b = _make_state(with_second_model=True)
+
+        async def _get_row_b(conn: Any = None, *, for_update: bool = False) -> dict[str, Any]:
+            return copy.deepcopy(state_b)
+
+        async def _save_b(
+            conn: Any,
+            *,
+            expected_revision: int,
+            action: str,
+            target_keys: list[str],
+            payload: dict[str, Any],
+            diff_summary: dict[str, Any],
+            side_effects: list[dict[str, Any]],
+            actor_user_id: str,
+            comment: str | None = None,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            state_b["revision"] = expected_revision + 1
+            state_b["payload"] = copy.deepcopy(payload)
+            return {
+                "catalog": {"revision": state_b["revision"]},
+                "revision_record": {"revision": state_b["revision"], "action": action},
+            }
+
+        monkeypatch.setattr(
+            tmc_service, "get_catalog_row", create_autospec(orig_get_row, side_effect=_get_row_b)
+        )
+        monkeypatch.setattr(
+            tmc_service, "save_catalog_revision", create_autospec(orig_save, side_effect=_save_b)
+        )
+        res_b = asyncio.run(
+            update_catalog_model(
+                actor_user_id="admin-1",
+                model_key="alias-model-1",
+                data=CatalogModelUpsertInput(
+                    model_id="card-alias",
+                    pricing=None,
+                    dalton_meta={
+                        "billing": "subscription",
+                        "notional_pricing": {"input": 3.0, "output": 9.0},
+                    },
+                    expected_revision=15,
+                ),
+            )
+        )
+        assert res_b["revision"] == 16
+        kept_cards = state_b["payload"]["providers"]["models"]["var-alias"]
+        assert len(kept_cards) == 1
+        assert kept_cards[0]["id"] == "card-canon"

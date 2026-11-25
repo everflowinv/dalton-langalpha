@@ -277,35 +277,13 @@ async def classify_model(
     of extra DB reads.
     """
     from src.llms.llm import LLM as LLMFactory
-    # DALTON-HOOK(team-model-catalog): when a recovery context or team catalog variant snapshot is
-    # bound for this model, classify from the snapshotted team catalog route BEFORE checking
-    # personal custom_models so a newly-added same-name custom model cannot hijack recovery or
-    # bypass catalog variant credential fingerprint verification.
-    from src.dalton.services.team_model_catalog.snapshot import (
-        get_active_catalog_snapshot,
-        get_active_recovery_context,
-        overlay_model_config_with_snapshot,
-    )
-
-    active_recovery = get_active_recovery_context()
-    active_snap = get_active_catalog_snapshot()
-    snap_models = active_snap.get("models") if isinstance(active_snap, dict) else None
-    snap_entry = snap_models.get(model_name) if isinstance(snap_models, dict) else None
-    if isinstance(snap_entry, dict) and (
-        active_recovery is not None or bool(snap_entry.get("catalog_defined"))
-    ):
-        mc = overlay_model_config_with_snapshot(LLMFactory.get_model_config())
-        system_info = mc.get_model_config(model_name)
-        if system_info:
-            return ModelSource.SYSTEM, system_info
 
     if not ignore_custom_models:
         custom_cm = await get_custom_model_config(user_id, model_name, _pref_cache=_pref_cache)
         if custom_cm:
             return ModelSource.CUSTOM, custom_cm
 
-    mc = overlay_model_config_with_snapshot(LLMFactory.get_model_config())
-    system_info = mc.get_model_config(model_name)
+    system_info = LLMFactory.get_model_config().get_model_config(model_name)
     if system_info:
         return ModelSource.SYSTEM, system_info
 

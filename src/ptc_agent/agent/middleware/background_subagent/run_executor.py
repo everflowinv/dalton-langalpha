@@ -275,34 +275,33 @@ async def _run_background_task(
 
         current_background_token_tracker.set(tracker)
         set_tool_tracker(tool_tracker)
-        # DALTON-HOOK(team-model-catalog): bind subagent RunRecoveryContext (effective_catalog_snapshot)
-        # via unified recovery entry point when persisted for this task_run_id.
-        subagent_recovery_ctx = None
+        # DALTON-HOOK(team-model-catalog): bind subagent effective_catalog_snapshot (audit/settlement only)
+        # when persisted for this task_run_id.
+        subagent_snapshot = None
         if task.task_run_id:
             try:
                 from src.dalton.database.team_model_catalog import (
                     is_conversation_db_pool_open,
                 )
                 from src.dalton.services.team_model_catalog.snapshot import (
-                    load_run_recovery_context,
+                    load_run_catalog_snapshot,
                 )
 
                 if is_conversation_db_pool_open():
-                    subagent_recovery_ctx = await load_run_recovery_context(
+                    subagent_snapshot = await load_run_catalog_snapshot(
                         str(task.task_run_id),
                         is_subagent=True,
-                        enforce_capabilities=False,
                     )
             except Exception:
-                subagent_recovery_ctx = None
+                subagent_snapshot = None
         from src.dalton.services.team_model_catalog.snapshot import (
-            bind_recovery_context,
+            bind_catalog_snapshot,
         )
 
         try:
             with (
-                bind_recovery_context(subagent_recovery_ctx)
-                if subagent_recovery_ctx is not None and subagent_recovery_ctx.snapshot is not None
+                bind_catalog_snapshot(subagent_snapshot)
+                if subagent_snapshot is not None
                 else nullcontext()
             ):
                 async with _child_credit_lane(task, tracker, tool_tracker, label):

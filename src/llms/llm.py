@@ -723,23 +723,13 @@ class LLM:
                 compiled = get_compiled_catalog_sync()
                 if compiled is not None and compiled.model_config is not None:
                     cls._model_config = compiled.model_config
-                    # DALTON-HOOK(team-model-catalog): overlay active turn snapshot (never mutating cls._model_config)
-                    from src.dalton.services.team_model_catalog.snapshot import (
-                        overlay_model_config_with_snapshot,
-                    )
-
-                    return overlay_model_config_with_snapshot(compiled.model_config)
+                    return compiled.model_config
             except Exception as exc:
                 logger.debug("CompiledCatalog lookup fell back to local ModelConfig: %s", exc)
         # DALTON-HOOK(llm-overlay): rebuild when the overlay file changed (re-sync button)
         if cls._model_config is None or overlay_changed(getattr(cls._model_config, "overlay_stamp", None)):
             cls._model_config = ModelConfig()
-        # DALTON-HOOK(team-model-catalog): overlay active turn snapshot (never mutating cls._model_config)
-        from src.dalton.services.team_model_catalog.snapshot import (
-            overlay_model_config_with_snapshot,
-        )
-
-        return overlay_model_config_with_snapshot(cls._model_config)
+        return cls._model_config
 
     def __init__(
         self,
@@ -776,12 +766,7 @@ class LLM:
         self.egress_transport = egress_transport
         self.follow_redirects = follow_redirects
         self._catalog_credential_source = _catalog_credential_source  # DALTON-HOOK(team-model-catalog)
-        # DALTON-HOOK(team-model-catalog): ensure active turn/resume snapshot overlays model route & parameters
-        from src.dalton.services.team_model_catalog.snapshot import (
-            overlay_model_config_with_snapshot,
-        )
-
-        self.model_config = overlay_model_config_with_snapshot(self.get_model_config())
+        self.model_config = self.get_model_config()
         spec = (
             model
             if isinstance(model, ModelSpec)
@@ -886,7 +871,7 @@ class LLM:
         self._merge_additional_betas(spec.additional_betas)
 
         # DALTON-HOOK(team-model-catalog): construct-time security invariant for catalog-defined variants.
-        if self.provider_info.get("catalog_defined"):
+        if self.provider_info.get("catalog_defined") is True:
             from src.dalton.services.team_model_catalog.transport import (
                 enforce_catalog_variant_construction,
             )
@@ -981,7 +966,12 @@ class LLM:
             _catalog_credential_source=_catalog_credential_source,  # DALTON-HOOK(team-model-catalog)
             **override_params,
         )
-        return instance.get_llm(cache_key=cache_key)
+        llm = instance.get_llm(cache_key=cache_key)
+        # DALTON-HOOK(team-model-catalog): tag personal custom-model clients so START snapshots
+        # do not record a team catalog entry for a personal model sharing the same name.
+        if isinstance(getattr(llm, "metadata", None), dict):
+            llm.metadata["is_custom_model"] = True
+        return llm
 
     def _resolve_billing_type(self) -> str:
         """Determine billing type based on how this LLM was constructed.
@@ -1015,7 +1005,7 @@ class LLM:
         from src.dalton.llm.providers import ensure_provider_enabled
         ensure_provider_enabled(self.provider)
         # DALTON-HOOK(team-model-catalog): re-verify catalog-defined variant invariants before SDK client build.
-        if self.provider_info.get("catalog_defined"):
+        if self.provider_info.get("catalog_defined") is True:
             from src.dalton.services.team_model_catalog.transport import (
                 enforce_catalog_variant_construction,
             )
@@ -1669,17 +1659,12 @@ def create_llm(
         A LangChain chat model instance
     """
     # DALTON-HOOK(team-model-catalog): auto-bind dedicated catalog variant credentials &
-    # CatalogVariantTransport on direct create_llm calls (zero env_key fallback), honoring
-    # any active turn/resume effective_catalog_snapshot route & credential fingerprint.
+    # CatalogVariantTransport on direct create_llm calls (zero env_key fallback).
     if "_catalog_credential_source" not in kwargs:
-        from src.dalton.services.team_model_catalog.snapshot import (
-            overlay_model_config_with_snapshot,
-        )
-
-        mc = overlay_model_config_with_snapshot(LLM.get_model_config())
+        mc = LLM.get_model_config()
         m_cfg = mc.get_model_config(model) if isinstance(model, str) else None
         prov = str(m_cfg.get("provider") or "") if isinstance(m_cfg, dict) else ""
-        if prov and mc.get_provider_info(prov).get("catalog_defined"):
+        if prov and mc.get_provider_info(prov).get("catalog_defined") is True:
             from src.dalton.services.team_model_catalog.transport import (
                 resolve_catalog_variant_binding_sync,
             )
@@ -1714,7 +1699,7 @@ def platform_key_configured(model_name: str) -> bool:
     if isinstance(m_cfg, dict):
         prov = str(m_cfg.get("provider") or "").strip()
         prov_info = mc.get_provider_info(prov) if prov else {}
-        if prov_info.get("catalog_defined"):
+        if prov_info.get("catalog_defined") is True:
             from src.dalton.services.team_model_catalog.transport import (
                 has_valid_catalog_variant_binding_sync,
             )

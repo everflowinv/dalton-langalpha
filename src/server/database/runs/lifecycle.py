@@ -606,10 +606,11 @@ async def start_run(
                         )
 
                         snap_candidates: list[str] = []
-                        for mk_field in ("model", "llm_model", "main_model"):
-                            val = run_metadata.get(mk_field)
-                            if isinstance(val, str) and val.strip():
-                                snap_candidates.append(val.strip())
+                        if run_metadata.get("model_source") != "custom":
+                            for mk_field in ("model", "llm_model", "main_model"):
+                                val = run_metadata.get(mk_field)
+                                if isinstance(val, str) and val.strip():
+                                    snap_candidates.append(val.strip())
                         fb_list = run_metadata.get("fallback_models")
                         if isinstance(fb_list, list):
                             snap_candidates.extend(

@@ -15,6 +15,8 @@ CATALOG_CHANGED_CHANNEL = "dalton:team_model_catalog:changed"
 CATALOG_REVISION_HEADER = "X-Dalton-Catalog-Revision"
 CATALOG_VARIANT_CREDENTIAL_SOURCE_PREFIX = "catalog_variant:"
 COMPILED_CATALOG_CACHE_MAXSIZE = 8
+CATALOG_ROUTE_CHANGED_CODE = "catalog_route_changed"
+CATALOG_ROUTE_CHANGED_MESSAGE = "这个回合中断期间团队模型配置发生了变化，请重新发送消息"
 
 VALID_LEGACY_IMPORT_STATUSES = frozenset(
     {"pending", "not_applicable", "imported", "failed", "abandoned"}
@@ -198,3 +200,23 @@ class CatalogVariantSecurityError(RuntimeError):
     """Raised when a catalog variant client fails construct-time or send-time invariants."""
 
     code = "catalog_variant_security_violation"
+
+
+def build_catalog_route_changed_http_exception(
+    *,
+    diffs: Mapping[str, Any] | None = None,
+    run_id: str | None = None,
+) -> Any:
+    """Build the canonical HTTP 400 exception when a resumed run's live route differs from its snapshot."""
+    from fastapi import HTTPException
+
+    detail: dict[str, Any] = {
+        "type": CATALOG_ROUTE_CHANGED_CODE,
+        "code": CATALOG_ROUTE_CHANGED_CODE,
+        "message": CATALOG_ROUTE_CHANGED_MESSAGE,
+    }
+    if run_id:
+        detail["run_id"] = str(run_id)
+    if diffs:
+        detail["diffs"] = dict(diffs)
+    return HTTPException(status_code=400, detail=detail)

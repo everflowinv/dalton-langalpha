@@ -566,14 +566,26 @@ async def astream_ptc_workflow(
                 # moves the standalone path onto the ordering production has.
                 if config is None:
                     # DALTON-HOOK(automation-subscription-fallback): resolve LLM config with automation subscription fallback
+                    # DALTON-HOOK(team-model-catalog): bind resume_verify_scope on standalone/automation refire so verify_resume_route runs before client build
+                    from contextlib import nullcontext
+
                     from src.dalton.services.automation_subscription_fallback import (
                         resolve_ptc_turn_llm_config,
                     )
-
-                    config, run_metadata = await resolve_ptc_turn_llm_config(
-                        setup.agent_config, user_id, request, is_byok=is_byok, thread_id=thread_id,
-                        workspace_id=workspace_id, identity=identity, role=route.role, run_metadata=run_metadata,
+                    from src.dalton.services.team_model_catalog.snapshot import (
+                        resume_verify_scope,
                     )
+
+                    _resume_src_id = getattr(request, "resume_of_run_id", None)
+                    with (
+                        resume_verify_scope(str(_resume_src_id), thread_id=thread_id)
+                        if _resume_src_id
+                        else nullcontext()
+                    ):
+                        config, run_metadata = await resolve_ptc_turn_llm_config(
+                            setup.agent_config, user_id, request, is_byok=is_byok, thread_id=thread_id,
+                            workspace_id=workspace_id, identity=identity, role=route.role, run_metadata=run_metadata,
+                        )
 
                 # Persist query start
                 feedback_action = None
@@ -805,6 +817,16 @@ async def astream_ptc_workflow(
                         # Per attempt, since a retry or an automation's turn may
                         # run another model than the turn's query row recorded.
                         **({"llm_model": effective_model} if effective_model else {}),
+                        # DALTON-HOOK(team-model-catalog): mark personal custom-model runs so START
+                        # snapshots never confuse a personal model with a same-name team catalog model.
+                        **(
+                            {"model_source": "custom"}
+                            if isinstance(
+                                getattr(getattr(config, "llm_client", None), "metadata", None), dict
+                            )
+                            and config.llm_client.metadata.get("is_custom_model")
+                            else {}
+                        ),
                         # DALTON-HOOK(team-model-catalog): include configured fallback_models so turn START snapshot covers fallbacks
                         **(
                             {"fallback_models": list(config.llm.fallback)}

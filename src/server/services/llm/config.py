@@ -240,17 +240,6 @@ def select_model(
     """
     from ptc_agent.config import LLMConfig
 
-    # DALTON-HOOK(team-model-catalog): on a resumed primary turn under an active recovery context,
-    # pin to the original run's selected model_key instead of drifting to a newly saved default.
-    if request_model is None and slot == "primary":
-        from src.dalton.services.team_model_catalog.snapshot import (
-            get_active_recovery_context,
-        )
-
-        rec_ctx = get_active_recovery_context()
-        if rec_ctx is not None and not rec_ctx.is_subagent and rec_ctx.model_key:
-            request_model = rec_ctx.model_key
-
     model_field, pref_key = _SLOT_MODEL_MAP[slot]
     saved = saved_default_model(model_pref, slot)
 
@@ -919,6 +908,32 @@ async def resolve_llm_config(
         # their own failure go unretrieved.
         if reads is not None:
             await cancel_and_join(reads)
+
+    # DALTON-HOOK(team-model-catalog): compare the live-resolved route against the
+    # interrupted run's snapshot BEFORE check_model_available / resolve_clients so any
+    # route/provider/credential/billing change refuses with 400 catalog_route_changed.
+    if slot == "primary":
+        from src.dalton.services.team_model_catalog.snapshot import (
+            get_active_resume_verify_target,
+            resolve_live_route_fingerprint,
+            verify_resume_route,
+        )
+
+        resume_target = get_active_resume_verify_target()
+        if resume_target is not None:
+            live_route = await resolve_live_route_fingerprint(
+                selection.effective_model,
+                user_id=user_id,
+                model_pref=model_pref,
+                ignore_custom_models=ignore_custom_models,
+            )
+            await verify_resume_route(
+                resume_target.run_id,
+                live_route,
+                thread_id=resume_target.thread_id or thread_id,
+                is_subagent=False,
+                run_row=resume_target.run_row,
+            )
 
     # The saved prefs, not the view: attribution asks whether the refused name
     # is one the user saved, and a dropped role may be that name.

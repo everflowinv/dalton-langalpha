@@ -171,6 +171,23 @@ async def assert_model_not_retired_under_lock(
                 for cp in raw_cps
             ):
                 return compiled
+        if user_id:
+            try:
+                from src.dalton.credentials import (
+                    credential_user_id,
+                    uses_shared_team_credential,
+                )
+
+                if uses_shared_team_credential(user_id):
+                    holder_id = credential_user_id(user_id)
+                    if holder_id and holder_id != user_id:
+                        holder_cp = await user_models.get_custom_provider_config(
+                            holder_id, cleaned
+                        )
+                        if holder_cp:
+                            return compiled
+            except Exception:
+                pass
     raise HTTPException(
         status_code=400,
         detail={
@@ -849,6 +866,33 @@ async def create_catalog_model(
     }
 
 
+def _find_provider_pricing_card(
+    mc: Any,
+    provider: str,
+    model_id: str,
+) -> dict[str, Any] | None:
+    """Locate a pricing card under ``provider`` matching ``norm_id(id)`` or any ``norm_id(alias)``."""
+    manifest_models = (getattr(mc, "manifest", None) or {}).get("models") or {}
+    cards = manifest_models.get(provider) if isinstance(manifest_models, Mapping) else None
+    if not isinstance(cards, list):
+        return None
+    target = norm_id(model_id)
+    if not target:
+        return None
+    for card in cards:
+        if not isinstance(card, Mapping):
+            continue
+        if norm_id(str(card.get("id") or "")) == target:
+            return dict(card)
+    for card in cards:
+        if not isinstance(card, Mapping):
+            continue
+        aliases = card.get("alias") or []
+        if isinstance(aliases, list) and any(norm_id(str(a)) == target for a in aliases if a):
+            return dict(card)
+    return None
+
+
 async def update_catalog_model(
     *,
     actor_user_id: str,
@@ -924,7 +968,9 @@ async def update_catalog_model(
 
                 deep_merge_patch_with_null_delete(merged_meta, dm_patch)
 
-            existing_card = mc.get_model_info(prov, str(merged_entry.get("model_id") or key))
+            existing_card = _find_provider_pricing_card(
+                mc, prov, str(merged_entry.get("model_id") or key)
+            )
             clearing_pricing = "pricing" in data.model_fields_set and data.pricing is None
             pricing_for_check = (
                 None

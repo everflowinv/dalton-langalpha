@@ -748,16 +748,19 @@ async def _handle_resume(
                 return refusal
         # Before the fence, so a refused model holds nothing once the claim
         # drops on the way out.
-        # DALTON-HOOK(team-model-catalog): call load_run_recovery_context FIRST to obtain the
-        # predecessor's model_key, effective_catalog_snapshot, and capability enforcement, then
-        # derive the target model/effort and bind the snapshot before building the client.
-        from contextlib import nullcontext
-
+        # DALTON-HOOK(team-model-catalog): compare the live-resolved subagent route against the
+        # interrupted predecessor run's persisted snapshot via verify_resume_route BEFORE
+        # _resolve_model constructs any LLM client.
         from fastapi import HTTPException
 
+        from src.dalton.services.team_model_catalog.constants import (
+            CATALOG_ROUTE_CHANGED_CODE,
+            CATALOG_ROUTE_CHANGED_MESSAGE,
+        )
         from src.dalton.services.team_model_catalog.snapshot import (
-            bind_recovery_context,
-            load_run_recovery_context,
+            _extract_primary_model_key_from_run,
+            resolve_live_route_fingerprint,
+            verify_resume_route,
         )
 
         pred_row: dict[str, Any] | None = prior_run
@@ -775,27 +778,6 @@ async def _handle_resume(
                 tool_call_id,
             )
 
-        subagent_recovery_ctx = None
-        if pred_row is not None:
-            try:
-                subagent_recovery_ctx = await load_run_recovery_context(
-                    run_id=str(pred_row.get("task_run_id") or "") or None,
-                    is_subagent=True,
-                    run_row=pred_row,
-                    explicit_model_key=ask.model,
-                    enforce_capabilities=True,
-                )
-            except HTTPException as exc:
-                detail = exc.detail if isinstance(exc.detail, dict) else {}
-                msg = str(detail.get("message") or f"Model cannot be resumed ({exc.status_code}).")
-                return _refusal(f"Error: {msg}", tool_call_id)
-            except Exception:
-                logger.warning(
-                    "subagent recovery context load failed",
-                    task_id=task.task_id,
-                    exc_info=True,
-                )
-
         if ask.complete:
             runs = ask
         else:
@@ -806,45 +788,45 @@ async def _handle_resume(
             )
             runs = ask.over(last_ask)
 
-        # When recovery context provides a snapshot covering the resumed model, pin to the
-        # predecessor's model_key (unless caller explicitly requested another) and bind the
-        # snapshot before _resolve_model verifies credentials and constructs the client.
-        # If recovery context or its snapshot is absent (pre-ledger task or unbackfillable
-        # legacy run), fall back to the existing live-catalog resolution via ``runs``.
-        use_recovery_snapshot = (
-            subagent_recovery_ctx is not None and subagent_recovery_ctx.snapshot is not None
-        )
-        resolve_ask = runs
-        if (
-            use_recovery_snapshot
-            and (not resolve_ask or resolve_ask.model is None)
-            and subagent_recovery_ctx is not None
-            and subagent_recovery_ctx.model_key
-        ):
-            resolve_ask = TaskAsk(
-                model=subagent_recovery_ctx.model_key,
-                effort=resolve_ask.effort if resolve_ask else None,
+        if pred_row is not None:
+            live_model_key = (
+                runs.model.strip()
+                if runs and runs.model
+                else (
+                    mw.task_models._own_model(task.subagent_type)
+                    if mw.task_models is not None
+                    else (_extract_primary_model_key_from_run(pred_row, is_subagent=True) or "")
+                )
             )
-        with (
-            bind_recovery_context(subagent_recovery_ctx)
-            if use_recovery_snapshot
-            else nullcontext()
-        ):
-            override = (
-                await _resolve_model(mw, resolve_ask, task.subagent_type)
-                if resolve_ask
-                else None
+            tm_user_id = getattr(mw.task_models, "_user_id", None)
+            tm_model_pref = getattr(mw.task_models, "_model_pref", None)
+            live_route = await resolve_live_route_fingerprint(
+                live_model_key,
+                user_id=tm_user_id,
+                model_pref=tm_model_pref,
             )
+            try:
+                await verify_resume_route(
+                    str(pred_row.get("task_run_id") or "") or None,
+                    live_route,
+                    is_subagent=True,
+                    run_row=pred_row,
+                )
+            except HTTPException as exc:
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                code = str(
+                    detail.get("code") or detail.get("type") or CATALOG_ROUTE_CHANGED_CODE
+                )
+                msg = str(detail.get("message") or CATALOG_ROUTE_CHANGED_MESSAGE)
+                return _refusal(f"Error: [{code}] {msg}", tool_call_id)
+
+        override = await _resolve_model(mw, runs, task.subagent_type) if runs else None
         if isinstance(override, TaskModelRefused):
             # DALTON-HOOK(computer-cli-tokens-off): omit `la models list` when CLI tokens are off.
             from src.dalton.settings import is_computer_cli_tokens_enabled
 
             # A model carried over is one the agent never named on this call.
-            carried = (
-                (resolve_ask.model if resolve_ask else runs.model)
-                if ask.model is None
-                else None
-            )
+            carried = runs.model if ask.model is None else None
             suffix = (
                 "Resume it with model set to another from `la models list`."
                 if is_computer_cli_tokens_enabled()

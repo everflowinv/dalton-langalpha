@@ -41,4 +41,23 @@ describe('readTurnFailure', () => {
     expect(failure({ message: 'Try later.' }, { status: 500 }).banner).toBe('Try later.');
     expect(failure({ type: 'service_unavailable' }, { status: 503 }).banner).toBeNull();
   });
+
+  // DALTON-HOOK(team-model-catalog): verify catalog_route_changed surfaces the resume notice cleanly
+  it('meets catalog_route_changed as an answered notice banner so the user can resend', () => {
+    const msg = '这个回合中断期间团队模型配置发生了变化，请重新发送消息';
+    expect(
+      failure({ type: 'catalog_route_changed', code: 'catalog_route_changed', message: msg }, { status: 400 }),
+    ).toEqual({
+      banner: { message: msg, kind: 'notice' },
+      answered: true,
+      holdsDraft: false,
+      reread: null,
+    });
+    expect(failure({ code: 'catalog_route_changed' }, { status: 400 })).toEqual({
+      banner: { message: msg, kind: 'notice' },
+      answered: true,
+      holdsDraft: false,
+      reread: null,
+    });
+  });
 });

@@ -302,12 +302,6 @@ class DaltonChatUploadsConfig(BaseModel):
     cleanup_enabled: bool = True
 
 
-class DaltonPriceWatchConfig(BaseModel):
-    """Periodic third-party public model pricing check toggle (shared across Everflow and Core)."""
-
-    enabled: bool = True
-
-
 # A fake-IP exemption may never reach these, whatever the config says: they are
 # the internal services and metadata endpoint the fetch guard exists to protect.
 NEVER_EXEMPT_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = tuple(
@@ -463,7 +457,6 @@ class DaltonConfig(BaseModel):
         default_factory=DaltonConversationsConfig
     )
     network: DaltonNetworkConfig = Field(default_factory=DaltonNetworkConfig)
-    price_watch: DaltonPriceWatchConfig = Field(default_factory=DaltonPriceWatchConfig)
 
 
 def _parse_env_pm_user_ids() -> list[str] | None:

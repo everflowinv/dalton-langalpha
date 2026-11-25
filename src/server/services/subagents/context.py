@@ -111,7 +111,7 @@ class SubagentContext:
             # DALTON-HOOK(team-model-catalog): check catalog-defined variant availability via
             # its bound credential row instead of calling platform_key_configured() (which constructs
             # an unauthenticated LLM client and raises CatalogVariantSecurityError -> HTTP 500).
-            if provider_info.get("catalog_defined"):
+            if provider_info.get("catalog_defined") is True:
                 from src.dalton.services.team_model_catalog.transport import (
                     has_valid_catalog_variant_binding_async,
                 )

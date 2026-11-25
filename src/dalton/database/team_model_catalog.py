@@ -47,18 +47,36 @@ async def acquire_catalog_shared_lock(conn: Any) -> None:
     ``lock_user_subagents`` / ``overrides_locked``) to guarantee deadlock-free
     ordering against exclusive catalog retire/rollback transactions.
     """
-    await conn.execute(
-        "SELECT pg_advisory_xact_lock_shared(hashtext(%s))",
-        (CATALOG_LOCK_KEY,),
-    )
+    if conn is None:
+        return
+    if hasattr(conn, "cursor"):
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT pg_advisory_xact_lock_shared(hashtext(%s))",
+                (CATALOG_LOCK_KEY,),
+            )
+    elif hasattr(conn, "execute"):
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock_shared(hashtext(%s))",
+            (CATALOG_LOCK_KEY,),
+        )
 
 
 async def acquire_catalog_exclusive_lock(conn: Any) -> None:
     """Acquire transaction-scoped exclusive advisory lock on ``dalton_team_model_catalog``."""
-    await conn.execute(
-        "SELECT pg_advisory_xact_lock(hashtext(%s))",
-        (CATALOG_LOCK_KEY,),
-    )
+    if conn is None:
+        return
+    if hasattr(conn, "cursor"):
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (CATALOG_LOCK_KEY,),
+            )
+    elif hasattr(conn, "execute"):
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            (CATALOG_LOCK_KEY,),
+        )
 
 
 # ---------------------------------------------------------------------------

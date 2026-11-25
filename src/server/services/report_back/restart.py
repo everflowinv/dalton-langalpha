@@ -69,9 +69,8 @@ class OwedResume:
     retry_run_id: Optional[str] = None
     # DALTON-HOOK(automation-subscription-fallback): interrupted turn's automation execution id
     automation_execution_id: Optional[str] = None
-    # DALTON-HOOK(team-model-catalog): interrupted run id & backfilled snapshot for authoritative server-side binding on resume
+    # DALTON-HOOK(team-model-catalog): interrupted run id for server-side compare-and-reject verification on resume
     source_run_id: Optional[str] = None
-    catalog_snapshot: Optional[Mapping[str, Any]] = None
 
     @property
     def report_source(self) -> None:
@@ -207,28 +206,6 @@ async def resume_verdict(job: Mapping[str, Any]) -> OwedResume | NotOwed | NotYe
         if retry_run_id is not None and state.get("run_user_id")
         else str(state["user_id"])
     )
-    # DALTON-HOOK(team-model-catalog): load recovery context (persisted or backfilled snapshot) via unified entry point
-    catalog_snapshot = None
-    try:
-        from src.dalton.services.team_model_catalog.snapshot import (
-            load_run_recovery_context,
-        )
-
-        recovery_ctx = await load_run_recovery_context(
-            str(run_id),
-            thread_id=thread_id,
-            is_subagent=False,
-            run_row={**dict(state), "conversation_response_id": str(run_id)},
-            enforce_capabilities=False,
-        )
-        catalog_snapshot = recovery_ctx.snapshot if recovery_ctx is not None else None
-    except Exception as _snap_err:
-        logger.warning(
-            "[RESTART_RESUME] Failed to load recovery context for run=%s: %s",
-            run_id,
-            type(_snap_err).__name__,
-        )
-
     return OwedResume(
         user_id=resume_user_id,
         workspace_id=str(state["workspace_id"]),
@@ -237,7 +214,6 @@ async def resume_verdict(job: Mapping[str, Any]) -> OwedResume | NotOwed | NotYe
         retry_run_id=retry_run_id,
         automation_execution_id=execution_id or None,
         source_run_id=str(run_id),
-        catalog_snapshot=catalog_snapshot,
     )
 
 

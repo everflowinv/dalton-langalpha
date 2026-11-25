@@ -1,7 +1,7 @@
 # 团队模型目录设计方案（管理员网页增改模型，版本化在线生效）
 
 > **设计定位**：面向 Everflow 与独立核心（Standalone Core）双安装形态的团队级模型目录管理能力
-> **目标体验**：管理员在 **设置 → 团队管理 → 模型与供应商** 页面自助完成新模型与兼容提供商变体接入、价格与评分修订、可见性切换、退役替换与一键回滚；每次新请求向 PostgreSQL 确认当前目录版本号，在途对话回合与跨部署恢复回合全程沿用回合启动时持久化的有效配置快照。
+> **目标体验**：管理员在 **设置 → 团队管理 → 模型与供应商** 页面自助完成新模型与兼容提供商变体接入、价格与评分修订、可见性切换、退役替换与一键回滚；每次新请求向 PostgreSQL 确认当前目录版本号，在途对话回合全程使用回合启动时持久化的有效配置快照，中断恢复时在构造客户端前校验当前路由与快照指纹一致后放行，配置变更时明确提示用户重新发送消息。
 
 ---
 
@@ -9,7 +9,7 @@
 
 1. **解决什么问题**：日常上线新模型、修订输入/缓存/输出费率、调整上下文窗口与思考档位、维护"智能 / 速度 / 说人话"评分，原先需要手工修改代码仓库内的 `src/dalton/llm/native_overlay.json`（或受门禁保护的上游清单）并重新发版部署（如智谱 `GLM 5.4` 近期由独立静态配置 PR 先行接入）。本方案将日常模型目录运维收敛到网页管理端，与代码发布解耦。
 2. **核心架构**：保留上游 `src/llms/manifest/*.json` 与 `src/dalton/llm/native_overlay.json` 作为随镜像发布的**出厂默认基线**；在 PostgreSQL 建立单行当前目录表 `dalton_team_model_catalog`（迁移预置 `revision = 0` 初始空目录）、事务审计与回滚表 `dalton_team_model_catalog_revisions`（含基于配置版本号的关联任务改写明细 `side_effects`）以及目录变体专属加密凭据表 `dalton_catalog_provider_credentials`；并将原本地文件 `native_sync_overlay.json` 在第一批一次性收口入库，形成清晰的**三层系统目录**。
-3. **版本真相与跨部署回合快照**：PostgreSQL 是当前目录版本号 `revision` 的唯一真相源，进程内存仅按不可变版本号缓存派生结果（`revision → CompiledCatalog`），Redis Pub/Sub 与 60 秒定时轮询负责后台单调预热；每个对话回合启动时将本回合涉及模型的**有效配置快照（`effective_catalog_snapshot`：费率、模态、思考参数、固定路由，以及目录变体原绑定的非密钥标识 `bound_base_url` 与 `key_fingerprint`）**随运行记录持久化，回合内调用及滚动部署后恢复的回合与子智能体一致沿用该快照（首次上线前的存量运行按当时目录补写快照后恢复或结算）。
+3. **版本真相、回合快照与恢复路由比对**：PostgreSQL 是当前目录版本号 `revision` 的唯一真相源，进程内存仅按不可变版本号缓存派生结果（`revision → CompiledCatalog`），Redis Pub/Sub 与 60 秒定时轮询负责后台单调预热；每个对话回合和子智能体启动时将所涉模型的**有效配置快照（`effective_catalog_snapshot`：费率、模态、思考参数、固定路由，以及目录变体原绑定的非密钥标识 `bound_base_url` 与 `key_fingerprint`）**随运行记录持久化用于回合内结算与审计。恢复已中断运行时，系统按当前目录正常解析模型与路由，在构造客户端前经统一入口 `verify_resume_route` 与原运行快照的路由指纹（模型键、提供商、型号、绑定地址、凭据指纹、计费方式）逐项比对：一致则按当前目录继续执行（路由与计费均与快照一致），任一项变更则直接返回错误码 `catalog_route_changed` 拒绝恢复并提示用户重新发送消息，避免在多恢复入口上为旧配置重建历史客户端引入复杂分支。
 4. **目录变体凭据隔离与全路径出站校验**：目录新增提供商变体只能通过系统目录条目、使用其绑定至完整授权 `bound_base_url` 的专属只写凭据调用（成员个人 `custom_models` 在保存与调用时按**解析后的提供商与地址**检查，含从凭据持有人继承的 `base_url`，凡落在目录变体或其 `bound_base_url` 上一律拒绝，且剥离父组 `env_key`）；在客户端构造期与实际发包期对全部 5 条出站路径双重校验，两种安装形态统一读取 `network.fake_ip_cidrs` 配置自动衔接 Fake-IP DoH 真实公网 IP 直连（保留原主机名做 TLS 证书校验）或 `HeldTransport` 公网单播校验，并固定设置 `follow_redirects=False`。
 
 ---
@@ -314,18 +314,18 @@ sequenceDiagram
 4. **按凭据持有人精准失效 Redis 可用模型缓存**：
    - 依据 `available_models_key(user_id)`（`src/server/services/llm/provider_models/service.py:136-142,223-233`），写操作提交后传入 `holder_id = get_team_credential_holder_id()`（及当前操作人 `actor_user_id`）调用 `await invalidate_available_models(...)`，并同步删除涉及网关的 `model_catalog:{url_key}:{provider}` 键（`service.py:203`）。
 
-### 2.4 回合内固定版本与跨部署有效配置快照持久化
+### 2.4 回合内固定版本、快照审计与恢复路由比对
 
-为同时保证单回合内部一致性与滚动发版恢复后的一致性，系统在回合启动时**固定目录版本并将有效配置快照随运行记录落库**：
+为同时保证单回合内部计费与审计一致性以及跨中断恢复的清晰边界，系统在回合启动时**固定目录版本并将有效配置快照随运行记录落库**，并在恢复时执行**先比对后放行**规则：
 
 1. **回合启动持久化自包含快照 `effective_catalog_snapshot`（含原凭据绑定标识）**：
-   - 对话回合在 START 事务写入 `conversation_responses.metadata`（`src/server/database/runs/lifecycle.py:599-621`）以及子智能体启动写入 `subagent_runs` 元数据（`src/server/database/runs/subagent_runs.py:1-26`）时，记录 `catalog_revision: R` 并同步持久化**本回合候选模型的自包含有效配置快照 `effective_catalog_snapshot`**（提取本回合主模型、备用链模型、已启用子智能体模型及 Dalton 后台角色模型的编译结果：现金费率卡 `pricing`、名义费率卡 `notional_card`、`billing`、`input_modalities`、窗口与输出上限、`reasoning` 阶梯与协议路径、固定路由 `provider` / `model_id`，以及目录变体原绑定的非密钥凭据标识 **`bound_base_url` 与 `key_fingerprint`**，体积仅数 KB）。
-2. **回合内全链路与跨部署恢复一致消费快照**：
-   - **本回合运行与结算**：主客户端、`ModelResilienceMiddleware` 备用客户端、子智能体、回合内 `dalton_complete`、`MultimodalStripMiddleware._target`（`src/ptc_agent/agent/middleware/file_operations/multimodal_strip.py:688-715`）、准入与分块预算预留、以及 `UsagePersistence`（`src/server/services/persistence/usage.py:136-147`）调用的 `calculate_cost_from_per_call_records`（`src/utils/tracking/core.py:209-270` → `find_model_pricing` / `resolve_notional_card`），一律从当前回合绑定的 `effective_catalog_snapshot` 读取费率与能力（独立于对话回合的后台单次 `dalton_complete` 在入口固定当次快照）；
-   - **跨镜像部署恢复**：当滚动部署打断运行中的回合或子智能体，由新镜像进程中的恢复服务（`src/server/services/report_back/restart.py:10-18,108-127`）拉起恢复执行或由 Abandoned Sweep 补结算历史未结账行时，**直接加载原运行记录持久化的 `effective_catalog_snapshot` 沿用原费率、模态、思考参数、固定路由与原凭据绑定标识 `(bound_base_url, key_fingerprint)`**，无需按新镜像的静态清单重新编译旧修订号；恢复后的每次发包检查均拿快照中的 `(bound_base_url, key_fingerprint)` 与当前凭据表比对；恢复完成后用户后续新发起的回合再读取最新目录版本。
-3. **首次发布前已存在旧运行记录的无快照兼容补写**：
-   - 本功能首次上线部署时，数据库内此前已启动的在途/被中断回合（`lifecycle.py:599-621`）及待补结算账单尚无 `effective_catalog_snapshot` 字段。恢复服务（`restart.py:108-127`）、`UsagePersistence` 与 Abandoned Sweep 遇到缺失该字段的旧运行记录时，先按当时的目录生效配置（首次上线基准目录）提取该运行所涉模型的有效配置，以条件更新（仅当 `effective_catalog_snapshot` 为空时写入）**补写快照至该运行记录**，随后进入标准恢复与结算流程；
-   - 若因遗留记录引用的模型当时已不存在或元数据残缺而无法补写快照，该回合与账单按上线前既有方式收尾结束（中断回合归为无需恢复并记录结构化日志，待结算记录按既有 `calculate_cost_from_per_call_records` 结账落库）。
+   - 对话回合在 START 事务写入 `conversation_responses.metadata`（`src/server/database/runs/lifecycle.py:599-621`）以及子智能体启动写入 `subagent_runs.replay_facts`（`src/server/database/runs/subagent_runs.py`）时，记录 `catalog_revision: R` 并同步持久化**本回合候选模型的自包含有效配置快照 `effective_catalog_snapshot`**（包含现金费率卡 `pricing`、名义费率卡 `notional_card`、`billing`、`input_modalities`、窗口与输出上限、`reasoning` 阶梯与协议路径、固定路由 `provider` / `model_id`，以及目录变体原绑定的非密钥凭据标识 **`bound_base_url` 与 `key_fingerprint`**，体积仅数 KB）。
+2. **回合内全链路结算与审计消费快照**：
+   - **本回合运行与结算**：主客户端、`ModelResilienceMiddleware` 备用客户端、子智能体、回合内 `dalton_complete`、`MultimodalStripMiddleware._target`（`src/ptc_agent/agent/middleware/file_operations/multimodal_strip.py:688-715`）、准入与分块预算预留、以及 `UsagePersistence`（`src/server/services/persistence/usage.py:136-147`）调用的 `calculate_cost_from_per_call_records`（`src/utils/tracking/core.py:209-270` → `find_model_pricing` / `resolve_notional_card`），一律优先从当前回合绑定的 `effective_catalog_snapshot` 读取费率与能力（独立于对话回合的后台单次 `dalton_complete` 在入口固定当次快照）。
+3. **中断恢复的「比对后放行 / 变更即拒绝」规则**：
+   - **单一校验入口 `verify_resume_route`**（`src/dalton/services/team_model_catalog/snapshot.py`）：任何继续已中断运行的入口——主回合重启恢复（`restart.py` → `messaging.py`）、`/retry`（服务端重试与客户端重试）、网页 HITL 续跑（`hitl_response`）、自动化重跑（`automation_executor.py` → `ptc_run.py`）以及子智能体恢复（`task_actions.py` `_handle_resume`）——均按当前实时目录正常解析模型与路由，随后在**构造任何 LLM 客户端之前**调用 `verify_resume_route(run_id, resolved_route)`，将当前解析出的 6 项路由指纹（`model_key`、`provider`、`model_id`、`bound_base_url`、`key_fingerprint`、`billing`）与原运行快照逐项比对。
+   - **一致放行、变更拒绝**：6 项指纹全部一致时，恢复回合按当前实时目录继续执行（路由与计费方式均与快照一致，结算金额相同）；任一项发生变化时，立即返回 HTTP 400（错误码 `catalog_route_changed`，中文提示：「这个回合中断期间团队模型配置发生了变化，请重新发送消息」），由前端展示提示横幅并解锁输入框供用户重新发起新消息。快照仅用于比对、审计与结算，系统始终按当前实时目录构造客户端，从而让每条恢复链路保持简单且可证明。
+   - **无快照的存量运行兼容**：对于本功能上线前已存在、运行记录中尚无 `effective_catalog_snapshot` 的历史运行，恢复路径直接按既有流程继续执行；Abandoned Sweep 与 `UsagePersistence` 补结算历史账单时保留条件补写快照用于审计。
 4. **预算汇总读取已持久化账单**：
    - `compute_provider_breakdown`（`src/dalton/budget/service.py:313-395`）优先累加每笔调用已持久化的 `cost`、`notional_cost` 与 `pricing_provider` 印章。
 
@@ -346,7 +346,7 @@ sequenceDiagram
    - **双重门禁不变量**：在 `LLM.__init__` / `LLM.get_llm`（`src/llms/llm.py:780-941`）构造出口与 `CatalogVariantTransport` 每次发包入口同时核验：① 凭据来源标记精确等于 `catalog_variant:{provider_slug}`；② 最终请求 URL 满足 `endpoint_matches_prefix(url, bound_base_url)`（`egress_policy.py:124-139`）；③ 客户端已成功挂载 `CatalogVariantTransport`。缺少专属凭据、地址绑定不符或目标 SDK 无法挂载受控传输时，立即拒绝构造或终止发包。
 3. **变体改址、换凭据或删凭据时对在途及恢复调用的处置规则**：
    - 管理员修改目录变体的 `base_url`（或轮换其凭据）时，`dalton_catalog_provider_credentials[provider_slug]` 更新为新的 `(canonical_bound_url, key_fingerprint)`，旧绑定立即撤销；
-   - 同进程在途回合以及跨部署由 `restart.py` 恢复的回合与子智能体在每次发包前，将 `effective_catalog_snapshot` 中持久化的原绑定非密钥标识 `(canonical_url_key(bound_base_url), key_fingerprint)` 与数据库当前 `dalton_catalog_provider_credentials[provider_slug]` 的 `(canonical_bound_url, key_fingerprint)` 精确比对；一旦发现凭据已删除、地址路径已更改或同地址凭据已轮换，**当场以明确的终端配置错误 `CatalogVariantCredentialRevokedError` 结束该次调用**。
+   - 同进程在途回合在每次发包前，将 `effective_catalog_snapshot` 中持久化的原绑定非密钥标识 `(canonical_url_key(bound_base_url), key_fingerprint)` 与数据库当前 `dalton_catalog_provider_credentials[provider_slug]` 的 `(canonical_bound_url, key_fingerprint)` 精确比对，发现凭据删除、地址更改或密钥轮换时立即以 `CatalogVariantCredentialRevokedError` 终止发包；跨部署恢复的回合与子智能体在构造客户端前先经 `verify_resume_route` 比对路由与凭据指纹，发现变更直接返回 `catalog_route_changed` 拒绝恢复。
 
 ### 2.6 原生模型同步（`NativeModelsCard`）收口、导入顺序与损坏修复
 

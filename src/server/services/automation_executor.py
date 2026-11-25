@@ -1056,6 +1056,23 @@ class AutomationExecutor:
             )
             run_metadata["automation_reasoning_effort_configured"] = True
             run_metadata["automation_reasoning_effort"] = effective_effort
+            # DALTON-HOOK(team-model-catalog): when refiring an interrupted automation execution
+            # (FiringRunsAgain), pass its prior run_id so ptc_run verifies the live route against
+            # the interrupted run's snapshot before building any LLM client.
+            refire_source_run_id: str | None = None
+            try:
+                from src.server.database.runs import lifecycle as _auto_tl_db
+
+                _prior_attempt = await _auto_tl_db.get_latest_attempt(firing.thread_id)
+                if _prior_attempt is not None:
+                    _prior_meta = _prior_attempt.get("metadata") or {}
+                    if str(_prior_meta.get("automation_execution_id") or "") == str(execution_id):
+                        refire_source_run_id = (
+                            str(_prior_attempt.get("conversation_response_id") or "").strip()
+                            or None
+                        )
+            except Exception:
+                refire_source_run_id = None
             request = ChatRequest(
                 workspace_id=firing.workspace_id,
                 messages=[ChatMessage(role="user", content=instruction)],
@@ -1068,6 +1085,7 @@ class AutomationExecutor:
                     name=(automation.get("name") or "").strip() or None,
                 ),
                 checked_computer_id=firing.checked_computer_id,
+                resume_of_run_id=refire_source_run_id,
             )
             # Generate run_id locally: automations don't pass through the
             # HTTP handler that normally creates it. Per-turn keying for

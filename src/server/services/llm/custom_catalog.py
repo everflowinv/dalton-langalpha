@@ -54,7 +54,7 @@ def validate_custom_models(
 
     valid_providers = {
         k for k, v in mc.flat_providers.items()
-        if not v.get("platform") and not v.get("catalog_defined")  # DALTON-HOOK(team-model-catalog): disallow personal custom models on catalog variants
+        if not v.get("platform") and v.get("catalog_defined") is not True  # DALTON-HOOK(team-model-catalog): disallow personal custom models on catalog variants
     }
     if custom_providers:
         valid_providers.update(
@@ -108,7 +108,7 @@ def validate_custom_models(
             )
 
         # DALTON-HOOK(team-model-catalog): reject personal custom models targeting a catalog-defined variant
-        if mc.get_provider_info(provider).get("catalog_defined"):
+        if mc.get_provider_info(provider).get("catalog_defined") is True:
             from src.dalton.services.team_model_catalog.transport import (
                 check_custom_model_against_catalog_variants,
             )
@@ -426,7 +426,7 @@ def validate_custom_providers(
     mc = LLM.get_model_config()
     builtin = {
         p for p in mc.get_byok_eligible_providers()
-        if not mc.get_provider_info(p).get("catalog_defined")  # DALTON-HOOK(team-model-catalog): exclude catalog variants from personal custom_providers
+        if mc.get_provider_info(p).get("catalog_defined") is not True  # DALTON-HOOK(team-model-catalog): exclude catalog variants from personal custom_providers
     }
     name_re = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$")
     seen: set[str] = set()

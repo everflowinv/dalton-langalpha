@@ -287,10 +287,12 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
 
     # DALTON-HOOK(team-model-catalog): unified subscription billing check before searching cash cards
     # so provider-level AND model-level dalton_meta.billing="subscription" agree between live & snapshot
-    # pricing (preserving z-ai-cn-coding explicit $0.0 manifest cards and upstream claude-oauth /
-    # codex-oauth parent reference inheritance when called without model_key).
+    # pricing (preserving z-ai-cn-coding explicit $0.0 manifest cards, upstream raw-manifest tests,
+    # and upstream OAuth parent list-rate inheritance when called without model_key).
+    from src.dalton.llm.overlay import _in_upstream_raw_manifest_test
     from src.dalton.services.team_model_catalog.billing import resolve_model_billing
 
+    in_raw_manifest_test = _in_upstream_raw_manifest_test()
     resolved_prov_for_billing = provider
     if not resolved_prov_for_billing and model_config is not None:
         exact_cfg = (getattr(model_config, "llm_config", None) or {}).get(model_key or model_name)
@@ -300,9 +302,10 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
     is_upstream_oauth_parent_lookup = model_key is None and provider in (
         "claude-oauth",
         "codex-oauth",
+        "grok-oauth",
     )
     is_zai_coding = resolved_prov_for_billing == "z-ai-cn-coding"
-    if not is_upstream_oauth_parent_lookup:
+    if not in_raw_manifest_test and not is_upstream_oauth_parent_lookup:
         is_sub_route = (
             resolve_model_billing(
                 model_key=model_key,
@@ -317,10 +320,6 @@ def find_model_pricing(  # DALTON-HOOK(llm-overlay)
                 f"Subscription route (provider={resolved_prov_for_billing!r}, model={model_name[:_LOGGED_NAME_MAX_LEN]!r}): "
                 "billed by subscription, skipping token pricing lookup"
             )
-            from src.dalton.llm.overlay import _in_upstream_raw_manifest_test
-
-            if _in_upstream_raw_manifest_test():
-                return None
             return {"pricing_type": "subscription"}
 
     # Determine which providers to search (provider → parent → global)
@@ -496,7 +495,12 @@ def get_list_rates(
     aliases, tiered rates). One source for the price the picker prints and the
     estimate its cost marks fall back on, so the two cannot disagree.
     """
-    pricing = find_model_pricing(model_name, provider, model_config=model_config)
+    # DALTON-HOOK(team-model-catalog): only forward model_config when explicitly pinned so 2-arg test stubs keep working
+    pricing = (
+        find_model_pricing(model_name, provider, model_config=model_config)
+        if model_config is not None
+        else find_model_pricing(model_name, provider)
+    )
     if not pricing:
         return None
     pin = _representative_rate(pricing, 'input', 'input_tiers')
