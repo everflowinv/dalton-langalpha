@@ -29,7 +29,7 @@ import { RowButton, StepLoadFailed } from '../answers/parts';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
 // DALTON-HOOK(team-credentials): team-shared credentials hint & PM disconnect guard
 import { isDaltonAuth } from '@/config/daltonAuth';
-import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
+import { useTeamCredentials } from '@/hooks/useTeamCredentials'; // DALTON-HOOK(team-credentials)
 import { useAccount } from '@/hooks/useAccount';
 import { methodAllowed } from '@/lib/accountRules';
 import { OwnAccessNote } from '@/components/organization/OwnAccessNote';
@@ -299,7 +299,7 @@ export default function MethodStep() {
       {/* DALTON-HOOK(team-credentials): team-shared credentials hint */}
       {isDaltonAuth && isTeamShared && !teamManagedByAdmin && (
         <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-          {TEAM_SHARED_CREDENTIALS_HINT}
+          {t('modelAccess.teamSharedCredentialsHint')}
         </p>
       )}
       {teamManagedByAdmin && (

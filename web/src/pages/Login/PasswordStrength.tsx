@@ -8,8 +8,9 @@ import { PASSWORD_REQUIREMENTS, MIN_PASSWORD_LENGTH } from './passwordRequiremen
  * server's password policy.
  */
 // eslint-disable-next-line react-refresh/only-export-components
-export function scorePassword(pw: string): 0 | 1 | 2 | 3 {
-  if (pw.length < MIN_PASSWORD_LENGTH) return 0;
+export function scorePassword(pw: string, minLength = MIN_PASSWORD_LENGTH): 0 | 1 | 2 | 3 {
+  // DALTON-HOOK(standalone-core): allow callers with a stricter floor (e.g. 10-char local admin/invite passwords) to match the backend minimum
+  if (pw.length < minLength) return 0;
   const classes =
     Number(/[a-z]/.test(pw)) +
     Number(/[A-Z]/.test(pw)) +
@@ -33,9 +34,16 @@ const LABEL_KEYS = [
  * them; once typing starts, a strength meter joins it — ember while weak,
  * setting to ink at full strength.
  */
-function PasswordStrength({ password }: { password: string }) {
+function PasswordStrength({
+  password,
+  minLength = MIN_PASSWORD_LENGTH,
+}: {
+  password: string;
+  minLength?: number;
+}) {
   const { t } = useTranslation();
-  const score = scorePassword(password);
+  // DALTON-HOOK(standalone-core): honor caller-specified minimum password length in both strength score and checklist
+  const score = scorePassword(password, minLength);
   return (
     <>
       {password.length > 0 && (
@@ -47,18 +55,26 @@ function PasswordStrength({ password }: { password: string }) {
         </div>
       )}
       <ul className="login-page__reqs">
-        {PASSWORD_REQUIREMENTS.map((req) => (
-          <li
-            key={req.key}
-            className="login-page__req"
-            data-met={req.test(password) || undefined}
-          >
-            <span className="login-page__req-mark" aria-hidden="true">
-              ✓
-            </span>
-            {t(req.key)}
-          </li>
-        ))}
+        {PASSWORD_REQUIREMENTS.map((req) => {
+          const isLengthReq = req.key === 'auth.reqLength';
+          const met = isLengthReq ? password.length >= minLength : req.test(password);
+          const label =
+            isLengthReq && minLength !== MIN_PASSWORD_LENGTH
+              ? t('auth.reqLengthMin', { count: minLength })
+              : t(req.key);
+          return (
+            <li
+              key={req.key}
+              className="login-page__req"
+              data-met={met || undefined}
+            >
+              <span className="login-page__req-mark" aria-hidden="true">
+                ✓
+              </span>
+              {label}
+            </li>
+          );
+        })}
       </ul>
     </>
   );

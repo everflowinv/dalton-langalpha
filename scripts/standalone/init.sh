@@ -1266,15 +1266,20 @@ main() {
           -t langalpha-sandbox:latest "${REPO_ROOT}"; then
         ok "Built langalpha-sandbox:latest."
       else
-        warn "Sandbox image build failed; rerun: docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest ."
+        err "Sandbox image build failed."
+        err "If Docker Hub rate-limited the pull (429 Too Many Requests), run 'docker login' or configure registry-mirrors in /etc/docker/daemon.json (see docs/dalton/dev-guide/STANDALONE-DEPLOY.md §7)."
+        err "Rerun sandbox build with: docker build -f Dockerfile.sandbox --build-arg INSTALL_AGENT_BROWSER=0 -t langalpha-sandbox:latest ."
+        err "Or rerun init.sh with --skip-sandbox-build to complete configuration first."
+        exit 1
       fi
     fi
   fi
 
-  local compose_base_cmd="docker compose -f docker-compose.yml -f docker-compose.core.yml"
+  local compose_base_cmd="docker compose -p ${project_name} -f docker-compose.yml -f docker-compose.core.yml --env-file .env"
   if [[ "$tls_mode" != "loopback" ]]; then
-    compose_base_cmd="docker compose -f docker-compose.yml -f docker-compose.core.yml -f ${tls_overlay_file}"
+    compose_base_cmd="docker compose -p ${project_name} -f docker-compose.yml -f docker-compose.core.yml -f ${tls_overlay_file} --env-file .env"
   fi
+  local compose_build_cmd="env -u VITE_DALTON_AUTH ${compose_base_cmd} build"
   local compose_start_cmd="${compose_base_cmd} up -d"
   local vite_auth
   vite_auth="$(get_env_value_any "VITE_DALTON_AUTH")"
@@ -1289,17 +1294,19 @@ main() {
   2. Optional: set SEC_USER_AGENT="Dalton <your-email@example.com>" in .env
      for SEC EDGAR compliance identification.
 
-  3. Build edge with VITE_DALTON_AUTH from .env and start the Standalone Core stack:
-       ${compose_base_cmd} build --build-arg VITE_DALTON_AUTH="${vite_auth}" edge
+  3. Build the images (clearing any exported shell VITE_DALTON_AUTH so Compose
+     reads the value from .env) and start the Standalone Core stack:
+       ${compose_build_cmd}
        ${compose_start_cmd}
      (Whenever you switch DALTON_AUTH_MODE / VITE_DALTON_AUTH in .env, rebuild edge
+      with \`env -u VITE_DALTON_AUTH ${compose_base_cmd} build edge && ${compose_start_cmd}\`
       so the frontend bundle picks up the new authentication mode.)
 
   4. Open the web UI at ${public_url}
 EOF
   else
     info "Non-interactive initialization complete (APP_ENV=core, DOMAIN=${domain}, DALTON_TLS_MODE=${tls_mode}, VITE_DALTON_AUTH=${vite_auth:-<empty>})."
-    info "Build edge with: ${compose_base_cmd} build --build-arg VITE_DALTON_AUTH=${vite_auth} edge"
+    info "Build images with: ${compose_build_cmd}"
     info "Start the stack with: ${compose_start_cmd}"
   fi
 }

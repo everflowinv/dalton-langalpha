@@ -7,6 +7,7 @@ import logging
 import shlex
 from collections.abc import Collection
 from typing import Any, Literal
+from urllib.parse import quote
 
 from fastapi import HTTPException
 from langchain_core.runnables import RunnableConfig
@@ -25,7 +26,11 @@ from src.dalton.monitors.models import (
     UpdateMonitorRequest,
 )
 from src.dalton.monitors.permissions import is_company_tier
-from src.dalton.settings import get_dalton_settings, is_artifact_publishing_enabled
+from src.dalton.settings import (
+    get_dalton_public_app_url,
+    get_dalton_settings,
+    is_artifact_publishing_enabled,
+)
 from src.dalton.tools.knowledge_tools import _extract_run_identity
 from src.server.database import artifacts as artifacts_db
 from src.server.database.artifacts import Artifact
@@ -531,6 +536,31 @@ async def _prepare_republish_snapshot(
     return [e.path for e in snap.entries], snap.page_sha256, None
 
 
+def _monitor_path(slug: str) -> str:
+    """Return the same-origin relative monitor path with URL-unsafe characters encoded."""
+    return f"/monitors/{quote(slug, safe='-._~')}"
+
+
+def _resolve_monitor_public_url(path: str) -> str | None:
+    """Return the absolute public monitor URL for external notifications, or None if unconfigured."""
+    base = get_dalton_public_app_url()
+    if base:
+        return f"{base}{path}"
+    return None
+
+
+def _format_markdown_link(label: str, href: str) -> str:
+    """Format a Markdown link with label brackets and href parentheses safely escaped."""
+    clean_label = " ".join(label.splitlines()).strip() or href
+    escaped_label = (
+        clean_label.replace("\\", "\\\\")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+    )
+    escaped_href = href.replace("(", "%28").replace(")", "%29").replace(" ", "%20")
+    return f"[{escaped_label}]({escaped_href})"
+
+
 def _format_monitor_result(
     action: str,
     detail: dict[str, Any],
@@ -549,6 +579,9 @@ def _format_monitor_result(
         if versions and isinstance(versions[0], dict)
         else mon.get("updated_at")
     )
+    path_val = _monitor_path(slug_val)
+    public_url = _resolve_monitor_public_url(path_val)
+    link_label = title_val or slug_val or path_val
     payload: dict[str, Any] = {
         "action": action,
         "slug": slug_val,
@@ -559,7 +592,13 @@ def _format_monitor_result(
         "published_seq": seq_val,
         "keep_updated": bool(mon.get("keep_updated")),
         "latest_version_at": latest_version_at,
-        "url": f"/monitors/{slug_val}",
+        "path": path_val,
+        "url": path_val,
+        "markdown_link": _format_markdown_link(link_label, path_val),
+        "public_url": public_url,
+        "public_markdown_link": (
+            _format_markdown_link(link_label, public_url) if public_url else None
+        ),
     }
     if "cut" in detail:
         payload["cut"] = bool(detail["cut"])
@@ -587,18 +626,18 @@ def build_dalton_monitor_tool(*, allow_home_workspace: bool = False) -> BaseTool
         *,
         config: RunnableConfig,
     ) -> str:
-        """将工作区 HTML 网页发布为监控面板（/monitors/<slug>，slug 为短标识）。
+        """将工作区 HTML 网页发布为监控面板（/monitors/<slug>）。
 
-        `publish`=发布新面板或用文件夹重新打包；`republish`=用工作区当前文件出新版本（只带上次文件与静态引用；新增动态文件用 publish）；`update`=只改设置；`list`=列出可管理面板。
-        仅支持 .html/.htm 或含 index.html 的文件夹；文件夹发布会带上文件夹内所有可被页面加载的非隐藏文件。页面运行时按变量拼路径读取数据文件时，把页面和数据放进一个文件夹再发布该文件夹。可见范围默认 own（仅自己；外部成员限 own），禁 public（公开）；设 members（指定成员）/company（全公司）或改名单须用户确认传 user_confirmed_scope=true。
+        `publish`=发布新面板或用文件夹重新打包；`republish`=用工作区当前文件出新版本（只带上次文件与静态引用，新增动态文件用 publish）；`update`=只改设置；`list`=列出可管理面板。
+        支持 .html/.htm 或含 index.html 的文件夹；文件夹发布会带上文件夹内所有可被页面加载的非隐藏文件。页面运行时按变量拼路径读取数据文件时，把页面和数据放进一个文件夹再发布该文件夹。可见范围默认 own（外部成员限 own），禁 public；设 members/company 或改名单须用户确认传 user_confirmed_scope=true。
 
         Args:
-            path: publish 工作区相对路径；slug: update/republish 必填。
-            member_names_or_emails: members 填姓名/邮箱/user_id（用户 ID）。
+            path: publish 相对路径；slug: update/republish 必填。
+            member_names_or_emails: members 填姓名/邮箱/user_id。
             keep_updated: 对话后自动更新。
 
         Returns:
-            JSON：含 url（地址）/version（版本）；candidates（候选成员）须问用户，files_changed（文件变更中）等写完重试。
+            JSON：含 markdown_link（网页回复直接贴）/public_url（外部通知绝对地址）/url/version；candidates 须问用户，files_changed 等写完重试。
         """
         act = str(action or "").strip().lower()
         if act not in _VALID_ACTIONS:
@@ -632,22 +671,41 @@ def build_dalton_monitor_tool(*, allow_home_workspace: bool = False) -> BaseTool
         try:
             if act == "list":
                 visible = await monitor_service.list_monitors_for_user(user_id)
-                manageable = [
-                    {
-                        "slug": str(item.get("slug") or ""),
-                        "title": str(item.get("title") or ""),
-                        "visibility": str(item.get("visibility") or ""),
-                        "category": item.get("category"),
-                        "source_kind": item.get("source_kind"),
-                        "version": item.get("published_seq"),
-                        "latest_version_at": item.get("updated_at"),
-                        "keep_updated": bool(item.get("keep_updated")),
-                        "url": f"/monitors/{item.get('slug')}",
-                    }
-                    for item in visible
-                    if bool(item.get("can_manage"))
-                    and item.get("source_kind") != "data_job"
-                ]
+                manageable = []
+                for item in visible:
+                    if not (
+                        bool(item.get("can_manage"))
+                        and item.get("source_kind") != "data_job"
+                    ):
+                        continue
+                    item_slug = str(item.get("slug") or "")
+                    item_title = str(item.get("title") or "")
+                    item_path = _monitor_path(item_slug)
+                    item_public_url = _resolve_monitor_public_url(item_path)
+                    item_label = item_title or item_slug or item_path
+                    manageable.append(
+                        {
+                            "slug": item_slug,
+                            "title": item_title,
+                            "visibility": str(item.get("visibility") or ""),
+                            "category": item.get("category"),
+                            "source_kind": item.get("source_kind"),
+                            "version": item.get("published_seq"),
+                            "latest_version_at": item.get("updated_at"),
+                            "keep_updated": bool(item.get("keep_updated")),
+                            "path": item_path,
+                            "url": item_path,
+                            "markdown_link": _format_markdown_link(
+                                item_label, item_path
+                            ),
+                            "public_url": item_public_url,
+                            "public_markdown_link": (
+                                _format_markdown_link(item_label, item_public_url)
+                                if item_public_url
+                                else None
+                            ),
+                        }
+                    )
                 return _ok({"action": "list", "monitors": manageable, "count": len(manageable)})
 
             if act == "republish":

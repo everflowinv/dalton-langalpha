@@ -1176,6 +1176,9 @@ fi
 release_publish_lock
 
 RESTORE_HINT_ARGS=(bash scripts/standalone/restore.sh --work-dir "$WORK_DIR" --backup-dir "$FINAL_DIR")
+if [[ -n "$ENV_PASSPHRASE_FILE" ]]; then
+  RESTORE_HINT_ARGS+=(--env-passphrase-file "$ENV_PASSPHRASE_FILE")
+fi
 if [[ "$COMPOSE_FILES_EXPLICIT" -eq 1 ]]; then
   RESTORE_HINT_ARGS+=(--compose-files "$COMPOSE_FILES_RAW")
 fi

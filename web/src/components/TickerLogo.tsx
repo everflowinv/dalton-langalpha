@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react';
+import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(standalone-core)
 import { cn } from '@/lib/utils';
 import { tickerInitial, tickerLogoUrl } from '@/lib/tickerLogo';
 import './TickerLogo.css';
@@ -15,7 +16,9 @@ const RETRY_AFTER_MS = 60_000;
  * get. Decorative: the ticker's own text stays the accessible name.
  */
 export function TickerLogo({ symbol, className }: { symbol: string; className?: string }): React.ReactElement {
-  const src = tickerLogoUrl(symbol);
+  // DALTON-HOOK(standalone-core): skip /api/v1/market-data/logos requests when Ginlix Data logo relay is disabled
+  const { tickerLogosEnabled } = useCapabilities();
+  const src = tickerLogosEnabled ? tickerLogoUrl(symbol) : null;
   // Keyed by the URL, so a row that is handed another symbol starts over.
   const [failure, setFailure] = useState<{ src: string; stage: FailureStage } | null>(null);
   const stage = failure?.src === src ? failure.stage : null;

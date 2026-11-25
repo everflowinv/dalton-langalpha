@@ -239,7 +239,7 @@ export const SETTINGS = {
   approveHandoffs: { section: 'chat', anchor: 'approve-handoffs', labelKey: 'settings:autoApproveHandoffs', descKey: 'settings:autoApproveHandoffsDesc' },
   approveWorkspaces: { section: 'chat', anchor: 'approve-workspaces', labelKey: 'settings:autoApproveWorkspaceCreation', descKey: 'settings:autoApproveWorkspaceCreationDesc' },
   searchProvider: { section: 'chat', anchor: 'search-provider', labelKey: 'settings:searchProvider', descKey: 'settings:searchProviderDesc', alsoKeys: ['settings:searchDepth'] },
-  daltonCosSharing: { section: 'chat', anchor: 'dalton-cos-sharing', labelKey: 'settings:dalton.cosSharingLabel', descKey: 'settings:dalton.cosSharingDesc', keywords: '研究总监 工作区协同共享 允许同事的研究总监向我的工作区派活 chief of staff sharing colleague dispatch', visibleWhen: canShowDaltonCosSharingCard },
+  daltonCosSharing: { section: 'chat', anchor: 'dalton-cos-sharing', labelKey: 'settings:dalton.cosSharingLabel', descKey: 'settings:dalton.cosSharingDesc', keywords: '研究总监 工作区协同共享 允许同事的研究总监向我的工作区派活 chief of staff sharing colleague dispatch', capability: 'colleague_sharing', visibleWhen: canShowDaltonCosSharingCard },
   // DALTON-HOOK(team-memory-toggle): Home Team Memory user-level setting entry
   // DALTON-HOOK(standalone-core): gate Home Team Memory on conversation_archive
   daltonHomeTeamMemory: { section: 'chat', anchor: 'dalton-home-team-memory', labelKey: 'settings:dalton.homeTeamMemoryLabel', descKey: 'settings:dalton.homeTeamMemoryDesc', keywords: '团队记忆 团队历史研究记录 对话记录 team memory conversation archive', capability: 'conversation_archive', visibleWhen: canShowDaltonHomeTeamMemoryCard },
@@ -386,6 +386,36 @@ const LEGACY_SECTIONS: Record<string, Section> = {
   'team-members': 'teamMembers',
   'team-channels': 'teamChannels',
 };
+
+// DALTON-HOOK(standalone-core): resolve capability-aware section subtitle so disabled integrations never appear
+export function sectionDescKey(
+  section: Section,
+  ctx?: DaltonSettingVisibilityContext | null,
+): string {
+  if (section === 'teamMembers' && !hasRequiredCapability(ctx?.capabilities, 'feishu_docs')) {
+    return 'settings:sectionDesc.teamMembersCore';
+  }
+  if (section === 'teamModels' && !hasRequiredCapability(ctx?.capabilities, 'native_oauth_sync')) {
+    return 'settings:sectionDesc.teamModelsCore';
+  }
+  if (section === 'teamChannels') {
+    const hasWeixin = hasRequiredCapability(ctx?.capabilities, 'channel_weixin');
+    const hasFeishu = hasRequiredCapability(ctx?.capabilities, 'channel_feishu');
+    const hasDiscord = hasRequiredCapability(ctx?.capabilities, 'channel_discord');
+    const hasDataJobs = hasRequiredCapability(ctx?.capabilities, 'data_jobs');
+    if (hasWeixin && hasFeishu && hasDataJobs) {
+      return SECTIONS.teamChannels.descKey;
+    }
+    const suffix = [
+      hasWeixin ? 'Weixin' : '',
+      hasFeishu ? 'Feishu' : '',
+      hasDiscord ? 'Discord' : '',
+      hasDataJobs ? 'DataJobs' : '',
+    ].join('');
+    return suffix ? `settings:sectionDesc.teamChannels${suffix}` : 'settings:sectionDesc.teamChannelsCore';
+  }
+  return SECTIONS[section].descKey;
+}
 
 // DALTON-HOOK(standalone-core): resolve capability-aware setting label so disabled channel names never appear in search results or CommandPalette
 export function settingLabelKey(

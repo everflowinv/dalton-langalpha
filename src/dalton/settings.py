@@ -1531,6 +1531,21 @@ def get_dalton_frontend_url() -> str:
     return ""
 
 
+def get_dalton_public_app_url() -> str:
+    """Return configured public web origin (``DALTON_FRONTEND_URL`` / ``PUBLIC_APP_URL`` / ``FRONTEND_URL``).
+
+    Unlike ``get_dalton_frontend_url()``, accepts a configured public URL even
+    when it equals ``SERVER_BASE_URL`` (the single-origin Caddy edge layout used
+    by Standalone Core deployments). Only ``http://`` and ``https://`` origins
+    are returned; returns empty string if unconfigured.
+    """
+    for key in ("DALTON_FRONTEND_URL", "PUBLIC_APP_URL", "FRONTEND_URL"):
+        val = os.getenv(key, "").strip().rstrip("/")
+        if val.startswith(("http://", "https://")):
+            return val
+    return ""
+
+
 def get_dalton_bridge_embed_url(host: str | None = None) -> str:
     """Return the host bridge `/embed` URL, or ``""`` when bridge capability is off."""
     from src.dalton.capabilities import CapabilityId, has_capability

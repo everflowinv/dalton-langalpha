@@ -103,6 +103,7 @@
     "strengthFair": "Fair",
     "strengthStrong": "Strong",
     "reqLength": "8+ characters",
+    "reqLengthMin": "At least {{count}} characters",
     "reqLetter": "One letter",
     "reqNumber": "One number",
     "setNewPassword": "Set a new password",
@@ -2174,6 +2175,12 @@
       "noBrokerage": "Let's set up my profile.",
       "modifyPreferences": "I'd like to review and update my preferences."
     },
+    "daltonCore": {
+      "title": "Set up your profile",
+      "description": "Your Chief of Staff will ask about the companies you follow, your investment style, and answer preferences. No message is sent until you start.",
+      "startButton": "Start setup",
+      "skipButton": "Go straight to workspace"
+    },
     "welcome": {
       "skip": "Skip",
       "cancel": "Cancel",
@@ -3070,6 +3077,7 @@
       "maxOutputInvalid": "Enter a number of tokens, like 8K."
     },
     "teamManagedByAdmin": "Team-shared credentials are managed by the administrator. Contact an administrator to connect or change them.",
+    "teamSharedCredentialsHint": "Shared with your team: once connected here, everyone on the team can use it.",
     "antigravity": {
       "name": "Google Antigravity",
       "intro": "Connect your Google Antigravity subscription (Google One AI / Antigravity plans) for its Gemini, Claude and GPT-OSS models.",

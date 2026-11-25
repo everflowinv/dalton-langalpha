@@ -2424,24 +2424,6 @@ def check_restore_on_clean_stack(
     )
 
 
-def _build_same_version_release_tar(work_dir: Path, tar_path: Path) -> None:
-    """Create a release tarball of ``work_dir`` excluding operator runtime state."""
-    skip_top = {".env", "backups", ".upgrade-backup", ".restore-backup", "ci-artifacts", ".git"}
-
-    def _filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
-        norm = info.name.lstrip("./")
-        top = norm.split("/", 1)[0]
-        if top in skip_top:
-            return None
-        return info
-
-    with tarfile.open(tar_path, "w:gz") as tf:
-        for entry in sorted(work_dir.iterdir()):
-            if entry.name in skip_top:
-                continue
-            tf.add(entry, arcname=entry.name, filter=_filter)
-
-
 def check_upgrade_same_version(
     ctx: _lib.ComposeContext,
     sentinel: dict[str, str],
@@ -2453,6 +2435,18 @@ def check_upgrade_same_version(
     compose_files_str = ":".join(str(p) for p in tls_context.compose_files)
     project_name = os.environ["COMPOSE_PROJECT_NAME"]
     assert project_name, "COMPOSE_PROJECT_NAME must be set by run_checks.sh"
+
+    env_release_tar = os.environ.get("STANDALONE_RELEASE_TAR", "").strip()
+    assert env_release_tar, (
+        "STANDALONE_RELEASE_TAR must be set to a packaged release tarball "
+        "(refusing to synthesize a fallback archive or skip image build)"
+    )
+    release_tar = Path(env_release_tar)
+    assert release_tar.is_file(), (
+        f"STANDALONE_RELEASE_TAR does not exist: {release_tar}"
+    )
+    log(f"  Using packaged release tarball from STANDALONE_RELEASE_TAR: {release_tar}")
+
     pre_backend_cid = _container_id(tls_context, "backend")
     pre_edge_cid = _container_id(tls_context, "edge")
 
@@ -2462,29 +2456,30 @@ def check_upgrade_same_version(
     try:
         with tempfile.TemporaryDirectory(prefix="b6-upgrade-") as tmpdir:
             tmp_path = Path(tmpdir)
-            release_tar = tmp_path / "dalton-core-same-version.tar.gz"
             upgrade_backups = tmp_path / "upgrade-backups"
-            _build_same_version_release_tar(ctx.work_dir, release_tar)
+
+            upgrade_cmd = [
+                "bash",
+                str(ctx.work_dir / "scripts" / "standalone" / "upgrade.sh"),
+                "--release-tar",
+                str(release_tar),
+                "--work-dir",
+                str(ctx.work_dir),
+                "--backup-dir",
+                str(upgrade_backups),
+                "--compose-files",
+                compose_files_str,
+                "--project-name",
+                project_name,
+                "--build-arg",
+                "INSTALL_BROWSER_CRAWLER=false",
+            ]
 
             _run_cmd(
-                [
-                    "bash",
-                    str(ctx.work_dir / "scripts" / "standalone" / "upgrade.sh"),
-                    "--release-tar",
-                    str(release_tar),
-                    "--work-dir",
-                    str(ctx.work_dir),
-                    "--backup-dir",
-                    str(upgrade_backups),
-                    "--compose-files",
-                    compose_files_str,
-                    "--project-name",
-                    project_name,
-                    "--skip-build",
-                ],
+                upgrade_cmd,
                 cwd=ctx.work_dir,
                 redact_env=ctx.env,
-                timeout=360,
+                timeout=600,
             )
 
             # Confirm pre-upgrade backup was created with the explicit project name

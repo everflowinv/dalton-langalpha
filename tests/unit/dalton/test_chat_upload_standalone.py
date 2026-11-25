@@ -5977,6 +5977,9 @@ class TestSandboxNetworkAndInitScript:
         assert "按 IPv4 发布" in doc_r17
         sec_41 = doc_r17.split("### 4.1", 1)[1].split("### 4.2", 1)[0]
         assert "init.sh --domain" in sec_41
-        assert "-f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d --build" in sec_41
-        assert "-f deploy/standalone/docker-compose.tls.yml --env-file .env up -d --build" in sec_41
-        assert "-f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env up -d --build" in sec_41
+        assert "-f docker-compose.yml -f docker-compose.core.yml --env-file .env build" in sec_41
+        assert "-f docker-compose.yml -f docker-compose.core.yml --env-file .env up -d" in sec_41
+        assert "-f deploy/standalone/docker-compose.tls.yml --env-file .env build" in sec_41
+        assert "-f deploy/standalone/docker-compose.tls.yml --env-file .env up -d" in sec_41
+        assert "-f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env build" in sec_41
+        assert "-f deploy/standalone/docker-compose.tls.ipv6.yml --env-file .env up -d" in sec_41

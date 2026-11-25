@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { api } from '@/api/client';
 import { isDaltonAuth } from '@/config/daltonAuth';
-import type { CapabilityId } from '@/hooks/useCapabilities';
+import { hasRequiredCapability, type CapabilityId } from '@/hooks/useCapabilities';
 import { queryKeys } from '@/lib/queryKeys';
 import { SettingRow } from '@/pages/Settings/components/SettingsLayout';
 import { ToggleSwitch } from '@/components/ui/switch';
@@ -70,6 +70,7 @@ export function canShowDaltonCosSharingCard(
   ctx?: DaltonSettingVisibilityContext | null,
 ): boolean {
   if (!isDaltonAuth || !ctx) return false;
+  if (!hasRequiredCapability(ctx.capabilities, 'colleague_sharing')) return false;
   if (ctx.callerTier === 'external') return false;
   if (ctx.cosSharingLoaded && ctx.colleagueDispatchEnabled === false) return false;
   return ctx.callerTier === 'admin' || ctx.callerTier === 'internal';
