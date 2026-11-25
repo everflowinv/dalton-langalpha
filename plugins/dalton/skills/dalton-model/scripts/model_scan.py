@@ -1149,6 +1149,7 @@ def scan_workbook(
                     recalc_ran = True
                     recalc_complete = True
                     error_source_label = "重算"
+                    upstream_truncated = bool(recalc_meta.get("upstream_truncated"))
                     filtered_recalc = [
                         err for err in recalc_errs
                         if not target_sheets or err.get("sheet") in target_sheets
@@ -1156,17 +1157,32 @@ def scan_workbook(
                     raw_error_rows = filtered_recalc
                     if target_sheets is None:
                         upstream_error_summary = recalc_meta.get("error_summary") or None
-                        upstream_truncated = bool(recalc_meta.get("upstream_truncated"))
                         reported_total_errors = max(
                             len(filtered_recalc),
                             int(recalc_meta.get("total_errors", 0) or 0),
                         )
                     else:
                         reported_total_errors = len(filtered_recalc)
+                        recalc_note = (
+                            f"recalc_ok (engine={recalc_meta.get('engine')}, status={recalc_meta.get('status')}, "
+                            f"sheet={sheet}, matched_in_listed={len(filtered_recalc)}"
+                            + (
+                                f", upstream_truncated=true, listed={len(recalc_errs)}"
+                                if upstream_truncated
+                                else ""
+                            )
+                            + ")"
+                            + (
+                                "：上游重算明细已截断，已取得明细中属于该表的数量可能不全"
+                                if upstream_truncated
+                                else ""
+                            )
+                        )
                 elif recalc_state == "incomplete":
                     recalc_ran = True
                     recalc_complete = False
                     error_source_label = "部分重算+缓存"
+                    upstream_truncated = bool(recalc_meta.get("upstream_truncated"))
                     filtered_recalc = [
                         err for err in recalc_errs
                         if not target_sheets or err.get("sheet") in target_sheets
@@ -1184,13 +1200,28 @@ def scan_workbook(
                     raw_error_rows = merged
                     if target_sheets is None:
                         upstream_error_summary = recalc_meta.get("error_summary") or None
-                        upstream_truncated = bool(recalc_meta.get("upstream_truncated"))
                         reported_total_errors = max(
                             len(merged),
                             int(recalc_meta.get("total_errors", 0) or 0),
                         )
                     else:
                         reported_total_errors = len(merged)
+                        recalc_note = (
+                            f"recalc_partial (engine={recalc_meta.get('engine')}, status=incomplete, "
+                            f"unmatched={recalc_meta.get('unmatched', 0)}, sheet={sheet}, "
+                            f"matched_in_listed={len(filtered_recalc)}"
+                            + (
+                                f", upstream_truncated=true, listed={len(recalc_errs)}"
+                                if upstream_truncated
+                                else ""
+                            )
+                            + ")：部分公式未能重算，已合并保留该表原文件现有缓存错误提示"
+                            + (
+                                "；上游重算明细已截断，已取得明细中属于该表的数量可能不全"
+                                if upstream_truncated
+                                else ""
+                            )
+                        )
 
     err_items, err_truncated, error_code_counts = _summarize_recalc_errors(
         raw_error_rows,
@@ -1209,12 +1240,21 @@ def scan_workbook(
         "recalc_errors": reported_total_errors,
     }
 
+    if target_sheets is not None and recalc_ran:
+        err_summary_clause = (
+            f"{error_source_label}错误值（已取得明细中属于该表的数量）{totals['recalc_errors']} 处"
+            + ("（上游重算明细已截断，该表结果可能不全）" if upstream_truncated else "")
+            + "。"
+        )
+    else:
+        err_summary_clause = f"{error_source_label}错误值 {totals['recalc_errors']} 处。"
+
     summary_parts = [
         f"扫描完成（共 {sheets_scanned} 张工作表）：",
         f"预测期数字常数 {totals['forecast_constants']} 处（无底色 {sum(v['unstyled'] for v in fc_summary_by_sheet.values())} 处）",
         f"可能期间不一致 {totals['possible_period_mismatch']} 处",
         f"外链/插件/#REF!/循环引用 {totals['external_or_broken_or_circular']} 处",
-        f"{error_source_label}错误值 {totals['recalc_errors']} 处。",
+        err_summary_clause,
     ]
     if recalc_status == "incomplete":
         summary_parts.append("注意：本次为部分重算（incomplete），已同时保留原文件现有缓存错误。")
@@ -1236,6 +1276,7 @@ def scan_workbook(
         "recalc_complete": recalc_complete,
         "recalc_status": recalc_status,
         "recalc_note": recalc_note,
+        "recalc_upstream_truncated": upstream_truncated,
         "plugin_formula_counts": dict(sorted(plugin_counts.items())),
         "external_breakdown": external_breakdown,
         "error_code_counts": error_code_counts,

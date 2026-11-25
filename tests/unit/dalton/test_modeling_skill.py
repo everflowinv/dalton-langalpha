@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -465,6 +466,244 @@ def test_model_style_parts_diff_detects_dropped_media_and_x14_after_openpyxl_rou
     assert "EMF" in rep["summary"] and "x14" in rep["summary"] and "Model" in rep["summary"]
 
 
+def test_model_style_parts_diff_refuses_to_overwrite_input_workbook(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    orig = tmp_path / "orig.xlsx"
+    new = tmp_path / "new.xlsx"
+    wb = openpyxl.Workbook()
+    wb.save(orig)
+    wb.save(new)
+    orig_hash = ms.file_sha256(orig)
+    new_hash = ms.file_sha256(new)
+
+    # 1. Resolved path matching orig_workbook (via redundant dot segment)
+    rc_orig = ms.main(["parts-diff", str(orig), str(new), "--out", str(orig.parent / "." / orig.name)])
+    out_orig = json.loads(capsys.readouterr().out)
+    assert rc_orig != 0
+    assert out_orig["status"] == "error"
+    assert "拒绝写入" in out_orig["message"]
+    assert ms.file_sha256(orig) == orig_hash
+
+    # 2. Symlink resolving to new_workbook
+    sym_new = tmp_path / "sym_new.xlsx"
+    sym_new.symlink_to(new)
+    rc_sym = ms.main(["parts-diff", str(orig), str(new), "--out", str(sym_new)])
+    out_sym = json.loads(capsys.readouterr().out)
+    assert rc_sym != 0
+    assert out_sym["status"] == "error"
+    assert ms.file_sha256(new) == new_hash
+
+    # 3. Hardlink to new_workbook (different resolved path, caught by os.path.samefile)
+    hard_new = tmp_path / "hard_new.xlsx"
+    os.link(new, hard_new)
+    rc_hard = ms.main(["parts-diff", str(orig), str(new), "--out", str(hard_new)])
+    out_hard = json.loads(capsys.readouterr().out)
+    assert rc_hard != 0
+    assert out_hard["status"] == "error"
+    assert ms.file_sha256(new) == new_hash
+
+    # 4. Distinct --out target succeeds and writes JSON
+    report_out = tmp_path / "parts_diff.json"
+    rc_ok = ms.main(["parts-diff", str(orig), str(new), "--out", str(report_out)])
+    out_ok = json.loads(capsys.readouterr().out)
+    assert rc_ok == 0
+    assert out_ok["status"] == "ok"
+    assert report_out.is_file()
+    assert json.loads(report_out.read_text(encoding="utf-8"))["status"] == "ok"
+
+
+def _write_minimal_xlsx_zip(
+    out_path: Path,
+    *,
+    sheet_specs: list[dict[str, Any]],
+    extra_parts: dict[str, bytes] | None = None,
+) -> None:
+    """Write a minimal valid OOXML zip package for parts-diff unit tests."""
+    wb_sheets_xml = "".join(
+        f'<sheet name="{sp["name"]}" sheetId="{idx}" r:id="rId{idx}"/>'
+        for idx, sp in enumerate(sheet_specs, start=1)
+    )
+    wb_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        f"<sheets>{wb_sheets_xml}</sheets></workbook>"
+    ).encode("utf-8")
+
+    wb_rels_items = "".join(
+        f'<Relationship Id="rId{idx}" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        f'Target="worksheets/sheet{idx}.xml"/>'
+        for idx in range(1, len(sheet_specs) + 1)
+    )
+    wb_rels_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        f"{wb_rels_items}</Relationships>"
+    ).encode("utf-8")
+
+    parts: dict[str, bytes] = {
+        "xl/workbook.xml": wb_xml,
+        "xl/_rels/workbook.xml.rels": wb_rels_xml,
+    }
+
+    for idx, sp in enumerate(sheet_specs, start=1):
+        dv_xml = ""
+        if sp.get("dv_count", 0):
+            dvs = "".join('<dataValidation type="list" sqref="A1"/>' for _ in range(sp["dv_count"]))
+            dv_xml = f"<dataValidations>{dvs}</dataValidations>"
+        x14_xml = ""
+        if sp.get("x14_count", 0):
+            cfs = "".join(
+                '<x14:conditionalFormatting><x14:cfRule type="dataBar"/></x14:conditionalFormatting>'
+                for _ in range(sp["x14_count"])
+            )
+            x14_xml = (
+                '<extLst><ext uri="{78C0D931-6437-407d-A8EE-F0AAD7539E65}" '
+                'xmlns:x14="http://schemas.microsoft.com/office/spreadsheetml/2009/9/main">'
+                f"<x14:conditionalFormattings>{cfs}</x14:conditionalFormattings>"
+                "</ext></extLst>"
+            )
+        parts[f"xl/worksheets/sheet{idx}.xml"] = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            f"<sheetData/>{dv_xml}{x14_xml}</worksheet>"
+        ).encode("utf-8")
+
+        sh_rels = sp.get("rels") or []
+        if sh_rels:
+            rel_xml = "".join(
+                f'<Relationship Id="rId{r_i}" Type="{r_type}" Target="{r_tgt}"/>'
+                for r_i, (r_type, r_tgt) in enumerate(sh_rels, start=1)
+            )
+            parts[f"xl/worksheets/_rels/sheet{idx}.xml.rels"] = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                f"{rel_xml}</Relationships>"
+            ).encode("utf-8")
+
+    if extra_parts:
+        parts.update(extra_parts)
+
+    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, data in parts.items():
+            zf.writestr(name, data)
+
+
+def test_model_style_parts_diff_separates_additions_and_removals_by_part_path(
+    tmp_path: Path,
+) -> None:
+    drawing_rel_type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing"
+    vml_rel_type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/vmlDrawing"
+    image_rel_type = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+
+    orig = tmp_path / "min_orig.xlsx"
+    new = tmp_path / "min_new.xlsx"
+
+    _write_minimal_xlsx_zip(
+        orig,
+        sheet_specs=[
+            {
+                "name": "SheetA",
+                "dv_count": 1,
+                "x14_count": 1,
+                "rels": [
+                    (drawing_rel_type, "../drawings/drawing1.xml"),
+                    (vml_rel_type, "../drawings/vmlDrawing1.vml"),
+                ],
+            },
+            {"name": "SheetB", "dv_count": 0, "x14_count": 0, "rels": []},
+        ],
+        extra_parts={
+            "xl/drawings/drawing1.xml": b'<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>',
+            "xl/drawings/_rels/drawing1.xml.rels": (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                f'<Relationship Id="rId1" Type="{image_rel_type}" Target="../media/image1.png"/>'
+                "</Relationships>"
+            ).encode("utf-8"),
+            "xl/drawings/vmlDrawing1.vml": b"<xml/>",
+            "xl/media/image1.png": b"PNG-ORIG",
+        },
+    )
+
+    _write_minimal_xlsx_zip(
+        new,
+        sheet_specs=[
+            {"name": "SheetA", "dv_count": 0, "x14_count": 0, "rels": []},
+            {
+                "name": "SheetB",
+                "dv_count": 1,
+                "x14_count": 1,
+                "rels": [
+                    (drawing_rel_type, "../drawings/drawing2.xml"),
+                    (vml_rel_type, "../drawings/vmlDrawing2.vml"),
+                ],
+            },
+        ],
+        extra_parts={
+            "xl/drawings/drawing2.xml": b'<xdr:wsDr xmlns:xdr="http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"/>',
+            "xl/drawings/_rels/drawing2.xml.rels": (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                f'<Relationship Id="rId1" Type="{image_rel_type}" Target="../media/image2.png"/>'
+                "</Relationships>"
+            ).encode("utf-8"),
+            "xl/drawings/vmlDrawing2.vml": b"<xml/>",
+            "xl/media/image2.png": b"PNG-NEW",
+        },
+    )
+
+    rep = ms.diff_workbook_parts(orig, new)
+    assert rep["status"] == "ok"
+    assert rep["has_losses"] is True
+    assert rep["has_additions"] is True
+
+    # Equal total counts must NOT cancel out to 0; removals and additions are listed separately
+    assert rep["package_losses"]["media"] == 1
+    assert rep["package_additions"]["media"] == 1
+    assert rep["package_losses"]["drawings"] == 2
+    assert rep["package_additions"]["drawings"] == 2
+    assert rep["package_losses"]["data_validations_total"] == 1
+    assert rep["package_additions"]["data_validations_total"] == 1
+    assert rep["package_losses"]["x14_cf_total"] == 1
+    assert rep["package_additions"]["x14_cf_total"] == 1
+    assert rep["media_ext_losses"] == {"png": 1}
+    assert rep["media_ext_additions"] == {"png": 1}
+
+    # Drawing and media parts are listed by exact original zip paths
+    assert rep["package_parts_removed"]["drawings"] == [
+        "xl/drawings/drawing1.xml",
+        "xl/drawings/vmlDrawing1.vml",
+    ]
+    assert rep["package_parts_added"]["drawings"] == [
+        "xl/drawings/drawing2.xml",
+        "xl/drawings/vmlDrawing2.vml",
+    ]
+    assert rep["package_parts_removed"]["media"] == ["xl/media/image1.png"]
+    assert rep["package_parts_added"]["media"] == ["xl/media/image2.png"]
+
+    loss_by_sheet = {s["sheet"]: s for s in rep["sheet_losses"]}
+    add_by_sheet = {s["sheet"]: s for s in rep["sheet_additions"]}
+    assert loss_by_sheet["SheetA"]["drawings_removed"] == [
+        "xl/drawings/drawing1.xml",
+        "xl/drawings/vmlDrawing1.vml",
+    ]
+    assert loss_by_sheet["SheetA"]["media_removed"] == ["xl/media/image1.png"]
+    assert add_by_sheet["SheetB"]["drawings_added_parts"] == [
+        "xl/drawings/drawing2.xml",
+        "xl/drawings/vmlDrawing2.vml",
+    ]
+    assert add_by_sheet["SheetB"]["media_added_parts"] == ["xl/media/image2.png"]
+
+    assert "xl/drawings/drawing1.xml" in rep["summary"]
+    assert "xl/drawings/drawing2.xml" in rep["summary"]
+    assert "xl/media/image1.png" in rep["summary"]
+    assert "xl/media/image2.png" in rep["summary"]
+
+
 def test_model_lineage_ordinary_bookkeeping_record(tmp_path: Path) -> None:
     base = tmp_path / "base.xlsx"
     out = tmp_path / "v01.xlsx"
@@ -789,6 +1028,110 @@ def test_model_scan_recalc_incomplete_and_upstream_truncation(
     assert rep_tr["truncated"]["recalc_errors"] is True
     assert rep_tr["error_code_counts"] == {"#DIV/0!": 100, "#REF!": 1}
     assert any(it.get("error") == "#REF!" for it in rep_tr["items"]["recalc_errors"])
+
+
+def test_model_scan_sheet_recalc_preserves_upstream_truncation_without_workbook_total(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(REPO_ROOT)
+    p = tmp_path / "sheet_trunc.xlsx"
+    wb = openpyxl.Workbook()
+    ws_other = wb.active
+    ws_other.title = "OtherSheet"
+    ws_other["A1"] = "=1/0"
+    ws_target = wb.create_sheet("TargetSheet")
+    ws_target["A1"] = '=1+"x"'
+    wb.save(p)
+    _inject_cached_errors_and_ext_parts(
+        p,
+        sheet_xml_path="xl/worksheets/sheet2.xml",
+        cell_errors={"A1": "#VALUE!"},
+    )
+
+    other_100 = [
+        {"sheet": "OtherSheet", "cell": f"B{i}", "error": "#DIV/0!", "formula": "=1/0"}
+        for i in range(1, 101)
+    ]
+
+    # Case A: complete recalc truncated at first 100 errors (all on OtherSheet)
+    def _fake_complete_other_truncated(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout=json.dumps({
+                "status": "errors_found",
+                "engine": "ironcalc",
+                "unmatched": 0,
+                "total_errors": 150,
+                "error_summary": {"#DIV/0!": 120, "#REF!": 30},
+                "errors": other_100,
+                "truncated": True,
+            }),
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        mscan.subprocess,
+        "run",
+        create_autospec(_REAL_SUBPROCESS_RUN, side_effect=_fake_complete_other_truncated),
+    )
+    rep_sheet = mscan.scan_workbook(p, sheet="TargetSheet", recalc=True)
+    assert rep_sheet["status"] == "ok"
+    assert rep_sheet["recalc_ran"] is True
+    assert rep_sheet["recalc_complete"] is True
+    assert rep_sheet["counts"]["recalc_errors"] == 0
+    assert rep_sheet["error_code_counts"] == {}
+    assert rep_sheet["items"]["recalc_errors"] == []
+    assert rep_sheet["truncated"]["recalc_errors"] is True
+    assert rep_sheet["recalc_upstream_truncated"] is True
+    assert "已取得明细中属于该表的数量" in rep_sheet["summary"]
+    assert "可能不全" in rep_sheet["summary"]
+    assert "可能不全" in rep_sheet["recalc_note"]
+    assert "150" not in rep_sheet["summary"]
+    assert "150" not in rep_sheet["recalc_note"]
+
+    # Whole-workbook scan still uses whole-workbook total_errors & error_summary
+    rep_all = mscan.scan_workbook(p, recalc=True)
+    assert rep_all["counts"]["recalc_errors"] == 150
+    assert rep_all["error_code_counts"] == {"#DIV/0!": 120, "#REF!": 30}
+    assert rep_all["truncated"]["recalc_errors"] is True
+
+    # Case B: incomplete recalc truncated on OtherSheet merges TargetSheet cached errors only
+    def _fake_incomplete_other_truncated(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout=json.dumps({
+                "status": "incomplete",
+                "engine": "ironcalc",
+                "unmatched": 4,
+                "total_errors": 150,
+                "error_summary": {"#DIV/0!": 150},
+                "errors": other_100,
+                "truncated": True,
+            }),
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        mscan.subprocess,
+        "run",
+        create_autospec(_REAL_SUBPROCESS_RUN, side_effect=_fake_incomplete_other_truncated),
+    )
+    rep_inc = mscan.scan_workbook(p, sheet="TargetSheet", recalc=True)
+    assert rep_inc["status"] == "ok"
+    assert rep_inc["recalc_complete"] is False
+    assert rep_inc["recalc_status"] == "incomplete"
+    assert rep_inc["counts"]["recalc_errors"] == 1
+    assert rep_inc["error_code_counts"] == {"#VALUE!": 1}
+    assert rep_inc["truncated"]["recalc_errors"] is True
+    assert rep_inc["recalc_upstream_truncated"] is True
+    assert "已取得明细中属于该表的数量" in rep_inc["summary"]
+    assert "可能不全" in rep_inc["summary"]
+    assert "可能不全" in rep_inc["recalc_note"]
+    assert "150" not in rep_inc["summary"]
+    assert "150" not in rep_inc["recalc_note"]
 
 
 def test_model_scan_subtype_quotas_dynamic_array_strings_and_short_text_headerless(

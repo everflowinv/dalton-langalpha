@@ -29,6 +29,7 @@ import copy
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import posixpath
 import re
@@ -619,7 +620,10 @@ def apply_cell_style(
     - ``"source_note"``: rightmost source/notes column (red font).
     - ``"target_price"``: valuation target price output (dark red bold).
     - ``"sec_report"`` / ``"sec_segment"`` / ``"sec_submodel"``: section bar headers
-      (uses matched known-default ``section_styles`` from profile, or default constants).
+      (``section_styles`` in a profile only maps known default colors and does not
+      infer custom section roles; when maintaining an existing sheet, locate matching
+      header rows via ``profile``'s ``blocks`` and copy reference cell styles or use
+      ``clone_period_column_style``).
     - ``"formula"`` (or any other value such as ``"financial_output"``): same-sheet formula
       (black), cross-sheet link (``is_link=True``, green), derived ratio (``is_ratio=True``,
       italic), subtotal/total (``is_total=True``, bold).
@@ -689,6 +693,8 @@ def apply_cell_style(
         cell.fill = PatternFill(fill_type=None)
         cell.border = Border()
     elif role in ("sec_report", "sec_segment", "sec_submodel"):
+        # section_styles only maps known default colors; for existing sheets with custom
+        # section fills, locate reference rows via profile's blocks and copy cell styles.
         sh_sec = (sh_ov.get("section_styles") or {}).get(role)
         wb_sec = (wb_def.get("section_styles") or {}).get(role)
         default_sec = _default_section_styles()[role]
@@ -808,19 +814,41 @@ def _inspect_workbook_parts(xlsx_path: Path) -> dict[str, Any]:
         names = sorted(zf.namelist())
         name_set = set(names)
 
-        media = [n for n in names if n.startswith("xl/media/") and not n.endswith("/")]
+        media = [
+            n for n in names
+            if n.startswith("xl/media/") and not n.endswith("/") and "/_rels/" not in n
+        ]
         media_by_ext: dict[str, int] = defaultdict(int)
         for m in media:
             ext = Path(m).suffix.lower().lstrip(".") or "unknown"
             media_by_ext[ext] += 1
 
-        drawings = [n for n in names if n.startswith("xl/drawings/") and n.endswith(".xml")]
-        charts = [n for n in names if n.startswith("xl/charts/") and n.endswith(".xml")]
-        ext_links = [n for n in names if n.startswith("xl/externalLinks/") and n.endswith(".xml")]
-        pivots = [n for n in names if n.startswith("xl/pivotTables/") and n.endswith(".xml")]
-        slicers = [n for n in names if n.startswith("xl/slicers/") and n.endswith(".xml")]
-        threaded_comments = [n for n in names if n.startswith("xl/threadedComments/") and n.endswith(".xml")]
+        drawings = [
+            n for n in names
+            if n.startswith("xl/drawings/") and not n.endswith("/") and "/_rels/" not in n
+        ]
+        charts = [
+            n for n in names
+            if n.startswith("xl/charts/") and n.endswith(".xml") and "/_rels/" not in n
+        ]
+        ext_links = [
+            n for n in names
+            if n.startswith("xl/externalLinks/") and n.endswith(".xml") and "/_rels/" not in n
+        ]
+        pivots = [
+            n for n in names
+            if n.startswith("xl/pivotTables/") and n.endswith(".xml") and "/_rels/" not in n
+        ]
+        slicers = [
+            n for n in names
+            if n.startswith("xl/slicers/") and n.endswith(".xml") and "/_rels/" not in n
+        ]
+        threaded_comments = [
+            n for n in names
+            if n.startswith("xl/threadedComments/") and n.endswith(".xml") and "/_rels/" not in n
+        ]
         has_vba = "xl/vbaProject.bin" in name_set
+        vba_parts = ["xl/vbaProject.bin"] if has_vba else []
 
         # Map worksheet XML parts to worksheet titles via workbook.xml + rels
         wb_rels = _read_rels(zf, "xl/workbook.xml", name_set)
@@ -850,16 +878,20 @@ def _inspect_workbook_parts(xlsx_path: Path) -> dict[str, Any]:
                     sh_media: set[str] = set()
                     sh_pivots: set[str] = set()
                     for _, tgt in sh_rels.values():
-                        if tgt.startswith("xl/drawings/") and tgt.endswith(".xml"):
+                        if tgt.startswith("xl/drawings/") and "/_rels/" not in tgt:
                             sh_drawings.add(tgt)
                             for _, dtgt in _read_rels(zf, tgt, name_set).values():
-                                if dtgt.startswith("xl/media/"):
+                                if dtgt.startswith("xl/media/") and "/_rels/" not in dtgt:
                                     sh_media.add(dtgt)
-                                elif dtgt.startswith("xl/charts/") and dtgt.endswith(".xml"):
+                                elif (
+                                    dtgt.startswith("xl/charts/")
+                                    and dtgt.endswith(".xml")
+                                    and "/_rels/" not in dtgt
+                                ):
                                     sh_charts.add(dtgt)
-                        elif tgt.startswith("xl/charts/") and tgt.endswith(".xml"):
+                        elif tgt.startswith("xl/charts/") and tgt.endswith(".xml") and "/_rels/" not in tgt:
                             sh_charts.add(tgt)
-                        elif tgt.startswith("xl/pivotTables/") and tgt.endswith(".xml"):
+                        elif tgt.startswith("xl/pivotTables/") and tgt.endswith(".xml") and "/_rels/" not in tgt:
                             sh_pivots.add(tgt)
 
                     sh_media_by_ext: dict[str, int] = defaultdict(int)
@@ -897,8 +929,11 @@ def _inspect_workbook_parts(xlsx_path: Path) -> dict[str, Any]:
                         "media": sorted(sh_media),
                         "media_count": len(sh_media),
                         "media_by_ext": dict(sorted(sh_media_by_ext.items())),
+                        "drawings": sorted(sh_drawings),
                         "drawings_count": len(sh_drawings),
+                        "charts": sorted(sh_charts),
                         "charts_count": len(sh_charts),
+                        "pivots": sorted(sh_pivots),
                         "pivots_count": len(sh_pivots),
                         "has_extlst": has_extlst,
                         "ext_uris": sorted(ext_uris),
@@ -908,6 +943,16 @@ def _inspect_workbook_parts(xlsx_path: Path) -> dict[str, Any]:
                     }
 
     return {
+        "package_parts": {
+            "media": media,
+            "drawings": drawings,
+            "charts": charts,
+            "external_links": ext_links,
+            "pivot_tables": pivots,
+            "slicers": slicers,
+            "threaded_comments": threaded_comments,
+            "vba_project": vba_parts,
+        },
         "package_counts": {
             "media": len(media),
             "media_by_ext": dict(sorted(media_by_ext.items())),
@@ -929,12 +974,21 @@ def _inspect_workbook_parts(xlsx_path: Path) -> dict[str, Any]:
     }
 
 
+def _count_media_by_ext(media_paths: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for m in media_paths:
+        ext = Path(m).suffix.lower().lstrip(".") or "unknown"
+        counts[ext] += 1
+    return dict(sorted(counts.items()))
+
+
 def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str, Any]:
     """Compare OOXML package parts and per-sheet XML extensions between two workbooks.
 
-    Read-only advisory tool: reports lost media/drawings/charts/externalLinks/
-    ``<extLst>``/x14 conditional formatting/data validations/sparklines and
-    affected sheet names without failing or blocking delivery.
+    Read-only advisory tool: reports removed and added media/drawings/charts/
+    externalLinks/``<extLst>``/x14 conditional formatting/data validations/sparklines
+    separately without cancelling additions against removals, and lists drawing/media
+    parts by their original zip paths (``xl/drawings/...``, ``xl/media/...``).
     """
     p_orig = Path(orig_path)
     p_new = Path(new_path)
@@ -954,9 +1008,14 @@ def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str
 
     oc = inv_orig["package_counts"]
     nc = inv_new["package_counts"]
+    op = inv_orig["package_parts"]
+    np_parts = inv_new["package_parts"]
 
-    # Package-level loss counts
+    # Package-level path-based removals and additions (never cancel additions against removals)
     pkg_losses: dict[str, int] = {}
+    pkg_additions: dict[str, int] = {}
+    pkg_parts_removed: dict[str, list[str]] = {}
+    pkg_parts_added: dict[str, list[str]] = {}
     for key in (
         "media",
         "drawings",
@@ -966,81 +1025,231 @@ def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str
         "slicers",
         "threaded_comments",
         "vba_project",
-        "sheets_with_extlst",
-        "sheets_with_x14_cf",
-        "x14_cf_total",
-        "data_validations_total",
-        "sparklines_total",
     ):
-        diff = int(oc.get(key, 0)) - int(nc.get(key, 0))
-        if diff > 0:
-            pkg_losses[key] = diff
+        orig_set = set(op.get(key) or ())
+        new_set = set(np_parts.get(key) or ())
+        removed = sorted(orig_set - new_set)
+        added = sorted(new_set - orig_set)
+        if removed:
+            pkg_losses[key] = len(removed)
+            pkg_parts_removed[key] = removed
+        if added:
+            pkg_additions[key] = len(added)
+            pkg_parts_added[key] = added
 
-    media_ext_losses: dict[str, int] = {}
-    for ext, cnt in (oc.get("media_by_ext") or {}).items():
-        new_cnt = (nc.get("media_by_ext") or {}).get(ext, 0)
-        if cnt > new_cnt:
-            media_ext_losses[ext] = cnt - new_cnt
+    media_ext_losses = _count_media_by_ext(pkg_parts_removed.get("media", []))
+    media_ext_additions = _count_media_by_ext(pkg_parts_added.get("media", []))
 
     orig_sheets = inv_orig["sheets"]
     new_sheets = inv_new["sheets"]
     sheets_removed = [s for s in inv_orig["sheet_order"] if s not in new_sheets]
     sheets_added = [s for s in inv_new["sheet_order"] if s not in orig_sheets]
 
+    # Sheet-XML-derived counts aggregated per sheet (additions on one sheet never cancel removals on another)
+    all_sheet_titles: list[str] = list(inv_orig["sheet_order"])
+    for title in inv_new["sheet_order"]:
+        if title not in orig_sheets:
+            all_sheet_titles.append(title)
+
+    sheets_with_extlst_lost = 0
+    sheets_with_extlst_added = 0
+    sheets_with_x14_cf_lost = 0
+    sheets_with_x14_cf_added = 0
+    x14_cf_lost_total = 0
+    x14_cf_added_total = 0
+    dv_lost_total = 0
+    dv_added_total = 0
+    sparklines_lost_total = 0
+    sparklines_added_total = 0
+
+    for title in all_sheet_titles:
+        os_i = orig_sheets.get(title)
+        ns_i = new_sheets.get(title)
+
+        o_extlst = bool(os_i["has_extlst"]) if os_i else False
+        n_extlst = bool(ns_i["has_extlst"]) if ns_i else False
+        if o_extlst and not n_extlst:
+            sheets_with_extlst_lost += 1
+        elif n_extlst and not o_extlst:
+            sheets_with_extlst_added += 1
+
+        o_x14 = int(os_i["x14_cf_count"]) if os_i else 0
+        n_x14 = int(ns_i["x14_cf_count"]) if ns_i else 0
+        if o_x14 > 0 and n_x14 == 0:
+            sheets_with_x14_cf_lost += 1
+        elif n_x14 > 0 and o_x14 == 0:
+            sheets_with_x14_cf_added += 1
+        if o_x14 > n_x14:
+            x14_cf_lost_total += o_x14 - n_x14
+        elif n_x14 > o_x14:
+            x14_cf_added_total += n_x14 - o_x14
+
+        o_dv = int(os_i["data_validations_count"]) if os_i else 0
+        n_dv = int(ns_i["data_validations_count"]) if ns_i else 0
+        if o_dv > n_dv:
+            dv_lost_total += o_dv - n_dv
+        elif n_dv > o_dv:
+            dv_added_total += n_dv - o_dv
+
+        o_sp = int(os_i["sparklines_count"]) if os_i else 0
+        n_sp = int(ns_i["sparklines_count"]) if ns_i else 0
+        if o_sp > n_sp:
+            sparklines_lost_total += o_sp - n_sp
+        elif n_sp > o_sp:
+            sparklines_added_total += n_sp - o_sp
+
+    for key, lost_val, added_val in (
+        ("sheets_with_extlst", sheets_with_extlst_lost, sheets_with_extlst_added),
+        ("sheets_with_x14_cf", sheets_with_x14_cf_lost, sheets_with_x14_cf_added),
+        ("x14_cf_total", x14_cf_lost_total, x14_cf_added_total),
+        ("data_validations_total", dv_lost_total, dv_added_total),
+        ("sparklines_total", sparklines_lost_total, sparklines_added_total),
+    ):
+        if lost_val > 0:
+            pkg_losses[key] = lost_val
+        if added_val > 0:
+            pkg_additions[key] = added_val
+
     sheet_losses: list[dict[str, Any]] = []
+    sheet_additions: list[dict[str, Any]] = []
     affected_by_type: dict[str, list[str]] = defaultdict(list)
+    added_sheets_by_type: dict[str, list[str]] = defaultdict(list)
 
     for title in inv_orig["sheet_order"]:
-        if title not in new_sheets:
-            continue
         os_i = orig_sheets[title]
+        if title not in new_sheets:
+            if os_i["media"]:
+                affected_by_type["media"].append(title)
+            if os_i["drawings"]:
+                affected_by_type["drawings"].append(title)
+            if os_i["charts"]:
+                affected_by_type["charts"].append(title)
+            if os_i["pivots"]:
+                affected_by_type["pivot_tables"].append(title)
+            if os_i["has_extlst"]:
+                affected_by_type["extlst"].append(title)
+            if os_i["x14_cf_count"] > 0:
+                affected_by_type["x14_conditional_formatting"].append(title)
+            if os_i["data_validations_count"] > 0:
+                affected_by_type["data_validations"].append(title)
+            if os_i["sparklines_count"] > 0:
+                affected_by_type["sparklines"].append(title)
+            continue
+
         ns_i = new_sheets[title]
         loss: dict[str, Any] = {}
+        gain: dict[str, Any] = {}
 
-        if os_i["media_count"] > ns_i["media_count"]:
-            ext_d = {
-                ext: cnt - ns_i["media_by_ext"].get(ext, 0)
-                for ext, cnt in os_i["media_by_ext"].items()
-                if cnt > ns_i["media_by_ext"].get(ext, 0)
-            }
-            loss["media_lost"] = os_i["media_count"] - ns_i["media_count"]
+        sh_media_removed = sorted(set(os_i["media"]) - set(ns_i["media"]))
+        sh_media_added = sorted(set(ns_i["media"]) - set(os_i["media"]))
+        if sh_media_removed:
+            ext_d = _count_media_by_ext(sh_media_removed)
+            loss["media_lost"] = len(sh_media_removed)
+            loss["media_removed"] = sh_media_removed
             if ext_d:
                 loss["media_ext_lost"] = ext_d
             affected_by_type["media"].append(title)
+        if sh_media_added:
+            ext_a = _count_media_by_ext(sh_media_added)
+            gain["media_added"] = len(sh_media_added)
+            gain["media_added_parts"] = sh_media_added
+            if ext_a:
+                gain["media_ext_added"] = ext_a
+            added_sheets_by_type["media"].append(title)
 
-        if os_i["drawings_count"] > ns_i["drawings_count"]:
-            loss["drawings_lost"] = os_i["drawings_count"] - ns_i["drawings_count"]
+        sh_drawings_removed = sorted(set(os_i["drawings"]) - set(ns_i["drawings"]))
+        sh_drawings_added = sorted(set(ns_i["drawings"]) - set(os_i["drawings"]))
+        if sh_drawings_removed:
+            loss["drawings_lost"] = len(sh_drawings_removed)
+            loss["drawings_removed"] = sh_drawings_removed
             affected_by_type["drawings"].append(title)
+        if sh_drawings_added:
+            gain["drawings_added"] = len(sh_drawings_added)
+            gain["drawings_added_parts"] = sh_drawings_added
+            added_sheets_by_type["drawings"].append(title)
 
-        if os_i["charts_count"] > ns_i["charts_count"]:
-            loss["charts_lost"] = os_i["charts_count"] - ns_i["charts_count"]
+        sh_charts_removed = sorted(set(os_i["charts"]) - set(ns_i["charts"]))
+        sh_charts_added = sorted(set(ns_i["charts"]) - set(os_i["charts"]))
+        if sh_charts_removed:
+            loss["charts_lost"] = len(sh_charts_removed)
+            loss["charts_removed"] = sh_charts_removed
             affected_by_type["charts"].append(title)
+        if sh_charts_added:
+            gain["charts_added"] = len(sh_charts_added)
+            gain["charts_added_parts"] = sh_charts_added
+            added_sheets_by_type["charts"].append(title)
 
-        if os_i["pivots_count"] > ns_i["pivots_count"]:
-            loss["pivots_lost"] = os_i["pivots_count"] - ns_i["pivots_count"]
+        sh_pivots_removed = sorted(set(os_i["pivots"]) - set(ns_i["pivots"]))
+        sh_pivots_added = sorted(set(ns_i["pivots"]) - set(os_i["pivots"]))
+        if sh_pivots_removed:
+            loss["pivots_lost"] = len(sh_pivots_removed)
+            loss["pivots_removed"] = sh_pivots_removed
             affected_by_type["pivot_tables"].append(title)
+        if sh_pivots_added:
+            gain["pivots_added"] = len(sh_pivots_added)
+            gain["pivots_added_parts"] = sh_pivots_added
+            added_sheets_by_type["pivot_tables"].append(title)
 
+        ext_uris_lost = sorted(set(os_i["ext_uris"]) - set(ns_i["ext_uris"]))
+        ext_uris_added = sorted(set(ns_i["ext_uris"]) - set(os_i["ext_uris"]))
         if os_i["has_extlst"] and not ns_i["has_extlst"]:
             loss["extlst_lost"] = True
             affected_by_type["extlst"].append(title)
-        elif set(os_i["ext_uris"]) - set(ns_i["ext_uris"]):
-            loss["ext_uris_lost"] = sorted(set(os_i["ext_uris"]) - set(ns_i["ext_uris"]))
+        elif ext_uris_lost:
+            loss["ext_uris_lost"] = ext_uris_lost
             affected_by_type["extlst"].append(title)
+
+        if ns_i["has_extlst"] and not os_i["has_extlst"]:
+            gain["extlst_added"] = True
+            added_sheets_by_type["extlst"].append(title)
+        elif ext_uris_added:
+            gain["ext_uris_added"] = ext_uris_added
+            added_sheets_by_type["extlst"].append(title)
 
         if os_i["x14_cf_count"] > ns_i["x14_cf_count"]:
             loss["x14_cf_lost"] = os_i["x14_cf_count"] - ns_i["x14_cf_count"]
             affected_by_type["x14_conditional_formatting"].append(title)
+        elif ns_i["x14_cf_count"] > os_i["x14_cf_count"]:
+            gain["x14_cf_added"] = ns_i["x14_cf_count"] - os_i["x14_cf_count"]
+            added_sheets_by_type["x14_conditional_formatting"].append(title)
 
         if os_i["data_validations_count"] > ns_i["data_validations_count"]:
             loss["data_validations_lost"] = os_i["data_validations_count"] - ns_i["data_validations_count"]
             affected_by_type["data_validations"].append(title)
+        elif ns_i["data_validations_count"] > os_i["data_validations_count"]:
+            gain["data_validations_added"] = ns_i["data_validations_count"] - os_i["data_validations_count"]
+            added_sheets_by_type["data_validations"].append(title)
 
         if os_i["sparklines_count"] > ns_i["sparklines_count"]:
             loss["sparklines_lost"] = os_i["sparklines_count"] - ns_i["sparklines_count"]
             affected_by_type["sparklines"].append(title)
+        elif ns_i["sparklines_count"] > os_i["sparklines_count"]:
+            gain["sparklines_added"] = ns_i["sparklines_count"] - os_i["sparklines_count"]
+            added_sheets_by_type["sparklines"].append(title)
 
         if loss:
             sheet_losses.append({"sheet": title, **loss})
+        if gain:
+            sheet_additions.append({"sheet": title, **gain})
+
+    for title in sheets_added:
+        ns_i = new_sheets[title]
+        if ns_i["media"]:
+            added_sheets_by_type["media"].append(title)
+        if ns_i["drawings"]:
+            added_sheets_by_type["drawings"].append(title)
+        if ns_i["charts"]:
+            added_sheets_by_type["charts"].append(title)
+        if ns_i["pivots"]:
+            added_sheets_by_type["pivot_tables"].append(title)
+        if ns_i["has_extlst"]:
+            added_sheets_by_type["extlst"].append(title)
+        if ns_i["x14_cf_count"] > 0:
+            added_sheets_by_type["x14_conditional_formatting"].append(title)
+        if ns_i["data_validations_count"] > 0:
+            added_sheets_by_type["data_validations"].append(title)
+        if ns_i["sparklines_count"] > 0:
+            added_sheets_by_type["sparklines"].append(title)
 
     def _fmt_sheets(sh_list: list[str]) -> str:
         if not sh_list:
@@ -1049,18 +1258,43 @@ def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str
         suffix = f" 等共 {len(sh_list)} 张表" if len(sh_list) > 8 else f"（共 {len(sh_list)} 张表）"
         return f"涉及 {shown}{suffix}"
 
+    def _fmt_parts(parts: list[str], limit: int = 5) -> str:
+        if not parts:
+            return ""
+        shown = "、".join(parts[:limit])
+        return f"{shown} 等共 {len(parts)} 个" if len(parts) > limit else shown
+
     summary_clauses: list[str] = []
-    if pkg_losses.get("media"):
-        ext_txt = "、".join(f"{cnt} 张 {ext.upper()}" for ext, cnt in sorted(media_ext_losses.items()))
-        detail = f"（{ext_txt}）" if ext_txt else ""
+    if pkg_losses.get("media") or affected_by_type.get("media"):
+        removed_media = pkg_parts_removed.get("media") or sorted(
+            {p for s in sheet_losses for p in s.get("media_removed", ())}
+        )
+        ext_map = media_ext_losses or _count_media_by_ext(removed_media)
+        ext_txt = "、".join(f"{cnt} 张 {ext.upper()}" for ext, cnt in sorted(ext_map.items()))
+        parts_txt = _fmt_parts(removed_media)
+        inner = "；".join(p for p in (ext_txt, parts_txt) if p)
+        detail = f"（{inner}）" if inner else ""
         sh_txt = _fmt_sheets(affected_by_type.get("media", []))
-        summary_clauses.append(f"嵌入图片减少 {pkg_losses['media']} 张{detail}" + (f"，{sh_txt}" if sh_txt else ""))
-    if pkg_losses.get("drawings"):
+        cnt = pkg_losses.get("media") or sum(s.get("media_lost", 0) for s in sheet_losses)
+        summary_clauses.append(f"嵌入图片减少 {cnt} 张{detail}" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_losses.get("drawings") or affected_by_type.get("drawings"):
+        removed_drawings = pkg_parts_removed.get("drawings") or sorted(
+            {p for s in sheet_losses for p in s.get("drawings_removed", ())}
+        )
+        parts_txt = _fmt_parts(removed_drawings)
+        detail = f"（{parts_txt}）" if parts_txt else ""
         sh_txt = _fmt_sheets(affected_by_type.get("drawings", []))
-        summary_clauses.append(f"绘图对象（xl/drawings）减少 {pkg_losses['drawings']} 个" + (f"，{sh_txt}" if sh_txt else ""))
-    if pkg_losses.get("charts"):
+        cnt = pkg_losses.get("drawings") or sum(s.get("drawings_lost", 0) for s in sheet_losses)
+        summary_clauses.append(f"绘图部件减少 {cnt} 个{detail}" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_losses.get("charts") or affected_by_type.get("charts"):
+        removed_charts = pkg_parts_removed.get("charts") or sorted(
+            {p for s in sheet_losses for p in s.get("charts_removed", ())}
+        )
+        parts_txt = _fmt_parts(removed_charts)
+        detail = f"（{parts_txt}）" if parts_txt else "（xl/charts）"
         sh_txt = _fmt_sheets(affected_by_type.get("charts", []))
-        summary_clauses.append(f"图表（xl/charts）减少 {pkg_losses['charts']} 个" + (f"，{sh_txt}" if sh_txt else ""))
+        cnt = pkg_losses.get("charts") or sum(s.get("charts_lost", 0) for s in sheet_losses)
+        summary_clauses.append(f"图表减少 {cnt} 个{detail}" + (f"，{sh_txt}" if sh_txt else ""))
     if pkg_losses.get("x14_cf_total") or affected_by_type.get("x14_conditional_formatting"):
         sh_list = affected_by_type.get("x14_conditional_formatting", [])
         n_rules = pkg_losses.get("x14_cf_total", len(sh_list))
@@ -1069,15 +1303,17 @@ def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str
     elif pkg_losses.get("sheets_with_extlst") or affected_by_type.get("extlst"):
         sh_list = affected_by_type.get("extlst", [])
         sh_txt = _fmt_sheets(sh_list)
-        summary_clauses.append(f"工作表扩展节点（<extLst>）减少" + (f"，{sh_txt}" if sh_txt else ""))
+        summary_clauses.append("工作表扩展节点（<extLst>）减少" + (f"，{sh_txt}" if sh_txt else ""))
     if pkg_losses.get("data_validations_total"):
         sh_txt = _fmt_sheets(affected_by_type.get("data_validations", []))
         summary_clauses.append(f"数据验证减少 {pkg_losses['data_validations_total']} 条" + (f"，{sh_txt}" if sh_txt else ""))
     if pkg_losses.get("sparklines_total"):
         sh_txt = _fmt_sheets(affected_by_type.get("sparklines", []))
         summary_clauses.append(f"迷你图（sparkline）减少 {pkg_losses['sparklines_total']} 组" + (f"，{sh_txt}" if sh_txt else ""))
-    if pkg_losses.get("pivot_tables"):
-        summary_clauses.append(f"数据透视表减少 {pkg_losses['pivot_tables']} 个")
+    if pkg_losses.get("pivot_tables") or affected_by_type.get("pivot_tables"):
+        cnt = pkg_losses.get("pivot_tables") or sum(s.get("pivots_lost", 0) for s in sheet_losses)
+        sh_txt = _fmt_sheets(affected_by_type.get("pivot_tables", []))
+        summary_clauses.append(f"数据透视表减少 {cnt} 个" + (f"，{sh_txt}" if sh_txt else ""))
     if pkg_losses.get("slicers"):
         summary_clauses.append(f"切片器减少 {pkg_losses['slicers']} 个")
     if pkg_losses.get("threaded_comments"):
@@ -1089,28 +1325,97 @@ def diff_workbook_parts(orig_path: str | Path, new_path: str | Path) -> dict[str
     if sheets_removed:
         summary_clauses.append(f"原工作表被移除：{'、'.join(sheets_removed)}")
 
+    addition_clauses: list[str] = []
+    if pkg_additions.get("media") or added_sheets_by_type.get("media"):
+        added_media = pkg_parts_added.get("media") or sorted(
+            {p for s in sheet_additions for p in s.get("media_added_parts", ())}
+        )
+        ext_map = media_ext_additions or _count_media_by_ext(added_media)
+        ext_txt = "、".join(f"{cnt} 张 {ext.upper()}" for ext, cnt in sorted(ext_map.items()))
+        parts_txt = _fmt_parts(added_media)
+        inner = "；".join(p for p in (ext_txt, parts_txt) if p)
+        detail = f"（{inner}）" if inner else ""
+        sh_txt = _fmt_sheets(added_sheets_by_type.get("media", []))
+        cnt = pkg_additions.get("media") or sum(s.get("media_added", 0) for s in sheet_additions)
+        addition_clauses.append(f"嵌入图片新增 {cnt} 张{detail}" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_additions.get("drawings") or added_sheets_by_type.get("drawings"):
+        added_drawings = pkg_parts_added.get("drawings") or sorted(
+            {p for s in sheet_additions for p in s.get("drawings_added_parts", ())}
+        )
+        parts_txt = _fmt_parts(added_drawings)
+        detail = f"（{parts_txt}）" if parts_txt else ""
+        sh_txt = _fmt_sheets(added_sheets_by_type.get("drawings", []))
+        cnt = pkg_additions.get("drawings") or sum(s.get("drawings_added", 0) for s in sheet_additions)
+        addition_clauses.append(f"绘图部件新增 {cnt} 个{detail}" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_additions.get("charts") or added_sheets_by_type.get("charts"):
+        added_charts = pkg_parts_added.get("charts") or sorted(
+            {p for s in sheet_additions for p in s.get("charts_added_parts", ())}
+        )
+        parts_txt = _fmt_parts(added_charts)
+        detail = f"（{parts_txt}）" if parts_txt else "（xl/charts）"
+        sh_txt = _fmt_sheets(added_sheets_by_type.get("charts", []))
+        cnt = pkg_additions.get("charts") or sum(s.get("charts_added", 0) for s in sheet_additions)
+        addition_clauses.append(f"图表新增 {cnt} 个{detail}" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_additions.get("x14_cf_total") or added_sheets_by_type.get("x14_conditional_formatting"):
+        sh_list = added_sheets_by_type.get("x14_conditional_formatting", [])
+        n_rules = pkg_additions.get("x14_cf_total", len(sh_list))
+        sh_txt = _fmt_sheets(sh_list)
+        addition_clauses.append(f"扩展条件格式（x14）新增 {n_rules} 处" + (f"，{sh_txt}" if sh_txt else ""))
+    elif pkg_additions.get("sheets_with_extlst") or added_sheets_by_type.get("extlst"):
+        sh_list = added_sheets_by_type.get("extlst", [])
+        sh_txt = _fmt_sheets(sh_list)
+        addition_clauses.append("工作表扩展节点（<extLst>）新增" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_additions.get("data_validations_total"):
+        sh_txt = _fmt_sheets(added_sheets_by_type.get("data_validations", []))
+        addition_clauses.append(f"数据验证新增 {pkg_additions['data_validations_total']} 条" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_additions.get("sparklines_total"):
+        sh_txt = _fmt_sheets(added_sheets_by_type.get("sparklines", []))
+        addition_clauses.append(f"迷你图（sparkline）新增 {pkg_additions['sparklines_total']} 组" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_additions.get("pivot_tables") or added_sheets_by_type.get("pivot_tables"):
+        cnt = pkg_additions.get("pivot_tables") or sum(s.get("pivots_added", 0) for s in sheet_additions)
+        sh_txt = _fmt_sheets(added_sheets_by_type.get("pivot_tables", []))
+        addition_clauses.append(f"数据透视表新增 {cnt} 个" + (f"，{sh_txt}" if sh_txt else ""))
+    if pkg_additions.get("slicers"):
+        addition_clauses.append(f"切片器新增 {pkg_additions['slicers']} 个")
+    if pkg_additions.get("threaded_comments"):
+        addition_clauses.append(f"线索批注（threadedComments）新增 {pkg_additions['threaded_comments']} 处")
+    if pkg_additions.get("vba_project"):
+        addition_clauses.append("VBA 宏工程（vbaProject.bin）新增")
+    if pkg_additions.get("external_links"):
+        addition_clauses.append(f"外部链接部件（xl/externalLinks）新增 {pkg_additions['external_links']} 个")
+    if sheets_added:
+        addition_clauses.append(f"工作表：{'、'.join(sheets_added)}")
+
     has_losses = bool(summary_clauses)
+    has_additions = bool(addition_clauses)
     if has_losses:
         summary = "部件对比发现新文件相对原文件有以下减少：" + "；".join(summary_clauses) + "。"
     else:
         summary = "部件对比完成：新文件未发现图片、绘图、图表、扩展条件格式（<extLst>/x14）、数据验证或其他关键部件丢失。"
-    if sheets_added:
-        summary += f" 新增工作表：{'、'.join(sheets_added)}。"
+    if addition_clauses:
+        summary += " 新增部分：" + "；".join(addition_clauses) + "。"
 
     return {
         "status": "ok",
         "orig_file": str(p_orig),
         "new_file": str(p_new),
         "has_losses": has_losses,
+        "has_additions": has_additions,
         "summary": summary,
         "orig_counts": oc,
         "new_counts": nc,
         "package_losses": pkg_losses,
+        "package_additions": pkg_additions,
+        "package_parts_removed": pkg_parts_removed,
+        "package_parts_added": pkg_parts_added,
         "media_ext_losses": media_ext_losses,
+        "media_ext_additions": media_ext_additions,
         "sheets_removed": sheets_removed,
         "sheets_added": sheets_added,
         "affected_sheets_by_type": dict(affected_by_type),
+        "added_sheets_by_type": dict(added_sheets_by_type),
         "sheet_losses": sheet_losses,
+        "sheet_additions": sheet_additions,
     }
 
 
@@ -1205,6 +1510,21 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _paths_refer_to_same_file(p1: Path, p2: Path) -> bool:
+    """Return True if ``p1`` and ``p2`` resolve to the same path or existing inode."""
+    try:
+        if p1.resolve() == p2.resolve():
+            return True
+    except OSError:
+        pass
+    try:
+        if p1.exists() and p2.exists() and os.path.samefile(p1, p2):
+            return True
+    except OSError:
+        pass
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -1228,6 +1548,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "parts-diff":
+        if args.out:
+            out_p = Path(args.out)
+            orig_p = Path(args.orig_workbook)
+            new_p = Path(args.new_workbook)
+            if _paths_refer_to_same_file(out_p, orig_p) or _paths_refer_to_same_file(out_p, new_p):
+                print(json.dumps({
+                    "status": "error",
+                    "message": f"拒绝写入：--out 目标路径（{out_p}）与输入工作簿相同，已中止以避免覆盖输入文件。",
+                }, ensure_ascii=False))
+                return 1
         diff = diff_workbook_parts(args.orig_workbook, args.new_workbook)
         text = json.dumps(diff, indent=2, ensure_ascii=False)
         if args.out and diff.get("status") == "ok":
@@ -1238,6 +1568,7 @@ def main(argv: list[str] | None = None) -> int:
                 "status": "ok",
                 "out": str(out_p),
                 "has_losses": diff.get("has_losses", False),
+                "has_additions": diff.get("has_additions", False),
                 "summary": diff.get("summary", ""),
             }, ensure_ascii=False))
         else:

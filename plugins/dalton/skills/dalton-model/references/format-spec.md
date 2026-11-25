@@ -10,10 +10,10 @@
 2. **新建模型或找不到参照**：用下表的默认格式。
 
 `.agents/skills/dalton-model/scripts/model_style.py` 提供两类工具：
-- 命令行提取格式画像：`python3 .agents/skills/dalton-model/scripts/model_style.py profile <原模型.xlsx> --out style_profile.json`，输出全表默认摘要与各工作表观察到的 `fonts_observed`、`fills_observed`、`section_fills`、`header_fill` 等，供挑选参照样式或传入 `apply_cell_style(..., profile=prof, sheet_name=...)`。
+- 命令行提取格式画像：`python3 .agents/skills/dalton-model/scripts/model_style.py profile <原模型.xlsx> --out style_profile.json`，输出全表默认摘要与各工作表观察到的 `fonts_observed`、`fills_observed`、`section_fills`、`header_fill`、`blocks`（各分节标题行号与底色）等。维护原表时，先用 `profile` 输出的 `blocks` 找到原表同类标题行，再用 `clone_period_column_style` 或直接复制参照单元格的完整样式；画像中的 `section_styles` 仅按已知颜色提供默认配色，保留原表自定义分节用途时以 `blocks` 和参照单元格为准。
 - Python 写入辅助：
   - `clone_period_column_style(ws, src_col, dst_col)`：维护原模型时，把同类期间列的完整样式（含字体、填充、边框、对齐、数字格式、保护属性与列宽）复制到新增列。
-  - `apply_cell_style(cell, role, ..., profile=None, sheet_name=None)`：按 `role` 写格式（传入 `profile` 时优先采用画像中的字体、字号、表头色、分节色与假设样式，未传画像时用基金默认格式）。
+  - `apply_cell_style(cell, role, ..., profile=None, sheet_name=None)`：按 `role` 写格式（传入 `profile` 时采用画像中的字体、字号、表头色与假设样式，以及按已知默认色映射的 `section_styles`；未传画像时用基金默认格式）。
 
 `apply_cell_style` 支持的 `role` 名称与对应单元格类型：
 
