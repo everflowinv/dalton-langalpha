@@ -954,7 +954,11 @@ build_gateway_staging() {
     STAGED_GATEWAY_RELEASE_ID=""
     return 1
   fi
-  for item in package.json pnpm-lock.yaml build.mjs tsconfig.json src; do
+  for item in package.json pnpm-lock.yaml pnpm-workspace.yaml build.mjs tsconfig.json src; do
+    # pnpm-workspace.yaml (build-script approvals) is optional so older revisions still rebuild on revert.
+    if [ "$item" = "pnpm-workspace.yaml" ] && [ ! -e "${gw_dir}/${item}" ]; then
+      continue
+    fi
     if [ ! -e "${gw_dir}/${item}" ]; then
       echo "ERROR: gateway staging source missing: ${gw_dir}/${item}" >&2
       cleanup_gateway_staging || true

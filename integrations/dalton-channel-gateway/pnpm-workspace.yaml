@@ -1,0 +1,6 @@
+# pnpm 10+ refuses to finish an install while dependency build scripts are
+# neither allowed nor denied. esbuild needs its install script for the platform
+# binary used by build.mjs; protobufjs (via @larksuiteoapi/node-sdk) does not.
+allowBuilds:
+  esbuild: true
+  protobufjs: false

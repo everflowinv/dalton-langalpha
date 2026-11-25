@@ -2464,3 +2464,49 @@ wait_gateway_health() {{
     assert "POST-REVERT REPORT: FAILED" in res_b.stdout
     assert "gateway_health" in res_b.stdout
     assert "all revert steps and post-revert checks passed" not in res_b.stdout
+
+
+@pytest.mark.parametrize("with_workspace_file", [True, False])
+def test_gateway_staging_copies_pnpm_workspace_file_when_present(
+    tmp_path: Path, with_workspace_file: bool
+) -> None:
+    """pnpm 10+ needs the build-script approvals in pnpm-workspace.yaml; older revisions lack the file."""
+    repo = tmp_path / "repo"
+    gw = repo / "integrations/dalton-channel-gateway"
+    (gw / "src").mkdir(parents=True)
+    (gw / "package.json").write_text('{"name":"@dalton/channel-gateway","type":"module"}\n')
+    (gw / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    (gw / "build.mjs").write_text("// build\n")
+    (gw / "tsconfig.json").write_text("{}\n")
+    (gw / "src/main.ts").write_text("export const v = 1;\n")
+    if with_workspace_file:
+        (gw / "pnpm-workspace.yaml").write_text("allowBuilds:\n  esbuild: true\n")
+
+    trace = tmp_path / "pnpm.trace"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    (fake_bin / "pnpm").write_text(
+        f'#!/bin/bash\nif [ -f pnpm-workspace.yaml ]; then echo ws=yes >> "{trace}"; '
+        f'else echo ws=no >> "{trace}"; fi\nmkdir -p node_modules\nexit 0\n'
+    )
+    (fake_bin / "node").write_text("#!/bin/bash\nmkdir -p dist\necho bundle > dist/index.mjs\nexit 0\n")
+    for name in ("pnpm", "node"):
+        (fake_bin / name).chmod(0o755)
+
+    res = subprocess.run(
+        [
+            "bash",
+            "-c",
+            (
+                f'set -uo pipefail; DALTON_DEPLOY_LIB_ONLY=1; source "{_DEPLOY_SCRIPT}"; '
+                f'REPO_ROOT="{repo}"; TARGET_GATEWAY_TREE=deadbeef; '
+                'build_gateway_staging; echo "rc=$?"; echo "staging=$ACTIVE_GATEWAY_STAGING_DIR"'
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    )
+    assert "rc=0" in res.stdout, res.stdout + res.stderr
+    assert trace.read_text().strip() == ("ws=yes" if with_workspace_file else "ws=no")
