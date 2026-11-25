@@ -919,6 +919,7 @@ class AutomationExecutor:
         llm_model: str | None,
         stored_effort: str | None,
         system_only: bool = False,  # DALTON-HOOK(cos-settings-tools)
+        has_snapshot: bool = False,  # DALTON-HOOK(cos-settings-tools)
     ) -> str | None:
         from src.dalton.llm.antigravity_series import ANTIGRAVITY_PROVIDER
         from src.dalton.services import automation_thread_model
@@ -926,7 +927,8 @@ class AutomationExecutor:
         from src.server.services.llm import user_models
 
         effective_effort: str | None = stored_effort
-        if thread_id:
+        # DALTON-HOOK(cos-settings-tools): when the execution row carries a frozen snapshot, never overwrite its reasoning_effort from run history
+        if thread_id and not has_snapshot:
             try:
                 (
                     _first_model,
@@ -1078,6 +1080,7 @@ class AutomationExecutor:
                 llm_model=exec_llm_model,
                 stored_effort=exec_stored_effort,
                 system_only=system_only,
+                has_snapshot=use_snapshot,
             )
             run_metadata["automation_reasoning_effort_configured"] = True
             run_metadata["automation_reasoning_effort"] = effective_effort
@@ -1276,9 +1279,14 @@ class AutomationExecutor:
                 return
             handed_thread = started.get("conversation_thread_id")
             checked = started.get("checked_computer_id")
-            # DALTON-HOOK(cos-settings-tools): read immutable model config snapshot from the execution row
+            # DALTON-HOOK(cos-settings-tools): read immutable model config snapshot from the execution row (lazily backfilling rolling-upgrade rows with snapshot_taken=False)
+            if started.get("snapshot_taken") is False:
+                hydrated_snap = await exec_db.ensure_execution_snapshot(execution_id)
+                if hydrated_snap is not None:
+                    started = {**started, **hydrated_snap}
             has_exec_snapshot = (
-                "llm_model" in started
+                started.get("snapshot_taken") is True
+                or "llm_model" in started
                 or "reasoning_effort" in started
                 or "llm_model_system_only" in started
             )
@@ -1297,6 +1305,7 @@ class AutomationExecutor:
                 if "llm_model_system_only" in started
                 else bool((automation.get("metadata") or {}).get("llm_model_system_only"))
             )
+            # DALTON-HOOK(cos-settings-tools): attach frozen execution snapshot to _Firing
             firing = _Firing(
                 automation=automation,
                 checked_computer_id=str(checked) if checked else None,

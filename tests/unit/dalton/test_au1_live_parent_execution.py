@@ -213,8 +213,8 @@ async def test_live_parent_insert_uses_clock_timestamp_for_created_at(monkeypatc
     )
     insert_sql = conn.cursor_obj.queries[1]
     assert "INSERT INTO automation_executions" in insert_sql
-    assert "( automation_execution_id, automation_id, status, scheduled_at, server_id, created_at, heartbeat_at, checked_computer_id, llm_model, reasoning_effort, llm_model_system_only )" in insert_sql
-    assert "VALUES (%s, %s, 'pending', %s, %s, clock_timestamp(), NOW(), %s, %s, %s, %s)" in insert_sql
+    assert "( automation_execution_id, automation_id, status, scheduled_at, server_id, created_at, heartbeat_at, checked_computer_id, llm_model, reasoning_effort, llm_model_system_only, snapshot_taken )" in insert_sql
+    assert "VALUES (%s, %s, 'pending', %s, %s, clock_timestamp(), NOW(), %s, %s, %s, %s, TRUE)" in insert_sql
 
     orphan_conn = _install(monkeypatch, None)
     await exec_db.create_execution(AUTO, datetime(2026, 11, 11, tzinfo=UTC), "server-1")

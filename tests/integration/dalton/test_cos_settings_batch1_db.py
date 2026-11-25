@@ -993,17 +993,50 @@ async def test_d050_migration_upgrade_backfills_existing_executions_and_downgrad
         metadata={"dalton_managed": True},
     )
 
+    # 5. Execution whose earliest run is linked ONLY via automation_source_execution_id while
+    #    e.conversation_response_id was advanced to a later run with different metadata.
+    auto_src_only = await auto_db.create_automation(
+        user_id=user_id,
+        name="d050-src-only",
+        trigger_type="cron",
+        cron_expression="0 13 * * 1-5",
+        timezone="Asia/Shanghai",
+        instruction="Check META.",
+        workspace_id=ws_id,
+        llm_model="owner-custom-later",
+        reasoning_effort="low",
+        metadata={"dalton_managed": True},
+    )
+    # 6. Execution whose earliest run is linked ONLY via metadata.automation_delivery.id.
+    auto_delivery_only = await auto_db.create_automation(
+        user_id=user_id,
+        name="d050-delivery-only",
+        trigger_type="cron",
+        cron_expression="0 14 * * 1-5",
+        timezone="Asia/Shanghai",
+        instruction="Check AMZN.",
+        workspace_id=ws_id,
+        llm_model="owner-custom-later",
+        reasoning_effort="low",
+        metadata={"dalton_managed": True},
+    )
+
     exec_sys_ran_id = str(uuid.uuid4())
     exec_norm_ran_id = str(uuid.uuid4())
     exec_sys_pending_id = str(uuid.uuid4())
     exec_norm_pending_id = str(uuid.uuid4())
+    exec_src_only_id = str(uuid.uuid4())
+    exec_delivery_only_id = str(uuid.uuid4())
     run_sys_first_id = str(uuid.uuid4())
     run_sys_later_id = str(uuid.uuid4())
     run_norm_first_id = str(uuid.uuid4())
+    run_src_earliest_id = str(uuid.uuid4())
+    run_src_pointer_later_id = str(uuid.uuid4())
+    run_delivery_earliest_id = str(uuid.uuid4())
     now = datetime.now(UTC)
 
     try:
-        # Downgrade to d046 (pre-d050 schema without the 3 snapshot columns).
+        # Downgrade to d046 (pre-d050 schema without the 4 snapshot columns).
         await asyncio.to_thread(command.downgrade, alembic_cfg, "d046")
 
         async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=False) as conn:
@@ -1014,12 +1047,12 @@ async def test_d050_migration_upgrade_backfills_existing_executions_and_downgrad
                     FROM information_schema.columns
                     WHERE table_schema = 'public'
                       AND table_name = 'automation_executions'
-                      AND column_name IN ('llm_model', 'reasoning_effort', 'llm_model_system_only')
+                      AND column_name IN ('llm_model', 'reasoning_effort', 'llm_model_system_only', 'snapshot_taken')
                     """
                 )
                 assert await cur.fetchall() == []
 
-                # Insert pre-d050 executions (2 with runs, 2 pending without runs).
+                # Insert pre-d050 executions (4 with runs, 2 pending without runs).
                 await cur.execute(
                     """
                     INSERT INTO automation_executions (
@@ -1031,7 +1064,9 @@ async def test_d050_migration_upgrade_backfills_existing_executions_and_downgrad
                         (%s::uuid, %s::uuid, 'running', %s::uuid, %s::uuid, %s, %s, 'srv-pre', %s),
                         (%s::uuid, %s::uuid, 'running', %s::uuid, %s::uuid, %s, %s, 'srv-pre', %s),
                         (%s::uuid, %s::uuid, 'pending', NULL, NULL, %s, NULL, 'srv-pre', %s),
-                        (%s::uuid, %s::uuid, 'pending', NULL, NULL, %s, NULL, 'srv-pre', %s)
+                        (%s::uuid, %s::uuid, 'pending', NULL, NULL, %s, NULL, 'srv-pre', %s),
+                        (%s::uuid, %s::uuid, 'running', %s::uuid, %s::uuid, %s, %s, 'srv-pre', %s),
+                        (%s::uuid, %s::uuid, 'running', %s::uuid, NULL, %s, %s, 'srv-pre', %s)
                     """,
                     (
                         exec_sys_ran_id,
@@ -1056,10 +1091,23 @@ async def test_d050_migration_upgrade_backfills_existing_executions_and_downgrad
                         str(auto_norm_pending["automation_id"]),
                         now,
                         now,
+                        exec_src_only_id,
+                        str(auto_src_only["automation_id"]),
+                        thread_id,
+                        run_src_pointer_later_id,
+                        now,
+                        now,
+                        now,
+                        exec_delivery_only_id,
+                        str(auto_delivery_only["automation_id"]),
+                        thread_id,
+                        now,
+                        now,
+                        now,
                     ),
                 )
 
-                # Earliest run + a later continuation run for exec_sys_ran, and earliest run for exec_norm_ran.
+                # Seed runs in chronological order (created_at, run_seq).
                 _seed = (
                     (
                         run_sys_first_id,
@@ -1076,6 +1124,8 @@ async def test_d050_migration_upgrade_backfills_existing_executions_and_downgrad
                         now,
                         str(uuid.uuid4()),
                         user_id,
+                    ),
+                    (
                         run_sys_later_id,
                         thread_id,
                         Json(
@@ -1090,6 +1140,8 @@ async def test_d050_migration_upgrade_backfills_existing_executions_and_downgrad
                         now + timedelta(seconds=10),
                         str(uuid.uuid4()),
                         user_id,
+                    ),
+                    (
                         run_norm_first_id,
                         thread_id,
                         Json(
@@ -1104,12 +1156,62 @@ async def test_d050_migration_upgrade_backfills_existing_executions_and_downgrad
                         now + timedelta(seconds=20),
                         str(uuid.uuid4()),
                         user_id,
-                    )
+                    ),
+                    # Earlier run linked ONLY via automation_source_execution_id
+                    (
+                        run_src_earliest_id,
+                        thread_id,
+                        Json(
+                            {
+                                "automation_source_execution_id": exec_src_only_id,
+                                "llm_model": "claude-sonnet-4-6",
+                                "llm_model_system_only": True,
+                                "automation_reasoning_effort_configured": True,
+                                "automation_reasoning_effort": "high",
+                            }
+                        ),
+                        now + timedelta(seconds=30),
+                        str(uuid.uuid4()),
+                        user_id,
+                    ),
+                    # Later run that e.conversation_response_id points to (must NOT beat earlier run!)
+                    (
+                        run_src_pointer_later_id,
+                        thread_id,
+                        Json(
+                            {
+                                "automation_execution_id": exec_src_only_id,
+                                "llm_model": "owner-custom-later",
+                                "llm_model_system_only": False,
+                                "automation_reasoning_effort_configured": True,
+                                "automation_reasoning_effort": "low",
+                            }
+                        ),
+                        now + timedelta(seconds=40),
+                        str(uuid.uuid4()),
+                        user_id,
+                    ),
+                    # Run linked ONLY via automation_delivery.id ("<exec_id>.1")
+                    (
+                        run_delivery_earliest_id,
+                        thread_id,
+                        Json(
+                            {
+                                "automation_delivery": {"id": f"{exec_delivery_only_id}.1"},
+                                "llm_model": "gpt-6.2-sol",
+                                "llm_model_system_only": True,
+                                "automation_reasoning_effort_configured": True,
+                                "automation_reasoning_effort": "medium",
+                            }
+                        ),
+                        now + timedelta(seconds=50),
+                        str(uuid.uuid4()),
+                        user_id,
+                    ),
                 )
                 # Rows are born in_progress (lifecycle guard) and a thread holds one in_progress row at a
                 # time (uq_responses_in_progress_slot): insert each run, then settle it before the next.
-                for turn_index in range(3):
-                    rid, tid, meta, created, req_key, uid = _seed[turn_index * 6 : turn_index * 6 + 6]
+                for turn_index, (rid, tid, meta, created, req_key, uid) in enumerate(_seed):
                     await cur.execute(
                         """
                         INSERT INTO conversation_responses (
@@ -1127,7 +1229,7 @@ async def test_d050_migration_upgrade_backfills_existing_executions_and_downgrad
                     )
             await conn.commit()
 
-        # Upgrade d046 -> d050: adds the 3 columns and backfills existing rows.
+        # Upgrade d046 -> d050: adds the 4 columns and backfills existing rows.
         await asyncio.to_thread(command.upgrade, alembic_cfg, "d050")
 
         async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn:
@@ -1135,7 +1237,7 @@ async def test_d050_migration_upgrade_backfills_existing_executions_and_downgrad
                 await cur.execute(
                     """
                     SELECT automation_execution_id::text AS eid,
-                           llm_model, reasoning_effort, llm_model_system_only
+                           llm_model, reasoning_effort, llm_model_system_only, snapshot_taken
                     FROM automation_executions
                     WHERE automation_execution_id = ANY(%s::uuid[])
                     """,
@@ -1145,10 +1247,15 @@ async def test_d050_migration_upgrade_backfills_existing_executions_and_downgrad
                             exec_norm_ran_id,
                             exec_sys_pending_id,
                             exec_norm_pending_id,
+                            exec_src_only_id,
+                            exec_delivery_only_id,
                         ],
                     ),
                 )
                 rows = {r["eid"]: dict(r) for r in await cur.fetchall()}
+
+        for eid in rows:
+            assert rows[eid]["snapshot_taken"] is True
 
         # System-only execution with runs: took earliest run metadata (NOT later run / mutated automation).
         assert rows[exec_sys_ran_id]["llm_model"] == "claude-sonnet-4-6"
@@ -1170,7 +1277,17 @@ async def test_d050_migration_upgrade_backfills_existing_executions_and_downgrad
         assert rows[exec_norm_pending_id]["reasoning_effort"] is None
         assert rows[exec_norm_pending_id]["llm_model_system_only"] is False
 
-        # Downgrade d050 -> d046 drops all 3 columns cleanly.
+        # Linked only via automation_source_execution_id beat later conversation_response_id pointer!
+        assert rows[exec_src_only_id]["llm_model"] == "claude-sonnet-4-6"
+        assert rows[exec_src_only_id]["reasoning_effort"] == "high"
+        assert rows[exec_src_only_id]["llm_model_system_only"] is True
+
+        # Linked only via metadata.automation_delivery.id
+        assert rows[exec_delivery_only_id]["llm_model"] == "gpt-6.2-sol"
+        assert rows[exec_delivery_only_id]["reasoning_effort"] == "medium"
+        assert rows[exec_delivery_only_id]["llm_model_system_only"] is True
+
+        # Downgrade d050 -> d046 drops all 4 columns cleanly.
         await asyncio.to_thread(command.downgrade, alembic_cfg, "d046")
         async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=True) as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -1180,10 +1297,95 @@ async def test_d050_migration_upgrade_backfills_existing_executions_and_downgrad
                     FROM information_schema.columns
                     WHERE table_schema = 'public'
                       AND table_name = 'automation_executions'
-                      AND column_name IN ('llm_model', 'reasoning_effort', 'llm_model_system_only')
+                      AND column_name IN ('llm_model', 'reasoning_effort', 'llm_model_system_only', 'snapshot_taken')
                     """
                 )
                 assert await cur.fetchall() == []
     finally:
         # Always restore Dalton schema to head (d050) for subsequent tests.
         await asyncio.to_thread(command.upgrade, alembic_cfg, "head")
+
+
+async def test_rolling_upgrade_snapshot_taken_false_lazily_backfills_once_under_row_lock_on_real_db(
+    patched_get_db_connection,
+    cleanup_tables,
+    test_db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 8 Decision 2 (codex high 2):
+    Simulate an old backend inserting rows after d050 committed (omitting the 4 new columns so
+    snapshot_taken=FALSE). Verify:
+    (a) begin_execution_if_not_deleted atomically backfills from automations and flips snapshot_taken=TRUE,
+        and subsequent automation edits never mutate the frozen snapshot.
+    (b) ensure_execution_snapshot atomically backfills a running row under FOR UPDATE OF e and flips
+        snapshot_taken=TRUE, and subsequent automation edits + re-reads return the frozen snapshot."""
+    _stub_catalog(monkeypatch)
+    monkeypatch.setattr("src.dalton.settings.is_coverage_units_enabled", lambda: False)
+    user_id = f"b1-r8-rolling-{uuid.uuid4().hex[:10]}"
+    _c1_id, _c2_id, ws_id = await _setup_user_and_two_computers(user_id)
+
+    auto = await auto_db.create_automation(
+        user_id=user_id,
+        name="rolling-snap-auto",
+        trigger_type="cron",
+        cron_expression="0 9 * * 1-5",
+        timezone="Asia/Shanghai",
+        instruction="Check NVDA.",
+        workspace_id=ws_id,
+        llm_model="claude-sonnet-4-6",
+        reasoning_effort="high",
+        metadata={"dalton_managed": True, "llm_model_system_only": True},
+    )
+    auto_id = str(auto["automation_id"])
+    now = datetime.now(UTC)
+
+    # Simulate old backend inserting 2 rows without the 4 snapshot columns (snapshot_taken defaults FALSE).
+    exec_pending_id = str(uuid.uuid4())
+    exec_running_id = str(uuid.uuid4())
+    async with await psycopg.AsyncConnection.connect(test_db_uri, autocommit=False) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO automation_executions (
+                    automation_execution_id, automation_id, status,
+                    scheduled_at, server_id, created_at
+                )
+                VALUES
+                    (%s::uuid, %s::uuid, 'pending', %s, 'old-backend', %s),
+                    (%s::uuid, %s::uuid, 'running', %s, 'old-backend', %s)
+                """,
+                (exec_pending_id, auto_id, now, now, exec_running_id, auto_id, now, now),
+            )
+        await conn.commit()
+
+    # (a) begin_execution_if_not_deleted backfills pending row and sets snapshot_taken=TRUE
+    started = await exec_db.begin_execution_if_not_deleted(exec_pending_id, started_at=now)
+    assert started is not None
+    assert started["llm_model"] == "claude-sonnet-4-6"
+    assert started["reasoning_effort"] == "high"
+    assert started["llm_model_system_only"] is True
+    assert started["snapshot_taken"] is True
+
+    # (b) ensure_execution_snapshot backfills running row under row lock and sets snapshot_taken=TRUE
+    snap1 = await exec_db.ensure_execution_snapshot(exec_running_id)
+    assert snap1 == {
+        "llm_model": "claude-sonnet-4-6",
+        "reasoning_effort": "high",
+        "llm_model_system_only": True,
+        "snapshot_taken": True,
+    }
+
+    # Edit automation config after both rows have snapshot_taken=TRUE
+    await auto_db.update_automation(
+        auto_id,
+        user_id,
+        llm_model="owner-custom-later",
+        reasoning_effort="low",
+        metadata={"dalton_managed": True},
+    )
+
+    # Re-reading either row returns the frozen snapshot, never the later automation edit!
+    snap_pending_again = await exec_db.ensure_execution_snapshot(exec_pending_id)
+    snap_running_again = await exec_db.ensure_execution_snapshot(exec_running_id)
+    assert snap_pending_again == snap1
+    assert snap_running_again == snap1

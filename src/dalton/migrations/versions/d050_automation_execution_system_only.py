@@ -32,21 +32,26 @@ def upgrade() -> None:
         ALTER TABLE automation_executions
             ADD COLUMN IF NOT EXISTS llm_model TEXT,
             ADD COLUMN IF NOT EXISTS reasoning_effort VARCHAR(16),
-            ADD COLUMN IF NOT EXISTS llm_model_system_only BOOLEAN NOT NULL DEFAULT FALSE
+            ADD COLUMN IF NOT EXISTS llm_model_system_only BOOLEAN NOT NULL DEFAULT FALSE,
+            ADD COLUMN IF NOT EXISTS snapshot_taken BOOLEAN NOT NULL DEFAULT FALSE
         """
     )
-    # Backfill existing execution rows:
-    # - Executions that already have runs take (llm_model, reasoning_effort, llm_model_system_only)
-    #   from their earliest run's metadata (falling back to automations config only for fields
-    #   absent from that run's metadata; an explicit NULL reasoning_effort when
-    #   automation_reasoning_effort_configured=true is preserved).
+    # Backfill existing execution rows and mark snapshot_taken = TRUE:
+    # - Executions that already have runs (linked via conversation_response_id,
+    #   metadata.automation_execution_id, metadata.automation_source_execution_id,
+    #   or metadata.automation_delivery.id) take their earliest run by
+    #   (created_at ASC, run_seq ASC).
     # - Executions with no runs yet take the parent automation's current config.
+    # - Any rows inserted by an older backend during a rolling upgrade after this
+    #   migration commits keep snapshot_taken = FALSE and are lazily snapshotted
+    #   on first read under a row lock.
     op.execute(
         """
         UPDATE automation_executions AS e
         SET llm_model = src.llm_model,
             reasoning_effort = src.reasoning_effort,
-            llm_model_system_only = src.llm_model_system_only
+            llm_model_system_only = src.llm_model_system_only,
+            snapshot_taken = TRUE
         FROM (
             SELECT
                 e0.automation_execution_id,
@@ -109,17 +114,10 @@ def upgrade() -> None:
                        AND (
                            r.metadata->>'automation_execution_id' = e0.automation_execution_id::text
                            OR r.metadata->>'automation_source_execution_id' = e0.automation_execution_id::text
+                           OR NULLIF(split_part(COALESCE(r.metadata->'automation_delivery'->>'id', ''), '.', 1), '') = e0.automation_execution_id::text
                        )
                    )
-                ORDER BY COALESCE(
-                             r.conversation_response_id = e0.conversation_response_id
-                             OR r.metadata->>'automation_execution_id' = e0.automation_execution_id::text,
-                             FALSE
-                         ) DESC,
-                         r.turn_index ASC,
-                         r.attempt_no ASC,
-                         r.run_seq ASC,
-                         r.created_at ASC
+                ORDER BY r.created_at ASC, r.run_seq ASC
                 LIMIT 1
             ) AS first_run ON TRUE
         ) AS src
@@ -132,6 +130,7 @@ def downgrade() -> None:
     op.execute(
         """
         ALTER TABLE automation_executions
+            DROP COLUMN IF EXISTS snapshot_taken,
             DROP COLUMN IF EXISTS llm_model_system_only,
             DROP COLUMN IF EXISTS reasoning_effort,
             DROP COLUMN IF EXISTS llm_model

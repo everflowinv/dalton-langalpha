@@ -821,8 +821,8 @@ async def _handle_send_message(
             on_fallback=fallback_records.append,
             on_automation_context=automation_run_ctx.update,
         )
-        # DALTON-HOOK(cos-settings-tools): HITL resume of an automation execution ignores the web composer's selected model and must not stamp it onto the thread
-        if request.hitl_response and automation_run_ctx.get("automation_source_execution_id"):
+        # DALTON-HOOK(cos-settings-tools): HITL resume and web /retry of an automation execution use the execution snapshot and must not stamp the composer's selected model onto the thread
+        if (request.hitl_response or retry_of_run_id) and automation_run_ctx.get("automation_source_execution_id"):
             named_model = None
 
         # is_byok is True only when the stamped credential_source confirms the user

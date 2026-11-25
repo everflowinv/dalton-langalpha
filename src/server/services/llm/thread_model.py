@@ -394,6 +394,7 @@ async def prepare_thread_model_switch(
     ]
     pending_sources = tuple(unique_sources[-MAX_HANDOFF_CANDIDATE_MODELS:])
 
+    # DALTON-HOOK(cos-settings-tools): attach per-run candidate_sources and source_system_only onto the switch plan
     return ThreadModelSwitchPlan(
         meta=meta,
         workspace_id=ws_id,

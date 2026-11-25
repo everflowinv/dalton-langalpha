@@ -382,8 +382,9 @@ async def test_explicit_model_retry_still_inherits_first_turn_effort_and_propaga
         resolve=resolver,
         on_automation_context=ctx.update,
     )
-    # Explicit retry model is respected while effort is still inherited from first turn
-    assert resolved == [("gpt-6.2-sol-oauth", "high")]
+    # Round 8 Decision 1: server retry linked to an execution always uses the execution's
+    # model and effort, ignoring request.llm_model.
+    assert resolved == [("claude-opus-5-5-oauth", "high")]
     assert ctx == {
         "automation_source_execution_id": EXEC_A,
         "automation_reasoning_effort_configured": True,
@@ -620,7 +621,8 @@ async def test_normal_user_retry_inherits_first_turn_effort_even_with_explicit_m
     }
     assert "automation_execution_id" not in ctx_1
 
-    # Case 2: Normal user retry WITH explicit model -> respects user model and still inherits "high" effort
+    # Case 2: Normal user retry WITH explicit model -> Round 8 Decision 1: execution snapshot wins
+    # over web composer's submitted model and effort.
     ctx_2: dict[str, Any] = {}
     await atm_mod.resolve_turn_config_with_automation_inheritance(
         user_id=USER,
@@ -639,7 +641,7 @@ async def test_normal_user_retry_inherits_first_turn_effort_even_with_explicit_m
         resolve=resolver,
         on_automation_context=ctx_2.update,
     )
-    assert resolved[-1] == ("gpt-6.2-sol-oauth", "high")
+    assert resolved[-1] == ("claude-opus-5-5-oauth", "high")
     assert ctx_2["automation_source_execution_id"] == EXEC_A
     assert "automation_execution_id" not in ctx_2
 
@@ -767,12 +769,15 @@ async def test_unattributed_legacy_wakeup_does_not_inherit_other_running_automat
         resolve=resolver,
         on_automation_context=ctx.update,
     )
-    # Must NOT inherit Automation B's "low" effort (keeps thread's "high"), and must NOT stamp
-    # automation_reasoning_effort or scheduler-owned automation_execution_id; running_thread still
-    # records automation_source_execution_id so downstream wakeups/reports trace back to the snapshot.
-    assert resolved[-1][1] == "high"
-    assert ctx == {"automation_source_execution_id": EXEC_B}
-    assert "automation_reasoning_effort" not in ctx
+    # Round 8 Decision 1: any continuation matched to an execution (including running_thread)
+    # uses the execution's model & reasoning_effort snapshot rather than the thread's effort,
+    # while never stamping scheduler-owned automation_execution_id.
+    assert resolved[-1][1] == "low"
+    assert ctx == {
+        "automation_source_execution_id": EXEC_B,
+        "automation_reasoning_effort_configured": True,
+        "automation_reasoning_effort": "low",
+    }
     assert "automation_execution_id" not in ctx
 
 

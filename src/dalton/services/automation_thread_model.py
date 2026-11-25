@@ -151,7 +151,7 @@ async def _get_execution_by_id(
     sql = """
         SELECT e.automation_execution_id, e.automation_id, e.status,
                e.conversation_thread_id, e.started_at, e.created_at,
-               e.llm_model, e.reasoning_effort, e.llm_model_system_only,
+               e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken,
                a.user_id, a.thread_strategy
         FROM automation_executions e
         JOIN automations a ON a.automation_id = e.automation_id
@@ -168,6 +168,21 @@ async def _get_execution_by_id(
             await cur.execute(sql, (execution_id,))
             row = await cur.fetchone()
             return dict(row) if row else None
+
+
+async def _hydrate_execution_snapshot(
+    exec_row: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Lazily snapshot a rolling-upgrade execution row when ``snapshot_taken`` is False."""
+    if exec_row is None or exec_row.get("snapshot_taken") is not False:
+        return exec_row
+    raw_exec_id = str(exec_row.get("automation_execution_id") or "").strip()
+    if not raw_exec_id or normalize_uuid(raw_exec_id) is None:
+        return exec_row
+    hydrated = await exec_db.ensure_execution_snapshot(raw_exec_id)
+    if hydrated is None:
+        return exec_row
+    return {**exec_row, **hydrated}
 
 
 def _response_execution_id_sql(alias: str) -> str:
@@ -191,7 +206,7 @@ async def _get_execution_for_run_id(run_id: str) -> dict[str, Any] | None:
                 f"""
                 SELECT e.automation_execution_id, e.automation_id, e.status,
                        e.conversation_thread_id, e.started_at, e.created_at,
-                       e.llm_model, e.reasoning_effort, e.llm_model_system_only,
+                       e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken,
                        a.user_id
                 FROM conversation_responses r
                 JOIN automation_executions e
@@ -262,6 +277,16 @@ async def get_run_model_and_system_only(
         )
     if exec_row is None:
         return run_model, False
+    try:
+        exec_row = await _hydrate_execution_snapshot(exec_row) or exec_row
+    except RuntimeError as exc:
+        if "pool" not in str(exc).lower():
+            raise
+    except Exception:
+        logger.debug(
+            "[AUTOMATION_THREAD_MODEL] Failed hydrating execution snapshot for run handoff",
+            exc_info=True,
+        )
     if run_model is None and exec_row.get("llm_model"):
         run_model = str(exec_row["llm_model"]).strip() or None
     return run_model, bool(exec_row.get("llm_model_system_only"))
@@ -358,7 +383,7 @@ async def _get_execution_for_command(
                 f"""
                 SELECT e.automation_execution_id, e.automation_id, e.status,
                        e.conversation_thread_id, e.started_at, e.created_at,
-                       e.llm_model, e.reasoning_effort, e.llm_model_system_only,
+                       e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken,
                        a.user_id
                 FROM command_runs cr
                 JOIN conversation_responses pr
@@ -397,7 +422,7 @@ async def _get_execution_for_task(
                 f"""
                 SELECT e.automation_execution_id, e.automation_id, e.status,
                        e.conversation_thread_id, e.started_at, e.created_at,
-                       e.llm_model, e.reasoning_effort, e.llm_model_system_only,
+                       e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken,
                        a.user_id
                 FROM subagent_runs sr
                 JOIN conversation_responses pr
@@ -800,33 +825,32 @@ async def _resolve_automation_notification_context(
     if target_exec is None:
         return None, None, None, False, False, None
 
+    try:
+        target_exec = await _hydrate_execution_snapshot(target_exec)
+    except Exception:
+        logger.warning(
+            f"[AUTOMATION_THREAD_MODEL] Failed hydrating execution snapshot "
+            f"for thread={thread_id} execution_id={target_exec.get('automation_execution_id')}",
+            exc_info=True,
+        )
+    if target_exec is None:
+        return None, None, None, False, False, None
+
     inherited_system_only = bool(target_exec.get("llm_model_system_only"))
     is_hitl_automation = match_kind == "hitl_resume_run"
     fallback_eligible = is_server_turn and match_kind in _EXPLICIT_EXECUTION_MATCH_KINDS
-    confirmed_source = fallback_eligible or match_kind in ("user_retry_run", "hitl_resume_run")
-    if confirmed_source and not fallback_eligible:
-        target_exec = {**target_exec, "_effort_source_confirmed": True}
-    if is_hitl_automation:
-        target_exec = {
-            **target_exec,
-            "_provenance_source_confirmed": True,
-            "_hitl_automation_override": True,
-        }
-    explicit_request_model = getattr(request, "llm_model", None)
-    explicit_request_effort = getattr(request, "reasoning_effort", None)
-    # HITL resumes belonging to an automation execution ALWAYS use the execution
-    # snapshot, ignoring both the web composer's submitted model/effort and the
-    # thread's stored model.
-    need_model = bool(
-        is_hitl_automation
-        or (is_server_turn and resolve_model and not explicit_request_model)
-    )
-    need_effort = bool(
-        is_hitl_automation
-        or (confirmed_source and explicit_request_effort is None)
-    )
-    if not need_model and not need_effort:
-        return target_exec, None, None, fallback_eligible, False, None
+    # Every continuation linked to an automation execution (including web /retry,
+    # HITL confirm, server retry, wakeup, report, restart resume, and running_thread)
+    # uses the execution's frozen snapshot for model, reasoning effort, and
+    # llm_model_system_only — ignoring composer inputs and thread settings.
+    target_exec = {
+        **target_exec,
+        "_effort_source_confirmed": True,
+        "_execution_snapshot_override": True,
+        **({"_provenance_source_confirmed": True, "_hitl_automation_override": True} if is_hitl_automation else {}),
+    }
+    need_model = True
+    need_effort = True
 
     exec_id = str(target_exec["automation_execution_id"])
     chosen_model: str | None = None
@@ -834,15 +858,19 @@ async def _resolve_automation_notification_context(
     effort_configured = False
     inherited_effort: str | None = None
     has_exec_snapshot = (
-        "llm_model" in target_exec or "reasoning_effort" in target_exec
+        target_exec.get("snapshot_taken") is True
+        or "llm_model" in target_exec
+        or "reasoning_effort" in target_exec
     )
+    if has_exec_snapshot:
+        target_exec = {**target_exec, "_has_exec_snapshot": True}
     if has_exec_snapshot:
         raw_snap_model = target_exec.get("llm_model")
         if need_model and raw_snap_model:
             chosen_model = str(raw_snap_model).strip() or None
             if chosen_model:
                 source = "execution_snapshot"
-        if need_effort and confirmed_source:
+        if need_effort:
             effort_configured = True
             raw_snap_effort = target_exec.get("reasoning_effort")
             inherited_effort = str(raw_snap_effort).strip() if raw_snap_effort else None
@@ -865,7 +893,7 @@ async def _resolve_automation_notification_context(
             if need_model and first_model:
                 chosen_model = first_model
                 source = "first_turn"
-            if need_effort and confirmed_source and first_effort_configured:
+            if need_effort and first_effort_configured:
                 effort_configured = True
                 inherited_effort = first_effort
 
@@ -1124,9 +1152,13 @@ async def resolve_turn_config_with_automation_inheritance(
         getattr(request, "llm_model_system_only", False)
         or (target_exec is not None and target_exec.get("llm_model_system_only"))
     )
-    is_hitl_automation = bool((target_exec or {}).get("_hitl_automation_override"))
+    use_execution_snapshot = bool(
+        target_exec is not None and target_exec.get("_execution_snapshot_override")
+    )
     confirmed_for_context = target_exec is not None and (
-        fallback_eligible or bool(target_exec.get("_effort_source_confirmed"))
+        use_execution_snapshot
+        or fallback_eligible
+        or bool(target_exec.get("_effort_source_confirmed"))
     )
     if on_automation_context is not None:
         ctx_meta: dict[str, Any] = {}
@@ -1144,11 +1176,9 @@ async def resolve_turn_config_with_automation_inheritance(
         if ctx_meta:
             on_automation_context(ctx_meta)
 
-    explicit_request_effort = getattr(request, "reasoning_effort", None)
     apply_effort_override = (
         confirmed_for_context
         and effort_configured
-        and (is_hitl_automation or explicit_request_effort is None)
         and _accepts_effort_override(resolve)
     )
     apply_system_only_override = (
@@ -1165,8 +1195,23 @@ async def resolve_turn_config_with_automation_inheritance(
     else:
         _effective_resolve = resolve
 
-    effective_requested_model = None if is_hitl_automation else requested_model
-    effective_held_model = None if is_hitl_automation else held_model
+    # Once a continuation is linked to an automation execution, its model and
+    # reasoning effort come solely from the execution snapshot — ignoring
+    # composer inputs and thread-stored model (a NULL snapshot llm_model
+    # inherits the account default model, never the thread's stored model).
+    effective_requested_model = None if use_execution_snapshot else requested_model
+    effective_held_model = (
+        None
+        if (
+            use_execution_snapshot
+            and target_exec is not None
+            and (
+                target_exec.get("_has_exec_snapshot")
+                or target_exec.get("_hitl_automation_override")
+            )
+        )
+        else held_model
+    )
 
     async def _try_subscription_fallback(
         *,

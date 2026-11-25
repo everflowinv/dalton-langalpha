@@ -989,17 +989,13 @@ async def _hand_off_config(
     if summary is None:
         return None
     meta, route = await thread_route(thread_id, user_id)
-    # DALTON-HOOK(cos-settings-tools): bind source_system_only captured from the same run instead of re-reading latest attempt
+    # DALTON-HOOK(cos-settings-tools): bind source_system_only captured from the same run; legacy candidates without snapshot metadata (None) resolve as non-system-only (False) and never borrow a newer run's flag
     resolve = await _resolver(
         user_id,
         thread_id,
         meta,
         route,
-        **(
-            {"ignore_custom_models": source_system_only}
-            if source_system_only is not None
-            else {}
-        ),
+        ignore_custom_models=bool(source_system_only),
     )
     try:
         # DALTON-HOOK(cos-settings-tools): resolve the newly switched-to model under the owner's own selection (not previous run's system-only flag)

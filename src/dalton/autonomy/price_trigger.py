@@ -655,12 +655,14 @@ async def claim_dalton_price_move_firing(
                     INSERT INTO automation_executions (
                         automation_execution_id, automation_id,
                         status, scheduled_at, server_id, created_at,
-                        heartbeat_at, llm_model, reasoning_effort, llm_model_system_only
+                        heartbeat_at, llm_model, reasoning_effort, llm_model_system_only,
+                        snapshot_taken
                     )
                     SELECT vals.execution_id, a.automation_id,
                            'pending', NOW(), vals.server_id, NOW(), NOW(),
                            a.llm_model, a.reasoning_effort,
-                           COALESCE((a.metadata->>'llm_model_system_only')::boolean, FALSE)
+                           COALESCE((a.metadata->>'llm_model_system_only')::boolean, FALSE),
+                           TRUE
                     FROM (VALUES (%s::uuid, %s::uuid, %s::text))
                         AS vals(execution_id, automation_id, server_id)
                     JOIN automations a ON a.automation_id = vals.automation_id

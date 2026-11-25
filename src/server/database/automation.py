@@ -1202,9 +1202,10 @@ async def claim_due_automations(
                         INSERT INTO automation_executions (
                             automation_execution_id, automation_id,
                             status, scheduled_at, server_id, created_at,
-                            heartbeat_at, llm_model, reasoning_effort, llm_model_system_only
+                            heartbeat_at, llm_model, reasoning_effort, llm_model_system_only,
+                            snapshot_taken
                         )
-                        VALUES (%s, %s, 'pending', %s, %s, NOW(), NOW(), %s, %s, %s)
+                        VALUES (%s, %s, 'pending', %s, %s, NOW(), NOW(), %s, %s, %s, TRUE)
                     """, (
                         execution_id,
                         automation_id,
@@ -1276,9 +1277,10 @@ async def claim_price_firing(automation_id: str, server_id: str) -> Optional[str
                     INSERT INTO automation_executions (
                         automation_execution_id, automation_id,
                         status, scheduled_at, server_id, created_at,
-                        heartbeat_at, llm_model, reasoning_effort, llm_model_system_only
+                        heartbeat_at, llm_model, reasoning_effort, llm_model_system_only,
+                        snapshot_taken
                     )
-                    VALUES (%s, %s, 'pending', NOW(), %s, NOW(), NOW(), %s, %s, %s)
+                    VALUES (%s, %s, 'pending', NOW(), %s, NOW(), NOW(), %s, %s, %s, TRUE)
                 """, (
                     execution_id,
                     automation_id,

@@ -74,17 +74,13 @@ async def inspect_hand_off(
         return "not_needed", None
     try:
         meta, route = await thread_route(thread_id, user_id)
-        # DALTON-HOOK(cos-settings-tools): bind source_system_only captured from the same run instead of re-reading latest attempt
+        # DALTON-HOOK(cos-settings-tools): bind source_system_only captured from the same run; legacy candidates without snapshot metadata (None) resolve as non-system-only (False) and never borrow a newer run's flag
         resolve = await _resolver(
             user_id,
             thread_id,
             meta,
             route,
-            **(
-                {"ignore_custom_models": source_system_only}
-                if source_system_only is not None
-                else {}
-            ),
+            ignore_custom_models=bool(source_system_only),
         )
     except Exception:
         logger.warning(f"[handoff] thread {thread_id}: switch not read", exc_info=True)

@@ -241,6 +241,7 @@ def _execution_update(
             "llm_model",  # DALTON-HOOK(cos-settings-tools)
             "reasoning_effort",  # DALTON-HOOK(cos-settings-tools)
             "llm_model_system_only",  # DALTON-HOOK(cos-settings-tools)
+            "snapshot_taken",  # DALTON-HOOK(cos-settings-tools)
         ],
         include_updated_at=False,  # no updated_at column on executions
     )
@@ -304,7 +305,15 @@ async def begin_execution_if_not_deleted(
                 await cur.execute(
                     """
                     UPDATE automation_executions e
-                    SET status = 'running', started_at = %s
+                    SET status = 'running',
+                        started_at = %s,
+                        llm_model = CASE WHEN e.snapshot_taken THEN e.llm_model ELSE a.llm_model END,
+                        reasoning_effort = CASE WHEN e.snapshot_taken THEN e.reasoning_effort ELSE a.reasoning_effort END,
+                        llm_model_system_only = CASE
+                            WHEN e.snapshot_taken THEN e.llm_model_system_only
+                            ELSE COALESCE((a.metadata->>'llm_model_system_only')::boolean, FALSE)
+                        END,
+                        snapshot_taken = TRUE
                     FROM automations a
                     WHERE e.automation_execution_id = %s
                       AND e.status = 'pending'
@@ -312,7 +321,7 @@ async def begin_execution_if_not_deleted(
                       AND a.deleted_at IS NULL
                     RETURNING e.conversation_thread_id, e.conversation_response_id,
                               e.scheduled_at, e.wait_reason, e.awaits_computer, e.checked_computer_id,
-                              e.llm_model, e.reasoning_effort, e.llm_model_system_only
+                              e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken
                     """,  # DALTON-HOOK(cos-settings-tools)
                     (started_at, execution_id),
                 )
@@ -342,7 +351,15 @@ async def begin_execution_if_not_deleted(
                             await cur.execute(
                                 f"""
                                 UPDATE automation_executions e
-                                SET status = 'running', started_at = %s
+                                SET status = 'running',
+                                    started_at = %s,
+                                    llm_model = CASE WHEN e.snapshot_taken THEN e.llm_model ELSE a.llm_model END,
+                                    reasoning_effort = CASE WHEN e.snapshot_taken THEN e.reasoning_effort ELSE a.reasoning_effort END,
+                                    llm_model_system_only = CASE
+                                        WHEN e.snapshot_taken THEN e.llm_model_system_only
+                                        ELSE COALESCE((a.metadata->>'llm_model_system_only')::boolean, FALSE)
+                                    END,
+                                    snapshot_taken = TRUE
                                 FROM automations a
                                 WHERE e.automation_execution_id = %s
                                   AND e.status = 'pending'
@@ -351,7 +368,7 @@ async def begin_execution_if_not_deleted(
                                   AND NOT ({managed_base_pred})
                                 RETURNING e.conversation_thread_id, e.conversation_response_id,
                                           e.scheduled_at, e.wait_reason, e.awaits_computer, e.checked_computer_id,
-                                          e.llm_model, e.reasoning_effort, e.llm_model_system_only,
+                                          e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken,
                                           NULL::text AS coverage_unit_id, NULL::timestamptz AS coverage_unit_version
                                 """,  # DALTON-HOOK(cos-settings-tools)
                                 (started_at, execution_id),
@@ -492,7 +509,10 @@ async def begin_execution_if_not_deleted(
                                              AND {managed_unit_pred}
                                              AND {unit_lead_expr} = {auto_owner_expr}
                                            LIMIT 1
-                                       ) AS stamp_unit_version
+                                       ) AS stamp_unit_version,
+                                       a.llm_model AS auto_llm_model,
+                                       a.reasoning_effort AS auto_reasoning_effort,
+                                       COALESCE((a.metadata->>'llm_model_system_only')::boolean, FALSE) AS auto_system_only
                                 FROM automation_executions e
                                 JOIN automations a ON a.automation_id = e.automation_id
                                 WHERE e.automation_execution_id = %s
@@ -528,24 +548,28 @@ async def begin_execution_if_not_deleted(
                                 SET status = 'running',
                                     started_at = %s,
                                     coverage_unit_id = t.stamp_unit_id,
-                                    coverage_unit_version = t.stamp_unit_version
+                                    coverage_unit_version = t.stamp_unit_version,
+                                    llm_model = CASE WHEN e.snapshot_taken THEN e.llm_model ELSE t.auto_llm_model END,
+                                    reasoning_effort = CASE WHEN e.snapshot_taken THEN e.reasoning_effort ELSE t.auto_reasoning_effort END,
+                                    llm_model_system_only = CASE WHEN e.snapshot_taken THEN e.llm_model_system_only ELSE t.auto_system_only END,
+                                    snapshot_taken = TRUE
                                 FROM target t
                                 WHERE e.automation_execution_id = t.automation_execution_id
                                   AND NOT t.ws_changed
                                   AND NOT t.reject_handoff
                                 RETURNING e.conversation_thread_id, e.conversation_response_id,
                                           e.scheduled_at, e.wait_reason, e.awaits_computer, e.checked_computer_id,
-                                          e.llm_model, e.reasoning_effort, e.llm_model_system_only,
+                                          e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken,
                                           e.coverage_unit_id, e.coverage_unit_version
                             )
                             SELECT s.conversation_thread_id, s.conversation_response_id,
                                    s.scheduled_at, s.wait_reason, s.awaits_computer, s.checked_computer_id,
-                                   s.llm_model, s.reasoning_effort, s.llm_model_system_only,
+                                   s.llm_model, s.reasoning_effort, s.llm_model_system_only, s.snapshot_taken,
                                    s.coverage_unit_id, s.coverage_unit_version,
                                    FALSE AS ws_changed
                             FROM started s
                             UNION ALL
-                            SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL::text, NULL::varchar, NULL::boolean, NULL, NULL,
+                            SELECT NULL, NULL, NULL, NULL, NULL, NULL, NULL::text, NULL::varchar, NULL::boolean, NULL::boolean, NULL, NULL,
                                    TRUE AS ws_changed
                             FROM target t
                             WHERE t.ws_changed
@@ -1373,7 +1397,7 @@ async def get_running_executions_for_thread(thread_id: str) -> List[Dict[str, An
                 SELECT e.automation_execution_id, e.automation_id, e.status,
                        e.conversation_thread_id, e.conversation_response_id,
                        e.started_at, e.created_at, e.delivery,
-                       e.llm_model, e.reasoning_effort, e.llm_model_system_only,
+                       e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken,
                        a.user_id, t.workspace_id
                 FROM automation_executions e
                 JOIN automations a ON a.automation_id = e.automation_id
@@ -1384,6 +1408,68 @@ async def get_running_executions_for_thread(thread_id: str) -> List[Dict[str, An
                 ORDER BY e.created_at ASC, e.automation_execution_id ASC
             """, (thread_id,))
             return [dict(row) for row in await cur.fetchall()]
+
+
+# DALTON-HOOK(cos-settings-tools): lazily snapshot rolling-upgrade execution rows (snapshot_taken=FALSE) under a row lock
+async def ensure_execution_snapshot(
+    execution_id: str,
+    *,
+    conn: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Ensure ``automation_executions.snapshot_taken`` is TRUE for ``execution_id``.
+
+    During a rolling upgrade window after migration ``d050`` commits and before
+    old backend instances finish draining, an old backend can insert rows whose
+    ``snapshot_taken`` defaults to ``FALSE``. On first read by the new backend,
+    this locks the execution row ``FOR UPDATE OF e`` in one transaction, copies
+    ``(llm_model, reasoning_effort, llm_model_system_only)`` from ``automations``,
+    and flips ``snapshot_taken = TRUE``; subsequent reads return the frozen
+    snapshot unchanged.
+    """
+    sql = """
+        WITH locked AS (
+            SELECT e.automation_execution_id,
+                   e.snapshot_taken,
+                   e.llm_model AS cur_llm_model,
+                   e.reasoning_effort AS cur_reasoning_effort,
+                   e.llm_model_system_only AS cur_system_only,
+                   a.llm_model AS auto_llm_model,
+                   a.reasoning_effort AS auto_reasoning_effort,
+                   COALESCE((a.metadata->>'llm_model_system_only')::boolean, FALSE) AS auto_system_only
+            FROM automation_executions e
+            JOIN automations a ON a.automation_id = e.automation_id
+            WHERE e.automation_execution_id = %s::uuid
+            FOR UPDATE OF e
+        ),
+        updated AS (
+            UPDATE automation_executions e
+            SET llm_model = l.auto_llm_model,
+                reasoning_effort = l.auto_reasoning_effort,
+                llm_model_system_only = l.auto_system_only,
+                snapshot_taken = TRUE
+            FROM locked l
+            WHERE e.automation_execution_id = l.automation_execution_id
+              AND NOT l.snapshot_taken
+            RETURNING e.llm_model, e.reasoning_effort, e.llm_model_system_only, e.snapshot_taken
+        )
+        SELECT llm_model, reasoning_effort, llm_model_system_only, snapshot_taken
+        FROM updated
+        UNION ALL
+        SELECT cur_llm_model, cur_reasoning_effort, cur_system_only, snapshot_taken
+        FROM locked
+        WHERE snapshot_taken
+    """
+    if conn is not None:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(sql, (execution_id,))
+            row = await cur.fetchone()
+            return dict(row) if row else None
+    async with get_db_connection() as own_conn:
+        async with own_conn.transaction():
+            async with own_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(sql, (execution_id,))
+                row = await cur.fetchone()
+                return dict(row) if row else None
 
 
 async def has_pending_background_work(
@@ -1902,9 +1988,10 @@ async def create_execution_for_live_parent(
                                 automation_execution_id, automation_id,
                                 status, scheduled_at, server_id, created_at,
                                 heartbeat_at, checked_computer_id,
-                                llm_model, reasoning_effort, llm_model_system_only
+                                llm_model, reasoning_effort, llm_model_system_only,
+                                snapshot_taken
                             )
-                            VALUES (%s, %s, 'pending', %s, %s, clock_timestamp(), NOW(), %s, %s, %s, %s)
+                            VALUES (%s, %s, 'pending', %s, %s, clock_timestamp(), NOW(), %s, %s, %s, %s, TRUE)
                             """,
                             (
                                 execution_id,
@@ -2002,11 +2089,13 @@ async def create_execution(
                     automation_execution_id, automation_id,
                     status, scheduled_at, server_id, created_at,
                     heartbeat_at, checked_computer_id,
-                    llm_model, reasoning_effort, llm_model_system_only
+                    llm_model, reasoning_effort, llm_model_system_only,
+                    snapshot_taken
                 )
                 SELECT %s, a.automation_id, 'pending', %s, %s, NOW(), NOW(), %s,
                        a.llm_model, a.reasoning_effort,
-                       COALESCE((a.metadata->>'llm_model_system_only')::boolean, FALSE)
+                       COALESCE((a.metadata->>'llm_model_system_only')::boolean, FALSE),
+                       TRUE
                 FROM automations a
                 WHERE a.automation_id = %s
             """, (execution_id, scheduled_at, server_id, checked_computer_id, automation_id))
