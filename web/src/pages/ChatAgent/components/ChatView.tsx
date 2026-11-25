@@ -2218,7 +2218,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 as --composer-h for the list's bottom padding and the jump pill. */}
             <div
               ref={publishComposerHeight}
-              className={`absolute inset-x-0 bottom-0 z-10 pointer-events-none ${isMobile ? 'p-3' : 'p-4'} flex justify-center`}
+              // DALTON-HOOK(mobile-web): respect iPhone Home Indicator safe-area inset on mobile floating composer
+              className={`absolute inset-x-0 bottom-0 z-10 pointer-events-none ${isMobile ? 'px-3 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))]' : 'p-4'} flex justify-center`}
             >
               {/* sibling-space-y, not space-y: SelectionChips' own margin would
                   otherwise win. */}

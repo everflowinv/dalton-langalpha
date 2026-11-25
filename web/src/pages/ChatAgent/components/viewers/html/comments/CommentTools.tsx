@@ -400,7 +400,8 @@ export function CommentTools({
         type="button"
         onClick={() => ui.setMode(tabId, !mode)}
         disabled={modeDisabled}
-        className={cn('page-comment-mode-btn press shrink-0', mode && 'is-on')}
+        // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on comment mode button
+        className={cn('page-comment-mode-btn tap-target press shrink-0', mode && 'is-on')}
         aria-pressed={mode}
         aria-keyshortcuts="C"
         // DALTON-HOOK(mobile-web): preserve accessible name when the text label hides on narrow phones
@@ -413,7 +414,8 @@ export function CommentTools({
       <button
         type="button"
         onClick={() => ui.setList(tabId, !listOpen)}
-        className="file-panel-icon-btn page-comment-list-btn shrink-0"
+        // DALTON-HOOK(mobile-web): expand coarse-pointer touch target on comment list button
+        className="file-panel-icon-btn page-comment-list-btn tap-target shrink-0"
         aria-pressed={listOpen}
         aria-label={listLabel}
         title={listLabel}

@@ -730,16 +730,28 @@
   opacity: 0.6;
 }
 
-/* DALTON-HOOK(mobile-web): keep file breadcrumb action row compact, non-overflowing, and padded enough (8px) for a 44px .tap-target::after on a 28px icon button */
+/* DALTON-HOOK(mobile-web): keep file breadcrumb action row compact, non-overflowing, and padded enough (8px vertical, 44px min-height) for a 44px .tap-target::after without overflow-x: clip clipping */
 @media (max-width: 767px) {
   .file-panel-crumbs {
     gap: 0.25rem;
-    padding: 0.125rem 0.5rem;
+    min-height: 44px;
+    padding: 0.5rem;
     min-width: 0;
     max-width: 100%;
     overflow-x: clip;
   }
   .file-panel-crumb-spacer {
     min-width: 0;
+  }
+}
+
+@media (pointer: coarse) {
+  .file-panel-crumbs {
+    min-height: 44px;
+    padding-block: 0.5rem;
+  }
+  .file-panel-crumbs .file-panel-icon-btn {
+    --tap-target-w: 30px;
+    --tap-target-h: 44px;
   }
 }

@@ -1,4 +1,5 @@
 import { api, ApiError } from '@/api/client';
+import { inferImageMimeType } from '@/pages/ChatAgent/utils/fileUpload';
 import {
   CHAT_UPLOAD_PART_SIZE,
   MAX_CHAT_UPLOAD_FILE_SIZE,
@@ -274,7 +275,7 @@ export async function uploadChatFile(
       workspace_id: workspaceId && workspaceId.trim() ? workspaceId.trim() : 'home',
       filename: file.name || 'attachment.bin',
       size_bytes: file.size,
-      mime_type: file.type || 'application/octet-stream',
+      mime_type: inferImageMimeType(file) || 'application/octet-stream',
     },
     { signal },
   );

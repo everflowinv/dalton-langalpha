@@ -403,4 +403,13 @@ p.file-panel-empty-note {
     --tap-target-w: 36px;
     --tap-target-h: 36px;
   }
+  /* DALTON-HOOK(mobile-web): space out tree toolbar buttons and clamp horizontal tap width so adjacent 26px buttons do not overlap */
+  .file-panel-tree-tools {
+    gap: 6px;
+    min-height: 44px;
+  }
+  .file-panel-tree-tools .file-panel-icon-btn {
+    --tap-target-w: 32px;
+    --tap-target-h: 44px;
+  }
 }

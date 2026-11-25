@@ -108,7 +108,8 @@ export const FileToolGroupRow = memo(function FileToolGroupRow({ items, onOpenFi
               <button
                 type="button"
                 onClick={(e) => { announceAnchoredToggle(e.currentTarget); setExpanded(!expanded); }}
-                className="inline-flex items-center shrink-0 bg-transparent border-0 p-0 cursor-pointer"
+                // DALTON-HOOK(mobile-web): expand diff chevron touch target on coarse pointers
+                className="tap-target inline-flex items-center shrink-0 bg-transparent border-0 p-0 cursor-pointer"
                 style={{ color: 'inherit', alignSelf: 'center' }}
                 aria-expanded={expanded}
                 aria-label={expanded ? t('toolArtifact:a11y.collapseDiff') : t('toolArtifact:a11y.expandDiff')}

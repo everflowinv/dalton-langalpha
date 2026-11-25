@@ -185,3 +185,16 @@
   from { opacity: 0.75; transform: scale(1); }
   to { opacity: 0; transform: scale(1.9); }
 }
+
+/* DALTON-HOOK(mobile-web): expand comment pin touch area to 44px on coarse pointers without clobbering ::before/::after */
+.page-comment-pin-hit {
+  display: none;
+}
+@media (pointer: coarse) {
+  .page-comment-pin-hit {
+    display: block;
+    position: absolute;
+    inset: 0;
+    pointer-events: auto;
+  }
+}

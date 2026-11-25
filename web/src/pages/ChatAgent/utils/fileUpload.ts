@@ -4,8 +4,23 @@ import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/
 import type { ChartSelection } from '@/pages/MarketView/stores/chartSelectionStore';
 
 /** An image by its MIME type, the server's `image` tag, or its name, for a file the browser could not type. */
+// DALTON-HOOK(mobile-web): classify iPhone .heic/.heif photos as images even when browser omits MIME type
 export function isImageFile({ type = '', name = '' }: { type?: string; name?: string }): boolean {
-  return type.startsWith('image/') || type === 'image' || /\.(jpe?g|png|gif|webp)$/i.test(name);
+  return type.startsWith('image/') || type === 'image' || /\.(jpe?g|png|gif|webp|heic|heif)$/i.test(name);
+}
+
+/** Infers an image MIME type from the filename when the browser leaves `file.type` empty (e.g. iOS/WebView `.heic`/`.heif`). */
+// DALTON-HOOK(mobile-web): preserve image/heic and image/heif MIME types when browser omits file.type
+export function inferImageMimeType({ type = '', name = '' }: { type?: string; name?: string }): string {
+  if (type) return type;
+  const lower = name.toLowerCase();
+  if (lower.endsWith('.heic')) return 'image/heic';
+  if (lower.endsWith('.heif')) return 'image/heif';
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.png')) return 'image/png';
+  return isImageFile({ type, name }) ? 'image/png' : '';
 }
 
 export interface Attachment {
@@ -170,7 +185,8 @@ export function attachmentsToContexts(attachments: Attachment[]): AttachmentCont
     }
     if (a.dataUrl != null) {
       result.push({
-        type: a.type.startsWith('image/')
+        // DALTON-HOOK(mobile-web): match attachmentSendParts by recognizing .heic/.heif filenames via isImageFile
+        type: isImageFile({ type: a.type, name: a.file.name })
           ? 'image'
           : a.type === 'application/pdf'
             ? 'pdf'

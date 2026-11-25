@@ -89,7 +89,8 @@ export function MobileNavDrawer({ visible, onMinimize, isActive, workspaceId, th
       {/* Minimize button — closes the drawer */}
       <button
         onClick={onMinimize}
-        className="nav-panel-dismiss-btn"
+        // DALTON-HOOK(mobile-web): expand mobile drawer header dismiss touch target on coarse pointers
+        className="nav-panel-dismiss-btn tap-target"
         style={{
           padding: 4,
           background: 'transparent',
