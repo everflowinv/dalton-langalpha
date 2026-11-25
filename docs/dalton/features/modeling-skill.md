@@ -9,7 +9,8 @@
 ### 1.1 技能名称与定位
 
 - **技能目录与注册标识**：`plugins/dalton/skills/dalton-model/`（注册名 `dalton-model`，斜杠命令 `/dalton-model`）。
-- **核心定位**：Dalton 建立与维护 Excel（电子表格工作簿，扩展名 `.xlsx`）财务预测模型的统一入口。当用户提供自有模型或工作区已有模型时，直接在既有模型基础上滚动维护，沿用原模型的版面、样式与公式链；当工作区尚无模型时，按本技能默认格式规范与预测规则从零搭建模型。
+- **核心定位**：Dalton 建立与维护 Excel（电子表格工作簿，扩展名 `.xlsx`）财务预测模型的统一入口。当用户提供自有模型或工作区已有模型时，直接在既有模型基础上滚动维护，沿用原模型的版面、样式与公式链；当工作区尚无模型时，按本技能默认格式与建模指引从零搭建模型。
+- **设计原则（指引优先，避免僵化代码裁决）**：不同公司的经营指标、报表正负号习惯、会计口径与财务年度结账日各不相同。建模技能的定位是**实践指引与辅助工具**，应给智能体留出结合公司实际自行判断与调节的空间，不尝试用硬编码脚本穷举所有边缘情况或阻断交付。技能仅保留四条核心硬性要求（预测期金额由驱动假设通过公式计算、季度加总年度列不放假设且比率由年度金额反算、与一致预期或卖方有重大差异时查明原因并写明理由、有用户模型时在其基础上滚动维护并保留原件），其余内容均以指引和判断依据呈现；配套脚本仅提供机械式样式辅助（`model_style.py`）与提示性只读扫描（`model_scan.py`）。
 
 ### 1.2 四类适用任务
 
@@ -25,9 +26,9 @@
 | `dalton-conventions` | `plugins/dalton/skills/dalton-conventions/` | 投研方法论总纲（含 `references/model-standards.md` 的期间跨度下限、一手财报来源台账、五层数据分类、未预测项留空规则及 `scripts/xlsx_repair.py` 损坏命名区域修复脚本）。`dalton-model` 开头先读该技能并继承其数据与空值标准，在此基础上落地具体的模型公式规则、样式画像与检查脚本。 |
 | `dalton-financial-lenses` | `plugins/dalton/skills/dalton-financial-lenses/` | 提供狭义与广义净现金、隐蔽资产、股东回报三层次指标（现金分红率 R1、总现金回报率 R2、扣除股份支付稀释后的净回报率 R3）及盈利质量计算脚本。`dalton-model` 在构建净现金计息、股份回购与股本桥接、估值净现金调整时直接采用同一口径。 |
 | `dalton-knowledge` | `plugins/dalton/skills/dalton-knowledge/` | 管理工作区结构化知识文档。`dalton-model` 执行前读取 `thesis.md`（核心论点）、`debate.md`（多空分歧）、`drivers.md`（业务驱动）与 `data/models.json`（模型版本台账），交付新版本模型后调用 `knowledge_update(doc="models", ...)` 登记模型路径与核心输出单元格。 |
-| `dalton-earnings-deep` | `plugins/dalton/skills/dalton-earnings-deep/`（及 `workflows/earnings-deep-update/`） | 财报后八节深度点评与模型更新工作流。第 2 批接入后，其模型更新支线与审稿后模型修订统一调用 `dalton-model` 执行滚动更新与 `style_audit.py --strict` 校验，继续产出原有的映射表 `mapping.md`、`Change Log` 与盈利变动拆解 `model-delta.md`。 |
-| `dalton-full-coverage` | `plugins/dalton/skills/dalton-full-coverage/`（及 `workflows/full-coverage/`） | 买方完整覆盖工作流。第 2 批接入后，工作区已有用户模型时由 `dalton-model` 在原模型基础上滚动补齐期间及 `Facts`、`Guidance vs Actual`、`Street vs House`、`Checks` 表；尚无模型时按 15 页规格新建并统一采用 `dalton-model` 的样式库与 `style_audit.py --strict` 校验。 |
-| 上游 `xlsx` | `plugins/langalpha_deliverables/skills/xlsx/` | 底层电子表格操作组件。`dalton-model` 复用其 `scripts/recalc.py`（公式重算与缓存值回写）、`scripts/insert.py`（在输出副本上插入或删除行列并重指公式、命名区域与图表引用）、`scripts/render.py`（导出图片核对版面）和 `scripts/profile.py`（原始数据表探查）；样式写入与检查统一使用 `dalton-model` 自带的 `model_style.py` 与 `style_audit.py`。 |
+| `dalton-earnings-deep` | `plugins/dalton/skills/dalton-earnings-deep/`（及 `workflows/earnings-deep-update/`） | 财报后八节深度点评与模型更新工作流。第 2 批接入后，其模型更新支线与审稿后模型修订统一调用 `dalton-model` 执行滚动更新与 `model_scan.py --recalc` 提示性扫描，继续产出原有的映射表 `mapping.md`、`Change Log` 与盈利变动拆解 `model-delta.md`。 |
+| `dalton-full-coverage` | `plugins/dalton/skills/dalton-full-coverage/`（及 `workflows/full-coverage/`） | 买方完整覆盖工作流。第 2 批接入后，工作区已有用户模型时由 `dalton-model` 在原模型基础上滚动补齐期间及 `Facts`、`Guidance vs Actual`、`Street vs House`、`Checks` 表；尚无模型时按 15 页规格新建并统一采用 `dalton-model` 的样式库与 `model_scan.py --recalc` 提示性扫描。 |
+| 上游 `xlsx` | `plugins/langalpha_deliverables/skills/xlsx/` | 底层电子表格操作组件。`dalton-model` 复用其 `scripts/recalc.py`（公式重算与缓存值回写）、`scripts/insert.py`（在输出副本上插入或删除行列并重指公式、命名区域与图表引用）、`scripts/render.py`（导出图片核对版面）和 `scripts/profile.py`（原始数据表探查）；样式辅助与提示性扫描使用 `dalton-model` 自带的 `model_style.py` 与 `model_scan.py`。 |
 | 上游 `model-update` / `3-statements` / `dcf-model` / `check-model` | `plugins/langalpha_research/skills/` | 注册在上游 `src/ptc_agent/agent/middleware/skills/registry.py`，不在 `src/ptc_agent/agent/middleware/skills/dalton_registry.py` 的 `SUPERSEDED_UPSTREAM_SKILLS` 集合中（保留在上游注册表且不加入 `SUPERSEDED_UPSTREAM_SKILLS`，供三表勾稽、自由现金流折现估值 `DCF`〔Discounted Cash Flow〕及只读核查的来源台账与报告格式按路径读取）；Dalton 工作区内的公司与行业建模、滚动更新和修订统一路由至 `dalton-model`。 |
 
 ---
@@ -46,37 +47,29 @@ plugins/dalton/skills/dalton-model/
 │   └── sanity-check.md
 └── scripts/
     ├── model_style.py
-    └── style_audit.py
+    └── model_scan.py
 ```
 
-### 2.1 `SKILL.md`（入口规程与八步执行顺序）
+### 2.1 `SKILL.md`（入口指引、四条硬性要求与常见步骤）
 
-- **YAML（配置文件标记格式）头部元数据**：`name: dalton-model`；中文 `description` 写明支持在用户现有 Excel 模型上滚动维护、财报后更新实际值、新建单公司或行业多公司财务预测模型及只读合理性核查。
-- **前置读取顺序**：首段固定写明 `Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable.`（一致预期取数工具统一按本文第 6.1 节执行）；公司工作区依次读取 `agent.md` → `thesis.md` → `debate.md` → `drivers.md` → `data/models.json`，行业工作区先读 `sector.md` 与 `data/models.json`。
-- **模式分流与损坏修复**：检查 `data/models.json`、`model/`（及历史 `models/`）和 `sources/`，确定进入「存量模型滚动维护」「从零新建模型」或「只读核查」；进入只读核查时，先对原件运行静态检查 `style_audit.py --static-only`（原件无外链且需核对计算缓存时，复制临时副本运行重算并检查副本，原件保持只读）；当 `openpyxl`（读写 `.xlsx` 文件的 Python 库）因损坏命名区域报错时，先调用 `.agents/skills/dalton-conventions/scripts/xlsx_repair.py` 生成修复副本。
-- **建模与更新八步执行顺序**：
-  1. **锁定基准与目标路径**：通过共用版本解析（规则见第 7.1–7.2 节）确定实际输入底稿与 `model/` 下递增版本号输出路径，计算输入底稿 `SHA-256`（安全哈希摘要值），在当次任务目录 `research/<YYYY-MM-DD>-model-<动作>/` 写入谱系记录 `model_lineage.json`（按输出文件绑定实际输入文件、输入哈希与样式配置）；
-  2. **提取样式画像与期间映射**：存量维护时对原底稿运行 `scripts/model_style.py profile <原模型.xlsx> --out <任务目录>/style_profile.json`；新建模型时加载默认样式配置；
-  3. **输出映射与结构清单**：列出期间扩展列位、预测转实际行项、登记留空的未预测行项、分部口径对账关系及待替换外部插件公式清单（季报更新时同步写入 `mapping.md`）；
-  4. **生成新版本工作簿**：在任务目录下保存可重复执行的构建或更新脚本，按第 4.3 节安全写入方式输出新版本 `.xlsx` 文件（原底稿保持字节级只读）；
-  5. **全表公式重算**：对新版本工作簿运行 `.agents/skills/xlsx/scripts/recalc.py <新模型.xlsx>`，解析输出 JSON（JavaScript Object Notation，结构化数据交换格式）直至 `status == "success"`；
-  6. **静态与勾稽检查**：运行 `.agents/skills/dalton-model/scripts/style_audit.py <新模型.xlsx> --strict`（存量维护传入 `--baseline <原模型.xlsx> --profile <style_profile.json>`），按第 5.3 节交付规则达到通过标准；
-  7. **渲染版面抽查**：调用 `.agents/skills/xlsx/scripts/render.py` 导出核心表图片，核对列宽、对齐、大纲分组与数字完整显示；
-  8. **登记知识层与交付**：写入输出模型哈希并校验原底稿哈希未变，调用 `knowledge_update(doc="models", ...)` 登记新模型版本与规范化期间后的核心输出格，向用户交付模型路径、关键财务预测表、一致预期差异拆解及原表硬编码修复清单（如有）。
+- **YAML（配置文件标记格式）头部元数据**：`name: dalton-model`；中文 `description` 写明支持在用户现有 Excel 模型上滚动维护、财报披露后更新实际值、新建单公司或行业财务预测模型及只读核查，提供建模指引、样式读取辅助与提示性扫描工具。
+- **前置读取顺序**：首段固定写明 `Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable.`（一致预期取数工具统一按 `references/sanity-check.md` 执行）；公司工作区依次读取 `agent.md` → `thesis.md` → `debate.md` → `drivers.md` → `data/models.json`，行业工作区先读 `sector.md` 与 `data/models.json`。
+- **四条硬性要求与指引定位**：显式列出四条硬性要求及其原因（预测金额由驱动假设通过公式计算；季度加总年不放假设、比率由年度金额反算；与一致预期或卖方重大差异查明原因并写明理由；有用户模型时在其基础上滚动维护、沿用格式并保留原件），说明其余建模与格式内容作为指引由智能体结合公司实际灵活判断。
+- **常见执行步骤**：确定起点与副本路径（损坏命名区域先用 `xlsx_repair.py` 修复副本）→ 运行 `model_style.py profile` 提取原表样式画像（失败时退回默认）并按需用 `model_scan.py` 预扫原件 → 在输出副本上使用上游 `xlsx/scripts/insert.py` 扩列、替换外链与插件公式 → 运行 `xlsx/scripts/recalc.py` 重算并运行 `model_scan.py --recalc` 获取核对提示，由智能体逐条判断（确认是问题就改，认为不是问题的在变更记录里写一句原因）→ 用 `model_style.py lineage` 留存普通的 `model_lineage.json` 记录并调用 `knowledge_update(doc="models", ...)` 交付。
 
-### 2.2 `references/` 四份细则参考文档职责
+### 2.2 `references/` 四份细则指引文档职责
 
-| 文件路径 | 按需读取时机 | 承载内容（细则见本文对应章节） |
+| 文件路径 | 按需读取时机 | 承载内容 |
 |---|---|---|
-| `references/format-spec.md` | 新建模型或修改存量模型样式时 | 默认样式常量表、主题色与色调还原算法、存量模型按表与子区块画像规则、多维组合样式判定（见第 4.1–4.2 节）。 |
-| `references/forecast-rules.md` | 设计预测逻辑、分部拆解与三表勾稽时 | 期间映射、季度加总年五类行公式与行属性判定顺序、分部改口径对账、经营指标挂钩、无循环利息与股本滚存、未预测项留空、四类单元格角色判定顺序与常数识别、汇总表规格（见第 3.1–3.8 节）。 |
-| `references/rollforward.md` | 在存量模型上扩列、填季报或清理插件公式时 | 输出副本 `insert.py` 扩列与求和区间重建、预测转实际切换、外部插件与外链抽离替换、保留扩展部件的包级 XML（Extensible Markup Language，可扩展标记语言）写入方法（见第 4.3 节、第 7 章）。 |
-| `references/sanity-check.md` | 执行一致预期对账、差异归因与内部勾稽复核时 | 双形态能力门控下的取数工具、口径对齐清单、可比期间重大差异归因与未解释差额列示、模型内理由写入位置、五大恒等式与 `Checks` 页规范（见第 5.2 节、第 6 章）。 |
+| `references/format-spec.md` | 新建模型或读取存量模型样式时 | 新建模型的常用默认样式常量、存量模型样式画像提取与沿用方式（失败退回默认）、常见版面与数字格式习惯。 |
+| `references/forecast-rules.md` | 设计预测逻辑、分部拆解与报表勾稽时 | 好模型的特征与常见例子、期间与非自然年财季处理、加总年常见写法、驱动假设示例、分部/利息/股本/三表/现金流/汇总表的判断依据。 |
+| `references/rollforward.md` | 在存量模型上扩列、填季报或处理外链时 | 原件只读与副本操作、双目录选择、上游 `insert.py` 与 `recalc.py` 使用注意点、外链与插件函数替换、普通 `model_lineage.json` 记录。 |
+| `references/sanity-check.md` | 执行一致预期对账、内部勾稽与扫描复核时 | 双形态能力门控下的取数指引、重大差异归因与理由写入位置、常见内部勾稽核对点及 `model_scan.py` 提示项的处理方式。 |
 
 ### 2.3 `scripts/` 两个确定性脚本职责
 
-- **`scripts/model_style.py`**：提供默认样式常量、共用财务期间解析器 `build_period_map`、主题色还原器、存量模型画像提取器 `profile_workbook_style`（CLI〔Command-Line Interface，命令行接口〕子命令 `profile`）、按角色写入单元格辅助函数、相邻期间列样式克隆函数 `clone_period_column_style` 及保留未知 XML 部件的补丁写入工具。
-- **`scripts/style_audit.py`**：独立命令行与可导入检查器，复用 `model_style.py` 的期间映射与角色分类器，执行重算缓存与公式断链检查、循环引用检测、原模型公式保留率比对、季度加总年检查、基于画像的样式检查及五大恒等式勾稽核验（详见第 5 章）。
+- **`scripts/model_style.py`**：纯机械辅助工具，提供默认样式常量、主题色加色调还原器、存量模型按表与区块样式画像提取（失败退回默认）、单元格默认样式写入 `apply_cell_style`、相邻期间列样式克隆 `clone_period_column_style`、知识层期间归一化 `normalize_period_for_knowledge` 及普通的 `model_lineage.json` 台账记录器（不做强制校验）。结构扩列与公式重算直接使用上游 `xlsx` 技能的 `insert.py` 与 `recalc.py`。
+- **`scripts/model_scan.py`**：只读提示性扫描器，列出四类值得核对的单元格及原因，输出 JSON 与简短摘要，退出码仅区分扫描成功（`0`）与扫描本身出错（`1`），不做对错裁决也不阻断交付（详见第 5 章）。
 
 ---
 
@@ -89,8 +82,8 @@ plugins/dalton/skills/dalton-model/
 - **期间跨度标准**：
   1. **逐季与年度跨度**：本财年尚未披露的剩余季度与下一完整财年的四个季度全部做逐季预测（例如最新已披露季为 `3Q26` 时，逐季预测覆盖 `4Q26E` 及 `1Q27E`–`4Q27E`）；年度预测至少覆盖本财年与下两个完整财年（如 `2026E`、`2027E`、`2028E`）。历史年度（自 `FY2018` 或招股书最早完整财年起）与历史单季（至少自 `2024Q1` 起）完整保留，只向后新增期间列。
   2. **工作表列头与知识层期间转换**：存量模型滚动维护时，**列头直接沿用原模型的期间写法**（如历史写 `2025`、`3Q26`、`2026Q2`，预测写 `2026E`、`4Q26E`、`2026Q3E`），保持全书一致，无需改成带 `FY` 或 `A` 的格式；非 12 月底结账的公司在表头旁或 `A2` 注明财年截止月（如 3 月底结账）。调用 `knowledge_update(doc="models", ...)` 登记 `key_outputs` 时，按 `src/dalton/knowledge/schemas/common.schema.json` 的 `period` 正则转换：将 `2026` / `2026E` / `2026F` 转为 `FY2026`，将 `4Q26E` / `2026Q4E` 转为 `4Q26`；对复合年增长率（`CAGR`〔Compound Annual Growth Rate〕）列等无法匹配该正则的列，省略非必填的 `period` 字段。
-- **画像与审计共用的期间映射（`PeriodMap`）**：
-  `model_style.py` 与 `style_audit.py` 调用同一函数 `build_period_map(ws)` 按工作表及表内子区块表头行（如主表第 1 行、子业务表第 60 行子表头）构建列级期间映射，统一处理四类情形：
+- **期间映射与非自然年财季指引**：
+  阅读与维护工作表时，结合表头与子区块表头行（如主表第 1 行、子业务表第 60 行子表头）区分四类常见情形：
   1. **财季归属与财年绑定**：每个财年对应的四个财季由公司财年截止日、主副表头文本和登记的列身份确定，不从待检查的 `SUM` 公式反推。例如 3 月底结账公司在 `Model - BABA` 中，财年列 `2027E` 对应 `2Q26E`–`1Q27E` 四个财季列；跨自然年的财季求和（`2027E = SUM(2Q26E:1Q27E)`）在 `PeriodMap` 下属于标准同财年对应，不算错期。
   2. **重复期间标签消歧与列身份保留**：同一表头行出现重复标签时（如 `Subs - JD!R1/S1` 两个 `2026E`，分别承接不同口径或明细列），结合子标题、口径说明、所属业务区块或跨表引用关系保存**可跨插列识别的列身份**（而非仅依赖列字母），并在扩列后的新旧版本公式比较与加总核对中持续使用该列身份。
   3. **实际列与预测列统一判定**：同时识别不带后缀的历史列（`2025`、`3Q26`、`2026Q2`）、带 `A` 后缀的历史列（`2025A`、`FY25A`、`3Q26A`），以及带 `E`、`F`、`P` 后缀的预测列（`2026E`、`2026F`、`2026P`、`4Q26E`、`2026Q4F`）。
@@ -162,7 +155,7 @@ plugins/dalton/skills/dalton-model/
 
 ### 3.7 四类单元格角色判定顺序、合法假设公式与常数识别规则
 
-为确保样式画像（`model_style.py`）与合规检查（`style_audit.py`）判定完全一致，**单元格角色判定遵循固定顺序：先按行项用途和所在期间列确定属于结果格还是假设格，再看单元格样式是否符合该角色**。涂成假设样式的硬编码金额，只要处在财务结果行与预测期间列，仍判为结果格硬编码（`forecast_amount_hardcode`）。工作簿内每个单元格明确归入以下**四类角色**之一：
+工作簿内单元格按用途常见归入以下**四类角色**之一，由智能体结合公司与区块语境判断（仅预测期财务结果金额必须由驱动假设通过公式计算）：
 
 | 单元格角色 | 涵盖范围（先按行项用途与期间确定） | 预测期允许的内容与样式要求（再核对样式） |
 |---|---|---|
@@ -272,116 +265,40 @@ plugins/dalton/skills/dalton-model/
 
 ---
 
-## 5. 模型静态与勾稽检查脚本设计（`style_audit.py`）
+## 5. 模型提示性扫描脚本设计（`model_scan.py`）
 
-`dalton-model` 自带专用检查脚本 `plugins/dalton/skills/dalton-model/scripts/style_audit.py`，保持上游 `plugins/langalpha_deliverables/skills/xlsx/scripts/audit.py` 不改动。上游 `audit.py` 会将合法相对假设公式（如 `=R138+0.3%`、`=P9-8%`）中的增量判为 `formula_hardcode`（`fail`）、将券商样例中的 `veryHidden` 缓存页 `_CIQHiddenCacheSheet` 判为 `hidden_sheet`（`fail`，电商样例的 `hidden` 同名页判为 `warn`）、并对蓝字假设公式与采用右侧红字备注列而未写单元格批注的蓝字输入报 `warn`；`style_audit.py` 按本规范精准识别上述合法结构。
+`dalton-model` 配备只读提示性扫描脚本 `plugins/dalton/skills/dalton-model/scripts/model_scan.py`，保持上游 `plugins/langalpha_deliverables/skills/xlsx/scripts/audit.py` 不改动。鉴于不同公司的指标口径、正负号习惯和财年结账日各异，本脚本不试图用硬代码替分析师作对错裁决，也不设 `--strict`、`fail/block` 或 `delivery_decision` 阻断门禁，而是把「值得核对的单元格与原因」整理成结构化提示，交由智能体逐条判断。
 
-### 5.1 命令行接口、重算与审计顺序及基准约束
+### 5.1 命令行接口与退出码
 
 ```bash
-python .agents/skills/dalton-model/scripts/style_audit.py <model.xlsx> \
-  [--static-only] \
-  [--strict] \
+python .agents/skills/dalton-model/scripts/model_scan.py <workbook.xlsx> \
   [--sheet "<工作表名>"] \
-  [--baseline <修改前原模型.xlsx>] \
-  [--profile <原模型提取的style_profile.json>]
+  [--recalc] \
+  [--max-items 50]
 ```
 
-- **重算与审计的执行顺序**：
-  1. **重算前静态检查入口（`--static-only`）**：直接读取工作簿结构与公式文本，先报告外部链接、插件函数（`external_or_plugin_link`）、断裂引用（`broken_formula_ref`）、循环引用（`circular_reference`）以及静态公式纪律与样式问题（跳过依赖重算缓存的检查项）。对含外链的原件（如券商样例含 50 个外链部件，`recalc.py` 默认拒绝重算）走静态检查入口，不直接重算，原件保持只读；
-  2. **重算后全量检查（默认模式）**：交付新版本模型时，先对 `<新模型.xlsx>` 运行 `.agents/skills/xlsx/scripts/recalc.py <新模型.xlsx>`，确认输出 JSON 中 **`status == "success"`**（`total_errors == 0` 且 `unmatched == 0`；`recalc.py` 在 `status == "errors_found"` 时退出码仍为 `0`，调用方必须解析 JSON `status` 字段），再运行全量 `style_audit.py --strict`。对不含外链的只读原件需要核对计算结果时，先复制临时副本重算并检查副本的缓存，原件保持只读；工作流阶段 4 的只读审查直接检查前序阶段已重算的交付模型。
-- **审计基准防自污染约束**：
-  - **存量模型维护与修订**：按共用版本解析（第 7.2 节）传入实际采用的输入原件 `--baseline <原模型.xlsx>`（及预先生成的 `--profile <style_profile.json>`；传入 `--baseline` 未传 `--profile` 时，脚本自动从 `--baseline` 原模型提取 `StyleProfile`），同时执行原公式保留率比对与原表样式核验；
-  - **从零新建模型**：不传 `--baseline` 与 `--profile`，脚本固定采用第 4.1 节默认样式常量检查；
-  - **样式画像来源固定为修改前的原模型或预生成配置**，确保当次误写入的外来模板配色或错误字号都能被准确检出。
-- **`--strict` 模式**：将核心格式与汇总链接项（`foreign_template_style`、新增/修改区的 `assumption_cell_style`、`formula_number_format`、`summary_table_links`）由 `warn` 提升为 `fail`；`FAIL`、`WARN`、`N/A` 对交付的影响及退出码规则统一见第 5.3 节。
+- **只读与副本重算**：默认读取工作簿公式、样式与现有缓存值，原件始终保持字节级只读。传入 `--recalc` 时，将工作簿复制到临时目录后调用上游 `.agents/skills/xlsx/scripts/recalc.py` 重算临时副本并汇报公式错误值（若原件含外部链接，则自动记录提示并跳过重算，原件不受影响）。
+- **退出码规则**：
+  - `0`：扫描正常完成（无论检出多少条核对提示，均不因发现提示项而返回非零退出码）；
+  - `1`：仅当扫描本身出错（文件不存在、参数错误、工作簿损坏无法打开或指定的 `--sheet` 不存在）。
 
-### 5.2 检查项清单、恒等式勾稽与 `Checks` 页规格
+### 5.2 四类提示项
 
-| 类别 | 检查项代号（`check`） | 默认级别（`--strict` 级别） | 检查内容与判定规则 |
-|---|---|---|---|
-| **基础与重算** | `external_or_plugin_link` | `fail` (`fail`) | 分四层检查外部依赖：（1）`.xlsx` 包内残留 `xl/externalLinks/*.xml` 部件、`workbook.xml` 的 `<externalReference>`、`workbook.xml.rels` 的 `externalLink` 关系或 `[Content_Types].xml` 外链声明；（2）工作簿级或工作表级命名区域（`definedNames`）指向外部工作簿；（3）单元格公式含 `[Book.xlsx]Sheet!A1` 外部引用；（4）公式含 `_xll.ciqfunctions`、`CIQ`、`BQL`、`BDH`、`BDP`（Bloomberg Data Point，彭博单点取数函数）、`RTD`（RealTimeData，Excel 实时数据函数）、`WEBSERVICE`（网页请求函数）等外部插件函数。 |
-| **基础与重算** | `broken_formula_ref` | `fail` (`fail`) | 用公式词法解析器扫描全书公式文本与命名区域表达式，检出公式内部含 `#REF!` 断裂引用词元——**即使外层套了 `IFERROR(...,"")` 或 `IFNA(...)` 使缓存值看似正常（如电商样例 `Peers!I36` 的 `=IFERROR(#REF!/I16-1,"")`），仍直接判 `fail`**。 |
-| **基础与重算** | `cached_error` | `fail` (`fail`) | 重算后单元格缓存值为任一 Excel 错误值：`#DIV/0!`、`#REF!`、`#NAME?`、`#VALUE!`、`#N/A`、`#NUM!`、`#NULL!`、`#SPILL!`、`#CALC!` 或 `#ERROR!`（`--static-only` 模式下跳过）。 |
-| **基础与重算** | `circular_reference` | `fail` (`fail`) | 独立循环引用检查：（1）工作簿开启了迭代计算（`wb.calculation.iterate == True`）；或（2）全工作簿公式有向依赖图检出任一同表或跨表强连通环路（输出完整单元格环路链）。 |
-| **基础与重算** | `unrecalculated` | `fail` (`fail`) | 结果应为数值或状态的公式单元格缓存值为 `None`（未经过 `recalc.py` 成功重算；`--static-only` 模式下跳过）。 |
-| **基础与重算** | `hidden_sheet_referenced` | `warn` (`warn`) | 可见页活动公式引用了 `hidden` 或 `veryHidden` 工作表；未被任何活动公式引用的历史遗留缓存页（无论 `hidden` 还是 `veryHidden`，如两本样例中的 `_CIQHiddenCacheSheet`）仅记 `info`。 |
-| **格式规范** | `foreign_template_style` | `warn` (`fail`) | 新增或修改区域出现原模型 `StyleProfile`（新建模型为 4.1 节默认表）之外的外来模板底色（如 `1F4E79`、`D9E1F2`、`F2F2F2`、`BDD7EE`）或偏离该页画像主字号的单元格（存量页如 `Futu>>` 原生 11pt 按其单页 `sheet_overrides` 核验）。 |
-| **格式规范** | `font_family` | `warn` (`warn`) | 非空单元格字体不在有效 `StyleProfile` 允许的字体集合（默认 `Arial`、`等线`）内。 |
-| **格式规范** | `actual_font_color` | `warn` (`warn`) | 历史期间列中的一手披露实际数值（排除表头、子区块表头与已套历史估算底色的单元格）字色（含 `theme+tint` 还原后色值）与有效 `StyleProfile` 的实际值字色（默认 `0000FF`）不符。 |
-| **格式规范** | `assumption_cell_style` | `warn` (`fail` 针对新增/修改区) | 非加总预测列中的 `driver_assumption` 单元格未完整套用有效 `StyleProfile` 规定的假设字色、假设底色与边框（默认 `0000FF` + `FFFFC8` + 四边 `hair`），或百分比类假设未设斜体；历史估算格与有效 `StyleProfile` 的历史估算样式（`EDEDED` 或 `FFFFC8`）比对。 |
-| **格式规范** | `formula_font_color` | `warn` (`warn`) | `financial_output` 公式单元格字色检查：跨表链接公式未使用有效画像的跨表链接色（默认 `008000`），或同表结果公式误用蓝字/红字（`color=None`、`000000` 与 `theme=1, tint=0` 均识别为黑色；**已套假设样式或历史估算样式的四类合法蓝字假设公式豁免**；`--baseline` 下未改动历史列原有的蓝字汇总习惯豁免）。 |
-| **格式规范** | `derived_ratio_italic` | `warn` (`warn`) | `financial_output` 中的衍生比率公式未设斜体（**允许跨表链接绿字 `008000` 与衍生比率斜体同时生效**）。 |
-| **格式规范** | `formula_number_format` | `warn` (`fail`) | 数值结果公式格处于 `General` 未格式化状态，或新增/修改列数字格式串与同行既有期间列不一致。 |
-| **格式规范** | `layout_and_grouping` | `warn` (`warn`) | 对新建工作簿及存量工作簿的新增/修改区域核查：网格线是否关闭、期间列顺序是否符合该页年度—`CAGR`—季度排布、滑出近期窗口的早年列是否设置大纲分组折叠、分节条颜色与列宽是否符合该页画像、冻结窗格是否保留原冻结行并位于近期季度附近。 |
-| **公式纪律** | `forecast_amount_hardcode` | `fail` (`fail`) | 按第 3.7 节判定顺序，预测期间列（支持 `E`/`F`/`P` 后缀，由共用 `PeriodMap` 判定）中按行项用途确定为 **`financial_output`（财务结果）** 的单元格被填入数值常数（**涂成假设样式的硬编码金额仍判为结果格硬编码**；`driver_assumption` 常数与已标注的 `external_input` 正常放行）。 |
-| **公式纪律** | `formula_regression_vs_baseline` | `fail` (`fail`) | 传入 `--baseline` 时，按 **`(工作表名, 分部/区块路径, 行项规范标识, PeriodMap 列身份与规范化财务期间)`** 四元组建立原模型与新模型的语义映射（保留重复表头如 `Subs - JD!R1/S1` 可跨插列识别的列身份）：<br/>• **合法转换放行**：（1）新披露财报季度的**预测转实际**（原预测期如 `3Q26E` 在新模型变为实际期 `3Q26`/`3Q26A`，填蓝字披露数并附来源说明）；（2）**外部插件或外链标准替换**（原插件/外链格改写为引用独立带来源输入格的标准公式）；（3）在 `README & Changelog` 或 `mapping.md` 显式登记的已确认废止分部行；（4）**在 `mapping.md` 或 `README & Changelog` 登记的未预测留空（写明工作表、行项、期间、原因）**。<br/>• **违规退化拦截**：对在新模型中**仍属预测期**的对应行项与期间，检出以下任一情形即判 `fail`：（1）行项或期间缺失；（2）公式退化为数值常数；（3）未登记的空白格；（4）变为文本字符串；（5）引用错期（错期只按 `PeriodMap` 判定，3 月底结账公司的跨自然年财季求和如 `2027E = SUM(2Q26E:1Q27E)` 不算错期）。 |
-| **公式纪律** | `summed_year_violation` | `fail` (`fail`) | **季度加总年专项检查**（基于独立 `PeriodMap` 财季归属，行属性按「期间列 → 公式结构 → 标签」顺序判定）：（1）流量金额行非对应四个财季的 `SUM` 或四格相加公式（四格相加与 `SUM` 等价）；（2）时点余额行非引用对应第四季度 `=Q4`；（3）加权股本行非 `AVERAGE(Q1:Q4)` 或 `=Q4`；（4）**`EPS`/`EPADS` 单列核验**：非「年度净利润 ÷ 年度加权股数」或「四季 `EPS`/`EPADS` 之和（`SUM` 或四格相加）」（这两种写法都合法）；（5）衍生比率行未由该年度列自身金额单元格反算，或加总年任一结果行残留常数、相对假设公式或假设底色。 |
-| **公式纪律** | `formula_hidden_literal` | `fail` (`fail`) | `financial_output` 结果公式内部夹带无换算用途的业务常数（含直接乘除加减数字如 `=E10*2`、`=E10*1.15` 及 **`IF` 分支返回的固定金额常数**）。按第 3.7 节规则放行引用可比历史或同期反算指标的四类驱动假设公式（如 `Model - Futu!P35 =P9-8%`、`Model - JD!BI157 =BE157`、`Model - JD!Q272 =P272+0.05%`）及五类结构性换算与容差常数。 |
-| **公式纪律** | `formula_literal` | `fail` (`fail`) | `financial_output` 单元格公式内容仅为裸常数（如 `=0`、`=500`）；**已套假设样式并在备注列写明零值证据的驱动输入格填 `0`（或假设格 `=0`）予以放行**。 |
-| **公式纪律** | `ambiguous_cell_role` | `info` / `warn` | 单元格样式与已判定角色冲突，或行属性按「期间列 → 公式结构 → 标签」顺序核对时互相对不上，统一列入待核对清单（`warn`），不直接判 `fail`。 |
-| **恒等式与勾稽** | `checks_sheet_rollup` | `fail` (`fail`) | 按下方「`Checks` 工作表规格」核验必检项完整性、动态公式、状态值闭集、缓存已计算及 `Overall` 汇总范围，并独立重算登记单元格差额（验收要点见第 9.3 节）；**缺失检查项（`missing_checks`）、未重算空缓存（`uncalculated_checks`）、写死静态状态或未覆盖全部检查行的汇总公式（`static_or_partial_rollup`）与实际勾稽不平（`check_failed_or_unexplained`）分开独立报告**。 |
-| **恒等式与勾稽** | `annual_quarters_tieout` | `fail` (`fail`) | 恒等式 1：同表具备四个对应财季列的年度列，核心流量行缓存值满足 `|年度值 − 四财季之和| ≤ max(0.5, 1e-4 × |年度值|)`，时点余额行等于第四季度值（已在 `Checks` 页登记为早期未重述历史口径差异 `WARN` 并附说明的旧历史年按第 5.3 节规则处理）。 |
-| **恒等式与勾稽** | `segment_op_tieout` | `fail` (`fail`) | 恒等式 2：优先读取 `Checks` 页登记的分部汇总行与集团汇总行配对（未登记且表内存在多行同名利润行无法唯一配对时报 `warn` 提示补充登记），可比预测期逐期验证 `集团收入/营业利润 == Σ分部 + 未分配总部项 + 分部间抵销`。 |
-| **恒等式与勾稽** | `cash_debt_share_rollforward` | `fail` (`fail`) | 恒等式 3（现金、有息债与期末股数滚存）：逐个预测期验证（1）`期末现金 == 期初现金 + 当期净现金变动（OCF − CapEx − 分红 − 回购 + 净融资及其他现金流）`；（2）预测债务时 `期末有息债 == 期初有息债 + 新增债务 − 偿还/转股`；（3）`期末总股数 == 期初总股数 + 股权激励增发股数 − 回购注销股数`（校验变动方向与回购金额 ÷ 回购均价一致），且 `EPS` 分母引用加权平均稀释股数行（跨期期初衔接与三表联动验收见第 9.3 节）。 |
-| **恒等式与勾稽** | `balance_sheet_tieout` | `fail` (`fail`) | 恒等式 4：包含完整预测资产负债表的工作表，逐期验证 `|总资产 − (总负债 + 股东权益)| < 0.05`。 |
-| **恒等式与勾稽** | `implied_rate_diagnostics` | `warn` (`warn`) | 逐期计算预测期隐含年化存款收益率与借款利率：（1）**与该公司自身历史期同口径反算出的隐含利率区间 `[hist_min, hist_max]` 比较**，偏离历史区间上下沿超过合理市场利差变动带（默认 150 个基点）时报 `warn`，在 `Checks` 页 D 列说明利率变动原因；（2）固定宽区间（`< 0%` 或 `> 20%`）专门用于捕捉千倍单位错配或分母引错行，单独标记为 `unit_or_row_mismatch_suspect`。 |
-| **恒等式与勾稽** | `summary_table_links` | `warn` (`fail`) | 检验汇总表是否同时包含收入与 `EPS`/`EPADS` 的年度及季度预测序列，且每个单元格均为公式并准确指向底层计算页对应指标与同一期间列。 |
+每条提示均附带 `sheet`（工作表）、`cell`（单元格坐标）与 `reason`（提示原因），供智能体逐条判断：
 
-**`Checks` 工作表必检项目、状态值与汇总范围规格**：
-- **表结构**（第 1 行为列名表头，第 2–9 行为八项标准检查，第 10 行为 `Overall`）：`A 列：check_id | B 列：检查内容、期间与参与单元格范围 | C 列：动态状态公式 | D 列：最大绝对差额公式及 WARN/N/A 原因说明`。
-- **八项标准检查行 + 一行总汇总**：
-  1. `annual_vs_quarters`（年度与四财季流量加总及时点余额一致性，覆盖近期历史与全部加总预测年）；
-  2. `segment_tieout`（分部与集团收入、营业利润恒等；单业务无分部公司填 `="N/A"` 并在 D 列注明）；
-  3. `cash_rollforward`（预测期各期期末现金滚存及跨期衔接恒等）；
-  4. `debt_rollforward`（预测期各期有息债务滚存恒等；零有息债或未单列债务滚存的净现金公司填 `="N/A"` 并在 D 列注明）；
-  5. `share_rollforward`（预测期期末股数滚存与回购现金流、`SBC` 增发恒等）；
-  6. `bs_balance`（完整资产负债表各期总资产等于负债加权益；仅建现金债务精简滚存的模型填 `="N/A"` 并在 D 列注明）；
-  7. `implied_rates`（预测期隐含存款收益率与借款利率相对公司历史区间核验）；
-  8. `summary_links`（汇总表收入与 `EPS` 年度及季度序列与主表零差额）；
-  9. `Overall`（第 10 行）：C 列写完整覆盖第 2–9 行的动态公式 `=IF(COUNTIF(C2:C9,"FAIL")>0,"FAIL",IF(COUNTIF(C2:C9,"WARN")>0,"WARN","OK"))`。
-- **合法状态值集合（闭集）**：仅限 `"OK"`、`"WARN"`、`"FAIL"`、`"N/A"` 四种状态值；三种非 `"OK"` 状态对模型交付与退出码的影响统一按第 5.3 节执行。
+| 提示类别（`category`） | 扫描内容 | 处理方式 |
+|---|---|---|
+| `forecast_constants` | 预测期列（按列头粗略识别 `E`/`F`/`P` 后缀，排除 `CAGR`/`YoY` 等列与表头行）中出现的全部数字常数，**金额行与假设行一并列出，不判定对错**，仅附是否带填充底色的客观提示。 | 智能体逐条核对：属驱动假设或外部静态输入的保留，属预测金额结果硬编码的改用公式。 |
+| `possible_period_mismatch` | 按列头粗略比对公式引用列的年份与所在列年份，标出「可能存在期间不一致」的单元格（均明确标注为「可能」）。 | 结合公司财年结账月（如 3 月结账跨自然年求和）与跨期逻辑核对，确认无误则保留。 |
+| `external_or_broken_or_circular` | 工作簿外部链接部件与引用、第三方插件函数（Capital IQ、`BQL`、`BDH`、`BDP`、`RTD`、`WEBSERVICE`）、公式与命名区域中的断裂引用 `#REF!`（含 `IFERROR`/`IFNA` 内）、以及迭代计算开关或公式依赖环路。 | 交付新版本前通常清理外链与插件函数、修复 `#REF!` 并消除循环引用。 |
+| `recalc_errors` | 现有缓存或 `--recalc` 在临时副本重算后出现的 Excel 错误值（`#DIV/0!`、`#REF!`、`#NAME?`、`#VALUE!`、`#N/A`、`#NUM!`、`#NULL!`、`#SPILL!`、`#CALC!`、`#ERROR!`）。 | 逐项定位并修复错误公式。 |
 
-### 5.3 输出 JSON 格式、退出码与统一交付规则
+### 5.3 输出 JSON 与处理原则
 
-`style_audit.py` 向标准输出打印单个 UTF-8（通用多字节字符编码）JSON 对象（每个检查项最多附 25 个具体单元格示例）：
+`model_scan.py` 向标准输出打印单个 UTF-8 JSON 对象，包含 `status`（`"ok"` 或 `"error"`）、简短中文摘要 `summary`、各类别计数 `counts`、截断标记 `truncated` 与提示明细 `items`。
 
-```json
-{
-  "status": "pass",
-  "strict": true,
-  "file": "model/China_eCommerce_Industry_Model_v01_20261125.xlsx",
-  "baseline": "sources/China eCommerce_Industry Model_20261008.xlsx",
-  "profile_source": "baseline",
-  "stats": {
-    "sheets_audited": 37,
-    "formula_cells": 68420,
-    "relative_assumption_formulas": 412,
-    "baseline_formulas_checked": 59310,
-    "verified_actual_switches": 186,
-    "plugin_links_replaced": 725,
-    "baseline_formula_regressions": 0,
-    "checks_sheet_fails": 0,
-    "checks_sheet_warns": 1
-  },
-  "findings": [
-    {
-      "check": "implied_rate_diagnostics",
-      "level": "warn",
-      "count": 1,
-      "message": "Forecast implied annualized cash yield sits outside company historical range [1.8%, 3.6%]; verify cash base or explain rate environment change in Checks column D",
-      "examples": [
-        "Model - VIPS!AG48 (2027E implied yield 0.2% vs FY22-FY25 historical range [1.8%, 3.6%]; Checks!D8 notes onshore RMB demand deposit rate cut)"
-      ]
-    }
-  ]
-}
-```
-
-- **`FAIL`、`WARN`、`N/A` 统一交付与退出码规则**（全书各环节与工作流验证均以此处为准）：
-  1. **失败（脚本 `fail` 或 `Checks` 页 `"FAIL"`）——阻断交付**：当参数错误、文件损坏无法读取，或检出任一 `fail` 级问题（含 `--strict` 下提升为 `fail` 的检查项、`Checks` 页出现 `"FAIL"`、必检项缺失、缓存为空或静态写死汇总）时，`style_audit.py` 输出 `"status": "fail"`（或 `"error"`）并返回**退出码 `1`**，必须修复全部失败项并重新重算校验后方可交付。
-  2. **警告（脚本 `warn` 或 `Checks` 页 `"WARN"`）——附明业务原因后放行交付**：当零 `fail` 项，且所有脚本 `warn` 项与 `Checks` 页 `"WARN"` 行均已在 `Checks` 页 `D` 列及交付说明中写明具体业务原因（此时 `Checks!Overall` 动态公式结果为 `"WARN"`）时，`style_audit.py`（含 `--strict`）输出 `"status": "pass"` 并返回**退出码 `0`**，允许正常交付；缺少 `D` 列原因说明的 `"WARN"` 由 `checks_sheet_rollup` 判为 `fail` 阻断交付。
-  3. **不适用（`Checks` 页 `"N/A"`）——仅限指定可豁免项附明原因后放行交付**：仅第 5.2 节明确列出的三类可不适用项目（单业务无分部公司的 `segment_tieout`、无有息债或未单列债务滚存公司的 `debt_rollforward`、精简滚存模型的 `bs_balance`）可填 `="N/A"`，在 `D` 列写明不适用原因后视为合规（其余项全为 `"OK"` 时 `Overall` 为 `"OK"`，其余项含已说明 `"WARN"` 时为 `"WARN"`），返回**退出码 `0`**；对其余必检项填 `"N/A"` 或未写原因的判为 `fail`。
+**智能体处理原则**：逐条查看提示清单，**确认是问题就修改模型并重新核对；结合公司实际判断不属于问题的，在变更记录（如 `README & Changelog` 或交付说明）里写一句原因即可**。
 
 ---
 
@@ -479,89 +396,52 @@ python .agents/skills/dalton-model/scripts/style_audit.py <model.xlsx> \
 
 | 类别 | 文件路径 | 修改内容 |
 |---|---|---|
-| 新技能目录 | `plugins/dalton/skills/dalton-model/**` | 新增 `SKILL.md`、`references/{format-spec,forecast-rules,rollforward,sanity-check}.md`、`scripts/{model_style,style_audit}.py`（按 `researchdata_bridge` 与 `alphaengine` 分别门控专有数据源说明，零内部域名硬编码）。 |
+| 新技能目录 | `plugins/dalton/skills/dalton-model/**` | 新增 `SKILL.md`、`references/{format-spec,forecast-rules,rollforward,sanity-check}.md`、`scripts/{model_style,model_scan}.py`（按 `researchdata_bridge` 与 `alphaengine` 分别门控专有数据源说明，零内部域名硬编码）。 |
 | 方法论索引与一致预期入口 | `plugins/dalton/skills/dalton-conventions/SKILL.md` | 1. 在第 4 节按任务查参考表格的「财务建模 / 历史对表 / 财务镜头」行增列 `.agents/skills/dalton-model/SKILL.md`；<br/>2. 将第 6 节「卖方一致预期（`estimates`）」核心安装分支中的 `yf_fundamentals` 改为 `yf_analysis.get_revenue_estimates` / `get_earnings_estimates`（及可选 `fundamentals.get_analyst_estimates`）。 |
 | 技能注册表 | `src/ptc_agent/agent/middleware/skills/dalton_registry.py` | `_DALTON_SKILL_SPECS` 与 `DALTON_SKILL_CAPABILITY_MAP` 新增 `dalton-model`，分组注释 `29 skills` 改为 `30 skills`。 |
 | 能力、注册与独立核心检查 | `tests/unit/dalton/test_core_capabilities_gate.py`<br/>`tests/unit/dalton/test_b3_skills_data_map_prompts_migration.py`<br/>`tests/standalone/checks/b3_skills_prompts_ui.py` | `test_core_capabilities_gate.py` 与 `tests/standalone/checks/b3_skills_prompts_ui.py`（`len(enabled_skills) == 29`）的核心可见技能数断言更新为 `30`；磁盘技能总数断言由 `51` 更新为 `52`。 |
 | 快照采集与技能总数断言 | `tests/unit/dalton/_everflow_parity_capture.py` 及 8 个含技能总数断言的单测文件（`test_agentturn_ai_app.py`、`test_agentturn_mark_weekly.py`、`test_agentturn_richard_earnings.py`、`test_agentturn_tmeet.py`、`test_agentturn_wiki_ingest.py`、`test_declared_sources.py`、`test_podcast_weekly_migration.py`、`test_richard_coverage_weekly.py`） | `_everflow_parity_capture.py` 两处磁盘技能数断言更新为 `52`；8 个单测文件中所有 `len(_DALTON_SKILL_SPECS) == 51` 与 `test_declared_sources.py` 中的 `len(DALTON_SKILL_DEFINITIONS) == 51` 全部更新为 `52`。 |
 | Everflow 快照 | `tests/unit/dalton/snapshots/everflow/**` | 运行 `pytest tests/unit/dalton/test_everflow_profile_parity.py --update-everflow-snapshots` 更新技能清单、提示词与组装全文快照。 |
-| 新增专项单测 | `tests/unit/dalton/test_modeling_skill.py` | 覆盖 `model_style.py`、`style_audit.py`、多组合能力门控装配与合成工作簿测试（见第 9.1 节）。 |
+| 新增专项单测 | `tests/unit/dalton/test_modeling_skill.py` | 覆盖 `model_style.py`、`model_scan.py`、多组合能力门控装配与合成工作簿测试（见第 9.1 节）。 |
 | 路径登记检查 | `scripts/dalton/dalton_paths.txt`（零改动，运行 `scripts/dalton/check_hooks.sh --strict` 验证） | 全部新增与修改文件均位于已登记的 Dalton 前缀内，零上游文件修改。 |
 
-### 8.3 第 2 批（`dalton-earnings-deep` 与 `dalton-full-coverage` 全链路切换）涉及文件
+### 8.3 第 2 批（`dalton-earnings-deep` 与 `dalton-full-coverage` 切换接入）涉及文件
 
-第 2 批将工作流与手动执行路径中的**建模、季报滚动更新、审稿修订、中断恢复执行（`resume`）、阶段 4 只读检查、只读探针 `strictAudit` 及两条工作流 `contract.json` 完成验证**统一切换至 `dalton-model`、`style_audit.py --strict` 与第 7.2 节共用版本解析：按当次输出文件在研究目录 `model_lineage.json` 记录实际输入文件（`baseline_path`）、输入哈希（`baseline_sha256`）和样式配置（`profile_path`），全链路直接读取该记录定位待检输出文件与实际输入原件（存量维护与修订必传 `--baseline` 以执行新旧公式比对，无底稿新建时 `baseline_path` 为 `null`），替换原有的磁盘最大版本排序（`ls model/... | sort -V | tail -1`）与版本号减一推断。
+第 2 批将两条工作流与手动执行路径中的建模与季报更新切换至 `dalton-model` 指引与 `model_scan.py --recalc` 提示性扫描，并用 `model_lineage.json` 记录实际输入与输出文件：
 
 | 类别 | 文件路径 | 修改内容 |
 |---|---|---|
-| 财报深度链技能 | `plugins/dalton/skills/dalton-earnings-deep/SKILL.md` | 手动路径与阶段 1 支线 B（Excel 模型更新）由读取 `model-update/SKILL.md` 和跑 `xlsx/scripts/audit.py --strict` 改为读取 `.agents/skills/dalton-model/SKILL.md`，按共用版本解析记录实际输入底稿并运行 `dalton-model/scripts/style_audit.py --strict --baseline <实际输入模型> --profile <style_profile.json>`（保留 `mapping.md`、`Change Log` 与 `model-delta.md`）。 |
-| 财报深度链工作流与契约 | `workflows/earnings-deep-update/workflow.js`<br/>`workflows/earnings-deep-update/contract.json` | 1. `workflow.js` 阶段 1「模型更新」提示词、审稿「修订」循环 `modelClause`、中断 `resume` 与只读探针共用一次版本解析，按输出文件在 `model_lineage.json` 记录实际输入文件、输入哈希与样式配置，切换至 `dalton-model/SKILL.md` 与 `style_audit.py --strict`；<br/>2. **`contract.json` 选版逻辑与完成验证器**：替换原有的 `ls model/{ticker}-model-v*.xlsx | sort -V | tail -1` 最大版本选版方式，改为通过共用版本解析读取当次输出文件及其实际输入底稿与样式配置，运行 `dalton-model/scripts/style_audit.py ... --strict`。 |
-| 完整覆盖技能与参考文档 | `plugins/dalton/skills/dalton-full-coverage/SKILL.md`<br/>`plugins/dalton/skills/dalton-full-coverage/references/model-spec.md`<br/>`plugins/dalton/skills/dalton-full-coverage/references/memo-writing.md` | 1. `SKILL.md` 阶段 2（建模）：支持从 `sources/` 或 `model/` 采用指定模型按 `dalton-model` 滚动补齐期间与专属表，无模型时新建 15 页模型并统一写入 `model_lineage.json`、运行 `style_audit.py --strict`；**阶段 4（审模型）**：对阶段 2 已重算的交付模型运行 `style_audit.py --strict`（按谱系传入基准与样式配置），明确写明**不运行 `xlsx/scripts/audit.py`，其 `formula_hardcode` 不算失败，只借用 `check-model` 的来源台账和报告格式，循环引用以 `style_audit.py` 的检查为准**；阶段 5（修订）、手动路径与收尾提示统一改为 `dalton-model/SKILL.md` 与 `style_audit.py`；<br/>2. `model-spec.md` 与 `memo-writing.md`：前置规范、校验命令与审稿修订指引同步切换为 `dalton-model` 与 `style_audit.py --strict`。 |
-| 完整覆盖工作流与契约 | `workflows/full-coverage/workflow.js`<br/>`workflows/full-coverage/contract.json` | 1. `workflow.js` 阶段 2 建模、阶段 5 修订 `modelClause`、中断 `resume` 与 `strictAudit` 只读探针共用一次版本解析，按输出文件记录并读取实际输入文件、输入哈希和样式配置运行 `style_audit.py --strict`；<br/>2. `workflow.js` 阶段 4 子任务提示词写明：**不运行 `xlsx/scripts/audit.py`，其 `formula_hardcode` 不算失败，只借用 `check-model` 的来源台账和 `model-check.md` 报告格式，循环引用以 `style_audit.py` 的检查为准**（与第 3.4 节关闭迭代计算一致）；<br/>3. **`contract.json` 选版逻辑与完成验证器**：替换原有的 `ls model/{ticker}-model-v*.xlsx | sort -V | tail -1` 最大版本选版方式，改为通过共用版本解析读取当次输出文件及其实际输入底稿与样式配置，运行 `dalton-model/scripts/style_audit.py ... --strict`。 |
-| 工作流单测与快照 | `tests/unit/dalton/test_workflows_js.py`<br/>`tests/unit/dalton/snapshots/everflow/**` | 更新 `test_workflows_js.py` 中对共用版本解析（含跨版本选底稿如 `v02 -> v04`、修订另存与 `resume`）、`contract.json` 选版逻辑、阶段 4 提示词及 `style_audit.py` 路径的断言，并刷新 Everflow 快照。 |
+| 财报深度链技能与工作流 | `plugins/dalton/skills/dalton-earnings-deep/SKILL.md`<br/>`workflows/earnings-deep-update/{workflow.js,contract.json}` | 阶段 1 支线 B 与修订循环改读 `.agents/skills/dalton-model/SKILL.md`，使用 `model_scan.py --recalc` 扫描并逐条核对提示，用 `model_lineage.json` 记录输入输出路径与哈希（保留 `mapping.md`、`Change Log` 与 `model-delta.md`）。 |
+| 完整覆盖技能与工作流 | `plugins/dalton/skills/dalton-full-coverage/{SKILL.md,references/model-spec.md,references/memo-writing.md}`<br/>`workflows/full-coverage/{workflow.js,contract.json}` | 阶段 2 建模、阶段 4 只读审模型（改用 `model_scan.py`，不再跑上游 `xlsx/scripts/audit.py --strict`）与阶段 5 修订统一切换至 `dalton-model` 指引与 `model_scan.py`。 |
+| 工作流单测与快照 | `tests/unit/dalton/test_workflows_js.py`<br/>`tests/unit/dalton/snapshots/everflow/**` | 更新工作流单测断言并刷新 Everflow 快照。 |
 
 ---
 
-## 9. 测试方案与实测验收标准
+## 9. 测试方案与验收标准
 
 ### 9.1 自动化单元测试（`tests/unit/dalton/test_modeling_skill.py`）
 
-将「纯离线公式/样式结构单元测试」与「调用 `recalc.py` 计算缓存值测试」分层编写，不依赖外部网络、数据库或未入库的本地大文件：
+不依赖外部网络、数据库或未入库的私有用户大文件，测试固件均用 `openpyxl` 在测试内现场构造：
 
 1. **技能注册与三组能力组合装配测试**：
    - 验证 `dalton-model` 在 `DALTON_PROFILE=core` 与 `DALTON_PROFILE=everflow` 下均可由 `get_skill("dalton-model")` 正常解析，依赖包含 `dalton-conventions` 与 `research-conventions`；
-   - 对 `plugins/dalton/skills/dalton-model/` 下全部 `.md` 文件分别测试**三种能力组合**的 `read_assembled_text` 输出：
-     1. 核心全关组合（`frozenset()`）：`researchdata`、`alphaengine`、`guidepoint`、`feishu`、`everflow` 等专有词命中为 `0`，一致预期采用 `yf_analysis.get_revenue_estimates` / `get_earnings_estimates` 与可选 `fundamentals.get_analyst_estimates`；
-     2. **桥接开启、卖方研报关闭组合（`frozenset({CapabilityId.RESEARCHDATA_BRIDGE})`）**：一致预期段启用 `researchdata.finance(route="estimates")`，卖方研报段自动走公开来源分支，`alphaengine` 命中数为 `0`；
-     3. 桥接与卖方研报全开组合（`frozenset({CapabilityId.RESEARCHDATA_BRIDGE, CapabilityId.ALPHAENGINE})`）：两段内部工具指引均完整输出且无残留 `DALTON_CAP` 标记。
-2. **`model_style.py` 期间映射、主题色还原、画像提取与包级补丁写入测试**：
-   - **共用 `PeriodMap` 测试**：构造含非自然年财年（如 3 月底结账年度列对应 `2Q26E`–`1Q27E`）、重复列头（连续两列 `2026E`）、混合后缀（无后缀历史、`A`/`E`/`F`/`P` 后缀）及 `CAGR 25-28E` 列的工作表，验证期间分类、财季绑定与唯一槽位键准确无误；
-   - **主题色还原与多维画像测试**：构造含 `theme=1` 黑色字体、`theme=6, tint=0.80`（还原为 `EDEDED` 历史估算浅灰底）与 `theme=6, tint=-0.25`（非估算深色）、`Subs` 第 60 行浅蓝底子表头、`Model - Tiger` 绿字斜体跨表比率公式（`='Model - Futu'!G89`）、第 400 行分部子块及含 11pt 目标价公式的非空 `Futu>>` 页签的工作簿，验证 `profile_workbook_style` 全表采样不漏块、`Futu>>` 不被误当空白分隔页跳过；
-   - **包级 XML 补丁保留扩展部件测试**：构造压缩包内含 `<extLst>` 节点与模拟 `.wmf` 媒体部件的工作簿，经补丁写入器更新单元格后对比前后 ZIP 部件，验证 `<extLst>` 与 `.wmf` 字节级保留。
-3. **`style_audit.py` 公式结构测试与 `recalc.py` 重算闭环测试**：
-   - **真实合法假设与换算常数零误报测试**：构造经 `recalc.py` 实跑返回 `status == "success"`（或在离线单元测试中显式构造重算后 XML 缓存值与 `recalc.py` 实跑两条测试套件）的合规模型，写入以下真实公式案例，断言 `style_audit.py --strict` 返回 `status == "pass"` 且退出码为 `0`：
-     - 引用同期反算指标做加减差：`Model - Futu!P35` 的 `=P9-8%`（其中 `P9 =P8/P6` 为同期反算比率，套假设样式）；
-     - 跨期直接引用历史反算指标：`Model - JD!BI157` 的 `=BE157`（套假设样式）；
-     - 历史估算相对上期微调：`Model - JD!Q272` 的 `=P272+0.05%`（同上样式）及浅灰底历史估算 `=N69`；
-     - 存托股换算常数：`EPADS` 行公式含 `*8`（对应 `1 ADS = 8 普通股`）；
-     - 经证据确认的零假设输入格：套假设样式填 `0` 且右侧备注列非空；
-     - 季度加总年同时覆盖流量行 `=SUM(Q1:Q4)` 与四格相加（含 3 月底结账跨自然年 `2027E = SUM(2Q26E:1Q27E)`）、期末现金行 `=Q4`、加权股本行 `=AVERAGE(Q1:Q4)`、`EPS`/`EPADS` 两种合法写法（年度净利润 ÷ 年度加权股数，以及四季 `EPS` 之和如 `Model - BABA!S202`）及由该年金额反算的 `=S9/R9-1` 衍生比率行；
-     - 存量合法转换放行：预测转实际（`3Q26E` 公式转为 `3Q26` 蓝字实际数）、外部插件抽离替换、重复标签列身份跨插列保留（`Subs - JD!R1/S1`）及已在 `mapping.md` 或 `README & Changelog` 登记原因的未预测留空。
-   - **违规项精准拦截测试**：逐项构造缺陷工作簿，断言 `--strict` 精确检出对应检查项并返回退出码 `1`：
-     1. 财务结果行在预测列填常数（含**涂成蓝字黄底假设样式的硬编码金额**）→ `forecast_amount_hardcode`；
-     2. 财务结果行公式夹带业务常数（如 **`=E10*2`**、`=E10*1.15` 或 `IF` 分支返回固定金额）→ `formula_hidden_literal`；
-     3. 仍属预测期的原模型公式在新模型中变为常数、**未登记的空白**、文本或按 `PeriodMap` 错引其他期间列 → `formula_regression_vs_baseline`；
-     4. 季度加总年流量行非四财季求和或四格相加、期末现金行误写成 `SUM`、`EPS` 非两种合法公式之一、或结果行残留常数/假设底色 → `summed_year_violation`；
-     5. 公式含 `=IFERROR(#REF!/I16-1,"")` 隐藏断链 → `broken_formula_ref`；
-     6. 包内残留外链引用/关系/部件/内容类型声明、命名区域外链、`_xll.ciqfunctions` 或 `BQL`/`BDH` → `external_or_plugin_link`；
-     7. 开启 `wb.calculation.iterate = True` 或存在现金—利息平均余额循环环路 → `circular_reference`；
-     8. `openpyxl` 刚保存未跑 `recalc.py`（缓存值为 `None`），或 `Checks` 页缺失必检项、`WARN` 缺 `D` 列说明、写死状态公式 → `unrecalculated` / `checks_sheet_rollup`；
-     9. 期末现金、有息债或期末股数滚存不恒等、分部与集团不平、资产负债表不平、汇总表未覆盖季度或指错期间 → 对应恒等式 `fail`；
-     10. 预测期隐含存款收益率跌出该公司历史隐含利率区间 `[1.8%, 3.6%]` 超过 150 个基点（如 `0.2%`）报 `implied_rate_diagnostics`（`warn`），千倍错配（如 `45%`）同步标出 `unit_or_row_mismatch_suspect`；
-     11. 不传 `--baseline`/`--profile` 且写入外来 `1F4E79` 底色时，验证脚本按默认规范直接拦截 → `foreign_template_style`。
+   - 对 `plugins/dalton/skills/dalton-model/` 下全部 `.md` 文件及 `dalton-conventions/SKILL.md` 测试三组能力组合的 `read_assembled_text` 输出：核心全关组合零专有词命中；桥接开启、卖方关闭组合零 `alphaengine` 命中；桥接与卖方全开组合无残留 `DALTON_CAP` 标记。
+2. **`model_style.py` 默认格式写入、画像沿用与谱系记录测试**：
+   - 验证 `apply_cell_style` 与 `clone_period_column_style` 正确写入默认样式与克隆相邻期间列样式，`normalize_period_for_knowledge` 正确转换年度、季度与 `CAGR` 标签；
+   - 验证 `profile_workbook_style` 提取主题色+色调还原、各页字号（含非空 11pt 页签）、分节条与常见数字格式，并在文件缺失或无法读取时平滑退回默认样式配置；
+   - 验证 `record_model_lineage` 作为普通记录保存输入文件、输出文件、哈希与时间戳。
+3. **`model_scan.py` 提示性扫描测试**：
+   - 现场构造含四类提示情形的合成工作簿，验证 `model_scan.py` 列出预测期数字常数（金额行与假设行一并列出）、可能期间不一致（标为「可能」）、外链/插件/`#REF!`（含 `IFERROR` 内）/循环引用及公式错误值，每条均含工作表、单元格与原因，输出合法 JSON 与简短摘要且退出码为 `0`；
+   - 验证 `model_scan.py --recalc` 在临时副本上调用上游 `recalc.py` 检出重算错误值且不修改源文件哈希，退出码仍为 `0`；
+   - 验证仅当文件缺失、损坏或指定工作表不存在时返回退出码 `1`。
 
-### 9.2 样本模型只读核对与滚动更新验收标准
+### 9.2 两本真实样例的本地只读扫描验收
 
-1. **两本真实用户样本模型的本地只读核对**（宿主机对 `.agy/modeling_samples/` 运行静态检查 `--static-only`，原件保持字节级只读，样本文件不入仓库）：
-   - `ecom_20261008.xlsx`：验证 `model_style.py profile` 完整提取 40 页画像（识别 `PDD>>` 等空白分隔页、`hidden` 状态的 `_CIQHiddenCacheSheet`、19 个含 `<extLst>` 部件、BABA 跨自然年的财年列、`Subs - JD` 重复 `2026E` 列头与第 60 行子表头、`EDEDED` 与 `FFFFC8` 两类历史估算底色）；验证 `style_audit.py --static-only` 准确检出原表待替换的 366 个 Capital IQ 公式、346 个 `BQL` 与 13 个 `BDH` 公式、`Peers!I36` 被 `IFERROR` 隐藏的 `#REF!` 及缺失 `Checks` 页，同时对原表数百个合法相对假设公式零误报；
-   - `brokerage_20260820.xlsx`：验证保留含公式与目标价的 `Futu>>` 页（39 个非空单元格、11pt 单页画像）、识别 `veryHidden` 状态的 `_CIQHiddenCacheSheet`、通过 `--static-only` 检出包内 50 个 `xl/externalLinks/` 外链部件（原件不直接重算），并对 `Model - Futu!P35`（`=P9-8%`）、`Model - Tiger!G95`（绿字斜体跨表比率公式）与 `EPADS` 的 `*8` 换算零误报。
-2. **中国电商工作区滚动更新实测验收标准**：
-   - 原底稿字节哈希不变；新模型输出至 `model/China_eCommerce_Industry_Model_v01_<YYYYMMDD>.xlsx`，原表 `<extLst>` 与媒体部件完整保留；全部 Capital IQ 与 Bloomberg `BQL`/`BDH` 插件公式已抽离为带来源说明的独立输入格加标准公式，`Peers!I36` 等隐藏 `#REF!` 已修复；
-   - 新披露季度完成「预测转实际」切换，登记原因的未预测留空正常放行，仍属预测期的既有公式在列身份语义四元组下零退化（`baseline_formula_regressions == 0`），所有预测期财务结果行均为无循环引用的动态公式；
-   - 季度加总年五类行全部符合第 3.1 节规范；现金、债务、期末股数滚存与分部勾稽恒等，隐含利率对比各公司历史区间合理；
-   - 已核实口径的可比季度与年度预测均对照一致预期与卖方报告（重点核对 JD `2027E`–`2028E` 净利润拆解），重大偏离及异常/缺值状态已在工作簿对照表与最右侧红字备注列写明具体依据；
-   - `recalc.py` 输出 JSON `status == "success"`，`Checks` 页必检项齐全且 `style_audit.py --strict --baseline <原底稿>` 符合第 5.3 节交付规则（返回退出码 `0`）。
-
-### 9.3 实现阶段验收要点
-
-以下实现细节不在设计正文展开为规则，统一交由开发任务实现并通过自动化测试与样例实测逐条验证：
-
-1. **外链四处同步清理与可重开验证**：用券商样例（含 50 个外链部件）和合成外链工作簿，验证外链清理同步移除 `workbook.xml` 的 `<externalReference>`、`workbook.xml.rels` 的关系、`xl/externalLinks/*` 部件和 `[Content_Types].xml` 声明，且清理和 `recalc.py` 重算后文件能正常重新打开。
-2. **扩列后扩展部件与图表引用区域验证**：用电商样例（含扩展条件格式 `<extLst>` 与媒体部件）和合成带图表工作簿，验证扩列及包级 XML 补丁写入后条件格式、图表、扩展部件的引用区域正确更新，且清理和重算后文件能正常重新打开。
-3. **跨期期初衔接与三表联动勾稽验证**：用合成多期季度加年度工作簿和电商样例滚动更新稿，验证季度和年度各自的期初余额衔接各自上期期末余额、现金流量表期末现金衔接资产负债表现金，且股本滚存中的回购金额引用现金流量表对应行。
-4. **`Checks` 页参与格登记与脚本独立重算差额验证**：用写入 `=IF(1,"OK","FAIL")` 等写死状态公式的负向测试工作簿和合规模型样例，验证 `Checks` 页登记实际参与检查的单元格并由 `style_audit.py` 独立重算差额，拦截未绑定真实检查对象的状态公式。
-5. **真实复杂单元格与涂假设样式硬编码固定用例验证**：将两本样例和审查引用的真实单元格（`Model - Futu!P35`、`Model - JD!BI157`、`Model - JD!Q272`、`Model - BABA!S202`、`Subs - JD!R1/S1`）外加一个涂成假设样式的硬编码金额格组成固定测试工作簿，验证前五项通过 `--strict` 检查而涂成假设样式的硬编码金额判定失败。
-6. **第二轮审查其余中低级意见逐条核对验证**：对照 `.agy/review_design_r2_codex.md` 与 `.agy/review_design_r2_grok.md` 的其余中、低级意见（必预测结果格漏填与零值假设备注检查、存量单页 `Futu>>` 的 `General` 数字格式保留与默认行分组、核心态组装全文含参考文档与共享方法论零专有词、`OFFSET`/命名区域循环依赖与跨表命名区域着色、`dalton-filing-review` 模型更新路由衔接、隐含利率 150 bps 默认警告带与股数容差），用对应合成测试工作簿与两本真实样例逐条核对测试并记入实现说明。
+宿主机对 `.agy/modeling_samples/ecom_20261008.xlsx` 与 `brokerage_20260820.xlsx` 运行只读扫描（样本文件不入仓库，原件哈希不变）：
+- 两本样例扫描均不崩溃、返回退出码 `0`、输出合法 JSON 与简短摘要；
+- `ecom_20261008.xlsx` 正确提示 Capital IQ、`BQL`、`BDH` 插件公式与 `Peers!I36` 隐藏 `#REF!` 等；
+- `brokerage_20260820.xlsx` 正确提示外部链接部件与插件公式等；
+- 原文件运行前后 `SHA-256` 一致。
 
 ---
 
@@ -569,8 +449,8 @@ python .agents/skills/dalton-model/scripts/style_audit.py <model.xlsx> \
 
 | 批次 | 交付范围 | 验收标准 |
 |---|---|---|
-| **第 1 批：`dalton-model` 技能本体、样式与补丁库、检查脚本及核心注册** | 1. 完成 `plugins/dalton/skills/dalton-model/` 下 `SKILL.md`、4 份 `references/*.md`、`scripts/model_style.py` 与 `scripts/style_audit.py`；<br/>2. 按第 8.2 节更新 `dalton_registry.py`（含 `30 skills` 注释）、`dalton-conventions/SKILL.md`（方法论索引及第 6 节 `yf_analysis` 一致预期工具更正）、技能数断言（含 `tests/standalone/checks/b3_skills_prompts_ui.py`、`test_core_capabilities_gate.py` 与 `test_declared_sources.py` 等）及 `tests/unit/dalton/snapshots/everflow/` 快照；<br/>3. 交付 `tests/unit/dalton/test_modeling_skill.py` 并落实第 9.3 节验收要点。 | 1. 单测覆盖共用期间映射、角色与行属性判定顺序、真实单元格固定用例与涂假设样式硬编码、外链清理与扩展部件补丁写入、三组能力组合全文装配校验及 `recalc.py` 重算闭环全部通过；<br/>2. 宿主机对两本真实样本模型运行 `--static-only` 只读检查与画像提取结果准确；<br/>3. `check_hooks.sh --strict` 与 `pr_baseline.sh` 通过。 |
-| **第 2 批：`dalton-earnings-deep` 与 `dalton-full-coverage` 全链路切换接入** | 1. 按第 8.3 节更新 `dalton-earnings-deep/SKILL.md` 与 `workflows/earnings-deep-update/{workflow.js,contract.json}`（覆盖支线 B 更新、修订循环 `modelClause`、只读探针及 `contract.json` 选版逻辑与验证器）；<br/>2. 更新 `dalton-full-coverage/{SKILL.md,references/model-spec.md,references/memo-writing.md}` 与 `workflows/full-coverage/{workflow.js,contract.json}`（覆盖阶段 2 建模、阶段 4 只读审查不运行 `xlsx/scripts/audit.py`、阶段 5 修订、`strictAudit` 及 `contract.json` 选版逻辑与验证器，全链路共用一次版本解析）；<br/>3. 更新 `tests/unit/dalton/test_workflows_js.py`（及 `dalton-filing-review` 衔接核对）与 Everflow 快照。 | 1. 工作流单测（覆盖共用版本解析、跨版本选底稿、`contract.json` 验证器、版本递增与中断 `resume` 续跑）全部通过；<br/>2. 核心态与 Everflow 态全文装配检查、快照比对与 `pr_baseline.sh` 通过。 |
+| **第 1 批：`dalton-model` 技能指引、机械样式与提示性扫描脚本及核心注册** | 1. 完成 `plugins/dalton/skills/dalton-model/` 下 `SKILL.md`、4 份 `references/*.md`、`scripts/model_style.py` 与 `scripts/model_scan.py`；<br/>2. 按第 8.2 节更新 `dalton_registry.py`（含 `30 skills` 注释）、`dalton-conventions/SKILL.md`（方法论索引及第 6 节 `yf_analysis` 一致预期工具更正）、技能数断言及 `tests/unit/dalton/snapshots/everflow/` 快照；<br/>3. 交付 `tests/unit/dalton/test_modeling_skill.py`。 | 1. 单测覆盖默认格式写入与画像沿用、四类扫描提示、副本重算、三组能力组合全文装配及注册断言全部通过；<br/>2. 两本真实样本模型运行 `model_scan.py` 不崩溃且退出码为 `0`；<br/>3. `check_hooks.sh --strict` 与 `pr_baseline.sh` 通过。 |
+| **第 2 批：`dalton-earnings-deep` 与 `dalton-full-coverage` 切换接入** | 1. 按第 8.3 节更新 `dalton-earnings-deep` 与 `dalton-full-coverage` 技能文档及两条工作流，改用 `dalton-model` 建模指引与 `model_scan.py` 提示性扫描；<br/>2. 更新 `tests/unit/dalton/test_workflows_js.py` 与 Everflow 快照。 | 1. 工作流单测与核心态/Everflow 态全文装配检查通过；<br/>2. `pr_baseline.sh` 通过。 |
 
 ---
 
@@ -579,4 +459,4 @@ python .agents/skills/dalton-model/scripts/style_audit.py <model.xlsx> \
 无。以下两项决定按用户 2026-11-25 指示按 lead 推荐执行：
 
 1. 技能目录名、注册名与斜杠命令统一为 `dalton-model`（`/dalton-model`）。
-2. 工作区没有用户模型、需要从零新建时，同样使用第 4 章的默认格式，并用 `style_audit.py --strict` 验收。
+2. 工作区没有用户模型、需要从零新建时，默认参考第 4 章样式常量，并用 `model_scan.py --recalc` 做提示性扫描复核。

@@ -1,97 +1,59 @@
-# 存量模型滚动维护、安全写入与版本管理流程（`rollforward.md`）
+# 在用户模型上滚动维护
 
-本文规定模型目录判定、新版本命名、共用谱系记录（`model_lineage.json`）、安全扩列、预测转实际切换、外部插件与四层外部链接清理，以及保留扩展部件的包级 XML（Extensible Markup Language，可扩展标记语言）写入流程。
+用户提供的模型是正本：在它的基础上更新，沿用它的结构、预测方法和格式。原件不动，新版本另存。
 
----
+## 步骤
 
-## 1. 目录统一、双目录判定与新版本命名
+**1. 找到底稿**
+- 优先用用户本次指定的文件。
+- 其次：`data/models.json` 登记的当前版本（`current` 是版本号，到 `versions[]` 里找同一 `id` 的条目，取它的 `path`），以及工作区此前交付的版本。
+- `model/` 和 `models/` 各有一份时，内容相同（哈希一致）就是副本；不同就比较内容和交付记录判断哪本是最新正本。仍然无法判断、而且选错会影响交付时，问用户。
 
-1. **统一正式目录**：单公司与行业多公司工作区统一将正式 `.xlsx` 模型存放在工作区根目录的 `model/` 下，匹配知识层模型台账路径规范（`^model/.+\.xlsx$`）。当次生成的更新脚本、`style_profile.json`、`model_lineage.json`、`mapping.md` 与 `part_diff.json` 存放在 `research/<YYYY-MM-DD>-model-<动作>/` 下。
-2. **`model/` 与历史 `models/` 并存判定**：
-   - 先计算两侧 `.xlsx` 文件的 `SHA-256` 哈希：哈希相同视为同一文件的重复副本，以 `model/` 下的路径为准；
-   - 哈希不同时，先读取 `data/models.json` 的 `current` 版本标识（如 `"v12"`），在 `versions[]` 数组中找到 `id` 等于 `current` 的条目并读取其 `path` 字段，结合用户在当前会话中明确指定的底稿确定唯一维护起点；
-   - 若 `data/models.json` 尚未登记且用户未指定底稿，先列出两边文件的路径、修改时间、版本号与核心页差异交用户确认起点，后续新版本统一写入 `model/`，原 `models/` 下的文件保持只读留存。
-3. **原件只读与递增版本命名**：
-   - `sources/` 中的用户底稿与 `model/` 下全部历史版本始终保持字节级只读；更新前记录基准文件 `SHA-256` 并写入新版本 `README & Changelog` 页，交付前核对原件哈希未变。
-   - 单公司工作区新版本命名为 `model/<TICKER>-model-v<NN>.xlsx`（两位递增版本号）。
-   - 行业多公司工作区新版本命名为 `model/<Industry_Slug>_Model_v<NN>_<YYYYMMDD>.xlsx`（空格转为下划线）。
+**2. 另存副本再改**：例如 `model/PDD-model-v03.xlsx`，所有修改都在副本上。
 
----
+**3. 读懂原模型**
+- 工作表结构、每张表的用途；
+- 哪些行是公式、用什么驱动预测、引用了哪些拆解区和其他工作表；
+- 勾稽关系：分部加总、季度汇总年度、三张表之间；
+- 格式习惯（`scripts/model_style.py` 的 `profile` 可以读出格式画像）。
+原模型有自己的规律就沿用。
 
-## 2. 共用版本解析与 `model_lineage.json` 谱系记录
+**4. 补实际值**（新披露的季度）
+- 把公司直接披露的数字写到原来就录入实际值的位置（历史实际值格式），例如各收入分项、成本、费用、KPI。
+- 这一季原来的驱动假设（黄底的增速、take rate 等）：改成由实际数算出的衍生比率（斜体、无底色），不再驱动公式；需要对照时，把原假设值写进备注。
+- **保留**合计、比率、引用和勾稽公式：收入合计仍是 `=SUM(...)`，毛利率仍是公式，跨表引用仍是引用。只有原来放驱动或直接录入的位置才换成实际数字。
+- 公司只披露累计数（半年、前三季、全年）时，单季 = 累计数之差（例如 `Q4 = 全年 − 前三季`），按 `model-standards.md` 标为推导值。
+- 未披露的拆分：继续用估算（估算格式 + 备注来源），或留空并备注。
+- 实际值与上一版预测差距大的重要项目，在变更记录里写一句原因。
 
-每次生成或修订输出模型时，调用 `model_style.py lineage` 在当次研究目录写入 `model_lineage.json`：
+**5. 加预测期**
+- 新增季度列时，按公式用途选参照：同比驱动的行，参照去年同季的写法；环比驱动的行，参照上一季。不要无差别复制相邻列，以免带错季节性。
+- 新增季度让某一年变成「由季度汇总的年度」（例如加了 1Q27E–4Q27E 之后的 2027E）：把这一年的金额改成季度汇总公式，比率改成用年度金额重算——原来这一年的年度假设要移到季度上。
+- 只有年度、没有季度的远期年份（例如原模型的 2027E 只在年度区）：保持年度列放假设，不要为它补季度，也不要把它改成汇总公式——除非这次的任务就是给这一年加季度。
+- 新增远期年度（例如 2028E）：同样直接在年度列放假设（假设格式）。
+- 有 CAGR 列的工作表：把起止年份和年数改到新的预测窗口；没有 CAGR 列的工作表不要为此新增。
+- 原模型有估值页（Valuation、SOTP、目标价）：检查目标年份、倍数对应的 EPS、净现金是否还指向更新后的预测；倍数是假设，目标价是公式。没有估值页就不新建。
+- 插列可以用上游 `xlsx` skill 的 `insert.py`：在副本上用 `--out` 输出，看它报告的警告，确认合计区间、图表和条件格式的范围跟着扩展了。
 
-```bash
-python .agents/skills/dalton-model/scripts/model_style.py lineage \
-  --file research/<YYYY-MM-DD>-model-<动作>/model_lineage.json \
-  --output model/<新版本文件名.xlsx> \
-  --baseline <实际输入底稿路径.xlsx> \
-  --profile research/<YYYY-MM-DD>-model-<动作>/style_profile.json \
-  [--fiscal-year-end-month <结账月>]
-```
+**6. 调整预测**
+- 数值：只改驱动假设。
+- 方法：需要新的拆分或勾稽时，在原框架里加，变更记录写明。
+- 发现原模型的预测金额是写死的数字：先看原拆解区能不能恢复它的计算关系（恢复成公式）；如果它本来就是有依据的直接输入（例如管理层指引），把它移到假设区作为输入，预测行引用它。改动列进变更记录。
 
-- **最终交付指针（`final_delivery`）**：同一运行产生初稿与修订稿时，中间草稿可加 `--draft` 仅写入 `entries[]`；最终交付稿不加 `--draft`，将 `final_delivery` 更新为最终交付文件的路径、`SHA-256` 哈希、实际输入底稿路径与哈希及样式画像路径。
-- **全链路统一读取**：后续的 `style_audit.py --lineage <model_lineage.json>`、中断恢复执行、只读核查与完成契约验证统一从 `final_delivery` 读取交付文件与实际基准原件，避免按磁盘文件名排序选版或按版本号减一猜底稿。
-- **未预测留空登记**：可在 `model_lineage.json` 的 `blank_forecast_registrations` 字段，或在 `mapping.md` / `README & Changelog` 中登记允许留空的未预测科目（含 `sheet`、`row`、`period`、`reason` 四项）。
+**7. 外部依赖**（Capital IQ `_xll.ciqfunctions...`、Bloomberg `BQL`、`BDH`、外部链接）
+- 在 Dalton 环境里无法刷新，重算会显示 `#NAME?` 或旧值。
+- 影响关键结果的：把需要的数值放到单独的输入单元格（注明来源和取数日期），原单元格引用它；原件保留，日后可用插件刷新。
+- 不影响结果的（例如参考用的可比公司表）：可以保留并在备注写「需插件刷新」。
+- 取不到可靠数值：在受影响的结果旁标明缺失原因。
+- 外部链接先处理再在副本上重算。
+- 同一工作簿内的跨表引用和命名区域（例如汇率）照常保留，它们不是外部依赖。
 
----
+**8. 重算和自查**：见 `SKILL.md` 第 5 步。
 
-## 3. 输出副本扩列与边界求和区间重建
+**9. 记录**：在 `README & Changelog` 写明本次所有改动（见 `SKILL.md` 第 7 步）。
 
-1. **只在输出副本上调用 `insert.py`**：先复制原底稿或通过 `--out` 生成新版本副本，再调用 `.agents/skills/xlsx/scripts/insert.py columns` 在新年度列与新季度列插入位扩列，并传 `--copy-style-from <相邻同类列>` 复制列宽、行高与行级样式：
+## 注意
 
-```bash
-python .agents/skills/xlsx/scripts/insert.py columns <基准或工作副本.xlsx> \
-  --sheet "<工作表名>" --at <插入列字母> --count <新增列数> \
-  --copy-style-from <相邻同类列字母> --out <新版本路径.xlsx>
-```
-
-2. **核查返回结果**：每次调用后检查返回 JSON 中 `status == "success"` 且 `self_check.ok == true`，逐条审阅 `warnings`。
-3. **显式重建边界外汇总公式**：`insert.py` 仅在插入点位于原求和区间内部时自动扩展 `SUM(起:止)`；在末尾追加新季度列或新年度列属于边界外扩列，扩列后必须显式写入：
-   - 新季度加总年的流量求和 `=SUM(Q1:Q4)`（或四格相加）、时点余额 `=Q4`、加权股本 `=AVERAGE(Q1:Q4)` / `=Q4`、年度 `EPS` 与衍生比率反算公式；
-   - 顺延 `CAGR` 列的起止年份引用与幂次；
-   - 核对横向汇总区间、扩展条件格式（`<extLst>` 中的 `sqref`）和图表数据区域（`xl/charts/*.xml` 中的 `<c:f>`）已覆盖新增列。
-
----
-
-## 4. 预测转实际与外部插件/四层外链抽离替换
-
-### 4.1 财报后预测转实际
-
-1. 将刚披露季度的列头由预测标签切换为原表一致的实际标签（如 `3Q26E` → `3Q26`，或 `2026Q3E` → `2026Q3`）。
-2. 将一手法定财报披露的实际值写入对应单元格，套用原表实际值样式（默认蓝字 `0000FF`、无底色、无边框），并在最右侧红字备注列写明财报来源与期间。
-3. 核对包含该季度的当财年加总年公式自动吸收新实际值，重新检查现金、有息债、利息与股本的期初衔接。
-
-### 4.2 外部插件函数与四层外部工作簿链接替换
-
-原模型中若含 `Capital IQ`（`_xll.ciqfunctions`、`CIQ`）、彭博终端函数（`BQL`、`BDH`、`BDP`）、`RTD`、`WEBSERVICE` 或指向外部 `.xlsx` 的链接：
-
-1. 在对应工作表下方或 `Inputs` 区建立独立的静态输入格（蓝字输入样式），在最右侧红字备注列写明可核验的数据来源与截至日期（如最新收盘价、汇率、总股本、同行可比数据）。
-2. 将原插件公式或外链单元格改写为引用上述静态输入格的标准 Excel 公式，并同步清理指向外部工作簿的命名区域（`definedNames`）。
-3. 清理完所有外链公式与命名区域后，使用 `model_style.py` 同步清除压缩包内的全部四层外部链接残留：
-   - `xl/workbook.xml` 中的 `<externalReferences>` / `<externalReference>` 节点；
-   - `xl/_rels/workbook.xml.rels` 中的 `externalLink` 关系条目；
-   - `xl/externalLinks/*` 全部部件（含 `.xml` 与 `_rels/*.xml.rels`）；
-   - `[Content_Types].xml` 中 `/xl/externalLinks/...` 的 `<Override>` 声明。
-
-```bash
-python .agents/skills/dalton-model/scripts/model_style.py clean-external-links \
-  <已替换外链公式的工作副本.xlsx> --out <清理外链后新版本.xlsx>
-```
-
----
-
-## 5. 保留扩展部件的包级 XML 补丁写入与写后校验
-
-当 `style_profile.json` 的 `package_info` 显示原工作簿包含 `<extLst>` 扩展节点（如条件格式扩展）或 `xl/media/*` 媒体部件（如 `.emf` / `.wmf` 矢量图）时，直接用 `openpyxl` 整本保存会丢失这些部件。此时改用 `model_style.py` 提供的包级补丁函数 `patch_workbook_xml`：
-
-- 在 `insert.py` 输出的 ZIP 包基础上，用 `lxml` 仅更新目标工作表的 `<sheetData>` 单元格节点，关闭 `xl/workbook.xml` 中的迭代计算（`iterate="0"`、`fullCalcOnLoad="1"`），按需平移 `<extLst>` 的 `sqref` 与图表 `<c:f>` 引用区域，并原样保留工作表尾部的 `<extLst>`、`<legacyDrawing>` 及全部媒体与绘图部件。
-- 写盘后执行部件对比并确认文件可正常重算与重新打开：
-
-```bash
-python .agents/skills/dalton-model/scripts/model_style.py part-diff \
-  <原模型.xlsx> <新模型.xlsx>
-```
-
-核对返回 JSON 中 `extlst_preserved == true`、`media_preserved == true`、`charts_preserved == true` 且 `new_external_link_parts == 0`，随后运行 `recalc.py` 与 `style_audit.py --strict`。
+- 不删除原模型的工作表；不再使用的可以移到最后并在变更记录说明。
+- 原模型里与四条必须做到的要求冲突的地方（例如某个汇总年里写死了数字）：修正并在变更记录列出。
+- 用户的格式和写法习惯优先于默认格式。
