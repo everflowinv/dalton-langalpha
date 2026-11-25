@@ -73,7 +73,7 @@ describe('readTurnFailure', () => {
       { id: 'u-1', role: 'user', content: 'fresh resend' },
       { id: 'a-1', role: 'assistant', content: 'reply 1' },
     ]);
-    expect(projected.map((m) => [m.id, m.turnIndex])).toEqual([
+    expect(projected.map((m) => [m.message.id, m.turnIndex])).toEqual([
       ['u-0', 0],
       ['a-0', 0],
       ['assistant-hitl-1', null],
