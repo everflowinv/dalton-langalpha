@@ -1602,29 +1602,31 @@ async def update_workspace(
 
                 async with _ws_transaction(conn) as cur:
                     await cur.execute(
-                        "SELECT user_id FROM workspaces WHERE workspace_id = %s AND status != 'deleted'",
+                        "SELECT user_id, name FROM workspaces WHERE workspace_id = %s AND status != 'deleted'",
                         (workspace_id,),
                     )
                     owner = await cur.fetchone()
                     if owner is None:
                         return None
                     owner_user_id = str(owner["user_id"])
-                    await lock_user_writes(cur, owner_user_id)
-                    await cur.execute(
-                        f"""
-                        SELECT workspace_id, name
-                        FROM workspaces
-                        WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
-                        """,
-                        {"user_id": owner_user_id},
-                    )
-                    for live_ws in await cur.fetchall():
-                        live_id = str(live_ws["workspace_id"])
-                        if live_id == str(workspace_id):
-                            continue
-                        live_name = str(live_ws.get("name") or "")
-                        if is_duplicate_name(name, live_name):
-                            raise WorkspaceNameTaken(live_name, live_id)
+                    current_name = str(owner.get("name") or "")
+                    if name.strip() != current_name.strip():
+                        await lock_user_writes(cur, owner_user_id)
+                        await cur.execute(
+                            f"""
+                            SELECT workspace_id, name
+                            FROM workspaces
+                            WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
+                            """,
+                            {"user_id": owner_user_id},
+                        )
+                        for live_ws in await cur.fetchall():
+                            live_id = str(live_ws["workspace_id"])
+                            if live_id == str(workspace_id):
+                                continue
+                            live_name = str(live_ws.get("name") or "")
+                            if is_duplicate_name(name, live_name):
+                                raise WorkspaceNameTaken(live_name, live_id)
                     await cur.execute(
                         f"""
                         UPDATE workspaces

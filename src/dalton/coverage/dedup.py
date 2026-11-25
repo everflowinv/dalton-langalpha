@@ -1372,13 +1372,13 @@ async def _refresh_live_hits(
                         continue
                     unit_state_by_id.setdefault(uid_row, dict(row))
                     u_row = unit_state_by_id[uid_row]
-                    u_kind = str(u_row.get("kind") or "company").strip().lower()
-                    u_status = str(
-                        u_row.get("status") if "status" in u_row else "active"
-                    ).strip().lower()
+                    # --- DALTON-HOOK(cos-settings-tools): begin ---
+                    # Still load live workspace status when bound unit is archived/rebound so an
+                    # active matching workspace (e.g. '00700') is preserved as an unclassified match.
                     bound_ws = _norm_uuid(u_row.get("workspace_id"))
-                    if bound_ws and u_kind == "company" and u_status == "active":
+                    if bound_ws:
                         ws_ids.add(bound_ws)
+                    # --- DALTON-HOOK(cos-settings-tools): end ---
 
             if ws_ids:
                 await cur.execute(
@@ -1436,14 +1436,36 @@ async def _refresh_live_hits(
     for entry, conf, reason in hits:
         if entry.unit_id:
             u_row = unit_state_by_id.get(entry.unit_id)
-            if u_row is None:
-                continue
-            u_kind = str(u_row.get("kind") or "company").strip().lower()
+            u_kind = str((u_row or {}).get("kind") or "company").strip().lower()
             u_status = str(
-                u_row.get("status") if "status" in u_row else "active"
+                (u_row or {}).get("status") if (u_row is not None and "status" in u_row) else "active"
             ).strip().lower()
-            if u_kind != "company" or u_status != "active":
+            if u_row is None or u_kind != "company" or u_status != "active":
+                # --- DALTON-HOOK(cos-settings-tools): begin ---
+                # Unit missing/archived: drop the coverage unit, but preserve its workspace
+                # as an active unclassified match if the workspace row itself is still live.
+                fallback_ws_id = entry.ws_id
+                fresh_ws = live_ws_by_id.get(fallback_ws_id) if fallback_ws_id else None
+                if fresh_ws is None:
+                    continue
+                updated_entry = replace(
+                    entry,
+                    is_unit=False,
+                    unit_id=None,
+                    ws_id=fallback_ws_id,
+                    unbound_unit=False,
+                    workspace_name=fresh_ws["name"],
+                    owner_name=fresh_ws.get("owner_name") or entry.owner_name,
+                    lead_analyst_name=None,
+                    ticker=entry.doc_ticker,
+                    unit_ticker=None,
+                    doc_ticker=entry.doc_ticker,
+                    unit_display_name=None,
+                    ws_row=fresh_ws,
+                )
+                raw_refreshed.append((updated_entry, fresh_ws, conf, reason))
                 continue
+                # --- DALTON-HOOK(cos-settings-tools): end ---
 
             lead_uid = str(
                 u_row.get("lead_analyst_user_id") or u_row.get("owner_user_id") or ""
@@ -1811,6 +1833,20 @@ async def recheck_company_workspace_before_create(
                 if unit_key != target_ticker_key and name_key != target_ticker_key:
                     continue
                 if entry.unit_id and entry.unit_id in dead_unit_ids:
+                    if not entry_ws_id or entry_ws_id in dead_ws_ids or name_key != target_ticker_key:
+                        continue
+                    ws_only_entry = replace(
+                        entry,
+                        is_unit=False,
+                        unit_id=None,
+                        unbound_unit=False,
+                        unit_ticker=None,
+                        unit_display_name=None,
+                    )
+                    if entry_ws_id in live_by_ws_id:
+                        confirmed_pairs.append(live_by_ws_id[entry_ws_id])
+                    else:
+                        to_verify.append((ws_only_entry, "high", "deterministic_ticker_match"))
                     continue
                 if entry_ws_id and entry_ws_id in dead_ws_ids:
                     continue
