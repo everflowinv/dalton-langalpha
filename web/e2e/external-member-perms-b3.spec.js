@@ -12,8 +12,8 @@
  *      read-only ?inject=view preview without comment controls), and runs A -> B -> C ->
  *      open C in own tab -> scripted location.href unbridged on desktop & mobile.
  *   3. Pathless public monitor (/m/:slug -> /api/v1/dalton/monitors/public/:slug/v/:seq/)
- *      with server-signed root proof entering bridged_root and keeping primary topbar actions
- *      on desktop & mobile, plus opaque-sandbox redirect failing closed to unbridged.
+ *      in an opaque sandbox renders its page content, treats root: true as unrecognized
+ *      (unbridged), keeps Copy link visible, and hides Open in new window on desktop & mobile.
  *   4. Misconfigured Dalton frontend (VITE_DALTON_AUTH intentionally unset) connected to a
  *      REAL core/local backend: waits for an unmocked HTTP 401 from
  *      GET /api/v1/dalton/credentials/status, then verifies Publish, Share, Audience
@@ -66,9 +66,9 @@ const WS_ID = 'a0000003-0000-4000-8000-000000000003';
 const APP_API_PORT = Number(process.env.E2E_MOCK_PORT) || 4100;
 const REAL_DALTON_FRONTEND_URL = (process.env.E2E_DALTON_REAL_FRONTEND_URL || '').replace(/\/+$/, '');
 
-function wrapHtml(title, body, injectBridge, headExtra = '') {
+function wrapHtml(title, body, injectBridge) {
   const script = injectBridge ? `<script>${VIEW_BRIDGE_SCRIPT}</script>` : '';
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>${headExtra}${script}</head><body>${body}</body></html>`;
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>${script}</head><body>${body}</body></html>`;
 }
 
 async function findFreePort() {
@@ -524,10 +524,8 @@ for (const mode of VIEWPORT_MODES) {
       await verifyRelativeLinksNewTabAndUnbridged(page, mode, { expectPublish: false });
     });
 
-    test('pathless public monitor with server root proof enters bridged_root and keeps primary topbar actions', async ({ page }) => {
+    test('pathless public monitor in opaque sandbox treats root: true as unbridged, hides Open in new window, and keeps Copy link', async ({ page }) => {
       const slug = 'public-root-pulse';
-      const rootNonce = 'e2e-public-root-nonce-123456';
-      const rootProof = 'e2e_public_root_proof_abcdef123456';
       await mockAPI(page, {
         [`GET /dalton/monitors/public/${slug}`]: {
           monitor: {
@@ -555,92 +553,22 @@ for (const mode of VIEWPORT_MODES) {
           frame_base: `/api/v1/dalton/monitors/public/${slug}/`,
           data_base: `/api/v1/dalton/monitors/public/${slug}/data`,
           expires_in: 0,
-          root_nonce: rootNonce,
-          root_proof: rootProof,
         },
       });
 
       await page.route(`**/api/v1/dalton/monitors/public/${slug}/v/4/**`, async (route) => {
-        const url = new URL(route.request().url());
-        const isConfirmedRoot =
-          /\/v\/4\/?$/.test(url.pathname) && url.searchParams.get('root_nonce') === rootNonce;
-        const proofMeta = isConfirmedRoot
-          ? `<meta name="dalton-root-proof" content="${rootProof}">`
-          : '';
         await route.fulfill({
           status: 200,
           contentType: 'text/html; charset=utf-8',
-          body: wrapHtml('Public Root Pulse', '<h1>Public Monitor Root</h1>', true, proofMeta),
+          body: wrapHtml('Public Root Pulse', '<h1>Public Monitor Root</h1>', true),
         });
       });
 
       await page.goto(`/m/${slug}`);
       const frame = page.frameLocator('iframe.bridged-frame-doc').first();
       await expect(frame.locator('h1')).toHaveText('Public Monitor Root', { timeout: 10000 });
-      await expect(page.locator('.monitors-frame-host')).toHaveAttribute('data-doc-state', 'bridged_root', { timeout: 5000 });
-      await expect(page.getByRole('button', { name: /Copy link|复制链接/i })).toBeVisible();
-      await expect(page.getByRole('link', { name: /Open in new window|新窗口打开/i })).toBeVisible();
-    });
-
-    test('pathless public monitor redirect in opaque sandbox does not enter bridged_root and hides Open in new window', async ({ page }) => {
-      const slug = 'public-root-redirect';
-      const rootNonce = 'e2e-redir-root-nonce-123456';
-      const rootProof = 'e2e_redir_root_proof_abcdef123456';
-      await mockAPI(page, {
-        [`GET /dalton/monitors/public/${slug}`]: {
-          monitor: {
-            monitor_id: 'mon-redir-1',
-            slug,
-            title: 'Public Root Redirect',
-            category: 'us',
-            sort_order: 0,
-            visibility: 'public',
-            member_user_ids: [],
-            published_seq: 4,
-            keep_updated: true,
-            source_kind: 'workspace',
-            source_ref: 'ws-1:index.html',
-            acl_revision: 1,
-            last_publish_error: null,
-            last_publish_failed_at: null,
-            data_as_of: null,
-            created_at: '2026-11-20T00:00:00Z',
-            updated_at: '2026-11-20T00:00:00Z',
-            can_manage: false,
-          },
-          versions: [],
-          monitor_grant: '',
-          frame_base: `/api/v1/dalton/monitors/public/${slug}/`,
-          data_base: `/api/v1/dalton/monitors/public/${slug}/data`,
-          expires_in: 0,
-          root_nonce: rootNonce,
-          root_proof: rootProof,
-        },
-      });
-
-      await page.route(`**/api/v1/dalton/monitors/public/${slug}/v/4/**`, async (route) => {
-        const url = new URL(route.request().url());
-        if (/\/v\/4\/?$/.test(url.pathname)) {
-          await route.fulfill({
-            status: 302,
-            headers: { location: `/api/v1/dalton/monitors/public/${slug}/v/4/redirected.html` },
-          });
-          return;
-        }
-        // Redirect target attempts to spoof root: true without the server-signed rootProof.
-        await route.fulfill({
-          status: 200,
-          contentType: 'text/html; charset=utf-8',
-          body: '<!doctype html><html><head><meta charset="utf-8"><script>'
-            + 'window.parent.postMessage({ type: "page:ready", v: 1, docId: "spoof-redir", root: true }, "*");'
-            + '</script></head><body><h1>Redirected Target</h1></body></html>',
-        });
-      });
-
-      await page.goto(`/m/${slug}`);
-      const frame = page.frameLocator('iframe.bridged-frame-doc').first();
-      await expect(frame.locator('h1')).toHaveText('Redirected Target', { timeout: 10000 });
       await expect(page.locator('.monitors-frame-host')).toHaveAttribute('data-doc-state', 'unbridged', { timeout: 5000 });
+      await expect(page.getByRole('button', { name: /Copy link|复制链接/i })).toBeVisible();
       await expect(page.getByRole('link', { name: /Open in new window|新窗口打开/i })).toHaveCount(0);
     });
   });

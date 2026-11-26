@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import base64
-import hashlib
-import hmac
 import re
-import secrets
 from dataclasses import dataclass
 
 from src.server.services.signed_grants import COUNT, GrantCodec
@@ -14,21 +11,17 @@ from src.server.services.signed_grants import COUNT, GrantCodec
 __all__ = [
     "DEFAULT_TTL_SECONDS",
     "MONITOR_GRANT_ROUTE",
-    "ROOT_NONCE_RE",
     "MonitorGrant",
     "MonitorGrantError",
     "VerifiedMonitorGrant",
-    "compute_public_root_proof",
     "data_prefix",
     "frame_prefix",
     "mint_monitor_grant",
-    "mint_public_root_challenge",
     "verify_monitor_grant",
 ]
 
 DEFAULT_TTL_SECONDS = 12 * 3600
 MONITOR_GRANT_ROUTE = "/api/v1/dalton/monitors/g/"
-ROOT_NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
 
 _MONITOR_ID = re.compile(
     r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
@@ -127,18 +120,3 @@ def frame_prefix(grant: MonitorGrant | str) -> str:
 
 def data_prefix(grant: MonitorGrant | str) -> str:
     return f"{frame_prefix(grant)}data"
-
-
-async def compute_public_root_proof(slug: str, seq: int, nonce: str) -> str:
-    """Compute a domain-separated HMAC proof binding a public monitor root entry to a one-time nonce."""
-    key = await _MONITOR_CODEC._signing_key()
-    message = "\x00".join(("public-monitor-root-v1", slug, str(seq), nonce))
-    digest = hmac.new(key, message.encode("utf-8"), hashlib.sha256).digest()
-    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
-
-
-async def mint_public_root_challenge(slug: str, seq: int) -> tuple[str, str]:
-    """Mint a one-time ``(root_nonce, root_proof)`` pair for an opaque-sandbox public monitor root."""
-    nonce = secrets.token_urlsafe(18)
-    proof = await compute_public_root_proof(slug, seq, nonce)
-    return nonce, proof

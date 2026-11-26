@@ -91,25 +91,22 @@ describe('parsePageMessage', () => {
     // Invalid version field drops the message whole.
     expect(parsePageMessage({ type: 'page:ready', v: '1', path: 'a.html' })).toBeNull();
 
-    // Valid docId and rootProof on page:ready.
+    // Valid docId on page:ready.
     expect(read('page:ready', { docId: 'doc-1', path: 'reports/a.html' })).toEqual({
       type: 'page:ready',
       path: 'reports/a.html',
       pathState: 'path',
       docId: 'doc-1',
     });
-    expect(read('page:ready', { docId: 'doc-root', root: true, rootProof: 'proof_token_1234567890' })).toEqual({
+    expect(read('page:ready', { docId: 'doc-root', root: true })).toEqual({
       type: 'page:ready',
       path: null,
       pathState: 'root',
       docId: 'doc-root',
-      rootProof: 'proof_token_1234567890',
     });
-    // Invalid docId or rootProof without root: true -> invalid.
+    // Invalid docId -> invalid.
     expect(read('page:ready', { docId: '', path: 'a.html' })).toEqual({ type: 'page:ready', path: null, pathState: 'invalid' });
     expect(read('page:ready', { docId: 'bad space', path: 'a.html' })).toEqual({ type: 'page:ready', path: null, pathState: 'invalid' });
-    expect(read('page:ready', { path: 'a.html', rootProof: 'proof_token_1234567890' })).toEqual({ type: 'page:ready', path: null, pathState: 'invalid' });
-    expect(read('page:ready', { root: true, rootProof: 'short' })).toEqual({ type: 'page:ready', path: null, pathState: 'invalid' });
   });
 
   // DALTON-HOOK(mobile-web): docPath rejects backslashes and traversal in page:loads too

@@ -168,8 +168,8 @@ export function docStatesEqual(a: HtmlFrameDocState, b: HtmlFrameDocState): bool
 /** What the document's bridge reports, as the viewer reads it. */
 export type PageToViewer =
   /** The bridge is listening; `path` is the workspace file the document is, which a link can change. */
-  // DALTON-HOOK(mobile-web): classify page:ready location as path / root / invalid / unrecognized with docId and optional rootProof
-  | { type: 'page:ready'; path: string | null; pathState: PageReadyPathState; docId?: string; rootProof?: string }
+  // DALTON-HOOK(mobile-web): classify page:ready location as path / root / invalid / unrecognized with docId
+  | { type: 'page:ready'; path: string | null; pathState: PageReadyPathState; docId?: string }
   /** The colour the document paints behind itself, null for none. */
   | { type: 'page:ground'; color: string | null }
   | { type: 'page:scroll'; x: number; y: number; moving: boolean }
@@ -439,7 +439,6 @@ function click<K extends 'page:pick' | 'page:area'>(type: K, anchor: typeof pick
 // DALTON-HOOK(mobile-web): validate raw page:ready own properties before Zod strips optional keys
 const pageReadyVersion = z.optional(z.number());
 const DOC_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
-const ROOT_PROOF_RE = /^[A-Za-z0-9_-]{16,128}$/;
 
 function parsePageReady(raw: Record<string, unknown>): Extract<PageToViewer, { type: 'page:ready' }> | null {
   if (raw.type !== 'page:ready') return null;
@@ -450,7 +449,6 @@ function parsePageReady(raw: Record<string, unknown>): Extract<PageToViewer, { t
   const hasRoot = hasOwn('root');
   const hasInvalidPath = hasOwn('invalidPath');
   const hasDocId = hasOwn('docId');
-  const hasRootProof = hasOwn('rootProof');
 
   let parsedDocId: string | undefined;
   if (hasDocId) {
@@ -460,24 +458,15 @@ function parsePageReady(raw: Record<string, unknown>): Extract<PageToViewer, { t
     parsedDocId = raw.docId;
   }
 
-  let parsedRootProof: string | undefined;
-  if (hasRootProof) {
-    if (typeof raw.rootProof !== 'string' || !ROOT_PROOF_RE.test(raw.rootProof)) {
-      return { type: 'page:ready', path: null, pathState: 'invalid' };
-    }
-    parsedRootProof = raw.rootProof;
-  }
-
   const docMeta = parsedDocId !== undefined ? { docId: parsedDocId } : {};
 
-  // Step 1: reject non-boolean root/invalidPath, explicit invalidPath: true, rootProof without root: true, or multiple location own properties
+  // Step 1: reject non-boolean root/invalidPath, explicit invalidPath: true, or multiple location own properties
   const locationKeyCount = Number(hasPath) + Number(hasRoot) + Number(hasInvalidPath);
   if (
     (hasRoot && typeof raw.root !== 'boolean') ||
     (hasInvalidPath && typeof raw.invalidPath !== 'boolean') ||
     raw.invalidPath === true ||
-    locationKeyCount > 1 ||
-    (hasRootProof && !(hasRoot && raw.root === true))
+    locationKeyCount > 1
   ) {
     return { type: 'page:ready', path: null, pathState: 'invalid', ...docMeta };
   }
@@ -492,13 +481,7 @@ function parsePageReady(raw: Record<string, unknown>): Extract<PageToViewer, { t
 
   // Step 3: only `root: true` own property present -> confirmed pathless version root
   if (hasRoot && raw.root === true) {
-    return {
-      type: 'page:ready',
-      path: null,
-      pathState: 'root',
-      ...docMeta,
-      ...(parsedRootProof !== undefined ? { rootProof: parsedRootProof } : {}),
-    };
+    return { type: 'page:ready', path: null, pathState: 'root', ...docMeta };
   }
 
   // Step 4: missing path and root !== true / invalidPath !== true -> unrecognized
@@ -611,7 +594,7 @@ const pageToViewer = z.discriminatedUnion('type', [
 // DALTON-HOOK(mobile-web): tri-state wire union for page:ready (validated on raw own properties in parsePageReady)
 export type PageReadyWire =
   | { type: 'page:ready'; v?: number; docId?: string; path: string }
-  | { type: 'page:ready'; v?: number; docId?: string; root: true; rootProof?: string }
+  | { type: 'page:ready'; v?: number; docId?: string; root: true }
   | { type: 'page:ready'; v?: number; docId?: string; invalidPath: true }
   | { type: 'page:ready'; v?: number; docId?: string };
 

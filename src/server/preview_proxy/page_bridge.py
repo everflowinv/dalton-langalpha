@@ -176,17 +176,7 @@ def _outside_comments(
         at = closed.end()
 
 
-# DALTON-HOOK(mobile-web): strict ASCII token pattern for server-signed version root proof meta
-_ROOT_PROOF_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
-
-
-def with_bridge(
-    document: bytes,
-    bridge: Bridge,
-    *,
-    # DALTON-HOOK(mobile-web): optional server-signed root proof for opaque-sandbox version root entries
-    root_proof: str | None = None,
-) -> bytes:
+def with_bridge(document: bytes, bridge: Bridge) -> bytes:
     """*document* with the bridge as the first thing in its head.
 
     A document with no head tag gets it after its html tag or doctype, where
@@ -202,14 +192,6 @@ def with_bridge(
     """
     tag = bridge.script
     if bridge.viewer_frame:
-        # DALTON-HOOK(mobile-web): prepend root proof meta right before bridge script so core.js reads and removes it first
-        if root_proof and _ROOT_PROOF_RE.fullmatch(root_proof):
-            tag = (
-                f'<meta name="dalton-root-proof" content="{root_proof}">'.encode(
-                    "ascii"
-                )
-                + tag
-            )
         if not _STYLES_OWN_SCROLLBAR.search(document):
             tag = _EMBED_SCROLLBARS + tag
         if not _declares_color_scheme(document):

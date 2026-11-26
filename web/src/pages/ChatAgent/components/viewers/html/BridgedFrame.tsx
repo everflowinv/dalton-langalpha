@@ -23,6 +23,12 @@ type RawFrameDoc =
   | { kind: 'root' }
   | { kind: 'unbridged' };
 
+type ReadyCandidate = {
+  docId: string | null;
+  raw: RawFrameDoc;
+  claimsRoot: boolean;
+};
+
 // DALTON-HOOK(mobile-web): left-anchored pathless version root entries (mirrors core.js DOC_ROOT);
 // only a host-initiated navigation whose framed URL matches this pattern may accept `root: true`.
 const VERSION_ROOT_PATH =
@@ -42,9 +48,11 @@ function matchesHostVersionRoot(
   frame: FramedDoc | null,
   expectedDocKey: string | null,
   el: HTMLIFrameElement | null,
-  messageRootProof?: string | null,
 ): boolean {
   if (!frame || expectedDocKey) return false;
+  // DALTON-HOOK(mobile-web): never recognize `root: true` in an opaque-origin sandbox;
+  // require the host to read the frame's actual same-origin location and confirm it matches the version root.
+  if (frame.origin === 'null' || !framedDirectly(frame.src) || !el) return false;
   let expectedUrl: URL;
   try {
     expectedUrl = new URL(frame.src, window.location.href);
@@ -54,32 +62,6 @@ function matchesHostVersionRoot(
   if (!VERSION_ROOT_PATH.test(expectedUrl.pathname)) return false;
 
   const norm = (p: string) => p.replace(/\/+$/, '');
-
-  // DALTON-HOOK(mobile-web): for opaque-origin sandboxes where contentWindow.location is unreadable,
-  // verify the server-signed one-time root proof embedded only on the pathless version root response.
-  if (frame.rootProof) {
-    if (!messageRootProof || messageRootProof !== frame.rootProof) {
-      return false;
-    }
-    if (framedDirectly(frame.src) && el) {
-      try {
-        const href = el.contentWindow?.location?.href;
-        if (href && href !== 'about:blank') {
-          const actualUrl = new URL(href);
-          if (actualUrl.origin !== expectedUrl.origin || norm(actualUrl.pathname) !== norm(expectedUrl.pathname)) {
-            return false;
-          }
-        }
-      } catch {
-        // Opaque origin: verified via server-signed rootProof above.
-      }
-    }
-    return true;
-  }
-
-  // Without a server-signed root proof, the host must be able to read the frame's actual same-origin
-  // location and confirm it matches the version root URL; never default to true when unreadable.
-  if (!framedDirectly(frame.src) || !el) return false;
   try {
     const href = el.contentWindow?.location?.href;
     if (!href || href === 'about:blank') return false;
@@ -134,8 +116,6 @@ export interface FrameSource {
   src: string;
   /** Which origin the document posts from follows from it: opaque without `allow-same-origin`. */
   sandbox: string;
-  // DALTON-HOOK(mobile-web): optional server-signed one-time root proof for opaque-sandbox version root entries
-  rootProof?: string | null;
 }
 
 /** The document the frame holds. */
@@ -227,8 +207,6 @@ export function BridgedFrame({
         src: source.src,
         origin: messageOrigin(source.src, source.sandbox),
         sandbox: source.sandbox,
-        // DALTON-HOOK(mobile-web): pin server-signed root proof onto the framed document
-        rootProof: source.rootProof ?? null,
       },
     };
     swap = frameSwap(swap, action);
@@ -282,13 +260,13 @@ export function BridgedFrame({
   // A load waiting for its hello, or a hello that came before its load. The
   // flags answer at once, since a hello can follow its load before React
   // renders again; `loads` restarts the wait for each load.
-  // DALTON-HOOK(mobile-web): correlate page:ready with the latest load via docId + page:ping/page:pong,
-  // and restrict `root: true` to a host-verified version root navigation.
-  const greetedDocRef = useRef<{ key: string; docId: string | null; raw: RawFrameDoc } | null>(null);
-  const verifyingRef = useRef<{ seq: number; key: string; docId: string | null; raw: RawFrameDoc } | null>(null);
+  // DALTON-HOOK(mobile-web): treat page:ready as a candidate only and publish confirmed doc state
+  // once page:pong matches both the latest load's navSeq and a recorded candidate docId.
+  const candidatesRef = useRef<{ key: string; docs: Map<string | null, ReadyCandidate> } | null>(null);
   const waiting = useRef(false);
   const navSeqRef = useRef(0);
   const currentKeyRef = useRef<string | null>(current);
+  const syncedKeyRef = useRef<string | null | undefined>(undefined);
   const isHostVersionRoot = isVersionRootUrl(frame?.src, expectedDocKey);
   const rootNavAllowedRef = useRef<{ key: string | null; allowed: boolean }>({
     key: null,
@@ -300,7 +278,11 @@ export function BridgedFrame({
   });
   useLayoutEffect(() => {
     currentKeyRef.current = current;
-    if (rootNavAllowedRef.current.key !== current) {
+    if (syncedKeyRef.current !== current) {
+      syncedKeyRef.current = current;
+      candidatesRef.current = null;
+      waiting.current = false;
+      navSeqRef.current += 1;
       rootNavAllowedRef.current = {
         key: current,
         allowed: current !== null && isHostVersionRoot,
@@ -340,10 +322,8 @@ export function BridgedFrame({
     dispatch({ type: 'loaded', key });
     onLoad?.();
     if (key !== currentKeyRef.current) return;
-    // DALTON-HOOK(mobile-web): every load bumps navSeqRef and starts a grace wait; if a pre-load
-    // page:ready arrived, ping the frame so a redirect-before-load can never consume the prior hello.
-    const greeted = greetedDocRef.current?.key === key ? greetedDocRef.current : null;
-    greetedDocRef.current = null;
+    // DALTON-HOOK(mobile-web): every load bumps navSeqRef and starts a grace wait; if candidate
+    // page:ready docs exist, ping the frame so only the live loaded document's matching pong confirms state.
     if (initialLoadSeenRef.current.key === key && initialLoadSeenRef.current.seen) {
       rootNavAllowedRef.current = { key, allowed: false };
     } else {
@@ -352,16 +332,9 @@ export function BridgedFrame({
     navSeqRef.current += 1;
     const seq = navSeqRef.current;
     waiting.current = true;
-    if (greeted) {
-      verifyingRef.current = { seq, key, docId: greeted.docId, raw: greeted.raw };
-      setDocTracking({
-        key,
-        raw: greeted.raw.kind === 'unbridged' ? { kind: 'unbridged' } : { kind: 'pending' },
-      });
+    setDocTracking({ key, raw: { kind: 'pending' } });
+    if (candidatesRef.current?.key === key && candidatesRef.current.docs.size > 0) {
       post({ type: 'page:ping', seq });
-    } else {
-      verifyingRef.current = null;
-      setDocTracking({ key, raw: { kind: 'pending' } });
     }
     setLoads((n) => n + 1);
   };
@@ -371,8 +344,7 @@ export function BridgedFrame({
   const unbridged = useEffectEvent((key: string | null) => {
     // DALTON-HOOK(mobile-web): clear stale bridge.path, revoke host root eligibility, and report unbridged
     if (key !== null) rootNavAllowedRef.current = { key, allowed: false };
-    verifyingRef.current = null;
-    greetedDocRef.current = null;
+    candidatesRef.current = null;
     bridge.clearPath?.();
     setOffPageOf(key);
     setDocTracking({ key, raw: { kind: 'unbridged' } });
@@ -386,19 +358,14 @@ export function BridgedFrame({
     const timer = setTimeout(() => {
       if (!waiting.current || navSeqRef.current !== seq || currentKeyRef.current !== key) return;
       waiting.current = false;
-      verifyingRef.current = null;
       unbridged(key);
     }, UNBRIDGED_GRACE_MS);
     return () => clearTimeout(timer);
   }, [loads]);
   useEffect(() => {
-    greetedDocRef.current = null;
-    verifyingRef.current = null;
-    waiting.current = false;
-    // DALTON-HOOK(mobile-web): invalidate pending grace timers and reset doc state on frameKey change
-    navSeqRef.current += 1;
+    // DALTON-HOOK(mobile-web): reset off-page overlay and doc state on frameKey change
     setOffPageOf(null);
-    setDocTracking({ key: current, raw: { kind: 'pending' } });
+    setDocTracking((prev) => (prev.key === current ? prev : { key: current, raw: { kind: 'pending' } }));
   }, [current]);
 
   const onMessage = useEffectEvent((message: PageToViewer) => {
@@ -419,18 +386,39 @@ export function BridgedFrame({
         setGround(message.color);
         return;
       case 'page:pong': {
-        // DALTON-HOOK(mobile-web): confirm the document that finished load matches both seq and docId
-        const verifying = verifyingRef.current;
-        if (!verifying || message.seq !== verifying.seq || navSeqRef.current !== verifying.seq || current !== verifying.key) {
+        // DALTON-HOOK(mobile-web): confirm the document that finished load matches both latest navSeq and a candidate docId
+        if (!waiting.current || message.seq !== navSeqRef.current || current === null) {
           return;
         }
-        const docMatches = verifying.docId !== null
-          ? message.docId === verifying.docId
-          : message.docId === undefined;
-        if (!docMatches) return;
-        verifyingRef.current = null;
+        const bucket = candidatesRef.current;
+        if (!bucket || bucket.key !== current) return;
+        const docId = message.docId ?? null;
+        const candidate = bucket.docs.get(docId);
+        if (!candidate) return;
+
+        let confirmedRaw = candidate.raw;
+        if (candidate.claimsRoot) {
+          const allowRoot =
+            rootNavAllowedRef.current.key === current &&
+            rootNavAllowedRef.current.allowed &&
+            matchesHostVersionRoot(frame, expectedDocKey, frameRef.current);
+          confirmedRaw = allowRoot ? { kind: 'root' } : { kind: 'unbridged' };
+        }
+        rootNavAllowedRef.current = { key: current, allowed: false };
+
+        if (confirmedRaw.kind === 'unbridged') {
+          bridge.clearPath?.();
+          setOffPageOf(current);
+        } else {
+          setOffPageOf(null);
+        }
+
         waiting.current = false;
-        setDocTracking({ key: verifying.key, raw: verifying.raw });
+        // Retain only the confirmed candidate in case this same document's load fires after it
+        // answered an earlier wait's ping; prune all other stale candidates.
+        bucket.docs.clear();
+        bucket.docs.set(docId, { docId, raw: confirmedRaw, claimsRoot: candidate.claimsRoot });
+        setDocTracking({ key: current, raw: confirmedRaw });
         return;
       }
       case 'page:frame-loads': {
@@ -446,11 +434,10 @@ export function BridgedFrame({
         const el = frameRef.current;
         if (!next || !el || carried.current === message.doc) return;
         carried.current = message.doc;
-        // DALTON-HOOK(mobile-web): invalidate prior greeted/verifying/root state before reloading with view
+        // DALTON-HOOK(mobile-web): invalidate prior candidates/root state before reloading with view
         navSeqRef.current += 1;
         waiting.current = false;
-        greetedDocRef.current = null;
-        verifyingRef.current = null;
+        candidatesRef.current = null;
         if (current !== null) rootNavAllowedRef.current = { key: current, allowed: false };
         setDocTracking({ key: current, raw: { kind: 'pending' } });
         sendFrameTo(el, next);
@@ -458,38 +445,34 @@ export function BridgedFrame({
       }
       case 'page:ready': {
         carried.current = null;
-        // DALTON-HOOK(mobile-web): invalidate active grace timer, gate `root: true` on host-verified
-        // version root navigation, and retain docId so a subsequent load confirms this exact document.
-        navSeqRef.current += 1;
-        verifyingRef.current = null;
-        waiting.current = false;
-
-        const allowRoot =
-          current !== null &&
-          rootNavAllowedRef.current.key === current &&
-          rootNavAllowedRef.current.allowed &&
-          matchesHostVersionRoot(frame, expectedDocKey, frameRef.current, message.rootProof);
-        if (current !== null) {
-          rootNavAllowedRef.current = { key: current, allowed: false };
-        }
-
-        let nextRaw: RawFrameDoc;
+        if (current === null) return;
+        // DALTON-HOOK(mobile-web): record page:ready as a candidate only; never publish state or
+        // cancel the active load wait until a page:pong matching both navSeq and docId confirms it.
+        const docId = message.docId ?? null;
+        let candidate: ReadyCandidate;
         if (message.pathState === 'path' && message.path) {
-          setOffPageOf(null);
-          nextRaw = { kind: 'path', path: message.path };
-        } else if (message.pathState === 'root' && allowRoot) {
-          setOffPageOf(null);
-          nextRaw = { kind: 'root' };
+          candidate = { docId, raw: { kind: 'path', path: message.path }, claimsRoot: false };
+        } else if (message.pathState === 'root') {
+          candidate = { docId, raw: { kind: 'root' }, claimsRoot: true };
         } else {
-          // invalid, unrecognized, or unconfirmed root: true -> clear stale bridge.path and enter unbridged
-          bridge.clearPath?.();
-          setOffPageOf(current);
-          nextRaw = { kind: 'unbridged' };
+          candidate = { docId, raw: { kind: 'unbridged' }, claimsRoot: false };
         }
-        setDocTracking({ key: current, raw: nextRaw });
-        greetedDocRef.current = current !== null
-          ? { key: current, docId: message.docId ?? null, raw: nextRaw }
-          : null;
+
+        let bucket = candidatesRef.current;
+        if (!bucket || bucket.key !== current) {
+          bucket = { key: current, docs: new Map() };
+          candidatesRef.current = bucket;
+        }
+        bucket.docs.delete(docId);
+        bucket.docs.set(docId, candidate);
+        if (bucket.docs.size > 8) {
+          const oldestKey = bucket.docs.keys().next().value;
+          if (oldestKey !== undefined) bucket.docs.delete(oldestKey);
+        }
+
+        if (waiting.current) {
+          post({ type: 'page:ping', seq: navSeqRef.current });
+        }
 
         // The first hello of a new frame, not a link inside it to another file.
         const pending = carry.current;

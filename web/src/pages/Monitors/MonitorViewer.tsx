@@ -63,15 +63,15 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
   const detail = detailQuery.data;
   const monitor = detail?.monitor;
   const [selectedSeq, setSelectedSeq] = useState<number | null>(null);
-  const [grantInfo, setGrantInfo] = useState<{
+  const [mountTime] = useState(() => Date.now());
+  const [renewedGrant, setRenewedGrant] = useState<{
     slug: string;
+    forDetail: MonitorDetail;
     grant: string;
     frameBase: string;
     dataBase: string;
     expiresIn: number;
     receivedAt: number;
-    rootNonce?: string;
-    rootProof?: string;
   } | null>(null);
   const [copied, setCopied] = useState(false);
 
@@ -79,24 +79,26 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     setSelectedSeq(null);
   }, [slug]);
 
-  useEffect(() => {
-    if (!detail) return;
-    setGrantInfo({
+  // Periodically renew monitor_grant before its 12h expiry and push to iframe via postMessage.
+  // Derive activeGrant synchronously from detail so version refreshes update frame key, src, and docState together.
+  const detailReceivedAt = detailQuery.dataUpdatedAt || mountTime;
+  const activeGrant = useMemo(() => {
+    if (!detail || detail.monitor.slug !== slug) return null;
+    if (renewedGrant && renewedGrant.slug === slug && renewedGrant.forDetail === detail) {
+      return renewedGrant;
+    }
+    return {
       slug: detail.monitor.slug,
       grant: detail.monitor_grant,
       frameBase: detail.frame_base,
       dataBase: detail.data_base,
       expiresIn: detail.expires_in,
-      receivedAt: Date.now(),
-      rootNonce: detail.root_nonce,
-      rootProof: detail.root_proof,
-    });
-  }, [detail]);
+      receivedAt: detailReceivedAt,
+    };
+  }, [detail, slug, renewedGrant, detailReceivedAt]);
 
-  // Periodically renew monitor_grant before its 12h expiry and push to iframe via postMessage.
-  const activeGrant = grantInfo && grantInfo.slug === slug ? grantInfo : null;
   useEffect(() => {
-    if (publicMode || !activeGrant || activeGrant.expiresIn <= 0) return;
+    if (publicMode || !activeGrant || !detail || activeGrant.expiresIn <= 0) return;
     const waitMs = Math.max(
       msUntilRenewal(activeGrant.expiresIn, activeGrant.receivedAt, GRANT_RENEW_MARGIN_MS),
       MIN_RENEW_INTERVAL_MS,
@@ -104,8 +106,9 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     const timer = window.setTimeout(() => {
       void mintMonitorGrant(slug)
         .then((next) => {
-          setGrantInfo({
+          setRenewedGrant({
             slug,
+            forDetail: detail,
             grant: next.monitor_grant,
             frameBase: next.frame_base,
             dataBase: next.data_base,
@@ -118,7 +121,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
         });
     }, waitMs);
     return () => window.clearTimeout(timer);
-  }, [publicMode, activeGrant, slug, detailQuery]);
+  }, [publicMode, activeGrant, detail, slug, detailQuery]);
 
   const effectiveSeq = publicMode
     ? (monitor?.published_seq || 1)
@@ -132,15 +135,10 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     const prefix = versionPrefix(activeGrant.frameBase, effectiveSeq);
     if (!effectiveEntryPath) {
       if (!publicMode) return null;
-      const rootUrl = `${prefix.replace(/\/+$/, '')}/`;
-      const src = activeGrant.rootNonce
-        ? `${rootUrl}?root_nonce=${encodeURIComponent(activeGrant.rootNonce)}`
-        : rootUrl;
       return {
         key: `${monitor.monitor_id}:v${effectiveSeq}`,
-        src,
+        src: `${prefix.replace(/\/+$/, '')}/`,
         sandbox: SERVED_HTML_SANDBOX,
-        rootProof: activeGrant.rootProof ?? null,
       };
     }
     return {

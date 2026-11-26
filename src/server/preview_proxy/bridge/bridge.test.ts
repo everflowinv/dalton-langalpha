@@ -2016,56 +2016,6 @@ describe('the page bridge classifies docLocation into path, root, or invalidPath
     }
   });
 
-  it('reads and strips dalton-root-proof meta into rootProof on pathless version roots only', () => {
-    const proof = 'signed_root_proof_token_123456';
-    const rootSent: Record<string, unknown>[] = [];
-    const rootViewer = { postMessage: (message: unknown) => rootSent.push(JSON.parse(JSON.stringify(message))) };
-    const { window: rootWin } = new JSDOM(
-      `<!doctype html><html><head><meta name="dalton-root-proof" content="${proof}"><script>${BRIDGE}</script></head><body></body></html>`,
-      {
-        url: 'https://api.example.com/api/v1/dalton/monitors/public/public-market-pulse/v/4/?root_nonce=nonce-12345678901234',
-        runScripts: 'dangerously',
-        pretendToBeVisual: true,
-        beforeParse(win) {
-          Object.defineProperty(win, 'parent', { value: rootViewer, configurable: true });
-        },
-      },
-    );
-    open.push(rootWin);
-    expect(rootSent.find((m) => m.type === 'page:ready')).toEqual({
-      type: 'page:ready',
-      v: 1,
-      docId: expect.any(String),
-      root: true,
-      rootProof: proof,
-    });
-    expect(rootWin.document.querySelector('meta[name="dalton-root-proof"]')).toBeNull();
-
-    // A non-root path page must never attach rootProof to page:ready.
-    const pathSent: Record<string, unknown>[] = [];
-    const pathViewer = { postMessage: (message: unknown) => pathSent.push(JSON.parse(JSON.stringify(message))) };
-    const { window: pathWin } = new JSDOM(
-      `<!doctype html><html><head><meta name="dalton-root-proof" content="${proof}"><script>${BRIDGE}</script></head><body></body></html>`,
-      {
-        url: 'https://api.example.com/api/v1/dalton/monitors/public/public-market-pulse/v/4/other.html',
-        runScripts: 'dangerously',
-        pretendToBeVisual: true,
-        beforeParse(win) {
-          Object.defineProperty(win, 'parent', { value: pathViewer, configurable: true });
-        },
-      },
-    );
-    open.push(pathWin);
-    const pathReady = pathSent.find((m) => m.type === 'page:ready');
-    expect(pathReady).toEqual({
-      type: 'page:ready',
-      v: 1,
-      docId: expect.any(String),
-      path: 'other.html',
-    });
-    expect(Object.prototype.hasOwnProperty.call(pathReady, 'rootProof')).toBe(false);
-  });
-
   it('sends invalidPath: true for traversal, backslashes, control chars, bad encoding, overlong paths, and unrecognized prefixes', () => {
     const overlong = 'a'.repeat(1025);
     const invalidUrls = [

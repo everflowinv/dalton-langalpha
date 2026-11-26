@@ -167,6 +167,35 @@ function stubFrameWindow(
   return { postMessage };
 }
 
+function trackPings(postMessage: { mockImplementation: (fn: (msg: unknown) => void) => unknown }): number[] {
+  const pings: number[] = [];
+  postMessage.mockImplementation((msg: unknown) => {
+    if (msg && typeof msg === 'object' && (msg as { type?: string }).type === 'page:ping') {
+      pings.push((msg as { seq: number }).seq);
+    }
+  });
+  return pings;
+}
+
+function confirmDoc(
+  iframe: HTMLIFrameElement,
+  pings: number[],
+  payload: Record<string, unknown>,
+  origin = 'null',
+) {
+  const before = pings.length;
+  const docId = typeof payload.docId === 'string' ? payload.docId : undefined;
+  postFromFrame(iframe, payload, origin);
+  fireEvent.load(iframe);
+  expect(pings.length).toBeGreaterThan(before);
+  const seq = pings.at(-1)!;
+  postFromFrame(
+    iframe,
+    docId !== undefined ? { type: 'page:pong', v: 1, seq, docId } : { type: 'page:pong', v: 1, seq },
+    origin,
+  );
+}
+
 function makeCommentUi() {
   return {
     modeTab: null,
@@ -322,59 +351,62 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
     );
 
     const iframe = container.querySelector('iframe')!;
+    const pings = trackPings(vi.spyOn(iframe.contentWindow!, 'postMessage'));
     expect(docStates.at(-1)).toEqual({ kind: 'pending' });
     expect(onBridge).toHaveBeenCalledWith(expect.objectContaining({ frameKey: 'view:ws:reports/a.html:' }), 'view:ws:reports/a.html:');
 
-    // 1. Current document A.
-    postFromFrame(iframe, { type: 'page:ready', v: 1, path: 'reports/a.html' });
+    // 1. Current document A (page:ready alone stays pending until load + matching page:pong).
+    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-a', path: 'reports/a.html' });
+    expect(docStates.at(-1)).toEqual({ kind: 'pending' });
+    fireEvent.load(iframe);
+    expect(pings).toHaveLength(1);
+    postFromFrame(iframe, { type: 'page:pong', v: 1, seq: pings[0], docId: 'doc-a' });
     expect(docStates.at(-1)).toEqual({ kind: 'current', path: 'reports/a.html' });
     expect(latestBridge.current?.path).toBe('reports/a.html');
 
     // 2. In-frame link to document B.
-    postFromFrame(iframe, { type: 'page:ready', v: 1, path: 'reports/b.html' });
+    confirmDoc(iframe, pings, { type: 'page:ready', v: 1, docId: 'doc-b', path: 'reports/b.html' });
     expect(docStates.at(-1)).toEqual({ kind: 'linked', path: 'reports/b.html' });
     expect(latestBridge.current?.path).toBe('reports/b.html');
 
     // 3. Normal file frame MUST reject self-declared `root: true` (treated as unrecognized -> unbridged).
-    postFromFrame(iframe, { type: 'page:ready', v: 1, root: true });
+    confirmDoc(iframe, pings, { type: 'page:ready', v: 1, docId: 'doc-root', root: true });
     expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
     expect(latestBridge.current?.path).toBeNull();
 
     // 4. All conflicting, invalid, and missing-root messages clear bridge.path and enter { kind: 'unbridged', currentUrl: null }.
     const badPayloads: Record<string, unknown>[] = [
-      { type: 'page:ready', v: 1, root: true },
-      { type: 'page:ready', v: 1, path: undefined, root: true },
-      { type: 'page:ready', v: 1, path: null, root: true },
-      { type: 'page:ready', v: 1, path: 'a.html', root: true },
-      { type: 'page:ready', v: 1, path: undefined },
-      { type: 'page:ready', v: 1, invalidPath: true },
-      { type: 'page:ready', v: 1 },
+      { type: 'page:ready', v: 1, docId: 'bad-1', root: true },
+      { type: 'page:ready', v: 1, docId: 'bad-2', path: undefined, root: true },
+      { type: 'page:ready', v: 1, docId: 'bad-3', path: null, root: true },
+      { type: 'page:ready', v: 1, docId: 'bad-4', path: 'a.html', root: true },
+      { type: 'page:ready', v: 1, docId: 'bad-5', path: undefined },
+      { type: 'page:ready', v: 1, docId: 'bad-6', invalidPath: true },
+      { type: 'page:ready', v: 1, docId: 'bad-7' },
     ];
     for (const payload of badPayloads) {
-      postFromFrame(iframe, { type: 'page:ready', v: 1, path: 'reports/a.html' });
+      confirmDoc(iframe, pings, { type: 'page:ready', v: 1, docId: 'doc-a-ok', path: 'reports/a.html' });
       expect(latestBridge.current?.path).toBe('reports/a.html');
-      postFromFrame(iframe, payload);
+      confirmDoc(iframe, pings, payload);
       expect(latestBridge.current?.path).toBeNull();
       expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
     }
   });
 
-  it('accepts root: true in an opaque sandbox only with a matching server rootProof and rejects forged or redirected root: true', () => {
+  it('treats root: true in an opaque sandbox as unrecognized (unbridged) even on a host-initiated version root', () => {
     vi.useFakeTimers();
     const docStates: HtmlFrameDocState[] = [];
     const onUnbridged = vi.fn();
-    const expectedProof = 'server_root_proof_1234567890abcdef';
 
     const { container } = renderWithProviders(
       <BridgedFrame
         source={{
-          key: 'mon-pub-1:v4',
-          src: '/api/v1/dalton/monitors/public/public-pulse/v/4/?root_nonce=nonce-12345678901234',
+          key: 'mon-pub-opaque:v4',
+          src: '/api/v1/dalton/monitors/public/public-pulse/v/4/',
           sandbox: 'allow-scripts',
-          rootProof: expectedProof,
         }}
-        title="Public Pulse"
-        groundKey="mon-pub-1"
+        title="Public Pulse Opaque"
+        groundKey="mon-pub-opaque"
         expectedDocKey={null}
         onDocStateChange={(state) => docStates.push(state)}
         onUnbridged={onUnbridged}
@@ -382,85 +414,23 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
     );
 
     const iframe = container.querySelector('iframe')!;
-    const pings: number[] = [];
     const { postMessage } = stubFrameWindow(iframe, { throwSecurityError: true });
-    postMessage.mockImplementation((msg: unknown) => {
-      if (msg && typeof msg === 'object' && (msg as { type?: string }).type === 'page:ping') {
-        pings.push((msg as { seq: number }).seq);
-      }
-    });
+    const pings = trackPings(postMessage);
 
-    // Host-initiated initial navigation to opaque version root with matching server proof -> enters bridged_root.
-    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-root-1', root: true, rootProof: expectedProof });
-    expect(docStates.at(-1)).toEqual({ kind: 'bridged_root' });
-
-    // Same document finishes load and echoes page:pong with matching docId -> remains bridged_root.
+    // Opaque sandbox cannot expose contentWindow.location -> root: true is treated as unrecognized (unbridged).
+    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-opaque-root', root: true });
+    expect(docStates.at(-1)).toEqual({ kind: 'pending' });
     fireEvent.load(iframe);
     expect(pings).toHaveLength(1);
-    postFromFrame(iframe, { type: 'page:pong', v: 1, seq: pings[0], docId: 'doc-root-1' });
-    expect(docStates.at(-1)).toEqual({ kind: 'bridged_root' });
+    postFromFrame(iframe, { type: 'page:pong', v: 1, seq: pings[0], docId: 'doc-opaque-root' });
+    expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
+
+    // Confirmed via pong so grace timer does not re-fire onUnbridged.
     act(() => { vi.advanceTimersByTime(3000); });
     expect(onUnbridged).not.toHaveBeenCalled();
-
-    // Navigating away and later forging root: true (even with the old proof) without host navigation is rejected.
-    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-away', invalidPath: true });
-    expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
-    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-forged', root: true, rootProof: expectedProof });
-    expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
   });
 
-  it('rejects root: true in an opaque sandbox when rootProof is missing or mismatched (initial navigation redirected)', () => {
-    // Case 1: Opaque sandbox with NO server rootProof (cannot read contentWindow.location) -> must NOT default to true.
-    const noProofStates: HtmlFrameDocState[] = [];
-    const { container: noProofContainer, unmount: unmountNoProof } = renderWithProviders(
-      <BridgedFrame
-        source={{
-          key: 'mon-pub-noproof:v4',
-          src: '/api/v1/dalton/monitors/public/public-pulse/v/4/',
-          sandbox: 'allow-scripts',
-        }}
-        title="Public Pulse No Proof"
-        groundKey="mon-pub-noproof"
-        expectedDocKey={null}
-        onDocStateChange={(state) => noProofStates.push(state)}
-      />,
-    );
-    const noProofIframe = noProofContainer.querySelector('iframe')!;
-    stubFrameWindow(noProofIframe, { throwSecurityError: true });
-    postFromFrame(noProofIframe, { type: 'page:ready', v: 1, docId: 'doc-unverified', root: true });
-    expect(noProofStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
-    unmountNoProof();
-
-    // Case 2: Opaque sandbox with expected server rootProof, but initial navigation redirected to a target
-    // that posts root: true without the server proof (or with a forged proof) -> stays unbridged.
-    for (const redirectedPayload of [
-      { type: 'page:ready', v: 1, docId: 'doc-redir-1', root: true },
-      { type: 'page:ready', v: 1, docId: 'doc-redir-2', root: true, rootProof: 'wrong_forged_proof_1234567890' },
-    ]) {
-      const states: HtmlFrameDocState[] = [];
-      const { container, unmount } = renderWithProviders(
-        <BridgedFrame
-          source={{
-            key: `mon-pub-redir:${String(redirectedPayload.docId)}`,
-            src: '/api/v1/dalton/monitors/public/public-pulse/v/4/?root_nonce=nonce-12345678901234',
-            sandbox: 'allow-scripts',
-            rootProof: 'server_root_proof_1234567890abcdef',
-          }}
-          title="Public Pulse Redirected"
-          groundKey="mon-pub-redir"
-          expectedDocKey={null}
-          onDocStateChange={(state) => states.push(state)}
-        />,
-      );
-      const iframe = container.querySelector('iframe')!;
-      stubFrameWindow(iframe, { throwSecurityError: true });
-      postFromFrame(iframe, redirectedPayload);
-      expect(states.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
-      unmount();
-    }
-  });
-
-  it('verifies same-origin readable location for version roots without rootProof and rejects redirected paths', () => {
+  it('verifies same-origin readable location for version roots into bridged_root and rejects redirected or subsequent root claims', () => {
     const okStates: HtmlFrameDocState[] = [];
     const { container: okContainer, unmount: unmountOk } = renderWithProviders(
       <BridgedFrame
@@ -476,9 +446,21 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
       />,
     );
     const okIframe = okContainer.querySelector('iframe')!;
-    stubFrameWindow(okIframe, { href: `${window.location.origin}/api/v1/dalton/monitors/public/public-pulse/v/4/` });
+    const { postMessage: okPost } = stubFrameWindow(okIframe, {
+      href: `${window.location.origin}/api/v1/dalton/monitors/public/public-pulse/v/4/`,
+    });
+    const okPings = trackPings(okPost);
+
     postFromFrame(okIframe, { type: 'page:ready', v: 1, docId: 'doc-so-1', root: true }, window.location.origin);
+    expect(okStates.at(-1)).toEqual({ kind: 'pending' });
+    fireEvent.load(okIframe);
+    expect(okPings).toHaveLength(1);
+    postFromFrame(okIframe, { type: 'page:pong', v: 1, seq: okPings[0], docId: 'doc-so-1' }, window.location.origin);
     expect(okStates.at(-1)).toEqual({ kind: 'bridged_root' });
+
+    // Subsequent in-frame navigation claiming root: true without host navigation is rejected.
+    confirmDoc(okIframe, okPings, { type: 'page:ready', v: 1, docId: 'doc-so-forged', root: true }, window.location.origin);
+    expect(okStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
     unmountOk();
 
     const badStates: HtmlFrameDocState[] = [];
@@ -496,8 +478,11 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
       />,
     );
     const badIframe = badContainer.querySelector('iframe')!;
-    stubFrameWindow(badIframe, { href: `${window.location.origin}/api/v1/dalton/monitors/public/public-pulse/v/4/other.html` });
-    postFromFrame(badIframe, { type: 'page:ready', v: 1, docId: 'doc-so-2', root: true }, window.location.origin);
+    const { postMessage: badPost } = stubFrameWindow(badIframe, {
+      href: `${window.location.origin}/api/v1/dalton/monitors/public/public-pulse/v/4/other.html`,
+    });
+    const badPings = trackPings(badPost);
+    confirmDoc(badIframe, badPings, { type: 'page:ready', v: 1, docId: 'doc-so-2', root: true }, window.location.origin);
     expect(badStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
   });
 
@@ -524,15 +509,11 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
     );
 
     const iframe = container.querySelector('iframe')!;
-    const pings: number[] = [];
-    vi.spyOn(iframe.contentWindow!, 'postMessage').mockImplementation((msg: unknown) => {
-      if (msg && typeof msg === 'object' && (msg as { type?: string }).type === 'page:ping') {
-        pings.push((msg as { seq: number }).seq);
-      }
-    });
+    const pings = trackPings(vi.spyOn(iframe.contentWindow!, 'postMessage'));
 
-    // 1. Same navigation: document A sends page:ready(doc-a), finishes load, and echoes page:pong(doc-a) -> stays current.
+    // 1. Same navigation: document A sends page:ready(doc-a), stays pending until load + page:pong(doc-a).
     postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-a', path: 'reports/a.html' });
+    expect(docStates.at(-1)).toEqual({ kind: 'pending' });
     fireEvent.load(iframe);
     expect(docStates.at(-1)).toEqual({ kind: 'pending' });
     expect(pings).toHaveLength(1);
@@ -542,18 +523,20 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
     expect(onUnbridged).not.toHaveBeenCalled();
 
     // 2. While previous load A is still waiting, new document B sends page:ready(doc-b) BEFORE B's load fires.
-    //    B's subsequent load MUST ping B and confirm doc-b via page:pong(doc-b), never misclassifying B as unbridged.
+    //    B stays pending as a candidate until matching pong, and B's own subsequent load still confirms doc-b.
     fireEvent.load(iframe);
     expect(docStates.at(-1)).toEqual({ kind: 'pending' });
     act(() => { vi.advanceTimersByTime(1000); });
     postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-b', path: 'reports/b.html' });
-    expect(docStates.at(-1)).toEqual({ kind: 'linked', path: 'reports/b.html' });
+    expect(docStates.at(-1)).toEqual({ kind: 'pending' });
 
-    // B finishes loading -> triggers page:ping -> B echoes page:pong with doc-b -> stays linked.
+    // B finishes loading -> triggers page:ping -> B echoes page:pong with doc-b -> enters linked.
+    const pingsBeforeBLoad = pings.length;
     fireEvent.load(iframe);
     expect(docStates.at(-1)).toEqual({ kind: 'pending' });
-    expect(pings).toHaveLength(2);
-    postFromFrame(iframe, { type: 'page:pong', v: 1, seq: pings[1], docId: 'doc-b' });
+    expect(pings.length).toBeGreaterThan(pingsBeforeBLoad);
+    const seqB = pings.at(-1)!;
+    postFromFrame(iframe, { type: 'page:pong', v: 1, seq: seqB, docId: 'doc-b' });
     expect(docStates.at(-1)).toEqual({ kind: 'linked', path: 'reports/b.html' });
     act(() => { vi.advanceTimersByTime(3000); });
     expect(onUnbridged).not.toHaveBeenCalled();
@@ -561,20 +544,81 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
 
     // 3. Redirect before load finishes with mismatched docId on page:pong -> rejected and times out to unbridged.
     postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-a2', path: 'reports/a.html' });
-    expect(docStates.at(-1)).toEqual({ kind: 'current', path: 'reports/a.html' });
-    expect(latestBridge.current?.path).toBe('reports/a.html');
+    // Candidate only: does NOT overwrite confirmed linked state before load + pong.
+    expect(docStates.at(-1)).toEqual({ kind: 'linked', path: 'reports/b.html' });
 
+    const pingsBeforeRedir = pings.length;
     fireEvent.load(iframe);
     expect(docStates.at(-1)).toEqual({ kind: 'pending' });
-    expect(pings).toHaveLength(3);
+    expect(pings.length).toBeGreaterThan(pingsBeforeRedir);
+    const seqRedir = pings.at(-1)!;
     // A pong with a different docId (or missing docId) must NOT confirm doc-a2.
-    postFromFrame(iframe, { type: 'page:pong', v: 1, seq: pings[2], docId: 'doc-other' });
-    postFromFrame(iframe, { type: 'page:pong', v: 1, seq: pings[2] });
+    postFromFrame(iframe, { type: 'page:pong', v: 1, seq: seqRedir, docId: 'doc-other' });
+    postFromFrame(iframe, { type: 'page:pong', v: 1, seq: seqRedir });
     expect(docStates.at(-1)).toEqual({ kind: 'pending' });
     act(() => { vi.advanceTimersByTime(2500); });
     expect(onUnbridged).toHaveBeenCalledTimes(1);
     expect(latestBridge.current?.path).toBeNull();
     expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
+  });
+
+  it('treats page:ready as a candidate only and prevents a delayed old page:ready arriving after a new load from overwriting state', () => {
+    vi.useFakeTimers();
+    const docStates: HtmlFrameDocState[] = [];
+    const onUnbridged = vi.fn();
+
+    const { container } = renderWithProviders(
+      <BridgedFrame
+        source={{
+          key: 'view:ws:reports/a.html:',
+          src: '/api/v1/public/shared/tok-1/files/serve/reports/a.html?inject=view',
+          sandbox: 'allow-scripts',
+        }}
+        title="Report A"
+        groundKey="reports/a.html"
+        expectedDocKey="reports/a.html"
+        onDocStateChange={(state) => docStates.push(state)}
+        onUnbridged={onUnbridged}
+      />,
+    );
+
+    const iframe = container.querySelector('iframe')!;
+    const pings = trackPings(vi.spyOn(iframe.contentWindow!, 'postMessage'));
+
+    // 1. Confirm initial doc A.
+    confirmDoc(iframe, pings, { type: 'page:ready', v: 1, docId: 'doc-a', path: 'reports/a.html' });
+    expect(docStates.at(-1)).toEqual({ kind: 'current', path: 'reports/a.html' });
+
+    // 2. New unbridged doc loads -> delayed old page:ready(doc-a) arrives AFTER the new load.
+    //    Old ready must stay candidate-only (never overwriting pending or cancelling the wait),
+    //    so without a matching pong the load still times out into unbridged.
+    fireEvent.load(iframe);
+    expect(docStates.at(-1)).toEqual({ kind: 'pending' });
+    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-a', path: 'reports/a.html' });
+    expect(docStates.at(-1)).toEqual({ kind: 'pending' });
+    act(() => { vi.advanceTimersByTime(2500); });
+    expect(onUnbridged).toHaveBeenCalledTimes(1);
+    expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
+
+    // Even a late stale ready arriving after timeout cannot overwrite unbridged.
+    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-a', path: 'reports/a.html' });
+    expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
+
+    // 3. New bridged doc B sends ready and loads, then delayed old ready(doc-a) arrives BEFORE B's pong.
+    //    State stays pending until B's pong matches both latest load seq and doc-b.
+    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-b', path: 'reports/b.html' });
+    const pingsBeforeB = pings.length;
+    fireEvent.load(iframe);
+    expect(docStates.at(-1)).toEqual({ kind: 'pending' });
+    expect(pings.length).toBeGreaterThan(pingsBeforeB);
+    const seqB = pings.at(-1)!;
+    // Delayed old ready from A arrives while waiting for B's pong -> must NOT overwrite or drop candidate doc-b.
+    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'doc-a', path: 'reports/a.html' });
+    expect(docStates.at(-1)).toEqual({ kind: 'pending' });
+    postFromFrame(iframe, { type: 'page:pong', v: 1, seq: seqB, docId: 'doc-b' });
+    expect(docStates.at(-1)).toEqual({ kind: 'linked', path: 'reports/b.html' });
+    act(() => { vi.advanceTimersByTime(3000); });
+    expect(onUnbridged).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -635,7 +679,8 @@ describe('ArtifactFrames and HtmlViewer onShownDocChange forwarding', () => {
     );
 
     const liveIframe = container.querySelector('iframe')!;
-    postFromFrame(liveIframe, { type: 'page:ready', v: 1, path: 'reports/linked.html' });
+    const livePings = trackPings(vi.spyOn(liveIframe.contentWindow!, 'postMessage'));
+    confirmDoc(liveIframe, livePings, { type: 'page:ready', v: 1, docId: 'live-doc-1', path: 'reports/linked.html' });
     expect(reported.at(-1)).toEqual({ kind: 'linked', path: 'reports/linked.html' });
 
     // Switch to published version 2 -> active layer becomes the version frame (starts pending).
@@ -656,12 +701,13 @@ describe('ArtifactFrames and HtmlViewer onShownDocChange forwarding', () => {
     const frames = container.querySelectorAll('iframe');
     expect(frames).toHaveLength(2);
     const versionIframe = frames[1];
+    const versionPings = trackPings(vi.spyOn(versionIframe.contentWindow!, 'postMessage'));
     // Version frame reporting a valid doc updates onShownDocChange.
-    postFromFrame(versionIframe, { type: 'page:ready', v: 1, path: 'reports/a.html' });
+    confirmDoc(versionIframe, versionPings, { type: 'page:ready', v: 1, docId: 'ver-doc-1', path: 'reports/a.html' });
     expect(reported.at(-1)).toEqual({ kind: 'current', path: 'reports/a.html' });
 
     // Version frame reporting invalidPath -> unbridged.
-    postFromFrame(versionIframe, { type: 'page:ready', v: 1, invalidPath: true });
+    confirmDoc(versionIframe, versionPings, { type: 'page:ready', v: 1, docId: 'ver-doc-2', invalidPath: true });
     expect(reported.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
   });
 
@@ -681,8 +727,9 @@ describe('ArtifactFrames and HtmlViewer onShownDocChange forwarding', () => {
     );
 
     const iframe = container.querySelector('iframe')!;
+    const pings = trackPings(vi.spyOn(iframe.contentWindow!, 'postMessage'));
     expect(reported.at(-1)).toEqual({ kind: 'pending' });
-    postFromFrame(iframe, { type: 'page:ready', v: 1, path: 'reports/b.html' });
+    confirmDoc(iframe, pings, { type: 'page:ready', v: 1, docId: 'viewer-doc-1', path: 'reports/b.html' });
     expect(reported.at(-1)).toEqual({ kind: 'linked', path: 'reports/b.html' });
   });
 });
@@ -882,11 +929,8 @@ describe('FileHeaderActions desktop & mobile parity across HtmlFrameDocState', (
   });
 });
 
-describe('MonitorViewer bridged_root and unbridged handling', () => {
-  const PUBLIC_ROOT_NONCE = 'nonce-public-pulse-123456';
-  const PUBLIC_ROOT_PROOF = 'proof_public_pulse_abcdef123456';
-
-  function makePublicMonitorDetail(): MonitorDetail {
+describe('MonitorViewer opaque-sandbox root and version refresh handling', () => {
+  function makePublicMonitorDetail(publishedSeq = 4): MonitorDetail {
     return {
       monitor: {
         monitor_id: 'mon-pub-1',
@@ -898,7 +942,7 @@ describe('MonitorViewer bridged_root and unbridged handling', () => {
         sort_order: 0,
         visibility: 'public',
         member_user_ids: [],
-        published_seq: 4,
+        published_seq: publishedSeq,
         keep_updated: true,
         source_kind: 'workspace',
         source_ref: 'ws-1:index.html',
@@ -915,13 +959,11 @@ describe('MonitorViewer bridged_root and unbridged handling', () => {
       frame_base: '/api/v1/dalton/monitors/public/public-pulse/',
       data_base: '/api/v1/dalton/monitors/public/public-pulse/data',
       expires_in: 0,
-      root_nonce: PUBLIC_ROOT_NONCE,
-      root_proof: PUBLIC_ROOT_PROOF,
     };
   }
 
-  it('enters bridged_root in opaque sandbox on matching rootProof and enters unbridged (hiding open-in-new-window) on conflicting/invalid/unrecognized page:ready', async () => {
-    hoisted.getPublicMonitorDetail.mockResolvedValue(makePublicMonitorDetail());
+  it('treats pathless public monitor root in opaque sandbox as unrecognized (unbridged), hides open-in-new-window, and keeps copy-link', async () => {
+    hoisted.getPublicMonitorDetail.mockResolvedValue(makePublicMonitorDetail(4));
 
     const { container } = renderWithProviders(
       <Routes>
@@ -934,53 +976,25 @@ describe('MonitorViewer bridged_root and unbridged handling', () => {
       expect(container.querySelector('iframe.bridged-frame-doc')).toBeTruthy();
     });
     const iframe = container.querySelector('iframe.bridged-frame-doc') as HTMLIFrameElement;
-    stubFrameWindow(iframe, { throwSecurityError: true });
+    const { postMessage } = stubFrameWindow(iframe, { throwSecurityError: true });
+    const pings = trackPings(postMessage);
     const host = container.querySelector('.monitors-frame-host')!;
-    expect(iframe.getAttribute('src')).toBe(
-      `/api/v1/dalton/monitors/public/public-pulse/v/4/?root_nonce=${PUBLIC_ROOT_NONCE}`,
-    );
+    expect(iframe.getAttribute('src')).toBe('/api/v1/dalton/monitors/public/public-pulse/v/4/');
 
-    // Confirmed pathless version root with matching server proof -> bridged_root, open-in-new-window stays visible.
-    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'mon-doc-1', root: true, rootProof: PUBLIC_ROOT_PROOF });
-    expect(host).toHaveAttribute('data-doc-state', 'bridged_root');
-    expect(screen.getByRole('link', { name: /openInNewWindow|Open in new window|新窗口打开/i })).toBeInTheDocument();
-
-    // Conflicting { path: undefined, root: true } -> unbridged, open-in-new-window hidden.
-    postFromFrame(iframe, { type: 'page:ready', v: 1, path: undefined, root: true });
+    // Opaque-sandbox root: true is treated as unrecognized (unbridged), hiding open-in-new-window while keeping copy-link.
+    confirmDoc(iframe, pings, { type: 'page:ready', v: 1, docId: 'mon-doc-1', root: true });
     expect(host).toHaveAttribute('data-doc-state', 'unbridged');
     expect(screen.queryByRole('link', { name: /openInNewWindow|Open in new window|新窗口打开/i })).toBeNull();
+    expect(screen.getByRole('button', { name: /copyLink|Copy link|复制链接/i })).toBeInTheDocument();
 
-    // Forged root: true after leaving the host-initiated version root navigation stays rejected (unbridged).
-    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'mon-doc-2', root: true, rootProof: PUBLIC_ROOT_PROOF });
-    expect(host).toHaveAttribute('data-doc-state', 'unbridged');
-    expect(screen.queryByRole('link', { name: /openInNewWindow|Open in new window|新窗口打开/i })).toBeNull();
-  });
-
-  it('rejects redirected opaque-sandbox public monitor root without matching rootProof and hides open-in-new-window', async () => {
-    hoisted.getPublicMonitorDetail.mockResolvedValue(makePublicMonitorDetail());
-
-    const { container } = renderWithProviders(
-      <Routes>
-        <Route path="/m/:slug" element={<MonitorViewer slug="public-pulse" publicMode />} />
-      </Routes>,
-      { route: '/m/public-pulse' },
-    );
-
-    await waitFor(() => {
-      expect(container.querySelector('iframe.bridged-frame-doc')).toBeTruthy();
-    });
-    const iframe = container.querySelector('iframe.bridged-frame-doc') as HTMLIFrameElement;
-    stubFrameWindow(iframe, { throwSecurityError: true });
-    const host = container.querySelector('.monitors-frame-host')!;
-
-    // Redirected target posts root: true without server-signed rootProof -> must NOT enter bridged_root.
-    postFromFrame(iframe, { type: 'page:ready', v: 1, docId: 'mon-redir', root: true });
+    // Conflicting { path: undefined, root: true } also stays unbridged.
+    confirmDoc(iframe, pings, { type: 'page:ready', v: 1, docId: 'mon-doc-2', path: undefined, root: true });
     expect(host).toHaveAttribute('data-doc-state', 'unbridged');
     expect(screen.queryByRole('link', { name: /openInNewWindow|Open in new window|新窗口打开/i })).toBeNull();
   });
 
   it('maps missing root: true on a pathless public monitor to unbridged and hides open-in-new-window', async () => {
-    hoisted.getPublicMonitorDetail.mockResolvedValue(makePublicMonitorDetail());
+    hoisted.getPublicMonitorDetail.mockResolvedValue(makePublicMonitorDetail(4));
 
     const { container } = renderWithProviders(
       <Routes>
@@ -993,12 +1007,69 @@ describe('MonitorViewer bridged_root and unbridged handling', () => {
       expect(container.querySelector('iframe.bridged-frame-doc')).toBeTruthy();
     });
     const iframe = container.querySelector('iframe.bridged-frame-doc') as HTMLIFrameElement;
-    stubFrameWindow(iframe, { throwSecurityError: true });
+    const { postMessage } = stubFrameWindow(iframe, { throwSecurityError: true });
+    const pings = trackPings(postMessage);
     const host = container.querySelector('.monitors-frame-host')!;
 
-    postFromFrame(iframe, { type: 'page:ready', v: 1 });
+    confirmDoc(iframe, pings, { type: 'page:ready', v: 1, docId: 'mon-missing' });
     expect(host).toHaveAttribute('data-doc-state', 'unbridged');
     expect(screen.queryByRole('link', { name: /openInNewWindow|Open in new window|新窗口打开/i })).toBeNull();
+  });
+
+  it('resets frame key and doc state synchronously when public monitor refreshes from version 4 to version 5', async () => {
+    const qc = createTestQueryClient();
+    hoisted.getPublicMonitorDetail
+      .mockResolvedValueOnce(makePublicMonitorDetail(4))
+      .mockResolvedValueOnce(makePublicMonitorDetail(5));
+
+    const { container } = renderWithProviders(
+      <Routes>
+        <Route path="/m/:slug" element={<MonitorViewer slug="public-pulse" publicMode />} />
+      </Routes>,
+      { route: '/m/public-pulse', queryClient: qc },
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('iframe.bridged-frame-doc')).toBeTruthy();
+    });
+    const host = container.querySelector('.monitors-frame-host')!;
+    const v4Iframe = container.querySelector('iframe.bridged-frame-doc') as HTMLIFrameElement;
+    expect(v4Iframe.getAttribute('src')).toBe('/api/v1/dalton/monitors/public/public-pulse/v/4/');
+
+    const { postMessage: v4Post } = stubFrameWindow(v4Iframe, { throwSecurityError: true });
+    const v4Pings = trackPings(v4Post);
+    // Confirm v4 on a path doc so the state transition current -> pending -> v5 state is explicit.
+    confirmDoc(v4Iframe, v4Pings, { type: 'page:ready', v: 1, docId: 'mon-v4', path: 'reports/v4.html' });
+    expect(host).toHaveAttribute('data-doc-state', 'current');
+    expect(screen.getByRole('link', { name: /openInNewWindow|Open in new window|新窗口打开/i })).toBeInTheDocument();
+
+    // Refresh public monitor detail to version 5 -> new frame key/src mounts and state resets to pending.
+    await act(async () => {
+      await qc.refetchQueries({ queryKey: ['dalton', 'monitors', 'public', 'public-pulse'] });
+    });
+
+    await waitFor(() => {
+      const frames = Array.from(container.querySelectorAll('iframe.bridged-frame-doc'));
+      expect(frames.some((el) => el.getAttribute('src') === '/api/v1/dalton/monitors/public/public-pulse/v/5/')).toBe(true);
+    });
+    expect(host).toHaveAttribute('data-doc-state', 'pending');
+
+    // Late message from the previous v4 iframe cannot bleed into v5.
+    postFromFrame(v4Iframe, { type: 'page:ready', v: 1, docId: 'mon-v4-late', path: 'reports/v4.html' });
+    expect(host).toHaveAttribute('data-doc-state', 'pending');
+
+    const v5Iframe = Array.from(container.querySelectorAll('iframe.bridged-frame-doc')).find(
+      (el) => el.getAttribute('src') === '/api/v1/dalton/monitors/public/public-pulse/v/5/',
+    ) as HTMLIFrameElement;
+    expect(v5Iframe).toBeTruthy();
+    expect(v5Iframe).not.toBe(v4Iframe);
+
+    const { postMessage: v5Post } = stubFrameWindow(v5Iframe, { throwSecurityError: true });
+    const v5Pings = trackPings(v5Post);
+    confirmDoc(v5Iframe, v5Pings, { type: 'page:ready', v: 1, docId: 'mon-v5', root: true });
+    expect(host).toHaveAttribute('data-doc-state', 'unbridged');
+    expect(screen.queryByRole('link', { name: /openInNewWindow|Open in new window|新窗口打开/i })).toBeNull();
+    expect(screen.getByRole('button', { name: /copyLink|Copy link|复制链接/i })).toBeInTheDocument();
   });
 });
 

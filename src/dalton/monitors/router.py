@@ -180,7 +180,6 @@ async def serve_public_monitor_entry_endpoint(
     slug: str,
     seq: str,
     request: Request,
-    root_nonce: str | None = None,
     if_none_match: Annotated[str | None, Header()] = None,
 ) -> Response:
     try:
@@ -190,7 +189,6 @@ async def serve_public_monitor_entry_endpoint(
             "",
             if_none_match=if_none_match,
             head=request.method == "HEAD",
-            root_nonce=root_nonce,
         )
     except ArtifactFileUnavailable as exc:
         logger.warning("Public monitor file could not be served: %s", exc)
