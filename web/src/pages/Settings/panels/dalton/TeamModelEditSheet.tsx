@@ -1365,6 +1365,9 @@ export function TeamModelEditSheet({
           }
           if (notionalCachedInput.trim() !== baseline.notionalCachedInput.trim()) {
             npPatch.cached_input = nCached;
+            if (nCached === null) {
+              npPatch.cache_read = null;
+            }
           }
           Object.assign(npPatch, buildDiffPriceMeta());
           if (Object.keys(npPatch).length > 0) {

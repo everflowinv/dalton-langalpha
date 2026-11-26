@@ -140,9 +140,17 @@ def _patch_overview_dependencies(
     get_row_mock = create_autospec(
         _ORIG_GET_CATALOG_ROW,
         return_value={
+            "singleton_id": 1,
             "revision": compiled.revision,
+            "schema_version": 1,
+            "payload": compiled.payload,
+            "payload_sha256": compiled.payload_sha256,
             "legacy_sync_import_status": compiled.legacy_sync_import_status,
+            "legacy_sync_imported_at": None,
             "legacy_sync_import_error": None,
+            "last_known_legacy_retired": sorted(compiled.readonly_legacy_retired_keys),
+            "updated_by": None,
+            "updated_at": None,
         },
     )
     monkeypatch.setattr(service_mod, "get_compiled_catalog_async", get_compiled_mock)
@@ -1289,3 +1297,173 @@ def test_partial_null_notional_rates_context_clear_and_tiered_cash_pricing_merge
     assert "input" not in grok["pricing"]
     assert len(grok["pricing"]["input_tiers"]) == 2
     assert len(grok["pricing"]["output_tiers"]) == 2
+
+
+def test_update_task_costs_bound_completes_partial_db_entry_from_compiled_factory_bound(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upstream_models = _sample_upstream_models()
+    upstream_models["kimi-k3.1-pro-highspeed"] = {
+        "model_id": "kimi-k3.1-pro-highspeed",
+        "provider": "openai",
+        "display_name": "Kimi K3.1 Pro Highspeed",
+        "visible": True,
+        "context": 262144,
+        "input_modalities": ["text", "image"],
+    }
+    upstream_providers = _sample_upstream_providers()
+    upstream_providers["models"]["openai"].append(
+        {
+            "id": "kimi-k3.1-pro-highspeed",
+            "name": "Kimi K3.1 Pro Highspeed",
+            "pricing": {"input": 1.0, "output": 4.0},
+        }
+    )
+
+    # DB payload previously persisted only `times` for factory-bounded kimi-k3.1-pro-highspeed.
+    initial_payload: dict[str, Any] = {
+        "schema": CATALOG_SCHEMA,
+        "task_costs": {
+            "bounds": {
+                "kimi-k3.1-pro-highspeed": {"times": 1.5},
+            }
+        },
+    }
+    state = _patch_tx_catalog_env(
+        monkeypatch,
+        initial_payload=initial_payload,
+        initial_revision=5,
+        upstream_models=upstream_models,
+        upstream_providers=upstream_providers,
+    )
+
+    # 1. Updating only `times` fills missing `model` from compiled factory bound ("kimi-k3.1-pro")
+    res1 = asyncio.run(
+        service_mod.update_catalog_model(
+            actor_user_id="admin-alice",
+            model_key="kimi-k3.1-pro-highspeed",
+            data=CatalogModelUpsertInput.model_validate(
+                {
+                    "task_costs_bound": {"times": 1.75},
+                    "expected_revision": 5,
+                }
+            ),
+        )
+    )
+    assert res1["revision"] == 6
+    assert state["row"]["payload"]["task_costs"]["bounds"]["kimi-k3.1-pro-highspeed"] == {
+        "model": "kimi-k3.1-pro",
+        "times": 1.75,
+    }
+
+    compiled_v6 = compiled_mod.compile_catalog_from_payload(state["row"]["payload"], revision=6)
+    _patch_overview_dependencies(monkeypatch, compiled_v6)
+    overview_v6 = asyncio.run(service_mod.get_team_catalog_overview())
+    by_key_v6 = {m["model_key"]: m for m in overview_v6["models"]}
+    assert by_key_v6["kimi-k3.1-pro-highspeed"]["task_costs_bound"] == {
+        "model": "kimi-k3.1-pro",
+        "times": 1.75,
+    }
+
+    # 2. Explicit deletion (`task_costs_bound: None`) still deletes the bound and rejects partial times-only re-add
+    res2 = asyncio.run(
+        service_mod.update_catalog_model(
+            actor_user_id="admin-alice",
+            model_key="kimi-k3.1-pro-highspeed",
+            data=CatalogModelUpsertInput.model_validate(
+                {
+                    "task_costs_bound": None,
+                    "expected_revision": 6,
+                }
+            ),
+        )
+    )
+    assert res2["revision"] == 7
+    assert state["row"]["payload"]["task_costs"]["bounds"]["kimi-k3.1-pro-highspeed"] is None
+
+    compiled_v7 = compiled_mod.compile_catalog_from_payload(state["row"]["payload"], revision=7)
+    _patch_overview_dependencies(monkeypatch, compiled_v7)
+    overview_v7 = asyncio.run(service_mod.get_team_catalog_overview())
+    by_key_v7 = {m["model_key"]: m for m in overview_v7["models"]}
+    assert by_key_v7["kimi-k3.1-pro-highspeed"]["task_costs_bound"] is None
+
+    with pytest.raises(CatalogValidationError) as exc_info:
+        asyncio.run(
+            service_mod.update_catalog_model(
+                actor_user_id="admin-alice",
+                model_key="kimi-k3.1-pro-highspeed",
+                data=CatalogModelUpsertInput.model_validate(
+                    {
+                        "task_costs_bound": {"times": 2.5},
+                        "expected_revision": 7,
+                    }
+                ),
+            )
+        )
+    assert exc_info.value.code == "invalid_task_costs_bound"
+
+
+def test_clear_notional_cache_read_removes_factory_cache_read_rate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_overlay = {
+        "models": {
+            "muse-spark-1.3-oauth": {
+                "model_id": "muse-spark-1.3",
+                "provider": "claude-oauth",
+                "display_name": "Muse Spark 1.3",
+                "visible": True,
+                "context": 1007997,
+                "input_modalities": ["text", "image"],
+            }
+        },
+        "dalton_meta": {
+            "muse-spark-1.3-oauth": {
+                "family": "meta-muse",
+                "billing": "subscription",
+                "tool_calling": True,
+                "notional_pricing": {
+                    "input": 2.0,
+                    "output": 6.0,
+                    "cache_read": 0.5,
+                    "estimated": True,
+                },
+            }
+        },
+    }
+    state = _patch_tx_catalog_env(
+        monkeypatch,
+        initial_payload={"schema": CATALOG_SCHEMA},
+        initial_revision=5,
+        native_overlay=native_overlay,
+    )
+
+    res = asyncio.run(
+        service_mod.update_catalog_model(
+            actor_user_id="admin-alice",
+            model_key="muse-spark-1.3-oauth",
+            data=CatalogModelUpsertInput.model_validate(
+                {
+                    "dalton_meta": {
+                        "notional_pricing": {
+                            "cached_input": None,
+                            "cache_read": None,
+                        }
+                    },
+                    "expected_revision": 5,
+                }
+            ),
+        )
+    )
+    assert res["revision"] == 6
+
+    compiled = compiled_mod.compile_catalog_from_payload(state["row"]["payload"], revision=6)
+    _patch_overview_dependencies(monkeypatch, compiled)
+    overview = asyncio.run(service_mod.get_team_catalog_overview())
+    by_key = {m["model_key"]: m for m in overview["models"]}
+    np = by_key["muse-spark-1.3-oauth"]["dalton_meta"]["notional_pricing"]
+    assert np["input"] == 2.0
+    assert np["output"] == 6.0
+    assert np["estimated"] is True
+    assert "cached_input" not in np
+    assert "cache_read" not in np

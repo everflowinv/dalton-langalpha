@@ -1504,15 +1504,19 @@ async def update_catalog_model(
                 elif isinstance(data.task_costs_bound, Mapping):
                     existing_bound: dict[str, Any] = {}
                     raw_existing_bound = bounds_map.get(key)
-                    if isinstance(raw_existing_bound, Mapping):
-                        existing_bound = copy.deepcopy(dict(raw_existing_bound))
-                    elif key not in bounds_map and current_compiled.task_costs is not None:
-                        compiled_bound = (current_compiled.task_costs.bounds or {}).get(key)
+                    if key not in bounds_map or raw_existing_bound is not None:
+                        compiled_bound = (
+                            (current_compiled.task_costs.bounds or {}).get(key)
+                            if current_compiled.task_costs is not None
+                            else None
+                        )
                         if compiled_bound is not None:
                             existing_bound = {
                                 "model": str(compiled_bound[0]),
                                 "times": float(compiled_bound[1]),
                             }
+                        if isinstance(raw_existing_bound, Mapping):
+                            deep_merge_patch_with_null_delete(existing_bound, raw_existing_bound)
                     deep_merge_patch_with_null_delete(existing_bound, data.task_costs_bound)
                     if not existing_bound:
                         bounds_map[key] = None

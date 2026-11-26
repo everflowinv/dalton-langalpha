@@ -903,6 +903,7 @@ describe('TeamModelCatalogCard', () => {
     expect(sentPayload.parameters).toEqual({ max_output_tokens: 131072 });
     expect(sentPayload.dalton_meta?.notional_pricing).toEqual({
       cached_input: null,
+      cache_read: null,
     });
   });
 
@@ -983,6 +984,7 @@ describe('TeamModelCatalogCard', () => {
       notional_pricing: {
         input: null,
         cached_input: null,
+        cache_read: null,
         output: null,
       },
     });
@@ -1254,6 +1256,7 @@ describe('TeamModelCatalogCard', () => {
         notional_pricing: {
           output: 7.5,
           cached_input: null,
+          cache_read: null,
         },
       },
       expected_revision: 11,
@@ -1874,6 +1877,92 @@ describe('TeamModelCatalogCard', () => {
         notional_pricing: null,
       },
       expected_revision: 9,
+      comment: undefined,
+    });
+  });
+
+  it('submits both cached_input null and cache_read null when clearing factory cache_read notional rate', async () => {
+    const museOverview = makeOverview({
+      revision: 7,
+      models: [
+        {
+          model_key: 'muse-spark-1.3-oauth',
+          model_id: 'muse-spark-1.3',
+          provider: 'muse-oauth',
+          provider_display_name: 'Muse OAuth',
+          provider_connected: true,
+          catalog_defined_provider: false,
+          display_name: 'Muse Spark 1.3',
+          visible: true,
+          source: 'factory',
+          status: 'visible',
+          intelligence: 3,
+          speed: 5,
+          plain_language: null,
+          context: 1007997,
+          compaction_profile: null,
+          input_modalities: ['text', 'image'],
+          reasoning: null,
+          pricing: null,
+          pricing_meta: null,
+          dalton_meta: {
+            family: 'meta-muse',
+            billing: 'subscription',
+            tool_calling: true,
+            notional_ref: 'grok-4.7',
+            notional_pricing: {
+              input: 2.0,
+              output: 6.0,
+              cache_read: 0.5,
+              estimated: true,
+            },
+          },
+        },
+      ],
+    });
+    h.fetchTeamModelCatalog.mockResolvedValue(museOverview);
+    h.updateTeamCatalogModel
+      .mockResolvedValueOnce({ revision: 8, model_key: 'muse-spark-1.3-oauth' })
+      .mockResolvedValueOnce({ revision: 9, model_key: 'muse-spark-1.3-oauth' });
+
+    renderCard();
+    await waitFor(() => expect(screen.getByTestId('edit-model-muse-spark-1.3-oauth-btn')).toBeInTheDocument());
+
+    // 1. Clearing factory cache_read rate sends both cached_input: null and cache_read: null
+    fireEvent.click(screen.getByTestId('edit-model-muse-spark-1.3-oauth-btn'));
+    await screen.findByTestId('team-model-edit-sheet');
+    expect((screen.getByTestId('edit-model-notional-cached') as HTMLInputElement).value).toBe('0.5');
+
+    fireEvent.change(screen.getByTestId('edit-model-notional-cached'), { target: { value: '' } });
+    fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
+
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(1));
+    expect(h.updateTeamCatalogModel.mock.calls[0][1]).toEqual({
+      dalton_meta: {
+        notional_pricing: {
+          cached_input: null,
+          cache_read: null,
+        },
+      },
+      expected_revision: 7,
+      comment: undefined,
+    });
+    await waitFor(() => expect(screen.queryByTestId('team-model-edit-sheet')).toBeNull());
+
+    // 2. Updating factory cache_read rate to a new number sends only cached_input
+    fireEvent.click(screen.getByTestId('edit-model-muse-spark-1.3-oauth-btn'));
+    await screen.findByTestId('team-model-edit-sheet');
+    fireEvent.change(screen.getByTestId('edit-model-notional-cached'), { target: { value: '0.25' } });
+    fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
+
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(2));
+    expect(h.updateTeamCatalogModel.mock.calls[1][1]).toEqual({
+      dalton_meta: {
+        notional_pricing: {
+          cached_input: 0.25,
+        },
+      },
+      expected_revision: 7,
       comment: undefined,
     });
   });
