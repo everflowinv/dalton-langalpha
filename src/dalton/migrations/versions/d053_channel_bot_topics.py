@@ -1,4 +1,4 @@
-"""Dalton d051: group bot topics table (`dalton_channel_bot_topics`) and DM recipient lock column.
+"""Dalton d053: group bot topics table (`dalton_channel_bot_topics`) and DM recipient lock column.
 
 Creates ``dalton_channel_bot_topics`` to persist pending reservations and confirmed
 bot-created/registered Feishu topics & Discord public threads, locking the
@@ -9,8 +9,8 @@ Also adds the nullable ``dm_recipient_platform_user_id`` column on
 ``dalton_channel_deliveries`` to pin the verified platform DM recipient from the
 originating inbound conversation for pre-send / post-upload binding verification.
 
-Revision ID: d051
-Revises: d050
+Revision ID: d053
+Revises: d051
 Create Date: 2026-11-25
 """
 
@@ -20,8 +20,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "d051"
-down_revision: str | None = "d050"
+revision: str = "d053"
+down_revision: str | None = "d051"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
