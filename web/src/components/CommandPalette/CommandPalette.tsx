@@ -101,7 +101,8 @@ export default function CommandPalette({ open, onClose, typed, returnFocus }: Co
           }}
         >
           <DialogTitle className="sr-only">{t('palette.title')}</DialogTitle>
-          <PaletteBody open={open} onClose={onClose} typed={typed} archiveThread={archiveThread} />
+          {/* DALTON-HOOK(dialog-focus-return): forward the palette's persistent return-focus target to local actions */}
+          <PaletteBody open={open} onClose={onClose} typed={typed} archiveThread={archiveThread} returnFocus={returnFocus} />
         </DialogContent>
       </Dialog>
       {archiveConfirm}
@@ -131,10 +132,12 @@ interface BodyProps {
   onClose: () => void;
   typed: string;
   archiveThread: Verbs['archiveThread'];
+  // DALTON-HOOK(dialog-focus-return): persistent control that opened the palette
+  returnFocus: () => HTMLElement | null;
 }
 
 /** Mounted with the dialog's content, so every open starts from an empty field. */
-function PaletteBody({ open, onClose, typed, archiveThread }: BodyProps) {
+function PaletteBody({ open, onClose, typed, archiveThread, returnFocus }: BodyProps) {
   const { t } = useTranslation();
   const isMobile = useIsMobile();
   const listId = useId();
@@ -142,7 +145,8 @@ function PaletteBody({ open, onClose, typed, archiveThread }: BodyProps) {
   const { frames, top, drilled, actionsOf: actionsOfId, actionIndex, edit, waiting, waitedOut, dispatch } = usePaletteView(open, typed);
   const { spec, query, chosenId, lead } = top;
   const verbs = useVerbs(archiveThread);
-  const view = useViewResult(spec, query, verbs, useLocalSources(verbs));
+  // DALTON-HOOK(dialog-focus-return): pass the palette's return-focus target so modal actions restore focus on cancel
+  const view = useViewResult(spec, query, verbs, useLocalSources(verbs, returnFocus));
   const placePending = verbs.newWork.pending;
 
   const flat = useMemo(() => view.groups.flatMap((group) => group.items), [view.groups]);

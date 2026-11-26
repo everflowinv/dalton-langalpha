@@ -134,6 +134,34 @@ def _extract_row_config_ticker(row: Mapping[str, Any]) -> Optional[str]:
     return None
 
 
+async def fetch_live_workspace_names_with_unit_ticker(
+    cur: Any,
+    user_id: str,
+) -> list[dict[str, Any]]:
+    """Fetch ``(workspace_id, name, unit_ticker)`` for a user's live workspaces
+    when Dalton coverage units are enabled, keeping ``dalton_coverage_units`` SQL
+    out of upstream ``src/server/database/workspace.py``."""
+    await cur.execute(
+        f"""
+        SELECT workspaces.workspace_id,
+               workspaces.name,
+               (
+                   SELECT cu.ticker
+                   FROM dalton_coverage_units cu
+                   WHERE cu.workspace_id = workspaces.workspace_id
+                     AND cu.status = 'active'
+                     AND cu.kind = 'company'
+                   ORDER BY cu.updated_at DESC NULLS LAST
+                   LIMIT 1
+               ) AS unit_ticker
+        FROM workspaces
+        WHERE user_id = %s AND {FENCE_LIVE_WORKSPACE}
+        """,
+        (user_id,),
+    )
+    return [dict(row) for row in await cur.fetchall()]
+
+
 async def check_duplicate_snapshot_unchanged(
     cur: Any,
     user_id: str,
@@ -522,13 +550,33 @@ async def check_duplicate_snapshot_unchanged(
 
             # Pass 1 (team workspaces): deterministic identity matches first
             # so a real duplicate is never masked by an unrelated drift.
+            # Shares the strict ticker-shape colleague predicate with proposal
+            # (Phase 0) and lock-free recheck (Phase 1) so mixed-case non-ticker
+            # names (e.g. 'Aapl' vs 'aapl') stay consistent across all phases.
+            from src.dalton.coverage.dedup import (
+                _is_explicit_ticker_shape,
+                colleague_workspace_deterministic_match,
+            )
+
             for ws_id_s, ws_name, unit_ticker, doc_ticker, config_ticker in eligible_team_rows:
                 if (
                     expected_duplicate_workspace_id is not None
                     and ws_id_s == expected_duplicate_workspace_id
                 ):
                     continue
-                if _same_name_or_ticker(name, ws_name):
+                if colleague_workspace_deterministic_match(
+                    name,
+                    candidate_name=ws_name,
+                    candidate_unit_ticker=unit_ticker,
+                    strict_name_ticker_shape=True,
+                ):
+                    _record_conflict(ws_id_s)
+                    return False
+                if (
+                    explicit_ticker_key is not None
+                    and _is_explicit_ticker_shape(ws_name)
+                    and canonical_workspace_ticker_key(ws_name) == explicit_ticker_key
+                ):
                     _record_conflict(ws_id_s)
                     return False
                 if (

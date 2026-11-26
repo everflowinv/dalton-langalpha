@@ -270,6 +270,7 @@ def _wrap_collect_barrier(orig_collect: Any, barrier_limit: int = 2) -> Any:
         *,
         caller_tier: str,
         include_colleagues: bool | None = None,
+        exclude_same_name_workspace_id: str | None = None,
         conn: Any = None,
         stats: dict[str, int] | None = None,
     ):
@@ -279,6 +280,7 @@ def _wrap_collect_barrier(orig_collect: Any, barrier_limit: int = 2) -> Any:
             raw_name,
             caller_tier=caller_tier,
             include_colleagues=include_colleagues,
+            exclude_same_name_workspace_id=exclude_same_name_workspace_id,
             conn=conn,
             stats=stats,
         )

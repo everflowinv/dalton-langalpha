@@ -89,6 +89,7 @@ from src.utils.cache import redis_cache as redis_cache_mod
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DALTON_TOOLS_DIR = REPO_ROOT / "src" / "dalton" / "tools"
 DALTON_APP_DIR = REPO_ROOT / "src" / "dalton" / "app"
+RESEARCH_HOST_APP_PATH = REPO_ROOT / "src" / "dalton" / "research_host" / "app.py"
 SETUP_PY_PATH = REPO_ROOT / "src" / "server" / "app" / "setup.py"
 EVERFLOW_MANIFEST_PATH = (
     REPO_ROOT / "tests" / "unit" / "dalton" / "snapshots" / "everflow" / "app_env_dalton" / "manifest.json"
@@ -96,6 +97,9 @@ EVERFLOW_MANIFEST_PATH = (
 
 # Explicit independent proprietary lists (NOT derived from DALTON_TOOL_REGISTRY /
 # DALTON_ROUTE_CAPABILITY_REGISTRY, preventing circular validation).
+# Note: Batch 3 promotes open-source `company_wiki` (`ingest_company_wiki`, and
+# `ingest_research` scoped to wiki) to a default Core capability; commercial
+# `ingest_sales_note` remains Everflow-proprietary.
 EXPLICIT_PROPRIETARY_TOOLS: frozenset[str] = frozenset(
     {
         "feishu_read",
@@ -103,9 +107,7 @@ EXPLICIT_PROPRIETARY_TOOLS: frozenset[str] = frozenset(
         "feishu_create_doc",
         "feishu_append",
         "feishu_grant_access",
-        "ingest_company_wiki",
         "ingest_sales_note",
-        "ingest_research",
         "prepare_transcription",
         "conversation_search",
         "dalton_notify_settings",
@@ -263,11 +265,14 @@ class TestCapabilityRegistry:
         app_env: str,
         dalton_profile: str | None,
     ) -> None:
+        # Batch 3 (§6.4): open-source `company_wiki` is enabled by default in Core;
+        # every other optional/proprietary capability defaults off.
         _clean_cap_env(monkeypatch, app_env=app_env, dalton_profile=dalton_profile)
         caps = effective_capabilities()
-        assert caps == frozenset()
+        assert caps == frozenset({CapabilityId.COMPANY_WIKI})
         for cap in CapabilityId:
-            assert has_capability(cap) is False
+            expected = cap is CapabilityId.COMPANY_WIKI
+            assert has_capability(cap) is expected
 
     @pytest.mark.parametrize("app_env", ["dalton", ""])
     def test_everflow_profile_defaults_all_on_except_transcription(
@@ -352,7 +357,7 @@ class TestCapabilityRegistry:
 
         # In Everflow process, asking for explicit CORE must NOT inherit Everflow's conversations/data_jobs
         explicit_core = effective_capabilities(profile=DeploymentProfile.CORE)
-        assert explicit_core == true_core_caps == frozenset()
+        assert explicit_core == true_core_caps == frozenset({CapabilityId.COMPANY_WIKI})
         assert capabilities_fingerprint(explicit_core) == true_core_fp
 
         # In Core process, asking for explicit EVERFLOW must read Everflow's conversations/data_jobs
@@ -372,12 +377,14 @@ class TestCapabilityRegistry:
 
         bridge_children = (
             CapabilityId.ALPHAENGINE,
+            CapabilityId.FEISHU_DOCS,
+        )
+        decoupled_research_caps = (
             CapabilityId.GUIDEPOINT,
             CapabilityId.COMPANY_WIKI,
             CapabilityId.SALES_NOTES,
             CapabilityId.TMTB,
             CapabilityId.FUNDA_AI,
-            CapabilityId.FEISHU_DOCS,
         )
         for child in bridge_children:
             monkeypatch.setenv(CAPABILITY_SPECS[child].env_var, "true")
@@ -389,13 +396,24 @@ class TestCapabilityRegistry:
                 return_value=True,
             ),
         )
-        assert effective_capabilities() == frozenset()
+        assert effective_capabilities() == frozenset({CapabilityId.COMPANY_WIKI})
+
+        # Batch 3: five research connector capabilities are decoupled from RESEARCHDATA_BRIDGE
+        for cap in decoupled_research_caps:
+            monkeypatch.setenv(CAPABILITY_SPECS[cap].env_var, "true")
+        caps_research_only = effective_capabilities()
+        assert CapabilityId.RESEARCHDATA_BRIDGE not in caps_research_only
+        assert set(decoupled_research_caps).issubset(caps_research_only)
+        assert CapabilityId.ALPHAENGINE not in caps_research_only
+        assert CapabilityId.FEISHU_DOCS not in caps_research_only
+        for cap in decoupled_research_caps:
+            monkeypatch.delenv(CAPABILITY_SPECS[cap].env_var, raising=False)
 
         # Batch 2: TRANSCRIPTION is decoupled from RESEARCHDATA_BRIDGE, requiring only
         # its own switch + dedicated ASR storage.
         monkeypatch.setenv("DALTON_CAP_TRANSCRIPTION", "true")
         caps_transcription_only = effective_capabilities()
-        assert caps_transcription_only == frozenset({CapabilityId.TRANSCRIPTION})
+        assert caps_transcription_only == frozenset({CapabilityId.TRANSCRIPTION, CapabilityId.COMPANY_WIKI})
 
         monkeypatch.setenv("DALTON_CAP_RESEARCHDATA_BRIDGE", "true")
         caps = effective_capabilities()
@@ -595,7 +613,16 @@ class TestDaltonToolsRegistrationGate:
 
         registered_by_module: dict[str, set[str]] = {}
         for entry in DALTON_TOOL_REGISTRY:
-            assert entry.capability is CORE_CAPABILITY or isinstance(entry.capability, CapabilityId), (
+            valid_cap = (
+                entry.capability is CORE_CAPABILITY
+                or isinstance(entry.capability, CapabilityId)
+                or (
+                    isinstance(entry.capability, tuple)
+                    and len(entry.capability) > 0
+                    and all(isinstance(c, CapabilityId) for c in entry.capability)
+                )
+            )
+            assert valid_cap, (
                 f"Tool registration {entry.id!r} has invalid capability={entry.capability!r}"
             )
             mod_file = entry.module.rsplit(".", 1)[-1] + ".py"
@@ -639,19 +666,22 @@ class TestDaltonToolsRegistrationGate:
                 continue
             _enable_all_capabilities(monkeypatch)
             cap = entry.capability
+            required_caps = cap if isinstance(cap, tuple) else (cap,)
+            cap_label = "|".join(c.value for c in required_caps)
             for role in sorted(entry.roles):
                 mounted_on = {t.name for t in build_dalton_tools(role, None, user_tier="internal")}
                 for tname in entry.tool_names:
                     assert tname in mounted_on, (
-                        f"Expected {tname!r} to be mounted when {cap.value} is enabled ({role})"
+                        f"Expected {tname!r} to be mounted when {cap_label} is enabled ({role})"
                     )
 
-            monkeypatch.setenv(CAPABILITY_SPECS[cap].env_var, "false")
+            for c in required_caps:
+                monkeypatch.setenv(CAPABILITY_SPECS[c].env_var, "false")
             for role in sorted(entry.roles):
                 mounted_off = {t.name for t in build_dalton_tools(role, None, user_tier="internal")}
                 for tname in entry.tool_names:
                     assert tname not in mounted_off, (
-                        f"Tool {tname!r} stayed mounted when {cap.value} was disabled ({role})"
+                        f"Tool {tname!r} stayed mounted when {cap_label} was disabled ({role})"
                     )
 
     @pytest.mark.parametrize(
@@ -748,12 +778,18 @@ class TestDaltonToolsRegistrationGate:
 
 
 def _scan_dalton_app_routes_ast() -> set[tuple[str, str]]:
-    """AST-scan every ``src/dalton/app/*.py`` for decorator AND ``add_api_route()`` handlers."""
+    """AST-scan every ``src/dalton/app/*.py`` and ``src/dalton/research_host/app.py`` for route handlers."""
     route_methods = {"get", "post", "put", "patch", "delete", "api_route"}
     discovered: set[tuple[str, str]] = set()
-    for py_file in sorted(DALTON_APP_DIR.glob("*.py")):
-        if py_file.name == "__init__.py":
-            continue
+    scan_targets: list[tuple[str, Path]] = [
+        (py_file.name, py_file)
+        for py_file in sorted(DALTON_APP_DIR.glob("*.py"))
+        if py_file.name != "__init__.py"
+    ]
+    if RESEARCH_HOST_APP_PATH.is_file():
+        scan_targets.append(("research_host/app.py", RESEARCH_HOST_APP_PATH))
+
+    for file_key, py_file in scan_targets:
         tree = ast.parse(py_file.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -763,7 +799,7 @@ def _scan_dalton_app_routes_ast() -> set[tuple[str, str]]:
                         and isinstance(dec.func, ast.Attribute)
                         and dec.func.attr in route_methods
                     ):
-                        discovered.add((py_file.name, node.name))
+                        discovered.add((file_key, node.name))
                         break
             elif (
                 isinstance(node, ast.Call)
@@ -775,9 +811,9 @@ def _scan_dalton_app_routes_ast() -> set[tuple[str, str]]:
                     None,
                 )
                 if isinstance(endpoint_arg, ast.Name):
-                    discovered.add((py_file.name, endpoint_arg.id))
+                    discovered.add((file_key, endpoint_arg.id))
                 else:
-                    discovered.add((py_file.name, f"<add_api_route@L{node.lineno}>"))
+                    discovered.add((file_key, f"<add_api_route@L{node.lineno}>"))
     return discovered
 
 
@@ -1093,7 +1129,7 @@ class TestDaltonRoutesRegistrationGate:
         assert resp.status_code == 200
         body = resp.json()
         assert body["profile"] == "core"
-        assert body["capabilities"] == []
+        assert body["capabilities"] == ["company_wiki"]
         assert body["brand_name"] == "Dalton"
         assert body["brand"] == {"name": "Dalton"}
         assert body["fingerprint"] == capabilities_fingerprint()
@@ -1909,7 +1945,8 @@ class TestBackendCapabilityPruning:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """Item 5 (codex medium 5): transcript bound to ALPHAENGINE in both catalog discovery and YAML fallback."""
-        # 1) Core mode: only market_quotes and sec_filings probed
+        # 1) Core mode: open-source company-wiki probed via research-host (never bridge),
+        #    and with company_wiki disabled only market_quotes and sec_filings are probed.
         _clean_cap_env(monkeypatch, app_env="core")
         _install_no_outbound_http_guard(monkeypatch)
 
@@ -1943,6 +1980,10 @@ class TestBackendCapabilityPruning:
             health_mod.default_sec_filings_probe,
             return_value={"latest_date": "2026-11-19"},
         )
+        rh_spy = create_autospec(
+            health_mod.default_call_research_host_connector,
+            return_value={"ok": True, "results": [{"date": "2026-11-20"}]},
+        )
 
         summary = await health_mod.run_all_health_checks(
             bridge_caller=bridge_spy,
@@ -1951,10 +1992,34 @@ class TestBackendCapabilityPruning:
             market_quote_prober=market_spy,
             sec_filings_prober=sec_spy,
             conversation_prober=conv_spy,
+            research_host_caller=rh_spy,
             persist=False,
         )
-        assert {r["source_id"] for r in summary["results"]} == {"market_quotes", "sec_filings"}
+        assert {r["source_id"] for r in summary["results"]} == {
+            "company-wiki",
+            "market_quotes",
+            "sec_filings",
+        }
         assert summary["data_task_health"] is None
+
+        # With company_wiki disabled in Core, research-host is not called either
+        monkeypatch.setenv("DALTON_CAP_COMPANY_WIKI", "false")
+        rh_never = create_autospec(
+            health_mod.default_call_research_host_connector,
+            side_effect=AssertionError("research-host probe must not run when company_wiki is disabled"),
+        )
+        summary_no_wiki = await health_mod.run_all_health_checks(
+            bridge_caller=bridge_spy,
+            web_search_prober=web_spy,
+            x_search_prober=x_spy,
+            market_quote_prober=market_spy,
+            sec_filings_prober=sec_spy,
+            conversation_prober=conv_spy,
+            research_host_caller=rh_never,
+            persist=False,
+        )
+        assert {r["source_id"] for r in summary_no_wiki["results"]} == {"market_quotes", "sec_filings"}
+        monkeypatch.delenv("DALTON_CAP_COMPANY_WIKI", raising=False)
 
         # 2) Everflow with ALPHAENGINE disabled: transcript is skipped in BOTH catalog discovery & YAML fallback
         _clean_cap_env(monkeypatch, app_env="dalton")
@@ -2515,7 +2580,15 @@ class TestBundledPluginsAndMcpRegistrationGate:
             "src/dalton/capabilities.py::BUNDLED_PLUGIN_CAPABILITY_MAP: "
             + ", ".join(unregistered_bundles)
         )
-        stale_bundles = sorted(set(BUNDLED_PLUGIN_CAPABILITY_MAP.keys()) - disk_bundle_names)
+        from src.dalton.capabilities import EXTRA_ONLY_BUNDLED_PLUGINS
+
+        assert EXTRA_ONLY_BUNDLED_PLUGINS.isdisjoint(disk_bundle_names), (
+            "Private commercial extra plugins must never live under public plugins/: "
+            + ", ".join(sorted(EXTRA_ONLY_BUNDLED_PLUGINS & disk_bundle_names))
+        )
+        stale_bundles = sorted(
+            set(BUNDLED_PLUGIN_CAPABILITY_MAP.keys()) - disk_bundle_names - set(EXTRA_ONLY_BUNDLED_PLUGINS)
+        )
         assert not stale_bundles, f"Stale entry(ies) in BUNDLED_PLUGIN_CAPABILITY_MAP: {stale_bundles}"
 
         unregistered_servers = sorted(disk_server_names - set(MCP_SERVER_CAPABILITY_MAP.keys()))

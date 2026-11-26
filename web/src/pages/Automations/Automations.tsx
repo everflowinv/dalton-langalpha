@@ -7,9 +7,20 @@ import { SwapCell } from '@/components/ui/crossfade';
 import { apiErrorStatus } from '@/api/errors';
 import { useAuth } from '@/contexts/AuthContext';
 import { useCallerIdentity } from '@/hooks/useCallerIdentity';
+// DALTON-HOOK(report-delivery): gate report_profile web confirmation card on channel_gateway capability
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { useHomeTimezone } from '@/hooks/useHomeTimezone';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
 import { ListError, ListSkeleton } from '@/components/mcp/McpPrimitives';
+// DALTON-HOOK(report-delivery): confirmation dialog & precheck/issue helpers for group or non-caller DM targets
+import ReportDeliveryConfirmDialog from '@/components/dalton/ReportDeliveryConfirmDialog';
+import {
+  changedReportProfileForSubmit,
+  issueReportDeliveryConfirmation,
+  precheckReportDeliveryConfirmation,
+  type ReportDeliveryConfirmRequest,
+  type ReportDeliveryPrecheckResponse,
+} from '@/lib/dalton/reportDeliveryConfirmation';
 import { queryKeys } from '@/lib/queryKeys';
 import { useScrollMemory } from '@/lib/scrollMemory';
 import ConfirmDialog from '@/pages/Dashboard/components/ConfirmDialog';
@@ -194,6 +205,8 @@ export default function Automations() {
   const { t } = useTranslation();
   const { userId } = useAuth();
   const identity = useCallerIdentity();
+  // DALTON-HOOK(report-delivery): read deployment capability via useCapabilities()
+  const { hasCapability } = useCapabilities();
   const callerTierPending = identity.status === 'loading';
   const { automations, loading, loaded, error } = useAutomations();
   const lastCount = useLastShape('automations.count', loaded ? automations.length : null);
@@ -249,6 +262,14 @@ export default function Automations() {
   const [scopeUser, setScopeUser] = useState(userId);
   const [editVersion, setEditVersion] = useState<number | null>(null);
   const [conflict, setConflict] = useState<ConfigConflict | null>(null);
+  // DALTON-HOOK(report-delivery): pending web confirmation card state for group / non-caller DM report_profile writes
+  const [pendingDeliveryConfirm, setPendingDeliveryConfirm] = useState<{
+    submission: FormSubmission;
+    confirmReq: ReportDeliveryConfirmRequest;
+    precheck: ReportDeliveryPrecheckResponse;
+  } | null>(null);
+  const [deliveryConfirmSubmitting, setDeliveryConfirmSubmitting] = useState(false);
+  const [deliveryConfirmError, setDeliveryConfirmError] = useState<string | null>(null);
   // True once manage has shown settled groups, so one group's next page does not replace the whole view.
   const manageSettled = useRef(false);
 
@@ -628,18 +649,21 @@ export default function Automations() {
     [detailTask, writeVersion],
   );
 
-  const handleSubmit = useCallback(
-    async (submission: FormSubmission) => {
+  const executeSubmission = useCallback(
+    async (submission: FormSubmission, confirmationToken?: string) => {
       if (submission.kind === 'edit' && form?.kind === 'edit') {
         const id = form.automationId;
         const task = taskById(id);
         const company = !!task && isCompanyTask(task);
-        let data: AutomationUpdatePayload & { expected_config_version?: number } = submission.payload;
+        let data: AutomationUpdatePayload & { expected_config_version?: number } = {
+          ...submission.payload,
+          ...(confirmationToken ? { report_delivery_confirmation_token: confirmationToken } : {}),
+        };
         if (company) {
           const version = versionFor(id);
           if (version == null) return;
           // DALTON-HOOK(company-automations): company agent updates carry the detail version and no delivery config.
-          data = companyAgentPatch(submission.payload, version);
+          data = companyAgentPatch(data, version);
         }
         try {
           await updateAutomation({ id, data });
@@ -652,13 +676,86 @@ export default function Automations() {
         return;
       }
       if (submission.kind === 'create') {
-        const created = await createAutomation(submission.payload);
+        const payload = confirmationToken
+          ? { ...submission.payload, report_delivery_confirmation_token: confirmationToken }
+          : submission.payload;
+        const created = await createAutomation(payload);
         setForm(null);
         if (created?.automation_id) navigateTo('manage', created.automation_id);
       }
     },
     [form, taskById, versionFor, updateAutomation, rememberConflict, createAutomation, navigateTo],
   );
+
+  // DALTON-HOOK(report-delivery): precheck group / non-caller DM report_profile changes and require web confirmation card before POST/PATCH
+  const handleSubmit = useCallback(
+    async (submission: FormSubmission) => {
+      if (hasCapability('channel_gateway')) {
+        const editingTask =
+          submission.kind === 'edit' && form?.kind === 'edit' ? taskById(form.automationId) : null;
+        const originalMetadata =
+          editingTask && !isScriptTask(editingTask) ? editingTask.metadata : null;
+        const changedProfile = changedReportProfileForSubmit(
+          submission.kind,
+          submission.payload.metadata,
+          originalMetadata,
+        );
+        if (changedProfile) {
+          const action: 'create' | 'update' = submission.kind === 'create' ? 'create' : 'update';
+          const confirmReq: ReportDeliveryConfirmRequest = {
+            action,
+            ...(action === 'update' && form?.kind === 'edit'
+              ? {
+                  automation_id: form.automationId,
+                  expected_config_version:
+                    editingTask && !isScriptTask(editingTask)
+                      ? configVersionOf(editingTask) ?? undefined
+                      : undefined,
+                }
+              : {}),
+            name: submission.payload.name ?? (editingTask ? editingTask.name : undefined),
+            instruction:
+              submission.payload.instruction ??
+              (editingTask && !isScriptTask(editingTask) ? editingTask.instruction : undefined),
+            report_profile: changedProfile,
+          };
+          const { data: precheck } = await precheckReportDeliveryConfirmation(confirmReq);
+          if (precheck.needs_confirmation) {
+            setDeliveryConfirmError(null);
+            setPendingDeliveryConfirm({
+              submission,
+              confirmReq: {
+                ...confirmReq,
+                expected_config_version: precheck.config_version ?? confirmReq.expected_config_version,
+              },
+              precheck,
+            });
+            return;
+          }
+        }
+      }
+      await executeSubmission(submission);
+    },
+    [hasCapability, form, taskById, executeSubmission],
+  );
+
+  const handleConfirmReportDelivery = useCallback(async () => {
+    if (!pendingDeliveryConfirm) return;
+    setDeliveryConfirmSubmitting(true);
+    setDeliveryConfirmError(null);
+    try {
+      const { data: issued } = await issueReportDeliveryConfirmation(pendingDeliveryConfirm.confirmReq);
+      await executeSubmission(
+        pendingDeliveryConfirm.submission,
+        issued.confirmation_token ?? undefined,
+      );
+      setPendingDeliveryConfirm(null);
+    } catch (err) {
+      setDeliveryConfirmError(mutationErrorMessage(err, t('automation:actionFailed')));
+    } finally {
+      setDeliveryConfirmSubmitting(false);
+    }
+  }, [pendingDeliveryConfirm, executeSubmission, t]);
 
   const submitScript = useCallback(
     async (id: string, patch: ScriptSchedulePatch) => {
@@ -988,6 +1085,19 @@ export default function Automations() {
         onConfirm={handleConfirmDelete}
         automationName={deleteTarget?.name}
         loading={busy}
+      />
+
+      {/* DALTON-HOOK(report-delivery): web confirmation card before submitting group or non-caller DM report_profile */}
+      <ReportDeliveryConfirmDialog
+        open={!!pendingDeliveryConfirm}
+        precheck={pendingDeliveryConfirm?.precheck ?? null}
+        loading={deliveryConfirmSubmitting || busy}
+        error={deliveryConfirmError}
+        onCancel={() => {
+          setPendingDeliveryConfirm(null);
+          setDeliveryConfirmError(null);
+        }}
+        onConfirm={handleConfirmReportDelivery}
       />
 
       <ConfirmDialog

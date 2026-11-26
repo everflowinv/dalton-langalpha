@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dalton-sales-notes",
+  "version": "0.1.0",
+  "description": "Sales notes and trading desk color research connector (commercial).",
+  "author": { "name": "Dalton" },
+  "license": "Proprietary",
+  "extensions": {
+    "ai.langalpha": {
+      "servers": {
+        "dalton_sales_notes": {
+          "description": "Sales notes & market-digest library (`search`, `read`, `list` over `mail:` and `digest:` partitions).",
+          "tool_exposure_mode": "summary",
+          "instruction": "Use `search(query=..., start=..., end=..., limit=...)`, `list(...)`, and `read(document='mail:<id>'|'digest:<id>')` for sell-side trading desk notes and daily digests."
+        }
+      }
+    }
+  }
+}

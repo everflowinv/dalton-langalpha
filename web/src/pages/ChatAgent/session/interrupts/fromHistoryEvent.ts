@@ -307,11 +307,15 @@ export function projectHistoryInterrupt(
         interruptId: event.interrupt_id,
         toolCallId: proposalData.tool_call_id,
       });
-    } else if (actionType === 'delete_workspace' || actionType === 'stop_workspace' || actionType === 'delete_thread') {
+    } else if (actionType === 'delete_workspace' || actionType === 'stop_workspace' || actionType === 'delete_thread' || actionType === 'archive_workspace') {
       // --- Secretary action interrupt (history) ---
       const proposalId = event.interrupt_id || `secretary-${actionType}-history-${Date.now()}`;
       const proposalData = actionRequests[0];
       const order = eventOrder(event, () => ++pairState.contentOrderCounter);
+      // --- DALTON-HOOK(cos-settings-tools): begin ---
+      const isArchive = actionType === 'archive_workspace';
+      const hasToolCallId = typeof proposalData.tool_call_id === 'string' && proposalData.tool_call_id.length > 0;
+      const legacyMissingToolCallId = isArchive && !hasToolCallId;
 
       rt.setMessages((prev) =>
         updateMessage(prev,interruptAssistantId, (m) => {
@@ -319,31 +323,44 @@ export function projectHistoryInterrupt(
           const msg = m as AssistantMessage;
           return {
             ...msg,
-            contentSegments: [...(msg.contentSegments || []), { type: actionType as 'delete_workspace' | 'stop_workspace' | 'delete_thread', proposalId, order }],
+            contentSegments: [...(msg.contentSegments || []), { type: actionType as 'delete_workspace' | 'stop_workspace' | 'delete_thread' | 'archive_workspace', proposalId, order }],
             secretaryActionProposals: {
               ...(msg.secretaryActionProposals || {}),
               [proposalId]: {
-                actionType: actionType as 'delete_workspace' | 'stop_workspace' | 'delete_thread',
+                actionType: actionType as 'delete_workspace' | 'stop_workspace' | 'delete_thread' | 'archive_workspace',
                 workspace_id: proposalData.workspace_id,
                 workspace_name: proposalData.workspace_name,
                 thread_id: proposalData.thread_id,
-                // DALTON-HOOK(cos-settings-tools): carry tool_call_id for secretary cards
+                computer_id: proposalData.computer_id,
+                computer_name: proposalData.computer_name,
+                expected_workspaces: Array.isArray(proposalData.expected_workspaces)
+                  ? proposalData.expected_workspaces
+                  : undefined,
                 tool_call_id: proposalData.tool_call_id,
                 interruptId: event.interrupt_id,
-                status: 'pending',
+                status: legacyMissingToolCallId ? 'failed' : 'pending',
+                ...(legacyMissingToolCallId
+                  ? {
+                      failure_code: 'scope_changed',
+                      failure_error: '情况已变化，请重新发起',
+                    }
+                  : {}),
               },
             },
           };
         })
       );
 
-      ctx.pendingHistoryInterrupts.push({
-        type: actionType,
-        assistantMessageId: interruptAssistantId,
-        proposalId,
-        interruptId: event.interrupt_id,
-        toolCallId: proposalData.tool_call_id,
-      });
+      if (!legacyMissingToolCallId) {
+        ctx.pendingHistoryInterrupts.push({
+          type: actionType,
+          assistantMessageId: interruptAssistantId,
+          proposalId,
+          interruptId: event.interrupt_id,
+          toolCallId: proposalData.tool_call_id,
+        });
+      }
+      // --- DALTON-HOOK(cos-settings-tools): end ---
     } else if (actionType === 'credit_pause') {
       // --- Credit pause interrupt (history) ---
       const proposalId = event.interrupt_id!;

@@ -10,9 +10,27 @@
 | **私信给发消息的人以外的人**（`kind == "dm"` 且目标不在 `caller_dm_set`） | **必须确认** | 例如管理员代改他人任务，将报告、纯文本或失败告警私信投递给任务属主（`owner_dm_set`）或其他同事账号。 |
 | **仅设置调用者本人已绑定私信**（`canonical in caller_dm_set`） | 无需确认 | 仅影响调用者本人接收，不扩大外部受众。 |
 | `action="get"` 查询、`action="clear"` 撤销配置 | 无需确认 | 只读或收紧外发范围。 |
-| **网页端直接提交创建或编辑（`POST /api/v1/automations` 与 `PATCH /api/v1/automations/{automation_id}`）** | **必须确认（需一次性确认凭据）** | **仅凭 `principal.auth == "session"` 与 `via_rest=True` 均不算确认**。用户（含管理员）本人的登录令牌在外部脚本、curl 或沙箱脚本中调用接口时，`principal.auth` 同样解析为 `"session"`（`src/server/dependencies/principal.py:215-217`），服务端无法仅凭登录态区分浏览器真人点击与脚本调用。因此 `POST /api/v1/automations`（`src/server/app/automations.py:172-194`）与 `PATCH /api/v1/automations/{automation_id}`（`automations.py:562-606`）执行同一套规则：配置群发或非本人私信时，必须由网页上的确认卡片先向服务端申请并由真人点击生成一次性确认凭据（绑定操作人、目标载荷、任务版本与短时效），随请求回传并由服务端核对且消费该一次性凭据后方可放行；未携带有效一次性凭据的 `"session"` 请求一律拒绝。 |
+| **网页端直接提交创建或编辑（`POST /api/v1/automations` 与 `PATCH /api/v1/automations/{automation_id}`）** | **必须确认（需一次性确认凭据）** | 网页登录令牌（`principal.auth == "session"`）**仅存在于用户本人的浏览器**，助手与沙箱永远拿不到该令牌（见下方「1.1 REST 一次性凭据的威胁模型与信任边界」）。因此持有效 `session` 登录态且通过同源校验的请求视为用户本人浏览器发起的操作；`POST /api/v1/automations`（`src/server/app/automations.py:172-194`）与 `PATCH /api/v1/automations/{automation_id}`（`automations.py:562-606`）执行同一套规则：配置群发或非本人私信时，必须由网页确认卡片经同源签发入口（强制校验 `principal.auth == "session"`、`Origin` 为本站且 `Sec-Fetch-Site: same-origin`，缺一即拒绝）生成绑定操作人、目标载荷摘要、任务版本且短时有效的一次性确认凭据，随提交请求回传并由服务端在写入事务内核对且原子消费后方可放行；未携带有效一次性凭据的 `"session"` 请求一律拒绝。 |
 | **受信任的服务端内部迁移路径（`principal.auth == "service"` / 显式内部迁移调用）** | 可免除二次确认 | 仅限运维/系统迁移脚本或受信任服务间调用，不可由外部用户令牌触发。 |
-| **非交互令牌请求（计算机令牌 `principal.auth == "computer"`、OAuth、PAT）** | **不可免除（不算用户确认）** | **`via_rest=True`、计算机令牌以及未附带网页确认卡片一次性凭据的 `"session"` 均不算用户确认**。`POST /api/v1/automations`（`src/server/app/automations.py:157-208`）与 `PATCH /api/v1/automations/{automation_id}`（`automations.py:562-606`）均接入了 `WorkspaceSendPrincipal` 且传入 `via_rest=True`；开启计算机令牌时，同机 CLI 编辑可跳过现有 `cli_approval`（`src/server/dependencies/cli_approval.py:790-793`）。因此 REST 层不能只凭 `via_rest=True` 或 `principal.auth == "session"` 豁免确认：除受信任 `"service"` 内部迁移外，所有 `POST`/`PATCH` 变更群目标或他人私信均必须携带网页确认卡片产生并经服务端核对的一次性确认凭据，`computer` / `oauth` / `pat` 令牌一律拒绝或走显式审批。 |
+| **非交互令牌请求（计算机令牌 `principal.auth == "computer"`、OAuth、PAT）** | **不可免除（不算用户确认）** | **`via_rest=True`、计算机令牌、OAuth、PAT 以及未附带网页确认卡片一次性凭据的 `"session"` 均不算用户确认**。`POST /api/v1/automations`（`src/server/app/automations.py:157-208`）与 `PATCH /api/v1/automations/{automation_id}`（`automations.py:562-606`）均接入了 `WorkspaceSendPrincipal` 且传入 `via_rest=True`；开启计算机令牌时，同机 CLI 编辑可跳过现有 `cli_approval`（`src/server/dependencies/cli_approval.py:790-793`）。因此 REST 层不能只凭 `via_rest=True` 豁免确认：除受信任 `"service"` 内部迁移外，所有 `POST`/`PATCH` 变更群目标或他人私信均必须携带由网页 `session` 同源签发的一次性确认凭据；`computer` / `oauth` / `pat` 令牌在签发入口、写入入口及对话 HITL 恢复入口一律拒绝。 |
+
+### 1.1 REST 一次性凭据的威胁模型与信任边界
+
+- **凭证隔离前提**：
+  - **网页登录令牌（`principal.auth == "session"`）只存在于用户本人的浏览器**（Supabase / 本地登录会话令牌或 HttpOnly cookie），绝不注入或透传给任何助手、沙箱或自动化执行路径：
+    - 沙箱作业环境变量（`src/ptc_agent/core/sandbox/execution.py:_job_env` 与 `src/dalton/sandbox_caller_identity.py:caller_env`）仅注入作业路径、调用者标识及桥接 HMAC 签名（`DALTON_CALLER_TOKEN`），不包含任何登录 `session` 令牌；
+    - 沙箱内 `la` CLI 凭据文件（`src/server/services/cli_tokens.py:payload`）仅写入以 `lac1.` 为前缀的电脑令牌（`principal.auth == "computer"`），且在 Dalton 默认配置下关闭；
+    - LangGraph `RunnableConfig["configurable"]`、工具返回值（`ToolMessage`）与线程历史/检查点均不携带登录 `session` 令牌。
+  - **助手、沙箱与外部脚本通道仅能持有 `computer`、`pat` 或 `oauth` 令牌**：这些令牌在以下三处全部被服务端强制拒绝：
+    1. REST 确认凭据预检与签发入口（`/api/v1/dalton/report-delivery/precheck`、`/confirmations`）；
+    2. REST 自动化写入入口（`POST /api/v1/automations`、`PATCH /api/v1/automations/{id}`）；
+    3. 对话 HITL 恢复入口（`src/server/handlers/checkpoint_handler.py:_verify_web_confirm_resume` 中的 `dalton_report_delivery_set` 网页会话守卫）。
+- **信任边界与同源加固**：
+  - 在上述凭证隔离前提下，携带有效 `session` 凭据的请求视为用户本人操作（防的是被提示注入或失控的助手/沙箱/非交互令牌绕过确认，而非防用户本人主动从自己浏览器开发者工具或本机脚本提取自己的登录会话）。
+  - 为防止跨站伪造（CSRF）及缺失浏览器同源上下文的直调，签发与预检入口除校验 `principal.auth == "session"`（并拒绝 `X-Service-Token`）外，还**强制要求**：
+    - `Origin` 请求头存在且属于本站允许来源集合；
+    - `Sec-Fetch-Site` 请求头存在且严格等于 `same-origin`（缺失或为 `cross-site` / `same-site` / `none` 均直接返回 `403`）。
+  - 签发的一次性凭据（`rdc_*`）在数据库 `dalton_report_delivery_confirmations` 中仅存 SHA-256 哈希，严格绑定 `actor_user_id`、`action`、`automation_id`、`expected_config_version` 与三类目标的规范化载荷摘要（`payload_digest`），短时有效（默认 `300s`），并在 `POST`/`PATCH` 写入事务内通过 `consumed_at IS NULL` 原子一次性消费。
 
 后续如将即时消息外发（如 `send_message`）开放至非调用者本人目标，亦复用同一“群发或私信他人必经真实确认”基线。
 

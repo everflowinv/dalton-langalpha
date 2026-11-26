@@ -13,7 +13,9 @@ import {
 } from "../../gateway-lease.js";
 import type { HostIpResolver } from "../../shared/safe-fetch.js";
 import {
+  WeixinApiError,
   fetchWeixinQrCode,
+  isInvalidVerifyCodeCode,
   normalizeAndValidateIlinkBaseUrl,
   pollWeixinQrStatus,
   resolveValidatedRedirectBaseUrl,
@@ -23,6 +25,7 @@ import {
   ILINK_DEFAULT_BASE_URL,
   ILINK_DEFAULT_BOT_TYPE,
   ILINK_DEFAULT_CDN_BASE_URL,
+  INVALID_VERIFY_CODE_ERRCODES,
   OFFICIAL_ILINK_API_DOMAINS,
   type QrCodeStatusResp,
   type WeixinQrPollStatus,
@@ -65,6 +68,8 @@ export interface WeixinQrLoginManagerOptions {
   cdnBaseUrl?: string;
   botType?: string;
   allowedApiDomains?: readonly string[];
+  /** Confirmed iLink `verify_qrcode_code` errcodes that indicate an invalid code (retryable). */
+  invalidVerifyCodeErrorCodes?: readonly number[];
   resolveHostIps?: HostIpResolver;
   checkResolvedIps?: boolean;
   fetchImpl?: typeof fetch;
@@ -109,6 +114,14 @@ export const SAFE_WEIXIN_QR_ERROR_MESSAGES: Readonly<Record<string, string>> = {
   roster_lookup_error: "Unable to verify team roster right now; please retry shortly.",
   member_not_in_roster: "Your account is not eligible for Weixin channel access.",
   external_member_forbidden: "External members are not permitted to bind Weixin.",
+  external_access_disabled: "External members are not permitted to bind Weixin.",
+  invalid_verify_code: "Verification code is invalid; please check and try again.",
+  verify_code_expired: "Verification code has expired; please refresh the QR code and scan again.",
+  weixin_login_failed: "Weixin login failed; please refresh the QR code and scan again.",
+  weixin_rate_limited: "Weixin iLink is rate limiting requests; please retry shortly.",
+  session_expired: "Weixin QR login session has expired.",
+  qr_expired: "Weixin QR code has expired.",
+  stale_bot_generation: "Weixin account was updated by another scan; please refresh the QR code.",
   ilink_invalid_qrcode: "Weixin iLink did not return a valid QR code.",
   ilink_invalid_confirm: "Weixin login confirmation response was incomplete.",
   gateway_lease_paused: "Gateway lease is renewing; please retry shortly.",
@@ -299,6 +312,7 @@ export class WeixinQrLoginManager {
   private readonly cdnBaseUrl: string;
   private readonly botType: string;
   private readonly allowedApiDomains?: readonly string[];
+  private readonly invalidVerifyCodeCodes: ReadonlySet<number>;
   private readonly resolveHostIps?: HostIpResolver;
   private readonly checkResolvedIps?: boolean;
   private readonly fetchImpl?: typeof fetch;
@@ -310,7 +324,20 @@ export class WeixinQrLoginManager {
   ) => Promise<void> | void;
   private readonly inFlightWaits = new Map<
     string,
-    Promise<WeixinQrPublicWaitResponse>
+    {
+      userId: string;
+      sessionKey: string;
+      orderUs: bigint | null;
+      controller: AbortController;
+      waiters: number;
+      superseded: boolean;
+      promise: Promise<WeixinQrPublicWaitResponse>;
+    }
+  >();
+  private readonly sessionOrderByKey = new Map<string, bigint>();
+  private readonly latestConfirmedOrderByUser = new Map<
+    string,
+    { sessionKey: string; orderUs: bigint }
   >();
 
   constructor(opts: WeixinQrLoginManagerOptions) {
@@ -319,6 +346,9 @@ export class WeixinQrLoginManager {
     this.cdnBaseUrl = (opts.cdnBaseUrl || ILINK_DEFAULT_CDN_BASE_URL).trim();
     this.botType = (opts.botType || ILINK_DEFAULT_BOT_TYPE).trim();
     this.allowedApiDomains = opts.allowedApiDomains;
+    this.invalidVerifyCodeCodes = new Set(
+      opts.invalidVerifyCodeErrorCodes ?? INVALID_VERIFY_CODE_ERRCODES,
+    );
     this.resolveHostIps = opts.resolveHostIps;
     this.checkResolvedIps = opts.checkResolvedIps;
     this.fetchImpl = opts.fetchImpl;
@@ -326,6 +356,64 @@ export class WeixinQrLoginManager {
     this.isLeaseValid = opts.isLeaseValid;
     this.assertLeaseValidFn = opts.assertLeaseValid;
     this.onAccountConfirmed = opts.onAccountConfirmed;
+  }
+
+  private parseIsoTimestampUs(raw?: string | null): bigint | null {
+    if (!raw) return null;
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    const match =
+      /^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})?$/i.exec(
+        trimmed,
+      );
+    if (!match) {
+      const ms = Date.parse(trimmed);
+      return Number.isFinite(ms) ? BigInt(Math.trunc(ms)) * 1_000n : null;
+    }
+    const basePart = match[1]!.replace(" ", "T");
+    const fracPart = match[2] ?? "";
+    const tzPart = match[3] || "Z";
+    const baseMs = Date.parse(`${basePart}${tzPart}`);
+    if (!Number.isFinite(baseMs)) return null;
+    const micros = BigInt(fracPart.slice(0, 6).padEnd(6, "0"));
+    return BigInt(Math.trunc(baseMs)) * 1_000n + micros;
+  }
+
+  private parseSessionOrderUs(createdAt?: string | null): bigint | null {
+    return this.parseIsoTimestampUs(createdAt);
+  }
+
+  /**
+   * Abort in-flight `waitQrLogin` polls for `userId`.
+   *
+   * When `newOrderUs` is supplied (DB-confirmed session ordering), only polls
+   * with a known, strictly older timestamp (`entry.orderUs < newOrderUs`) are
+   * cancelled so a late or unordered `save_qr` response can never abort a newer
+   * session. When `newOrderUs` is omitted (`undefined`), all in-flight waits
+   * for the user (except `exceptSessionKey`) are aborted.
+   */
+  cancelUserInFlightWaits(
+    userId: string,
+    exceptSessionKey?: string,
+    newOrderUs?: bigint | null,
+  ): void {
+    const cleanUserId = userId.trim();
+    for (const [key, entry] of this.inFlightWaits.entries()) {
+      if (entry.userId !== cleanUserId) continue;
+      if (exceptSessionKey && entry.sessionKey === exceptSessionKey) continue;
+      if (newOrderUs !== undefined) {
+        if (
+          newOrderUs === null ||
+          entry.orderUs === null ||
+          entry.orderUs >= newOrderUs
+        ) {
+          continue;
+        }
+      }
+      entry.superseded = true;
+      entry.controller.abort(new Error("superseded_by_new_qr_session"));
+      this.inFlightWaits.delete(key);
+    }
   }
 
   private assertLeaseValid(operation: string): void {
@@ -390,17 +478,29 @@ export class WeixinQrLoginManager {
 
     const sessionKey = opts?.sessionKey?.trim() || randomUUID();
 
-    const qrResp = await fetchWeixinQrCode({
-      baseUrl: this.baseUrl,
-      botType: this.botType,
-      signal: opts?.signal,
-      fetchImpl: this.fetchImpl,
-      dispatcher: this.getDispatcher?.(),
-      allowedDomains: this.allowedApiDomains,
-      resolveHostIps: this.resolveHostIps,
-      checkResolvedIps: this.checkResolvedIps,
-      assertLeaseValid: () => this.assertLeaseValid("fetchWeixinQrCode"),
-    });
+    let qrResp;
+    try {
+      qrResp = await fetchWeixinQrCode({
+        baseUrl: this.baseUrl,
+        botType: this.botType,
+        signal: opts?.signal,
+        fetchImpl: this.fetchImpl,
+        dispatcher: this.getDispatcher?.(),
+        allowedDomains: this.allowedApiDomains,
+        resolveHostIps: this.resolveHostIps,
+        checkResolvedIps: this.checkResolvedIps,
+        assertLeaseValid: () => this.assertLeaseValid("fetchWeixinQrCode"),
+      });
+    } catch (err) {
+      if (err instanceof WeixinApiError && err.kind === "rate_limited") {
+        throw new WeixinQrLoginError(
+          SAFE_WEIXIN_QR_ERROR_MESSAGES.weixin_rate_limited!,
+          429,
+          "weixin_rate_limited",
+        );
+      }
+      throw err;
+    }
 
     const qrcode = qrResp.qrcode?.trim();
     const qrcodeImgContent = qrResp.qrcode_img_content?.trim();
@@ -444,6 +544,22 @@ export class WeixinQrLoginManager {
       throw new WeixinQrLoginError(safe.message, 409, safe.code);
     }
 
+    // Only cancel older in-flight polls AFTER the database confirms this session
+    // is active and carries a strictly newer DB `created_at`; a late or
+    // unordered `save_qr` response (even with `expires_at`) never cancels a newer session.
+    const confirmedOrderUs = this.parseSessionOrderUs(saved.created_at);
+    if (confirmedOrderUs !== null) {
+      this.sessionOrderByKey.set(sessionKey, confirmedOrderUs);
+      const prevLatest = this.latestConfirmedOrderByUser.get(cleanUserId);
+      if (!prevLatest || confirmedOrderUs > prevLatest.orderUs) {
+        this.latestConfirmedOrderByUser.set(cleanUserId, {
+          sessionKey,
+          orderUs: confirmedOrderUs,
+        });
+        this.cancelUserInFlightWaits(cleanUserId, sessionKey, confirmedOrderUs);
+      }
+    }
+
     return shapePublicQrStartResponse({
       sessionKey,
       status: "wait",
@@ -468,23 +584,97 @@ export class WeixinQrLoginManager {
       throw new WeixinQrLoginError("Missing session_key", 400, "invalid_request");
     }
 
-    const inflightKey = `${cleanUserId}:${cleanSessionKey}`;
-    const existing = this.inFlightWaits.get(inflightKey);
-    if (existing) {
-      return existing;
+    if (opts?.signal?.aborted) {
+      throw opts.signal.reason instanceof Error
+        ? opts.signal.reason
+        : new Error("aborted");
     }
 
-    const promise = this.executeWaitQrLogin(
-      cleanUserId,
-      cleanSessionKey,
-      opts,
-    ).finally(() => {
-      if (this.inFlightWaits.get(inflightKey) === promise) {
-        this.inFlightWaits.delete(inflightKey);
-      }
+    const inflightKey = `${cleanUserId}:${cleanSessionKey}`;
+    let entry = this.inFlightWaits.get(inflightKey);
+    if (!entry || entry.controller.signal.aborted) {
+      const controller = new AbortController();
+      const created = {
+        userId: cleanUserId,
+        sessionKey: cleanSessionKey,
+        orderUs: this.sessionOrderByKey.get(cleanSessionKey) ?? null,
+        controller,
+        waiters: 0,
+        superseded: false,
+        promise: null as unknown as Promise<WeixinQrPublicWaitResponse>,
+      };
+      created.promise = this.executeWaitQrLogin(
+        cleanUserId,
+        cleanSessionKey,
+        {
+          timeoutMs: opts?.timeoutMs,
+          signal: controller.signal,
+          isSuperseded: () => created.superseded,
+          onSessionOrder: (orderUs) => {
+            if (orderUs !== null && created.orderUs === null) {
+              created.orderUs = orderUs;
+            }
+          },
+        },
+      ).finally(() => {
+        if (this.inFlightWaits.get(inflightKey) === created) {
+          this.inFlightWaits.delete(inflightKey);
+        }
+      });
+      this.inFlightWaits.set(inflightKey, created);
+      entry = created;
+    }
+
+    entry.waiters += 1;
+    const callerSignal = opts?.signal;
+    if (!callerSignal) {
+      return entry.promise.finally(() => {
+        entry!.waiters = Math.max(0, entry!.waiters - 1);
+      });
+    }
+
+    return await new Promise<WeixinQrPublicWaitResponse>((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        callerSignal.removeEventListener("abort", onCallerAbort);
+      };
+      const onCallerAbort = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        entry!.waiters = Math.max(0, entry!.waiters - 1);
+        if (entry!.waiters === 0 && !entry!.controller.signal.aborted) {
+          entry!.controller.abort(
+            callerSignal.reason ?? new Error("client_disconnected"),
+          );
+          if (this.inFlightWaits.get(inflightKey) === entry) {
+            this.inFlightWaits.delete(inflightKey);
+          }
+        }
+        reject(
+          callerSignal.reason instanceof Error
+            ? callerSignal.reason
+            : new Error("aborted"),
+        );
+      };
+      callerSignal.addEventListener("abort", onCallerAbort, { once: true });
+      entry!.promise.then(
+        (val) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          entry!.waiters = Math.max(0, entry!.waiters - 1);
+          resolve(val);
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          entry!.waiters = Math.max(0, entry!.waiters - 1);
+          reject(err);
+        },
+      );
     });
-    this.inFlightWaits.set(inflightKey, promise);
-    return promise;
   }
 
   private async shapeAlreadyConfirmedSession(
@@ -735,7 +925,12 @@ export class WeixinQrLoginManager {
   private async executeWaitQrLogin(
     userId: string,
     sessionKey: string,
-    opts?: { signal?: AbortSignal; timeoutMs?: number },
+    opts?: {
+      signal?: AbortSignal;
+      timeoutMs?: number;
+      isSuperseded?: () => boolean;
+      onSessionOrder?: (orderUs: bigint | null) => void;
+    },
   ): Promise<WeixinQrPublicWaitResponse> {
     this.assertLeaseValid("waitQrLogin");
 
@@ -744,6 +939,11 @@ export class WeixinQrLoginManager {
       return fetched.response;
     }
     const { session } = fetched;
+    const sessionOrder = this.parseSessionOrderUs(session.created_at);
+    if (sessionOrder !== null) {
+      this.sessionOrderByKey.set(sessionKey, sessionOrder);
+    }
+    opts?.onSessionOrder?.(sessionOrder);
     const check = await this.validateSessionState(session, userId, sessionKey);
     if (!check.valid) {
       return check.response;
@@ -756,18 +956,53 @@ export class WeixinQrLoginManager {
 
     this.assertLeaseValid("pollWeixinQrStatus");
 
-    const statusResp = await pollWeixinQrStatus({
-      baseUrl: pollBaseUrl,
-      qrcode: session.qrcode!,
-      timeoutMs: opts?.timeoutMs,
-      signal: opts?.signal,
-      fetchImpl: this.fetchImpl,
-      dispatcher: this.getDispatcher?.(),
-      allowedDomains: this.allowedApiDomains,
-      resolveHostIps: this.resolveHostIps,
-      checkResolvedIps: this.checkResolvedIps,
-      assertLeaseValid: () => this.assertLeaseValid("pollWeixinQrStatus"),
-    });
+    let statusResp: QrCodeStatusResp;
+    try {
+      statusResp = await pollWeixinQrStatus({
+        baseUrl: pollBaseUrl,
+        qrcode: session.qrcode!,
+        timeoutMs: opts?.timeoutMs,
+        signal: opts?.signal,
+        fetchImpl: this.fetchImpl,
+        dispatcher: this.getDispatcher?.(),
+        allowedDomains: this.allowedApiDomains,
+        resolveHostIps: this.resolveHostIps,
+        checkResolvedIps: this.checkResolvedIps,
+        assertLeaseValid: () => this.assertLeaseValid("pollWeixinQrStatus"),
+      });
+    } catch (err) {
+      if (opts?.isSuperseded?.()) {
+        return shapePublicQrWaitResponse({
+          sessionKey,
+          status: "superseded",
+          connected: false,
+          revoked: true,
+          code: "login_session_revoked",
+          expiresAt: session.expires_at,
+          message: SAFE_WEIXIN_QR_ERROR_MESSAGES.login_session_revoked,
+        });
+      }
+      if (err instanceof WeixinApiError && err.kind === "rate_limited") {
+        throw new WeixinQrLoginError(
+          SAFE_WEIXIN_QR_ERROR_MESSAGES.weixin_rate_limited!,
+          429,
+          "weixin_rate_limited",
+        );
+      }
+      throw err;
+    }
+
+    if (opts?.isSuperseded?.()) {
+      return shapePublicQrWaitResponse({
+        sessionKey,
+        status: "superseded",
+        connected: false,
+        revoked: true,
+        code: "login_session_revoked",
+        expiresAt: session.expires_at,
+        message: SAFE_WEIXIN_QR_ERROR_MESSAGES.login_session_revoked,
+      });
+    }
 
     return this.handleStatusPollResult(
       userId,
@@ -816,19 +1051,91 @@ export class WeixinQrLoginManager {
 
     this.assertLeaseValid("submitWeixinQrVerifyCode");
 
-    const statusResp = await submitWeixinQrVerifyCode({
-      baseUrl: pollBaseUrl,
-      qrcode: session.qrcode!,
-      verifyCode: cleanCode,
-      timeoutMs: opts?.timeoutMs,
-      signal: opts?.signal,
-      fetchImpl: this.fetchImpl,
-      dispatcher: this.getDispatcher?.(),
-      allowedDomains: this.allowedApiDomains,
-      resolveHostIps: this.resolveHostIps,
-      checkResolvedIps: this.checkResolvedIps,
-      assertLeaseValid: () => this.assertLeaseValid("submitWeixinQrVerifyCode"),
-    });
+    let statusResp: QrCodeStatusResp;
+    try {
+      statusResp = await submitWeixinQrVerifyCode({
+        baseUrl: pollBaseUrl,
+        qrcode: session.qrcode!,
+        verifyCode: cleanCode,
+        timeoutMs: opts?.timeoutMs,
+        signal: opts?.signal,
+        fetchImpl: this.fetchImpl,
+        dispatcher: this.getDispatcher?.(),
+        allowedDomains: this.allowedApiDomains,
+        resolveHostIps: this.resolveHostIps,
+        checkResolvedIps: this.checkResolvedIps,
+        assertLeaseValid: () => this.assertLeaseValid("submitWeixinQrVerifyCode"),
+      });
+    } catch (err) {
+      if (
+        isStaleGatewayEpochError(err) ||
+        isLeaseSafetyMarginPauseError(err) ||
+        err instanceof WeixinQrLoginError
+      ) {
+        throw err;
+      }
+      if (err instanceof WeixinApiError) {
+        if (err.kind === "rate_limited") {
+          throw new WeixinQrLoginError(
+            SAFE_WEIXIN_QR_ERROR_MESSAGES.weixin_rate_limited!,
+            429,
+            "weixin_rate_limited",
+          );
+        }
+        if (err.kind === "session_expired") {
+          throw new WeixinQrLoginError(
+            SAFE_WEIXIN_QR_ERROR_MESSAGES.verify_code_expired!,
+            409,
+            "verify_code_expired",
+          );
+        }
+        if (err.kind === "business_error") {
+          if (this.invalidVerifyCodeCodes.size > 0) {
+            if (
+              isInvalidVerifyCodeCode(
+                err.ret,
+                err.errcode,
+                this.invalidVerifyCodeCodes,
+              )
+            ) {
+              throw new WeixinQrLoginError(
+                SAFE_WEIXIN_QR_ERROR_MESSAGES.invalid_verify_code!,
+                400,
+                "invalid_verify_code",
+              );
+            }
+            throw new WeixinQrLoginError(
+              SAFE_WEIXIN_QR_ERROR_MESSAGES.weixin_login_failed!,
+              502,
+              "weixin_login_failed",
+            );
+          }
+          // Without empirically confirmed retryable verify-code error codes, treat
+          // verify_qrcode_code 2xx/4xx business errors as requiring a fresh scan
+          // and 5xx business errors as login service failures.
+          if (typeof err.status === "number" && err.status >= 500) {
+            throw new WeixinQrLoginError(
+              SAFE_WEIXIN_QR_ERROR_MESSAGES.weixin_login_failed!,
+              502,
+              "weixin_login_failed",
+            );
+          }
+          throw new WeixinQrLoginError(
+            SAFE_WEIXIN_QR_ERROR_MESSAGES.verify_code_expired!,
+            409,
+            "verify_code_expired",
+          );
+        }
+        if (err.kind === "http_error" || err.kind === "network_error") {
+          throw new WeixinQrLoginError(
+            SAFE_WEIXIN_QR_ERROR_MESSAGES.weixin_login_failed!,
+            502,
+            "weixin_login_failed",
+          );
+        }
+      }
+      throw err;
+    }
 
     return this.handleStatusPollResult(
       cleanUserId,

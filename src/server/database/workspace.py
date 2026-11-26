@@ -461,12 +461,21 @@ async def get_workspace_name_keys(user_id: str) -> set[str]:
 # DALTON-HOOK(workspace-duplicate-guard): names of every live workspace, for the
 # agent-side check that turns a duplicate create into an ask.
 async def get_live_workspace_names(user_id: str) -> List[Dict[str, Any]]:
-    """``(workspace_id, name)`` of every live workspace the user holds.
+    """``(workspace_id, name[, unit_ticker])`` of every live workspace the user holds.
 
     The same fence as the name-key lookups, so what counts as a duplicate
     here is exactly what would collide there.
     """
+    # DALTON-HOOK(cos-settings-tools): delegate coverage-unit ticker enrichment to src/dalton
+    from src.dalton.settings import is_coverage_units_enabled
+
     async with _ws_cursor() as cur:
+        if is_coverage_units_enabled():
+            from src.dalton.coverage.locked_recheck import (
+                fetch_live_workspace_names_with_unit_ticker,
+            )
+
+            return await fetch_live_workspace_names_with_unit_ticker(cur, user_id)
         await cur.execute(
             f"""
             SELECT workspace_id, name FROM workspaces
@@ -872,6 +881,7 @@ async def create_workspace_on_computer(
     expected_duplicate_workspace_name: Optional[str] = None,
     verified_company_candidates: Optional[Iterable[Tuple[Any, ...]]] = None,
     check_colleague_duplicate: bool = False,
+    reject_reason_out: Optional[list[str]] = None,
     # --- DALTON-HOOK(cos-settings-tools): end ---
     # --- DALTON-HOOK(workspace-dedup): begin ---
     target_ticker: Optional[str] = None,
@@ -963,6 +973,27 @@ async def create_workspace_on_computer(
                     if expected_computer_kind is not None:
                         extra_fence += "\n                                  AND kind = %(expected_computer_kind)s"
                     async with owned.transaction():
+                        if reject_reason_out is not None:
+                            await cur.execute(
+                                f"""
+                                SELECT config
+                                FROM computers
+                                WHERE computer_id = %(computer_id)s AND {FENCE_NOT_DELETED}
+                                  AND user_id = %(user_id)s
+                                FOR SHARE
+                                """,
+                                {
+                                    "computer_id": computer_id,
+                                    "user_id": user_id,
+                                },
+                            )
+                            locked_state = await cur.fetchone()
+                            if (
+                                isinstance(locked_state, dict)
+                                and (locked_state.get("config") or {}).get("archiving")
+                            ):
+                                reject_reason_out.append("archiving")
+                                return None
                         if expected_computer_name is not None or expected_computer_kind is not None:
                             from src.tools.secretary.utils import spoken_computer_name
 

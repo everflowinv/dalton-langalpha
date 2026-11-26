@@ -416,8 +416,12 @@ export function resolveDaltonAutomationNotifyState(
         return { enabled: overrides[customKey], source: 'task' };
       }
     } else {
+      // DALTON-HOOK(weixin-multi-account): align inherent-category override precedence with dispatch.py (automation:<id> first)
+      const autoId = automation.automation_id?.trim();
+      const idKey = autoId && category !== 'data_task' ? `automation:${autoId}` : '';
       const trimmedName = automation.name.trim();
       const candidates: Array<[string, string]> = [
+        ...(idKey ? ([[idKey, 'task']] as Array<[string, string]>) : []),
         [trimmedName, 'task'],
         [trimmedName.toLowerCase(), 'task'],
         [`category:${category}`, 'category'],

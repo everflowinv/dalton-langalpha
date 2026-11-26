@@ -990,9 +990,17 @@ async def pull_direct(
     # DALTON-HOOK(chat-large-upload): forward sweep_orphans=False to sandbox transfer runtime
     if not sweep_orphans:
         spec["sweep_orphans"] = False
-    out = await run_transfer_op(
-        sandbox, "pull", spec, timeout_s=transfer_timeout_s(total)
-    )
+        out = await run_transfer_op(
+            sandbox, "pull", spec, timeout_s=transfer_timeout_s(total)
+        )
+    else:
+        # DALTON-HOOK(relay-staging-race): serialize orphan-sweeping pulls against concurrent relay staging/placement on the same root
+        from src.dalton.services.relay_staging_guard import relay_transfer_lock
+
+        async with relay_transfer_lock(sandbox, layout.workspace):
+            out = await run_transfer_op(
+                sandbox, "pull", spec, timeout_s=transfer_timeout_s(total)
+            )
     return out.get("results", {})
 
 

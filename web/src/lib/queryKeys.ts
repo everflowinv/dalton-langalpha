@@ -546,6 +546,8 @@ export const queryKeys = {
     workspaceSettings: (workspaceId: string) => [...queryKeys.dalton.all, 'workspace-settings', workspaceId],
     userSettings: () => [...queryKeys.dalton.all, 'user-settings'],
     channelBindings: () => [...queryKeys.dalton.all, 'channels', 'bindings'],
+    // DALTON-HOOK(weixin-multi-account): admin overview query key for team WeChat channel management
+    weixinAdminOverview: () => [...queryKeys.dalton.all, 'channels', 'weixin', 'admin', 'overview'],
     // DALTON-HOOK(team-model-catalog): team model catalog overview, revisions, and revision detail query keys
     teamModelCatalog: () => [...queryKeys.dalton.all, 'team-model-catalog'],
     teamModelRevisions: (limit = 50, offset = 0) => [

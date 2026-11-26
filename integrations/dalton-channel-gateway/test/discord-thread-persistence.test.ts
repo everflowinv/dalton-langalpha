@@ -25,6 +25,10 @@ import {
 } from "../src/channels/discord/index.js";
 import { DeliveryService } from "../src/delivery-service.js";
 import type { ChannelPlatform } from "../src/types.js";
+import {
+  createIsolatedPostgresDatabase,
+  type IsolatedPostgresDatabase,
+} from "./pg-isolation.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "../../..");
@@ -92,8 +96,16 @@ async function startOrAttachBackend(): Promise<Harness> {
     .split(delimiter)
     .filter((part) => part.length > 0);
   if (!pythonPath.includes(REPO_ROOT)) pythonPath.unshift(REPO_ROOT);
+  const pyBin = resolvePythonBin();
+  const isolatedDb: IsolatedPostgresDatabase =
+    await createIsolatedPostgresDatabase({
+      baseDsn: dsn,
+      tag: "discord_thread",
+      pythonBin: pyBin,
+      repoRoot: REPO_ROOT,
+    });
   const proc = spawn(
-    resolvePythonBin(),
+    pyBin,
     [
       "-m",
       "tests.integration.dalton.test_discord_thread_persistence_db",
@@ -103,7 +115,9 @@ async function startOrAttachBackend(): Promise<Harness> {
       cwd: REPO_ROOT,
       env: {
         ...process.env,
-        DALTON_CHANNEL_GATEWAY_TEST_DSN: dsn,
+        DALTON_CHANNEL_GATEWAY_TEST_DSN: isolatedDb.dsn,
+        DALTON_TEST_DB_DSN: isolatedDb.dsn,
+        TEST_DATABASE_URL: isolatedDb.dsn,
         PYTHONPATH: pythonPath.join(delimiter),
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -114,11 +128,16 @@ async function startOrAttachBackend(): Promise<Harness> {
     return {
       baseUrl,
       stop: async () => {
-        await stopProcess(proc);
+        try {
+          await stopProcess(proc);
+        } finally {
+          await isolatedDb.drop();
+        }
       },
     };
   } catch (err) {
     await stopProcess(proc);
+    await isolatedDb.drop();
     throw err;
   }
 }

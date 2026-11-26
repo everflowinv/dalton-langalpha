@@ -28,6 +28,7 @@ import {
   ILINK_CHANNEL_VERSION,
   ILINK_DEFAULT_BASE_URL,
   ILINK_DEFAULT_BOT_TYPE,
+  INVALID_VERIFY_CODE_ERRCODES,
   OFFICIAL_ILINK_API_DOMAINS,
   type QrCodeStartResp,
   type QrCodeStatusResp,
@@ -144,12 +145,27 @@ export function buildIlinkApiHeaders(opts: {
   return headers;
 }
 
+const DEFAULT_INVALID_VERIFY_CODE_SET: ReadonlySet<number> = new Set(
+  INVALID_VERIFY_CODE_ERRCODES,
+);
+
 export function isSessionExpiredCode(
   ret?: number,
   errcode?: number,
 ): boolean {
   return (
     ret === SESSION_EXPIRED_ERRCODE || errcode === SESSION_EXPIRED_ERRCODE
+  );
+}
+
+export function isInvalidVerifyCodeCode(
+  ret?: number,
+  errcode?: number,
+  knownCodes: ReadonlySet<number> = DEFAULT_INVALID_VERIFY_CODE_SET,
+): boolean {
+  return (
+    (typeof ret === "number" && knownCodes.has(ret)) ||
+    (typeof errcode === "number" && knownCodes.has(errcode))
   );
 }
 
@@ -186,6 +202,7 @@ export function assertIlinkBusinessOk(
   payload: { ret?: unknown; errcode?: unknown; errmsg?: unknown },
   endpoint: string,
   requestSent = true,
+  httpStatus?: number,
 ): void {
   const safeEndpoint = sanitizeIlinkEndpointForLog(endpoint);
   const rawRet = payload.ret;
@@ -211,6 +228,7 @@ export function assertIlinkBusinessOk(
     endpoint: safeEndpoint,
     // §4.3: never emit raw iLink errmsg text or unvalidated non-numeric fields into logs/errors
     message: `${safeEndpoint} business error: ret=${retLabel} errcode=${errcodeLabel}`,
+    status: httpStatus,
     ret,
     errcode,
     requestSent,
@@ -301,6 +319,8 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
   resolveHostIps?: HostIpResolver;
   checkResolvedIps?: boolean;
   assertLeaseValid?: () => void;
+  /** Only opt-in callers (e.g. verify_qrcode_code) parse business ret/errcode on non-2xx responses. */
+  parseBusinessErrorOnNon2xx?: boolean;
 }): Promise<T> {
   const safeEndpoint = sanitizeIlinkEndpointForLog(params.endpoint);
   const allowedDomains = params.allowedDomains ?? OFFICIAL_ILINK_API_DOMAINS;
@@ -367,6 +387,19 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
     });
   }
 
+  if (response.status === 429) {
+    const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
+    void response.body?.cancel().catch(() => {});
+    throw new WeixinApiError({
+      kind: "rate_limited",
+      endpoint: safeEndpoint,
+      message: `${safeEndpoint} rate limited (HTTP 429)`,
+      status: 429,
+      retryAfterMs,
+      requestSent: requestDispatched,
+    });
+  }
+
   let rawText: string;
   try {
     rawText = await response.text();
@@ -380,19 +413,32 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
       cause: err,
     });
   }
-  if (response.status === 429) {
-    const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
-    throw new WeixinApiError({
-      kind: "rate_limited",
-      endpoint: safeEndpoint,
-      message: `${safeEndpoint} rate limited (HTTP 429)`,
-      status: 429,
-      retryAfterMs,
-      requestSent: requestDispatched,
-    });
-  }
 
   if (!response.ok) {
+    // Only opt-in endpoints (verify_qrcode_code) parse business ret/errcode on
+    // non-2xx responses; sendmessage 5xx stays `http_error` so uncertain delivery
+    // outcomes remain `unknown`.
+    if (params.parseBusinessErrorOnNon2xx) {
+      let parsedErr: unknown = null;
+      try {
+        parsedErr = parseWeixinApiJson<unknown>(rawText);
+      } catch {
+        parsedErr = null;
+      }
+      if (
+        parsedErr !== null &&
+        parsedErr !== undefined &&
+        typeof parsedErr === "object" &&
+        !Array.isArray(parsedErr)
+      ) {
+        assertIlinkBusinessOk(
+          parsedErr as { ret?: unknown; errcode?: unknown; errmsg?: unknown },
+          safeEndpoint,
+          requestDispatched,
+          response.status,
+        );
+      }
+    }
     throw new WeixinApiError({
       kind: "http_error",
       endpoint: safeEndpoint,
@@ -517,6 +563,7 @@ export async function submitWeixinQrVerifyCode(
     resolveHostIps: options.resolveHostIps,
     checkResolvedIps: options.checkResolvedIps,
     assertLeaseValid: options.assertLeaseValid,
+    parseBusinessErrorOnNon2xx: true,
   });
 }
 

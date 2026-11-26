@@ -2888,19 +2888,27 @@ async def test_http_retry_and_pending_input_retry_routes_preserve_system_only_to
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Decision 5 (codex medium 5): HTTP POST /api/v1/threads/{id}/retry exercises BOTH
-    checkpoint retry and pending-input rerun through FastAPI routing all the way to
-    resolve_llm_config and astream_ptc_workflow(run_metadata=...)."""
+    checkpoint retry and pending-input rerun through FastAPI routing, real
+    astream_ptc_workflow, real begin_run, and real RunCoordinator.start_run all the
+    way to the runs_lifecycle_db.start_run DB write boundary."""
+    from datetime import datetime, timezone
+
     from fastapi import FastAPI
     from httpx import ASGITransport, AsyncClient
 
     from src.server.app.threads import messaging as msg_mod
     from src.server.database.conversation import queries as queries_db
     from src.server.dependencies import cli_approval, principal as principal_mod, usage_limits
-    from src.server.handlers import chat as chat_handlers, checkpoint_handler
-    from src.server.services import turn_runtime
+    from src.server.handlers import checkpoint_handler
+    from src.server.handlers.chat import ptc_run
+    from src.server.services import turn_runtime, writer_guard
     from src.server.services.llm import thread_model as thread_model_mod
+    from src.server.services.report_back.handoff import carry
     from src.server.services.runs import pending_input as pending_input_mod
+    from src.server.services.shared_workspaces import turn as shared_turn_mod
     from src.server.services.shared_workspaces.turn import TurnIdentity as SharedTurnIdentity
+    from src.server.services.thread_mutation import ThreadMutationRunner
+    from src.server.services.workspace_manager import WorkspaceManager
 
     app = FastAPI()
     app.include_router(msg_mod.router)
@@ -3049,9 +3057,16 @@ async def test_http_retry_and_pending_input_retry_routes_preserve_system_only_to
             (model_name, bool(kw.get("ignore_custom_models", False)), kw.get("reasoning_effort"))
         )
         return SimpleNamespace(
-            llm=SimpleNamespace(name=model_name),
+            llm=SimpleNamespace(name=model_name, fallback=[]),
             llm_client=object(),
             credential_source=None,
+            claude_code=False,
+            claude_code_admitted=None,
+            disabled_skills=set(),
+            withheld_skills=set(),
+            user_skills=[],
+            user_skill_dir=None,
+            skill_command_overrides={},
         )
 
     monkeypatch.setattr(
@@ -3060,38 +3075,210 @@ async def test_http_retry_and_pending_input_retry_routes_preserve_system_only_to
         create_autospec(llm_config_mod.resolve_llm_config, side_effect=_fake_resolve),
     )
 
-    workflow_run_metas: list[dict[str, Any] | None] = []
+    # Keep the real START path (astream_ptc_workflow -> begin_run -> RunCoordinator.start_run)
+    # and assert the metadata written at the runs_lifecycle_db.start_run DB boundary.
+    wm = create_autospec(WorkspaceManager, instance=True)
+    wm.has_ready_session.return_value = True
+    monkeypatch.setattr(
+        ptc_run.WorkspaceManager,
+        "get_instance",
+        create_autospec(WorkspaceManager.get_instance, return_value=wm),
+    )
+    mut_runner = create_autospec(ThreadMutationRunner, instance=True)
+    mut_runner.holding_verb.return_value = None
+    monkeypatch.setattr(
+        ThreadMutationRunner,
+        "get_instance",
+        create_autospec(ThreadMutationRunner.get_instance, return_value=mut_runner),
+    )
+    monkeypatch.setattr(
+        ptc_run,
+        "dedup_retransmit_or_raise",
+        create_autospec(ptc_run.dedup_retransmit_or_raise, return_value=None),
+    )
+    monkeypatch.setattr(
+        ptc_run,
+        "wait_or_steer",
+        create_autospec(ptc_run.wait_or_steer, return_value=(True, None)),
+    )
+    monkeypatch.setattr(
+        ptc_run,
+        "ensure_thread",
+        create_autospec(ptc_run.ensure_thread, return_value=ptc_run.PriorThread()),
+    )
+    monkeypatch.setattr(
+        ptc_run,
+        "retried_on_its_surface",
+        create_autospec(ptc_run.retried_on_its_surface, side_effect=lambda req: (req, False)),
+    )
+    monkeypatch.setattr(
+        carry,
+        "prior_attempt",
+        create_autospec(
+            carry.prior_attempt,
+            return_value=carry.PriorAttempt(latest=None, retried=None),
+        ),
+    )
+    monkeypatch.setattr(
+        carry,
+        "carried_pair",
+        create_autospec(carry.carried_pair, return_value={}),
+    )
+    monkeypatch.setattr(
+        carry,
+        "carried_firing",
+        create_autospec(carry.carried_firing, return_value={}),
+    )
+    monkeypatch.setattr(
+        carry,
+        "carried_delivery",
+        create_autospec(carry.carried_delivery, return_value=None),
+    )
+    monkeypatch.setattr(
+        ptc_run,
+        "read_disk_notice",
+        create_autospec(ptc_run.read_disk_notice, return_value=(None, False)),
+    )
+    monkeypatch.setattr(
+        shared_turn_mod,
+        "get_user_profile_for_prompt",
+        create_autospec(shared_turn_mod.get_user_profile_for_prompt, return_value=None),
+    )
+    monkeypatch.setattr(
+        ptc_run.HomeTurnStart,
+        "read",
+        create_autospec(
+            ptc_run.HomeTurnStart.read,
+            return_value=ptc_run.HomeTurnStart(workspace_id=WS, away=None, back=None),
+        ),
+    )
+    monkeypatch.setattr(
+        ptc_run,
+        "_resolve_origin_meta",
+        create_autospec(ptc_run._resolve_origin_meta, return_value={}),
+    )
+    monkeypatch.setattr(
+        ptc_run,
+        "replaced_turn_typed",
+        create_autospec(ptc_run.replaced_turn_typed, return_value=None),
+    )
+    monkeypatch.setattr(
+        ptc_run,
+        "keep_named_model",
+        create_autospec(ptc_run.keep_named_model, return_value=None),
+    )
+    monkeypatch.setattr(
+        atm_mod,
+        "remember_automation_thread_model",
+        create_autospec(atm_mod.remember_automation_thread_model, return_value=None),
+    )
+    monkeypatch.setattr(
+        writer_guard,
+        "guard_enabled",
+        create_autospec(writer_guard.guard_enabled, return_value=False),
+    )
+    monkeypatch.setattr(
+        "src.server.services.thread_control_stream.announce_run_started",
+        create_autospec(
+            __import__(
+                "src.server.services.thread_control_stream",
+                fromlist=["announce_run_started"],
+            ).announce_run_started,
+            return_value=None,
+        ),
+    )
+    monkeypatch.setattr(
+        "src.server.services.thread_lifecycle_feed.publish_run_started",
+        create_autospec(
+            __import__(
+                "src.server.services.thread_lifecycle_feed",
+                fromlist=["publish_run_started"],
+            ).publish_run_started,
+            return_value=None,
+        ),
+    )
 
-    async def _fake_astream(*_a: Any, **kw: Any):
-        workflow_run_metas.append(kw.get("run_metadata"))
-        if kw.get("setup_over") is not None:
-            kw["setup_over"].set()
-        yield "event: done\ndata: {}\n\n"
+    class _StopAfterStart(RuntimeError):
+        pass
 
     monkeypatch.setattr(
-        chat_handlers,
-        "astream_ptc_workflow",
-        create_autospec(chat_handlers.astream_ptc_workflow, side_effect=_fake_astream),
+        ptc_run,
+        "init_tracking",
+        create_autospec(ptc_run.init_tracking, side_effect=_StopAfterStart("after START")),
+    )
+
+    async def _end_after_start_error(*_a: Any, **_kw: Any):
+        yield "event: error\ndata: {\"error\": \"stop_after_start\"}\n\n"
+
+    monkeypatch.setattr(
+        ptc_run,
+        "handle_workflow_error",
+        create_autospec(ptc_run.handle_workflow_error, side_effect=_end_after_start_error),
+    )
+
+    persisted_start_metas: list[dict[str, Any]] = []
+
+    async def _capture_db_start_run(
+        *,
+        run_id: str,
+        thread_id: str,
+        request_key: str,
+        turn_index: int | None = None,
+        attempt_no: int = 1,
+        retry_of_run_id: str | None = None,
+        query: Any = None,
+        fork: Any = None,
+        run_horizon: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        created_at: Any = None,
+        user_id: str | None = None,
+        before_commit: Any = None,
+        conn: Any = None,
+    ) -> dict[str, Any]:
+        captured = dict(metadata or {})
+        persisted_start_metas.append(captured)
+        return {
+            "conversation_response_id": run_id,
+            "conversation_thread_id": thread_id,
+            "turn_index": turn_index if turn_index is not None else 1,
+            "attempt_no": attempt_no,
+            "retry_of_run_id": retry_of_run_id,
+            "status": "in_progress",
+            "metadata": captured,
+            "created_at": created_at or datetime.now(timezone.utc),
+            "thread_title": "Test Thread",
+        }
+
+    monkeypatch.setattr(
+        runs_lifecycle_db,
+        "start_run",
+        create_autospec(runs_lifecycle_db.start_run, side_effect=_capture_db_start_run),
     )
 
     failed_run_id = "99999999-9999-4999-8999-999999999901"
     orig_get_latest = runs_lifecycle_db.get_latest_attempt
+    orig_get_run = runs_lifecycle_db.get_run
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         # (1) Checkpoint /retry with BOTH llm_model and reasoning_effort
+        cp_failed_row = {
+            "conversation_response_id": failed_run_id,
+            "conversation_thread_id": THREAD_ID,
+            "turn_index": 1,
+            "attempt_no": 1,
+            "status": "error",
+            "error_message": "transient_failure",
+            "metadata": {"automation_execution_id": EXEC_ID},
+        }
         monkeypatch.setattr(
             runs_lifecycle_db,
             "get_latest_attempt",
-            create_autospec(
-                orig_get_latest,
-                return_value={
-                    "conversation_response_id": failed_run_id,
-                    "turn_index": 1,
-                    "status": "error",
-                    "error_message": "transient_failure",
-                    "metadata": {"automation_execution_id": EXEC_ID},
-                },
-            ),
+            create_autospec(orig_get_latest, return_value=cp_failed_row),
+        )
+        monkeypatch.setattr(
+            runs_lifecycle_db,
+            "get_run",
+            create_autospec(orig_get_run, return_value=cp_failed_row),
         )
         resp_cp = await client.post(
             f"/api/v1/threads/{THREAD_ID}/retry",
@@ -3104,32 +3291,41 @@ async def test_http_retry_and_pending_input_retry_routes_preserve_system_only_to
         assert resp_cp.status_code == 200
         # Round 8 Decision 1: web /retry ignores composer's reasoning_effort="high", uses execution snapshot "medium"
         assert resolve_seen[-1] == ("claude-sonnet-4-6", True, "medium")
-        assert workflow_run_metas[-1] is not None
-        assert "llm_model_system_only" not in workflow_run_metas[-1]
-        assert workflow_run_metas[-1]["automation_source_execution_id"] == EXEC_ID
+        assert len(persisted_start_metas) == 1
+        assert "llm_model_system_only" not in persisted_start_metas[-1]
+        assert persisted_start_metas[-1]["automation_source_execution_id"] == EXEC_ID
+        # The persisted START run row carries the snapshot's effort beside the link to
+        # its execution, as test_automation_effort_inheritance.py reads them.
+        assert persisted_start_metas[-1]["automation_reasoning_effort_configured"] is True
+        assert persisted_start_metas[-1]["automation_reasoning_effort"] == "medium"
 
         # (2) Pending-input /retry (failed before graph checkpoint -> input_rerun_request)
+        pending_failed_row = {
+            "conversation_response_id": failed_run_id,
+            "conversation_thread_id": THREAD_ID,
+            "turn_index": 1,
+            "attempt_no": 1,
+            "status": "error",
+            "error_message": "transient_failure",
+            "metadata": {
+                "automation_execution_id": EXEC_ID,
+                pending_input_mod.PENDING_INPUT_KEY: {
+                    "replay": False,
+                    "checkpoint_id": None,
+                    "resend": False,
+                    "context": False,
+                },
+            },
+        }
         monkeypatch.setattr(
             runs_lifecycle_db,
             "get_latest_attempt",
-            create_autospec(
-                orig_get_latest,
-                return_value={
-                    "conversation_response_id": failed_run_id,
-                    "turn_index": 1,
-                    "status": "error",
-                    "error_message": "transient_failure",
-                    "metadata": {
-                        "automation_execution_id": EXEC_ID,
-                        pending_input_mod.PENDING_INPUT_KEY: {
-                            "replay": False,
-                            "checkpoint_id": None,
-                            "resend": False,
-                            "context": False,
-                        },
-                    },
-                },
-            ),
+            create_autospec(orig_get_latest, return_value=pending_failed_row),
+        )
+        monkeypatch.setattr(
+            runs_lifecycle_db,
+            "get_run",
+            create_autospec(orig_get_run, return_value=pending_failed_row),
         )
         resp_pending = await client.post(
             f"/api/v1/threads/{THREAD_ID}/retry",
@@ -3141,9 +3337,12 @@ async def test_http_retry_and_pending_input_retry_routes_preserve_system_only_to
         )
         assert resp_pending.status_code == 200
         assert resolve_seen[-1] == ("claude-sonnet-4-6", True, "medium")
-        assert workflow_run_metas[-1] is not None
-        assert "llm_model_system_only" not in workflow_run_metas[-1]
-        assert workflow_run_metas[-1]["automation_source_execution_id"] == EXEC_ID
+        assert len(persisted_start_metas) == 2
+        assert "llm_model_system_only" not in persisted_start_metas[-1]
+        assert persisted_start_metas[-1]["automation_source_execution_id"] == EXEC_ID
+        # A rerun of the input persists the same three markers at START as the checkpoint retry above.
+        assert persisted_start_metas[-1]["automation_reasoning_effort_configured"] is True
+        assert persisted_start_metas[-1]["automation_reasoning_effort"] == "medium"
 
 
 @pytest.mark.asyncio

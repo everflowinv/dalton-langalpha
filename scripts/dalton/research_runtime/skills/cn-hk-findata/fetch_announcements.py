@@ -112,6 +112,9 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
 
     rows = []
     seen = set()
+    pages_fetched = 0
+    total_count = None
+    has_more = False
 
     for page in range(1, max_pages + 1):
         payload = {
@@ -134,11 +137,30 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
         r = requests.post(ANN_URL, data=payload, headers=headers, timeout=20)
         r.raise_for_status()
         data = r.json()
+        pages_fetched += 1
+        raw_has_more = data.get("hasMore")
+        if isinstance(raw_has_more, bool):
+            api_has_more = raw_has_more
+        elif isinstance(raw_has_more, str) and raw_has_more.strip().lower() in ("true", "false"):
+            api_has_more = raw_has_more.strip().lower() == "true"
+        else:
+            api_has_more = None
+
+        raw_total = data.get("totalAnnouncement")
+        if raw_total is None:
+            raw_total = data.get("totalRecordNum")
+        if isinstance(raw_total, int) and not isinstance(raw_total, bool) and raw_total >= 0:
+            total_count = raw_total
+        elif isinstance(raw_total, str) and raw_total.strip().isdigit():
+            total_count = int(raw_total.strip())
+
         items = data.get("announcements", []) or []
         if not items:
+            has_more = False
             break
 
-        for item in items:
+        stopped_for_limit = False
+        for idx, item in enumerate(items):
             title = str(item.get("announcementTitle", "")).replace("<em>", "").replace("</em>", "")
             ts = float(item.get("announcementTime", 0) or 0) / 1000
             date_str = dt.datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else ""
@@ -156,14 +178,52 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
                 "source": "cninfo",
             })
             if len(rows) >= wanted:
+                stopped_for_limit = True
+                if (
+                    idx < len(items) - 1
+                    or api_has_more is True
+                    or (total_count is not None and total_count > len(rows))
+                    or (api_has_more is None and len(items) >= page_size)
+                ):
+                    has_more = True
                 break
-        if len(rows) >= wanted:
+        if stopped_for_limit:
             break
+
+        # Detect whether upstream pagination actually completed or was cut off by max_pages.
+        reached_end = (
+            api_has_more is False
+            or (total_count is not None and page * page_size >= total_count)
+            or (len(items) < page_size and api_has_more is not True)
+        )
+        if reached_end:
+            has_more = False
+            break
+        if page == max_pages:
+            has_more = (
+                api_has_more is True
+                or (total_count is not None and total_count > len(rows))
+                or len(items) >= page_size
+            )
 
     for i, r in enumerate(rows, start=1):
         r["index"] = i
 
-    return {"ok": True, "ticker": stock_code, "market": market, "count": len(rows), "rows": rows}
+    result = {
+        "ok": True,
+        "ticker": stock_code,
+        "market": market,
+        "count": len(rows),
+        "rows": rows,
+        "has_more": bool(has_more),
+        "truncated": bool(has_more),
+        "pagination_complete": not bool(has_more),
+        "page_size": page_size,
+        "pages_fetched": pages_fetched,
+    }
+    if total_count is not None:
+        result["total_count"] = total_count
+    return result
 
 
 def pick_announcement(rows, index):

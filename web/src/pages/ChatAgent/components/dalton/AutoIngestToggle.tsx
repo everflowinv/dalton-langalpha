@@ -22,8 +22,8 @@ export function AutoIngestToggle({
   readOnly?: boolean;
 }): React.ReactElement | null {
   const { t } = useTranslation();
-  const { hasCapability } = useCapabilities();
-  const canAutoIngest = hasCapability('researchdata_bridge');
+  const { hasCapability, isLoading } = useCapabilities();
+  const canAutoIngest = hasCapability(['company_wiki', 'sales_notes']);
   const [enabled, setEnabled] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
   const [loaded, setLoaded] = useState(false);
@@ -31,7 +31,7 @@ export function AutoIngestToggle({
 
   React.useEffect(() => {
     let cancelled = false;
-    if (!workspaceId || !canAutoIngest) return;
+    if (!workspaceId || !canAutoIngest || isLoading) return;
     fetchAutoIngest(workspaceId)
       .then((value) => {
         if (!cancelled) {
@@ -45,9 +45,9 @@ export function AutoIngestToggle({
     return () => {
       cancelled = true;
     };
-  }, [workspaceId, canAutoIngest]);
+  }, [workspaceId, canAutoIngest, isLoading]);
 
-  if (!canAutoIngest || !workspaceId || !loaded || enabled === null) {
+  if (isLoading || !canAutoIngest || !workspaceId || !loaded || enabled === null) {
     return null;
   }
 

@@ -371,7 +371,7 @@ def test_read_cap_pending_commit_and_internal_retry(
     ws = _workspace(tmp_path)
     tracker = ws / "research" / "tracker"
     seen_path = tracker / "seen.json"
-    last_path = tracker / "last_run.json"
+    last_path = tracker / "bullbear_last_run.json"
     log_path = tracker / "updates.log"
     seen_path.write_text('["old-seen"]\n', encoding="utf-8")
     last_path.write_text('{"until": "2026-11-09", "run_id": "seed"}\n', encoding="utf-8")
@@ -789,7 +789,7 @@ def test_legacy_ae_resume_then_new_state(
         ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-1000", "--material", "no", "--summary", "legacy"],
     )
     assert code == 0
-    last = _read_json(ws / "research" / "tracker" / "last_run.json")
+    last = _read_json(ws / "research" / "tracker" / "bullbear_last_run.json")
     assert last["run_id"] == "20261110-1000"
     assert "ae_resume" not in last and "ae_covered_until" not in last
     assert "legacy-cursor-token" not in json.dumps(last)
@@ -892,7 +892,7 @@ def test_retained_ae_coverage_commits_and_resumes(
             ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-2200", "--material", "no", "--summary", kind],
         )
         assert code == 0 and payload["ok"] is True
-        last = _read_json(ws / "research" / "tracker" / "last_run.json")
+        last = _read_json(ws / "research" / "tracker" / "bullbear_last_run.json")
         saved = {row["query"]: row for row in last["msft_ae_state"]["queries"]}
         for row in states[kind]["queries"]:
             kept = saved[row["query"]]
@@ -937,7 +937,7 @@ def test_retained_ae_coverage_commits_and_resumes(
     assert code == 2 and payload["status"] == "ae_incomplete_advanced"
     assert earlier_path.read_bytes() == before
 
-    kept_path = kept_ws / "research" / "tracker" / "last_run.json"
+    kept_path = kept_ws / "research" / "tracker" / "bullbear_last_run.json"
     past = json.loads(json.dumps(states["has_more"]))
     for row in past["queries"]:
         row["complete"] = False
@@ -1088,7 +1088,7 @@ def test_commit_same_day_order_stale_and_partial_log(
 
     code, _payload = commit("20261110-1000")
     assert code == 0
-    last_path = ws / "research" / "tracker" / "last_run.json"
+    last_path = ws / "research" / "tracker" / "bullbear_last_run.json"
     log_path = ws / "research" / "tracker" / "updates.log"
     seen_path = ws / "research" / "tracker" / "seen.json"
     first = _read_json(last_path)
@@ -1174,7 +1174,7 @@ def test_commit_same_day_order_stale_and_partial_log(
         ["commit", "--workspace-dir", str(imported), "--run-id", "20261110-2200", "--material", "yes", "--summary", "later"],
     )
     assert code == 0
-    imported_now = _read_json(imported / "research" / "tracker" / "last_run.json")
+    imported_now = _read_json(imported / "research" / "tracker" / "bullbear_last_run.json")
     assert imported_now["run_id"] == "20261110-2200"
     assert imported_now["msft_ae_state"]["queries"][0]["query"] == "q-2200"
     imported_log = (imported / "research" / "tracker" / "updates.log").read_text(encoding="utf-8")
@@ -1223,7 +1223,7 @@ def test_commit_older_first_logs_once_and_keeps_newer_cursors(
 
     code, payload = commit("20261110-2200")
     assert code == 0 and payload["last_run_unchanged"] is False
-    last_path = ws / "research" / "tracker" / "last_run.json"
+    last_path = ws / "research" / "tracker" / "bullbear_last_run.json"
     log_path = ws / "research" / "tracker" / "updates.log"
     saved = last_path.read_text(encoding="utf-8")
     last = _read_json(last_path)
@@ -1630,7 +1630,7 @@ def test_legacy_incomplete_window_can_commit_and_resume(monkeypatch, tmp_path, c
     _write_packet(ws, "20261110-1000", "2026-11-10", since="2026-11-09", ae=state)
     code, _ = _run(capsys, ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-1000", "--material", "no", "--summary", "resume legacy window"])
     assert code == 0
-    last = _read_json(ws / "research/tracker/last_run.json")
+    last = _read_json(ws / "research/tracker/bullbear_last_run.json")
     assert all("cursor" not in row for row in last["msft_ae_state"]["queries"])
     calls.clear()
     collect_mod.collect_alphaengine(cfg, "2026-11-09", "2026-11-11", set(), last)
@@ -1656,10 +1656,10 @@ def test_old_incomplete_packet_commits_after_newer_coverage(monkeypatch, tmp_pat
     def commit(run):
         return _run(capsys, ["commit", "--workspace-dir", str(ws), "--run-id", run, "--material", "no", "--summary", run])
     assert commit("20261111-2200")[0] == 0
-    latest = (ws / "research/tracker/last_run.json").read_bytes()
+    latest = (ws / "research/tracker/bullbear_last_run.json").read_bytes()
     assert commit("20261110-2200")[0] == 0
     assert commit("20261110-2200")[0] == 0
-    assert (ws / "research/tracker/last_run.json").read_bytes() == latest
+    assert (ws / "research/tracker/bullbear_last_run.json").read_bytes() == latest
     assert _log_count((ws / "research/tracker/updates.log").read_text(), "20261110-2200") == 1
     assert {"old-doc", "new-doc"} <= set(_read_json(ws / "research/tracker/seen.json"))
 
@@ -4234,7 +4234,7 @@ def test_ae_same_run_multipage_and_no_cursor_in_last_run(
         ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-2250", "--material", "no", "--summary", "multipage"],
     )
     assert code == 0
-    last_text = (ws / "research" / "tracker" / "last_run.json").read_text(encoding="utf-8")
+    last_text = (ws / "research" / "tracker" / "bullbear_last_run.json").read_text(encoding="utf-8")
     last = json.loads(last_text)
     for row in last["msft_ae_state"]["queries"]:
         assert "cursor" not in row
@@ -4584,7 +4584,7 @@ def test_ae_page_cap_advances_only_completed_days_and_next_run_resumes(
         ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-2250", "--material", "no", "--summary", "cap-partial"],
     )
     assert code == 0
-    last = _read_json(tracker / "last_run.json")
+    last = _read_json(tracker / "bullbear_last_run.json")
     saved_by_q = {row["query"]: row for row in last["msft_ae_state"]["queries"]}
     assert saved_by_q[first]["covered_until"] == "2026-11-08"
     assert "cursor" not in saved_by_q[first]
@@ -4633,7 +4633,7 @@ def test_ae_window_advances_to_until_after_normal_completion(
     assert code == 0 and payload1["failed_sources"] == []
     code, _ = _run(capsys, ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-2250", "--material", "no", "--summary", "r1"])
     assert code == 0
-    last1 = _read_json(tracker / "last_run.json")
+    last1 = _read_json(tracker / "bullbear_last_run.json")
     assert all(row["covered_until"] == "2026-11-10" and "cursor" not in row for row in last1["msft_ae_state"]["queries"])
 
     ae_calls.clear()
@@ -4646,7 +4646,7 @@ def test_ae_window_advances_to_until_after_normal_completion(
     assert all(c["params"] == {"sort": "relevance", "fresh": True} for c in ae_calls)
     code, _ = _run(capsys, ["commit", "--workspace-dir", str(ws), "--run-id", "20261113-2250", "--material", "no", "--summary", "r2"])
     assert code == 0
-    last2 = _read_json(tracker / "last_run.json")
+    last2 = _read_json(tracker / "bullbear_last_run.json")
     assert all(row["covered_until"] == "2026-11-13" and "cursor" not in row for row in last2["msft_ae_state"]["queries"])
 
 
@@ -4911,7 +4911,7 @@ def test_ae_single_day_over_page_cap_advances_boundary_with_footnote_and_commits
         ["commit", "--workspace-dir", str(ws), "--run-id", "20261110-2250", "--material", "no", "--summary", "single-day-cap"],
     )
     assert code == 0 and payload["ok"] is True
-    saved = {row["query"]: row for row in _read_json(ws / "research" / "tracker" / "last_run.json")["msft_ae_state"]["queries"]}
+    saved = {row["query"]: row for row in _read_json(ws / "research" / "tracker" / "bullbear_last_run.json")["msft_ae_state"]["queries"]}
     assert saved[first]["covered_until"] == "2026-11-10"
 
 
@@ -5712,7 +5712,7 @@ def test_ae_disabled_commit_preserves_covered_until_and_resumes_when_reenabled(
     )
     assert code_m == 0 and payload_m["ok"] is True
 
-    last_after_off = _read_json(tracker / "last_run.json")
+    last_after_off = _read_json(tracker / "bullbear_last_run.json")
     assert last_after_off["until"] == "2026-11-08"
     assert last_after_off["msft_ae_state"]["queries"] == initial_queries
 
@@ -6266,7 +6266,7 @@ def test_bridge_disabled_two_days_preserves_internal_sec_x_and_ae_resume_positio
             ["commit", "--workspace-dir", str(ws), "--run-id", run_id, "--material", "no", "--summary", f"off-{day_num}"],
         )
         assert code_m == 0 and payload_m["ok"] is True
-        saved = _read_json(tracker / "last_run.json")
+        saved = _read_json(tracker / "bullbear_last_run.json")
         assert saved["until"] == f"2026-11-{day_num:02d}"
         assert saved["internal_retry_since"] == "2026-11-08"
         assert saved["sec_last_collected_until"] == "2026-11-10"
@@ -6345,7 +6345,7 @@ def test_bridge_disabled_two_days_preserves_internal_sec_x_and_ae_resume_positio
         ["commit", "--workspace-dir", str(ws), "--run-id", "20261113-2250", "--material", "no", "--summary", "reopen"],
     )
     assert code_cm == 0 and payload_cm["ok"] is True
-    last_final = _read_json(tracker / "last_run.json")
+    last_final = _read_json(tracker / "bullbear_last_run.json")
     assert last_final["until"] == "2026-11-13"
     assert last_final["internal_retry_since"] is None
     assert "sec_last_collected_until" not in last_final
@@ -6598,7 +6598,7 @@ def test_bridge_reopen_sec_x_timeout_preserves_resume_and_fresh_bridge_off_no_fa
         ["commit", "--workspace-dir", str(ws), "--run-id", "20261116-2250", "--material", "no", "--summary", "off"],
     )
     assert code_m == 0
-    saved_16 = _read_json(tracker / "last_run.json")
+    saved_16 = _read_json(tracker / "bullbear_last_run.json")
     assert saved_16["sec_last_collected_until"] == "2026-11-10"
     assert saved_16["x_last_collected_until"] == "2026-11-10"
     assert saved_16["internal_last_collected_until"] == "2026-11-10"
@@ -6623,7 +6623,7 @@ def test_bridge_reopen_sec_x_timeout_preserves_resume_and_fresh_bridge_off_no_fa
         ["commit", "--workspace-dir", str(ws), "--run-id", "20261117-2250", "--material", "no", "--summary", "timeout"],
     )
     assert code_m17 == 0
-    saved_17 = _read_json(tracker / "last_run.json")
+    saved_17 = _read_json(tracker / "bullbear_last_run.json")
     assert saved_17["until"] == "2026-11-17"
     assert saved_17["sec_last_collected_until"] == "2026-11-10"
     assert saved_17["x_last_collected_until"] == "2026-11-10"
@@ -6664,7 +6664,7 @@ def test_bridge_reopen_sec_x_timeout_preserves_resume_and_fresh_bridge_off_no_fa
         ["commit", "--workspace-dir", str(ws), "--run-id", "20261118-2250", "--material", "no", "--summary", "recovered"],
     )
     assert code_m18 == 0
-    saved_18 = _read_json(tracker / "last_run.json")
+    saved_18 = _read_json(tracker / "bullbear_last_run.json")
     assert "sec_last_collected_until" not in saved_18
     assert "x_last_collected_until" not in saved_18
 
@@ -6688,7 +6688,7 @@ def test_bridge_reopen_sec_x_timeout_preserves_resume_and_fresh_bridge_off_no_fa
             ["commit", "--workspace-dir", str(fresh_ws), "--run-id", run_id, "--material", "no", "--summary", f"fresh-{day_num}"],
         )
         assert m_code == 0
-        saved_fresh = _read_json(fresh_tracker / "last_run.json")
+        saved_fresh = _read_json(fresh_tracker / "bullbear_last_run.json")
         assert saved_fresh["until"] == f"2026-11-{day_num:02d}"
         assert first_since is not None and first_since < "2026-11-10"
         assert saved_fresh["internal_last_collected_until"] == first_since
@@ -6763,7 +6763,7 @@ def test_single_disabled_internal_route_preserves_retry_since_until_reopened(
         ["commit", "--workspace-dir", str(ws), "--run-id", "20261112-2250", "--material", "no", "--summary", "tmtb-off"],
     )
     assert code_m1 == 0
-    saved_12 = _read_json(tracker / "last_run.json")
+    saved_12 = _read_json(tracker / "bullbear_last_run.json")
     assert saved_12["until"] == "2026-11-12"
     assert saved_12["internal_retry_since"] == "2026-11-08"
 
@@ -6792,7 +6792,7 @@ def test_single_disabled_internal_route_preserves_retry_since_until_reopened(
         ["commit", "--workspace-dir", str(ws), "--run-id", "20261113-2250", "--material", "no", "--summary", "tmtb-on"],
     )
     assert code_m2 == 0
-    saved_13 = _read_json(tracker / "last_run.json")
+    saved_13 = _read_json(tracker / "bullbear_last_run.json")
     assert saved_13["internal_retry_since"] is None
 
 
@@ -6957,7 +6957,7 @@ def test_ae_consecutive_over_cap_days_advance_in_single_round_and_commit(
         ["commit", "--workspace-dir", str(ws), "--run-id", "20261115-2250", "--material", "no", "--summary", "multi-day"],
     )
     assert code == 0 and payload["ok"] is True
-    saved = {r["query"]: r for r in _read_json(ws / "research" / "tracker" / "last_run.json")["msft_ae_state"]["queries"]}
+    saved = {r["query"]: r for r in _read_json(ws / "research" / "tracker" / "bullbear_last_run.json")["msft_ae_state"]["queries"]}
     assert saved[first]["covered_until"] == "2026-11-15"
 
 
@@ -7087,7 +7087,7 @@ def test_ae_13_day_backlog_jumps_to_until_minus_3_with_note_and_commits(
         ["commit", "--workspace-dir", str(ws), "--run-id", "20261124-2217", "--material", "no", "--summary", "backlog-jump"],
     )
     assert code == 0 and payload["ok"] is True
-    saved = {r["query"]: r for r in _read_json(ws / "research" / "tracker" / "last_run.json")["msft_ae_state"]["queries"]}
+    saved = {r["query"]: r for r in _read_json(ws / "research" / "tracker" / "bullbear_last_run.json")["msft_ae_state"]["queries"]}
     assert saved[first]["covered_until"] == "2026-11-24"
 
     # 失败轮不跳积压、边界留在 2026-11-11
@@ -7515,3 +7515,546 @@ def test_duplicate_ae_queries_rejected_on_config_load(
     with pytest.raises(collect_mod.CollectError) as exc_load:
         collect_mod.load_research_config()
     assert exc_load.value.status == "duplicate_ae_query"
+
+
+def test_thesis_delta_and_bullbear_tracker_alternating_runs_keep_separate_progress_and_migrate_once(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """thesis-delta 与多空跟踪各自保存进度文件，交替运行不互相覆盖；旧 last_run.json 兼容读取并迁移一次。"""
+    import argparse
+
+    thesis_mod = collect_mod._g
+    ws = _workspace(tmp_path / "msft_alt")
+    tracker = ws / "research" / "tracker"
+    (ws / "data" / "consensus" / "snap.json").write_text("{}", encoding="utf-8")
+
+    # 1. Seed legacy shared last_run.json containing bullbear per-query msft_ae_state (unfinished query on 2026-11-10)
+    queries = [
+        item[0] if isinstance(item, tuple) else (item["query"] if isinstance(item, dict) else item)
+        for item in collect_mod._parse_ae_queries(collect_mod.load_research_config())
+    ]
+    assert len(queries) >= 2
+    q0, q1 = queries[0], queries[1]
+    legacy_bullbear_state = {
+        "ticker": "MSFT",
+        "run_id": "20261110-1800",
+        "committed_at": "2026-11-10T18:00:00-05:00",
+        "collected_at": "2026-11-10T18:00:00-05:00",
+        "since": "2026-11-08",
+        "until": "2026-11-10",
+        "snapshot_file": "data/consensus/snap.json",
+        "material": "no",
+        "summary": "legacy bullbear seed",
+        "msft_ae_state": {
+            "queries": [
+                {
+                    "query": q0,
+                    "ok": True,
+                    "complete": False,
+                    "covered_until": "2026-11-10",
+                    "window": {"start": "2026-11-08", "end": "2026-11-10"},
+                },
+                {
+                    "query": q1,
+                    "ok": True,
+                    "complete": True,
+                    "covered_until": "2026-11-10",
+                    "window": {"start": "2026-11-08", "end": "2026-11-10"},
+                },
+            ]
+        },
+    }
+    (tracker / "last_run.json").write_text(json.dumps(legacy_bullbear_state), encoding="utf-8")
+
+    # 2. thesis-delta commits first -> must NOT clobber bullbear per-query state!
+    td_run_id = "20261110-2000"
+    td_pkt_dir = tracker / td_run_id
+    td_pkt_dir.mkdir(parents=True, exist_ok=True)
+    td_packet = {
+        "ticker": "MSFT",
+        "run_id": td_run_id,
+        "since": "2026-11-09",
+        "until": "2026-11-10",
+        "snapshot_file": "data/consensus/snap.json",
+        "ae_state": {
+            "ran": True,
+            "covered_until": "2026-11-10",
+            "incomplete": False,
+            "resume": None,
+        },
+        "internal": {"status": {"alphaengine": {"ok": True}}, "new": {}},
+        "alphaengine": {"status": [], "new": {}},
+        "sec": {"status": [], "new": {}},
+        "x": {"status": [], "new": {}},
+    }
+    (td_pkt_dir / "packet.json").write_text(json.dumps(td_packet), encoding="utf-8")
+    td_args = argparse.Namespace(
+        workspace_dir=str(ws),
+        ticker="MSFT",
+        run_id=td_run_id,
+        material="no",
+        summary="thesis delta run 1",
+    )
+    assert thesis_mod.cmd_commit(td_args) == 0
+    capsys.readouterr()
+
+    # 3. bullbear-tracker commits an incomplete re-run on the same day (2026-11-10):
+    # Previously this FAILED with ae_incomplete_advanced because thesis-delta wiped msft_ae_state!
+    bb_ae_state = {
+        "queries": [
+            {
+                "query": q0,
+                "ok": True,
+                "complete": False,
+                "covered_until": "2026-11-10",
+                "window": {"start": "2026-11-08", "end": "2026-11-10"},
+                "error": "未扫完，留待下一轮",
+            },
+            {
+                "query": q1,
+                "ok": True,
+                "complete": True,
+                "covered_until": "2026-11-10",
+                "window": {"start": "2026-11-08", "end": "2026-11-10"},
+            },
+        ]
+    }
+    _write_packet(
+        ws,
+        "20261110-2200",
+        "2026-11-10",
+        ae=bb_ae_state,
+        collected_at="2026-11-10T22:00:00-05:00",
+    )
+    code, payload = _run(
+        capsys,
+        [
+            "commit",
+            "--workspace-dir",
+            str(ws),
+            "--run-id",
+            "20261110-2200",
+            "--material",
+            "no",
+            "--summary",
+            "bullbear run 1",
+        ],
+    )
+    assert code == 0 and payload["ok"] is True
+
+    # Verify they wrote to DIFFERENT progress files
+    bb_file = ws / payload["last_run_file"]
+    td_file = tracker / "last_run.json"
+    assert bb_file != td_file
+    assert bb_file.is_file()
+    assert td_file.is_file()
+
+    # 4. Another thesis-delta commit does NOT affect bullbear's progress file
+    td_run_id_2 = "20261111-0800"
+    td_pkt_dir_2 = tracker / td_run_id_2
+    td_pkt_dir_2.mkdir(parents=True, exist_ok=True)
+    td_packet_2 = {**td_packet, "run_id": td_run_id_2, "until": "2026-11-11", "ae_state": {"ran": True, "covered_until": "2026-11-11", "incomplete": False, "resume": None}}
+    (td_pkt_dir_2 / "packet.json").write_text(json.dumps(td_packet_2), encoding="utf-8")
+    assert thesis_mod.cmd_commit(
+        argparse.Namespace(
+            workspace_dir=str(ws),
+            ticker="MSFT",
+            run_id=td_run_id_2,
+            material="yes",
+            summary="thesis delta run 2",
+        )
+    ) == 0
+    capsys.readouterr()
+
+    bb_saved = _read_json(bb_file)
+    td_saved = _read_json(td_file)
+    assert bb_saved["run_id"] == "20261110-2200"
+    assert "msft_ae_state" in bb_saved
+    assert td_saved["run_id"] == td_run_id_2
+    assert td_saved["ae_covered_until"] == "2026-11-11"
+
+    # 5. Legacy workspace whose last_run.json was already overwritten by old thesis-delta
+    #    (only ae_covered_until, no msft_ae_state) still lets bullbear commit and migrate once.
+    ws_legacy_td = _workspace(tmp_path / "msft_legacy_td")
+    tracker2 = ws_legacy_td / "research" / "tracker"
+    (ws_legacy_td / "data" / "consensus" / "snap.json").write_text("{}", encoding="utf-8")
+    (tracker2 / "last_run.json").write_text(
+        json.dumps(
+            {
+                "ticker": "MSFT",
+                "run_id": "20261110-1900",
+                "committed_at": "2026-11-10T19:00:00-05:00",
+                "since": "2026-11-09",
+                "until": "2026-11-10",
+                "snapshot_file": "data/consensus/snap.json",
+                "material": "no",
+                "summary": "old thesis-delta overwrite",
+                "ae_covered_until": "2026-11-10",
+                "ae_resume": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_packet(
+        ws_legacy_td,
+        "20261110-2230",
+        "2026-11-10",
+        ae=bb_ae_state,
+        collected_at="2026-11-10T22:30:00-05:00",
+    )
+    code2, payload2 = _run(
+        capsys,
+        [
+            "commit",
+            "--workspace-dir",
+            str(ws_legacy_td),
+            "--run-id",
+            "20261110-2230",
+            "--material",
+            "no",
+            "--summary",
+            "bullbear migrate from legacy thesis-delta",
+        ],
+    )
+    assert code2 == 0 and payload2["ok"] is True
+    migrated_bb = _read_json(tracker2 / "bullbear_last_run.json")
+    assert migrated_bb["run_id"] == "20261110-2230"
+    assert "msft_ae_state" in migrated_bb
+    # Legacy thesis-delta file remains intact
+    assert _read_json(tracker2 / "last_run.json")["run_id"] == "20261110-1900"
+
+
+def test_bullbear_commit_earlier_packet_not_stale_after_legacy_thesis_delta_overwrite(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """旧 last_run.json 已被较新的 thesis-delta 覆盖时，较早采集的多空包提交不得被判为 stale，且须迁移逐查询状态。"""
+    ws = _workspace(tmp_path / "msft_earlier_bb")
+    tracker = ws / "research" / "tracker"
+    (ws / "data" / "consensus" / "snap.json").write_text("{}", encoding="utf-8")
+
+    # Legacy last_run.json was overwritten by thesis-delta at 2026-11-10 20:00 (no msft_ae_state, no collected_at)
+    (tracker / "last_run.json").write_text(
+        json.dumps(
+            {
+                "ticker": "MSFT",
+                "run_id": "20261110-2000",
+                "committed_at": "2026-11-10T20:00:00-05:00",
+                "since": "2026-11-09",
+                "until": "2026-11-10",
+                "snapshot_file": "data/consensus/snap.json",
+                "material": "no",
+                "summary": "thesis delta overwrite",
+                "ae_covered_until": "2026-11-10",
+                "ae_resume": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Bullbear packet was collected EARLIER (18:00) and commits later
+    queries = [
+        item[0] if isinstance(item, tuple) else (item["query"] if isinstance(item, dict) else item)
+        for item in collect_mod._parse_ae_queries(collect_mod.load_research_config())
+    ]
+    q0 = queries[0]
+    _write_packet(
+        ws,
+        "20261110-1800",
+        "2026-11-10",
+        ae={
+            "queries": [
+                {
+                    "query": q0,
+                    "ok": True,
+                    "complete": False,
+                    "covered_until": "2026-11-10",
+                    "window": {"start": "2026-11-08", "end": "2026-11-10"},
+                    "error": "未扫完，留待下一轮",
+                }
+            ]
+        },
+        collected_at="2026-11-10T18:00:00-05:00",
+    )
+    code, payload = _run(
+        capsys,
+        [
+            "commit",
+            "--workspace-dir",
+            str(ws),
+            "--run-id",
+            "20261110-1800",
+            "--material",
+            "no",
+            "--summary",
+            "earlier bullbear commit",
+        ],
+    )
+    assert code == 0 and payload["ok"] is True
+    assert payload["stale"] is False
+    assert payload["last_run_unchanged"] is False
+    bb_file = tracker / "bullbear_last_run.json"
+    assert bb_file.is_file()
+    saved = _read_json(bb_file)
+    assert saved["run_id"] == "20261110-1800"
+    assert saved["msft_ae_state"]["queries"][0]["query"] == q0
+    assert _read_json(tracker / "last_run.json")["run_id"] == "20261110-2000"
+
+
+def test_thesis_delta_migration_uses_bullbear_lock_and_never_overwrites_existing_file(
+    tmp_path: Path,
+) -> None:
+    """thesis-delta 迁移旧进度时使用与 bullbear 相同的锁文件，且目标文件已存在时绝不覆盖。"""
+    thesis_mod = collect_mod._g
+    ws = _workspace(tmp_path / "msft_lock_mig")
+    paths = thesis_mod.tracker_paths(ws)
+    bb_path = paths["bullbear_last_run"]
+
+    # Existing bullbear_last_run.json must NOT be overwritten by legacy snapshot
+    existing = {"ticker": "MSFT", "run_id": "20261112-0900", "msft_ae_state": {"queries": [{"query": "fresh"}]}}
+    bb_path.write_text(json.dumps(existing), encoding="utf-8")
+    stale_legacy = {"ticker": "MSFT", "run_id": "20261110-0900", "msft_ae_state": {"queries": [{"query": "stale"}]}}
+    thesis_mod._preserve_legacy_bullbear_last_run(paths, stale_legacy, ticker="MSFT")
+    assert _read_json(bb_path)["run_id"] == "20261112-0900"
+    assert (paths["tracker"] / ".msft-collect.lock").exists()
+
+    # Skill guide omits --since by default and no longer tells the agent to read last_run.json
+    skill_md = (
+        Path(__file__).resolve().parents[3]
+        / "plugins"
+        / "dalton"
+        / "skills"
+        / "dalton-bullbear-tracker"
+        / "SKILL.md"
+    ).read_text(encoding="utf-8")
+    assert "research/tracker/last_run.json" not in skill_md
+    assert "省略 `--since`" in skill_md
+
+
+def test_bullbear_collect_ignores_legacy_thesis_delta_last_run_and_uses_3d_lookback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """还没有 bullbear_last_run.json 且旧 last_run.json 为 thesis-delta 形态时，collect 按空进度回看 3 天。"""
+    calls: list[dict[str, Any]] = []
+
+    def _bridge(tool: str, args: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+        calls.append({"tool": tool, **args})
+        route = args.get("route")
+        if route == "sec":
+            return {"ok": True, "data": {"filings": []}}
+        if route == "x":
+            return {"ok": True, "data": {"tweets": []}}
+        return {"ok": True, "data": {"results": [], "has_more": False}}
+
+    _patch_bridge(monkeypatch, _bridge)
+    _patch_clock(monkeypatch, {"now": FROZEN})
+    _patch_transport(monkeypatch, {"mode": "bridge"})
+    _patch_consensus(monkeypatch, _consensus_ok)
+
+    ws = _workspace(tmp_path / "msft_thesis_only_collect")
+    tracker = ws / "research" / "tracker"
+    # Seed legacy last_run.json written by thesis-delta with until == today (2026-11-10)
+    (tracker / "last_run.json").write_text(
+        json.dumps(
+            {
+                "ticker": "MSFT",
+                "run_id": "20261110-1900",
+                "committed_at": "2026-11-10T19:00:00-05:00",
+                "since": "2026-11-09",
+                "until": "2026-11-10",
+                "snapshot_file": "data/consensus/snap.json",
+                "material": "no",
+                "summary": "thesis delta only",
+                "ae_covered_until": "2026-11-10",
+                "ae_resume": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    code, payload = _run(capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261110-2250"])
+    assert code == 0 and payload["ok"] is True
+    packet = _read_json(tracker / "20261110-2250" / "packet.json")
+    thesis_calls = [(c.get("route"), c.get("start"), c.get("end"), c.get("since")) for c in calls]
+
+    # Compare against a completely fresh workspace with no last_run.json at all
+    calls.clear()
+    ws_empty = _workspace(tmp_path / "msft_brand_new_collect")
+    code_e, payload_e = _run(
+        capsys, ["collect", "--workspace-dir", str(ws_empty), "--run-id", "20261110-2250"]
+    )
+    assert code_e == 0 and payload_e["ok"] is True
+    packet_empty = _read_json(ws_empty / "research" / "tracker" / "20261110-2250" / "packet.json")
+    empty_calls = [(c.get("route"), c.get("start"), c.get("end"), c.get("since")) for c in calls]
+
+    # Today is 2026-11-10; FIRST_LOOKBACK_DAYS=3 -> since MUST be 2026-11-07 (identical to fresh workspace)
+    assert packet["since"] == "2026-11-07" == packet_empty["since"]
+    assert packet["internal_since"] == "2026-11-07" == packet_empty["internal_since"]
+    assert thesis_calls == empty_calls
+
+    # First commit when AE is disabled stores thesis-delta watermark in legacy_thesis_ae_covered_until
+    # (NOT ae_covered_until) so next day's AE collection does not shrink its query window.
+    (ws / "data" / "consensus" / "snap.json").write_text("{}", encoding="utf-8")
+    _write_packet(
+        ws,
+        "20261110-2255",
+        "2026-11-10",
+        ae={"queries": []},
+        collected_at="2026-11-10T22:55:00-05:00",
+    )
+    code_c, payload_c = _run(
+        capsys,
+        [
+            "commit",
+            "--workspace-dir",
+            str(ws),
+            "--run-id",
+            "20261110-2255",
+            "--material",
+            "no",
+            "--summary",
+            "first commit with ae off",
+        ],
+    )
+    assert code_c == 0 and payload_c["ok"] is True
+    saved_bb = _read_json(tracker / "bullbear_last_run.json")
+    assert "ae_covered_until" not in saved_bb
+    assert saved_bb["legacy_thesis_ae_covered_until"] == "2026-11-10"
+
+    # Next day (2026-11-11) when AlphaEngine is re-enabled, collect MUST NOT treat 2026-11-10 as
+    # covered_until for bullbear queries; its AE start date matches a clean workspace with no thesis watermark.
+    from datetime import timedelta
+
+    next_day = FROZEN + timedelta(days=1)
+    _patch_clock(monkeypatch, {"now": next_day})
+
+    # Seed matching Day-1 commit (AE off, no thesis-delta watermark) in ws_empty for exact comparison
+    (ws_empty / "data" / "consensus" / "snap.json").write_text("{}", encoding="utf-8")
+    _write_packet(
+        ws_empty,
+        "20261110-2255",
+        "2026-11-10",
+        ae={"queries": []},
+        collected_at="2026-11-10T22:55:00-05:00",
+    )
+    code_ce, payload_ce = _run(
+        capsys,
+        [
+            "commit",
+            "--workspace-dir",
+            str(ws_empty),
+            "--run-id",
+            "20261110-2255",
+            "--material",
+            "no",
+            "--summary",
+            "clean first commit with ae off",
+        ],
+    )
+    assert code_ce == 0 and payload_ce["ok"] is True
+
+    calls.clear()
+    code_d2, payload_d2 = _run(
+        capsys, ["collect", "--workspace-dir", str(ws), "--run-id", "20261111-1000"]
+    )
+    assert code_d2 == 0 and payload_d2["ok"] is True
+    ae_starts_migrated = [
+        (c.get("query"), (c.get("params") or {}).get("date_from") or c.get("start"))
+        for c in calls
+        if c.get("route") == "alphaengine"
+    ]
+    pkt_d2 = _read_json(tracker / "20261111-1000" / "packet.json")
+    ae_windows_migrated = [
+        (q["query"], q["window"]["start"], q["window"]["end"])
+        for q in pkt_d2[collect_mod.ae_state_key()]["queries"]
+    ]
+
+    calls.clear()
+    code_d2_clean, payload_d2_clean = _run(
+        capsys, ["collect", "--workspace-dir", str(ws_empty), "--run-id", "20261111-1000"]
+    )
+    assert code_d2_clean == 0 and payload_d2_clean["ok"] is True
+    ae_starts_clean = [
+        (c.get("query"), (c.get("params") or {}).get("date_from") or c.get("start"))
+        for c in calls
+        if c.get("route") == "alphaengine"
+    ]
+    pkt_d2_clean = _read_json(ws_empty / "research" / "tracker" / "20261111-1000" / "packet.json")
+    ae_windows_clean = [
+        (q["query"], q["window"]["start"], q["window"]["end"])
+        for q in pkt_d2_clean[collect_mod.ae_state_key()]["queries"]
+    ]
+
+    assert ae_windows_migrated == ae_windows_clean
+    assert ae_starts_migrated == ae_starts_clean
+    expected_full_start = collect_mod._day_shift(pkt_d2["since"], -collect_mod.AE_LOOKBACK_DAYS)
+    assert all(start == expected_full_start for _, start, _ in ae_windows_migrated)
+
+
+def test_thesis_delta_commit_serializes_with_bullbear_collect_via_shared_lock(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """thesis-delta 提交与 bullbear 采集共用同一把 .<ticker>-collect.lock，交错时不互相破坏。"""
+    import argparse
+    import fcntl
+    import threading
+
+    thesis_mod = collect_mod._g
+    ws = _workspace(tmp_path / "msft_lock_serialize")
+    tracker = ws / "research" / "tracker"
+    (ws / "data" / "consensus" / "snap.json").write_text("{}", encoding="utf-8")
+    td_dir = tracker / "20261110-2100"
+    td_dir.mkdir(parents=True, exist_ok=True)
+    (td_dir / "packet.json").write_text(
+        json.dumps(
+            {
+                "ticker": "MSFT",
+                "run_id": "20261110-2100",
+                "since": "2026-11-09",
+                "until": "2026-11-10",
+                "snapshot_file": "data/consensus/snap.json",
+                "ae_state": {"ran": True, "covered_until": "2026-11-10", "incomplete": False, "resume": None},
+                "internal": {"status": {"alphaengine": {"ok": True}}, "new": {}},
+                "alphaengine": {"status": [], "new": {}},
+                "sec": {"status": [], "new": {}},
+                "x": {"status": [], "new": {}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    lock_file = tracker / ".msft-collect.lock"
+    finished = threading.Event()
+    rc_box: dict[str, int] = {}
+
+    def _run_thesis_commit() -> None:
+        rc_box["rc"] = thesis_mod.cmd_commit(
+            argparse.Namespace(
+                workspace_dir=str(ws),
+                ticker="MSFT",
+                run_id="20261110-2100",
+                material="no",
+                summary="locked commit",
+            )
+        )
+        finished.set()
+
+    with lock_file.open("a+") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        try:
+            t = threading.Thread(target=_run_thesis_commit)
+            t.start()
+            # While bullbear holds .msft-collect.lock, thesis-delta commit must wait and NOT write last_run.json
+            assert not finished.wait(timeout=0.2)
+            assert not (tracker / "last_run.json").exists()
+        finally:
+            fcntl.flock(held.fileno(), fcntl.LOCK_UN)
+    t.join(timeout=2.0)
+    capsys.readouterr()
+    assert finished.is_set()
+    assert rc_box["rc"] == 0
+    assert _read_json(tracker / "last_run.json")["run_id"] == "20261110-2100"

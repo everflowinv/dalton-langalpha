@@ -641,6 +641,7 @@ def _wrap_collect_with_barrier(
         *,
         caller_tier: str,
         include_colleagues: bool | None = None,
+        exclude_same_name_workspace_id: str | None = None,
         conn: Any = None,
         stats: dict[str, int] | None = None,
     ):
@@ -650,6 +651,7 @@ def _wrap_collect_with_barrier(
             raw_name,
             caller_tier=caller_tier,
             include_colleagues=include_colleagues,
+            exclude_same_name_workspace_id=exclude_same_name_workspace_id,
             conn=conn,
             stats=stats,
         )
@@ -1829,10 +1831,11 @@ async def test_snapshot_collection_failure_still_enforces_locked_recheck(
         *,
         caller_tier: str,
         include_colleagues: bool | None = None,
+        exclude_same_name_workspace_id: str | None = None,
         conn: Any = None,
         stats: dict[str, int] | None = None,
     ):
-        del uid, raw_name, caller_tier, include_colleagues, conn, stats
+        del uid, raw_name, caller_tier, include_colleagues, exclude_same_name_workspace_id, conn, stats
         calls["n"] += 1
         raise RuntimeError("transient candidate query failure")
 

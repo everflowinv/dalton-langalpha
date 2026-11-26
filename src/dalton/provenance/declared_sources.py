@@ -10,7 +10,19 @@ from typing import Any
 
 from ptc_agent.agent.provenance.types import ProvenanceSource, SNIPPET_MAX_CHARS
 
-_ALLOWED_SERVERS: frozenset[str] = frozenset({"researchdata", "dalton_sec"})
+_ALLOWED_SERVERS: frozenset[str] = frozenset(
+    {
+        "researchdata",
+        "dalton_sec",
+        "dalton_macro",
+        "dalton_company_wiki",
+        "dalton_research_all",
+        "dalton_guidepoint",
+        "dalton_sales_notes",
+        "dalton_tmtb",
+        "dalton_funda_ai",
+    }
+)
 
 _ALLOWED_SOURCE_TYPES: frozenset[str] = frozenset(
     {"sec_filing", "research_doc", "market_data", "data_api"}

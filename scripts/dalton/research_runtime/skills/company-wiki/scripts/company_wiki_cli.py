@@ -32,11 +32,9 @@ import json
 import os
 import re
 import sqlite3
-import struct
 import sys
-import textwrap
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Ensure the scripts directory is in sys.path so auto_tagger can be imported
@@ -209,7 +207,6 @@ def embed_texts(texts, model_name):
     client = get_genai_client()
     log(f"Embedding {len(texts)} chunks with {model_name}")
 
-    import numpy as np
     embeddings = []
     BATCH_SIZE = 100
     for i in range(0, len(texts), BATCH_SIZE):
@@ -399,6 +396,80 @@ def init_db():
     return conn
 
 
+def insert_document_and_chunks(
+    conn,
+    cat_type,
+    cat_name,
+    content_type,
+    date_str,
+    filename,
+    filepath,
+    chunks_text,
+    embeddings=None,
+    tags_json=None,
+    related_json=None,
+    *,
+    content_sha256=None,
+    created_at=None,
+    commit=True,
+):
+    """Insert or update a document and its chunks (triggers keep `chunks_fts` in sync).
+
+    Shared between `company_wiki_cli.store_document` and `OpenWikiStore` ingest so
+    every writer writes the exact same `documents` (`content_type`, `tags`, `related`)
+    and `chunks` / `chunks_fts` schema.
+    """
+    now = created_at or datetime.now(timezone.utc).isoformat()
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(documents)").fetchall()}
+    has_sha = "content_sha256" in cols
+
+    cur = conn.execute("SELECT id FROM documents WHERE filepath = ?", (filepath,))
+    row = cur.fetchone()
+    if row:
+        doc_id = row[0]
+        if has_sha and content_sha256 is not None:
+            conn.execute(
+                "UPDATE documents SET date=?, content_type=?, created_at=?, tags=?, related=?, content_sha256=? WHERE id=?",
+                (date_str, content_type, now, tags_json, related_json, content_sha256, doc_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE documents SET date=?, content_type=?, created_at=?, tags=?, related=? WHERE id=?",
+                (date_str, content_type, now, tags_json, related_json, doc_id),
+            )
+        conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
+    else:
+        if has_sha and content_sha256 is not None:
+            cur = conn.execute(
+                """INSERT INTO documents (category_type, category_name, content_type, date, filename, filepath, created_at, tags, related, content_sha256)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (cat_type, cat_name, content_type, date_str, filename, filepath, now, tags_json, related_json, content_sha256),
+            )
+        else:
+            cur = conn.execute(
+                """INSERT INTO documents (category_type, category_name, content_type, date, filename, filepath, created_at, tags, related)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (cat_type, cat_name, content_type, date_str, filename, filepath, now, tags_json, related_json),
+            )
+        doc_id = cur.lastrowid
+
+    emb_list = list(embeddings) if embeddings is not None else [None] * len(chunks_text)
+    if any(emb is not None for emb in emb_list):
+        import numpy as np
+    else:
+        np = None
+    for i, (chunk, emb) in enumerate(zip(chunks_text, emb_list)):
+        emb_blob = np.array(emb, dtype=np.float32).tobytes() if (emb is not None and np is not None) else None
+        conn.execute(
+            "INSERT INTO chunks (doc_id, chunk_index, content, embedding) VALUES (?, ?, ?, ?)",
+            (doc_id, i, chunk, emb_blob),
+        )
+
+    if commit:
+        conn.commit()
+    return doc_id
+
+
 def store_document(conn, cat_type, cat_name, content_type, date_str, filename, filepath,
                    chunks_text, embeddings, tags_json=None, related_json=None):
     """Store a document and its chunks with embeddings.
@@ -407,39 +478,20 @@ def store_document(conn, cat_type, cat_name, content_type, date_str, filename, f
         tags_json: JSON string of tags array, e.g. '["跨境电商", "AI"]'
         related_json: JSON string of related slugs, e.g. '["BABA", "JD", "china-internet"]'
     """
-    import numpy as np
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    # Upsert document record
-    cur = conn.execute(
-        "SELECT id FROM documents WHERE filepath = ?", (filepath,)
+    return insert_document_and_chunks(
+        conn,
+        cat_type,
+        cat_name,
+        content_type,
+        date_str,
+        filename,
+        filepath,
+        chunks_text,
+        embeddings=embeddings,
+        tags_json=tags_json,
+        related_json=related_json,
+        commit=True,
     )
-    row = cur.fetchone()
-    if row:
-        doc_id = row[0]
-        conn.execute(
-            "UPDATE documents SET date=?, content_type=?, created_at=?, tags=?, related=? WHERE id=?",
-            (date_str, content_type, now, tags_json, related_json, doc_id))
-        conn.execute("DELETE FROM chunks WHERE doc_id=?", (doc_id,))
-    else:
-        cur = conn.execute(
-            """INSERT INTO documents (category_type, category_name, content_type, date, filename, filepath, created_at, tags, related)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (cat_type, cat_name, content_type, date_str, filename, filepath, now, tags_json, related_json)
-        )
-        doc_id = cur.lastrowid
-
-    # Store chunks
-    for i, (chunk, emb) in enumerate(zip(chunks_text, embeddings)):
-        emb_blob = np.array(emb, dtype=np.float32).tobytes()
-        conn.execute(
-            "INSERT INTO chunks (doc_id, chunk_index, content, embedding) VALUES (?, ?, ?, ?)",
-            (doc_id, i, chunk, emb_blob)
-        )
-
-    conn.commit()
-    return doc_id
 
 
 def tagger_context(cat_type, cat_name, content_type, conn=None, exclude_doc_id=None):
@@ -1121,7 +1173,7 @@ def cmd_add_file(args, config):
         fail("Extracted content is empty")
 
     source_suffix = file_path.suffix.lower()
-    source_note = f"[提取自: {file_path.name} ({source_suffix})]"
+    _ = source_suffix
 
     # --- Auto-tag (optional) ---
     tag_result = None

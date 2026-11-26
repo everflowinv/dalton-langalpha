@@ -4,9 +4,13 @@ import type {
   AutomationUpdatePayload,
   PriceCondition,
   PriceTriggerConfig,
+  // DALTON-HOOK(report-delivery): optional report_profile config carried by the automation form
+  ReportProfileConfig,
   TriggerType,
 } from '@/types/automation';
 import type { ComposerScope } from '@/components/ui/chat-input.types';
+// DALTON-HOOK(report-delivery): extract and compare metadata.report_profile
+import { extractReportProfile, reportProfilesEqual } from '@/lib/dalton/reportProfileUtils';
 import { deviceTimezone } from '@/lib/deviceTimezone';
 import { DEFAULT_CRON } from './cron';
 import { rezone } from './moments';
@@ -50,6 +54,8 @@ export interface FormState {
   price_reference: NonNullable<PriceCondition['reference']>;
   price_retrigger_mode: Retrigger;
   price_cooldown_minutes: string;
+  // DALTON-HOOK(report-delivery): optional metadata.report_profile edited in the form
+  report_profile?: ReportProfileConfig | null;
 }
 
 export type FormPatch = <K extends keyof FormState>(key: K, value: FormState[K]) => void;
@@ -112,6 +118,8 @@ export function automationToFormState(automation: Automation, timezone = deviceT
     price_reference: condition?.reference ?? 'previous_close',
     price_retrigger_mode: mode === 'recurring' || mode === 'cooldown' ? 'recurring' : 'one_shot',
     price_cooldown_minutes: cooldown ? String(Math.round(cooldown / 60)) : '',
+    // DALTON-HOOK(report-delivery): backfill saved metadata.report_profile when present
+    ...(extractReportProfile(automation.metadata) ? { report_profile: extractReportProfile(automation.metadata) } : {}),
   };
 }
 
@@ -126,7 +134,10 @@ export function withZone(form: FormState, timezone: string): FormState {
 /** Whether the form differs from what it opened with, which is what makes
  *  leaving it a loss worth asking about. */
 export function isFormChanged(initial: FormState, form: FormState): boolean {
+  // DALTON-HOOK(report-delivery): compare optional report_profile canonically
+  if (!reportProfilesEqual(initial.report_profile ?? null, form.report_profile ?? null)) return true;
   return (Object.keys(initial) as (keyof FormState)[]).some((key) => {
+    if (key === 'report_profile') return false;
     const a = initial[key];
     const b = form[key];
     if (Array.isArray(a) && Array.isArray(b)) return a.length !== b.length || a.some((v, i) => v !== b[i]);
@@ -275,6 +286,17 @@ export function formStateToPayload(
     trigger_type: form.trigger_type,
     timezone: form.timezone,
     ...triggerPayload(form),
+    // DALTON-HOOK(report-delivery): include metadata.report_profile when configured on create
+    ...(form.report_profile && form.report_profile.profile.trim()
+      ? {
+          metadata: {
+            report_profile: {
+              ...form.report_profile,
+              profile: form.report_profile.profile.trim(),
+            },
+          },
+        }
+      : {}),
   };
 }
 
@@ -332,6 +354,21 @@ export function formStateToUpdatePayload(
     ...(form.llm_model !== initial.llm_model ? { llm_model: form.llm_model } : {}),
     // DALTON-HOOK(automation-effort): send reasoning_effort only when changed (null clears override)
     ...(form.reasoning_effort !== initial.reasoning_effort ? { reasoning_effort: form.reasoning_effort } : {}),
+    // DALTON-HOOK(report-delivery): send updated metadata.report_profile only when changed
+    ...(!reportProfilesEqual(initial.report_profile ?? null, form.report_profile ?? null)
+      ? {
+          metadata: {
+            ...(original.metadata && typeof original.metadata === 'object' ? original.metadata : {}),
+            report_profile:
+              form.report_profile && form.report_profile.profile.trim()
+                ? {
+                    ...form.report_profile,
+                    profile: form.report_profile.profile.trim(),
+                  }
+                : null,
+          },
+        }
+      : {}),
   };
   if (!TRIGGER_FIELDS[form.trigger_type].some((k) => form[k] !== initial[k])) return payload;
   const trigger = triggerPayload(form);

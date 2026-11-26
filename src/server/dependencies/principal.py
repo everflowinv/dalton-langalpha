@@ -454,6 +454,8 @@ WorkspaceSendUserId = Annotated[str, Depends(_user_of(_WORKSPACE_SEND))]
 ComputerWriteUserId = Annotated[str, Depends(_user_of(_COMPUTER_WRITE))]
 DataReadUserId = Annotated[str, Depends(_user_of(require_scopes("data:read")))]
 ComputerEndUserId = Annotated[str, Depends(_user_of(_COMPUTER_END))]
+# DALTON-HOOK(cos-settings-tools): principal variant for computer archive cli_approval gate
+ComputerEndPrincipal = Annotated[Principal, Depends(_COMPUTER_END)]
 ComputerAddUserId = Annotated[str, Depends(_user_of(_COMPUTER_ADD))]
 ComputerAddPrincipal = Annotated[Principal, Depends(_COMPUTER_ADD)]
 ComputerWritePrincipal = Annotated[Principal, Depends(_COMPUTER_WRITE)]

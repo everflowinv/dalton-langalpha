@@ -128,6 +128,7 @@ export interface WeixinChannelAdapterOptions {
   rateLimitAccountThreshold?: number;
   rateLimitCooldownMs?: number;
   staleContextTokenErrorCodes?: readonly number[];
+  invalidVerifyCodeErrorCodes?: readonly number[];
   allowedApiDomains?: readonly string[];
   allowedCdnDomains?: readonly string[];
   resolveHostIps?: HostIpResolver;
@@ -477,6 +478,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       cdnBaseUrl: this.opts.cdnBaseUrl || ILINK_DEFAULT_CDN_BASE_URL,
       botType: this.opts.botType || ILINK_DEFAULT_BOT_TYPE,
       allowedApiDomains: this.opts.allowedApiDomains,
+      invalidVerifyCodeErrorCodes: this.opts.invalidVerifyCodeErrorCodes,
       resolveHostIps: this.opts.resolveHostIps,
       checkResolvedIps: this.opts.checkResolvedIps,
       fetchImpl: this.opts.fetchImpl,
@@ -2842,6 +2844,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     sessionKey?: string;
     loginVersion?: number;
     expectedBotGeneration?: number;
+    signal?: AbortSignal;
   }): Promise<WeixinQrStartResult> {
     this.assertLeaseForOutbound("startQrLogin");
     if (!this.qrManager) {
@@ -2849,7 +2852,10 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         "Weixin QR login manager is not initialized with a BackendClient",
       );
     }
-    const { signal, release } = this.createOperationSignal();
+    const { signal: opSignal, release } = this.createOperationSignal();
+    const signal = options.signal
+      ? AbortSignal.any([opSignal, options.signal])
+      : opSignal;
     try {
       return await this.qrManager.startQrLogin(options.userId, {
         sessionKey: options.sessionKey,
@@ -2865,6 +2871,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   async waitQrLogin(options: {
     userId: string;
     sessionKey: string;
+    signal?: AbortSignal;
   }): Promise<WeixinQrWaitResult> {
     this.assertLeaseForOutbound("waitQrLogin");
     if (!this.qrManager) {
@@ -2872,7 +2879,10 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         "Weixin QR login manager is not initialized with a BackendClient",
       );
     }
-    const { signal, release } = this.createOperationSignal();
+    const { signal: opSignal, release } = this.createOperationSignal();
+    const signal = options.signal
+      ? AbortSignal.any([opSignal, options.signal])
+      : opSignal;
     try {
       return await this.qrManager.waitQrLogin(
         options.userId,
@@ -2888,6 +2898,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     userId: string;
     sessionKey: string;
     code: string;
+    signal?: AbortSignal;
   }): Promise<WeixinQrWaitResult> {
     this.assertLeaseForOutbound("submitVerifyCode");
     if (!this.qrManager) {
@@ -2895,7 +2906,10 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         "Weixin QR login manager is not initialized with a BackendClient",
       );
     }
-    const { signal, release } = this.createOperationSignal();
+    const { signal: opSignal, release } = this.createOperationSignal();
+    const signal = options.signal
+      ? AbortSignal.any([opSignal, options.signal])
+      : opSignal;
     try {
       return await this.qrManager.verifyQrCode(
         options.userId,

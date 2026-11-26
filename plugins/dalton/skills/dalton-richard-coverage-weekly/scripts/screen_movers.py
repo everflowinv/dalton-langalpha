@@ -66,6 +66,7 @@ TICKERS: dict[str, tuple[str, str, str, str]] = {
     "Meta": ("META", "megacap", "US Mega Tech", "Core"),
     "Tesla": ("TSLA", "megacap", "US Mega Tech", "Watch"),
     # AI Native
+    "Anthropic": ("ANT", "ai", "AI Native", "Core"),
     "智谱": ("2513.HK", "cn_ai", "AI Native", "Core"),
     "Minimax": ("0100.HK", "cn_ai", "AI Native", "Watch"),
     # US Internet
@@ -391,7 +392,7 @@ TICKERS: dict[str, tuple[str, str, str, str]] = {
 }
 
 # Sheet rows with no market data that are companies, not section headers.
-PRIVATE_ROWS = {"OpenAI", "Anthropic"}
+PRIVATE_ROWS = {"OpenAI"}
 
 # Extra peers / ETFs anchoring a group (tickers; may overlap with other groups)
 EXTRA_PEERS: dict[str, list[str]] = {

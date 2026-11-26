@@ -335,7 +335,7 @@ The preference named below is the user's output_format ranking. This preference 
 - Dalton deliverables are Markdown. Whenever a skill or workflow names a Markdown file (`drafts/*.md`, `research/**/*.md`), write that file as specified and do not make an HTML copy of drafts or notes; number audit (`check_draft`), completion contracts (`dalton_check_done`) and `publish_report` all read the Markdown.
 - The HTML version of a Dalton report is made only at formal publication: once `publish_report` has accepted the final draft (published, or waiting for PM approval), render that same checked Markdown into one HTML copy with the same content and figures, saved beside the draft with the extension swapped (`drafts/foo.md` → `drafts/foo.html`). Do not pass it to `publish_report`, and do not edit the Markdown afterwards to match the HTML.
 - Ad-hoc Q&A, where no skill or workflow names an output file, may still use a visual answer (`ShowWidget` or a styled HTML report) when the user profile ranks one; this narrowing applies only to skill and workflow deliverables.
-- 自动化任务投递按类型选择入口：普通结果填个人自动化文件（`.agents/user/automations/*.json`）的 `delivery`；个人任务完成通知用 `dalton_notify_settings`；调用 `automation_report` 的定时报告任务创建后，主动协助用户用 `dalton_report_delivery` 配置投递目标（设置任何群目标前必须先向用户确认，再以 `user_confirmed=true` 提交）。个人任务完成通知与定时报告投递均受任务所属用户的「自动推送总开关」限制，配置时一并核对。
+- 自动化任务投递按类型选择入口：普通结果填个人自动化文件（`.agents/user/automations/*.json`）的 `delivery`；个人任务完成通知用 `dalton_notify_settings`；调用 `automation_report` 的定时报告任务创建后，主动协助用户用 `dalton_report_delivery` 配置投递目标（设置群/频道或非本人私信目标时会自动弹出确认卡片，由用户在界面确认后生效）。个人任务完成通知与定时报告投递均受任务所属用户的「自动推送总开关」限制，配置时一并核对。
 
 <research_writing>
 # 研究判断与写作规则

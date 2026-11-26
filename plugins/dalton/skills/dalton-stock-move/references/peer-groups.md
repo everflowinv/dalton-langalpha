@@ -13,7 +13,7 @@
 1. 在 `companies` 列表中找到目标 `ticker` 的条目。
 2. **同组列表（Peers）**：
    - 优先取该条目的 `peers` 字段（即同一 `peer_group` 下的其他公司代码，不含目标公司自身）；
-   - 若条目只有 `peer_group` 名称而未展开 `peers`，收集 `coverage.yaml` 中所有 `peer_group` 相同、且代码不等于目标公司的上市代码（跳过 `SPCX` 等无公开行情的私有公司）。
+   - 若条目只有 `peer_group` 名称而未展开 `peers`，收集 `coverage.yaml` 中所有 `peer_group` 相同、且代码不等于目标公司的上市代码（按数据字段跳过标记为未上市或无公开行情的私有公司）。
 3. **板块 ETF**：
    - 取该条目的 `etfs[0]`（若 `etfs` 非空，例如 `QQQ`、`IGV`、`KWEB`、`XHB`）；
    - 若该条目的 `etfs` 为空，按其 `sheet_section` 或 `peer_group` 映射到对应的板块 ETF（见下表）。

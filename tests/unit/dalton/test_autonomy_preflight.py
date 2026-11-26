@@ -13,6 +13,7 @@ from unittest.mock import create_autospec
 from zoneinfo import ZoneInfo
 
 from psycopg import AsyncCursor
+import httpx
 import pytest
 
 from src.dalton.autonomy.backoff import (
@@ -1977,7 +1978,8 @@ async def test_probe_cnhk_filings_full_contract(
                 ],
             }
         if (start, end) == ("2026-10-19", "2026-10-19"):
-            # 1-day window STILL hits limit=2 -> logs warning, records 2026-10-19 in cnhk_probe_truncated_dates, and advances
+            # 1-day window STILL hits limit=2 -> logs warning, records 2026-10-19 in cnhk_probe_truncated_dates,
+            # and leaves the day unscanned (watermark must NOT advance past 2026-10-19)
             return {
                 "ok": True,
                 "rows": [
@@ -2017,8 +2019,10 @@ async def test_probe_cnhk_filings_full_contract(
         ("2026-10-21", "2026-10-22"),
     ]
     assert len(split_sigs) == 4
-    assert split_state["last_cnhk_check_date"] == "2026-10-22"
+    assert "last_cnhk_check_date" not in split_state
+    assert split_state["cnhk_probe_partial"] is True
     assert split_state["cnhk_probe_truncated_dates"] == ["2026-10-19"]
+    assert split_state["cnhk_probe_unresolved_truncated_dates"] == ["2026-10-19"]
     assert any("cnhk_probe_truncated_dates" in r.message for r in caplog.records)
 
     # If a sub-window fails during recursive split, watermark must NOT advance
@@ -4122,7 +4126,8 @@ async def test_backoff_probe_does_not_reset_timeout_streak(monkeypatch: pytest.M
     )
 
     assert result.should_wake is False
-    assert result.reason == "no_new_signals"
+    assert result.reason == "sources_degraded"
+    assert result.degraded_sources == ["sec"]
     assert doubles["reset"].await_count == 0
     assert preflight_mod.probe_sec.await_count == 0
 
@@ -4176,7 +4181,8 @@ async def test_degraded_or_partial_probe_does_not_reset_timeout_streak(
         agenda_doc_override={},
     )
     assert partial.should_wake is False
-    assert partial.reason == "no_new_signals"
+    assert partial.reason == "sources_degraded"
+    assert partial.degraded_sources == ["cnhk"]
     assert doubles["reset"].await_count == 0
 
     _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk_degraded)
@@ -4427,7 +4433,7 @@ def test_dalton_migration_graph_has_a_single_head() -> None:
         revisions[mod.revision] = mod.down_revision
     parents = {down for down in revisions.values() if down}
     heads = sorted(rev for rev in revisions if rev not in parents)
-    assert heads == ["d055"], heads
+    assert heads == ["d057"], heads
 
 
 @pytest.mark.asyncio
@@ -5834,3 +5840,461 @@ async def test_phase1_schedule_helper_row5_web_access_g3_and_c2_lead_check(
             action="upsert",
         )
     assert exc_g3.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_preflight_distinguishes_sources_degraded_and_timeout_from_no_new_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """来源不可用记为 sources_degraded（列出来源），超时记为 preflight_timeout（列出未完成探针），且在 summary 可见。"""
+    doubles = _install_company_preflight_doubles(monkeypatch)
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    async def _cnhk_degraded(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        st = dict(kwargs.get("watch_state") or {})
+        st["cnhk_probe_degraded"] = True
+        return [], st
+
+    async def _sec_degraded(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        st = dict(kwargs.get("watch_state") or {})
+        st["sec_probe_degraded"] = True
+        return [], st
+
+    # 1. Both SEC and CNHK degraded -> sources_degraded listing both sources, visible in summary and preflight_log
+    _patch_company_probes(monkeypatch, sec=_sec_degraded, cnhk=_cnhk_degraded)
+    res_deg = await preflight_check(
+        _company_watch_automation(),
+        "exec-sources-degraded-1",
+        persist=True,
+        agenda_doc_override={},
+    )
+    assert res_deg.should_wake is False
+    assert res_deg.decision == "skip"
+    assert res_deg.reason == "sources_degraded"
+    assert res_deg.degraded_sources == ["sec", "cnhk"]
+    assert "sources_degraded" in res_deg.summary
+    assert "sec" in res_deg.summary and "cnhk" in res_deg.summary
+    assert doubles["logs"][-1]["reason"] == "sources_degraded"
+    assert doubles["logs"][-1]["signals"] == [{"degraded_sources": ["sec", "cnhk"]}]
+
+    # 2. All probes healthy, no signals -> no_new_signals
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet)
+    res_quiet = await preflight_check(
+        _company_watch_automation(),
+        "exec-clean-quiet-1",
+        persist=True,
+        agenda_doc_override={},
+    )
+    assert res_quiet.should_wake is False
+    assert res_quiet.reason == "no_new_signals"
+    assert res_quiet.degraded_sources == []
+    assert res_quiet.summary == "no_new_signals"
+
+    # 3. Probe timeout -> preflight_timeout with incomplete probes visible in summary
+    async def _slow_sec(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        await asyncio.sleep(5.0)
+        return [], dict(kwargs.get("watch_state") or {})
+
+    _patch_company_probes(monkeypatch, sec=_slow_sec, cnhk=_quiet)
+    res_to = await preflight_check(
+        _company_watch_automation(),
+        "exec-preflight-timeout-vis",
+        persist=True,
+        agenda_doc_override={},
+        timeout_s=0.05,
+    )
+    assert res_to.should_wake is False
+    assert res_to.reason == "preflight_timeout"
+    assert "sec" in res_to.incomplete_probes
+    assert "preflight_timeout" in res_to.summary
+    assert "sec" in res_to.summary
+
+
+@pytest.mark.asyncio
+async def test_sec_probe_skips_non_sec_tickers_without_degrading(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """没有 SEC CIK 的港股/韩股/A股跳过 SEC 检查，不记 sec_probe_degraded，也不触发网络查询。"""
+    from src.dalton.autonomy.probes import sec as sec_mod
+
+    mock_resolve = create_autospec(sec_mod._lookup_local_cik, return_value=None)
+    monkeypatch.setattr(sec_mod, "_lookup_local_cik", mock_resolve)
+
+    mock_client_cls = create_autospec(httpx.AsyncClient)
+    monkeypatch.setattr(sec_mod.httpx, "AsyncClient", mock_client_cls)
+
+    for ticker in ("0700.HK", "005930.KS", "035420.KQ", "600519.SS", "7203.T", "2330.TW"):
+        with caplog.at_level("WARNING"):
+            sigs, st = await sec_mod.probe_sec(
+                ticker=ticker,
+                watch_state={},
+                allow_network=True,
+            )
+        assert sigs == []
+        assert st.get("sec_probe_degraded") is not True
+        assert st.get("sec_probe_unsupported") is True
+
+    mock_client_cls.assert_not_called()
+    assert not any("marking sec_probe_degraded=True" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_preflight_backoff_and_partial_cnhk_report_sources_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """探针在退避窗口内跳过，或 CN/HK 仅完成部分扫描时，都记为 sources_degraded 并写出来源名。"""
+    doubles = _install_company_preflight_doubles(monkeypatch)
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    async def _cnhk_partial(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        st = dict(kwargs.get("watch_state") or {})
+        st["cnhk_probe_partial"] = True
+        st["cnhk_probe_degraded"] = False
+        return [], st
+
+    # 1. Persistent outage in backoff window: cnhk skipped by backoff -> still sources_degraded listing cnhk
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_quiet)
+    not_before = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+    res_bo = await preflight_check(
+        _company_watch_automation(),
+        "exec-backoff-degraded",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override={"probe_backoff": {"cnhk": {"not_before": not_before, "attempt": 3}}},
+    )
+    assert res_bo.should_wake is False
+    assert res_bo.reason == "sources_degraded"
+    assert res_bo.degraded_sources == ["cnhk"]
+    assert res_bo.summary == "sources_degraded: cnhk"
+    assert doubles["logs"][-1]["reason"] == "sources_degraded"
+    assert doubles["logs"][-1]["signals"] == [{"degraded_sources": ["cnhk"]}]
+
+    # 2. Partial CNHK scan (budget exhausted) -> sources_degraded listing cnhk (never no_new_signals)
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk_partial)
+    res_partial = await preflight_check(
+        _company_watch_automation(),
+        "exec-partial-degraded",
+        persist=True,
+        agenda_doc_override={},
+    )
+    assert res_partial.should_wake is False
+    assert res_partial.reason == "sources_degraded"
+    assert res_partial.degraded_sources == ["cnhk"]
+    assert res_partial.summary == "sources_degraded: cnhk"
+    assert doubles["logs"][-1]["reason"] == "sources_degraded"
+    assert doubles["logs"][-1]["signals"] == [{"degraded_sources": ["cnhk"]}]
+
+
+@pytest.mark.asyncio
+async def test_preflight_cnhk_single_day_truncation_with_seen_filings_reports_sources_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CN/HK 单日查询触及上限且返回公告均已见过时，预检报 sources_degraded: cnhk 而非 no_new_signals。"""
+    from src.dalton.autonomy.probes import cnhk as cnhk_mod
+
+    doubles = _install_company_preflight_doubles(monkeypatch)
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    seen_hashes = [
+        compute_cnhk_filing_hash("2026-10-22", "常规公告A", "http://cninfo/a"),
+        compute_cnhk_filing_hash("2026-10-22", "常规公告B", "http://cninfo/b"),
+    ]
+
+    async def _saturated_bridge(**kwargs: Any) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "rows": [
+                {"date": "2026-10-22", "title": "常规公告A", "pdf_link": "http://cninfo/a"},
+                {"date": "2026-10-22", "title": "常规公告B", "pdf_link": "http://cninfo/b"},
+            ],
+        }
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(cnhk_mod._query_bridge_cnhk_filings, side_effect=_saturated_bridge),
+    )
+
+    async def _real_cnhk_with_small_limit(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return await cnhk_mod.probe_cnhk_filings(
+            ticker="0700.HK",
+            watch_state=dict(kwargs.get("watch_state") or {}),
+            allow_network=True,
+            today=date(2026, 10, 22),
+            now=datetime(2026, 10, 22, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+            limit=2,
+        )
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_real_cnhk_with_small_limit)
+    res = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-truncated-seen",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override={
+            "last_cnhk_check_date": "2026-10-22",
+            "seen_cnhk_filings": seen_hashes,
+        },
+    )
+    assert res.should_wake is False
+    assert res.reason == "sources_degraded"
+    assert res.degraded_sources == ["cnhk"]
+    assert res.summary == "sources_degraded: cnhk"
+    assert doubles["reset"].await_count == 0
+    assert doubles["logs"][-1]["reason"] == "sources_degraded"
+    assert doubles["logs"][-1]["signals"] == [{"degraded_sources": ["cnhk"]}]
+
+
+@pytest.mark.asyncio
+async def test_cnhk_31_filings_detected_as_truncated_across_script_and_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """生产传 limit=50、公告脚本每页 30 条时，31 条公告仍返回分页未完成标记，探针与预检识别截断且不推进水位。"""
+    import importlib.util
+    import sys
+    import types
+    from pathlib import Path
+
+    from src.dalton.autonomy.probes import cnhk as cnhk_mod
+
+    script_path = (
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "dalton"
+        / "research_runtime"
+        / "skills"
+        / "cn-hk-findata"
+        / "fetch_announcements.py"
+    )
+    # Stub optional OCR/PDF libraries if absent in unit-test venv; fetch_announcements itself only uses requests.
+    for mod_name in ("fitz", "pytesseract", "PIL", "PIL.Image", "pypdf"):
+        if mod_name not in sys.modules:
+            stub = types.ModuleType(mod_name)
+            if mod_name == "PIL":
+                stub.Image = types.ModuleType("PIL.Image")
+            if mod_name == "pypdf":
+                stub.PdfReader = object
+            monkeypatch.setitem(sys.modules, mod_name, stub)
+
+    spec = importlib.util.spec_from_file_location("test_fetch_announcements_mod", script_path)
+    assert spec is not None and spec.loader is not None
+    fa_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fa_mod)
+
+    ts_ms = int(datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    thirty_items = [
+        {
+            "announcementTitle": f"例行公告-{i:02d}",
+            "announcementTime": ts_ms,
+            "adjunctUrl": f"finalpage/2026-10-22/{i:02d}.PDF",
+        }
+        for i in range(1, 31)
+    ]
+
+    class _FakeResp:
+        def __init__(self, payload: Any) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> Any:
+            return self._payload
+
+    def _fake_post(url: str, data: dict[str, Any] | None = None, headers: Any = None, timeout: int = 20) -> Any:
+        if "topSearch" in url:
+            return _FakeResp([{"orgId": "9900000700"}])
+        return _FakeResp(
+            {
+                "announcements": thirty_items,
+                "hasMore": True,
+                "totalAnnouncement": 31,
+            }
+        )
+
+    post_mock = create_autospec(fa_mod.requests.post, side_effect=_fake_post)
+    monkeypatch.setattr(fa_mod.requests, "post", post_mock)
+
+    script_out = fa_mod.fetch_announcements(
+        "00700",
+        limit=50,
+        max_pages=1,
+        date_from="2026-10-22",
+        date_to="2026-10-22",
+    )
+    assert script_out["ok"] is True
+    assert script_out["count"] == 30
+    assert script_out["page_size"] == 30
+    assert script_out["pages_fetched"] == 1
+    assert script_out["total_count"] == 31
+    assert script_out["has_more"] is True
+    assert script_out["truncated"] is True
+    assert script_out["pagination_complete"] is False
+
+    # Feed this exact 30-row payload (wrapped by data_gateway) into cnhk probe + preflight with limit=50
+    doubles = _install_company_preflight_doubles(monkeypatch)
+    seen_hashes = [
+        compute_cnhk_filing_hash(r["date"], r["title"], r["pdf_link"])
+        for r in script_out["rows"]
+    ]
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    async def _bridge_31(**kwargs: Any) -> dict[str, Any]:
+        if kwargs["start"] == "2026-10-21" and kwargs["end"] == "2026-10-21":
+            return {"ok": True, "data": {"ok": True, "rows": [], "has_more": False, "pagination_complete": True}}
+        return {"ok": True, "data": script_out}
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(cnhk_mod._query_bridge_cnhk_filings, side_effect=_bridge_31),
+    )
+
+    captured_state: dict[str, Any] = {}
+
+    async def _real_cnhk_limit_50(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        sigs, st = await cnhk_mod.probe_cnhk_filings(
+            ticker="0700.HK",
+            watch_state=dict(kwargs.get("watch_state") or {}),
+            allow_network=True,
+            today=date(2026, 10, 22),
+            now=datetime(2026, 10, 22, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+            limit=50,
+        )
+        captured_state.clear()
+        captured_state.update(st)
+        return sigs, st
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_real_cnhk_limit_50)
+    res = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-31-filings",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override={
+            "last_cnhk_check_date": "2026-10-21",
+            "seen_cnhk_filings": seen_hashes,
+        },
+    )
+    assert res.should_wake is False
+    assert res.reason == "sources_degraded"
+    assert res.degraded_sources == ["cnhk"]
+    assert res.summary == "sources_degraded: cnhk"
+    # Watermark MUST stop at 2026-10-21 (confirmed complete), NOT advance to truncated 2026-10-22!
+    assert captured_state["last_cnhk_check_date"] == "2026-10-21"
+    assert captured_state["cnhk_probe_partial"] is True
+    assert "2026-10-22" in captured_state["cnhk_probe_unresolved_truncated_dates"]
+    assert doubles["logs"][-1]["reason"] == "sources_degraded"
+
+
+@pytest.mark.asyncio
+async def test_preflight_cnhk_next_day_after_truncated_day_never_reports_no_new_signals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """截断日不算扫完且留在下次窗口；次日即使默认窗口本不再包含截断日且无未见公告，也不得误报 no_new_signals。"""
+    from src.dalton.autonomy.probes import cnhk as cnhk_mod
+
+    _install_company_preflight_doubles(monkeypatch)
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    # Day 1 (2026-10-22) with empty initial watch_state: lookback window is [2026-10-19..2026-10-22].
+    # 2026-10-19 hits limit=2 (truncated); 2026-10-20..2026-10-22 are clean.
+    seen_hashes = [
+        compute_cnhk_filing_hash("2026-10-19", "公告19A", "http://cninfo/19a"),
+        compute_cnhk_filing_hash("2026-10-19", "公告19B", "http://cninfo/19b"),
+    ]
+    day1_windows: list[tuple[str, str]] = []
+    day2_windows: list[tuple[str, str]] = []
+    active_log = day1_windows
+
+    async def _bridge(**kwargs: Any) -> dict[str, Any]:
+        start_s, end_s = kwargs["start"], kwargs["end"]
+        active_log.append((start_s, end_s))
+        if start_s <= "2026-10-19" <= end_s:
+            return {
+                "ok": True,
+                "rows": [
+                    {"date": "2026-10-19", "title": "公告19A", "pdf_link": "http://cninfo/19a"},
+                    {"date": "2026-10-19", "title": "公告19B", "pdf_link": "http://cninfo/19b"},
+                ],
+            }
+        return {"ok": True, "rows": []}
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(cnhk_mod._query_bridge_cnhk_filings, side_effect=_bridge),
+    )
+
+    state_after_day1: dict[str, Any] = {}
+
+    async def _cnhk_day1(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        sigs, st = await cnhk_mod.probe_cnhk_filings(
+            ticker="0700.HK",
+            watch_state=dict(kwargs.get("watch_state") or {}),
+            allow_network=True,
+            today=date(2026, 10, 22),
+            now=datetime(2026, 10, 22, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+            limit=2,
+        )
+        state_after_day1.clear()
+        state_after_day1.update(st)
+        return sigs, st
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk_day1)
+    res_day1 = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-day1-trunc",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override={"seen_cnhk_filings": seen_hashes},
+    )
+    assert res_day1.reason == "sources_degraded"
+    assert res_day1.degraded_sources == ["cnhk"]
+    assert "last_cnhk_check_date" not in state_after_day1
+    assert state_after_day1["cnhk_probe_unresolved_truncated_dates"] == ["2026-10-19"]
+
+    # Day 2 (2026-10-23): default 3-day lookback would be [2026-10-20..2026-10-23] (no longer containing 2026-10-19!).
+    # Probe must keep 2026-10-19 in the window and preflight MUST NOT report no_new_signals.
+    active_log = day2_windows
+    state_after_day2: dict[str, Any] = {}
+
+    async def _cnhk_day2(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        sigs, st = await cnhk_mod.probe_cnhk_filings(
+            ticker="0700.HK",
+            watch_state=dict(kwargs.get("watch_state") or {}),
+            allow_network=True,
+            today=date(2026, 10, 23),
+            now=datetime(2026, 10, 23, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+            limit=2,
+        )
+        state_after_day2.clear()
+        state_after_day2.update(st)
+        return sigs, st
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk_day2)
+    res_day2 = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-day2-after-trunc",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override=state_after_day1,
+    )
+    assert any(s <= "2026-10-19" <= e for s, e in day2_windows)
+    assert res_day2.should_wake is False
+    assert res_day2.reason == "sources_degraded"
+    assert res_day2.degraded_sources == ["cnhk"]
+    assert res_day2.reason != "no_new_signals"
+    assert "last_cnhk_check_date" not in state_after_day2
+    assert state_after_day2["cnhk_probe_unresolved_truncated_dates"] == ["2026-10-19"]

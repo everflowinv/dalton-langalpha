@@ -278,7 +278,7 @@ async def get_retry_checkpoint(thread_id: str, checkpoint_id: str | None = None)
 
 # --- DALTON-HOOK(cos-settings-tools): begin ---
 WEB_CONFIRM_ACTION_TYPES: frozenset[str] = frozenset(
-    {"create_workspace", "archive_workspace"}
+    {"create_workspace", "archive_workspace", "dalton_report_delivery_set"}
 )
 
 
@@ -366,11 +366,25 @@ def _snapshot_matches_action(
             and bool(snapshot.get("duplicate_check_unavailable"))
             == bool(action_req.get("duplicate_check_unavailable"))
         )
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
     if action_type == "archive_workspace":
+        from src.server.database.computer import normalize_archive_workspace_snapshot
+
+        snap_ws = snapshot.get("expected_workspaces")
+        req_ws = action_req.get("expected_workspaces")
+        if not isinstance(snap_ws, list) or not isinstance(req_ws, list):
+            return False
         return (
             snapshot.get("workspace_id") == action_req.get("workspace_id")
+            and (snapshot.get("workspace_name") or "")
+            == (action_req.get("workspace_name") or "")
             and snapshot.get("computer_id") == action_req.get("computer_id")
+            and (snapshot.get("computer_name") or "")
+            == (action_req.get("computer_name") or "")
+            and normalize_archive_workspace_snapshot(snap_ws)
+            == normalize_archive_workspace_snapshot(req_ws)
         )
+    # --- DALTON-HOOK(cos-settings-tools): end ---
     return False
 
 
@@ -492,6 +506,19 @@ async def _verify_web_confirm_resume(
         if _is_reject_answer(answers[iid]):
             continue
         action_req = _interrupt_action_request(guarded_by_id[iid]) or {}
+        if action_req.get("type") == "dalton_report_delivery_set":
+            # DALTON-HOOK(report-delivery): delegate AD5 session & confirm_token verification to src.dalton
+            from src.dalton.services.report_delivery import (
+                verify_report_delivery_interrupt_resume,
+            )
+
+            verify_report_delivery_interrupt_resume(
+                action_req,
+                answers[iid],
+                principal=principal,
+                raw_request=raw_request,
+            )
+            continue
         tool_call_id = action_req.get("tool_call_id")
         snap = (
             snapshots.get(tool_call_id)

@@ -31,7 +31,7 @@ export function AutomationNotifyToggle({
 
   if (
     !automation.dalton_notify_category ||
-    !hasCapability(['channel_gateway', 'channel_feishu', 'channel_discord'])
+    !hasCapability(['channel_gateway', 'channel_feishu', 'channel_discord', 'channel_weixin'])
   ) {
     return null;
   }
@@ -42,9 +42,10 @@ export function AutomationNotifyToggle({
   const overrides = prefs.dalton_notify_overrides;
   const { enabled: taskEnabled } = resolveDaltonAutomationNotifyState(automation, overrides);
   const canInteract = prefsReady && masterEnabled;
+  const autoId = automation.automation_id?.trim();
   const overrideKey =
-    automation.dalton_notify_category === 'custom' && automation.automation_id
-      ? `automation:${automation.automation_id}`
+    autoId && automation.dalton_notify_category !== 'data_task'
+      ? `automation:${autoId}`
       : automation.name;
 
   const handleToggle = () => {

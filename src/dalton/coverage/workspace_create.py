@@ -6,6 +6,7 @@ retains only a thin ``DALTON-HOOK(workspace-dedup)`` call.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Callable
 
@@ -319,8 +320,11 @@ async def create_workspace_for_web(
     if request.allow_duplicate_company:
         matched_ids: list[str] = []
         try:
-            dup_for_log = await dedup_mod.find_existing_company_workspace(
-                x_user_id, request.name, channel="web"
+            dup_for_log = await asyncio.wait_for(
+                dedup_mod.find_existing_company_workspace(
+                    x_user_id, request.name, channel="web"
+                ),
+                timeout=dedup_mod.WEB_DEDUP_OVERALL_TIMEOUT_SECONDS,
             )
             if dup_for_log is not None and dup_for_log.matches:
                 matched_ids = list(
@@ -375,18 +379,34 @@ async def create_workspace_for_web(
 
     workspace: dict[str, Any] | None = None
     registration_state = {"ran": False, "result": (None, None, None)}
+    dedup_warning: str | None = None
+    dedup_warning_code: str | None = None
 
     for attempt in range(MAX_WEB_DEDUP_ATTEMPTS):
         dup = None
         dedup_snapshots: list[Any] = []
         phase1_failed = False
+        dedup_warning = None
+        dedup_warning_code = None
         try:
-            dup = await dedup_mod.find_existing_company_workspace(
-                x_user_id,
-                request.name,
-                channel="web",
-                snapshot_out=dedup_snapshots,
+            dup = await asyncio.wait_for(
+                dedup_mod.find_existing_company_workspace(
+                    x_user_id,
+                    request.name,
+                    channel="web",
+                    raise_on_timeout=True,
+                    snapshot_out=dedup_snapshots,
+                ),
+                timeout=dedup_mod.WEB_DEDUP_OVERALL_TIMEOUT_SECONDS,
             )
+        except (TimeoutError, asyncio.TimeoutError):
+            phase1_failed = True
+            logger.warning(
+                "Company workspace dedup check timed out after %.1fs; falling back to locked recheck",
+                dedup_mod.WEB_DEDUP_OVERALL_TIMEOUT_SECONDS,
+            )
+            dedup_warning = dedup_mod.WEB_DEDUP_UNAVAILABLE_MESSAGE
+            dedup_warning_code = dedup_mod.WEB_DEDUP_UNAVAILABLE_CODE
         except Exception as exc:
             phase1_failed = True
             logger.warning(
@@ -456,10 +476,15 @@ async def create_workspace_for_web(
             create_kwargs["on_workspace_inserted"] = in_tx_hook
 
         dedup_snap = dedup_snapshots[-1] if dedup_snapshots else None
-        if dedup_snap is not None and not dedup_snap.active:
+        if not phase1_failed and dedup_snap is not None and not dedup_snap.active:
             # Dedup explicitly disabled (e.g. single-user OSS / coverage units off / company user).
             pass
-        elif dedup_snap is not None and dedup_snap.active and dedup_snap.status == "clear":
+        elif (
+            not phase1_failed
+            and dedup_snap is not None
+            and dedup_snap.active
+            and dedup_snap.status == "clear"
+        ):
             create_kwargs["check_duplicate_snapshot"] = True
             create_kwargs["verified_company_candidates"] = dedup_snap.checked_candidates
             if dedup_snap.check_colleague_workspaces:
@@ -537,7 +562,7 @@ async def create_workspace_for_web(
             ) from None
 
     assert workspace is not None
-    return await _attach_coverage_registration_result(
+    workspace = await _attach_coverage_registration_result(
         workspace,
         user_id=x_user_id,
         request=request,
@@ -545,3 +570,8 @@ async def create_workspace_for_web(
         wants_coverage=wants_coverage,
         registration_state=registration_state,
     )
+    if dedup_warning is not None:
+        workspace = dict(workspace)
+        workspace["dedup_warning"] = dedup_warning
+        workspace["dedup_warning_code"] = dedup_warning_code
+    return workspace

@@ -18,7 +18,9 @@ const ComputersDialogHost = lazy(withCopy(() => import('@/pages/ChatAgent/compon
   'filePanel', 'settings', 'setup',
 ]));
 
-const OpenCreateWorkspace = createContext<(() => void) | null>(null);
+type OpenCreateWorkspace = (opener?: HTMLElement | null) => void; // DALTON-HOOK(dialog-focus-return): the click handler names its control
+
+const OpenCreateWorkspace = createContext<OpenCreateWorkspace | null>(null);
 
 // DALTON-HOOK(settings-reorg): fallback Computers host for pages without their own ComputersDialogHost.
 // Yields immediately when a page-level host mounts (e.g. browser back to /chat) so two dialogs never
@@ -70,12 +72,14 @@ export function CreateWorkspaceHost({ children }: { children: ReactNode }) {
     document.addEventListener('pointerdown', onPointerDown, true);
     return () => document.removeEventListener('pointerdown', onPointerDown, true);
   }, []);
-  const openDialog = useCallback(() => {
+  const openDialog = useCallback((opener?: HTMLElement | null) => {
     const focused = document.activeElement;
     const pressed = lastPressedRef.current;
     lastPressedRef.current = null;
     const recentPress = pressed && performance.now() - pressed.at < 1000 ? pressed.el : null;
-    setOpener(focused instanceof HTMLElement && focused !== document.body ? focused : recentPress);
+    // DALTON-HOOK(dialog-focus-return): the control the click handler named comes first. The two guesses
+    // stand in for an opener that has none to give (such as the desktop app menu).
+    setOpener(opener ?? (focused instanceof HTMLElement && focused !== document.body ? focused : recentPress));
     setOpen(true);
   }, []);
   const openCreated = useCallback(
@@ -97,8 +101,11 @@ export function CreateWorkspaceHost({ children }: { children: ReactNode }) {
   );
 }
 
-/** Opens the "New workspace" dialog; null outside the app shell. */
+/**
+ * Opens the "New workspace" dialog; null outside the app shell. A click
+ * handler passes the control it runs for, and focus comes back to it on close.
+ */
 // eslint-disable-next-line react-refresh/only-export-components
-export function useOpenCreateWorkspace(): (() => void) | null {
+export function useOpenCreateWorkspace(): OpenCreateWorkspace | null {
   return useContext(OpenCreateWorkspace);
 }

@@ -48,6 +48,8 @@ set -euo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/standalone/env_tokens.sh
+source "${SCRIPT_DIR}/env_tokens.sh"
 WORK_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BACKUP_DIR=""
 ENV_PASSPHRASE_FILE="${DALTON_BACKUP_PASSPHRASE_FILE:-}"
@@ -59,6 +61,7 @@ REPLACE_ENV=0
 SKIP_EDGE_BUILD=0
 SKIP_CADDY=0
 SKIP_MINIO=0
+SKIP_WIKI=0
 
 MANUAL_OVERWRITE_REF="docs/dalton/dev-guide/STANDALONE-DEPLOY.md (§6.2 在已有实例上覆盖恢复)"
 
@@ -169,6 +172,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-caddy)
       SKIP_CADDY=1
+      shift
+      ;;
+    --skip-wiki)
+      SKIP_WIKI=1
       shift
       ;;
     -h|--help)
@@ -818,6 +825,8 @@ for key in (
     "DB_USER",
     "DB_PASSWORD",
     "DB_NAME",
+    "DALTON_RESEARCH_HOST_TOKEN",
+    "DALTON_RESEARCH_ADMIN_TOKEN",
 ):
     seen.add(key)
     print(key)
@@ -1651,6 +1660,250 @@ if [[ "$SKIP_CADDY" -eq 0 && -f "${BACKUP_DIR}/caddy-data.tar.gz" ]]; then
   ok "Caddy certificate data restored."
 else
   info "6/7 Skipping Caddy certificate restore."
+fi
+
+if [[ "$SKIP_WIKI" -eq 0 && -f "${BACKUP_DIR}/wiki-data.tar.gz" ]]; then
+  if compose_cmd config --services 2>/dev/null | grep -qx "research-host"; then
+    info "6/7 Restoring Wiki data volume (/var/lib/dalton/wiki)..."
+    if ! compose_cmd run --rm -T --no-deps --entrypoint /bin/sh research-host \
+        -c 'mkdir -p /var/lib/dalton/wiki && rm -rf /var/lib/dalton/wiki/* /var/lib/dalton/wiki/.[!.]* /var/lib/dalton/wiki/..?* 2>/dev/null || true; tar -xzf - -C /var/lib/dalton/wiki' \
+        < "${BACKUP_DIR}/wiki-data.tar.gz"; then
+      err "Failed to extract Wiki data volume from ${BACKUP_DIR}/wiki-data.tar.gz."
+      exit 1
+    fi
+    WIKI_VERIFY_PY='
+import json, os, sqlite3, sys
+from pathlib import Path
+
+root = Path(os.getenv("DALTON_WIKI_DATA_DIR") or "/var/lib/dalton/wiki")
+db = root / "wiki" / "vectors.db"
+audit_path = root / "state" / "wiki_ingest_audit.jsonl"
+img_db = root / "state" / "research-images" / "index.sqlite"
+
+errors: list[str] = []
+doc_ids: set[int] = set()
+doc_filepaths: set[str] = set()
+has_rcpts = None
+receipt_rows: list[tuple] = []
+
+if db.is_file():
+    conn = sqlite3.connect(str(db))
+    try:
+        res = conn.execute("PRAGMA integrity_check").fetchone()
+        if not res or str(res[0]).lower() != "ok":
+            errors.append(f"Wiki vectors.db integrity_check failed: {res}")
+        else:
+            docs = conn.execute("SELECT id, filepath FROM documents").fetchall()
+            for doc_num, fp in docs:
+                doc_ids.add(int(doc_num))
+                doc_filepaths.add(str(fp))
+                if not (root / str(fp)).is_file():
+                    errors.append(f"documents row id={doc_num} references missing markdown file: {fp}")
+            has_rcpts = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type=\"table\" AND name=\"ingest_receipts\""
+            ).fetchone()
+            if has_rcpts:
+                receipt_rows = conn.execute(
+                    "SELECT request_id, doc_id, filepath, sha256, receipt_json FROM ingest_receipts"
+                ).fetchall()
+    finally:
+        conn.close()
+
+# Parse audit JSONL entries (if present)
+audit_entries: list[dict] = []
+successful_audits: list[dict] = []
+if audit_path.is_file():
+    for lineno, raw in enumerate(audit_path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception as exc:
+            errors.append(f"Malformed JSON in wiki_ingest_audit.jsonl line {lineno}: {exc}")
+            continue
+        if not isinstance(obj, dict):
+            continue
+        audit_entries.append(obj)
+        if obj.get("status") in ("ingested", "done"):
+            successful_audits.append(obj)
+
+# Require vectors.db whenever successful audit records or Wiki Markdown files exist
+wiki_md_files = (
+    [p for p in (root / "wiki").rglob("*.md") if p.is_file()]
+    if (root / "wiki").is_dir()
+    else []
+)
+if (successful_audits or wiki_md_files) and not db.is_file():
+    errors.append(
+        f"Wiki index wiki/vectors.db is missing despite {len(successful_audits)} successful audit record(s) "
+        f"and {len(wiki_md_files)} markdown file(s)."
+    )
+
+if any(e.get("image_id") for e in successful_audits) and not img_db.is_file():
+    errors.append(
+        "Audit records reference image_id, but state/research-images/index.sqlite is missing."
+    )
+
+# Verify image index SQLite, asset files, and refs -> assets & documents consistency
+img_ref_ids: set[str] = set()
+if img_db.is_file():
+    conn = sqlite3.connect(str(img_db))
+    try:
+        res = conn.execute("PRAGMA integrity_check").fetchone()
+        if not res or str(res[0]).lower() != "ok":
+            errors.append(f"Wiki image index integrity_check failed: {res}")
+        else:
+            assets = conn.execute("SELECT sha, path FROM assets").fetchall()
+            asset_shas: set[str] = set()
+            for sha, rel_path in assets:
+                asset_shas.add(str(sha))
+                if not rel_path or not (root / str(rel_path)).is_file():
+                    errors.append(f"Image asset sha={sha} missing file on disk: {rel_path}")
+            refs = conn.execute("SELECT id, asset_sha, source, doc_key FROM refs").fetchall()
+            for ref_id, asset_sha, source, doc_key in refs:
+                img_ref_ids.add(f"image:{ref_id}")
+                if str(asset_sha) not in asset_shas:
+                    errors.append(f"Image ref id={ref_id} points to missing asset_sha={asset_sha}")
+                if str(source) == "company-wiki" and str(doc_key).startswith("wiki:") and db.is_file():
+                    try:
+                        ref_doc_num = int(str(doc_key).split(":", 1)[1])
+                    except ValueError:
+                        ref_doc_num = -1
+                    if ref_doc_num not in doc_ids:
+                        errors.append(f"Image ref id={ref_id} references missing wiki document {doc_key}")
+    finally:
+        conn.close()
+
+# Cross-check DB ingest_receipts <-> documents <-> originals <-> image index <-> audit JSONL (per-record!)
+receipt_keys: list[tuple[str, str, str]] = []
+for req_id, doc_id_str, fp, sha256, rcpt_json in receipt_rows:
+    req_str = str(req_id or "")
+    doc_str = str(doc_id_str or "")
+    fp_str = str(fp or "")
+    sha_str = str(sha256 or "")
+    receipt_keys.append((req_str, doc_str, sha_str))
+
+    if fp_str not in doc_filepaths or not (root / fp_str).is_file():
+        errors.append(f"ingest_receipts request_id={req_str} references missing document filepath={fp_str}")
+    if doc_str.startswith("wiki:"):
+        try:
+            dnum = int(doc_str.split(":", 1)[1])
+        except ValueError:
+            dnum = -1
+        if dnum not in doc_ids:
+            errors.append(f"ingest_receipts request_id={req_str} references missing doc_id={doc_str}")
+    rcpt = {}
+    if rcpt_json:
+        try:
+            rcpt = json.loads(rcpt_json)
+        except Exception as exc:
+            errors.append(f"ingest_receipts request_id={req_str} has corrupt receipt_json: {exc}")
+    orig_fp = rcpt.get("original_filepath")
+    if orig_fp and not (root / str(orig_fp)).is_file():
+        errors.append(f"ingest_receipts request_id={req_str} references missing original file: {orig_fp}")
+    img_id = rcpt.get("image_id")
+    if img_id and str(img_id) not in img_ref_ids:
+        errors.append(f"ingest_receipts request_id={req_str} references missing image index entry: {img_id}")
+
+    # Every DB receipt must match a SINGLE audit record on doc_id, sha256, and (when explicit) request_id
+    explicit_req = req_str if (req_str and not req_str.startswith("sha:")) else None
+    matched_audit = False
+    for entry in successful_audits:
+        if str(entry.get("doc_id") or "") != doc_str:
+            continue
+        if str(entry.get("sha256") or "") != sha_str:
+            continue
+        if explicit_req is not None and str(entry.get("request_id") or "") != explicit_req:
+            continue
+        e_fp = entry.get("filepath")
+        if e_fp and str(e_fp) != fp_str:
+            continue
+        matched_audit = True
+        break
+    if not matched_audit:
+        errors.append(
+            f"ingest_receipts mismatch: request_id={req_str}, doc_id={doc_str}, sha256={sha_str[:12]}... "
+            f"has no matching entry (same request_id, doc_id, and sha256) in state/wiki_ingest_audit.jsonl"
+        )
+
+# Cross-check successful audit JSONL entries -> documents, originals, image index, and ingest_receipts
+if db.is_file():
+    if successful_audits and not has_rcpts:
+        errors.append(
+            f"state/wiki_ingest_audit.jsonl has {len(successful_audits)} successful record(s), "
+            f"but ingest_receipts table is missing in wiki/vectors.db"
+        )
+    elif successful_audits and not receipt_keys:
+        errors.append(
+            f"state/wiki_ingest_audit.jsonl has {len(successful_audits)} successful record(s), "
+            f"but ingest_receipts table is empty in wiki/vectors.db"
+        )
+    for entry in successful_audits:
+        e_req = str(entry.get("request_id") or "")
+        e_doc = str(entry.get("doc_id") or "")
+        e_sha = str(entry.get("sha256") or "")
+        e_fp = entry.get("filepath")
+        if e_fp and (str(e_fp) not in doc_filepaths or not (root / str(e_fp)).is_file()):
+            errors.append(f"wiki_ingest_audit.jsonl entry (doc_id={e_doc}) references missing document filepath={e_fp}")
+        if e_doc.startswith("wiki:"):
+            try:
+                e_dnum = int(e_doc.split(":", 1)[1])
+            except ValueError:
+                e_dnum = -1
+            if e_dnum not in doc_ids:
+                errors.append(f"wiki_ingest_audit.jsonl entry references missing doc_id={e_doc}")
+        e_orig = entry.get("original_filepath")
+        if e_orig and not (root / str(e_orig)).is_file():
+            errors.append(f"wiki_ingest_audit.jsonl entry (doc_id={e_doc}) references missing original file={e_orig}")
+        e_img = entry.get("image_id")
+        if e_img and str(e_img) not in img_ref_ids:
+            errors.append(f"wiki_ingest_audit.jsonl entry (doc_id={e_doc}) references missing image_id={e_img}")
+        if has_rcpts and (e_doc or e_sha or e_req):
+            matched_rcpt = False
+            for r_req, r_doc, r_sha in receipt_keys:
+                if e_doc and r_doc != e_doc:
+                    continue
+                if e_sha and r_sha != e_sha:
+                    continue
+                if e_req and r_req != e_req:
+                    continue
+                matched_rcpt = True
+                break
+            if not matched_rcpt:
+                req_label = e_req if e_req else "(none)"
+                errors.append(
+                    f"wiki_ingest_audit.jsonl mismatch: request_id={req_label}, doc_id={e_doc}, "
+                    f"sha256={e_sha[:12]}... has no matching row in ingest_receipts"
+                )
+
+if errors:
+    for msg in errors[:10]:
+        print(f"ERROR: {msg}", file=sys.stderr)
+    if len(errors) > 10:
+        print(f"ERROR: ... and {len(errors) - 10} more Wiki consistency error(s).", file=sys.stderr)
+    sys.exit(1)
+'
+    if ! compose_cmd run --rm -T --no-deps --entrypoint /bin/sh research-host \
+        -c 'uv run --no-sync python -c "$1"' _ "$WIKI_VERIFY_PY"; then
+      err "Restored Wiki data volume failed post-restore integrity verification."
+      exit 1
+    fi
+    ok "Wiki data volume restored and verified."
+  else
+    warn "Backup includes wiki-data.tar.gz, but research-host service is not defined in Compose; skipping Wiki restore."
+  fi
+else
+  info "6/7 Skipping Wiki data volume restore."
+fi
+
+# Backfill missing research-host tokens in restored/existing .env before starting the stack
+# (pre-Batch-3a backups lack DALTON_RESEARCH_HOST_TOKEN / DALTON_RESEARCH_ADMIN_TOKEN).
+if compose_cmd config --services 2>/dev/null | grep -qx "research-host"; then
+  restored_rh_tokens="$(ensure_research_host_tokens "$ENV_FILE")"
+  if [[ -n "$restored_rh_tokens" ]]; then
+    ok "Generated missing research-host token(s) in ${ENV_FILE}: ${restored_rh_tokens} (existing values preserved)."
+  fi
 fi
 
 # Step 7: Start full stack and run unified health & schema checks

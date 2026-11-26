@@ -32,6 +32,7 @@ import {
 import { canShowDaltonHomeTeamMemoryCard } from './panels/dalton/DaltonHomeTeamMemoryCard';
 import { canShowDaltonInviteAdminCard } from './panels/dalton/DaltonInvitesCard';
 import { canShowDaltonFeishuScopesCard } from './panels/dalton/FeishuReadScopesCard';
+import { canShowDaltonWeixinBindCard } from './panels/dalton/weixinVisibility'; // DALTON-HOOK(weixin-multi-account)
 
 /** Discord channels card & search visibility: requires verified admin tier and channel_discord capability. */
 export function canShowDaltonDiscordChannelsCard(
@@ -50,6 +51,7 @@ export {
   canShowDaltonHomeTeamMemoryCard,
   canShowDaltonInviteAdminCard,
   canShowDaltonFeishuScopesCard,
+  canShowDaltonWeixinBindCard, // DALTON-HOOK(weixin-multi-account)
   type DaltonSettingVisibilityContext,
 };
 
@@ -290,9 +292,11 @@ export const SETTINGS = {
   daltonBudget: { section: 'budget', anchor: 'dalton-budget', labelKey: 'settings:dalton.budgetLabel', descKey: 'settings:dalton.budgetDesc', keywords: '预算 每日预算 花费上限 USD 额度 调额 daily budget spending limit' },
 
   // DALTON-HOOK(settings-section): personal messaging channels and push targets live together in Messaging & Channels
-  daltonNotifyTargets: { section: 'integrations', anchor: 'dalton-notify-targets', labelKey: 'settings:dalton.notifyTargetsLabel', descKey: 'settings:dalton.notifyTargetsDesc', keywords: '通知目标 飞书 Discord 自动推送 消息提醒 notify targets feishu discord 推送总开关 总开关 飞书提醒 推送开关', capability: ['channel_feishu', 'channel_discord'] },
+  // DALTON-HOOK(weixin-multi-account): include channel_weixin in notify targets capability gate
+  daltonNotifyTargets: { section: 'integrations', anchor: 'dalton-notify-targets', labelKey: 'settings:dalton.notifyTargetsLabel', descKey: 'settings:dalton.notifyTargetsDesc', keywords: '通知目标 飞书 Discord 微信 自动推送 消息提醒 notify targets feishu discord weixin wechat 推送总开关 总开关 飞书提醒 推送开关', capability: ['channel_feishu', 'channel_discord', 'channel_weixin'] },
   daltonChannelBindings: { section: 'integrations', anchor: 'dalton-channel-bindings', labelKey: 'settings:dalton.channelBindingsLabel', descKey: 'settings:dalton.channelBindingsDesc', keywords: '飞书 Discord 账号绑定 绑定码 私聊 机器人 bind code feishu discord account', capability: ['channel_feishu', 'channel_discord'] },
-  daltonWeixinBind: { section: 'integrations', anchor: 'dalton-weixin-bind', labelKey: 'settings:dalton.weixinBindLabel', descKey: 'settings:dalton.weixinBindDesc', keywords: '微信 我的微信 绑定 个人微信 wechat weixin bind', capability: 'channel_weixin' },
+  // DALTON-HOOK(weixin-multi-account): personal WeChat QR connection card gated by capability and external access policy
+  daltonWeixinBind: { section: 'integrations', anchor: 'dalton-weixin-bind', labelKey: 'settings:dalton.weixinBindLabel', descKey: 'settings:dalton.weixinBindDesc', keywords: '微信 我的微信 扫码 连接 个人微信 wechat weixin qr connect', capability: 'channel_weixin', visibleWhen: canShowDaltonWeixinBindCard },
   chatApps: { section: 'integrations', anchor: 'chat-apps', labelKey: 'settings:integrations.chatApps', descKey: 'settings:integrations.chatAppsDesc', visibleWhen: () => isPlatformMode },
   // DALTON-HOOK(settings-reorg): match runtime platform-only visibility in search & palette
   connectedApps: { section: 'integrations', anchor: 'connected-apps', labelKey: 'settings:integrations.connectedApps', descKey: 'settings:integrations.connectedAppsDesc', visibleWhen: () => isPlatformMode },
@@ -308,7 +312,8 @@ export const SETTINGS = {
   daltonFeishuScopes: { section: 'teamMembers', anchor: 'dalton-feishu-scopes', labelKey: 'settings:dalton.feishuScopesLabel', descKey: 'settings:dalton.feishuScopesDesc', keywords: '飞书读取权限 飞书授权 文档 知识库 多维表格 feishu read scopes', capability: 'feishu_docs', visibleWhen: canShowDaltonFeishuScopesCard },
 
   // DALTON-HOOK(standalone-core): gate team channel cards on respective channel capabilities
-  daltonWeixinBot: { section: 'teamChannels', anchor: 'dalton-weixin-bot', labelKey: 'settings:dalton.weixinBotLabel', descKey: 'settings:dalton.weixinBotDesc', keywords: '团队微信机器人 微信扫码 wechat bot qr', capability: 'channel_weixin', visibleWhen: (ctx) => ctx?.callerTier === 'admin' },
+  // DALTON-HOOK(weixin-multi-account): admin team WeChat channel management card
+  daltonWeixinBot: { section: 'teamChannels', anchor: 'dalton-weixin-bot', labelKey: 'settings:dalton.weixinBotLabel', descKey: 'settings:dalton.weixinBotDesc', keywords: '团队微信渠道管理 个人微信 微信接入 外部成员 槽位 代解除 wechat channel admin', capability: 'channel_weixin', visibleWhen: (ctx) => ctx?.callerTier === 'admin' },
   daltonFeishuGroups: { section: 'teamChannels', anchor: 'dalton-feishu-groups', labelKey: 'settings:dalton.feishuGroupsLabel', descKey: 'settings:dalton.feishuGroupsDesc', keywords: '飞书群 团队群 群聊绑定 feishu groups', capability: 'channel_feishu' },
   daltonDiscordChannels: { section: 'teamChannels', anchor: 'dalton-discord-channels', labelKey: 'settings:dalton.discordChannelsLabel', descKey: 'settings:dalton.discordChannelsDesc', keywords: 'Discord 频道 团队频道 群报告 频道绑定 discord channels', capability: 'channel_discord', visibleWhen: canShowDaltonDiscordChannelsCard },
   daltonSystemJobs: { section: 'teamChannels', anchor: 'dalton-system-jobs', labelKey: 'settings:dalton.systemJobsLabel', descKey: 'settings:dalton.systemJobsDesc', keywords: '自动巡检 团队公共任务 知识库同步 研报增量扫描 公司近况巡检 system jobs cron', capability: 'data_jobs' },
@@ -448,6 +453,10 @@ export function settingSearchText(
     const channelTokens: string[] = [];
     if (canFeishu) channelTokens.push('飞书 feishu 飞书提醒');
     if (canDiscord) channelTokens.push('Discord discord');
+    // DALTON-HOOK(weixin-multi-account): delegate WeChat search token gating to Dalton helper
+    if (entry.anchor === 'dalton-notify-targets' && canShowDaltonWeixinBindCard(ctx)) {
+      channelTokens.push('微信 weixin wechat');
+    }
     if (entry.anchor === 'dalton-channel-bindings') {
       if (canFeishu && !canDiscord) {
         descKey = 'settings:dalton.channelBindingsDescFeishu';

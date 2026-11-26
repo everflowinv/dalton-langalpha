@@ -24,8 +24,10 @@ export function IntegrationsPanel() {
   const copy = useSettingCopy();
   const linked = useLinkedChatApps();
   // DALTON-HOOK(standalone-core): gate personal channel cards on enabled channel capabilities
+  // DALTON-HOOK(weixin-multi-account): show personal notify targets when channel_weixin is enabled too
   const { hasCapability, isLoading: capsLoading } = useCapabilities();
-  const showNotifyAndBindings = hasCapability(['channel_feishu', 'channel_discord']);
+  const showNotifyTargets = hasCapability(['channel_feishu', 'channel_discord', 'channel_weixin']);
+  const showChannelBindings = hasCapability(['channel_feishu', 'channel_discord']);
   const showWeixinBind = hasCapability('channel_weixin');
   // iMessage depends on the deployment, so it shows once it is linked.
   const apps = MESSAGING_APPS.filter((app) => app !== 'imessage' || linked?.has(app));
@@ -38,8 +40,8 @@ export function IntegrationsPanel() {
   return (
     <>
       {/* DALTON-HOOK(settings-reorg): personal notify switches, channel bindings, and WeChat link */}
-      {showNotifyAndBindings && <DaltonNotifyTargetsCard />}
-      {showNotifyAndBindings && <DaltonChannelBindingsCard />}
+      {showNotifyTargets && <DaltonNotifyTargetsCard />}
+      {showChannelBindings && <DaltonChannelBindingsCard />}
       {showWeixinBind && <DaltonWeixinBindCard />}
 
       {isPlatformMode && (

@@ -653,7 +653,7 @@ class TestDataMapD046AndFiltering:
     ) -> None:
         _clean_env(monkeypatch, app_env="core")
 
-        # Live catalog routes are filtered out when researchdata_bridge is off
+        # Live catalog routes without enabled sub-sources are filtered out when researchdata_bridge is off
         live_routes = [
             {"id": "all", "category": "research"},
             {"id": "alphaengine", "category": "research"},
@@ -662,12 +662,32 @@ class TestDataMapD046AndFiltering:
             {"id": "custom-bridge-route", "category": "research"},
         ]
         assert map_builder.merge_catalog_routes(catalog_routes=live_routes) == []
-        assert map_builder.merge_catalog_routes(catalog_routes=None) == []
 
+        # Core default enables open-source company-wiki (and federated `all` over it) with zero proprietary text
+        default_core_routes = [r["id"] for r in map_builder.merge_catalog_routes(catalog_routes=None)]
+        assert default_core_routes == ["all", "company-wiki"]
+        rendered_static_default = map_builder.render_static_data_map_markdown(
+            team_memory_enabled=True,
+        )
+        _assert_zero_blacklist_hits(rendered_static_default, label="core default static data_map")
+        assert "### 1. 直接工具" in rendered_static_default
+        assert "### 2. 已启用的研究连接器" in rendered_static_default
+        assert "`company-wiki`" in rendered_static_default
+        assert "### 3. 明确没有的数据（切勿以为查过）" in rendered_static_default
+        assert "`conversation_search`" not in rendered_static_default
+        assert "`market_quotes`" in rendered_static_default
+        assert "`sec_filings`" in rendered_static_default
+        assert "未接通(期权链用get_options_chain)。" in rendered_static_default
+        assert "未接直连，切勿以为已核查。" in rendered_static_default
+
+        # When company_wiki is explicitly disabled in Core, no research connector routes remain
+        monkeypatch.setenv("DALTON_CAP_COMPANY_WIKI", "false")
+        assert map_builder.merge_catalog_routes(catalog_routes=live_routes) == []
+        assert map_builder.merge_catalog_routes(catalog_routes=None) == []
         rendered_static = map_builder.render_static_data_map_markdown(
             team_memory_enabled=True,
         )
-        _assert_zero_blacklist_hits(rendered_static, label="core static data_map")
+        _assert_zero_blacklist_hits(rendered_static, label="core no-wiki static data_map")
         assert "### 1. 直接工具" in rendered_static
         assert "### 2. 明确没有的数据（切勿以为查过）" in rendered_static
         assert "### 3. " not in rendered_static
@@ -676,6 +696,7 @@ class TestDataMapD046AndFiltering:
         assert "`sec_filings`" in rendered_static
         assert "未接通(期权链用get_options_chain)。" in rendered_static
         assert "未接直连，切勿以为已核查。" in rendered_static
+        monkeypatch.delenv("DALTON_CAP_COMPANY_WIKI", raising=False)
 
         # Partial capability: bridge + alphaengine only -> alt_data names ONLY alphaengine
         monkeypatch.setenv("DALTON_HOST_PLATFORM", "macos")

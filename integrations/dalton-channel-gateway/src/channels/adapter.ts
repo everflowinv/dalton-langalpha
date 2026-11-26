@@ -503,15 +503,18 @@ export interface ChannelAdapter {
     sessionKey?: string;
     loginVersion?: number;
     expectedBotGeneration?: number;
+    signal?: AbortSignal;
   }): Promise<WeixinQrStartResult>;
   waitQrLogin?(options: {
     userId: string;
     sessionKey: string;
+    signal?: AbortSignal;
   }): Promise<WeixinQrWaitResult>;
   submitVerifyCode?(options: {
     userId: string;
     sessionKey: string;
     code: string;
+    signal?: AbortSignal;
   }): Promise<WeixinQrWaitResult>;
 
   /**

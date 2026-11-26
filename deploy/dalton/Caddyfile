@@ -6,7 +6,7 @@
 }
 
 :8088 {
-	root * /srv
+	root * /srv-releases/current
 	encode zstd gzip
 
 	# Redact ?token=<jwt> in access logs (e.g. /ws/v1/market-data/aggregates/* handshake)
@@ -31,6 +31,19 @@
 		Referrer-Policy "strict-origin-when-cross-origin"
 		X-Frame-Options "SAMEORIGIN"
 		-Server
+	}
+
+	# 0a. Edge readiness probe (independent of frontend static files so deploy_main.sh
+	#     can confirm Caddy is serving the releases Caddyfile before switching web/releases/current).
+	@edge_health {
+		method GET HEAD
+		path /__edge_health
+	}
+	handle @edge_health {
+		header Content-Type "text/plain; charset=utf-8"
+		header Cache-Control "no-cache, no-store, must-revalidate"
+		header X-Dalton-Edge-Ready "releases-v1"
+		respond "dalton-edge-ok releases-v1" 200
 	}
 
 	# 0. History replay (/api/v1/threads/<id>/messages/replay) is a finite SSE

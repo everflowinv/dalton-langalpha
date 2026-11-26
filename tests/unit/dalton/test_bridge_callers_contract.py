@@ -41,7 +41,9 @@ COVERED_BRIDGE_CALLER_FILES: set[str] = {
     "src/dalton/autonomy/probes/cnhk.py",
     "plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py",
     "plugins/dalton/skills/dalton-stock-move/scripts/cn_price_fallback.py",
+    "plugins/dalton/skills/dalton-conventions/scripts/connector_transport.py",
     "src/dalton/data_map/health.py",
+    "src/dalton/research_host/federated.py",
 }
 
 DOCUMENTED_TOOLS_CALL_EXCEPTIONS: dict[str, str] = {
@@ -80,6 +82,10 @@ DOCUMENTED_TOOLS_CALL_EXCEPTIONS: dict[str, str] = {
     "scripts/dalton/research_runtime/skills/guidepoint-transcript-search/scripts/gp_search.py": (
         "Migrated OpenClaw guidepoint-transcript-search skill CLI inside research_runtime: forwards downstream "
         "MCP tools/call to the local Guidepoint proxy service rather than calling Dalton's HTTP bridge route contract."
+    ),
+    "scripts/dalton/research_runtime/host_connectors/guidepoint.py": (
+        "Commercial Guidepoint connector on dalton-research-host: calls vendor native Guidepoint MCP "
+        "(https://clapi.guidepoint.io/mcp-server/v1/mcp) with OAuth Bearer token rather than Dalton's HTTP bridge."
     ),
 }
 
@@ -497,3 +503,102 @@ def test_collect_source_failure_never_short_circuits_and_surfaces_status(
     pkt_md = (tmp_path / stdout_summary["packet_md"]).read_text(encoding="utf-8")
     assert "guidepoint 本轮取数失败" in pkt_md
     assert "（`short_circuit_eligible`）**：`false`" in pkt_md
+
+
+def test_connector_transport_legacy_fallback_matches_bridge_route_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify connector_transport.py legacy fallback calls conform to ROUTE_CONTRACT_SPECS."""
+    import importlib.util
+
+    ct_path = (
+        REPO_ROOT
+        / "plugins"
+        / "dalton"
+        / "skills"
+        / "dalton-conventions"
+        / "scripts"
+        / "connector_transport.py"
+    )
+    spec = importlib.util.spec_from_file_location("connector_transport_contract", ct_path)
+    assert spec is not None and spec.loader is not None
+    ct_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ct_mod)
+
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _capture_http(
+        bridge_url: str,
+        tool_name: str,
+        arguments: dict[str, Any],
+        timeout: int = 120,
+    ) -> dict[str, Any]:
+        del bridge_url, timeout
+        assert_valid_bridge_call(tool_name, arguments)
+        captured.append((tool_name, dict(arguments)))
+        return {"ok": True, "status": "ok", "data": {"ok": True, "results": []}}
+
+    monkeypatch.setenv("DALTON_RESEARCHDATA_URL", "http://127.0.0.1:8960/mcp")
+    monkeypatch.setattr(
+        ct_mod,
+        "_call_bridge_http",
+        create_autospec(ct_mod._call_bridge_http, side_effect=_capture_http),
+    )
+
+    assert ct_mod.call_sec_operation("list-filings", {"ticker": "NVDA", "limit": 2})["ok"] is True
+    assert ct_mod.call_macro_operation("fred", {"series": "DGS10", "start": "2026-01-01", "end": "2026-06-01", "limit": 5})["ok"] is True
+    assert ct_mod.call_macro_operation("tga", {"start": "2026-01-01", "end": "2026-06-01", "limit": 5})["ok"] is True
+    assert ct_mod.call_research_route("company-wiki", "search", {"query": "NVDA", "limit": 3})["ok"] is True
+
+    assert [t for t, _ in captured] == ["finance", "macro", "macro", "research"]
+    assert captured[1][1]["route"] == "fred"
+    assert captured[2][1]["route"] == "treasury"
+    assert captured[2][1]["dataset"] == "tga"
+
+
+@pytest.mark.asyncio
+async def test_federated_alphaengine_proxy_matches_bridge_route_contract() -> None:
+    """Verify LegacyBridgeAlphaEngineProxy sends a contract-compliant research/alphaengine tools/call."""
+    import httpx
+    from src.dalton.research_host.federated import LegacyBridgeAlphaEngineProxy
+
+    seen_bodies: list[dict[str, Any]] = []
+    seen_headers: list[dict[str, str]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content.decode("utf-8"))
+        seen_bodies.append(body)
+        seen_headers.append(dict(request.headers))
+        params = body["params"]
+        assert_valid_bridge_call(params["name"], params["arguments"])
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "structuredContent": {
+                        "ok": True,
+                        "status": "ok",
+                        "results": [{"document_id": "ae:1", "title": "NVDA"}],
+                    }
+                },
+            },
+        )
+
+    transport = httpx.MockTransport(_handler)
+
+    def _make_client(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs.pop("trust_env", None)
+        return httpx.AsyncClient(transport=transport, **kwargs)
+
+    proxy = LegacyBridgeAlphaEngineProxy(
+        bridge_mcp_url="http://127.0.0.1:8960/mcp",
+        bridge_token="bridge-secret-tok",
+        client_factory=_make_client,
+    )
+    res = await proxy.search("NVDA", "2026-01-01", "2026-06-01", 5, {"sort": "relevance"}, "user:alice")
+    assert res["ok"] is True
+    assert len(seen_bodies) == 1
+    assert seen_headers[0]["authorization"] == "Bearer bridge-secret-tok"
+    assert seen_headers[0]["x-dalton-caller-key"] == "user:alice"

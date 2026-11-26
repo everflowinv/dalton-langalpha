@@ -220,10 +220,12 @@ export interface Workspace {
   // DALTON-HOOK(colleague-access): read-only auto-publish pause flag & CAS token for PublishDialog
   auto_publish_paused?: boolean;
   auto_publish_pause_token?: string | null;
-  // DALTON-HOOK(workspace-dedup): coverage unit auto-registration outcome on create
+  // DALTON-HOOK(workspace-dedup): coverage unit auto-registration outcome and dedup availability warning on create
   coverage_unit?: Record<string, unknown> | null;
   coverage_unit_warning?: string | null;
   coverage_unit_warning_detail?: CoverageUnitWarningDetail | null;
+  dedup_warning?: string | null;
+  dedup_warning_code?: string | null;
   [key: string]: unknown;
 }
 

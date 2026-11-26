@@ -287,14 +287,32 @@ async def fetch_conversation_archive_stats(
     }
 
 
+def data_map_cache_fingerprint(
+    capabilities: Any = None,
+) -> str:
+    """Compute transport-aware data-map cache fingerprint.
+
+    Keeps ``capabilities_fingerprint()`` unchanged for Standalone Core and
+    pre-cutover Everflow, and appends a transport discriminator (``:b3``) only
+    when Everflow activates Batch 3 dedicated connectors so pre-cutover and
+    post-cutover Everflow data maps never collide in
+    ``dalton_data_map_scoped_cache``.
+    """
+    from src.dalton.capabilities import capabilities_fingerprint, is_batch3_connectors_enabled
+    from src.dalton.profile import DeploymentProfile, resolve_profile
+
+    base = capabilities_fingerprint(capabilities)
+    if resolve_profile() is not DeploymentProfile.CORE and is_batch3_connectors_enabled():
+        return f"{base}:b3"
+    return base
+
+
 def _resolve_cache_fingerprint(fingerprint: str | None) -> str:
     if fingerprint is not None:
         cleaned = str(fingerprint).strip()
         if cleaned:
             return cleaned
-    from src.dalton.capabilities import capabilities_fingerprint
-
-    return capabilities_fingerprint()
+    return data_map_cache_fingerprint()
 
 
 async def get_cached_data_map(

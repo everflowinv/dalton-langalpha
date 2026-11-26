@@ -11,7 +11,14 @@ handoff_filtered_routes:
 
 catalog_routes:
   all:
-    capability: researchdata_bridge
+    capability: null
+    any_capability:
+      - company_wiki
+      - sales_notes
+      - tmtb
+      - funda_ai
+      - guidepoint
+      - alphaengine
     category: research
     title: 跨库初筛
     rules: "四库+AE+GP,不含transcript"

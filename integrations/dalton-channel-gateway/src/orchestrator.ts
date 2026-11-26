@@ -39,6 +39,7 @@ import {
 import {
   type CollectedChartLayerRef,
   type CollectedHtmlWidgetRef,
+  type PendingChartDeliveryReceipt,
   chartLayerCompositeKey,
   collectPublishedChartLayers,
   collectReportSourceChartLayers,
@@ -208,6 +209,7 @@ function confirmationFields(value: object): {
 /** Chinese names for the actions that only the web app can confirm. */
 const WEB_ONLY_ACTION_LABELS: Record<string, string> = {
   create_workspace: "新建工作区",
+  archive_workspace: "归档工作区",
   delete_workspace: "删除工作区",
   delete_thread: "删除对话",
   ptc_agent: "把任务交给工作区分析师",
@@ -391,6 +393,10 @@ export class ChannelGatewayOrchestrator {
   private readonly inFlightChartSettlements = new Map<
     string,
     Promise<boolean>
+  >();
+  private readonly pendingChartReceipts = new Map<
+    string,
+    PendingChartDeliveryReceipt
   >();
   private static readonly MAX_SETTLED_DELIVERABLE_KEYS = 2_000;
   private readonly logger = createSubsystemLogger("orchestrator");
@@ -10906,6 +10912,7 @@ export class ChannelGatewayOrchestrator {
         initialSnapshots: params.initialSnapshots,
         widgets: params.widgets,
         outboundBlocked: params.outboundBlocked,
+        pendingReceipts: this.pendingChartReceipts,
         nowFn: this.nowFn,
       });
       if (res.settled) {

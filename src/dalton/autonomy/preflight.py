@@ -283,6 +283,8 @@ class PreflightResult:
     wake_context: Optional[str] = None
     # Probe names still unfinished when a company-watch preflight times out.
     incomplete_probes: list[str] = field(default_factory=list)
+    # Probe/source names unavailable or errored during this preflight run.
+    degraded_sources: list[str] = field(default_factory=list)
 
     @property
     def skip(self) -> bool:
@@ -292,6 +294,10 @@ class PreflightResult:
     def summary(self) -> str:
         if self.signals:
             return "; ".join(str(s.get("summary") or "") for s in self.signals[:3])
+        if self.reason == "sources_degraded" and self.degraded_sources:
+            return f"sources_degraded: {', '.join(self.degraded_sources)}"
+        if self.reason == "preflight_timeout" and self.incomplete_probes:
+            return f"preflight_timeout: {', '.join(self.incomplete_probes)}"
         return str(self.reason or self.decision)
 
     @property
@@ -769,6 +775,32 @@ def _note_probe_not_succeeded(progress: Optional[dict[str, Any]]) -> None:
     """A backed-off or failed probe did not finish a real request."""
     if isinstance(progress, dict):
         progress["probes_all_succeeded"] = False
+
+
+def _note_probe_degraded(progress: Optional[dict[str, Any]], probe_name: str) -> None:
+    """Record a probe whose data source was unavailable or errored in this run."""
+    if not isinstance(progress, dict) or not probe_name:
+        return
+    degraded = progress.get("degraded_sources")
+    if not isinstance(degraded, list):
+        degraded = []
+        progress["degraded_sources"] = degraded
+    if probe_name not in degraded:
+        degraded.append(probe_name)
+
+
+def _degraded_sources_of(progress: Optional[dict[str, Any]]) -> list[str]:
+    if not isinstance(progress, dict):
+        return []
+    raw = progress.get("degraded_sources")
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        name = str(item or "").strip()
+        if name and name not in out:
+            out.append(name)
+    return out
 
 
 def _restore_seen_watermarks(state: dict[str, Any], prior: dict[str, Any]) -> dict[str, Any]:
@@ -1291,6 +1323,9 @@ async def _conclude_preflight(
     candidate_signals = effective_candidates
 
     if not candidate_signals:
+        degraded_sources = _degraded_sources_of(probe_progress)
+        skip_reason = "sources_degraded" if degraded_sources else "no_new_signals"
+        log_signals = [{"degraded_sources": degraded_sources}] if degraded_sources else []
         if persist and not _wake_already_committed(probe_progress):
             try:
                 await watch_db.insert_preflight_log(
@@ -1298,17 +1333,18 @@ async def _conclude_preflight(
                     automation_execution_id=execution_id,
                     workspace_id=workspace_id,
                     decision="skip",
-                    reason="no_new_signals",
-                    signals=[],
+                    reason=skip_reason,
+                    signals=log_signals,
                 )
             except Exception as e:
                 logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
         return PreflightResult(
             should_wake=False,
             decision="skip",
-            reason="no_new_signals",
+            reason=skip_reason,
             signals=[],
             wake_context=None,
+            degraded_sources=degraded_sources,
         )
 
     # Split into direct-wake signals and LLM-triage signals (G4.3)
@@ -2027,6 +2063,7 @@ async def _preflight_check_inner(
                 name,
                 nb_iso,
             )
+            _note_probe_degraded(probe_progress, "agenda")
         else:
             try:
                 sigs, state = await probe_agenda(
@@ -2045,6 +2082,7 @@ async def _preflight_check_inner(
                     err,
                 )
                 state = record_probe_backoff(state, "agenda", str(err))
+                _note_probe_degraded(probe_progress, "agenda")
     else:
         # Company watch: due items and the earnings date first, then SEC / CN-HK.
         # Network probes still run after a due item. The one claim is the
@@ -2126,6 +2164,7 @@ async def _preflight_check_inner(
                     nb_iso,
                 )
                 _note_probe_not_succeeded(probe_progress)
+                _note_probe_degraded(probe_progress, probe_name)
                 _mark_probe_done(probe_progress, probe_name)
                 return
             prior_state = dict(state)
@@ -2134,14 +2173,21 @@ async def _preflight_check_inner(
                 if probe_name == "cnhk" and state.get("cnhk_probe_degraded"):
                     state = record_probe_backoff(state, probe_name, "cnhk_probe_degraded")
                     _note_probe_not_succeeded(probe_progress)
+                    _note_probe_degraded(probe_progress, probe_name)
                 else:
                     state = clear_probe_backoff(state, probe_name)
                 # Only the probe that just returned. A flag this run cleared
                 # stays false and does not block the streak reset.
                 if probe_name == "sec" and state.get("sec_probe_degraded") is True:
                     _note_probe_not_succeeded(probe_progress)
-                if probe_name == "cnhk" and state.get("cnhk_probe_partial") is True:
+                    _note_probe_degraded(probe_progress, probe_name)
+                if probe_name == "cnhk" and (
+                    state.get("cnhk_probe_partial") is True
+                    or state.get("cnhk_probe_truncated_this_run") is True
+                    or bool(state.get("cnhk_probe_unresolved_truncated_dates"))
+                ):
                     _note_probe_not_succeeded(probe_progress)
+                    _note_probe_degraded(probe_progress, probe_name)
                 emitted.extend(sigs)
                 if commit_seen:
                     committed = await _commit_network_probe_signals(
@@ -2164,6 +2210,7 @@ async def _preflight_check_inner(
                 )
                 state = record_probe_backoff(state, probe_name, str(err))
                 _note_probe_not_succeeded(probe_progress)
+                _note_probe_degraded(probe_progress, probe_name)
                 _mark_probe_done(probe_progress, probe_name)
 
         for probe_name, runner in local_runners:

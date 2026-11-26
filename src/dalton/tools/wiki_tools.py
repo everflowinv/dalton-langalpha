@@ -445,8 +445,14 @@ async def _read_workspace_file_safely(
 
 
 async def call_bridge_wiki_ingest(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-    """POST `payload` to `{bridge_url}/wiki/ingest` authenticated with `DALTON_BRIDGE_ADMIN_TOKEN`."""
+    """POST `payload` to research-host `/ingest/wiki` (or legacy bridge `/wiki/ingest` before Everflow cutover)."""
     from src.dalton.capabilities import CapabilityId, has_capability
+    from src.dalton.profile import DeploymentProfile, resolve_profile
+    from src.dalton.settings import (
+        get_dalton_research_admin_token,
+        get_dalton_research_host_base_url,
+        has_explicit_research_host_url,
+    )
 
     if not has_capability(CapabilityId.COMPANY_WIKI):
         return 503, {
@@ -454,31 +460,60 @@ async def call_bridge_wiki_ingest(payload: dict[str, Any]) -> tuple[int, dict[st
             "status": "capability_disabled",
             "error": "company_wiki capability is disabled.",
         }
-    bridge_url = get_dalton_bridge_base_url().rstrip("/")
-    if not bridge_url:
-        return 503, {
-            "ok": False,
-            "status": "config_error",
-            "error": "researchdata bridge URL is not configured on backend.",
+
+    use_research_host = (
+        has_explicit_research_host_url()
+        or resolve_profile() is DeploymentProfile.CORE
+        or not has_capability(CapabilityId.RESEARCHDATA_BRIDGE)
+    )
+    if use_research_host:
+        host_url = get_dalton_research_host_base_url().rstrip("/")
+        if not host_url:
+            return 503, {
+                "ok": False,
+                "status": "config_error",
+                "error": "research-host URL is not configured on backend.",
+            }
+        admin_token = get_dalton_research_admin_token()
+        if not admin_token:
+            return 500, {
+                "ok": False,
+                "status": "config_error",
+                "error": "DALTON_RESEARCH_ADMIN_TOKEN is not configured on backend.",
+            }
+        target_url = f"{host_url}/ingest/wiki"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {admin_token}",
+            "X-Dalton-Research-Admin-Token": admin_token,
         }
-    admin_token = get_dalton_bridge_admin_token()
-    if not admin_token:
-        return 500, {
-            "ok": False,
-            "status": "config_error",
-            "error": "DALTON_BRIDGE_ADMIN_TOKEN is not configured on backend.",
+    else:
+        bridge_url = get_dalton_bridge_base_url().rstrip("/")
+        if not bridge_url:
+            return 503, {
+                "ok": False,
+                "status": "config_error",
+                "error": "researchdata bridge URL is not configured on backend.",
+            }
+        admin_token = get_dalton_bridge_admin_token()
+        if not admin_token:
+            return 500, {
+                "ok": False,
+                "status": "config_error",
+                "error": "DALTON_BRIDGE_ADMIN_TOKEN is not configured on backend.",
+            }
+        target_url = f"{bridge_url}/wiki/ingest"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {admin_token}",
+            "X-Dalton-Bridge-Token": admin_token,
         }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {admin_token}",
-        "X-Dalton-Bridge-Token": admin_token,
-    }
     async with httpx.AsyncClient(
         timeout=WIKI_INGEST_HTTP_TIMEOUT_S,
         trust_env=False,
     ) as client:
         resp = await client.post(
-            f"{bridge_url}/wiki/ingest",
+            target_url,
             json=payload,
             headers=headers,
         )
@@ -490,7 +525,11 @@ async def call_bridge_wiki_ingest(payload: dict[str, Any]) -> tuple[int, dict[st
             data = {
                 "ok": False,
                 "status": "http_error",
-                "error": f"Bridge returned HTTP {resp.status_code}",
+                "error": (
+                    f"Ingest service returned HTTP {resp.status_code}"
+                    if use_research_host
+                    else f"Bridge returned HTTP {resp.status_code}"
+                ),
             }
         return resp.status_code, data
 

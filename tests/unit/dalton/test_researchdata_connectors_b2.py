@@ -865,6 +865,8 @@ def test_backend_settings_resolve_connector_env_defaults_and_secret_redaction(
 ) -> None:
     assert dalton_settings.resolve_connector_env_defaults(DeploymentProfile.CORE) == {
         "DALTON_TRANSCRIPTION_SERVICE_URL": "http://transcription:8965",
+        "DALTON_RESEARCH_HOST_URL": "http://research-host:8951",
+        "DALTON_RESEARCH_HOST_BASE_URL": "http://research-host:8951",
     }
     assert dalton_settings.resolve_connector_env_defaults(DeploymentProfile.EVERFLOW) == {
         "DALTON_TRANSCRIPTION_SERVICE_URL": "http://host.docker.internal:8960",

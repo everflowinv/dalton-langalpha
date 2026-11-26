@@ -244,7 +244,142 @@ class FeedDaemon:
         with self._state_lock:
             fstate_snap = dict(self.state[market])
 
-        # Calendar error must be reported & pushed BEFORE skipping collection.
+        def _parse_ts(raw: Any) -> datetime | None:
+            if not raw:
+                return None
+            s = str(raw).strip()
+            if not s:
+                return None
+            try:
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=cur_local.tzinfo)
+            return dt
+
+        def _is_stale_conflict_error(exc: Exception) -> bool:
+            status_code = getattr(exc, "status_code", None)
+            if status_code == 409:
+                return True
+            resp_obj = getattr(exc, "response", None)
+            if getattr(resp_obj, "status_code", None) == 409:
+                return True
+            msg = str(exc)
+            return "(HTTP 409)" in msg or "HTTP 409" in msg
+
+        def _has_newer_or_equal_pending(state_view: dict[str, Any]) -> dict[str, Any] | None:
+            cur_pending = state_view.get("pending_push")
+            if not (isinstance(cur_pending, dict) and isinstance(cur_pending.get("payload"), dict)):
+                return None
+            p_payload = cur_pending["payload"]
+            p_ts = _parse_ts(
+                cur_pending.get("as_of") or p_payload.get("as_of_iso") or p_payload.get("as_of")
+            )
+            lg_payload = state_view.get("last_good_payload") or {}
+            lg_ts = (
+                _parse_ts(lg_payload.get("as_of_iso") or lg_payload.get("as_of"))
+                if isinstance(lg_payload, dict)
+                else None
+            )
+            if lg_ts is None or p_ts is None or p_ts >= lg_ts:
+                return cur_pending
+            return None
+
+        def _retry_pending(
+            pending: dict[str, Any],
+            *,
+            action_on_ok: str = "retried_push",
+            extra_result: dict[str, Any] | None = None,
+        ) -> dict[str, Any]:
+            p_slug = str(pending.get("slug") or slug)
+            p_key = str(pending.get("data_key") or data_key)
+            p_payload = pending["payload"]
+            p_as_of = pending.get("as_of") or p_payload.get("as_of_iso") or cur_iso
+            try:
+                self._push(
+                    p_slug,
+                    p_key,
+                    p_payload,
+                    as_of=p_as_of,
+                    backend_url=self.backend_url,
+                )
+            except Exception as retry_exc:
+                if _is_stale_conflict_error(retry_exc):
+                    logger.info(
+                        "Pending push for %s/%s superseded on server (HTTP 409); clearing stale pending_push: %s",
+                        p_slug,
+                        p_key,
+                        retry_exc,
+                    )
+                    with self._state_lock:
+                        self.state[market].pop("pending_push", None)
+                    self._save_state()
+                    stale_res: dict[str, Any] = {
+                        "market": market,
+                        "action": "stale_pending_cleared",
+                        "stale": False,
+                        "error": str(retry_exc),
+                    }
+                    if extra_result:
+                        stale_res.update(extra_result)
+                    return stale_res
+                logger.warning("Pending push retry failed for %s/%s: %s", p_slug, p_key, retry_exc)
+                with self._state_lock:
+                    updated_pending = dict(pending)
+                    updated_pending["failed_at"] = cur_iso
+                    updated_pending["attempts"] = int(updated_pending.get("attempts") or 1) + 1
+                    self.state[market]["pending_push"] = updated_pending
+                self._save_state()
+                res: dict[str, Any] = {
+                    "market": market,
+                    "action": "retry_push_failed",
+                    "stale": bool(p_payload.get("stale")),
+                    "error": str(retry_exc),
+                }
+                if extra_result:
+                    res.update(extra_result)
+                return res
+            p_stale = bool(p_payload.get("stale"))
+            p_trade_date = str(pending.get("trade_date") or trade_date)
+            p_daily_sig = str(pending.get("current_daily_sig") or "")
+            with self._state_lock:
+                self.state[market].pop("pending_push", None)
+                if market == "hk" and p_daily_sig:
+                    self.state[market]["last_hk_daily_sig"] = p_daily_sig
+                if pending.get("is_closed_td") and not pending.get("in_window") and not p_stale:
+                    if pending.get("needs_post_close"):
+                        self.state[market]["post_close_written_date"] = p_trade_date
+                    sc = p_payload.get("smallcap") or {}
+                    ng = p_payload.get("nonggt") or {}
+                    pushed_daily_date = (
+                        p_payload.get("daily_close_date")
+                        or p_payload.get("trade_date")
+                        or p_trade_date
+                    )
+                    if (
+                        market == "hk"
+                        and isinstance(sc, dict)
+                        and isinstance(ng, dict)
+                        and sc.get("source") == "daily_close"
+                        and ng.get("source") == "daily_close"
+                        and pushed_daily_date == p_trade_date
+                        and not self._hk_daily_is_stale_or_failed()
+                    ):
+                        self.state[market]["post_close_daily_synced_date"] = p_trade_date
+            self._save_state()
+            ok_res: dict[str, Any] = {
+                "market": market,
+                "action": action_on_ok,
+                "stale": p_stale,
+                "as_of": p_payload.get("as_of"),
+            }
+            if extra_result:
+                ok_res.update(extra_result)
+            return ok_res
+
+        # Calendar error must be reported & pushed BEFORE skipping collection,
+        # while preserving any newer unpushed pending snapshot instead of stamping last_good_payload.
         if sess.get("calendar_error"):
             cal_st = make_source_result(
                 "calendar",
@@ -255,6 +390,13 @@ class FeedDaemon:
             )
             daemon_store = SourceStatusStore(self.daemon_state_dir, filename=f"{market}_daemon_status.json")
             status_doc = daemon_store.update_sources([cal_st], required=["calendar"], now_str=f"{cur_str} 北京时间")
+            newer_pending = _has_newer_or_equal_pending(fstate_snap)
+            if newer_pending is not None:
+                return _retry_pending(
+                    newer_pending,
+                    action_on_ok="retried_push",
+                    extra_result={"calendar_error": str(sess["calendar_error"])},
+                )
             payload = dict(fstate_snap.get("last_good_payload") or {})
             merged_sources = dict(payload.get("sources") or {})
             merged_sources.update(status_doc["sources"])
@@ -283,12 +425,30 @@ class FeedDaemon:
                 )
             except Exception as exc:
                 logger.warning("Calendar error push failed for %s/%s: %s", slug, data_key, exc)
+                with self._state_lock:
+                    self.state[market]["pending_push"] = {
+                        "slug": slug,
+                        "data_key": data_key,
+                        "payload": payload,
+                        "as_of": cur_iso,
+                        "trade_date": trade_date,
+                        "in_window": False,
+                        "is_closed_td": False,
+                        "needs_post_close": False,
+                        "current_daily_sig": "",
+                        "failed_at": cur_iso,
+                        "attempts": 1,
+                    }
+                self._save_state()
                 return {
                     "market": market,
                     "action": "push_failed",
                     "stale": True,
                     "error": str(exc),
                 }
+            with self._state_lock:
+                self.state[market].pop("pending_push", None)
+            self._save_state()
             return {
                 "market": market,
                 "action": "calendar_error",
@@ -311,13 +471,18 @@ class FeedDaemon:
             and bool(current_daily_sig)
             and current_daily_sig != fstate_snap.get("last_hk_daily_sig")
         )
-        if (
-            not force
-            and not in_window
-            and not needs_post_close
-            and not needs_hk_daily_sync
-            and not daily_state_changed
-        ):
+        should_collect = bool(
+            force
+            or in_window
+            or needs_post_close
+            or needs_hk_daily_sync
+            or daily_state_changed
+        )
+
+        pending_push = fstate_snap.get("pending_push")
+        if not should_collect:
+            if isinstance(pending_push, dict) and isinstance(pending_push.get("payload"), dict):
+                return _retry_pending(pending_push)
             return {"market": market, "action": "skip", "status": sess["status"]}
 
         daemon_store = SourceStatusStore(self.daemon_state_dir, filename=f"{market}_daemon_status.json")
@@ -342,6 +507,15 @@ class FeedDaemon:
             status_doc = daemon_store.update_sources(
                 [daemon_err_st], required=[f"{market}_collector"], now_str=f"{cur_str} 北京时间"
             )
+            newer_pending = _has_newer_or_equal_pending(fstate_cur)
+            if newer_pending is not None:
+                # Never overwrite a newer unpushed pending snapshot with an older last_good_payload
+                # stamped with a synthetic cur_iso. Retry the pending snapshot directly instead.
+                return _retry_pending(
+                    newer_pending,
+                    action_on_ok="retried_push",
+                    extra_result={"collect_error": str(exc)},
+                )
             payload = dict(fstate_cur.get("last_good_payload") or {})
             merged_sources = dict(payload.get("sources") or {})
             merged_sources.update(status_doc["sources"])
@@ -385,16 +559,31 @@ class FeedDaemon:
                 elif not payload.get("last_success_at") and self.state[market].get("last_success_at"):
                     payload["last_success_at"] = self.state[market]["last_success_at"]
 
+        push_as_of = payload.get("as_of_iso") or cur_iso
         try:
             self._push(
                 slug,
                 data_key,
                 payload,
-                as_of=payload.get("as_of_iso") or cur_iso,
+                as_of=push_as_of,
                 backend_url=self.backend_url,
             )
         except Exception as exc:
             logger.warning("Push failed for %s/%s: %s", slug, data_key, exc)
+            with self._state_lock:
+                self.state[market]["pending_push"] = {
+                    "slug": slug,
+                    "data_key": data_key,
+                    "payload": payload,
+                    "as_of": push_as_of,
+                    "trade_date": trade_date,
+                    "in_window": in_window,
+                    "is_closed_td": is_closed_td,
+                    "needs_post_close": needs_post_close,
+                    "current_daily_sig": current_daily_sig,
+                    "failed_at": cur_iso,
+                    "attempts": 1,
+                }
             self._save_state()
             return {
                 "market": market,
@@ -405,6 +594,7 @@ class FeedDaemon:
 
         is_stale = bool(payload.get("stale"))
         with self._state_lock:
+            self.state[market].pop("pending_push", None)
             if market == "hk" and current_daily_sig:
                 self.state[market]["last_hk_daily_sig"] = current_daily_sig
             if is_closed_td and not in_window and not is_stale:
@@ -460,6 +650,8 @@ class FeedDaemon:
         trade_date = str(sess["trade_date"])
         with self._state_lock:
             fstate = dict(self.state[market])
+        if isinstance(fstate.get("pending_push"), dict):
+            return self._aligned_interval_wait(cur)
         if sess["is_trading_day"] and sess["status"] == "closed":
             if fstate.get("post_close_written_date") != trade_date:
                 return self._aligned_interval_wait(cur)

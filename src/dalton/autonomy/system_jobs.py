@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 import json
 import logging
 import os
@@ -47,6 +47,8 @@ from src.dalton.data_jobs.manifest import (
 )
 from src.dalton.llm.model_prefs import (
     DALTON_NOTIFY_ROUTES_KEY,
+    is_dalton_weixin_user_target,
+    load_bound_dm_targets,
     run_with_feishu_group_prefetch,
     validate_dalton_model_preferences,
     validate_dalton_notify_routes_for_user,
@@ -1683,6 +1685,47 @@ async def record_auto_pruned_data_task_routes(
             )
 
 
+async def _validate_data_task_weixin_route_change(
+    *,
+    actor_uid: str,
+    pm_user_id: str,
+    old_routes: Sequence[str],
+    new_routes: Sequence[str],
+    conn: Any,
+) -> set[str] | None:
+    """Enforce PM-only WeChat route changes and active binding checks for public data tasks.
+
+    Returns ``bound_dm_targets`` when loaded (so callers can pass it directly to
+    ``validate_dalton_model_preferences``), or ``None`` when no WeChat targets
+    are involved.
+    """
+    old_wx_set = {
+        t.strip()
+        for t in old_routes
+        if isinstance(t, str) and is_dalton_weixin_user_target(t)
+    }
+    new_wx_set = {
+        t.strip()
+        for t in new_routes
+        if isinstance(t, str) and is_dalton_weixin_user_target(t)
+    }
+    if new_wx_set != old_wx_set and actor_uid != pm_user_id:
+        raise PermissionError(
+            "公共数据任务的个人微信推送目标仅可由首位管理员本人配置"
+        )
+    if not (old_wx_set or new_wx_set):
+        return None
+    bound_dm_targets = await load_bound_dm_targets(pm_user_id, conn=conn)
+    added_wx = new_wx_set - old_wx_set
+    if added_wx:
+        unbound = sorted(t for t in added_wx if t not in bound_dm_targets)
+        if unbound:
+            raise ValueError(
+                f"个人微信推送目标仅支持本人当前已连接的微信账号，未绑定或已失效：{', '.join(unbound)}"
+            )
+    return bound_dm_targets
+
+
 async def rollback_data_task_config(
     actor_user_id: str,
     job_key: str,
@@ -1802,18 +1845,29 @@ async def rollback_data_task_config(
                     for x in raw_row_routes
                     if isinstance(x, str) and str(x).strip()
                 ] if isinstance(raw_row_routes, list) else []
-            elif target in stored_routes_map:
-                old_routes = stored_routes_map[target]
-            elif isinstance(active_snap, Mapping) and isinstance(
-                active_snap.get("notify_routes"), list
-            ):
-                old_routes = [
-                    str(x).strip()
-                    for x in active_snap["notify_routes"]
-                    if isinstance(x, str) and str(x).strip()
-                ]
+                current_routes_for_wx = old_routes
             else:
-                old_routes = []
+                current_routes_for_wx = stored_routes_map.get(target, [])
+                if target in stored_routes_map:
+                    old_routes = stored_routes_map[target]
+                elif isinstance(active_snap, Mapping) and isinstance(
+                    active_snap.get("notify_routes"), list
+                ):
+                    old_routes = [
+                        str(x).strip()
+                        for x in active_snap["notify_routes"]
+                        if isinstance(x, str) and str(x).strip()
+                    ]
+                else:
+                    old_routes = []
+
+            await _validate_data_task_weixin_route_change(
+                actor_uid=actor_uid,
+                pm_user_id=pm_user_id,
+                old_routes=current_routes_for_wx,
+                new_routes=restored_routes,
+                conn=conn,
+            )
 
             rollback_changes: dict[str, Any] = {
                 "enabled": {"old": old_enabled, "new": restored_enabled},
@@ -2614,6 +2668,22 @@ async def toggle_system_job(
                     else {}
                 )
                 if notify_routes is not None:
+                    stored_route_entries = (
+                        stored_routes_raw.get(route_key)
+                        if isinstance(stored_routes_raw, Mapping)
+                        else None
+                    )
+                    bound_dm_targets = await _validate_data_task_weixin_route_change(
+                        actor_uid=actor_uid,
+                        pm_user_id=pm_user_id,
+                        old_routes=(
+                            stored_route_entries
+                            if isinstance(stored_route_entries, list)
+                            else []
+                        ),
+                        new_routes=notify_routes,
+                        conn=conn,
+                    )
                     patch_model_pref: dict[str, Any] = {
                         DALTON_NOTIFY_ROUTES_KEY: {route_key: list(notify_routes)}
                     }
@@ -2625,6 +2695,7 @@ async def toggle_system_job(
                                 **patch_model_pref,
                             },
                             stored_model_preference=locked_model_pref,
+                            bound_dm_targets=bound_dm_targets,
                         )
                     except TuningError as exc:
                         raise ValueError(str(exc)) from exc

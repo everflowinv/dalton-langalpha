@@ -5,13 +5,15 @@ Mounted under `/api/v1/dalton` via `src/dalton/app/router.py`.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qsl, urlparse
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -38,6 +40,7 @@ from src.dalton.database.channel_gateway import (
     recover_channel_state,
     register_and_resolve_inbound,
     register_automation_run,
+    resolve_authorized_automation_run_platforms,
     update_delivery_progress,
     update_inbound_progress,
     update_user_channel_settings,
@@ -46,7 +49,7 @@ from src.dalton.database.channel_gateway import (
 from src.dalton.database import weixin_multi_account as wx_db
 from src.dalton.database.weixin_multi_account import StaleGatewayEpochError
 from src.dalton.settings import redact_weixin_secrets
-from src.server.utils.api import CurrentUserId
+from src.server.utils.api import CurrentUserId, ServiceUserId
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +244,9 @@ class TopicsLookupRequest(BaseModel):
     external_topic_id: str | None = None
     canonical_scope_key: str | None = None
     root_message_id: str | None = None
+    initiator_platform_user_id: str | None = None
+    pending_limit: int | None = Field(default=None, ge=1)
+    pending_offset: int = Field(default=0, ge=0)
 
 
 class InboundRegisterResolveRequest(BaseModel):
@@ -459,6 +465,7 @@ _WEIXIN_QR_PUBLIC_WHITELIST: tuple[str, ...] = (
     "qrcode_img_content",
     "expires_at",
     "account_id",
+    "account_status",
     "ilink_bot_id",
     "ilink_user_id",
     "masked_ilink_user_id",
@@ -535,6 +542,12 @@ def _shape_public_weixin_qr_response(raw: dict[str, Any]) -> dict[str, Any]:
             out[key] = redact_weixin_secrets(val)
         else:
             out[key] = val
+    if (
+        out.get("status") == "confirmed"
+        and "pending_verification" not in out
+        and out.get("account_status") in ("active", "pending_verification")
+    ):
+        out["pending_verification"] = out.get("account_status") == "pending_verification"
     return out
 
 
@@ -824,6 +837,9 @@ async def internal_topics_lookup_endpoint(
             external_topic_id=body.external_topic_id,
             canonical_scope_key=body.canonical_scope_key,
             root_message_id=body.root_message_id,
+            initiator_platform_user_id=body.initiator_platform_user_id,
+            pending_limit=body.pending_limit,
+            pending_offset=body.pending_offset,
         )
     except HTTPException as exc:
         return _handle_structured_http_error(exc)
@@ -924,6 +940,240 @@ async def internal_snapshots_download_endpoint(
                 "Content-Disposition": f"inline; filename*=UTF-8''{encoded_name}",
                 "Cache-Control": "no-store",
             },
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.get(
+    "/internal/threads/{thread_id}/runs/{run_id}/replay",
+)
+async def internal_thread_run_replay_endpoint(
+    thread_id: str,
+    run_id: str,
+    x_user_id: ServiceUserId,
+    execution_id: str | None = Query(default=None),
+    source: Literal["auto", "checkpoint"] = Query(default="auto"),
+) -> Any:
+    """Read-only SSE replay of a single target turn addressed directly by ``run_id``.
+
+    Enforces account admission via ``ServiceUserId``, platform sub-capability checks
+    resolved from authorized automation targets, and the same thread ownership /
+    shared-workspace read checks as ``GET /api/v1/threads/{thread_id}/messages/replay``.
+    Never writes back replay caches (``persist=False``).
+    """
+    from src.server.database.conversation.replay_rows import get_replay_thread_data
+    from src.server.database.pool import DATABASE_UNAVAILABLE
+    from src.server.database.shared_workspaces import is_holder
+    from src.server.services.history.replay import (
+        CheckpointReplayUnavailable,
+        finish_lines,
+        read_replay_page,
+    )
+    from src.server.services.shared_workspaces.access import thread_access
+    from src.server.services.shared_workspaces.viewer import name_turn_senders
+    from src.server.utils.api import database_unavailable
+
+    cleaned_run_id = str(run_id or "").strip()
+    if not cleaned_run_id:
+        raise HTTPException(status_code=400, detail="run_id is required")
+
+    try:
+        authorized_platforms = await resolve_authorized_automation_run_platforms(
+            thread_id=thread_id,
+            run_id=cleaned_run_id,
+            user_id=x_user_id,
+            execution_id=execution_id,
+        )
+        if not authorized_platforms:
+            raise HTTPException(
+                status_code=403,
+                detail="No authorized channel automation target for this run",
+            )
+        enabled_platform_found = False
+        last_cap_exc: HTTPException | None = None
+        for plat in authorized_platforms:
+            try:
+                require_channel_platform_capability(plat)
+                enabled_platform_found = True
+                break
+            except HTTPException as exc:
+                last_cap_exc = exc
+        if not enabled_platform_found:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    last_cap_exc.detail
+                    if last_cap_exc is not None
+                    else "Channel platform capability is disabled"
+                ),
+            )
+
+        rows = await get_replay_thread_data(thread_id)
+        if rows is None:
+            raise HTTPException(status_code=404, detail="Thread not found")
+
+        if is_holder(rows.owner_id):
+            if rows.owner_id != x_user_id:
+                await thread_access(thread_id, x_user_id)
+            is_non_owner_reader = False
+        else:
+            from src.dalton.settings import is_dalton_multiuser_auth_enabled
+
+            is_non_owner_reader = False
+            if is_dalton_multiuser_auth_enabled():
+                from src.dalton.sharing import require_thread_access
+
+                await require_thread_access(
+                    thread_id,
+                    x_user_id,
+                    channel="web",
+                    need="read",
+                    owner_id=rows.owner_id,
+                    workspace_owner_id=rows.workspace_owner_id,
+                    workspace_id=rows.thread.get("workspace_id"),
+                )
+                is_non_owner_reader = rows.owner_id != x_user_id
+            elif rows.owner_id != x_user_id:
+                raise HTTPException(status_code=403, detail="Forbidden")
+
+        responses_map = getattr(rows, "responses_by_turn", None)
+        target_turn_index: int | None = None
+        target_resp_row: dict[str, Any] | None = None
+        if isinstance(responses_map, dict):
+            for t_idx, resp_row in responses_map.items():
+                if not isinstance(resp_row, dict):
+                    continue
+                rid = str(
+                    resp_row.get("conversation_response_id")
+                    or resp_row.get("run_id")
+                    or ""
+                ).strip()
+                if rid == cleaned_run_id:
+                    target_turn_index = int(t_idx)
+                    target_resp_row = resp_row
+                    break
+
+        if target_turn_index is None or target_resp_row is None:
+            raise HTTPException(status_code=404, detail="Run not found in thread")
+
+        try:
+            page, resolved_source = await read_replay_page(
+                rows,
+                source=source,
+                before_turn=target_turn_index + 1,
+                limit=1,
+                persist=False,
+            )
+        except CheckpointReplayUnavailable as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Checkpoint replay unavailable: {exc}",
+            )
+
+        target_lines: list[Any] = []
+        matched_page_run = False
+        current_turn_index: int | None = None
+        current_run_id: str | None = None
+        for line in page.lines:
+            try:
+                payload = json.loads(line.data_json)
+            except Exception:
+                payload = None
+            if not isinstance(payload, dict):
+                continue
+            raw_ti = payload.get("turn_index")
+            ev_ti: int | None = None
+            if isinstance(raw_ti, int) and not isinstance(raw_ti, bool):
+                ev_ti = raw_ti
+            elif isinstance(raw_ti, str) and raw_ti.strip().isdigit():
+                ev_ti = int(raw_ti.strip())
+            ev_rid = (
+                str(
+                    payload.get("response_id")
+                    or payload.get("run_id")
+                    or payload.get("report_run_id")
+                    or ""
+                ).strip()
+                or None
+            )
+            if line.event in ("user_message", "turn_separator", "turn_start"):
+                current_turn_index = ev_ti
+                current_run_id = ev_rid
+            eff_ti = ev_ti if ev_ti is not None else current_turn_index
+            eff_rid = ev_rid or current_run_id
+            # BW2: `read_replay_page(limit=1)` can include both a prior committed turn and
+            # a subsequent uncheckpointed target turn. Emit ONLY events for the target turn.
+            if eff_ti is not None and eff_ti != target_turn_index:
+                continue
+            if eff_rid is not None and eff_rid != cleaned_run_id:
+                continue
+            if eff_ti != target_turn_index and eff_rid != cleaned_run_id:
+                continue
+            if ev_rid == cleaned_run_id:
+                matched_page_run = True
+            target_lines.append(line)
+
+        await finish_lines(thread_id, target_lines)
+        if is_holder(rows.owner_id):
+            await name_turn_senders(thread_id, target_lines)
+
+        target_queries = [
+            q
+            for q in (getattr(rows, "queries", None) or ())
+            if isinstance(q, dict) and q.get("turn_index") == target_turn_index
+        ]
+
+        async def event_generator():
+            seq = 0
+            for line in target_lines:
+                seq += 1
+                yield f"id: {seq}\nevent: {line.event}\ndata: {line.data_json}\n\n"
+
+            done: dict[str, object] = {
+                "thread_id": thread_id,
+                "turn_index": target_turn_index,
+            }
+            if matched_page_run:
+                done["run_id"] = cleaned_run_id
+            if not is_non_owner_reader and has_capability(CapabilityId.CHANNEL_GATEWAY):
+                from src.dalton.channel_chart_snapshots import (
+                    resolve_replay_chart_snapshots_by_run,
+                )
+                from src.dalton.colleague_outbound_guard import (
+                    is_run_row_outbound_blocked,
+                )
+
+                blocked = is_run_row_outbound_blocked(target_resp_row)
+                done["outbound_blocked_by_run"] = {cleaned_run_id: blocked}
+                if not blocked:
+                    resp_meta = target_resp_row.get("metadata")
+                    if isinstance(resp_meta, dict):
+                        td = resp_meta.get("turn_deliverables")
+                        if isinstance(td, list) and td:
+                            done["turn_deliverables_by_run"] = {cleaned_run_id: td}
+                chart_snapshots_by_run = await resolve_replay_chart_snapshots_by_run(
+                    thread_id=thread_id,
+                    queries=target_queries,
+                    responses_by_turn={target_turn_index: target_resp_row},
+                )
+                if chart_snapshots_by_run:
+                    done["chart_snapshots_by_run"] = chart_snapshots_by_run
+
+            seq += 1
+            yield f"id: {seq}\nevent: replay_done\ndata: {json.dumps(done, default=str)}\n\n"
+
+        return StreamingResponse(
+            event_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Replay-Source": resolved_source,
+            },
+        )
+    except DATABASE_UNAVAILABLE as exc:
+        raise database_unavailable(
+            f"replaying run {cleaned_run_id} in thread {thread_id}", logger, exc
         )
     except HTTPException as exc:
         return _handle_structured_http_error(exc)
@@ -1454,7 +1704,7 @@ async def web_get_bindings_endpoint(
                 "platform": "weixin",
                 "account_id": wx_view.get("account_id"),
                 "status": wx_view.get("status"),
-                "platform_user_id": wx_view.get("ilink_user_id"),
+                "platform_user_id": wx_view.get("platform_user_id"),
                 "masked_ilink_user_id": wx_view.get("masked_ilink_user_id"),
                 "platform_username": wx_view.get("ilink_username"),
                 "has_usable_context_token": wx_view.get("has_usable_context_token"),
@@ -1606,6 +1856,16 @@ _PUBLIC_WEIXIN_QR_ERROR_MAP: dict[str, tuple[int, str, dict[str, Any]]] = {
         "验证码已过期，请重新扫码连接。",
         {"need_rescan": True},
     ),
+    "weixin_login_failed": (
+        502,
+        "微信登录校验失败，请重新获取二维码并扫码。",
+        {"need_rescan": True},
+    ),
+    "weixin_rate_limited": (
+        429,
+        "微信服务请求过于频繁，请稍后再试。",
+        {},
+    ),
     "ilink_user_already_bound": (
         409,
         "该微信号已绑定其他团队成员账号，无法重复绑定。",
@@ -1680,6 +1940,13 @@ def _build_public_weixin_qr_error(
     )
 
 
+async def _await_request_disconnect(request: Request) -> None:
+    while True:
+        if await request.is_disconnected():
+            return
+        await asyncio.sleep(0.05)
+
+
 async def _proxy_to_gateway_weixin(
     method: str,
     subpath: str,
@@ -1687,6 +1954,7 @@ async def _proxy_to_gateway_weixin(
     user_id: str,
     params: dict[str, Any] | None = None,
     json_body: dict[str, Any] | None = None,
+    request: Request | None = None,
 ) -> dict[str, Any]:
     from src.dalton.settings import get_dalton_channel_gateway_url
 
@@ -1706,13 +1974,46 @@ async def _proxy_to_gateway_weixin(
     url = f"{base_url}{subpath}"
     try:
         async with httpx.AsyncClient(timeout=_GATEWAY_PROXY_TIMEOUT) as client:
-            resp = await client.request(
-                method,
-                url,
-                headers=headers,
-                params=params,
-                json=json_body,
-            )
+            if request is None:
+                resp = await client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    params=params,
+                    json=json_body,
+                )
+            else:
+                req_task = asyncio.create_task(
+                    client.request(
+                        method,
+                        url,
+                        headers=headers,
+                        params=params,
+                        json=json_body,
+                    )
+                )
+                disconnect_task = asyncio.create_task(_await_request_disconnect(request))
+                try:
+                    done, _ = await asyncio.wait(
+                        {req_task, disconnect_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if req_task in done:
+                        resp = req_task.result()
+                    else:
+                        req_task.cancel()
+                        await asyncio.gather(req_task, return_exceptions=True)
+                        raise HTTPException(
+                            status_code=499,
+                            detail={
+                                "code": "client_disconnected",
+                                "message": "客户端已取消请求。",
+                            },
+                        )
+                finally:
+                    if not disconnect_task.done():
+                        disconnect_task.cancel()
+                        await asyncio.gather(disconnect_task, return_exceptions=True)
     except httpx.HTTPError as exc:
         raise _build_public_weixin_qr_error("gateway_unreachable", 503) from exc
 
@@ -1768,6 +2069,7 @@ async def web_weixin_qrcode_start_endpoint(
     dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN))],
 )
 async def web_weixin_qrcode_wait_endpoint(
+    request: Request,
     user_id: CurrentUserId,
     session_key: str = Query(..., min_length=1),
 ) -> Any:
@@ -1781,6 +2083,8 @@ async def web_weixin_qrcode_wait_endpoint(
         st = str(sess.get("status") or "")
         if st == "confirmed" and sess.get("connected") is True:
             confirmed = sess.get("confirmed_result") or {}
+            account_status = sess.get("account_status") or confirmed.get("account_status")
+            pending_verification = account_status == "pending_verification"
             return _shape_public_weixin_qr_response(
                 {
                     "session_key": session_key,
@@ -1788,6 +2092,8 @@ async def web_weixin_qrcode_wait_endpoint(
                     "connected": True,
                     "already_connected": True,
                     "account_id": confirmed.get("account_id"),
+                    "account_status": account_status,
+                    "pending_verification": pending_verification,
                     "bot_generation": confirmed.get("bot_generation"),
                     "accounts_revision": confirmed.get("accounts_revision"),
                 }
@@ -1810,6 +2116,7 @@ async def web_weixin_qrcode_wait_endpoint(
             "/internal/weixin/qrcode/wait",
             user_id=user_id,
             params={"session_key": session_key},
+            request=request,
         )
         return _shape_public_weixin_qr_response(raw)
     except HTTPException as exc:

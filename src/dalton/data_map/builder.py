@@ -25,10 +25,11 @@ import yaml
 
 from src.dalton.capabilities import (
     CapabilityId,
-    capabilities_fingerprint as compute_capabilities_fingerprint,
     effective_capabilities,
+    has_any_research_connector_capability,
     has_capability,
     is_bridge_route_enabled,
+    is_research_source_enabled,
 )
 from src.dalton.database import data_map as db_data_map
 
@@ -176,9 +177,16 @@ def _parse_capability_requirement(raw: Any) -> tuple[CapabilityId, ...]:
 def _capabilities_satisfied(
     raw_requirement: Any,
     active_caps: frozenset[CapabilityId],
+    *,
+    any_requirement: Any = None,
 ) -> bool:
     req = _parse_capability_requirement(raw_requirement)
-    return all(cap in active_caps for cap in req)
+    if not all(cap in active_caps for cap in req):
+        return False
+    any_req = _parse_capability_requirement(any_requirement)
+    if any_req and not any(cap in active_caps for cap in any_req):
+        return False
+    return True
 
 
 def _resolve_unavailable_source_note(
@@ -285,8 +293,14 @@ def merge_catalog_routes(
       (when ``researchdata_bridge`` is enabled) and marked with `description = "未写说明"`.
     """
     active_caps = effective_capabilities() if capabilities is None else capabilities
-    if CapabilityId.RESEARCHDATA_BRIDGE not in active_caps:
+    bridge_on = CapabilityId.RESEARCHDATA_BRIDGE in active_caps
+    if not bridge_on and not has_any_research_connector_capability(active_caps):
         return []
+
+    def _route_enabled(rid: str) -> bool:
+        if bridge_on:
+            return is_bridge_route_enabled(rid, capabilities=active_caps)
+        return is_research_source_enabled(rid, capabilities=active_caps)
 
     loaded_spec = dict(spec) if isinstance(spec, Mapping) else load_sources_spec()
     yaml_routes = (
@@ -322,11 +336,13 @@ def merge_catalog_routes(
                 "last30days",
             ):
                 continue
-            if not is_bridge_route_enabled(route_id, capabilities=active_caps):
+            if not _route_enabled(route_id):
                 continue
             yaml_entry = yaml_routes.get(route_id)
             if isinstance(yaml_entry, Mapping) and not _capabilities_satisfied(
-                yaml_entry.get("capability"), active_caps
+                yaml_entry.get("capability"),
+                active_caps,
+                any_requirement=yaml_entry.get("any_capability"),
             ):
                 continue
             seen_ids.add(route_id)
@@ -361,14 +377,31 @@ def merge_catalog_routes(
                     "description": desc,
                 }
             )
+        if not bridge_on:
+            _all_subsource_ids = frozenset(
+                {
+                    "company-wiki",
+                    "sales-notes",
+                    "tmtb",
+                    "funda-ai",
+                    "guidepoint",
+                    "alphaengine",
+                }
+            )
+            if not any(item["id"] in _all_subsource_ids for item in merged):
+                merged = [item for item in merged if item["id"] != "all"]
     else:
         for route_id, raw_entry in yaml_routes.items():
             rid = str(route_id).strip()
             if not rid or rid in effective_handoff or not isinstance(raw_entry, Mapping):
                 continue
-            if not is_bridge_route_enabled(rid, capabilities=active_caps):
+            if not _route_enabled(rid):
                 continue
-            if not _capabilities_satisfied(raw_entry.get("capability"), active_caps):
+            if not _capabilities_satisfied(
+                raw_entry.get("capability"),
+                active_caps,
+                any_requirement=raw_entry.get("any_capability"),
+            ):
                 continue
             seen_ids.add(rid)
             if rid == "all":
@@ -486,10 +519,34 @@ def _build_data_map_lines(
             )
 
     if routes:
+        from src.dalton.capabilities import is_batch3_connectors_enabled
+
+        b3_active = is_batch3_connectors_enabled()
+        b3_route_entry_map: dict[str, str] = {
+            "sec": "dalton_sec",
+            "fred": "dalton_macro",
+            "treasury": "dalton_macro",
+            "company-wiki": "dalton_company_wiki",
+            "guidepoint": "dalton_guidepoint",
+            "sales-notes": "dalton_sales_notes",
+            "tmtb": "dalton_tmtb",
+            "funda-ai": "dalton_funda_ai",
+            "all": "dalton_research_all",
+        }
         lines.append("")
-        lines.append(
-            "### 2. 研究库与金融/宏观/社区路由（经 `ExecuteCode` 调用 `researchdata` 的 `research`、`finance`、`macro` 或 `community`）"
-        )
+        if CapabilityId.RESEARCHDATA_BRIDGE in active_caps:
+            if b3_active:
+                lines.append(
+                    "### 2. 研究连接器与金融/宏观/社区路由（经 `ExecuteCode` 调用对应专用连接器或 `researchdata`）"
+                )
+            else:
+                lines.append(
+                    "### 2. 研究库与金融/宏观/社区路由（经 `ExecuteCode` 调用 `researchdata` 的 `research`、`finance`、`macro` 或 `community`）"
+                )
+        else:
+            lines.append(
+                "### 2. 已启用的研究连接器（经 `ExecuteCode` 调用对应连接器）"
+            )
 
         for r in routes:
             rid = r["id"]
@@ -499,7 +556,11 @@ def _build_data_map_lines(
             desc = r["description"]
             st_label = format_health_status(health_lookup.get(rid) or health_lookup.get(f"researchdata:{rid}"))
             rules_part = f"({rules_text})" if rules_text else ""
-            lines.append(f"- `{rid}`[{cat}/{title}|{st_label}]:{desc}{rules_part}")
+            if b3_active:
+                entry_name = b3_route_entry_map.get(rid, "researchdata")
+                lines.append(f"- `{rid}`[{cat}/{title}|{st_label}|`{entry_name}`]:{desc}{rules_part}")
+            else:
+                lines.append(f"- `{rid}`[{cat}/{title}|{st_label}]:{desc}{rules_part}")
 
     unavail_idx = 3 if routes else 2
     lines.append("")
@@ -672,7 +733,7 @@ async def refresh_daily_data_map(
     fp = (
         capabilities_fingerprint.strip()
         if isinstance(capabilities_fingerprint, str) and capabilities_fingerprint.strip()
-        else compute_capabilities_fingerprint(active_caps)
+        else db_data_map.data_map_cache_fingerprint(active_caps)
     )
     health_map = await db_data_map.fetch_all_source_health(conn=conn)
     conv_stats: dict[str, Any] | None = None

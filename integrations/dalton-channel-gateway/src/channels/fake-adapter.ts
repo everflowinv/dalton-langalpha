@@ -136,11 +136,16 @@ export class FakeChannelAdapter implements ChannelAdapter {
         sessionKey?: string;
         loginVersion?: number;
         expectedBotGeneration?: number;
+        signal?: AbortSignal;
       }) => Promise<WeixinQrStartResult>)
     | null = null;
 
   private qrWaitBehavior:
-    | ((options: { userId: string; sessionKey: string }) => Promise<WeixinQrWaitResult>)
+    | ((options: {
+        userId: string;
+        sessionKey: string;
+        signal?: AbortSignal;
+      }) => Promise<WeixinQrWaitResult>)
     | null = null;
 
   private qrVerifyBehavior:
@@ -148,6 +153,7 @@ export class FakeChannelAdapter implements ChannelAdapter {
         userId: string;
         sessionKey: string;
         code: string;
+        signal?: AbortSignal;
       }) => Promise<WeixinQrWaitResult>)
     | null = null;
 
@@ -309,12 +315,18 @@ export class FakeChannelAdapter implements ChannelAdapter {
       sessionKey?: string;
       loginVersion?: number;
       expectedBotGeneration?: number;
+      signal?: AbortSignal;
     }) => Promise<WeixinQrStartResult>;
-    wait?: (options: { userId: string; sessionKey: string }) => Promise<WeixinQrWaitResult>;
+    wait?: (options: {
+      userId: string;
+      sessionKey: string;
+      signal?: AbortSignal;
+    }) => Promise<WeixinQrWaitResult>;
     verify?: (options: {
       userId: string;
       sessionKey: string;
       code: string;
+      signal?: AbortSignal;
     }) => Promise<WeixinQrWaitResult>;
   }): void {
     this.qrStartBehavior = handlers.start ?? null;
@@ -543,6 +555,7 @@ export class FakeChannelAdapter implements ChannelAdapter {
   async waitQrLogin(options: {
     userId: string;
     sessionKey: string;
+    signal?: AbortSignal;
   }): Promise<WeixinQrWaitResult> {
     if (this.qrWaitBehavior) {
       return await this.qrWaitBehavior(options);
@@ -554,6 +567,7 @@ export class FakeChannelAdapter implements ChannelAdapter {
     userId: string;
     sessionKey: string;
     code: string;
+    signal?: AbortSignal;
   }): Promise<WeixinQrWaitResult> {
     if (this.qrVerifyBehavior) {
       return await this.qrVerifyBehavior(options);

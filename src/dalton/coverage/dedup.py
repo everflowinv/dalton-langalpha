@@ -92,6 +92,11 @@ MAX_DUPLICATE_MATCHES = 3
 DEDUP_BATCH_SIZE = 1000
 DEDUP_TIMEOUT_SECONDS = 15.0
 DEDUP_PRIMARY_MODEL_TIMEOUT_SECONDS = 9.0
+WEB_DEDUP_OVERALL_TIMEOUT_SECONDS = 20.0
+WEB_DEDUP_UNAVAILABLE_CODE = "dedup_unavailable"
+WEB_DEDUP_UNAVAILABLE_MESSAGE = (
+    "公司查重暂时不可用（检查超时），已继续创建工作区；请留意是否与已有工作区重复。"
+)
 
 DEDUP_SYSTEM_PROMPT = (
     "你是投研工作区查重助手。给定「待新建工作区名称」和「已有工作区候选清单」"
@@ -594,14 +599,20 @@ def _caller_has_same_name_workspace(
     *,
     uid: str,
     input_name_key: str | None,
+    exclude_workspace_id: str | None = None,
 ) -> bool:
     if input_name_key is None:
         return False
+    excluded_id = _norm_uuid(exclude_workspace_id) or (
+        str(exclude_workspace_id).strip() if exclude_workspace_id else None
+    )
     for ws in ws_rows:
         ws_owner_id = str(ws.get("user_id") or "").strip()
         ws_status = str(ws.get("status") or "").strip()
         ws_name = str(ws.get("name") or "").strip()
         ws_id = _norm_uuid(ws.get("workspace_id"))
+        if excluded_id and ws_id and ws_id == excluded_id:
+            continue
         if (
             ws_owner_id == uid
             and ws_status not in ("deleted", "unbound")
@@ -626,6 +637,7 @@ async def _collect_candidates(
     *,
     caller_tier: str,
     include_colleagues: bool | None = None,
+    exclude_same_name_workspace_id: str | None = None,
     conn: Any = None,
     stats: dict[str, int] | None = None,
 ) -> tuple[bool, list[_CandidateEntry]]:
@@ -678,7 +690,10 @@ async def _collect_candidates(
                 stats["workspace_count"] = len(ws_rows)
 
             if _caller_has_same_name_workspace(
-                ws_rows, uid=uid, input_name_key=input_name_key
+                ws_rows,
+                uid=uid,
+                input_name_key=input_name_key,
+                exclude_workspace_id=exclude_same_name_workspace_id,
             ):
                 return True, []
 
@@ -1327,35 +1342,46 @@ async def _judge_candidates_with_llm(
         await asyncio.gather(*pending, return_exceptions=True)
 
     succeeded = 0
-    failed_exc: Exception | None = None
+    timed_out_exc: Exception | None = None
+    other_failed_exc: Exception | None = None
     all_hits: list[tuple[_CandidateEntry, str, str]] = []
 
     for task in done:
         exc = task.exception()
         if exc is not None:
-            failed_exc = exc if isinstance(exc, Exception) else RuntimeError(type(exc).__name__)
+            if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+                if timed_out_exc is None:
+                    timed_out_exc = exc
+            elif other_failed_exc is None:
+                other_failed_exc = (
+                    exc if isinstance(exc, Exception) else RuntimeError(type(exc).__name__)
+                )
             continue
         succeeded += 1
         all_hits.extend(task.result())
 
-    if pending and failed_exc is None:
-        failed_exc = TimeoutError("Workspace dedup LLM timed out")
+    if pending and timed_out_exc is None:
+        timed_out_exc = TimeoutError("Workspace dedup LLM timed out")
 
+    primary_exc = timed_out_exc or other_failed_exc
     ws_count = stats["workspace_count"] if stats is not None else len(entries)
     if succeeded == 0:
-        raise failed_exc or TimeoutError("Workspace dedup LLM timed out")
+        raise primary_exc or TimeoutError("Workspace dedup LLM timed out")
 
     if suggestion_out is not None and not is_external:
         best_suggestion = _pick_best_suggestion(batch_suggestions)
         if best_suggestion is not None:
             suggestion_out.append(best_suggestion)
 
-    if failed_exc is not None:
+    if primary_exc is not None:
         if partial_failure_out is not None:
-            partial_failure_out.append(failed_exc)
+            if timed_out_exc is not None:
+                partial_failure_out.append(timed_out_exc)
+            if other_failed_exc is not None:
+                partial_failure_out.append(other_failed_exc)
         logger.warning(
             "Company workspace dedup partial batch failure (%s, succeeded=%d/%d, workspace_count=%d)",
-            type(failed_exc).__name__,
+            type(primary_exc).__name__,
             succeeded,
             len(batches),
             ws_count,
@@ -1394,6 +1420,9 @@ async def _refresh_live_hits(
         tuple[_CandidateEntry, dict[str, Any], str, str]
     ]
     | None = None,
+    unit_changed_out: list[str] | None = None,
+    downgraded_entries_out: list[_CandidateEntry] | None = None,
+    skip_downgraded_rejudge: bool = False,
     conn: Any = None,
 ) -> list[tuple[_CandidateEntry, dict[str, Any] | None, str, str]]:
     """Re-query hit workspaces and unit bindings after LLM return, releasing conn before permission checks."""
@@ -1504,8 +1533,11 @@ async def _refresh_live_hits(
             ).strip().lower()
             if u_row is None or u_kind != "company" or u_status != "active":
                 # --- DALTON-HOOK(cos-settings-tools): begin ---
-                # Unit missing/archived: drop the coverage unit, and stage its still-live
-                # workspace for self-match verification against ``raw_name`` after releasing conn.
+                # Unit missing/archived: record change for candidate re-collection,
+                # drop the coverage unit, and stage its still-live workspace for
+                # self-match verification against ``raw_name`` after releasing conn.
+                if unit_changed_out is not None:
+                    unit_changed_out.append(entry.unit_id)
                 fallback_ws_id = entry.ws_id
                 fresh_ws = live_ws_by_id.get(fallback_ws_id) if fallback_ws_id else None
                 if fresh_ws is None:
@@ -1526,6 +1558,8 @@ async def _refresh_live_hits(
                     ws_row=fresh_ws,
                 )
                 downgraded_hits.append((updated_entry, fresh_ws, conf, reason))
+                if downgraded_entries_out is not None:
+                    downgraded_entries_out.append(updated_entry)
                 continue
                 # --- DALTON-HOOK(cos-settings-tools): end ---
 
@@ -1546,9 +1580,17 @@ async def _refresh_live_hits(
             kept_doc_ticker = entry.doc_ticker if same_ws else None
             if "ticker" in u_row:
                 fresh_ticker = unit_ticker_now or kept_doc_ticker
+                ticker_changed = normalize_ticker_key(unit_ticker_now) != normalize_ticker_key(
+                    entry.unit_ticker
+                )
             else:
                 unit_ticker_now = entry.unit_ticker
                 fresh_ticker = entry.unit_ticker or kept_doc_ticker
+                ticker_changed = False
+            if unit_changed_out is not None and (
+                current_ws_id != entry.ws_id or ticker_changed
+            ):
+                unit_changed_out.append(entry.unit_id)
 
             if not current_ws_id:
                 updated_entry = replace(
@@ -1601,7 +1643,7 @@ async def _refresh_live_hits(
     # --- DALTON-HOOK(cos-settings-tools): begin ---
     # Re-verify workspaces whose bound coverage unit archived/rebound after releasing conn,
     # so unrelated workspaces (e.g. "行业笔记") that only matched via the unit are dropped.
-    if downgraded_hits:
+    if downgraded_hits and not skip_downgraded_rejudge:
         cleaned_query = str(raw_name or "").strip()
         if not cleaned_query:
             raw_refreshed.extend(downgraded_hits)
@@ -1751,6 +1793,325 @@ async def _resolve_live_hit_candidate(
     )
 
 
+def _is_explicit_ticker_shape(raw: str | None) -> bool:
+    """True when ``raw`` is an unambiguous ticker token (digits, market/share suffix,
+    or 1–5 uppercase ASCII letters) rather than an ordinary mixed-case English word
+    such as ``Anthropic`` or ``Macro``."""
+    s = str(raw or "").strip()
+    if not s or canonical_workspace_ticker_key(s) is None:
+        return False
+    if any(ch.isdigit() for ch in s) or "." in s or "-" in s:
+        return True
+    return 1 <= len(s) <= 5 and s.isalpha() and s.isupper()
+
+
+def colleague_workspace_name_matches_ticker(
+    target_name: str,
+    candidate_name: str | None,
+    *,
+    strict_name_ticker_shape: bool = True,
+) -> bool:
+    """Whether ``candidate_name`` deterministically matches ``target_name`` as a ticker.
+
+    Shared by proposal, lock-free recheck, and locked Phase 2 colleague verification so
+    all three phases agree on non-explicit mixed-case names (e.g. ``Aapl`` vs ``aapl``).
+    """
+    target_ticker_key = canonical_workspace_ticker_key(target_name)
+    if target_ticker_key is None:
+        return False
+    name_key = canonical_workspace_ticker_key(candidate_name)
+    if name_key != target_ticker_key:
+        return False
+    if not strict_name_ticker_shape:
+        return True
+    return _is_explicit_ticker_shape(target_name) or _is_explicit_ticker_shape(
+        candidate_name
+    )
+
+
+def colleague_workspace_deterministic_match(
+    target_name: str,
+    *,
+    candidate_name: str | None,
+    candidate_unit_ticker: str | None = None,
+    strict_name_ticker_shape: bool = True,
+) -> bool:
+    """Single shared deterministic predicate for colleague workspace candidates across
+    proposal (Phase 0), lock-free recheck (Phase 1), and locked write recheck (Phase 2)."""
+    target_ticker_key = canonical_workspace_ticker_key(target_name)
+    if target_ticker_key is None:
+        return False
+    unit_key = normalize_ticker_key(candidate_unit_ticker)
+    if unit_key is not None and unit_key == target_ticker_key:
+        return True
+    return colleague_workspace_name_matches_ticker(
+        target_name,
+        candidate_name,
+        strict_name_ticker_shape=strict_name_ticker_shape,
+    )
+
+
+async def _deterministic_ticker_match_entries(
+    *,
+    uid: str,
+    raw_name: str,
+    entries: Sequence[_CandidateEntry],
+    is_external: bool,
+    expected_duplicate_workspace_id: str | None = None,
+    checked_hits: Sequence[tuple[_CandidateEntry, str, str]] = (),
+    live_hits: Sequence[
+        tuple[_CandidateEntry, dict[str, Any] | None, str, str]
+    ] = (),
+    partial_failure_out: list[Exception] | None = None,
+    unit_changed_out: list[str] | None = None,
+    downgraded_entries_out: list[_CandidateEntry] | None = None,
+    skip_downgraded_rejudge: bool = False,
+    strict_name_ticker_shape: bool = False,
+    conn: Any = None,
+) -> list[tuple[_CandidateEntry, dict[str, Any] | None]]:
+    """Deterministically match candidates sharing the same canonical ticker key as ``raw_name``."""
+    target_ticker_key = canonical_workspace_ticker_key(raw_name)
+    if target_ticker_key is None:
+        return []
+
+    live_by_unit_id: dict[str, tuple[_CandidateEntry, dict[str, Any] | None]] = {}
+    live_by_ws_id: dict[str, tuple[_CandidateEntry, dict[str, Any] | None]] = {}
+    for live_entry, fresh_ws, _conf, _reason in live_hits:
+        if live_entry.unit_id:
+            live_by_unit_id[live_entry.unit_id] = (live_entry, fresh_ws)
+        live_ws_id = str(
+            (fresh_ws or {}).get("workspace_id") or live_entry.ws_id or ""
+        ).strip()
+        if live_ws_id:
+            live_by_ws_id[live_ws_id] = (live_entry, fresh_ws)
+
+    dead_unit_ids = {
+        hit_entry.unit_id
+        for hit_entry, _conf, _reason in checked_hits
+        if hit_entry.unit_id and hit_entry.unit_id not in live_by_unit_id
+    }
+    dead_ws_ids = {
+        hit_entry.ws_id
+        for hit_entry, _conf, _reason in checked_hits
+        if hit_entry.ws_id and hit_entry.ws_id not in live_by_ws_id
+    }
+
+    confirmed_pairs: list[tuple[_CandidateEntry, dict[str, Any] | None]] = []
+    to_verify: list[tuple[_CandidateEntry, str, str]] = []
+    for entry in entries:
+        entry_ws_id = entry.ws_id
+        if (
+            expected_duplicate_workspace_id is not None
+            and entry_ws_id is not None
+            and entry_ws_id == expected_duplicate_workspace_id
+        ):
+            continue
+        unit_key = normalize_ticker_key(entry.unit_ticker)
+        doc_key = normalize_ticker_key(entry.doc_ticker)
+        name_matches = colleague_workspace_name_matches_ticker(
+            raw_name,
+            entry.workspace_name,
+            strict_name_ticker_shape=strict_name_ticker_shape,
+        )
+        if unit_key != target_ticker_key and doc_key != target_ticker_key and not name_matches:
+            continue
+        if entry.unit_id and entry.unit_id in dead_unit_ids:
+            if (
+                not entry_ws_id
+                or entry_ws_id in dead_ws_ids
+                or (not name_matches and doc_key != target_ticker_key)
+            ):
+                continue
+            ws_only_entry = replace(
+                entry,
+                is_unit=False,
+                unit_id=None,
+                unbound_unit=False,
+                unit_ticker=None,
+                unit_display_name=None,
+            )
+            if entry_ws_id in live_by_ws_id:
+                confirmed_pairs.append(live_by_ws_id[entry_ws_id])
+            else:
+                to_verify.append((ws_only_entry, "high", "deterministic_ticker_match"))
+            continue
+        if entry_ws_id and entry_ws_id in dead_ws_ids:
+            continue
+        if entry.unit_id and entry.unit_id in live_by_unit_id:
+            confirmed_pairs.append(live_by_unit_id[entry.unit_id])
+            continue
+        if entry_ws_id and entry_ws_id in live_by_ws_id:
+            confirmed_pairs.append(live_by_ws_id[entry_ws_id])
+            continue
+        to_verify.append((entry, "high", "deterministic_ticker_match"))
+
+    if to_verify:
+        refreshed_det = await _refresh_live_hits(
+            to_verify,
+            raw_name=raw_name,
+            uid=uid,
+            is_external=is_external,
+            partial_failure_out=partial_failure_out,
+            unit_changed_out=unit_changed_out,
+            downgraded_entries_out=downgraded_entries_out,
+            skip_downgraded_rejudge=skip_downgraded_rejudge,
+            conn=conn,
+        )
+        for live_entry, fresh_ws, _conf, _reason in refreshed_det:
+            confirmed_pairs.append((live_entry, fresh_ws))
+
+    matched_pairs: list[tuple[_CandidateEntry, dict[str, Any] | None]] = []
+    seen_keys: set[str] = set()
+    for live_entry, fresh_ws in confirmed_pairs:
+        live_ws_id = (
+            str(
+                (fresh_ws or {}).get("workspace_id")
+                or live_entry.ws_id
+                or ""
+            ).strip()
+            or None
+        )
+        if (
+            expected_duplicate_workspace_id is not None
+            and live_ws_id is not None
+            and live_ws_id == expected_duplicate_workspace_id
+        ):
+            continue
+        live_unit_key = normalize_ticker_key(live_entry.unit_ticker)
+        live_doc_key = normalize_ticker_key(live_entry.doc_ticker)
+        live_name_matches = colleague_workspace_name_matches_ticker(
+            raw_name,
+            live_entry.workspace_name,
+            strict_name_ticker_shape=strict_name_ticker_shape,
+        )
+        if (
+            live_unit_key != target_ticker_key
+            and live_doc_key != target_ticker_key
+            and not live_name_matches
+        ):
+            continue
+        dedup_key = f"ws:{live_ws_id}" if live_ws_id else f"unit:{live_entry.unit_id}"
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+        matched_pairs.append((live_entry, fresh_ws))
+    return matched_pairs
+
+
+async def _candidate_units_changed(
+    entries: Sequence[_CandidateEntry],
+    *,
+    conn: Any = None,
+) -> bool:
+    """Return True if any candidate's bound coverage unit archived, changed kind,
+    rebound to another workspace, or changed ticker since candidate collection."""
+    unit_entries = [entry for entry in entries if entry.unit_id]
+    if not unit_entries:
+        return False
+    unit_ids = sorted({entry.unit_id for entry in unit_entries if entry.unit_id})
+    unit_set = set(unit_ids)
+    by_unit_id: dict[str, dict[str, Any]] = {}
+    async with get_db_connection(conn) as c:
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT u.unit_id::text AS unit_id,
+                       u.status,
+                       u.kind,
+                       u.workspace_id::text AS workspace_id,
+                       u.ticker
+                FROM dalton_coverage_units u
+                WHERE u.unit_id = ANY(%s::uuid[])
+                """,
+                (unit_ids,),
+            )
+            for row in await cur.fetchall():
+                uid_row = _norm_uuid(row.get("unit_id"))
+                if uid_row and uid_row in unit_set:
+                    by_unit_id.setdefault(uid_row, dict(row))
+
+    for entry in unit_entries:
+        u_row = by_unit_id.get(entry.unit_id or "")
+        if u_row is None:
+            return True
+        u_kind = str(u_row.get("kind") or "company").strip().lower()
+        u_status = str(
+            u_row.get("status") if "status" in u_row else "active"
+        ).strip().lower()
+        if u_kind != "company" or u_status != "active":
+            return True
+        if _norm_uuid(u_row.get("workspace_id")) != entry.ws_id:
+            return True
+        if "ticker" in u_row and normalize_ticker_key(u_row.get("ticker")) != normalize_ticker_key(
+            entry.unit_ticker
+        ):
+            return True
+    return False
+
+
+async def _deterministic_ticker_match_snapshot(
+    *,
+    uid: str,
+    raw_name: str,
+    entries: Sequence[_CandidateEntry],
+    is_external: bool,
+    checked_candidates: tuple[tuple[str, str, str | None, str | None], ...],
+    check_colleagues: bool,
+    expected_duplicate_workspace_id: str | None = None,
+    checked_hits: Sequence[tuple[_CandidateEntry, str, str]] = (),
+    live_hits: Sequence[
+        tuple[_CandidateEntry, dict[str, Any] | None, str, str]
+    ] = (),
+    partial_failure_out: list[Exception] | None = None,
+    unit_changed_out: list[str] | None = None,
+    downgraded_entries_out: list[_CandidateEntry] | None = None,
+    skip_downgraded_rejudge: bool = False,
+    conn: Any = None,
+) -> CompanyDedupRecheckSnapshot | None:
+    matched_pairs = await _deterministic_ticker_match_entries(
+        uid=uid,
+        raw_name=raw_name,
+        entries=entries,
+        is_external=is_external,
+        expected_duplicate_workspace_id=expected_duplicate_workspace_id,
+        checked_hits=checked_hits,
+        live_hits=live_hits,
+        partial_failure_out=partial_failure_out,
+        unit_changed_out=unit_changed_out,
+        downgraded_entries_out=downgraded_entries_out,
+        skip_downgraded_rejudge=skip_downgraded_rejudge,
+        strict_name_ticker_shape=True,
+        conn=conn,
+    )
+    if not matched_pairs:
+        return None
+    det_ids: list[str] = []
+    det_unbound = False
+    for live_entry, fresh_ws in matched_pairs:
+        live_ws_id = (
+            str(
+                (fresh_ws or {}).get("workspace_id")
+                or live_entry.ws_id
+                or ""
+            ).strip()
+            or None
+        )
+        if live_ws_id:
+            if live_ws_id not in det_ids:
+                det_ids.append(live_ws_id)
+        if live_entry.unbound_unit or not live_ws_id:
+            det_unbound = True
+    if det_ids or det_unbound:
+        return CompanyDedupRecheckSnapshot(
+            status="matched",
+            matched_workspace_ids=tuple(det_ids),
+            has_unbound_or_unreadable_match=det_unbound,
+            checked_candidates=checked_candidates,
+            check_colleague_workspaces=check_colleagues,
+        )
+    return None
+
+
 async def _find_matches(
     uid: str,
     raw_name: str,
@@ -1758,6 +2119,8 @@ async def _find_matches(
     channel: str,
     caller_tier: str,
     include_colleagues: bool | None = None,
+    exclude_workspace_id: str | None = None,
+    raise_on_timeout: bool = False,
     conn: Any = None,
     stats: dict[str, int] | None = None,
     snapshot_out: list[CompanyDedupRecheckSnapshot] | None = None,
@@ -1767,15 +2130,102 @@ async def _find_matches(
         if include_colleagues is None
         else bool(include_colleagues and caller_tier != "external")
     )
-    early_exit, entries = await _collect_candidates(
-        uid,
-        raw_name,
-        caller_tier=caller_tier,
-        include_colleagues=eff_include_colleagues,
-        conn=conn,
-        stats=stats,
+    excluded_ws_id = _norm_uuid(exclude_workspace_id) or (
+        str(exclude_workspace_id or "").strip() or None
     )
-    if snapshot_out is not None and not early_exit:
+    entries: list[_CandidateEntry] = []
+    carry_downgraded: list[_CandidateEntry] = []
+    for _attempt in range(2):
+        allow_recollect = _attempt == 0
+        collect_kwargs: dict[str, Any] = {
+            "caller_tier": caller_tier,
+            "include_colleagues": eff_include_colleagues,
+            "conn": conn,
+            "stats": stats,
+        }
+        if excluded_ws_id is not None:
+            collect_kwargs["exclude_same_name_workspace_id"] = excluded_ws_id
+        early_exit, entries = await _collect_candidates(
+            uid,
+            raw_name,
+            **collect_kwargs,
+        )
+        if carry_downgraded:
+            seen_ws = {e.ws_id for e in entries if e.ws_id}
+            for d_entry in carry_downgraded:
+                if d_entry.ws_id and d_entry.ws_id not in seen_ws:
+                    entries.append(d_entry)
+                    seen_ws.add(d_entry.ws_id)
+            carry_downgraded = []
+        if excluded_ws_id is not None:
+            entries = [e for e in entries if e.ws_id != excluded_ws_id]
+        if early_exit:
+            return None
+        if not entries:
+            if snapshot_out is not None:
+                snapshot_out.append(
+                    CompanyDedupRecheckSnapshot(
+                        status="clear",
+                        checked_candidates=(),
+                        active=True,
+                        check_colleague_workspaces=eff_include_colleagues,
+                    )
+                )
+            return None
+
+        det_unit_changed: list[str] = []
+        det_downgraded: list[_CandidateEntry] = []
+        det_pairs = await _deterministic_ticker_match_entries(
+            uid=uid,
+            raw_name=raw_name,
+            entries=entries,
+            is_external=(caller_tier == "external"),
+            expected_duplicate_workspace_id=excluded_ws_id,
+            unit_changed_out=det_unit_changed,
+            downgraded_entries_out=det_downgraded,
+            skip_downgraded_rejudge=allow_recollect,
+            strict_name_ticker_shape=True,
+            conn=conn,
+        )
+        if allow_recollect and det_unit_changed:
+            carry_downgraded = det_downgraded
+            continue
+        if det_pairs:
+            resolved_det: list[tuple[DuplicateWorkspaceCandidate, str | None]] = []
+            for entry, fresh_ws in det_pairs:
+                cand, ws_id = await _resolve_live_hit_candidate(
+                    uid,
+                    entry,
+                    fresh_ws,
+                    channel=channel,
+                    conn=conn,
+                )
+                resolved_det.append((cand, ws_id))
+            display_pairs = resolved_det[:MAX_DUPLICATE_MATCHES]
+            resolved = [cand for cand, _ in display_pairs]
+            matched_ids = [ws_id for _cand, ws_id in display_pairs if ws_id]
+            message = _format_duplicate_message(raw_name, resolved[0])
+            return DuplicateMatch(
+                company=raw_name,
+                message=message,
+                matches=tuple(resolved),
+                matched_workspace_ids=tuple(matched_ids),
+                suggestion=None,
+            )
+        break
+
+    def _record_clear_snapshot(*, has_failures: bool) -> None:
+        if snapshot_out is None:
+            return
+        if has_failures:
+            snapshot_out.append(
+                CompanyDedupRecheckSnapshot(
+                    status="unavailable",
+                    active=True,
+                    check_colleague_workspaces=eff_include_colleagues,
+                )
+            )
+            return
         checked_candidates = tuple(
             (
                 entry.ws_id,
@@ -1794,10 +2244,9 @@ async def _find_matches(
                 check_colleague_workspaces=eff_include_colleagues,
             )
         )
-    if early_exit or not entries:
-        return None
 
     suggestion_out: list[DedupCoverageSuggestion] = []
+    llm_partial_failures: list[Exception] = []
     hits = await _judge_candidates_with_llm(
         uid=uid,
         raw_name=raw_name,
@@ -1805,8 +2254,14 @@ async def _find_matches(
         stats=stats,
         is_external=(caller_tier == "external"),
         suggestion_out=suggestion_out,
+        partial_failure_out=llm_partial_failures,
     )
     if not hits:
+        if raise_on_timeout:
+            for exc in llm_partial_failures:
+                if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                    raise exc
+        _record_clear_snapshot(has_failures=bool(llm_partial_failures))
         if suggestion_out:
             return DuplicateMatch(
                 company=raw_name,
@@ -1843,7 +2298,21 @@ async def _find_matches(
             if ws_key_id:
                 seen_unverified_ws.add(ws_key_id)
             all_live_hits.append((upd_entry, f_ws, c_conf, r_reason))
+    if excluded_ws_id is not None:
+        all_live_hits = [
+            item
+            for item in all_live_hits
+            if str((item[1] or {}).get("workspace_id") or item[0].ws_id or "").strip()
+            != excluded_ws_id
+        ]
     if not all_live_hits:
+        if raise_on_timeout:
+            for exc in (*llm_partial_failures, *recheck_failures):
+                if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                    raise exc
+        _record_clear_snapshot(
+            has_failures=bool(llm_partial_failures or recheck_failures)
+        )
         if suggestion_out:
             return DuplicateMatch(
                 company=raw_name,
@@ -1938,257 +2407,206 @@ async def recheck_company_workspace_before_create(
         if caller_tier == "company":
             return CompanyDedupRecheckSnapshot(status="clear", active=False)
         check_colleagues = (caller_tier != "external") and is_colleague_dedup_enabled()
-        early_exit, entries = await _collect_candidates(
-            uid,
-            raw_name,
-            caller_tier=caller_tier,
-            include_colleagues=check_colleagues,
-            stats=stats,
-        )
-        checked_candidates = tuple(
-            (
-                entry.ws_id,
-                entry.workspace_name,
-                normalize_ticker_key(entry.unit_ticker),
-                normalize_ticker_key(entry.doc_ticker),
-            )
-            for entry in entries
-            if entry.ws_id
-        )
-        if early_exit:
-            return CompanyDedupRecheckSnapshot(
-                status="matched",
-                has_unbound_or_unreadable_match=True,
-                checked_candidates=checked_candidates,
-                check_colleague_workspaces=check_colleagues,
-            )
-        if not entries:
-            return CompanyDedupRecheckSnapshot(
-                status="clear",
-                checked_candidates=(),
-                check_colleague_workspaces=check_colleagues,
-            )
+        is_external = caller_tier == "external"
 
-        target_ticker_key = canonical_workspace_ticker_key(raw_name)
+        carry_downgraded: list[_CandidateEntry] = []
+        for _attempt in range(2):
+            allow_recollect = _attempt == 0
+            unit_changed: list[str] = []
+            downgraded_entries: list[_CandidateEntry] = []
+            partial_failures: list[Exception] = []
 
-        async def _deterministic_ticker_match_snapshot(
-            *,
-            checked_hits: Sequence[tuple[_CandidateEntry, str, str]] = (),
-            live_hits: Sequence[
-                tuple[_CandidateEntry, dict[str, Any] | None, str, str]
-            ] = (),
-        ) -> CompanyDedupRecheckSnapshot | None:
-            if target_ticker_key is None:
-                return None
-
-            live_by_unit_id: dict[
-                str, tuple[_CandidateEntry, dict[str, Any] | None]
-            ] = {}
-            live_by_ws_id: dict[
-                str, tuple[_CandidateEntry, dict[str, Any] | None]
-            ] = {}
-            for live_entry, fresh_ws, _conf, _reason in live_hits:
-                if live_entry.unit_id:
-                    live_by_unit_id[live_entry.unit_id] = (live_entry, fresh_ws)
-                live_ws_id = str(
-                    (fresh_ws or {}).get("workspace_id") or live_entry.ws_id or ""
-                ).strip()
-                if live_ws_id:
-                    live_by_ws_id[live_ws_id] = (live_entry, fresh_ws)
-
-            dead_unit_ids = {
-                hit_entry.unit_id
-                for hit_entry, _conf, _reason in checked_hits
-                if hit_entry.unit_id and hit_entry.unit_id not in live_by_unit_id
+            collect_kwargs: dict[str, Any] = {
+                "caller_tier": caller_tier,
+                "include_colleagues": check_colleagues,
+                "stats": stats,
             }
-            dead_ws_ids = {
-                hit_entry.ws_id
-                for hit_entry, _conf, _reason in checked_hits
-                if hit_entry.ws_id and hit_entry.ws_id not in live_by_ws_id
-            }
-
-            confirmed_pairs: list[tuple[_CandidateEntry, dict[str, Any] | None]] = []
-            to_verify: list[tuple[_CandidateEntry, str, str]] = []
-            for entry in entries:
-                entry_ws_id = entry.ws_id
-                if (
-                    expected_duplicate_workspace_id is not None
-                    and entry_ws_id is not None
-                    and entry_ws_id == expected_duplicate_workspace_id
-                ):
-                    continue
-                unit_key = normalize_ticker_key(entry.unit_ticker)
-                doc_key = normalize_ticker_key(entry.doc_ticker)
-                name_key = canonical_workspace_ticker_key(entry.workspace_name)
-                if (
-                    unit_key != target_ticker_key
-                    and doc_key != target_ticker_key
-                    and name_key != target_ticker_key
-                ):
-                    continue
-                if entry.unit_id and entry.unit_id in dead_unit_ids:
-                    if (
-                        not entry_ws_id
-                        or entry_ws_id in dead_ws_ids
-                        or (name_key != target_ticker_key and doc_key != target_ticker_key)
-                    ):
-                        continue
-                    ws_only_entry = replace(
-                        entry,
-                        is_unit=False,
-                        unit_id=None,
-                        unbound_unit=False,
-                        unit_ticker=None,
-                        unit_display_name=None,
-                    )
-                    if entry_ws_id in live_by_ws_id:
-                        confirmed_pairs.append(live_by_ws_id[entry_ws_id])
-                    else:
-                        to_verify.append((ws_only_entry, "high", "deterministic_ticker_match"))
-                    continue
-                if entry_ws_id and entry_ws_id in dead_ws_ids:
-                    continue
-                if entry.unit_id and entry.unit_id in live_by_unit_id:
-                    confirmed_pairs.append(live_by_unit_id[entry.unit_id])
-                    continue
-                if entry_ws_id and entry_ws_id in live_by_ws_id:
-                    confirmed_pairs.append(live_by_ws_id[entry_ws_id])
-                    continue
-                to_verify.append((entry, "high", "deterministic_ticker_match"))
-
-            if to_verify:
-                refreshed_det = await _refresh_live_hits(to_verify)
-                for live_entry, fresh_ws, _conf, _reason in refreshed_det:
-                    confirmed_pairs.append((live_entry, fresh_ws))
-
-            det_ids: list[str] = []
-            det_unbound = False
-            for live_entry, fresh_ws in confirmed_pairs:
-                live_ws_id = (
-                    str(
-                        (fresh_ws or {}).get("workspace_id")
-                        or live_entry.ws_id
-                        or ""
-                    ).strip()
-                    or None
+            if expected_duplicate_workspace_id is not None:
+                collect_kwargs["exclude_same_name_workspace_id"] = (
+                    expected_duplicate_workspace_id
                 )
-                if (
-                    expected_duplicate_workspace_id is not None
-                    and live_ws_id is not None
-                    and live_ws_id == expected_duplicate_workspace_id
-                ):
-                    continue
-                live_unit_key = normalize_ticker_key(live_entry.unit_ticker)
-                live_doc_key = normalize_ticker_key(live_entry.doc_ticker)
-                live_name_key = canonical_workspace_ticker_key(
-                    live_entry.workspace_name
+            early_exit, entries = await _collect_candidates(
+                uid,
+                raw_name,
+                **collect_kwargs,
+            )
+            if carry_downgraded:
+                seen_ws = {e.ws_id for e in entries if e.ws_id}
+                for d_entry in carry_downgraded:
+                    if d_entry.ws_id and d_entry.ws_id not in seen_ws:
+                        entries.append(d_entry)
+                        seen_ws.add(d_entry.ws_id)
+                carry_downgraded = []
+            checked_candidates = tuple(
+                (
+                    entry.ws_id,
+                    entry.workspace_name,
+                    normalize_ticker_key(entry.unit_ticker),
+                    normalize_ticker_key(entry.doc_ticker),
                 )
-                if (
-                    live_unit_key != target_ticker_key
-                    and live_doc_key != target_ticker_key
-                    and live_name_key != target_ticker_key
-                ):
-                    continue
-                if live_ws_id:
-                    if live_ws_id not in det_ids:
-                        det_ids.append(live_ws_id)
-                if live_entry.unbound_unit or not live_ws_id:
-                    det_unbound = True
-            if det_ids or det_unbound:
+                for entry in entries
+                if entry.ws_id
+            )
+            if early_exit:
                 return CompanyDedupRecheckSnapshot(
                     status="matched",
-                    matched_workspace_ids=tuple(det_ids),
-                    has_unbound_or_unreadable_match=det_unbound,
+                    has_unbound_or_unreadable_match=True,
                     checked_candidates=checked_candidates,
                     check_colleague_workspaces=check_colleagues,
                 )
-            return None
+            if not entries:
+                return CompanyDedupRecheckSnapshot(
+                    status="clear",
+                    checked_candidates=(),
+                    check_colleague_workspaces=check_colleagues,
+                )
 
-        partial_failures: list[Exception] = []
-        hits = await _judge_candidates_with_llm(
-            uid=uid,
-            raw_name=raw_name,
-            entries=entries,
-            stats=stats,
-            is_external=(caller_tier == "external"),
-            partial_failure_out=partial_failures,
-        )
-        if not hits:
-            det_match = await _deterministic_ticker_match_snapshot()
-            if det_match is not None:
-                return det_match
-            if partial_failures:
-                return CompanyDedupRecheckSnapshot(status="unavailable")
-            return CompanyDedupRecheckSnapshot(
-                status="clear",
-                checked_candidates=checked_candidates,
-                check_colleague_workspaces=check_colleagues,
+            hits = await _judge_candidates_with_llm(
+                uid=uid,
+                raw_name=raw_name,
+                entries=entries,
+                stats=stats,
+                is_external=is_external,
+                partial_failure_out=partial_failures,
             )
+            if not hits:
+                det_match = await _deterministic_ticker_match_snapshot(
+                    uid=uid,
+                    raw_name=raw_name,
+                    entries=entries,
+                    is_external=is_external,
+                    checked_candidates=checked_candidates,
+                    check_colleagues=check_colleagues,
+                    expected_duplicate_workspace_id=expected_duplicate_workspace_id,
+                    partial_failure_out=partial_failures,
+                    unit_changed_out=unit_changed,
+                    downgraded_entries_out=downgraded_entries,
+                    skip_downgraded_rejudge=allow_recollect,
+                )
+                if allow_recollect and unit_changed:
+                    carry_downgraded = downgraded_entries
+                    continue
+                if det_match is not None:
+                    return det_match
+                if partial_failures:
+                    return CompanyDedupRecheckSnapshot(status="unavailable")
+                if await _candidate_units_changed(entries):
+                    if allow_recollect:
+                        continue
+                    return CompanyDedupRecheckSnapshot(status="unavailable")
+                return CompanyDedupRecheckSnapshot(
+                    status="clear",
+                    checked_candidates=checked_candidates,
+                    check_colleague_workspaces=check_colleagues,
+                )
 
-        all_live_hits = await _refresh_live_hits(
-            hits,
-            raw_name=raw_name,
-            uid=uid,
-            is_external=(caller_tier == "external"),
-            partial_failure_out=partial_failures,
-        )
-        if not all_live_hits:
+            all_live_hits = await _refresh_live_hits(
+                hits,
+                raw_name=raw_name,
+                uid=uid,
+                is_external=is_external,
+                partial_failure_out=partial_failures,
+                unit_changed_out=unit_changed,
+                downgraded_entries_out=downgraded_entries,
+                skip_downgraded_rejudge=allow_recollect,
+            )
+            if allow_recollect and unit_changed:
+                carry_downgraded = downgraded_entries
+                continue
+            if not all_live_hits:
+                det_match = await _deterministic_ticker_match_snapshot(
+                    uid=uid,
+                    raw_name=raw_name,
+                    entries=entries,
+                    is_external=is_external,
+                    checked_candidates=checked_candidates,
+                    check_colleagues=check_colleagues,
+                    expected_duplicate_workspace_id=expected_duplicate_workspace_id,
+                    checked_hits=hits,
+                    live_hits=all_live_hits,
+                    partial_failure_out=partial_failures,
+                    unit_changed_out=unit_changed,
+                    downgraded_entries_out=downgraded_entries,
+                    skip_downgraded_rejudge=allow_recollect,
+                )
+                if allow_recollect and unit_changed:
+                    carry_downgraded = downgraded_entries
+                    continue
+                if det_match is not None:
+                    return det_match
+                if partial_failures:
+                    return CompanyDedupRecheckSnapshot(status="unavailable")
+                if await _candidate_units_changed(entries):
+                    if allow_recollect:
+                        continue
+                    return CompanyDedupRecheckSnapshot(status="unavailable")
+                return CompanyDedupRecheckSnapshot(
+                    status="clear",
+                    checked_candidates=checked_candidates,
+                    check_colleague_workspaces=check_colleagues,
+                )
+
+            matched_ids: list[str] = []
+            has_unbound_or_unreadable = False
+            for entry, fresh_ws, _conf, _reason in all_live_hits:
+                cand, ws_id = await _resolve_live_hit_candidate(
+                    uid,
+                    entry,
+                    fresh_ws,
+                    channel=cleaned_channel,
+                )
+                if ws_id:
+                    if ws_id not in matched_ids:
+                        matched_ids.append(ws_id)
+                if cand.unbound_unit or not cand.workspace_id:
+                    has_unbound_or_unreadable = True
+
+            has_undisclosed = (
+                expected_duplicate_workspace_id is None
+                or has_unbound_or_unreadable
+                or any(mid != expected_duplicate_workspace_id for mid in matched_ids)
+                or not matched_ids
+            )
+            if has_undisclosed:
+                return CompanyDedupRecheckSnapshot(
+                    status="matched",
+                    matched_workspace_ids=tuple(matched_ids),
+                    has_unbound_or_unreadable_match=has_unbound_or_unreadable,
+                    checked_candidates=checked_candidates,
+                    check_colleague_workspaces=check_colleagues,
+                )
             det_match = await _deterministic_ticker_match_snapshot(
+                uid=uid,
+                raw_name=raw_name,
+                entries=entries,
+                is_external=is_external,
+                checked_candidates=checked_candidates,
+                check_colleagues=check_colleagues,
+                expected_duplicate_workspace_id=expected_duplicate_workspace_id,
                 checked_hits=hits,
                 live_hits=all_live_hits,
+                partial_failure_out=partial_failures,
+                unit_changed_out=unit_changed,
+                downgraded_entries_out=downgraded_entries,
+                skip_downgraded_rejudge=allow_recollect,
             )
+            if allow_recollect and unit_changed:
+                carry_downgraded = downgraded_entries
+                continue
             if det_match is not None:
                 return det_match
             if partial_failures:
+                return CompanyDedupRecheckSnapshot(status="unavailable")
+            if await _candidate_units_changed(entries):
+                if allow_recollect:
+                    continue
                 return CompanyDedupRecheckSnapshot(status="unavailable")
             return CompanyDedupRecheckSnapshot(
                 status="clear",
                 checked_candidates=checked_candidates,
                 check_colleague_workspaces=check_colleagues,
             )
-
-        matched_ids: list[str] = []
-        has_unbound_or_unreadable = False
-        for entry, fresh_ws, _conf, _reason in all_live_hits:
-            cand, ws_id = await _resolve_live_hit_candidate(
-                uid,
-                entry,
-                fresh_ws,
-                channel=cleaned_channel,
-            )
-            if ws_id:
-                if ws_id not in matched_ids:
-                    matched_ids.append(ws_id)
-            if cand.unbound_unit or not cand.workspace_id:
-                has_unbound_or_unreadable = True
-
-        has_undisclosed = (
-            expected_duplicate_workspace_id is None
-            or has_unbound_or_unreadable
-            or any(mid != expected_duplicate_workspace_id for mid in matched_ids)
-            or not matched_ids
-        )
-        if has_undisclosed:
-            return CompanyDedupRecheckSnapshot(
-                status="matched",
-                matched_workspace_ids=tuple(matched_ids),
-                has_unbound_or_unreadable_match=has_unbound_or_unreadable,
-                checked_candidates=checked_candidates,
-                check_colleague_workspaces=check_colleagues,
-            )
-        det_match = await _deterministic_ticker_match_snapshot(
-            checked_hits=hits,
-            live_hits=all_live_hits,
-        )
-        if det_match is not None:
-            return det_match
-        if partial_failures:
-            return CompanyDedupRecheckSnapshot(status="unavailable")
-        return CompanyDedupRecheckSnapshot(
-            status="clear",
-            checked_candidates=checked_candidates,
-            check_colleague_workspaces=check_colleagues,
-        )
+        return CompanyDedupRecheckSnapshot(status="unavailable")
     except Exception as exc:
         logger.warning(
             "Lock-free company workspace dedup recheck unavailable (%s, workspace_count=%d)",
@@ -2363,6 +2781,8 @@ async def find_existing_company_workspace(
     name: str | None,
     *,
     channel: str = "web",
+    exclude_workspace_id: str | None = None,
+    raise_on_timeout: bool = False,
     conn: Any = None,
     snapshot_out: list[CompanyDedupRecheckSnapshot] | None = None,
 ) -> DuplicateMatch | None:
@@ -2398,12 +2818,33 @@ async def find_existing_company_workspace(
             channel=cleaned_channel,
             caller_tier=caller_tier,
             include_colleagues=include_colleagues,
+            exclude_workspace_id=exclude_workspace_id,
+            raise_on_timeout=raise_on_timeout,
             conn=conn,
             stats=stats,
             snapshot_out=snapshot_out,
         )
+    except (TimeoutError, asyncio.TimeoutError) as exc:
+        if snapshot_out is not None:
+            snapshot_out.clear()
+            snapshot_out.append(
+                CompanyDedupRecheckSnapshot(
+                    status="unavailable",
+                    active=True,
+                    check_colleague_workspaces=include_colleagues,
+                )
+            )
+        logger.warning(
+            "Company workspace dedup check timed out (%s, workspace_count=%d); proceeding",
+            type(exc).__name__,
+            stats["workspace_count"],
+        )
+        if raise_on_timeout:
+            raise
+        return None
     except Exception as exc:
-        if snapshot_out is not None and not snapshot_out:
+        if snapshot_out is not None:
+            snapshot_out.clear()
             snapshot_out.append(
                 CompanyDedupRecheckSnapshot(
                     status="unavailable",

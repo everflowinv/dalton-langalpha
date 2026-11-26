@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dalton-company-wiki",
+  "version": "0.1.0",
+  "description": "Company and sector research wiki connector (read-only search, list, read, topic, and image retrieval).",
+  "author": {
+    "name": "Dalton"
+  },
+  "license": "Apache-2.0",
+  "extensions": {
+    "ai.langalpha": {
+      "servers": {
+        "dalton_company_wiki": {
+          "description": "Company & sector research wiki (search, read, list, topic; supports media='all'|'text'|'images' and UTC ISO indexed_since).",
+          "tool_exposure_mode": "summary",
+          "instruction": "Read-only company & sector research wiki. Use `list(params={'company': 'TICKER'})` to browse documents, `search(query=..., params={'media': 'all'|'text'|'images', 'indexed_since': '...'})` to retrieve, `read(document='wiki:<id>')` to read full text with offset/max_chars paging, and `topic(query=...)` for tag lookup."
+        }
+      }
+    }
+  }
+}

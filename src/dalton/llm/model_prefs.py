@@ -66,10 +66,11 @@ _FEISHU_NOTIFY_TARGET_RE = re.compile(r"^feishu:user:ou_[A-Za-z0-9_-]+$")
 _FEISHU_CHAT_NOTIFY_TARGET_RE = re.compile(r"^feishu:chat:oc_[A-Za-z0-9_-]+$")
 _DISCORD_NOTIFY_TARGET_RE = re.compile(r"^discord:user:[0-9]+$")
 _DISCORD_CHANNEL_NOTIFY_TARGET_RE = re.compile(r"^discord:channel:[0-9]{5,32}$")
+_WEIXIN_NOTIFY_TARGET_RE = re.compile(r"^weixin:user:[^\s:]{1,255}$")
 
 
 def is_valid_dalton_notify_target(target: str) -> bool:
-    """Return True for a Feishu user, Feishu group, Discord user, or Discord channel target."""
+    """Return True for a Feishu, Discord, or personal Weixin notify target."""
     if not isinstance(target, str):
         return False
     cleaned = target.strip()
@@ -78,6 +79,7 @@ def is_valid_dalton_notify_target(target: str) -> bool:
         or _FEISHU_CHAT_NOTIFY_TARGET_RE.match(cleaned)
         or _DISCORD_NOTIFY_TARGET_RE.match(cleaned)
         or _DISCORD_CHANNEL_NOTIFY_TARGET_RE.match(cleaned)
+        or _WEIXIN_NOTIFY_TARGET_RE.match(cleaned)
     )
 
 
@@ -99,13 +101,20 @@ def is_dalton_discord_channel_target(target: str) -> bool:
     return bool(_DISCORD_CHANNEL_NOTIFY_TARGET_RE.match(target.strip()))
 
 
+def is_dalton_weixin_user_target(target: str) -> bool:
+    """True for ``weixin:user:<id>`` (a personal Weixin DM target)."""
+    if not isinstance(target, str):
+        return False
+    return bool(_WEIXIN_NOTIFY_TARGET_RE.match(target.strip()))
+
+
 def _route_target_skips_personal_list(target: str) -> bool:
     """Feishu groups and Discord channels ride on a route, not the personal DM list."""
     return is_dalton_chat_target(target) or is_dalton_discord_channel_target(target)
 
 
 def is_valid_dalton_personal_target(target: str) -> bool:
-    """A target a user may keep in their own list: a personal DM only (``feishu:user:``/``discord:user:``).
+    """A target a user may keep in their own list: a personal DM only (``feishu:user:``/``discord:user:``/``weixin:user:``).
 
     Group targets (``feishu:chat:``) and Discord channels never enter
     ``dalton_notify_targets``; they only appear inside an admin's route entries.
@@ -748,7 +757,7 @@ def validate_dalton_model_preferences(
         elif not isinstance(raw_targets, list):
             raise TuningError(
                 DALTON_NOTIFY_TARGETS_KEY,
-                f"{DALTON_NOTIFY_TARGETS_KEY} 必须为字符串列表（如 feishu:user:ou_xxx 或 discord:user:123）",
+                f"{DALTON_NOTIFY_TARGETS_KEY} 必须为字符串列表（如 feishu:user:ou_xxx、discord:user:123 或 weixin:user:<id>）",
             )
         else:
             deduped_targets: list[str] = []
@@ -757,7 +766,7 @@ def validate_dalton_model_preferences(
                 if not isinstance(item, str) or not is_valid_dalton_personal_target(item):
                     raise TuningError(
                         DALTON_NOTIFY_TARGETS_KEY,
-                        f"{DALTON_NOTIFY_TARGETS_KEY}: 个人目标格式无效 {item!r}，仅支持 feishu:user:<open_id> 或 discord:user:<数字id>（飞书群由内部成员在任务路由中选择）",
+                        f"{DALTON_NOTIFY_TARGETS_KEY}: 个人目标格式无效 {item!r}，仅支持 feishu:user:<open_id>、discord:user:<数字id> 或 weixin:user:<id>（飞书群由内部成员在任务路由中选择）",
                     )
                 cleaned_target = item.strip()
                 if cleaned_target not in seen_targets:
@@ -800,7 +809,7 @@ def validate_dalton_model_preferences(
                 if not isinstance(k, str) or not is_valid_dalton_notify_target(k.strip()):
                     raise TuningError(
                         DALTON_NOTIFY_TARGET_LABELS_KEY,
-                        f"{DALTON_NOTIFY_TARGET_LABELS_KEY}: 键必须是合法推送目标（feishu:user:<open_id>、feishu:chat:<chat_id> 或 discord:user:<数字id>）",
+                        f"{DALTON_NOTIFY_TARGET_LABELS_KEY}: 键必须是合法推送目标（feishu:user:<open_id>、feishu:chat:<chat_id>、discord:user:<数字id>、discord:channel:<数字id> 或 weixin:user:<id>）",
                     )
                 if v is None:
                     normalized_labels[k.strip()] = None
@@ -842,7 +851,7 @@ def validate_dalton_model_preferences(
                     if not isinstance(item, str) or not is_valid_dalton_notify_target(item):
                         raise TuningError(
                             DALTON_NOTIFY_ROUTES_KEY,
-                            f"{DALTON_NOTIFY_ROUTES_KEY}: 目标格式无效 {item!r}，仅支持 feishu:user:<open_id>、feishu:chat:<chat_id>、discord:user:<数字id> 或 discord:channel:<数字id>",
+                            f"{DALTON_NOTIFY_ROUTES_KEY}: 目标格式无效 {item!r}，仅支持 feishu:user:<open_id>、feishu:chat:<chat_id>、discord:user:<数字id>、discord:channel:<数字id> 或 weixin:user:<id>",
                         )
                     cleaned_route_target = item.strip()
                     if cleaned_route_target not in seen_route_targets:
@@ -999,6 +1008,44 @@ def _validate_and_prune_notify_target_refs(
         current_labels,
     )
 
+    stored_targets_raw = (
+        stored_bag.get(DALTON_NOTIFY_TARGETS_KEY)
+        if isinstance(stored_bag, Mapping)
+        else None
+    )
+    stored_target_set = (
+        {t.strip() for t in stored_targets_raw if isinstance(t, str) and t.strip()}
+        if isinstance(stored_targets_raw, list)
+        else set()
+    )
+    stored_routes_raw = (
+        stored_bag.get(DALTON_NOTIFY_ROUTES_KEY)
+        if isinstance(stored_bag, Mapping)
+        else None
+    )
+
+    def _stored_route_targets_for(key: str) -> set[str]:
+        if not isinstance(stored_routes_raw, Mapping):
+            return set()
+        for raw_k, raw_v in stored_routes_raw.items():
+            if isinstance(raw_k, str) and raw_k.strip() == key and isinstance(raw_v, list):
+                return {t.strip() for t in raw_v if isinstance(t, str) and t.strip()}
+        return set()
+
+    patched_targets = model_preference.get(DALTON_NOTIFY_TARGETS_KEY)
+    if isinstance(patched_targets, list) and bound_dm_targets is not None:
+        for item in patched_targets:
+            cleaned_item = item.strip() if isinstance(item, str) else ""
+            if (
+                is_dalton_weixin_user_target(cleaned_item)
+                and cleaned_item not in bound_dm_targets
+                and cleaned_item not in stored_target_set
+            ):
+                raise TuningError(
+                    DALTON_NOTIFY_TARGETS_KEY,
+                    f"{DALTON_NOTIFY_TARGETS_KEY}: 个人微信目标 {cleaned_item!r} 必须是当前账号已连接并激活的个人微信",
+                )
+
     patched_routes = model_preference.get(DALTON_NOTIFY_ROUTES_KEY)
     if isinstance(patched_routes, Mapping):
         for route_key, route_targets in patched_routes.items():
@@ -1006,13 +1053,28 @@ def _validate_and_prune_notify_target_refs(
                 continue
             cleaned_rk = route_key.strip() if isinstance(route_key, str) else ""
             is_task_route = cleaned_rk.startswith("automation:")
+            existing_route_set = _stored_route_targets_for(cleaned_rk)
             for item in route_targets:
                 cleaned_item = item.strip() if isinstance(item, str) else ""
-                if (
-                    cleaned_item
-                    and not _route_target_skips_personal_list(cleaned_item)
-                    and cleaned_item not in target_set
-                ):
+                if not cleaned_item or _route_target_skips_personal_list(cleaned_item):
+                    continue
+                if is_dalton_weixin_user_target(cleaned_item):
+                    if cleaned_item in existing_route_set:
+                        continue
+                    if bound_dm_targets is not None:
+                        if cleaned_item in bound_dm_targets:
+                            continue
+                        raise TuningError(
+                            DALTON_NOTIFY_ROUTES_KEY,
+                            f"{DALTON_NOTIFY_ROUTES_KEY}: 路由中的个人微信目标 {cleaned_item!r} 必须是当前账号已连接并激活的个人微信",
+                        )
+                    if cleaned_item in target_set or (is_task_route and skip_task_dm_list_check):
+                        continue
+                    raise TuningError(
+                        DALTON_NOTIFY_ROUTES_KEY,
+                        f"{DALTON_NOTIFY_ROUTES_KEY}: 路由中的个人微信目标 {cleaned_item!r} 必须是当前账号已连接并激活的个人微信",
+                    )
+                if cleaned_item not in target_set:
                     if is_task_route and (
                         skip_task_dm_list_check
                         or (bound_dm_targets is not None and cleaned_item in bound_dm_targets)
@@ -1044,13 +1106,17 @@ def _validate_and_prune_notify_target_refs(
                     if not _route_target_skips_personal_list(t):
                         preserved_task_dm_targets.add(t)
                 continue
-            # Personal entries must survive in the new list; group entries stay
-            # untouched whatever the personal list did.
-            kept = [
-                t
-                for t in original
-                if _route_target_skips_personal_list(t) or t in target_set
-            ]
+            # Personal entries must survive in the new list; group entries and
+            # caller's active personal Weixin route entries stay untouched.
+            kept: list[str] = []
+            for t in original:
+                if _route_target_skips_personal_list(t) or t in target_set:
+                    kept.append(t)
+                elif is_dalton_weixin_user_target(t) and (
+                    bound_dm_targets is None or t in bound_dm_targets
+                ):
+                    kept.append(t)
+                    preserved_task_dm_targets.add(t)
             if kept != original:
                 # An emptied route is `[]` (deliver nowhere), never null.
                 route_cleanup[cleaned_rk] = kept
@@ -1382,6 +1448,9 @@ async def _validate_report_automation_route_entries(
         prev_route_groups = [
             t for t in old_targets if _is_group_or_channel_target(t)
         ]
+        prev_route_weixin_dms = [
+            t for t in old_targets if is_dalton_weixin_user_target(t)
+        ]
 
         try:
             change = await validate_report_profile_change(
@@ -1389,9 +1458,10 @@ async def _validate_report_automation_route_entries(
                 auto,
                 candidate_profile,
                 via_rest=via_rest,
-                user_confirmed=user_confirmed,
+                confirmed=bool(user_confirmed),
                 action="route_update",
                 previous_groups_override=prev_route_groups if old_targets else None,
+                previous_dm_targets_override=prev_route_weixin_dms if old_targets else None,
                 skip_skill_match=True,
             )
         except ReportDeliveryError as exc:
@@ -1730,9 +1800,33 @@ async def apply_dalton_notify_preference_patch(
             model_pref, submitted_routes, stored_routes
         )
 
+        def _patch_contains_weixin_target(mp: Mapping[str, Any]) -> bool:
+            raw_targets = mp.get(DALTON_NOTIFY_TARGETS_KEY)
+            if isinstance(raw_targets, list) and any(
+                isinstance(t, str) and is_dalton_weixin_user_target(t)
+                for t in raw_targets
+            ):
+                return True
+            raw_routes = mp.get(DALTON_NOTIFY_ROUTES_KEY)
+            if isinstance(raw_routes, Mapping):
+                for rlist in raw_routes.values():
+                    if isinstance(rlist, list) and any(
+                        isinstance(t, str) and is_dalton_weixin_user_target(t)
+                        for t in rlist
+                    ):
+                        return True
+            return False
+
+        needs_bound_dm = (
+            (not skip_report_profile_validation)
+            and (
+                DALTON_NOTIFY_ROUTES_KEY in model_pref
+                or DALTON_NOTIFY_TARGETS_KEY in model_pref
+            )
+        ) or _patch_contains_weixin_target(model_pref)
         bound_dm_targets = (
             await load_bound_dm_targets(user_id, conn=db_conn)
-            if (not skip_report_profile_validation and DALTON_NOTIFY_ROUTES_KEY in model_pref)
+            if needs_bound_dm
             else None
         )
         validate_dalton_model_preferences(
@@ -1859,10 +1953,16 @@ async def add_dalton_personal_notify_target(
         submitted_routes = model_pref.get(DALTON_NOTIFY_ROUTES_KEY)
         stored_routes = stored_model_pref.get(DALTON_NOTIFY_ROUTES_KEY)
 
+        bound_dm_targets = (
+            await load_bound_dm_targets(user_id, conn=conn)
+            if is_dalton_weixin_user_target(cleaned_target)
+            else None
+        )
         validate_dalton_model_preferences(
             model_pref,
             effective_model_preference=effective,
             stored_model_preference=stored_model_pref,
+            bound_dm_targets=bound_dm_targets,
         )
         pruned_data_task_routes = collect_auto_pruned_data_task_routes(
             user_id,

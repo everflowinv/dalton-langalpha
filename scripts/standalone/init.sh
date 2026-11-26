@@ -26,7 +26,10 @@
 set -euo pipefail
 umask 077
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=scripts/standalone/env_tokens.sh
+source "${SCRIPT_DIR}/env_tokens.sh"
 ENV_FILE="${REPO_ROOT}/.env"
 ENV_EXAMPLE="${REPO_ROOT}/.env.core.example"
 DEFAULT_CORE_INTERNAL_SUBNET="172.31.250.0/24"
@@ -1122,6 +1125,8 @@ main() {
   set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME" "chat-uploads" || true
   set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_REGION" "us-east-1" || true
   set_env_if_empty "DALTON_CHAT_UPLOAD_STORAGE_ADDRESSING_STYLE" "path" || true
+  set_env_if_empty "DALTON_CAP_COMPANY_WIKI" "true" || true
+  set_env_if_empty "DALTON_RESEARCH_HOST_URL" "http://research-host:8951" || true
 
   local edge_port tls_bind http_port https_port public_url invite_domain cert_dir compose_file tls_overlay_file
   edge_port="$(get_env_value "DALTON_EDGE_PORT")"
@@ -1248,7 +1253,7 @@ main() {
   fi
   ok "DALTON_TLS_MODE=${actual_tls_mode:-$tls_mode} (bind=${actual_tls_bind:-$tls_bind}, http=${actual_http_port:-$http_port}, https=${actual_https_port:-$https_port}, url=${actual_public_url:-$public_url})"
 
-  # Generate all secrets with `openssl rand -hex 32` without overwriting existing values.
+  # Generate all secrets via shared env_tokens.sh helper without overwriting existing values.
   local generated=()
   local secret_keys=(
     "DB_PASSWORD"
@@ -1261,19 +1266,15 @@ main() {
     "EGRESS_RELAY_SECRET"
     "JWT_SIGNING_SECRET"
     "BOOTSTRAP_SETUP_TOKEN"
+    "DALTON_RESEARCH_HOST_TOKEN"
+    "DALTON_RESEARCH_ADMIN_TOKEN"
   )
 
-  local key new_val
-  for key in "${secret_keys[@]}"; do
-    local cur
-    cur="$(get_env_value "$key")"
-    # Treat obvious placeholder dev values as unset so they are replaced safely.
-    if [[ -z "$cur" || "$cur" == "langalpha-local-dev-encryption-key" ]]; then
-      new_val="$(gen_hex_secret)"
-      write_env_key "$key" "$new_val"
-      generated+=("$key")
-    fi
-  done
+  local added_str=""
+  added_str="$(ensure_env_tokens "$ENV_FILE" "${secret_keys[@]}")"
+  if [[ -n "$added_str" ]]; then
+    read -r -a generated <<< "$added_str"
+  fi
 
   # Mirror MinIO root credentials into DALTON_CHAT_UPLOAD_STORAGE_* when unset.
   local minio_user minio_pass

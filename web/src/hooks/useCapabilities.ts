@@ -17,6 +17,10 @@ export const CAPABILITY_IDS = [
   'researchdata_bridge',
   'alphaengine',
   'guidepoint',
+  'company_wiki',
+  'sales_notes',
+  'tmtb',
+  'funda_ai',
   'feishu_docs',
   'channel_gateway',
   'channel_feishu',
@@ -27,6 +31,7 @@ export const CAPABILITY_IDS = [
   'native_oauth_sync',
   'transcription',
   'colleague_sharing',
+  'fund_automations',
 ] as const;
 
 export type CapabilityId = (typeof CAPABILITY_IDS)[number];
@@ -40,6 +45,10 @@ export const EVERFLOW_DEFAULT_CAPABILITIES: readonly CapabilityId[] = [
   'researchdata_bridge',
   'alphaengine',
   'guidepoint',
+  'company_wiki',
+  'sales_notes',
+  'tmtb',
+  'funda_ai',
   'feishu_docs',
   'channel_gateway',
   'channel_feishu',
@@ -49,13 +58,15 @@ export const EVERFLOW_DEFAULT_CAPABILITIES: readonly CapabilityId[] = [
   'conversation_archive',
   'native_oauth_sync',
   'colleague_sharing',
+  'fund_automations',
 ];
 
 /**
- * Core build default capability set (all optional capabilities disabled until
+ * Core build default capability set (`company_wiki` is enabled by default in
+ * Standalone Core; optional Everflow capabilities remain disabled until
  * `/api/v1/dalton/capabilities` confirms otherwise).
  */
-export const CORE_DEFAULT_CAPABILITIES: readonly CapabilityId[] = [];
+export const CORE_DEFAULT_CAPABILITIES: readonly CapabilityId[] = ['company_wiki'];
 
 export const EVERFLOW_DEFAULT_CAPABILITY_SET: ReadonlySet<CapabilityId> = new Set(
   EVERFLOW_DEFAULT_CAPABILITIES,

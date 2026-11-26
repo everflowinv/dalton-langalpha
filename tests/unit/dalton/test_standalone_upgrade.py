@@ -1199,4 +1199,2530 @@ exit 0
     assert int(poll_count_file.read_text(encoding="utf-8").strip()) == 2
 
 
+def test_upgrade_backfills_missing_research_host_tokens_and_verifies_wiki_mcp(tmp_path: Path):
+    """Item #2: upgrade.sh backfills missing research-host tokens without overwriting existing ones,
+    and runs an authenticated /mcp/company-wiki tools/list probe."""
+    from dotenv import dotenv_values
+    from fastapi.testclient import TestClient
+
+    from src.dalton.profile import DeploymentProfile
+    from src.dalton.research_host.app import ResearchHostConfig, create_app
+
+    # Part A: old .env missing DALTON_RESEARCH_HOST_TOKEN and DALTON_RESEARCH_ADMIN_TOKEN
+    missing_dir = tmp_path / "missing_tokens"
+    missing_dir.mkdir()
+    w_a, r_a, fb_a, _tr_a = _make_fake_env(
+        missing_dir,
+        compose_services="postgres\nredis\nbackend\ncrawler\nresearch-host\nedge\n",
+        pre_up="148",
+        pre_da="d049",
+        post_up="148",
+        post_da="d049",
+        new_upstream_head="148",
+        new_dalton_head="d049",
+    )
+    probe_token_log = tmp_path / "rh_probe_token.txt"
+    fd_path = fb_a / "docker"
+    fd_src = fd_path.read_text(encoding="utf-8")
+    rh_probe_handler = f"""      if [[ "$joined" == *"research-host"* && "$joined" == *"/healthz"* ]]; then
+        echo "enabled"
+        exit 0
+      fi
+      if [[ "$joined" == *"research-host"* && "$joined" == *"/mcp/company-wiki"* ]]; then
+        printf '%s' "${{DALTON_RH_PROBE_TOKEN:-}}" > "{probe_token_log}"
+        if [[ -z "${{DALTON_RH_PROBE_TOKEN:-}}" ]]; then
+          exit 1
+        fi
+        exit 0
+      fi
+      if [[ "$joined" == *"/health"* ]]; then"""
+    assert '      if [[ "$joined" == *"/health"* ]]; then' in fd_src
+    fd_path.write_text(
+        fd_src.replace('      if [[ "$joined" == *"/health"* ]]; then', rh_probe_handler, 1),
+        encoding="utf-8",
+    )
+
+    res_a = subprocess.run(
+        [
+            "bash",
+            str(_UPGRADE_SCRIPT),
+            "--work-dir",
+            str(w_a),
+            "--release-dir",
+            str(r_a),
+            "--skip-build",
+        ],
+        env={
+            **os.environ,
+            "PATH": f"{fb_a}:{os.environ['PATH']}",
+            "DALTON_POST_UPGRADE_HEALTH_RETRIES": "1",
+            "DALTON_POST_UPGRADE_HEALTH_SLEEP_S": "0",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_a.returncode == 0, f"stdout:\n{res_a.stdout}\nstderr:\n{res_a.stderr}"
+
+    env_vals = dotenv_values(w_a / ".env")
+    host_tok = env_vals.get("DALTON_RESEARCH_HOST_TOKEN") or ""
+    admin_tok = env_vals.get("DALTON_RESEARCH_ADMIN_TOKEN") or ""
+    assert len(host_tok) == 64 and all(c in "0123456789abcdef" for c in host_tok)
+    assert len(admin_tok) == 64 and all(c in "0123456789abcdef" for c in admin_tok)
+    assert host_tok != admin_tok
+    assert env_vals.get("DB_HOST") == "postgres"
+    assert env_vals.get("DOMAIN") == "localhost"
+    assert (w_a / ".env").stat().st_mode & 0o777 == 0o600
+    assert probe_token_log.read_text(encoding="utf-8") == host_tok
+
+    # Verify the backfilled token actually unlocks authenticated company-wiki tools/list
+    wiki_dir = tmp_path / "upgrade_wiki_data"
+    cfg = ResearchHostConfig(
+        profile=DeploymentProfile.CORE,
+        data_root=wiki_dir,
+        mcp_token=host_tok,
+        admin_token=admin_tok,
+    )
+    app = create_app(cfg)
+    client = TestClient(app)
+    unauth = client.post(
+        "/mcp/company-wiki",
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    )
+    assert unauth.status_code == 401
+    authed = client.post(
+        "/mcp/company-wiki",
+        headers={"Authorization": f"Bearer {host_tok}"},
+        json={"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+    )
+    assert authed.status_code == 200, authed.text
+    tool_names = [t["name"] for t in authed.json()["result"]["tools"]]
+    assert "search" in tool_names
+
+    # Part B: existing tokens in .env must NEVER be overwritten
+    existing_dir = tmp_path / "existing_tokens"
+    existing_dir.mkdir()
+    w_b, r_b, fb_b, _tr_b = _make_fake_env(
+        existing_dir,
+        compose_services="postgres\nredis\nbackend\ncrawler\nresearch-host\nedge\n",
+        pre_up="148",
+        pre_da="d049",
+        post_up="148",
+        post_da="d049",
+        new_upstream_head="148",
+        new_dalton_head="d049",
+    )
+    with (w_b / ".env").open("a", encoding="utf-8") as fh:
+        fh.write("DALTON_RESEARCH_HOST_TOKEN=existing-host-token-keep-me\n")
+        fh.write("DALTON_RESEARCH_ADMIN_TOKEN=existing-admin-token-keep-me\n")
+    fd_b = fb_b / "docker"
+    fd_b_src = fd_b.read_text(encoding="utf-8")
+    fd_b.write_text(
+        fd_b_src.replace(
+            '      if [[ "$joined" == *"/health"* ]]; then',
+            """      if [[ "$joined" == *"research-host"* && "$joined" == *"/healthz"* ]]; then
+        echo "enabled"
+        exit 0
+      fi
+      if [[ "$joined" == *"research-host"* && "$joined" == *"/mcp/company-wiki"* ]]; then
+        if [[ "${DALTON_RH_PROBE_TOKEN:-}" != "existing-host-token-keep-me" ]]; then
+          exit 1
+        fi
+        exit 0
+      fi
+      if [[ "$joined" == *"/health"* ]]; then""",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    res_b = subprocess.run(
+        [
+            "bash",
+            str(_UPGRADE_SCRIPT),
+            "--work-dir",
+            str(w_b),
+            "--release-dir",
+            str(r_b),
+            "--skip-build",
+        ],
+        env={
+            **os.environ,
+            "PATH": f"{fb_b}:{os.environ['PATH']}",
+            "DALTON_POST_UPGRADE_HEALTH_RETRIES": "1",
+            "DALTON_POST_UPGRADE_HEALTH_SLEEP_S": "0",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_b.returncode == 0, f"stdout:\n{res_b.stdout}\nstderr:\n{res_b.stderr}"
+    env_vals_b = dotenv_values(w_b / ".env")
+    assert env_vals_b.get("DALTON_RESEARCH_HOST_TOKEN") == "existing-host-token-keep-me"
+    assert env_vals_b.get("DALTON_RESEARCH_ADMIN_TOKEN") == "existing-admin-token-keep-me"
+
+    # Part C (r7 #2): DALTON_CAP_COMPANY_WIKI=' false ' disables company-wiki in research-host;
+    # upgrade.sh reads actual capability state from running `/healthz` (not bash .env parsing)
+    # and skips the /mcp/company-wiki probe without failing.
+    from src.dalton.capabilities import CapabilityId, effective_capabilities
+    from src.dalton.config_env import load_shared_dotenv
+
+    disabled_dir = tmp_path / "wiki_disabled_quoted"
+    disabled_dir.mkdir()
+    w_c, r_c, fb_c, _tr_c = _make_fake_env(
+        disabled_dir,
+        compose_services="postgres\nredis\nbackend\ncrawler\nresearch-host\nedge\n",
+        pre_up="148",
+        pre_da="d049",
+        post_up="148",
+        post_da="d049",
+        new_upstream_head="148",
+        new_dalton_head="d049",
+    )
+    with (w_c / ".env").open("a", encoding="utf-8") as fh:
+        fh.write("APP_ENV=core\n")
+        fh.write("DALTON_CAP_COMPANY_WIKI=' false '\n")
+
+    # Confirm real Python shared loader + research-host /healthz report company-wiki=False
+    iso_env: dict[str, str] = {}
+    load_shared_dotenv(w_c / ".env", environ=iso_env)
+    iso_caps = effective_capabilities(profile=DeploymentProfile.CORE, environ=iso_env)
+    assert CapabilityId.COMPANY_WIKI not in iso_caps
+    app_c = create_app(
+        ResearchHostConfig(
+            profile=DeploymentProfile.CORE,
+            data_root=tmp_path / "disabled_wiki_data",
+            mcp_token="tok-c-mcp",
+            admin_token="tok-c-adm",
+        ),
+        capabilities_provider=lambda: iso_caps,
+    )
+    hz_c = TestClient(app_c).get("/healthz").json()
+    assert hz_c["ok"] is True and hz_c["connectors"]["company-wiki"] is False
+    expected_state = "enabled" if hz_c["connectors"]["company-wiki"] else "disabled"
+
+    mcp_probe_called = tmp_path / "wiki_disabled_mcp_called"
+    fd_c = fb_c / "docker"
+    fd_c_src = fd_c.read_text(encoding="utf-8")
+    fd_c.write_text(
+        fd_c_src.replace(
+            '      if [[ "$joined" == *"/health"* ]]; then',
+            f"""      if [[ "$joined" == *"research-host"* && "$joined" == *"/healthz"* ]]; then
+        echo "{expected_state}"
+        exit 0
+      fi
+      if [[ "$joined" == *"research-host"* && "$joined" == *"/mcp/company-wiki"* ]]; then
+        touch "{mcp_probe_called}"
+        exit 1
+      fi
+      if [[ "$joined" == *"/health"* ]]; then""",
+            1,
+        ),
+        encoding="utf-8",
+    )
+    res_c = subprocess.run(
+        [
+            "bash",
+            str(_UPGRADE_SCRIPT),
+            "--work-dir",
+            str(w_c),
+            "--release-dir",
+            str(r_c),
+            "--skip-build",
+        ],
+        env={
+            **os.environ,
+            "PATH": f"{fb_c}:{os.environ['PATH']}",
+            "DALTON_POST_UPGRADE_HEALTH_RETRIES": "1",
+            "DALTON_POST_UPGRADE_HEALTH_SLEEP_S": "0",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_c.returncode == 0, f"stdout:\n{res_c.stdout}\nstderr:\n{res_c.stderr}"
+    assert not mcp_probe_called.exists(), "upgrade.sh must not probe /mcp/company-wiki when /healthz reports it disabled"
+
+
+def test_backup_and_restore_include_wiki_volume_sqlite_originals_and_receipts(tmp_path: Path):
+    """Item #3: backup.sh & restore.sh round-trip the Wiki data volume
+    (SQLite online backup, Markdown, originals binary, image index, audit receipts)."""
+    import asyncio
+    import base64
+    import hashlib
+    import io
+    import json
+    import sqlite3
+    import tarfile
+
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    from src.dalton.research_host.wiki_store import OpenWikiStore
+
+    backup_script = _REPO_ROOT / "scripts/standalone/backup.sh"
+    restore_script = _REPO_ROOT / "scripts/standalone/restore.sh"
+
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    (work_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    (work_dir / "docker-compose.core.yml").write_text("services: {}\n", encoding="utf-8")
+    (work_dir / ".env").write_text(
+        "\n".join(
+            [
+                "COMPOSE_PROJECT_NAME=dalton_wiki_br_test",
+                "DB_HOST=postgres",
+                "DB_USER=postgres",
+                "DB_PASSWORD=postgres",
+                "DB_NAME=postgres",
+                "DOMAIN=localhost",
+                "DALTON_TLS_MODE=loopback",
+                "DALTON_EDGE_PORT=8088",
+                "DALTON_CHAT_UPLOAD_STORAGE_PROVIDER=s3",
+                "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT=http://minio:9000",
+                "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME=chat-uploads",
+                "MINIO_ROOT_USER=minioadmin",
+                "MINIO_ROOT_PASSWORD=minioadmin",
+                "DALTON_RESEARCH_ADMIN_TOKEN=backup-test-admin-token-1234",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # Seed source Wiki volume with a compressed PDF + PNG image via OpenWikiStore
+    src_wiki = tmp_path / "src_wiki"
+    dst_wiki = tmp_path / "dst_wiki"
+    dst_wiki.mkdir()
+    store = OpenWikiStore(src_wiki)
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    font_dict = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
+    )
+    page[NameObject("/Resources")] = DictionaryObject(
+        {NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font_dict)})}
+    )
+    stream = DecodedStreamObject()
+    stream.set_data(
+        b"BT /F1 12 Tf 72 720 Td (BackupRestoreUniqueCompressedPdfMarker 2026Q4) Tj ET"
+    )
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    page.compress_content_streams()
+    pdf_buf = io.BytesIO()
+    writer.write(pdf_buf)
+    pdf_bytes = pdf_buf.getvalue()
+
+    sc_pdf, pdf_receipt = asyncio.run(
+        store.ingest(
+            {
+                "request_id": "br-req-pdf-001",
+                "target_type": "company",
+                "target": "BRCorp",
+                "content_type": "研报笔记",
+                "title": "BR Compressed Memo",
+                "date": "2026-11-26",
+                "source": "backup-test",
+                "tags": ["backup-verify"],
+                "file": {
+                    "filename": "memo.pdf",
+                    "content_b64": base64.b64encode(pdf_bytes).decode("ascii"),
+                },
+            }
+        )
+    )
+    assert sc_pdf == 200 and pdf_receipt["ok"] is True, pdf_receipt
+
+    png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII="
+    )
+    sc_img, img_receipt = asyncio.run(
+        store.ingest(
+            {
+                "request_id": "br-req-img-001",
+                "target_type": "company",
+                "target": "BRCorp",
+                "content_type": "研报笔记",
+                "title": "BR Chart Image",
+                "date": "2026-11-26",
+                "source": "backup-test",
+                "body": "BackupRestoreImageSummaryText",
+                "file": {
+                    "filename": "chart.png",
+                    "content_b64": base64.b64encode(png_bytes).decode("ascii"),
+                },
+            }
+        )
+    )
+    assert sc_img == 200 and img_receipt["ok"] is True, img_receipt
+
+    # Hermetic fake docker/curl that execute backup.sh & restore.sh's REAL wiki Python/tar commands
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir()
+    py_exe = sys.executable
+    pause_events_log = tmp_path / "wiki_pause_events.log"
+    lease_state_file = tmp_path / "wiki_lease_state.json"
+    fail_wiki_backup_flag = tmp_path / "fail_wiki_backup.flag"
+    fail_wiki_resume_flag = tmp_path / "fail_wiki_resume.flag"
+    hold_backup_gate_flag = tmp_path / "hold_backup_gate.flag"
+    in_backup_marker = tmp_path / "in_backup_marker.flag"
+    backup_sleep_file = tmp_path / "backup_sleep_s.txt"
+
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        f"""#!/usr/bin/env python3
+import fcntl, io, json, os, subprocess, sys, tarfile, time
+
+args = sys.argv[1:]
+if not args or args[0] != "compose":
+    sys.exit(0)
+
+# Strip compose global flags
+i = 1
+while i < len(args):
+    if args[i] in ("-p", "-f", "--env-file", "--project-directory"):
+        i += 2
+    else:
+        break
+sub = args[i] if i < len(args) else ""
+rest = args[i + 1 :]
+
+if sub == "config":
+    if "--services" in rest:
+        sys.stdout.write("postgres\\nredis\\nminio\\nbackend\\nedge\\nresearch-host\\n")
+        sys.exit(0)
+    if "--format" in rest and "json" in rest:
+        cfg = {{
+            "services": {{
+                "backend": {{
+                    "environment": {{
+                        "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT_URL": "http://minio:9000",
+                        "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME": "chat-uploads",
+                        "DALTON_CHAT_UPLOAD_STORAGE_ACCESS_KEY_ID": "minioadmin",
+                        "DALTON_CHAT_UPLOAD_STORAGE_SECRET_ACCESS_KEY": "minioadmin",
+                        "MINIO_ROOT_USER": "minioadmin",
+                        "MINIO_ROOT_PASSWORD": "minioadmin",
+                    }}
+                }}
+            }}
+        }}
+        sys.stdout.write(json.dumps(cfg))
+        sys.exit(0)
+    sys.exit(0)
+
+if sub == "ps":
+    sys.stdout.write("postgres\\nredis\\nminio\\nbackend\\nedge\\nresearch-host\\n")
+    sys.exit(0)
+
+if sub in ("up", "build", "stop"):
+    sys.exit(0)
+
+if sub == "port":
+    sys.stdout.write("127.0.0.1:8088\\n")
+    sys.exit(0)
+
+if sub == "exec":
+    joined = " ".join(rest)
+    if "research-host" in rest:
+        if "/admin/wiki/pause-writes" in joined:
+            tok = os.environ.get("DALTON_RH_ADMIN_TOKEN", "")
+            if not tok:
+                sys.exit(1)
+            owner = os.environ.get("DALTON_RH_PAUSE_OWNER", "")
+            lease_id_env = os.environ.get("DALTON_RH_PAUSE_LEASE_ID", "").strip()
+            ttl_env = os.environ.get("DALTON_RH_PAUSE_TTL_S", "").strip()
+            state_path = {str(lease_state_file)!r}
+            lock_fd = os.open(state_path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                if os.path.exists(state_path):
+                    with open(state_path, encoding="utf-8") as sf:
+                        st = json.load(sf)
+                else:
+                    st = {{"next_id": 0, "paused": False, "owner": None, "lease_id": 0, "expires_at": 0.0}}
+                now = time.time()
+                if st["paused"] and now >= float(st.get("expires_at") or 0.0):
+                    st["paused"] = False
+                    st["owner"] = None
+                    st["lease_id"] = 0
+                with open({str(pause_events_log)!r}, "a", encoding="utf-8") as lf:
+                    if "DALTON_RH_PAUSE_TTL_S" in joined and "DALTON_RH_PAUSE_LEASE_ID" in joined:
+                        # Heartbeat renewal
+                        req_lid = int(lease_id_env)
+                        ttl_s = float(ttl_env or "300")
+                        if not st["paused"] or st["lease_id"] != req_lid or st["owner"] != owner:
+                            lf.write(f"renew_expired:{{owner}}:{{req_lid}}\\n")
+                            with open(state_path, "w", encoding="utf-8") as sf:
+                                json.dump(st, sf)
+                            sys.exit(1)
+                        st["expires_at"] = now + ttl_s
+                        lf.write(f"renew:{{owner}}:{{req_lid}}\\n")
+                        with open(state_path, "w", encoding="utf-8") as sf:
+                            json.dump(st, sf)
+                        sys.exit(0)
+                    elif "DALTON_RH_PAUSE_TTL_S" in joined:
+                        # Initial pause acquire
+                        if not owner:
+                            sys.exit(1)
+                        ttl_s = float(ttl_env or "300")
+                        if st["paused"] and st["owner"] != owner:
+                            sys.exit(1)
+                        st["next_id"] += 1
+                        st["paused"] = True
+                        st["owner"] = owner
+                        st["lease_id"] = st["next_id"]
+                        st["expires_at"] = now + ttl_s
+                        lf.write(f"pause:{{owner}}:{{st['lease_id']}}\\n")
+                        with open(state_path, "w", encoding="utf-8") as sf:
+                            json.dump(st, sf)
+                        sys.stdout.write(f"{{st['lease_id']}}\\n")
+                        sys.exit(0)
+                    elif "DALTON_RH_PAUSE_OWNER" in joined:
+                        # Resume
+                        if not owner:
+                            sys.exit(1)
+                        if os.path.exists({str(fail_wiki_resume_flag)!r}):
+                            lf.write(f"resume_fail:{{owner}}\\n")
+                            sys.exit(1)
+                        req_lid = int(lease_id_env) if lease_id_env else 0
+                        if not st["paused"]:
+                            lf.write(f"resume_expired:{{owner}}:{{req_lid}}\\n")
+                            with open(state_path, "w", encoding="utf-8") as sf:
+                                json.dump(st, sf)
+                            sys.stdout.write("EXPIRED\\n")
+                            sys.exit(0)
+                        if st["owner"] != owner or (req_lid and st["lease_id"] != req_lid):
+                            sys.exit(1)
+                        st["paused"] = False
+                        st["owner"] = None
+                        st["lease_id"] = 0
+                        st["expires_at"] = 0.0
+                        lf.write(f"resume:{{owner}}:{{req_lid}}\\n")
+                        with open(state_path, "w", encoding="utf-8") as sf:
+                            json.dump(st, sf)
+                        sys.stdout.write("OK\\n")
+                        sys.exit(0)
+                    else:
+                        lf.write("poll_in_flight\\n")
+                        sys.stdout.write("0\\n")
+                        sys.exit(0)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+        idx = rest.index("-c")
+        script = rest[idx + 1]
+        with open({str(pause_events_log)!r}, "a", encoding="utf-8") as lf:
+            lf.write("backup_python\\n")
+        if os.path.exists({str(backup_sleep_file)!r}):
+            with open({str(backup_sleep_file)!r}, encoding="utf-8") as bsf:
+                sleep_dur = float(bsf.read().strip() or "0")
+            if sleep_dur > 0:
+                time.sleep(sleep_dur)
+        if os.path.exists({str(hold_backup_gate_flag)!r}):
+            with open({str(in_backup_marker)!r}, "w", encoding="utf-8") as mf:
+                mf.write("1")
+            deadline = time.monotonic() + 10.0
+            while os.path.exists({str(hold_backup_gate_flag)!r}) and time.monotonic() < deadline:
+                time.sleep(0.05)
+        if os.path.exists({str(fail_wiki_backup_flag)!r}):
+            sys.exit(17)
+        env = dict(os.environ, DALTON_WIKI_DATA_DIR={str(src_wiki)!r})
+        rc = subprocess.run([{py_exe!r}, "-c", script], env=env).returncode
+        sys.exit(rc)
+    if "pg_dump" in rest:
+        sys.stdout.buffer.write(b"PGDMP-FAKE-BACKUP")
+        sys.exit(0)
+    if "pg_restore" in rest:
+        if "--list" in rest:
+            sys.stdout.write("1; 0 0 TABLE public users postgres\\n")
+            sys.exit(0)
+        if "-f" in rest:
+            sys.stdout.write("")
+            sys.exit(0)
+        sys.exit(0)
+    if "pg_isready" in rest:
+        sys.exit(0)
+    if "psql" in rest:
+        if "is_superuser" in joined or "rolsuper" in joined:
+            sys.stdout.write("on\\n")
+        elif "pg_database" in joined:
+            sys.stdout.write("postgres\\n")
+        elif "pg_class" in joined:
+            sys.stdout.write("0\\t0\\t0\\n")
+        elif "to_regclass" in joined:
+            sys.stdout.write("\\n")
+        elif "uploading" in joined:
+            sys.stdout.write("0\\n")
+        elif "alembic_version_dalton" in joined:
+            sys.stdout.write("d049\\n")
+        elif "alembic_version" in joined:
+            sys.stdout.write("148\\n")
+        sys.exit(0)
+    if "backend" in rest and "python" in rest:
+        # MinIO backup stream: empty valid tar.gz containing _dalton_minio_manifest.json
+        manifest = {{
+            "primary_bucket": "chat-uploads",
+            "primary_key_prefix": "",
+            "targets": {{"chat_upload": {{"bucket": "chat-uploads", "key_prefix": ""}}}},
+            "bucket_count": 1,
+            "object_count": 0,
+            "total_bytes": 0,
+            "objects": [],
+        }}
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            raw = json.dumps(manifest).encode("utf-8")
+            ti = tarfile.TarInfo(name="_minio_manifest.json")
+            ti.size = len(raw)
+            tf.addfile(ti, io.BytesIO(raw))
+        sys.stdout.buffer.write(buf.getvalue())
+        sys.exit(0)
+    if "edge" in rest and "tar" in rest:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            raw = b"fake-caddy"
+            ti = tarfile.TarInfo(name="caddy.txt")
+            ti.size = len(raw)
+            tf.addfile(ti, io.BytesIO(raw))
+        sys.stdout.buffer.write(buf.getvalue())
+        sys.exit(0)
+    if "curl" in rest:
+        sys.exit(0)
+    sys.exit(0)
+
+if sub == "run":
+    joined = " ".join(rest)
+    if "research-host" in rest and "-c" in rest:
+        c_idx = rest.index("-c")
+        cmd_str = rest[c_idx + 1]
+        extra = rest[c_idx + 2 :]
+        if "tar -xzf" in cmd_str:
+            rewritten = cmd_str.replace("/var/lib/dalton/wiki", {str(dst_wiki)!r})
+            rc = subprocess.run(["/bin/sh", "-c", rewritten]).returncode
+            sys.exit(rc)
+        if "python -c" in cmd_str and len(extra) >= 2:
+            env = dict(os.environ, DALTON_WIKI_DATA_DIR={str(dst_wiki)!r})
+            rc = subprocess.run([{py_exe!r}, "-c", extra[1]], env=env).returncode
+            sys.exit(rc)
+    if "backend" in rest and "MINIO_PREFLIGHT" not in joined and "-c" in rest:
+        if "EMPTY" in joined:
+            sys.stdout.write("EMPTY\\n")
+        sys.exit(0)
+    sys.exit(0)
+
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+
+    fake_curl = fake_bin / "curl"
+    fake_curl.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    fake_curl.chmod(0o755)
+
+    backups_dir = tmp_path / "backups"
+    run_env = {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"}
+
+    # 1. Run backup.sh
+    b_res = subprocess.run(
+        [
+            "bash",
+            str(backup_script),
+            "--work-dir",
+            str(work_dir),
+            "--output-dir",
+            str(backups_dir),
+        ],
+        env=run_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert b_res.returncode == 0, f"backup stdout:\n{b_res.stdout}\nstderr:\n{b_res.stderr}"
+    # r7/r8/r9 #1: Verify backup paused Wiki writes with owner+lease_id, drained in-flight writes, ran online backup, then resumed with same owner+lease_id
+    events = pause_events_log.read_text(encoding="utf-8").splitlines()
+    assert len(events) >= 4, events
+    assert events[0].startswith("pause:") and events[1] == "poll_in_flight" and events[2] == "backup_python"
+    assert events[-1] == "resume:" + events[0].split(":", 1)[1], events
+
+    # r9 #1a: Copy duration EXCEEDS TTL (0.9s > 0.5s) -> heartbeat renews the SAME lease_id continuously and backup succeeds!
+    pause_events_log.write_text("", encoding="utf-8")
+    backup_sleep_file.write_text("0.9", encoding="utf-8")
+    b_long_ok = subprocess.run(
+        [
+            "bash",
+            str(backup_script),
+            "--work-dir",
+            str(work_dir),
+            "--output-dir",
+            str(tmp_path / "backups_long_hb"),
+        ],
+        env={
+            **run_env,
+            "DALTON_WIKI_PAUSE_TTL_S": "0.5",
+            "DALTON_WIKI_PAUSE_HEARTBEAT_S": "0.15",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    backup_sleep_file.unlink()
+    assert b_long_ok.returncode == 0, f"long heartbeat backup failed:\n{b_long_ok.stdout}\n{b_long_ok.stderr}"
+    hb_events = pause_events_log.read_text(encoding="utf-8").splitlines()
+    assert any(e.startswith("renew:") for e in hb_events), f"expected heartbeat renewals, got: {hb_events}"
+    assert hb_events[-1].startswith("resume:"), hb_events
+
+    # r9 #1b: Copy duration EXCEEDS TTL without timely heartbeat -> lease expires mid-copy ->
+    # backup.sh MUST fail non-zero and NOT publish an inconsistent backup directory!
+    pause_events_log.write_text("", encoding="utf-8")
+    backup_sleep_file.write_text("0.45", encoding="utf-8")
+    expired_out_dir = tmp_path / "backups_expired_lease"
+    b_expired = subprocess.run(
+        [
+            "bash",
+            str(backup_script),
+            "--work-dir",
+            str(work_dir),
+            "--output-dir",
+            str(expired_out_dir),
+        ],
+        env={
+            **run_env,
+            "DALTON_WIKI_PAUSE_TTL_S": "0.15",
+            "DALTON_WIKI_PAUSE_HEARTBEAT_S": "5",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    backup_sleep_file.unlink()
+    assert b_expired.returncode != 0, "backup.sh must fail when pause lease expires mid-backup"
+    assert "expired" in b_expired.stderr.lower() or "did not remain active" in b_expired.stderr.lower()
+    published_after_expiry = [p for p in expired_out_dir.iterdir() if p.is_dir() and p.name.startswith("dalton-backup-")] if expired_out_dir.exists() else []
+    assert published_after_expiry == [], f"incomplete backup must be deleted on lease expiry, found: {published_after_expiry}"
+
+    # r7 #1: Verify cleanup trap resumes Wiki writes even if online backup fails mid-stream
+    pause_events_log.write_text("", encoding="utf-8")
+    fail_wiki_backup_flag.write_text("1", encoding="utf-8")
+    b_fail = subprocess.run(
+        [
+            "bash",
+            str(backup_script),
+            "--work-dir",
+            str(work_dir),
+            "--output-dir",
+            str(backups_dir),
+        ],
+        env=run_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    fail_wiki_backup_flag.unlink()
+    assert b_fail.returncode != 0
+    fail_events = pause_events_log.read_text(encoding="utf-8").splitlines()
+    assert len(fail_events) >= 4 and fail_events[0].startswith("pause:") and fail_events[-1].startswith("resume:"), fail_events
+
+    # r8 #1a: Resume failure MUST cause backup.sh to exit non-zero with a clear diagnostic (not just warn!)
+    pause_events_log.write_text("", encoding="utf-8")
+    fail_wiki_resume_flag.write_text("1", encoding="utf-8")
+    b_res_fail = subprocess.run(
+        [
+            "bash",
+            str(backup_script),
+            "--work-dir",
+            str(work_dir),
+            "--output-dir",
+            str(tmp_path / "backups_resume_fail"),
+        ],
+        env=run_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    fail_wiki_resume_flag.unlink()
+    # Reset simulated lease state since resume was forced to fail above
+    if lease_state_file.exists():
+        lease_state_file.unlink()
+    assert b_res_fail.returncode != 0, "backup.sh must exit non-zero when resuming Wiki writes fails"
+    assert "Failed to resume Wiki writes" in b_res_fail.stderr or "could not be confirmed resumed" in b_res_fail.stderr
+
+    # r8/r9 #2: Atomic fcntl.flock per-instance Wiki mutex serializes / blocks concurrent backups (zero PID-file race!)
+    import time
+
+    pause_events_log.write_text("", encoding="utf-8")
+    hold_backup_gate_flag.write_text("1", encoding="utf-8")
+    if in_backup_marker.exists():
+        in_backup_marker.unlink()
+    p1 = subprocess.Popen(
+        [
+            "bash",
+            str(backup_script),
+            "--work-dir",
+            str(work_dir),
+            "--output-dir",
+            str(tmp_path / "backups_conc_1"),
+        ],
+        env=run_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 10.0
+        while not in_backup_marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert in_backup_marker.exists(), "First backup did not reach Wiki backup section"
+        # Start second backup concurrently with wait=0.3s targeting a DIFFERENT output dir -> rejected by flock
+        p2_res = subprocess.run(
+            [
+                "bash",
+                str(backup_script),
+                "--work-dir",
+                str(work_dir),
+                "--output-dir",
+                str(tmp_path / "backups_conc_2"),
+            ],
+            env={**run_env, "DALTON_WIKI_BACKUP_LOCK_WAIT_S": "0.3"},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert p2_res.returncode != 0, "Concurrent second backup must not bypass per-instance flock mutex"
+        assert "Another Wiki backup is already running" in p2_res.stderr
+
+        # Start third backup concurrently with generous wait -> waits until P1 releases flock, then succeeds serially!
+        p3 = subprocess.Popen(
+            [
+                "bash",
+                str(backup_script),
+                "--work-dir",
+                str(work_dir),
+                "--output-dir",
+                str(tmp_path / "backups_conc_3"),
+            ],
+            env={**run_env, "DALTON_WIKI_BACKUP_LOCK_WAIT_S": "15"},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        time.sleep(0.25)
+        assert p3.poll() is None, "p3 must block on flock while p1 holds it"
+    finally:
+        if hold_backup_gate_flag.exists():
+            hold_backup_gate_flag.unlink()
+        p1_out, p1_err = p1.communicate(timeout=20)
+    p3_out, p3_err = p3.communicate(timeout=20)
+    assert p1.returncode == 0, f"p1 failed:\n{p1_out}\n{p1_err}"
+    assert p3.returncode == 0, f"p3 failed:\n{p3_out}\n{p3_err}"
+    conc_events = pause_events_log.read_text(encoding="utf-8").splitlines()
+    # Verify strict serialization: p1's resume MUST occur strictly BEFORE p3's pause!
+    p1_resume_idx = next(idx for idx, ev in enumerate(conc_events) if ev.startswith("resume:"))
+    p3_pause_idx = next(idx for idx, ev in enumerate(conc_events) if idx > 0 and ev.startswith("pause:"))
+    assert p1_resume_idx < p3_pause_idx, f"Backups overlapped instead of serializing via flock: {conc_events}"
+
+    backup_dirs = [p for p in backups_dir.iterdir() if p.is_dir() and p.name.startswith("dalton-backup-")]
+    assert len(backup_dirs) == 1
+    bdir = backup_dirs[0]
+
+    wiki_tar = bdir / "wiki-data.tar.gz"
+    assert wiki_tar.is_file()
+    manifest = json.loads((bdir / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["wiki"]["file"] == "wiki-data.tar.gz"
+    assert manifest["wiki"]["file_count"] >= 5
+
+    sums_text = (bdir / "SHA256SUMS").read_text(encoding="utf-8")
+    wiki_sha = hashlib.sha256(wiki_tar.read_bytes()).hexdigest()
+    assert f"{wiki_sha}  wiki-data.tar.gz" in sums_text
+    with tarfile.open(wiki_tar, "r:gz") as tf:
+        names = tf.getnames()
+    assert "wiki/vectors.db" in names
+    assert "state/wiki_ingest_audit.jsonl" in names
+    assert "state/research-images/index.sqlite" in names
+    assert not any(n.endswith(("-wal", "-shm", "-journal")) for n in names)
+
+    # 2. Run restore.sh into empty dst_wiki
+    r_res = subprocess.run(
+        [
+            "bash",
+            str(restore_script),
+            "--work-dir",
+            str(work_dir),
+            "--backup-dir",
+            str(bdir),
+            "--skip-edge-build",
+        ],
+        env=run_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r_res.returncode == 0, f"restore stdout:\n{r_res.stdout}\nstderr:\n{r_res.stderr}"
+
+    # 3. Verify restored Wiki index, originals binary, image index, and audit receipts
+    restored = OpenWikiStore(dst_wiki)
+    search_res = restored.query("search", query="BackupRestoreUniqueCompressedPdfMarker")
+    assert search_res["results"], f"expected restored PDF text hit, got: {search_res}"
+
+    orig_rel = pdf_receipt["original_filepath"]
+    assert (dst_wiki / orig_rel).read_bytes() == pdf_bytes
+
+    sc_rimg, rimg_res = restored.read_image("image:1", allowed_sources={"company-wiki"})
+    assert sc_rimg == 200 and rimg_res["ok"] is True
+
+    # Check ingest_receipts table and audit JSONL match pre-backup
+    with sqlite3.connect(str(dst_wiki / "wiki" / "vectors.db")) as conn:
+        rcpt_rows = conn.execute(
+            "SELECT request_id FROM ingest_receipts ORDER BY request_id"
+        ).fetchall()
+    assert [r[0] for r in rcpt_rows] == ["br-req-img-001", "br-req-pdf-001"]
+    assert (dst_wiki / "state" / "wiki_ingest_audit.jsonl").read_text(encoding="utf-8") == (
+        src_wiki / "state" / "wiki_ingest_audit.jsonl"
+    ).read_text(encoding="utf-8")
+
+    # 4. (r7 #2) Restore with a pre-3a .env lacking research-host tokens backfills BOTH distinct tokens
+    from dotenv import dotenv_values
+
+    (work_dir / ".env").write_text(
+        "\n".join(
+            [
+                "COMPOSE_PROJECT_NAME=dalton_wiki_br_test",
+                "DB_HOST=postgres",
+                "DB_USER=postgres",
+                "DB_PASSWORD=postgres",
+                "DB_NAME=postgres",
+                "DOMAIN=localhost",
+                "DALTON_TLS_MODE=loopback",
+                "DALTON_EDGE_PORT=8088",
+                "DALTON_CHAT_UPLOAD_STORAGE_PROVIDER=s3",
+                "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT=http://minio:9000",
+                "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME=chat-uploads",
+                "MINIO_ROOT_USER=minioadmin",
+                "MINIO_ROOT_PASSWORD=minioadmin",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    r_backfill = subprocess.run(
+        [
+            "bash",
+            str(restore_script),
+            "--work-dir",
+            str(work_dir),
+            "--backup-dir",
+            str(bdir),
+            "--skip-edge-build",
+        ],
+        env=run_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r_backfill.returncode == 0, f"restore backfill stderr:\n{r_backfill.stderr}"
+    restored_env = dotenv_values(work_dir / ".env")
+    rh_tok = restored_env.get("DALTON_RESEARCH_HOST_TOKEN") or ""
+    rh_adm = restored_env.get("DALTON_RESEARCH_ADMIN_TOKEN") or ""
+    assert len(rh_tok) == 64 and len(rh_adm) == 64 and rh_tok != rh_adm
+
+    # 5. (r7 #1) Restoring an inconsistent Wiki snapshot (DB receipt missing from audit JSONL) MUST fail
+    bad_bdir = tmp_path / "bad_backup_inconsistent"
+    shutil.copytree(bdir, bad_bdir)
+    # Rebuild wiki-data.tar.gz with an empty state/wiki_ingest_audit.jsonl (simulating mid-ingest drift)
+    bad_stage = tmp_path / "bad_wiki_stage"
+    bad_stage.mkdir()
+    with tarfile.open(bad_bdir / "wiki-data.tar.gz", "r:gz") as tf_in:
+        tf_in.extractall(bad_stage)
+    (bad_stage / "state" / "wiki_ingest_audit.jsonl").write_text("", encoding="utf-8")
+    with tarfile.open(bad_bdir / "wiki-data.tar.gz", "w:gz") as tf_out:
+        for item in sorted(bad_stage.rglob("*")):
+            tf_out.add(str(item), arcname=item.relative_to(bad_stage).as_posix(), recursive=False)
+    # Recompute SHA256SUMS so restore.sh reaches Step 6 Wiki consistency verification
+    new_sums: list[str] = []
+    for line in (bad_bdir / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+        parts = line.split("  ", 1)
+        if len(parts) == 2 and parts[1] == "wiki-data.tar.gz":
+            new_sha = hashlib.sha256((bad_bdir / "wiki-data.tar.gz").read_bytes()).hexdigest()
+            new_sums.append(f"{new_sha}  wiki-data.tar.gz")
+        else:
+            new_sums.append(line)
+    (bad_bdir / "SHA256SUMS").write_text("\n".join(new_sums) + "\n", encoding="utf-8")
+
+    r_bad = subprocess.run(
+        [
+            "bash",
+            str(restore_script),
+            "--work-dir",
+            str(work_dir),
+            "--backup-dir",
+            str(bad_bdir),
+            "--skip-edge-build",
+        ],
+        env=run_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r_bad.returncode != 0, "restore.sh must fail when DB ingest_receipts lack matching audit JSONL"
+    assert "wiki_ingest_audit.jsonl" in r_bad.stderr or "consistency" in r_bad.stderr.lower() or "verification" in r_bad.stderr.lower()
+
+    def _run_tampered_wiki_restore(tag: str, mutator) -> subprocess.CompletedProcess[str]:
+        t_bdir = tmp_path / f"bad_backup_{tag}"
+        shutil.copytree(bdir, t_bdir)
+        t_stage = tmp_path / f"bad_wiki_stage_{tag}"
+        t_stage.mkdir()
+        with tarfile.open(t_bdir / "wiki-data.tar.gz", "r:gz") as tf_in:
+            tf_in.extractall(t_stage)
+        mutator(t_stage)
+        with tarfile.open(t_bdir / "wiki-data.tar.gz", "w:gz") as tf_out:
+            for item in sorted(t_stage.rglob("*")):
+                tf_out.add(str(item), arcname=item.relative_to(t_stage).as_posix(), recursive=False)
+        recomputed: list[str] = []
+        for line in (t_bdir / "SHA256SUMS").read_text(encoding="utf-8").splitlines():
+            parts = line.split("  ", 1)
+            if len(parts) == 2 and parts[1] == "wiki-data.tar.gz":
+                recomputed.append(f"{hashlib.sha256((t_bdir / 'wiki-data.tar.gz').read_bytes()).hexdigest()}  wiki-data.tar.gz")
+            else:
+                recomputed.append(line)
+        (t_bdir / "SHA256SUMS").write_text("\n".join(recomputed) + "\n", encoding="utf-8")
+        return subprocess.run(
+            [
+                "bash",
+                str(restore_script),
+                "--work-dir",
+                str(work_dir),
+                "--backup-dir",
+                str(t_bdir),
+                "--skip-edge-build",
+            ],
+            env=run_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    # 6. (r8 #2a) False-pass guard: audit JSONL + markdown exist, but wiki/vectors.db is MISSING -> MUST fail
+    r_missing_db = _run_tampered_wiki_restore(
+        "missing_vectors_db",
+        lambda st: (st / "wiki" / "vectors.db").unlink(),
+    )
+    assert r_missing_db.returncode != 0, "restore.sh must fail when audit records/markdown exist without vectors.db"
+    assert "vectors.db" in r_missing_db.stderr
+
+    # 7. (r8 #2b) False-pass guard: audit entry keeps same doc_id ('wiki:1') but has DIFFERENT request_id AND sha256 -> MUST fail
+    def _corrupt_audit_req_and_sha(st: Path) -> None:
+        audit_f = st / "state" / "wiki_ingest_audit.jsonl"
+        mutated_lines: list[str] = []
+        for raw_line in audit_f.read_text(encoding="utf-8").splitlines():
+            if not raw_line.strip():
+                continue
+            obj = json.loads(raw_line)
+            obj["request_id"] = "wrong-req-id-999"
+            obj["sha256"] = "0" * 64
+            mutated_lines.append(json.dumps(obj, ensure_ascii=False))
+        audit_f.write_text("\n".join(mutated_lines) + "\n", encoding="utf-8")
+
+    r_mismatch = _run_tampered_wiki_restore("req_sha_mismatch", _corrupt_audit_req_and_sha)
+    assert r_mismatch.returncode != 0, "restore.sh must fail when audit request_id & sha256 differ even if doc_id matches"
+    assert "mismatch" in r_mismatch.stderr.lower() or "verification" in r_mismatch.stderr.lower()
+
+    # 8. (r9 #3) False-pass guard: audit JSONL has successful ingests, but ingest_receipts table is EMPTY -> MUST fail
+    def _empty_ingest_receipts(st: Path) -> None:
+        with sqlite3.connect(str(st / "wiki" / "vectors.db")) as conn:
+            conn.execute("DELETE FROM ingest_receipts")
+            conn.commit()
+
+    r_empty_rcpts = _run_tampered_wiki_restore("empty_ingest_receipts", _empty_ingest_receipts)
+    assert r_empty_rcpts.returncode != 0, "restore.sh must fail when ingest_receipts table is empty despite successful audit records"
+    assert "ingest_receipts" in r_empty_rcpts.stderr
+
+
+def _build_r11_backup_fixture(
+    tmp_path: Path,
+    *,
+    project_name: str = "dalton_r11_test",
+) -> dict[str, object]:
+    """Create a self-contained backup.sh fixture with controllable fake docker & barriers."""
+    import sys
+
+    work_dir = tmp_path / "work"
+    (work_dir / "scripts" / "standalone").mkdir(parents=True)
+    for name in ("backup.sh", "storage_config.py", "env_tokens.sh"):
+        src = _REPO_ROOT / "scripts" / "standalone" / name
+        dst = work_dir / "scripts" / "standalone" / name
+        shutil.copy2(src, dst)
+        if name.endswith(".sh"):
+            dst.chmod(0o755)
+    (work_dir / "docker-compose.yml").write_text("services:\n  postgres: {}\n", encoding="utf-8")
+    (work_dir / "docker-compose.core.yml").write_text("services:\n  research-host: {}\n", encoding="utf-8")
+    (work_dir / ".env").write_text(
+        "\n".join(
+            [
+                f"COMPOSE_PROJECT_NAME={project_name}",
+                "DB_HOST=postgres",
+                "DB_USER=postgres",
+                "DB_PASSWORD=postgres",
+                "DB_NAME=postgres",
+                "DOMAIN=localhost",
+                "DALTON_TLS_MODE=loopback",
+                "DALTON_EDGE_PORT=8088",
+                "DALTON_CHAT_UPLOAD_STORAGE_PROVIDER=s3",
+                "DALTON_CHAT_UPLOAD_STORAGE_ENDPOINT=http://minio:9000",
+                "DALTON_CHAT_UPLOAD_STORAGE_BUCKET_NAME=chat-uploads",
+                "MINIO_ROOT_USER=minioadmin",
+                "MINIO_ROOT_PASSWORD=minioadmin",
+                "DALTON_RESEARCH_HOST_TOKEN=r11-mcp-token",
+                "DALTON_RESEARCH_ADMIN_TOKEN=r11-admin-token",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (work_dir / ".env").chmod(0o600)
+
+    src_wiki = tmp_path / "wiki_data"
+    (src_wiki / "wiki").mkdir(parents=True)
+    (src_wiki / "wiki" / "note.md").write_text("# r11 test\n", encoding="utf-8")
+
+    state_dir = tmp_path / "sim_state"
+    state_dir.mkdir()
+    events_log = state_dir / "events.log"
+    lease_state = state_dir / "lease.json"
+    drain_polls_file = state_dir / "drain_polls.txt"
+    drain_busy_until_file = state_dir / "drain_busy_until.txt"
+    hold_backup_gate = state_dir / "hold_backup.gate"
+    backup_entered_marker = state_dir / "backup_entered.marker"
+    wait_for_renew_marker = state_dir / "wait_for_renew.flag"
+    renew_entered_marker = state_dir / "renew_entered.marker"
+    hang_renew_gate = state_dir / "hang_renew.gate"
+    renew_cmd_log = state_dir / "renew_cmd.log"
+    clock_file = state_dir / "clock.txt"
+    fd_audit_log = state_dir / "fd_audit.log"
+    hang_pause_after_apply_gate = state_dir / "hang_pause_after_apply.gate"
+    pause_entered_marker = state_dir / "pause_entered.marker"
+    hang_drain_gate = state_dir / "hang_drain.gate"
+    drain_entered_marker = state_dir / "drain_entered.marker"
+    hang_resume_gate = state_dir / "hang_resume.gate"
+    resume_entered_marker = state_dir / "resume_entered.marker"
+    hang_resume_first_only_flag = state_dir / "hang_resume_first_only.flag"
+    resume_attempts_file = state_dir / "resume_attempts.txt"
+    probe_delay_until_file = state_dir / "probe_delay_until.txt"
+    probe_attempts_file = state_dir / "probe_attempts.txt"
+    drain_stdout_holder_flag = state_dir / "drain_stdout_holder.flag"
+    drain_stdout_holder_pid_file = state_dir / "drain_stdout_holder.pid"
+    spawn_sigterm_ignoring_child_flag = state_dir / "spawn_sigterm_child.flag"
+    sigterm_ignoring_child_pid_file = state_dir / "sigterm_child.pid"
+    sigterm_ignoring_child_ready_file = state_dir / "sigterm_child.ready"
+
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir()
+    py_exe = sys.executable
+
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        f"""#!{py_exe}
+import fcntl, io, json, os, signal, subprocess, sys, tarfile, time
+
+args = sys.argv[1:]
+if args and args[0] == "compose":
+    args = args[1:]
+i = 0
+while i < len(args) and args[i].startswith("-"):
+    if args[i] in ("-p", "-f", "--env-file", "--project-directory"):
+        i += 2
+    else:
+        i += 1
+if i >= len(args):
+    sys.exit(0)
+sub = args[i]
+rest = args[i + 1 :]
+joined = " ".join(rest)
+
+if sub == "config" and "--services" in rest:
+    sys.stdout.write("postgres\\nredis\\nminio\\nbackend\\nedge\\nresearch-host\\n")
+    sys.exit(0)
+
+if sub == "ps":
+    sys.stdout.write("postgres\\nredis\\nminio\\nbackend\\nedge\\nresearch-host\\n")
+    sys.exit(0)
+
+if sub == "exec":
+    if "research-host" in rest:
+        leaked_fds = []
+        for check_fd in (8, 9):
+            try:
+                os.fstat(check_fd)
+                leaked_fds.append(check_fd)
+            except OSError:
+                pass
+        with open({str(fd_audit_log)!r}, "a", encoding="utf-8") as faf:
+            faf.write(f"fds={{leaked_fds}}\\n")
+    if "research-host" in rest and "/admin/wiki/pause-writes" in joined:
+        tok = os.environ.get("DALTON_RH_ADMIN_TOKEN", "")
+        if not tok:
+            sys.exit(1)
+        owner = os.environ.get("DALTON_RH_PAUSE_OWNER", "")
+        lease_id_env = os.environ.get("DALTON_RH_PAUSE_LEASE_ID", "").strip()
+        ttl_env = os.environ.get("DALTON_RH_PAUSE_TTL_S", "").strip()
+        expect_owner = os.environ.get("DALTON_RH_EXPECT_OWNER", "")
+        expect_lid = os.environ.get("DALTON_RH_EXPECT_LEASE_ID", "").strip()
+        probe_owner = os.environ.get("DALTON_RH_PROBE_OWNER", "")
+        state_path = {str(lease_state)!r}
+
+        def _now():
+            if os.path.exists({str(clock_file)!r}):
+                with open({str(clock_file)!r}, encoding="utf-8") as cf:
+                    return float((cf.read().strip() or "0"))
+            return time.time()
+
+        def _load_state():
+            if os.path.exists(state_path):
+                with open(state_path, encoding="utf-8") as sf:
+                    st = json.load(sf)
+            else:
+                st = {{"next_id": 0, "paused": False, "owner": None, "lease_id": 0, "expires_at": 0.0}}
+            now = _now()
+            if st["paused"] and now >= float(st.get("expires_at") or 0.0):
+                st["paused"] = False
+                st["owner"] = None
+                st["lease_id"] = 0
+            return st, now
+
+        if "DALTON_RH_PAUSE_TTL_S" in joined and "DALTON_RH_PAUSE_LEASE_ID" in joined:
+            # Heartbeat renewal
+            with open({str(renew_cmd_log)!r}, "a", encoding="utf-8") as cf:
+                cf.write(joined + "\\n")
+            if os.path.exists({str(spawn_sigterm_ignoring_child_flag)!r}):
+                # Leader waits on ready barrier proving grandchild already installed SIG_IGN for SIGTERM,
+                # then leader exits immediately on SIGTERM!
+                ready_p = {str(sigterm_ignoring_child_ready_file)!r}
+                child = subprocess.Popen(
+                    [
+                        {py_exe!r},
+                        "-c",
+                        "import os, signal, sys, time; "
+                        "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                        "open(sys.argv[1], 'w', encoding='utf-8').write(str(os.getpid())); "
+                        "time.sleep(30)",
+                        ready_p,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                with open({str(sigterm_ignoring_child_pid_file)!r}, "w", encoding="utf-8") as cpf:
+                    cpf.write(str(child.pid))
+                ready_deadline = time.monotonic() + 5.0
+                while not os.path.exists(ready_p) and time.monotonic() < ready_deadline:
+                    time.sleep(0.01)
+                signal.signal(signal.SIGTERM, lambda _s, _f: os._exit(0))
+            if os.path.exists({str(hang_renew_gate)!r}):
+                with open({str(renew_entered_marker)!r}, "w", encoding="utf-8") as mf:
+                    mf.write(str(os.getpid()))
+                deadline = time.monotonic() + 30.0
+                while os.path.exists({str(hang_renew_gate)!r}) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            lock_fd = os.open(state_path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                st, now = _load_state()
+                req_lid = int(lease_id_env)
+                ttl_s = float(ttl_env or "300")
+                with open({str(events_log)!r}, "a", encoding="utf-8") as lf:
+                    if not st["paused"] or st["lease_id"] != req_lid or st["owner"] != owner:
+                        lf.write(f"renew_expired:{{os.getppid()}}:{{owner}}:{{req_lid}}\\n")
+                        with open(state_path, "w", encoding="utf-8") as sf:
+                            json.dump(st, sf)
+                        sys.exit(1)
+                    st["expires_at"] = now + ttl_s
+                    lf.write(f"renew:{{os.getppid()}}:{{owner}}:{{req_lid}}\\n")
+                    with open(state_path, "w", encoding="utf-8") as sf:
+                        json.dump(st, sf)
+                    sys.exit(0)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+
+        if "DALTON_RH_PROBE_OWNER" in joined:
+            lock_fd = os.open(state_path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                p_cnt = 0
+                if os.path.exists({str(probe_attempts_file)!r}):
+                    with open({str(probe_attempts_file)!r}, encoding="utf-8") as paf:
+                        p_cnt = int((paf.read().strip() or "0"))
+                p_cnt += 1
+                with open({str(probe_attempts_file)!r}, "w", encoding="utf-8") as paf:
+                    paf.write(str(p_cnt))
+                delay_until = 0
+                if os.path.exists({str(probe_delay_until_file)!r}):
+                    with open({str(probe_delay_until_file)!r}, encoding="utf-8") as pdf:
+                        delay_until = int((pdf.read().strip() or "0"))
+                st, _now_val = _load_state()
+                if p_cnt <= delay_until:
+                    # Simulate probe arriving BEFORE delayed pause POST took effect
+                    with open({str(events_log)!r}, "a", encoding="utf-8") as lf:
+                        lf.write(f"probe_pause:{{probe_owner}}:NONE:attempt={{p_cnt}}\\n")
+                    sys.stdout.write("NONE\\n")
+                    sys.exit(0)
+                lid = st["lease_id"] if (st["paused"] is True and str(st.get("owner") or "") == probe_owner) else ""
+                with open({str(events_log)!r}, "a", encoding="utf-8") as lf:
+                    lf.write(f"probe_pause:{{probe_owner}}:{{lid or 'NONE'}}:attempt={{p_cnt}}\\n")
+                sys.stdout.write(f"{{lid if lid else 'NONE'}}\\n")
+                sys.exit(0)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+
+        if "DALTON_RH_PAUSE_TTL_S" in joined:
+            lock_fd = os.open(state_path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                st, now = _load_state()
+                ttl_s = float(ttl_env or "300")
+                st["next_id"] += 1
+                st["paused"] = True
+                st["owner"] = owner
+                st["lease_id"] = st["next_id"]
+                st["expires_at"] = now + ttl_s
+                lid = st["lease_id"]
+                with open({str(events_log)!r}, "a", encoding="utf-8") as lf:
+                    lf.write(f"pause:{{owner}}:{{lid}}\\n")
+                with open(state_path, "w", encoding="utf-8") as sf:
+                    json.dump(st, sf)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            if os.path.exists({str(hang_pause_after_apply_gate)!r}):
+                with open({str(pause_entered_marker)!r}, "w", encoding="utf-8") as mf:
+                    mf.write(str(os.getpid()))
+                deadline = time.monotonic() + 30.0
+                while os.path.exists({str(hang_pause_after_apply_gate)!r}) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            sys.stdout.write(f"{{lid}}\\n")
+            sys.exit(0)
+
+        if "DALTON_RH_PAUSE_OWNER" in joined:
+            r_cnt = 0
+            if os.path.exists({str(resume_attempts_file)!r}):
+                with open({str(resume_attempts_file)!r}, encoding="utf-8") as raf:
+                    r_cnt = int((raf.read().strip() or "0"))
+            r_cnt += 1
+            with open({str(resume_attempts_file)!r}, "w", encoding="utf-8") as raf:
+                raf.write(str(r_cnt))
+            should_hang_resume = os.path.exists({str(hang_resume_gate)!r}) and (
+                (not os.path.exists({str(hang_resume_first_only_flag)!r})) or r_cnt == 1
+            )
+            if should_hang_resume:
+                with open({str(resume_entered_marker)!r}, "w", encoding="utf-8") as mf:
+                    mf.write(str(os.getpid()))
+                deadline = time.monotonic() + 30.0
+                while os.path.exists({str(hang_resume_gate)!r}) and time.monotonic() < deadline:
+                    time.sleep(0.05)
+            lock_fd = os.open(state_path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                st, _now_val = _load_state()
+                req_lid = int(lease_id_env) if lease_id_env else 0
+                with open({str(events_log)!r}, "a", encoding="utf-8") as lf:
+                    if not st["paused"]:
+                        lf.write(f"resume_expired:{{owner}}:{{req_lid}}\\n")
+                        with open(state_path, "w", encoding="utf-8") as sf:
+                            json.dump(st, sf)
+                        sys.stdout.write("EXPIRED\\n")
+                        sys.exit(0)
+                    st["paused"] = False
+                    st["owner"] = None
+                    st["lease_id"] = 0
+                    st["expires_at"] = 0.0
+                    lf.write(f"resume:{{owner}}:{{req_lid}}\\n")
+                    with open(state_path, "w", encoding="utf-8") as sf:
+                        json.dump(st, sf)
+                    sys.stdout.write("OK\\n")
+                    sys.exit(0)
+            finally:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+
+        # GET /admin/wiki/pause-writes drain poll with lease validation
+        if os.path.exists({str(drain_stdout_holder_flag)!r}):
+            # Group leader spawns a descendant that inherits stdout and blocks, then leader exits 0 immediately!
+            holder = subprocess.Popen(
+                [
+                    {py_exe!r},
+                    "-c",
+                    "import os, sys, time; "
+                    "open(sys.argv[1], 'w', encoding='utf-8').write(str(os.getpid())); "
+                    "time.sleep(30)",
+                    {str(drain_stdout_holder_pid_file)!r},
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=None,  # explicitly inherit stdout pipe!
+                stderr=subprocess.DEVNULL,
+            )
+            ready_deadline = time.monotonic() + 5.0
+            while not os.path.exists({str(drain_stdout_holder_pid_file)!r}) and time.monotonic() < ready_deadline:
+                time.sleep(0.01)
+            sys.stdout.write("1\\n")
+            sys.stdout.flush()
+            os._exit(0)
+        if os.path.exists({str(hang_drain_gate)!r}):
+            with open({str(drain_entered_marker)!r}, "w", encoding="utf-8") as mf:
+                mf.write(str(os.getpid()))
+            deadline = time.monotonic() + 30.0
+            while os.path.exists({str(hang_drain_gate)!r}) and time.monotonic() < deadline:
+                time.sleep(0.05)
+        lock_fd = os.open(state_path + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            st, _now_val = _load_state()
+            poll_cnt = 0
+            if os.path.exists({str(drain_polls_file)!r}):
+                with open({str(drain_polls_file)!r}, encoding="utf-8") as pf:
+                    poll_cnt = int((pf.read().strip() or "0"))
+            poll_cnt += 1
+            with open({str(drain_polls_file)!r}, "w", encoding="utf-8") as pf:
+                pf.write(str(poll_cnt))
+            busy_until = 0
+            if os.path.exists({str(drain_busy_until_file)!r}):
+                with open({str(drain_busy_until_file)!r}, encoding="utf-8") as bf:
+                    busy_until = int((bf.read().strip() or "0"))
+            lease_ok = (
+                st["paused"] is True
+                and (not expect_owner or str(st.get("owner") or "") == expect_owner)
+                and (not expect_lid or str(st.get("lease_id") or "") == expect_lid)
+            )
+            with open({str(events_log)!r}, "a", encoding="utf-8") as lf:
+                if not lease_ok:
+                    lf.write(f"poll_lease_lost:{{poll_cnt}}\\n")
+                    sys.stdout.write("LEASE_LOST\\n")
+                    sys.exit(0)
+                in_flight = 1 if poll_cnt <= busy_until else 0
+                lf.write(f"poll_in_flight:{{poll_cnt}}:{{in_flight}}\\n")
+                sys.stdout.write(f"{{in_flight}}\\n")
+                sys.exit(0)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+
+    if "research-host" in rest and "-c" in rest:
+        idx = rest.index("-c")
+        script = rest[idx + 1]
+        with open({str(events_log)!r}, "a", encoding="utf-8") as lf:
+            lf.write("backup_python\\n")
+        with open({str(backup_entered_marker)!r}, "w", encoding="utf-8") as mf:
+            mf.write(str(os.getpid()))
+        if os.path.exists({str(wait_for_renew_marker)!r}):
+            deadline = time.monotonic() + 10.0
+            while not os.path.exists({str(renew_entered_marker)!r}) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            extra_wait = float((open({str(wait_for_renew_marker)!r}).read().strip() or "0"))
+            if extra_wait > 0:
+                time.sleep(extra_wait)
+        if os.path.exists({str(hold_backup_gate)!r}):
+            deadline = time.monotonic() + 15.0
+            while os.path.exists({str(hold_backup_gate)!r}) and time.monotonic() < deadline:
+                time.sleep(0.05)
+        env = dict(os.environ, DALTON_WIKI_DATA_DIR={str(src_wiki)!r})
+        rc = subprocess.run([{py_exe!r}, "-c", script], env=env).returncode
+        sys.exit(rc)
+
+    if "pg_dump" in rest:
+        sys.stdout.buffer.write(b"PGDMP-FAKE-BACKUP")
+        sys.exit(0)
+    if "pg_restore" in rest:
+        if "--list" in rest:
+            sys.stdout.write("1; 0 0 TABLE public users postgres\\n")
+        sys.exit(0)
+    if "psql" in rest:
+        if "alembic_version_dalton" in joined:
+            sys.stdout.write("d049\\n")
+        elif "alembic_version" in joined:
+            sys.stdout.write("148\\n")
+        sys.exit(0)
+    if "backend" in rest and "python" in rest:
+        manifest = {{
+            "primary_bucket": "chat-uploads",
+            "primary_key_prefix": "",
+            "targets": {{"chat_upload": {{"bucket": "chat-uploads", "key_prefix": ""}}}},
+            "bucket_count": 1,
+            "object_count": 0,
+            "total_bytes": 0,
+            "objects": [],
+        }}
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            raw = json.dumps(manifest).encode("utf-8")
+            ti = tarfile.TarInfo(name="_minio_manifest.json")
+            ti.size = len(raw)
+            tf.addfile(ti, io.BytesIO(raw))
+        sys.stdout.buffer.write(buf.getvalue())
+        sys.exit(0)
+    if "edge" in rest and "tar" in rest:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+            raw = b"fake-caddy"
+            ti = tarfile.TarInfo(name="caddy.txt")
+            ti.size = len(raw)
+            tf.addfile(ti, io.BytesIO(raw))
+        sys.stdout.buffer.write(buf.getvalue())
+        sys.exit(0)
+    sys.exit(0)
+
+sys.exit(0)
+""",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    (fake_bin / "curl").write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    (fake_bin / "curl").chmod(0o755)
+
+    return {
+        "work_dir": work_dir,
+        "backup_script": work_dir / "scripts" / "standalone" / "backup.sh",
+        "fake_bin": fake_bin,
+        "env": {**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
+        "events_log": events_log,
+        "lease_state": lease_state,
+        "drain_polls_file": drain_polls_file,
+        "drain_busy_until_file": drain_busy_until_file,
+        "hold_backup_gate": hold_backup_gate,
+        "backup_entered_marker": backup_entered_marker,
+        "wait_for_renew_marker": wait_for_renew_marker,
+        "renew_entered_marker": renew_entered_marker,
+        "hang_renew_gate": hang_renew_gate,
+        "renew_cmd_log": renew_cmd_log,
+        "clock_file": clock_file,
+        "fd_audit_log": fd_audit_log,
+        "hang_pause_after_apply_gate": hang_pause_after_apply_gate,
+        "pause_entered_marker": pause_entered_marker,
+        "hang_drain_gate": hang_drain_gate,
+        "drain_entered_marker": drain_entered_marker,
+        "hang_resume_gate": hang_resume_gate,
+        "resume_entered_marker": resume_entered_marker,
+        "hang_resume_first_only_flag": hang_resume_first_only_flag,
+        "resume_attempts_file": resume_attempts_file,
+        "probe_delay_until_file": probe_delay_until_file,
+        "probe_attempts_file": probe_attempts_file,
+        "drain_stdout_holder_flag": drain_stdout_holder_flag,
+        "drain_stdout_holder_pid_file": drain_stdout_holder_pid_file,
+        "spawn_sigterm_ignoring_child_flag": spawn_sigterm_ignoring_child_flag,
+        "sigterm_ignoring_child_pid_file": sigterm_ignoring_child_pid_file,
+        "sigterm_ignoring_child_ready_file": sigterm_ignoring_child_ready_file,
+    }
+
+
+def test_r11_backup_heartbeat_exits_when_parent_killed_with_sigkill(tmp_path: Path) -> None:
+    """r11 #1: When main backup.sh is SIGKILL'd, background heartbeat exits within one cycle and stops renewing."""
+    import signal
+    import time
+
+    fx = _build_r11_backup_fixture(tmp_path, project_name="dalton_r11_orphan")
+    fx["hold_backup_gate"].write_text("1", encoding="utf-8")
+    lock_file = tmp_path / "orphan.flock"
+
+    proc = subprocess.Popen(
+        [
+            "bash",
+            str(fx["backup_script"]),
+            "--work-dir",
+            str(fx["work_dir"]),
+            "--output-dir",
+            str(tmp_path / "out_orphan"),
+        ],
+        env={
+            **fx["env"],
+            "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_file),
+            "DALTON_WIKI_PAUSE_TTL_S": "1.0",
+            "DALTON_WIKI_PAUSE_HEARTBEAT_S": "0.15",
+            "DALTON_WIKI_PAUSE_HEARTBEAT_TIMEOUT_S": "2.0",
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    hb_pid: int | None = None
+    try:
+        # Wait until backup entered AND heartbeat completed at least one renewal
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if fx["backup_entered_marker"].exists() and fx["events_log"].exists():
+                renews = [
+                    ln
+                    for ln in fx["events_log"].read_text(encoding="utf-8").splitlines()
+                    if ln.startswith("renew:")
+                ]
+                if renews:
+                    hb_pid = int(renews[-1].split(":")[1])
+                    break
+            time.sleep(0.03)
+        assert hb_pid is not None, "Heartbeat did not perform initial renewal before SIGKILL"
+
+        # Simulate OOM / kill -9 of main backup.sh process
+        t_kill = time.monotonic()
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=5)
+
+        # Heartbeat must detect parent death and exit within one heartbeat cycle (<= 0.5s)
+        hb_dead = False
+        exit_deadline = t_kill + 0.6
+        while time.monotonic() < exit_deadline:
+            try:
+                os.kill(hb_pid, 0)
+            except ProcessLookupError:
+                hb_dead = True
+                break
+            time.sleep(0.02)
+        assert hb_dead, f"Orphan heartbeat PID {hb_pid} stayed alive after parent SIGKILL"
+
+        renews_after_exit = [
+            ln
+            for ln in fx["events_log"].read_text(encoding="utf-8").splitlines()
+            if ln.startswith("renew:")
+        ]
+        # Wait 2 more heartbeat cycles and confirm zero further renewals occur
+        time.sleep(0.35)
+        renews_later = [
+            ln
+            for ln in fx["events_log"].read_text(encoding="utf-8").splitlines()
+            if ln.startswith("renew:")
+        ]
+        assert len(renews_later) == len(renews_after_exit), (
+            f"Orphan heartbeat kept renewing after parent death: before={renews_after_exit}, after={renews_later}"
+        )
+    finally:
+        if fx["hold_backup_gate"].exists():
+            fx["hold_backup_gate"].unlink()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        if hb_pid is not None:
+            try:
+                os.kill(hb_pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def test_r11_backup_lock_handshake_reports_unopenable_lock_and_times_out_without_hanging(
+    tmp_path: Path,
+) -> None:
+    """r11 #2: Lock handshake never hangs when lock file cannot be opened or lock helper stalls."""
+    import sys
+    import time
+
+    fx = _build_r11_backup_fixture(tmp_path, project_name="dalton_r11_lock")
+
+    # 2a. Unopenable lock file (0o000 simulates root-owned 0600 file left by sudo)
+    unreadable_lock = tmp_path / "root_owned_sim.flock"
+    unreadable_lock.write_text("", encoding="utf-8")
+    unreadable_lock.chmod(0o000)
+    try:
+        t0 = time.monotonic()
+        res_perm = subprocess.run(
+            [
+                "bash",
+                str(fx["backup_script"]),
+                "--work-dir",
+                str(fx["work_dir"]),
+                "--output-dir",
+                str(tmp_path / "out_perm"),
+            ],
+            env={
+                **fx["env"],
+                "DALTON_WIKI_BACKUP_LOCK_FILE": str(unreadable_lock),
+                "DALTON_WIKI_BACKUP_LOCK_WAIT_S": "1",
+                "DALTON_WIKI_BACKUP_LOCK_HANDSHAKE_TIMEOUT_S": "3",
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        elapsed_perm = time.monotonic() - t0
+    finally:
+        unreadable_lock.chmod(0o600)
+
+    assert res_perm.returncode != 0
+    assert elapsed_perm < 5.0, f"Lock handshake hung on unreadable lock file: {elapsed_perm:.2f}s"
+    assert str(unreadable_lock) in res_perm.stderr
+    assert "PermissionError" in res_perm.stderr or "Permission denied" in res_perm.stderr
+
+    # 2b. Stalled lock helper (never writes status) hits total handshake timeout without hanging
+    stall_bin = tmp_path / "stall_bin"
+    stall_bin.mkdir()
+    py_exe = sys.executable
+    py_shim = stall_bin / "python3"
+    py_shim.write_text(
+        f"""#!{py_exe}
+import os, sys, time
+if len(sys.argv) >= 3 and sys.argv[1] == "-c" and "fcntl.flock" in sys.argv[2]:
+    time.sleep(30)
+    sys.exit(0)
+os.execv({py_exe!r}, [{py_exe!r}, *sys.argv[1:]])
+""",
+        encoding="utf-8",
+    )
+    py_shim.chmod(0o755)
+
+    stall_lock = tmp_path / "stalled.flock"
+    t1 = time.monotonic()
+    res_stall = subprocess.run(
+        [
+            "bash",
+            str(fx["backup_script"]),
+            "--work-dir",
+            str(fx["work_dir"]),
+            "--output-dir",
+            str(tmp_path / "out_stall"),
+        ],
+        env={
+            **fx["env"],
+            "PATH": f"{stall_bin}:{fx['env']['PATH']}",
+            "DALTON_WIKI_BACKUP_LOCK_FILE": str(stall_lock),
+            "DALTON_WIKI_BACKUP_LOCK_WAIT_S": "0.1",
+            "DALTON_WIKI_BACKUP_LOCK_HANDSHAKE_TIMEOUT_S": "0.4",
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    elapsed_stall = time.monotonic() - t1
+    assert res_stall.returncode != 0
+    assert elapsed_stall < 5.0, f"Stalled lock helper handshake exceeded timeout: {elapsed_stall:.2f}s"
+    assert str(stall_lock) in res_stall.stderr
+    assert "handshake" in res_stall.stderr.lower()
+
+
+def test_r11_backup_heartbeat_request_timeout_and_stop_reaps_hung_exec(tmp_path: Path) -> None:
+    """r11 #3: Heartbeat enforces curl & compose exec timeouts, and stop_wiki_pause_heartbeat terminates/reaps in-flight child."""
+    import time
+    import pytest
+
+    # 3a. Hung renewal subprocess exceeds DALTON_WIKI_PAUSE_HEARTBEAT_TIMEOUT_S -> killed, marked failed, backup aborted
+    fx_to = _build_r11_backup_fixture(tmp_path / "timeout_case", project_name="dalton_r11_hbto")
+    fx_to["hang_renew_gate"].write_text("1", encoding="utf-8")
+    fx_to["wait_for_renew_marker"].write_text("0.45", encoding="utf-8")
+    t0 = time.monotonic()
+    try:
+        res_to = subprocess.run(
+            [
+                "bash",
+                str(fx_to["backup_script"]),
+                "--work-dir",
+                str(fx_to["work_dir"]),
+                "--output-dir",
+                str(tmp_path / "timeout_case" / "out"),
+            ],
+            env={
+                **fx_to["env"],
+                "DALTON_WIKI_BACKUP_LOCK_FILE": str(tmp_path / "timeout_case" / "hbto.flock"),
+                "DALTON_WIKI_PAUSE_TTL_S": "5.0",
+                "DALTON_WIKI_PAUSE_HEARTBEAT_S": "0.05",
+                "DALTON_WIKI_PAUSE_HEARTBEAT_TIMEOUT_S": "0.2",
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    finally:
+        if fx_to["hang_renew_gate"].exists():
+            fx_to["hang_renew_gate"].unlink()
+    elapsed_to = time.monotonic() - t0
+    assert res_to.returncode != 0, "backup.sh must fail when heartbeat renewal times out"
+    assert elapsed_to < 8.0, f"Heartbeat timeout did not bound backup duration: {elapsed_to:.2f}s"
+    renew_cmd = fx_to["renew_cmd_log"].read_text(encoding="utf-8")
+    assert "--connect-timeout" in renew_cmd and "--max-time" in renew_cmd
+    hung_pid = int(fx_to["renew_entered_marker"].read_text(encoding="utf-8").strip())
+    # Hung child must already have been killed & reaped by the timeout handler
+    with pytest.raises(ProcessLookupError):
+        os.kill(hung_pid, 0)
+
+    # 3b. stop_wiki_pause_heartbeat called while renewal exec is blocked -> kills & reaps child without wait hanging
+    fx_stop = _build_r11_backup_fixture(tmp_path / "stop_case", project_name="dalton_r11_hbstop")
+    fx_stop["hang_renew_gate"].write_text("1", encoding="utf-8")
+    # Backup exits immediately once renewal child enters its blocked wait
+    fx_stop["wait_for_renew_marker"].write_text("0", encoding="utf-8")
+    t1 = time.monotonic()
+    try:
+        res_stop = subprocess.run(
+            [
+                "bash",
+                str(fx_stop["backup_script"]),
+                "--work-dir",
+                str(fx_stop["work_dir"]),
+                "--output-dir",
+                str(tmp_path / "stop_case" / "out"),
+            ],
+            env={
+                **fx_stop["env"],
+                "DALTON_WIKI_BACKUP_LOCK_FILE": str(tmp_path / "stop_case" / "hbstop.flock"),
+                "DALTON_WIKI_PAUSE_TTL_S": "10.0",
+                "DALTON_WIKI_PAUSE_HEARTBEAT_S": "0.05",
+                "DALTON_WIKI_PAUSE_HEARTBEAT_TIMEOUT_S": "15.0",
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    finally:
+        if fx_stop["hang_renew_gate"].exists():
+            fx_stop["hang_renew_gate"].unlink()
+    elapsed_stop = time.monotonic() - t1
+    assert res_stop.returncode == 0, f"backup failed:\n{res_stop.stdout}\n{res_stop.stderr}"
+    assert elapsed_stop < 6.0, f"stop_wiki_pause_heartbeat hung waiting for in-flight renewal: {elapsed_stop:.2f}s"
+    stopped_pid = int(fx_stop["renew_entered_marker"].read_text(encoding="utf-8").strip())
+    with pytest.raises(ProcessLookupError):
+        os.kill(stopped_pid, 0)
+
+
+def test_r11_backup_heartbeat_starts_before_drain_and_aborts_on_lease_loss_during_drain(
+    tmp_path: Path,
+) -> None:
+    """r11 #4: Heartbeat starts right after pause (surviving slow drain > TTL), and lease loss during drain aborts & resumes."""
+    # 4a. Slow drain lasts ~0.6s (> TTL=0.45s); heartbeat starts immediately after pause and renews during drain
+    fx_ok = _build_r11_backup_fixture(tmp_path / "drain_ok", project_name="dalton_r11_drainok")
+    fx_ok["drain_busy_until_file"].write_text("3", encoding="utf-8")
+    res_ok = subprocess.run(
+        [
+            "bash",
+            str(fx_ok["backup_script"]),
+            "--work-dir",
+            str(fx_ok["work_dir"]),
+            "--output-dir",
+            str(tmp_path / "drain_ok" / "out"),
+        ],
+        env={
+            **fx_ok["env"],
+            "DALTON_WIKI_BACKUP_LOCK_FILE": str(tmp_path / "drain_ok" / "drainok.flock"),
+            "DALTON_WIKI_PAUSE_TTL_S": "0.45",
+            "DALTON_WIKI_PAUSE_HEARTBEAT_S": "0.12",
+            "DALTON_WIKI_DRAIN_POLL_S": "0.2",
+            "DALTON_WIKI_DRAIN_MAX_POLLS": "10",
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res_ok.returncode == 0, f"slow-drain backup failed:\n{res_ok.stdout}\n{res_ok.stderr}"
+    ok_events = fx_ok["events_log"].read_text(encoding="utf-8").splitlines()
+    backup_idx = ok_events.index("backup_python")
+    pre_backup_renews = [ev for ev in ok_events[:backup_idx] if ev.startswith("renew:")]
+    assert pre_backup_renews, f"Expected heartbeat renewals BEFORE backup_python during slow drain, got: {ok_events}"
+
+    # 4b. Lease expires during drain -> drain poll detects LEASE_LOST, aborts before backup_python, and resumes writes
+    fx_lost = _build_r11_backup_fixture(tmp_path / "drain_lost", project_name="dalton_r11_drainlost")
+    fx_lost["drain_busy_until_file"].write_text("2", encoding="utf-8")
+    res_lost = subprocess.run(
+        [
+            "bash",
+            str(fx_lost["backup_script"]),
+            "--work-dir",
+            str(fx_lost["work_dir"]),
+            "--output-dir",
+            str(tmp_path / "drain_lost" / "out"),
+        ],
+        env={
+            **fx_lost["env"],
+            "DALTON_WIKI_BACKUP_LOCK_FILE": str(tmp_path / "drain_lost" / "drainlost.flock"),
+            "DALTON_WIKI_PAUSE_TTL_S": "0.12",
+            "DALTON_WIKI_PAUSE_HEARTBEAT_S": "5",
+            "DALTON_WIKI_DRAIN_POLL_S": "0.22",
+            "DALTON_WIKI_DRAIN_MAX_POLLS": "10",
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res_lost.returncode != 0, "backup.sh must abort when pause lease expires during in-flight drain"
+    assert "no longer active while draining" in res_lost.stderr
+    lost_events = fx_lost["events_log"].read_text(encoding="utf-8").splitlines()
+    assert "backup_python" not in lost_events, f"backup_python must not run after lease lost during drain: {lost_events}"
+    assert any(ev.startswith("resume") for ev in lost_events), f"Expected resume after drain lease loss: {lost_events}"
+
+
+def test_r11_env_tokens_preserves_group_or_falls_back_to_0600(tmp_path: Path) -> None:
+    """r11 #5: ensure_env_tokens preserves original .env group ownership (with 0640) and falls back to 0600 when chgrp fails."""
+    import stat
+
+    env_tokens_sh = _REPO_ROOT / "scripts" / "standalone" / "env_tokens.sh"
+
+    # 5a. Group ownership preserved alongside 0640 mode
+    env_keep = tmp_path / "keep.env"
+    env_keep.write_text("DOMAIN=localhost\n", encoding="utf-8")
+    groups = os.getgroups()
+    alt_gid = next((g for g in groups if g != os.getgid()), os.getgid())
+    os.chown(env_keep, -1, alt_gid)
+    env_keep.chmod(0o640)
+
+    res_keep = subprocess.run(
+        ["bash", "-c", 'source "$1" && ensure_research_host_tokens "$2"', "_", str(env_tokens_sh), str(env_keep)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_keep.returncode == 0, res_keep.stderr
+    assert "DALTON_RESEARCH_HOST_TOKEN" in res_keep.stdout
+    assert "DALTON_RESEARCH_ADMIN_TOKEN" in res_keep.stdout
+    st_keep = env_keep.stat()
+    assert st_keep.st_gid == alt_gid
+    assert stat.S_IMODE(st_keep.st_mode) == 0o640
+
+    # 5b. When preserving group fails (os.chown raises EPERM), mode falls back to 0600
+    env_fallback = tmp_path / "fallback.env"
+    env_fallback.write_text("DOMAIN=localhost\n", encoding="utf-8")
+    env_fallback.chmod(0o640)
+
+    hook_dir = tmp_path / "py_hook"
+    hook_dir.mkdir()
+    (hook_dir / "sitecustomize.py").write_text(
+        "import errno, os\n"
+        "_orig_chown = os.chown\n"
+        "def _deny_tmp_chown(path, uid, gid, *a, **kw):\n"
+        "    if '.tmp-tokens-' in str(path):\n"
+        "        raise PermissionError(errno.EPERM, 'Operation not permitted', str(path))\n"
+        "    return _orig_chown(path, uid, gid, *a, **kw)\n"
+        "os.chown = _deny_tmp_chown\n",
+        encoding="utf-8",
+    )
+    env_with_hook = dict(os.environ)
+    prev_py = env_with_hook.get("PYTHONPATH", "")
+    env_with_hook["PYTHONPATH"] = f"{hook_dir}:{prev_py}" if prev_py else str(hook_dir)
+
+    res_fb = subprocess.run(
+        ["bash", "-c", 'source "$1" && ensure_research_host_tokens "$2"', "_", str(env_tokens_sh), str(env_fallback)],
+        env=env_with_hook,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_fb.returncode == 0, res_fb.stderr
+    assert "DALTON_RESEARCH_HOST_TOKEN" in res_fb.stdout
+    assert "DALTON_RESEARCH_ADMIN_TOKEN" in res_fb.stdout
+    st_fb = env_fallback.stat()
+    assert stat.S_IMODE(st_fb.st_mode) == 0o600
+
+
+def _assert_pid_dead(pid: int, *, label: str, timeout_s: float = 1.5) -> None:
+    """Assert that process `pid` has actually exited (os.kill(pid, 0) raises ProcessLookupError)."""
+    import time
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"{label} (pid={pid}) is still alive after {timeout_s}s")
+
+
+def _assert_flock_reacquirable(lock_path: Path, *, label: str) -> None:
+    """Assert that an exclusive non-blocking flock on `lock_path` can be acquired immediately."""
+    import fcntl
+
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise AssertionError(f"{label}: lock {lock_path} is still held by another process") from exc
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def test_r12_lock_helper_reclaimed_on_handshake_timeout_and_lock_reacquirable(tmp_path: Path) -> None:
+    """r12 #1: Python lock helper is tracked directly as $!, killed & reaped on handshake timeout, and lock is immediately re-acquirable."""
+    import sys
+    import time
+
+    fx = _build_r11_backup_fixture(tmp_path / "r12_lock", project_name="dalton_r12_lock")
+    lock_file = tmp_path / "r12_lock" / "reclaim.flock"
+    helper_pid_file = tmp_path / "r12_lock" / "helper.pid"
+    hold_helper_gate = tmp_path / "r12_lock" / "hold_helper.gate"
+    hold_helper_gate.write_text("1", encoding="utf-8")
+
+    # Python shim intercepts ONLY the lock helper invocation, acquires flock, records its real PID, and stalls before writing status
+    shim_bin = tmp_path / "r12_lock" / "shim_bin"
+    shim_bin.mkdir()
+    py_exe = sys.executable
+    py_shim = shim_bin / "python3"
+    py_shim.write_text(
+        f"""#!{py_exe}
+import fcntl, os, sys, time
+if len(sys.argv) >= 4 and sys.argv[1] == "-c" and "fcntl.flock" in sys.argv[2]:
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    lock_path = sys.argv[3]
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    with open({str(helper_pid_file)!r}, "w", encoding="utf-8") as pf:
+        pf.write(str(os.getpid()))
+    deadline = time.monotonic() + 30.0
+    while os.path.exists({str(hold_helper_gate)!r}) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    os.close(fd)
+    sys.exit(0)
+os.execv({py_exe!r}, [{py_exe!r}, *sys.argv[1:]])
+""",
+        encoding="utf-8",
+    )
+    py_shim.chmod(0o755)
+
+    out_timeout = tmp_path / "r12_lock" / "out_timeout"
+    t0 = time.monotonic()
+    try:
+        res_to = subprocess.run(
+            [
+                "bash",
+                str(fx["backup_script"]),
+                "--work-dir",
+                str(fx["work_dir"]),
+                "--output-dir",
+                str(out_timeout),
+            ],
+            env={
+                **fx["env"],
+                "PATH": f"{shim_bin}:{fx['env']['PATH']}",
+                "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_file),
+                "DALTON_WIKI_BACKUP_LOCK_WAIT_S": "0.1",
+                "DALTON_WIKI_BACKUP_LOCK_HANDSHAKE_TIMEOUT_S": "0.35",
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        elapsed = time.monotonic() - t0
+        assert res_to.returncode != 0
+        assert elapsed < 6.0, f"Handshake timeout took too long: {elapsed:.2f}s"
+        assert str(lock_file) in res_to.stderr
+        assert helper_pid_file.is_file(), "Stalled Python lock helper never started"
+        helper_pid = int(helper_pid_file.read_text(encoding="utf-8").strip())
+        # Assert BEFORE finally unlinks hold_helper_gate so shim cannot exit on its own
+        _assert_pid_dead(helper_pid, label="stalled Python lock helper")
+        _assert_flock_reacquirable(lock_file, label="after handshake timeout")
+    finally:
+        if hold_helper_gate.exists():
+            hold_helper_gate.unlink()
+    leftover_stages = [p for p in out_timeout.iterdir() if p.name.startswith(".staging-")] if out_timeout.exists() else []
+    assert leftover_stages == [], f"Staging directory not cleaned up: {leftover_stages}"
+
+    # Normal run with the same lock file succeeds, leaves no .wiki-lock-* artifacts, and releases lock cleanly
+    out_ok = tmp_path / "r12_lock" / "out_ok"
+    res_ok = subprocess.run(
+        [
+            "bash",
+            str(fx["backup_script"]),
+            "--work-dir",
+            str(fx["work_dir"]),
+            "--output-dir",
+            str(out_ok),
+        ],
+        env={
+            **fx["env"],
+            "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_file),
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res_ok.returncode == 0, f"normal backup failed:\n{res_ok.stdout}\n{res_ok.stderr}"
+    _assert_flock_reacquirable(lock_file, label="after normal release")
+    published = [p for p in out_ok.iterdir() if p.is_dir() and p.name.startswith("dalton-backup-")]
+    assert len(published) == 1
+    leaked_lock_files = [p.name for p in published[0].iterdir() if p.name.startswith(".wiki-lock")]
+    assert leaked_lock_files == [], f"Lock handshake files leaked into published backup: {leaked_lock_files}"
+
+
+def test_r12_process_group_sigkill_kills_sigterm_ignoring_child_after_leader_exits(tmp_path: Path) -> None:
+    """r12 #2: Even when pgrp leader exits immediately on SIGTERM, grace period still SIGKILLs SIGTERM-ignoring descendants."""
+    import signal
+    import time
+
+    fx = _build_r11_backup_fixture(tmp_path / "r12_pgrp", project_name="dalton_r12_pgrp")
+    fx["spawn_sigterm_ignoring_child_flag"].write_text("1", encoding="utf-8")
+    fx["hang_renew_gate"].write_text("1", encoding="utf-8")
+    fx["wait_for_renew_marker"].write_text("0.75", encoding="utf-8")
+    lock_file = tmp_path / "r12_pgrp" / "pgrp.flock"
+
+    t0 = time.monotonic()
+    try:
+        res = subprocess.run(
+            [
+                "bash",
+                str(fx["backup_script"]),
+                "--work-dir",
+                str(fx["work_dir"]),
+                "--output-dir",
+                str(tmp_path / "r12_pgrp" / "out"),
+            ],
+            env={
+                **fx["env"],
+                "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_file),
+                "DALTON_WIKI_PAUSE_TTL_S": "5.0",
+                "DALTON_WIKI_PAUSE_HEARTBEAT_S": "0.05",
+                "DALTON_WIKI_PAUSE_HEARTBEAT_TIMEOUT_S": "0.2",
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        elapsed = time.monotonic() - t0
+        assert res.returncode != 0
+        assert elapsed < 8.0, f"pgrp cleanup took too long: {elapsed:.2f}s"
+        # Confirm grandchild actually reached SIG_IGN barrier before leader accepted SIGTERM
+        assert fx["sigterm_ignoring_child_ready_file"].is_file(), "Grandchild never reached SIG_IGN ready barrier"
+        leader_pid = int(fx["renew_entered_marker"].read_text(encoding="utf-8").strip())
+        child_pid = int(fx["sigterm_ignoring_child_pid_file"].read_text(encoding="utf-8").strip())
+        # Assert BOTH leader and SIGTERM-ignoring grandchild are dead BEFORE finally fallback cleanup!
+        _assert_pid_dead(leader_pid, label="pgrp leader")
+        _assert_pid_dead(child_pid, label="SIGTERM-ignoring descendant in same process group")
+    finally:
+        if fx["hang_renew_gate"].exists():
+            fx["hang_renew_gate"].unlink()
+        if fx["sigterm_ignoring_child_pid_file"].exists():
+            try:
+                child_pid_cleanup = int(fx["sigterm_ignoring_child_pid_file"].read_text(encoding="utf-8").strip())
+                os.kill(child_pid_cleanup, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def test_r12_drain_and_resume_outer_timeouts_exit_kill_hung_exec_and_clean_lock_and_stage(
+    tmp_path: Path,
+) -> None:
+    """r12 #3: Outer compose exec timeouts on drain GET and resume POST kill hung processes, release lock, and remove staging dir."""
+    import time
+
+    # 3a. Outer compose exec hangs during drain GET
+    fx_drain = _build_r11_backup_fixture(tmp_path / "r12_drain_hang", project_name="dalton_r12_dh")
+    fx_drain["clock_file"].write_text("1000.0", encoding="utf-8")
+    fx_drain["hang_drain_gate"].write_text("1", encoding="utf-8")
+    drain_lock = tmp_path / "r12_drain_hang" / "dh.flock"
+    drain_out = tmp_path / "r12_drain_hang" / "out"
+
+    t0 = time.monotonic()
+    try:
+        res_dh = subprocess.run(
+            [
+                "bash",
+                str(fx_drain["backup_script"]),
+                "--work-dir",
+                str(fx_drain["work_dir"]),
+                "--output-dir",
+                str(drain_out),
+            ],
+            env={
+                **fx_drain["env"],
+                "DALTON_WIKI_BACKUP_LOCK_FILE": str(drain_lock),
+                "DALTON_WIKI_PAUSE_TTL_S": "300",
+                "DALTON_WIKI_PAUSE_HEARTBEAT_S": "60",
+                "DALTON_WIKI_EXEC_TIMEOUT_S": "0.2",
+                "DALTON_WIKI_DRAIN_TIMEOUT_S": "0.45",
+                "DALTON_WIKI_DRAIN_POLL_S": "0.05",
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    finally:
+        if fx_drain["hang_drain_gate"].exists():
+            fx_drain["hang_drain_gate"].unlink()
+    elapsed_dh = time.monotonic() - t0
+    assert res_dh.returncode != 0
+    assert elapsed_dh < 6.0, f"Hung drain GET did not time out within budget: {elapsed_dh:.2f}s"
+    assert "Timed out waiting for in-flight Wiki writes" in res_dh.stderr
+    hung_drain_pid = int(fx_drain["drain_entered_marker"].read_text(encoding="utf-8").strip())
+    _assert_pid_dead(hung_drain_pid, label="hung drain GET compose exec")
+    _assert_flock_reacquirable(drain_lock, label="after drain GET timeout")
+    assert not [p for p in drain_out.iterdir() if p.name.startswith(".staging-")]
+    drain_events = fx_drain["events_log"].read_text(encoding="utf-8").splitlines()
+    assert any(ev.startswith("resume:") for ev in drain_events), f"Expected resume after drain timeout: {drain_events}"
+    assert "backup_python" not in drain_events
+
+    # 3b. Outer compose exec hangs during resume POST
+    fx_res = _build_r11_backup_fixture(tmp_path / "r12_resume_hang", project_name="dalton_r12_rh")
+    fx_res["clock_file"].write_text("2000.0", encoding="utf-8")
+    fx_res["hang_resume_gate"].write_text("1", encoding="utf-8")
+    res_lock = tmp_path / "r12_resume_hang" / "rh.flock"
+    res_out = tmp_path / "r12_resume_hang" / "out"
+
+    t1 = time.monotonic()
+    try:
+        res_rh = subprocess.run(
+            [
+                "bash",
+                str(fx_res["backup_script"]),
+                "--work-dir",
+                str(fx_res["work_dir"]),
+                "--output-dir",
+                str(res_out),
+            ],
+            env={
+                **fx_res["env"],
+                "DALTON_WIKI_BACKUP_LOCK_FILE": str(res_lock),
+                "DALTON_WIKI_PAUSE_TTL_S": "300",
+                "DALTON_WIKI_PAUSE_HEARTBEAT_S": "60",
+                "DALTON_WIKI_RESUME_TIMEOUT_S": "0.25",
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    finally:
+        if fx_res["hang_resume_gate"].exists():
+            fx_res["hang_resume_gate"].unlink()
+    elapsed_rh = time.monotonic() - t1
+    assert res_rh.returncode != 0
+    assert elapsed_rh < 6.0, f"Hung resume POST did not time out within budget: {elapsed_rh:.2f}s"
+    assert "Failed to resume Wiki writes" in res_rh.stderr
+    hung_resume_pid = int(fx_res["resume_entered_marker"].read_text(encoding="utf-8").strip())
+    _assert_pid_dead(hung_resume_pid, label="hung resume POST compose exec")
+    _assert_flock_reacquirable(res_lock, label="after resume POST timeout")
+    assert not [p for p in res_out.iterdir() if p.name.startswith(".staging-")]
+
+
+def test_r12_ambiguous_pause_timeout_probes_status_and_resumes_owner_lease(tmp_path: Path) -> None:
+    """r12 #4: When pause POST times out after taking effect on research-host, backup.sh probes status, resumes its owner lease, kills hung exec, and exits."""
+    import json
+    import time
+
+    fx = _build_r11_backup_fixture(tmp_path / "r12_pause_ambig", project_name="dalton_r12_pa")
+    # Controllable virtual clock guarantees lease cannot expire naturally
+    fx["clock_file"].write_text("5000.0", encoding="utf-8")
+    fx["hang_pause_after_apply_gate"].write_text("1", encoding="utf-8")
+    lock_file = tmp_path / "r12_pause_ambig" / "pa.flock"
+    out_dir = tmp_path / "r12_pause_ambig" / "out"
+
+    t0 = time.monotonic()
+    try:
+        res = subprocess.run(
+            [
+                "bash",
+                str(fx["backup_script"]),
+                "--work-dir",
+                str(fx["work_dir"]),
+                "--output-dir",
+                str(out_dir),
+            ],
+            env={
+                **fx["env"],
+                "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_file),
+                "DALTON_WIKI_PAUSE_TTL_S": "300",
+                "DALTON_WIKI_EXEC_TIMEOUT_S": "0.25",
+                "DALTON_WIKI_RESUME_TIMEOUT_S": "2.0",
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    finally:
+        if fx["hang_pause_after_apply_gate"].exists():
+            fx["hang_pause_after_apply_gate"].unlink()
+    elapsed = time.monotonic() - t0
+    assert res.returncode != 0
+    assert elapsed < 6.0, f"Ambiguous pause timeout recovery took too long: {elapsed:.2f}s"
+    hung_pause_pid = int(fx["pause_entered_marker"].read_text(encoding="utf-8").strip())
+    _assert_pid_dead(hung_pause_pid, label="hung pause POST compose exec")
+
+    events = fx["events_log"].read_text(encoding="utf-8").splitlines()
+    assert any(ev.startswith("pause:") for ev in events), events
+    assert any(ev.startswith("probe_pause:") for ev in events), events
+    assert any(ev.startswith("resume:") for ev in events), events
+    assert "backup_python" not in events
+    # Verify lease state on research-host is actually UNPAUSED (not left stuck paused for 300s)
+    st = json.loads(fx["lease_state"].read_text(encoding="utf-8"))
+    assert st["paused"] is False, f"Wiki writes were left stuck paused after ambiguous pause POST timeout: {st}"
+    _assert_flock_reacquirable(lock_file, label="after ambiguous pause timeout")
+    assert not [p for p in out_dir.iterdir() if p.name.startswith(".staging-")]
+
+
+def test_r12_command_substitutions_close_fds_8_and_9_before_exec(tmp_path: Path) -> None:
+    """r12 #5: Every $(...) while fd 8/9 are open closes them at subshell entry; SIGKILLing backup mid-drain-subshell immediately frees flock & kills heartbeat."""
+    import signal
+    import time
+
+    fx = _build_r11_backup_fixture(tmp_path / "r12_fdclose", project_name="dalton_r12_fd")
+    fx["clock_file"].write_text("6000.0", encoding="utf-8")
+    lock_file = tmp_path / "r12_fdclose" / "fd.flock"
+
+    # 5a. Normal run: audit every research-host child call and confirm ZERO inherited fd 8 or fd 9
+    res_ok = subprocess.run(
+        [
+            "bash",
+            str(fx["backup_script"]),
+            "--work-dir",
+            str(fx["work_dir"]),
+            "--output-dir",
+            str(tmp_path / "r12_fdclose" / "out_ok"),
+        ],
+        env={
+            **fx["env"],
+            "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_file),
+            "DALTON_WIKI_PAUSE_TTL_S": "300",
+            "DALTON_WIKI_PAUSE_HEARTBEAT_S": "60",
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert res_ok.returncode == 0, f"backup failed:\n{res_ok.stdout}\n{res_ok.stderr}"
+    audit_lines = fx["fd_audit_log"].read_text(encoding="utf-8").splitlines()
+    assert len(audit_lines) >= 4
+    assert all(ln == "fds=[]" for ln in audit_lines), f"Child inherited lock/heartbeat fds: {audit_lines}"
+
+    # 5b. SIGKILL main backup.sh while it is blocked INSIDE the drain GET $(exec 8>&- 9>&-; ...) command substitution.
+    # Because the subshell closed fd 8 and fd 9 at entry, killing main backup.sh immediately delivers EOF to BOTH
+    # the flock helper and the heartbeat helper even while the drain child is still blocked!
+    fx2 = _build_r11_backup_fixture(tmp_path / "r12_fdclose_kill", project_name="dalton_r12_fdk")
+    fx2["clock_file"].write_text("7000.0", encoding="utf-8")
+    fx2["hang_drain_gate"].write_text("1", encoding="utf-8")
+    lock_file2 = tmp_path / "r12_fdclose_kill" / "fdk.flock"
+
+    proc = subprocess.Popen(
+        [
+            "bash",
+            str(fx2["backup_script"]),
+            "--work-dir",
+            str(fx2["work_dir"]),
+            "--output-dir",
+            str(tmp_path / "r12_fdclose_kill" / "out_kill"),
+        ],
+        env={
+            **fx2["env"],
+            "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_file2),
+            "DALTON_WIKI_PAUSE_TTL_S": "300",
+            "DALTON_WIKI_PAUSE_HEARTBEAT_S": "0.1",
+            "DALTON_WIKI_EXEC_TIMEOUT_S": "15",
+            "DALTON_WIKI_DRAIN_TIMEOUT_S": "20",
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    hb_pid: int | None = None
+    drain_child_pid: int | None = None
+    try:
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if fx2["drain_entered_marker"].exists() and fx2["events_log"].exists():
+                renews = [
+                    ln
+                    for ln in fx2["events_log"].read_text(encoding="utf-8").splitlines()
+                    if ln.startswith("renew:")
+                ]
+                if renews:
+                    hb_pid = int(renews[-1].split(":")[1])
+                    drain_child_pid = int(fx2["drain_entered_marker"].read_text(encoding="utf-8").strip())
+                    break
+            time.sleep(0.03)
+        assert hb_pid is not None and drain_child_pid is not None, "Did not reach blocked drain GET + active heartbeat"
+
+        # SIGKILL main backup.sh while drain child is STILL blocked inside $(exec 8>&- 9>&-; ...)
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.wait(timeout=5)
+
+        # Even while drain_child_pid is still blocked on hang_drain_gate, BOTH heartbeat exits AND flock is released!
+        _assert_pid_dead(hb_pid, label="heartbeat after SIGKILL during drain $(...)", timeout_s=1.0)
+        # Brief wait for flock helper to receive EOF on fd 8 and exit
+        flock_deadline = time.monotonic() + 1.5
+        reacquired = False
+        while time.monotonic() < flock_deadline:
+            try:
+                _assert_flock_reacquirable(lock_file2, label="probe")
+                reacquired = True
+                break
+            except AssertionError:
+                time.sleep(0.03)
+        assert reacquired, "Flock was NOT released after SIGKILL during drain $(...) (fd 8 leaked into command substitution!)"
+    finally:
+        if fx2["hang_drain_gate"].exists():
+            fx2["hang_drain_gate"].unlink()
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        for p in (hb_pid, drain_child_pid):
+            if p is not None:
+                try:
+                    os.kill(p, signal.SIGKILL)
+                except OSError:
+                    pass
+
+
+def test_r13_run_with_timeout_bounds_stdout_when_leader_exits_and_child_holds_stdout(
+    tmp_path: Path,
+) -> None:
+    """r13 #1: Single deadline covers both pgrp and stdout reading; leader exiting early while descendant holds stdout still terminates within deadline."""
+    import signal
+    import time
+
+    fx = _build_r11_backup_fixture(tmp_path / "r13_stdout_hold", project_name="dalton_r13_so")
+    fx["clock_file"].write_text("8000.0", encoding="utf-8")
+    fx["drain_stdout_holder_flag"].write_text("1", encoding="utf-8")
+    lock_file = tmp_path / "r13_stdout_hold" / "so.flock"
+    out_dir = tmp_path / "r13_stdout_hold" / "out"
+
+    t0 = time.monotonic()
+    try:
+        res = subprocess.run(
+            [
+                "bash",
+                str(fx["backup_script"]),
+                "--work-dir",
+                str(fx["work_dir"]),
+                "--output-dir",
+                str(out_dir),
+            ],
+            env={
+                **fx["env"],
+                "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_file),
+                "DALTON_WIKI_PAUSE_TTL_S": "300",
+                "DALTON_WIKI_PAUSE_HEARTBEAT_S": "60",
+                "DALTON_WIKI_EXEC_TIMEOUT_S": "0.25",
+                "DALTON_WIKI_DRAIN_TIMEOUT_S": "0.45",
+                "DALTON_WIKI_DRAIN_POLL_S": "0.05",
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        elapsed = time.monotonic() - t0
+        assert res.returncode != 0
+        # Must NOT block 30s waiting for the stdout-holding child after leader exited 0!
+        assert elapsed < 5.0, f"Command substitution stalled on stdout-holding child: {elapsed:.2f}s"
+        assert fx["drain_stdout_holder_pid_file"].is_file(), "Stdout-holding child never started"
+        holder_pid = int(fx["drain_stdout_holder_pid_file"].read_text(encoding="utf-8").strip())
+        # Assert stdout-holding child is dead BEFORE finally fallback cleanup!
+        _assert_pid_dead(holder_pid, label="stdout-holding descendant after leader exit")
+        _assert_flock_reacquirable(lock_file, label="after stdout-holder timeout")
+        assert not [p for p in out_dir.iterdir() if p.name.startswith(".staging-")]
+    finally:
+        if fx["drain_stdout_holder_pid_file"].exists():
+            try:
+                pid_c = int(fx["drain_stdout_holder_pid_file"].read_text(encoding="utf-8").strip())
+                os.kill(pid_c, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def test_r13_pause_recovery_retries_until_confirmed_and_resume_retries_in_exit_trap(
+    tmp_path: Path,
+) -> None:
+    """r13 #2: Ambiguous pause POST retries status probes within budget until confirmed & resumed; failed resume POST keeps WIKI_WRITES_PAUSED=1 so EXIT trap retries."""
+    import json
+    import time
+
+    # 2a. Pause POST times out; probe #1 arrives before pause is visible (returns NONE), probe #2 sees lease and resumes it!
+    fx_p = _build_r11_backup_fixture(tmp_path / "r13_pause_retry", project_name="dalton_r13_pr")
+    fx_p["clock_file"].write_text("9000.0", encoding="utf-8")
+    fx_p["hang_pause_after_apply_gate"].write_text("1", encoding="utf-8")
+    fx_p["probe_delay_until_file"].write_text("1", encoding="utf-8")
+    lock_p = tmp_path / "r13_pause_retry" / "pr.flock"
+    out_p = tmp_path / "r13_pause_retry" / "out"
+
+    try:
+        res_p = subprocess.run(
+            [
+                "bash",
+                str(fx_p["backup_script"]),
+                "--work-dir",
+                str(fx_p["work_dir"]),
+                "--output-dir",
+                str(out_p),
+            ],
+            env={
+                **fx_p["env"],
+                "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_p),
+                "DALTON_WIKI_PAUSE_TTL_S": "300",
+                "DALTON_WIKI_EXEC_TIMEOUT_S": "0.25",
+                "DALTON_WIKI_PAUSE_RECOVERY_TIMEOUT_S": "2.0",
+                "DALTON_WIKI_PAUSE_RECOVERY_POLL_S": "0.05",
+                "DALTON_WIKI_RESUME_TIMEOUT_S": "2.0",
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        assert res_p.returncode != 0
+        hung_pause_pid = int(fx_p["pause_entered_marker"].read_text(encoding="utf-8").strip())
+        _assert_pid_dead(hung_pause_pid, label="hung pause POST exec")
+        p_events = fx_p["events_log"].read_text(encoding="utf-8").splitlines()
+        probe_events = [ev for ev in p_events if ev.startswith("probe_pause:")]
+        assert len(probe_events) >= 2, f"Expected repeated pause probes until confirmed, got: {p_events}"
+        assert any(ev.startswith("resume:") for ev in p_events), f"Expected resume after probe #2 confirmed lease: {p_events}"
+        st_p = json.loads(fx_p["lease_state"].read_text(encoding="utf-8"))
+        assert st_p["paused"] is False, f"Wiki writes left paused after delayed pause probe recovery: {st_p}"
+        _assert_flock_reacquirable(lock_p, label="after delayed pause recovery")
+        assert not [p for p in out_p.iterdir() if p.name.startswith(".staging-")]
+    finally:
+        if fx_p["hang_pause_after_apply_gate"].exists():
+            fx_p["hang_pause_after_apply_gate"].unlink()
+
+    # 2b. Resume POST #1 times out -> WIKI_WRITES_PAUSED stays 1 -> EXIT trap retries resume_wiki_writes (#2 succeeds & unpauses!)
+    fx_r = _build_r11_backup_fixture(tmp_path / "r13_resume_retry", project_name="dalton_r13_rr")
+    fx_r["clock_file"].write_text("9500.0", encoding="utf-8")
+    fx_r["hang_resume_gate"].write_text("1", encoding="utf-8")
+    fx_r["hang_resume_first_only_flag"].write_text("1", encoding="utf-8")
+    lock_r = tmp_path / "r13_resume_retry" / "rr.flock"
+    out_r = tmp_path / "r13_resume_retry" / "out"
+
+    t0 = time.monotonic()
+    try:
+        res_r = subprocess.run(
+            [
+                "bash",
+                str(fx_r["backup_script"]),
+                "--work-dir",
+                str(fx_r["work_dir"]),
+                "--output-dir",
+                str(out_r),
+            ],
+            env={
+                **fx_r["env"],
+                "DALTON_WIKI_BACKUP_LOCK_FILE": str(lock_r),
+                "DALTON_WIKI_PAUSE_TTL_S": "300",
+                "DALTON_WIKI_PAUSE_HEARTBEAT_S": "60",
+                "DALTON_WIKI_RESUME_TIMEOUT_S": "0.25",
+            },
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        elapsed_r = time.monotonic() - t0
+        # Main backup failed because resume #1 timed out, but EXIT trap retried resume #2 and unpaused Wiki writes!
+        assert res_r.returncode != 0
+        assert elapsed_r < 6.0
+        hung_res1_pid = int(fx_r["resume_entered_marker"].read_text(encoding="utf-8").strip())
+        _assert_pid_dead(hung_res1_pid, label="hung first resume POST exec")
+        attempts = int(fx_r["resume_attempts_file"].read_text(encoding="utf-8").strip())
+        assert attempts == 2, f"Expected EXIT trap to retry resume_wiki_writes (2 attempts total), got {attempts}"
+        st_r = json.loads(fx_r["lease_state"].read_text(encoding="utf-8"))
+        assert st_r["paused"] is False, f"EXIT trap retry failed to resume Wiki writes: {st_r}"
+        _assert_flock_reacquirable(lock_r, label="after EXIT trap resume retry")
+        assert not [p for p in out_r.iterdir() if p.name.startswith(".staging-")]
+    finally:
+        if fx_r["hang_resume_gate"].exists():
+            fx_r["hang_resume_gate"].unlink()
+
 

@@ -46,8 +46,10 @@ def takes_a_workspace_sql(alias: str = "") -> str:
     failed, not being retired (``FENCE_TAKES_WORKSPACES``), and past its
     first build, before which it has no sandbox to hold a folder."""
     c = f"{alias}." if alias else ""
+    # DALTON-HOOK(cos-settings-tools): exclude stopping computers from move-target and primary candidates
     return (
         f"({c}{FENCE_NOT_DELETED} AND {_takes_workspaces(c)} AND {c}status <> 'error'"
+        f" AND {c}status <> 'stopping'"
         f" AND ({c}provider_ref IS NOT NULL OR {c}status NOT IN ('creating', 'starting')))"
     )
 

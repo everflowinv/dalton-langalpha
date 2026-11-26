@@ -80,8 +80,12 @@ export function useInterruptAnswers({
     const interruptId = (typeof proposal?.interruptId === 'string' && proposal.interruptId)
       ? proposal.interruptId
       : pendingInterrupt.interruptId;
+    const waitsForToolResult =
+      bucket === 'workspaceProposals'
+      || (bucket === 'secretaryActionProposals'
+        && (proposal?.actionType === 'archive_workspace' || pendingInterrupt.type === 'archive_workspace'));
     const nextStatus = verdict === 'approve'
-      ? (bucket === 'workspaceProposals' ? 'submitting' : 'approved')
+      ? (waitsForToolResult ? 'submitting' : 'approved')
       : 'rejected';
     setMessages((prev) => setCardFields(prev, bucket, proposalId!, {
       status: nextStatus,

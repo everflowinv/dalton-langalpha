@@ -6,11 +6,83 @@ The proxy (LaunchAgent ai.openclaw.guidepoint-mcp-proxy) handles OAuth token ref
 """
 import argparse
 import json
+import os
+from pathlib import Path
 import sys
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8943/mcp"
+BASE = os.environ.get("DALTON_GUIDEPOINT_MCP_URL", "").strip() or "http://127.0.0.1:8943/mcp"
+
+
+def _read_bridge_env_fallback(key: str) -> str:
+    env_file = Path(
+        os.environ.get("DALTON_BRIDGE_ENV_FILE", "").strip()
+        or (Path.home() / ".config" / "dalton" / "researchdata-bridge.env")
+    ).expanduser()
+    if not env_file.is_file():
+        return ""
+    try:
+        for raw in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            k, v = line.split("=", 1)
+            if k.strip() == key:
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                return v
+    except OSError:
+        return ""
+    return ""
+
+
+def _resolve_base_url():
+    return (
+        os.environ.get("DALTON_GUIDEPOINT_MCP_URL", "").strip()
+        or _read_bridge_env_fallback("DALTON_GUIDEPOINT_MCP_URL")
+        or BASE
+    )
+
+
+def _resolve_host_token():
+    return (
+        os.environ.get("DALTON_RESEARCH_HOST_TOKEN", "").strip()
+        or _read_bridge_env_fallback("DALTON_RESEARCH_HOST_TOKEN")
+    )
+
+
+def _extract_transcripts(res: dict) -> list:
+    """Extract transcript rows from both legacy `:8943` and Batch 3 `:8951/mcp/guidepoint` responses."""
+    candidates = []
+    if isinstance(res.get("structuredContent"), dict):
+        candidates.append(res["structuredContent"])
+    for item in res.get("content", []) or []:
+        if isinstance(item, dict) and item.get("type") == "text":
+            try:
+                parsed = json.loads(item["text"])
+                if isinstance(parsed, dict):
+                    candidates.append(parsed)
+                elif isinstance(parsed, list):
+                    return parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
+    for cand in candidates:
+        data_val = cand.get("data")
+        if isinstance(data_val, list):
+            return data_val
+        if isinstance(data_val, dict):
+            nested_sc = data_val.get("structuredContent")
+            if isinstance(nested_sc, dict) and isinstance(nested_sc.get("data"), list):
+                return nested_sc["data"]
+            if isinstance(data_val.get("data"), list):
+                return data_val["data"]
+        if isinstance(cand.get("results"), list):
+            return cand["results"]
+    return []
 
 
 def rpc(payload, session_id=None):
@@ -18,10 +90,14 @@ def rpc(payload, session_id=None):
         "Content-Type": "application/json",
         "Accept": "application/json, text/event-stream",
     }
+    host_token = _resolve_host_token()
+    if host_token:
+        headers["Authorization"] = f"Bearer {host_token}"
     if session_id:
         headers["Mcp-Session-Id"] = session_id
-    req = urllib.request.Request(BASE, data=json.dumps(payload).encode(), headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=120) as resp:
+    req = urllib.request.Request(_resolve_base_url(), data=json.dumps(payload).encode(), headers=headers, method="POST")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=120) as resp:
         sid = resp.headers.get("Mcp-Session-Id")
         raw = resp.read().decode()
         ctype = resp.headers.get("Content-Type", "")
@@ -118,17 +194,45 @@ def cmd_search(args):
             print("ERROR: " + ("\n".join(texts) or json.dumps(error, ensure_ascii=False)), file=sys.stderr)
         return 1
 
-    payload = result.get("structuredContent")
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-        payload = None
-        for t in texts:
-            try:
-                candidate = json.loads(t)
-                if isinstance(candidate, dict) and isinstance(candidate.get("data"), list):
-                    payload = candidate
-                    break
-            except (ValueError, TypeError):
-                continue
+    rows = _extract_transcripts(result)
+    payload = None
+    if rows is not None and (
+        rows
+        or isinstance(result.get("structuredContent"), dict)
+        or any(t.strip().startswith("{") for t in texts)
+    ):
+        # Verify at least one candidate carried an excerpt list (even empty [])
+        found_list = False
+        sc = result.get("structuredContent")
+        if isinstance(sc, dict):
+            if isinstance(sc.get("data"), list):
+                payload = sc
+                found_list = True
+            elif isinstance(sc.get("data"), dict) and isinstance((sc["data"].get("structuredContent") or {}).get("data"), list):
+                payload = sc["data"]["structuredContent"]
+                found_list = True
+            elif isinstance(sc.get("results"), list):
+                payload = {"data": sc["results"]}
+                found_list = True
+        if not found_list:
+            for t in texts:
+                try:
+                    candidate = json.loads(t)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(candidate, dict):
+                    if isinstance(candidate.get("data"), list):
+                        payload = candidate
+                        found_list = True
+                        break
+                    if isinstance(candidate.get("data"), dict) and isinstance((candidate["data"].get("structuredContent") or {}).get("data"), list):
+                        payload = candidate["data"]["structuredContent"]
+                        found_list = True
+                        break
+                    if isinstance(candidate.get("results"), list):
+                        payload = {"data": candidate["results"]}
+                        found_list = True
+                        break
     if payload is None:
         if args.json:
             json.dump({"ok": False, "error": "E_UPSTREAM_SHAPE", "raw": texts}, sys.stdout, ensure_ascii=False)

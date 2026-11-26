@@ -49,7 +49,8 @@ const EXPECTED = ['index', 'rolldown-runtime', 'vendor-react']
 // sync12: upstream dropped to 444 after #863/#865 (lazy copy namespaces + logo split); Dalton measured 475.0 kB, lowered ceiling to 490 (~15 kB headroom).
 const MAX_EAGER_KB = 490
 
-const outDir = process.argv[2] || 'dist'
+// DALTON-HOOK(frontend-release-dir): fall back to DALTON_VITE_OUT_DIR so shared `pnpm build` checks the staged release dir
+const outDir = process.argv[2] || (process.env.DALTON_VITE_OUT_DIR || '').trim() || 'dist'
 const indexPath = join(outDir, 'index.html')
 
 let html
@@ -123,9 +124,11 @@ try {
   process.exit(1)
 }
 
-if (version.build !== entryFile) {
+// DALTON-HOOK(frontend-release-dir): accept `entry` when version.json's `build` also carries docs/release identity
+const manifestEntry = typeof version.entry === 'string' && version.entry ? version.entry : version.build
+if (manifestEntry !== entryFile) {
   console.error(`\n✗ version.json disagrees with ${indexPath}`)
-  console.error(`  version.json build: ${version.build}`)
+  console.error(`  version.json entry: ${manifestEntry}`)
   console.error(`  index.html entry:   ${entryFile}`)
   console.error('  The client compares these two. A mismatch prompts every user to')
   console.error('  reload, forever, and the reload does not clear it.\n')

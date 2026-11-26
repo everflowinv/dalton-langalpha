@@ -426,7 +426,9 @@ describe('Settings reorganization (groups, minTier guards, legacy links, dropdow
     renderSettings('/settings?tab=teamMembers');
 
     const banner = await screen.findByTestId('settings-permission-denied');
-    expect(banner).toHaveTextContent(/Everflow 团队版|Everflow Team Edition/);
+    // The notice names the build's brand (SettingsAuthOnlyBrand.test.tsx pins
+    // that), so only its own words are matched here.
+    expect(banner).toHaveTextContent(/团队版提供|Team Edition/);
     expect(banner).not.toHaveTextContent(/Team member permission required|需要团队成员权限/);
     await waitFor(() => {
       expect(screen.getByTestId('location-spy')).toHaveTextContent('/settings?tab=account');

@@ -2,7 +2,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { DaltonNotifyTargetsCard } from '../DaltonNotifyTargetsCard';
+import {
+  DaltonNotifyTargetsCard,
+  countDistinctWeixinRouteTasks,
+} from '../DaltonNotifyTargetsCard';
+import type { Automation } from '@/types/automation';
 import type {
   DaltonChannelBindingsResponse,
   DaltonNotifyTestResponse,
@@ -53,6 +57,14 @@ const h = vi.hoisted(() => ({
     weixin_bot: null,
   } as DaltonChannelBindingsResponse,
   sendTest: vi.fn<(target: string) => Promise<DaltonNotifyTestResponse>>(),
+  capabilities: new Set<string>(['channel_feishu', 'channel_discord', 'channel_weixin']),
+  automations: null as Automation[] | null,
+}));
+
+vi.mock('@/hooks/useCapabilities', () => ({
+  useCapabilities: () => ({
+    hasCapability: (cap: string) => h.capabilities.has(cap),
+  }),
 }));
 
 vi.mock('@/hooks/usePreferences', () => ({
@@ -75,8 +87,20 @@ vi.mock('@/pages/Settings/utils/daltonApi', () => ({
   sendDaltonNotifyTest: (target: string) => h.sendTest(target),
 }));
 
+vi.mock('@/pages/Automations/utils/api', () => ({
+  listAutomations: async () => {
+    if (h.automations === null) {
+      throw new Error('automations unavailable');
+    }
+    return { data: { automations: h.automations, total: h.automations.length } };
+  },
+}));
+
 vi.mock('react-i18next', () => ({
-  useTranslation: () => ({ t: (key: string) => key }),
+  useTranslation: () => ({
+    t: (key: string, opts?: Record<string, unknown>) =>
+      opts && typeof opts.count === 'number' ? `${key}:${opts.count}` : key,
+  }),
 }));
 
 function renderCard(allowManualInput = false) {
@@ -102,6 +126,9 @@ describe('DaltonNotifyTargetsCard', () => {
     };
     h.mutateAsync.mockReset().mockResolvedValue({});
     h.sendTest.mockReset().mockResolvedValue({ ok: true, detail: null, error_code: null });
+    h.capabilities = new Set(['channel_feishu', 'channel_discord', 'channel_weixin']);
+    h.bindings.weixin_account = null;
+    h.automations = null;
   });
 
   it('derives bound-account switches from linked bindings without manual target input by default', async () => {
@@ -243,5 +270,207 @@ describe('DaltonNotifyTargetsCard', () => {
         },
       });
     });
+  });
+
+  it('offers connected personal WeChat as a selectable push target and hides pending/unlinked WeChat', async () => {
+    h.capabilities = new Set(['channel_weixin']);
+    h.bindings.weixin_account = {
+      linked: true,
+      platform: 'weixin',
+      status: 'active',
+      channel_enabled: true,
+      allow_external: false,
+      member_allowed: true,
+      deny_reason: null,
+      account_id: 'acc_wx_1',
+      platform_user_id: 'wx_alice_01',
+      masked_ilink_user_id: '****e_01',
+      platform_username: 'Alice WX',
+      ilink_username: 'Alice WX',
+      active_push_ready: true,
+      last_inbound_at: '2026-11-26T00:00:00Z',
+      updated_at: '2026-11-26T00:00:00Z',
+    };
+
+    const { unmount } = renderCard(false);
+    const wxRow = await screen.findByTestId('dalton-notify-bound-weixin');
+    expect(wxRow).toHaveTextContent('Alice WX');
+    expect(screen.queryByTestId('dalton-notify-bound-feishu')).not.toBeInTheDocument();
+
+    const wxToggle = screen.getByRole('switch', { name: 'Alice WX' });
+    fireEvent.click(wxToggle);
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: {
+          dalton_notify_targets: ['weixin:user:wx_alice_01'],
+        },
+      });
+    });
+
+    unmount();
+
+    h.bindings.weixin_account = {
+      ...h.bindings.weixin_account,
+      status: 'pending_verification',
+    };
+    renderCard(false);
+    await waitFor(() => {
+      expect(screen.queryByTestId('dalton-notify-bound-weixin')).not.toBeInTheDocument();
+    });
+  });
+
+  it('gates manual WeChat target copy and validation on channel_weixin capability', async () => {
+    // channel_weixin disabled: omits WithWeixin copy and rejects weixin:user: input without saving
+    h.capabilities = new Set(['channel_feishu', 'channel_discord']);
+    const { unmount } = renderCard(true);
+
+    const inputOff = screen.getByTestId('dalton-notify-manual-input');
+    expect(inputOff).toHaveAttribute('placeholder', 'dalton.notifyTargets.manualAddPlaceholder');
+    fireEvent.change(inputOff, { target: { value: 'weixin:user:wx_unallowed' } });
+    fireEvent.click(screen.getByTestId('dalton-notify-manual-add'));
+    expect(await screen.findByText('dalton.notifyTargets.manualAddError')).toBeInTheDocument();
+    expect(h.mutateAsync).not.toHaveBeenCalled();
+    unmount();
+
+    // channel_weixin enabled: shows WithWeixin placeholder and submits to backend (which verifies ownership)
+    h.capabilities = new Set(['channel_feishu', 'channel_discord', 'channel_weixin']);
+    renderCard(true);
+    const inputOn = screen.getByTestId('dalton-notify-manual-input');
+    expect(inputOn).toHaveAttribute(
+      'placeholder',
+      'dalton.notifyTargets.manualAddPlaceholderWithWeixin',
+    );
+    fireEvent.change(inputOn, { target: { value: 'weixin:user:wx_me_1' } });
+    fireEvent.click(screen.getByTestId('dalton-notify-manual-add'));
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: { dalton_notify_targets: ['weixin:user:wx_me_1'] },
+      });
+    });
+  });
+
+  it('clarifies explicit WeChat task routes in disable confirmation dialog', async () => {
+    h.capabilities = new Set(['channel_weixin']);
+    h.prefs.model_preference.dalton_notify_targets = ['weixin:user:wx_alice_01'];
+    (h.prefs.model_preference as Record<string, unknown>).dalton_notify_routes = {
+      'automation:a-1': ['weixin:user:wx_alice_01'],
+      'automation:a-2': ['feishu:user:ou_ada', 'weixin:user:wx_alice_01'],
+    };
+    h.bindings.weixin_account = {
+      linked: true,
+      platform: 'weixin',
+      status: 'active',
+      channel_enabled: true,
+      allow_external: false,
+      member_allowed: true,
+      deny_reason: null,
+      account_id: 'acc_wx_1',
+      platform_user_id: 'wx_alice_01',
+      masked_ilink_user_id: '****e_01',
+      platform_username: 'Alice WX',
+      ilink_username: 'Alice WX',
+      active_push_ready: true,
+      last_inbound_at: null,
+      updated_at: null,
+    };
+
+    const { unmount } = renderCard(false);
+    await screen.findByTestId('dalton-notify-bound-weixin');
+    fireEvent.click(screen.getByRole('switch', { name: 'Alice WX' }));
+    expect(
+      await screen.findByText('dalton.notifyTargets.disableBoundWeixinConfirmWithCount:2'),
+    ).toBeInTheDocument();
+    unmount();
+
+    (h.prefs.model_preference as Record<string, unknown>).dalton_notify_routes = {};
+    renderCard(false);
+    await screen.findByTestId('dalton-notify-bound-weixin');
+    fireEvent.click(screen.getByRole('switch', { name: 'Alice WX' }));
+    expect(
+      await screen.findByText('dalton.notifyTargets.disableBoundWeixinConfirm'),
+    ).toBeInTheDocument();
+  });
+
+  it('deduplicates explicit WeChat route task count across ID, legacy display-name, and category keys', async () => {
+    const wx = 'weixin:user:wx_alice_01';
+    const taskA = {
+      automation_id: 'a-1',
+      name: 'dalton-googl-earn-2026q1-t0',
+      dalton_notify_category: 'earnings_t0',
+    } as Automation;
+    const taskB = {
+      automation_id: 'a-2',
+      name: 'dalton-msft-earn-2026q1-t0',
+      dalton_notify_category: 'earnings_t0',
+    } as Automation;
+
+    // Task A has BOTH automation:a-1 and legacy name key with wx -> counted once (1, not 2).
+    // Task B has legacy name key with wx, overridden by automation:a-2 without wx -> counted 0.
+    const routes = {
+      'automation:a-1': [wx],
+      'dalton-googl-earn-2026q1-t0': [wx],
+      'automation:a-2': ['feishu:user:ou_ada'],
+      'dalton-msft-earn-2026q1-t0': [wx],
+    };
+    expect(countDistinctWeixinRouteTasks(routes, wx, [taskA, taskB])).toBe(1);
+    // Without loaded automations, category fallback keys return null (non-numeric copy)
+    expect(countDistinctWeixinRouteTasks({ 'category:earnings_t0': [wx] }, wx, null)).toBeNull();
+
+    h.capabilities = new Set(['channel_weixin']);
+    h.prefs.model_preference.dalton_notify_targets = [wx];
+    (h.prefs.model_preference as Record<string, unknown>).dalton_notify_routes = routes;
+    h.automations = [taskA, taskB];
+    h.bindings.weixin_account = {
+      linked: true,
+      platform: 'weixin',
+      status: 'active',
+      channel_enabled: true,
+      allow_external: false,
+      member_allowed: true,
+      deny_reason: null,
+      account_id: 'acc_wx_1',
+      platform_user_id: 'wx_alice_01',
+      masked_ilink_user_id: '****e_01',
+      platform_username: 'Alice WX',
+      ilink_username: 'Alice WX',
+      active_push_ready: true,
+      last_inbound_at: null,
+      updated_at: null,
+    };
+
+    renderCard(false);
+    await screen.findByTestId('dalton-notify-bound-weixin');
+    fireEvent.click(screen.getByRole('switch', { name: 'Alice WX' }));
+    expect(
+      await screen.findByText('dalton.notifyTargets.disableBoundWeixinConfirmWithCount:1'),
+    ).toBeInTheDocument();
+  });
+
+  it('deduplicates data_task entries against data: route keys and falls back to non-numeric copy on ambiguous cold cache', () => {
+    const wx = 'weixin:user:wx_alice_01';
+    const dataTask = {
+      automation_id: 'data-auto-1',
+      name: 'cn-leverage-daily',
+      dalton_notify_category: 'data_task',
+    } as Automation;
+    const routes = {
+      'data:cn-leverage-daily': [wx],
+      'data:jp-leverage-daily': [wx],
+    };
+    // cn-leverage-daily is in automations AND in routes['data:cn-leverage-daily'] -> counted once;
+    // jp-leverage-daily is only in routes['data:jp-leverage-daily'] -> counted once; total = 2 (not 3).
+    expect(countDistinctWeixinRouteTasks(routes, wx, [dataTask])).toBe(2);
+
+    // Cold cache (automations = null) with both automation:<id> and legacy display-name key -> null (non-numeric copy)
+    expect(
+      countDistinctWeixinRouteTasks(
+        {
+          'automation:a-1': [wx],
+          'dalton-googl-earn-2026q1-t0': [wx],
+        },
+        wx,
+        null,
+      ),
+    ).toBeNull();
   });
 });

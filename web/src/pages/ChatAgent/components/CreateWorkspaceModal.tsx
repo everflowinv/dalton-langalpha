@@ -44,6 +44,7 @@ interface CreateWorkspaceModalProps {
   /** Called with the created workspace once the modal is done with it. */
   onComplete?: (workspace: Workspace) => void;
   // DALTON-HOOK(mobile-web): where focus returns on close when the opener never took focus (Safari clicks)
+  // DALTON-HOOK(dialog-focus-return): the control the click handler names; it outranks what holds focus when the dialog opens
   returnFocusTo?: HTMLElement | null;
 }
 
@@ -349,7 +350,13 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete, returnFoc
       return;
     }
 
-    // DALTON-HOOK(workspace-dedup): show non-fatal hint when workspace succeeded but coverage registration did not
+    // DALTON-HOOK(workspace-dedup): show non-fatal hint when workspace succeeded but coverage registration or dedup check did not
+    if (workspace.dedup_warning) {
+      toast({
+        title: t('workspace.dedup.unavailableTitle', '公司查重暂不可用'),
+        description: workspace.dedup_warning,
+      });
+    }
     const coverageWarning = formatCoverageUnitWarning(t, workspace);
     if (coverageWarning) {
       toast({
@@ -451,7 +458,9 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete, returnFoc
     const pressed = lastPressedRef.current;
     lastPressedRef.current = null;
     const recentPress = pressed && performance.now() - pressed.at < 1000 ? pressed.el : null;
-    const opener = focused && focused !== document.body ? focused : (returnFocusTo ?? recentPress);
+    // DALTON-HOOK(dialog-focus-return): the named control first. A Safari click leaves focus where it was, and
+    // Voice Control, a virtual cursor and a script's click() neither move focus nor press, so neither guess holds.
+    const opener = returnFocusTo ?? (focused && focused !== document.body ? focused : recentPress);
 
     const getFocusables = (root: HTMLElement) =>
       Array.from(

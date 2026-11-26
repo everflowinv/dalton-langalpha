@@ -24,6 +24,10 @@ from ptc_agent.core.session import Session, SessionManager
 
 from src.server.database.computer import (
     MAKE_PRIMARY_INTENT,
+    # DALTON-HOOK(cos-settings-tools): transactional archive claim & terminal-only fence clearing
+    claim_computer_for_archive,
+    clear_computer_archiving,
+    retain_computer_archive_claim,
     computer_advisory_key,
     computer_capacity_lock,
     create_computer,
@@ -717,26 +721,25 @@ class MachineLifecycleMixin:
             )
         return claimed
 
-    async def _settle_machine_stop(self, computer_id: str, status: str) -> None:
-        """CAS from 'stopping' so a teardown's tail cannot stomp a peer's transition."""
-        if status == ComputerStatus.STOPPED:
-            # While the row still reads 'stopping', so no start can have minted
-            # a token this would end.
-            await self._revoke_computer_tokens(computer_id)
-            await self._revoke_livefs(computer_id)
-        if (
-            await update_computer_status(
-                computer_id,
-                status,
-                expected="stopping",
-                drop_config_key="archiving",  # DALTON-HOOK(cos-settings-tools)
-            )
-            is None
-        ):
-            logger.info(
-                f"Computer {computer_id} was moved out of 'stopping' by another "
-                f"worker; leaving it rather than writing {status!r}"
-            )
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    async def _settle_machine_stop(
+        self,
+        computer_id: str,
+        status: str,
+        *,
+        clear_archiving: bool = True,
+        expected_archiving_owner: str | None = None,
+    ) -> None:
+        from src.dalton.services.archive_lifecycle import settle_machine_stop_impl
+
+        await settle_machine_stop_impl(
+            self,
+            computer_id,
+            status,
+            clear_archiving=clear_archiving,
+            expected_archiving_owner=expected_archiving_owner,
+        )
+    # --- DALTON-HOOK(cos-settings-tools): end ---
 
     async def _retain_machine_stop_claim(self, computer_id: str) -> bool:
         """Fence provider stop against a row another worker has recovered."""
@@ -749,27 +752,48 @@ class MachineLifecycleMixin:
             is not None
         )
 
-    async def _claim_machine_for_archive(self, computer_id: str) -> Dict[str, Any]:
-        """Share the stopping claim and recovery path while archiving the disk."""
-        computer = await get_computer(computer_id)
-        if computer is None:
-            raise ValueError(f"Computer {computer_id} not found")
-        if computer["status"] != "stopped":
-            raise RuntimeError(
-                f"Cannot archive computer in '{computer['status']}' state. "
-                "Only stopped computers can be archived."
-            )
-        if not computer.get("provider_ref"):
-            raise RuntimeError("No sandbox associated with this computer")
-        claimed = await update_computer_status(
-            computer_id,
-            ComputerStatus.STOPPING,
-            expected=ComputerStatus.STOPPED,
-            merge_config={"archiving": True},  # DALTON-HOOK(cos-settings-tools)
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    async def _retain_machine_archive_claim(
+        self, computer_id: str, *, archiving_owner: str
+    ) -> bool:
+        return await retain_computer_archive_claim(
+            computer_id, archiving_owner=archiving_owner
         )
-        if claimed is None:
-            raise RuntimeError("Computer changed while preparing archive; retry")
-        return claimed
+
+    async def _claim_machine_for_archive(
+        self,
+        computer_id: str,
+        *,
+        expected_workspaces: Any = None,
+        expected_workspace_id: str | None = None,
+    ) -> Dict[str, Any]:
+        return await claim_computer_for_archive(
+            computer_id,
+            expected_workspaces=expected_workspaces,
+            expected_workspace_id=expected_workspace_id,
+        )
+
+    # DALTON-HOOK(cos-settings-tools): thin delegates to Dalton archive lifecycle
+    async def _reconcile_stopped_archiving_locked(self, computer: Dict[str, Any]) -> Dict[str, Any]:
+        from src.dalton.services.archive_lifecycle import reconcile_stopped_archiving_locked_impl
+
+        return await reconcile_stopped_archiving_locked_impl(self, computer)
+
+    async def _ensure_not_archiving_locked(self, computer: Dict[str, Any]) -> Dict[str, Any]:
+        from src.dalton.services.archive_lifecycle import ensure_not_archiving_locked_impl
+
+        return await ensure_not_archiving_locked_impl(self, computer)
+
+    async def ensure_computer_not_archiving(self, computer_id: str) -> bool:
+        from src.dalton.services.archive_lifecycle import ensure_computer_not_archiving_impl
+
+        return await ensure_computer_not_archiving_impl(self, computer_id)
+
+    async def reconcile_archiving_computer(self, computer_id: str) -> Dict[str, Any] | None:
+        from src.dalton.services.archive_lifecycle import reconcile_archiving_computer_impl
+
+        return await reconcile_archiving_computer_impl(self, computer_id)
+    # --- DALTON-HOOK(cos-settings-tools): end ---
 
     # Bare computers have no folder, file mirror or project MCP set. Use machine
     # statements directly so subscribers see the same lifecycle frames without
@@ -999,6 +1023,8 @@ class MachineLifecycleMixin:
                         ComputerStatus.RUNNING,
                         expected=("starting", "running"),
                         expected_always_on=current_always_on,
+                        # DALTON-HOOK(cos-settings-tools): remote wake clears any residual archiving fence
+                        drop_config_key="archiving",
                     )
                 else:
                     published = await try_bind_computer_provider_ref(
@@ -1009,6 +1035,9 @@ class MachineLifecycleMixin:
                         expected_always_on=current_always_on,
                         expected_host_unavailable_since=outage_since,
                     )
+                    # DALTON-HOOK(cos-settings-tools): clear residual archiving fence once rebuilt sandbox is bound
+                    if published is not None and (published.get("config") or {}).get("archiving"):
+                        await clear_computer_archiving(computer_id)
                 if published is not None:
                     break
             if published is None:
@@ -1189,6 +1218,14 @@ class MachineLifecycleMixin:
             # Ahead of the live handle, which a session opened before the
             # policy would otherwise hand back.
             await refuse_machine_use(computer["kind"], computer.get("user_id"))
+
+            # --- DALTON-HOOK(cos-settings-tools): begin ---
+            # Shared archive-fence reconciliation: clear once provider left 'archiving',
+            # otherwise refuse start with ComputerArchivingError.
+            if (computer.get("config") or {}).get("archiving"):
+                computer = await self._ensure_not_archiving_locked(computer)
+                status = computer["status"]
+            # --- DALTON-HOOK(cos-settings-tools): end ---
 
             if status in CLAIMABLE_FOR_START:
                 claimed = await self._claim_start_with_capacity(
@@ -1377,5 +1414,16 @@ class MachineLifecycleMixin:
     ) -> Optional[Dict[str, Any]]:
         return await self._stop_machine(computer_id, back_up=back_up)
 
-    async def archive_computer(self, computer_id: str) -> Optional[Dict[str, Any]]:
-        return await self._archive_machine(computer_id)
+    async def archive_computer(
+        self,
+        computer_id: str,
+        *,
+        # DALTON-HOOK(cos-settings-tools): optional confirmation snapshot for whole-computer archive
+        expected_workspaces: Any = None,
+    ) -> Optional[Dict[str, Any]]:
+        # DALTON-HOOK(cos-settings-tools): thin delegate to Dalton archive service
+        from src.dalton.services.archive_lifecycle import archive_computer_impl
+
+        return await archive_computer_impl(
+            self, computer_id, expected_workspaces=expected_workspaces
+        )
