@@ -21,6 +21,10 @@ import { createGatewayApp } from "../src/server.js";
 import type { ChannelPlatform } from "../src/types.js";
 import { makeInboundRequestKey } from "../src/uuid.js";
 import { fetchGatewayServer } from "./helpers.js";
+import {
+  createIsolatedPostgresDatabase,
+  type IsolatedPostgresDatabase,
+} from "./pg-isolation.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "../../..");
@@ -182,6 +186,13 @@ async function startOrAttachRealBackend(
 
   const pyBin = resolvePythonBin();
   const scriptPath = resolve(REPO_ROOT, scriptRel);
+  const isolatedDb: IsolatedPostgresDatabase =
+    await createIsolatedPostgresDatabase({
+      baseDsn: dsn,
+      tag: "real_http",
+      pythonBin: pyBin,
+      repoRoot: REPO_ROOT,
+    });
 
   let proc: ChildProcess | null = null;
   try {
@@ -189,7 +200,9 @@ async function startOrAttachRealBackend(
       cwd: REPO_ROOT,
       env: {
         ...process.env,
-        DALTON_CHANNEL_GATEWAY_TEST_DSN: dsn,
+        DALTON_CHANNEL_GATEWAY_TEST_DSN: isolatedDb.dsn,
+        DALTON_TEST_DB_DSN: isolatedDb.dsn,
+        TEST_DATABASE_URL: isolatedDb.dsn,
         PYTHONPATH: process.env.PYTHONPATH
           ? `${REPO_ROOT}${delimiter}${process.env.PYTHONPATH}`
           : REPO_ROOT,
@@ -207,7 +220,7 @@ async function startOrAttachRealBackend(
             `Timed out waiting for HARNESS_READY.\nstdout: ${stdoutBuf}\nstderr: ${stderrBuf}`,
           ),
         );
-      }, 30_000);
+      }, 60_000);
 
       childProc.stdout?.on("data", (chunk: Buffer) => {
         stdoutBuf += chunk.toString("utf8");
@@ -237,28 +250,32 @@ async function startOrAttachRealBackend(
     return {
       baseUrl,
       stop: async () => {
-        if (!childProc || childProc.exitCode !== null) {
-          return;
+        try {
+          if (childProc && childProc.exitCode === null) {
+            childProc.kill("SIGTERM");
+            await new Promise<void>((res) => {
+              const killTimer = setTimeout(() => {
+                if (childProc.exitCode === null) {
+                  childProc.kill("SIGKILL");
+                }
+                res();
+              }, 5_000);
+              childProc.once("exit", () => {
+                clearTimeout(killTimer);
+                res();
+              });
+            });
+          }
+        } finally {
+          await isolatedDb.drop();
         }
-        childProc.kill("SIGTERM");
-        await new Promise<void>((res) => {
-          const killTimer = setTimeout(() => {
-            if (childProc.exitCode === null) {
-              childProc.kill("SIGKILL");
-            }
-            res();
-          }, 5_000);
-          childProc.once("exit", () => {
-            clearTimeout(killTimer);
-            res();
-          });
-        });
       },
     };
   } catch (err) {
     if (proc && proc.exitCode === null) {
       proc.kill("SIGKILL");
     }
+    await isolatedDb.drop();
     throw err;
   }
 }
@@ -731,8 +748,11 @@ describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChann
 
         // -------------------------------------------------------------------
         // 2. Current-conversation POST /agent/send (omitted `target`) delivers
-        //    both text and file to `thread_cid` and NEVER to `parent_cid`
+        //    text to `thread_cid` (resolved `:thread:` address), converts group
+        //    files into sign-in web deep links (Phase 2 Batch 1 §2.4), and NEVER
+        //    posts to `parent_cid`
         // -------------------------------------------------------------------
+        const expectedThreadAddress = `${boot.parent_addr}:thread:${boot.thread_cid}`;
         const currentSendRes = await postAgentSend({
           thread_id: turnThreadId,
           run_id: turnRunId,
@@ -745,16 +765,20 @@ describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChann
         expect(currentSendRes.body).toEqual({
           status: "sent",
           code: null,
-          address: boot.parent_addr,
+          address: expectedThreadAddress,
           current: true,
           duplicate: false,
-          message: `Delivered to ${boot.parent_addr}.`,
+          message: `Delivered to ${expectedThreadAddress}.`,
           files: [
-            { path: "reports/q4-margins.png", status: "sent", reason: null },
+            {
+              path: "reports/q4-margins.png",
+              status: "linked",
+              reason: "group_target_deep_link",
+            },
           ],
         });
 
-        expect(sentMessages).toHaveLength(2);
+        expect(sentMessages).toHaveLength(1);
         expect(sentMessages[0]!.route).toBe(
           `/channels/${boot.thread_cid}/messages`,
         );
@@ -762,18 +786,13 @@ describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChann
         expect(sentMessages[0]!.bodyText).toContain(
           "Q4 gross margin expanded 180 bps.",
         );
-        expect(sentMessages[1]!.route).toBe(
-          `/channels/${boot.thread_cid}/messages`,
-        );
-        expect(sentMessages[1]!.isMultipart).toBe(true);
-        expect(sentMessages[1]!.bodyText).toContain("q4-margins.png");
+        expect(sentMessages[0]!.bodyText).toContain("q4-margins.png");
         expect(
           sentMessages.some(
             (m) => m.route === `/channels/${boot.parent_cid}/messages`,
           ),
         ).toBe(false);
         expect(messagePostRoutes(restCalls)).toEqual([
-          `/channels/${boot.thread_cid}/messages`,
           `/channels/${boot.thread_cid}/messages`,
         ]);
         expect(restCalls.some((call) => isParentRoute(call.route))).toBe(false);
@@ -812,8 +831,8 @@ describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChann
           address: boot.other_allowed_addr,
           current: false,
         });
-        expect(sentMessages).toHaveLength(3);
-        expect(sentMessages[2]!.route).toBe(
+        expect(sentMessages).toHaveLength(2);
+        expect(sentMessages[1]!.route).toBe(
           `/channels/${boot.other_cid}/messages`,
         );
         const explicitRoutes = restCalls.slice(restCountBeforeExplicit);
@@ -860,9 +879,8 @@ describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChann
           code: "not_allowed",
           current: false,
         });
-        expect(sentMessages).toHaveLength(3);
+        expect(sentMessages).toHaveLength(2);
         expect(messagePostRoutes(restCalls)).toEqual([
-          `/channels/${boot.thread_cid}/messages`,
           `/channels/${boot.thread_cid}/messages`,
           `/channels/${boot.other_cid}/messages`,
         ]);
@@ -882,7 +900,7 @@ describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChann
           text: "Retryable thread reply over real Postgres",
         });
         expect(failedRetryRes.body).toMatchObject({ status: "failed" });
-        expect(sentMessages).toHaveLength(3);
+        expect(sentMessages).toHaveLength(2);
 
         const snapFailedDlv = await inspectDb({
           deliveryKey: `${turnRunId}:tc-real-http-retry-1`,
@@ -898,12 +916,12 @@ describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChann
         });
         expect(succeededRetryRes.body).toMatchObject({
           status: "sent",
-          address: boot.parent_addr,
+          address: expectedThreadAddress,
           current: true,
-          message: `Delivered to ${boot.parent_addr}.`,
+          message: `Delivered to ${expectedThreadAddress}.`,
         });
-        expect(sentMessages).toHaveLength(4);
-        expect(sentMessages[3]!.route).toBe(
+        expect(sentMessages).toHaveLength(3);
+        expect(sentMessages[2]!.route).toBe(
           `/channels/${boot.thread_cid}/messages`,
         );
         const retryRoutes = restCalls.slice(restCountBeforeRetry);
@@ -930,7 +948,7 @@ describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChann
         expect(snapCompleted.inbound?.status).toBe("completed");
         expect(snapCompleted.inbound?.fallback_pending).toBe(false);
         expect(snapCompleted.inbound?.sent_to_current_count).toBe(2);
-        expect(sentMessages).toHaveLength(4);
+        expect(sentMessages).toHaveLength(3);
         expect(
           sentMessages.some(
             (m) => m.route === `/channels/${boot.parent_cid}/messages`,
@@ -975,11 +993,11 @@ describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChann
 
         await app.orchestrator.runStartupRecovery();
 
-        expect(sentMessages).toHaveLength(5);
-        expect(sentMessages[4]!.route).toBe(
+        expect(sentMessages).toHaveLength(4);
+        expect(sentMessages[3]!.route).toBe(
           `/channels/${boot.thread_cid}/messages`,
         );
-        expect(sentMessages[4]!.bodyText).toContain(
+        expect(sentMessages[3]!.bodyText).toContain(
           "Recovered background thread analysis from Postgres.",
         );
         expect(
@@ -988,7 +1006,6 @@ describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChann
           ),
         ).toBe(false);
         expect(messagePostRoutes(restCalls)).toEqual([
-          `/channels/${boot.thread_cid}/messages`,
           `/channels/${boot.thread_cid}/messages`,
           `/channels/${boot.other_cid}/messages`,
           `/channels/${boot.thread_cid}/messages`,
@@ -1716,7 +1733,11 @@ describe.skipIf(feishuSuiteGate === "skip")("Real HTTP End-to-End: FeishuChannel
         });
         expect(snapUnmentioned.inbound).toBeNull();
 
-        // 6b. User A switches workspace in group with structured @bot mention -> User A is in ws_cn (gen 2)
+        // 6b. User A switches workspace in a Feishu group topic with structured @bot mention
+        //     (Phase 2 Batch 1 §2.2: top-level `@bot` isolates per `:topic:<msg>`, while in-topic
+        //     messages & commands share `chat:<chat_id>:thread:<thread_id>`) -> User A is in ws_cn (gen 2)
+        const grpThreadId = `${boot.prefix}_omt_grp_1`;
+        const grpThreadScope = `chat:${boot.grp_chat_id}:thread:${grpThreadId}`;
         const mGrpSwA = `${boot.prefix}_om_grp_sw_a`;
         await feishuInboundAdapter.receiveRawEvent({
           sender: {
@@ -1726,6 +1747,7 @@ describe.skipIf(feishuSuiteGate === "skip")("Real HTTP End-to-End: FeishuChannel
           message: {
             message_id: mGrpSwA,
             chat_id: boot.grp_chat_id,
+            thread_id: grpThreadId,
             chat_type: "group",
             message_type: "text",
             content: JSON.stringify({ text: `@_user_1 /${boot.cn_name}` }),
@@ -1739,14 +1761,14 @@ describe.skipIf(feishuSuiteGate === "skip")("Real HTTP End-to-End: FeishuChannel
           },
         });
         const snapGrpA = await inspectDb({
-          scopeKey: boot.grp_scope,
+          scopeKey: grpThreadScope,
           userId: boot.user_a,
           messageId: mGrpSwA,
         });
         expect(snapGrpA.session?.generation).toBe(2);
         expect(snapGrpA.session?.override_workspace_id).toBe(boot.ws_cn);
 
-        // 6c. User B sends a mentioned message in the exact same group chat -> User B stays in User B's Home (gen 1)!
+        // 6c. User B sends a mentioned message in the exact same group topic -> User B stays in User B's Home (gen 1)!
         const mGrpMsgB = `${boot.prefix}_om_grp_msg_b`;
         await feishuInboundAdapter.receiveRawEvent({
           sender: {
@@ -1756,6 +1778,7 @@ describe.skipIf(feishuSuiteGate === "skip")("Real HTTP End-to-End: FeishuChannel
           message: {
             message_id: mGrpMsgB,
             chat_id: boot.grp_chat_id,
+            thread_id: grpThreadId,
             chat_type: "group",
             message_type: "text",
             content: JSON.stringify({
@@ -1771,7 +1794,7 @@ describe.skipIf(feishuSuiteGate === "skip")("Real HTTP End-to-End: FeishuChannel
           },
         });
         const snapGrpB = await inspectDb({
-          scopeKey: boot.grp_scope,
+          scopeKey: grpThreadScope,
           userId: boot.user_b,
           messageId: mGrpMsgB,
         });
@@ -1781,7 +1804,7 @@ describe.skipIf(feishuSuiteGate === "skip")("Real HTTP End-to-End: FeishuChannel
         expect(snapGrpB.session?.generation).toBe(1);
         expect(snapGrpB.session?.override_workspace_id).toBeNull();
 
-        // 6d. Same-workspace switch keeps generation 2 in `ws_cn` and does not start a model turn.
+        // 6d. Same-workspace switch in the same group topic keeps generation 2 in `ws_cn` and does not start a model turn.
         // The reply names that workspace and its id.
         const threadsBeforeSameSwitch =
           (
@@ -1798,6 +1821,7 @@ describe.skipIf(feishuSuiteGate === "skip")("Real HTTP End-to-End: FeishuChannel
           message: {
             message_id: mGrpSwSame,
             chat_id: boot.grp_chat_id,
+            thread_id: grpThreadId,
             chat_type: "group",
             message_type: "text",
             content: JSON.stringify({ text: `@_user_1 /${boot.cn_name}` }),
@@ -1811,7 +1835,7 @@ describe.skipIf(feishuSuiteGate === "skip")("Real HTTP End-to-End: FeishuChannel
           },
         });
         const snapGrpSame = await inspectDb({
-          scopeKey: boot.grp_scope,
+          scopeKey: grpThreadScope,
           userId: boot.user_a,
           messageId: mGrpSwSame,
         });

@@ -866,6 +866,9 @@ async def _record_pending_bot_topic_reply_in_tx(
     return dict(inserted) if inserted else None
 
 
+MAX_PENDING_BOT_TOPIC_CANDIDATES = 50
+
+
 async def lookup_bot_topic(
     *,
     platform: str,
@@ -874,6 +877,9 @@ async def lookup_bot_topic(
     external_topic_id: str | None = None,
     canonical_scope_key: str | None = None,
     root_message_id: str | None = None,
+    initiator_platform_user_id: str | None = None,
+    pending_limit: int | None = None,
+    pending_offset: int = 0,
     conn: Any = None,
 ) -> dict[str, Any]:
     """Read-only lookup of a confirmed registered bot topic for inbound follow-up or outbound routing."""
@@ -893,6 +899,13 @@ async def lookup_bot_topic(
     ext_tid = str(external_topic_id or "").strip() or None
     scope = str(canonical_scope_key or "").strip() or None
     root_mid = str(root_message_id or "").strip() or None
+    init_puid = str(initiator_platform_user_id or "").strip() or None
+    eff_offset = max(0, int(pending_offset or 0))
+    eff_limit = (
+        min(max(1, int(pending_limit)), MAX_PENDING_BOT_TOPIC_CANDIDATES)
+        if pending_limit is not None
+        else MAX_PENDING_BOT_TOPIC_CANDIDATES
+    )
 
     empty_resp: dict[str, Any] = {
         "found": False,
@@ -914,6 +927,8 @@ async def lookup_bot_topic(
         async with owned_conn.cursor(row_factory=dict_row) as cur:
             row = None
             pending_candidates: list[dict[str, Any]] = []
+            has_more_pending = False
+            pending_truncated = False
             if cleaned_mode == "inbound_followup":
                 await cur.execute(
                     """
@@ -941,13 +956,37 @@ async def lookup_bot_topic(
                           AND chat_address = %s
                           AND status = 'pending'
                           AND first_reply_message_id IS NOT NULL
-                        ORDER BY CASE WHEN %s::varchar IS NOT NULL AND root_message_id = %s THEN 0 ELSE 1 END,
-                                 last_active_at DESC
-                        LIMIT 5
+                        ORDER BY
+                          CASE WHEN %s::varchar IS NOT NULL AND root_message_id = %s THEN 0 ELSE 1 END,
+                          CASE WHEN %s::varchar IS NOT NULL AND initiator_platform_user_id = %s THEN 0 ELSE 1 END,
+                          last_active_at DESC,
+                          canonical_scope_key ASC
+                        LIMIT %s OFFSET %s
                         """,
-                        (cleaned_plat, topic_addr, root_mid, root_mid),
+                        (
+                            cleaned_plat,
+                            topic_addr,
+                            root_mid,
+                            root_mid,
+                            init_puid,
+                            init_puid,
+                            eff_limit + 1,
+                            eff_offset,
+                        ),
                     )
-                    for pending_row in await cur.fetchall() or []:
+                    fetched_pending = list(await cur.fetchall() or [])
+                    if len(fetched_pending) > eff_limit:
+                        has_more_pending = True
+                        fetched_pending = fetched_pending[:eff_limit]
+                        if eff_offset + eff_limit >= MAX_PENDING_BOT_TOPIC_CANDIDATES:
+                            pending_truncated = True
+                            logger.warning(
+                                "Pending Feishu bot topics in %s exceeded cap (%d) at offset=%d; truncating candidates",
+                                topic_addr,
+                                MAX_PENDING_BOT_TOPIC_CANDIDATES,
+                                eff_offset,
+                            )
+                    for pending_row in fetched_pending:
                         if (
                             pending_row.get("canonical_scope_key")
                             and pending_row.get("first_reply_message_id")
@@ -1026,7 +1065,15 @@ async def lookup_bot_topic(
 
     if not row:
         if pending_candidates:
-            return {**empty_resp, "pending_candidates": pending_candidates}
+            resp_pending: dict[str, Any] = {
+                **empty_resp,
+                "pending_candidates": pending_candidates,
+            }
+            if has_more_pending:
+                resp_pending["pending_candidates_has_more"] = True
+            if pending_truncated:
+                resp_pending["pending_candidates_truncated"] = True
+            return resp_pending
         return empty_resp
     return {
         "found": True,
@@ -14975,9 +15022,65 @@ async def finish_automation_run(
                         )
                         verified_run_id = None
 
-                # R12 (Codex #7): mark_finished=True always converges to 'finished' even when
-                # targets is omitted (preserving persisted targets), and never reverts 'finished'.
+                # R12 (Codex #7) & BW2: mark_finished=True never overwrites an already-finished
+                # run (conditional `status <> 'finished'`), and refuses to mark `finished` while
+                # any `:charts` delivery for this execution is still `in_flight` in DB.
                 if mark_finished:
+                    if prev_db_status == "finished":
+                        return {
+                            "execution_id": norm_exec_id,
+                            "status": "finished",
+                            "previous_status": "finished",
+                            "user_id": row["user_id"],
+                            "workspace_id": (
+                                str(row["workspace_id"])
+                                if row.get("workspace_id")
+                                else None
+                            ),
+                            "thread_id": (
+                                str(row["thread_id"])
+                                if row.get("thread_id")
+                                else None
+                            ),
+                            "run_id": stored_run_id,
+                            "automation_name": row.get("automation_name") or "",
+                            "finish_status": row.get("finish_status"),
+                            "final_text": row.get("final_text"),
+                            "targets": list(row.get("targets") or []),
+                        }
+                    await cur.execute(
+                        """
+                        SELECT 1
+                        FROM dalton_channel_deliveries
+                        WHERE execution_id = %s
+                          AND delivery_key LIKE %s
+                          AND status = 'in_flight'
+                        LIMIT 1
+                        """,
+                        (norm_exec_id, f"automation:{norm_exec_id}:%:charts"),
+                    )
+                    if await cur.fetchone():
+                        return {
+                            "execution_id": norm_exec_id,
+                            "status": "finishing",
+                            "previous_status": prev_db_status,
+                            "user_id": row["user_id"],
+                            "workspace_id": (
+                                str(row["workspace_id"])
+                                if row.get("workspace_id")
+                                else None
+                            ),
+                            "thread_id": (
+                                str(row["thread_id"])
+                                if row.get("thread_id")
+                                else None
+                            ),
+                            "run_id": verified_run_id or stored_run_id,
+                            "automation_name": row.get("automation_name") or "",
+                            "finish_status": row.get("finish_status"),
+                            "final_text": row.get("final_text"),
+                            "targets": list(row.get("targets") or []),
+                        }
                     eff_targets = (
                         targets if targets is not None else list(row.get("targets") or [])
                     )
@@ -14992,6 +15095,7 @@ async def finish_automation_run(
                             targets = %s,
                             updated_at = NOW()
                         WHERE execution_id = %s
+                          AND status <> 'finished'
                         RETURNING *
                         """,
                         (
@@ -15003,7 +15107,8 @@ async def finish_automation_run(
                             norm_exec_id,
                         ),
                     )
-                    updated = dict(await cur.fetchone())
+                    updated_row = await cur.fetchone()
+                    updated = dict(updated_row) if updated_row else dict(row)
                     return {
                         "execution_id": norm_exec_id,
                         "status": "finished",
@@ -15128,4 +15233,74 @@ async def finish_automation_run(
                     "targets": enriched_targets,
                 }
 
+
+async def resolve_authorized_automation_run_platforms(
+    *,
+    thread_id: str,
+    run_id: str,
+    user_id: str,
+    execution_id: str | None = None,
+    conn: Any = None,
+) -> list[str]:
+    """Resolve distinct channel platforms from authorized ``dalton_channel_automation_runs``
+    targets owned by ``user_id`` for ``(thread_id, run_id)`` (and optional ``execution_id``).
+
+    Used by ``GET /internal/threads/{thread_id}/runs/{run_id}/replay`` so platform
+    sub-capabilities are enforced against server-authoritative automation targets.
+    """
+    norm_tid = normalize_uuid(thread_id)
+    cleaned_rid = str(run_id or "").strip()
+    cleaned_uid = str(user_id or "").strip()
+    norm_exec = normalize_uuid(execution_id) if execution_id else None
+    if not norm_tid or not cleaned_rid or not cleaned_uid:
+        return []
+
+    async with get_db_connection(conn) as owned_conn:
+        async with owned_conn.cursor(row_factory=dict_row) as cur:
+            if norm_exec:
+                await cur.execute(
+                    """
+                    SELECT targets
+                    FROM dalton_channel_automation_runs
+                    WHERE execution_id = %s
+                      AND user_id = %s
+                      AND thread_id = %s::uuid
+                      AND run_id = %s
+                    """,
+                    (norm_exec, cleaned_uid, norm_tid, cleaned_rid),
+                )
+            else:
+                await cur.execute(
+                    """
+                    SELECT targets
+                    FROM dalton_channel_automation_runs
+                    WHERE user_id = %s
+                      AND thread_id = %s::uuid
+                      AND run_id = %s
+                    ORDER BY updated_at DESC
+                    LIMIT 5
+                    """,
+                    (cleaned_uid, norm_tid, cleaned_rid),
+                )
+            rows = await cur.fetchall()
+
+    platforms: list[str] = []
+    seen: set[str] = set()
+    for row in rows or ():
+        raw_targets = row.get("targets")
+        if not isinstance(raw_targets, list):
+            continue
+        for item in raw_targets:
+            if not isinstance(item, dict) or item.get("ok") is not True:
+                continue
+            addr = str(item.get("address") or "").strip()
+            if ":" not in addr:
+                continue
+            prefix = addr.split(":", 1)[0].strip().lower()
+            if prefix == "wechat":
+                prefix = "weixin"
+            if prefix in SUPPORTED_PLATFORMS and prefix not in seen:
+                seen.add(prefix)
+                platforms.append(prefix)
+    return platforms
 
