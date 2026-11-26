@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dalton-macro",
+  "version": "0.1.0",
+  "description": "Public US macro time series from official FRED/ALFRED (with historical vintage support) and US Treasury Fiscal Data (TGA closing balance and federal debt to the penny).",
+  "author": {
+    "name": "Dalton"
+  },
+  "license": "Apache-2.0",
+  "extensions": {
+    "ai.langalpha": {
+      "servers": {
+        "dalton_macro": {
+          "description": "Official keyless US macro series (FRED/ALFRED with vintage dates) and US Treasury Fiscal Data (daily TGA closing balance and federal debt).",
+          "tool_exposure_mode": "summary",
+          "instruction": "Use `get_fred_series(series, start, end, vintage=None)` for FRED/ALFRED macro series (e.g., DGS10, SOFR, CPIAUCSL, WALCL, RRPONTSYD, WTREGEN) with optional point-in-time `vintage` (YYYY-MM-DD). Use `get_treasury_data(dataset='tga'|'debt', start, end)` for official US Treasury General Account closing balance or Debt to the Penny. Use `list_macro_catalog()` to view common series IDs."
+        }
+      }
+    }
+  }
+}

@@ -1,22 +1,11 @@
-import os
-from pathlib import Path
-
 from .core import load_yaml_config
 
-from dotenv import load_dotenv
+from src.dalton.config_env import load_shared_dotenv  # DALTON-HOOK(standalone-core): shared .env loader for backend and research-host
 
-# DALTON-HOOK(conversation-archive): bind explicit dotenv file when configured
-_explicit_dotenv = (
-    os.environ.get("DALTON_DOTENV_PATH", "").strip()
-    or os.environ.get("DALTON_REPO_ENV_FILE", "").strip()
-)
-if _explicit_dotenv:
-    load_dotenv(Path(_explicit_dotenv).expanduser())
-else:
-    load_dotenv()
-
+load_shared_dotenv()  # DALTON-HOOK(conversation-archive): bind explicit dotenv file when configured
 
 __all__ = [
     # Utilities
+    "load_shared_dotenv",
     "load_yaml_config",
 ]

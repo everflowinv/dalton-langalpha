@@ -1,0 +1,21 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dalton-research-all",
+  "version": "0.1.0",
+  "description": "Federated cross-library research connector with per-source capability checks, partial-failure status, and prefix-dispatched document reading.",
+  "author": {
+    "name": "Dalton"
+  },
+  "license": "Apache-2.0",
+  "extensions": {
+    "ai.langalpha": {
+      "servers": {
+        "dalton_research_all": {
+          "description": "Federated search and prefix-dispatched read across currently enabled internal research sources.",
+          "tool_exposure_mode": "summary",
+          "instruction": "Use `search(query=..., limit=...)` to screen across all enabled research sources at once (returns `source_status` and `status='partial'` when any enabled source times out or degrades). Use `read(document='<prefix>:<id>')` (or `get_document`) to fetch full text or image metadata; each source is checked against deployment capabilities on every call."
+        }
+      }
+    }
+  }
+}

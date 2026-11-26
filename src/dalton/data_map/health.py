@@ -480,6 +480,100 @@ def build_route_probe_spec(
     return tool_name, {"route": rid, "operation": "search", "query": "NVDA", "limit": 1}
 
 
+RESEARCH_HOST_CONNECTOR_ROUTES: frozenset[str] = frozenset(
+    {
+        "company-wiki",
+        "guidepoint",
+        "sales-notes",
+        "tmtb",
+        "funda-ai",
+    }
+)
+
+
+def resolve_route_probe_target(route_id: str) -> str:
+    """Return the active probe backend for `route_id`: 'research_host', 'dalton_macro', 'dalton_sec', or 'bridge'.
+
+    Pre-cutover Everflow returns 'bridge' for every route so existing behavior is unchanged.
+    Once Batch 3 connectors are enabled (Core or post-cutover Everflow), migrated routes
+    probe their dedicated entry points while unmigrated routes (e.g. `alphaengine`,
+    `estimates`, `cn-hk`) continue probing the legacy bridge.
+    """
+    from src.dalton.capabilities import is_batch3_connectors_enabled
+
+    rid = str(route_id or "").strip()
+    if not is_batch3_connectors_enabled():
+        return "bridge"
+    if rid in RESEARCH_HOST_CONNECTOR_ROUTES:
+        return "research_host"
+    if rid in ("fred", "treasury"):
+        return "dalton_macro"
+    if rid == "sec":
+        return "dalton_sec"
+    return "bridge"
+
+
+async def default_call_research_host_connector(
+    route_id: str,
+    tool_name: str,
+    arguments: Mapping[str, Any],
+    *,
+    timeout_s: float = DEFAULT_ITEM_TIMEOUT_S,
+) -> dict[str, Any]:
+    """Invoke a Batch 3 research-host connector at `/mcp/<route_id>` with `DALTON_RESEARCH_HOST_TOKEN`."""
+    from src.dalton.settings import get_dalton_research_host_base_url, get_dalton_research_host_token
+
+    base_url = get_dalton_research_host_base_url()
+    if not base_url:
+        raise RuntimeError("DALTON_RESEARCH_HOST_URL is not configured")
+    token = get_dalton_research_host_token()
+    url = f"{base_url.rstrip('/')}/mcp/{route_id}"
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    rpc_list_body = {
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "tools/list",
+        "params": {},
+    }
+    rpc_body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": tool_name, "arguments": dict(arguments)},
+    }
+    async with httpx.AsyncClient(timeout=clamp_timeout_s(timeout_s), trust_env=False) as client:
+        list_resp = await client.post(url, json=rpc_list_body, headers=headers)
+        list_resp.raise_for_status()
+        list_body = list_resp.json()
+        if isinstance(list_body, Mapping) and list_body.get("error"):
+            raise RuntimeError(sanitize_health_text(list_body.get("error")))
+        listed_tools = (list_body.get("result") or {}).get("tools") if isinstance(list_body, Mapping) else None
+        if isinstance(listed_tools, list):
+            tool_names = {str(t.get("name") or "") for t in listed_tools if isinstance(t, Mapping)}
+            if tool_name not in tool_names:
+                raise RuntimeError(f"Tool '{tool_name}' not advertised by research-host connector {route_id}")
+        resp = await client.post(url, json=rpc_body, headers=headers)
+    resp.raise_for_status()
+    body = resp.json()
+    if isinstance(body, Mapping) and body.get("error"):
+        raise RuntimeError(sanitize_health_text(body.get("error")))
+    result_obj = body.get("result") if isinstance(body, Mapping) else {}
+    if isinstance(result_obj, Mapping):
+        sc = result_obj.get("structuredContent")
+        if isinstance(sc, Mapping):
+            return _validate_bridge_payload(sc, result_obj=result_obj)
+        content = result_obj.get("content")
+        if isinstance(content, list) and content:
+            first = content[0]
+            if isinstance(first, Mapping) and isinstance(first.get("text"), str):
+                parsed = json.loads(first["text"])
+                if isinstance(parsed, Mapping):
+                    return _validate_bridge_payload(parsed, result_obj=result_obj)
+    raise RuntimeError(f"Unrecognized response from research-host connector {route_id}")
+
+
 async def default_web_search_probe(*, timeout_s: float = DEFAULT_ITEM_TIMEOUT_S) -> dict[str, Any]:
     """Minimal real probe for `web_search` using ``gemini_grounding``."""
     from src.config.tool_settings import get_search_api
@@ -764,6 +858,7 @@ async def _execute_probes(
     probe_market: Callable[..., Any],
     probe_sec_filings: Callable[..., Any] | None,
     probe_conv: Callable[..., Any],
+    research_host_caller: Callable[..., Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None, set[str]]:
     from src.dalton.capabilities import (
         CapabilityId,
@@ -837,6 +932,16 @@ async def _execute_probes(
                     routes_to_probe.append((rid_s, str(entry.get("category") or "research").strip()))
     else:
         catalog_routes = []
+        # Standalone Core (no legacy bridge): probe enabled research-host connectors
+        # using the actually resolved research-host base URL (including Core's default
+        # `http://research-host:8951`) or an injected caller.
+        from src.dalton.capabilities import is_research_source_enabled
+        from src.dalton.settings import get_dalton_research_host_base_url
+
+        if research_host_caller is not None or bool(get_dalton_research_host_base_url()):
+            for rid in ("company-wiki", "sales-notes", "tmtb", "funda-ai", "guidepoint"):
+                if is_research_source_enabled(rid, capabilities=active_caps):
+                    routes_to_probe.append((rid, "research"))
 
     # 2. Schedule all probes with bounded concurrency and per-item timeout <= 60s
     tasks: list[asyncio.Task[dict[str, Any]]] = []
@@ -915,7 +1020,39 @@ async def _execute_probes(
                     if window_days == PROBE_WINDOW_DAYS_DEFAULT
                     else build_route_probe_spec(r_id, r_cat, window_days=window_days)[1]
                 )
-                res = await call_bridge(t_name, call_args, timeout_s=clamped_timeout)
+                probe_target = resolve_route_probe_target(r_id)
+                if probe_target == "research_host":
+                    op_name = str(call_args.get("operation") or "list")
+                    conn_args = {
+                        k: v for k, v in call_args.items() if k not in ("route", "operation")
+                    }
+                    rh_call = research_host_caller or default_call_research_host_connector
+                    res = await rh_call(
+                        r_id, op_name, conn_args, timeout_s=clamped_timeout
+                    )
+                elif probe_target == "dalton_macro" and call_bridge is default_bridge_rpc_call:
+                    from plugins.dalton_macro import dalton_macro_mcp_server as macro_mod
+
+                    if r_id == "treasury":
+                        res = await asyncio.to_thread(
+                            macro_mod.get_treasury_data,
+                            dataset=str(call_args.get("dataset") or "tga"),
+                            start=call_args.get("start"),
+                            end=call_args.get("end"),
+                            limit=int(call_args.get("limit") or 1),
+                        )
+                    else:
+                        res = await asyncio.to_thread(
+                            macro_mod.get_fred_series,
+                            series=str(call_args.get("series") or "DGS10"),
+                            start=call_args.get("start"),
+                            end=call_args.get("end"),
+                            limit=int(call_args.get("limit") or 1),
+                        )
+                elif probe_target == "dalton_sec" and call_bridge is default_bridge_rpc_call:
+                    res = await default_sec_filings_probe(timeout_s=clamped_timeout)
+                else:
+                    res = await call_bridge(t_name, call_args, timeout_s=clamped_timeout)
                 if isinstance(res, Mapping):
                     _validate_bridge_payload(res)
                     if r_id == "xueqiu":
@@ -1148,6 +1285,7 @@ async def run_all_health_checks(
     market_quote_prober: Callable[..., Any] | None = None,
     sec_filings_prober: Callable[..., Any] | None = default_sec_filings_probe,
     conversation_prober: Callable[..., Any] | None = None,
+    research_host_caller: Callable[..., Any] | None = None,
     persist: bool = True,
     skip_if_cached: bool = False,
     use_advisory_lock: bool = False,
@@ -1221,6 +1359,7 @@ async def run_all_health_checks(
             probe_market=probe_market,
             probe_sec_filings=sec_filings_prober,
             probe_conv=probe_conv,
+            research_host_caller=research_host_caller,
         )
 
         data_task_health: dict[str, Any] | None = None

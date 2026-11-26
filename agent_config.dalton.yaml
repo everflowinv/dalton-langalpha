@@ -50,6 +50,18 @@ mcp:
       enabled: true
     - name: "researchdata"
       call_timeout_s: 625
+    - name: "dalton_company_wiki"
+      call_timeout_s: 625
+    - name: "dalton_research_all"
+      call_timeout_s: 625
+    - name: "dalton_guidepoint"
+      call_timeout_s: 625
+    - name: "dalton_sales_notes"
+      call_timeout_s: 625
+    - name: "dalton_tmtb"
+      call_timeout_s: 625
+    - name: "dalton_funda_ai"
+      call_timeout_s: 625
     # Keep upstream's Firecrawl MCP / Alexandria data catalog off on Dalton
     # (only the shared FIRECRAWL_API_KEY web-fetch fallback stays enabled).
     - name: "firecrawl"

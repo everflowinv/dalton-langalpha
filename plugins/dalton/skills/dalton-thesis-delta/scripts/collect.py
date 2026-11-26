@@ -871,8 +871,88 @@ def _call_bridge_http(
         return {"ok": False, "status": "exception", "error": str(e)[:300]}
 
 
+def _load_connector_transport_helper() -> Any | None:
+    import importlib.util
+
+    helper_path = (
+        Path(__file__).resolve().parents[2]
+        / "dalton-conventions"
+        / "scripts"
+        / "connector_transport.py"
+    )
+    if not helper_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("_dalton_connector_transport", helper_path)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _resolve_dedicated_server_for_call(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> tuple[str | None, str | None, dict[str, Any]]:
+    """Map a legacy (tool_name, arguments) call to a Batch 3 dedicated MCP server when its tool & params are available."""
+    ct = _load_connector_transport_helper()
+    if ct is None:
+        return None, None, {}
+    return ct.resolve_dedicated_for_legacy_call(tool_name, arguments)
+
+
+def _try_dedicated_connector_call(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Invoke a mounted Batch 3 dedicated MCP connector when it exposes the required tool and parameters."""
+    server, mapped_tool, mapped_args = _resolve_dedicated_server_for_call(tool_name, arguments)
+    if not server or not mapped_tool:
+        return None
+    try:
+        import mcp_client as mcp_client_module  # type: ignore
+    except Exception:  # noqa: BLE001
+        return None
+    call_fn = getattr(mcp_client_module, "call_mcp_tool_with_error_flag", None)
+    if not callable(call_fn):
+        return None
+    try:
+        result = call_fn(server, mapped_tool, mapped_args)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "status": "exception", "error": str(exc)[:300]}
+    is_error = False
+    value = result
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], bool):
+        is_error, value = result
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return {
+                "ok": False,
+                "status": "empty_bridge_content",
+                "error": value.strip()[:300] or "wrapper returned non-JSON text",
+            }
+    if isinstance(value, dict):
+        return _normalize_dict_result(
+            value, outer_is_error=is_error, default_error="wrapper_call_failed"
+        )
+    return {
+        "ok": False,
+        "status": "invalid_format",
+        "error": f"wrapper returned non-dict result ({type(value).__name__}): {str(value)[:200]}",
+        "data": clean_val(value),
+    }
+
+
 def call_bridge_jsonrpc(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
-    """调用一个 researchdata 工具：HTTP 桥覆盖优先，默认走沙箱包装模块（tools.researchdata）。"""
+    """按来源选择实际入口：HTTP 桥显式覆盖优先；否则若工作区 MCP 清单已启用该来源对应的独立连接器，直接走独立连接器；未迁移来源（如 alphaengine）或切换前走 tools.researchdata。"""
+    if os.environ.get("DALTON_RESEARCHDATA_URL", "").strip():
+        transport = resolve_researchdata_transport()
+        return _call_bridge_http(transport["call"], tool_name, arguments, timeout)
+    dedicated_res = _try_dedicated_connector_call(tool_name, arguments)
+    if dedicated_res is not None:
+        return dedicated_res
     transport = resolve_researchdata_transport()
     if transport["mode"] == "bridge":
         return _call_bridge_http(transport["call"], tool_name, arguments, timeout)

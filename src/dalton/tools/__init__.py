@@ -12,7 +12,9 @@ from langchain_core.tools import BaseTool
 from src.dalton.capabilities import (
     CORE_CAPABILITY,
     CapabilityId,
+    CapabilityRequirement,
     effective_capabilities,
+    is_capability_requirement_satisfied,
 )
 from src.dalton.settings import get_dalton_settings
 from src.dalton.tools.coverage_tools import build_coverage_tools
@@ -47,7 +49,7 @@ class DaltonToolRegistration:
     tool_names: tuple[str, ...]
     roles: frozenset[str]
     min_tier: ToolMinTier
-    capability: CapabilityId | None
+    capability: CapabilityRequirement
     description: str
     kwarg_mode: ToolKwargMode = "none"
     single_tool: bool = False
@@ -397,7 +399,7 @@ DALTON_TOOL_REGISTRY: tuple[DaltonToolRegistration, ...] = (
         tool_names=("ingest_research",),
         roles=_ALL_ROLES,
         min_tier="any",
-        capability=CapabilityId.RESEARCHDATA_BRIDGE,
+        capability=(CapabilityId.COMPANY_WIKI, CapabilityId.SALES_NOTES),
         description="研究资料统一入库路由（Wiki / 销售笔记）",
         kwarg_mode="fs_and_allow_home",
         single_tool=True,
@@ -562,7 +564,7 @@ def build_dalton_tools(
             tier_mounts_conversation_search=tier_mounts_conversation_search,
         ):
             continue
-        if entry.capability is not None and entry.capability not in active_caps:
+        if not is_capability_requirement_satisfied(entry.capability, active_caps):
             continue
         if not _passes_setting_gate(
             entry.setting_gate,

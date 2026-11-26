@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dalton-tmtb",
+  "version": "0.1.0",
+  "description": "TMTB technology market summaries connector (commercial).",
+  "author": { "name": "Dalton" },
+  "license": "Proprietary",
+  "extensions": {
+    "ai.langalpha": {
+      "servers": {
+        "dalton_tmtb": {
+          "description": "TMTB closing & pre/post-market tech summaries (`search`, `read`, `list` over `tmtb:` partition).",
+          "tool_exposure_mode": "summary",
+          "instruction": "Use `search(query=..., start=..., end=..., limit=...)`, `list(...)`, and `read(document='tmtb:<id>')` for TMTB tech commentary."
+        }
+      }
+    }
+  }
+}
