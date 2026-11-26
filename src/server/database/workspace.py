@@ -461,19 +461,42 @@ async def get_workspace_name_keys(user_id: str) -> set[str]:
 # DALTON-HOOK(workspace-duplicate-guard): names of every live workspace, for the
 # agent-side check that turns a duplicate create into an ask.
 async def get_live_workspace_names(user_id: str) -> List[Dict[str, Any]]:
-    """``(workspace_id, name)`` of every live workspace the user holds.
+    """``(workspace_id, name[, unit_ticker])`` of every live workspace the user holds.
 
     The same fence as the name-key lookups, so what counts as a duplicate
     here is exactly what would collide there.
     """
+    # DALTON-HOOK(cos-settings-tools): include active company unit ticker when coverage units are enabled so the card matches locked recheck
+    from src.dalton.settings import is_coverage_units_enabled
+
     async with _ws_cursor() as cur:
-        await cur.execute(
-            f"""
-            SELECT workspace_id, name FROM workspaces
-            WHERE user_id = %s AND {FENCE_LIVE_WORKSPACE}
-            """,
-            (user_id,),
-        )
+        if is_coverage_units_enabled():
+            await cur.execute(
+                f"""
+                SELECT workspaces.workspace_id,
+                       workspaces.name,
+                       (
+                           SELECT cu.ticker
+                           FROM dalton_coverage_units cu
+                           WHERE cu.workspace_id = workspaces.workspace_id
+                             AND cu.status = 'active'
+                             AND cu.kind = 'company'
+                           ORDER BY cu.updated_at DESC NULLS LAST
+                           LIMIT 1
+                       ) AS unit_ticker
+                FROM workspaces
+                WHERE user_id = %s AND {FENCE_LIVE_WORKSPACE}
+                """,
+                (user_id,),
+            )
+        else:
+            await cur.execute(
+                f"""
+                SELECT workspace_id, name FROM workspaces
+                WHERE user_id = %s AND {FENCE_LIVE_WORKSPACE}
+                """,
+                (user_id,),
+            )
         return [dict(row) for row in await cur.fetchall()]
 
 
@@ -1347,19 +1370,48 @@ async def check_duplicate_snapshot_unchanged(
     candidates_list = list(verified_company_candidates) if verified_company_candidates else []
 
     async def _run_checks(check_cur) -> bool:
-        await check_cur.execute(
-            f"""
-            SELECT workspace_id, name
-            FROM workspaces
-            WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
-            """,
-            {"user_id": user_id},
-        )
+        from src.dalton.settings import is_coverage_units_enabled
+
+        if is_coverage_units_enabled():
+            await check_cur.execute(
+                f"""
+                SELECT workspaces.workspace_id,
+                       workspaces.name,
+                       (
+                           SELECT cu.ticker
+                           FROM dalton_coverage_units cu
+                           WHERE cu.workspace_id = workspaces.workspace_id
+                             AND cu.status = 'active'
+                             AND cu.kind = 'company'
+                           ORDER BY cu.updated_at DESC NULLS LAST
+                           LIMIT 1
+                       ) AS unit_ticker
+                FROM workspaces
+                WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
+                """,
+                {"user_id": user_id},
+            )
+        else:
+            await check_cur.execute(
+                f"""
+                SELECT workspace_id, name
+                FROM workspaces
+                WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
+                """,
+                {"user_id": user_id},
+            )
         live_rows = await check_cur.fetchall()
         matched_expected = False
         for live_ws in live_rows:
             live_id = str(live_ws["workspace_id"])
             live_name = str(live_ws.get("name") or "")
+            live_unit_ticker = normalize_ticker_key(live_ws.get("unit_ticker"))
+            matches_live = _same_name_or_ticker(name, live_name) or (
+                live_unit_ticker is not None
+                and _same_name_or_ticker(
+                    name, live_unit_ticker, candidate_is_ticker=True
+                )
+            )
             if (
                 expected_duplicate_workspace_id is not None
                 and live_id == expected_duplicate_workspace_id
@@ -1369,11 +1421,11 @@ async def check_duplicate_snapshot_unchanged(
                     and live_name != expected_duplicate_workspace_name
                 ):
                     return False
-                if not _same_name_or_ticker(name, live_name):
+                if not matches_live:
                     return False
                 matched_expected = True
                 continue
-            if _same_name_or_ticker(name, live_name):
+            if matches_live:
                 return False
         if expected_duplicate_workspace_id is not None and not matched_expected:
             return False

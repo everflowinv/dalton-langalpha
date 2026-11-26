@@ -286,6 +286,18 @@ class WorkspaceManager(ComputerManager):
         if workspace is None:
             if verify_snapshot or bootstrap_cloud_primary:
                 raise ApprovalScopeChangedError("情况已变化，请重新发起")
+            try:
+                latest = await get_computer(computer_id)
+            except Exception:
+                latest = None
+            if (
+                latest is not None
+                and str(latest.get("user_id")) == str(user_id)
+                and (latest.get("config") or {}).get("archiving")
+            ):
+                raise ComputerArchivingError(
+                    "This computer is currently being archived and cannot accept new workspaces."
+                )
             if chosen:
                 raise ComputerNotFoundError("Computer not found")
             raise RuntimeError(

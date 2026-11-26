@@ -15,10 +15,51 @@ from starlette.requests import Request
 from src.dalton.database import automation_reports as reports_db
 from src.dalton.services import report_delivery as rd_svc
 from src.dalton.tools import build_dalton_tools
+from src.dalton.tools import report_delivery_tools as rd_tools
 from src.dalton.tools.report_delivery_tools import create_report_delivery_tools
 from src.ptc_agent.agent.prompts import get_loader
 from src.server.app import automations as automations_app
 from src.server.models.automation import AutomationCreate
+
+
+def _tool_json(result: Any) -> dict[str, Any]:
+    if isinstance(result, str):
+        return json.loads(result)
+    update = getattr(result, "update", None)
+    if isinstance(update, dict) and update.get("messages"):
+        return json.loads(update["messages"][0].content)
+    raise AssertionError(f"Unexpected tool return value: {result!r}")
+
+
+async def _call_tool(tool: Any, args: dict[str, Any], *, config: dict[str, Any]) -> dict[str, Any]:
+    raw = await tool.ainvoke(
+        {
+            "name": tool.name,
+            "args": args,
+            "id": "tc-rd-1",
+            "type": "tool_call",
+        },
+        config=config,
+    )
+    return _tool_json(raw)
+
+
+_REAL_HITL_CONFIRM = rd_tools.hitl_confirm
+
+
+def _patch_hitl_approve(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, Any]]]:
+    captured: list[tuple[str, dict[str, Any]]] = []
+
+    def _approve(action_type: str, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        captured.append((action_type, dict(payload)))
+        return True, {"decisions": [{"type": "approve", "confirm_token": payload.get("confirm_token")}]}
+
+    monkeypatch.setattr(
+        rd_tools,
+        "hitl_confirm",
+        create_autospec(_REAL_HITL_CONFIRM, side_effect=_approve),
+    )
+    return captured
 
 _AUTO_UUID = "11111111-1111-1111-1111-111111111111"
 _EXEC_UUID = "22222222-2222-2222-2222-222222222222"
@@ -252,7 +293,7 @@ def test_prompt_renders_report_delivery_guidance_only_when_enabled() -> None:
     rendered_on = loader.render("components/dalton_deliverable.md.j2", dalton_report_delivery_enabled=True)
     assert "dalton_report_delivery" not in rendered_off
     assert "dalton_report_delivery" in rendered_on
-    assert "user_confirmed=true" in rendered_on
+    assert "user_confirmed=true" not in rendered_on
 
 
 @pytest.mark.asyncio
@@ -261,26 +302,28 @@ async def test_internal_set_authorized_group_member_succeeds_archives_and_notifi
     tmp_path: Path,
 ) -> None:
     mocks = _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="internal", is_feishu_member=True)
+    hitl_calls = _patch_hitl_approve(monkeypatch)
     tool = create_report_delivery_tools()[0]
 
-    raw = await tool.ainvoke(
+    res = await _call_tool(
+        tool,
         {
             "action": "set",
             "automation_id": _AUTO_UUID,
             "report_targets": [_FEISHU_CHAT_AUTH],
-            "user_confirmed": True,
         },
         config=_cfg(_OWNER),
     )
-    res = json.loads(raw)
 
+    assert len(hitl_calls) == 1
+    assert hitl_calls[0][0] == "dalton_report_delivery_set"
     assert res["ok"] is True
     assert res["report_profile"] == {
         "profile": "daily-filing-alert",
         "report_targets": [_FEISHU_CHAT_AUTH],
         "failure_targets": [_CALLER_DISCORD_DM],
     }
-    mocks["verify_member"].assert_awaited_once()
+    mocks["verify_member"].assert_awaited()
     mocks["sync_chats"].assert_awaited_once()
     mocks["patch_prefs"].assert_awaited_once()
     patch_arg = mocks["patch_prefs"].await_args.args[1]
@@ -304,16 +347,15 @@ async def test_internal_rejects_unauthorized_group_with_exact_message(
     mocks = _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="internal")
     tool = create_report_delivery_tools()[0]
 
-    raw = await tool.ainvoke(
+    res = await _call_tool(
+        tool,
         {
             "action": "set",
             "automation_id": _AUTO_UUID,
             "report_targets": [_FEISHU_CHAT_UNAUTH],
-            "user_confirmed": True,
         },
         config=_cfg(_OWNER),
     )
-    res = json.loads(raw)
 
     assert res["ok"] is False
     assert res["message"] == rd_svc.UNAUTHORIZED_GROUP_MESSAGE
@@ -331,16 +373,15 @@ async def test_internal_rejects_non_member_of_authorized_group(
     )
     tool = create_report_delivery_tools()[0]
 
-    raw = await tool.ainvoke(
+    res = await _call_tool(
+        tool,
         {
             "action": "set",
             "automation_id": _AUTO_UUID,
             "report_targets": [_FEISHU_CHAT_AUTH],
-            "user_confirmed": True,
         },
         config=_cfg(_OWNER),
     )
-    res = json.loads(raw)
 
     assert res["ok"] is False
     assert res["error"] == "not_group_member"
@@ -353,34 +394,33 @@ async def test_internal_rejects_discord_channel_admin_allows(
     tmp_path: Path,
 ) -> None:
     mocks = _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="internal")
+    _patch_hitl_approve(monkeypatch)
     tool = create_report_delivery_tools()[0]
 
-    raw_internal = await tool.ainvoke(
+    res_internal = await _call_tool(
+        tool,
         {
             "action": "set",
             "automation_id": _AUTO_UUID,
             "report_targets": [],
             "text_targets": [_DISCORD_CHAN_AUTH],
-            "user_confirmed": True,
         },
         config=_cfg(_OWNER),
     )
-    res_internal = json.loads(raw_internal)
     assert res_internal["ok"] is False
     assert res_internal["error"] == "admin_only_channel"
 
     mocks["get_tier"].return_value = "admin"
-    raw_admin = await tool.ainvoke(
+    res_admin = await _call_tool(
+        tool,
         {
             "action": "set",
             "automation_id": _AUTO_UUID,
             "report_targets": [],
             "text_targets": [_DISCORD_CHAN_AUTH],
-            "user_confirmed": True,
         },
         config=_cfg(_OWNER),
     )
-    res_admin = json.loads(raw_admin)
     assert res_admin["ok"] is True
 
 
@@ -390,44 +430,46 @@ async def test_rejects_foreign_task_external_tier_and_unconfirmed_group(
     tmp_path: Path,
 ) -> None:
     mocks = _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="internal")
+    monkeypatch.setattr(
+        rd_tools,
+        "hitl_confirm",
+        create_autospec(rd_tools.hitl_confirm, return_value=(False, {"message": "暂不发群"})),
+    )
     tool = create_report_delivery_tools()[0]
 
     # Foreign task rejected for internal user
-    res_foreign = json.loads(
-        await tool.ainvoke(
-            {
-                "action": "set",
-                "automation_id": _AUTO_UUID,
-                "report_targets": [_CALLER_FEISHU_DM],
-            },
-            config=_cfg(_OTHER_USER),
-        )
+    res_foreign = await _call_tool(
+        tool,
+        {
+            "action": "set",
+            "automation_id": _AUTO_UUID,
+            "report_targets": [_CALLER_FEISHU_DM],
+        },
+        config=_cfg(_OTHER_USER),
     )
     assert res_foreign["ok"] is False
     assert res_foreign["error"] == "forbidden_or_not_found"
 
-    # Unconfirmed group rejected
-    res_unconfirmed = json.loads(
-        await tool.ainvoke(
-            {
-                "action": "set",
-                "automation_id": _AUTO_UUID,
-                "report_targets": [_FEISHU_CHAT_AUTH],
-                "user_confirmed": False,
-            },
-            config=_cfg(_OWNER),
-        )
+    # Declined group confirmation rejected even if model passes deprecated user_confirmed=True
+    res_unconfirmed = await _call_tool(
+        tool,
+        {
+            "action": "set",
+            "automation_id": _AUTO_UUID,
+            "report_targets": [_FEISHU_CHAT_AUTH],
+            "user_confirmed": True,
+        },
+        config=_cfg(_OWNER),
     )
     assert res_unconfirmed["ok"] is False
-    assert res_unconfirmed["error"] == "confirmation_required"
+    assert res_unconfirmed["error"] == "user_declined"
 
     # External member rejected at runtime even if invoked directly
     mocks["get_tier"].return_value = "external"
-    res_ext = json.loads(
-        await tool.ainvoke(
-            {"action": "get", "automation_id": _AUTO_UUID},
-            config=_cfg(_EXT_USER),
-        )
+    res_ext = await _call_tool(
+        tool,
+        {"action": "get", "automation_id": _AUTO_UUID},
+        config=_cfg(_EXT_USER),
     )
     assert res_ext["ok"] is False
     assert res_ext["error"] == "forbidden"
@@ -440,22 +482,23 @@ async def test_dm_targets_require_no_confirmation_and_skip_admin_notify(
     tmp_path: Path,
 ) -> None:
     mocks = _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="internal")
+    hitl_spy = create_autospec(rd_tools.hitl_confirm)
+    monkeypatch.setattr(rd_tools, "hitl_confirm", hitl_spy)
     tool = create_report_delivery_tools()[0]
 
-    res = json.loads(
-        await tool.ainvoke(
-            {
-                "action": "set",
-                "automation_id": _AUTO_UUID,
-                "report_targets": [_CALLER_FEISHU_DM],
-                "user_confirmed": False,
-            },
-            config=_cfg(_OWNER),
-        )
+    res = await _call_tool(
+        tool,
+        {
+            "action": "set",
+            "automation_id": _AUTO_UUID,
+            "report_targets": [_CALLER_FEISHU_DM],
+        },
+        config=_cfg(_OWNER),
     )
     assert res["ok"] is True
     assert res["report_profile"]["report_targets"] == [_CALLER_FEISHU_DM]
     assert not hasattr(rd_svc, "add_dalton_personal_notify_target")
+    hitl_spy.assert_not_called()
     mocks["sync_chats"].assert_not_awaited()
     mocks["notify_admins"].assert_not_awaited()
 
@@ -480,16 +523,18 @@ async def test_clear_archives_clears_profile_and_notifies_admin_when_groups_pres
     mocks = _patch_common_set_deps(
         monkeypatch, tmp_path=tmp_path, tier="internal", auto_row=existing_row
     )
+    hitl_spy = create_autospec(rd_tools.hitl_confirm)
+    monkeypatch.setattr(rd_tools, "hitl_confirm", hitl_spy)
     tool = create_report_delivery_tools()[0]
 
-    res = json.loads(
-        await tool.ainvoke(
-            {"action": "clear", "automation_id": _AUTO_UUID},
-            config=_cfg(_OWNER),
-        )
+    res = await _call_tool(
+        tool,
+        {"action": "clear", "automation_id": _AUTO_UUID},
+        config=_cfg(_OWNER),
     )
     assert res["ok"] is True
     assert res["cleared"] is True
+    hitl_spy.assert_not_called()
     assert mocks["update_auto"].await_args.kwargs["metadata"] == {"other_key": "keep_me"}
     patch_arg = mocks["patch_prefs"].await_args.args[1]
     assert patch_arg[rd_svc.DALTON_NOTIFY_OVERRIDES_KEY][f"automation:{_AUTO_UUID}"] is None
@@ -773,8 +818,8 @@ async def test_get_diagnostics_profile_inference_and_feishu_member_check(
     )
 
     tool = create_report_delivery_tools()[0]
-    got = json.loads(
-        await tool.ainvoke({"action": "get", "automation_id": _AUTO_UUID}, config=_cfg(_OWNER))
+    got = await _call_tool(
+        tool, {"action": "get", "automation_id": _AUTO_UUID}, config=_cfg(_OWNER)
     )
     assert got["ok"] is True
     assert got["automation"]["notify_state"]["master_switch_enabled"] is False
@@ -786,29 +831,27 @@ async def test_get_diagnostics_profile_inference_and_feishu_member_check(
     assert groups[_DISCORD_CHAN_AUTH]["membership_status"] == "admin_only_channel"
 
     # Ambiguous market-digest without explicit profile requires profile; mismatched profile rejected
-    res_req = json.loads(
-        await tool.ainvoke(
-            {
-                "action": "set",
-                "automation_id": _AUTO_UUID,
-                "report_targets": [_CALLER_FEISHU_DM],
-            },
-            config=_cfg(_OWNER),
-        )
+    res_req = await _call_tool(
+        tool,
+        {
+            "action": "set",
+            "automation_id": _AUTO_UUID,
+            "report_targets": [_CALLER_FEISHU_DM],
+        },
+        config=_cfg(_OWNER),
     )
     assert res_req["ok"] is False
     assert res_req["error"] == "profile_required"
 
-    res_mismatch = json.loads(
-        await tool.ainvoke(
-            {
-                "action": "set",
-                "automation_id": _AUTO_UUID,
-                "profile": "daily-filing-alert",
-                "report_targets": [_CALLER_FEISHU_DM],
-            },
-            config=_cfg(_OWNER),
-        )
+    res_mismatch = await _call_tool(
+        tool,
+        {
+            "action": "set",
+            "automation_id": _AUTO_UUID,
+            "profile": "daily-filing-alert",
+            "report_targets": [_CALLER_FEISHU_DM],
+        },
+        config=_cfg(_OWNER),
     )
     assert res_mismatch["ok"] is False
     assert res_mismatch["error"] == "profile_skill_mismatch"
@@ -987,7 +1030,8 @@ async def test_unified_validation_blocks_rest_groups_and_prefs_routes(
     assert ok_dm_resp.report_delivery_warning is None
     handler_update.assert_awaited_once()
 
-    # Admin REST PATCH with authorized group target succeeds, archives, and notifies admins
+    # Admin REST PATCH with authorized group target requires one-time credential for session
+    # and succeeds without card only for trusted internal service principal
     mocks["get_tier"].return_value = "admin"
     handler_update.reset_mock()
     updated_grp_row = {
@@ -1001,6 +1045,18 @@ async def test_unified_validation_blocks_rest_groups_and_prefs_routes(
         },
     }
     handler_update.return_value = updated_grp_row
+    principal.auth = "session"
+    with pytest.raises(HTTPException) as exc_admin_no_tok:
+        await automations_app.update_automation(
+            _AUTO_UUID,
+            principal,
+            http_req,
+            body={"metadata": updated_grp_row["metadata"]},
+        )
+    assert exc_admin_no_tok.value.status_code == 403
+    assert "确认" in str(exc_admin_no_tok.value.detail)
+
+    principal.auth = "service"
     admin_resp = await automations_app.update_automation(
         _AUTO_UUID,
         principal,
@@ -1076,7 +1132,7 @@ async def test_set_and_clear_atomicity_on_version_conflict(
             caller_user_id=_OWNER,
             automation_id=_AUTO_UUID,
             report_targets=[_FEISHU_CHAT_AUTH],
-            user_confirmed=True,
+            hitl_confirmed=True,
         )
     assert exc_set.value.code == "conflict"
     assert committed_state == {"prefs": None, "settings": None}
@@ -1591,7 +1647,7 @@ async def test_feishu_token_cache_timeout_distinction_and_admin_external_owner_g
                 "failure_targets": [],
             },
             via_rest=False,
-            user_confirmed=True,
+            confirmed=True,
         )
     assert exc_ext_owner.value.code == "owner_tier_forbidden"
 
@@ -1805,7 +1861,7 @@ async def test_r3_3_5_9_db_audit_history_honest_route_update_and_schedule_rollba
         auto_row,
         {"profile": "daily-filing-alert", "report_targets": [_FEISHU_CHAT_AUTH], "failure_targets": []},
         via_rest=False,
-        user_confirmed=True,
+        confirmed=True,
         action="route_update",
         previous_groups_override=[],
         skip_skill_match=True,
@@ -1846,7 +1902,7 @@ async def test_r3_3_5_9_db_audit_history_honest_route_update_and_schedule_rollba
         auto_row,
         {"profile": "daily-filing-alert", "report_targets": [_FEISHU_CHAT_AUTH], "failure_targets": []},
         via_rest=False,
-        user_confirmed=True,
+        confirmed=True,
         action="set",
     )
     with automation_history_context(
@@ -1899,7 +1955,7 @@ async def test_r3_3_5_9_db_audit_history_honest_route_update_and_schedule_rollba
                 "metadata": {
                     "report_profile": {
                         "profile": "daily-filing-alert",
-                        "report_targets": [_FEISHU_CHAT_AUTH],
+                        "report_targets": [_CALLER_FEISHU_DM],
                         "failure_targets": [],
                     }
                 },
@@ -2181,6 +2237,7 @@ async def test_r3_7_8_populate_notify_state_classified_report_task_rest_route_sy
 
     principal = MagicMock()
     principal.user_id = _OWNER
+    principal.auth = "service"
     http_req = Request({"type": "http", "headers": [], "app": MagicMock()})
     req_create = AutomationCreate(
         name="API Report Sync",
@@ -2197,9 +2254,10 @@ async def test_r3_7_8_populate_notify_state_classified_report_task_rest_route_sy
     assert sync_patch[rd_svc.DALTON_NOTIFY_ROUTES_KEY][f"automation:{_AUTO_UUID}"] == [_FEISHU_CHAT_AUTH]
     assert c_resp.route_warning is not None
 
-    # 3. Tool docstring updated for owner's DM default failure_targets
+    # 3. Tool docstring updated for owner's DM default failure_targets and drops user_confirmed=true guidance
     tool = create_report_delivery_tools()[0]
     assert "任务属主的私信" in (tool.description or "")
+    assert "user_confirmed=true" not in (tool.description or "")
 
 
 @pytest.mark.asyncio
@@ -2744,7 +2802,7 @@ async def test_r4_3_route_update_audit_snapshot_uses_real_tx_preferences(
         auto_row,
         {"profile": "daily-filing-alert", "report_targets": [_CALLER_FEISHU_DM], "failure_targets": []},
         via_rest=False,
-        user_confirmed=False,
+        confirmed=False,
         action="route_update",
         previous_groups_override=[],
         skip_skill_match=True,
@@ -4041,3 +4099,641 @@ def test_infer_report_profile_uses_explicit_supported_ticker_even_with_multiple_
     assert profile == "ant-tracker"
     assert "ant-tracker" in candidates
     assert "daily-filing-alert" in candidates
+
+
+# ============================================================================
+# AD5: Real user confirmation for report delivery configuration
+# ============================================================================
+
+
+@pytest.mark.asyncio
+async def test_ad5_hitl_approve_decline_and_ignores_model_user_confirmed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mocks = _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="internal", is_feishu_member=True)
+    tool = create_report_delivery_tools()[0]
+
+    # 1. Model passing user_confirmed=True is ignored — HITL card MUST be triggered; decline blocks DB write.
+    decline_spy = create_autospec(
+        rd_tools.hitl_confirm,
+        return_value=(False, {"type": "reject", "message": "不发到该群"}),
+    )
+    monkeypatch.setattr(rd_tools, "hitl_confirm", decline_spy)
+    res_decline = await _call_tool(
+        tool,
+        {
+            "action": "set",
+            "automation_id": _AUTO_UUID,
+            "report_targets": [_FEISHU_CHAT_AUTH],
+            "user_confirmed": True,
+        },
+        config=_cfg(_OWNER),
+    )
+    assert res_decline["ok"] is False
+    assert res_decline["error"] == "user_declined"
+    decline_spy.assert_called_once()
+    assert decline_spy.call_args.args[0] == "dalton_report_delivery_set"
+    mocks["update_auto"].assert_not_awaited()
+
+    # 2. Approving with matching confirm_token persists and returns ok=True.
+    hitl_calls = _patch_hitl_approve(monkeypatch)
+    res_ok = await _call_tool(
+        tool,
+        {
+            "action": "set",
+            "automation_id": _AUTO_UUID,
+            "report_targets": [_FEISHU_CHAT_AUTH],
+            "user_confirmed": False,
+        },
+        config=_cfg(_OWNER),
+    )
+    assert res_ok["ok"] is True
+    assert len(hitl_calls) == 1
+    assert hitl_calls[0][1]["confirm_token"]
+    mocks["update_auto"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ad5_confirm_token_mismatch_and_cross_target_type_tampering(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    mocks = _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="internal", is_feishu_member=True)
+    tool = create_report_delivery_tools()[0]
+
+    # Token digests distinguish report_targets / text_targets (None vs []) / failure_targets / config_version.
+    tok_report = rd_svc.compute_report_delivery_confirm_token(
+        caller_user_id=_OWNER,
+        action="set",
+        automation_id=_AUTO_UUID,
+        config_version=3,
+        profile="daily-filing-alert",
+        report_targets=[_FEISHU_CHAT_AUTH],
+        text_targets=None,
+        failure_targets=[_CALLER_DISCORD_DM],
+    )
+    tok_text_empty = rd_svc.compute_report_delivery_confirm_token(
+        caller_user_id=_OWNER,
+        action="set",
+        automation_id=_AUTO_UUID,
+        config_version=3,
+        profile="daily-filing-alert",
+        report_targets=[_FEISHU_CHAT_AUTH],
+        text_targets=[],
+        failure_targets=[_CALLER_DISCORD_DM],
+    )
+    tok_swapped_to_text = rd_svc.compute_report_delivery_confirm_token(
+        caller_user_id=_OWNER,
+        action="set",
+        automation_id=_AUTO_UUID,
+        config_version=3,
+        profile="daily-filing-alert",
+        report_targets=[],
+        text_targets=[_FEISHU_CHAT_AUTH],
+        failure_targets=[_CALLER_DISCORD_DM],
+    )
+    tok_swapped_to_failure = rd_svc.compute_report_delivery_confirm_token(
+        caller_user_id=_OWNER,
+        action="set",
+        automation_id=_AUTO_UUID,
+        config_version=3,
+        profile="daily-filing-alert",
+        report_targets=[],
+        text_targets=None,
+        failure_targets=[_FEISHU_CHAT_AUTH],
+    )
+    tok_next_ver = rd_svc.compute_report_delivery_confirm_token(
+        caller_user_id=_OWNER,
+        action="set",
+        automation_id=_AUTO_UUID,
+        config_version=4,
+        profile="daily-filing-alert",
+        report_targets=[_FEISHU_CHAT_AUTH],
+        text_targets=None,
+        failure_targets=[_CALLER_DISCORD_DM],
+    )
+    assert len({tok_report, tok_text_empty, tok_swapped_to_text, tok_swapped_to_failure, tok_next_ver}) == 5
+
+    # Tampered confirm_token on resume (e.g. from text_targets token) is rejected before DB write.
+    monkeypatch.setattr(
+        rd_tools,
+        "hitl_confirm",
+        create_autospec(
+            rd_tools.hitl_confirm,
+            return_value=(True, {"decisions": [{"type": "approve", "confirm_token": tok_swapped_to_text}]}),
+        ),
+    )
+    res_mismatch = await _call_tool(
+        tool,
+        {
+            "action": "set",
+            "automation_id": _AUTO_UUID,
+            "report_targets": [_FEISHU_CHAT_AUTH],
+            "failure_targets": [_CALLER_DISCORD_DM],
+        },
+        config=_cfg(_OWNER),
+    )
+    assert res_mismatch["ok"] is False
+    assert res_mismatch["error"] == "confirm_token_mismatch"
+    mocks["update_auto"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ad5_config_version_change_during_resume_rejects_and_requires_reconfirm(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    row = _make_automation_row(config_version=3)
+    mocks = _patch_common_set_deps(
+        monkeypatch, tmp_path=tmp_path, tier="internal", auto_row=row, is_feishu_member=True
+    )
+    tool = create_report_delivery_tools()[0]
+
+    def _approve_while_version_bumps(_action_type: str, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        # Automation was modified concurrently while waiting for user click.
+        row["config_version"] = 4
+        return True, {"decisions": [{"type": "approve", "confirm_token": payload["confirm_token"]}]}
+
+    monkeypatch.setattr(
+        rd_tools,
+        "hitl_confirm",
+        create_autospec(rd_tools.hitl_confirm, side_effect=_approve_while_version_bumps),
+    )
+
+    res = await _call_tool(
+        tool,
+        {
+            "action": "set",
+            "automation_id": _AUTO_UUID,
+            "report_targets": [_FEISHU_CHAT_AUTH],
+        },
+        config=_cfg(_OWNER),
+    )
+    assert res["ok"] is False
+    assert res["error"] == "confirm_token_mismatch"
+    mocks["update_auto"].assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ad5_graph_interrupt_not_swallowed_by_tool(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from langgraph.errors import GraphInterrupt
+
+    _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="internal", is_feishu_member=True)
+    monkeypatch.setattr(
+        rd_tools,
+        "hitl_confirm",
+        create_autospec(rd_tools.hitl_confirm, side_effect=GraphInterrupt(("paused",))),
+    )
+    tool = create_report_delivery_tools()[0]
+
+    with pytest.raises(GraphInterrupt):
+        await _call_tool(
+            tool,
+            {
+                "action": "set",
+                "automation_id": _AUTO_UUID,
+                "report_targets": [_FEISHU_CHAT_AUTH],
+            },
+            config=_cfg(_OWNER),
+        )
+
+
+@pytest.mark.asyncio
+async def test_ad5_non_caller_dm_requires_confirmation_on_tool_and_rest(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from fastapi import HTTPException
+
+    colleague_dm = "feishu:user:ou_colleague_other_9"
+    row = _make_automation_row(user_id=_OTHER_USER)
+    mocks = _patch_common_set_deps(
+        monkeypatch, tmp_path=tmp_path, tier="admin", auto_row=row, is_feishu_member=True
+    )
+
+    async def _tier_for(uid: str) -> str:
+        return "admin" if uid == _ADMIN else "internal"
+
+    async def _dm_for(uid: str, *, conn: Any = None) -> list[dict[str, Any]]:
+        if uid == _OTHER_USER:
+            return [
+                {
+                    "platform": "feishu",
+                    "platform_user_id": "ou_colleague_other_9",
+                    "target": colleague_dm,
+                    "supports_report_cards": True,
+                    "supports_text_targets": True,
+                    "supports_failure_targets": False,
+                }
+            ]
+        return _caller_identities()
+
+    async def _get_auto_any(aid: str, uid: str, *, conn: Any = None) -> dict[str, Any] | None:
+        if aid == _AUTO_UUID:
+            return dict(row)
+        return None
+
+    mocks["get_tier"].side_effect = _tier_for
+    mocks["get_auto"].side_effect = _get_auto_any
+    rd_svc.list_caller_dm_identities.side_effect = _dm_for
+
+    # Admin (_ADMIN) setting colleague (_OTHER_USER)'s bound DM -> valid target, non-caller DM -> requires HITL!
+    hitl_calls = _patch_hitl_approve(monkeypatch)
+    tool = create_report_delivery_tools()[0]
+
+    res = await _call_tool(
+        tool,
+        {
+            "action": "set",
+            "automation_id": _AUTO_UUID,
+            "report_targets": [colleague_dm],
+            "failure_targets": [],
+        },
+        config=_cfg(_ADMIN),
+    )
+    assert res["ok"] is True
+    assert len(hitl_calls) == 1
+    assert hitl_calls[0][0] == "dalton_report_delivery_set"
+    assert colleague_dm in hitl_calls[0][1]["non_caller_dm_targets"]
+
+    # Same non-caller DM on REST PATCH without one-time credential is rejected 403.
+    monkeypatch.setattr(
+        automations_app.cli_approval,
+        "automation_runs",
+        create_autospec(automations_app.cli_approval.automation_runs, return_value=None),
+    )
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    api_row = {
+        **row,
+        "automation_id": UUID(_AUTO_UUID),
+        "workspace_id": UUID(_WS_UUID),
+        "description": None,
+        "trigger_type": "cron",
+        "cron_expression": "0 8 * * *",
+        "timezone": "UTC",
+        "trigger_config": None,
+        "next_run_at": None,
+        "last_run_at": None,
+        "llm_model": None,
+        "additional_context": None,
+        "thread_strategy": "new",
+        "conversation_thread_id": None,
+        "status": "active",
+        "max_failures": 3,
+        "failure_count": 0,
+        "disable_reason": None,
+        "delivery_config": None,
+        "created_at": now,
+        "updated_at": now,
+        "last_execution": None,
+        "scope": "personal",
+    }
+    mocks["get_auto"].side_effect = None
+    mocks["get_auto"].return_value = {**api_row, "metadata": {}}
+    principal = MagicMock()
+    principal.user_id = _ADMIN
+    principal.auth = "session"
+    http_req = Request({"type": "http", "headers": [], "app": MagicMock()})
+    with pytest.raises(HTTPException) as exc_non_caller:
+        await automations_app.update_automation(
+            _AUTO_UUID,
+            principal,
+            http_req,
+            body={
+                "metadata": {
+                    "report_profile": {
+                        "profile": "daily-filing-alert",
+                        "report_targets": [colleague_dm],
+                        "failure_targets": [],
+                    }
+                }
+            },
+        )
+    assert exc_non_caller.value.status_code == 403
+    assert "确认" in str(exc_non_caller.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_ad5_rest_post_and_patch_require_one_time_credential_and_block_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from datetime import datetime, timezone
+    from fastapi import HTTPException
+    from src.dalton.notify import dispatch as dispatch_mod
+
+    mocks = _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="admin", is_feishu_member=True)
+    now = datetime.now(timezone.utc)
+    grp_profile = {
+        "profile": "daily-filing-alert",
+        "report_targets": [_FEISHU_CHAT_AUTH],
+        "failure_targets": [],
+    }
+    api_row = {
+        "automation_id": UUID(_AUTO_UUID),
+        "user_id": _OWNER,
+        "name": "API Report Sync",
+        "description": None,
+        "trigger_type": "cron",
+        "cron_expression": "0 8 * * *",
+        "timezone": "UTC",
+        "trigger_config": None,
+        "next_run_at": None,
+        "last_run_at": None,
+        "instruction": _DAILY_FILING_INST,
+        "workspace_id": UUID(_WS_UUID),
+        "llm_model": None,
+        "additional_context": None,
+        "thread_strategy": "new",
+        "conversation_thread_id": None,
+        "status": "active",
+        "max_failures": 3,
+        "failure_count": 0,
+        "disable_reason": None,
+        "delivery_config": None,
+        "metadata": {"report_profile": grp_profile},
+        "config_version": 3,
+        "created_at": now,
+        "updated_at": now,
+        "last_execution": None,
+        "scope": "personal",
+    }
+    mocks["get_auto"].side_effect = None
+    mocks["get_auto"].return_value = {**api_row, "metadata": {}}
+    monkeypatch.setattr(
+        automations_app.cli_approval,
+        "automation_runs",
+        create_autospec(automations_app.cli_approval.automation_runs, return_value=None),
+    )
+    handler_create = create_autospec(automations_app.handler.create_automation, return_value=dict(api_row))
+    handler_update = create_autospec(automations_app.handler.update_automation, return_value=dict(api_row))
+    monkeypatch.setattr(automations_app.handler, "create_automation", handler_create)
+    monkeypatch.setattr(automations_app.handler, "update_automation", handler_update)
+    monkeypatch.setattr(
+        dispatch_mod,
+        "populate_automation_notify_state",
+        create_autospec(dispatch_mod.populate_automation_notify_state, return_value=None),
+    )
+
+    # In-memory store backing dalton_report_delivery_confirmations SQL in _FakeConn
+    store: dict[str, dict[str, Any]] = {}
+
+    class _ConfCur:
+        def __init__(self) -> None:
+            self._one: dict[str, Any] | None = None
+
+        async def __aenter__(self) -> "_ConfCur":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            self._one = None
+            if "INSERT INTO dalton_report_delivery_confirmations" in sql:
+                (cid, thash, actor, action, aid, cver, payload_digest, expires_at) = params
+                store[thash] = {
+                    "confirmation_id": cid,
+                    "token_hash": thash,
+                    "actor_user_id": actor,
+                    "action": action,
+                    "automation_id": aid,
+                    "payload_digest": payload_digest,
+                    "config_version": cver,
+                    "expires_at": expires_at,
+                    "consumed_at": None,
+                }
+            elif "UPDATE dalton_report_delivery_confirmations" in sql:
+                (thash, actor, action, aid, cver, payload_digest) = params
+                rec = store.get(thash)
+                if (
+                    rec is not None
+                    and rec["consumed_at"] is None
+                    and rec["actor_user_id"] == actor
+                    and rec["action"] == action
+                    and rec["payload_digest"] == payload_digest
+                    and (rec["automation_id"] or "") == (aid or "")
+                    and rec["config_version"] == cver
+                ):
+                    rec["consumed_at"] = now
+                    self._one = {"confirmation_id": rec["confirmation_id"]}
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            return self._one
+
+    class _ConfTx:
+        async def __aenter__(self) -> "_ConfTx":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+    class _ConfConn:
+        def transaction(self) -> _ConfTx:
+            return _ConfTx()
+
+        def cursor(self, **kwargs: Any) -> _ConfCur:
+            return _ConfCur()
+
+    @asynccontextmanager
+    async def _conf_conn(conn: Any = None):
+        yield conn or _ConfConn()
+
+    monkeypatch.setattr(rd_svc, "get_db_connection", _conf_conn)
+
+    http_req = Request({"type": "http", "headers": [], "app": MagicMock()})
+
+    # 1. POST & PATCH rejected when missing one-time credential (session direct script call + computer/oauth/pat tokens).
+    for auth_kind in ("session", "computer", "oauth", "pat"):
+        principal = MagicMock()
+        principal.user_id = _OWNER
+        principal.auth = auth_kind
+
+        req_create = AutomationCreate(
+            name="API Report Sync",
+            trigger_type="cron",
+            cron_expression="0 8 * * *",
+            instruction=_DAILY_FILING_INST,
+            workspace_id=UUID(_WS_UUID),
+            metadata={"report_profile": grp_profile},
+        )
+        with pytest.raises(HTTPException) as exc_post:
+            await automations_app.create_automation(req_create, principal, http_req)
+        assert exc_post.value.status_code == 403
+        assert "确认" in str(exc_post.value.detail)
+
+        with pytest.raises(HTTPException) as exc_patch:
+            await automations_app.update_automation(
+                _AUTO_UUID,
+                principal,
+                http_req,
+                body={"metadata": {"report_profile": grp_profile}},
+            )
+        assert exc_patch.value.status_code == 403
+        assert "确认" in str(exc_patch.value.detail)
+
+    handler_create.assert_not_awaited()
+    handler_update.assert_not_awaited()
+
+    # 2. Issue one-time confirmation credential for POST; session succeeds ONCE and replay is rejected.
+    issued_post = await rd_svc.issue_report_delivery_confirmation(
+        actor_user_id=_OWNER,
+        action="create",
+        automation_id=None,
+        config_version=None,
+        profile="daily-filing-alert",
+        report_targets=[_FEISHU_CHAT_AUTH],
+        text_targets=None,
+        failure_targets=[],
+    )
+    post_token = issued_post["confirmation_token"]
+    assert post_token
+
+    # Non-interactive computer token cannot redeem even a valid credential!
+    comp_principal = MagicMock()
+    comp_principal.user_id = _OWNER
+    comp_principal.auth = "computer"
+    with pytest.raises(HTTPException) as exc_comp_tok:
+        await automations_app.create_automation(
+            AutomationCreate(
+                name="API Report Sync",
+                trigger_type="cron",
+                cron_expression="0 8 * * *",
+                instruction=_DAILY_FILING_INST,
+                workspace_id=UUID(_WS_UUID),
+                metadata={"report_profile": grp_profile},
+                report_delivery_confirmation_token=post_token,
+            ),
+            comp_principal,
+            http_req,
+        )
+    assert exc_comp_tok.value.status_code == 403
+
+    # Session with valid token succeeds once...
+    sess_principal = MagicMock()
+    sess_principal.user_id = _OWNER
+    sess_principal.auth = "session"
+    resp_ok = await automations_app.create_automation(
+        AutomationCreate(
+            name="API Report Sync",
+            trigger_type="cron",
+            cron_expression="0 8 * * *",
+            instruction=_DAILY_FILING_INST,
+            workspace_id=UUID(_WS_UUID),
+            metadata={"report_profile": grp_profile},
+            report_delivery_confirmation_token=post_token,
+        ),
+        sess_principal,
+        http_req,
+    )
+    assert str(resp_ok.automation_id) == _AUTO_UUID
+    handler_create.assert_awaited_once()
+
+    # ...and replaying the same one-time token is rejected!
+    with pytest.raises(HTTPException) as exc_replay:
+        await automations_app.create_automation(
+            AutomationCreate(
+                name="API Report Sync",
+                trigger_type="cron",
+                cron_expression="0 8 * * *",
+                instruction=_DAILY_FILING_INST,
+                workspace_id=UUID(_WS_UUID),
+                metadata={"report_profile": grp_profile},
+                report_delivery_confirmation_token=post_token,
+            ),
+            sess_principal,
+            http_req,
+        )
+    assert exc_replay.value.status_code == 403
+    assert "凭据" in str(exc_replay.value.detail)
+
+    # 3. Issue one-time credential for PATCH; tampered target fails, matching target succeeds once.
+    issued_patch = await rd_svc.issue_report_delivery_confirmation(
+        actor_user_id=_OWNER,
+        action="update",
+        automation_id=_AUTO_UUID,
+        config_version=3,
+        profile="daily-filing-alert",
+        report_targets=[_FEISHU_CHAT_AUTH],
+        text_targets=None,
+        failure_targets=[],
+    )
+    patch_token = issued_patch["confirmation_token"]
+    assert patch_token
+
+    # Tampered target (different channel) fails consumption without consuming the valid token!
+    with pytest.raises(HTTPException) as exc_tamper:
+        await automations_app.update_automation(
+            _AUTO_UUID,
+            sess_principal,
+            http_req,
+            body={
+                "metadata": {
+                    "report_profile": {
+                        "profile": "daily-filing-alert",
+                        "report_targets": [],
+                        "text_targets": [_DISCORD_CHAN_AUTH],
+                        "failure_targets": [],
+                    }
+                },
+                "report_delivery_confirmation_token": patch_token,
+            },
+        )
+    assert exc_tamper.value.status_code == 403
+    assert "凭据" in str(exc_tamper.value.detail)
+
+    # Original matching target succeeds once!
+    patch_ok = await automations_app.update_automation(
+        _AUTO_UUID,
+        sess_principal,
+        http_req,
+        body={
+            "metadata": {"report_profile": grp_profile},
+            "report_delivery_confirmation_token": patch_token,
+        },
+    )
+    assert str(patch_ok.automation_id) == _AUTO_UUID
+    handler_update.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ad5_unattended_automation_turn_refuses_without_hanging_and_migration_d057(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="internal", is_feishu_member=True)
+    hitl_spy = create_autospec(rd_tools.hitl_confirm)
+    monkeypatch.setattr(rd_tools, "hitl_confirm", hitl_spy)
+    tool = create_report_delivery_tools()[0]
+
+    for extra_cfg in (
+        {"automation_execution_id": _EXEC_UUID},
+        {"platform": "automation"},
+        {"surface": {"platform": "automation"}},
+    ):
+        cfg = {"configurable": {"user_id": _OWNER, "thread_id": "t-auto", **extra_cfg}}
+        res = await _call_tool(
+            tool,
+            {
+                "action": "set",
+                "automation_id": _AUTO_UUID,
+                "report_targets": [_FEISHU_CHAT_AUTH],
+            },
+            config=cfg,
+        )
+        assert res["ok"] is False
+        assert res["error"] == "automation_turn_confirmation_forbidden"
+    hitl_spy.assert_not_called()
+
+    # Migration d057 chains directly off d055 and defines dalton_report_delivery_confirmations.
+    import importlib
+
+    mig = importlib.import_module("src.dalton.migrations.versions.d057_report_delivery_confirmations")
+    assert mig.revision == "d057"
+    assert mig.down_revision == "d055"

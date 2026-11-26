@@ -3382,7 +3382,7 @@ async def test_find_existing_company_workspace_keeps_downgraded_hit_when_rejudge
         raise TimeoutError("rejudge timed out")
 
     monkeypatch.setattr(dedup_mod, "dalton_complete", _llm_hit_then_fail)
-    dup = await find_existing_company_workspace(USER_ID, "700.HK", channel="cos")
+    dup = await find_existing_company_workspace(USER_ID, "腾讯控股", channel="cos")
     assert dup is not None
     assert call_count["n"] == 2
     assert ws_live in dup.matched_workspace_ids

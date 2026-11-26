@@ -8,12 +8,13 @@ import hashlib
 import json
 import logging
 import re
+import secrets
 import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 from psycopg.rows import dict_row
@@ -76,6 +77,16 @@ REPORT_PROFILE_MISSING_NOTICE_KEY = "report_profile_missing_notice"
 MISSING_NOTICE_MAX_ATTEMPTS = 3
 MISSING_NOTICE_STALE_PENDING_S = 300
 ADMIN_NOTIFY_COALESCE_WINDOW_S = 600
+REPORT_DELIVERY_CONFIRMATION_TTL_S = 300
+CONFIRMATION_REQUIRED_MESSAGE = (
+    "配置群/频道目标或非本人私信目标必须先经用户真实确认，请通过确认卡片确认后再提交。"
+)
+REST_NON_INTERACTIVE_CONFIRM_REFUSED_MESSAGE = (
+    "非交互令牌（computer / oauth / pat）不可直接配置群/频道目标或非本人私信目标，请在网页端确认或在对话中由本人确认。"
+)
+CONFIRMATION_INVALID_MESSAGE = (
+    "一次性确认凭据无效、已过期、已使用或与当前提交目标不一致，请重新确认后再提交。"
+)
 
 _FEISHU_TENANT_TOKEN_URL = (
     "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
@@ -1989,13 +2000,224 @@ async def record_route_warning_error_in_audit(
     )
 
 
-async def validate_report_profile_change(
+@dataclass(frozen=True)
+class ReportProfilePrecheckResult:
+    """Read-only precheck result for ``report_profile`` changes."""
+
+    actor_user_id: str
+    caller_tier: str
+    owner_user_id: str
+    automation_id: str
+    automation_name: str
+    action: str
+    config_version: int | None
+    profile: str | None
+    report_targets: list[str]
+    text_targets: list[str] | None
+    failure_targets: list[str]
+    stored_profile: dict[str, Any] | None
+    group_targets: list[str]
+    non_caller_dm_targets: list[str]
+    needs_confirmation: bool
+    target_labels: dict[str, str]
+    change: ValidatedReportProfileChange
+
+
+def _coerce_config_version(raw: Any) -> int | None:
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    return None
+
+
+def compute_report_delivery_confirm_token(
+    *,
+    action: str,
+    caller_user_id: str,
+    automation_id: str | None,
+    config_version: int | None,
+    profile: str,
+    report_targets: Sequence[str],
+    text_targets: Sequence[str] | None,
+    failure_targets: Sequence[str],
+) -> str:
+    """Compute SHA-256 confirm_token / payload digest binding all three target lists and config_version."""
+    canonical_payload = {
+        "action": str(action or "").strip(),
+        "caller_user_id": str(caller_user_id or "").strip(),
+        "automation_id": str(automation_id or "").strip(),
+        "config_version": _coerce_config_version(config_version),
+        "profile": str(profile or "").strip(),
+        "report_targets": sorted(str(t).strip() for t in report_targets if str(t).strip()),
+        "text_targets": (
+            sorted(str(t).strip() for t in text_targets if str(t).strip())
+            if text_targets is not None
+            else None
+        ),
+        "failure_targets": sorted(str(t).strip() for t in failure_targets if str(t).strip()),
+    }
+    encoded = json.dumps(
+        canonical_payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _hash_confirmation_token(token: str) -> str:
+    return hashlib.sha256(str(token or "").strip().encode("utf-8")).hexdigest()
+
+
+async def issue_report_delivery_confirmation(
+    *,
+    actor_user_id: str,
+    action: str,
+    automation_id: str | None,
+    config_version: int | None,
+    profile: str,
+    report_targets: Sequence[str],
+    text_targets: Sequence[str] | None,
+    failure_targets: Sequence[str],
+    ttl_seconds: int = REPORT_DELIVERY_CONFIRMATION_TTL_S,
+    conn: Any = None,
+) -> dict[str, Any]:
+    """Mint and persist a short-lived single-use REST confirmation credential."""
+    cleaned_action = str(action or "").strip().lower()
+    if cleaned_action not in ("create", "update"):
+        raise ReportDeliveryError(f"不支持的确认动作: {action!r}", code="invalid_request")
+    cleaned_actor = str(actor_user_id or "").strip()
+    if not cleaned_actor:
+        raise ReportDeliveryError("缺少操作人身份，无法签发确认凭据。", code="forbidden")
+    cleaned_aid = str(automation_id or "").strip() or None
+    if cleaned_action == "update" and not cleaned_aid:
+        raise ReportDeliveryError("更新任务确认必须提供 automation_id。", code="invalid_request")
+    cv = _coerce_config_version(config_version)
+    payload_digest = compute_report_delivery_confirm_token(
+        action=cleaned_action,
+        caller_user_id=cleaned_actor,
+        automation_id=cleaned_aid or "",
+        config_version=cv,
+        profile=profile,
+        report_targets=report_targets,
+        text_targets=text_targets,
+        failure_targets=failure_targets,
+    )
+    raw_token = f"rdc_{secrets.token_urlsafe(32)}"
+    token_hash = _hash_confirmation_token(raw_token)
+    confirmation_id = str(uuid4())
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=max(30, int(ttl_seconds)))
+
+    async with _use_conn(conn) as db_conn:
+        if not _conn_has_cursor(db_conn):
+            raise ReportDeliveryError("数据库不可用，无法签发确认凭据。", code="internal_error")
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                INSERT INTO dalton_report_delivery_confirmations (
+                    confirmation_id,
+                    token_hash,
+                    actor_user_id,
+                    action,
+                    automation_id,
+                    expected_config_version,
+                    payload_digest,
+                    expires_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    confirmation_id,
+                    token_hash,
+                    cleaned_actor,
+                    cleaned_action,
+                    cleaned_aid,
+                    cv,
+                    payload_digest,
+                    expires_at,
+                ),
+            )
+
+    return {
+        "confirmation_id": confirmation_id,
+        "confirmation_token": raw_token,
+        "expires_at": expires_at.isoformat(),
+        "payload_digest": payload_digest,
+    }
+
+
+async def consume_report_delivery_confirmation(
+    *,
+    token: str,
+    actor_user_id: str,
+    action: str,
+    automation_id: str | None,
+    config_version: int | None,
+    profile: str,
+    report_targets: Sequence[str],
+    text_targets: Sequence[str] | None,
+    failure_targets: Sequence[str],
+    conn: Any = None,
+) -> str:
+    """Verify and atomically consume a single-use REST confirmation credential."""
+    cleaned_token = str(token or "").strip()
+    if not cleaned_token:
+        raise ReportDeliveryError(CONFIRMATION_REQUIRED_MESSAGE, code="confirmation_required")
+    cleaned_action = str(action or "").strip().lower()
+    cleaned_actor = str(actor_user_id or "").strip()
+    cleaned_aid = str(automation_id or "").strip() or None
+    cv = _coerce_config_version(config_version)
+    expected_digest = compute_report_delivery_confirm_token(
+        action=cleaned_action,
+        caller_user_id=cleaned_actor,
+        automation_id=cleaned_aid or "",
+        config_version=cv,
+        profile=profile,
+        report_targets=report_targets,
+        text_targets=text_targets,
+        failure_targets=failure_targets,
+    )
+    token_hash = _hash_confirmation_token(cleaned_token)
+
+    async with _use_conn(conn) as db_conn:
+        if not _conn_has_cursor(db_conn):
+            raise ReportDeliveryError(CONFIRMATION_INVALID_MESSAGE, code="confirmation_invalid")
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_report_delivery_confirmations
+                SET consumed_at = NOW()
+                WHERE token_hash = %s
+                  AND actor_user_id = %s
+                  AND action = %s
+                  AND COALESCE(automation_id, '') = COALESCE(%s, '')
+                  AND expected_config_version IS NOT DISTINCT FROM %s
+                  AND payload_digest = %s
+                  AND consumed_at IS NULL
+                  AND expires_at > NOW()
+                RETURNING confirmation_id
+                """,
+                (
+                    token_hash,
+                    cleaned_actor,
+                    cleaned_action,
+                    cleaned_aid,
+                    cv,
+                    expected_digest,
+                ),
+            )
+            row = await cur.fetchone()
+    if not row or not row.get("confirmation_id"):
+        raise ReportDeliveryError(CONFIRMATION_INVALID_MESSAGE, code="confirmation_invalid")
+    return str(row["confirmation_id"])
+
+
+async def precheck_report_profile_change(
     actor: str,
     automation: Mapping[str, Any] | None,
     new_profile: Any,
     *,
     via_rest: bool = False,
-    user_confirmed: bool = False,
     action: str | None = None,
     after_metadata: Mapping[str, Any] | None = None,
     previous_groups_override: Sequence[str] | None = None,
@@ -2006,14 +2228,14 @@ async def validate_report_profile_change(
     list_dm_identities_fn: Callable[..., Awaitable[list[dict[str, Any]]]] | None = None,
     list_group_bindings_fn: Callable[..., Awaitable[list[dict[str, Any]]]] | None = None,
     get_feishu_open_id_fn: Callable[..., Awaitable[str]] | None = None,
-) -> ValidatedReportProfileChange:
-    """Single shared enforcement point for all ``report_profile`` / ``automation:<id>`` route writes.
+) -> ReportProfilePrecheckResult:
+    """Read-only validation and confirmation-requirement precheck for ``report_profile`` changes.
 
-    Checks caller tier, ownership, owner tier for group targets, profile schema & skill
-    compatibility, DM binding ownership, REST group restrictions, authorized group
-    bindings, dialogue confirmation, workspace write access, and Feishu membership.
-    Returns a ``ValidatedReportProfileChange`` carrying the DB audit payload and
-    post-commit admin notification plan.
+    Validates caller tier, ownership, owner tier for group targets, profile schema & skill
+    compatibility, DM binding ownership, REST non-admin group restriction, authorized group
+    bindings, workspace write access, and Feishu membership without mutating state.
+    Sets ``needs_confirmation=True`` when any target is a group/channel (``kind != "dm"``)
+    or a DM not belonging to ``actor`` (``kind == "dm" and canonical not in caller_dm_set``).
     """
     eff_get_tier = get_tier_fn or get_user_tier
     caller_tier = await _require_internal_or_admin(actor, get_tier_fn=eff_get_tier)
@@ -2022,6 +2244,7 @@ async def validate_report_profile_change(
     owner_user_id = str(auto_map.get("user_id") or actor).strip()
     aid_str = str(auto_map.get("automation_id") or "pending").strip() or "pending"
     auto_name = str(auto_map.get("name") or "").strip() or aid_str
+    config_version = _coerce_config_version(auto_map.get("config_version"))
 
     if owner_user_id != actor and caller_tier != "admin":
         raise ReportDeliveryError(
@@ -2046,7 +2269,7 @@ async def validate_report_profile_change(
         next_meta.pop("report_profile", None)
         next_meta.pop(REPORT_PROFILE_MISSING_NOTIFIED_KEY, None)
         next_meta.pop(REPORT_PROFILE_MISSING_NOTICE_KEY, None)
-        return ValidatedReportProfileChange(
+        change = ValidatedReportProfileChange(
             actor_user_id=actor,
             caller_tier=caller_tier,
             owner_user_id=owner_user_id,
@@ -2058,6 +2281,25 @@ async def validate_report_profile_change(
             profile=None,
             previous_groups=previous_groups,
             new_groups=[],
+        )
+        return ReportProfilePrecheckResult(
+            actor_user_id=actor,
+            caller_tier=caller_tier,
+            owner_user_id=owner_user_id,
+            automation_id=aid_str,
+            automation_name=auto_name,
+            action=eff_action,
+            config_version=config_version,
+            profile=None,
+            report_targets=[],
+            text_targets=None,
+            failure_targets=[],
+            stored_profile=None,
+            group_targets=[],
+            non_caller_dm_targets=[],
+            needs_confirmation=False,
+            target_labels={},
+            change=change,
         )
 
     if not isinstance(new_profile, Mapping):
@@ -2103,6 +2345,9 @@ async def validate_report_profile_change(
     all_raw_targets = norm_report + (norm_text or []) + norm_failure
 
     checked_targets: set[str] = set()
+    group_targets: list[str] = []
+    non_caller_dm_targets: list[str] = []
+    target_labels: dict[str, str] = {}
     caller_open_id: str | None = None
     owner_tier_checked: str | None = None
     eff_verify = verify_member_fn or verify_feishu_chat_member
@@ -2125,6 +2370,11 @@ async def validate_report_profile_change(
                     f"私信目标 {canonical} 未绑定在调用者或任务属主的账号下。",
                     code="dm_not_bound",
                 )
+            if canonical not in caller_dm_set:
+                non_caller_dm_targets.append(canonical)
+                target_labels[canonical] = f"{canonical}（非本人私信）"
+            else:
+                target_labels[canonical] = f"{canonical}（本人私信）"
             continue
 
         # Group / channel target checks:
@@ -2146,12 +2396,6 @@ async def validate_report_profile_change(
         binding = bindings_by_target.get(canonical)
         if not binding:
             raise ReportDeliveryError(UNAUTHORIZED_GROUP_MESSAGE, code="unauthorized_group")
-
-        if not via_rest and not user_confirmed:
-            raise ReportDeliveryError(
-                f"设置群发送目标 ({canonical}) 必须先在当前对话向用户确认，并以 user_confirmed=true 重新调用。",
-                code="confirmation_required",
-            )
 
         if binding.get("workspace_id"):
             async with _use_conn(conn) as db_conn:
@@ -2185,6 +2429,14 @@ async def validate_report_profile_change(
                     code="not_group_member",
                 )
 
+        group_targets.append(canonical)
+        chat_name = str(binding.get("chat_name") or "").strip()
+        kind_label = "群" if plat == "feishu" else "频道"
+        target_labels[canonical] = (
+            f"{chat_name}（{kind_label}，{canonical}）"
+            if chat_name and chat_name != canonical
+            else f"{canonical}（{kind_label}）"
+        )
         authorized_group_bindings.append(binding)
 
     stored_profile: dict[str, Any] = {
@@ -2212,13 +2464,14 @@ async def validate_report_profile_change(
         if t not in route_targets:
             route_targets.append(t)
 
-    return ValidatedReportProfileChange(
+    eff_action = action or "set"
+    change = ValidatedReportProfileChange(
         actor_user_id=actor,
         caller_tier=caller_tier,
         owner_user_id=owner_user_id,
         automation_id=aid_str,
         automation_name=auto_name,
-        action=action or "set",
+        action=eff_action,
         before_metadata=old_meta,
         after_metadata=next_meta,
         profile=stored_profile,
@@ -2228,6 +2481,78 @@ async def validate_report_profile_change(
         route_targets=route_targets,
         metadata_unchanged=is_route_only,
     )
+    needs_confirmation = bool(group_targets or non_caller_dm_targets)
+    return ReportProfilePrecheckResult(
+        actor_user_id=actor,
+        caller_tier=caller_tier,
+        owner_user_id=owner_user_id,
+        automation_id=aid_str,
+        automation_name=auto_name,
+        action=eff_action,
+        config_version=config_version,
+        profile=str(parsed_ok["profile"]),
+        report_targets=norm_report,
+        text_targets=norm_text,
+        failure_targets=norm_failure,
+        stored_profile=stored_profile,
+        group_targets=group_targets,
+        non_caller_dm_targets=non_caller_dm_targets,
+        needs_confirmation=needs_confirmation,
+        target_labels=target_labels,
+        change=change,
+    )
+
+
+async def validate_report_profile_change(
+    actor: str,
+    automation: Mapping[str, Any] | None,
+    new_profile: Any,
+    *,
+    via_rest: bool = False,
+    confirmed: bool = False,
+    action: str | None = None,
+    after_metadata: Mapping[str, Any] | None = None,
+    previous_groups_override: Sequence[str] | None = None,
+    skip_skill_match: bool = False,
+    conn: Any = None,
+    verify_member_fn: Callable[[str, str], Awaitable[tuple[bool, str | None]]] | None = None,
+    get_tier_fn: Callable[[str], Awaitable[str]] | None = None,
+    list_dm_identities_fn: Callable[..., Awaitable[list[dict[str, Any]]]] | None = None,
+    list_group_bindings_fn: Callable[..., Awaitable[list[dict[str, Any]]]] | None = None,
+    get_feishu_open_id_fn: Callable[..., Awaitable[str]] | None = None,
+) -> ValidatedReportProfileChange:
+    """Single shared enforcement point for all ``report_profile`` / ``automation:<id>`` route writes.
+
+    Delegates all read-only validation to :func:`precheck_report_profile_change`.
+    Explicitly exempts ``action == "clear"`` (``new_profile is None``); otherwise
+    requires ``confirmed=True`` (set only after real HITL confirm_token verification,
+    verified REST one-time credential, or trusted internal ``service`` migration)
+    whenever any target is a group/channel or a non-caller DM.
+    """
+    precheck = await precheck_report_profile_change(
+        actor,
+        automation,
+        new_profile,
+        via_rest=via_rest,
+        action=action,
+        after_metadata=after_metadata,
+        previous_groups_override=previous_groups_override,
+        skip_skill_match=skip_skill_match,
+        conn=conn,
+        verify_member_fn=verify_member_fn,
+        get_tier_fn=get_tier_fn,
+        list_dm_identities_fn=list_dm_identities_fn,
+        list_group_bindings_fn=list_group_bindings_fn,
+        get_feishu_open_id_fn=get_feishu_open_id_fn,
+    )
+    if precheck.action == "clear" or precheck.stored_profile is None:
+        return precheck.change
+    if precheck.needs_confirmation and not confirmed:
+        raise ReportDeliveryError(
+            CONFIRMATION_REQUIRED_MESSAGE,
+            code="confirmation_required",
+        )
+    return precheck.change
 
 
 async def _binding_accessible_for_caller(
@@ -2797,6 +3122,87 @@ async def evaluate_route_warning_best_effort(
         return f"已写入 report_profile，但路由状态检查失败（{type(exc).__name__}），请稍后核对通知资格。"
 
 
+@dataclass(frozen=True)
+class RestReportProfileWritePlan:
+    """Authorized REST mutation plan produced by :func:`prepare_rest_report_profile_write`."""
+
+    change: ValidatedReportProfileChange
+    confirmation_token: str | None = None
+    confirmation_action: str | None = None
+    confirmation_automation_id: str | None = None
+    confirmation_config_version: int | None = None
+    required_expected_config_version: int | None = None
+
+
+async def prepare_rest_report_profile_write(
+    *,
+    principal: Any,
+    http_request: Any,
+    automation: Mapping[str, Any],
+    new_profile: Any,
+    action: str,
+    after_metadata: Mapping[str, Any] | None = None,
+    body_confirmation_token: str | None = None,
+    expected_config_version: int | None = None,
+    conn: Any = None,
+) -> RestReportProfileWritePlan:
+    """Validate and enforce AD5 REST confirmation rules for ``POST`` / ``PATCH /api/v1/automations``."""
+    actor_user_id = str(getattr(principal, "user_id", "") or "").strip()
+    auth_kind = str(getattr(principal, "auth", "") or "").strip().lower()
+
+    precheck = await precheck_report_profile_change(
+        actor_user_id,
+        automation,
+        new_profile,
+        via_rest=True,
+        action=action,
+        after_metadata=after_metadata,
+        conn=conn,
+    )
+    if precheck.stored_profile is None or not precheck.needs_confirmation:
+        return RestReportProfileWritePlan(change=precheck.change)
+
+    if auth_kind == "service":
+        return RestReportProfileWritePlan(change=precheck.change)
+
+    if auth_kind != "session":
+        raise ReportDeliveryError(
+            REST_NON_INTERACTIVE_CONFIRM_REFUSED_MESSAGE,
+            code="confirmation_required",
+        )
+
+    headers = getattr(http_request, "headers", None)
+    header_token = headers.get("x-report-delivery-confirmation") if headers is not None else None
+    raw_token = str(body_confirmation_token or header_token or "").strip()
+    if not raw_token:
+        raise ReportDeliveryError(
+            CONFIRMATION_REQUIRED_MESSAGE,
+            code="confirmation_required",
+        )
+
+    is_update = str(action).strip().lower() == "update"
+    aid = str(automation.get("automation_id") or "").strip() or None if is_update else None
+    row_cv = precheck.config_version if is_update else None
+    if (
+        is_update
+        and expected_config_version is not None
+        and row_cv is not None
+        and expected_config_version != row_cv
+    ):
+        raise ReportDeliveryError(
+            "确认期间任务配置版本已变更，请刷新后重新确认。",
+            code="conflict",
+        )
+    return RestReportProfileWritePlan(
+        change=precheck.change,
+        confirmation_token=raw_token,
+        confirmation_action="update" if is_update else "create",
+        confirmation_automation_id=aid,
+        confirmation_config_version=row_cv,
+        required_expected_config_version=row_cv,
+    )
+
+
 async def execute_report_profile_rest_mutation(
     *,
     change: ValidatedReportProfileChange,
@@ -2804,9 +3210,14 @@ async def execute_report_profile_rest_mutation(
     mutate_fn: Callable[[Any], Awaitable[dict[str, Any] | None]],
     expected_config_version: int | None = None,
     is_company: bool = False,
+    confirmation_token: str | None = None,
+    confirmation_action: str | None = None,
+    confirmation_automation_id: str | None = None,
+    confirmation_config_version: int | None = None,
+    consume_confirmation_fn: Callable[..., Awaitable[str]] | None = None,
     conn: Any = None,
 ) -> tuple[dict[str, Any] | None, str | None]:
-    """Run REST create/update + route sync + DB audit + 10m notify slot in one transaction."""
+    """Run REST create/update + optional confirmation consumption + route sync + DB audit + 10m notify slot in one transaction."""
     from src.dalton.company_identity import is_company_system_user
 
     audit_entry = change.build_audit_entry()
@@ -2815,6 +3226,25 @@ async def execute_report_profile_rest_mutation(
 
     async with _use_conn(conn) as db_conn:
         async with db_conn.transaction():
+            if confirmation_token is not None and change.profile is not None:
+                eff_consume = consume_confirmation_fn or consume_report_delivery_confirmation
+                prof = change.profile
+                await eff_consume(
+                    token=confirmation_token,
+                    actor_user_id=actor_user_id,
+                    action=confirmation_action or change.action,
+                    automation_id=confirmation_automation_id,
+                    config_version=confirmation_config_version,
+                    profile=str(prof.get("profile") or ""),
+                    report_targets=list(prof.get("report_targets") or []),
+                    text_targets=(
+                        list(prof["text_targets"])
+                        if prof.get("text_targets") is not None
+                        else None
+                    ),
+                    failure_targets=list(prof.get("failure_targets") or []),
+                    conn=db_conn,
+                )
             with automation_history_context(
                 actor_user_id=actor_user_id,
                 action=change.action if change.action in {"create", "update"} else "update",
@@ -2850,7 +3280,7 @@ async def execute_report_profile_rest_mutation(
     return saved_row, route_warning
 
 
-async def set_report_delivery_config(
+async def precheck_report_delivery_set(
     *,
     caller_user_id: str,
     automation_id: str,
@@ -2858,17 +3288,13 @@ async def set_report_delivery_config(
     profile: str | None = None,
     failure_targets: Sequence[str] | None = None,
     text_targets: Sequence[str] | None = None,
-    user_confirmed: bool = False,
     conn: Any = None,
     verify_member_fn: Callable[[str, str], Awaitable[tuple[bool, str | None]]] | None = None,
-    notify_admins_fn: Callable[..., Awaitable[dict[str, Any]]] | None = None,
-) -> dict[str, Any]:
-    """Validate permissions/targets and atomically save ``metadata.report_profile`` + notify route."""
+) -> ReportProfilePrecheckResult:
+    """Read-only precheck for ``dalton_report_delivery(action='set')``."""
     caller_tier = await _require_internal_or_admin(caller_user_id)
     auto = await _load_automation_for_actor(automation_id, caller_user_id, caller_tier, conn=conn)
     owner_user_id = str(auto.get("user_id") or "").strip()
-    aid_str = str(auto.get("automation_id"))
-    auto_name = str(auto.get("name") or "").strip() or aid_str
 
     if owner_user_id != caller_user_id and caller_tier != "admin":
         raise ReportDeliveryError(
@@ -2910,12 +3336,91 @@ async def set_report_delivery_config(
     if norm_text is not None:
         candidate_profile["text_targets"] = norm_text
 
+    return await precheck_report_profile_change(
+        caller_user_id,
+        auto,
+        candidate_profile,
+        via_rest=False,
+        action="set",
+        conn=conn,
+        verify_member_fn=verify_member_fn,
+    )
+
+
+async def set_report_delivery_config(
+    *,
+    caller_user_id: str,
+    automation_id: str,
+    report_targets: Sequence[str],
+    profile: str | None = None,
+    failure_targets: Sequence[str] | None = None,
+    text_targets: Sequence[str] | None = None,
+    hitl_confirmed: bool = False,
+    expected_config_version: int | None = None,
+    conn: Any = None,
+    verify_member_fn: Callable[[str, str], Awaitable[tuple[bool, str | None]]] | None = None,
+    notify_admins_fn: Callable[..., Awaitable[dict[str, Any]]] | None = None,
+) -> dict[str, Any]:
+    """Validate permissions/targets and atomically save ``metadata.report_profile`` + notify route."""
+    caller_tier = await _require_internal_or_admin(caller_user_id)
+    auto = await _load_automation_for_actor(automation_id, caller_user_id, caller_tier, conn=conn)
+    owner_user_id = str(auto.get("user_id") or "").strip()
+    aid_str = str(auto.get("automation_id"))
+    auto_name = str(auto.get("name") or "").strip() or aid_str
+
+    if owner_user_id != caller_user_id and caller_tier != "admin":
+        raise ReportDeliveryError(
+            "只能修改自己的定时任务发送配置（管理员可代为修改）",
+            code="forbidden",
+        )
+
+    current_cv = _coerce_config_version(auto.get("config_version"))
+    if expected_config_version is not None and current_cv != expected_config_version:
+        raise ReportDeliveryError(
+            "确认期间任务配置已变更（可能发生并发修改），请重新发起。",
+            code="conflict",
+        )
+
+    old_meta = copy.deepcopy(dict(auto.get("metadata") or {}))
+    resolved_profile = resolve_report_profile_id(
+        auto.get("instruction"),
+        requested_profile=profile,
+        metadata=old_meta,
+        name=auto.get("name"),
+    )
+
+    def _dedup_parse(raw_list: Sequence[str] | None) -> list[str]:
+        seen_t: set[str] = set()
+        out: list[str] = []
+        for raw in raw_list or []:
+            parsed_t = parse_delivery_target(raw)
+            if parsed_t[0] not in seen_t:
+                seen_t.add(parsed_t[0])
+                out.append(parsed_t[0])
+        return out
+
+    norm_report = _dedup_parse(report_targets)
+    norm_text = _dedup_parse(text_targets) if text_targets is not None else None
+    if failure_targets is None:
+        owner_identities = await list_caller_dm_identities(owner_user_id)
+        norm_failure = default_failure_targets_for_identities(owner_identities)
+    else:
+        norm_failure = _dedup_parse(failure_targets)
+
+    candidate_profile: dict[str, Any] = {
+        "profile": resolved_profile,
+        "report_targets": norm_report,
+        "failure_targets": norm_failure,
+    }
+    if norm_text is not None:
+        candidate_profile["text_targets"] = norm_text
+
     validated = await validate_report_profile_change(
         caller_user_id,
         auto,
         candidate_profile,
         via_rest=False,
-        user_confirmed=user_confirmed,
+        confirmed=bool(hitl_confirmed),
         action="set",
         conn=conn,
         verify_member_fn=verify_member_fn,
@@ -2924,20 +3429,23 @@ async def set_report_delivery_config(
     route_key = f"automation:{aid_str}"
     updated: dict[str, Any] | None = None
     audit_entry = validated.build_audit_entry()
+    write_expected_cv = (
+        expected_config_version if expected_config_version is not None else auto.get("config_version")
+    )
     async with _use_conn(conn) as db_conn:
         async with db_conn.transaction():
             try:
                 with automation_history_context(
                     actor_user_id=caller_user_id,
                     action="update",
-                    expected_config_version=auto.get("config_version"),
+                    expected_config_version=write_expected_cv,
                     report_delivery_audit=audit_entry,
                 ):
                     updated = await auto_db.update_automation(
                         aid_str,
                         owner_user_id,
                         metadata=validated.after_metadata,
-                        expected_config_version=auto.get("config_version"),
+                        expected_config_version=write_expected_cv,
                         actor_user_id=caller_user_id,
                         history_action="update",
                         conn=db_conn,
@@ -3099,7 +3607,6 @@ async def clear_report_delivery_config(
         auto,
         None,
         via_rest=False,
-        user_confirmed=True,
         action="clear",
         conn=conn,
     )

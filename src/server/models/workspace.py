@@ -12,7 +12,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class WorkspaceStatus(str, Enum):
@@ -86,6 +86,16 @@ class WorkspaceCreate(BaseModel):
         False,
         description="Skip coverage unit registration suggestion confirmation when creating with coverage_kind='none'",
     )
+
+    @field_validator("coverage_kind", "ticker", "display_name", mode="before")
+    @classmethod
+    def _ignore_invalid_coverage_str(cls, value: Any) -> Optional[str]:
+        return value if isinstance(value, str) else None
+
+    @field_validator("skip_coverage_suggestion", mode="before")
+    @classmethod
+    def _ignore_invalid_skip_coverage_bool(cls, value: Any) -> bool:
+        return value if isinstance(value, bool) else False
 
 
 class WorkspaceUpdate(BaseModel):
@@ -296,6 +306,14 @@ class WorkspaceResponse(BaseModel):
     coverage_unit_warning_detail: Optional[Dict[str, Any]] = Field(
         None,
         description="Structured code and params when coverage unit auto-registration failed or was skipped",
+    )
+    dedup_warning: Optional[str] = Field(
+        None,
+        description="Non-fatal notice when company workspace deduplication check was unavailable (e.g. timed out)",
+    )
+    dedup_warning_code: Optional[str] = Field(
+        None,
+        description="Structured code when company workspace deduplication check was unavailable",
     )
 
     model_config = ConfigDict(from_attributes=True)

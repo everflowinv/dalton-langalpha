@@ -444,8 +444,13 @@ async def workspaces_create(
             return None
         dup = None
         try:
+            dedup_kwargs: dict[str, Any] = {"channel": "cos"}
+            if snapshot is not None and snapshot.get("duplicate_workspace_id") is not None:
+                dedup_kwargs["exclude_workspace_id"] = str(
+                    snapshot["duplicate_workspace_id"]
+                )
             dup = await find_existing_company_workspace(
-                user_id, name, channel="cos"
+                user_id, name, **dedup_kwargs
             )
         except Exception as exc:
             logger.warning(

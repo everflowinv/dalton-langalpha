@@ -999,6 +999,8 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("router.py", "dalton_notify_feishu_groups_endpoint"): CapabilityId.CHANNEL_FEISHU,
         ("router.py", "dalton_notify_discord_channel_verify_endpoint"): CapabilityId.CHANNEL_DISCORD,
         ("router.py", "dalton_notify_test_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("router.py", "report_delivery_precheck_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("router.py", "issue_report_delivery_confirmation_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("router.py", "global_search_endpoint"): CORE_CAPABILITY,
         # --- channels_router.py ---
         ("channels_router.py", "internal_gateway_lease_acquire_endpoint"): CapabilityId.CHANNEL_GATEWAY,

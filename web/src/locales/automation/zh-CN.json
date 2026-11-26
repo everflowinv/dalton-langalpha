@@ -372,5 +372,19 @@
   "modelUnavailableOption": "{{model}}（不可用）",
   "modelCatalogLoading": "正在加载模型…",
   "modelCatalogUnavailable": "模型列表暂时无法加载，已保存的选择保持不变。",
-  "modelCurrentOption": "{{model}}（当前设置）"
+  "modelCurrentOption": "{{model}}（当前设置）",
+  "reportDeliverySection": "报告外发",
+  "reportDeliveryConfigure": "配置报告外发对象",
+  "reportDeliveryClear": "清除报告外发配置",
+  "reportDeliveryConfirmTitle": "确认定时报告外发对象",
+  "reportDeliveryConfirmDesc": "本次配置包含群聊/频道或非本人私信接收对象。请核对以下信息并确认后再提交。",
+  "reportDeliveryConfirmTask": "任务名称",
+  "reportDeliveryConfirmProfile": "报告类型",
+  "reportDeliveryConfirmReportTargets": "报告卡片目标",
+  "reportDeliveryConfirmTextTargets": "纯文本目标",
+  "reportDeliveryConfirmFailureTargets": "失败告警目标",
+  "reportDeliveryTargetNone": "无",
+  "reportDeliveryTargetUnset": "未设置",
+  "reportDeliveryConfirmCreate": "确认并创建",
+  "reportDeliveryConfirmSave": "确认并保存"
 }

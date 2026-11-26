@@ -1,0 +1,207 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { fireEvent, screen, waitFor } from '@testing-library/react';
+import i18n from '@/i18n';
+import { renderWithProviders } from '@/test/utils';
+import type { Automation, DeliveryOptions } from '@/types/automation';
+import * as api from '../utils/api';
+import Automations from '../Automations';
+
+const confirmMocks = vi.hoisted(() => ({
+  precheck: vi.fn(),
+  issue: vi.fn(),
+}));
+
+const home = vi.hoisted(() => ({
+  getHomeWorkspace: vi.fn(),
+}));
+
+vi.mock('@/lib/dalton/reportDeliveryConfirmation', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/dalton/reportDeliveryConfirmation')>();
+  return {
+    ...actual,
+    precheckReportDeliveryConfirmation: confirmMocks.precheck,
+    issueReportDeliveryConfirmation: confirmMocks.issue,
+  };
+});
+
+vi.mock('@/hooks/useCapabilities', () => ({
+  useCapabilities: () => ({
+    capabilities: { channel_gateway: true },
+    hasCapability: (cap: string) => cap === 'channel_gateway',
+    isLoading: false,
+  }),
+}));
+
+vi.mock('@/hooks/usePreferences', () => ({
+  usePreferences: () => ({
+    preferences: { model_preference: {}, other_preference: {} },
+    isLoading: false,
+    isLoaded: true,
+  }),
+}));
+
+vi.mock('@/hooks/useUpdatePreferences', () => ({
+  PREFERENCE_MUTATION_KEY: ['user-preferences'],
+  useUpdatePreferences: () => ({ mutate: vi.fn(), mutateAsync: vi.fn() }),
+}));
+
+vi.mock('@/hooks/useHomeTimezone', () => ({ useHomeTimezone: () => 'America/New_York' }));
+vi.mock('@/hooks/useWorkspaces', () => ({
+  useWorkspaces: () => ({ data: { workspaces: [{ workspace_id: 'ws-1', name: 'Research' }] } }),
+}));
+vi.mock('@/pages/ChatAgent/utils/api/workspaces', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  getHomeWorkspace: home.getHomeWorkspace,
+}));
+
+vi.mock('@/contexts/AuthContext', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/contexts/AuthContext')>();
+  return { ...actual, useAuth: () => ({ userId: 'user-1', isLoggedIn: true, isInitialized: true }) };
+});
+
+vi.mock('../utils/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../utils/api')>();
+  const { personalReadMocks } = await import('./readBridge');
+  const listAutomations = vi.fn(async () => ({
+    data: { automations: new Array<Automation>(), total: 0 },
+  }));
+  return {
+    ...actual,
+    listAutomations,
+    listExecutions: vi.fn(async () => ({ data: { executions: [], has_more: false } })),
+    listRecentRuns: vi.fn(async () => ({ data: { executions: [], has_more: false } })),
+    getDeliveryOptions: vi.fn(async () => ({
+      data: { enabled: false, workspace_id: 'ws-1', apps: {} } as DeliveryOptions,
+    })),
+    createAutomation: vi.fn(async (payload) => ({
+      data: {
+        automation_id: 'auto-new-1',
+        user_id: 'user-1',
+        name: payload.name,
+        description: null,
+        trigger_type: payload.trigger_type,
+        cron_expression: payload.cron_expression ?? '0 9 * * 1-5',
+        timezone: payload.timezone ?? 'America/New_York',
+        trigger_config: null,
+        next_run_at: null,
+        last_run_at: null,
+        instruction: payload.instruction,
+        workspace_id: 'ws-1',
+        llm_model: null,
+        thread_strategy: 'continue',
+        conversation_thread_id: null,
+        status: 'active',
+        max_failures: 3,
+        failure_count: 0,
+        disable_reason: null,
+        delivery_config: null,
+        metadata: payload.metadata ?? {},
+        created_at: '2026-11-26T00:00:00Z',
+        updated_at: '2026-11-26T00:00:00Z',
+        last_execution: null,
+      } as Automation,
+    })),
+    ...personalReadMocks(listAutomations),
+  };
+});
+
+beforeEach(() => {
+  home.getHomeWorkspace.mockResolvedValue({ workspace_id: 'home-1', is_home: true });
+});
+
+afterEach(() => {
+  vi.clearAllMocks();
+  localStorage.clear();
+});
+
+const label = (key: string, opts?: Record<string, unknown>) => i18n.t(key, opts);
+
+describe('Automations report delivery confirmation dialog (AD5)', () => {
+  it('shows confirmation dialog for group targets, issues one-time token on confirm, and aborts on cancel', async () => {
+    confirmMocks.precheck.mockResolvedValue({
+      data: {
+        needs_confirmation: true,
+        action: 'create',
+        automation_id: null,
+        automation_name: 'Daily Filing Alert',
+        config_version: null,
+        profile: 'daily-filing-alert',
+        report_targets: ['feishu:chat:oc_group_auth_1'],
+        text_targets: null,
+        failure_targets: [],
+        group_targets: ['feishu:chat:oc_group_auth_1'],
+        non_caller_dm_targets: [],
+        target_labels: { 'feishu:chat:oc_group_auth_1': 'Research Group 1' },
+      },
+    });
+    confirmMocks.issue.mockResolvedValue({
+      data: {
+        needs_confirmation: true,
+        confirmation_id: 'conf-1',
+        confirmation_token: 'one-time-tok-xyz',
+        expires_at: '2026-11-26T01:00:00Z',
+        action: 'create',
+        automation_id: null,
+        automation_name: 'Daily Filing Alert',
+        config_version: null,
+        profile: 'daily-filing-alert',
+        report_targets: ['feishu:chat:oc_group_auth_1'],
+        text_targets: null,
+        failure_targets: [],
+        target_labels: { 'feishu:chat:oc_group_auth_1': 'Research Group 1' },
+      },
+    });
+
+    renderWithProviders(<Automations />, { route: '/automations' });
+
+    // Start new automation from zero-state blank automation (matching Automations.place.test.tsx)
+    fireEvent.click(await screen.findByText(label('automation:blankAutomation')));
+    fireEvent.change(await screen.findByLabelText(label('common.name')), {
+      target: { value: 'Daily Filing Alert' },
+    });
+    fireEvent.change(screen.getByLabelText(label('automation:instruction')), {
+      target: { value: 'Run daily filing alert report.' },
+    });
+
+    // Open More options -> expand report profile fields -> fill profile & group target
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation:moreOptions')) }));
+    fireEvent.click(
+      await screen.findByRole('button', { name: label('automation:reportDeliveryConfigure') }),
+    );
+    const profileInput = await screen.findByLabelText(label('automation:reportDeliveryConfirmProfile'));
+    fireEvent.change(profileInput, { target: { value: 'daily-filing-alert' } });
+    const targetsInput = await screen.findByLabelText(label('automation:reportDeliveryConfirmReportTargets'));
+    fireEvent.change(targetsInput, { target: { value: 'feishu:chat:oc_group_auth_1' } });
+
+    // Submit form -> precheck runs, dialog opens, createAutomation NOT called yet
+    const submitBtn = screen.getByRole('button', { name: label('common.create') });
+    fireEvent.click(submitBtn);
+
+    await waitFor(() => {
+      expect(confirmMocks.precheck).toHaveBeenCalledTimes(1);
+    });
+    expect(await screen.findByText('Research Group 1')).toBeTruthy();
+    expect(api.createAutomation).not.toHaveBeenCalled();
+
+    // Cancel closes dialog without calling createAutomation
+    fireEvent.click(screen.getByRole('button', { name: label('common.cancel') }));
+    await waitFor(() => {
+      expect(screen.queryByText('Research Group 1')).toBeNull();
+    });
+    expect(api.createAutomation).not.toHaveBeenCalled();
+
+    // Submit again -> confirm -> issues one-time credential and attaches report_delivery_confirmation_token
+    fireEvent.click(submitBtn);
+    await screen.findByText('Research Group 1');
+    fireEvent.click(
+      screen.getByRole('button', { name: label('automation:reportDeliveryConfirmCreate') }),
+    );
+
+    await waitFor(() => {
+      expect(confirmMocks.issue).toHaveBeenCalledTimes(1);
+      expect(api.createAutomation).toHaveBeenCalledTimes(1);
+    });
+    const sentPayload = vi.mocked(api.createAutomation).mock.calls[0]?.[0];
+    expect(sentPayload?.report_delivery_confirmation_token).toBe('one-time-tok-xyz');
+  });
+});

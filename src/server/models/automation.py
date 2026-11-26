@@ -562,6 +562,10 @@ class AutomationCreate(_ScheduleFields):
     metadata: Optional[Dict[str, Any]] = Field(
         default=None, description="Arbitrary metadata"
     )
+    # DALTON-HOOK(report-delivery): one-time confirmation credential issued by web confirmation card
+    report_delivery_confirmation_token: Optional[str] = Field(
+        default=None, exclude=True
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -614,6 +618,10 @@ class AutomationUpdate(_ScheduleFields):
         description="Delivery configuration: { methods: ['slack', ...] }",
     )
     metadata: Optional[Dict[str, Any]] = None
+    # DALTON-HOOK(report-delivery): one-time confirmation credential issued by web confirmation card
+    report_delivery_confirmation_token: Optional[str] = Field(
+        default=None, exclude=True
+    )
     # DALTON-HOOK(company-automations): optional expected_config_version for optimistic concurrency check
     expected_config_version: Any = Field(default=None, exclude=True)
     # DALTON-HOOK(company-automations): keep the raw delivery object, including keys DeliveryConfig drops
