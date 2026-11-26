@@ -1187,9 +1187,30 @@ async def test_default_get_live_sandbox_uses_get_session_if_running_and_refuses_
     assert dir_stopped is None
     assert session_calls == []
 
-    # 4) Confirmed stopped via get_session_if_running returning None -> returns (None, None)
+    # 3b) Transitioning (`starting` / `stopping`) -> raises 503 immediately without reading backup
+    for trans_status in ("starting", "stopping"):
+        session_calls.clear()
+        monkeypatch.setattr(
+            ws_db,
+            "get_workspace",
+            create_autospec(
+                real_get_workspace, return_value={**ws_row_running, "status": trans_status}
+            ),
+        )
+        with pytest.raises(HTTPException) as exc_trans:
+            await cd._default_get_live_sandbox("ws-research", user_id="user-alice")
+        assert exc_trans.value.status_code == 503
+        assert exc_trans.value.detail["code"] == "deliverable_sandbox_unavailable"
+        assert session_calls == []
+
+    # 4) `get_session_if_running` returns None:
+    #    - If re-check confirms `stopped`, allow offline backup `(None, None)`.
+    #    - If re-check sees `stopping` / `running`, refuse stale backup with 503.
+    ws_sequence_stopped = iter([ws_row_running, ws_row_stopped])
     monkeypatch.setattr(
-        ws_db, "get_workspace", create_autospec(real_get_workspace, return_value=ws_row_running)
+        ws_db,
+        "get_workspace",
+        create_autospec(real_get_workspace, side_effect=lambda *_a, **_kw: next(ws_sequence_stopped)),
     )
     monkeypatch.setattr(
         WorkspaceManager,
@@ -1199,6 +1220,128 @@ async def test_default_get_live_sandbox_uses_get_session_if_running_and_refuses_
     sb_none, dir_none = await cd._default_get_live_sandbox("ws-research", user_id="user-alice")
     assert sb_none is None
     assert dir_none is None
+
+    ws_sequence_stopping = iter([ws_row_running, {**ws_row_running, "status": "stopping"}])
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(real_get_workspace, side_effect=lambda *_a, **_kw: next(ws_sequence_stopping)),
+    )
+    with pytest.raises(HTTPException) as exc_race:
+        await cd._default_get_live_sandbox("ws-research", user_id="user-alice")
+    assert exc_race.value.status_code == 503
+    assert exc_race.value.detail["code"] == "deliverable_sandbox_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_download_verified_deliverable_stopping_refuses_stale_backup_when_online_updated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R8 #3: When DB status has entered `stopping` (online file already overwritten, stop backup
+    not yet flushed so offline mirror still holds the old turn-matching bytes), download MUST
+    return 503 `deliverable_sandbox_unavailable` and NEVER read or serve the stale backup."""
+    from src.server.database import workspace as ws_db
+
+    old_bytes = b"%PDF-1.4\nv1-recorded-in-turn\n"
+    old_sha = hashlib.sha256(old_bytes).hexdigest()
+
+    monkeypatch.setattr(
+        cd,
+        "require_channel_platform_capability",
+        create_autospec(cd.require_channel_platform_capability, return_value=None),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "require_channel_platform_capability",
+        create_autospec(cg_db.require_channel_platform_capability, return_value=None),
+    )
+    monkeypatch.setattr(
+        wx_db,
+        "verify_gateway_epoch_in_tx",
+        create_autospec(wx_db.verify_gateway_epoch_in_tx, return_value=None),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "check_team_member_status_live",
+        create_autospec(cg_db.check_team_member_status_live, return_value="active"),
+    )
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={
+                "workspace_id": "ws-stopping-1",
+                "user_id": "user-alice",
+                "status": "stopping",
+                "dir_name": "Research",
+                "computer_root_dir": "/home/workspace",
+            },
+        ),
+    )
+
+    cur = _FakeTopicCursor()
+    cur.identities[("user-alice", "feishu")] = {"platform_user_id": "ou_alice"}
+    cur.workspaces["ws-stopping-1"] = {
+        "workspace_id": "ws-stopping-1",
+        "user_id": "user-alice",
+    }
+    cur.deliveries["deliverables:run-stopping-1"] = {
+        "delivery_key": "deliverables:run-stopping-1",
+        "kind": "fallback",
+        "platform": "feishu",
+        "user_id": "user-alice",
+        "thread_id": "tid-stopping-1",
+        "run_id": "run-stopping-1",
+        "is_current": True,
+        "target_address": "feishu:@me",
+        "status": "in_flight",
+        "delivery_attempt": 1,
+        "dm_recipient_platform_user_id": "ou_alice",
+    }
+    cur.responses["run-stopping-1"] = {
+        "conversation_response_id": "run-stopping-1",
+        "thread_id": "tid-stopping-1",
+        "metadata": {
+            "turn_deliverables": [
+                {
+                    "workspace_id": "ws-stopping-1",
+                    "path": "results/report.pdf",
+                    "sha256": old_sha,
+                    "size": len(old_bytes),
+                    "stamp": {
+                        "size": len(old_bytes),
+                        "mtime": "1700000001.0",
+                        "ctime": "1700000001.0",
+                        "inode": "99",
+                    },
+                }
+            ]
+        },
+    }
+    conn = _FakeConn(cur)
+
+    backup_read_calls = 0
+
+    async def _stale_backup_reader(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        nonlocal backup_read_calls
+        backup_read_calls += 1
+        # Offline backup still has old matching bytes even though online sandbox was overwritten!
+        return {"content": old_bytes, "size": len(old_bytes)}
+
+    with pytest.raises(HTTPException) as exc:
+        await cd.download_verified_deliverable(
+            delivery_key="deliverables:run-stopping-1",
+            delivery_attempt=1,
+            workspace_id="ws-stopping-1",
+            path="results/report.pdf",
+            gateway_epoch=7,
+            conn=conn,
+            offline_backup_reader_fn=_stale_backup_reader,
+        )
+    assert exc.value.status_code == 503
+    assert exc.value.detail["code"] == "deliverable_sandbox_unavailable"
+    assert backup_read_calls == 0
 
 
 @pytest.mark.asyncio
@@ -1365,19 +1508,42 @@ class _LockOrderTrackingCursor:
         if "UPDATE DALTON_CHANNEL_SESSION_GENERATIONS" in norm:
             return
 
+        if "SELECT COALESCE(MAX(SENT_TO_CURRENT_COUNT), 0) AS CNT" in norm:
+            rid = str(params[0])
+            cnt = max(
+                (int(r.get("sent_to_current_count") or 0) for r in self.inbound_events.values() if r.get("run_id") == rid),
+                default=0,
+            )
+            self._one = {"cnt": cnt}
+            return
+
+        if "FROM DALTON_CHANNEL_INBOUND_EVENTS" in norm:
+            if "WHERE PLATFORM = %S AND MESSAGE_ID = %S" in norm:
+                plat, msg_id = str(params[0]), str(params[1])
+                row = self.inbound_events.get((plat, msg_id))
+                if row and (
+                    "AND CHAT_ADDRESS = %S" not in norm
+                    or row.get("chat_address") == str(params[2])
+                ):
+                    self._one = dict(row)
+                return
+            return
+
         if "INSERT INTO DALTON_CHANNEL_INBOUND_EVENTS" in norm:
             plat, msg_id = str(params[0]), str(params[1])
             key = (plat, msg_id)
             if key not in self.inbound_events:
+                raw_p = params[6]
+                raw_dict = dict(raw_p.obj) if hasattr(raw_p, "obj") else (dict(raw_p) if isinstance(raw_p, dict) else {})
                 self.inbound_events[key] = {
                     "platform": plat,
                     "message_id": msg_id,
-                    "chat_type": params[2],
-                    "chat_address": params[3],
-                    "thread_scope_key": params[4],
-                    "request_key": params[5],
-                    "raw_payload": {},
-                    "status": "received",
+                    "request_key": params[2],
+                    "chat_type": params[3],
+                    "chat_address": params[4],
+                    "thread_scope_key": params[5],
+                    "raw_payload": raw_dict,
+                    "status": "pending",
                     "dalton_user_id": None,
                     "workspace_id": None,
                     "external_thread_id": None,
@@ -1390,6 +1556,14 @@ class _LockOrderTrackingCursor:
             return
 
         if "UPDATE DALTON_CHANNEL_INBOUND_EVENTS" in norm:
+            if "SET SENT_TO_CURRENT_COUNT = SENT_TO_CURRENT_COUNT + 1" in norm:
+                rid = str(params[0])
+                for row in self.inbound_events.values():
+                    if row.get("run_id") == rid:
+                        row["sent_to_current_count"] = int(row.get("sent_to_current_count") or 0) + 1
+                        self._one = {"sent_to_current_count": row["sent_to_current_count"]}
+                        return
+                return
             if "WHERE PLATFORM = %S AND MESSAGE_ID = %S" in norm:
                 plat, msg_id = str(params[-2]), str(params[-1])
                 row = self.inbound_events.get((plat, msg_id))
@@ -1399,6 +1573,8 @@ class _LockOrderTrackingCursor:
                         row["workspace_id"] = params[1]
                         row["external_thread_id"] = params[2]
                         row["session_generation"] = params[3]
+                        raw_p = params[5]
+                        row["raw_payload"] = dict(raw_p.obj) if hasattr(raw_p, "obj") else (dict(raw_p) if isinstance(raw_p, dict) else {})
                         row["thread_scope_key"] = params[6]
                     self._one = dict(row)
             return
@@ -1476,6 +1652,54 @@ class _LockOrderTrackingCursor:
                     self._one = dict(r)
             return
 
+        if "SELECT EXISTS (" in norm and "FROM DALTON_CHANNEL_DELIVERIES" in norm:
+            run_id = str(params[0])
+            exclude_deliv = "NOT LIKE 'DELIVERABLES:" in norm
+            want_status = "in_flight" if "STATUS = 'IN_FLIGHT'" in norm else "unknown"
+            matched = any(
+                d.get("run_id") == run_id
+                and bool(d.get("is_current"))
+                and bool(d.get("has_non_empty_text"))
+                and str(d.get("status")) == want_status
+                and (
+                    not exclude_deliv
+                    or not str(d.get("delivery_key") or "").startswith(
+                        ("deliverables:", "deliverables-links:")
+                    )
+                )
+                for d in self.deliveries.values()
+            )
+            if "AS IN_FLIGHT" in norm:
+                self._one = {"in_flight": matched}
+            else:
+                self._one = {"has_unknown_text": matched}
+            return
+
+        if "INSERT INTO DALTON_CHANNEL_DELIVERIES" in norm:
+            dkey = str(params[0])
+            self.deliveries[dkey] = {
+                "delivery_key": dkey,
+                "kind": params[1],
+                "user_id": params[2],
+                "thread_id": params[3],
+                "run_id": params[4],
+                "execution_id": params[5],
+                "is_current": bool(params[6]),
+                "has_non_empty_text": bool(params[7]),
+                "platform": params[8],
+                "target_address": params[9],
+                "status": "in_flight",
+                "total_chunks": params[10],
+                "sent_chunks": 0,
+                "platform_message_ids": [],
+                "files_status": [],
+                "source_scope_key": params[11],
+                "source_generation": params[12],
+                "activity_origin": params[13],
+                "delivery_attempt": 1,
+            }
+            return
+
         if "FROM DALTON_CHANNEL_DELIVERIES" in norm and "WHERE DELIVERY_KEY = %S" in norm:
             if "FOR UPDATE" in norm:
                 self.lock_events.append("for_update:dalton_channel_deliveries")
@@ -1485,6 +1709,11 @@ class _LockOrderTrackingCursor:
             return
 
         if "UPDATE DALTON_CHANNEL_DELIVERIES" in norm:
+            if params:
+                dkey = str(params[-1])
+                row = self.deliveries.get(dkey)
+                if row and "SET STATUS = %S" in norm:
+                    row["status"] = params[0]
             return
 
         if "FROM DALTON_CHANNEL_CHAT_BINDINGS" in norm:
@@ -1656,6 +1885,172 @@ async def test_i1_and_i7_lock_order_and_real_i1_inbound_before_i7(
     i7_topic_idx = cur.lock_events.index("advisory:dalton_bot_topic:feishu:feishu:oc_grp_1")
     i7_sess_idx = cur.lock_events.index("for_update:dalton_channel_session_generations")
     assert i7_topic_idx < i7_sess_idx
+
+    # 4) Real I-1 + I-6 + I-7 on Discord (pre-confirmation Bob @bot + initiator follow-up + I-7 confirm)
+    cur.identities[("user-alice", "discord")] = {"platform_user_id": "100001"}
+    cur.identities[("user-bob", "discord")] = {"platform_user_id": "200002"}
+    cur.chat_bindings[("discord", "discord:111111/222222")] = {
+        "chat_name": "research",
+        "workspace_id": None,
+    }
+    cur.user_settings["user-bob"] = {
+        "apps": {"discord": {"chats": {"discord:111111/222222": {"name": "research"}}}}
+    }
+    cur.topics[("discord", "discord:111111/222222", "chat:111111/222222:topic:999000111")] = {
+        "platform": "discord",
+        "chat_address": "discord:111111/222222",
+        "canonical_scope_key": "chat:111111/222222:topic:999000111",
+        "external_topic_id": None,
+        "root_message_id": "999000111",
+        "first_reply_message_id": None,
+        "initiator_dalton_user_id": "user-alice",
+        "initiator_platform_user_id": "100001",
+        "status": "pending",
+    }
+    cur.session_rows[("discord", "chat:111111/222222:topic:999000111", "user-alice")] = {
+        "platform": "discord",
+        "scope_key": "chat:111111/222222:topic:999000111",
+        "dalton_user_id": "user-alice",
+        "generation": 1,
+        "override_workspace_id": None,
+        "pending_interrupt": None,
+        "selection_initialized_at": datetime.now(timezone.utc),
+        "last_conversation_activity_at": datetime.now(timezone.utc),
+    }
+    cur.deliveries["fallback:run-disc-topic-1"] = {
+        "delivery_key": "fallback:run-disc-topic-1",
+        "kind": "fallback",
+        "user_id": "user-alice",
+        "platform": "discord",
+        "target_address": "discord:111111/222222",
+        "source_scope_key": "chat:111111/222222:topic:999000111",
+        "source_generation": 1,
+        "activity_origin": "conversation",
+        "status": "in_flight",
+        "sent_chunks": 0,
+        "total_chunks": 1,
+        "platform_message_ids": [],
+        "files_status": [],
+        "delivery_attempt": 1,
+        "is_current": True,
+        "has_non_empty_text": True,
+        "run_id": "run-disc-topic-1",
+    }
+
+    cur.lock_events.clear()
+    disc_bob = await cg_db.register_and_resolve_inbound(
+        platform="discord",
+        platform_user_id="200002",
+        chat_type="group",
+        chat_address="discord:111111/222222",
+        thread_scope_key="chat:111111/222222:thread:999000111",
+        message_id="disc_bob_in_1",
+        request_key="rk-disc-bob-1",
+        raw_payload={"platform_user_id": "200002"},
+        external_topic_id="999000111",
+        root_message_id="999000111",
+        conn=conn,
+    )
+    assert disc_bob["allowed"] is True
+    assert disc_bob["resolved_scope_key"] == "chat:111111/222222:thread:999000111"
+    assert disc_bob["topic_initiator_platform_user_id"] == "100001"
+    assert cur.lock_events.index("advisory:dalton_bot_topic:discord:discord:111111/222222") < cur.lock_events.index(
+        "for_update:dalton_channel_session_generations"
+    )
+
+    # Bob's Feishu & Discord pre-confirmation I-6 claims MUST both return the verified inbound external_topic_id
+    real_find_src = cg_db._find_current_conversation_source
+    bob_feishu_row = {
+        **cur.inbound_events[("feishu", "om_bob_in_1")],
+        "_source_table": "inbound_events",
+        "target_address": "feishu:oc_grp_1",
+        "thread_id": "44444444-4444-4444-8444-444444444444",
+        "run_id": "run-bob-pre-i7-fs",
+    }
+    monkeypatch.setattr(
+        cg_db,
+        "_find_current_conversation_source",
+        create_autospec(real_find_src, return_value=bob_feishu_row),
+    )
+    # Reset Feishu topic to pending to verify pre-confirmation I-6 fallback to verified inbound topic id
+    cur.topics[("feishu", "feishu:oc_grp_1", "chat:oc_grp_1:topic:om_root_1")]["status"] = "pending"
+    cur.topics[("feishu", "feishu:oc_grp_1", "chat:oc_grp_1:topic:om_root_1")]["external_topic_id"] = None
+    bob_fs_claim = await cg_db.authorize_and_claim_delivery(
+        delivery_key="fallback:run-bob-pre-i7-fs",
+        kind="fallback",
+        user_id="user-bob",
+        thread_id="44444444-4444-4444-8444-444444444444",
+        run_id="run-bob-pre-i7-fs",
+        platform="feishu",
+        target=None,
+        has_non_empty_text=True,
+        total_chunks=1,
+        source_scope_key="chat:oc_grp_1:thread:omt_topic_1",
+        source_generation=1,
+        activity_origin="conversation",
+        conn=conn,
+    )
+    assert bob_fs_claim["claim_status"] == "claimed"
+    assert bob_fs_claim["external_topic_id"] == "omt_topic_1"
+    assert bob_fs_claim["inbound_message_id"] == "om_bob_in_1"
+    assert bob_fs_claim["root_message_id"] == "om_root_1"
+
+    bob_disc_row = {
+        **cur.inbound_events[("discord", "disc_bob_in_1")],
+        "_source_table": "inbound_events",
+        "target_address": "discord:111111/222222",
+        "thread_id": "55555555-5555-4555-8555-555555555555",
+        "run_id": "run-bob-pre-i7-dc",
+    }
+    monkeypatch.setattr(
+        cg_db,
+        "_find_current_conversation_source",
+        create_autospec(real_find_src, return_value=bob_disc_row),
+    )
+    bob_dc_claim = await cg_db.authorize_and_claim_delivery(
+        delivery_key="fallback:run-bob-pre-i7-dc",
+        kind="fallback",
+        user_id="user-bob",
+        thread_id="55555555-5555-4555-8555-555555555555",
+        run_id="run-bob-pre-i7-dc",
+        platform="discord",
+        target=None,
+        has_non_empty_text=True,
+        total_chunks=1,
+        source_scope_key="chat:111111/222222:thread:999000111",
+        source_generation=1,
+        activity_origin="conversation",
+        conn=conn,
+    )
+    assert bob_dc_claim["claim_status"] == "claimed"
+    assert bob_dc_claim["external_topic_id"] == "999000111"
+
+    # Real Discord I-7 confirmation preserves lock order
+    cur.lock_events.clear()
+    disc_i7 = await cg_db._update_delivery_progress_once(
+        delivery_key="fallback:run-disc-topic-1",
+        sent_chunks=1,
+        total_chunks=1,
+        platform_message_ids=["disc_reply_1"],
+        status="sent",
+        delivery_attempt=1,
+        bot_topic_registration={
+            "platform": "discord",
+            "chat_address": "discord:111111/222222",
+            "canonical_scope_key": "chat:111111/222222:topic:999000111",
+            "external_topic_id": "999000111",
+            "root_message_id": "999000111",
+            "first_reply_message_id": "disc_reply_1",
+            "initiator_platform_user_id": "100001",
+            "initiator_dalton_user_id": "user-alice",
+        },
+        conn=conn,
+    )
+    assert disc_i7["ok"] is True
+    assert disc_i7["bot_topic_registered"] is True
+    assert cur.lock_events.index("advisory:dalton_bot_topic:discord:discord:111111/222222") < cur.lock_events.index(
+        "for_update:dalton_channel_session_generations"
+    )
 
 
 @pytest.mark.asyncio
@@ -1872,3 +2267,371 @@ def test_rewrite_preserves_loopback_http_and_rejects_host_absolute_paths_in_repo
     )
     assert prepared is None
     assert err == "invalid_card"
+
+    # R8 #9: Percent-encoded host absolute path (`%2Fetc%2Fssl%2Fopenssl.cnf`) MUST be decoded
+    # BEFORE checking leading `/` so report button URLs cannot bypass validation.
+    assert (
+        notify_dispatch.classify_external_workspace_destination("%2Fetc%2Fssl%2Fopenssl.cnf")[
+            "kind"
+        ]
+        == "keep"
+    )
+    assert (
+        notify_dispatch.classify_external_workspace_destination("%2fetc%2fssl%2fopenssl.cnf")[
+            "kind"
+        ]
+        == "keep"
+    )
+    encoded_button_card = {
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": "打开配置"},
+                    "behaviors": [
+                        {
+                            "type": "open_url",
+                            "default_url": "%2Fetc%2Fssl%2Fopenssl.cnf",
+                        }
+                    ],
+                }
+            ]
+        },
+    }
+    rw_btn_cards, _, _ = auto_reports_db._rewrite_automation_report_inputs(
+        cards=[encoded_button_card],
+        failure_text=None,
+        text=None,
+        thread_id="tid-rep-3",
+        workspace_id="ws-rep-3",
+    )
+    assert (
+        rw_btn_cards[0]["body"]["elements"][0]["behaviors"][0]["default_url"]
+        == "%2Fetc%2Fssl%2Fopenssl.cnf"
+    )
+    btn_prepared, btn_err = auto_reports_db.prepare_automation_report_content(
+        profile="market-digest-am",
+        cards=rw_btn_cards,
+        failure_text=None,
+        text=None,
+    )
+    assert btn_prepared is None
+    assert btn_err == "invalid_card"
+
+
+@pytest.mark.asyncio
+async def test_discord_parent_recheck_covers_legacy_thread_and_unconfirmed_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R8 #2: Discord parent channel binding & user channel settings are re-verified for ALL
+    current-session subthread deliveries, including:
+    1. Pre-upgrade `:thread:` sessions with NO `dalton_channel_bot_topics` row (`inbound_events` and `background_runs`).
+    2. Pre-confirmation `:thread:` / `:topic:` sessions where the topic row is still `pending`.
+    """
+    monkeypatch.setattr(
+        cg_db,
+        "require_channel_platform_capability",
+        create_autospec(cg_db.require_channel_platform_capability, return_value=None),
+    )
+    monkeypatch.setattr(
+        wx_db,
+        "verify_gateway_epoch_in_tx",
+        create_autospec(wx_db.verify_gateway_epoch_in_tx, return_value=None),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "get_user_tier",
+        create_autospec(cg_db.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "get_home_workspace_id",
+        create_autospec(cg_db.get_home_workspace_id, return_value="ws-home"),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "_verify_workspace_write_permission",
+        create_autospec(
+            cg_db._verify_workspace_write_permission,
+            return_value=(True, None, {"workspace_id": "ws-home", "user_id": "user-alice"}),
+        ),
+    )
+
+    real_find_src = cg_db._find_current_conversation_source
+
+    scenarios = [
+        (
+            "legacy_thread_bg_no_topic_row",
+            "background_runs",
+            "chat:111111/222222:thread:555666777",
+            None,
+        ),
+        (
+            "legacy_thread_inbound_no_topic_row",
+            "inbound_events",
+            "chat:111111/222222:thread:555666777",
+            None,
+        ),
+        (
+            "pending_topic_before_confirmation",
+            "inbound_events",
+            "chat:111111/222222:topic:999000888",
+            "pending",
+        ),
+        (
+            "pre_confirmation_other_member_thread",
+            "inbound_events",
+            "chat:111111/222222:thread:999000888",
+            "pending",
+        ),
+    ]
+
+    for label, source_table, scope_key, topic_status in scenarios:
+        cur = _LockOrderTrackingCursor()
+        cur.identities[("user-alice", "discord")] = {
+            "platform_user_id": "100001",
+            "weixin_context_token": None,
+        }
+        if topic_status is not None:
+            cur.topics[("discord", "discord:111111/222222", "chat:111111/222222:topic:999000888")] = {
+                "platform": "discord",
+                "chat_address": "discord:111111/222222",
+                "canonical_scope_key": "chat:111111/222222:topic:999000888",
+                "external_topic_id": None,
+                "root_message_id": "999000888",
+                "first_reply_message_id": None,
+                "initiator_dalton_user_id": "user-alice",
+                "initiator_platform_user_id": "100001",
+                "status": topic_status,
+            }
+        cur.chat_bindings[("discord", "discord:111111/222222")] = {
+            "chat_name": "research",
+            "workspace_id": None,
+        }
+        cur.user_settings["user-alice"] = {
+            "apps": {"discord": {"chats": {"discord:111111/222222": {"name": "research"}}}}
+        }
+        conn = _FakeConn(cur)
+
+        src_row = {
+            "_source_table": source_table,
+            "platform": "discord",
+            "dalton_user_id": "user-alice",
+            "target_address": "discord:111111/222222",
+            "thread_scope_key": scope_key,
+            "thread_id": "66666666-6666-4666-8666-666666666666",
+            "run_id": f"run-{label}",
+            "workspace_id": "ws-home",
+            "session_generation": 1,
+            "message_id": "msg-in-1" if source_table == "inbound_events" else None,
+            "raw_payload": {"platform_user_id": "100001"},
+        }
+        monkeypatch.setattr(
+            cg_db,
+            "_find_current_conversation_source",
+            create_autospec(real_find_src, return_value=src_row),
+        )
+
+        # 1) Bound parent channel -> allowed
+        ok_res = await cg_db.authorize_and_claim_delivery(
+            delivery_key=f"fallback:ok-{label}",
+            kind="fallback",
+            user_id="user-alice",
+            thread_id="66666666-6666-4666-8666-666666666666",
+            run_id=f"run-{label}",
+            platform="discord",
+            target=None,
+            has_non_empty_text=True,
+            total_chunks=1,
+            source_scope_key=scope_key,
+            source_generation=1,
+            activity_origin="replay" if source_table == "inbound_events" else "notification",
+            conn=conn,
+        )
+        assert ok_res["claim_status"] == "claimed", label
+
+        # 2) Revoke parent channel binding -> denied
+        saved_binding = cur.chat_bindings.pop(("discord", "discord:111111/222222"))
+        denied_unbind = await cg_db.authorize_and_claim_delivery(
+            delivery_key=f"fallback:unbind-{label}",
+            kind="fallback",
+            user_id="user-alice",
+            thread_id="66666666-6666-4666-8666-666666666666",
+            run_id=f"run-{label}",
+            platform="discord",
+            target=None,
+            has_non_empty_text=True,
+            total_chunks=1,
+            source_scope_key=scope_key,
+            source_generation=1,
+            activity_origin="replay" if source_table == "inbound_events" else "notification",
+            conn=conn,
+        )
+        assert denied_unbind["claim_status"] == "denied", label
+        assert denied_unbind["code"] == "not_allowed", label
+        cur.chat_bindings[("discord", "discord:111111/222222")] = saved_binding
+
+        # 3) Revoke user channel setting -> denied
+        cur.user_settings["user-alice"] = {"apps": {"discord": {"chats": {}}}}
+        denied_setting = await cg_db.authorize_and_claim_delivery(
+            delivery_key=f"fallback:setting-{label}",
+            kind="fallback",
+            user_id="user-alice",
+            thread_id="66666666-6666-4666-8666-666666666666",
+            run_id=f"run-{label}",
+            platform="discord",
+            target=None,
+            has_non_empty_text=True,
+            total_chunks=1,
+            source_scope_key=scope_key,
+            source_generation=1,
+            activity_origin="replay" if source_table == "inbound_events" else "notification",
+            conn=conn,
+        )
+        assert denied_setting["claim_status"] == "denied", label
+        assert denied_setting["code"] == "not_allowed", label
+
+
+@pytest.mark.asyncio
+async def test_deliverables_links_excluded_from_body_dedupe_and_sent_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R8 #5: `deliverables:<run_id>` and `deliverables-links:<run_id>` carrying overflow link
+    lines are excluded from body-text dedupe (`has_non_empty_text`, `has_in_flight_or_unknown_current_text`,
+    fallback guard, and `sent_to_current_count`)."""
+    monkeypatch.setattr(
+        cg_db,
+        "require_channel_platform_capability",
+        create_autospec(cg_db.require_channel_platform_capability, return_value=None),
+    )
+    monkeypatch.setattr(
+        wx_db,
+        "verify_gateway_epoch_in_tx",
+        create_autospec(wx_db.verify_gateway_epoch_in_tx, return_value=None),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "get_user_tier",
+        create_autospec(cg_db.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "get_home_workspace_id",
+        create_autospec(cg_db.get_home_workspace_id, return_value="ws-home"),
+    )
+
+    cur = _LockOrderTrackingCursor()
+    cur.identities[("user-alice", "feishu")] = {
+        "platform_user_id": "ou_alice",
+        "weixin_context_token": None,
+    }
+    cur.inbound_events[("feishu", "om_dm_6files")] = {
+        "platform": "feishu",
+        "message_id": "om_dm_6files",
+        "dalton_user_id": "user-alice",
+        "chat_type": "dm",
+        "chat_address": "feishu:@me",
+        "thread_scope_key": "dm:ou_alice",
+        "thread_id": "77777777-7777-4777-8777-777777777777",
+        "run_id": "run-6files",
+        "workspace_id": "ws-home",
+        "session_generation": 1,
+        "raw_payload": {"platform_user_id": "ou_alice"},
+        "sent_to_current_count": 0,
+    }
+    conn = _FakeConn(cur)
+
+    real_find_src = cg_db._find_current_conversation_source
+    src_row = {
+        **cur.inbound_events[("feishu", "om_dm_6files")],
+        "_source_table": "inbound_events",
+        "target_address": "feishu:@me",
+    }
+    monkeypatch.setattr(
+        cg_db,
+        "_find_current_conversation_source",
+        create_autospec(real_find_src, return_value=src_row),
+    )
+
+    # 1) Claim `deliverables:run-6files` even if caller sent has_non_empty_text=True -> stored FALSE!
+    deliv_claim = await cg_db.authorize_and_claim_delivery(
+        delivery_key="deliverables:run-6files",
+        kind="fallback",
+        user_id="user-alice",
+        thread_id="77777777-7777-4777-8777-777777777777",
+        run_id="run-6files",
+        platform="feishu",
+        target="feishu:@me",
+        has_non_empty_text=True,
+        total_chunks=1,
+        source_scope_key="dm:ou_alice",
+        source_generation=1,
+        activity_origin="conversation",
+        conn=conn,
+    )
+    assert deliv_claim["claim_status"] == "claimed"
+    assert cur.deliveries["deliverables:run-6files"]["has_non_empty_text"] is False
+
+    # 2) Simulate legacy/crashed `deliverables:run-6files` row left in `unknown` even with has_non_empty_text=True
+    cur.deliveries["deliverables:run-6files"]["status"] = "unknown"
+    cur.deliveries["deliverables:run-6files"]["has_non_empty_text"] = True
+
+    prog = await cg_db.update_inbound_progress(
+        platform="feishu",
+        message_id="om_dm_6files",
+        run_id="run-6files",
+        conn=conn,
+    )
+    assert prog["has_unknown_current_text"] is False
+    assert prog["has_in_flight_or_unknown_current_text"] is False
+
+    # 3) Body `fallback:run-6files` is NOT blocked by unknown `deliverables:run-6files`
+    fb_claim = await cg_db.authorize_and_claim_delivery(
+        delivery_key="fallback:run-6files",
+        kind="fallback",
+        user_id="user-alice",
+        thread_id="77777777-7777-4777-8777-777777777777",
+        run_id="run-6files",
+        platform="feishu",
+        target="feishu:@me",
+        has_non_empty_text=True,
+        total_chunks=1,
+        source_scope_key="dm:ou_alice",
+        source_generation=1,
+        activity_origin="replay",
+        conn=conn,
+    )
+    assert fb_claim["claim_status"] == "claimed"
+
+    # 4) Settling `deliverables-links:run-6files` as `sent` MUST NOT increment `sent_to_current_count`
+    cur.deliveries["deliverables-links:run-6files"] = {
+        "delivery_key": "deliverables-links:run-6files",
+        "kind": "fallback",
+        "user_id": "user-alice",
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "source_scope_key": "dm:ou_alice",
+        "source_generation": 1,
+        "activity_origin": "replay",
+        "status": "in_flight",
+        "sent_chunks": 0,
+        "total_chunks": 1,
+        "platform_message_ids": [],
+        "files_status": [],
+        "delivery_attempt": 1,
+        "is_current": True,
+        "has_non_empty_text": True,
+        "run_id": "run-6files",
+    }
+    i7_links = await cg_db._update_delivery_progress_once(
+        delivery_key="deliverables-links:run-6files",
+        sent_chunks=1,
+        total_chunks=1,
+        platform_message_ids=["om_links_1"],
+        status="sent",
+        delivery_attempt=1,
+        conn=conn,
+    )
+    assert i7_links["ok"] is True
+    assert cur.inbound_events[("feishu", "om_dm_6files")]["sent_to_current_count"] == 0

@@ -473,10 +473,18 @@ export interface FeishuMessageSendResult {
   messageId: string;
   chatId: string;
   threadId?: string;
+  repliedInThread?: boolean;
+  usedDirectFallback?: boolean;
 }
 
 export function toFeishuMessageSendResult(
-  response: { data?: { message_id?: string; thread_id?: string } } | undefined,
+  response:
+    | {
+        data?: { message_id?: string; thread_id?: string };
+        repliedInThread?: boolean;
+        usedDirectFallback?: boolean;
+      }
+    | undefined,
   chatId: string,
 ): FeishuMessageSendResult {
   const messageId = response?.data?.message_id?.trim();
@@ -494,6 +502,12 @@ export function toFeishuMessageSendResult(
     messageId,
     chatId,
     ...(threadId ? { threadId } : {}),
+    ...(typeof response?.repliedInThread === "boolean"
+      ? { repliedInThread: response.repliedInThread }
+      : {}),
+    ...(typeof response?.usedDirectFallback === "boolean"
+      ? { usedDirectFallback: response.usedDirectFallback }
+      : {}),
   };
 }
 
@@ -543,12 +557,20 @@ export async function sendReplyOrFallbackDirect(
     target: string;
     receiveIdType: "chat_id" | "open_id" | "user_id";
   },
-): Promise<{ data?: { message_id?: string; thread_id?: string }; code?: number; msg?: string }> {
+): Promise<{
+  data?: { message_id?: string; thread_id?: string };
+  code?: number;
+  msg?: string;
+  repliedInThread?: boolean;
+  usedDirectFallback?: boolean;
+}> {
   const allowDirectFallback = params.allowDirectFallback !== false;
   const sendDirect = async (): Promise<{
     data?: { message_id?: string; thread_id?: string };
     code?: number;
     msg?: string;
+    repliedInThread: boolean;
+    usedDirectFallback: boolean;
   }> => {
     try {
       const response = (await client.im.message.create({
@@ -565,7 +587,11 @@ export async function sendReplyOrFallbackDirect(
           "Feishu send failed",
         );
       }
-      return response;
+      return {
+        ...response,
+        repliedInThread: false,
+        usedDirectFallback: true,
+      };
     } catch (err) {
       throw classifyFeishuDeliveryError(err, "Feishu send failed");
     }
@@ -634,7 +660,11 @@ export async function sendReplyOrFallbackDirect(
       );
     }
 
-    return replyResponse;
+    return {
+      ...replyResponse,
+      repliedInThread: Boolean(params.replyInThread),
+      usedDirectFallback: false,
+    };
   }
 
   if (allowDirectFallback) {

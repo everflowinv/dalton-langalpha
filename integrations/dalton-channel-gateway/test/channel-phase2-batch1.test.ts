@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import type { BackendClient, I6AuthorizeAndClaimRequest, I6AuthorizeAndClaimResponse, I7DeliveriesProgressRequest } from "../src/backend-client.js";
+import { AgentRoutesHandler } from "../src/agent-routes.js";
+import { BackendHttpError, type BackendClient, type I6AuthorizeAndClaimRequest, type I6AuthorizeAndClaimResponse, type I7DeliveriesProgressRequest } from "../src/backend-client.js";
 import type { ChannelAdapter, SendFileOptions, SendFileResult, SendTextChunkOptions, SendTextChunkResult } from "../src/channels/adapter.js";
 import { DiscordChannelAdapter } from "../src/channels/discord/index.js";
 import { DiscordError } from "../src/channels/discord/rest.js";
@@ -827,6 +828,374 @@ describe("Channel Phase 2 Batch 1 — Group Deep Links & DM Deliverables", () =>
     );
     expect(sentText).toContain(
       `${WEB_BASE}/chat/ws-nvda?file=results%2Freport.pdf`,
+    );
+  });
+
+  it("keeps Feishu multi-chunk topic replies inside thread when chunk 0 succeeds without thread_id, and stops as `unknown` if location cannot be confirmed", async () => {
+    // 1) Chunk 0 succeeds via `im.message.reply({ reply_in_thread: true })` without returning `thread_id`,
+    //    and `im.message.get` also omits `thread_id` -> chunk 1 MUST still reply in thread anchored on
+    //    chunk 0's confirmed messageId (NEVER falling back to `im.message.create` in main group).
+    const createMock = vi.fn(async () => ({ code: 0, data: { message_id: "om_leaked_main" } }));
+    const replyCalls: Array<{ message_id: string; reply_in_thread?: boolean }> = [];
+    let replySeq = 0;
+    const replyMock = vi.fn(
+      async (req: { path: { message_id: string }; data: { reply_in_thread?: boolean } }) => {
+        replySeq += 1;
+        replyCalls.push({
+          message_id: req.path.message_id,
+          reply_in_thread: req.data.reply_in_thread,
+        });
+        return {
+          code: 0,
+          data: {
+            message_id: `om_topic_reply_${replySeq}`,
+            // Chunk 0 omits thread_id; chunk 1 eventually returns it
+            ...(replySeq === 2 ? { thread_id: "omt_late_resolved_1" } : {}),
+          },
+        };
+      },
+    );
+    const getMock = vi.fn(async () => ({
+      code: 0,
+      data: { items: [{ message_id: "om_topic_reply_1", chat_id: "oc_grp_1", msg_type: "post", body: { content: "{}" } }] },
+    }));
+    const feishuAdapter = new FeishuChannelAdapter({
+      appId: "cli_test",
+      appSecret: "sec_test",
+      botOpenId: "ou_bot",
+      clientFactory: () =>
+        ({
+          im: {
+            message: { create: createMock, reply: replyMock, get: getMock },
+          },
+        }) as unknown as ReturnType<
+          NonNullable<NonNullable<ConstructorParameters<typeof FeishuChannelAdapter>[0]>["clientFactory"]>
+        >,
+    });
+    vi.spyOn(feishuAdapter, "isConnected").mockReturnValue(true);
+    vi.spyOn(feishuAdapter, "splitTextChunks").mockImplementation((text) => text.split("||"));
+
+    const progressCalls: I7DeliveriesProgressRequest[] = [];
+    const svc = new DeliveryService({
+      backend: makeMockBackend({
+        authorizeAndClaimDelivery: vi.fn(async () => ({
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:oc_grp_1",
+          recipient_id: "oc_grp_1",
+          is_current: true,
+          delivery_attempt: 1,
+          thread_scope_key: "chat:oc_grp_1:topic:om_root_1",
+          root_message_id: "om_root_1",
+          external_topic_id: null,
+          topic_canonical_scope_key: "chat:oc_grp_1:topic:om_root_1",
+          topic_initiator_platform_user_id: "ou_alice",
+        })),
+        updateDeliveryProgress: vi.fn(async (req: I7DeliveriesProgressRequest) => {
+          progressCalls.push(req);
+          return { ok: true, delivery_key: req.delivery_key, status: req.status ?? "in_flight", sent_to_current_count: 1 };
+        }),
+      }),
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuAdapter]]),
+      webBaseUrl: WEB_BASE,
+    });
+
+    const res = await svc.executeDelivery({
+      deliveryKey: "fallback:run-fs-no-tid",
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-fs-no-tid",
+      platform: "feishu",
+      target: "feishu:oc_grp_1",
+      text: "第一片结论||第二片结论",
+    });
+
+    expect(res.status).toBe("sent");
+    expect(createMock).not.toHaveBeenCalled();
+    expect(replyCalls).toEqual([
+      { message_id: "om_root_1", reply_in_thread: true },
+      { message_id: "om_topic_reply_1", reply_in_thread: true },
+    ]);
+    expect(
+      progressCalls.some((p) => p.bot_topic_registration?.external_topic_id === "omt_late_resolved_1"),
+    ).toBe(true);
+
+    // 2) When chunk 0's location cannot be confirmed (neither externalTopicId, repliedInThread, nor usedDirectFallback),
+    //    stop immediately and settle as `unknown` without sending chunk 1 to the main group.
+    const unconfirmedFeishu = makeStubAdapter("feishu", {
+      splitTextChunks: (text: string) => text.split("||"),
+      sendTextChunk: vi.fn(async (opts: SendTextChunkOptions): Promise<SendTextChunkResult> => {
+        unconfirmedFeishu.sentTexts.push(opts);
+        return { messageId: "om_mystery_1", resolvedAddress: opts.targetAddress };
+      }),
+    });
+    const svcUnconfirmed = new DeliveryService({
+      backend: makeMockBackend({
+        authorizeAndClaimDelivery: vi.fn(async () => ({
+          claim_status: "claimed" as const,
+          platform: "feishu",
+          target_address: "feishu:oc_grp_1",
+          recipient_id: "oc_grp_1",
+          is_current: true,
+          delivery_attempt: 1,
+          thread_scope_key: "chat:oc_grp_1:topic:om_root_1",
+          root_message_id: "om_root_1",
+          external_topic_id: null,
+          topic_canonical_scope_key: "chat:oc_grp_1:topic:om_root_1",
+          topic_initiator_platform_user_id: "ou_alice",
+        })),
+      }),
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", unconfirmedFeishu]]),
+      webBaseUrl: WEB_BASE,
+    });
+    const resUnconfirmed = await svcUnconfirmed.executeDelivery({
+      deliveryKey: "fallback:run-fs-unconfirmed",
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-fs-unconfirmed",
+      platform: "feishu",
+      target: "feishu:oc_grp_1",
+      text: "第一片||第二片绝不漏主群",
+    });
+    expect(resUnconfirmed.status).toBe("unknown");
+    expect(unconfirmedFeishu.sentTexts).toHaveLength(1);
+  });
+
+  it("terminates multi-chunk Discord delivery after a single parent-channel web notice on 10008 (deleted starter message)", async () => {
+    const postCalls: Array<{ path: string; body: Record<string, unknown> }> = [];
+    const rest = {
+      get: vi.fn(async (path: string) => {
+        if (path === "/channels/222") return { id: "222", type: 0, guild_id: "111" };
+        if (path === "/channels/999") throw new DiscordError(404, { code: 10003 }, "Not found");
+        return { threads: [], members: [] };
+      }),
+      post: vi.fn(async (path: string, body: Record<string, unknown>) => {
+        postCalls.push({ path, body });
+        if (path.endsWith("/messages/999/threads")) {
+          throw new DiscordError(404, { code: 10008 }, "Unknown Message");
+        }
+        return { id: `msg_parent_${postCalls.length}` };
+      }),
+      patch: vi.fn(async () => ({})),
+    };
+    const discordAdapter = new DiscordChannelAdapter({
+      botToken: "tok",
+      botUserId: "bot_1",
+      rest: rest as unknown as NonNullable<ConstructorParameters<typeof DiscordChannelAdapter>[0]>["rest"],
+    });
+    vi.spyOn(discordAdapter, "isConnected").mockReturnValue(true);
+    vi.spyOn(discordAdapter, "splitTextChunks").mockImplementation((text) => text.split("||"));
+
+    const progressCalls: I7DeliveriesProgressRequest[] = [];
+    const svc = new DeliveryService({
+      backend: makeMockBackend({
+        authorizeAndClaimDelivery: vi.fn(async () => ({
+          claim_status: "claimed" as const,
+          platform: "discord",
+          target_address: "discord:111/222",
+          recipient_id: "222",
+          is_current: true,
+          delivery_attempt: 1,
+          thread_scope_key: "chat:111/222:topic:999",
+          root_message_id: "999",
+          external_topic_id: null,
+          topic_canonical_scope_key: "chat:111/222:topic:999",
+          topic_initiator_platform_user_id: "user_alice_disc",
+        })),
+        updateDeliveryProgress: vi.fn(async (req: I7DeliveriesProgressRequest) => {
+          progressCalls.push(req);
+          return { ok: true, delivery_key: req.delivery_key, status: req.status ?? "in_flight", sent_to_current_count: 1 };
+        }),
+      }),
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["discord", discordAdapter]]),
+      webBaseUrl: WEB_BASE,
+    });
+
+    const res = await svc.executeDelivery({
+      deliveryKey: "fallback:run-disc-10008-long",
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      runId: "run-disc-10008-long",
+      platform: "discord",
+      target: "discord:111/222",
+      text: "第一片长回答内容||第二片绝不能发到父频道||第三片也绝不能发到父频道",
+      replyToMessageId: "999",
+    });
+
+    expect(res.status).toBe("sent");
+    const msgPosts = postCalls.filter((c) => c.path === "/channels/222/messages");
+    expect(msgPosts).toHaveLength(1);
+    expect(String(msgPosts[0]!.body.content)).toContain(`${WEB_BASE}/chat/t/${THREAD_ID}`);
+    expect(String(msgPosts[0]!.body.content)).not.toContain("第二片");
+    const finalProg = progressCalls[progressCalls.length - 1]!;
+    expect(finalProg.status).toBe("sent");
+    expect(finalProg.sent_chunks).toBe(1);
+    expect(finalProg.total_chunks).toBe(1);
+  });
+
+  it("deduplicates DM deliverables by (workspace_id, normalized_path) without colliding across workspaces", async () => {
+    const feishu = makeStubAdapter("feishu");
+    const backend = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async () => ({
+        claim_status: "claimed" as const,
+        platform: "feishu",
+        target_address: "feishu:@me",
+        recipient_id: "ou_alice",
+        dm_recipient_platform_user_id: "ou_alice",
+        is_current: true,
+        delivery_attempt: 1,
+        workspace_id: "ws-home",
+        home_workspace_id: "ws-home",
+        prior_run_files: [
+          // Chief of Staff explicitly sent ws-a's `results/report.pdf` earlier in the same turn
+          { workspace_id: "ws-a", path: "results/report.pdf", status: "sent" },
+          // Same-workspace file with unnormalized path should still dedupe
+          { workspace_id: "ws-home", path: "./results//already-home.pdf", status: "sent" },
+          // Legacy record missing workspace_id matches current session workspace only
+          { workspace_id: null, path: "results/legacy-home.pdf", status: "sent" },
+        ],
+      })),
+    });
+
+    const svc = new DeliveryService({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]),
+      webBaseUrl: WEB_BASE,
+    });
+
+    const res = await svc.executeDelivery({
+      deliveryKey: "deliverables:run-ws-dedupe",
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      workspaceId: "ws-home",
+      runId: "run-ws-dedupe",
+      platform: "feishu",
+      target: "feishu:@me",
+      text: "",
+      files: [
+        { path: "results/report.pdf", workspace_id: "ws-home" },
+        { path: "results/already-home.pdf", workspace_id: "ws-home" },
+        { path: "results/legacy-home.pdf", workspace_id: "ws-home" },
+        { path: "results/legacy-home.pdf", workspace_id: "ws-b" },
+      ],
+      downloadMode: "deliverable",
+      linkFallbackOnDeliverableMismatch: true,
+    });
+
+    expect(res.status).toBe("sent");
+    // Home's `results/report.pdf` MUST NOT be skipped because ws-a sent a same-named file;
+    // ws-b's `results/legacy-home.pdf` MUST NOT match a legacy null-workspace record belonging to Home.
+    expect(feishu.sentFiles.map((f) => f.path)).toEqual([
+      "results/report.pdf",
+      "results/legacy-home.pdf",
+    ]);
+  });
+
+  it("converts explicit DM `send_message(files=['results/report.html'])` into web login deep links with zero download and zero upload", async () => {
+    const feishu = makeStubAdapter("feishu");
+    const downloadWsMock = vi.fn();
+    const downloadDelivMock = vi.fn();
+    const backend = makeMockBackend({
+      authorizeAndClaimDelivery: vi.fn(async () => ({
+        claim_status: "claimed" as const,
+        platform: "feishu",
+        target_address: "feishu:@me",
+        recipient_id: "ou_alice",
+        dm_recipient_platform_user_id: "ou_alice",
+        is_current: true,
+        delivery_attempt: 1,
+        workspace_id: "ws-1",
+        home_workspace_id: "ws-1",
+      })),
+      downloadWorkspaceFile: downloadWsMock,
+      downloadVerifiedDeliverable: downloadDelivMock,
+    });
+    const adapters = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]);
+    const deliveryService = new DeliveryService({
+      backend,
+      adapters,
+      webBaseUrl: WEB_BASE,
+    });
+    const routes = new AgentRoutesHandler({
+      backend,
+      adapters,
+      deliveryService,
+      webBaseUrl: WEB_BASE,
+    });
+
+    const resp = await routes.handleAgentSend("user-alice", {
+      thread_id: THREAD_ID,
+      workspace_id: "ws-1",
+      run_id: "run-dm-html",
+      tool_call_id: "tc-html-1",
+      turn_platform: "feishu",
+      target: "feishu:@me",
+      text: "请查看交互式 HTML 报告",
+      files: [
+        { path: "results/report.html", workspace_id: "ws-1" },
+        { path: "results/chart.HTM", workspace_id: "ws-1" },
+      ],
+    });
+
+    expect(resp.status).toBe(200);
+    expect(resp.data.status).toBe("sent");
+    expect(resp.data.files).toEqual([
+      { path: "results/report.html", status: "linked", reason: "html_file_deep_link" },
+      { path: "results/chart.HTM", status: "linked", reason: "html_file_deep_link" },
+    ]);
+    expect(downloadWsMock).not.toHaveBeenCalled();
+    expect(downloadDelivMock).not.toHaveBeenCalled();
+    expect(feishu.sentFiles).toHaveLength(0);
+    expect(feishu.sentTexts).toHaveLength(1);
+    expect(feishu.sentTexts[0]!.text).toContain(
+      `${WEB_BASE}/chat/t/${THREAD_ID}?file=results%2Freport.html`,
+    );
+    expect(feishu.sentTexts[0]!.text).toContain(
+      `${WEB_BASE}/chat/t/${THREAD_ID}?file=results%2Fchart.HTM`,
+    );
+  });
+
+  it("falls back to web login deep link when deliverable download returns 503 `deliverable_sandbox_unavailable`", async () => {
+    const feishu = makeStubAdapter("feishu");
+    const backend = makeMockBackend({
+      downloadVerifiedDeliverable: vi.fn(async () => {
+        throw new BackendHttpError(
+          "Workspace sandbox is stopping",
+          503,
+          { detail: { code: "deliverable_sandbox_unavailable", message: "stopping" } },
+        );
+      }),
+    });
+    const svc = new DeliveryService({
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]),
+      webBaseUrl: WEB_BASE,
+    });
+
+    const res = await svc.executeDelivery({
+      deliveryKey: "deliverables:run-stopping-503",
+      kind: "fallback",
+      userId: "user-alice",
+      threadId: THREAD_ID,
+      workspaceId: "ws-1",
+      runId: "run-stopping-503",
+      platform: "feishu",
+      target: "feishu:@me",
+      text: "",
+      files: [{ path: "results/report.pdf", workspace_id: "ws-1" }],
+      downloadMode: "deliverable",
+      linkFallbackOnDeliverableMismatch: true,
+    });
+
+    expect(res.status).toBe("sent");
+    expect(feishu.sentFiles).toHaveLength(0);
+    expect(feishu.sentTexts).toHaveLength(1);
+    expect(feishu.sentTexts[0]!.text).toContain(
+      `${WEB_BASE}/chat/t/${THREAD_ID}?file=results%2Freport.pdf`,
     );
   });
 });

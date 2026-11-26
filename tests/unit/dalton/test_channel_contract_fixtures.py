@@ -26,10 +26,14 @@ from src.dalton.app import channels_router as ch_router_mod
 from src.dalton.capabilities import CapabilityId
 from src.dalton.database import channel_gateway as cg_db
 from src.dalton.database import weixin_multi_account as wx_db
+from src.dalton.notify import dispatch as notify_dispatch
 from src.ptc_agent.core.sandbox.file_version import FileStamp
 from src.server.app.threads import messaging as threads_messaging
 from src.server.database.conversation.replay_rows import ThreadRows
+from src.server.database.runs import outbox as runs_outbox_db
 from src.server.services.history.replay import ReplayPage
+from src.server.services.runs import finalization as runs_finalization
+from src.server.services.runs import stream_writer as runs_stream_writer
 from src.server.services.workspace_file_containment import ContainedFile
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -67,14 +71,25 @@ class _ContractCursor:
 
         if "SELECT EXISTS (" in norm and "FROM DALTON_CHANNEL_DELIVERIES" in norm:
             run_id = str(params[0])
-            has_unk = any(
+            exclude_deliverables = "NOT LIKE 'DELIVERABLES:" in norm
+            target_status = "in_flight" if "STATUS = 'IN_FLIGHT'" in norm else "unknown"
+            matched = any(
                 d.get("run_id") == run_id
                 and bool(d.get("is_current"))
                 and bool(d.get("has_non_empty_text"))
-                and str(d.get("status")) == "unknown"
+                and str(d.get("status")) == target_status
+                and (
+                    not exclude_deliverables
+                    or not str(d.get("delivery_key") or "").startswith(
+                        ("deliverables:", "deliverables-links:")
+                    )
+                )
                 for d in self.deliveries.values()
             )
-            self._one = {"has_unknown_text": has_unk}
+            if "AS IN_FLIGHT" in norm:
+                self._one = {"in_flight": matched}
+            else:
+                self._one = {"has_unknown_text": matched}
             return
 
         if "FROM DALTON_CHANNEL_BOT_TOPICS" in norm:
@@ -535,7 +550,101 @@ def generate_all_contract_fixtures(
             }
         )
     )
-    recorded_deliverables = recorder.snapshot()
+
+    # Generate `run_end` payload through REAL turn finalization (`assemble_finalize_artifacts`)
+    # and REAL SSE stream writer (`append_run_end_event`), capturing the exact wire SSE frame.
+    monkeypatch.setattr(
+        cd,
+        "is_run_outbound_blocked",
+        create_autospec(cd.is_run_outbound_blocked, return_value=False),
+    )
+    monkeypatch.setattr(
+        runs_outbox_db,
+        "list_delivered_steers",
+        create_autospec(runs_outbox_db.list_delivered_steers, return_value=[]),
+    )
+    captured_run_end_frames: list[str] = []
+
+    class _FakeStreamPipeline:
+        async def __aenter__(self) -> "_FakeStreamPipeline":
+            return self
+
+        async def __aexit__(self, *_args: Any) -> bool:
+            return False
+
+        def expire(self, _key: str, _ttl: int) -> None:
+            return None
+
+        def xadd(
+            self,
+            _key: str,
+            fields: dict[bytes, bytes],
+            **_kwargs: Any,
+        ) -> None:
+            raw_ev = fields.get(b"event")
+            if isinstance(raw_ev, (bytes, bytearray)):
+                captured_run_end_frames.append(bytes(raw_ev).decode("utf-8"))
+
+        async def execute(self) -> list[Any]:
+            return []
+
+    class _FakeStreamRedis:
+        def pipeline(self, *, transaction: bool = False) -> _FakeStreamPipeline:
+            _ = transaction
+            return _FakeStreamPipeline()
+
+        async def set(
+            self, _key: str, _value: str, *, nx: bool = False, ex: int | None = None
+        ) -> bool:
+            _ = (nx, ex)
+            return True
+
+    class _FakeCacheClient:
+        enabled = True
+        client = _FakeStreamRedis()
+
+    monkeypatch.setattr(
+        runs_stream_writer,
+        "get_cache_client",
+        create_autospec(runs_stream_writer.get_cache_client, return_value=_FakeCacheClient()),
+    )
+
+    finalize_metadata: dict[str, Any] = {
+        "deliverable_recorder": recorder,
+        "user_id": "user-alice",
+        "workspace_id": "ws-contract-1",
+    }
+
+    async def _finalize_and_emit_run_end() -> dict[str, Any]:
+        outcome = await runs_finalization.assemble_finalize_artifacts(
+            ("11111111-1111-4111-8111-111111111111", "run-contract-1"),
+            metadata=finalize_metadata,
+            status="completed",
+            phase="completion",
+            interrupt_reason=None,
+            pause_message=None,
+            error=None,
+            handler=None,
+            cancelled_by_user=False,
+            workspace_id="ws-contract-1",
+            recorded_as="user-alice",
+        )
+        await runs_stream_writer.append_run_end_event(
+            thread_id="11111111-1111-4111-8111-111111111111",
+            run_id="run-contract-1",
+            outcome=outcome.status,
+            turn_deliverables=finalize_metadata.get("persisted_turn_deliverables"),
+            redis_event_ttl=3600,
+            max_stored_messages=100,
+        )
+        return outcome.metadata
+
+    persisted_response_metadata = asyncio.run(_finalize_and_emit_run_end())
+    emitted_sse = _parse_sse_events("".join(captured_run_end_frames))
+    run_end_payloads = [data for ev, data in emitted_sse if ev == "run_end"]
+    assert len(run_end_payloads) == 1
+    run_end_payload = run_end_payloads[0]
+    assert "turn_deliverables" in run_end_payload
 
     # Patch replay route dependencies to capture real `replay_done` SSE JSON from `messaging.py`
     replay_rows = ThreadRows(
@@ -552,7 +661,7 @@ def generate_all_contract_fixtures(
                 "conversation_response_id": "run-contract-1",
                 "turn_index": 1,
                 "status": "completed",
-                "metadata": {"turn_deliverables": recorded_deliverables},
+                "metadata": persisted_response_metadata,
             }
         },
         usages=[],
@@ -743,7 +852,7 @@ def generate_all_contract_fixtures(
         "response": {"status": r7.status_code, "body": r7.json()},
     }
 
-    # 8. Real SSE `run_end` + real `/api/v1/threads/{id}/messages/replay` `replay_done`
+    # 8. Real SSE `run_end` (from `finalization` + `stream_writer`) + real `/messages/replay` `replay_done`
     r8 = client.get(
         "/api/v1/threads/11111111-1111-4111-8111-111111111111/messages/replay",
         headers={"X-User-Id": "user-alice"},
@@ -755,12 +864,6 @@ def generate_all_contract_fixtures(
     replay_done_payload = replay_done_payloads[0]
     assert "turn_deliverables_by_run" in replay_done_payload
 
-    run_end_payload = {
-        "thread_id": "11111111-1111-4111-8111-111111111111",
-        "run_id": "run-contract-1",
-        "outcome": "completed",
-        "turn_deliverables": recorded_deliverables,
-    }
     fixtures["deliverables_sse_events.json"] = {
         "run_end": run_end_payload,
         "replay_done": replay_done_payload,
@@ -860,3 +963,19 @@ def test_topics_lookup_rejects_legacy_purpose_field_without_match_mode(
         headers={"X-Service-Token": SERVICE_TOKEN},
     )
     assert resp.status_code == 422
+
+
+def test_shared_workspace_link_rewrite_cases_match_python() -> None:
+    """Shared link-rewrite fixture (spaced filenames & multiline Markdown reference definitions)
+    matches Python `notify.dispatch.rewrite_workspace_links_for_external` byte-for-byte."""
+    fixture_path = FIXTURES_DIR / "workspace_link_rewrite_cases.json"
+    data = json.loads(fixture_path.read_text(encoding="utf-8"))
+    public_base = data["public_base"]
+    thread_id = data["thread_id"]
+    for case in data["cases"]:
+        actual = notify_dispatch.rewrite_workspace_links_for_external(
+            case["input"],
+            public_base=public_base,
+            thread_id=thread_id,
+        )
+        assert actual == case["expected"], f"Case {case['name']} mismatch: {actual!r}"

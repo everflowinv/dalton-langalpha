@@ -2814,6 +2814,10 @@ async def _register_and_resolve_inbound_once(
     )
     if cleaned_puid:
         payload_dict["platform_user_id"] = cleaned_puid
+    if cleaned_ext_topic_id:
+        payload_dict["external_topic_id"] = cleaned_ext_topic_id
+    if cleaned_root_msg_id:
+        payload_dict["root_message_id"] = cleaned_root_msg_id
 
     is_weixin_group = cleaned_platform == "weixin" and (
         cleaned_chat_type == "group"
@@ -9274,9 +9278,12 @@ async def authorize_and_claim_delivery(
 
                 # Guard final text fallback (`fallback:<run_id>`) when an `unknown` current-turn text delivery exists (§1.3.3).
                 # Independent DM deliverable keys (`deliverables:` / `deliverables-links:`) deduplicate via `prior_run_files`
-                # and are NOT blocked by the text-fallback guard.
+                # and are excluded from body-text deduplication.
                 is_deliverables_key = cleaned_key.startswith(
                     ("deliverables:", "deliverables-links:")
+                )
+                effective_has_non_empty_text = (
+                    False if is_deliverables_key else bool(has_non_empty_text)
                 )
                 if (
                     cleaned_key.startswith("fallback:")
@@ -9295,6 +9302,8 @@ async def authorize_and_claim_delivery(
                                 WHERE run_id = %s
                                   AND is_current = TRUE
                                   AND has_non_empty_text = TRUE
+                                  AND delivery_key NOT LIKE 'deliverables:%%'
+                                  AND delivery_key NOT LIKE 'deliverables-links:%%'
                                   AND status = 'unknown'
                             ) AS has_unknown_text
                             """,
@@ -9697,7 +9706,7 @@ async def authorize_and_claim_delivery(
                                     norm_tid,
                                     cleaned_rid,
                                     eff_exec_id,
-                                    bool(has_non_empty_text),
+                                    effective_has_non_empty_text,
                                     int(total_chunks or 0),
                                     "No verifiable Weixin conversation source found for this delivery.",
                                     eff_source_scope,
@@ -10376,7 +10385,7 @@ async def authorize_and_claim_delivery(
                                 cleaned_rid,
                                 eff_exec_id,
                                 is_current,
-                                bool(has_non_empty_text),
+                                effective_has_non_empty_text,
                                 resolved_target_address or "weixin:@me",
                                 int(total_chunks or 0),
                                 err_code,
@@ -10817,16 +10826,74 @@ async def authorize_and_claim_delivery(
                                             "first_reply_message_id"
                                         )
 
+                    # When the topic is not yet confirmed (e.g. another member `@bot` inside a
+                    # bot-created topic before the initiator's I-7 confirms), preserve the
+                    # external topic ID from the verified inbound event so outbound stays inside
+                    # the topic instead of leaking into the main group.
+                    if (
+                        resp_external_topic_id is None
+                        and is_current
+                        and verified_source_row is not None
+                        and str(verified_source_row.get("_source_table") or "")
+                        == "inbound_events"
+                    ):
+                        src_raw = verified_source_row.get("raw_payload")
+                        inbound_ext_tid: str | None = None
+                        inbound_root_mid: str | None = None
+                        if isinstance(src_raw, dict):
+                            inbound_ext_tid = (
+                                str(src_raw.get("external_topic_id") or "").strip()
+                                or None
+                            )
+                            inbound_root_mid = (
+                                str(src_raw.get("root_message_id") or "").strip()
+                                or None
+                            )
+                            if not inbound_ext_tid and resolved_platform == "feishu":
+                                raw_msg = src_raw.get("message")
+                                if isinstance(raw_msg, dict):
+                                    inbound_ext_tid = (
+                                        str(raw_msg.get("thread_id") or "").strip()
+                                        or None
+                                    )
+                        if not inbound_ext_tid:
+                            inbound_ext_tid = _parse_thread_id_from_scope_key(
+                                verified_source_row.get("thread_scope_key")
+                            )
+                        if inbound_ext_tid:
+                            resp_external_topic_id = inbound_ext_tid
+                            if inbound_root_mid:
+                                resp_root_message_id = inbound_root_mid
+
                     # Re-verify Discord parent channel binding & user channel settings before
-                    # authorizing current-conversation delivery to a registered thread/topic.
+                    # authorizing ANY current-conversation delivery targeting a Discord subthread
+                    # (registered topics, pre-upgrade `:thread:` sessions without topic rows,
+                    # pre-confirmation `:thread:`/`:topic:` sessions, `:thread:` addresses, or
+                    # stored `confirmed_thread_address`).
+                    req_scope_thread_tid = _parse_thread_id_from_scope_key(
+                        eff_source_scope
+                    )
+                    req_scope_root_mid = _parse_topic_root_from_scope_key(
+                        eff_source_scope
+                    )
+                    has_confirmed_thread_addr = bool(
+                        existing
+                        and str(existing.get("confirmed_thread_address") or "").strip()
+                    )
+                    is_discord_subthread_delivery = (
+                        resp_external_topic_id is not None
+                        or scope_thread_tid is not None
+                        or req_scope_thread_tid is not None
+                        or scope_root_mid is not None
+                        or req_scope_root_mid is not None
+                        or has_confirmed_thread_addr
+                        or _extract_discord_parent_address(resolved_target_address)
+                        != resolved_target_address
+                    )
                     if (
                         resolved_platform == "discord"
                         and is_current
-                        and (
-                            resp_external_topic_id is not None
-                            or _extract_discord_parent_address(resolved_target_address)
-                            != resolved_target_address
-                        )
+                        and is_discord_subthread_delivery
                     ):
                         grp_ok, grp_err, _ = await _verify_group_target_deliverable(
                             cur,
@@ -10941,7 +11008,7 @@ async def authorize_and_claim_delivery(
                         cleaned_rid,
                         eff_exec_id,
                         is_current,
-                        bool(has_non_empty_text),
+                        effective_has_non_empty_text,
                         resolved_platform,
                         resolved_target_address,
                         int(total_chunks or 0),
@@ -11421,6 +11488,7 @@ async def _update_delivery_progress_once(
                 if (
                     bool(row.get("is_current"))
                     and bool(row.get("has_non_empty_text"))
+                    and not cleaned_key.startswith(("deliverables:", "deliverables-links:"))
                     and new_status in ("sent", "partial")
                     and prev_status not in ("sent", "partial")
                     and run_id_val
@@ -13237,6 +13305,8 @@ async def _update_inbound_progress_once(
                             WHERE run_id = %s
                               AND is_current = TRUE
                               AND has_non_empty_text = TRUE
+                              AND delivery_key NOT LIKE 'deliverables:%%'
+                              AND delivery_key NOT LIKE 'deliverables-links:%%'
                               AND status = 'in_flight'
                         ) AS in_flight
                         """,
@@ -13250,6 +13320,8 @@ async def _update_inbound_progress_once(
                             WHERE run_id = %s
                               AND is_current = TRUE
                               AND has_non_empty_text = TRUE
+                              AND delivery_key NOT LIKE 'deliverables:%%'
+                              AND delivery_key NOT LIKE 'deliverables-links:%%'
                               AND status = 'unknown'
                         ) AS has_unknown_text
                         """,

@@ -104,6 +104,7 @@ export interface SendMessageDiscordResult {
   resolvedAddress: string;
   nonce: string;
   externalTopicId?: string | null;
+  terminalFallbackNotice?: boolean;
 }
 
 /**
@@ -317,6 +318,7 @@ export async function sendMessageDiscord(
     resolvedAddress,
     nonce,
     ...(resolvedExternalTopicId ? { externalTopicId: resolvedExternalTopicId } : {}),
+    ...(fallbackDeletedMessageNotice ? { terminalFallbackNotice: true } : {}),
   };
 }
 

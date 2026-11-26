@@ -1060,7 +1060,12 @@ export class FeishuChannelAdapter implements ChannelAdapter {
 
     let externalTopicId: string | null =
       res.threadId ?? options.externalTopicId ?? null;
-    if (options.replyInThread && !externalTopicId && res.messageId) {
+    if (
+      options.replyInThread &&
+      res.repliedInThread &&
+      !externalTopicId &&
+      res.messageId
+    ) {
       try {
         const fetched = await getMessageFeishu(client, {
           messageId: res.messageId,
@@ -1079,6 +1084,12 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       messageId: res.messageId,
       resolvedAddress: options.targetAddress,
       ...(externalTopicId ? { externalTopicId } : {}),
+      ...(typeof res.repliedInThread === "boolean"
+        ? { repliedInThread: res.repliedInThread }
+        : {}),
+      ...(typeof res.usedDirectFallback === "boolean"
+        ? { usedDirectFallback: res.usedDirectFallback }
+        : {}),
     };
   }
 

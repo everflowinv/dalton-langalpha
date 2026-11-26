@@ -109,6 +109,12 @@ export interface SendTextChunkResult {
   resolvedAddress?: string;
   /** Platform topic/thread ID discovered or created when sending this chunk (e.g. Feishu `omt_xxx`, Discord thread channel ID). */
   externalTopicId?: string | null;
+  /** Feishu: true when the chunk was confirmed sent via `im.message.reply` with `reply_in_thread: true`. */
+  repliedInThread?: boolean;
+  /** Feishu: true when topic/reply creation explicitly fell back to main-chat `im.message.create`. */
+  usedDirectFallback?: boolean;
+  /** Discord: true when starter message was deleted (10008) and the single parent-channel web notice completes the delivery. */
+  terminalFallbackNotice?: boolean;
 }
 
 export interface SendFileOptions {

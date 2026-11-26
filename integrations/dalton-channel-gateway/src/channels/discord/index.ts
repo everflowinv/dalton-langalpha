@@ -1277,6 +1277,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       messageId: res.messageId,
       resolvedAddress: res.resolvedAddress,
       ...(res.externalTopicId ? { externalTopicId: res.externalTopicId } : {}),
+      ...(res.terminalFallbackNotice ? { terminalFallbackNotice: true } : {}),
     };
   }
 

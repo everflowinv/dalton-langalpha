@@ -18,6 +18,7 @@ import { FeishuChannelAdapter } from "../src/channels/feishu/monitor.js";
 import { DeliveryService } from "../src/delivery-service.js";
 import { StaleGatewayEpochError } from "../src/gateway-lease.js";
 import { ChannelGatewayOrchestrator } from "../src/orchestrator.js";
+import { rewriteSandboxLinks } from "../src/shared/sandbox-links.js";
 import type { ChannelPlatform, InboundChannelEvent } from "../src/types.js";
 
 const FIXTURES_DIR = resolve(
@@ -854,5 +855,280 @@ describe("Shared Backend <-> Gateway Contract Tests (real FastAPI fixtures)", ()
     expect(res.code).toBe("not_allowed");
     expect(weixin.sentFiles).toHaveLength(0);
     expect(weixin.sentTexts).toHaveLength(0);
+  });
+
+  it("recovers 6-file DM deliverables via real orchestrator replay when `deliverables:${runId}` is `unknown` after sending overflow link: keeps `unknown`, zero binary re-upload, login links sent once", async () => {
+    const threadId = "11111111-1111-4111-8111-111111111111";
+    const runId = "run-6files-replay";
+    const sixDeliverables = [1, 2, 3, 4, 5, 6].map((n) => ({
+      workspace_id: "ws-contract-1",
+      path: `results/file_${n}.pdf`,
+      sha256: `sha_${n}`,
+      size: 1024,
+      stamp: { size: 1024, mtime: "1700000000.0", ctime: "1700000000.0", inode: String(100 + n) },
+      stamp_settled: true,
+    }));
+
+    // Simulate backend state after crash:
+    // - `deliverables:run-6files-replay` already sent chunk 0 (overflow link for file_6.pdf)
+    //   and entered `unknown` before binary attachments were confirmed.
+    // - Its link chunk is excluded from body-text dedupe (`has_non_empty_text: false`),
+    //   so `updateInboundProgress` reports `has_in_flight_or_unknown_current_text: false`.
+    const deliveriesDb = new Map<
+      string,
+      { status: string; sent_chunks: number; has_non_empty_text: boolean; is_current: boolean }
+    >([
+      [
+        `deliverables:${runId}`,
+        {
+          status: "unknown",
+          sent_chunks: 1,
+          has_non_empty_text: false,
+          is_current: true,
+        },
+      ],
+    ]);
+
+    const feishu = makeStubAdapter("feishu");
+    const claimedKeys: string[] = [];
+    const progressWrites: Array<{ key: string; status?: string }> = [];
+    const downloadCalls: string[] = [];
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/messages/replay")) {
+        return makeSseResponse([
+          {
+            event: "user_message",
+            data: {
+              turn_index: 1,
+              run_id: runId,
+              run_completed_at: "2026-11-25T20:00:00Z",
+            },
+          },
+          {
+            event: "message_chunk",
+            data: {
+              agent: "main",
+              turn_index: 1,
+              run_id: runId,
+              content_type: "text",
+              content: "已生成 6 份 PDF 文件。",
+            },
+          },
+          {
+            event: "replay_done",
+            data: {
+              thread_id: threadId,
+              latest_run_id: runId,
+              turn_deliverables_by_run: {
+                [runId]: sixDeliverables,
+              },
+            },
+          },
+        ]);
+      }
+      if (url.pathname.endsWith("/inbound/progress")) {
+        // Mirror backend SQL: exclude `deliverables:` / `deliverables-links:` from body dedupe!
+        let hasUnknownBody = false;
+        let hasInFlightBody = false;
+        for (const [dKey, row] of deliveriesDb.entries()) {
+          if (
+            !row.is_current ||
+            !row.has_non_empty_text ||
+            dKey.startsWith("deliverables:") ||
+            dKey.startsWith("deliverables-links:")
+          ) {
+            continue;
+          }
+          if (row.status === "unknown") hasUnknownBody = true;
+          if (row.status === "in_flight") hasInFlightBody = true;
+        }
+        return makeJsonResponse(200, {
+          ok: true,
+          run_id: runId,
+          has_in_flight_current_text: hasInFlightBody,
+          has_unknown_current_text: hasUnknownBody,
+          has_in_flight_or_unknown_current_text: hasInFlightBody || hasUnknownBody,
+          sent_to_current_count: 1,
+        });
+      }
+      if (url.pathname.endsWith("/deliveries/authorize-and-claim")) {
+        const reqBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        const dKey = String(reqBody.delivery_key ?? "");
+        claimedKeys.push(dKey);
+        if (dKey.startsWith("deliverables:") || dKey.startsWith("deliverables-links:")) {
+          expect(reqBody.has_non_empty_text).toBe(false);
+        }
+        const existing = deliveriesDb.get(dKey);
+        if (existing?.status === "unknown") {
+          return makeJsonResponse(200, {
+            claim_status: "in_flight_or_unknown",
+            existing_status: "unknown",
+            sent_chunks: existing.sent_chunks,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: true,
+            delivery_attempt: 1,
+          });
+        }
+        if (existing?.status === "sent") {
+          return makeJsonResponse(200, {
+            claim_status: "already_completed",
+            status: "sent",
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: true,
+            first_response_json: {
+              status: "sent",
+              code: null,
+              address: "feishu:@me",
+              current: true,
+              duplicate: true,
+              message: "already sent",
+              files: [],
+            },
+          });
+        }
+        deliveriesDb.set(dKey, {
+          status: "in_flight",
+          sent_chunks: 0,
+          has_non_empty_text:
+            dKey.startsWith("deliverables:") || dKey.startsWith("deliverables-links:")
+              ? false
+              : Boolean(reqBody.has_non_empty_text),
+          is_current: true,
+        });
+        return makeJsonResponse(200, {
+          claim_status: "claimed",
+          platform: "feishu",
+          target_address: "feishu:@me",
+          recipient_id: "ou_alice",
+          dm_recipient_platform_user_id: "ou_alice",
+          is_current: true,
+          delivery_attempt: 1,
+          workspace_id: "ws-contract-1",
+          home_workspace_id: "ws-home-alice",
+          prior_run_files: [
+            { workspace_id: "ws-contract-1", path: "results/file_1.pdf", status: "unknown" },
+          ],
+        });
+      }
+      if (url.pathname.endsWith("/deliveries/progress")) {
+        const reqBody = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+        const dKey = String(reqBody.delivery_key ?? "");
+        const st = typeof reqBody.status === "string" ? reqBody.status : undefined;
+        progressWrites.push({ key: dKey, status: st });
+        const row = deliveriesDb.get(dKey);
+        if (row && st) {
+          row.status = st;
+        }
+        return makeJsonResponse(200, {
+          ok: true,
+          delivery_key: dKey,
+          status: st ?? "in_flight",
+          sent_to_current_count: 1,
+        });
+      }
+      if (url.pathname.endsWith("/deliverables/download")) {
+        downloadCalls.push(url.toString());
+        throw new Error("Must never download or re-upload binaries during unknown deliverable recovery");
+      }
+      if (url.pathname.endsWith("/status")) {
+        return makeJsonResponse(200, {
+          status: "idle",
+          run_id: runId,
+          latest_turn_index: 1,
+        });
+      }
+      throw new Error(`Unexpected fetch URL: ${url.toString()}`);
+    });
+
+    const backend = new HttpBackendClient({
+      baseUrl: "http://backend.test",
+      serviceToken: SERVICE_TOKEN,
+      fetchImpl: fetchMock as unknown as typeof fetch,
+    });
+    backend.setGatewayEpoch(GATEWAY_EPOCH);
+    const adapters = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishu]]);
+    const deliveryService = new DeliveryService({
+      backend,
+      adapters,
+      webBaseUrl: WEB_BASE,
+    });
+    const agentRoutes = new AgentRoutesHandler({
+      backend,
+      adapters,
+      deliveryService,
+      webBaseUrl: WEB_BASE,
+    });
+
+    // Simulate two gateway restarts hitting the real awaited replay entrypoint (`deliverReplayFallback`,
+    // invoked by both `recoverSingleInboundRow` during startup recovery and `handleInboundEvent` on fallback_pending rows).
+    for (let restart = 1; restart <= 2; restart += 1) {
+      const orch = new ChannelGatewayOrchestrator({
+        backend,
+        adapters,
+        deliveryService,
+        agentRoutes,
+        webBaseUrl: WEB_BASE,
+        backoffDelayFn: async () => undefined,
+      });
+      const settled = await orch.deliverReplayFallback({
+        userId: "user-alice",
+        threadId,
+        runId,
+        turnIndex: 1,
+        platform: "feishu",
+        targetAddress: "feishu:@me",
+        inboundMessageId: "om_6files_in",
+        scopeKey: "dm:ou_alice",
+        generation: 1,
+      });
+      expect(settled).toBe(true);
+      await orch.stopAllWatches();
+    }
+
+    // 1) Original `deliverables:${runId}` stayed `unknown` and was never mutated via I-7
+    expect(deliveriesDb.get(`deliverables:${runId}`)?.status).toBe("unknown");
+    expect(progressWrites.some((w) => w.key === `deliverables:${runId}`)).toBe(false);
+    // 2) Zero binary downloads and zero binary uploads
+    expect(downloadCalls).toHaveLength(0);
+    expect(feishu.sentFiles).toHaveLength(0);
+    // 3) Login links sent ONCE via `deliverables-links:${runId}` for the 5 unconfirmed files,
+    //    without duplicating file_6.pdf (whose overflow link was already sent in chunk 0).
+    expect(feishu.sentTexts).toHaveLength(1);
+    for (const n of [1, 2, 3, 4, 5]) {
+      expect(feishu.sentTexts[0]!.text).toContain(`results%2Ffile_${n}.pdf`);
+    }
+    expect(feishu.sentTexts[0]!.text).not.toContain("results%2Ffile_6.pdf");
+    // Real `deliverReplayFallback` also checks `fallback:${runId}` via `settleTurnFallbackAndPartialNotice`
+    // when `sent_to_current_count > 0` before settling `deliverables:${runId}` -> `deliverables-links:${runId}`.
+    expect(claimedKeys).toEqual([
+      `fallback:${runId}`,
+      `deliverables:${runId}`,
+      `deliverables-links:${runId}`,
+      `fallback:${runId}`,
+      `deliverables:${runId}`,
+      `deliverables-links:${runId}`,
+    ]);
+  });
+
+  it("matches shared workspace link rewrite fixture (spaced filenames & multiline reference definitions) identically to Python", () => {
+    const fixture = loadFixture<{
+      public_base: string;
+      thread_id: string;
+      cases: Array<{ name: string; input: string; expected: string }>;
+    }>("workspace_link_rewrite_cases.json");
+
+    expect(fixture.cases.length).toBeGreaterThanOrEqual(4);
+    for (const c of fixture.cases) {
+      const actual = rewriteSandboxLinks(
+        c.input,
+        fixture.public_base,
+        fixture.thread_id,
+      );
+      expect(actual, `Case ${c.name}`).toBe(c.expected);
+    }
   });
 });

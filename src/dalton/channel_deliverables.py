@@ -538,11 +538,18 @@ async def _default_get_live_sandbox(
     its live sandbox or workspace directory layout cannot be reached (preventing
     stale offline backup reads while the sandbox is running).
     """
+    from collections.abc import Mapping
     from src.server.database.workspace import get_workspace as db_get_workspace
-    from src.server.models.workspace import served_from_mirror
+    from src.server.models.workspace import WorkspaceStatus
     from src.server.services.workspace_files import layout_for
     from src.server.services.workspace_layout import WorkspaceLayoutUnavailable
     from src.server.services.workspace_manager import WorkspaceManager
+
+    def _normalize_ws_status(ws_row: Mapping[str, Any] | None) -> str:
+        raw = ws_row.get("status") if isinstance(ws_row, Mapping) else None
+        if isinstance(raw, WorkspaceStatus):
+            return raw.value
+        return str(raw or "").strip().lower()
 
     workspace = await db_get_workspace(workspace_id)
     if not workspace:
@@ -553,8 +560,20 @@ async def _default_get_live_sandbox(
                 "message": "Workspace not found.",
             },
         )
-    if served_from_mirror(workspace.get("status")):
+    ws_status = _normalize_ws_status(workspace)
+    if ws_status == WorkspaceStatus.STOPPED.value:
         return None, None
+    if ws_status != WorkspaceStatus.RUNNING.value:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "deliverable_sandbox_unavailable",
+                "message": (
+                    f"Workspace sandbox is in status {ws_status!r}; "
+                    "offline backup is only read after the sandbox is confirmed stopped."
+                ),
+            },
+        )
 
     ws_mgr = WorkspaceManager.get_instance()
     try:
@@ -579,9 +598,19 @@ async def _default_get_live_sandbox(
         ) from exc
 
     if session is None:
-        # `get_session_if_running` returns None only when Postgres computer status != 'running'
-        # or the provider runtime confirmed state != RUNNING.
-        return None, None
+        # `get_session_if_running` also returns None during `starting`/`stopping`
+        # before the stop backup finishes. Re-check DB status and only allow
+        # offline backup reads once status is confirmed `stopped`.
+        refreshed = await db_get_workspace(workspace_id)
+        if _normalize_ws_status(refreshed) == WorkspaceStatus.STOPPED.value:
+            return None, None
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "deliverable_sandbox_unavailable",
+                "message": "Workspace sandbox is not confirmed stopped; refusing potentially stale offline backup.",
+            },
+        )
 
     sandbox = getattr(session, "sandbox", None)
     if sandbox is None:

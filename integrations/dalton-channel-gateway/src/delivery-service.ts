@@ -487,6 +487,14 @@ export class DeliveryService {
         : [outboundText]
       : [];
 
+    // Deliverable deliveries (`deliverables:*` / `deliverables-links:*`) only send attachment
+    // deep-link fallbacks in their text field — never treat them as conversation body text for
+    // body dedupe (`has_non_empty_text`).
+    const isDeliverableDelivery =
+      options.downloadMode === "deliverable" ||
+      options.deliveryKey.startsWith("deliverables:") ||
+      options.deliveryKey.startsWith("deliverables-links:");
+
     let claim: I6AuthorizeAndClaimResponse;
     try {
       claim = await this.claimDeliveryWith503Retry({
@@ -500,7 +508,7 @@ export class DeliveryService {
         platform: preliminaryPlat ?? options.platform ?? null,
         target: options.target ?? null,
         inbound_message_id: options.inboundMessageId ?? null,
-        has_non_empty_text: hasOutboundText,
+        has_non_empty_text: isDeliverableDelivery ? false : hasOutboundText,
         total_chunks: Math.max(preliminaryChunks.length, hasOutboundText ? 1 : 0),
         source_scope_key: options.sourceScopeKey ?? options.threadScopeKey ?? null,
         source_generation: options.sourceGeneration ?? null,
@@ -715,33 +723,97 @@ export class DeliveryService {
       filesToSend = [];
     }
 
+    // Convert `.html` / `.htm` files into sign-in-protected web deep links after I-6 authorizes
+    // the actual target (covers explicit DM `send_message(files=...)` as well as auto-attach),
+    // ensuring zero file downloads and zero platform uploads for HTML files.
+    if (filesToSend.length > 0) {
+      const nonHtmlFiles: AgentSendFileRef[] = [];
+      for (const fileRef of filesToSend) {
+        const lowerPath = fileRef.path.trim().toLowerCase();
+        if (lowerPath.endsWith(".html") || lowerPath.endsWith(".htm")) {
+          const wsId = fileRef.workspace_id || currentSessionWsId || null;
+          extraLinkLines.push(
+            buildWorkspaceFileDeepLinkLine(
+              basename(fileRef.path) || fileRef.path,
+              fileRef.path,
+              this.webBaseUrl,
+              options.threadId,
+              wsId,
+              currentSessionWsId,
+            ),
+          );
+          fileOutcomes.push({
+            path: fileRef.path,
+            workspace_id: wsId,
+            status: "linked",
+            reason: "html_file_deep_link",
+          });
+          continue;
+        }
+        nonHtmlFiles.push(fileRef);
+      }
+      filesToSend = nonHtmlFiles;
+    }
+
     // Lead Decisions #6 & #7 (DM auto-attach deliverables):
-    // 1. Deduplicate against `claim.prior_run_files` across the run's `is_current=TRUE` deliveries:
+    // 1. Deduplicate against `claim.prior_run_files` across the run's `is_current=TRUE` deliveries
+    //    by `(workspace_id, normalized_path)`. Only fall back to legacy path-only matching when a
+    //    prior record lacks `workspace_id` and the file belongs to the current session workspace.
     //    - `sent` / `linked` -> skip (already delivered)
     //    - `pending` / `unknown` -> never re-send binary; emit web login deep link only
     // 2. If `options.forceLinkOnly` (recovery after an `unknown` deliverables attempt) or DM deliverable
     //    lacks a pinned original DM recipient (`claim.dm_recipient_platform_user_id`), emit web login deep
     //    links only (never upload binaries).
     if (isDmTarget && options.downloadMode === "deliverable" && filesToSend.length > 0) {
-      const priorByKey = new Map<string, string>();
+      const normalizeDeliverablePath = (rawPath: string): string => {
+        const segments: string[] = [];
+        for (const seg of rawPath.trim().replace(/\\/g, "/").split("/")) {
+          if (!seg || seg === ".") continue;
+          segments.push(seg);
+        }
+        return segments.join("/");
+      };
+      const statusPriority = (status: string): number => {
+        if (status === "sent" || status === "linked") return 3;
+        if (status === "unknown" || status === "pending") return 2;
+        return 1;
+      };
+      const recordPrior = (
+        map: Map<string, string>,
+        key: string,
+        status: string,
+      ): void => {
+        const prev = map.get(key);
+        if (!prev || statusPriority(status) >= statusPriority(prev)) {
+          map.set(key, status);
+        }
+      };
+
+      const priorByWsAndPath = new Map<string, string>();
+      const legacyPriorByPath = new Map<string, string>();
       for (const prior of claim.prior_run_files ?? []) {
-        const normPath = prior.path.trim().replace(/^\/+/, "");
+        const normPath = normalizeDeliverablePath(prior.path);
         const wsKey = (prior.workspace_id ?? "").trim();
         const status = (prior.status ?? "").trim().toLowerCase();
         if (!normPath || !status) continue;
-        priorByKey.set(`${wsKey}::${normPath}`, status);
-        priorByKey.set(`::${normPath}`, status);
+        if (wsKey) {
+          recordPrior(priorByWsAndPath, `${wsKey}::${normPath}`, status);
+        } else {
+          recordPrior(legacyPriorByPath, normPath, status);
+        }
       }
 
       const pinnedDmRecipient = (claim.dm_recipient_platform_user_id ?? "").trim();
       const nextFilesToSend: AgentSendFileRef[] = [];
       for (const fileRef of filesToSend) {
         const wsId =
-          fileRef.workspace_id || currentSessionWsId || "";
-        const normPath = fileRef.path.trim().replace(/^\/+/, "");
+          (fileRef.workspace_id ?? "").trim() || currentSessionWsId || "";
+        const normPath = normalizeDeliverablePath(fileRef.path);
+        const canUseLegacyMatch =
+          !wsId || !currentSessionWsId || wsId === currentSessionWsId;
         const priorStatus =
-          priorByKey.get(`${wsId}::${normPath}`) ??
-          priorByKey.get(`::${normPath}`);
+          (wsId ? priorByWsAndPath.get(`${wsId}::${normPath}`) : undefined) ??
+          (canUseLegacyMatch ? legacyPriorByPath.get(normPath) : undefined);
         if (priorStatus === "sent" || priorStatus === "linked") {
           continue;
         }
@@ -848,7 +920,7 @@ export class DeliveryService {
     const chunks = hasEffectiveOutboundText
       ? adapter.splitTextChunks(effectiveOutboundText)
       : [];
-    const totalChunks = chunks.length;
+    let totalChunks = chunks.length;
     if (totalChunks !== preliminaryChunks.length) {
       await recordProgress({
         delivery_key: options.deliveryKey,
@@ -915,7 +987,12 @@ export class DeliveryService {
       extTopicId: string,
       firstReplyId?: string | null,
     ): BotTopicRegistrationPayload | null => {
-      if (!isGroupTopicTarget || !extTopicId || !topicCanonicalScopeKey) {
+      if (
+        !isGroupTopicTarget ||
+        !extTopicId ||
+        !topicCanonicalScopeKey ||
+        !topicInitiatorPlatformUserId
+      ) {
         return null;
       }
       return {
@@ -950,6 +1027,9 @@ export class DeliveryService {
     const platformMessageIds: string[] = [];
     let sentChunks = 0;
     let feishuTopicCreationFailed = false;
+    let feishuTopicConfirmedInThread = Boolean(currentExternalTopicId);
+    let feishuLastInThreadMessageId: string | null = firstReplyMessageId;
+    let terminalNoticeCompleted = false;
     let firstCurrentDeliveryNotified = false;
     const isFeedbackTrackedKind =
       options.kind === "agent_send" ||
@@ -973,6 +1053,7 @@ export class DeliveryService {
       platformStr === "discord" && confirmedThreadAddress.length > 0;
     let chunkFailure: {
       outcome: "failed" | "unknown";
+      forceUnknown?: boolean;
       code: AgentSendResponse["code"];
       denyCode?: string;
       errorDetail?: string;
@@ -1060,25 +1141,38 @@ export class DeliveryService {
               platformStr === "feishu" &&
               isGroupTopicTarget &&
               (Boolean(currentExternalTopicId) || shouldCreateGroupTopic);
-            // Main-group direct fallback is ONLY permitted when first-turn topic creation
-            // fails (no authorized `currentExternalTopicId` yet). Once inside an authorized
-            // topic, never leak messages into the main group on anchor withdrawal.
+            // Main-group direct fallback is ONLY permitted before any chunk has entered a
+            // Feishu topic (no authorized `currentExternalTopicId` and no chunk confirmed
+            // replied in thread yet). Once inside a topic, never leak chunks to the main group.
             const feishuAllowDirectFallback =
               platformStr === "feishu" && feishuReplyInThread
-                ? !currentExternalTopicId
+                ? !currentExternalTopicId && !feishuTopicConfirmedInThread
                 : true;
             let chunkReplyToMessageId: string | null | undefined;
             let feishuFallbackReplyIds: string[] | undefined;
             if (feishuReplyInThread) {
               if (!currentExternalTopicId) {
-                // First-turn topic creation: anchor chunk 0 on verified root message,
-                // subsequent chunks on chunk 0's reply (or root).
-                chunkReplyToMessageId =
-                  i === 0
-                    ? verifiedRootMessageId
-                    : (firstReplyMessageId ?? verifiedRootMessageId);
-                if (i > 0 && verifiedRootMessageId && verifiedRootMessageId !== chunkReplyToMessageId) {
-                  feishuFallbackReplyIds = [verifiedRootMessageId];
+                // First-turn topic creation: anchor chunk 0 on verified root message;
+                // subsequent chunks anchor on already-confirmed in-thread reply messages
+                // (never falling back to main group once chunk 0 entered the topic).
+                if (i === 0) {
+                  chunkReplyToMessageId = verifiedRootMessageId;
+                } else {
+                  const createAnchors: string[] = [];
+                  for (const rawAnchor of [
+                    feishuLastInThreadMessageId,
+                    firstReplyMessageId,
+                    verifiedRootMessageId,
+                  ]) {
+                    const cleanedAnchor = rawAnchor?.trim();
+                    if (cleanedAnchor && !createAnchors.includes(cleanedAnchor)) {
+                      createAnchors.push(cleanedAnchor);
+                    }
+                  }
+                  chunkReplyToMessageId = createAnchors[0] ?? null;
+                  if (createAnchors.length > 1) {
+                    feishuFallbackReplyIds = createAnchors.slice(1);
+                  }
                 }
               } else {
                 // Authorized topic (`:topic:` or `:thread:`): prefer current inbound message on live
@@ -1174,10 +1268,15 @@ export class DeliveryService {
         if (i === 0 && !firstReplyMessageId) {
           firstReplyMessageId = res.messageId;
         }
+        if (platformStr === "feishu" && res.repliedInThread === true) {
+          feishuTopicConfirmedInThread = true;
+          feishuLastInThreadMessageId = res.messageId;
+        }
         if (res.resolvedAddress) {
           finalAddress = res.resolvedAddress;
         }
         let feishuTopicReg: BotTopicRegistrationPayload | null = null;
+        let stopForUnconfirmedFeishuTopic = false;
         if (
           platformStr === "feishu" &&
           isGroupTopicTarget &&
@@ -1185,6 +1284,8 @@ export class DeliveryService {
           res.externalTopicId
         ) {
           currentExternalTopicId = res.externalTopicId;
+          feishuTopicConfirmedInThread = true;
+          feishuLastInThreadMessageId = res.messageId;
           feishuTopicReg = buildTopicRegistration(
             res.externalTopicId,
             firstReplyMessageId ?? res.messageId,
@@ -1198,7 +1299,19 @@ export class DeliveryService {
           !res.externalTopicId &&
           i === 0
         ) {
-          feishuTopicCreationFailed = true;
+          if (res.usedDirectFallback === true) {
+            // Platform explicitly rejected topic creation and fell back to main group.
+            feishuTopicCreationFailed = true;
+          } else if (res.repliedInThread === true) {
+            // Chunk 0 succeeded inside the topic but topic ID is not yet available;
+            // keep subsequent chunks inside the topic using the confirmed reply anchor.
+            feishuTopicConfirmedInThread = true;
+            feishuLastInThreadMessageId = res.messageId;
+          } else {
+            // Cannot confirm whether chunk 0 landed in the topic or main group;
+            // stop sending and mark `unknown` instead of risking a main-group leak.
+            stopForUnconfirmedFeishuTopic = true;
+          }
         } else if (
           platformStr === "feishu" &&
           isGroupTopicTarget &&
@@ -1212,6 +1325,10 @@ export class DeliveryService {
             res.messageId,
           );
         }
+        if (res.terminalFallbackNotice === true) {
+          terminalNoticeCompleted = true;
+          totalChunks = sentChunks;
+        }
         maybeNotifyFirstCurrentDelivery();
         await recordProgress({
           delivery_key: options.deliveryKey,
@@ -1220,6 +1337,19 @@ export class DeliveryService {
           platform_message_ids: [...platformMessageIds],
           ...(feishuTopicReg ? { bot_topic_registration: feishuTopicReg } : {}),
         });
+        if (terminalNoticeCompleted) {
+          break;
+        }
+        if (stopForUnconfirmedFeishuTopic) {
+          chunkFailure = {
+            outcome: "unknown",
+            forceUnknown: true,
+            code: "unavailable",
+            message:
+              "Feishu topic location could not be confirmed; stopping delivery to avoid leaking into main group.",
+          };
+          break;
+        }
       } catch (err) {
         if (isStaleGatewayEpochError(err) || this.leaseLost) {
           // D1 / §3.5 / R5 #3: lease loss MUST stop locally without writing I-7 settlement.
@@ -1230,9 +1360,17 @@ export class DeliveryService {
                 { cause: err },
               );
         }
+        const feishuUnconfirmedTopicStop =
+          platformStr === "feishu" &&
+          feishuTopicConfirmedInThread &&
+          !currentExternalTopicId;
         if (err instanceof ChannelDeliveryError) {
           chunkFailure = {
-            outcome: err.outcome === "unknown" ? "unknown" : "failed",
+            outcome:
+              feishuUnconfirmedTopicStop || err.outcome === "unknown"
+                ? "unknown"
+                : "failed",
+            ...(feishuUnconfirmedTopicStop ? { forceUnknown: true } : {}),
             code: err.code,
             denyCode: err.denyCode,
             errorDetail: err.errorDetail,
@@ -1242,6 +1380,7 @@ export class DeliveryService {
         } else {
           chunkFailure = {
             outcome: "unknown",
+            ...(feishuUnconfirmedTopicStop ? { forceUnknown: true } : {}),
             code: "unavailable",
             message: err instanceof Error ? err.message : String(err),
           };
@@ -1423,7 +1562,7 @@ export class DeliveryService {
       }
     };
 
-    if (!chunkFailure) {
+    if (!chunkFailure && !terminalNoticeCompleted) {
       for (let fileIdx = 0; fileIdx < filesToSend.length; fileIdx += 1) {
         const fileRef = filesToSend[fileIdx]!;
         const wsId =
@@ -1471,21 +1610,41 @@ export class DeliveryService {
                   { cause: err },
                 );
           }
+          const dlBody =
+            err instanceof BackendHttpError && err.body && typeof err.body === "object"
+              ? (err.body as Record<string, unknown>)
+              : null;
+          const dlDetail =
+            dlBody?.detail && typeof dlBody.detail === "object"
+              ? (dlBody.detail as Record<string, unknown>)
+              : null;
+          const dlErrCode =
+            typeof dlBody?.code === "string"
+              ? dlBody.code
+              : typeof dlDetail?.code === "string"
+                ? dlDetail.code
+                : undefined;
           const isVersionOrMissing =
             err instanceof BackendHttpError &&
             (err.status === 409 || err.status === 404);
+          const isSandboxUnavailable =
+            err instanceof BackendHttpError &&
+            err.status === 503 &&
+            dlErrCode === "deliverable_sandbox_unavailable";
           const isSizeExceeded =
             err instanceof Error && err.name === "SafeFetchError";
           if (
             options.linkFallbackOnDeliverableMismatch &&
-            (isVersionOrMissing || isSizeExceeded)
+            (isVersionOrMissing || isSandboxUnavailable || isSizeExceeded)
           ) {
             const linked = await sendDeliverableLinkFallback(
               fileRef,
               wsId,
               isSizeExceeded
                 ? "deliverable_size_exceeded_link_fallback"
-                : "deliverable_version_mismatch_link_fallback",
+                : isSandboxUnavailable
+                  ? "deliverable_sandbox_unavailable_link_fallback"
+                  : "deliverable_version_mismatch_link_fallback",
               chunks.length + fileIdx,
             );
             if (linked) {
@@ -1703,7 +1862,7 @@ export class DeliveryService {
           });
         }
       }
-    } else if (filesToSend.length > 0) {
+    } else if (filesToSend.length > 0 && !terminalNoticeCompleted) {
       for (const fileRef of filesToSend) {
         anyFileFailed = true;
         fileOutcomes.push({
@@ -1722,9 +1881,10 @@ export class DeliveryService {
 
     if (chunkFailure) {
       if (chunkFailure.outcome === "unknown") {
-        // Round 3 Decision #9: `unknown` overrides `partial` ONLY on Weixin;
-        // Feishu & Discord preserve original `partial` settlement when earlier chunks succeeded.
-        if (platformStr === "weixin" || !somethingSucceeded) {
+        // Round 3 Decision #9: `unknown` overrides `partial` on Weixin or when explicitly forced
+        // (e.g. unconfirmed Feishu topic location where stopping avoids a main-group leak);
+        // Feishu & Discord otherwise preserve `partial` settlement when earlier chunks succeeded.
+        if (chunkFailure.forceUnknown || platformStr === "weixin" || !somethingSucceeded) {
           finalStatus = "unknown";
           finalCode = chunkFailure.code;
           finalMessage = somethingSucceeded
