@@ -71,7 +71,7 @@ beforeEach(() => {
 describe('the primary nav', () => {
   it('draws every non-orders item by default when VITE_DALTON_MODE is unset', () => {
     const defaultItems = NAV_ITEMS.filter(
-      (item) => item.requires !== 'orders' && item.requires !== 'org_library',
+      (item) => item.requires !== 'orders' && item.requires !== 'org_library' && item.requires !== 'drive',
     ).map((item) => item.key);
     expect(keys()).toEqual(defaultItems);
     servers = [httpCatalogServer({ url: MOOMOO.url, oauth_status: 'connected' })];
@@ -93,7 +93,7 @@ describe('the primary nav', () => {
   // DALTON-HOOK(hide-trading): Orders nav item is unconditionally hidden and never queries brokerage/order state
   it('hides Orders even when a shipped brokerage is connected', () => {
     servers = [httpCatalogServer({ name: 'moomoo', url: MOOMOO.url, oauth_status: 'connected' })];
-    features = [{ key: 'org_library', enabled: true }];
+    features = [{ key: 'org_library', enabled: true }, { key: 'drive', enabled: true }];
     expect(keys()).not.toContain('/orders');
     expect(keys()).toEqual(NAV_ITEMS.filter((item) => item.requires !== 'orders').map((item) => item.key));
   });
@@ -106,6 +106,14 @@ describe('the primary nav', () => {
     expect(keys()).not.toContain('/library');
     features = [{ key: 'org_library', enabled: true }];
     expect(keys()).toContain('/library');
+  });
+
+  it('shows the Drive only where its feature is on, apart from the library', () => {
+    features = [{ key: 'org_library', enabled: true }];
+    expect(keys()).not.toContain('/drive');
+    features = [{ key: 'drive', enabled: true }];
+    expect(keys()).toContain('/drive');
+    expect(keys()).not.toContain('/library');
   });
 
   it('hides Orders while the answer is still in flight', () => {

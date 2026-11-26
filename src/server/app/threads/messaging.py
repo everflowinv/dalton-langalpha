@@ -1755,6 +1755,37 @@ async def replay_thread_messages(
                 done["latest_run_id"] = (
                     str(latest_run_id) if latest_run_id is not None else None
                 )
+            # DALTON-HOOK(channel-deliverables): expose persisted turn_deliverables on replay when CHANNEL_GATEWAY is active
+            if not is_non_owner_reader:
+                from src.dalton.capabilities import CapabilityId, has_capability
+                from src.dalton.colleague_outbound_guard import is_run_row_outbound_blocked
+
+                if has_capability(CapabilityId.CHANNEL_GATEWAY):
+                    deliverables_by_run: dict[str, list[dict[str, object]]] = {}
+                    responses_map = getattr(rows, "responses_by_turn", None)
+                    resp_rows = (
+                        responses_map.values()
+                        if isinstance(responses_map, dict)
+                        else ()
+                    )
+                    for resp_row in resp_rows:
+                        if not isinstance(resp_row, dict):
+                            continue
+                        if is_run_row_outbound_blocked(resp_row):
+                            continue
+                        resp_meta = resp_row.get("metadata")
+                        if not isinstance(resp_meta, dict):
+                            continue
+                        td = resp_meta.get("turn_deliverables")
+                        rid = str(
+                            resp_row.get("conversation_response_id")
+                            or resp_row.get("run_id")
+                            or ""
+                        ).strip()
+                        if rid and isinstance(td, list) and td:
+                            deliverables_by_run[rid] = td
+                    if deliverables_by_run:
+                        done["turn_deliverables_by_run"] = deliverables_by_run
             seq += 1
             yield f"id: {seq}\nevent: replay_done\ndata: {json.dumps(done, default=str)}\n\n"
 

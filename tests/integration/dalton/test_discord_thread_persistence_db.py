@@ -604,15 +604,17 @@ async def test_confirmed_discord_thread_survives_progress_restart_and_revocation
     assert legacy_after["discord_body_phase"] is None
     assert legacy_after["error_code"] == "timeout"
 
+    # Lead Decision #4: unsettled deliveries marked `gateway_restarted` stay `unknown`
+    # and are not auto-resumed after restart (including Discord `before_body`).
     reclaimed = await _claim(user_a, restart_key, parent)
-    assert reclaimed["claim_status"] == "claimed"
-    assert reclaimed["delivery_attempt"] == 2
-    assert reclaimed["target_address"] == parent
+    assert reclaimed["claim_status"] == "in_flight_or_unknown"
+    assert reclaimed["delivery_attempt"] == 1
     assert reclaimed["confirmed_thread_address"] == confirmed
     assert reclaimed["discord_body_phase"] == "before_body"
     reclaimed_row = await _delivery_row(pool, restart_key)
-    assert reclaimed_row["status"] == "in_flight"
-    assert reclaimed_row["delivery_attempt"] == 2
+    assert reclaimed_row["status"] == "unknown"
+    assert reclaimed_row["error_code"] == "gateway_restarted"
+    assert reclaimed_row["delivery_attempt"] == 1
     assert reclaimed_row["confirmed_thread_address"] == confirmed
     assert reclaimed_row["discord_body_phase"] == "before_body"
 

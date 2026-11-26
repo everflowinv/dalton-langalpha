@@ -91,6 +91,15 @@ features:
   # Flip to true only after meeting the prerequisites in docs/dalton/OPERATIONS.md.
   browser:
     enabled: false
+  # SYNC13 S2 (#872): keep upstream's Drive off by default.
+  # The kill switch hides the Settings Experiments toggle, the /drive nav entry
+  # and route, skips the computer Drive mount, binds DriveAbsent instead of
+  # DriveRoute in agent file tools, withholds <drive_system> prompts, and makes
+  # every /api/v1/drive/* and /api/v1/livefs/drive/* route return 404.
+  # Flip to true only after completing the colleague/external-member review in
+  # docs/dalton/OPERATIONS.md.
+  drive:
+    enabled: false
   # Keep upstream teams / shared workspaces / org libraries / org connectors off
   # in Dalton production; Dalton uses colleague sharing instead.
   teams:

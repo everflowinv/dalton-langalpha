@@ -319,6 +319,8 @@ export function buildDaltonFeishuThreadScopeKey(params: {
   chatId: string;
   senderOpenId: string;
   threadId?: string | null;
+  messageId?: string | null;
+  isGroupTrigger?: boolean;
 }): string {
   if (params.chatType === "p2p" || params.chatType === "dm") {
     return `dm:${params.senderOpenId.trim()}`;
@@ -327,6 +329,10 @@ export function buildDaltonFeishuThreadScopeKey(params: {
   const cleanThreadId = params.threadId?.trim();
   if (cleanThreadId) {
     return `chat:${cleanChatId}:thread:${cleanThreadId}`;
+  }
+  const cleanMessageId = params.messageId?.trim();
+  if (params.isGroupTrigger && cleanMessageId) {
+    return `chat:${cleanChatId}:topic:${cleanMessageId}`;
   }
   return `chat:${cleanChatId}`;
 }

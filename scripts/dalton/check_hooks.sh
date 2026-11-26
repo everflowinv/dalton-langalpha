@@ -457,6 +457,10 @@ ALLOWED_HOOKS=(
   # Preserve server-written dalton_historical_duplicate_of marker in
   # SERVER_OWNED_CONFIG_KEYS across whole-config replacements (workspace.py).
   "historical-duplicate-marker"
+  # Channel phase 2 batch 1: record actual written bytes SHA-256 and verified
+  # FileStamp for DM turn deliverables across Write/Edit, run finalization,
+  # run_end SSE frame, and /messages/replay.
+  "channel-deliverables"
   # Collapse Antigravity model variants into series + reasoning-effort pickers
   # across UI selectors while preserving suffixed model IDs on the wire.
   "antigravity-series"
@@ -504,6 +508,11 @@ ALLOWED_HOOKS=(
   "mobile-web"
   # Channel sandbox link rewriting: preserve validated ?redirect= deep links across login in App.tsx.
   "channel-links"
+  # SYNC13 S2 (#872): deployment kill switch for Drive — refuses enabling Drive
+  # while Dalton colleague access or computer_cli_tokens is active (features.py,
+  # setup.py), skips DriveTrashSweep, and answers 404 before auth/param validation
+  # on drive.py and drive_mount.py when Drive is off.
+  "drive-kill-switch"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

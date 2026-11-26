@@ -183,6 +183,8 @@ async def append_run_end_event(
     images: Optional[Dict[str, str]] = None,
     closing_frames: Sequence[str] = (),
     stopped_by: Optional[str] = None,
+    # DALTON-HOOK(channel-deliverables): include persisted turn_deliverables on run_end SSE frame
+    turn_deliverables: Optional[Sequence[Dict[str, Any]]] = None,
     redis_event_ttl: int,
     max_stored_messages: int,
 ) -> None:
@@ -275,6 +277,9 @@ async def append_run_end_event(
         # shows the account's suspension as that, not as a stop they made.
         if stopped_by:
             frame_data["stopped_by"] = stopped_by
+        # DALTON-HOOK(channel-deliverables): attach verified DM turn deliverables on run_end
+        if turn_deliverables:
+            frame_data["turn_deliverables"] = list(turn_deliverables)
         data = json.dumps(frame_data, ensure_ascii=False)
         payload = f"event: {RUN_END_EVENT_TYPE}\ndata: {data}\n\n".encode(
             "utf-8"

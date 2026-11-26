@@ -128,22 +128,43 @@ def main() -> int:
         ),
     )
 
+    initialized: set[tuple[str, str]] = set()
+
     rc = _ensure_private_bucket(client, bucket=bucket, region=region, endpoint=endpoint)
     if rc != 0:
         return rc
+    initialized.add((endpoint, bucket))
+
+    # Optional general storage bucket initialization when STORAGE_BUCKET_NAME is set
+    # to a distinct bucket on the same MinIO endpoint.
+    storage_bucket = _env("STORAGE_BUCKET_NAME")
+    if storage_bucket:
+        storage_endpoint = _env("STORAGE_ENDPOINT_URL", default=endpoint).rstrip("/")
+        if storage_endpoint == endpoint and (storage_endpoint, storage_bucket) not in initialized:
+            storage_region = _env("STORAGE_REGION", default=region)
+            rc = _ensure_private_bucket(
+                client,
+                bucket=storage_bucket,
+                region=storage_region,
+                endpoint=storage_endpoint,
+            )
+            if rc != 0:
+                return rc
+            initialized.add((storage_endpoint, storage_bucket))
 
     # Optional transcription bucket initialization when DALTON_ASR_STORAGE_BUCKET_NAME is set
     # against the same MinIO endpoint (keeps default Core behavior unchanged when unset).
     asr_bucket = _env("DALTON_ASR_STORAGE_BUCKET_NAME")
-    if asr_bucket and asr_bucket != bucket:
+    if asr_bucket:
         asr_endpoint = _env("DALTON_ASR_STORAGE_ENDPOINT_URL", default=endpoint).rstrip("/")
-        if asr_endpoint == endpoint:
+        if asr_endpoint == endpoint and (asr_endpoint, asr_bucket) not in initialized:
             asr_region = _env("DALTON_ASR_STORAGE_REGION", default=region)
             rc = _ensure_private_bucket(
                 client, bucket=asr_bucket, region=asr_region, endpoint=asr_endpoint
             )
             if rc != 0:
                 return rc
+            initialized.add((asr_endpoint, asr_bucket))
 
     return 0
 

@@ -101,11 +101,17 @@ function rewriteFeishuCardMarkdownValue(
   value: unknown,
   webBaseUrl: string,
   threadId: string | null,
+  workspaceId: string | null = null,
 ): { value: unknown; changed: boolean } {
   if (Array.isArray(value)) {
     let changed = false;
     const next = value.map((item) => {
-      const res = rewriteFeishuCardMarkdownValue(item, webBaseUrl, threadId);
+      const res = rewriteFeishuCardMarkdownValue(
+        item,
+        webBaseUrl,
+        threadId,
+        workspaceId,
+      );
       if (res.changed) changed = true;
       return res.value;
     });
@@ -122,7 +128,12 @@ function rewriteFeishuCardMarkdownValue(
     typeof out.content === "string" &&
     out.content.length > 0
   ) {
-    const rewritten = rewriteSandboxLinks(out.content, webBaseUrl, threadId);
+    const rewritten = rewriteSandboxLinks(
+      out.content,
+      webBaseUrl,
+      threadId,
+      workspaceId,
+    );
     if (rewritten !== out.content) {
       out.content = rewritten;
       changed = true;
@@ -130,7 +141,12 @@ function rewriteFeishuCardMarkdownValue(
   }
   for (const key of ["body", "elements", "columns", "text", "extra", "fields"]) {
     if (key in out) {
-      const res = rewriteFeishuCardMarkdownValue(out[key], webBaseUrl, threadId);
+      const res = rewriteFeishuCardMarkdownValue(
+        out[key],
+        webBaseUrl,
+        threadId,
+        workspaceId,
+      );
       if (res.changed) {
         out[key] = res.value;
         changed = true;
@@ -144,8 +160,14 @@ function rewriteFeishuCardLinksWithinBudget(
   card: Record<string, unknown>,
   webBaseUrl: string,
   threadId: string | null,
+  workspaceId: string | null = null,
 ): Record<string, unknown> {
-  const withLinks = rewriteFeishuCardMarkdownValue(card, webBaseUrl, threadId);
+  const withLinks = rewriteFeishuCardMarkdownValue(
+    card,
+    webBaseUrl,
+    threadId,
+    workspaceId,
+  );
   if (!withLinks.changed) {
     return card;
   }
@@ -153,8 +175,8 @@ function rewriteFeishuCardLinksWithinBudget(
   if (Buffer.byteLength(JSON.stringify(candidate), "utf8") <= FEISHU_CARD_MAX_BYTES) {
     return candidate;
   }
-  if (threadId) {
-    const degraded = rewriteFeishuCardMarkdownValue(card, webBaseUrl, null);
+  if (threadId || workspaceId) {
+    const degraded = rewriteFeishuCardMarkdownValue(card, webBaseUrl, null, null);
     if (degraded.changed) {
       const fallback = degraded.value as Record<string, unknown>;
       if (Buffer.byteLength(JSON.stringify(fallback), "utf8") <= FEISHU_CARD_MAX_BYTES) {
@@ -1439,14 +1461,27 @@ export class DataTaskNotificationService {
 
       const usePlainFeishu =
         item.kind === "text" && item.plain === true && platform === "feishu";
-      const outboundItemText =
+      const rawItemText =
         item.kind === "feishu_card" || !item.text
           ? ""
           : rewriteSandboxLinks(
               item.text,
               this.webBaseUrl,
               plan.thread_id ?? null,
+              plan.workspace_id ?? null,
             );
+      const monitorUrl =
+        typeof plan.monitor_url === "string" && plan.monitor_url.trim().length > 0
+          ? plan.monitor_url.trim()
+          : null;
+      const isLastItem = item.item_index === planItems[planItems.length - 1]?.item_index;
+      const outboundItemText =
+        rawItemText &&
+        monitorUrl &&
+        isLastItem &&
+        !rawItemText.includes(monitorUrl)
+          ? `${rawItemText}\n\n查看监控面板：${monitorUrl}`
+          : rawItemText;
       const textChunks =
         item.kind === "feishu_card"
           ? []
@@ -1834,6 +1869,7 @@ export class DataTaskNotificationService {
             item.card,
             this.webBaseUrl,
             plan.thread_id ?? null,
+            plan.workspace_id ?? null,
           );
           const sendRes = await readyAdapter.sendCard!({
             targetAddress,

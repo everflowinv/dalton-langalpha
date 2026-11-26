@@ -442,9 +442,11 @@ def test_switch_thread_model_only_on_main_agent_not_subagents():
     from ptc_agent.core.mcp_registry import MCPRegistry
     from ptc_agent.core.paths import SandboxLayout
     from ptc_agent.core.sandbox import PTCSandbox
+    from ptc_agent.core.sandbox.asset_gate import AssetGate
 
     fake_llm = GenericFakeChatModel(messages=iter([]))
     sandbox = create_autospec(PTCSandbox, instance=True)
+    sandbox.assets = AssetGate()
     sandbox.config = config
     sandbox.sandbox_id = "sb-1"
     sandbox.working_dir = "/home/workspace"

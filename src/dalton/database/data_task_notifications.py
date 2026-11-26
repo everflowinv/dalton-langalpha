@@ -93,6 +93,7 @@ class AuthorizedDataTaskTarget:
     plan: ResolvedDataTaskPlan | None = None
     create_outer_row: bool = True
     thread_id: str | None = None
+    workspace_id: str | None = None
 
 
 def build_data_task_item_delivery_key(
@@ -431,6 +432,14 @@ def _authorized_target_from_report(decision: Mapping[str, Any]) -> AuthorizedDat
         ).strip()
         or None
     )
+    workspace_id = (
+        str(
+            decision.get("workspace_id")
+            or payload_map.get("workspace_id")
+            or ""
+        ).strip()
+        or None
+    )
     return AuthorizedDataTaskTarget(
         allowed=True,
         run_id=plan.run_id,
@@ -445,6 +454,7 @@ def _authorized_target_from_report(decision: Mapping[str, Any]) -> AuthorizedDat
         plan=plan,
         create_outer_row=False,
         thread_id=thread_id,
+        workspace_id=workspace_id,
     )
 
 
@@ -1257,6 +1267,46 @@ async def _persist_reconcile_identity_on_outer_delivery(
     return OuterIdentityEnforcementResult(ok=True, metadata=expected_meta)
 
 
+async def _resolve_data_task_monitor_url(
+    auth: AuthorizedDataTaskTarget,
+) -> str | None:
+    """Resolve optional ``monitor_url`` for a data-job bound monitor when allowed."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+    from src.dalton.monitors import db as monitor_db
+    from src.dalton.monitors.data_job_registry import get_registered_monitor_bindings
+    from src.dalton.monitors.permissions import (
+        can_view_monitor,
+        is_monitor_capability_enabled,
+    )
+    from src.dalton.notify.dispatch import normalize_public_web_base_url
+    from src.dalton.settings import get_dalton_public_app_url
+
+    if not (
+        has_capability(CapabilityId.CHANNEL_GATEWAY)
+        and has_capability(CapabilityId.DATA_JOBS)
+    ):
+        return None
+    bindings = get_registered_monitor_bindings(auth.job_key)
+    if not bindings:
+        return None
+    public_base = normalize_public_web_base_url(get_dalton_public_app_url())
+    if not public_base:
+        return None
+    monitor = await monitor_db.get_monitor_by_data_job(auth.job_key)
+    if monitor is None:
+        monitor = await monitor_db.get_monitor_by_slug(bindings[0].slug)
+    if monitor is None or not is_monitor_capability_enabled(monitor):
+        return None
+    if auth.target_kind == "group":
+        # Group targets may be read by company members; only expose public/company monitors.
+        if monitor.visibility not in ("public", "company"):
+            return None
+    else:
+        if not await can_view_monitor(monitor, auth.owner_user_id):
+            return None
+    return f"{public_base}/monitors/{monitor.slug}"
+
+
 async def authorize_data_task_notification_plan(
     *,
     run_id: str,
@@ -1357,11 +1407,14 @@ async def authorize_data_task_notification_plan(
                     "canonical_target_address": auth.canonical_target_address,
                     "recipient_id": auth.recipient_id,
                     "items": wire_items,
+                    "thread_id": auth.thread_id,
+                    "workspace_id": auth.workspace_id,
                 }
                 if auth.owner_platform_user_id is not None:
                     plan_payload["owner_platform_user_id"] = auth.owner_platform_user_id
-                if auth.thread_id:
-                    plan_payload["thread_id"] = auth.thread_id
+                monitor_url = await _resolve_data_task_monitor_url(auth)
+                if monitor_url:
+                    plan_payload["monitor_url"] = monitor_url
                 return plan_payload
 
 

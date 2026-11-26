@@ -12,7 +12,7 @@ import {
 import { checkAttachment } from '@/pages/ChatAgent/utils/api/attachments';
 import { apiErrorStatus } from '@/api/errors';
 import { inferImageMimeType } from '@/pages/ChatAgent/utils/fileUpload'; // DALTON-HOOK(mobile-web)
-import { classifyUploadError } from '@/pages/ChatAgent/utils/partUpload';
+import { classifyUploadError } from '@/lib/partUpload';
 import {
   cancelChatUpload,
   formatUploadErrorMessage,

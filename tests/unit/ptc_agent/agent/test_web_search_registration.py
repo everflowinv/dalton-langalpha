@@ -33,6 +33,7 @@ from ptc_agent.config.file_utils import load_yaml_config
 from ptc_agent.config.loaders import load_from_dict
 from ptc_agent.core.mcp_registry import MCPRegistry
 from ptc_agent.core.paths import SandboxLayout, WorkspaceLayout
+from ptc_agent.core.sandbox.asset_gate import AssetGate
 from ptc_agent.core.sandbox.livefs_mount import MountHandle
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 from src.config.core import clear_config_cache
@@ -108,6 +109,7 @@ def _build_and_capture_tools(
         return real_task_middleware(subagents, *args, **kwargs)
 
     sandbox = create_autospec(PTCSandbox, instance=True)
+    sandbox.assets = AssetGate()
     sandbox.config = config.to_core_config()
     sandbox.working_dir = "/home/workspace"
     sandbox.layout = SandboxLayout(root="/home/workspace")

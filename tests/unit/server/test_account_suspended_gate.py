@@ -40,8 +40,8 @@ MESSAGE = (
 
 
 def _gated() -> set:
-    from src.dalton.app import transcriptions
-    from src.server.app import livefs
+    from src.dalton.app import transcriptions  # DALTON-HOOK(dalton-auth)
+    from src.server.app import drive_mount, livefs
 
     return {
         api.get_current_user_id,
@@ -51,6 +51,7 @@ def _gated() -> set:
         api.get_stamp_auth,
         get_principal,
         livefs._caller,
+        drive_mount._caller,
         # DALTON-HOOK(dalton-auth): transcription routes admit session or task-ticket callers.
         transcriptions._transcription_caller_gate,
     }
@@ -157,6 +158,9 @@ NO_USER_CREDENTIAL = {
     ("POST", "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim"),
     ("POST", "/api/v1/dalton/channels/internal/deliveries/progress"),
     ("POST", "/api/v1/dalton/channels/internal/deliveries/{delivery_key}/preflight-send"),
+    ("POST", "/api/v1/dalton/channels/internal/deliveries/{delivery_key}/verify-dm-recipient"),
+    ("GET", "/api/v1/dalton/channels/internal/deliverables/download"),
+    ("POST", "/api/v1/dalton/channels/internal/topics/lookup"),
     ("POST", "/api/v1/dalton/channels/internal/gateway-lease/acquire"),
     ("POST", "/api/v1/dalton/channels/internal/gateway-lease/heartbeat"),
     ("POST", "/api/v1/dalton/channels/internal/gateway-lease/release"),
@@ -436,7 +440,7 @@ async def test_the_file_mount_closes_with_the_account():
 
     stack, _ = _deployment(SUSPENDED)
     with stack, patch(
-        "src.server.app.livefs.authenticate",
+        "src.server.services.livefs.tokens.authenticate",
         AsyncMock(return_value=LivefsIdentity("c-1", "u", "/root")),
     ):
         transport = httpx.ASGITransport(app=app)

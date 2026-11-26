@@ -443,12 +443,22 @@ function classifyLinkDestination(rawDest: string): DestinationClassification {
 function buildDeepLinkUrl(
   classification: Extract<DestinationClassification, { kind: "workspace_file" }>,
   publicWebBaseUrl: string,
-  normalizedThreadId: string,
-): string {
+  normalizedThreadId: string | null,
+  normalizedWorkspaceId: string | null = null,
+): string | null {
   if (classification.workspaceId) {
+    if (!normalizedThreadId) {
+      return null;
+    }
     return `${publicWebBaseUrl}/chat/${encodeURIComponent(classification.workspaceId)}?file=${encodeFileParam(classification.deepLinkPath)}`;
   }
-  return `${publicWebBaseUrl}/chat/t/${encodeURIComponent(normalizedThreadId)}?file=${encodeFileParam(classification.deepLinkPath)}`;
+  if (normalizedThreadId) {
+    return `${publicWebBaseUrl}/chat/t/${encodeURIComponent(normalizedThreadId)}?file=${encodeFileParam(classification.deepLinkPath)}`;
+  }
+  if (normalizedWorkspaceId) {
+    return `${publicWebBaseUrl}/chat/${encodeURIComponent(normalizedWorkspaceId)}?file=${encodeFileParam(classification.deepLinkPath)}`;
+  }
+  return null;
 }
 
 function formatWorkspaceFileLink(
@@ -456,17 +466,70 @@ function formatWorkspaceFileLink(
   classification: Extract<DestinationClassification, { kind: "workspace_file" }>,
   publicWebBaseUrl: string | null,
   normalizedThreadId: string | null,
+  normalizedWorkspaceId: string | null = null,
 ): string {
-  if (publicWebBaseUrl && normalizedThreadId) {
+  if (publicWebBaseUrl) {
     const url = buildDeepLinkUrl(
       classification,
       publicWebBaseUrl,
       normalizedThreadId,
+      normalizedWorkspaceId,
     );
-    return `[${label || classification.displayPath}](${url})`;
+    if (url) {
+      return `[${label || classification.displayPath}](${url})`;
+    }
   }
   const hint = `（在网页工作区查看：${classification.displayPath}）`;
   return label ? `${label}${hint}` : hint;
+}
+
+/**
+ * Format a standalone sign-in-protected web deep-link line for a workspace file
+ * (used when group targets or DM deliverable fallbacks link to the web UI
+ * instead of uploading binary attachments).
+ */
+export function buildWorkspaceFileDeepLinkLine(
+  filename: string,
+  workspacePath: string,
+  webBaseUrl: string | null | undefined,
+  threadId?: string | null,
+  workspaceId?: string | null,
+  currentWorkspaceId?: string | null,
+): string {
+  const cleanName = (filename || workspacePath.split("/").pop() || workspacePath).trim();
+  const cleanPath = workspacePath.trim().replace(/^\/+/, "");
+  const publicWebBaseUrl = normalizePublicWebBaseUrl(webBaseUrl);
+  const normalizedThreadId = (threadId ?? "").trim() || null;
+  const normalizedWorkspaceId = (workspaceId ?? "").trim() || null;
+  const normalizedCurrentWorkspaceId = (currentWorkspaceId ?? "").trim() || null;
+  const isCrossWorkspace = Boolean(
+    normalizedWorkspaceId &&
+      normalizedCurrentWorkspaceId &&
+      normalizedWorkspaceId !== normalizedCurrentWorkspaceId,
+  );
+  const classification: Extract<
+    DestinationClassification,
+    { kind: "workspace_file" }
+  > = {
+    kind: "workspace_file",
+    deepLinkPath: cleanPath,
+    displayPath: cleanPath,
+    ...(isCrossWorkspace && normalizedThreadId && normalizedWorkspaceId
+      ? { workspaceId: normalizedWorkspaceId }
+      : {}),
+  };
+  if (publicWebBaseUrl) {
+    const url = buildDeepLinkUrl(
+      classification,
+      publicWebBaseUrl,
+      normalizedThreadId,
+      normalizedWorkspaceId,
+    );
+    if (url) {
+      return `📎 ${cleanName} — 请前往网页查看：[${cleanName}](${url})`;
+    }
+  }
+  return `📎 ${cleanName}（在网页工作区查看：${cleanPath}）`;
 }
 
 function findClosingBacktickRun(
@@ -769,6 +832,7 @@ function rewriteUnprotectedGap(
   gap: string,
   publicWebBaseUrl: string | null,
   normalizedThreadId: string | null,
+  normalizedWorkspaceId: string | null = null,
 ): string {
   if (!gap) return gap;
   const out: string[] = [];
@@ -830,6 +894,7 @@ function rewriteUnprotectedGap(
                 classified,
                 publicWebBaseUrl,
                 normalizedThreadId,
+                normalizedWorkspaceId,
               ),
             );
           } else {
@@ -933,6 +998,7 @@ export function rewriteSandboxLinks(
   text: string,
   webBaseUrl: string | null | undefined,
   threadId?: string | null,
+  workspaceId?: string | null,
 ): string {
   if (!text || typeof text !== "string") {
     return text;
@@ -944,6 +1010,7 @@ export function rewriteSandboxLinks(
 
   const publicWebBaseUrl = normalizePublicWebBaseUrl(webBaseUrl);
   const normalizedThreadId = (threadId ?? "").trim() || null;
+  const normalizedWorkspaceId = (workspaceId ?? "").trim() || null;
 
   const tree = parseChannelMarkdown(text);
 
@@ -1048,19 +1115,10 @@ export function rewriteSandboxLinks(
         return;
       }
       if (info.classification.kind === "workspace_file") {
-        if (publicWebBaseUrl && normalizedThreadId) {
-          const deepUrl = buildDeepLinkUrl(
-            info.classification,
-            publicWebBaseUrl,
-            normalizedThreadId,
-          );
-          actions.push({
-            start: offsets.start,
-            end: offsets.end,
-            kind: "edit",
-            replacement: `[${info.rawLabel}]: ${deepUrl}${formatDefinitionTitle(info.title)}`,
-          });
-        } else if (info.referencedCount > 0) {
+        // Referenced workspace definitions are always expanded inline at each
+        // reference site (so splitTextChunks never splits a reference from its
+        // definition) and their definition line is removed.
+        if (info.referencedCount > 0) {
           const bounds = expandRemovedDefinitionBounds(
             text,
             offsets.start,
@@ -1074,12 +1132,29 @@ export function rewriteSandboxLinks(
             clampToCursor: true,
           });
         } else {
-          actions.push({
-            start: offsets.start,
-            end: offsets.end,
-            kind: "edit",
-            replacement: `${info.rawLabel}（在网页工作区查看：${info.classification.displayPath}）`,
-          });
+          const deepUrl = publicWebBaseUrl
+            ? buildDeepLinkUrl(
+                info.classification,
+                publicWebBaseUrl,
+                normalizedThreadId,
+                normalizedWorkspaceId,
+              )
+            : null;
+          if (deepUrl) {
+            actions.push({
+              start: offsets.start,
+              end: offsets.end,
+              kind: "edit",
+              replacement: `[${info.rawLabel}]: ${deepUrl}${formatDefinitionTitle(info.title)}`,
+            });
+          } else {
+            actions.push({
+              start: offsets.start,
+              end: offsets.end,
+              kind: "edit",
+              replacement: `${info.rawLabel}（在网页工作区查看：${info.classification.displayPath}）`,
+            });
+          }
         }
         return;
       }
@@ -1146,31 +1221,27 @@ export function rewriteSandboxLinks(
       );
       const refLabel = extracted?.label ?? node.alt ?? node.label ?? "";
       if (info.classification.kind === "workspace_file") {
-        if (publicWebBaseUrl && normalizedThreadId) {
-          if (isImage) {
-            // Convert `![alt][id]` -> `[alt][id]` so it renders as a clickable link reference
-            actions.push({
-              start: offsets.start,
-              end: offsets.end,
-              kind: "edit",
-              replacement: text.slice(offsets.start + 1, offsets.end),
-            });
-          } else {
-            actions.push({ start: offsets.start, end: offsets.end, kind: "protect" });
-          }
-        } else {
+        if (insideOuterLink) {
           actions.push({
             start: offsets.start,
             end: offsets.end,
             kind: "edit",
-            replacement: formatWorkspaceFileLink(
-              refLabel,
-              info.classification,
-              null,
-              null,
-            ),
+            replacement: refLabel || info.classification.displayPath,
           });
+          return;
         }
+        actions.push({
+          start: offsets.start,
+          end: offsets.end,
+          kind: "edit",
+          replacement: formatWorkspaceFileLink(
+            refLabel,
+            info.classification,
+            publicWebBaseUrl,
+            normalizedThreadId,
+            normalizedWorkspaceId,
+          ),
+        });
         return;
       }
       // local_preview reference
@@ -1229,6 +1300,7 @@ export function rewriteSandboxLinks(
             classification,
             publicWebBaseUrl,
             normalizedThreadId,
+            normalizedWorkspaceId,
           ),
         });
         return;
@@ -1304,6 +1376,7 @@ export function rewriteSandboxLinks(
           classification,
           publicWebBaseUrl,
           normalizedThreadId,
+          normalizedWorkspaceId,
         ),
       });
       return;
@@ -1342,6 +1415,7 @@ export function rewriteSandboxLinks(
           text.slice(cursor, action.start),
           publicWebBaseUrl,
           normalizedThreadId,
+          normalizedWorkspaceId,
         ),
       );
     }
@@ -1359,6 +1433,7 @@ export function rewriteSandboxLinks(
         text.slice(cursor),
         publicWebBaseUrl,
         normalizedThreadId,
+        normalizedWorkspaceId,
       ),
     );
   }

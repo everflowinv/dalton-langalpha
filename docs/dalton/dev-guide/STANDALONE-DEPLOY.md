@@ -120,7 +120,7 @@ docker compose -p "${PROJECT_NAME}" -f docker-compose.yml -f docker-compose.core
 
 启动流程按顺序完成：
 1. 拉起 `postgres`（含 `pgvector` 向量扩展）、`redis`（Valkey 8）与 `minio`；
-2. 运行一次性容器 `minio-init` 建立私有存储桶 `chat-uploads`；
+2. 运行一次性容器 `minio-init` 建立私有存储桶 `chat-uploads`（后续若计划启用 Drive 功能，请在开启前通过 MinIO 原生的 `stale_uploads_expiry` 配置未完成分片清理）；
 3. 运行一次性容器 `migrate` 通过 PostgreSQL 咨询锁串行执行上游与 Dalton 两条 Alembic（数据库表结构迁移工具）迁移链至最新版本；
 4. 启动 `backend`、`crawler` 与 `edge`。
 

@@ -1,0 +1,36 @@
+{
+  "cases": [
+    {
+      "expected": "请查阅 [Q3 季报](https://dalton.example.com/chat/t/11111111-1111-4111-8111-111111111111?file=%2Fhome%2Fworkspace%2Fresults%2FQ3%20report.md)。\n",
+      "input": "请查阅 [Q3 季报][ref]。\n\n[ref]: /home/workspace/results/Q3%20report.md",
+      "name": "percent_encoded_space_in_ref_def"
+    },
+    {
+      "expected": "先看 [季度复盘](https://dalton.example.com/chat/t/11111111-1111-4111-8111-111111111111?file=%2Fhome%2Fworkspace%2Fresults%2FQ3%20report.md)，再看结论。\n\n\n结论如上。",
+      "input": "先看 [季度复盘][q3]，再看结论。\n\n[q3]: </home/workspace/results/Q3 report.md>\n\n结论如上。",
+      "name": "angle_bracket_space_in_ref_def_mid_doc"
+    },
+    {
+      "expected": "见 [多行引用](https://dalton.example.com/chat/t/11111111-1111-4111-8111-111111111111?file=%2Fhome%2Fworkspace%2Fresults%2FQ3%20report.md)。\n",
+      "input": "见 [多行引用][ml]。\n\n[ml]:\n  /home/workspace/results/Q3%20report.md",
+      "name": "multiline_def_dest_on_next_line"
+    },
+    {
+      "expected": "见 [带标题多行](https://dalton.example.com/chat/t/11111111-1111-4111-8111-111111111111?file=%2Fhome%2Fworkspace%2Fresults%2FQ3%20report.md)。\n",
+      "input": "见 [带标题多行][ml2]。\n\n[ml2]:\n  </home/workspace/results/Q3 report.md>\n  \"Q3 Report\"",
+      "name": "multiline_def_angle_dest_and_title_on_next_lines"
+    },
+    {
+      "expected": "详见 [`季度报告`](https://dalton.example.com/chat/t/11111111-1111-4111-8111-111111111111?file=%2Fhome%2Fworkspace%2Fresults%2FQ3%20report.md)。\n",
+      "input": "详见 [`季度报告`][ref]。\n\n[ref]: /home/workspace/results/Q3%20report.md",
+      "name": "code_label_reference_link"
+    },
+    {
+      "expected": "详见 [季度报告](https://dalton.example.com/chat/t/11111111-1111-4111-8111-111111111111?file=%2Fhome%2Fworkspace%2Fresults%2FQ3%20report.md)。",
+      "input": "详见 [季度报告](</home/workspace/results/Q3 report.md>)。",
+      "name": "angle_bracket_space_in_inline_link"
+    }
+  ],
+  "public_base": "https://dalton.example.com",
+  "thread_id": "11111111-1111-4111-8111-111111111111"
+}

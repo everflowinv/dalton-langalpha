@@ -754,6 +754,11 @@
         "gate": "none",
         "min_tier": null
       },
+      "drive": {
+        "enabled": false,
+        "gate": null,
+        "min_tier": null
+      },
       "market_watch": {
         "enabled": false,
         "gate": "opt_in",

@@ -19,6 +19,9 @@ class EditTextResult(TypedDict, total=False):
     message: str
     occurrences: int
     size: int
+    # DALTON-HOOK(channel-deliverables): exact written UTF-8 byte digest & byte length from aedit_file_text
+    written_sha256: str
+    written_size: int
 
 
 class WriteTextResult(TypedDict, total=False):
@@ -42,3 +45,15 @@ class GrepAnswer(list):
     def __init__(self, entries: Iterable[Any] = (), notes: Iterable[str] = ()) -> None:
         super().__init__(entries)
         self.notes = tuple(notes)
+
+
+class RouteRefused(Exception):
+    """A file call a route refused for a reason it words for the agent (the
+    file is read-only, too large, holds what the store cannot, or failed a
+    check), which the file tools answer as ``ERROR: <text>``."""
+
+
+class RouteUnavailable(Exception):
+    """A route that could not answer a Glob or Grep. The search answers with
+    what the rest found and this as a note naming what it left out, rather
+    than failing whole for one server-held folder."""

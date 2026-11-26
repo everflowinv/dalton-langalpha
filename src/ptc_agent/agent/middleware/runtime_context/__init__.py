@@ -2,7 +2,7 @@
 
 Three surfaces, split by how long the content lives.
 ``BaselineContextMiddleware`` freezes the per-thread baseline (agent.md, the
-memory indices, the memo pointer, identity, and the harness-authored blocks
+memory indices, identity, and the harness-authored blocks
 in ``harness_blocks.py``) into ``runtime_baseline`` at the turn
 boundary and re-renders it byte-identically as a system block on every call. Everything that is true for one turn is a durable row written once into
 ``messages`` (``durable.py``) so it keeps its place in time: the turn's own
@@ -20,7 +20,6 @@ from .baseline import (
     BaselineContextMiddleware,
     BaselineSources,
     BlockReader,
-    MemoSource,
     MemoryTierSource,
 )
 from .carrier import (
@@ -62,7 +61,7 @@ from .envelope import (
     render_stamp,
 )
 from .epoch import BaselineEpoch, Observations, advance_epoch
-from .frozen_prompt import FrozenPromptMiddleware
+from .frozen_prompt import FrozenPromptMiddleware, prompt_says_mounted
 from .harness_blocks import HARNESS_BLOCKS, HarnessBlock
 from .state import STATE_BASELINE
 from .surface import (
@@ -76,6 +75,7 @@ from .tail import RowCarrierMiddleware
 from .templates import render_template
 from .turn import (
     ELAPSED_MIN_GAP,
+    FILE_MOUNT_ROW_KIND,
     NON_CHANGE_ROW_KINDS,
     NOTICE_ROW_KINDS,
     SUBAGENTS_ROW_KIND,
@@ -104,6 +104,7 @@ __all__ = [
     "ENVELOPE_HARD_CAP_TOKENS",
     "ENVELOPE_OPEN",
     "ENVELOPE_STEADY_TOKENS",
+    "FILE_MOUNT_ROW_KIND",
     "HARNESS_BLOCKS",
     "KNOWN_SURFACES",
     "NON_CHANGE_ROW_KINDS",
@@ -131,7 +132,6 @@ __all__ = [
     "FrozenPromptMiddleware",
     "HarnessBlock",
     "HomeAway",
-    "MemoSource",
     "MemoryTierSource",
     "Observations",
     "PinSite",
@@ -152,6 +152,7 @@ __all__ = [
     "last_stated",
     "may_hold_breakpoint",
     "parse_surface",
+    "prompt_says_mounted",
     "render_diff",
     "render_template",
     "render_stamp",

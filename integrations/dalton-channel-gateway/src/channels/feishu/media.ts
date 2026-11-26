@@ -513,6 +513,7 @@ export async function sendMediaFeishu(
     mimeType?: string;
     replyToMessageId?: string | null;
     replyInThread?: boolean;
+    verifyRecipientBeforeSend?: () => Promise<void>;
   },
 ): Promise<FeishuMessageSendResult> {
   if (params.buffer.byteLength > FEISHU_MAX_FILE_UPLOAD_BYTES) {
@@ -540,6 +541,9 @@ export async function sendMediaFeishu(
       image: params.buffer,
       imageType: "message",
     });
+    if (params.verifyRecipientBeforeSend) {
+      await params.verifyRecipientBeforeSend();
+    }
     const response = await sendReplyOrFallbackDirect(client, {
       replyToMessageId,
       replyInThread,
@@ -557,6 +561,9 @@ export async function sendMediaFeishu(
     fileName: params.fileName,
     fileType,
   });
+  if (params.verifyRecipientBeforeSend) {
+    await params.verifyRecipientBeforeSend();
+  }
   const response = await sendReplyOrFallbackDirect(client, {
     replyToMessageId,
     replyInThread,

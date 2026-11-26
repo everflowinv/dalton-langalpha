@@ -6,10 +6,8 @@ import { HoverCard, HoverCardTrigger, HoverCardContent } from '@/components/ui/h
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
 import { Loader } from '@/components/ui/loader';
 import { AnimatePresence, motion, useReducedMotion } from '@/lib/framer';
-import { compactNumber } from '@/lib/format';
 import { DURATION, EASE_COLLAPSE, TWEEN } from '@/lib/motion';
 import { useIsMobile } from '@/hooks/useIsMobile'; // DALTON-HOOK(mobile-web)
-import { useLocale } from '@/hooks/useLocale';
 import { useModelName } from '@/hooks/useModelName';
 import type { ModelStatus, TurnStatus } from '../../session/types';
 import type { RetiredModel } from '../../hooks/useThreadModel';
@@ -19,6 +17,8 @@ import { CliQueueLine } from '../CliQueueNotice';
 import { ModelStatusPill } from './ModelStatusPill';
 import { RetiredModelNotice } from './RetiredModelNotice';
 import { StatusLine } from './StatusLine';
+import { CompactingLine } from './CompactingLine';
+import type { Compaction } from './compaction';
 
 /** A row with a surface of its own under the lines (the thread's error, its
  *  computer's warnings), which decides on its own whether it shows. */
@@ -39,9 +39,10 @@ interface TranscriptStatusProps {
   turnStatus: TurnStatus;
   /** The model the thread runs, which a hand-off's wait names. */
   model: string | null;
-  isCompacting: string | false;
-  /** About how many tokens the summary being written has written. */
-  compactionTokens: number | null;
+  /** The compaction under way, unless the transcript draws it above the
+   *  message whose turn it holds (MessageList's `holdLine`). A send held
+   *  behind one is said here, not as the hold's own line. */
+  compaction: Compaction | null;
   queuedSend: string | false;
   /** The thread whose due automations wait for its turn to end. */
   threadId: string;
@@ -77,8 +78,7 @@ export function TranscriptStatus({
   retired,
   turnStatus: { workspaceStarting, turnHeld, cliQueue },
   model,
-  isCompacting,
-  compactionTokens,
+  compaction,
   queuedSend,
   threadId,
   active,
@@ -86,7 +86,6 @@ export function TranscriptStatus({
   noticesDocked = false,
 }: TranscriptStatusProps): React.ReactElement {
   const { t } = useTranslation();
-  const locale = useLocale();
   const reducedMotion = useReducedMotion();
   const lines: { key: string; node: React.ReactNode }[] = [];
   if (modelStatus && isLoading) {
@@ -96,27 +95,11 @@ export function TranscriptStatus({
   if (workspaceStarting) {
     lines.push({ key: 'workspace', node: <WorkspaceStartingLine archived={workspaceStarting === 'archived'} /> });
   }
-  if (turnHeld !== null) lines.push({ key: 'turnHeld', node: <TurnHeldLine reason={turnHeld} model={model} /> });
-  if (cliQueue) lines.push({ key: 'cliQueue', node: <CliQueueLine wait={cliQueue} /> });
-  if (isCompacting) {
-    lines.push({
-      key: 'compacting',
-      node: (
-        <div className="flex items-center gap-2">
-          <StatusLine glyph={<Loader size={14} className="text-(--color-accent-primary)" />}>
-            {t(isCompacting === 'offload' ? 'chat.offloading' : 'chat.compacting')}
-          </StatusLine>
-          {/* Beside the live region rather than in it, which would read the
-              count out every time it moves; a screen reader still reaches it. */}
-          {isCompacting === 'summarize' && compactionTokens != null && (
-            <span className="text-xs tabular-nums" style={{ color: 'var(--color-text-quaternary)' }}>
-              {t('chat.compactingTokens', { value: compactNumber(compactionTokens, locale) })}
-            </span>
-          )}
-        </div>
-      ),
-    });
+  if (turnHeld !== null && turnHeld !== 'compact') {
+    lines.push({ key: 'turnHeld', node: <TurnHeldLine reason={turnHeld} model={model} /> });
   }
+  if (cliQueue) lines.push({ key: 'cliQueue', node: <CliQueueLine wait={cliQueue} /> });
+  if (compaction) lines.push({ key: 'compacting', node: <CompactingLine {...compaction} /> });
   if (queuedSend) {
     lines.push({
       key: 'queued',
@@ -175,7 +158,6 @@ export function TranscriptStatus({
 }
 
 function turnHeldKey(reason: string): string {
-  if (reason === 'compact') return 'chat.compacting';
   if (reason === 'handoff') return 'chat.turnHeld.handoff';
   return 'chat.turnHeld.other';
 }

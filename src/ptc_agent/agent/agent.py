@@ -27,6 +27,7 @@ from src.dalton.middleware.patch_tool_calls import DaltonPatchToolCallsMiddlewar
 from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware
 
 from ptc_agent.agent.middleware import (
+    AssetGateMiddleware,
     AskUserMiddleware,
     BackgroundSubagentMiddleware,
     BackgroundSubagentOrchestrator,
@@ -77,6 +78,7 @@ from ptc_agent.agent.middleware.direct_mcp import (
     direct_tool_middleware,
     direct_tool_summary,
 )
+from ptc_agent.agent.middleware.file_mount_notice import FileMountNoticeMiddleware
 from ptc_agent.agent.middleware.order_governance import OrderLedger, places_order
 from ptc_agent.agent.middleware.subagent_switch import (
     SubagentSwitchMiddleware,
@@ -223,6 +225,7 @@ class PTCAgent:
         memo_enabled: bool = True,
         user_memory_enabled: bool = True,
         user_data_enabled: bool = True,
+        drive_enabled: bool = False,
         plan_enabled: bool = False,
         crawl_enabled: bool = False,
         scratchpad_enabled: bool = False,
@@ -281,6 +284,7 @@ class PTCAgent:
             memo_enabled=memo_enabled,
             user_memory_enabled=user_memory_enabled,
             user_data_enabled=user_data_enabled,
+            drive_enabled=drive_enabled,
             market_watch_enabled=self.config.feature_enabled("market_watch"),
             plan_enabled=plan_enabled,
             crawl_enabled=crawl_enabled,
@@ -486,6 +490,11 @@ class PTCAgent:
         # id is what commands and transcripts are found by on its computer.
         workspace_id_for_memory = project.owner_id if project else None
         folder_workspace_id = project.workspace_id if project else None
+        # DALTON-HOOK(colleague-access): never expose owner's personal Drive on cross-user turns
+        fs_owner_id = workspace_owner_id or owner_id
+        is_cross_user_turn = bool(
+            user_id and fs_owner_id and str(user_id) != str(fs_owner_id)
+        )
         gates = resolve_identity_gates(
             store=store,
             user_id=owner_id,
@@ -493,6 +502,7 @@ class PTCAgent:
             workspace_id=workspace_id_for_memory,
             disable_subagents=disable_subagents,
             channels=messaging_enabled(),
+            drive=self.config.feature_enabled("drive") and not is_cross_user_turn,
         )
         if store is not None and not gates.memory:
             logger.warning(
@@ -741,6 +751,30 @@ class PTCAgent:
         # --- Build shared middleware (for both main agent and subagents) ---
         shared_middleware: list[Any] = []
 
+        # Holds a call that may run on the computer until the host has
+        # brought its synced files up to date, which a turn's first model
+        # call does not wait for. The tools named here reach only the
+        # server; the rest are named where they are built.
+        asset_gate = AssetGateMiddleware(sandbox.assets, workspace_id=workspace_id or None)
+        # DALTON-HOOK(standalone-core): skip web_search_tool when omitted; include direct x_search_tools
+        # DALTON-HOOK(x-search-direct): direct X search reaches only the server
+        asset_gate.free_of_computer(
+            tool.name
+            for tool in (
+                web_search_tool,
+                web_fetch_tool,
+                *x_search_tools,
+                get_quote,
+                get_daily_prices,
+                get_company_overview,
+                get_market_overview,
+                get_options_chain,
+                screen_stocks,
+                watch_market,
+            )
+            if tool is not None
+        )
+
         leak_detection = LeakDetectionMiddleware(
             mcp_servers=self.config.mcp.servers,
             vault_secrets=vault_secrets,
@@ -775,6 +809,10 @@ class PTCAgent:
                 ToolErrorHandlingMiddleware(),
                 leak_detection,
                 ToolResultNormalizationMiddleware(),
+                # Inside every wrapper above that can refuse a call, so a
+                # refusal answers at once, and outside the ones below that
+                # reach the computer for a call they let through.
+                asset_gate,
             ]
         )
 
@@ -958,6 +996,7 @@ class PTCAgent:
                 model=turn.label,
                 prompt_vars=gates.prompt_vars(),
                 shared=not own_data,
+                drive=gates.drive,
             )
             subagents = create_subagents(turn_roster(self.config.subagents), compiler, role)
             # DALTON-HOOK(dalton-tools): Dalton workflows drive the two
@@ -1045,6 +1084,11 @@ class PTCAgent:
             else None
         )
         shared_tools.extend(ask_user_middleware.tools)
+        # A subagent's own calls wait at the gate it shares; starting one,
+        # reading its result and asking the user reach only the server.
+        asset_gate.free_of_computer(
+            tool.name for tool in (*background_middleware.tools, *ask_user_middleware.tools)
+        )
 
         tools: list[Any] = [execute_code_tool, bash_tool, *shared_tools]
         if member_mount is not None:
@@ -1163,6 +1207,7 @@ class PTCAgent:
             memory_enabled=gates.memory,
             memo_enabled=gates.memo,
             **gates.prompt_vars(),
+            drive_enabled=gates.drive,
             plan_enabled=plan_on,
             crawl_enabled=bool(crawl_tools),
             scratchpad_enabled=scratchpad is not None,
@@ -1264,7 +1309,9 @@ class PTCAgent:
 
         model_resilience = [build_model_resilience_middleware(self.config, turn)]
 
-        multimodal_read = MultimodalMiddleware(sandbox=sandbox, computers=reach)
+        # Through the file tools' backend, so a file a route holds (the
+        # Drive's) is read from where the Read tool read it.
+        multimodal_read = MultimodalMiddleware(sandbox=filesystem_backend, computers=reach)
 
         # Placed before (outer to) model_resilience so sandbox images are
         # captured once, on the final response only — not per retry attempt.
@@ -1334,8 +1381,8 @@ class PTCAgent:
         ]
 
         # The turn row, the per-thread baseline and the row carrier, wired
-        # for the main agent: the baseline is agent.md, the memory indices, the
-        # memo pointer and the user's identity + steering. A subagent's
+        # for the main agent: the baseline is agent.md, the memory indices and
+        # the user's identity + steering. A subagent's
         # baseline is its definition's (SubagentContext): the profile, its
         # roster, skills and scratchpad, and memory when its switch is on.
         # Where each of the three has to sit is on ContextMiddleware.
@@ -1507,6 +1554,7 @@ class PTCAgent:
         # answers the main agent, not the user.
         if chart_annotation:
             tools.extend(CHART_LAYER_TOOLS)
+            asset_gate.free_of_computer(tool.name for tool in CHART_LAYER_TOOLS)
 
         # Messaging the user (send_message, list_message_targets), present only
         # when a channel gateway is configured. Main agent only, added after the
@@ -1515,18 +1563,28 @@ class PTCAgent:
         # their own chats, and in a shared workspace other members write what
         # steers this agent.
         if own_data:
-            tools.extend(build_messaging_tools(role, computers=reach))
+            messaging_tools = build_messaging_tools(role, computers=reach)
+            tools.extend(messaging_tools)
+            # Listing where a message can go asks only the gateway; sending
+            # one attaches files from the computer.
+            asset_gate.free_of_computer(
+                tool.name for tool in messaging_tools if tool.name == "list_message_targets"
+            )
 
         # The agent's own follow-ups on this thread, main agent only and
         # added after the subagent snapshot: a wakeup comes back to the
         # thread, and a subagent has no thread of its own to come back to.
         if wakeups_on:
-            tools.append(build_schedule_wakeup_tool(watch_elsewhere=own_data))
+            wakeup_tool = build_schedule_wakeup_tool(watch_elsewhere=own_data)
+            tools.append(wakeup_tool)
+            asset_gate.free_of_computer([wakeup_tool.name])
 
         # The plan the user follows while the agent works, main agent only:
         # it is drawn in the thread's chat, which a subagent has no part of.
         if plan_on:
-            tools.append(build_update_plan_tool())
+            plan_tool = build_update_plan_tool()
+            tools.append(plan_tool)
+            asset_gate.free_of_computer([plan_tool.name])
 
         # Answering the user's comments on files, main agent only and added
         # after the subagent snapshot: comments are sent to a thread, and a
@@ -1542,19 +1600,21 @@ class PTCAgent:
         from src.dalton.settings import is_artifact_publishing_enabled
 
         if thread_id and is_artifact_publishing_enabled():
-            tools.append(create_reply_to_comment_tool())
+            reply_to_comment_tool = create_reply_to_comment_tool()
+            tools.append(reply_to_comment_tool)
+            asset_gate.free_of_computer([reply_to_comment_tool.name])
 
         # What will report back to the thread, main agent only for the same
         # reason: a subagent's own commands wait, and its result covers them.
         if thread_id:
-            tools.append(
-                build_thread_status_tool(
-                    thread_id=thread_id,
-                    user_id=str(user_id) if user_id else None,
-                    analysts=role == "chief_of_staff",
-                    registry=_bg_registry,
-                )
+            thread_status_tool = build_thread_status_tool(
+                thread_id=thread_id,
+                user_id=str(user_id) if user_id else None,
+                analysts=role == "chief_of_staff",
+                registry=_bg_registry,
             )
+            tools.append(thread_status_tool)
+            asset_gate.free_of_computer([thread_status_tool.name])
 
         # Main agent middleware (includes SubAgentMiddleware + main_only)
         # Ordering matters for prompt caching:
@@ -1644,6 +1704,11 @@ class PTCAgent:
                     storage_owner_id=workspace_owner_id or user_id,
                 ),
                 context.baseline,
+                # After the baseline, whose epoch holds what the prompt says
+                # of the mount.
+                FileMountNoticeMiddleware(
+                    sandbox, files_mounted=files_mounted, waits_for_start=claude_code
+                ),
                 notes_rows,
                 # Market watch (main agent only): writes the <market-watch>
                 # price stamp into history as a row while a watched venue is
@@ -1680,6 +1745,7 @@ class PTCAgent:
             from src.tools.secretary.chief_of_staff import CHIEF_OF_STAFF_TOOLS
 
             tools = [*tools, *CHIEF_OF_STAFF_TOOLS]
+            asset_gate.free_of_computer(tool.name for tool in CHIEF_OF_STAFF_TOOLS)
         # DALTON-HOOK(dalton-tools): bind role-scoped Dalton knowledge/publish/director tools onto the main agent (PK.4, PK.11, PK.19).
         # ``user_tier`` (resolved by the async builder) withholds internal-only
         # tools from external members here, at mount time.
@@ -1687,6 +1753,8 @@ class PTCAgent:
         tools = [*tools, *dalton_tools]
         if direct_tools:
             tools = [*tools, *direct_tools]
+            # Dialed from the server through the relay, never from the computer.
+            asset_gate.free_of_computer(tool.name for tool in direct_tools)
 
         agent: Any = create_agent(
             turn.client,

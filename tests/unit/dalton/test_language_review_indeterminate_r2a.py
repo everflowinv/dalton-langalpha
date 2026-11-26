@@ -36,7 +36,8 @@ from src.dalton.llm.complete import DaltonCompleteResult, dalton_complete  # noq
 from src.dalton.publish import language as language_mod  # noqa: E402
 from src.dalton.publish.language import run_check_language  # noqa: E402
 from ptc_agent.agent.backends.sandbox import SandboxBackend  # noqa: E402
-from ptc_agent.core.paths import DEFAULT_LAYOUT, resolve_agent_path  # noqa: E402
+from ptc_agent.core.path_fold import resolve_agent_path  # noqa: E402
+from ptc_agent.core.paths import DEFAULT_LAYOUT  # noqa: E402
 
 SCHEMA = {"type": "object", "properties": {"issues": {"type": "array"}}, "required": ["issues"]}
 LANG_SUB = "lang-review-oauth"  # "-oauth" suffix: subscription-billed

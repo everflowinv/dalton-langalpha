@@ -11,6 +11,7 @@ import structlog
 
 
 from ptc_agent.config.core import CoreConfig
+from ptc_agent.core.sandbox.asset_gate import AssetGate
 from ptc_agent.core.sandbox._defaults import (
     DEFAULT_DEPENDENCIES,
     SANDBOX_IMAGE_ENV,
@@ -32,6 +33,7 @@ from ptc_agent.core.sandbox.jobs import (
     Running,
     StoppedJob,
 )
+from ptc_agent.core.sandbox.drive_mount import NO_DRIVE, DriveHandle
 from ptc_agent.core.sandbox.livefs_mount import (
     CallFiler,
     HistoryFiles,
@@ -104,6 +106,9 @@ class PTCSandbox:
         # Set by the host while the file mount serves this sandbox; None
         # means the store-backed paths are not on its filesystem.
         self.livefs: MountHandle | None = None
+        # Held by the host while it brings a workspace's synced files up to
+        # date off a turn's path; the agent's calls on the computer wait on it.
+        self.assets = AssetGate()
         # Set by the host: files who each command's call runs for, which a
         # save through the mount and a call the ``la`` CLI makes both read.
         self.call_filer: CallFiler | None = None
@@ -113,6 +118,10 @@ class PTCSandbox:
         # Set by the host on a machine the mount never serves, whose past
         # threads the file tools then read in process.
         self.history: HistoryFiles | None = None
+        # Set by the host at each acquire: its view of the Drive mount here,
+        # which the tools ask before a call names the Drive. Until then the
+        # Drive is none of this sandbox's business.
+        self.drive: DriveHandle = NO_DRIVE
         # A reconnect found the mount gone: it booted the sandbox, or nothing
         # answered at the mount's path. The host records that before it next
         # reads what was recorded of the mount, which still says it serves.
@@ -1191,6 +1200,7 @@ class PTCSandbox:
         reusing_sandbox: bool = False,
         force_refresh: bool = False,
         rebuild_overlay: bool = False,
+        known_layout_version: int | None = None,
         project: "ProjectContext | None" = None,
         root_owner_dir_name: str | None = None,
         workspace_dir_names: tuple[str, ...] = (),
@@ -1204,6 +1214,7 @@ class PTCSandbox:
             reusing_sandbox=reusing_sandbox,
             force_refresh=force_refresh,
             rebuild_overlay=rebuild_overlay,
+            known_layout_version=known_layout_version,
             project=project,
             root_owner_dir_name=root_owner_dir_name,
             workspace_dir_names=workspace_dir_names,
@@ -1265,10 +1276,14 @@ class PTCSandbox:
         return await _mcp_setup._upload_discovery_client(self, extra_servers)
 
     async def _install_tool_modules(
-        self, *, project: ProjectContext, tool_version: str | None = None
+        self,
+        *,
+        project: ProjectContext,
+        mcp_registry: MCPRegistry,
+        tool_version: str | None = None,
     ) -> None:
         return await _tool_overlay.install_tool_modules(
-            self, project=project, tool_version=tool_version
+            self, project=project, mcp_registry=mcp_registry, tool_version=tool_version
         )
 
     async def _missing_tool_modules(

@@ -30,7 +30,8 @@ from src.dalton.tools.publish_tools import (
     create_publish_tools,
 )
 from ptc_agent.agent.backends.sandbox import SandboxBackend
-from ptc_agent.core.paths import DEFAULT_LAYOUT, resolve_agent_path
+from ptc_agent.core.path_fold import resolve_agent_path
+from ptc_agent.core.paths import DEFAULT_LAYOUT
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DRAFT = "drafts/2026-10-23-call-META.md"

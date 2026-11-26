@@ -88,6 +88,7 @@ from ptc_agent.core.mcp_registry import MCPRegistry
 from ptc_agent.core.mcp_schema import MCPToolInfo
 from ptc_agent.core.paths import SandboxLayout, WorkspaceLayout
 from ptc_agent.core.project_context import ProjectContext
+from ptc_agent.core.sandbox.asset_gate import AssetGate
 from ptc_agent.core.sandbox.livefs_mount import MountHandle
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 from ptc_agent.core.session import Session
@@ -289,6 +290,7 @@ async def _capture_production_graph_surface(
     real_mcp_tools = await _load_real_mcp_tools(config)
 
     sandbox = create_autospec(PTCSandbox, instance=True)
+    sandbox.assets = AssetGate()
     sandbox.config = core_cfg
     sandbox.working_dir = FIXED_SANDBOX_ROOT
     sandbox.layout = SandboxLayout(root=FIXED_SANDBOX_ROOT)

@@ -8,12 +8,8 @@ from typing import Any, Callable
 
 import structlog
 
-from ptc_agent.agent.backends import (
-    FilesystemBackend,
-    ReadOnlyStoreError,
-    StoreContentInvalidError,
-    StoreContentTooLargeError,
-)
+from ptc_agent.agent.backends import FilesystemBackend
+from ptc_agent.agent.backends.results import RouteRefused
 from ptc_agent.agent.backends.read_window import (
     DEFAULT_READ_LINES,
     MAX_READ_CHARS,
@@ -30,7 +26,6 @@ from ptc_agent.agent.tools.context_file_policy import (
 )
 from ptc_agent.agent.tools.utils import mark_sandbox_raised, stamp_sandbox_served
 from ptc_agent.core.paths import MEMO_USER_DIR, logged_path
-from ptc_agent.agent.backends.db_json_route import UserDataValidationError
 from ptc_agent.agent.transcript.reading import READ_CHARS as TRANSCRIPT_READ_CHARS
 from ptc_agent.agent.transcript.reading import cut_window, is_segment
 from src.observability.private_errors import failure
@@ -380,6 +375,8 @@ def create_filesystem_tools(
         except IsADirectoryError:
             logger.info("Read of a directory", file_path=logged_path(file_path))
             return f"ERROR: {file_path} is a directory. Use Glob or `ls` to list it, then Read a file in it."
+        except RouteRefused as e:
+            return f"ERROR: {e}"
         except Exception as e:
             mark_sandbox_raised(e)
             error_msg = f"Failed to read file: {e!s}"
@@ -417,26 +414,13 @@ def create_filesystem_tools(
             stamp_sandbox_served(backend, normalized_path)
             try:
                 result = await backend.awrite_text(normalized_path, content)
-            except ReadOnlyStoreError as exc:
-                logger.info(
-                    "write rejected on read-only path",
-                    file_path=logged_path(file_path),
-                )
-                return f"ERROR: {exc}"
-            except (StoreContentTooLargeError, StoreContentInvalidError) as exc:
-                logger.info(
-                    "store write refused",
-                    file_path=logged_path(file_path),
-                    error_type=type(exc).__name__,
-                )
-                return f"ERROR: {exc}"
-            except UserDataValidationError as exc:
-                # The refusal's text quotes what it refused (a holding, an
+            except RouteRefused as exc:
+                # A user-data refusal quotes what it refused (a holding, an
                 # automation's name or status), so the log keeps its type.
                 logger.info(
-                    "user-data write rejected",
+                    "write refused",
                     file_path=logged_path(file_path),
-                    error_type=exc.error_type,
+                    error_type=getattr(exc, "error_type", None) or type(exc).__name__,
                 )
                 return f"ERROR: {exc}"
             if not result:
@@ -446,13 +430,22 @@ def create_filesystem_tools(
 
             if operation_callback:
                 try:
-                    operation_callback({
+                    # DALTON-HOOK(channel-deliverables): pass exact written byte hash/size and await async callbacks
+                    import hashlib as _hashlib
+                    import inspect as _inspect
+
+                    _written_bytes = content.encode("utf-8")
+                    _cb_res = operation_callback({
                         "operation": "write_file",
                         "file_path": normalized_path,
                         "line_count": content.count("\n") + 1,
                         "timestamp": datetime.now(UTC).isoformat(),
                         "content": content,
+                        "written_sha256": _hashlib.sha256(_written_bytes).hexdigest(),
+                        "written_size": len(_written_bytes),
                     })
+                    if _inspect.isawaitable(_cb_res):
+                        await _cb_res
                 except Exception as cb_err:
                     logger.warning("Operation callback failed", error=str(cb_err))
 
@@ -523,8 +516,11 @@ def create_filesystem_tools(
 
             if operation_callback:
                 try:
+                    # DALTON-HOOK(channel-deliverables): forward exact written byte hash/size from aedit_text and await async callbacks
+                    import inspect as _inspect
+
                     content = await backend.aread_text(normalized_path)
-                    operation_callback({
+                    _cb_payload: dict[str, Any] = {
                         "operation": "edit_file",
                         "file_path": normalized_path,
                         "occurrences": result.get("occurrences", 1),
@@ -533,7 +529,14 @@ def create_filesystem_tools(
                         "old_string": old_string,
                         "new_string": new_string,
                         "content": content,
-                    })
+                    }
+                    if result.get("written_sha256") is not None:
+                        _cb_payload["written_sha256"] = result.get("written_sha256")
+                    if result.get("written_size") is not None:
+                        _cb_payload["written_size"] = result.get("written_size")
+                    _cb_res = operation_callback(_cb_payload)
+                    if _inspect.isawaitable(_cb_res):
+                        await _cb_res
                 except Exception as cb_err:
                     logger.warning("Operation callback failed", error=str(cb_err))
 

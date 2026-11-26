@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from ptc_agent.core.sandbox._shared import REPLACE_UNLESS_NEWER_SCRIPT
+from ptc_agent.core.sandbox.asset_gate import AssetGate
 from src.server.database import computer_data_tokens as db
 from src.server.services import data_token_sweep, data_tokens
 from src.server.services.data_token_sweep import DataTokenSweeper
@@ -855,16 +856,13 @@ class TestSweepSparesIdleComputers:
 
 
 class TestTheAcquireKeepsTheToken:
-    @pytest.mark.asyncio
-    async def test_a_warm_acquire_writes_the_token_when_it_runs_low(self):
-        """No asset sync runs on a warm acquire, and the sweep leaves an idle
-        computer's token to lapse, so the acquire is what renews it."""
-
+    @staticmethod
+    async def _acquire(*, later: bool):
         @asynccontextmanager
         async def in_use(_workspace_id):
             yield
 
-        session = SimpleNamespace(sandbox=SimpleNamespace(runtime=object()))
+        session = SimpleNamespace(sandbox=SimpleNamespace(runtime=object(), assets=AssetGate()))
         binding = SimpleNamespace(
             computer_id=COMPUTER_ID, root_dir="/home/workspace", dir_name=None, user_id=USER_ID
         )
@@ -874,12 +872,35 @@ class TestTheAcquireKeepsTheToken:
             _keep_computer_tokens=AsyncMock(),
             _settle_folders=AsyncMock(),
             _ensure_project_attached=AsyncMock(),
+            _catches_up_later=MagicMock(return_value=later),
+            _catch_up_soon=MagicMock(),
         )
 
         with patch("src.server.services.workspace_manager.workspace_folder_in_use", in_use):
             got = await WorkspaceManager.get_session_for_workspace(
-                manager, "ws-1", user_id=USER_ID
+                manager, "ws-1", user_id=USER_ID, assets_later=later
             )
 
         assert got is session
+        return manager, session
+
+    @pytest.mark.asyncio
+    async def test_a_warm_acquire_writes_the_token_when_it_runs_low(self):
+        """No asset sync runs on a warm acquire, and the sweep leaves an idle
+        computer's token to lapse, so the acquire is what renews it."""
+        manager, session = await self._acquire(later=False)
+
+        manager._keep_computer_tokens.assert_awaited_once_with(COMPUTER_ID, USER_ID, session.sandbox)
+        manager._catch_up_soon.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_turns_acquire_hands_the_token_to_a_catch_up(self):
+        """A mint asks another service, and only what the turn runs on the
+        computer reads the token: the gate the catch-up holds covers it."""
+        manager, session = await self._acquire(later=True)
+
+        manager._keep_computer_tokens.assert_not_awaited()
+        work = manager._catch_up_soon.call_args.args[2]
+        assert manager._catch_up_soon.call_args.kwargs == {"what": "tokens"}
+        await work()
         manager._keep_computer_tokens.assert_awaited_once_with(COMPUTER_ID, USER_ID, session.sandbox)

@@ -60,6 +60,8 @@ export interface DataTaskAuthorizePlanResponse {
   message?: string;
   run_id?: string;
   thread_id?: string | null;
+  workspace_id?: string | null;
+  monitor_url?: string | null;
   job_key?: string;
   owner_user_id?: string;
   /** Present on authorized DM plans; omitted (`undefined`) on administrator group plans. */

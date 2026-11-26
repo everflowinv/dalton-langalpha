@@ -46,7 +46,8 @@ from deepagents.backends.protocol import (
 )
 
 from ptc_agent.agent.backends.results import EditTextResult
-from ptc_agent.core.paths import langalpha_config_dir, on_file_mount, resolve_agent_path
+from ptc_agent.core.paths import langalpha_config_dir
+from ptc_agent.core.path_fold import on_file_mount, resolve_agent_path
 from ptc_agent.core.sandbox import PTCSandbox
 from ptc_agent.core.sandbox.execution import app_command
 from ptc_agent.core.sandbox.grep_render import GrepLine
@@ -200,13 +201,14 @@ class SandboxBackend(SandboxBackendProtocol):
             allowed=self.sandbox.config.filesystem.allowed_directories,
         )
 
-    def _invoke_operation_callback(self, operation: str, file_path: str, **kwargs: Any) -> None:
+    # DALTON-HOOK(channel-deliverables): Return callback result so async write/edit recorders can be awaited.
+    def _invoke_operation_callback(self, operation: str, file_path: str, **kwargs: Any) -> Any:
         """Invoke the operation callback if configured."""
         if self.operation_callback is None:
-            return
+            return None
 
         try:
-            self.operation_callback({
+            return self.operation_callback({
                 "operation": operation,
                 "file_path": file_path,
                 "timestamp": datetime.now(UTC).isoformat(),
@@ -214,6 +216,7 @@ class SandboxBackend(SandboxBackendProtocol):
             })
         except Exception:
             logger.exception("Failed to invoke operation callback", operation=operation, file_path=file_path)
+            return None
 
     async def _areserve_new_file(self, normalized_path: str) -> bool | None:
         """Atomically create an empty file if it does not exist.
@@ -328,12 +331,21 @@ class SandboxBackend(SandboxBackendProtocol):
         if not ok:
             return WriteResult(error=f"Failed to write to '{normalized_path}'")
 
-        self._invoke_operation_callback(
+        # DALTON-HOOK(channel-deliverables): include exact written byte digest & await async callback
+        import hashlib as _hashlib
+        import inspect as _inspect
+
+        _written_bytes = content.encode("utf-8")
+        _cb_res = self._invoke_operation_callback(
             "write_file",
             normalized_path,
             line_count=content.count("\n") + 1,
             content=content,
+            written_sha256=_hashlib.sha256(_written_bytes).hexdigest(),
+            written_size=len(_written_bytes),
         )
+        if _inspect.isawaitable(_cb_res):
+            await _cb_res
         return WriteResult(path=normalized_path)
 
     async def aedit(
@@ -371,7 +383,15 @@ class SandboxBackend(SandboxBackendProtocol):
                     "Could not read back edited file for the operation callback",
                     path=normalized_path,
                 )
-        self._invoke_operation_callback(
+        # DALTON-HOOK(channel-deliverables): forward exact written byte digest from aedit_file_text & await async callback
+        import inspect as _inspect
+
+        _cb_extra: dict[str, Any] = {}
+        if result.get("written_sha256") is not None:
+            _cb_extra["written_sha256"] = result.get("written_sha256")
+        if result.get("written_size") is not None:
+            _cb_extra["written_size"] = result.get("written_size")
+        _cb_res = self._invoke_operation_callback(
             "edit_file",
             normalized_path,
             occurrences=occurrences,
@@ -379,7 +399,10 @@ class SandboxBackend(SandboxBackendProtocol):
             old_string=old_string,
             new_string=new_string,
             content=content,
+            **_cb_extra,
         )
+        if _inspect.isawaitable(_cb_res):
+            await _cb_res
         return EditResult(path=normalized_path, occurrences=occurrences)
 
     def _parse_grep_matches(self, raw: Any) -> list[GrepMatch]:
@@ -514,6 +537,11 @@ class SandboxBackend(SandboxBackendProtocol):
                 return FileUploadResponse(path=path, error=f"write_failed: {exc}")
 
         return await asyncio.gather(*[_upload_one(p, c) for p, c in files])
+
+    async def adownload_file_bytes_capped(
+        self, filepath: str, cap: Callable[[bytes], int]
+    ) -> bytes | None:
+        return await self.sandbox.adownload_file_bytes_capped(self.normalize_path(filepath), cap)
 
     async def aexecute(self, command: str, *, timeout: int | None = None) -> ExecuteResponse:
         """Execute a shell command in the sandbox.
