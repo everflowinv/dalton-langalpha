@@ -908,7 +908,7 @@ function MobileHtmlOverflowMenu({
   });
   const { data: linkedArtifact } = useArtifactByPath(
     isOwner && isLinkedDoc ? workspaceId : null,
-    isLinkedDoc ? commentDocPath : null,
+    isLinkedDoc ? commentDocKey : null,
     { root },
   );
   const artifact = !isLinkedDoc ? menu.artifact : null;
@@ -949,6 +949,7 @@ function MobileHtmlOverflowMenu({
     onReview: () => openPublish?.(selectedFile),
     readAt: mobileHtmlTools?.readAt ?? null,
     enabled: Boolean(!isLinkedDoc && actions.showArtifactCrumbs && versionView),
+    updateDisabled: isPendingHtmlDoc,
   });
   const latestSeq = crumbs.latest;
   const shared = crumbs.shared;
@@ -1133,7 +1134,7 @@ function MobileHtmlOverflowMenu({
               {crumbs.showUpdate && openPublish && (
                 <DropdownMenuItem
                   disabled={crumbs.updatePending || isPendingHtmlDoc}
-                  onSelect={crumbs.onUpdate}
+                  onSelect={isPendingHtmlDoc ? undefined : crumbs.onUpdate}
                   data-testid="file-header-mobile-update"
                   title={versionStatusFullNote ?? undefined}
                 >

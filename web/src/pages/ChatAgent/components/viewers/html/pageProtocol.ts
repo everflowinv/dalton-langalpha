@@ -87,6 +87,8 @@ export type ViewerToPage =
   | { type: 'page:outlined'; id: string | null }
   /** The document's address under a renewed grant, which it moves to without loading again. */
   | { type: 'page:address'; src: string }
+  /** DALTON-HOOK(mobile-web): verify the document that finished load matches the prior page:ready. */
+  | { type: 'page:ping'; seq: number }
   /** DALTON-HOOK(monitors): deliver or renew a signed monitor grant for realtime data polling. */
   | { type: 'page:monitor-grant'; grant: string; dataBase: string; expiresIn: number };
 
@@ -210,6 +212,8 @@ export type PageToViewer =
    * the frame to that file without the view, so it carries the nested bridge.
    */
   | { type: 'page:frame-loads'; doc: string }
+  /** DALTON-HOOK(mobile-web): liveness echo confirming the loaded document is still bridged. */
+  | { type: 'page:pong'; seq: number }
   /** DALTON-HOOK(monitors): cross-monitor /monitors/* link clicked inside a sandboxed monitor frame. */
   | { type: 'page:navigate-monitor'; path: string };
 
@@ -558,6 +562,8 @@ const pageToViewer = z.discriminatedUnion('type', [
   ),
   z.object({ type: z.literal('page:key'), key: z.enum(['Escape', 'c']) }),
   z.object({ type: z.literal('page:pointer-in') }),
+  // DALTON-HOOK(mobile-web): liveness echo confirming the loaded document is still bridged
+  z.object({ type: z.literal('page:pong'), seq: z.int().check(z.gte(1)) }),
   // DALTON-HOOK(monitors): cross-monitor navigation requested from sandboxed monitor frame
   z.object({
     type: z.literal('page:navigate-monitor'),

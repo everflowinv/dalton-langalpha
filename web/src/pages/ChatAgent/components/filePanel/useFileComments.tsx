@@ -51,6 +51,8 @@ interface FileCommentsOptions {
   ui: CommentUi | undefined;
   /** DALTON-HOOK(monitors): independently enables monitor publishing in own workspace (incl. external members). */
   canPublishMonitor?: boolean;
+  /** DALTON-HOOK(mobile-web): disables desktop ArtifactCrumbs Update button & callback while framed HTML doc is pending. */
+  updateDisabled?: boolean;
   /** The thread beside the panel, where a dashboard set from here is edited. */
   threadId?: string | null;
   /** Lets the selection toolbar go once its Comment is taken. */
@@ -88,8 +90,9 @@ export interface FileComments {
  * (`useArtifactVersionView`).
  */
 // DALTON-HOOK(monitors): accept optional canPublishMonitor override for non-owner publish
+// DALTON-HOOK(mobile-web): forward updateDisabled to desktop ArtifactCrumbs while framed HTML doc is pending
 export function useFileComments({
-  workspaceId, tabId, file, commentViewer, source, active, readAt, ui, canPublishMonitor, threadId = null, dismissSelection,
+  workspaceId, tabId, file, commentViewer, source, active, readAt, ui, canPublishMonitor, updateDisabled = false, threadId = null, dismissSelection,
 }: FileCommentsOptions): FileComments {
   const { t } = useTranslation();
   const root = useWorkspaceFolders()?.rootDir;
@@ -123,7 +126,7 @@ export function useFileComments({
     path,
     doc: path && ui ? ui.docOf(tabId, artifactPathKey(path, root)) : null,
     crumbs: path && openPublish && (
-      <ArtifactCrumbs view={versionView} onReview={() => openPublish(path)} readAt={readAt} />
+      <ArtifactCrumbs view={versionView} onReview={() => openPublish(path)} readAt={readAt} updateDisabled={updateDisabled} />
     ),
     tools: target ? (
       <CommentTools

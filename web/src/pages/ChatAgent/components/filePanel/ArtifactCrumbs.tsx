@@ -16,6 +16,8 @@ interface ArtifactCrumbsProps {
   onReview: () => void;
   /** When the panel last read the file's bytes: a new read is a new live file to compare. */
   readAt: number | null;
+  // DALTON-HOOK(mobile-web): disable Update button and callback while framed HTML doc identity is pending
+  updateDisabled?: boolean;
 }
 
 /**
@@ -29,12 +31,14 @@ export function useArtifactCrumbsState({
   onReview,
   readAt,
   enabled = true,
+  updateDisabled = false,
 }: {
   artifact: Artifact | null | undefined;
   version: number | null;
   onReview: () => void;
   readAt: number | null;
   enabled?: boolean;
+  updateDisabled?: boolean;
 }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
@@ -103,6 +107,7 @@ export function useArtifactCrumbsState({
 
   // DALTON-HOOK(mobile-web): unified Update click handler shared by desktop ArtifactCrumbs & mobile More menu
   const onUpdate = () => {
+    if (updateDisabled) return;
     if (refused) {
       onReview();
       return;
@@ -134,11 +139,12 @@ export function useArtifactCrumbsState({
  * link shared before versions whose files were past the caps). A file never
  * published says nothing here; its Publish is in the header menu.
  */
-export function ArtifactCrumbs({ view, onReview, readAt }: ArtifactCrumbsProps): React.ReactElement | null {
+// DALTON-HOOK(mobile-web): forward updateDisabled so desktop Update matches mobile pending gating
+export function ArtifactCrumbs({ view, onReview, readAt, updateDisabled = false }: ArtifactCrumbsProps): React.ReactElement | null {
   const { t } = useTranslation();
   const { record: artifact, version } = view;
   // DALTON-HOOK(mobile-web): consume shared state & Update handler
-  const crumbs = useArtifactCrumbsState({ artifact, version, onReview, readAt });
+  const crumbs = useArtifactCrumbsState({ artifact, version, onReview, readAt, updateDisabled });
 
   if (!crumbs.visible || !artifact) return null;
 
@@ -149,7 +155,12 @@ export function ArtifactCrumbs({ view, onReview, readAt }: ArtifactCrumbsProps):
       {crumbs.refused ? (
         // The list goes through the dialog: it may still be past the caps.
         <CrumbStatus key="refused" tone="warning" words={t('artifact.legacyRefused')} label={t('publish:legacyRefused')}>
-          <button type="button" className="file-panel-artifact-update" onClick={crumbs.onUpdate}>
+          <button
+            type="button"
+            className="file-panel-artifact-update"
+            onClick={updateDisabled ? undefined : crumbs.onUpdate}
+            disabled={updateDisabled}
+          >
             {t('artifact.update')}
           </button>
         </CrumbStatus>
@@ -158,8 +169,8 @@ export function ArtifactCrumbs({ view, onReview, readAt }: ArtifactCrumbsProps):
           <button
             type="button"
             className="file-panel-artifact-update"
-            onClick={crumbs.onUpdate}
-            disabled={crumbs.updatePending}
+            onClick={updateDisabled ? undefined : crumbs.onUpdate}
+            disabled={crumbs.updatePending || updateDisabled}
           >
             {t('artifact.update')}
           </button>

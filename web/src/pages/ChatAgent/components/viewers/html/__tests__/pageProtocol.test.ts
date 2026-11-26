@@ -339,6 +339,17 @@ describe('page:key', () => {
   });
 });
 
+// DALTON-HOOK(mobile-web): verify page:pong liveness response parsing
+describe('page:pong', () => {
+  it('accepts positive integer sequence numbers and rejects invalid values', () => {
+    expect(read('page:pong', { seq: 1 })).toEqual({ type: 'page:pong', seq: 1 });
+    expect(read('page:pong', { seq: 42 })).toEqual({ type: 'page:pong', seq: 42 });
+    for (const seq of [0, -1, 1.5, '3', null, undefined]) {
+      expect(read('page:pong', { seq })).toBeNull();
+    }
+  });
+});
+
 describe('page:scroll', () => {
   it('reads where the scroll stands and whether it is still moving', () => {
     expect(read('page:scroll', { x: 0, y: 720, moving: true })).toEqual({ type: 'page:scroll', x: 0, y: 720, moving: true });

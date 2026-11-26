@@ -437,6 +437,12 @@ listen('page:monitor-grant', function (data) {
   }
 });
 
+// DALTON-HOOK(mobile-web): confirm the same bridged document owns the frame after load completes.
+listen('page:ping', function (data) {
+  if (!data || typeof data.seq !== 'number' || !isFinite(data.seq)) return;
+  send({ type: 'page:pong', seq: data.seq });
+});
+
 // A window the document has no tie to is not heard, by this bridge or the
 // document's own listeners. Anyone holding this page's link can open it and
 // reach its frames with a message, so a listener that writes what it hears into

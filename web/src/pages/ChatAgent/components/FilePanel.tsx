@@ -485,6 +485,19 @@ function FilePanel({
   // The file the owner reads takes comments, and an HTML one has versions,
   // unless its viewer failed: the fallback drew no comment layer.
   const [documentFailed, setDocumentFailed] = useState(false);
+  // DALTON-HOOK(mobile-web): derive current tab's active HtmlFrameDocState before useFileComments so
+  // pending state disables desktop ArtifactCrumbs Update identically to the mobile overflow menu
+  const isHtmlPreview = viewer === 'html' && !edit.isEditing && !htmlView.source && !fileLoading && !fileError;
+  const htmlDocState: HtmlFrameDocState | null = !isHtmlPreview
+    ? null
+    : htmlDocEntry.tabId === activeTab.id && htmlDocEntry.filePath === selectedFile
+      ? htmlDocEntry.state
+      : htmlDocEntry.state !== null
+        ? { kind: 'pending' }
+        : null;
+  const isHtmlDocPending = htmlDocState?.kind === 'pending';
+  const isHtmlDocLinked = htmlDocState?.kind === 'linked';
+  const isHtmlDocUnbridged = htmlDocState?.kind === 'unbridged';
   const fileComments = useFileComments({
     workspaceId,
     tabId: activeTab.id,
@@ -496,21 +509,12 @@ function FilePanel({
     ui: comments,
     // DALTON-HOOK(monitors): decoupled monitor publishing permission
     canPublishMonitor,
+    // DALTON-HOOK(mobile-web): disable desktop Update button and callback while HTML doc state is pending
+    updateDisabled: isHtmlDocPending,
     threadId,
     dismissSelection,
   });
   const htmlArtifactPath = fileComments.path;
-  // DALTON-HOOK(mobile-web): derive current tab's active HtmlFrameDocState; stay null until a bridged HTML frame reports
-  const isHtmlPreview = viewer === 'html' && !edit.isEditing && !htmlView.source && !fileLoading && !fileError;
-  const htmlDocState: HtmlFrameDocState | null = !isHtmlPreview
-    ? null
-    : htmlDocEntry.tabId === activeTab.id && htmlDocEntry.filePath === selectedFile
-      ? htmlDocEntry.state
-      : htmlDocEntry.state !== null
-        ? { kind: 'pending' }
-        : null;
-  const isHtmlDocLinked = htmlDocState?.kind === 'linked';
-  const isHtmlDocUnbridged = htmlDocState?.kind === 'unbridged';
   const htmlArtifactDoc =
     htmlDocState?.kind === 'current' || htmlDocState?.kind === 'linked'
       ? htmlDocState.path
@@ -1027,12 +1031,12 @@ function FilePanel({
           tools={
             (isMobile && viewer === 'html' && !edit.isEditing) || isHtmlDocUnbridged
               ? null
-              : isHtmlDocLinked && fileComments.path && comments
+              : htmlDocState?.kind === 'linked' && fileComments.path && comments
                 ? (
                   <CommentTools
                     tabId={activeTab.id}
                     workspaceId={workspaceId}
-                    path={fileComments.path}
+                    path={htmlDocState.path}
                     ui={comments}
                     variant="crumb"
                     modeDisabled={fileComments.view?.versionView.version !== null || htmlView.source}

@@ -10,6 +10,7 @@ import { act, fireEvent } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { renderWithProviders } from '@/test/utils';
+import type { ViewerToPage } from '../pageProtocol'; // DALTON-HOOK(mobile-web)
 import type { PageBridgeListener } from '../usePageBridge';
 
 const page = vi.hoisted(() => ({ listener: null as PageBridgeListener | null, sent: [] as string[] }));
@@ -18,7 +19,12 @@ vi.mock('../usePageBridge', () => {
     ready: false,
     session: 0,
     path: null,
-    post: () => {},
+    // DALTON-HOOK(mobile-web): echo page:ping with page:pong when the bridged document finishes loading
+    post: (message: ViewerToPage) => {
+      if (message.type === 'page:ping') {
+        page.listener?.({ type: 'page:pong', seq: message.seq }, bridge as never);
+      }
+    },
     subscribe: (listener: PageBridgeListener) => {
       page.listener = listener;
       return () => {};

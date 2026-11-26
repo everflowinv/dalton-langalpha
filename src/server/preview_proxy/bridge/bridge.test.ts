@@ -2044,4 +2044,14 @@ describe('the page bridge classifies docLocation into path, root, or invalidPath
       expect(Object.prototype.hasOwnProperty.call(msg, 'root')).toBe(false);
     }
   });
+
+  it('echoes page:ping with page:pong carrying the matching sequence number', () => {
+    const page = served('https://api.example.com/api/v1/public/shared/tok-1/files/serve/reports/a.html?inject=view');
+    page.from(page.viewer, { type: 'page:ping', seq: 7 });
+    expect(page.of('page:pong')).toEqual([{ type: 'page:pong', v: 1, seq: 7 }]);
+
+    page.from(page.viewer, { type: 'page:ping', seq: 'not-a-number' });
+    page.from(page.viewer, { type: 'page:ping', seq: Number.NaN });
+    expect(page.of('page:pong')).toHaveLength(1);
+  });
 });

@@ -1,17 +1,22 @@
 import React from 'react';
 import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Route, Routes } from 'react-router';
 import '@testing-library/jest-dom';
 
 import { createTestQueryClient, renderWithProviders } from '@/test/utils';
 import { ThemeProvider } from '@/contexts/ThemeContext';
+import type { Artifact, ArtifactComment, ArtifactStatus } from '@/types/api';
 import { BridgedFrame, type HtmlFrameDocState } from '../BridgedFrame';
 import { useLiveFrame } from '../liveFrame';
 import { usePageBridge, type PageBridge } from '../usePageBridge';
 import { ArtifactFrames, type HtmlArtifactView } from '../ArtifactFrames';
+import { CommentTools } from '../comments/CommentTools';
 import HtmlViewer from '../../HtmlViewer';
 import FileHeaderActions from '../../../FileHeaderActions';
+import { ArtifactCrumbs } from '../../../filePanel/ArtifactCrumbs';
+import { ArtifactCommentSendContext, type ArtifactCommentSender } from '../../../artifactComments/sendContext';
 import { MonitorViewer } from '@/pages/Monitors/MonitorViewer';
 import type { MonitorDetail } from '@/pages/Monitors/api';
 
@@ -21,6 +26,10 @@ const hoisted = vi.hoisted(() => ({
   getMonitorDetail: vi.fn(),
   getPublicMonitorDetail: vi.fn(),
   mintMonitorGrant: vi.fn(),
+  artifactsByPath: {} as Record<string, Partial<Artifact>>,
+  commentsByArtifactId: {} as Record<string, ArtifactComment[]>,
+  artifactStatus: null as ArtifactStatus | null,
+  targetFor: (() => ({ kind: 'send', to: { threadId: 'th-1' } })) as unknown,
 }));
 
 vi.mock('@/hooks/useIsMobile', () => ({
@@ -55,11 +64,32 @@ vi.mock('@/hooks/useArtifact', async (importOriginal) => {
       record: workspaceId ? { artifact_id: 'art-1', code: 'code123', url: '/a/code123' } : undefined,
       error: null,
     }),
-    useArtifactByPath: () => ({ data: { artifact_id: 'art-1', shared: true, bound_thread_id: null } }),
+    useArtifactByPath: (_workspaceId: string | null | undefined, path: string | null | undefined) => {
+      if (!path) return { data: undefined };
+      const mapped = hoisted.artifactsByPath[path];
+      return {
+        data: mapped ?? { artifact_id: 'art-1', shared: true, bound_thread_id: null },
+      };
+    },
     useArtifactBinding: () => ({ bind: { mutate: vi.fn() }, unbind: { mutate: vi.fn() } }),
-    useArtifactComments: () => ({ data: [] }),
+    useArtifactComments: (artifactId: string | null | undefined) => ({
+      data: artifactId ? (hoisted.commentsByArtifactId[artifactId] ?? []) : [],
+    }),
+    useArtifactStatus: () => ({ data: hoisted.artifactStatus ?? undefined }),
   };
 });
+
+vi.mock('../../../artifactComments/useCommentDestinations', () => ({
+  useCommentDestinations: () => ({
+    choices: [],
+    canBind: false,
+    targetFor: hoisted.targetFor,
+  }),
+}));
+
+vi.mock('../ArtifactVersionPicker', () => ({
+  ArtifactVersionPicker: () => <div data-testid="artifact-version-picker" />,
+}));
 
 vi.mock('@/pages/Monitors/api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/pages/Monitors/api')>();
@@ -197,6 +227,10 @@ beforeEach(() => {
   hoisted.getMonitorDetail.mockReset();
   hoisted.getPublicMonitorDetail.mockReset();
   hoisted.mintMonitorGrant.mockReset();
+  hoisted.artifactsByPath = {};
+  hoisted.commentsByArtifactId = {};
+  hoisted.artifactStatus = null;
+  hoisted.targetFor = () => ({ kind: 'send', to: { threadId: 'th-1' } });
 });
 
 afterEach(() => {
@@ -238,7 +272,7 @@ describe('usePageBridge tri-state path clearing and frameKey', () => {
 });
 
 describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
-  it('transitions pending -> current -> linked -> bridged_root, and maps invalid/conflicting/missing-root payloads to unbridged with cleared bridge.path', () => {
+  it('rejects self-declared root: true on normal file frames and maps invalid/conflicting/missing-root payloads to unbridged with cleared bridge.path', () => {
     const docStates: HtmlFrameDocState[] = [];
     const latestBridge: { current: PageBridge | null } = { current: null };
     const onBridge = vi.fn((bridge: PageBridge, _key: string | null) => {
@@ -274,13 +308,14 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
     expect(docStates.at(-1)).toEqual({ kind: 'linked', path: 'reports/b.html' });
     expect(latestBridge.current?.path).toBe('reports/b.html');
 
-    // 3. Confirmed pathless version root -> bridged_root.
+    // 3. Normal file frame MUST reject self-declared `root: true` (treated as unrecognized -> unbridged).
     postFromFrame(iframe, { type: 'page:ready', v: 1, root: true });
-    expect(docStates.at(-1)).toEqual({ kind: 'bridged_root' });
+    expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
     expect(latestBridge.current?.path).toBeNull();
 
     // 4. All conflicting, invalid, and missing-root messages clear bridge.path and enter { kind: 'unbridged', currentUrl: null }.
     const badPayloads: Record<string, unknown>[] = [
+      { type: 'page:ready', v: 1, root: true },
       { type: 'page:ready', v: 1, path: undefined, root: true },
       { type: 'page:ready', v: 1, path: null, root: true },
       { type: 'page:ready', v: 1, path: 'a.html', root: true },
@@ -297,7 +332,54 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
     }
   });
 
-  it('guards timeout callbacks by navigation sequence and clears stale bridge.path on real timeout', () => {
+  it('accepts root: true only on a host-initiated pathless version root navigation and rejects later forged root: true', () => {
+    vi.useFakeTimers();
+    const docStates: HtmlFrameDocState[] = [];
+    const onUnbridged = vi.fn();
+
+    const { container } = renderWithProviders(
+      <BridgedFrame
+        source={{
+          key: 'mon-pub-1:v4',
+          src: '/api/v1/dalton/monitors/public/public-pulse/v/4/',
+          sandbox: 'allow-scripts',
+        }}
+        title="Public Pulse"
+        groundKey="mon-pub-1"
+        expectedDocKey={null}
+        onDocStateChange={(state) => docStates.push(state)}
+        onUnbridged={onUnbridged}
+      />,
+    );
+
+    const iframe = container.querySelector('iframe')!;
+    const pings: number[] = [];
+    vi.spyOn(iframe.contentWindow!, 'postMessage').mockImplementation((msg: unknown) => {
+      if (msg && typeof msg === 'object' && (msg as { type?: string }).type === 'page:ping') {
+        pings.push((msg as { seq: number }).seq);
+      }
+    });
+
+    // Host-initiated initial navigation to version root -> accepts root: true.
+    postFromFrame(iframe, { type: 'page:ready', v: 1, root: true });
+    expect(docStates.at(-1)).toEqual({ kind: 'bridged_root' });
+
+    // Same document finishes load and echoes page:pong -> remains bridged_root.
+    fireEvent.load(iframe);
+    expect(pings).toHaveLength(1);
+    postFromFrame(iframe, { type: 'page:pong', v: 1, seq: pings[0] });
+    expect(docStates.at(-1)).toEqual({ kind: 'bridged_root' });
+    act(() => { vi.advanceTimersByTime(3000); });
+    expect(onUnbridged).not.toHaveBeenCalled();
+
+    // Navigating away and later forging root: true without host navigation is rejected.
+    postFromFrame(iframe, { type: 'page:ready', v: 1, invalidPath: true });
+    expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
+    postFromFrame(iframe, { type: 'page:ready', v: 1, root: true });
+    expect(docStates.at(-1)).toEqual({ kind: 'unbridged', currentUrl: null });
+  });
+
+  it('guards timeout callbacks by navigation sequence, verifies pre-load page:ready on load, and fails closed when a page redirects before load finishes', () => {
     vi.useFakeTimers();
     const docStates: HtmlFrameDocState[] = [];
     const latestBridge: { current: PageBridge | null } = { current: null };
@@ -320,26 +402,44 @@ describe('BridgedFrame unified HtmlFrameDocState & race guards', () => {
     );
 
     const iframe = container.querySelector('iframe')!;
-    // Initial document A loads and says hello.
+    const pings: number[] = [];
+    vi.spyOn(iframe.contentWindow!, 'postMessage').mockImplementation((msg: unknown) => {
+      if (msg && typeof msg === 'object' && (msg as { type?: string }).type === 'page:ping') {
+        pings.push((msg as { seq: number }).seq);
+      }
+    });
+
+    // 1. Same navigation: document A sends page:ready, finishes load, and echoes page:pong -> stays current.
     postFromFrame(iframe, { type: 'page:ready', v: 1, path: 'reports/a.html' });
     fireEvent.load(iframe);
+    expect(docStates.at(-1)).toEqual({ kind: 'pending' });
+    expect(pings).toHaveLength(1);
+    postFromFrame(iframe, { type: 'page:pong', v: 1, seq: pings[0] });
     expect(docStates.at(-1)).toEqual({ kind: 'current', path: 'reports/a.html' });
+    act(() => { vi.advanceTimersByTime(3000); });
+    expect(onUnbridged).not.toHaveBeenCalled();
 
-    // Load #1 starts waiting; before timeout expires, Load #2 arrives and gets page:ready for B.
+    // 2. Load #1 starts waiting; before timeout expires, page:ready for B arrives -> Load #1 timer is invalidated.
     fireEvent.load(iframe);
     expect(docStates.at(-1)).toEqual({ kind: 'pending' });
     act(() => { vi.advanceTimersByTime(1500); });
     postFromFrame(iframe, { type: 'page:ready', v: 1, path: 'reports/b.html' });
     expect(docStates.at(-1)).toEqual({ kind: 'linked', path: 'reports/b.html' });
-
-    // Advancing past Load #1's original deadline must NOT fire unbridged.
     act(() => { vi.advanceTimersByTime(3000); });
     expect(onUnbridged).not.toHaveBeenCalled();
     expect(docStates.at(-1)).toEqual({ kind: 'linked', path: 'reports/b.html' });
 
-    // Now simulate navigating to an unbridged page (no page:ready within grace period).
+    // 3. Redirect before load finishes: page A sends page:ready, then redirects to an unbridged page
+    //    before A's own load completes. The unbridged page's load must NOT consume A's greeted state:
+    //    it bumps navSeq, enters pending, pings (no pong from unbridged page), and times out to unbridged.
+    postFromFrame(iframe, { type: 'page:ready', v: 1, path: 'reports/a.html' });
+    expect(docStates.at(-1)).toEqual({ kind: 'current', path: 'reports/a.html' });
+    expect(latestBridge.current?.path).toBe('reports/a.html');
+
     fireEvent.load(iframe);
     expect(docStates.at(-1)).toEqual({ kind: 'pending' });
+    expect(pings).toHaveLength(2);
+    // Unbridged destination never echoes page:pong -> timeout transitions to unbridged and clears bridge.path.
     act(() => { vi.advanceTimersByTime(2500); });
     expect(onUnbridged).toHaveBeenCalledTimes(1);
     expect(latestBridge.current?.path).toBeNull();
@@ -711,13 +811,196 @@ describe('MonitorViewer bridged_root and unbridged handling', () => {
     expect(host).toHaveAttribute('data-doc-state', 'unbridged');
     expect(screen.queryByRole('link', { name: /openInNewWindow|Open in new window|新窗口打开/i })).toBeNull();
 
-    // Back to root: true -> bridged_root restored.
+    // Forged root: true after leaving the host-initiated version root navigation stays rejected (unbridged).
     postFromFrame(iframe, { type: 'page:ready', v: 1, root: true });
-    expect(host).toHaveAttribute('data-doc-state', 'bridged_root');
+    expect(host).toHaveAttribute('data-doc-state', 'unbridged');
+    expect(screen.queryByRole('link', { name: /openInNewWindow|Open in new window|新窗口打开/i })).toBeNull();
+  });
 
-    // Missing root: true ({ type: 'page:ready', v: 1 }) -> unrecognized -> unbridged.
+  it('maps missing root: true on a pathless public monitor to unbridged and hides open-in-new-window', async () => {
+    hoisted.getPublicMonitorDetail.mockResolvedValue(makePublicMonitorDetail());
+
+    const { container } = renderWithProviders(
+      <Routes>
+        <Route path="/m/:slug" element={<MonitorViewer slug="public-pulse" publicMode />} />
+      </Routes>,
+      { route: '/m/public-pulse' },
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('iframe.bridged-frame-doc')).toBeTruthy();
+    });
+    const iframe = container.querySelector('iframe.bridged-frame-doc') as HTMLIFrameElement;
+    const host = container.querySelector('.monitors-frame-host')!;
+
     postFromFrame(iframe, { type: 'page:ready', v: 1 });
     expect(host).toHaveAttribute('data-doc-state', 'unbridged');
     expect(screen.queryByRole('link', { name: /openInNewWindow|Open in new window|新窗口打开/i })).toBeNull();
+  });
+});
+
+describe('Desktop pending ArtifactCrumbs and linked-doc CommentTools parity', () => {
+  it('disables desktop ArtifactCrumbs Update button and callback while pending (changed and legacy_refused)', () => {
+    const onReview = vi.fn();
+    hoisted.artifactStatus = {
+      latest_seq: 2,
+      live_sha256: 'a'.repeat(64),
+      page_sha256: 'b'.repeat(64),
+      files: [],
+      left_out: [],
+      total_size: 100,
+      changed: true,
+      drift: { added: ['reports/extra.js'], removed: [], changed: [] },
+    };
+
+    const view = makeArtifactView(null).versionView;
+    const { rerender } = renderWithProviders(
+      <ArtifactCrumbs view={view} onReview={onReview} readAt={1} updateDisabled />,
+    );
+
+    const changedBtn = screen.getByRole('button', { name: /artifact\.update|Update|更新/i });
+    expect(changedBtn).toBeDisabled();
+    fireEvent.click(changedBtn);
+    expect(onReview).not.toHaveBeenCalled();
+
+    // Legacy refused variant is also disabled while pending.
+    const refusedView = {
+      ...view,
+      record: { ...view.record!, legacy_refused: 'too_many_files' as const },
+    };
+    rerender(<ArtifactCrumbs view={refusedView} onReview={onReview} readAt={1} updateDisabled />);
+    const refusedBtn = screen.getByRole('button', { name: /artifact\.update|Update|更新/i });
+    expect(refusedBtn).toBeDisabled();
+    fireEvent.click(refusedBtn);
+    expect(onReview).not.toHaveBeenCalled();
+
+    // Once doc state settles (updateDisabled: false), Update becomes enabled and invokes onReview.
+    rerender(<ArtifactCrumbs view={refusedView} onReview={onReview} readAt={1} updateDisabled={false} />);
+    const enabledBtn = screen.getByRole('button', { name: /artifact\.update|Update|更新/i });
+    expect(enabledBtn).toBeEnabled();
+    fireEvent.click(enabledBtn);
+    expect(onReview).toHaveBeenCalledTimes(1);
+  });
+
+  it('targets linked document B for comment counts and Send all on both desktop and mobile even in a version frame without CommentLayer', async () => {
+    const user = userEvent.setup();
+    const makeComment = (id: string, artifactId: string, body: string): ArtifactComment => ({
+      comment_id: id,
+      artifact_id: artifactId,
+      author_id: 'user-1',
+      status: 'open',
+      delivery: 'queued',
+      thread_id: 'th-1',
+      thread_title: 'Main',
+      thread_hidden: false,
+      anchor: { kind: 'element', path: 'h1', quote: body },
+      body,
+      replies: [],
+      created_at: '2026-11-25T00:00:00Z',
+      updated_at: '2026-11-25T00:00:00Z',
+    } as unknown as ArtifactComment);
+
+    const cmtA = makeComment('cmt-a-1', 'art-a', 'Comment on A');
+    const cmtB1 = makeComment('cmt-b-1', 'art-b', 'First comment on B');
+    const cmtB2 = makeComment('cmt-b-2', 'art-b', 'Second comment on B');
+
+    hoisted.artifactsByPath = {
+      'reports/a.html': { artifact_id: 'art-a', path: 'reports/a.html', shared: true, bound_thread_id: null },
+      'reports/b.html': { artifact_id: 'art-b', path: 'reports/b.html', shared: true, bound_thread_id: null },
+    };
+    hoisted.commentsByArtifactId = {
+      'art-a': [cmtA],
+      'art-b': [cmtB1, cmtB2],
+    };
+
+    // Simulate a version frame where the hidden live CommentLayer still maps tab-1's opened file A -> A.
+    const ui = {
+      ...makeCommentUi(),
+      docOf: (tabId: string, opened: string) =>
+        tabId === 'tab-1' && opened === 'reports/a.html' ? 'reports/a.html' : opened,
+    } as unknown as HtmlArtifactView['ui'];
+
+    const desktopSend = vi.fn().mockResolvedValue({ threadId: 'th-1' });
+    const desktopSender: ArtifactCommentSender = {
+      besideThreadId: 'th-1',
+      running: false,
+      send: desktopSend,
+    };
+
+    // 1. Desktop: FilePanel passes htmlDocState.path ('reports/b.html') to CommentTools when linked.
+    const { unmount } = renderWithProviders(
+      <ArtifactCommentSendContext.Provider value={desktopSender}>
+        <CommentTools
+          tabId="tab-1"
+          workspaceId="ws-1"
+          path="reports/b.html"
+          ui={ui}
+          variant="crumb"
+          modeDisabled
+        />
+      </ArtifactCommentSendContext.Provider>,
+    );
+
+    const sendAllDesktop = screen.getByRole('button', { name: /sendAll|Send all|全部发送/i });
+    expect(screen.getByRole('button', { name: /2/ })).toBeInTheDocument();
+    await user.click(sendAllDesktop);
+    await waitFor(() => expect(desktopSend).toHaveBeenCalledTimes(1));
+    expect(desktopSend.mock.calls[0][0].map((c: ArtifactComment) => c.comment_id)).toEqual(['cmt-b-1', 'cmt-b-2']);
+    unmount();
+
+    // 2. Mobile: FileHeaderActions (MobileHtmlOverflowMenu) targets linked doc B for open count and Send all.
+    hoisted.isMobile = true;
+    const mobileSend = vi.fn().mockResolvedValue({ threadId: 'th-1' });
+    const mobileSender: ArtifactCommentSender = {
+      besideThreadId: 'th-1',
+      running: false,
+      send: mobileSend,
+    };
+    renderWithProviders(
+      <ArtifactCommentSendContext.Provider value={mobileSender}>
+        <FileHeaderActions
+          selectedFile="reports/a.html"
+          isEditing={false}
+          workspaceId="ws-1"
+          fileContent="<h1>A</h1>"
+          fileMime="text/html"
+          canEdit={false}
+          onStartEdit={vi.fn()}
+          onOpenExportModal={vi.fn()}
+          triggerDownloadFn={vi.fn().mockResolvedValue(undefined)}
+          canDownload
+          readFileFullFn={vi.fn().mockResolvedValue({ content: '' })}
+          access={{ kind: 'owner' }}
+          htmlDocState={{ kind: 'linked', path: 'reports/b.html' }}
+          onOpenDocAsTab={vi.fn()}
+          mobileHtmlTools={{
+            tabId: 'tab-1',
+            ui,
+            versionView: makeArtifactView(2).versionView,
+            modeDisabled: true,
+            readAt: 1,
+          }}
+          editorRef={{ current: null }}
+          canUndo={false}
+          canRedo={false}
+          hasUnsavedChanges={false}
+          showDiff={false}
+          setShowDiff={vi.fn()}
+          isSaving={false}
+          saveError={null}
+          onSave={vi.fn()}
+          onCancelEdit={vi.fn()}
+        />
+      </ArtifactCommentSendContext.Provider>,
+    );
+
+    await user.click(screen.getByTestId('file-header-mobile-more'));
+    const listItem = await screen.findByTestId('file-header-mobile-comment-list');
+    expect(listItem).toHaveTextContent('(2)');
+    const sendAllMobile = screen.getByTestId('file-header-mobile-send-all');
+    expect(sendAllMobile).toHaveTextContent('(2)');
+    await user.click(sendAllMobile);
+    await waitFor(() => expect(mobileSend).toHaveBeenCalledTimes(1));
+    expect(mobileSend.mock.calls[0][0].map((c: ArtifactComment) => c.comment_id)).toEqual(['cmt-b-1', 'cmt-b-2']);
   });
 });

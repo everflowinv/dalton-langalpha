@@ -9,6 +9,7 @@ import { Select } from '@/components/ui/select';
 import { toast } from '@/components/ui/use-toast';
 import { ListError, TagBadge } from '@/components/mcp/McpPrimitives';
 import { apiErrorStatus } from '@/api/errors';
+// DALTON-HOOK(monitors): normalize entry paths and track unified HtmlFrameDocState in monitor frames
 import { artifactPathKey } from '@/hooks/useArtifact';
 import { useCapabilities } from '@/hooks/useCapabilities';
 import { useLocale } from '@/hooks/useLocale';
@@ -140,7 +141,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     };
   }, [monitor, activeGrant, effectiveSeq, effectiveEntryPath, publicMode]);
 
-  // Guard bridge & unified HtmlFrameDocState by frameKey so monitor/version switches never bleed stale paths.
+  // DALTON-HOOK(monitors): guard bridge & unified HtmlFrameDocState by frameKey so monitor/version switches never bleed stale paths.
   const currentFrameKey = frameSource?.key ?? null;
   const [bridgeEntry, setBridgeEntry] = useState<{ key: string | null; bridge: PageBridge | null }>({
     key: null,
@@ -234,6 +235,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
     );
   }
 
+  // DALTON-HOOK(monitors): gate monitor topbar actions (open-in-new-window and go-to-source) on unified HtmlFrameDocState
   const isUnbridgedDoc = docState.kind === 'unbridged';
   const isLinkedDoc = docState.kind === 'linked';
   const showOpenInNewWindow = docState.kind !== 'unbridged' || docState.currentUrl !== null;
@@ -345,6 +347,7 @@ export function MonitorViewer({ slug, publicMode = false }: MonitorViewerProps):
         </div>
       </header>
 
+      {/* DALTON-HOOK(monitors): expose docState on monitor host and wire BridgedFrame expectedDocKey & onDocStateChange */}
       <div className="monitors-frame-host" data-doc-state={docState.kind}>
         <BridgedFrame
           source={frameSource}
