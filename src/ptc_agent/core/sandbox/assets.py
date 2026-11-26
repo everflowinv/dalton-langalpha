@@ -588,11 +588,12 @@ async def _missing_tool_modules(
     except Exception as e:  # noqa: BLE001 - a failed probe is not a missing module
         logger.warning("Tool wrapper existence probe failed", error=str(e))
         return None
-    if result.exit_code != 0:
+    if result is None or getattr(result, "exit_code", None) != 0:
         return None
-    missing = [
-        line.strip() for line in (result.stdout or "").splitlines() if line.strip()
-    ]
+    stdout = getattr(result, "stdout", None)
+    if not isinstance(stdout, str):
+        return None
+    missing = [line.strip() for line in stdout.splitlines() if line.strip()]
     return missing or None
 
 
