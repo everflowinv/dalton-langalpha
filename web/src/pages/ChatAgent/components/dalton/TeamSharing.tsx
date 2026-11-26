@@ -149,7 +149,7 @@ export function useTeamReadOnly(
 
   const effectiveAccess = workspaceRecord?.effective_web_access ?? null;
   const isThreadOnly = effectiveAccess === 'thread_only';
-  // DALTON-HOOK(external-member-perms): the workspace record's effective access is computed by the
+  // DALTON-HOOK(colleague-access): the workspace record's effective access is computed by the
   // server for this caller; cached team lists and route state grant write access only to a caller
   // confirmed as an internal member or admin.
   const confirmedTeamWriter =

@@ -66,13 +66,22 @@ class CallContext:
 
 
 class MountHandle(Protocol):
-    """What a tool asks of a serving mount around one command. The host
+    """What a tool asks of the mount around one command. The host
     implements it, since the token, the links and the save outcomes are its
-    own."""
+    own, and hands it to the sandbox while the mount serves, or ahead of a
+    start a turn did not wait for."""
+
+    @property
+    def serving(self) -> bool | None:
+        """Whether the mount serves; None while the start it was handed
+        ahead of has yet to answer."""
+
+    async def started(self) -> None:
+        """Wait out a start still to answer."""
 
     async def ready(self, workspace_id: str | None = None) -> bool:
-        """Wait out links still going in and a token that has to be replaced
-        first; whether the mount then serves ``workspace_id``'s folder (None:
+        """Wait out a start still to answer, links still going in and a token
+        that has to be replaced first; whether the mount then serves ``workspace_id``'s folder (None:
         the computer's root). A command run without it would write beside
         the files the store holds."""
 
@@ -262,9 +271,9 @@ async def _run(
 ) -> MountOutcome:
     """Run one daemon command as root, carrying ``config`` in when given.
 
-    The daemon's code reaches the machine with the asset sync, which the
-    mount comes up beside. A command refused for stale code ships the
-    daemon's own files and asks once more, so the mount never depends on
+    The daemon's code reaches the machine with the asset sync, which a
+    turn's mount does not wait for. A command refused for stale code ships
+    the daemon's own files and asks once more, so the mount never depends on
     that sync having got there first."""
     outcome = await _ask(sandbox, action, args, config)
     if outcome.error == MountError.STALE_CODE and await _ship_code(sandbox):

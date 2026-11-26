@@ -143,6 +143,10 @@ import type {
   ChatViewProps,
 } from './chatView/types';
 import { TranscriptStatus, type ThreadNotice } from './chatView/TranscriptStatus';
+import { CompactingLine } from './chatView/CompactingLine';
+import { compactionOf } from './chatView/compaction';
+import { newestTurnUnstarted } from './messageList/turnProjection';
+import { useLiveSelect } from '../session/stream/liveMessages';
 import { useComposerNotices } from './chatView/useComposerNotices';
 import { useNextSummary } from '../hooks/useNextSummaryHint';
 import { ChatDiskWarning } from './chatView/ChatDiskWarning';
@@ -606,6 +610,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     ...turnStatus,
     workspaceStarting: mergeWarmingDisplay(turnStatus.workspaceStarting, warmingState),
   };
+  // The running turn held before its model has done anything: a compaction
+  // ahead of its first call, or the send waiting behind one. A compaction
+  // there summarizes the thread up to the turn's message, so its line goes
+  // above that message, where the divider its end leaves goes too.
+  const turnUnstarted = useLiveSelect(liveMessages, newestTurnUnstarted);
+  const heldBeforeWork = isLoading && turnUnstarted && (!!isCompacting || displayTurnStatus.turnHeld !== null);
+  const compaction = compactionOf(isCompacting, compactionTokens, displayTurnStatus.turnHeld);
+  const compactionAbove = heldBeforeWork ? compaction : null;
 
   const chatPlaceholder = useMemo(() => {
     if (wasStopped && !isLoading && !pendingInterrupt)
@@ -1115,13 +1127,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       summarizeThread(tid)
         .then((data: Record<string, unknown>) => {
           clearIfCurrent(myGeneration);
-          thread.setNextSummary(null);
-          const detail = (data.summary_text as string | undefined) || undefined;
-          thread.insertNotification(
-            t('chat.compactedNotification', { from: data.original_message_count }),
-            'info',
-            detail,
-          );
+          thread.landCompaction({
+            notice: t('chat.compactedNotification', { from: data.original_message_count }),
+            detail: (data.summary_text as string | undefined) || undefined,
+          });
         })
         .catch((err: unknown) => {
           console.error('[ChatView] Compaction failed:', err);
@@ -1138,13 +1147,13 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       offloadThread(tid)
         .then((data: Record<string, unknown>) => {
           clearIfCurrent(myGeneration);
-          thread.setNextSummary((data.next_summary as NextSummary | null | undefined) ?? null);
-          thread.insertNotification(
-            t('chat.offloadedNotification', {
+          thread.landCompaction({
+            notice: t('chat.offloadedNotification', {
               args: (data.offloaded_args as number) || 0,
               reads: (data.offloaded_reads as number) || 0,
             }),
-          );
+            nextSummary: (data.next_summary as NextSummary | null | undefined) ?? null,
+          });
         })
         .catch((err: unknown) => {
           console.error('[ChatView] Offload failed:', err);
@@ -2085,6 +2094,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                               // DALTON-HOOK(colleague-dispatch): also render message cards read-only on foreign-owned threads
                               readOnly={isThreadReadOnly}
                               allowFiles={isThreadReadOnly}
+                              holding={heldBeforeWork}
+                              holdLine={compactionAbove && <CompactingLine {...compactionAbove} />}
                             />
                           </DispatchStatusProvider>
                         </MessageActionsProvider>
@@ -2094,8 +2105,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                           retired={threadModel.retired}
                           turnStatus={displayTurnStatus}
                           model={threadModel.model}
-                          isCompacting={isCompacting}
-                          compactionTokens={compactionTokens}
+                          compaction={compactionAbove ? null : compaction}
                           queuedSend={queuedSend}
                           threadId={feedThreadId}
                           active={isActive}

@@ -19,6 +19,7 @@ from ptc_agent.agent.middleware.runtime_context.epoch import Workspace
 from ptc_agent.agent.prompts.loader import PromptLoader
 from ptc_agent.config.agent import AgentConfig
 from ptc_agent.core.project_context import ProjectContext
+from ptc_agent.core.sandbox.asset_gate import AssetGate
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 from ptc_agent.core.session import Session
 from src.config import settings as app_settings
@@ -1307,6 +1308,7 @@ def test_ptc_agent_passes_conversation_search_enabled_to_turn_context_middleware
             return g
 
         fake_sandbox = create_autospec(PTCSandbox, instance=True)
+        fake_sandbox.assets = AssetGate()
         fake_sandbox.config = cfg
         fake_sandbox.working_dir = "/home/workspace"
         fake_sandbox.livefs = None
@@ -1400,6 +1402,7 @@ def _build_ptc_agent_kwargs(
         return g
 
     fake_sandbox = create_autospec(PTCSandbox, instance=True)
+    fake_sandbox.assets = AssetGate()
     fake_sandbox.config = cfg
     fake_sandbox.working_dir = "/home/workspace"
     fake_sandbox.livefs = None
@@ -1865,6 +1868,7 @@ async def test_claude_code_static_prompt_tools_and_runtime_notices(
 
         def _build_claude_graph(team_memory_enabled: bool) -> ClaudeCodeGraph:
             fake_sandbox = create_autospec(PTCSandbox, instance=True)
+            fake_sandbox.assets = AssetGate()
             fake_sandbox.config = cfg
             fake_sandbox.working_dir = "/home/workspace"
             fake_sandbox.livefs = None
@@ -2175,6 +2179,7 @@ async def test_external_company_main_agent_and_internal_subagents_omit_team_memo
             return specs
 
         fake_sandbox = create_autospec(PTCSandbox, instance=True)
+        fake_sandbox.assets = AssetGate()
         fake_sandbox.config = cfg
         fake_sandbox.working_dir = "/home/workspace"
         fake_sandbox.livefs = None

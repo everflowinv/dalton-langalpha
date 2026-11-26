@@ -80,6 +80,11 @@ TURN_ROW_KIND = "turn_opened"
 #: the same way.
 SUBAGENTS_ROW_KIND = "subagents_switched"
 
+#: Row kind of the notice that the file mount stopped serving or serves again
+#: (``middleware/file_mount_notice.py``), which ``update_row.md.j2`` hardcodes
+#: the same way.
+FILE_MOUNT_ROW_KIND = "file_mount"
+
 # DALTON-HOOK(team-memory-toggle): durable row when the team-memory switch is absent from visible history or flips
 TEAM_MEMORY_ROW_KIND = "team_memory_switched"
 TEAM_MEMORY_ON_MARKER = "[team-memory:on]"
@@ -163,14 +168,15 @@ NOTICE_ROW_KINDS = frozenset({WAKEUP_CANCELLED_ROW_KIND, LAST_STEP_ROW_KIND})
 #: once a compaction takes them from view (the notes reminder before the next
 #: summary, the check-in after the next run of tool calls, the ask before a
 #: mid-turn rebuild at the next one, the time-up ask on the next call, the
-#: live prices on the next fetch), so a rebuild does not
-#: count them and a summary does not carry them. The withdrawal of a time-up ask answers only that ask, which a
+#: live prices on the next fetch, the mount found down on the next call), so a
+#: rebuild does not count them and a summary does not carry them. The withdrawal of a time-up ask answers only that ask, which a
 #: summary does not carry either, so it has nothing to answer once both are
 #: out of view.
 NON_CHANGE_ROW_KINDS = frozenset(
     {
         TURN_ROW_KIND,
         SUBAGENTS_ROW_KIND,
+        FILE_MOUNT_ROW_KIND,
         TEAM_MEMORY_ROW_KIND,  # DALTON-HOOK(team-memory-toggle)
         NOTES_DUE_ROW_KIND,
         NOTES_CHECK_IN_ROW_KIND,

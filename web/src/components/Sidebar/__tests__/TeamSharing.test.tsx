@@ -259,7 +259,7 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
     // #662 (sync3 B12): the cold-summary hint and its per-thread setters,
     // idle here — no thread in these cases is owed a summary.
     nextSummary: null,
-    forThread: () => ({ setNextSummary: vi.fn(), insertNotification: vi.fn() }),
+    forThread: () => ({ setNextSummary: vi.fn(), insertNotification: vi.fn(), landCompaction: vi.fn() }),
     clearReturnedDraft: () => {},
     awaitingReportBack: false,
     reportBackOwed: false,
@@ -1238,7 +1238,7 @@ describe('Dalton Team Sharing', () => {
     }
   });
 
-  // DALTON-HOOK(external-member-perms): cached team lists grant write access only to a confirmed internal member.
+  // DALTON-HOOK(colleague-access): cached team lists grant write access only to a confirmed internal member.
   it('keeps a cached rw colleague workspace read-only for an external caller', () => {
     const queryClient = createTestQueryClient();
     queryClient.setQueryData(queryKeys.dalton.credentialsStatus(LOCAL_USER_ID), {

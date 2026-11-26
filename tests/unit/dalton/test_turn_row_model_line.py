@@ -33,6 +33,7 @@ from ptc_agent.config.core import (
 from ptc_agent.core.mcp_registry import MCPRegistry
 from ptc_agent.core.paths import SandboxLayout
 from ptc_agent.core.sandbox import PTCSandbox
+from ptc_agent.core.sandbox.asset_gate import AssetGate
 
 NOW = datetime(2026, 9, 9, 17, 0, tzinfo=UTC)
 
@@ -150,6 +151,7 @@ def test_single_computer_agent_has_no_copy_file_tool(role: str) -> None:
     client = GenericFakeChatModel(messages=iter([]))
     compaction_llm = GenericFakeChatModel(messages=iter([]))
     sandbox = create_autospec(PTCSandbox, instance=True)
+    sandbox.assets = AssetGate()
     sandbox.config = config
     sandbox.livefs = None
     sandbox.workspace.return_value = SandboxLayout("/home/workspace").for_workspace("ws")
@@ -215,6 +217,7 @@ def test_single_computer_roster_gives_no_copy_file_via_turn_computers() -> None:
     client = GenericFakeChatModel(messages=iter([]))
     compaction_llm = GenericFakeChatModel(messages=iter([]))
     sandbox = create_autospec(PTCSandbox, instance=True)
+    sandbox.assets = AssetGate()
     sandbox.config = config
     sandbox.livefs = None
     sandbox.workspace.return_value = SandboxLayout("/home/workspace").for_workspace("ws")
