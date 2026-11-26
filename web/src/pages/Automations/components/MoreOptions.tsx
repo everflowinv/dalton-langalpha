@@ -20,7 +20,10 @@ import { Select as NativeSelect } from '@/components/ui/select';
 import { getModelDisplayName } from '@/components/ui/chat-input.helpers';
 import { useAllModels } from '@/hooks/useAllModels';
 import { useApiKeys } from '@/hooks/useApiKeys';
+// DALTON-HOOK(report-delivery): gate report_profile form section on channel_gateway capability
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
+import ReportProfileFields from '@/components/dalton/ReportProfileFields';
 import { formatAntigravityVariantLabel, inspectSavedAntigravityModel } from '@/lib/antigravitySeries';
 import { effortLabelFor, effortOptions, resolveEffort } from '@/lib/modelTuning';
 import { cn } from '@/lib/utils';
@@ -80,6 +83,8 @@ export default function MoreOptions({
   omitDelivery = false,
 }: MoreOptionsProps) {
   const { t } = useTranslation();
+  // DALTON-HOOK(report-delivery): gate report_profile configuration on channel_gateway capability
+  const { hasCapability } = useCapabilities();
   const uid = useId();
   const ids = {
     thread: `${uid}-thread`,
@@ -386,6 +391,16 @@ export default function MoreOptions({
           )}
         {/* DALTON-HOOK(company-automations): company edits stop before this delivery choice. */}
         </FormRow>}
+
+        {/* DALTON-HOOK(report-delivery): optional report_profile delivery targets gated on channel_gateway capability */}
+        {!omitDelivery && hasCapability('channel_gateway') && (
+          <FormRow label={t('automation:reportDeliverySection', '报告外发')}>
+            <ReportProfileFields
+              value={form.report_profile}
+              onChange={(next) => patch('report_profile', next)}
+            />
+          </FormRow>
+        )}
 
         {form.trigger_type === 'price' && (
           <FormRow label={t('automation:priceRetrigger')} labelId={ids.retrigger}>

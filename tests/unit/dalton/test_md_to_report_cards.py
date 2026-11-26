@@ -318,18 +318,44 @@ async def test_market_alert_ta_screen_profile_passes_report_validation_and_deliv
     )
     monkeypatch.setenv("DALTON_BACKEND_VAR_DIR", str(tmp_path / "var_dalton"))
 
+    from src.dalton.tools import report_delivery_tools as rd_tools
+
+    captured_cards: list[tuple[str, dict[str, Any]]] = []
+
+    def _approve_hitl(action_type: str, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        captured_cards.append((action_type, dict(payload)))
+        return True, {
+            "decisions": [{"type": "approve", "confirm_token": payload.get("confirm_token")}]
+        }
+
+    monkeypatch.setattr(
+        rd_tools,
+        "hitl_confirm",
+        create_autospec(rd_tools.hitl_confirm, side_effect=_approve_hitl),
+    )
+
     tool = create_report_delivery_tools()[0]
-    raw = await tool.ainvoke(
+    cmd = await tool.ainvoke(
         {
-            "action": "set",
-            "automation_id": _AUTO_UUID,
-            "profile": "market-alert-ta-screen",
-            "report_targets": [_FEISHU_CHAT],
-            "user_confirmed": True,
+            "name": tool.name,
+            "args": {
+                "action": "set",
+                "automation_id": _AUTO_UUID,
+                "profile": "market-alert-ta-screen",
+                "report_targets": [_FEISHU_CHAT],
+            },
+            "id": f"tc-ta-screen-{task_name}",
+            "type": "tool_call",
         },
         config={"configurable": {"user_id": _OWNER, "thread_id": "t-ta"}},
     )
-    res = json.loads(raw)
+    assert len(captured_cards) == 1
+    assert captured_cards[0][0] == "dalton_report_delivery_set"
+    assert captured_cards[0][1]["report_targets"] == [_FEISHU_CHAT]
+    assert captured_cards[0][1]["failure_targets"] == [_DISCORD_DM]
+    update = getattr(cmd, "update", None)
+    assert isinstance(update, dict) and update.get("messages")
+    res = json.loads(update["messages"][0].content)
     assert res["ok"] is True
     assert res["report_profile"] == {
         "profile": "market-alert-ta-screen",

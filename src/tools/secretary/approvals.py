@@ -102,9 +102,21 @@ async def duplicate_workspace(user_id: str, name: str) -> tuple[dict | None, boo
             type(exc).__name__,
         )
         return None, False
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
+    from src.dalton.coverage.identity import (
+        canonical_workspace_ticker_key,
+        normalize_ticker_key,
+    )
+
+    target_ticker_key = canonical_workspace_ticker_key(name)
     for holder in holders:
         if is_duplicate_name(name, holder.get("name") or ""):
             return holder, True
+        if target_ticker_key is not None:
+            holder_unit_key = normalize_ticker_key(holder.get("unit_ticker"))
+            if holder_unit_key is not None and holder_unit_key == target_ticker_key:
+                return holder, True
+    # --- DALTON-HOOK(cos-settings-tools): end ---
     return None, True
 
 

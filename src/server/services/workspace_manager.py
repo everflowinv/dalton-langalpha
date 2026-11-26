@@ -277,6 +277,9 @@ class WorkspaceManager(ComputerManager):
                 create_kwargs["verified_company_candidates"] = verified_company_candidates
             if check_colleague_duplicate:
                 create_kwargs["check_colleague_duplicate"] = True
+        reject_reasons: list[str] = []
+        if not (verify_snapshot or bootstrap_cloud_primary):
+            create_kwargs["reject_reason_out"] = reject_reasons
         workspace = await create_workspace_on_computer(
             user_id,
             name,
@@ -286,6 +289,10 @@ class WorkspaceManager(ComputerManager):
         if workspace is None:
             if verify_snapshot or bootstrap_cloud_primary:
                 raise ApprovalScopeChangedError("情况已变化，请重新发起")
+            if "archiving" in reject_reasons:
+                raise ComputerArchivingError(
+                    "This computer is currently being archived and cannot accept new workspaces."
+                )
             if chosen:
                 raise ComputerNotFoundError("Computer not found")
             raise RuntimeError(

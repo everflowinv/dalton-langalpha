@@ -240,10 +240,12 @@ def workspace_response(workspace: dict) -> WorkspaceResponse:
         # DALTON-HOOK(colleague-access): expose read-only auto-publish pause fields for web UI confirmation.
         auto_publish_paused=auto_publish_paused,
         auto_publish_pause_token=auto_publish_pause_token,
-        # DALTON-HOOK(workspace-dedup): pass optional coverage unit registration outcome on create.
+        # DALTON-HOOK(workspace-dedup): pass optional coverage unit registration outcome and dedup warning on create.
         coverage_unit=workspace.get("coverage_unit"),
         coverage_unit_warning=workspace.get("coverage_unit_warning"),
         coverage_unit_warning_detail=workspace.get("coverage_unit_warning_detail"),
+        dedup_warning=workspace.get("dedup_warning"),
+        dedup_warning_code=workspace.get("dedup_warning_code"),
     )
 
 
@@ -281,7 +283,12 @@ async def create_workspace(
             or computer_id
         )
         # --- DALTON-HOOK(workspace-dedup): begin ---
-        from src.dalton.coverage.dedup import find_existing_company_workspace
+        from src.dalton.coverage.dedup import (
+            WEB_DEDUP_OVERALL_TIMEOUT_SECONDS,
+            WEB_DEDUP_UNAVAILABLE_CODE,
+            WEB_DEDUP_UNAVAILABLE_MESSAGE,
+            find_existing_company_workspace,
+        )
         from src.dalton.coverage.units import is_workspace_coverage_registration_active
 
         raw_coverage_kind = str(request.coverage_kind or "").strip().lower()
@@ -290,11 +297,16 @@ async def create_workspace(
         if requested_coverage:
             coverage_active = await is_workspace_coverage_registration_active(x_user_id)
         wants_coverage = bool(requested_coverage and coverage_active)
+        dedup_warning: str | None = None
+        dedup_warning_code: str | None = None
         if request.allow_duplicate_company:
             matched_ids: list[str] = []
             try:
-                dup_for_log = await find_existing_company_workspace(
-                    x_user_id, request.name, channel="web"
+                dup_for_log = await asyncio.wait_for(
+                    find_existing_company_workspace(
+                        x_user_id, request.name, channel="web"
+                    ),
+                    timeout=WEB_DEDUP_OVERALL_TIMEOUT_SECONDS,
                 )
                 if dup_for_log is not None and dup_for_log.matches:
                     matched_ids = list(
@@ -316,9 +328,22 @@ async def create_workspace(
         else:
             dup = None
             try:
-                dup = await find_existing_company_workspace(
-                    x_user_id, request.name, channel="web"
+                dup = await asyncio.wait_for(
+                    find_existing_company_workspace(
+                        x_user_id,
+                        request.name,
+                        channel="web",
+                        raise_on_timeout=True,
+                    ),
+                    timeout=WEB_DEDUP_OVERALL_TIMEOUT_SECONDS,
                 )
+            except TimeoutError:
+                logger.warning(
+                    "Company workspace dedup check timed out after %.1fs; proceeding",
+                    WEB_DEDUP_OVERALL_TIMEOUT_SECONDS,
+                )
+                dedup_warning = WEB_DEDUP_UNAVAILABLE_MESSAGE
+                dedup_warning_code = WEB_DEDUP_UNAVAILABLE_CODE
             except Exception as exc:
                 logger.warning(
                     "Company workspace dedup check failed (%s); proceeding",
@@ -400,6 +425,10 @@ async def create_workspace(
                     workspace["coverage_unit_warning"] = unit_warning
                 if unit_warning_detail is not None:
                     workspace["coverage_unit_warning_detail"] = unit_warning_detail
+        if dedup_warning is not None:
+            workspace = dict(workspace)
+            workspace["dedup_warning"] = dedup_warning
+            workspace["dedup_warning_code"] = dedup_warning_code
         # --- DALTON-HOOK(workspace-dedup): end ---
 
         logger.info(

@@ -349,7 +349,13 @@ function CreateWorkspaceModal({ isOpen, onClose, onCreate, onComplete, returnFoc
       return;
     }
 
-    // DALTON-HOOK(workspace-dedup): show non-fatal hint when workspace succeeded but coverage registration did not
+    // DALTON-HOOK(workspace-dedup): show non-fatal hint when workspace succeeded but coverage registration or dedup check did not
+    if (workspace.dedup_warning) {
+      toast({
+        title: t('workspace.dedup.unavailableTitle', '公司查重暂不可用'),
+        description: workspace.dedup_warning,
+      });
+    }
     const coverageWarning = formatCoverageUnitWarning(t, workspace);
     if (coverageWarning) {
       toast({

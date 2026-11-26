@@ -638,3 +638,6 @@ web/src/pages/ChatAgent/components/__tests__/ChatView.channelDeepLinks.test.tsx
 web/src/pages/Settings/utils/priceSource.ts
 web/src/pages/Settings/utils/__tests__/priceSource.test.ts
 web/src/components/ui/__tests__/chat-input.priceSource.dalton.test.tsx
+# AD5 + Bundle 2: server-side report delivery confirmation and workspace create/dedup tests.
+tests/unit/server/test_workspace_bundle2.py
+web/src/pages/Automations/__tests__/Automations.reportDeliveryConfirm.test.tsx
