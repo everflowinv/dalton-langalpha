@@ -9038,54 +9038,6 @@ ALLOWED_DELIVERY_STATUS_TRANSITIONS: dict[str, frozenset[str]] = {
 }
 
 
-def _is_deliverable_link_item_key(delivery_key: str) -> bool:
-    cleaned = str(delivery_key or "").strip()
-    return cleaned.startswith("deliverables-links:") and ":item:" in cleaned
-
-
-def _is_deliverable_link_parent_key(delivery_key: str) -> bool:
-    cleaned = str(delivery_key or "").strip()
-    return cleaned.startswith("deliverables-links:") and ":item:" not in cleaned
-
-
-def _has_no_confirmed_deliverable_link_receipt(existing: Mapping[str, Any]) -> bool:
-    """True when the row has zero sent chunks, zero platform receipts, and no confirmed file entry."""
-    if int(existing.get("sent_chunks") or 0) > 0:
-        return False
-    raw_mids = existing.get("platform_message_ids")
-    if isinstance(raw_mids, list) and any(str(m or "").strip() for m in raw_mids):
-        return False
-    raw_fs = existing.get("files_status")
-    if isinstance(raw_fs, list):
-        for item in raw_fs:
-            if not isinstance(item, dict):
-                continue
-            st = str(item.get("status") or "").strip().lower()
-            if st in ("sent", "linked"):
-                return False
-            if str(item.get("platform_message_id") or "").strip():
-                return False
-    return True
-
-
-def _is_provably_unsent_deliverable_link_item(existing: Mapping[str, Any]) -> bool:
-    """True iff an ``unknown`` ``deliverables-links:<runId>:item:<digest>`` row proves
-    the platform send was never started (0 chunks, 0 receipts, and no dispatching/pending/
-    unknown/sent/linked item markers in ``files_status``).
-    """
-    if not _has_no_confirmed_deliverable_link_receipt(existing):
-        return False
-    raw_fs = existing.get("files_status")
-    if isinstance(raw_fs, list):
-        for item in raw_fs:
-            if not isinstance(item, dict):
-                continue
-            st = str(item.get("status") or "").strip().lower()
-            if st not in ("queued", "not_sent", "failed"):
-                return False
-    return True
-
-
 def _validate_delivery_status_transition(
     *,
     prev_status: str,
@@ -9097,7 +9049,6 @@ def _validate_delivery_status_transition(
     discord_body_phase: str | None,
     current_attempt: int,
     requested_attempt: int | None,
-    delivery_key: str = "",
 ) -> str:
     """Validate and resolve the target delivery status for I-7 progress updates (R10 Codex #5).
 
@@ -9106,8 +9057,7 @@ def _validate_delivery_status_transition(
       ``VALID_DELIVERY_STATUSES`` (rejecting unsupported values such as ``deferred``).
     - Discord ``unknown`` protection cannot be bypassed via ``outcome`` or any other field;
       only the exact ``gateway_restarted`` + ``dispatching`` + matching ``delivery_attempt``
-      recovery terminal transition (or attempt-fenced ``deliverables-links:`` recovery
-      settlement to ``sent``) is permitted.
+      recovery terminal transition is permitted.
     - Terminal statuses (``sent``, ``failed``, ``unknown``) cannot regress to ``in_flight``
       or transition to another terminal status via I-7 (re-claim after ``failed`` goes
       exclusively through I-6 ``authorize_and_claim_delivery``).
@@ -9130,14 +9080,6 @@ def _validate_delivery_status_transition(
         )
     clean_plat = str(platform or "").strip().lower()
     clean_kind = str(kind or "").strip().lower()
-    clean_key = str(delivery_key or "").strip()
-    deliverable_links_recovery_settled = (
-        clean_key.startswith("deliverables-links:")
-        and clean_prev in ("unknown", "partial")
-        and requested == "sent"
-        and requested_attempt is not None
-        and requested_attempt == current_attempt
-    )
     recovery_terminal = (
         clean_plat == "discord"
         and clean_kind != "data_task"
@@ -9154,12 +9096,11 @@ def _validate_delivery_status_transition(
         and clean_prev == "unknown"
         and requested != "unknown"
         and not recovery_terminal
-        and not deliverable_links_recovery_settled
     ):
         _reject_delivery_update(
             409, "Discord delivery status unknown cannot be changed"
         )
-    if recovery_terminal or deliverable_links_recovery_settled:
+    if recovery_terminal:
         return requested
     allowed_targets = ALLOWED_DELIVERY_STATUS_TRANSITIONS.get(clean_prev, frozenset())
     if requested not in allowed_targets:
@@ -9224,7 +9165,6 @@ async def authorize_and_claim_delivery(
     source_scope_key: str | None = None,
     source_generation: int | None = None,
     activity_origin: str | None = None,
-    reclaim_verified_unsent: bool = False,
     gateway_epoch: int | None = None,
     require_gateway_epoch: bool = False,
     conn: Any = None,
@@ -9355,7 +9295,6 @@ async def authorize_and_claim_delivery(
                 existing = await cur.fetchone()
                 # True only when this claim may persist activity_origin conversation -> replay.
                 replay_recovery = False
-                reclaim_deliverable_link_item = False
                 if existing:
                     if str(existing.get("platform") or "").strip().lower() == "weixin":
                         await wx_db.verify_gateway_epoch_in_tx(
@@ -9446,15 +9385,7 @@ async def authorize_and_claim_delivery(
                             )
                             if ex_src and ex_src.get("thread_scope_key"):
                                 ex_scope_key = str(ex_src["thread_scope_key"])
-                    is_deliverable_link_parent_partial = (
-                        _is_deliverable_link_parent_key(cleaned_key)
-                        and ex_status == "partial"
-                    )
-                    if (
-                        ex_status in ("sent", "partial")
-                        and not is_deliverable_link_parent_partial
-                        and conversation_to_replay
-                    ):
+                    if ex_status in ("sent", "partial") and conversation_to_replay:
                         ex_user = str(existing.get("user_id") or "").strip()
                         ex_plat = str(existing.get("platform") or "").strip().lower()
                         ex_target = str(existing.get("target_address") or "").strip()
@@ -9484,23 +9415,9 @@ async def authorize_and_claim_delivery(
                             "thread_scope_key": ex_scope_key,
                             "is_current": ex_is_current,
                         }
-                    reclaim_deliverable_link_item = (
-                        _is_deliverable_link_item_key(cleaned_key)
-                        and ex_status == "unknown"
-                        and (
-                            _is_provably_unsent_deliverable_link_item(existing)
-                            or (
-                                bool(reclaim_verified_unsent)
-                                and _has_no_confirmed_deliverable_link_receipt(existing)
-                            )
-                        )
-                    )
                     if (
                         cleaned_key.startswith(("deliverables:", "deliverables-links:"))
-                        and (
-                            ex_status in ("in_flight", "unknown")
-                            or is_deliverable_link_parent_partial
-                        )
+                        and ex_status in ("in_flight", "unknown")
                         and conversation_to_replay
                     ):
                         ex_user = str(existing.get("user_id") or "").strip()
@@ -9520,45 +9437,23 @@ async def authorize_and_claim_delivery(
                                 "code": "not_allowed",
                                 "message": "Delivery identity or destination does not match the existing record.",
                             }
-                        if reclaim_deliverable_link_item:
-                            replay_recovery = True
-                        else:
-                            return {
-                                "claim_status": "in_flight_or_unknown",
-                                "status": (
-                                    "partial"
-                                    if is_deliverable_link_parent_partial
-                                    else "unknown"
-                                ),
-                                "existing_status": ex_status,
-                                "error_code": existing.get("error_code"),
-                                "sent_chunks": int(existing.get("sent_chunks") or 0),
-                                "platform_message_ids": list(
-                                    existing.get("platform_message_ids") or []
-                                ),
-                                "code": "in_flight",
-                                "message": (
-                                    "An earlier attempt partially delivered links and must recover remaining items."
-                                    if is_deliverable_link_parent_partial
-                                    else "An earlier attempt of this same call is still delivering it."
-                                ),
-                                "platform": existing["platform"],
-                                "target_address": existing["target_address"],
-                                "confirmed_thread_address": stored_confirmed_thread,
-                                "discord_body_phase": stored_body_phase,
-                                "delivery_attempt": _delivery_attempt(existing),
-                                "thread_scope_key": ex_scope_key,
-                                "files_status": existing.get("files_status") or [],
-                                "dm_recipient_platform_user_id": existing.get(
-                                    "dm_recipient_platform_user_id"
-                                ),
-                                "weixin_account_id": (
-                                    str(existing["weixin_account_id"])
-                                    if existing.get("weixin_account_id")
-                                    else None
-                                ),
-                                "is_current": ex_is_current,
-                            }
+                        return {
+                            "claim_status": "in_flight_or_unknown",
+                            "status": "unknown",
+                            "existing_status": ex_status,
+                            "error_code": existing.get("error_code"),
+                            "sent_chunks": int(existing.get("sent_chunks") or 0),
+                            "code": "in_flight",
+                            "message": "An earlier attempt of this same call is still delivering it.",
+                            "platform": existing["platform"],
+                            "target_address": existing["target_address"],
+                            "confirmed_thread_address": stored_confirmed_thread,
+                            "discord_body_phase": stored_body_phase,
+                            "delivery_attempt": _delivery_attempt(existing),
+                            "thread_scope_key": ex_scope_key,
+                            "files_status": existing.get("files_status") or [],
+                            "is_current": ex_is_current,
+                        }
                     if scope_mismatch or gen_mismatch or (
                         origin_differs and not replay_recovery
                     ):
@@ -9568,10 +9463,7 @@ async def authorize_and_claim_delivery(
                             "code": "not_allowed",
                             "message": "Delivery source metadata is immutable and does not match existing record.",
                         }
-                    if (
-                        ex_status in ("sent", "partial")
-                        and not is_deliverable_link_parent_partial
-                    ):
+                    if ex_status in ("sent", "partial"):
                         return {
                             "claim_status": "already_completed",
                             "status": ex_status,
@@ -9589,11 +9481,6 @@ async def authorize_and_claim_delivery(
                     # `before_body`) stays `unknown` and is NOT re-claimed/resumed; users
                     # view on the web. Non-restart in-process lost-ack `before_body`
                     # retries (e.g. `timeout`/`unavailable`) retain attempt-fenced reclaim.
-                    # BT2: `deliverables-links:<runId>:item:<digest>` rows that are provably
-                    # unsent (or explicitly verified unsent / at-least-once reclaimed without
-                    # confirmed receipt) may reclaim. Partial parent `deliverables-links:<runId>`
-                    # rows stay recoverable per-item until all links are confirmed and settled
-                    # to `sent` via I-7.
                     existing_error_code = str(existing.get("error_code") or "").strip().lower()
                     reclaim_in_process_before_body = (
                         ex_status == "unknown"
@@ -9601,33 +9488,15 @@ async def authorize_and_claim_delivery(
                         and bool(stored_confirmed_thread)
                         and existing_error_code != "gateway_restarted"
                     )
-                    if (
-                        (
-                            ex_status in ("in_flight", "unknown")
-                            or is_deliverable_link_parent_partial
-                        )
-                        and not reclaim_in_process_before_body
-                        and not reclaim_deliverable_link_item
-                    ):
+                    if ex_status in ("in_flight", "unknown") and not reclaim_in_process_before_body:
                         return {
                             "claim_status": "in_flight_or_unknown",
-                            "status": (
-                                "partial"
-                                if is_deliverable_link_parent_partial
-                                else "unknown"
-                            ),
+                            "status": "unknown",
                             "existing_status": ex_status,
                             "error_code": existing.get("error_code"),
                             "sent_chunks": int(existing.get("sent_chunks") or 0),
-                            "platform_message_ids": list(
-                                existing.get("platform_message_ids") or []
-                            ),
                             "code": "in_flight",
-                            "message": (
-                                "An earlier attempt partially delivered links and must recover remaining items."
-                                if is_deliverable_link_parent_partial
-                                else "An earlier attempt of this same call is still delivering it."
-                            ),
+                            "message": "An earlier attempt of this same call is still delivering it.",
                             "platform": existing["platform"],
                             "target_address": existing["target_address"],
                             "confirmed_thread_address": stored_confirmed_thread,
@@ -9635,14 +9504,6 @@ async def authorize_and_claim_delivery(
                             "delivery_attempt": _delivery_attempt(existing),
                             "thread_scope_key": ex_scope_key,
                             "files_status": existing.get("files_status") or [],
-                            "dm_recipient_platform_user_id": existing.get(
-                                "dm_recipient_platform_user_id"
-                            ),
-                            "weixin_account_id": (
-                                str(existing["weixin_account_id"])
-                                if existing.get("weixin_account_id")
-                                else None
-                            ),
                             "is_current": ex_is_current,
                         }
 
@@ -11397,16 +11258,10 @@ async def authorize_and_claim_delivery(
                         dm_recipient_platform_user_id = COALESCE(dalton_channel_deliveries.dm_recipient_platform_user_id, EXCLUDED.dm_recipient_platform_user_id),
                         activity_origin = CASE
                             WHEN %s
-                             AND dalton_channel_deliveries.status IN ('failed', 'unknown')
+                             AND dalton_channel_deliveries.status = 'failed'
                              AND dalton_channel_deliveries.activity_origin = 'conversation'
                             THEN 'replay'
                             ELSE dalton_channel_deliveries.activity_origin
-                        END,
-                        files_status = CASE
-                            WHEN EXCLUDED.delivery_key LIKE 'deliverables-links:%%:item:%%'
-                             AND dalton_channel_deliveries.status = 'unknown'
-                            THEN '[]'::jsonb
-                            ELSE dalton_channel_deliveries.files_status
                         END,
                         updated_at = NOW()
                     """,
@@ -11705,15 +11560,9 @@ async def _update_delivery_progress_once(
                     discord_body_phase=_delivery_discord_body_phase(row),
                     current_attempt=current_attempt,
                     requested_attempt=requested_attempt,
-                    delivery_key=cleaned_key,
                 )
                 eff_error_code = error_code
                 eff_error_message = error_message
-                clear_recovered_error = (
-                    prev_status in ("unknown", "partial")
-                    and new_status == "sent"
-                    and cleaned_key.startswith("deliverables-links:")
-                )
                 if prev_status == "unknown" and new_status == "unknown":
                     if (
                         error_code is not None
@@ -11837,58 +11686,32 @@ async def _update_delivery_progress_once(
                             root_message_id=reg_root_mid,
                         )
 
-                if clear_recovered_error:
-                    await cur.execute(
-                        """
-                        UPDATE dalton_channel_deliveries
-                        SET sent_chunks = %s,
-                            total_chunks = %s,
-                            platform_message_ids = %s,
-                            files_status = %s,
-                            first_response_json = %s,
-                            status = %s,
-                            error_code = NULL,
-                            error_message = NULL,
-                            updated_at = NOW()
-                        WHERE delivery_key = %s
-                        """,
-                        (
-                            new_sent_chunks,
-                            new_total_chunks,
-                            Jsonb(new_msg_ids),
-                            Jsonb(new_files_status),
-                            Jsonb(new_first_resp) if new_first_resp is not None else None,
-                            new_status,
-                            cleaned_key,
-                        ),
-                    )
-                else:
-                    await cur.execute(
-                        """
-                        UPDATE dalton_channel_deliveries
-                        SET sent_chunks = %s,
-                            total_chunks = %s,
-                            platform_message_ids = %s,
-                            files_status = %s,
-                            first_response_json = %s,
-                            status = %s,
-                            error_code = COALESCE(%s::varchar, error_code),
-                            error_message = COALESCE(%s::text, error_message),
-                            updated_at = NOW()
-                        WHERE delivery_key = %s
-                        """,
-                        (
-                            new_sent_chunks,
-                            new_total_chunks,
-                            Jsonb(new_msg_ids),
-                            Jsonb(new_files_status),
-                            Jsonb(new_first_resp) if new_first_resp is not None else None,
-                            new_status,
-                            eff_error_code,
-                            eff_error_message,
-                            cleaned_key,
-                        ),
-                    )
+                await cur.execute(
+                    """
+                    UPDATE dalton_channel_deliveries
+                    SET sent_chunks = %s,
+                        total_chunks = %s,
+                        platform_message_ids = %s,
+                        files_status = %s,
+                        first_response_json = %s,
+                        status = %s,
+                        error_code = COALESCE(%s::varchar, error_code),
+                        error_message = COALESCE(%s::text, error_message),
+                        updated_at = NOW()
+                    WHERE delivery_key = %s
+                    """,
+                    (
+                        new_sent_chunks,
+                        new_total_chunks,
+                        Jsonb(new_msg_ids),
+                        Jsonb(new_files_status),
+                        Jsonb(new_first_resp) if new_first_resp is not None else None,
+                        new_status,
+                        eff_error_code,
+                        eff_error_message,
+                        cleaned_key,
+                    ),
+                )
 
                 # 3. Conditionally advance last_conversation_activity_at when new conversation output was delivered
                 made_new_output_progress = (
@@ -15199,9 +15022,65 @@ async def finish_automation_run(
                         )
                         verified_run_id = None
 
-                # R12 (Codex #7): mark_finished=True always converges to 'finished' even when
-                # targets is omitted (preserving persisted targets), and never reverts 'finished'.
+                # R12 (Codex #7) & BW2: mark_finished=True never overwrites an already-finished
+                # run (conditional `status <> 'finished'`), and refuses to mark `finished` while
+                # any `:charts` delivery for this execution is still `in_flight` in DB.
                 if mark_finished:
+                    if prev_db_status == "finished":
+                        return {
+                            "execution_id": norm_exec_id,
+                            "status": "finished",
+                            "previous_status": "finished",
+                            "user_id": row["user_id"],
+                            "workspace_id": (
+                                str(row["workspace_id"])
+                                if row.get("workspace_id")
+                                else None
+                            ),
+                            "thread_id": (
+                                str(row["thread_id"])
+                                if row.get("thread_id")
+                                else None
+                            ),
+                            "run_id": stored_run_id,
+                            "automation_name": row.get("automation_name") or "",
+                            "finish_status": row.get("finish_status"),
+                            "final_text": row.get("final_text"),
+                            "targets": list(row.get("targets") or []),
+                        }
+                    await cur.execute(
+                        """
+                        SELECT 1
+                        FROM dalton_channel_deliveries
+                        WHERE execution_id = %s
+                          AND delivery_key LIKE %s
+                          AND status = 'in_flight'
+                        LIMIT 1
+                        """,
+                        (norm_exec_id, f"automation:{norm_exec_id}:%:charts"),
+                    )
+                    if await cur.fetchone():
+                        return {
+                            "execution_id": norm_exec_id,
+                            "status": "finishing",
+                            "previous_status": prev_db_status,
+                            "user_id": row["user_id"],
+                            "workspace_id": (
+                                str(row["workspace_id"])
+                                if row.get("workspace_id")
+                                else None
+                            ),
+                            "thread_id": (
+                                str(row["thread_id"])
+                                if row.get("thread_id")
+                                else None
+                            ),
+                            "run_id": verified_run_id or stored_run_id,
+                            "automation_name": row.get("automation_name") or "",
+                            "finish_status": row.get("finish_status"),
+                            "final_text": row.get("final_text"),
+                            "targets": list(row.get("targets") or []),
+                        }
                     eff_targets = (
                         targets if targets is not None else list(row.get("targets") or [])
                     )
@@ -15216,6 +15095,7 @@ async def finish_automation_run(
                             targets = %s,
                             updated_at = NOW()
                         WHERE execution_id = %s
+                          AND status <> 'finished'
                         RETURNING *
                         """,
                         (
@@ -15227,7 +15107,8 @@ async def finish_automation_run(
                             norm_exec_id,
                         ),
                     )
-                    updated = dict(await cur.fetchone())
+                    updated_row = await cur.fetchone()
+                    updated = dict(updated_row) if updated_row else dict(row)
                     return {
                         "execution_id": norm_exec_id,
                         "status": "finished",

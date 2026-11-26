@@ -362,7 +362,6 @@ class AuthorizeAndClaimDeliveryRequest(BaseModel):
     source_scope_key: str | None = None
     source_generation: int | None = None
     activity_origin: str | None = "none"
-    reclaim_verified_unsent: bool = False
 
 
 class DeliveryProgressRequest(BaseModel):
@@ -1417,7 +1416,6 @@ async def internal_deliveries_authorize_and_claim_endpoint(
             source_scope_key=body.source_scope_key,
             source_generation=body.source_generation,
             activity_origin=body.activity_origin,
-            reclaim_verified_unsent=body.reclaim_verified_unsent,
             gateway_epoch=epoch,
             require_gateway_epoch=True,
         )

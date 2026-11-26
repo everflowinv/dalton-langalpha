@@ -13,7 +13,6 @@
  * - Excludes `withFeishuSendContext` and `withFeishuMessageDispatch` authority fencing.
  */
 
-import { createHash } from "node:crypto";
 import type * as Lark from "@larksuiteoapi/node-sdk";
 import { ChannelDeliveryError } from "../adapter.js";
 import {
@@ -546,13 +545,6 @@ export function resolveFeishuSendTarget(params: {
   };
 }
 
-function formatFeishuIdempotencyUuid(idempotencyKey?: string | null): string | undefined {
-  const cleaned = (idempotencyKey ?? "").trim();
-  if (!cleaned) return undefined;
-  const hex = createHash("sha256").update(cleaned).digest("hex").slice(0, 32);
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
-}
-
 export async function sendReplyOrFallbackDirect(
   client: Lark.Client,
   params: {
@@ -564,7 +556,6 @@ export async function sendReplyOrFallbackDirect(
     msgType: string;
     target: string;
     receiveIdType: "chat_id" | "open_id" | "user_id";
-    idempotencyKey?: string | null;
   },
 ): Promise<{
   data?: { message_id?: string; thread_id?: string };
@@ -574,7 +565,6 @@ export async function sendReplyOrFallbackDirect(
   usedDirectFallback?: boolean;
 }> {
   const allowDirectFallback = params.allowDirectFallback !== false;
-  const feishuUuid = formatFeishuIdempotencyUuid(params.idempotencyKey);
   const sendDirect = async (): Promise<{
     data?: { message_id?: string; thread_id?: string };
     code?: number;
@@ -589,7 +579,6 @@ export async function sendReplyOrFallbackDirect(
           receive_id: params.target,
           content: params.content,
           msg_type: params.msgType,
-          ...(feishuUuid ? { uuid: feishuUuid } : {}),
         },
       })) as { data?: { message_id?: string; thread_id?: string }; code?: number; msg?: string };
       if (response.code !== undefined && response.code !== 0) {
@@ -696,7 +685,6 @@ export async function sendMessageFeishu(
     fallbackReplyToMessageIds?: string[];
     replyInThread?: boolean;
     allowDirectFallback?: boolean;
-    idempotencyKey?: string | null;
   },
 ): Promise<FeishuMessageSendResult> {
   const { target, receiveIdType, replyToMessageId, replyInThread } =
@@ -719,7 +707,6 @@ export async function sendMessageFeishu(
     msgType: "post",
     target,
     receiveIdType,
-    idempotencyKey: params.idempotencyKey,
   });
 
   return toFeishuMessageSendResult(response, target);
@@ -766,7 +753,6 @@ export async function sendCardFeishu(
     fallbackReplyToMessageIds?: string[];
     replyInThread?: boolean;
     allowDirectFallback?: boolean;
-    idempotencyKey?: string | null;
   },
 ): Promise<FeishuMessageSendResult> {
   const { target, receiveIdType, replyToMessageId, replyInThread } =
@@ -787,7 +773,6 @@ export async function sendCardFeishu(
     msgType: "interactive",
     target,
     receiveIdType,
-    idempotencyKey: params.idempotencyKey,
   });
 
   return toFeishuMessageSendResult(response, target);
@@ -803,7 +788,6 @@ export async function sendStructuredCardFeishu(
     replyInThread?: boolean;
     allowDirectFallback?: boolean;
     title?: string;
-    idempotencyKey?: string | null;
   },
 ): Promise<FeishuMessageSendResult> {
   const card = buildStructuredCard(params.text, { title: params.title });
@@ -814,7 +798,6 @@ export async function sendStructuredCardFeishu(
     fallbackReplyToMessageIds: params.fallbackReplyToMessageIds,
     replyInThread: params.replyInThread,
     allowDirectFallback: params.allowDirectFallback,
-    idempotencyKey: params.idempotencyKey,
   });
 }
 

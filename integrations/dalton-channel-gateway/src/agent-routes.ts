@@ -736,7 +736,9 @@ export class AgentRoutesHandler {
       retryable?: boolean;
     };
   }> {
-    // Shape B check: if another caller in this gateway process is already finishing `executionId`
+    // Shape B check: if another caller in this gateway process is already finishing `executionId`,
+    // never enter execution or write `finished`; return a retryable response while in flight
+    // (or Shape C if the first caller already transitioned the row to `finished`).
     if (this.activeFinishExecutors.has(executionId)) {
       const current = await this.backend.finishAutomationRun(
         executionId,
@@ -751,6 +753,22 @@ export class AgentRoutesHandler {
       );
       if (current.status === 404 || !current.data) {
         return { status: 404, data: { detail: "Unknown execution_id" } };
+      }
+      if (
+        current.data.status === "finished" &&
+        current.data.previous_status === "finished"
+      ) {
+        const finishedRows: AgentAutomationRunFinishTargetRow[] = (
+          current.data.targets ?? []
+        ).map((t) => ({
+          entry: t.entry,
+          address: t.address ?? null,
+          name: t.name ?? null,
+          reached: Boolean(t.reached),
+          via: t.via ?? null,
+          error: t.error ?? (t.ok === false ? (t.message ?? "Failed") : null),
+        }));
+        return { status: 200, data: { targets: finishedRows } };
       }
       const inFlightRows: AgentAutomationRunFinishTargetRow[] = (
         current.data.targets ?? []
@@ -785,73 +803,93 @@ export class AgentRoutesHandler {
           error: null,
         };
       });
-      return { status: 200, data: { targets: inFlightRows } };
-    }
-
-    const claimed = await this.backend.finishAutomationRun(
-      executionId,
-      {
-        status: body.status,
-        thread_id: body.thread_id ?? null,
-        run_id: body.run_id ?? null,
-        final_text: body.final_text ?? null,
-        mark_finished: false,
-      },
-      userId,
-    );
-
-    if (claimed.status === 404 || !claimed.data) {
-      return { status: 404, data: { detail: "Unknown execution_id" } };
-    }
-
-    // Shape C: already `finished` in DB
-    if (
-      claimed.data.status === "finished" &&
-      claimed.data.previous_status === "finished"
-    ) {
-      const finishedRows: AgentAutomationRunFinishTargetRow[] = (
-        claimed.data.targets ?? []
-      ).map((t) => ({
-        entry: t.entry,
-        address: t.address ?? null,
-        name: t.name ?? null,
-        reached: Boolean(t.reached),
-        via: t.via ?? null,
-        error: t.error ?? (t.ok === false ? (t.message ?? "Failed") : null),
-      }));
-      return { status: 200, data: { targets: finishedRows } };
-    }
-
-    // Shape A: execute finish deliveries and finalize in DB
-    const detailed = await this.executeAutomationRunFinishDetailed({
-      executionId,
-      userId: claimed.data.user_id || userId,
-      threadId: claimed.data.thread_id ?? body.thread_id ?? null,
-      runId: claimed.data.run_id ?? null,
-      initialSnapshots: claimed.data.chart_snapshots,
-      outboundBlocked: claimed.data.outbound_blocked,
-      automationName: claimed.data.automation_name,
-      finishStatus:
-        (body.status ??
-          claimed.data.finish_status ??
-          "completed") as AgentAutomationRunFinishRequest["status"],
-      finalText: body.final_text ?? claimed.data.final_text ?? null,
-      targets: claimed.data.targets ?? [],
-    });
-
-    if (detailed.replayPending) {
       return {
         status: 503,
         data: {
           detail:
-            "Target run replay could not be completed yet; retry finish to settle charts and widgets.",
+            "Another finish request is already delivering this automation run; retry finish to settle.",
           retryable: true,
-          targets: detailed.targets,
+          targets: inFlightRows,
         },
       };
     }
 
-    return { status: 200, data: { targets: detailed.targets } };
+    // BW2: Acquire in-process execution ownership synchronously BEFORE the first `await`
+    // (I-8 `finishAutomationRun`) so two concurrent `/finish` calls cannot both pass the
+    // active check before I-8 returns.
+    this.activeFinishExecutors.add(executionId);
+    try {
+      const claimed = await this.backend.finishAutomationRun(
+        executionId,
+        {
+          status: body.status,
+          thread_id: body.thread_id ?? null,
+          run_id: body.run_id ?? null,
+          final_text: body.final_text ?? null,
+          mark_finished: false,
+        },
+        userId,
+      );
+
+      if (claimed.status === 404 || !claimed.data) {
+        return { status: 404, data: { detail: "Unknown execution_id" } };
+      }
+
+      // Shape C: already `finished` in DB
+      if (
+        claimed.data.status === "finished" &&
+        claimed.data.previous_status === "finished"
+      ) {
+        const finishedRows: AgentAutomationRunFinishTargetRow[] = (
+          claimed.data.targets ?? []
+        ).map((t) => ({
+          entry: t.entry,
+          address: t.address ?? null,
+          name: t.name ?? null,
+          reached: Boolean(t.reached),
+          via: t.via ?? null,
+          error: t.error ?? (t.ok === false ? (t.message ?? "Failed") : null),
+        }));
+        return { status: 200, data: { targets: finishedRows } };
+      }
+
+      // Shape A: execute finish deliveries and finalize in DB
+      const detailed = await this.executeAutomationRunFinishDetailed(
+        {
+          executionId,
+          userId: claimed.data.user_id || userId,
+          threadId: claimed.data.thread_id ?? body.thread_id ?? null,
+          runId: claimed.data.run_id ?? null,
+          initialSnapshots: claimed.data.chart_snapshots,
+          outboundBlocked: claimed.data.outbound_blocked,
+          automationName: claimed.data.automation_name,
+          finishStatus:
+            (body.status ??
+              claimed.data.finish_status ??
+              "completed") as AgentAutomationRunFinishRequest["status"],
+          finalText: body.final_text ?? claimed.data.final_text ?? null,
+          targets: claimed.data.targets ?? [],
+        },
+        { callerHoldsExecutionLock: true },
+      );
+
+      if (detailed.replayPending || detailed.chartsInFlight) {
+        return {
+          status: 503,
+          data: {
+            detail: detailed.chartsInFlight
+              ? "Automation charts or widgets are still being delivered; retry finish to settle."
+              : "Target run replay could not be completed yet; retry finish to settle charts and widgets.",
+            retryable: true,
+            targets: detailed.targets,
+          },
+        };
+      }
+
+      return { status: 200, data: { targets: detailed.targets } };
+    } finally {
+      this.activeFinishExecutors.delete(executionId);
+    }
   }
 
   /**
@@ -870,24 +908,38 @@ export class AgentRoutesHandler {
     finalText: string | null;
     targets: AutomationRunTargetRecord[];
   }): Promise<AgentAutomationRunFinishTargetRow[]> {
+    if (this.activeFinishExecutors.has(params.executionId)) {
+      return params.targets.map((t) => ({
+        entry: t.entry,
+        address: t.address ?? null,
+        name: t.name ?? null,
+        reached: Boolean(t.reached),
+        via: t.via ?? null,
+        error: t.error ?? (t.ok === false ? (t.message ?? "Target could not be resolved.") : null),
+      }));
+    }
     const detailed = await this.executeAutomationRunFinishDetailed(params);
     return detailed.targets;
   }
 
-  private async executeAutomationRunFinishDetailed(params: {
-    executionId: string;
-    userId: string;
-    threadId: string | null;
-    runId?: string | null;
-    initialSnapshots?: ChartSnapshotItem[];
-    outboundBlocked?: boolean;
-    automationName: string;
-    finishStatus: AgentAutomationRunFinishRequest["status"];
-    finalText: string | null;
-    targets: AutomationRunTargetRecord[];
-  }): Promise<{
+  private async executeAutomationRunFinishDetailed(
+    params: {
+      executionId: string;
+      userId: string;
+      threadId: string | null;
+      runId?: string | null;
+      initialSnapshots?: ChartSnapshotItem[];
+      outboundBlocked?: boolean;
+      automationName: string;
+      finishStatus: AgentAutomationRunFinishRequest["status"];
+      finalText: string | null;
+      targets: AutomationRunTargetRecord[];
+    },
+    opts?: { callerHoldsExecutionLock?: boolean },
+  ): Promise<{
     targets: AgentAutomationRunFinishTargetRow[];
     replayPending: boolean;
+    chartsInFlight: boolean;
     replayRetryable: boolean;
     replayHttpStatus: number | null;
   }> {
@@ -901,7 +953,10 @@ export class AgentRoutesHandler {
       targets,
     } = params;
 
-    this.activeFinishExecutors.add(executionId);
+    const acquiredHere = !opts?.callerHoldsExecutionLock;
+    if (acquiredHere) {
+      this.activeFinishExecutors.add(executionId);
+    }
     try {
       const results: AutomationRunTargetRecord[] = [];
       let truncatedFinalText = (finalText ?? "").trim();
@@ -990,6 +1045,8 @@ export class AgentRoutesHandler {
           autoInitialSnapshots.length > 0 ||
           autoWidgets.length > 0);
 
+      let chartsInFlight = false;
+
       const deliverAutomationChartsForTarget = async (
         t: AutomationRunTargetRecord,
       ): Promise<boolean> => {
@@ -1022,6 +1079,9 @@ export class AgentRoutesHandler {
           initialSnapshots: autoInitialSnapshots,
           widgets: autoWidgets,
         });
+        if (chartRes.inFlight) {
+          chartsInFlight = true;
+        }
         return chartRes.settled && chartRes.sentImages + chartRes.sentLinks > 0;
       };
 
@@ -1138,8 +1198,8 @@ export class AgentRoutesHandler {
         }
       }
 
-      if (!replayTargetMissing) {
-        await this.backend.finishAutomationRun(
+      if (!replayTargetMissing && !chartsInFlight) {
+        const finalized = await this.backend.finishAutomationRun(
           executionId,
           {
             status: finishStatus,
@@ -1150,6 +1210,15 @@ export class AgentRoutesHandler {
           },
           userId,
         );
+        // If backend DB refused to mark finished (e.g. concurrent finisher still has
+        // `:charts` in_flight and kept `finishing`), return retryable instead of 200.
+        if (
+          finalized.status === 200 &&
+          finalized.data &&
+          finalized.data.status !== "finished"
+        ) {
+          chartsInFlight = true;
+        }
       }
 
       return {
@@ -1162,11 +1231,14 @@ export class AgentRoutesHandler {
           error: r.error ?? null,
         })),
         replayPending: replayTargetMissing,
+        chartsInFlight,
         replayRetryable,
         replayHttpStatus,
       };
     } finally {
-      this.activeFinishExecutors.delete(executionId);
+      if (acquiredHere) {
+        this.activeFinishExecutors.delete(executionId);
+      }
     }
   }
 

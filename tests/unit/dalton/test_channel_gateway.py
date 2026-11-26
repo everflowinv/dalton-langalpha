@@ -1980,6 +1980,22 @@ class InMemoryChannelStore:
                 }
             return [{"targets": self.automation_runs[exec_id]["targets"]}]
 
+        if "SELECT 1 FROM dalton_channel_deliveries WHERE execution_id = %s AND delivery_key LIKE %s AND status = 'in_flight'" in norm:
+            exec_id = str(params[0])
+            like_pat = str(params[1])
+            prefix = like_pat.split("%", 1)[0]
+            suffix = like_pat.rsplit("%", 1)[-1]
+            for r in self.deliveries.values():
+                dkey = str(r.get("delivery_key") or "")
+                if (
+                    str(r.get("execution_id") or "") == exec_id
+                    and r.get("status") == "in_flight"
+                    and dkey.startswith(prefix)
+                    and dkey.endswith(suffix)
+                ):
+                    return [{"?column?": 1}]
+            return []
+
         if "SELECT DISTINCT target_address FROM dalton_channel_deliveries WHERE execution_id = %s" in norm:
             exec_id = str(params[0])
             return [
@@ -3446,6 +3462,109 @@ def test_outbound_deliveries_progress_steers_recover_automation_and_weixin(
     assert r_fin_direct.json()["status"] == "finished"
     assert r_fin_direct.json()["previous_status"] == "registered"
     assert len(r_fin_direct.json()["targets"]) == 1
+
+    # BW2: mark_finished=True MUST keep status='finishing' while an `:charts` delivery
+    # for the execution is still `in_flight`, and once settled only the first caller writes
+    # `finished` without a later caller overwriting persisted targets.
+    exec_id_3 = str(uuid4())
+    r_reg_3 = client.post(
+        "/api/v1/dalton/channels/internal/automation-runs",
+        headers=headers,
+        json={
+            "execution_id": exec_id_3,
+            "user_id": "u-alice",
+            "automation_name": "concurrent-charts-guard",
+            "entries": ["feishu"],
+        },
+    )
+    assert r_reg_3.status_code == 200
+    r_claim_3 = client.post(
+        f"/api/v1/dalton/channels/internal/automation-runs/{exec_id_3}/finish",
+        headers=headers,
+        json={"status": "completed", "mark_finished": False},
+    )
+    assert r_claim_3.status_code == 200
+    assert r_claim_3.json()["status"] == "finishing"
+
+    charts_key_3 = f"automation:{exec_id_3}:feishu:charts"
+    store.deliveries[charts_key_3] = {
+        "delivery_key": charts_key_3,
+        "execution_id": exec_id_3,
+        "kind": "automation",
+        "platform": "feishu",
+        "target_address": "feishu:@me",
+        "status": "in_flight",
+    }
+    r_blocked_finish = client.post(
+        f"/api/v1/dalton/channels/internal/automation-runs/{exec_id_3}/finish",
+        headers=headers,
+        json={
+            "status": "completed",
+            "mark_finished": True,
+            "targets": [
+                {
+                    "entry": "feishu",
+                    "address": "feishu:@me",
+                    "name": "Alice (feishu DM)",
+                    "reached": False,
+                    "via": None,
+                    "error": "premature",
+                }
+            ],
+        },
+    )
+    assert r_blocked_finish.status_code == 200
+    assert r_blocked_finish.json()["status"] == "finishing"
+    assert store.automation_runs[exec_id_3]["status"] == "finishing"
+
+    # Once `:charts` settles to `sent`, the legitimate finisher transitions `finishing -> finished`,
+    # and a subsequent concurrent `mark_finished=True` cannot overwrite the persisted targets.
+    store.deliveries[charts_key_3]["status"] = "sent"
+    r_settled_finish = client.post(
+        f"/api/v1/dalton/channels/internal/automation-runs/{exec_id_3}/finish",
+        headers=headers,
+        json={
+            "status": "completed",
+            "mark_finished": True,
+            "targets": [
+                {
+                    "entry": "feishu",
+                    "address": "feishu:@me",
+                    "name": "Alice (feishu DM)",
+                    "reached": True,
+                    "via": "fallback",
+                    "error": None,
+                }
+            ],
+        },
+    )
+    assert r_settled_finish.status_code == 200
+    assert r_settled_finish.json()["status"] == "finished"
+    assert r_settled_finish.json()["previous_status"] == "finishing"
+
+    r_late_overwrite = client.post(
+        f"/api/v1/dalton/channels/internal/automation-runs/{exec_id_3}/finish",
+        headers=headers,
+        json={
+            "status": "completed",
+            "mark_finished": True,
+            "targets": [
+                {
+                    "entry": "feishu",
+                    "address": "feishu:@me",
+                    "name": "Alice (feishu DM)",
+                    "reached": False,
+                    "via": None,
+                    "error": "late overwrite must be ignored",
+                }
+            ],
+        },
+    )
+    assert r_late_overwrite.status_code == 200
+    assert r_late_overwrite.json()["status"] == "finished"
+    assert r_late_overwrite.json()["previous_status"] == "finished"
+    assert r_late_overwrite.json()["targets"][0]["reached"] is True
+    assert r_late_overwrite.json()["targets"][0]["error"] is None
 
     # §6.1: Legacy singleton /internal/weixin-state is removed (404)
     assert (

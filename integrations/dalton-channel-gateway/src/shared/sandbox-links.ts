@@ -580,29 +580,41 @@ function mergeSortedCodeRanges(ranges: CodeRange[]): CodeRange[] {
 }
 
 /**
- * Scans Markdown code zones BEFORE reference definition / link collection in two passes:
- * Pass A (block-level code boundaries):
- *   Uses the CommonMark/GFM Markdown AST (`code` nodes from `mdast-util-from-markdown`)
- *   as the authoritative source of truth for all fenced, indented, list-nested, quoted,
- *   and unterminated code blocks.
- * Pass B (inline & multiline backtick spans strictly OUTSIDE block-level code boundaries):
- *   - Scans each non-code gap linearly so stray backticks before a fence NEVER pair with
- *     backticks inside or across a fenced/indented code block, and arbitrary chains of
- *     consecutive multiline backtick spans are all protected.
- *   - Single-line inline code spans that serve purely as a Markdown link label (`[`foo`](dest)`)
- *     are left unprotected so the spaced-destination link fallback can still rewrite the outer link.
+ * Scans Markdown code zones BEFORE reference definition / link collection strictly
+ * within Markdown block boundaries:
+ * - When the CommonMark + GFM table AST (`tree`) is available (always true in
+ *   `rewriteSandboxLinks`), `code` nodes cover every fenced, indented, list-nested,
+ *   quoted, and unterminated code block, and `inlineCode` nodes cover every single-line
+ *   and same-paragraph multiline backtick span without ever pairing stray backticks
+ *   across paragraph, heading, list-item, blockquote, or table-cell boundaries.
+ * - Single-line inline code spans that serve purely as a Markdown link label (`[`foo`](dest)`)
+ *   are left unprotected so the spaced-destination link fallback can still rewrite the outer link.
  */
 function findProtectedCodeRanges(text: string, tree?: MdastNode): CodeRange[] {
-  const blockRanges: CodeRange[] = [];
+  const allRanges: CodeRange[] = [];
   const len = text.length;
 
-  // Pass A: collect authoritative block-level `code` nodes from the Markdown AST.
+  const isSingleLineSpacedLinkLabel = (start: number, end: number): boolean =>
+    !text.slice(start, end).includes("\n") &&
+    start > 0 &&
+    text[start - 1] === "[" &&
+    end + 1 < len &&
+    text[end] === "]" &&
+    text[end + 1] === "(";
+
   if (tree) {
     const collectAstCode = (node: MdastNode): void => {
       if (node.type === "code") {
         const offsets = getNodeOffsets(node);
         if (offsets) {
-          blockRanges.push({ start: offsets.start, end: offsets.end });
+          allRanges.push({ start: offsets.start, end: offsets.end });
+        }
+        return;
+      }
+      if (node.type === "inlineCode") {
+        const offsets = getNodeOffsets(node);
+        if (offsets && !isSingleLineSpacedLinkLabel(offsets.start, offsets.end)) {
+          allRanges.push({ start: offsets.start, end: offsets.end });
         }
         return;
       }
@@ -613,13 +625,12 @@ function findProtectedCodeRanges(text: string, tree?: MdastNode): CodeRange[] {
       }
     };
     collectAstCode(tree);
+    return mergeSortedCodeRanges(allRanges);
   }
 
-  const mergedBlocks = mergeSortedCodeRanges(blockRanges);
-  const allRanges: CodeRange[] = mergedBlocks.map((r) => ({ ...r }));
-
-  // Pass B: scan inline & multiline backtick spans strictly within each non-block-code gap.
-  const scanBacktickGap = (segStart: number, segEnd: number): void => {
+  // Fallback when invoked without an AST: scan inline backticks per paragraph block
+  // (split on blank lines) so stray backticks in separate paragraphs never pair.
+  const scanBacktickBlock = (segStart: number, segEnd: number): void => {
     let pos = segStart;
     while (pos < segEnd) {
       const ch = text[pos]!;
@@ -635,15 +646,7 @@ function findProtectedCodeRanges(text: string, tree?: MdastNode): CodeRange[] {
         const close = findClosingBacktickRun(text, pos + run, run, segEnd);
         if (close !== -1) {
           const spanEnd = close + run;
-          const isSingleLine = !text.slice(pos, spanEnd).includes("\n");
-          const isSpacedLinkLabel =
-            isSingleLine &&
-            pos > 0 &&
-            text[pos - 1] === "[" &&
-            spanEnd + 1 < len &&
-            text[spanEnd] === "]" &&
-            text[spanEnd + 1] === "(";
-          if (!isSpacedLinkLabel) {
+          if (!isSingleLineSpacedLinkLabel(pos, spanEnd)) {
             allRanges.push({ start: pos, end: spanEnd });
           }
           pos = spanEnd;
@@ -656,17 +659,17 @@ function findProtectedCodeRanges(text: string, tree?: MdastNode): CodeRange[] {
     }
   };
 
-  let gapCursor = 0;
-  for (const blk of mergedBlocks) {
-    if (blk.start > gapCursor) {
-      scanBacktickGap(gapCursor, blk.start);
+  let blockStart = 0;
+  const blankLineRe = /\r?\n[ \t]*\r?\n/g;
+  let match: RegExpExecArray | null;
+  while ((match = blankLineRe.exec(text)) !== null) {
+    if (match.index > blockStart) {
+      scanBacktickBlock(blockStart, match.index);
     }
-    if (blk.end > gapCursor) {
-      gapCursor = blk.end;
-    }
+    blockStart = match.index + match[0].length;
   }
-  if (gapCursor < len) {
-    scanBacktickGap(gapCursor, len);
+  if (blockStart < len) {
+    scanBacktickBlock(blockStart, len);
   }
 
   return mergeSortedCodeRanges(allRanges);

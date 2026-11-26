@@ -3300,4 +3300,352 @@ describe("Channel Phase 2 Batch 2: chart_layer DM snapshots & interactive deep l
     expect(feishu403.sentTexts).toHaveLength(0);
     expect(feishu403.sentCards).toHaveLength(0);
   });
+
+  it("BW2: concurrent /finish calls acquire execution lock before I-8 and second caller seeing in-flight :charts returns retryable 503 without marking finished", async () => {
+    const targetRunId = "run-bw2-concurrent-finish";
+    const execId = "exec-bw2-concurrent-finish";
+
+    // Part A: Same gateway process — two concurrent `/finish` calls arrive BEFORE first I-8 returns.
+    // Call 1 acquires `activeFinishExecutors` synchronously before awaiting I-8; Call 2 hits the
+    // in-process lock, returns retryable 503, and NEVER writes `mark_finished: true`.
+    const feishuSameProc = makeMockAdapter("feishu");
+    let releaseFirstI8!: () => void;
+    const firstI8Started = new Promise<void>((resolve) => {
+      // resolved when first I-8 enters
+      (globalThis as Record<string, unknown>).__bw2Start = resolve;
+    });
+    const firstI8Gate = new Promise<void>((resolve) => {
+      releaseFirstI8 = resolve;
+    });
+    let i8CallCount = 0;
+    const markFinishedSameProc: boolean[] = [];
+    let dbStatusSameProc: "registered" | "finishing" | "finished" = "registered";
+
+    const backendSameProc = makeMockBackend({
+      finishAutomationRun: vi.fn(async (_id, req) => {
+        i8CallCount += 1;
+        const callIdx = i8CallCount;
+        markFinishedSameProc.push(Boolean(req.mark_finished));
+        if (callIdx === 1) {
+          (
+            (globalThis as Record<string, unknown>).__bw2Start as () => void
+          )();
+          await firstI8Gate;
+        }
+        const prev = dbStatusSameProc;
+        if (req.mark_finished) {
+          dbStatusSameProc = "finished";
+        } else if (dbStatusSameProc === "registered") {
+          dbStatusSameProc = "finishing";
+        }
+        return {
+          status: 200,
+          data: {
+            execution_id: execId,
+            status: dbStatusSameProc,
+            previous_status: prev,
+            user_id: "user-alice",
+            workspace_id: "ws-1",
+            thread_id: THREAD_ID,
+            run_id: targetRunId,
+            chart_snapshots: [],
+            outbound_blocked: false,
+            automation_name: "Concurrent Same-Process Brief",
+            finish_status: "completed",
+            final_text: "同进程并发摘要。",
+            targets: [
+              {
+                entry: "feishu:@me",
+                address: "feishu:@me",
+                name: "Feishu DM",
+                ok: true,
+                message: null,
+                agent_sent: false,
+              },
+            ],
+          },
+        };
+      }),
+      replayThreadRun: vi.fn(async () => ({
+        status: 200,
+        isSse: true as const,
+        events: (async function* () {
+          yield {
+            event: "user_message",
+            data: JSON.stringify({ turn_index: 1, run_id: targetRunId }),
+          };
+          yield {
+            event: "artifact",
+            data: JSON.stringify({
+              artifact_type: "chart_layer",
+              artifact_id: "layer-concurrent-a",
+              response_id: targetRunId,
+              payload: {
+                chart_id: "NVDA:1day",
+                layer_id: "layer-concurrent-a",
+                title: "Concurrent Chart A",
+              },
+            }),
+          };
+          yield {
+            event: "replay_done",
+            data: JSON.stringify({
+              thread_id: THREAD_ID,
+              run_id: targetRunId,
+              turn_index: 1,
+              outbound_blocked_by_run: { [targetRunId]: false },
+            }),
+          };
+        })(),
+      })),
+    });
+
+    const adaptersSameProc = new Map<ChannelPlatform, ChannelAdapter>([
+      ["feishu", feishuSameProc],
+    ]);
+    const deliverySameProc = new DeliveryService({
+      backend: backendSameProc,
+      adapters: adaptersSameProc,
+      webBaseUrl: WEB_BASE,
+    });
+    const routesSameProc = new AgentRoutesHandler({
+      backend: backendSameProc,
+      adapters: adaptersSameProc,
+      deliveryService: deliverySameProc,
+      webBaseUrl: WEB_BASE,
+    });
+
+    const reqBody = {
+      status: "completed" as const,
+      thread_id: THREAD_ID,
+      run_id: targetRunId,
+      final_text: "同进程并发摘要。",
+    };
+    const p1 = routesSameProc.handleFinishAutomationRun("user-alice", execId, reqBody);
+    await firstI8Started;
+    // Second `/finish` arrives BEFORE first I-8 returns:
+    const res2SameProc = await routesSameProc.handleFinishAutomationRun(
+      "user-alice",
+      execId,
+      reqBody,
+    );
+    expect(res2SameProc.status).toBe(503);
+    expect(res2SameProc.data.retryable).toBe(true);
+    expect(dbStatusSameProc).toBe("finishing");
+    expect(markFinishedSameProc.filter(Boolean)).toHaveLength(0);
+
+    // Now release first I-8: Call 1 finishes charts and marks `finished` ONCE.
+    releaseFirstI8();
+    const res1SameProc = await p1;
+    expect(res1SameProc.status).toBe(200);
+    expect(dbStatusSameProc).toBe("finished");
+    expect(markFinishedSameProc.filter(Boolean)).toHaveLength(1);
+    expect(feishuSameProc.sentCards).toHaveLength(1);
+
+    // Part B: Two separate gateway instances (no shared `activeFinishExecutors`):
+    // Instance A holds `automation:${execId}:feishu:@me:charts` as `in_flight` while sending.
+    // Instance B arrives concurrently, sees `:charts` still `in_flight`, MUST return retryable 503,
+    // and MUST NOT call `mark_finished: true` (DB stays `finishing`).
+    const execIdCross = "exec-bw2-concurrent-cross-proc";
+    let releaseChartSend!: () => void;
+    let notifyChartSendStarted!: () => void;
+    const chartSendStarted = new Promise<void>((resolve) => {
+      notifyChartSendStarted = resolve;
+    });
+    const chartSendGate = new Promise<void>((resolve) => {
+      releaseChartSend = resolve;
+    });
+
+    const feishuA = makeMockAdapter("feishu");
+    const origSendCardA = feishuA.sendCard!.bind(feishuA);
+    feishuA.sendCard = vi.fn(async (opts) => {
+      notifyChartSendStarted();
+      await chartSendGate;
+      return origSendCardA(opts);
+    });
+    const feishuB = makeMockAdapter("feishu");
+
+    const deliveryStates = new Map<string, "in_flight" | "sent">();
+    let dbStatusCross: "registered" | "finishing" | "finished" = "registered";
+    const markFinishedByCaller: string[] = [];
+
+    const makeCrossBackend = (callerTag: string): BackendClient =>
+      makeMockBackend({
+        authorizeAndClaimDelivery: vi.fn(async (req) => {
+          const st = deliveryStates.get(req.delivery_key);
+          if (st === "sent") {
+            return {
+              claim_status: "already_completed" as const,
+              status: "sent" as const,
+              platform: "feishu",
+              target_address: "feishu:@me",
+              is_current: false,
+              delivery_attempt: 1,
+              first_response_json: {
+                status: "sent",
+                code: null,
+                address: "feishu:@me",
+                current: false,
+                duplicate: true,
+                message: "already sent",
+                files: [],
+              },
+            };
+          }
+          if (st === "in_flight") {
+            return {
+              claim_status: "in_flight_or_unknown" as const,
+              status: "unknown" as const,
+              existing_status: "in_flight" as const,
+              code: "in_flight" as const,
+              platform: "feishu",
+              target_address: "feishu:@me",
+              is_current: false,
+              delivery_attempt: 1,
+            };
+          }
+          deliveryStates.set(req.delivery_key, "in_flight");
+          return {
+            claim_status: "claimed" as const,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            recipient_id: "ou_alice",
+            dm_recipient_platform_user_id: "ou_alice",
+            is_current: false,
+            delivery_attempt: 1,
+          };
+        }),
+        updateDeliveryProgress: vi.fn(async (req) => {
+          if (req.status === "sent" || req.status === "partial") {
+            deliveryStates.set(req.delivery_key, "sent");
+          }
+          return {
+            ok: true,
+            delivery_key: req.delivery_key,
+            status: req.status ?? "sent",
+            sent_to_current_count: 1,
+          };
+        }),
+        finishAutomationRun: vi.fn(async (_id, req) => {
+          const prev = dbStatusCross;
+          if (req.mark_finished) {
+            markFinishedByCaller.push(callerTag);
+            // Mirror DB guard: never transition while `:charts` is `in_flight`, and only once.
+            const hasInFlightCharts = [...deliveryStates.entries()].some(
+              ([k, v]) =>
+                k.startsWith(`automation:${execIdCross}:`) &&
+                k.endsWith(":charts") &&
+                v === "in_flight",
+            );
+            if (!hasInFlightCharts && dbStatusCross !== "finished") {
+              dbStatusCross = "finished";
+            }
+          } else if (dbStatusCross === "registered") {
+            dbStatusCross = "finishing";
+          }
+          return {
+            status: 200,
+            data: {
+              execution_id: execIdCross,
+              status: dbStatusCross,
+              previous_status: prev,
+              user_id: "user-alice",
+              workspace_id: "ws-1",
+              thread_id: THREAD_ID,
+              run_id: targetRunId,
+              chart_snapshots: [],
+              outbound_blocked: false,
+              automation_name: "Concurrent Cross-Process Brief",
+              finish_status: "completed",
+              final_text: "跨进程并发摘要。",
+              targets: [
+                {
+                  entry: "feishu:@me",
+                  address: "feishu:@me",
+                  name: "Feishu DM",
+                  ok: true,
+                  message: null,
+                  agent_sent: false,
+                },
+              ],
+            },
+          };
+        }),
+        replayThreadRun: vi.fn(async () => ({
+          status: 200,
+          isSse: true as const,
+          events: (async function* () {
+            yield {
+              event: "user_message",
+              data: JSON.stringify({ turn_index: 1, run_id: targetRunId }),
+            };
+            yield {
+              event: "artifact",
+              data: JSON.stringify({
+                artifact_type: "chart_layer",
+                artifact_id: "layer-concurrent-cross",
+                response_id: targetRunId,
+                payload: {
+                  chart_id: "NVDA:1day",
+                  layer_id: "layer-concurrent-cross",
+                  title: "Concurrent Cross Chart",
+                },
+              }),
+            };
+            yield {
+              event: "replay_done",
+              data: JSON.stringify({
+                thread_id: THREAD_ID,
+                run_id: targetRunId,
+                turn_index: 1,
+                outbound_blocked_by_run: { [targetRunId]: false },
+              }),
+            };
+          })(),
+        })),
+      });
+
+    const backendA = makeCrossBackend("A");
+    const backendB = makeCrossBackend("B");
+    const adaptersA = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuA]]);
+    const adaptersB = new Map<ChannelPlatform, ChannelAdapter>([["feishu", feishuB]]);
+    const routesA = new AgentRoutesHandler({
+      backend: backendA,
+      adapters: adaptersA,
+      deliveryService: new DeliveryService({ backend: backendA, adapters: adaptersA, webBaseUrl: WEB_BASE }),
+      webBaseUrl: WEB_BASE,
+    });
+    const routesB = new AgentRoutesHandler({
+      backend: backendB,
+      adapters: adaptersB,
+      deliveryService: new DeliveryService({ backend: backendB, adapters: adaptersB, webBaseUrl: WEB_BASE }),
+      webBaseUrl: WEB_BASE,
+    });
+
+    const crossBody = {
+      status: "completed" as const,
+      thread_id: THREAD_ID,
+      run_id: targetRunId,
+      final_text: "跨进程并发摘要。",
+    };
+    const pA = routesA.handleFinishAutomationRun("user-alice", execIdCross, crossBody);
+    await chartSendStarted;
+
+    // While Instance A's `:charts` key is `in_flight`, Instance B runs `/finish`:
+    const resB = await routesB.handleFinishAutomationRun("user-alice", execIdCross, crossBody);
+    expect(resB.status).toBe(503);
+    expect(resB.data.retryable).toBe(true);
+    expect(dbStatusCross).toBe("finishing");
+    expect(markFinishedByCaller).toEqual([]);
+    expect(feishuB.sentCards).toHaveLength(0);
+
+    // Release Instance A's chart send -> Instance A finishes and writes `finished` ONCE.
+    releaseChartSend();
+    const resA = await pA;
+    expect(resA.status).toBe(200);
+    expect(dbStatusCross).toBe("finished");
+    expect(markFinishedByCaller).toEqual(["A"]);
+    expect(feishuA.sentCards).toHaveLength(1);
+    expect(feishuA.sentTexts).toHaveLength(1);
+  });
 });

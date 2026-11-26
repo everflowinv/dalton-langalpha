@@ -935,6 +935,8 @@ export interface DeliverChartsAndWidgetsParams {
 
 export interface DeliverChartsAndWidgetsResult {
   settled: boolean;
+  /** True when another worker currently holds an active `in_flight` claim on this charts key. */
+  inFlight?: boolean;
   sentImages: number;
   sentLinks: number;
   timedOutPending: boolean;
@@ -1036,11 +1038,21 @@ export async function deliverTurnChartsAndWidgets(
   }
 
   if (claim.claim_status === "already_completed") {
-    return { settled: true, sentImages: 0, sentLinks: 0, timedOutPending: false };
+    return {
+      settled: true,
+      inFlight: false,
+      sentImages: 0,
+      sentLinks: 0,
+      timedOutPending: false,
+    };
   }
   if (claim.claim_status !== "claimed") {
+    const inFlight =
+      claim.claim_status === "in_flight_or_unknown" &&
+      claim.existing_status !== "unknown";
     return {
       settled: claim.claim_status === "denied",
+      inFlight,
       sentImages: 0,
       sentLinks: 0,
       timedOutPending: false,

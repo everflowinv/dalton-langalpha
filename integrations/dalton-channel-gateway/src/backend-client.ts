@@ -459,7 +459,6 @@ export interface I6AuthorizeAndClaimRequest {
   source_scope_key?: string | null;
   source_generation?: number | null;
   activity_origin?: DeliveryActivityOrigin | null;
-  reclaim_verified_unsent?: boolean;
 }
 
 export interface I6AuthorizeAndClaimResponse {
@@ -472,15 +471,11 @@ export interface I6AuthorizeAndClaimResponse {
   existing_status?: "in_flight" | "unknown" | string;
   error_code?: string | null;
   sent_chunks?: number;
-  platform_message_ids?: string[];
   files_status?: Array<{
     workspace_id?: string | null;
     path: string;
     status: string;
     reason?: string | null;
-    idempotency_key?: string | null;
-    platform_message_id?: string | null;
-    chunk_index?: number | null;
   }>;
   code?:
     | "not_linked"
@@ -645,18 +640,8 @@ export interface I7DeliveriesProgressRequest {
   files_status?: Array<{
     path: string;
     workspace_id?: string | null;
-    status:
-      | "sent"
-      | "linked"
-      | "failed"
-      | "unknown"
-      | "pending"
-      | "queued"
-      | "dispatching";
+    status: "sent" | "linked" | "failed" | "unknown" | "pending";
     reason: string | null;
-    idempotency_key?: string | null;
-    platform_message_id?: string | null;
-    chunk_index?: number | null;
   }>;
   first_response_json?: Record<string, unknown>;
   status?: "in_flight" | "sent" | "partial" | "failed" | "unknown";
@@ -692,18 +677,8 @@ export interface I7DeliveriesProgressResponse {
   files_status?: Array<{
     path: string;
     workspace_id?: string | null;
-    status:
-      | "sent"
-      | "linked"
-      | "failed"
-      | "unknown"
-      | "pending"
-      | "queued"
-      | "dispatching";
+    status: "sent" | "linked" | "failed" | "unknown" | "pending";
     reason: string | null;
-    idempotency_key?: string | null;
-    platform_message_id?: string | null;
-    chunk_index?: number | null;
   }>;
   sent_to_current_count: number;
   bot_topic_registered?: boolean;

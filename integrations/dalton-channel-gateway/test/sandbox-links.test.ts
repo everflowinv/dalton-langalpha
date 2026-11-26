@@ -550,11 +550,10 @@ describe("channel chunkers preserve rewritten Markdown links and underscores", (
     expect(restored).toBe(codeLine);
   });
 
-  it("BT3: preserves reference link definitions inside multiline backtick spans and fenced code blocks verbatim", () => {
+  it("BT3: preserves reference link definitions inside same-paragraph multiline backtick spans and fenced code blocks verbatim", () => {
     const singleBacktickMultiline = [
       "示例：",
       "`line 1",
-      "",
       "[x]: /home/workspace/secret.md",
       "`",
       "",
@@ -566,7 +565,6 @@ describe("channel chunkers preserve rewritten Markdown links and underscores", (
 
     const doubleBacktickMultiline = [
       "说明：``first line",
-      "",
       "[def]: /home/workspace/internal.pdf",
       "last line``",
     ].join("\n");
@@ -574,10 +572,19 @@ describe("channel chunkers preserve rewritten Markdown links and underscores", (
       doubleBacktickMultiline,
     );
 
-    // A definition inside a multiline backtick span must NOT shadow a real definition outside code.
+    // Same-paragraph multiline backtick span inside a blockquote also stays protected.
+    const quotedMultiline = [
+      "> `line 1",
+      "> [q1]: /home/workspace/quoted_inline.md",
+      "> line 2`",
+    ].join("\n");
+    expect(rewriteSandboxLinks(quotedMultiline, WEB_BASE, THREAD_ID)).toBe(
+      quotedMultiline,
+    );
+
+    // A definition inside a same-paragraph multiline backtick span must NOT shadow a real definition outside code.
     const mixedInput = [
       "代码里的样例：`header",
-      "",
       "[r1]: /home/workspace/inside_code.md",
       "`",
       "",
@@ -587,7 +594,6 @@ describe("channel chunkers preserve rewritten Markdown links and underscores", (
     ].join("\n");
     const mixedExpected = [
       "代码里的样例：`header",
-      "",
       "[r1]: /home/workspace/inside_code.md",
       "`",
       "",
@@ -605,6 +611,72 @@ describe("channel chunkers preserve rewritten Markdown links and underscores", (
       "正文提到 [f1]。",
     ].join("\n");
     expect(rewriteSandboxLinks(fencedDef, WEB_BASE, THREAD_ID)).toBe(fencedDef);
+  });
+
+  it("BT3: stray backticks across different Markdown paragraphs or blocks never pair or suppress link rewriting in between", () => {
+    // 1) Two stray backticks in separate paragraphs with a normal file link AND a reference
+    //    link/definition between them: neither backtick may pair across paragraph boundaries.
+    const strayAcrossParagraphs = [
+      "第一段包含一个孤立反引号 ` 未闭合。",
+      "",
+      "第二段有普通文件链接 [完整报告](/home/workspace/results/report.md) 和引用 [摘要][r1]。",
+      "",
+      "[r1]: /home/workspace/results/summary.md",
+      "",
+      "第三段也有一个孤立反引号 ` 未闭合。",
+    ].join("\n");
+    const strayAcrossParagraphsExpected = [
+      "第一段包含一个孤立反引号 ` 未闭合。",
+      "",
+      `第二段有普通文件链接 [完整报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Freport.md) 和引用 [摘要](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Fsummary.md)。`,
+      "",
+      "",
+      "第三段也有一个孤立反引号 ` 未闭合。",
+    ].join("\n");
+    expect(rewriteSandboxLinks(strayAcrossParagraphs, WEB_BASE, THREAD_ID)).toBe(
+      strayAcrossParagraphsExpected,
+    );
+
+    // 2) Stray backticks across list items, heading-to-paragraph, and GFM table cells
+    //    must NOT pair across block boundaries.
+    const strayAcrossListItems = [
+      "- 第一项有孤立反引号 `",
+      "- 第二项链接：[列表报告](/home/workspace/results/list.md)",
+      "- 第三项有孤立反引号 `",
+    ].join("\n");
+    expect(rewriteSandboxLinks(strayAcrossListItems, WEB_BASE, THREAD_ID)).toBe(
+      [
+        "- 第一项有孤立反引号 `",
+        `- 第二项链接：[列表报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Flist.md)`,
+        "- 第三项有孤立反引号 `",
+      ].join("\n"),
+    );
+
+    const strayHeadingAndParagraph = [
+      "# 标题里的孤立反引号 `",
+      "[紧邻正文](/home/workspace/results/body.md)",
+      "结尾孤立反引号 `",
+    ].join("\n");
+    expect(rewriteSandboxLinks(strayHeadingAndParagraph, WEB_BASE, THREAD_ID)).toBe(
+      [
+        "# 标题里的孤立反引号 `",
+        `[紧邻正文](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Fbody.md)`,
+        "结尾孤立反引号 `",
+      ].join("\n"),
+    );
+
+    const strayTableCells = [
+      "| 左 ` | [表格报告](/home/workspace/results/table.md) | 右 ` |",
+      "| --- | --- | --- |",
+      "| 1 | 2 | 3 |",
+    ].join("\n");
+    expect(rewriteSandboxLinks(strayTableCells, WEB_BASE, THREAD_ID)).toBe(
+      [
+        `| 左 \` | [表格报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Ftable.md) | 右 \` |`,
+        "| --- | --- | --- |",
+        "| 1 | 2 | 3 |",
+      ].join("\n"),
+    );
   });
 
   it("BT3: stray backtick before a fenced code block does not pair into the fence and three chained multiline backtick spans all stay protected", () => {
@@ -632,13 +704,12 @@ describe("channel chunkers preserve rewritten Markdown links and underscores", (
       strayBeforeFenceExpected,
     );
 
-    // 2) Three chained consecutive multiline backtick spans: the 3rd span's reference definition
-    //    MUST stay verbatim while links outside all three spans are still rewritten.
+    // 2) Three chained consecutive same-paragraph multiline backtick spans: the 3rd span's
+    //    reference definition MUST stay verbatim while links outside all three spans are still rewritten.
     const threeChainedSpans = [
       "`span 1 line 1",
       "span 1 line 2` `span 2 line 1",
       "span 2 line 2` `span 3 line 1",
-      "",
       "[r3]: /home/workspace/inside_third_span.md",
       "span 3 line 2`",
       "",
@@ -648,7 +719,6 @@ describe("channel chunkers preserve rewritten Markdown links and underscores", (
       "`span 1 line 1",
       "span 1 line 2` `span 2 line 1",
       "span 2 line 2` `span 3 line 1",
-      "",
       "[r3]: /home/workspace/inside_third_span.md",
       "span 3 line 2`",
       "",
