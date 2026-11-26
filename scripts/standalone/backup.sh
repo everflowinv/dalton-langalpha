@@ -401,6 +401,707 @@ chmod 700 "$STAGE_DIR"
 
 LOCK_DIR="${OUTPUT_DIR}/.dalton-backup.lock"
 LOCK_HELD=0
+WIKI_INSTANCE_HASH="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:12])' "${WORK_DIR}|${PROJECT_NAME}")"
+WIKI_LOCK_FILE="${DALTON_WIKI_BACKUP_LOCK_FILE:-/tmp/dalton-wiki-backup-${PROJECT_NAME}-${WIKI_INSTANCE_HASH}.flock}"
+WIKI_LOCK_HELD=0
+WIKI_LOCK_FD_OPEN=0
+WIKI_LOCK_HELPER_PID=""
+WIKI_LOCK_CTL_FIFO=""
+WIKI_LOCK_STATUS_FILE=""
+WIKI_LOCK_ERR_FILE=""
+WIKI_WRITES_PAUSED=0
+WIKI_PAUSE_PORT="8951"
+WIKI_PAUSE_ADMIN_TOKEN=""
+WIKI_PAUSE_OWNER="${BACKUP_NAME}-pid$$"
+WIKI_PAUSE_LEASE_ID=""
+WIKI_PAUSE_TTL_S="${DALTON_WIKI_PAUSE_TTL_S:-300}"
+if [[ ! "$WIKI_PAUSE_TTL_S" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  WIKI_PAUSE_TTL_S="300"
+fi
+WIKI_PAUSE_HEARTBEAT_S="${DALTON_WIKI_PAUSE_HEARTBEAT_S:-}"
+if [[ -z "$WIKI_PAUSE_HEARTBEAT_S" || ! "$WIKI_PAUSE_HEARTBEAT_S" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  WIKI_PAUSE_HEARTBEAT_S="$(python3 -c 'import sys; ttl=float(sys.argv[1]); print(f"{max(0.05, min(60.0, ttl / 3.0)):.3f}")' "$WIKI_PAUSE_TTL_S")"
+fi
+WIKI_PAUSE_HEARTBEAT_TIMEOUT_S="${DALTON_WIKI_PAUSE_HEARTBEAT_TIMEOUT_S:-}"
+if [[ -z "$WIKI_PAUSE_HEARTBEAT_TIMEOUT_S" || ! "$WIKI_PAUSE_HEARTBEAT_TIMEOUT_S" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  WIKI_PAUSE_HEARTBEAT_TIMEOUT_S="$(python3 -c 'import sys; ttl=float(sys.argv[1]); print(f"{max(1.0, min(30.0, ttl / 2.0)):.3f}")' "$WIKI_PAUSE_TTL_S")"
+fi
+WIKI_EXEC_TIMEOUT_S="${DALTON_WIKI_EXEC_TIMEOUT_S:-$WIKI_PAUSE_HEARTBEAT_TIMEOUT_S}"
+if [[ -z "$WIKI_EXEC_TIMEOUT_S" || ! "$WIKI_EXEC_TIMEOUT_S" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  WIKI_EXEC_TIMEOUT_S="$WIKI_PAUSE_HEARTBEAT_TIMEOUT_S"
+fi
+WIKI_RESUME_TIMEOUT_S="${DALTON_WIKI_RESUME_TIMEOUT_S:-$WIKI_EXEC_TIMEOUT_S}"
+if [[ -z "$WIKI_RESUME_TIMEOUT_S" || ! "$WIKI_RESUME_TIMEOUT_S" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  WIKI_RESUME_TIMEOUT_S="$WIKI_EXEC_TIMEOUT_S"
+fi
+WIKI_DRAIN_POLL_S="${DALTON_WIKI_DRAIN_POLL_S:-1}"
+if [[ ! "$WIKI_DRAIN_POLL_S" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  WIKI_DRAIN_POLL_S="1"
+fi
+WIKI_DRAIN_MAX_POLLS="${DALTON_WIKI_DRAIN_MAX_POLLS:-30}"
+if [[ ! "$WIKI_DRAIN_MAX_POLLS" =~ ^[1-9][0-9]*$ ]]; then
+  WIKI_DRAIN_MAX_POLLS="30"
+fi
+WIKI_DRAIN_TIMEOUT_S="${DALTON_WIKI_DRAIN_TIMEOUT_S:-35}"
+if [[ -z "$WIKI_DRAIN_TIMEOUT_S" || ! "$WIKI_DRAIN_TIMEOUT_S" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  WIKI_DRAIN_TIMEOUT_S="35"
+fi
+WIKI_PAUSE_RECOVERY_TIMEOUT_S="${DALTON_WIKI_PAUSE_RECOVERY_TIMEOUT_S:-}"
+if [[ -z "$WIKI_PAUSE_RECOVERY_TIMEOUT_S" || ! "$WIKI_PAUSE_RECOVERY_TIMEOUT_S" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  WIKI_PAUSE_RECOVERY_TIMEOUT_S="$(python3 -c 'import sys; t=float(sys.argv[1]); print(f"{min(15.0, max(2.0, t * 3.0)):.3f}")' "$WIKI_EXEC_TIMEOUT_S")"
+fi
+WIKI_PAUSE_RECOVERY_POLL_S="${DALTON_WIKI_PAUSE_RECOVERY_POLL_S:-0.25}"
+if [[ -z "$WIKI_PAUSE_RECOVERY_POLL_S" || ! "$WIKI_PAUSE_RECOVERY_POLL_S" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+  WIKI_PAUSE_RECOVERY_POLL_S="0.25"
+fi
+WIKI_HEARTBEAT_PID=""
+WIKI_HEARTBEAT_FD_OPEN=0
+WIKI_HEARTBEAT_CTL_FIFO=""
+WIKI_HEARTBEAT_FAILED_FILE=""
+
+# Run a command in its own process group with a single wall-clock deadline that
+# covers BOTH the process group AND reading stdout to EOF (so a descendant still
+# holding stdout after the group leader exits cannot stall command substitution).
+# On timeout or signal, closes our stdout pipe read end, sends SIGTERM to the
+# entire process group, waits a short grace period, then unconditionally sends
+# SIGKILL to the entire process group and reaps the direct child.
+# Exits with child exit code, or 124 on timeout.
+run_with_timeout_pg() {
+  local timeout_s="$1"
+  shift
+  python3 - "$timeout_s" "$@" <<'PY'
+import errno, os, select, signal, subprocess, sys, time
+
+timeout_s = max(0.05, float(sys.argv[1]))
+cmd = sys.argv[2:]
+if not cmd:
+    sys.exit(2)
+
+active_proc = None
+
+def terminate_pg(proc) -> None:
+    if proc is None:
+        return
+    pgid = proc.pid
+    if proc.stdout is not None:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    grace_deadline = time.monotonic() + 0.4
+    while time.monotonic() < grace_deadline:
+        child_done = proc.poll() is not None
+        try:
+            os.killpg(pgid, 0)
+            pg_alive = True
+        except ProcessLookupError:
+            pg_alive = False
+        except PermissionError:
+            pg_alive = True
+        if child_done and not pg_alive:
+            break
+        time.sleep(0.02)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=2.0)
+    except Exception:
+        pass
+    kill_deadline = time.monotonic() + 0.5
+    while time.monotonic() < kill_deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            break
+        except PermissionError:
+            break
+        time.sleep(0.02)
+
+def on_sig(signum, _frame) -> None:
+    terminate_pg(active_proc)
+    sys.exit(128 + signum)
+
+signal.signal(signal.SIGTERM, on_sig)
+signal.signal(signal.SIGINT, on_sig)
+
+active_proc = subprocess.Popen(
+    cmd,
+    stdout=subprocess.PIPE,
+    start_new_session=True,
+)
+assert active_proc.stdout is not None
+stdout_fd = active_proc.stdout.fileno()
+os.set_blocking(stdout_fd, False)
+
+deadline = time.monotonic() + timeout_s
+chunks: list[bytes] = []
+stdout_eof = False
+
+while True:
+    rem = deadline - time.monotonic()
+    if rem <= 0:
+        terminate_pg(active_proc)
+        sys.exit(124)
+
+    if not stdout_eof:
+        try:
+            r, _, _ = select.select([stdout_fd], [], [], min(0.02, rem))
+        except InterruptedError:
+            continue
+        if r:
+            while True:
+                try:
+                    data = os.read(stdout_fd, 65536)
+                except BlockingIOError:
+                    break
+                except OSError as exc:
+                    if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                        break
+                    stdout_eof = True
+                    break
+                if not data:
+                    stdout_eof = True
+                    break
+                chunks.append(data)
+    else:
+        if active_proc.poll() is not None:
+            break
+        time.sleep(min(0.02, rem))
+
+    if stdout_eof and active_proc.poll() is not None:
+        break
+
+try:
+    active_proc.stdout.close()
+except OSError:
+    pass
+rc = active_proc.returncode if active_proc.returncode is not None else 1
+if chunks:
+    sys.stdout.buffer.write(b"".join(chunks))
+    sys.stdout.buffer.flush()
+sys.exit(rc)
+PY
+}
+
+_kill_lock_helper_and_reap() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 0
+  kill -TERM -- "-${pid}" 2>/dev/null || true
+  kill -TERM "$pid" 2>/dev/null || true
+  local waited_ms=0
+  while (( waited_ms < 400 )); do
+    if ! kill -0 "$pid" 2>/dev/null && ! kill -0 -- "-${pid}" 2>/dev/null; then
+      break
+    fi
+    sleep 0.02
+    waited_ms=$(( waited_ms + 20 ))
+  done
+  kill -KILL -- "-${pid}" 2>/dev/null || true
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  local reap_ms=0
+  while (( reap_ms < 500 )); do
+    if ! kill -0 "$pid" 2>/dev/null && ! kill -0 -- "-${pid}" 2>/dev/null; then
+      break
+    fi
+    sleep 0.02
+    reap_ms=$(( reap_ms + 20 ))
+  done
+}
+
+# Acquire an atomic OS-level exclusive advisory lock (fcntl.flock) per deployment instance.
+# Kernel automatically releases the lock on process exit/crash, eliminating PID-file cleanup races.
+acquire_wiki_backup_lock() {
+  local max_wait="${DALTON_WIKI_BACKUP_LOCK_WAIT_S:-60}"
+  if [[ ! "$max_wait" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    max_wait=60
+  fi
+  local handshake_timeout="${DALTON_WIKI_BACKUP_LOCK_HANDSHAKE_TIMEOUT_S:-}"
+  if [[ -z "$handshake_timeout" || ! "$handshake_timeout" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    handshake_timeout="$(exec 8>&- 9>&-; python3 -c 'import sys; print(f"{float(sys.argv[1]) + 5.0:.3f}")' "$max_wait")"
+  fi
+  WIKI_LOCK_CTL_FIFO="${STAGE_DIR}/.wiki-lock-ctl.fifo"
+  WIKI_LOCK_STATUS_FILE="${STAGE_DIR}/.wiki-lock-status"
+  WIKI_LOCK_ERR_FILE="${STAGE_DIR}/.wiki-lock-err"
+  rm -f "$WIKI_LOCK_CTL_FIFO" "$WIKI_LOCK_STATUS_FILE" "$WIKI_LOCK_ERR_FILE"
+  mkfifo "$WIKI_LOCK_CTL_FIFO"
+  local wiki_lock_py
+  wiki_lock_py='
+import fcntl, os, sys, time
+
+try:
+    os.setsid()
+except OSError:
+    pass
+
+lock_path, max_wait_s, status_file = sys.argv[1], float(sys.argv[2]), sys.argv[3]
+
+def write_status(msg: str) -> None:
+    tmp = f"{status_file}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as sf:
+        sf.write(msg + "\n")
+        sf.flush()
+    os.replace(tmp, status_file)
+
+fd = -1
+try:
+    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + max(0.0, max_wait_s)
+    acquired = False
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+    write_status("ACQUIRED" if acquired else "TIMEOUT")
+except Exception as exc:
+    if fd >= 0:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    write_status(f"ERROR:{type(exc).__name__}: {exc}")
+    sys.exit(2)
+
+if not acquired:
+    os.close(fd)
+    sys.exit(1)
+
+try:
+    for line in sys.stdin:
+        if line.strip() == "RELEASE":
+            break
+finally:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+'
+  # Open control FIFO read/write in parent so neither parent nor helper can hang on FIFO open.
+  # Launch Python lock helper directly (no wrapper subshell) so $! IS the actual lock helper PID.
+  exec 8<>"$WIKI_LOCK_CTL_FIFO"
+  WIKI_LOCK_FD_OPEN=1
+  python3 -c "$wiki_lock_py" "$WIKI_LOCK_FILE" "$max_wait" "$WIKI_LOCK_STATUS_FILE" < "$WIKI_LOCK_CTL_FIFO" >/dev/null 2>"$WIKI_LOCK_ERR_FILE" 8>&- 9>&- &
+  WIKI_LOCK_HELPER_PID=$!
+
+  local lock_status=""
+  lock_status="$(exec 8>&- 9>&-; python3 - "$WIKI_LOCK_HELPER_PID" "$WIKI_LOCK_STATUS_FILE" "$WIKI_LOCK_ERR_FILE" "$handshake_timeout" <<'PY'
+import os, subprocess, sys, time
+
+helper_pid = int(sys.argv[1])
+status_file = sys.argv[2]
+err_file = sys.argv[3]
+timeout_s = max(0.1, float(sys.argv[4]))
+deadline = time.monotonic() + timeout_s
+
+def read_first_line(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().strip().splitlines()
+            return lines[0] if lines else ""
+    except OSError:
+        return ""
+
+def helper_exited(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    proc_stat = f"/proc/{pid}/stat"
+    if os.path.exists(proc_stat):
+        try:
+            raw = open(proc_stat, encoding="utf-8", errors="replace").read()
+            rp = raw.rfind(")")
+            if rp > 0:
+                fields = raw[rp + 1 :].strip().split()
+                if fields and fields[0] in ("Z", "X", "x"):
+                    return True
+        except OSError:
+            pass
+        return False
+    try:
+        res = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if res.returncode == 0:
+            stat_str = (res.stdout or "").strip()
+            return (not stat_str) or stat_str.startswith("Z")
+    except OSError:
+        pass
+    return False
+
+while True:
+    if os.path.exists(status_file):
+        line = read_first_line(status_file)
+        if line:
+            print(line)
+            sys.exit(0)
+    if helper_exited(helper_pid):
+        if os.path.exists(status_file):
+            line = read_first_line(status_file)
+            if line:
+                print(line)
+                sys.exit(0)
+        err_msg = read_first_line(err_file) or "lock helper exited unexpectedly before handshake"
+        print(f"HELPER_EXITED:{err_msg}")
+        sys.exit(0)
+    if time.monotonic() >= deadline:
+        print("HANDSHAKE_TIMEOUT")
+        sys.exit(0)
+    time.sleep(0.02)
+PY
+  )" || lock_status="HANDSHAKE_WAIT_FAILED"
+
+  if [[ "$lock_status" != "ACQUIRED" ]]; then
+    if [[ "$WIKI_LOCK_FD_OPEN" -eq 1 ]]; then
+      exec 8>&- || true
+      WIKI_LOCK_FD_OPEN=0
+    fi
+    if [[ -n "$WIKI_LOCK_HELPER_PID" ]]; then
+      if [[ "$lock_status" == "HANDSHAKE_TIMEOUT" || "$lock_status" == "HANDSHAKE_WAIT_FAILED" ]]; then
+        _kill_lock_helper_and_reap "$WIKI_LOCK_HELPER_PID"
+      else
+        wait "$WIKI_LOCK_HELPER_PID" 2>/dev/null || _kill_lock_helper_and_reap "$WIKI_LOCK_HELPER_PID"
+      fi
+      WIKI_LOCK_HELPER_PID=""
+    fi
+    rm -f "$WIKI_LOCK_STATUS_FILE" "$WIKI_LOCK_ERR_FILE" "$WIKI_LOCK_CTL_FIFO"
+    WIKI_LOCK_STATUS_FILE=""
+    WIKI_LOCK_ERR_FILE=""
+    WIKI_LOCK_CTL_FIFO=""
+    case "$lock_status" in
+      TIMEOUT)
+        err "Another Wiki backup is already running for project '${PROJECT_NAME}' (lock=${WIKI_LOCK_FILE}, waited ${max_wait}s)."
+        ;;
+      ERROR:*)
+        err "Failed to open or lock Wiki backup lock '${WIKI_LOCK_FILE}': ${lock_status#ERROR:}"
+        ;;
+      HELPER_EXITED:*)
+        err "Wiki backup lock helper exited before handshake (lock=${WIKI_LOCK_FILE}): ${lock_status#HELPER_EXITED:}"
+        ;;
+      HANDSHAKE_TIMEOUT)
+        err "Timed out waiting for Wiki backup lock helper handshake (lock=${WIKI_LOCK_FILE}, timeout=${handshake_timeout}s)."
+        ;;
+      *)
+        err "Wiki backup lock acquisition failed (lock=${WIKI_LOCK_FILE}, status=${lock_status:-empty})."
+        ;;
+    esac
+    return 1
+  fi
+  rm -f "$WIKI_LOCK_STATUS_FILE" "$WIKI_LOCK_ERR_FILE"
+  WIKI_LOCK_STATUS_FILE=""
+  WIKI_LOCK_ERR_FILE=""
+  WIKI_LOCK_HELD=1
+  return 0
+}
+
+release_wiki_backup_lock() {
+  if [[ "$WIKI_LOCK_HELD" -eq 1 || "$WIKI_LOCK_FD_OPEN" -eq 1 || -n "$WIKI_LOCK_HELPER_PID" ]]; then
+    # Closing fd 8 delivers EOF to the flock helper without risking SIGPIPE.
+    if [[ "$WIKI_LOCK_FD_OPEN" -eq 1 ]]; then
+      exec 8>&- || true
+      WIKI_LOCK_FD_OPEN=0
+    fi
+    if [[ -n "$WIKI_LOCK_HELPER_PID" ]]; then
+      local waited_ms=0
+      while kill -0 "$WIKI_LOCK_HELPER_PID" 2>/dev/null && (( waited_ms < 2000 )); do
+        sleep 0.05
+        waited_ms=$(( waited_ms + 50 ))
+      done
+      if kill -0 "$WIKI_LOCK_HELPER_PID" 2>/dev/null || kill -0 -- "-${WIKI_LOCK_HELPER_PID}" 2>/dev/null; then
+        _kill_lock_helper_and_reap "$WIKI_LOCK_HELPER_PID"
+      else
+        wait "$WIKI_LOCK_HELPER_PID" 2>/dev/null || true
+      fi
+      WIKI_LOCK_HELPER_PID=""
+    fi
+    WIKI_LOCK_HELD=0
+  fi
+  if [[ -n "$WIKI_LOCK_CTL_FIFO" ]]; then
+    rm -f "$WIKI_LOCK_CTL_FIFO" 2>/dev/null || true
+    WIKI_LOCK_CTL_FIFO=""
+  fi
+  if [[ -n "$WIKI_LOCK_STATUS_FILE" ]]; then
+    rm -f "$WIKI_LOCK_STATUS_FILE" 2>/dev/null || true
+    WIKI_LOCK_STATUS_FILE=""
+  fi
+  if [[ -n "$WIKI_LOCK_ERR_FILE" ]]; then
+    rm -f "$WIKI_LOCK_ERR_FILE" 2>/dev/null || true
+    WIKI_LOCK_ERR_FILE=""
+  fi
+}
+
+stop_wiki_pause_heartbeat() {
+  if [[ "$WIKI_HEARTBEAT_FD_OPEN" -eq 1 ]]; then
+    exec 9>&- || true
+    WIKI_HEARTBEAT_FD_OPEN=0
+  fi
+  if [[ -n "$WIKI_HEARTBEAT_PID" ]]; then
+    kill -TERM "$WIKI_HEARTBEAT_PID" 2>/dev/null || true
+    local waited_ms=0
+    while kill -0 "$WIKI_HEARTBEAT_PID" 2>/dev/null && (( waited_ms < 2000 )); do
+      sleep 0.05
+      waited_ms=$(( waited_ms + 50 ))
+    done
+    if kill -0 "$WIKI_HEARTBEAT_PID" 2>/dev/null; then
+      kill -KILL "$WIKI_HEARTBEAT_PID" 2>/dev/null || true
+    fi
+    wait "$WIKI_HEARTBEAT_PID" 2>/dev/null || true
+    WIKI_HEARTBEAT_PID=""
+  fi
+  if [[ -n "$WIKI_HEARTBEAT_CTL_FIFO" ]]; then
+    rm -f "$WIKI_HEARTBEAT_CTL_FIFO" 2>/dev/null || true
+    WIKI_HEARTBEAT_CTL_FIFO=""
+  fi
+}
+
+start_wiki_pause_heartbeat() {
+  stop_wiki_pause_heartbeat
+  WIKI_HEARTBEAT_FAILED_FILE="${STAGE_DIR}/.wiki-heartbeat-failed"
+  WIKI_HEARTBEAT_CTL_FIFO="${STAGE_DIR}/.wiki-hb-ctl.fifo"
+  rm -f "$WIKI_HEARTBEAT_FAILED_FILE" "$WIKI_HEARTBEAT_CTL_FIFO"
+  mkfifo "$WIKI_HEARTBEAT_CTL_FIFO"
+  exec 9<>"$WIKI_HEARTBEAT_CTL_FIFO"
+  WIKI_HEARTBEAT_FD_OPEN=1
+
+  local parent_pid="$$"
+  local wiki_hb_py
+  wiki_hb_py='
+import os, select, signal, subprocess, sys, time
+
+parent_pid = int(sys.argv[1])
+interval_s = max(0.02, float(sys.argv[2]))
+req_timeout_s = max(0.1, float(sys.argv[3]))
+failed_file = sys.argv[4]
+cmd = sys.argv[5:]
+
+stop_requested = False
+active_proc = None
+
+def terminate_proc(proc) -> None:
+    if proc is None:
+        return
+    pgid = proc.pid
+    # Always signal the entire process group even if the leader already exited.
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    deadline = time.monotonic() + 0.4
+    while time.monotonic() < deadline:
+        child_done = proc.poll() is not None
+        try:
+            os.killpg(pgid, 0)
+            pg_alive = True
+        except ProcessLookupError:
+            pg_alive = False
+        except PermissionError:
+            pg_alive = True
+        if child_done and not pg_alive:
+            break
+        time.sleep(0.02)
+    # After grace period, unconditionally SIGKILL the entire process group
+    # regardless of whether the group leader has already exited.
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=2.0)
+    except Exception:
+        pass
+    kill_deadline = time.monotonic() + 0.5
+    while time.monotonic() < kill_deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            break
+        except PermissionError:
+            break
+        time.sleep(0.02)
+
+def on_signal(_signum, _frame) -> None:
+    global stop_requested
+    stop_requested = True
+    terminate_proc(active_proc)
+
+signal.signal(signal.SIGTERM, on_signal)
+signal.signal(signal.SIGINT, on_signal)
+
+def parent_alive() -> bool:
+    try:
+        os.kill(parent_pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+def ctl_eof() -> bool:
+    try:
+        r, _, _ = select.select([sys.stdin], [], [], 0.0)
+        if r:
+            data = os.read(sys.stdin.fileno(), 64)
+            if not data or b"STOP" in data:
+                return True
+    except (OSError, ValueError):
+        return True
+    return False
+
+while not stop_requested:
+    sleep_deadline = time.monotonic() + interval_s
+    while not stop_requested:
+        if not parent_alive() or ctl_eof():
+            sys.exit(0)
+        rem = sleep_deadline - time.monotonic()
+        if rem <= 0:
+            break
+        try:
+            r, _, _ = select.select([sys.stdin], [], [], min(0.05, rem))
+            if r:
+                data = os.read(sys.stdin.fileno(), 64)
+                if not data or b"STOP" in data:
+                    sys.exit(0)
+        except InterruptedError:
+            continue
+        except (OSError, ValueError):
+            sys.exit(0)
+
+    if stop_requested or not parent_alive() or ctl_eof():
+        sys.exit(0)
+
+    active_proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    req_deadline = time.monotonic() + req_timeout_s
+    timed_out = False
+    while active_proc.poll() is None:
+        if stop_requested or not parent_alive() or ctl_eof():
+            terminate_proc(active_proc)
+            active_proc = None
+            sys.exit(0)
+        if time.monotonic() >= req_deadline:
+            timed_out = True
+            terminate_proc(active_proc)
+            break
+        try:
+            r, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if r:
+                data = os.read(sys.stdin.fileno(), 64)
+                if not data or b"STOP" in data:
+                    terminate_proc(active_proc)
+                    active_proc = None
+                    sys.exit(0)
+        except InterruptedError:
+            continue
+        except (OSError, ValueError):
+            terminate_proc(active_proc)
+            active_proc = None
+            sys.exit(0)
+
+    rc = active_proc.returncode if active_proc is not None else 1
+    active_proc = None
+    if stop_requested or not parent_alive():
+        sys.exit(0)
+    if timed_out or rc != 0:
+        try:
+            with open(failed_file, "w", encoding="utf-8") as ff:
+                ff.write("heartbeat_timeout\n" if timed_out else "heartbeat_failed\n")
+        except OSError:
+            pass
+        sys.exit(1)
+'
+  local hb_sh_script
+  hb_sh_script='payload="$(python3 -c "import json,os; print(json.dumps({\"paused\": True, \"owner\": os.environ[\"DALTON_RH_PAUSE_OWNER\"], \"lease_id\": int(os.environ[\"DALTON_RH_PAUSE_LEASE_ID\"]), \"ttl_s\": float(os.environ[\"DALTON_RH_PAUSE_TTL_S\"])}))")" && body="$(curl -sf --connect-timeout "${DALTON_RH_CURL_TIMEOUT_S}" --max-time "${DALTON_RH_CURL_TIMEOUT_S}" -X POST -H "Content-Type: application/json" -H "Authorization: Bearer ${DALTON_RH_ADMIN_TOKEN}" -d "$payload" "$1/admin/wiki/pause-writes")" && printf "%s" "$body" | python3 -c "import json,os,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if isinstance(d, dict) and d.get(\"paused\") is True and d.get(\"expired\") is not True and str(d.get(\"lease_id\")) == os.environ[\"DALTON_RH_PAUSE_LEASE_ID\"] else 1)"'
+  DALTON_RH_ADMIN_TOKEN="$WIKI_PAUSE_ADMIN_TOKEN" \
+    DALTON_RH_PAUSE_OWNER="$WIKI_PAUSE_OWNER" \
+    DALTON_RH_PAUSE_LEASE_ID="$WIKI_PAUSE_LEASE_ID" \
+    DALTON_RH_PAUSE_TTL_S="$WIKI_PAUSE_TTL_S" \
+    DALTON_RH_CURL_TIMEOUT_S="$WIKI_PAUSE_HEARTBEAT_TIMEOUT_S" \
+    python3 -c "$wiki_hb_py" \
+      "$parent_pid" \
+      "$WIKI_PAUSE_HEARTBEAT_S" \
+      "$WIKI_PAUSE_HEARTBEAT_TIMEOUT_S" \
+      "$WIKI_HEARTBEAT_FAILED_FILE" \
+      env "${ENV_UNSET_ARGS[@]}" docker compose -p "$PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" --project-directory "$WORK_DIR" \
+      exec -T -e DALTON_RH_ADMIN_TOKEN -e DALTON_RH_PAUSE_OWNER -e DALTON_RH_PAUSE_LEASE_ID -e DALTON_RH_PAUSE_TTL_S -e DALTON_RH_CURL_TIMEOUT_S \
+      research-host sh -c "$hb_sh_script" _ "http://127.0.0.1:${WIKI_PAUSE_PORT}" \
+      < "$WIKI_HEARTBEAT_CTL_FIFO" >/dev/null 2>&1 8>&- 9>&- &
+  WIKI_HEARTBEAT_PID=$!
+}
+
+resume_wiki_writes() {
+  stop_wiki_pause_heartbeat
+  if [[ "$WIKI_WRITES_PAUSED" -eq 1 && -n "$WIKI_PAUSE_ADMIN_TOKEN" ]]; then
+    local resume_state=""
+    local resume_sh_script
+    resume_sh_script='payload="$(python3 -c "import json,os; p={\"paused\": False, \"owner\": os.environ[\"DALTON_RH_PAUSE_OWNER\"]}; lid=os.environ.get(\"DALTON_RH_PAUSE_LEASE_ID\", \"\").strip(); p.update({\"lease_id\": int(lid)} if lid else {}); print(json.dumps(p))")" && body="$(curl -sf --connect-timeout "${DALTON_RH_CURL_TIMEOUT_S}" --max-time "${DALTON_RH_CURL_TIMEOUT_S}" -X POST -H "Content-Type: application/json" -H "Authorization: Bearer ${DALTON_RH_ADMIN_TOKEN}" -d "$payload" "$1/admin/wiki/pause-writes")" && printf "%s" "$body" | python3 -c "import json,os,sys; d=json.loads(sys.stdin.read()); paused=d.get(\"paused\") if isinstance(d, dict) else None; expired=bool(d.get(\"expired\")) if isinstance(d, dict) else True; cont=d.get(\"continuous\") if isinstance(d, dict) else False; print(\"FAIL\" if paused is not False else (\"EXPIRED\" if (expired or cont is False) else \"OK\"))"'
+    set +e
+    resume_state="$(exec 8>&- 9>&-; \
+      DALTON_RH_ADMIN_TOKEN="$WIKI_PAUSE_ADMIN_TOKEN" \
+      DALTON_RH_PAUSE_OWNER="$WIKI_PAUSE_OWNER" \
+      DALTON_RH_PAUSE_LEASE_ID="$WIKI_PAUSE_LEASE_ID" \
+      DALTON_RH_CURL_TIMEOUT_S="$WIKI_RESUME_TIMEOUT_S" \
+      run_with_timeout_pg "$WIKI_RESUME_TIMEOUT_S" \
+        env "${ENV_UNSET_ARGS[@]}" docker compose -p "$PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" --project-directory "$WORK_DIR" \
+        exec -T -e DALTON_RH_ADMIN_TOKEN -e DALTON_RH_PAUSE_OWNER -e DALTON_RH_PAUSE_LEASE_ID -e DALTON_RH_CURL_TIMEOUT_S \
+        research-host sh -c "$resume_sh_script" _ "http://127.0.0.1:${WIKI_PAUSE_PORT}" 2>/dev/null)"
+    local exec_rc=$?
+    set -e
+    if [[ "$exec_rc" -ne 0 || "$resume_state" == "FAIL" || -z "$resume_state" ]]; then
+      # Keep WIKI_WRITES_PAUSED=1 so the EXIT cleanup trap can retry resuming once more.
+      err "CRITICAL: Failed to resume Wiki writes on research-host (owner=${WIKI_PAUSE_OWNER}, lease_id=${WIKI_PAUSE_LEASE_ID}, exit=${exec_rc}, timeout=${WIKI_RESUME_TIMEOUT_S}s); Wiki writes may remain paused (503) until resumed or lease expires (ttl=${WIKI_PAUSE_TTL_S}s)."
+      return 1
+    fi
+    WIKI_WRITES_PAUSED=0
+    if [[ "$resume_state" == "EXPIRED" ]]; then
+      err "ERROR: Wiki write-pause lease (owner=${WIKI_PAUSE_OWNER}, lease_id=${WIKI_PAUSE_LEASE_ID}) expired during backup; Wiki may have accepted writes mid-snapshot, discarding incomplete backup."
+      return 2
+    fi
+  fi
+  return 0
+}
 
 pid_is_alive() {
   local pid="$1"
@@ -466,6 +1167,8 @@ release_publish_lock() {
 }
 
 cleanup() {
+  resume_wiki_writes || true
+  release_wiki_backup_lock
   release_publish_lock
   if [[ -d "$STAGE_DIR" ]]; then
     rm -rf "$STAGE_DIR"
@@ -975,7 +1678,7 @@ fi
 rm -f "$PG_TOC_FILE"
 
 # 3. Caddy certificate & PKI data backup (/data on edge)
-info "3/4 Backing up Caddy certificate & PKI data..."
+info "3/5 Backing up Caddy certificate & PKI data..."
 compose_cmd exec -T edge tar -czf - -C /data . > "${STAGE_DIR}/caddy-data.tar.gz"
 
 CADDY_FILE_COUNT=0
@@ -986,10 +1689,231 @@ else
   ok "Caddy data archived (verification skipped)."
 fi
 
-# 4. .env handling (never copy plaintext .env into backup directory)
+# 4. Wiki data volume backup (/var/lib/dalton/wiki on research-host: SQLite DBs via online backup API, Markdown, originals, audit receipts)
+WIKI_FILE_COUNT=0
+WIKI_BACKUP_INCLUDED=0
+if compose_cmd config --services 2>/dev/null | grep -qx "research-host"; then
+  info "4/5 Backing up Wiki data volume (/var/lib/dalton/wiki on research-host)..."
+  WIKI_BACKUP_PY='
+from __future__ import annotations
+import os, shutil, sqlite3, sys, tarfile, tempfile
+from pathlib import Path
+
+root = Path(os.getenv("DALTON_WIKI_DATA_DIR") or "/var/lib/dalton/wiki")
+stage = Path(tempfile.mkdtemp(prefix="wiki-backup-"))
+try:
+    if root.is_dir():
+        for dirpath, _dirnames, filenames in os.walk(root):
+            rel_dir = Path(dirpath).relative_to(root)
+            dst_dir = stage / rel_dir
+            dst_dir.mkdir(parents=True, exist_ok=True)
+            for fname in filenames:
+                if fname.endswith(("-wal", "-shm", "-journal")):
+                    continue
+                src_f = Path(dirpath) / fname
+                dst_f = dst_dir / fname
+                if fname.endswith((".db", ".sqlite", ".sqlite3")):
+                    src_conn = sqlite3.connect(str(src_f), timeout=30)
+                    dst_conn = sqlite3.connect(str(dst_f))
+                    try:
+                        src_conn.backup(dst_conn)
+                    finally:
+                        dst_conn.close()
+                        src_conn.close()
+                else:
+                    shutil.copy2(src_f, dst_f)
+    with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz", format=tarfile.PAX_FORMAT) as tf:
+        for item in sorted(stage.rglob("*")):
+            rel = item.relative_to(stage).as_posix()
+            tf.add(str(item), arcname=rel, recursive=False)
+finally:
+    shutil.rmtree(stage, ignore_errors=True)
+'
+  if ! acquire_wiki_backup_lock; then
+    exit 1
+  fi
+  if compose_cmd ps --status running --services 2>/dev/null 8>&- 9>&- | grep -qx "research-host" 8>&- 9>&-; then
+    WIKI_PAUSE_PORT="$(exec 8>&- 9>&-; read_env_file_var "$ENV_FILE" "DALTON_RESEARCH_HOST_PORT" "8951")"
+    if [[ ! "$WIKI_PAUSE_PORT" =~ ^[0-9]+$ ]]; then
+      WIKI_PAUSE_PORT="8951"
+    fi
+    WIKI_PAUSE_ADMIN_TOKEN="$(exec 8>&- 9>&-; read_env_file_var "$ENV_FILE" "DALTON_RESEARCH_ADMIN_TOKEN" "")"
+    if [[ -z "$WIKI_PAUSE_ADMIN_TOKEN" ]]; then
+      err "DALTON_RESEARCH_ADMIN_TOKEN is missing in ${ENV_FILE}; cannot pause Wiki writes for a consistent online backup."
+      exit 1
+    fi
+    info "Pausing Wiki writes on research-host (owner=${WIKI_PAUSE_OWNER}, ttl=${WIKI_PAUSE_TTL_S}s, heartbeat=${WIKI_PAUSE_HEARTBEAT_S}s) and waiting for in-flight writes to drain..."
+    local_pause_sh='payload="$(python3 -c "import json,os; print(json.dumps({\"paused\": True, \"owner\": os.environ[\"DALTON_RH_PAUSE_OWNER\"], \"ttl_s\": float(os.environ[\"DALTON_RH_PAUSE_TTL_S\"])}))")" && body="$(curl -sf --connect-timeout "${DALTON_RH_CURL_TIMEOUT_S}" --max-time "${DALTON_RH_CURL_TIMEOUT_S}" -X POST -H "Content-Type: application/json" -H "Authorization: Bearer ${DALTON_RH_ADMIN_TOKEN}" -d "$payload" "$1/admin/wiki/pause-writes")" && printf "%s" "$body" | python3 -c "import json,os,sys; d=json.loads(sys.stdin.read()); lid=d.get(\"lease_id\") if isinstance(d, dict) else None; ok=isinstance(d, dict) and d.get(\"paused\") is True and d.get(\"owner\") == os.environ[\"DALTON_RH_PAUSE_OWNER\"] and isinstance(lid, int) and lid > 0; sys.exit(1) if not ok else print(lid)"'
+    set +e
+    WIKI_PAUSE_LEASE_ID="$(exec 8>&- 9>&-; \
+      DALTON_RH_ADMIN_TOKEN="$WIKI_PAUSE_ADMIN_TOKEN" \
+      DALTON_RH_PAUSE_OWNER="$WIKI_PAUSE_OWNER" \
+      DALTON_RH_PAUSE_TTL_S="$WIKI_PAUSE_TTL_S" \
+      DALTON_RH_CURL_TIMEOUT_S="$WIKI_EXEC_TIMEOUT_S" \
+      run_with_timeout_pg "$WIKI_EXEC_TIMEOUT_S" \
+        env "${ENV_UNSET_ARGS[@]}" docker compose -p "$PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" --project-directory "$WORK_DIR" \
+        exec -T -e DALTON_RH_ADMIN_TOKEN -e DALTON_RH_PAUSE_OWNER -e DALTON_RH_PAUSE_TTL_S -e DALTON_RH_CURL_TIMEOUT_S \
+        research-host sh -c "$local_pause_sh" _ "http://127.0.0.1:${WIKI_PAUSE_PORT}")"
+    wiki_pause_rc=$?
+    set -e
+    if [[ "$wiki_pause_rc" -ne 0 || ! "$WIKI_PAUSE_LEASE_ID" =~ ^[0-9]+$ ]]; then
+      # Pause POST may have succeeded (or still be landing) on research-host after a timeout
+      # or dropped response; repeatedly probe status within a bounded deadline until confirmed
+      # paused by this owner (then resume) or until the deadline expires.
+      local_probe_sh='body="$(curl -sf --connect-timeout "${DALTON_RH_CURL_TIMEOUT_S}" --max-time "${DALTON_RH_CURL_TIMEOUT_S}" -H "Authorization: Bearer ${DALTON_RH_ADMIN_TOKEN}" "$1/admin/wiki/pause-writes")" || exit 1; printf "%s" "$body" | python3 -c "import json,os,sys; d=json.loads(sys.stdin.read()); lid=d.get(\"lease_id\") if isinstance(d, dict) else None; ok=isinstance(d, dict) and d.get(\"paused\") is True and str(d.get(\"owner\") or \"\") == os.environ[\"DALTON_RH_PROBE_OWNER\"] and isinstance(lid, int) and lid > 0; print(lid if ok else \"NONE\")"'
+      probe_deadline_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{time.monotonic() + max(0.05, float(sys.argv[1])):.6f}")' "$WIKI_PAUSE_RECOVERY_TIMEOUT_S")"
+      recovered_lease_id=""
+      while true; do
+        rem_probe_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{max(0.0, float(sys.argv[1]) - time.monotonic()):.6f}")' "$probe_deadline_s")"
+        if [[ "$rem_probe_s" == "0.000000" ]]; then
+          break
+        fi
+        probe_step_s="$(exec 8>&- 9>&-; python3 -c 'import sys; print(f"{max(0.05, min(float(sys.argv[1]), float(sys.argv[2]))):.6f}")' "$WIKI_EXEC_TIMEOUT_S" "$rem_probe_s")"
+        set +e
+        probe_out="$(exec 8>&- 9>&-; \
+          DALTON_RH_ADMIN_TOKEN="$WIKI_PAUSE_ADMIN_TOKEN" \
+          DALTON_RH_PROBE_OWNER="$WIKI_PAUSE_OWNER" \
+          DALTON_RH_CURL_TIMEOUT_S="$probe_step_s" \
+          run_with_timeout_pg "$probe_step_s" \
+            env "${ENV_UNSET_ARGS[@]}" docker compose -p "$PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" --project-directory "$WORK_DIR" \
+            exec -T -e DALTON_RH_ADMIN_TOKEN -e DALTON_RH_PROBE_OWNER -e DALTON_RH_CURL_TIMEOUT_S \
+            research-host sh -c "$local_probe_sh" _ "http://127.0.0.1:${WIKI_PAUSE_PORT}" 2>/dev/null)"
+        probe_rc=$?
+        set -e
+        if [[ "$probe_rc" -eq 0 && "$probe_out" =~ ^[0-9]+$ ]]; then
+          recovered_lease_id="$probe_out"
+          break
+        fi
+        # For non-timeout pause errors where a healthy GET explicitly confirms our owner is not paused, stop early.
+        if [[ "$wiki_pause_rc" -ne 124 && "$probe_rc" -eq 0 && "$probe_out" == "NONE" ]]; then
+          break
+        fi
+        rem_probe_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{max(0.0, float(sys.argv[1]) - time.monotonic()):.6f}")' "$probe_deadline_s")"
+        if [[ "$rem_probe_s" == "0.000000" ]]; then
+          break
+        fi
+        probe_sleep_s="$(exec 8>&- 9>&-; python3 -c 'import sys; print(f"{min(float(sys.argv[1]), float(sys.argv[2])):.6f}")' "$WIKI_PAUSE_RECOVERY_POLL_S" "$rem_probe_s")"
+        sleep "$probe_sleep_s" 8>&- 9>&-
+      done
+      if [[ "$recovered_lease_id" =~ ^[0-9]+$ ]]; then
+        warn "Pause request outcome was ambiguous (exit=${wiki_pause_rc}), but research-host confirmed owner=${WIKI_PAUSE_OWNER} holds active lease ${recovered_lease_id}; resuming Wiki writes before exiting..."
+        WIKI_PAUSE_LEASE_ID="$recovered_lease_id"
+        WIKI_WRITES_PAUSED=1
+        resume_wiki_writes || true
+      fi
+      err "Failed to pause Wiki writes via research-host /admin/wiki/pause-writes (owner=${WIKI_PAUSE_OWNER}, exit=${wiki_pause_rc})."
+      release_wiki_backup_lock
+      exit 1
+    fi
+    WIKI_WRITES_PAUSED=1
+    start_wiki_pause_heartbeat
+    wiki_drained=0
+    wiki_in_flight="-1"
+    drain_deadline_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{time.monotonic() + max(0.05, float(sys.argv[1])):.6f}")' "$WIKI_DRAIN_TIMEOUT_S")"
+    local_drain_sh='body="$(curl -sf --connect-timeout "${DALTON_RH_CURL_TIMEOUT_S}" --max-time "${DALTON_RH_CURL_TIMEOUT_S}" -H "Authorization: Bearer ${DALTON_RH_ADMIN_TOKEN}" "$1/admin/wiki/pause-writes")" || exit 1; printf "%s" "$body" | python3 -c "import json,os,sys; d=json.loads(sys.stdin.read()); ok=isinstance(d, dict) and d.get(\"paused\") is True and str(d.get(\"owner\") or \"\") == os.environ[\"DALTON_RH_EXPECT_OWNER\"] and str(d.get(\"lease_id\") or \"\") == os.environ[\"DALTON_RH_EXPECT_LEASE_ID\"]; print(int(d.get(\"in_flight\", -1)) if ok else \"LEASE_LOST\")"'
+    for (( wiki_drain_poll=1; wiki_drain_poll<=WIKI_DRAIN_MAX_POLLS; wiki_drain_poll++ )); do
+      if [[ -n "$WIKI_HEARTBEAT_FAILED_FILE" && -f "$WIKI_HEARTBEAT_FAILED_FILE" ]]; then
+        err "Wiki write-pause heartbeat failed while draining in-flight writes (owner=${WIKI_PAUSE_OWNER}, lease_id=${WIKI_PAUSE_LEASE_ID}); aborting backup and resuming writes."
+        resume_wiki_writes || true
+        release_wiki_backup_lock
+        exit 1
+      fi
+      rem_drain_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{max(0.0, float(sys.argv[1]) - time.monotonic()):.6f}")' "$drain_deadline_s")"
+      if [[ "$rem_drain_s" == "0.000000" ]]; then
+        break
+      fi
+      poll_timeout_s="$(exec 8>&- 9>&-; python3 -c 'import sys; print(f"{max(0.05, min(float(sys.argv[1]), float(sys.argv[2]))):.6f}")' "$WIKI_EXEC_TIMEOUT_S" "$rem_drain_s")"
+      wiki_in_flight="$(exec 8>&- 9>&-; \
+        DALTON_RH_ADMIN_TOKEN="$WIKI_PAUSE_ADMIN_TOKEN" \
+        DALTON_RH_EXPECT_OWNER="$WIKI_PAUSE_OWNER" \
+        DALTON_RH_EXPECT_LEASE_ID="$WIKI_PAUSE_LEASE_ID" \
+        DALTON_RH_CURL_TIMEOUT_S="$poll_timeout_s" \
+        run_with_timeout_pg "$poll_timeout_s" \
+          env "${ENV_UNSET_ARGS[@]}" docker compose -p "$PROJECT_NAME" "${COMPOSE_FILE_ARGS[@]}" --env-file "$ENV_FILE" --project-directory "$WORK_DIR" \
+          exec -T -e DALTON_RH_ADMIN_TOKEN -e DALTON_RH_EXPECT_OWNER -e DALTON_RH_EXPECT_LEASE_ID -e DALTON_RH_CURL_TIMEOUT_S \
+          research-host sh -c "$local_drain_sh" _ "http://127.0.0.1:${WIKI_PAUSE_PORT}" 2>/dev/null || echo "-1")"
+      if [[ -n "$WIKI_HEARTBEAT_FAILED_FILE" && -f "$WIKI_HEARTBEAT_FAILED_FILE" ]]; then
+        err "Wiki write-pause heartbeat failed while draining in-flight writes (owner=${WIKI_PAUSE_OWNER}, lease_id=${WIKI_PAUSE_LEASE_ID}); aborting backup and resuming writes."
+        resume_wiki_writes || true
+        release_wiki_backup_lock
+        exit 1
+      fi
+      if [[ "$wiki_in_flight" == "LEASE_LOST" ]]; then
+        err "Wiki write-pause lease (owner=${WIKI_PAUSE_OWNER}, lease_id=${WIKI_PAUSE_LEASE_ID}) is no longer active while draining in-flight writes; aborting backup and resuming writes."
+        resume_wiki_writes || true
+        release_wiki_backup_lock
+        exit 1
+      fi
+      if [[ "$wiki_in_flight" == "0" ]]; then
+        wiki_drained=1
+        break
+      fi
+      rem_drain_s="$(exec 8>&- 9>&-; python3 -c 'import sys, time; print(f"{max(0.0, float(sys.argv[1]) - time.monotonic()):.6f}")' "$drain_deadline_s")"
+      if [[ "$rem_drain_s" == "0.000000" ]]; then
+        break
+      fi
+      sleep_s="$(exec 8>&- 9>&-; python3 -c 'import sys; print(f"{min(float(sys.argv[1]), float(sys.argv[2])):.6f}")' "$WIKI_DRAIN_POLL_S" "$rem_drain_s")"
+      sleep "$sleep_s" 8>&- 9>&-
+    done
+    if [[ "$wiki_drained" -ne 1 ]]; then
+      err "Timed out waiting for in-flight Wiki writes to finish before backup (in_flight=${wiki_in_flight:-unknown}, timeout=${WIKI_DRAIN_TIMEOUT_S}s)."
+      resume_wiki_writes || true
+      release_wiki_backup_lock
+      exit 1
+    fi
+    set +e
+    compose_cmd exec -T research-host uv run --no-sync python -c "$WIKI_BACKUP_PY" > "${STAGE_DIR}/wiki-data.tar.gz" 8>&- 9>&-
+    wiki_backup_rc=$?
+    resume_wiki_writes
+    wiki_resume_rc=$?
+    set -e
+    heartbeat_failed=0
+    if [[ -n "$WIKI_HEARTBEAT_FAILED_FILE" && -f "$WIKI_HEARTBEAT_FAILED_FILE" ]]; then
+      heartbeat_failed=1
+      rm -f "$WIKI_HEARTBEAT_FAILED_FILE"
+    fi
+    release_wiki_backup_lock
+    if [[ "$wiki_resume_rc" -eq 2 || "$heartbeat_failed" -eq 1 ]]; then
+      rm -f "${STAGE_DIR}/wiki-data.tar.gz"
+      err "Backup failed because Wiki write-pause lease ${WIKI_PAUSE_LEASE_ID} did not remain active for the entire backup; removed incomplete Wiki archive."
+      exit 1
+    fi
+    if [[ "$wiki_resume_rc" -ne 0 ]]; then
+      rm -f "${STAGE_DIR}/wiki-data.tar.gz"
+      err "Backup failed because Wiki writes could not be confirmed resumed (backup_exit=${wiki_backup_rc})."
+      exit 1
+    fi
+    if [[ "$wiki_backup_rc" -ne 0 ]]; then
+      rm -f "${STAGE_DIR}/wiki-data.tar.gz"
+      err "Wiki online backup command failed (exit=${wiki_backup_rc})."
+      exit 1
+    fi
+  else
+    set +e
+    compose_cmd run --rm -T --no-deps --entrypoint /bin/sh research-host -c 'uv run --no-sync python -c "$1"' _ "$WIKI_BACKUP_PY" > "${STAGE_DIR}/wiki-data.tar.gz" 8>&- 9>&-
+    wiki_backup_rc=$?
+    set -e
+    release_wiki_backup_lock
+    if [[ "$wiki_backup_rc" -ne 0 ]]; then
+      err "Wiki offline backup command failed (exit=${wiki_backup_rc})."
+      exit 1
+    fi
+  fi
+  WIKI_BACKUP_INCLUDED=1
+  if [[ "$VERIFY" -eq 1 ]]; then
+    WIKI_FILE_COUNT="$(tar -tzf "${STAGE_DIR}/wiki-data.tar.gz" | awk '!/\/$/ && $0 != "." && $0 != "./" { c++ } END { print c+0 }')"
+    ok "Wiki data volume verified (${WIKI_FILE_COUNT} file(s))."
+  else
+    ok "Wiki data volume archived (verification skipped)."
+  fi
+else
+  info "4/5 Skipping Wiki data volume (research-host service not configured in Compose)."
+fi
+
+# 5. .env handling (never copy plaintext .env into backup directory)
 ENV_BACKUP_STATUS="excluded"
 if [[ -n "$ENV_PASSPHRASE_FILE" ]]; then
-  info "4/4 Encrypting .env into env.enc (${ENV_CIPHER} + ${ENV_KDF} ${ENV_KDF_ITER} iter)..."
+  info "5/5 Encrypting .env into env.enc (${ENV_CIPHER} + ${ENV_KDF} ${ENV_KDF_ITER} iter)..."
   openssl enc "-${ENV_CIPHER}" -pbkdf2 -md "${ENV_KDF_DIGEST}" -iter "${ENV_KDF_ITER}" -salt \
     -in "$ENV_FILE" \
     -out "${STAGE_DIR}/env.enc" \
@@ -1003,7 +1927,7 @@ if [[ -n "$ENV_PASSPHRASE_FILE" ]]; then
   ENV_BACKUP_STATUS="encrypted"
   ok "Encrypted .env saved as env.enc (passphrase file is NOT stored in backup directory)."
 else
-  info "4/4 Skipping plaintext .env (secrets are never stored unencrypted in backup folders)."
+  info "5/5 Skipping plaintext .env (secrets are never stored unencrypted in backup folders)."
   warn "Store ${ENV_FILE} separately in a password manager / secret vault, or pass --env-passphrase-file <file> next time to include an encrypted env.enc."
 fi
 
@@ -1027,6 +1951,8 @@ python3 - "${STAGE_DIR}/manifest.json" \
   "$MINIO_OBJECT_COUNT" \
   "$MINIO_TOTAL_BYTES" \
   "$CADDY_FILE_COUNT" \
+  "$WIKI_BACKUP_INCLUDED" \
+  "$WIKI_FILE_COUNT" \
   "$ENV_BACKUP_STATUS" \
   "$ENV_CIPHER" \
   "$ENV_KDF" \
@@ -1049,6 +1975,8 @@ import json, sys
     minio_objects,
     minio_bytes,
     caddy_files,
+    wiki_included,
+    wiki_files,
     env_status,
     env_cipher,
     env_kdf,
@@ -1086,6 +2014,14 @@ manifest = {
         "file": "caddy-data.tar.gz",
         "file_count": int(caddy_files),
     },
+    "wiki": (
+        {
+            "file": "wiki-data.tar.gz",
+            "file_count": int(wiki_files),
+        }
+        if int(wiki_included) == 1
+        else None
+    ),
     "env_backup": env_status,
     "env_encryption": (
         {
@@ -1111,7 +2047,7 @@ chmod 600 "${STAGE_DIR}/manifest.json"
 (
   cd "$STAGE_DIR"
   : > SHA256SUMS
-  for f in postgres.dump minio-objects.tar.gz caddy-data.tar.gz manifest.json env.enc; do
+  for f in postgres.dump minio-objects.tar.gz caddy-data.tar.gz wiki-data.tar.gz manifest.json env.enc; do
     if [[ -f "$f" ]]; then
       printf '%s  %s\n' "$(sha256_file "$f")" "$f" >> SHA256SUMS
     fi
@@ -1191,6 +2127,9 @@ printf "  Backup directory : %s\n" "$FINAL_DIR"
 printf "  PostgreSQL dump  : %s bytes (%s TOC entries)\n" "$PG_DUMP_BYTES" "$PG_TOC_ENTRIES"
 printf "  MinIO objects    : %s object(s) across %s bucket(s)\n" "$MINIO_OBJECT_COUNT" "$MINIO_BUCKET_COUNT"
 printf "  Caddy data       : %s file(s)\n" "$CADDY_FILE_COUNT"
+if [[ "$WIKI_BACKUP_INCLUDED" -eq 1 ]]; then
+  printf "  Wiki data        : %s file(s)\n" "$WIKI_FILE_COUNT"
+fi
 printf "  .env handling    : %s\n" "$ENV_BACKUP_STATUS"
 if (( RETAIN > 0 )); then
   printf "  Retention policy : keep %s (pruned %s older backup(s))\n" "$RETAIN" "$PRUNED"

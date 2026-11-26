@@ -5,6 +5,7 @@ Mounted under `/api/v1/dalton` via `src/dalton/app/router.py`.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from typing import Any
@@ -459,6 +460,7 @@ _WEIXIN_QR_PUBLIC_WHITELIST: tuple[str, ...] = (
     "qrcode_img_content",
     "expires_at",
     "account_id",
+    "account_status",
     "ilink_bot_id",
     "ilink_user_id",
     "masked_ilink_user_id",
@@ -535,6 +537,12 @@ def _shape_public_weixin_qr_response(raw: dict[str, Any]) -> dict[str, Any]:
             out[key] = redact_weixin_secrets(val)
         else:
             out[key] = val
+    if (
+        out.get("status") == "confirmed"
+        and "pending_verification" not in out
+        and out.get("account_status") in ("active", "pending_verification")
+    ):
+        out["pending_verification"] = out.get("account_status") == "pending_verification"
     return out
 
 
@@ -1454,7 +1462,7 @@ async def web_get_bindings_endpoint(
                 "platform": "weixin",
                 "account_id": wx_view.get("account_id"),
                 "status": wx_view.get("status"),
-                "platform_user_id": wx_view.get("ilink_user_id"),
+                "platform_user_id": wx_view.get("platform_user_id"),
                 "masked_ilink_user_id": wx_view.get("masked_ilink_user_id"),
                 "platform_username": wx_view.get("ilink_username"),
                 "has_usable_context_token": wx_view.get("has_usable_context_token"),
@@ -1606,6 +1614,16 @@ _PUBLIC_WEIXIN_QR_ERROR_MAP: dict[str, tuple[int, str, dict[str, Any]]] = {
         "验证码已过期，请重新扫码连接。",
         {"need_rescan": True},
     ),
+    "weixin_login_failed": (
+        502,
+        "微信登录校验失败，请重新获取二维码并扫码。",
+        {"need_rescan": True},
+    ),
+    "weixin_rate_limited": (
+        429,
+        "微信服务请求过于频繁，请稍后再试。",
+        {},
+    ),
     "ilink_user_already_bound": (
         409,
         "该微信号已绑定其他团队成员账号，无法重复绑定。",
@@ -1680,6 +1698,13 @@ def _build_public_weixin_qr_error(
     )
 
 
+async def _await_request_disconnect(request: Request) -> None:
+    while True:
+        if await request.is_disconnected():
+            return
+        await asyncio.sleep(0.05)
+
+
 async def _proxy_to_gateway_weixin(
     method: str,
     subpath: str,
@@ -1687,6 +1712,7 @@ async def _proxy_to_gateway_weixin(
     user_id: str,
     params: dict[str, Any] | None = None,
     json_body: dict[str, Any] | None = None,
+    request: Request | None = None,
 ) -> dict[str, Any]:
     from src.dalton.settings import get_dalton_channel_gateway_url
 
@@ -1706,13 +1732,46 @@ async def _proxy_to_gateway_weixin(
     url = f"{base_url}{subpath}"
     try:
         async with httpx.AsyncClient(timeout=_GATEWAY_PROXY_TIMEOUT) as client:
-            resp = await client.request(
-                method,
-                url,
-                headers=headers,
-                params=params,
-                json=json_body,
-            )
+            if request is None:
+                resp = await client.request(
+                    method,
+                    url,
+                    headers=headers,
+                    params=params,
+                    json=json_body,
+                )
+            else:
+                req_task = asyncio.create_task(
+                    client.request(
+                        method,
+                        url,
+                        headers=headers,
+                        params=params,
+                        json=json_body,
+                    )
+                )
+                disconnect_task = asyncio.create_task(_await_request_disconnect(request))
+                try:
+                    done, _ = await asyncio.wait(
+                        {req_task, disconnect_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if req_task in done:
+                        resp = req_task.result()
+                    else:
+                        req_task.cancel()
+                        await asyncio.gather(req_task, return_exceptions=True)
+                        raise HTTPException(
+                            status_code=499,
+                            detail={
+                                "code": "client_disconnected",
+                                "message": "客户端已取消请求。",
+                            },
+                        )
+                finally:
+                    if not disconnect_task.done():
+                        disconnect_task.cancel()
+                        await asyncio.gather(disconnect_task, return_exceptions=True)
     except httpx.HTTPError as exc:
         raise _build_public_weixin_qr_error("gateway_unreachable", 503) from exc
 
@@ -1768,6 +1827,7 @@ async def web_weixin_qrcode_start_endpoint(
     dependencies=[Depends(require_capability_dep(CapabilityId.CHANNEL_WEIXIN))],
 )
 async def web_weixin_qrcode_wait_endpoint(
+    request: Request,
     user_id: CurrentUserId,
     session_key: str = Query(..., min_length=1),
 ) -> Any:
@@ -1781,6 +1841,8 @@ async def web_weixin_qrcode_wait_endpoint(
         st = str(sess.get("status") or "")
         if st == "confirmed" and sess.get("connected") is True:
             confirmed = sess.get("confirmed_result") or {}
+            account_status = sess.get("account_status") or confirmed.get("account_status")
+            pending_verification = account_status == "pending_verification"
             return _shape_public_weixin_qr_response(
                 {
                     "session_key": session_key,
@@ -1788,6 +1850,8 @@ async def web_weixin_qrcode_wait_endpoint(
                     "connected": True,
                     "already_connected": True,
                     "account_id": confirmed.get("account_id"),
+                    "account_status": account_status,
+                    "pending_verification": pending_verification,
                     "bot_generation": confirmed.get("bot_generation"),
                     "accounts_revision": confirmed.get("accounts_revision"),
                 }
@@ -1810,6 +1874,7 @@ async def web_weixin_qrcode_wait_endpoint(
             "/internal/weixin/qrcode/wait",
             user_id=user_id,
             params={"session_key": session_key},
+            request=request,
         )
         return _shape_public_weixin_qr_response(raw)
     except HTTPException as exc:

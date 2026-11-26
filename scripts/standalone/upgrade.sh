@@ -26,6 +26,8 @@ set -euo pipefail
 umask 077
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/standalone/env_tokens.sh
+source "${SCRIPT_DIR}/env_tokens.sh"
 WORK_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 RELEASE_TAR=""
 RELEASE_DIR=""
@@ -375,6 +377,8 @@ for key in (
     "DB_USER",
     "DB_PASSWORD",
     "DB_NAME",
+    "DALTON_RESEARCH_HOST_TOKEN",
+    "DALTON_RESEARCH_ADMIN_TOKEN",
 ):
     seen.add(key)
     print(key)
@@ -753,6 +757,13 @@ else
   info "Release directory is already ${WORK_DIR}; continuing in place."
 fi
 
+# Ensure research-host auth tokens exist in .env for upgrades from pre-Batch-3a installs
+# (shared helper in scripts/standalone/env_tokens.sh: fills missing keys only, mode 600).
+added_rh_tokens="$(ensure_research_host_tokens "$ENV_FILE")"
+if [[ -n "$added_rh_tokens" ]]; then
+  ok "Generated missing research-host token(s) in ${ENV_FILE}: ${added_rh_tokens} (existing values preserved)."
+fi
+
 NEW_RELEASE_SHA=""
 if [[ -f "${WORK_DIR}/.release_git_sha" ]]; then
   NEW_RELEASE_SHA="$(tr -d '[:space:]' < "${WORK_DIR}/.release_git_sha")"
@@ -1018,6 +1029,28 @@ probe_service_health_once() {
         'if [ -z "${DALTON_HEALTH_TOKEN:-}" ]; then exit 1; fi; if command -v node >/dev/null 2>&1; then node -e "const base=process.argv[1]; const hdr={\"X-Service-Token\": process.env.DALTON_HEALTH_TOKEN || \"\"}; (async()=>{const r=await fetch(base+\"/health\",{headers:hdr}); if(!r.ok) process.exit(1); const d=await r.json(); process.exit(d&&d.ok===true&&d.ready===true?0:1);})().catch(()=>process.exit(1));" "$1"; elif command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then body="$(curl -sf -H "X-Service-Token: ${DALTON_HEALTH_TOKEN}" "$1/health")" || exit 1; printf "%s" "$body" | python3 -c "import json,sys; d=json.loads(sys.stdin.read(), parse_constant=lambda c: (_ for _ in ()).throw(ValueError(c))); sys.exit(0 if isinstance(d, dict) and d.get(\"ok\") is True and d.get(\"ready\") is True else 1)" 2>/dev/null; else exit 1; fi' \
         _ "http://127.0.0.1:${gw_port}" >/dev/null 2>&1
       ;;
+    research-host)
+      local rh_port rh_token rh_wiki_state
+      rh_port="$(read_env_file_var "$ENV_FILE" "DALTON_RESEARCH_HOST_PORT" "8951")"
+      if [[ ! "$rh_port" =~ ^[0-9]+$ ]]; then rh_port=8951; fi
+      rh_token="$(read_env_file_var "$ENV_FILE" "DALTON_RESEARCH_HOST_TOKEN" "")"
+      # Query the running research-host `/healthz` for its actual effective capability state
+      # (never self-parse `DALTON_CAP_*` in bash); run authenticated MCP tools/list ONLY when
+      # `company-wiki` is enabled by the running service.
+      rh_wiki_state="$(compose_cmd_timeout 10 exec -T research-host sh -c \
+        'body="$(curl -sf "$1/healthz")" || exit 1; printf "%s" "$body" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(1) if not (isinstance(d, dict) and d.get(\"ok\") is True) else None; connectors=d.get(\"connectors\") if isinstance(d.get(\"connectors\"), dict) else {}; print(\"enabled\" if connectors.get(\"company-wiki\") is True else \"disabled\")"' \
+        _ "http://127.0.0.1:${rh_port}" 2>/dev/null)" || return 1
+      if [[ "$rh_wiki_state" == "enabled" ]]; then
+        if [[ -z "$rh_token" ]]; then
+          return 1
+        fi
+        DALTON_RH_PROBE_TOKEN="$rh_token" compose_cmd_timeout 10 exec -T -e DALTON_RH_PROBE_TOKEN research-host sh -c \
+          'body="$(curl -sf -X POST -H "Content-Type: application/json" -H "Authorization: Bearer ${DALTON_RH_PROBE_TOKEN}" -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}" "$1/mcp/company-wiki")" || exit 1; printf "%s" "$body" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); tools=((d.get(\"result\") or {}).get(\"tools\") or []) if isinstance(d, dict) else []; sys.exit(0 if any(isinstance(t, dict) and t.get(\"name\") == \"search\" for t in tools) else 1)"' \
+          _ "http://127.0.0.1:${rh_port}" >/dev/null 2>&1 || return 1
+      elif [[ "$rh_wiki_state" != "disabled" ]]; then
+        return 1
+      fi
+      ;;
     *)
       return 0
       ;;
@@ -1253,10 +1286,13 @@ info "Running plain 'docker compose up -d' to converge all services..."
 compose_cmd up -d
 ok "All services converged."
 
-# Post-upgrade application service /health verification (crawler + configured channel-gateway)
+# Post-upgrade application service /health verification (crawler + configured channel-gateway / research-host)
 POST_UPGRADE_HEALTH_SERVICES=(crawler)
 if grep -qx "channel-gateway" <<<"$CONFIG_SERVICES_LIST"; then
   POST_UPGRADE_HEALTH_SERVICES+=(channel-gateway)
+fi
+if grep -qx "research-host" <<<"$CONFIG_SERVICES_LIST"; then
+  POST_UPGRADE_HEALTH_SERVICES+=(research-host)
 fi
 POST_UPGRADE_HEALTH_RETRIES="${DALTON_POST_UPGRADE_HEALTH_RETRIES:-30}"
 POST_UPGRADE_HEALTH_SLEEP_S="${DALTON_POST_UPGRADE_HEALTH_SLEEP_S:-2}"

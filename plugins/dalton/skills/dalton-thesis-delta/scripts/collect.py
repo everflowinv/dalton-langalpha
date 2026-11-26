@@ -35,6 +35,7 @@ collect.py — 每晚 thesis 增量包采集与状态提交脚本（PS.11）
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -176,6 +177,7 @@ def tracker_paths(workspace_dir: Path) -> dict[str, Path]:
         "thresholds": tr / "thresholds.json",
         "seen": tr / "seen.json",
         "last_run": tr / "last_run.json",
+        "bullbear_last_run": tr / "bullbear_last_run.json",
         "log": tr / "updates.log",
         "consensus": ws / "data" / "consensus",
         "company_json": ws / "data" / "company.json",
@@ -871,8 +873,88 @@ def _call_bridge_http(
         return {"ok": False, "status": "exception", "error": str(e)[:300]}
 
 
+def _load_connector_transport_helper() -> Any | None:
+    import importlib.util
+
+    helper_path = (
+        Path(__file__).resolve().parents[2]
+        / "dalton-conventions"
+        / "scripts"
+        / "connector_transport.py"
+    )
+    if not helper_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("_dalton_connector_transport", helper_path)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _resolve_dedicated_server_for_call(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> tuple[str | None, str | None, dict[str, Any]]:
+    """Map a legacy (tool_name, arguments) call to a Batch 3 dedicated MCP server when its tool & params are available."""
+    ct = _load_connector_transport_helper()
+    if ct is None:
+        return None, None, {}
+    return ct.resolve_dedicated_for_legacy_call(tool_name, arguments)
+
+
+def _try_dedicated_connector_call(
+    tool_name: str,
+    arguments: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Invoke a mounted Batch 3 dedicated MCP connector when it exposes the required tool and parameters."""
+    server, mapped_tool, mapped_args = _resolve_dedicated_server_for_call(tool_name, arguments)
+    if not server or not mapped_tool:
+        return None
+    try:
+        import mcp_client as mcp_client_module  # type: ignore
+    except Exception:  # noqa: BLE001
+        return None
+    call_fn = getattr(mcp_client_module, "call_mcp_tool_with_error_flag", None)
+    if not callable(call_fn):
+        return None
+    try:
+        result = call_fn(server, mapped_tool, mapped_args)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "status": "exception", "error": str(exc)[:300]}
+    is_error = False
+    value = result
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], bool):
+        is_error, value = result
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return {
+                "ok": False,
+                "status": "empty_bridge_content",
+                "error": value.strip()[:300] or "wrapper returned non-JSON text",
+            }
+    if isinstance(value, dict):
+        return _normalize_dict_result(
+            value, outer_is_error=is_error, default_error="wrapper_call_failed"
+        )
+    return {
+        "ok": False,
+        "status": "invalid_format",
+        "error": f"wrapper returned non-dict result ({type(value).__name__}): {str(value)[:200]}",
+        "data": clean_val(value),
+    }
+
+
 def call_bridge_jsonrpc(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
-    """调用一个 researchdata 工具：HTTP 桥覆盖优先，默认走沙箱包装模块（tools.researchdata）。"""
+    """按来源选择实际入口：HTTP 桥显式覆盖优先；否则若工作区 MCP 清单已启用该来源对应的独立连接器，直接走独立连接器；未迁移来源（如 alphaengine）或切换前走 tools.researchdata。"""
+    if os.environ.get("DALTON_RESEARCHDATA_URL", "").strip():
+        transport = resolve_researchdata_transport()
+        return _call_bridge_http(transport["call"], tool_name, arguments, timeout)
+    dedicated_res = _try_dedicated_connector_call(tool_name, arguments)
+    if dedicated_res is not None:
+        return dedicated_res
     transport = resolve_researchdata_transport()
     if transport["mode"] == "bridge":
         return _call_bridge_http(transport["call"], tool_name, arguments, timeout)
@@ -2624,16 +2706,143 @@ def latest_previous_snapshot(consensus_dir: Path, current_file: Path, last_run_h
     return load_json(files[-1], None)
 
 
+def _has_legacy_bullbear_ae_state(last_run: Any) -> bool:
+    """Return True when ``last_run`` carries per-query bullbear ``<ticker>_ae_state``."""
+    if not isinstance(last_run, dict):
+        return False
+    for key, value in last_run.items():
+        if (
+            isinstance(key, str)
+            and key.endswith("_ae_state")
+            and isinstance(value, dict)
+            and isinstance(value.get("queries"), list)
+        ):
+            return True
+    return False
+
+
+def _legacy_bullbear_covered_until(last_run: Any) -> str | None:
+    """Extract the conservative earliest ``covered_until`` from a legacy bullbear ``last_run.json``."""
+    if not isinstance(last_run, dict):
+        return None
+    days: list[str] = []
+    for key, value in last_run.items():
+        if not (isinstance(key, str) and key.endswith("_ae_state") and isinstance(value, dict)):
+            continue
+        queries = value.get("queries")
+        if not isinstance(queries, list):
+            continue
+        for row in queries:
+            if not isinstance(row, dict):
+                continue
+            day = _coerce_iso_day(row.get("covered_until"))
+            if day:
+                days.append(day)
+    return min(days) if days else None
+
+
+def _legacy_bullbear_lock_ticker(prev_last_run: Any, fallback_ticker: str | None = None) -> str | None:
+    """Resolve the lowercase ticker matching bullbear's ``.<ticker>-collect.lock`` file."""
+    if isinstance(prev_last_run, dict):
+        for key, value in prev_last_run.items():
+            if (
+                isinstance(key, str)
+                and key.endswith("_ae_state")
+                and isinstance(value, dict)
+                and isinstance(value.get("queries"), list)
+            ):
+                prefix = key[: -len("_ae_state")].strip().lower()
+                if prefix:
+                    return prefix
+        raw_ticker = str(prev_last_run.get("ticker") or "").strip().lower()
+        if raw_ticker:
+            return raw_ticker
+    fb = str(fallback_ticker or "").strip().lower()
+    return fb or None
+
+
+def _write_json_exclusive(path: Path, obj: Any) -> bool:
+    """Create ``path`` exclusively; return False without overwriting if it already exists."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = (json.dumps(obj, ensure_ascii=False, indent=2, default=str) + "\n").encode("utf-8")
+    try:
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+    except BaseException:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return True
+
+
+def _tracker_lock_path(tracker_dir: Path, prev_last_run: Any = None, fallback_ticker: str | None = None) -> Path:
+    lock_ticker = _legacy_bullbear_lock_ticker(prev_last_run, fallback_ticker=fallback_ticker)
+    return tracker_dir / (f".{lock_ticker}-collect.lock" if lock_ticker else ".collect.lock")
+
+
+@contextlib.contextmanager
+def _tracker_state_lock(tracker_dir: Path, prev_last_run: Any = None, *, ticker: str | None = None):
+    """Acquire the same ``.<ticker>-collect.lock`` used by bullbear so shared tracker files never interleave."""
+    tracker_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = _tracker_lock_path(tracker_dir, prev_last_run, fallback_ticker=ticker)
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None  # type: ignore[assignment]
+    with lock_path.open("a+") as handle:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _preserve_legacy_bullbear_last_run(
+    paths: dict[str, Path],
+    prev_last_run: Any,
+    *,
+    ticker: str | None = None,
+    already_locked: bool = False,
+) -> None:
+    """Migrate a legacy bullbear ``last_run.json`` once to ``bullbear_last_run.json`` under bullbear's lock."""
+    bb_path = paths.get("bullbear_last_run")
+    if bb_path is None or not _has_legacy_bullbear_ae_state(prev_last_run):
+        return
+
+    def _do_migrate() -> None:
+        if bb_path.exists():
+            return
+        _write_json_exclusive(bb_path, prev_last_run)
+
+    if already_locked:
+        _do_migrate()
+        return
+    with _tracker_state_lock(paths["tracker"], prev_last_run, ticker=ticker):
+        _do_migrate()
+
+
 def _ae_state_of(last_run: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
     """读 last_run.json 里 AlphaEngine 的（包含式覆盖边界, None）。
 
     覆盖边界 ``ae_covered_until`` 表示这一天及之前都已扫完；旧状态文件含
     ``ae_resume.window.since``（包含式未扫起点）时先换算为 ``since - 1 天`` 再与
-    ``ae_covered_until`` 取较早者，并一律丢弃 cursor。两者均无时返回 (None, None)。"""
-    return _migrate_ae_covered_until(
+    ``ae_covered_until`` 取较早者，并一律丢弃 cursor。若旧文件为多空跟踪逐查询
+    格式，兼容提取各查询最早的 ``covered_until``。两者均无时返回 (None, None)。"""
+    covered = _migrate_ae_covered_until(
         last_run.get("ae_covered_until"),
         last_run.get("ae_resume"),
-    ), None
+    )
+    if not covered:
+        covered = _legacy_bullbear_covered_until(last_run)
+    return covered, None
 
 
 def cmd_collect(args: argparse.Namespace) -> int:
@@ -2921,53 +3130,56 @@ def cmd_commit(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "error": f"找不到数据包: {pkt_path}"}, ensure_ascii=False))
         return 2
 
-    prev_last_run = load_json(P["last_run"], {})
-    ae_err = _validate_ae_state(pk, prev_last_run)
-    if ae_err:
-        print(json.dumps({"ok": False, "status": "bad_ae_state", "error": ae_err}, ensure_ascii=False))
-        return 2
+    commit_ticker = pk.get("ticker") or args.ticker
+    with _tracker_state_lock(P["tracker"], ticker=commit_ticker):
+        prev_last_run = load_json(P["last_run"], {})
+        ae_err = _validate_ae_state(pk, prev_last_run)
+        if ae_err:
+            print(json.dumps({"ok": False, "status": "bad_ae_state", "error": ae_err}, ensure_ascii=False))
+            return 2
 
-    seen = set(load_json(P["seen"], []))
-    new_ids = (
-        set((pk.get("internal") or {}).get("new") or {})
-        | set((pk.get("alphaengine") or {}).get("new") or {})
-        | set((pk.get("sec") or {}).get("new") or {})
-        | set((pk.get("x") or {}).get("new") or {})
-    )
-    seen |= new_ids
-    dump_json(P["seen"], sorted(seen))
+        seen = set(load_json(P["seen"], []))
+        new_ids = (
+            set((pk.get("internal") or {}).get("new") or {})
+            | set((pk.get("alphaengine") or {}).get("new") or {})
+            | set((pk.get("sec") or {}).get("new") or {})
+            | set((pk.get("x") or {}).get("new") or {})
+        )
+        seen |= new_ids
+        dump_json(P["seen"], sorted(seen))
 
-    committed_at = now_et().isoformat()
-    # AE 状态：统一按迁移规则从 packet.ae_state 解析包含式覆盖边界（兼容升级前生成
-    # 的带 resume.window.since/cursor 的旧 packet.json：取 covered_until 与
-    # resume.window.since - 1 天 较早者并丢弃 cursor）；若旧 packet 缺失 ae_state，
-    # 回退从上一份 last_run.json 迁移。ae_resume 固定写 None。
-    ae_state = pk.get("ae_state") if isinstance(pk.get("ae_state"), dict) else {}
-    ae_covered_until = _migrate_ae_covered_until(
-        ae_state.get("covered_until"),
-        ae_state.get("resume"),
-    )
-    if not ae_covered_until:
-        ae_covered_until, _ = _ae_state_of(prev_last_run)
-    last_run_obj = {
-        "ticker": pk.get("ticker") or args.ticker,
-        "run_id": args.run_id,
-        "committed_at": committed_at,
-        "since": pk.get("since"),
-        "until": pk.get("until"),
-        "snapshot_file": pk.get("snapshot_file"),
-        "material": args.material,
-        "summary": args.summary.strip(),
-        # AlphaEngine 覆盖边界（按整段或逐日推进，与全局 until 解耦）；跨轮续采
-        # 不再保存 cursor，ae_resume 固定为 None。
-        "ae_covered_until": ae_covered_until,
-        "ae_resume": None,
-    }
-    dump_json(P["last_run"], last_run_obj)
+        committed_at = now_et().isoformat()
+        # AE 状态：统一按迁移规则从 packet.ae_state 解析包含式覆盖边界（兼容升级前生成
+        # 的带 resume.window.since/cursor 的旧 packet.json：取 covered_until 与
+        # resume.window.since - 1 天 较早者并丢弃 cursor）；若旧 packet 缺失 ae_state，
+        # 回退从上一份 last_run.json 迁移。ae_resume 固定写 None。
+        ae_state = pk.get("ae_state") if isinstance(pk.get("ae_state"), dict) else {}
+        ae_covered_until = _migrate_ae_covered_until(
+            ae_state.get("covered_until"),
+            ae_state.get("resume"),
+        )
+        if not ae_covered_until:
+            ae_covered_until, _ = _ae_state_of(prev_last_run)
+        last_run_obj = {
+            "ticker": commit_ticker,
+            "run_id": args.run_id,
+            "committed_at": committed_at,
+            "since": pk.get("since"),
+            "until": pk.get("until"),
+            "snapshot_file": pk.get("snapshot_file"),
+            "material": args.material,
+            "summary": args.summary.strip(),
+            # AlphaEngine 覆盖边界（按整段或逐日推进，与全局 until 解耦）；跨轮续采
+            # 不再保存 cursor，ae_resume 固定为 None。
+            "ae_covered_until": ae_covered_until,
+            "ae_resume": None,
+        }
+        _preserve_legacy_bullbear_last_run(P, prev_last_run, ticker=commit_ticker, already_locked=True)
+        dump_json(P["last_run"], last_run_obj)
 
-    P["log"].parent.mkdir(parents=True, exist_ok=True)
-    with P["log"].open("a", encoding="utf-8") as f:
-        f.write(f"{now_et().strftime('%Y-%m-%d %H:%M')} | {args.run_id} | material={args.material} | {args.summary.strip()}\n")
+        P["log"].parent.mkdir(parents=True, exist_ok=True)
+        with P["log"].open("a", encoding="utf-8") as f:
+            f.write(f"{now_et().strftime('%Y-%m-%d %H:%M')} | {args.run_id} | material={args.material} | {args.summary.strip()}\n")
 
     res = {
         "ok": True,

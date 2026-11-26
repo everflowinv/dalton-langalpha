@@ -781,3 +781,101 @@ async def test_restore_before_the_skip_keeps_the_new_execution(
     assert len(statements) == 1
     assert [row["status"] for row in executions] == ["pending", "pending"]
     assert executions[1]["id"] == "new"
+
+
+@pytest.mark.asyncio
+async def test_legacy_rollback_inherent_category_override_matches_dispatch_for_enabled_and_disabled(
+    monkeypatch,
+) -> None:
+    """r5 #2: Rollback override key (automation:<id>) takes precedence in dispatch for both True and False."""
+    from src.dalton.notify import dispatch as dispatch_mod
+
+    auto_name = "dalton-googl-earn-2026q1-t0"
+
+    for restored_enabled, legacy_name_override in ((True, False), (False, True)):
+        row = _history_row(mode="legacy", trigger_type="cron")
+        row["name"] = auto_name
+        row["notify_enabled"] = not restored_enabled
+        row["audit_history"] = [
+            {
+                "version": 1,
+                "prev_version": None,
+                "snapshot": _complete_snapshot(
+                    trigger_type="cron",
+                    name=auto_name,
+                    notify_enabled=restored_enabled,
+                    notify_routes=[_NEW],
+                    cron_expression="0 9 * * *",
+                    once_run_at=None,
+                ),
+            },
+            {
+                "version": 2,
+                "prev_version": 1,
+                "snapshot": _complete_snapshot(
+                    trigger_type="cron",
+                    name=auto_name,
+                    notify_enabled=not restored_enabled,
+                    notify_routes=[_OLD],
+                    cron_expression="0 9 * * *",
+                    once_run_at=None,
+                ),
+            },
+        ]
+        _captured, upserts, _invalidations = _install_rollback_fakes(monkeypatch, row)
+        pref_row = {
+            "model_preference": {
+                "dalton_notify_enabled": True,
+                "dalton_notify_targets": [_OLD, _NEW],
+                "dalton_notify_routes": {auto_name: [_OLD]},
+                "dalton_notify_overrides": {auto_name: legacy_name_override},
+            }
+        }
+        await recycle.rollback_automation(
+            AUTO_ID,
+            actor_user_id=OWNER,
+            expected_config_version=2,
+            target_version=1,
+            owner_user_id=OWNER,
+            company=False,
+            prelocked_pref_row=pref_row,
+            principal=_principal(OWNER),
+        )
+        assert len(upserts) == 1
+        written = upserts[0]["model_preference"]
+        merged_routes = {
+            **pref_row["model_preference"]["dalton_notify_routes"],
+            **written["dalton_notify_routes"],
+        }
+        merged_overrides = {
+            **pref_row["model_preference"]["dalton_notify_overrides"],
+            **written["dalton_notify_overrides"],
+        }
+        assert merged_overrides[f"automation:{AUTO_ID}"] is restored_enabled
+
+        ok, skip_reason, effective = await dispatch_mod.evaluate_user_notify_eligibility(
+            OWNER,
+            {"automation_id": AUTO_ID, "name": auto_name},
+            resolve_enabled_fn=create_autospec(
+                dispatch_mod.resolve_dalton_notify_enabled, return_value=True
+            ),
+            resolve_overrides_fn=create_autospec(
+                dispatch_mod.resolve_dalton_notify_overrides,
+                return_value=merged_overrides,
+            ),
+            resolve_targets_fn=create_autospec(
+                dispatch_mod.resolve_dalton_notify_targets,
+                return_value=[_OLD, _NEW],
+            ),
+            resolve_routes_fn=create_autospec(
+                dispatch_mod.resolve_dalton_notify_routes,
+                return_value=merged_routes,
+            ),
+            is_admin_fn=create_autospec(
+                dispatch_mod._default_notify_admin, return_value=False
+            ),
+        )
+        if restored_enabled:
+            assert (ok, skip_reason, effective) == (True, None, [_NEW])
+        else:
+            assert (ok, skip_reason, effective) == (False, "toggle_off", [])

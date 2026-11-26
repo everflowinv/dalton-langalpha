@@ -121,7 +121,11 @@ def _bundle_dirs() -> list[Path]:
             "built-in MCP servers", BUNDLES_DIR, e,
         )
         return []
-    return [p for p in entries if p.is_dir() and not p.name.startswith((".", "_"))]
+    base_dirs = [p for p in entries if p.is_dir() and not p.name.startswith((".", "_"))]
+    # DALTON-HOOK(standalone-core): delegate optional commercial extra plugin dir scanning to Dalton
+    from src.dalton.plugin_loader import append_extra_bundle_dirs
+
+    return append_extra_bundle_dirs(base_dirs)
 
 
 def _namespace_block(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -246,18 +250,10 @@ def _server(
         "tools": meta.tools,
         "auth": meta.auth,
     }
-    if transport == "stdio":
-        return MCPServerConfig(
-            **common,
-            command=_expand(entry.get("command")),
-            args=_expand(list(entry.get("args") or [])),
-            env=_expand(dict(entry.get("env") or {})),
-        )
-    return MCPServerConfig(
-        **common,
-        url=_expand(entry.get("url")),
-        headers=_expand(dict(entry.get("headers") or {})),
-    )
+    # DALTON-HOOK(standalone-core): delegate profile-aware connector expansion & SEC env injection to Dalton
+    from src.dalton.plugin_loader import build_bundled_server_transport_kwargs
+
+    return MCPServerConfig(**common, **build_bundled_server_transport_kwargs(key, transport, entry))
 
 
 def _staged_entrypoint(server: MCPServerConfig) -> str | None:

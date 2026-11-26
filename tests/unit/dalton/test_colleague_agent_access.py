@@ -5142,3 +5142,70 @@ class TestR6SharingAuthGating:
         [(_sql_off, params_off)] = cur_off.calls
         assert params_off[1] == params_off[2] == list(SERVER_OWNED_CONFIG_KEYS)
         assert "pending_outbound_confirm" not in params_off[1]
+
+
+class TestColleagueWorkspaceProvenanceRedactor:
+    """ProvenanceMiddleware receives a callable redactor (e.g. leak_detection.redact)."""
+
+    def test_colleague_workspace_provenance_invokes_callable_redactor(self) -> None:
+        import json
+        from types import SimpleNamespace
+        from unittest.mock import create_autospec
+
+        from src.ptc_agent.agent.middleware.provenance.middleware import ProvenanceMiddleware
+
+        def _redact(text: str | None) -> str | None:
+            if text is None:
+                return None
+            return text.replace("sk-secret-colleague-token", "[REDACTED]")
+
+        redactor_mock = create_autospec(_redact, side_effect=_redact)
+        mw = ProvenanceMiddleware(redactor=redactor_mock)
+
+        # read_file action
+        req_file = SimpleNamespace(
+            tool_call={
+                "id": "call-file-1",
+                "name": "colleague_workspace",
+                "args": {"action": "read_file", "workspace_id": "ws-colleague", "path": "notes.md"},
+            }
+        )
+        res_file = SimpleNamespace(
+            content=json.dumps(
+                {
+                    "success": True,
+                    "workspace_id": "ws-colleague",
+                    "path": "notes.md",
+                    "content": "Memo with sk-secret-colleague-token inside.",
+                }
+            )
+        )
+        file_sources = list(mw._extract_colleague_workspace(req_file, res_file))
+        assert len(file_sources) == 1
+        assert file_sources[0].identifier == "colleague_workspace:ws-colleague/notes.md"
+        assert "sk-secret-colleague-token" not in (file_sources[0].result_body or "")
+        assert "[REDACTED]" in (file_sources[0].result_body or "")
+
+        # read_thread action
+        req_thread = SimpleNamespace(
+            tool_call={
+                "id": "call-thread-1",
+                "name": "colleague_workspace",
+                "args": {"action": "read_thread", "thread_id": "th-99"},
+            }
+        )
+        res_thread = SimpleNamespace(
+            content=json.dumps(
+                {
+                    "success": True,
+                    "thread_id": "th-99",
+                    "text": "Thread text with sk-secret-colleague-token.",
+                }
+            )
+        )
+        thread_sources = list(mw._extract_colleague_workspace(req_thread, res_thread))
+        assert len(thread_sources) == 1
+        assert thread_sources[0].identifier == "colleague_thread:th-99"
+        assert "sk-secret-colleague-token" not in (thread_sources[0].result_body or "")
+        assert "[REDACTED]" in (thread_sources[0].result_body or "")
+        assert redactor_mock.call_count == 2

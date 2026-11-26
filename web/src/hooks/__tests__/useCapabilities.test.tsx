@@ -241,4 +241,25 @@ describe('useCapabilities build-time initial state and server authority', () => 
     expect(screen.getByTestId('profile')).toHaveTextContent('everflow');
     expect(mockApiGet).not.toHaveBeenCalled();
   });
+
+  it('includes Batch 3 research connector capabilities in CAPABILITY_IDS and EVERFLOW_DEFAULT_CAPABILITIES while CORE_DEFAULT_CAPABILITIES includes company_wiki', async () => {
+    vi.stubEnv('VITE_DALTON_PROFILE', 'core');
+    vi.resetModules();
+
+    const mod = await import('../useCapabilities');
+    for (const cap of ['company_wiki', 'sales_notes', 'tmtb', 'funda_ai', 'fund_automations'] as const) {
+      expect(mod.CAPABILITY_IDS).toContain(cap);
+      expect(mod.EVERFLOW_DEFAULT_CAPABILITIES).toContain(cap);
+    }
+    expect(mod.CORE_DEFAULT_CAPABILITIES).toEqual(['company_wiki']);
+    expect(
+      mod.hasRequiredCapability(new Set(['company_wiki']), ['company_wiki', 'sales_notes']),
+    ).toBe(true);
+    expect(
+      mod.hasRequiredCapability(new Set(['sales_notes']), ['company_wiki', 'sales_notes']),
+    ).toBe(true);
+    expect(
+      mod.hasRequiredCapability(new Set(['researchdata_bridge']), ['company_wiki', 'sales_notes']),
+    ).toBe(false);
+  });
 });

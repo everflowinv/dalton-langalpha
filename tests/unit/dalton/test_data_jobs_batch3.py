@@ -1133,7 +1133,7 @@ def test_discord_channel_route_is_not_a_personal_or_feishu_target() -> None:
     }
     validate_dalton_model_preferences(bag)
     assert bag[DALTON_NOTIFY_ROUTES_KEY]["data:ai-chain-daily"] == [channel]
-    with pytest.raises(TuningError, match="仅支持 feishu:user:<open_id> 或 discord:user:<数字id>"):
+    with pytest.raises(TuningError, match="仅支持 feishu:user:<open_id>、discord:user:<数字id> 或 weixin:user:<id>"):
         validate_dalton_model_preferences({DALTON_NOTIFY_TARGETS_KEY: [channel]})
     with pytest.raises(TuningError, match="discord:channel:<数字id>"):
         validate_dalton_model_preferences(

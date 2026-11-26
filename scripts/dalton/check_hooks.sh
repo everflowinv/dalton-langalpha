@@ -128,6 +128,7 @@ ALLOWED_HOOKS=(
   "invite-signup"
   "wiki-ingest"
   "handoff-keep-on-resumable"
+  "frontend-release-dir"
   "fallback-reason-log"
   "httpx2-log-level"
   "sandbox-pip-system"

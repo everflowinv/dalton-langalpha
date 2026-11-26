@@ -288,24 +288,41 @@
 
 ---
 
-### 6.4 第 3 批：公开插件（`dalton_sec` 11 操作、`dalton_macro`）、五路研究连接器、`all` 与部署脚本同步改造
+### 6.4 第 3a 批：公开插件、开源 `research-host`、能力门控与核心安装
 
-- **前置条件**：第 2 批已稳定运行。
+- **前置条件**：第 2 批已稳定运行。Everflow 生产保持原有旧桥运行，本批部署后生产行为保持不变。
 - **实施范围**：
-  1. 扩展公开插件 `plugins/dalton_sec/` 逐操作兼容原 `sec` 11 项操作（见 2.3 节），新增 `plugins/dalton_macro/`（`fred` + `treasury` TGA/债务），新增公开声明与开源容器服务 `plugins/dalton_company_wiki/`、`plugins/dalton_research_all/`（`docker-compose.core.yml` 接入 `sandbox-net` + `core_internal`），并同步加入 `scripts/standalone/package_release.sh:219-227` 的 `ALLOWLIST_OPTIONAL`。
-  2. **先改宿主 Guidepoint 地址为可配置**：修改 `scripts/dalton/research_runtime/scripts/data_gateway.py:40,283` 与 `scripts/dalton/research_runtime/skills/guidepoint-transcript-search/scripts/gp_search.py:13` 读取环境变量 `DALTON_GUIDEPOINT_MCP_URL`（缺省 `:8943/mcp`）。
-  3. 部署宿主机 `com.dalton.research-host`（`:8951`），上线 `guidepoint`、`company-wiki`、`sales-notes`、`tmtb`、`funda-ai`、`all`（**本批 `all` 的 AlphaEngine 分支统一经当时唯一的 AlphaEngine 处理方——旧桥 `:8960`——转发检索，第 4 批再切为进程内直调**）及管理口 `/ingest/{wiki,sales-notes}`；扩展 `_bundle_dirs()` 支持 `DALTON_EXTRA_PLUGINS_DIR`。
-  4. **同批改完 `deploy_main.sh` 与全链路能力门控**：更新 `scripts/dalton/ops/prod/deploy_main.sh:633,658,662,915-924` 与 `scripts/dalton/ops/research_runtime_migrate.sh:806-812` 纳入 `com.dalton.research-host` 的拉起、探活及部署失败回退时的 `:8951`↔`:8943` 刷新权交接；同步更新 `src/dalton/capabilities.py`（逐来源检查）、`src/dalton/provenance/declared_sources.py:13`、`src/dalton/tools/__init__.py:393-404`、`web/src/hooks/useCapabilities.ts:16-50`、`web/src/pages/ChatAgent/components/dalton/AutoIngestToggle.tsx:26`、`src/dalton/data_map/builder.py`、`src/dalton/content_assembly.py`、`agent_config.dalton.yaml:51-52` 超时，随后解除 `guidepoint`、`company_wiki`、`sales_notes`、`tmtb`、`funda_ai` 对 `RESEARCHDATA_BRIDGE` 的 `depends_on`。
-  5. 上线 `connector_transport.py` 并迁移对应技能脚本与 `workflows/topic-research/workflow.js`。
-  6. *本批开发任务书须定义*：`dalton_sec` 全部 11 个工具的精确参数/返回 JSON Schema、`deploy_main.sh` 失败自动回退 `revert_deploy` 中 `:8951` 与 `:8943` 的切换状态机。
+  1. **公开插件与打包白名单**：扩展公开插件 `plugins/dalton_sec/`（默认按未切流基线仅注册原有 2 项工具，由后端按能力显式传入 `DALTON_SEC_EXTENDED_TOOLS=1` 时启用全部 11 项兼容操作，见 2.3 节）；新增 `plugins/dalton_macro/`（`fred` 含 vintage、`treasury` TGA/债务）；新增公开声明插件 `plugins/dalton_company_wiki/` 与 `plugins/dalton_research_all/`；同步更新 `scripts/standalone/package_release.sh:219-227` 的 `ALLOWLIST_OPTIONAL`。
+  2. **开源 `research-host` 服务（`src/dalton/research_host/`）**：提供 `python -m src.dalton.research_host`、`/healthz`、`/admin/drain`（停止接单与 `in_flight` 原子记账）、`/mcp/company-wiki`、`/mcp/federated`（动态按生效能力暴露工具清单与文档前缀，按来源白名单过滤查询参数，同步 SQLite 查询通过 `asyncio.to_thread` 卸载出事件循环）、`/ingest/wiki`（复用 PDF/DOCX/图片正文提取、保留原始附件文件、SQLite 事务内原子写入幂等回执并支持审计日志补写），并与后端读取同一份 `.env` 能力配置。
+  3. **核心安装接入**：在 `docker-compose.core.yml`（默认随栈启动）与 `scripts/standalone/init.sh` / `upgrade.sh` / `backup.sh` / `restore.sh` 接入 `research-host`（同处 `sandbox-net` 与 `core_internal`），使独立核心安装开箱具备 `company_wiki` 与 `dalton_research_all`，并在升级与备份恢复中保持令牌与 Wiki 卷一致。
+  4. **能力门控、数据地图与调用方适配**：更新 `src/dalton/capabilities.py`（解除 `guidepoint`、`company_wiki`、`sales_notes`、`tmtb`、`funda_ai` 对 `RESEARCHDATA_BRIDGE` 的 `depends_on`，并在未配置宿主连接器地址时保持 Everflow 生产默认清单不变）、`src/dalton/provenance/declared_sources.py`、`src/dalton/tools/__init__.py`、`web/src/hooks/useCapabilities.ts`、`web/src/pages/ChatAgent/components/dalton/AutoIngestToggle.tsx`、`src/dalton/data_map/builder.py`、`src/dalton/data_map/health.py`（独立核心按连接器探活、数据地图缓存键区分传输形态）、`src/dalton/content_assembly.py`；上线 `connector_transport.py` 并按工具与参数签名级别适配 `collect.py`、`rd_transport.py` 与 `workflows/topic-research/workflow.js`；使 `data_gateway.py` 与 `gp_search.py` 支持 `DALTON_GUIDEPOINT_MCP_URL`（缺省 `:8943/mcp`）。
+  5. **商业连接器代码预置（默认关闭）**：`scripts/dalton/research_runtime/host_connectors/` 与 `extra_plugins/` 代码可预置在仓库（严格排除在核心安装包之外），在 Everflow 默认配置中处于未加载状态，留待第 3b 批正式切换启用。
+- **验收条件**：
+  1. Everflow 生产基线不变：`test_everflow_profile_parity.py` 全部通过；未切流工作区挂载旧桥与 2 工具基线 `dalton_sec` 时，技能脚本对 SEC 与研究路由的调用请求与改前完全一致；`dalton_sec` 在无 `src` 路径下启动时 `tools/list` 完整结构与基线一致。
+  2. 独立核心能力完备：`package_release.sh` 白名单包含 4 个公开插件且排除商业连接器；`research-host` 默认随核心安装启动，跑通 `company_wiki` 读写（含 PDF/DOCX/图片附件入库、原始文件保留、图片索引、审计补写重试、`media="images"` 与 UTC `indexed_since`）、`dalton_research_all` 仅展示已启用来源与工具、`dalton_sec` 11 操作与 `dalton_macro` TGA/FRED 查询；共享 `.env` 关闭某来源后，后端与直连 `research-host` 同步返回 `403`；前端 `AutoIngestToggle` 待能力加载完成后按能力显示。
+
+---
+
+### 6.4b 第 3b 批（Everflow 切换）：宿主机 `com.dalton.research-host` 切流、Guidepoint 令牌刷新权交接与部署回退
+
+- **前置条件**：第 3a 批合入并稳定运行；以下由第 3a 批双审确认的切换前置要求全部落地后方可开始切换。
+- **实施范围与切换前置要求**：
+  1. **宿主机服务与私有连接器启用**：新增 `scripts/dalton/launchd/com.dalton.research-host.plist.template`、`scripts/dalton/ops/prod/switch_research_host.sh`、`scripts/dalton/ops/prod/RESEARCH_HOST_SWITCH_RUNBOOK.md`，并更新 `scripts/dalton/ops/prod/deploy_main.sh` 与 `scripts/dalton/ops/research_runtime_migrate.sh` 纳入 `com.dalton.research-host`（`:8951`）拉起、探活与回退；在 Everflow 启用 `host_connectors`（`guidepoint`、`sales-notes`、`tmtb`、`funda-ai`）与 `DALTON_EXTRA_PLUGINS_DIR`，`all` 的 AlphaEngine 分支继续经旧桥 `:8960` 单处理方转发。
+  2. **Guidepoint 单刷新方排他锁与真实路径对齐**：`guidepoint_mcp_proxy.py`（`:8943`）与 `host_connectors/guidepoint.py`（`:8951`）共用同一令牌文件路径与同一排他文件锁（读取令牌与开始接单前先取得锁）；切换脚本、LaunchAgent 模板与运维手册全部使用真实可部署绝对路径（仓库根、研究数据目录与持久化回滚快照目录）。
+  3. **`:8943` 在途请求排空后再交接锁**：切换前先对 `:8943` 停止接单并确认在途请求归零后再停止代理、释放锁并启动 `:8951`，避免交接瞬间发生双刷新或请求中断；`/admin/drain` 与请求入口在读取请求体前完成原子 `draining` 检查与 `in_flight` 记账。
+  4. **旧桥地址切换早于生产前端构建与持久化回滚快照**：切换时先将旧桥与宿主脚本的 `DALTON_GUIDEPOINT_MCP_URL` 指向 `:8951/mcp/guidepoint`、核验健康后再构建生产前端与重建后端；切换与部署开始即在持久化目录留存上一版配置（`.env`、bridge/host env、plist）与前端 `dist` 产物快照，保障重启后仍可一键完整回退。
+  5. **`deploy_main.sh` 失败自动回退顺序**：部署开始先落盘快照；回退时先排空并停止当前 Guidepoint 令牌持有方，再恢复上一版配置并拉起目标持有方（`:8943` 或 `:8951`），随后重建后端容器并核验真实生效的 Guidepoint 入口与旧桥连通性。
+  6. **前后端与宿主共享同一份能力配置**：生产 `com.dalton.research-host` 明确指向仓库 `.env` 读取 `DALTON_CAP_*`，与后端能力门控保持单一真相源。
 - **切换步骤顺序**：
-  1. 先部署支持 `DALTON_GUIDEPOINT_MCP_URL` 的宿主脚本；
-  2. 停止 `com.dalton.guidepoint-mcp-proxy`（`:8943`），启动 `com.dalton.research-host`（`:8951`）独占接管 `guidepoint_mcp_tokens.json` 刷新锁，并将宿主与旧桥的 `DALTON_GUIDEPOINT_MCP_URL` 指向 `http://127.0.0.1:8951/mcp/guidepoint`；
-  3. 构建前端静态包，更新 `.env` 连接器地址与令牌，执行 `docker compose up -d --no-deps backend`（及重建 `edge`），并重刷全部活跃工作区沙箱同步新包装器。
+  1. 在持久化目录保存当前 `.env`、宿主配置、plist 与前端静态产物快照；
+  2. 令 `com.dalton.guidepoint-mcp-proxy`（`:8943`）停止接单、待在途请求归零后停止进程释放令牌锁；
+  3. 启动 `com.dalton.research-host`（`:8951`）独占取得令牌锁并探活 `/healthz`，将旧桥与宿主脚本的 `DALTON_GUIDEPOINT_MCP_URL` 切至 `http://127.0.0.1:8951/mcp/guidepoint` 并确认旧桥连通；
+  4. 构建前端静态包，更新 `.env` 连接器地址与令牌，执行 `docker compose up -d --no-deps backend`（及重建 `edge`），并重刷全部活跃工作区沙箱同步新包装器。
 - **回退步骤顺序**：
-  1. 停止 `com.dalton.research-host`（释放 Guidepoint 刷新写权），将 `DALTON_GUIDEPOINT_MCP_URL` 切回 `http://127.0.0.1:8943/mcp` 并拉起 `com.dalton.guidepoint-mcp-proxy`；
-  2. 恢复上一版代码、前端构建产物与 `.env`，执行 `docker compose up -d --no-deps backend` 重建容器，重刷活跃沙箱恢复旧包装器。
-- **验收条件**：① 核心发布包在隔离 `sandbox-net` 下启动 `research-host` 容器，跑通 `company_wiki` 读写（含 `media="images"`、UTC `indexed_since`）、`all.read("image:...")`、`AutoIngestToggle` 首屏展示、`dalton_sec` 11 操作与 `dalton_macro` TGA 查询；② Everflow 生产 `all.search` 正常联搜本地四库 + Guidepoint + 旧桥 AlphaEngine，且模拟回退时旧桥与 `gp_search.py` 均正常检索 Guidepoint。
+  1. 令 `com.dalton.research-host` 停止接单、待 `in_flight` 归零后停止进程释放令牌锁；
+  2. 从持久化快照恢复 `DALTON_GUIDEPOINT_MCP_URL` 为 `http://127.0.0.1:8943/mcp` 并拉起 `com.dalton.guidepoint-mcp-proxy`；
+  3. 恢复上一版代码、前端构建产物与 `.env`，执行 `docker compose up -d --no-deps backend` 重建容器，重刷活跃沙箱恢复旧包装器并核验真实入口。
+- **验收条件**：Everflow 生产 `all.search` 正常联搜本地四库 + Guidepoint + 旧桥 AlphaEngine；实操演练一次完整切换与回退后，旧桥与 `gp_search.py` 均正常检索 Guidepoint 且无双刷新锁冲突。
 
 ---
 

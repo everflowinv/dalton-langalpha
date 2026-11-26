@@ -240,6 +240,9 @@ ALLOWLIST_OPTIONAL=(
   "deploy/standalone"
   "scripts/standalone"
   "plugins/dalton_sec"
+  "plugins/dalton_macro"
+  "plugins/dalton_company_wiki"
+  "plugins/dalton_research_all"
 )
 
 # Exported only when `--include-ci` is explicitly passed so customer release
@@ -291,16 +294,18 @@ mkdir -p "$EXPORT_ROOT"
 git archive --format=tar "$COMMIT_SHA" -- "${ARCHIVE_PATHS[@]}" | tar ${TAR_EXTRACT_FLAGS[@]+"${TAR_EXTRACT_FLAGS[@]}"} -xf - -C "$EXPORT_ROOT"
 
 # Defense-in-depth post-extract denylist inside allowlisted parent directories
-# (e.g. `web/`, `src/`). Never touches the working tree.
-# Note: docs-site/src/content/docs/everflow is intentionally retained in Batch 1
-# because Starlight's sidebar still references those slugs; Batch 3 prunes both
-# the sidebar and the everflow docs pages together.
+# (e.g. `web/`, `src/`, `docs-site/`). Never touches the working tree.
+# `docs-site/astro.config.mjs` omits the Everflow sidebar section and Feishu guide
+# under Core, so stripping them keeps the Core release clean.
 DENY_PATHS=(
   "plugins/dalton_data"
   "scripts/dalton/researchdata_bridge.py"
   "scripts/dalton/research_runtime"
   "scripts/dalton/ops"
   "web/.env.dalton"
+  "docs-site/src/content/docs/everflow"
+  "docs-site/src/content/docs/explore/deliver-to-feishu.mdx"
+  "docs-site/src/content/docs/explore/deliver-to-feishu.md"
 )
 
 for deny in "${DENY_PATHS[@]}"; do

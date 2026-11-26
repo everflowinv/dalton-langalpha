@@ -1,6 +1,9 @@
 plugins/dalton/
 plugins/dalton_data/
 plugins/dalton_sec/
+plugins/dalton_macro/
+plugins/dalton_company_wiki/
+plugins/dalton_research_all/
 src/dalton/
 workflows/
 scripts/dalton/

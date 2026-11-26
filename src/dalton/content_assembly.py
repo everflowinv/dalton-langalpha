@@ -33,7 +33,9 @@ from typing import Any
 from src.dalton.capabilities import (
     CapabilityId,
     effective_capabilities,
+    has_any_research_connector_capability,
     is_bridge_route_enabled,
+    is_research_source_enabled,
 )
 
 
@@ -232,6 +234,16 @@ def _assemble_stacked(
     return "".join(out_parts)
 
 
+_PROPRIETARY_RESEARCH_CAPS: tuple[CapabilityId, ...] = (
+    CapabilityId.RESEARCHDATA_BRIDGE,
+    CapabilityId.ALPHAENGINE,
+    CapabilityId.GUIDEPOINT,
+    CapabilityId.SALES_NOTES,
+    CapabilityId.TMTB,
+    CapabilityId.FUNDA_AI,
+)
+
+
 def assemble_markdown_text(
     text: str,
     *,
@@ -241,7 +253,7 @@ def assemble_markdown_text(
     """Assemble Markdown/text content with ``<!-- DALTON_CAP:... -->`` blocks."""
     active_caps = effective_capabilities() if capabilities is None else capabilities
     out = _assemble_stacked(text, _HTML_TOKEN_RE, active_caps, path=path)
-    if CapabilityId.RESEARCHDATA_BRIDGE not in active_caps:
+    if not any(cap in active_caps for cap in _PROPRIETARY_RESEARCH_CAPS):
         if "、内部研究库与卖方增量" in out:
             out = out.replace("、内部研究库与卖方增量", "、公开市场新闻与卖方动态")
         if "以行业名与成员公司名检索内部研究库" in out:
@@ -285,9 +297,18 @@ def assemble_json_text(
     if path_str.endswith("workflows/topic-research/contract.json") or (
         '"name": "topic-research"' in text and "guidepoint.md" in text
     ):
-        bridge_on = CapabilityId.RESEARCHDATA_BRIDGE in active_caps
+        internal_on = any(
+            cap in active_caps
+            for cap in (
+                CapabilityId.RESEARCHDATA_BRIDGE,
+                CapabilityId.COMPANY_WIKI,
+                CapabilityId.SALES_NOTES,
+                CapabilityId.TMTB,
+                CapabilityId.FUNDA_AI,
+            )
+        )
         gp_on = CapabilityId.GUIDEPOINT in active_caps
-        if bridge_on and gp_on:
+        if internal_on and gp_on:
             return text
         doc: dict[str, Any] = json.loads(text)
         for stage in doc.get("stages") or []:
@@ -296,7 +317,7 @@ def assemble_json_text(
             filtered = []
             for art in stage["artifacts"]:
                 art_path = str((art or {}).get("path") or "") if isinstance(art, dict) else ""
-                if not bridge_on and art_path.endswith("/internal-memory.md"):
+                if not internal_on and art_path.endswith("/internal-memory.md"):
                     continue
                 if not gp_on and art_path.endswith("/guidepoint.md"):
                     continue
@@ -396,12 +417,16 @@ def assemble_json_text(
                         r
                         for r in raw_routes
                         if is_bridge_route_enabled(str(r), capabilities=active_caps)
+                        or is_research_source_enabled(str(r), capabilities=active_caps)
                     ]
                     if len(filtered_routes) != len(raw_routes):
                         for r in raw_routes:
                             rs = str(r)
                             if (
-                                not is_bridge_route_enabled(rs, capabilities=active_caps)
+                                not (
+                                    is_bridge_route_enabled(rs, capabilities=active_caps)
+                                    or is_research_source_enabled(rs, capabilities=active_caps)
+                                )
                                 and rs not in disabled_internal_routes
                             ):
                                 disabled_internal_routes.append(rs)
@@ -413,12 +438,16 @@ def assemble_json_text(
                         r
                         for r in top_routes
                         if is_bridge_route_enabled(str(r), capabilities=active_caps)
+                        or is_research_source_enabled(str(r), capabilities=active_caps)
                     ]
                     if len(filtered_top) != len(top_routes):
                         for r in top_routes:
                             rs = str(r)
                             if (
-                                not is_bridge_route_enabled(rs, capabilities=active_caps)
+                                not (
+                                    is_bridge_route_enabled(rs, capabilities=active_caps)
+                                    or is_research_source_enabled(rs, capabilities=active_caps)
+                                )
                                 and rs not in disabled_internal_routes
                             ):
                                 disabled_internal_routes.append(rs)
@@ -458,7 +487,28 @@ def assemble_text(
     """Assemble *text* according to file suffix and active capabilities."""
     suffix = Path(path).suffix.lower() if path is not None else ".md"
     if suffix == ".js":
-        return assemble_js_text(text, path=path, capabilities=capabilities)
+        assembled = assemble_js_text(text, path=path, capabilities=capabilities)
+        # When dedicated Batch 3 connectors are active alongside the legacy bridge
+        # (post-cutover Everflow), direct `topic-research/workflow.js` to the mounted
+        # dedicated research connectors rather than retired legacy bridge routes, while
+        # keeping pre-cutover Everflow output byte-for-byte identical.
+        path_norm = Path(path).as_posix() if path is not None else ""
+        if path_norm.endswith("topic-research/workflow.js"):
+            from src.dalton.capabilities import is_batch3_connectors_enabled
+            from src.dalton.settings import get_dalton_research_host_base_url
+
+            active_caps = effective_capabilities() if capabilities is None else capabilities
+            if (
+                CapabilityId.RESEARCHDATA_BRIDGE in active_caps
+                and is_batch3_connectors_enabled()
+                and bool(get_dalton_research_host_base_url())
+                and has_any_research_connector_capability(active_caps)
+            ):
+                assembled = assembled.replace(
+                    "检索 researchdata 的 sales-notes、tmtb、funda-ai、company-wiki（只读）",
+                    "检索已启用的内部研究知识库连接器（只读）",
+                )
+        return assembled
     if suffix == ".json":
         return assemble_json_text(text, path=path, capabilities=capabilities)
     return assemble_markdown_text(text, path=path, capabilities=capabilities)

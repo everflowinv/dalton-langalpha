@@ -1606,6 +1606,58 @@ def _read_state_list(path: Path) -> list[str]:
     return data
 
 
+BULLBEAR_LAST_RUN_FILENAME = "bullbear_last_run.json"
+
+
+def _bullbear_last_run_path(paths: dict[str, Path]) -> Path:
+    """多空跟踪独立的进度文件路径（与 thesis-delta 的 last_run.json 分离）。"""
+    return paths.get("bullbear_last_run") or (paths["tracker"] / BULLBEAR_LAST_RUN_FILENAME)
+
+
+def _read_bullbear_last_run_with_source(paths: dict[str, Path]) -> tuple[dict[str, Any], bool]:
+    """优先读独立进度文件 bullbear_last_run.json；首次运行兼容旧 last_run.json。
+
+    返回 ``(data, from_legacy)``：``from_legacy`` 为 True 表示本次来自旧共享文件。
+    """
+    bb_path = _bullbear_last_run_path(paths)
+    if bb_path.exists():
+        return _read_state_object(bb_path), False
+    if paths["last_run"].exists():
+        return _read_state_object(paths["last_run"]), True
+    return {}, False
+
+
+def _read_bullbear_last_run(paths: dict[str, Path]) -> dict[str, Any]:
+    """优先读独立进度文件 bullbear_last_run.json；首次运行兼容旧 last_run.json。"""
+    data, _from_legacy = _read_bullbear_last_run_with_source(paths)
+    return data
+
+
+def _has_any_bullbear_ae_state(last_run: Any) -> bool:
+    if not isinstance(last_run, dict):
+        return False
+    for key, value in last_run.items():
+        if (
+            isinstance(key, str)
+            and key.endswith("_ae_state")
+            and isinstance(value, dict)
+            and isinstance(value.get("queries"), list)
+        ):
+            return True
+    return False
+
+
+def _is_legacy_thesis_delta_last_run(last_run: dict[str, Any], from_legacy: bool) -> bool:
+    """旧共享 last_run.json 已被 thesis-delta 覆盖（无逐查询状态、无 collected_at、含 ae_covered_until/ae_resume）。"""
+    if not from_legacy or not isinstance(last_run, dict) or not last_run:
+        return False
+    if _has_any_bullbear_ae_state(last_run):
+        return False
+    if "collected_at" in last_run:
+        return False
+    return "ae_covered_until" in last_run or "ae_resume" in last_run
+
+
 def _read_state_object(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
@@ -3608,11 +3660,16 @@ def cmd_collect(args: argparse.Namespace) -> int:
                     str(transport.get("error") or _g.RESEARCHDATA_TRANSPORT_UNCONFIGURED),
                     hint="本轮未采集任何来源",
                 )
-        last_run = _read_state_object(paths["last_run"])
+        bb_last_run_path = _bullbear_last_run_path(paths)
+        raw_last_run, from_legacy = _read_bullbear_last_run_with_source(paths)
+        # 还没有 bullbear_last_run.json 且旧共享 last_run.json 已被 thesis-delta 覆盖时，
+        # 窗口、内部库/SEC/X 与 AE 采集都按空进度（3 天回看）计算；ae_covered_until 仅留给提交校验做水位。
+        last_run = {} if _is_legacy_thesis_delta_last_run(raw_last_run, from_legacy) else raw_last_run
         seen = set(_read_state_list(paths["seen"]))
         before = {
             "seen": paths["seen"].read_text(encoding="utf-8") if paths["seen"].exists() else None,
-            "last": paths["last_run"].read_text(encoding="utf-8") if paths["last_run"].exists() else None,
+            "last": bb_last_run_path.read_text(encoding="utf-8") if bb_last_run_path.exists() else None,
+            "legacy_last": paths["last_run"].read_text(encoding="utf-8") if paths["last_run"].exists() else None,
             "log": paths["log"].read_text(encoding="utf-8") if paths["log"].exists() else None,
         }
         current = now_et()
@@ -3797,7 +3854,8 @@ def cmd_collect(args: argparse.Namespace) -> int:
         atomic_write_json(workspace, run_dir / "packet.json", packet)
         after = {
             "seen": paths["seen"].read_text(encoding="utf-8") if paths["seen"].exists() else None,
-            "last": paths["last_run"].read_text(encoding="utf-8") if paths["last_run"].exists() else None,
+            "last": bb_last_run_path.read_text(encoding="utf-8") if bb_last_run_path.exists() else None,
+            "legacy_last": paths["last_run"].read_text(encoding="utf-8") if paths["last_run"].exists() else None,
             "log": paths["log"].read_text(encoding="utf-8") if paths["log"].exists() else None,
         }
         if after != before:
@@ -3851,6 +3909,14 @@ def _committed_ae_covered(last_run: dict[str, Any]) -> dict[str, str]:
 
 def _validate_ae_state(state: dict[str, Any], last_run: dict[str, Any] | None = None) -> None:
     retained = _committed_ae_covered(last_run or {})
+    legacy_covered = (
+        _coerce_day(
+            (last_run or {}).get("ae_covered_until")
+            or (last_run or {}).get("legacy_thesis_ae_covered_until")
+        )
+        if isinstance(last_run, dict) and not _has_ae_state(last_run)
+        else None
+    )
     queries = state.get("queries")
     if not isinstance(queries, list):
         raise CollectError("bad_ae_state", f"{ae_state_key()}.queries 必须是列表")
@@ -3943,9 +4009,10 @@ def _validate_ae_state(state: dict[str, Any], last_run: dict[str, Any] | None = 
                     )
                 )
             )
+            retained_day = retained.get(row["query"], "") or (legacy_covered or "")
             if covered_day > end or (
                 covered_day == end
-                and retained.get(row["query"], "") < covered_day
+                and retained_day < covered_day
                 and not allow_partial_day_advance
             ):
                 raise CollectError("ae_incomplete_advanced", "未完成的 AE 查询不能把覆盖日期推进到窗口终点")
@@ -3976,6 +4043,7 @@ def cmd_commit(args: argparse.Namespace) -> int:
     paths = _g.tracker_paths(workspace)
     packet_path = ensure_relative(workspace, Path("research") / "tracker" / run_id / "packet.json")
     ensure_relative(workspace, Path("research") / "tracker" / "seen.json")
+    bb_last_run_path = ensure_relative(workspace, Path("research") / "tracker" / BULLBEAR_LAST_RUN_FILENAME)
     ensure_relative(workspace, Path("research") / "tracker" / "last_run.json")
     log_path = ensure_relative(workspace, Path("research") / "tracker" / "updates.log")
     if log_path.is_symlink():
@@ -3992,22 +4060,25 @@ def cmd_commit(args: argparse.Namespace) -> int:
         if not isinstance(ae_state, dict):
             return fail("bad_ae_state", f"packet 缺少 {ae_key}")
         seen = _read_state_list(paths["seen"])
-        last_run = _read_state_object(paths["last_run"])
+        last_run, from_legacy = _read_bullbear_last_run_with_source(paths)
         _validate_ae_state(ae_state, last_run)
+        is_legacy_thesis = _is_legacy_thesis_delta_last_run(last_run, from_legacy)
+        # 旧共享文件已被 thesis-delta 覆盖时，仅借其日期做兼容校验，提交先后与续采点只和多空记录比较。
+        bullbear_last_run = {} if is_legacy_thesis else last_run
         log_text = paths["log"].read_text(encoding="utf-8") if paths["log"].exists() else ""
         new_ids = _commit_ids(packet)
         merged_set = set(seen) | new_ids
         merged = sorted(merged_set)
-        current = last_run.get("run_id") == run_id
+        current = bullbear_last_run.get("run_id") == run_id
         # 同一 run 已经写进 last_run 时只补日志和 seen，不把状态改回这轮。
-        advance = _is_newer_collection(packet, last_run) and not current
+        advance = _is_newer_collection(packet, bullbear_last_run) and not current
         already_logged = _log_has_run(log_text, run_id)
         if not paths["seen"].exists() or merged_set != set(seen):
             atomic_write_json(workspace, paths["seen"], merged)
         if advance:
             ae_state_to_save = _ae_state_for_last_run(ae_state)
             if not ae_state_to_save.get("queries"):
-                prev_ae_state = last_run.get(ae_key) if isinstance(last_run, dict) else None
+                prev_ae_state = bullbear_last_run.get(ae_key) if isinstance(bullbear_last_run, dict) else None
                 if isinstance(prev_ae_state, dict) and prev_ae_state.get("queries"):
                     ae_state_to_save = _ae_state_for_last_run(prev_ae_state)
             last_body = {
@@ -4022,11 +4093,25 @@ def cmd_commit(args: argparse.Namespace) -> int:
                 "summary": summary,
                 ae_key: ae_state_to_save,
             }
-            if not ae_state_to_save.get("queries") and isinstance(last_run, dict):
-                if last_run.get("ae_covered_until") is not None:
-                    last_body["ae_covered_until"] = last_run["ae_covered_until"]
-                if last_run.get("ae_resume") is not None:
-                    last_body["ae_resume"] = last_run["ae_resume"]
+            if not ae_state_to_save.get("queries"):
+                if isinstance(bullbear_last_run, dict):
+                    if bullbear_last_run.get("ae_covered_until") is not None:
+                        last_body["ae_covered_until"] = bullbear_last_run["ae_covered_until"]
+                    if bullbear_last_run.get("ae_resume") is not None:
+                        last_body["ae_resume"] = bullbear_last_run["ae_resume"]
+                    if bullbear_last_run.get("legacy_thesis_ae_covered_until") is not None:
+                        last_body["legacy_thesis_ae_covered_until"] = bullbear_last_run[
+                            "legacy_thesis_ae_covered_until"
+                        ]
+                if (
+                    is_legacy_thesis
+                    and isinstance(last_run, dict)
+                    and last_run.get("ae_covered_until") is not None
+                    and "ae_covered_until" not in last_body
+                ):
+                    # 兼容提交校验的 thesis-delta 水位单独保存，不写入 ae_covered_until，
+                    # 避免下次恢复 AlphaEngine 采集时将其误作每条多空查询的已覆盖日。
+                    last_body["legacy_thesis_ae_covered_until"] = last_run["ae_covered_until"]
             internal_obj = packet.get("internal")
             internal_skipped = (
                 isinstance(internal_obj, dict)
@@ -4035,29 +4120,29 @@ def cmd_commit(args: argparse.Namespace) -> int:
             )
             internal_failed = isinstance(internal_obj, dict) and _internal_needs_retry(internal_obj)
             if internal_skipped:
-                if isinstance(last_run, dict) and "internal_retry_since" in last_run:
-                    last_body["internal_retry_since"] = last_run.get("internal_retry_since")
+                if isinstance(bullbear_last_run, dict) and "internal_retry_since" in bullbear_last_run:
+                    last_body["internal_retry_since"] = bullbear_last_run.get("internal_retry_since")
                 elif "internal_retry_since" in packet:
                     last_body["internal_retry_since"] = _coerce_retry_since(packet.get("internal_retry_since"))
                 last_body["internal_last_collected_until"] = _resume_point(
-                    last_run, "internal_last_collected_until", packet
+                    bullbear_last_run, "internal_last_collected_until", packet
                 )
             elif internal_failed:
                 prev_retry = (
-                    _coerce_retry_since(last_run.get("internal_retry_since"))
-                    if isinstance(last_run, dict)
+                    _coerce_retry_since(bullbear_last_run.get("internal_retry_since"))
+                    if isinstance(bullbear_last_run, dict)
                     else None
                 )
                 pkt_retry = _coerce_retry_since(packet.get("internal_retry_since"))
                 retry_candidates = [d for d in (prev_retry, pkt_retry) if d is not None]
                 last_body["internal_retry_since"] = min(retry_candidates) if retry_candidates else None
                 last_body["internal_last_collected_until"] = _resume_point(
-                    last_run, "internal_last_collected_until", packet
+                    bullbear_last_run, "internal_last_collected_until", packet
                 )
             elif "internal_retry_since" in packet:
                 last_body["internal_retry_since"] = _coerce_retry_since(packet.get("internal_retry_since"))
-            elif isinstance(last_run, dict) and "internal_retry_since" in last_run:
-                last_body["internal_retry_since"] = last_run.get("internal_retry_since")
+            elif isinstance(bullbear_last_run, dict) and "internal_retry_since" in bullbear_last_run:
+                last_body["internal_retry_since"] = bullbear_last_run.get("internal_retry_since")
 
             sec_obj = packet.get("sec")
             sec_skipped = (
@@ -4075,7 +4160,7 @@ def cmd_commit(args: argparse.Namespace) -> int:
             )
             if sec_skipped or sec_failed:
                 last_body["sec_last_collected_until"] = _resume_point(
-                    last_run, "sec_last_collected_until", packet
+                    bullbear_last_run, "sec_last_collected_until", packet
                 )
 
             x_obj = packet.get("x")
@@ -4094,10 +4179,12 @@ def cmd_commit(args: argparse.Namespace) -> int:
             )
             if x_skipped or x_failed:
                 last_body["x_last_collected_until"] = _resume_point(
-                    last_run, "x_last_collected_until", packet
+                    bullbear_last_run, "x_last_collected_until", packet
                 )
 
-            atomic_write_json(workspace, paths["last_run"], last_body)
+            atomic_write_json(workspace, bb_last_run_path, last_body)
+        elif current and not bb_last_run_path.exists() and bullbear_last_run:
+            atomic_write_json(workspace, bb_last_run_path, bullbear_last_run)
         log_repaired = False
         # updates.log 是完成回执。比当前 last_run 更早的首次提交也记一行，否则该轮会一直算未完成。
         # 这一行不改 last_run，也不改其中的 AE 覆盖状态或内部库重试起点。
@@ -4116,7 +4203,7 @@ def cmd_commit(args: argparse.Namespace) -> int:
             "seen_total": len(merged),
             "new_ids_marked_seen": len(merged_set - set(seen)),
             "packet_json": packet_rel,
-            "last_run_file": "research/tracker/last_run.json",
+            "last_run_file": f"research/tracker/{BULLBEAR_LAST_RUN_FILENAME}",
             "updates_log": "research/tracker/updates.log",
             "stale": not advance and not current,
             "idempotent": current and already_logged and merged_set == set(seen),

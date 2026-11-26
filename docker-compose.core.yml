@@ -306,6 +306,33 @@ services:
       - core_internal
       - sandbox-net
 
+  research-host:
+    image: ${DALTON_BACKEND_IMAGE:-dalton-core-backend:local}
+    # Bypass /docker_entrypoint.sh so only the one-shot `migrate` service runs Alembic migrations.
+    entrypoint: ["/usr/bin/tini", "-s", "--"]
+    command: ["uv", "run", "--no-sync", "python", "-m", "src.dalton.research_host"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # ptc_agent lives under src/; set it explicitly instead of relying on the venv .pth.
+      PYTHONPATH: /app/src
+      APP_ENV: core
+      DALTON_PROFILE: core
+      DALTON_RESEARCH_HOST_BIND: 0.0.0.0
+      DALTON_RESEARCH_HOST_PORT: "8951"
+      DALTON_WIKI_DATA_DIR: /var/lib/dalton/wiki
+    volumes:
+      - dalton-wiki-data:/var/lib/dalton/wiki
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8951/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - core_internal
+      - sandbox-net
+
   ssh-gateway:
     # !override drops upstream docker-compose.yml's shell-interpolated BYOK_ENCRYPTION_KEY
     # so ssh-gateway and backend always share the exact same key from `env_file: .env`.
@@ -383,5 +410,6 @@ volumes:
   dalton-minio-data:
   dalton-backend-var:
   dalton-asr-jobs:
+  dalton-wiki-data:
   dalton-caddy-data:
   dalton-caddy-config:

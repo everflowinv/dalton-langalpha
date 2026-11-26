@@ -620,3 +620,29 @@ class TestSweepPidfdInProcess:
             assert gone, "fork-and-exit orphan survived the in-process sweep"
         finally:
             reaper_mod._kill_backend = None
+
+
+class TestCrawlRunnerParseReply:
+    def test_parse_reply_preserves_json_with_u2028_and_u2029(self) -> None:
+        from src.dalton.crawl_service.runner import _parse_reply
+
+        payload = {
+            "ok": True,
+            "page": {
+                "status": 200,
+                "url": "https://example.com/article",
+                "encoding": "utf-8",
+                "headers": {"content-type": "text/html"},
+                "body_b64": base64.b64encode(b"<html>ok</html>").decode("ascii"),
+                "title": "Line\u2028Separator and\u2029Paragraph",
+            },
+        }
+        # Worker emits JSON with ensure_ascii=False, so U+2028 / U+2029 appear as raw UTF-8 bytes
+        stdout = (
+            b"browser startup noise line\n"
+            + json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            + b"\n"
+        )
+        parsed = _parse_reply(stdout, returncode=0)
+        assert parsed["ok"] is True
+        assert parsed["page"]["title"] == "Line\u2028Separator and\u2029Paragraph"

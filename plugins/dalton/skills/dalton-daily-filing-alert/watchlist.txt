@@ -82,3 +82,17 @@ SAP
 HEI
 WSE
 BAM
+
+# 用户 Core 名单补充（2026-11-26 一次性补入）
+ANT
+BZ
+CRWD
+MCO
+NDAQ
+NOW
+NTES
+PANW
+RBC
+RBRK
+SPCX
+SPGI

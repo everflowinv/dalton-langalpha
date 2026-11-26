@@ -295,6 +295,7 @@ async def fetch_antigravity_models(
     base_url: str = "https://daily-cloudcode-pa.googleapis.com",
     user_agent: str | None = None,
     client: httpx.AsyncClient | None = None,
+    strict: bool = False,
 ) -> list[UpstreamModel]:
     """POST `{base}/v1internal:fetchAvailableModels` (empty body) on the Cloud Code endpoint.
 
@@ -324,24 +325,46 @@ async def fetch_antigravity_models(
         payload = resp.json()
         rows = payload.get("models") if isinstance(payload, dict) else None
         if not isinstance(rows, dict):
+            if strict:
+                raise ValueError("Invalid Antigravity models payload: missing models object")
             return []
+        if strict and (not rows or all(not isinstance(row, dict) for row in rows.values())):
+            raise ValueError("Invalid Antigravity models payload: empty or malformed models object")
         out: list[UpstreamModel] = []
         # Every id in the dict participates in the deprecation check; only the
         # ones with a displayName are user-facing additions.
         for model_id, row in rows.items():
-            if not model_id or not isinstance(row, dict):
+            if not isinstance(model_id, str) or not model_id.strip() or not isinstance(row, dict):
+                if strict:
+                    raise ValueError(f"Invalid Antigravity model entry: {model_id!r}")
                 continue
-            internal = not row.get("displayName")
+            raw_display = row.get("displayName")
+            raw_max_tokens = row.get("maxTokens")
+            raw_max_output = row.get("maxOutputTokens")
+            if strict:
+                if raw_display is not None and not isinstance(raw_display, str):
+                    raise ValueError(f"Invalid displayName for Antigravity model {model_id!r}")
+                if raw_max_tokens is not None and (
+                    not isinstance(raw_max_tokens, int) or isinstance(raw_max_tokens, bool)
+                ):
+                    raise ValueError(f"Invalid maxTokens for Antigravity model {model_id!r}")
+                if raw_max_output is not None and (
+                    not isinstance(raw_max_output, int) or isinstance(raw_max_output, bool)
+                ):
+                    raise ValueError(f"Invalid maxOutputTokens for Antigravity model {model_id!r}")
+            internal = not raw_display
             out.append(
                 UpstreamModel(
                     id=str(model_id),
-                    display_name=None if internal else str(row["displayName"]),
+                    display_name=None if internal else str(raw_display),
                     context_window=(
-                        int(row["maxTokens"]) if isinstance(row.get("maxTokens"), int) else None
+                        int(raw_max_tokens)
+                        if isinstance(raw_max_tokens, int) and not isinstance(raw_max_tokens, bool)
+                        else None
                     ),
                     max_output=(
-                        int(row["maxOutputTokens"])
-                        if isinstance(row.get("maxOutputTokens"), int)
+                        int(raw_max_output)
+                        if isinstance(raw_max_output, int) and not isinstance(raw_max_output, bool)
                         else None
                     ),
                     internal=internal,

@@ -59,11 +59,14 @@ def _b64url_encode(data: bytes) -> str:
 
 
 def _derive_caller_hmac_key(admin_token: str | None = None) -> bytes | None:
-    """Derive a dedicated HMAC-SHA256 subkey from ``DALTON_BRIDGE_ADMIN_TOKEN`` via HKDF."""
+    """Derive a dedicated HMAC-SHA256 subkey from admin token via HKDF."""
     if admin_token is None:
-        from src.dalton.settings import get_dalton_bridge_admin_token
+        from src.dalton.settings import (
+            get_dalton_bridge_admin_token,
+            get_dalton_research_admin_token,
+        )
 
-        secret = get_dalton_bridge_admin_token()
+        secret = get_dalton_bridge_admin_token() or get_dalton_research_admin_token()
     else:
         secret = str(admin_token).strip()
     if not secret:

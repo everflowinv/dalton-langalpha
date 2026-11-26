@@ -220,12 +220,37 @@ def _call_wrapper(call_fn: Any, tool_name: str, arguments: dict[str, Any]) -> di
     }
 
 
-def call_bridge_jsonrpc(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
-    """Call one researchdata tool through the sandbox wrapper.
+def _load_connector_transport() -> Any | None:
+    import importlib.util
+    from pathlib import Path
 
-    `timeout` stays on the signature so existing callers match. The wrapper
-    does not apply it. The HTTP bridge override has been removed.
+    helper_path = (
+        Path(__file__).resolve().parents[2]
+        / "dalton-conventions"
+        / "scripts"
+        / "connector_transport.py"
+    )
+    if not helper_path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("_dalton_connector_transport", helper_path)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def call_bridge_jsonrpc(tool_name: str, arguments: dict[str, Any], timeout: int = 120) -> dict[str, Any]:
+    """Route per-source through `connector_transport.py` when a dedicated Batch 3 MCP server
+    is mounted AND exposes the requested tool & parameters, falling back to the legacy
+    `researchdata` wrapper for unmigrated routes (e.g. `alphaengine`) or pre-cutover workspaces.
     """
+    ct = _load_connector_transport()
+    if ct is not None:
+        server, mapped_tool, mapped_args = ct.resolve_dedicated_for_legacy_call(tool_name, arguments)
+        if server and mapped_tool:
+            return ct.call_connector_tool(server, mapped_tool, mapped_args)
+
     del timeout
     transport = resolve_researchdata_transport()
     if transport["mode"] == "wrapper":

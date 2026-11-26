@@ -50,7 +50,23 @@ def _setup_deploy_env(tmp_path: Path) -> dict[str, Path | str]:
     (seed / "web/.keep").write_text("")
     (seed / "app.py").write_text("v1\n")
     (seed / "scripts/dalton/build_frontend_prod.sh").write_text(
-        "#!/bin/bash\necho 'OK: Production bundle'\nexit 0\n"
+        """#!/bin/bash
+out_dir="web/dist"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out-dir) out_dir="$2"; shift ;;
+    --out-dir=*) out_dir="${1#--out-dir=}" ;;
+  esac
+  shift
+done
+mkdir -p "${out_dir}/assets" "${out_dir}/help"
+echo '<!doctype html><div id="root"></div>' > "${out_dir}/index.html"
+echo '{"build":"index-test.js"}' > "${out_dir}/version.json"
+echo 'console.log("ok")' > "${out_dir}/assets/index-test.js"
+echo '<h1>Help</h1>' > "${out_dir}/help/index.html"
+echo 'OK: Production bundle'
+exit 0
+"""
     )
     (seed / "scripts/dalton/check_public_edge.sh").write_text("#!/bin/bash\necho 'edge ok'\nexit 0\n")
     subprocess.run(["git", "-C", str(seed), "add", "."], check=True)
@@ -1083,6 +1099,19 @@ exit 0
 
     (seed1 / "scripts/dalton/build_frontend_prod.sh").write_text(
         """#!/bin/bash
+out_dir="web/dist"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out-dir) out_dir="$2"; shift ;;
+    --out-dir=*) out_dir="${1#--out-dir=}" ;;
+  esac
+  shift
+done
+mkdir -p "${out_dir}/assets" "${out_dir}/help"
+echo '<!doctype html><div id="root"></div>' > "${out_dir}/index.html"
+echo '{"build":"index-test.js"}' > "${out_dir}/version.json"
+echo 'console.log("ok")' > "${out_dir}/assets/index-test.js"
+echo '<h1>Help</h1>' > "${out_dir}/help/index.html"
 cat > src/dalton/migrations/versions/.env.d049.bak.py <<'EOF'
 revision = 'd049'
 down_revision = 'd040'
@@ -1131,6 +1160,19 @@ exit 0
 
     (seed2 / "scripts/dalton/build_frontend_prod.sh").write_text(
         """#!/bin/bash
+out_dir="web/dist"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out-dir) out_dir="$2"; shift ;;
+    --out-dir=*) out_dir="${1#--out-dir=}" ;;
+  esac
+  shift
+done
+mkdir -p "${out_dir}/assets" "${out_dir}/help"
+echo '<!doctype html><div id="root"></div>' > "${out_dir}/index.html"
+echo '{"build":"index-test.js"}' > "${out_dir}/version.json"
+echo 'console.log("ok")' > "${out_dir}/assets/index-test.js"
+echo '<h1>Help</h1>' > "${out_dir}/help/index.html"
 if [ ! -f src/dalton/migrations/versions/d049_mid_build.py ]; then
   cat > src/dalton/migrations/versions/d049_mid_build.py <<'EOF'
 revision = 'd049'

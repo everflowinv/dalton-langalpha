@@ -235,6 +235,14 @@ async def test_closed_switch_removed_target_and_eve_chat_are_skipped(
     assert eve["status"] == "skipped"
     assert eve["code"] == "eve_tracking_mirror_pending"
 
+    monkeypatch.setattr(
+        notify_dispatch,
+        "resolve_active_dalton_weixin_targets",
+        create_autospec(
+            notify_dispatch.resolve_active_dalton_weixin_targets,
+            return_value={"weixin:user:abc"},
+        ),
+    )
     weixin = await _plan(
         _completion_row("weixin:user:abc", base),
         targets=["weixin:user:abc"],

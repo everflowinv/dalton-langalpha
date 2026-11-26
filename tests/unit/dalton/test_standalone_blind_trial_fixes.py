@@ -367,6 +367,10 @@ class TestInitAndComposeSingleBuild:
             encoding="utf-8",
         )
         init_dst.chmod(0o755)
+        (inst / "scripts" / "standalone" / "env_tokens.sh").write_text(
+            (REPO_ROOT / "scripts" / "standalone" / "env_tokens.sh").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
         (inst / ".env.core.example").write_text(
             (REPO_ROOT / ".env.core.example").read_text(encoding="utf-8"),
             encoding="utf-8",

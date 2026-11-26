@@ -70,8 +70,14 @@ async def get_workspace_auto_ingest(workspace_id: str) -> bool:
 
 
 async def call_bridge_sales_notes_ingest(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-    """POST `payload` to `{bridge_url}/sales-notes/ingest` with the admin token."""
+    """POST `payload` to research-host `/ingest/sales-notes` (or legacy bridge `/sales-notes/ingest` before Everflow cutover)."""
     from src.dalton.capabilities import CapabilityId, has_capability
+    from src.dalton.profile import DeploymentProfile, resolve_profile
+    from src.dalton.settings import (
+        get_dalton_research_admin_token,
+        get_dalton_research_host_base_url,
+        has_explicit_research_host_url,
+    )
 
     if not has_capability(CapabilityId.SALES_NOTES):
         return 503, {
@@ -79,28 +85,57 @@ async def call_bridge_sales_notes_ingest(payload: dict[str, Any]) -> tuple[int, 
             "status": "capability_disabled",
             "error": "sales_notes capability is disabled.",
         }
-    bridge_url = get_dalton_bridge_base_url().rstrip("/")
-    if not bridge_url:
-        return 503, {
-            "ok": False,
-            "status": "config_error",
-            "error": "researchdata bridge URL is not configured on backend.",
+
+    use_research_host = (
+        has_explicit_research_host_url()
+        or resolve_profile() is DeploymentProfile.CORE
+        or not has_capability(CapabilityId.RESEARCHDATA_BRIDGE)
+    )
+    if use_research_host:
+        host_url = get_dalton_research_host_base_url().rstrip("/")
+        if not host_url:
+            return 503, {
+                "ok": False,
+                "status": "config_error",
+                "error": "research-host URL is not configured on backend.",
+            }
+        admin_token = get_dalton_research_admin_token()
+        if not admin_token:
+            return 500, {
+                "ok": False,
+                "status": "config_error",
+                "error": "DALTON_RESEARCH_ADMIN_TOKEN is not configured on backend.",
+            }
+        target_url = f"{host_url}/ingest/sales-notes"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {admin_token}",
+            "X-Dalton-Research-Admin-Token": admin_token,
         }
-    admin_token = get_dalton_bridge_admin_token()
-    if not admin_token:
-        return 500, {
-            "ok": False,
-            "status": "config_error",
-            "error": "DALTON_BRIDGE_ADMIN_TOKEN is not configured on backend.",
+    else:
+        bridge_url = get_dalton_bridge_base_url().rstrip("/")
+        if not bridge_url:
+            return 503, {
+                "ok": False,
+                "status": "config_error",
+                "error": "researchdata bridge URL is not configured on backend.",
+            }
+        admin_token = get_dalton_bridge_admin_token()
+        if not admin_token:
+            return 500, {
+                "ok": False,
+                "status": "config_error",
+                "error": "DALTON_BRIDGE_ADMIN_TOKEN is not configured on backend.",
+            }
+        target_url = f"{bridge_url}/sales-notes/ingest"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {admin_token}",
+            "X-Dalton-Bridge-Token": admin_token,
         }
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {admin_token}",
-        "X-Dalton-Bridge-Token": admin_token,
-    }
     async with httpx.AsyncClient(timeout=SALES_NOTES_HTTP_TIMEOUT_S, trust_env=False) as client:
         resp = await client.post(
-            f"{bridge_url}/sales-notes/ingest", json=payload, headers=headers
+            target_url, json=payload, headers=headers
         )
         try:
             data = resp.json()
@@ -110,7 +145,11 @@ async def call_bridge_sales_notes_ingest(payload: dict[str, Any]) -> tuple[int, 
             data = {
                 "ok": False,
                 "status": "http_error",
-                "error": f"Bridge returned HTTP {resp.status_code}",
+                "error": (
+                    f"Ingest service returned HTTP {resp.status_code}"
+                    if use_research_host
+                    else f"Bridge returned HTTP {resp.status_code}"
+                ),
             }
         return resp.status_code, data
 

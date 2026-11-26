@@ -17,6 +17,24 @@ const h = vi.hoisted(() => ({
   isLoaded: true,
   groups: [] as Array<{ chat_id: string; name: string }>,
   groupsError: null as ApiError | null,
+  bindingsError: null as Error | null,
+  weixinAccount: null as null | {
+    linked: boolean;
+    platform: 'weixin';
+    status: string;
+    channel_enabled: boolean;
+    allow_external: boolean;
+    member_allowed: boolean;
+    deny_reason: string | null;
+    account_id: string | null;
+    platform_user_id: string | null;
+    masked_ilink_user_id: string | null;
+    platform_username: string | null;
+    ilink_username: string | null;
+    active_push_ready: boolean;
+    last_inbound_at: string | null;
+    updated_at: string | null;
+  },
   fetchCount: 0,
   listeners: new Set<() => void>(),
   mutateAsync: vi.fn(async (patch: Record<string, unknown>) => {
@@ -66,6 +84,23 @@ vi.mock('@/pages/Settings/utils/daltonApi', () => ({
     h.fetchCount += 1;
     if (h.groupsError) throw h.groupsError;
     return { ok: true, groups: h.groups };
+  },
+  fetchDaltonChannelBindings: async () => {
+    if (h.bindingsError) throw h.bindingsError;
+    return {
+      user_id: 'u-1',
+      user_tier: 'internal',
+      home_workspace_id: 'home-ws',
+      bindings: {
+        feishu: { linked: false, platform: 'feishu', platform_user_id: null, platform_username: null, updated_at: null },
+        discord: { linked: false, platform: 'discord', platform_user_id: null, platform_username: null, updated_at: null },
+        weixin: { linked: h.weixinAccount?.linked === true, platform: 'weixin', platform_user_id: h.weixinAccount?.platform_user_id ?? null, platform_username: h.weixinAccount?.ilink_username ?? null, updated_at: null },
+      },
+      identities: {},
+      settings: { version: '1', apps: {} },
+      chat_bindings: [],
+      weixin_account: h.weixinAccount,
+    };
   },
 }));
 
@@ -159,6 +194,7 @@ describe('AutomationNotifyTargets', () => {
     h.isLoaded = true;
     h.groups = [];
     h.groupsError = null;
+    h.weixinAccount = null;
     h.fetchCount = 0;
     h.mutateAsync.mockClear();
   });
@@ -786,5 +822,414 @@ describe('AutomationNotifyTargets', () => {
     await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('保存推送目标失败'));
     expect(groupB).toHaveAttribute('aria-checked', 'true');
     expect(screen.getByRole('checkbox', { name: '飞书群 核心投研群' })).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('offers connected personal WeChat for selection without modifying global dalton_notify_targets', async () => {
+    h.groupsError = refusal(403);
+    h.preferences = prefsWith({ dalton_notify_targets: [] });
+    h.weixinAccount = {
+      linked: true,
+      platform: 'weixin',
+      status: 'active',
+      channel_enabled: true,
+      allow_external: true,
+      member_allowed: true,
+      deny_reason: null,
+      account_id: 'acc-wx-1',
+      platform_user_id: 'wx_user_01',
+      masked_ilink_user_id: '****r_01',
+      platform_username: 'MyWeChat',
+      ilink_username: 'MyWeChat',
+      active_push_ready: true,
+      last_inbound_at: null,
+      updated_at: null,
+    };
+
+    renderSelector();
+    const trigger = await screen.findByRole('button', {
+      name: '推送目标 dalton-googl-earn-2026q1-t0',
+    });
+    await act(async () => {
+      fireEvent.click(trigger);
+    });
+
+    const wxCheckbox = await screen.findByRole('checkbox', {
+      name: '个人目标 weixin:user:wx_user_01',
+    });
+    expect(wxCheckbox).toHaveAttribute('aria-checked', 'false');
+    expect(screen.getByText('MyWeChat')).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(wxCheckbox);
+    });
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: {
+          dalton_notify_routes: {
+            'dalton-googl-earn-2026q1-t0': ['weixin:user:wx_user_01'],
+          },
+        },
+      });
+    });
+  });
+
+  it('preserves existing Feishu group and Discord channel targets when toggling personal WeChat on an inherent-category route', async () => {
+    h.groups = GROUPS;
+    h.preferences = prefsWith({
+      dalton_notify_targets: ['feishu:user:ou_me_1'],
+      dalton_notify_routes: {
+        'dalton-googl-earn-2026q1-t0': [
+          'feishu:chat:oc_research_group',
+          'discord:channel:123456789012345678',
+        ],
+      },
+    });
+    h.weixinAccount = {
+      linked: true,
+      platform: 'weixin',
+      status: 'active',
+      channel_enabled: true,
+      allow_external: true,
+      member_allowed: true,
+      deny_reason: null,
+      account_id: 'acc-wx-1',
+      platform_user_id: 'wx_user_01',
+      masked_ilink_user_id: '****r_01',
+      platform_username: 'MyWeChat',
+      ilink_username: 'MyWeChat',
+      active_push_ready: true,
+      last_inbound_at: null,
+      updated_at: null,
+    };
+
+    renderSelector();
+    await act(async () => {
+      fireEvent.click(triggerButton());
+    });
+
+    const wxCheckbox = await screen.findByRole('checkbox', {
+      name: '个人目标 weixin:user:wx_user_01',
+    });
+    expect(wxCheckbox).toHaveAttribute('aria-checked', 'false');
+
+    // Toggle WeChat ON -> preserves Feishu group + Discord channel, does NOT modify dalton_notify_targets
+    await act(async () => {
+      fireEvent.click(wxCheckbox);
+    });
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenLastCalledWith({
+        model_preference: {
+          dalton_notify_routes: {
+            'dalton-googl-earn-2026q1-t0': [
+              'weixin:user:wx_user_01',
+              'feishu:chat:oc_research_group',
+              'discord:channel:123456789012345678',
+            ],
+          },
+        },
+      });
+    });
+
+    // Toggle WeChat OFF -> Feishu group + Discord channel remain intact
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole('checkbox', { name: '个人目标 weixin:user:wx_user_01' }),
+      );
+    });
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenLastCalledWith({
+        model_preference: {
+          dalton_notify_routes: {
+            'dalton-googl-earn-2026q1-t0': [
+              'feishu:chat:oc_research_group',
+              'discord:channel:123456789012345678',
+            ],
+          },
+        },
+      });
+    });
+  });
+
+  it('writes automation:<id> key when automation_id is present so same-named tasks do not share routes', async () => {
+    h.groupsError = refusal(403);
+    h.preferences = prefsWith({
+      dalton_notify_targets: ['feishu:user:ou_me_1'],
+      dalton_notify_routes: {},
+    });
+    h.weixinAccount = {
+      linked: true,
+      platform: 'weixin',
+      status: 'active',
+      channel_enabled: true,
+      allow_external: true,
+      member_allowed: true,
+      deny_reason: null,
+      account_id: 'acc-wx-1',
+      platform_user_id: 'wx_user_01',
+      masked_ilink_user_id: '****r_01',
+      platform_username: 'MyWeChat',
+      ilink_username: 'MyWeChat',
+      active_push_ready: true,
+      last_inbound_at: null,
+      updated_at: null,
+    };
+
+    const taskA = {
+      automation_id: 'auto-id-a',
+      name: 'dalton-googl-earn-2026q1-t0',
+      dalton_notify_category: 'earnings_t0',
+    };
+    const taskB = {
+      automation_id: 'auto-id-b',
+      name: 'dalton-googl-earn-2026q1-t0',
+      dalton_notify_category: 'earnings_t0',
+    };
+
+    renderWithProviders(<AutomationNotifyTargets automation={taskA} />);
+    await act(async () => {
+      fireEvent.click(triggerButton());
+    });
+    const wxCheckbox = await screen.findByRole('checkbox', {
+      name: '个人目标 weixin:user:wx_user_01',
+    });
+    await act(async () => {
+      fireEvent.click(wxCheckbox);
+    });
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: {
+          dalton_notify_routes: {
+            'automation:auto-id-a': ['feishu:user:ou_me_1', 'weixin:user:wx_user_01'],
+          },
+        },
+      });
+    });
+
+    // Same-named task B does NOT match automation:auto-id-a; legacy name key only serves as fallback
+    expect(resolveNotifyRouteEntry(taskB, { 'automation:auto-id-a': ['weixin:user:wx_user_01'] })).toBeNull();
+    expect(
+      resolveNotifyRouteEntry(taskB, { 'dalton-googl-earn-2026q1-t0': ['feishu:user:ou_me_1'] }),
+    ).toEqual({ list: ['feishu:user:ou_me_1'], source: 'task' });
+  });
+
+  it('renders discord:channel: as selected group target on custom tasks and preserves it when toggling another target', async () => {
+    h.groupsError = refusal(403);
+    h.preferences = prefsWith({
+      dalton_notify_targets: ['feishu:user:ou_me_1'],
+      dalton_notify_routes: {},
+    });
+    h.weixinAccount = {
+      linked: true,
+      platform: 'weixin',
+      status: 'active',
+      channel_enabled: true,
+      allow_external: true,
+      member_allowed: true,
+      deny_reason: null,
+      account_id: 'acc-wx-1',
+      platform_user_id: 'wx_user_01',
+      masked_ilink_user_id: '****r_01',
+      platform_username: 'MyWeChat',
+      ilink_username: 'MyWeChat',
+      active_push_ready: true,
+      last_inbound_at: null,
+      updated_at: null,
+    };
+
+    const customDiscordOnly = {
+      automation_id: 'auto-discord-only',
+      name: 'Discord Report',
+      dalton_notify_category: 'custom',
+      dalton_notify_route_targets: ['discord:channel:123456789012345678'],
+    };
+
+    renderWithProviders(<AutomationNotifyTargets automation={customDiscordOnly} />);
+    const btn = screen.getByRole('button', { name: '推送目标 Discord Report' });
+    // Collapsed label counts discord:channel: as selected (NOT "Not pushed")
+    expect(btn).not.toHaveTextContent('Not pushed');
+    expect(btn).toHaveTextContent('discord:channel:123456789012345678');
+
+    await act(async () => {
+      fireEvent.click(btn);
+    });
+    // Must NOT appear under personal options; appears checked under Discord channels
+    expect(
+      screen.queryByRole('checkbox', { name: '个人目标 discord:channel:123456789012345678' }),
+    ).not.toBeInTheDocument();
+    const dcCheckbox = screen.getByRole('checkbox', {
+      name: 'Discord 频道 123456789012345678',
+    });
+    expect(dcCheckbox).toHaveAttribute('aria-checked', 'true');
+
+    // Clicking another target keeps the Discord channel intact
+    const wxCheckbox = await screen.findByRole('checkbox', {
+      name: '个人目标 weixin:user:wx_user_01',
+    });
+    await act(async () => {
+      fireEvent.click(wxCheckbox);
+    });
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: {
+          dalton_notify_routes: {
+            'automation:auto-discord-only': [
+              'weixin:user:wx_user_01',
+              'discord:channel:123456789012345678',
+            ],
+          },
+        },
+      });
+    });
+  });
+
+  it('strips disconnected or replaced personal WeChat target from route before saving', async () => {
+    h.groupsError = refusal(403);
+    h.preferences = prefsWith({
+      dalton_notify_targets: ['feishu:user:ou_me_1'],
+      dalton_notify_routes: {
+        'dalton-googl-earn-2026q1-t0': ['feishu:user:ou_me_1', 'weixin:user:wx_old_unbound'],
+      },
+    });
+    // User rebound to a different WeChat account
+    h.weixinAccount = {
+      linked: true,
+      platform: 'weixin',
+      status: 'active',
+      channel_enabled: true,
+      allow_external: true,
+      member_allowed: true,
+      deny_reason: null,
+      account_id: 'acc-wx-2',
+      platform_user_id: 'wx_new_active',
+      masked_ilink_user_id: '****tive',
+      platform_username: 'NewWeChat',
+      ilink_username: 'NewWeChat',
+      active_push_ready: true,
+      last_inbound_at: null,
+      updated_at: null,
+    };
+
+    renderSelector();
+    await act(async () => {
+      fireEvent.click(triggerButton());
+    });
+    const newWxCheckbox = await screen.findByRole('checkbox', {
+      name: '个人目标 weixin:user:wx_new_active',
+    });
+    await act(async () => {
+      fireEvent.click(newWxCheckbox);
+    });
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: {
+          dalton_notify_routes: {
+            'dalton-googl-earn-2026q1-t0': [
+              'feishu:user:ou_me_1',
+              'weixin:user:wx_new_active',
+            ],
+          },
+        },
+      });
+    });
+  });
+
+  it('preserves existing personal WeChat target when bindings query fails instead of stripping it', async () => {
+    h.groupsError = refusal(403);
+    h.bindingsError = new Error('temporary network error');
+    h.preferences = prefsWith({
+      dalton_notify_targets: ['feishu:user:ou_me_1', 'feishu:user:ou_backup_2'],
+      dalton_notify_routes: {
+        'dalton-googl-earn-2026q1-t0': ['feishu:user:ou_me_1', 'weixin:user:wx_active_1'],
+      },
+    });
+
+    try {
+      renderSelector();
+      await act(async () => {
+        fireEvent.click(triggerButton());
+      });
+      const backupCheckbox = await screen.findByRole('checkbox', {
+        name: '个人目标 feishu:user:ou_backup_2',
+      });
+      await act(async () => {
+        fireEvent.click(backupCheckbox);
+      });
+      await waitFor(() => {
+        expect(h.mutateAsync).toHaveBeenCalledWith({
+          model_preference: {
+            dalton_notify_routes: {
+              'dalton-googl-earn-2026q1-t0': [
+                'feishu:user:ou_me_1',
+                'weixin:user:wx_active_1',
+                'feishu:user:ou_backup_2',
+              ],
+            },
+          },
+        });
+      });
+    } finally {
+      h.bindingsError = null;
+    }
+  });
+
+  it('inherent-category AutomationNotifyToggle reads and writes automation:<id> override matching dispatch', async () => {
+    const inherentWithId = {
+      automation_id: 'auto-earn-1',
+      name: 'dalton-googl-earn-2026q1-t0',
+      dalton_notify_category: 'earnings_t0',
+      dalton_notify_effective: true,
+      dalton_notify_source: 'task',
+    };
+    // Case 1: ID override is true while legacy name override is false -> toggle shows ON and clicking writes ID=false
+    h.preferences = prefsWith({
+      dalton_notify_overrides: {
+        'automation:auto-earn-1': true,
+        'dalton-googl-earn-2026q1-t0': false,
+      },
+    });
+    const { unmount } = renderWithProviders(
+      <AutomationNotifyToggle automation={inherentWithId} />,
+    );
+    const toggle1 = screen.getByRole('switch', { name: '推送 dalton-googl-earn-2026q1-t0' });
+    expect(toggle1).toHaveAttribute('aria-checked', 'true');
+    await act(async () => {
+      fireEvent.click(toggle1);
+    });
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: {
+          dalton_notify_overrides: {
+            'automation:auto-earn-1': false,
+          },
+        },
+      });
+    });
+    expect(toggle1).toHaveAttribute('aria-checked', 'false');
+    unmount();
+
+    // Case 2: ID override is false while legacy name override is true -> toggle shows OFF and clicking writes ID=true
+    h.mutateAsync.mockClear();
+    h.preferences = prefsWith({
+      dalton_notify_overrides: {
+        'automation:auto-earn-1': false,
+        'dalton-googl-earn-2026q1-t0': true,
+      },
+    });
+    renderWithProviders(<AutomationNotifyToggle automation={inherentWithId} />);
+    const toggle2 = screen.getByRole('switch', { name: '推送 dalton-googl-earn-2026q1-t0' });
+    expect(toggle2).toHaveAttribute('aria-checked', 'false');
+    await act(async () => {
+      fireEvent.click(toggle2);
+    });
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: {
+          dalton_notify_overrides: {
+            'automation:auto-earn-1': true,
+          },
+        },
+      });
+    });
+    expect(toggle2).toHaveAttribute('aria-checked', 'true');
   });
 });

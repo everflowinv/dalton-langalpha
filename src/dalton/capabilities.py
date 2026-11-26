@@ -147,40 +147,40 @@ _RAW_CAPABILITY_SPECS: tuple[CapabilitySpec, ...] = (
     ),
     CapabilitySpec(
         id=CapabilityId.GUIDEPOINT,
-        description="专家访谈库（依赖 researchdata_bridge）",
-        depends_on=(CapabilityId.RESEARCHDATA_BRIDGE,),
+        description="专家访谈库（独立研究连接器）",
+        depends_on=(),
         everflow_default=True,
         core_default=False,
         yaml_keys=("capabilities.guidepoint",),
     ),
     CapabilitySpec(
         id=CapabilityId.COMPANY_WIKI,
-        description="内部 Wiki 读写（依赖 researchdata_bridge）",
-        depends_on=(CapabilityId.RESEARCHDATA_BRIDGE,),
+        description="内部 Wiki 读写（开源研究宿主连接器）",
+        depends_on=(),
         everflow_default=True,
-        core_default=False,
+        core_default=True,
         yaml_keys=("capabilities.company_wiki",),
     ),
     CapabilitySpec(
         id=CapabilityId.SALES_NOTES,
-        description="销售笔记检索与入库（依赖 researchdata_bridge）",
-        depends_on=(CapabilityId.RESEARCHDATA_BRIDGE,),
+        description="销售笔记检索与入库（独立研究连接器）",
+        depends_on=(),
         everflow_default=True,
         core_default=False,
         yaml_keys=("capabilities.sales_notes",),
     ),
     CapabilitySpec(
         id=CapabilityId.TMTB,
-        description="TMT 总结库（依赖 researchdata_bridge）",
-        depends_on=(CapabilityId.RESEARCHDATA_BRIDGE,),
+        description="TMT 总结库（独立研究连接器）",
+        depends_on=(),
         everflow_default=True,
         core_default=False,
         yaml_keys=("capabilities.tmtb",),
     ),
     CapabilitySpec(
         id=CapabilityId.FUNDA_AI,
-        description="FUNDA AI 研究库（依赖 researchdata_bridge）",
-        depends_on=(CapabilityId.RESEARCHDATA_BRIDGE,),
+        description="FUNDA AI 研究库（独立研究连接器）",
+        depends_on=(),
         everflow_default=True,
         core_default=False,
         yaml_keys=("capabilities.funda_ai",),
@@ -660,10 +660,61 @@ def is_messaging_gateway_allowed() -> bool:
 # Built-in MCP server & data-map route capability bindings
 # ---------------------------------------------------------------------------
 
-MCP_SERVER_CAPABILITY_MAP: Mapping[str, CapabilityId | None] = MappingProxyType(
+CapabilityRequirement = CapabilityId | tuple[CapabilityId, ...] | None
+
+# Internal research source capabilities that may power `dalton_research_all` (OR semantics).
+INTERNAL_RESEARCH_CAPABILITIES: tuple[CapabilityId, ...] = (
+    CapabilityId.COMPANY_WIKI,
+    CapabilityId.SALES_NOTES,
+    CapabilityId.TMTB,
+    CapabilityId.FUNDA_AI,
+    CapabilityId.GUIDEPOINT,
+    CapabilityId.ALPHAENGINE,
+)
+
+# Private commercial connector bundles loaded only via `DALTON_EXTRA_PLUGINS_DIR`
+# (never shipped under public `plugins/` or in Standalone Core releases).
+EXTRA_ONLY_BUNDLED_PLUGINS: frozenset[str] = frozenset(
+    {
+        "dalton-guidepoint",
+        "dalton-sales-notes",
+        "dalton-tmtb",
+        "dalton-funda-ai",
+    }
+)
+
+
+def is_capability_requirement_satisfied(
+    req: CapabilityRequirement,
+    active: frozenset[CapabilityId],
+) -> bool:
+    """Evaluate a capability binding: ``None`` -> True; single -> AND; tuple -> OR (any enabled)."""
+    if req is None:
+        return True
+    if isinstance(req, tuple):
+        return any(cap in active for cap in req)
+    return req in active
+
+
+def has_any_research_connector_capability(
+    capabilities: frozenset[CapabilityId] | None = None,
+) -> bool:
+    """Return True iff at least one internal research source capability is enabled."""
+    active = effective_capabilities() if capabilities is None else capabilities
+    return any(cap in active for cap in INTERNAL_RESEARCH_CAPABILITIES)
+
+
+MCP_SERVER_CAPABILITY_MAP: Mapping[str, CapabilityRequirement] = MappingProxyType(
     {
         "researchdata": CapabilityId.RESEARCHDATA_BRIDGE,
         "dalton_sec": CORE_CAPABILITY,
+        "dalton_macro": CORE_CAPABILITY,
+        "dalton_company_wiki": CapabilityId.COMPANY_WIKI,
+        "dalton_research_all": INTERNAL_RESEARCH_CAPABILITIES,
+        "dalton_guidepoint": CapabilityId.GUIDEPOINT,
+        "dalton_sales_notes": CapabilityId.SALES_NOTES,
+        "dalton_tmtb": CapabilityId.TMTB,
+        "dalton_funda_ai": CapabilityId.FUNDA_AI,
         "price_data": CORE_CAPABILITY,
         "fundamentals": CORE_CAPABILITY,
         "macro": CORE_CAPABILITY,
@@ -680,13 +731,21 @@ MCP_SERVER_CAPABILITY_MAP: Mapping[str, CapabilityId | None] = MappingProxyType(
 )
 
 # Canonical bundled plugin registry: every shipped package under `plugins/`
-# must be explicitly classified as CORE_CAPABILITY (None) or a CapabilityId.
-BUNDLED_PLUGIN_CAPABILITY_MAP: Mapping[str, CapabilityId | None] = MappingProxyType(
+# (and commercial extra bundles loaded via `DALTON_EXTRA_PLUGINS_DIR`) must be
+# explicitly classified as CORE_CAPABILITY (None), a CapabilityId, or an OR tuple.
+BUNDLED_PLUGIN_CAPABILITY_MAP: Mapping[str, CapabilityRequirement] = MappingProxyType(
     {
         "alternative-data": CORE_CAPABILITY,
         "dalton": CORE_CAPABILITY,
         "dalton-data": CapabilityId.RESEARCHDATA_BRIDGE,
         "dalton-sec": CORE_CAPABILITY,
+        "dalton-macro": CORE_CAPABILITY,
+        "dalton-company-wiki": CapabilityId.COMPANY_WIKI,
+        "dalton-research-all": INTERNAL_RESEARCH_CAPABILITIES,
+        "dalton-guidepoint": CapabilityId.GUIDEPOINT,
+        "dalton-sales-notes": CapabilityId.SALES_NOTES,
+        "dalton-tmtb": CapabilityId.TMTB,
+        "dalton-funda-ai": CapabilityId.FUNDA_AI,
         "firecrawl": CORE_CAPABILITY,
         "langalpha-deliverables": CORE_CAPABILITY,
         "langalpha-market-data": CORE_CAPABILITY,
@@ -697,20 +756,81 @@ BUNDLED_PLUGIN_CAPABILITY_MAP: Mapping[str, CapabilityId | None] = MappingProxyT
 )
 
 
+# Batch 3 split MCP servers / bundled plugins: enabled by default in Core
+# (subject to their capability requirement), and opted-in in Everflow only once
+# `DALTON_RESEARCH_HOST_URL` (or `DALTON_RESEARCH_HOST_BASE_URL`) is explicitly
+# set in `.env` during cutover (§0.2 #6 single authoritative handler).
+BATCH3_CONNECTOR_MCP_SERVERS: frozenset[str] = frozenset(
+    {
+        "dalton_macro",
+        "dalton_company_wiki",
+        "dalton_research_all",
+        "dalton_guidepoint",
+        "dalton_sales_notes",
+        "dalton_tmtb",
+        "dalton_funda_ai",
+    }
+)
+
+BATCH3_CONNECTOR_BUNDLED_PLUGINS: frozenset[str] = frozenset(
+    {
+        "dalton-macro",
+        "dalton-company-wiki",
+        "dalton-research-all",
+        "dalton-guidepoint",
+        "dalton-sales-notes",
+        "dalton-tmtb",
+        "dalton-funda-ai",
+    }
+)
+
+
+def is_batch3_connectors_enabled(
+    *,
+    profile: DeploymentProfile | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Return True when Batch 3 split MCP connectors should be mounted.
+
+    - ``DeploymentProfile.CORE``: always True (Core ships and uses the split
+      public connectors by default, subject to each connector's capability).
+    - ``DeploymentProfile.EVERFLOW``: False by default so pre-cutover Everflow
+      keeps legacy ``researchdata`` as the sole authoritative handler; becomes
+      True once ``DALTON_RESEARCH_HOST_URL`` (or ``DALTON_RESEARCH_HOST_BASE_URL``)
+      is explicitly set in ``.env`` by ``switch_research_host.sh --switch``.
+    """
+    from src.dalton.settings import has_explicit_research_host_url
+
+    env = os.environ if environ is None else environ
+    active_profile = (
+        resolve_profile(
+            app_env=env.get("APP_ENV", "") if environ is not None else None,
+            dalton_profile=env.get("DALTON_PROFILE", "") if environ is not None else None,
+        )
+        if profile is None
+        else profile
+    )
+    if active_profile is DeploymentProfile.CORE:
+        return True
+    return has_explicit_research_host_url(env)
+
+
 def is_mcp_server_enabled_by_capability(
     server_name: str | None,
     *,
     capabilities: frozenset[CapabilityId] | None = None,
 ) -> bool:
-    """Return True iff the named MCP server has no disabled capability requirement."""
+    """Return True iff the named MCP server is active under profile cutover and capabilities."""
     cleaned = str(server_name or "").strip()
     if not cleaned:
         return True
+    if cleaned in BATCH3_CONNECTOR_MCP_SERVERS and not is_batch3_connectors_enabled():
+        return False
     req = MCP_SERVER_CAPABILITY_MAP.get(cleaned)
     if req is None:
         return True
     active = effective_capabilities() if capabilities is None else capabilities
-    return req in active
+    return is_capability_requirement_satisfied(req, active)
 
 
 def is_bundled_plugin_enabled_by_capability(
@@ -718,7 +838,7 @@ def is_bundled_plugin_enabled_by_capability(
     *,
     capabilities: frozenset[CapabilityId] | None = None,
 ) -> bool:
-    """Return True iff the named bundled plugin has no disabled capability requirement.
+    """Return True iff the named bundled plugin is active under profile cutover and capabilities.
 
     Accepts both manifest names (``dalton-data``) and directory names
     (``dalton_data``) so raw directory reads and API lookups always agree.
@@ -726,13 +846,16 @@ def is_bundled_plugin_enabled_by_capability(
     cleaned = str(bundle_name or "").strip()
     if not cleaned:
         return True
+    normalized = cleaned.replace("_", "-") if "_" in cleaned else cleaned
+    if normalized in BATCH3_CONNECTOR_BUNDLED_PLUGINS and not is_batch3_connectors_enabled():
+        return False
     req = BUNDLED_PLUGIN_CAPABILITY_MAP.get(cleaned)
     if req is None and "_" in cleaned:
-        req = BUNDLED_PLUGIN_CAPABILITY_MAP.get(cleaned.replace("_", "-"))
+        req = BUNDLED_PLUGIN_CAPABILITY_MAP.get(normalized)
     if req is None:
         return True
     active = effective_capabilities() if capabilities is None else capabilities
-    return req in active
+    return is_capability_requirement_satisfied(req, active)
 
 
 def filter_mcp_servers_by_capability(
@@ -782,8 +905,7 @@ def filter_reconnectable_builtin_mcp(failed_servers: Iterable[str] | None) -> se
     for name in failed_servers:
         if not isinstance(name, str) or not name:
             continue
-        req = MCP_SERVER_CAPABILITY_MAP.get(name.strip())
-        if req is None or req in active:
+        if is_mcp_server_enabled_by_capability(name.strip(), capabilities=active):
             eligible.add(name)
     return eligible
 
@@ -832,18 +954,35 @@ def start_mcp_builtin_reconnect_task(
     return task
 
 
-BRIDGE_ROUTE_CAPABILITY_MAP: Mapping[str, CapabilityId] = MappingProxyType(
+BRIDGE_ROUTE_CAPABILITY_MAP: Mapping[str, CapabilityRequirement] = MappingProxyType(
     {
+        "all": INTERNAL_RESEARCH_CAPABILITIES,
         "alphaengine": CapabilityId.ALPHAENGINE,
         "transcript": CapabilityId.ALPHAENGINE,
         "guidepoint": CapabilityId.GUIDEPOINT,
         "company-wiki": CapabilityId.COMPANY_WIKI,
         "sales-notes": CapabilityId.SALES_NOTES,
+        "sales-mail": (CapabilityId.SALES_NOTES, CapabilityId.TMTB),
         "tmtb": CapabilityId.TMTB,
         "funda-ai": CapabilityId.FUNDA_AI,
+        "tmeet": CapabilityId.FUND_AUTOMATIONS,
+        "gcal": CapabilityId.FUND_AUTOMATIONS,
         "discord-history": CapabilityId.CHANNEL_DISCORD,
     }
 )
+
+
+def is_research_source_enabled(
+    source_id: str,
+    *,
+    capabilities: frozenset[CapabilityId] | None = None,
+) -> bool:
+    """Return True iff the given research connector/source capability is enabled (independent of legacy bridge)."""
+    active = effective_capabilities() if capabilities is None else capabilities
+    req = BRIDGE_ROUTE_CAPABILITY_MAP.get(str(source_id or "").strip())
+    if req is None:
+        return False
+    return is_capability_requirement_satisfied(req, active)
 
 
 def is_bridge_route_enabled(
@@ -857,7 +996,7 @@ def is_bridge_route_enabled(
         return False
     req = BRIDGE_ROUTE_CAPABILITY_MAP.get(str(route_id or "").strip())
     if req is not None:
-        return req in active
+        return is_capability_requirement_satisfied(req, active)
     return True
 
 
@@ -1134,6 +1273,17 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("chat_uploads.py", "download_sandbox_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "get_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "cancel_chat_upload_endpoint"): CORE_CAPABILITY,
+        # --- research_host/app.py (standalone research-host service) ---
+        ("research_host/app.py", "healthz"): CORE_CAPABILITY,
+        ("research_host/app.py", "get_drain"): CORE_CAPABILITY,
+        ("research_host/app.py", "set_drain"): CORE_CAPABILITY,
+        ("research_host/app.py", "get_wiki_pause_writes"): CapabilityId.COMPANY_WIKI,
+        ("research_host/app.py", "set_wiki_pause_writes"): CapabilityId.COMPANY_WIKI,
+        ("research_host/app.py", "mcp_endpoint"): INTERNAL_RESEARCH_CAPABILITIES,
+        ("research_host/app.py", "ingest_endpoint"): (
+            CapabilityId.COMPANY_WIKI,
+            CapabilityId.SALES_NOTES,
+        ),
     }
 )
 
