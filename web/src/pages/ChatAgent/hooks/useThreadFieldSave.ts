@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { toast } from '@/components/ui/use-toast';
-// DALTON-HOOK(antigravity-series): gate chained extraUpdates rollback preservation to Dalton builds
+// DALTON-HOOK(antigravity-series): gate chained extraUpdates rollback preservation & peer effort inspection to Dalton builds
 import { isDaltonBuild } from '@/config/brand';
+import { hasPendingModelEffortUpdate } from '@/lib/dalton/threadFieldSaveDalton';
 import { queryKeys } from '@/lib/queryKeys';
 import { threadFieldMutationKey, type ThreadField } from '@/lib/threadFieldMutations';
 import type { Thread } from '@/types/api';
@@ -92,18 +93,6 @@ export function useThreadFieldSave<F extends ThreadField>({
   const scopeId = isDaltonBuild && isModelOrEffortField
     ? `thread-field:model-effort:${threadId ?? ''}`
     : `thread-field:${field}:${threadId ?? ''}`;
-
-  // DALTON-HOOK(antigravity-series): check whether a queued llm_model mutation actually modifies reasoning_effort (e.g. Antigravity atomic clear) so a failed effort PATCH still rolls back immediately behind a plain model switch
-  const hasPendingModelEffortUpdate = useCallback((id: string) => (
-    isDaltonBuild
-    && field === 'reasoning_effort'
-    && queryClient.getMutationCache()
-      .findAll({ mutationKey: threadFieldMutationKey(id, 'llm_model'), status: 'pending' })
-      .some((m) => {
-        const vars = m.state.variables as ThreadFieldSave<unknown> | undefined;
-        return Boolean(vars?.extraUpdates && 'reasoning_effort' in vars.extraUpdates);
-      })
-  ), [field, queryClient]);
 
   const { mutateAsync } = useMutation({
     mutationKey: threadFieldMutationKey(threadId ?? '', field),
@@ -207,7 +196,7 @@ export function useThreadFieldSave<F extends ThreadField>({
       const restored = confirmed.has(save.threadId) ? confirmed.get(save.threadId) : context?.previous;
       // DALTON-HOOK(antigravity-series): respect serialized peer llm_model/reasoning_effort mutations and use latest confirmedEffort on rollback (only skip effort rollback when a queued model PATCH itself mutates reasoning_effort)
       const effortMap = isDaltonBuild && isModelOrEffortField ? getConfirmedEffortMap(queryClient) : null;
-      const modelMutatesEffort = hasPendingModelEffortUpdate(save.threadId);
+      const modelMutatesEffort = hasPendingModelEffortUpdate(queryClient, save.threadId, field);
       const effortOut = isDaltonBuild && field === 'llm_model'
         && queryClient.isMutating({ mutationKey: threadFieldMutationKey(save.threadId, 'reasoning_effort') }) > 0;
       if (restored && !modelMutatesEffort) {
@@ -241,7 +230,7 @@ export function useThreadFieldSave<F extends ThreadField>({
       confirmedRef.current.delete(id);
       const modelOut = isDaltonBuild && field === 'reasoning_effort'
         && queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, 'llm_model') }) > 0;
-      const modelMutatesEffort = hasPendingModelEffortUpdate(id);
+      const modelMutatesEffort = hasPendingModelEffortUpdate(queryClient, id, field);
       const effortOut = isDaltonBuild && field === 'llm_model'
         && queryClient.isMutating({ mutationKey: threadFieldMutationKey(id, 'reasoning_effort') }) > 0;
       if (isDaltonBuild && isModelOrEffortField && !modelOut && !effortOut) {

@@ -6,6 +6,8 @@
  */
 import { vi, type Mock } from 'vitest';
 import { act } from '@testing-library/react';
+// DALTON-HOOK(antigravity-series): constrain sendHitlResponse mock in harness to its real signature
+import type { sendHitlResponse as sendHitlResponseApi } from '../../utils/api';
 
 /**
  * Mock module shape for `../../utils/api` used by all useChatMessages suites.
@@ -16,7 +18,8 @@ export function apiMockModule<T extends Record<string, unknown>>(overrides = {} 
   return {
     sendChatMessageStream: vi.fn(),
     sendRetryStream: vi.fn(),
-    sendHitlResponse: vi.fn(),
+    // DALTON-HOOK(antigravity-series): type sendHitlResponse mock against the real API signature
+    sendHitlResponse: vi.fn<typeof sendHitlResponseApi>(),
     cancelWorkflow: vi.fn().mockResolvedValue({ cancelled: true, message: 'ok' }),
     replayThreadHistory: vi.fn().mockResolvedValue(undefined),
     getWorkflowStatus: vi.fn().mockResolvedValue({ can_reconnect: false, status: 'completed' }),

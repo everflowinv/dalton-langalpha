@@ -19,6 +19,7 @@ import { CLAUDE_CODE } from '@/lib/claudeCode';
 // DALTON-HOOK(antigravity-series): buildSeriesCatalog & catalog types for Antigravity series tests
 import { buildSeriesCatalog, type AntigravitySeriesCatalog } from '@/lib/antigravitySeries';
 import { useThreadModel } from '../useThreadModel';
+import { useThreadTuning } from '../useThreadTuning';
 
 const mocks = vi.hoisted(() => ({
   getThread: vi.fn(),
@@ -2266,8 +2267,8 @@ describe('useThreadModel', () => {
       expect(result.current.sendModel).toBeNull();
     });
 
-    // DALTON-HOOK(antigravity-series): Q2b — pre-id Antigravity pick during first-turn creation must defer onSettled until the turn-end PATCH settles so failure restores just-picked effort
-    it('restores just-picked effort via onSettled(false) when a pre-id Antigravity pick fails its first-turn deferred PATCH', async () => {
+    // DALTON-HOOK(antigravity-series): Q2b — real useThreadModel + useThreadTuning integration: pre-id Antigravity pick during first-turn creation must not standalone-PATCH effort=null and must restore effort when the deferred model PATCH fails
+    it('restores just-picked effort and prevents premature standalone effort PATCH across null->id creation when a pre-id Antigravity deferred PATCH fails (real model + tuning hooks)', async () => {
       mocks.seriesCatalog = NEON_CATALOG;
       mocks.rawMetadata = NEON_RAW_META;
       mocks.catalogModelNames = new Set([
@@ -2277,45 +2278,83 @@ describe('useThreadModel', () => {
       ]);
       mocks.sharedEntry = null;
 
-      const onSettled = vi.fn();
-      const { result, rerender } = setup(
-        { threadId: '__default__', isLoading: false, initialModel: 'model-a', workspaceId: 'ws-personal', activeTurnModel: null },
-        null,
+      const queryClient = createTestQueryClient();
+      type CombinedProps = {
+        threadId: string;
+        isLoading: boolean;
+        initialModel: string | null;
+        activeTurnModel: { model: string | null; pickSeq?: number | null; admitted?: boolean } | null;
+      };
+      const initial: CombinedProps = {
+        threadId: '__default__',
+        isLoading: false,
+        initialModel: 'model-a',
+        activeTurnModel: null,
+      };
+      const { result, rerender } = renderHookWithProviders(
+        (p: CombinedProps = initial) => ({
+          model: useThreadModel({
+            threadId: p.threadId,
+            isLoading: p.isLoading,
+            initialModel: p.initialModel,
+            workspaceId: 'ws-personal',
+            activeTurnModel: p.activeTurnModel,
+          }),
+          tuning: useThreadTuning({
+            threadId: p.threadId,
+            workspaceId: 'ws-personal',
+          }),
+        }),
+        { queryClient },
       );
 
-      // First turn starts before thread id returns (sent with model-a).
+      // 1) User picks effort='high' before the first send.
+      await act(async () => {
+        await result.current.tuning.setReasoningEffort('high');
+      });
+      expect(result.current.tuning.tuning.reasoningEffort).toBe('high');
+      expect(result.current.tuning.toSend.reasoningEffortOverride).toBe('high');
+
+      // 2) First turn starts before thread id returns (sent with model-a & reasoningEffortOverride='high').
       rerender({
         threadId: '__default__',
         isLoading: true,
         initialModel: 'model-a',
-        workspaceId: 'ws-personal',
         activeTurnModel: { model: 'model-a', pickSeq: null, admitted: false },
       });
 
-      // User picks Antigravity before thread id returns.
+      // 3) While threadId is still null, user switches to Antigravity (wired just like ChatView/MarketChatPanel).
       await act(async () => {
-        await result.current.pickModel('gemini-4-neon-medium-oauth', { onSettled });
+        const effortClear = result.current.tuning.clearLocalEffort();
+        await result.current.model.pickModel('gemini-4-neon-medium-oauth', {
+          onSettled: (saved) => {
+            if (saved) effortClear.confirm();
+            else effortClear();
+          },
+        });
       });
-      // Must NOT confirm early before the deferred first-turn PATCH has even run.
-      expect(onSettled).not.toHaveBeenCalled();
+      expect(result.current.model.model).toBe('gemini-4-neon-medium-oauth');
+      expect(result.current.tuning.tuning.reasoningEffort).toBeNull();
 
-      // Thread id arrives mid-turn; server created the row with first-send model-a and reasoning_effort: 'high'.
-      mocks.getThread.mockResolvedValue({ ...row('model-a'), reasoning_effort: 'high' } as Thread);
+      // 4) Thread id arrives mid-turn (null -> THREAD); server created the row with model-a & reasoning_effort: 'high'.
+      const createdRow = { ...row('model-a'), reasoning_effort: 'high', fast_mode: null } as Thread;
+      mocks.getThread.mockResolvedValue(createdRow);
       rerender({
         threadId: THREAD,
         isLoading: true,
         initialModel: 'model-a',
-        workspaceId: 'ws-personal',
         activeTurnModel: { model: 'model-a', pickSeq: null, admitted: true },
       });
+      await waitFor(() => expect(queryClient.getQueryData<Thread>(queryKeys.threads.detail(THREAD))).toEqual(createdRow));
+      // Tuning hook must NOT fire a standalone PATCH { reasoning_effort: null } for the temporary clear!
+      expect(mocks.updateThread).not.toHaveBeenCalled();
 
-      // Turn ends; reread returns model-a with reasoning_effort: 'high'; deferred PATCH fails.
+      // 5) Turn ends; reread returns model-a + reasoning_effort: 'high'; deferred model PATCH fails.
       mocks.updateThread.mockRejectedValueOnce(failure());
       rerender({
         threadId: THREAD,
         isLoading: false,
         initialModel: 'model-a',
-        workspaceId: 'ws-personal',
         activeTurnModel: null,
       });
 
@@ -2323,8 +2362,149 @@ describe('useThreadModel', () => {
         THREAD,
         { llm_model: 'gemini-4-neon-medium-oauth', reasoning_effort: null },
       ));
+      await waitFor(() => expect(result.current.model.model).toBe('model-a'));
+      // Clear handle followed null->THREAD and restored local effort to 'high'; server detail still holds 'high'.
+      expect(result.current.tuning.tuning.reasoningEffort).toBe('high');
+      expect(queryClient.getQueryData<Thread>(queryKeys.threads.detail(THREAD))?.reasoning_effort).toBe('high');
+      expect(mocks.updateThread).toHaveBeenCalledTimes(1);
+    });
+
+    // DALTON-HOOK(antigravity-series): Q2b early exits — empty detail reread, thrown detail reread, and reload during reread must all call onSettled(false) and restore local effort
+    it.each([
+      ['empty detail reread', 'empty'],
+      ['rejected detail reread', 'reject'],
+      ['reloading while reread is in flight', 'reloading'],
+    ] as const)('calls onSettled(false) and restores local effort on %s', async (_label, mode) => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set(['model-default', 'model-a', 'gemini-4-neon-medium-oauth']);
+      mocks.sharedEntry = null;
+
+      const queryClient = createTestQueryClient();
+      type P = { threadId: string; isLoading: boolean; activeTurnModel: { model: string | null; admitted?: boolean } | null };
+      const init: P = { threadId: '__default__', isLoading: false, activeTurnModel: null };
+      const { result, rerender } = renderHookWithProviders(
+        (p: P = init) => ({
+          model: useThreadModel({
+            threadId: p.threadId,
+            isLoading: p.isLoading,
+            initialModel: 'model-a',
+            workspaceId: 'ws-personal',
+            activeTurnModel: p.activeTurnModel,
+          }),
+          tuning: useThreadTuning({ threadId: p.threadId, workspaceId: 'ws-personal' }),
+        }),
+        { queryClient },
+      );
+
+      await act(async () => { await result.current.tuning.setReasoningEffort('high'); });
+      rerender({ threadId: '__default__', isLoading: true, activeTurnModel: { model: 'model-a', admitted: false } });
+
+      const onSettled = vi.fn();
+      await act(async () => {
+        const effortClear = result.current.tuning.clearLocalEffort();
+        await result.current.model.pickModel('gemini-4-neon-medium-oauth', {
+          onSettled: (saved) => {
+            onSettled(saved);
+            if (saved) effortClear.confirm();
+            else effortClear();
+          },
+        });
+      });
+      expect(result.current.tuning.tuning.reasoningEffort).toBeNull();
+
+      // Thread id arrives; initial detail fetch succeeds with reasoning_effort='high' (or stays pending for reloading test).
+      const initialRow = { ...row('model-a'), reasoning_effort: 'high', fast_mode: null } as Thread;
+      mocks.getThread.mockResolvedValueOnce(initialRow);
+      rerender({ threadId: THREAD, isLoading: true, activeTurnModel: { model: 'model-a', admitted: true } });
+      await waitFor(() => expect(queryClient.getQueryData<Thread>(queryKeys.threads.detail(THREAD))).toEqual(initialRow));
+
+      const turnEndReread = deferred<Thread | undefined>();
+      mocks.getThread.mockReturnValueOnce(turnEndReread.promise);
+      rerender({ threadId: THREAD, isLoading: false, activeTurnModel: null });
+
+      if (mode === 'empty') {
+        await act(async () => {
+          turnEndReread.resolve(undefined);
+          await turnEndReread.promise;
+        });
+      } else if (mode === 'reject') {
+        await act(async () => {
+          turnEndReread.reject(failure());
+          await turnEndReread.promise.catch(() => {});
+        });
+      } else {
+        // Reloading / next turn starts before reread resolves.
+        rerender({ threadId: THREAD, isLoading: true, activeTurnModel: { model: 'model-a', admitted: false } });
+        await act(async () => {
+          turnEndReread.resolve(initialRow);
+          await turnEndReread.promise;
+        });
+      }
+
       await waitFor(() => expect(onSettled).toHaveBeenCalledWith(false));
       expect(onSettled).toHaveBeenCalledTimes(1);
+      expect(result.current.tuning.tuning.reasoningEffort).toBe('high');
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+    });
+
+    // DALTON-HOOK(antigravity-series): R5b — when a resumed turn starts reading Low (admitted: false) then adopts an old High run via 409 (admitted: true), Low must remain preserved after the High turn ends
+    it('preserves a newly picked Low when a turn starts unadmitted on Low and mid-turn adopts an older High duplicate run', async () => {
+      mocks.seriesCatalog = NEON_CATALOG;
+      mocks.rawMetadata = NEON_RAW_META;
+      mocks.catalogModelNames = new Set([
+        'model-default',
+        'gemini-4-neon-low-oauth',
+        'gemini-4-neon-medium-oauth',
+        'gemini-4-neon-high-oauth',
+      ]);
+      mocks.sharedEntry = null;
+      mocks.updateThread.mockResolvedValueOnce(row('gemini-4-neon-high-oauth'));
+      mocks.updateThread.mockResolvedValueOnce(row('gemini-4-neon-low-oauth'));
+
+      const { result, rerender } = setup(
+        { workspaceId: 'ws-personal', activeTurnModel: null },
+        row('gemini-4-neon-medium-oauth'),
+      );
+
+      // Submission 1 picked High (seq 1).
+      await act(async () => { await result.current.pickModel('gemini-4-neon-high-oauth'); });
+      const highSeq = result.current.sendModelSeq!;
+      // Before submission 2, user switches to Low (seq 2).
+      await act(async () => { await result.current.pickModel('gemini-4-neon-low-oauth'); });
+      const lowSeq = result.current.sendModelSeq!;
+      expect(lowSeq).toBeGreaterThan(highSeq);
+
+      // Submission 2 starts unadmitted with Low (seq 2).
+      rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-personal',
+        activeTurnModel: { model: 'gemini-4-neon-low-oauth', pickSeq: lowSeq, admitted: false },
+      });
+      // Mid-turn, 409 duplicate_request adopts submission 1's High (seq 1).
+      rerender({
+        threadId: THREAD,
+        isLoading: true,
+        workspaceId: 'ws-personal',
+        activeTurnModel: { model: 'gemini-4-neon-high-oauth', pickSeq: highSeq, admitted: true },
+      });
+
+      // Adopted High turn ends; server row reports High (written by the old High turn).
+      mocks.getThread.mockResolvedValueOnce(row('gemini-4-neon-high-oauth'));
+      mocks.updateThread.mockResolvedValueOnce(row('gemini-4-neon-low-oauth'));
+      rerender({
+        threadId: THREAD,
+        isLoading: false,
+        workspaceId: 'ws-personal',
+        activeTurnModel: null,
+      });
+
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenLastCalledWith(
+        THREAD,
+        { llm_model: 'gemini-4-neon-low-oauth' },
+      ));
+      expect(result.current.model).toBe('gemini-4-neon-low-oauth');
     });
   });
 });

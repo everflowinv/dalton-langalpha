@@ -17,6 +17,7 @@ import { useWorkspace } from '@/hooks/useWorkspace';
 import { isDaltonAuth } from '@/config/daltonAuth';
 // DALTON-HOOK(antigravity-series): scope MarketChatPanel workspaceId & Antigravity effort reset to Dalton builds
 import { isDaltonBuild } from '@/config/brand';
+import { buildWidgetPromptModelOptions } from '@/lib/dalton/threadModelDalton';
 import { usePreferences } from '@/hooks/usePreferences';
 // DALTON-HOOK(antigravity-series): inspect picked Antigravity variants to clear local effort alongside ChatView
 import { useAllModels } from '@/hooks/useAllModels';
@@ -769,18 +770,10 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const stableThumbUp = useStableHandler(handleThumbUp);
   const stableThumbDown = useStableHandler(handleThumbDown);
   const stableThumbDownFollowUp = useStableHandler(handleThumbDownFollowUp);
-  // DALTON-HOOK(antigravity-series): forward composer model options and modelPickSeq on widget prompts in Dalton builds so saved picks are recognized as consumed
+  // DALTON-HOOK(antigravity-series): forward only model and modelPickSeq on Dalton widget prompts
   const stableWidgetSendPrompt = useStableHandler((text: string) => {
-    const composerOpts = chatInputRef.current?.getModelOptions?.();
-    const model = composerOpts?.model ?? (isDaltonBuild ? threadModel.sendModel : undefined);
-    const modelPickSeq = isDaltonBuild && model && model === threadModel.sendModel
-      ? threadModel.sendModelSeq
-      : undefined;
-    handleSendMessage(text, null, null, {
-      ...(composerOpts ?? {}),
-      ...(model !== undefined ? { model } : {}),
-      ...(modelPickSeq != null ? { modelPickSeq } : {}),
-    });
+    const opts = buildWidgetPromptModelOptions(chatInputRef.current?.getModelOptions?.()?.model, threadModel);
+    handleSendMessage(text, null, null, opts);
   });
 
   const { onPublishFile, dialog: publishDialog } = usePublishFile(activeWorkspaceId);

@@ -65,6 +65,8 @@ import { readGivenBack, spellOutQuotes } from './chat-input.quoteTokens';
 import { formatContextBlock } from './chat-input.wire';
 // DALTON-HOOK(composer-drafts): persist unsent composer draft text across view/thread switches
 import { useComposerDraft, type DraftParts } from '@/lib/dalton/chatDrafts';
+// DALTON-HOOK(automation-effort): draft-content & retry-intent helpers for effort picks and standalone actions
+import { hasComposerDraftContent, invalidateRetryIntent, recordEffortPickRetryIntent } from '@/lib/dalton/composerRetryGuard';
 import { useAccount } from '@/hooks/useAccount';
 import { modelRefusedBy, modelRuleRowKey } from '@/lib/accountRules';
 
@@ -893,23 +895,19 @@ function ChatInput({
   // The menu names null for the level Settings gives, which returns the
   // thread to following Settings rather than pinning today's value.
   // DALTON-HOOK(automation-effort): switching effort while a draft is already composed belongs to the draft, not a retry
-  const hasDraftContent = Boolean(
-    message.trim() || attachedFiles.length > 0 || chartImage || chips.length > 0 || widgetSnapshots.length > 0 || hasExternalContext,
-  );
+  const hasDraftContent = hasComposerDraftContent({
+    message, attachedCount: attachedFiles.length, hasChartImage: Boolean(chartImage),
+    chipsCount: chips.length, widgetSnapshotsCount: widgetSnapshots.length, hasExternalContext,
+  });
   // DALTON-HOOK(antigravity-series): for Antigravity series, switching effort picks the series variant key
   const handleReasoningEffortChange = useCallback((effort: string | null) => {
-    const eligibleForRetry = !isLoading && retryTargetId !== null && !hasDraftContent;
+    const retryRefs = { explicitRetryEffortRef, seriesEffortModelRef };
     if (pillSeriesMatch) {
       if (!effort) return;
       const targetKey = pillSelectableSeries?.variants[effort] ?? pillSeriesMatch.series.variants[effort];
       if (!targetKey) return;
-      // DALTON-HOOK(automation-effort): bind Antigravity series-effort variant switch to the active retry target only when no draft is being composed
-      seriesEffortModelRef.current = {
-        model: targetKey,
-        targetId: retryTargetId ?? null,
-        activeForRetry: eligibleForRetry,
-      };
-      explicitRetryEffortRef.current = undefined;
+      // DALTON-HOOK(automation-effort): record series-effort retry intent via Dalton helper
+      recordEffortPickRetryIntent(retryRefs, { isLoading, retryTargetId, hasDraftContent, seriesTargetModel: targetKey, effort, settingsEffort: settingsTuning.reasoning_effort });
       if (targetKey === pillModel) return;
       if (hostModel === undefined) setOwnModel(targetKey);
       else onPickModel?.(targetKey);
@@ -918,15 +916,8 @@ function ChatInput({
       }
       return;
     }
-    // DALTON-HOOK(automation-effort): mark explicit effort pick only for the current active retry target when no draft is being composed
-    if (eligibleForRetry) {
-      explicitRetryEffortRef.current = {
-        targetId: retryTargetId ?? null,
-        effort: effort ?? settingsTuning.reasoning_effort ?? null,
-      };
-    } else {
-      explicitRetryEffortRef.current = undefined;
-    }
+    // DALTON-HOOK(automation-effort): record explicit retry effort intent via Dalton helper
+    recordEffortPickRetryIntent(retryRefs, { isLoading, retryTargetId, hasDraftContent, effort, settingsEffort: settingsTuning.reasoning_effort });
     if (effort === tuning.reasoningEffort) return;
     if (hostTuning === undefined) setOwnTuning((prev) => ({ ...prev, reasoningEffort: effort }));
     else onPickReasoningEffort?.(effort);
@@ -1098,10 +1089,7 @@ function ChatInput({
       // DALTON-HOOK(composer-drafts): clear stored composer draft on successful send
       clearCurrentDraft();
       // DALTON-HOOK(automation-effort): standalone action commands invalidate retry eligibility without erasing the series-effort guard over sentModel
-      explicitRetryEffortRef.current = undefined;
-      if (seriesEffortModelRef.current) {
-        seriesEffortModelRef.current = { ...seriesEffortModelRef.current, activeForRetry: false };
-      }
+      invalidateRetryIntent({ explicitRetryEffortRef, seriesEffortModelRef });
       resetSlash();
       // DALTON-HOOK(chat-large-upload): cancel any unsent server/staged uploads on standalone action commands
       discardFiles();

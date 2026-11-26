@@ -85,19 +85,23 @@ describe('postSSEStream: a duplicate refused in the stream', () => {
     expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ event: 'error', error: 'boom' }));
   });
 
-  // DALTON-HOOK(antigravity-series): R2 — a stream-level stale_fork refusal frame must not trigger onRunIdResolved
-  it('does not invoke onRunIdResolved when the first SSE frame is a stale_fork refusal', async () => {
-    const staleFork = {
+  // DALTON-HOOK(antigravity-series): R2 — stream-level START refusal frames must not trigger onRunIdResolved
+  it.each([
+    ['stale_fork', { error_type: 'admission_conflict', code: 'stale_fork', error: 'the branch moved' }],
+    ['running', { error_type: 'admission_conflict', code: 'running', error: 'another turn is running' }],
+    ['workspace_moving', { error_type: 'admission_conflict', code: 'workspace_moving', error: 'workspace is moving' }],
+    ['writer_capacity', { error_type: 'capacity_limit', code: 'writer_capacity', error: 'at capacity' }],
+    ['scope_changed', { error_type: 'scope_changed', code: 'scope_changed', error: 'scope changed' }],
+  ])('does not invoke onRunIdResolved when the first SSE frame is a %s refusal', async (_label, payload) => {
+    const refusalFrame = {
       event: 'error',
       data: {
         thread_id: 'thread-1',
-        error: 'the branch moved',
         type: 'workflow_error',
-        error_type: 'admission_conflict',
-        code: 'stale_fork',
+        ...payload,
       },
     };
-    const resp = sse([staleFork]);
+    const resp = sse([refusalFrame]);
     (resp as unknown as { headers: { get: (k: string) => string | null } }).headers = {
       get: (k: string) => (k.toLowerCase() === 'content-location' ? '/api/v1/threads/thread-1/stream?run_id=run-refused' : null),
     };
@@ -108,6 +112,21 @@ describe('postSSEStream: a duplicate refused in the stream', () => {
 
     await expect(postSSEStream('/api/v1/threads/thread-1/messages', {}, { onEvent, onRunIdResolved })).resolves.toMatchObject({ aborted: false });
     expect(onRunIdResolved).not.toHaveBeenCalled();
-    expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ event: 'error', code: 'stale_fork' }));
+    expect(onEvent).toHaveBeenCalledWith(expect.objectContaining({ event: 'error', code: payload.code }));
+  });
+
+  // DALTON-HOOK(antigravity-series): R2 — a normal non-hold frame still triggers onRunIdResolved
+  it('invokes onRunIdResolved once a non-hold non-refusal frame arrives', async () => {
+    const resp = sse([{ event: 'metadata', data: { thread_id: 'thread-1', run_id: 'run-admitted' } }]);
+    (resp as unknown as { headers: { get: (k: string) => string | null } }).headers = {
+      get: (k: string) => (k.toLowerCase() === 'content-location' ? '/api/v1/threads/thread-1/stream?run_id=run-admitted' : null),
+    };
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValue(resp);
+    const { postSSEStream } = await import('../transport');
+    const onEvent = vi.fn();
+    const onRunIdResolved = vi.fn();
+
+    await expect(postSSEStream('/api/v1/threads/thread-1/messages', {}, { onEvent, onRunIdResolved })).resolves.toMatchObject({ aborted: false });
+    expect(onRunIdResolved).toHaveBeenCalledWith('run-admitted', 'thread-1');
   });
 });

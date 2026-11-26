@@ -467,44 +467,78 @@ describe('useThreadTuning', () => {
       });
     });
 
-    // DALTON-HOOK(antigravity-series): R5a — if an optimistic effort PATCH fails and a queued Antigravity switch also fails, effortClear must not write the failed effort back into held
+    // DALTON-HOOK(antigravity-series): R5a — queue two real mutations (effort PATCH then Antigravity model PATCH with reasoning_effort: null) and reject both sequentially; must restore server-confirmed 'low', not failed 'high'
     it('does not write back a failed optimistic effort into held when a queued Antigravity switch also fails and calls effortClear', async () => {
       mocks.isDaltonBuild = true;
       mocks.sharedEnabled = true;
       mocks.sharedWorkspaces = [];
       mocks.sharedError = false;
 
+      const { useThreadFieldSave } = await import('../useThreadFieldSave');
       let rejectEffort!: (err: Error) => void;
-      mocks.updateThread.mockImplementationOnce(() => new Promise<Thread>((_res, rej) => { rejectEffort = rej; }));
+      let rejectModel!: (err: Error) => void;
+      mocks.updateThread
+        .mockImplementationOnce(() => new Promise<Thread>((_res, rej) => { rejectEffort = rej; }))
+        .mockImplementationOnce(() => new Promise<Thread>((_res, rej) => { rejectModel = rej; }));
 
-      const { result } = setup(
-        { workspaceId: 'ws-personal' },
-        row({ reasoning_effort: 'low', fast_mode: null }),
-      );
+      const queryClient = createTestQueryClient();
+      const initialRow = { thread_id: THREAD, llm_model: 'gpt-6', reasoning_effort: 'low', fast_mode: null } as unknown as Thread;
+      queryClient.setQueryData(queryKeys.threads.detail(THREAD), initialRow);
+      mocks.getThread.mockResolvedValue(initialRow);
+
+      const { result } = renderHookWithProviders(() => ({
+        tuning: useThreadTuning({ threadId: THREAD, workspaceId: 'ws-personal' }),
+        saveModel: useThreadFieldSave({
+          threadId: THREAD,
+          field: 'llm_model',
+          failedMessage: 'failed',
+          onFailed: () => {},
+        }),
+      }), { queryClient });
 
       let effortP!: Promise<boolean>;
-      let effortClear!: ReturnType<typeof result.current.clearLocalEffort>;
+      let modelP!: Promise<boolean>;
       act(() => {
-        effortP = result.current.setReasoningEffort('high');
-        // Queued Antigravity switch optimistically clears local effort while effort='high' is still in flight.
-        effortClear = result.current.clearLocalEffort();
+        effortP = result.current.tuning.setReasoningEffort('high');
+        // Real queued Antigravity switch: clears local effort optimistically and queues a real llm_model+reasoning_effort PATCH behind effort='high'.
+        const effortClear = result.current.tuning.clearLocalEffort();
+        modelP = result.current.saveModel({
+          threadId: THREAD,
+          value: 'gemini-4-neon-medium-oauth',
+          before: 'gpt-6',
+          extraUpdates: { reasoning_effort: null },
+        }).then((saved) => {
+          if (saved) effortClear.confirm();
+          else effortClear();
+          return saved;
+        });
       });
-      expect(result.current.tuning.reasoningEffort).toBeNull();
+      expect(result.current.tuning.tuning.reasoningEffort).toBeNull();
+      // Serialized scope: only the first mutation (effort='high') is on the wire initially.
       await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(1));
+      expect(mocks.updateThread).toHaveBeenNthCalledWith(1, THREAD, { reasoning_effort: 'high' });
 
-      // First, the earlier effort='high' PATCH fails.
+      // 1) First real mutation (effort='high') fails -> serialized scope advances and sends the second real mutation.
       await act(async () => {
-        rejectEffort(new Error('500'));
+        rejectEffort(new Error('500 effort'));
         expect(await effortP).toBe(false);
       });
-
-      // Then the Antigravity switch PATCH also fails and calls effortClear() to restore.
-      act(() => {
-        effortClear();
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(2));
+      expect(mocks.updateThread).toHaveBeenNthCalledWith(2, THREAD, {
+        llm_model: 'gemini-4-neon-medium-oauth',
+        reasoning_effort: null,
       });
 
-      // Must fall back to the server-confirmed 'low', NOT restore the failed optimistic 'high'.
-      expect(result.current.tuning.reasoningEffort).toBe('low');
+      // 2) Second real mutation (Antigravity model switch) also fails -> real onSettled invokes effortClear().
+      await act(async () => {
+        rejectModel(new Error('500 model'));
+        expect(await modelP).toBe(false);
+      });
+
+      // Must fall back to the server-confirmed 'low' (both tuning display and cached thread detail), NOT the failed optimistic 'high'.
+      expect(result.current.tuning.tuning.reasoningEffort).toBe('low');
+      expect(queryClient.getQueryData<Thread>(queryKeys.threads.detail(THREAD))?.reasoning_effort).toBe('low');
+      expect(queryClient.getQueryData<Thread>(queryKeys.threads.detail(THREAD))?.llm_model).toBe('gpt-6');
     });
   });
 });

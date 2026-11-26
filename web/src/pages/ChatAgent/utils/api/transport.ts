@@ -12,6 +12,8 @@ import { RUN_STREAM_BEAT_MS, watchStreamSilence, type StreamSilenceWatch } from 
 import { noteIfSuspended } from '@/lib/accountSuspension';
 // DALTON-HOOK(team-model-catalog): observe X-Dalton-Catalog-Revision and catalog 400 errors on raw SSE fetch streams
 import { observeCatalogModelError, observeCatalogRevisionHeader } from '@/lib/dalton/catalogRevision';
+// DALTON-HOOK(antigravity-series): skip onRunIdResolved for pre-START stream admission refusal frames
+import { isStreamAdmissionRefusalFrame } from '@/lib/dalton/turnAdmission';
 
 export const baseURL = api.defaults.baseURL;
 
@@ -292,13 +294,7 @@ export async function postSSEStream(
     const onEvent = (event: Record<string, unknown>) => {
       if (event.event === 'metadata' || event.event === 'steering_accepted') release();
       // DALTON-HOOK(antigravity-series): do not treat stream-level admission refusal frames as an admitted run in onRunIdResolved
-      const isAdmissionRefusalFrame = event.event === 'error' && (
-        event.code === 'duplicate_request'
-        || event.code === 'stale_fork'
-        || event.code === 'stale_retry'
-        || event.code === 'scope_changed'
-      );
-      if (event.event !== 'turn_held' && !isAdmissionRefusalFrame) {
+      if (event.event !== 'turn_held' && !isStreamAdmissionRefusalFrame(event)) {
         const runId = parseRunIdFromContentLocation(runLocation);
         if (runId && onRunIdResolved) onRunIdResolved(runId, parseThreadIdFromContentLocation(runLocation));
         runLocation = null;
