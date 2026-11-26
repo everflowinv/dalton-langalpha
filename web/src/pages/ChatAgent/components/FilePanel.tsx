@@ -22,6 +22,9 @@ import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 import { classifyAgentPath, parseAgentPath } from '../utils/agentPaths';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useHtmlViewMode } from './viewers/html/useHtmlViewMode';
+// DALTON-HOOK(mobile-web): unified HtmlFrameDocState tracking and CommentTools for linked desktop crumbs
+import { docStatesEqual, type HtmlFrameDocState } from './viewers/html/pageProtocol';
+import { CommentTools } from './viewers/html/comments/CommentTools';
 import { useLatestRef } from '@/hooks/useLatestRef';
 import { cn } from '@/lib/utils';
 import { parseFragment, type FileLocation, type OpenFileHandler } from '../utils/fileLocation';
@@ -405,21 +408,29 @@ function FilePanel({
   // for a link they already made public.
   const [unshareTarget, setUnshareTarget] = useState<string | null>(null);
   const [pageCounts, setPageCounts] = useState<Record<string, number>>({});
-  // DALTON-HOOK(mobile-web): track the document shown inside a read-only HTML ViewFrame
-  // (e.g. external member preview) so in-frame links to B collapse mobile More to "Open in its own tab".
-  const [readOnlyHtmlDoc, setReadOnlyHtmlDoc] = useState<{ tabId: string; path: string | null }>({
+  // DALTON-HOOK(mobile-web): track unified HtmlFrameDocState across owner (live/version) and read-only HTML frames;
+  // stays null until a bridged HTML frame reports state so plain / non-bridged previews keep file actions clickable
+  const [htmlDocEntry, setHtmlDocEntry] = useState<{
+    tabId: string;
+    filePath: string | null;
+    state: HtmlFrameDocState | null;
+  }>({
     tabId: activeTab.id,
-    path: null,
+    filePath: selectedFile,
+    state: null,
   });
-  const handleReadOnlyHtmlDocChange = useCallback(
-    (docPath: string | null) => {
-      setReadOnlyHtmlDoc((prev) =>
-        prev.tabId === activeTab.id && prev.path === docPath
+  const handleHtmlDocChange = useCallback(
+    (nextState: HtmlFrameDocState) => {
+      setHtmlDocEntry((prev) =>
+        prev.tabId === activeTab.id &&
+        prev.filePath === selectedFile &&
+        prev.state !== null &&
+        docStatesEqual(prev.state, nextState)
           ? prev
-          : { tabId: activeTab.id, path: docPath },
+          : { tabId: activeTab.id, filePath: selectedFile, state: nextState },
       );
     },
-    [activeTab.id],
+    [activeTab.id, selectedFile],
   );
 
   // DALTON-HOOK(multi-file-upload): uploadStatus carries the batch position
@@ -474,6 +485,19 @@ function FilePanel({
   // The file the owner reads takes comments, and an HTML one has versions,
   // unless its viewer failed: the fallback drew no comment layer.
   const [documentFailed, setDocumentFailed] = useState(false);
+  // DALTON-HOOK(mobile-web): derive current tab's active HtmlFrameDocState before useFileComments so
+  // pending state disables desktop ArtifactCrumbs Update identically to the mobile overflow menu
+  const isHtmlPreview = viewer === 'html' && !edit.isEditing && !htmlView.source && !fileLoading && !fileError;
+  const htmlDocState: HtmlFrameDocState | null = !isHtmlPreview
+    ? null
+    : htmlDocEntry.tabId === activeTab.id && htmlDocEntry.filePath === selectedFile
+      ? htmlDocEntry.state
+      : htmlDocEntry.state !== null
+        ? { kind: 'pending' }
+        : null;
+  const isHtmlDocPending = htmlDocState?.kind === 'pending';
+  const isHtmlDocLinked = htmlDocState?.kind === 'linked';
+  const isHtmlDocUnbridged = htmlDocState?.kind === 'unbridged';
   const fileComments = useFileComments({
     workspaceId,
     tabId: activeTab.id,
@@ -485,10 +509,18 @@ function FilePanel({
     ui: comments,
     // DALTON-HOOK(monitors): decoupled monitor publishing permission
     canPublishMonitor,
+    // DALTON-HOOK(mobile-web): disable desktop Update button and callback while HTML doc state is pending
+    updateDisabled: isHtmlDocPending,
     threadId,
     dismissSelection,
   });
   const htmlArtifactPath = fileComments.path;
+  const htmlArtifactDoc =
+    htmlDocState?.kind === 'current' || htmlDocState?.kind === 'linked'
+      ? htmlDocState.path
+      : htmlDocState !== null
+        ? null
+        : fileComments.doc;
   // The agent's edit to the HTML file in front is read at once, unlike other
   // files: the frame swaps it in over the old one with the place kept, and a
   // reader whose comments the agent is answering is waiting for exactly that.
@@ -990,9 +1022,28 @@ function FilePanel({
           chip={focus.chip && (
             <FocusChip state={focus.chip} onJump={focus.jump} onDismiss={() => { focus.dismiss(); tabs.clearLocation(activeTab.id); }} />
           )}
-          // DALTON-HOOK(mobile-web): fold HTML version/update, comment, dashboard pin, and publish/bind actions into the mobile More menu using the same fileComments visibility conditions as desktop crumbs
-          artifact={isMobile && viewer === 'html' && !edit.isEditing ? null : fileComments.crumbs}
-          tools={isMobile && viewer === 'html' && !edit.isEditing ? null : fileComments.tools}
+          // DALTON-HOOK(mobile-web): fold HTML controls on mobile and align desktop crumbs with unified HtmlFrameDocState
+          artifact={
+            (isMobile && viewer === 'html' && !edit.isEditing) || isHtmlDocLinked || isHtmlDocUnbridged
+              ? null
+              : fileComments.crumbs
+          }
+          tools={
+            (isMobile && viewer === 'html' && !edit.isEditing) || isHtmlDocUnbridged
+              ? null
+              : htmlDocState?.kind === 'linked' && fileComments.path && comments
+                ? (
+                  <CommentTools
+                    tabId={activeTab.id}
+                    workspaceId={workspaceId}
+                    path={htmlDocState.path}
+                    ui={comments}
+                    variant="crumb"
+                    modeDisabled={fileComments.view?.versionView.version !== null || htmlView.source}
+                  />
+                )
+                : fileComments.tools
+          }
           actions={(
             <FileHeaderActions
               selectedFile={selectedFile}
@@ -1015,8 +1066,10 @@ function FilePanel({
                   ? (path) => setUnshareTarget(path)
                   : null
               }
-              artifactDoc={fileComments.doc ?? (readOnlyHtmlDoc.tabId === activeTab.id ? readOnlyHtmlDoc.path : null)}
-              // DALTON-HOOK(mobile-web): allow mobile HTML More menu to open a linked in-frame document as its own tab
+              artifactDoc={htmlArtifactDoc}
+              // DALTON-HOOK(mobile-web): drive both desktop and mobile header actions from unified HtmlFrameDocState
+              htmlDocState={htmlDocState}
+              // DALTON-HOOK(mobile-web): allow desktop and mobile HTML toolbars to open a linked in-frame document as its own tab
               onOpenDocAsTab={(docPath) => { void openFileAt(docPath, { pin: true }); }}
               htmlSource={htmlView.source}
               // Only where the viewer is up to switch: not while loading, nor on an error card.
@@ -1033,7 +1086,7 @@ function FilePanel({
               onCancelEdit={edit.handleCancelEdit}
               // DALTON-HOOK(mobile-web): expose comment, queued-send, pin-as-dashboard, version controls, and readAt inside the mobile HTML More menu whenever desktop crumbs would render them
               mobileHtmlTools={
-                isMobile && viewer === 'html' && !edit.isEditing && fileComments.tools && fileComments.path && comments
+                isMobile && viewer === 'html' && !edit.isEditing && !isHtmlDocUnbridged && fileComments.tools && fileComments.path && comments
                   ? {
                       tabId: activeTab.id,
                       ui: comments,
@@ -1181,8 +1234,8 @@ function FilePanel({
                   teamReadOnly,
                   htmlSource: htmlView.source,
                   htmlArtifact: fileComments.view,
-                  // DALTON-HOOK(mobile-web): track shown doc path in read-only HTML ViewFrame
-                  onHtmlDocChange: handleReadOnlyHtmlDocChange,
+                  // DALTON-HOOK(mobile-web): track unified HtmlFrameDocState across all bridged HTML frames
+                  onHtmlDocChange: handleHtmlDocChange,
                   comments: fileComments.target,
                 }}
                 onPageCount={onPageCount}

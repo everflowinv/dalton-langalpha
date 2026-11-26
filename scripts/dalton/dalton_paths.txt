@@ -625,3 +625,6 @@ web/src/pages/ChatAgent/hooks/useComputerFoldersReady.ts
 web/e2e/team-model-catalog.spec.js
 web/src/pages/Setup/answers/__tests__/teamCatalogSetup.test.ts
 web/src/pages/Setup/steps/__tests__/ModelStep.dalton.test.tsx
+# External member permissions Batch 3: preview bridge docLocation & unified HtmlFrameDocState unit and Playwright E2E tests.
+web/src/pages/ChatAgent/components/viewers/html/__tests__/HtmlFrameDocState.test.tsx
+web/e2e/external-member-perms-b3.spec.js

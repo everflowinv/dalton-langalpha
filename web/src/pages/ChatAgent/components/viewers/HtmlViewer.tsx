@@ -1,9 +1,12 @@
-import React, { useEffect, useMemo, useRef } from 'react';
+import React, { useEffect, useEffectEvent, useMemo, useRef } from 'react';
 import { useTheme } from '@/contexts/ThemeContext';
+// DALTON-HOOK(mobile-web): artifactPathKey & workspace rootDir for unified HtmlFrameDocState reporting
+import { artifactPathKey } from '@/hooks/useArtifact';
+import { useWorkspaceFolders } from '../../contexts/WorkspaceContext';
 import SyntaxHighlighter, { oneDark, oneLight } from '../SyntaxHighlighter';
 import { ComposerDockSlot } from '../chatView/composerDock';
 import { ArtifactFrames, ServeFailed, type HtmlArtifactView } from './html/ArtifactFrames';
-import { BridgedFrame } from './html/BridgedFrame';
+import { BridgedFrame, type HtmlFrameDocState } from './html/BridgedFrame';
 import { useLiveFrame, type FrameLinkHandler } from './html/liveFrame';
 // DALTON-HOOK(team-sharing): the colleague mirror frame keeps the srcDoc sandbox path
 import { useHtmlSandbox } from './html/useHtmlSandbox';
@@ -11,6 +14,7 @@ import { SERVED_HTML_SANDBOX } from './html/sandbox';
 import './HtmlViewer.css';
 
 export type { HtmlArtifactView } from './html/ArtifactFrames';
+export type { HtmlFrameDocState } from './html/BridgedFrame';
 
 interface HtmlViewerProps {
   /** Full source (read unlimited so Source isn't truncated). */
@@ -36,8 +40,8 @@ interface HtmlViewerProps {
   artifact?: HtmlArtifactView | null;
   /** Where a link to another workspace file opens. */
   onOpenLink?: FrameLinkHandler | null;
-  // DALTON-HOOK(mobile-web): report the workspace-relative path shown inside the read-only ViewFrame
-  onShownDocChange?: ((docPath: string | null) => void) | null;
+  // DALTON-HOOK(mobile-web): report unified HtmlFrameDocState from owner (live/version) and read-only frames
+  onShownDocChange?: ((state: HtmlFrameDocState) => void) | null;
 }
 
 /**
@@ -106,6 +110,8 @@ export default function HtmlViewer({
             anchor={anchor}
             anchorSeq={anchorSeq}
             onOpenLink={onOpenLink}
+            // DALTON-HOOK(mobile-web): forward unified HtmlFrameDocState from owner live/version frames
+            onShownDocChange={onShownDocChange}
           />
         </div>
       ) : !source && (
@@ -114,7 +120,7 @@ export default function HtmlViewer({
             // DALTON-HOOK(team-sharing): a teammate's HTML previews from the
             // DB mirror in a sandboxed iframe — no owner file grant exists
             // for their session, so the served-URL path cannot serve them.
-            <MirrorFrame content={content} fileName={fileName} />
+            <MirrorFrame content={content} fileName={fileName} filePath={filePath} onShownDocChange={onShownDocChange} />
           ) : (
             <ViewFrame
               fileName={fileName}
@@ -143,24 +149,56 @@ function ViewFrame({ fileName, workspaceId, filePath, servePrefix, anchor, ancho
   anchor: string | null;
   anchorSeq: number | null;
   onOpenLink: FrameLinkHandler | null;
-  onShownDocChange?: ((docPath: string | null) => void) | null;
+  onShownDocChange?: ((state: HtmlFrameDocState) => void) | null;
 }): React.ReactElement {
+  const root = useWorkspaceFolders()?.rootDir;
+  const expectedDocKey = artifactPathKey(filePath, root);
   const live = useLiveFrame({ workspaceId, filePath, prefix: servePrefix, inject: 'view', anchor, anchorSeq, onOpenLink });
-  // DALTON-HOOK(mobile-web): report the currently displayed document path (e.g. after an in-frame link) to FilePanel
-  const shownDoc = live.failed ? null : (live.bridge?.path ?? null);
+  // DALTON-HOOK(mobile-web): report unified HtmlFrameDocState once a live BridgedFrame has attached (leave failed/unattached previews clear)
+  const activeDocState: HtmlFrameDocState | null =
+    live.failed || !live.hasDocState ? null : live.docState;
+  const reportShownDoc = useEffectEvent((state: HtmlFrameDocState) => {
+    onShownDocChange?.(state);
+  });
   useEffect(() => {
-    onShownDocChange?.(shownDoc);
-    return () => { onShownDocChange?.(null); };
-  }, [shownDoc, onShownDocChange]);
+    if (activeDocState) reportShownDoc(activeDocState);
+  }, [activeDocState]);
   if (live.failed) return <ServeFailed onRetry={live.retry} />;
-  return <BridgedFrame source={live.source} title={fileName || 'HTML Preview'} groundKey={filePath} onBridge={live.onBridge} />;
+  return (
+    <BridgedFrame
+      source={live.source}
+      title={fileName || 'HTML Preview'}
+      groundKey={filePath}
+      expectedDocKey={expectedDocKey}
+      docRoot={root}
+      onBridge={live.onBridge}
+      onDocStateChange={live.onDocStateChange}
+    />
+  );
 }
 
 // DALTON-HOOK(team-sharing): the mirror frame a colleague's panel shows — the
 // panel's own copy of the file's bytes, sandboxed with no bridge.
-function MirrorFrame({ content, fileName }: { content: string; fileName: string }): React.ReactElement {
+function MirrorFrame({
+  content,
+  fileName,
+  filePath,
+  onShownDocChange,
+}: {
+  content: string;
+  fileName: string;
+  filePath: string;
+  onShownDocChange?: ((state: HtmlFrameDocState) => void) | null;
+}): React.ReactElement {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const { pushTheme } = useHtmlSandbox({ iframeRef, autoHeight: false });
+  // DALTON-HOOK(mobile-web): srcDoc mirror has no bridge; report current so actions do not stay pending
+  const reportShownDoc = useEffectEvent((state: HtmlFrameDocState) => {
+    onShownDocChange?.(state);
+  });
+  useEffect(() => {
+    reportShownDoc({ kind: 'current', path: filePath });
+  }, [filePath]);
   return (
     <iframe
       ref={iframeRef}

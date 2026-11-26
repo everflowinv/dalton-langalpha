@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useEffectEvent, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { resolveThemeVars } from './buildHtmlSrcDoc';
-import { parsePageMessage, type PageToViewer, type ViewerToPage } from './pageProtocol';
+// DALTON-HOOK(mobile-web): import PageReadyPathState for tri-state bridge location tracking
+import { parsePageMessage, type PageReadyPathState, type PageToViewer, type ViewerToPage } from './pageProtocol';
 
 /** The viewer's end of the bridge, handed to whatever draws over the frame. */
 export interface PageBridge {
@@ -18,6 +19,11 @@ export interface PageBridge {
    * Null when the hello named none.
    */
   path: string | null;
+  // DALTON-HOOK(mobile-web): frame identity, last page:ready pathState, and confirmed path setters
+  readonly frameKey?: string | null;
+  readonly pathState?: PageReadyPathState | null;
+  readonly setPath?: (path: string | null) => void;
+  readonly clearPath?: () => void;
   /** Send to the page. Dropped until it is ready: before then the frame may hold another document. */
   post: (message: ViewerToPage) => void;
   /**
@@ -61,7 +67,13 @@ interface UsePageBridgeOptions {
  * named, so it is told apart by its window alone, and posts to it go to `'*'`.
  */
 export function usePageBridge({ frameRef, origin, frameKey }: UsePageBridgeOptions): PageBridge {
-  const [hello, setHello] = useState<{ key: string | null; count: number; path: string | null }>({ key: null, count: 0, path: null });
+  // DALTON-HOOK(mobile-web): track pathState alongside path and allow clearing stale path on unbridged timeout
+  const [hello, setHello] = useState<{
+    key: string | null;
+    count: number;
+    path: string | null;
+    pathState: PageReadyPathState | null;
+  }>({ key: null, count: 0, path: null, pathState: null });
   const ready = frameKey !== null && hello.key === frameKey;
   // `ready` for posts, which run outside render: the key whose document said
   // hello against the key framed now. Both are facts, not a flag an effect
@@ -88,9 +100,21 @@ export function usePageBridge({ frameRef, origin, frameKey }: UsePageBridgeOptio
     return () => { all.delete(listener); };
   }, []);
 
+  // DALTON-HOOK(mobile-web): publish confirmed path only after matching page:pong, and allow clearing on unbridged/root
+  const setPath = useCallback((nextPath: string | null) => {
+    setHello((prev) => (prev.key !== framedKey.current || prev.path === nextPath ? prev : { ...prev, path: nextPath }));
+  }, []);
+  const clearPath = useCallback(() => {
+    setHello((prev) => (prev.path === null ? prev : { ...prev, path: null }));
+  }, []);
+
   const session = hello.count;
   const path = ready ? hello.path : null;
-  const bridge = useMemo<PageBridge>(() => ({ ready, session, path, post, subscribe }), [ready, session, path, post, subscribe]);
+  const pathState = ready ? hello.pathState : null;
+  const bridge = useMemo<PageBridge>(
+    () => ({ ready, session, path, frameKey, pathState, setPath, clearPath, post, subscribe }),
+    [ready, session, path, frameKey, pathState, setPath, clearPath, post, subscribe],
+  );
 
   const pushTheme = useCallback(() => post({ type: 'page:theme', css: resolveThemeVars() }), [post]);
 
@@ -101,7 +125,14 @@ export function usePageBridge({ frameRef, origin, frameKey }: UsePageBridgeOptio
     if (!message) return;
     if (message.type === 'page:ready') {
       heardKey.current = frameKey;
-      setHello((prev) => ({ key: frameKey, count: prev.count + 1, path: message.path }));
+      // DALTON-HOOK(mobile-web): do not publish bridge.path on page:ready;
+      // wait for BridgedFrame to publish the confirmed candidate path after a matching page:pong.
+      setHello((prev) => ({
+        key: frameKey,
+        count: prev.count + 1,
+        path: prev.key === frameKey ? prev.path : null,
+        pathState: message.pathState,
+      }));
       pushTheme();
     }
     for (const listener of listeners.current) listener(message, bridge);

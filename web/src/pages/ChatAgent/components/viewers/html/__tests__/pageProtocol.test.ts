@@ -24,11 +24,97 @@ describe('parsePageMessage', () => {
   });
 
   it('reads the path a hello names, and none it could not be', () => {
-    expect(read('page:ready', { path: '/results/q3.html' })).toEqual({ type: 'page:ready', path: 'results/q3.html' });
-    expect(read('page:ready', {})?.path).toBeNull();
-    expect(read('page:ready', { path: 'a\u0000b' })?.path).toBeNull();
-    expect(read('page:ready', { path: 'x'.repeat(1024) })?.path).toBe('x'.repeat(1024));
-    expect(read('page:ready', { path: 'x'.repeat(1025) })?.path).toBeNull();
+    // DALTON-HOOK(mobile-web): page:ready now reports pathState ('path' | 'root' | 'invalid' | 'unrecognized')
+    expect(read('page:ready', { path: '/results/q3.html' })).toEqual({ type: 'page:ready', path: 'results/q3.html', pathState: 'path' });
+    expect(read('page:ready', {})).toEqual({ type: 'page:ready', path: null, pathState: 'unrecognized' });
+    expect(read('page:ready', { path: 'a\u0000b' })).toEqual({ type: 'page:ready', path: null, pathState: 'invalid' });
+    expect(read('page:ready', { path: 'x'.repeat(1024) })).toEqual({ type: 'page:ready', path: 'x'.repeat(1024), pathState: 'path' });
+    expect(read('page:ready', { path: 'x'.repeat(1025) })).toEqual({ type: 'page:ready', path: null, pathState: 'invalid' });
+  });
+
+  // DALTON-HOOK(mobile-web): raw own-property mutual-exclusion validation on page:ready and docPath traversal/backslash checks
+  it('classifies page:ready root, invalid, conflicting own properties, and missing root strictly', () => {
+    // Confirmed pathless version root.
+    expect(read('page:ready', { root: true })).toEqual({ type: 'page:ready', path: null, pathState: 'root' });
+    // Legitimate filename containing double-dots inside a segment.
+    expect(read('page:ready', { path: 'reports/q1..q2.html' })).toEqual({
+      type: 'page:ready',
+      path: 'reports/q1..q2.html',
+      pathState: 'path',
+    });
+
+    // Conflicting own-property combinations (including explicit `path: undefined` retained by structured clone) -> invalid.
+    const conflictingPayloads: Record<string, unknown>[] = [
+      { path: undefined, root: true },
+      { path: null, root: true },
+      { path: 'a.html', root: true },
+      { path: 'a.html', invalidPath: true },
+      { root: true, invalidPath: true },
+      { path: undefined, invalidPath: false },
+      { path: 'a.html', root: false },
+      { root: false, invalidPath: false },
+    ];
+    for (const fields of conflictingPayloads) {
+      expect(read('page:ready', fields)).toEqual({ type: 'page:ready', path: null, pathState: 'invalid' });
+    }
+
+    // Invalid single-field payloads (explicit invalidPath, non-boolean flags, traversal, backslashes, empty, undefined/null path) -> invalid.
+    const invalidPayloads: Record<string, unknown>[] = [
+      { invalidPath: true },
+      { path: undefined },
+      { path: null },
+      { path: '' },
+      { path: '///' },
+      { path: '../secret.html' },
+      { path: 'reports/../secret.html' },
+      { path: 'reports/..' },
+      { path: '..' },
+      { path: 'reports\\a.html' },
+      { root: 'true' },
+      { root: undefined },
+      { invalidPath: 'true' },
+      { invalidPath: undefined },
+    ];
+    for (const fields of invalidPayloads) {
+      expect(read('page:ready', fields)).toEqual({ type: 'page:ready', path: null, pathState: 'invalid' });
+    }
+
+    // Missing root: true / unrecognized shapes -> unrecognized.
+    expect(read('page:ready', {})).toEqual({ type: 'page:ready', path: null, pathState: 'unrecognized' });
+    expect(read('page:ready', { root: false })).toEqual({ type: 'page:ready', path: null, pathState: 'unrecognized' });
+    expect(read('page:ready', { invalidPath: false })).toEqual({ type: 'page:ready', path: null, pathState: 'unrecognized' });
+
+    // Inherited root: true on prototype must not satisfy hasOwn('root').
+    const inherited = Object.assign(Object.create({ root: true }), { type: 'page:ready', v: 1 });
+    expect(parsePageMessage(inherited)).toEqual({ type: 'page:ready', path: null, pathState: 'unrecognized' });
+
+    // Invalid version field drops the message whole.
+    expect(parsePageMessage({ type: 'page:ready', v: '1', path: 'a.html' })).toBeNull();
+
+    // Valid docId on page:ready.
+    expect(read('page:ready', { docId: 'doc-1', path: 'reports/a.html' })).toEqual({
+      type: 'page:ready',
+      path: 'reports/a.html',
+      pathState: 'path',
+      docId: 'doc-1',
+    });
+    expect(read('page:ready', { docId: 'doc-root', root: true })).toEqual({
+      type: 'page:ready',
+      path: null,
+      pathState: 'root',
+      docId: 'doc-root',
+    });
+    // Invalid docId -> invalid.
+    expect(read('page:ready', { docId: '', path: 'a.html' })).toEqual({ type: 'page:ready', path: null, pathState: 'invalid' });
+    expect(read('page:ready', { docId: 'bad space', path: 'a.html' })).toEqual({ type: 'page:ready', path: null, pathState: 'invalid' });
+  });
+
+  // DALTON-HOOK(mobile-web): docPath rejects backslashes and traversal in page:loads too
+  it('rejects backslashes and traversal segments in page:loads path', () => {
+    expect(read('page:loads', { path: 'reports\\index.html', paths: [] })).toBeNull();
+    expect(read('page:loads', { path: '../secret.html', paths: [] })).toBeNull();
+    expect(read('page:loads', { path: 'reports/../index.html', paths: [] })).toBeNull();
+    expect(read('page:loads', { path: '///', paths: [] })).toBeNull();
   });
 
   it('reads a link to another file, and none that names no path', () => {
@@ -267,6 +353,20 @@ describe('page:key', () => {
     expect(read('page:key', { key: 'c' })?.key).toBe('c');
     expect(read('page:key', { key: 'Enter' })).toBeNull();
     expect(read('page:key', {})).toBeNull();
+  });
+});
+
+// DALTON-HOOK(mobile-web): verify page:pong liveness response parsing
+describe('page:pong', () => {
+  it('accepts positive integer sequence numbers with optional docId and rejects invalid values', () => {
+    expect(read('page:pong', { seq: 1 })).toEqual({ type: 'page:pong', seq: 1 });
+    expect(read('page:pong', { seq: 42, docId: 'doc-42' })).toEqual({ type: 'page:pong', seq: 42, docId: 'doc-42' });
+    for (const seq of [0, -1, 1.5, '3', null, undefined]) {
+      expect(read('page:pong', { seq })).toBeNull();
+    }
+    for (const docId of ['', 'bad space', 123, null]) {
+      expect(read('page:pong', { seq: 1, docId })).toBeNull();
+    }
   });
 });
 
