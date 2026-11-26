@@ -21,7 +21,7 @@ Endpoints:
 import asyncio
 import contextlib
 import logging
-from typing import Any, Literal, Optional  # DALTON-HOOK(workspace-dedup): Any for 409 detail dict
+from typing import Literal, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
@@ -329,154 +329,12 @@ async def create_workspace(
             await cli_approval.workspace_create(http_request, principal, request)
             or computer_id
         )
-        # --- DALTON-HOOK(workspace-dedup): begin ---
-        from src.dalton.coverage.dedup import (
-            WEB_DEDUP_OVERALL_TIMEOUT_SECONDS,
-            WEB_DEDUP_UNAVAILABLE_CODE,
-            WEB_DEDUP_UNAVAILABLE_MESSAGE,
-            find_existing_company_workspace,
+        # DALTON-HOOK(workspace-dedup): delegate company dedup, locked recheck retry, 409 handling, and same-tx coverage registration to src/dalton
+        from src.dalton.coverage.workspace_create import create_workspace_for_web
+        workspace = await create_workspace_for_web(
+            request=request, principal=principal, computer_id=computer_id,
+            get_manager=WorkspaceManager.get_instance, cause_factory=computer_cause,
         )
-        from src.dalton.coverage.units import is_workspace_coverage_registration_active
-
-        raw_coverage_kind = str(request.coverage_kind or "").strip().lower()
-        requested_coverage = raw_coverage_kind not in ("", "none", "other")
-        coverage_active: bool | None = None
-        if requested_coverage:
-            coverage_active = await is_workspace_coverage_registration_active(x_user_id)
-        wants_coverage = bool(requested_coverage and coverage_active)
-        dedup_warning: str | None = None
-        dedup_warning_code: str | None = None
-        if request.allow_duplicate_company:
-            matched_ids: list[str] = []
-            try:
-                dup_for_log = await asyncio.wait_for(
-                    find_existing_company_workspace(
-                        x_user_id, request.name, channel="web"
-                    ),
-                    timeout=WEB_DEDUP_OVERALL_TIMEOUT_SECONDS,
-                )
-                if dup_for_log is not None and dup_for_log.matches:
-                    matched_ids = list(
-                        dup_for_log.matched_workspace_ids
-                        or [
-                            m.workspace_id
-                            for m in dup_for_log.matches
-                            if m.workspace_id
-                        ]
-                    )
-            except Exception:
-                matched_ids = []
-            logger.info(
-                "Skipping company workspace dedup check (allow_duplicate_company=True, user_id=%s, name=%r, matched_workspace_ids=%s)",
-                x_user_id,
-                request.name,
-                matched_ids,
-            )
-        else:
-            dup = None
-            try:
-                dup = await asyncio.wait_for(
-                    find_existing_company_workspace(
-                        x_user_id,
-                        request.name,
-                        channel="web",
-                        raise_on_timeout=True,
-                    ),
-                    timeout=WEB_DEDUP_OVERALL_TIMEOUT_SECONDS,
-                )
-            except TimeoutError:
-                logger.warning(
-                    "Company workspace dedup check timed out after %.1fs; proceeding",
-                    WEB_DEDUP_OVERALL_TIMEOUT_SECONDS,
-                )
-                dedup_warning = WEB_DEDUP_UNAVAILABLE_MESSAGE
-                dedup_warning_code = WEB_DEDUP_UNAVAILABLE_CODE
-            except Exception as exc:
-                logger.warning(
-                    "Company workspace dedup check failed (%s); proceeding",
-                    type(exc).__name__,
-                )
-            if dup is not None and dup.matches:
-                detail: dict[str, Any] = {
-                    "code": "company_workspace_exists",
-                    "message": dup.message,
-                    "matches": dup.matches_payload(),
-                }
-                suggestion = dup.suggestion_payload()
-                if suggestion is not None:
-                    detail["suggestion"] = suggestion
-                raise HTTPException(
-                    status_code=409,
-                    detail=detail,
-                )
-            if (
-                dup is not None
-                and dup.suggestion is not None
-                and not wants_coverage
-                and not request.skip_coverage_suggestion
-                and principal.unlimited
-            ):
-                if coverage_active is None:
-                    coverage_active = await is_workspace_coverage_registration_active(x_user_id)
-                if coverage_active:
-                    suggestion = dup.suggestion_payload()
-                    kind_label = (
-                        "公司" if dup.suggestion.coverage_kind == "company" else "行业"
-                    )
-                    ticker_note = (
-                        f"（代码 {dup.suggestion.ticker}）"
-                        if dup.suggestion.ticker
-                        else ""
-                    )
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "code": "coverage_suggestion",
-                            "message": f"「{request.name}」识别为{kind_label}{ticker_note}，是否自动登记覆盖单元并创建工作区？",
-                            "suggestion": suggestion,
-                        },
-                    )
-        # --- DALTON-HOOK(workspace-dedup): end ---
-        manager = WorkspaceManager.get_instance()
-        with computer_cause("create"):
-            workspace = await manager.create_workspace(
-                user_id=x_user_id,
-                name=request.name,
-                description=request.description,
-                config=request.config,
-                computer_id=computer_id,
-            )
-
-        # --- DALTON-HOOK(workspace-dedup): begin ---
-        if wants_coverage:
-            from src.dalton.coverage.units import auto_register_workspace_coverage_unit
-
-            unit_row, unit_warning, unit_warning_detail = await auto_register_workspace_coverage_unit(
-                x_user_id,
-                workspace_id=str(workspace["workspace_id"]),
-                workspace_name=str(workspace.get("name") or request.name),
-                coverage_kind=request.coverage_kind,
-                ticker=request.ticker,
-                display_name=request.display_name,
-                principal=principal,
-            )
-            if (
-                unit_row is not None
-                or unit_warning is not None
-                or unit_warning_detail is not None
-            ):
-                workspace = dict(workspace)
-                if unit_row is not None:
-                    workspace["coverage_unit"] = unit_row
-                if unit_warning is not None:
-                    workspace["coverage_unit_warning"] = unit_warning
-                if unit_warning_detail is not None:
-                    workspace["coverage_unit_warning_detail"] = unit_warning_detail
-        if dedup_warning is not None:
-            workspace = dict(workspace)
-            workspace["dedup_warning"] = dedup_warning
-            workspace["dedup_warning_code"] = dedup_warning_code
-        # --- DALTON-HOOK(workspace-dedup): end ---
 
         logger.info(
             f"Created workspace {workspace['workspace_id']} for user {x_user_id}"

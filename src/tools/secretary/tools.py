@@ -432,6 +432,7 @@ async def workspaces_create(
     raw_coverage_kind = str(coverage_kind or "").strip().lower()
     requested_coverage = raw_coverage_kind not in ("", "none", "other")
     coverage_active: bool | None = None
+    early_suggestion: Any = None
 
     async def _ensure_coverage_active() -> bool:
         nonlocal coverage_active
@@ -440,6 +441,7 @@ async def workspaces_create(
         return bool(coverage_active)
 
     async def _check_company_dedup() -> Command | None:
+        nonlocal early_suggestion
         if allow_duplicate_company:
             return None
         dup = None
@@ -502,6 +504,8 @@ async def workspaces_create(
                     suggestion=suggestion,
                     **preapproved_meta,
                 )
+        if dup is not None and dup.suggestion is not None:
+            early_suggestion = dup.suggestion
         return None
 
     # DALTON-HOOK(cos-settings-tools): on interrupt resume, read the interrupt
@@ -616,11 +620,39 @@ async def workspaces_create(
         ComputerArchivingError,  # DALTON-HOOK(cos-settings-tools)
         ComputerNotFoundError,  # DALTON-HOOK(cos-settings-tools)
         ComputerPreparingError,
+        DuplicateWorkspaceConflictError,  # DALTON-HOOK(workspace-dedup)
         ProviderNotOffered,  # DALTON-HOOK(cos-settings-tools)
     )
 
     try:
         from src.server.services.workspace_manager import WorkspaceManager
+        # --- DALTON-HOOK(workspace-dedup): begin ---
+        from src.dalton.coverage.workspace_create import (
+            build_in_tx_identity_hook,
+            format_cos_duplicate_conflict_error,
+            resolve_cos_colleague_dedup,
+            resolve_coverage_registration_result,
+            resolve_effective_company_ticker,
+        )
+
+        effective_ticker, effective_ticker_key = resolve_effective_company_ticker(
+            raw_coverage_kind=raw_coverage_kind,
+            explicit_ticker=ticker,
+            suggestion=early_suggestion,
+        )
+        registration_state: dict[str, Any] = {"ran": False, "result": (None, None, None)}
+        in_tx_hook = build_in_tx_identity_hook(
+            user_id=user_id,
+            workspace_name=name,
+            coverage_kind=coverage_kind,
+            ticker=ticker,
+            display_name=display_name,
+            wants_coverage=wants_coverage,
+            raw_coverage_kind=raw_coverage_kind,
+            effective_ticker_key=effective_ticker_key,
+            registration_state=registration_state,
+        )
+        # --- DALTON-HOOK(workspace-dedup): end ---
 
         workspace_manager = WorkspaceManager.get_instance()
         # --- DALTON-HOOK(cos-settings-tools): begin ---
@@ -659,6 +691,9 @@ async def workspaces_create(
                 if recheck.active:
                     verified_company_candidates = recheck.checked_candidates
                     check_colleague_duplicate = recheck.check_colleague_workspaces
+            # DALTON-HOOK(workspace-dedup): preapproved CoS creates also enforce colleague dedup + ws_ticker lock
+            elif preapproved and not allow_duplicate_company:
+                check_colleague_duplicate = await resolve_cos_colleague_dedup(user_id)
 
             create_kwargs: dict[str, Any] = {
                 "user_id": user_id,
@@ -671,6 +706,11 @@ async def workspaces_create(
                 create_kwargs["verified_company_candidates"] = verified_company_candidates
             if check_colleague_duplicate:
                 create_kwargs["check_colleague_duplicate"] = True
+            # DALTON-HOOK(workspace-dedup): forward target_ticker & same-tx company identity hook
+            if effective_ticker and not allow_duplicate_company:
+                create_kwargs["target_ticker"] = effective_ticker
+            if in_tx_hook is not None:
+                create_kwargs["on_workspace_inserted"] = in_tx_hook
             if snapshot.get("duplicate_workspace_id") is not None:
                 create_kwargs["expected_duplicate_workspace_id"] = str(
                     snapshot["duplicate_workspace_id"]
@@ -699,11 +739,27 @@ async def workspaces_create(
                 )
             workspace = await workspace_manager.create_workspace(**create_kwargs)
         else:
-            workspace = await workspace_manager.create_workspace(
-                user_id=user_id,
-                name=name,
-                description=description,
-            )
+            # DALTON-HOOK(workspace-dedup): enforce ticker lock + same-tx company identity even without a snapshot
+            fallback_kwargs: dict[str, Any] = {
+                "user_id": user_id,
+                "name": name,
+                "description": description,
+            }
+            if not allow_duplicate_company and await resolve_cos_colleague_dedup(user_id):
+                fallback_kwargs["check_duplicate_snapshot"] = True
+                fallback_kwargs["check_colleague_duplicate"] = True
+                if effective_ticker:
+                    fallback_kwargs["target_ticker"] = effective_ticker
+            elif not allow_duplicate_company and effective_ticker:
+                from src.dalton.company_identity import is_company_system_user
+                from src.dalton.coverage.dedup import is_company_dedup_active
+
+                if is_company_dedup_active() and not is_company_system_user(user_id):
+                    fallback_kwargs["check_duplicate_snapshot"] = True
+                    fallback_kwargs["target_ticker"] = effective_ticker
+            if in_tx_hook is not None:
+                fallback_kwargs["on_workspace_inserted"] = in_tx_hook
+            workspace = await workspace_manager.create_workspace(**fallback_kwargs)
         # --- DALTON-HOOK(cos-settings-tools): end ---
 
         result = {
@@ -722,15 +778,17 @@ async def workspaces_create(
         # --- DALTON-HOOK(cos-settings-tools): end ---
         # --- DALTON-HOOK(workspace-dedup): begin ---
         if wants_coverage:
-            from src.dalton.coverage.units import auto_register_workspace_coverage_unit
-
-            unit_row, unit_warning, unit_warning_detail = await auto_register_workspace_coverage_unit(
-                user_id,
-                workspace_id=str(workspace["workspace_id"]),
-                workspace_name=str(workspace.get("name") or name),
-                coverage_kind=coverage_kind,
-                ticker=ticker,
-                display_name=display_name,
+            unit_row, unit_warning, unit_warning_detail = (
+                await resolve_coverage_registration_result(
+                    user_id=user_id,
+                    workspace_id=str(workspace["workspace_id"]),
+                    workspace_name=str(workspace.get("name") or name),
+                    coverage_kind=coverage_kind,
+                    ticker=ticker,
+                    display_name=display_name,
+                    wants_coverage=wants_coverage,
+                    registration_state=registration_state,
+                )
             )
             if unit_row is not None:
                 result["coverage_unit"] = unit_row
@@ -774,6 +832,18 @@ async def workspaces_create(
             tool_call_id,
             code="scope_changed",
             message_status="error",
+            **preapproved_meta,
+        )
+    # DALTON-HOOK(workspace-dedup): handle locked-recheck duplicate conflict on non-snapshot create
+    except DuplicateWorkspaceConflictError as conflict:
+        err_msg, err_code, err_extra = await format_cos_duplicate_conflict_error(
+            user_id, name, conflict
+        )
+        return error_command(
+            err_msg,
+            tool_call_id,
+            code=err_code,
+            **err_extra,
             **preapproved_meta,
         )
     except (ComputerNotFoundError, ComputerArchivingError):

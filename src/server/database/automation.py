@@ -72,17 +72,12 @@ def owned_execution_thread_join_sql(
     exec_alias: str, task_alias: str, thread_alias: str = "t"
 ) -> str:
     """LEFT JOIN ``conversation_threads`` only when the thread sits in a live
-    workspace that the automation's owner can read (their own workspace, or a
-    thread they own in a colleague's workspace).
+    workspace owned by the automation's owner.
 
     DALTON-HOOK(history-computer-scope): ``automation_executions.conversation_thread_id``
-    has no foreign key. If a run's thread was deleted and another account
-    reused that UUID in their own workspace, or the thread's workspace was
-    soft-deleted, treat the execution as having no accessible thread so
-    neither its ``workspace_id`` nor computer-scope reach leaks across
-    accounts or points at a deleted workspace. A caller-owned thread in a live
-    colleague workspace remains linked so its actual ``workspace_id`` is
-    preserved even after the automation moves.
+    has no foreign key. Keep SQL strictly owner-scoped on upstream tables
+    (never referencing ``t.user_id`` or Dalton tables); colleague thread
+    accessibility is resolved per page in Python.
     """
     return (
         f"LEFT JOIN conversation_threads {thread_alias}\n"
@@ -91,10 +86,7 @@ def owned_execution_thread_join_sql(
         "       SELECT 1 FROM workspaces thread_workspace\n"
         f"       WHERE thread_workspace.workspace_id = {thread_alias}.workspace_id\n"
         "         AND thread_workspace.status <> 'deleted'\n"
-        "         AND (\n"
-        f"             thread_workspace.user_id = {task_alias}.user_id\n"
-        f"             OR {thread_alias}.user_id = {task_alias}.user_id\n"
-        "         )\n"
+        f"         AND thread_workspace.user_id = {task_alias}.user_id\n"
         "   )"
     )
 

@@ -248,6 +248,21 @@ class ArchivePostSubmitGoneError(RuntimeError):
 # --- DALTON-HOOK(cos-settings-tools): end ---
 
 
+# --- DALTON-HOOK(workspace-dedup): begin ---
+class DuplicateWorkspaceConflictError(RuntimeError):
+    """Locked duplicate recheck detected a matching workspace or candidate drift."""
+
+    def __init__(
+        self,
+        message: str = "Workspace duplicate state changed before creation",
+        *,
+        conflicting_workspace_id: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.conflicting_workspace_id = conflicting_workspace_id
+# --- DALTON-HOOK(workspace-dedup): end ---
+
+
 class ComputerRemovalRefused(RuntimeError):
     """The computer stays, for a reason its owner can act on.
 

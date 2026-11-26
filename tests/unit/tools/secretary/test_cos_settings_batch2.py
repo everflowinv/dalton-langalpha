@@ -1430,7 +1430,7 @@ async def test_real_langgraph_approve_two_phase_dedup_matches_expected_workspace
     )
     assert len(recheck_results) == 1
     assert recheck_results[0].status == "clear"
-    assert recheck_results[0].checked_candidates == ((dup_ws_id, "BABA", None),)
+    assert recheck_results[0].checked_candidates == ((dup_ws_id, "BABA", None, None),)
     assert all(call["lock_held"] is False for call in llm_calls)
     assert lock_state["lock_acquires"] == 1
     assert lock_state["inserts"] == 1

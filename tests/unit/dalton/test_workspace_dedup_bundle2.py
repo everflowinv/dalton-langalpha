@@ -225,7 +225,7 @@ async def test_bd5_recheck_recollects_candidates_when_coverage_unit_archived_mid
     assert snap.status == "clear"
     assert snap.matched_workspace_ids == ()
     assert collect_calls["n"] == 2
-    assert snap.checked_candidates == ((ws_notes, "宏观随笔", None),)
+    assert snap.checked_candidates == ((ws_notes, "宏观随笔", None, None),)
 
 
 @pytest.mark.asyncio
@@ -629,7 +629,7 @@ async def test_bd5_r2_recheck_detects_unmatched_candidate_unit_archived_mid_chec
     snap = await recheck_company_workspace_before_create(USER_ID, "NVDA", channel="cos")
     assert snap.status == "clear"
     assert collect_calls["n"] == 2
-    assert (ws_baba, "阿里研究", None) in snap.checked_candidates
+    assert (ws_baba, "阿里研究", None, None) in snap.checked_candidates
 
 
 @pytest.mark.asyncio

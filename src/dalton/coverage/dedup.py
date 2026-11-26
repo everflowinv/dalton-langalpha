@@ -52,7 +52,6 @@ from src.dalton.access_tiers import get_user_tier
 from src.dalton.coverage.identity import (
     _extract_ticker_from_text,
     canonical_workspace_ticker_key,
-    is_historical_duplicate_workspace,
     normalize_ticker_key,
 )
 from src.dalton.credentials import get_team_credential_holder_id
@@ -66,6 +65,13 @@ from src.dalton.llm.complete import (
     dalton_complete,
     model_requires_user_oauth,
 )
+from src.dalton.coverage.locked_recheck import (
+    WORKSPACE_COMPANY_TICKER_CONFIG_KEY,
+    is_dedup_excluded_workspace,
+    row_is_historical_duplicate,
+    row_is_home_stand_in,
+)
+from src.dalton import settings as dalton_settings_mod
 from src.dalton.settings import (
     is_coverage_units_enabled,
     is_dalton_supabase_auth_enabled,
@@ -269,6 +275,26 @@ class _CandidateEntry:
     ws_row: dict[str, Any] | None
 
 
+def _is_dedup_auth_enabled() -> bool:
+    """Whether multi-user Dalton auth (Supabase or Standalone Core local auth) is active."""
+    return (
+        is_dalton_supabase_auth_enabled()
+        or dalton_settings_mod.is_dalton_local_auth_enabled()
+    )
+
+
+def is_company_dedup_active() -> bool:
+    """Whether company workspace dedup and locked recheck apply to this deployment."""
+    return is_coverage_units_enabled() and _is_dedup_auth_enabled()
+
+
+def is_colleague_dedup_enabled() -> bool:
+    """Whether dedup includes internal colleagues' workspaces (follows COLLEAGUE_SHARING capability)."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    return has_capability(CapabilityId.COLLEAGUE_SHARING) and _is_dedup_auth_enabled()
+
+
 def _safe_workspace_name_key(raw: str | None) -> str | None:
     try:
         return workspace_name_key(raw)
@@ -414,6 +440,7 @@ async def _load_live_workspaces(
                w.status,
                (w.config->'home_stand_in') = 'true'::jsonb AS is_home_stand_in,
                NULLIF(BTRIM(COALESCE(w.config->>'dalton_historical_duplicate_of', '')), '') IS NOT NULL AS is_historical_duplicate,
+               NULLIF(BTRIM(COALESCE(w.config->>'{WORKSPACE_COMPANY_TICKER_CONFIG_KEY}', '')), '') AS config_ticker,
                w.last_activity_at,
                w.updated_at,
                w.created_at,
@@ -481,10 +508,7 @@ def _row_is_home_stand_in(
     *,
     config_key: str = "config",
 ) -> bool:
-    if bool(row.get("is_home_stand_in")):
-        return True
-    cfg = row.get(config_key)
-    return isinstance(cfg, Mapping) and bool(cfg.get(HOME_STAND_IN_KEY))
+    return row_is_home_stand_in(row, config_key=config_key)
 
 
 def _row_is_stand_in_or_historical(
@@ -492,14 +516,9 @@ def _row_is_stand_in_or_historical(
     *,
     config_key: str = "config",
 ) -> bool:
-    if _row_is_home_stand_in(row, config_key=config_key) or bool(
-        row.get("is_historical_duplicate")
-    ):
-        return True
-    cfg = row.get(config_key)
-    if cfg is None:
-        return False
-    return is_historical_duplicate_workspace({"config": cfg})
+    return row_is_home_stand_in(row, config_key=config_key) or row_is_historical_duplicate(
+        row, config_key=config_key
+    )
 
 
 def _is_excluded_workspace(
@@ -510,19 +529,13 @@ def _is_excluded_workspace(
     row: Mapping[str, Any],
     config_key: str = "config",
 ) -> bool:
-    if not ws_id or ws_status in ("deleted", "unbound"):
-        return True
-    if _row_is_stand_in_or_historical(row, config_key=config_key):
-        return True
-    ws_check = {
-        "workspace_id": ws_id,
-        "user_id": ws_owner_id,
-        "status": ws_status,
-        "config": row.get(config_key),
-    }
-    if is_reserved_row(ws_check) or is_historical_duplicate_workspace(ws_check):
-        return True
-    return False
+    return is_dedup_excluded_workspace(
+        ws_id=ws_id,
+        ws_owner_id=ws_owner_id,
+        ws_status=ws_status,
+        row=row,
+        config_key=config_key,
+    )
 
 
 async def _resolve_caller_tier(uid: str) -> str:
@@ -623,6 +636,7 @@ async def _collect_candidates(
     raw_name: str,
     *,
     caller_tier: str,
+    include_colleagues: bool | None = None,
     exclude_same_name_workspace_id: str | None = None,
     conn: Any = None,
     stats: dict[str, int] | None = None,
@@ -634,6 +648,11 @@ async def _collect_candidates(
     """
     input_name_key = _safe_workspace_name_key(raw_name)
     is_external = caller_tier == "external"
+    check_colleagues = (
+        not is_external
+        if include_colleagues is None
+        else (bool(include_colleagues) and not is_external)
+    )
 
     raw_items: dict[str, dict[str, Any]] = {}
 
@@ -641,6 +660,22 @@ async def _collect_candidates(
         async with c.cursor(row_factory=dict_row) as cur:
             if is_external:
                 unit_rows: list[dict[str, Any]] = []
+                ws_rows = await _load_live_workspaces(cur, owner_user_id=uid)
+                ws_rows = [
+                    ws
+                    for ws in ws_rows
+                    if str(ws.get("user_id") or "").strip() == uid
+                ]
+            elif not check_colleagues:
+                all_units = await _load_active_company_units(cur)
+                unit_rows = [
+                    u
+                    for u in all_units
+                    if str(
+                        u.get("workspace_owner_id") or u.get("owner_user_id") or ""
+                    ).strip()
+                    == uid
+                ]
                 ws_rows = await _load_live_workspaces(cur, owner_user_id=uid)
                 ws_rows = [
                     ws
@@ -676,32 +711,40 @@ async def _collect_candidates(
                         if not unit_id_u:
                             continue
                         unit_owner_id = str(u.get("owner_user_id") or "").strip()
-                        unit_owner_email = (
-                            u.get("unit_owner_email")
-                            if "unit_owner_email" in u
-                            else u.get("owner_email")
-                        )
-                        if not _is_internal_team_owner(unit_owner_id, unit_owner_email):
-                            continue
+                        if not check_colleagues:
+                            if unit_owner_id != uid:
+                                continue
+                        else:
+                            unit_owner_email = (
+                                u.get("unit_owner_email")
+                                if "unit_owner_email" in u
+                                else u.get("owner_email")
+                            )
+                            if not _is_internal_team_owner(unit_owner_id, unit_owner_email):
+                                continue
                         unbound_units[unit_id_u] = u
                         continue
                     ws_owner_id = str(
                         u.get("workspace_owner_id") or u.get("owner_user_id") or ""
                     ).strip()
-                    if not _is_internal_team_owner(ws_owner_id, u.get("owner_email")):
-                        continue
-                    unit_owner_id = str(u.get("owner_user_id") or ws_owner_id).strip()
-                    unit_owner_email = (
-                        u.get("unit_owner_email")
-                        if "unit_owner_email" in u
-                        else u.get("owner_email")
-                    )
-                    if (
-                        unit_owner_id
-                        and unit_owner_id != ws_owner_id
-                        and not _is_internal_team_owner(unit_owner_id, unit_owner_email)
-                    ):
-                        continue
+                    if not check_colleagues:
+                        if ws_owner_id != uid:
+                            continue
+                    else:
+                        if not _is_internal_team_owner(ws_owner_id, u.get("owner_email")):
+                            continue
+                        unit_owner_id = str(u.get("owner_user_id") or ws_owner_id).strip()
+                        unit_owner_email = (
+                            u.get("unit_owner_email")
+                            if "unit_owner_email" in u
+                            else u.get("owner_email")
+                        )
+                        if (
+                            unit_owner_id
+                            and unit_owner_id != ws_owner_id
+                            and not _is_internal_team_owner(unit_owner_id, unit_owner_email)
+                        ):
+                            continue
                     ws_name = str(u.get("workspace_name") or "").strip()
                     ws_status = str(u.get("workspace_status") or "").strip()
                     if not ws_name or _is_excluded_workspace(
@@ -717,7 +760,7 @@ async def _collect_candidates(
             for ws in ws_rows:
                 ws_id = _norm_uuid(ws.get("workspace_id"))
                 ws_owner_id = str(ws.get("user_id") or "").strip()
-                if is_external:
+                if is_external or not check_colleagues:
                     if ws_owner_id != uid:
                         continue
                 elif not _is_internal_team_owner(ws_owner_id, ws.get("owner_email")):
@@ -736,6 +779,14 @@ async def _collect_candidates(
                 owner_name = _resolve_display_name(
                     ws.get("owner_name"), ws.get("owner_email"), ws_owner_id
                 )
+                raw_config_ticker = str(ws.get("config_ticker") or "").strip().upper() or None
+                if raw_config_ticker is None and isinstance(ws.get("config"), Mapping):
+                    raw_config_ticker = (
+                        str(ws["config"].get(WORKSPACE_COMPANY_TICKER_CONFIG_KEY) or "")
+                        .strip()
+                        .upper()
+                        or None
+                    )
                 raw_items[ws_id] = {
                     "ws_id": ws_id,
                     "unit_id": None,
@@ -743,6 +794,7 @@ async def _collect_candidates(
                     "ws_name": ws_name,
                     "owner_name": owner_name,
                     "activity_ts": _activity_timestamp(ws),
+                    "config_ticker": raw_config_ticker,
                     "ws_row": {
                         "workspace_id": ws_id,
                         "user_id": ws_owner_id,
@@ -825,7 +877,8 @@ async def _collect_candidates(
         doc_ticker = str(doc.get("ticker") or "").strip().upper() or None
         doc_name = str(doc.get("name") or "").strip() or None
         doc_name_zh = str(doc.get("name_zh") or "").strip() or None
-        effective_ticker = unit_ticker or doc_ticker
+        config_ticker = item.get("config_ticker")
+        effective_ticker = unit_ticker or doc_ticker or config_ticker
 
         prelim.append(
             {
@@ -1854,18 +1907,19 @@ async def _deterministic_ticker_match_entries(
         ):
             continue
         unit_key = normalize_ticker_key(entry.unit_ticker)
+        doc_key = normalize_ticker_key(entry.doc_ticker)
         name_matches = colleague_workspace_name_matches_ticker(
             raw_name,
             entry.workspace_name,
             strict_name_ticker_shape=strict_name_ticker_shape,
         )
-        if unit_key != target_ticker_key and not name_matches:
+        if unit_key != target_ticker_key and doc_key != target_ticker_key and not name_matches:
             continue
         if entry.unit_id and entry.unit_id in dead_unit_ids:
             if (
                 not entry_ws_id
                 or entry_ws_id in dead_ws_ids
-                or not name_matches
+                or (not name_matches and doc_key != target_ticker_key)
             ):
                 continue
             ws_only_entry = replace(
@@ -1924,12 +1978,17 @@ async def _deterministic_ticker_match_entries(
         ):
             continue
         live_unit_key = normalize_ticker_key(live_entry.unit_ticker)
+        live_doc_key = normalize_ticker_key(live_entry.doc_ticker)
         live_name_matches = colleague_workspace_name_matches_ticker(
             raw_name,
             live_entry.workspace_name,
             strict_name_ticker_shape=strict_name_ticker_shape,
         )
-        if live_unit_key != target_ticker_key and not live_name_matches:
+        if (
+            live_unit_key != target_ticker_key
+            and live_doc_key != target_ticker_key
+            and not live_name_matches
+        ):
             continue
         dedup_key = f"ws:{live_ws_id}" if live_ws_id else f"unit:{live_entry.unit_id}"
         if dedup_key in seen_keys:
@@ -1996,7 +2055,7 @@ async def _deterministic_ticker_match_snapshot(
     raw_name: str,
     entries: Sequence[_CandidateEntry],
     is_external: bool,
-    checked_candidates: tuple[tuple[str, str, str | None], ...],
+    checked_candidates: tuple[tuple[str, str, str | None, str | None], ...],
     check_colleagues: bool,
     expected_duplicate_workspace_id: str | None = None,
     checked_hits: Sequence[tuple[_CandidateEntry, str, str]] = (),
@@ -2059,11 +2118,18 @@ async def _find_matches(
     *,
     channel: str,
     caller_tier: str,
+    include_colleagues: bool | None = None,
     exclude_workspace_id: str | None = None,
     raise_on_timeout: bool = False,
     conn: Any = None,
     stats: dict[str, int] | None = None,
+    snapshot_out: list[CompanyDedupRecheckSnapshot] | None = None,
 ) -> DuplicateMatch | None:
+    eff_include_colleagues = (
+        caller_tier != "external"
+        if include_colleagues is None
+        else bool(include_colleagues and caller_tier != "external")
+    )
     excluded_ws_id = _norm_uuid(exclude_workspace_id) or (
         str(exclude_workspace_id or "").strip() or None
     )
@@ -2071,13 +2137,18 @@ async def _find_matches(
     carry_downgraded: list[_CandidateEntry] = []
     for _attempt in range(2):
         allow_recollect = _attempt == 0
+        collect_kwargs: dict[str, Any] = {
+            "caller_tier": caller_tier,
+            "include_colleagues": eff_include_colleagues,
+            "conn": conn,
+            "stats": stats,
+        }
+        if excluded_ws_id is not None:
+            collect_kwargs["exclude_same_name_workspace_id"] = excluded_ws_id
         early_exit, entries = await _collect_candidates(
             uid,
             raw_name,
-            caller_tier=caller_tier,
-            exclude_same_name_workspace_id=excluded_ws_id,
-            conn=conn,
-            stats=stats,
+            **collect_kwargs,
         )
         if carry_downgraded:
             seen_ws = {e.ws_id for e in entries if e.ws_id}
@@ -2088,7 +2159,18 @@ async def _find_matches(
             carry_downgraded = []
         if excluded_ws_id is not None:
             entries = [e for e in entries if e.ws_id != excluded_ws_id]
-        if early_exit or not entries:
+        if early_exit:
+            return None
+        if not entries:
+            if snapshot_out is not None:
+                snapshot_out.append(
+                    CompanyDedupRecheckSnapshot(
+                        status="clear",
+                        checked_candidates=(),
+                        active=True,
+                        check_colleague_workspaces=eff_include_colleagues,
+                    )
+                )
             return None
 
         det_unit_changed: list[str] = []
@@ -2132,6 +2214,37 @@ async def _find_matches(
             )
         break
 
+    def _record_clear_snapshot(*, has_failures: bool) -> None:
+        if snapshot_out is None:
+            return
+        if has_failures:
+            snapshot_out.append(
+                CompanyDedupRecheckSnapshot(
+                    status="unavailable",
+                    active=True,
+                    check_colleague_workspaces=eff_include_colleagues,
+                )
+            )
+            return
+        checked_candidates = tuple(
+            (
+                entry.ws_id,
+                entry.workspace_name,
+                normalize_ticker_key(entry.unit_ticker),
+                normalize_ticker_key(entry.doc_ticker),
+            )
+            for entry in entries
+            if entry.ws_id
+        )
+        snapshot_out.append(
+            CompanyDedupRecheckSnapshot(
+                status="clear",
+                checked_candidates=checked_candidates,
+                active=True,
+                check_colleague_workspaces=eff_include_colleagues,
+            )
+        )
+
     suggestion_out: list[DedupCoverageSuggestion] = []
     llm_partial_failures: list[Exception] = []
     hits = await _judge_candidates_with_llm(
@@ -2148,6 +2261,7 @@ async def _find_matches(
             for exc in llm_partial_failures:
                 if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
                     raise exc
+        _record_clear_snapshot(has_failures=bool(llm_partial_failures))
         if suggestion_out:
             return DuplicateMatch(
                 company=raw_name,
@@ -2196,6 +2310,9 @@ async def _find_matches(
             for exc in (*llm_partial_failures, *recheck_failures):
                 if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
                     raise exc
+        _record_clear_snapshot(
+            has_failures=bool(llm_partial_failures or recheck_failures)
+        )
         if suggestion_out:
             return DuplicateMatch(
                 company=raw_name,
@@ -2253,7 +2370,7 @@ class CompanyDedupRecheckSnapshot:
     status: Literal["clear", "matched", "unavailable"]
     matched_workspace_ids: tuple[str, ...] = ()
     has_unbound_or_unreadable_match: bool = False
-    checked_candidates: tuple[tuple[str, str, str | None], ...] = ()
+    checked_candidates: tuple[tuple[str, str, str | None, str | None], ...] = ()
     active: bool = True
     check_colleague_workspaces: bool = False
 
@@ -2272,7 +2389,7 @@ async def recheck_company_workspace_before_create(
     from check failures (``status="unavailable"``), and returns the observed
     candidate list for deterministic Phase 2 verification inside the lock.
     """
-    if not is_coverage_units_enabled() or not is_dalton_supabase_auth_enabled():
+    if not is_company_dedup_active():
         return CompanyDedupRecheckSnapshot(status="clear", active=False)
 
     cleaned_channel = str(channel or "cos").strip().lower()
@@ -2289,7 +2406,7 @@ async def recheck_company_workspace_before_create(
         caller_tier = await _resolve_caller_tier(uid)
         if caller_tier == "company":
             return CompanyDedupRecheckSnapshot(status="clear", active=False)
-        check_colleagues = caller_tier != "external"
+        check_colleagues = (caller_tier != "external") and is_colleague_dedup_enabled()
         is_external = caller_tier == "external"
 
         carry_downgraded: list[_CandidateEntry] = []
@@ -2299,12 +2416,19 @@ async def recheck_company_workspace_before_create(
             downgraded_entries: list[_CandidateEntry] = []
             partial_failures: list[Exception] = []
 
+            collect_kwargs: dict[str, Any] = {
+                "caller_tier": caller_tier,
+                "include_colleagues": check_colleagues,
+                "stats": stats,
+            }
+            if expected_duplicate_workspace_id is not None:
+                collect_kwargs["exclude_same_name_workspace_id"] = (
+                    expected_duplicate_workspace_id
+                )
             early_exit, entries = await _collect_candidates(
                 uid,
                 raw_name,
-                caller_tier=caller_tier,
-                exclude_same_name_workspace_id=expected_duplicate_workspace_id,
-                stats=stats,
+                **collect_kwargs,
             )
             if carry_downgraded:
                 seen_ws = {e.ws_id for e in entries if e.ws_id}
@@ -2314,7 +2438,12 @@ async def recheck_company_workspace_before_create(
                         seen_ws.add(d_entry.ws_id)
                 carry_downgraded = []
             checked_candidates = tuple(
-                (entry.ws_id, entry.workspace_name, normalize_ticker_key(entry.unit_ticker))
+                (
+                    entry.ws_id,
+                    entry.workspace_name,
+                    normalize_ticker_key(entry.unit_ticker),
+                    normalize_ticker_key(entry.doc_ticker),
+                )
                 for entry in entries
                 if entry.ws_id
             )
@@ -2487,6 +2616,166 @@ async def recheck_company_workspace_before_create(
         return CompanyDedupRecheckSnapshot(status="unavailable")
 
 
+async def build_deterministic_duplicate_match(
+    user_id: str | None,
+    name: str | None,
+    workspace_id: str | None,
+    *,
+    channel: str = "web",
+    conn: Any = None,
+) -> DuplicateMatch | None:
+    """Build a ``DuplicateMatch`` for a known conflicting workspace found under lock.
+
+    Used as a deterministic fallback on the web create path when the locked
+    recheck caught a concrete conflicting workspace (e.g. normalized ticker or
+    company knowledge doc ticker) and a follow-up LLM dedup call returned none.
+    """
+    uid = str(user_id or "").strip()
+    raw_name = str(name or "").strip()
+    ws_id = _norm_uuid(workspace_id)
+    if not uid or not raw_name or not ws_id:
+        return None
+    cleaned_channel = str(channel or "web").strip().lower()
+    if cleaned_channel not in ("web", "cos"):
+        raise ValueError(f"Unsupported channel: {channel!r}")
+
+    ws_row: dict[str, Any] | None = None
+    unit_row: dict[str, Any] | None = None
+    doc_row: dict[str, str] = {}
+    async with get_db_connection(conn) as c:
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT w.workspace_id::text AS workspace_id,
+                       w.user_id,
+                       w.name,
+                       w.status,
+                       (w.config->'home_stand_in') = 'true'::jsonb AS is_home_stand_in,
+                       NULLIF(BTRIM(COALESCE(w.config->>'dalton_historical_duplicate_of', '')), '') IS NOT NULL AS is_historical_duplicate,
+                       NULLIF(BTRIM(COALESCE(w.config->>'{WORKSPACE_COMPANY_TICKER_CONFIG_KEY}', '')), '') AS config_ticker,
+                       u.name AS owner_name,
+                       u.email AS owner_email
+                FROM workspaces w
+                LEFT JOIN users u ON u.user_id = w.user_id
+                WHERE w.workspace_id = ANY(%s::uuid[])
+                """,
+                ([ws_id],),
+            )
+            fetched_ws = await cur.fetchone()
+            if fetched_ws:
+                ws_row = dict(fetched_ws)
+                docs = await _load_workspace_company_docs(cur, [ws_id])
+                doc_row = docs.get(ws_id) or {}
+                await cur.execute(
+                    """
+                    SELECT u.unit_id::text AS unit_id,
+                           u.display_name,
+                           u.ticker,
+                           u.owner_user_id,
+                           COALESCE(u.lead_analyst_user_id, u.owner_user_id) AS lead_analyst_user_id,
+                           ul.name AS lead_name,
+                           ul.email AS lead_email
+                    FROM dalton_coverage_units u
+                    LEFT JOIN users ul ON ul.user_id = COALESCE(u.lead_analyst_user_id, u.owner_user_id)
+                    WHERE u.workspace_id = %s::uuid
+                      AND u.status = 'active'
+                      AND u.kind = 'company'
+                    ORDER BY u.updated_at DESC NULLS LAST
+                    LIMIT 1
+                    """,
+                    (ws_id,),
+                )
+                fetched_unit = await cur.fetchone()
+                if fetched_unit:
+                    unit_row = dict(fetched_unit)
+
+    if not ws_row:
+        return None
+    ws_owner_id = str(ws_row.get("user_id") or "").strip()
+    ws_status = str(ws_row.get("status") or "").strip()
+    ws_name = str(ws_row.get("name") or "").strip()
+    if not ws_name or _is_excluded_workspace(
+        ws_id=ws_id,
+        ws_owner_id=ws_owner_id,
+        ws_status=ws_status,
+        row=ws_row,
+    ):
+        return None
+
+    owner_name = _resolve_display_name(
+        ws_row.get("owner_name"), ws_row.get("owner_email"), ws_owner_id
+    )
+    unit_ticker = (
+        str(unit_row.get("ticker") or "").strip().upper() or None
+        if unit_row is not None
+        else None
+    )
+    doc_ticker = str(doc_row.get("ticker") or "").strip().upper() or None
+    config_ticker = str(ws_row.get("config_ticker") or "").strip().upper() or None
+    if config_ticker is None and isinstance(ws_row.get("config"), Mapping):
+        config_ticker = (
+            str(ws_row["config"].get(WORKSPACE_COMPANY_TICKER_CONFIG_KEY) or "")
+            .strip()
+            .upper()
+            or None
+        )
+    lead_uid = (
+        str(unit_row.get("lead_analyst_user_id") or unit_row.get("owner_user_id") or "").strip()
+        if unit_row is not None
+        else ""
+    )
+    lead_name = (
+        _resolve_display_name(unit_row.get("lead_name"), unit_row.get("lead_email"), lead_uid)
+        if unit_row is not None and lead_uid
+        else None
+    )
+    fresh_ws = {
+        "workspace_id": ws_id,
+        "user_id": ws_owner_id,
+        "name": ws_name,
+        "status": ws_status,
+        "owner_name": owner_name,
+        "config": {HOME_STAND_IN_KEY: _row_is_home_stand_in(ws_row)},
+    }
+    entry = _CandidateEntry(
+        short_id="c1",
+        order_idx=0,
+        ws_id=ws_id,
+        unit_id=_norm_uuid(unit_row.get("unit_id")) if unit_row is not None else None,
+        unbound_unit=False,
+        workspace_name=ws_name,
+        owner_name=owner_name,
+        lead_analyst_name=lead_name,
+        ticker=unit_ticker or doc_ticker or config_ticker,
+        unit_ticker=unit_ticker,
+        unit_display_name=(
+            str(unit_row.get("display_name") or "").strip() or None
+            if unit_row is not None
+            else None
+        ),
+        doc_ticker=doc_ticker,
+        doc_name=str(doc_row.get("name") or "").strip() or None,
+        doc_name_zh=str(doc_row.get("name_zh") or "").strip() or None,
+        is_unit=unit_row is not None,
+        activity_ts=0.0,
+        ws_row=fresh_ws,
+    )
+    cand, matched_ws_id = await _resolve_live_hit_candidate(
+        uid,
+        entry,
+        fresh_ws,
+        channel=cleaned_channel,
+        conn=conn,
+    )
+    message = _format_duplicate_message(raw_name, cand)
+    return DuplicateMatch(
+        company=raw_name,
+        message=message,
+        matches=(cand,),
+        matched_workspace_ids=(matched_ws_id,) if matched_ws_id else (),
+    )
+
+
 async def find_existing_company_workspace(
     user_id: str | None,
     name: str | None,
@@ -2495,9 +2784,12 @@ async def find_existing_company_workspace(
     exclude_workspace_id: str | None = None,
     raise_on_timeout: bool = False,
     conn: Any = None,
+    snapshot_out: list[CompanyDedupRecheckSnapshot] | None = None,
 ) -> DuplicateMatch | None:
     """Return matching existing company workspaces, or None when clear / disabled / on error."""
-    if not is_coverage_units_enabled() or not is_dalton_supabase_auth_enabled():
+    if not is_company_dedup_active():
+        if snapshot_out is not None:
+            snapshot_out.append(CompanyDedupRecheckSnapshot(status="clear", active=False))
         return None
 
     cleaned_channel = str(channel or "web").strip().lower()
@@ -2507,24 +2799,41 @@ async def find_existing_company_workspace(
     uid = str(user_id or "").strip()
     raw_name = str(name or "").strip()
     if not uid or not raw_name:
+        if snapshot_out is not None:
+            snapshot_out.append(CompanyDedupRecheckSnapshot(status="clear", active=False))
         return None
 
     stats = {"workspace_count": 0}
+    include_colleagues = False
     try:
         caller_tier = await _resolve_caller_tier(uid)
         if caller_tier == "company":
+            if snapshot_out is not None:
+                snapshot_out.append(CompanyDedupRecheckSnapshot(status="clear", active=False))
             return None
+        include_colleagues = (caller_tier != "external") and is_colleague_dedup_enabled()
         return await _find_matches(
             uid,
             raw_name,
             channel=cleaned_channel,
             caller_tier=caller_tier,
+            include_colleagues=include_colleagues,
             exclude_workspace_id=exclude_workspace_id,
             raise_on_timeout=raise_on_timeout,
             conn=conn,
             stats=stats,
+            snapshot_out=snapshot_out,
         )
     except (TimeoutError, asyncio.TimeoutError) as exc:
+        if snapshot_out is not None:
+            snapshot_out.clear()
+            snapshot_out.append(
+                CompanyDedupRecheckSnapshot(
+                    status="unavailable",
+                    active=True,
+                    check_colleague_workspaces=include_colleagues,
+                )
+            )
         logger.warning(
             "Company workspace dedup check timed out (%s, workspace_count=%d); proceeding",
             type(exc).__name__,
@@ -2534,6 +2843,15 @@ async def find_existing_company_workspace(
             raise
         return None
     except Exception as exc:
+        if snapshot_out is not None:
+            snapshot_out.clear()
+            snapshot_out.append(
+                CompanyDedupRecheckSnapshot(
+                    status="unavailable",
+                    active=True,
+                    check_colleague_workspaces=include_colleagues,
+                )
+            )
         logger.warning(
             "Company workspace dedup check failed (%s, workspace_count=%d); proceeding",
             type(exc).__name__,

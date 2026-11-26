@@ -1055,7 +1055,15 @@ async def list_executions(
                     SELECT
                         {EXECUTION_COLUMNS},
                         a.name AS automation_name, a.trigger_type,
-                        COALESCE(t.workspace_id, a.workspace_id) AS workspace_id
+                        COALESCE(t.workspace_id, a.workspace_id) AS workspace_id,
+                        t.workspace_id AS _owned_thread_workspace_id,
+                        a.workspace_id AS _task_workspace_id,
+                        EXISTS (
+                            SELECT 1 FROM workspaces aw
+                            WHERE aw.workspace_id = a.workspace_id
+                              AND aw.user_id = a.user_id
+                              AND aw.status <> 'deleted'
+                        ) AS _task_workspace_owned
                     FROM automation_executions e
                     JOIN automations a ON a.automation_id = e.automation_id
                     {thread_join}
@@ -1117,7 +1125,15 @@ async def list_executions(
                     SELECT
                         {EXECUTION_COLUMNS},
                         a.name AS automation_name, a.trigger_type,
-                        COALESCE(t.workspace_id, a.workspace_id) AS workspace_id
+                        COALESCE(t.workspace_id, a.workspace_id) AS workspace_id,
+                        t.workspace_id AS _owned_thread_workspace_id,
+                        a.workspace_id AS _task_workspace_id,
+                        EXISTS (
+                            SELECT 1 FROM workspaces aw
+                            WHERE aw.workspace_id = a.workspace_id
+                              AND aw.user_id = a.user_id
+                              AND aw.status <> 'deleted'
+                        ) AS _task_workspace_owned
                     FROM paged_execution_ids p
                     JOIN automation_executions e
                       ON e.automation_execution_id = p.automation_execution_id
@@ -1142,7 +1158,11 @@ async def list_executions(
                 ))
 
             rows = [dict(row) for row in await cur.fetchall()]
-            return rows[:limit], len(rows) > limit
+            page = rows[:limit]
+            # DALTON-HOOK(history-computer-scope): resolve per-page thread and colleague workspace accessibility in Python without touching Dalton tables in SQL
+            from src.dalton.services.execution_history_access import resolve_execution_history_page_links
+            page = await resolve_execution_history_page_links(user_id, page, conn=conn)
+            return page, len(rows) > limit
 
 
 async def list_settled_since(

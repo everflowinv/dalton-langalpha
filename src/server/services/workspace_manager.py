@@ -161,6 +161,9 @@ class WorkspaceManager(ComputerManager):
         verified_company_candidates: Optional[Any] = None,
         check_colleague_duplicate: bool = False,
         # --- DALTON-HOOK(cos-settings-tools): end ---
+        # DALTON-HOOK(workspace-dedup): optional target ticker & same-tx insert hook for web create dedup
+        target_ticker: Optional[str] = None,
+        on_workspace_inserted: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Create a project on the user's computer and return it straight away.
 
@@ -195,17 +198,23 @@ class WorkspaceManager(ComputerManager):
         if bootstrap_cloud_primary:
             if chosen:
                 raise ApprovalScopeChangedError("情况已变化，请重新发起")
+            bootstrap_kwargs: Dict[str, Any] = {
+                "default_name": name,
+                "resource_tier": resource_tier,
+                "expected_kind": expected_computer_kind,
+                "check_duplicate_snapshot": bool(verify_snapshot and check_duplicate_snapshot),
+                "workspace_name": name,
+                "expected_duplicate_workspace_id": expected_duplicate_workspace_id,
+                "expected_duplicate_workspace_name": expected_duplicate_workspace_name,
+                "verified_company_candidates": verified_company_candidates if verify_snapshot else None,
+                "check_colleague_duplicate": bool(verify_snapshot and check_colleague_duplicate),
+            }
+            # DALTON-HOOK(workspace-dedup): forward target_ticker into cloud-primary bootstrap recheck
+            if verify_snapshot and target_ticker is not None:
+                bootstrap_kwargs["target_ticker"] = target_ticker
             computer = await self.bootstrap_cloud_primary_computer(
                 user_id,
-                default_name=name,
-                resource_tier=resource_tier,
-                expected_kind=expected_computer_kind,
-                check_duplicate_snapshot=bool(verify_snapshot and check_duplicate_snapshot),
-                workspace_name=name,
-                expected_duplicate_workspace_id=expected_duplicate_workspace_id,
-                expected_duplicate_workspace_name=expected_duplicate_workspace_name,
-                verified_company_candidates=verified_company_candidates if verify_snapshot else None,
-                check_colleague_duplicate=bool(verify_snapshot and check_colleague_duplicate),
+                **bootstrap_kwargs,
             )
         elif chosen:
             try:
@@ -291,8 +300,11 @@ class WorkspaceManager(ComputerManager):
                 create_kwargs["expected_computer_name"] = expected_computer_name
             if expected_computer_kind is not None:
                 create_kwargs["expected_computer_kind"] = expected_computer_kind
-        if verify_snapshot and check_duplicate_snapshot:
+        if check_duplicate_snapshot:
             create_kwargs["check_duplicate_snapshot"] = True
+            # DALTON-HOOK(workspace-dedup): raise DuplicateWorkspaceConflictError when web create runs locked recheck without verify_snapshot
+            if not verify_snapshot:
+                create_kwargs["raise_on_duplicate_conflict"] = True
             if expected_duplicate_workspace_id is not None:
                 create_kwargs["expected_duplicate_workspace_id"] = (
                     expected_duplicate_workspace_id
@@ -305,6 +317,11 @@ class WorkspaceManager(ComputerManager):
                 create_kwargs["verified_company_candidates"] = verified_company_candidates
             if check_colleague_duplicate:
                 create_kwargs["check_colleague_duplicate"] = True
+            if target_ticker is not None:
+                create_kwargs["target_ticker"] = target_ticker
+        # DALTON-HOOK(workspace-dedup): forward same-transaction company identity hook
+        if on_workspace_inserted is not None:
+            create_kwargs["on_workspace_inserted"] = on_workspace_inserted
         reject_reasons: list[str] = []
         if not (verify_snapshot or bootstrap_cloud_primary):
             create_kwargs["reject_reason_out"] = reject_reasons

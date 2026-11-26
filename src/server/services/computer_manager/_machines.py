@@ -290,6 +290,8 @@ class MachineLifecycleMixin:
         expected_duplicate_workspace_name: Optional[str] = None,
         verified_company_candidates: Optional[list[tuple[str, str, Optional[str]]]] = None,
         check_colleague_duplicate: bool = False,
+        # DALTON-HOOK(workspace-dedup): forward target_ticker into locked duplicate recheck
+        target_ticker: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Create a hosted cloud primary computer for a confirmed snapshot that
         observed no primary computer.
@@ -336,6 +338,8 @@ class MachineLifecycleMixin:
                             expected_duplicate_workspace_name=expected_duplicate_workspace_name,
                             verified_company_candidates=verified_company_candidates,
                             check_colleague_duplicate=check_colleague_duplicate,
+                            # DALTON-HOOK(workspace-dedup): pass target_ticker to locked recheck
+                            target_ticker=target_ticker,
                             conn=conn,
                         ):
                             raise ApprovalScopeChangedError("情况已变化，请重新发起")
