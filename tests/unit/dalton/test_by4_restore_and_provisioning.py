@@ -205,16 +205,42 @@ async def test_provisioning_backup_without_worker_session_skips_all_projects_and
 async def test_sessionless_idle_stop_defers_and_requests_cross_worker_mirror_then_proceeds_after_grace(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """BY4 r2: when an idle stop lands on a worker without a cached session and files_backup is on,
-    _finish_claimed_stop requests commands.mirror.mirror_computer and defers stop (settling back to RUNNING)
-    within the grace window; once the grace window expires (no worker held a session), it proceeds with teardown."""
+    """BY4 r2/r3: when Redis is enabled and an idle stop lands on a worker without a cached
+    session (with files_backup on), _finish_claimed_stop requests commands.mirror.mirror_computer
+    and defers stop (settling back to RUNNING) within the grace window; once the grace window
+    expires (no worker held a session) or the owed mirror completes, it proceeds with teardown.
+    When Redis is disabled, no cross-worker mirror is possible so it does NOT defer."""
     from src.server.models.computer import ComputerStatus
     from src.server.services.commands import mirror as commands_mirror
     from src.server.services.computer_manager._lifecycle import SessionLifecycleMixin
 
-    mirror_spy = create_autospec(commands_mirror.mirror_computer, return_value=None)
+    class _FakeRedis:
+        def __init__(self) -> None:
+            self.kv: dict[str, bytes] = {}
+            self.zsets: dict[str, dict[str, float]] = {}
+
+        async def get(self, key: str) -> bytes | None:
+            return self.kv.get(key)
+
+        async def set(self, key: str, value: str, ex: int | None = None) -> bool:
+            self.kv[key] = value.encode()
+            return True
+
+        async def delete(self, key: str) -> int:
+            return 1 if self.kv.pop(key, None) is not None else 0
+
+        async def zscore(self, key: str, member: str) -> float | None:
+            return self.zsets.get(key, {}).get(member)
+
+    fake_redis = _FakeRedis()
+
+    async def _fake_mirror_computer(computer_id: str) -> None:
+        fake_redis.zsets.setdefault(commands_mirror._OWED_KEY, {})[computer_id] = 1.0
+
+    mirror_spy = create_autospec(commands_mirror.mirror_computer, side_effect=_fake_mirror_computer)
+    redis_spy = create_autospec(commands_mirror._redis, return_value=fake_redis)
     monkeypatch.setattr(commands_mirror, "mirror_computer", mirror_spy)
-    monkeypatch.setattr(commands_mirror, "_redis", create_autospec(commands_mirror._redis, return_value=None))
+    monkeypatch.setattr(commands_mirror, "_redis", redis_spy)
 
     settled_states: list[tuple[str, Any]] = []
     teardown_calls: list[str] = []
@@ -259,7 +285,7 @@ async def test_sessionless_idle_stop_defers_and_requests_cross_worker_mirror_the
         provider=SimpleNamespace(recreatable=True),
     )
 
-    # First idle stop on session-less worker -> requests cross-worker mirror and defers teardown!
+    # First idle stop on session-less worker with Redis enabled -> requests cross-worker mirror and defers teardown!
     res1 = await harness._finish_claimed_stop(
         binding,
         workspace_id="ws-1",
@@ -272,8 +298,20 @@ async def test_sessionless_idle_stop_defers_and_requests_cross_worker_mirror_the
     assert teardown_calls == []
     assert settled_states == [("comp-idle-1", ComputerStatus.RUNNING)]
 
+    # Second sweep still inside grace window while mirror debt is owed -> stays deferred
+    res1b = await harness._finish_claimed_stop(
+        binding,
+        workspace_id="ws-1",
+        durable_sandbox_id="sb-1",
+        back_up=True,
+        reason="idle",
+    )
+    assert res1b["status"] == "running"
+    assert teardown_calls == []
+
     # Expire the deferral grace window (e.g. after backend restart when no worker holds a session)
-    harness._idle_stop_defer_since["comp-idle-1"] -= 120.0
+    defer_key = "by4:idle_stop_mirror_defer:comp-idle-1"
+    fake_redis.kv[defer_key] = f"{float(fake_redis.kv[defer_key].decode()) - 120.0:.3f}".encode()
     res2 = await harness._finish_claimed_stop(
         binding,
         workspace_id="ws-1",
@@ -284,3 +322,24 @@ async def test_sessionless_idle_stop_defers_and_requests_cross_worker_mirror_the
     assert res2["status"] == "stopped"
     assert teardown_calls == ["sb-1"]
     assert settled_states[-1] == ("comp-idle-1", ComputerStatus.STOPPED)
+    assert defer_key not in fake_redis.kv
+
+    # When Redis is disabled, cross-worker mirror cannot run so session-less idle stop proceeds immediately
+    redis_spy.return_value = None
+    teardown_calls.clear()
+    settled_states.clear()
+    binding_no_redis = SimpleNamespace(
+        computer_id="comp-idle-no-redis",
+        files_backup=True,
+        provider=SimpleNamespace(recreatable=True),
+    )
+    res_no_redis = await harness._finish_claimed_stop(
+        binding_no_redis,
+        workspace_id="ws-2",
+        durable_sandbox_id="sb-2",
+        back_up=True,
+        reason="idle",
+    )
+    assert res_no_redis["status"] == "stopped"
+    assert teardown_calls == ["sb-2"]
+    assert settled_states == [("comp-idle-no-redis", ComputerStatus.STOPPED)]

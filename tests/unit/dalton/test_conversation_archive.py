@@ -116,7 +116,7 @@ async def test_extraction_verbatim_quote_validation_and_speaker_rules(
                 "is_owner": True,
                 "role": "owner",
             },
-            "text": "META 2026 年资本开支指引我们模型按 680 亿美元测算，同时 OpenAI 与 Anthropic 的推理算力需求仍在翻倍。",
+            "text": "META 2026 年资本开支指引我们模型按 680 亿美元测算，同时 OpenAI 与 xAI 的推理算力需求仍在翻倍。",
         },
         {
             "agent": "main",
@@ -154,7 +154,7 @@ async def test_extraction_verbatim_quote_validation_and_speaker_rules(
                         "type": "model_assumption",
                         "topic_label": "META 2026 Capex",
                         "claim": "META 2026 年资本开支模型假设为 680 亿美元",
-                        "tickers": ["META", "OpenAI", "Anthropic"],
+                        "tickers": ["META", "OpenAI", "xAI"],
                         "entities": [],
                         "sectors": ["Internet", "AI"],
                         "figures": [
@@ -231,7 +231,7 @@ async def test_extraction_verbatim_quote_validation_and_speaker_rules(
     assert owner_card["source_type"] == "conversation"
     assert owner_card["tickers"] == ["META"]
     assert "OpenAI" in owner_card["entities"]
-    assert "Anthropic" in owner_card["entities"]
+    assert "xAI" in owner_card["entities"]
     assert owner_card["speaker"]["role"] == "owner"
 
     agent_downgraded = outcome.cards[1]
@@ -1166,20 +1166,50 @@ def test_integration_conftest_sessionstart_test_db_guard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify `tests/integration/dalton/conftest.py` `pytest_sessionstart` aborts via `pytest.exit`
-    before any DB connection or destructive SQL when `TEST_DB_NAME` does not end with `_test`.
+    before any DB connection or destructive SQL when explicit test DB config is missing or when
+    the configured DB name does not end with `_test`.
     """
     from tests.integration.dalton import conftest as dalton_int_conftest
 
     mock_session = create_autospec(pytest.Session, instance=True)
 
+    for var in (
+        "TEST_DB_DSN",
+        "DALTON_TEST_DB_DSN",
+        "TEST_DATABASE_URL",
+        "DALTON_DATA_JOBS_TEST_DSN",
+        "TEST_DB_HOST",
+        "TEST_DB_PORT",
+        "TEST_DB_NAME",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    # Missing explicit test DB configuration must be refused (no localhost:5432 fallback)
+    with pytest.raises(pytest.exit.Exception, match="without explicit test DB configuration"):
+        dalton_int_conftest.pytest_sessionstart(mock_session)
+
+    # Non-_test DB name must be refused regardless of host/port
+    monkeypatch.setenv("TEST_DB_HOST", "127.0.0.1")
+    monkeypatch.setenv("TEST_DB_PORT", "55432")
     monkeypatch.setenv("TEST_DB_NAME", "langalpha_prod")
     with pytest.raises(pytest.exit.Exception, match="must end with '_test'"):
         dalton_int_conftest.pytest_sessionstart(mock_session)
 
+    # Empty TEST_DB_NAME must be refused as missing explicit test DB configuration
     monkeypatch.setenv("TEST_DB_NAME", "")
-    with pytest.raises(pytest.exit.Exception, match="must end with '_test'"):
+    with pytest.raises(pytest.exit.Exception, match="without explicit test DB configuration"):
         dalton_int_conftest.pytest_sessionstart(mock_session)
 
+    # TEST_DB_NAME alone without explicit host/port must still be refused
+    monkeypatch.delenv("TEST_DB_HOST", raising=False)
+    monkeypatch.delenv("TEST_DB_PORT", raising=False)
+    monkeypatch.setenv("TEST_DB_NAME", "langalpha_test")
+    with pytest.raises(pytest.exit.Exception, match="without explicit test DB configuration"):
+        dalton_int_conftest.pytest_sessionstart(mock_session)
+
+    # Explicit host + port + *_test DB name is accepted
+    monkeypatch.setenv("TEST_DB_HOST", "127.0.0.1")
+    monkeypatch.setenv("TEST_DB_PORT", "55432")
     monkeypatch.setenv("TEST_DB_NAME", "langalpha_test")
     dalton_int_conftest.pytest_sessionstart(mock_session)
 

@@ -1845,48 +1845,39 @@ class SessionLifecycleMixin:
     async def _defer_sessionless_idle_stop_for_mirror(self, computer_id: str) -> bool:
         """Request a cross-worker mirror when an idle stop lands on a worker without a cached
         session, deferring teardown within a bounded grace window so the session-holding worker
-        can mirror first. Returns True if this stop should defer and release its claim."""
+        can mirror first. Returns True if this stop should defer and release its claim.
+
+        Cross-worker mirror coordination requires Redis (``commands.mirror.take_owed`` is a no-op
+        without Redis), so when Redis is disabled we never defer and let the upstream stop path run.
+        """
         from src.server.services.commands import mirror as commands_mirror
 
         redis = commands_mirror._redis()
+        if redis is None:
+            return False
+
         now = time.time()
         defer_key = f"by4:idle_stop_mirror_defer:{computer_id}"
 
-        if redis is not None:
-            try:
-                raw_since = await redis.get(defer_key)
-                if raw_since is None:
-                    await redis.set(defer_key, f"{now:.3f}", ex=self._IDLE_STOP_DEFER_TTL_S)
-                    await commands_mirror.mirror_computer(computer_id)
-                    return True
-                since = float(raw_since.decode() if isinstance(raw_since, bytes) else raw_since)
-                still_owed = await redis.zscore(commands_mirror._OWED_KEY, computer_id)
-                if still_owed is not None and (now - since) < self._IDLE_STOP_DEFER_GRACE_S:
-                    return True
-                await redis.delete(defer_key)
-                return False
-            except Exception as exc:
-                logger.warning(
-                    "Computer %s idle-stop mirror deferral check failed (%s); proceeding with stop",
-                    computer_id,
-                    type(exc).__name__,
-                )
-                return False
-
-        # In-process fallback when Redis is disabled (e.g. unit tests / single-process dev).
-        local_map = getattr(self, "_idle_stop_defer_since", None)
-        if local_map is None:
-            local_map = {}
-            setattr(self, "_idle_stop_defer_since", local_map)
-        since = local_map.get(computer_id)
-        if since is None:
-            local_map[computer_id] = now
-            await commands_mirror.mirror_computer(computer_id)
-            return True
-        if (now - since) < self._IDLE_STOP_DEFER_GRACE_S:
-            return True
-        local_map.pop(computer_id, None)
-        return False
+        try:
+            raw_since = await redis.get(defer_key)
+            if raw_since is None:
+                await redis.set(defer_key, f"{now:.3f}", ex=self._IDLE_STOP_DEFER_TTL_S)
+                await commands_mirror.mirror_computer(computer_id)
+                return True
+            since = float(raw_since.decode() if isinstance(raw_since, bytes) else raw_since)
+            still_owed = await redis.zscore(commands_mirror._OWED_KEY, computer_id)
+            if still_owed is not None and (now - since) < self._IDLE_STOP_DEFER_GRACE_S:
+                return True
+            await redis.delete(defer_key)
+            return False
+        except Exception as exc:
+            logger.warning(
+                "Computer %s idle-stop mirror deferral check failed (%s); proceeding with stop",
+                computer_id,
+                type(exc).__name__,
+            )
+            return False
 
     async def _finish_claimed_stop(
         self,
