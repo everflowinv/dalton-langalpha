@@ -5,9 +5,12 @@ import React from 'react';
 import {
   attachCatalogRevisionQueryClient,
   getObservedCatalogRevision,
+  isTeamCatalogEnabled,
   observeCatalogModelError,
   observeCatalogRevisionHeader,
   resetCatalogRevisionTracker,
+  setTeamCatalogEnabled,
+  syncTeamCatalogCapabilityFromResponse,
 } from '../catalogRevision';
 import { queryKeys } from '@/lib/queryKeys';
 import type { ModelsResponse } from '@/api/model';
@@ -30,6 +33,7 @@ const SAMPLE_MODELS: ModelsResponse = {
   search_providers: {} as ModelsResponse['search_providers'],
   provider_catalog: [],
   key_candidates: {},
+  team_catalog_enabled: true,
   catalog_revision: 3,
 };
 
@@ -55,10 +59,21 @@ afterEach(() => {
 });
 
 describe('catalogRevision tracker & useModels active refresh', () => {
-  it('initializes baseline on first header and invalidates attached QueryClients when revision rises', () => {
+  it('stays inert when team_catalog_enabled is false and activates once enabled', () => {
     const qc = makeClient();
     const invalidateSpy = vi.spyOn(qc, 'invalidateQueries');
     const detach = attachCatalogRevisionQueryClient(qc);
+
+    expect(isTeamCatalogEnabled()).toBe(false);
+    // Headers and errors are ignored until the server explicitly enables team catalog
+    expect(observeCatalogRevisionHeader({ 'x-dalton-catalog-revision': '3' }, { url: '/api/v1/users/me' })).toBe(false);
+    expect(getObservedCatalogRevision()).toBeNull();
+    expect(observeCatalogModelError(400, { type: 'model_removed' })).toBe(false);
+    expect(invalidateSpy).not.toHaveBeenCalled();
+
+    // Syncing /api/v1/models with team_catalog_enabled: true activates tracking
+    syncTeamCatalogCapabilityFromResponse('/api/v1/models', 200, { team_catalog_enabled: true, catalog_revision: 3 });
+    expect(isTeamCatalogEnabled()).toBe(true);
 
     expect(observeCatalogRevisionHeader({ 'x-dalton-catalog-revision': '3' }, { url: '/api/v1/users/me' })).toBe(false);
     expect(getObservedCatalogRevision()).toBe(3);
@@ -69,8 +84,8 @@ describe('catalogRevision tracker & useModels active refresh', () => {
     expect(observeCatalogRevisionHeader({ 'x-dalton-catalog-revision': '2' }, { url: '/api/v1/users/me' })).toBe(false);
     expect(invalidateSpy).not.toHaveBeenCalled();
 
-    // Higher revision triggers immediate invalidation
-    expect(observeCatalogRevisionHeader({ 'x-dalton-catalog-revision': '4' }, { url: '/api/v1/users/me' })).toBe(true);
+    // Higher revision (including Headers instance from SSE stream) triggers immediate invalidation
+    expect(observeCatalogRevisionHeader(new Headers({ 'X-Dalton-Catalog-Revision': '4' }), { url: '/api/v1/threads/t1/messages' })).toBe(true);
     expect(getObservedCatalogRevision()).toBe(4);
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.models.all });
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: queryKeys.providerModels.all });
@@ -87,6 +102,7 @@ describe('catalogRevision tracker & useModels active refresh', () => {
     const invalidateSpy = vi.spyOn(qc, 'invalidateQueries');
     const detachGlobal = attachCatalogRevisionQueryClient(qc);
     const detachHook = attachCatalogRevisionQueryClient(qc);
+    setTeamCatalogEnabled(true);
 
     observeCatalogRevisionHeader({ 'x-dalton-catalog-revision': '1' });
     detachHook();
@@ -100,24 +116,28 @@ describe('catalogRevision tracker & useModels active refresh', () => {
     expect(invalidateSpy).not.toHaveBeenCalled();
   });
 
-  it('invalidates models immediately on 400 model_removed, model_unavailable, and catalog_route_changed', () => {
+  it('invalidates models on 400 model_removed, model_retired, and catalog_route_changed, but ignores upstream 400 model_unavailable', () => {
     const qc = makeClient();
     const invalidateSpy = vi.spyOn(qc, 'invalidateQueries');
     const detach = attachCatalogRevisionQueryClient(qc);
+    setTeamCatalogEnabled(true);
 
     expect(observeCatalogModelError(400, { type: 'model_removed' })).toBe(true);
-    expect(observeCatalogModelError(400, { code: 'model_unavailable' })).toBe(true);
+    expect(observeCatalogModelError(400, { code: 'model_retired' })).toBe(true);
     expect(observeCatalogModelError(400, { code: 'catalog_route_changed' })).toBe(true);
     expect(invalidateSpy).toHaveBeenCalledTimes(12);
 
     invalidateSpy.mockClear();
+    // Upstream 400 model_unavailable must NOT trigger catalog invalidation in generic REST client
+    expect(observeCatalogModelError(400, { type: 'model_unavailable' })).toBe(false);
+    expect(observeCatalogModelError(400, { code: 'model_unavailable' })).toBe(false);
     expect(observeCatalogModelError(400, { code: 'other_error' })).toBe(false);
     expect(observeCatalogModelError(500, { code: 'model_removed' })).toBe(false);
     expect(invalidateSpy).not.toHaveBeenCalled();
     detach();
   });
 
-  it('useModels enables 5-minute foreground refetchInterval only when catalog_revision is present and reacts to higher revision header', async () => {
+  it('useModels enables 5-minute foreground refetchInterval only when team_catalog_enabled is true and reacts to higher revision header', async () => {
     const qc = makeClient();
     const wrapper = ({ children }: { children: React.ReactNode }) =>
       React.createElement(QueryClientProvider, { client: qc }, children);
@@ -136,8 +156,10 @@ describe('catalogRevision tracker & useModels active refresh', () => {
     expect(typeof opts.refetchInterval).toBe('function');
     if (typeof opts.refetchInterval === 'function') {
       expect(opts.refetchInterval({ state: { data: undefined } })).toBe(false);
-      const { catalog_revision: _omit, ...upstreamOnly } = SAMPLE_MODELS;
-      expect(opts.refetchInterval({ state: { data: upstreamOnly } })).toBe(false);
+      // Numeric catalog_revision WITHOUT team_catalog_enabled: true must NOT enable polling
+      expect(opts.refetchInterval({ state: { data: { ...SAMPLE_MODELS, team_catalog_enabled: false } } })).toBe(false);
+      const { team_catalog_enabled: _omit, ...withoutFlag } = SAMPLE_MODELS;
+      expect(opts.refetchInterval({ state: { data: withoutFlag } })).toBe(false);
       expect(opts.refetchInterval({ state: { data: SAMPLE_MODELS } })).toBe(5 * 60_000);
     }
     expect(opts.refetchIntervalInBackground).toBe(false);
@@ -152,10 +174,10 @@ describe('catalogRevision tracker & useModels active refresh', () => {
     unmount();
   });
 
-  it('useModels does not schedule an infinite timer under vi.runAllTimers when backend omits catalog_revision', () => {
+  it('useModels does not schedule an infinite timer under vi.runAllTimers when team_catalog_enabled is absent', () => {
     vi.useFakeTimers();
     try {
-      const { catalog_revision: _omit, ...upstreamOnly } = SAMPLE_MODELS;
+      const { team_catalog_enabled: _omit, ...upstreamOnly } = SAMPLE_MODELS;
       h.getAvailableModels.mockResolvedValue(upstreamOnly);
       const qc = makeClient();
       const wrapper = ({ children }: { children: React.ReactNode }) =>

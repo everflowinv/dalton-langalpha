@@ -12,7 +12,14 @@ import {
   resolveDaltonSetupModels,
 } from '@/config/daltonSetup';
 import { defaultChoices, type DefaultChoicesInput } from '../defaultChoices';
-import { DALTON_CURATED_PROVIDERS, resolveDaltonCuratedProviders } from '../setupSteps';
+import {
+  DALTON_CURATED_PROVIDERS,
+  isDaltonEverflowCuratedEmpty,
+  needsModelStep,
+  nextSetupStep,
+  resolveDaltonCuratedProviders,
+  setupRail,
+} from '../setupSteps';
 
 const h = vi.hoisted(() => ({
   getAvailableModels: vi.fn<() => Promise<ModelsResponse>>(),
@@ -20,6 +27,15 @@ const h = vi.hoisted(() => ({
     (provider: string, options?: { refresh?: boolean; signal?: AbortSignal }) => Promise<AvailableModels>
   >(),
   getPreferences: vi.fn<() => Promise<Record<string, unknown>>>(async () => ({})),
+}));
+
+vi.mock('@/config/brand', () => ({
+  isDaltonBuild: true,
+  isCoreProfileBuild: false,
+  DALTON_PROFILE: 'everflow',
+  BRAND_NAME: 'Everflow',
+  BRAND_MARK: 'everflow',
+  faviconHref: () => '/everflow/favicon.svg',
 }));
 
 vi.mock('@/config/hostMode', () => ({
@@ -262,5 +278,47 @@ describe('team catalog setup alignment (dalton_setup_candidates & dalton_curated
     });
     expect(coreRes.available).toBe(true);
     qcCore.clear();
+  });
+
+  it('holds saved langalpha_models members on /setup/model when Everflow curated models are empty and routes Core fallback to /setup/default', () => {
+    const savedTeamAnswers = { models: 'langalpha_models' as const, runsOn: 'cloud' as const };
+
+    // Everflow with empty curated candidates -> teamModelsEmpty: true keeps /setup/model in rail and stops at 'model'
+    expect(isDaltonEverflowCuratedEmpty('everflow', [])).toBe(true);
+    expect(isDaltonEverflowCuratedEmpty('everflow', ['gemini-4-neon-high-oauth'])).toBe(false);
+    expect(isDaltonEverflowCuratedEmpty('everflow', undefined)).toBe(false);
+    expect(isDaltonEverflowCuratedEmpty('core', [])).toBe(false);
+    expect(needsModelStep(savedTeamAnswers, false, true)).toBe(true);
+    expect(setupRail(savedTeamAnswers, null, false, true)).toEqual(['model', 'default']);
+    expect(
+      nextSetupStep({
+        answers: savedTeamAnswers,
+        server: null,
+        ownComputer: false,
+        homeOnCloud: true,
+        claudeCodeToken: false,
+        providerConnected: true,
+        teamModelsAvailable: false,
+        teamModelsEmpty: true,
+        lastStep: null,
+      }),
+    ).toBe('model');
+
+    // Core with confirmed tool-calling fallback model -> teamModelsAvailable: true, teamModelsEmpty: false advances to 'default'
+    expect(needsModelStep(savedTeamAnswers, true, false)).toBe(false);
+    expect(setupRail(savedTeamAnswers, null, true, false)).toEqual(['default']);
+    expect(
+      nextSetupStep({
+        answers: savedTeamAnswers,
+        server: null,
+        ownComputer: false,
+        homeOnCloud: true,
+        claudeCodeToken: false,
+        providerConnected: true,
+        teamModelsAvailable: true,
+        teamModelsEmpty: false,
+        lastStep: null,
+      }),
+    ).toBe('default');
   });
 });

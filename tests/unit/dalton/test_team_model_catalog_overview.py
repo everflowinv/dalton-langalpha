@@ -3,19 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Any
 from unittest.mock import create_autospec
 
 import pytest
 
 from src.dalton.services.team_model_catalog import compiled as compiled_mod
+from src.dalton.services.team_model_catalog import follow as follow_mod
 from src.dalton.services.team_model_catalog import service as service_mod
 from src.dalton.services.team_model_catalog.compiled import (
     compile_catalog_from_payload,
     reset_catalog_caches_for_tests,
 )
-from src.dalton.services.team_model_catalog.constants import CATALOG_SCHEMA
-from src.dalton.services.team_model_catalog.validation import _SUPPORTED_VARIANT_SDKS
+from src.dalton.services.team_model_catalog.constants import (
+    CATALOG_SCHEMA,
+    CatalogValidationError,
+)
+from src.dalton.services.team_model_catalog.validation import (
+    _SUPPORTED_VARIANT_SDKS,
+    CatalogModelUpsertInput,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -41,6 +49,10 @@ def _sample_upstream_models() -> dict[str, Any]:
                 "max_tokens": 16384,
                 "reasoning": {"effort": "medium"},
                 "api_key": "sk-should-never-leak",
+                "accessToken": "camel-access-token-leak",
+                "aws_session_token": "aws-sess-token-leak",
+                "x-custom-auth": "hyphen-auth-leak",
+                "secret-token": "hyphen-secret-leak",
                 "default_headers": {"Authorization": "Bearer secret-header"},
                 "nested": {
                     "temperature": 0.2,
@@ -214,22 +226,29 @@ def test_overview_echoes_edit_fields_strips_credentials_and_exposes_server_varia
     assert gpt5["task_costs_bound"] == {"model": "claude-sonnet-4-5", "times": 0.75}
     assert gpt5["parameters"] == {
         "max_tokens": 16384,
-        "reasoning": {"effort": "medium"},
-        "nested": {"temperature": 0.2},
     }
 
     acme_fast = by_key["acme-fast"]
     assert acme_fast["prompt_guidance"] == "lean"
     assert acme_fast["alias"] == ["acme-fast-alias"]
-    assert acme_fast["parameters"] == {"max_output_tokens": 8192, "top_p": 0.9}
+    assert acme_fast["parameters"] == {"max_output_tokens": 8192}
     assert acme_fast["task_costs_bound"] == {"model": "unmeasured-ref", "times": 1.25}
 
     serialized = str(overview)
     for forbidden in (
         "sk-should-never-leak",
+        "camel-access-token-leak",
+        "aws-sess-token-leak",
+        "hyphen-auth-leak",
+        "hyphen-secret-leak",
+        "accessToken",
+        "aws_session_token",
+        "x-custom-auth",
+        "secret-token",
         "secret-header",
         "top-secret",
         "tok-123",
+        "top_p",
         "cipher-blob-must-not-appear",
     ):
         assert forbidden not in serialized
@@ -253,3 +272,443 @@ def test_overview_omits_oauth_parent_provider_groups_when_oauth_disabled(
     assert overview["parent_provider_groups"] == ["anthropic", "openai", "z-ai"]
     assert all(not g.endswith("-oauth") for g in overview["parent_provider_groups"])
     assert overview["supported_variant_sdks"] == sorted(_SUPPORTED_VARIANT_SDKS)
+
+
+class _RecordingTxConn:
+    """Minimal transactional DB connection stub that records commit/rollback state."""
+
+    def __init__(self) -> None:
+        self.tx_started = 0
+        self.committed = 0
+        self.rolled_back = 0
+
+    @asynccontextmanager
+    async def transaction(self):
+        self.tx_started += 1
+        try:
+            yield self
+        except BaseException:
+            self.rolled_back += 1
+            raise
+        else:
+            self.committed += 1
+
+
+def _patch_tx_catalog_env(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    initial_payload: dict[str, Any],
+    initial_revision: int = 3,
+    existing_creds: dict[str, dict[str, Any]] | None = None,
+    upstream_models: dict[str, Any] | None = None,
+    upstream_providers: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    conn = _RecordingTxConn()
+    state: dict[str, Any] = {
+        "conn": conn,
+        "row": {
+            "revision": initial_revision,
+            "payload": initial_payload,
+            "legacy_sync_import_status": "not_applicable",
+            "last_known_legacy_retired": [],
+        },
+        "creds": dict(existing_creds or {}),
+        "upserted_creds": [],
+        "saved_calls": [],
+    }
+    u_models = upstream_models if upstream_models is not None else _sample_upstream_models()
+    u_providers = upstream_providers if upstream_providers is not None else _sample_upstream_providers()
+
+    @asynccontextmanager
+    async def _fake_get_db_connection(existing=None):
+        yield existing or conn
+
+    orig_compile = compiled_mod.compile_catalog_from_payload
+
+    def _compile_with_sample(payload, **kwargs):
+        kwargs.setdefault("oauth_sync_enabled", True)
+        kwargs.setdefault("native_overlay_override", {})
+        kwargs.setdefault("upstream_models_override", u_models)
+        kwargs.setdefault("upstream_providers_override", u_providers)
+        return orig_compile(payload, **kwargs)
+
+    async def _fake_lock(_conn):
+        return None
+
+    async def _fake_get_row(*, conn=None, for_update=False):
+        return state["row"]
+
+    async def _fake_list_creds(*, conn=None):
+        return state["creds"]
+
+    async def _fake_upsert_cred(
+        _conn, *, provider_slug, api_key, bound_base_url, updated_by
+    ):
+        rec = {
+            "provider_slug": provider_slug,
+            "api_key": api_key,
+            "bound_base_url": bound_base_url,
+            "canonical_bound_url": bound_base_url,
+            "key_fingerprint": f"fp-{provider_slug}",
+            "updated_by": updated_by,
+        }
+        state["upserted_creds"].append(rec)
+        return rec
+
+    async def _fake_save_rev(
+        _conn,
+        *,
+        expected_revision,
+        action,
+        target_keys,
+        payload,
+        diff_summary,
+        side_effects,
+        actor_user_id,
+        comment=None,
+        restored_from=None,
+    ):
+        next_rev = int(expected_revision) + 1
+        rec = {
+            "revision": next_rev,
+            "action": action,
+            "target_keys": list(target_keys),
+            "payload": payload,
+            "diff_summary": diff_summary,
+            "side_effects": side_effects,
+            "actor_user_id": actor_user_id,
+            "comment": comment,
+            "restored_from": restored_from,
+        }
+        state["saved_calls"].append(rec)
+        state["row"] = {**state["row"], "revision": next_rev, "payload": payload}
+        return {"catalog": {"revision": next_rev}, "revision_record": rec}
+
+    async def _fake_preflight(_url: str):
+        return None
+
+    async def _fake_publish(_rev: int):
+        return None
+
+    async def _fake_invalidate(*, actor_user_id=None, compiled=None):
+        return None
+
+    monkeypatch.setattr(service_mod, "get_db_connection", _fake_get_db_connection)
+    monkeypatch.setattr(service_mod, "acquire_catalog_exclusive_lock", _fake_lock)
+    monkeypatch.setattr(service_mod, "get_catalog_row", _fake_get_row)
+    monkeypatch.setattr(service_mod, "list_catalog_provider_credentials", _fake_list_creds)
+    monkeypatch.setattr(service_mod, "upsert_catalog_provider_credential", _fake_upsert_cred)
+    monkeypatch.setattr(service_mod, "save_catalog_revision", _fake_save_rev)
+    monkeypatch.setattr(service_mod, "preflight_catalog_variant_url", _fake_preflight)
+    monkeypatch.setattr(service_mod, "publish_catalog_changed", _fake_publish)
+    monkeypatch.setattr(service_mod, "invalidate_catalog_redis_caches", _fake_invalidate)
+    monkeypatch.setattr(service_mod, "compile_catalog_from_payload", _compile_with_sample)
+    monkeypatch.setattr(compiled_mod, "compile_catalog_from_payload", _compile_with_sample)
+    return state
+
+
+def test_update_model_preserves_hidden_parameters_and_deletes_explicit_null_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_payload: dict[str, Any] = {
+        "schema": CATALOG_SCHEMA,
+        "models": {
+            "acme-fast": {
+                "model_id": "acme-fast-v1",
+                "provider": "openai",
+                "display_name": "Acme Fast",
+                "visible": True,
+                "prompt_guidance": "detailed",
+                "compaction_profile": "spacious",
+                "context": 128000,
+                "parameters": {"max_tokens": 8192, "top_p": 0.9, "temperature": 0.2},
+                "reasoning": {
+                    "efforts": ["low", "medium", "high"],
+                    "default": "medium",
+                    "write": "parameters.reasoning.effort",
+                },
+            }
+        },
+        "providers": {
+            "models": {
+                "openai": [
+                    {
+                        "id": "acme-fast-v1",
+                        "name": "Acme Fast",
+                        "pricing": {"input": 1.0, "output": 4.0},
+                    }
+                ]
+            }
+        },
+        "dalton_meta": {
+            "acme-fast": {
+                "family": "acme",
+                "notional_pricing": {"input": 1.0, "output": 4.0},
+                "tool_calling": True,
+            }
+        },
+        "task_costs": {
+            "bounds": {
+                "acme-fast": {"model": "gpt-5", "times": 1.2},
+            }
+        },
+    }
+    state = _patch_tx_catalog_env(monkeypatch, initial_payload=initial_payload, initial_revision=4)
+
+    # Clear prompt_guidance, compaction_profile, max_tokens, reasoning, notional_pricing, task_costs_bound
+    parsed = CatalogModelUpsertInput.model_validate(
+        {
+            "prompt_guidance": None,
+            "compaction_profile": None,
+            "parameters": {"max_tokens": None, "max_output_tokens": None},
+            "reasoning": None,
+            "dalton_meta": {"notional_pricing": None},
+            "task_costs_bound": None,
+            "expected_revision": 4,
+        }
+    )
+    res = asyncio.run(
+        service_mod.update_catalog_model(
+            actor_user_id="admin-1", model_key="acme-fast", data=parsed
+        )
+    )
+    assert res["revision"] == 5
+    saved_payload = state["saved_calls"][0]["payload"]
+    saved_model = saved_payload["models"]["acme-fast"]
+    assert "prompt_guidance" not in saved_model
+    assert "compaction_profile" not in saved_model
+    assert "reasoning" not in saved_model
+    # Hidden non-UI parameters (top_p, temperature) stay preserved server-side
+    assert saved_model["parameters"] == {"top_p": 0.9, "temperature": 0.2}
+
+    compiled = compiled_mod.compile_catalog_from_payload(saved_payload, revision=5)
+    entry = compiled.model_config.get_model_config("acme-fast")
+    assert entry is not None
+    assert "prompt_guidance" not in entry
+    assert "compaction_profile" not in entry
+    assert "reasoning" not in entry
+    assert entry["parameters"] == {"top_p": 0.9, "temperature": 0.2}
+    assert "notional_pricing" not in (compiled.dalton_meta.get("acme-fast") or {})
+    assert compiled.dalton_meta["acme-fast"]["tool_calling"] is True
+    assert "acme-fast" not in (compiled.task_costs.bounds if compiled.task_costs else {})
+
+
+def test_atomic_model_save_rolls_back_variant_and_curated_on_mid_transaction_validation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_payload: dict[str, Any] = {
+        "schema": CATALOG_SCHEMA,
+        "providers": {
+            "provider_variants": {
+                "openai": {
+                    "acme-gw": {
+                        "display_name": "Acme Gateway",
+                        "sdk": "openai",
+                        "parent_provider": "openai",
+                        "access_type": "api_key",
+                        "billing": "cash",
+                        "base_url": "https://gw-v1.acme.example.com/v1",
+                    }
+                }
+            }
+        },
+        "curated_setup": ["gpt-5"],
+    }
+    state = _patch_tx_catalog_env(
+        monkeypatch,
+        initial_payload=initial_payload,
+        initial_revision=6,
+        existing_creds={
+            "acme-gw": {
+                "provider_slug": "acme-gw",
+                "bound_base_url": "https://gw-v1.acme.example.com/v1",
+                "canonical_bound_url": "https://gw-v1.acme.example.com/v1",
+                "key_fingerprint": "fp-old",
+            }
+        },
+    )
+
+    # Variant update is valid, but model has invalid max_tokens > context (fails mid-transaction!)
+    failing_input = CatalogModelUpsertInput.model_validate(
+        {
+            "model_key": "acme-bad-model",
+            "model_id": "acme-bad-v1",
+            "provider": "acme-gw",
+            "display_name": "Acme Bad",
+            "context": 32000,
+            "parameters": {"max_tokens": 64000},
+            "pricing": {"input": 1.0, "output": 4.0},
+            "provider_variant_update": {
+                "provider_slug": "acme-gw",
+                "display_name": "Acme Gateway",
+                "sdk": "openai",
+                "parent_provider": "openai",
+                "access_type": "api_key",
+                "billing": "cash",
+                "base_url": "https://gw-v2.acme.example.com/v1",
+                "api_key": "sk-new-v2-key",
+            },
+            "curated_setup_member": True,
+            "expected_revision": 6,
+        }
+    )
+
+    with pytest.raises(CatalogValidationError) as exc_info:
+        asyncio.run(
+            service_mod.create_catalog_model(actor_user_id="admin-1", data=failing_input)
+        )
+    assert exc_info.value.code == "invalid_max_tokens"
+    assert state["conn"].tx_started == 1
+    assert state["conn"].rolled_back == 1
+    assert state["conn"].committed == 0
+    assert state["saved_calls"] == []
+    assert state["row"]["revision"] == 6
+
+    # Now fix max_tokens and verify all 3 changes commit atomically in ONE revision bump
+    valid_input = CatalogModelUpsertInput.model_validate(
+        {
+            "model_key": "acme-good-model",
+            "model_id": "acme-good-v1",
+            "provider": "acme-gw",
+            "display_name": "Acme Good",
+            "context": 128000,
+            "parameters": {"max_tokens": 16384},
+            "pricing": {"input": 1.0, "output": 4.0},
+            "provider_variant_update": {
+                "provider_slug": "acme-gw",
+                "display_name": "Acme Gateway",
+                "sdk": "openai",
+                "parent_provider": "openai",
+                "access_type": "api_key",
+                "billing": "cash",
+                "base_url": "https://gw-v2.acme.example.com/v1",
+                "api_key": "sk-new-v2-key",
+            },
+            "curated_setup_member": True,
+            "expected_revision": 6,
+        }
+    )
+    ok_res = asyncio.run(
+        service_mod.create_catalog_model(actor_user_id="admin-1", data=valid_input)
+    )
+    assert ok_res["revision"] == 7
+    assert state["conn"].committed == 1
+    assert len(state["saved_calls"]) == 1
+    committed_payload = state["saved_calls"][0]["payload"]
+    assert committed_payload["providers"]["provider_variants"]["openai"]["acme-gw"]["base_url"] == (
+        "https://gw-v2.acme.example.com/v1"
+    )
+    assert "acme-good-model" in committed_payload["models"]
+    assert committed_payload["curated_setup"] == ["gpt-5", "acme-good-model"]
+
+
+def test_list_revisions_view_prunes_oauth_fields_when_native_oauth_sync_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    compiled = compile_catalog_from_payload(
+        {"schema": CATALOG_SCHEMA},
+        revision=10,
+        oauth_sync_enabled=False,
+        native_overlay_override={},
+        upstream_models_override=_sample_upstream_models(),
+        upstream_providers_override=_sample_upstream_providers(),
+    )
+    get_compiled_mock = create_autospec(
+        compiled_mod.get_compiled_catalog_async, return_value=compiled
+    )
+    list_revs_mock = create_autospec(
+        service_mod.list_catalog_revisions,
+        return_value=[
+            {
+                "revision": 10,
+                "action": "update_model",
+                "target_keys": ["gpt-5", "gemini-4-neon-high-oauth"],
+                "payload_sha256": "sha10",
+                "diff_summary": {
+                    "updated": "gemini-4-neon-high-oauth",
+                    "models": ["gpt-5", "claude-test-oauth"],
+                    "provider": "openai",
+                },
+                "side_effects": [
+                    {
+                        "kind": "automation",
+                        "id": "a1",
+                        "before": {"llm_model": "gemini-4-neon-high-oauth"},
+                        "after": {"llm_model": "gpt-5"},
+                    },
+                    {
+                        "kind": "automation",
+                        "id": "a2",
+                        "before": {"llm_model": "gpt-4o"},
+                        "after": {"llm_model": "gpt-5"},
+                    },
+                ],
+                "comment": "History entry",
+                "restored_from": None,
+                "actor_user_id": "admin-1",
+                "actor_label": "Admin",
+                "created_at": "2026-11-25T10:00:00Z",
+            }
+        ],
+    )
+    monkeypatch.setattr(service_mod, "get_compiled_catalog_async", get_compiled_mock)
+    monkeypatch.setattr(service_mod, "list_catalog_revisions", list_revs_mock)
+
+    view = asyncio.run(service_mod.list_revisions_view())
+    assert view["revision"] == 10
+    assert len(view["revisions"]) == 1
+    rev = view["revisions"][0]
+    assert rev["revision"] == 10
+    assert rev["target_keys"] == ["gpt-5"]
+    assert rev["diff_summary"] == {"models": ["gpt-5"], "provider": "openai"}
+    assert len(rev["side_effects"]) == 1
+    assert rev["side_effects"][0]["id"] == "a2"
+    assert "-oauth" not in str(rev)
+
+
+def test_catalog_revision_header_middleware_emits_only_when_dalton_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton import settings as dalton_settings
+
+    compiled = compile_catalog_from_payload(
+        {"schema": CATALOG_SCHEMA},
+        revision=15,
+        oauth_sync_enabled=False,
+        native_overlay_override={},
+        upstream_models_override=_sample_upstream_models(),
+        upstream_providers_override=_sample_upstream_providers(),
+    )
+    get_compiled_mock = create_autospec(
+        compiled_mod.get_compiled_catalog_async, return_value=compiled
+    )
+    monkeypatch.setattr(compiled_mod, "get_compiled_catalog_async", get_compiled_mock)
+
+    async def _dummy_app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+    mw = follow_mod.CatalogRevisionHeaderMiddleware(_dummy_app)
+
+    async def _invoke(path: str) -> list[tuple[bytes, bytes]]:
+        captured: list[dict[str, Any]] = []
+
+        async def _receive():
+            return {"type": "http.request", "body": b""}
+
+        async def _send(msg):
+            captured.append(msg)
+
+        await mw({"type": "http", "path": path}, _receive, _send)
+        start = next(m for m in captured if m["type"] == "http.response.start")
+        return list(start["headers"])
+
+    monkeypatch.setattr(dalton_settings, "is_dalton_enabled", lambda: True)
+    pref_headers = dict(asyncio.run(_invoke("/api/v1/users/me/preferences")))
+    chat_headers = dict(asyncio.run(_invoke("/api/v1/threads/th-1/messages")))
+    assert pref_headers.get(b"x-dalton-catalog-revision") == b"15"
+    assert chat_headers.get(b"x-dalton-catalog-revision") == b"15"
+
+    monkeypatch.setattr(dalton_settings, "is_dalton_enabled", lambda: False)
+    disabled_headers = dict(asyncio.run(_invoke("/api/v1/users/me/preferences")))
+    assert b"x-dalton-catalog-revision" not in disabled_headers

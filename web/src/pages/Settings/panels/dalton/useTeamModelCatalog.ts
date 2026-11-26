@@ -31,6 +31,12 @@ export interface MissingVariantCredentialDetail {
   current_bound_base_url?: string | null;
 }
 
+export interface RollbackTargetModelOption {
+  model_key: string;
+  display_name: string;
+  provider: string;
+}
+
 export interface ParsedCatalogApiError {
   status: number | null;
   code: string | null;
@@ -45,6 +51,8 @@ export interface ParsedCatalogApiError {
   daltonSettings: Record<string, string[]>;
   bundledPluginSubagents: Record<string, string[]>;
   currentRevision: number | null;
+  droppedModel: string | null;
+  targetRevisionModels: RollbackTargetModelOption[];
 }
 
 /** Extract structured error info from a catalog API failure (400/409/422/429/503). */
@@ -101,6 +109,15 @@ export function parseCatalogApiError(err: unknown, fallbackMessage: string): Par
       : {};
   const currentRevision =
     typeof detailObj?.current_revision === 'number' ? detailObj.current_revision : null;
+  const droppedModel =
+    typeof detailObj?.dropped_model === 'string' && detailObj.dropped_model.trim()
+      ? detailObj.dropped_model.trim()
+      : null;
+  const targetRevisionModels = Array.isArray(detailObj?.target_revision_models)
+    ? (detailObj.target_revision_models as RollbackTargetModelOption[]).filter(
+        (m) => m && typeof m.model_key === 'string' && m.model_key.trim().length > 0,
+      )
+    : [];
 
   return {
     status,
@@ -116,6 +133,8 @@ export function parseCatalogApiError(err: unknown, fallbackMessage: string): Par
     daltonSettings,
     bundledPluginSubagents,
     currentRevision,
+    droppedModel,
+    targetRevisionModels,
   };
 }
 

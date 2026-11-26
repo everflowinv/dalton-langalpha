@@ -13,7 +13,7 @@ import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(team-model-catalog): resolve curated providers from server `dalton_curated_providers`
 import { isDaltonBuild } from '@/config/brand';
 import { getDaltonModelStepConfig } from '@/config/daltonSetup';
-import { effectiveModelsAnswer, resolveDaltonCuratedProviders } from '../answers/setupSteps';
+import { effectiveModelsAnswer, isDaltonEverflowCuratedEmpty, resolveDaltonCuratedProviders } from '../answers/setupSteps';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import { useAccount, useRule } from '@/hooks/useAccount';
@@ -52,7 +52,15 @@ export default function ModelStep() {
   if (!flow.answers) return <Navigate to="/setup" replace />;
   const effectiveModels = effectiveModelsAnswer(flow.answers.models, team.available);
   if (isDaltonBuild && team.available) return <Navigate to="/setup/default" replace />;
-  if (isDaltonBuild && team.empty && !team.canManage) {
+  // DALTON-HOOK(team-model-catalog): in Everflow, when the live catalog revision defines zero curated candidates (`[]`),
+  // hold everyone (including admins) on /setup/model with a contact-admin notice instead of bouncing to an empty
+  // /setup/default; when curated candidates exist and team credentials are simply not configured yet (`team.empty`),
+  // hold non-admin members while keeping admins in SubscriptionStep so they can connect initial credentials.
+  const everflowCuratedEmpty = isDaltonEverflowCuratedEmpty(
+    team.daltonProfile,
+    team.daltonSetupCandidates,
+  );
+  if (everflowCuratedEmpty || (isDaltonBuild && team.empty && !team.canManage)) {
     return (
       <div data-testid="setup-model-team-models-empty">
         <WizardStepHeader
@@ -68,7 +76,9 @@ export default function ModelStep() {
     );
   }
   if (isDaltonBuild && effectiveModels === 'claude_code') return <Navigate to="/setup/use" replace />;
-  if (effectiveModels === 'langalpha_models') return <Navigate to="/setup/default" replace />;
+  if (effectiveModels === 'langalpha_models' && !(isDaltonBuild && team.empty)) {
+    return <Navigate to="/setup/default" replace />;
+  }
   if (effectiveModels !== 'claude_code') {
     return (
       <SubscriptionStep

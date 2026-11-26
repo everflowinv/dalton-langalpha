@@ -114,9 +114,10 @@ export function TeamModelCatalogCard() {
   const [editSheet, setEditSheet] = useState<{
     open: boolean;
     mode: TeamModelEditMode;
+    revision: number;
     model: TeamCatalogModelItem | null;
     variant: TeamCatalogProviderVariant | null;
-  }>({ open: false, mode: 'create', model: null, variant: null });
+  }>({ open: false, mode: 'create', revision: 0, model: null, variant: null });
 
   const [retireTarget, setRetireTarget] = useState<TeamCatalogModelItem | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -175,6 +176,8 @@ export function TeamModelCatalogCard() {
         displayName: v.display_name || v.provider_slug,
         isVariant: true,
         sdk: v.sdk,
+        parentProvider: v.parent_provider,
+        accessType: v.access_type,
         billing: v.billing,
         baseUrl: v.base_url,
         credentialConfigured: v.credential_configured,
@@ -293,7 +296,7 @@ export function TeamModelCatalogCard() {
 
   const openEditForModel = (model: TeamCatalogModelItem, mode: 'edit' | 'clone') => {
     const matchedVariant = providerVariants.find((v) => v.provider_slug === model.provider) ?? null;
-    setEditSheet({ open: true, mode, model, variant: matchedVariant });
+    setEditSheet({ open: true, mode, revision, model, variant: matchedVariant });
   };
 
   const statusPills: Array<{ id: StatusFilter; label: string; count: number }> = [
@@ -406,7 +409,7 @@ export function TeamModelCatalogCard() {
               className="h-8 text-xs gap-1"
               disabled={!isAdmin || catalogQuery.isLoading}
               onClick={() =>
-                setEditSheet({ open: true, mode: 'create_variant', model: null, variant: null })
+                setEditSheet({ open: true, mode: 'create_variant', revision, model: null, variant: null })
               }
               data-testid="team-catalog-add-variant-btn"
             >
@@ -419,7 +422,7 @@ export function TeamModelCatalogCard() {
               className="h-8 text-xs gap-1"
               disabled={!isAdmin || catalogQuery.isLoading}
               onClick={() =>
-                setEditSheet({ open: true, mode: 'create', model: null, variant: null })
+                setEditSheet({ open: true, mode: 'create', revision, model: null, variant: null })
               }
               data-testid="team-catalog-add-model-btn"
             >
@@ -520,7 +523,7 @@ export function TeamModelCatalogCard() {
                           size="sm"
                           className="h-6 px-1.5 text-[11px]"
                           onClick={() =>
-                            setEditSheet({ open: true, mode: 'edit_variant', model: null, variant: v })
+                            setEditSheet({ open: true, mode: 'edit_variant', revision, model: null, variant: v })
                           }
                           data-testid={`edit-variant-${v.provider_slug}-btn`}
                         >
@@ -1023,15 +1026,27 @@ export function TeamModelCatalogCard() {
         open={editSheet.open}
         mode={editSheet.mode}
         onClose={() => setEditSheet((prev) => ({ ...prev, open: false }))}
-        revision={revision}
+        revision={editSheet.revision}
+        latestRevision={revision}
         model={editSheet.model}
+        latestModel={
+          editSheet.model
+            ? (allModels.find((m) => m.model_key === editSheet.model?.model_key) ?? null)
+            : null
+        }
         variant={editSheet.variant}
+        latestVariant={
+          editSheet.variant
+            ? (providerVariants.find((v) => v.provider_slug === editSheet.variant?.provider_slug) ?? null)
+            : null
+        }
         allModels={allModels}
         providerOptions={providerOptions}
         parentProviderGroups={parentProviderGroups}
         supportedVariantSdks={supportedVariantSdks}
         curatedSetup={data?.curated_setup ?? null}
         effectiveCuratedCandidates={data?.dalton_setup_candidates ?? []}
+        onRefreshCatalog={() => void catalogQuery.refetch()}
         onSaved={(message) => setNotice({ tone: 'success', message })}
       />
 

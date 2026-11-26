@@ -10,7 +10,10 @@ import type { DaltonDeploymentProfile } from '@/config/daltonSetup';
 import { AuthContext } from '@/contexts/AuthContext';
 import type { ConfiguredProvider } from '@/hooks/useConfiguredProviders';
 import { fetchTeamCredentialsStatus } from '@/hooks/useTeamCredentials';
-import { attachCatalogRevisionQueryClient } from '@/lib/dalton/catalogRevision';
+import {
+  attachCatalogRevisionQueryClient,
+  setTeamCatalogEnabled,
+} from '@/lib/dalton/catalogRevision';
 import { queryKeys } from '@/lib/queryKeys';
 import type { AccountPolicy } from '@/types/api';
 
@@ -64,11 +67,16 @@ function useDaltonTeamModelsAvailableImpl(
     enabled,
     staleTime: 5 * 60_000,
     refetchInterval: (query) =>
-      typeof query.state.data?.catalog_revision === 'number' ? 5 * 60_000 : false,
+      query.state.data?.team_catalog_enabled === true ? 5 * 60_000 : false,
     refetchIntervalInBackground: false,
     refetchOnWindowFocus: true,
     retry: false,
   });
+  useEffect(() => {
+    if (modelsCatalog.data !== undefined) {
+      setTeamCatalogEnabled(modelsCatalog.data.team_catalog_enabled === true);
+    }
+  }, [modelsCatalog.data]);
   const daltonProfile = modelsCatalog.data?.dalton_profile;
   const catalogRevision = modelsCatalog.data?.catalog_revision;
   const daltonSetupCandidates = modelsCatalog.data?.dalton_setup_candidates;

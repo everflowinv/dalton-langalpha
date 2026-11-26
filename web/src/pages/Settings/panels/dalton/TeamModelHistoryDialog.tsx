@@ -9,6 +9,7 @@ import {
   DaltonLoadingRow,
   DaltonStatusBadge,
 } from '@/components/dalton/primitives';
+import { useCapabilities } from '@/hooks/useCapabilities';
 import { useLocale } from '@/hooks/useLocale';
 import { formatTimestamp } from '@/lib/format';
 import type { TeamCatalogModelItem } from '@/pages/Settings/utils/daltonApi';
@@ -18,7 +19,46 @@ import {
   useTeamCatalogRevisionDetail,
   useTeamCatalogRevisions,
   type MissingVariantCredentialDetail,
+  type RollbackTargetModelOption,
 } from './useTeamModelCatalog';
+
+function isOAuthKey(value: string): boolean {
+  return value.trim().toLowerCase().endsWith('-oauth');
+}
+
+function containsOAuthValue(value: unknown): boolean {
+  if (typeof value === 'string') return isOAuthKey(value);
+  if (Array.isArray(value)) return value.some((item) => containsOAuthValue(item));
+  if (value && typeof value === 'object') {
+    return Object.entries(value as Record<string, unknown>).some(
+      ([k, v]) => isOAuthKey(k) || containsOAuthValue(v),
+    );
+  }
+  return false;
+}
+
+function pruneOAuthFromJson(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => !(typeof item === 'string' && isOAuthKey(item)))
+      .map((item) => pruneOAuthFromJson(item))
+      .filter((item) => !(item && typeof item === 'object' && !Array.isArray(item) && Object.keys(item).length === 0));
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (isOAuthKey(k)) continue;
+      if (typeof v === 'string' && isOAuthKey(v)) continue;
+      const pruned = pruneOAuthFromJson(v);
+      if (pruned && typeof pruned === 'object' && !Array.isArray(pruned) && Object.keys(pruned).length === 0) {
+        continue;
+      }
+      out[k] = pruned;
+    }
+    return out;
+  }
+  return value;
+}
 
 export interface TeamModelHistoryDialogProps {
   open: boolean;
@@ -58,6 +98,8 @@ export function TeamModelHistoryDialog({
   const { t } = useTranslation();
   const locale = useLocale();
   const labelId = useId();
+  const { hasCapability } = useCapabilities();
+  const oauthSyncEnabled = hasCapability('native_oauth_sync');
 
   const revisionsQuery = useTeamCatalogRevisions(open, 50, 0);
   const rollbackMutation = useRollbackTeamCatalog();
@@ -70,6 +112,7 @@ export function TeamModelHistoryDialog({
   const [credKeys, setCredKeys] = useState<Record<string, string>>({});
   const [droppedSuccessors, setDroppedSuccessors] = useState<Record<string, string>>({});
   const [droppedModelNeedSuccessor, setDroppedModelNeedSuccessor] = useState<string | null>(null);
+  const [targetRevisionModels, setTargetRevisionModels] = useState<RollbackTargetModelOption[]>([]);
   const [rollbackError, setRollbackError] = useState<string | null>(null);
   const [rollbackResult, setRollbackResult] = useState<{
     newRevision: number;
@@ -83,6 +126,27 @@ export function TeamModelHistoryDialog({
   const revisions = revisionsQuery.data?.revisions ?? [];
   const liveRevision = revisionsQuery.data?.revision ?? currentRevision;
 
+  const buildSubmittedCredentials = (): Record<string, { base_url: string; api_key: string }> | null => {
+    if (missingCreds.length === 0) return {};
+    const credsPayload: Record<string, { base_url: string; api_key: string }> = {};
+    for (const item of missingCreds) {
+      const apiKey = (credKeys[item.provider_slug] ?? '').trim();
+      if (!apiKey) {
+        setRollbackError(
+          t('settings:dalton.teamCatalog.rollbackCredMissingInput', {
+            slug: item.provider_slug,
+          }),
+        );
+        return null;
+      }
+      credsPayload[item.provider_slug] = {
+        base_url: item.required_base_url,
+        api_key: apiKey,
+      };
+    }
+    return credsPayload;
+  };
+
   const executeRollback = async (
     targetRevision: number,
     suppliedCreds?: Record<string, { base_url: string; api_key: string }>,
@@ -90,6 +154,13 @@ export function TeamModelHistoryDialog({
   ) => {
     setRollbackError(null);
     setRollbackResult(null);
+    if (pendingTargetRev !== targetRevision) {
+      setMissingCreds([]);
+      setCredKeys({});
+      setDroppedModelNeedSuccessor(null);
+      setDroppedSuccessors({});
+      setTargetRevisionModels([]);
+    }
     setPendingTargetRev(targetRevision);
     try {
       const res = await rollbackMutation.mutateAsync({
@@ -103,6 +174,7 @@ export function TeamModelHistoryDialog({
       setCredKeys({});
       setDroppedModelNeedSuccessor(null);
       setDroppedSuccessors({});
+      setTargetRevisionModels([]);
       setPendingTargetRev(null);
       setRollbackResult({
         newRevision: res.revision,
@@ -125,8 +197,12 @@ export function TeamModelHistoryDialog({
         setRollbackError(parsed.message);
       } else if (parsed.code === 'model_in_use') {
         const match = /Model '([^']+)'/.exec(parsed.message);
-        if (match?.[1]) {
-          setDroppedModelNeedSuccessor(match[1]);
+        const droppedKey = parsed.droppedModel ?? match?.[1] ?? null;
+        if (droppedKey) {
+          setDroppedModelNeedSuccessor(droppedKey);
+        }
+        if (parsed.targetRevisionModels.length > 0) {
+          setTargetRevisionModels(parsed.targetRevisionModels);
         }
         setRollbackError(parsed.message);
       } else {
@@ -135,26 +211,26 @@ export function TeamModelHistoryDialog({
     }
   };
 
-  const handleConfirmWithCredentials = () => {
+  const handleConfirmRollbackRetry = () => {
     if (pendingTargetRev === null) return;
-    const credsPayload: Record<string, { base_url: string; api_key: string }> = {};
-    for (const item of missingCreds) {
-      const apiKey = (credKeys[item.provider_slug] ?? '').trim();
-      if (!apiKey) {
-        setRollbackError(
-          t('settings:dalton.teamCatalog.rollbackCredMissingInput', {
-            slug: item.provider_slug,
-          }),
-        );
-        return;
-      }
-      credsPayload[item.provider_slug] = {
-        base_url: item.required_base_url,
-        api_key: apiKey,
-      };
-    }
+    const credsPayload = buildSubmittedCredentials();
+    if (credsPayload === null) return;
     void executeRollback(pendingTargetRev, credsPayload, droppedSuccessors);
   };
+
+  const successorChoices = (
+    targetRevisionModels.length > 0
+      ? targetRevisionModels
+      : activeModels.map((m) => ({
+          model_key: m.model_key,
+          display_name: m.display_name,
+          provider: m.provider,
+        }))
+  ).filter(
+    (m) =>
+      m.model_key !== droppedModelNeedSuccessor &&
+      (oauthSyncEnabled || (!isOAuthKey(m.model_key) && !isOAuthKey(m.provider))),
+  );
 
   return (
     <ModalShell
@@ -237,6 +313,10 @@ export function TeamModelHistoryDialog({
                 size="sm"
                 onClick={() => {
                   setMissingCreds([]);
+                  setCredKeys({});
+                  setDroppedModelNeedSuccessor(null);
+                  setDroppedSuccessors({});
+                  setTargetRevisionModels([]);
                   setPendingTargetRev(null);
                   setRollbackError(null);
                 }}
@@ -247,7 +327,7 @@ export function TeamModelHistoryDialog({
                 type="button"
                 size="sm"
                 disabled={rollbackMutation.isPending}
-                onClick={handleConfirmWithCredentials}
+                onClick={handleConfirmRollbackRetry}
                 data-testid="rollback-creds-submit-btn"
               >
                 {rollbackMutation.isPending
@@ -289,13 +369,11 @@ export function TeamModelHistoryDialog({
               data-testid="rollback-dropped-successor-select"
             >
               <option value="">{t('settings:dalton.teamCatalog.selectSuccessorOption')}</option>
-              {activeModels
-                .filter((m) => m.model_key !== droppedModelNeedSuccessor)
-                .map((m) => (
-                  <option key={m.model_key} value={m.model_key}>
-                    {m.display_name} ({m.model_key})
-                  </option>
-                ))}
+              {successorChoices.map((m) => (
+                <option key={m.model_key} value={m.model_key}>
+                  {m.display_name} ({m.model_key})
+                </option>
+              ))}
             </select>
             <div className="flex justify-end">
               <Button
@@ -304,7 +382,7 @@ export function TeamModelHistoryDialog({
                 disabled={
                   rollbackMutation.isPending || !droppedSuccessors[droppedModelNeedSuccessor]
                 }
-                onClick={() => void executeRollback(pendingTargetRev, undefined, droppedSuccessors)}
+                onClick={handleConfirmRollbackRetry}
                 data-testid="rollback-dropped-submit-btn"
               >
                 {t('settings:dalton.teamCatalog.rollbackRetryWithSuccessor')}
@@ -330,6 +408,17 @@ export function TeamModelHistoryDialog({
               const isExpanded = expandedRev === rev.revision;
               const actionKey = ACTION_LABEL_KEY[rev.action];
               const actionLabel = actionKey ? t(actionKey) : rev.action;
+              const visibleTargetKeys = oauthSyncEnabled
+                ? rev.target_keys
+                : rev.target_keys.filter((k) => !isOAuthKey(k));
+              const visibleSideEffects = oauthSyncEnabled
+                ? rev.side_effects
+                : rev.side_effects.filter((eff) => !containsOAuthValue(eff));
+              const rawDiffSummary =
+                detailQuery.data?.revision_record?.diff_summary ?? rev.diff_summary;
+              const visibleDiffSummary = oauthSyncEnabled
+                ? rawDiffSummary
+                : pruneOAuthFromJson(rawDiffSummary);
               return (
                 <div
                   key={rev.revision}
@@ -375,11 +464,11 @@ export function TeamModelHistoryDialog({
                           })}
                         />
                       )}
-                      {rev.side_effects.length > 0 && (
+                      {visibleSideEffects.length > 0 && (
                         <DaltonStatusBadge
                           tone="neutral"
                           label={t('settings:dalton.teamCatalog.sideEffectsCount', {
-                            count: rev.side_effects.length,
+                            count: visibleSideEffects.length,
                           })}
                         />
                       )}
@@ -411,9 +500,9 @@ export function TeamModelHistoryDialog({
                         actor: rev.actor_label || rev.actor_user_id,
                       })}
                     </span>
-                    {rev.target_keys.length > 0 && (
+                    {visibleTargetKeys.length > 0 && (
                       <span className="font-mono break-all">
-                        {rev.target_keys.join(', ')}
+                        {visibleTargetKeys.join(', ')}
                       </span>
                     )}
                     {rev.comment && <span>· {rev.comment}</span>}
@@ -433,13 +522,10 @@ export function TeamModelHistoryDialog({
                       ) : (
                         <>
                           <div>
-                            diff_summary:{' '}
-                            {JSON.stringify(
-                              detailQuery.data?.revision_record?.diff_summary ?? rev.diff_summary,
-                            )}
+                            diff_summary: {JSON.stringify(visibleDiffSummary)}
                           </div>
-                          {rev.side_effects.length > 0 && (
-                            <div>side_effects: {JSON.stringify(rev.side_effects)}</div>
+                          {visibleSideEffects.length > 0 && (
+                            <div>side_effects: {JSON.stringify(visibleSideEffects)}</div>
                           )}
                         </>
                       )}

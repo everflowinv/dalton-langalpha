@@ -15,8 +15,12 @@ import { authSessionCheck } from '../lib/authResets';
 import { authGeneration, bearerTokenOf, getAccessToken, refreshAccessToken } from '../lib/authToken';
 import { trackRequest } from '../lib/reloadHolds';
 import { noteIfSuspended } from '../lib/accountSuspension';
-// DALTON-HOOK(team-model-catalog): invalidate model caches on newer X-Dalton-Catalog-Revision headers or stale-model 400s
-import { observeCatalogModelError, observeCatalogRevisionHeader } from '../lib/dalton/catalogRevision';
+// DALTON-HOOK(team-model-catalog): sync explicit server capability flag and invalidate model caches on newer X-Dalton-Catalog-Revision headers or stale-model 400s
+import {
+  observeCatalogModelError,
+  observeCatalogRevisionHeader,
+  syncTeamCatalogCapabilityFromResponse,
+} from '../lib/dalton/catalogRevision';
 
 const baseURL: string = import.meta.env.VITE_API_BASE_URL ?? '';
 
@@ -261,7 +265,8 @@ async function send(
   const { rawHeaders, ...rest } = sent;
   const response: ApiResponse = { ...rest, headers: Object.fromEntries(rawHeaders) };
   const { status } = response;
-  // DALTON-HOOK(team-model-catalog): track X-Dalton-Catalog-Revision on every response for immediate cross-session refresh
+  // DALTON-HOOK(team-model-catalog): sync server capability flag before observing X-Dalton-Catalog-Revision
+  syncTeamCatalogCapabilityFromResponse(url, status, response.data);
   observeCatalogRevisionHeader(response.headers, { url });
   if (status >= 200 && status < 300) return response;
   // Every route refuses a suspended account the same way: the shell turns

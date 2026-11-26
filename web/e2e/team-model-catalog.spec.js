@@ -177,6 +177,7 @@ test.describe('Team Model Catalog Batch 2 E2E', () => {
     const adminModelsState = {
       fetchCount: 0,
       current: () => ({
+        team_catalog_enabled: true,
         catalog_revision: rev,
         dalton_profile: 'core',
         dalton_setup_candidates: ['gpt-5', ...extraModels.map((m) => m.model_key)],
@@ -210,7 +211,8 @@ test.describe('Team Model Catalog Batch 2 E2E', () => {
       }),
     };
 
-    // 1. Open an idle foreground member page with controllable clock BEFORE the admin adds a model.
+    // 1. Open an idle foreground member page on Settings -> Model (with model selector visible)
+    // using a controllable clock BEFORE the admin adds a model.
     const memberPage = await context.newPage();
     await memberPage.clock.install();
     const memberModelsState = {
@@ -226,11 +228,13 @@ test.describe('Team Model Catalog Batch 2 E2E', () => {
         modelsState: memberModelsState,
       }),
     );
-    await memberPage.goto('/chat');
+    await memberPage.goto('/settings?tab=models');
     await expect.poll(() => memberModelsState.fetchCount).toBeGreaterThanOrEqual(1);
+    await expect(memberPage.locator('select option', { hasText: 'GPT-5' }).first()).toBeAttached();
+    await expect(memberPage.locator('select option', { hasText: 'GPT-5 Research Preview' })).toHaveCount(0);
     const initialMemberFetches = memberModelsState.fetchCount;
 
-    // 2. Admin saves a new model in Settings -> immediately visible in admin catalog & models query
+    // 2. Admin saves a new model in Settings -> immediately visible in admin catalog AND selectable in model picker
     await mockAPI(
       page,
       makeAdminOverrides({
@@ -255,9 +259,16 @@ test.describe('Team Model Catalog Batch 2 E2E', () => {
 
     await expect(page.getByTestId('catalog-model-row-gpt-5-research-preview')).toBeVisible();
 
+    // Admin switches to Settings -> Model tab and confirms the new model is immediately selectable
+    await page.goto('/settings?tab=models');
+    await expect(page.locator('select option', { hasText: 'GPT-5 Research Preview' }).first()).toBeAttached();
+
     // 3. Keep memberPage completely idle in the foreground (zero clicks/keys/focus) and fast-forward 5 minutes
     await memberPage.clock.fastForward(5 * 60_000 + 1_000);
     await expect.poll(() => memberModelsState.fetchCount).toBeGreaterThan(initialMemberFetches);
+    await expect(
+      memberPage.locator('select option', { hasText: 'GPT-5 Research Preview' }).first(),
+    ).toBeAttached();
     await memberPage.close();
   });
 
@@ -318,6 +329,7 @@ test.describe('Team Model Catalog Batch 2 E2E', () => {
         cached: false,
       },
       'GET /models': {
+        team_catalog_enabled: true,
         catalog_revision: 12,
         dalton_profile: profile,
         dalton_setup_candidates: daltonSetupCandidates,
@@ -373,6 +385,7 @@ test.describe('Team Model Catalog Batch 2 E2E', () => {
         cached: false,
       },
       'GET /models': {
+        team_catalog_enabled: true,
         catalog_revision: 11,
         dalton_profile: 'everflow',
         dalton_setup_candidates: ['gpt-6.2-sol-oauth'],
@@ -493,6 +506,7 @@ test.describe('Team Model Catalog Batch 2 E2E', () => {
     const modelsState = {
       fetchCount: 0,
       current: () => ({
+        team_catalog_enabled: true,
         catalog_revision: 4,
         dalton_profile: 'core',
         dalton_setup_candidates: ['gpt-5'],
@@ -546,5 +560,15 @@ test.describe('Team Model Catalog Batch 2 E2E', () => {
     expect(footerBox).not.toBeNull();
     expect(footerBox.y + footerBox.height).toBeLessThanOrEqual(813);
     expect(footerBox.x + footerBox.width).toBeLessThanOrEqual(376);
+
+    // Focus an input and simulate soft keyboard shrinking visual viewport to 500px
+    await page.getByTestId('edit-model-display-name-input').focus();
+    await page.evaluate(() => {
+      document.documentElement.style.setProperty('--visual-viewport-height', '500px');
+      document.documentElement.style.setProperty('--visual-viewport-bottom-offset', '312px');
+    });
+    const footerKeyboardBox = await page.getByTestId('edit-sheet-footer').boundingBox();
+    expect(footerKeyboardBox).not.toBeNull();
+    expect(footerKeyboardBox.y + footerKeyboardBox.height).toBeLessThanOrEqual(501);
   });
 });

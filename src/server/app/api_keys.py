@@ -790,18 +790,21 @@ async def list_models(response: Response):
     )
 
     # DALTON-HOOK(team-model-catalog): confirm live PG catalog revision on every GET /api/v1/models,
-    # expose X-Dalton-Catalog-Revision header, and serve version-aligned curated setup candidates.
+    # expose X-Dalton-Catalog-Revision header when enabled, and serve version-aligned curated setup candidates.
     from src.dalton.services.team_model_catalog.compiled import get_compiled_catalog_async
     from src.dalton.services.team_model_catalog.constants import CATALOG_REVISION_HEADER
     from src.dalton.services.team_model_catalog.service import derive_curated_setup_for_catalog
+    from src.dalton.settings import is_dalton_enabled
 
+    team_catalog_enabled = is_dalton_enabled()
     compiled_catalog = await get_compiled_catalog_async()
     prev_rev = getattr(LLM._model_config, "catalog_revision", None)
     if LLM._model_config is None or prev_rev != compiled_catalog.revision:
         LLM._model_config = compiled_catalog.model_config
         provider_catalog.cache_clear()
         key_candidates.cache_clear()
-    response.headers[CATALOG_REVISION_HEADER] = str(compiled_catalog.revision)
+    if team_catalog_enabled:
+        response.headers[CATALOG_REVISION_HEADER] = str(compiled_catalog.revision)
     curated_setup_fields = derive_curated_setup_for_catalog(compiled_catalog)
 
     # DALTON-HOOK(catalog-cache): clear provider catalog caches when the OpenClaw overlay changes
@@ -889,8 +892,9 @@ async def list_models(response: Response):
         # A pick from a gateway's list is tuned as the built-in it matched.
         "gateway_index": gateway_index(config),
         # DALTON-HOOK(antigravity-series): expose Antigravity series grouping & centralized default efforts
-        # DALTON-HOOK(team-model-catalog): serve compiled catalog series, revision & version-aligned setup candidates
+        # DALTON-HOOK(team-model-catalog): serve compiled catalog series, capability flag, revision & version-aligned setup candidates
         "antigravity_series": compiled_catalog.antigravity_series,
+        "team_catalog_enabled": team_catalog_enabled,
         "catalog_revision": compiled_catalog.revision,
         **curated_setup_fields,
         # DALTON-HOOK(standalone-core): expose deployment profile (everflow vs core) for setup wizard gating

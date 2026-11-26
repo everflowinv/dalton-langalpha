@@ -170,3 +170,73 @@ async def stop_following() -> None:
         await task
     except asyncio.CancelledError:
         pass
+
+
+def _should_stamp_catalog_revision_path(path: str) -> bool:
+    if path == "/api/v1/users/me/preferences":
+        return True
+    if path.startswith("/api/v1/threads/") and (
+        path.endswith("/messages") or path.endswith("/messages/stream")
+    ):
+        return True
+    return False
+
+
+class CatalogRevisionHeaderMiddleware:
+    """Pure-ASGI middleware emitting ``X-Dalton-Catalog-Revision`` on chat and preferences routes.
+
+    Non-buffering so SSE ``StreamingResponse`` streams are never delayed; no-op when
+    Dalton is disabled.
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or not _should_stamp_catalog_revision_path(
+            str(scope.get("path") or "")
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        from src.dalton.settings import is_dalton_enabled
+
+        if not is_dalton_enabled():
+            await self.app(scope, receive, send)
+            return
+
+        from src.dalton.services.team_model_catalog.compiled import (
+            get_compiled_catalog_async,
+        )
+        from src.dalton.services.team_model_catalog.constants import (
+            CATALOG_REVISION_HEADER,
+        )
+
+        header_key = CATALOG_REVISION_HEADER.lower().encode("ascii")
+
+        async def _send_with_revision(message: dict[str, Any]) -> None:
+            if message.get("type") == "http.response.start":
+                raw_headers = list(message.get("headers") or [])
+                has_header = any(
+                    isinstance(k, (bytes, bytearray)) and bytes(k).lower() == header_key
+                    for k, _ in raw_headers
+                )
+                if not has_header:
+                    rev_value: int | None = None
+                    try:
+                        compiled = await get_compiled_catalog_async()
+                        rev_value = int(compiled.revision)
+                    except Exception:
+                        from src.llms.llm import LLM
+
+                        raw_rev = getattr(LLM._model_config, "catalog_revision", None)
+                        if isinstance(raw_rev, int):
+                            rev_value = raw_rev
+                    if rev_value is not None:
+                        raw_headers.append(
+                            (header_key, str(rev_value).encode("ascii"))
+                        )
+                        message = {**message, "headers": raw_headers}
+            await send(message)
+
+        await self.app(scope, receive, _send_with_revision)

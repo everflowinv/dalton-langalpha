@@ -1604,6 +1604,11 @@ class _CORSMiddleware(CORSMiddleware):
         await super().__call__(scope, receive, send)
 
 
+# DALTON-HOOK(team-model-catalog): emit X-Dalton-Catalog-Revision on chat & preferences responses when Dalton is enabled
+from src.dalton.services.team_model_catalog.follow import CatalogRevisionHeaderMiddleware
+
+app.add_middleware(CatalogRevisionHeaderMiddleware)
+
 app.add_middleware(
     _CORSMiddleware,
     allow_origins=allowed_origins,  # Restrict to specific origins
@@ -1625,6 +1630,8 @@ app.add_middleware(
         "Accept-Ranges",
         "ETag",
         COMPUTER_UNREACHABLE_HEADER,
+        # DALTON-HOOK(team-model-catalog): expose catalog revision header for cross-origin browsers
+        "X-Dalton-Catalog-Revision",
     ],
 )
 

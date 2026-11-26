@@ -939,7 +939,7 @@ export interface TeamCatalogDaltonMeta {
 export interface TeamCatalogReasoningConfig {
   efforts?: string[];
   default?: string;
-  write?: string;
+  write?: string | null;
   on?: Record<string, unknown>;
   off?: Record<string, unknown>;
   [extra: string]: unknown;
@@ -1037,6 +1037,17 @@ export interface TeamCatalogRevisionDetailResponse {
   revision_record: TeamCatalogRevisionRecord;
 }
 
+export interface TeamCatalogInlineVariantUpdatePayload {
+  provider_slug: string;
+  display_name: string;
+  sdk: string;
+  parent_provider: string;
+  access_type: 'api_key' | 'coding_plan';
+  billing: TeamCatalogBillingMode;
+  base_url: string;
+  api_key?: string;
+}
+
 export interface TeamCatalogModelUpsertPayload {
   model_key?: string;
   model_id?: string;
@@ -1058,6 +1069,8 @@ export interface TeamCatalogModelUpsertPayload {
   alias?: string[] | null;
   dalton_meta?: TeamCatalogDaltonMeta | null;
   task_costs_bound?: { model: string; times: number } | null;
+  provider_variant_update?: TeamCatalogInlineVariantUpdatePayload | null;
+  curated_setup_member?: boolean | null;
   expected_revision?: number;
   comment?: string | null;
 }

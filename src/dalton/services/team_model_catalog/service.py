@@ -66,6 +66,7 @@ from src.dalton.services.team_model_catalog.validation import (
     CatalogRollbackInput,
     CatalogTestCallInput,
     CuratedSetupUpdateInput,
+    InlineProviderVariantUpdateInput,
     ModelRestoreInput,
     ModelRetireInput,
     ModelVisibilityInput,
@@ -98,78 +99,131 @@ _USER_PREF_SLOT_KEYS = (
     "summarization_model",
 )
 
-# Defensive read-only parameter sanitizer for GET /api/v1/dalton/team-models:
-# strips any credential, secret, auth, or header keys recursively while
-# preserving legitimate model parameters such as max_tokens / reasoning / thinking.
-_PUBLIC_PARAM_FORBIDDEN_KEYS = frozenset(
+# Strict read-only parameter whitelist for GET /api/v1/dalton/team-models:
+# exposes ONLY the parameter keys rendered/edited by TeamModelEditSheet so
+# non-UI or sensitive parameters are never read by or echoed from the browser,
+# and remain preserved server-side across model updates.
+_OVERVIEW_ALLOWED_PARAMETER_KEYS = frozenset(
     {
-        "apikey",
-        "api_key",
-        "headers",
-        "default_headers",
-        "additional_headers",
-        "extra_headers",
-        "auth",
-        "authorization",
-        "token",
-        "access_token",
-        "refresh_token",
-        "id_token",
-        "auth_token",
-        "secret",
-        "client_secret",
-        "api_secret",
-        "secret_key",
-        "private_key",
-        "env_key",
-        "password",
-        "passwd",
-        "credentials",
-        "credential",
-        "bearer",
-        "x-api-key",
-        "x_api_key",
+        "max_tokens",
+        "max_output_tokens",
     }
 )
-_PUBLIC_PARAM_FORBIDDEN_SUFFIXES = (
-    "_key",
-    "_secret",
-    "_password",
-    "_passwd",
-    "_credential",
-    "_credentials",
-    "_auth",
-    "_headers",
-    "_header",
-)
-
-
-def _is_forbidden_public_param_key(key: str) -> bool:
-    low = key.strip().lower()
-    if low in _PUBLIC_PARAM_FORBIDDEN_KEYS:
-        return True
-    return any(low.endswith(suffix) for suffix in _PUBLIC_PARAM_FORBIDDEN_SUFFIXES)
-
-
-def _sanitize_public_value(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        cleaned: dict[str, Any] = {}
-        for k, v in value.items():
-            k_str = str(k)
-            if _is_forbidden_public_param_key(k_str):
-                continue
-            cleaned[k_str] = _sanitize_public_value(v)
-        return cleaned
-    if isinstance(value, list):
-        return [_sanitize_public_value(item) for item in value]
-    return copy.deepcopy(value)
 
 
 def _sanitize_public_parameters(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, Mapping):
         return None
-    cleaned = _sanitize_public_value(raw)
-    return cleaned if isinstance(cleaned, dict) and cleaned else None
+    cleaned: dict[str, Any] = {}
+    for key in _OVERVIEW_ALLOWED_PARAMETER_KEYS:
+        if key not in raw:
+            continue
+        val = raw.get(key)
+        if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+            cleaned[key] = val
+    return cleaned if cleaned else None
+
+
+def _contains_oauth_identifier(value: Any) -> bool:
+    from src.dalton.llm.overlay import _is_oauth_model_key
+
+    if isinstance(value, str):
+        return _is_oauth_model_key(value.strip().lower())
+    if isinstance(value, Mapping):
+        return any(
+            _contains_oauth_identifier(k) or _contains_oauth_identifier(v)
+            for k, v in value.items()
+        )
+    if isinstance(value, (list, tuple, set)):
+        return any(_contains_oauth_identifier(item) for item in value)
+    return False
+
+
+def _prune_oauth_from_value(value: Any) -> Any:
+    from src.dalton.llm.overlay import _is_oauth_model_key
+
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            k_str = str(k)
+            if _is_oauth_model_key(k_str.strip().lower()):
+                continue
+            if isinstance(v, str) and _is_oauth_model_key(v.strip().lower()):
+                continue
+            pruned = _prune_oauth_from_value(v)
+            if isinstance(v, Mapping) and not pruned:
+                continue
+            out[k_str] = pruned
+        return out
+    if isinstance(value, list):
+        kept = []
+        for item in value:
+            if isinstance(item, str) and _is_oauth_model_key(item.strip().lower()):
+                continue
+            pruned = _prune_oauth_from_value(item)
+            if isinstance(item, Mapping) and not pruned:
+                continue
+            kept.append(pruned)
+        return kept
+    return copy.deepcopy(value)
+
+
+def sanitize_revision_record_for_capabilities(
+    rec: Mapping[str, Any],
+    *,
+    oauth_sync_enabled: bool,
+) -> dict[str, Any]:
+    """Prune ``*-oauth`` identifiers from revision audit fields when ``native_oauth_sync`` is off.
+
+    Preserves revision number, action, timestamps, and rollback metadata so Core
+    deployments keep full version history and rollback entrypoints without leaking
+    Everflow OAuth model or provider names.
+    """
+    out = copy.deepcopy(dict(rec))
+    if oauth_sync_enabled:
+        return out
+
+    from src.dalton.llm.overlay import _is_oauth_model_key
+    from src.dalton.services.team_model_catalog.compiled import (
+        _filter_payload_for_oauth_disabled,
+    )
+
+    raw_targets = out.get("target_keys")
+    if isinstance(raw_targets, list):
+        out["target_keys"] = [
+            str(k)
+            for k in raw_targets
+            if not _is_oauth_model_key(str(k).strip().lower())
+        ]
+
+    raw_diff = out.get("diff_summary")
+    if isinstance(raw_diff, Mapping):
+        out["diff_summary"] = _prune_oauth_from_value(raw_diff)
+
+    raw_effects = out.get("side_effects")
+    if isinstance(raw_effects, list):
+        out["side_effects"] = [
+            eff
+            for eff in raw_effects
+            if not _contains_oauth_identifier(eff)
+        ]
+
+    raw_payload = out.get("payload")
+    if isinstance(raw_payload, Mapping):
+        out["payload"] = _filter_payload_for_oauth_disabled(raw_payload)
+
+    return out
+
+
+def _merge_model_override_patch(target: dict[str, Any], patch: Mapping[str, Any]) -> None:
+    """Deep-merge ``patch`` into a ``model_overrides`` dict while preserving explicit ``None`` markers."""
+    for key, value in patch.items():
+        if value is None:
+            target[key] = None
+        elif isinstance(value, Mapping) and isinstance(target.get(key), dict):
+            _merge_model_override_patch(target[key], value)
+        else:
+            target[key] = copy.deepcopy(value)
 
 
 def _utcnow_iso() -> str:
@@ -695,7 +749,13 @@ async def get_team_catalog_overview() -> dict[str, Any]:
 async def list_revisions_view(*, limit: int = 50, offset: int = 0) -> dict[str, Any]:
     compiled = await get_compiled_catalog_async()
     revs = await list_catalog_revisions(limit=limit, offset=offset)
-    return {"revision": compiled.revision, "revisions": revs}
+    sanitized = [
+        sanitize_revision_record_for_capabilities(
+            r, oauth_sync_enabled=compiled.oauth_sync_enabled
+        )
+        for r in revs
+    ]
+    return {"revision": compiled.revision, "revisions": sanitized}
 
 
 # ---------------------------------------------------------------------------
@@ -862,17 +922,142 @@ def _build_pricing_card_dict(
     return card
 
 
+async def _apply_inline_provider_variant_update_in_tx(
+    conn: Any,
+    *,
+    variant_in: InlineProviderVariantUpdateInput,
+    target_provider: str,
+    current_compiled: CompiledCatalog,
+    next_payload: dict[str, Any],
+    actor_user_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate and apply an inline catalog provider variant update inside an active catalog transaction.
+
+    Because the credential upsert runs on ``conn`` inside the caller's ``conn.transaction()``,
+    any subsequent model validation or trial-compile failure rolls back both the variant
+    payload and the credential write atomically.
+    """
+    slug = variant_in.provider_slug.strip()
+    if slug != target_provider.strip():
+        raise CatalogValidationError(
+            "variant_provider_mismatch",
+            f"provider_variant_update.provider_slug ({slug!r}) must match model provider ({target_provider!r}).",
+        )
+
+    cleaned_url, canonical_bound = validate_provider_variant_input(
+        variant_in, compiled=current_compiled, is_update=True
+    )
+    existing_creds = await list_catalog_provider_credentials(conn=conn)
+    existing_cred = existing_creds.get(slug)
+
+    url_changed = (
+        existing_cred is not None
+        and existing_cred.get("canonical_bound_url") != canonical_bound
+    )
+    if (existing_cred is None or url_changed) and not (
+        variant_in.api_key and variant_in.api_key.strip()
+    ):
+        raise CatalogValidationError(
+            "variant_api_key_required",
+            f"Setting or changing base_url for catalog variant '{slug}' requires a dedicated api_key.",
+        )
+
+    prov_block = next_payload.setdefault("providers", {})
+    variants_by_group = prov_block.setdefault("provider_variants", {})
+    for grp, vmap in list(variants_by_group.items()):
+        if isinstance(vmap, dict) and slug in vmap and grp != variant_in.parent_provider:
+            vmap.pop(slug, None)
+    grp_map = variants_by_group.setdefault(variant_in.parent_provider, {})
+    variant_entry = {
+        "display_name": variant_in.display_name.strip(),
+        "sdk": variant_in.sdk.strip(),
+        "parent_provider": variant_in.parent_provider.strip(),
+        "access_type": variant_in.access_type,
+        "billing": variant_in.billing,
+        "base_url": cleaned_url,
+    }
+    grp_map[slug] = variant_entry
+
+    cred_updated = False
+    key_fp: str | None = (existing_cred or {}).get("key_fingerprint")
+    if variant_in.api_key and variant_in.api_key.strip():
+        cred_row = await upsert_catalog_provider_credential(
+            conn,
+            provider_slug=slug,
+            api_key=variant_in.api_key.strip(),
+            bound_base_url=cleaned_url,
+            updated_by=actor_user_id,
+        )
+        cred_updated = True
+        key_fp = cred_row["key_fingerprint"]
+
+    updated_prov_info = {
+        **variant_entry,
+        "catalog_defined": True,
+        "own_api_key": True,
+        "group": variant_in.parent_provider.strip(),
+    }
+    variant_diff = {
+        "provider_slug": slug,
+        "parent_provider": variant_in.parent_provider.strip(),
+        "base_url": cleaned_url,
+        "credential_updated": cred_updated,
+        "key_fingerprint": key_fp,
+    }
+    return updated_prov_info, variant_diff
+
+
+def _apply_curated_setup_member_in_tx(
+    next_payload: dict[str, Any],
+    *,
+    current_compiled: CompiledCatalog,
+    model_key: str,
+    include: bool,
+) -> list[str]:
+    """Add or remove ``model_key`` in ``next_payload['curated_setup']`` within the same transaction."""
+    if isinstance(next_payload.get("curated_setup"), list):
+        base_list = [str(k).strip() for k in next_payload["curated_setup"] if str(k).strip()]
+    else:
+        base_list = list(derive_curated_setup_for_catalog(current_compiled)["dalton_setup_candidates"])
+
+    if include:
+        next_list = list(base_list)
+        if model_key not in next_list:
+            next_list.append(model_key)
+    else:
+        next_list = [k for k in base_list if k != model_key]
+    next_payload["curated_setup"] = next_list
+    return next_list
+
+
 async def create_catalog_model(
     *,
     actor_user_id: str,
     data: CatalogModelUpsertInput,
 ) -> dict[str, Any]:
-    """Create a new model in the team catalog (returns 409 if key exists in Layers 1–3)."""
+    """Create a new model in the team catalog (returns 409 if key exists in Layers 1–3).
+
+    When ``provider_variant_update`` and/or ``curated_setup_member`` are supplied,
+    all changes execute atomically inside the same PostgreSQL transaction and
+    catalog revision bump.
+    """
     model_key = str(data.model_key or "").strip()
     if not model_key:
         raise CatalogValidationError("missing_model_key", "model_key is required")
     if not data.model_id or not data.provider:
         raise CatalogValidationError("missing_fields", "model_id and provider are required")
+
+    if data.provider_variant_update is not None:
+        if data.provider_variant_update.provider_slug.strip() != data.provider.strip():
+            raise CatalogValidationError(
+                "variant_provider_mismatch",
+                f"provider_variant_update.provider_slug ({data.provider_variant_update.provider_slug.strip()!r}) "
+                f"must match model provider ({data.provider.strip()!r}).",
+            )
+        try:
+            await preflight_catalog_variant_url(data.provider_variant_update.base_url)
+        except (ValueError, EgressBlockedError) as exc:
+            raise CatalogValidationError("variant_base_url_blocked", str(exc)) from exc
 
     async with get_db_connection() as conn:
         async with conn.transaction():
@@ -901,11 +1086,26 @@ async def create_catalog_model(
                     "model_key_exists",
                     f"Model key {model_key!r} already exists as {existing_lower[model_key.lower()]!r}; use update instead.",
                 )
-            prov_info = mc.get_provider_info(data.provider)
-            if not prov_info:
-                raise CatalogValidationError(
-                    "unknown_provider", f"Unknown provider {data.provider!r}"
+
+            next_payload = copy.deepcopy(row["payload"])
+            next_payload["schema"] = CATALOG_SCHEMA
+
+            variant_diff: dict[str, Any] | None = None
+            if data.provider_variant_update is not None:
+                prov_info, variant_diff = await _apply_inline_provider_variant_update_in_tx(
+                    conn,
+                    variant_in=data.provider_variant_update,
+                    target_provider=data.provider.strip(),
+                    current_compiled=current_compiled,
+                    next_payload=next_payload,
+                    actor_user_id=actor_user_id,
                 )
+            else:
+                prov_info = mc.get_provider_info(data.provider)
+                if not prov_info:
+                    raise CatalogValidationError(
+                        "unknown_provider", f"Unknown provider {data.provider!r}"
+                    )
 
             model_entry: dict[str, Any] = {
                 "model_id": data.model_id.strip(),
@@ -927,13 +1127,23 @@ async def create_catalog_model(
             ):
                 val = getattr(data, fname)
                 if val is not None:
-                    model_entry[fname] = copy.deepcopy(val)
+                    copied = copy.deepcopy(val)
+                    if fname in ("parameters", "reasoning") and isinstance(copied, dict):
+                        for sub_k in [k for k, v in copied.items() if v is None]:
+                            copied.pop(sub_k, None)
+                        if not copied:
+                            continue
+                    model_entry[fname] = copied
 
             dm_entry = (
                 data.dalton_meta.model_dump(exclude_unset=True)
                 if data.dalton_meta is not None
                 else None
             )
+            if isinstance(dm_entry, dict):
+                dm_entry = {k: v for k, v in dm_entry.items() if v is not None}
+                if not dm_entry:
+                    dm_entry = None
             pricing_dict = (
                 data.pricing.model_dump(exclude_none=True) if data.pricing is not None else None
             )
@@ -946,8 +1156,6 @@ async def create_catalog_model(
                 pricing_explicit=(data.pricing is not None),
             )
 
-            next_payload = copy.deepcopy(row["payload"])
-            next_payload["schema"] = CATALOG_SCHEMA
             next_payload.setdefault("models", {})[model_key] = model_entry
 
             card_obj = _build_pricing_card_dict(
@@ -967,19 +1175,33 @@ async def create_catalog_model(
                     copy.deepcopy(data.task_costs_bound)
                 )
 
+            curated_updated: list[str] | None = None
+            if data.curated_setup_member is not None:
+                curated_updated = _apply_curated_setup_member_in_tx(
+                    next_payload,
+                    current_compiled=current_compiled,
+                    model_key=model_key,
+                    include=bool(data.curated_setup_member),
+                )
+
             compiled = trial_compile_and_validate_catalog(
                 next_payload,
                 revision=cur_rev + 1,
                 legacy_sync_import_status=row["legacy_sync_import_status"],
                 last_known_legacy_retired=row["last_known_legacy_retired"],
             )
+            diff_summary: dict[str, Any] = {"created": model_key, "provider": data.provider}
+            if variant_diff is not None:
+                diff_summary["provider_variant"] = variant_diff
+            if curated_updated is not None:
+                diff_summary["curated_setup"] = curated_updated
             saved = await save_catalog_revision(
                 conn,
                 expected_revision=cur_rev,
                 action="create_model",
                 target_keys=[model_key],
                 payload=next_payload,
-                diff_summary={"created": model_key, "provider": data.provider},
+                diff_summary=diff_summary,
                 side_effects=[],
                 actor_user_id=actor_user_id,
                 comment=data.comment,
@@ -1029,8 +1251,23 @@ async def update_catalog_model(
     model_key: str,
     data: CatalogModelUpsertInput,
 ) -> dict[str, Any]:
-    """Update an existing model (writes to ``models`` for team-added or ``model_overrides`` for factory)."""
+    """Update an existing model (writes to ``models`` for team-added or ``model_overrides`` for factory).
+
+    Supports atomic companion ``provider_variant_update`` and ``curated_setup_member``
+    inside the same PostgreSQL transaction, preserves non-mentioned nested ``parameters``
+    server-side, and treats explicit ``None`` values as field deletions.
+    """
+    from src.dalton.services.team_model_catalog.compiled import (
+        deep_merge_patch_with_null_delete,
+    )
+
     key = model_key.strip()
+    if data.provider_variant_update is not None:
+        try:
+            await preflight_catalog_variant_url(data.provider_variant_update.base_url)
+        except (ValueError, EgressBlockedError) as exc:
+            raise CatalogValidationError("variant_base_url_blocked", str(exc)) from exc
+
     async with get_db_connection() as conn:
         async with conn.transaction():
             await acquire_catalog_exclusive_lock(conn)
@@ -1079,11 +1316,28 @@ async def update_catalog_model(
                     patch[fname] = copy.deepcopy(getattr(data, fname))
 
             merged_entry = copy.deepcopy(dict(existing))
-            merged_entry.update(patch)
+            deep_merge_patch_with_null_delete(merged_entry, patch)
+            if merged_entry.get("parameters") == {}:
+                merged_entry.pop("parameters", None)
             prov = str(merged_entry.get("provider") or "")
-            prov_info = mc.get_provider_info(prov)
-            if not prov_info:
-                raise CatalogValidationError("unknown_provider", f"Unknown provider {prov!r}")
+
+            next_payload = copy.deepcopy(row["payload"])
+            next_payload["schema"] = CATALOG_SCHEMA
+
+            variant_diff: dict[str, Any] | None = None
+            if data.provider_variant_update is not None:
+                prov_info, variant_diff = await _apply_inline_provider_variant_update_in_tx(
+                    conn,
+                    variant_in=data.provider_variant_update,
+                    target_provider=prov,
+                    current_compiled=current_compiled,
+                    next_payload=next_payload,
+                    actor_user_id=actor_user_id,
+                )
+            else:
+                prov_info = mc.get_provider_info(prov)
+                if not prov_info:
+                    raise CatalogValidationError("unknown_provider", f"Unknown provider {prov!r}")
 
             dm_patch = (
                 data.dalton_meta.model_dump(exclude_unset=True)
@@ -1092,10 +1346,6 @@ async def update_catalog_model(
             )
             merged_meta = copy.deepcopy(current_compiled.dalton_meta.get(key) or {})
             if dm_patch is not None:
-                from src.dalton.services.team_model_catalog.compiled import (
-                    deep_merge_patch_with_null_delete,
-                )
-
                 deep_merge_patch_with_null_delete(merged_meta, dm_patch)
 
             existing_card = _find_provider_pricing_card(
@@ -1124,13 +1374,13 @@ async def update_catalog_model(
                 pricing_explicit=(data.pricing is not None),
             )
 
-            next_payload = copy.deepcopy(row["payload"])
-            next_payload["schema"] = CATALOG_SCHEMA
             if key in (next_payload.get("models") or {}):
-                next_payload["models"][key].update(patch)
+                deep_merge_patch_with_null_delete(next_payload["models"][key], patch)
+                if next_payload["models"][key].get("parameters") == {}:
+                    next_payload["models"][key].pop("parameters", None)
             else:
                 ov = next_payload.setdefault("model_overrides", {}).setdefault(key, {})
-                ov.update(patch)
+                _merge_model_override_patch(ov, patch)
 
             if clearing_pricing:
                 card_id = str(merged_entry.get("model_id") or key)
@@ -1229,19 +1479,33 @@ async def update_catalog_model(
                     copy.deepcopy(data.task_costs_bound)
                 )
 
+            curated_updated: list[str] | None = None
+            if data.curated_setup_member is not None:
+                curated_updated = _apply_curated_setup_member_in_tx(
+                    next_payload,
+                    current_compiled=current_compiled,
+                    model_key=key,
+                    include=bool(data.curated_setup_member),
+                )
+
             compiled = trial_compile_and_validate_catalog(
                 next_payload,
                 revision=cur_rev + 1,
                 legacy_sync_import_status=row["legacy_sync_import_status"],
                 last_known_legacy_retired=row["last_known_legacy_retired"],
             )
+            diff_summary: dict[str, Any] = {"updated": key, "fields": sorted(patch.keys())}
+            if variant_diff is not None:
+                diff_summary["provider_variant"] = variant_diff
+            if curated_updated is not None:
+                diff_summary["curated_setup"] = curated_updated
             saved = await save_catalog_revision(
                 conn,
                 expected_revision=cur_rev,
                 action="update_model",
                 target_keys=[key],
                 payload=next_payload,
-                diff_summary={"updated": key, "fields": sorted(patch.keys())},
+                diff_summary=diff_summary,
                 side_effects=[],
                 actor_user_id=actor_user_id,
                 comment=data.comment,
@@ -2799,14 +3063,30 @@ async def rollback_catalog(
                     )
                     if has_blocking:
                         succ = data.successor_for_dropped.get(dkey)
-                        extra_se, extra_pref_users = await _validate_and_replace_references_in_tx(
-                            conn,
-                            retired_key=dkey,
-                            successor_model=succ,
-                            refs=d_refs,
-                            post_compiled=target_compiled,
-                            actor_user_id=actor_user_id,
-                        )
+                        try:
+                            extra_se, extra_pref_users = await _validate_and_replace_references_in_tx(
+                                conn,
+                                retired_key=dkey,
+                                successor_model=succ,
+                                refs=d_refs,
+                                post_compiled=target_compiled,
+                                actor_user_id=actor_user_id,
+                            )
+                        except CatalogConflictError as exc:
+                            if exc.code == "model_in_use":
+                                exc.extra["dropped_model"] = dkey
+                                exc.extra["target_revision_models"] = [
+                                    {
+                                        "model_key": str(mk),
+                                        "display_name": str((me or {}).get("display_name") or mk),
+                                        "provider": str((me or {}).get("provider") or ""),
+                                    }
+                                    for mk, me in sorted(
+                                        (target_compiled.model_config.llm_config or {}).items()
+                                    )
+                                    if isinstance(me, Mapping)
+                                ]
+                            raise
                         rollback_side_effects.extend(extra_se)
                         affected_pref_users.update(extra_pref_users)
 

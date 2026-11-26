@@ -30,7 +30,7 @@ import type { SetupStatus } from '@/api/setup';
 import { useSetupStatus } from '@/hooks/useServerSetup';
 import { isDaltonSetupProviderAllowed } from '@/config/daltonSetup';
 import { useDaltonTeamModelsAvailable } from './useTeamModelsAvailable';
-import { effectiveModelsAnswer, nextSetupPath, nextSetupStep, readAnswers, resolveDaltonCuratedProviders, setupRail, type ServerStepState, type SetupFacts } from './setupSteps';
+import { effectiveModelsAnswer, isDaltonEverflowCuratedEmpty, nextSetupPath, nextSetupStep, readAnswers, resolveDaltonCuratedProviders, setupRail, type ServerStepState, type SetupFacts } from './setupSteps';
 
 /**
  * The server's own step, from its setup status: owed while it says the step is,
@@ -140,6 +140,11 @@ export function useSetupFacts({ refetchInterval = false }: { refetchInterval?: n
   ));
 
   // DALTON-HOOK(dalton-setup): include teamModelsAvailable in SetupFacts & rail
+  // DALTON-HOOK(team-model-catalog): share current revision's curated/team empty state between routing and ModelStep
+  const teamModelsEmpty =
+    isDaltonBuild &&
+    (team.empty ||
+      isDaltonEverflowCuratedEmpty(team.daltonProfile, team.daltonSetupCandidates));
   const facts: SetupFacts | null = answers && {
     answers,
     server,
@@ -148,6 +153,7 @@ export function useSetupFacts({ refetchInterval = false }: { refetchInterval?: n
     claudeCodeToken,
     providerConnected,
     teamModelsAvailable: team.available,
+    teamModelsEmpty,
     lastStep: progress?.setup_step ?? null,
   };
 
@@ -166,7 +172,8 @@ export function useSetupFacts({ refetchInterval = false }: { refetchInterval?: n
     ownComputers: own,
     tokenTarget,
     // DALTON-HOOK(dalton-setup): pass both server step state and teamModelsAvailable to setupRail
-    rail: answers ? setupRail(answers, server, team.available) : [],
+    // DALTON-HOOK(team-model-catalog): pass teamModelsEmpty so /setup/model stays on the rail when curated models are empty
+    rail: answers ? setupRail(answers, server, team.available, teamModelsEmpty) : [],
     next,
     /** Where setup goes from here, /welcome once it is done; null while unknown. */
     nextPath: next ? nextSetupPath(next) : null,

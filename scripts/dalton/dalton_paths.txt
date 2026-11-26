@@ -624,3 +624,4 @@ web/src/pages/ChatAgent/hooks/useComputerFoldersReady.ts
 # Team model catalog Batch 2: Playwright E2E spec and setup integration unit tests (DALTON-HOOK(team-model-catalog)).
 web/e2e/team-model-catalog.spec.js
 web/src/pages/Setup/answers/__tests__/teamCatalogSetup.test.ts
+web/src/pages/Setup/steps/__tests__/ModelStep.dalton.test.tsx

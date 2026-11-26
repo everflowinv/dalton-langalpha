@@ -1,13 +1,15 @@
 /**
  * Cross-session team model catalog revision tracker.
  *
- * Tracks the highest `X-Dalton-Catalog-Revision` integer observed from any REST
- * response and invalidates model/setup queries as soon as a higher revision
- * arrives, or when a 400 `model_removed` / `model_unavailable` /
- * `catalog_route_changed` error is returned.
+ * Gated by the explicit server capability flag (`team_catalog_enabled: true`
+ * returned by `GET /api/v1/models`, or any 2xx response from `/api/v1/dalton/team-models`).
+ * When active, tracks the highest `X-Dalton-Catalog-Revision` integer observed
+ * from REST and SSE responses and invalidates model/setup queries as soon as a
+ * higher revision arrives, or when a Dalton-catalog 400 (`model_removed` /
+ * `model_retired` / `catalog_route_changed`) error is returned.
  *
- * Module-scoped (like `accountSuspension.ts`) so `api/client.ts` can report
- * headers without pulling React or heavy hooks into the entry bundle.
+ * Module-scoped (like `accountSuspension.ts`) so `api/client.ts` and SSE
+ * `transport.ts` can report headers without pulling React into the entry bundle.
  */
 import type { QueryClient } from '@tanstack/react-query';
 import { registerAuthReset } from '@/lib/authResets';
@@ -15,14 +17,28 @@ import { queryKeys } from '@/lib/queryKeys';
 
 export const CATALOG_REVISION_HEADER = 'x-dalton-catalog-revision';
 
+// Intentionally excludes upstream `model_unavailable` (used by org Claude Code
+// policies and non-catalog checks) so generic REST calls never trigger catalog
+// refreshes on upstream 400s.
 const INVALIDATING_MODEL_ERROR_CODES = new Set([
   'model_removed',
-  'model_unavailable',
+  'model_retired',
   'catalog_route_changed',
 ]);
 
+let teamCatalogEnabled = false;
 let highestObservedRevision: number | null = null;
 const attachedClients = new Map<QueryClient, number>();
+
+/** Set whether the connected backend advertises `team_catalog_enabled`. */
+export function setTeamCatalogEnabled(enabled: boolean): void {
+  teamCatalogEnabled = Boolean(enabled);
+}
+
+/** Whether the connected backend explicitly enabled the team model catalog. */
+export function isTeamCatalogEnabled(): boolean {
+  return teamCatalogEnabled;
+}
 
 /** Attach a QueryClient to receive catalog-revision invalidations (ref-counted). Returns an unsubscribe fn. */
 export function attachCatalogRevisionQueryClient(queryClient: QueryClient): () => void {
@@ -75,19 +91,48 @@ function parseRevisionHeader(
   return parsed;
 }
 
-function isModelsListEndpoint(url?: string): boolean {
-  if (!url) return false;
+function extractPathname(url?: string): string {
+  if (!url) return '';
   try {
-    const pathname = /^https?:\/\//i.test(url) ? new URL(url).pathname : url.split('?')[0];
-    return pathname === '/api/v1/models';
+    return /^https?:\/\//i.test(url) ? new URL(url).pathname : url.split('?')[0];
   } catch {
-    return false;
+    return '';
+  }
+}
+
+function isModelsListEndpoint(url?: string): boolean {
+  return extractPathname(url) === '/api/v1/models';
+}
+
+function isTeamCatalogAdminEndpoint(url?: string): boolean {
+  const pathname = extractPathname(url);
+  return pathname === '/api/v1/dalton/team-models' || pathname.startsWith('/api/v1/dalton/team-models/');
+}
+
+/**
+ * Update the explicit server capability flag from a REST response before header
+ * or error observation runs.
+ */
+export function syncTeamCatalogCapabilityFromResponse(
+  url: string | undefined,
+  status: number,
+  data: unknown,
+): void {
+  if (status < 200 || status >= 300) return;
+  if (isModelsListEndpoint(url) && data && typeof data === 'object') {
+    const flag = (data as { team_catalog_enabled?: unknown }).team_catalog_enabled;
+    setTeamCatalogEnabled(flag === true);
+    return;
+  }
+  if (isTeamCatalogAdminEndpoint(url)) {
+    setTeamCatalogEnabled(true);
   }
 }
 
 /**
- * Observe `X-Dalton-Catalog-Revision` on any API response.
+ * Observe `X-Dalton-Catalog-Revision` on any API or SSE response.
  *
+ * No-op unless the server explicitly enabled the team model catalog.
  * The very first observed revision initializes the baseline without triggering
  * a redundant refetch. Any strictly higher revision triggers immediate
  * invalidation of cached model queries (skipping redundant invalidation when
@@ -98,6 +143,7 @@ export function observeCatalogRevisionHeader(
   headers: Record<string, string> | Headers | null | undefined,
   options?: { url?: string },
 ): boolean {
+  if (!teamCatalogEnabled) return false;
   const rev = parseRevisionHeader(headers);
   if (rev === null) return false;
 
@@ -123,10 +169,12 @@ export function observeCatalogRevisionHeader(
 }
 
 /**
- * Observe a 400 error payload; if it indicates a removed, unavailable, or
- * route-changed catalog model, immediately invalidate model caches.
+ * Observe a 400 error payload; when team catalog is enabled and the error
+ * indicates a removed, retired, or route-changed catalog model, immediately
+ * invalidate model caches.
  */
 export function observeCatalogModelError(status: number | undefined, detail: unknown): boolean {
+  if (!teamCatalogEnabled) return false;
   if (status !== 400 || !detail || typeof detail !== 'object') return false;
   const d = detail as Record<string, unknown>;
   const code =
@@ -146,6 +194,7 @@ export function observeCatalogModelError(status: number | undefined, detail: unk
 
 /** Reset session revision state (called on sign-out/account switch and in unit tests). */
 export function resetCatalogRevisionTracker(options?: { clearClients?: boolean }): void {
+  teamCatalogEnabled = false;
   highestObservedRevision = null;
   if (options?.clearClients) {
     attachedClients.clear();

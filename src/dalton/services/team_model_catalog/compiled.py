@@ -323,12 +323,25 @@ def _merge_db_payload_layer(
                     key_str,
                     existing_key,
                 )
-                _deep_merge_patch(llm_config[existing_key], dict(entry))
+                deep_merge_patch_with_null_delete(llm_config[existing_key], dict(entry))
+                if llm_config[existing_key].get("parameters") == {}:
+                    llm_config[existing_key].pop("parameters", None)
             else:
-                llm_config[key_str] = copy.deepcopy(dict(entry))
+                cleaned_entry = copy.deepcopy(dict(entry))
+                for k_null in [k for k, v in cleaned_entry.items() if v is None]:
+                    cleaned_entry.pop(k_null, None)
+                if isinstance(cleaned_entry.get("parameters"), dict):
+                    for pk in [k for k, v in cleaned_entry["parameters"].items() if v is None]:
+                        cleaned_entry["parameters"].pop(pk, None)
+                    if not cleaned_entry["parameters"]:
+                        cleaned_entry.pop("parameters", None)
+                if isinstance(cleaned_entry.get("reasoning"), dict):
+                    for rk in [k for k, v in cleaned_entry["reasoning"].items() if v is None]:
+                        cleaned_entry["reasoning"].pop(rk, None)
+                llm_config[key_str] = cleaned_entry
                 key_lower_map[key_str.lower()] = key_str
 
-    # 5. Model overrides (skip orphan overrides with INFO log per §7.3)
+    # 5. Model overrides (skip orphan overrides with INFO log per §7.3; explicit null deletes keys)
     raw_overrides = db_payload.get("model_overrides") or {}
     if isinstance(raw_overrides, Mapping):
         for key, patch in raw_overrides.items():
@@ -342,7 +355,9 @@ def _merge_db_payload_layer(
                     key_str,
                 )
                 continue
-            _deep_merge_patch(llm_config[existing_key], dict(patch))
+            deep_merge_patch_with_null_delete(llm_config[existing_key], dict(patch))
+            if llm_config[existing_key].get("parameters") == {}:
+                llm_config[existing_key].pop("parameters", None)
 
     # 6. dalton_meta deep merge with explicit null deletion (§2.2 #1)
     raw_meta = db_payload.get("dalton_meta") or {}
