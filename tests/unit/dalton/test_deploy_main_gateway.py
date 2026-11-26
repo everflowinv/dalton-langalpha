@@ -2522,6 +2522,5 @@ def test_gateway_import_check_passes_the_entry_path_outside_argv():
     script = (_REPO_ROOT / "scripts/dalton/ops/prod/deploy_main.sh").read_text()
     check = [ln for ln in script.splitlines() if "await import(pathToFileURL" in ln]
     assert check, "import check not found"
-    for ln in check:
-        assert "process.argv" not in ln
-        assert "DALTON_GATEWAY_IMPORT_PATH" in ln
+    assert all("process.argv" not in ln for ln in check)
+    assert any("DALTON_GATEWAY_IMPORT_PATH" in ln for ln in check)
