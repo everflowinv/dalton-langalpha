@@ -326,18 +326,40 @@ async def _query_bridge_cnhk_filings(
         return {"ok": False, "error": str(exc)}
 
 
-def _extract_filings_from_response(raw_resp: Any) -> tuple[bool, list[dict[str, Any]]]:
-    """Unwrap bridge response into ``(is_ok, rows)``."""
+def _response_indicates_truncation(container: dict[str, Any], row_count: int) -> bool:
+    """Return True when a bridge/script payload signals incomplete pagination."""
+    for key in ("has_more", "hasMore", "truncated", "incomplete"):
+        val = container.get(key)
+        if val is True or (isinstance(val, str) and val.strip().lower() == "true"):
+            return True
+    pag_complete = container.get("pagination_complete")
+    if pag_complete is False or (
+        isinstance(pag_complete, str) and pag_complete.strip().lower() == "false"
+    ):
+        return True
+    for total_key in ("total_count", "totalAnnouncement", "totalRecordNum", "total"):
+        raw_total = container.get(total_key)
+        if isinstance(raw_total, int) and not isinstance(raw_total, bool):
+            if raw_total > row_count:
+                return True
+        elif isinstance(raw_total, str) and raw_total.strip().isdigit():
+            if int(raw_total.strip()) > row_count:
+                return True
+    return False
+
+
+def _extract_filings_meta(raw_resp: Any) -> tuple[bool, list[dict[str, Any]], bool]:
+    """Unwrap bridge response into ``(is_ok, rows, is_truncated)``."""
     if isinstance(raw_resp, list):
-        return True, [x for x in raw_resp if isinstance(x, dict)]
+        return True, [x for x in raw_resp if isinstance(x, dict)], False
     if not isinstance(raw_resp, dict):
-        return False, []
+        return False, [], False
     if raw_resp.get("ok") is False or raw_resp.get("isError") is True:
-        return False, []
+        return False, [], False
     inner = raw_resp.get("data")
     if isinstance(inner, dict):
         if inner.get("ok") is False or inner.get("isError") is True:
-            return False, []
+            return False, [], False
         candidates = (
             inner.get("rows")
             or inner.get("filings")
@@ -345,9 +367,11 @@ def _extract_filings_from_response(raw_resp: Any) -> tuple[bool, list[dict[str, 
             or inner.get("results")
             or inner.get("data")
         )
-        if isinstance(candidates, list):
-            return True, [x for x in candidates if isinstance(x, dict)]
-        return True, []
+        rows = [x for x in candidates if isinstance(x, dict)] if isinstance(candidates, list) else []
+        truncated = _response_indicates_truncation(inner, len(rows)) or _response_indicates_truncation(
+            raw_resp, len(rows)
+        )
+        return True, rows, truncated
     candidates = (
         raw_resp.get("rows")
         or raw_resp.get("filings")
@@ -355,9 +379,15 @@ def _extract_filings_from_response(raw_resp: Any) -> tuple[bool, list[dict[str, 
         or raw_resp.get("results")
         or (raw_resp.get("data") if isinstance(raw_resp.get("data"), list) else None)
     )
-    if isinstance(candidates, list):
-        return True, [x for x in candidates if isinstance(x, dict)]
-    return True, []
+    rows = [x for x in candidates if isinstance(x, dict)] if isinstance(candidates, list) else []
+    truncated = _response_indicates_truncation(raw_resp, len(rows))
+    return True, rows, truncated
+
+
+def _extract_filings_from_response(raw_resp: Any) -> tuple[bool, list[dict[str, Any]]]:
+    """Unwrap bridge response into ``(is_ok, rows)``."""
+    is_ok, rows, _truncated = _extract_filings_meta(raw_resp)
+    return is_ok, rows
 
 
 def _parse_iso_date(val: Any) -> Optional[date]:
@@ -381,9 +411,11 @@ async def _fetch_window_filings_recursive(
     clock: Callable[[], float],
     deadline: float,
 ) -> tuple[bool, bool, Optional[date], list[dict[str, Any]]]:
-    """Fetch filings for ``[win_start, win_end]``, recursively halving the window when ``len(rows) >= limit``.
+    """Fetch filings for ``[win_start, win_end]``, recursively halving the window when saturated or truncated.
 
     Returns ``(is_ok, is_complete, contiguous_completed_end, rows)``.
+    A single day that reaches ``limit`` or reports incomplete pagination is NOT counted as complete
+    so the watermark stops strictly before that day and keeps it in the next window.
     Before issuing each request, checks remaining time budget against ``deadline``.
     """
     start_s = win_start.isoformat()
@@ -409,23 +441,24 @@ async def _fetch_window_filings_recursive(
         )
         return False, False, None, []
 
-    is_ok, rows = _extract_filings_from_response(raw_resp)
+    is_ok, rows, resp_truncated = _extract_filings_meta(raw_resp)
     if not is_ok:
         return False, False, None, []
 
-    if limit > 0 and len(rows) >= limit:
+    if resp_truncated or (limit > 0 and len(rows) >= limit):
         if win_start >= win_end:
             logger.warning(
-                "[DALTON_CNHK_PROBE] single-day filings window saturated (len=%d >= limit=%d) for %s on %s; "
-                "recording in cnhk_probe_truncated_dates.",
+                "[DALTON_CNHK_PROBE] single-day filings window incomplete (len=%d, limit=%d, truncated=%s) "
+                "for %s on %s; recording in cnhk_probe_truncated_dates and leaving day unscanned.",
                 len(rows),
                 limit,
+                resp_truncated,
                 norm_ticker,
                 start_s,
             )
             if start_s not in truncated_dates:
                 truncated_dates.append(start_s)
-            return True, True, win_end, rows
+            return True, False, None, rows
 
         mid_days = (win_end - win_start).days // 2
         mid_date = win_start + timedelta(days=mid_days)
@@ -442,7 +475,7 @@ async def _fetch_window_filings_recursive(
         )
         if not ok_left:
             return False, False, None, []
-        if not comp_left:
+        if not comp_left and clock() >= deadline:
             # Keep the parent window's rows too: they are real filings already fetched, and the
             # seen-hash dedupe downstream drops any overlap. The watermark still stops at end_left.
             return True, False, end_left, [*rows, *left_rows]
@@ -460,8 +493,22 @@ async def _fetch_window_filings_recursive(
         )
         if not ok_right:
             return False, False, None, []
+        if not comp_left:
+            # Left half had a truncated day (or incomplete prefix); still return right half's rows
+            # so newer filings are not starved, but hold contiguous watermark at end_left.
+            combined_rows = (
+                [*rows, *left_rows, *right_rows]
+                if (not comp_right and clock() >= deadline)
+                else [*left_rows, *right_rows]
+            )
+            return True, False, end_left, combined_rows
         if not comp_right:
-            return True, False, (end_right if end_right is not None else mid_date), [*rows, *left_rows, *right_rows]
+            combined_rows = (
+                [*rows, *left_rows, *right_rows]
+                if clock() >= deadline
+                else [*left_rows, *right_rows]
+            )
+            return True, False, (end_right if end_right is not None else mid_date), combined_rows
 
         return True, True, win_end, [*left_rows, *right_rows]
 
@@ -499,10 +546,21 @@ async def probe_cnhk_filings(
     last_check_date = _parse_iso_date(
         state.get("last_cnhk_check_date") or state.get("last_cnhk_date")
     )
+    raw_unresolved = state.get("cnhk_probe_unresolved_truncated_dates")
+    prev_unresolved_dates: list[date] = []
+    if isinstance(raw_unresolved, list):
+        for raw_d in raw_unresolved:
+            parsed = _parse_iso_date(raw_d)
+            if parsed is not None and parsed not in prev_unresolved_dates:
+                prev_unresolved_dates.append(parsed)
+
     if last_check_date is not None:
         start_date = min(last_check_date, end_date)
     else:
         start_date = end_date - timedelta(days=DEFAULT_INITIAL_LOOKBACK_DAYS)
+    eligible_unresolved = [d for d in prev_unresolved_dates if d <= end_date]
+    if eligible_unresolved:
+        start_date = min(start_date, min(eligible_unresolved))
 
     end_str = end_date.isoformat()
     truncated_dates: list[str] = []
@@ -511,7 +569,12 @@ async def probe_cnhk_filings(
 
     raw_data = filings_override if filings_override is not None else state.get("cnhk_filings_mock")
     if raw_data is not None:
-        is_ok, rows = _extract_filings_from_response(raw_data)
+        is_ok, rows, resp_truncated = _extract_filings_meta(raw_data)
+        if is_ok and (resp_truncated or (limit > 0 and len(rows) >= limit)):
+            is_complete = False
+            completed_end_date = None
+            if end_str not in truncated_dates:
+                truncated_dates.append(end_str)
     else:
         if not allow_network:
             return [], state
@@ -533,26 +596,61 @@ async def probe_cnhk_filings(
         return [], state
 
     state["cnhk_probe_degraded"] = False
+    resolved_until: Optional[date] = end_date if is_complete else completed_end_date
+    next_unresolved: list[str] = []
+    for d in prev_unresolved_dates:
+        ds = d.isoformat()
+        if (
+            resolved_until is not None
+            and start_date <= d <= resolved_until
+            and ds not in truncated_dates
+        ):
+            continue
+        if ds not in next_unresolved:
+            next_unresolved.append(ds)
+    for ds in truncated_dates:
+        if ds not in next_unresolved:
+            next_unresolved.append(ds)
+
     if not is_complete:
         state["cnhk_probe_partial"] = True
-        logger.warning(
-            "[DALTON_CNHK_PROBE] query budget (%.1fs) exhausted during window split for %s (%s..%s); "
-            "contiguous_end=%s, marking cnhk_probe_partial=True.",
-            total_budget_s,
-            norm_ticker,
-            start_date.isoformat(),
-            end_str,
-            completed_end_date.isoformat() if completed_end_date else None,
-        )
+        if truncated_dates:
+            logger.warning(
+                "[DALTON_CNHK_PROBE] filings window incomplete due to truncation for %s (%s..%s); "
+                "truncated_dates=%s contiguous_end=%s, marking cnhk_probe_partial=True.",
+                norm_ticker,
+                start_date.isoformat(),
+                end_str,
+                truncated_dates,
+                completed_end_date.isoformat() if completed_end_date else None,
+            )
+        else:
+            logger.warning(
+                "[DALTON_CNHK_PROBE] query budget (%.1fs) exhausted during window split for %s (%s..%s); "
+                "contiguous_end=%s, marking cnhk_probe_partial=True.",
+                total_budget_s,
+                norm_ticker,
+                start_date.isoformat(),
+                end_str,
+                completed_end_date.isoformat() if completed_end_date else None,
+            )
         if completed_end_date is not None:
             state["last_cnhk_check_date"] = completed_end_date.isoformat()
     else:
         state.pop("cnhk_probe_partial", None)
         state["last_cnhk_check_date"] = end_str
+    if next_unresolved:
+        state["cnhk_probe_unresolved_truncated_dates"] = next_unresolved
+        state["cnhk_probe_partial"] = True
+    else:
+        state.pop("cnhk_probe_unresolved_truncated_dates", None)
     if truncated_dates:
+        state["cnhk_probe_truncated_this_run"] = True
         prev_trunc = state.get("cnhk_probe_truncated_dates")
         existing_trunc = [str(x) for x in prev_trunc if x] if isinstance(prev_trunc, list) else []
         state["cnhk_probe_truncated_dates"] = list(dict.fromkeys([*existing_trunc, *truncated_dates]))
+    else:
+        state.pop("cnhk_probe_truncated_this_run", None)
 
     raw_seen = state.get("seen_cnhk_filings")
     existing_seen: list[str] = (

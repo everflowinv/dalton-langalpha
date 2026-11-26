@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from typing import Any
 from unittest.mock import create_autospec
 
@@ -233,6 +232,8 @@ class TestSwitchOnDaltonSupabaseAuth:
         monkeypatch.setattr(jwt_bearer, "HOST_MODE", "oss")
         monkeypatch.setattr(api_utils, "HOST_MODE", "oss")
         monkeypatch.setattr(dalton_auth, "_auth_settings_cache", None)
+        monkeypatch.setattr(dalton_auth, "_auth_settings_retry", None)
+        dalton_auth._cancel_background_auth_retry()
 
         fetch_mock = create_autospec(
             _fetch_supabase_auth_settings,
@@ -243,6 +244,8 @@ class TestSwitchOnDaltonSupabaseAuth:
             },
         )
         monkeypatch.setattr(dalton_auth, "_fetch_supabase_auth_settings", fetch_mock)
+        yield
+        dalton_auth._cancel_background_auth_retry()
 
     @pytest.mark.asyncio
     async def test_missing_token_returns_401_and_optional_skips_remote_check(
@@ -522,8 +525,8 @@ class TestSwitchOnDaltonSupabaseAuth:
         monkeypatch.setattr(jwt_bearer, "_decode_token", decode_mock)
 
         current_time = 1000.0
-        monotonic_mock = create_autospec(time.monotonic, side_effect=lambda: current_time)
-        monkeypatch.setattr(dalton_auth.time, "monotonic", monotonic_mock)
+        monotonic_mock = create_autospec(dalton_auth._monotonic, side_effect=lambda: current_time)
+        monkeypatch.setattr(dalton_auth, "_monotonic", monotonic_mock)
 
         fetch_mock = dalton_auth._fetch_supabase_auth_settings
 
@@ -539,7 +542,7 @@ class TestSwitchOnDaltonSupabaseAuth:
         assert (await verify_dalton_token(raw_token)).user_id == "user-uuid-42"
         assert fetch_mock.await_count == 2  # type: ignore[attr-defined]
 
-        # 2. Failure TTL (30s): failure cached for 30s without re-fetching, then re-fetched after 30s
+        # 2. Transient failure retry TTL (5s): retry cooldown cached for 5s, then recovers once Supabase is back
         monkeypatch.setattr(dalton_auth, "_auth_settings_cache", None)
         fetch_mock.reset_mock()  # type: ignore[attr-defined]
         fetch_mock.side_effect = httpx.ConnectError("upstream down")  # type: ignore[attr-defined]
@@ -550,15 +553,15 @@ class TestSwitchOnDaltonSupabaseAuth:
         assert exc1.value.status_code == 503
         assert fetch_mock.await_count == 1  # type: ignore[attr-defined]
 
-        current_time = 2029.0
+        current_time = 2004.0
         with pytest.raises(HTTPException) as exc2:
             await verify_dalton_token(raw_token)
         assert exc2.value.status_code == 503
         assert fetch_mock.await_count == 1  # type: ignore[attr-defined]
 
-        # After 30s failure TTL expires, next request re-fetches
+        # After 5s retry TTL expires, next request re-fetches and recovers
         fetch_mock.side_effect = None  # type: ignore[attr-defined]
-        current_time = 2031.0
+        current_time = 2006.0
         assert (await verify_dalton_token(raw_token)).user_id == "user-uuid-42"
         assert fetch_mock.await_count == 2  # type: ignore[attr-defined]
 
@@ -2704,3 +2707,454 @@ async def test_daily_system_maintenance_counts_expired_publications_from_row_cou
     result = await director_mod.run_daily_system_maintenance()
     assert result["expired_publications"] == 3
     assert result["expired_signals"] == 1
+
+
+class TestAuthSettingsStaleGraceAndBackgroundRefresh:
+    """Auth settings refresh uses background task and 30m stale grace on transient failure."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_supabase_auth(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
+        monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+        monkeypatch.setattr(app_settings, "SUPABASE_URL", "https://example.supabase.co")
+        monkeypatch.setenv("SUPABASE_PUBLISHABLE_KEY", "sb_publishable_grace_test")
+        monkeypatch.setenv("DALTON_ALLOWED_EMAILS", "analyst1@dalton.org")
+        monkeypatch.setattr(dalton_auth, "_auth_settings_cache", None)
+        monkeypatch.setattr(dalton_auth, "_auth_settings_retry", None)
+        dalton_auth._cancel_background_auth_retry()
+        if hasattr(dalton_auth, "_auth_settings_refresh_task"):
+            monkeypatch.setattr(dalton_auth, "_auth_settings_refresh_task", None)
+        if hasattr(dalton_auth, "_auth_settings_refresh_key"):
+            monkeypatch.setattr(dalton_auth, "_auth_settings_refresh_key", None)
+
+        decode_mock = create_autospec(_decode_token, return_value=AuthInfo(user_id="user-grace-1"))
+        monkeypatch.setattr(jwt_bearer, "_decode_token", decode_mock)
+        yield
+        dalton_auth._cancel_background_auth_retry()
+
+    @pytest.mark.asyncio
+    async def test_first_failure_rejects_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fetch_mock = create_autospec(
+            _fetch_supabase_auth_settings,
+            side_effect=httpx.ConnectTimeout("connect timed out"),
+        )
+        monkeypatch.setattr(dalton_auth, "_fetch_supabase_auth_settings", fetch_mock)
+        raw_token = _make_jwt(sub="user-grace-1", email="analyst1@dalton.org")
+
+        with pytest.raises(HTTPException) as exc_info:
+            await verify_dalton_token(raw_token)
+        assert exc_info.value.status_code == 503
+        assert fetch_mock.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_refresh_failure_within_30m_reuses_last_success_and_logs_warning(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        now_box = {"t": 1000.0}
+        monkeypatch.setattr(
+            dalton_auth,
+            "_monotonic",
+            create_autospec(dalton_auth._monotonic, side_effect=lambda: now_box["t"]),
+        )
+        ok_payload = {
+            "disable_signup": True,
+            "mailer_autoconfirm": False,
+            "external": {"email": True, "anonymous_users": False},
+        }
+        calls = {"n": 0}
+
+        async def _flaky_fetch(url: str, key: str) -> dict[str, Any]:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return ok_payload
+            now_box["t"] += 0.25
+            raise httpx.ReadTimeout("supabase settings timeout")
+
+        fetch_mock = create_autospec(_fetch_supabase_auth_settings, side_effect=_flaky_fetch)
+        monkeypatch.setattr(dalton_auth, "_fetch_supabase_auth_settings", fetch_mock)
+        raw_token = _make_jwt(sub="user-grace-1", email="analyst1@dalton.org")
+
+        # Initial success at t=1000
+        assert (await verify_dalton_token(raw_token)).user_id == "user-grace-1"
+        assert calls["n"] == 1
+
+        # Fresh TTL (300s) expires at t=1301; background refresh fails -> still allowed within 30m + warning logged
+        now_box["t"] = 1301.0
+        with caplog.at_level(logging.WARNING):
+            assert (await verify_dalton_token(raw_token)).user_id == "user-grace-1"
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+        assert calls["n"] == 2
+        warn_msgs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("ReadTimeout" in m and "ms" in m for m in warn_msgs), warn_msgs
+
+        # Another request at t=2700 (still < 30m from t=1000) still succeeds
+        now_box["t"] = 2700.0
+        assert (await verify_dalton_token(raw_token)).user_id == "user-grace-1"
+
+    @pytest.mark.asyncio
+    async def test_refresh_failure_past_30m_or_url_key_change_rejects_503(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now_box = {"t": 5000.0}
+        monkeypatch.setattr(
+            dalton_auth,
+            "_monotonic",
+            create_autospec(dalton_auth._monotonic, side_effect=lambda: now_box["t"]),
+        )
+        ok_payload = {
+            "disable_signup": True,
+            "mailer_autoconfirm": False,
+            "external": {"email": True, "anonymous_users": False},
+        }
+        should_fail = {"flag": False}
+
+        async def _fetch(url: str, key: str) -> dict[str, Any]:
+            if should_fail["flag"]:
+                raise httpx.ConnectError("down")
+            return ok_payload
+
+        fetch_mock = create_autospec(_fetch_supabase_auth_settings, side_effect=_fetch)
+        monkeypatch.setattr(dalton_auth, "_fetch_supabase_auth_settings", fetch_mock)
+        raw_token = _make_jwt(sub="user-grace-1", email="analyst1@dalton.org")
+
+        # Initial success at t=5000
+        assert (await verify_dalton_token(raw_token)).user_id == "user-grace-1"
+
+        # URL/key change + failure -> must reject immediately (fail-closed)
+        should_fail["flag"] = True
+        monkeypatch.setenv("SUPABASE_PUBLISHABLE_KEY", "sb_publishable_other_key")
+        with pytest.raises(HTTPException) as exc_key:
+            await verify_dalton_token(raw_token)
+        assert exc_key.value.status_code == 503
+
+        # Restore key, re-seed success at t=5000, then jump past 30 minutes (1801s)
+        monkeypatch.setenv("SUPABASE_PUBLISHABLE_KEY", "sb_publishable_grace_test")
+        dalton_auth._auth_settings_cache = None
+        should_fail["flag"] = False
+        assert (await verify_dalton_token(raw_token)).user_id == "user-grace-1"
+
+        should_fail["flag"] = True
+        now_box["t"] = 5000.0 + 1801.0
+        with pytest.raises(HTTPException) as exc_expired:
+            await verify_dalton_token(raw_token)
+        assert exc_expired.value.status_code == 503
+
+    @pytest.mark.asyncio
+    async def test_concurrent_requests_after_ttl_trigger_single_background_refresh_without_blocking(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now_box = {"t": 9000.0}
+        monkeypatch.setattr(
+            dalton_auth,
+            "_monotonic",
+            create_autospec(dalton_auth._monotonic, side_effect=lambda: now_box["t"]),
+        )
+        ok_payload = {
+            "disable_signup": True,
+            "mailer_autoconfirm": False,
+            "external": {"email": True, "anonymous_users": False},
+        }
+        gate = asyncio.Event()
+        fetch_started = asyncio.Event()
+        calls = {"n": 0}
+
+        async def _slow_on_second(url: str, key: str) -> dict[str, Any]:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return ok_payload
+            fetch_started.set()
+            await gate.wait()
+            return ok_payload
+
+        fetch_mock = create_autospec(_fetch_supabase_auth_settings, side_effect=_slow_on_second)
+        monkeypatch.setattr(dalton_auth, "_fetch_supabase_auth_settings", fetch_mock)
+        raw_token = _make_jwt(sub="user-grace-1", email="analyst1@dalton.org")
+
+        # Initial cold check succeeds
+        assert (await verify_dalton_token(raw_token)).user_id == "user-grace-1"
+        assert calls["n"] == 1
+
+        # Expire fresh TTL (301s later): 5 concurrent requests MUST complete immediately without waiting on gate!
+        now_box["t"] = 9301.0
+        results = await asyncio.wait_for(
+            asyncio.gather(*(verify_dalton_token(raw_token) for _ in range(5))),
+            timeout=1.0,
+        )
+        assert [r.user_id for r in results] == ["user-grace-1"] * 5
+        await asyncio.wait_for(fetch_started.wait(), timeout=1.0)
+        assert calls["n"] == 2  # Only ONE background refresh triggered!
+
+        # Release background refresh cleanly
+        gate.set()
+        if dalton_auth._auth_settings_refresh_task is not None:
+            await asyncio.wait_for(dalton_auth._auth_settings_refresh_task, timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_recovers_within_5s_once_supabase_recovers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """首次失败或宽限耗尽后，瞬时错误只缓存 5 秒重试冷却；Supabase 恢复后最迟 5 秒恢复正常。"""
+        now_box = {"t": 12000.0}
+        monkeypatch.setattr(
+            dalton_auth,
+            "_monotonic",
+            create_autospec(dalton_auth._monotonic, side_effect=lambda: now_box["t"]),
+        )
+        ok_payload = {
+            "disable_signup": True,
+            "mailer_autoconfirm": False,
+            "external": {"email": True, "anonymous_users": False},
+        }
+        state = {"down": True}
+        calls = {"n": 0}
+
+        async def _flaky_fetch(url: str, key: str) -> dict[str, Any]:
+            calls["n"] += 1
+            if state["down"]:
+                raise httpx.ConnectTimeout("supabase blip")
+            return ok_payload
+
+        fetch_mock = create_autospec(_fetch_supabase_auth_settings, side_effect=_flaky_fetch)
+        monkeypatch.setattr(dalton_auth, "_fetch_supabase_auth_settings", fetch_mock)
+        raw_token = _make_jwt(sub="user-grace-1", email="analyst1@dalton.org")
+
+        # 1. Cold start transient failure -> fail-closed 503 with independent 5s retry deadline (NOT cached refusal)
+        with pytest.raises(HTTPException) as exc1:
+            await verify_dalton_token(raw_token)
+        assert exc1.value.status_code == 503
+        assert calls["n"] == 1
+        assert dalton_auth._auth_settings_cache is None
+        assert dalton_auth._auth_settings_retry is not None
+
+        # 2. Supabase recovers at t+2s; within 5s retry window returns 503 without extra fetch
+        state["down"] = False
+        now_box["t"] += 4.0
+        with pytest.raises(HTTPException) as exc2:
+            await verify_dalton_token(raw_token)
+        assert exc2.value.status_code == 503
+        assert calls["n"] == 1
+
+        # 3. Past 5s retry cooldown -> recovers immediately (does NOT stay blocked for 30s)
+        now_box["t"] += 1.1
+        assert (await verify_dalton_token(raw_token)).user_id == "user-grace-1"
+        assert calls["n"] == 2
+        assert dalton_auth._auth_settings_cache is not None
+        assert dalton_auth._auth_settings_cache.is_ready is True
+        assert dalton_auth._auth_settings_retry is None
+
+        # 4. Grace exhausted (>30m) + transient failure -> also recovers after 5s once Supabase is back
+        state["down"] = True
+        now_box["t"] += dalton_auth._AUTH_SETTINGS_STALE_MAX_AGE_S + 5.0
+        with pytest.raises(HTTPException) as exc3:
+            await verify_dalton_token(raw_token)
+        assert exc3.value.status_code == 503
+        assert calls["n"] == 3
+
+        state["down"] = False
+        now_box["t"] += dalton_auth._AUTH_SETTINGS_RETRY_TTL_S + 0.1
+        assert (await verify_dalton_token(raw_token)).user_id == "user-grace-1"
+        assert calls["n"] == 4
+
+    @pytest.mark.asyncio
+    async def test_sync_cold_check_enforces_short_timeout_and_single_flight(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(dalton_auth, "_AUTH_SETTINGS_FETCH_TIMEOUT_S", 0.05)
+        calls = {"n": 0}
+        gate = asyncio.Event()
+
+        async def _hanging_fetch(url: str, key: str) -> dict[str, Any]:
+            calls["n"] += 1
+            await gate.wait()
+            return {}
+
+        fetch_mock = create_autospec(_fetch_supabase_auth_settings, side_effect=_hanging_fetch)
+        monkeypatch.setattr(dalton_auth, "_fetch_supabase_auth_settings", fetch_mock)
+        raw_token = _make_jwt(sub="user-grace-1", email="analyst1@dalton.org")
+
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                verify_dalton_token(raw_token),
+                verify_dalton_token(raw_token),
+                return_exceptions=True,
+            ),
+            timeout=1.0,
+        )
+        assert all(isinstance(r, HTTPException) and r.status_code == 503 for r in results)
+        assert calls["n"] == 1
+        gate.set()
+        if dalton_auth._auth_settings_refresh_task is not None:
+            await asyncio.wait_for(dalton_auth._auth_settings_refresh_task, timeout=1.0)
+
+    @pytest.mark.asyncio
+    async def test_background_retry_refreshes_automatically_without_subsequent_requests(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """瞬时失败后排定后台单飞重试：即使没有后续请求，冷却到期后也会自动刷新并恢复缓存。"""
+        now_box = {"t": 15000.0}
+        monkeypatch.setattr(
+            dalton_auth,
+            "_monotonic",
+            create_autospec(dalton_auth._monotonic, side_effect=lambda: now_box["t"]),
+        )
+        sleep_gate = asyncio.Event()
+        sleep_delays: list[float] = []
+
+        async def _controlled_sleep(delay_s: float) -> None:
+            sleep_delays.append(delay_s)
+            await sleep_gate.wait()
+            now_box["t"] += delay_s
+
+        monkeypatch.setattr(
+            dalton_auth,
+            "_sleep",
+            create_autospec(dalton_auth._sleep, side_effect=_controlled_sleep),
+        )
+        ok_payload = {
+            "disable_signup": True,
+            "mailer_autoconfirm": False,
+            "external": {"email": True, "anonymous_users": False},
+        }
+        state = {"down": True}
+        calls = {"n": 0}
+
+        async def _flaky(url: str, key: str) -> dict[str, Any]:
+            calls["n"] += 1
+            if state["down"]:
+                raise httpx.ConnectError("transient network blip")
+            return ok_payload
+
+        monkeypatch.setattr(
+            dalton_auth,
+            "_fetch_supabase_auth_settings",
+            create_autospec(_fetch_supabase_auth_settings, side_effect=_flaky),
+        )
+        raw_token = _make_jwt(sub="user-grace-1", email="analyst1@dalton.org")
+
+        # Initial failure schedules one background retry with 5s delay
+        with pytest.raises(HTTPException) as exc1:
+            await verify_dalton_token(raw_token)
+        assert exc1.value.status_code == 503
+        assert calls["n"] == 1
+        assert dalton_auth._auth_settings_retry_task is not None
+        assert dalton_auth._auth_settings_cache is None
+
+        # Supabase recovers; NO further requests arrive! Release the 5s retry timer.
+        state["down"] = False
+        retry_task = dalton_auth._auth_settings_retry_task
+        sleep_gate.set()
+        assert await asyncio.wait_for(retry_task, timeout=1.0) is True
+        assert sleep_delays == [dalton_auth._AUTH_SETTINGS_RETRY_TTL_S]
+        assert calls["n"] == 2
+        assert dalton_auth._auth_settings_cache is not None
+        assert dalton_auth._auth_settings_cache.is_ready is True
+        assert dalton_auth._auth_settings_retry is None
+
+        # Subsequent request immediately hits the warm cache without any extra external fetch
+        assert (await verify_dalton_token(raw_token)).user_id == "user-grace-1"
+        assert calls["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_background_retry_keeps_retrying_with_backoff_and_requests_reuse_inflight_refresh(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """后台重试再次瞬时失败时由同一后台任务按退避继续重试；在途刷新期间的请求复用该刷新并在恢复后直接通过。"""
+        now_box = {"t": 20000.0}
+        monkeypatch.setattr(
+            dalton_auth,
+            "_monotonic",
+            create_autospec(dalton_auth._monotonic, side_effect=lambda: now_box["t"]),
+        )
+        sleep_delays: list[float] = []
+        sleep_entered: list[asyncio.Event] = [asyncio.Event(), asyncio.Event()]
+        sleep_release: list[asyncio.Event] = [asyncio.Event(), asyncio.Event()]
+
+        async def _controlled_sleep(delay_s: float) -> None:
+            idx = len(sleep_delays)
+            sleep_delays.append(delay_s)
+            if idx < len(sleep_entered):
+                sleep_entered[idx].set()
+                await sleep_release[idx].wait()
+            now_box["t"] += delay_s
+
+        monkeypatch.setattr(
+            dalton_auth,
+            "_sleep",
+            create_autospec(dalton_auth._sleep, side_effect=_controlled_sleep),
+        )
+        ok_payload = {
+            "disable_signup": True,
+            "mailer_autoconfirm": False,
+            "external": {"email": True, "anonymous_users": False},
+        }
+        calls = {"n": 0}
+        attempt2_started = asyncio.Event()
+        attempt2_release = asyncio.Event()
+        attempt3_started = asyncio.Event()
+        attempt3_release = asyncio.Event()
+
+        async def _staged_fetch(url: str, key: str) -> dict[str, Any]:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ConnectError("initial outage")
+            if calls["n"] == 2:
+                attempt2_started.set()
+                await attempt2_release.wait()
+                raise httpx.ReadTimeout("still hanging during first bg retry")
+            attempt3_started.set()
+            await attempt3_release.wait()
+            return ok_payload
+
+        monkeypatch.setattr(
+            dalton_auth,
+            "_fetch_supabase_auth_settings",
+            create_autospec(_fetch_supabase_auth_settings, side_effect=_staged_fetch),
+        )
+        raw_token = _make_jwt(sub="user-grace-1", email="analyst1@dalton.org")
+
+        # 1. Cold failure -> schedules single background retry task (delay=5s)
+        with pytest.raises(HTTPException) as exc1:
+            await verify_dalton_token(raw_token)
+        assert exc1.value.status_code == 503
+        assert calls["n"] == 1
+        retry_task = dalton_auth._auth_settings_retry_task
+        assert retry_task is not None
+        await asyncio.wait_for(sleep_entered[0].wait(), timeout=1.0)
+        assert sleep_delays == [5.0]
+
+        # 2. Release 1st background retry -> enters in-flight fetch #2.
+        # An incoming request arriving now MUST reuse that in-flight fetch (no 3rd call!).
+        sleep_release[0].set()
+        await asyncio.wait_for(attempt2_started.wait(), timeout=1.0)
+        assert calls["n"] == 2
+        req_during_retry1 = asyncio.create_task(verify_dalton_token(raw_token))
+        await asyncio.sleep(0)
+        assert calls["n"] == 2
+
+        # Fetch #2 times out -> waiting request gets 503, and the SAME retry_task continues to backoff sleep #2 (10s)!
+        attempt2_release.set()
+        with pytest.raises(HTTPException) as exc2:
+            await asyncio.wait_for(req_during_retry1, timeout=1.0)
+        assert exc2.value.status_code == 503
+        await asyncio.wait_for(sleep_entered[1].wait(), timeout=1.0)
+        assert dalton_auth._auth_settings_retry_task is retry_task
+        assert sleep_delays == [5.0, 10.0]
+
+        # 3. Release 2nd background retry (Supabase recovered) -> enters in-flight fetch #3.
+        # Incoming request reuses fetch #3 and succeeds immediately once it returns!
+        sleep_release[1].set()
+        await asyncio.wait_for(attempt3_started.wait(), timeout=1.0)
+        assert calls["n"] == 3
+        req_during_retry2 = asyncio.create_task(verify_dalton_token(raw_token))
+        await asyncio.sleep(0)
+        assert calls["n"] == 3
+
+        attempt3_release.set()
+        auth_info = await asyncio.wait_for(req_during_retry2, timeout=1.0)
+        assert auth_info.user_id == "user-grace-1"
+        assert await asyncio.wait_for(retry_task, timeout=1.0) is True
+        assert calls["n"] == 3
+        assert dalton_auth._auth_settings_cache is not None
+        assert dalton_auth._auth_settings_cache.is_ready is True
+        assert dalton_auth._auth_settings_retry is None

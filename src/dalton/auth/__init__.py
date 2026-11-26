@@ -13,7 +13,7 @@ import logging
 import os
 import time
 import uuid
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 import jwt
@@ -35,12 +35,45 @@ from src.server.auth.jwt_bearer import AuthInfo
 logger = logging.getLogger(__name__)
 
 _AUTH_SETTINGS_SUCCESS_TTL_S = 300.0
+_AUTH_SETTINGS_STALE_MAX_AGE_S = 1800.0
 _AUTH_SETTINGS_FAILURE_TTL_S = 30.0
+_AUTH_SETTINGS_RETRY_TTL_S = 5.0
+_AUTH_SETTINGS_RETRY_MAX_TTL_S = 30.0
+_AUTH_SETTINGS_FETCH_TIMEOUT_S = 3.0
 MIN_SERVICE_TOKEN_LEN = 32
 
-# Per-worker cache: (supabase_url, publishable_key, is_ready, expires_at_monotonic)
-_auth_settings_cache: tuple[str, str, bool, float] | None = None
+
+class _AuthSettingsCache(NamedTuple):
+    supabase_url: str
+    publishable_key: str
+    is_ready: bool
+    expires_at: float
+    last_success_at: float | None = None
+
+
+class _AuthSettingsRetryState(NamedTuple):
+    supabase_url: str
+    publishable_key: str
+    retry_at: float
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+async def _sleep(delay_s: float) -> None:
+    await asyncio.sleep(delay_s)
+
+
+# Per-worker auth decision cache (success or explicit policy refusal only).
+_auth_settings_cache: _AuthSettingsCache | None = None
+# Independent transient-failure retry deadline (kept separate from auth decision).
+_auth_settings_retry: _AuthSettingsRetryState | None = None
 _auth_settings_lock = asyncio.Lock()
+_auth_settings_refresh_task: asyncio.Task[bool] | None = None
+_auth_settings_refresh_key: tuple[str, str] | None = None
+_auth_settings_retry_task: asyncio.Task[bool] | None = None
+_auth_settings_retry_key: tuple[str, str] | None = None
 _verified_token_identity: contextvars.ContextVar[tuple[str, str] | None] = (
     contextvars.ContextVar("_verified_token_identity", default=None)
 )
@@ -60,7 +93,7 @@ async def _fetch_supabase_auth_settings(
 ) -> dict[str, Any]:
     """Fetch ``${SUPABASE_URL}/auth/v1/settings`` asynchronously with ``SUPABASE_PUBLISHABLE_KEY``."""
     url = f"{supabase_url.rstrip('/')}/auth/v1/settings"
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    async with httpx.AsyncClient(timeout=_AUTH_SETTINGS_FETCH_TIMEOUT_S) as client:
         resp = await client.get(
             url,
             headers={
@@ -75,21 +108,146 @@ async def _fetch_supabase_auth_settings(
     return data
 
 
+def _cache_last_success_at(
+    cached: _AuthSettingsCache | tuple[Any, ...] | None,
+    supabase_url: str,
+    publishable_key: str,
+) -> float | None:
+    if cached is None or len(cached) < 5:
+        return None
+    if cached[0] != supabase_url or cached[1] != publishable_key:
+        return None
+    last_ok = cached[4]
+    return float(last_ok) if isinstance(last_ok, (int, float)) else None
+
+
+def _cancel_background_auth_retry() -> None:
+    global _auth_settings_retry_task, _auth_settings_retry_key
+    task = _auth_settings_retry_task
+    if task is not None and not task.done() and task is not asyncio.current_task():
+        task.cancel()
+    _auth_settings_retry_task = None
+    _auth_settings_retry_key = None
+
+
+async def _run_background_auth_retry(
+    supabase_url: str, publishable_key: str, delay_s: float
+) -> bool:
+    global _auth_settings_retry, _auth_settings_retry_task, _auth_settings_retry_key
+    attempt = 0
+    next_delay = max(0.0, delay_s)
+    try:
+        while True:
+            if next_delay > 0:
+                await _sleep(next_delay)
+            if get_supabase_publishable_key() != publishable_key:
+                return False
+            now = _monotonic()
+            cached = _auth_settings_cache
+            if (
+                cached is not None
+                and cached[0] == supabase_url
+                and cached[1] == publishable_key
+                and now < cached[3]
+            ):
+                return bool(cached[2])
+
+            # Share the single-flight refresh task so incoming requests reuse this in-flight check.
+            task, _created = _schedule_background_auth_refresh(
+                supabase_url,
+                publishable_key,
+                schedule_retry_on_failure=False,
+            )
+            ok = await task
+            if ok:
+                return True
+
+            # Explicit policy failure (e.g. disable_signup=False) caches a non-ready decision;
+            # stop transient retries until that decision expires or config changes.
+            cached_after = _auth_settings_cache
+            if (
+                cached_after is not None
+                and cached_after[0] == supabase_url
+                and cached_after[1] == publishable_key
+                and not cached_after[2]
+            ):
+                return False
+            if get_supabase_publishable_key() != publishable_key:
+                return False
+
+            attempt += 1
+            next_delay = min(
+                _AUTH_SETTINGS_RETRY_TTL_S * (2**attempt),
+                _AUTH_SETTINGS_RETRY_MAX_TTL_S,
+            )
+            _auth_settings_retry = _AuthSettingsRetryState(
+                supabase_url,
+                publishable_key,
+                _monotonic() + next_delay,
+            )
+    except asyncio.CancelledError:
+        cached = _auth_settings_cache
+        if (
+            cached is not None
+            and cached[0] == supabase_url
+            and cached[1] == publishable_key
+            and cached[2]
+            and _monotonic() < cached[3]
+        ):
+            return True
+        return False
+    finally:
+        if _auth_settings_retry_task is asyncio.current_task():
+            _auth_settings_retry_task = None
+            _auth_settings_retry_key = None
+
+
+def _schedule_background_auth_retry(
+    supabase_url: str, publishable_key: str, delay_s: float
+) -> asyncio.Task[bool] | None:
+    """Schedule one single-flight background retry after ``delay_s`` for transient failures."""
+    global _auth_settings_retry_task, _auth_settings_retry_key
+    key = (supabase_url, publishable_key)
+    if (
+        _auth_settings_retry_task is not None
+        and not _auth_settings_retry_task.done()
+        and _auth_settings_retry_key == key
+    ):
+        return _auth_settings_retry_task
+    if _auth_settings_retry_task is not None and not _auth_settings_retry_task.done():
+        _auth_settings_retry_task.cancel()
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    _auth_settings_retry_key = key
+    _auth_settings_retry_task = asyncio.create_task(
+        _run_background_auth_retry(supabase_url, publishable_key, max(0.0, delay_s))
+    )
+    return _auth_settings_retry_task
+
+
 async def _check_supabase_signup_disabled(
     supabase_url: str,
     target_logger: logging.Logger | None = None,
+    *,
+    schedule_retry_on_failure: bool = True,
 ) -> bool:
     """Verify via ``${SUPABASE_URL}/auth/v1/settings`` that signup, autoconfirm, and anonymous users are disabled."""
-    global _auth_settings_cache
+    global _auth_settings_cache, _auth_settings_retry
     log = target_logger or logger
     clean_url = supabase_url.strip().rstrip("/")
     publishable_key = get_supabase_publishable_key()
     if not publishable_key:
-        _auth_settings_cache = (
+        _auth_settings_retry = None
+        if schedule_retry_on_failure:
+            _cancel_background_auth_retry()
+        _auth_settings_cache = _AuthSettingsCache(
             clean_url,
             "",
             False,
-            time.monotonic() + _AUTH_SETTINGS_FAILURE_TTL_S,
+            _monotonic() + _AUTH_SETTINGS_FAILURE_TTL_S,
+            None,
         )
         log.error(
             "HOST_MODE=oss, DALTON_AUTH_MODE=supabase: SUPABASE_PUBLISHABLE_KEY 为空，"
@@ -98,29 +256,80 @@ async def _check_supabase_signup_disabled(
         )
         return False
 
+    prev_success_at = _cache_last_success_at(
+        _auth_settings_cache, clean_url, publishable_key
+    )
+    started = _monotonic()
     try:
-        settings_data = await _fetch_supabase_auth_settings(clean_url, publishable_key)
+        settings_data = await asyncio.wait_for(
+            _fetch_supabase_auth_settings(clean_url, publishable_key),
+            timeout=_AUTH_SETTINGS_FETCH_TIMEOUT_S,
+        )
     except Exception as exc:
-        _auth_settings_cache = (
+        finished = _monotonic()
+        elapsed_ms = max(0.0, (finished - started) * 1000.0)
+        if (
+            prev_success_at is not None
+            and (finished - prev_success_at) <= _AUTH_SETTINGS_STALE_MAX_AGE_S
+        ):
+            stale_age_s = max(0.0, finished - prev_success_at)
+            next_expires_at = min(
+                finished + _AUTH_SETTINGS_FAILURE_TTL_S,
+                prev_success_at + _AUTH_SETTINGS_STALE_MAX_AGE_S,
+            )
+            _auth_settings_retry = None
+            _auth_settings_cache = _AuthSettingsCache(
+                clean_url,
+                publishable_key,
+                True,
+                next_expires_at,
+                prev_success_at,
+            )
+            log.warning(
+                "HOST_MODE=oss, DALTON_AUTH_MODE=supabase: 刷新 %s/auth/v1/settings 失败 "
+                "(%s: %s, elapsed=%.1fms)，继续沿用上次成功结果 (age=%.1fs/%.0fs)。",
+                clean_url,
+                type(exc).__name__,
+                exc,
+                elapsed_ms,
+                stale_age_s,
+                _AUTH_SETTINGS_STALE_MAX_AGE_S,
+            )
+            return True
+
+        # No valid cached success: keep auth decision empty (fail-closed) and record an
+        # independent 5s retry deadline + single-flight background retry task.
+        _auth_settings_cache = None
+        _auth_settings_retry = _AuthSettingsRetryState(
             clean_url,
             publishable_key,
-            False,
-            time.monotonic() + _AUTH_SETTINGS_FAILURE_TTL_S,
+            finished + _AUTH_SETTINGS_RETRY_TTL_S,
         )
+        if schedule_retry_on_failure:
+            _schedule_background_auth_retry(
+                clean_url, publishable_key, _AUTH_SETTINGS_RETRY_TTL_S
+            )
         log.error(
-            "HOST_MODE=oss, DALTON_AUTH_MODE=supabase: 请求 %s/auth/v1/settings 失败 (%s)，"
-            "所有请求将被拒绝 (fail-closed)。",
+            "HOST_MODE=oss, DALTON_AUTH_MODE=supabase: 请求 %s/auth/v1/settings 失败 "
+            "(%s: %s, elapsed=%.1fms)，将在 %.0fs 后后台重试，当前请求拒绝 (fail-closed)。",
             clean_url,
+            type(exc).__name__,
             exc,
+            elapsed_ms,
+            _AUTH_SETTINGS_RETRY_TTL_S,
         )
         return False
 
     if settings_data.get("disable_signup") is not True:
-        _auth_settings_cache = (
+        _auth_settings_retry = None
+        if schedule_retry_on_failure:
+            _cancel_background_auth_retry()
+        _auth_settings_cache = _AuthSettingsCache(
             clean_url,
             publishable_key,
             False,
-            time.monotonic() + _AUTH_SETTINGS_FAILURE_TTL_S,
+            _monotonic() + _AUTH_SETTINGS_FAILURE_TTL_S,
+            None,
         )
         log.error(
             "HOST_MODE=oss, DALTON_AUTH_MODE=supabase: %s/auth/v1/settings 中 disable_signup=%r "
@@ -131,11 +340,15 @@ async def _check_supabase_signup_disabled(
         return False
 
     if settings_data.get("mailer_autoconfirm") is not False:
-        _auth_settings_cache = (
+        _auth_settings_retry = None
+        if schedule_retry_on_failure:
+            _cancel_background_auth_retry()
+        _auth_settings_cache = _AuthSettingsCache(
             clean_url,
             publishable_key,
             False,
-            time.monotonic() + _AUTH_SETTINGS_FAILURE_TTL_S,
+            _monotonic() + _AUTH_SETTINGS_FAILURE_TTL_S,
+            None,
         )
         log.error(
             "HOST_MODE=oss, DALTON_AUTH_MODE=supabase: %s/auth/v1/settings 中 mailer_autoconfirm=%r "
@@ -157,11 +370,15 @@ async def _check_supabase_signup_disabled(
         or (not isinstance(anon_users, (bool, str, type(None))) and bool(anon_users))
     )
     if anon_enabled:
-        _auth_settings_cache = (
+        _auth_settings_retry = None
+        if schedule_retry_on_failure:
+            _cancel_background_auth_retry()
+        _auth_settings_cache = _AuthSettingsCache(
             clean_url,
             publishable_key,
             False,
-            time.monotonic() + _AUTH_SETTINGS_FAILURE_TTL_S,
+            _monotonic() + _AUTH_SETTINGS_FAILURE_TTL_S,
+            None,
         )
         log.error(
             "HOST_MODE=oss, DALTON_AUTH_MODE=supabase: %s/auth/v1/settings 中 external.anonymous_users=%r "
@@ -171,13 +388,78 @@ async def _check_supabase_signup_disabled(
         )
         return False
 
-    _auth_settings_cache = (
+    ok_at = _monotonic()
+    _auth_settings_retry = None
+    if schedule_retry_on_failure:
+        _cancel_background_auth_retry()
+    _auth_settings_cache = _AuthSettingsCache(
         clean_url,
         publishable_key,
         True,
-        time.monotonic() + _AUTH_SETTINGS_SUCCESS_TTL_S,
+        ok_at + _AUTH_SETTINGS_SUCCESS_TTL_S,
+        ok_at,
     )
     return True
+
+
+async def _run_background_auth_refresh(
+    supabase_url: str,
+    publishable_key: str,
+    *,
+    schedule_retry_on_failure: bool = True,
+) -> bool:
+    global _auth_settings_refresh_task, _auth_settings_refresh_key
+    try:
+        async with _auth_settings_lock:
+            now = _monotonic()
+            cached = _auth_settings_cache
+            if (
+                cached is not None
+                and cached[0] == supabase_url
+                and cached[1] == publishable_key
+                and now < cached[3]
+            ):
+                return bool(cached[2])
+            if get_supabase_publishable_key() != publishable_key:
+                return False
+            return await _check_supabase_signup_disabled(
+                supabase_url,
+                logger,
+                schedule_retry_on_failure=schedule_retry_on_failure,
+            )
+    finally:
+        if _auth_settings_refresh_task is asyncio.current_task():
+            _auth_settings_refresh_task = None
+            _auth_settings_refresh_key = None
+
+
+def _schedule_background_auth_refresh(
+    supabase_url: str,
+    publishable_key: str,
+    *,
+    schedule_retry_on_failure: bool = True,
+) -> tuple[asyncio.Task[bool], bool]:
+    """Start at most one background refresh for ``(supabase_url, publishable_key)``.
+
+    Returns ``(task, created_new)`` so callers share one single-flight refresh.
+    """
+    global _auth_settings_refresh_task, _auth_settings_refresh_key
+    key = (supabase_url, publishable_key)
+    if (
+        _auth_settings_refresh_task is not None
+        and not _auth_settings_refresh_task.done()
+        and _auth_settings_refresh_key == key
+    ):
+        return _auth_settings_refresh_task, False
+    _auth_settings_refresh_key = key
+    _auth_settings_refresh_task = asyncio.create_task(
+        _run_background_auth_refresh(
+            supabase_url,
+            publishable_key,
+            schedule_retry_on_failure=schedule_retry_on_failure,
+        )
+    )
+    return _auth_settings_refresh_task, True
 
 
 async def _ensure_dalton_auth_ready() -> None:
@@ -189,33 +471,80 @@ async def _ensure_dalton_auth_ready() -> None:
         raise HTTPException(status_code=503, detail="认证配置错误")
 
     publishable_key = get_supabase_publishable_key()
-    now = time.monotonic()
+    now = _monotonic()
     cached = _auth_settings_cache
     if (
         cached is not None
         and cached[0] == supabase_url
         and cached[1] == publishable_key
-        and now < cached[3]
     ):
-        if not cached[2]:
+        last_success_at = _cache_last_success_at(cached, supabase_url, publishable_key)
+        within_stale_window = (
+            last_success_at is not None
+            and (now - last_success_at) <= _AUTH_SETTINGS_STALE_MAX_AGE_S
+        )
+        if now < cached[3]:
+            if not cached[2]:
+                raise HTTPException(status_code=503, detail="认证配置错误")
+            if last_success_at is None or within_stale_window:
+                return
+        elif cached[2] and within_stale_window:
+            _task, started_new = _schedule_background_auth_refresh(
+                supabase_url, publishable_key
+            )
+            if started_new:
+                # Let the newly created background task start immediately without blocking on I/O.
+                await asyncio.sleep(0)
+            return
+
+    # If a single-flight refresh (including one launched by the background retry loop) is
+    # already in flight for this (url, key), reuse it instead of returning a stale 503.
+    key = (supabase_url, publishable_key)
+    in_flight = (
+        _auth_settings_refresh_task
+        if (
+            _auth_settings_refresh_task is not None
+            and not _auth_settings_refresh_task.done()
+            and _auth_settings_refresh_key == key
+        )
+        else None
+    )
+    if in_flight is not None:
+        try:
+            ok = await asyncio.wait_for(
+                asyncio.shield(in_flight), timeout=_AUTH_SETTINGS_FETCH_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=503, detail="认证配置错误") from None
+        if not ok:
             raise HTTPException(status_code=503, detail="认证配置错误")
         return
 
-    async with _auth_settings_lock:
-        now = time.monotonic()
-        cached = _auth_settings_cache
-        if (
-            cached is not None
-            and cached[0] == supabase_url
-            and cached[1] == publishable_key
-            and now < cached[3]
-        ):
-            if not cached[2]:
-                raise HTTPException(status_code=503, detail="认证配置错误")
-            return
+    # Independent transient-failure retry window (5s+ backoff): fail-closed without hammering
+    # upstream, while ensuring the single-flight background retry loop is running.
+    retry_state = _auth_settings_retry
+    if (
+        retry_state is not None
+        and retry_state.supabase_url == supabase_url
+        and retry_state.publishable_key == publishable_key
+        and now < retry_state.retry_at
+    ):
+        _schedule_background_auth_retry(
+            supabase_url, publishable_key, retry_state.retry_at - now
+        )
+        raise HTTPException(status_code=503, detail="认证配置错误")
 
-        if not await _check_supabase_signup_disabled(supabase_url, logger):
-            raise HTTPException(status_code=503, detail="认证配置错误")
+    # Cold start, URL/key change, expired grace (>30m), or expired retry cooldown:
+    # run a single-flight refresh task bounded by the short timeout (3s).
+    task, _created = _schedule_background_auth_refresh(supabase_url, publishable_key)
+    try:
+        ok = await asyncio.wait_for(
+            asyncio.shield(task), timeout=_AUTH_SETTINGS_FETCH_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=503, detail="认证配置错误") from None
+    if not ok:
+        raise HTTPException(status_code=503, detail="认证配置错误")
 
 
 def _extract_token_claims(token: str) -> dict[str, Any]:
@@ -561,7 +890,7 @@ async def log_dalton_auth_startup_if_enabled(
     Returns True when Dalton auth (``supabase`` or ``local``) is active, False for ``oss``.
     Raises :class:`DaltonStartupConfigError` on invalid auth mode configuration.
     """
-    global _auth_settings_cache
+    global _auth_settings_cache, _auth_settings_retry, _auth_settings_refresh_task, _auth_settings_refresh_key
     validate_dalton_auth_config()
 
     log = target_logger or logger
@@ -585,6 +914,12 @@ async def log_dalton_auth_startup_if_enabled(
     from src.config import settings as app_settings
 
     _auth_settings_cache = None
+    _auth_settings_retry = None
+    _cancel_background_auth_retry()
+    if _auth_settings_refresh_task is not None and not _auth_settings_refresh_task.done():
+        _auth_settings_refresh_task.cancel()
+    _auth_settings_refresh_task = None
+    _auth_settings_refresh_key = None
     has_error = False
 
     supabase_url = (app_settings.SUPABASE_URL or "").strip()

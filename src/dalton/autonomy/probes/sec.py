@@ -4,14 +4,90 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Optional
 
 import httpx
 
 from src.dalton.autonomy.probes import ProbeSignal
+from src.dalton.autonomy.probes.cnhk import classify_cnhk_ticker
 from src.dalton.coverage import get_user_coverage
 
 logger = logging.getLogger(__name__)
+
+_NON_SEC_EXCHANGE_SUFFIXES: tuple[str, ...] = (
+    ".HK",
+    ".SS",
+    ".SZ",
+    ".SH",
+    ".BJ",
+    ".KS",
+    ".KQ",
+    ".T",
+    ".JP",
+    ".TW",
+    ".TWO",
+    ".SI",
+    ".AX",
+    ".DE",
+    ".PA",
+    ".AS",
+    ".BR",
+    ".MI",
+    ".MC",
+    ".SW",
+    ".ST",
+    ".CO",
+    ".OL",
+    ".HE",
+    ".NS",
+    ".BO",
+    ".SA",
+    ".MX",
+    ".KL",
+    ".JK",
+    ".BK",
+    ".NZ",
+    ".TA",
+    ".WA",
+    ".VI",
+    ".L",
+    ".F",
+    ".TO",
+    ".V",
+)
+_NON_SEC_EXCHANGE_PREFIXES: tuple[str, ...] = (
+    "HKG:",
+    "KRX:",
+    "KOSDAQ:",
+    "TYO:",
+    "TSE:",
+    "TWSE:",
+    "SSE:",
+    "SZSE:",
+    "ASX:",
+    "SGX:",
+    "LON:",
+)
+
+
+def is_non_sec_ticker(ticker: str) -> bool:
+    """Return True when ``ticker`` denotes a non-US security (e.g. HK/CN/KR/JP/TW/EU) without SEC filings by default."""
+    sym = (ticker or "").strip().upper()
+    if not sym or sym == "UNKNOWN":
+        return False
+    cnhk_kind, _ = classify_cnhk_ticker(sym)
+    if cnhk_kind in ("cn", "hk"):
+        return True
+    if any(sym.endswith(sfx) for sfx in _NON_SEC_EXCHANGE_SUFFIXES):
+        return True
+    if any(sym.startswith(pfx) for pfx in _NON_SEC_EXCHANGE_PREFIXES):
+        return True
+    if re.fullmatch(r"KR\d{5,6}", sym):
+        return True
+    if re.fullmatch(r"\d{4,6}", sym):
+        return True
+    return False
 
 WATCHED_FORMS = frozenset({"10-K", "10-Q", "8-K", "20-F", "6-K", "DEF 14A", "13D", "13G", "4", "SC 13D", "SC 13G"})
 P0_FORMS = frozenset({"10-K", "10-Q", "20-F", "6-K", "8-K"})
@@ -178,19 +254,26 @@ async def probe_sec(
     state = dict(watch_state or {})
     data = submissions_override or state.get("sec_submissions_mock")
 
+    non_sec = is_non_sec_ticker(ticker)
     cik = await resolve_company_cik(
         ticker,
         watch_state=state,
         workspace_id=workspace_id if allow_network else None,
         user_id=user_id,
-        allow_network=(data is None and allow_network),
+        allow_network=(data is None and allow_network and not non_sec),
     )
     if cik:
         if not state.get("cik"):
             state["cik"] = cik
         state["sec_probe_degraded"] = False
+        state.pop("sec_probe_unsupported", None)
+    elif data is None and non_sec:
+        state["sec_probe_degraded"] = False
+        state["sec_probe_unsupported"] = True
+        return [], state
     elif data is None:
         state["sec_probe_degraded"] = True
+        state.pop("sec_probe_unsupported", None)
         logger.warning(
             "[DALTON_SEC_PROBE] CIK resolution failed across all fallbacks for ticker=%s; "
             "marking sec_probe_degraded=True",

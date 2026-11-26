@@ -26,11 +26,14 @@ ERROR_BODY_BYTES = 64 * 1024
 _OPENAI_DEFAULT_BASE = "https://api.openai.com/v1"
 _ANTHROPIC_DEFAULT_BASE = "https://api.anthropic.com"
 _GEMINI_DEFAULT_BASE = "https://generativelanguage.googleapis.com"
+# DALTON-HOOK(llm-sdk-dispatch): Antigravity native Cloud Code endpoint default
+_ANTIGRAVITY_DEFAULT_BASE = "https://daily-cloudcode-pa.googleapis.com"
 _ANTHROPIC_OAUTH_BETA = "oauth-2025-04-20"
 
 # Shapes of list endpoint, one per SDK family that answers differently.
-OPENAI, ANTHROPIC, GEMINI, CODEX, OPENROUTER = (
-    "openai", "anthropic", "gemini", "codex", "openrouter",
+# DALTON-HOOK(llm-sdk-dispatch): add ANTIGRAVITY native list shape
+OPENAI, ANTHROPIC, GEMINI, CODEX, OPENROUTER, ANTIGRAVITY = (
+    "openai", "anthropic", "gemini", "codex", "openrouter", "antigravity",
 )
 
 # Why a list could not be read, as the endpoint reports it.
@@ -67,6 +70,9 @@ class ListRequest:
 
 def list_shape(info: dict) -> str:
     sdk = info.get("sdk")
+    # DALTON-HOOK(llm-sdk-dispatch): Antigravity uses native POST v1internal:fetchAvailableModels
+    if sdk == "antigravity":
+        return ANTIGRAVITY
     if sdk == "codex":
         return CODEX
     if sdk == "openrouter" or info.get("parent_provider") == "openrouter":
@@ -109,6 +115,9 @@ def list_url(info: dict, shape: str, override: str | None) -> tuple[str, str]:
         return f"{base}/models?client_version={codex_client_version()}", shape
     if shape == OPENROUTER:
         return f"{base}/models?supported_parameters=tools", shape
+    # DALTON-HOOK(llm-sdk-dispatch): Antigravity native model list path
+    if shape == ANTIGRAVITY:
+        return f"{base or _ANTIGRAVITY_DEFAULT_BASE}/v1internal:fetchAvailableModels", shape
     return f"{base or _OPENAI_DEFAULT_BASE}/models", shape
 
 
@@ -152,6 +161,12 @@ def build_list_request(
             from src.llms.extension.codex import codex_identity_headers
 
             headers.update(codex_identity_headers())
+        # DALTON-HOOK(llm-sdk-dispatch): Antigravity requires JSON content-type and CLI User-Agent
+        if shape == ANTIGRAVITY:
+            from src.dalton.llm.providers.antigravity.client import ANTIGRAVITY_USER_AGENT
+
+            headers.setdefault("Content-Type", "application/json")
+            headers.setdefault("User-Agent", ANTIGRAVITY_USER_AGENT)
     headers.update(token_headers or {})
     return ListRequest(shape=shape, url=url, headers=headers)
 
@@ -212,10 +227,43 @@ async def fetch_list(
         except ValueError as e:
             raise ListFetchError(BAD_RESPONSE) from e
 
+    # DALTON-HOOK(llm-sdk-dispatch): reuse native_catalog.fetch_antigravity_models for Antigravity
+    async def _fetch_antigravity() -> Any:
+        from src.dalton.llm import native_catalog
+
+        auth_header = req.headers.get("Authorization") or ""
+        access_token = (
+            auth_header[7:].strip()
+            if auth_header.lower().startswith("bearer ")
+            else auth_header.strip()
+        )
+        base_url = req.url.removesuffix("/v1internal:fetchAvailableModels")
+        user_agent = req.headers.get("User-Agent")
+        async with httpx.AsyncClient(
+            timeout=timeout, transport=transport, follow_redirects=False
+        ) as client:
+            try:
+                return await native_catalog.fetch_antigravity_models(
+                    access_token,
+                    base_url=base_url,
+                    user_agent=user_agent,
+                    client=client,
+                    strict=True,
+                )
+            except httpx.HTTPStatusError as e:
+                refusal = (e.response.content or b"")[:ERROR_BODY_BYTES]
+                status = e.response.status_code
+                reason = UNAUTHORIZED if status in (401, 403) else BAD_RESPONSE
+                raise ListFetchError(reason, status, error_message(refusal)) from e
+            except ValueError as e:
+                raise ListFetchError(BAD_RESPONSE) from e
+
     from src.server.services.llm.egress import EndpointRefused
 
     try:
-        return await asyncio.wait_for(_get(), timeout)
+        # DALTON-HOOK(llm-sdk-dispatch): dispatch Antigravity requests to native POST fetcher
+        coro = _fetch_antigravity() if req.shape == ANTIGRAVITY else _get()
+        return await asyncio.wait_for(coro, timeout)
     except ListFetchError:
         raise
     except EndpointRefused as e:
@@ -437,12 +485,45 @@ def _normalize_openrouter(payload: Any) -> list[dict]:
     return out
 
 
+# DALTON-HOOK(llm-sdk-dispatch): normalize native Antigravity model list
+def _normalize_antigravity(payload: Any) -> list[dict]:
+    out: list[dict] = []
+    if isinstance(payload, list):
+        for item in payload:
+            model_id = getattr(item, "id", None)
+            if not isinstance(model_id, str) or not model_id:
+                continue
+            if getattr(item, "internal", False):
+                continue
+            out.append(
+                _model(
+                    model_id,
+                    getattr(item, "display_name", None),
+                    _int(getattr(item, "context_window", None)),
+                    None,
+                )
+            )
+        return out
+    rows = payload.get("models") if isinstance(payload, dict) else None
+    if not isinstance(rows, dict):
+        raise ListFetchError(BAD_RESPONSE)
+    for model_id, row in rows.items():
+        if not isinstance(model_id, str) or not model_id or not isinstance(row, dict):
+            continue
+        if not row.get("displayName"):
+            continue
+        out.append(_model(model_id, row.get("displayName"), _int(row.get("maxTokens")), None))
+    return out
+
+
 _NORMALIZERS = {
     OPENAI: _normalize_openai,
     ANTHROPIC: _normalize_anthropic,
     GEMINI: _normalize_gemini,
     CODEX: _normalize_codex,
     OPENROUTER: _normalize_openrouter,
+    # DALTON-HOOK(llm-sdk-dispatch): Antigravity normalizer
+    ANTIGRAVITY: _normalize_antigravity,
 }
 
 
