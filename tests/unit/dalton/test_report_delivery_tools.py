@@ -31,12 +31,18 @@ def _tool_json(result: Any) -> dict[str, Any]:
     raise AssertionError(f"Unexpected tool return value: {result!r}")
 
 
-async def _call_tool(tool: Any, args: dict[str, Any], *, config: dict[str, Any]) -> dict[str, Any]:
+async def _call_tool(
+    tool: Any,
+    args: dict[str, Any],
+    *,
+    config: dict[str, Any],
+    tool_call_id: str | None = None,
+) -> dict[str, Any]:
     raw = await tool.ainvoke(
         {
             "name": tool.name,
             "args": args,
-            "id": "tc-rd-1",
+            "id": tool_call_id or f"tc-rd-{uuid4().hex[:8]}",
             "type": "tool_call",
         },
         config=config,
@@ -5491,16 +5497,36 @@ async def test_ad5_r3_resume_persists_snapshot_and_handles_reject_before_reprech
     )
     monkeypatch.setattr(rd_tools, "hitl_confirm", hitl_reject_mock)
 
-    res_rej = _tool_json(
-        await tool.ainvoke(
-            {"name": tool.name, "args": call_args, "id": "tc-resume-rej", "type": "tool_call"},
-            config=_cfg(_ADMIN),
-        )
+    cmd_rej = await tool.ainvoke(
+        {"name": tool.name, "args": call_args, "id": "tc-resume-rej", "type": "tool_call"},
+        config=_cfg(_ADMIN),
     )
+    res_rej = _tool_json(cmd_rej)
     assert res_rej["ok"] is False
     assert res_rej["error"] == "user_declined"
     hitl_reject_mock.assert_called_once()
     mocks["update_auto"].assert_not_awaited()
+    # B1 (r4): snapshot stays persisted until the ToolMessage is checkpointed so a
+    # worker crash + replay before checkpoint commit still follows the original reject!
+    assert ("t-1", "tc-resume-rej") in snap_table
+
+    cmd_rej_replay = await tool.ainvoke(
+        {"name": tool.name, "args": call_args, "id": "tc-resume-rej", "type": "tool_call"},
+        config=_cfg(_ADMIN),
+    )
+    res_rej_replay = _tool_json(cmd_rej_replay)
+    assert res_rej_replay["ok"] is False
+    assert res_rej_replay["error"] == "user_declined"
+    assert hitl_reject_mock.call_count == 2
+    mocks["update_auto"].assert_not_awaited()
+
+    # Once LangGraph checkpoints the ToolMessage and enters the next model step,
+    # ReportDeliveryHitlCleanupMiddleware removes the snapshot.
+    cleanup_mw = rd_tools.ReportDeliveryHitlCleanupMiddleware(
+        thread_id="t-1",
+        caller_user_id=_ADMIN,
+    )
+    await cleanup_mw.abefore_model({"messages": list(cmd_rej.update["messages"])})
     assert ("t-1", "tc-resume-rej") not in snap_table
 
     # --- Case 2: Pause -> owner unbinds Discord -> admin clicks APPROVE ---
@@ -5525,16 +5551,27 @@ async def test_ad5_r3_resume_persists_snapshot_and_handles_reject_before_reprech
     )
     monkeypatch.setattr(rd_tools, "hitl_confirm", hitl_approve_mock)
 
-    res_app = _tool_json(
-        await tool.ainvoke(
-            {"name": tool.name, "args": call_args, "id": "tc-resume-app", "type": "tool_call"},
-            config=_cfg(_ADMIN),
-        )
+    cmd_app = await tool.ainvoke(
+        {"name": tool.name, "args": call_args, "id": "tc-resume-app", "type": "tool_call"},
+        config=_cfg(_ADMIN),
     )
+    res_app = _tool_json(cmd_app)
     assert res_app["ok"] is False
     assert res_app["error"] == "dm_not_bound"
     hitl_approve_mock.assert_called_once()
     mocks["update_auto"].assert_not_awaited()
+    assert ("t-1", "tc-resume-app") in snap_table
+
+    # Replay before checkpoint commit still uses the frozen snapshot targets & fails dm_not_bound.
+    cmd_app_replay = await tool.ainvoke(
+        {"name": tool.name, "args": call_args, "id": "tc-resume-app", "type": "tool_call"},
+        config=_cfg(_ADMIN),
+    )
+    assert _tool_json(cmd_app_replay)["error"] == "dm_not_bound"
+    assert hitl_approve_mock.call_count == 2
+    mocks["update_auto"].assert_not_awaited()
+
+    await cleanup_mw.abefore_model({"messages": list(cmd_app.update["messages"])})
     assert ("t-1", "tc-resume-app") not in snap_table
 
 
@@ -5646,3 +5683,201 @@ async def test_ad5_r3_patch_report_profile_null_clears_config_and_routes_without
     clear_patch = mocks["patch_prefs"].await_args.args[1]
     assert clear_patch[rd_svc.DALTON_NOTIFY_OVERRIDES_KEY][f"automation:{_AUTO_UUID}"] is None
     assert clear_patch[rd_svc.DALTON_NOTIFY_ROUTES_KEY][f"automation:{_AUTO_UUID}"] is None
+
+
+@pytest.mark.asyncio
+async def test_ad5_r4_schedule_update_interleaved_with_report_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """AD5 r4 (Codex A-class): interleaving `dalton_schedule_automation` with an
+    approved `report_profile` update must never clobber the newer `report_profile`:
+    - schedule-only or unrelated-metadata updates preserve the locked row's `report_profile`
+      and merge only the fields touched by the schedule call;
+    - explicit `report_profile` writes bind `expected_config_version` to the precheck
+      version and fail closed with `conflict` when the row advances concurrently."""
+    import copy
+    import src.dalton.autonomy.schedule as schedule_mod
+    from psycopg import AsyncConnection
+    from src.dalton.autonomy.schedule import schedule_dalton_automation_helper
+    from src.dalton.services import company_automations
+    from src.server.database import automation as auto_db
+    from src.server.database import workspace as ws_db
+
+    mocks = _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="internal", is_feishu_member=True)
+    monkeypatch.setattr("src.dalton.settings.is_coverage_units_enabled", lambda: False)
+    monkeypatch.setattr("src.dalton.settings.is_dalton_auth_enabled", lambda: False)
+    monkeypatch.setattr("src.dalton.settings.is_dalton_local_auth_enabled", lambda: False)
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(ws_db.get_workspace, return_value={"workspace_id": _WS_UUID, "user_id": _OWNER}),
+    )
+
+    lock_conn = create_autospec(AsyncConnection, instance=True)
+
+    @asynccontextmanager
+    async def _tx(*_a: Any, **_kw: Any):
+        yield lock_conn
+
+    lock_conn.transaction.side_effect = _tx
+
+    @asynccontextmanager
+    async def _get_conn():
+        yield lock_conn
+
+    monkeypatch.setattr(
+        schedule_mod,
+        "get_db_connection",
+        create_autospec(schedule_mod.get_db_connection, side_effect=_get_conn),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "lock_user_automations",
+        create_autospec(auto_db.lock_user_automations, return_value=None),
+    )
+
+    old_group = _FEISHU_CHAT_AUTH
+    new_group = "feishu:chat:oc_new_approved_group_999"
+    old_rp = {
+        "profile": "daily-filing-alert",
+        "report_targets": [old_group],
+        "failure_targets": [],
+    }
+    approved_new_rp = {
+        "profile": "daily-filing-alert",
+        "report_targets": [new_group],
+        "text_targets": [old_group],
+        "failure_targets": [],
+    }
+    stale_pre_row: dict[str, Any] = {
+        "automation_id": _AUTO_UUID,
+        "user_id": _OWNER,
+        "workspace_id": _WS_UUID,
+        "name": "dalton-nvda-filing",
+        "instruction": _DAILY_FILING_INST,
+        "trigger_type": "cron",
+        "cron_expression": "0 8 * * *",
+        "timezone": "UTC",
+        "status": "active",
+        "llm_model": None,
+        "reasoning_effort": None,
+        "config_version": 3,
+        "metadata": {
+            "dalton_managed": True,
+            "ticker": "NVDA",
+            "report_profile": old_rp,
+        },
+    }
+    # Concurrently, human approved moving cards to new_group and leaving text-only in old_group (v4).
+    locked_v4_row: dict[str, Any] = {
+        **stale_pre_row,
+        "config_version": 4,
+        "metadata": {
+            "dalton_managed": True,
+            "ticker": "NVDA",
+            "report_profile": approved_new_rp,
+        },
+    }
+
+    async def _list_stale(_uid: str, *, conn: Any = None) -> list[dict[str, Any]]:
+        return [copy.deepcopy(stale_pre_row)]
+
+    monkeypatch.setattr(
+        auto_db,
+        "list_all_automations",
+        create_autospec(auto_db.list_all_automations, side_effect=_list_stale),
+    )
+
+    captured_calls: list[dict[str, Any]] = []
+
+    async def _fake_update_under_lock(
+        aid: str,
+        uid: str,
+        *,
+        conn: Any = None,
+        **kw: Any,
+    ) -> dict[str, Any]:
+        hist_ctx = company_automations.get_current_history_context()
+        assert hist_ctx is not None and hist_ctx.locked_row_reconciler is not None
+        expected_cv = hist_ctx.expected_config_version
+        captured_calls.append({"raw_kwargs": copy.deepcopy(kw), "expected_cv": expected_cv})
+        if expected_cv is not None and locked_v4_row["config_version"] != expected_cv:
+            raise company_automations.AutomationVersionConflictError(
+                f"expected {expected_cv}, got {locked_v4_row['config_version']}"
+            )
+        effective = copy.deepcopy(kw)
+        await hist_ctx.locked_row_reconciler(copy.deepcopy(locked_v4_row), effective, conn)
+        captured_calls[-1]["effective_kwargs"] = copy.deepcopy(effective)
+        saved = copy.deepcopy(locked_v4_row)
+        saved.update(effective)
+        return saved
+
+    mocks["update_auto"].side_effect = _fake_update_under_lock
+
+    # 1. Schedule-only update (cron change, no metadata.report_profile):
+    #    must not send stale metadata and must preserve locked row's approved_new_rp.
+    res_cron = await schedule_dalton_automation_helper(
+        name="dalton-nvda-filing",
+        spec={"cron_expression": "30 9 * * *"},
+        user_id=_OWNER,
+        workspace_id=_WS_UUID,
+        ticker="NVDA",
+        role="chief_of_staff",
+    )
+    assert res_cron["ok"] is True
+    assert captured_calls[-1]["expected_cv"] is None
+    assert "metadata" not in captured_calls[-1]["raw_kwargs"]
+    assert "metadata" not in captured_calls[-1]["effective_kwargs"]
+
+    # 2. Schedule update that also edits an unrelated metadata field (window="post"):
+    #    locked reconciler merges ONLY the delta onto locked_v4_row, keeping approved_new_rp!
+    res_meta = await schedule_dalton_automation_helper(
+        name="dalton-nvda-filing",
+        spec={"cron_expression": "45 9 * * *", "metadata": {"window": "post"}},
+        user_id=_OWNER,
+        workspace_id=_WS_UUID,
+        ticker="NVDA",
+        role="chief_of_staff",
+    )
+    assert res_meta["ok"] is True
+    assert captured_calls[-1]["expected_cv"] is None
+    eff_meta = captured_calls[-1]["effective_kwargs"]["metadata"]
+    assert eff_meta["window"] == "post"
+    assert eff_meta["report_profile"] == approved_new_rp
+
+    # 3. Explicit report_profile change (to caller's own DM) interleaved with v3 -> v4:
+    #    must bind expected_config_version=3 and fail closed with conflict!
+    dm_rp = {
+        "profile": "daily-filing-alert",
+        "report_targets": [_CALLER_FEISHU_DM],
+        "failure_targets": [],
+    }
+    res_explicit_change = await schedule_dalton_automation_helper(
+        name="dalton-nvda-filing",
+        spec={"cron_expression": "0 10 * * *", "metadata": {"report_profile": dm_rp}},
+        user_id=_OWNER,
+        workspace_id=_WS_UUID,
+        ticker="NVDA",
+        role="chief_of_staff",
+    )
+    assert res_explicit_change["ok"] is False
+    assert res_explicit_change["error"] == "conflict"
+    assert captured_calls[-1]["expected_cv"] == 3
+    assert "effective_kwargs" not in captured_calls[-1]
+
+    # 4. Explicit unchanged report_profile (echoing stale old_rp) interleaved with v3 -> v4:
+    #    must ALSO bind expected_config_version=3 and fail closed (including via_rest=True -> conflict)!
+    with pytest.raises(rd_svc.ReportDeliveryError) as exc_info:
+        await schedule_dalton_automation_helper(
+            name="dalton-nvda-filing",
+            spec={"cron_expression": "15 10 * * *", "metadata": {"report_profile": old_rp}},
+            user_id=_OWNER,
+            workspace_id=_WS_UUID,
+            ticker="NVDA",
+            role="chief_of_staff",
+            via_rest=True,
+        )
+    assert exc_info.value.code == "conflict"
+    assert captured_calls[-1]["expected_cv"] == 3
+    assert "effective_kwargs" not in captured_calls[-1]

@@ -7,7 +7,8 @@ import logging
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Any, Literal
 
-from langchain_core.messages import ToolMessage
+from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import AIMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 from langgraph.errors import GraphInterrupt
@@ -50,6 +51,7 @@ def _tool_command(payload: Mapping[str, Any], tool_call_id: str) -> Command:
                 ToolMessage(
                     content=json.dumps(dict(payload), ensure_ascii=False, default=str),
                     tool_call_id=tool_call_id,
+                    name="dalton_report_delivery",
                 ),
             ],
         }
@@ -376,11 +378,11 @@ def create_report_delivery_tools() -> list[BaseTool]:
                         "dalton_report_delivery_set",
                         card_payload,
                     )
-                    await delete_report_delivery_hitl_snapshot(
-                        thread_id=eff_thread_id,
-                        tool_call_id=tool_call_id,
-                        caller_user_id=caller_user_id,
-                    )
+                    # Keep the pending snapshot intact until the ToolMessage result is
+                    # persisted in the LangGraph checkpoint (deleted post-persistence by
+                    # ReportDeliveryHitlCleanupMiddleware.abefore_model). If the worker
+                    # exits before checkpoint commit, replay reloads the frozen snapshot
+                    # and follows the original decision instead of re-running live precheck.
                     if not approved:
                         return _error_command(
                             "user_declined",
@@ -493,3 +495,100 @@ def create_report_delivery_tools() -> list[BaseTool]:
             )
 
     return [dalton_report_delivery]
+
+
+async def cleanup_persisted_report_delivery_hitl_snapshots(
+    *,
+    thread_id: str,
+    caller_user_id: str,
+    messages: Sequence[Any],
+) -> list[str]:
+    """Delete pending AD5 HITL snapshots whose ``ToolMessage`` is already persisted in state."""
+    uid = str(caller_user_id or "").strip()
+    tid = str(thread_id or "")
+    if not uid or not messages:
+        return []
+
+    trailing_tool_msgs: list[ToolMessage] = []
+    preceding_ai: AIMessage | None = None
+    for msg in reversed(messages):
+        if isinstance(msg, ToolMessage):
+            trailing_tool_msgs.append(msg)
+            continue
+        if isinstance(msg, AIMessage):
+            preceding_ai = msg
+        break
+
+    if not trailing_tool_msgs:
+        return []
+
+    rd_call_ids: set[str] = set()
+    if preceding_ai is not None:
+        raw_calls = getattr(preceding_ai, "tool_calls", None) or ()
+        for tc in raw_calls:
+            if (
+                isinstance(tc, Mapping)
+                and str(tc.get("name") or "").strip() == "dalton_report_delivery"
+            ):
+                cid = str(tc.get("id") or "").strip()
+                if cid:
+                    rd_call_ids.add(cid)
+
+    cleaned: list[str] = []
+    for tmsg in trailing_tool_msgs:
+        tcid = str(getattr(tmsg, "tool_call_id", "") or "").strip()
+        mname = str(getattr(tmsg, "name", "") or "").strip()
+        if not tcid:
+            continue
+        if mname != "dalton_report_delivery" and tcid not in rd_call_ids:
+            continue
+        try:
+            await delete_report_delivery_hitl_snapshot(
+                thread_id=tid,
+                tool_call_id=tcid,
+                caller_user_id=uid,
+            )
+            cleaned.append(tcid)
+        except Exception:
+            logger.warning(
+                "[DALTON_REPORT_DELIVERY] Failed to clean persisted HITL snapshot thread=%s tool_call_id=%s",
+                tid,
+                tcid,
+                exc_info=True,
+            )
+    return cleaned
+
+
+class ReportDeliveryHitlCleanupMiddleware(AgentMiddleware):
+    """Deletes AD5 HITL snapshots only after the tool node's ``ToolMessage`` is checkpointed."""
+
+    def __init__(self, *, thread_id: str, caller_user_id: str) -> None:
+        super().__init__()
+        self._thread_id = str(thread_id or "")
+        self._caller_user_id = str(caller_user_id or "").strip()
+
+    async def abefore_model(
+        self, state: Any, runtime: Any = None
+    ) -> dict[str, Any] | None:
+        if not self._caller_user_id:
+            return None
+        messages = (
+            state.get("messages")
+            if isinstance(state, Mapping)
+            else getattr(state, "messages", None)
+        )
+        if not messages:
+            return None
+        eff_tid = self._thread_id
+        if not eff_tid and runtime is not None:
+            rt_cfg = getattr(runtime, "config", None)
+            if isinstance(rt_cfg, Mapping):
+                cfg_map = rt_cfg.get("configurable")
+                if isinstance(cfg_map, Mapping):
+                    eff_tid = str(cfg_map.get("thread_id") or "")
+        await cleanup_persisted_report_delivery_hitl_snapshots(
+            thread_id=eff_tid,
+            caller_user_id=self._caller_user_id,
+            messages=messages,
+        )
+        return None
