@@ -791,9 +791,13 @@ async def list_models(response: Response):
 
     # DALTON-HOOK(team-model-catalog): confirm live PG catalog revision on every GET /api/v1/models,
     # expose X-Dalton-Catalog-Revision header when enabled, and serve version-aligned curated setup candidates.
+    from src.dalton.services.team_model_catalog.billing import bind_billing_dalton_meta
     from src.dalton.services.team_model_catalog.compiled import get_compiled_catalog_async
     from src.dalton.services.team_model_catalog.constants import CATALOG_REVISION_HEADER
-    from src.dalton.services.team_model_catalog.service import derive_curated_setup_for_catalog
+    from src.dalton.services.team_model_catalog.service import (
+        annotate_model_metadata_price_source,
+        derive_curated_setup_for_catalog,
+    )
     from src.dalton.settings import is_dalton_enabled
 
     team_catalog_enabled = is_dalton_enabled()
@@ -846,6 +850,28 @@ async def list_models(response: Response):
         for name, spec in providers_with_capability(CAPABILITY_SEARCH).items()
         if (cap := spec.capability(CAPABILITY_SEARCH)) is not None
     }
+    # DALTON-HOOK(standalone-core): mark text-only models so core setup excludes non-tool models
+    # DALTON-HOOK(team-model-catalog): bind compiled_catalog.dalton_meta for this request's metadata
+    # pricing/tool-calling/price-source resolution (zero sync DB fallbacks) and attach read-only
+    # price source fields only when Dalton team catalog is enabled; fall back cleanly on errors.
+    with bind_billing_dalton_meta(None if llm_is_mocked else compiled_catalog.dalton_meta):
+        model_metadata = __import__(
+            "src.dalton.llm.role_policy", fromlist=["annotate_model_metadata_tool_calling"]
+        ).annotate_model_metadata_tool_calling(
+            config.get_model_metadata(), dalton_meta=compiled_catalog.dalton_meta
+        )
+        if team_catalog_enabled:
+            try:
+                model_metadata = annotate_model_metadata_price_source(
+                    model_metadata,
+                    model_config=config,
+                    dalton_meta=compiled_catalog.dalton_meta,
+                    compiled_catalog=None if llm_is_mocked else compiled_catalog,
+                    oauth_sync_enabled=compiled_catalog.oauth_sync_enabled,
+                )
+            except Exception as exc:
+                logger.warning("Failed to annotate model price source metadata: %s", exc)
+
     return {
         "models": {
             provider: {
@@ -854,13 +880,7 @@ async def list_models(response: Response):
             }
             for provider, model_list in models.items()
         },
-        # DALTON-HOOK(standalone-core): mark text-only models so core setup excludes non-tool models
-        # DALTON-HOOK(team-model-catalog): pass compiled_catalog.dalton_meta so metadata aligns with X-Dalton-Catalog-Revision
-        "model_metadata": __import__(
-            "src.dalton.llm.role_policy", fromlist=["annotate_model_metadata_tool_calling"]
-        ).annotate_model_metadata_tool_calling(
-            config.get_model_metadata(), dalton_meta=compiled_catalog.dalton_meta
-        ),
+        "model_metadata": model_metadata,
         "system_defaults": {
             # One source with the default-model reassignment on preference
             # writes, so "threads on the old default" means what the composer showed.

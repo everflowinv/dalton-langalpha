@@ -54,6 +54,12 @@ export interface ModelMetadataEntry {
   task_cost_estimate?: number;
   /** List price in USD per million tokens. Absent = no price known. */
   pricing?: { input: number; output: number };
+  // DALTON-HOOK(team-model-catalog): read-only price source metadata for model picker badges
+  pricing_meta?: { source_kind?: 'official' | 'estimated' | 'third_party'; estimated?: boolean };
+  notional_pricing?: {
+    source_kind?: 'official' | 'estimated' | 'third_party';
+    estimated?: boolean;
+  };
 }
 
 /** The model and level every `task_cost` figure is a multiple of. */
@@ -443,6 +449,9 @@ export function withCustomModels(
       display_name: _shadowedLabel,
       native_compaction: _shadowedNative,
       pricing,
+      // DALTON-HOOK(team-model-catalog): keep price source metadata scoped to the same provider and model_id
+      pricing_meta: pricingMeta,
+      notional_pricing: notionalPricing,
       task_cost: measured,
       task_cost_estimate: estimate,
       // DALTON-HOOK(standalone-core): never inherit catalog tool_calling onto a custom model without explicit verification
@@ -463,6 +472,9 @@ export function withCustomModels(
     metadata[cm.name] = {
       ...declared,
       ...(sameModel && pricing ? { pricing } : {}),
+      // DALTON-HOOK(team-model-catalog): preserve price source metadata only when shadowing the same provider/model_id
+      ...(sameModel && pricingMeta ? { pricing_meta: pricingMeta } : {}),
+      ...(sameModel && notionalPricing ? { notional_pricing: notionalPricing } : {}),
       ...(sameModel && measured ? { task_cost: measured } : {}),
       ...(sameModel && estimate !== undefined ? { task_cost_estimate: estimate } : {}),
       ...('efforts' in ladder ? { reasoning_efforts: ladder.efforts } : {}),

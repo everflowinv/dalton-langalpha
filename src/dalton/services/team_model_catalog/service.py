@@ -16,6 +16,8 @@ import asyncio
 import copy
 import logging
 import math
+import threading
+from collections import OrderedDict
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
@@ -1257,6 +1259,254 @@ def _find_provider_pricing_card(
         if isinstance(aliases, list) and any(norm_id(str(a)) == target for a in aliases if a):
             return dict(card)
     return None
+
+
+_PUBLIC_PRICE_SOURCE_KINDS = frozenset({"official", "estimated", "third_party"})
+
+
+def _extract_public_price_source(raw: Any) -> dict[str, Any]:
+    """Return read-only price source fields (``source_kind``, ``estimated``) only."""
+    if not isinstance(raw, Mapping):
+        return {}
+    out: dict[str, Any] = {}
+    sk = raw.get("source_kind")
+    if isinstance(sk, str) and sk in _PUBLIC_PRICE_SOURCE_KINDS:
+        out["source_kind"] = sk
+    est = raw.get("estimated")
+    if isinstance(est, bool):
+        out["estimated"] = est
+    return out
+
+
+def _find_manifest_card_by_pricing_identity(
+    model_config: Any,
+    pricing_dict: Any,
+) -> Mapping[str, Any] | None:
+    """Locate the manifest card whose ``pricing`` field is the exact object returned by ``find_model_pricing``."""
+    if not isinstance(pricing_dict, Mapping) or not pricing_dict:
+        return None
+    manifest = getattr(model_config, "manifest", None)
+    manifest_models = manifest.get("models") if isinstance(manifest, Mapping) else None
+    if not isinstance(manifest_models, Mapping):
+        return None
+    for cards in manifest_models.values():
+        if not isinstance(cards, list):
+            continue
+        for card in cards:
+            if isinstance(card, Mapping) and card.get("pricing") is pricing_dict:
+                return card
+    return None
+
+
+_PRICE_SOURCE_CACHE_MAXSIZE = 8
+_PRICE_SOURCE_CACHE_LOCK = threading.Lock()
+_PRICE_SOURCE_CACHE: OrderedDict[
+    tuple[Any, ...], dict[str, tuple[str, dict[str, Any]]]
+] = OrderedDict()
+
+
+def clear_price_source_cache() -> None:
+    """Clear the process-local per-revision price-source annotation cache."""
+    with _PRICE_SOURCE_CACHE_LOCK:
+        _PRICE_SOURCE_CACHE.clear()
+
+
+def _compute_price_source_for_entries(
+    entries: Mapping[str, Mapping[str, Any]],
+    *,
+    model_config: Any,
+    dalton_meta_map: dict[str, dict[str, Any]],
+    oauth_sync_enabled: bool,
+    require_entry_pricing_for_cash: bool,
+) -> dict[str, tuple[str, dict[str, Any]]]:
+    """Compute ``{model_key: ("pricing_meta" | "notional_pricing", source_dict)}`` with zero DB queries."""
+    from src.dalton.llm.notional_pricing import (
+        build_notional_price_index_for_catalog,
+        resolve_notional_card,
+    )
+    from src.dalton.services.team_model_catalog.billing import (
+        bind_billing_dalton_meta,
+        resolve_model_billing,
+    )
+    from src.llms.pricing_utils import find_model_pricing
+
+    llm_cfg = getattr(model_config, "llm_config", None)
+    llm_cfg_map = llm_cfg if isinstance(llm_cfg, Mapping) else {}
+    notional_idx: dict[str, dict[str, Any]] | None = None
+    result: dict[str, tuple[str, dict[str, Any]]] = {}
+
+    with bind_billing_dalton_meta(dalton_meta_map):
+        for model_key, entry in entries.items():
+            if not isinstance(entry, Mapping):
+                continue
+
+            cfg_entry = llm_cfg_map.get(model_key)
+            cfg_map = cfg_entry if isinstance(cfg_entry, Mapping) else {}
+            provider = str(entry.get("provider") or cfg_map.get("provider") or "")
+            model_id = str(entry.get("model_id") or cfg_map.get("model_id") or model_key)
+
+            is_sub = (
+                resolve_model_billing(
+                    model_key=model_key,
+                    provider=provider or None,
+                    model_id=model_id,
+                    model_config=model_config,
+                    dalton_meta=dalton_meta_map,
+                )
+                == "subscription"
+            )
+
+            if is_sub:
+                if notional_idx is None:
+                    notional_idx = build_notional_price_index_for_catalog(
+                        model_config=model_config,
+                        dalton_meta=dalton_meta_map,
+                        oauth_sync_enabled=oauth_sync_enabled,
+                        include_source_meta=True,
+                    )
+                notional_card = resolve_notional_card(
+                    model_key,
+                    pricing_model_id=model_id,
+                    pricing_provider=provider or None,
+                    index=notional_idx,
+                    model_config=model_config,
+                )
+                np_out = _extract_public_price_source(notional_card)
+                if np_out:
+                    result[model_key] = ("notional_pricing", np_out)
+                continue
+
+            if require_entry_pricing_for_cash and not (
+                isinstance(entry.get("pricing"), Mapping) and bool(entry.get("pricing"))
+            ):
+                continue
+
+            # Match get_list_rates(...) parameters exactly (no model_key override).
+            pricing_dict = find_model_pricing(
+                model_id,
+                provider or None,
+                _warn_on_miss=False,
+                model_config=model_config,
+            )
+            cash_card = _find_manifest_card_by_pricing_identity(model_config, pricing_dict)
+            pm_out = _extract_public_price_source(
+                cash_card.get("pricing_meta") if isinstance(cash_card, Mapping) else None
+            )
+            if pm_out:
+                result[model_key] = ("pricing_meta", pm_out)
+
+    return result
+
+
+def annotate_model_metadata_price_source(
+    metadata: dict[str, Any],
+    *,
+    model_config: Any,
+    dalton_meta: Mapping[str, Any] | None = None,
+    compiled_catalog: CompiledCatalog | None = None,
+    oauth_sync_enabled: bool | None = None,
+) -> dict[str, Any]:
+    """Attach read-only ``pricing_meta`` / ``notional_pricing`` source fields to ``/api/v1/models``.
+
+    Exposes strictly ``source_kind`` and ``estimated`` (never numeric prices or internal notes):
+    - Billing classification delegates to ``resolve_model_billing`` using the request's
+      ``dalton_meta`` without any DB fallback.
+    - Cash models attach ``pricing_meta`` ONLY when ``metadata[key]`` already displays a cash
+      ``pricing`` dict, calling unmodified ``find_model_pricing`` with the same parameters as
+      ``get_list_rates`` and matching the exact manifest card by object identity
+      (``card.get("pricing") is pricing_dict``).
+    - Subscription models resolve via ``resolve_notional_card(..., model_config=model_config)``
+      on an index built with the same ``oauth_sync_enabled`` flag as ``CompiledCatalog``.
+    - When ``compiled_catalog`` is provided and matches ``model_config``, computed source badges
+      are cached in-process keyed by catalog revision/identity and recomputed on revision change.
+    """
+    if not isinstance(metadata, dict):
+        return metadata
+
+    eff_oauth_sync = (
+        bool(oauth_sync_enabled)
+        if oauth_sync_enabled is not None
+        else (
+            bool(compiled_catalog.oauth_sync_enabled)
+            if compiled_catalog is not None
+            else has_capability(CapabilityId.NATIVE_OAUTH_SYNC)
+        )
+    )
+
+    raw_dalton_meta = (
+        dalton_meta
+        if isinstance(dalton_meta, Mapping)
+        else (compiled_catalog.dalton_meta if compiled_catalog is not None else None)
+    )
+    dalton_meta_map: dict[str, dict[str, Any]] = (
+        {str(k): dict(v) for k, v in raw_dalton_meta.items() if isinstance(v, Mapping)}
+        if isinstance(raw_dalton_meta, Mapping)
+        else {}
+    )
+
+    source_map: dict[str, tuple[str, dict[str, Any]]] | None = None
+    if compiled_catalog is not None and model_config is compiled_catalog.model_config:
+        cache_key = (
+            compiled_catalog.revision,
+            compiled_catalog.payload_sha256,
+            compiled_catalog.overlay_stamp,
+            eff_oauth_sync,
+            compiled_catalog.legacy_retired_fingerprint,
+            compiled_catalog.from_db,
+            id(compiled_catalog.model_config),
+        )
+        with _PRICE_SOURCE_CACHE_LOCK:
+            cached = _PRICE_SOURCE_CACHE.get(cache_key)
+            if cached is not None:
+                _PRICE_SOURCE_CACHE.move_to_end(cache_key)
+                source_map = cached
+        if source_map is None:
+            llm_cfg = getattr(model_config, "llm_config", None)
+            catalog_entries = llm_cfg if isinstance(llm_cfg, Mapping) else metadata
+            computed = _compute_price_source_for_entries(
+                catalog_entries,
+                model_config=model_config,
+                dalton_meta_map=dalton_meta_map,
+                oauth_sync_enabled=eff_oauth_sync,
+                require_entry_pricing_for_cash=False,
+            )
+            with _PRICE_SOURCE_CACHE_LOCK:
+                _PRICE_SOURCE_CACHE[cache_key] = computed
+                _PRICE_SOURCE_CACHE.move_to_end(cache_key)
+                while len(_PRICE_SOURCE_CACHE) > _PRICE_SOURCE_CACHE_MAXSIZE:
+                    _PRICE_SOURCE_CACHE.popitem(last=False)
+            source_map = computed
+    else:
+        source_map = _compute_price_source_for_entries(
+            metadata,
+            model_config=model_config,
+            dalton_meta_map=dalton_meta_map,
+            oauth_sync_enabled=eff_oauth_sync,
+            require_entry_pricing_for_cash=True,
+        )
+
+    out: dict[str, Any] = {}
+    changed = False
+    for model_key, entry in metadata.items():
+        if not isinstance(entry, dict):
+            out[model_key] = entry
+            continue
+        hit = source_map.get(model_key)
+        if hit is None:
+            out[model_key] = entry
+            continue
+        field_name, source_payload = hit
+        if field_name == "pricing_meta" and not (
+            isinstance(entry.get("pricing"), Mapping) and bool(entry.get("pricing"))
+        ):
+            out[model_key] = entry
+            continue
+        updated = dict(entry)
+        updated[field_name] = dict(source_payload)
+        out[model_key] = updated
+        changed = True
+
+    return out if changed else metadata
 
 
 async def update_catalog_model(

@@ -15,6 +15,13 @@ import { costBarFraction, costsRelativeTo, formatCostMultiple, paysPerToken } fr
 import { formatTokenPrice } from '@/lib/format';
 import { useLocale } from '@/hooks/useLocale';
 import { cn } from '@/lib/utils';
+// DALTON-HOOK(team-model-catalog): shared price source badge resolver for API price line in tuning pane
+import { DaltonStatusBadge } from '@/components/dalton/primitives';
+import {
+  priceSourceBadgeTone,
+  priceSourceLabelKey,
+  resolvePriceSourceKind,
+} from '@/pages/Settings/utils/priceSource';
 
 /**
  * The thread's tuning of the current model, as the composer resolves it: the
@@ -136,6 +143,8 @@ export function TuningPane({ tuning, meta, payer, range, disabled = false }: {
   useFocusCheckedRow(menuRef, hasMenu);
   const { reasoningEffort, onFastModeChange } = tuning;
   const price = paysPerToken(payer) ? meta?.pricing : undefined;
+  // DALTON-HOOK(team-model-catalog): resolve price source kind for API price row
+  const priceSourceKind = price ? resolvePriceSourceKind(meta) : null;
 
   const onSpeed = (keys: Selection) => {
     const [key] = keys === 'all' ? [] : [...keys];
@@ -243,7 +252,18 @@ export function TuningPane({ tuning, meta, payer, range, disabled = false }: {
       {showCosts && <span id={noteId} hidden>{t('chat.modelSelector.taskCostNote')}</span>}
       {price && (
         <div className="rule-t flex flex-none flex-col gap-0.5 px-3 py-2 text-xs">
-          <span className="text-(--color-text-tertiary)">{t('chat.modelSelector.apiPrice')}</span>
+          {/* DALTON-HOOK(team-model-catalog): show official / estimated / third-party badge beside API price line */}
+          <div className="flex items-center justify-between gap-1.5">
+            <span className="text-(--color-text-tertiary)">{t('chat.modelSelector.apiPrice')}</span>
+            {priceSourceKind && (
+              <DaltonStatusBadge
+                tone={priceSourceBadgeTone(priceSourceKind)}
+                label={t(priceSourceLabelKey(priceSourceKind))}
+                className="flex-none px-1.5 py-0 text-[10px] leading-4"
+                testId="tuning-pane-price-source"
+              />
+            )}
+          </div>
           <span className="tabular-nums text-(--color-text-secondary)">
             {t('chat.modelSelector.apiPriceValue', { input: formatTokenPrice(price.input, locale), output: formatTokenPrice(price.output, locale) })}
           </span>

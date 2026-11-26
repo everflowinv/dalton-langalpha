@@ -4130,6 +4130,11 @@
         "emptyCap": "请输入工作区单任务上限金额"
       }
     },
+    "priceSource": {
+      "official": "官方",
+      "estimated": "估算",
+      "thirdParty": "第三方"
+    },
     "openclaw": {
       "title": "OpenClaw 模型同步（Dalton Broker）",
       "healthChecking": "检查中...",

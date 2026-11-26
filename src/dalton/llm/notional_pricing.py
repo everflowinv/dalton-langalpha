@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from collections.abc import Mapping
 from typing import Any, Callable
 
 import src.dalton.llm.overlay as _overlay_mod
@@ -61,14 +62,34 @@ def extract_flat_rates_from_card(np: dict[str, Any]) -> dict[str, float]:
     return {"input": in_rate, "output": out_rate, "cached_input": cache_rate}
 
 
-def normalize_notional_card(card: dict[str, Any] | None) -> dict[str, Any] | None:
+_VALID_PRICE_SOURCE_KINDS = frozenset({"official", "estimated", "third_party"})
+
+
+def _copy_source_meta(src: Any, dst: dict[str, Any]) -> None:
+    """Copy valid read-only ``source_kind`` / ``estimated`` fields from ``src`` into ``dst``."""
+    if not isinstance(src, dict):
+        return
+    sk = src.get("source_kind")
+    if isinstance(sk, str) and sk in _VALID_PRICE_SOURCE_KINDS:
+        dst["source_kind"] = sk
+    est = src.get("estimated")
+    if isinstance(est, bool):
+        dst["estimated"] = est
+
+
+def normalize_notional_card(
+    card: dict[str, Any] | None,
+    *,
+    include_source_meta: bool = False,
+) -> dict[str, Any] | None:
     """Normalize a nominal pricing card while preserving tiered/matrix structures.
 
     Flat cards normalize to `{"input": float, "output": float, "cached_input": float}`
     (converting `cache_read` to `cached_input`). Tiered or matrix cards retain their
     full structure (`input_tiers`, `output_tiers`, `tier_matrix`, `input_pricing_mode`,
     `output_pricing_mode`, `unit`, `source`, `verified_at`) so `calculate_total_cost`
-    evaluates exact per-call thresholds.
+    evaluates exact per-call thresholds. When ``include_source_meta=True``, read-only
+    ``source_kind`` and ``estimated`` fields are retained on flat cards too.
     """
     if not isinstance(card, dict) or not card:
         return None
@@ -117,7 +138,10 @@ def normalize_notional_card(card: dict[str, Any] | None) -> dict[str, Any] | Non
         else card.get("cache_read", 0.0)
     )
     cache_f = float(cache_val or 0.0)
-    return {"input": in_f, "output": out_f, "cached_input": cache_f}
+    out: dict[str, Any] = {"input": in_f, "output": out_f, "cached_input": cache_f}
+    if include_source_meta:
+        _copy_source_meta(card, out)
+    return out
 
 
 def notional_pair_key(provider: str | None, model_id: str | None) -> str:
@@ -156,6 +180,8 @@ def _canonical_card_signature(card: dict[str, Any] | None) -> str:
 def _lookup_pricing_in_model_config(
     model_config: Any,
     ref_id: str,
+    *,
+    include_source_meta: bool = False,
 ) -> dict[str, Any] | None:
     """Resolve a pricing card for ``ref_id`` directly from ``model_config`` without re-entering ``LLM.get_model_config()``."""
     llm_cfg = getattr(model_config, "llm_config", None) or {}
@@ -181,6 +207,13 @@ def _lookup_pricing_in_model_config(
                     ref_pricing_id = ref_id.strip()
                     break
 
+    def _return_pricing(card: dict[str, Any], pricing: dict[str, Any]) -> dict[str, Any]:
+        if not include_source_meta:
+            return pricing
+        enriched = dict(pricing)
+        _copy_source_meta(card.get("pricing_meta"), enriched)
+        return enriched
+
     def _search_cards(cards: Any, target: str) -> dict[str, Any] | None:
         if not isinstance(cards, list):
             return None
@@ -193,7 +226,7 @@ def _lookup_pricing_in_model_config(
             if cid.lower() == t_low or cid.lower().replace(".", "-") == t_norm:
                 pricing = card.get("pricing")
                 if isinstance(pricing, dict):
-                    return pricing
+                    return _return_pricing(card, pricing)
         for card in cards:
             if not isinstance(card, dict):
                 continue
@@ -204,7 +237,7 @@ def _lookup_pricing_in_model_config(
                     if al == t_low or al.replace(".", "-") == t_norm:
                         pricing = card.get("pricing")
                         if isinstance(pricing, dict):
-                            return pricing
+                            return _return_pricing(card, pricing)
         return None
 
     candidate_ids = [ref_pricing_id] if ref_pricing_id == ref_id else [ref_pricing_id, ref_id]
@@ -235,17 +268,20 @@ def _resolve_meta_entry_notional_card(
     *,
     resolved_so_far: dict[str, dict[str, Any]],
     model_config: Any = None,
+    include_source_meta: bool = False,
 ) -> dict[str, Any] | None:
     np = meta_entry.get("notional_pricing")
     if isinstance(np, dict):
-        return normalize_notional_card(np)
+        return normalize_notional_card(np, include_source_meta=include_source_meta)
     if meta_entry.get("notional_ref"):
         ref_id = str(meta_entry["notional_ref"])
         if ref_id in resolved_so_far:
             return copy.deepcopy(resolved_so_far[ref_id])
         raw_card: dict[str, Any] | None = None
         if model_config is not None:
-            raw_card = _lookup_pricing_in_model_config(model_config, ref_id)
+            raw_card = _lookup_pricing_in_model_config(
+                model_config, ref_id, include_source_meta=include_source_meta
+            )
         else:
             from src.llms.pricing_utils import find_model_pricing, resolve_pricing_identity
 
@@ -254,7 +290,7 @@ def _resolve_meta_entry_notional_card(
             if raw_card is None and ref_pricing_id != ref_id:
                 raw_card = find_model_pricing(ref_id)
         if isinstance(raw_card, dict):
-            return normalize_notional_card(raw_card)
+            return normalize_notional_card(raw_card, include_source_meta=include_source_meta)
     return None
 
 
@@ -340,6 +376,7 @@ def build_notional_price_index_for_catalog(
     model_config: Any,
     dalton_meta: dict[str, dict[str, Any]],
     oauth_sync_enabled: bool = True,
+    include_source_meta: bool = False,
 ) -> dict[str, dict[str, Any]]:
     """Build notional price index keyed primarily by ``(provider.lower(), norm_id(model_id))``
     plus exact ``model_key`` secondary keys and unambiguous bare ``model_id`` keys (§2.2 #1)."""
@@ -362,7 +399,11 @@ def build_notional_price_index_for_catalog(
         if not isinstance(meta_entry, dict):
             continue
         card = _resolve_meta_entry_notional_card(
-            str(key), meta_entry, resolved_so_far=out, model_config=model_config
+            str(key),
+            meta_entry,
+            resolved_so_far=out,
+            model_config=model_config,
+            include_source_meta=include_source_meta,
         )
         if card is None:
             continue
@@ -502,6 +543,31 @@ def is_subscription_model(
     )
 
 
+def _resolve_byok_pricing_identity_from_config(
+    model_config: Any,
+    model_name: str,
+) -> tuple[str | None, str]:
+    """Resolve ``(provider, pricing_id)`` for ``billing_type="byok"`` strictly from ``model_config``."""
+    config_data = getattr(model_config, "llm_config", None)
+    if not isinstance(config_data, Mapping) or not config_data:
+        return None, model_name
+    model_name_lower = model_name.lower()
+    for custom_name, cfg in config_data.items():
+        if not isinstance(cfg, Mapping):
+            continue
+        if str(custom_name).lower() == model_name_lower:
+            provider = cfg.get("provider")
+            pricing_id = cfg.get("model_id") or model_name
+            return (str(provider) if provider is not None else None), str(pricing_id)
+    for cfg in config_data.values():
+        if not isinstance(cfg, Mapping):
+            continue
+        if str(cfg.get("model_id") or "").lower() == model_name_lower:
+            provider = cfg.get("provider")
+            return (str(provider) if provider is not None else None), model_name
+    return None, model_name
+
+
 def resolve_notional_card(
     model_name: str,
     *,
@@ -509,6 +575,7 @@ def resolve_notional_card(
     pricing_provider: str | None = None,
     index: dict[str, dict[str, Any]] | None = None,
     overlay_loader: Callable[..., dict[str, Any]] | None = None,
+    model_config: Any = None,
 ) -> dict[str, Any] | None:
     """Resolve the normalized nominal pricing card by ``(provider, norm_id(model_id))`` or ``model_key``.
 
@@ -533,14 +600,20 @@ def resolve_notional_card(
             return copy.deepcopy(idx[pkey])
         if model_name and model_name in idx:
             return copy.deepcopy(idx[model_name])
-        from src.llms.pricing_utils import resolve_pricing_identity
 
         want_prov = pricing_provider.strip().lower()
         want_norm = pricing_model_id.strip().lower().replace(".", "-")
         for candidate, card in idx.items():
             if "\0" in candidate:
                 continue
-            c_prov, c_id = resolve_pricing_identity(candidate, billing_type="byok")
+            if model_config is not None:
+                c_prov, c_id = _resolve_byok_pricing_identity_from_config(
+                    model_config, candidate
+                )
+            else:
+                from src.llms.pricing_utils import resolve_pricing_identity
+
+                c_prov, c_id = resolve_pricing_identity(candidate, billing_type="byok")
             if (
                 c_prov
                 and c_prov.strip().lower() == want_prov

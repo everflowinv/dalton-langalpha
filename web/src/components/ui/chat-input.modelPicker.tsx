@@ -42,6 +42,14 @@ import { catalogCostRange, costMarks, formatCostMultiple, type CostMarks } from 
 import { effortLabelFor, modelHasTuning } from '@/lib/modelTuning';
 import { useLocale } from '@/hooks/useLocale';
 import { useIsMobile } from '@/hooks/useIsMobile'; // DALTON-HOOK(mobile-web)
+// DALTON-HOOK(team-model-catalog): shared price source badge resolver for model picker rows
+import { DaltonStatusBadge } from '@/components/dalton/primitives';
+import {
+  priceSourceBadgeTone,
+  priceSourceLabelKey,
+  resolvePriceSourceKind,
+  type PriceSourceKind,
+} from '@/pages/Settings/utils/priceSource';
 
 export const FAVORITES_TAB = '__favorites__';
 
@@ -490,6 +498,8 @@ function ModelList({
       marks={marksOf(r.rawModel)}
       costColumn={showCosts}
       costLabel={costLabel}
+      // DALTON-HOOK(team-model-catalog): surface official / estimated / third-party price source badge
+      priceSourceKind={resolvePriceSourceKind(metadata?.[r.rawModel])}
       onToggleFavorite={() => toggleFav(r)}
     />
   );
@@ -763,7 +773,8 @@ function useCostMarksLabel(baseline: TaskCostBaseline | null | undefined, metada
 }
 
 // DALTON-HOOK(antigravity-series): render pre-resolved series or model display name on row
-function ModelRow({ model, displayName, provider, rowRef, payer, selected, favorite, status, marks, costColumn = false, costLabel, onToggleFavorite }: {
+// DALTON-HOOK(team-model-catalog): render optional price source badge beside row cost marks
+function ModelRow({ model, displayName, provider, rowRef, payer, selected, favorite, status, marks, costColumn = false, costLabel, priceSourceKind = null, onToggleFavorite }: {
   model: string;
   displayName: string;
   provider?: string;
@@ -777,6 +788,7 @@ function ModelRow({ model, displayName, provider, rowRef, payer, selected, favor
    *  star stays in the column. */
   costColumn?: boolean;
   costLabel: (marks: CostMarks) => string;
+  priceSourceKind?: PriceSourceKind | null;
   onToggleFavorite: () => void;
 }) {
   const { t } = useTranslation();
@@ -842,6 +854,15 @@ function ModelRow({ model, displayName, provider, rowRef, payer, selected, favor
               <Star aria-hidden className="h-3.5 w-3.5" fill={favorite ? 'currentColor' : 'none'} />
             </Button>
           </span>
+          {/* DALTON-HOOK(team-model-catalog): render price source badge beside row cost marks when source metadata exists */}
+          {priceSourceKind && (
+            <DaltonStatusBadge
+              tone={priceSourceBadgeTone(priceSourceKind)}
+              label={t(priceSourceLabelKey(priceSourceKind))}
+              className="flex-none px-1.5 py-0 text-[10px] leading-4"
+              testId={`model-picker-price-source-${model}`}
+            />
+          )}
           {/* Last, against the row's edge, under their heading. */}
           {marks && cost ? (
             <Tooltip>

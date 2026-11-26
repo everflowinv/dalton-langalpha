@@ -9,12 +9,28 @@ and budget accounting (`src/dalton/budget/service.py`) always agree.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Literal
 
 from src.dalton.services.team_model_catalog.constants import norm_id
 
 BillingKind = Literal["subscription", "cash"]
+
+_SCOPED_DALTON_META: ContextVar[Mapping[str, Any] | None] = ContextVar(
+    "_SCOPED_DALTON_META", default=None
+)
+
+
+@contextmanager
+def bind_billing_dalton_meta(dalton_meta: Mapping[str, Any] | None) -> Iterator[None]:
+    """Bind an already-loaded ``dalton_meta`` map for nested billing lookups (no DB fallback)."""
+    token = _SCOPED_DALTON_META.set(dalton_meta)
+    try:
+        yield
+    finally:
+        _SCOPED_DALTON_META.reset(token)
 
 
 def _is_oauth_name(name: str | None) -> bool:
@@ -197,12 +213,18 @@ def resolve_model_billing(
     if isinstance(dalton_meta, Mapping):
         meta_map = dalton_meta
     else:
-        try:
-            from src.dalton.llm.overlay import load_dalton_meta
+        # The price-source annotation binds its already-loaded map; every other caller keeps the
+        # original load_dalton_meta() path unchanged.
+        scoped_meta = _SCOPED_DALTON_META.get()
+        if isinstance(scoped_meta, Mapping):
+            meta_map = scoped_meta
+        else:
+            try:
+                from src.dalton.llm.overlay import load_dalton_meta
 
-            meta_map = load_dalton_meta() or {}
-        except Exception:
-            meta_map = {}
+                meta_map = load_dalton_meta() or {}
+            except Exception:
+                meta_map = {}
 
     # 1) When the caller's own model_key matched a catalog entry on this route, decide strictly
     # from that key's own dalton_meta (never letting another key on the same (provider, model_id)

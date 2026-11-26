@@ -33,10 +33,14 @@ import { formatTimestamp } from '@/lib/format';
 import { cn } from '@/lib/utils';
 import type {
   TeamCatalogModelItem,
-  TeamCatalogPriceSourceKind,
   TeamCatalogProviderVariant,
   TeamCatalogRetiredItem,
 } from '@/pages/Settings/utils/daltonApi';
+import {
+  priceSourceBadgeTone,
+  priceSourceLabelKey,
+  resolvePriceSourceKind,
+} from '@/pages/Settings/utils/priceSource';
 import { TeamModelEditSheet, type ProviderOptionItem, type TeamModelEditMode } from './TeamModelEditSheet';
 import { TeamModelHistoryDialog } from './TeamModelHistoryDialog';
 import { TeamModelLegacyImportDialog } from './TeamModelLegacyImportDialog';
@@ -69,17 +73,6 @@ function formatContextWindow(ctx: number | null): string {
 function formatPriceRate(value: number | null | undefined): string {
   if (typeof value !== 'number' || !Number.isFinite(value)) return '-';
   return `$${value}`;
-}
-
-function resolvePriceSourceKind(model: TeamCatalogModelItem): TeamCatalogPriceSourceKind | null {
-  const isSub = model.dalton_meta?.billing === 'subscription';
-  const meta = isSub ? model.dalton_meta?.notional_pricing : model.pricing_meta;
-  if (!meta) return null;
-  if (meta.estimated) return 'estimated';
-  if (meta.source_kind === 'official' || meta.source_kind === 'estimated' || meta.source_kind === 'third_party') {
-    return meta.source_kind;
-  }
-  return null;
 }
 
 /**
@@ -330,14 +323,7 @@ export function TeamModelCatalogCard() {
   const renderPriceBadge = (model: TeamCatalogModelItem) => {
     const kind = resolvePriceSourceKind(model);
     if (!kind) return null;
-    const tone = kind === 'official' ? 'success' : kind === 'estimated' ? 'warning' : 'accent';
-    const label =
-      kind === 'official'
-        ? t('settings:dalton.teamCatalog.priceSourceOfficial')
-        : kind === 'estimated'
-          ? t('settings:dalton.teamCatalog.priceSourceEstimated')
-          : t('settings:dalton.teamCatalog.priceSourceThirdParty');
-    return <DaltonStatusBadge tone={tone} label={label} />;
+    return <DaltonStatusBadge tone={priceSourceBadgeTone(kind)} label={t(priceSourceLabelKey(kind))} />;
   };
 
   const renderPricingText = (model: TeamCatalogModelItem) => {

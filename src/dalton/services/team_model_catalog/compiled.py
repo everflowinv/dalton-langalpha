@@ -713,6 +713,12 @@ def invalidate_compiled_catalog_cache() -> None:
         key_candidates.cache_clear()
     except Exception:
         pass
+    try:
+        from src.dalton.services.team_model_catalog.service import clear_price_source_cache
+
+        clear_price_source_cache()
+    except Exception:
+        pass
 
 
 def reset_catalog_caches_for_tests() -> None:
