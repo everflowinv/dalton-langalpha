@@ -1154,10 +1154,21 @@ async def _latest_run_dir(
     return best_dir
 
 
-async def _load_run_args(
+def _parse_run_dir_identity(run_dir: str | None) -> tuple[str | None, str | None]:
+    """Extract ``(short_thread_id, run_id)`` from ``.agents/threads/<short>/workflows/<run_id>``."""
+    if not isinstance(run_dir, str) or not run_dir:
+        return None, None
+    parts = [p for p in run_dir.strip("/").split("/") if p]
+    for i, part in enumerate(parts):
+        if part == "threads" and i + 3 < len(parts) and parts[i + 2] == "workflows":
+            return parts[i + 1], parts[i + 3]
+    return None, None
+
+
+async def _load_run_args_with_dir(
     backend: Any, workflow: str, run_id: str | None, thread_id: str | None
-) -> dict[str, Any] | None:
-    """Read the server-written ``args.json`` snapshot for this run, or None when unavailable."""
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Read the server-written ``args.json`` snapshot and its resolved run dir."""
     dirs: list[str]
     if run_id:
         if thread_id:
@@ -1167,11 +1178,11 @@ async def _load_run_args(
             dirs = [m.rsplit("/args.json", 1)[0] for m in (matches or [])]
     else:
         if not thread_id:
-            return None
+            return None, None
         try:
             latest = await _latest_run_dir(backend, workflow, thread_id)
         except _CannotVerify:
-            return None
+            return None, None
         dirs = [latest] if latest else []
     for run_dir in dirs:
         text = await _read_text(backend, f"{run_dir}/args.json")
@@ -1182,8 +1193,16 @@ async def _load_run_args(
         except ValueError:
             continue
         if isinstance(doc, dict):
-            return doc
-    return None
+            return doc, run_dir
+    return None, None
+
+
+async def _load_run_args(
+    backend: Any, workflow: str, run_id: str | None, thread_id: str | None
+) -> dict[str, Any] | None:
+    """Read the server-written ``args.json`` snapshot for this run, or None when unavailable."""
+    doc, _ = await _load_run_args_with_dir(backend, workflow, run_id, thread_id)
+    return doc
 
 
 async def _run_args_as_of(
@@ -1209,27 +1228,35 @@ async def _run_args_as_of(
 def _apply_run_internal_memory_decision(
     contract: dict[str, Any],
     run_args: dict[str, Any] | None,
+    *,
+    run_dir: str | None = None,
+    run_id: str | None = None,
+    thread_id: str | None = None,
 ) -> dict[str, Any]:
-    """Align `topic-research` contract with the server-recorded launch decision in `args.json`."""
+    """Align `topic-research` contract ONLY with a verified server-signed launch decision.
+
+    Never trusts unsigned or tampered `args.json` fields, never honors a skip when
+    legacy `researchdata_bridge` is enabled, and binds verification to the resolved
+    `(short_thread_id, run_id)` so a skip snapshot from another run cannot be replayed.
+    """
     if contract.get("name") != "topic-research" or not isinstance(run_args, dict):
         return contract
-    skip_internal = False
-    decision = run_args.get("internal_memory_decision")
-    if isinstance(decision, dict) and isinstance(decision.get("run"), bool):
-        skip_internal = not decision["run"]
-    else:
-        from src.dalton.capabilities import CapabilityId, effective_capabilities
-        from src.dalton.content_assembly import decide_topic_research_internal_memory
+    from src.dalton.capabilities import CapabilityId, effective_capabilities
+    from src.dalton.content_assembly import verify_topic_research_internal_memory_decision
 
-        active_caps = effective_capabilities()
-        discovered = run_args.get("discovered_mcp_servers")
-        if (
-            CapabilityId.RESEARCHDATA_BRIDGE not in active_caps
-            and isinstance(discovered, dict)
-        ):
-            inferred = decide_topic_research_internal_memory(discovered, active_caps)
-            skip_internal = not inferred["run"]
-    if not skip_internal:
+    active_caps = effective_capabilities()
+    if CapabilityId.RESEARCHDATA_BRIDGE in active_caps:
+        return contract
+
+    dir_thread, dir_run = _parse_run_dir_identity(run_dir)
+    expected_thread = dir_thread or (str(thread_id)[:8] if thread_id else None)
+    expected_run = dir_run or (str(run_id) if run_id else None)
+    verified = verify_topic_research_internal_memory_decision(
+        run_args.get("internal_memory_decision"),
+        short_thread_id=expected_thread,
+        run_id=expected_run,
+    )
+    if verified is None or verified["run"] is not False:
         return contract
 
     pruned = dict(contract)
@@ -3850,15 +3877,22 @@ async def run_check_done(
 
     try:
         contract = load_contract(workflow)
-        run_args = (
-            await _load_run_args(backend, workflow, run_id, thread_id)
+        run_args, resolved_run_dir = (
+            await _load_run_args_with_dir(backend, workflow, run_id, thread_id)
             if backend is not None
-            else None
+            else (None, None)
         )
-        # Honor the same server-recorded internal-memory decision written to
-        # `args.json` at workflow launch, so skipping internal-memory retrieval
-        # when no workspace connector was discovered does not fail check_done.
-        contract = _apply_run_internal_memory_decision(contract, run_args)
+        # Honor ONLY a verified server-signed internal-memory decision bound to
+        # this run's `(short_thread_id, run_id)` in `args.json`, so skipping
+        # internal-memory retrieval when no workspace connector was discovered
+        # passes check_done while forged/tampered decisions are rejected.
+        contract = _apply_run_internal_memory_decision(
+            contract,
+            run_args,
+            run_dir=resolved_run_dir,
+            run_id=run_id,
+            thread_id=thread_id,
+        )
         # The launch path resolves ``as_of`` to a concrete trading day before
         # the script runs; the closing check inherits that effective date from
         # the run's own ``args.json`` so the caller's original params (which

@@ -4201,3 +4201,141 @@ acquire_publish_lock
     assert len(backups) == 1, f"Expected 1 published backup after empty-PID lock recovery, got {backups}"
 
 
+def test_backup_publish_lock_concurrent_empty_pid_recovery_is_mutually_exclusive(
+    tmp_path: Path,
+) -> None:
+    """R3 item 4: Concurrent processes racing to recover the same empty-PID stale publish lock
+    serialize strictly through the per-output-dir OS flock (fcntl.flock), so no latecomer can
+    delete a live winner's newly created lock or enter publish/prune concurrently."""
+    import time
+
+    # 1. Direct concurrency stress on acquire_publish_lock / release_publish_lock with 4 racing workers
+    race_dir = tmp_path / "race_out"
+    race_dir.mkdir(parents=True)
+    stale_lock = race_dir / ".dalton-backup.lock"
+    stale_lock.mkdir()
+    (stale_lock / "pid").write_text("", encoding="utf-8")  # 0-byte empty PID file
+
+    barrier = tmp_path / "go.barrier"
+    event_log = tmp_path / "events.log"
+    backup_src = (_REPO_ROOT / "scripts" / "standalone" / "backup.sh").read_text(encoding="utf-8")
+    fn_start = backup_src.index("pid_is_alive() {")
+    fn_end = backup_src.index("cleanup() {")
+    lock_funcs = backup_src[fn_start:fn_end]
+
+    worker_script = tmp_path / "lock_worker.sh"
+    worker_script.write_text(
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+WORKER_ID="$1"
+BARRIER="$2"
+EVENT_LOG="$3"
+err() {{ echo "ERR[$WORKER_ID]: $*" >&2; }}
+warn() {{ echo "WARN[$WORKER_ID]: $*" >&2; }}
+LOCK_DIR={str(stale_lock)!r}
+LOCK_HELD=0
+export DALTON_PUBLISH_LOCK_MISSING_PID_GRACE_S=1
+export DALTON_PUBLISH_LOCK_WAIT_S=30
+{lock_funcs}
+trap release_publish_lock EXIT
+while [[ ! -f "$BARRIER" ]]; do
+  sleep 0.01
+done
+acquire_publish_lock
+printf 'ENTER %s\\n' "$WORKER_ID" >> "$EVENT_LOG"
+[[ "$(tr -d '[:space:]' < "${{LOCK_DIR}}/pid")" == "$$" ]] || {{ echo "PID_MISMATCH_ENTER:$WORKER_ID" >&2; exit 21; }}
+sleep 0.25
+[[ -f "${{LOCK_DIR}}/pid" && "$(tr -d '[:space:]' < "${{LOCK_DIR}}/pid")" == "$$" ]] || {{ echo "LOCK_STOLEN:$WORKER_ID" >&2; exit 22; }}
+printf 'EXIT %s\\n' "$WORKER_ID" >> "$EVENT_LOG"
+release_publish_lock
+""",
+        encoding="utf-8",
+    )
+
+    procs = [
+        subprocess.Popen(
+            ["bash", str(worker_script), f"w{i}", str(barrier), str(event_log)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for i in range(4)
+    ]
+    time.sleep(0.15)
+    barrier.write_text("GO\n", encoding="utf-8")
+
+    outputs: list[tuple[int, str, str]] = []
+    for p in procs:
+        out, err = p.communicate(timeout=25)
+        outputs.append((p.returncode, out, err))
+    for idx, (rc, out, err) in enumerate(outputs):
+        assert rc == 0, f"Worker w{idx} failed (rc={rc}): stdout={out!r} stderr={err!r}"
+
+    lines = [ln.strip() for ln in event_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == 8, f"Expected 8 ENTER/EXIT events from 4 workers, got {lines}"
+    active: set[str] = set()
+    max_active = 0
+    for ln in lines:
+        verb, wid = ln.split()
+        if verb == "ENTER":
+            active.add(wid)
+            max_active = max(max_active, len(active))
+        elif verb == "EXIT":
+            assert wid in active, f"EXIT without matching ENTER: {lines}"
+            active.remove(wid)
+    assert max_active == 1, f"Mutual exclusion violated (max concurrent holders={max_active}): {lines}"
+    assert not active
+    assert not stale_lock.exists(), "Stale/active LOCK_DIR must be removed after all workers release"
+    _assert_flock_reacquirable(
+        race_dir / ".dalton-backup.lock.flock",
+        label="after 4-worker concurrent empty-PID publish lock recovery",
+    )
+
+    # 2. End-to-end: 2 concurrent backup.sh invocations (two instances sharing the same output dir)
+    #    racing to recover an orphan empty-PID `.dalton-backup.lock` during publish + prune
+    fx1 = _build_r11_backup_fixture(tmp_path / "r3_concurrent_e2e_1", project_name="dalton_r3_conc_a")
+    fx2 = _build_r11_backup_fixture(tmp_path / "r3_concurrent_e2e_2", project_name="dalton_r3_conc_b")
+    fx1["clock_file"].write_text("16000.0", encoding="utf-8")
+    fx2["clock_file"].write_text("16000.0", encoding="utf-8")
+    out_e2e = tmp_path / "r3_concurrent_e2e_out"
+    stale_e2e = out_e2e / ".dalton-backup.lock"
+    stale_e2e.mkdir(parents=True, exist_ok=True)
+    (stale_e2e / "pid").write_text("", encoding="utf-8")
+
+    p1 = subprocess.Popen(
+        ["bash", str(fx1["backup_script"]), "--work-dir", str(fx1["work_dir"]), "--output-dir", str(out_e2e), "--retain", "5"],
+        env={
+            **fx1["env"],
+            "DALTON_WIKI_BACKUP_LOCK_FILE": str(tmp_path / "r3_concurrent_e2e_1" / "wiki1.flock"),
+            "DALTON_WIKI_PAUSE_TTL_S": "300",
+            "DALTON_WIKI_PAUSE_HEARTBEAT_S": "60",
+            "DALTON_PUBLISH_LOCK_MISSING_PID_GRACE_S": "1",
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    p2 = subprocess.Popen(
+        ["bash", str(fx2["backup_script"]), "--work-dir", str(fx2["work_dir"]), "--output-dir", str(out_e2e), "--retain", "5"],
+        env={
+            **fx2["env"],
+            "DALTON_WIKI_BACKUP_LOCK_FILE": str(tmp_path / "r3_concurrent_e2e_2" / "wiki2.flock"),
+            "DALTON_WIKI_PAUSE_TTL_S": "300",
+            "DALTON_WIKI_PAUSE_HEARTBEAT_S": "60",
+            "DALTON_PUBLISH_LOCK_MISSING_PID_GRACE_S": "1",
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    out1, err1 = p1.communicate(timeout=30)
+    out2, err2 = p2.communicate(timeout=30)
+    assert p1.returncode == 0, f"Concurrent backup #1 failed: {err1}"
+    assert p2.returncode == 0, f"Concurrent backup #2 failed: {err2}"
+    published = sorted(p for p in out_e2e.iterdir() if p.is_dir() and p.name.startswith("dalton-backup-"))
+    assert len(published) == 2, f"Expected 2 distinct published backups, got {published}"
+    assert not stale_e2e.exists()
+    _assert_flock_reacquirable(
+        out_e2e / ".dalton-backup.lock.flock",
+        label="after 2 concurrent end-to-end backups",
+    )

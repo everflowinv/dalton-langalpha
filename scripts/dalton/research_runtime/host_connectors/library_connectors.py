@@ -452,16 +452,31 @@ class MarketDigestPartitionStore:
         """Fuse semantic and keyword document ranks via RRF (k=60) so neither arm buries the other."""
         rrf_k = 60.0
         fused: dict[str, dict[str, Any]] = {}
-        sem_ranked = [
-            it
-            for it in semantic_results
-            if isinstance(it, dict) and it.get("score") is not None
-        ]
-        kw_ranked = [
-            it
-            for it in keyword_results
-            if isinstance(it, dict) and int(it.get("keyword_hits") or 0) > 0
-        ]
+        sem_ranked = sorted(
+            (
+                it
+                for it in semantic_results
+                if isinstance(it, dict) and it.get("score") is not None
+            ),
+            key=lambda x: (
+                float(x["score"]),
+                int(x.get("keyword_hits") or 0),
+                str(x.get("date") or ""),
+            ),
+            reverse=True,
+        )
+        kw_ranked = sorted(
+            (
+                it
+                for it in keyword_results
+                if isinstance(it, dict) and int(it.get("keyword_hits") or 0) > 0
+            ),
+            key=lambda x: (
+                int(x.get("keyword_hits") or 0),
+                str(x.get("date") or ""),
+            ),
+            reverse=True,
+        )
 
         def _doc_key(item: dict[str, Any]) -> str:
             return str(item.get("document_id") or item.get("canonical_id") or id(item))
@@ -695,13 +710,44 @@ class MarketDigestPartitionStore:
 
         chunk_texts = [str(r[1] or "") for r in missing_rows]
         blobs, embed_err = self._embed_texts(chunk_texts)
-        if embed_err is not None or len(blobs) != len(missing_rows) or any(b is None for b in blobs):
+        valid_pairs: list[tuple[int, bytes]] = []
+        for idx, (row_id, _) in enumerate(missing_rows):
+            if idx < len(blobs) and blobs[idx] is not None:
+                valid_pairs.append((int(row_id), blobs[idx]))
+        if embed_err is not None or len(valid_pairs) != len(missing_rows):
             still_pending = {
                 **receipt_prior,
                 "embedding_indexed": False,
                 "embedding_pending": True,
                 **({"embedding_error": embed_err} if embed_err else {}),
             }
+            if (
+                valid_pairs
+                or receipt_prior.get("embedding_pending") is not True
+                or receipt_prior.get("embedding_indexed") is not False
+            ):
+                conn = sqlite3.connect(self.mail_db, timeout=20, isolation_level=None)
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    for row_id, blob in valid_pairs:
+                        conn.execute(
+                            "UPDATE email_chunks SET embedding = ? WHERE id = ?",
+                            (blob, row_id),
+                        )
+                    conn.execute(
+                        "UPDATE sales_ingest_receipts SET receipt_json = ? WHERE doc_key = ?",
+                        (json.dumps(still_pending, ensure_ascii=False), doc_key),
+                    )
+                    conn.execute("COMMIT")
+                except BaseException:
+                    try:
+                        if conn.in_transaction:
+                            conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                finally:
+                    conn.close()
             return still_pending, False
 
         updated = {
@@ -843,9 +889,11 @@ class MarketDigestPartitionStore:
                 if db_pair is not None:
                     manifest_entry, receipt_prior = db_pair
                     prior_doc_key = str(manifest_entry.get("doc_key") or doc_key)
-                    backfilled = False
-                    if receipt_prior.get("embedding_pending") or receipt_prior.get("embedding_indexed") is False:
-                        receipt_prior, backfilled = self._backfill_missing_embeddings(prior_doc_key, receipt_prior)
+                    receipt_prior, backfilled = self._backfill_missing_embeddings(
+                        prior_doc_key,
+                        receipt_prior,
+                    )
+                    still_pending = bool(receipt_prior.get("embedding_pending"))
                     if prior_doc_key not in manifest:
                         sales_notes_store_mod.append_manifest(self.data_root, manifest_entry)
                     if audit_prior is None or backfilled:
@@ -855,6 +903,7 @@ class MarketDigestPartitionStore:
                         "ok": True,
                         "status": "ingested",
                         "idempotent_replay": True,
+                        **({"retryable": True} if still_pending else {}),
                         **({"embedding_backfilled": True} if backfilled else {}),
                     }
                 if audit_prior is not None and audit_prior.get("status") in ("ingested", "done"):
@@ -865,10 +914,12 @@ class MarketDigestPartitionStore:
                     manifest_entry, receipt_prior = db_doc_pair
                     need_manifest = manifest_entry.get("doc_key") not in manifest
                     need_audit = self._find_audit_by_doc_key(doc_key) is None
-                    backfilled = False
-                    if receipt_prior.get("embedding_pending") or receipt_prior.get("embedding_indexed") is False:
-                        receipt_prior, backfilled = self._backfill_missing_embeddings(doc_key, receipt_prior)
-                    if need_manifest or need_audit or backfilled:
+                    receipt_prior, backfilled = self._backfill_missing_embeddings(
+                        doc_key,
+                        receipt_prior,
+                    )
+                    still_pending = bool(receipt_prior.get("embedding_pending"))
+                    if need_manifest or need_audit or backfilled or still_pending:
                         if need_manifest:
                             sales_notes_store_mod.append_manifest(self.data_root, manifest_entry)
                         if need_audit or backfilled:
@@ -878,6 +929,7 @@ class MarketDigestPartitionStore:
                             "ok": True,
                             "status": "ingested",
                             "idempotent_replay": True,
+                            **({"retryable": True} if still_pending else {}),
                             **({"embedding_backfilled": True} if backfilled else {}),
                         }
 

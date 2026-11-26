@@ -400,7 +400,12 @@ STAGE_DIR="$(mktemp -d "${OUTPUT_DIR}/.staging-${BACKUP_NAME}.XXXXXX")"
 chmod 700 "$STAGE_DIR"
 
 LOCK_DIR="${OUTPUT_DIR}/.dalton-backup.lock"
+PUBLISH_LOCK_FILE="${DALTON_PUBLISH_LOCK_FILE:-${OUTPUT_DIR}/.dalton-backup.lock.flock}"
 LOCK_HELD=0
+PUBLISH_LOCK_HELD=0
+PUBLISH_LOCK_FD_OPEN=0
+PUBLISH_LOCK_HELPER_PID=""
+PUBLISH_LOCK_TMP_DIR=""
 WIKI_INSTANCE_HASH="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(sys.argv[1].encode()).hexdigest()[:12])' "${WORK_DIR}|${PROJECT_NAME}")"
 WIKI_LOCK_FILE="${DALTON_WIKI_BACKUP_LOCK_FILE:-/tmp/dalton-wiki-backup-${PROJECT_NAME}-${WIKI_INSTANCE_HASH}.flock}"
 WIKI_LOCK_HELD=0
@@ -1190,6 +1195,186 @@ acquire_publish_lock() {
   if [[ ! "$missing_pid_grace" =~ ^[1-9][0-9]*$ ]]; then
     missing_pid_grace=5
   fi
+  local max_wait="${DALTON_PUBLISH_LOCK_WAIT_S:-60}"
+  if [[ ! "$max_wait" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    max_wait=60
+  fi
+  local flock_path="${PUBLISH_LOCK_FILE:-${LOCK_DIR}.flock}"
+  PUBLISH_LOCK_HELD="${PUBLISH_LOCK_HELD:-0}"
+  PUBLISH_LOCK_FD_OPEN="${PUBLISH_LOCK_FD_OPEN:-0}"
+  PUBLISH_LOCK_HELPER_PID="${PUBLISH_LOCK_HELPER_PID:-}"
+  PUBLISH_LOCK_TMP_DIR="${PUBLISH_LOCK_TMP_DIR:-}"
+
+  # Acquire an OS-level exclusive advisory lock (fcntl.flock, portable across Linux & macOS)
+  # per output directory before inspecting or modifying LOCK_DIR, covering both publish and prune.
+  # Kernel releases the lock automatically on crash/exit, eliminating empty-PID stale-lock races.
+  PUBLISH_LOCK_TMP_DIR="$(mktemp -d)"
+  local ctl_fifo="${PUBLISH_LOCK_TMP_DIR}/ctl.fifo"
+  local status_file="${PUBLISH_LOCK_TMP_DIR}/status"
+  local err_file="${PUBLISH_LOCK_TMP_DIR}/err"
+  mkfifo "$ctl_fifo"
+  local pub_lock_py
+  pub_lock_py='
+import fcntl, os, select, sys, time
+
+try:
+    os.setsid()
+except OSError:
+    pass
+
+lock_path = sys.argv[1]
+max_wait_s = float(sys.argv[2])
+status_file = sys.argv[3]
+parent_pid = int(sys.argv[4])
+
+def write_status(msg: str) -> None:
+    tmp = f"{status_file}.tmp.{os.getpid()}"
+    with open(tmp, "w", encoding="utf-8") as sf:
+        sf.write(msg + "\n")
+        sf.flush()
+    os.replace(tmp, status_file)
+
+def parent_alive() -> bool:
+    try:
+        os.kill(parent_pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+fd = -1
+try:
+    os.makedirs(os.path.dirname(lock_path) or ".", exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    deadline = time.monotonic() + max(0.0, max_wait_s)
+    acquired = False
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline or not parent_alive():
+                break
+            time.sleep(0.02)
+    write_status("ACQUIRED" if acquired else "TIMEOUT")
+except Exception as exc:
+    if fd >= 0:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    write_status(f"ERROR:{type(exc).__name__}: {exc}")
+    sys.exit(2)
+
+if not acquired:
+    os.close(fd)
+    sys.exit(1)
+
+try:
+    stdin_fd = sys.stdin.fileno()
+    while parent_alive():
+        try:
+            ready, _, _ = select.select([stdin_fd], [], [], 0.1)
+        except InterruptedError:
+            continue
+        except (OSError, ValueError):
+            break
+        if ready:
+            try:
+                chunk = os.read(stdin_fd, 64)
+            except OSError:
+                break
+            if not chunk or b"RELEASE" in chunk:
+                break
+finally:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    os.close(fd)
+'
+  exec 7<>"$ctl_fifo"
+  PUBLISH_LOCK_FD_OPEN=1
+  python3 -c "$pub_lock_py" "$flock_path" "$max_wait" "$status_file" "$$" < "$ctl_fifo" >/dev/null 2>"$err_file" 8>&- 9>&- &
+  PUBLISH_LOCK_HELPER_PID=$!
+
+  local lock_status=""
+  lock_status="$(exec 7>&- 8>&- 9>&-; python3 - "$PUBLISH_LOCK_HELPER_PID" "$status_file" "$err_file" "$max_wait" <<'PY'
+import os, subprocess, sys, time
+
+helper_pid = int(sys.argv[1])
+status_file = sys.argv[2]
+err_file = sys.argv[3]
+timeout_s = max(0.5, float(sys.argv[4]) + 5.0)
+deadline = time.monotonic() + timeout_s
+
+def read_first_line(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().strip().splitlines()
+            return lines[0] if lines else ""
+    except OSError:
+        return ""
+
+def helper_exited(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    proc_stat = f"/proc/{pid}/stat"
+    if os.path.exists(proc_stat):
+        try:
+            raw = open(proc_stat, encoding="utf-8", errors="replace").read()
+            rp = raw.rfind(")")
+            if rp > 0:
+                fields = raw[rp + 1 :].strip().split()
+                if fields and fields[0] in ("Z", "X", "x"):
+                    return True
+        except OSError:
+            pass
+        return False
+    try:
+        res = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False)
+        if res.returncode == 0:
+            stat_str = (res.stdout or "").strip()
+            return (not stat_str) or stat_str.startswith("Z")
+    except OSError:
+        pass
+    return False
+
+while True:
+    if os.path.exists(status_file):
+        line = read_first_line(status_file)
+        if line:
+            print(line)
+            sys.exit(0)
+    if helper_exited(helper_pid):
+        if os.path.exists(status_file):
+            line = read_first_line(status_file)
+            if line:
+                print(line)
+                sys.exit(0)
+        err_msg = read_first_line(err_file) or "lock helper exited unexpectedly"
+        print(f"HELPER_EXITED:{err_msg}")
+        sys.exit(0)
+    if time.monotonic() >= deadline:
+        print("HANDSHAKE_TIMEOUT")
+        sys.exit(0)
+    time.sleep(0.02)
+PY
+  )" || lock_status="HANDSHAKE_WAIT_FAILED"
+
+  if [[ "$lock_status" != "ACQUIRED" ]]; then
+    release_publish_lock
+    err "Failed to acquire OS backup publish lock (${flock_path}): ${lock_status:-unknown}"
+    exit 1
+  fi
+  PUBLISH_LOCK_HELD=1
+
   while ! mkdir "$LOCK_DIR" 2>/dev/null; do
     local pid_file="${LOCK_DIR}/pid"
     if [[ -f "$pid_file" ]]; then
@@ -1223,6 +1408,7 @@ acquire_publish_lock() {
       fi
     fi
     if (( waited >= 60 )); then
+      release_publish_lock
       err "Timed out waiting for backup publish lock: ${LOCK_DIR}"
       exit 1
     fi
@@ -1232,15 +1418,13 @@ acquire_publish_lock() {
   LOCK_HELD=1
   if ! printf '%s\n' "$$" > "${LOCK_DIR}/pid" 2>/dev/null || [[ "$(tr -d '[:space:]' < "${LOCK_DIR}/pid" 2>/dev/null || true)" != "$$" ]]; then
     err "Failed to write PID file for backup publish lock: ${LOCK_DIR}/pid"
-    rm -f "${LOCK_DIR}/pid" 2>/dev/null || true
-    rmdir "$LOCK_DIR" 2>/dev/null || true
-    LOCK_HELD=0
+    release_publish_lock
     exit 1
   fi
 }
 
 release_publish_lock() {
-  if [[ "$LOCK_HELD" -eq 1 && -d "$LOCK_DIR" ]]; then
+  if [[ "${LOCK_HELD:-0}" -eq 1 && -d "${LOCK_DIR:-}" ]]; then
     local lock_pid=""
     if [[ -f "${LOCK_DIR}/pid" ]]; then
       lock_pid="$(tr -d '[:space:]' < "${LOCK_DIR}/pid" 2>/dev/null || true)"
@@ -1250,6 +1434,41 @@ release_publish_lock() {
       rmdir "$LOCK_DIR" 2>/dev/null || true
     fi
     LOCK_HELD=0
+  fi
+  if [[ "${PUBLISH_LOCK_HELD:-0}" -eq 1 || "${PUBLISH_LOCK_FD_OPEN:-0}" -eq 1 || -n "${PUBLISH_LOCK_HELPER_PID:-}" ]]; then
+    if [[ "${PUBLISH_LOCK_FD_OPEN:-0}" -eq 1 ]]; then
+      exec 7>&- || true
+      PUBLISH_LOCK_FD_OPEN=0
+    fi
+    if [[ -n "${PUBLISH_LOCK_HELPER_PID:-}" ]]; then
+      local pid="$PUBLISH_LOCK_HELPER_PID"
+      local waited_ms=0
+      while kill -0 "$pid" 2>/dev/null && (( waited_ms < 2000 )); do
+        sleep 0.02
+        waited_ms=$(( waited_ms + 20 ))
+      done
+      if kill -0 "$pid" 2>/dev/null || kill -0 -- "-${pid}" 2>/dev/null; then
+        kill -TERM -- "-${pid}" 2>/dev/null || true
+        kill -TERM "$pid" 2>/dev/null || true
+        local term_ms=0
+        while (( term_ms < 400 )); do
+          if ! kill -0 "$pid" 2>/dev/null && ! kill -0 -- "-${pid}" 2>/dev/null; then
+            break
+          fi
+          sleep 0.02
+          term_ms=$(( term_ms + 20 ))
+        done
+        kill -KILL -- "-${pid}" 2>/dev/null || true
+        kill -KILL "$pid" 2>/dev/null || true
+      fi
+      wait "$pid" 2>/dev/null || true
+      PUBLISH_LOCK_HELPER_PID=""
+    fi
+    PUBLISH_LOCK_HELD=0
+  fi
+  if [[ -n "${PUBLISH_LOCK_TMP_DIR:-}" ]]; then
+    rm -rf "$PUBLISH_LOCK_TMP_DIR" 2>/dev/null || true
+    PUBLISH_LOCK_TMP_DIR=""
   fi
 }
 
@@ -2125,7 +2344,7 @@ chmod 600 "${STAGE_DIR}/manifest.json"
 # delete unrelated directories.
 acquire_publish_lock
 while [[ -e "$FINAL_DIR" ]]; do
-  RAND_SUFFIX="$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
+  RAND_SUFFIX="$(exec 7>&-; python3 -c 'import secrets; print(secrets.token_hex(3))')"
   BACKUP_NAME="dalton-backup-${TIMESTAMP}-${RAND_SUFFIX}"
   FINAL_DIR="${OUTPUT_DIR}/${BACKUP_NAME}"
 done
@@ -2135,7 +2354,7 @@ chmod 700 "$FINAL_DIR"
 # Prune older backups belonging to this instance (must have a valid manifest.json)
 PRUNED=0
 if (( RETAIN > 0 )); then
-  PRUNE_LIST="$(python3 - "$OUTPUT_DIR" "$PROJECT_NAME" "$RETAIN" <<'PY'
+  PRUNE_LIST="$(exec 7>&-; python3 - "$OUTPUT_DIR" "$PROJECT_NAME" "$RETAIN" <<'PY'
 import json
 import sys
 from pathlib import Path

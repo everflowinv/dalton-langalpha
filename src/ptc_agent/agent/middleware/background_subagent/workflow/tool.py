@@ -709,19 +709,53 @@ def create_run_workflow_tool(
                 await registry.discard_unstarted(launch_tool_call_id)
             raise
 
+        # DALTON-HOOK(workflow-discovered-tools): bind the server-computed
+        # internal-memory decision to `(short_thread_id, run_task.task_id)`
+        # with an HMAC before snapshotting `args.json`, and refuse launch
+        # (aborting the admitted run) when `args.json` cannot be persisted.
+        if isinstance(params, dict):
+            from src.dalton.content_assembly import (
+                sign_topic_research_internal_memory_decision,
+            )
+
+            params = sign_topic_research_internal_memory_decision(
+                params,
+                short_thread_id=short_thread_id,
+                run_id=run_task.task_id,
+            )
+
         artifacts = {
             "workflow.js": script,
             "args.json": json.dumps(params, ensure_ascii=False, default=str),
         }
         for filename, content in artifacts.items():
+            # DALTON-HOOK(workflow-discovered-tools): fail closed if `args.json`
+            # fails to persist (exception or explicit False / ok=False) on runs
+            # that depend on the launch decision snapshot.
+            args_snapshot_required = filename == "args.json" and (
+                meta.name == "topic-research"
+                or (isinstance(params, dict) and "internal_memory_decision" in params)
+            )
             try:
-                await backend.awrite_text(f"{base_rel}/{filename}", content)
-            except Exception:
+                write_res = await backend.awrite_text(f"{base_rel}/{filename}", content)
+                if args_snapshot_required and (
+                    write_res is False
+                    or (hasattr(write_res, "ok") and write_res.ok is False)
+                ):
+                    raise OSError(f"snapshot write returned failure for {base_rel}/{filename}")
+            except Exception as snap_error:
                 logger.warning(
                     "Failed to snapshot workflow artifact",
                     path=f"{base_rel}/{filename}",
                     exc_info=True,
                 )
+                if args_snapshot_required:
+                    refused = _Refused(
+                        f"failed to snapshot launch args ({base_rel}/args.json) — refusing to start {meta.name}.",
+                        failure="SnapshotWriteError",
+                    )
+                    await mw._abort_admitted_run(run_task, refused)
+                    raise refused from snap_error
 
         spec = WorkflowRunSpec(
             run_task=run_task,

@@ -12,6 +12,7 @@ import ipaddress
 import logging
 import os
 import re
+import secrets
 import uuid
 from collections.abc import Mapping
 from functools import lru_cache
@@ -1936,6 +1937,36 @@ def get_dalton_audit_cache_hmac_key() -> bytes | None:
     if not seed:
         return None
     return hmac.new(seed.encode("utf-8"), b"dalton-audit-cache-v1", hashlib.sha256).digest()
+
+
+_EPHEMERAL_WORKFLOW_DECISION_KEY: bytes = secrets.token_bytes(32)
+
+
+def get_dalton_workflow_decision_hmac_key() -> bytes:
+    """Derive the server-only HMAC-SHA256 key for signing workflow launch decisions.
+
+    Uses a deployment server secret (never exposed to sandboxes) when configured so
+    signatures survive process restarts and multi-worker routing, falling back to a
+    process-ephemeral 32-byte key in local/test runs without env secrets.
+    """
+    for env_name in (
+        "JWT_SIGNING_SECRET",
+        "DALTON_AUDIT_CACHE_KEY",
+        "SUPABASE_SECRET_KEY",
+        "DALTON_RESEARCH_HOST_ADMIN_TOKEN",
+    ):
+        seed = os.getenv(env_name, "").strip()
+        if seed:
+            return hmac.new(
+                seed.encode("utf-8"),
+                b"dalton-workflow-decision-v1",
+                hashlib.sha256,
+            ).digest()
+    return hmac.new(
+        _EPHEMERAL_WORKFLOW_DECISION_KEY,
+        b"dalton-workflow-decision-v1",
+        hashlib.sha256,
+    ).digest()
 
 
 DEFAULT_INVITE_EMAIL_DOMAIN = "team.dalton.local"
