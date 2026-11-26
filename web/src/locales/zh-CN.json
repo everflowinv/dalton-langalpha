@@ -1945,6 +1945,7 @@
       "decline": "取消",
       "retryReconcile": "一键补齐同步",
       "retrying": "补齐中…",
+      "retryRunningError": "同步任务正在后台运行，请稍后重试",
       "retryPartialError": "仍有部分任务未完成同步，请稍后重试",
       "retryFailedError": "补齐同步失败，请稍后重试",
       "changeLabels": {

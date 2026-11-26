@@ -101,19 +101,28 @@ def strip_watchlist_context_if_shared(
     return [item for item in additional_context if not is_personal_watchlist_context_item(item)]
 
 
-async def _is_thread_publicly_shared(thread_id: str | None) -> bool:
+async def is_thread_shared(thread_id: str | None) -> bool:
+    """Return True if the thread is publicly shared OR if share state cannot be verified (fail-closed)."""
     tid = str(thread_id or "").strip()
     if not tid or tid == "__default__":
         return False
     try:
-        from src.server.database.conversation.threads_read import get_thread_share_status
+        from src.server.database.conversation.threads_read import get_thread_auth_meta
 
-        info = await get_thread_share_status(tid)
+        info = await get_thread_auth_meta(tid)
+        if info is None:
+            # Brand-new thread not yet persisted in conversation_threads cannot be publicly shared
+            return False
         if isinstance(info, Mapping):
             return bool(info.get("is_shared"))
+        return True
     except Exception:
-        pass
-    return False
+        # Fail-closed: if thread share status cannot be verified, treat as shared
+        return True
+
+
+async def _is_thread_publicly_shared(thread_id: str | None) -> bool:
+    return await is_thread_shared(thread_id)
 
 
 async def sanitize_turn_watchlist_context(
@@ -162,9 +171,12 @@ def build_watchlist_context_reminder(
 
 def dispatch_price_monitor_signal(service: Any, raw_data: Any) -> None:
     """Route Redis target-change pub/sub messages to automation reload vs target reload."""
-    if isinstance(raw_data, bytes):
-        raw_data = raw_data.decode("utf-8", errors="ignore")
-    if str(raw_data or "").strip() == "__automations__":
+    decoded = (
+        raw_data.decode("utf-8", errors="ignore")
+        if isinstance(raw_data, bytes)
+        else str(raw_data or "")
+    )
+    if decoded.strip() == "__automations__":
         service.request_automations_reload()
     else:
         service.request_targets_reload(raw_data)
@@ -175,6 +187,7 @@ __all__ = [
     "dispatch_price_monitor_signal",
     "is_personal_watchlist_context_item",
     "is_personal_watchlist_turn_allowed",
+    "is_thread_shared",
     "sanitize_turn_watchlist_context",
     "strip_watchlist_context_if_shared",
 ]

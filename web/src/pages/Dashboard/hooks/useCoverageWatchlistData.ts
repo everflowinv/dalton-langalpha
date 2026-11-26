@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useSyncExternalStore } from 'react';
 import { useQuotes, snapshotToStockPrice } from '@/lib/quotes';
 import { quoteCurrency } from '@/lib/bars/exchanges';
 import { quotePlaces } from '@/lib/bars/currencyDisplay';
@@ -151,7 +151,28 @@ export function buildCoverageRowsForCompanies(
   });
 }
 
+let activeDashboardCoverageTier: WatchlistTier | 'all' = 'all';
+const activeTierListeners = new Set<() => void>();
+
+export function setActiveDashboardCoverageTier(tier: WatchlistTier | 'all'): void {
+  if (activeDashboardCoverageTier === tier) return;
+  activeDashboardCoverageTier = tier;
+  for (const fn of activeTierListeners) fn();
+}
+
+export function useActiveDashboardCoverageTier(): WatchlistTier | 'all' {
+  return useSyncExternalStore(
+    (cb) => {
+      activeTierListeners.add(cb);
+      return () => activeTierListeners.delete(cb);
+    },
+    () => activeDashboardCoverageTier,
+    () => 'all',
+  );
+}
+
 export function useCoverageWatchlistData() {
+  const activeTier = useActiveDashboardCoverageTier();
   const {
     data: summary,
     isLoading: listLoading,
@@ -164,16 +185,22 @@ export function useCoverageWatchlistData() {
     [summary],
   );
 
+  // Filter by currently visible tier BEFORE slicing the single 50-symbol live quote cap (§7.2, r5).
+  const activeCompanies = useMemo(
+    () => (activeTier === 'all' ? companies : companies.filter((c) => c.tier === activeTier)),
+    [companies, activeTier],
+  );
+
   // Cap live quote subscriptions at MAX_DASHBOARD_COVERAGE_QUOTES (50) visible listed companies (§7.2).
   const quotedSymbols = useMemo(() => {
     const out: string[] = [];
-    for (const c of companies) {
+    for (const c of activeCompanies) {
       if (c.is_private) continue;
       if (out.length >= MAX_DASHBOARD_COVERAGE_QUOTES) break;
       out.push(c.ticker);
     }
     return out;
-  }, [companies]);
+  }, [activeCompanies]);
 
   const { quotes, isLoading: quotesLoading } = useQuotes(quotedSymbols, {
     staleTime: 1000 * 30,
@@ -182,8 +209,8 @@ export function useCoverageWatchlistData() {
   });
 
   const rows = useMemo<CoverageWatchlistRow[]>(
-    () => buildCoverageRowsForCompanies(companies, quotes),
-    [companies, quotes],
+    () => buildCoverageRowsForCompanies(activeCompanies, quotes),
+    [activeCompanies, quotes],
   );
 
   const counts = summary?.counts ?? {

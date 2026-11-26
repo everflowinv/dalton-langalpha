@@ -2044,8 +2044,9 @@ async def test_preflight_attempts_home_coverage_sync_before_timeout_steps(
         yaml_text: str | None = None,
         backend: Any = None,
         rel_path: str = "dalton/coverage.yaml",
+        roster_revision: int | None = None,
     ) -> bool:
-        _ = (yaml_text, backend, rel_path)
+        _ = (yaml_text, backend, rel_path, roster_revision)
         sync_attempts.append(user_id)
         return True
 
@@ -2093,8 +2094,9 @@ async def test_preflight_attempts_home_coverage_sync_before_timeout_steps(
         yaml_text: str | None = None,
         backend: Any = None,
         rel_path: str = "dalton/coverage.yaml",
+        roster_revision: int | None = None,
     ) -> bool:
-        _ = (yaml_text, backend, rel_path)
+        _ = (yaml_text, backend, rel_path, roster_revision)
         sync_attempts.append(f"hang:{user_id}")
         await asyncio.sleep(0.5)
         return True

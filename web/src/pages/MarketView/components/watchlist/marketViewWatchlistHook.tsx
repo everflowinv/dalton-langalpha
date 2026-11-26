@@ -8,6 +8,7 @@ import type { NavigateFunction, SetURLSearchParams } from 'react-router';
 import { ArrowLeft } from 'lucide-react';
 import { isDaltonBuild } from '@/config/brand';
 import { buildMarketViewUrl, readMarketViewRoute, type MarketViewRouteParams } from '../../utils/marketRoute';
+import { WatchlistWorkspace, type WatchlistWorkspaceProps } from './WatchlistWorkspace';
 
 interface DaltonMarketLocationState {
   fromWatchlist?: boolean;
@@ -56,6 +57,7 @@ export function buildConsumedRouteReplaceState(
 export function syncDaltonMarketSymbolParam(
   setSearchParams: SetURLSearchParams,
   symbol: string,
+  locationState?: unknown,
 ): void {
   if (!isDaltonBuild || !symbol) return;
   setSearchParams(
@@ -64,13 +66,14 @@ export function syncDaltonMarketSymbolParam(
       next.set('symbol', symbol);
       return next;
     },
-    { replace: true },
+    { replace: true, ...(locationState !== undefined ? { state: locationState } : {}) },
   );
 }
 
 export function syncDaltonMarketTimeframeParam(
   setSearchParams: SetURLSearchParams,
   timeframe: string,
+  locationState?: unknown,
 ): void {
   if (!isDaltonBuild || !timeframe) return;
   setSearchParams(
@@ -81,7 +84,7 @@ export function syncDaltonMarketTimeframeParam(
       next.set('tf', timeframe);
       return next;
     },
-    { replace: true },
+    { replace: true, ...(locationState !== undefined ? { state: locationState } : {}) },
   );
 }
 
@@ -90,8 +93,17 @@ export function navigateDaltonChartJump(
   symbol: string,
   timeframe: string | undefined,
   fromWatchlistView: boolean,
+  locationState?: unknown,
 ): void {
   if (!isDaltonBuild) return;
+  const nextState = fromWatchlistView
+    ? {
+        ...(locationState && typeof locationState === 'object'
+          ? (locationState as Record<string, unknown>)
+          : {}),
+        fromWatchlist: true,
+      }
+    : locationState;
   navigate(
     buildMarketViewUrl({
       symbol,
@@ -99,9 +111,16 @@ export function navigateDaltonChartJump(
     }),
     {
       replace: !fromWatchlistView,
-      ...(fromWatchlistView ? { state: { fromWatchlist: true } } : {}),
+      ...(nextState !== undefined ? { state: nextState } : {}),
     },
   );
+}
+
+export function renderDaltonWatchlistWorkspace(
+  props: WatchlistWorkspaceProps,
+): React.ReactElement | null {
+  if (!isDaltonBuild) return null;
+  return <WatchlistWorkspace {...props} />;
 }
 
 export function navigateBackToDaltonWatchlist(

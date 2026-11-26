@@ -1073,6 +1073,55 @@ def _get_home_yaml_sync_lock(user_id: str) -> asyncio.Lock:
     return lock
 
 
+@asynccontextmanager
+async def _cross_worker_home_yaml_lock(user_id: str):
+    """Serialize Home YAML check->write->record across workers via PG session advisory lock.
+
+    Falls back to in-process asyncio lock cleanly when DB pool is closed (unit tests).
+    """
+    uid = str(user_id or "").strip()
+    async with _get_home_yaml_sync_lock(uid):
+        lock_key = f"dalton_home_yaml_sync:{uid}"
+        try:
+            async with coverage_db.get_db_connection() as lock_conn:
+                can_lock = callable(getattr(lock_conn, "cursor", None))
+                if not can_lock:
+                    yield
+                    return
+                try:
+                    async with lock_conn.cursor() as cur:
+                        await cur.execute(
+                            "SELECT pg_advisory_lock(hashtext(%s))",
+                            (lock_key,),
+                        )
+                except Exception as exc:
+                    if _is_pool_not_open_error(exc) or not isinstance(exc, Exception):
+                        yield
+                        return
+                    # Non-PG mock connection in unit tests: fall back to in-process lock
+                    if isinstance(exc, (TypeError, AttributeError)):
+                        yield
+                        return
+                    raise
+                try:
+                    yield
+                finally:
+                    try:
+                        async with lock_conn.cursor() as cur:
+                            await cur.execute(
+                                "SELECT pg_advisory_unlock(hashtext(%s))",
+                                (lock_key,),
+                            )
+                    except Exception:
+                        pass
+                return
+        except Exception as exc:
+            if _is_pool_not_open_error(exc) or isinstance(exc, (TypeError, AttributeError)):
+                yield
+                return
+            raise
+
+
 async def sync_user_coverage_to_home(
     user_id: str,
     *,
@@ -1081,9 +1130,9 @@ async def sync_user_coverage_to_home(
     rel_path: str = "dalton/coverage.yaml",
     roster_revision: int | None = None,
 ) -> bool:
-    """Serialized, revision-guarded write of rendered `coverage.yaml` into `user_id`'s Home sandbox.
+    """Cross-worker serialized, revision-guarded write of rendered `coverage.yaml` into `user_id`'s Home sandbox.
 
-    Refuses to overwrite Home YAML when ``roster_revision < last_yaml_synced_revision``.
+    Refuses to overwrite Home YAML when ``roster_revision < last_yaml_synced_revision`` (including revision 0).
     Logs and returns False on failure without raising.
     """
     uid = str(user_id or "").strip()
@@ -1095,7 +1144,7 @@ async def sync_user_coverage_to_home(
     )
 
     is_personal_yaml = rel_path == "dalton/coverage.yaml"
-    async with _get_home_yaml_sync_lock(uid):
+    async with _cross_worker_home_yaml_lock(uid):
         try:
             eff_revision = roster_revision
             if yaml_text is None:
@@ -2497,8 +2546,10 @@ async def resolve_coverage_group(
     *,
     now: datetime | None = None,
     sync_home: bool = True,
+    snapshot_id: str | None = None,
+    allow_internal: bool = True,
 ) -> dict[str, Any]:
-    """Re-resolve an existing coverage group via the unified WatchlistMutationService internal action."""
+    """Re-resolve an existing coverage group via the unified WatchlistMutationService action."""
     uid = str(user_id or "").strip()
     gid = str(group_id or "").strip()
     if not uid or not gid:
@@ -2510,6 +2561,8 @@ async def resolve_coverage_group(
         uid,
         action="resolve_group",
         group_id=gid,
+        snapshot_id=snapshot_id,
+        allow_internal=allow_internal,
         now=now,
         sync_home=sync_home,
     )

@@ -776,8 +776,17 @@ async def _sync_home_coverage_for_preflight(
             return bool(await sync_user_coverage_to_home(user_id, yaml_text=yaml_text))
         yaml_text = await render_coverage_yaml(user_id)
         sync_kwargs: dict[str, Any] = {"yaml_text": yaml_text}
-        if rendered_revision is not None and rendered_revision > 0:
-            sync_kwargs["roster_revision"] = rendered_revision
+        if rendered_revision is not None:
+            import inspect as _inspect
+
+            try:
+                _sync_params = _inspect.signature(sync_user_coverage_to_home).parameters
+                if "roster_revision" in _sync_params or any(
+                    p.kind == _inspect.Parameter.VAR_KEYWORD for p in _sync_params.values()
+                ):
+                    sync_kwargs["roster_revision"] = rendered_revision
+            except (TypeError, ValueError):
+                sync_kwargs["roster_revision"] = rendered_revision
         return bool(await sync_user_coverage_to_home(user_id, **sync_kwargs))
 
     try:

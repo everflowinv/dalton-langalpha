@@ -229,11 +229,23 @@ def _install_fake_automation_store(
     monkeypatch.setattr(exec_db, "skip_unstarted_executions_for_automations", mock_skip_execs)
     monkeypatch.setattr(exec_db, "get_db_now", mock_get_db_now)
     from src.dalton.database import coverage as cov_db
+    from src.dalton.watchlist import policies as wl_policies_mod
 
     monkeypatch.setattr(
         cov_db,
         "get_coverage_row",
-        create_autospec(cov_db.get_coverage_row, return_value=None),
+        create_autospec(
+            cov_db.get_coverage_row,
+            return_value={"ticker": str(ticker).upper(), "tier": "core", "is_private": False},
+        ),
+    )
+    monkeypatch.setattr(
+        wl_policies_mod,
+        "get_user_tier_policy",
+        create_autospec(
+            wl_policies_mod.get_user_tier_policy,
+            return_value=wl_policies_mod.DEFAULT_TIER_POLICIES["core"],
+        ),
     )
 
     return {
@@ -1649,6 +1661,25 @@ async def test_round10_resume_once_automation_never_readds_removed_paused_by_use
         _cu_db,
         "get_active_unit_by_workspace",
         create_autospec(_REAL_GET_ACTIVE_UNIT, return_value=None),
+    )
+    from src.dalton.database import coverage as cov_db_mod
+    from src.dalton.watchlist import policies as wl_policies_mod
+
+    monkeypatch.setattr(
+        cov_db_mod,
+        "get_coverage_row",
+        create_autospec(
+            cov_db_mod.get_coverage_row,
+            return_value={"ticker": "NVDA", "tier": "core", "is_private": False},
+        ),
+    )
+    monkeypatch.setattr(
+        wl_policies_mod,
+        "get_user_tier_policy",
+        create_autospec(
+            wl_policies_mod.get_user_tier_policy,
+            return_value=wl_policies_mod.DEFAULT_TIER_POLICIES["core"],
+        ),
     )
 
     res = await schedule_dalton_automation_helper(

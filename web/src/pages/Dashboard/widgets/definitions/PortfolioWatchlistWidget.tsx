@@ -18,17 +18,10 @@ import { RowAttachButton } from '../../components/RowAttachButton';
 import type { WidgetRenderProps } from '../types';
 import { formatSignedPct2 } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
 import { watchlistQuoteRow } from '../../hooks/useWatchlistData';
-import type { WatchlistTier } from '@/lib/dalton/watchlist'; // DALTON-HOOK(watchlist)
-import {
-  buildCoverageFullContextExport,
-  buildCoverageRowContextExport,
-  CoverageWatchlistTabPanel,
-  getPortfolioWatchlistTabs,
-  normalizeCoverageContext,
-  resolveInitialPortfolioWatchlistTab,
-  useFilteredCoverageWatchlistRows,
-  type PortfolioWatchlistTabKey,
-} from '../../components/dalton/CoverageWatchlistTab'; // DALTON-HOOK(watchlist)
+// DALTON-HOOK(watchlist): Personal Watchlist tab & helpers
+import * as daltonCoverage from '../../components/dalton/CoverageWatchlistTab';
+import type { WatchlistTier } from '@/lib/dalton/watchlist';
+import type { PortfolioWatchlistTabKey } from '../../components/dalton/CoverageWatchlistTab';
 import { WidgetCardMeta } from '../framework/widgetCardSlots';
 import {
   HoldingsAddButton,
@@ -71,23 +64,21 @@ function PortfolioWatchlistWidget({
     dashboard,
   } = useDashboardContext();
 
-  // DALTON-HOOK(watchlist): normalize coverage context and preserve saved defaultTab
-  const coverage = normalizeCoverageContext(rawCoverage);
+  // DALTON-HOOK(watchlist): normalize coverage context and filter rows by tier
+  const coverage = daltonCoverage.normalizeCoverageContext(rawCoverage);
+  const [coverageTier, setCoverageTier] = useState<WatchlistTier | 'all'>('all');
+  const { rows: filteredCoverageRows, filteredTotalCount, quotesBridge } = daltonCoverage.useFilteredCoverageWatchlistRows(coverage, coverageTier);
   const savedDefaultTab = instance.config.defaultTab;
   const userPickedTabRef = useRef(false);
   const [activeTab, setActiveTab] = useState<PWTabKey>(() =>
-    resolveInitialPortfolioWatchlistTab(savedDefaultTab, coverage.totalCount),
+    daltonCoverage.resolveInitialPortfolioWatchlistTab(savedDefaultTab, coverage.totalCount),
   );
-  const [coverageTier, setCoverageTier] = useState<WatchlistTier | 'all'>('all');
   const [valuesHidden, setValuesHidden] = useState(!!instance.config.valuesHidden);
 
   useEffect(() => {
     if (savedDefaultTab || userPickedTabRef.current || !isDaltonBuild) return;
     if (coverage.loaded && coverage.totalCount > 0 && activeTab !== 'coverage') setActiveTab('coverage');
   }, [savedDefaultTab, coverage.loaded, coverage.totalCount, activeTab]);
-
-  // DALTON-HOOK(watchlist): filter coverage rows by tier BEFORE slicing the 50-symbol quote cap
-  const { rows: filteredCoverageRows, filteredTotalCount, quotesBridge } = useFilteredCoverageWatchlistRows(coverage, coverageTier);
 
   // Snapshot exporter — full payload reflects whichever tab the user is viewing
   // (the agent should see what the user sees). Per-row attach delegates to the
@@ -96,10 +87,7 @@ function PortfolioWatchlistWidget({
     full: () => {
       // DALTON-HOOK(watchlist): export personal watchlist tab snapshot
       if (activeTab === 'coverage') {
-        return buildCoverageFullContextExport({
-          instanceId: instance.id, coverage, filteredRows: filteredCoverageRows, filteredTotalCount,
-          coverageTier, marketStatus: dashboard.marketStatus, headerLabel: t('dashboard:widgets.portfolioWatchlist.headerCoverage'),
-        });
+        return daltonCoverage.buildCoverageFullContextExport({ instanceId: instance.id, coverage, filteredRows: filteredCoverageRows, filteredTotalCount, coverageTier, marketStatus: dashboard.marketStatus, headerLabel: t('dashboard:widgets.portfolioWatchlist.headerCoverage') });
       }
       if (activeTab === 'watchlist') {
         // DALTON-HOOK(extended-hours-quotes): Pass marketStatus so full watchlist export includes extended-hours quotes.
@@ -145,10 +133,7 @@ function PortfolioWatchlistWidget({
     rows: (rowId: string) => {
       // DALTON-HOOK(watchlist): export single personal watchlist row
       if (activeTab === 'coverage') {
-        return buildCoverageRowContextExport({
-          instanceId: instance.id, rowId, coverage, filteredRows: filteredCoverageRows,
-          marketStatus: dashboard.marketStatus, headerLabel: t('dashboard:widgets.portfolioWatchlist.headerCoverage'),
-        });
+        return daltonCoverage.buildCoverageRowContextExport({ instanceId: instance.id, rowId, coverage, filteredRows: filteredCoverageRows, marketStatus: dashboard.marketStatus, headerLabel: t('dashboard:widgets.portfolioWatchlist.headerCoverage') });
       }
       if (activeTab === 'watchlist') {
         const row = watchlist.rows.find((r) => (r.watchlist_item_id ?? r.symbol) === rowId);
@@ -243,7 +228,7 @@ function PortfolioWatchlistWidget({
         : portfolio.rows.length;
 
   // DALTON-HOOK(watchlist): tab order `[关注列表][自选股][持仓]` in Dalton builds
-  const tabs = getPortfolioWatchlistTabs(t);
+  const tabs = daltonCoverage.getPortfolioWatchlistTabs(t);
 
   return (
     <div className="widget-term dash-fill">
@@ -281,17 +266,7 @@ function PortfolioWatchlistWidget({
           {/* DALTON-HOOK(watchlist): render personal watchlist tab panel via Dalton component */}
           {quotesBridge}
           {activeTab === 'coverage' ? (
-            <CoverageWatchlistTabPanel
-              instanceId={instance.id}
-              coverage={coverage}
-              filteredRows={filteredCoverageRows}
-              filteredTotalCount={filteredTotalCount}
-              coverageTier={coverageTier}
-              onSelectTier={setCoverageTier}
-              showSkeleton={showCoverageSkeleton}
-              skeletonRows={coverageSkeletonRows}
-              marketStatus={dashboard.marketStatus}
-            />
+            <daltonCoverage.CoverageWatchlistTabPanel instanceId={instance.id} coverage={coverage} filteredRows={filteredCoverageRows} filteredTotalCount={filteredTotalCount} coverageTier={coverageTier} onSelectTier={setCoverageTier} showSkeleton={showCoverageSkeleton} skeletonRows={coverageSkeletonRows} marketStatus={dashboard.marketStatus} />
           ) : activeTab === 'watchlist' ? (
             <div>
               <WatchlistTable>

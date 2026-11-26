@@ -21,6 +21,7 @@ import os
 from pathlib import Path
 import re
 import sys
+from typing import Any
 import urllib.error
 import urllib.request
 from zoneinfo import ZoneInfo
@@ -368,6 +369,35 @@ def cmd_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_live_stage_scope(
+    ticker: str,
+    *,
+    coverage: dict[str, dict[str, Any]],
+    tier_policies: dict[str, dict[str, Any]] | None,
+    workspace_id: str | None,
+) -> tuple[str | None, list[str]]:
+    """Single source of truth for ``check`` / ``mark`` / ``diff``: live coverage ONLY.
+
+    - Removed ticker (not in ``coverage``): returns ``(None, [])`` — never falls back to stale ledger tier.
+    - Shared Home ticker-only entry (in ``coverage`` without ``tier``): returns ``(None, [])``.
+    - Private company or missing ``workspace_id``: returns ``(live_tier, [])``.
+    """
+    sym = str(ticker or "").strip().upper()
+    if sym not in coverage:
+        return None, []
+    cov = coverage[sym]
+    live_tier_raw = str(cov.get("tier") or "").strip().lower()
+    live_tier = live_tier_raw or None
+    if not live_tier or bool(cov.get("is_private")) or not workspace_id:
+        return live_tier, []
+    stages = resolve_earnings_stages(
+        live_tier,
+        tier_policies=tier_policies,
+        task_overrides=cov.get("task_overrides") if isinstance(cov, dict) else None,
+    )
+    return live_tier, stages
+
+
 def cmd_check(args: argparse.Namespace) -> int:
     state_path = Path(args.state) if args.state else _default_state_path()
     cov_path = Path(getattr(args, "coverage", None)) if getattr(args, "coverage", None) else _default_coverage_path()
@@ -380,18 +410,13 @@ def cmd_check(args: argparse.Namespace) -> int:
     is_confirmed = bool(entry and entry.get("status") == "confirmed" and entry.get("date_status") == "confirmed")
     old_date = entry.get("date") if entry else None
     same_date = bool(is_confirmed and old_date == args.date)
-    # Item 9: prioritize live coverage tier over stale ledger tier
-    tier_val = cov.get("tier") or (entry or {}).get("tier")
     cov_ws_id = (cov.get("workspace") or {}).get("workspace_id") if isinstance(cov.get("workspace"), dict) else None
     effective_ws_id = (entry or {}).get("workspace_id") or cov_ws_id
-    expected_stages = (
-        resolve_earnings_stages(
-            tier_val,
-            tier_policies=tier_policies,
-            task_overrides=cov.get("task_overrides") if isinstance(cov, dict) else None,
-        )
-        if effective_ws_id
-        else []
+    tier_val, expected_stages = _resolve_live_stage_scope(
+        ticker,
+        coverage=coverage,
+        tier_policies=tier_policies,
+        workspace_id=effective_ws_id,
     )
     existing_autos = (entry or {}).get("automations") if isinstance((entry or {}).get("automations"), dict) else {}
     has_autos = (not expected_stages) or all(stage in existing_autos for stage in expected_stages)
@@ -427,14 +452,20 @@ def cmd_mark(args: argparse.Namespace) -> int:
     now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
     name = args.name or existing.get("name") or cov.get("name") or ticker
-    # Item 9: prioritize explicit --tier, then live coverage tier, then stale ledger tier
-    tier = (args.tier or cov.get("tier") or existing.get("tier") or "watch").capitalize()
     cov_ws_id = (cov.get("workspace") or {}).get("workspace_id") if isinstance(cov.get("workspace"), dict) else None
     workspace_id = (
         args.workspace_id
         if args.workspace_id is not None
         else (existing.get("workspace_id") or cov_ws_id)
     )
+    # r5: allowed stages ALWAYS follow live coverage tier/policy (never overridden by stale ledger or --tier)
+    live_tier, allowed_stages = _resolve_live_stage_scope(
+        ticker,
+        coverage=coverage,
+        tier_policies=tier_policies,
+        workspace_id=workspace_id,
+    )
+    tier = (live_tier or args.tier or existing.get("tier") or "radar").capitalize()
     fiscal_note = args.fiscal_note or existing.get("fiscal_note") or cov.get("note") or "FY=CY"
     history = list(existing.get("history") or [])
 
@@ -455,15 +486,6 @@ def cmd_mark(args: argparse.Namespace) -> int:
                     "reason": args.reason or "公司改期或更新披露日期",
                 }
             )
-        allowed_stages = (
-            resolve_earnings_stages(
-                tier,
-                tier_policies=tier_policies,
-                task_overrides=cov.get("task_overrides") if isinstance(cov, dict) else None,
-            )
-            if workspace_id
-            else []
-        )
         allowed_stage_set = set(allowed_stages)
 
         if args.automations_json:
@@ -816,17 +838,12 @@ def cmd_diff(args: argparse.Namespace) -> int:
 
         # Check automations presence when workspace_id is active/present
         if ent.get("workspace_id"):
-            cov = coverage.get(t, {})
-            # r4 Decision 4: use live coverage tier when company is in live coverage (never stale ledger tier)
-            tier_key = (
-                str(cov.get("tier") or "").lower()
-                if t in coverage
-                else str(ent.get("tier") or "").lower()
-            )
-            expected_keys = resolve_earnings_stages(
-                tier_key,
+            # r5: diff uses the exact same live-coverage stage resolver as check and mark
+            _live_tier_diff, expected_keys = _resolve_live_stage_scope(
+                t,
+                coverage=coverage,
                 tier_policies=tier_policies,
-                task_overrides=cov.get("task_overrides") if isinstance(cov, dict) else None,
+                workspace_id=ent.get("workspace_id"),
             )
             autos = ent.get("automations") or {}
             missing_keys = [k for k in expected_keys if not autos.get(k)]

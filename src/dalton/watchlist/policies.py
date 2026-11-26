@@ -978,6 +978,48 @@ async def list_unfinished_reconcile_jobs(
             ]
 
 
+async def renew_reconcile_job_lease(
+    user_id: str,
+    job_id: str,
+    *,
+    claim_token: str,
+    lease_seconds: int = DEFAULT_OUTBOX_LEASE_SECONDS,
+    conn: Any = None,
+) -> bool:
+    """Verify & extend an active claim lease BEFORE running side effects.
+
+    Returns True iff ``claim_token`` still owns ``job_id`` and its lease has not expired.
+    """
+    uid = str(user_id or "").strip()
+    jid = str(job_id or "").strip()
+    tok = str(claim_token or "").strip()
+    if not uid or not jid or not tok:
+        return False
+    eff_lease = max(1, int(lease_seconds))
+
+    async def _run(c: Any) -> bool:
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_watchlist_reconcile_jobs
+                SET claim_expires_at = NOW() + (%s * INTERVAL '1 second'),
+                    updated_at = NOW()
+                WHERE user_id = %s
+                  AND job_id = %s::uuid
+                  AND claim_token = %s
+                  AND (claim_expires_at IS NULL OR claim_expires_at > NOW())
+                RETURNING job_id::text AS job_id
+                """,
+                (eff_lease, uid, jid, tok),
+            )
+            return (await cur.fetchone()) is not None
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as c, c.transaction():
+        return await _run(c)
+
+
 async def update_reconcile_job_progress(
     user_id: str,
     job_id: str,
@@ -989,6 +1031,7 @@ async def update_reconcile_job_progress(
     status: str | None = None,
     claim_token: str | None = None,
     release_claim: bool = False,
+    only_unclaimed_completed: bool = False,
     lease_seconds: int = DEFAULT_OUTBOX_LEASE_SECONDS,
     conn: Any = None,
 ) -> dict[str, Any] | None:
@@ -1029,6 +1072,11 @@ async def update_reconcile_job_progress(
     if claim_token is not None:
         where_clauses.append("claim_token = %s")
         params.append(str(claim_token))
+    elif only_unclaimed_completed:
+        where_clauses.append("claim_token IS NULL")
+        where_clauses.append("status IN ('pending', 'partial', 'completed')")
+        where_clauses.append("jsonb_array_length(pending_tickers) = 0")
+        where_clauses.append("jsonb_array_length(failed_items) = 0")
 
     async def _run(c: Any) -> dict[str, Any] | None:
         async with c.cursor(row_factory=dict_row) as cur:
@@ -1083,6 +1131,7 @@ __all__ = [
     "normalize_tier",
     "policy_from_mapping",
     "record_yaml_synced_revision",
+    "renew_reconcile_job_lease",
     "resolve_effective_company_policy",
     "update_reconcile_job_progress",
     "validate_delta_cron",

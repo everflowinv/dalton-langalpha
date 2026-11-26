@@ -126,6 +126,8 @@ class CoverageMutateRequest(BaseModel):
 class CoverageGroupPreviewRequest(BaseModel):
     label: str = "未命名规则组"
     criteria: dict[str, Any] = Field(default_factory=dict)
+    default_tier: str = "watch"
+    auto_refresh: bool = True
 
 
 class CoverageGroupCreateRequest(BaseModel):
@@ -2783,14 +2785,28 @@ async def preview_user_coverage_group_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     _require_dalton_enabled()
-    from src.dalton.coverage import CoverageDataSourceError, preview_coverage_group
+    from src.dalton.coverage import CoverageDataSourceError
+    from src.dalton.watchlist.service import WatchlistMutationService
 
-    _ = user_id
+    uid = str(user_id).strip()
     try:
-        return await preview_coverage_group(
+        preview = await WatchlistMutationService().preview_mutation(
+            uid,
+            action="add_group",
             label=body.label,
             criteria=body.criteria,
+            default_tier=body.default_tier,
+            auto_refresh=body.auto_refresh,
         )
+        companies = list((preview.get("prevalidated") or {}).values())
+        return {
+            **preview,
+            "label": preview.get("group_label") or body.label,
+            "criteria": preview.get("criteria") if preview.get("criteria") is not None else body.criteria,
+            "matched_tickers": list(preview.get("target_tickers") or []),
+            "companies": companies,
+            "rejected": list(preview.get("not_found") or []),
+        }
     except CoverageDataSourceError as exc:
         raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
     except ValueError as exc:
@@ -2859,12 +2875,24 @@ async def delete_user_coverage_group_endpoint(
 async def resolve_user_coverage_group_endpoint(
     group_id: str,
     user_id: CurrentUserId,
+    snapshot_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
     _require_dalton_enabled()
     from src.dalton.coverage import CoverageDataSourceError, resolve_coverage_group
+    from src.dalton.watchlist.service import WatchlistScopeChangedError
 
     try:
-        res = await resolve_coverage_group(str(user_id).strip(), group_id)
+        res = await resolve_coverage_group(
+            str(user_id).strip(),
+            group_id,
+            snapshot_id=snapshot_id,
+            allow_internal=False,
+        )
+    except WatchlistScopeChangedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
     except CoverageDataSourceError as exc:
         raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
     except ValueError as exc:

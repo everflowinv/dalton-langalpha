@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
@@ -28,11 +29,44 @@ def is_dalton_managed_automation(row: Mapping[str, Any] | None) -> bool:
     return False
 
 
+def resolve_paused_once_schedule_at(row: Mapping[str, Any] | None) -> datetime | None:
+    """Return a paused Dalton ``once`` row's effective scheduled timestamp (``next_run_at`` or saved ``metadata.once_schedule_at``)."""
+    if not isinstance(row, Mapping):
+        return None
+    when = row.get("next_run_at")
+    if isinstance(when, datetime):
+        return when if when.tzinfo is not None else when.replace(tzinfo=timezone.utc)
+    if isinstance(when, str) and when.strip():
+        try:
+            dt = datetime.fromisoformat(when.strip().replace("Z", "+00:00"))
+            return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    if not is_dalton_managed_automation(row):
+        return None
+    meta = row.get("metadata")
+    if not isinstance(meta, Mapping):
+        return None
+    raw = str(meta.get("once_schedule_at") or "").strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def apply_manual_pause_metadata(
     row: Mapping[str, Any] | None,
     effective_kwargs: dict[str, Any],
 ) -> None:
-    """Persist ``metadata.paused_by_user = True`` when a user manually pauses a Dalton task."""
+    """Persist ``metadata.paused_by_user = True`` and clear ``next_run_at`` on manual pause of Dalton tasks.
+
+    For one-time (``once``) Dalton tasks, preserves the original scheduled timestamp in
+    ``metadata.once_schedule_at`` before setting ``next_run_at = None`` so paused rows never
+    keep a dangling schedule while still allowing future manual resume if not yet expired.
+    """
     if not is_dalton_managed_automation(row):
         return
     base_meta: dict[str, Any] = {}
@@ -41,6 +75,15 @@ def apply_manual_pause_metadata(
     if isinstance(effective_kwargs.get("metadata"), Mapping):
         base_meta.update(dict(effective_kwargs["metadata"]))
     base_meta["paused_by_user"] = True
+    if isinstance(row, Mapping) and str(row.get("trigger_type") or "").strip().lower() == "once":
+        orig_when = row.get("next_run_at")
+        if orig_when is not None and not str(base_meta.get("once_schedule_at") or "").strip():
+            if isinstance(orig_when, datetime):
+                dt = orig_when if orig_when.tzinfo is not None else orig_when.replace(tzinfo=timezone.utc)
+                base_meta["once_schedule_at"] = dt.isoformat()
+            elif isinstance(orig_when, str) and orig_when.strip():
+                base_meta["once_schedule_at"] = orig_when.strip()
+        effective_kwargs["next_run_at"] = None
     effective_kwargs["metadata"] = base_meta
 
 
@@ -190,23 +233,28 @@ async def validate_earnings_stage_allowed_for_user(
         if dot_form not in candidates:
             candidates.append(dot_form)
 
+    # Never reuse a non-SQL sentinel/mock lock handle as a psycopg connection
+    sql_conn = conn if (conn is not None and callable(getattr(conn, "cursor", None))) else None
+
     cov_row: dict[str, Any] | None = None
     try:
         for cand in candidates:
-            cov_row = await coverage_db.get_coverage_row(uid, cand, conn=conn)
+            cov_row = await coverage_db.get_coverage_row(uid, cand, conn=sql_conn)
             if cov_row is not None:
                 break
     except Exception as exc:
-        msg = str(exc).lower()
-        if any(
-            tok in msg
-            for tok in ("pool is not open", "not initialized", "connection pool", "does not exist")
-        ):
-            return None
-        raise
+        return {
+            "ok": False,
+            "error": "earnings_stage_check_unavailable",
+            "message": f"无法核验 {candidates[0]} 的实时观察名单分档，拒绝排程财报 {stage} 阶段任务（{type(exc).__name__}）。",
+        }
 
     if cov_row is None:
-        return None
+        return {
+            "ok": False,
+            "error": "earnings_stage_disabled",
+            "message": f"{candidates[0]} 当前不在个人观察名单中，不启用财报 {stage} 阶段自动任务。",
+        }
 
     sym = str(cov_row.get("ticker") or candidates[0]).strip().upper()
     if bool(cov_row.get("is_private")):
@@ -217,7 +265,14 @@ async def validate_earnings_stage_allowed_for_user(
         }
 
     live_tier = str(cov_row.get("tier") or "").strip().lower()
-    base_policy = await get_user_tier_policy(uid, live_tier, conn=conn)
+    try:
+        base_policy = await get_user_tier_policy(uid, live_tier, conn=sql_conn)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": "earnings_stage_check_unavailable",
+            "message": f"无法读取 {sym} 的生效分档策略，拒绝排程财报 {stage} 阶段任务（{type(exc).__name__}）。",
+        }
     eff_policy = resolve_effective_company_policy(base_policy, cov_row.get("task_overrides"))
     if stage not in set(eff_policy.earnings_stages):
         return {
@@ -237,5 +292,6 @@ __all__ = [
     "can_override_user_pause_locked",
     "is_dalton_managed_automation",
     "parse_earnings_stage_task_name",
+    "resolve_paused_once_schedule_at",
     "validate_earnings_stage_allowed_for_user",
 ]

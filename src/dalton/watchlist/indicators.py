@@ -26,6 +26,35 @@ _EXCHANGE_TZ_BY_SUFFIX: tuple[tuple[str, str], ...] = (
 _DEFAULT_EXCHANGE_TZ = "America/New_York"
 
 
+_EXCHANGE_MIC_BY_SUFFIX: tuple[tuple[str, str], ...] = (
+    (".HK", "XHKG"),
+    (".SS", "XSHG"),
+    (".SH", "XSHG"),
+    (".SZ", "XSHE"),
+    (".BJ", "XSHG"),
+    (".T", "XTKS"),
+    (".JP", "XTKS"),
+    (".L", "XLON"),
+)
+
+
+def _is_exchange_trading_day(d: date, symbol: str | None) -> bool:
+    """Use ``market_protocol.calendars`` for real holiday awareness, falling back to weekdays."""
+    sym = str(symbol or "").strip().upper()
+    mic = "XNYS"
+    for suffix, mapped_mic in _EXCHANGE_MIC_BY_SUFFIX:
+        if sym.endswith(suffix):
+            mic = mapped_mic
+            break
+    try:
+        from market_protocol.calendars import get_calendar
+
+        cal = get_calendar(mic)
+        return bool(cal.is_trading_day(d))
+    except Exception:
+        return d.weekday() < 5
+
+
 def exchange_timezone_for_symbol(symbol: str | None) -> ZoneInfo:
     """Resolve the exchange ``ZoneInfo`` for ``symbol`` (defaults to ``America/New_York``)."""
     sym = str(symbol or "").strip().upper()
@@ -203,7 +232,7 @@ def compute_symbol_metrics(
         eff_now = eff_now.replace(tzinfo=timezone.utc)
     exchange_today = eff_now.astimezone(tz).date()
 
-    # Anchor end-of-series to live price in exchange timezone without fabricating weekend/holiday/duplicate bars
+    # Anchor end-of-series to live price in exchange timezone using real exchange trading calendar
     eff_closes = list(closes)
     terminal_trade_date: date | None = last_bar_date
     if price is not None and eff_closes and last_bar_date is not None:
@@ -211,7 +240,7 @@ def compute_symbol_metrics(
             if quote_trade_date == last_bar_date:
                 eff_closes[-1] = price
                 terminal_trade_date = quote_trade_date
-            elif quote_trade_date > last_bar_date and quote_trade_date.weekday() < 5:
+            elif quote_trade_date > last_bar_date and _is_exchange_trading_day(quote_trade_date, symbol):
                 eff_closes.append(price)
                 terminal_trade_date = quote_trade_date
         else:
@@ -220,7 +249,7 @@ def compute_symbol_metrics(
                 terminal_trade_date = exchange_today
             elif (
                 exchange_today > last_bar_date
-                and exchange_today.weekday() < 5
+                and _is_exchange_trading_day(exchange_today, symbol)
                 and abs(price - eff_closes[-1]) > 1e-9
             ):
                 eff_closes.append(price)
@@ -241,10 +270,21 @@ def compute_symbol_metrics(
     chg_3m = _pct_change(price, _lookback_base(63))
     chg_1y = _pct_change(price, _lookback_base(252))
 
-    # YTD: anchored to the last trading day of (terminal_trade_date.year - 1)
+    # YTD: anchored to the last trading day of (ref_year - 1).
+    # On holidays like Jan 1 (New Year's Day), exchange_today is already in the new year
+    # even though last_bar_date was Dec 31 of the prior year -> YTD must be 0%, not prior year's gain.
     chg_ytd: float | None = None
     if parsed and price is not None:
-        ref_year = (terminal_trade_date or exchange_today).year
+        if now_utc is not None:
+            ref_year = exchange_today.year
+        elif (
+            terminal_trade_date is not None
+            and exchange_today >= terminal_trade_date
+            and (exchange_today - terminal_trade_date).days <= 14
+        ):
+            ref_year = exchange_today.year
+        else:
+            ref_year = (terminal_trade_date or exchange_today).year
         prior_year_closes = [
             row[1] for row in parsed if row[0] is not None and row[0].year <= (ref_year - 1)
         ]

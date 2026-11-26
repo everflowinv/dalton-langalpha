@@ -1676,13 +1676,13 @@ async def enable_tracking(
                         for p in std_prefixes_empty
                         for sfx in std_suffixes_empty
                     )
-                    is_unstarted_earn_once = (
+                    from src.dalton.watchlist.reconciler import is_unstarted_earn_once
+
+                    is_unstarted_earn_once_row = (
                         any(r_name.startswith(f"{p}earn-") for p in std_prefixes_empty)
-                        and str(r.get("trigger_type") or "").strip().lower() == "once"
-                        and r.get("last_run_at") is None
-                        and not (isinstance(r.get("run_count"), int) and r["run_count"] > 0)
+                        and await is_unstarted_earn_once(r, conn=conn)
                     )
-                    if not (is_std_row or is_unstarted_earn_once):
+                    if not (is_std_row or is_unstarted_earn_once_row):
                         continue
                     if r_status != "active":
                         continue

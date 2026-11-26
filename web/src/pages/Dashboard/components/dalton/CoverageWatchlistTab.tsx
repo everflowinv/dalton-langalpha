@@ -27,6 +27,7 @@ import {
   buildCoverageRowsForCompanies,
   coverageQuoteRow,
   MAX_DASHBOARD_COVERAGE_QUOTES,
+  setActiveDashboardCoverageTier,
   useCoverageWatchlistData,
   type CoverageWatchlistRow,
 } from '../../hooks/useCoverageWatchlistData';
@@ -101,6 +102,11 @@ export function useFilteredCoverageWatchlistRows(
   filteredTotalCount: number;
   quotesBridge: ReactNode;
 } {
+  useEffect(() => {
+    setActiveDashboardCoverageTier(coverageTier);
+    return () => setActiveDashboardCoverageTier('all');
+  }, [coverageTier]);
+
   const allCompanies = coverage.allCompanies ?? EMPTY_COMPANIES;
   const filteredCompanies = useMemo(() => {
     if (allCompanies.length === 0) return EMPTY_COMPANIES;

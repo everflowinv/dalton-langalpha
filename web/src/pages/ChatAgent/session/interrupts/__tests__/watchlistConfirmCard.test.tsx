@@ -313,7 +313,15 @@ describe('WatchlistConfirmCard & interrupt bucket 4-state lifecycle', () => {
     // Retry button stays visible when still partial
     expect(screen.getByRole('button', { name: /一键补齐同步|Retry sync/i })).toBeTruthy();
 
-    // Second click succeeds -> Retry button disappears & settled label updates
+    // r5: If another worker is already running (status='running', claimed=false), keep Retry visible & show running notice
+    spyReconcile.mockResolvedValueOnce({ ok: true, status: 'running', claimed: false });
+    fireEvent.click(screen.getByRole('button', { name: /一键补齐同步|Retry sync/i }));
+    await waitFor(() => {
+      expect(screen.getByText(/正在后台运行|already running/i)).toBeTruthy();
+    });
+    expect(screen.getByRole('button', { name: /一键补齐同步|Retry sync/i })).toBeTruthy();
+
+    // Final click succeeds (status='completed') -> Retry button disappears & settled label updates
     spyReconcile.mockResolvedValueOnce({ ok: true, status: 'completed' });
     fireEvent.click(screen.getByRole('button', { name: /一键补齐同步|Retry sync/i }));
     await waitFor(() => {

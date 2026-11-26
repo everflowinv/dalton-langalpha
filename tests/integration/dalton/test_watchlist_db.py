@@ -384,7 +384,7 @@ def test_d056_upgrade_backfill_and_downgrade_with_radar_samples() -> None:
                 # r4 Decision 7: re-upgrade enqueues a pending migration_restore_radar reconcile job for NET
                 cur.execute(
                     """
-                    SELECT trigger_action, pending_tickers, status
+                    SELECT job_id::text, trigger_action, pending_tickers, status
                     FROM dalton_watchlist_reconcile_jobs
                     WHERE user_id = %s AND trigger_action = 'migration_restore_radar'
                     """,
@@ -392,9 +392,83 @@ def test_d056_upgrade_backfill_and_downgrade_with_radar_samples() -> None:
                 )
                 mig_job = cur.fetchone()
                 assert mig_job is not None
-                assert mig_job[0] == "migration_restore_radar"
-                assert mig_job[1] == ["NET"]
-                assert mig_job[2] == "pending"
+                mig_job_id = mig_job[0]
+                assert mig_job[1] == "migration_restore_radar"
+                assert mig_job[2] == ["NET"]
+                assert mig_job[3] == "pending"
+
+                # r5: seed an active automation for NET and verify executing the restore job pauses it
+                net_ws_id = str(uuid.uuid4())
+                net_auto_id = str(uuid.uuid4())
+                cur.execute(
+                    """
+                    INSERT INTO users (user_id, email, name)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    (test_uid, f"{test_uid}@example.com", "Roundtrip User"),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO workspaces (workspace_id, user_id, name, status)
+                    VALUES (%s::uuid, %s, 'NET', 'running')
+                    """,
+                    (net_ws_id, test_uid),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO automations (
+                        automation_id, user_id, name, trigger_type, cron_expression,
+                        timezone, instruction, next_run_at, workspace_id, status, metadata
+                    )
+                    VALUES (
+                        %s::uuid, %s, 'dalton-net-watch', 'cron', '0 9 * * 1-5',
+                        'America/New_York', 'Watch NET', NOW() + INTERVAL '1 day',
+                        %s::uuid, 'active', '{"ticker": "NET", "dalton_managed": true}'::jsonb
+                    )
+                    """,
+                    (net_auto_id, test_uid, net_ws_id),
+                )
+            conn.commit()
+
+        # Execute the migration_restore_radar outbox job against the real DB and verify task is paused
+        import asyncio
+        from psycopg_pool import AsyncConnectionPool
+        import src.dalton.watchlist.reconciler as reconciler_mod
+        import src.server.database.pool as pool_mod
+
+        async def _consume_restore_job() -> None:
+            pool = AsyncConnectionPool(conninfo=iso_dsn, min_size=1, max_size=2, open=False)
+            await pool.open()
+            prev_pool = pool_mod._pool
+            pool_mod._pool = pool
+            orig_sync = reconciler_mod.sync_user_coverage_to_home
+
+            async def _noop_sync(*_a: Any, **_kw: Any) -> bool:
+                return True
+
+            reconciler_mod.sync_user_coverage_to_home = _noop_sync  # type: ignore[assignment]
+            try:
+                res = await reconciler_mod.TierPolicyReconciler().reconcile_job(
+                    test_uid, mig_job_id, sync_home=True
+                )
+                assert res["status"] == "completed"
+            finally:
+                reconciler_mod.sync_user_coverage_to_home = orig_sync
+                pool_mod._pool = prev_pool
+                await pool.close()
+
+        asyncio.run(_consume_restore_job())
+
+        with psycopg.connect(iso_dsn, autocommit=False) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status, next_run_at FROM automations WHERE automation_id = %s::uuid",
+                    (net_auto_id,),
+                )
+                st_after, next_after = cur.fetchone()
+                assert st_after == "paused"
+                assert next_after is None
 
 
 @pytest.mark.asyncio
@@ -620,3 +694,87 @@ async def test_r4_coverage_units_enabled_real_pg_tx(
                     assert resolved == ws_id
         finally:
             await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_r5_expired_lease_takeover_blocks_old_worker_side_effects_real_pg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r5 (Real PG): Once a lease expires and Worker B takes over, Worker A aborts BEFORE executing side effects."""
+    from src.dalton.watchlist import policies as policies_mod
+    from src.dalton.watchlist import reconciler as reconciler_mod
+
+    with _isolated_pg_database(PG_DSN) as iso_dsn:
+        env = _alembic_env_for_dsn(iso_dsn)
+        _run_alembic(["upgrade", "head"], env=env, dalton=False)
+        _run_alembic(["upgrade", "head"], env=env, dalton=True)
+
+        @asynccontextmanager
+        async def _connect_iso(existing_conn: Any = None):
+            if existing_conn is not None:
+                yield existing_conn
+                return
+            async with await psycopg.AsyncConnection.connect(iso_dsn) as aconn:
+                yield aconn
+
+        monkeypatch.setattr(policies_mod, "get_db_connection", _connect_iso)
+
+        uid = f"u-exp-{uuid.uuid4().hex[:8]}"
+        job = await policies_mod.insert_reconcile_job(
+            uid,
+            trigger_action="set_tier",
+            target_policy_versions={"core": 1},
+            pending_tickers=["NVDA"],
+            roster_revision=1,
+        )
+        jid = str(job["job_id"])
+
+        # Worker A claims job with 1-second lease
+        claimed_a = await policies_mod.claim_reconcile_job(uid, jid, lease_seconds=1)
+        assert claimed_a is not None
+        # Expire lease deterministically in PG and let Worker B take over
+        async with await psycopg.AsyncConnection.connect(iso_dsn) as aconn:
+            async with aconn.transaction():
+                async with aconn.cursor() as cur:
+                    await cur.execute(
+                        "UPDATE dalton_watchlist_reconcile_jobs SET claim_expires_at = NOW() - INTERVAL '5 seconds' WHERE job_id = %s::uuid",
+                        (jid,),
+                    )
+        claimed_b = await policies_mod.claim_reconcile_job(uid, jid, lease_seconds=60)
+        assert claimed_b is not None
+        assert claimed_b["claim_token"] != claimed_a["claim_token"]
+
+        side_effects: list[str] = []
+
+        async def _track_side_effect(self: Any, user_id: str, ticker: str, **kwargs: Any) -> dict[str, Any]:
+            _ = (self, user_id, kwargs)
+            side_effects.append(ticker)
+            return {"ticker": ticker, "ok": True, "actions": []}
+
+        monkeypatch.setattr(
+            reconciler_mod.TierPolicyReconciler,
+            "reconcile_company",
+            create_autospec(
+                reconciler_mod.TierPolicyReconciler.reconcile_company,
+                side_effect=_track_side_effect,
+            ),
+        )
+        monkeypatch.setattr(
+            reconciler_mod,
+            "sync_user_coverage_to_home",
+            create_autospec(reconciler_mod.sync_user_coverage_to_home, return_value=True),
+        )
+
+        # Old Worker A resumes with its stale preclaimed job -> MUST abort BEFORE reconcile_company!
+        res_a = await reconciler_mod.TierPolicyReconciler().reconcile_job(
+            uid, jid, sync_home=True, _preclaimed_job=claimed_a
+        )
+        assert res_a["reason"] == "lease_lost"
+        assert side_effects == []
+
+        # Worker B runs with valid lease -> succeeds
+        res_b = await reconciler_mod.TierPolicyReconciler().reconcile_job(
+            uid, jid, sync_home=True, _preclaimed_job=claimed_b
+        )
+        assert res_b["status"] == "completed"
+        assert side_effects == ["NVDA"]

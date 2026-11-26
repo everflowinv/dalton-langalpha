@@ -313,6 +313,8 @@ async def build_ptc_graph_with_session(
     claude_code_launcher: Any | None = None,
     thread_history: Any | None = None,
     member_context: Any | None = None,
+    # DALTON-HOOK(watchlist): withhold personal watchlist tool on individually shared threads
+    thread_is_shared: bool = False,
 ) -> Any:
     """Build a BackgroundSubagentOrchestrator from a pre-acquired session (WorkspaceManager path).
 
@@ -503,6 +505,11 @@ async def build_ptc_graph_with_session(
             else {}
         ),  # DALTON-HOOK(research-writing)
         member_context=member_context,
+        **(
+            {"thread_is_shared": True}
+            if thread_is_shared
+            else {}
+        ),  # DALTON-HOOK(watchlist)
     )
 
     logger.debug(

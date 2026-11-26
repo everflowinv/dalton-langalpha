@@ -76,8 +76,7 @@ def upgrade() -> None:
         """
         UPDATE dalton_coverage_groups
         SET default_tier = 'radar',
-            criteria = COALESCE(criteria, '{}'::jsonb) - '_downgraded_default_tier',
-            updated_at = NOW()
+            criteria = COALESCE(criteria, '{}'::jsonb) - '_downgraded_default_tier'
         WHERE COALESCE(criteria->>'_downgraded_default_tier', '') = 'radar'
         """
     )
@@ -315,8 +314,7 @@ def downgrade() -> None:
         UPDATE dalton_coverage_groups
         SET criteria = COALESCE(criteria, '{}'::jsonb)
                        || jsonb_build_object('_downgraded_default_tier', 'radar'),
-            default_tier = 'watch',
-            updated_at = NOW()
+            default_tier = 'watch'
         WHERE default_tier = 'radar'
         """
     )

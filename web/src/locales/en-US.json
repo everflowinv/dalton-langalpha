@@ -1962,6 +1962,7 @@
       "decline": "Cancel",
       "retryReconcile": "Retry sync",
       "retrying": "Syncing…",
+      "retryRunningError": "Sync is already running in the background. Please try again shortly.",
       "retryPartialError": "Some tasks are still pending sync. Please retry.",
       "retryFailedError": "Sync retry failed. Please try again.",
       "changeLabels": {

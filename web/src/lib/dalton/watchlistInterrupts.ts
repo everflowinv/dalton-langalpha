@@ -179,16 +179,53 @@ export function rearmHistoryWatchlistInterrupt(params: {
   return true;
 }
 
+export function projectLiveWatchlistInterrupt(params: {
+  actionType: WatchlistProposalActionType;
+  interruptId: string | undefined;
+  proposalData: Record<string, unknown>;
+  assistantMessageId: string;
+  order: number;
+  interruptAlreadyRendered: boolean;
+  setMessages: (updater: (prev: any[]) => any[]) => void;
+  updateMessage: (prev: any[], id: string, fn: (m: any) => any) => any[];
+  setCardStatus: (prev: any[], field: 'watchlistProposals', pid: string, status: 'pending') => any[];
+  appendCardSegment: (
+    segments: AssistantMessage['contentSegments'],
+    seg: { type: WatchlistProposalActionType; proposalId: string; order: number },
+  ) => AssistantMessage['contentSegments'];
+  arm: (info: {
+    type: WatchlistProposalActionType;
+    interruptId: string | undefined;
+    assistantMessageId: string;
+    proposalId: string;
+    toolCallId: string;
+  }) => void;
+}): void {
+  const {
+    actionType, interruptId, proposalData, assistantMessageId, order,
+    interruptAlreadyRendered, setMessages, updateMessage, setCardStatus, appendCardSegment, arm,
+  } = params;
+  const proposalId = interruptId || `watchlist-${actionType}-${Date.now()}`;
+  const { state, toolCallId, hasToolCallId } = buildWatchlistProposalState(actionType, proposalData, interruptId);
+  setMessages((prev) =>
+    interruptAlreadyRendered
+      ? (hasToolCallId ? setCardStatus(prev, 'watchlistProposals', proposalId, 'pending') : prev)
+      : updateMessage(prev, assistantMessageId, (m) =>
+          m.role === 'assistant'
+            ? applyWatchlistProposalToMessage(m as AssistantMessage, actionType, proposalId, order, state, appendCardSegment, { isStreaming: false })
+            : m),
+  );
+  if (hasToolCallId) arm({ type: actionType, interruptId, assistantMessageId, proposalId, toolCallId });
+}
+
 export function projectHistoryWatchlistInterrupt(params: {
   actionType: WatchlistProposalActionType;
   interruptId: string | undefined;
   proposalData: Record<string, unknown>;
   assistantMessageId: string;
   order: number;
-  applyToMessage: (
-    proposalId: string,
-    state: WatchlistProposalState,
-  ) => void;
+  setMessages: (updater: (prev: any[]) => any[]) => void;
+  updateMessage: (prev: any[], id: string, fn: (m: any) => any) => any[];
   pendingHistoryInterrupts: Array<{
     type: string;
     assistantMessageId: string;
@@ -197,10 +234,18 @@ export function projectHistoryWatchlistInterrupt(params: {
     toolCallId?: string;
   }>;
 }): void {
-  const { actionType, interruptId, proposalData, assistantMessageId, applyToMessage, pendingHistoryInterrupts } = params;
+  const {
+    actionType, interruptId, proposalData, assistantMessageId, order,
+    setMessages, updateMessage, pendingHistoryInterrupts,
+  } = params;
   const proposalId = interruptId || `watchlist-${actionType}-history-${Date.now()}`;
   const { state, toolCallId, hasToolCallId } = buildWatchlistProposalState(actionType, proposalData, interruptId);
-  applyToMessage(proposalId, state);
+  setMessages((prev) =>
+    updateMessage(prev, assistantMessageId, (m) =>
+      m.role === 'assistant'
+        ? applyWatchlistProposalToMessage(m as AssistantMessage, actionType, proposalId, order, state, (segs, s) => [...(segs || []), s])
+        : m),
+  );
   if (hasToolCallId) {
     pendingHistoryInterrupts.push({
       type: actionType,

@@ -1177,3 +1177,93 @@ async def test_r4_server_issued_snapshots_web_exempt_add_group_binding_legacy_an
     assert res_resolve["job_id"] in state["jobs"]
     assert state["jobs"][res_resolve["job_id"]]["trigger_action"] == "resolve_group"
     assert state["jobs"][res_resolve["job_id"]]["roster_revision"] >= 1
+
+    # 6. r5: Public /watchlist/mutate rejects internal-only action='resolve_group' (400),
+    #    public POST /coverage/groups/{id}/resolve requires snapshot_id (409 without),
+    #    and legacy POST /coverage/groups/preview issues a real server snapshot_id.
+    r_pub_resolve_mutate = client.post(
+        "/api/v1/dalton/watchlist/mutate",
+        json={"action": "resolve_group", "group_id": gid_b},
+    )
+    assert r_pub_resolve_mutate.status_code == 400
+
+    r_pub_resolve_no_snap = client.post(f"/api/v1/dalton/coverage/groups/{gid_b}/resolve")
+    assert r_pub_resolve_no_snap.status_code == 409
+
+    r_legacy_preview = client.post(
+        "/api/v1/dalton/coverage/groups/preview",
+        json={"label": "Legacy Cloud", "criteria": {"sector": "Tech"}, "default_tier": "watch"},
+    )
+    assert r_legacy_preview.status_code == 200
+    assert r_legacy_preview.json()["snapshot_id"]
+    assert "CRWD" in r_legacy_preview.json()["matched_tickers"]
+
+
+@pytest.mark.asyncio
+async def test_r5_shared_thread_strips_context_and_withholds_tool_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r5: Individually shared thread uses real get_thread_auth_meta, strips context,
+    withholds dalton_coverage tool, and fails closed when share lookup errors."""
+    from types import SimpleNamespace
+    from src.dalton.tools import build_dalton_tools
+    from src.dalton.watchlist import privacy as privacy_mod
+    from src.server.database.conversation import threads_read as threads_read_mod
+
+    orig_get_meta = threads_read_mod.get_thread_auth_meta
+    monkeypatch.setattr(
+        threads_read_mod,
+        "get_thread_auth_meta",
+        create_autospec(
+            orig_get_meta,
+            return_value={"user_id": USER_ALICE, "is_shared": True},
+        ),
+    )
+    assert await privacy_mod.is_thread_shared("thread-shared-1") is True
+    assert (
+        privacy_mod.is_personal_watchlist_turn_allowed(
+            own_data=True,
+            thread_is_shared=True,
+            user_id=USER_ALICE,
+            owner_id=USER_ALICE,
+        )
+        is False
+    )
+    tools_shared = build_dalton_tools(
+        "chief_of_staff",
+        None,
+        allow_personal_watchlist=privacy_mod.is_personal_watchlist_turn_allowed(
+            own_data=True,
+            thread_is_shared=await privacy_mod.is_thread_shared("thread-shared-1"),
+            user_id=USER_ALICE,
+            owner_id=USER_ALICE,
+        ),
+    )
+    assert all(getattr(t, "name", "") != "dalton_coverage" for t in tools_shared)
+
+    req_shared = SimpleNamespace(
+        additional_context=[
+            {"type": "watchlist_context", "content": "<watchlist_context>secret</watchlist_context>"},
+            {"type": "directive", "content": "keep"},
+        ]
+    )
+    await privacy_mod.sanitize_turn_watchlist_context(
+        req_shared,
+        thread_id="thread-shared-1",
+        is_shared=False,
+        user_id=USER_ALICE,
+        workspace_owner_id=USER_ALICE,
+    )
+    assert len(req_shared.additional_context) == 1
+    assert req_shared.additional_context[0]["type"] == "directive"
+
+    # Fail-closed when thread auth meta lookup raises
+    monkeypatch.setattr(
+        threads_read_mod,
+        "get_thread_auth_meta",
+        create_autospec(
+            orig_get_meta,
+            side_effect=RuntimeError("db down"),
+        ),
+    )
+    assert await privacy_mod.is_thread_shared("thread-err-1") is True

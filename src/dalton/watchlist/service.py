@@ -477,6 +477,39 @@ class WatchlistMutationService:
             )
             raw_tickers = list(norm_tickers)
 
+        elif act == "resolve_group":
+            target_gid = str(group_id or label or "").strip()
+            if not target_gid:
+                raise ValueError("执行 resolve_group 时必须提供 group_id。")
+            matched_group = await coverage_db.get_coverage_group(uid, target_gid)
+            if matched_group is None:
+                return {
+                    "ok": False,
+                    "raw_action": act,
+                    "action": None,
+                    "requires_confirmation": False,
+                    "error": "group_not_found",
+                    "precheck_error": f"未找到规则组 `{target_gid}`。",
+                    "owner_user_id": uid,
+                }
+            resolved_group_id = str(matched_group["group_id"])
+            resolved_group_label = str(matched_group.get("label") or resolved_group_id)
+            resolved_criteria = dict(matched_group.get("criteria") or {})
+            target_tier = normalize_tier(matched_group.get("default_tier"), default="watch")
+            grp_preview = await preview_coverage_group(resolved_group_label, resolved_criteria)
+            resolved_companies = grp_preview.get("companies") or []
+            not_found = list(grp_preview.get("not_found") or [])
+            matched_all = [
+                str(c["ticker"]).upper() for c in resolved_companies if c.get("ticker")
+            ]
+            norm_tickers = [t for t in matched_all if t not in existing_by_ticker]
+            raw_tickers = list(norm_tickers)
+            prevalidated = {
+                str(c["ticker"]).upper(): dict(c)
+                for c in resolved_companies
+                if c.get("ticker")
+            }
+
         else:
             raise ValueError(f"Unsupported watchlist mutation action: {action!r}")
 
@@ -619,7 +652,7 @@ class WatchlistMutationService:
             else:
                 confirm_action_type = "watchlist_batch_add"
                 requires_confirmation = True
-        elif act == "add_group":
+        elif act in ("add_group", "resolve_group"):
             confirm_action_type = "watchlist_batch_add"
             requires_confirmation = True
         elif act == "set_tier":
@@ -744,6 +777,7 @@ class WatchlistMutationService:
         now: datetime | None = None,
         sync_home: bool = True,
         reconcile_now: bool = True,
+        allow_internal: bool = False,
     ) -> dict[str, Any]:
         """Execute Stage 1 (locked server-snapshot check + DB write + Outbox insert) and Stage 2/3 reconciliation."""
         uid = str(user_id or "").strip()
@@ -797,6 +831,10 @@ class WatchlistMutationService:
             }
 
         if act == "resolve_group":
+            if not allow_internal and clean_snapshot_id is None:
+                raise WatchlistScopeChangedError(
+                    "刷新规则组需要预览确认快照，或由后台定期任务内部触发。"
+                )
             gid = str(group_id or "").strip()
             if not gid:
                 raise ValueError("user_id and group_id are required")
@@ -840,6 +878,39 @@ class WatchlistMutationService:
                     has_any_rows = bool(matched_by_ticker or existing_rows)
 
                     new_tickers = [t for t in matched_by_ticker if t not in existing_by_ticker]
+                    if not allow_internal:
+                        snap_row_res = await get_confirm_snapshot(
+                            uid,
+                            clean_snapshot_id or "",
+                            for_update=True,
+                            conn=db_conn,
+                        )
+                        if snap_row_res is None:
+                            raise WatchlistScopeChangedError("确认快照无效、已过期或已被使用，请重新预览确认。")
+                        snap_res = snap_row_res.get("payload")
+                        if not isinstance(snap_res, Mapping):
+                            raise WatchlistScopeChangedError()
+                        if str(snap_res.get("raw_action") or "").strip().lower() != "resolve_group":
+                            raise WatchlistScopeChangedError()
+                        if str(snap_res.get("group_id") or "").strip() != gid:
+                            raise WatchlistScopeChangedError()
+                        live_state_res = await get_user_roster_state(uid, conn=db_conn)
+                        if int(snap_res.get("roster_revision", 0)) != int(
+                            live_state_res.get("roster_revision") or 0
+                        ):
+                            raise WatchlistScopeChangedError()
+                        snap_new_tickers = sorted(
+                            str(t).strip().upper()
+                            for t in (snap_res.get("target_tickers") or [])
+                            if str(t).strip()
+                        )
+                        if sorted(new_tickers) != snap_new_tickers:
+                            raise WatchlistScopeChangedError()
+                        consumed_res = await consume_confirm_snapshot(
+                            uid, clean_snapshot_id or "", conn=db_conn
+                        )
+                        if consumed_res is None:
+                            raise WatchlistScopeChangedError("确认快照已被使用或已过期，请重新预览确认。")
                     tickers_needing_membership = [
                         t
                         for t in matched_by_ticker

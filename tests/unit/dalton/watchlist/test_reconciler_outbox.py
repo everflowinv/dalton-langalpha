@@ -172,6 +172,18 @@ class _FakeWatchlistInfra:
                 and (j["status"] in ("pending", "running", "partial") or not j["yaml_synced"])
             ]
 
+        async def _renew_lease(
+            uid: str,
+            jid: str,
+            *,
+            claim_token: str,
+            lease_seconds: int = 300,
+            conn: Any = None,
+        ) -> bool:
+            _ = (lease_seconds, conn)
+            job = infra.jobs.get(jid)
+            return bool(job and job["user_id"] == uid and job.get("claim_token") == claim_token)
+
         async def _update_job(
             uid: str,
             jid: str,
@@ -183,6 +195,7 @@ class _FakeWatchlistInfra:
             status: str | None = None,
             claim_token: str | None = None,
             release_claim: bool = False,
+            only_unclaimed_completed: bool = False,
             lease_seconds: int = 300,
             conn: Any = None,
         ) -> dict[str, Any] | None:
@@ -192,6 +205,14 @@ class _FakeWatchlistInfra:
                 return None
             if claim_token is not None and job.get("claim_token") != claim_token:
                 return None
+            if claim_token is None and only_unclaimed_completed:
+                if (
+                    job.get("claim_token") is not None
+                    or job.get("status") == "running"
+                    or bool(job.get("pending_tickers"))
+                    or bool(job.get("failed_items"))
+                ):
+                    return None
             if pending_tickers is not None:
                 job["pending_tickers"] = list(pending_tickers)
             if completed_tickers is not None:
@@ -346,6 +367,11 @@ class _FakeWatchlistInfra:
             reconciler_mod,
             "list_unfinished_reconcile_jobs",
             create_autospec(policies_mod.list_unfinished_reconcile_jobs, side_effect=_list_unfinished),
+        )
+        monkeypatch.setattr(
+            reconciler_mod,
+            "renew_reconcile_job_lease",
+            create_autospec(policies_mod.renew_reconcile_job_lease, side_effect=_renew_lease),
         )
         monkeypatch.setattr(
             reconciler_mod,
@@ -1341,3 +1367,295 @@ async def test_r4_earnings_stage_guard_and_calendar_state_live_tier_consistency(
     diff_out = json.loads(buf3.getvalue())
     assert diff_out["reconciled"] is True
     assert diff_out["missing"] == []
+
+
+@pytest.mark.asyncio
+async def test_r5_outbox_lease_checked_before_side_effects_and_mark_yaml_skips_leased(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r5: Stale worker aborts BEFORE executing reconcile_company or Home YAML sync when lease is lost;
+    mark_yaml_synced_for_user never marks currently-leased or non-completed jobs."""
+    infra = _FakeWatchlistInfra()
+    infra.install(monkeypatch)
+    infra.workspaces[("u1", "NVDA")] = "ws-nvda"
+    infra.workspace_owners["ws-nvda"] = "u1"
+    infra.workspace_rows["ws-nvda"] = {"workspace_id": "ws-nvda", "user_id": "u1", "name": "NVDA", "status": "running"}
+    infra.coverage[("u1", "NVDA")] = {"user_id": "u1", "ticker": "NVDA", "tier": "core", "is_private": False, "extra": {"workspace": {"workspace_id": "ws-nvda"}}}
+
+    jid = str(uuid.uuid4())
+    job: dict[str, Any] = {
+        "job_id": jid,
+        "user_id": "u1",
+        "trigger_action": "set_tier",
+        "target_policy_versions": {"core": 1},
+        "pending_tickers": ["NVDA"],
+        "completed_tickers": [],
+        "failed_items": [],
+        "override_user_pause": False,
+        "job_context": {},
+        "roster_revision": 1,
+        "yaml_synced": False,
+        "status": "running",
+        "claim_token": "tok-worker-b",  # Another worker now owns the lease
+    }
+    infra.jobs[jid] = job
+
+    reconcile_calls: list[str] = []
+
+    async def _spy_company(self: Any, uid: str, sym: str, **kw: Any) -> dict[str, Any]:
+        _ = (self, uid, kw)
+        reconcile_calls.append(sym)
+        return {"ticker": sym, "ok": True, "actions": []}
+
+    monkeypatch.setattr(
+        reconciler_mod.TierPolicyReconciler,
+        "reconcile_company",
+        create_autospec(reconciler_mod.TierPolicyReconciler.reconcile_company, side_effect=_spy_company),
+    )
+
+    # Old Worker A holds stale token 'tok-worker-a' -> MUST abort before calling reconcile_company or YAML sync
+    stale_preclaimed = {**job, "claim_token": "tok-worker-a"}
+    res_stale = await reconciler_mod.TierPolicyReconciler().reconcile_job(
+        "u1", jid, sync_home=True, _preclaimed_job=stale_preclaimed
+    )
+    assert res_stale["reason"] == "lease_lost"
+    assert reconcile_calls == []
+    assert infra.home_sync_calls == 0
+
+    # mark_yaml_synced_for_user skips leased running job even when pending_tickers is empty
+    job["pending_tickers"] = []
+    job["failed_items"] = []
+    marked = await reconciler_mod.TierPolicyReconciler().mark_yaml_synced_for_user("u1")
+    assert marked == 0
+    assert job["yaml_synced"] is False
+
+
+@pytest.mark.asyncio
+async def test_r5_tracking_locked_reconciler_composed_and_manual_pause_once_clears_next_run_at() -> None:
+    """r5: Nested automation_history_context composes parent & inner locked_row_reconcilers;
+    manual pause of Dalton once task clears next_run_at while preserving once_schedule_at for future resume."""
+    from src.dalton.services.company_automations import (
+        automation_history_context,
+        get_current_history_context,
+    )
+    from src.dalton.watchlist.pause_guards import build_locked_resume_reconciler
+    from src.server.services.automations.lifecycle import (
+        apply_locked_pause_schedule,
+        pause_update_fields,
+        resume_update_fields,
+    )
+
+    # 1. Nested automation_history_context composes inner + outer reconcilers (outer keeps final authority)
+    order: list[str] = []
+
+    async def _inner(locked_row: Any, eff: dict[str, Any], conn: Any) -> None:
+        _ = (locked_row, conn)
+        order.append("inner")
+        eff["status"] = "active"
+        eff["next_run_at"] = datetime.now(UTC) + timedelta(hours=1)
+
+    outer = build_locked_resume_reconciler(override_user_pause=False, override_pause_versions=None)
+    with automation_history_context(actor_user_id="u1", action="resume", locked_row_reconciler=outer):
+        with automation_history_context(actor_user_id="u1", action="resume", locked_row_reconciler=_inner):
+            ctx = get_current_history_context()
+            assert ctx is not None and ctx.locked_row_reconciler is not None
+            eff: dict[str, Any] = {"status": "active"}
+            locked_paused = {
+                "automation_id": "a-1",
+                "status": "paused",
+                "config_version": 3,
+                "metadata": {"paused_by_user": True},
+            }
+            await ctx.locked_row_reconciler(locked_paused, eff, None)
+            assert order == ["inner"]
+            assert eff["status"] == "paused"
+            assert eff["next_run_at"] is None
+            assert eff["metadata"]["paused_by_user"] is True
+
+    # 2. Manual pause of Dalton once task clears next_run_at and saves once_schedule_at; resume restores it
+    future_ts = datetime.now(UTC) + timedelta(days=5)
+    once_row = {
+        "automation_id": "a-once-1",
+        "name": "dalton-nvda-earn-2026q4-t0",
+        "trigger_type": "once",
+        "status": "active",
+        "timezone": "UTC",
+        "next_run_at": future_ts,
+        "metadata": {"ticker": "NVDA", "dalton_managed": True},
+    }
+    p_fields = pause_update_fields(once_row)
+    assert p_fields["status"] == "paused"
+    assert p_fields["next_run_at"] is None
+    assert p_fields["metadata"]["paused_by_user"] is True
+    assert p_fields["metadata"]["once_schedule_at"] == future_ts.isoformat()
+
+    locked_eff: dict[str, Any] = {"status": "paused", "next_run_at": future_ts}
+    apply_locked_pause_schedule(once_row, locked_eff)
+    assert locked_eff["next_run_at"] is None
+    assert locked_eff["metadata"]["once_schedule_at"] == future_ts.isoformat()
+
+    paused_row = {**once_row, **p_fields}
+    r_fields = resume_update_fields(paused_row)
+    assert r_fields["status"] == "active"
+    assert r_fields["next_run_at"] == future_ts
+
+
+@pytest.mark.asyncio
+async def test_r5_earnings_guard_refuses_removed_ticker_and_catches_claimed_pending_once_and_calendar_unified(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """r5: Removed ticker and DB errors are refused (fail-closed); scheduler-claimed pending once is caught;
+    calendar_state check/mark/diff share the exact same live-coverage stage set."""
+    import importlib.util
+    import io
+    import json
+    from contextlib import redirect_stdout
+    from pathlib import Path
+    from types import SimpleNamespace
+    from src.dalton.watchlist.pause_guards import validate_earnings_stage_allowed_for_user
+
+    orig_get_cov = coverage_db.get_coverage_row
+    orig_list_exec = reconciler_mod.exec_db.list_executions
+
+    # 1. Removed ticker (cov_row is None) -> REFUSED
+    monkeypatch.setattr(
+        coverage_db,
+        "get_coverage_row",
+        create_autospec(orig_get_cov, return_value=None),
+    )
+    err_removed = await validate_earnings_stage_allowed_for_user(
+        "u1", "dalton-nvda-earn-2026q4-t0", ticker="NVDA"
+    )
+    assert err_removed is not None and err_removed["error"] == "earnings_stage_disabled"
+
+    # 2. DB error containing 'does not exist' -> REFUSED (fail-closed, never allowed)
+    monkeypatch.setattr(
+        coverage_db,
+        "get_coverage_row",
+        create_autospec(
+            orig_get_cov,
+            side_effect=RuntimeError('relation "dalton_coverage" does not exist'),
+        ),
+    )
+    err_db = await validate_earnings_stage_allowed_for_user(
+        "u1", "dalton-nvda-earn-2026q4-t0", ticker="NVDA"
+    )
+    assert err_db is not None and err_db["error"] == "earnings_stage_check_unavailable"
+
+    # 3. Scheduler-claimed pending once (last_run_at set, pending execution) is caught by is_unstarted_earn_once
+    claimed_once_row = {
+        "automation_id": "a-claimed-once",
+        "name": "dalton-nvda-earn-2026q4-t0",
+        "trigger_type": "once",
+        "status": "active",
+        "last_run_at": datetime.now(UTC),
+        "run_count": 0,
+    }
+    monkeypatch.setattr(
+        reconciler_mod.exec_db,
+        "list_executions",
+        create_autospec(
+            orig_list_exec,
+            return_value=[{"status": "pending"}],
+        ),
+    )
+    assert await reconciler_mod.is_unstarted_earn_once(claimed_once_row) is True
+
+    monkeypatch.setattr(
+        reconciler_mod.exec_db,
+        "list_executions",
+        create_autospec(
+            orig_list_exec,
+            return_value=[{"status": "completed"}],
+        ),
+    )
+    assert await reconciler_mod.is_unstarted_earn_once(claimed_once_row) is False
+
+    # 4. calendar_state.py check / mark (--tier core) / diff all enforce live coverage (radar & removed -> [])
+    script_path = (
+        Path(__file__).resolve().parents[4]
+        / "plugins/dalton/skills/dalton-earnings-calendar/scripts/calendar_state.py"
+    )
+    spec = importlib.util.spec_from_file_location("calendar_state_r5_test", script_path)
+    assert spec and spec.loader
+    cs_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cs_mod)
+
+    cov_yaml = tmp_path / "coverage.yaml"
+    cov_yaml.write_text(
+        "companies:\n"
+        "  - ticker: NET\n"
+        "    name: Cloudflare\n"
+        "    tier: radar\n"
+        "    workspace:\n"
+        "      workspace_id: ws-net\n",
+        encoding="utf-8",
+    )
+    ledger_path = tmp_path / "ledger.json"
+    ledger_path.write_text(
+        json.dumps(
+            {
+                "updated": "2026-10-01",
+                "entries": {
+                    "GONE": {
+                        "ticker": "GONE",
+                        "tier": "Core",
+                        "workspace_id": "ws-gone",
+                        "status": "confirmed",
+                        "date_status": "confirmed",
+                        "date": "2026-11-05",
+                        "quarter": "FY26Q3",
+                        "automations": {},
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    # Radar company with explicit --tier core --t0 MUST still filter out t0!
+    buf_mark = io.StringIO()
+    with redirect_stdout(buf_mark):
+        cs_mod.cmd_mark(
+            SimpleNamespace(
+                state=str(ledger_path),
+                coverage=str(cov_yaml),
+                ticker="NET",
+                name="Cloudflare",
+                tier="core",
+                workspace_id="ws-net",
+                fiscal_note=None,
+                status="confirmed",
+                date="2026-11-05",
+                date_status="confirmed",
+                quarter="FY26Q3",
+                timing="AMC",
+                release_time_et=None,
+                call_time_et=None,
+                confidence="high",
+                source_url="https://ir.cloudflare.com",
+                source_type="company_ir",
+                reason=None,
+                automations_json=None,
+                tm3=None,
+                t0="dalton-net-earn-fy26q3-t0.json",
+                tp1=None,
+                tentative_date=None,
+                tentative_sources=None,
+                recheck_automation=None,
+            )
+        )
+    mark_res = json.loads(buf_mark.getvalue())
+    assert mark_res["entry"]["automations"] == {}
+    assert mark_res["filtered_out_stages"] == ["t0"]
+
+    # Removed company GONE -> check returns tier=None, allowed_stages=[]
+    buf_chk = io.StringIO()
+    with redirect_stdout(buf_chk):
+        cs_mod.cmd_check(
+            SimpleNamespace(state=str(ledger_path), coverage=str(cov_yaml), ticker="GONE", date="2026-11-05")
+        )
+    chk_res = json.loads(buf_chk.getvalue())
+    assert chk_res["tier"] is None
+    assert chk_res["allowed_stages"] == []

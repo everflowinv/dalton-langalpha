@@ -158,6 +158,11 @@ async def mutate_watchlist_endpoint(
 ) -> dict[str, Any]:
     uid = str(user_id).strip()
     reject_company_system_auth(uid)
+    if str(body.action or "").strip().lower() == "resolve_group":
+        raise HTTPException(
+            status_code=400,
+            detail="resolve_group is an internal-only action and cannot be invoked via /watchlist/mutate",
+        )
 
     try:
         return await WatchlistMutationService().execute_mutation(

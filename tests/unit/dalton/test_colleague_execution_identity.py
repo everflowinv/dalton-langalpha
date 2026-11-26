@@ -1722,8 +1722,27 @@ async def test_round6_item1_item2_schedule_helper_pause_resume_lifecycle_and_rep
 
     update_spy = create_autospec(auto_db.update_automation, side_effect=_fake_update)
     monkeypatch.setattr(auto_db, "update_automation", update_spy)
+    from src.dalton.database import coverage as cov_db_mod
+    from src.dalton.watchlist import policies as wl_policies_mod
 
-    # 1. Pause once preserves next_run_at (pause_update_fields does not wipe next_run_at)
+    monkeypatch.setattr(
+        cov_db_mod,
+        "get_coverage_row",
+        create_autospec(
+            cov_db_mod.get_coverage_row,
+            return_value={"ticker": "NVDA", "tier": "core", "is_private": False},
+        ),
+    )
+    monkeypatch.setattr(
+        wl_policies_mod,
+        "get_user_tier_policy",
+        create_autospec(
+            wl_policies_mod.get_user_tier_policy,
+            return_value=wl_policies_mod.DEFAULT_TIER_POLICIES["core"],
+        ),
+    )
+
+    # 1. r5: Pause Dalton-managed once clears next_run_at while preserving once_schedule_at in metadata
     paused = await sched_mod.schedule_dalton_automation_helper(
         "dalton-nvda-once",
         {"action": "pause"},
@@ -1733,8 +1752,9 @@ async def test_round6_item1_item2_schedule_helper_pause_resume_lifecycle_and_rep
     )
     assert paused["ok"] is True
     assert update_spy.await_args.kwargs["status"] == "paused"
-    assert "next_run_at" not in update_spy.await_args.kwargs
-    assert rows_by_id["auto-once-future"]["next_run_at"] == future_once
+    assert update_spy.await_args.kwargs["next_run_at"] is None
+    assert rows_by_id["auto-once-future"]["next_run_at"] is None
+    assert rows_by_id["auto-once-future"]["metadata"]["once_schedule_at"] == future_once.isoformat()
 
     # 2. Resume paused once keeps original future_once unchanged and cleans handoff_paused_reason
     update_spy.reset_mock()
@@ -1971,6 +1991,25 @@ async def test_round7_item3_item4_upsert_blocks_replaced_delta_and_schedule_rech
 
     update_spy = create_autospec(auto_db.update_automation, side_effect=_fake_update)
     monkeypatch.setattr(auto_db, "update_automation", update_spy)
+    from src.dalton.database import coverage as cov_db_mod
+    from src.dalton.watchlist import policies as wl_policies_mod
+
+    monkeypatch.setattr(
+        cov_db_mod,
+        "get_coverage_row",
+        create_autospec(
+            cov_db_mod.get_coverage_row,
+            return_value={"ticker": "NVDA", "tier": "core", "is_private": False},
+        ),
+    )
+    monkeypatch.setattr(
+        wl_policies_mod,
+        "get_user_tier_policy",
+        create_autospec(
+            wl_policies_mod.get_user_tier_policy,
+            return_value=wl_policies_mod.DEFAULT_TIER_POLICIES["core"],
+        ),
+    )
 
     # Item 3: upsert (schedule helper & REST PUT) on replaced_by_tracker delta returns resume refusal without writing
     upsert_err = await sched_mod.schedule_dalton_automation_helper(

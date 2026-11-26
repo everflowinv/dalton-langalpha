@@ -15,7 +15,6 @@ import {
   CARD_BUCKET_FOR_TYPE,
 } from './buckets';
 import {
-  applyWatchlistProposalToMessage,
   isWatchlistInterruptType,
   projectHistoryWatchlistInterrupt,
   rearmHistoryWatchlistInterrupt,
@@ -360,12 +359,7 @@ export function projectHistoryInterrupt(
     // DALTON-HOOK(watchlist): project history personal watchlist confirmation interrupt via Dalton helper
     } else if (isWatchlistInterruptType(actionType)) {
       const order = eventOrder(event, () => ++pairState.contentOrderCounter);
-      projectHistoryWatchlistInterrupt({
-        actionType, interruptId: event.interrupt_id, proposalData: actionRequests[0] as Record<string, unknown>,
-        assistantMessageId: interruptAssistantId, order, pendingHistoryInterrupts: ctx.pendingHistoryInterrupts,
-        applyToMessage: (pid, st) => rt.setMessages((prev) => updateMessage(prev, interruptAssistantId, (m) =>
-          m.role === 'assistant' ? applyWatchlistProposalToMessage(m as AssistantMessage, actionType, pid, order, st, (segs, s) => [...(segs || []), s]) : m)),
-      });
+      projectHistoryWatchlistInterrupt({ actionType, interruptId: event.interrupt_id, proposalData: actionRequests[0] as Record<string, unknown>, assistantMessageId: interruptAssistantId, order, setMessages: rt.setMessages, updateMessage, pendingHistoryInterrupts: ctx.pendingHistoryInterrupts });
     } else if (actionType === 'credit_pause') {
       // --- Credit pause interrupt (history) ---
       const proposalId = event.interrupt_id!;

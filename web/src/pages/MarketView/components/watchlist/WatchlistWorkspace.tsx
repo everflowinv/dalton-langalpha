@@ -47,7 +47,7 @@ interface PersistedWatchlistViewState {
   scrollTop: number;
 }
 
-interface WatchlistWorkspaceProps {
+export interface WatchlistWorkspaceProps {
   scope: ComposerScope;
   onScopeChange: (scope: ComposerScope) => void;
   activeWorkspaceId: string | null;

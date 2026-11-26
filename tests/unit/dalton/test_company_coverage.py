@@ -605,8 +605,9 @@ async def test_company_preflight_syncs_union_personal_preflight_unchanged(
         yaml_text: str | None = None,
         backend: Any = None,
         rel_path: str = "dalton/coverage.yaml",
+        roster_revision: int | None = None,
     ) -> bool:
-        del backend, rel_path
+        del backend, rel_path, roster_revision
         syncs.append((user_id, yaml_text))
         return True
 

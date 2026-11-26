@@ -9,9 +9,8 @@ import type { AssistantMessage } from '@/types/chat';
 import { updateMessage } from '../../hooks/utils/messageHelpers';
 import { setCardStatus } from './buckets';
 import {
-  applyWatchlistProposalToMessage,
-  buildWatchlistProposalState,
   isWatchlistInterruptType,
+  projectLiveWatchlistInterrupt,
 } from '@/lib/dalton/watchlistInterrupts'; // DALTON-HOOK(watchlist)
 import { buildCreditPauseState } from './creditPauseCard';
 import { isToolApprovalInterrupt, toolApprovalCards } from './toolApprovalCard';
@@ -242,18 +241,8 @@ export function projectLiveInterrupt(
     });
   // DALTON-HOOK(watchlist): project live personal watchlist confirmation interrupt via Dalton helper
   } else if (isWatchlistInterruptType(actionType)) {
-    const proposalId = event.interrupt_id || `watchlist-${actionType}-${Date.now()}`;
     const order = eventOrder(event, () => ++refs.contentOrderCounterRef.current);
-    const { state, toolCallId, hasToolCallId } = buildWatchlistProposalState(actionType, actionRequests[0] as Record<string, unknown>, event.interrupt_id);
-    rt.setMessages((prev) =>
-      interruptAlreadyRendered
-        ? (hasToolCallId ? setCardStatus(prev, 'watchlistProposals', proposalId, 'pending') : prev)
-        : updateMessage(prev, assistantMessageId, (m) =>
-            m.role === 'assistant'
-              ? applyWatchlistProposalToMessage(m as AssistantMessage, actionType, proposalId, order, state, appendCardSegment, { isStreaming: false })
-              : m),
-    );
-    if (hasToolCallId) arm({ type: actionType, interruptId: event.interrupt_id, assistantMessageId, proposalId, toolCallId });
+    projectLiveWatchlistInterrupt({ actionType, interruptId: event.interrupt_id, proposalData: actionRequests[0] as Record<string, unknown>, assistantMessageId, order, interruptAlreadyRendered, setMessages: rt.setMessages, updateMessage, setCardStatus, appendCardSegment, arm });
   } else if (actionType === 'credit_pause') {
     // --- Credit pause interrupt ---
     const proposalId = event.interrupt_id!;

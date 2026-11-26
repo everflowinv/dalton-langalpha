@@ -363,6 +363,8 @@ class PTCAgent:
         # DALTON-HOOK(research-writing): permanent Chinese research judgment and writing rules
         research_writing_enabled: bool = False,
         member_context: MemberContext | None = None,
+        # DALTON-HOOK(watchlist): withhold personal watchlist tool on individually shared threads
+        thread_is_shared: bool = False,
     ) -> Any:
         """Create a deepagent with PTC pattern capabilities.
 
@@ -1176,6 +1178,7 @@ class PTCAgent:
             user_tier=user_tier,
             allow_personal_watchlist=is_personal_watchlist_turn_allowed(
                 own_data=own_data,
+                thread_is_shared=thread_is_shared,
                 user_id=user_id,
                 owner_id=owner_id,
                 workspace_owner_id=workspace_owner_id,

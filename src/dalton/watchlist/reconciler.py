@@ -35,6 +35,7 @@ from src.dalton.watchlist.policies import (
     get_reconcile_job,
     get_user_tier_policies,
     list_unfinished_reconcile_jobs,
+    renew_reconcile_job_lease,
     resolve_effective_company_policy,
     update_reconcile_job_progress,
 )
@@ -110,8 +111,73 @@ def _earn_stage_from_name(name: str, ticker: str) -> str | None:
     return None
 
 
+async def is_unstarted_earn_once(
+    row: Mapping[str, Any],
+    *,
+    conn: Any = None,
+) -> bool:
+    """Return True iff ``row`` is an unstarted one-shot earnings task.
+
+    Includes tasks already claimed by the scheduler (``last_run_at`` stamped on claim)
+    whose execution rows are still ``pending`` / ``waiting`` and have never started running.
+    """
+    name = str(row.get("name") or "").strip().lower()
+    if "-earn-" not in name:
+        return False
+    if str(row.get("trigger_type") or "").strip().lower() != "once":
+        return False
+    status = str(row.get("status") or "").strip().lower()
+    if status in ("completed", "disabled", "deleted"):
+        return False
+    run_count = row.get("run_count")
+    if isinstance(run_count, int) and run_count > 0:
+        return False
+    if row.get("last_run_at") is None:
+        return True
+
+    # Scheduler sets last_run_at when inserting a 'pending' execution before the run begins.
+    # Inspect execution statuses to catch claimed-but-unstarted rows.
+    auto_id = str(row.get("automation_id") or "").strip()
+    if not auto_id:
+        return False
+    statuses: list[str] = []
+    if conn is not None and callable(getattr(conn, "cursor", None)):
+        try:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT status
+                    FROM automation_executions
+                    WHERE automation_id = %s::uuid
+                    ORDER BY created_at DESC
+                    LIMIT 10
+                    """,
+                    (auto_id,),
+                )
+                exec_rows = await cur.fetchall()
+            for er in exec_rows or []:
+                st = er["status"] if isinstance(er, Mapping) else er[0]
+                if st is not None:
+                    statuses.append(str(st).strip().lower())
+        except Exception:
+            statuses = []
+    if not statuses:
+        try:
+            exec_list = await exec_db.list_executions(auto_id, limit=10)
+            for er in exec_list or []:
+                if isinstance(er, Mapping) and er.get("status") is not None:
+                    statuses.append(str(er["status"]).strip().lower())
+        except Exception:
+            return False
+    if not statuses:
+        return False
+    has_unstarted = any(s in ("pending", "waiting") for s in statuses)
+    has_started = any(s in ("running", "completed", "failed", "timed_out") for s in statuses)
+    return has_unstarted and not has_started
+
+
 def _is_future_earn_once(row: Mapping[str, Any]) -> bool:
-    """Return True iff ``row`` is an unstarted one-shot earnings task (even if overdue/delayed)."""
+    """Synchronous fast-path check for unstarted one-shot earnings tasks."""
     name = str(row.get("name") or "").strip().lower()
     if "-earn-" not in name:
         return False
@@ -335,11 +401,18 @@ async def _verify_workspace_bound_to_ticker(
     if ws_name_upper and _PURE_TICKER_RE.fullmatch(ws_name_upper) and ws_name_upper != sym:
         return False
 
-    # 3. Positive fallback: workspace resolves as ticker's company workspace (e.g. via knowledge doc)
+    # 3. Positive fallback: read the CURRENT active company identity/document inside ws_clean itself
+    # (never search historical knowledge versions across workspaces).
     try:
-        matched_ws = await resolve_workspace_id_by_ticker(sym, user_id)
-        if matched_ws and str(matched_ws).strip() == ws_clean:
-            return True
+        from src.dalton.autonomy.tracking import _resolve_workspace_ticker
+
+        cur_ws_ticker = await _resolve_workspace_ticker(ws_clean)
+        if cur_ws_ticker:
+            cur_canon = canonical_workspace_ticker_key(str(cur_ws_ticker))
+            if cur_canon and sym_canon and cur_canon == sym_canon:
+                return True
+            if str(cur_ws_ticker).strip().upper() == sym:
+                return True
     except Exception:
         pass
     return False
@@ -506,7 +579,9 @@ class TierPolicyReconciler:
                         if not auto_id or r_status == "disabled":
                             continue
                         is_std = r_name in all_std_names
-                        is_future_earn = (live_row is None) and _is_future_earn_once(r)
+                        is_future_earn = (live_row is None) and (
+                            await is_unstarted_earn_once(r, conn=conn)
+                        )
                         if not (is_std or is_future_earn):
                             continue
                         new_meta = (
@@ -838,10 +913,10 @@ class TierPolicyReconciler:
                         {"name": s_name, "op": "resume" if resuming else "update"}
                     )
 
-                # Item 9: pause future unstarted earnings tasks whose stage is no longer in effective_policy.earnings_stages
+                # Item 9 / r5: pause unstarted earnings tasks (including scheduler-claimed pending/waiting rows)
                 allowed_earn_stages = set(effective_policy.earnings_stages)
                 for r in company_rows:
-                    if not _is_future_earn_once(r):
+                    if not (await is_unstarted_earn_once(r, conn=conn)):
                         continue
                     auto_id = str(r.get("automation_id") or "").strip()
                     r_name = str(r.get("name") or "").strip().lower()
@@ -988,6 +1063,25 @@ class TierPolicyReconciler:
         company_results: list[dict[str, Any]] = []
 
         for sym in retry_tickers:
+            # r5: verify & extend active lease BEFORE executing per-company side effects
+            if claim_token is not None:
+                still_held = await renew_reconcile_job_lease(
+                    uid, jid, claim_token=claim_token
+                )
+                if not still_held:
+                    return {
+                        "ok": False,
+                        "claimed": False,
+                        "job_id": jid,
+                        "status": "running",
+                        "reason": "lease_lost",
+                        "yaml_synced": bool(job.get("yaml_synced", False)),
+                        "completed_tickers": completed,
+                        "pending_tickers": remaining_pending,
+                        "failed_items": new_failed,
+                        "company_results": company_results,
+                        "job": None,
+                    }
             try:
                 res = await self.reconcile_company(
                     uid,
@@ -1070,11 +1164,37 @@ class TierPolicyReconciler:
                         "job": None,
                     }
 
-        # Stage 3: Home YAML sync (only when job has no remaining work, or sync with revision guard)
+        # Stage 3: Home YAML sync (verify active lease BEFORE writing Home YAML; include revision 0)
         yaml_synced = bool(job.get("yaml_synced", False))
         if sync_home and not yaml_synced:
+            if claim_token is not None:
+                still_held_yaml = await renew_reconcile_job_lease(
+                    uid, jid, claim_token=claim_token
+                )
+                if not still_held_yaml:
+                    return {
+                        "ok": False,
+                        "claimed": False,
+                        "job_id": jid,
+                        "status": "running",
+                        "reason": "lease_lost",
+                        "yaml_synced": False,
+                        "completed_tickers": completed,
+                        "pending_tickers": remaining_pending,
+                        "failed_items": new_failed,
+                        "company_results": company_results,
+                        "job": None,
+                    }
+            import inspect as _inspect
+
             sync_kwargs: dict[str, Any] = {}
-            if job_roster_revision > 0:
+            try:
+                _sync_params = _inspect.signature(sync_user_coverage_to_home).parameters
+                if "roster_revision" in _sync_params or any(
+                    p.kind == _inspect.Parameter.VAR_KEYWORD for p in _sync_params.values()
+                ):
+                    sync_kwargs["roster_revision"] = job_roster_revision
+            except (TypeError, ValueError):
                 sync_kwargs["roster_revision"] = job_roster_revision
             synced = bool(await sync_user_coverage_to_home(uid, **sync_kwargs))
             if synced:
@@ -1178,16 +1298,20 @@ class TierPolicyReconciler:
                 continue
             pending = list(job.get("pending_tickers") or [])
             failed = list(job.get("failed_items") or [])
-            # Decision 6: NEVER mark a job with remaining pending_tickers or failed_items as yaml_synced=TRUE
+            # Decision 6 / r5: NEVER mark unfinished, failed, running, or currently-leased jobs as yaml_synced=TRUE
             if pending or failed:
                 continue
-            await update_reconcile_job_progress(
+            if job.get("claim_token") or str(job.get("status") or "").strip().lower() == "running":
+                continue
+            res_upd = await update_reconcile_job_progress(
                 uid,
                 jid,
                 yaml_synced=True,
                 status="completed",
+                only_unclaimed_completed=True,
             )
-            updated += 1
+            if res_upd is not None:
+                updated += 1
         return updated
 
 
@@ -1196,9 +1320,11 @@ async def run_startup_reconcile_scan(
     limit: int = 100,
     batch_size: int | None = None,
 ) -> dict[str, Any]:
-    """Drain all claimable unfinished watchlist outbox jobs in batches without re-claiming failures."""
+    """Drain all claimable unfinished watchlist outbox jobs just-in-time without pre-claiming stale batches."""
     reconciler = TierPolicyReconciler()
-    eff_batch = max(1, int(batch_size if batch_size is not None else limit))
+    # r5: default to claiming 1 job just-in-time so queued jobs never sit idle in a pre-claimed batch past lease TTL
+    eff_batch = max(1, int(batch_size)) if batch_size is not None else 1
+    _ = limit
     seen_job_ids: set[str] = set()
     results: list[dict[str, Any]] = []
 

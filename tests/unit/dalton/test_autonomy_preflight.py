@@ -313,6 +313,25 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
     monkeypatch.setattr(auto_db, "list_all_automations", mock_list_all)
     monkeypatch.setattr(auto_db, "create_automation", mock_create)
     monkeypatch.setattr(auto_db, "update_automation", mock_update)
+    from src.dalton.database import coverage as cov_db_mod
+    from src.dalton.watchlist import policies as wl_policies_mod
+
+    monkeypatch.setattr(
+        cov_db_mod,
+        "get_coverage_row",
+        create_autospec(
+            cov_db_mod.get_coverage_row,
+            return_value={"ticker": "META", "tier": "core", "is_private": False},
+        ),
+    )
+    monkeypatch.setattr(
+        wl_policies_mod,
+        "get_user_tier_policy",
+        create_autospec(
+            wl_policies_mod.get_user_tier_policy,
+            return_value=wl_policies_mod.DEFAULT_TIER_POLICIES["core"],
+        ),
+    )
 
     res_create = await schedule_dalton_automation_helper(
         "dalton-meta-watch",

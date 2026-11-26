@@ -278,3 +278,19 @@ async def test_r4_metrics_no_empty_bar_cache_progressive_warmup_and_watchlist_co
     )
     assert len(req_shared_thread.additional_context) == 1
     assert req_shared_thread.additional_context[0]["type"] == "directive"
+
+
+def test_r5_new_years_day_holiday_ytd_is_zero_not_prior_year_gain() -> None:
+    """r5: On Jan 1 (exchange holiday), YTD anchors to Dec 31 of prior year (0%), not 2 years back (50%)."""
+    bars = [
+        {"date": "2024-12-31", "close": 100.0, "high": 101.0, "low": 99.0, "volume": 1000},
+        {"date": "2025-12-30", "close": 148.0, "high": 149.0, "low": 147.0, "volume": 1000},
+        {"date": "2025-12-31", "close": 150.0, "high": 151.0, "low": 149.0, "volume": 1000},
+    ]
+    res = ind_mod.compute_symbol_metrics(
+        bars,
+        symbol="NVDA",
+        latest_price=150.0,
+        now_utc=datetime(2026, 1, 1, 15, 0, tzinfo=timezone.utc),
+    )
+    assert res["chg_ytd"] == 0.0

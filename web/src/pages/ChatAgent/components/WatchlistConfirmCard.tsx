@@ -110,13 +110,14 @@ export function WatchlistConfirmCard({
     setRetryError(null);
     try {
       const res = await reconcileWatchlist(job_id || undefined);
-      const stillPartial =
-        !res || res.ok === false || res.status === 'partial';
-      if (stillPartial) {
+      if (res && res.ok === true && res.status === 'completed') {
+        setRetryDone(true);
+      } else if (res && (res.status === 'running' || res.claimed === false)) {
+        setRetryDone(false);
+        setRetryError(t('chat.watchlistConfirm.retryRunningError'));
+      } else {
         setRetryDone(false);
         setRetryError(t('chat.watchlistConfirm.retryPartialError'));
-      } else {
-        setRetryDone(true);
       }
     } catch {
       setRetryDone(false);

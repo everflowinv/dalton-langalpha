@@ -1253,7 +1253,10 @@ def resume_refusal(current: Dict[str, Any]) -> AutomationRefusal | None:
             f"(must be 'paused' or 'disabled')",
             field="status",
         )
-    when = current.get("next_run_at")
+    # DALTON-HOOK(watchlist): resolve saved once_schedule_at when Dalton once pause cleared next_run_at
+    from src.dalton.watchlist.pause_guards import resolve_paused_once_schedule_at
+
+    when = resolve_paused_once_schedule_at(current) if current["trigger_type"] == "once" else current.get("next_run_at")
     if (
         current["trigger_type"] == "once"
         and current["status"] == "paused"
@@ -1290,7 +1293,10 @@ def resume_update_fields(current: Dict[str, Any]) -> Dict[str, Any]:
             current.get("timezone", "UTC"),
         )
     elif current["trigger_type"] == "once":
-        when = current.get("next_run_at")
+        # DALTON-HOOK(watchlist): restore saved once_schedule_at on manual resume of paused Dalton once row
+        from src.dalton.watchlist.pause_guards import resolve_paused_once_schedule_at
+
+        when = resolve_paused_once_schedule_at(current)
         # Disabled by the run it already had: back on, it waits for Run now,
         # as a one-time automation whose run failed does.
         update_kwargs["next_run_at"] = when if when and when > datetime.now(timezone.utc) else None
@@ -1316,7 +1322,10 @@ def apply_locked_resume_schedule(
             locked_row.get("timezone", "UTC"),
         )
     elif locked_row.get("trigger_type") == "once":
-        when_locked = locked_row.get("next_run_at")
+        # DALTON-HOOK(watchlist): restore saved once_schedule_at under lock when resuming paused Dalton once row
+        from src.dalton.watchlist.pause_guards import resolve_paused_once_schedule_at
+
+        when_locked = resolve_paused_once_schedule_at(locked_row)
         if when_locked and when_locked > datetime.now(timezone.utc):
             effective_kwargs["next_run_at"] = when_locked
         elif locked_row.get("status") == "disabled":
