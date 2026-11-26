@@ -1160,13 +1160,8 @@ async def list_executions(
             rows = [dict(row) for row in await cur.fetchall()]
             page = rows[:limit]
             # DALTON-HOOK(history-computer-scope): resolve per-page thread and colleague workspace accessibility in Python without touching Dalton tables in SQL
-            from src.dalton.services.execution_history_access import (
-                resolve_execution_history_page_links,
-            )
-
-            page = await resolve_execution_history_page_links(
-                user_id, page, conn=conn
-            )
+            from src.dalton.services.execution_history_access import resolve_execution_history_page_links
+            page = await resolve_execution_history_page_links(user_id, page, conn=conn)
             return page, len(rows) > limit
 
 

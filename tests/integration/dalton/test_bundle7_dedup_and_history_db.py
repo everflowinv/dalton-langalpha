@@ -24,6 +24,7 @@ from typing import Any
 from unittest.mock import create_autospec, patch
 import uuid
 
+from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 import psycopg
 from psycopg.rows import dict_row
@@ -32,6 +33,7 @@ import pytest
 import pytest_asyncio
 
 from src.dalton import access_tiers as access_tiers_mod
+from src.dalton import settings as dalton_settings_mod
 from src.dalton import sharing as sharing_mod
 from src.dalton.coverage import dedup as dedup_mod
 from src.dalton.coverage import locked_recheck as locked_recheck_mod
@@ -65,6 +67,7 @@ _REAL_MULTIUSER_AUTH_ENABLED = sharing_mod._multiuser_auth_enabled
 _REAL_ALLOWED_EMAILS = sharing_mod.get_dalton_allowed_emails
 _REAL_IS_INVITE_PM = sharing_mod.is_invite_pm
 _REAL_IS_COMPANY_USER = sharing_mod.is_company_system_user
+_REAL_GET_DALTON_SETTINGS = dalton_settings_mod.get_dalton_settings
 
 
 def _enable_everflow_env(
@@ -148,76 +151,102 @@ async def bundle7_live_pool(
 
     with ExitStack() as stack:
         stack.enter_context(
-            patch.object(pool_mod, "get_db_connection_string", lambda: test_db_uri)
+            patch.object(
+                pool_mod,
+                "get_db_connection_string",
+                create_autospec(pool_mod.get_db_connection_string, return_value=test_db_uri),
+            )
         )
         stack.enter_context(
-            patch.object(pool_mod, "get_or_create_pool", lambda: local_pool)
+            patch.object(
+                pool_mod,
+                "get_or_create_pool",
+                create_autospec(pool_mod.get_or_create_pool, return_value=local_pool),
+            )
         )
         stack.enter_context(
-            patch.object(pool_mod, "open_session_connection", _live_session_connection)
+            patch.object(
+                pool_mod,
+                "open_session_connection",
+                create_autospec(
+                    pool_mod.open_session_connection, side_effect=_live_session_connection
+                ),
+            )
         )
+        gdc_spec = create_autospec(orig_gdc, side_effect=_live_get_db_connection)
         for module in holders:
             if hasattr(module, "get_db_connection"):
                 stack.enter_context(
-                    patch.object(module, "get_db_connection", _live_get_db_connection)
+                    patch.object(module, "get_db_connection", gdc_spec)
                 )
         await close_shared_lock_session()
         try:
             yield local_pool
         finally:
-            await close_shared_lock_session()
-            async with local_pool.connection() as cleanup_conn:
-                async with cleanup_conn.cursor() as cur:
-                    await cur.execute(
-                        """
-                        DELETE FROM automation_executions
-                        WHERE automation_id IN (
-                            SELECT automation_id FROM automations WHERE user_id LIKE 'b7-%'
+            try:
+                await close_shared_lock_session()
+                async with local_pool.connection() as cleanup_conn:
+                    async with cleanup_conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            DELETE FROM automation_executions
+                            WHERE automation_id IN (
+                                SELECT automation_id FROM automations WHERE user_id LIKE 'b7-%'
+                            )
+                            """
                         )
-                        """
-                    )
-                    await cur.execute(
-                        "DELETE FROM automations WHERE user_id LIKE 'b7-%'"
-                    )
-                    await cur.execute(
-                        """
-                        DELETE FROM conversation_threads
-                        WHERE user_id LIKE 'b7-%'
-                           OR workspace_id IN (
-                               SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
-                           )
-                        """
-                    )
-                    await cur.execute(
-                        """
-                        DELETE FROM dalton_workspace_sharing
-                        WHERE workspace_id IN (
-                            SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
+                        await cur.execute(
+                            "DELETE FROM automations WHERE user_id LIKE 'b7-%'"
                         )
-                        """
-                    )
-                    await cur.execute(
-                        """
-                        DELETE FROM dalton_coverage_units
-                        WHERE owner_user_id LIKE 'b7-%'
-                           OR workspace_id IN (
-                               SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
-                           )
-                        """
-                    )
-                    await cur.execute(
-                        "DELETE FROM dalton_coverage WHERE user_id LIKE 'b7-%'"
-                    )
-                    await cur.execute(
-                        "DELETE FROM workspaces WHERE user_id LIKE 'b7-%'"
-                    )
-                    await cur.execute(
-                        "DELETE FROM computers WHERE user_id LIKE 'b7-%'"
-                    )
-                    await cur.execute(
-                        "DELETE FROM users WHERE user_id LIKE 'b7-%'"
-                    )
-            await local_pool.close()
+                        await cur.execute(
+                            """
+                            DELETE FROM conversation_threads
+                            WHERE user_id LIKE 'b7-%'
+                               OR workspace_id IN (
+                                   SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
+                               )
+                            """
+                        )
+                        await cur.execute(
+                            """
+                            DELETE FROM dalton_knowledge_versions
+                            WHERE user_id LIKE 'b7-%'
+                               OR workspace_id IN (
+                                   SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
+                               )
+                            """
+                        )
+                        await cur.execute(
+                            """
+                            DELETE FROM dalton_workspace_sharing
+                            WHERE workspace_id IN (
+                                SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
+                            )
+                            """
+                        )
+                        await cur.execute(
+                            """
+                            DELETE FROM dalton_coverage_units
+                            WHERE owner_user_id LIKE 'b7-%'
+                               OR workspace_id IN (
+                                   SELECT workspace_id FROM workspaces WHERE user_id LIKE 'b7-%'
+                               )
+                            """
+                        )
+                        await cur.execute(
+                            "DELETE FROM dalton_coverage WHERE user_id LIKE 'b7-%'"
+                        )
+                        await cur.execute(
+                            "DELETE FROM workspaces WHERE user_id LIKE 'b7-%'"
+                        )
+                        await cur.execute(
+                            "DELETE FROM computers WHERE user_id LIKE 'b7-%'"
+                        )
+                        await cur.execute(
+                            "DELETE FROM users WHERE user_id LIKE 'b7-%'"
+                        )
+            finally:
+                await local_pool.close()
 
 
 def _wrap_collect_barrier(orig_collect: Any, barrier_limit: int = 2) -> Any:
@@ -407,7 +436,9 @@ async def test_e2_web_concurrent_create_real_postgres_with_bound_home_creates_on
     monkeypatch.setattr(dedup_mod, "dalton_complete", _make_llm_stub(("700.HK", "0700.HK")))
 
     app = create_test_app(ws_router)
-    app.dependency_overrides[get_principal] = lambda: Principal(user_id=uid, computer_id=None)
+    app.dependency_overrides[get_principal] = lambda: Principal(
+        user_id=uid, auth="session", computer_id=None
+    )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         # 1. Ordinary create succeeds on first try even with bound Homes present.
@@ -505,7 +536,7 @@ async def test_e2_web_concurrent_alias_same_ticker_real_postgres_commits_unit_in
     )
     monkeypatch.setattr(
         "src.dalton.settings.get_dalton_settings",
-        lambda: SimpleNamespace(enabled=True),
+        create_autospec(_REAL_GET_DALTON_SETTINGS, return_value=SimpleNamespace(enabled=True)),
     )
     monkeypatch.setattr(
         dedup_mod,
@@ -573,7 +604,9 @@ async def test_e2_web_concurrent_alias_same_ticker_real_postgres_commits_unit_in
     monkeypatch.setattr(dedup_mod, "dalton_complete", _make_llm_stub())
 
     app = create_test_app(ws_router)
-    app.dependency_overrides[get_principal] = lambda: Principal(user_id=uid, computer_id=None)
+    app.dependency_overrides[get_principal] = lambda: Principal(
+        user_id=uid, auth="session", computer_id=None
+    )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp_a, resp_b = await asyncio.gather(
@@ -625,6 +658,259 @@ async def test_e2_web_concurrent_alias_same_ticker_real_postgres_commits_unit_in
     assert len(unit_rows) == 1
     assert unit_rows[0]["workspace_id"] == ws_rows[0]["workspace_id"]
     assert unit_rows[0]["ticker_key"] == "00700"
+
+
+async def test_e2_web_cross_user_concurrent_alias_same_ticker_real_postgres_creates_only_one(
+    bundle7_live_pool: AsyncConnectionPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 Item 1 & Item 3 (real PG): Two DIFFERENT internal members concurrently
+    creating different aliases for the same normalized ticker with LLM returning
+    empty matches serialize on pg_advisory_xact_lock(hashtext('ws_ticker:' || ticker))
+    after lock_user_writes; only ONE workspace is created (both with coverage_kind
+    and with config-only dalton_company_ticker), and PUT config updates preserve
+    dalton_company_ticker while refusing client overrides."""
+    from src.server.app.workspaces import router as ws_router
+    from src.server.dependencies.principal import Principal, get_principal
+
+    uid_a = f"b7-xu-a-{uuid.uuid4().hex[:8]}"
+    uid_b = f"b7-xu-b-{uuid.uuid4().hex[:8]}"
+    email_a = f"{uid_a}@team.local"
+    email_b = f"{uid_b}@team.local"
+    await create_user(user_id=uid_a, email=email_a, name="CrossUser Alice")
+    await create_user(user_id=uid_b, email=email_b, name="CrossUser Bob")
+    comp_a = await create_computer(
+        uid_a,
+        kind="docker",
+        name="Alice Box",
+        is_primary=True,
+        status="stopped",
+        provider_ref=f"b7-xua-{uuid.uuid4()}",
+    )
+    comp_b = await create_computer(
+        uid_b,
+        kind="docker",
+        name="Bob Box",
+        is_primary=True,
+        status="stopped",
+        provider_ref=f"b7-xub-{uuid.uuid4()}",
+    )
+    comp_a_id = str(comp_a["computer_id"])
+    comp_b_id = str(comp_b["computer_id"])
+    comp_by_user = {uid_a: comp_a, uid_b: comp_b}
+
+    ws_mgr = object.__new__(WorkspaceManager)
+
+    async def _ensure_primary(_self, uid: str, *, default_name=None, resource_tier=None):
+        del default_name, resource_tier
+        return dict(comp_by_user[uid])
+
+    async def _resolve_binding(_self, _wid: str, *, workspace=None):
+        del workspace
+        return None
+
+    monkeypatch.setattr(
+        WorkspaceManager,
+        "ensure_primary_computer",
+        create_autospec(WorkspaceManager.ensure_primary_computer, side_effect=_ensure_primary),
+    )
+    monkeypatch.setattr(
+        WorkspaceManager,
+        "resolve_binding",
+        create_autospec(WorkspaceManager.resolve_binding, side_effect=_resolve_binding),
+    )
+    monkeypatch.setattr(
+        "src.server.app.workspaces.WorkspaceManager.get_instance",
+        create_autospec(WorkspaceManager.get_instance, return_value=ws_mgr),
+    )
+    _enable_everflow_env(monkeypatch, (email_a, email_b))
+    monkeypatch.setattr(
+        dedup_mod,
+        "is_coverage_units_enabled",
+        create_autospec(_REAL_IS_COV_ENABLED, return_value=True),
+    )
+    monkeypatch.setattr(
+        "src.dalton.settings.is_coverage_units_enabled",
+        create_autospec(_REAL_IS_COV_ENABLED, return_value=True),
+    )
+    monkeypatch.setattr(
+        "src.dalton.settings.get_dalton_settings",
+        create_autospec(_REAL_GET_DALTON_SETTINGS, return_value=SimpleNamespace(enabled=True)),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "is_dalton_supabase_auth_enabled",
+        create_autospec(_REAL_IS_SUPA_AUTH, return_value=True),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "get_user_tier",
+        create_autospec(dedup_mod.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "is_internal_or_admin",
+        create_autospec(access_tiers_mod.is_internal_or_admin, return_value=True),
+    )
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "is_admin_user",
+        create_autospec(access_tiers_mod.is_admin_user, return_value=False),
+    )
+    monkeypatch.setattr(
+        "src.dalton.settings.is_dalton_local_auth_enabled",
+        create_autospec(_REAL_IS_LOCAL_AUTH, return_value=False),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "is_dalton_local_auth_enabled",
+        create_autospec(_REAL_IS_LOCAL_AUTH, return_value=False),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "get_dalton_allowed_emails",
+        create_autospec(_REAL_ALLOWED_EMAILS, return_value=frozenset({email_a, email_b})),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "is_invite_pm",
+        create_autospec(_REAL_IS_INVITE_PM, return_value=False),
+    )
+    monkeypatch.setattr(
+        sharing_mod,
+        "is_company_system_user",
+        create_autospec(_REAL_IS_COMPANY_USER, return_value=False),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_model",
+        create_autospec(dedup_mod.resolve_assist_model, return_value="gpt-4o-mini"),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "resolve_assist_fallback_models",
+        create_autospec(dedup_mod.resolve_assist_fallback_models, return_value=[]),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "model_requires_user_oauth",
+        create_autospec(dedup_mod.model_requires_user_oauth, return_value=False),
+    )
+    # LLM always returns empty matches.
+    monkeypatch.setattr(dedup_mod, "dalton_complete", _make_llm_stub())
+
+    app = create_test_app(ws_router)
+
+    async def _principal_from_header(request: Request) -> Principal:
+        return Principal(user_id=request.headers["X-User-Id"], auth="session")
+
+    app.dependency_overrides[get_principal] = _principal_from_header
+
+    orig_collect = dedup_mod._collect_candidates
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # Case 1: Two different users with coverage_kind='company' and different aliases.
+        monkeypatch.setattr(dedup_mod, "_collect_candidates", _wrap_collect_barrier(orig_collect))
+        resp_a, resp_b = await asyncio.gather(
+            client.post(
+                "/api/v1/workspaces",
+                headers={"X-User-Id": uid_a},
+                json={
+                    "name": "腾讯控股",
+                    "computer_id": comp_a_id,
+                    "coverage_kind": "company",
+                    "ticker": "0700.HK",
+                },
+            ),
+            client.post(
+                "/api/v1/workspaces",
+                headers={"X-User-Id": uid_b},
+                json={
+                    "name": "Tencent",
+                    "computer_id": comp_b_id,
+                    "coverage_kind": "company",
+                    "ticker": "700.HK",
+                },
+            ),
+        )
+
+        assert sorted([resp_a.status_code, resp_b.status_code]) == [201, 409]
+        winner_resp = resp_a if resp_a.status_code == 201 else resp_b
+        conflict_resp = resp_b if resp_b.status_code == 409 else resp_a
+        assert conflict_resp.json()["detail"]["code"] == "company_workspace_exists"
+        assert (
+            conflict_resp.json()["detail"]["matches"][0]["workspace_id"]
+            == winner_resp.json()["workspace_id"]
+        )
+
+        # Case 2: Two different users WITHOUT coverage_kind (same-tx config ticker stamp).
+        monkeypatch.setattr(dedup_mod, "_collect_candidates", _wrap_collect_barrier(orig_collect))
+        resp_c, resp_d = await asyncio.gather(
+            client.post(
+                "/api/v1/workspaces",
+                headers={"X-User-Id": uid_a},
+                json={
+                    "name": "阿里巴巴",
+                    "computer_id": comp_a_id,
+                    "ticker": "9988.HK",
+                },
+            ),
+            client.post(
+                "/api/v1/workspaces",
+                headers={"X-User-Id": uid_b},
+                json={
+                    "name": "Alibaba",
+                    "computer_id": comp_b_id,
+                    "ticker": "09988",
+                },
+            ),
+        )
+        assert sorted([resp_c.status_code, resp_d.status_code]) == [201, 409]
+        cfg_winner = resp_c if resp_c.status_code == 201 else resp_d
+        cfg_owner = uid_a if resp_c.status_code == 201 else uid_b
+        cfg_ws_id = cfg_winner.json()["workspace_id"]
+
+        # Verify PUT whole-config replacement preserves dalton_company_ticker and
+        # refuses client overrides in real PostgreSQL.
+        put_normal = await client.put(
+            f"/api/v1/workspaces/{cfg_ws_id}",
+            headers={"X-User-Id": cfg_owner},
+            json={"config": {"theme": "dark"}},
+        )
+        assert put_normal.status_code == 200, put_normal.text
+        put_override = await client.put(
+            f"/api/v1/workspaces/{cfg_ws_id}",
+            headers={"X-User-Id": cfg_owner},
+            json={"config": {"dalton_company_ticker": "FORGED", "theme": "light"}},
+        )
+        assert put_override.status_code == 200, put_override.text
+
+    async with bundle7_live_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT workspace_id::text AS workspace_id, user_id, name, config
+                FROM workspaces
+                WHERE user_id = ANY(%s::text[]) AND status <> 'deleted'
+                ORDER BY created_at ASC
+                """,
+                ([uid_a, uid_b],),
+            )
+            ws_rows = await cur.fetchall()
+            await cur.execute(
+                """
+                SELECT workspace_id::text AS workspace_id, ticker_key
+                FROM dalton_coverage_units
+                WHERE owner_user_id = ANY(%s::text[]) AND status = 'active'
+                """,
+                ([uid_a, uid_b],),
+            )
+            unit_rows = await cur.fetchall()
+    # Exactly 1 workspace for 00700 + 1 workspace for 09988 across both users.
+    assert len(ws_rows) == 2
+    assert len(unit_rows) == 1
+    assert unit_rows[0]["ticker_key"] == "00700"
+    cfg_row = next(r for r in ws_rows if r["workspace_id"] == cfg_ws_id)
+    assert cfg_row["config"] == {"theme": "light", "dalton_company_ticker": "09988"}
 
 
 async def test_bd4_locked_recheck_reads_real_postgres_company_knowledge_doc_ticker(
@@ -860,3 +1146,31 @@ async def test_o1_q1_execution_history_real_postgres_access_rules(
     assert exec_id in by_id_del
     assert str(by_id_del[exec_id]["conversation_thread_id"]) == thread_id
     assert by_id_del[exec_id]["workspace_id"] is None
+
+    # Case 3 (r3 Item 4): automation migrated to caller's own live workspace
+    # while colleague workspace stays soft-deleted -> MUST NOT pair the new
+    # workspace ID with the old readable thread (workspace_id stays None).
+    comp_a = await create_computer(
+        uid_a,
+        kind="docker",
+        name="Alice Box",
+        is_primary=True,
+        status="stopped",
+        provider_ref=f"b7-o1a-{uuid.uuid4()}",
+    )
+    ws_a = await ws_db.create_workspace_on_computer(
+        uid_a, "Alice Migrated WS", str(comp_a["computer_id"])
+    )
+    assert ws_a is not None
+    ws_a_id = str(ws_a["workspace_id"])
+    async with bundle7_live_pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE automations SET workspace_id = %s::uuid WHERE automation_id = %s::uuid",
+                (ws_a_id, auto_id),
+            )
+    rows_migrated, _ = await exec_db.list_executions(uid_a, limit=20)
+    by_id_migrated = {str(r["automation_execution_id"]): r for r in rows_migrated}
+    assert exec_id in by_id_migrated
+    assert str(by_id_migrated[exec_id]["conversation_thread_id"]) == thread_id
+    assert by_id_migrated[exec_id]["workspace_id"] is None

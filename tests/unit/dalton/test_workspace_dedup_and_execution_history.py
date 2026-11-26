@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -26,11 +27,13 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec, patch
 
+from fastapi import Request
 from httpx import ASGITransport, AsyncClient
 import psycopg
 import pytest
 
 from src.dalton import access_tiers as access_tiers_mod
+from src.dalton import settings as dalton_settings_mod
 from src.dalton import sharing as sharing_mod
 from src.dalton.coverage import dedup as dedup_mod
 from src.dalton.coverage import locked_recheck as locked_recheck_mod
@@ -58,13 +61,19 @@ USER_A = "test-user-123"
 USER_B = "user-colleague-b"
 
 _REAL_GET_INSTANCE = WorkspaceManager.get_instance
+_REAL_ENSURE_PRIMARY = WorkspaceManager.ensure_primary_computer
+_REAL_GET_COMPUTER = ws_db.get_computer
 _REAL_IS_COV_ENABLED = dedup_mod.is_coverage_units_enabled
 _REAL_IS_SUPA_AUTH = dedup_mod.is_dalton_supabase_auth_enabled
 _REAL_IS_LOCAL_AUTH = dedup_mod.dalton_settings_mod.is_dalton_local_auth_enabled
 _REAL_BUILD_DET_MATCH = dedup_mod.build_deterministic_duplicate_match
 _REAL_IS_WS_COV_REG_ACTIVE = units_mod.is_workspace_coverage_registration_active
 _REAL_IS_INTERNAL_OR_ADMIN = access_tiers_mod.is_internal_or_admin
+_REAL_GET_DALTON_SETTINGS = dalton_settings_mod.get_dalton_settings
+_REAL_IS_COLLEAGUE_DISPATCH = sharing_mod.is_colleague_dispatch_enabled
+_REAL_GET_WS_SHARING = sharing_mod.get_workspace_sharing
 COMP_A = "11111111-1111-4111-8111-111111111111"
+COMP_B = "11111111-1111-4111-8111-111111111112"
 WS_COLLEAGUE = "22222222-2222-4222-8222-222222222222"
 WS_OWN_A = "33333333-3333-4333-8333-333333333333"
 WS_DOC_ONLY = "44444444-4444-4444-8444-444444444444"
@@ -106,12 +115,16 @@ def _make_in_memory_workspace_db(
     docs_by_ws: dict[str, dict[str, Any]] = dict(knowledge_docs or {})
     units_by_ws: dict[str, dict[str, Any]] = dict(coverage_units or {})
     user_locks: dict[str, asyncio.Lock] = {}
+    ticker_locks: dict[str, asyncio.Lock] = {}
     lock_events: list[str] = []
     executed_sql: list[tuple[str, Any]] = []
     local_roles = list(local_internal_users or [])
 
     def _get_lock(uid: str) -> asyncio.Lock:
         return user_locks.setdefault(uid, asyncio.Lock())
+
+    def _get_ticker_lock(ticker_key: str) -> asyncio.Lock:
+        return ticker_locks.setdefault(ticker_key, asyncio.Lock())
 
     def _config_dict(w: dict[str, Any]) -> dict[str, Any]:
         cfg = w.get("config")
@@ -141,8 +154,36 @@ def _make_in_memory_workspace_db(
             text = " ".join(sql.split())
             executed_sql.append((text, params))
 
+            if "pg_advisory_xact_lock(hashtext('ws_ticker:'" in text:
+                ticker_key = str(params[0])
+                lk = _get_ticker_lock(ticker_key)
+                await lk.acquire()
+                self._conn.held_locks.append(lk)
+                lock_events.append(f"acquire:ws_ticker:{ticker_key}")
+                self._rows = []
+                return
+
             if "FROM dalton_user_roles" in text:
                 self._rows = [{"user_id": u} for u in local_roles]
+                return
+
+            if "UPDATE workspaces SET config = (%s::jsonb - %s::text[]) || COALESCE(" in text:
+                raw_json, strip_keys, keep_keys, updated_at, wid = params
+                incoming = dict(raw_json.obj if hasattr(raw_json, "obj") else raw_json)
+                strip_set = set(strip_keys)
+                keep_set = set(keep_keys)
+                updated_rows: list[dict[str, Any]] = []
+                for w in workspaces:
+                    if str(w["workspace_id"]) == str(wid) and w.get("status") != "deleted":
+                        existing_cfg = _config_dict(w)
+                        merged = {k: v for k, v in incoming.items() if k not in strip_set}
+                        for k, v in existing_cfg.items():
+                            if k in keep_set:
+                                merged[k] = v
+                        w["config"] = merged
+                        w["updated_at"] = updated_at
+                        updated_rows.append(dict(w))
+                self._rows = updated_rows
                 return
 
             if "UPDATE workspaces SET config = COALESCE(config, '{}'::jsonb) ||" in text:
@@ -272,6 +313,15 @@ def _make_in_memory_workspace_db(
                 elif isinstance(params, dict) and "ws_ids" in params:
                     wanted = set(params["ws_ids"])
                     pool = [w for w in workspaces if w["workspace_id"] in wanted]
+                elif (
+                    "WHERE w.workspace_id = %s" in text
+                    and params
+                    and isinstance(params, tuple)
+                    and len(params) == 1
+                    and isinstance(params[0], str)
+                ):
+                    wid_filter = str(params[0])
+                    pool = [w for w in workspaces if str(w["workspace_id"]) == wid_filter]
                 elif (
                     params
                     and isinstance(params, tuple)
@@ -771,7 +821,7 @@ async def test_e2_web_concurrent_alias_same_ticker_commits_identity_in_same_tx_w
     )
     monkeypatch.setattr(
         "src.dalton.settings.get_dalton_settings",
-        lambda: SimpleNamespace(enabled=True),
+        create_autospec(_REAL_GET_DALTON_SETTINGS, return_value=SimpleNamespace(enabled=True)),
     )
     monkeypatch.setattr(
         "src.dalton.settings.is_coverage_units_enabled",
@@ -900,6 +950,166 @@ async def test_e2_web_concurrent_alias_explicit_ticker_without_coverage_kind_whe
 
 
 @pytest.mark.asyncio
+async def test_e2_web_cross_user_concurrent_alias_same_ticker_serializes_with_ticker_lock_after_user_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 Item 1: Two DIFFERENT internal members concurrently creating different
+    aliases ('腾讯控股' and 'Tencent') for the same normalized ticker ('0700.HK'
+    and '700.HK') with LLM returning empty matches serialize via the normalized
+    ticker advisory lock acquired strictly AFTER lock_user_writes; only ONE
+    workspace is created and the second receives 409 company_workspace_exists."""
+    from src.server.app.workspaces import router as ws_router
+    from src.server.dependencies.principal import Principal, get_principal
+
+    db_state = _make_in_memory_workspace_db()
+    _patch_web_create_env(monkeypatch, db_state)
+
+    comp_by_user = {
+        USER_A: _computer_row(COMP_A, USER_A),
+        USER_B: _computer_row(COMP_B, USER_B),
+    }
+    comp_by_id = {COMP_A: comp_by_user[USER_A], COMP_B: comp_by_user[USER_B]}
+
+    async def _ensure_primary(
+        _self, uid: str, *, default_name=None, resource_tier=None
+    ):
+        del default_name, resource_tier
+        return dict(comp_by_user[uid])
+
+    async def _get_computer(cid: str, *, conn=None):
+        del conn
+        return dict(comp_by_id[str(cid)])
+
+    monkeypatch.setattr(
+        WorkspaceManager,
+        "ensure_primary_computer",
+        create_autospec(_REAL_ENSURE_PRIMARY, side_effect=_ensure_primary),
+    )
+    monkeypatch.setattr(
+        ws_db,
+        "get_computer",
+        create_autospec(_REAL_GET_COMPUTER, side_effect=_get_computer),
+    )
+    monkeypatch.setattr(
+        dedup_mod, "_collect_candidates", _wrap_collect_with_barrier(dedup_mod._collect_candidates)
+    )
+    monkeypatch.setattr(dedup_mod, "dalton_complete", _make_llm_mock())
+
+    app = create_test_app(ws_router)
+
+    async def _principal_from_header(request: Request) -> Principal:
+        return Principal(user_id=request.headers["X-User-Id"], auth="session")
+
+    app.dependency_overrides[get_principal] = _principal_from_header
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp_a, resp_b = await asyncio.gather(
+            client.post(
+                "/api/v1/workspaces",
+                headers={"X-User-Id": USER_A},
+                json={"name": "腾讯控股", "ticker": "0700.HK"},
+            ),
+            client.post(
+                "/api/v1/workspaces",
+                headers={"X-User-Id": USER_B},
+                json={"name": "Tencent", "ticker": "700.HK"},
+            ),
+        )
+
+    assert sorted([resp_a.status_code, resp_b.status_code]) == [201, 409]
+    assert len(db_state["workspaces"]) == 1
+    conflict_resp = resp_b if resp_b.status_code == 409 else resp_a
+    detail = conflict_resp.json()["detail"]
+    assert detail["code"] == "company_workspace_exists"
+    assert detail["matches"][0]["workspace_id"] == db_state["workspaces"][0]["workspace_id"]
+
+    # Verify lock ordering: both users took lock_user_writes BEFORE ws_ticker:00700.
+    events = db_state["lock_events"]
+    assert "acquire:ws_ticker:00700" in events
+    first_ticker_idx = events.index("acquire:ws_ticker:00700")
+    assert (
+        events.index(f"acquire:{USER_A}") < first_ticker_idx
+        or events.index(f"acquire:{USER_B}") < first_ticker_idx
+    )
+    # Every ticker lock acquisition was preceded by a user lock acquisition.
+    ticker_indices = [i for i, ev in enumerate(events) if ev == "acquire:ws_ticker:00700"]
+    assert len(ticker_indices) >= 2
+    assert events.index(f"acquire:{USER_A}") < max(ticker_indices)
+    assert events.index(f"acquire:{USER_B}") < max(ticker_indices)
+
+
+@pytest.mark.asyncio
+async def test_dalton_company_ticker_preserved_on_put_and_rejected_from_client_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 Item 3: dalton_company_ticker is server-owned across POST and PUT;
+    ordinary whole-config PUT preserves it, and client writes/forgeries are refused."""
+    from src.server.app.workspaces import router as ws_router
+
+    assert (
+        locked_recheck_mod.WORKSPACE_COMPANY_TICKER_CONFIG_KEY
+        in ws_db.SERVER_OWNED_CONFIG_KEYS
+    )
+    assert (
+        locked_recheck_mod.WORKSPACE_COMPANY_TICKER_CONFIG_KEY
+        in ws_db.server_owned_config_keys()
+    )
+
+    db_state = _make_in_memory_workspace_db()
+    _patch_web_create_env(monkeypatch, db_state)
+    monkeypatch.setattr(dedup_mod, "dalton_complete", _make_llm_mock())
+
+    app = create_test_app(ws_router)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # 1. POST with client-forged dalton_company_ticker strips it.
+        resp_plain = await client.post(
+            "/api/v1/workspaces",
+            json={
+                "name": "Macro Notes",
+                "config": {"dalton_company_ticker": "FAKE", "theme": "dark"},
+            },
+        )
+        assert resp_plain.status_code == 201, resp_plain.text
+        plain_id = resp_plain.json()["workspace_id"]
+        plain_row = next(w for w in db_state["workspaces"] if w["workspace_id"] == plain_id)
+        assert plain_row["config"] == {"theme": "dark"}
+
+        # 2. PUT forging dalton_company_ticker onto plain workspace is refused.
+        put_forge_plain = await client.put(
+            f"/api/v1/workspaces/{plain_id}",
+            json={"config": {"dalton_company_ticker": "FAKE", "theme": "light"}},
+        )
+        assert put_forge_plain.status_code == 200, put_forge_plain.text
+        assert plain_row["config"] == {"theme": "light"}
+
+        # 3. POST with explicit ticker stamps server-owned dalton_company_ticker='00700'.
+        resp_ticker = await client.post(
+            "/api/v1/workspaces",
+            json={"name": "腾讯控股", "ticker": "0700.HK"},
+        )
+        assert resp_ticker.status_code == 201, resp_ticker.text
+        ticker_id = resp_ticker.json()["workspace_id"]
+        ticker_row = next(w for w in db_state["workspaces"] if w["workspace_id"] == ticker_id)
+        assert ticker_row["config"].get("dalton_company_ticker") == "00700"
+
+        # 4. Ordinary whole-config PUT without dalton_company_ticker preserves '00700'.
+        put_normal = await client.put(
+            f"/api/v1/workspaces/{ticker_id}",
+            json={"config": {"theme": "dark"}},
+        )
+        assert put_normal.status_code == 200, put_normal.text
+        assert ticker_row["config"] == {"theme": "dark", "dalton_company_ticker": "00700"}
+
+        # 5. PUT trying to overwrite dalton_company_ticker keeps original '00700'.
+        put_override = await client.put(
+            f"/api/v1/workspaces/{ticker_id}",
+            json={"config": {"dalton_company_ticker": "NVDA", "theme": "light"}},
+        )
+        assert put_override.status_code == 200, put_override.text
+        assert ticker_row["config"] == {"theme": "light", "dalton_company_ticker": "00700"}
+
+
+@pytest.mark.asyncio
 async def test_e2_web_concurrent_create_same_company_ticker_variants_creates_only_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1020,11 +1230,15 @@ async def test_e2_web_concurrent_create_deterministic_fallback_when_retry_llm_mi
 
 
 def test_separation_upstream_files_have_no_dalton_tables_or_heavy_dedup_logic() -> None:
-    """Item 3: Upstream workspace.py must not reference Dalton tables in SQL,
-    and upstream workspaces.py delegates dedup/retry/409 to src/dalton."""
+    """Item 3 & r3 Item 5: Upstream workspace.py must not reference Dalton tables
+    in SQL, upstream workspaces.py delegates dedup/retry/409 to src/dalton, and
+    each thin-hook delegation in upstream files stays within 1–5 lines."""
     repo_root = Path(__file__).resolve().parents[3]
     ws_db_src = (repo_root / "src/server/database/workspace.py").read_text(encoding="utf-8")
     ws_app_src = (repo_root / "src/server/app/workspaces.py").read_text(encoding="utf-8")
+    exec_db_src = (repo_root / "src/server/database/automation_executions.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "dalton_knowledge_versions" not in ws_db_src
     assert "dalton_coverage_units" not in ws_db_src
@@ -1034,6 +1248,49 @@ def test_separation_upstream_files_have_no_dalton_tables_or_heavy_dedup_logic() 
     assert "create_workspace_for_web" in ws_app_src
     assert "workspace_create_conflict" not in ws_app_src
     assert "company_workspace_exists" not in ws_app_src
+
+    # Thin-hook line-count guard (1–5 lines per standalone-core.md §7.2):
+    ws_db_tree = ast.parse(ws_db_src)
+    check_fn = next(
+        n
+        for n in ws_db_tree.body
+        if isinstance(n, ast.AsyncFunctionDef) and n.name == "check_duplicate_snapshot_unchanged"
+    )
+    assert check_fn.end_lineno is not None
+    assert (check_fn.end_lineno - check_fn.lineno + 1) <= 5
+    assert (check_fn.body[-1].end_lineno - check_fn.body[0].lineno + 1) <= 5
+
+    def _assert_import_and_call_span(src: str, fn_name: str, imported_name: str) -> None:
+        tree = ast.parse(src)
+        fn = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == fn_name
+        )
+        stmts = [
+            node
+            for node in ast.walk(fn)
+            if (
+                isinstance(node, ast.ImportFrom)
+                and any(alias.name == imported_name for alias in node.names)
+            )
+            or (
+                isinstance(node, ast.Assign)
+                and isinstance(node.value, ast.Await)
+                and isinstance(node.value.value, ast.Call)
+                and isinstance(node.value.value.func, ast.Name)
+                and node.value.value.func.id == imported_name
+            )
+        ]
+        assert len(stmts) == 2
+        start = min(s.lineno for s in stmts)
+        end = max(s.end_lineno for s in stmts if s.end_lineno is not None)
+        assert (end - start + 1) <= 5
+
+    _assert_import_and_call_span(ws_app_src, "create_workspace", "create_workspace_for_web")
+    _assert_import_and_call_span(
+        exec_db_src, "list_executions", "resolve_execution_history_page_links"
+    )
 
 
 @pytest.mark.asyncio
@@ -1905,3 +2162,128 @@ async def test_o1_q1_execution_history_external_caller_strips_colleague_thread_i
         assert by_id[EXEC_OWN]["workspace_id"] == WS_OWN_A
     finally:
         sq.close()
+
+
+@pytest.mark.asyncio
+async def test_o1_q1_execution_history_does_not_pair_migrated_task_workspace_with_old_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r3 Item 4: Thread ID and workspace ID are paired. When a colleague
+    workspace is soft-deleted and the automation has migrated to another live
+    readable workspace (WS_OWN_A), execution history MUST NOT pair WS_OWN_A
+    with the old readable thread (THREAD_COLLEAGUE); it clears workspace_id to
+    None so the frontend resolves the thread directly. When the thread itself
+    is unreadable, conversation_thread_id is cleared and only WS_OWN_A remains."""
+    # Case 1: colleague workspace soft-deleted, automation migrated to WS_OWN_A,
+    # colleague_dispatch=True -> thread readable, workspace_id MUST be None (not WS_OWN_A).
+    sq_del = _build_sqlite_execution_history_db(colleague_ws_status="deleted")
+    sq_del.execute(
+        "UPDATE automations SET workspace_id = ? WHERE automation_id = ?",
+        (WS_OWN_A, AUTO_COLLEAGUE),
+    )
+    sq_del.commit()
+    get_conn_del, _ = _sqlite_async_wrapper(sq_del)
+
+    try:
+        monkeypatch.setattr(
+            sharing_mod,
+            "_sharing_auth_enabled",
+            create_autospec(sharing_mod._sharing_auth_enabled, return_value=True),
+        )
+        monkeypatch.setattr(
+            sharing_mod,
+            "_multiuser_auth_enabled",
+            create_autospec(sharing_mod._multiuser_auth_enabled, return_value=True),
+        )
+        monkeypatch.setattr(
+            sharing_mod,
+            "is_colleague_dispatch_enabled",
+            create_autospec(_REAL_IS_COLLEAGUE_DISPATCH, return_value=True),
+        )
+        monkeypatch.setattr(
+            sharing_mod,
+            "require_team_reader",
+            create_autospec(sharing_mod.require_team_reader, return_value=USER_A),
+        )
+        monkeypatch.setattr(
+            sharing_mod,
+            "get_user_tier",
+            create_autospec(sharing_mod.get_user_tier, return_value="internal"),
+        )
+        monkeypatch.setattr(
+            sharing_mod,
+            "classify_owner_tier",
+            create_autospec(sharing_mod.classify_owner_tier, return_value="internal"),
+        )
+
+        with (
+            patch("src.server.database.automation_executions.get_db_connection", new=get_conn_del),
+            patch("src.server.database.pool.get_db_connection", new=get_conn_del),
+        ):
+            rows_del, _ = await exec_db.list_executions(USER_A, limit=20)
+
+        by_id_del = {r["automation_execution_id"]: r for r in rows_del}
+        assert by_id_del[EXEC_COLLEAGUE]["conversation_thread_id"] == THREAD_COLLEAGUE
+        assert by_id_del[EXEC_COLLEAGUE]["workspace_id"] is None
+
+        # Case 2: colleague_dispatch=False -> old thread unreadable, so
+        # conversation_thread_id is cleared and only the migrated readable WS_OWN_A remains.
+        monkeypatch.setattr(
+            sharing_mod,
+            "is_colleague_dispatch_enabled",
+            create_autospec(_REAL_IS_COLLEAGUE_DISPATCH, return_value=False),
+        )
+        monkeypatch.setattr(
+            sharing_mod,
+            "get_workspace_sharing",
+            create_autospec(
+                _REAL_GET_WS_SHARING,
+                return_value={"web_access": "hidden", "cos_access": "hidden"},
+            ),
+        )
+        with (
+            patch("src.server.database.automation_executions.get_db_connection", new=get_conn_del),
+            patch("src.server.database.pool.get_db_connection", new=get_conn_del),
+        ):
+            rows_unreadable, _ = await exec_db.list_executions(USER_A, limit=20)
+
+        by_id_unreadable = {r["automation_execution_id"]: r for r in rows_unreadable}
+        assert by_id_unreadable[EXEC_COLLEAGUE]["conversation_thread_id"] is None
+        assert by_id_unreadable[EXEC_COLLEAGUE]["workspace_id"] == WS_OWN_A
+    finally:
+        sq_del.close()
+
+    # Case 3: colleague workspace live & readable (ro), automation migrated to WS_OWN_A ->
+    # thread keeps its OWN workspace WS_COLLEAGUE (never WS_OWN_A).
+    sq_live = _build_sqlite_execution_history_db(colleague_ws_status="running")
+    sq_live.execute(
+        "UPDATE automations SET workspace_id = ? WHERE automation_id = ?",
+        (WS_OWN_A, AUTO_COLLEAGUE),
+    )
+    sq_live.commit()
+    get_conn_live, _ = _sqlite_async_wrapper(sq_live)
+    try:
+        monkeypatch.setattr(
+            sharing_mod,
+            "is_colleague_dispatch_enabled",
+            create_autospec(_REAL_IS_COLLEAGUE_DISPATCH, return_value=False),
+        )
+        monkeypatch.setattr(
+            sharing_mod,
+            "get_workspace_sharing",
+            create_autospec(
+                _REAL_GET_WS_SHARING,
+                return_value={"web_access": "ro", "cos_access": "hidden"},
+            ),
+        )
+        with (
+            patch("src.server.database.automation_executions.get_db_connection", new=get_conn_live),
+            patch("src.server.database.pool.get_db_connection", new=get_conn_live),
+        ):
+            rows_live, _ = await exec_db.list_executions(USER_A, limit=20)
+
+        by_id_live = {r["automation_execution_id"]: r for r in rows_live}
+        assert by_id_live[EXEC_COLLEAGUE]["conversation_thread_id"] == THREAD_COLLEAGUE
+        assert by_id_live[EXEC_COLLEAGUE]["workspace_id"] == WS_COLLEAGUE
+    finally:
+        sq_live.close()

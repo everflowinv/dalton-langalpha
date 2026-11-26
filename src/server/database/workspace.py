@@ -647,6 +647,8 @@ SERVER_OWNED_CONFIG_KEYS = (
     *SANDBOX_STAMP_KEYS,
     # DALTON-HOOK(historical-duplicate-marker): preserve server-written duplicate marker across whole-config replacements
     "dalton_historical_duplicate_of",
+    # DALTON-HOOK(workspace-dedup): preserve server-written company ticker across whole-config replacements and refuse client writes
+    "dalton_company_ticker",
 )
 
 
@@ -1311,33 +1313,9 @@ async def get_workspaces_for_user(
 
 
 # DALTON-HOOK(cos-settings-tools): thin delegation to src/dalton locked duplicate recheck (keeps all Dalton SQL out of upstream)
-async def check_duplicate_snapshot_unchanged(
-    cur,
-    user_id: str,
-    name: str,
-    *,
-    expected_duplicate_workspace_id: Optional[str] = None,
-    expected_duplicate_workspace_name: Optional[str] = None,
-    verified_company_candidates: Optional[Iterable[Tuple[Any, ...]]] = None,
-    check_colleague_duplicate: bool = False,
-    target_ticker: Optional[str] = None,
-    conflict_out: Optional[Dict[str, Any]] = None,
-    conn: Any = None,
-) -> bool:
-    from src.dalton.coverage.locked_recheck import (
-        check_duplicate_snapshot_unchanged as _dalton_check_duplicate_snapshot_unchanged,
-    )
-
-    return await _dalton_check_duplicate_snapshot_unchanged(
-        cur, user_id, name,
-        expected_duplicate_workspace_id=expected_duplicate_workspace_id,
-        expected_duplicate_workspace_name=expected_duplicate_workspace_name,
-        verified_company_candidates=verified_company_candidates,
-        check_colleague_duplicate=check_colleague_duplicate,
-        target_ticker=target_ticker,
-        conflict_out=conflict_out,
-        conn=conn,
-    )
+async def check_duplicate_snapshot_unchanged(*args: Any, **kwargs: Any) -> bool:
+    from src.dalton.coverage.locked_recheck import check_duplicate_snapshot_unchanged as _impl
+    return await _impl(*args, **kwargs)
 
 
 async def update_workspace(
@@ -1369,6 +1347,7 @@ async def update_workspace(
                 # A replaced config keeps the row's server-owned keys and never
                 # takes the caller's.
                 # DALTON-HOOK(historical-duplicate-marker): SERVER_OWNED_CONFIG_KEYS includes dalton_historical_duplicate_of
+                # DALTON-HOOK(workspace-dedup): SERVER_OWNED_CONFIG_KEYS includes dalton_company_ticker
                 # DALTON-HOOK(colleague-access): include pending_outbound_confirm only when colleague sharing auth is enabled
                 cfg_sql = (
                     "(%s::jsonb - %s::text[]) || COALESCE("

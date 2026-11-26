@@ -230,6 +230,18 @@ async def check_duplicate_snapshot_unchanged(
         return str(cand[0]), str(cand[1]), cand[2], False, None
 
     async def _run_checks(check_cur: Any) -> bool:
+        # Lock order invariant: caller holds lock_user_writes(user_id) first;
+        # when colleague dedup is active, acquire normalized ticker advisory
+        # lock(s) in sorted order strictly after the user lock so cross-user
+        # concurrent creates for the same company ticker serialize across
+        # recheck, workspace INSERT, and same-tx identity commit without deadlocks.
+        if check_colleague_duplicate and target_ticker_keys:
+            for ticker_key in sorted(target_ticker_keys):
+                await check_cur.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext('ws_ticker:' || %s::text))",
+                    (ticker_key,),
+                )
+
         await check_cur.execute(
             f"""
             SELECT workspace_id::text AS workspace_id,

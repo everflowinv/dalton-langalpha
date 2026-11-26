@@ -8,11 +8,12 @@ Replaces SQL-level ``t.user_id = a.user_id`` thread joins so:
   initiator's readable thread link when a colleague workspace was soft-deleted
   while colleague dispatch is on, and blocking external members from viewing
   colleague-initiated threads inside their own workspace).
-- Workspace ID visibility is resolved independently from thread readability
-  (never returning a deleted/unbound or hidden non-accessible workspace ID).
-- Inaccessible links are stripped (``conversation_thread_id = None`` and, when
-  no accessible fallback workspace applies, ``workspace_id = None``), keeping
-  the execution record itself intact.
+- Thread ID and workspace ID are paired: when a thread is readable, only that
+  thread's own live accessible workspace ID is paired with it (or ``None`` when
+  that workspace is deleted/unbound/inaccessible so the frontend resolves the
+  thread directly — never substituting a migrated automation's new workspace ID).
+  When a thread is absent or unreadable, ``conversation_thread_id`` is cleared
+  and only an accessible task workspace ID (if any) is kept.
 """
 
 from __future__ import annotations
@@ -277,11 +278,11 @@ async def resolve_execution_history_page_links(
                 )
             can_read_thread, resolved_ws = thread_cache[tid]
             if can_read_thread:
-                row["workspace_id"] = (
-                    resolved_ws
-                    if resolved_ws is not None
-                    else await _resolve_fallback_ws(task_ws, task_ws_owned)
-                )
+                # Pair a readable thread ONLY with its own accessible workspace
+                # (or None when its workspace is gone/hidden so the frontend
+                # looks up the thread directly rather than opening it under a
+                # migrated automation's unrelated workspace).
+                row["workspace_id"] = resolved_ws
             else:
                 row["conversation_thread_id"] = None
                 row["workspace_id"] = await _resolve_fallback_ws(

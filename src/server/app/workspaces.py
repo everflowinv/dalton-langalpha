@@ -282,7 +282,6 @@ async def create_workspace(
         )
         # DALTON-HOOK(workspace-dedup): delegate company dedup, locked recheck retry, 409 handling, and same-tx coverage registration to src/dalton
         from src.dalton.coverage.workspace_create import create_workspace_for_web
-
         workspace = await create_workspace_for_web(
             request=request, principal=principal, computer_id=computer_id,
             get_manager=WorkspaceManager.get_instance, cause_factory=computer_cause,
