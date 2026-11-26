@@ -30,6 +30,7 @@ vi.mock('@/pages/Dashboard/utils/api', () => ({
 import {
   bumpDaltonTeamModelsRetry,
   checkDaltonTeamModelsAvailable,
+  forceRefreshProviderAvailableModels,
 } from '../daltonTeamModelsCheck';
 
 const MODELS_RESPONSE: ModelsResponse = {
@@ -385,6 +386,105 @@ describe('daltonTeamModelsCheck forced retry', () => {
       policy: null,
     });
     expect(cached.available).toBe(true);
+    expect(calls).toEqual([{ refresh: true }, { refresh: true }]);
+    qc.clear();
+  });
+
+  it('reuses a first retry refresh=1 that was still in-flight when a second retry started, even if it settles before the second retry reaches provider refresh', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let resolveForced!: (v: AvailableModels) => void;
+    let resolveSecondModels!: (v: ModelsResponse) => void;
+    const calls: Array<{ refresh: boolean }> = [];
+
+    h.getProviderAvailableModels.mockImplementation((_provider, opts) => {
+      calls.push({ refresh: Boolean(opts?.refresh) });
+      if (calls.length === 1) {
+        return new Promise<AvailableModels>((resolve) => {
+          resolveForced = resolve;
+        });
+      }
+      return Promise.resolve(freshReady());
+    });
+
+    // Retry #1 starts and sends refresh=1 (still in-flight).
+    bumpDaltonTeamModelsRetry(qc);
+    const first = checkDaltonTeamModelsAvailable({
+      queryClient: qc,
+      providers: PROVIDERS,
+      byokEnabled: false,
+      providersUnread: false,
+      policy: null,
+    });
+    await vi.waitFor(() => expect(calls).toEqual([{ refresh: true }]));
+
+    // Retry #2 starts while Retry #1's refresh=1 is still in-flight, and its
+    // pre-refresh /api/v1/models read is still pending when Retry #1 finishes.
+    bumpDaltonTeamModelsRetry(qc);
+    qc.removeQueries({ queryKey: queryKeys.models.all, exact: true });
+    h.getAvailableModels.mockImplementationOnce(
+      () => new Promise<ModelsResponse>((resolve) => {
+        resolveSecondModels = resolve;
+      }),
+    );
+    const second = checkDaltonTeamModelsAvailable({
+      queryClient: qc,
+      providers: PROVIDERS,
+      byokEnabled: false,
+      providersUnread: false,
+      policy: null,
+    });
+
+    // Retry #1's refresh=1 settles live while Retry #2 is still awaiting /api/v1/models.
+    resolveForced(freshReady());
+    const res1 = await first;
+    expect(res1.available).toBe(true);
+
+    // Retry #2 now finishes /api/v1/models and proceeds — must NOT send a second refresh=1.
+    resolveSecondModels(MODELS_RESPONSE);
+    const res2 = await second;
+    expect(res2.available).toBe(true);
+    expect(calls).toEqual([{ refresh: true }]);
+    qc.clear();
+  });
+
+  it('reuses a first retry refresh=1 recorded at retry start on the direct forceRefreshProviderAvailableModels path (sharing off)', async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    let resolveForced!: (v: AvailableModels) => void;
+    const calls: Array<{ refresh: boolean }> = [];
+
+    h.getProviderAvailableModels.mockImplementation((_provider, opts) => {
+      calls.push({ refresh: Boolean(opts?.refresh) });
+      if (calls.length === 1) {
+        return new Promise<AvailableModels>((resolve) => {
+          resolveForced = resolve;
+        });
+      }
+      return Promise.resolve(freshReady());
+    });
+
+    // Retry #1 (sharing off) enters forceRefreshProviderAvailableModels -> refresh=1 is in-flight.
+    const gen1 = bumpDaltonTeamModelsRetry(qc);
+    const first = forceRefreshProviderAvailableModels(qc, 'antigravity-oauth', gen1);
+    await vi.waitFor(() => expect(calls).toEqual([{ refresh: true }]));
+
+    // Retry #2 clicks while Retry #1's refresh=1 is still in-flight (before Retry #2 finishes invalidateQueries).
+    const gen2 = bumpDaltonTeamModelsRetry(qc);
+
+    // Retry #1's refresh=1 resolves live before Retry #2 reaches forceRefreshProviderAvailableModels.
+    resolveForced(freshReady());
+    const res1 = await first;
+    expect(res1.ready).toContain('gemini-4-neon-high-oauth');
+
+    // Retry #2 finishes invalidateQueries and calls forceRefreshProviderAvailableModels(qc, provider, gen2).
+    // Must reuse the refresh=1 that was already in-flight when Retry #2 started, not send a second refresh=1.
+    const res2 = await forceRefreshProviderAvailableModels(qc, 'antigravity-oauth', gen2);
+    expect(res2.ready).toContain('gemini-4-neon-high-oauth');
+    expect(calls).toEqual([{ refresh: true }]);
+
+    // Retry #3 clicked AFTER Retry #1 already finished must still send a fresh refresh=1.
+    const gen3 = bumpDaltonTeamModelsRetry(qc);
+    const res3 = await forceRefreshProviderAvailableModels(qc, 'antigravity-oauth', gen3);
+    expect(res3.ready).toContain('gemini-4-neon-high-oauth');
     expect(calls).toEqual([{ refresh: true }, { refresh: true }]);
     qc.clear();
   });
