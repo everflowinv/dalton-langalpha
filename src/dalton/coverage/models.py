@@ -80,7 +80,7 @@ _TASK_OVERRIDE_BOOL_KEYS: tuple[str, ...] = (
     "delta_enabled",
     "move_enabled",
 )
-PRIVATE_TICKERS: frozenset[str] = frozenset({"SPCX", "OPENAI", "ANTHROPIC"})
+PRIVATE_TICKERS: frozenset[str] = frozenset({"OPENAI"})
 
 
 def infer_market(ticker: str) -> str:

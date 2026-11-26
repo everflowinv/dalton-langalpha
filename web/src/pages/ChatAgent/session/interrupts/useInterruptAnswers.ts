@@ -13,7 +13,13 @@ import type { PendingInterrupt, SetMessages } from '../types';
 import type { AnswerBoard } from './answerBoard';
 import { PROPOSAL_DATA_KEY_MAP, setCardFields, setCardStatus } from './buckets';
 
-type ProposalBucket = keyof AssistantMessage & ('workspaceProposals' | 'questionProposals' | 'secretaryActionProposals');
+// DALTON-HOOK(watchlist): include watchlistProposals in ProposalBucket
+type ProposalBucket = keyof AssistantMessage & (
+  | 'workspaceProposals'
+  | 'questionProposals'
+  | 'secretaryActionProposals'
+  | 'watchlistProposals'
+);
 
 interface InterruptAnswerDeps {
   pendingInterrupt: PendingInterrupt | null;
@@ -80,8 +86,9 @@ export function useInterruptAnswers({
     const interruptId = (typeof proposal?.interruptId === 'string' && proposal.interruptId)
       ? proposal.interruptId
       : pendingInterrupt.interruptId;
+    // DALTON-HOOK(watchlist): watchlistProposals also wait for tool_call_result settlement (stay in 'submitting' on approve)
     const nextStatus = verdict === 'approve'
-      ? (bucket === 'workspaceProposals' ? 'submitting' : 'approved')
+      ? (bucket === 'workspaceProposals' || bucket === 'watchlistProposals' ? 'submitting' : 'approved')
       : 'rejected';
     setMessages((prev) => setCardFields(prev, bucket, proposalId!, {
       status: nextStatus,
@@ -105,6 +112,11 @@ export function useInterruptAnswers({
       decidePendingProposal('secretaryActionProposals', 'approve', proposal),
     handleRejectSecretaryAction: (proposal?: Record<string, unknown>) =>
       decidePendingProposal('secretaryActionProposals', 'reject', proposal),
+    // DALTON-HOOK(watchlist): approve/reject personal watchlist confirmation cards
+    handleApproveWatchlistAction: (proposal?: Record<string, unknown>) =>
+      decidePendingProposal('watchlistProposals', 'approve', proposal),
+    handleRejectWatchlistAction: (proposal?: Record<string, unknown>) =>
+      decidePendingProposal('watchlistProposals', 'reject', proposal),
   }), [decidePendingProposal]);
   // --- DALTON-HOOK(cos-settings-tools): end ---
 

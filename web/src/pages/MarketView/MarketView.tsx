@@ -2,8 +2,11 @@ import React, { useState, useRef, useEffect, useEffectEvent, useCallback, useMem
 import { useNavigate, useSearchParams } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { Info } from 'lucide-react';
+import { ArrowLeft, Info } from 'lucide-react';
 import { useToast } from '@/components/ui/use-toast';
+// DALTON-HOOK(watchlist): gate full-page personal watchlist route on Dalton build
+import { isDaltonBuild } from '@/config/brand';
+import { WatchlistWorkspace } from './components/watchlist/WatchlistWorkspace';
 import './MarketView.css';
 import StockHeader from './components/StockHeader';
 import MarketChart from './components/MarketChart';
@@ -16,7 +19,7 @@ import MarketChatPanel from './components/MarketChatPanel';
 import { QuoteList } from './components/quoteList/QuoteList';
 import { QuoteListDrawer } from './components/quoteList/QuoteListDrawer';
 import { INTERVALS } from './utils/chartConstants';
-import { MARKET_VIEW_ROUTE_PARAMS, readMarketViewRoute } from './utils/marketRoute';
+import { MARKET_VIEW_ROUTE_PARAMS, buildMarketViewUrl, readMarketViewRoute } from './utils/marketRoute';
 import { useWorkspaces } from '@/hooks/useWorkspaces';
 import { homeWorkspaceQuery, resolveChatWorkspace } from '@/hooks/useHomeWorkspace';
 import type { Workspace } from '@/types/api';
@@ -105,6 +108,9 @@ function MarketViewInner() {
   // for a fresh chat. Seeded here, the effect below re-applies the same values
   // and React bails, so the link's conversation survives the landing.
   const [openingRoute] = useState(() => readMarketViewRoute(searchParams));
+  // DALTON-HOOK(watchlist): `/market` without `?symbol=` opens the full personal watchlist in Dalton builds
+  const routeHasSymbol = Boolean(readMarketViewRoute(searchParams).symbol);
+  const showWatchlistView = isDaltonBuild && !routeHasSymbol;
   // Every way in (link, saved pref, search, sidebar, chip) lands on the display
   // spelling, so a `600519.SS` link, its header, pref and chart keys all read
   // `600519.SH` from the first render.
@@ -269,7 +275,17 @@ function MarketViewInner() {
       const tf = normalizeTimeframe(timeframe);
       setSelectedInterval((cur) => (cur === tf ? cur : tf));
     }
-  }, [selectedStock]);
+    // DALTON-HOOK(watchlist): push chart URL when jumping from watchlist list view so Back returns to /market
+    if (isDaltonBuild) {
+      navigate(
+        buildMarketViewUrl({
+          symbol: sym,
+          ...(timeframe ? { timeframe: normalizeTimeframe(timeframe) } : {}),
+        }),
+        { replace: !showWatchlistView },
+      );
+    }
+  }, [selectedStock, navigate, showWatchlistView]);
 
   // A request to show layers made while the page is open (the agent publishing
   // from the chat panel, a card's chip) brings the chart to their instance when
@@ -335,7 +351,10 @@ function MarketViewInner() {
       setChatReturnPath(route.returnTo);
     }
     // `thread` stays for MarketChatPanel, which consumes it itself.
-    const consumed = MARKET_VIEW_ROUTE_PARAMS.filter((key) => key !== 'thread' && searchParams.has(key));
+    // DALTON-HOOK(watchlist): keep `symbol` and `tf` in the URL so reload and back/forward between /market and /market?symbol= stay lossless
+    const consumed = MARKET_VIEW_ROUTE_PARAMS.filter(
+      (key) => key !== 'thread' && (!isDaltonBuild || (key !== 'symbol' && key !== 'tf')) && searchParams.has(key),
+    );
     if (consumed.length > 0) {
       setSearchParams((prev) => {
         const next = new URLSearchParams(prev);
@@ -346,20 +365,29 @@ function MarketViewInner() {
   }, [searchParams, selectedStock, setSearchParams, selectWorkspace]);
 
   const handleStockSearch = useCallback((symbol: string, searchResult?: StockSearchHit | null) => {
-    setSelectedStock(displaySpelling(symbol));
+    const nextSym = displaySpelling(symbol);
+    setSelectedStock(nextSym);
     setSelectedStockDisplay(
       searchResult ? displayOverrideFromHit(searchResult) : null
     );
     setChartMeta(null);
     setShowOverview(false);
-  }, []);
+    // DALTON-HOOK(watchlist): reflect symbol switches in the URL in Dalton builds
+    if (isDaltonBuild && nextSym) {
+      setSearchParams((prev) => {
+        const next = new URLSearchParams(prev);
+        next.set('symbol', nextSym);
+        return next;
+      }, { replace: true });
+    }
+  }, [setSearchParams]);
 
   // Subscribe selected stock to WS feed
   useEffect(() => {
-    if (!selectedStock) return;
+    if (!selectedStock || showWatchlistView) return;
     wsSubscribe([selectedStock]);
     return () => wsUnsubscribe([selectedStock]);
-  }, [selectedStock, wsSubscribe, wsUnsubscribe]);
+  }, [selectedStock, showWatchlistView, wsSubscribe, wsUnsubscribe]);
 
   // Display price: prefer WS live data over REST. useStockData only returns
   // the rows of the symbol on screen, so a switch shows dashes, not the last one's.
@@ -560,11 +588,34 @@ function MarketViewInner() {
   }, [navigate, toast, t, queryClient, chartImage, chartImageDesc, scope, selectedWorkspaceId, selectedStock, selectedInterval, subagents.toSend, tuning.toSend, collectViews]);
 
   const handleListPick = useCallback((symbol: string) => {
-    setSelectedStock(displaySpelling(symbol));
+    const nextSym = displaySpelling(symbol);
+    setSelectedStock(nextSym);
     setSelectedStockDisplay(null);
     setChartMeta(null);
     setShowOverview(false);
-  }, []);
+    // DALTON-HOOK(watchlist): sync symbol picks to URL
+    if (isDaltonBuild && nextSym) {
+      setSearchParams((prev) => {
+        const next = new URLSearchParams(prev);
+        next.set('symbol', nextSym);
+        return next;
+      }, { replace: true });
+    }
+  }, [setSearchParams]);
+
+  // DALTON-HOOK(watchlist): button returning from K-line view to `/market` personal watchlist
+  const backToWatchlistButton = isDaltonBuild ? (
+    <button
+      type="button"
+      data-testid="back-to-watchlist-btn"
+      onClick={() => navigate('/market')}
+      className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs font-medium hover:bg-(--color-bg-hover) mr-1"
+      style={{ color: 'var(--color-text-secondary)' }}
+    >
+      <ArrowLeft className="h-3.5 w-3.5" />
+      <span>{t('marketView:watchlist.backToWatchlist')}</span>
+    </button>
+  ) : null;
 
   // The chart toolbar's own end: the watchlist and holdings, then the company overview.
   const toolbarTrail = useMemo(() => (
@@ -631,9 +682,32 @@ function MarketViewInner() {
           Page-wide, so the chat and watchlist columns stay draggable too; it
           overlaps the header rather than pushing it down (App.css). */}
       <div className="chrome-drag-strip" aria-hidden="true" />
-      <h1 className="sr-only">{t('marketView:pageHeading', { symbol: selectedStock })}</h1>
-      {isMobile ? (
+      <h1 className="sr-only">
+        {showWatchlistView
+          ? t('marketView:watchlist.title')
+          : t('marketView:pageHeading', { symbol: selectedStock })}
+      </h1>
+      {/* DALTON-HOOK(watchlist): render full personal watchlist at `/market` when no `?symbol=` is present */}
+      {showWatchlistView ? (
+        <WatchlistWorkspace
+          scope={scope}
+          onScopeChange={setScope}
+          activeWorkspaceId={activeWorkspaceId}
+          workspaces={selectableWorkspaces}
+          selectedWorkspaceId={selectedWorkspaceId}
+          workspacePending={workspacePending}
+          onWorkspaceChange={selectWorkspace}
+          chatPanelWidth={chatPanelWidth}
+          onDragStart={handleDragStart}
+          onJumpToChart={handleJumpToChart}
+        />
+      ) : isMobile ? (
         <div className="market-mobile-layout">
+          {backToWatchlistButton && (
+            <div className="px-2 pt-1.5" style={{ backgroundColor: 'var(--color-bg-card)' }}>
+              {backToWatchlistButton}
+            </div>
+          )}
           <StockHeader
             symbol={selectedStock}
             quote={quote}
@@ -821,7 +895,14 @@ function MarketViewInner() {
                   wsStatus={wsStatus}
                   marketStatus={marketStatus}
                   selectionTools
-                  toolbarLead={legend.toolbarLead}
+                  toolbarLead={
+                    backToWatchlistButton ? (
+                      <div className="inline-flex items-center">
+                        {backToWatchlistButton}
+                        {legend.toolbarLead}
+                      </div>
+                    ) : legend.toolbarLead
+                  }
                   toolbarLeadKey={legend.toolbarLeadKey}
                   measureToolbarLead={legend.measureToolbarLead}
                   toolbarTrail={toolbarTrail}

@@ -1906,6 +1906,46 @@
       "confirm": "确认",
       "decline": "拒绝"
     },
+    "watchlistConfirm": {
+      "actions": {
+        "watchlist_batch_add": "批量添加到个人观察名单",
+        "watchlist_set_tier": "调整观察名单分档",
+        "watchlist_remove": "从观察名单移除标的",
+        "watchlist_tier_policy": "更新分档监控策略"
+      },
+      "tiers": {
+        "core": "核心",
+        "watch": "跟踪",
+        "radar": "雷达"
+      },
+      "tasks": {
+        "watch": "盘中盯盘",
+        "delta": "论点增量",
+        "move": "涨跌异动快评",
+        "earnings": "财报自动写稿"
+      },
+      "summary": {
+        "create": "新建 {{count}} 项任务",
+        "update": "改频 {{count}} 项任务",
+        "resume": "恢复 {{count}} 项任务",
+        "pause": "暂停 {{count}} 项任务"
+      },
+      "settled": {
+        "approved": "个人观察名单已更新",
+        "partial": "名单已更新（部分后台任务待补齐）",
+        "rejected": "已取消观察名单修改",
+        "failed": "观察名单修改失败",
+        "failedWithReason": "观察名单修改失败：{{reason}}",
+        "scopeChanged": "情况已变化，请重新发起"
+      },
+      "affectedCompanies": "受影响公司（{{count}}）",
+      "affectedWorkspaces": "受影响研究工作区与任务（{{count}}）",
+      "confirm": "确认执行",
+      "submitting": "执行中…",
+      "decline": "取消",
+      "retryReconcile": "一键补齐同步",
+      "retrying": "补齐中…"
+    },
     "userQuestion": {
       "answered": "已回答：{{answer}}",
       "noAnswer": "（无回答）",

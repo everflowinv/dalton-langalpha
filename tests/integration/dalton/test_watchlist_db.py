@@ -4,7 +4,7 @@ Covers:
 1. Empty-database full upgrade to head (verifies single linear head, new tables,
    columns, indexes, and 3-tier CHECK constraints).
 2. Existing-data upgrade (`d055` -> `d056`) and safe `downgrade` (`d056` -> `d055`)
-   -> re-`upgrade` (`d055` -> `d056`) with real samples: unlisted `SPCX`,
+   -> re-`upgrade` (`d055` -> `d056`) with real samples: unlisted `OPENAI`,
    manual workspace binding (`_manual_workspace_id`), rule groups, and `radar`
    rows/groups.
 
@@ -135,7 +135,7 @@ def test_d056_single_head_and_fresh_upgrade_schema() -> None:
 
 
 def test_d056_upgrade_backfill_and_downgrade_with_radar_samples() -> None:
-    """Verify d055 -> d056 backfill (SPCX, manual ws, rule groups, legacy tags) and radar-safe downgrade."""
+    """Verify d055 -> d056 backfill (OPENAI, manual ws, rule groups, legacy tags) and radar-safe downgrade."""
     env = _alembic_env_for_dsn(PG_DSN)
     _run_alembic(["upgrade", "head"], env=env, dalton=False)
     _run_alembic(["upgrade", "d055"], env=env, dalton=True)
@@ -145,7 +145,7 @@ def test_d056_upgrade_backfill_and_downgrade_with_radar_samples() -> None:
     radar_group_id = str(uuid.uuid4())
     manual_ws_id = str(uuid.uuid4())
 
-    # Seed pre-d056 rows at d055: SPCX (core), AAPL (core + _manual_workspace_id + extra.tags), MSFT (watch + group)
+    # Seed pre-d056 rows at d055: OPENAI (core), AAPL (core + _manual_workspace_id + extra.tags), MSFT (watch + group)
     with psycopg.connect(PG_DSN, autocommit=False) as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -158,7 +158,7 @@ def test_d056_upgrade_backfill_and_downgrade_with_radar_samples() -> None:
             cur.execute(
                 """
                 INSERT INTO dalton_coverage (user_id, ticker, name, tier, market, extra, source)
-                VALUES (%s, 'SPCX', 'SpaceX', 'core', 'US', '{}'::jsonb, 'seed')
+                VALUES (%s, 'OPENAI', 'OpenAI', 'core', 'US', '{}'::jsonb, 'seed')
                 """,
                 (test_uid,),
             )
@@ -193,9 +193,9 @@ def test_d056_upgrade_backfill_and_downgrade_with_radar_samples() -> None:
 
         with psycopg.connect(PG_DSN, autocommit=False) as conn:
             with conn.cursor() as cur:
-                # Verify SPCX backfilled is_private=TRUE and core tier preserved
+                # Verify OPENAI backfilled is_private=TRUE and core tier preserved
                 cur.execute(
-                    "SELECT tier, is_private FROM dalton_coverage WHERE user_id = %s AND ticker = 'SPCX'",
+                    "SELECT tier, is_private FROM dalton_coverage WHERE user_id = %s AND ticker = 'OPENAI'",
                     (test_uid,),
                 )
                 assert cur.fetchone() == ("core", True)
@@ -289,7 +289,7 @@ def test_d056_upgrade_backfill_and_downgrade_with_radar_samples() -> None:
                     ("AAPL", "core"),
                     ("MSFT", "watch"),
                     ("NET", "watch"),
-                    ("SPCX", "core"),
+                    ("OPENAI", "core"),
                 ]
 
                 # 2-tier CHECK constraint rejects 'radar' again after downgrade
@@ -306,7 +306,7 @@ def test_d056_upgrade_backfill_and_downgrade_with_radar_samples() -> None:
         with psycopg.connect(PG_DSN, autocommit=False) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT is_private FROM dalton_coverage WHERE user_id = %s AND ticker = 'SPCX'",
+                    "SELECT is_private FROM dalton_coverage WHERE user_id = %s AND ticker = 'OPENAI'",
                     (test_uid,),
                 )
                 assert cur.fetchone() == (True,)

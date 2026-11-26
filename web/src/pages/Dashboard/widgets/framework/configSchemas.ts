@@ -193,9 +193,10 @@ export const AutomationsConfigSchema = z.object({
   limit: optCatch(intInRange(8, 1, 100), 8),
 });
 
-export const PW_TAB_KEYS = ['watchlist', 'portfolio'] as const;
+// DALTON-HOOK(watchlist): add personal 'coverage' tab and keep defaultTab optional so saved cards keep their pick while new cards auto-pick coverage when non-empty
+export const PW_TAB_KEYS = ['coverage', 'watchlist', 'portfolio'] as const;
 export const PortfolioWatchlistConfigSchema = z.object({
-  defaultTab: optCatch(z.enum(PW_TAB_KEYS), 'watchlist'),
+  defaultTab: z.catch(z.optional(z.enum(PW_TAB_KEYS)), undefined),
   valuesHidden: optCatch(z.boolean(), false),
 });
 

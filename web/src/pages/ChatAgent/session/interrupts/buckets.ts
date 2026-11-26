@@ -10,6 +10,7 @@ import type {
   AssistantMessage,
   ChatMessage,
   SecretaryActionProposalState,
+  WatchlistProposalState, // DALTON-HOOK(watchlist)
   WorkspaceProposalState,
 } from '@/types/chat';
 // --- DALTON-HOOK(cos-settings-tools): end ---
@@ -17,10 +18,20 @@ import { updateMessage } from '../../hooks/utils/messageHelpers';
 import { dispatchResultFields, type ToolResultLike } from '../../utils/dispatchResult';
 import type { HistoryInterruptInfo, SetMessages } from '../types';
 
+// DALTON-HOOK(watchlist): personal watchlist confirmation action types
+const WATCHLIST_INTERRUPT_TYPES = new Set([
+  'watchlist_batch_add',
+  'watchlist_set_tier',
+  'watchlist_remove',
+  'watchlist_tier_policy',
+]);
+
 /** Interrupt types that map to proposal-based HITL cards (workspace, question, ptc, secretary). */
 const PROPOSAL_INTERRUPT_TYPES = new Set([
   'create_workspace', 'start_question', 'ptc_agent',
   'delete_workspace', 'stop_workspace', 'delete_thread',
+  // DALTON-HOOK(watchlist): personal watchlist mutation cards
+  'watchlist_batch_add', 'watchlist_set_tier', 'watchlist_remove', 'watchlist_tier_policy',
 ]);
 
 /** Maps interrupt types to their proposal bucket key on AssistantMessage. */
@@ -31,6 +42,11 @@ const PROPOSAL_DATA_KEY_MAP: Record<string, keyof AssistantMessage> = {
   delete_workspace: 'secretaryActionProposals',
   stop_workspace: 'secretaryActionProposals',
   delete_thread: 'secretaryActionProposals',
+  // DALTON-HOOK(watchlist): map watchlist confirmation interrupts to watchlistProposals bucket
+  watchlist_batch_add: 'watchlistProposals',
+  watchlist_set_tier: 'watchlistProposals',
+  watchlist_remove: 'watchlistProposals',
+  watchlist_tier_policy: 'watchlistProposals',
 };
 
 /**
@@ -55,6 +71,7 @@ const CARD_BUCKET_FOR_TYPE: Record<string, keyof AssistantMessage> = {
 const INTERRUPT_CARD_BUCKETS = [
   'userQuestions', 'workspaceProposals', 'questionProposals',
   'ptcAgentProposals', 'secretaryActionProposals',
+  'watchlistProposals', // DALTON-HOOK(watchlist)
   'creditPauses', 'toolApprovals',
 ] as const satisfies readonly (keyof AssistantMessage)[];
 
@@ -200,7 +217,9 @@ function proposalOutcomeFields(
     return { status: 'rejected', failure_code: undefined, failure_error: undefined };
   }
   const isToolError = toolStatus === 'error';
-  const strictJsonOutcome = type === 'create_workspace' || type === 'archive_workspace';
+  // DALTON-HOOK(watchlist): personal watchlist confirmation cards require explicit JSON success/error settlement
+  const strictJsonOutcome =
+    type === 'create_workspace' || type === 'archive_workspace' || WATCHLIST_INTERRUPT_TYPES.has(type);
   if (typeof content !== 'string') {
     return isToolError || strictJsonOutcome
       ? { status: 'failed' }
@@ -290,6 +309,29 @@ function proposalResultFields(
   if (type === 'create_workspace') {
     return workspaceProposalResultFields(result);
   }
+  // --- DALTON-HOOK(watchlist): begin ---
+  if (WATCHLIST_INTERRUPT_TYPES.has(type)) {
+    const outcome = proposalOutcomeFields(type, result);
+    if (outcome.status !== 'approved' || typeof result.content !== 'string') {
+      return outcome;
+    }
+    try {
+      const parsed: unknown = JSON.parse(result.content);
+      if (isPlainObject(parsed)) {
+        return {
+          ...outcome,
+          ...(typeof parsed.reconcile_status === 'string'
+            ? { reconcile_status: parsed.reconcile_status }
+            : {}),
+          ...(typeof parsed.job_id === 'string' ? { job_id: parsed.job_id } : {}),
+        };
+      }
+    } catch {
+      // Keep base outcome.
+    }
+    return outcome;
+  }
+  // --- DALTON-HOOK(watchlist): end ---
   return proposalOutcomeFields(type, result);
 }
 
@@ -346,12 +388,37 @@ function settleLiveProposalFromResult(
         msgChanged = true;
       }
     }
+    // --- DALTON-HOOK(watchlist): begin ---
+    let nextWatchlistProposals = m.watchlistProposals;
+    if (m.watchlistProposals) {
+      let bucketChanged = false;
+      const updatedCards: Record<string, WatchlistProposalState> = { ...m.watchlistProposals };
+      for (const [cardId, card] of Object.entries(m.watchlistProposals)) {
+        if (
+          card
+          && card.tool_call_id === toolCallId
+          && (card.status === 'submitting' || card.status === 'pending')
+        ) {
+          updatedCards[cardId] = {
+            ...card,
+            ...proposalResultFields(card.actionType || 'watchlist_set_tier', result),
+          } as WatchlistProposalState;
+          bucketChanged = true;
+        }
+      }
+      if (bucketChanged) {
+        nextWatchlistProposals = updatedCards;
+        msgChanged = true;
+      }
+    }
+    // --- DALTON-HOOK(watchlist): end ---
     if (!msgChanged) return m;
     changed = true;
     const updatedMsg: AssistantMessage = {
       ...m,
       ...(nextWorkspaceProposals ? { workspaceProposals: nextWorkspaceProposals } : {}),
       ...(nextSecretaryProposals ? { secretaryActionProposals: nextSecretaryProposals } : {}),
+      ...(nextWatchlistProposals ? { watchlistProposals: nextWatchlistProposals } : {}), // DALTON-HOOK(watchlist)
     };
     return updatedMsg;
   });
@@ -380,8 +447,9 @@ function settleProposalFromResult(
   return resolvePendingHistoryInterrupt(
     pending,
     // DALTON-HOOK(cos-settings-tools): create_workspace settles only by exact tool_call_id (never positional fallback)
+    // DALTON-HOOK(watchlist): watchlist confirmation cards also settle strictly by exact tool_call_id
     (p) => PROPOSAL_INTERRUPT_TYPES.has(p.type) && (
-      p.type === 'create_workspace'
+      p.type === 'create_workspace' || WATCHLIST_INTERRUPT_TYPES.has(p.type)
         ? (!!toolCallId && p.toolCallId === toolCallId)
         : (named ? p.toolCallId === toolCallId : !toolCallId || !p.toolCallId)
     ),
@@ -397,6 +465,7 @@ function settleProposalFromResult(
 }
 
 export {
+  WATCHLIST_INTERRUPT_TYPES, // DALTON-HOOK(watchlist)
   PROPOSAL_INTERRUPT_TYPES, PROPOSAL_DATA_KEY_MAP,
   INTERRUPT_CARD_BUCKETS, CARD_BUCKET_FOR_TYPE,
   setCardStatus, setCardFields, resolvePendingHistoryInterrupt, historyCardKey,

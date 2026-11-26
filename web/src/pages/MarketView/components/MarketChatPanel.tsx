@@ -124,6 +124,8 @@ interface MarketChatPanelProps {
   onReturnToChat?: () => void;
   /** Switch the live chart to a symbol+timeframe (so a chip can jump to it). */
   onJumpToChart?: (symbol: string, timeframe: string) => void;
+  /** DALTON-HOOK(watchlist): optional personal watchlist snapshot attached only in private sessions. */
+  watchlistContext?: string | null;
 }
 
 function PanelLoading(): React.ReactElement {
@@ -292,6 +294,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     placeholder,
     onReturnToChat,
     onJumpToChart,
+    watchlistContext,
     activeWorkspaceId,
     initialThreadId,
     onSelectThread,
@@ -436,6 +439,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     handleRejectPTCAgent,
     handleApproveSecretaryAction,
     handleRejectSecretaryAction,
+    // DALTON-HOOK(watchlist): personal watchlist confirmation card handlers
+    handleApproveWatchlistAction,
+    handleRejectWatchlistAction,
     handleResumeCreditPause,
     handleApproveToolCall,
     handleRejectToolCall,
@@ -556,7 +562,11 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     ({ message, files, commands, modelOptions }: ComposerSend) => {
       const slashCommands = commands as SlashCommandLike[];
       const send = buildMarketSendContexts(symbol, interval, message, collectViews());
-      const contexts: Record<string, unknown>[] = [send.skill];
+      const contexts: Record<string, unknown>[] = symbol ? [send.skill] : [];
+      // DALTON-HOOK(watchlist): auto-attach personal watchlist snapshot ONLY in private sessions (never shared workspaces/threads)
+      if (watchlistContext && !teamReadOnly.isColleague && (scope === 'all' || !(activeWorkspace as { is_shared?: boolean } | null)?.is_shared)) {
+        contexts.push({ type: 'text', content: watchlistContext });
+      }
 
       // Skill contexts from typed slash commands (mirrors ChatView). Skip a
       // second chart-annotation context — it's always injected above.
@@ -625,7 +635,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
       });
       return sent;
     },
-    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend, collectViews, t, threadModel.sendModel, threadModel.sendModelSeq],
+    [symbol, interval, chartImage, chartImageDesc, handleSendMessage, onClearChartImage, subagentsToSend, tuningToSend, collectViews, t, threadModel.sendModel, threadModel.sendModelSeq, watchlistContext, teamReadOnly.isColleague, scope, activeWorkspace],
   );
 
   // DALTON-HOOK(chat-attachment-count): reject capturing a new chart screenshot when already at MAX_FILES
@@ -737,6 +747,11 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   const stableRejectPTCAgent = useStableHandler(handleRejectPTCAgent);
   const stableApproveSecretaryAction = useStableHandler(handleApproveSecretaryAction);
   const stableRejectSecretaryAction = useStableHandler(handleRejectSecretaryAction);
+  // DALTON-HOOK(watchlist): stable watchlist confirmation handlers
+  const stableApproveWatchlistAction = useStableHandler((proposalData: Record<string, unknown>) =>
+    handleApproveWatchlistAction?.(proposalData));
+  const stableRejectWatchlistAction = useStableHandler((proposalData: Record<string, unknown>) =>
+    handleRejectWatchlistAction?.(proposalData));
   const stableResumeCreditPause = useStableHandler(handleResumeCreditPause);
   const stableApproveToolCall = useStableHandler(handleApproveToolCall);
   const stableRejectToolCall = useStableHandler(handleRejectToolCall);
@@ -793,6 +808,9 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     onRejectPTCAgent: stableRejectPTCAgent,
     onApproveSecretaryAction: stableApproveSecretaryAction,
     onRejectSecretaryAction: stableRejectSecretaryAction,
+    // DALTON-HOOK(watchlist): expose watchlist confirmation handlers on MarketChatPanel
+    onApproveWatchlistAction: stableApproveWatchlistAction,
+    onRejectWatchlistAction: stableRejectWatchlistAction,
     onResumeCreditPause: stableResumeCreditPause,
     onApproveToolCall: stableApproveToolCall,
     onRejectToolCall: stableRejectToolCall,
@@ -812,7 +830,8 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
     stableRejectCreateWorkspace, stableApproveStartQuestion, stableRejectStartQuestion,
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
-    stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
+    stableRejectSecretaryAction, stableApproveWatchlistAction, stableRejectWatchlistAction, // DALTON-HOOK(watchlist)
+    stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
     stableEditMessage, stableRegenerate, stableRetry, editDrafts,
     stableThumbUp, stableThumbDown, stableThumbDownFollowUp, stableWidgetSendPrompt, follow.reveal, onPublishFile, publishAllowed, reportThreadId, // DALTON-HOOK(external-share-guard)
   ]);

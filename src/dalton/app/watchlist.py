@@ -5,12 +5,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from src.dalton.company_identity import reject_company_system_auth
 from src.dalton.coverage import CoverageDataSourceError, list_user_coverage_summary
 from src.dalton.settings import get_dalton_settings
+from src.dalton.watchlist.metrics import WatchlistMetricsService
 from src.dalton.watchlist.policies import (
     get_user_tier_policies,
     list_unfinished_reconcile_jobs,
@@ -88,6 +89,22 @@ async def get_watchlist_endpoint(
         "tier_policies": {t: p.to_dict() for t, p in policies.items()},
         "pending_reconcile_count": len(unfinished_jobs),
     }
+
+
+@router.get("/metrics")
+@handle_api_exceptions("get personal watchlist metrics", logger)
+async def get_watchlist_metrics_endpoint(
+    user_id: CurrentUserId,
+    symbols: str | None = Query(default=None, description="Optional comma-separated ticker filter"),
+) -> dict[str, Any]:
+    uid = str(user_id).strip()
+    reject_company_system_auth(uid)
+    sym_list = (
+        [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        if symbols
+        else None
+    )
+    return await WatchlistMetricsService().get_metrics_for_user(uid, symbols=sym_list)
 
 
 @router.get("/tier-policies")

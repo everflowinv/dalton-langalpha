@@ -1136,6 +1136,7 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("chat_uploads.py", "cancel_chat_upload_endpoint"): CORE_CAPABILITY,
         # --- watchlist.py (Personal Watchlist three-tier & outbox reconciler) ---
         ("watchlist.py", "get_watchlist_endpoint"): CORE_CAPABILITY,
+        ("watchlist.py", "get_watchlist_metrics_endpoint"): CORE_CAPABILITY,
         ("watchlist.py", "get_watchlist_tier_policies_endpoint"): CORE_CAPABILITY,
         ("watchlist.py", "preview_watchlist_mutation_endpoint"): CORE_CAPABILITY,
         ("watchlist.py", "mutate_watchlist_endpoint"): CORE_CAPABILITY,

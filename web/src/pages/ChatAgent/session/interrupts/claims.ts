@@ -146,7 +146,15 @@ export function claimedCardFields(
       : { status: 'answered', answer: typeof claim.answer === 'string' ? claim.answer : null };
   }
   // DALTON-HOOK(cos-settings-tools): keep create/archive cards in 'submitting' until tool_call_result confirms outcome
-  if (type === 'create_workspace' || type === 'archive_workspace') {
+  // DALTON-HOOK(watchlist): keep personal watchlist confirmation cards in 'submitting' until tool_call_result confirms outcome
+  if (
+    type === 'create_workspace'
+    || type === 'archive_workspace'
+    || type === 'watchlist_batch_add'
+    || type === 'watchlist_set_tier'
+    || type === 'watchlist_remove'
+    || type === 'watchlist_tier_policy'
+  ) {
     return { status: verdict === 'approved' ? 'submitting' : 'rejected' };
   }
   // Every proposal family and tool approval share the one pair of names.

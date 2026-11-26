@@ -62,12 +62,12 @@ def upgrade() -> None:
         """
     )
 
-    # Backfill unlisted companies (e.g. SPCX, OPENAI, ANTHROPIC) and legacy extra.tags
+    # Backfill unlisted companies (e.g. OPENAI) and legacy extra.tags
     op.execute(
         """
         UPDATE dalton_coverage
         SET is_private = TRUE
-        WHERE ticker IN ('SPCX', 'OPENAI', 'ANTHROPIC')
+        WHERE ticker IN ('OPENAI')
            OR UPPER(COALESCE(market, '')) = 'PRIVATE'
            OR COALESCE(extra->>'is_private', '') = 'true'
         """

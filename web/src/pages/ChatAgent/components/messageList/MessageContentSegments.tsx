@@ -10,6 +10,8 @@ import CreateWorkspaceCard from '../CreateWorkspaceCard';
 import { WorkspaceCreatedSlip } from './WorkspaceCreatedSlip';
 import StartQuestionCard from '../StartQuestionCard';
 import SecretaryConfirmCard from '../SecretaryConfirmCard';
+// DALTON-HOOK(watchlist): personal watchlist confirmation card
+import WatchlistConfirmCard from '../WatchlistConfirmCard';
 import CreditPauseCard from '../CreditPauseCard';
 import ToolApprovalCard from '../ToolApprovalCard';
 import PastPlanCard from '../PastPlanCard';
@@ -46,6 +48,7 @@ import type {
   PTCAgentRenderBlock,
   RenderBlock,
   SecretaryActionRenderBlock,
+  WatchlistProposalRenderBlock, // DALTON-HOOK(watchlist)
   StartQuestionRenderBlock,
   SubagentTaskRenderBlock,
   TextRenderBlock,
@@ -80,6 +83,8 @@ interface MessageContentSegmentsProps {
   othersPause?: boolean;
   ptcAgentProposals?: Record<string, PTCAgentProposalState>;
   secretaryActionProposals?: Record<string, Record<string, unknown>>;
+  // DALTON-HOOK(watchlist): personal watchlist confirmation proposals
+  watchlistProposals?: Record<string, Record<string, unknown>>;
   creditPauses?: Record<string, CreditPauseState>;
   toolApprovals?: Record<string, ToolApprovalState>;
   htmlWidgetProcesses?: Record<string, Record<string, unknown>>;
@@ -166,7 +171,7 @@ function TextBlock({ block, isStreaming, isSubagentView, isReplyStart, onOpenFil
   return isReplyStart && rendersNow ? <div data-reply-start="">{textEl}</div> : textEl;
 }
 
-export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, endsReply = isTurnTail, isSubagentView = false, readOnly = false, othersPause = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext, messageId }: MessageContentSegmentsProps): React.ReactElement {
+export const MessageContentSegments = memo(function MessageContentSegments({ segments, contentProjection, reasoningProcesses, toolCallProcesses, subagentTasks, userQuestions = EMPTY_OBJ, workspaceProposals = EMPTY_OBJ, questionProposals = EMPTY_OBJ, pendingToolCallChunks = EMPTY_OBJ, isStreaming, fold = 'unfolded', isTurnTail = false, endsReply = isTurnTail, isSubagentView = false, readOnly = false, othersPause = false, ptcAgentProposals = EMPTY_OBJ, secretaryActionProposals = EMPTY_OBJ, watchlistProposals = EMPTY_OBJ, creditPauses = EMPTY_OBJ, toolApprovals = EMPTY_OBJ, htmlWidgetProcesses = EMPTY_OBJ, dispatcherContext, messageId }: MessageContentSegmentsProps): React.ReactElement {
   const { turnDisplay } = useTranscriptDisplay();
   const motionSafe = useMotionSafe();
   const {
@@ -176,6 +181,7 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
     onApproveStartQuestion, onRejectStartQuestion,
     onApprovePTCAgent, onRejectPTCAgent,
     onApproveSecretaryAction, onRejectSecretaryAction,
+    onApproveWatchlistAction, onRejectWatchlistAction, // DALTON-HOOK(watchlist)
     onResumeCreditPause,
     onApproveToolCall, onRejectToolCall,
     onWidgetSendPrompt,
@@ -557,6 +563,26 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
             />
           );
         }
+
+        // --- DALTON-HOOK(watchlist): begin ---
+        if (
+          block.type === 'watchlist_batch_add'
+          || block.type === 'watchlist_set_tier'
+          || block.type === 'watchlist_remove'
+          || block.type === 'watchlist_tier_policy'
+        ) {
+          const wld = watchlistProposals[(block as WatchlistProposalRenderBlock).segment.proposalId!];
+          if (!wld) return null;
+          return (
+            <WatchlistConfirmCard
+              key={block.key}
+              proposalData={wld as any}
+              onApprove={!readOnly && answers && onApproveWatchlistAction ? () => onApproveWatchlistAction(wld) : undefined}
+              onReject={!readOnly && answers && onRejectWatchlistAction ? () => onRejectWatchlistAction(wld) : undefined}
+            />
+          );
+        }
+        // --- DALTON-HOOK(watchlist): end ---
 
         if (block.type === 'credit_pause') {
           const pauseId = (block as CreditPauseRenderBlock).segment.proposalId!;
