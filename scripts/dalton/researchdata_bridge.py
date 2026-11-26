@@ -3293,25 +3293,124 @@ _HK_DOT_RE = re.compile(r"^0*(\d{1,5})\.HK$", re.IGNORECASE)
 _CN_DOT_RE = re.compile(r"^(\d{6})\.(SH|SZ|SS)$", re.IGNORECASE)
 _US_DOT_RE = re.compile(r"^([A-Za-z][A-Za-z0-9.\-]{0,15})\.US$", re.IGNORECASE)
 
-try:
-    from src.dalton.sec_issuer_map import (
-        DUAL_LISTED_SEC_ISSUER_MAP as _DUAL_LISTED_SEC_ISSUER_MAP,
-        NON_SEC_MARKET_PATTERNS as _NON_SEC_MARKET_PATTERNS,
-        classify_sec_ticker as _classify_sec_ticker,
-        detect_non_sec_market as _detect_non_sec_ticker,
-        resolve_sec_issuer_ticker as _resolve_sec_issuer_ticker,
+def _load_sec_issuer_map_data() -> dict[str, Any]:
+    """Load the canonical SEC issuer map JSON from ``plugins/dalton_sec/`` without importing ``src``."""
+    here = Path(__file__).resolve()
+    candidates = (
+        here.with_name("sec_issuer_map.json"),
+        *(parent / "plugins" / "dalton_sec" / "sec_issuer_map.json" for parent in here.parents),
     )
-except Exception:
-    _sec_map_repo_root = str(Path(__file__).resolve().parents[2])
-    if _sec_map_repo_root not in sys.path:
-        sys.path.insert(0, _sec_map_repo_root)
-    from src.dalton.sec_issuer_map import (
-        DUAL_LISTED_SEC_ISSUER_MAP as _DUAL_LISTED_SEC_ISSUER_MAP,
-        NON_SEC_MARKET_PATTERNS as _NON_SEC_MARKET_PATTERNS,
-        classify_sec_ticker as _classify_sec_ticker,
-        detect_non_sec_market as _detect_non_sec_ticker,
-        resolve_sec_issuer_ticker as _resolve_sec_issuer_ticker,
-    )
+    for path in candidates:
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+    return {}
+
+
+_SEC_ISSUER_MAP_DATA: dict[str, Any] = _load_sec_issuer_map_data()
+_DUAL_LISTED_SEC_ISSUER_MAP: dict[str, str] = {
+    str(k).upper(): str(v).upper()
+    for k, v in (_SEC_ISSUER_MAP_DATA.get("dual_listed_sec_issuer_map") or {}).items()
+}
+_CONFIRMED_NON_SEC_ISSUERS: frozenset[str] = frozenset(
+    str(item).upper() for item in (_SEC_ISSUER_MAP_DATA.get("confirmed_non_sec_issuers") or ())
+)
+_NON_SEC_MARKET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(str(pat), re.IGNORECASE), str(label))
+    for pat, label in (_SEC_ISSUER_MAP_DATA.get("non_sec_market_patterns") or ())
+)
+_SEC_A_SHARE_RE = re.compile(r"^(?:\d{6}\.(?:SH|SZ|SS|BJ)|(?:SH|SZ|BJ)\d{6})$", re.IGNORECASE)
+_SEC_HK_RE = re.compile(r"^(?:HK:)?0*(\d{1,5})(?:\.HK)?$", re.IGNORECASE)
+
+
+def _sec_hk_candidates(raw: str) -> tuple[str, ...]:
+    m_hk = _SEC_HK_RE.fullmatch(raw)
+    if not m_hk:
+        return ()
+    if not (
+        raw.endswith(".HK")
+        or raw.startswith("HK:")
+        or (raw.isdigit() and len(raw) == 5 and raw.startswith("0"))
+    ):
+        return ()
+    num = int(m_hk.group(1))
+    return (f"{num:04d}.HK", f"{num}.HK", f"{num:05d}", f"HK:{num:04d}", f"HK:{num:05d}")
+
+
+def _detect_non_sec_ticker(ticker: str | None) -> str | None:
+    raw = str(ticker or "").strip()
+    if not raw:
+        return None
+    for pat, label in _NON_SEC_MARKET_PATTERNS:
+        if pat.fullmatch(raw):
+            return label
+    return None
+
+
+def _lookup_sec_watchlist_alias(raw: str) -> str | None:
+    alias_map = None
+    for mod_name in ("scripts.dalton.alphaengine_search_cache", "alphaengine_search_cache"):
+        try:
+            mod = __import__(mod_name, fromlist=["_CORE_WATCHLIST_ALIASES"])
+            alias_map = getattr(mod, "_CORE_WATCHLIST_ALIASES", None)
+            if isinstance(alias_map, dict):
+                break
+        except Exception:
+            continue
+    if not isinstance(alias_map, dict):
+        return None
+    cands = {raw, *_sec_hk_candidates(raw)}
+    for canon, aliases in alias_map.items():
+        canon_str = str(canon or "").strip().upper()
+        if not canon_str or _detect_non_sec_ticker(canon_str) is not None:
+            continue
+        if any(str(a or "").strip().upper() in cands for a in (aliases or ())):
+            return canon_str
+    return None
+
+
+def _resolve_sec_issuer_ticker(ticker: str | None) -> str | None:
+    raw = str(ticker or "").strip().upper()
+    if not raw:
+        return None
+    if raw in _DUAL_LISTED_SEC_ISSUER_MAP:
+        return _DUAL_LISTED_SEC_ISSUER_MAP[raw]
+    for cand in _sec_hk_candidates(raw):
+        if cand in _DUAL_LISTED_SEC_ISSUER_MAP:
+            return _DUAL_LISTED_SEC_ISSUER_MAP[cand]
+    return _lookup_sec_watchlist_alias(raw)
+
+
+def _is_confirmed_non_sec_ticker(ticker: str | None) -> bool:
+    raw = str(ticker or "").strip().upper()
+    if not raw:
+        return False
+    if _SEC_A_SHARE_RE.fullmatch(raw):
+        return True
+    if raw in _CONFIRMED_NON_SEC_ISSUERS:
+        return True
+    for cand in _sec_hk_candidates(raw):
+        if cand in _CONFIRMED_NON_SEC_ISSUERS:
+            return True
+    if raw.startswith(("KR:", "KS:", "KQ:")):
+        code = raw.split(":", 1)[1].strip()
+        if f"{code}.KS" in _CONFIRMED_NON_SEC_ISSUERS or f"{code}.KQ" in _CONFIRMED_NON_SEC_ISSUERS:
+            return True
+    return False
+
+
+def _classify_sec_ticker(ticker: str | None) -> tuple[str, str | None, str | None]:
+    raw = str(ticker or "").strip()
+    if not raw:
+        return ("direct", raw, None)
+    mapped = _resolve_sec_issuer_ticker(raw)
+    market_label = _detect_non_sec_ticker(raw)
+    if mapped is not None:
+        return ("mapped", mapped, market_label)
+    if market_label is not None:
+        if _is_confirmed_non_sec_ticker(raw):
+            return ("confirmed_non_sec", None, market_label)
+        return ("unmapped_non_us", None, market_label)
+    return ("direct", raw, None)
 
 
 def _normalize_ticker_for_route(route: str, ticker: str) -> str:

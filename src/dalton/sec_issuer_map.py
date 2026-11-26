@@ -13,22 +13,27 @@ Distinguishes three cases for non-US tickers:
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import re
-from typing import Literal
+from typing import Any, Literal
 
 SecTickerKind = Literal["direct", "mapped", "confirmed_non_sec", "unmapped_non_us"]
 
-NON_SEC_MARKET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"^(?:\d{1,5}\.HK|HK:\d{1,5}|0\d{3,4})$", re.IGNORECASE), "港股"),
-    (re.compile(r"^(?:\d{6}\.(?:KS|KQ)|(?:KR|KS|KQ):\d{6})$", re.IGNORECASE), "韩股"),
-    (re.compile(r"^(?:\d{6}\.(?:SH|SZ|SS|BJ)|(?:SH|SZ|BJ)\d{6})$", re.IGNORECASE), "A股"),
-    (
-        re.compile(
-            r"^[A-Z0-9._-]+\.(?:T|JP|TW|TWO|L|PA|DE|SW|AS|MI|TO|AX|SI|NS|BO|CO|HE|ST|MC)$",
-            re.IGNORECASE,
-        ),
-        "非美股交易所标的",
-    ),
+SEC_ISSUER_MAP_DATA_PATH: Path = (
+    Path(__file__).resolve().parents[2] / "plugins" / "dalton_sec" / "sec_issuer_map.json"
+)
+
+
+def _load_issuer_map_data() -> dict[str, Any]:
+    return json.loads(SEC_ISSUER_MAP_DATA_PATH.read_text(encoding="utf-8"))
+
+
+_ISSUER_MAP_DATA: dict[str, Any] = _load_issuer_map_data()
+
+NON_SEC_MARKET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(str(pat), re.IGNORECASE), str(label))
+    for pat, label in (_ISSUER_MAP_DATA.get("non_sec_market_patterns") or ())
 )
 
 _A_SHARE_RE = re.compile(r"^(?:\d{6}\.(?:SH|SZ|SS|BJ)|(?:SH|SZ|BJ)\d{6})$", re.IGNORECASE)
@@ -36,152 +41,13 @@ _HK_RE = re.compile(r"^(?:HK:)?0*(\d{1,5})(?:\.HK)?$", re.IGNORECASE)
 
 # Known dual-listed / foreign-private-issuer tickers whose SEC EDGAR filings (20-F / 6-K) live under a US ADR/ticker.
 DUAL_LISTED_SEC_ISSUER_MAP: dict[str, str] = {
-    # Hong Kong dual-listed ADRs
-    "9988.HK": "BABA",
-    "09988": "BABA",
-    "HK:9988": "BABA",
-    "HK:09988": "BABA",
-    "9618.HK": "JD",
-    "09618": "JD",
-    "HK:9618": "JD",
-    "HK:09618": "JD",
-    "9888.HK": "BIDU",
-    "09888": "BIDU",
-    "HK:9888": "BIDU",
-    "HK:09888": "BIDU",
-    "9999.HK": "NTES",
-    "09999": "NTES",
-    "HK:9999": "NTES",
-    "9626.HK": "BILI",
-    "09626": "BILI",
-    "HK:9626": "BILI",
-    "2015.HK": "LI",
-    "02015": "LI",
-    "HK:2015": "LI",
-    "9866.HK": "NIO",
-    "09866": "NIO",
-    "HK:9866": "NIO",
-    "9868.HK": "XPEV",
-    "09868": "XPEV",
-    "HK:9868": "XPEV",
-    "9961.HK": "TCOM",
-    "09961": "TCOM",
-    "HK:9961": "TCOM",
-    "9987.HK": "YUMC",
-    "09987": "YUMC",
-    "2057.HK": "ZTO",
-    "02057": "ZTO",
-    "0005.HK": "HSBC",
-    "00005": "HSBC",
-    "9901.HK": "EDU",
-    "09901": "EDU",
-    "1179.HK": "HTHT",
-    "01179": "HTHT",
-    "9898.HK": "WB",
-    "09898": "WB",
-    "9698.HK": "GDS",
-    "09698": "GDS",
-    "2076.HK": "BZ",
-    "02076": "BZ",
-    "9990.HK": "ZH",
-    "09990": "ZH",
-    "9878.HK": "HKD",
-    # Taiwan ADRs
-    "2330.TW": "TSM",
-    "2303.TW": "UMC",
-    "3711.TW": "ASX",
-    "2412.TW": "CHT",
-    # Japan ADRs (20-F filers)
-    "7203.T": "TM",
-    "6758.T": "SONY",
-    "7267.T": "HMC",
-    "8306.T": "MUFG",
-    "8316.T": "SMFG",
-    "8411.T": "MFG",
-    "8604.T": "NMR",
-    "8591.T": "IX",
-    "4502.T": "TAK",
-    # Korea ADRs (20-F filers)
-    "005490.KS": "PKX",
-    "015760.KS": "KEP",
-    "017670.KS": "SKM",
-    "030200.KS": "KT",
-    "055550.KS": "SHG",
-    "105560.KS": "KB",
-    "316140.KS": "WF",
-    "034220.KS": "LPL",
-    # Europe / UK ADRs (20-F filers)
-    "ASML.AS": "ASML",
-    "SAP.DE": "SAP",
-    "AZN.L": "AZN",
-    "SHEL.L": "SHEL",
-    "ULVR.L": "UL",
-    "BP.L": "BP",
-    "GSK.L": "GSK",
-    "REL.L": "RELX",
-    "RIO.L": "RIO",
-    "BHP.AX": "BHP",
-    "NOVO-B.CO": "NVO",
-    "NOKIA.HE": "NOK",
-    "ERIC-B.ST": "ERIC",
-    "SAN.PA": "SNY",
-    "SAN.MC": "SAN",
-    "TTE.PA": "TTE",
+    str(k).upper(): str(v).upper()
+    for k, v in (_ISSUER_MAP_DATA.get("dual_listed_sec_issuer_map") or {}).items()
 }
 
 # Tickers explicitly confirmed to have NO SEC registration / CIK (canonical normalized keys).
 CONFIRMED_NON_SEC_ISSUERS: frozenset[str] = frozenset(
-    {
-        # Hong Kong primary listings without US SEC registration
-        "0700.HK",
-        "00700",
-        "3690.HK",
-        "03690",
-        "1810.HK",
-        "01810",
-        "9992.HK",
-        "09992",
-        "0788.HK",
-        "00788",
-        "1211.HK",
-        "01211",
-        "0981.HK",
-        "00981",
-        "1024.HK",
-        "01024",
-        "2318.HK",
-        "02318",
-        "0388.HK",
-        "00388",
-        "1299.HK",
-        "01299",
-        "0941.HK",
-        "00941",
-        "0883.HK",
-        "00883",
-        "9633.HK",
-        "09633",
-        "2020.HK",
-        "02020",
-        "2382.HK",
-        "02382",
-        "0268.HK",
-        "00268",
-        "6690.HK",
-        "06690",
-        # Korea primary listings without US SEC registration
-        "005930.KS",
-        "000660.KS",
-        "035420.KS",
-        "035420.KQ",
-        "035720.KS",
-        "035720.KQ",
-        "373220.KS",
-        "207940.KS",
-        "005380.KS",
-        "000270.KS",
-        "068270.KS",
-    }
+    str(item).upper() for item in (_ISSUER_MAP_DATA.get("confirmed_non_sec_issuers") or ())
 )
 
 
