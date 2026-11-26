@@ -84,7 +84,7 @@ const [report, model] = await parallel([
   () =>
     args.model_path
       ? agent(
-          `${base} 按 .agents/skills/model-update/SKILL.md 更新模型 ${args.model_path}：触发类型 Results；先出映射表到 ${R}/mapping.md，再写入另存的新版本（不覆盖旧版），Change Log 完整；recalc 与 audit --strict 通过；输出 EPS walk 与估值变化到 ${R}/model-delta.md。`,
+          `${base} 按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/rollforward.md（对照一致预期时按需读 .agents/skills/dalton-model/references/sanity-check.md）基于原模型 ${args.model_path}（已按 dalton-model 第 1 步优先采用用户本次上传或指定的文件，其次为已登记模型）滚动更新：原件与已有版本保持只读，先输出财报披露行项与模型行项映射表到 ${R}/mapping.md，写入当季实际值并校准远期驱动假设；工作区尚无 model/${T}-model-v*.xlsx 时另存为 ${W}/model/${T}-model-v01.xlsx，已有版本时另存为下一版，并在变更记录（工作簿最前面的 README & Changelog 工作表，或原模型已有的 Change Log 工作表）写明本次改动与原因；运行 python3 .agents/skills/xlsx/scripts/recalc.py <新版本路径> 重算缓存值、python3 .agents/skills/dalton-model/scripts/model_style.py parts-diff ${args.model_path} <新版本路径> 核对部件变动，以及 python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc <新版本路径> 提示性扫描并逐条核对（属问题的修正并重算；合理建模处理、扫描超时或执行失败、以及 Checks〔勾稽检查〕表个别未显示 OK 的条目均写入变更记录后继续）；运行 python3 .agents/skills/dalton-model/scripts/model_style.py lineage --file ${R}/model_lineage.json --output <新版本路径> --baseline ${args.model_path} 记录输入输出路径与哈希；输出新旧版本每股收益（EPS）变动拆解（EPS walk）与估值变化到 ${R}/model-delta.md。`,
           { agentType: 'general-purpose', label: '模型更新', phase: '深度点评与模型', schema: OUT }
         )
       : Promise.resolve(null),
@@ -249,7 +249,7 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
   const modelClause =
     modelPath === null
       ? ''
-      : `模型若有改动走 .agents/skills/model-update/SKILL.md，另存为 ${target}，不覆盖旧版本；模型没改就原样沿用 ${modelPath}。不管改没改，都必须在 files 里回报当前模型的路径（另存则报 ${target}，未改则报 ${modelPath}）。`
+      : `模型若有改动，按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/rollforward.md 保持原件只读，另存为 ${target}，运行 python3 .agents/skills/xlsx/scripts/recalc.py ${target} 重算与 python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc ${target} 提示性扫描并逐条核对（属问题的修正并重算；保留项、扫描超时或执行失败随本次改动一并写入变更记录〔README & Changelog 或 Change Log 工作表〕后继续），再运行 python3 .agents/skills/dalton-model/scripts/model_style.py lineage --file ${R}/model_lineage.json --output ${target} --baseline ${modelPath} 记录输入输出路径与哈希；另存后将报告与 ${R}/model-delta.md 中代表当前模型的路径及单元格引用改为指向 ${target}（model-delta.md 中用于对比的旧版本数值保留原引用），模型输出有变化时同步更新两份文档中受影响的数值；模型未改则原样沿用 ${modelPath}。无论是否修改，均须在 files 里回报当前模型路径（另存报 ${target}，未改报 ${modelPath}）。`
   const fixed = await agent(
     `先核对 ${reportPath} 的 sha256 是否与审稿前（${
       currentSha || '成稿记录值'
@@ -384,7 +384,7 @@ const kp = await agent(
     currentSha || '修订后记录值'
   }）一致。${finalModel ? `最终模型为 ${finalModel.path}。` : ''}然后汇总 ${R}/ 全部文件与审稿意见（${
     finalReview ? '见下' : '审稿缺席：只写 NO_CHANGE 以外结论为待审说明，不改核心支柱状态'
-  }），按 PK.2 的 JSON Schema 写知识层修订草案 ${R}/knowledge-revision.json（{doc: {ops, reason, evidence_refs}}）：thesis 支柱信号与证据行、debate 变化、drivers 新读数、management 指引兑现行、lessons（前瞻错判的原因）、models（新模型版本登记，若模型更新失败则写“模型未更新”并排人工跟进）、事件五词终判。\n${
+  }），按 PK.2 的 JSON Schema 写知识层修订草案 ${R}/knowledge-revision.json（{doc: {ops, reason, evidence_refs}}）：thesis 支柱信号与证据行、debate 变化、drivers 新读数、management 指引兑现行、lessons（前瞻错判的原因）、models（按 .agents/skills/dalton-model/SKILL.md 第 7 步登记新模型版本与关键输出单元格；若模型更新失败则写“模型未更新”并在 agenda_ops 排入人工跟进待办）、事件五词终判。\n${
     finalReview ? JSON.stringify(finalReview) : ''
   }`,
   { agentType: 'general-purpose', label: '知识层修订草案', phase: '审稿', schema: OUT }

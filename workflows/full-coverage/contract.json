@@ -78,9 +78,9 @@
       ],
       "validators": [
         {
-          "command": "python .agents/skills/xlsx/scripts/audit.py \"$(ls model/{ticker}-model-v*.xlsx | sort -V | tail -1)\" --strict",
+          "command": "python3 .agents/skills/dalton-model/scripts/model_readable.py \"$(ls model/{ticker}-model-v*.xlsx | sort -V | tail -1)\"",
           "pass_when": "exit_zero",
-          "description": "对最终版模型（修订后为 v02）做静态审计（audit --strict）"
+          "description": "核对最终版模型文件（修订后为递增版本）存在且可由 openpyxl 正常打开读取（不因提示性扫描阻断）"
         }
       ]
     },

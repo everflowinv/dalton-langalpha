@@ -44,7 +44,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 | `quarter` | 公司财季标签（如 `"FY26Q3"`，与 filing、电话会及快讯一致） |
 | `workspace_dir` | 当前公司工作区目录路径（如 `"."` 或工作区绝对/相对路径） |
 | `release_date` | 官方财报发布日期 `YYYY-MM-DD`（如 `"2026-10-28"`） |
-| `model_path` | 从 `data/models.json` 读取当前登记的最新 Excel 模型路径（如 `"model/META-model-v01.xlsx"`）；**若该公司尚无模型，传 `null`**（workflow 会自动跳过模型更新支线，仅执行点评、对账与校准） |
+| `model_path` | 启动前按 `.agents/skills/dalton-model/SKILL.md` 第 1 步确定原模型：优先用用户本次上传或指定的模型文件（如 `sources/` 下的文件），其次取 `data/models.json` 中 `current`（当前版本）对应的已登记路径（如 `"model/META-model-v01.xlsx"`）；`model/` 与 `models/` 并存或有多份文件时，按第 1 步核对内容与交付记录，无法判断时询问用户。**尚无模型时传 `null`**（workflow 跳过模型更新支线，仅执行点评、对账与校准） |
 | `preview_predictions` | 前瞻预测文件路径（如 `"research/2026-10-23-preview-FY26Q3/predictions.json"`）；若本次财报前无前瞻预测文件，传 `null` |
 | `progress_path` | 固定传 `"research/<D>-deep-<quarter>/.progress.json"`（`<D>` 即 `release_date`），让中断后的 run 可被发现与续跑 |
 | `sector_overlay` | 若标的属于半导体/硬件行业（NVDA、AVGO、AMD、MRVL、TSM、ASML、MU、QCOM、ARM、INTC、TXN、LRCX、AMAT、KLAC、ADI、ON、MCHP、SMCI、ANET、CRDO、ALAB 等），传 `"hardware"` 以叠加 [`references/hardware-overlay.md`](references/hardware-overlay.md)；其他行业传 `null` |
@@ -69,10 +69,11 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - **证据层级与四类信息标注**：美股遵守 `10-Q/10-K > 8-K EX-99.1 > 新闻稿 > 演示稿 > 电话会` 优先级；港股与 A 股<!-- DALTON_CAP:researchdata_bridge -->通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取法定定期报告与业绩公告（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），`operation="ask"` 平台财务表仅作二手初值，核心数字一律回公告核实<!-- DALTON_CAP_ELSE -->通过 `web_search` 检索港交所披露易（`site:hkexnews.hk`）、巨潮资讯或交易所官网法定定期报告与业绩公告原文核实核心数字<!-- /DALTON_CAP -->，并核对复权、分红、拆股与交易/报表币种；只在电话会口头提及、未写入公告的指引在正文用自然中文说明（如“管理层在电话会上口头表示，未写入公告”）；所有内容严格区分 **事实 / 管理层指引 / 市场预期 / 研究判断**。
 
 2. **支线 B —— Excel 模型更新（`model_path` 非空时运行）**：
-   - 先读 `.agents/skills/model-update/SKILL.md`，触发类型设为 `Results`。
-   - 先输出披露行项与模型行项的映射表到 `research/<D>-deep-<quarter>/mapping.md`。
-   - 将当季实际值写入并调整远期驱动假设，**另存为新版本 `model/<TICKER>-model-v<NN+1>.xlsx`（严禁覆盖旧版本）**，完整填写 `Change Log`。
-   - 运行模型重算（`recalc.py`）与严格审计（`audit.py --strict`），确保 `Checks` 全数 `OK`，并输出新旧版本 EPS walk 与估值对比至 `research/<D>-deep-<quarter>/model-delta.md`。
+   - 先读 `.agents/skills/dalton-model/SKILL.md` 与 `.agents/skills/dalton-model/references/rollforward.md`（对照一致预期时按需读 `.agents/skills/dalton-model/references/sanity-check.md`），在原模型 `model_path` 上滚动维护：原件与已有版本保持只读，沿用原模型的结构、预测方法与格式（可先运行 `python3 .agents/skills/dalton-model/scripts/model_style.py profile <原模型路径> --out research/<D>-deep-<quarter>/style_profile.json` 提取格式画像）。
+   - 输出财报披露行项与模型行项的映射表到 `research/<D>-deep-<quarter>/mapping.md`。
+   - 将当季实际披露值写入对应期间、按需扩展预测期并校准远期驱动假设：工作区尚无 `model/<TICKER>-model-v*.xlsx` 时另存为 `model/<TICKER>-model-v01.xlsx`，已有版本时另存为下一版（如已有 `v01` 则另存为 `v02`），并在变更记录（工作簿最前面的 `README & Changelog` 工作表，或原模型已有的 `Change Log` 工作表）写明本次补充的实际值、驱动假设调整及原因。
+   - 运行公式重算（`python3 .agents/skills/xlsx/scripts/recalc.py <新版本路径>`）、部件对比（`python3 .agents/skills/dalton-model/scripts/model_style.py parts-diff <原模型路径> <新版本路径>`）与提示性扫描（`python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc <新版本路径>`），逐条核对扫描提示：属问题的修正模型并重算；结合公司实际属合理建模处理、扫描超时或执行失败、以及 `Checks`（勾稽检查）表个别条目未显示 `OK` 的情况，均在变更记录写明原因后继续推进。
+   - 运行 `python3 .agents/skills/dalton-model/scripts/model_style.py lineage --file research/<D>-deep-<quarter>/model_lineage.json --output <新版本路径> --baseline <原模型路径>` 记录输入与输出文件路径及哈希，并输出新旧版本每股收益（`EPS`）变动拆解（`EPS walk`）与估值对比至 `research/<D>-deep-<quarter>/model-delta.md`（若后续审稿修订更新了模型，须用最终模型版本同步更新 `model-delta.md`）。
 
 ### 阶段 2：前瞻对账与 Thesis 财报后校准
 
@@ -94,7 +95,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### 阶段 3：草稿期审稿与生成 `knowledge-revision.json`
 
-1. **草稿期审稿（`dalton-reviewer`）**：审阅 `drafts/<D>-deep-<quarter>.md` 及 `research/<D>-deep-<quarter>/` 下的对账与校准文件（核查超预期/低于预期〔beat/miss〕口径、摘要与各节是否有独立判断、核心论点〔thesis〕信号是否被股价涨跌替代、对账是否诚实面对错判、正文「投资逻辑的验证」节是否已各用一两句话准确写入 reconcile.md、thesis-calibration.md、management-delta.md 的结论〔逐条表格留在内部文件〕，以及“`## 引用` 节存在且每个 `[引用N]` 都能在其中找到”）。手动路径下先计算被审草稿的 `sha256` 写进审稿提示词（审稿人不回填任何哈希），将返回的 JSON（`verdict` / `summary` / `items` 逐项覆盖 1–9 项检查 / `must_fix` / `nice_to_have`）存为 `research/<D>-deep-<quarter>/review.json`，并把这个被审草稿的 `sha256` 写入其 `draft_sha256` 字段；改稿后必须重新计算哈希、重新审稿并覆盖该文件。
+1. **草稿期审稿（`dalton-reviewer`）**：审阅 `drafts/<D>-deep-<quarter>.md` 及 `research/<D>-deep-<quarter>/` 下的对账与校准文件（核查超预期/低于预期〔beat/miss〕口径、摘要与各节是否有独立判断、核心论点〔thesis〕信号是否被股价涨跌替代、对账是否诚实面对错判、正文「投资逻辑的验证」节是否已各用一两句话准确写入 reconcile.md、thesis-calibration.md、management-delta.md 的结论〔逐条表格留在内部文件〕，以及“`## 引用` 节存在且每个 `[引用N]` 都能在其中找到”）。手动路径下先计算被审草稿的 `sha256` 写进审稿提示词（审稿人不回填任何哈希），将返回的 JSON（`verdict` / `summary` / `items` 逐项覆盖 1–9 项检查 / `must_fix` / `nice_to_have`）存为 `research/<D>-deep-<quarter>/review.json`，并把这个被审草稿的 `sha256` 写入其 `draft_sha256` 字段；改稿后重新计算哈希、重新审稿并覆盖该文件。修订时若需改动模型，按 `.agents/skills/dalton-model/SKILL.md` 与 `.agents/skills/dalton-model/references/rollforward.md` 保持原件只读、在当前模型上另存为下一版，运行 `python3 .agents/skills/xlsx/scripts/recalc.py <新版本路径>` 重算与 `python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc <新版本路径>` 提示性扫描并逐条核对（属问题的修正并重算；保留项、扫描超时或执行失败随本次改动一并写入变更记录后继续），再运行 `python3 .agents/skills/dalton-model/scripts/model_style.py lineage --file research/<D>-deep-<quarter>/model_lineage.json --output <新版本路径> --baseline <修订前模型路径>` 记录输入与输出；随后用最终模型版本同步更新 `research/<D>-deep-<quarter>/model-delta.md` 及草稿中的模型引用与受影响数字，重新计算草稿哈希并送审，再生成 `knowledge-revision.json`。
 2. **生成知识层修订草案**：汇总全部产出与审稿意见，按 PK.2 Schema 生成 `research/<D>-deep-<quarter>/knowledge-revision.json`。
 
 ---
@@ -109,13 +110,13 @@ Workflow 结束后（或独立模式完成后），由当前主智能体读取 `
    - `doc="drivers"`：追加当季核心财务与经营 KPI 最新实际读数；
    - `doc="management"`：补填 `guidance_history[].actual` 与 `outcome`；若连续两季同类指标同向偏差，更新 `guidance_style` / `credibility_notes`；
    - `doc="lessons"`：将前瞻对账中“错/部分”条目的错因与适用边界追加为经验教训；
-   - `doc="models"`：若有新模型版本通过 `Checks`，登记新模型路径与版本说明；**若模型更新失败（`Checks` 未过），严禁静默跳过**，必须在修订说明中写明“模型未更新”并在 `agenda_ops` 排入人工跟进待办。
+   - `doc="models"`：只要新模型文件可读，无论重算（`recalc.py`）或提示性扫描（`model_scan.py --recalc`）是否超时、报错或留有提示项，均按 `.agents/skills/dalton-model/SKILL.md` 第 7 步先调用 `knowledge_read(doc="models")` 取 `latest_version_no`，再调用 `knowledge_update(doc="models", ...)` 登记新版本路径、`created_at`、`reason`、`recalculated` 与关键输出单元格（`key_outputs`），并将 `current` 指向新版本，同时把重算与提示性扫描状态记入变更记录与 `reason` 字段（`research/<D>-deep-<quarter>/model_lineage.json` 作为输入输出文件记录留存）。若未产出可读的新模型版本，在修订说明中写明“模型未更新”，并在 `agenda_ops` 中排入人工跟进待办。
 2. **调用 `knowledge_append_verdict` 写入事件五词终判与议程**：
    - 写入财报终判（`NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`，`trigger.kind="earnings"`，`trigger.ref` 填 `tp1` 信号 id 或 `"manual"`）；
    - 在 `agenda_ops` 中写入下一季需要跟踪验证的事项；
    - **重大异常升级（PM Escalation）**：若终判为 `THESIS_BROKEN` 或任一核心支柱状态变为 `impaired` / `broken`，必须立即通过通知渠道推送 PM，并在 `agenda_ops` 中写入一条 `pm_handoffs`（PK.14）。
 3. **草稿核验（`check_draft`）与推送稿审查**：
-   - 末尾合并为单一 `## 引用` 节：确认报告末尾的 `## 引用` 表存在且每个 `[引用N]` 都能在表里找到（每行一条写出核验目标与括号内来源说明，形如 `[引用1]: evidence:E-20261023-01 （法定财报｜SEC 10-Q｜3Q26 季报｜2026-10-28｜accession ...）` 或 `[引用6]: model:model/META-model-v01.xlsx!Scenarios!C12 （本方模型｜Bull 情景远期 EPS）`）；
+   - 末尾合并为单一 `## 引用` 节：确认报告末尾的 `## 引用` 表存在且每个 `[引用N]` 都能在表里找到（每行一条写出核验目标与括号内来源说明，形如 `[引用1]: evidence:E-20261023-01 （法定财报｜SEC 10-Q｜3Q26 季报｜2026-10-28｜accession ...）` 或 `[引用6]: model:model/<TICKER>-model-v<NN>.xlsx!<估值页>!C12 （本方模型｜远期 EPS，`<估值页>` 填实际工作表名）`）；
    - 调用 `check_draft` 生成数字核验报告 `drafts/<D>-deep-<quarter>.audit.md`；
    - **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将推送正文写入 `research/push/<D>-earnings-deep-<quarter>.md` 并完成两轮 `check_language`，最后回复与该推送稿逐字相同。
 4. **汇报完成前必须过完成契约（`dalton_check_done`）**：

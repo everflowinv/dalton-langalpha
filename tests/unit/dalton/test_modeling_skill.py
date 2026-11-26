@@ -149,6 +149,44 @@ def test_dalton_model_registration_core_and_everflow(monkeypatch: pytest.MonkeyP
         assert sk.requires == ("dalton-conventions", "research-conventions")
 
 
+@pytest.mark.asyncio
+async def test_dalton_model_stays_enabled_when_dependents_are_enabled(tmp_path: Path) -> None:
+    """Modeling Batch 2 r2 (#2): dalton-full-coverage and dalton-earnings-deep
+    declare `dalton-model` in `requires`, so disabling `dalton-model` alone
+    keeps it synced in the sandbox while either dependent stays enabled."""
+    from ptc_agent.agent.middleware.skills.dalton_registry import DALTON_SKILL_DEFINITIONS
+    from ptc_agent.agent.middleware.skills.registry import (
+        SKILL_REGISTRY,
+        resolve_disabled_skills,
+    )
+    from ptc_agent.core.sandbox.assets import _collect_local_skill_names
+
+    layer = "dalton-model"
+    expected_dependents = {"dalton-full-coverage", "dalton-earnings-deep"}
+    for dep in expected_dependents:
+        assert layer in DALTON_SKILL_DEFINITIONS[dep].requires
+
+    dependents = {name for name, skill in SKILL_REGISTRY.items() if layer in skill.requires}
+    assert expected_dependents <= dependents
+    assert layer not in resolve_disabled_skills({layer})
+    assert resolve_disabled_skills({layer, *dependents}) == frozenset({layer, *dependents})
+
+    for name in (layer, *expected_dependents):
+        skill_dir = tmp_path / name
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("body", encoding="utf-8")
+
+    kept = await _collect_local_skill_names([str(tmp_path)], disabled=frozenset({layer}))
+    assert kept == {layer, *expected_dependents}
+
+    removed = await _collect_local_skill_names(
+        [str(tmp_path)],
+        disabled=frozenset({layer, *dependents}),
+    )
+    assert layer not in removed
+    assert not (expected_dependents & removed)
+
+
 def test_dalton_model_three_capability_combinations_assembly() -> None:
     md_files = sorted(SKILL_DIR.rglob("*.md"))
     assert len(md_files) == 5  # SKILL.md + 4 references/*.md
@@ -1332,3 +1370,88 @@ def test_model_scan_real_samples_do_not_crash_and_exit_zero(filename: str) -> No
     assert rep["status"] == "ok"
     assert isinstance(rep["summary"], str) and rep["summary"]
     assert ms.file_sha256(sample_path) == before_hash
+
+
+_READABLE_SCRIPT = (
+    Path(__file__).resolve().parents[3]
+    / "plugins/dalton/skills/dalton-model/scripts/model_readable.py"
+)
+
+
+def _run_readable(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(_READABLE_SCRIPT), *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_model_readable_accepts_a_workbook_with_a_chart_sheet(tmp_path: Path) -> None:
+    from openpyxl.chart import BarChart, Reference
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Data"
+    for row in ([1, 2], [3, 4], [5, 6]):
+        ws.append(row)
+    chart = BarChart()
+    chart.add_data(Reference(ws, min_col=1, min_row=1, max_col=2, max_row=3))
+    cs = wb.create_chartsheet("Chart")
+    cs.add_chart(chart)
+    target = tmp_path / "with-chart.xlsx"
+    wb.save(target)
+
+    result = _run_readable(str(target))
+    assert result.returncode == 0, result.stderr
+
+
+def test_model_readable_returns_one_when_the_path_is_missing() -> None:
+    result = _run_readable()
+    assert result.returncode == 1
+    assert "missing workbook path" in result.stderr
+
+
+def test_model_readable_rejects_a_truncated_worksheet(tmp_path: Path) -> None:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for i in range(50):
+        ws.append([i, i * 2, f"row {i}"])
+    good = tmp_path / "good.xlsx"
+    wb.save(good)
+
+    bad = tmp_path / "truncated.xlsx"
+    with zipfile.ZipFile(good) as src, zipfile.ZipFile(bad, "w", zipfile.ZIP_DEFLATED) as dst:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            if item.filename.startswith("xl/worksheets/") and item.filename.endswith(".xml"):
+                data = data.replace(b"</worksheet>", b"")
+            dst.writestr(item, data)
+
+    assert _run_readable(str(good)).returncode == 0
+    result = _run_readable(str(bad))
+    assert result.returncode == 1
+    assert "corrupt XML" in result.stderr
+
+
+def test_model_readable_follows_relationships_to_a_relocated_sheet(tmp_path: Path) -> None:
+    wb = openpyxl.Workbook()
+    wb.active.append([1, 2, 3])
+    good = tmp_path / "good.xlsx"
+    wb.save(good)
+
+    moved = tmp_path / "moved-truncated.xlsx"
+    with zipfile.ZipFile(good) as src, zipfile.ZipFile(moved, "w", zipfile.ZIP_DEFLATED) as dst:
+        for item in src.infolist():
+            data = src.read(item.filename)
+            name = item.filename
+            if name == "xl/worksheets/sheet1.xml":
+                name = "xl/sheets/sheet1.xml"
+                data = data.replace(b"</worksheet>", b"")
+            elif name in ("xl/_rels/workbook.xml.rels", "[Content_Types].xml"):
+                data = data.replace(b"worksheets/sheet1.xml", b"sheets/sheet1.xml")
+            dst.writestr(name, data)
+
+    result = _run_readable(str(moved))
+    assert result.returncode == 1, result.stderr
+    assert "corrupt XML" in result.stderr

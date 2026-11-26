@@ -11,9 +11,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 本 skill 是 Dalton 买方完整覆盖（P3 深度覆盖阶段）的启动与发布控制器。目标是针对已完成初次覆盖（或 PM 直接指定深度覆盖）的标的，一次运行产出：
 1. **数字底表（`research/<D>-fc/facts.md`）**：含 `<!-- FACTS-LEDGER ... -->` 机器可读账本，作为全文唯一目标公司财务数字来源与发布核验基准；
 2. **公司专属 12 问研究提纲（`research/<D>-fc/questions.md`）** 与 **A/B/C/D 四条取证支线底稿（`ea.md`、`eb.md`、`ec.md`、`ed.md`）**；
-3. **带动态公式的 15 页 Excel 财务与估值模型（`model/<TICKER>-model-v01.xlsx`）**：含标准 12 页 + Dalton 专属 `Facts`、`Guidance vs Actual`（12 季表）、`Street vs House` 三页；
+3. **带动态公式的 Excel 财务与估值模型（`model/<TICKER>-model-v<NN>.xlsx`）**：工作区已有用户模型或历史版本时，按 `.agents/skills/dalton-model/SKILL.md` 保持原件只读，在原模型上滚动维护并另存为下一版，补齐预测期及 `Facts`（数字底表镜像）、`Guidance vs Actual`（12 季指引兑现表）、`Street vs House`（本方与市场预期对比表）、`Checks`（勾稽检查表）；尚无模型时按 `references/model-spec.md` 的 15 页规格新建，统一采用 `dalton-model` 的格式规范与提示性扫描；
 4. **深度投资备忘录（`drafts/<D>-memo.md`）**：写给基金经理看（摘要 → 公司与商业模式 → 行业与竞争〔可并入上一节〕→ 业务质量 → 核心投资逻辑与争议 → 财务预测与估值 → 风险 → 管理层 → 跟踪 → 附录 → 引用），12 问研究提纲（含每问 `A / B / C / D` 自评档位）留在 `questions.md` 工作底稿、不进正文；
-5. **模型审计（`check-model`）与独立审稿（`dalton-reviewer`）**，修订后更新公司知识层并经 `publish_report(kind="full_coverage", updates_thesis=True)` 提交正式发布审批。
+5. **只读审模型（按 `.agents/skills/dalton-model/SKILL.md` 与 `model_scan.py --recalc` 提示性扫描）与独立审稿（`dalton-reviewer`）**，修订后更新公司知识层并经 `publish_report(kind="full_coverage", updates_thesis=True)` 提交正式发布审批。
 
 ---
 
@@ -71,10 +71,10 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      - `eb.md`：按 `references/branch-b-sellside-expert.md`（<!-- DALTON_CAP:alphaengine|researchdata_bridge|guidepoint -->AlphaEngine 分类检索与全文精读、卖方预期地图、内部库与 company-wiki、Guidepoint 英文专家纪要、卖方盲点<!-- DALTON_CAP_ELSE -->公开卖方研报摘要与预期地图、公开行业专家与访谈纪要、卖方盲点<!-- /DALTON_CAP -->）；
      - `ec.md`：按 `references/branch-c-primary.md`（4 期报告 MD&A/Risk Factors diff、4 期电话会措辞漂移、招股书承诺对照、**C4 过去 12 个季度指引 vs 实际可信度表**、8-K 与内部人交易）；
      - `ed.md`：按 `references/branch-d-offstreet.md`（X、雪球、员工评价、社区情绪、招聘信号、13F、ToC 产品体验表或 ToB 从业者信号表）。
-   - **阶段 2（建模，串行在最前）**：按 `references/model-spec.md` 构建 `model/<TICKER>-model-v01.xlsx`（`recalc.py` 与 `audit.py --strict` 通过，Checks 全 OK）。建模失败立即中止，不进入写作——估值与三情景数字全部来自模型。
+   - **阶段 2（建模，串行在最前）**：按 `.agents/skills/dalton-model/SKILL.md` 与 `references/model-spec.md` 产出模型至 `model/<TICKER>-model-v<NN>.xlsx`（原件只读；尚无 `model/` 版本时存为 `v01`，已有版本时另存为下一版；已有原模型时在其上滚动维护并补齐预测期及 `Facts`、`Guidance vs Actual`、`Street vs House`、`Checks`，尚无模型时按 15 页规格新建并调用 `.agents/skills/dalton-model/scripts/model_style.py` 写格式）。完成后运行 `.agents/skills/xlsx/scripts/recalc.py` 重算与 `.agents/skills/dalton-model/scripts/model_scan.py --recalc` 提示性扫描，将结果及扫描超时、执行失败、保留不改的提示项或 `Checks` 未显示 `OK` 的原因记入 `Checks` 表与工作簿最前面的 `README & Changelog` 工作表（下称「变更记录」）后继续推进，再运行 `model_style.py lineage` 在 `research/<D>-fc/model_lineage.json` 记录输入输出路径与哈希。确认模型文件存在且可正常打开后进入写作——估值与基准预测数字均来自模型。
    - **阶段 3（单一写手成稿与第 1 轮语言审查）**：一位写手通读 `questions.md`（12 问研究提纲）、四条支线底稿（含文末逐题证据小结）、`facts.md` 与模型输出，同步更新 `questions.md` 每问 `A / B / C / D` 自评档位（只写在底稿、不进备忘录正文），并按 `references/memo-writing.md` 一次写成整篇备忘录（成稿后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处） → 跑 `validate_memo.py --mode full` 到 0 FAIL → 第 1 轮语言审查（`check_language` round=1，按清单修改）→ 复跑校验。
-   - **阶段 4（审模型与独立审稿并行）**：`check-model` 审模型输出 `research/<D>-fc/model-check.md`（只出报告不改模型）∥ `dalton-reviewer` 审 memo。
-   - **阶段 5（一轮修订、终稿语言审查与知识层修订草案）**：审稿 `revise` 时按审稿意见与 `model-check.md` 做一轮修订（memo 与模型；若改模型，按 `.agents/skills/model-update/SKILL.md` 另存 `v02`，绝不覆盖 `v01`；每次修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处）后复审；随后对终稿做第 2 轮语言审查（`check_language` round=2，按清单修改并复核，绑定终稿哈希），并生成 `research/<D>-fc/knowledge-revision.json`。
+   - **阶段 4（只读审模型与独立审稿并行）**：按 `.agents/skills/dalton-model/SKILL.md` 与 `.agents/skills/dalton-model/references/sanity-check.md` 对本次最终模型做只读核查（原件只读；运行 `python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc <模型路径>` 获取提示清单，结合公司实际与一致预期逐条复核；扫描超时或执行失败时如实记录状态，直接基于工作簿完成核查），输出 `research/<D>-fc/model-check.md` ∥ `dalton-reviewer` 审备忘录。
+   - **阶段 5（一轮修订、终稿语言审查与知识层修订草案）**：审稿 `revise` 时按审稿意见与 `model-check.md` 做一轮修订（备忘录与模型；若修订模型，按 `.agents/skills/dalton-model/SKILL.md` 与 `.agents/skills/dalton-model/references/rollforward.md` 保持原件只读并另存为下一版，重算后运行 `model_scan.py --recalc` 提示性扫描并核对，更新变更记录与 `model_lineage.json`；每次修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处）后复审；随后对终稿做第 2 轮语言审查（`check_language` round=2，按清单修改并复核，绑定终稿哈希），并生成 `research/<D>-fc/knowledge-revision.json`。
 
 3. **Workflow 不可用时的手动降级路径**
    - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按阶段 0 → 0.8 → 1 → 2 → 3 → 4 → 5 的顺序手动完成各阶段产物与脚本校验（语言审查两轮、修订一轮，顺序同阶段 3–5；成稿和每次修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处）。派 `dalton-reviewer` 审稿（含修订后复审）时：（1）先算 `drafts/<D>-memo.md` 的 sha256；（2）把该哈希写入审稿提示词；（3）将返回的 JSON（`verdict` / `summary` / `items` 逐项覆盖 1–9 项检查 / `must_fix` / `nice_to_have`，审稿人不回填任何哈希）保存为 `research/<D>-fc/review.json`，并写入 `draft_sha256` 字段（复审时覆盖为最新一轮；改稿后必须重新计算哈希、重新审稿）。备忘录主稿语言审查两轮：成稿并跑 `validate_memo.py --mode full` 到 0 FAIL 后调用 `check_language(draft_path=<草稿>, round=1)` 按清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），复跑校验，再派 `dalton-reviewer` 首次审稿；一轮修订结束后对终稿调用 `check_language(round=2)` 完成终稿语言修改，草稿有改动就再跑一次 round=2 复核（记录追加在同一 json），然后做最后一次审稿（pass 的 JSON 存 review.json）。`research/<D>-fc/` 下给人读的底稿笔记（`facts.md`、`questions.md`、`ea.md`–`ed.md`、`model-check.md`）各做两轮 `check_language`（第 1 轮按清单改，第 2 轮复核，有改动则再跑一次 round=2 确认）；不审 json/xlsx 等机器文件与 `.audit/.annotated/.language` 侧车。收尾按第三节第 5 步以 `manual: true` 调用 `dalton_check_done`。**在途的旧结构运行**（备忘录还是「零、12 问 + 一至十章」的旧版双轨稿）：按旧规则完成并收尾——`validate_memo.py` 会自动识别旧结构并按旧规则校验（`--part` 仍可用），不要把旧稿改写成新结构。
@@ -97,7 +97,7 @@ Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在�
   - **`drivers`**：更新核心业务驱动树变量、模型敏感度与高频跟踪指标；
   - **`management`**：写入 C4 支线整理的 12 季指引兑现历史（`guidance_history`）与指引风格定性结论（`guidance_style`：保守/中性/激进、收入还是利润更保守、全年修正节奏）；
   - **`lessons`**：若完整覆盖推翻了初次覆盖中的某项早期判断，记录一条经验教训（错误类型、适用条件、反例与证据）；
-  - **`models`**：登记模型文件 `model/<TICKER>-model-v01.xlsx`（及修订版 `v02`，如有）；
+  - **`models`**：按 `.agents/skills/dalton-model/SKILL.md` 第 7 步先调用 `knowledge_read(doc="models")` 取 `latest_version_no`，再调用 `knowledge_update(doc="models", ...)` 登记本次最终模型路径（如 `model/<TICKER>-model-v<NN>.xlsx`，取 workflow 返回的 `model` 字段或 `model/` 下最新版本）、`created_at`、`reason`、`recalculated` 与关键输出单元格（`key_outputs`），并将 `current` 指向最新版本号（`research/<D>-fc/model_lineage.json` 作为输入输出文件记录留存）；
   - **`company`**：将 `coverage_stage` 更新为 `"full"`。
 - 调用 **`knowledge_append_verdict`**：
   - 对照初次覆盖的 thesis 给出正式五词结论（通常为 `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `NEW_THESIS` / `THESIS_BROKEN` / `NO_CHANGE`）；
@@ -116,24 +116,24 @@ Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在�
      "kind": "full_coverage",
      "slug": "<ticker-lower>-full-coverage-<D>",
      "attachments": [
-       {"path": "model/<TICKER>-model-v01.xlsx", "role": "model"},
+       {"path": "<本次最终模型路径，如 model/<TICKER>-model-v<NN>.xlsx>", "role": "model"},
        {"path": "research/<D>-fc/facts.md", "role": "facts"}
      ],
      "updates_thesis": true
    }
    ```
-   - **注意**：`attachments` 必须同时附带模型文件（`role: "model"`）和数字底表 `research/<D>-fc/facts.md`（`role: "facts"`，作为发布核验的对账基准）；其余支线文件与草稿审稿意见留在 `research/`，不进发布包。
+   - **注意**：`attachments` 同时附带本次最终模型文件（`role: "model"`，取 workflow 返回的 `model` 字段或 `model/` 下最新版本）和数字底表 `research/<D>-fc/facts.md`（`role: "facts"`，作为发布核验的对账基准）；其余支线文件与草稿审稿意见留在 `research/`，不进发布包。复用同一基准日（`as_of`）已有备忘录前，先核对正文引用的模型路径及哈希与本次最终模型一致；若模型已更新，按新模型同步更新受影响的预测、估值与引用并重审后再调用 `publish_report`。
    - 若核验退回或服务端独立审稿返回 `revise`，逐条修订后再调 `publish_report`，直至进入 PM 审批卡（`awaiting_pm`）。
 
 ### 第 5 步：汇报完成前必须过完成契约（`dalton_check_done`）
 
 - 向 PM 汇报"完成"前，必须调用 `dalton_check_done(workflow="full-coverage", run_id=<`research/<D>-fc/.progress.json` 里的 run_id>, params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>"})`（与启动 `RunWorkflow` 时的参数一致）。
 - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，调用 `dalton_check_done(workflow="full-coverage", params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "manual": true})`，审稿结论按 `research/<D>-fc/review.json` 核对。
-- `done=false` 时按 `missing` 逐条补齐（缺文件补文件、`facts.py check`/`validate_memo`/`audit.py` 未过修到过、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑 `check_draft`），补完再查一次。
+- `done=false` 时按 `missing` 逐条补齐（缺文件补文件、`facts.py check`/`validate_memo`/模型文件可读性核对未通过时修到通过、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑 `check_draft`），补完再查一次。
 - 补不了的缺项只能汇报"未完成"，列出缺项与原因；没有 `dalton_check_done` 通过，不得汇报"完成"。
 
 ### 第 6 步：完成判定（必查清单）
-- `drafts/<D>-memo.md`、`model/<TICKER>-model-v01.xlsx` 及 `research/<D>-fc/facts.md` 均已通过校验；
+- `drafts/<D>-memo.md`、本次最终模型文件（`model/<TICKER>-model-v<NN>.xlsx`）及 `research/<D>-fc/facts.md` 均已通过校验；
 - 知识层（含 `company.coverage_stage="full"`）与 `knowledge_append_verdict` 已落库；
 - 已调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 并检查确认自动跟踪已开启（`status="enabled"`，或因 `paused_by_user=true` 保持关闭）；
 - `publish_report` 已提交进入 PM 审批卡（`awaiting_pm`），PM 在审批卡片上批准后，发布管线自动将 `thesis.official`（含正式 house view）写入知识层，并在 `published/` 下生成不可变正式副本。
@@ -150,7 +150,7 @@ Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在�
 - `references/branch-c-primary.md`：支线 C（一手文件精读与 C4 12 季指引可信度表）取证规则。
 - `references/branch-d-offstreet.md`：支线 D（场外信号、产品体验与从业者反馈）取证规则。
 - `references/memo-writing.md`：备忘录写作目标、章节结构与各节要求、引用与数字纪律、写作与校验流程。
-- `references/model-spec.md`：15 页 Excel 模型规格（标准 12 页 + Dalton 增补 3 页）。
+- `references/model-spec.md`：完整覆盖 Excel 模型规格（在原模型上滚动维护与 15 页新建规格，统一遵循 `dalton-model` 规范）。
 - `scripts/research_structure.py`：12 问映射表、问题清单校验（`validate-agenda`）与备忘录结构校验（新稿按章节结构；旧版十二章在途稿按旧规则）。
 - `scripts/facts.py`：`facts.md` 中 `FACTS-LEDGER` 的命令行读写与必填键检查工具。
 - `scripts/validate_memo.py`：备忘录机械校验脚本（新稿查章节结构与引用闭环；旧版十二章在途稿按旧规则校验、`--part` 仍可用）。

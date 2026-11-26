@@ -161,18 +161,18 @@ class ScriptedHost:
                 "summary": "plan",
             }
         if label == "建模":
-            # The full-coverage model child must attest its own checks
-            # (recalc / audit --strict / Checks) and declare the xlsx.
+            # The full-coverage model child declares the xlsx; scan findings /
+            # Checks non-OK are recorded in changelog and do not block drafting.
             return {
                 "files": ["model/META-model-v01.xlsx"],
                 "summary": "built, checks all green",
                 "sha256": "a" * 64,
                 "checks_passed": True,
             }
-        if label.startswith("模型审计"):
+        if label.startswith("模型可读性核验"):
             m = re.search(r"f='([^']+)'", prompt)
-            assert m, "the model-audit probe prompt must quote the model path"
-            return {"files": [f"{m.group(1)}|audit_ok"]}
+            assert m, "the model-readability probe prompt must quote the model path"
+            return {"files": [f"{m.group(1)}|readable_ok"]}
         if label == "memo 探测":
             m = re.search(r"f='([^']+)'", prompt)
             assert m, "the memo probe prompt must quote the draft path"
@@ -611,10 +611,10 @@ class CapturingHost:
                 "sha256": "a" * 64,
                 "checks_passed": True,
             }
-        if label.startswith("模型审计"):
+        if label.startswith("模型可读性核验"):
             m = re.search(r"f='([^']+)'", prompt)
-            assert m, "the model-audit probe prompt must quote the model path"
-            return {"files": [f"{m.group(1)}|audit_ok"]}
+            assert m, "the model-readability probe prompt must quote the model path"
+            return {"files": [f"{m.group(1)}|readable_ok"]}
         if label == "memo 探测":
             m = re.search(r"f='([^']+)'", prompt)
             assert m, "the memo probe prompt must quote the draft path"
@@ -913,16 +913,18 @@ def _pick(workspace: Path, command: str) -> str:
 
 
 def _contract_audit_pick(name: str, workspace: Path, ticker: str = "META") -> str:
-    """The file the workflow contract's `audit.py "$(ls … | sort -V | tail -1)"`
-    validator would audit, evaluated in ``workspace``."""
+    """The file the workflow contract's readability validator
+    (`model_readable.py "$(ls … | sort -V | tail -1)"`) would check,
+    evaluated in ``workspace``."""
     text = (REPO_ROOT / "workflows" / name / "contract.json").read_text(encoding="utf-8")
     commands = [
         v["command"]
         for stage in json.loads(text)["stages"]
         for v in stage.get("validators") or []
-        if "audit.py" in v.get("command", "")
+        if "model_readable.py" in v.get("command", "")
     ]
     assert len(commands) == 1, commands
+    assert "model_scan.py" not in commands[0] and "audit.py" not in commands[0], commands[0]
     match = _CONTRACT_PICK.search(commands[0])
     assert match, commands[0]
     return _pick(workspace, match.group(1).replace("{ticker}", ticker))
@@ -960,9 +962,11 @@ class DiskHost(ScriptedHost):
         if label.startswith("解析"):
             return self.resolve(prompt)
         if label == "memo 探测":
-            # Disk-backed, with the real probe's semantics (round 3 #2): a draft
-            # counts as complete only when it clears validate_memo's structure
-            # check; anything else on disk is a partial handed to the writer.
+            # Disk-backed, with the real probe's semantics (round 3 #2 + Batch 2 r3 #4):
+            # a draft counts as reusable only when it clears validate_memo's structure
+            # check AND its cited model path + recorded model sha256 match the current
+            # final model; stale model citations/hash yield stale_model so the writer
+            # refreshes affected predictions, valuation, and citations before review.
             m = re.search(r"f='([^']+)'", prompt)
             assert m, "the memo probe prompt must quote the draft path"
             rel = m.group(1)[2:] if m.group(1).startswith("./") else m.group(1)
@@ -977,6 +981,22 @@ class DiskHost(ScriptedHost):
             fails, _, _ = validate_memo_text(content)
             if fails:
                 return {"files": [f"{m.group(1)}|incomplete"]}
+            model_m = re.search(r"m='([^']+)'", prompt)
+            msha_m = re.search(r"msha='([0-9a-f]{64})'", prompt)
+            meta_m = re.search(r"meta='([^']+)'", prompt)
+            if model_m and msha_m:
+                expected_model = model_m.group(1).lstrip("./")
+                expected_sha = msha_m.group(1)
+                cited = [r.lstrip("./") for r in re.findall(r"model:([^\s!]+\.xlsx)!", content)]
+                if any(r != expected_model for r in cited):
+                    return {"files": [f"{m.group(1)}|stale_model"]}
+                if meta_m:
+                    meta_rel = meta_m.group(1)[2:] if meta_m.group(1).startswith("./") else meta_m.group(1)
+                    meta_path = self.workspace / meta_rel
+                    if meta_path.exists():
+                        meta_doc = json.loads(meta_path.read_text(encoding="utf-8"))
+                        if meta_doc.get("path") != expected_model or meta_doc.get("sha256") != expected_sha:
+                            return {"files": [f"{m.group(1)}|stale_model"]}
             digest = hashlib.sha256(path.read_bytes()).hexdigest()
             return {"files": [f"{m.group(1)}|ok|{digest}"]}
         mode = self.revise_modes.get(label)
@@ -1725,9 +1745,10 @@ class _ModelProbeHost(ScriptedHost):
 
 @pytest.mark.asyncio
 async def test_full_model_failure_blocks_before_the_draft() -> None:
-    """建模串行在前、失败即停（第 2 批）：建模子任务 null、自检未回报通过、
-    只声明脚本没有 xlsx、或声明的模型在盘缺失，四种情形都停在成稿之前——
-    不派写作、审稿与产物核验。"""
+    """建模串行在前、仅在模型缺失或不可读时停在成稿之前：建模子任务 null、
+    未声明本次公司的 model/<TICKER>-model-vNN.xlsx、声明的模型在盘缺失/过小、
+    或只读可读性探针（model_readable.py）判定文件损坏或探针本身失败，均停在
+    成稿之前；提示性扫描失败/超时与 checks_passed=False 不阻断（另见独立用例）。"""
     params = _WORKFLOW_PARAMS["full-coverage"]
 
     host = ScriptedHost(fail_labels={"建模"})
@@ -1738,22 +1759,6 @@ async def test_full_model_failure_blocks_before_the_draft() -> None:
     labels = host.labels()
     assert "成稿" not in labels, "a failed model build must not dispatch the writer"
     assert "独立审稿" not in labels and "产物核验" not in labels
-
-    # xlsx 在盘、自检也通过，但 recalc / audit --strict 失败：checks_passed=false 拦下。
-    host = ScriptedHost(
-        by_label={
-            "建模": {
-                "files": ["model/META-model-v01.xlsx"],
-                "summary": "audit --strict failed: 3 broken links on DCF",
-                "sha256": "a" * 64,
-                "checks_passed": False,
-            },
-        },
-    )
-    result = await _run("full-coverage", params, host)
-    assert result["ok"] is False
-    assert "建模自检未通过" in result["blocked"] and "audit --strict failed" in result["blocked"]
-    assert "成稿" not in host.labels()
 
     # 只回报了建模脚本、没有模型文件：不算建模产物。
     host = ScriptedHost(
@@ -1789,7 +1794,7 @@ async def test_full_model_failure_blocks_before_the_draft() -> None:
         assert "未声明本次的模型文件 model/META-model-vNN.xlsx" in result["blocked"], wrong
         assert "成稿" not in host.labels()
 
-    # 只读探针对模型实跑 audit --strict 失败（第 3 轮 #4）：不能只信自报的 checks_passed。
+    # 只读探针对模型实跑工作簿可读性检查失败（文件损坏或不可读）：停在成稿之前。
     host = ScriptedHost(
         by_label={
             "建模": {
@@ -1798,15 +1803,15 @@ async def test_full_model_failure_blocks_before_the_draft() -> None:
                 "sha256": "a" * 64,
                 "checks_passed": True,
             },
-            "模型审计": {"files": ["model/META-model-v01.xlsx|audit_failed"]},
+            "模型可读性核验": {"files": ["model/META-model-v01.xlsx|readable_failed"]},
         },
     )
     result = await _run("full-coverage", params, host)
     assert result["ok"] is False
-    assert "audit --strict" in result["blocked"] and "实跑" in result["blocked"]
+    assert "不可读或已损坏" in result["blocked"]
     assert "成稿" not in host.labels()
 
-    # 审计探针子任务本身失败：fail-closed，同样停在成稿之前。
+    # 可读性探针子任务本身失败：fail-closed，同样停在成稿之前。
     host = ScriptedHost(
         by_label={
             "建模": {
@@ -1816,11 +1821,11 @@ async def test_full_model_failure_blocks_before_the_draft() -> None:
                 "checks_passed": True,
             },
         },
-        fail_labels={"模型审计"},
+        fail_labels={"模型可读性核验"},
     )
     result = await _run("full-coverage", params, host)
     assert result["ok"] is False
-    assert "模型审计探针失败" in result["blocked"]
+    assert "模型可读性探针失败" in result["blocked"]
     assert "成稿" not in host.labels()
 
     # 自检通过、也声明了 xlsx，但探针在盘上找不到（不足契约的 1000 字节下限）。
@@ -1906,20 +1911,20 @@ async def test_full_resume_reviews_and_revises_the_latest_model_version(tmp_path
     revise_prompt = host.prompts[labels.index("修订 1")]
     assert "另存为 model/META-model-v03.xlsx" in revise_prompt, "the next version rides the latest"
     assert "另存为 model/META-model-v02.xlsx" not in revise_prompt
-    assert "model/META-model-v02.xlsx" in host.prompts[labels.index("check-model")]
+    assert "model/META-model-v02.xlsx" in host.prompts[labels.index("只读审模型")]
     assert result["ok"] is True, result["incomplete"]
     assert result["model"] == "model/META-model-v02.xlsx"
 
 
 @pytest.mark.asyncio
 async def test_full_latest_model_failing_audit_blocks_before_the_draft(tmp_path: Path) -> None:
-    """The model the gate audits must be the model the run then uses: with a
-    passing v01 built and a failing v02 already on disk, the run stops before
-    the draft instead of writing from an unaudited v02."""
+    """The model the gate verifies must be the model the run then uses: with a
+    readable v01 built and a corrupt/unreadable v02 already on disk, the run
+    stops before the draft instead of writing from an unreadable v02."""
     host = _fc_host(
         tmp_path,
         by_label={
-            "模型审计（最新版本）": {"files": ["model/META-model-v02.xlsx|audit_failed"]},
+            "模型可读性核验（最新版本）": {"files": ["model/META-model-v02.xlsx|readable_failed"]},
         },
     )
     host.touch("model/META-model-v02.xlsx")
@@ -2488,4 +2493,174 @@ async def test_initial_coverage_writer_must_declare_the_payoff_summary() -> None
     assert out["ok"] is False
     assert "初筛成稿" in host.labels()
     assert "审稿" not in host.labels()
+
+
+@pytest.mark.asyncio
+async def test_full_model_scan_failure_or_non_ok_checks_continues_to_draft(
+    tmp_path: Path,
+) -> None:
+    """Modeling Batch 2 r2 (#1): advisory scan timeout/failure or non-OK rows in
+    Checks (recorded in changelog) never block drafting when the workbook file
+    exists and is readable."""
+    for summary, extra in (
+        ("model_scan.py --recalc 超时，已记入 README & Changelog", {"checks_passed": False}),
+        ("model_scan.py --recalc 执行失败且 Checks 第 4 行非 OK，已在变更记录写明原因", {"checks_passed": False}),
+        ("已按原模型滚动完成并记录扫描结果", {}),
+    ):
+        ws = tmp_path / f"case_{len(summary)}"
+        ws.mkdir()
+        host = _fc_host(
+            ws,
+            by_label={
+                "建模": {
+                    "files": ["model/META-model-v01.xlsx"],
+                    "summary": summary,
+                    "sha256": "a" * 64,
+                    **extra,
+                },
+                "独立审稿": PASS,
+            },
+        )
+        result = await _run("full-coverage", FC_PARAMS, host)
+        assert result["ok"] is True, (summary, result["incomplete"])
+        labels = host.labels()
+        assert "模型可读性核验" in labels
+        assert "成稿" in labels, f"advisory scan issue must not block drafting: {summary}"
+        if extra.get("checks_passed") is False:
+            assert any("工作流继续" in line for line in host.logs)
+
+
+@pytest.mark.asyncio
+async def test_modeling_batch2_workflows_and_contracts_route_to_dalton_model(
+    tmp_path: Path,
+) -> None:
+    """Modeling Batch 2 (§8.3 + r2): earnings-deep-update and full-coverage route
+    model build, rollforward, read-only model review, and revision to
+    `.agents/skills/dalton-model/...`, `model_scan.py --recalc`, and
+    `model_lineage.json`, while fast readability checks (`zipfile`/`testzip`)
+    verify the deliverable without blocking on advisory scans."""
+    # 1. earnings-deep-update: model update + revision loop
+    deep_host = _deep_host(
+        tmp_path,
+        {"审稿": REVISE, "复审 1": PASS, "终稿审稿": PASS},
+        revise_modes={"修订 1": "save"},
+    )
+    deep_res = await _run("earnings-deep-update", DEEP_PARAMS, deep_host)
+    assert deep_res["ok"] is True, deep_res["incomplete"]
+    deep_labels = deep_host.labels()
+
+    update_prompt = deep_host.prompts[deep_labels.index("模型更新")]
+    assert ".agents/skills/dalton-model/SKILL.md" in update_prompt
+    assert ".agents/skills/dalton-model/references/rollforward.md" in update_prompt
+    assert ".agents/skills/dalton-model/scripts/model_scan.py --recalc" in update_prompt
+    assert "model_lineage.json" in update_prompt
+    assert "mapping.md" in update_prompt and "model-delta.md" in update_prompt
+    assert "Change Log" in update_prompt
+    assert "用户本次上传或指定的文件" in update_prompt
+    assert "model-update/SKILL.md" not in update_prompt
+    assert "audit.py" not in update_prompt
+
+    deep_rev_prompt = deep_host.prompts[deep_labels.index("修订 1")]
+    assert ".agents/skills/dalton-model/SKILL.md" in deep_rev_prompt
+    assert ".agents/skills/dalton-model/scripts/model_scan.py --recalc" in deep_rev_prompt
+    assert "model_lineage.json" in deep_rev_prompt
+    assert "model-update/SKILL.md" not in deep_rev_prompt
+
+    # 2. full-coverage: model build + readability probe + writer + read-only model review + revision loop
+    fc_dir = tmp_path / "fc"
+    fc_dir.mkdir()
+    fc_host = _fc_host(
+        fc_dir,
+        by_label={"独立审稿": REVISE, "复审 1": PASS, "终稿审稿": PASS},
+        revise_modes={"修订 1": "save"},
+    )
+    fc_res = await _run("full-coverage", FC_PARAMS, fc_host)
+    assert fc_res["ok"] is True, fc_res["incomplete"]
+    fc_labels = fc_host.labels()
+
+    build_prompt = fc_host.prompts[fc_labels.index("建模")]
+    assert ".agents/skills/dalton-model/SKILL.md" in build_prompt
+    assert "第 1 步选择起点原模型" in build_prompt
+    assert ".agents/skills/dalton-model/scripts/model_style.py" in build_prompt
+    assert ".agents/skills/dalton-model/scripts/model_scan.py --recalc" in build_prompt
+    assert "model_lineage.json" in build_prompt
+    assert "Facts" in build_prompt and "Guidance vs Actual" in build_prompt
+    assert "Street vs House" in build_prompt and "Checks" in build_prompt
+    assert "不新建情景页" in build_prompt
+    assert "不阻断交付" in build_prompt
+    assert "audit.py" not in build_prompt
+
+    probe_prompt = fc_host.prompts[fc_labels.index("模型可读性核验")]
+    assert ".agents/skills/dalton-model/scripts/model_readable.py" in probe_prompt
+    assert "model_scan.py" not in probe_prompt
+    assert "audit.py" not in probe_prompt
+
+    draft_prompt = fc_host.prompts[fc_labels.index("成稿")]
+    assert "原模型未设情景页" in draft_prompt and "模型里没有对应计算" in draft_prompt
+
+    review_model_prompt = fc_host.prompts[fc_labels.index("只读审模型")]
+    assert ".agents/skills/dalton-model/SKILL.md" in review_model_prompt
+    assert ".agents/skills/dalton-model/references/sanity-check.md" in review_model_prompt
+    assert ".agents/skills/dalton-model/scripts/model_scan.py --recalc" in review_model_prompt
+    assert "扫描超时或执行失败" in review_model_prompt
+    assert "check-model/SKILL.md" not in review_model_prompt
+
+    fc_rev_prompt = fc_host.prompts[fc_labels.index("修订 1")]
+    assert ".agents/skills/dalton-model/SKILL.md" in fc_rev_prompt
+    assert ".agents/skills/dalton-model/scripts/model_scan.py --recalc" in fc_rev_prompt
+    assert "model_lineage.json" in fc_rev_prompt
+    assert "model-update/SKILL.md" not in fc_rev_prompt
+
+    # 3. Both contract.json files use shared model_readable.py, not model_scan.py or audit.py
+    for wf in ("earnings-deep-update", "full-coverage"):
+        contract_text = (REPO_ROOT / "workflows" / wf / "contract.json").read_text(encoding="utf-8")
+        assert ".agents/skills/dalton-model/scripts/model_readable.py" in contract_text, wf
+        assert "model_scan.py" not in contract_text, wf
+        assert "audit.py" not in contract_text, wf
+
+
+@pytest.mark.asyncio
+async def test_full_existing_draft_with_stale_model_updates_affected_sections(
+    tmp_path: Path,
+) -> None:
+    """Modeling Batch 2 r3 (#4): reusing a same-as_of memo verifies that its
+    cited model path and recorded model sha256 match the current final model;
+    either mismatch dispatches 成稿 to sync predictions/valuation/citations
+    before review."""
+    # Case A: memo cites v01 while current final model is v02
+    ws_path_drift = tmp_path / "path_drift"
+    ws_path_drift.mkdir()
+    host_a = _fc_host(ws_path_drift, by_label={"独立审稿": PASS})
+    host_a.touch("model/META-model-v02.xlsx")
+    draft_a = ws_path_drift / "drafts" / "2026-10-23-memo.md"
+    draft_a.parent.mkdir(parents=True, exist_ok=True)
+    draft_a.write_text(FC_COMPLETE_MEMO, encoding="utf-8")
+
+    res_a = await _run("full-coverage", FC_PARAMS, host_a)
+    assert res_a["ok"] is True, res_a["incomplete"]
+    labels_a = host_a.labels()
+    assert "成稿" in labels_a, "stale model path in existing memo must trigger update"
+    prompt_a = host_a.prompts[labels_a.index("成稿")]
+    assert "model/META-model-v02.xlsx" in prompt_a
+    assert "更新受影响的预测、估值、表格与全部 model: 引用" in prompt_a
+
+    # Case B: memo cites v01 and .memo-model.json records an older sha256 for v01
+    ws_sha_drift = tmp_path / "sha_drift"
+    ws_sha_drift.mkdir()
+    host_b = _fc_host(ws_sha_drift, by_label={"独立审稿": PASS})
+    draft_b = ws_sha_drift / "drafts" / "2026-10-23-memo.md"
+    draft_b.parent.mkdir(parents=True, exist_ok=True)
+    draft_b.write_text(FC_COMPLETE_MEMO, encoding="utf-8")
+    meta_b = ws_sha_drift / "research" / "2026-10-23-fc" / ".memo-model.json"
+    meta_b.parent.mkdir(parents=True, exist_ok=True)
+    meta_b.write_text(
+        json.dumps({"path": "model/META-model-v01.xlsx", "sha256": "0" * 64}),
+        encoding="utf-8",
+    )
+
+    res_b = await _run("full-coverage", FC_PARAMS, host_b)
+    assert res_b["ok"] is True, res_b["incomplete"]
+    labels_b = host_b.labels()
+    assert "成稿" in labels_b, "stale model sha256 in existing memo must trigger update"
+    assert "更新受影响的预测、估值、表格与全部 model: 引用" in host_b.prompts[labels_b.index("成稿")]
 
