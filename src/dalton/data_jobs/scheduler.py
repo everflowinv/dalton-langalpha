@@ -821,44 +821,13 @@ async def claim_next_queued_run(
                 else datetime.now(timezone.utc)
             )
             if cand_deadline_utc is not None and claim_check_now >= cand_deadline_utc:
-                slot_dt = _coerce_utc_datetime(cand.get("scheduled_slot_utc"))
-                expired_detail = (
-                    f"takeover_retry_expired: 补跑领取时已过截止时间"
-                    f"（时段 {slot_dt.isoformat() if slot_dt else 'unknown'}，"
-                    f"截止 {cand_deadline_utc.isoformat()}）"
+                await _cancel_and_publish_expired_takeover_retry(
+                    conn,
+                    run_id=run_id,
+                    job_key=job_key,
+                    scheduled_slot_utc=_coerce_utc_datetime(cand.get("scheduled_slot_utc")),
+                    deadline_utc=cand_deadline_utc,
                 )
-                async with conn.transaction():
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            """
-                            UPDATE dalton_data_task_runs
-                            SET status = 'cancelled',
-                                failure_reason = 'takeover_retry_expired',
-                                notify_status = 'skipped',
-                                completed_at = NOW(),
-                                updated_at = NOW()
-                            WHERE run_id = %(run_id)s::uuid
-                              AND status = 'queued'
-                            """,
-                            {"run_id": run_id},
-                        )
-                try:
-                    from src.dalton.monitors.service import maybe_publish_data_job_monitor
-
-                    await maybe_publish_data_job_monitor(
-                        job_key=job_key,
-                        run_id=run_id,
-                        terminal_status="cancelled",
-                        failure_reason=expired_detail,
-                        data_root=build_path_map().backend_data_root,
-                    )
-                except Exception as monitor_exc:
-                    logger.warning(
-                        "Failed to update monitor for expired takeover retry %s (%s): %s",
-                        run_id,
-                        job_key,
-                        monitor_exc,
-                    )
                 continue
 
         # Unclaimable head row (disabled/paused for non-trial runs, missing def, or unsupported runner):
@@ -982,8 +951,13 @@ async def claim_next_queued_run(
                         if now_utc is not None
                         else datetime.now(timezone.utc)
                     )
+                    deadline_guard_sql = (
+                        "%(claim_now_utc)s < r.deadline_utc"
+                        if now_utc is not None
+                        else "NOW() < r.deadline_utc"
+                    )
                     await cur.execute(
-                        """
+                        f"""
                         UPDATE dalton_data_task_runs r
                         SET status     = 'starting',
                             generation = %(generation)s,
@@ -1002,7 +976,7 @@ async def claim_next_queued_run(
                           AND (
                               COALESCE(r.triggered_by_user_id, '') <> %(takeover_retry_user)s
                               OR r.deadline_utc IS NULL
-                              OR %(claim_now_utc)s < r.deadline_utc
+                              OR {deadline_guard_sql}
                           )
                           AND d.runner IN ('container', 'host')
                         """,
@@ -1017,10 +991,9 @@ async def claim_next_queued_run(
                     )
                     if cur.rowcount != 1:
                         cand_dl = _coerce_utc_datetime(deadline_utc)
-                        expired_at_claim = (
-                            is_takeover_retry
-                            and cand_dl is not None
-                            and claim_now_utc >= cand_dl
+                        expired_at_claim = is_takeover_retry and cand_dl is not None and (
+                            (now_utc is not None and claim_now_utc >= cand_dl)
+                            or (now_utc is None and datetime.now(timezone.utc) >= cand_dl)
                         )
                         raise _ClaimRollback(
                             "takeover_retry_expired" if expired_at_claim else "run_not_claimable",
@@ -1030,30 +1003,37 @@ async def claim_next_queued_run(
             if rb.reason == "slot_not_idle" or rb.reason == "slot_returning_empty":
                 return None
             if rb.unclaimable_run_id:
-                async with conn.transaction():
-                    async with conn.cursor() as cur:
-                        await cur.execute(
-                            """
-                            UPDATE dalton_data_task_runs
-                            SET status = 'cancelled',
-                                failure_reason = %(failure_reason)s,
-                                notify_status = 'skipped',
-                                completed_at = NOW(),
-                                updated_at = NOW()
-                            WHERE run_id = %(run_id)s::uuid
-                              AND status = 'queued'
-                            """,
-                            {
-                                "run_id": rb.unclaimable_run_id,
-                                "failure_reason": (
-                                    "task_deleted"
-                                    if rb.reason == "task_deleted"
-                                    else "takeover_retry_expired"
-                                    if rb.reason == "takeover_retry_expired"
-                                    else "task_disabled_before_claim"
-                                ),
-                            },
-                        )
+                if rb.reason == "takeover_retry_expired":
+                    await _cancel_and_publish_expired_takeover_retry(
+                        conn,
+                        run_id=rb.unclaimable_run_id,
+                        job_key=job_key,
+                        scheduled_slot_utc=_coerce_utc_datetime(cand.get("scheduled_slot_utc")),
+                        deadline_utc=_coerce_utc_datetime(deadline_utc),
+                    )
+                else:
+                    async with conn.transaction():
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                """
+                                UPDATE dalton_data_task_runs
+                                SET status = 'cancelled',
+                                    failure_reason = %(failure_reason)s,
+                                    notify_status = 'skipped',
+                                    completed_at = NOW(),
+                                    updated_at = NOW()
+                                WHERE run_id = %(run_id)s::uuid
+                                  AND status = 'queued'
+                                """,
+                                {
+                                    "run_id": rb.unclaimable_run_id,
+                                    "failure_reason": (
+                                        "task_deleted"
+                                        if rb.reason == "task_deleted"
+                                        else "task_disabled_before_claim"
+                                    ),
+                                },
+                            )
             continue
 
         raw_argv = cand["command_argv"]
@@ -1791,6 +1771,377 @@ async def _stop_and_confirm_container(
 
 
 TAKEOVER_RETRY_TRIGGERED_BY = "system:takeover_retry"
+_PENDING_MONITOR_PUBLISHES_FILE = "pending_monitor_publishes.json"
+_PENDING_TAKEOVER_RETRIES_FILE = "pending_takeover_retries.json"
+
+
+def _read_json_store(path: Path) -> dict[str, dict[str, Any]]:
+    try:
+        if not path.is_file():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {
+                str(k): dict(v)
+                for k, v in data.items()
+                if isinstance(v, dict)
+            }
+    except Exception:
+        pass
+    return {}
+
+
+def _write_json_store(path: Path, data: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".{uuid4().hex[:8]}.tmp")
+    tmp.write_text(json.dumps(dict(data), ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _record_pending_monitor_publish(
+    paths: DataTaskPathMap,
+    *,
+    run_id: str,
+    job_key: str,
+    terminal_status: str,
+    failure_reason: str,
+) -> None:
+    store_path = paths.backend_var_dir / _PENDING_MONITOR_PUBLISHES_FILE
+    records = _read_json_store(store_path)
+    records[str(run_id)] = {
+        "run_id": str(run_id),
+        "job_key": str(job_key),
+        "terminal_status": str(terminal_status),
+        "failure_reason": str(failure_reason),
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        _write_json_store(store_path, records)
+    except Exception as exc:
+        logger.warning("Failed persisting pending monitor publish %s: %s", run_id, exc)
+
+
+def _clear_pending_monitor_publish(paths: DataTaskPathMap, run_id: str) -> None:
+    store_path = paths.backend_var_dir / _PENDING_MONITOR_PUBLISHES_FILE
+    records = _read_json_store(store_path)
+    if str(run_id) not in records:
+        return
+    records.pop(str(run_id), None)
+    try:
+        _write_json_store(store_path, records)
+    except Exception as exc:
+        logger.warning("Failed clearing pending monitor publish %s: %s", run_id, exc)
+
+
+def _record_pending_takeover_retry(
+    paths: DataTaskPathMap,
+    *,
+    job_key: str,
+    scheduled_slot_utc: datetime,
+    deadline_utc: datetime,
+    source_run_id: str,
+    blocked_by_run_id: str | None = None,
+) -> None:
+    """Persist a deferred takeover-retry intent deduplicated by ``(job_key, scheduled_slot_utc)``."""
+    store_path = paths.backend_var_dir / _PENDING_TAKEOVER_RETRIES_FILE
+    records = _read_json_store(store_path)
+    dedup_key = f"{job_key}|{scheduled_slot_utc.astimezone(timezone.utc).isoformat()}"
+    if dedup_key not in records:
+        records[dedup_key] = {
+            "job_key": str(job_key),
+            "scheduled_slot_utc": scheduled_slot_utc.astimezone(timezone.utc).isoformat(),
+            "deadline_utc": deadline_utc.astimezone(timezone.utc).isoformat(),
+            "source_run_id": str(source_run_id),
+            "blocked_by_run_id": str(blocked_by_run_id) if blocked_by_run_id else None,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            _write_json_store(store_path, records)
+        except Exception as exc:
+            logger.warning(
+                "Failed persisting deferred takeover retry intent for %s: %s",
+                dedup_key,
+                exc,
+            )
+
+
+async def _durable_publish_data_job_monitor(
+    *,
+    job_key: str,
+    run_id: str,
+    terminal_status: str,
+    failure_reason: str,
+    paths: DataTaskPathMap,
+) -> bool:
+    """Persist a pending monitor publish record before calling ``maybe_publish_data_job_monitor``
+    and remove it only on success so failures survive slot reset and process restarts."""
+    _record_pending_monitor_publish(
+        paths,
+        run_id=str(run_id),
+        job_key=job_key,
+        terminal_status=terminal_status,
+        failure_reason=failure_reason,
+    )
+    try:
+        from src.dalton.monitors.service import maybe_publish_data_job_monitor
+
+        await maybe_publish_data_job_monitor(
+            job_key=job_key,
+            run_id=str(run_id),
+            terminal_status=terminal_status,
+            failure_reason=failure_reason,
+            data_root=paths.backend_data_root,
+        )
+    except Exception as monitor_exc:
+        logger.warning(
+            "Failed to update monitor for data task run %s (%s, %s); kept pending for replay: %s",
+            run_id,
+            job_key,
+            terminal_status,
+            monitor_exc,
+        )
+        return False
+    _clear_pending_monitor_publish(paths, str(run_id))
+    return True
+
+
+async def replay_pending_monitor_publishes(
+    *,
+    path_map: DataTaskPathMap | None = None,
+) -> int:
+    """Replay any persisted monitor publish failures that previously failed before succeeding."""
+    paths = path_map or build_path_map()
+    store_path = paths.backend_var_dir / _PENDING_MONITOR_PUBLISHES_FILE
+    records = _read_json_store(store_path)
+    if not records:
+        return 0
+    replayed = 0
+    for rid, rec in list(records.items()):
+        ok = await _durable_publish_data_job_monitor(
+            job_key=str(rec.get("job_key") or ""),
+            run_id=str(rec.get("run_id") or rid),
+            terminal_status=str(rec.get("terminal_status") or "aborted"),
+            failure_reason=str(rec.get("failure_reason") or "scheduler_takeover_aborted"),
+            paths=paths,
+        )
+        if ok:
+            replayed += 1
+    return replayed
+
+
+async def _cancel_and_publish_expired_takeover_retry(
+    conn: Any,
+    *,
+    run_id: str,
+    job_key: str,
+    scheduled_slot_utc: datetime | None,
+    deadline_utc: datetime | None,
+    path_map: DataTaskPathMap | None = None,
+) -> None:
+    """Shared cancellation + durable monitor registration for both takeover-retry expiry branches."""
+    paths = path_map or build_path_map()
+    expired_detail = (
+        f"takeover_retry_expired: 补跑领取时已过截止时间"
+        f"（时段 {scheduled_slot_utc.isoformat() if scheduled_slot_utc else 'unknown'}，"
+        f"截止 {deadline_utc.isoformat() if deadline_utc else 'unknown'}）"
+    )
+    async with conn.transaction():
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_data_task_runs
+                SET status = 'cancelled',
+                    failure_reason = 'takeover_retry_expired',
+                    notify_status = 'skipped',
+                    completed_at = NOW(),
+                    updated_at = NOW()
+                WHERE run_id = %(run_id)s::uuid
+                  AND status = 'queued'
+                """,
+                {"run_id": run_id},
+            )
+    await _durable_publish_data_job_monitor(
+        job_key=job_key,
+        run_id=run_id,
+        terminal_status="cancelled",
+        failure_reason=expired_detail,
+        paths=paths,
+    )
+
+
+async def flush_pending_takeover_retries(
+    conn: Any,
+    *,
+    path_map: DataTaskPathMap | None = None,
+    now_utc: datetime | None = None,
+) -> int:
+    """Attempt to enqueue persisted deferred takeover-retry intents once a job's queue slot frees up.
+
+    Deduplicates strictly by ``(job_key, scheduled_slot_utc)`` and enforces ``deadline_utc``
+    against the database clock (``NOW()`` when ``now_utc`` is None) so expired intents are
+    dropped and reported rather than enqueued late.
+    """
+    paths = path_map or build_path_map()
+    store_path = paths.backend_var_dir / _PENDING_TAKEOVER_RETRIES_FILE
+    records = _read_json_store(store_path)
+    if not records:
+        return 0
+
+    enqueued = 0
+    changed = False
+    use_db_clock = now_utc is None
+    check_now = (
+        now_utc.astimezone(timezone.utc)
+        if now_utc is not None
+        else datetime.now(timezone.utc)
+    )
+
+    for dedup_key, rec in list(records.items()):
+        job_key = str(rec.get("job_key") or "").strip()
+        slot_dt = _coerce_utc_datetime(rec.get("scheduled_slot_utc"))
+        dl_dt = _coerce_utc_datetime(rec.get("deadline_utc"))
+        source_run_id = str(rec.get("source_run_id") or dedup_key)
+        if not job_key or slot_dt is None or dl_dt is None:
+            records.pop(dedup_key, None)
+            changed = True
+            continue
+        if check_now >= dl_dt:
+            records.pop(dedup_key, None)
+            changed = True
+            await _durable_publish_data_job_monitor(
+                job_key=job_key,
+                run_id=source_run_id,
+                terminal_status="aborted",
+                failure_reason=(
+                    f"takeover_retry_expired: 占槽释放前已过截止时间"
+                    f"（时段 {slot_dt.isoformat()}，截止 {dl_dt.isoformat()}，不再补跑）"
+                ),
+                paths=paths,
+            )
+            continue
+
+        deadline_pred_sql = "NOW() < %(deadline_utc)s" if use_db_clock else "%(check_now)s < %(deadline_utc)s"
+        inserted_id: str | None = None
+        should_remove = False
+        expired_in_db = False
+
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT enabled, paused_by_user, deleted_at
+                    FROM dalton_data_task_defs
+                    WHERE job_key = %(job_key)s
+                    """,
+                    {"job_key": job_key},
+                )
+                def_row = await cur.fetchone()
+                if (
+                    def_row is None
+                    or not bool(_extract_field(def_row, "enabled", 0))
+                    or bool(_extract_field(def_row, "paused_by_user", 1))
+                    or _extract_field(def_row, "deleted_at", 2) is not None
+                ):
+                    should_remove = True
+                else:
+                    await cur.execute(
+                        """
+                        SELECT run_id
+                        FROM dalton_data_task_runs
+                        WHERE job_key = %(job_key)s
+                          AND scheduled_slot_utc = %(slot_utc)s
+                          AND triggered_by_user_id = %(triggered_by_user_id)s
+                        LIMIT 1
+                        """,
+                        {
+                            "job_key": job_key,
+                            "slot_utc": slot_dt,
+                            "triggered_by_user_id": TAKEOVER_RETRY_TRIGGERED_BY,
+                        },
+                    )
+                    if await cur.fetchone() is not None:
+                        should_remove = True
+                    else:
+                        rerun_id = str(uuid4())
+                        await cur.execute(
+                            f"""
+                            INSERT INTO dalton_data_task_runs (
+                                run_id,
+                                job_key,
+                                trigger_source,
+                                triggered_by_user_id,
+                                scheduled_slot_utc,
+                                deadline_utc,
+                                status,
+                                created_at,
+                                updated_at
+                            )
+                            SELECT
+                                %(run_id)s::uuid,
+                                %(job_key)s,
+                                'manual',
+                                %(triggered_by_user_id)s,
+                                %(slot_utc)s,
+                                %(deadline_utc)s,
+                                'queued',
+                                NOW(),
+                                NOW()
+                            WHERE {deadline_pred_sql}
+                            ON CONFLICT DO NOTHING
+                            RETURNING run_id
+                            """,
+                            {
+                                "run_id": rerun_id,
+                                "job_key": job_key,
+                                "triggered_by_user_id": TAKEOVER_RETRY_TRIGGERED_BY,
+                                "slot_utc": slot_dt,
+                                "deadline_utc": dl_dt,
+                                "check_now": check_now,
+                            },
+                        )
+                        ins = await cur.fetchone()
+                        if ins is not None:
+                            inserted_id = str(_extract_field(ins, "run_id", 0))
+                            should_remove = True
+                        else:
+                            await cur.execute(
+                                """
+                                SELECT run_id
+                                FROM dalton_data_task_runs
+                                WHERE job_key = %(job_key)s
+                                  AND status = 'queued'
+                                LIMIT 1
+                                """,
+                                {"job_key": job_key},
+                            )
+                            still_blocked = await cur.fetchone()
+                            if still_blocked is None:
+                                should_remove = True
+                                expired_in_db = True
+
+        if inserted_id:
+            enqueued += 1
+        if should_remove:
+            records.pop(dedup_key, None)
+            changed = True
+        if expired_in_db:
+            await _durable_publish_data_job_monitor(
+                job_key=job_key,
+                run_id=source_run_id,
+                terminal_status="aborted",
+                failure_reason=(
+                    f"takeover_retry_expired: 补跑入队时已过截止时间"
+                    f"（时段 {slot_dt.isoformat()}，截止 {dl_dt.isoformat()}，不再补跑）"
+                ),
+                paths=paths,
+            )
+
+    if changed:
+        try:
+            _write_json_store(store_path, records)
+        except Exception as exc:
+            logger.warning("Failed updating pending takeover retries store: %s", exc)
+    return enqueued
 
 
 def _coerce_utc_datetime(value: Any) -> datetime | None:
@@ -1830,7 +2181,7 @@ def _format_takeover_abort_detail(
     if blocked_by_queued_run_id and scheduled_slot_utc is not None:
         return (
             f"scheduler_takeover_aborted: 调度器接管终止"
-            f"（时段 {scheduled_slot_utc.isoformat()} 因已有排队任务 {blocked_by_queued_run_id} 占槽，未重复入队补跑）"
+            f"（时段 {scheduled_slot_utc.isoformat()} 因已有排队任务 {blocked_by_queued_run_id} 占槽，已登记待补跑，空槽后在截止前自动补入队）"
         )
     if retry_exhausted and scheduled_slot_utc is not None:
         return (
@@ -1862,9 +2213,13 @@ async def _enqueue_takeover_retry_in_tx(
     def_paused: bool,
     def_deleted_at: Any,
     decision_now_utc: datetime,
+    use_db_clock: bool = False,
+    source_run_id: str | None = None,
+    deferred_retries_out: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Inside the abort transaction, atomically check the slot deadline and enqueue at most
-    one same-slot takeover rerun, distinguishing already-retried from blocked-by-queued.
+    """Inside the abort transaction, atomically check the slot deadline (using DB ``NOW()``
+    in production) and enqueue at most one same-slot takeover rerun, distinguishing
+    already-retried, DB-clock-expired, and blocked-by-queued (recording a deferred intent).
 
     Returns the formatted ``abort_failure_detail`` for monitor registration.
     """
@@ -1911,8 +2266,13 @@ async def _enqueue_takeover_retry_in_tx(
             retry_exhausted = True
         else:
             rerun_id = str(uuid4())
+            deadline_where_sql = (
+                "NOW() < %(deadline_utc)s"
+                if use_db_clock
+                else "%(decision_now_utc)s < %(deadline_utc)s"
+            )
             await cur.execute(
-                """
+                f"""
                 INSERT INTO dalton_data_task_runs (
                     run_id,
                     job_key,
@@ -1923,7 +2283,8 @@ async def _enqueue_takeover_retry_in_tx(
                     status,
                     created_at,
                     updated_at
-                ) VALUES (
+                )
+                SELECT
                     %(run_id)s::uuid,
                     %(job_key)s,
                     'manual',
@@ -1933,7 +2294,7 @@ async def _enqueue_takeover_retry_in_tx(
                     'queued',
                     NOW(),
                     NOW()
-                )
+                WHERE {deadline_where_sql}
                 ON CONFLICT DO NOTHING
                 RETURNING run_id
                 """,
@@ -1943,13 +2304,14 @@ async def _enqueue_takeover_retry_in_tx(
                     "triggered_by_user_id": TAKEOVER_RETRY_TRIGGERED_BY,
                     "slot_utc": scheduled_slot_utc,
                     "deadline_utc": deadline_utc,
+                    "decision_now_utc": decision_now_utc,
                 },
             )
             inserted = await cur.fetchone()
             if inserted is not None:
                 scheduled_rerun_id = str(_extract_field(inserted, "run_id", 0))
             else:
-                # Distinguish slot-already-retried vs blocked by another queued run (e.g. manual trigger).
+                # Distinguish DB-clock expiry while waiting for lock vs blocked by another queued run.
                 await cur.execute(
                     """
                     SELECT run_id, trigger_source, triggered_by_user_id, scheduled_slot_utc
@@ -1969,6 +2331,19 @@ async def _enqueue_takeover_retry_in_tx(
                         retry_exhausted = True
                     elif b_run_id:
                         blocked_by_queued_run_id = b_run_id
+                        if deferred_retries_out is not None:
+                            deferred_retries_out.append(
+                                {
+                                    "job_key": job_key,
+                                    "scheduled_slot_utc": scheduled_slot_utc,
+                                    "deadline_utc": deadline_utc,
+                                    "source_run_id": str(source_run_id or ""),
+                                    "blocked_by_run_id": b_run_id,
+                                }
+                            )
+                elif use_db_clock:
+                    # No queued row blocked the insert -> WHERE NOW() < deadline_utc filtered it out.
+                    slot_still_valid = False
                 else:
                     retry_exhausted = True
 
@@ -2056,25 +2431,15 @@ async def _publish_takeover_abort_monitor(
     failure_reason: str,
     paths: DataTaskPathMap,
 ) -> None:
-    """Register takeover-abort publish failure for any monitor bound to ``job_key`` (idempotent/replayable)."""
+    """Register takeover-abort publish failure durably so failures survive slot reset and restarts."""
     # DALTON-HOOK(monitors): record takeover-abort publish failure for any monitor bound to this job_key.
-    try:
-        from src.dalton.monitors.service import maybe_publish_data_job_monitor
-
-        await maybe_publish_data_job_monitor(
-            job_key=job_key,
-            run_id=str(run_id),
-            terminal_status="aborted",
-            failure_reason=failure_reason,
-            data_root=paths.backend_data_root,
-        )
-    except Exception as monitor_exc:
-        logger.warning(
-            "Failed to update monitor for takeover-aborted data task run %s (%s): %s",
-            run_id,
-            job_key,
-            monitor_exc,
-        )
+    await _durable_publish_data_job_monitor(
+        job_key=job_key,
+        run_id=str(run_id),
+        terminal_status="aborted",
+        failure_reason=failure_reason,
+        paths=paths,
+    )
 
 
 async def recover_on_takeover(
@@ -2259,6 +2624,7 @@ async def recover_on_takeover(
 
                 await check_scheduler_lock(lock_conn)
                 post_kill_now = _decision_now()
+                deferred_retries: list[dict[str, Any]] = []
                 async with conn.transaction():
                     async with conn.cursor(row_factory=dict_row) as cur:
                         await cur.execute(
@@ -2296,10 +2662,23 @@ async def recover_on_takeover(
                                 def_paused=def_paused,
                                 def_deleted_at=def_deleted_at,
                                 decision_now_utc=post_kill_now,
+                                use_db_clock=(now_utc is None),
+                                source_run_id=active_run_id,
+                                deferred_retries_out=deferred_retries,
                             )
                             recovery_outcome = "aborted"
                         else:
                             recovery_outcome = "cleaned_terminal"
+
+                for item in deferred_retries:
+                    _record_pending_takeover_retry(
+                        paths,
+                        job_key=item["job_key"],
+                        scheduled_slot_utc=item["scheduled_slot_utc"],
+                        deadline_utc=item["deadline_utc"],
+                        source_run_id=item["source_run_id"],
+                        blocked_by_run_id=item.get("blocked_by_run_id"),
+                    )
 
                 if recovery_outcome == "aborted" and abort_failure_detail is not None:
                     await _publish_takeover_abort_monitor(
@@ -2340,6 +2719,7 @@ async def recover_on_takeover(
                 if run_status in NON_TERMINAL_RUN_STATUSES:
                     await check_scheduler_lock(lock_conn)
                     post_stop_now = _decision_now()
+                    deferred_retries = []
                     async with conn.transaction():
                         async with conn.cursor(row_factory=dict_row) as cur:
                             await cur.execute(
@@ -2377,10 +2757,23 @@ async def recover_on_takeover(
                                     def_paused=def_paused,
                                     def_deleted_at=def_deleted_at,
                                     decision_now_utc=post_stop_now,
+                                    use_db_clock=(now_utc is None),
+                                    source_run_id=active_run_id,
+                                    deferred_retries_out=deferred_retries,
                                 )
                                 recovery_outcome = "aborted"
                             else:
                                 recovery_outcome = "cleaned_terminal"
+
+                    for item in deferred_retries:
+                        _record_pending_takeover_retry(
+                            paths,
+                            job_key=item["job_key"],
+                            scheduled_slot_utc=item["scheduled_slot_utc"],
+                            deadline_utc=item["deadline_utc"],
+                            source_run_id=item["source_run_id"],
+                            blocked_by_run_id=item.get("blocked_by_run_id"),
+                        )
 
                     if recovery_outcome == "aborted" and abort_failure_detail is not None:
                         await _publish_takeover_abort_monitor(
@@ -2493,6 +2886,8 @@ async def recover_on_takeover(
                     WHERE slot_id = 1
                     """
                 )
+
+    await replay_pending_monitor_publishes(path_map=paths)
 
     secrets_root = paths.backend_var_dir / "run-secrets"
     if secrets_root.is_dir():
@@ -4427,6 +4822,8 @@ async def run_data_task_scheduler_loop(
             async with db_conn_factory() as work_conn:
                 # Enqueue due cron tasks every minute, even while a background task is running.
                 await enqueue_due_cron_tasks(work_conn)
+                await flush_pending_takeover_retries(work_conn)
+                await replay_pending_monitor_publishes()
                 await expire_low_memory_runs(work_conn)
 
                 if active_exec_task is None and not stop.is_set():

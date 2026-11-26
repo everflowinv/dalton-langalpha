@@ -45,27 +45,34 @@ def _run_alembic(args: list[str], *, env: dict[str, str], dalton: bool = True) -
     )
 
 
-def _alembic_env_for_dsn(dsn: str) -> dict[str, str]:
-    from urllib.parse import urlparse
+from tests.integration.dalton._db_guard import extract_effective_test_db_name
 
-    parsed = urlparse(dsn)
+
+def _alembic_env_for_dsn(dsn: str) -> dict[str, str]:
+    from psycopg.conninfo import conninfo_to_dict
+
+    db_name = extract_effective_test_db_name(dsn, source="DALTON_TEST_PG_DSN")
+    params = conninfo_to_dict(dsn)
     env = os.environ.copy()
     env["DATABASE_URL"] = dsn
-    if parsed.hostname:
-        env["DB_HOST"] = parsed.hostname
-    if parsed.port:
-        env["DB_PORT"] = str(parsed.port)
-    if parsed.username:
-        env["DB_USER"] = parsed.username
-    if parsed.password is not None:
-        env["DB_PASSWORD"] = parsed.password
-    if parsed.path and parsed.path.lstrip("/"):
-        env["DB_NAME"] = parsed.path.lstrip("/")
+    if params.get("host"):
+        env["DB_HOST"] = str(params["host"])
+    if params.get("port"):
+        env["DB_PORT"] = str(params["port"])
+    if params.get("user"):
+        env["DB_USER"] = str(params["user"])
+    if params.get("password") is not None:
+        env["DB_PASSWORD"] = str(params["password"])
+    env["DB_NAME"] = db_name
     return env
 
 
 def test_d048_upgrade_downgrade_reupgrade_real_postgres() -> None:
     """Verify d047 -> d048 -> downgrade d047 -> re-upgrade d048 preserves audit & revokes pending admin invites."""
+    try:
+        extract_effective_test_db_name(PG_DSN, source="DALTON_TEST_PG_DSN")
+    except ValueError as exc:
+        pytest.fail(str(exc))
     env = _alembic_env_for_dsn(PG_DSN)
 
     # Ensure upstream schema + Dalton up to d047 exist, then upgrade to d048.

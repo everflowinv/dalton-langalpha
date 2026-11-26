@@ -435,3 +435,103 @@ def test_bridge_sec_list_filings_maps_dual_listed_9988_hk_to_baba_before_short_c
     payload = json.loads(text)
     assert payload.get("error_code") != "not_sec_filer"
     assert payload.get("sec_filer") is not False
+
+
+def test_sec_shared_issuer_map_resolves_toyota_7203_t_and_distinguishes_unmapped_from_non_sec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Med #4: all three SEC entrypoints share src.dalton.sec_issuer_map:
+    - 7203.T maps to TM (CIK 0001094517) instead of being rejected as non-SEC
+    - Unmapped non-US ticker (e.g. 9432.T) returns sec_issuer_mapping_not_found with sec_filer=None (NOT sec_filer=False)
+    - _CORE_WATCHLIST_ALIASES is consulted (not nonexistent _TICKER_ALIASES/TICKER_ALIASES)."""
+    from src.dalton import sec_issuer_map
+
+    # 1. Shared classifier: 7203.T -> TM; 0700.HK -> confirmed_non_sec; 9432.T -> unmapped_non_us
+    assert sec_issuer_map.classify_sec_ticker("7203.T")[0:2] == ("mapped", "TM")
+    assert sec_issuer_map.classify_sec_ticker("0700.HK")[0] == "confirmed_non_sec"
+    assert sec_issuer_map.classify_sec_ticker("9432.T")[0] == "unmapped_non_us"
+
+    # Verify _CORE_WATCHLIST_ALIASES lookup works via the real attribute name
+    import scripts.dalton.alphaengine_search_cache as ae_cache
+
+    monkeypatch.setitem(ae_cache._CORE_WATCHLIST_ALIASES, "SPOT", ("SPOT", "SPOT.ST", "Spotify"))
+    assert sec_issuer_map.resolve_sec_issuer_ticker("SPOT.ST") == "SPOT"
+
+    # 2. dalton_sec_mcp_server: 7203.T queries TM (0001094517); unmapped 9432.T returns sec_issuer_mapping_not_found
+    sec_mod = _load_dalton_sec()
+    fake_tm_sub = {
+        "name": "TOYOTA MOTOR CORP",
+        "filings": {
+            "recent": {
+                "accessionNumber": ["0001193125-26-264811"],
+                "form": ["20-F"],
+                "filingDate": ["2026-06-25"],
+                "reportDate": ["2026-03-31"],
+                "primaryDocument": ["d101983d20f.htm"],
+            }
+        },
+    }
+    fetch_spy = create_autospec(sec_mod.fetch_submissions, return_value=fake_tm_sub)
+    monkeypatch.setattr(sec_mod, "fetch_submissions", fetch_spy)
+
+    tm_res = sec_mod.list_filings(ticker="7203.T", limit=5)
+    fetch_spy.assert_called_once_with("0001094517")
+    assert (tm_res.get("data") or [])[0]["cik"] == "0001094517"
+
+    unmapped_sec = sec_mod.list_filings(ticker="9432.T", limit=5)
+    assert unmapped_sec.get("error_code") == "sec_issuer_mapping_not_found"
+    assert unmapped_sec.get("sec_filer") is None
+
+    # 3. researchdata_bridge: 7203.T forwards ticker="TM"; unmapped 9432.T returns sec_issuer_mapping_not_found
+    rb = _load_bridge()
+    bridge = rb.ResearchDataBridge(rb.BridgeConfig())
+    captured: list[dict[str, Any]] = []
+
+    async def _fake_stdio(requests: list[dict[str, Any]], timeout_s: float) -> list[dict[str, Any]]:
+        captured.extend(requests)
+        return [
+            {
+                "jsonrpc": "2.0",
+                "id": requests[0]["id"],
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps({"ok": True, "ticker": "TM", "rows": []})}],
+                    "isError": False,
+                },
+            }
+        ]
+
+    bridge._run_stdio_rpc = create_autospec(bridge._run_stdio_rpc, side_effect=_fake_stdio)
+    asyncio.run(
+        bridge.handle_tools_call(
+            req_id=3,
+            params={"name": "finance", "arguments": {"route": "sec", "operation": "list-filings", "ticker": "7203.T"}},
+        )
+    )
+    assert captured[0]["params"]["arguments"]["ticker"] == "TM"
+
+    unmapped_bridge_resp = asyncio.run(
+        bridge.handle_tools_call(
+            req_id=4,
+            params={"name": "finance", "arguments": {"route": "sec", "operation": "list-filings", "ticker": "9432.T"}},
+        )
+    )
+    unmapped_bridge_payload = json.loads(unmapped_bridge_resp["result"]["content"][0]["text"])
+    assert unmapped_bridge_payload["error_code"] == "sec_issuer_mapping_not_found"
+    assert unmapped_bridge_payload["sec_filer"] is None
+
+    # 4. findata_cli: 7203.T calls Company("TM"); unmapped 9432.T returns sec_issuer_mapping_not_found
+    cli = _load_findata_cli()
+    seen_companies: list[str] = []
+
+    def _capture_company(sym: str) -> Any:
+        seen_companies.append(sym)
+        return _StubCompany(sym, _StubFilingsList([]))
+
+    monkeypatch.setattr(cli, "Company", create_autospec(_capture_company, side_effect=_capture_company))
+    cli.cmd_list_filings(argparse.Namespace(ticker="7203.T", form="20-F", limit=5, as_of=None))
+    assert seen_companies == ["TM"]
+
+    unmapped_cli = cli.cmd_list_filings(argparse.Namespace(ticker="9432.T", form="20-F", limit=5, as_of=None))
+    assert unmapped_cli["ok"] is False
+    assert unmapped_cli["error_code"] == "sec_issuer_mapping_not_found"
+    assert unmapped_cli["sec_filer"] is None

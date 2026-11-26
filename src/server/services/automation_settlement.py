@@ -352,6 +352,7 @@ async def _after_settling(
     repeated_refusal = _repeats_a_refusal(policy.failure_reason, run_id, row)
     webhook_delivery_result: Optional[list] = None
     held_pending = False
+    nudge_deferred = False
     if (
         not deleted
         and policy.webhook
@@ -360,7 +361,10 @@ async def _after_settling(
         if delivery is not None and delivery.held and policy.finish is not None:
             if finish_left:
                 held_pending = True
-                _nudge_drainer()
+                if policy.status in ("failed", "timeout"):
+                    nudge_deferred = True
+                else:
+                    _nudge_drainer()
             else:
                 # DALTON-HOOK(dalton-notify): capture _finish_here delivery result for failure notification receipt
                 webhook_delivery_result = await _finish_here(
@@ -403,22 +407,26 @@ async def _after_settling(
     elif policy.status in ("failed", "timeout"):
         from src.dalton.notify.dispatch import on_automation_failed
 
-        await on_automation_failed(
-            automation=automation,
-            execution_id=execution_id,
-            outcome=outcome.value,
-            failure_reason=policy.failure_reason,
-            error=error,
-            thread_id=thread_id,
-            run_id=run_id,
-            workspace_id=workspace_id,
-            deleted=deleted,
-            repeated_refusal=repeated_refusal,
-            webhook_result=webhook_delivery_result,
-            held_pending=held_pending,
-            coverage_unit_id=row.get("coverage_unit_id") if isinstance(row, dict) else None,
-            coverage_unit_version=row.get("coverage_unit_version") if isinstance(row, dict) else None,
-        )
+        try:
+            await on_automation_failed(
+                automation=automation,
+                execution_id=execution_id,
+                outcome=outcome.value,
+                failure_reason=policy.failure_reason,
+                error=error,
+                thread_id=thread_id,
+                run_id=run_id,
+                workspace_id=workspace_id,
+                deleted=deleted,
+                repeated_refusal=repeated_refusal,
+                webhook_result=webhook_delivery_result,
+                held_pending=held_pending,
+                coverage_unit_id=row.get("coverage_unit_id") if isinstance(row, dict) else None,
+                coverage_unit_version=row.get("coverage_unit_version") if isinstance(row, dict) else None,
+            )
+        finally:
+            if nudge_deferred:
+                _nudge_drainer()
     if row["settled_from"] == "waiting" and thread_id:
         await publish_automation_wait(
             user_id=automation["user_id"],

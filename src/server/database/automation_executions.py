@@ -926,13 +926,88 @@ async def stamp_delivery(execution_id: str, stamp: Optional[Dict[str, Any]]) -> 
 
 async def record_delivery(execution_id: str, delivery_result: list, *, conn=None) -> None:
     """Record what the webhook delivery returned, whatever the status.
-    ``conn`` joins the caller's transaction."""
+    ``conn`` joins the caller's transaction.
+
+    DALTON-HOOK(execution-delivery-status): preserve any separately persisted
+    ``kind = 'failure_receipt'`` entries unless ``delivery_result`` itself supplies one.
+    """
+    has_receipt = any(
+        isinstance(item, Mapping) and item.get("kind") == "failure_receipt"
+        for item in (delivery_result or ())
+    )
     async with get_db_connection(conn) as conn:
         async with conn.cursor() as cur:
-            await cur.execute("""
-                UPDATE automation_executions SET delivery_result = %s
+            if has_receipt:
+                await cur.execute("""
+                    UPDATE automation_executions SET delivery_result = %s
+                    WHERE automation_execution_id = %s
+                """, (Json(delivery_result), execution_id))
+            else:
+                await cur.execute("""
+                    UPDATE automation_executions
+                    SET delivery_result = (
+                        %s::jsonb || COALESCE(
+                            (
+                                SELECT jsonb_agg(elem ORDER BY ord)
+                                FROM jsonb_array_elements(
+                                    CASE
+                                        WHEN delivery_result IS NOT NULL
+                                             AND jsonb_typeof(delivery_result) = 'array'
+                                        THEN delivery_result
+                                        ELSE '[]'::jsonb
+                                    END
+                                ) WITH ORDINALITY AS t(elem, ord)
+                                WHERE jsonb_typeof(elem) = 'object'
+                                  AND elem ->> 'kind' = 'failure_receipt'
+                            ),
+                            '[]'::jsonb
+                        )
+                    )
+                    WHERE automation_execution_id = %s
+                """, (Json(delivery_result), execution_id))
+
+
+# DALTON-HOOK(execution-delivery-status): persist failure notification receipt without overwriting outbox/webhook delivery entries
+async def record_failure_receipt(
+    execution_id: str,
+    receipt: Mapping[str, Any],
+    *,
+    conn=None,
+) -> None:
+    """Upsert only the ``kind = 'failure_receipt'`` entry in ``delivery_result``.
+
+    Any existing non-receipt delivery entries (e.g. written concurrently by the hook
+    outbox or webhook delivery path) are strictly preserved.
+    """
+    async with get_db_connection(conn) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE automation_executions
+                SET delivery_result = (
+                    COALESCE(
+                        (
+                            SELECT jsonb_agg(elem ORDER BY ord)
+                            FROM jsonb_array_elements(
+                                CASE
+                                    WHEN delivery_result IS NOT NULL
+                                         AND jsonb_typeof(delivery_result) = 'array'
+                                    THEN delivery_result
+                                    ELSE '[]'::jsonb
+                                END
+                            ) WITH ORDINALITY AS t(elem, ord)
+                            WHERE NOT (
+                                jsonb_typeof(elem) = 'object'
+                                AND elem ->> 'kind' = 'failure_receipt'
+                            )
+                        ),
+                        '[]'::jsonb
+                    ) || jsonb_build_array(%s::jsonb)
+                )
                 WHERE automation_execution_id = %s
-            """, (Json(delivery_result), execution_id))
+                """,
+                (Json(dict(receipt)), execution_id),
+            )
 
 
 # DALTON-HOOK(execution-delivery-status): clear retrying flag on saved delivery_result without replacing the record

@@ -377,6 +377,29 @@ _ALL_TABLES = [
 ]
 
 
+def _validate_test_db_dsn(dsn: str, *, source: str) -> str:
+    """Validate effective libpq dbname via conninfo_to_dict() before returning any test URI."""
+    from psycopg.conninfo import conninfo_to_dict
+
+    try:
+        conn_params = conninfo_to_dict(dsn)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Refusing to run integration DB tests with invalid DSN from {source}: {exc}"
+        ) from exc
+    if conn_params.get("service"):
+        raise RuntimeError(
+            f"Refusing to run integration DB tests with libpq service={conn_params.get('service')!r} from {source}"
+        )
+    db_name = str(conn_params.get("dbname") or "").strip()
+    if not db_name or not db_name.endswith("_test"):
+        raise RuntimeError(
+            f"Refusing to run integration DB setup against non-test database: {db_name!r} "
+            f"from {source} (must end with '_test')"
+        )
+    return dsn
+
+
 def _build_db_uri() -> str:
     """Build PostgreSQL connection string from explicit env vars.
 
@@ -388,7 +411,7 @@ def _build_db_uri() -> str:
     for dsn_var in ("TEST_DB_DSN", "DALTON_TEST_DB_DSN", "TEST_DATABASE_URL"):
         dsn_val = (os.getenv(dsn_var) or "").strip()
         if dsn_val:
-            return dsn_val
+            return _validate_test_db_dsn(dsn_val, source=dsn_var)
 
     host = (os.getenv("TEST_DB_HOST") or "").strip()
     port = (os.getenv("TEST_DB_PORT") or "").strip()
@@ -414,7 +437,8 @@ def _build_db_uri() -> str:
     # Deliberately not DB_SSLMODE — reading it would let a production-shaped .env
     # dictate test TLS policy, which is what TEST_DB_* exists to prevent.
     sslmode = os.getenv("TEST_DB_SSLMODE", "prefer")
-    return f"postgresql://{user}:{password}@{host}:{port}/{name}?sslmode={sslmode}"
+    uri = f"postgresql://{user}:{password}@{host}:{port}/{name}?sslmode={sslmode}"
+    return _validate_test_db_dsn(uri, source="TEST_DB_NAME")
 
 
 async def _run_alembic_upgrade(db_uri: str) -> None:

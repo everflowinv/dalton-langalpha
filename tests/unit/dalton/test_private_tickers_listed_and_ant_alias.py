@@ -176,30 +176,35 @@ def test_ai_app_weekly_monitor_universe_moves_anthropic_from_private_watchlist_t
 
 
 def test_core_release_packaging_excludes_richard_exclusive_weekly_skill(tmp_path: Path) -> None:
-    """Separation principle: package_release.sh denylist excludes dalton-richard-coverage-weekly
-    and verify_release_tarball.inspect_tarball rejects any core tarball containing it."""
+    """Separation principle: package_release.sh denylist excludes FUND_AUTOMATIONS-bound Everflow
+    skills (dalton-richard-coverage-weekly & dalton-ai-app-weekly-monitor) and verify_release_tarball rejects them."""
     import io
     import tarfile
 
     pkg_sh = (REPO_ROOT / "scripts" / "standalone" / "package_release.sh").read_text(encoding="utf-8")
     assert '"plugins/dalton/skills/dalton-richard-coverage-weekly"' in pkg_sh
+    assert '"plugins/dalton/skills/dalton-ai-app-weekly-monitor"' in pkg_sh
 
     verify_mod = _load_module(
         "verify_release_tarball_sep_check",
         "scripts/standalone/verify_release_tarball.py",
     )
-    tar_path = tmp_path / "bad_core.tar.gz"
-    top = "dalton-core-test"
-    with tarfile.open(tar_path, "w:gz") as tf:
-        d_info = tarfile.TarInfo(name=top)
-        d_info.type = tarfile.DIRTYPE
-        tf.addfile(d_info)
-        f_data = b"# exclusive\n"
-        f_info = tarfile.TarInfo(
-            name=f"{top}/plugins/dalton/skills/dalton-richard-coverage-weekly/scripts/screen_movers.py"
-        )
-        f_info.size = len(f_data)
-        tf.addfile(f_info, io.BytesIO(f_data))
+    for skill_dir, rel_file in (
+        ("dalton-richard-coverage-weekly", "scripts/screen_movers.py"),
+        ("dalton-ai-app-weekly-monitor", "scripts/ai_application_weekly_monitor_cli.py"),
+    ):
+        tar_path = tmp_path / f"bad_core_{skill_dir}.tar.gz"
+        top = "dalton-core-test"
+        with tarfile.open(tar_path, "w:gz") as tf:
+            d_info = tarfile.TarInfo(name=top)
+            d_info.type = tarfile.DIRTYPE
+            tf.addfile(d_info)
+            f_data = b"# exclusive\n"
+            f_info = tarfile.TarInfo(
+                name=f"{top}/plugins/dalton/skills/{skill_dir}/{rel_file}"
+            )
+            f_info.size = len(f_data)
+            tf.addfile(f_info, io.BytesIO(f_data))
 
-    violations = verify_mod.inspect_tarball(tar_path, expected_top_dir=top)
-    assert any("dalton-richard-coverage-weekly" in v for v in violations)
+        violations = verify_mod.inspect_tarball(tar_path, expected_top_dir=top)
+        assert any(skill_dir in v for v in violations), skill_dir

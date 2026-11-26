@@ -509,6 +509,17 @@ export function resolveExecutionDelivery(
   else if (sentCount > 0) status = 'partial_failed';
   else status = 'failed';
 
+  let effectiveFailureNotice: FailureNoticeStatus | null = failureNoticeStatus;
+  if (failureNoticeStatus) {
+    if (status === 'delivered') {
+      effectiveFailureNotice = 'delivered';
+    } else if (status === 'retrying' && failureNoticeStatus !== 'unconfigured' && failureNoticeStatus !== 'suppressed') {
+      effectiveFailureNotice = 'pending';
+    } else if ((status === 'failed' || status === 'partial_failed') && failureNoticeStatus === 'pending') {
+      effectiveFailureNotice = null;
+    }
+  }
+
   return {
     status,
     total_targets: targets.length,
@@ -521,7 +532,7 @@ export function resolveExecutionDelivery(
         ? failureReasons[0]
         : null,
     failure_reasons: status === 'failed' || status === 'partial_failed' ? failureReasons : [],
-    ...(failureNoticeStatus ? { failure_notice_status: failureNoticeStatus } : {}),
+    ...(effectiveFailureNotice ? { failure_notice_status: effectiveFailureNotice } : {}),
     targets,
   };
 }

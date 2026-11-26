@@ -6927,16 +6927,148 @@ _FAILURE_NOTICE_PERMANENT_CODES: frozenset[str] = frozenset(
         "http_410",
         "http_422",
         "invalid_target",
+        "invalid_target_format",
+        "empty_target",
         "not_allowed",
         "target_not_found",
         "unsupported_platform",
+        "unsupported_notify_channel",
         "unsupported_media",
         "empty_content",
+        "feishu_card_required",
         "card_limit_exceeded",
         "invalid_json",
         "invalid_shape",
     }
 )
+
+
+def build_feishu_failure_notice_card(
+    *,
+    auto_name: str,
+    outcome: str,
+    failure_reason: str | None = None,
+    error: str | None = None,
+    thread_id: str | None = None,
+    frontend_base_url: str | None = None,
+    timestamp_str: str | None = None,
+) -> dict[str, Any]:
+    """Build a Feishu Card Schema 2.0 dictionary for an automation failure notice."""
+    ts_label = (timestamp_str or "").strip()
+    if not ts_label:
+        ts_label = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M")
+    reason_text = str(failure_reason or outcome or "failed").strip()
+    clean_name = str(auto_name or "定时任务").strip()
+
+    body_lines = [
+        f"**任务**：{clean_name}",
+        f"**原因**：`{reason_text}`",
+    ]
+    if error and str(error).strip():
+        body_lines.append(f"**详情**：{str(error).strip()[:300]}")
+
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "markdown",
+            "content": "\n".join(body_lines),
+        }
+    ]
+    resolved_base = (
+        get_dalton_frontend_url()
+        if frontend_base_url is None
+        else str(frontend_base_url).strip().rstrip("/")
+    )
+    cleaned_tid = str(thread_id or "").strip()
+    if resolved_base and cleaned_tid:
+        elements.append({"tag": "hr"})
+        elements.append(
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "在 Dalton 中打开"},
+                "type": "primary",
+                "behaviors": [
+                    {
+                        "type": "open_url",
+                        "default_url": f"{resolved_base}/chat/t/{cleaned_tid}",
+                    }
+                ],
+            }
+        )
+
+    return {
+        "schema": "2.0",
+        "header": {
+            "title": {
+                "tag": "plain_text",
+                "content": f"{clean_name} · 执行失败"[:100],
+            },
+            "subtitle": {
+                "tag": "plain_text",
+                "content": f"{ts_label} · {reason_text}"[:100],
+            },
+            "template": "red",
+        },
+        "body": {
+            "elements": elements,
+        },
+    }
+
+
+def _extract_target_dispatch_outcome(
+    target: str,
+    res: Any,
+) -> tuple[bool, str | None, str | None]:
+    """Extract ``(ok, error_code, error_message)`` for one target from bridge/gateway response.
+
+    Preserves per-target bridge reasons (e.g. ``feishu_card_required``, ``unsupported_notify_channel``)
+    instead of downgrading them to a generic ``dispatch_failed``.
+    """
+    if not isinstance(res, Mapping):
+        return False, "invalid_response", "invalid_response"
+
+    cleaned = str(target or "").strip()
+    results = res.get("results")
+    if isinstance(results, list) and results:
+        matched: Mapping[str, Any] | None = None
+        for item in results:
+            if not isinstance(item, Mapping):
+                continue
+            item_t = str(item.get("target") or "").strip()
+            if item_t == cleaned:
+                matched = item
+                break
+        if matched is None and len(results) == 1 and isinstance(results[0], Mapping):
+            matched = results[0]
+        if matched is not None:
+            if matched.get("ok") is True:
+                return True, None, None
+            item_code = str(
+                matched.get("error_code")
+                or matched.get("error")
+                or res.get("error_code")
+                or res.get("error")
+                or "target_failed"
+            ).strip()
+            item_msg = str(
+                matched.get("feishu_msg")
+                or matched.get("error")
+                or matched.get("error_code")
+                or item_code
+            ).strip() or item_code
+            return False, item_code, item_msg
+
+    status_code = res.get("status_code")
+    if isinstance(status_code, int) and status_code >= 400:
+        code = str(res.get("error_code") or f"http_{status_code}").strip()
+        msg = str(res.get("error") or code).strip() or code
+        return False, code, msg
+
+    if res.get("ok") is True:
+        return True, None, None
+
+    code = str(res.get("error_code") or res.get("error") or "dispatch_failed").strip()
+    msg = str(res.get("error") or res.get("error_code") or code).strip() or code
+    return False, code, msg
 
 
 def _is_retryable_failure_notice_error(
@@ -6973,36 +7105,49 @@ async def _enqueue_failure_notice_retries(
     notice_text: str,
     error_code: str,
     run_id: str | None = None,
+    notice_card: dict[str, Any] | None = None,
+    automation_name: str = "",
+    thread_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> bool:
     """Record failed retryable failure-notice attempts in ``dalton_notify_deliveries`` so
-    ``retry_failed_notify_deliveries`` retries them later. Returns True if at least one
-    target was successfully enqueued for retry."""
+    ``retry_failed_notify_deliveries`` retries them later (preserving the Feishu card payload).
+    Returns True if at least one target was successfully enqueued for retry."""
     enqueued = False
     for raw_target in targets:
         cleaned = str(raw_target or "").strip()
         if not cleaned or ":" not in cleaned:
             continue
-        channel = cleaned.split(":", 1)[0].strip().lower()
-        payload = {
+        channel, norm_target = _split_target_channel(cleaned)
+        payload: dict[str, Any] = {
             "source": "automation_failure_notice",
+            "transport": "bridge",
             "text": notice_text,
+            "automation_name": automation_name,
+            "category": "custom",
             "run_id": run_id,
-            "targets": [cleaned],
+            "targets": [norm_target],
         }
+        if notice_card is not None:
+            payload["card"] = notice_card
+        if thread_id and str(thread_id).strip():
+            payload["thread_id"] = str(thread_id).strip()
+        if workspace_id and str(workspace_id).strip():
+            payload["workspace_id"] = str(workspace_id).strip()
         try:
             claimed = await claim_target_delivery(
                 execution_id=execution_id,
                 channel=channel,
-                target=cleaned,
-                automation_id=automation_id,
+                target=norm_target,
+                automation_id=automation_id or None,
                 user_id=user_id,
-                payload_json=payload,
+                payload=payload,
             )
             if claimed:
                 await mark_target_delivery(
                     execution_id,
                     channel,
-                    cleaned,
+                    norm_target,
                     status="failed",
                     error_code=error_code,
                     expected_status="pending",
@@ -7014,7 +7159,7 @@ async def _enqueue_failure_notice_retries(
             logger.debug(
                 "[DALTON_NOTIFY] Failed to enqueue failure-notice retry for execution_id=%s target=%s: %s",
                 execution_id,
-                cleaned,
+                norm_target,
                 type(exc).__name__,
             )
     return enqueued
@@ -7078,17 +7223,18 @@ async def on_automation_failed(
     is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
     post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_bridge_notify,
     record_delivery_fn: Callable[[str, list[dict[str, Any]]], Awaitable[Any]] | None = None,
+    record_failure_receipt_fn: Callable[[str, dict[str, Any]], Awaitable[Any]] | None = None,
     enqueue_retry_fn: Callable[..., Awaitable[bool]] | None = None,
+    frontend_url_fn: Callable[[], str] = get_dalton_frontend_url,
 ) -> dict[str, Any] | None:
     """Record a failure notification receipt distinguishing unconfigured / suppressed / pending / delivered.
 
     When upstream settlement did not already record a webhook/messaging delivery
     result (e.g. quota-exhausted ``429`` runs with no upstream webhook URL, or an
     outbox-queued held run), this evaluates configured Dalton channel targets,
-    attempts failure notice dispatch when configured and allowed, and persists a
-    structured receipt into ``automation_executions.delivery_result`` so execution
-    records show one of:
-    ``unconfigured`` (未配置) / ``suppressed`` (已抑制) / ``pending`` (待发) / ``delivered`` (已送达).
+    dispatches failure notices through the channel-capable path (including Feishu
+    Card 2.0 and gateway transport when enabled), records per-target actual outcomes,
+    and persists receipts separately without overwriting outbox/webhook delivery results.
     """
     from src.dalton.capabilities import CapabilityId, has_capability, is_channel_target_enabled
 
@@ -7102,7 +7248,7 @@ async def on_automation_failed(
             await writer(execution_id, entries)
         except Exception as exc:
             logger.warning(
-                "[DALTON_NOTIFY] Failed persisting failure receipt for execution_id=%s: %s",
+                "[DALTON_NOTIFY] Failed persisting failure delivery entries for execution_id=%s: %s",
                 execution_id,
                 type(exc).__name__,
             )
@@ -7110,7 +7256,29 @@ async def on_automation_failed(
     async def _persist(receipt_entry: dict[str, Any]) -> None:
         if webhook_result is not None:
             return
-        await _persist_entries([receipt_entry])
+        if record_failure_receipt_fn is not None:
+            try:
+                await record_failure_receipt_fn(execution_id, receipt_entry)
+            except Exception as exc:
+                logger.warning(
+                    "[DALTON_NOTIFY] Failed persisting failure receipt for execution_id=%s: %s",
+                    execution_id,
+                    type(exc).__name__,
+                )
+            return
+        if record_delivery_fn is not None:
+            await _persist_entries([receipt_entry])
+            return
+        from src.server.database import automation_executions as exec_db
+
+        try:
+            await exec_db.record_failure_receipt(execution_id, receipt_entry)
+        except Exception as exc:
+            logger.warning(
+                "[DALTON_NOTIFY] Failed persisting failure receipt for execution_id=%s: %s",
+                execution_id,
+                type(exc).__name__,
+            )
 
     try:
         if webhook_result:
@@ -7152,6 +7320,7 @@ async def on_automation_failed(
 
         if (
             record_delivery_fn is None
+            and record_failure_receipt_fn is None
             and post_notify_fn is post_bridge_notify
             and not has_capability(CapabilityId.CHANNEL_GATEWAY)
         ):
@@ -7195,7 +7364,7 @@ async def on_automation_failed(
         clean_stamped_unit_id = str(coverage_unit_id or "").strip()
         clean_stamped_unit_version = _normalize_coverage_unit_version(coverage_unit_version)
 
-        gate_ok, gate_reason, _active_unit_id, gate_include_chats = await resolve_unit_gate_fn(
+        gate_ok, gate_reason, active_unit_id, gate_include_chats = await resolve_unit_gate_fn(
             user_id,
             ws_id_notify,
             automation,
@@ -7279,121 +7448,334 @@ async def on_automation_failed(
             return receipt
 
         auto_name = str(automation.get("name") or automation.get("automation_id") or "定时任务").strip()
+        automation_id_str = str(automation.get("automation_id") or "").strip() or None
         reason_text = failure_reason or outcome
         err_snippet = f"\n详情：{str(error).strip()[:200]}" if error else ""
         notice_text = f"自动化任务「{auto_name}」执行失败（原因：{reason_text}）。{err_snippet}"
+        resolved_frontend_url = frontend_url_fn()
+        notice_card = build_feishu_failure_notice_card(
+            auto_name=auto_name,
+            outcome=outcome,
+            failure_reason=failure_reason,
+            error=error,
+            thread_id=thread_id,
+            frontend_base_url=resolved_frontend_url,
+        )
 
-        any_sent = False
-        dispatch_resp: Mapping[str, Any] | None = None
-        last_dispatch_err: str | None = None
-        last_dispatch_msg: str | None = None
-        try:
-            res = await post_notify_fn(
-                enabled_targets,
-                notice_text,
-                run_id=run_id,
-            )
-            if isinstance(res, Mapping):
-                dispatch_resp = res
-                if res.get("ok") is True:
-                    any_sent = True
-                else:
-                    last_dispatch_err = str(
-                        res.get("error_code") or res.get("error") or "dispatch_failed"
-                    ).strip()
-                    last_dispatch_msg = str(
-                        res.get("error") or res.get("error_code") or ""
-                    ).strip() or None
-        except Exception as send_exc:
-            last_dispatch_err = type(send_exc).__name__
-            last_dispatch_msg = str(send_exc).strip() or type(send_exc).__name__
+        via_gateway = notify_via_gateway_enabled() and _post_notify_is_bridge(post_notify_fn)
+        base_payload_record: dict[str, Any] = {
+            "text": notice_text,
+            "card": notice_card,
+            "automation_name": auto_name,
+            "category": "custom",
+            "source": "automation_failure_notice",
+            "run_id": run_id,
+        }
+        if thread_id and str(thread_id).strip():
+            base_payload_record["thread_id"] = str(thread_id).strip()
+        if ws_id_notify:
+            base_payload_record["workspace_id"] = ws_id_notify
+        eff_unit_id = clean_stamped_unit_id or active_unit_id
+        if eff_unit_id:
+            base_payload_record["coverage_unit_id"] = eff_unit_id
+            base_payload_record["workspace_id"] = ws_id_notify
+            if clean_stamped_unit_version:
+                base_payload_record["coverage_unit_version"] = clean_stamped_unit_version
 
         primary_channel = (
             enabled_targets[0].split(":", 1)[0].lower()
             if ":" in enabled_targets[0]
             else "failure_notification"
         )
-        if any_sent:
+
+        sent_entries: list[dict[str, Any]] = []
+        retrying_targets: list[str] = []
+        retrying_reasons: list[str] = []
+        unconfigured_reasons: list[tuple[str, str | None]] = []
+        suppressed_reasons: list[str] = []
+        failed_entries: list[dict[str, Any]] = []
+
+        for raw_tgt in enabled_targets:
+            ch, cleaned_tgt = _split_target_channel(raw_tgt)
+            target_via_gateway = cleaned_tgt.startswith("weixin:") or via_gateway
+
+            dispatch_resp: Mapping[str, Any] | None = None
+            target_ok = False
+            target_err_code: str | None = None
+            target_err_msg: str | None = None
+            target_skipped_code: str | None = None
+            target_uncertain_code: str | None = None
+
+            if target_via_gateway:
+                target_payload = {**base_payload_record, "transport": "gateway"}
+                try:
+                    claim_res = await claim_target_delivery_with_attempt(
+                        execution_id,
+                        ch,
+                        cleaned_tgt,
+                        user_id=user_id,
+                        automation_id=automation_id_str,
+                        payload=target_payload,
+                    )
+                    if not claim_res[0]:
+                        suppressed_reasons.append("duplicate_claim")
+                        continue
+                    if not claim_res.delivery_id:
+                        await mark_target_delivery(
+                            execution_id,
+                            ch,
+                            cleaned_tgt,
+                            status="failed",
+                            error_code="missing_delivery_id",
+                            expected_status="pending",
+                        )
+                        target_err_code = "missing_delivery_id"
+                        target_err_msg = "missing_delivery_id"
+                    else:
+                        res = await post_automation_gateway_notify(
+                            str(claim_res.delivery_id),
+                            target=cleaned_tgt,
+                        )
+                        if isinstance(res, Mapping):
+                            dispatch_resp = res
+                        target_skipped_code = _notify_result_skip_code(cleaned_tgt, res)
+                        if target_skipped_code is not None:
+                            await mark_target_delivery(
+                                execution_id,
+                                ch,
+                                cleaned_tgt,
+                                status="skipped",
+                                reason=target_skipped_code,
+                                error_code=target_skipped_code,
+                                expected_status="pending",
+                            )
+                        else:
+                            target_uncertain_code = extract_target_uncertain_code(cleaned_tgt, res)
+                            if target_uncertain_code is not None:
+                                await _shielded_mark_uncertain(
+                                    mark_target_delivery,
+                                    execution_id,
+                                    ch,
+                                    cleaned_tgt,
+                                    error_code=target_uncertain_code,
+                                    expected_status="pending",
+                                )
+                            else:
+                                target_ok, target_err_code, target_err_msg = (
+                                    _extract_target_dispatch_outcome(cleaned_tgt, res)
+                                )
+                                await mark_target_delivery(
+                                    execution_id,
+                                    ch,
+                                    cleaned_tgt,
+                                    status="sent" if target_ok else "failed",
+                                    error_code=None if target_ok else (target_err_code or "target_failed"),
+                                    expected_status="pending",
+                                )
+                except asyncio.CancelledError:
+                    await _shielded_mark_uncertain(
+                        mark_target_delivery,
+                        execution_id,
+                        ch,
+                        cleaned_tgt,
+                        error_code="delivery_uncertain",
+                        expected_status="pending",
+                    )
+                    raise
+                except Exception as send_exc:
+                    status_code = getattr(getattr(send_exc, "response", None), "status_code", None)
+                    target_err_code = (
+                        f"http_{status_code}" if status_code else type(send_exc).__name__
+                    )
+                    target_err_msg = str(send_exc).strip() or target_err_code
+                    try:
+                        await mark_target_delivery(
+                            execution_id,
+                            ch,
+                            cleaned_tgt,
+                            status="failed",
+                            error_code=target_err_code,
+                            expected_status="pending",
+                        )
+                    except Exception:
+                        pass
+            else:
+                try:
+                    res = await _invoke_post_notify(
+                        post_notify_fn,
+                        [cleaned_tgt],
+                        notice_text,
+                        notice_card,
+                        run_id=run_id,
+                    )
+                    if isinstance(res, Mapping):
+                        dispatch_resp = res
+                    target_ok, target_err_code, target_err_msg = _extract_target_dispatch_outcome(
+                        cleaned_tgt, res
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as send_exc:
+                    status_code = getattr(getattr(send_exc, "response", None), "status_code", None)
+                    target_err_code = (
+                        f"http_{status_code}" if status_code else type(send_exc).__name__
+                    )
+                    target_err_msg = str(send_exc).strip() or target_err_code
+
+            if target_skipped_code is not None:
+                suppressed_reasons.append(target_skipped_code)
+                continue
+
+            if target_uncertain_code is not None:
+                retrying_targets.append(cleaned_tgt)
+                retrying_reasons.append(target_uncertain_code)
+                continue
+
+            if target_ok:
+                sent_entries.append(
+                    {
+                        "method": ch or primary_channel,
+                        "address": cleaned_tgt,
+                        "success": True,
+                    }
+                )
+                continue
+
+            norm_err_code = str(target_err_code or "").strip().lower()
+            if norm_err_code in _FAILURE_NOTICE_UNCONFIGURED_CODES:
+                unconfigured_reasons.append((norm_err_code, target_err_msg))
+                continue
+
+            retry_enqueued = False
+            if _is_retryable_failure_notice_error(target_err_code, dispatch_resp):
+                if target_via_gateway or (
+                    isinstance(dispatch_resp, Mapping)
+                    and (dispatch_resp.get("queued") is True or dispatch_resp.get("retrying") is True)
+                ):
+                    retry_enqueued = True
+                else:
+                    enqueuer = enqueue_retry_fn or _enqueue_failure_notice_retries
+                    enqueue_kwargs: dict[str, Any] = {
+                        "execution_id": execution_id,
+                        "automation_id": automation_id_str or "",
+                        "user_id": user_id,
+                        "targets": [cleaned_tgt],
+                        "notice_text": notice_text,
+                        "error_code": target_err_code or "dispatch_pending",
+                        "run_id": run_id,
+                    }
+                    if _callable_accepts_kwarg(enqueuer, "notice_card"):
+                        enqueue_kwargs["notice_card"] = notice_card
+                    if _callable_accepts_kwarg(enqueuer, "automation_name"):
+                        enqueue_kwargs["automation_name"] = auto_name
+                    if _callable_accepts_kwarg(enqueuer, "thread_id"):
+                        enqueue_kwargs["thread_id"] = thread_id
+                    if _callable_accepts_kwarg(enqueuer, "workspace_id"):
+                        enqueue_kwargs["workspace_id"] = ws_id_notify or None
+                    retry_enqueued = bool(await enqueuer(**enqueue_kwargs))
+
+            if retry_enqueued:
+                retrying_targets.append(cleaned_tgt)
+                retrying_reasons.append(target_err_code or "channel_dispatch_pending")
+                continue
+
+            failed_entries.append(
+                {
+                    "method": ch or primary_channel,
+                    "address": cleaned_tgt,
+                    "success": False,
+                    "retrying": False,
+                    "error_code": target_err_code or "target_failed",
+                    "error": (target_err_msg or target_err_code or "failure notice failed")[:300],
+                }
+            )
+
+        if (
+            not sent_entries
+            and not retrying_targets
+            and not failed_entries
+            and unconfigured_reasons
+        ):
+            reason_code, reason_msg = unconfigured_reasons[0]
+            receipt = build_failure_notification_receipt(
+                receipt_status="unconfigured",
+                outcome=outcome,
+                failure_reason=failure_reason,
+                reason=reason_code,
+                error=reason_msg or error,
+                targets=enabled_targets,
+                channel=primary_channel,
+            )
+            await _persist(receipt)
+            return receipt
+
+        if (
+            not sent_entries
+            and not retrying_targets
+            and not failed_entries
+            and suppressed_reasons
+        ):
+            receipt = build_failure_notification_receipt(
+                receipt_status="suppressed",
+                outcome=outcome,
+                failure_reason=failure_reason,
+                reason=suppressed_reasons[0],
+                error=error,
+                targets=enabled_targets,
+                channel=primary_channel,
+            )
+            await _persist(receipt)
+            return receipt
+
+        if sent_entries and not retrying_targets and not failed_entries:
             receipt = build_failure_notification_receipt(
                 receipt_status="delivered",
                 outcome=outcome,
                 failure_reason=failure_reason,
                 reason="channel_delivered",
                 error=error,
-                targets=enabled_targets,
+                targets=[str(e["address"]) for e in sent_entries],
                 channel=primary_channel,
             )
             await _persist(receipt)
             return receipt
 
-        norm_err_code = str(last_dispatch_err or "").strip().lower()
-        if norm_err_code in _FAILURE_NOTICE_UNCONFIGURED_CODES:
-            receipt = build_failure_notification_receipt(
-                receipt_status="unconfigured",
-                outcome=outcome,
-                failure_reason=failure_reason,
-                reason=norm_err_code,
-                error=last_dispatch_msg or error,
-                targets=enabled_targets,
-                channel=primary_channel,
-            )
-            await _persist(receipt)
-            return receipt
-
-        retry_enqueued = False
-        if _is_retryable_failure_notice_error(last_dispatch_err, dispatch_resp):
-            if isinstance(dispatch_resp, Mapping) and (
-                dispatch_resp.get("queued") is True or dispatch_resp.get("retrying") is True
-            ):
-                retry_enqueued = True
-            else:
-                enqueuer = enqueue_retry_fn or _enqueue_failure_notice_retries
-                retry_enqueued = bool(
-                    await enqueuer(
-                        execution_id=execution_id,
-                        automation_id=str(automation.get("automation_id") or ""),
-                        user_id=user_id,
-                        targets=enabled_targets,
-                        notice_text=notice_text,
-                        error_code=last_dispatch_err or "dispatch_pending",
-                        run_id=run_id,
-                    )
-                )
-
-        if retry_enqueued:
+        if retrying_targets and not failed_entries:
             receipt = build_failure_notification_receipt(
                 receipt_status="pending",
                 outcome=outcome,
                 failure_reason=failure_reason,
-                reason=last_dispatch_err or "channel_dispatch_pending",
+                reason=retrying_reasons[0] if retrying_reasons else "channel_dispatch_pending",
                 error=error,
-                targets=enabled_targets,
+                targets=list(retrying_targets),
                 channel=primary_channel,
             )
             await _persist(receipt)
             return receipt
 
-        # Permanent failure (e.g. http_400/401/403/404) or retry enqueue unavailable:
-        # record terminal failed delivery entries instead of leaving a perpetual 'pending' receipt.
-        failed_entries = [
-            {
-                "method": (t.split(":", 1)[0].lower() if ":" in t else primary_channel),
-                "address": t,
-                "success": False,
-                "retrying": False,
-                "error_code": last_dispatch_err or "target_failed",
-                "error": (last_dispatch_msg or last_dispatch_err or "failure notice failed")[:300],
-            }
-            for t in enabled_targets
-        ]
-        if webhook_result is None:
-            await _persist_entries(failed_entries)
+        # Record per-target actual outcomes (terminal failures and any succeeded targets).
+        combined_entries = [*sent_entries, *failed_entries]
+        if webhook_result is None and combined_entries:
+            await _persist_entries(combined_entries)
+        if retrying_targets:
+            receipt = build_failure_notification_receipt(
+                receipt_status="pending",
+                outcome=outcome,
+                failure_reason=failure_reason,
+                reason=retrying_reasons[0] if retrying_reasons else "channel_dispatch_pending",
+                error=error,
+                targets=list(retrying_targets),
+                channel=primary_channel,
+            )
+            await _persist(receipt)
+        first_fail = failed_entries[0] if failed_entries else {}
         return {
             "kind": "failure_dispatch_failed",
-            "status": "failed",
-            "error_code": last_dispatch_err or "target_failed",
-            "error": last_dispatch_msg or last_dispatch_err,
+            "status": "partial_failed" if sent_entries else "failed",
+            "error_code": first_fail.get("error_code") or "target_failed",
+            "error": first_fail.get("error") or first_fail.get("error_code"),
             "targets": list(enabled_targets),
+            "results": combined_entries,
         }
     except asyncio.CancelledError:
         raise

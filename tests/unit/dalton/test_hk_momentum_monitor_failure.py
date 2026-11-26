@@ -311,3 +311,26 @@ def test_hk_momentum_month_end_compute_failure_carries_current_run_diagnostics_a
     assert saved_meta["last_date"] == "2026-03-31"
     assert saved_meta["index_dates"]["smallcap"] == "2026-04-29"
     assert saved_meta["index_dates"]["nonggt"] == "2026-04-30"
+
+
+def test_hk_failure_summary_and_db_clip_preserve_index_dates_under_1000_chars() -> None:
+    """r4 Med #5: even when the raw error body exceeds 1000 chars, both _format_hk_failure_summary
+    and record_monitor_publish_failure's _clip_publish_error preserve trailing `| 数据日期: ...`."""
+    from scripts.dalton.monitor_feeds.hk_momentum import run as hk_run
+    from src.dalton.monitors import db as monitor_db
+
+    huge_reason = "采集异常: " + ("x" * 1500)
+    dates = {"smallcap": "2026-04-29", "nonggt": "2026-04-30", "hsi": "2026-04-30"}
+    formatted = hk_run._format_hk_failure_summary(
+        stale_reason=huge_reason,
+        index_dates=dates,
+    )
+    assert formatted is not None
+    assert len(formatted) <= 1000
+    assert "| 数据日期: smallcap=2026-04-29, nonggt=2026-04-30, hsi=2026-04-30" in formatted
+
+    # Also test DB-layer defense-in-depth clipping on an unclipped >1000-char error with date suffix
+    raw_overlong = ("E" * 1300) + " | 数据日期: smallcap=2026-04-29, nonggt=2026-04-30"
+    clipped = monitor_db._clip_publish_error(raw_overlong, limit=1000)
+    assert len(clipped) <= 1000
+    assert clipped.endswith(" | 数据日期: smallcap=2026-04-29, nonggt=2026-04-30")

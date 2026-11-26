@@ -685,6 +685,15 @@ def next_session_open(market: MarketKind, now: datetime | None = None) -> dateti
 # ---------------------------------------------------------------------------
 
 
+class MonitorPushHttpError(RuntimeError):
+    """HTTP error returned by ``PUT /api/v1/dalton/monitors/internal/{slug}/data/{key}``."""
+
+    def __init__(self, status_code: int, message: str, *, detail: str = "") -> None:
+        super().__init__(message)
+        self.status_code = int(status_code)
+        self.detail = detail
+
+
 def push_monitor_data(
     slug: str,
     data_key: str,
@@ -717,7 +726,11 @@ def push_monitor_data(
             detail = resp.text[:300]
         except Exception:
             pass
-        raise RuntimeError(f"写入 {slug}/{data_key} 失败 (HTTP {resp.status_code}): {detail}")
+        raise MonitorPushHttpError(
+            resp.status_code,
+            f"写入 {slug}/{data_key} 失败 (HTTP {resp.status_code}): {detail}",
+            detail=detail,
+        )
     return resp.json() if resp.content else {"ok": True}
 
 

@@ -248,8 +248,13 @@ def _format_hk_failure_summary(
     index_dates: dict[str, Any] | None,
     missing_held_by_index: dict[str, Any] | None = None,
     sources: dict[str, Any] | None = None,
+    max_chars: int = 900,
 ) -> str | None:
-    """Format a concise human-readable failure summary with missing constituents & per-index dates."""
+    """Format a concise human-readable failure summary with missing constituents & per-index dates.
+
+    Caps the error body before appending ``| 数据日期: ...`` so the 1000-char DB column
+    cap in ``record_monitor_publish_failure`` never truncates the date suffix.
+    """
     reason_parts: list[str] = []
     if stale_reason and str(stale_reason).strip():
         reason_parts.append(str(stale_reason).strip())
@@ -277,7 +282,13 @@ def _format_hk_failure_summary(
         return None
     headline = "；".join(reason_parts) if reason_parts else "港股动量日度更新失败"
     if date_parts:
-        return f"{headline} | 数据日期: {', '.join(date_parts)}"
+        date_suffix = f" | 数据日期: {', '.join(date_parts)}"
+        body_budget = max(80, int(max_chars) - len(date_suffix))
+        if len(headline) > body_budget:
+            headline = headline[: body_budget - 1].rstrip() + "…"
+        return f"{headline}{date_suffix}"
+    if len(headline) > max_chars:
+        return headline[: max_chars - 1].rstrip() + "…"
     return headline
 
 

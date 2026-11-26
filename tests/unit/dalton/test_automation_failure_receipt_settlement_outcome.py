@@ -413,12 +413,14 @@ async def test_failure_receipt_permanent_http_400_records_terminal_failure_not_p
 async def test_failure_receipt_default_writer_persists_via_automation_executions_module(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Production default writer (record_delivery_fn=None) must use src.server.database.automation_executions.record_delivery."""
+    """Production default writer persists receipts via exec_db.record_failure_receipt (never overwriting delivery_result)."""
     from src.dalton import capabilities as cap_mod
 
     monkeypatch.setattr(cap_mod, "has_capability", create_autospec(cap_mod.has_capability, return_value=True))
-    record_spy = create_autospec(exec_db.record_delivery, return_value=None)
-    monkeypatch.setattr(exec_db, "record_delivery", record_spy)
+    receipt_spy = create_autospec(exec_db.record_failure_receipt, return_value=None)
+    delivery_spy = create_autospec(exec_db.record_delivery, return_value=None)
+    monkeypatch.setattr(exec_db, "record_failure_receipt", receipt_spy)
+    monkeypatch.setattr(exec_db, "record_delivery", delivery_spy)
 
     receipt = await notify_dispatch.on_automation_failed(
         automation={"automation_id": "auto-prod-writer", "user_id": "u-1", "name": "Prod Writer"},
@@ -432,9 +434,10 @@ async def test_failure_receipt_default_writer_persists_via_automation_executions
 
     assert receipt is not None
     assert receipt["receipt_status"] == "suppressed"
-    record_spy.assert_awaited_once()
-    assert record_spy.await_args.args[0] == "exec-prod-writer"
-    assert record_spy.await_args.args[1][0]["receipt_status"] == "suppressed"
+    receipt_spy.assert_awaited_once()
+    delivery_spy.assert_not_awaited()
+    assert receipt_spy.await_args.args[0] == "exec-prod-writer"
+    assert receipt_spy.await_args.args[1]["receipt_status"] == "suppressed"
 
 
 @pytest.mark.asyncio
@@ -442,10 +445,12 @@ async def test_failure_receipt_outbox_held_pending_persists_and_updates_when_del
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When settlement leaves a failed run to the hook outbox (held_pending=True),
-    on_automation_failed persists a 'pending' receipt; once outbox finishes with success,
-    the read path reflects 'delivered'."""
-    record_spy = create_autospec(exec_db.record_delivery, return_value=None)
-    monkeypatch.setattr(exec_db, "record_delivery", record_spy)
+    on_automation_failed persists a 'pending' receipt separately via record_failure_receipt;
+    even if outbox already wrote success before the receipt write, the combined rows converge to 'delivered'."""
+    receipt_spy = create_autospec(exec_db.record_failure_receipt, return_value=None)
+    delivery_spy = create_autospec(exec_db.record_delivery, return_value=None)
+    monkeypatch.setattr(exec_db, "record_failure_receipt", receipt_spy)
+    monkeypatch.setattr(exec_db, "record_delivery", delivery_spy)
 
     receipt = await notify_dispatch.on_automation_failed(
         automation={"automation_id": "auto-outbox", "user_id": "u-1", "name": "Outbox Fail"},
@@ -460,18 +465,20 @@ async def test_failure_receipt_outbox_held_pending_persists_and_updates_when_del
     assert receipt is not None
     assert receipt["receipt_status"] == "pending"
     assert receipt["reason"] == "outbox_queued"
-    record_spy.assert_awaited_once()
+    receipt_spy.assert_awaited_once()
+    delivery_spy.assert_not_awaited()
+    saved_receipt = receipt_spy.await_args.args[1]
     pending_summary = summarize_execution_delivery(
-        delivery_result=record_spy.await_args.args[1],
+        delivery_result=[saved_receipt],
         execution_status="failed",
     )
     assert pending_summary is not None
     assert pending_summary["status"] == "retrying"
     assert pending_summary["failure_notice_status"] == "pending"
 
-    # Simulate _finish_held_run overwriting delivery_result once the message lands.
+    # Simulate outbox having written success alongside the separately persisted pending receipt.
     settled_summary = summarize_execution_delivery(
-        delivery_result=[{"method": "slack:T/C", "success": True}],
+        delivery_result=[{"method": "slack:T/C", "success": True}, saved_receipt],
         execution_status="failed",
     )
     assert settled_summary is not None
@@ -663,3 +670,358 @@ async def test_automation_list_and_execution_endpoints_return_200_for_quota_429_
     bad_exec = AutomationExecutionResponse.model_validate(exec_row)
     eds_mod._set_delivery_summary(bad_exec, {"status": "totally_unknown_status"})
     assert bad_exec.delivery_summary is None
+
+
+@pytest.mark.asyncio
+async def test_failure_notice_sends_feishu_card_and_preserves_per_target_bridge_errors() -> None:
+    """r4 High #1: quota-429 with Feishu-only target sends a Feishu Card 2.0 payload, and
+    preserves per-target bridge errors (e.g. feishu_card_required) without downgrading to dispatch_failed."""
+    sent_calls: list[dict] = []
+
+    async def _fake_bridge(
+        targets: list[str],
+        text: str,
+        card: dict | None = None,
+        *,
+        images: list[dict] | None = None,
+        run_id: str | None = None,
+    ) -> dict:
+        sent_calls.append({"targets": list(targets), "text": text, "card": card, "run_id": run_id})
+        if card and card.get("schema") == "2.0":
+            return {"ok": True, "results": [{"target": targets[0], "channel": "feishu", "ok": True}]}
+        return {
+            "ok": False,
+            "results": [
+                {"target": targets[0], "channel": "feishu", "ok": False, "error": "feishu_card_required"}
+            ],
+        }
+
+    recorded: list[tuple[str, list[dict]]] = []
+
+    async def _record(execution_id: str, entries: list[dict]) -> None:
+        recorded.append((execution_id, entries))
+
+    resolve_enabled = create_autospec(notify_dispatch.resolve_dalton_notify_enabled, return_value=True)
+    resolve_overrides = create_autospec(notify_dispatch.resolve_dalton_notify_overrides, return_value={})
+    resolve_targets = create_autospec(
+        notify_dispatch.resolve_dalton_notify_targets, return_value=["feishu:ou_feishu_only"]
+    )
+    resolve_routes = create_autospec(notify_dispatch.resolve_dalton_notify_routes, return_value={})
+    gate_spy = create_autospec(
+        notify_dispatch._resolve_unit_managed_notify_gate,
+        return_value=(True, None, None, False),
+    )
+
+    # 1. Production bridge path: Feishu Card 2.0 is built & passed, so Feishu target succeeds!
+    receipt = await notify_dispatch.on_automation_failed(
+        automation={
+            "automation_id": "auto-feishu-429",
+            "user_id": "u-1",
+            "name": "dalton-feishu-move-up",
+            "trigger_type": "price",
+        },
+        execution_id="exec-feishu-card-ok",
+        outcome=Outcome.LIMITED.value,
+        failure_reason="usage_limit",
+        error="HTTP 429 quota exceeded",
+        thread_id="thread-abc",
+        run_id="run-123",
+        resolve_enabled_fn=resolve_enabled,
+        resolve_overrides_fn=resolve_overrides,
+        resolve_targets_fn=resolve_targets,
+        resolve_routes_fn=resolve_routes,
+        resolve_unit_gate_fn=gate_spy,
+        post_notify_fn=_fake_bridge,
+        record_delivery_fn=_record,
+        frontend_url_fn=lambda: "https://dalton.example.com",
+    )
+
+    assert receipt is not None
+    assert receipt["receipt_status"] == "delivered"
+    assert len(sent_calls) == 1
+    assert sent_calls[0]["targets"] == ["feishu:ou_feishu_only"]
+    assert isinstance(sent_calls[0]["card"], dict)
+    assert sent_calls[0]["card"]["schema"] == "2.0"
+    assert sent_calls[0]["card"]["header"]["template"] == "red"
+    assert sent_calls[0]["run_id"] == "run-123"
+
+    # 2. If bridge still returns HTTP 200 with per-target feishu_card_required, preserve exact reason!
+    recorded.clear()
+
+    async def _bridge_card_required(
+        targets: list[str],
+        text: str,
+        card: dict | None = None,
+        *,
+        run_id: str | None = None,
+    ) -> dict:
+        return {
+            "ok": False,
+            "results": [
+                {
+                    "target": targets[0],
+                    "channel": "feishu",
+                    "ok": False,
+                    "error": "feishu_card_required",
+                }
+            ],
+        }
+
+    enqueue_spy = create_autospec(notify_dispatch._enqueue_failure_notice_retries, return_value=True)
+    fail_res = await notify_dispatch.on_automation_failed(
+        automation={
+            "automation_id": "auto-feishu-429",
+            "user_id": "u-1",
+            "name": "dalton-feishu-move-up",
+            "trigger_type": "price",
+        },
+        execution_id="exec-feishu-card-req",
+        outcome=Outcome.LIMITED.value,
+        failure_reason="usage_limit",
+        error="HTTP 429 quota exceeded",
+        resolve_enabled_fn=resolve_enabled,
+        resolve_overrides_fn=resolve_overrides,
+        resolve_targets_fn=resolve_targets,
+        resolve_routes_fn=resolve_routes,
+        resolve_unit_gate_fn=gate_spy,
+        post_notify_fn=_bridge_card_required,
+        record_delivery_fn=_record,
+        enqueue_retry_fn=enqueue_spy,
+    )
+
+    assert fail_res is not None
+    assert fail_res["status"] == "failed"
+    assert fail_res["error_code"] == "feishu_card_required"
+    enqueue_spy.assert_not_awaited()
+    assert len(recorded) == 1
+    saved_entry = recorded[0][1][0]
+    assert saved_entry["address"] == "feishu:ou_feishu_only"
+    assert saved_entry["error_code"] == "feishu_card_required"
+    assert saved_entry["error"] == "feishu_card_required"
+    summary = summarize_execution_delivery(delivery_result=recorded[0][1], execution_status="failed")
+    assert summary is not None
+    assert summary["status"] == "failed"
+    assert summary["failure_code"] == "feishu_card_required"
+    assert summary.get("failure_notice_status") is None
+
+
+@pytest.mark.asyncio
+async def test_failure_notice_enqueue_retry_passes_card_via_payload_kwarg(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_enqueue_failure_notice_retries must pass `payload=` (including card) to claim_target_delivery."""
+    claim_spy = create_autospec(notify_dispatch.claim_target_delivery, return_value=True)
+    mark_spy = create_autospec(notify_dispatch.mark_target_delivery, return_value=True)
+    monkeypatch.setattr(notify_dispatch, "claim_target_delivery", claim_spy)
+    monkeypatch.setattr(notify_dispatch, "mark_target_delivery", mark_spy)
+
+    card = notify_dispatch.build_feishu_failure_notice_card(
+        auto_name="Daily Alert",
+        outcome="limited",
+        failure_reason="usage_limit",
+        error="HTTP 429",
+    )
+    enqueued = await notify_dispatch._enqueue_failure_notice_retries(
+        execution_id="exec-retry-card",
+        automation_id="auto-1",
+        user_id="u-1",
+        targets=["feishu:ou_retry_1"],
+        notice_text="failed text",
+        error_code="http_503",
+        run_id="run-1",
+        notice_card=card,
+        automation_name="Daily Alert",
+    )
+
+    assert enqueued is True
+    claim_spy.assert_awaited_once()
+    kwargs = claim_spy.await_args.kwargs
+    assert "payload" in kwargs
+    assert kwargs["payload"]["card"] == card
+    assert kwargs["payload"]["source"] == "automation_failure_notice"
+    mark_spy.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_after_settling_held_pending_persists_receipt_before_nudging_drainer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 High #2: _after_settling must write the held_pending receipt before calling _nudge_drainer."""
+    from src.dalton.database import automation_recycle
+    from src.server.services import automation_delivery
+
+    events: list[str] = []
+
+    monkeypatch.setattr(
+        automation_recycle,
+        "automation_is_soft_deleted",
+        create_autospec(automation_recycle.automation_is_soft_deleted, return_value=False),
+    )
+    monkeypatch.setattr(
+        settlement_mod,
+        "_nudge_drainer",
+        lambda: events.append("nudge_drainer"),
+    )
+
+    async def _fake_on_failed(**kwargs):
+        assert kwargs.get("held_pending") is True
+        events.append("on_automation_failed")
+        return {"receipt_status": "pending"}
+
+    monkeypatch.setattr(notify_dispatch, "on_automation_failed", _fake_on_failed)
+    monkeypatch.setattr(settlement_mod, "safe_add", create_autospec(settlement_mod.safe_add))
+
+    delivery = SimpleNamespace(id="del-1", targets=["slack:T/C"], held=True)
+    await settlement_mod._after_settling(
+        outcome=Outcome.FAILED,
+        automation={"automation_id": "auto-race-1", "user_id": "u-1", "trigger_type": "cron"},
+        execution_id="exec-race-1",
+        row={"settled_from": "running", "previous_failure_reason": None},
+        thread_id="t-1",
+        run_id="r-1",
+        workspace_id="ws-1",
+        error="boom",
+        delivery=delivery,
+        final_text=None,
+        finish_left=True,
+    )
+
+    assert events == ["on_automation_failed", "nudge_drainer"]
+
+
+@pytest.mark.asyncio
+async def test_record_failure_receipt_and_record_delivery_sql_preserve_each_other(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 High #2: record_failure_receipt and record_delivery issue non-clobbering JSONB lane updates."""
+    executed_sql: list[tuple[str, tuple]] = []
+
+    class _FakeCursor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, sql: str, params: tuple) -> None:
+            executed_sql.append((sql, params))
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+    class _FakeCtx:
+        async def __aenter__(self):
+            return _FakeConn()
+
+        async def __aexit__(self, *args):
+            return False
+
+    monkeypatch.setattr(exec_db, "get_db_connection", lambda conn=None: _FakeCtx())
+
+    receipt = notify_dispatch.build_failure_notification_receipt(
+        receipt_status="pending",
+        outcome="failed",
+        reason="outbox_queued",
+    )
+    await exec_db.record_failure_receipt("exec-sep-1", receipt)
+    await exec_db.record_delivery("exec-sep-1", [{"method": "slack:T/C", "success": True}])
+
+    assert len(executed_sql) == 2
+    receipt_sql = executed_sql[0][0]
+    delivery_sql = executed_sql[1][0]
+    # record_failure_receipt filters OUT old failure_receipt entries while preserving non-receipt delivery rows
+    assert "WHERE NOT" in receipt_sql and "failure_receipt" in receipt_sql
+    # record_delivery preserves existing failure_receipt entries while replacing non-receipt delivery rows
+    assert "WHERE jsonb_typeof(elem) = 'object'" in delivery_sql and "failure_receipt" in delivery_sql
+
+
+def test_failure_receipt_converges_away_from_pending_when_retries_exhaust_or_skip() -> None:
+    """r4 High #2: once outbox or channel retries exhaust (or skip), summary must NOT remain 'pending' (待发)."""
+    pending_receipt = notify_dispatch.build_failure_notification_receipt(
+        receipt_status="pending",
+        outcome="limited",
+        failure_reason="usage_limit",
+        reason="http_503",
+        targets=["feishu:ou_1"],
+        channel="feishu",
+    )
+
+    # 1. Channel retry exhausted in dalton_notify_deliveries
+    ch_exhausted = summarize_execution_delivery(
+        notify_rows=[
+            {
+                "channel": "feishu",
+                "target": "feishu:ou_1",
+                "status": "failed",
+                "attempt_count": 3,
+                "error_code": "http_503",
+            }
+        ],
+        delivery_result=[pending_receipt],
+        execution_status="failed",
+        max_attempts=3,
+    )
+    assert ch_exhausted is not None
+    assert ch_exhausted["status"] == "failed"
+    assert ch_exhausted.get("failure_notice_status") is None
+    assert ch_exhausted.get("failure_notification_receipt") is None
+    ExecutionDeliverySummary.model_validate(ch_exhausted)
+
+    # 2. Outbox retry exhausted (retrying=False on delivery entry alongside pending receipt)
+    outbox_exhausted = summarize_execution_delivery(
+        delivery_result=[
+            {
+                "method": "slack:T/C",
+                "success": False,
+                "retrying": False,
+                "error": "unconfirmed: gateway timeout",
+            },
+            pending_receipt,
+        ],
+        execution_status="failed",
+    )
+    assert outbox_exhausted is not None
+    assert outbox_exhausted["status"] == "failed"
+    assert outbox_exhausted.get("failure_notice_status") is None
+    ExecutionDeliverySummary.model_validate(outbox_exhausted)
+
+    # 3. Channel retry skipped due to toggle_off -> converges from pending to suppressed
+    ch_suppressed = summarize_execution_delivery(
+        notify_rows=[
+            {
+                "channel": "feishu",
+                "target": "feishu:ou_1",
+                "status": "skipped",
+                "attempt_count": 1,
+                "error_code": "toggle_off",
+            }
+        ],
+        delivery_result=[pending_receipt],
+        execution_status="failed",
+    )
+    assert ch_suppressed is not None
+    assert ch_suppressed["status"] == "skipped"
+    assert ch_suppressed["failure_notice_status"] == "suppressed"
+    assert ch_suppressed["failure_notice_label_zh"] == "已抑制"
+    ExecutionDeliverySummary.model_validate(ch_suppressed)
+
+    # 4. Channel retry skipped due to target_removed -> converges from pending to unconfigured
+    ch_unconf = summarize_execution_delivery(
+        notify_rows=[
+            {
+                "channel": "feishu",
+                "target": "feishu:ou_1",
+                "status": "skipped",
+                "attempt_count": 1,
+                "error_code": "target_removed",
+            }
+        ],
+        delivery_result=[pending_receipt],
+        execution_status="failed",
+    )
+    assert ch_unconf is not None
+    assert ch_unconf["status"] == "skipped"
+    assert ch_unconf["failure_notice_status"] == "unconfigured"
+    assert ch_unconf["failure_notice_label_zh"] == "未配置"
+    ExecutionDeliverySummary.model_validate(ch_unconf)

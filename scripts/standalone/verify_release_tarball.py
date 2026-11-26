@@ -36,6 +36,7 @@ FORBIDDEN_PAX_KEYS: frozenset[str] = frozenset(
 FORBIDDEN_RELEASE_SUBPATHS: tuple[tuple[str, ...], ...] = (
     ("plugins", "dalton_data"),
     ("plugins", "dalton", "skills", "dalton-richard-coverage-weekly"),
+    ("plugins", "dalton", "skills", "dalton-ai-app-weekly-monitor"),
     ("scripts", "dalton", "researchdata_bridge.py"),
     ("scripts", "dalton", "research_runtime"),
     ("scripts", "dalton", "ops"),

@@ -658,3 +658,251 @@ async def test_claim_next_queued_run_rejects_expired_takeover_retry(
     assert publish_spy.await_args.kwargs["run_id"] == "run-expired-retry-1"
     assert "takeover_retry_expired" in str(publish_spy.await_args.kwargs["failure_reason"])
 
+
+@pytest.mark.asyncio
+async def test_takeover_enqueue_uses_db_clock_when_now_utc_is_none_and_handles_lock_wait_expiry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Med #2: in production (now_utc=None), takeover retry INSERT must enforce `NOW() < %(deadline_utc)s`
+    in SQL; if waiting on a lock crosses the deadline (0 rows inserted and no blocking queued run),
+    it reports slot expired instead of retry_exhausted."""
+    path_map = build_path_map(host_var_dir=tmp_path / "h", backend_var_dir=tmp_path / "b")
+    slot_utc = datetime.now(timezone.utc) - timedelta(minutes=5)
+    deadline_utc = datetime.now(timezone.utc) + timedelta(minutes=25)
+
+    publish_spy = create_autospec(monitor_service.maybe_publish_data_job_monitor)
+    monkeypatch.setattr(monitor_service, "maybe_publish_data_job_monitor", publish_spy)
+
+    docker_client = create_autospec(DataTaskDockerClient, instance=True)
+    docker_client.list_data_task_containers.return_value = []
+
+    lock_conn, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(10)])
+    conn, state = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "slot_id": 1,
+                    "generation": 30,
+                    "slot_state": "running",
+                    "active_run_id": "run-lock-wait-exp",
+                    "active_job_key": "pm-market-state",
+                }
+            },
+            {
+                "fetchone": {
+                    "run_id": "run-lock-wait-exp",
+                    "job_key": "pm-market-state",
+                    "status": "running",
+                    "container_id": None,
+                    "runner": "container",
+                    "trigger_source": "cron",
+                    "scheduled_slot_utc": slot_utc,
+                    "deadline_utc": deadline_utc,
+                    "triggered_by_user_id": None,
+                    "enabled": True,
+                    "paused_by_user": False,
+                    "deleted_at": None,
+                }
+            },
+            {"rowcount": 1},  # UPDATE runs -> aborted
+            {"rowcount": 1},  # UPDATE defs -> consecutive_failures + 1
+            {"fetchone": None},  # SELECT prior takeover retry -> none
+            {"rowcount": 0, "fetchone": None},  # INSERT ... WHERE NOW() < deadline_utc -> filtered out!
+            {"fetchone": None},  # SELECT blocking queued row -> none (filtered by DB clock!)
+            {"rowcount": 1},  # UPDATE slot -> idle
+        ]
+    )
+
+    outcome = await recover_on_takeover(
+        conn,
+        lock_conn=lock_conn,
+        docker_client=docker_client,
+        path_map=path_map,
+        now_utc=None,
+    )
+    assert outcome == "aborted"
+    insert_sqls = [sql for sql, _ in state["executed"] if "INSERT INTO dalton_data_task_runs" in sql]
+    assert len(insert_sqls) == 1
+    assert "WHERE NOW() < %(deadline_utc)s" in insert_sqls[0]
+    publish_spy.assert_awaited_once()
+    assert "已过期" in str(publish_spy.await_args.kwargs["failure_reason"])
+
+
+@pytest.mark.asyncio
+async def test_claim_second_expiry_branch_also_publishes_monitor_and_persists_failed_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Med #2: when takeover retry expires on the second atomic UPDATE check inside
+    claim_next_queued_run, it shares the cancellation+monitor-publish helper, and if monitor
+    publish fails, the pending record survives slot reset and replays on the next tick."""
+    from src.dalton.data_jobs import scheduler as sched_mod
+
+    path_map = build_path_map(host_var_dir=tmp_path / "h", backend_var_dir=tmp_path / "b")
+    monkeypatch.setattr(sched_mod, "build_path_map", lambda: path_map)
+
+    slot_utc = datetime(2026, 4, 21, 9, 0, 0, tzinfo=timezone.utc)
+    deadline_utc = slot_utc + timedelta(minutes=30)
+
+    # First call to maybe_publish fails, second (replay) succeeds.
+    publish_calls: list[dict[str, Any]] = []
+    should_fail = {"flag": True}
+
+    async def _flaky_publish(**kwargs: Any) -> None:
+        publish_calls.append(dict(kwargs))
+        if should_fail["flag"]:
+            raise RuntimeError("monitor db briefly unavailable")
+
+    monkeypatch.setattr(monitor_service, "maybe_publish_data_job_monitor", _flaky_publish)
+
+    # Simulate ref_utc + pre-check passing (< deadline) while atomic claim UPDATE returns rowcount=0
+    # because the clock crossed deadline_utc during lock wait.
+    class _TickingDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            val = clock_ticks.pop(0) if clock_ticks else deadline_utc + timedelta(seconds=5)
+            return val if tz is None else val.astimezone(tz)
+
+    slot_utc = _TickingDatetime(2026, 4, 21, 9, 0, 0, tzinfo=timezone.utc)
+    deadline_utc = _TickingDatetime(2026, 4, 21, 9, 30, 0, tzinfo=timezone.utc)
+    clock_ticks = [
+        _TickingDatetime(2026, 4, 21, 9, 29, 57, tzinfo=timezone.utc),  # ref_utc
+        _TickingDatetime(2026, 4, 21, 9, 29, 58, tzinfo=timezone.utc),  # claim_check_now (passes!)
+        _TickingDatetime(2026, 4, 21, 9, 29, 59, tzinfo=timezone.utc),  # claim_now_utc
+        _TickingDatetime(2026, 4, 21, 9, 30, 1, tzinfo=timezone.utc),   # expired_at_claim -> True!
+    ]
+
+    monkeypatch.setattr(sched_mod, "datetime", _TickingDatetime)
+
+    conn, state = _make_autospec_db(
+        [
+            {"fetchone": {"slot_id": 1, "generation": 40, "slot_state": "idle", "active_run_id": None, "active_job_key": None}},
+            {"fetchall": []},
+            {
+                "fetchall": [
+                    {
+                        "run_id": "run-second-branch-exp",
+                        "job_key": "pm-market-state",
+                        "trigger_source": "manual",
+                        "triggered_by_user_id": "system:takeover_retry",
+                        "scheduled_slot_utc": slot_utc,
+                        "deadline_utc": deadline_utc,
+                        "low_mem_since_utc": None,
+                        "enabled": True,
+                        "paused_by_user": False,
+                        "runner": "container",
+                        "command_argv": ["python3", "run.py"],
+                        "workdir": "/tmp",
+                        "timeout_seconds": 1800,
+                        "no_output_timeout_seconds": 600,
+                        "required_secrets": [],
+                        "cos_mode": None,
+                        "notify_enabled": True,
+                        "timezone": "Asia/Shanghai",
+                        "deleted_at": None,
+                    }
+                ]
+            },
+            # Atomic claim transaction:
+            {"rowcount": 1, "fetchone": {"generation": 41}},  # UPDATE slot -> running
+            {"fetchone": {"enabled": True, "paused_by_user": False, "deleted_at": None}},  # SELECT def FOR SHARE
+            {"rowcount": 0},  # UPDATE runs -> 0 rows (NOW() >= deadline_utc!) -> _ClaimRollback("takeover_retry_expired")
+            # Shared expiry helper UPDATE runs -> cancelled:
+            {"rowcount": 1},
+        ]
+    )
+
+    claimed = await claim_next_queued_run(conn, now_utc=None, available_memory_mb=4096)
+    assert claimed is None
+    assert len(publish_calls) == 1
+    assert publish_calls[0]["run_id"] == "run-second-branch-exp"
+    assert "takeover_retry_expired" in publish_calls[0]["failure_reason"]
+
+    # Pending monitor publish persisted on disk even though publish raised!
+    pending_file = path_map.backend_var_dir / "pending_monitor_publishes.json"
+    assert pending_file.is_file()
+    assert "run-second-branch-exp" in pending_file.read_text(encoding="utf-8")
+
+    # On next tick / restart, replay_pending_monitor_publishes succeeds and clears the pending entry
+    should_fail["flag"] = False
+    replayed = await sched_mod.replay_pending_monitor_publishes(path_map=path_map)
+    assert replayed == 1
+    assert len(publish_calls) == 2
+    assert "run-second-branch-exp" not in pending_file.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_deferred_takeover_retry_persisted_when_blocked_and_enqueued_once_slot_frees(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 Med #3: when takeover retry is blocked by an existing queued run for the same job,
+    the intent is persisted durably and enqueued by flush_pending_takeover_retries once the
+    queue slot frees up before deadline_utc (deduplicated by original scheduled_slot_utc)."""
+    from src.dalton.data_jobs.scheduler import flush_pending_takeover_retries
+
+    path_map = build_path_map(host_var_dir=tmp_path / "h", backend_var_dir=tmp_path / "b")
+    now = datetime(2026, 4, 21, 9, 10, 0, tzinfo=timezone.utc)
+    slot_utc = datetime(2026, 4, 21, 9, 0, 0, tzinfo=timezone.utc)
+    deadline_utc = slot_utc + timedelta(minutes=30)
+
+    publish_spy = create_autospec(monitor_service.maybe_publish_data_job_monitor)
+    monkeypatch.setattr(monitor_service, "maybe_publish_data_job_monitor", publish_spy)
+
+    docker_client = create_autospec(DataTaskDockerClient, instance=True)
+    docker_client.list_data_task_containers.return_value = []
+
+    lock_conn, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(10)])
+    conn, _ = _make_autospec_db(
+        [
+            {"fetchone": {"slot_id": 1, "generation": 50, "slot_state": "running", "active_run_id": "run-blocked-defer", "active_job_key": "pm-market-state"}},
+            {"fetchone": {"run_id": "run-blocked-defer", "job_key": "pm-market-state", "status": "running", "container_id": None, "runner": "container", "trigger_source": "cron", "scheduled_slot_utc": slot_utc, "deadline_utc": deadline_utc, "triggered_by_user_id": None, "enabled": True, "paused_by_user": False, "deleted_at": None}},
+            {"rowcount": 1},  # UPDATE runs -> aborted
+            {"rowcount": 1},  # UPDATE defs -> consecutive_failures + 1
+            {"fetchone": None},  # SELECT prior takeover retry -> none
+            {"rowcount": 0, "fetchone": None},  # INSERT -> blocked!
+            {"fetchone": {"run_id": "run-overlap-slot-2", "trigger_source": "cron", "triggered_by_user_id": None, "scheduled_slot_utc": slot_utc + timedelta(minutes=5)}},
+            {"rowcount": 1},  # UPDATE slot -> idle
+        ]
+    )
+
+    outcome = await recover_on_takeover(
+        conn,
+        lock_conn=lock_conn,
+        docker_client=docker_client,
+        path_map=path_map,
+        now_utc=now,
+    )
+    assert outcome == "aborted"
+    intent_file = path_map.backend_var_dir / "pending_takeover_retries.json"
+    assert intent_file.is_file()
+    assert "pm-market-state" in intent_file.read_text(encoding="utf-8")
+
+    # Once the overlapping queued run finishes/claims and queue slot is free before deadline_utc,
+    # flush_pending_takeover_retries enqueues the original slot's retry and clears the intent.
+    flush_conn, flush_state = _make_autospec_db(
+        [
+            {"fetchone": {"enabled": True, "paused_by_user": False, "deleted_at": None}},  # SELECT def
+            {"fetchone": None},  # SELECT existing same-slot takeover_retry -> none
+            {"rowcount": 1, "fetchone": {"run_id": "run-deferred-retry-1"}},  # INSERT retry succeeds!
+        ]
+    )
+    enqueued = await flush_pending_takeover_retries(
+        flush_conn,
+        path_map=path_map,
+        now_utc=now + timedelta(minutes=5),
+    )
+    assert enqueued == 1
+    inserts = [
+        params
+        for sql, params in flush_state["executed"]
+        if "INSERT INTO dalton_data_task_runs" in sql
+    ]
+    assert len(inserts) == 1
+    assert inserts[0]["job_key"] == "pm-market-state"
+    assert inserts[0]["slot_utc"] == slot_utc
+    assert inserts[0]["deadline_utc"] == deadline_utc
+    assert inserts[0]["triggered_by_user_id"] == "system:takeover_retry"
+    assert "pm-market-state" not in intent_file.read_text(encoding="utf-8")
+

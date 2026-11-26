@@ -3293,101 +3293,25 @@ _HK_DOT_RE = re.compile(r"^0*(\d{1,5})\.HK$", re.IGNORECASE)
 _CN_DOT_RE = re.compile(r"^(\d{6})\.(SH|SZ|SS)$", re.IGNORECASE)
 _US_DOT_RE = re.compile(r"^([A-Za-z][A-Za-z0-9.\-]{0,15})\.US$", re.IGNORECASE)
 
-_NON_SEC_MARKET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"^(?:\d{1,5}\.HK|HK:\d{1,5}|0\d{3,4})$", re.IGNORECASE), "港股"),
-    (re.compile(r"^(?:\d{6}\.(?:KS|KQ)|(?:KR|KS|KQ):\d{6})$", re.IGNORECASE), "韩股"),
-    (re.compile(r"^(?:\d{6}\.(?:SH|SZ|SS|BJ)|(?:SH|SZ|BJ)\d{6})$", re.IGNORECASE), "A股"),
-    (
-        re.compile(
-            r"^[A-Z0-9._-]+\.(?:T|JP|TW|TWO|L|PA|DE|SW|AS|MI|TO|AX|SI|NS|BO)$",
-            re.IGNORECASE,
-        ),
-        "非美股交易所标的",
-    ),
-)
-
-
-_DUAL_LISTED_SEC_ISSUER_MAP: dict[str, str] = {
-    "9988.HK": "BABA",
-    "09988": "BABA",
-    "HK:9988": "BABA",
-    "HK:09988": "BABA",
-    "9618.HK": "JD",
-    "09618": "JD",
-    "HK:9618": "JD",
-    "HK:09618": "JD",
-    "9888.HK": "BIDU",
-    "09888": "BIDU",
-    "HK:9888": "BIDU",
-    "HK:09888": "BIDU",
-    "9999.HK": "NTES",
-    "09999": "NTES",
-    "HK:9999": "NTES",
-    "9626.HK": "BILI",
-    "09626": "BILI",
-    "HK:9626": "BILI",
-    "2015.HK": "LI",
-    "02015": "LI",
-    "HK:2015": "LI",
-    "9866.HK": "NIO",
-    "09866": "NIO",
-    "HK:9866": "NIO",
-    "9868.HK": "XPEV",
-    "09868": "XPEV",
-    "HK:9868": "XPEV",
-    "9961.HK": "TCOM",
-    "09961": "TCOM",
-    "HK:9961": "TCOM",
-    "9987.HK": "YUMC",
-    "09987": "YUMC",
-    "2057.HK": "ZTO",
-    "02057": "ZTO",
-    "0005.HK": "HSBC",
-    "00005": "HSBC",
-    "2330.TW": "TSM",
-}
-
-
-def _resolve_sec_issuer_ticker(ticker: str | None) -> str | None:
-    """Resolve dual-listed non-US ticker (e.g. ``9988.HK``) to its SEC filer ticker/CIK via known issuer maps."""
-    raw = str(ticker or "").strip().upper()
-    if not raw:
-        return None
-    if raw in _DUAL_LISTED_SEC_ISSUER_MAP:
-        return _DUAL_LISTED_SEC_ISSUER_MAP[raw]
-    m_hk = re.fullmatch(r"(?:HK:)?0*(\d{1,5})(?:\.HK)?", raw)
-    if m_hk and (raw.endswith(".HK") or raw.startswith("HK:") or (raw.isdigit() and len(raw) == 5 and raw.startswith("0"))):
-        num = int(m_hk.group(1))
-        for cand in (f"{num:04d}.HK", f"{num}.HK", f"{num:05d}"):
-            if cand in _DUAL_LISTED_SEC_ISSUER_MAP:
-                return _DUAL_LISTED_SEC_ISSUER_MAP[cand]
-    # Also consult the repo's alphaengine_search_cache canonical ticker alias map when available.
-    try:
-        import alphaengine_search_cache as _ae_cache  # type: ignore[import-not-found]
-
-        alias_map = getattr(_ae_cache, "_TICKER_ALIASES", None) or getattr(
-            _ae_cache, "TICKER_ALIASES", None
-        )
-        if isinstance(alias_map, dict):
-            for sec_sym, aliases in alias_map.items():
-                if _detect_non_sec_ticker(str(sec_sym)) is not None:
-                    continue
-                if any(str(a).strip().upper() == raw for a in (aliases or ())):
-                    return str(sec_sym).strip().upper()
-    except Exception:
-        pass
-    return None
-
-
-def _detect_non_sec_ticker(ticker: str | None) -> str | None:
-    """Return market label when ``ticker`` clearly belongs to a non-SEC market (no SEC CIK)."""
-    raw = str(ticker or "").strip()
-    if not raw:
-        return None
-    for pat, label in _NON_SEC_MARKET_PATTERNS:
-        if pat.fullmatch(raw):
-            return label
-    return None
+try:
+    from src.dalton.sec_issuer_map import (
+        DUAL_LISTED_SEC_ISSUER_MAP as _DUAL_LISTED_SEC_ISSUER_MAP,
+        NON_SEC_MARKET_PATTERNS as _NON_SEC_MARKET_PATTERNS,
+        classify_sec_ticker as _classify_sec_ticker,
+        detect_non_sec_market as _detect_non_sec_ticker,
+        resolve_sec_issuer_ticker as _resolve_sec_issuer_ticker,
+    )
+except Exception:
+    _sec_map_repo_root = str(Path(__file__).resolve().parents[2])
+    if _sec_map_repo_root not in sys.path:
+        sys.path.insert(0, _sec_map_repo_root)
+    from src.dalton.sec_issuer_map import (
+        DUAL_LISTED_SEC_ISSUER_MAP as _DUAL_LISTED_SEC_ISSUER_MAP,
+        NON_SEC_MARKET_PATTERNS as _NON_SEC_MARKET_PATTERNS,
+        classify_sec_ticker as _classify_sec_ticker,
+        detect_non_sec_market as _detect_non_sec_ticker,
+        resolve_sec_issuer_ticker as _resolve_sec_issuer_ticker,
+    )
 
 
 def _normalize_ticker_for_route(route: str, ticker: str) -> str:
@@ -14073,36 +13997,53 @@ class ResearchDataBridge:
             and operation in ("list-filings", "")
         ):
             sec_ticker = str(call_args.get("ticker") or "").strip()
-            mapped_sec = _resolve_sec_issuer_ticker(sec_ticker)
-            if mapped_sec is not None:
+            ticker_kind, mapped_sec, non_sec_market = _classify_sec_ticker(sec_ticker)
+            if ticker_kind == "mapped" and mapped_sec is not None:
                 call_args["ticker"] = mapped_sec
                 norm_params_view["ticker"] = mapped_sec
-            else:
-                non_sec_market = _detect_non_sec_ticker(sec_ticker)
-                if non_sec_market is not None:
-                    alt_hint = (
-                        '港股与 A 股请改用 finance(route="cn-hk", operation="filings", ...) 查询公告。'
-                        if non_sec_market in ("港股", "A股")
-                        else "韩股及其他非美股请查当地交易所公告或内部研究库，无需请求 SEC。"
-                    )
-                    non_sec_payload: dict[str, Any] = {
-                        "_declared_sources": [],
-                        "_sources": [],
-                        "ok": False,
-                        "status": "not_sec_filer",
-                        "error_code": "not_sec_filer",
-                        "error_category": "没有匹配",
-                        "sec_filer": False,
-                        "ticker": sec_ticker,
-                        "filings": [],
-                        "rows": [],
-                        "error": f"该证券不在 SEC 申报：{sec_ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
-                        "hint": alt_hint,
-                        "normalized_params": norm_params_view,
-                    }
-                    return self._make_tool_result_response(
-                        req_id, non_sec_payload, is_error=True
-                    )
+            elif ticker_kind == "confirmed_non_sec":
+                alt_hint = (
+                    '港股与 A 股请改用 finance(route="cn-hk", operation="filings", ...) 查询公告。'
+                    if non_sec_market in ("港股", "A股")
+                    else "韩股及其他非美股请查当地交易所公告或内部研究库，无需请求 SEC。"
+                )
+                non_sec_payload: dict[str, Any] = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "not_sec_filer",
+                    "error_code": "not_sec_filer",
+                    "error_category": "没有匹配",
+                    "sec_filer": False,
+                    "ticker": sec_ticker,
+                    "filings": [],
+                    "rows": [],
+                    "error": f"该证券不在 SEC 申报：{sec_ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
+                    "hint": alt_hint,
+                    "normalized_params": norm_params_view,
+                }
+                return self._make_tool_result_response(
+                    req_id, non_sec_payload, is_error=True
+                )
+            elif ticker_kind == "unmapped_non_us":
+                unmapped_payload: dict[str, Any] = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "sec_issuer_mapping_not_found",
+                    "error_code": "sec_issuer_mapping_not_found",
+                    "error_category": "没有匹配",
+                    "sec_filer": None,
+                    "ticker": sec_ticker,
+                    "filings": [],
+                    "rows": [],
+                    "error": f"未找到 {sec_ticker} 对应的美股/ADR 代码或 SEC CIK 映射（属于{non_sec_market}）；若该公司以 ADR/20-F 在 SEC 申报，请改用其美股代码或 10 位 CIK 查询。",
+                    "hint": "请提供该公司对应的美股 ADR 代码或 SEC CIK，或改用当地交易所/cn-hk 路由查询。",
+                    "normalized_params": norm_params_view,
+                }
+                return self._make_tool_result_response(
+                    req_id, unmapped_payload, is_error=True
+                )
 
         do_fanout = self._should_fanout_alphaengine(tool_name, arguments)
         ae_args: dict[str, Any] | None = None

@@ -162,14 +162,14 @@ def _skip_or_fail_infra(reason: str) -> None:
     pytest.skip(reason)
 
 
+from tests.integration.dalton._db_guard import extract_effective_test_db_name
+
+
 def _assert_isolated_test_dsn(dsn: str, *, source: str) -> str:
-    parsed = urlsplit(dsn)
-    db_name = (parsed.path or "").strip().lstrip("/")
-    if not db_name or not db_name.endswith("_test"):
-        pytest.fail(
-            f"Refusing to run chat upload integration tests against non-test database "
-            f"{db_name!r} (from {source}; database name must end with '_test')"
-        )
+    try:
+        db_name = extract_effective_test_db_name(dsn, source=source)
+    except ValueError as exc:
+        pytest.fail(str(exc))
     prod_db = (os.environ.get("DB_NAME") or "").strip().lstrip("/")
     if prod_db and not prod_db.endswith("_test") and db_name == prod_db:
         pytest.fail(

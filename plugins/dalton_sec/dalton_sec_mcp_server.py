@@ -63,64 +63,35 @@ BUILTIN_TICKER_CIKS: dict[str, tuple[str, str]] = {
     "YUMC": ("0001673358", "Yum China Holdings, Inc."),
     "ZTO": ("0001677250", "ZTO Express (Cayman) Inc."),
     "HSBC": ("0001089113", "HSBC HOLDINGS PLC"),
+    "TM": ("0001094517", "TOYOTA MOTOR CORP"),
+    "SONY": ("0000313838", "SONY GROUP CORP"),
+    "ASML": ("0000937966", "ASML HOLDING NV"),
+    "SAP": ("0001000184", "SAP SE"),
+    "NVO": ("0000353278", "NOVO NORDISK A S"),
+    "AZN": ("0000901832", "ASTRAZENECA PLC"),
+    "SHEL": ("0001306965", "Shell plc"),
+    "PKX": ("0000889132", "POSCO HOLDINGS INC."),
 }
 
-# Dual-listed / cross-market issuer aliases whose SEC EDGAR filings live under their US ADR / CIK.
-DUAL_LISTED_SEC_ALIASES: dict[str, str] = {
-    "9988.HK": "BABA",
-    "09988": "BABA",
-    "HK:9988": "BABA",
-    "HK:09988": "BABA",
-    "9618.HK": "JD",
-    "09618": "JD",
-    "HK:9618": "JD",
-    "HK:09618": "JD",
-    "9888.HK": "BIDU",
-    "09888": "BIDU",
-    "HK:9888": "BIDU",
-    "HK:09888": "BIDU",
-    "9999.HK": "NTES",
-    "09999": "NTES",
-    "HK:9999": "NTES",
-    "9626.HK": "BILI",
-    "09626": "BILI",
-    "HK:9626": "BILI",
-    "2015.HK": "LI",
-    "02015": "LI",
-    "HK:2015": "LI",
-    "9866.HK": "NIO",
-    "09866": "NIO",
-    "HK:9866": "NIO",
-    "9868.HK": "XPEV",
-    "09868": "XPEV",
-    "HK:9868": "XPEV",
-    "9961.HK": "TCOM",
-    "09961": "TCOM",
-    "HK:9961": "TCOM",
-    "9987.HK": "YUMC",
-    "09987": "YUMC",
-    "2057.HK": "ZTO",
-    "02057": "ZTO",
-    "0005.HK": "HSBC",
-    "00005": "HSBC",
-    "2330.TW": "TSM",
-}
+try:
+    from src.dalton.sec_issuer_map import (
+        DUAL_LISTED_SEC_ISSUER_MAP as DUAL_LISTED_SEC_ALIASES,
+        classify_sec_ticker as _classify_sec_ticker,
+        detect_non_sec_market as _shared_detect_non_sec_market,
+        resolve_sec_issuer_ticker as _resolve_sec_issuer_alias,
+    )
+except Exception:
+    import sys as _sys
 
-
-def _resolve_sec_issuer_alias(ticker: str | None) -> str | None:
-    """Resolve a known dual-listed/cross-market ticker (e.g. ``9988.HK``) to its SEC ticker."""
-    raw = str(ticker or "").strip().upper()
-    if not raw:
-        return None
-    if raw in DUAL_LISTED_SEC_ALIASES:
-        return DUAL_LISTED_SEC_ALIASES[raw]
-    m_hk = re.fullmatch(r"(?:HK:)?0*(\d{1,5})(?:\.HK)?", raw)
-    if m_hk and (raw.endswith(".HK") or raw.startswith("HK:") or (raw.isdigit() and len(raw) == 5 and raw.startswith("0"))):
-        num = int(m_hk.group(1))
-        for cand in (f"{num:04d}.HK", f"{num}.HK", f"{num:05d}"):
-            if cand in DUAL_LISTED_SEC_ALIASES:
-                return DUAL_LISTED_SEC_ALIASES[cand]
-    return None
+    _repo_root = str(Path(__file__).resolve().parents[2])
+    if _repo_root not in _sys.path:
+        _sys.path.insert(0, _repo_root)
+    from src.dalton.sec_issuer_map import (
+        DUAL_LISTED_SEC_ISSUER_MAP as DUAL_LISTED_SEC_ALIASES,
+        classify_sec_ticker as _classify_sec_ticker,
+        detect_non_sec_market as _shared_detect_non_sec_market,
+        resolve_sec_issuer_ticker as _resolve_sec_issuer_alias,
+    )
 
 # Canonical concept alias groups (ordered by modern US-GAAP prevalence)
 CONCEPT_ALIASES: dict[str, list[str]] = {
@@ -1141,19 +1112,26 @@ def list_filings(
     Returns:
         dict: Filing list with form, filing_date, report_date, accession_no, and url.
     """
-    # Resolve known dual-listed / ADR issuer mapping to SEC ticker/CIK BEFORE short-circuiting.
-    mapped_sec_ticker = _resolve_sec_issuer_alias(ticker)
+    # Classify using shared issuer map: resolve known ADRs (e.g. 9988.HK -> BABA, 7203.T -> TM),
+    # reject confirmed non-SEC issuers, and distinguish unmapped non-US tickers without claiming sec_filer=False.
+    ticker_kind, mapped_sec_ticker, non_sec_market = _classify_sec_ticker(ticker)
     effective_ticker = mapped_sec_ticker or ticker
-    if mapped_sec_ticker is None:
-        non_sec_market = _detect_non_sec_ticker(ticker)
-        if non_sec_market is not None:
-            return make_error(
-                "not_found",
-                f"该证券不在 SEC 申报：{ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
-                symbol=ticker.upper(),
-                error_code="not_sec_filer",
-                sec_filer=False,
-            )
+    if ticker_kind == "confirmed_non_sec":
+        return make_error(
+            "not_found",
+            f"该证券不在 SEC 申报：{ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
+            symbol=ticker.upper(),
+            error_code="not_sec_filer",
+            sec_filer=False,
+        )
+    if ticker_kind == "unmapped_non_us":
+        return make_error(
+            "not_found",
+            f"未找到 {ticker} 对应的美股/ADR 代码或 SEC CIK 映射（属于{non_sec_market}）；若该公司以 ADR/20-F 在 SEC 申报，请改用其美股代码或 10 位 CIK 查询。",
+            symbol=ticker.upper(),
+            error_code="sec_issuer_mapping_not_found",
+            sec_filer=None,
+        )
     try:
         cik10, company_name = resolve_cik(effective_ticker)
         sub = fetch_submissions(cik10)

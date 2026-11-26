@@ -1498,6 +1498,21 @@ async def migrate_data_job_monitor_and_cut_tx(
     return loaded, result, False
 
 
+def _clip_publish_error(message: str | None, limit: int = 1000) -> str:
+    """Clip a monitor publish error to ``limit`` chars while preserving trailing ``| 数据日期: ...``."""
+    raw = (message or "Republish failed").strip()
+    if len(raw) <= limit:
+        return raw
+    marker = " | 数据日期: "
+    idx = raw.rfind(marker)
+    if idx != -1:
+        suffix = raw[idx:]
+        if len(suffix) < limit - 20:
+            body_budget = limit - len(suffix) - 1
+            return raw[:body_budget].rstrip() + "…" + suffix
+    return raw[:limit]
+
+
 async def record_monitor_publish_failure(
     monitor_id: str,
     *,
@@ -1506,7 +1521,7 @@ async def record_monitor_publish_failure(
 ) -> MonitorRecord | None:
     """Record the latest failure message/timestamp without marking ``run_id`` as processed."""
     _ = run_id
-    clipped = (error_message or "Republish failed").strip()[:1000]
+    clipped = _clip_publish_error(error_message, limit=1000)
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(

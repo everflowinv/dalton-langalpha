@@ -298,6 +298,7 @@ git archive --format=tar "$COMMIT_SHA" -- "${ARCHIVE_PATHS[@]}" | tar ${TAR_EXTR
 DENY_PATHS=(
   "plugins/dalton_data"
   "plugins/dalton/skills/dalton-richard-coverage-weekly"
+  "plugins/dalton/skills/dalton-ai-app-weekly-monitor"
   "scripts/dalton/researchdata_bridge.py"
   "scripts/dalton/research_runtime"
   "scripts/dalton/ops"

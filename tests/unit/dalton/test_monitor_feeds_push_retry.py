@@ -327,3 +327,116 @@ def test_upsert_monitor_data_conditional_as_of_idempotent_replay_and_stale_rejec
     assert exc_info.value.status_code == 409
     assert store[(mid, "intraday")]["as_of"] == t2
     assert store[(mid, "intraday")]["updated_at"] == clock["now"]
+
+
+def test_calendar_error_preserves_newer_pending_push_and_409_clears_stale_pending(
+    tmp_path: Path,
+    monkeypatch: Any,
+) -> None:
+    """r4 Med #1: calendar_error must NOT overwrite/clear a newer pending_push with last_good_payload,
+    and an HTTP 409 stale-snapshot conflict from the server must clear the superseded pending_push."""
+    from scripts.dalton.monitor_feeds import run_feeds
+    from scripts.dalton.monitor_feeds.common import MonitorPushHttpError
+
+    pushed: list[dict[str, Any]] = []
+
+    def _recording_push(
+        slug: str,
+        data_key: str,
+        payload: Any,
+        *,
+        as_of: str | None = None,
+        backend_url: str | None = None,
+    ) -> dict[str, Any]:
+        pushed.append({"slug": slug, "data_key": data_key, "as_of": as_of, "payload": payload})
+        return {"ok": True}
+
+    daemon = FeedDaemon(
+        feeds=("cn",),
+        backend_url="http://127.0.0.1:8000",
+        interval_seconds=60.0,
+        state_dir=tmp_path / "state",
+        push_fn=_recording_push,
+    )
+    daemon.state["cn"]["last_good_payload"] = {
+        "as_of": "2026-04-21 10:00:00",
+        "as_of_iso": "2026-04-21T10:00:00+08:00",
+        "value": "old",
+    }
+    daemon.state["cn"]["pending_push"] = {
+        "slug": "cn-intraday",
+        "data_key": "snapshot",
+        "payload": {
+            "as_of": "2026-04-21 10:05:00",
+            "as_of_iso": "2026-04-21T10:05:00+08:00",
+            "value": "newer_pending",
+        },
+        "as_of": "2026-04-21T10:05:00+08:00",
+        "trade_date": "2026-04-21",
+        "in_window": True,
+        "is_closed_td": False,
+        "needs_post_close": False,
+        "current_daily_sig": "",
+        "attempts": 1,
+    }
+
+    monkeypatch.setattr(
+        run_feeds,
+        "market_session_state",
+        lambda market, cur: {
+            "trade_date": "2026-04-21",
+            "is_trading_day": False,
+            "in_trading_window": False,
+            "status": "calendar_error",
+            "label": "交易日历不可用",
+            "calendar_error": "calendar file missing",
+        },
+    )
+
+    cur = datetime(2026, 4, 21, 10, 10, 0, tzinfo=BJ)
+    res = daemon._collect_and_push_one("cn", cur, force=False)
+    assert res["action"] == "retried_push"
+    assert res["calendar_error"] == "calendar file missing"
+    assert len(pushed) == 1
+    assert pushed[0]["as_of"] == "2026-04-21T10:05:00+08:00"
+    assert pushed[0]["payload"]["value"] == "newer_pending"
+    assert "pending_push" not in daemon.state["cn"]
+
+    # Now test HTTP 409 stale-snapshot conflict during pending retry -> clears pending_push immediately
+    def _conflict_push(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        raise MonitorPushHttpError(409, "写入 cn-intraday/snapshot 失败 (HTTP 409): stale snapshot")
+
+    daemon._push = _conflict_push
+    daemon.state["cn"]["pending_push"] = {
+        "slug": "cn-intraday",
+        "data_key": "snapshot",
+        "payload": {
+            "as_of": "2026-04-21 10:05:00",
+            "as_of_iso": "2026-04-21T10:05:00+08:00",
+            "value": "superseded_pending",
+        },
+        "as_of": "2026-04-21T10:05:00+08:00",
+        "trade_date": "2026-04-21",
+        "in_window": False,
+        "is_closed_td": False,
+        "needs_post_close": False,
+        "current_daily_sig": "",
+        "attempts": 1,
+    }
+    monkeypatch.setattr(
+        run_feeds,
+        "market_session_state",
+        lambda market, cur: {
+            "trade_date": "2026-04-21",
+            "is_trading_day": True,
+            "in_trading_window": False,
+            "status": "closed",
+            "label": "已收盘",
+            "calendar_error": None,
+        },
+    )
+    daemon.state["cn"]["post_close_written_date"] = "2026-04-21"
+
+    res_409 = daemon._collect_and_push_one("cn", cur, force=False)
+    assert res_409["action"] == "stale_pending_cleared"
+    assert "pending_push" not in daemon.state["cn"]

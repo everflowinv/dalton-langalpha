@@ -15,6 +15,10 @@ _DB_ENV_VARS = (
     "TEST_DB_DSN",
     "DALTON_TEST_DB_DSN",
     "TEST_DATABASE_URL",
+    "DALTON_DATA_JOBS_TEST_DSN",
+    "DALTON_CHANNEL_GATEWAY_TEST_DSN",
+    "DALTON_CHAT_UPLOAD_TEST_DSN",
+    "DALTON_TEST_PG_DSN",
     "TEST_DB_HOST",
     "TEST_DB_PORT",
     "TEST_DB_NAME",
@@ -155,3 +159,81 @@ def test_ci_backend_integration_workflow_sets_explicit_test_db_env_vars() -> Non
     assert "TEST_DB_HOST:" in wf_text
     assert "TEST_DB_PORT:" in wf_text
     assert "TEST_DB_NAME:" in wf_text
+
+
+@pytest.mark.parametrize(
+    "sneaky_dsn",
+    [
+        "postgresql://postgres:postgres@127.0.0.1:5432/langalpha_test?dbname=langalpha",
+        "postgresql://postgres:postgres@127.0.0.1:5432/fake_test?dbname=postgres",
+        "host=127.0.0.1 port=5432 dbname=langalpha",
+        "postgresql://postgres:postgres@127.0.0.1:5432/langalpha_test?service=prod",
+        "postgresql://postgres:postgres@127.0.0.1:5432/",
+    ],
+)
+def test_integration_db_guards_reject_libpq_dbname_override_and_service_bypass(
+    sneaky_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r4 High #4: libpq query-param `?dbname=prod`, key-value DSN, missing dbname, or `service=`
+    must be rejected by conninfo_to_dict() across conftest, data_jobs, d048, and all Dalton DB modules."""
+    _clear_db_env(monkeypatch)
+
+    # 1. Root tests/integration/conftest.py:_build_db_uri
+    monkeypatch.setenv("TEST_DB_DSN", sneaky_dsn)
+    root_conftest = _load_mod("int_conftest_override", "tests/integration/conftest.py")
+    with pytest.raises(RuntimeError):
+        root_conftest._build_db_uri()
+    monkeypatch.delenv("TEST_DB_DSN", raising=False)
+
+    # 2. Dalton tests/integration/dalton/conftest.py:_ensure_safe_test_db_name
+    monkeypatch.setenv("DALTON_DATA_JOBS_TEST_DSN", sneaky_dsn)
+    dalton_conftest = _load_mod("dalton_int_conftest_override", "tests/integration/dalton/conftest.py")
+    with pytest.raises(pytest.exit.Exception):
+        dalton_conftest._ensure_safe_test_db_name()
+
+    # 3. tests/integration/dalton/test_data_jobs_db.py:_get_test_dsn
+    data_jobs_mod = _load_mod("dalton_data_jobs_override", "tests/integration/dalton/test_data_jobs_db.py")
+    with pytest.raises(BaseException) as dj_exc:
+        data_jobs_mod._get_test_dsn()
+    assert "Refusing" in str(dj_exc.value)
+    monkeypatch.delenv("DALTON_DATA_JOBS_TEST_DSN", raising=False)
+
+    # 4. tests/integration/dalton/test_d048_invite_admin_tier_migration_db.py:_alembic_env_for_dsn
+    d048_mod = _load_mod(
+        "dalton_d048_override",
+        "tests/integration/dalton/test_d048_invite_admin_tier_migration_db.py",
+    )
+    with pytest.raises(ValueError) as d048_exc:
+        d048_mod._alembic_env_for_dsn(sneaky_dsn)
+    assert "Refusing" in str(d048_exc.value)
+
+    # 5. All other Dalton integration DB fixtures using _get_test_dsn / resolve_validated_test_dsn
+    monkeypatch.setenv("DALTON_TEST_DB_DSN", sneaky_dsn)
+    for rel_path in (
+        "tests/integration/dalton/test_automation_reports_db.py",
+        "tests/integration/dalton/test_channel_chart_snapshots_db.py",
+        "tests/integration/dalton/test_channel_gateway_db.py",
+        "tests/integration/dalton/test_data_task_notifications_db.py",
+        "tests/integration/dalton/test_discord_gateway_db.py",
+    ):
+        mod = _load_mod(f"dalton_override_{Path(rel_path).stem}", rel_path)
+        with pytest.raises(BaseException) as mod_exc:
+            mod._get_test_dsn()
+        assert "Refusing" in str(mod_exc.value), rel_path
+
+    upload_mod = _load_mod(
+        "dalton_override_chat_upload",
+        "tests/integration/dalton/test_chat_large_upload_e2e.py",
+    )
+    with pytest.raises(BaseException) as up_exc:
+        upload_mod._assert_isolated_test_dsn(sneaky_dsn, source="DALTON_TEST_DB_DSN")
+    assert "Refusing" in str(up_exc.value)
+
+    wx_mod = _load_mod(
+        "dalton_override_wx_harness",
+        "tests/integration/dalton/weixin_live_backend_harness.py",
+    )
+    with pytest.raises(RuntimeError) as wx_exc:
+        wx_mod.resolve_validated_test_dsn(sneaky_dsn)
+    assert "Refusing" in str(wx_exc.value)
