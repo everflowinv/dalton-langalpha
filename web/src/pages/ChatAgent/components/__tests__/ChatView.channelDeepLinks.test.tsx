@@ -16,7 +16,7 @@ import {
   parseChartDeepLinkParam,
   useChannelDeepLinks,
 } from '../chatView/useChannelDeepLinks';
-import MessageContentSegments from '../messageList/MessageContentSegments';
+import { MessageContentSegments } from '../messageList/MessageContentSegments';
 
 function ChannelDeepLinksHost({
   workspaceId,
