@@ -1481,6 +1481,25 @@ def _validate_host_platform_if_set(env: Mapping[str, str]) -> str | None:
     return None
 
 
+def _load_profile_module() -> Any:
+    """Load stdlib-only ``src.dalton.profile`` without requiring third-party packages."""
+    try:
+        import src.dalton.profile as profile_mod
+
+        return profile_mod
+    except ImportError:
+        import importlib.util
+
+        repo_root = Path(__file__).resolve().parents[2]
+        profile_path = repo_root / "src" / "dalton" / "profile.py"
+        spec = importlib.util.spec_from_file_location("_dalton_profile_stdlib", profile_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot load {profile_path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+
 def _validate_direct_embedding_env(env: Mapping[str, str]) -> list[str]:
     """Validate backend-direct embedding provider/credentials without logging secret values."""
     issues: list[str] = []
@@ -1498,10 +1517,16 @@ def _validate_direct_embedding_env(env: Mapping[str, str]) -> list[str]:
         except ValueError:
             issues.append("invalid key DALTON_EMBEDDING_DIMENSIONS (not an integer)")
 
-    is_core = (
-        str(env.get("DALTON_PROFILE") or "").strip().lower() == "core"
-        or str(env.get("APP_ENV") or "").strip().lower() == "core"
-    )
+    profile_mod = _load_profile_module()
+    try:
+        active_profile = profile_mod.resolve_profile(
+            app_env=str(env.get("APP_ENV") or ""),
+            dalton_profile=str(env.get("DALTON_PROFILE") or ""),
+        )
+    except profile_mod.ProfileConfigError as exc:
+        issues.append(f"invalid deployment profile configuration: {exc}")
+        return issues
+    is_core = active_profile is profile_mod.DeploymentProfile.CORE
     if raw_provider:
         provider = raw_provider
     elif is_core and str(env.get("OPENAI_API_KEY") or "").strip():

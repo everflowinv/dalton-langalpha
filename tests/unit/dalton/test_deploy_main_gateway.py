@@ -86,7 +86,24 @@ def _setup_gateway_deploy_env(
 
     events_trace = tmp_path / "events.trace"
     (seed / "scripts/dalton/build_frontend_prod.sh").write_text(
-        f'#!/bin/bash\necho \'frontend_build\' >> "{events_trace}"\necho \'OK: Production bundle\'\nexit 0\n'
+        f"""#!/bin/bash
+out_dir="web/dist"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out-dir) out_dir="$2"; shift ;;
+    --out-dir=*) out_dir="${{1#--out-dir=}}" ;;
+  esac
+  shift
+done
+mkdir -p "${{out_dir}}/assets" "${{out_dir}}/help"
+echo '<!doctype html><div id="root"></div>' > "${{out_dir}}/index.html"
+echo '{{"build":"index-test.js"}}' > "${{out_dir}}/version.json"
+echo 'console.log("ok")' > "${{out_dir}}/assets/index-test.js"
+echo '<h1>Help</h1>' > "${{out_dir}}/help/index.html"
+echo 'frontend_build' >> "{events_trace}"
+echo 'OK: Production bundle'
+exit 0
+"""
     )
     (seed / "scripts/dalton/check_public_edge.sh").write_text(
         "#!/bin/bash\necho 'edge ok'\nexit 0\n"

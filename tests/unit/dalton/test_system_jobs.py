@@ -3364,6 +3364,256 @@ async def test_phase1_c2_and_row7_system_jobs_lead_discovery_toggle_and_run_now(
     assert pm_res["execution_id"] == "exec-pm"
 
 
+@pytest.mark.asyncio
+async def test_data_task_weixin_route_requires_primary_admin_owner_and_validates_against_pm_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Public data task WeChat targets validate against delivery owner (primary admin) and reject other editors."""
+    store = _InMemoryAutomationsStore()
+    _wire_store(monkeypatch, store)
+    data_store = _InMemoryDataTaskStore()
+    tiers = {
+        USER_ID: "admin",
+        "internal-colleague": "internal",
+    }
+    data_store.wire(monkeypatch, tiers)
+
+    loaded_for: list[str | None] = []
+
+    async def _fake_load_bound_dm_targets(
+        user_id: str | None, *, conn: Any = None
+    ) -> set[str]:
+        _ = conn
+        loaded_for.append(user_id)
+        if user_id == USER_ID:
+            return {"feishu:user:ou_admin1", "weixin:user:wx_pm_active"}
+        if user_id == "internal-colleague":
+            return {"feishu:user:ou_colleague", "weixin:user:wx_colleague"}
+        return set()
+
+    monkeypatch.setattr(
+        system_jobs_mod,
+        "load_bound_dm_targets",
+        create_autospec(
+            system_jobs_mod.load_bound_dm_targets,
+            side_effect=_fake_load_bound_dm_targets,
+        ),
+    )
+
+    # 1. Non-owner internal member cannot configure a WeChat target (even their own or PM's)
+    with pytest.raises(PermissionError, match="首位管理员本人配置"):
+        await system_jobs_mod.toggle_system_job(
+            "internal-colleague",
+            "data:cn-leverage-daily",
+            notify_routes=["weixin:user:wx_colleague"],
+        )
+    with pytest.raises(PermissionError, match="首位管理员本人配置"):
+        await system_jobs_mod.toggle_system_job(
+            "internal-colleague",
+            "data:cn-leverage-daily",
+            notify_routes=["weixin:user:wx_pm_active"],
+        )
+
+    # 2. Primary admin cannot add someone else's WeChat ID
+    with pytest.raises(ValueError, match="个人微信"):
+        await system_jobs_mod.toggle_system_job(
+            USER_ID,
+            "data:cn-leverage-daily",
+            notify_routes=["weixin:user:wx_colleague"],
+        )
+    assert loaded_for[-1] == USER_ID
+
+    # 3. Primary admin can configure their own active WeChat target (validated against PM binding)
+    res = await system_jobs_mod.toggle_system_job(
+        USER_ID,
+        "data:cn-leverage-daily",
+        enabled=True,
+        notify_routes=["feishu:user:ou_admin1", "weixin:user:wx_pm_active"],
+    )
+    assert res["ok"] is True
+    assert res["notify_routes"] == ["feishu:user:ou_admin1", "weixin:user:wx_pm_active"]
+    assert loaded_for[-1] == USER_ID
+
+
+@pytest.mark.asyncio
+async def test_rollback_data_task_config_enforces_pm_weixin_permission_and_active_binding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r5 #3: rollback_data_task_config blocks non-PM WeChat additions/removals and validates PM active binding."""
+    store = _InMemoryAutomationsStore()
+    _wire_store(monkeypatch, store)
+    data_store = _InMemoryDataTaskStore()
+    tiers = {
+        USER_ID: "admin",
+        "internal-colleague": "internal",
+    }
+    data_store.wire(monkeypatch, tiers)
+
+    pm_bound_wx = {"weixin:user:wx_pm_active"}
+
+    async def _fake_load_bound_dm_targets(
+        user_id: str | None, *, conn: Any = None
+    ) -> set[str]:
+        _ = conn
+        if user_id == USER_ID:
+            return {"feishu:user:ou_admin1"} | set(pm_bound_wx)
+        return {"feishu:user:ou_colleague", "weixin:user:wx_colleague"}
+
+    monkeypatch.setattr(
+        system_jobs_mod,
+        "load_bound_dm_targets",
+        create_autospec(
+            system_jobs_mod.load_bound_dm_targets,
+            side_effect=_fake_load_bound_dm_targets,
+        ),
+    )
+
+    # Seed v1 -> v2 (PM adds own WeChat)
+    await system_jobs_mod.toggle_system_job(
+        USER_ID,
+        "data:cn-leverage-daily",
+        enabled=True,
+        notify_routes=["feishu:user:ou_admin1", "weixin:user:wx_pm_active"],
+    )
+
+    # 1. Non-PM internal member cannot roll back v2 -> v1 because it removes PM's WeChat target
+    with pytest.raises(PermissionError, match="首位管理员本人配置"):
+        await system_jobs_mod.rollback_data_task_config(
+            "internal-colleague",
+            "cn-leverage-daily",
+        )
+    assert data_store.user_model_prefs[USER_ID]["dalton_notify_routes"][
+        "data:cn-leverage-daily"
+    ] == ["feishu:user:ou_admin1", "weixin:user:wx_pm_active"]
+
+    # PM removes WeChat -> v3
+    await system_jobs_mod.toggle_system_job(
+        USER_ID,
+        "data:cn-leverage-daily",
+        enabled=True,
+        notify_routes=["feishu:user:ou_admin1"],
+    )
+
+    # 2. Non-PM internal member cannot roll back v3 -> v2 because it re-adds PM's WeChat target
+    with pytest.raises(PermissionError, match="首位管理员本人配置"):
+        await system_jobs_mod.rollback_data_task_config(
+            "internal-colleague",
+            "cn-leverage-daily",
+        )
+    assert data_store.user_model_prefs[USER_ID]["dalton_notify_routes"][
+        "data:cn-leverage-daily"
+    ] == ["feishu:user:ou_admin1"]
+
+    # 3. If PM unbinds WeChat, even PM cannot roll back v3 -> v2 to re-introduce an unbound WeChat target
+    pm_bound_wx.clear()
+    with pytest.raises(ValueError, match="个人微信"):
+        await system_jobs_mod.rollback_data_task_config(
+            USER_ID,
+            "cn-leverage-daily",
+        )
+    assert data_store.user_model_prefs[USER_ID]["dalton_notify_routes"][
+        "data:cn-leverage-daily"
+    ] == ["feishu:user:ou_admin1"]
+
+    # 4. Once active again, PM rollback v3 -> v2 succeeds
+    pm_bound_wx.add("weixin:user:wx_pm_active")
+    rb_ok = await system_jobs_mod.rollback_data_task_config(
+        USER_ID,
+        "cn-leverage-daily",
+    )
+    assert rb_ok["ok"] is True
+    assert data_store.user_model_prefs[USER_ID]["dalton_notify_routes"][
+        "data:cn-leverage-daily"
+    ] == ["feishu:user:ou_admin1", "weixin:user:wx_pm_active"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_rollback_uses_live_pm_routes_not_historical_snapshot_for_weixin_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 #2: In legacy mode after PM switch, rollback compares against live PM routes, never historical snapshots."""
+    store = _InMemoryAutomationsStore()
+    _wire_store(monkeypatch, store)
+    data_store = _InMemoryDataTaskStore()
+    new_pm_id = "new-pm-admin"
+    tiers = {
+        USER_ID: "admin",
+        new_pm_id: "admin",
+        "internal-colleague": "internal",
+    }
+    data_store.wire(monkeypatch, tiers)
+
+    old_pm_wx = "weixin:user:wx_old_pm"
+    new_pm_bound: set[str] = {"feishu:user:ou_new_pm"}
+
+    async def _fake_load_bound_dm_targets(
+        user_id: str | None, *, conn: Any = None
+    ) -> set[str]:
+        _ = conn
+        if user_id == USER_ID:
+            return {"feishu:user:ou_admin1", old_pm_wx}
+        if user_id == new_pm_id:
+            return set(new_pm_bound)
+        return set()
+
+    monkeypatch.setattr(
+        system_jobs_mod,
+        "load_bound_dm_targets",
+        create_autospec(
+            system_jobs_mod.load_bound_dm_targets,
+            side_effect=_fake_load_bound_dm_targets,
+        ),
+    )
+
+    # Old PM creates two consecutive versions both containing old_pm_wx in snapshot
+    await system_jobs_mod.toggle_system_job(
+        USER_ID,
+        "data:cn-leverage-daily",
+        enabled=True,
+        notify_routes=["feishu:user:ou_admin1", old_pm_wx],
+    )
+    await system_jobs_mod.toggle_system_job(
+        USER_ID,
+        "data:cn-leverage-daily",
+        enabled=False,
+        notify_routes=["feishu:user:ou_admin1", old_pm_wx],
+    )
+
+    # Switch primary admin to new_pm_id, whose live preferences have NO route for cn-leverage-daily
+    monkeypatch.setenv("DALTON_PM_USER_IDS", new_pm_id)
+    data_store.user_model_prefs[new_pm_id] = {
+        "dalton_notify_targets": ["feishu:user:ou_new_pm"],
+        "dalton_notify_routes": {},
+    }
+
+    # 1. Non-PM internal member cannot smuggle old_pm_wx into new PM's empty route via rollback
+    with pytest.raises(PermissionError, match="首位管理员本人配置"):
+        await system_jobs_mod.rollback_data_task_config(
+            "internal-colleague",
+            "cn-leverage-daily",
+        )
+    assert "data:cn-leverage-daily" not in data_store.user_model_prefs[new_pm_id]["dalton_notify_routes"]
+
+    # 2. Even new PM cannot roll back to old_pm_wx when old_pm_wx is neither in live route nor bound to new PM
+    with pytest.raises(ValueError, match="个人微信"):
+        await system_jobs_mod.rollback_data_task_config(
+            new_pm_id,
+            "cn-leverage-daily",
+        )
+    assert "data:cn-leverage-daily" not in data_store.user_model_prefs[new_pm_id]["dalton_notify_routes"]
+
+    # 3. If old_pm_wx is actively bound to new PM, new PM rollback succeeds
+    new_pm_bound.add(old_pm_wx)
+    rb_ok = await system_jobs_mod.rollback_data_task_config(
+        new_pm_id,
+        "cn-leverage-daily",
+    )
+    assert rb_ok["ok"] is True
+    assert data_store.user_model_prefs[new_pm_id]["dalton_notify_routes"][
+        "data:cn-leverage-daily"
+    ] == ["feishu:user:ou_admin1", old_pm_wx]
+
+
 
 
 

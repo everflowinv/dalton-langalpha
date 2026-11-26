@@ -7,6 +7,7 @@ import { isNotFoundError } from '@/api/errors'; // DALTON-HOOK(external-share-gu
 import { useCallerIdentity, type UseCallerIdentityOptions } from '@/hooks/useCallerIdentity'; // DALTON-HOOK(settings-section)
 import { useCapabilities } from '@/hooks/useCapabilities'; // DALTON-HOOK(standalone-core)
 import { useDaltonCoverageUnits } from '@/lib/dalton/coverage'; // DALTON-HOOK(settings-reorg)
+import { useWeixinExternalVisibility } from '../panels/dalton/useWeixinVisibility'; // DALTON-HOOK(weixin-multi-account)
 import { isDesktopShell } from '@/lib/desktop';
 import { isFeatureEnabled, useFeatures } from '@/hooks/useFeatures';
 import { isImeComposing } from '@/lib/ime';
@@ -32,6 +33,8 @@ export function useDaltonSettingsVisibility(
   );
   const cosSharingNotFound = isNotFoundError(cosSharingError);
   const { data: coverageData, isLoading: coverageLoading } = useDaltonCoverageUnits(true);
+  // DALTON-HOOK(weixin-multi-account): delegate external WeChat entry visibility to Dalton hook
+  const weixinAllowExternal = useWeixinExternalVisibility(identity.isExternal, hasCapability);
   const effectiveTier = identity.status === 'ready' ? identity.tier : null;
   return {
     canInvite: identity.canInvite,
@@ -44,6 +47,7 @@ export function useDaltonSettingsVisibility(
     coverageUnitsEnabled: coverageData?.enabled === true,
     coverageUnitsPending: coverageLoading,
     discordChannelsAdmin: identity.isAdmin,
+    weixinAllowExternal,
     capabilities,
     capabilitiesLoading,
   };

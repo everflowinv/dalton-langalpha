@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dalton-guidepoint",
+  "version": "0.1.0",
+  "description": "Guidepoint expert interview transcript search connector (commercial).",
+  "author": { "name": "Dalton" },
+  "license": "Proprietary",
+  "extensions": {
+    "ai.langalpha": {
+      "servers": {
+        "dalton_guidepoint": {
+          "description": "Guidepoint expert interview transcript search (`search_library`, max size 30).",
+          "tool_exposure_mode": "summary",
+          "instruction": "Use `search_library(query=..., start=..., end=..., limit=..., params={'keywords': [...], 'recency_bias': 30})` to search Guidepoint expert interview Q&A excerpts. Cite expert role, never full name; keep verbatim quotes <= 20 words."
+        }
+      }
+    }
+  }
+}

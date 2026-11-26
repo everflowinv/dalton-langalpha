@@ -3293,6 +3293,125 @@ _HK_DOT_RE = re.compile(r"^0*(\d{1,5})\.HK$", re.IGNORECASE)
 _CN_DOT_RE = re.compile(r"^(\d{6})\.(SH|SZ|SS)$", re.IGNORECASE)
 _US_DOT_RE = re.compile(r"^([A-Za-z][A-Za-z0-9.\-]{0,15})\.US$", re.IGNORECASE)
 
+def _load_sec_issuer_map_data() -> dict[str, Any]:
+    """Load the canonical SEC issuer map JSON from ``plugins/dalton_sec/`` without importing ``src``."""
+    here = Path(__file__).resolve()
+    candidates = (
+        here.with_name("sec_issuer_map.json"),
+        *(parent / "plugins" / "dalton_sec" / "sec_issuer_map.json" for parent in here.parents),
+    )
+    for path in candidates:
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+    return {}
+
+
+_SEC_ISSUER_MAP_DATA: dict[str, Any] = _load_sec_issuer_map_data()
+_DUAL_LISTED_SEC_ISSUER_MAP: dict[str, str] = {
+    str(k).upper(): str(v).upper()
+    for k, v in (_SEC_ISSUER_MAP_DATA.get("dual_listed_sec_issuer_map") or {}).items()
+}
+_CONFIRMED_NON_SEC_ISSUERS: frozenset[str] = frozenset(
+    str(item).upper() for item in (_SEC_ISSUER_MAP_DATA.get("confirmed_non_sec_issuers") or ())
+)
+_NON_SEC_MARKET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = tuple(
+    (re.compile(str(pat), re.IGNORECASE), str(label))
+    for pat, label in (_SEC_ISSUER_MAP_DATA.get("non_sec_market_patterns") or ())
+)
+_SEC_A_SHARE_RE = re.compile(r"^(?:\d{6}\.(?:SH|SZ|SS|BJ)|(?:SH|SZ|BJ)\d{6})$", re.IGNORECASE)
+_SEC_HK_RE = re.compile(r"^(?:HK:)?0*(\d{1,5})(?:\.HK)?$", re.IGNORECASE)
+
+
+def _sec_hk_candidates(raw: str) -> tuple[str, ...]:
+    m_hk = _SEC_HK_RE.fullmatch(raw)
+    if not m_hk:
+        return ()
+    if not (
+        raw.endswith(".HK")
+        or raw.startswith("HK:")
+        or (raw.isdigit() and len(raw) == 5 and raw.startswith("0"))
+    ):
+        return ()
+    num = int(m_hk.group(1))
+    return (f"{num:04d}.HK", f"{num}.HK", f"{num:05d}", f"HK:{num:04d}", f"HK:{num:05d}")
+
+
+def _detect_non_sec_ticker(ticker: str | None) -> str | None:
+    raw = str(ticker or "").strip()
+    if not raw:
+        return None
+    for pat, label in _NON_SEC_MARKET_PATTERNS:
+        if pat.fullmatch(raw):
+            return label
+    return None
+
+
+def _lookup_sec_watchlist_alias(raw: str) -> str | None:
+    alias_map = None
+    for mod_name in ("scripts.dalton.alphaengine_search_cache", "alphaengine_search_cache"):
+        try:
+            mod = __import__(mod_name, fromlist=["_CORE_WATCHLIST_ALIASES"])
+            alias_map = getattr(mod, "_CORE_WATCHLIST_ALIASES", None)
+            if isinstance(alias_map, dict):
+                break
+        except Exception:
+            continue
+    if not isinstance(alias_map, dict):
+        return None
+    cands = {raw, *_sec_hk_candidates(raw)}
+    for canon, aliases in alias_map.items():
+        canon_str = str(canon or "").strip().upper()
+        if not canon_str or _detect_non_sec_ticker(canon_str) is not None:
+            continue
+        if any(str(a or "").strip().upper() in cands for a in (aliases or ())):
+            return canon_str
+    return None
+
+
+def _resolve_sec_issuer_ticker(ticker: str | None) -> str | None:
+    raw = str(ticker or "").strip().upper()
+    if not raw:
+        return None
+    if raw in _DUAL_LISTED_SEC_ISSUER_MAP:
+        return _DUAL_LISTED_SEC_ISSUER_MAP[raw]
+    for cand in _sec_hk_candidates(raw):
+        if cand in _DUAL_LISTED_SEC_ISSUER_MAP:
+            return _DUAL_LISTED_SEC_ISSUER_MAP[cand]
+    return _lookup_sec_watchlist_alias(raw)
+
+
+def _is_confirmed_non_sec_ticker(ticker: str | None) -> bool:
+    raw = str(ticker or "").strip().upper()
+    if not raw:
+        return False
+    if _SEC_A_SHARE_RE.fullmatch(raw):
+        return True
+    if raw in _CONFIRMED_NON_SEC_ISSUERS:
+        return True
+    for cand in _sec_hk_candidates(raw):
+        if cand in _CONFIRMED_NON_SEC_ISSUERS:
+            return True
+    if raw.startswith(("KR:", "KS:", "KQ:")):
+        code = raw.split(":", 1)[1].strip()
+        if f"{code}.KS" in _CONFIRMED_NON_SEC_ISSUERS or f"{code}.KQ" in _CONFIRMED_NON_SEC_ISSUERS:
+            return True
+    return False
+
+
+def _classify_sec_ticker(ticker: str | None) -> tuple[str, str | None, str | None]:
+    raw = str(ticker or "").strip()
+    if not raw:
+        return ("direct", raw, None)
+    mapped = _resolve_sec_issuer_ticker(raw)
+    market_label = _detect_non_sec_ticker(raw)
+    if mapped is not None:
+        return ("mapped", mapped, market_label)
+    if market_label is not None:
+        if _is_confirmed_non_sec_ticker(raw):
+            return ("confirmed_non_sec", None, market_label)
+        return ("unmapped_non_us", None, market_label)
+    return ("direct", raw, None)
+
 
 def _normalize_ticker_for_route(route: str, ticker: str) -> str:
     """Normalize stock code format to match the target route's expected representation."""
@@ -5544,11 +5663,23 @@ def _classify_error_category_and_hint(
         or xueqiu_login_expired
     )
 
+    internal_serialization_signal = (
+        err_code in ("serialization_error", "internal_serialization_error")
+        or status == "internal_error"
+        or "keys must be str, int, float, bool or none" in err_lower
+        or "is not json serializable" in err_lower
+        or "内部序列化" in err_text
+    )
+
     _succeeded, failed_legs = (
         _collect_multi_source_health(payload) if route == "all" else ([], [])
     )
 
-    if existing_cat in ("参数错误", "上游不可用", "权限或额度", "没有匹配"):
+    if internal_serialization_signal:
+        payload["error_code"] = payload.get("error_code") or "internal_serialization_error"
+        payload["status"] = "internal_error"
+        category = "内部错误"
+    elif existing_cat in ("参数错误", "上游不可用", "权限或额度", "没有匹配", "内部错误"):
         category = existing_cat
     elif route == "all" and failed_legs:
         leg_cats = {
@@ -5588,7 +5719,12 @@ def _classify_error_category_and_hint(
     if existing_hint and not _hint_conflicts_with_category(category, existing_hint):
         return category, existing_hint
 
-    if category == "参数错误":
+    if category == "内部错误":
+        hint = (
+            "服务端内部数据序列化失败（非调用参数错误）；请勿修改参数盲目重试，"
+            "可稍后重试或改用备用数据源。"
+        )
+    elif category == "参数错误":
         if ae_query_sort:
             hint = (
                 "有关键词的主题检索必须使用 sort='relevance'；无关键词浏览才可使用 sort='newest'。"
@@ -13953,6 +14089,60 @@ class ResearchDataBridge:
         norm_params_view = _build_normalized_params_view(call_args, is_community=False)
         if tool_name == "catalog" and route:
             norm_params_view["route"] = route
+
+        if (
+            tool_name == "finance"
+            and route == "sec"
+            and operation in ("list-filings", "")
+        ):
+            sec_ticker = str(call_args.get("ticker") or "").strip()
+            ticker_kind, mapped_sec, non_sec_market = _classify_sec_ticker(sec_ticker)
+            if ticker_kind == "mapped" and mapped_sec is not None:
+                call_args["ticker"] = mapped_sec
+                norm_params_view["ticker"] = mapped_sec
+            elif ticker_kind == "confirmed_non_sec":
+                alt_hint = (
+                    '港股与 A 股请改用 finance(route="cn-hk", operation="filings", ...) 查询公告。'
+                    if non_sec_market in ("港股", "A股")
+                    else "韩股及其他非美股请查当地交易所公告或内部研究库，无需请求 SEC。"
+                )
+                non_sec_payload: dict[str, Any] = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "not_sec_filer",
+                    "error_code": "not_sec_filer",
+                    "error_category": "没有匹配",
+                    "sec_filer": False,
+                    "ticker": sec_ticker,
+                    "filings": [],
+                    "rows": [],
+                    "error": f"该证券不在 SEC 申报：{sec_ticker} 属于{non_sec_market}，无 SEC 身份（CIK），未请求 SEC。",
+                    "hint": alt_hint,
+                    "normalized_params": norm_params_view,
+                }
+                return self._make_tool_result_response(
+                    req_id, non_sec_payload, is_error=True
+                )
+            elif ticker_kind == "unmapped_non_us":
+                unmapped_payload: dict[str, Any] = {
+                    "_declared_sources": [],
+                    "_sources": [],
+                    "ok": False,
+                    "status": "sec_issuer_mapping_not_found",
+                    "error_code": "sec_issuer_mapping_not_found",
+                    "error_category": "没有匹配",
+                    "sec_filer": None,
+                    "ticker": sec_ticker,
+                    "filings": [],
+                    "rows": [],
+                    "error": f"未找到 {sec_ticker} 对应的美股/ADR 代码或 SEC CIK 映射（属于{non_sec_market}）；若该公司以 ADR/20-F 在 SEC 申报，请改用其美股代码或 10 位 CIK 查询。",
+                    "hint": "请提供该公司对应的美股 ADR 代码或 SEC CIK，或改用当地交易所/cn-hk 路由查询。",
+                    "normalized_params": norm_params_view,
+                }
+                return self._make_tool_result_response(
+                    req_id, unmapped_payload, is_error=True
+                )
 
         do_fanout = self._should_fanout_alphaengine(tool_name, arguments)
         ae_args: dict[str, Any] | None = None

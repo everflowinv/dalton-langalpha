@@ -67,6 +67,7 @@ const sidebar = [
             { label: '研究数据源', slug: 'everflow/research-data-sources' },
             { label: '定时报告与投递', slug: 'everflow/scheduled-reports-and-delivery' },
             { label: '设置页逐组说明', slug: 'everflow/settings-guide' },
+            { label: '隐私政策', slug: 'everflow/privacy' },
           ],
         },
       ]

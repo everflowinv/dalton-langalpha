@@ -124,8 +124,15 @@ def _commit_failure_artifacts(
     prev_index_meta: dict[str, Any],
     is_month_end: bool,
     headline_reason: str | None = None,
+    diagnostic_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Commit degraded SourceStatuses without touching frozen history or advancing last_success_at."""
+    """Commit degraded SourceStatuses without touching frozen history or advancing last_success_at.
+
+    When ``diagnostic_meta`` is supplied (e.g. from this run's ``compute_all`` on a month-end
+    completeness failure), this run's diagnostic fields (``index_dates``,
+    ``missing_held_by_index``) are recorded for observability while ``prev_index_meta``'s
+    published ``last_date`` / ``launch_date`` and published series/frozen files are preserved.
+    """
     status_doc = status_store.update_sources(
         results,
         required=required_names,
@@ -152,6 +159,11 @@ def _commit_failure_artifacts(
             "source_statuses": status_doc["sources"],
         }
     )
+    if isinstance(diagnostic_meta, dict):
+        if isinstance(diagnostic_meta.get("index_dates"), dict):
+            fail_meta["index_dates"] = dict(diagnostic_meta["index_dates"])
+        if isinstance(diagnostic_meta.get("missing_held_by_index"), dict):
+            fail_meta["missing_held_by_index"] = dict(diagnostic_meta["missing_held_by_index"])
     atomic_write_json(st_dir / "index_meta.json", fail_meta)
 
     prev_live = load_json_safe(st_dir / "live.json", {}) or {}
@@ -196,19 +208,88 @@ def _commit_failure_artifacts(
         live_err["stale_reason"] = fail_meta["stale_reason"]
         atomic_write_json(st_dir / "live.json", live_err)
 
+    fail_index_dates = fail_meta.get("index_dates") if isinstance(fail_meta.get("index_dates"), dict) else None
+    fail_missing = (
+        fail_meta.get("missing_held_by_index")
+        if isinstance(fail_meta.get("missing_held_by_index"), dict)
+        else None
+    )
+    fail_summary = _format_hk_failure_summary(
+        stale_reason=fail_meta.get("stale_reason"),
+        index_dates=fail_index_dates,
+        missing_held_by_index=fail_missing,
+        sources=status_doc["sources"],
+    )
+    if fail_summary:
+        fail_meta["failure_summary"] = fail_summary
+        atomic_write_json(st_dir / "index_meta.json", fail_meta)
+
     return {
         "ok": False,
         "publish_ok": False,
         "froze": False,
         "output": out_path_str,
         "last_date": fail_meta.get("last_date"),
+        "index_dates": fail_index_dates,
+        "missing_held_by_index": fail_missing,
         "launch_date": fail_meta.get("launch_date"),
         "stale": True,
         "month_end_failed": is_month_end,
         "stale_reason": fail_meta["stale_reason"],
+        "failure_summary": fail_summary,
         "last_success_at": overall.get("last_success_at"),
         "sources": status_doc["sources"],
     }
+
+
+def _format_hk_failure_summary(
+    *,
+    stale_reason: str | None,
+    index_dates: dict[str, Any] | None,
+    missing_held_by_index: dict[str, Any] | None = None,
+    sources: dict[str, Any] | None = None,
+    max_chars: int = 900,
+) -> str | None:
+    """Format a concise human-readable failure summary with missing constituents & per-index dates.
+
+    Caps the error body before appending ``| 数据日期: ...`` so the 1000-char DB column
+    cap in ``record_monitor_publish_failure`` never truncates the date suffix.
+    """
+    reason_parts: list[str] = []
+    if stale_reason and str(stale_reason).strip():
+        reason_parts.append(str(stale_reason).strip())
+    elif isinstance(sources, dict):
+        for src_val in sources.values():
+            if isinstance(src_val, dict) and (not src_val.get("ok") or src_val.get("stale")):
+                r = str(src_val.get("reason") or "").strip()
+                if r and r not in reason_parts:
+                    reason_parts.append(r)
+    if not reason_parts and isinstance(missing_held_by_index, dict):
+        for idx_key, codes in missing_held_by_index.items():
+            if isinstance(codes, list) and codes:
+                preview = ", ".join(str(c) for c in codes[:5])
+                reason_parts.append(
+                    f"{idx_key} 持有成分缺少必要价格 {len(codes)} 只 (如 {preview})"
+                )
+
+    date_parts: list[str] = []
+    if isinstance(index_dates, dict):
+        for idx_key, dt_val in index_dates.items():
+            if dt_val is not None and str(dt_val).strip():
+                date_parts.append(f"{idx_key}={dt_val}")
+
+    if not reason_parts and not date_parts:
+        return None
+    headline = "；".join(reason_parts) if reason_parts else "港股动量日度更新失败"
+    if date_parts:
+        date_suffix = f" | 数据日期: {', '.join(date_parts)}"
+        body_budget = max(80, int(max_chars) - len(date_suffix))
+        if len(headline) > body_budget:
+            headline = headline[: body_budget - 1].rstrip() + "…"
+        return f"{headline}{date_suffix}"
+    if len(headline) > max_chars:
+        return headline[: max_chars - 1].rstrip() + "…"
+    return headline
 
 
 def _hk_publish_ok(
@@ -375,6 +456,7 @@ def run_daily_job(
             prev_index_meta=prev_index_meta,
             is_month_end=True,
             headline_reason=detail,
+            diagnostic_meta=meta,
         )
 
     snap: dict[str, Any] | None = None
@@ -482,6 +564,14 @@ def run_daily_job(
             k: v for k, v in final_doc["sources"].items() if k in (daily_source_names + ["html_render"])
         }
         meta["source_statuses"] = meta["sources"]
+        render_fail_summary = _format_hk_failure_summary(
+            stale_reason=final_overall.get("reason"),
+            index_dates=meta.get("index_dates"),
+            missing_held_by_index=meta.get("missing_held_by_index"),
+            sources=final_doc["sources"],
+        )
+        if render_fail_summary:
+            meta["failure_summary"] = render_fail_summary
         atomic_write_json(st_dir / "index_meta.json", meta)
         return {
             "ok": False,
@@ -489,10 +579,13 @@ def run_daily_job(
             "froze": False,
             "output": str(Path(output_dir) / "index.html"),
             "last_date": meta.get("last_date"),
+            "index_dates": meta.get("index_dates"),
+            "missing_held_by_index": meta.get("missing_held_by_index"),
             "launch_date": meta.get("launch_date"),
             "stale": True,
             "month_end_failed": False,
             "stale_reason": final_overall.get("reason"),
+            "failure_summary": render_fail_summary,
             "last_success_at": final_overall.get("last_success_at"),
             "sources": final_doc["sources"],
         }
@@ -525,16 +618,35 @@ def run_daily_job(
         skip_fetch=skip_fetch,
         render_ok=True,
     )
+    failure_summary = (
+        None
+        if publish_ok
+        else _format_hk_failure_summary(
+            stale_reason=overall.get("reason") or meta.get("stale_reason"),
+            index_dates=meta.get("index_dates"),
+            missing_held_by_index=meta.get("missing_held_by_index"),
+            sources=final_doc["sources"],
+        )
+    )
+    if failure_summary:
+        meta["failure_summary"] = failure_summary
+        atomic_write_json(st_dir / "index_meta.json", meta)
+    elif "failure_summary" in meta:
+        meta.pop("failure_summary", None)
+        atomic_write_json(st_dir / "index_meta.json", meta)
     return {
         "ok": bool(overall.get("ok")),
         "publish_ok": bool(publish_ok),
         "froze": will_freeze,
         "output": str(out_path),
         "last_date": meta.get("last_date"),
+        "index_dates": meta.get("index_dates"),
+        "missing_held_by_index": meta.get("missing_held_by_index"),
         "launch_date": meta.get("launch_date"),
         "stale": bool(overall.get("stale")),
         "month_end_failed": False,
-        "stale_reason": overall.get("reason"),
+        "stale_reason": overall.get("reason") or meta.get("stale_reason"),
+        "failure_summary": failure_summary,
         "last_success_at": overall.get("last_success_at"),
         "sources": final_doc["sources"],
     }

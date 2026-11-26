@@ -183,6 +183,11 @@ const evTasks = [
       `${base} 阶段 2 内部记忆检索：检索 researchdata 的 sales-notes、tmtb、funda-ai、company-wiki（只读），英文与中文结合，写 ${R}/internal-memory.md。`,
       { agentType: 'dalton-evidence', label: '内部记忆', phase: '分簇取证', schema: OUT }
     ),
+/* /DALTON_CAP *//* DALTON_CAP:!researchdata_bridge,company_wiki|!researchdata_bridge,sales_notes|!researchdata_bridge,tmtb|!researchdata_bridge,funda_ai */  () =>
+    agent(
+      `${base} 阶段 2 内部记忆检索：检索已启用的内部研究知识库连接器（只读），英文与中文结合，写 ${R}/internal-memory.md。`,
+      { agentType: 'dalton-evidence', label: '内部记忆', phase: '分簇取证', schema: OUT }
+    ),
 /* /DALTON_CAP *//* DALTON_CAP:guidepoint */  () =>
     agent(
       `${base} 阶段 2 专家纪要检索：用英文检索 Guidepoint 1–2 轮，标专家身份不写姓名，原话引用 ≤20 个英文词并带出处，写 ${R}/guidepoint.md。`,
@@ -191,20 +196,20 @@ const evTasks = [
 /* /DALTON_CAP */]
 const evResults = await parallel(evTasks)
 
-// B1：contract 要求 primary.md（≥100 字节）、cluster-* ≥3 个（各 ≥100 字节）/* DALTON_CAP:researchdata_bridge,guidepoint */、
+// B1：contract 要求 primary.md（≥100 字节）、cluster-* ≥3 个（各 ≥100 字节）/* DALTON_CAP:researchdata_bridge,guidepoint|company_wiki,guidepoint|sales_notes,guidepoint|tmtb,guidepoint|funda_ai,guidepoint */、
 // internal-memory.md 与 guidepoint.md（各 ≥50 字节）/* /DALTON_CAP */必交。取证子任务返回
 // null/files 为空、或核验发现在盘缺失/过小，都算缺失；凑不满底线（含全部缺失）
 // 停在交叉验证之前，出口与审稿 block 同一段文案。个别簇缺失但底线仍够时不
 // block：缺失簇写进 incomplete、传给写作提示词并在返回值里列出。
 const clusterFiles = clusters.map((c, idx) => `${R}/cluster-${c.id || `c${idx + 1}`}.md`)
 const clusterNames = clusters.map((c, idx) => c.name || `簇 ${idx + 1}`)
-/* DALTON_CAP:researchdata_bridge */const internalFile = `${R}/internal-memory.md`
+/* DALTON_CAP:researchdata_bridge|company_wiki|sales_notes|tmtb|funda_ai */const internalFile = `${R}/internal-memory.md`
 /* /DALTON_CAP *//* DALTON_CAP:guidepoint */const guidepointFile = `${R}/guidepoint.md`
 /* /DALTON_CAP */const primaryFile = `${R}/primary.md`
 const clusterOnDisk = clusters.map((_, i) => branchArtifacts(evResults[i]).length > 0)
-/* DALTON_CAP:researchdata_bridge */let internalOnDisk = branchArtifacts(evResults[clusters.length]).length > 0
+/* DALTON_CAP:researchdata_bridge|company_wiki|sales_notes|tmtb|funda_ai */let internalOnDisk = branchArtifacts(evResults[clusters.length]).length > 0
 /* /DALTON_CAP *//* DALTON_CAP:guidepoint */let guidepointOnDisk = branchArtifacts(evResults[clusters.length + 1]).length > 0
-/* /DALTON_CAP *//* DALTON_CAP:!researchdata_bridge,guidepoint */guidepointOnDisk = branchArtifacts(evResults[clusters.length]).length > 0
+/* /DALTON_CAP *//* DALTON_CAP:!researchdata_bridge,!company_wiki,!sales_notes,!tmtb,!funda_ai,guidepoint */guidepointOnDisk = branchArtifacts(evResults[clusters.length]).length > 0
 /* /DALTON_CAP */let primaryOnDisk = branchArtifacts(primary).length > 0
 // 缺失簇在核验前先按子任务回报算一遍（核验失败的出口要用），核验后再按在盘
 // 结果重算；此后所有出口（取证缺失 block、审稿 block、最终返回）都带上。
@@ -217,7 +222,7 @@ let missingClusterIds = clusters
 const toProbe = [
   ...(primaryOnDisk ? [[primaryFile, 100]] : []),
   ...clusterFiles.filter((_, i) => clusterOnDisk[i]).map((p) => [p, 100]),
-/* DALTON_CAP:researchdata_bridge */  ...(internalOnDisk ? [[internalFile, 50]] : []),
+/* DALTON_CAP:researchdata_bridge|company_wiki|sales_notes|tmtb|funda_ai */  ...(internalOnDisk ? [[internalFile, 50]] : []),
 /* /DALTON_CAP *//* DALTON_CAP:guidepoint */  ...(guidepointOnDisk ? [[guidepointFile, 50]] : []),
 /* /DALTON_CAP */]
 if (toProbe.length) {
@@ -240,7 +245,7 @@ if (toProbe.length) {
     const path = entry.slice(0, -'|missing'.length)
     const idx = clusterFiles.indexOf(path)
     if (idx >= 0) clusterOnDisk[idx] = false
-/* DALTON_CAP:researchdata_bridge */    else if (path === internalFile) internalOnDisk = false
+/* DALTON_CAP:researchdata_bridge|company_wiki|sales_notes|tmtb|funda_ai */    else if (path === internalFile) internalOnDisk = false
 /* /DALTON_CAP *//* DALTON_CAP:guidepoint */    else if (path === guidepointFile) guidepointOnDisk = false
 /* /DALTON_CAP */    else if (path === primaryFile) primaryOnDisk = false
   }
@@ -257,7 +262,7 @@ const topicMissing = []
 if (!primaryOnDisk) topicMissing.push('一手材料')
 if (presentClusters < 3)
   topicMissing.push(`cluster-*.md 完整产物不足 3 个（现 ${presentClusters} 个）`)
-/* DALTON_CAP:researchdata_bridge */if (!internalOnDisk) topicMissing.push('内部记忆检索')
+/* DALTON_CAP:researchdata_bridge|company_wiki|sales_notes|tmtb|funda_ai */if (!internalOnDisk) topicMissing.push('内部记忆检索')
 /* /DALTON_CAP *//* DALTON_CAP:guidepoint */if (!guidepointOnDisk) topicMissing.push('专家纪要检索')
 /* /DALTON_CAP */if (topicMissing.length) {
   return {
@@ -273,7 +278,7 @@ if (presentClusters < 3)
 
 phase('交叉验证与盲区')
 const cross = await agent(
-  `${base} 阶段 3 交叉验证 + 阶段 3.5 盲区检查：读 ${R}/ 下全部取证文件（primary.md、cluster-*.md/* DALTON_CAP:researchdata_bridge */、internal-memory.md/* /DALTON_CAP *//* DALTON_CAP:guidepoint */、guidepoint.md/* /DALTON_CAP */），跨簇互证升级置信度（【高】≥3 独立源、【中】2 源、【低】单源）；矛盾保留各方原话（【冲突】），不折中合并；检查盲区并写 ${R}/cross-check.md，结尾写“盲区检查完成”。若仍有必须补查的盲区，放入返回 JSON 的 gaps 数组（最多 2 项）。`,
+  `${base} 阶段 3 交叉验证 + 阶段 3.5 盲区检查：读 ${R}/ 下全部取证文件（primary.md、cluster-*.md/* DALTON_CAP:researchdata_bridge|company_wiki|sales_notes|tmtb|funda_ai */、internal-memory.md/* /DALTON_CAP *//* DALTON_CAP:guidepoint */、guidepoint.md/* /DALTON_CAP */），跨簇互证升级置信度（【高】≥3 独立源、【中】2 源、【低】单源）；矛盾保留各方原话（【冲突】），不折中合并；检查盲区并写 ${R}/cross-check.md，结尾写“盲区检查完成”。若仍有必须补查的盲区，放入返回 JSON 的 gaps 数组（最多 2 项）。`,
   { agentType: 'general-purpose', label: '交叉验证与盲区', phase: '交叉验证与盲区', schema: OUT }
 )
 
@@ -282,7 +287,7 @@ if (cross && Array.isArray(cross.gaps) && cross.gaps.length > 0) {
   await parallel(
     suppGaps.map((g, idx) => () =>
       agent(
-        `${base} 阶段 3.5 盲区补查 #${idx + 1}：针对盲区「${g}」补充检索一手材料/* DALTON_CAP:alphaengine|researchdata_bridge */、内部库或 AlphaEngine/* DALTON_CAP_ELSE */与公开资料/* /DALTON_CAP */，写 ${R}/supplement-${
+        `${base} 阶段 3.5 盲区补查 #${idx + 1}：针对盲区「${g}」补充检索一手材料/* DALTON_CAP:alphaengine */、内部库或 AlphaEngine/* /DALTON_CAP *//* DALTON_CAP:!alphaengine,researchdata_bridge|!alphaengine,company_wiki|!alphaengine,sales_notes|!alphaengine,tmtb|!alphaengine,funda_ai */、内部研究库/* /DALTON_CAP *//* DALTON_CAP:!alphaengine,!researchdata_bridge,!company_wiki,!sales_notes,!tmtb,!funda_ai */与公开资料/* /DALTON_CAP */，写 ${R}/supplement-${
           idx + 1
         }.md。`,
         { agentType: 'dalton-evidence', label: `盲区补查 ${idx + 1}`, phase: '交叉验证与盲区', schema: OUT }

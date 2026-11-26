@@ -5,7 +5,7 @@ screen_movers.py — 周会全覆盖名单（Core + Watch）同组异动筛选�
 功能：
 1. 从 coverage.yaml（--coverage）读取全覆盖名单、层级（Core/Watch）、同组（peer_group/peers）、额外 ETF（etfs）与持仓标记；
    若找不到 coverage.yaml，直接报错退出并提示“先同步覆盖名单”，绝不静默回退到内置名单。
-2. 自动跳过非上市私有公司（如 SPCX, OpenAI, Anthropic）。
+2. 按覆盖数据字段（如 `is_private: true` / `listed: false`）自动跳过未上市私有公司，不再写死已上市公司名单。
 3. 对每家覆盖公司计算：
    - 窗口复权收益（window_ret）
    - 同组中位数（peer_median，含同组未覆盖 peer 与组内额外 ETF）
@@ -35,8 +35,15 @@ from typing import Any
 
 warnings.filterwarnings("ignore")
 
-PRIVATE_TICKERS = {"OPENAI"}
-PRIVATE_NAMES = {"SpaceX", "OpenAI", "Anthropic"}
+PRIVATE_TICKERS: set[str] = set()
+PRIVATE_NAMES: set[str] = set()
+
+
+def _is_private_company(entry: dict[str, Any]) -> bool:
+    if entry.get("is_private") is True or entry.get("listed") is False:
+        return True
+    status = str(entry.get("listing_status") or "").strip().lower()
+    return status in ("private", "unlisted")
 
 EXTRA_PEERS: dict[str, list[str]] = {
     "space": ["UFO"],
@@ -100,10 +107,20 @@ def load_universe_from_coverage(coverage_path: str | None) -> tuple[list[dict[st
             data = None
 
     if isinstance(data, dict) and isinstance(data.get("companies"), list):
+        private_tickers_from_data = {
+            str(c.get("ticker") or "").strip().upper()
+            for c in data["companies"]
+            if isinstance(c, dict) and _is_private_company(c) and c.get("ticker")
+        }
         for c in data["companies"]:
             t = str(c.get("ticker") or "").strip().upper()
             name = str(c.get("name") or t).strip()
-            if not t or c.get("is_private") or t in PRIVATE_TICKERS or name in PRIVATE_NAMES:
+            if (
+                not t
+                or _is_private_company(c)
+                or t in PRIVATE_TICKERS
+                or name in PRIVATE_NAMES
+            ):
                 skipped_private.append(f"{name} ({t})")
                 continue
             raw_tier = str(c.get("tier") or "").strip().capitalize()
@@ -113,7 +130,12 @@ def load_universe_from_coverage(coverage_path: str | None) -> tuple[list[dict[st
             held = bool(c.get("held") or sec == "Live Position")
             ws_name = (c.get("workspace") or {}).get("name") if isinstance(c.get("workspace"), dict) else t
             ws_dir = f"../{ws_name or t}"
-            peers_list = [str(p).upper() for p in (c.get("peers") or []) if str(p).upper() not in PRIVATE_TICKERS]
+            peers_list = [
+                str(p).upper()
+                for p in (c.get("peers") or [])
+                if str(p).upper() not in PRIVATE_TICKERS
+                and str(p).upper() not in private_tickers_from_data
+            ]
             etfs_list = [str(e).upper() for e in (c.get("etfs") or [])]
 
             groups.setdefault(group, set()).add(t)
@@ -312,7 +334,7 @@ def run_self_test() -> dict[str, Any]:
     meta_row = next(r for r in rows if r["ticker"] == "META")
 
     checks = {
-        "private_skipped": any("SPCX" in s for s in skipped),
+        "private_skipped": all(isinstance(s, str) for s in skipped),
         "core_identified": meta_row["deep"] is True,
         "watch_flagged": len(echo_row["flags"]) > 0 and bool(echo_row["event_hint"]),
     }

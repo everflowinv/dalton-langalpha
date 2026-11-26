@@ -45,6 +45,7 @@ from .service import (
 )
 from .wire import (
     ANTHROPIC,
+    ANTIGRAVITY,  # DALTON-HOOK(llm-sdk-dispatch): export Antigravity list shape
     BAD_RESPONSE,
     CODEX,
     ENDPOINT_REFUSED,
@@ -65,6 +66,7 @@ from .wire import (
 
 __all__ = [
     "ANTHROPIC",
+    "ANTIGRAVITY",  # DALTON-HOOK(llm-sdk-dispatch): export Antigravity list shape
     "BAD_RESPONSE",
     "CODEX",
     "EMPTY_LIST",

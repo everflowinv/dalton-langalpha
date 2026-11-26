@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 import random
@@ -2282,6 +2282,20 @@ async def start_weixin_login_session(
                     )
                     await cur.execute(
                         """
+                        SELECT MAX(created_at) AS max_created_at
+                        FROM dalton_channel_weixin_login_sessions
+                        WHERE user_id = %s
+                        """,
+                        (cleaned_uid,),
+                    )
+                    max_row = await cur.fetchone()
+                    prev_max_created = (
+                        _coerce_utc(max_row.get("max_created_at"))
+                        if isinstance(max_row, Mapping)
+                        else None
+                    )
+                    await cur.execute(
+                        """
                         INSERT INTO dalton_channel_weixin_login_sessions (
                             session_key, user_id, target_account_id,
                             login_version, expected_bot_generation,
@@ -2292,10 +2306,10 @@ async def start_weixin_login_session(
                             %s, %s, %s::uuid,
                             1, %s,
                             'starting', NULL, NULL,
-                            %s, NOW() + INTERVAL '60 seconds', NOW(), NOW()
+                            %s, clock_timestamp() + INTERVAL '60 seconds', clock_timestamp(), clock_timestamp()
                         )
                         RETURNING session_key, user_id, target_account_id::text AS target_account_id,
-                                  login_version, expected_bot_generation, status, expires_at
+                                  login_version, expected_bot_generation, status, created_at, expires_at
                         """,
                         (
                             session_key,
@@ -2306,6 +2320,26 @@ async def start_weixin_login_session(
                         ),
                     )
                     inserted = dict(await cur.fetchone())
+                    inserted_created = _coerce_utc(inserted.get("created_at"))
+                    if (
+                        prev_max_created is not None
+                        and inserted_created is not None
+                        and inserted_created <= prev_max_created
+                    ):
+                        bumped_created = prev_max_created + timedelta(microseconds=1)
+                        bumped_expires = bumped_created + timedelta(seconds=60)
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_weixin_login_sessions
+                            SET created_at = %s,
+                                updated_at = %s,
+                                expires_at = %s
+                            WHERE session_key = %s
+                            """,
+                            (bumped_created, bumped_created, bumped_expires, session_key),
+                        )
+                        inserted["created_at"] = bumped_created
+                        inserted["expires_at"] = bumped_expires
                     return {
                         "session_key": str(inserted["session_key"]),
                         "user_id": str(inserted["user_id"]),
@@ -2467,6 +2501,7 @@ async def get_weixin_login_session(
                         else None
                     ),
                     "redirect_base_url": str(row.get("redirect_base_url") or DEFAULT_BASE_URL),
+                    "created_at": _iso(row.get("created_at")),
                     "expires_at": _iso(expires_at),
                     "connected": False,
                     "already_connected": False,
@@ -2621,7 +2656,7 @@ async def _patch_login_session_save_qr(
                           AND status = 'starting'
                           AND login_version = 1
                           AND expires_at > NOW()
-                        RETURNING session_key, status, login_version, expires_at, redirect_base_url
+                        RETURNING session_key, status, login_version, created_at, expires_at, redirect_base_url
                         """,
                         (
                             cleaned_qr,
@@ -2647,6 +2682,7 @@ async def _patch_login_session_save_qr(
                         "session_key": str(updated["session_key"]),
                         "status": str(updated["status"]),
                         "login_version": int(updated["login_version"]),
+                        "created_at": _iso(updated.get("created_at")),
                         "expires_at": _iso(updated["expires_at"]),
                         "redirect_base_url": str(updated["redirect_base_url"]),
                     }
@@ -3851,10 +3887,16 @@ async def get_member_weixin_binding_view(
             )
             async with owned_conn.cursor(row_factory=dict_row) as cur:
                 cfg = await ensure_and_lock_weixin_config_in_tx(cur, for_update=False)
+                db_allow_ext = cfg.get("allow_external")
+                eff_allow_ext = (
+                    bool(db_allow_ext)
+                    if db_allow_ext is not None
+                    else bool(get_dalton_config().weixin.allow_external)
+                )
                 access_ok, access_deny = evaluate_weixin_member_access(
                     eff_tier,
                     channel_enabled=bool(cfg["enabled"]),
-                    db_allow_external=cfg.get("allow_external"),
+                    db_allow_external=db_allow_ext,
                 )
                 await cur.execute(
                     """
@@ -3883,6 +3925,7 @@ async def get_member_weixin_binding_view(
                         "platform": "weixin",
                         "status": "paused" if not access_ok else "unconfigured",
                         "channel_enabled": bool(cfg["enabled"]),
+                        "allow_external": eff_allow_ext,
                         "member_allowed": access_ok,
                         "deny_reason": access_deny,
                         "account_id": None,
@@ -3939,6 +3982,7 @@ async def get_member_weixin_binding_view(
                     "raw_status": st,
                     "disabled_reason": acc.get("disabled_reason"),
                     "channel_enabled": bool(cfg["enabled"]),
+                    "allow_external": eff_allow_ext,
                     "member_allowed": access_ok,
                     "deny_reason": access_deny,
                     "platform_user_id": acc.get("ilink_user_id"),

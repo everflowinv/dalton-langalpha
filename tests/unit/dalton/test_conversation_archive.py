@@ -116,7 +116,7 @@ async def test_extraction_verbatim_quote_validation_and_speaker_rules(
                 "is_owner": True,
                 "role": "owner",
             },
-            "text": "META 2026 年资本开支指引我们模型按 680 亿美元测算，同时 OpenAI 与 Anthropic 的推理算力需求仍在翻倍。",
+            "text": "META 2026 年资本开支指引我们模型按 680 亿美元测算，同时 OpenAI 与 xAI 的推理算力需求仍在翻倍。",
         },
         {
             "agent": "main",
@@ -154,7 +154,7 @@ async def test_extraction_verbatim_quote_validation_and_speaker_rules(
                         "type": "model_assumption",
                         "topic_label": "META 2026 Capex",
                         "claim": "META 2026 年资本开支模型假设为 680 亿美元",
-                        "tickers": ["META", "OpenAI", "Anthropic"],
+                        "tickers": ["META", "OpenAI", "xAI"],
                         "entities": [],
                         "sectors": ["Internet", "AI"],
                         "figures": [
@@ -231,7 +231,7 @@ async def test_extraction_verbatim_quote_validation_and_speaker_rules(
     assert owner_card["source_type"] == "conversation"
     assert owner_card["tickers"] == ["META"]
     assert "OpenAI" in owner_card["entities"]
-    assert "Anthropic" in owner_card["entities"]
+    assert "xAI" in owner_card["entities"]
     assert owner_card["speaker"]["role"] == "owner"
 
     agent_downgraded = outcome.cards[1]
@@ -1166,20 +1166,50 @@ def test_integration_conftest_sessionstart_test_db_guard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Verify `tests/integration/dalton/conftest.py` `pytest_sessionstart` aborts via `pytest.exit`
-    before any DB connection or destructive SQL when `TEST_DB_NAME` does not end with `_test`.
+    before any DB connection or destructive SQL when explicit test DB config is missing or when
+    the configured DB name does not end with `_test`.
     """
     from tests.integration.dalton import conftest as dalton_int_conftest
 
     mock_session = create_autospec(pytest.Session, instance=True)
 
+    for var in (
+        "TEST_DB_DSN",
+        "DALTON_TEST_DB_DSN",
+        "TEST_DATABASE_URL",
+        "DALTON_DATA_JOBS_TEST_DSN",
+        "TEST_DB_HOST",
+        "TEST_DB_PORT",
+        "TEST_DB_NAME",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+    # Missing explicit test DB configuration must be refused (no localhost:5432 fallback)
+    with pytest.raises(pytest.exit.Exception, match="without explicit test DB configuration"):
+        dalton_int_conftest.pytest_sessionstart(mock_session)
+
+    # Non-_test DB name must be refused regardless of host/port
+    monkeypatch.setenv("TEST_DB_HOST", "127.0.0.1")
+    monkeypatch.setenv("TEST_DB_PORT", "55432")
     monkeypatch.setenv("TEST_DB_NAME", "langalpha_prod")
     with pytest.raises(pytest.exit.Exception, match="must end with '_test'"):
         dalton_int_conftest.pytest_sessionstart(mock_session)
 
+    # Empty TEST_DB_NAME must be refused as missing explicit test DB configuration
     monkeypatch.setenv("TEST_DB_NAME", "")
-    with pytest.raises(pytest.exit.Exception, match="must end with '_test'"):
+    with pytest.raises(pytest.exit.Exception, match="without explicit test DB configuration"):
         dalton_int_conftest.pytest_sessionstart(mock_session)
 
+    # TEST_DB_NAME alone without explicit host/port must still be refused
+    monkeypatch.delenv("TEST_DB_HOST", raising=False)
+    monkeypatch.delenv("TEST_DB_PORT", raising=False)
+    monkeypatch.setenv("TEST_DB_NAME", "langalpha_test")
+    with pytest.raises(pytest.exit.Exception, match="without explicit test DB configuration"):
+        dalton_int_conftest.pytest_sessionstart(mock_session)
+
+    # Explicit host + port + *_test DB name is accepted
+    monkeypatch.setenv("TEST_DB_HOST", "127.0.0.1")
+    monkeypatch.setenv("TEST_DB_PORT", "55432")
     monkeypatch.setenv("TEST_DB_NAME", "langalpha_test")
     dalton_int_conftest.pytest_sessionstart(mock_session)
 
@@ -2352,18 +2382,17 @@ async def test_conv_card_v2_3_audit_regressions(
     assert c_b4d["type"] == "estimate"
     assert res_b4d.types_corrected == 0
 
-    # --- Item 2: Private companies (`SPCX`) and trading channels (`IBKR` vs `FUTU`) ---
+    # --- Item 2: Listed SpaceX (`SPCX`) stays in tickers, private companies (`OPENAI`, `PRIVATE_COMPANIES`)
+    # and trading channels (`IBKR` vs `FUTU`) ---
     c_0b0 = deepcopy(by_id["v22_0b0936821124"])
     res_0b0 = ex.validate_candidate_card(c_0b0)
-    assert res_0b0.tickers == []
-    assert res_0b0.tickers_dropped == 1
-    assert res_0b0.tickers_dropped_private == 1
+    assert res_0b0.tickers == ["SPCX"]
+    assert res_0b0.tickers_dropped_private == 0
 
     c_bf1 = deepcopy(by_id["v22_bf1790fd1ca2"])
     res_bf1 = ex.validate_candidate_card(c_bf1)
-    assert res_bf1.tickers == ["TSM", "INTC"]
-    assert res_bf1.tickers_dropped == 1
-    assert res_bf1.tickers_dropped_private == 1
+    assert res_bf1.tickers == ["TSM", "INTC", "SPCX"]
+    assert res_bf1.tickers_dropped_private == 0
 
     c_f02 = deepcopy(by_id["v22_f02b05b12ff5"])
     res_f02 = ex.validate_candidate_card(c_f02)
@@ -2468,6 +2497,9 @@ async def test_conv_card_v2_3_audit_regressions(
     for cid in ("v22_0b0936821124", "v22_f02b05b12ff5", "v22_ea4a5347e261"):
         item = deepcopy(by_id[cid])
         item["quote_event_id"] = "ev-v23-1"
+        if cid == "v22_0b0936821124":
+            # SPCX is now listed; add an unlisted private company to verify private-drop counter.
+            item["tickers"] = list(item.get("tickers") or []) + ["OPENAI"]
         if cid == "v22_ea4a5347e261" and not item.get("cited_sources"):
             item["cited_sources"] = ["卖方口径"]
         llm_cards_v23.append(item)
@@ -2814,13 +2846,13 @@ async def test_conv_card_v2_3_round6_review_fixes(
     # --- Item 13: Private company drop counters match between `validate_candidate_card` and `extract_segment_cards` ---
     priv_card_input = {
         "type": "opinion",
-        "topic_label": "SpaceX发射频次",
-        "claim": "SpaceX全年星舰发射频次继续提升。",
-        "tickers": ["SPCX", "TSLA"],
+        "topic_label": "OpenAI算力扩张",
+        "claim": "OpenAI全年推理算力继续扩张。",
+        "tickers": ["OPENAI", "TSLA"],
         "entities": [],
         "sectors": [],
         "figures": [],
-        "quote": "SpaceX 与 Tesla 协同推进，全年星舰发射频次继续提升。",
+        "quote": "OpenAI 与 Tesla 协同推进，全年推理算力继续扩张。",
         "quote_event_id": "ev-priv-1",
         "cited_sources": [],
         "confidence": 0.85,
@@ -3141,7 +3173,7 @@ async def test_round7_item11_types_corrected_and_duplicate_private_ticker_counts
             "date_et": "2026-10-20",
             "message_role": "assistant",
             "speaker": {"sender_id_hash": "agent:main", "name": "Eve", "is_owner": False, "role": "agent"},
-            "text": "卖方预计2026年SpaceX收入增长20%。",
+            "text": "卖方预计2026年OpenAI收入增长20%。",
         }
     ]
     orig_assist = ex.assist_json
@@ -3155,17 +3187,17 @@ async def test_round7_item11_types_corrected_and_duplicate_private_ticker_counts
                 status="ok",
                 data={
                     "category": "research",
-                    "topic_label": "SpaceX",
+                    "topic_label": "OpenAI",
                     "cards": [
                         {
                             "type": "estimate",
-                            "topic_label": "SpaceX预测",
-                            "claim": "卖方预计2026年SpaceX收入增长20%。",
-                            "tickers": ["SPCX", "SPCX"],
+                            "topic_label": "OpenAI预测",
+                            "claim": "卖方预计2026年OpenAI收入增长20%。",
+                            "tickers": ["OPENAI", "OPENAI"],
                             "entities": [],
                             "sectors": [],
                             "figures": [],
-                            "quote": "卖方预计2026年SpaceX收入增长20%。",
+                            "quote": "卖方预计2026年OpenAI收入增长20%。",
                             "quote_event_id": "ev-r7-11",
                             "cited_sources": [],
                             "confidence": 0.8,
@@ -3185,16 +3217,16 @@ async def test_round7_item11_types_corrected_and_duplicate_private_ticker_counts
 
     direct = ex.validate_candidate_card(
         {
-            "claim": "卖方预计2026年SpaceX收入增长20%。",
-            "topic_label": "SpaceX预测",
+            "claim": "卖方预计2026年OpenAI收入增长20%。",
+            "topic_label": "OpenAI预测",
             "type": "opinion",
             "figures": [],
-            "tickers": ["SPCX", "SPCX"],
-            "quote": "卖方预计2026年SpaceX收入增长20%。",
+            "tickers": ["OPENAI", "OPENAI"],
+            "quote": "卖方预计2026年OpenAI收入增长20%。",
             "cited_sources": [],
             "confidence": 0.8,
         },
-        quote="卖方预计2026年SpaceX收入增长20%。",
+        quote="卖方预计2026年OpenAI收入增长20%。",
     )
     assert direct.tickers_dropped == out.tickers_dropped == 1
     assert direct.tickers_dropped_private == out.tickers_dropped_private == 1

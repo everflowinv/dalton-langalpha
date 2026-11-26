@@ -10,6 +10,7 @@ import {
   parseChartSnapshotsList,
   type CollectedChartLayerRef,
   type CollectedHtmlWidgetRef,
+  type PendingChartDeliveryReceipt,
 } from "./chart-snapshots.js";
 import { DeliveryService } from "./delivery-service.js";
 import {
@@ -53,6 +54,16 @@ export class AgentRoutesHandler {
    * Distinguishes Shape A (claim & execute) from Shape B (concurrent caller sees mid-post rows).
    */
   readonly activeFinishExecutors = new Set<string>();
+
+  /**
+   * Process-local pending `:charts` I-7 receipts whose platform send succeeded
+   * but whose I-7 progress write failed transiently, so subsequent `/finish`
+   * retries can settle I-7 with the same `delivery_attempt` without resending.
+   */
+  private readonly pendingChartReceipts = new Map<
+    string,
+    PendingChartDeliveryReceipt
+  >();
 
   constructor(options: {
     backend: BackendClient;
@@ -730,9 +741,15 @@ export class AgentRoutesHandler {
     body: AgentAutomationRunFinishRequest,
   ): Promise<{
     status: number;
-    data: { targets?: AgentAutomationRunFinishTargetRow[]; detail?: string };
+    data: {
+      targets?: AgentAutomationRunFinishTargetRow[];
+      detail?: string;
+      retryable?: boolean;
+    };
   }> {
-    // Shape B check: if another caller in this gateway process is already finishing `executionId`
+    // Shape B check: if another caller in this gateway process is already finishing `executionId`,
+    // never enter execution or write `finished`; return a retryable response while in flight
+    // (or Shape C if the first caller already transitioned the row to `finished`).
     if (this.activeFinishExecutors.has(executionId)) {
       const current = await this.backend.finishAutomationRun(
         executionId,
@@ -747,6 +764,22 @@ export class AgentRoutesHandler {
       );
       if (current.status === 404 || !current.data) {
         return { status: 404, data: { detail: "Unknown execution_id" } };
+      }
+      if (
+        current.data.status === "finished" &&
+        current.data.previous_status === "finished"
+      ) {
+        const finishedRows: AgentAutomationRunFinishTargetRow[] = (
+          current.data.targets ?? []
+        ).map((t) => ({
+          entry: t.entry,
+          address: t.address ?? null,
+          name: t.name ?? null,
+          reached: Boolean(t.reached),
+          via: t.via ?? null,
+          error: t.error ?? (t.ok === false ? (t.message ?? "Failed") : null),
+        }));
+        return { status: 200, data: { targets: finishedRows } };
       }
       const inFlightRows: AgentAutomationRunFinishTargetRow[] = (
         current.data.targets ?? []
@@ -781,61 +814,93 @@ export class AgentRoutesHandler {
           error: null,
         };
       });
-      return { status: 200, data: { targets: inFlightRows } };
+      return {
+        status: 503,
+        data: {
+          detail:
+            "Another finish request is already delivering this automation run; retry finish to settle.",
+          retryable: true,
+          targets: inFlightRows,
+        },
+      };
     }
 
-    const claimed = await this.backend.finishAutomationRun(
-      executionId,
-      {
-        status: body.status,
-        thread_id: body.thread_id ?? null,
-        run_id: body.run_id ?? null,
-        final_text: body.final_text ?? null,
-        mark_finished: false,
-      },
-      userId,
-    );
+    // BW2: Acquire in-process execution ownership synchronously BEFORE the first `await`
+    // (I-8 `finishAutomationRun`) so two concurrent `/finish` calls cannot both pass the
+    // active check before I-8 returns.
+    this.activeFinishExecutors.add(executionId);
+    try {
+      const claimed = await this.backend.finishAutomationRun(
+        executionId,
+        {
+          status: body.status,
+          thread_id: body.thread_id ?? null,
+          run_id: body.run_id ?? null,
+          final_text: body.final_text ?? null,
+          mark_finished: false,
+        },
+        userId,
+      );
 
-    if (claimed.status === 404 || !claimed.data) {
-      return { status: 404, data: { detail: "Unknown execution_id" } };
+      if (claimed.status === 404 || !claimed.data) {
+        return { status: 404, data: { detail: "Unknown execution_id" } };
+      }
+
+      // Shape C: already `finished` in DB
+      if (
+        claimed.data.status === "finished" &&
+        claimed.data.previous_status === "finished"
+      ) {
+        const finishedRows: AgentAutomationRunFinishTargetRow[] = (
+          claimed.data.targets ?? []
+        ).map((t) => ({
+          entry: t.entry,
+          address: t.address ?? null,
+          name: t.name ?? null,
+          reached: Boolean(t.reached),
+          via: t.via ?? null,
+          error: t.error ?? (t.ok === false ? (t.message ?? "Failed") : null),
+        }));
+        return { status: 200, data: { targets: finishedRows } };
+      }
+
+      // Shape A: execute finish deliveries and finalize in DB
+      const detailed = await this.executeAutomationRunFinishDetailed(
+        {
+          executionId,
+          userId: claimed.data.user_id || userId,
+          threadId: claimed.data.thread_id ?? body.thread_id ?? null,
+          runId: claimed.data.run_id ?? null,
+          initialSnapshots: claimed.data.chart_snapshots,
+          outboundBlocked: claimed.data.outbound_blocked,
+          automationName: claimed.data.automation_name,
+          finishStatus:
+            (body.status ??
+              claimed.data.finish_status ??
+              "completed") as AgentAutomationRunFinishRequest["status"],
+          finalText: body.final_text ?? claimed.data.final_text ?? null,
+          targets: claimed.data.targets ?? [],
+        },
+        { callerHoldsExecutionLock: true },
+      );
+
+      if (detailed.replayPending || detailed.chartsInFlight) {
+        return {
+          status: 503,
+          data: {
+            detail: detailed.chartsInFlight
+              ? "Automation charts or widgets are still being delivered; retry finish to settle."
+              : "Target run replay could not be completed yet; retry finish to settle charts and widgets.",
+            retryable: true,
+            targets: detailed.targets,
+          },
+        };
+      }
+
+      return { status: 200, data: { targets: detailed.targets } };
+    } finally {
+      this.activeFinishExecutors.delete(executionId);
     }
-
-    // Shape C: already `finished` in DB
-    if (
-      claimed.data.status === "finished" &&
-      claimed.data.previous_status === "finished"
-    ) {
-      const finishedRows: AgentAutomationRunFinishTargetRow[] = (
-        claimed.data.targets ?? []
-      ).map((t) => ({
-        entry: t.entry,
-        address: t.address ?? null,
-        name: t.name ?? null,
-        reached: Boolean(t.reached),
-        via: t.via ?? null,
-        error: t.error ?? (t.ok === false ? (t.message ?? "Failed") : null),
-      }));
-      return { status: 200, data: { targets: finishedRows } };
-    }
-
-    // Shape A: execute finish deliveries and finalize in DB
-    const finalRows = await this.executeAutomationRunFinish({
-      executionId,
-      userId: claimed.data.user_id || userId,
-      threadId: claimed.data.thread_id ?? body.thread_id ?? null,
-      runId: claimed.data.run_id ?? null,
-      initialSnapshots: claimed.data.chart_snapshots,
-      outboundBlocked: claimed.data.outbound_blocked,
-      automationName: claimed.data.automation_name,
-      finishStatus:
-        (body.status ??
-          claimed.data.finish_status ??
-          "completed") as AgentAutomationRunFinishRequest["status"],
-      finalText: body.final_text ?? claimed.data.final_text ?? null,
-      targets: claimed.data.targets ?? [],
-    });
-
-    return { status: 200, data: { targets: finalRows } };
   }
 
   /**
@@ -854,6 +919,41 @@ export class AgentRoutesHandler {
     finalText: string | null;
     targets: AutomationRunTargetRecord[];
   }): Promise<AgentAutomationRunFinishTargetRow[]> {
+    if (this.activeFinishExecutors.has(params.executionId)) {
+      return params.targets.map((t) => ({
+        entry: t.entry,
+        address: t.address ?? null,
+        name: t.name ?? null,
+        reached: Boolean(t.reached),
+        via: t.via ?? null,
+        error: t.error ?? (t.ok === false ? (t.message ?? "Target could not be resolved.") : null),
+      }));
+    }
+    const detailed = await this.executeAutomationRunFinishDetailed(params);
+    return detailed.targets;
+  }
+
+  private async executeAutomationRunFinishDetailed(
+    params: {
+      executionId: string;
+      userId: string;
+      threadId: string | null;
+      runId?: string | null;
+      initialSnapshots?: ChartSnapshotItem[];
+      outboundBlocked?: boolean;
+      automationName: string;
+      finishStatus: AgentAutomationRunFinishRequest["status"];
+      finalText: string | null;
+      targets: AutomationRunTargetRecord[];
+    },
+    opts?: { callerHoldsExecutionLock?: boolean },
+  ): Promise<{
+    targets: AgentAutomationRunFinishTargetRow[];
+    replayPending: boolean;
+    chartsInFlight: boolean;
+    replayRetryable: boolean;
+    replayHttpStatus: number | null;
+  }> {
     const {
       executionId,
       userId,
@@ -864,7 +964,10 @@ export class AgentRoutesHandler {
       targets,
     } = params;
 
-    this.activeFinishExecutors.add(executionId);
+    const acquiredHere = !opts?.callerHoldsExecutionLock;
+    if (acquiredHere) {
+      this.activeFinishExecutors.add(executionId);
+    }
     try {
       const results: AutomationRunTargetRecord[] = [];
       let truncatedFinalText = (finalText ?? "").trim();
@@ -883,11 +986,16 @@ export class AgentRoutesHandler {
       let autoOutboundBlocked: boolean | undefined =
         typeof params.outboundBlocked === "boolean" ? params.outboundBlocked : undefined;
 
+      let replayTargetMissing = false;
+      let replayDenied = false;
+      let replayRetryable = false;
+      let replayHttpStatus: number | null = null;
       if (
         finishStatus === "completed" &&
         threadId &&
         effectiveRunId &&
-        typeof this.backend.replayThreadMessages === "function"
+        (typeof this.backend.replayThreadRun === "function" ||
+          typeof this.backend.replayThreadMessages === "function")
       ) {
         try {
           const recovered = await extractRunChartsAndWidgetsFromReplay({
@@ -895,27 +1003,60 @@ export class AgentRoutesHandler {
             userId,
             threadId,
             targetRunId: effectiveRunId,
+            executionId,
           });
-          autoCharts = recovered.charts;
-          autoWidgets = recovered.widgets;
-          if (autoInitialSnapshots.length === 0 && recovered.snapshots.length > 0) {
-            autoInitialSnapshots = recovered.snapshots;
-          }
-          if (typeof recovered.outboundBlocked === "boolean") {
-            autoOutboundBlocked =
-              autoOutboundBlocked === true || recovered.outboundBlocked;
+          replayHttpStatus = recovered.httpStatus ?? null;
+          if (!recovered.found) {
+            if (replayHttpStatus === 403 && !recovered.retryable) {
+              // Permanent permission/platform-capability refusal: settle targets
+              // according to their permissions instead of looping 503 in `finishing`.
+              replayDenied = true;
+            } else {
+              replayTargetMissing = true;
+              replayRetryable = Boolean(recovered.retryable);
+            }
+          } else {
+            autoCharts = recovered.charts;
+            autoWidgets = recovered.widgets;
+            if (recovered.snapshots.length > 0) {
+              if (autoInitialSnapshots.length === 0) {
+                autoInitialSnapshots = recovered.snapshots;
+              } else {
+                const merged = new Map<string, ChartSnapshotItem>();
+                for (const s of autoInitialSnapshots) {
+                  merged.set(`${s.chart_id}\0${s.layer_id}`, s);
+                }
+                for (const s of recovered.snapshots) {
+                  merged.set(`${s.chart_id}\0${s.layer_id}`, s);
+                }
+                autoInitialSnapshots = [...merged.values()];
+              }
+            }
+            if (typeof recovered.outboundBlocked === "boolean") {
+              autoOutboundBlocked =
+                autoOutboundBlocked === true || recovered.outboundBlocked;
+            }
           }
         } catch {
-          // Best-effort replay enrichment; snapshots from finish_automation_run still work.
+          // Target run replay could not be read; keep pending recovery state instead of marking finished.
+          replayTargetMissing = true;
+          replayRetryable = true;
         }
       }
 
+      // BW2: Never claim the `:charts` idempotency key before replay has completed (`found`).
+      // Summary delivery still runs idempotently; charts and widgets are delivered together
+      // once the full replay succeeds.
       const hasAutomationChartsOrWidgets =
         finishStatus === "completed" &&
+        !replayTargetMissing &&
+        !replayDenied &&
         Boolean(effectiveRunId) &&
         (autoCharts.length > 0 ||
           autoInitialSnapshots.length > 0 ||
           autoWidgets.length > 0);
+
+      let chartsInFlight = false;
 
       const deliverAutomationChartsForTarget = async (
         t: AutomationRunTargetRecord,
@@ -948,8 +1089,15 @@ export class AgentRoutesHandler {
           charts: autoCharts,
           initialSnapshots: autoInitialSnapshots,
           widgets: autoWidgets,
+          pendingReceipts: this.pendingChartReceipts,
         });
-        return chartRes.settled && chartRes.sentImages + chartRes.sentLinks > 0;
+        if (chartRes.inFlight) {
+          chartsInFlight = true;
+        }
+        return Boolean(
+          chartRes.settled &&
+            (chartRes.delivered ?? chartRes.sentImages + chartRes.sentLinks > 0),
+        );
       };
 
       for (const t of targets) {
@@ -1027,7 +1175,9 @@ export class AgentRoutesHandler {
             ...t,
             reached: false,
             via: null,
-            error: "Automation completed without sending a message or final summary.",
+            error: replayDenied
+              ? "Target platform capability or replay permission denied; charts and widgets were not delivered."
+              : "Automation completed without sending a message or final summary.",
           });
           continue;
         }
@@ -1063,28 +1213,47 @@ export class AgentRoutesHandler {
         }
       }
 
-      await this.backend.finishAutomationRun(
-        executionId,
-        {
-          status: finishStatus,
-          thread_id: threadId,
-          final_text: finalText,
-          targets: results,
-          mark_finished: true,
-        },
-        userId,
-      );
+      if (!replayTargetMissing && !chartsInFlight) {
+        const finalized = await this.backend.finishAutomationRun(
+          executionId,
+          {
+            status: finishStatus,
+            thread_id: threadId,
+            final_text: finalText,
+            targets: results,
+            mark_finished: true,
+          },
+          userId,
+        );
+        // If backend DB refused to mark finished (e.g. concurrent finisher still has
+        // `:charts` in_flight and kept `finishing`), return retryable instead of 200.
+        if (
+          finalized.status === 200 &&
+          finalized.data &&
+          finalized.data.status !== "finished"
+        ) {
+          chartsInFlight = true;
+        }
+      }
 
-      return results.map((r) => ({
-        entry: r.entry,
-        address: r.address,
-        name: r.name,
-        reached: Boolean(r.reached),
-        via: r.via ?? null,
-        error: r.error ?? null,
-      }));
+      return {
+        targets: results.map((r) => ({
+          entry: r.entry,
+          address: r.address,
+          name: r.name,
+          reached: Boolean(r.reached),
+          via: r.via ?? null,
+          error: r.error ?? null,
+        })),
+        replayPending: replayTargetMissing,
+        chartsInFlight,
+        replayRetryable,
+        replayHttpStatus,
+      };
     } finally {
-      this.activeFinishExecutors.delete(executionId);
+      if (acquiredHere) {
+        this.activeFinishExecutors.delete(executionId);
+      }
     }
   }
 

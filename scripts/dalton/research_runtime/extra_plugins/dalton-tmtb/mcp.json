@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "dalton_tmtb": {
+      "type": "streamable-http",
+      "url": "${DALTON_RESEARCH_HOST_URL}/mcp/tmtb",
+      "headers": {
+        "Authorization": "Bearer ${DALTON_RESEARCH_HOST_TOKEN}"
+      }
+    }
+  }
+}

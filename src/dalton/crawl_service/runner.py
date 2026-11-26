@@ -182,8 +182,8 @@ def _parse_reply(stdout: bytes, returncode: int | None) -> dict[str, Any]:
     Last-not-first because scrapling or a browser may print to stdout before
     the worker's own line; the worker always writes its reply last.
     """
-    for line in reversed(stdout.decode("utf-8", errors="replace").splitlines()):
-        line = line.strip()
+    for raw_line in reversed(stdout.split(b"\n")):
+        line = raw_line.strip().decode("utf-8", errors="replace")
         if not line:
             continue
         try:

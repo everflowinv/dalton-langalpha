@@ -107,8 +107,14 @@ export async function* parseSseStream(
     }
   }
   buffer += decoder.decode();
-  if (buffer.trim().length > 0) {
-    const parsed = processBlock(buffer);
+  // Per the WHATWG SSE specification, an event frame is complete only when terminated
+  // by a blank line (`\r?\n\r?\n`). Never flush an unterminated trailing buffer at EOF,
+  // so a mid-frame truncation of `replay_done` cannot masquerade as a complete replay.
+  let trailingMatch: RegExpExecArray | null;
+  while ((trailingMatch = /\r?\n\r?\n/.exec(buffer)) !== null) {
+    const block = buffer.slice(0, trailingMatch.index);
+    buffer = buffer.slice(trailingMatch.index + trailingMatch[0].length);
+    const parsed = processBlock(block);
     if (parsed) {
       yield parsed;
     }
@@ -558,6 +564,9 @@ export interface InternalTopicLookupRequest {
   external_topic_id?: string | null;
   canonical_scope_key?: string | null;
   root_message_id?: string | null;
+  initiator_platform_user_id?: string | null;
+  pending_limit?: number | null;
+  pending_offset?: number | null;
 }
 
 export interface InternalTopicLookupResponse {
@@ -570,6 +579,8 @@ export interface InternalTopicLookupResponse {
   initiator_platform_user_id?: string | null;
   initiator_dalton_user_id?: string | null;
   pending_candidates?: PendingBotTopicCandidate[];
+  pending_candidates_has_more?: boolean;
+  pending_candidates_truncated?: boolean;
 }
 
 export interface VerifyDmRecipientResponse {
@@ -1047,6 +1058,7 @@ export interface WeixinLoginSessionGetResponse {
   qrcode?: string | null;
   qrcode_img_content?: string | null;
   redirect_base_url?: string | null;
+  created_at?: string | null;
   expires_at?: string | null;
   connected?: boolean;
   already_connected?: boolean;
@@ -1076,6 +1088,7 @@ export interface WeixinLoginSessionPatchResponse {
   status?: string;
   account_status?: string | null;
   login_version?: number;
+  created_at?: string | null;
   expires_at?: string | null;
   redirect_base_url?: string | null;
   ilink_bot_id?: string | null;
@@ -1530,6 +1543,13 @@ export interface BackendClient {
     userId: string,
     threadId: string,
     beforeTurnOrOptions?: number | ReplayThreadMessagesOptions,
+  ): Promise<SseOrErrorResponse>;
+
+  replayThreadRun?(
+    userId: string,
+    threadId: string,
+    runId: string,
+    opts?: { source?: "auto" | "checkpoint"; executionId?: string | null },
   ): Promise<SseOrErrorResponse>;
 
   watchThread(
@@ -2651,6 +2671,29 @@ export class HttpBackendClient implements BackendClient {
           limit: String(opts.limit ?? 5),
           ...(opts.beforeTurn !== undefined ? { before_turn: String(opts.beforeTurn) } : {}),
         },
+      },
+    );
+  }
+
+  async replayThreadRun(
+    userId: string,
+    threadId: string,
+    runId: string,
+    opts?: { source?: "auto" | "checkpoint"; executionId?: string | null },
+  ): Promise<SseOrErrorResponse> {
+    const query: Record<string, string | null | undefined> = {
+      source: opts?.source ?? "auto",
+    };
+    const execId = opts?.executionId?.trim();
+    if (execId) {
+      query.execution_id = execId;
+    }
+    return await this.sseRequest(
+      "GET",
+      `/api/v1/dalton/channels/internal/threads/${encodeURIComponent(threadId)}/runs/${encodeURIComponent(runId)}/replay`,
+      {
+        userId,
+        query,
       },
     );
   }

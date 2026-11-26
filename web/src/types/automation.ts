@@ -203,6 +203,14 @@ export interface Automation {
   dalton_notify_route_targets?: string[] | null;
 }
 
+// DALTON-HOOK(report-delivery): structured metadata.report_profile shape & one-time confirmation credential
+export interface ReportProfileConfig {
+  profile: string;
+  report_targets: string[];
+  text_targets?: string[] | null;
+  failure_targets: string[];
+}
+
 /** The settings the form writes: every field on a create, and the whole set
  *  again on an edit, which the server applies as a patch. */
 export interface AutomationPayload {
@@ -223,6 +231,9 @@ export interface AutomationPayload {
   thread_strategy: Automation['thread_strategy'];
   max_failures: number;
   delivery_config: DeliveryConfig;
+  // DALTON-HOOK(report-delivery): optional metadata (including report_profile) and one-time confirmation credential
+  metadata?: Record<string, unknown> | null;
+  report_delivery_confirmation_token?: string;
 }
 
 /** What an edit sends, applied by the server as a patch: only the fields

@@ -138,14 +138,14 @@ async def _isolated_pool(iso_dsn: str, *, max_size: int = 4):
 
 
 def test_d056_single_head_and_fresh_upgrade_schema() -> None:
-    """Verify Dalton migration chain has a single head `d056` and all watchlist tables/constraints exist."""
+    """Verify Dalton migration chain has a single head (`d057`) and all watchlist tables/constraints exist."""
     with _isolated_pg_database(PG_DSN) as iso_dsn:
         env = _alembic_env_for_dsn(iso_dsn)
 
         heads_out = _run_alembic(["heads"], env=env, dalton=True)
         head_lines = [ln.strip() for ln in heads_out.splitlines() if ln.strip()]
         assert len(head_lines) == 1, f"Expected single Dalton head, got: {head_lines}"
-        assert head_lines[0].startswith("d056"), f"Expected head d056, got: {head_lines}"
+        assert head_lines[0].startswith("d057"), f"Expected head d057, got: {head_lines}"
 
         _run_alembic(["upgrade", "head"], env=env, dalton=False)
         _run_alembic(["upgrade", "head"], env=env, dalton=True)

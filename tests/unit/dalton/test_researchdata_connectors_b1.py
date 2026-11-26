@@ -168,20 +168,26 @@ def test_resolve_host_platform_and_batch1_depends_on_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _clear_b1_env(monkeypatch)
-    # Remaining 7 bridge sub-capabilities retain depends_on=(RESEARCHDATA_BRIDGE,).
+    # Remaining 2 legacy-bridge sub-capabilities retain depends_on=(RESEARCHDATA_BRIDGE,).
     for cap in (
         CapabilityId.ALPHAENGINE,
-        CapabilityId.GUIDEPOINT,
-        CapabilityId.COMPANY_WIKI,
-        CapabilityId.SALES_NOTES,
-        CapabilityId.TMTB,
-        CapabilityId.FUNDA_AI,
         CapabilityId.FEISHU_DOCS,
     ):
         assert CAPABILITY_SPECS[cap].depends_on == (CapabilityId.RESEARCHDATA_BRIDGE,)
     # Batch 2 (docs/dalton/features/researchdata-connectors.md §6.3) decoupled
     # TRANSCRIPTION from RESEARCHDATA_BRIDGE so standalone dalton-transcription runs without the bridge.
     assert CAPABILITY_SPECS[CapabilityId.TRANSCRIPTION].depends_on == ()
+    # Batch 3 (docs/dalton/features/researchdata-connectors.md §6.4 #4) decoupled the five
+    # research connector capabilities from RESEARCHDATA_BRIDGE so they run independently
+    # on dalton-research-host (:8951) in both Standalone Core and Everflow.
+    for cap in (
+        CapabilityId.GUIDEPOINT,
+        CapabilityId.COMPANY_WIKI,
+        CapabilityId.SALES_NOTES,
+        CapabilityId.TMTB,
+        CapabilityId.FUNDA_AI,
+    ):
+        assert CAPABILITY_SPECS[cap].depends_on == ()
 
     # Explicit macos keeps alphaengine enabled even inside a Linux container.
     monkeypatch.setattr(sys, "platform", "linux")

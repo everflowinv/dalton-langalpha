@@ -108,7 +108,8 @@ export interface PTCAgentRenderBlock {
   proposal?: PTCAgentProposalState;
 }
 export interface SecretaryActionRenderBlock {
-  type: 'delete_workspace' | 'stop_workspace' | 'delete_thread';
+  // DALTON-HOOK(cos-settings-tools): include archive_workspace in secretary action render blocks
+  type: 'delete_workspace' | 'stop_workspace' | 'delete_thread' | 'archive_workspace';
   key: string;
   segment: ContentSegmentRecord;
 }
@@ -268,6 +269,8 @@ export function buildRenderBlocks(
         if (s.type === 'delete_workspace') return true;
         if (s.type === 'stop_workspace') return true;
         if (s.type === 'delete_thread') return true;
+        // DALTON-HOOK(cos-settings-tools): keep archive_workspace segment
+        if (s.type === 'archive_workspace') return true;
         // --- DALTON-HOOK(watchlist): begin ---
         if (
           s.type === 'watchlist_batch_add'
@@ -467,7 +470,8 @@ export function buildRenderBlocks(
         } else if (seg.type === 'ptc_agent') {
           flushActivity();
           blocks.push({ type: 'ptc_agent', key: `ptc-agent-${seg.proposalId}`, segment: seg });
-        } else if (seg.type === 'delete_workspace' || seg.type === 'stop_workspace' || seg.type === 'delete_thread') {
+        // DALTON-HOOK(cos-settings-tools): project archive_workspace into SecretaryActionRenderBlock
+        } else if (seg.type === 'delete_workspace' || seg.type === 'stop_workspace' || seg.type === 'delete_thread' || seg.type === 'archive_workspace') {
           flushActivity();
           blocks.push({ type: seg.type, key: `secretary-${seg.type}-${seg.proposalId}`, segment: seg });
         // --- DALTON-HOOK(watchlist): begin ---

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "dalton_macro": {
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "python",
+        "plugins/dalton_macro/dalton_macro_mcp_server.py"
+      ],
+      "env": {
+        "FRED_API_KEY": "${FRED_API_KEY}"
+      }
+    }
+  }
+}

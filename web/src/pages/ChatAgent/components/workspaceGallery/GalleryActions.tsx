@@ -1,3 +1,4 @@
+import type { MouseEvent } from 'react';
 import { Plus } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 
@@ -5,7 +6,8 @@ import { cn } from '@/lib/utils';
 import { buttonSlot } from '@/components/ui/button-class';
 
 interface GalleryActionsProps {
-  onNewWorkspace: () => void;
+  /** The button's own click: the gallery keeps the control for focus to return to. */
+  onNewWorkspace: (event: MouseEvent<HTMLButtonElement>) => void; // DALTON-HOOK(dialog-focus-return)
   /** Fill the row (the narrow header). */
   stacked?: boolean;
 }

@@ -323,7 +323,17 @@ def check_prompts_data_map_automations() -> dict[str, Any]:
     static_dm = map_builder.render_static_data_map_markdown(team_memory_enabled=True)
     _assert_no_proprietary_terms(static_dm, label="Core static <data_map>")
     assert "`conversation_search`" not in static_dm
-    assert "### 3. " not in static_dm
+    assert "`company-wiki`" in static_dm
+    assert "### 2. 已启用的研究连接器" in static_dm
+    assert "### 3. 明确没有的数据（切勿以为查过）" in static_dm
+
+    static_dm_no_connectors = map_builder.render_static_data_map_markdown(
+        team_memory_enabled=True,
+        capabilities=frozenset(),
+    )
+    _assert_no_proprietary_terms(static_dm_no_connectors, label="Core no-connector static <data_map>")
+    assert "`conversation_search`" not in static_dm_no_connectors
+    assert "### 3. " not in static_dm_no_connectors
 
     readme = render_automations_readme()
     _assert_no_proprietary_terms(readme, label="Core AutomationsBackend README")
@@ -804,8 +814,14 @@ def _check_frontend_capability_gating(dist_root: Path) -> None:
     log("4/5 OK (brand.ts, useCapabilities.ts, sections.ts, MonitorsList.tsx verified).")
 
 
-def _check_docs_site_core_surface(dist_root: Path) -> dict[str, int]:
-    """5/5 Verify `/help` Core profile filter via Node and optional live `/help` HTTP probe."""
+def _check_docs_site_core_surface(dist_root: Path, *, packaged: bool = True) -> dict[str, int]:
+    """5/5 Verify `/help` Core profile filter via Node and optional live `/help` HTTP probe.
+
+    ``packaged=True`` (the release check) expects an exported Core package: the
+    Everflow-only docs must already be absent. ``packaged=False`` runs against the
+    source tree, where those docs still exist and the profile filter must exclude
+    at least five of them.
+    """
     log("5/5 Checking /help docs-site Core profile filter via Node (and optional live /help)...")
     node_bin = shutil.which("node")
     if not node_bin:
@@ -855,8 +871,25 @@ for (const fp of walk(docsRoot)) {
     errors.push(`${rel}: leftover 'Everflow' mention in Core doc`);
   }
 }
-if (excluded < 5) {
-  errors.push(`Expected at least 5 excluded Everflow docs (everflow/* + deliver-to-feishu), got ${excluded}`);
+const packaged = process.env.DALTON_DOCS_CHECK_PACKAGED === '1';
+const forbiddenPackagedPaths = [
+  'everflow',
+  'explore/deliver-to-feishu.mdx',
+  'explore/deliver-to-feishu.md',
+];
+for (const relBad of packaged ? forbiddenPackagedPaths : []) {
+  if (fs.existsSync(path.join(docsRoot, relBad))) {
+    errors.push(`Core release package must exclude Everflow/Feishu doc path: docs-site/src/content/docs/${relBad}`);
+  }
+}
+if (!packaged && !(excluded >= 5)) {
+  errors.push(`Source tree: expected the Core profile filter to exclude at least 5 Everflow-only docs, got ${excluded}`);
+}
+if (packaged && excluded > 0) {
+  errors.push(`Core release package still contains ${excluded} Everflow-only doc(s) that should be excluded at package time`);
+}
+if (included === 0) {
+  errors.push('Expected Core release package to include at least one public doc');
 }
 if (errors.length > 0) {
   console.error(errors.join('\n'));
@@ -867,6 +900,7 @@ console.log(JSON.stringify({ included, excluded }));
     proc = subprocess.run(
         [node_bin, "--input-type=module", "-e", node_script],
         cwd=str(dist_root),
+        env={**os.environ, "DALTON_DOCS_CHECK_PACKAGED": "1" if packaged else "0"},
         capture_output=True,
         text=True,
         timeout=NODE_TIMEOUT_S,

@@ -87,8 +87,13 @@ export function useInterruptAnswers({
       ? proposal.interruptId
       : pendingInterrupt.interruptId;
     // DALTON-HOOK(watchlist): watchlistProposals also wait for tool_call_result settlement (stay in 'submitting' on approve)
+    const waitsForToolResult =
+      bucket === 'workspaceProposals'
+      || bucket === 'watchlistProposals'
+      || (bucket === 'secretaryActionProposals'
+        && (proposal?.actionType === 'archive_workspace' || pendingInterrupt.type === 'archive_workspace'));
     const nextStatus = verdict === 'approve'
-      ? (bucket === 'workspaceProposals' || bucket === 'watchlistProposals' ? 'submitting' : 'approved')
+      ? (waitsForToolResult ? 'submitting' : 'approved')
       : 'rejected';
     setMessages((prev) => setCardFields(prev, bucket, proposalId!, {
       status: nextStatus,

@@ -288,7 +288,6 @@ class TestContentAssembly:
                 "sales-notes",
                 "sales notes",
                 "tmtb",
-                "公司 wiki",
                 "基金 wiki",
                 "销售纪要",
             ):
@@ -298,6 +297,31 @@ class TestContentAssembly:
             assert not re.search(r"\bfunda\b", surface_text, flags=re.IGNORECASE), (
                 f"{surface_label} leaked 'FUNDA'"
             )
+
+        # When company_wiki is disabled in Core, "公司 wiki" must also be absent
+        monkeypatch.setenv("DALTON_CAP_COMPANY_WIKI", "false")
+        no_wiki_defn = plugin_definition(ev_plan.row, bundled=True)
+        no_wiki_compiled = SubagentCompiler().compile(no_wiki_defn)
+        no_wiki_view_body = render_base_body(no_wiki_defn)
+        no_wiki_views = value_views(
+            {"dalton-evidence": BaseSubagent("plugin:dalton/dalton-evidence", no_wiki_defn)},
+            ("dalton-evidence",),
+            [],
+        )
+        no_wiki_body = load_agent_body("dalton-evidence")
+        assert no_wiki_body is not None
+        for surface_label, surface_text in (
+            ("load_agent_body(no-wiki)", no_wiki_body),
+            ("render_base_body(no-wiki)", no_wiki_view_body),
+            ("value_views.instructions(no-wiki)", no_wiki_views[0]["instructions"]),
+            ("value_views.description(no-wiki)", no_wiki_views[0]["description"]),
+            ("SubagentCompiler.system_prompt(no-wiki)", no_wiki_compiled["system_prompt"]),
+            ("SubagentCompiler.description(no-wiki)", no_wiki_compiled["description"]),
+        ):
+            assert "公司 wiki" not in surface_text.lower(), (
+                f"{surface_label} leaked '公司 wiki' while DALTON_CAP_COMPANY_WIKI=false"
+            )
+        monkeypatch.delenv("DALTON_CAP_COMPANY_WIKI", raising=False)
 
         # Core channel-routing.md has zero DALTON-HOOK developer comments
         routing_fp = (
@@ -989,10 +1013,10 @@ class TestB3StandaloneCheckScript:
         assert mod._check_no_everflowinv_in_dist(REPO_ROOT) > 0
         mod._check_frontend_capability_gating(REPO_ROOT)
         monkeypatch.delenv("STANDALONE_BASE_URL", raising=False)
-        docs_summary = mod._check_docs_site_core_surface(REPO_ROOT)
+        docs_summary = mod._check_docs_site_core_surface(REPO_ROOT, packaged=False)
         assert docs_summary["included"] > 15 and docs_summary["excluded"] >= 5
 
         # Missing node executable raises RuntimeError explicitly instead of silently skipping
         monkeypatch.setattr(shutil, "which", lambda _name: None)
         with pytest.raises(RuntimeError, match="node executable not found"):
-            mod._check_docs_site_core_surface(REPO_ROOT)
+            mod._check_docs_site_core_surface(REPO_ROOT, packaged=False)

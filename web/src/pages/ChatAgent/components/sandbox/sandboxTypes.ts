@@ -30,6 +30,8 @@ export interface SandboxStats {
   sandbox_id?: string | null;
   /** Which provider answered, e.g. 'daytona' | 'docker'. Null, not absent, when unresolved. */
   provider?: string | null;
+  // DALTON-HOOK(cos-settings-tools): whether this computer's provider supports cold archive
+  archivable?: boolean | null;
   created_at?: string;
   auto_stop_interval?: number;
   resources: {

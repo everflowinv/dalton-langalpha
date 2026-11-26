@@ -2578,6 +2578,14 @@ async def test_report_text_targets_notify_test_plan_and_per_target_completion_tr
     monkeypatch.setattr(dispatch_mod, "post_automation_gateway_notify", _fake_gw_post)
     monkeypatch.setattr(dispatch_mod, "post_bridge_notify", _fake_bridge_post)
     monkeypatch.setattr(dispatch_mod, "_post_notify_is_bridge", lambda fn: True)
+    monkeypatch.setattr(
+        dispatch_mod,
+        "resolve_active_dalton_weixin_targets",
+        create_autospec(
+            dispatch_mod.resolve_active_dalton_weixin_targets,
+            return_value={"weixin:user:wx_u1@im.wechat"},
+        ),
+    )
 
     auto_id = str(uuid4())
     sent = await dispatch_mod.on_automation_settled(
@@ -8520,3 +8528,108 @@ async def test_r17_i7_mixed_stale_watch_gen_session_current_preserves_watch_inte
     assert watch_interrupt_updates == []
     assert watch_state["generation"] == 2
     assert watch_state["pending_interrupt"] == gen2_int
+
+
+@pytest.mark.asyncio
+async def test_weixin_qr_wait_proxy_cancels_gateway_request_on_client_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When browser aborts /weixin/qrcode/wait, FastAPI cancels the upstream httpx request."""
+    from fastapi import Request
+    import httpx
+
+    monkeypatch.setattr(ch_router_mod, "require_capability", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        "src.dalton.settings.get_dalton_channel_gateway_url",
+        lambda: "http://127.0.0.1:9999",
+    )
+
+    disconnected = False
+    req_started = asyncio.Event()
+    req_cancelled = asyncio.Event()
+
+    async def _fake_is_disconnected() -> bool:
+        return disconnected
+
+    fake_request = create_autospec(Request, instance=True)
+    fake_request.is_disconnected.side_effect = _fake_is_disconnected
+
+    async def _hanging_request(*_args: Any, **_kwargs: Any) -> httpx.Response:
+        req_started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            req_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    fake_client = create_autospec(httpx.AsyncClient, instance=True)
+    fake_client.__aenter__.return_value = fake_client
+    fake_client.__aexit__.return_value = None
+    fake_client.request.side_effect = _hanging_request
+    monkeypatch.setattr(ch_router_mod.httpx, "AsyncClient", lambda **_kw: fake_client)
+
+    proxy_task = asyncio.create_task(
+        ch_router_mod._proxy_to_gateway_weixin(
+            "GET",
+            "/internal/weixin/qrcode/wait",
+            user_id="u-alice",
+            params={"session_key": "sess-1"},
+            request=fake_request,
+        )
+    )
+    await asyncio.wait_for(req_started.wait(), timeout=1.0)
+    disconnected = True
+
+    with pytest.raises(HTTPException) as exc_info:
+        await asyncio.wait_for(proxy_task, timeout=1.0)
+    assert exc_info.value.status_code == 499
+    assert req_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_web_channel_bindings_exposes_weixin_platform_user_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /channels/bindings populates bindings['weixin']['platform_user_id'] from wx_view['platform_user_id']."""
+    monkeypatch.setattr(
+        ch_router_mod,
+        "has_capability",
+        lambda cap: cap == ch_router_mod.CapabilityId.CHANNEL_WEIXIN,
+    )
+    monkeypatch.setattr(
+        ch_router_mod,
+        "get_channel_internal_state",
+        create_autospec(
+            ch_router_mod.get_channel_internal_state,
+            return_value={
+                "user_id": "u-alice",
+                "user_tier": "internal",
+                "home_workspace_id": "ws-home",
+                "identities": {},
+                "settings": {"version": "1", "apps": {}},
+                "chat_bindings": [],
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        ch_router_mod.wx_db,
+        "get_member_weixin_binding_view",
+        create_autospec(
+            ch_router_mod.wx_db.get_member_weixin_binding_view,
+            return_value={
+                "linked": True,
+                "platform": "weixin",
+                "account_id": "acc-1",
+                "status": "active",
+                "platform_user_id": "wx_alice_01",
+                "masked_ilink_user_id": "****e_01",
+                "ilink_username": "Alice WX",
+                "has_usable_context_token": True,
+                "updated_at": "2026-11-26T00:00:00Z",
+            },
+        ),
+    )
+
+    resp = await ch_router_mod.web_get_bindings_endpoint(user_id="u-alice")
+    assert resp["bindings"]["weixin"]["platform_user_id"] == "wx_alice_01"

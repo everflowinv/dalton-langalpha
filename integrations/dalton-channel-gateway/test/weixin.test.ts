@@ -9494,4 +9494,847 @@ describe("Round 10 Fixes (Codex R9 + Grok R9)", () => {
       });
     }
   });
-});
+
+  it("r3 #3: rescanning aborts old in-flight waitQrLogin within 1s and leaves only the new session polling", async () => {
+    const h = createTestHarness();
+    try {
+      const tOld = new Date(Date.now() - 5_000).toISOString();
+      const tNew = new Date(Date.now() - 1_000).toISOString();
+      const sessions = new Map<string, Record<string, unknown>>();
+      sessions.set("sess_old", {
+        session_key: "sess_old",
+        user_id: "user_a",
+        login_version: 1,
+        expected_bot_generation: 0,
+        status: "wait",
+        qrcode: "qr_old",
+        qrcode_img_content: "https://ilinkai.weixin.qq.com/qr/old",
+        redirect_base_url: "https://ilinkai.weixin.qq.com",
+        created_at: tOld,
+        expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+      });
+      vi.mocked(h.backend.getWeixinLoginSession).mockImplementation(async (key) => {
+        const s = sessions.get(key);
+        if (!s) throw new Error(`missing session ${key}`);
+        return s as never;
+      });
+      vi.mocked(h.backend.patchWeixinLoginSession).mockImplementation(async (key, req) => {
+        if (req.action === "save_qr") {
+          sessions.set(key, {
+            session_key: key,
+            user_id: "user_a",
+            login_version: 2,
+            expected_bot_generation: 0,
+            status: "wait",
+            qrcode: req.qrcode,
+            qrcode_img_content: req.qrcode_img_content,
+            redirect_base_url: req.redirect_base_url ?? "https://ilinkai.weixin.qq.com",
+            created_at: tNew,
+            expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+          });
+        }
+        return {
+          ok: true,
+          revoked: false,
+          session_key: key,
+          status: "wait",
+          login_version: 2,
+          created_at: tNew,
+          expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+        };
+      });
+
+      const activePolls = new Set<string>();
+      let oldPollStartedResolve!: () => void;
+      const oldPollStarted = new Promise<void>((r) => {
+        oldPollStartedResolve = r;
+      });
+      let oldPollAborted = false;
+
+      const fakeFetch: typeof fetch = vi.fn(async (input, init) => {
+        const parsed = new URL(String(input));
+        if (parsed.pathname.includes("get_bot_qrcode")) {
+          return makeJsonResponse({
+            ret: 0,
+            qrcode: "qr_new",
+            qrcode_img_content: "https://ilinkai.weixin.qq.com/qr/new",
+          });
+        }
+        if (parsed.pathname.includes("get_qrcode_status")) {
+          const qr = parsed.searchParams.get("qrcode") ?? "";
+          activePolls.add(qr);
+          if (qr === "qr_old") {
+            oldPollStartedResolve();
+            return await new Promise<Response>((_resolve, reject) => {
+              const onAbort = () => {
+                oldPollAborted = true;
+                activePolls.delete(qr);
+                reject(new DOMException("Aborted", "AbortError"));
+              };
+              if (init?.signal?.aborted) {
+                onAbort();
+                return;
+              }
+              init?.signal?.addEventListener("abort", onAbort, { once: true });
+            });
+          }
+          // New session poll resolves cleanly
+          return makeJsonResponse({ ret: 0, status: "wait" });
+        }
+        throw new Error(`Unexpected URL: ${String(input)}`);
+      });
+
+      const qrManager = new WeixinQrLoginManager({
+        backend: h.backend,
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        allowedApiDomains: ["ilinkai.weixin.qq.com", "weixin.qq.com"],
+        fetchImpl: fakeFetch,
+        checkResolvedIps: false,
+      });
+
+      const oldWaitPromise = qrManager.waitQrLogin("user_a", "sess_old");
+      await oldPollStarted;
+      expect(activePolls.has("qr_old")).toBe(true);
+
+      const t0 = Date.now();
+      const startedNew = await qrManager.startQrLogin("user_a", {
+        sessionKey: "sess_new",
+        loginVersion: 2,
+      });
+      expect(startedNew.session_key).toBe("sess_new");
+
+      const oldWaitRes = await oldWaitPromise;
+      expect(Date.now() - t0).toBeLessThan(1000);
+      expect(oldPollAborted).toBe(true);
+      expect(oldWaitRes.status).toBe("superseded");
+      expect(oldWaitRes.revoked).toBe(true);
+      expect(activePolls.has("qr_old")).toBe(false);
+
+      const newWaitRes = await qrManager.waitQrLogin("user_a", "sess_new");
+      expect(newWaitRes.status).toBe("wait");
+      expect(activePolls.has("qr_new")).toBe(true);
+
+      // Server HTTP /internal/weixin/qrcode/wait aborts adapter wait signal on client disconnect
+      let serverWaitSignal: AbortSignal | undefined;
+      let serverWaitStartedResolve!: () => void;
+      const serverWaitStarted = new Promise<void>((r) => {
+        serverWaitStartedResolve = r;
+      });
+      let serverWaitAbortedResolve!: () => void;
+      const serverWaitAborted = new Promise<void>((r) => {
+        serverWaitAbortedResolve = r;
+      });
+      const fakeAdapter = new FakeChannelAdapter("weixin", 2000);
+      fakeAdapter.setQrHandlers({
+        wait: async (opts) => {
+          serverWaitSignal = opts.signal;
+          serverWaitStartedResolve();
+          return await new Promise((_resolve, reject) => {
+            opts.signal?.addEventListener(
+              "abort",
+              () => {
+                serverWaitAbortedResolve();
+                reject(new Error("client_disconnected"));
+              },
+              { once: true },
+            );
+          });
+        },
+      });
+      const srvConfig = loadConfig({
+        GATEWAY_HOST: "127.0.0.1",
+        GATEWAY_PORT: "0",
+        INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+        DALTON_WEIXIN_ENABLED: "true",
+      });
+      const srv = createGatewayApp({
+        config: srvConfig,
+        backend: h.backend,
+        adapters: new Map<ChannelPlatform, FakeChannelAdapter>([["weixin", fakeAdapter]]),
+        enableLease: false,
+      });
+      const { EventEmitter } = await import("node:events");
+      const mockReq = Object.assign(new EventEmitter(), {
+        method: "GET",
+        url: "/internal/weixin/qrcode/wait?session_key=sess_http_abort",
+        headers: {
+          "x-service-token": TEST_SERVICE_TOKEN,
+          "x-user-id": "user_a",
+        },
+        socket: { remoteAddress: "127.0.0.1" },
+      });
+      const mockRes = Object.assign(new EventEmitter(), {
+        statusCode: 200,
+        writableEnded: false,
+        destroyed: false,
+        setHeader: vi.fn(),
+        writeHead: vi.fn(),
+        end: vi.fn(() => {
+          mockRes.writableEnded = true;
+        }),
+      });
+      srv.server.emit("request", mockReq as never, mockRes as never);
+      await serverWaitStarted;
+      const abortT0 = Date.now();
+      mockRes.destroyed = true;
+      mockRes.emit("close");
+      await Promise.race([
+        serverWaitAborted,
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error("server did not abort waitQrLogin within 1s")), 1000),
+        ),
+      ]);
+      expect(Date.now() - abortT0).toBeLessThan(1000);
+      expect(serverWaitSignal?.aborted).toBe(true);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("r4 #6: out-of-order late startQrLogin does not cancel a newer DB-confirmed session poll", async () => {
+    const h = createTestHarness();
+    try {
+      const t1 = new Date(Date.now() - 10_000).toISOString();
+      const t2 = new Date(Date.now() - 2_000).toISOString();
+      const sessions = new Map<string, Record<string, unknown>>([
+        [
+          "sess_new",
+          {
+            session_key: "sess_new",
+            user_id: "user_a",
+            login_version: 2,
+            expected_bot_generation: 0,
+            status: "wait",
+            qrcode: "qr_new",
+            qrcode_img_content: "https://ilinkai.weixin.qq.com/qr/new",
+            redirect_base_url: "https://ilinkai.weixin.qq.com",
+            created_at: t2,
+            expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+          },
+        ],
+      ]);
+      vi.mocked(h.backend.getWeixinLoginSession).mockImplementation(async (key) => {
+        const s = sessions.get(key);
+        if (!s) throw new Error(`missing session ${key}`);
+        return s as never;
+      });
+      // Case A: late start(sess_old_revoked) rejected by DB with 409; Case B: older created_at response arrives late
+      vi.mocked(h.backend.patchWeixinLoginSession).mockImplementation(async (key) => {
+        if (key === "sess_new") {
+          return {
+            ok: true,
+            revoked: false,
+            session_key: "sess_new",
+            status: "wait",
+            login_version: 2,
+            created_at: t2,
+            expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+          };
+        }
+        if (key === "sess_old_revoked") {
+          return {
+            ok: false,
+            revoked: true,
+            code: "login_session_revoked",
+          };
+        }
+        return {
+          ok: true,
+          revoked: false,
+          session_key: key,
+          status: "wait",
+          login_version: 2,
+          created_at: t1,
+          expires_at: new Date(Date.now() + 4 * 60_000).toISOString(),
+        };
+      });
+
+      let newPollAborted = false;
+      let newPollStartedResolve!: () => void;
+      const newPollStarted = new Promise<void>((r) => {
+        newPollStartedResolve = r;
+      });
+      let releaseNewPoll!: () => void;
+      const newPollRelease = new Promise<void>((r) => {
+        releaseNewPoll = r;
+      });
+
+      const fakeFetch: typeof fetch = vi.fn(async (input, init) => {
+        const parsed = new URL(String(input));
+        if (parsed.pathname.includes("get_bot_qrcode")) {
+          return makeJsonResponse({
+            ret: 0,
+            qrcode: "qr_fetched",
+            qrcode_img_content: "https://ilinkai.weixin.qq.com/qr/fetched",
+          });
+        }
+        if (parsed.pathname.includes("get_qrcode_status")) {
+          newPollStartedResolve();
+          return await new Promise<Response>((resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => {
+                newPollAborted = true;
+                reject(new DOMException("Aborted", "AbortError"));
+              },
+              { once: true },
+            );
+            void newPollRelease.then(() => resolve(makeJsonResponse({ ret: 0, status: "wait" })));
+          });
+        }
+        throw new Error(`Unexpected URL: ${String(input)}`);
+      });
+
+      const qrManager = new WeixinQrLoginManager({
+        backend: h.backend,
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        allowedApiDomains: ["ilinkai.weixin.qq.com", "weixin.qq.com"],
+        fetchImpl: fakeFetch,
+        checkResolvedIps: false,
+      });
+
+      // Newer session starts and begins polling
+      await qrManager.startQrLogin("user_a", { sessionKey: "sess_new", loginVersion: 1 });
+      const newWaitPromise = qrManager.waitQrLogin("user_a", "sess_new");
+      await newPollStarted;
+
+      // Case A: Late old start rejected by DB -> MUST NOT abort sess_new's live poll
+      await expect(
+        qrManager.startQrLogin("user_a", { sessionKey: "sess_old_revoked", loginVersion: 1 }),
+      ).rejects.toMatchObject({ statusCode: 409, code: "login_session_revoked" });
+      expect(newPollAborted).toBe(false);
+
+      // Case B: Older created_at save_qr response arriving out-of-order -> MUST NOT abort sess_new
+      await qrManager.startQrLogin("user_a", { sessionKey: "sess_old_late_ok", loginVersion: 1 });
+      expect(newPollAborted).toBe(false);
+
+      releaseNewPoll();
+      const res = await newWaitPromise;
+      expect(res.status).toBe("wait");
+      expect(newPollAborted).toBe(false);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("r4 #7: HTTP 429 maps to weixin_rate_limited first, default verifyQrCode maps business errors to verify_code_expired vs weixin_login_failed, and sendmessage 503 stays unknown", async () => {
+    const h = createTestHarness();
+    try {
+      vi.mocked(h.backend.getWeixinLoginSession).mockResolvedValue({
+        session_key: "sess_vc",
+        user_id: "user_a",
+        login_version: 1,
+        expected_bot_generation: 0,
+        status: "verify_code",
+        qrcode: "qr_vc",
+        qrcode_img_content: "https://ilinkai.weixin.qq.com/qr/vc",
+        redirect_base_url: "https://ilinkai.weixin.qq.com",
+        expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+      } as never);
+
+      // 1. Production default (no confirmed retryable invalidVerifyCodeErrorCodes)
+      const prodResponses: Array<() => Response> = [
+        // HTTP 429 (even if body has ret=-14) -> 429 weixin_rate_limited first!
+        () =>
+          new Response(JSON.stringify({ ret: -14, errcode: -14 }), {
+            status: 429,
+            headers: { "Content-Type": "application/json", "Retry-After": "3" },
+          }),
+        // Verify-code business error on HTTP 200 -> 409 verify_code_expired (rescan)
+        () => makeJsonResponse({ ret: -1, errcode: 48001, errmsg: "raw secret" }),
+        // Verify-code business error on HTTP 400 -> 409 verify_code_expired (rescan)
+        () =>
+          new Response(JSON.stringify({ ret: -1, errcode: 48002 }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          }),
+        // Session expired (-14) on HTTP 400 -> 409 verify_code_expired
+        () =>
+          new Response(JSON.stringify({ ret: -14, errcode: -14 }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          }),
+        // HTTP 503 with business JSON -> 502 weixin_login_failed
+        () =>
+          new Response(JSON.stringify({ ret: -1, errcode: 50001 }), {
+            status: 503,
+            headers: { "Content-Type": "application/json" },
+          }),
+        // HTTP 502 plain text -> 502 weixin_login_failed
+        () => new Response("bad gateway", { status: 502 }),
+      ];
+      let prodStep = 0;
+      const prodQrManager = new WeixinQrLoginManager({
+        backend: h.backend,
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        allowedApiDomains: ["ilinkai.weixin.qq.com", "weixin.qq.com"],
+        fetchImpl: vi.fn(async () => prodResponses[prodStep++]!()),
+        checkResolvedIps: false,
+      });
+
+      await expect(
+        prodQrManager.verifyQrCode("user_a", "sess_vc", "000000"),
+      ).rejects.toMatchObject({ statusCode: 429, code: "weixin_rate_limited" });
+      await expect(
+        prodQrManager.verifyQrCode("user_a", "sess_vc", "000000"),
+      ).rejects.toMatchObject({ statusCode: 409, code: "verify_code_expired" });
+      await expect(
+        prodQrManager.verifyQrCode("user_a", "sess_vc", "000000"),
+      ).rejects.toMatchObject({ statusCode: 409, code: "verify_code_expired" });
+      await expect(
+        prodQrManager.verifyQrCode("user_a", "sess_vc", "000000"),
+      ).rejects.toMatchObject({ statusCode: 409, code: "verify_code_expired" });
+      await expect(
+        prodQrManager.verifyQrCode("user_a", "sess_vc", "000000"),
+      ).rejects.toMatchObject({ statusCode: 502, code: "weixin_login_failed" });
+      await expect(
+        prodQrManager.verifyQrCode("user_a", "sess_vc", "000000"),
+      ).rejects.toMatchObject({ statusCode: 502, code: "weixin_login_failed" });
+
+      // 2. When confirmed retryable codes ARE configured, matching code maps to 400 invalid_verify_code
+      const customResponses: Array<() => Response> = [
+        () =>
+          new Response(JSON.stringify({ ret: -1, errcode: 48001 }), {
+            status: 400,
+            headers: { "Content-Type": "application/json" },
+          }),
+        () => makeJsonResponse({ ret: -1, errcode: 50001 }),
+      ];
+      let customStep = 0;
+      const customQrManager = new WeixinQrLoginManager({
+        backend: h.backend,
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        allowedApiDomains: ["ilinkai.weixin.qq.com", "weixin.qq.com"],
+        invalidVerifyCodeErrorCodes: [48001],
+        fetchImpl: vi.fn(async () => customResponses[customStep++]!()),
+        checkResolvedIps: false,
+      });
+      await expect(
+        customQrManager.verifyQrCode("user_a", "sess_vc", "000000"),
+      ).rejects.toMatchObject({ statusCode: 400, code: "invalid_verify_code" });
+      await expect(
+        customQrManager.verifyQrCode("user_a", "sess_vc", "000000"),
+      ).rejects.toMatchObject({ statusCode: 502, code: "weixin_login_failed" });
+
+      // 3. sendmessage HTTP 503 with {"ret": -1} stays http_error so sendWeixinTextMessage keeps outcome=unknown
+      await expect(
+        sendWeixinTextMessage(
+          {
+            baseUrl: "https://ilinkai.weixin.qq.com",
+            cdnBaseUrl: "https://novac2c.cdn.weixin.qq.com/c2c",
+            botToken: "tok_test",
+            toUserId: "wx_u1",
+            contextToken: "ctx_tok_1",
+            allowedApiDomains: ["ilinkai.weixin.qq.com"],
+            checkResolvedIps: false,
+            fetchImpl: vi.fn(
+              async () =>
+                new Response(JSON.stringify({ ret: -1 }), {
+                  status: 503,
+                  headers: { "Content-Type": "application/json" },
+                }),
+            ),
+          },
+          "hi",
+        ),
+      ).rejects.toMatchObject({ outcome: "unknown" });
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("r5 #4: same-millisecond microsecond-ordered or unordered late save_qr success never cancels newer poll", async () => {
+    const h = createTestHarness();
+    try {
+      // Two sessions within the exact same millisecond, differing only in microseconds
+      const futureExp = new Date(Date.now() + 5 * 60_000).toISOString();
+      const tUsOld = "2026-11-26T08:00:00.123001Z";
+      const tUsNew = "2026-11-26T08:00:00.123002Z";
+      const tUsNewer = "2026-11-26T08:00:00.123003Z";
+      const sessions = new Map<string, Record<string, unknown>>([
+        [
+          "sess_us_new",
+          {
+            session_key: "sess_us_new",
+            user_id: "user_a",
+            login_version: 2,
+            expected_bot_generation: 0,
+            status: "wait",
+            qrcode: "qr_us_new",
+            qrcode_img_content: "https://ilinkai.weixin.qq.com/qr/new",
+            redirect_base_url: "https://ilinkai.weixin.qq.com",
+            created_at: tUsNew,
+            expires_at: futureExp,
+          },
+        ],
+      ]);
+      vi.mocked(h.backend.getWeixinLoginSession).mockImplementation(async (key) => {
+        const s = sessions.get(key);
+        if (!s) throw new Error(`missing session ${key}`);
+        return s as never;
+      });
+      vi.mocked(h.backend.patchWeixinLoginSession).mockImplementation(async (key) => {
+        if (key === "sess_us_new") {
+          return {
+            ok: true,
+            revoked: false,
+            session_key: key,
+            status: "wait",
+            login_version: 2,
+            created_at: tUsNew,
+            expires_at: futureExp,
+          };
+        }
+        if (key === "sess_us_old_late") {
+          return {
+            ok: true,
+            revoked: false,
+            session_key: key,
+            status: "wait",
+            login_version: 2,
+            created_at: tUsOld,
+            expires_at: futureExp,
+          };
+        }
+        if (key === "sess_unordered_late") {
+          return {
+            ok: true,
+            revoked: false,
+            session_key: key,
+            status: "wait",
+            login_version: 2,
+          };
+        }
+        return {
+          ok: true,
+          revoked: false,
+          session_key: key,
+          status: "wait",
+          login_version: 2,
+          created_at: tUsNewer,
+          expires_at: futureExp,
+        };
+      });
+
+      let pollAborted = false;
+      let pollStartedResolve!: () => void;
+      const pollStarted = new Promise<void>((r) => {
+        pollStartedResolve = r;
+      });
+      const fakeFetch: typeof fetch = vi.fn(async (input, init) => {
+        const parsed = new URL(String(input));
+        if (parsed.pathname.includes("get_bot_qrcode")) {
+          return makeJsonResponse({
+            ret: 0,
+            qrcode: "qr_fetched",
+            qrcode_img_content: "https://ilinkai.weixin.qq.com/qr/fetched",
+          });
+        }
+        if (parsed.pathname.includes("get_qrcode_status")) {
+          pollStartedResolve();
+          return await new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => {
+                pollAborted = true;
+                reject(new DOMException("Aborted", "AbortError"));
+              },
+              { once: true },
+            );
+          });
+        }
+        throw new Error(`Unexpected URL: ${String(input)}`);
+      });
+
+      const qrManager = new WeixinQrLoginManager({
+        backend: h.backend,
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        allowedApiDomains: ["ilinkai.weixin.qq.com", "weixin.qq.com"],
+        fetchImpl: fakeFetch,
+        checkResolvedIps: false,
+      });
+
+      await qrManager.startQrLogin("user_a", { sessionKey: "sess_us_new", loginVersion: 1 });
+      const waitPromise = qrManager.waitQrLogin("user_a", "sess_us_new");
+      await pollStarted;
+
+      // 1. Late save_qr 1µs earlier (same millisecond!) MUST NOT cancel sess_us_new
+      await qrManager.startQrLogin("user_a", { sessionKey: "sess_us_old_late", loginVersion: 1 });
+      expect(pollAborted).toBe(false);
+
+      // 2. Late save_qr missing created_at/expires_at MUST NOT cancel sess_us_new
+      await qrManager.startQrLogin("user_a", { sessionKey: "sess_unordered_late", loginVersion: 1 });
+      expect(pollAborted).toBe(false);
+
+      // 3. Strictly newer session (1µs later) DOES cancel sess_us_new
+      await qrManager.startQrLogin("user_a", { sessionKey: "sess_us_newer", loginVersion: 1 });
+      const waitRes = await waitPromise;
+      expect(pollAborted).toBe(true);
+      expect(waitRes.status).toBe("superseded");
+      expect(waitRes.revoked).toBe(true);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("r5 #5: HTTP 429 body-read failure still maps to weixin_rate_limited and verifyQrCode network failure maps to weixin_login_failed", async () => {
+    const h = createTestHarness();
+    try {
+      vi.mocked(h.backend.getWeixinLoginSession).mockResolvedValue({
+        session_key: "sess_vc_r5",
+        user_id: "user_a",
+        login_version: 1,
+        expected_bot_generation: 0,
+        status: "verify_code",
+        qrcode: "qr_vc_r5",
+        qrcode_img_content: "https://ilinkai.weixin.qq.com/qr/vc",
+        redirect_base_url: "https://ilinkai.weixin.qq.com",
+        expires_at: new Date(Date.now() + 5 * 60_000).toISOString(),
+      } as never);
+
+      let step = 0;
+      const qrManager = new WeixinQrLoginManager({
+        backend: h.backend,
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        allowedApiDomains: ["ilinkai.weixin.qq.com", "weixin.qq.com"],
+        checkResolvedIps: false,
+        fetchImpl: vi.fn(async () => {
+          step += 1;
+          if (step === 1) {
+            // HTTP 429 whose body stream fails mid-read -> must still throw 429 weixin_rate_limited
+            const failingStream = new ReadableStream<Uint8Array>({
+              pull() {
+                throw new Error("socket closed while reading 429 body");
+              },
+            });
+            return new Response(failingStream, {
+              status: 429,
+              headers: { "retry-after": "5" },
+            });
+          }
+          // Network error during verify_qrcode_code
+          throw new TypeError("fetch failed: ECONNRESET");
+        }),
+      });
+
+      await expect(
+        qrManager.verifyQrCode("user_a", "sess_vc_r5", "123456"),
+      ).rejects.toMatchObject({ statusCode: 429, code: "weixin_rate_limited" });
+
+      await expect(
+        qrManager.verifyQrCode("user_a", "sess_vc_r5", "123456"),
+      ).rejects.toMatchObject({ statusCode: 502, code: "weixin_login_failed" });
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("r6 #3: late save_qr response with expires_at but missing created_at never cancels newer poll", async () => {
+    const h = createTestHarness();
+    try {
+      const tNew = "2026-11-26T08:00:00.123002Z";
+      const futureExp = new Date(Date.now() + 5 * 60_000).toISOString();
+      const farFutureExp = new Date(Date.now() + 30 * 60_000).toISOString();
+      vi.mocked(h.backend.getWeixinLoginSession).mockResolvedValue({
+        session_key: "sess_r6_new",
+        user_id: "user_a",
+        login_version: 2,
+        expected_bot_generation: 0,
+        status: "wait",
+        qrcode: "qr_r6_new",
+        qrcode_img_content: "https://ilinkai.weixin.qq.com/qr/new",
+        redirect_base_url: "https://ilinkai.weixin.qq.com",
+        created_at: tNew,
+        expires_at: futureExp,
+      } as never);
+      vi.mocked(h.backend.patchWeixinLoginSession).mockImplementation(async (key) => {
+        if (key === "sess_r6_new") {
+          return {
+            ok: true,
+            revoked: false,
+            session_key: key,
+            status: "wait",
+            login_version: 2,
+            created_at: tNew,
+            expires_at: futureExp,
+          };
+        }
+        // Late response has a far-future expires_at (rewritten on save_qr) but NO created_at
+        return {
+          ok: true,
+          revoked: false,
+          session_key: key,
+          status: "wait",
+          login_version: 2,
+          expires_at: farFutureExp,
+        };
+      });
+
+      let pollAborted = false;
+      let pollStartedResolve!: () => void;
+      const pollStarted = new Promise<void>((r) => {
+        pollStartedResolve = r;
+      });
+      let releasePoll!: () => void;
+      const pollRelease = new Promise<void>((r) => {
+        releasePoll = r;
+      });
+      const fakeFetch: typeof fetch = vi.fn(async (input, init) => {
+        const parsed = new URL(String(input));
+        if (parsed.pathname.includes("get_bot_qrcode")) {
+          return makeJsonResponse({
+            ret: 0,
+            qrcode: "qr_fetched",
+            qrcode_img_content: "https://ilinkai.weixin.qq.com/qr/fetched",
+          });
+        }
+        if (parsed.pathname.includes("get_qrcode_status")) {
+          pollStartedResolve();
+          return await new Promise<Response>((resolve, reject) => {
+            init?.signal?.addEventListener(
+              "abort",
+              () => {
+                pollAborted = true;
+                reject(new DOMException("Aborted", "AbortError"));
+              },
+              { once: true },
+            );
+            void pollRelease.then(() => resolve(makeJsonResponse({ ret: 0, status: "wait" })));
+          });
+        }
+        throw new Error(`Unexpected URL: ${String(input)}`);
+      });
+
+      const qrManager = new WeixinQrLoginManager({
+        backend: h.backend,
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        allowedApiDomains: ["ilinkai.weixin.qq.com", "weixin.qq.com"],
+        fetchImpl: fakeFetch,
+        checkResolvedIps: false,
+      });
+
+      await qrManager.startQrLogin("user_a", { sessionKey: "sess_r6_new", loginVersion: 1 });
+      const waitPromise = qrManager.waitQrLogin("user_a", "sess_r6_new");
+      await pollStarted;
+
+      // Late save_qr missing created_at (even with far-future expires_at) MUST NOT cancel sess_r6_new
+      await qrManager.startQrLogin("user_a", { sessionKey: "sess_r6_no_created_at", loginVersion: 1 });
+      expect(pollAborted).toBe(false);
+
+      releasePoll();
+      const res = await waitPromise;
+      expect(res.status).toBe("wait");
+      expect(pollAborted).toBe(false);
+    } finally {
+      await h.cleanup();
+    }
+  });
+  });
+
+  it("BE2: throttles immediate empty getupdates polls with a minimum interval, aborts wait promptly on stop, and isolates per-account intervals", async () => {
+    // 1) Consecutive immediate empty returns are rate-limited (cannot spin hundreds of times in 120ms)
+    const backend = createMockBackend();
+    const ctrl1 = new AbortController();
+    let emptyPollCalls = 0;
+    const monitor1 = new WeixinMonitor({
+      accountId: "00000000-0000-4000-8000-00000000be21",
+      baseUrl: "https://ilinkai.weixin.qq.com",
+      botToken: "tok_be2_1",
+      ilinkBotId: "bot_be2_1",
+      botGeneration: 1,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+      backend,
+      signal: ctrl1.signal,
+      onInboundEvent: async () => undefined,
+      fetchImpl: async () => {
+        emptyPollCalls += 1;
+        if (emptyPollCalls > 10) {
+          ctrl1.abort();
+        }
+        return new Response(
+          JSON.stringify({ ret: 0, msgs: [], get_updates_buf: "" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+    const run1 = monitor1.start();
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const abortStart = Date.now();
+    ctrl1.abort();
+    await waitBounded(run1, "monitor1 exited promptly when aborted during empty-poll wait");
+    const abortElapsedMs = Date.now() - abortStart;
+    // With default 1000ms minimum empty-poll interval, in 150ms only 1 poll should have fired,
+    // and aborting during the ~850ms remaining wait MUST exit immediately (< 150ms).
+    expect(emptyPollCalls).toBe(1);
+    expect(abortElapsedMs).toBeLessThan(150);
+
+    // 2) Multi-account independence: account A receiving immediate empty polls waits its interval
+    //    while account B receiving messages polls back-to-back without waiting on account A.
+    const ctrlA = new AbortController();
+    const ctrlB = new AbortController();
+    let callsA = 0;
+    let callsB = 0;
+    const thirdCallB = defer<void>();
+    const monitorA = new WeixinMonitor({
+      accountId: "00000000-0000-4000-8000-00000000be2a",
+      baseUrl: "https://ilinkai.weixin.qq.com",
+      botToken: "tok_be2_a",
+      ilinkBotId: "bot_be2_a",
+      botGeneration: 1,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+      backend,
+      signal: ctrlA.signal,
+      onInboundEvent: async () => undefined,
+      fetchImpl: async () => {
+        callsA += 1;
+        return new Response(
+          JSON.stringify({ ret: 0, msgs: [], get_updates_buf: "" }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+    const monitorB = new WeixinMonitor({
+      accountId: "00000000-0000-4000-8000-00000000be2b",
+      baseUrl: "https://ilinkai.weixin.qq.com",
+      botToken: "tok_be2_b",
+      ilinkBotId: "bot_be2_b",
+      botGeneration: 1,
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: false,
+      backend,
+      signal: ctrlB.signal,
+      onInboundEvent: async () => undefined,
+      fetchImpl: async () => {
+        callsB += 1;
+        if (callsB >= 3) {
+          thirdCallB.resolve();
+          ctrlB.abort();
+        }
+        return new Response(
+          JSON.stringify({
+            ret: 0,
+            msgs: [
+              {
+                message_id: `msg_b_${callsB}`,
+                from_user_id: "wx_user_b",
+                message_type: 1,
+                item_list: [{ type: 1, text_item: { text: `hi ${callsB}` } }],
+              },
+            ],
+            get_updates_buf: "",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      },
+    });
+    const runA = monitorA.start();
+    const runB = monitorB.start();
+    await waitBounded(thirdCallB.promise, "account B completed 3 non-empty polls independently");
+    await waitBounded(runB, "monitorB exited");
+    expect(callsB).toBe(3);
+    expect(callsA).toBe(1);
+    ctrlA.abort();
+    await waitBounded(runA, "monitorA exited");
+  });

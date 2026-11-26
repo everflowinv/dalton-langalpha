@@ -773,8 +773,9 @@ class ProvenanceMiddleware(AgentMiddleware):
 
         if not identifier:
             return
+        # DALTON-HOOK(colleague-access): self._redactor is a callable function; invoke directly
         if isinstance(summary_obj, str) and self._redactor is not None:
-            summary_obj = self._redactor.redact(summary_obj)
+            summary_obj = self._redactor(summary_obj)
         sha256, size, snippet, body = fingerprint_result_with_body(summary_obj)
         yield ProvenanceSource(
             record_id=_new_id(),

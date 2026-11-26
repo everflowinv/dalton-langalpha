@@ -1,0 +1,19 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "dalton-funda-ai",
+  "version": "0.1.0",
+  "description": "FUNDA AI research archive connector (commercial).",
+  "author": { "name": "Dalton" },
+  "license": "Proprietary",
+  "extensions": {
+    "ai.langalpha": {
+      "servers": {
+        "dalton_funda_ai": {
+          "description": "FUNDA AI independent tech/AI infrastructure research (`search`, `read`, `list` over `funda:` archive).",
+          "tool_exposure_mode": "summary",
+          "instruction": "Use `search(query=..., start=..., end=..., limit=...)`, `list(...)`, and `read(document='funda:<id>')` for FUNDA AI research articles."
+        }
+      }
+    }
+  }
+}

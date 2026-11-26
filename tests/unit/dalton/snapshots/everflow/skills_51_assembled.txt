@@ -5155,13 +5155,22 @@ Palantir、Cloudflare 这类公司的问题不是没被收进池子，是**卡�
       "name": "Instacart",
       "name_en": "Maplebear",
       "watch": "AI 广告投放、Carrot Ads 外部客户、GTV 与广告 take rate"
+    },
+    {
+      "track": "tob_software",
+      "market": "US",
+      "scan_tier": 1,
+      "ai_purity": "native",
+      "ticker": "ANT",
+      "name": "Anthropic",
+      "name_en": "Anthropic",
+      "watch": "Claude 企业订阅与 API ARR、Claude Code 付费席位、云渠道分成"
     }
   ],
   "private_watchlist": {
     "note": "未上市，不可交易。作用是领先指标：新变现方式与新产品形态通常先在这里出现，再传导到上市公司。只做定性追踪，不进增速筛选表。",
     "companies": [
       "OpenAI",
-      "Anthropic",
       "xAI",
       "Mistral",
       "月之暗面 Moonshot",
@@ -6509,11 +6518,10 @@ python3 .agents/skills/dalton-bullbear-tracker/scripts/state.py open-runs \
 python3 .agents/skills/dalton-bullbear-tracker/scripts/collect.py collect \
   --ticker <TICKER> \
   --workspace-dir <workspace> \
-  --since <YYYY-MM-DD> \
   --run-id <YYYYMMDD-HHMM>
 ```
 
-`--since` 用上一份 `research/tracker/last_run.json` 的 `until`；没有上一份时可以省略。`--run-id` 用美东时间 `YYYYMMDD-HHMM`。记下返回的 `run_id`、相对路径 `packet_json` 和 `packet_md`。运行目录是 `research/tracker/<run_id>/`。
+常规运行省略 `--since`，采集程序会自动读取本任务的进度决定起止日期；需要手动回补特定起始日时再传入 `--since <YYYY-MM-DD>`。`--run-id` 用美东时间 `YYYYMMDD-HHMM`。记下返回的 `run_id`、相对路径 `packet_json` 和 `packet_md`。运行目录是 `research/tracker/<run_id>/`。
 
 完整数据包已存在时，采集程序会恢复该数据包。恢复结果不是失败，不要再采集一次。采集失败可以重试一次。两次都失败时，不要本地提交（commit），`seen.json` 保持原状，按第 7 节发失败报告并结束。
 
@@ -23092,7 +23100,7 @@ python3 .agents/skills/dalton-stock-move/scripts/make_price_triggers.py \
 1. 在 `companies` 列表中找到目标 `ticker` 的条目。
 2. **同组列表（Peers）**：
    - 优先取该条目的 `peers` 字段（即同一 `peer_group` 下的其他公司代码，不含目标公司自身）；
-   - 若条目只有 `peer_group` 名称而未展开 `peers`，收集 `coverage.yaml` 中所有 `peer_group` 相同、且代码不等于目标公司的上市代码（跳过 `SPCX` 等无公开行情的私有公司）。
+   - 若条目只有 `peer_group` 名称而未展开 `peers`，收集 `coverage.yaml` 中所有 `peer_group` 相同、且代码不等于目标公司的上市代码（按数据字段跳过标记为未上市或无公开行情的私有公司）。
 3. **板块 ETF**：
    - 取该条目的 `etfs[0]`（若 `etfs` 非空，例如 `QQQ`、`IGV`、`KWEB`、`XHB`）；
    - 若该条目的 `etfs` 为空，按其 `sheet_section` 或 `peer_group` 映射到对应的板块 ETF（见下表）。

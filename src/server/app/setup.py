@@ -523,6 +523,22 @@ async def lifespan(app: FastAPI):
             config=agent_config,
             cleanup_interval=300,  # 5 minutes
         )
+        # --- DALTON-HOOK(cos-settings-tools): begin ---
+        try:
+            recovered_archiving = (
+                await workspace_manager.recover_archiving_computers_on_startup()
+            )
+            if recovered_archiving:
+                logger.info(
+                    "startup_recovered_archiving_computers count=%d",
+                    recovered_archiving,
+                )
+        except Exception as exc:
+            logger.warning(
+                "startup_recover_archiving_computers_failed exc_type=%s",
+                type(exc).__name__,
+            )
+        # --- DALTON-HOOK(cos-settings-tools): end ---
         await workspace_manager.start_cleanup_task()
         logger.info("Workspace Manager initialized")
 
@@ -901,7 +917,12 @@ async def lifespan(app: FastAPI):
                 "or one sooner than 7 days; parts of an upload interrupted "
                 "mid-transfer are kept and billed without one, and a Drive file "
                 "sent in parts may stay open up to 6 days before one aborts it. "
-                "Add an AbortIncompleteMultipartUpload lifecycle rule of at least 7 days."
+                "Add an AbortIncompleteMultipartUpload lifecycle rule of at least 7 days. "
+                # DALTON-HOOK(drive-guidance): MinIO has no such rule; say what stands in for it
+                "On MinIO the equivalent is its stale_uploads_expiry setting "
+                "(MINIO_API_STALE_UPLOADS_EXPIRY, 24h by default), set to 168h or longer "
+                "before turning the Drive on; MinIO keeps that setting to itself, so this "
+                "warning appears there either way."
             )
     except Exception as e:
         logger.info(f"Skipped the multipart cleanup rule check: {e!r}")

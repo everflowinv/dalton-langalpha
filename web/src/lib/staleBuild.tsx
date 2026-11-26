@@ -336,7 +336,9 @@ export async function checkForNewBuild(): Promise<void> {
   } catch {
     return warnUnrecognized('unparseable body');
   }
-  const build = (data as { build?: unknown } | null)?.build;
+  // DALTON-HOOK(frontend-release-dir): read app entry chunk from `entry` when `build` also encodes docs/release identity
+  const parsed = data as { entry?: unknown; build?: unknown } | null;
+  const build = typeof parsed?.entry === 'string' && parsed.entry ? parsed.entry : parsed?.build;
   if (typeof build !== 'string' || !build) return warnUnrecognized('no build id');
   if (build === mine) return;
   serverMovedOn = true;

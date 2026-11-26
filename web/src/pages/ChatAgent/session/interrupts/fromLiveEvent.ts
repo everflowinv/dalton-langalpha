@@ -205,40 +205,59 @@ export function projectLiveInterrupt(
       proposalId,
       toolCallId: proposalData.tool_call_id,
     });
-  } else if (actionType === 'delete_workspace' || actionType === 'stop_workspace' || actionType === 'delete_thread') {
+  } else if (actionType === 'delete_workspace' || actionType === 'stop_workspace' || actionType === 'delete_thread' || actionType === 'archive_workspace') {
     // --- Secretary action interrupt ---
     const proposalId = event.interrupt_id || `secretary-${actionType}-${Date.now()}`;
     const proposalData = actionRequests[0];
     const order = eventOrder(event, () => ++refs.contentOrderCounterRef.current);
+    // --- DALTON-HOOK(cos-settings-tools): begin ---
+    const isArchive = actionType === 'archive_workspace';
+    const hasToolCallId = typeof proposalData.tool_call_id === 'string' && proposalData.tool_call_id.length > 0;
+    const legacyMissingToolCallId = isArchive && !hasToolCallId;
 
     rt.setMessages((prev) =>
-      updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
-        ...msg,
-        contentSegments: appendCardSegment(msg.contentSegments, { type: actionType as 'delete_workspace' | 'stop_workspace' | 'delete_thread', proposalId, order }),
-        secretaryActionProposals: {
-          ...(msg.secretaryActionProposals || {}),
-          [proposalId]: {
-            actionType: actionType as 'delete_workspace' | 'stop_workspace' | 'delete_thread',
-            workspace_id: proposalData.workspace_id,
-            workspace_name: proposalData.workspace_name,
-            thread_id: proposalData.thread_id,
-            // DALTON-HOOK(cos-settings-tools): carry tool_call_id for secretary cards
-            tool_call_id: proposalData.tool_call_id,
-            interruptId: event.interrupt_id,
-            status: 'pending',
-          },
-        },
-        isStreaming: false,
-      }; })
+      interruptAlreadyRendered && isArchive
+        ? (hasToolCallId ? setCardStatus(prev, 'secretaryActionProposals', proposalId, 'pending') : prev)
+        : updateMessage(prev,assistantMessageId, (m) => { if (m.role !== 'assistant') return m; const msg = m as AssistantMessage; return {
+            ...msg,
+            contentSegments: appendCardSegment(msg.contentSegments, { type: actionType as 'delete_workspace' | 'stop_workspace' | 'delete_thread' | 'archive_workspace', proposalId, order }),
+            secretaryActionProposals: {
+              ...(msg.secretaryActionProposals || {}),
+              [proposalId]: {
+                actionType: actionType as 'delete_workspace' | 'stop_workspace' | 'delete_thread' | 'archive_workspace',
+                workspace_id: proposalData.workspace_id,
+                workspace_name: proposalData.workspace_name,
+                thread_id: proposalData.thread_id,
+                computer_id: proposalData.computer_id,
+                computer_name: proposalData.computer_name,
+                expected_workspaces: Array.isArray(proposalData.expected_workspaces)
+                  ? proposalData.expected_workspaces
+                  : undefined,
+                tool_call_id: proposalData.tool_call_id,
+                interruptId: event.interrupt_id,
+                status: legacyMissingToolCallId ? 'failed' : 'pending',
+                ...(legacyMissingToolCallId
+                  ? {
+                      failure_code: 'scope_changed',
+                      failure_error: '情况已变化，请重新发起',
+                    }
+                  : {}),
+              },
+            },
+            isStreaming: false,
+          }; })
     );
 
-    arm({
-      type: actionType,
-      interruptId: event.interrupt_id,
-      assistantMessageId,
-      proposalId,
-      toolCallId: proposalData.tool_call_id,
-    });
+    if (!legacyMissingToolCallId) {
+      arm({
+        type: actionType,
+        interruptId: event.interrupt_id,
+        assistantMessageId,
+        proposalId,
+        toolCallId: proposalData.tool_call_id,
+      });
+    }
+    // --- DALTON-HOOK(cos-settings-tools): end ---
   // DALTON-HOOK(watchlist): project live personal watchlist confirmation interrupt via Dalton helper
   } else if (isWatchlistInterruptType(actionType)) {
     const order = eventOrder(event, () => ++refs.contentOrderCounterRef.current);

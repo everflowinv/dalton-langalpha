@@ -90,6 +90,49 @@ export async function getWorkspace(workspaceId: string): Promise<Workspace> {
   return data;
 }
 
+// --- DALTON-HOOK(cos-settings-tools): begin ---
+export interface ArchiveWorkspaceSnapshotItem {
+  workspace_id: string;
+  name: string;
+  dir_name: string;
+  status: string;
+  is_stand_in?: boolean;
+}
+
+export interface ArchivePreviewResponse {
+  computer_id: string;
+  computer_name: string;
+  computer_kind: string;
+  computer_status: string;
+  archivable: boolean;
+  expected_workspaces: ArchiveWorkspaceSnapshotItem[];
+}
+
+export async function getWorkspaceArchivePreview(workspaceId: string): Promise<ArchivePreviewResponse> {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.get<ArchivePreviewResponse>(`/api/v1/workspaces/${workspaceId}/archive-preview`, {
+    timeout: WORKSPACE_QUERY_TIMEOUT_MS,
+  });
+  return data;
+}
+
+export async function archiveWorkspaceWithSnapshot(
+  workspaceId: string,
+  snapshot: {
+    expected_computer_id: string;
+    expected_workspaces: ArchiveWorkspaceSnapshotItem[];
+  },
+): Promise<{ workspace_id: string; status: string; message: string }> {
+  if (!workspaceId) throw new Error('Workspace ID is required');
+  const { data } = await api.post<{ workspace_id: string; status: string; message: string }>(
+    `/api/v1/workspaces/${workspaceId}/archive`,
+    snapshot,
+    { timeout: WORKSPACE_MUTATION_TIMEOUT_MS },
+  );
+  return data;
+}
+// --- DALTON-HOOK(cos-settings-tools): end ---
+
 /**
  * Get or create the user's Home, the workspace the Chief of Staff runs in.
  * Idempotent, so safe to call on every app load.

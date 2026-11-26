@@ -31,21 +31,24 @@
 │   │    • flush_interval -1 (SSE 零缓冲 + 原生 WebSocket Upgrade)        │
 │   │    └──► Docker 内网 backend:8000 (FastAPI)                          │
 │   │                                                                     │
+│   ├─ /__edge_health                                                     │
+│   │    └──► 专用就绪探针，返回 200 text/plain (`dalton-edge-ok releases-v1`) │
+│   │                                                                     │
 │   ├─ /version.json                                                      │
-│   │    └──► 静态只读卷 /srv/version.json (no-store；不存在时真实 404)    │
+│   │    └──► 静态只读卷 /srv-releases/current/version.json (no-store)    │
 │   │                                                                     │
 │   ├─ /assets/*                                                          │
-│   │    └──► 静态只读卷 /srv/assets/* (immutable 长缓存；不存在时 404)    │
+│   │    └──► 静态只读卷 /srv-releases/current/assets/* (immutable 长缓存) │
 │   │                                                                     │
 │   ├─ /health*, /docs*, /redoc*, /openapi.json, /metrics*                │
-│   │    └──► 直接返回 404 Not Found（不回退 SPA）                         │
+│   │    └──► 直接返回 404 Not Found                                       │
 │   │                                                                     │
 │   ├─ /help, /help/*                                                     │
-│   │    • /help/_astro/*：immutable 长缓存；不存在时 404                 │
+│   │    • /help/_astro/*：immutable 长缓存                                │
 │   │    • HTML 文档：no-store；缺失路径返回 HTTP 404 + /help/404.html    │
 │   │                                                                     │
 │   ├─ 其余 GET/HEAD                                                      │
-│   │    └──► 静态只读卷 /srv + SPA 回退 /index.html (index.html 不缓存)  │
+│   │    └──► 静态只读卷 /srv-releases/current + SPA 回退 /index.html     │
 │   │                                                                     │
 │   └─ 其余所有路径 / 方法 ──► 404 Not Found                              │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -113,10 +116,17 @@ PUBLIC_APP_URL=https://<主机名>.<tailnet>.ts.net:8443
 
 ## 4. 构建与启动步骤
 
-### 步骤 1：构建前端生产产物 (`web/dist`)
-在仓库根目录执行生产构建脚本（自动读取 `.env` 中的 `VITE_*` 与 `web/.env.dalton` 品牌默认项，输出应用到 `web/dist` 并校验 `index.html` 与 `version.json`，同时构建 `docs-site/` 静态帮助站点输出到 `web/dist/help/`）：
+### 步骤 1：构建并激活前端生产产物 (`web/releases/current`)
+`edge`（Caddy）挂载 `./web/releases:/srv-releases:ro` 并将站点根目录指向相对符号链接 `/srv-releases/current`。在仓库根目录按场景执行：
 
 ```bash
+# 场景 A：全新环境或手工发布——构建独立版本目录（含应用、help/ 帮助站与 version.json）并原子切换 web/releases/current
+DALTON_DEPLOY_LIB_ONLY=1 bash -c 'source scripts/dalton/ops/prod/deploy_main.sh && manual_build_frontend_release'
+
+# 场景 B：已有运行中 web/dist 挂载的生产环境首次迁移——先快进检出，再运行专用首次上线入口
+bash scripts/dalton/ops/prod/deploy_main.sh --first-releases-rollout
+
+# 场景 C：仅构建到默认 web/dist 目录（供独立核心安装或本地验证使用）
 bash scripts/dalton/build_frontend_prod.sh --require-supabase
 ```
 
@@ -128,13 +138,15 @@ docker compose -f docker-compose.yml -f docker-compose.dalton.yml up -d backend 
 
 > **注意**：若此前 `backend` 或 `frontend` 以旧配置运行在 `0.0.0.0:8000` / `0.0.0.0:5173`，执行 `up -d --force-recreate backend frontend edge` 以确保宿主端口绑定立即切换为 `127.0.0.1`。
 
-### 步骤 3：执行本机网关自检
-在开启 Tailscale Funnel 前，先对 `127.0.0.1:8088` 执行自检脚本：
+### 步骤 3：执行本机网关自检与版本核对
+在开启 Tailscale Funnel 前，先对 `127.0.0.1:8088` 核对 `/__edge_health`、`/version.json`（确认返回当前 `web/releases/current` 的 `build` 与 `release`）并执行自检脚本：
 
 ```bash
+curl -fsS http://127.0.0.1:8088/__edge_health
+curl -fsS http://127.0.0.1:8088/version.json
 bash scripts/dalton/check_public_edge.sh
 ```
-确认输出 `ALL PUBLIC EDGE CHECKS PASSED.`。
+确认输出 `dalton-edge-ok releases-v1`、当前版本的 JSON 清单以及 `ALL PUBLIC EDGE CHECKS PASSED.`。
 
 ---
 

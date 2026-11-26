@@ -659,12 +659,34 @@ export function createGatewayApp(options: {
           sendJson(res, 503, { detail: "Weixin QR login is not available" });
           return;
         }
-        const out = await wxAdapter.waitQrLogin({
-          userId: uid,
-          sessionKey,
-        });
-        sendJson(res, 200, sanitizePublicWeixinQrResponse(out));
-        return;
+        const waitAbort = new AbortController();
+        const onClientClose = () => {
+          if (!res.writableEnded) {
+            waitAbort.abort(new Error("client_disconnected"));
+          }
+        };
+        req.once("aborted", onClientClose);
+        res.once("close", onClientClose);
+        try {
+          const out = await wxAdapter.waitQrLogin({
+            userId: uid,
+            sessionKey,
+            signal: waitAbort.signal,
+          });
+          if (waitAbort.signal.aborted || res.writableEnded || res.destroyed) {
+            return;
+          }
+          sendJson(res, 200, sanitizePublicWeixinQrResponse(out));
+          return;
+        } catch (err) {
+          if (waitAbort.signal.aborted && (res.writableEnded || res.destroyed)) {
+            return;
+          }
+          throw err;
+        } finally {
+          req.off("aborted", onClientClose);
+          res.off("close", onClientClose);
+        }
       }
 
       if (

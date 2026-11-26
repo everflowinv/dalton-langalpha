@@ -444,8 +444,13 @@ async def workspaces_create(
             return None
         dup = None
         try:
+            dedup_kwargs: dict[str, Any] = {"channel": "cos"}
+            if snapshot is not None and snapshot.get("duplicate_workspace_id") is not None:
+                dedup_kwargs["exclude_workspace_id"] = str(
+                    snapshot["duplicate_workspace_id"]
+                )
             dup = await find_existing_company_workspace(
-                user_id, name, channel="cos"
+                user_id, name, **dedup_kwargs
             )
         except Exception as exc:
             logger.warning(
@@ -939,6 +944,199 @@ async def workspaces_update(
             type(e).__name__,
         )
         return error_command("failed to update workspace", tool_call_id)
+
+
+async def workspaces_archive(
+    user_id: str,
+    workspace_id: str | None,
+    tool_call_id: str,
+    *,
+    snapshot: dict[str, Any] | None = None,
+) -> Command:
+    """Archive a stopped Daytona workspace's computer with whole-computer HITL confirmation."""
+    if not workspace_id:
+        return error_command(
+            "workspace_id is required for archive action", tool_call_id
+        )
+
+    if snapshot is None:
+        return error_command(
+            "情况已变化，请重新发起",
+            tool_call_id,
+            code="scope_changed",
+            message_status="error",
+        )
+
+    if snapshot.get("precheck_error"):
+        return error_command(
+            str(snapshot["precheck_error"]),
+            tool_call_id,
+            code=str(snapshot.get("precheck_error_code") or "precheck_failed"),
+            message_status="error",
+        )
+
+    snap_ws_id = snapshot.get("workspace_id")
+    snap_comp_id = snapshot.get("computer_id")
+    snap_comp_name = snapshot.get("computer_name")
+    snap_ws_name = snapshot.get("workspace_name") or ""
+    snap_expected = snapshot.get("expected_workspaces")
+    if (
+        not isinstance(snap_ws_id, str)
+        or not snap_ws_id
+        or not isinstance(snap_comp_id, str)
+        or not snap_comp_id
+        or not isinstance(snap_expected, list)
+    ):
+        return error_command(
+            "情况已变化，请重新发起",
+            tool_call_id,
+            code="scope_changed",
+            message_status="error",
+        )
+
+    payload: dict[str, Any] = {
+        "tool_call_id": tool_call_id,
+        "workspace_id": snap_ws_id,
+        "workspace_name": snap_ws_name,
+        "computer_id": snap_comp_id,
+        "computer_name": snap_comp_name or "",
+        "expected_workspaces": snap_expected,
+    }
+    approved, response = hitl_confirm("archive_workspace", payload)
+    if isinstance(response, dict) and response.get("scope_changed"):
+        return error_command(
+            "情况已变化，请重新发起",
+            tool_call_id,
+            code="scope_changed",
+            message_status="error",
+        )
+    if not approved:
+        return decline_command(
+            "User declined workspace archive.", tool_call_id
+        )
+
+    from ptc_agent.core.sandbox.providers.ssh_errors import SSHConnectError
+    from ptc_agent.core.sandbox.runtime import SandboxGoneError, SandboxTransientError
+    from src.server.services.computer_errors import (
+        ApprovalScopeChangedError,
+        ArchiveProviderError,
+        ArchiveScopeChangedError,
+        ArchiveUnsupportedError,
+        ComputerArchivingError,
+        ComputerBusyError,
+        ComputerNotStoppedError,
+    )
+    from src.server.services.workspace_manager import WorkspaceManager
+    from src.server.utils.error_sanitization import sandbox_unreachable_detail
+
+    try:
+        workspace_manager = WorkspaceManager.get_instance()
+        result = await workspace_manager.archive_workspace(
+            snap_ws_id,
+            expected_computer_id=snap_comp_id,
+            expected_workspaces=snap_expected,
+        )
+        visible_count = sum(
+            1 for w in snap_expected if not bool(w.get("is_stand_in"))
+        )
+        archive_state = (
+            "archiving"
+            if isinstance(result, dict) and result.get("archive_state") == "archiving"
+            else "archived"
+        )
+        in_progress = archive_state == "archiving"
+        return success_command(
+            {
+                "success": True,
+                "in_progress": in_progress,
+                "archive_state": archive_state,
+                "message": (
+                    "归档进行中，后台将在归档完成后自动收尾。"
+                    if in_progress
+                    else "归档已完成。"
+                ),
+                "workspace_id": snap_ws_id,
+                "workspace_name": snap_ws_name,
+                "computer_id": snap_comp_id,
+                "computer_name": snap_comp_name or "",
+                "archived_workspace_count": visible_count,
+            },
+            tool_call_id,
+        )
+    except (ArchiveScopeChangedError, ApprovalScopeChangedError):
+        return error_command(
+            "情况已变化，请重新发起",
+            tool_call_id,
+            code="scope_changed",
+            message_status="error",
+        )
+    except ArchiveUnsupportedError:
+        return error_command(
+            "当前电脑提供商不支持冷归档（只有 Daytona 云端电脑支持冷归档，停止电脑即可释放计算资源）。",
+            tool_call_id,
+            code="archive_unsupported",
+            message_status="error",
+        )
+    except ComputerNotStoppedError:
+        return error_command(
+            "仅已停止的电脑可执行归档，请先在网页端停止电脑后再重新发起。",
+            tool_call_id,
+            code="not_stopped",
+            message_status="error",
+        )
+    except ComputerArchivingError:
+        return error_command(
+            "该电脑正在归档中，无需重复发起。",
+            tool_call_id,
+            code="computer_archiving",
+            message_status="error",
+        )
+    except ComputerBusyError:
+        return error_command(
+            "该电脑当前有活跃任务或迁移进行中，请稍后再试。",
+            tool_call_id,
+            code="busy",
+            message_status="error",
+        )
+    except ArchiveProviderError as exc:
+        logger.warning(
+            "workspace_archive_failed stage=archive category=%s workspace_id=%s computer_id=%s exc_type=%s",
+            exc.category,
+            snap_ws_id,
+            snap_comp_id,
+            type(exc).__name__,
+        )
+        return error_command(
+            "沙箱提供商暂时不可用或归档未完成，请稍后重试。",
+            tool_call_id,
+            code=exc.category,
+            message_status="error",
+        )
+    except (SandboxGoneError, SandboxTransientError, SSHConnectError) as exc:
+        logger.warning(
+            "workspace_archive_failed stage=archive workspace_id=%s computer_id=%s exc_type=%s",
+            snap_ws_id,
+            snap_comp_id,
+            type(exc).__name__,
+        )
+        return error_command(
+            sandbox_unreachable_detail(exc),
+            tool_call_id,
+            code="sandbox_unreachable",
+            message_status="error",
+        )
+    except Exception as exc:
+        logger.error(
+            "workspace_archive_failed stage=archive workspace_id=%s computer_id=%s exc_type=%s",
+            snap_ws_id,
+            snap_comp_id,
+            type(exc).__name__,
+        )
+        return error_command(
+            "failed to archive workspace",
+            tool_call_id,
+            message_status="error",
+        )
 # --- DALTON-HOOK(cos-settings-tools): end ---
 
 

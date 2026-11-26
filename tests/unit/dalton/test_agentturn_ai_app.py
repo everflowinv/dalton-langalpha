@@ -167,7 +167,7 @@ def test_offline_commands_and_records(tmp_path: Path, monkeypatch: pytest.Monkey
 
     _ok( *_run(module, _ws(workspace, "self-test")), "self-test")
     plan = _ok(*_run(module, _ws(workspace, "plan", "--as-of", AS_OF)), "plan")
-    assert plan["universe_size"] == 290
+    assert plan["universe_size"] == 291
     _ok(*_run(module, _ws(workspace, "diff", "--against", "2026-11-06")), "diff")
     _ok(*_run(module, _ws(workspace, "screen")), "screen")
     _ok(*_run(module, _ws(workspace, "reconcile", "--expected", "NET")), "reconcile")

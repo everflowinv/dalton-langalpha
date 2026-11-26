@@ -3,7 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequence
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Mapping,
+    MutableMapping,
+    Sequence,
+    Set as AbstractSet,
+)
 from dataclasses import dataclass
 from datetime import datetime
 import inspect
@@ -453,8 +460,8 @@ def resolve_automation_notify_state(
     ):
         return (None, False, None)
     classification = classify_automation_for_notify(automation)
+    custom_key = _custom_automation_key(automation)
     if _has_validated_report_profile(automation):
-        custom_key = _custom_automation_key(automation)
         if custom_key and isinstance(routes, Mapping) and custom_key in routes:
             routed = routes.get(custom_key)
             if isinstance(routed, Sequence) and not isinstance(routed, (str, bytes)):
@@ -465,7 +472,6 @@ def resolve_automation_notify_state(
                         return (cat, val, "task")
                 return (cat, True, "default")
     if classification is None:
-        custom_key = _custom_automation_key(automation)
         if (
             not custom_key
             or not isinstance(routes, Mapping)
@@ -496,6 +502,7 @@ def resolve_automation_notify_state(
             )
         else:
             candidate_pairs = (
+                (custom_key or "", "task"),
                 (name, "task"),
                 (name.lower(), "task"),
                 (f"category:{classification.category}", "category"),
@@ -2479,13 +2486,16 @@ def _notify_route_keys(automation: Mapping[str, Any] | None) -> list[str]:
     custom_key = _custom_automation_key(automation)
     if classification is None:
         return [custom_key] if custom_key else []
-    report_prefix = [custom_key] if (custom_key and _has_validated_report_profile(automation)) else []
+    report_prefix = (
+        [custom_key] if (custom_key and _has_validated_report_profile(automation)) else []
+    )
     # DALTON-HOOK(data-jobs): OC-1 3-level route fallback keys (§5.1 item 2)
     if classification.category == "data_task":
         return [*report_prefix, f"data:{classification.scope}", "data_task", "default"]
+    id_prefix = [custom_key] if custom_key else []
     name = str(automation.get("name") or "").strip()
     return [
-        *report_prefix,
+        *id_prefix,
         *(
             key
             for key in (
@@ -2499,12 +2509,49 @@ def _notify_route_keys(automation: Mapping[str, Any] | None) -> list[str]:
     ]
 
 
+async def resolve_active_dalton_weixin_targets(
+    user_id: str | None,
+) -> set[str]:
+    """Return the caller's currently active ``weixin:user:<id>`` targets (empty set on DB error)."""
+    cleaned_uid = str(user_id or "").strip()
+    if not cleaned_uid:
+        return set()
+    from src.dalton.capabilities import CapabilityId, has_capability
+    from src.server.database.pool import get_db_connection
+
+    if not has_capability(CapabilityId.CHANNEL_WEIXIN):
+        return set()
+    try:
+        async with get_db_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT ilink_user_id
+                FROM dalton_channel_weixin_accounts
+                WHERE user_id = %s
+                  AND status = 'active'
+                  AND ilink_user_id IS NOT NULL
+                """,
+                (cleaned_uid,),
+            )
+            rows = await cur.fetchall()
+    except Exception:
+        return set()
+    out: set[str] = set()
+    for row in rows or []:
+        if isinstance(row, Mapping):
+            uid = str(row.get("ilink_user_id") or "").strip()
+            if uid:
+                out.add(f"weixin:user:{uid}")
+    return out
+
+
 def resolve_notify_route_targets(
     automation: Mapping[str, Any] | None,
     routes: Mapping[str, Sequence[str]] | None,
     configured_targets: Sequence[str],
     *,
     include_chat_targets: bool = False,
+    active_weixin_targets: AbstractSet[str] | None = None,
 ) -> list[str] | None:
     """Apply per-task routes: the routed delivery list, or ``None`` for "no route".
 
@@ -2515,10 +2562,13 @@ def resolve_notify_route_targets(
     a validated ``report_profile`` under ``automation:<id>``, task-scoped DM
     targets in the route are preserved without requiring global
     ``dalton_notify_targets`` membership (delivery re-verifies channel
-    identity bindings).
+    identity bindings). When ``active_weixin_targets`` is provided, personal
+    Weixin targets are delivered only if still active for the user.
     """
     if not isinstance(routes, Mapping):
         return None
+    from src.dalton.llm.model_prefs import is_dalton_weixin_user_target
+
     is_report_profile_task = _has_validated_report_profile(automation)
     for key in _notify_route_keys(automation):
         routed = routes.get(key)
@@ -2532,6 +2582,15 @@ def resolve_notify_route_targets(
                 personal = [t for t in routed_list if not _is_chat_target(t)]
             else:
                 personal = [t for t in configured if t in routed_set]
+                for t in routed_list:
+                    if is_dalton_weixin_user_target(t) and t not in personal:
+                        personal.append(t)
+            if active_weixin_targets is not None:
+                personal = [
+                    t
+                    for t in personal
+                    if not is_dalton_weixin_user_target(t) or t in active_weixin_targets
+                ]
             chat_targets = (
                 [t for t in routed_list if _is_chat_target(t)]
                 if include_chat_targets
@@ -2573,6 +2632,10 @@ async def evaluate_user_notify_eligibility(
     resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] = resolve_dalton_notify_targets,
     resolve_routes_fn: Callable[[str | None], Awaitable[dict[str, list[str]]]] = resolve_dalton_notify_routes,
     is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+    resolve_active_weixin_targets_fn: Callable[
+        [str | None], Awaitable[AbstractSet[str] | None]
+    ]
+    | None = None,
 ) -> tuple[bool, str | None, list[str]]:
     """Evaluate master switch, per-task override, routes, and target configuration for ``user_id``.
 
@@ -2617,13 +2680,48 @@ async def evaluate_user_notify_eligibility(
         _split_target_channel(t)[1] for t in targets if str(t).strip()
     ]
 
+    from src.dalton.llm.model_prefs import is_dalton_weixin_user_target
+
+    has_weixin_candidate = any(
+        is_dalton_weixin_user_target(t) for t in normalized_targets
+    ) or (
+        isinstance(routes, Mapping)
+        and any(
+            isinstance(rlist, Sequence)
+            and not isinstance(rlist, (str, bytes))
+            and any(isinstance(t, str) and is_dalton_weixin_user_target(t) for t in rlist)
+            for rlist in routes.values()
+        )
+    )
+    active_weixin_targets: AbstractSet[str] | None = None
+    if has_weixin_candidate:
+        active_wx_fn = (
+            resolve_active_weixin_targets_fn
+            if resolve_active_weixin_targets_fn is not None
+            else resolve_active_dalton_weixin_targets
+        )
+        try:
+            resolved_wx = await active_wx_fn(cleaned_uid)
+        except Exception:
+            resolved_wx = set()
+        active_weixin_targets = set() if resolved_wx is None else resolved_wx
+        normalized_targets = [
+            t
+            for t in normalized_targets
+            if not is_dalton_weixin_user_target(t) or t in active_weixin_targets
+        ]
+
     if include_chat_targets is not None:
         include_chats = bool(include_chat_targets)
     else:
         admin_check = is_admin_fn if is_admin_fn is not None else _default_notify_admin
         include_chats = await admin_check(cleaned_uid)
     routed = resolve_notify_route_targets(
-        automation, routes, normalized_targets, include_chat_targets=include_chats
+        automation,
+        routes,
+        normalized_targets,
+        include_chat_targets=include_chats,
+        active_weixin_targets=active_weixin_targets,
     )
     if routed is None:
         # Unclassified custom tasks do not push unless an explicit route is configured.

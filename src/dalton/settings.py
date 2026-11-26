@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import uuid
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
@@ -466,6 +467,9 @@ class DaltonConfig(BaseModel):
     )
     network: DaltonNetworkConfig = Field(default_factory=DaltonNetworkConfig)
     weixin: DaltonWeixinConfig = Field(default_factory=DaltonWeixinConfig)
+    stop_backup_attach_timeout_s: float = Field(default=60.0, gt=0)
+    stop_backup_total_timeout_s: float = Field(default=120.0, gt=0)
+    stop_backup_close_timeout_s: float = Field(default=10.0, gt=0)
 
 
 def _parse_env_pm_user_ids() -> list[str] | None:
@@ -1214,6 +1218,16 @@ def get_dalton_transcription_token() -> str:
     return os.getenv("DALTON_TRANSCRIPTION_TOKEN", "").strip()
 
 
+def get_dalton_research_host_token() -> str:
+    """Return sandbox read-only MCP token ``DALTON_RESEARCH_HOST_TOKEN`` (empty string if unset)."""
+    return os.getenv("DALTON_RESEARCH_HOST_TOKEN", "").strip()
+
+
+def get_dalton_research_admin_token() -> str:
+    """Return backend-only research host admin token ``DALTON_RESEARCH_ADMIN_TOKEN`` (empty string if unset)."""
+    return os.getenv("DALTON_RESEARCH_ADMIN_TOKEN", "").strip()
+
+
 def get_dalton_transcription_ticket_secret() -> str:
     """Return ``DALTON_TRANSCRIPTION_TICKET_SECRET`` from environment (empty string if unset)."""
     return os.getenv("DALTON_TRANSCRIPTION_TICKET_SECRET", "").strip()
@@ -1259,6 +1273,7 @@ def managed_secret_token_values() -> tuple[str, ...]:
             get_internal_service_token(),
             get_dalton_transcription_ticket_secret(),
             get_dalton_transcription_token(),
+            get_dalton_research_admin_token(),
         )
         if t
     )
@@ -1511,23 +1526,92 @@ def has_explicit_transcription_service_url() -> bool:
     return bool(explicit and not (explicit.startswith("${") and explicit.endswith("}")))
 
 
+def _raw_explicit_research_host_url(environ: Mapping[str, str] | None = None) -> str:
+    env = os.environ if environ is None else environ
+    for key in ("DALTON_RESEARCH_HOST_URL", "DALTON_RESEARCH_HOST_BASE_URL"):
+        val = str(env.get(key) or "").strip()
+        if val and not (val.startswith("${") and val.endswith("}")):
+            return val
+    return ""
+
+
+def has_explicit_research_host_url(environ: Mapping[str, str] | None = None) -> bool:
+    """Return True when ``DALTON_RESEARCH_HOST_URL`` (or alias ``DALTON_RESEARCH_HOST_BASE_URL``) is explicitly configured."""
+    return bool(_raw_explicit_research_host_url(environ))
+
+
 def resolve_connector_env_defaults(
     profile: DeploymentProfile | None = None,
 ) -> dict[str, str]:
     """Return deployment-profile default service URLs for split connector services.
 
-    - ``DeploymentProfile.CORE``: standalone Compose service DNS name on ``core_internal`` / ``sandbox-net``.
-    - ``DeploymentProfile.EVERFLOW``: legacy host bridge (`:8960`) until cutover explicitly sets
-      ``DALTON_TRANSCRIPTION_SERVICE_URL`` + ``DALTON_TRANSCRIPTION_TOKEN`` in ``.env``.
+    - ``DeploymentProfile.CORE``: standalone Compose service DNS names on ``core_internal`` / ``sandbox-net``.
+    - ``DeploymentProfile.EVERFLOW``: keeps legacy bridge defaults until explicit cutover sets
+      ``DALTON_TRANSCRIPTION_SERVICE_URL`` / ``DALTON_RESEARCH_HOST_URL`` in ``.env`` (never hardcodes
+      ``:8951`` in Everflow).
     """
     active = resolve_profile() if profile is None else profile
     if active is DeploymentProfile.CORE:
         return {
             "DALTON_TRANSCRIPTION_SERVICE_URL": "http://transcription:8965",
+            "DALTON_RESEARCH_HOST_URL": "http://research-host:8951",
+            "DALTON_RESEARCH_HOST_BASE_URL": "http://research-host:8951",
         }
     return {
         "DALTON_TRANSCRIPTION_SERVICE_URL": "http://host.docker.internal:8960",
     }
+
+
+def get_dalton_research_host_base_url(host: str | None = None) -> str:
+    """Return ``dalton-research-host`` base URL, or ``""`` when disabled or unconfigured in Everflow."""
+    from urllib.parse import urlparse, urlunparse
+    from src.dalton.capabilities import has_any_research_connector_capability
+
+    if not has_any_research_connector_capability():
+        return ""
+    profile = resolve_profile()
+    in_docker = os.path.exists("/.dockerenv")
+    raw_url = _raw_explicit_research_host_url()
+    if raw_url:
+        default_host = host or (HOST_IP if in_docker else "127.0.0.1") or "127.0.0.1"
+        expanded = raw_url.replace("{HOST_IP}", default_host).rstrip("/")
+        parsed = urlparse(expanded)
+        if parsed.scheme and parsed.hostname:
+            if host is not None:
+                target_host: str | None = host
+            elif (
+                profile is DeploymentProfile.EVERFLOW
+                and in_docker
+                and parsed.hostname.lower() in ("127.0.0.1", "localhost", "::1")
+            ):
+                target_host = HOST_IP or "host.docker.internal"
+            else:
+                target_host = None
+            if target_host:
+                host_part = (
+                    f"[{target_host}]"
+                    if ":" in target_host and not target_host.startswith("[")
+                    else target_host
+                )
+                netloc = f"{host_part}:{parsed.port}" if parsed.port else host_part
+                return urlunparse(
+                    (parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+                ).rstrip("/")
+        return expanded
+
+    if profile is DeploymentProfile.EVERFLOW:
+        return ""
+
+    default_url = resolve_connector_env_defaults(profile)["DALTON_RESEARCH_HOST_URL"]
+    port = os.getenv("DALTON_RESEARCH_HOST_PORT", "8951").strip() or "8951"
+    if host is not None:
+        host_part = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        return f"http://{host_part}:{port}"
+    if port != "8951":
+        parsed_def = urlparse(default_url)
+        if parsed_def.scheme and parsed_def.hostname:
+            return f"{parsed_def.scheme}://{parsed_def.hostname}:{port}"
+    return default_url.rstrip("/")
 
 
 def get_dalton_transcription_service_url(host: str | None = None) -> str:
@@ -1939,6 +2023,33 @@ def is_chat_upload_cleanup_enabled() -> bool:
     if raw is None or not raw.strip():
         return True
     return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def get_stop_backup_attach_timeout_s() -> float:
+    """Timeout in seconds for temporary sandbox attach during stop-time backup."""
+    cfg = get_dalton_config()
+    return _positive_float_env(
+        "DALTON_STOP_BACKUP_ATTACH_TIMEOUT_S",
+        cfg.stop_backup_attach_timeout_s,
+    )
+
+
+def get_stop_backup_total_timeout_s() -> float:
+    """Shared wall-clock deadline in seconds for one whole stop-time backup round."""
+    cfg = get_dalton_config()
+    return _positive_float_env(
+        "DALTON_STOP_BACKUP_TOTAL_TIMEOUT_S",
+        cfg.stop_backup_total_timeout_s,
+    )
+
+
+def get_stop_backup_close_timeout_s() -> float:
+    """Independent short timeout in seconds for closing temporary stop-backup clients."""
+    cfg = get_dalton_config()
+    return _positive_float_env(
+        "DALTON_STOP_BACKUP_CLOSE_TIMEOUT_S",
+        cfg.stop_backup_close_timeout_s,
+    )
 
 
 

@@ -549,4 +549,250 @@ describe("channel chunkers preserve rewritten Markdown links and underscores", (
       .join("");
     expect(restored).toBe(codeLine);
   });
+
+  it("BT3: preserves reference link definitions inside same-paragraph multiline backtick spans and fenced code blocks verbatim", () => {
+    const singleBacktickMultiline = [
+      "示例：",
+      "`line 1",
+      "[x]: /home/workspace/secret.md",
+      "`",
+      "",
+      "正文提到 [x]。",
+    ].join("\n");
+    expect(rewriteSandboxLinks(singleBacktickMultiline, WEB_BASE, THREAD_ID)).toBe(
+      singleBacktickMultiline,
+    );
+
+    const doubleBacktickMultiline = [
+      "说明：``first line",
+      "[def]: /home/workspace/internal.pdf",
+      "last line``",
+    ].join("\n");
+    expect(rewriteSandboxLinks(doubleBacktickMultiline, WEB_BASE, THREAD_ID)).toBe(
+      doubleBacktickMultiline,
+    );
+
+    // Same-paragraph multiline backtick span inside a blockquote also stays protected.
+    const quotedMultiline = [
+      "> `line 1",
+      "> [q1]: /home/workspace/quoted_inline.md",
+      "> line 2`",
+    ].join("\n");
+    expect(rewriteSandboxLinks(quotedMultiline, WEB_BASE, THREAD_ID)).toBe(
+      quotedMultiline,
+    );
+
+    // A definition inside a same-paragraph multiline backtick span must NOT shadow a real definition outside code.
+    const mixedInput = [
+      "代码里的样例：`header",
+      "[r1]: /home/workspace/inside_code.md",
+      "`",
+      "",
+      "真实引用见 [外部报告][r1]。",
+      "",
+      "[r1]: /home/workspace/outside_real.md",
+    ].join("\n");
+    const mixedExpected = [
+      "代码里的样例：`header",
+      "[r1]: /home/workspace/inside_code.md",
+      "`",
+      "",
+      `真实引用见 [外部报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Foutside_real.md)。`,
+      "",
+    ].join("\n");
+    expect(rewriteSandboxLinks(mixedInput, WEB_BASE, THREAD_ID)).toBe(mixedExpected);
+
+    // Fenced code blocks containing reference definitions also stay untouched.
+    const fencedDef = [
+      "```markdown",
+      "[f1]: /home/workspace/fenced.md",
+      "```",
+      "",
+      "正文提到 [f1]。",
+    ].join("\n");
+    expect(rewriteSandboxLinks(fencedDef, WEB_BASE, THREAD_ID)).toBe(fencedDef);
+  });
+
+  it("BT3: stray backticks across different Markdown paragraphs or blocks never pair or suppress link rewriting in between", () => {
+    // 1) Two stray backticks in separate paragraphs with a normal file link AND a reference
+    //    link/definition between them: neither backtick may pair across paragraph boundaries.
+    const strayAcrossParagraphs = [
+      "第一段包含一个孤立反引号 ` 未闭合。",
+      "",
+      "第二段有普通文件链接 [完整报告](/home/workspace/results/report.md) 和引用 [摘要][r1]。",
+      "",
+      "[r1]: /home/workspace/results/summary.md",
+      "",
+      "第三段也有一个孤立反引号 ` 未闭合。",
+    ].join("\n");
+    const strayAcrossParagraphsExpected = [
+      "第一段包含一个孤立反引号 ` 未闭合。",
+      "",
+      `第二段有普通文件链接 [完整报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Freport.md) 和引用 [摘要](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Fsummary.md)。`,
+      "",
+      "",
+      "第三段也有一个孤立反引号 ` 未闭合。",
+    ].join("\n");
+    expect(rewriteSandboxLinks(strayAcrossParagraphs, WEB_BASE, THREAD_ID)).toBe(
+      strayAcrossParagraphsExpected,
+    );
+
+    // 2) Stray backticks across list items, heading-to-paragraph, and GFM table cells
+    //    must NOT pair across block boundaries.
+    const strayAcrossListItems = [
+      "- 第一项有孤立反引号 `",
+      "- 第二项链接：[列表报告](/home/workspace/results/list.md)",
+      "- 第三项有孤立反引号 `",
+    ].join("\n");
+    expect(rewriteSandboxLinks(strayAcrossListItems, WEB_BASE, THREAD_ID)).toBe(
+      [
+        "- 第一项有孤立反引号 `",
+        `- 第二项链接：[列表报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Flist.md)`,
+        "- 第三项有孤立反引号 `",
+      ].join("\n"),
+    );
+
+    const strayHeadingAndParagraph = [
+      "# 标题里的孤立反引号 `",
+      "[紧邻正文](/home/workspace/results/body.md)",
+      "结尾孤立反引号 `",
+    ].join("\n");
+    expect(rewriteSandboxLinks(strayHeadingAndParagraph, WEB_BASE, THREAD_ID)).toBe(
+      [
+        "# 标题里的孤立反引号 `",
+        `[紧邻正文](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Fbody.md)`,
+        "结尾孤立反引号 `",
+      ].join("\n"),
+    );
+
+    const strayTableCells = [
+      "| 左 ` | [表格报告](/home/workspace/results/table.md) | 右 ` |",
+      "| --- | --- | --- |",
+      "| 1 | 2 | 3 |",
+    ].join("\n");
+    expect(rewriteSandboxLinks(strayTableCells, WEB_BASE, THREAD_ID)).toBe(
+      [
+        `| 左 \` | [表格报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Ftable.md) | 右 \` |`,
+        "| --- | --- | --- |",
+        "| 1 | 2 | 3 |",
+      ].join("\n"),
+    );
+  });
+
+  it("BT3: stray backtick before a fenced code block does not pair into the fence and three chained multiline backtick spans all stay protected", () => {
+    // 1) Stray single backtick before a fenced code block containing a backtick inside:
+    //    must NOT pair into the fence or suppress rewriting the normal link after the fence.
+    const strayBeforeFence = [
+      "这里有一个孤立反引号 ` 在围栏前面。",
+      "",
+      "```bash",
+      "echo `date` /home/workspace/inside_fence.md",
+      "```",
+      "",
+      "围栏后的普通链接：[报告](/home/workspace/results/after_fence.md)",
+    ].join("\n");
+    const strayBeforeFenceExpected = [
+      "这里有一个孤立反引号 ` 在围栏前面。",
+      "",
+      "```bash",
+      "echo `date` /home/workspace/inside_fence.md",
+      "```",
+      "",
+      `围栏后的普通链接：[报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Fafter_fence.md)`,
+    ].join("\n");
+    expect(rewriteSandboxLinks(strayBeforeFence, WEB_BASE, THREAD_ID)).toBe(
+      strayBeforeFenceExpected,
+    );
+
+    // 2) Three chained consecutive same-paragraph multiline backtick spans: the 3rd span's
+    //    reference definition MUST stay verbatim while links outside all three spans are still rewritten.
+    const threeChainedSpans = [
+      "`span 1 line 1",
+      "span 1 line 2` `span 2 line 1",
+      "span 2 line 2` `span 3 line 1",
+      "[r3]: /home/workspace/inside_third_span.md",
+      "span 3 line 2`",
+      "",
+      "正文提到 [r3]，以及外部链接 [外部](/home/workspace/results/outside.md)。",
+    ].join("\n");
+    const threeChainedExpected = [
+      "`span 1 line 1",
+      "span 1 line 2` `span 2 line 1",
+      "span 2 line 2` `span 3 line 1",
+      "[r3]: /home/workspace/inside_third_span.md",
+      "span 3 line 2`",
+      "",
+      `正文提到 [r3]，以及外部链接 [外部](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Foutside.md)。`,
+    ].join("\n");
+    expect(rewriteSandboxLinks(threeChainedSpans, WEB_BASE, THREAD_ID)).toBe(
+      threeChainedExpected,
+    );
+
+    // 3) Top-level fenced code block containing a `> ``` ` line inside it:
+    //    must NOT close the fence early or treat the real closing ``` as a new fence;
+    //    normal links after the fence MUST still be rewritten.
+    const quotedFenceInsideTopLevel = [
+      "```markdown",
+      "[inside](/home/workspace/results/inside_fence.md)",
+      "> ```",
+      "still inside fence",
+      "```",
+      "",
+      "围栏后的普通链接：[报告](/home/workspace/results/after_quoted_fence.md)",
+    ].join("\n");
+    const quotedFenceInsideTopLevelExpected = [
+      "```markdown",
+      "[inside](/home/workspace/results/inside_fence.md)",
+      "> ```",
+      "still inside fence",
+      "```",
+      "",
+      `围栏后的普通链接：[报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2Fresults%2Fafter_quoted_fence.md)`,
+    ].join("\n");
+    expect(rewriteSandboxLinks(quotedFenceInsideTopLevel, WEB_BASE, THREAD_ID)).toBe(
+      quotedFenceInsideTopLevelExpected,
+    );
+  });
+
+  it("BT3: fallback scanner reuses AST code ranges so spaced-filename links between cross-paragraph stray backticks are still rewritten", () => {
+    // Stray backticks in paragraph 1 and paragraph 3 must NOT pair inside the gap scanner
+    // and swallow a spaced-destination file link (or bare sandbox path) in paragraph 2.
+    const spacedAcrossParagraphs = [
+      "第一段包含一个孤立反引号 ` 未闭合。",
+      "",
+      "第二段有带空格文件链接 [季度报告](/home/workspace/Quarterly Report.md)，以及裸路径 /home/workspace/notes/summary.md。",
+      "",
+      "第三段也有一个孤立反引号 ` 未闭合。",
+    ].join("\n");
+    const spacedAcrossParagraphsExpected = [
+      "第一段包含一个孤立反引号 ` 未闭合。",
+      "",
+      `第二段有带空格文件链接 [季度报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2FQuarterly%20Report.md)，以及裸路径 notes/summary.md。`,
+      "",
+      "第三段也有一个孤立反引号 ` 未闭合。",
+    ].join("\n");
+    expect(rewriteSandboxLinks(spacedAcrossParagraphs, WEB_BASE, THREAD_ID)).toBe(
+      spacedAcrossParagraphsExpected,
+    );
+
+    // Same guarantee across list items and GFM table cells for spaced-filename links.
+    const spacedAcrossList = [
+      "- 第一项孤立反引号 `",
+      "- 第二项：[季度报告](/home/workspace/Quarterly Report.md)",
+      "- 第三项孤立反引号 `",
+    ].join("\n");
+    expect(rewriteSandboxLinks(spacedAcrossList, WEB_BASE, THREAD_ID)).toBe(
+      [
+        "- 第一项孤立反引号 `",
+        `- 第二项：[季度报告](${WEB_BASE}/chat/t/${THREAD_ID}?file=%2Fhome%2Fworkspace%2FQuarterly%20Report.md)`,
+        "- 第三项孤立反引号 `",
+      ].join("\n"),
+    );
+
+    // Real inline code span wrapping a spaced-filename link still stays verbatim,
+    // and an unclosed `[`inlineCode`](` still protects the AST inlineCode verbatim.
+    const realInlineCode =
+      "示例 `[季度报告](/home/workspace/Quarterly Report.md)`，以及未闭合 [`/home/workspace/Quarterly Report.md`](no-close。";
+    expect(rewriteSandboxLinks(realInlineCode, WEB_BASE, THREAD_ID)).toBe(realInlineCode);
+  });
 });

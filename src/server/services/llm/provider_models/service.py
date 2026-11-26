@@ -19,6 +19,8 @@ from src.server.services.oauth_providers import SUBSCRIPTIONS
 from .catalog import GatewayCatalog, fetch_section
 from .matching import ModelsResult, build_result, filter_others, match_endpoint_models
 from .wire import (
+    ANTIGRAVITY,  # DALTON-HOOK(llm-sdk-dispatch): guard malformed empty Antigravity payloads
+    BAD_RESPONSE,  # DALTON-HOOK(catalog-cache): classify empty Antigravity payloads as bad_response
     CODEX,
     ENDPOINT_REFUSED,
     OPENAI,
@@ -33,6 +35,11 @@ from .wire import (
 logger = logging.getLogger(__name__)
 
 CACHE_TTL_S = 6 * 3600
+# DALTON-HOOK(catalog-cache): short-term failure cache TTL, stale retention, and per-key write lock
+# so transient errors and concurrent refreshes never overwrite a newer successful list.
+_FAILURE_CACHE_TTL_S = 60
+_STALE_RETENTION_S = 7 * 24 * 3600
+_cache_write_locks: dict[tuple[str, str], asyncio.Lock] = {}
 # Bumped when the cached shape changes, so an old entry reads as a miss.
 _CACHE_SCHEMA = 2
 _REFRESH_COOLDOWN_S = 10
@@ -166,7 +173,8 @@ def _redis():
     return cache.client if cache.enabled and cache.client else None
 
 
-async def _cache_read(user_id: str, provider: str, fingerprint: str) -> dict | None:
+# DALTON-HOOK(catalog-cache): read raw cached entry to allow preserving last successful list on failure
+async def _cache_read_raw(user_id: str, provider: str, fingerprint: str) -> dict | None:
     client = _redis()
     if client is None:
         return None
@@ -178,12 +186,26 @@ async def _cache_read(user_id: str, provider: str, fingerprint: str) -> dict | N
     except Exception:
         return None
     if (
-        entry.get("schema") != _CACHE_SCHEMA
+        not isinstance(entry, dict)
+        or entry.get("schema") != _CACHE_SCHEMA
         or entry.get("fingerprint") != fingerprint
-        or time.time() - entry.get("stored", 0) > CACHE_TTL_S
     ):
         return None
     return entry
+
+
+async def _cache_read(user_id: str, provider: str, fingerprint: str) -> dict | None:
+    entry = await _cache_read_raw(user_id, provider, fingerprint)
+    if entry is None:
+        return None
+    now = time.time()
+    # DALTON-HOOK(catalog-cache): serve fresh list OR active short-term failure cache entry
+    failed_at = entry.get("failed_at")
+    if isinstance(failed_at, (int, float)) and now - failed_at <= _FAILURE_CACHE_TTL_S:
+        return entry
+    if isinstance(entry.get("models"), list) and now - entry.get("stored", 0) <= CACHE_TTL_S:
+        return entry
+    return None
 
 
 async def _cache_write(user_id: str, provider: str, entry: dict) -> None:
@@ -192,10 +214,334 @@ async def _cache_write(user_id: str, provider: str, entry: dict) -> None:
         return
     key = available_models_key(user_id)
     try:
-        await client.hset(key, provider, json.dumps({**entry, "schema": _CACHE_SCHEMA, "stored": time.time()}))
-        await client.expire(key, CACHE_TTL_S)
+        # DALTON-HOOK(catalog-cache): keep caller-provided stored timestamp when preserving stale list on failure
+        payload = {"stored": time.time(), **entry, "schema": _CACHE_SCHEMA}
+        await client.hset(key, provider, json.dumps(payload))
+        await client.expire(key, _STALE_RETENTION_S)
     except Exception:
         logger.debug("[provider_models] cache write failed", exc_info=True)
+
+
+# DALTON-HOOK(catalog-cache): generation-checked cache writes so concurrent refreshes
+# cannot overwrite a fresher successful list with an older stale list or failure record.
+def _cache_lock(user_id: str, provider: str) -> asyncio.Lock:
+    lock_key = (available_models_key(user_id), provider)
+    lock = _cache_write_locks.get(lock_key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _cache_write_locks[lock_key] = lock
+    return lock
+
+
+def _entry_gen(entry: dict | None) -> int:
+    if not isinstance(entry, dict):
+        return 0
+    raw = entry.get("gen")
+    return raw if isinstance(raw, int) and not isinstance(raw, bool) and raw >= 0 else 0
+
+
+# DALTON-HOOK(catalog-cache): cross-worker atomic Redis Lua CAS for model-list cache writes
+_CAS_SUCCESS_LUA = """
+local key = KEYS[1]
+local field = ARGV[1]
+local schema = tonumber(ARGV[2])
+local fp = ARGV[3]
+local base_gen = tonumber(ARGV[4])
+local shape = ARGV[5]
+local models = cjson.decode(ARGV[6])
+local fetched_at = ARGV[7]
+local now_ts = tonumber(ARGV[8])
+local ttl_s = tonumber(ARGV[9])
+
+local raw = redis.call("HGET", key, field)
+local cur_gen = 0
+if raw then
+  local ok, cur = pcall(cjson.decode, raw)
+  if ok and type(cur) == "table" and cur.schema == schema and cur.fingerprint == fp then
+    if type(cur.gen) == "number" and cur.gen >= 0 then
+      cur_gen = math.floor(cur.gen)
+    end
+    if cur_gen > base_gen and type(cur.models) == "table" and type(cur.fetched_at) == "string" and cur.fetched_at > fetched_at then
+      return raw
+    end
+  end
+end
+
+if next(models) == nil then
+  models = cjson.empty_array
+end
+local next_gen = math.max(cur_gen, base_gen) + 1
+local out = cjson.encode({
+  schema = schema,
+  fingerprint = fp,
+  shape = shape,
+  models = models,
+  fetched_at = fetched_at,
+  stored = now_ts,
+  gen = next_gen,
+})
+redis.call("HSET", key, field, out)
+redis.call("EXPIRE", key, ttl_s)
+return out
+"""
+
+_CAS_FAILURE_LUA = """
+local key = KEYS[1]
+local field = ARGV[1]
+local schema = tonumber(ARGV[2])
+local fp = ARGV[3]
+local base_gen = tonumber(ARGV[4])
+local req_shape = ARGV[5]
+local reason = ARGV[6]
+local now_ts = tonumber(ARGV[7])
+local ttl_s = tonumber(ARGV[8])
+local fb_raw = ARGV[9]
+
+local raw = redis.call("HGET", key, field)
+local cur = nil
+local cur_gen = 0
+if raw then
+  local ok, decoded = pcall(cjson.decode, raw)
+  if ok and type(decoded) == "table" and decoded.schema == schema and decoded.fingerprint == fp then
+    cur = decoded
+    if type(cur.gen) == "number" and cur.gen >= 0 then
+      cur_gen = math.floor(cur.gen)
+    end
+    if cur_gen > base_gen and type(cur.models) == "table" then
+      return raw
+    end
+  end
+end
+
+local preserved = nil
+if cur and type(cur.models) == "table" then
+  preserved = cur
+elseif fb_raw ~= "" then
+  local ok_fb, fb = pcall(cjson.decode, fb_raw)
+  if ok_fb and type(fb) == "table" and type(fb.models) == "table" then
+    preserved = fb
+  end
+end
+
+local out_tbl
+if preserved then
+  local p_gen = cur_gen
+  if type(preserved.gen) == "number" and preserved.gen > p_gen then
+    p_gen = math.floor(preserved.gen)
+  end
+  local p_models = preserved.models
+  if next(p_models) == nil then
+    p_models = cjson.empty_array
+  end
+  out_tbl = {
+    schema = schema,
+    fingerprint = fp,
+    shape = preserved.shape or req_shape,
+    models = p_models,
+    fetched_at = preserved.fetched_at,
+    stored = preserved.stored or 0,
+    gen = p_gen,
+    failed_at = now_ts,
+    failure_reason = reason,
+  }
+else
+  out_tbl = {
+    schema = schema,
+    fingerprint = fp,
+    shape = req_shape,
+    models = cjson.null,
+    fetched_at = cjson.null,
+    stored = 0,
+    gen = cur_gen,
+    failed_at = now_ts,
+    failure_reason = reason,
+  }
+end
+local out = cjson.encode(out_tbl)
+redis.call("HSET", key, field, out)
+redis.call("EXPIRE", key, ttl_s)
+return out
+"""
+
+
+_DEFAULT_CACHE_WRITE = _cache_write
+
+
+async def _cache_write_success(
+    user_id: str,
+    provider: str,
+    fingerprint: str,
+    *,
+    base_gen: int,
+    shape: str,
+    models: list[dict],
+    fetched_at: str,
+) -> tuple[str, list[dict], str]:
+    client = _redis()
+    if (
+        _cache_write is _DEFAULT_CACHE_WRITE
+        and client is not None
+        and callable(getattr(client, "eval", None))
+    ):
+        key = available_models_key(user_id)
+        try:
+            raw = await client.eval(
+                _CAS_SUCCESS_LUA,
+                1,
+                key,
+                provider,
+                _CACHE_SCHEMA,
+                fingerprint,
+                base_gen,
+                shape,
+                json.dumps(models),
+                fetched_at,
+                time.time(),
+                _STALE_RETENTION_S,
+            )
+            if raw is not None:
+                winner = json.loads(raw)
+                if isinstance(winner, dict) and isinstance(winner.get("models"), list):
+                    return (
+                        str(winner.get("shape") or shape),
+                        winner["models"],
+                        str(winner.get("fetched_at") or fetched_at),
+                    )
+        except Exception:
+            logger.debug("[provider_models] atomic success cache write failed", exc_info=True)
+            return shape, models, fetched_at
+
+    async with _cache_lock(user_id, provider):
+        current = await _cache_read_raw(user_id, provider, fingerprint)
+        current_gen = _entry_gen(current)
+        if (
+            current is not None
+            and current_gen > base_gen
+            and isinstance(current.get("models"), list)
+            and str(current.get("fetched_at") or "") > fetched_at
+        ):
+            return (
+                str(current.get("shape") or shape),
+                current["models"],
+                str(current.get("fetched_at") or fetched_at),
+            )
+        next_gen = max(current_gen, base_gen) + 1
+        await _cache_write(
+            user_id,
+            provider,
+            {
+                "fingerprint": fingerprint,
+                "shape": shape,
+                "models": models,
+                "fetched_at": fetched_at,
+                "gen": next_gen,
+            },
+        )
+        return shape, models, fetched_at
+
+
+async def _cache_write_failure(
+    user_id: str,
+    provider: str,
+    fingerprint: str,
+    *,
+    base_gen: int,
+    req_shape: str,
+    reason: str,
+    fallback_stale: dict | None,
+) -> dict | None:
+    """Record a short-term failure without clobbering a newer concurrent success.
+
+    Uses atomic Redis Lua CAS when available so cross-worker concurrent refreshes
+    cannot roll back a newer generation. Returns the preserved successful entry
+    when one exists, or None when no successful list exists.
+    """
+    client = _redis()
+    if (
+        _cache_write is _DEFAULT_CACHE_WRITE
+        and client is not None
+        and callable(getattr(client, "eval", None))
+    ):
+        key = available_models_key(user_id)
+        fb_json = (
+            json.dumps(fallback_stale)
+            if isinstance(fallback_stale, dict) and isinstance(fallback_stale.get("models"), list)
+            else ""
+        )
+        try:
+            raw = await client.eval(
+                _CAS_FAILURE_LUA,
+                1,
+                key,
+                provider,
+                _CACHE_SCHEMA,
+                fingerprint,
+                base_gen,
+                req_shape,
+                reason,
+                time.time(),
+                _STALE_RETENTION_S,
+                fb_json,
+            )
+            if raw is not None:
+                entry = json.loads(raw)
+                if isinstance(entry, dict) and isinstance(entry.get("models"), list):
+                    return entry
+            return None
+        except Exception:
+            logger.debug("[provider_models] atomic failure cache write failed", exc_info=True)
+            if isinstance(fallback_stale, dict) and isinstance(fallback_stale.get("models"), list):
+                return fallback_stale
+            return None
+
+    async with _cache_lock(user_id, provider):
+        current = await _cache_read_raw(user_id, provider, fingerprint)
+        current_gen = _entry_gen(current)
+        if (
+            current is not None
+            and current_gen > base_gen
+            and isinstance(current.get("models"), list)
+        ):
+            # A newer concurrent refresh already succeeded — leave it untouched.
+            return current
+        preserved = (
+            current
+            if current is not None and isinstance(current.get("models"), list)
+            else (
+                fallback_stale
+                if isinstance(fallback_stale, dict)
+                and isinstance(fallback_stale.get("models"), list)
+                else None
+            )
+        )
+        if preserved is not None:
+            preserved_entry = {
+                "fingerprint": fingerprint,
+                "shape": preserved.get("shape") or req_shape,
+                "models": preserved["models"],
+                "fetched_at": preserved.get("fetched_at"),
+                "stored": preserved.get("stored", 0),
+                "gen": max(current_gen, _entry_gen(preserved)),
+                "failed_at": time.time(),
+                "failure_reason": reason,
+            }
+            await _cache_write(user_id, provider, preserved_entry)
+            return preserved_entry
+        await _cache_write(
+            user_id,
+            provider,
+            {
+                "fingerprint": fingerprint,
+                "shape": req_shape,
+                "models": None,
+                "fetched_at": None,
+                "stored": 0,
+                "gen": current_gen,
+                "failed_at": time.time(),
+                "failure_reason": reason,
+            },
+        )
+        return None
 
 
 async def _refresh_allowed(user_id: str, provider: str) -> bool:
@@ -287,12 +633,25 @@ async def available_models(user_id: str, provider: str, *, refresh: bool = False
     if not refresh or not await _refresh_allowed(user_id, provider):
         entry = await _cache_read(user_id, provider, fingerprint)
         if entry is not None:
+            # DALTON-HOOK(catalog-cache): return cached list (fresh or stale-preserved) or cached failure
+            cached_models = entry.get("models")
+            if isinstance(cached_models, list):
+                result = build_result(
+                    provider, entry["shape"], cached_models, mc, fetched_at=entry.get("fetched_at"),
+                    catalog=await _gateway_catalog(info), **match_kwargs,
+                )
+                return filter_others({**result, "cached": True}, q)
+            cached_reason = entry.get("failure_reason")
             result = build_result(
-                provider, entry["shape"], entry["models"], mc, fetched_at=entry["fetched_at"],
-                catalog=await _gateway_catalog(info), **match_kwargs,
+                provider, entry["shape"], None, mc, reason=cached_reason,
+                catalog=await _gateway_catalog(info) if cached_reason != UNAUTHORIZED else None,
+                **match_kwargs,
             )
             return filter_others({**result, "cached": True}, q)
 
+    # DALTON-HOOK(catalog-cache): capture stale entry & generation before fetching for CAS write
+    stale_entry = await _cache_read_raw(user_id, provider, fingerprint)
+    base_gen = _entry_gen(stale_entry)
     req = build_list_request(info, api_key=cred.api_key, base_url=cred.base_url, token_headers=cred.token_headers)
     started = time.monotonic()
     # A gateway's catalog is read beside its list: neither waits on the other.
@@ -329,6 +688,9 @@ async def available_models(user_id: str, provider: str, *, refresh: bool = False
             except egress.EndpointRefused as e:
                 raise ListFetchError(ENDPOINT_REFUSED) from e
         models = normalize(req.shape, await fetch_list(req, transport=transport))
+        # DALTON-HOOK(catalog-cache): empty Antigravity 200 payload is treated as bad_response so prior list is preserved
+        if req.shape == ANTIGRAVITY and not models:
+            raise ListFetchError(BAD_RESPONSE)
     except ListFetchError as e:
         catalog = await catalog_read
         logger.warning(
@@ -346,6 +708,28 @@ async def available_models(user_id: str, provider: str, *, refresh: bool = False
             # Revoked before its stated expiry: spent now, so the next list or
             # turn refreshes it instead of offering it again until then.
             await _expire_refused_token(user_id, provider)
+        # DALTON-HOOK(catalog-cache): short-term cache transient failures and preserve last successful list/fetched_at
+        if reason not in (UNAUTHORIZED, NO_API_ACCESS):
+            preserved = await _cache_write_failure(
+                user_id,
+                provider,
+                fingerprint,
+                base_gen=base_gen,
+                req_shape=req.shape,
+                reason=reason,
+                fallback_stale=stale_entry,
+            )
+            if preserved is not None:
+                result = build_result(
+                    provider,
+                    preserved.get("shape") or req.shape,
+                    preserved["models"],
+                    mc,
+                    fetched_at=preserved.get("fetched_at"),
+                    catalog=catalog,
+                    **match_kwargs,
+                )
+                return filter_others({**result, "cached": True}, q)
         # A refused key runs none of a gateway's models, so its catalog does
         # not stand in for the list then.
         result = build_result(
@@ -359,11 +743,19 @@ async def available_models(user_id: str, provider: str, *, refresh: bool = False
     catalog = await catalog_read
 
     fetched_at = datetime.now(timezone.utc).isoformat()
-    await _cache_write(
-        user_id, provider,
-        {"fingerprint": fingerprint, "shape": req.shape, "models": models, "fetched_at": fetched_at},
+    # DALTON-HOOK(catalog-cache): generation-checked success write
+    final_shape, final_models, final_fetched_at = await _cache_write_success(
+        user_id,
+        provider,
+        fingerprint,
+        base_gen=base_gen,
+        shape=req.shape,
+        models=models,
+        fetched_at=fetched_at,
     )
-    result = build_result(provider, req.shape, models, mc, fetched_at=fetched_at, catalog=catalog, **match_kwargs)
+    result = build_result(
+        provider, final_shape, final_models, mc, fetched_at=final_fetched_at, catalog=catalog, **match_kwargs
+    )
     if result["status"] == "fallback":
         logger.warning(
             "[provider_models] falling back to the manifest provider=%s user_id=%s reason=%s listed=%d",

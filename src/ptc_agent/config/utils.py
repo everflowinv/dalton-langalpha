@@ -319,6 +319,11 @@ def create_mcp_config(data: dict[str, Any]) -> MCPConfig:
         fields = {k: v for k, v in server.items() if k != "source"}
         position = index.get(fields.get("name"))
         if position is None:
+            # DALTON-HOOK(standalone-core): delegate unmounted extra-plugin partial-override check to Dalton
+            from src.dalton.plugin_loader import should_skip_unmounted_partial_override
+
+            if should_skip_unmounted_partial_override(fields):
+                continue
             config = MCPServerConfig(**fields)
             index[config.name] = len(mcp_servers)
             mcp_servers.append(config)

@@ -549,6 +549,20 @@ async def clear_computer_retirement_pending(
         return cur.rowcount > 0
 
 
+# --- DALTON-HOOK(cos-settings-tools): begin ---
+from src.dalton.database.computer_archive import (  # noqa: E402
+    claim_computer_for_archive as claim_computer_for_archive,
+    clear_computer_archiving as clear_computer_archiving,
+    computer_has_blocking_archive_move as computer_has_blocking_archive_move,
+    get_archiving_computers_by_status as get_archiving_computers_by_status,
+    get_live_workspaces_for_archive_snapshot as get_live_workspaces_for_archive_snapshot,
+    normalize_archive_workspace_snapshot as normalize_archive_workspace_snapshot,
+    reset_abandoned_archiving_computer as reset_abandoned_archiving_computer,
+    retain_computer_archive_claim as retain_computer_archive_claim,
+)
+# --- DALTON-HOOK(cos-settings-tools): end ---
+
+
 async def set_computer_setting(
     computer_id: str, user_id: str, key: str, value: Any, *, conn=None
 ) -> bool:
@@ -1049,6 +1063,8 @@ async def update_computer_status(
     drop_config_key: str | None = None,
     unless_config_key: str | None = None,
     merge_config: dict[str, Any] | None = None,
+    # DALTON-HOOK(cos-settings-tools): optional CAS guard matching config.archiving_owner
+    expected_archiving_owner: Optional[str] = None,
     conn=None,
 ) -> Optional[Dict[str, Any]]:
     """Only try_bind_computer_provider_ref may change the durable machine binding.
@@ -1083,13 +1099,25 @@ async def update_computer_status(
             "\n                  AND c.provider_ref IS NOT DISTINCT FROM"
             " %(expected_ref)s"
         )
+    # DALTON-HOOK(cos-settings-tools): optional CAS guard on archiving_owner
+    if expected_archiving_owner is not None:
+        expected_clause += (
+            "\n                  AND COALESCE(c.config, '{}'::jsonb)->>'archiving_owner'"
+            " = %(expected_archiving_owner)s"
+        )
     stopped_clause = ", stopped_at = NOW()" if status == "stopped" else ""
     primary_clause = ", is_primary = FALSE" if status == "deleted" else ""
     config_value = "COALESCE(config, '{}'::jsonb)"
     if drop_config_key:
+        # DALTON-HOOK(cos-settings-tools): dropping archiving also clears its owner and claimed_at metadata
+        drop_expr = (
+            f"{config_value} - ARRAY['archiving', 'archiving_owner', 'archiving_claimed_at']::text[]"
+            if drop_config_key == "archiving"
+            else f"{config_value} - %(drop_key)s::text"
+        )
         config_value = (
             f"CASE WHEN {config_value} ? %(unless_key)s"
-            f" THEN config ELSE {config_value} - %(drop_key)s::text END"
+            f" THEN config ELSE {drop_expr} END"
         )
     if merge_config:
         config_value = f"({config_value}) || %(merge)s::jsonb"
@@ -1112,6 +1140,7 @@ async def update_computer_status(
         "updated_before": updated_before,
         "expected_always_on": expected_always_on,
         "expected_ref": expected_provider_ref,
+        "expected_archiving_owner": expected_archiving_owner,  # DALTON-HOOK(cos-settings-tools)
         "drop_key": drop_config_key,
         "unless_key": unless_config_key,
         "merge": Json(merge_config or {}),
@@ -1164,6 +1193,12 @@ async def try_claim_computer_for_start(
             "\n                  AND c.provider_ref IS NOT DISTINCT FROM"
             " %(expected_ref)s"
         )
+    # DALTON-HOOK(cos-settings-tools): atomically refuse starting a computer while config.archiving=true
+    archiving_guard = (
+        "\n                  AND NOT COALESCE(c.config, '{}'::jsonb)"
+        " @> '{\"archiving\": true}'::jsonb"
+    )
+    computer_guard = f"{ref_guard}{archiving_guard}"
 
     params = {
         "computer_id": computer_id,
@@ -1177,7 +1212,7 @@ async def try_claim_computer_for_start(
                 computer_set="status = 'starting'",
                 workspace_set="status = 'starting'",
                 computer_fence="status = %(from_status)s",
-                computer_guard=ref_guard,
+                computer_guard=computer_guard,
                 # Only the projects that were down move; a sibling left behind in
                 # another state is not this claim's to reinterpret.
                 workspace_fence="status = %(from_status)s",

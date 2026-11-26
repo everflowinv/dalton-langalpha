@@ -22,7 +22,12 @@ from typing import Any
 
 # 导入同目录的 coverage.yaml 解析辅助函数
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from move_quant import PRIVATE_TICKERS, _cn_price_fallback, load_coverage_yaml  # noqa: E402
+from move_quant import (  # noqa: E402
+    PRIVATE_TICKERS,
+    _cn_price_fallback,
+    is_private_company_entry,
+    load_coverage_yaml,
+)
 
 DEFAULT_THRESHOLD_PCT = 4.0  # 默认取自 stock_tracker 配置的 price_1d_pct: 4.0
 
@@ -283,7 +288,7 @@ def main() -> int:
         c_tier = str(c.get("tier") or "").strip().lower()
         if c_tier != tier_target:
             continue
-        if bool(c.get("is_private")) or ticker in PRIVATE_TICKERS:
+        if ticker in PRIVATE_TICKERS or is_private_company_entry(c):
             skipped.append({"ticker": ticker, "reason": "private_or_no_market_data"})
             continue
         move_enabled, policy_threshold = resolve_move_trigger_policy(

@@ -1199,6 +1199,7 @@ async def schedule_dalton_automation_helper(
         merged_spec["metadata"] = sanitized_spec_meta
 
     from src.dalton.services.company_automations import (
+        AutomationVersionConflictError,
         automation_history_context,
         get_current_history_context,
     )
@@ -1875,6 +1876,8 @@ async def schedule_dalton_automation_helper(
                         cleaned_locked_meta.pop("handoff_paused_reason", None)
                         cleaned_locked_meta.pop("paused_by_user", None)
                         effective_kwargs["metadata"] = cleaned_locked_meta
+                    else:
+                        effective_kwargs.pop("metadata", None)
 
             try:
                 with automation_history_context(
@@ -1946,7 +1949,9 @@ async def schedule_dalton_automation_helper(
         cron_expression = merged_spec.get("cron_expression") or merged_spec.get("cron")
         trigger_type = str(merged_spec.get("trigger_type") or ("cron" if cron_expression else "once"))
         trigger_config = merged_spec.get("trigger_config")
-        meta = dict(merged_spec.get("metadata") or {})
+        raw_spec_meta = merged_spec.get("metadata")
+        meta = dict(raw_spec_meta or {})
+        rp_explicit = isinstance(raw_spec_meta, Mapping) and "report_profile" in raw_spec_meta
         meta.setdefault("dalton_managed", True)
         if resolved_ticker and not meta.get("ticker"):
             meta["ticker"] = str(resolved_ticker).upper()
@@ -2053,9 +2058,42 @@ async def schedule_dalton_automation_helper(
             old_rp = existing_meta.get("report_profile")
             new_rp = merged_meta.get("report_profile")
             rp_changed = (
-                "report_profile" in meta
+                rp_explicit
                 or ("report_profile" in existing_meta and new_rp != old_rp)
             ) and new_rp != old_rp
+            rp_expected_cv: int | None = None
+            if rp_explicit:
+                raw_existing_cv = existing.get("config_version")
+                observed_cv = (
+                    raw_existing_cv
+                    if isinstance(raw_existing_cv, int)
+                    and not isinstance(raw_existing_cv, bool)
+                    else None
+                )
+                outer_cv = (
+                    outer_hist_ctx.expected_config_version
+                    if outer_hist_ctx is not None
+                    else None
+                )
+                if (
+                    outer_cv is not None
+                    and observed_cv is not None
+                    and outer_cv != observed_cv
+                ):
+                    from src.dalton.services.report_delivery import ReportDeliveryError
+
+                    conflict_exc = ReportDeliveryError(
+                        "任务配置版本已变更，请刷新后重试。",
+                        code="conflict",
+                    )
+                    if via_rest:
+                        raise conflict_exc
+                    return {
+                        "ok": False,
+                        "error": conflict_exc.code,
+                        "message": conflict_exc.message,
+                    }
+                rp_expected_cv = observed_cv if observed_cv is not None else outer_cv
             report_profile_change = None
             if rp_changed:
                 from src.dalton.services.report_delivery import (
@@ -2072,7 +2110,7 @@ async def schedule_dalton_automation_helper(
                         target_view,
                         new_rp,
                         via_rest=via_rest,
-                        user_confirmed=False,
+                        confirmed=False,
                         action="update",
                         after_metadata=merged_meta,
                         conn=active_conn,
@@ -2106,7 +2144,7 @@ async def schedule_dalton_automation_helper(
                     cross_user=cross_user,
                     existing_meta=existing_meta,
                 )
-            if merged_meta or rp_changed or merged_meta != existing_meta:
+            if rp_changed or merged_meta != existing_meta:
                 patch["metadata"] = merged_meta
             if explicit_status:
                 patch["status"] = explicit_status
@@ -2250,11 +2288,39 @@ async def schedule_dalton_automation_helper(
                     if isinstance(locked_row.get("metadata"), Mapping)
                     else {}
                 )
-                base_meta = (
-                    effective_kwargs["metadata"]
-                    if isinstance(effective_kwargs.get("metadata"), Mapping)
-                    else locked_existing_meta
-                )
+                if rp_explicit:
+                    locked_cv = locked_row.get("config_version")
+                    if (
+                        rp_expected_cv is not None
+                        and isinstance(locked_cv, int)
+                        and not isinstance(locked_cv, bool)
+                        and locked_cv != rp_expected_cv
+                    ):
+                        raise AutomationVersionConflictError(
+                            f"Configuration version conflict: expected {rp_expected_cv}, current is {locked_cv}"
+                        )
+                    if locked_existing_meta.get("report_profile") != old_rp:
+                        raise AutomationVersionConflictError(
+                            "Configuration version conflict: report_profile changed concurrently"
+                        )
+                    base_meta = (
+                        dict(effective_kwargs["metadata"])
+                        if isinstance(effective_kwargs.get("metadata"), Mapping)
+                        else dict(locked_existing_meta)
+                    )
+                else:
+                    # Only merge this call's metadata delta onto the locked row so
+                    # concurrent report_profile (or other metadata) updates committed
+                    # before the row lock are preserved.
+                    base_meta = dict(locked_existing_meta)
+                    for mk, mv in meta.items():
+                        if mk == "report_profile":
+                            continue
+                        if mv is None:
+                            if mk != "replaced_by_tracker":
+                                base_meta.pop(mk, None)
+                        else:
+                            base_meta[mk] = mv
                 final_meta = _apply_system_only_metadata(
                     base_meta,
                     model_in_spec=model_in_spec,
@@ -2262,8 +2328,10 @@ async def schedule_dalton_automation_helper(
                     cross_user=cross_user,
                     existing_meta=locked_existing_meta,
                 )
-                if "metadata" in effective_kwargs or final_meta != locked_existing_meta:
+                if rp_changed or final_meta != locked_existing_meta:
                     effective_kwargs["metadata"] = final_meta
+                else:
+                    effective_kwargs.pop("metadata", None)
                 final_system_only = bool(final_meta.get(_LLM_MODEL_SYSTEM_ONLY_KEY))
                 locked_failure_ctx["model"] = final_model
                 locked_failure_ctx["system_only"] = final_system_only
@@ -2360,6 +2428,7 @@ async def schedule_dalton_automation_helper(
                 with automation_history_context(
                     actor_user_id=effective_actor_id,
                     action=effective_update_action,
+                    expected_config_version=rp_expected_cv,
                     skip_if_unchanged=True,
                     locked_row_reconciler=_reconcile_locked_upsert,
                     report_delivery_audit=report_audit_payload,
@@ -2376,6 +2445,20 @@ async def schedule_dalton_automation_helper(
                     model_name=locked_failure_ctx["model"],
                     system_only=bool(locked_failure_ctx["system_only"]),
                 )
+            except AutomationVersionConflictError:
+                from src.dalton.services.report_delivery import ReportDeliveryError
+
+                conflict_exc = ReportDeliveryError(
+                    "任务配置版本已变更，请刷新后重试。",
+                    code="conflict",
+                )
+                if via_rest:
+                    raise conflict_exc from None
+                return {
+                    "ok": False,
+                    "error": conflict_exc.code,
+                    "message": conflict_exc.message,
+                }
             updated_row = updated or existing
             sync_failed_warning: str | None = None
             if report_profile_change is not None:
@@ -2454,7 +2537,7 @@ async def schedule_dalton_automation_helper(
                         },
                         clean_meta.get("report_profile"),
                         via_rest=via_rest,
-                        user_confirmed=False,
+                        confirmed=False,
                         action="create",
                         after_metadata=clean_meta,
                         conn=active_conn,

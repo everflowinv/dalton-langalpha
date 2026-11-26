@@ -10,7 +10,7 @@ import { DaltonWeixinBotCard } from './DaltonWeixinBotCard';
 
 /**
  * Team Management -> Team Channels & Ops panel:
- * - Admin-only: WeChat team bot QR login, Discord report channels, manual notify target override.
+ * - Admin-only: Team WeChat channel management, Discord report channels, manual notify target override.
  * - Internal+: Feishu team groups, team research system jobs.
  */
 export function DaltonTeamOpsPanel() {
@@ -32,7 +32,7 @@ export function DaltonTeamOpsPanel() {
       {canChannelFeishu && <DaltonFeishuGroupsCard />}
       {isAdmin && canChannelDiscord && <DaltonDiscordChannelsCard />}
       {canDataJobs && <DaltonSystemJobsCard />}
-      {isAdmin && (canChannelFeishu || canChannelDiscord) && (
+      {isAdmin && (canChannelFeishu || canChannelDiscord || canChannelWeixin) && (
         <DaltonNotifyTargetsCard allowManualInput />
       )}
     </div>

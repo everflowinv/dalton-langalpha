@@ -29,6 +29,8 @@ import {
 const PROPOSAL_INTERRUPT_TYPES = new Set([
   'create_workspace', 'start_question', 'ptc_agent',
   'delete_workspace', 'stop_workspace', 'delete_thread',
+  // DALTON-HOOK(cos-settings-tools): register archive_workspace confirmation card
+  'archive_workspace',
   // DALTON-HOOK(watchlist): personal watchlist mutation cards
   'watchlist_batch_add', 'watchlist_set_tier', 'watchlist_remove', 'watchlist_tier_policy',
 ]);
@@ -41,6 +43,8 @@ const PROPOSAL_DATA_KEY_MAP: Record<string, keyof AssistantMessage> = {
   delete_workspace: 'secretaryActionProposals',
   stop_workspace: 'secretaryActionProposals',
   delete_thread: 'secretaryActionProposals',
+  // DALTON-HOOK(cos-settings-tools): map archive_workspace into secretaryActionProposals
+  archive_workspace: 'secretaryActionProposals',
   // DALTON-HOOK(watchlist): map watchlist confirmation interrupts to watchlistProposals bucket
   watchlist_batch_add: 'watchlistProposals',
   watchlist_set_tier: 'watchlistProposals',
@@ -292,6 +296,34 @@ function workspaceProposalResultFields(
   return outcome;
 }
 
+// --- DALTON-HOOK(cos-settings-tools): begin ---
+function archiveProposalResultFields(
+  result: ToolResultLike & { status?: unknown },
+): ProposalOutcomeFields & { computer_name?: string; archived_workspace_count?: number } {
+  const outcome = proposalOutcomeFields('archive_workspace', result);
+  if (outcome.status !== 'approved' || typeof result.content !== 'string') {
+    return outcome;
+  }
+  try {
+    const parsed: unknown = JSON.parse(result.content);
+    if (isPlainObject(parsed)) {
+      return {
+        ...outcome,
+        ...(typeof parsed.computer_name === 'string' && parsed.computer_name
+          ? { computer_name: parsed.computer_name }
+          : {}),
+        ...(typeof parsed.archived_workspace_count === 'number'
+          ? { archived_workspace_count: parsed.archived_workspace_count }
+          : {}),
+      };
+    }
+  } catch {
+    // Already parsed in proposalOutcomeFields.
+  }
+  return outcome;
+}
+// --- DALTON-HOOK(cos-settings-tools): end ---
+
 /** Derive settled card fields (approved / rejected / failed) from a tool result.
  *  Shared by both live stream settlement and history replay so both views agree.
  *  A tool result with `status === 'error'` or non-JSON / unparseable payload on
@@ -308,6 +340,10 @@ function proposalResultFields(
   }
   if (type === 'create_workspace') {
     return workspaceProposalResultFields(result);
+  }
+  // DALTON-HOOK(cos-settings-tools): settle archive_workspace proposal card
+  if (type === 'archive_workspace') {
+    return archiveProposalResultFields(result);
   }
   // DALTON-HOOK(watchlist): enrich watchlist confirmation outcome with reconcile_status / job_id
   if (WATCHLIST_INTERRUPT_TYPES.has(type)) {
@@ -359,7 +395,9 @@ function settleLiveProposalFromResult(
         ) {
           updatedCards[cardId] = {
             ...card,
-            ...proposalOutcomeFields(card.actionType || 'delete_workspace', result),
+            ...(card.actionType === 'archive_workspace'
+              ? archiveProposalResultFields(result)
+              : proposalOutcomeFields(card.actionType || 'delete_workspace', result)),
           };
           bucketChanged = true;
         }
@@ -412,10 +450,10 @@ function settleProposalFromResult(
   const named = !!toolCallId && pending.some((p) => p.toolCallId === toolCallId);
   return resolvePendingHistoryInterrupt(
     pending,
-    // DALTON-HOOK(cos-settings-tools): create_workspace settles only by exact tool_call_id (never positional fallback)
+    // DALTON-HOOK(cos-settings-tools): create_workspace and archive_workspace settle only by exact tool_call_id
     // DALTON-HOOK(watchlist): watchlist confirmation cards also settle strictly by exact tool_call_id
     (p) => PROPOSAL_INTERRUPT_TYPES.has(p.type) && (
-      p.type === 'create_workspace' || WATCHLIST_INTERRUPT_TYPES.has(p.type)
+      p.type === 'create_workspace' || p.type === 'archive_workspace' || WATCHLIST_INTERRUPT_TYPES.has(p.type)
         ? (!!toolCallId && p.toolCallId === toolCallId)
         : (named ? p.toolCallId === toolCallId : !toolCallId || !p.toolCallId)
     ),

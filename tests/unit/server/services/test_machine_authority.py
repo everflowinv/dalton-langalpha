@@ -414,17 +414,24 @@ class TestStopEntersThroughTheMachine(_Base):
     @pytest.mark.asyncio
     async def test_archive_reads_the_machines_status_too(self):
         """A stopped project shadow cannot authorize archiving a running machine."""
+        from src.server.services.computer_errors import ComputerNotStoppedError
+
         ws_id = str(uuid.uuid4())
         manager = self._manager()
         manager._machine_has_active_tasks = AsyncMock(return_value=False)
+        # DALTON-HOOK(cos-settings-tools): transactional archive claim enforces stopped machine status
         with (
             cm_patch(
                 "db_get_workspace",
                 AsyncMock(return_value=_workspace(ws_id, status="stopped")),
             ),
             patch(
-                f"{_MACHINES}.get_computer",
-                AsyncMock(return_value=_computer(shadowed=[ws_id])),
+                f"{_MACHINES}.claim_computer_for_archive",
+                AsyncMock(
+                    side_effect=ComputerNotStoppedError(
+                        "Cannot archive computer in 'running' state."
+                    )
+                ),
             ),
         ):
             with pytest.raises(RuntimeError, match="Cannot archive computer"):
@@ -498,9 +505,15 @@ class TestStopOwnershipFence(_Base):
 
         if settles:
             await manager._reconcile_provider_stop(_binding("ws-1"))
-            manager._settle_machine_stop.assert_awaited_once_with(
-                COMPUTER_ID, "stopped"
-            )
+            # DALTON-HOOK(cos-settings-tools): keep config.archiving fence while provider state is 'archiving'
+            if state == "archiving":
+                manager._settle_machine_stop.assert_awaited_once_with(
+                    COMPUTER_ID, "stopped", clear_archiving=False
+                )
+            else:
+                manager._settle_machine_stop.assert_awaited_once_with(
+                    COMPUTER_ID, "stopped"
+                )
         else:
             with pytest.raises(RuntimeError, match="transient state"):
                 await manager._reconcile_provider_stop(_binding("ws-1"))
@@ -831,32 +844,49 @@ class TestArchiveClaim(_Base):
     @pytest.mark.asyncio
     @pytest.mark.parametrize("wins", [True, False])
     async def test_archive_claim_blocks_start_before_provider_call(self, wins):
+        from unittest.mock import create_autospec
+
+        from ptc_agent.core.sandbox.runtime import RuntimeState, SandboxRuntime
+        from src.server.database import computer as computer_db
+
         manager = self._manager()
-        manager._machine_has_active_tasks = AsyncMock(return_value=False)
+        manager._machine_has_active_tasks = create_autospec(
+            manager._machine_has_active_tasks, return_value=False
+        )
         row = _computer(shadowed=[], status="stopped")
-        status = AsyncMock(return_value={**row, "status": "stopping"} if wins else None)
-        runtime = SimpleNamespace(archives=True, archive=AsyncMock())
+        claimed_row = {**row, "status": "stopping", "config": {"archiving": True}}
+        claim = create_autospec(
+            computer_db.claim_computer_for_archive,
+            return_value=claimed_row if wins else None,
+        )
+        if not wins:
+            claim.side_effect = RuntimeError("Computer changed while preparing archive; retry")
+        status = create_autospec(computer_db.update_computer_status, return_value=row)
+        runtime = create_autospec(SandboxRuntime, instance=True)
+        runtime.archives = True
+        runtime.refresh_state.return_value = RuntimeState.ARCHIVED
 
         @asynccontextmanager
         async def detached(*_args, **_kwargs):
-            # DALTON-HOOK(cos-settings-tools): archive claim stamps config.archiving=True under the stopping CAS
-            status.assert_awaited_once_with(
+            # DALTON-HOOK(cos-settings-tools): transactional archive claim runs before provider call
+            claim.assert_awaited_once_with(
                 COMPUTER_ID,
-                "stopping",
-                expected="stopped",
-                merge_config={"archiving": True},
+                expected_workspaces=None,
+                expected_workspace_id=None,
             )
             yield runtime
 
         manager._detached_runtime = detached
-        manager._stop_result = AsyncMock(return_value=row)
+        manager._stop_result = create_autospec(manager._stop_result, return_value=row)
         with (
-            patch(f"{_MACHINES}.get_computer", AsyncMock(return_value=row)),
+            patch(f"{_MACHINES}.claim_computer_for_archive", claim),
             patch(f"{_MACHINES}.update_computer_status", status),
         ):
             if wins:
-                await manager._archive_machine(COMPUTER_ID)
+                res = await manager._archive_machine(COMPUTER_ID)
                 runtime.archive.assert_awaited_once()
+                runtime.refresh_state.assert_awaited_once()
+                assert res["archive_state"] == "archived"
                 assert status.await_args_list[-1].args == (COMPUTER_ID, "stopped")
                 # DALTON-HOOK(cos-settings-tools): settling the stop drops config.archiving
                 assert status.await_args_list[-1].kwargs == {
@@ -868,25 +898,37 @@ class TestArchiveClaim(_Base):
                     await manager._archive_machine(COMPUTER_ID)
                 runtime.archive.assert_not_awaited()
 
+    # --- DALTON-HOOK(cos-settings-tools): begin ---
     @pytest.mark.asyncio
     async def test_failed_archive_keeps_recovery_claim_when_provider_unreachable(self):
+        from unittest.mock import create_autospec
+
+        from ptc_agent.core.sandbox.runtime import SandboxRuntime
+        from src.server.services.computer_errors import ArchiveProviderError
+
         manager = self._manager()
-        manager._machine_has_active_tasks = AsyncMock(return_value=False)
-        manager._claim_machine_for_archive = AsyncMock(
-            return_value=_computer(shadowed=[], status="stopping")
+        manager._machine_has_active_tasks = create_autospec(
+            manager._machine_has_active_tasks, return_value=False
         )
-        manager._reconcile_provider_stop = AsyncMock(side_effect=RuntimeError("unreachable"))
-        manager._settle_machine_stop = AsyncMock()
-        runtime = SimpleNamespace(
-            archives=True, archive=AsyncMock(side_effect=RuntimeError("archive failed"))
+        manager._claim_machine_for_archive = create_autospec(
+            manager._claim_machine_for_archive,
+            return_value=_computer(shadowed=[], status="stopping"),
         )
+        manager._reconcile_provider_stop = create_autospec(
+            manager._reconcile_provider_stop, side_effect=RuntimeError("unreachable")
+        )
+        manager._settle_machine_stop = create_autospec(manager._settle_machine_stop)
+        runtime = create_autospec(SandboxRuntime, instance=True)
+        runtime.archives = True
+        runtime.archive.side_effect = RuntimeError("archive failed")
 
         @asynccontextmanager
         async def detached(*_args, **_kwargs):
             yield runtime
 
         manager._detached_runtime = detached
-        with pytest.raises(RuntimeError, match="archive failed"):
+        with pytest.raises(ArchiveProviderError, match="archive_failed"):
             await manager._archive_machine(COMPUTER_ID)
         manager._reconcile_provider_stop.assert_awaited_once()
         manager._settle_machine_stop.assert_not_awaited()
+    # --- DALTON-HOOK(cos-settings-tools): end ---

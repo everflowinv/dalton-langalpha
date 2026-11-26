@@ -1498,6 +1498,21 @@ async def migrate_data_job_monitor_and_cut_tx(
     return loaded, result, False
 
 
+def _clip_publish_error(message: str | None, limit: int = 1000) -> str:
+    """Clip a monitor publish error to ``limit`` chars while preserving trailing ``| 数据日期: ...``."""
+    raw = (message or "Republish failed").strip()
+    if len(raw) <= limit:
+        return raw
+    marker = " | 数据日期: "
+    idx = raw.rfind(marker)
+    if idx != -1:
+        suffix = raw[idx:]
+        if len(suffix) < limit - 20:
+            body_budget = limit - len(suffix) - 1
+            return raw[:body_budget].rstrip() + "…" + suffix
+    return raw[:limit]
+
+
 async def record_monitor_publish_failure(
     monitor_id: str,
     *,
@@ -1506,7 +1521,7 @@ async def record_monitor_publish_failure(
 ) -> MonitorRecord | None:
     """Record the latest failure message/timestamp without marking ``run_id`` as processed."""
     _ = run_id
-    clipped = (error_message or "Republish failed").strip()[:1000]
+    clipped = _clip_publish_error(error_message, limit=1000)
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -1645,6 +1660,12 @@ async def _prune_monitor_versions_in_cur(
     return deleted_versions
 
 
+def _normalize_utc(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        return ts.replace(tzinfo=UTC)
+    return ts.astimezone(UTC)
+
+
 async def upsert_monitor_data(
     monitor_id: str,
     data_key: str,
@@ -1654,7 +1675,7 @@ async def upsert_monitor_data(
 ) -> MonitorDataEntry:
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-    ts = as_of or datetime.now(UTC)
+    ts = _normalize_utc(as_of) if as_of is not None else datetime.now(UTC)
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -1668,11 +1689,41 @@ async def upsert_monitor_data(
                        as_of = EXCLUDED.as_of,
                        sha256 = EXCLUDED.sha256,
                        updated_at = NOW()
+                 WHERE EXCLUDED.as_of > dalton_monitor_data.as_of
                 RETURNING monitor_id::text AS monitor_id, data_key, payload, as_of, sha256, updated_at
                 """,
                 (monitor_id, data_key, canonical, ts, digest),
             )
             row = await cur.fetchone()
+            if row is None:
+                await cur.execute(
+                    """
+                    SELECT monitor_id::text AS monitor_id, data_key, payload, as_of, sha256, updated_at
+                      FROM dalton_monitor_data
+                     WHERE monitor_id = %s::uuid AND data_key = %s
+                    """,
+                    (monitor_id, data_key),
+                )
+                existing = await cur.fetchone()
+                if existing is None:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Monitor data upsert produced no row",
+                    )
+                existing_as_of = _normalize_utc(existing["as_of"])
+                existing_sha = str(existing["sha256"])
+                if existing_as_of == ts and existing_sha == digest:
+                    # Idempotent replay of the exact same snapshot: keep original updated_at untouched.
+                    row = existing
+                else:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Rejected stale monitor snapshot for {data_key}: "
+                            f"incoming as_of={ts.isoformat()} is not newer than "
+                            f"stored as_of={existing_as_of.isoformat()}"
+                        ),
+                    )
     return MonitorDataEntry(
         monitor_id=str(row["monitor_id"]),
         data_key=str(row["data_key"]),

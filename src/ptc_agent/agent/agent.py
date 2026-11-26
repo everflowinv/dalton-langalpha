@@ -1198,6 +1198,17 @@ class PTCAgent:
         dalton_report_delivery_enabled = any(
             getattr(t, "name", None) == "dalton_report_delivery" for t in dalton_tools
         )
+        if dalton_report_delivery_enabled and user_id:
+            from src.dalton.tools.report_delivery_tools import (
+                ReportDeliveryHitlCleanupMiddleware,
+            )
+
+            main_only_middleware.append(
+                ReportDeliveryHitlCleanupMiddleware(
+                    thread_id=str(thread_id or ""),
+                    caller_user_id=str(user_id),
+                )
+            )
         # DALTON-HOOK(colleague-access): gate CoS hand-off & analyst colleague_workspace prompts on actual capability/mounted tool
         from src.dalton.capabilities import CapabilityId, has_capability
 

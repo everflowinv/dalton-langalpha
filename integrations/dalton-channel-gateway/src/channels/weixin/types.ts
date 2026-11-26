@@ -9,6 +9,8 @@ export const ILINK_DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 export const ILINK_DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
 export const ILINK_DEFAULT_BOT_TYPE = "3";
 export const SESSION_EXPIRED_ERRCODE = -14;
+/** Confirmed iLink `verify_qrcode_code` invalid-code errcodes (populated when empirically confirmed). */
+export const INVALID_VERIFY_CODE_ERRCODES: readonly number[] = [];
 
 export const OFFICIAL_ILINK_API_DOMAINS: readonly string[] = [
   "ilinkai.weixin.qq.com",

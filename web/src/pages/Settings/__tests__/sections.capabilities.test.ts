@@ -170,4 +170,94 @@ describe('Settings sections & search capability gating', () => {
     );
     expect(coreAnchors.has('dalton-cos-sharing')).toBe(false);
   });
+
+  it('hides personal WeChat search entry for external members when weixinAllowExternal is false or unconfirmed while keeping internal/admin visible, and enables notify targets when only channel_weixin is on', () => {
+    const extUnconfirmedCtx: DaltonSettingVisibilityContext = {
+      ...everflowAdminCtx,
+      callerTier: 'external',
+      weixinAllowExternal: undefined,
+    };
+    const extBlockedCtx: DaltonSettingVisibilityContext = {
+      ...everflowAdminCtx,
+      callerTier: 'external',
+      weixinAllowExternal: false,
+    };
+    const extAllowedCtx: DaltonSettingVisibilityContext = {
+      ...everflowAdminCtx,
+      callerTier: 'external',
+      weixinAllowExternal: true,
+    };
+    const internalCtx: DaltonSettingVisibilityContext = {
+      ...everflowAdminCtx,
+      callerTier: 'internal',
+      weixinAllowExternal: false,
+    };
+    const adminCtx: DaltonSettingVisibilityContext = {
+      ...everflowAdminCtx,
+      callerTier: 'admin',
+      weixinAllowExternal: false,
+    };
+    const weixinOnlyCtx: DaltonSettingVisibilityContext = {
+      ...coreAdminCtx,
+      capabilities: new Set<CapabilityId>(['channel_weixin']),
+    };
+
+    const extUnconfirmedAnchors = new Set(
+      searchableSettings(false, extUnconfirmedCtx).map((entry) => entry.anchor),
+    );
+    const extBlockedAnchors = new Set(
+      searchableSettings(false, extBlockedCtx).map((entry) => entry.anchor),
+    );
+    const extAllowedAnchors = new Set(
+      searchableSettings(false, extAllowedCtx).map((entry) => entry.anchor),
+    );
+    const internalAnchors = new Set(
+      searchableSettings(false, internalCtx).map((entry) => entry.anchor),
+    );
+    const adminAnchors = new Set(
+      searchableSettings(false, adminCtx).map((entry) => entry.anchor),
+    );
+    const weixinOnlyAnchors = new Set(
+      searchableSettings(false, weixinOnlyCtx).map((entry) => entry.anchor),
+    );
+
+    expect(extUnconfirmedAnchors.has('dalton-weixin-bind')).toBe(false);
+    expect(extBlockedAnchors.has('dalton-weixin-bind')).toBe(false);
+    expect(extBlockedAnchors.has('dalton-weixin-bot')).toBe(false);
+    expect(extAllowedAnchors.has('dalton-weixin-bind')).toBe(true);
+    expect(internalAnchors.has('dalton-weixin-bind')).toBe(true);
+    expect(internalAnchors.has('dalton-weixin-bot')).toBe(false);
+    expect(adminAnchors.has('dalton-weixin-bind')).toBe(true);
+    expect(adminAnchors.has('dalton-weixin-bot')).toBe(true);
+    expect(weixinOnlyAnchors.has('dalton-notify-targets')).toBe(true);
+    expect(weixinOnlyAnchors.has('dalton-weixin-bind')).toBe(true);
+    expect(weixinOnlyAnchors.has('dalton-channel-bindings')).toBe(false);
+
+    // Unresolved caller identity (loading, error, or null tier) hides personal WeChat entry and keywords
+    const pendingCtx: DaltonSettingVisibilityContext = {
+      ...everflowAdminCtx,
+      callerTier: null,
+      callerTierPending: true,
+      weixinAllowExternal: true,
+    };
+    const errorCtx: DaltonSettingVisibilityContext = {
+      ...everflowAdminCtx,
+      callerTier: null,
+      callerTierError: true,
+      weixinAllowExternal: true,
+    };
+    const unknownCtx: DaltonSettingVisibilityContext = {
+      ...everflowAdminCtx,
+      callerTier: null,
+      weixinAllowExternal: true,
+    };
+    for (const ctx of [pendingCtx, errorCtx, unknownCtx]) {
+      const entries = searchableSettings(false, ctx);
+      const anchors = new Set(entries.map((entry) => entry.anchor));
+      expect(anchors.has('dalton-weixin-bind')).toBe(false);
+      const notifyEntry = entries.find((entry) => entry.anchor === 'dalton-notify-targets');
+      expect(notifyEntry).toBeDefined();
+      expect(settingSearchText(notifyEntry!, tZh, ctx).toLowerCase()).not.toContain('微信');
+    }
+  });
 });

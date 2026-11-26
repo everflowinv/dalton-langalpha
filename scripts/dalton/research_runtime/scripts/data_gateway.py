@@ -37,7 +37,50 @@ def _resolve_research_roots(default_code_root: Path = _DEFAULT_CODE_ROOT) -> tup
 
 ROOT, HOME_ROOT = _resolve_research_roots()
 REGISTRY = ROOT / "config/data_sources.json"
-NATIVE_SOURCES = {"alphaengine": "http://127.0.0.1:8950/mcp", "guidepoint": "http://127.0.0.1:8943/mcp"}
+NATIVE_SOURCES = {
+    "alphaengine": "http://127.0.0.1:8950/mcp",
+    "guidepoint": os.environ.get("DALTON_GUIDEPOINT_MCP_URL", "").strip() or "http://127.0.0.1:8943/mcp",
+}
+
+
+def _read_bridge_env_fallback(key: str) -> str:
+    env_file = Path(
+        os.environ.get("DALTON_BRIDGE_ENV_FILE", "").strip()
+        or (Path.home() / ".config" / "dalton" / "researchdata-bridge.env")
+    ).expanduser()
+    if not env_file.is_file():
+        return ""
+    try:
+        for raw in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            k, v = line.split("=", 1)
+            if k.strip() == key:
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                return v
+    except OSError:
+        return ""
+    return ""
+
+
+def _resolve_guidepoint_mcp_url() -> str:
+    return (
+        os.environ.get("DALTON_GUIDEPOINT_MCP_URL", "").strip()
+        or _read_bridge_env_fallback("DALTON_GUIDEPOINT_MCP_URL")
+        or NATIVE_SOURCES["guidepoint"]
+    )
+
+
+def _resolve_research_host_token() -> str:
+    return (
+        os.environ.get("DALTON_RESEARCH_HOST_TOKEN", "").strip()
+        or _read_bridge_env_fallback("DALTON_RESEARCH_HOST_TOKEN")
+    )
 LIBRARY_SOURCES = {"company-wiki", "sales-notes", "tmtb", "funda-ai", "all"}
 # AlphaEngine 业绩会 ASR 稿类型；roic.ai 自 2026-08 整站 403，已停用。
 TRANSCRIPT_TYPE_ID = "IND_SECOND_5FA442AE"
@@ -280,10 +323,19 @@ def native_request(route, args, execute_request=False):
     result = {"operation": operation, "parameters": params}
     if not execute_request:
         return result
-    request = urllib.request.Request(NATIVE_SOURCES[rid], data=json.dumps({
+    target_url = _resolve_guidepoint_mcp_url() if rid == "guidepoint" else NATIVE_SOURCES[rid]
+    req_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json, text/event-stream",
+    }
+    if rid == "guidepoint":
+        host_token = _resolve_research_host_token()
+        if host_token:
+            req_headers["Authorization"] = f"Bearer {host_token}"
+    request = urllib.request.Request(target_url, data=json.dumps({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": operation, "arguments": params},
-    }).encode(), headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"})
+    }).encode(), headers=req_headers)
     try:
         # Local services must not be sent through an outbound HTTP proxy.
         with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(request, timeout=args.timeout) as response:

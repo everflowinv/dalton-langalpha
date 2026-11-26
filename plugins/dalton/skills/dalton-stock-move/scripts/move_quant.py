@@ -47,8 +47,18 @@ HIST_LOOKBACK_DAYS = 60      # 窗口起点前 60 个交易日计算日超额标
 MIN_HIST_SAMPLES = 20        # 历史样本数 > 20 才计算 σ 和 z 值
 ADTV_LOOKBACK_DAYS = 20      # 当日成交量对比前 20 个交易日均量（不含当日）
 
-PRIVATE_TICKERS = {"OPENAI"}
+PRIVATE_TICKERS: set[str] = set()
 DEFAULT_FUTURES = ["NQ=F", "ES=F"]
+
+
+def is_private_company_entry(entry: dict[str, Any] | None) -> bool:
+    """以覆盖数据字段为准判断是否未上市（不再写死 SPCX / Anthropic）。"""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("is_private") is True or entry.get("listed") is False:
+        return True
+    status = str(entry.get("listing_status") or "").strip().lower()
+    return status in ("private", "unlisted")
 NON_US_EXTENDED_UNSUPPORTED_SUFFIXES = (
     ".HK", ".SH", ".SS", ".SZ", ".T", ".L", ".KS", ".KQ", ".TW", ".TWO",
     ".DE", ".PA", ".AS", ".TO", ".AX", ".SI", ".NS", ".BO",
@@ -74,12 +84,16 @@ def _cn_price_fallback():
     return _cn_price_fallback_mod
 
 
-def supports_extended_session(symbol: str) -> tuple[bool, str | None]:
+def supports_extended_session(
+    symbol: str,
+    *,
+    company_entry: dict[str, Any] | None = None,
+) -> tuple[bool, str | None]:
     """检查标的是否支持美股盘前/盘后（pre/post）分钟线计算。"""
     s = (symbol or "").strip().upper()
     if not s:
         return False, "标的代码为空"
-    if s in PRIVATE_TICKERS:
+    if s in PRIVATE_TICKERS or is_private_company_entry(company_entry):
         return False, f"未上市标的 {s} 不支持行情查询"
     if s.startswith("^"):
         return (
@@ -287,6 +301,11 @@ def resolve_peers_and_etf(
     if companies and (not peers or not etf):
         entry = next((c for c in companies if str(c.get("ticker", "")).upper() == t), None)
         if entry:
+            private_in_cov = {
+                str(c.get("ticker", "")).upper()
+                for c in companies
+                if is_private_company_entry(c) and c.get("ticker")
+            }
             if not peers:
                 cov_peers: list[str] = []
                 raw_peers = entry.get("peers") or []
@@ -294,7 +313,9 @@ def resolve_peers_and_etf(
                     cov_peers = [
                         str(p).upper()
                         for p in raw_peers
-                        if str(p).upper() != t and str(p).upper() not in PRIVATE_TICKERS
+                        if str(p).upper() != t
+                        and str(p).upper() not in PRIVATE_TICKERS
+                        and str(p).upper() not in private_in_cov
                     ]
                 elif entry.get("peer_group"):
                     pg = entry["peer_group"]
@@ -303,6 +324,7 @@ def resolve_peers_and_etf(
                         for c in companies
                         if c.get("peer_group") == pg
                         and str(c.get("ticker", "")).upper() != t
+                        and not is_private_company_entry(c)
                         and str(c.get("ticker", "")).upper() not in PRIVATE_TICKERS
                     ]
                 if cov_peers:

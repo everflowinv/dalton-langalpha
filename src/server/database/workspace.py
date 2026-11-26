@@ -461,19 +461,42 @@ async def get_workspace_name_keys(user_id: str) -> set[str]:
 # DALTON-HOOK(workspace-duplicate-guard): names of every live workspace, for the
 # agent-side check that turns a duplicate create into an ask.
 async def get_live_workspace_names(user_id: str) -> List[Dict[str, Any]]:
-    """``(workspace_id, name)`` of every live workspace the user holds.
+    """``(workspace_id, name[, unit_ticker])`` of every live workspace the user holds.
 
     The same fence as the name-key lookups, so what counts as a duplicate
     here is exactly what would collide there.
     """
+    # DALTON-HOOK(cos-settings-tools): include active company unit ticker when coverage units are enabled so the card matches locked recheck
+    from src.dalton.settings import is_coverage_units_enabled
+
     async with _ws_cursor() as cur:
-        await cur.execute(
-            f"""
-            SELECT workspace_id, name FROM workspaces
-            WHERE user_id = %s AND {FENCE_LIVE_WORKSPACE}
-            """,
-            (user_id,),
-        )
+        if is_coverage_units_enabled():
+            await cur.execute(
+                f"""
+                SELECT workspaces.workspace_id,
+                       workspaces.name,
+                       (
+                           SELECT cu.ticker
+                           FROM dalton_coverage_units cu
+                           WHERE cu.workspace_id = workspaces.workspace_id
+                             AND cu.status = 'active'
+                             AND cu.kind = 'company'
+                           ORDER BY cu.updated_at DESC NULLS LAST
+                           LIMIT 1
+                       ) AS unit_ticker
+                FROM workspaces
+                WHERE user_id = %s AND {FENCE_LIVE_WORKSPACE}
+                """,
+                (user_id,),
+            )
+        else:
+            await cur.execute(
+                f"""
+                SELECT workspace_id, name FROM workspaces
+                WHERE user_id = %s AND {FENCE_LIVE_WORKSPACE}
+                """,
+                (user_id,),
+            )
         return [dict(row) for row in await cur.fetchall()]
 
 
@@ -870,6 +893,7 @@ async def create_workspace_on_computer(
     expected_duplicate_workspace_name: Optional[str] = None,
     verified_company_candidates: Optional[Iterable[Tuple[str, str, Optional[str]]]] = None,
     check_colleague_duplicate: bool = False,
+    reject_reason_out: Optional[list[str]] = None,
     # --- DALTON-HOOK(cos-settings-tools): end ---
     conn=None,
 ) -> Optional[Dict[str, Any]]:
@@ -941,6 +965,27 @@ async def create_workspace_on_computer(
                     if expected_computer_kind is not None:
                         extra_fence += "\n                                  AND kind = %(expected_computer_kind)s"
                     async with owned.transaction():
+                        if reject_reason_out is not None:
+                            await cur.execute(
+                                f"""
+                                SELECT config
+                                FROM computers
+                                WHERE computer_id = %(computer_id)s AND {FENCE_NOT_DELETED}
+                                  AND user_id = %(user_id)s
+                                FOR SHARE
+                                """,
+                                {
+                                    "computer_id": computer_id,
+                                    "user_id": user_id,
+                                },
+                            )
+                            locked_state = await cur.fetchone()
+                            if (
+                                isinstance(locked_state, dict)
+                                and (locked_state.get("config") or {}).get("archiving")
+                            ):
+                                reject_reason_out.append("archiving")
+                                return None
                         if expected_computer_name is not None or expected_computer_kind is not None:
                             from src.tools.secretary.utils import spoken_computer_name
 
@@ -1347,19 +1392,48 @@ async def check_duplicate_snapshot_unchanged(
     candidates_list = list(verified_company_candidates) if verified_company_candidates else []
 
     async def _run_checks(check_cur) -> bool:
-        await check_cur.execute(
-            f"""
-            SELECT workspace_id, name
-            FROM workspaces
-            WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
-            """,
-            {"user_id": user_id},
-        )
+        from src.dalton.settings import is_coverage_units_enabled
+
+        if is_coverage_units_enabled():
+            await check_cur.execute(
+                f"""
+                SELECT workspaces.workspace_id,
+                       workspaces.name,
+                       (
+                           SELECT cu.ticker
+                           FROM dalton_coverage_units cu
+                           WHERE cu.workspace_id = workspaces.workspace_id
+                             AND cu.status = 'active'
+                             AND cu.kind = 'company'
+                           ORDER BY cu.updated_at DESC NULLS LAST
+                           LIMIT 1
+                       ) AS unit_ticker
+                FROM workspaces
+                WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
+                """,
+                {"user_id": user_id},
+            )
+        else:
+            await check_cur.execute(
+                f"""
+                SELECT workspace_id, name
+                FROM workspaces
+                WHERE user_id = %(user_id)s AND {FENCE_LIVE_WORKSPACE}
+                """,
+                {"user_id": user_id},
+            )
         live_rows = await check_cur.fetchall()
         matched_expected = False
         for live_ws in live_rows:
             live_id = str(live_ws["workspace_id"])
             live_name = str(live_ws.get("name") or "")
+            live_unit_ticker = normalize_ticker_key(live_ws.get("unit_ticker"))
+            matches_live = _same_name_or_ticker(name, live_name) or (
+                live_unit_ticker is not None
+                and _same_name_or_ticker(
+                    name, live_unit_ticker, candidate_is_ticker=True
+                )
+            )
             if (
                 expected_duplicate_workspace_id is not None
                 and live_id == expected_duplicate_workspace_id
@@ -1369,17 +1443,18 @@ async def check_duplicate_snapshot_unchanged(
                     and live_name != expected_duplicate_workspace_name
                 ):
                     return False
-                if not _same_name_or_ticker(name, live_name):
+                if not matches_live:
                     return False
                 matched_expected = True
                 continue
-            if _same_name_or_ticker(name, live_name):
+            if matches_live:
                 return False
         if expected_duplicate_workspace_id is not None and not matched_expected:
             return False
 
         if check_colleague_duplicate:
             from src.dalton import settings as dalton_settings
+            from src.dalton.coverage.dedup import colleague_workspace_deterministic_match
             from src.dalton.sharing import is_internal_team_owner
 
             internal_user_ids: Optional[set[str]] = None
@@ -1444,10 +1519,11 @@ async def check_duplicate_snapshot_unchanged(
                     and ws_id_s == expected_duplicate_workspace_id
                 ):
                     continue
-                if _same_name_or_ticker(name, ws_name):
-                    return False
-                if unit_ticker is not None and _same_name_or_ticker(
-                    name, unit_ticker, candidate_is_ticker=True
+                if colleague_workspace_deterministic_match(
+                    name,
+                    candidate_name=ws_name,
+                    candidate_unit_ticker=unit_ticker,
+                    strict_name_ticker_shape=True,
                 ):
                     return False
 

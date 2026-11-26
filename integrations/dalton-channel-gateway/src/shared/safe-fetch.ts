@@ -724,6 +724,13 @@ export async function safeFetchResponse(
           : Buffer.alloc(0);
       } catch (error) {
         await cancelResponseBody(response);
+        if (response.status === 429 && !options.signal?.aborted) {
+          return new Response("", {
+            status: 429,
+            statusText: response.statusText,
+            headers: new Headers(response.headers),
+          });
+        }
         if (error instanceof SafeFetchError) {
           throw error;
         }
