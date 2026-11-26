@@ -333,7 +333,7 @@ def test_window_monday_and_form_table(tmp_path: Path, monkeypatch: pytest.Monkey
     assert a_bounds == {("2026-11-07", "2026-11-09")}
     assert hk_bounds == {("2026-11-06", "2026-11-10")}
     assert [row["ticker"] for row in payload["cn_hk"]] == [
-        "300308", "300502", "300750", "09992", "00700", "03690", "00788",
+        "300308", "300502", "300750", "09992", "00700", "03690", "00788", "02513",
     ]
     by_code = {row["code"]: row for row in payload["cn_hk"]}
     assert by_code["3690"] == {
@@ -438,7 +438,7 @@ def test_documented_commands_run_offline(tmp_path: Path, monkeypatch: pytest.Mon
         for line in (SKILL_ROOT / "watchlist.txt").read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.strip().startswith("#")
     ]
-    assert sec["tickers_scanned"] == len(symbols) == 58
+    assert sec["tickers_scanned"] == len(symbols) == 70
     assert {"ECHO", "CRWV", "BAM"}.issubset(symbols) and "SATS" not in symbols
     assert sec["tickers_with_alerts"] == 0
     assert all(result["errors"] for result in sec["results"])
@@ -577,7 +577,7 @@ def test_cn_hk_window_and_excerpt(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
     assert code == 0 and payload["ok"] is True, payload
     assert payload["report_run_id"] == "daily-filing-alert-2026-11-12"
     assert payload["cn_stocks_scanned"] == 3
-    assert payload["hk_stocks_scanned"] == 4
+    assert payload["hk_stocks_scanned"] == 5
     assert fake.call_count == 0
     saved = json.loads((tmp_path / output).read_text(encoding="utf-8"))
     by_ticker = {row["ticker"]: row for row in saved["results"]}
