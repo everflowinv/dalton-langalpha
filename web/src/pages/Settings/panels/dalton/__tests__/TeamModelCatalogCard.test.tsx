@@ -181,6 +181,7 @@ function makeOverview(
         model_key: 'gemini-4-neon-high-oauth',
         model_id: 'gemini-4-neon',
         provider: 'antigravity-oauth',
+        provider_sdk: 'antigravity',
         provider_display_name: 'Antigravity',
         provider_connected: true,
         catalog_defined_provider: false,
@@ -195,13 +196,20 @@ function makeOverview(
         compaction_profile: 'expansive',
         input_modalities: ['text', 'image', 'pdf'],
         reasoning: null,
+        parameters: { max_output_tokens: 65536 },
         pricing: null,
         pricing_meta: null,
         dalton_meta: {
           family: 'google-gemini',
           billing: 'subscription',
           tool_calling: true,
-          notional_pricing: { input: 1.5, output: 6, source_kind: 'estimated', estimated: true },
+          notional_pricing: {
+            input: 1.5,
+            cached_input: 0.15,
+            output: 6,
+            source_kind: 'estimated',
+            estimated: true,
+          },
         },
       },
     ],
@@ -626,16 +634,18 @@ describe('TeamModelCatalogCard', () => {
     expect((screen.getByTestId('edit-model-task-cost-ref-input') as HTMLInputElement).value).toBe('claude-sonnet-5-5');
     expect((screen.getByTestId('edit-model-task-cost-times-input') as HTMLInputElement).value).toBe('0.8');
 
-    // Update max_tokens and save -> sends ONLY the edit-sheet max_tokens patch (never echoes non-UI parameters)
+    // Update max_tokens and save -> sends ONLY the changed parameters field (never echoes unchanged fields or non-UI parameters)
     fireEvent.change(screen.getByTestId('edit-model-max-tokens-input'), { target: { value: '32768' } });
     fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
     await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(1));
-    expect(h.updateTeamCatalogModel.mock.calls[0][1]).toMatchObject({
-      prompt_guidance: 'detailed',
+    const editedPayload = h.updateTeamCatalogModel.mock.calls[0][1];
+    expect(editedPayload).toEqual({
       parameters: { max_tokens: 32768 },
-      task_costs_bound: { model: 'claude-sonnet-5-5', times: 0.8 },
+      expected_revision: 7,
+      comment: undefined,
     });
-    expect(h.updateTeamCatalogModel.mock.calls[0][1].parameters).toEqual({ max_tokens: 32768 });
+    expect(editedPayload.prompt_guidance).toBeUndefined();
+    expect(editedPayload.task_costs_bound).toBeUndefined();
     await waitFor(() => expect(screen.queryByTestId('team-model-edit-sheet')).toBeNull());
 
     // Open Add Variant -> options come directly from server parent_provider_groups & supported_variant_sdks
@@ -752,7 +762,7 @@ describe('TeamModelCatalogCard', () => {
     });
   });
 
-  it('uses opened snapshot revision on save, preserves draft on 409 revision_conflict, shows latest values, and resubmits cleanly', async () => {
+  it('waits for target catalog revision refresh on 409 conflict, shows conflicted fields, preserves draft, and submits only user-changed fields', async () => {
     const initial = makeOverview({ revision: 7 });
     const updatedByOther = makeOverview({
       revision: 9,
@@ -760,13 +770,20 @@ describe('TeamModelCatalogCard', () => {
         {
           ...initial.models[0],
           display_name: 'GPT-5 Edited By Bob',
+          context: 512000,
+          visible: false,
         },
         initial.models[1],
       ],
     });
+    let resolveConflictRefetch!: (value: TeamCatalogOverviewResponse) => void;
+    const deferredRefetch = new Promise<TeamCatalogOverviewResponse>((resolve) => {
+      resolveConflictRefetch = resolve;
+    });
+
     h.fetchTeamModelCatalog
       .mockResolvedValueOnce(initial)
-      .mockResolvedValueOnce(updatedByOther)
+      .mockReturnValueOnce(deferredRefetch)
       .mockResolvedValue(updatedByOther);
 
     h.updateTeamCatalogModel
@@ -783,32 +800,111 @@ describe('TeamModelCatalogCard', () => {
     renderCard();
     await waitFor(() => expect(screen.getByTestId('edit-model-gpt-5-btn')).toBeInTheDocument());
 
-    // Open edit sheet at revision 7
+    // Open edit sheet at revision 7 and edit ONLY display_name
     fireEvent.click(screen.getByTestId('edit-model-gpt-5-btn'));
     const nameInput = (await screen.findByTestId('edit-model-display-name-input')) as HTMLInputElement;
-
-    // Background refresh updates catalog to revision 9 while sheet is open
-    fireEvent.click(screen.getByTestId('team-catalog-refresh-btn'));
-    await waitFor(() => expect(h.fetchTeamModelCatalog).toHaveBeenCalledTimes(2));
-
-    // Edit draft name and click save -> MUST send opened revision 7 (not 9)
     fireEvent.change(nameInput, { target: { value: 'GPT-5 My Draft' } });
     fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
 
     await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(1));
     expect(h.updateTeamCatalogModel.mock.calls[0][1].expected_revision).toBe(7);
 
-    // Conflict banner appears, draft is preserved, and latest value is shown
+    // Conflict banner appears while refetch to v9 is still pending: retry MUST remain disabled
     expect(await screen.findByTestId('edit-sheet-revision-conflict')).toBeInTheDocument();
+    expect(screen.getByTestId('edit-sheet-conflict-syncing')).toBeInTheDocument();
+    expect(screen.getByTestId('edit-sheet-conflict-resubmit-btn')).toBeDisabled();
     expect((screen.getByTestId('edit-model-display-name-input') as HTMLInputElement).value).toBe('GPT-5 My Draft');
-    expect(screen.getByTestId('edit-sheet-conflict-latest-summary').textContent).toContain('GPT-5 Edited By Bob');
 
-    // Resubmit draft against revision 9
+    // Complete catalog refresh at revision 9 -> conflicted fields are shown and retry enables
+    resolveConflictRefetch(updatedByOther);
+    await waitFor(() => expect(screen.getByTestId('edit-sheet-conflict-resubmit-btn')).toBeEnabled());
+    expect(screen.getByTestId('edit-sheet-conflict-latest-summary').textContent).toContain('GPT-5 Edited By Bob');
+    const conflictFields = screen.getByTestId('edit-sheet-conflict-fields');
+    expect(conflictFields.textContent).toContain('GPT-5 Edited By Bob');
+    expect(conflictFields.textContent).toContain('GPT-5 My Draft');
+    expect(conflictFields.textContent).toContain('512000');
+
+    // Resubmit draft against revision 9 -> sends ONLY the user's changed field (display_name), preserving Bob's context & visibility
     fireEvent.click(screen.getByTestId('edit-sheet-conflict-resubmit-btn'));
     await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(2));
-    expect(h.updateTeamCatalogModel.mock.calls[1][1]).toMatchObject({
+    expect(h.updateTeamCatalogModel.mock.calls[1][1]).toEqual({
       display_name: 'GPT-5 My Draft',
       expected_revision: 9,
+      comment: undefined,
+    });
+  });
+
+  it('retries restore-default (not normal save) after 409 revision_conflict once target revision finishes loading', async () => {
+    const initial = makeOverview({ revision: 7 });
+    const updatedByOther = makeOverview({
+      revision: 9,
+      models: [
+        {
+          ...initial.models[0],
+          display_name: 'GPT-5 Bob Override',
+        },
+        initial.models[1],
+      ],
+    });
+    h.fetchTeamModelCatalog
+      .mockResolvedValueOnce(initial)
+      .mockResolvedValueOnce(updatedByOther)
+      .mockResolvedValue(updatedByOther);
+
+    h.restoreTeamCatalogModelDefault
+      .mockRejectedValueOnce(
+        makeConflictError({
+          code: 'revision_conflict',
+          message: 'Expected revision 7, current is 9.',
+          expected_revision: 7,
+          current_revision: 9,
+        }),
+      )
+      .mockResolvedValueOnce({ revision: 10, model_key: 'gpt-5' });
+
+    renderCard();
+    await waitFor(() => expect(screen.getByTestId('edit-model-gpt-5-btn')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId('edit-model-gpt-5-btn'));
+    fireEvent.click(await screen.findByTestId('edit-sheet-restore-default-btn'));
+    fireEvent.click(await screen.findByTestId('restore-default-confirm-btn'));
+
+    await waitFor(() => expect(h.restoreTeamCatalogModelDefault).toHaveBeenCalledTimes(1));
+    expect(await screen.findByTestId('edit-sheet-revision-conflict')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByTestId('edit-sheet-conflict-resubmit-btn')).toBeEnabled());
+
+    // Clicking conflict retry MUST execute restore-default again (never updateTeamCatalogModel)
+    fireEvent.click(screen.getByTestId('edit-sheet-conflict-resubmit-btn'));
+    await waitFor(() => expect(h.restoreTeamCatalogModelDefault).toHaveBeenCalledTimes(2));
+    expect(h.updateTeamCatalogModel).not.toHaveBeenCalled();
+    expect(h.restoreTeamCatalogModelDefault.mock.calls[1]).toEqual([
+      'gpt-5',
+      { expected_revision: 9, comment: undefined },
+    ]);
+  });
+
+  it('updates Antigravity max output using max_output_tokens without swapping to max_tokens and sends null when clearing notional cached_input', async () => {
+    renderCard();
+    await waitFor(() => expect(screen.getByTestId('edit-model-gemini-4-neon-high-oauth-btn')).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId('edit-model-gemini-4-neon-high-oauth-btn'));
+    await screen.findByTestId('team-model-edit-sheet');
+
+    // 1. Update max output on Antigravity model -> writes max_output_tokens directly
+    expect((screen.getByTestId('edit-model-max-tokens-input') as HTMLInputElement).value).toBe('65536');
+    fireEvent.change(screen.getByTestId('edit-model-max-tokens-input'), { target: { value: '131072' } });
+    // 2. Clear ONLY notional cached_input -> sends explicit cached_input: null while keeping input & output
+    expect((screen.getByTestId('edit-model-notional-cached') as HTMLInputElement).value).toBe('0.15');
+    fireEvent.change(screen.getByTestId('edit-model-notional-cached'), { target: { value: '' } });
+
+    fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
+    await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(1));
+    const sentPayload = h.updateTeamCatalogModel.mock.calls[0][1];
+    expect(sentPayload.parameters).toEqual({ max_output_tokens: 131072 });
+    expect(sentPayload.dalton_meta?.notional_pricing).toMatchObject({
+      input: 1.5,
+      output: 6,
+      cached_input: null,
     });
   });
 
@@ -879,10 +975,11 @@ describe('TeamModelCatalogCard', () => {
     });
     await waitFor(() => expect(screen.queryByTestId('team-model-edit-sheet')).toBeNull());
 
-    // 4. Clear subscription notional pricing -> submits dalton_meta.notional_pricing: null
+    // 4. Clear all subscription notional pricing rates -> submits dalton_meta.notional_pricing: null
     fireEvent.click(screen.getByTestId('edit-model-gemini-4-neon-high-oauth-btn'));
     await screen.findByTestId('team-model-edit-sheet');
     fireEvent.change(screen.getByTestId('edit-model-notional-input'), { target: { value: '' } });
+    fireEvent.change(screen.getByTestId('edit-model-notional-cached'), { target: { value: '' } });
     fireEvent.change(screen.getByTestId('edit-model-notional-output'), { target: { value: '' } });
     fireEvent.click(screen.getByTestId('edit-sheet-save-btn'));
     await waitFor(() => expect(h.updateTeamCatalogModel).toHaveBeenCalledTimes(4));

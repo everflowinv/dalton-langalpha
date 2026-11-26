@@ -13,13 +13,69 @@
  */
 import { mockAPI, resetMockServer, test, expect } from './fixtures.js';
 
+const BASE_E2E_OTHER_PREFERENCE = {
+  default_model_scope: 'new_threads',
+  onboarding: {
+    version: 1,
+    pageIntrosSeen: { chat: 1, thread: 1, dashboard: 1 },
+    gettingStartedDoneAt: {},
+    gettingStartedDismissedAt: 1,
+    lastSeenReleaseVersion: null,
+    firstRunAt: 1,
+  },
+};
+
 function makeAdminOverrides({
   capabilities = ['native_oauth_sync'],
   profile = 'everflow',
   catalogState,
   modelsState,
+  prefsState,
 }) {
+  const prefs = prefsState ?? {
+    theme: 'dark',
+    locale: 'en-US',
+    timezone: 'America/New_York',
+    model_preference: { preferred_model: 'gpt-5' },
+    other_preference: { ...BASE_E2E_OTHER_PREFERENCE },
+  };
   return {
+    'GET /users/me': {
+      user_id: 'admin-user-1',
+      name: 'Admin',
+      email: 'admin@example.com',
+      onboarding_completed: true,
+      has_api_key: true,
+      has_oauth_token: false,
+    },
+    'GET /users/me/preferences': async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: {
+          'X-Dalton-Catalog-Revision': String(modelsState.current().catalog_revision ?? 1),
+        },
+        body: JSON.stringify(prefs),
+      });
+    },
+    'PUT /users/me/preferences': async (route) => {
+      const body = route.request().postDataJSON() ?? {};
+      if (body.model_preference && typeof body.model_preference === 'object') {
+        prefs.model_preference = { ...(prefs.model_preference || {}), ...body.model_preference };
+      }
+      Object.assign(prefs, {
+        ...body,
+        ...(prefs.model_preference ? { model_preference: prefs.model_preference } : {}),
+      });
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: {
+          'X-Dalton-Catalog-Revision': String(modelsState.current().catalog_revision ?? 1),
+        },
+        body: JSON.stringify(prefs),
+      });
+    },
     'GET /dalton/capabilities': {
       profile,
       capabilities,
@@ -29,8 +85,8 @@ function makeAdminOverrides({
     'GET /dalton/credentials/status': {
       sharing: 'team',
       enabled: true,
-      holder_user_id: 'local-dev-user',
-      credential_user_id: 'local-dev-user',
+      holder_user_id: 'admin-user-1',
+      credential_user_id: 'admin-user-1',
       is_pm: true,
       can_disconnect: true,
       can_invite: true,
@@ -98,6 +154,87 @@ function makeAdminOverrides({
   };
 }
 
+function makeMemberOverrides({
+  capabilities = [],
+  profile = 'core',
+  modelsState,
+}) {
+  return {
+    'GET /users/me': {
+      user_id: 'member-user-2',
+      name: 'Member',
+      email: 'member@example.com',
+      onboarding_completed: true,
+      has_api_key: true,
+      has_oauth_token: false,
+    },
+    'GET /users/me/preferences': async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: {
+          'X-Dalton-Catalog-Revision': String(modelsState.current().catalog_revision ?? 1),
+        },
+        body: JSON.stringify({
+          theme: 'dark',
+          locale: 'en-US',
+          timezone: 'America/New_York',
+          model_preference: { preferred_model: 'gpt-5' },
+          other_preference: { ...BASE_E2E_OTHER_PREFERENCE },
+        }),
+      });
+    },
+    'GET /dalton/capabilities': {
+      profile,
+      capabilities,
+      brand_name: profile === 'core' ? 'Dalton' : 'Everflow',
+      ticker_logos: false,
+    },
+    'GET /dalton/credentials/status': {
+      sharing: 'team',
+      enabled: true,
+      holder_user_id: 'admin-user-1',
+      credential_user_id: 'admin-user-1',
+      is_pm: false,
+      can_disconnect: false,
+      can_invite: false,
+      caller_tier: 'internal',
+      auth_mode: 'oss',
+    },
+    'GET /users/me/api-keys': {
+      byok_enabled: true,
+      providers: [
+        {
+          provider: 'openai',
+          display_name: 'OpenAI',
+          access_type: 'api_key',
+          has_key: true,
+          masked_key: 'sk-...1234',
+        },
+      ],
+    },
+    'GET /dalton/team-models': async (route) => {
+      await route.fulfill({
+        status: 403,
+        contentType: 'application/json',
+        body: JSON.stringify({ detail: 'Admin access required' }),
+      });
+    },
+    'GET /models': async (route) => {
+      modelsState.fetchCount += 1;
+      const snapshot = modelsState.current();
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        headers: {
+          'X-Dalton-Catalog-Revision': String(snapshot.catalog_revision ?? 1),
+        },
+        body: JSON.stringify(snapshot),
+      });
+    },
+  };
+}
+
 test.describe('Team Model Catalog Batch 2 E2E', () => {
   test.beforeEach(async () => {
     await resetMockServer();
@@ -105,7 +242,9 @@ test.describe('Team Model Catalog Batch 2 E2E', () => {
 
   test('admin adds model -> immediately visible; idle foreground member refetches within 5-minute refetchInterval', async ({
     page,
-    context,
+    browser,
+    baseURL,
+    mockServer,
   }) => {
     let rev = 1;
     const extraModels = [];
@@ -211,65 +350,88 @@ test.describe('Team Model Catalog Batch 2 E2E', () => {
       }),
     };
 
-    // 1. Open an idle foreground member page on Settings -> Model (with model selector visible)
+    // 1. Open an independent non-admin member browser context on Settings -> Model
     // using a controllable clock BEFORE the admin adds a model.
-    const memberPage = await context.newPage();
-    await memberPage.clock.install();
-    const memberModelsState = {
-      fetchCount: 0,
-      current: () => adminModelsState.current(),
-    };
-    await mockAPI(
-      memberPage,
-      makeAdminOverrides({
-        profile: 'core',
-        capabilities: [],
-        catalogState,
-        modelsState: memberModelsState,
-      }),
+    const memberContext = await browser.newContext({ baseURL });
+    const appApiPort = Number(process.env.E2E_MOCK_PORT);
+    const workerMockPort = new URL(mockServer).port;
+    await memberContext.route(`http://127.0.0.1:${appApiPort}/**`, (route) => {
+      const url = new URL(route.request().url());
+      url.port = workerMockPort;
+      return route.fallback({ url: url.href });
+    });
+    await memberContext.route(/^https:\/\/fonts\.(?:googleapis|gstatic)\.com\//, (route) =>
+      route.request().url().startsWith('https://fonts.googleapis.com/')
+        ? route.fulfill({ status: 200, contentType: 'text/css', body: '' })
+        : route.fulfill({ status: 404, body: '' }),
     );
-    await memberPage.goto('/settings?tab=models');
-    await expect.poll(() => memberModelsState.fetchCount).toBeGreaterThanOrEqual(1);
-    await expect(memberPage.locator('select option', { hasText: 'GPT-5' }).first()).toBeAttached();
-    await expect(memberPage.locator('select option', { hasText: 'GPT-5 Research Preview' })).toHaveCount(0);
-    const initialMemberFetches = memberModelsState.fetchCount;
+    const memberPage = await memberContext.newPage();
+    try {
+      await memberPage.clock.install();
+      const memberModelsState = {
+        fetchCount: 0,
+        current: () => adminModelsState.current(),
+      };
+      await mockAPI(
+        memberPage,
+        makeMemberOverrides({
+          profile: 'core',
+          capabilities: [],
+          modelsState: memberModelsState,
+        }),
+      );
+      await memberPage.goto('/settings?tab=model');
+      await expect.poll(() => memberModelsState.fetchCount).toBeGreaterThanOrEqual(1);
+      // Confirm member session is genuinely non-admin (Team Models admin section is absent)
+      await expect(memberPage.locator('a.page-rail-link[href*="tab=teamModels"]')).toHaveCount(0);
+      await expect(memberPage.locator('select option', { hasText: 'GPT-5' }).first()).toBeAttached();
+      await expect(memberPage.locator('select option', { hasText: 'GPT-5 Research Preview' })).toHaveCount(0);
+      const initialMemberFetches = memberModelsState.fetchCount;
 
-    // 2. Admin saves a new model in Settings -> immediately visible in admin catalog AND selectable in model picker
-    await mockAPI(
-      page,
-      makeAdminOverrides({
-        profile: 'core',
-        capabilities: [],
-        catalogState,
-        modelsState: adminModelsState,
-      }),
-    );
-    await page.goto('/settings?tab=teamModels#dalton-team-model-catalog');
-    await expect(page.getByTestId('dalton-team-model-catalog-card')).toBeVisible();
-    await page.getByTestId('team-catalog-add-model-btn').click();
-    await expect(page.getByTestId('team-model-edit-sheet')).toBeVisible();
+      // 2. Admin saves a new model in Settings -> immediately visible in admin catalog AND selectable in-app without page reload
+      await mockAPI(
+        page,
+        makeAdminOverrides({
+          profile: 'core',
+          capabilities: [],
+          catalogState,
+          modelsState: adminModelsState,
+        }),
+      );
+      await page.goto('/settings?tab=teamModels#dalton-team-model-catalog');
+      await expect(page.getByTestId('dalton-team-model-catalog-card')).toBeVisible();
+      await page.getByTestId('team-catalog-add-model-btn').click();
+      await expect(page.getByTestId('team-model-edit-sheet')).toBeVisible();
 
-    await page.getByTestId('edit-model-provider-select').selectOption('openai');
-    await page.getByTestId('edit-model-key-input').fill('gpt-5-research-preview');
-    await page.getByTestId('edit-model-display-name-input').fill('GPT-5 Research Preview');
-    await page.getByTestId('edit-model-id-input').fill('gpt-5-research-preview');
-    await page.getByTestId('edit-model-cash-input').fill('2.0');
-    await page.getByTestId('edit-model-cash-output').fill('8.0');
-    await page.getByTestId('edit-sheet-save-btn').click();
+      await page.getByTestId('edit-model-provider-select').selectOption('openai');
+      await page.getByTestId('edit-model-key-input').fill('gpt-5-research-preview');
+      await page.getByTestId('edit-model-display-name-input').fill('GPT-5 Research Preview');
+      await page.getByTestId('edit-model-id-input').fill('gpt-5-research-preview');
+      await page.getByTestId('edit-model-cash-input').fill('2.0');
+      await page.getByTestId('edit-model-cash-output').fill('8.0');
+      await page.getByTestId('edit-sheet-save-btn').click();
 
-    await expect(page.getByTestId('catalog-model-row-gpt-5-research-preview')).toBeVisible();
+      await expect(page.getByTestId('catalog-model-row-gpt-5-research-preview')).toBeVisible();
 
-    // Admin switches to Settings -> Model tab and confirms the new model is immediately selectable
-    await page.goto('/settings?tab=models');
-    await expect(page.locator('select option', { hasText: 'GPT-5 Research Preview' }).first()).toBeAttached();
+      // Switch in-app via the Settings rail (no page.goto reload) and select the newly added model
+      await page.locator('a.page-rail-link[href*="tab=model"]').first().click();
+      await expect(page).toHaveURL(/\/settings\?tab=model/);
+      const primarySelect = page
+        .locator('select', { has: page.locator('option[value="gpt-5-research-preview"]') })
+        .first();
+      await expect(primarySelect).toBeVisible();
+      await primarySelect.selectOption('gpt-5-research-preview');
+      await expect(primarySelect).toHaveValue('gpt-5-research-preview');
 
-    // 3. Keep memberPage completely idle in the foreground (zero clicks/keys/focus) and fast-forward 5 minutes
-    await memberPage.clock.fastForward(5 * 60_000 + 1_000);
-    await expect.poll(() => memberModelsState.fetchCount).toBeGreaterThan(initialMemberFetches);
-    await expect(
-      memberPage.locator('select option', { hasText: 'GPT-5 Research Preview' }).first(),
-    ).toBeAttached();
-    await memberPage.close();
+      // 3. Keep memberPage completely idle in the foreground (zero clicks/keys/focus) and fast-forward 5 minutes
+      await memberPage.clock.fastForward(5 * 60_000 + 1_000);
+      await expect.poll(() => memberModelsState.fetchCount).toBeGreaterThan(initialMemberFetches);
+      await expect(
+        memberPage.locator('select option[value="gpt-5-research-preview"]').first(),
+      ).toBeAttached();
+    } finally {
+      await memberContext.close();
+    }
   });
 
   test('setup entrypoints respect server dalton_setup_candidates and empty curated fallback in Everflow vs Core', async ({

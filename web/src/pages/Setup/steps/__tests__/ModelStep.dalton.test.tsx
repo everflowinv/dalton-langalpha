@@ -1,11 +1,18 @@
-// DALTON-HOOK(team-model-catalog): verify ModelStep holds both members and admins on /setup/model when Everflow curated setup is empty, while Core uses fallback models
+// DALTON-HOOK(team-model-catalog): verify ModelStep holds non-admin members on contact-admin notice when Everflow curated setup is empty while preserving policy-permitted connections/subscriptions for admins
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import type { AccountPolicy } from '@/types/api';
 
 const h = vi.hoisted(() => ({
   models: 'langalpha_models' as 'langalpha_models' | 'subscription_or_key',
+  policy: null as AccountPolicy | null,
+  planGroups: [] as Array<{
+    group: string;
+    display_name: string;
+    variants: Array<{ provider: string; display_name: string }>;
+  }>,
   team: {
     shared: true,
     available: false,
@@ -69,15 +76,15 @@ vi.mock('@/hooks/useConfiguredProviders', async (importOriginal) => ({
 }));
 
 vi.mock('@/hooks/useProviderCatalog', () => ({
-  useProviderCatalog: () => ({ planGroups: [] }),
+  useProviderCatalog: () => ({ planGroups: h.planGroups }),
 }));
 
 vi.mock('@/hooks/useAccount', async () => {
   const { allows } = await import('@/lib/accountRules');
   const who = { start: 'Your organization', mid: 'your organization' };
   return {
-    useAccount: () => ({ policy: null, setterName: () => who }),
-    useRule: (rule: Parameters<typeof allows>[1]) => ({ allowed: allows(null, rule), who }),
+    useAccount: () => ({ policy: h.policy, setterName: () => who }),
+    useRule: (rule: Parameters<typeof allows>[1]) => ({ allowed: allows(h.policy, rule), who }),
   };
 });
 
@@ -116,6 +123,8 @@ function renderModelStep() {
 beforeEach(() => {
   vi.clearAllMocks();
   h.models = 'langalpha_models';
+  h.policy = null;
+  h.planGroups = [];
   h.team = {
     shared: true,
     available: false,
@@ -139,11 +148,39 @@ describe('ModelStep (Dalton curated setup alignment)', () => {
     expect(screen.queryByTestId('where')).toBeNull();
   });
 
-  it('holds admin (canManage: true) on /setup/model with empty curated notice when server dalton_setup_candidates is [] in Everflow', () => {
+  it('keeps admin (canManage: true) on SubscriptionStep with policy-permitted subscriptions and key connections when server returns empty curated candidates and providers', () => {
     h.team.canManage = true;
+    // Exact server shape when Everflow curated setup is empty: both arrays are []
+    h.team.daltonSetupCandidates = [];
+    h.team.daltonCuratedProviders = [];
     renderModelStep();
-    expect(screen.getByTestId('setup-model-team-models-empty')).toBeInTheDocument();
+    expect(screen.queryByTestId('setup-model-team-models-empty')).toBeNull();
     expect(screen.queryByTestId('where')).toBeNull();
+    expect(screen.getByRole('button', { name: /Google Antigravity/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /ChatGPT/i })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Claude/i })).toBeInTheDocument();
+    expect(screen.getByTestId('setup-sub-api-key')).toBeInTheDocument();
+  });
+
+  it('respects account policy restrictions for admin when Everflow curated setup is empty', () => {
+    h.team.canManage = true;
+    h.team.daltonSetupCandidates = [];
+    h.team.daltonCuratedProviders = [];
+    h.policy = {
+      models: { allowed: null },
+      own_model_access: {
+        api_keys: false,
+        subscriptions: true,
+      },
+      public_links: true,
+      trading: true,
+      own_machines: true,
+      user_connectors: true,
+    } as AccountPolicy;
+    renderModelStep();
+    expect(screen.queryByTestId('setup-model-team-models-empty')).toBeNull();
+    expect(screen.getByRole('button', { name: /Google Antigravity/i })).toBeInTheDocument();
+    expect(screen.queryByTestId('setup-sub-api-key')).toBeNull();
   });
 
   it('lets admin (canManage: true) reach SubscriptionStep when team credentials are empty but curated candidates exist', () => {

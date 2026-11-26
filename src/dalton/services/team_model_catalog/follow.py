@@ -175,11 +175,9 @@ async def stop_following() -> None:
 def _should_stamp_catalog_revision_path(path: str) -> bool:
     if path == "/api/v1/users/me/preferences":
         return True
-    if path.startswith("/api/v1/threads/") and (
-        path.endswith("/messages") or path.endswith("/messages/stream")
-    ):
-        return True
-    return False
+    return path.startswith("/api/v1/threads/") and path.endswith(
+        ("/messages", "/messages/stream", "/retry")
+    )
 
 
 class CatalogRevisionHeaderMiddleware:

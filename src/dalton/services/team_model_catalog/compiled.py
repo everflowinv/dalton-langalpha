@@ -85,8 +85,12 @@ def deep_merge_patch_with_null_delete(target: dict[str, Any], patch: Mapping[str
     for key, value in patch.items():
         if value is None:
             target.pop(key, None)
-        elif isinstance(value, Mapping) and isinstance(target.get(key), dict):
-            deep_merge_patch_with_null_delete(target[key], value)
+        elif isinstance(value, Mapping):
+            existing = target.get(key)
+            if not isinstance(existing, dict):
+                existing = {}
+                target[key] = existing
+            deep_merge_patch_with_null_delete(existing, value)
         else:
             target[key] = copy.deepcopy(value)
 
@@ -301,8 +305,13 @@ def _merge_db_payload_layer(
                     if clear_pricing:
                         patch_copy.pop("pricing", None)
                     elif isinstance(patch_copy.get("pricing"), Mapping):
-                        patch_copy["pricing"] = normalize_cash_pricing_card(patch_copy["pricing"])
-                    _deep_merge_patch(card, patch_copy)
+                        raw_p_patch = dict(patch_copy["pricing"])
+                        if "cache_read" in raw_p_patch:
+                            cr_val = raw_p_patch.pop("cache_read")
+                            if raw_p_patch.get("cached_input") is None and cr_val is not None:
+                                raw_p_patch["cached_input"] = cr_val
+                        patch_copy["pricing"] = raw_p_patch
+                    deep_merge_patch_with_null_delete(card, patch_copy)
                     if clear_pricing:
                         card.pop("pricing", None)
                     elif isinstance(card.get("pricing"), Mapping):

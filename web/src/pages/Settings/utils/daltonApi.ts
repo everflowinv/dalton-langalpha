@@ -949,6 +949,7 @@ export interface TeamCatalogModelItem {
   model_key: string;
   model_id: string;
   provider: string;
+  provider_sdk?: string | null;
   provider_display_name: string;
   provider_connected: boolean;
   catalog_defined_provider: boolean;
@@ -1016,7 +1017,6 @@ export interface TeamCatalogRevisionRecord {
   revision: number;
   action: string;
   target_keys: string[];
-  payload?: Record<string, unknown>;
   payload_sha256: string;
   diff_summary: Record<string, unknown>;
   side_effects: Array<Record<string, unknown>>;

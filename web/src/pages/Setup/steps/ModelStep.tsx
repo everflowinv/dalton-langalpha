@@ -52,15 +52,14 @@ export default function ModelStep() {
   if (!flow.answers) return <Navigate to="/setup" replace />;
   const effectiveModels = effectiveModelsAnswer(flow.answers.models, team.available);
   if (isDaltonBuild && team.available) return <Navigate to="/setup/default" replace />;
-  // DALTON-HOOK(team-model-catalog): in Everflow, when the live catalog revision defines zero curated candidates (`[]`),
-  // hold everyone (including admins) on /setup/model with a contact-admin notice instead of bouncing to an empty
-  // /setup/default; when curated candidates exist and team credentials are simply not configured yet (`team.empty`),
-  // hold non-admin members while keeping admins in SubscriptionStep so they can connect initial credentials.
+  // DALTON-HOOK(team-model-catalog): in Everflow, when the live catalog revision defines zero curated candidates (`[]`)
+  // or team credentials are not configured yet (`team.empty`), hold non-admin members on /setup/model with a contact-admin
+  // notice; keep admins (canManage) in SubscriptionStep with policy-permitted connections and subscriptions.
   const everflowCuratedEmpty = isDaltonEverflowCuratedEmpty(
     team.daltonProfile,
     team.daltonSetupCandidates,
   );
-  if (everflowCuratedEmpty || (isDaltonBuild && team.empty && !team.canManage)) {
+  if ((everflowCuratedEmpty || (isDaltonBuild && team.empty)) && !team.canManage) {
     return (
       <div data-testid="setup-model-team-models-empty">
         <WizardStepHeader
@@ -76,7 +75,8 @@ export default function ModelStep() {
     );
   }
   if (isDaltonBuild && effectiveModels === 'claude_code') return <Navigate to="/setup/use" replace />;
-  if (effectiveModels === 'langalpha_models' && !(isDaltonBuild && team.empty)) {
+  // DALTON-HOOK(team-model-catalog): keep admins on SubscriptionStep when Everflow curated setup is empty instead of bouncing to empty /setup/default
+  if (effectiveModels === 'langalpha_models' && !(isDaltonBuild && (team.empty || everflowCuratedEmpty))) {
     return <Navigate to="/setup/default" replace />;
   }
   if (effectiveModels !== 'claude_code') {
@@ -86,6 +86,7 @@ export default function ModelStep() {
         teamModelsAvailable={team.available}
         daltonProfile={team.daltonProfile}
         daltonCuratedProviders={team.daltonCuratedProviders}
+        canManage={team.canManage}
       />
     );
   }
@@ -276,17 +277,19 @@ function ClaudeCodeTokenStep({ flow, askConsent }: { flow: Flow; askConsent: boo
 
 // DALTON-HOOK(dalton-setup): pass teamModelsAvailable to AnswersStrip
 // DALTON-HOOK(standalone-core): pass daltonProfile to Dalton helper for Core/Everflow control config
-// DALTON-HOOK(team-model-catalog): pass version-aligned `daltonCuratedProviders` into getDaltonModelStepConfig
+// DALTON-HOOK(team-model-catalog): pass version-aligned `daltonCuratedProviders` and `canManage` into getDaltonModelStepConfig
 function SubscriptionStep({
   flow,
   teamModelsAvailable,
   daltonProfile,
   daltonCuratedProviders,
+  canManage,
 }: {
   flow: Flow;
   teamModelsAvailable: boolean;
   daltonProfile?: string | null;
   daltonCuratedProviders?: readonly string[];
+  canManage?: boolean;
 }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -311,6 +314,7 @@ function SubscriptionStep({
     ownKeys,
     configured,
     curatedProviders: resolveDaltonCuratedProviders(daltonCuratedProviders),
+    canManage,
   });
 
   // Back from a connect page with what it connected: that becomes the

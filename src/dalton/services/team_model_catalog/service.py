@@ -168,25 +168,41 @@ def _prune_oauth_from_value(value: Any) -> Any:
     return copy.deepcopy(value)
 
 
+_PUBLIC_REVISION_RECORD_FIELDS = (
+    "revision",
+    "action",
+    "target_keys",
+    "payload_sha256",
+    "diff_summary",
+    "side_effects",
+    "comment",
+    "restored_from",
+    "actor_user_id",
+    "actor_label",
+    "created_at",
+)
+
+
 def sanitize_revision_record_for_capabilities(
     rec: Mapping[str, Any],
     *,
     oauth_sync_enabled: bool,
 ) -> dict[str, Any]:
-    """Prune ``*-oauth`` identifiers from revision audit fields when ``native_oauth_sync`` is off.
+    """Project UI-only revision metadata and prune ``*-oauth`` identifiers when ``native_oauth_sync`` is off.
 
-    Preserves revision number, action, timestamps, and rollback metadata so Core
-    deployments keep full version history and rollback entrypoints without leaking
-    Everflow OAuth model or provider names.
+    Never returns raw historical ``payload`` (including historical model parameters) to
+    the browser; rollback continues to read the full revision row server-side via
+    ``get_catalog_revision``.
     """
-    out = copy.deepcopy(dict(rec))
+    out: dict[str, Any] = {
+        field: copy.deepcopy(rec[field])
+        for field in _PUBLIC_REVISION_RECORD_FIELDS
+        if field in rec
+    }
     if oauth_sync_enabled:
         return out
 
     from src.dalton.llm.overlay import _is_oauth_model_key
-    from src.dalton.services.team_model_catalog.compiled import (
-        _filter_payload_for_oauth_disabled,
-    )
 
     raw_targets = out.get("target_keys")
     if isinstance(raw_targets, list):
@@ -207,10 +223,6 @@ def sanitize_revision_record_for_capabilities(
             for eff in raw_effects
             if not _contains_oauth_identifier(eff)
         ]
-
-    raw_payload = out.get("payload")
-    if isinstance(raw_payload, Mapping):
-        out["payload"] = _filter_payload_for_oauth_disabled(raw_payload)
 
     return out
 
@@ -646,6 +658,7 @@ async def get_team_catalog_overview() -> dict[str, Any]:
                 "model_key": key,
                 "model_id": model_id,
                 "provider": prov,
+                "provider_sdk": prov_info.get("sdk"),
                 "provider_display_name": prov_info.get("display_name") or prov,
                 "provider_connected": prov in connected_providers,
                 "catalog_defined_provider": is_variant,
@@ -1436,17 +1449,21 @@ async def update_catalog_model(
                 card_id = str(merged_entry.get("model_id") or key)
                 card_patch: dict[str, Any] = {}
                 if data.pricing is not None:
-                    raw_p = data.pricing.model_dump(exclude_none=True)
+                    raw_p = data.pricing.model_dump(exclude_unset=True)
                     pm_extra: dict[str, Any] = {}
                     for mf in ("source_kind", "estimated", "source", "source_url", "verified_at", "note"):
                         if mf in raw_p:
                             pm_extra[mf] = raw_p.pop(mf)
-                    card_patch["pricing"] = normalize_cash_pricing_card(raw_p) or {}
+                    if "cache_read" in raw_p:
+                        cr_val = raw_p.pop("cache_read")
+                        if raw_p.get("cached_input") is None and cr_val is not None:
+                            raw_p["cached_input"] = cr_val
+                    card_patch["pricing"] = raw_p
                     if pm_extra:
                         card_patch["pricing_meta"] = pm_extra
                 if data.pricing_meta is not None:
                     card_patch.setdefault("pricing_meta", {}).update(
-                        data.pricing_meta.model_dump(exclude_none=True)
+                        data.pricing_meta.model_dump(exclude_unset=True)
                     )
                 # Update team-added card in place if present, else write to providers.model_overrides
                 prov_block = next_payload.setdefault("providers", {})
@@ -1455,14 +1472,19 @@ async def update_catalog_model(
                 if isinstance(team_cards, list):
                     for tc in team_cards:
                         if isinstance(tc, dict) and norm_id(str(tc.get("id"))) == norm_id(card_id):
-                            tc.update(card_patch)
+                            deep_merge_patch_with_null_delete(tc, card_patch)
+                            if isinstance(tc.get("pricing"), Mapping):
+                                tc["pricing"] = normalize_cash_pricing_card(tc["pricing"]) or {}
                             updated_in_place = True
                             break
                 if not updated_in_place:
                     if existing_card is not None:
-                        prov_block.setdefault("model_overrides", {}).setdefault(prov, {})[
-                            str(existing_card.get("id") or card_id)
-                        ] = card_patch
+                        target_card_ov = (
+                            prov_block.setdefault("model_overrides", {})
+                            .setdefault(prov, {})
+                            .setdefault(str(existing_card.get("id") or card_id), {})
+                        )
+                        _merge_model_override_patch(target_card_ov, card_patch)
                     else:
                         new_card = _build_pricing_card_dict(
                             card_id, str(merged_entry.get("display_name") or key), data
@@ -1472,7 +1494,7 @@ async def update_catalog_model(
 
             if dm_patch is not None:
                 cur_dm = next_payload.setdefault("dalton_meta", {}).setdefault(key, {})
-                cur_dm.update(dm_patch)
+                _merge_model_override_patch(cur_dm, dm_patch)
 
             if "task_costs_bound" in data.model_fields_set:
                 next_payload.setdefault("task_costs", {}).setdefault("bounds", {})[key] = (

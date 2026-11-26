@@ -99,14 +99,17 @@ export function getDaltonModelStepConfig(params: {
   ownKeys: boolean;
   configured: ReadonlySet<string>;
   curatedProviders: ReadonlySet<string>;
+  canManage?: boolean;
 }): DaltonModelStepConfig {
   const curatedOnly = isDaltonCuratedOnly(params.dalton, params.daltonProfile);
+  const curatedEmptyForAdmin =
+    curatedOnly && Boolean(params.canManage) && params.curatedProviders.size === 0;
   const canContinue = !curatedOnly || [...params.configured].some((p) => params.curatedProviders.has(p));
   return {
     curatedOnly,
-    showPlanGroups: !curatedOnly && params.ownKeys,
-    showApiKeyLink: !curatedOnly && params.ownKeys,
-    allowedSignIns: curatedOnly ? params.curatedProviders : undefined,
+    showPlanGroups: (!curatedOnly || curatedEmptyForAdmin) && params.ownKeys,
+    showApiKeyLink: (!curatedOnly || curatedEmptyForAdmin) && params.ownKeys,
+    allowedSignIns: curatedOnly && !curatedEmptyForAdmin ? params.curatedProviders : undefined,
     canContinue,
   };
 }

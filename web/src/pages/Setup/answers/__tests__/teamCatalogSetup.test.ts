@@ -177,6 +177,33 @@ describe('team catalog setup alignment (dalton_setup_candidates & dalton_curated
       curatedProviders: resolveDaltonCuratedProviders([]),
     });
     expect(efModelStep.canContinue).toBe(false);
+    expect(efModelStep.allowedSignIns?.size).toBe(0);
+
+    // Admin with empty server dalton_curated_providers keeps policy-permitted sign-ins & key connections
+    const efAdminModelStep = getDaltonModelStepConfig({
+      dalton: true,
+      daltonProfile: 'everflow',
+      ownKeys: true,
+      configured: new Set(),
+      curatedProviders: resolveDaltonCuratedProviders([]),
+      canManage: true,
+    });
+    expect(efAdminModelStep.allowedSignIns).toBeUndefined();
+    expect(efAdminModelStep.showPlanGroups).toBe(true);
+    expect(efAdminModelStep.showApiKeyLink).toBe(true);
+    expect(efAdminModelStep.canContinue).toBe(false);
+
+    const efAdminNoKeysStep = getDaltonModelStepConfig({
+      dalton: true,
+      daltonProfile: 'everflow',
+      ownKeys: false,
+      configured: new Set(),
+      curatedProviders: resolveDaltonCuratedProviders([]),
+      canManage: true,
+    });
+    expect(efAdminNoKeysStep.allowedSignIns).toBeUndefined();
+    expect(efAdminNoKeysStep.showPlanGroups).toBe(false);
+    expect(efAdminNoKeysStep.showApiKeyLink).toBe(false);
 
     // Core: falls back to resolveDaltonCoreFallbackModels (excludes text_only)
     expect(

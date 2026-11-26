@@ -202,8 +202,12 @@ export function TeamModelCatalogCard() {
           provider: m.provider,
           displayName: m.provider_display_name || m.provider,
           isVariant: m.catalog_defined_provider,
+          sdk: m.provider_sdk ?? undefined,
           billing: m.dalton_meta?.billing === 'subscription' ? 'subscription' : 'cash',
         });
+      } else if (m.provider_sdk && !map.get(m.provider)?.sdk) {
+        const existing = map.get(m.provider)!;
+        map.set(m.provider, { ...existing, sdk: m.provider_sdk });
       }
     }
     return [...map.values()].sort((a, b) => a.displayName.localeCompare(b.displayName));
@@ -1046,7 +1050,13 @@ export function TeamModelCatalogCard() {
         supportedVariantSdks={supportedVariantSdks}
         curatedSetup={data?.curated_setup ?? null}
         effectiveCuratedCandidates={data?.dalton_setup_candidates ?? []}
-        onRefreshCatalog={() => void catalogQuery.refetch()}
+        onRefreshCatalog={async () => {
+          const res = await catalogQuery.refetch();
+          if (res.isError || !res.data) {
+            throw res.error ?? new Error('Catalog refresh failed');
+          }
+          return res.data.revision;
+        }}
         onSaved={(message) => setNotice({ tone: 'success', message })}
       />
 

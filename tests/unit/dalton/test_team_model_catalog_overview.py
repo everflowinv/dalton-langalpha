@@ -120,19 +120,24 @@ def _sample_upstream_providers() -> dict[str, Any]:
     }
 
 
+_ORIG_GET_COMPILED_CATALOG_ASYNC = compiled_mod.get_compiled_catalog_async
+_ORIG_LIST_CATALOG_PROVIDER_CREDENTIALS = service_mod.list_catalog_provider_credentials
+_ORIG_GET_CATALOG_ROW = service_mod.get_catalog_row
+
+
 def _patch_overview_dependencies(
     monkeypatch: pytest.MonkeyPatch,
     compiled: Any,
     *,
     creds: dict[str, dict[str, Any]] | None = None,
 ) -> None:
-    get_compiled_mock = create_autospec(compiled_mod.get_compiled_catalog_async, return_value=compiled)
+    get_compiled_mock = create_autospec(_ORIG_GET_COMPILED_CATALOG_ASYNC, return_value=compiled)
     list_creds_mock = create_autospec(
-        service_mod.list_catalog_provider_credentials,
+        _ORIG_LIST_CATALOG_PROVIDER_CREDENTIALS,
         return_value=creds or {},
     )
     get_row_mock = create_autospec(
-        service_mod.get_catalog_row,
+        _ORIG_GET_CATALOG_ROW,
         return_value={
             "revision": compiled.revision,
             "legacy_sync_import_status": compiled.legacy_sync_import_status,
@@ -302,6 +307,7 @@ def _patch_tx_catalog_env(
     existing_creds: dict[str, dict[str, Any]] | None = None,
     upstream_models: dict[str, Any] | None = None,
     upstream_providers: dict[str, Any] | None = None,
+    native_overlay: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     conn = _RecordingTxConn()
     state: dict[str, Any] = {
@@ -318,6 +324,7 @@ def _patch_tx_catalog_env(
     }
     u_models = upstream_models if upstream_models is not None else _sample_upstream_models()
     u_providers = upstream_providers if upstream_providers is not None else _sample_upstream_providers()
+    n_overlay = native_overlay if native_overlay is not None else {}
 
     @asynccontextmanager
     async def _fake_get_db_connection(existing=None):
@@ -327,7 +334,7 @@ def _patch_tx_catalog_env(
 
     def _compile_with_sample(payload, **kwargs):
         kwargs.setdefault("oauth_sync_enabled", True)
-        kwargs.setdefault("native_overlay_override", {})
+        kwargs.setdefault("native_overlay_override", n_overlay)
         kwargs.setdefault("upstream_models_override", u_models)
         kwargs.setdefault("upstream_providers_override", u_providers)
         return orig_compile(payload, **kwargs)
@@ -706,9 +713,311 @@ def test_catalog_revision_header_middleware_emits_only_when_dalton_enabled(
     monkeypatch.setattr(dalton_settings, "is_dalton_enabled", lambda: True)
     pref_headers = dict(asyncio.run(_invoke("/api/v1/users/me/preferences")))
     chat_headers = dict(asyncio.run(_invoke("/api/v1/threads/th-1/messages")))
+    stream_headers = dict(asyncio.run(_invoke("/api/v1/threads/th-1/messages/stream")))
+    retry_headers = dict(asyncio.run(_invoke("/api/v1/threads/th-1/retry")))
     assert pref_headers.get(b"x-dalton-catalog-revision") == b"15"
     assert chat_headers.get(b"x-dalton-catalog-revision") == b"15"
+    assert stream_headers.get(b"x-dalton-catalog-revision") == b"15"
+    assert retry_headers.get(b"x-dalton-catalog-revision") == b"15"
 
     monkeypatch.setattr(dalton_settings, "is_dalton_enabled", lambda: False)
     disabled_headers = dict(asyncio.run(_invoke("/api/v1/users/me/preferences")))
+    disabled_retry_headers = dict(asyncio.run(_invoke("/api/v1/threads/th-1/retry")))
     assert b"x-dalton-catalog-revision" not in disabled_headers
+    assert b"x-dalton-catalog-revision" not in disabled_retry_headers
+
+
+def test_revision_detail_omits_historical_payload_and_secrets_while_preserving_ui_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import Response
+
+    from src.dalton.app import router as dalton_router
+    from src.dalton.database import team_model_catalog as db_catalog
+
+    historical_row = {
+        "revision": 4,
+        "action": "update_model",
+        "target_keys": ["gpt-5", "claude-test-oauth"],
+        "payload_sha256": "sha-4",
+        "diff_summary": {"updated": "gpt-5", "fields": ["display_name"]},
+        "side_effects": [
+            {"kind": "automation", "id": "auto-1", "before": {"llm_model": "gpt-4o"}},
+        ],
+        "comment": "Historical tweak",
+        "restored_from": None,
+        "actor_user_id": "admin-1",
+        "actor_label": "Alice",
+        "created_at": "2026-11-24T09:00:00Z",
+        "payload": {
+            "schema": CATALOG_SCHEMA,
+            "models": {
+                "gpt-5": {
+                    "model_id": "gpt-5",
+                    "provider": "openai",
+                    "parameters": {
+                        "max_tokens": 16384,
+                        "api_key": "hist-api-key-secret",
+                        "accessToken": "hist-camel-access-token",
+                        "aws_session_token": "hist-aws-session-token",
+                        "aws-session-token": "hist-hyphen-aws-token",
+                        "clientSecret": "hist-client-secret",
+                        "x-api-key": "hist-hyphen-api-key",
+                        "default_headers": {"Authorization": "Bearer hist-bearer-secret"},
+                    },
+                }
+            },
+        },
+    }
+
+    orig_require_admin = dalton_router._require_catalog_admin
+    orig_get_revision = db_catalog.get_catalog_revision
+    orig_get_compiled = compiled_mod.get_compiled_catalog_async
+
+    for oauth_enabled in (True, False):
+        compiled = compile_catalog_from_payload(
+            {"schema": CATALOG_SCHEMA},
+            revision=12,
+            oauth_sync_enabled=oauth_enabled,
+            native_overlay_override={},
+            upstream_models_override=_sample_upstream_models(),
+            upstream_providers_override=_sample_upstream_providers(),
+        )
+        require_admin_mock = create_autospec(orig_require_admin, return_value=None)
+        get_rev_mock = create_autospec(orig_get_revision, return_value=historical_row)
+        get_compiled_mock = create_autospec(orig_get_compiled, return_value=compiled)
+        monkeypatch.setattr(dalton_router, "_require_catalog_admin", require_admin_mock)
+        monkeypatch.setattr(db_catalog, "get_catalog_revision", get_rev_mock)
+        monkeypatch.setattr(compiled_mod, "get_compiled_catalog_async", get_compiled_mock)
+
+        resp = Response()
+        result = asyncio.run(
+            dalton_router.get_team_model_revision_endpoint(
+                revision=4, response=resp, user_id="admin-1"
+            )
+        )
+        assert result["current_revision"] == 12
+        assert resp.headers.get("X-Dalton-Catalog-Revision") == "12"
+        record = result["revision_record"]
+        assert "payload" not in record
+        assert record["revision"] == 4
+        assert record["action"] == "update_model"
+        assert record["diff_summary"] == {"updated": "gpt-5", "fields": ["display_name"]}
+        assert record["side_effects"] == historical_row["side_effects"]
+        assert record["comment"] == "Historical tweak"
+        assert record["actor_user_id"] == "admin-1"
+        assert record["actor_label"] == "Alice"
+        assert record["created_at"] == "2026-11-24T09:00:00Z"
+        if oauth_enabled:
+            assert record["target_keys"] == ["gpt-5", "claude-test-oauth"]
+        else:
+            assert record["target_keys"] == ["gpt-5"]
+
+        serialized = str(result)
+        for forbidden in (
+            "api_key",
+            "hist-api-key-secret",
+            "accessToken",
+            "aws_session_token",
+            "aws-session-token",
+            "clientSecret",
+            "x-api-key",
+            "hist-camel-access-token",
+            "hist-aws-session-token",
+            "hist-hyphen-aws-token",
+            "hist-client-secret",
+            "hist-hyphen-api-key",
+            "hist-bearer-secret",
+        ):
+            assert forbidden not in serialized
+
+
+def test_antigravity_max_output_tokens_update_applies_to_request_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from langchain_core.messages import HumanMessage
+
+    from src.dalton.llm.providers.antigravity import build_antigravity_client
+
+    antigravity_models = {
+        **_sample_upstream_models(),
+        "gemini-4-neon-high-oauth": {
+            "model_id": "gemini-4-neon",
+            "provider": "antigravity-oauth",
+            "display_name": "Gemini 4 Neon",
+            "visible": True,
+            "context": 1000000,
+            "input_modalities": ["text", "image"],
+            "parameters": {"max_output_tokens": 65536},
+        },
+    }
+    antigravity_providers = {
+        "provider_config": {
+            **_sample_upstream_providers()["provider_config"],
+            "antigravity": {
+                "sdk": "antigravity",
+                "base_url": "https://daily-cloudcode-pa.googleapis.com",
+                "env_key": None,
+                "access_type": "oauth",
+                "display_name": "Google Antigravity",
+                "variants": {
+                    "antigravity-oauth": {
+                        "display_name": "Antigravity (Google Account)",
+                        "billing": "subscription",
+                    }
+                },
+            },
+        },
+        "models": _sample_upstream_providers()["models"],
+    }
+    state = _patch_tx_catalog_env(
+        monkeypatch,
+        initial_payload={"schema": CATALOG_SCHEMA},
+        initial_revision=3,
+        upstream_models=antigravity_models,
+        upstream_providers=antigravity_providers,
+    )
+
+    parsed = CatalogModelUpsertInput.model_validate(
+        {
+            "parameters": {"max_output_tokens": 131072},
+            "expected_revision": 3,
+        }
+    )
+    res = asyncio.run(
+        service_mod.update_catalog_model(
+            actor_user_id="admin-1",
+            model_key="gemini-4-neon-high-oauth",
+            data=parsed,
+        )
+    )
+    assert res["revision"] == 4
+
+    saved_payload = state["saved_calls"][0]["payload"]
+    compiled = compiled_mod.compile_catalog_from_payload(
+        saved_payload,
+        revision=4,
+        oauth_sync_enabled=True,
+        native_overlay_override={},
+        upstream_models_override=antigravity_models,
+        upstream_providers_override=antigravity_providers,
+    )
+    entry = compiled.model_config.get_model_config("gemini-4-neon-high-oauth")
+    assert entry is not None
+    assert entry["parameters"]["max_output_tokens"] == 131072
+    assert "max_tokens" not in entry["parameters"]
+
+    class _LLMStub:
+        def __init__(self) -> None:
+            self.model = entry["model_id"]
+            self.parameters = dict(entry["parameters"])
+            self.default_headers: dict[str, str] = {}
+
+        def _resolve_api_key(self) -> str:
+            return "oauth-access-token"
+
+        def _resolve_base_url(self, key: str) -> dict[str, str]:
+            return {key: "https://daily-cloudcode-pa.googleapis.com"}
+
+    client = build_antigravity_client(_LLMStub())
+    assert client.max_output_tokens == 131072
+    req_payload = client._build_payload([HumanMessage(content="Hello")])
+    assert req_payload["request"]["generationConfig"]["maxOutputTokens"] == 131072
+
+
+def test_clearing_optional_notional_and_cash_cached_input_overrides_factory_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    native_overlay = {
+        "models": {
+            "gemini-4-neon-high-oauth": {
+                "model_id": "gemini-4-neon",
+                "provider": "claude-oauth",
+                "display_name": "Gemini 4 Neon",
+                "visible": True,
+                "context": 1000000,
+                "input_modalities": ["text"],
+            }
+        },
+        "dalton_meta": {
+            "gemini-4-neon-high-oauth": {
+                "billing": "subscription",
+                "tool_calling": True,
+                "notional_pricing": {
+                    "input": 1.5,
+                    "cached_input": 0.15,
+                    "output": 6.0,
+                    "source_kind": "official",
+                },
+            }
+        },
+    }
+    clean_upstream_models = _sample_upstream_models()
+    clean_upstream_models["gpt-5"]["parameters"] = {"max_tokens": 16384}
+
+    state = _patch_tx_catalog_env(
+        monkeypatch,
+        initial_payload={"schema": CATALOG_SCHEMA},
+        initial_revision=5,
+        upstream_models=clean_upstream_models,
+        native_overlay=native_overlay,
+    )
+
+    # 1. Clear ONLY notional cached_input on factory subscription model
+    sub_update = CatalogModelUpsertInput.model_validate(
+        {
+            "dalton_meta": {
+                "notional_pricing": {
+                    "input": 1.5,
+                    "output": 6.0,
+                    "cached_input": None,
+                    "source_kind": "official",
+                }
+            },
+            "expected_revision": 5,
+        }
+    )
+    sub_res = asyncio.run(
+        service_mod.update_catalog_model(
+            actor_user_id="admin-1",
+            model_key="gemini-4-neon-high-oauth",
+            data=sub_update,
+        )
+    )
+    assert sub_res["revision"] == 6
+
+    # 2. Clear ONLY cash cached_input on factory cash model gpt-5
+    cash_update = CatalogModelUpsertInput.model_validate(
+        {
+            "pricing": {
+                "input": 2.5,
+                "output": 10.0,
+                "cached_input": None,
+                "unit": "per_1m_tokens",
+            },
+            "expected_revision": 6,
+        }
+    )
+    cash_res = asyncio.run(
+        service_mod.update_catalog_model(
+            actor_user_id="admin-1",
+            model_key="gpt-5",
+            data=cash_update,
+        )
+    )
+    assert cash_res["revision"] == 7
+
+    compiled = compiled_mod.compile_catalog_from_payload(state["row"]["payload"], revision=7)
+    _patch_overview_dependencies(monkeypatch, compiled)
+    overview = asyncio.run(service_mod.get_team_catalog_overview())
+    by_key = {m["model_key"]: m for m in overview["models"]}
+
+    sub_notional = by_key["gemini-4-neon-high-oauth"]["dalton_meta"]["notional_pricing"]
+    assert sub_notional["input"] == 1.5
+    assert sub_notional["output"] == 6.0
+    assert "cached_input" not in sub_notional
+
+    cash_pricing = by_key["gpt-5"]["pricing"]
+    assert cash_pricing["input"] == 2.5
+    assert cash_pricing["output"] == 10.0
+    assert "cached_input" not in cash_pricing

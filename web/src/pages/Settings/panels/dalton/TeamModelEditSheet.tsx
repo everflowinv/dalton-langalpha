@@ -14,6 +14,7 @@ import type {
   TeamCatalogModelItem,
   TeamCatalogModelUpsertPayload,
   TeamCatalogPriceSourceKind,
+  TeamCatalogPricingCard,
   TeamCatalogProviderVariant,
   TeamCatalogReasoningConfig,
   TeamCatalogTestCallResponse,
@@ -59,7 +60,7 @@ export interface TeamModelEditSheetProps {
   supportedVariantSdks: readonly string[];
   curatedSetup: readonly string[] | null;
   effectiveCuratedCandidates: readonly string[];
-  onRefreshCatalog?: () => void;
+  onRefreshCatalog?: () => Promise<number | void> | void;
   onSaved?: (message: string) => void;
 }
 
@@ -79,9 +80,145 @@ const COMPACTION_PROFILES = [
 const RATING_VALUES = ['', '1', '2', '3', '4', '5'] as const;
 
 type GroupId = 'identity' | 'pricing' | 'window' | 'reasoning' | 'ratings';
+type ConflictOperation = 'save_model' | 'restore_default' | 'save_variant';
+
+interface RevisionConflictState {
+  requiredRevision: number;
+  operation: ConflictOperation;
+  refreshStatus: 'loading' | 'ready' | 'failed';
+}
+
+interface ConflictFieldItem {
+  key: string;
+  label: string;
+  latestValue: string;
+  draftValue?: string;
+  directConflict: boolean;
+}
+
+interface EditBaseline {
+  modelId: string;
+  provider: string;
+  displayName: string;
+  visible: boolean;
+  promptGuidance: string;
+  contextWindow: string;
+  maxTokens: string;
+  hasMaxTokensKey: boolean;
+  hasMaxOutputTokensKey: boolean;
+  compactionProfile: string;
+  modalities: string[];
+  hasReasoning: boolean;
+  reasoningEfforts: string[];
+  reasoningDefault: string;
+  reasoningWrite: string;
+  intelligence: string;
+  speed: string;
+  plainLanguage: string;
+  billingMode: TeamCatalogBillingMode;
+  cashInput: string;
+  cashCachedInput: string;
+  cashCache5m: string;
+  cashCache1h: string;
+  cashOutput: string;
+  hasNotionalPricing: boolean;
+  notionalInput: string;
+  notionalCachedInput: string;
+  notionalOutput: string;
+  notionalRef: string;
+  priceSourceKind: TeamCatalogPriceSourceKind;
+  priceEstimated: boolean;
+  priceSourceUrl: string;
+  priceVerifiedAt: string;
+  priceNote: string;
+  hasTaskCostBound: boolean;
+  taskCostRefModel: string;
+  taskCostTimes: string;
+  family: string;
+  series: string;
+  toolCalling: ToolCallingTriState;
+  inCuratedSetup: boolean;
+}
+
+const EMPTY_BASELINE: EditBaseline = {
+  modelId: '',
+  provider: '',
+  displayName: '',
+  visible: true,
+  promptGuidance: '',
+  contextWindow: '200000',
+  maxTokens: '',
+  hasMaxTokensKey: false,
+  hasMaxOutputTokensKey: false,
+  compactionProfile: '',
+  modalities: ['text', 'image'],
+  hasReasoning: false,
+  reasoningEfforts: ['low', 'medium', 'high'],
+  reasoningDefault: 'medium',
+  reasoningWrite: '',
+  intelligence: '',
+  speed: '',
+  plainLanguage: '',
+  billingMode: 'cash',
+  cashInput: '',
+  cashCachedInput: '',
+  cashCache5m: '',
+  cashCache1h: '',
+  cashOutput: '',
+  hasNotionalPricing: false,
+  notionalInput: '',
+  notionalCachedInput: '',
+  notionalOutput: '',
+  notionalRef: '',
+  priceSourceKind: 'official',
+  priceEstimated: false,
+  priceSourceUrl: '',
+  priceVerifiedAt: '',
+  priceNote: '',
+  hasTaskCostBound: false,
+  taskCostRefModel: '',
+  taskCostTimes: '',
+  family: '',
+  series: '',
+  toolCalling: 'unknown',
+  inCuratedSetup: false,
+};
 
 function isOAuthKey(value: string): boolean {
   return value.trim().toLowerCase().endsWith('-oauth');
+}
+
+function sameStringList(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((v, idx) => v === b[idx]);
+}
+
+function resolveMaxOutputParamKey(
+  providerName: string,
+  providerSdk?: string | null,
+  existingParams?: Record<string, unknown> | null,
+): 'max_output_tokens' | 'max_tokens' {
+  const sdk = (providerSdk ?? '').trim().toLowerCase();
+  if (sdk === 'antigravity' || sdk === 'gemini') {
+    return 'max_output_tokens';
+  }
+  const prov = providerName.trim().toLowerCase();
+  if (
+    prov === 'antigravity-oauth' ||
+    prov === 'antigravity' ||
+    prov === 'gemini' ||
+    prov === 'google'
+  ) {
+    return 'max_output_tokens';
+  }
+  if (
+    existingParams &&
+    existingParams.max_output_tokens != null &&
+    existingParams.max_tokens == null
+  ) {
+    return 'max_output_tokens';
+  }
+  return 'max_tokens';
 }
 
 function parseOptionalNumber(raw: string): number | null {
@@ -96,6 +233,34 @@ function parseOptionalInt(raw: string): number | null {
   if (!trimmed) return null;
   const n = Number.parseInt(trimmed, 10);
   return Number.isSafeInteger(n) ? n : null;
+}
+
+function formatReasoningSummary(
+  enabled: boolean,
+  efforts: readonly string[],
+  defaultEffort: string,
+  writePath: string,
+): string {
+  if (!enabled || efforts.length === 0) return '-';
+  const parts = [`${efforts.join('/')} (${defaultEffort || efforts[0]})`];
+  if (writePath.trim()) parts.push(writePath.trim());
+  return parts.join(' · ');
+}
+
+function formatRateTuple(
+  input: string,
+  cached: string,
+  output: string,
+  extra?: string[],
+): string {
+  const parts: string[] = [];
+  if (input.trim()) parts.push(`in=${input.trim()}`);
+  if (cached.trim()) parts.push(`cached=${cached.trim()}`);
+  if (output.trim()) parts.push(`out=${output.trim()}`);
+  for (const item of extra ?? []) {
+    if (item) parts.push(item);
+  }
+  return parts.length > 0 ? parts.join(', ') : '-';
 }
 
 /**
@@ -213,26 +378,10 @@ export function TeamModelEditSheet({
   const [toolCalling, setToolCalling] = useState<ToolCallingTriState>('unknown');
   const [series, setSeries] = useState('');
   const [inCuratedSetup, setInCuratedSetup] = useState(false);
-  const [initialInCuratedSetup, setInitialInCuratedSetup] = useState(false);
 
-  // Opened snapshot baseline (for expected_revision & explicit null-clear tracking)
+  // Opened snapshot baseline (for expected_revision, diff-only edit patches & conflict comparison)
   const [baseRevision, setBaseRevision] = useState(revision);
-  const [initialToolCalling, setInitialToolCalling] = useState<ToolCallingTriState>('unknown');
-  const [initialPromptGuidance, setInitialPromptGuidance] = useState('');
-  const [initialCompactionProfile, setInitialCompactionProfile] = useState('');
-  const [initialMaxTokens, setInitialMaxTokens] = useState('');
-  const [initialHasMaxOutputTokensKey, setInitialHasMaxOutputTokensKey] = useState(false);
-  const [initialHasReasoning, setInitialHasReasoning] = useState(false);
-  const [initialReasoningWrite, setInitialReasoningWrite] = useState('');
-  const [initialHasTaskCostBound, setInitialHasTaskCostBound] = useState(false);
-  const [initialHasNotionalPricing, setInitialHasNotionalPricing] = useState(false);
-  const [initialNotionalRef, setInitialNotionalRef] = useState('');
-  const [initialIntelligence, setInitialIntelligence] = useState('');
-  const [initialSpeed, setInitialSpeed] = useState('');
-  const [initialPlainLanguage, setInitialPlainLanguage] = useState('');
-  const [initialFamily, setInitialFamily] = useState('');
-  const [initialSeries, setInitialSeries] = useState('');
-  const [initialBillingMode, setInitialBillingMode] = useState<TeamCatalogBillingMode>('cash');
+  const [baseline, setBaseline] = useState<EditBaseline>(EMPTY_BASELINE);
 
   // Comment, test-call result, conflict state & confirmations
   const [comment, setComment] = useState('');
@@ -240,7 +389,7 @@ export function TeamModelEditSheet({
   const [testResult, setTestResult] = useState<TeamCatalogTestCallResponse | null>(null);
   const [confirmRestoreDefault, setConfirmRestoreDefault] = useState(false);
   const [confirmLastCurated, setConfirmLastCurated] = useState(false);
-  const [revisionConflict, setRevisionConflict] = useState<{ currentRevision: number } | null>(null);
+  const [revisionConflict, setRevisionConflict] = useState<RevisionConflictState | null>(null);
 
   const visibleProviderOptions = useMemo(
     () =>
@@ -315,14 +464,15 @@ export function TeamModelEditSheet({
 
     if ((mode === 'edit' || mode === 'clone') && snapModel) {
       const clonedKey = mode === 'clone' ? `${snapModel.model_key}-copy` : snapModel.model_key;
+      const initDisplayName =
+        mode === 'clone' ? `${snapModel.display_name} (Copy)` : snapModel.display_name;
       setModelKey(clonedKey);
-      setDisplayName(mode === 'clone' ? `${snapModel.display_name} (Copy)` : snapModel.display_name);
+      setDisplayName(initDisplayName);
       setProvider(snapModel.provider);
       setModelId(snapModel.model_id);
       setVisible(snapModel.visible);
       const initPrompt = snapModel.prompt_guidance ?? '';
       setPromptGuidance(initPrompt);
-      setInitialPromptGuidance(initPrompt);
 
       const provMeta = visibleProviderOptions.find((p) => p.provider === snapModel.provider);
       setVariantBaseUrl(provMeta?.isVariant ? (provMeta.baseUrl ?? '') : '');
@@ -332,79 +482,88 @@ export function TeamModelEditSheet({
           ? 'subscription'
           : 'cash';
       setBillingMode(effBilling);
-      setInitialBillingMode(effBilling);
 
-      setCashInput(snapModel.pricing?.input != null ? String(snapModel.pricing.input) : '');
-      setCashCachedInput(
+      const initCashIn = snapModel.pricing?.input != null ? String(snapModel.pricing.input) : '';
+      const initCashCached =
         snapModel.pricing?.cached_input != null
           ? String(snapModel.pricing.cached_input)
           : snapModel.pricing?.cache_read != null
             ? String(snapModel.pricing.cache_read)
-            : '',
-      );
-      setCashCache5m(snapModel.pricing?.cache_5m != null ? String(snapModel.pricing.cache_5m) : '');
-      setCashCache1h(snapModel.pricing?.cache_1h != null ? String(snapModel.pricing.cache_1h) : '');
-      setCashOutput(snapModel.pricing?.output != null ? String(snapModel.pricing.output) : '');
+            : '';
+      const initCash5m = snapModel.pricing?.cache_5m != null ? String(snapModel.pricing.cache_5m) : '';
+      const initCash1h = snapModel.pricing?.cache_1h != null ? String(snapModel.pricing.cache_1h) : '';
+      const initCashOut = snapModel.pricing?.output != null ? String(snapModel.pricing.output) : '';
+      setCashInput(initCashIn);
+      setCashCachedInput(initCashCached);
+      setCashCache5m(initCash5m);
+      setCashCache1h(initCash1h);
+      setCashOutput(initCashOut);
 
       const np = snapModel.dalton_meta?.notional_pricing;
-      setNotionalInput(np?.input != null ? String(np.input) : '');
-      setNotionalCachedInput(np?.cached_input != null ? String(np.cached_input) : '');
-      setNotionalOutput(np?.output != null ? String(np.output) : '');
+      const initNotionalIn = np?.input != null ? String(np.input) : '';
+      const initNotionalCached =
+        np?.cached_input != null
+          ? String(np.cached_input)
+          : np?.cache_read != null
+            ? String(np.cache_read)
+            : '';
+      const initNotionalOut = np?.output != null ? String(np.output) : '';
       const initNotionalRef = snapModel.dalton_meta?.notional_ref ?? '';
+      setNotionalInput(initNotionalIn);
+      setNotionalCachedInput(initNotionalCached);
+      setNotionalOutput(initNotionalOut);
       setNotionalRef(initNotionalRef);
-      setInitialHasNotionalPricing(Boolean(np && (np.input != null || np.output != null || np.cached_input != null)));
-      setInitialNotionalRef(initNotionalRef);
 
       const pm = effBilling === 'subscription' ? np : snapModel.pricing_meta;
-      setPriceSourceKind((pm?.source_kind as TeamCatalogPriceSourceKind) || 'official');
-      setPriceEstimated(Boolean(pm?.estimated));
-      setPriceSourceUrl(pm?.source_url ?? '');
-      setPriceVerifiedAt(pm?.verified_at ?? '');
-      setPriceNote(pm?.note ?? pm?.source ?? '');
+      const initPriceKind = (pm?.source_kind as TeamCatalogPriceSourceKind) || 'official';
+      const initPriceEst = Boolean(pm?.estimated);
+      const initPriceUrl = pm?.source_url ?? '';
+      const initPriceVerified = pm?.verified_at ?? '';
+      const initPriceNote = pm?.note ?? pm?.source ?? '';
+      setPriceSourceKind(initPriceKind);
+      setPriceEstimated(initPriceEst);
+      setPriceSourceUrl(initPriceUrl);
+      setPriceVerifiedAt(initPriceVerified);
+      setPriceNote(initPriceNote);
 
-      setTaskCostRefModel(snapModel.task_costs_bound?.model ?? '');
-      setTaskCostTimes(
-        snapModel.task_costs_bound?.times != null ? String(snapModel.task_costs_bound.times) : '',
-      );
-      setInitialHasTaskCostBound(
-        Boolean(snapModel.task_costs_bound?.model && snapModel.task_costs_bound?.times != null),
-      );
+      const initTaskRef = snapModel.task_costs_bound?.model ?? '';
+      const initTaskTimes =
+        snapModel.task_costs_bound?.times != null ? String(snapModel.task_costs_bound.times) : '';
+      setTaskCostRefModel(initTaskRef);
+      setTaskCostTimes(initTaskTimes);
 
-      setContextWindow(snapModel.context != null ? String(snapModel.context) : '');
+      const initCtx = snapModel.context != null ? String(snapModel.context) : '';
+      setContextWindow(initCtx);
       const paramMax =
         (snapModel.parameters?.max_tokens as number | undefined) ??
         (snapModel.parameters?.max_output_tokens as number | undefined);
       const initMaxStr = paramMax != null ? String(paramMax) : '';
       setMaxTokens(initMaxStr);
-      setInitialMaxTokens(initMaxStr);
-      setInitialHasMaxOutputTokensKey(snapModel.parameters?.max_output_tokens != null);
       const initCompaction = snapModel.compaction_profile ?? '';
       setCompactionProfile(initCompaction);
-      setInitialCompactionProfile(initCompaction);
-      setModalities(snapModel.input_modalities?.length ? [...snapModel.input_modalities] : ['text']);
+      const initModalities = snapModel.input_modalities?.length
+        ? [...snapModel.input_modalities]
+        : ['text'];
+      setModalities(initModalities);
 
       const r = snapModel.reasoning;
       const hasReasoning = Boolean(r && Array.isArray(r.efforts) && r.efforts.length > 0);
+      const initEfforts = hasReasoning && r?.efforts ? [...r.efforts] : ['low', 'medium', 'high'];
+      const initDefaultEffort = r?.default ?? 'medium';
       const initWrite = typeof r?.write === 'string' ? r.write : '';
       setReasoningEnabled(hasReasoning);
-      setInitialHasReasoning(hasReasoning);
-      setReasoningEfforts(hasReasoning && r?.efforts ? [...r.efforts] : ['low', 'medium', 'high']);
-      setReasoningDefault(r?.default ?? 'medium');
+      setReasoningEfforts(initEfforts);
+      setReasoningDefault(initDefaultEffort);
       setReasoningWrite(initWrite);
-      setInitialReasoningWrite(initWrite);
 
       const initIntel = snapModel.intelligence != null ? String(snapModel.intelligence) : '';
       const initSpd = snapModel.speed != null ? String(snapModel.speed) : '';
       const initPlain = snapModel.plain_language != null ? String(snapModel.plain_language) : '';
       setIntelligence(initIntel);
-      setInitialIntelligence(initIntel);
       setSpeed(initSpd);
-      setInitialSpeed(initSpd);
       setPlainLanguage(initPlain);
-      setInitialPlainLanguage(initPlain);
       const initFam = snapModel.dalton_meta?.family ?? '';
       setFamily(initFam);
-      setInitialFamily(initFam);
       const initTc: ToolCallingTriState =
         snapModel.dalton_meta?.tool_calling === true
           ? 'true'
@@ -412,10 +571,8 @@ export function TeamModelEditSheet({
             ? 'false'
             : 'unknown';
       setToolCalling(initTc);
-      setInitialToolCalling(initTc);
       const initSer = snapModel.dalton_meta?.series ?? '';
       setSeries(initSer);
-      setInitialSeries(initSer);
 
       const isCurated =
         mode === 'edit' &&
@@ -423,7 +580,54 @@ export function TeamModelEditSheet({
           ? curatedSetup.includes(snapModel.model_key)
           : effectiveCuratedCandidates.includes(snapModel.model_key));
       setInCuratedSetup(isCurated);
-      setInitialInCuratedSetup(isCurated);
+
+      setBaseline({
+        modelId: snapModel.model_id,
+        provider: snapModel.provider,
+        displayName: initDisplayName,
+        visible: snapModel.visible,
+        promptGuidance: initPrompt,
+        contextWindow: initCtx,
+        maxTokens: initMaxStr,
+        hasMaxTokensKey: snapModel.parameters?.max_tokens != null,
+        hasMaxOutputTokensKey: snapModel.parameters?.max_output_tokens != null,
+        compactionProfile: initCompaction,
+        modalities: initModalities,
+        hasReasoning,
+        reasoningEfforts: initEfforts,
+        reasoningDefault: initDefaultEffort,
+        reasoningWrite: initWrite,
+        intelligence: initIntel,
+        speed: initSpd,
+        plainLanguage: initPlain,
+        billingMode: effBilling,
+        cashInput: initCashIn,
+        cashCachedInput: initCashCached,
+        cashCache5m: initCash5m,
+        cashCache1h: initCash1h,
+        cashOutput: initCashOut,
+        hasNotionalPricing: Boolean(
+          np && (np.input != null || np.output != null || np.cached_input != null || np.cache_read != null),
+        ),
+        notionalInput: initNotionalIn,
+        notionalCachedInput: initNotionalCached,
+        notionalOutput: initNotionalOut,
+        notionalRef: initNotionalRef,
+        priceSourceKind: initPriceKind,
+        priceEstimated: initPriceEst,
+        priceSourceUrl: initPriceUrl,
+        priceVerifiedAt: initPriceVerified,
+        priceNote: initPriceNote,
+        hasTaskCostBound: Boolean(
+          snapModel.task_costs_bound?.model && snapModel.task_costs_bound?.times != null,
+        ),
+        taskCostRefModel: initTaskRef,
+        taskCostTimes: initTaskTimes,
+        family: initFam,
+        series: initSer,
+        toolCalling: initTc,
+        inCuratedSetup: isCurated,
+      });
       return;
     }
 
@@ -437,10 +641,8 @@ export function TeamModelEditSheet({
     setModelId('');
     setVisible(true);
     setPromptGuidance('');
-    setInitialPromptGuidance('');
     const initBilling = defaultProvMeta?.billing ?? 'cash';
     setBillingMode(initBilling);
-    setInitialBillingMode(initBilling);
     setCashInput('');
     setCashCachedInput('');
     setCashCache5m('');
@@ -450,8 +652,6 @@ export function TeamModelEditSheet({
     setNotionalCachedInput('');
     setNotionalOutput('');
     setNotionalRef('');
-    setInitialHasNotionalPricing(false);
-    setInitialNotionalRef('');
     setPriceSourceKind('official');
     setPriceEstimated(false);
     setPriceSourceUrl('');
@@ -459,34 +659,26 @@ export function TeamModelEditSheet({
     setPriceNote('');
     setTaskCostRefModel('');
     setTaskCostTimes('');
-    setInitialHasTaskCostBound(false);
     setContextWindow('200000');
     setMaxTokens('');
-    setInitialMaxTokens('');
-    setInitialHasMaxOutputTokensKey(false);
     setCompactionProfile('');
-    setInitialCompactionProfile('');
     setModalities(['text', 'image']);
     setReasoningEnabled(false);
-    setInitialHasReasoning(false);
     setReasoningEfforts(['low', 'medium', 'high']);
     setReasoningDefault('medium');
     setReasoningWrite('');
-    setInitialReasoningWrite('');
     setIntelligence('');
-    setInitialIntelligence('');
     setSpeed('');
-    setInitialSpeed('');
     setPlainLanguage('');
-    setInitialPlainLanguage('');
     setFamily('');
-    setInitialFamily('');
     setToolCalling('unknown');
-    setInitialToolCalling('unknown');
     setSeries('');
-    setInitialSeries('');
     setInCuratedSetup(false);
-    setInitialInCuratedSetup(false);
+    setBaseline({
+      ...EMPTY_BASELINE,
+      provider: defaultProv,
+      billingMode: initBilling,
+    });
   };
 
   // Initialize form whenever sheet opens or opened snapshot changes (never reset on background catalog refresh)
@@ -594,13 +786,59 @@ export function TeamModelEditSheet({
     }
   };
 
-  const handleRestoreDefault = async () => {
+  const beginConflictRecovery = async (
+    requiredRevision: number,
+    operation: ConflictOperation,
+  ) => {
+    setRevisionConflict({
+      requiredRevision,
+      operation,
+      refreshStatus: 'loading',
+    });
+    if (!onRefreshCatalog) {
+      setRevisionConflict((prev) =>
+        prev && prev.requiredRevision === requiredRevision && prev.operation === operation
+          ? {
+              ...prev,
+              refreshStatus:
+                latestRevision !== undefined && latestRevision >= requiredRevision ? 'ready' : 'failed',
+            }
+          : prev,
+      );
+      return;
+    }
+    try {
+      const refreshedRev = await onRefreshCatalog();
+      const reachedTarget =
+        typeof refreshedRev === 'number' ? refreshedRev >= requiredRevision : true;
+      setRevisionConflict((prev) =>
+        prev && prev.requiredRevision === requiredRevision && prev.operation === operation
+          ? {
+              ...prev,
+              refreshStatus: reachedTarget ? 'ready' : 'failed',
+            }
+          : prev,
+      );
+    } catch {
+      setRevisionConflict((prev) =>
+        prev && prev.requiredRevision === requiredRevision && prev.operation === operation
+          ? {
+              ...prev,
+              refreshStatus: 'failed',
+            }
+          : prev,
+      );
+    }
+  };
+
+  const handleRestoreDefault = async (overrideExpectedRevision?: number) => {
     if (!model) return;
     setErrorMsg(null);
+    const targetExpectedRev = overrideExpectedRevision ?? baseRevision;
     try {
       await restoreDefaultMutation.mutateAsync({
         modelKey: model.model_key,
-        expected_revision: baseRevision,
+        expected_revision: targetExpectedRev,
         comment: comment.trim() || undefined,
       });
       onSaved?.(
@@ -612,10 +850,10 @@ export function TeamModelEditSheet({
     } catch (err) {
       const parsed = parseCatalogApiError(err, t('settings:dalton.teamCatalog.saveFailed'));
       if (parsed.code === 'revision_conflict') {
-        onRefreshCatalog?.();
-        setRevisionConflict({
-          currentRevision: parsed.currentRevision ?? latestRevision ?? baseRevision,
-        });
+        setConfirmRestoreDefault(false);
+        const requiredRev =
+          parsed.currentRevision ?? Math.max((latestRevision ?? targetExpectedRev), targetExpectedRev + 1);
+        void beginConflictRecovery(requiredRev, 'restore_default');
       }
       setErrorMsg(parsed.message);
     }
@@ -663,10 +901,9 @@ export function TeamModelEditSheet({
     } catch (err) {
       const parsed = parseCatalogApiError(err, t('settings:dalton.teamCatalog.saveFailed'));
       if (parsed.code === 'revision_conflict') {
-        onRefreshCatalog?.();
-        setRevisionConflict({
-          currentRevision: parsed.currentRevision ?? latestRevision ?? targetExpectedRev,
-        });
+        const requiredRev =
+          parsed.currentRevision ?? Math.max((latestRevision ?? targetExpectedRev), targetExpectedRev + 1);
+        void beginConflictRecovery(requiredRev, 'save_variant');
       }
       setErrorMsg(parsed.message);
     }
@@ -707,18 +944,33 @@ export function TeamModelEditSheet({
     setConfirmLastCurated(false);
 
     const targetExpectedRev = options?.overrideExpectedRevision ?? baseRevision;
+    const isEdit = mode === 'edit';
 
     try {
+      const cleanDisplayName = displayName.trim() || cleanKey;
       const payload: TeamCatalogModelUpsertPayload = {
-        model_id: cleanModelId,
-        provider: cleanProvider,
-        display_name: displayName.trim() || cleanKey,
-        visible,
         expected_revision: targetExpectedRev,
         comment: comment.trim() || undefined,
       };
-      if (mode === 'create' || mode === 'clone') {
+      if (!isEdit) {
         payload.model_key = cleanKey;
+        payload.model_id = cleanModelId;
+        payload.provider = cleanProvider;
+        payload.display_name = cleanDisplayName;
+        payload.visible = visible;
+      } else {
+        if (cleanModelId !== baseline.modelId.trim()) {
+          payload.model_id = cleanModelId;
+        }
+        if (cleanProvider !== baseline.provider.trim()) {
+          payload.provider = cleanProvider;
+        }
+        if (cleanDisplayName !== (baseline.displayName.trim() || cleanKey)) {
+          payload.display_name = cleanDisplayName;
+        }
+        if (visible !== baseline.visible) {
+          payload.visible = visible;
+        }
       }
 
       // Single-transaction inline catalog provider variant update (strictly from currently selected variant)
@@ -747,85 +999,130 @@ export function TeamModelEditSheet({
       }
 
       // Prompt guidance: explicit null deletes override when reset to default in edit mode
-      if (promptGuidance.trim()) {
-        payload.prompt_guidance = promptGuidance.trim();
-      } else if (mode === 'edit' && initialPromptGuidance) {
-        payload.prompt_guidance = null;
+      const cleanPrompt = promptGuidance.trim();
+      if (!isEdit) {
+        if (cleanPrompt) payload.prompt_guidance = cleanPrompt;
+      } else if (cleanPrompt !== baseline.promptGuidance.trim()) {
+        payload.prompt_guidance = cleanPrompt || null;
       }
 
-      if (ctxVal !== null) payload.context = ctxVal;
+      if (ctxVal !== null && (!isEdit || contextWindow.trim() !== baseline.contextWindow.trim())) {
+        payload.context = ctxVal;
+      }
 
       // Compaction profile: explicit null resets to auto in edit mode
-      if (compactionProfile) {
-        payload.compaction_profile = compactionProfile;
-      } else if (mode === 'edit' && initialCompactionProfile) {
-        payload.compaction_profile = null;
+      if (!isEdit) {
+        if (compactionProfile) payload.compaction_profile = compactionProfile;
+      } else if (compactionProfile !== baseline.compactionProfile) {
+        payload.compaction_profile = compactionProfile || null;
       }
 
-      if (modalities.length > 0) payload.input_modalities = modalities;
+      if (modalities.length > 0 && (!isEdit || !sameStringList(modalities, baseline.modalities))) {
+        payload.input_modalities = modalities;
+      }
 
-      // Parameters: send ONLY the edit-sheet max_tokens patch (never echo non-UI parameters)
+      // Parameters: update max output using the provider's actual parameter name without swapping keys
       if (maxTokVal !== null) {
-        if (mode !== 'edit' || maxTokens.trim() !== initialMaxTokens.trim()) {
-          payload.parameters = {
-            max_tokens: maxTokVal,
-            ...(initialHasMaxOutputTokensKey ? { max_output_tokens: null } : {}),
-          };
+        if (!isEdit || maxTokens.trim() !== baseline.maxTokens.trim()) {
+          const targetMaxKey = resolveMaxOutputParamKey(
+            cleanProvider,
+            selectedProviderMeta?.sdk ?? (cleanProvider === (model?.provider ?? '') ? model?.provider_sdk : null),
+            isEdit && cleanProvider === (model?.provider ?? '') ? model?.parameters : null,
+          );
+          if (targetMaxKey === 'max_output_tokens') {
+            payload.parameters = {
+              max_output_tokens: maxTokVal,
+              ...(isEdit && baseline.hasMaxTokensKey ? { max_tokens: null } : {}),
+            };
+          } else {
+            payload.parameters = {
+              max_tokens: maxTokVal,
+              ...(isEdit && baseline.hasMaxOutputTokensKey ? { max_output_tokens: null } : {}),
+            };
+          }
         }
-      } else if (mode === 'edit' && initialMaxTokens) {
+      } else if (isEdit && baseline.maxTokens.trim()) {
         payload.parameters = { max_tokens: null, max_output_tokens: null };
       }
 
       const intelVal = parseOptionalInt(intelligence);
       const speedVal = parseOptionalInt(speed);
       const plainVal = parseOptionalInt(plainLanguage);
-      if (intelVal !== null) {
-        payload.intelligence = intelVal;
-      } else if (mode === 'edit' && initialIntelligence) {
-        payload.intelligence = null;
-      }
-      if (speedVal !== null) {
-        payload.speed = speedVal;
-      } else if (mode === 'edit' && initialSpeed) {
-        payload.speed = null;
-      }
-      if (plainVal !== null) {
-        payload.plain_language = plainVal;
-      } else if (mode === 'edit' && initialPlainLanguage) {
-        payload.plain_language = null;
+      if (!isEdit) {
+        if (intelVal !== null) payload.intelligence = intelVal;
+        if (speedVal !== null) payload.speed = speedVal;
+        if (plainVal !== null) payload.plain_language = plainVal;
+      } else {
+        if (intelligence !== baseline.intelligence) {
+          payload.intelligence = intelVal;
+        }
+        if (speed !== baseline.speed) {
+          payload.speed = speedVal;
+        }
+        if (plainLanguage !== baseline.plainLanguage) {
+          payload.plain_language = plainVal;
+        }
       }
 
-      // Reasoning: turning off submits null; clearing write submits write: null
-      if (reasoningEnabled && reasoningEfforts.length > 0) {
-        const nextReasoning: TeamCatalogReasoningConfig = {
-          efforts: reasoningEfforts,
-          default: reasoningDefault || reasoningEfforts[0],
-        };
-        if (reasoningWrite.trim()) {
-          nextReasoning.write = reasoningWrite.trim();
-        } else if (mode === 'edit' && initialReasoningWrite) {
-          nextReasoning.write = null;
+      // Reasoning: only send when changed in edit mode; turning off submits null; clearing write submits write: null
+      const reasoningChanged =
+        !isEdit ||
+        reasoningEnabled !== baseline.hasReasoning ||
+        (reasoningEnabled &&
+          (!sameStringList(reasoningEfforts, baseline.reasoningEfforts) ||
+            reasoningDefault !== baseline.reasoningDefault ||
+            reasoningWrite.trim() !== baseline.reasoningWrite.trim()));
+      if (reasoningChanged) {
+        if (reasoningEnabled && reasoningEfforts.length > 0) {
+          const nextReasoning: TeamCatalogReasoningConfig = {
+            efforts: reasoningEfforts,
+            default: reasoningDefault || reasoningEfforts[0],
+          };
+          if (reasoningWrite.trim()) {
+            nextReasoning.write = reasoningWrite.trim();
+          } else if (isEdit && baseline.reasoningWrite.trim()) {
+            nextReasoning.write = null;
+          }
+          payload.reasoning = nextReasoning;
+        } else if (isEdit && baseline.hasReasoning) {
+          payload.reasoning = null;
         }
-        payload.reasoning = nextReasoning;
-      } else if (mode === 'edit' && initialHasReasoning) {
-        payload.reasoning = null;
       }
+
+      const priceMetaChanged =
+        priceSourceKind !== baseline.priceSourceKind ||
+        priceEstimated !== baseline.priceEstimated ||
+        priceSourceUrl.trim() !== baseline.priceSourceUrl.trim() ||
+        priceVerifiedAt.trim() !== baseline.priceVerifiedAt.trim() ||
+        priceNote.trim() !== baseline.priceNote.trim();
 
       const priceMeta = {
         source_kind: priceSourceKind,
         estimated: priceSourceKind === 'estimated' ? true : priceEstimated,
-        ...(priceSourceUrl.trim() ? { source_url: priceSourceUrl.trim() } : {}),
-        ...(priceVerifiedAt.trim() ? { verified_at: priceVerifiedAt.trim() } : {}),
-        ...(priceNote.trim() ? { note: priceNote.trim() } : {}),
+        ...(priceSourceUrl.trim()
+          ? { source_url: priceSourceUrl.trim() }
+          : isEdit && baseline.priceSourceUrl.trim()
+            ? { source_url: null }
+            : {}),
+        ...(priceVerifiedAt.trim()
+          ? { verified_at: priceVerifiedAt.trim() }
+          : isEdit && baseline.priceVerifiedAt.trim()
+            ? { verified_at: null }
+            : {}),
+        ...(priceNote.trim()
+          ? { note: priceNote.trim() }
+          : isEdit && baseline.priceNote.trim()
+            ? { note: null }
+            : {}),
       };
 
       const daltonMeta: NonNullable<TeamCatalogModelUpsertPayload['dalton_meta']> = {};
-      if (mode !== 'edit' || billingMode !== initialBillingMode) {
+      if (!isEdit || billingMode !== baseline.billingMode) {
         daltonMeta.billing = billingMode;
       }
       // Tri-state tool_calling: omit when unchanged in edit mode or unverified on create/clone
-      if (mode === 'edit') {
-        if (toolCalling !== initialToolCalling) {
+      if (isEdit) {
+        if (toolCalling !== baseline.toolCalling) {
           daltonMeta.tool_calling =
             toolCalling === 'true' ? true : toolCalling === 'false' ? false : null;
         }
@@ -834,18 +1131,18 @@ export function TeamModelEditSheet({
       }
 
       if (family.trim()) {
-        if (mode !== 'edit' || family.trim() !== initialFamily.trim()) {
+        if (!isEdit || family.trim() !== baseline.family.trim()) {
           daltonMeta.family = family.trim();
         }
-      } else if (mode === 'edit' && initialFamily) {
+      } else if (isEdit && baseline.family.trim()) {
         daltonMeta.family = null;
       }
       if (oauthSyncEnabled) {
         if (series.trim()) {
-          if (mode !== 'edit' || series.trim() !== initialSeries.trim()) {
+          if (!isEdit || series.trim() !== baseline.series.trim()) {
             daltonMeta.series = series.trim();
           }
-        } else if (mode === 'edit' && initialSeries) {
+        } else if (isEdit && baseline.series.trim()) {
           daltonMeta.series = null;
         }
       }
@@ -853,23 +1150,40 @@ export function TeamModelEditSheet({
       if (billingMode === 'cash') {
         const inRate = parseOptionalNumber(cashInput);
         const outRate = parseOptionalNumber(cashOutput);
-        if ((mode === 'create' || mode === 'clone') && (inRate === null || outRate === null)) {
+        const cachedRate = parseOptionalNumber(cashCachedInput);
+        const cache5mRate = parseOptionalNumber(cashCache5m);
+        const cache1hRate = parseOptionalNumber(cashCache1h);
+        if (!isEdit && (inRate === null || outRate === null)) {
           setErrorMsg(t('settings:dalton.teamCatalog.cashPricingRequired'));
           return;
         }
-        if (pricingTouched && (inRate !== null || outRate !== null)) {
+        const cashRatesChanged =
+          !isEdit ||
+          billingMode !== baseline.billingMode ||
+          cashInput.trim() !== baseline.cashInput.trim() ||
+          cashCachedInput.trim() !== baseline.cashCachedInput.trim() ||
+          cashCache5m.trim() !== baseline.cashCache5m.trim() ||
+          cashCache1h.trim() !== baseline.cashCache1h.trim() ||
+          cashOutput.trim() !== baseline.cashOutput.trim();
+        if ((cashRatesChanged || (pricingTouched && priceMetaChanged)) && (inRate !== null || outRate !== null)) {
           payload.pricing = {
             input: inRate ?? 0,
             output: outRate ?? 0,
-            ...(parseOptionalNumber(cashCachedInput) !== null
-              ? { cached_input: parseOptionalNumber(cashCachedInput) }
-              : {}),
-            ...(parseOptionalNumber(cashCache5m) !== null
-              ? { cache_5m: parseOptionalNumber(cashCache5m) }
-              : {}),
-            ...(parseOptionalNumber(cashCache1h) !== null
-              ? { cache_1h: parseOptionalNumber(cashCache1h) }
-              : {}),
+            ...(cachedRate !== null
+              ? { cached_input: cachedRate }
+              : isEdit && baseline.cashCachedInput.trim()
+                ? { cached_input: null }
+                : {}),
+            ...(cache5mRate !== null
+              ? { cache_5m: cache5mRate }
+              : isEdit && baseline.cashCache5m.trim()
+                ? { cache_5m: null }
+                : {}),
+            ...(cache1hRate !== null
+              ? { cache_1h: cache1hRate }
+              : isEdit && baseline.cashCache1h.trim()
+                ? { cache_1h: null }
+                : {}),
             unit: 'per_1m_tokens',
           };
           payload.pricing_meta = priceMeta;
@@ -878,25 +1192,42 @@ export function TeamModelEditSheet({
         const nIn = parseOptionalNumber(notionalInput);
         const nOut = parseOptionalNumber(notionalOutput);
         const nCached = parseOptionalNumber(notionalCachedInput);
-        if (nIn !== null || nOut !== null || nCached !== null) {
-          daltonMeta.notional_pricing = {
-            input: nIn ?? 0,
-            output: nOut ?? 0,
-            ...(nCached !== null ? { cached_input: nCached } : {}),
-            ...priceMeta,
-          };
-          daltonMeta.notional_ref = null;
-        } else if (notionalRef.trim()) {
-          daltonMeta.notional_ref = notionalRef.trim();
-          if (mode === 'edit' && initialHasNotionalPricing) {
-            daltonMeta.notional_pricing = null;
-          }
-        } else if (mode === 'edit') {
-          if (initialHasNotionalPricing) {
-            daltonMeta.notional_pricing = null;
-          }
-          if (initialNotionalRef) {
-            daltonMeta.notional_ref = null;
+        const notionalChanged =
+          !isEdit ||
+          billingMode !== baseline.billingMode ||
+          notionalInput.trim() !== baseline.notionalInput.trim() ||
+          notionalCachedInput.trim() !== baseline.notionalCachedInput.trim() ||
+          notionalOutput.trim() !== baseline.notionalOutput.trim() ||
+          notionalRef.trim() !== baseline.notionalRef.trim() ||
+          priceMetaChanged;
+        if (notionalChanged) {
+          if (nIn !== null || nOut !== null || nCached !== null) {
+            const nextNotional: TeamCatalogPricingCard = {
+              input: nIn ?? 0,
+              output: nOut ?? 0,
+              ...(nCached !== null
+                ? { cached_input: nCached }
+                : isEdit && baseline.notionalCachedInput.trim()
+                  ? { cached_input: null }
+                  : {}),
+              ...priceMeta,
+            };
+            daltonMeta.notional_pricing = nextNotional;
+            if (!isEdit || baseline.notionalRef.trim()) {
+              daltonMeta.notional_ref = null;
+            }
+          } else if (notionalRef.trim()) {
+            daltonMeta.notional_ref = notionalRef.trim();
+            if (isEdit && baseline.hasNotionalPricing) {
+              daltonMeta.notional_pricing = null;
+            }
+          } else if (isEdit) {
+            if (baseline.hasNotionalPricing) {
+              daltonMeta.notional_pricing = null;
+            }
+            if (baseline.notionalRef.trim()) {
+              daltonMeta.notional_ref = null;
+            }
           }
         }
       }
@@ -905,21 +1236,27 @@ export function TeamModelEditSheet({
       }
 
       const taskTimesVal = parseOptionalNumber(taskCostTimes);
-      if (taskCostRefModel.trim() && taskTimesVal !== null) {
-        payload.task_costs_bound = {
-          model: taskCostRefModel.trim(),
-          times: taskTimesVal,
-        };
-      } else if (mode === 'edit' && initialHasTaskCostBound) {
-        payload.task_costs_bound = null;
+      const taskCostChanged =
+        !isEdit ||
+        taskCostRefModel.trim() !== baseline.taskCostRefModel.trim() ||
+        taskCostTimes.trim() !== baseline.taskCostTimes.trim();
+      if (taskCostChanged) {
+        if (taskCostRefModel.trim() && taskTimesVal !== null) {
+          payload.task_costs_bound = {
+            model: taskCostRefModel.trim(),
+            times: taskTimesVal,
+          };
+        } else if (isEdit && baseline.hasTaskCostBound) {
+          payload.task_costs_bound = null;
+        }
       }
 
       // Single-transaction curated setup membership update when toggled
-      if (inCuratedSetup !== initialInCuratedSetup) {
+      if (inCuratedSetup !== baseline.inCuratedSetup) {
         payload.curated_setup_member = inCuratedSetup;
       }
 
-      if (mode === 'edit') {
+      if (isEdit) {
         await updateModelMutation.mutateAsync({ modelKey: cleanKey, payload });
       } else {
         await createModelMutation.mutateAsync(payload);
@@ -927,17 +1264,16 @@ export function TeamModelEditSheet({
 
       onSaved?.(
         t('settings:dalton.teamCatalog.modelSaveSuccess', {
-          name: displayName.trim() || cleanKey,
+          name: cleanDisplayName,
         }),
       );
       onClose();
     } catch (err) {
       const parsed = parseCatalogApiError(err, t('settings:dalton.teamCatalog.saveFailed'));
       if (parsed.code === 'revision_conflict') {
-        onRefreshCatalog?.();
-        setRevisionConflict({
-          currentRevision: parsed.currentRevision ?? latestRevision ?? targetExpectedRev,
-        });
+        const requiredRev =
+          parsed.currentRevision ?? Math.max((latestRevision ?? targetExpectedRev), targetExpectedRev + 1);
+        void beginConflictRecovery(requiredRev, 'save_model');
       }
       setErrorMsg(parsed.message);
     }
@@ -1001,10 +1337,238 @@ export function TeamModelEditSheet({
     );
   };
 
-  const resolvedLatestRevision = Math.max(
-    revisionConflict?.currentRevision ?? 0,
-    latestRevision ?? baseRevision,
+  const resolvedLatestRevision = revisionConflict
+    ? Math.max(revisionConflict.requiredRevision, latestRevision ?? 0)
+    : (latestRevision ?? baseRevision);
+  const conflictCatalogSynced = Boolean(
+    revisionConflict &&
+      revisionConflict.refreshStatus === 'ready' &&
+      latestRevision !== undefined &&
+      latestRevision >= revisionConflict.requiredRevision,
   );
+
+  const conflictedFields: ConflictFieldItem[] = (() => {
+    if (!revisionConflict || !conflictCatalogSynced) return [];
+    const items: ConflictFieldItem[] = [];
+    const pushIfRemoteChanged = (
+      key: string,
+      label: string,
+      openedVal: string,
+      latestVal: string,
+      draftVal: string,
+    ) => {
+      if (latestVal === openedVal) return;
+      const draftChanged = draftVal !== openedVal;
+      items.push({
+        key,
+        label,
+        latestValue: latestVal || '-',
+        ...(draftChanged ? { draftValue: draftVal || '-' } : {}),
+        directConflict: draftChanged && draftVal !== latestVal,
+      });
+    };
+
+    if (!isVariantOnly && model && latestModel) {
+      const visLabel = (v: boolean) =>
+        v ? t('settings:dalton.teamCatalog.filterVisible') : t('settings:dalton.teamCatalog.filterHidden');
+      pushIfRemoteChanged(
+        'display_name',
+        t('settings:dalton.teamCatalog.displayNameLabel'),
+        baseline.displayName,
+        latestModel.display_name,
+        displayName.trim() || modelKey.trim(),
+      );
+      pushIfRemoteChanged(
+        'model_id',
+        t('settings:dalton.teamCatalog.modelIdLabel'),
+        baseline.modelId,
+        latestModel.model_id,
+        modelId.trim(),
+      );
+      pushIfRemoteChanged(
+        'provider',
+        t('settings:dalton.teamCatalog.providerLabel'),
+        baseline.provider,
+        latestModel.provider,
+        provider.trim(),
+      );
+      pushIfRemoteChanged(
+        'visible',
+        t('settings:dalton.teamCatalog.visibleInPickerLabel'),
+        visLabel(baseline.visible),
+        visLabel(latestModel.visible),
+        visLabel(visible),
+      );
+      pushIfRemoteChanged(
+        'prompt_guidance',
+        t('settings:dalton.teamCatalog.promptGuidanceLabel'),
+        baseline.promptGuidance,
+        latestModel.prompt_guidance ?? '',
+        promptGuidance.trim(),
+      );
+      pushIfRemoteChanged(
+        'context',
+        t('settings:dalton.teamCatalog.contextWindowLabel'),
+        baseline.contextWindow,
+        latestModel.context != null ? String(latestModel.context) : '',
+        contextWindow.trim(),
+      );
+      const latestMax =
+        (latestModel.parameters?.max_tokens as number | undefined) ??
+        (latestModel.parameters?.max_output_tokens as number | undefined);
+      pushIfRemoteChanged(
+        'max_tokens',
+        t('settings:dalton.teamCatalog.maxOutputLabel'),
+        baseline.maxTokens,
+        latestMax != null ? String(latestMax) : '',
+        maxTokens.trim(),
+      );
+      pushIfRemoteChanged(
+        'compaction_profile',
+        t('settings:dalton.teamCatalog.compactionProfileLabel'),
+        baseline.compactionProfile,
+        latestModel.compaction_profile ?? '',
+        compactionProfile,
+      );
+      pushIfRemoteChanged(
+        'input_modalities',
+        t('settings:dalton.teamCatalog.modalitiesLabel'),
+        baseline.modalities.join(', '),
+        (latestModel.input_modalities?.length ? latestModel.input_modalities : ['text']).join(', '),
+        modalities.join(', '),
+      );
+      const lr = latestModel.reasoning;
+      const latestHasReasoning = Boolean(lr && Array.isArray(lr.efforts) && lr.efforts.length > 0);
+      pushIfRemoteChanged(
+        'reasoning',
+        t('settings:dalton.teamCatalog.reasoningEnabledLabel'),
+        formatReasoningSummary(
+          baseline.hasReasoning,
+          baseline.reasoningEfforts,
+          baseline.reasoningDefault,
+          baseline.reasoningWrite,
+        ),
+        formatReasoningSummary(
+          latestHasReasoning,
+          lr?.efforts ?? [],
+          lr?.default ?? '',
+          typeof lr?.write === 'string' ? lr.write : '',
+        ),
+        formatReasoningSummary(reasoningEnabled, reasoningEfforts, reasoningDefault, reasoningWrite),
+      );
+      pushIfRemoteChanged(
+        'intelligence',
+        t('settings:dalton.teamCatalog.ratingIntelligence'),
+        baseline.intelligence,
+        latestModel.intelligence != null ? String(latestModel.intelligence) : '',
+        intelligence,
+      );
+      pushIfRemoteChanged(
+        'speed',
+        t('settings:dalton.teamCatalog.ratingSpeed'),
+        baseline.speed,
+        latestModel.speed != null ? String(latestModel.speed) : '',
+        speed,
+      );
+      pushIfRemoteChanged(
+        'plain_language',
+        t('settings:dalton.teamCatalog.ratingPlainLanguage'),
+        baseline.plainLanguage,
+        latestModel.plain_language != null ? String(latestModel.plain_language) : '',
+        plainLanguage,
+      );
+      const latestCashCached =
+        latestModel.pricing?.cached_input != null
+          ? String(latestModel.pricing.cached_input)
+          : latestModel.pricing?.cache_read != null
+            ? String(latestModel.pricing.cache_read)
+            : '';
+      pushIfRemoteChanged(
+        'pricing',
+        t('settings:dalton.teamCatalog.colPricing'),
+        formatRateTuple(baseline.cashInput, baseline.cashCachedInput, baseline.cashOutput),
+        formatRateTuple(
+          latestModel.pricing?.input != null ? String(latestModel.pricing.input) : '',
+          latestCashCached,
+          latestModel.pricing?.output != null ? String(latestModel.pricing.output) : '',
+        ),
+        formatRateTuple(cashInput, cashCachedInput, cashOutput),
+      );
+      const latestNp = latestModel.dalton_meta?.notional_pricing;
+      const latestNotionalCached =
+        latestNp?.cached_input != null
+          ? String(latestNp.cached_input)
+          : latestNp?.cache_read != null
+            ? String(latestNp.cache_read)
+            : '';
+      pushIfRemoteChanged(
+        'notional_pricing',
+        t('settings:dalton.teamCatalog.notionalInputLabel'),
+        formatRateTuple(baseline.notionalInput, baseline.notionalCachedInput, baseline.notionalOutput),
+        formatRateTuple(
+          latestNp?.input != null ? String(latestNp.input) : '',
+          latestNotionalCached,
+          latestNp?.output != null ? String(latestNp.output) : '',
+        ),
+        formatRateTuple(notionalInput, notionalCachedInput, notionalOutput),
+      );
+      const latestTc: ToolCallingTriState =
+        latestModel.dalton_meta?.tool_calling === true
+          ? 'true'
+          : latestModel.dalton_meta?.tool_calling === false
+            ? 'false'
+            : 'unknown';
+      pushIfRemoteChanged(
+        'tool_calling',
+        t('settings:dalton.teamCatalog.toolCallingLabel'),
+        baseline.toolCalling,
+        latestTc,
+        toolCalling,
+      );
+      const latestCurated = curatedSetup
+        ? curatedSetup.includes(latestModel.model_key)
+        : effectiveCuratedCandidates.includes(latestModel.model_key);
+      pushIfRemoteChanged(
+        'curated_setup',
+        t('settings:dalton.teamCatalog.curatedToggleLabel'),
+        String(baseline.inCuratedSetup),
+        String(latestCurated),
+        String(inCuratedSetup),
+      );
+    } else if (isVariantOnly && variant && latestVariant) {
+      pushIfRemoteChanged(
+        'display_name',
+        t('settings:dalton.teamCatalog.variantDisplayNameLabel'),
+        variant.display_name,
+        latestVariant.display_name,
+        variantDisplayName.trim() || variantSlug.trim(),
+      );
+      pushIfRemoteChanged(
+        'parent_provider',
+        t('settings:dalton.teamCatalog.variantParentLabel'),
+        variant.parent_provider,
+        latestVariant.parent_provider,
+        variantParent,
+      );
+      pushIfRemoteChanged(
+        'sdk',
+        t('settings:dalton.teamCatalog.variantSdkLabel'),
+        variant.sdk,
+        latestVariant.sdk,
+        variantSdk,
+      );
+      pushIfRemoteChanged(
+        'base_url',
+        t('settings:dalton.teamCatalog.variantBaseUrlLabel'),
+        variant.base_url,
+        latestVariant.base_url,
+        variantBaseUrl.trim(),
+      );
+    }
+    return items;
+  })();
+
+  const conflictSyncPending = Boolean(revisionConflict && !conflictCatalogSynced);
 
   return (
     <div
@@ -1079,7 +1643,48 @@ export function TeamModelEditSheet({
                 <div className="text-[11px] opacity-90">
                   {t('settings:dalton.teamCatalog.revisionConflictDesc')}
                 </div>
-                {!isVariantOnly && latestModel && (
+                {!conflictCatalogSynced && (
+                  <div
+                    className="rounded border px-2.5 py-1.5 text-[11px] flex flex-wrap items-center justify-between gap-2"
+                    style={{
+                      borderColor: 'var(--color-border-muted)',
+                      backgroundColor: 'var(--color-bg-card)',
+                    }}
+                    data-testid={
+                      revisionConflict.refreshStatus === 'failed'
+                        ? 'edit-sheet-conflict-refresh-failed'
+                        : 'edit-sheet-conflict-syncing'
+                    }
+                  >
+                    <span>
+                      {revisionConflict.refreshStatus === 'failed'
+                        ? t('settings:dalton.teamCatalog.revisionConflictRefreshFailed', {
+                            latestRevision: revisionConflict.requiredRevision,
+                          })
+                        : t('settings:dalton.teamCatalog.revisionConflictSyncing', {
+                            latestRevision: revisionConflict.requiredRevision,
+                          })}
+                    </span>
+                    {revisionConflict.refreshStatus === 'failed' && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={busy}
+                        onClick={() =>
+                          void beginConflictRecovery(
+                            revisionConflict.requiredRevision,
+                            revisionConflict.operation,
+                          )
+                        }
+                        data-testid="edit-sheet-conflict-refresh-btn"
+                      >
+                        {t('settings:dalton.teamCatalog.revisionConflictRefreshAction')}
+                      </Button>
+                    )}
+                  </div>
+                )}
+                {conflictCatalogSynced && !isVariantOnly && latestModel && (
                   <div
                     className="rounded border px-2.5 py-1.5 text-[11px] font-mono break-words"
                     style={{
@@ -1098,7 +1703,7 @@ export function TeamModelEditSheet({
                     })}
                   </div>
                 )}
-                {isVariantOnly && latestVariant && (
+                {conflictCatalogSynced && isVariantOnly && latestVariant && (
                   <div
                     className="rounded border px-2.5 py-1.5 text-[11px] font-mono break-words"
                     style={{
@@ -1113,16 +1718,57 @@ export function TeamModelEditSheet({
                     })}
                   </div>
                 )}
+                {conflictCatalogSynced && conflictedFields.length > 0 && (
+                  <div
+                    className="rounded border px-2.5 py-1.5 text-[11px] space-y-1"
+                    style={{
+                      borderColor: 'var(--color-border-muted)',
+                      backgroundColor: 'var(--color-bg-card)',
+                    }}
+                    data-testid="edit-sheet-conflict-fields"
+                  >
+                    <div className="font-medium">
+                      {t('settings:dalton.teamCatalog.revisionConflictFieldsHeading')}
+                    </div>
+                    <ul className="space-y-1">
+                      {conflictedFields.map((field) => (
+                        <li
+                          key={field.key}
+                          className="font-mono break-words"
+                          data-testid={`edit-sheet-conflict-field-${field.key}`}
+                        >
+                          <span className="font-semibold">{field.label}:</span>{' '}
+                          <span>
+                            {t('settings:dalton.teamCatalog.revisionConflictFieldLatest', {
+                              value: field.latestValue,
+                            })}
+                          </span>
+                          {field.draftValue !== undefined && (
+                            <span>
+                              {' · '}
+                              {t('settings:dalton.teamCatalog.revisionConflictFieldDraft', {
+                                value: field.draftValue,
+                              })}
+                            </span>
+                          )}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
                 <div className="flex flex-wrap items-center gap-2 pt-1">
                   <Button
                     type="button"
                     size="sm"
-                    disabled={busy}
+                    disabled={busy || !conflictCatalogSynced}
                     onClick={() => {
+                      if (!conflictCatalogSynced) return;
                       const nextRev = resolvedLatestRevision;
-                      setBaseRevision(nextRev);
+                      const op = revisionConflict.operation;
                       setRevisionConflict(null);
-                      if (isVariantOnly) {
+                      if (op === 'restore_default') {
+                        void handleRestoreDefault(nextRev);
+                      } else if (op === 'save_variant') {
                         void handleSaveVariantOnly(nextRev);
                       } else {
                         void handleSaveModel({ overrideExpectedRevision: nextRev });
@@ -1130,16 +1776,20 @@ export function TeamModelEditSheet({
                     }}
                     data-testid="edit-sheet-conflict-resubmit-btn"
                   >
-                    {t('settings:dalton.teamCatalog.revisionConflictResubmit', {
-                      latestRevision: resolvedLatestRevision,
-                    })}
+                    {revisionConflict.operation === 'restore_default'
+                      ? t('settings:dalton.teamCatalog.revisionConflictResubmitRestoreDefault', {
+                          latestRevision: resolvedLatestRevision,
+                        })
+                      : t('settings:dalton.teamCatalog.revisionConflictResubmit', {
+                          latestRevision: resolvedLatestRevision,
+                        })}
                   </Button>
                   {(latestModel || latestVariant) && (
                     <Button
                       type="button"
                       variant="outline"
                       size="sm"
-                      disabled={busy}
+                      disabled={busy || !conflictCatalogSynced}
                       onClick={() =>
                         populateFromSnapshot(
                           latestModel ?? model,
@@ -1638,6 +2288,7 @@ export function TeamModelEditSheet({
                             setPricingTouched(true);
                           }}
                           className={inputCls}
+                          data-testid="edit-model-cash-cached"
                         />
                       </div>
                       <div className="space-y-1">
@@ -1723,6 +2374,7 @@ export function TeamModelEditSheet({
                             value={notionalCachedInput}
                             onChange={(e) => setNotionalCachedInput(e.target.value)}
                             className={inputCls}
+                            data-testid="edit-model-notional-cached"
                           />
                         </div>
                         <div className="space-y-1">
@@ -2281,7 +2933,7 @@ export function TeamModelEditSheet({
             <Button
               type="button"
               size="sm"
-              disabled={busy}
+              disabled={busy || conflictSyncPending}
               onClick={() => void (isVariantOnly ? handleSaveVariantOnly() : handleSaveModel())}
               data-testid="edit-sheet-save-btn"
             >
