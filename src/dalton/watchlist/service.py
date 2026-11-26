@@ -29,6 +29,7 @@ from src.dalton.coverage.service import (
     validate_and_enrich_tickers,
 )
 from src.dalton.database import coverage as coverage_db
+from src.dalton.watchlist.pause_guards import is_earnings_task_allowed_for_stages
 from src.dalton.watchlist.policies import (
     TierPolicy,
     bump_user_roster_revision,
@@ -268,14 +269,14 @@ def _estimate_workspace_task_changes(
                     }
                 )
 
-    # Preview future earnings stage pauses when earnings_stages shrinks or empties
+    # Preview future earnings stage pauses using the same shared rules as reconciler
     allowed_stages = set(new_policy.earnings_stages)
     for r in company_rows:
         if not _is_future_earn_once(r):
             continue
         r_name = str(r.get("name") or "").strip().lower()
-        stage = _earn_stage_from_name(r_name, ticker)
-        if not allowed_stages or (stage is not None and stage not in allowed_stages):
+        earn_kind = _earn_stage_from_name(r_name, ticker)
+        if not is_earnings_task_allowed_for_stages(earn_kind, allowed_stages):
             counts["pause_count"] += 1
             changes.append({"name": r_name, "change": "pause"})
 

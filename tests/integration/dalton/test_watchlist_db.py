@@ -1123,42 +1123,63 @@ async def test_r7_reconciler_fallback_query_savepoint_commits_pause_real_pg(
                             """
                             INSERT INTO automations (
                                 automation_id, user_id, name, trigger_type,
-                                timezone, instruction, next_run_at, last_run_at, run_count,
+                                timezone, instruction, next_run_at, last_run_at,
                                 workspace_id, status, metadata
                             )
                             VALUES (
                                 %s::uuid, %s, 'dalton-nvda-earn-fy26q4-t0', 'once',
                                 'America/New_York', 'Earnings flash',
-                                NOW() + INTERVAL '2 days', NOW(), 0,
+                                NOW() + INTERVAL '2 days', NOW(),
                                 %s::uuid, 'active', '{"ticker": "NVDA", "dalton_managed": true}'::jsonb
                             )
                             """,
                             (auto_id, uid, ws_id),
                         )
 
-            # Rename automation_executions so BOTH the primary SQL query AND the real fallback
-            # exec_db.list_executions(..., conn=sql_conn) hit real PostgreSQL UndefinedTable errors
-            # on the held transaction connection.
+            # Shadow public.automation_executions via pg_temp ONLY while is_unstarted_earn_once
+            # runs, so BOTH its primary SQL query AND the real fallback
+            # exec_db.list_executions(..., conn=sql_conn) hit real PostgreSQL UndefinedColumn
+            # errors inside their savepoints, while list_all_user_automations (before) and
+            # update_automation / skip_unstarted_executions_for_automations (after) still see
+            # the real public.automation_executions table.
+            orig_is_unstarted = reconciler_mod.is_unstarted_earn_once
             orig_list_exec = exec_db_mod.list_executions
-            fallback_spy = create_autospec(orig_list_exec, side_effect=orig_list_exec)
+            fallback_errors: list[type[BaseException]] = []
 
-            async with pool.connection() as admin_conn:
-                async with admin_conn.transaction():
-                    async with admin_conn.cursor() as cur:
-                        await cur.execute("ALTER TABLE automation_executions RENAME TO automation_executions_bak")
+            async def _spy_list_executions(*args: Any, **kwargs: Any) -> Any:
+                try:
+                    return await orig_list_exec(*args, **kwargs)
+                except Exception as exc:
+                    fallback_errors.append(type(exc))
+                    raise
 
+            fallback_spy = create_autospec(orig_list_exec, side_effect=_spy_list_executions)
+
+            async def _shadow_executions_during_check(
+                row: Any, *, user_id: str | None = None, conn: Any = None
+            ) -> bool:
+                assert conn is not None
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        "CREATE TEMP VIEW automation_executions AS SELECT 1 AS broken_col"
+                    )
+                try:
+                    return await orig_is_unstarted(row, user_id=user_id, conn=conn)
+                finally:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            "DROP VIEW IF EXISTS pg_temp.automation_executions"
+                        )
+
+            monkeypatch.setattr(
+                reconciler_mod,
+                "is_unstarted_earn_once",
+                _shadow_executions_during_check,
+            )
             monkeypatch.setattr(
                 reconciler_mod.exec_db,
                 "list_executions",
                 fallback_spy,
-            )
-            monkeypatch.setattr(
-                reconciler_mod.exec_db,
-                "skip_unstarted_executions_for_automations",
-                create_autospec(
-                    exec_db_mod.skip_unstarted_executions_for_automations,
-                    return_value=0,
-                ),
             )
 
             res = await reconciler_mod.TierPolicyReconciler().reconcile_company(
@@ -1168,6 +1189,7 @@ async def test_r7_reconciler_fallback_query_savepoint_commits_pause_real_pg(
             assert res.get("skipped") is not True
             assert fallback_spy.await_count == 1
             assert fallback_spy.await_args.kwargs.get("conn") is not None
+            assert fallback_errors == [psycopg.errors.UndefinedColumn]
 
             # Verify from a fresh connection that the pause ACTUALLY COMMITTED to Postgres
             async with pool.connection() as verify_conn:

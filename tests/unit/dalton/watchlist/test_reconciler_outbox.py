@@ -2912,3 +2912,144 @@ def test_r7_calendar_state_matches_tasks_by_live_workspace_id_on_unbind_and_rebi
     diff_after = json.loads(buf_diff_after.getvalue())
     assert rc_after == 0
     assert diff_after["reconciled"] is True
+
+
+@pytest.mark.asyncio
+async def test_r8_core_to_watch_preview_and_reconcile_agree_on_recheck(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r8 Item 2: Core -> Watch confirmation preview and actual reconciler agree on earnings
+    tasks (including ``recheck``): ``tm3`` and ``tp1`` pause while ``t0`` and ``recheck`` stay
+    active; Watch -> Radar pauses both ``t0`` and ``recheck`` in both preview and reconciler."""
+    infra = _FakeWatchlistInfra()
+    infra.install(monkeypatch)
+
+    uid = "u-r8-preview-recheck"
+    ws_id = "ws-nvda-r8"
+    future_ts = datetime.now(UTC) + timedelta(days=5)
+
+    infra.coverage[(uid, "NVDA")] = {
+        "user_id": uid,
+        "ticker": "NVDA",
+        "name": "NVIDIA",
+        "tier": "core",
+        "is_private": False,
+        "task_overrides": None,
+    }
+    infra.workspaces[(uid, "NVDA")] = ws_id
+    infra.workspace_owners[ws_id] = uid
+    infra.workspace_rows[ws_id] = {"workspace_id": ws_id, "name": "NVDA", "status": "active"}
+
+    earn_names = (
+        "dalton-nvda-earn-fy26q4-tm3",
+        "dalton-nvda-earn-fy26q4-t0",
+        "dalton-nvda-earn-fy26q4-tp1",
+        "dalton-nvda-earn-fy26q4-recheck",
+    )
+    earn_ids: dict[str, str] = {}
+    for name in earn_names:
+        row = infra.add_automation(
+            user_id=uid,
+            workspace_id=ws_id,
+            name=name,
+            trigger_type="once",
+            cron_expression=None,
+            status="active",
+            next_run_at=future_ts,
+            metadata={"ticker": "NVDA", "dalton_managed": True},
+        )
+        earn_ids[name] = row["automation_id"]
+
+    monkeypatch.setattr(
+        service_mod,
+        "get_user_roster_state",
+        create_autospec(
+            service_mod.get_user_roster_state,
+            return_value={"roster_revision": 1, "last_yaml_synced_revision": 1},
+        ),
+    )
+    monkeypatch.setattr(
+        service_mod,
+        "insert_confirm_snapshot",
+        create_autospec(service_mod.insert_confirm_snapshot, return_value="snap-r8"),
+    )
+    monkeypatch.setattr(
+        service_mod,
+        "_user_workspace_tickers",
+        create_autospec(service_mod._user_workspace_tickers, return_value={"NVDA": ws_id}),
+    )
+    monkeypatch.setattr(
+        service_mod,
+        "resolve_company_workspace_id",
+        create_autospec(service_mod.resolve_company_workspace_id, return_value=ws_id),
+    )
+    monkeypatch.setattr(
+        service_mod,
+        "resolve_workspace_tracking_owner",
+        create_autospec(service_mod.resolve_workspace_tracking_owner, return_value=uid),
+    )
+    monkeypatch.setattr(
+        service_mod,
+        "list_all_user_automations",
+        create_autospec(
+            service_mod.list_all_user_automations,
+            side_effect=lambda u, **kw: [
+                dict(r) for r in infra.automations.values() if r["user_id"] == u
+            ],
+        ),
+    )
+
+    svc = service_mod.WatchlistMutationService()
+
+    # 1. Core -> Watch: preview pauses tm3 & tp1, keeps t0 & recheck
+    preview_watch = await svc.preview_mutation(
+        uid,
+        action="set_tier",
+        tickers=["NVDA"],
+        tier="watch",
+    )
+    preview_watch_paused = {
+        c["name"]
+        for ws in preview_watch["affected_workspaces"]
+        for c in ws["task_changes"]
+        if c["change"] == "pause" and c["name"] in earn_ids
+    }
+    assert preview_watch_paused == {
+        "dalton-nvda-earn-fy26q4-tm3",
+        "dalton-nvda-earn-fy26q4-tp1",
+    }
+
+    # Execute actual reconciler for Core -> Watch and verify exact agreement on earnings tasks
+    infra.coverage[(uid, "NVDA")]["tier"] = "watch"
+    rec_watch = await reconciler_mod.TierPolicyReconciler().reconcile_company(uid, "NVDA")
+    assert rec_watch["ok"] is True
+    actual_watch_paused = {
+        name
+        for name, aid in earn_ids.items()
+        if infra.automations[aid]["status"] == "paused"
+    }
+    assert actual_watch_paused == preview_watch_paused
+    assert infra.automations[earn_ids["dalton-nvda-earn-fy26q4-recheck"]]["status"] == "active"
+    assert infra.automations[earn_ids["dalton-nvda-earn-fy26q4-t0"]]["status"] == "active"
+
+    # 2. Watch -> Radar: preview and actual reconciler both pause remaining t0 & recheck
+    preview_radar = await svc.preview_mutation(
+        uid,
+        action="set_tier",
+        tickers=["NVDA"],
+        tier="radar",
+    )
+    preview_radar_paused = {
+        c["name"]
+        for ws in preview_radar["affected_workspaces"]
+        for c in ws["task_changes"]
+        if c["change"] == "pause" and c["name"] in earn_ids
+    }
+    assert "dalton-nvda-earn-fy26q4-recheck" in preview_radar_paused
+    assert "dalton-nvda-earn-fy26q4-t0" in preview_radar_paused
+
+    infra.coverage[(uid, "NVDA")]["tier"] = "radar"
+    rec_radar = await reconciler_mod.TierPolicyReconciler().reconcile_company(uid, "NVDA")
+    assert rec_radar["ok"] is True
+    assert infra.automations[earn_ids["dalton-nvda-earn-fy26q4-recheck"]]["status"] == "paused"
+    assert infra.automations[earn_ids["dalton-nvda-earn-fy26q4-t0"]]["status"] == "paused"
