@@ -903,6 +903,107 @@ def self_test(as_json: bool) -> int:
           and "GS Prime Mag7：净敞口 21.2%" in syn_gp["mag7_quiet"]
           and "gs_prime_html=gs_prime_html" in us_section_src,
           "GS Prime 净杠杆5年0分位触发极度出清绿字预警，滞后超过7天的Mag7历史读数进quiet小字不误报当期拥挤")
+
+    # ── JEPQ—QQQ Put 价差三级灯：离线计算、阈值两侧、陈旧拦截、统一校验与变色检测 ──
+    import tempfile
+    from jepq_signal import (
+        JEPQ_DISCLAIMER,
+        detect_jepq_light_change,
+        evaluate_jepq_signal,
+        load_jepq_state,
+        save_jepq_light,
+        validate_jepq,
+    )
+
+    def _jepq_series(daily_step_std: float, d8_gap_target: float, n: int = 25) -> tuple[pd.Series, pd.Series]:
+        dates = pd.bdate_range("2026-10-01", periods=n)
+        # 构造交替涨跌幅使近 20 日样本标准差精确对应目标年化波动率。
+        alt = np.array([1.0 if i % 2 == 0 else -1.0 for i in range(n - 1)], dtype=float)
+        rets = alt * (daily_step_std / float(pd.Series(alt[-20:]).std())) if daily_step_std > 0 else np.zeros(n - 1)
+        qqq_vals = [100.0]
+        for r in rets:
+            qqq_vals.append(qqq_vals[-1] * (1.0 + float(r)))
+        qqq_s = pd.Series(qqq_vals, index=dates, dtype=float)
+        jepq_vals = [50.0] * n
+        qqq_8d_ret = qqq_vals[-1] / qqq_vals[-9] - 1.0
+        jepq_8d_ret = qqq_8d_ret - d8_gap_target
+        jepq_vals[-1] = jepq_vals[-9] * (1.0 + jepq_8d_ret)
+        jepq_s = pd.Series(jepq_vals, index=dates, dtype=float)
+        return qqq_s, jepq_s
+
+    check("jepq_wired_in_build_and_signals",
+          'tickers += ["QQQ", "JEPQ"]' in src
+          and "evaluate_jepq_signal(" in src
+          and '"jepq": jepq_signal' in src
+          and "any(t in prices for t in existing_tickers)" in src,
+          "JEPQ 必须复用看板现有 download_prices 批量取价、保留既有标的下载失败门禁并写入 signals['jepq']")
+    qqq_green, jepq_green = _jepq_series(0.199 / math.sqrt(252), 0.00299)
+    res_green = evaluate_jepq_signal(qqq_green, jepq_green)
+    qqq_yellow_lo, jepq_yellow_lo = _jepq_series(0.201 / math.sqrt(252), 0.00299)
+    res_yellow_lo = evaluate_jepq_signal(qqq_yellow_lo, jepq_yellow_lo)
+    qqq_yellow_hi, jepq_yellow_hi = _jepq_series(0.249 / math.sqrt(252), 0.001)
+    res_yellow_hi = evaluate_jepq_signal(qqq_yellow_hi, jepq_yellow_hi)
+    qqq_red_gap, jepq_red_gap = _jepq_series(0.15 / math.sqrt(252), 0.00301)
+    res_red_gap = evaluate_jepq_signal(qqq_red_gap, jepq_red_gap)
+    qqq_red_vol, jepq_red_vol = _jepq_series(0.251 / math.sqrt(252), 0.001)
+    res_red_vol = evaluate_jepq_signal(qqq_red_vol, jepq_red_vol)
+    qqq_red_both, jepq_red_both = _jepq_series(0.28 / math.sqrt(252), 0.005)
+    res_red_both = evaluate_jepq_signal(qqq_red_both, jepq_red_both)
+    res_stale_jepq = evaluate_jepq_signal(qqq_green, jepq_green.iloc[:-1])
+    res_stale_ref = evaluate_jepq_signal(
+        qqq_green.iloc[:-1], jepq_green.iloc[:-1], reference_series=qqq_green
+    )
+    res_short = evaluate_jepq_signal(qqq_green.iloc[:15], jepq_green.iloc[:15])
+    res_missing = evaluate_jepq_signal(qqq_green, pd.Series(dtype=float))
+    check("jepq_signal_three_lights_and_boundaries",
+          res_green["ok"] and res_green["light"] == "🟢"
+          and res_yellow_lo["ok"] and res_yellow_lo["light"] == "🟡"
+          and res_yellow_hi["ok"] and res_yellow_hi["light"] == "🟡"
+          and res_red_gap["ok"] and res_red_gap["light"] == "🔴" and res_red_gap["reason"] == "暂停观察 — D-8 gap 超过阈值"
+          and res_red_vol["ok"] and res_red_vol["light"] == "🔴" and res_red_vol["reason"] == "暂停观察 — 波动率不低于 25%"
+          and res_red_both["ok"] and res_red_both["light"] == "🔴" and res_red_both["reason"] == "暂停观察 — D-8 gap 超过阈值"
+          and (not res_stale_jepq["ok"]) and "不一致" in res_stale_jepq["error"]
+          and (not res_stale_ref["ok"]) and "早于" in res_stale_ref["error"]
+          and (not res_short["ok"]) and res_short["light"] is None and "不足" in res_short["error"]
+          and (not res_missing["ok"]) and res_missing["light"] is None and "JEPQ" in res_missing["error"],
+          "JEPQ 三级灯阈值两侧、双超只报 D-8 gap、最新交易日对齐/陈旧拦截与缺数降级必须全部符合原版口径")
+
+    first_chg = detect_jepq_light_change("🟡", None, current_asof="2028-01-06")
+    same_chg = detect_jepq_light_change("🟡", "🟡", current_asof="2028-01-06", prev_asof="2028-01-05")
+    same_day_diff_chg = detect_jepq_light_change("🔴", "🟡", current_asof="2028-01-05", prev_asof="2028-01-05")
+    older_day_chg = detect_jepq_light_change("🔴", "🟡", current_asof="2028-01-04", prev_asof="2028-01-05")
+    turn_chg = detect_jepq_light_change("🔴", "🟡", current_asof="2028-01-06", prev_asof="2028-01-05")
+    with tempfile.TemporaryDirectory() as _tmp_dir:
+        _state = Path(_tmp_dir) / "jepq_light.json"
+        _missing_load = load_jepq_state(_state)
+        save_jepq_light(_state, "🟡", "2028-01-05")
+        _saved_state = load_jepq_state(_state)
+    jepq_fix = card_fixture(False, False)
+    jepq_fix["jepq"] = dict(res_red_gap)
+    card_same = digest_card(jepq_fix, prev_jepq_light="🔴")
+    card_first = digest_card(jepq_fix, prev_jepq_light=None)
+    card_changed = digest_card(jepq_fix, prev_jepq_light="🟡")
+    bad_fix = card_fixture(False, False)
+    bad_fix["jepq"] = {"ok": True, "light": "🟡", "d8_gap": "not-a-number"}
+    bad_card_dump = json.dumps(digest_card(bad_fix), ensure_ascii=False)
+    bad_md = "\n".join(digest_lines(bad_fix))
+    same_dump = json.dumps(card_same, ensure_ascii=False)
+    first_dump = json.dumps(card_first, ensure_ascii=False)
+    changed_dump = json.dumps(card_changed, ensure_ascii=False)
+    changed_md = "\n".join(digest_lines(jepq_fix, prev_jepq_light="🟡"))
+    check("jepq_light_change_detection",
+          (not first_chg["changed"]) and first_chg["should_save"]
+          and (not same_chg["changed"]) and same_chg["should_save"]
+          and (not same_day_diff_chg["changed"]) and (not same_day_diff_chg["should_save"])
+          and (not older_day_chg["changed"]) and (not older_day_chg["should_save"])
+          and turn_chg["changed"] and turn_chg["should_save"] and turn_chg["transition"] == "JEPQ—QQQ 信号灯由 🟡 转为 🔴"
+          and _missing_load is None and _saved_state == {"light": "🟡", "asof": "2028-01-05"}
+          and validate_jepq(bad_fix["jepq"]) is None and "数据不足" in bad_card_dump and "数据不足" in bad_md
+          and "信号灯由" not in same_dump and "信号灯由" not in first_dump
+          and f"<font color='{DIGEST_CARD_HOT}'>JEPQ—QQQ 信号灯由 🟡 转为 🔴</font>" in changed_dump
+          and JEPQ_DISCLAIMER in same_dump and JEPQ_DISCLAIMER in changed_dump
+          and "- JEPQ—QQQ 信号灯由 🟡 转为 🔴：" in changed_md,
+          "首次、同色、同日/早日均按未变色处理且同日/早日不写回；无效字段经 validate_jepq 降级不抛错；变色时标题醒目着色")
     ok = all(x["ok"] for x in checks)
     payload = {"ok": ok, "checks": checks, "count": len(checks), "hint": "Run scripts/run.sh build --json after fixing failed checks." if not ok else ""}
     if as_json:
