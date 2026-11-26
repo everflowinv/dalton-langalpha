@@ -18,6 +18,7 @@ from src.dalton.services.team_model_catalog.compiled import (
 )
 from src.dalton.services.team_model_catalog.constants import (
     CATALOG_SCHEMA,
+    CatalogConflictError,
     CatalogValidationError,
 )
 from src.dalton.services.team_model_catalog.validation import (
@@ -1021,3 +1022,270 @@ def test_clearing_optional_notional_and_cash_cached_input_overrides_factory_base
     assert cash_pricing["input"] == 2.5
     assert cash_pricing["output"] == 10.0
     assert "cached_input" not in cash_pricing
+
+
+def test_update_task_costs_bound_merges_partial_fields_into_current_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clean_upstream_models = _sample_upstream_models()
+    clean_upstream_models["gpt-5"]["parameters"] = {"max_tokens": 16384}
+
+    initial_payload: dict[str, Any] = {
+        "schema": CATALOG_SCHEMA,
+        "task_costs": {
+            "bounds": {
+                "gpt-5": {"model": "claude-sonnet-4-5", "times": 0.75},
+            }
+        },
+    }
+    state = _patch_tx_catalog_env(
+        monkeypatch,
+        initial_payload=initial_payload,
+        initial_revision=5,
+        upstream_models=clean_upstream_models,
+    )
+
+    # 1. Admin B updates ONLY task_costs_bound.model (rev 5 -> 6)
+    bob_update = CatalogModelUpsertInput.model_validate(
+        {
+            "task_costs_bound": {"model": "claude-opus-4-5"},
+            "expected_revision": 5,
+        }
+    )
+    bob_res = asyncio.run(
+        service_mod.update_catalog_model(
+            actor_user_id="admin-bob",
+            model_key="gpt-5",
+            data=bob_update,
+        )
+    )
+    assert bob_res["revision"] == 6
+    assert state["row"]["payload"]["task_costs"]["bounds"]["gpt-5"] == {
+        "model": "claude-opus-4-5",
+        "times": 0.75,
+    }
+
+    # 2. Admin A tries stale rev 5 with partial times -> rejected with revision_conflict before merge
+    alice_stale = CatalogModelUpsertInput.model_validate(
+        {
+            "task_costs_bound": {"times": 1.5},
+            "expected_revision": 5,
+        }
+    )
+    with pytest.raises(CatalogConflictError) as exc_info:
+        asyncio.run(
+            service_mod.update_catalog_model(
+                actor_user_id="admin-alice",
+                model_key="gpt-5",
+                data=alice_stale,
+            )
+        )
+    assert exc_info.value.code == "revision_conflict"
+    assert state["row"]["payload"]["task_costs"]["bounds"]["gpt-5"] == {
+        "model": "claude-opus-4-5",
+        "times": 0.75,
+    }
+
+    # 3. Admin A retries at rev 6 with ONLY times -> merges into Bob's updated model
+    alice_retry = CatalogModelUpsertInput.model_validate(
+        {
+            "task_costs_bound": {"times": 1.5},
+            "expected_revision": 6,
+        }
+    )
+    alice_res = asyncio.run(
+        service_mod.update_catalog_model(
+            actor_user_id="admin-alice",
+            model_key="gpt-5",
+            data=alice_retry,
+        )
+    )
+    assert alice_res["revision"] == 7
+    assert state["row"]["payload"]["task_costs"]["bounds"]["gpt-5"] == {
+        "model": "claude-opus-4-5",
+        "times": 1.5,
+    }
+
+    # 4. Clearing task_costs_bound sets explicit None; subsequent partial times-only patch fails validation
+    clear_bound = CatalogModelUpsertInput.model_validate(
+        {
+            "task_costs_bound": None,
+            "expected_revision": 7,
+        }
+    )
+    clear_res = asyncio.run(
+        service_mod.update_catalog_model(
+            actor_user_id="admin-bob",
+            model_key="gpt-5",
+            data=clear_bound,
+        )
+    )
+    assert clear_res["revision"] == 8
+    assert state["row"]["payload"]["task_costs"]["bounds"]["gpt-5"] is None
+
+    incomplete_after_clear = CatalogModelUpsertInput.model_validate(
+        {
+            "task_costs_bound": {"times": 2.0},
+            "expected_revision": 8,
+        }
+    )
+    with pytest.raises(CatalogValidationError) as val_exc:
+        asyncio.run(
+            service_mod.update_catalog_model(
+                actor_user_id="admin-alice",
+                model_key="gpt-5",
+                data=incomplete_after_clear,
+            )
+        )
+    assert val_exc.value.code == "invalid_task_costs_bound"
+
+
+def test_partial_null_notional_rates_context_clear_and_tiered_cash_pricing_merge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    upstream_models = _sample_upstream_models()
+    upstream_models["gpt-5"]["parameters"] = {"max_tokens": 16384}
+    upstream_models["grok-4.7"] = {
+        "model_id": "grok-4.7",
+        "provider": "openai",
+        "display_name": "Grok 4.7",
+        "visible": True,
+        "context": 2000000,
+        "input_modalities": ["text", "image"],
+    }
+    upstream_providers = _sample_upstream_providers()
+    upstream_providers["models"]["openai"].append(
+        {
+            "id": "grok-4.7",
+            "name": "Grok 4.7",
+            "pricing": {
+                "input_tiers": [
+                    {"max_tokens": 200000, "rate": 2.0, "cached_input": 0.5},
+                    {"max_tokens": None, "rate": 4.0, "cached_input": 1.0},
+                ],
+                "output_tiers": [
+                    {"max_tokens": 200000, "rate": 6.0},
+                    {"max_tokens": None, "rate": 12.0},
+                ],
+            },
+        }
+    )
+    native_overlay = {
+        "models": {
+            "gemini-4-neon-high-oauth": {
+                "model_id": "gemini-4-neon",
+                "provider": "claude-oauth",
+                "display_name": "Gemini 4 Neon",
+                "visible": True,
+                "context": 1000000,
+                "input_modalities": ["text"],
+            }
+        },
+        "dalton_meta": {
+            "gemini-4-neon-high-oauth": {
+                "billing": "subscription",
+                "tool_calling": True,
+                "notional_pricing": {
+                    "input": 1.5,
+                    "cached_input": 0.2,
+                    "output": 6.0,
+                    "source_kind": "third_party",
+                    "note": "Added by Bob",
+                },
+            }
+        },
+    }
+
+    state = _patch_tx_catalog_env(
+        monkeypatch,
+        initial_payload={"schema": CATALOG_SCHEMA},
+        initial_revision=5,
+        upstream_models=upstream_models,
+        upstream_providers=upstream_providers,
+        native_overlay=native_overlay,
+    )
+
+    # 1. Per-field null clearing of notional input & output preserves Bob's cached_input & price source
+    res1 = asyncio.run(
+        service_mod.update_catalog_model(
+            actor_user_id="admin-alice",
+            model_key="gemini-4-neon-high-oauth",
+            data=CatalogModelUpsertInput.model_validate(
+                {
+                    "dalton_meta": {
+                        "notional_pricing": {
+                            "input": None,
+                            "output": None,
+                        }
+                    },
+                    "expected_revision": 5,
+                }
+            ),
+        )
+    )
+    assert res1["revision"] == 6
+
+    # 2. Clearing context on gpt-5 removes context in compiled overview
+    res2 = asyncio.run(
+        service_mod.update_catalog_model(
+            actor_user_id="admin-alice",
+            model_key="gpt-5",
+            data=CatalogModelUpsertInput.model_validate(
+                {
+                    "context": None,
+                    "expected_revision": 6,
+                }
+            ),
+        )
+    )
+    assert res2["revision"] == 7
+
+    # 3. Tiered-only cash model accepts pricing_meta-only and output-only updates while preserving tiers
+    res3 = asyncio.run(
+        service_mod.update_catalog_model(
+            actor_user_id="admin-alice",
+            model_key="grok-4.7",
+            data=CatalogModelUpsertInput.model_validate(
+                {
+                    "pricing_meta": {"source_kind": "third_party", "verified_at": "2026-11-26"},
+                    "expected_revision": 7,
+                }
+            ),
+        )
+    )
+    assert res3["revision"] == 8
+
+    res4 = asyncio.run(
+        service_mod.update_catalog_model(
+            actor_user_id="admin-alice",
+            model_key="grok-4.7",
+            data=CatalogModelUpsertInput.model_validate(
+                {
+                    "pricing": {"output": 14.0},
+                    "expected_revision": 8,
+                }
+            ),
+        )
+    )
+    assert res4["revision"] == 9
+
+    compiled = compiled_mod.compile_catalog_from_payload(state["row"]["payload"], revision=9)
+    _patch_overview_dependencies(monkeypatch, compiled)
+    overview = asyncio.run(service_mod.get_team_catalog_overview())
+    by_key = {m["model_key"]: m for m in overview["models"]}
+
+    sub_np = by_key["gemini-4-neon-high-oauth"]["dalton_meta"]["notional_pricing"]
+    assert "input" not in sub_np
+    assert "output" not in sub_np
+    assert sub_np["cached_input"] == 0.2
+    assert sub_np["source_kind"] == "third_party"
+    assert sub_np["note"] == "Added by Bob"
+
+    assert by_key["gpt-5"]["context"] is None
+
+    grok = by_key["grok-4.7"]
+    assert grok["pricing_meta"] == {"source_kind": "third_party", "verified_at": "2026-11-26"}
+    assert grok["pricing"]["output"] == 14.0
+    assert "input" not in grok["pricing"]
+    assert len(grok["pricing"]["input_tiers"]) == 2
+    assert len(grok["pricing"]["output_tiers"]) == 2

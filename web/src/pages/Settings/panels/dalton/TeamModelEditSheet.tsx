@@ -359,6 +359,7 @@ export function TeamModelEditSheet({
   const [notionalCachedInput, setNotionalCachedInput] = useState('');
   const [notionalOutput, setNotionalOutput] = useState('');
   const [notionalRef, setNotionalRef] = useState('');
+  const [clearNotionalTable, setClearNotionalTable] = useState(false);
   const [priceSourceKind, setPriceSourceKind] = useState<TeamCatalogPriceSourceKind>('official');
   const [priceEstimated, setPriceEstimated] = useState(false);
   const [priceSourceUrl, setPriceSourceUrl] = useState('');
@@ -441,6 +442,7 @@ export function TeamModelEditSheet({
     setRevisionConflict(null);
     setComment('');
     setVariantApiKey('');
+    setClearNotionalTable(false);
     setBaseRevision(snapRevision);
     setAcknowledgedRevision(null);
     setOpenGroups({
@@ -621,22 +623,14 @@ export function TeamModelEditSheet({
         plainLanguage: initPlain,
         billingMode: effBilling,
         hasCashPricing: Boolean(
-          snapModel.pricing &&
-            (snapModel.pricing.input != null ||
-              snapModel.pricing.output != null ||
-              snapModel.pricing.cached_input != null ||
-              snapModel.pricing.cache_read != null ||
-              snapModel.pricing.cache_5m != null ||
-              snapModel.pricing.cache_1h != null),
+          snapModel.pricing && Object.keys(snapModel.pricing).length > 0,
         ),
         cashInput: initCashIn,
         cashCachedInput: initCashCached,
         cashCache5m: initCash5m,
         cashCache1h: initCash1h,
         cashOutput: initCashOut,
-        hasNotionalPricing: Boolean(
-          np && (np.input != null || np.output != null || np.cached_input != null || np.cache_read != null),
-        ),
+        hasNotionalPricing: Boolean(np && Object.keys(np).length > 0),
         notionalInput: initNotionalIn,
         notionalCachedInput: initNotionalCached,
         notionalOutput: initNotionalOut,
@@ -712,11 +706,22 @@ export function TeamModelEditSheet({
     });
   };
 
-  // Initialize form whenever sheet opens or opened snapshot changes (never reset on background catalog refresh)
+  // Initialize form whenever sheet opens or opened snapshot changes (never reset on background catalog refresh or layout resize)
   useEffect(() => {
     if (!open) return;
     populateFromSnapshot(model, variant, revision);
-  }, [open, mode, model, variant, revision, isMobile]);
+  }, [open, mode, model, variant, revision]);
+
+  // Layout breakpoint changes update accordion display state only, preserving draft, revision, and conflict state
+  useEffect(() => {
+    setOpenGroups({
+      identity: true,
+      pricing: !isMobile,
+      window: !isMobile,
+      reasoning: !isMobile,
+      ratings: !isMobile,
+    });
+  }, [isMobile]);
 
   useEffect(() => {
     if (!open || mode !== 'create_variant') return;
@@ -1093,7 +1098,9 @@ export function TeamModelEditSheet({
         payload.prompt_guidance = cleanPrompt || null;
       }
 
-      if (ctxVal !== null && (!isEdit || contextWindow.trim() !== baseline.contextWindow.trim())) {
+      if (!isEdit) {
+        if (ctxVal !== null) payload.context = ctxVal;
+      } else if (contextWindow.trim() !== baseline.contextWindow.trim()) {
         payload.context = ctxVal;
       }
 
@@ -1322,10 +1329,11 @@ export function TeamModelEditSheet({
         const nIn = parseOptionalNumber(notionalInput);
         const nOut = parseOptionalNumber(notionalOutput);
         const nCached = parseOptionalNumber(notionalCachedInput);
+        const cleanNotionalRef = notionalRef.trim();
         const creatingNotionalCard =
           !isEdit || billingMode !== baseline.billingMode || !baseline.hasNotionalPricing;
-        if (nIn !== null || nOut !== null || nCached !== null) {
-          if (creatingNotionalCard) {
+        if (creatingNotionalCard) {
+          if (nIn !== null || nOut !== null || nCached !== null) {
             daltonMeta.notional_pricing = {
               input: nIn ?? 0,
               output: nOut ?? 0,
@@ -1335,38 +1343,35 @@ export function TeamModelEditSheet({
             if (!isEdit || baseline.notionalRef.trim()) {
               daltonMeta.notional_ref = null;
             }
-          } else {
-            const npPatch: TeamCatalogPricingCard = {};
-            if (notionalInput.trim() !== baseline.notionalInput.trim()) {
-              npPatch.input = nIn;
+          } else if (cleanNotionalRef) {
+            if (!isEdit || cleanNotionalRef !== baseline.notionalRef.trim()) {
+              daltonMeta.notional_ref = cleanNotionalRef;
             }
-            if (notionalOutput.trim() !== baseline.notionalOutput.trim()) {
-              npPatch.output = nOut;
-            }
-            if (notionalCachedInput.trim() !== baseline.notionalCachedInput.trim()) {
-              npPatch.cached_input = nCached;
-            }
-            Object.assign(npPatch, buildDiffPriceMeta());
-            if (Object.keys(npPatch).length > 0) {
-              daltonMeta.notional_pricing = npPatch;
-            }
-            if (notionalRef.trim() !== baseline.notionalRef.trim()) {
-              daltonMeta.notional_ref = notionalRef.trim() || null;
-            }
-          }
-        } else if (notionalRef.trim()) {
-          if (!isEdit || notionalRef.trim() !== baseline.notionalRef.trim()) {
-            daltonMeta.notional_ref = notionalRef.trim();
-          }
-          if (isEdit && baseline.hasNotionalPricing) {
-            daltonMeta.notional_pricing = null;
-          }
-        } else if (isEdit) {
-          if (baseline.hasNotionalPricing) {
-            daltonMeta.notional_pricing = null;
-          }
-          if (baseline.notionalRef.trim()) {
+          } else if (isEdit && baseline.notionalRef.trim()) {
             daltonMeta.notional_ref = null;
+          }
+        } else if (clearNotionalTable) {
+          daltonMeta.notional_pricing = null;
+          if (cleanNotionalRef !== baseline.notionalRef.trim()) {
+            daltonMeta.notional_ref = cleanNotionalRef || null;
+          }
+        } else {
+          const npPatch: TeamCatalogPricingCard = {};
+          if (notionalInput.trim() !== baseline.notionalInput.trim()) {
+            npPatch.input = nIn;
+          }
+          if (notionalOutput.trim() !== baseline.notionalOutput.trim()) {
+            npPatch.output = nOut;
+          }
+          if (notionalCachedInput.trim() !== baseline.notionalCachedInput.trim()) {
+            npPatch.cached_input = nCached;
+          }
+          Object.assign(npPatch, buildDiffPriceMeta());
+          if (Object.keys(npPatch).length > 0) {
+            daltonMeta.notional_pricing = npPatch;
+          }
+          if (cleanNotionalRef !== baseline.notionalRef.trim()) {
+            daltonMeta.notional_ref = cleanNotionalRef || null;
           }
         }
       }
@@ -1375,17 +1380,29 @@ export function TeamModelEditSheet({
       }
 
       const taskTimesVal = parseOptionalNumber(taskCostTimes);
-      const taskCostChanged =
-        !isEdit ||
-        taskCostRefModel.trim() !== baseline.taskCostRefModel.trim() ||
-        taskCostTimes.trim() !== baseline.taskCostTimes.trim();
-      if (taskCostChanged) {
-        if (taskCostRefModel.trim() && taskTimesVal !== null) {
+      const cleanTaskRef = taskCostRefModel.trim();
+      const taskRefChanged = cleanTaskRef !== baseline.taskCostRefModel.trim();
+      const taskTimesChanged = taskCostTimes.trim() !== baseline.taskCostTimes.trim();
+      if (!isEdit || !baseline.hasTaskCostBound) {
+        if (cleanTaskRef && taskTimesVal !== null) {
           payload.task_costs_bound = {
-            model: taskCostRefModel.trim(),
+            model: cleanTaskRef,
             times: taskTimesVal,
           };
-        } else if (isEdit && baseline.hasTaskCostBound) {
+        }
+      } else if (taskRefChanged || taskTimesChanged) {
+        if (cleanTaskRef && taskTimesVal !== null) {
+          const boundPatch: { model?: string; times?: number } = {};
+          if (taskRefChanged) {
+            boundPatch.model = cleanTaskRef;
+          }
+          if (taskTimesChanged) {
+            boundPatch.times = taskTimesVal;
+          }
+          if (Object.keys(boundPatch).length > 0) {
+            payload.task_costs_bound = boundPatch;
+          }
+        } else {
           payload.task_costs_bound = null;
         }
       }
@@ -1679,6 +1696,18 @@ export function TeamModelEditSheet({
         ),
         formatRateTuple(notionalInput, notionalCachedInput, notionalOutput),
       );
+      const formatTaskCostBound = (ref: string, times: string) =>
+        ref.trim() || times.trim() ? `${ref.trim() || '-'} × ${times.trim() || '-'}` : '';
+      pushIfRemoteChanged(
+        'task_costs_bound',
+        t('settings:dalton.teamCatalog.taskCostRefLabel'),
+        formatTaskCostBound(baseline.taskCostRefModel, baseline.taskCostTimes),
+        formatTaskCostBound(
+          latestModel.task_costs_bound?.model ?? '',
+          latestModel.task_costs_bound?.times != null ? String(latestModel.task_costs_bound.times) : '',
+        ),
+        formatTaskCostBound(taskCostRefModel, taskCostTimes),
+      );
       const latestTc: ToolCallingTriState =
         latestModel.dalton_meta?.tool_calling === true
           ? 'true'
@@ -1840,6 +1869,9 @@ export function TeamModelEditSheet({
                           void beginConflictRecovery(
                             revisionConflict.requiredRevision,
                             revisionConflict.operation,
+                            {
+                              confirmedLastCurated: Boolean(revisionConflict.confirmedLastCurated),
+                            },
                           )
                         }
                         data-testid="edit-sheet-conflict-refresh-btn"
@@ -2387,6 +2419,7 @@ export function TeamModelEditSheet({
                         value={billingMode}
                         onChange={(e) => {
                           setBillingMode(e.target.value as TeamCatalogBillingMode);
+                          setClearNotionalTable(false);
                         }}
                         disabled={busy || selectedProviderMeta?.billing === 'subscription'}
                         className={selectCls}
@@ -2408,6 +2441,7 @@ export function TeamModelEditSheet({
                           const next = e.target.value as TeamCatalogPriceSourceKind;
                           setPriceSourceKind(next);
                           setPriceEstimated(next === 'estimated');
+                          setClearNotionalTable(false);
                         }}
                         disabled={busy}
                         className={selectCls}
@@ -2510,7 +2544,10 @@ export function TeamModelEditSheet({
                             step="any"
                             min="0"
                             value={notionalInput}
-                            onChange={(e) => setNotionalInput(e.target.value)}
+                            onChange={(e) => {
+                              setNotionalInput(e.target.value);
+                              setClearNotionalTable(false);
+                            }}
                             className={inputCls}
                             data-testid="edit-model-notional-input"
                           />
@@ -2525,7 +2562,10 @@ export function TeamModelEditSheet({
                             step="any"
                             min="0"
                             value={notionalCachedInput}
-                            onChange={(e) => setNotionalCachedInput(e.target.value)}
+                            onChange={(e) => {
+                              setNotionalCachedInput(e.target.value);
+                              setClearNotionalTable(false);
+                            }}
                             className={inputCls}
                             data-testid="edit-model-notional-cached"
                           />
@@ -2540,12 +2580,57 @@ export function TeamModelEditSheet({
                             step="any"
                             min="0"
                             value={notionalOutput}
-                            onChange={(e) => setNotionalOutput(e.target.value)}
+                            onChange={(e) => {
+                              setNotionalOutput(e.target.value);
+                              setClearNotionalTable(false);
+                            }}
                             className={inputCls}
                             data-testid="edit-model-notional-output"
                           />
                         </div>
                       </div>
+                      {mode === 'edit' && baseline.hasNotionalPricing && (
+                        clearNotionalTable ? (
+                          <DaltonInlineNotice tone="warning" testId="edit-model-delete-notional-table-notice">
+                            <div className="flex flex-wrap items-center justify-between gap-2">
+                              <span>{t('settings:dalton.teamCatalog.deleteNotionalPricingTablePending')}</span>
+                              <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                disabled={busy}
+                                onClick={() => {
+                                  setClearNotionalTable(false);
+                                  setNotionalInput(baseline.notionalInput);
+                                  setNotionalCachedInput(baseline.notionalCachedInput);
+                                  setNotionalOutput(baseline.notionalOutput);
+                                }}
+                                data-testid="edit-model-undo-delete-notional-table-btn"
+                              >
+                                {t('settings:dalton.teamCatalog.undoDeleteNotionalPricingTable')}
+                              </Button>
+                            </div>
+                          </DaltonInlineNotice>
+                        ) : (
+                          <div className="flex justify-end">
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              disabled={busy}
+                              onClick={() => {
+                                setClearNotionalTable(true);
+                                setNotionalInput('');
+                                setNotionalCachedInput('');
+                                setNotionalOutput('');
+                              }}
+                              data-testid="edit-model-delete-notional-table-btn"
+                            >
+                              {t('settings:dalton.teamCatalog.deleteNotionalPricingTable')}
+                            </Button>
+                          </div>
+                        )
+                      )}
                       <div className="space-y-1">
                         <label htmlFor="notional-ref" className="text-[11px]" style={{ color: 'var(--color-text-secondary)' }}>
                           {t('settings:dalton.teamCatalog.notionalRefLabel')}
@@ -2569,7 +2654,10 @@ export function TeamModelEditSheet({
                       <Input
                         id="price-verified-at"
                         value={priceVerifiedAt}
-                        onChange={(e) => setPriceVerifiedAt(e.target.value)}
+                        onChange={(e) => {
+                          setPriceVerifiedAt(e.target.value);
+                          setClearNotionalTable(false);
+                        }}
                         placeholder="2026-11-25"
                         className={inputCls}
                         data-testid="edit-model-price-verified-at"
@@ -2582,7 +2670,10 @@ export function TeamModelEditSheet({
                       <Input
                         id="price-source-url"
                         value={priceSourceUrl}
-                        onChange={(e) => setPriceSourceUrl(e.target.value)}
+                        onChange={(e) => {
+                          setPriceSourceUrl(e.target.value);
+                          setClearNotionalTable(false);
+                        }}
                         placeholder="https://..."
                         className={inputCls}
                         data-testid="edit-model-price-source-url"
@@ -2595,7 +2686,10 @@ export function TeamModelEditSheet({
                       <Input
                         id="price-note"
                         value={priceNote}
-                        onChange={(e) => setPriceNote(e.target.value)}
+                        onChange={(e) => {
+                          setPriceNote(e.target.value);
+                          setClearNotionalTable(false);
+                        }}
                         className={inputCls}
                         data-testid="edit-model-price-note"
                       />

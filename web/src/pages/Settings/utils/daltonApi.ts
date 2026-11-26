@@ -1068,7 +1068,7 @@ export interface TeamCatalogModelUpsertPayload {
   pricing_meta?: TeamCatalogPricingMeta | null;
   alias?: string[] | null;
   dalton_meta?: TeamCatalogDaltonMeta | null;
-  task_costs_bound?: { model: string; times: number } | null;
+  task_costs_bound?: { model?: string | null; times?: number | null } | null;
   provider_variant_update?: TeamCatalogInlineVariantUpdatePayload | null;
   curated_setup_member?: boolean | null;
   expected_revision?: number;

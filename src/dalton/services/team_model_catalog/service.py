@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import math
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
@@ -1497,9 +1498,42 @@ async def update_catalog_model(
                 _merge_model_override_patch(cur_dm, dm_patch)
 
             if "task_costs_bound" in data.model_fields_set:
-                next_payload.setdefault("task_costs", {}).setdefault("bounds", {})[key] = (
-                    copy.deepcopy(data.task_costs_bound)
-                )
+                bounds_map = next_payload.setdefault("task_costs", {}).setdefault("bounds", {})
+                if data.task_costs_bound is None:
+                    bounds_map[key] = None
+                elif isinstance(data.task_costs_bound, Mapping):
+                    existing_bound: dict[str, Any] = {}
+                    raw_existing_bound = bounds_map.get(key)
+                    if isinstance(raw_existing_bound, Mapping):
+                        existing_bound = copy.deepcopy(dict(raw_existing_bound))
+                    elif key not in bounds_map and current_compiled.task_costs is not None:
+                        compiled_bound = (current_compiled.task_costs.bounds or {}).get(key)
+                        if compiled_bound is not None:
+                            existing_bound = {
+                                "model": str(compiled_bound[0]),
+                                "times": float(compiled_bound[1]),
+                            }
+                    deep_merge_patch_with_null_delete(existing_bound, data.task_costs_bound)
+                    if not existing_bound:
+                        bounds_map[key] = None
+                    else:
+                        bound_model = existing_bound.get("model")
+                        bound_times = existing_bound.get("times")
+                        if (
+                            not isinstance(bound_model, str)
+                            or not bound_model.strip()
+                            or isinstance(bound_times, bool)
+                            or not isinstance(bound_times, (int, float))
+                            or not math.isfinite(float(bound_times))
+                            or float(bound_times) <= 0.0
+                        ):
+                            raise CatalogValidationError(
+                                "invalid_task_costs_bound",
+                                "task_costs_bound requires a non-empty 'model' and a positive finite 'times' multiplier.",
+                            )
+                        existing_bound["model"] = bound_model.strip()
+                        existing_bound["times"] = float(bound_times)
+                        bounds_map[key] = existing_bound
 
             curated_updated: list[str] | None = None
             if data.curated_setup_member is not None:

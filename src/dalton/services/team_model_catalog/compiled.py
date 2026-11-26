@@ -441,7 +441,11 @@ def _merge_task_costs(db_payload: Mapping[str, Any]) -> Any:
                 if bound is None:
                     target_bounds.pop(str(model_key), None)
                 elif isinstance(bound, Mapping):
-                    target_bounds[str(model_key)] = copy.deepcopy(dict(bound))
+                    existing_target = target_bounds.get(str(model_key))
+                    if isinstance(existing_target, dict):
+                        deep_merge_patch_with_null_delete(existing_target, bound)
+                    else:
+                        target_bounds[str(model_key)] = copy.deepcopy(dict(bound))
     return parse_task_costs(merged)
 
 
