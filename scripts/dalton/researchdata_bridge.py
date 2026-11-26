@@ -2410,14 +2410,14 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "query": "ask",
             "search": "ask",
         },
-        "accepted_params": ["ticker", "query", "start", "end", "limit"],
-        "accepted_nested_params": [],
+        "accepted_params": ["ticker", "query", "start", "end", "limit", "params"],
+        "accepted_nested_params": ["max_pages", "start_page"],
         "required_params": {
             "filings": ["ticker", "start", "end"],
             "ask": ["query"],
             "quote": ["ticker"],
         },
-        "optional_params": ["operation", "ticker", "start", "end", "limit"],
+        "optional_params": ["operation", "ticker", "start", "end", "limit", "params"],
         "param_formats": {
             "ticker": "港股用 5 位数字 '00700'（勿写 '0700.HK'，桥接层自动转为 '00700'）；A 股用 6 位数字 '600519'/'300750'。filings / quote 用；ask 不单独接受 ticker（桥接层会并入 query）",
             "start": "YYYY-MM-DD（filings 必填；ask 的日期写进 query）",
@@ -4420,6 +4420,13 @@ def _normalize_and_validate_call_args(
             cn_hk_refused = [
                 k for k in ("query", "start", "end") if str(normalized.get(k) or "").strip()
             ]
+        if (
+            route == "cn-hk"
+            and eff_op != "filings"
+            and isinstance(normalized.get("params"), dict)
+            and any(v is not None for v in normalized["params"].values())
+        ):
+            cn_hk_refused.append("params")
         if cn_hk_refused:
             return normalized, norm_view, {
                 "_declared_sources": [],
@@ -4431,11 +4438,28 @@ def _normalize_and_validate_call_args(
                 "unsupported_parameters": cn_hk_refused,
                 "error": (
                     f"[参数错误] cn-hk operation='{eff_op}' 不接受 {cn_hk_refused}："
-                    "filings 用 ticker/start/end；quote 只用 ticker（当前报价，没有历史日期）；"
+                    "filings 用 ticker/start/end（可选 params.max_pages/start_page）；quote 只用 ticker（当前报价，没有历史日期）；"
                     "自然语言问题用 operation='ask'，公司和日期写进 query。"
                 ),
                 "normalized_params": norm_view,
             }
+        if route == "cn-hk" and eff_op == "filings" and isinstance(normalized.get("params"), dict):
+            for cn_pk, cn_max in (("max_pages", 20), ("start_page", 200)):
+                cn_pv = normalized["params"].get(cn_pk)
+                if cn_pv is None:
+                    continue
+                if isinstance(cn_pv, bool) or not isinstance(cn_pv, int) or not 1 <= cn_pv <= cn_max:
+                    return normalized, norm_view, {
+                        "_declared_sources": [],
+                        "_sources": [],
+                        "ok": False,
+                        "status": "invalid_arguments",
+                        "error_code": "invalid_nested_param_value",
+                        "error_category": "参数错误",
+                        "error": f"[参数错误] cn-hk filings 的 params.{cn_pk} 须为 1–{cn_max} 的正整数（当前为 {cn_pv!r}）。",
+                        "hint": f"请将 params.{cn_pk} 设为 1–{cn_max} 的整数，或省略该参数。",
+                        "normalized_params": norm_view,
+                    }
         missing_req: list[str] = []
         if route == "alphaengine":
             p_cur = dict(normalized.get("params")) if isinstance(normalized.get("params"), dict) else {}

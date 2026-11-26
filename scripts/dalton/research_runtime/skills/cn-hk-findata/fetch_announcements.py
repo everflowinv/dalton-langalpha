@@ -91,7 +91,18 @@ def get_org_id(stock_code: str, headers: dict) -> str:
     return str(data[0].get("orgId", "") or "")
 
 
-def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_from: str = "", date_to: str = ""):
+CNINFO_MAX_PAGE_SIZE = 30
+DEFAULT_SINGLE_DAY_MAX_PAGES = 5
+
+
+def fetch_announcements(
+    ticker: str,
+    limit: int = 10,
+    max_pages: int | None = None,
+    date_from: str = "",
+    date_to: str = "",
+    start_page: int = 1,
+):
     stock_code = normalize_ticker(ticker)
     market = resolve_market(stock_code)
     headers = {
@@ -106,17 +117,25 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
     except Exception:
         org_id = ""
 
-    page_size = min(max(10, int(limit)), 30)
-    max_pages = max(1, int(max_pages))
+    is_single_day = bool(date_from and date_to and date_from.strip() == date_to.strip())
+    start_page = max(1, int(start_page or 1))
+    if max_pages is None:
+        page_budget = DEFAULT_SINGLE_DAY_MAX_PAGES if is_single_day else 1
+    else:
+        page_budget = max(1, int(max_pages))
+    page_size = CNINFO_MAX_PAGE_SIZE if is_single_day else min(max(10, int(limit)), CNINFO_MAX_PAGE_SIZE)
     wanted = max(1, int(limit))
+    end_page = start_page + page_budget - 1
 
     rows = []
     seen = set()
     pages_fetched = 0
+    last_page = start_page - 1
     total_count = None
     has_more = False
+    next_page = None
 
-    for page in range(1, max_pages + 1):
+    for page in range(start_page, end_page + 1):
         payload = {
             "pageNum": page,
             "pageSize": page_size,
@@ -138,6 +157,7 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
         r.raise_for_status()
         data = r.json()
         pages_fetched += 1
+        last_page = page
         raw_has_more = data.get("hasMore")
         if isinstance(raw_has_more, bool):
             api_has_more = raw_has_more
@@ -157,6 +177,7 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
         items = data.get("announcements", []) or []
         if not items:
             has_more = False
+            next_page = None
             break
 
         stopped_for_limit = False
@@ -177,20 +198,24 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
                 "pdf_link": f"{STATIC_BASE}/{adjunct_url}" if adjunct_url else "",
                 "source": "cninfo",
             })
-            if len(rows) >= wanted:
+            # Single-day queries crawl complete pages up to page_budget so all filings on
+            # that day are collected (or cleanly resumable by page number when budget runs out).
+            if not is_single_day and len(rows) >= wanted:
                 stopped_for_limit = True
+                consumed_pos = (page - 1) * page_size + idx + 1
                 if (
                     idx < len(items) - 1
                     or api_has_more is True
-                    or (total_count is not None and total_count > len(rows))
+                    or (total_count is not None and total_count > consumed_pos)
                     or (api_has_more is None and len(items) >= page_size)
                 ):
                     has_more = True
+                    next_page = page if idx < len(items) - 1 else page + 1
                 break
         if stopped_for_limit:
             break
 
-        # Detect whether upstream pagination actually completed or was cut off by max_pages.
+        # Detect whether upstream pagination actually completed or was cut off by page_budget.
         reached_end = (
             api_has_more is False
             or (total_count is not None and page * page_size >= total_count)
@@ -198,13 +223,15 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
         )
         if reached_end:
             has_more = False
+            next_page = None
             break
-        if page == max_pages:
+        if page == end_page:
             has_more = (
                 api_has_more is True
-                or (total_count is not None and total_count > len(rows))
+                or (total_count is not None and total_count > page * page_size)
                 or len(items) >= page_size
             )
+            next_page = (page + 1) if has_more else None
 
     for i, r in enumerate(rows, start=1):
         r["index"] = i
@@ -220,6 +247,10 @@ def fetch_announcements(ticker: str, limit: int = 10, max_pages: int = 1, date_f
         "pagination_complete": not bool(has_more),
         "page_size": page_size,
         "pages_fetched": pages_fetched,
+        "start_page": start_page,
+        "last_page": last_page,
+        "max_pages": page_budget,
+        "next_page": next_page if has_more else None,
     }
     if total_count is not None:
         result["total_count"] = total_count
@@ -426,7 +457,8 @@ def main():
     parser = argparse.ArgumentParser(description="CN/HK filing fetcher + report extractor")
     parser.add_argument("--ticker", type=str, help="Stock ticker")
     parser.add_argument("--limit", type=int, default=10, help="Number of filings to return")
-    parser.add_argument("--max-pages", type=int, default=1, help="How many pages to crawl from Cninfo")
+    parser.add_argument("--max-pages", type=int, default=None, help="How many pages to crawl from Cninfo (default: 5 for single-day, 1 otherwise)")
+    parser.add_argument("--start-page", type=int, default=1, help="1-based start page for Cninfo pagination")
     parser.add_argument("--date-from", type=str, default="", help="Start date YYYY-MM-DD (optional)")
     parser.add_argument("--date-to", type=str, default="", help="End date YYYY-MM-DD (optional)")
     parser.add_argument("--json", action="store_true", help="Output machine-readable JSON")
@@ -477,7 +509,14 @@ def main():
         if args.extract_financials_latest:
             args.financials = True
 
-        ann = fetch_announcements(args.ticker, args.limit, max_pages=args.max_pages, date_from=args.date_from, date_to=args.date_to)
+        ann = fetch_announcements(
+            args.ticker,
+            args.limit,
+            max_pages=args.max_pages,
+            date_from=args.date_from,
+            date_to=args.date_to,
+            start_page=args.start_page,
+        )
 
         if args.facts_metric:
             out = build_facts_series(args.ticker, args.facts_metric, args.facts_limit, args.ocr_fallback == "true", args.max_pages, args.date_from, args.date_to)

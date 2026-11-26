@@ -6298,3 +6298,634 @@ async def test_preflight_cnhk_next_day_after_truncated_day_never_reports_no_new_
     assert res_day2.reason != "no_new_signals"
     assert "last_cnhk_check_date" not in state_after_day2
     assert state_after_day2["cnhk_probe_unresolved_truncated_dates"] == ["2026-10-19"]
+
+
+def _load_cnhk_runtime_modules(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any]:
+    """Load real research_runtime fetch_announcements and data_gateway modules for unit tests."""
+    import importlib.util
+    import sys
+    import types
+
+    repo_root = Path(__file__).resolve().parents[3]
+    for mod_name in ("fitz", "pytesseract", "PIL", "PIL.Image", "pypdf"):
+        if mod_name not in sys.modules:
+            stub = types.ModuleType(mod_name)
+            if mod_name == "PIL":
+                stub.Image = types.ModuleType("PIL.Image")
+            if mod_name == "pypdf":
+                stub.PdfReader = object
+            monkeypatch.setitem(sys.modules, mod_name, stub)
+
+    fa_path = (
+        repo_root
+        / "scripts"
+        / "dalton"
+        / "research_runtime"
+        / "skills"
+        / "cn-hk-findata"
+        / "fetch_announcements.py"
+    )
+    fa_spec = importlib.util.spec_from_file_location("test_cnhk_fetch_announcements_pag", fa_path)
+    assert fa_spec is not None and fa_spec.loader is not None
+    fa_mod = importlib.util.module_from_spec(fa_spec)
+    fa_spec.loader.exec_module(fa_mod)
+
+    dg_path = (
+        repo_root
+        / "scripts"
+        / "dalton"
+        / "research_runtime"
+        / "scripts"
+        / "data_gateway.py"
+    )
+    dg_spec = importlib.util.spec_from_file_location("test_cnhk_data_gateway_pag", dg_path)
+    assert dg_spec is not None and dg_spec.loader is not None
+    dg_mod = importlib.util.module_from_spec(dg_spec)
+    dg_spec.loader.exec_module(dg_mod)
+    return fa_mod, dg_mod
+
+
+@pytest.mark.asyncio
+async def test_cnhk_single_day_31_and_65_filings_collected_across_three_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """单家公司单日 31 条与 65 条公告：默认预算可单日翻页取全，分页预算耗尽时保留续采位置并在连续三轮后全部采到。"""
+    import argparse
+    import subprocess
+
+    from src.dalton.autonomy.probes import cnhk as cnhk_mod
+
+    fa_mod, dg_mod = _load_cnhk_runtime_modules(monkeypatch)
+    real_requests_post = fa_mod.requests.post
+    real_requests_response = fa_mod.requests.Response
+    real_popen = subprocess.Popen
+    real_query_bridge = cnhk_mod._query_bridge_cnhk_filings
+    cn_hk_route = next(r for r in dg_mod.catalog()["routes"] if r["id"] == "cn-hk")
+    ts_ms = int(datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+    def _make_items(total: int) -> list[dict[str, Any]]:
+        return [
+            {
+                "announcementTitle": f"例行公告-{i:03d}",
+                "announcementTime": ts_ms - i * 1000,
+                "adjunctUrl": f"finalpage/2026-10-22/{i:03d}.PDF",
+            }
+            for i in range(1, total + 1)
+        ]
+
+    def _run_gateway_and_script(
+        *,
+        all_items: list[dict[str, Any]],
+        ticker: str,
+        start: str,
+        end: str,
+        limit: int,
+        start_page: Optional[int] = None,
+        max_pages: Optional[int] = None,
+    ) -> tuple[list[str], dict[str, Any]]:
+        params: dict[str, int] = {}
+        if start_page is not None and start_page > 1:
+            params["start_page"] = start_page
+        if max_pages is not None:
+            params["max_pages"] = max_pages
+        ns = argparse.Namespace(
+            operation="filings",
+            ticker=ticker,
+            query=None,
+            series=None,
+            concept=None,
+            item=None,
+            document=None,
+            form=None,
+            dataset=None,
+            start=start,
+            end=end,
+            as_of=None,
+            vintage=None,
+            limit=limit,
+            timeout=60,
+            params_json=json.dumps(params) if params else None,
+        )
+        cmd = dg_mod.build_command(cn_hk_route, ns)
+        assert cmd is not None
+        cmd_max_pages = int(cmd[cmd.index("--max-pages") + 1])
+        cmd_start_page = int(cmd[cmd.index("--start-page") + 1]) if "--start-page" in cmd else 1
+
+        # Simulate CNINFO server paginated by (pageNum, pageSize) for 2026-10-22 only.
+        def _fake_post(
+            url: str,
+            data: dict[str, Any] | None = None,
+            headers: Any = None,
+            timeout: int = 20,
+        ) -> Any:
+            resp = create_autospec(real_requests_response, instance=True)
+            resp.raise_for_status.return_value = None
+            if "topSearch" in url:
+                resp.json.return_value = [{"orgId": "9900000700"}]
+                return resp
+            req_data = data or {}
+            se_date = str(req_data.get("seDate") or "")
+            if "2026-10-22" not in se_date:
+                resp.json.return_value = {
+                    "announcements": [],
+                    "hasMore": False,
+                    "totalAnnouncement": 0,
+                }
+                return resp
+            page_num = int(req_data.get("pageNum", 1))
+            page_size = int(req_data.get("pageSize", 30))
+            offset = (page_num - 1) * page_size
+            slice_items = all_items[offset : offset + page_size]
+            resp.json.return_value = {
+                "announcements": slice_items,
+                "hasMore": (offset + len(slice_items)) < len(all_items),
+                "totalAnnouncement": len(all_items),
+            }
+            return resp
+
+        monkeypatch.setattr(
+            fa_mod.requests,
+            "post",
+            create_autospec(real_requests_post, side_effect=_fake_post),
+        )
+        script_out = fa_mod.fetch_announcements(
+            ticker,
+            limit=limit,
+            max_pages=cmd_max_pages,
+            date_from=start,
+            date_to=end,
+            start_page=cmd_start_page,
+        )
+
+        fake_proc = create_autospec(real_popen, instance=True)
+        fake_proc.returncode = 0
+        fake_proc.communicate.return_value = (json.dumps(script_out, ensure_ascii=False), "")
+        monkeypatch.setattr(
+            dg_mod.subprocess,
+            "Popen",
+            create_autospec(real_popen, return_value=fake_proc),
+        )
+        gw_out = dg_mod.execute(cmd, timeout=60)
+        return cmd, gw_out
+
+    now_et = datetime(2026, 10, 22, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+
+    # Case 1 & 2: 31 filings and 65 filings with production default budget (limit=50, no explicit max_pages)
+    for total_count in (31, 65):
+        items = _make_items(total_count)
+        cmds_seen: list[list[str]] = []
+
+        async def _bridge_default(**kwargs: Any) -> dict[str, Any]:
+            cmd, gw_out = _run_gateway_and_script(
+                all_items=items,
+                ticker=kwargs["ticker"],
+                start=kwargs["start"],
+                end=kwargs["end"],
+                limit=kwargs["limit"],
+                start_page=kwargs.get("start_page"),
+                max_pages=kwargs.get("max_pages"),
+            )
+            cmds_seen.append(cmd)
+            return gw_out
+
+        monkeypatch.setattr(
+            cnhk_mod,
+            "_query_bridge_cnhk_filings",
+            create_autospec(real_query_bridge, side_effect=_bridge_default),
+        )
+
+        state: dict[str, Any] = {"last_cnhk_check_date": "2026-10-21"}
+        collected_titles: set[str] = set()
+        for round_idx in range(3):
+            sigs, state = await probe_cnhk_filings(
+                ticker="0700.HK",
+                watch_state=state,
+                allow_network=True,
+                today=date(2026, 10, 22),
+                now=now_et,
+                limit=50,
+            )
+            collected_titles.update(s.payload["title"] for s in sigs)
+            if round_idx == 0:
+                assert len(sigs) == total_count
+            else:
+                assert sigs == []
+            assert state["last_cnhk_check_date"] == "2026-10-22"
+            assert "cnhk_probe_partial" not in state
+            assert "cnhk_probe_resume_pages" not in state
+            assert "cnhk_probe_unresolved_truncated_dates" not in state
+
+        assert len(collected_titles) == total_count
+        assert f"例行公告-{total_count:03d}" in collected_titles
+        # Verify data_gateway passed single-day page budget (--max-pages 5)
+        single_day_cmds = [
+            c for c in cmds_seen if c[c.index("--date-from") + 1] == c[c.index("--date-to") + 1] == "2026-10-22"
+        ]
+        assert single_day_cmds
+        assert all(c[c.index("--max-pages") + 1] == str(dg_mod.CN_HK_SINGLE_DAY_DEFAULT_MAX_PAGES) for c in single_day_cmds)
+
+    # Case 3: 31 filings with page budget=1/round -> completes on round 2, round 3 clean, all 31 collected
+    items_31 = _make_items(31)
+    start_pages_31: list[int] = []
+
+    async def _bridge_budget1_31(**kwargs: Any) -> dict[str, Any]:
+        if kwargs["start"] == kwargs["end"] == "2026-10-22":
+            start_pages_31.append(int(kwargs.get("start_page") or 1))
+        _cmd, gw_out = _run_gateway_and_script(
+            all_items=items_31,
+            ticker=kwargs["ticker"],
+            start=kwargs["start"],
+            end=kwargs["end"],
+            limit=kwargs["limit"],
+            start_page=kwargs.get("start_page"),
+            max_pages=kwargs.get("max_pages"),
+        )
+        return gw_out
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(real_query_bridge, side_effect=_bridge_budget1_31),
+    )
+
+    st31: dict[str, Any] = {"last_cnhk_check_date": "2026-10-21"}
+    titles_31: set[str] = set()
+    # Round 1: budget exhausted after page 1 (30 rows); watermark stays 2026-10-21, resume_pages={"2026-10-22": 2}
+    s1, st31 = await probe_cnhk_filings(
+        ticker="0700.HK",
+        watch_state=st31,
+        allow_network=True,
+        today=date(2026, 10, 22),
+        now=now_et,
+        limit=50,
+        max_pages=1,
+    )
+    titles_31.update(s.payload["title"] for s in s1)
+    assert len(s1) == 30
+    assert st31["last_cnhk_check_date"] == "2026-10-21"
+    assert st31["cnhk_probe_partial"] is True
+    assert st31["cnhk_probe_resume_pages"] == {"2026-10-22": 2}
+    assert st31["cnhk_probe_unresolved_truncated_dates"] == ["2026-10-22"]
+
+    # Round 2: resumes from page 2, collects #31, clears resume state and marks 2026-10-22 scanned
+    s2, st31 = await probe_cnhk_filings(
+        ticker="0700.HK",
+        watch_state=st31,
+        allow_network=True,
+        today=date(2026, 10, 22),
+        now=now_et,
+        limit=50,
+        max_pages=1,
+    )
+    titles_31.update(s.payload["title"] for s in s2)
+    assert [s.payload["title"] for s in s2] == ["例行公告-031"]
+    assert st31["last_cnhk_check_date"] == "2026-10-22"
+    assert "cnhk_probe_partial" not in st31
+    assert "cnhk_probe_resume_pages" not in st31
+    assert "cnhk_probe_unresolved_truncated_dates" not in st31
+    assert start_pages_31 == [1, 2]
+
+    # Round 3 (next day 2026-10-23, default budget): no duplicate signals, all 31 captured
+    s3, st31 = await probe_cnhk_filings(
+        ticker="0700.HK",
+        watch_state=st31,
+        allow_network=True,
+        today=date(2026, 10, 23),
+        now=datetime(2026, 10, 23, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+        limit=50,
+    )
+    assert s3 == []
+    assert st31["last_cnhk_check_date"] == "2026-10-23"
+    assert len(titles_31) == 31
+
+    # Case 4: 65 filings with page budget=1/round -> 3 consecutive rounds collect 30 + 30 + 5 = 65
+    items_65 = _make_items(65)
+    start_pages_65: list[int] = []
+
+    async def _bridge_budget1_65(**kwargs: Any) -> dict[str, Any]:
+        if kwargs["start"] == kwargs["end"] == "2026-10-22":
+            start_pages_65.append(int(kwargs.get("start_page") or 1))
+        _cmd, gw_out = _run_gateway_and_script(
+            all_items=items_65,
+            ticker=kwargs["ticker"],
+            start=kwargs["start"],
+            end=kwargs["end"],
+            limit=kwargs["limit"],
+            start_page=kwargs.get("start_page"),
+            max_pages=kwargs.get("max_pages"),
+        )
+        return gw_out
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(real_query_bridge, side_effect=_bridge_budget1_65),
+    )
+
+    st65: dict[str, Any] = {"last_cnhk_check_date": "2026-10-21"}
+    titles_65: set[str] = set()
+    round_counts: list[int] = []
+    for expected_round in (1, 2, 3):
+        sigs, st65 = await probe_cnhk_filings(
+            ticker="0700.HK",
+            watch_state=st65,
+            allow_network=True,
+            today=date(2026, 10, 22),
+            now=now_et,
+            limit=50,
+            max_pages=1,
+        )
+        round_counts.append(len(sigs))
+        titles_65.update(s.payload["title"] for s in sigs)
+        if expected_round < 3:
+            assert st65["last_cnhk_check_date"] == "2026-10-21"
+            assert st65["cnhk_probe_partial"] is True
+            assert st65["cnhk_probe_resume_pages"] == {"2026-10-22": expected_round + 1}
+            assert st65["cnhk_probe_unresolved_truncated_dates"] == ["2026-10-22"]
+        else:
+            assert st65["last_cnhk_check_date"] == "2026-10-22"
+            assert "cnhk_probe_partial" not in st65
+            assert "cnhk_probe_resume_pages" not in st65
+            assert "cnhk_probe_unresolved_truncated_dates" not in st65
+
+    assert round_counts == [30, 30, 5]
+    assert start_pages_65 == [1, 2, 3]
+    assert len(titles_65) == 65
+    assert "例行公告-031" in titles_65
+    assert "例行公告-065" in titles_65
+
+    # Case 5: 65 filings with page budget=2/round -> round 1 fetches 60 (pages 1..2, next_page=3), round 2 finishes 5
+    start_pages_65_b2: list[int] = []
+
+    async def _bridge_budget2_65(**kwargs: Any) -> dict[str, Any]:
+        if kwargs["start"] == kwargs["end"] == "2026-10-22":
+            start_pages_65_b2.append(int(kwargs.get("start_page") or 1))
+        _cmd, gw_out = _run_gateway_and_script(
+            all_items=items_65,
+            ticker=kwargs["ticker"],
+            start=kwargs["start"],
+            end=kwargs["end"],
+            limit=kwargs["limit"],
+            start_page=kwargs.get("start_page"),
+            max_pages=kwargs.get("max_pages"),
+        )
+        return gw_out
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(real_query_bridge, side_effect=_bridge_budget2_65),
+    )
+    st65_b2: dict[str, Any] = {"last_cnhk_check_date": "2026-10-21"}
+    r1_b2, st65_b2 = await probe_cnhk_filings(
+        ticker="0700.HK",
+        watch_state=st65_b2,
+        allow_network=True,
+        today=date(2026, 10, 22),
+        now=now_et,
+        limit=50,
+        max_pages=2,
+    )
+    assert len(r1_b2) == 60
+    assert st65_b2["last_cnhk_check_date"] == "2026-10-21"
+    assert st65_b2["cnhk_probe_resume_pages"] == {"2026-10-22": 3}
+
+    r2_b2, st65_b2 = await probe_cnhk_filings(
+        ticker="0700.HK",
+        watch_state=st65_b2,
+        allow_network=True,
+        today=date(2026, 10, 22),
+        now=now_et,
+        limit=50,
+        max_pages=2,
+    )
+    assert len(r2_b2) == 5
+    assert st65_b2["last_cnhk_check_date"] == "2026-10-22"
+    assert "cnhk_probe_resume_pages" not in st65_b2
+    assert start_pages_65_b2 == [1, 3]
+    assert len({s.payload["title"] for s in [*r1_b2, *r2_b2]}) == 65
+
+
+@pytest.mark.asyncio
+async def test_cnhk_data_gateway_completeness_passthrough_and_preflight_resume_wake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """生产桥传递分页预算并透传完整性；预检在首轮预算耗尽报 sources_degraded 后，下一轮从续采页继续并命中第 31 条 P1 公告唤醒。"""
+    import argparse
+    import subprocess
+
+    from src.dalton.autonomy.probes import cnhk as cnhk_mod
+
+    fa_mod, dg_mod = _load_cnhk_runtime_modules(monkeypatch)
+    cn_hk_route = next(r for r in dg_mod.catalog()["routes"] if r["id"] == "cn-hk")
+
+    # 1. data_gateway.build_command validates params and forwards --max-pages / --start-page
+    def _ns(**overrides: Any) -> argparse.Namespace:
+        base = {
+            "operation": "filings",
+            "ticker": "00700",
+            "query": None,
+            "series": None,
+            "concept": None,
+            "item": None,
+            "document": None,
+            "form": None,
+            "dataset": None,
+            "start": "2026-10-22",
+            "end": "2026-10-22",
+            "as_of": None,
+            "vintage": None,
+            "limit": 50,
+            "timeout": 60,
+            "params_json": None,
+        }
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    cmd_single_default = dg_mod.build_command(cn_hk_route, _ns())
+    assert cmd_single_default[cmd_single_default.index("--max-pages") + 1] == "5"
+    assert "--start-page" not in cmd_single_default
+
+    cmd_resume = dg_mod.build_command(
+        cn_hk_route,
+        _ns(params_json=json.dumps({"max_pages": 2, "start_page": 3})),
+    )
+    assert cmd_resume[cmd_resume.index("--max-pages") + 1] == "2"
+    assert cmd_resume[cmd_resume.index("--start-page") + 1] == "3"
+
+    cmd_multiday = dg_mod.build_command(cn_hk_route, _ns(start="2026-10-20", end="2026-10-22", limit=50))
+    assert cmd_multiday[cmd_multiday.index("--max-pages") + 1] == "2"
+
+    with pytest.raises(ValueError, match="params 仅支持"):
+        dg_mod.build_command(cn_hk_route, _ns(params_json=json.dumps({"bad_key": 1})))
+    with pytest.raises(ValueError, match="须为范围内的正整数"):
+        dg_mod.build_command(cn_hk_route, _ns(params_json=json.dumps({"max_pages": 0})))
+    with pytest.raises(ValueError, match="params 仅支持"):
+        dg_mod.build_command(
+            cn_hk_route,
+            _ns(operation="quote", start=None, end=None, params_json=json.dumps({"max_pages": 2})),
+        )
+
+    # 2. data_gateway.execute surfaces status='partial' & completeness fields at top level
+    partial_payload = {
+        "ok": True,
+        "ticker": "00700",
+        "count": 30,
+        "rows": [{"date": "2026-10-22", "title": "A", "pdf_link": "http://cninfo/a"}],
+        "has_more": True,
+        "truncated": True,
+        "pagination_complete": False,
+        "page_size": 30,
+        "pages_fetched": 1,
+        "start_page": 1,
+        "last_page": 1,
+        "max_pages": 1,
+        "next_page": 2,
+        "total_count": 31,
+    }
+    fake_proc = create_autospec(subprocess.Popen, instance=True)
+    fake_proc.returncode = 0
+    fake_proc.communicate.return_value = (json.dumps(partial_payload), "")
+    monkeypatch.setattr(
+        dg_mod.subprocess,
+        "Popen",
+        create_autospec(subprocess.Popen, return_value=fake_proc),
+    )
+    gw_partial = dg_mod.execute(cmd_single_default, timeout=30)
+    assert gw_partial["ok"] is True
+    assert gw_partial["status"] == "partial"
+    assert gw_partial["pagination_complete"] is False
+    assert gw_partial["has_more"] is True
+    assert gw_partial["next_page"] == 2
+    assert gw_partial["total_count"] == 31
+
+    # 3. Preflight end-to-end: page 1 (30 routine filings already seen) hits budget=1 -> sources_degraded;
+    #    next round resumes at page 2, fetches #31 (P1 earnings alert) -> wakes & marks day scanned.
+    doubles = _install_company_preflight_doubles(monkeypatch)
+    ts_ms = int(datetime(2026, 10, 22, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+    all_31 = [
+        {
+            "announcementTitle": f"例行公告-{i:02d}",
+            "announcementTime": ts_ms - i * 1000,
+            "adjunctUrl": f"finalpage/2026-10-22/{i:02d}.PDF",
+        }
+        for i in range(1, 31)
+    ] + [
+        {
+            "announcementTitle": "2026年第三季度业绩公告",
+            "announcementTime": ts_ms - 31 * 1000,
+            "adjunctUrl": "finalpage/2026-10-22/31.PDF",
+        }
+    ]
+
+    def _fake_cninfo_post(
+        url: str,
+        data: dict[str, Any] | None = None,
+        headers: Any = None,
+        timeout: int = 20,
+    ) -> Any:
+        resp = create_autospec(fa_mod.requests.Response, instance=True)
+        resp.raise_for_status.return_value = None
+        if "topSearch" in url:
+            resp.json.return_value = [{"orgId": "9900000700"}]
+            return resp
+        req_data = data or {}
+        if "2026-10-22" not in str(req_data.get("seDate") or ""):
+            resp.json.return_value = {"announcements": [], "hasMore": False, "totalAnnouncement": 0}
+            return resp
+        page_num = int(req_data.get("pageNum", 1))
+        page_size = int(req_data.get("pageSize", 30))
+        off = (page_num - 1) * page_size
+        chunk = all_31[off : off + page_size]
+        resp.json.return_value = {
+            "announcements": chunk,
+            "hasMore": (off + len(chunk)) < len(all_31),
+            "totalAnnouncement": len(all_31),
+        }
+        return resp
+
+    monkeypatch.setattr(
+        fa_mod.requests,
+        "post",
+        create_autospec(fa_mod.requests.post, side_effect=_fake_cninfo_post),
+    )
+
+    page1_seen = [
+        compute_cnhk_filing_hash(
+            "2026-10-22",
+            f"例行公告-{i:02d}",
+            f"https://static.cninfo.com.cn/finalpage/2026-10-22/{i:02d}.PDF",
+        )
+        for i in range(1, 31)
+    ]
+
+    async def _quiet(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        return [], dict(kwargs.get("watch_state") or {})
+
+    async def _bridge_preflight(**kwargs: Any) -> dict[str, Any]:
+        script_out = fa_mod.fetch_announcements(
+            kwargs["ticker"],
+            limit=kwargs["limit"],
+            max_pages=kwargs.get("max_pages") or 1,
+            date_from=kwargs["start"],
+            date_to=kwargs["end"],
+            start_page=kwargs.get("start_page") or 1,
+        )
+        return {"ok": True, "status": "partial" if script_out["has_more"] else "ok", "data": script_out}
+
+    monkeypatch.setattr(
+        cnhk_mod,
+        "_query_bridge_cnhk_filings",
+        create_autospec(cnhk_mod._query_bridge_cnhk_filings, side_effect=_bridge_preflight),
+    )
+
+    persisted_state: dict[str, Any] = {}
+
+    async def _cnhk_runner(**kwargs: Any) -> tuple[list[Any], dict[str, Any]]:
+        sigs, st = await cnhk_mod.probe_cnhk_filings(
+            ticker="0700.HK",
+            watch_state=dict(kwargs.get("watch_state") or {}),
+            allow_network=True,
+            today=date(2026, 10, 22),
+            now=datetime(2026, 10, 22, 10, 0, tzinfo=ZoneInfo("America/New_York")),
+            limit=50,
+            max_pages=1,
+        )
+        persisted_state.clear()
+        persisted_state.update(st)
+        return sigs, st
+
+    _patch_company_probes(monkeypatch, sec=_quiet, cnhk=_cnhk_runner)
+
+    res_r1 = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-resume-r1",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override={
+            "last_cnhk_check_date": "2026-10-21",
+            "seen_cnhk_filings": page1_seen,
+        },
+    )
+    assert res_r1.should_wake is False
+    assert res_r1.reason == "sources_degraded"
+    assert res_r1.degraded_sources == ["cnhk"]
+    assert persisted_state["last_cnhk_check_date"] == "2026-10-21"
+    assert persisted_state["cnhk_probe_resume_pages"] == {"2026-10-22": 2}
+
+    res_r2 = await preflight_check(
+        _company_watch_automation(),
+        "exec-cnhk-resume-r2",
+        persist=True,
+        agenda_doc_override={},
+        watch_state_override=copy.deepcopy(persisted_state),
+    )
+    assert res_r2.should_wake is True
+    assert res_r2.decision == "wake"
+    assert len(res_r2.signals) == 1
+    assert res_r2.signals[0]["payload"]["title"] == "2026年第三季度业绩公告"
+    assert persisted_state["last_cnhk_check_date"] == "2026-10-22"
+    assert "cnhk_probe_resume_pages" not in persisted_state
+    assert "cnhk_probe_unresolved_truncated_dates" not in persisted_state
+    assert "cnhk_probe_partial" not in persisted_state
+    assert doubles["logs"][-1]["decision"] == "wake"

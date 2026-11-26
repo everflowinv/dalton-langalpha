@@ -760,6 +760,8 @@ _SEEN_WATERMARK_KEYS: tuple[str, ...] = (
     "last_sec_accession",
     "seen_cnhk_filings",
     "last_cnhk_check_date",
+    "cnhk_probe_resume_pages",
+    "cnhk_probe_unresolved_truncated_dates",
 )
 
 
@@ -2185,6 +2187,7 @@ async def _preflight_check_inner(
                     state.get("cnhk_probe_partial") is True
                     or state.get("cnhk_probe_truncated_this_run") is True
                     or bool(state.get("cnhk_probe_unresolved_truncated_dates"))
+                    or bool(state.get("cnhk_probe_resume_pages"))
                 ):
                     _note_probe_not_succeeded(probe_progress)
                     _note_probe_degraded(probe_progress, probe_name)

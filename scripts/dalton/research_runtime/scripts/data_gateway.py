@@ -82,6 +82,9 @@ def _resolve_research_host_token() -> str:
         or _read_bridge_env_fallback("DALTON_RESEARCH_HOST_TOKEN")
     )
 LIBRARY_SOURCES = {"company-wiki", "sales-notes", "tmtb", "funda-ai", "all"}
+CN_HK_SINGLE_DAY_DEFAULT_MAX_PAGES = 5
+CN_HK_MAX_PAGES_LIMIT = 20
+CN_HK_MAX_START_PAGE = 200
 # AlphaEngine 业绩会 ASR 稿类型；roic.ai 自 2026-08 整站 403，已停用。
 TRANSCRIPT_TYPE_ID = "IND_SECOND_5FA442AE"
 CALL_TITLE = re.compile(r"(?:\b[1-4]Q|\bQ[1-4])\s*'?(?:FY)?\s*\d{2,4}|\bFY\s?'?\d{2,4}|\bearnings\b|业绩.{0,6}会|电话会|说明会", re.I)
@@ -139,7 +142,7 @@ def date_arg(value):
 
 def build_command(route, args):
     rid = route["id"]
-    if getattr(args, "params_json", None) and rid not in set(NATIVE_SOURCES) | LIBRARY_SOURCES | {"sales-mail", "sec", "estimates"}:
+    if getattr(args, "params_json", None) and rid not in set(NATIVE_SOURCES) | LIBRARY_SOURCES | {"sales-mail", "sec", "estimates", "cn-hk"}:
         raise ValueError("--params-json 仅用于研究来源的只读参数")
     accepted = {
         "sec": {"ticker", "query", "concept", "item", "document", "as_of", "form"},
@@ -235,12 +238,42 @@ def build_command(route, args):
         require(args, "dataset", "start", "end")
         return fin + ["treasury", "--dataset", args.dataset, "--start", args.start, "--end", args.end]
     if rid == "cn-hk":
+        extra = json.loads(args.params_json or "{}")
+        if not isinstance(extra, dict):
+            raise ValueError("params-json 须为对象")
         cmd = ["bash", str(ROOT / "skills/cn-hk-findata/run.sh"), "--json"]
         if operation == "filings":
             require(args, "ticker", "start", "end")
             if args.query:
                 raise ValueError("cn-hk filings 不接受 query；使用 ticker/start/end")
-            return cmd + ["--ticker", args.ticker, "--list-filings", "--date-from", args.start, "--date-to", args.end, "--limit", str(args.limit)]
+            allowed_filings_params = {"max_pages", "start_page"}
+            if set(extra) - allowed_filings_params:
+                raise ValueError("cn-hk filings params 仅支持 ['max_pages', 'start_page']")
+            for key, max_val in (("max_pages", CN_HK_MAX_PAGES_LIMIT), ("start_page", CN_HK_MAX_START_PAGE)):
+                if key in extra and extra[key] is not None:
+                    val = extra[key]
+                    if type(val) is not int or not 1 <= val <= max_val:
+                        raise ValueError(f"{key} 须为范围内的正整数")
+            max_pages = extra.get("max_pages")
+            if max_pages is None:
+                if args.start == args.end:
+                    max_pages = CN_HK_SINGLE_DAY_DEFAULT_MAX_PAGES
+                else:
+                    max_pages = max(1, (int(args.limit) + 29) // 30)
+            start_page = extra.get("start_page") or 1
+            filings_cmd = cmd + [
+                "--ticker", args.ticker,
+                "--list-filings",
+                "--date-from", args.start,
+                "--date-to", args.end,
+                "--limit", str(args.limit),
+                "--max-pages", str(max_pages),
+            ]
+            if start_page > 1:
+                filings_cmd += ["--start-page", str(start_page)]
+            return filings_cmd
+        if any(v is not None for v in extra.values()):
+            raise ValueError(f"cn-hk {operation} params 仅支持 []")
         if operation == "quote":
             require(args, "ticker")
             if args.query or args.start or args.end:
@@ -544,7 +577,30 @@ def execute(cmd, timeout):
         return {"ok": False, "status": "invalid_output", "error": "底层 JSON 缺少结果对象", "hint": "直接核对底层工具输出协议。"}
     if proc.returncode or payload.get("ok") is False:
         return {"ok": False, "status": "error", "data": payload, "exit_code": proc.returncode}
-    return {"ok": True, "status": payload.get("status", "ok"), "data": payload}
+    status = payload.get("status", "ok")
+    out = {"ok": True, "status": status, "data": payload}
+    if "pagination_complete" in payload:
+        if status == "ok" and (
+            payload.get("pagination_complete") is False
+            or payload.get("has_more") is True
+            or payload.get("truncated") is True
+        ):
+            out["status"] = "partial"
+        for key in (
+            "pagination_complete",
+            "has_more",
+            "truncated",
+            "next_page",
+            "start_page",
+            "last_page",
+            "pages_fetched",
+            "max_pages",
+            "page_size",
+            "total_count",
+        ):
+            if key in payload:
+                out[key] = payload[key]
+    return out
 
 
 class _ArgumentError(ValueError):

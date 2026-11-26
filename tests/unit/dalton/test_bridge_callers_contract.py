@@ -195,6 +195,38 @@ def test_cnhk_probe_request_matches_bridge_route_contract() -> None:
     )
     assert_valid_bridge_call(tool_name, arguments)
 
+    tool_name_pag, arguments_pag = build_cnhk_filings_request(
+        ticker="00700",
+        start="2026-10-22",
+        end="2026-10-22",
+        limit=50,
+        start_page=2,
+        max_pages=3,
+    )
+    assert arguments_pag["params"] == {"start_page": 2, "max_pages": 3}
+    assert_valid_bridge_call(tool_name_pag, arguments_pag)
+
+    _, _, err_quote_params = _normalize_and_validate_call_args(
+        "finance",
+        {"route": "cn-hk", "operation": "quote", "ticker": "00700", "params": {"max_pages": 2}},
+    )
+    assert err_quote_params is not None
+    assert err_quote_params["error_code"] == "unsupported_parameters"
+
+    _, _, err_bad_pages = _normalize_and_validate_call_args(
+        "finance",
+        {
+            "route": "cn-hk",
+            "operation": "filings",
+            "ticker": "00700",
+            "start": "2026-10-22",
+            "end": "2026-10-22",
+            "params": {"max_pages": 0},
+        },
+    )
+    assert err_bad_pages is not None
+    assert err_bad_pages["error_code"] == "invalid_nested_param_value"
+
 
 def test_cn_price_fallback_quote_request_matches_bridge_route_contract() -> None:
     """cn_price_fallback 的 cn-hk 备用报价请求符合路由契约（quote 只收 ticker）。"""
