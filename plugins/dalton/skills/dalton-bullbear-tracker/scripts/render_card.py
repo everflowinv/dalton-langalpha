@@ -294,6 +294,104 @@ def _truncate_table_row_to_fit(
     return prefix + marker
 
 
+def _format_table_row(
+    cells: list[str],
+    *,
+    quote_prefix: str = "",
+    leading_pipe: bool = True,
+    trailing_pipe: bool = True,
+) -> str:
+    inner = " | ".join(cells)
+    if leading_pipe and trailing_pipe:
+        return f"{quote_prefix}| {inner} |"
+    if leading_pipe:
+        return f"{quote_prefix}| {inner}"
+    if trailing_pipe:
+        return f"{quote_prefix}{inner} |"
+    return f"{quote_prefix}{inner}"
+
+
+def _split_oversized_table_row_to_fit(
+    header_line: str,
+    sep_line: str,
+    row_line: str,
+    *,
+    fits_text: Callable[[str], bool],
+) -> list[str]:
+    prefix = f"{header_line}\n{sep_line}\n"
+    if fits_text(prefix + row_line):
+        return [prefix + row_line]
+
+    row_depth, row_inner = _strip_blockquote_prefix(row_line)
+    quote_prefix = "> " * row_depth
+    stripped = row_inner.strip()
+    leading_pipe = stripped.startswith("|")
+    trailing_pipe = stripped.endswith("|") and not stripped.endswith("\\|")
+    cells = _split_table_row_cells(stripped)
+    if not cells:
+        raise RenderError("table_unfit", "当前卡片上限无法容纳表头与一行表格数据")
+
+    remaining = list(cells)
+    chunks: list[str] = []
+    while any(remaining):
+        row_cells = [""] * len(remaining)
+        progressed = False
+        for col_idx, rem_cell in enumerate(remaining):
+            if not rem_cell:
+                continue
+            row_cells[col_idx] = rem_cell
+            cand_row = _format_table_row(
+                row_cells,
+                quote_prefix=quote_prefix,
+                leading_pipe=leading_pipe,
+                trailing_pipe=trailing_pipe,
+            )
+            if fits_text(prefix + cand_row):
+                remaining[col_idx] = ""
+                progressed = True
+                continue
+
+            lo, hi = 1, len(rem_cell)
+            best = 0
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                row_cells[col_idx] = rem_cell[:mid]
+                cand_part = _format_table_row(
+                    row_cells,
+                    quote_prefix=quote_prefix,
+                    leading_pipe=leading_pipe,
+                    trailing_pipe=trailing_pipe,
+                )
+                if fits_text(prefix + cand_part):
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
+            if best > 1 and rem_cell[best - 1] == "\\":
+                best -= 1
+            if best > 0:
+                row_cells[col_idx] = rem_cell[:best]
+                remaining[col_idx] = rem_cell[best:]
+                progressed = True
+            else:
+                row_cells[col_idx] = ""
+            break
+
+        if not progressed:
+            raise RenderError("table_unfit", "当前卡片上限无法容纳表头与一行表格数据")
+
+        chunks.append(
+            prefix
+            + _format_table_row(
+                row_cells,
+                quote_prefix=quote_prefix,
+                leading_pipe=leading_pipe,
+                trailing_pipe=trailing_pipe,
+            )
+        )
+    return chunks
+
+
 def _split_table_to_fitting_chunks(
     header_line: str,
     sep_line: str,
@@ -314,11 +412,10 @@ def _split_table_to_fitting_chunks(
         sub_lines = sub_tbl.splitlines()
         sub_rows = sub_lines[2:] if len(sub_lines) > 2 else []
         if not sub_rows:
-            out.append(sub_tbl)
-            continue
+            raise RenderError("table_unfit", "当前卡片上限无法容纳表头与一行表格数据")
         for single_row in sub_rows:
-            out.append(
-                _truncate_table_row_to_fit(
+            out.extend(
+                _split_oversized_table_row_to_fit(
                     header_line,
                     sep_line,
                     single_row,
@@ -599,9 +696,13 @@ def _sections_to_card_elements(
 
     for section in sections:
         sec_title = section["title"].strip()
-        if not sec_title:
-            continue
         section_text = "\n".join(section["content"]).strip()
+        if not sec_title:
+            if not section_text:
+                continue
+            elements.extend(content_to_elements(section_text))
+            elements.append({"tag": "hr"})
+            continue
 
         if NOTATION_SECTION_RE.match(_SECTION_CONT_SUFFIX_RE.sub("", sec_title).strip()):
             if elements and elements[-1].get("tag") != "hr":
@@ -833,6 +934,11 @@ def markdown_to_card_chunks(
         )
 
     titled_sections = [s for s in sections if s["title"]]
+    active_sections = [
+        s
+        for s in sections
+        if str(s.get("title") or "").strip() or "\n".join(s.get("content") or []).strip()
+    ]
     atomic_sections: list[dict[str, Any]] = []
     if not titled_sections:
         for sub in _split_oversized_section(
@@ -845,7 +951,7 @@ def markdown_to_card_chunks(
         ):
             atomic_sections.append(sub)
     else:
-        for sec in titled_sections:
+        for sec in active_sections:
             if _bucket_fits([sec]):
                 atomic_sections.append(sec)
             else:

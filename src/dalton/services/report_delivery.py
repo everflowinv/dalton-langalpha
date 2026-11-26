@@ -150,6 +150,15 @@ _DIRECT_AUTOMATION_REPORT_RE = re.compile(
     r"(?<![a-z0-9_])automation_report(?![a-z0-9_])",
     re.IGNORECASE,
 )
+# `md_to_report_cards.py` lives inside `dalton-bullbear-tracker/scripts/` so it
+# stays co-located with the shared `render_card.py` under `FUND_AUTOMATIONS`.
+# Automations (such as `market-alert-ta-screen`) that only invoke this shared
+# Markdown-to-card helper script are not running the bull/bear tracker skill,
+# so exclude this single script path when inferring report skills from text.
+_SHARED_REPORT_HELPER_SCRIPT_RE = re.compile(
+    r"(?<![a-z0-9-])dalton-bullbear-tracker/scripts/md_to_report_cards\.py(?![a-z0-9_.-])",
+    re.IGNORECASE,
+)
 _DISCORD_ID_RE = re.compile(r"^\d+$")
 _FEISHU_CHAT_ID_RE = re.compile(r"^oc_[A-Za-z0-9_-]+$")
 _FEISHU_USER_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]+$")
@@ -179,7 +188,8 @@ def extract_report_skills(instruction: str | None) -> list[str]:
     text = str(instruction or "")
     if not text:
         return []
-    return [skill for skill, pat in _SKILL_TOKEN_PATTERNS if pat.search(text)]
+    scrubbed = _SHARED_REPORT_HELPER_SCRIPT_RE.sub(" ", text)
+    return [skill for skill, pat in _SKILL_TOKEN_PATTERNS if pat.search(scrubbed)]
 
 
 def instruction_uses_report_skill(instruction: str | None) -> bool:

@@ -106,6 +106,7 @@ _STATIC_REPORT_PROFILES = frozenset(
         "richard-coverage-weekly",
         "wiki-auto-ingest",
         "podcast-weekly",
+        "market-alert-ta-screen",
     }
 )
 

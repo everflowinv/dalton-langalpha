@@ -210,3 +210,14 @@ automation_report(
 ```
 
 `RUN_ID` 用已经产生的 `run_id`；采集还没有 `run_id` 时，用当天美东日期组成稳定标识 `<ticker小写>-collect-YYYYMMDD`。失败文本的确认要求返回里的 `report_run_id` 与这条记录完全一致，并且 `content_kind` 明确为 `failure_text`。对上之后，用同一个 `run_id`、`report_run_id` 和 `--content-kind failure_text` 把 `send_status` 写成 `sent`。这不表示本轮研究已经处理完成，不要因此本地提交（`commit --material yes`），`seen.json` 保持原状。标识不一致或缺字段时保持原状。失败文本已确认发出后，最终回复只写 `NO_REPLY`。失败文本未能保存时，最终回复只留这一行失败说明，不附卡片正文。工具返回的 `code` 为 `not_automation_run` 时，按第 1 节处理，不要把 `status` 字段当成这个结果。
+
+## 8. 通用 Markdown 转卡片工具
+
+配置了 `metadata.report_profile` 且直接通过 `automation_report` 提交正文卡片的自动化任务，可用同目录的 `md_to_report_cards.py` 将任意 Markdown 文件转为合法的飞书卡片 2.0（Card Schema 2.0）JSON 数组：
+
+```bash
+python3 .agents/skills/dalton-bullbear-tracker/scripts/md_to_report_cards.py \
+  <报告.md> --title-from-first-line --out <cards.json>
+```
+
+脚本复用本目录 `render_card.py` 的共享分卡渲染器，按飞书硬上限（每卡 30,720 字节、200 元素、5 个表格）自动分卡，移除本地图片路径与 `IMG:` 标记并在末卡末尾注明「图表见 Dalton」。传 `--title "<标题>"` 可覆盖首行标题，省略 `--out` 时直接向标准输出打印卡片数组；使用 `--out` 时读取输出文件并把解析后的数组直接传给 `automation_report(action="submit", ..., cards=<数组>)`。
