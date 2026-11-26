@@ -10,15 +10,30 @@ import { act, fireEvent } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { renderWithProviders } from '@/test/utils';
+import type { ViewerToPage } from '../pageProtocol'; // DALTON-HOOK(mobile-web)
 import type { PageBridgeListener } from '../usePageBridge';
 
-const page = vi.hoisted(() => ({ listener: null as PageBridgeListener | null, sent: [] as string[] }));
+const page = vi.hoisted(() => ({
+  listener: null as PageBridgeListener | null,
+  sent: [] as string[],
+  lastDocId: undefined as string | undefined,
+}));
 vi.mock('../usePageBridge', () => {
   const bridge = {
     ready: false,
     session: 0,
     path: null,
-    post: () => {},
+    // DALTON-HOOK(mobile-web): echo page:ping with page:pong carrying the active docId
+    post: (message: ViewerToPage) => {
+      if (message.type === 'page:ping') {
+        page.listener?.(
+          page.lastDocId !== undefined
+            ? { type: 'page:pong', seq: message.seq, docId: page.lastDocId }
+            : { type: 'page:pong', seq: message.seq },
+          bridge as never,
+        );
+      }
+    },
     subscribe: (listener: PageBridgeListener) => {
       page.listener = listener;
       return () => {};
@@ -37,6 +52,7 @@ const PREFIX = `${window.location.origin}/api/v1/wsfiles/g/v1.ws.1.sig/`;
 const NEXT = `${PREFIX}r/next.html`;
 
 function say(message: Parameters<PageBridgeListener>[0]) {
+  if (message.type === 'page:ready') page.lastDocId = message.docId; // DALTON-HOOK(mobile-web)
   act(() => page.listener?.(message, null as never));
 }
 
@@ -55,6 +71,7 @@ function renderFrame(onUnbridged = vi.fn()) {
 beforeEach(() => {
   page.listener = null;
   page.sent = [];
+  page.lastDocId = undefined;
 });
 afterEach(() => vi.useRealTimers());
 
@@ -69,7 +86,8 @@ describe('BridgedFrame after a scripted navigation', () => {
     expect(page.sent).toHaveLength(1);
 
     // Viewed, its own script takes it there again: once more.
-    say({ type: 'page:ready', path: 'r/next.html' });
+    // DALTON-HOOK(mobile-web): include pathState and docId on parsed page:ready message
+    say({ type: 'page:ready', path: 'r/next.html', pathState: 'path', docId: 'doc-next-1' });
     say({ type: 'page:frame-loads', doc: NEXT });
     expect(page.sent).toHaveLength(2);
   });
@@ -86,12 +104,14 @@ describe('BridgedFrame after a scripted navigation', () => {
     const { frame, onUnbridged } = renderFrame();
     fireEvent.load(frame);
     say({ type: 'page:frame-loads', doc: NEXT });
-    say({ type: 'page:ready', path: 'r/next.html' });
+    // DALTON-HOOK(mobile-web): include pathState and docId on parsed page:ready message
+    say({ type: 'page:ready', path: 'r/next.html', pathState: 'path', docId: 'doc-next-2' });
     fireEvent.load(frame);
     act(() => { vi.advanceTimersByTime(5000); });
     expect(onUnbridged).not.toHaveBeenCalled();
 
     // A load nothing answers still is.
+    page.lastDocId = 'doc-stale';
     fireEvent.load(frame);
     act(() => { vi.advanceTimersByTime(5000); });
     expect(onUnbridged).toHaveBeenCalledTimes(1);

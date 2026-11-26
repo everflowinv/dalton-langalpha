@@ -1272,6 +1272,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       confirmedThreadAddress: options.confirmedThreadAddress,
       onConfirmedThread: options.onConfirmedThread,
       resolveDmChannelId: (id) => this.resolveDmChannelId(id),
+      components: options.components,
     });
     return {
       messageId: res.messageId,
@@ -1291,6 +1292,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       threadScopeKey: options.threadScopeKey,
       resolveDmChannelId: (id) => this.resolveDmChannelId(id),
       verifyRecipientBeforeSend: options.verifyRecipientBeforeSend,
+      components: options.components,
     });
     return { messageId: res.messageId, status: "sent", reason: null };
   }
@@ -1305,6 +1307,8 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       text: options.text,
       threadScopeKey: options.threadScopeKey,
       resolveDmChannelId: (id) => this.resolveDmChannelId(id),
+      verifyRecipientBeforeSend: options.verifyRecipientBeforeSend,
+      components: options.components,
     });
     return { messageId: res.messageId, status: "sent", reason: null };
   }

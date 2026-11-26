@@ -1065,6 +1065,7 @@ async def verify_dm_delivery_recipient(
             await cur.execute(
                 """
                 SELECT delivery_key, kind, user_id, thread_id, run_id,
+                       execution_id::text AS execution_id,
                        is_current, platform, target_address, status,
                        delivery_attempt, dm_recipient_platform_user_id
                 FROM dalton_channel_deliveries
@@ -1126,7 +1127,11 @@ async def verify_dm_delivery_recipient(
                         "message": "delivery_attempt does not match current attempt.",
                     },
                 )
-            if not bool(row.get("is_current")) or not _is_dm_address(
+            row_kind = str(row.get("kind") or "").strip().lower()
+            is_authorized_automation_dm = row_kind == "automation" and bool(
+                row.get("execution_id")
+            )
+            if (not bool(row.get("is_current")) and not is_authorized_automation_dm) or not _is_dm_address(
                 platform, str(row.get("target_address") or "")
             ):
                 raise HTTPException(
@@ -10823,35 +10828,68 @@ async def authorize_and_claim_delivery(
                             "message": "No valid Weixin context_token for recipient under current bot session.",
                         }
 
-                # 2b. Pin verified DM platform recipient (Lead Decision #6)
+                # 2b. Pin verified DM platform recipient (Lead Decision #6 + Batch 2 r4 Grok #2)
                 pinned_dm_recipient: str | None = None
                 if (
-                    is_current
-                    and resolved_platform
+                    resolved_platform
                     and resolved_target_address
                     and _is_dm_address(resolved_platform, resolved_target_address)
                 ):
-                    if resolved_platform == "weixin":
-                        pinned_dm_recipient = str(resolved_recipient_id or "").strip() or None
-                    elif (
-                        verified_source_row is not None
-                        and str(verified_source_row.get("_source_table") or "")
-                        == "inbound_events"
-                    ):
-                        src_ct = str(verified_source_row.get("chat_type") or "dm").strip().lower()
-                        src_raw = verified_source_row.get("raw_payload") or {}
-                        origin_puid = (
-                            str(src_raw.get("platform_user_id") or "").strip()
-                            if isinstance(src_raw, dict)
-                            else ""
-                        )
-                        if (
-                            src_ct == "dm"
-                            and origin_puid
-                            and resolved_recipient_id
-                            and origin_puid == str(resolved_recipient_id).strip()
-                        ):
-                            pinned_dm_recipient = origin_puid
+                    if is_current:
+                        if resolved_platform == "weixin":
+                            pinned_dm_recipient = str(resolved_recipient_id or "").strip() or None
+                        elif resolved_recipient_id:
+                            origin_puid = ""
+                            src_table = (
+                                str(verified_source_row.get("_source_table") or "")
+                                if verified_source_row is not None
+                                else ""
+                            )
+                            if src_table == "inbound_events" and verified_source_row is not None:
+                                src_ct = str(
+                                    verified_source_row.get("chat_type") or "dm"
+                                ).strip().lower()
+                                src_raw = verified_source_row.get("raw_payload") or {}
+                                if src_ct == "dm" and isinstance(src_raw, dict):
+                                    origin_puid = str(
+                                        src_raw.get("platform_user_id") or ""
+                                    ).strip()
+                            elif (
+                                src_table in ("background_runs", "thread_watches")
+                                and norm_tid
+                            ):
+                                # Command report-back / background DM: pin recipient when owner's
+                                # active binding matches the thread's latest self DM inbound event.
+                                await cur.execute(
+                                    """
+                                    SELECT chat_type, raw_payload
+                                    FROM dalton_channel_inbound_events
+                                    WHERE thread_id = %s
+                                      AND dalton_user_id = %s
+                                      AND platform = %s
+                                    ORDER BY created_at DESC
+                                    LIMIT 1
+                                    """,
+                                    (norm_tid, resolved_user_id, resolved_platform),
+                                )
+                                latest_inb = await cur.fetchone()
+                                if latest_inb:
+                                    inb_ct = str(
+                                        latest_inb.get("chat_type") or ""
+                                    ).strip().lower()
+                                    inb_raw = latest_inb.get("raw_payload") or {}
+                                    if inb_ct == "dm" and isinstance(inb_raw, dict):
+                                        origin_puid = str(
+                                            inb_raw.get("platform_user_id") or ""
+                                        ).strip()
+                            if (
+                                origin_puid
+                                and origin_puid == str(resolved_recipient_id).strip()
+                            ):
+                                pinned_dm_recipient = origin_puid
+                    elif cleaned_kind == "automation" and eff_exec_id and resolved_recipient_id:
+                        # Authorized automation DM target (verified against dalton_channel_automation_runs)
+                        pinned_dm_recipient = str(resolved_recipient_id).strip() or None
 
                 # 2c. Resolve verified root_message_id, confirmed topic, and pre-reserve :topic: (Lead Decisions #1 & #3)
                 resp_root_message_id: str | None = None
@@ -14474,6 +14512,55 @@ async def _recover_channel_state_once(
                     """
                 )
                 automation_runs = [dict(r) for r in await cur.fetchall()]
+                for auto_row in automation_runs:
+                    eff_tid = (
+                        str(auto_row["thread_id"])
+                        if auto_row.get("thread_id")
+                        else None
+                    )
+                    persisted_rid = (
+                        str(auto_row.get("run_id") or "").strip() or None
+                    )
+                    verified_rid: str | None = None
+                    auto_snaps: list[dict[str, Any]] = []
+                    auto_blocked: bool | None = None
+                    if persisted_rid:
+                        try:
+                            async with owned_conn.transaction():
+                                verified_rid = await _resolve_verified_automation_run_id(
+                                    cur,
+                                    execution_id=str(auto_row["execution_id"]),
+                                    owner_user_id=str(auto_row["user_id"]),
+                                    thread_id=eff_tid,
+                                    candidate_run_id=persisted_rid,
+                                )
+                                if verified_rid:
+                                    from src.dalton.channel_chart_snapshots import (
+                                        get_run_chart_snapshots_status,
+                                    )
+
+                                    snap_info = await get_run_chart_snapshots_status(
+                                        run_id=verified_rid,
+                                        thread_id=eff_tid,
+                                        conn=owned_conn,
+                                    )
+                                    raw_blocked = snap_info.get("outbound_blocked")
+                                    if isinstance(raw_blocked, bool):
+                                        auto_blocked = raw_blocked
+                                    if auto_blocked is False and isinstance(
+                                        snap_info.get("snapshots"), list
+                                    ):
+                                        auto_snaps = list(snap_info["snapshots"])
+                        except Exception:
+                            logger.debug(
+                                "[channel_gateway] recovery chart_snapshots load failed for automation %s",
+                                auto_row.get("execution_id"),
+                                exc_info=True,
+                            )
+                    auto_row["run_id"] = verified_rid
+                    auto_row["chart_snapshots"] = auto_snaps
+                    if auto_blocked is not None:
+                        auto_row["outbound_blocked"] = auto_blocked
 
                 return {
                     "mode": "startup",
@@ -14725,11 +14812,93 @@ async def register_automation_run(
                 return {"targets": list((ins or {}).get("targets") or [])}
 
 
+async def _resolve_verified_automation_run_id(
+    cur: Any,
+    *,
+    execution_id: str,
+    owner_user_id: str,
+    thread_id: str | None,
+    candidate_run_id: str | None,
+) -> str | None:
+    """Validate that ``candidate_run_id`` belongs to ``execution_id``, ``owner_user_id``, and ``thread_id``.
+
+    Never falls back to picking the latest run on the thread so a user follow-up turn during
+    delayed settlement can never leak its charts or widgets into the old automation execution.
+    """
+    cleaned_rid = str(candidate_run_id or "").strip()
+    if not cleaned_rid:
+        return None
+    cleaned_tid = str(thread_id or "").strip() or None
+
+    await cur.execute(
+        """
+        SELECT r.conversation_response_id,
+               r.conversation_thread_id::text AS thread_id,
+               r.metadata,
+               t.user_id AS owner_user_id
+        FROM conversation_responses r
+        JOIN conversation_threads t
+          ON t.conversation_thread_id = r.conversation_thread_id
+        WHERE r.conversation_response_id = %s
+        LIMIT 1
+        """,
+        (cleaned_rid,),
+    )
+    resp_row = await cur.fetchone()
+    if not resp_row:
+        return None
+    resp_owner = str(resp_row.get("owner_user_id") or "").strip()
+    if not resp_owner or resp_owner != owner_user_id:
+        return None
+    resp_tid = str(resp_row.get("thread_id") or "").strip()
+    if cleaned_tid and resp_tid != cleaned_tid:
+        return None
+    resp_meta = resp_row.get("metadata") if isinstance(resp_row.get("metadata"), dict) else {}
+    resp_exec_id = str(resp_meta.get("automation_execution_id") or "").strip()
+    if resp_exec_id and resp_exec_id != execution_id:
+        return None
+
+    await cur.execute(
+        """
+        SELECT e.automation_execution_id::text AS execution_id,
+               e.conversation_thread_id::text AS thread_id,
+               e.conversation_response_id AS run_id,
+               a.user_id AS owner_user_id
+        FROM automation_executions e
+        JOIN automations a
+          ON a.automation_id = e.automation_id
+        WHERE e.automation_execution_id = %s::uuid
+        LIMIT 1
+        """,
+        (execution_id,),
+    )
+    exec_row = await cur.fetchone()
+    exec_points_to_run = False
+    if exec_row:
+        exec_owner = str(exec_row.get("owner_user_id") or "").strip()
+        if not exec_owner or exec_owner != owner_user_id:
+            return None
+        exec_tid = str(exec_row.get("thread_id") or "").strip()
+        if exec_tid and resp_tid and exec_tid != resp_tid:
+            return None
+        exec_rid = str(exec_row.get("run_id") or "").strip()
+        if exec_rid and exec_rid != cleaned_rid:
+            return None
+        exec_points_to_run = exec_rid == cleaned_rid
+
+    meta_points_to_exec = resp_exec_id == execution_id
+    if not exec_points_to_run and not meta_points_to_exec:
+        return None
+
+    return cleaned_rid
+
+
 async def finish_automation_run(
     *,
     execution_id: str,
     status: str | None = None,
     thread_id: str | None = None,
+    run_id: str | None = None,
     final_text: str | None = None,
     targets: list[dict[str, Any]] | None = None,
     mark_finished: bool = False,
@@ -14740,6 +14909,7 @@ async def finish_automation_run(
     if not norm_exec_id:
         raise HTTPException(status_code=404, detail="Unknown execution_id")
     norm_tid = normalize_uuid(thread_id) if thread_id else None
+    cleaned_req_run_id = str(run_id or "").strip() or None
 
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
@@ -14758,6 +14928,7 @@ async def finish_automation_run(
                 reject_company_system_auth(row.get("user_id"))
 
                 prev_db_status = str(row["status"])
+                stored_run_id = str(row.get("run_id") or "").strip() or None
                 # R12 (Codex #7): A finished run can never revert to 'finishing'.
                 if prev_db_status == "finished" and not mark_finished:
                     return {
@@ -14773,11 +14944,36 @@ async def finish_automation_run(
                         "thread_id": (
                             str(row["thread_id"]) if row.get("thread_id") else None
                         ),
+                        "run_id": stored_run_id,
                         "automation_name": row.get("automation_name") or "",
                         "finish_status": row.get("finish_status"),
                         "final_text": row.get("final_text"),
                         "targets": list(row.get("targets") or []),
                     }
+
+                eff_thread_for_validation = norm_tid or (
+                    str(row["thread_id"]) if row.get("thread_id") else None
+                )
+                candidate_run_id = cleaned_req_run_id or stored_run_id
+                verified_run_id: str | None = None
+                if candidate_run_id:
+                    try:
+                        async with owned_conn.transaction():
+                            verified_run_id = await _resolve_verified_automation_run_id(
+                                cur,
+                                execution_id=norm_exec_id,
+                                owner_user_id=str(row["user_id"]),
+                                thread_id=eff_thread_for_validation,
+                                candidate_run_id=candidate_run_id,
+                            )
+                    except Exception:
+                        logger.debug(
+                            "[channel_gateway] validating run_id=%s for automation %s failed",
+                            candidate_run_id,
+                            norm_exec_id,
+                            exc_info=True,
+                        )
+                        verified_run_id = None
 
                 # R12 (Codex #7): mark_finished=True always converges to 'finished' even when
                 # targets is omitted (preserving persisted targets), and never reverts 'finished'.
@@ -14792,6 +14988,7 @@ async def finish_automation_run(
                             finish_status = COALESCE(%s, finish_status),
                             final_text = COALESCE(%s, final_text),
                             thread_id = COALESCE(%s, thread_id),
+                            run_id = COALESCE(%s, run_id),
                             targets = %s,
                             updated_at = NOW()
                         WHERE execution_id = %s
@@ -14801,6 +14998,7 @@ async def finish_automation_run(
                             status,
                             final_text,
                             norm_tid,
+                            verified_run_id,
                             Jsonb(eff_targets),
                             norm_exec_id,
                         ),
@@ -14820,6 +15018,9 @@ async def finish_automation_run(
                             str(updated["thread_id"])
                             if updated.get("thread_id")
                             else None
+                        ),
+                        "run_id": (
+                            str(updated["run_id"]) if updated.get("run_id") else None
                         ),
                         "automation_name": updated.get("automation_name") or "",
                         "finish_status": updated.get("finish_status"),
@@ -14857,6 +15058,7 @@ async def finish_automation_run(
                         finish_status = COALESCE(%s, finish_status),
                         final_text = COALESCE(%s, final_text),
                         thread_id = COALESCE(%s, thread_id),
+                        run_id = COALESCE(%s, run_id),
                         targets = %s,
                         updated_at = NOW()
                     WHERE execution_id = %s
@@ -14866,11 +15068,42 @@ async def finish_automation_run(
                         status,
                         final_text,
                         norm_tid,
+                        verified_run_id,
                         Jsonb(enriched_targets),
                         norm_exec_id,
                     ),
                 )
                 updated = dict(await cur.fetchone())
+                eff_thread_str = (
+                    str(updated["thread_id"]) if updated.get("thread_id") else None
+                )
+                auto_chart_snapshots: list[dict[str, Any]] = []
+                auto_outbound_blocked: bool | None = None
+                if eff_thread_str and verified_run_id:
+                    try:
+                        async with owned_conn.transaction():
+                            from src.dalton.channel_chart_snapshots import (
+                                get_run_chart_snapshots_status,
+                            )
+
+                            snap_info = await get_run_chart_snapshots_status(
+                                run_id=verified_run_id,
+                                thread_id=eff_thread_str,
+                                conn=owned_conn,
+                            )
+                            raw_blocked = snap_info.get("outbound_blocked")
+                            if isinstance(raw_blocked, bool):
+                                auto_outbound_blocked = raw_blocked
+                            if auto_outbound_blocked is False and isinstance(
+                                snap_info.get("snapshots"), list
+                            ):
+                                auto_chart_snapshots = list(snap_info["snapshots"])
+                    except Exception:
+                        logger.debug(
+                            "[channel_gateway] reading chart_snapshots for automation %s failed",
+                            norm_exec_id,
+                            exc_info=True,
+                        )
                 return {
                     "execution_id": norm_exec_id,
                     "status": "finishing",
@@ -14881,8 +15114,13 @@ async def finish_automation_run(
                         if updated.get("workspace_id")
                         else None
                     ),
-                    "thread_id": (
-                        str(updated["thread_id"]) if updated.get("thread_id") else None
+                    "thread_id": eff_thread_str,
+                    "run_id": verified_run_id,
+                    "chart_snapshots": auto_chart_snapshots,
+                    **(
+                        {"outbound_blocked": auto_outbound_blocked}
+                        if auto_outbound_blocked is not None
+                        else {}
                     ),
                     "automation_name": updated.get("automation_name") or "",
                     "finish_status": updated.get("finish_status"),

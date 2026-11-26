@@ -241,8 +241,16 @@ async def run_command(
     # nothing, never loads the store.
     from src.tools.chart_annotation.layers import publish_outbox
 
-    workspace_id = ((call.config or {}).get("configurable") or {}).get("workspace_id")
-    published = await publish_outbox(outbox, str(workspace_id) if workspace_id else None)
+    cfg = (call.config or {}).get("configurable") or {}
+    workspace_id = cfg.get("workspace_id")
+    # DALTON-HOOK(channel-chart-snapshot): pass turn identity so DM chart snapshots persist pending in the same tx
+    published = await publish_outbox(
+        outbox,
+        str(workspace_id) if workspace_id else None,
+        thread_id=str(cfg.get("thread_id")) if cfg.get("thread_id") else None,
+        run_id=str(cfg.get("run_id")) if cfg.get("run_id") else None,
+        user_id=str(cfg.get("user_id")) if cfg.get("user_id") else None,
+    )
     content, artifact = result
     if published.layers:
         artifact = {**artifact, "chart_layers": published.layers}

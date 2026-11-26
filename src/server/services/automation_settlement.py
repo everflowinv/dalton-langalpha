@@ -358,7 +358,13 @@ async def _after_settling(
                 _nudge_drainer()
             else:
                 await _finish_here(
-                    automation, execution_id, thread_id, delivery, policy.finish, final_text
+                    automation,
+                    execution_id,
+                    thread_id,
+                    delivery,
+                    policy.finish,
+                    final_text,
+                    run_id=run_id,  # DALTON-HOOK(channel-chart-snapshot)
                 )
         else:
             delivery_result = await WebhookClient().fire_event(
@@ -465,6 +471,7 @@ async def _leave_finish(
                     "execution_id": execution_id,
                     "automation_id": str(automation["automation_id"]),
                     "user_id": str(automation["user_id"]),
+                    "run_id": run_id,  # DALTON-HOOK(channel-chart-snapshot)
                     "status": policy.finish,
                     "final_text": final_text,
                     "delivery": automation_delivery.stamp(delivery),
@@ -529,6 +536,9 @@ async def _finish_here(
     delivery: automation_delivery.Delivery,
     status: automation_delivery.FinishStatus,
     final_text: Optional[str],
+    *,
+    # DALTON-HOOK(channel-chart-snapshot): forward settlement run_id to automation_delivery.finish_run
+    run_id: Optional[str] = None,
 ) -> None:
     """Ask the messaging service to end a held run from this process, for a
     run with no outbox job to leave it to. The first ask's record stands
@@ -536,6 +546,7 @@ async def _finish_here(
     ask = functools.partial(
         automation_delivery.finish_run, automation, delivery.id, status,
         targets=delivery.targets, final_text=final_text, thread_id=thread_id,
+        run_id=run_id,  # DALTON-HOOK(channel-chart-snapshot)
     )
     finish = await ask()
     # DALTON-HOOK(execution-delivery-status): persist whether finish will be retried
@@ -585,10 +596,13 @@ async def _finish_held_run(job: Dict[str, Any]) -> None:
     delivery = automation_delivery.read_stamp(payload["delivery"], execution_id)
     recorded = payload.get("recorded") is True
     answered = payload.get("answered") is True
+    # DALTON-HOOK(channel-chart-snapshot): pass the outbox job's own run_id to finish_run
+    job_run_id = payload.get("run_id") or job.get("run_id")
     finish = await automation_delivery.finish_run(
         automation, delivery.id, payload["status"],
         targets=delivery.targets, final_text=payload.get("final_text"),
         thread_id=str(job["conversation_thread_id"]),
+        run_id=str(job_run_id) if job_run_id else None,
     )
     # DALTON-HOOK(execution-delivery-status): persist sender retry decision on delivery_result
     will_retry = finish.retry and job["attempts"] < MAX_ATTEMPTS

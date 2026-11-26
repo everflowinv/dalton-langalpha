@@ -85,8 +85,12 @@ def deep_merge_patch_with_null_delete(target: dict[str, Any], patch: Mapping[str
     for key, value in patch.items():
         if value is None:
             target.pop(key, None)
-        elif isinstance(value, Mapping) and isinstance(target.get(key), dict):
-            deep_merge_patch_with_null_delete(target[key], value)
+        elif isinstance(value, Mapping):
+            existing = target.get(key)
+            if not isinstance(existing, dict):
+                existing = {}
+                target[key] = existing
+            deep_merge_patch_with_null_delete(existing, value)
         else:
             target[key] = copy.deepcopy(value)
 
@@ -301,8 +305,13 @@ def _merge_db_payload_layer(
                     if clear_pricing:
                         patch_copy.pop("pricing", None)
                     elif isinstance(patch_copy.get("pricing"), Mapping):
-                        patch_copy["pricing"] = normalize_cash_pricing_card(patch_copy["pricing"])
-                    _deep_merge_patch(card, patch_copy)
+                        raw_p_patch = dict(patch_copy["pricing"])
+                        if "cache_read" in raw_p_patch:
+                            cr_val = raw_p_patch.pop("cache_read")
+                            if raw_p_patch.get("cached_input") is None and cr_val is not None:
+                                raw_p_patch["cached_input"] = cr_val
+                        patch_copy["pricing"] = raw_p_patch
+                    deep_merge_patch_with_null_delete(card, patch_copy)
                     if clear_pricing:
                         card.pop("pricing", None)
                     elif isinstance(card.get("pricing"), Mapping):
@@ -323,12 +332,25 @@ def _merge_db_payload_layer(
                     key_str,
                     existing_key,
                 )
-                _deep_merge_patch(llm_config[existing_key], dict(entry))
+                deep_merge_patch_with_null_delete(llm_config[existing_key], dict(entry))
+                if llm_config[existing_key].get("parameters") == {}:
+                    llm_config[existing_key].pop("parameters", None)
             else:
-                llm_config[key_str] = copy.deepcopy(dict(entry))
+                cleaned_entry = copy.deepcopy(dict(entry))
+                for k_null in [k for k, v in cleaned_entry.items() if v is None]:
+                    cleaned_entry.pop(k_null, None)
+                if isinstance(cleaned_entry.get("parameters"), dict):
+                    for pk in [k for k, v in cleaned_entry["parameters"].items() if v is None]:
+                        cleaned_entry["parameters"].pop(pk, None)
+                    if not cleaned_entry["parameters"]:
+                        cleaned_entry.pop("parameters", None)
+                if isinstance(cleaned_entry.get("reasoning"), dict):
+                    for rk in [k for k, v in cleaned_entry["reasoning"].items() if v is None]:
+                        cleaned_entry["reasoning"].pop(rk, None)
+                llm_config[key_str] = cleaned_entry
                 key_lower_map[key_str.lower()] = key_str
 
-    # 5. Model overrides (skip orphan overrides with INFO log per §7.3)
+    # 5. Model overrides (skip orphan overrides with INFO log per §7.3; explicit null deletes keys)
     raw_overrides = db_payload.get("model_overrides") or {}
     if isinstance(raw_overrides, Mapping):
         for key, patch in raw_overrides.items():
@@ -342,7 +364,9 @@ def _merge_db_payload_layer(
                     key_str,
                 )
                 continue
-            _deep_merge_patch(llm_config[existing_key], dict(patch))
+            deep_merge_patch_with_null_delete(llm_config[existing_key], dict(patch))
+            if llm_config[existing_key].get("parameters") == {}:
+                llm_config[existing_key].pop("parameters", None)
 
     # 6. dalton_meta deep merge with explicit null deletion (§2.2 #1)
     raw_meta = db_payload.get("dalton_meta") or {}
@@ -417,7 +441,11 @@ def _merge_task_costs(db_payload: Mapping[str, Any]) -> Any:
                 if bound is None:
                     target_bounds.pop(str(model_key), None)
                 elif isinstance(bound, Mapping):
-                    target_bounds[str(model_key)] = copy.deepcopy(dict(bound))
+                    existing_target = target_bounds.get(str(model_key))
+                    if isinstance(existing_target, dict):
+                        deep_merge_patch_with_null_delete(existing_target, bound)
+                    else:
+                        target_bounds[str(model_key)] = copy.deepcopy(dict(bound))
     return parse_task_costs(merged)
 
 
@@ -683,6 +711,12 @@ def invalidate_compiled_catalog_cache() -> None:
 
         provider_catalog.cache_clear()
         key_candidates.cache_clear()
+    except Exception:
+        pass
+    try:
+        from src.dalton.services.team_model_catalog.service import clear_price_source_cache
+
+        clear_price_source_cache()
     except Exception:
         pass
 

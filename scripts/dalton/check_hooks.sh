@@ -513,6 +513,12 @@ ALLOWED_HOOKS=(
   # setup.py), skips DriveTrashSweep, and answers 404 before auth/param validation
   # on drive.py and drive_mount.py when Drive is off.
   "drive-kill-switch"
+  # Channel phase 2 batch 2: DM chart_layer snapshot rendering, cross-process pending/ready/failed
+  # state persistence across _publish and command_runs.finalize/settle, stale pending cleanup, and
+  # replay/run_end snapshot metadata exposure.
+  "channel-chart-snapshot"
+  # Channel phase 2 batch 2: web deep-link query params (?chart=&layer= and ?widget=) in ChatView.
+  "channel-deep-links"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

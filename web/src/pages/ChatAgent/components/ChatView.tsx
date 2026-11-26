@@ -167,6 +167,8 @@ import { PanelLoadingStrip } from './filePanel/PanelLoadingStrip';
 import { usePanelFiles } from './chatView/usePanelFiles';
 import { usePanelChart } from './chatView/usePanelChart';
 import { SelectionChips } from '@/pages/MarketView/components/SelectionChips';
+// DALTON-HOOK(channel-deep-links): resolve ?chart=&layer= and ?widget= deep links in ChatView
+import { useChannelDeepLinks } from './chatView/useChannelDeepLinks';
 import { useMessageActionBundles } from './chatView/useMessageActionBundles';
 // DALTON-HOOK(team-sharing): read-only state, banner, and disabled composer for colleague threads
 import {
@@ -1293,6 +1295,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     const timer = setTimeout(() => { void loadFilePanel(); }, 1500);
     return () => clearTimeout(timer);
   }, []);
+
+  // DALTON-HOOK(channel-deep-links): parse ?chart=&layer= (open chart panel & focus layer) and ?widget= (scroll/highlight widget)
+  useChannelDeepLinks({
+    active: isActive,
+    workspaceId,
+    onOpenChart: handleOpenChart,
+    messagesDeps: messages,
+  });
   // The file panel's props are one compiled scope, so this handler's per-chunk
   // identity would re-create every inline prop beside it and re-render the panel.
   const openSubagentTaskFromPanel = useStableHandler(handleOpenSubagentTask);

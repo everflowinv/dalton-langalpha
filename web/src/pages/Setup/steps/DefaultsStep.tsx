@@ -106,10 +106,19 @@ function DefaultsForm({ prefsLoaded, prefsFailed }: { prefsLoaded: boolean; pref
   // they just picked. Set during render like the Background fill below.
   // From the slot models, so the fill never lands on a conversation-only
   // model (Claude Code); the user may still pick one.
-  // DALTON-HOOK(dalton-setup): enforce curated 5 primary candidates & live catalog membership in Dalton builds; non-Dalton preserves upstream behavior
+  // DALTON-HOOK(dalton-setup): enforce curated primary candidates & live catalog membership in Dalton builds; non-Dalton preserves upstream behavior
   // DALTON-HOOK(standalone-core): pass runtime dalton_profile & metadata so Core unlocks BYOK/custom models
-  const curatedModels = filterDaltonCuratedModels(visibleModels, isDaltonBuild, { profile: rawApiResponse?.dalton_profile, metadata });
-  const curatedSlotModels = filterDaltonCuratedModels(visibleSlotModels, isDaltonBuild, { profile: rawApiResponse?.dalton_profile, metadata });
+  // DALTON-HOOK(team-model-catalog): pass version-aligned `dalton_setup_candidates` from `/api/v1/models`
+  const curatedModels = filterDaltonCuratedModels(visibleModels, isDaltonBuild, {
+    profile: rawApiResponse?.dalton_profile,
+    metadata,
+    serverCandidates: rawApiResponse?.dalton_setup_candidates,
+  });
+  const curatedSlotModels = filterDaltonCuratedModels(visibleSlotModels, isDaltonBuild, {
+    profile: rawApiResponse?.dalton_profile,
+    metadata,
+    serverCandidates: rawApiResponse?.dalton_setup_candidates,
+  });
   const availablePrimary = Object.values(curatedModels).flatMap((p) => p.models ?? []);
   const fillable = Object.values(visibleSlotModels).flatMap((p) => p.models ?? []);
   const curatedSlotFillable = Object.values(curatedSlotModels).flatMap((p) => p.models ?? []);

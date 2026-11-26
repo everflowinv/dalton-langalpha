@@ -438,6 +438,9 @@ async def finalize(
             row = dict(row)
             if layer_rows:
                 await _store_layers(conn, row, outbox, layer_rows)
+                # DALTON-HOOK(channel-chart-snapshot): persist pending DM chart snapshots in the same finalize tx
+                if row.get("outbox_layers") and outbox is not None and outbox.rows:
+                    await _register_pending_command_chart_snapshots(conn, row, outbox)
             if oom_kill_on is not None:
                 await _count_oom_kill(conn, oom_kill_on, command_id)
             if outcome.report != "none":
@@ -477,6 +480,43 @@ async def _store_layers(
             WHERE command_id = %s
             """,
             (strip_pg_nul_str(outbox.unsaved_report), row["command_id"]),
+        )
+
+
+async def _register_pending_command_chart_snapshots(
+    conn, row: Dict[str, Any], outbox: CommandOutbox
+) -> None:
+    """DALTON-HOOK(channel-chart-snapshot): record status='pending' chart snapshots in the
+    same finalize transaction (isolated in a savepoint so snapshot metadata issues never abort
+    command finalize)."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.CHANNEL_GATEWAY):
+        return
+    thread_id = row.get("conversation_thread_id")
+    run_id = row.get("run_id")
+    if not thread_id or not run_id:
+        return
+    try:
+        from src.dalton.channel_chart_snapshots import (
+            register_pending_chart_snapshots_in_tx,
+        )
+
+        async with conn.transaction():
+            pending = await register_pending_chart_snapshots_in_tx(
+                conn,
+                thread_id=str(thread_id),
+                run_id=str(run_id),
+                user_id=str(row.get("user_id") or "") or None,
+                bodies=outbox.rows,
+                command_id=str(row.get("command_id") or "") or None,
+            )
+            if pending:
+                row["_pending_chart_snapshots"] = pending
+    except Exception:
+        logger.warning(
+            f"[command_runs] registering pending DM chart snapshots for {row.get('command_id')} failed",
+            exc_info=True,
         )
 
 

@@ -161,6 +161,8 @@ NO_USER_CREDENTIAL = {
     ("POST", "/api/v1/dalton/channels/internal/deliveries/{delivery_key}/verify-dm-recipient"),
     ("GET", "/api/v1/dalton/channels/internal/deliverables/download"),
     ("POST", "/api/v1/dalton/channels/internal/topics/lookup"),
+    ("GET", "/api/v1/dalton/channels/internal/snapshots/status"),
+    ("GET", "/api/v1/dalton/channels/internal/snapshots/{snapshot_key:path}"),
     ("POST", "/api/v1/dalton/channels/internal/gateway-lease/acquire"),
     ("POST", "/api/v1/dalton/channels/internal/gateway-lease/heartbeat"),
     ("POST", "/api/v1/dalton/channels/internal/gateway-lease/release"),

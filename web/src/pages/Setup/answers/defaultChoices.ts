@@ -58,6 +58,8 @@ export interface DefaultChoicesInput {
   dalton?: boolean;
   // DALTON-HOOK(standalone-core): active deployment profile (everflow vs core) for setup fallback
   daltonProfile?: string | null;
+  // DALTON-HOOK(team-model-catalog): version-aligned server `dalton_setup_candidates` from `/api/v1/models`
+  daltonSetupCandidates?: readonly string[] | null;
   // DALTON-HOOK(antigravity-series): series catalog & selectable series for collapsing onboarding candidates
   seriesCatalog?: AntigravitySeriesCatalog;
   selectableSeries?: readonly SelectableAntigravitySeries[];
@@ -300,14 +302,12 @@ export function defaultChoices(input: DefaultChoicesInput): DefaultChoices {
   }
   pool = collapsedPool;
 
-  // DALTON-HOOK(dalton-setup): Dalton /setup/default shows only the fixed 5 curated candidates in order (never falls back to uncurated models)
+  // DALTON-HOOK(dalton-setup): Dalton /setup/default shows only curated candidates in order (never falls back to uncurated models in Everflow)
   // DALTON-HOOK(standalone-core): Core profile lists connected non-rejected models (unverified labeled, never auto-selected); default picks come only from confirmed tool-calling models
-  const curated = input.dalton
-    ? resolveDaltonSetupModels(rawPool, { profile: input.daltonProfile, metadata: input.metadata }, pool)
-    : null;
-  const confirmedCurated = input.dalton
-    ? resolveDaltonConfirmedSetupModels(rawPool, { profile: input.daltonProfile, metadata: input.metadata }, pool)
-    : null;
+  // DALTON-HOOK(team-model-catalog): feed server `dalton_setup_candidates` so hidden/retired curated models are dropped immediately
+  const daltonFilterOpts = { profile: input.daltonProfile, metadata: input.metadata, serverCandidates: input.daltonSetupCandidates };
+  const curated = input.dalton ? resolveDaltonSetupModels(rawPool, daltonFilterOpts, pool) : null;
+  const confirmedCurated = input.dalton ? resolveDaltonConfirmedSetupModels(rawPool, daltonFilterOpts, pool) : null;
 
   // DALTON-HOOK(antigravity-series): preserve saved suffixed variant while keeping 1 card per series
   const sameAs = (a: string, b: string | null) => a === b || sameAntigravitySeries(a, b, seriesOpts);

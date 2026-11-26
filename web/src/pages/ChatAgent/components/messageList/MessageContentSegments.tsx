@@ -440,11 +440,16 @@ export const MessageContentSegments = memo(function MessageContentSegments({ seg
           const widgetSeg = (block as HtmlWidgetRenderBlock).segment;
           const widgetData = (htmlWidgetProcesses as Record<string, { html: string; title: string; data?: Record<string, string> }> | undefined)?.[widgetSeg.widgetId!];
           if (!widgetData) return null;
+          // DALTON-HOOK(channel-deep-links): strip internal 'widget-' segment prefix so data-widget-id matches ShowWidget's persistent artifact_id
+          const deepLinkWidgetId = widgetSeg.widgetId?.startsWith('widget-')
+            ? widgetSeg.widgetId.slice('widget-'.length)
+            : widgetSeg.widgetId;
           return (
             // Keep the widget's own margins inside a stable transcript block.
             // Otherwise the list's gap overrides them until the preceding fold hides,
             // then restores them in one frame at the end of the animation.
-            <div key={block.key} className="flow-root">
+            // DALTON-HOOK(channel-deep-links): expose stable data-widget-id for ?widget= deep link scroll/highlight
+            <div key={block.key} className="flow-root" data-widget-id={deepLinkWidgetId}>
               <InlineWidget
                 html={widgetData.html}
                 title={widgetData.title}

@@ -39,6 +39,8 @@ _FIRST_PARTY_PROVIDER_FAMILIES: dict[str, str] = {
 
 _CAPABILITY_CACHE_KEY: tuple[str | None, str] | None = None
 _CAPABILITY_CACHE_VALUE: tuple[dict[str, dict[str, Any]], dict[str, Any], dict[str, bool]] | None = None
+_SMOKE_CACHE_KEY: str | None = None
+_SMOKE_CACHE_VALUE: dict[str, Any] | None = None
 
 _OAUTH_PROVIDER_TOKEN_KEYS: dict[str, str] = {
     "claude-oauth": "claude-oauth",
@@ -68,13 +70,41 @@ def _load_tool_capability_snapshot() -> tuple[
     requests (reads disk at most once per `(overlay_stamp, smoke_stat)` change).
     """
     global _CAPABILITY_CACHE_KEY, _CAPABILITY_CACHE_VALUE
+    from collections.abc import Mapping
+
+    from src.dalton.services.team_model_catalog.billing import _SCOPED_DALTON_META
+
+    scoped_meta = _SCOPED_DALTON_META.get()
+    if isinstance(scoped_meta, Mapping):
+        # Active request scope (e.g. GET /api/v1/models) already fetched dalton_meta;
+        # compute from bound map + cached smoke without calling load_dalton_meta() or
+        # overwriting the process-level capability cache.
+        meta_map = {str(k): dict(v) for k, v in scoped_meta.items() if isinstance(v, Mapping)}
+        native_smoke = _load_latest_native_smoke_cached()
+        resolved: dict[str, bool] = {}
+        for key, meta in meta_map.items():
+            if isinstance(meta.get("tool_calling"), bool):
+                resolved[key] = meta["tool_calling"]
+        for key, smoke_entry in native_smoke.items():
+            if not isinstance(smoke_entry, dict):
+                continue
+            checks = smoke_entry.get("checks") or {}
+            if not isinstance(checks, dict):
+                continue
+            n3 = checks.get("N3")
+            if n3 == "fail":
+                resolved[key] = False
+            elif n3 == "pass" and key not in resolved:
+                resolved[key] = True
+        return (meta_map, native_smoke, resolved)
+
     cache_key = (current_overlay_stamp(), _file_stat_stamp(LATEST_NATIVE_SMOKE_PATH))
     if _CAPABILITY_CACHE_KEY == cache_key and _CAPABILITY_CACHE_VALUE is not None:
         return _CAPABILITY_CACHE_VALUE
 
     meta_map = load_dalton_meta()
     native_smoke = _load_latest_native_smoke()
-    resolved: dict[str, bool] = {}
+    resolved = {}
 
     for key, meta in meta_map.items():
         if isinstance(meta, dict) and isinstance(meta.get("tool_calling"), bool):
@@ -97,11 +127,25 @@ def _load_tool_capability_snapshot() -> tuple[
     return _CAPABILITY_CACHE_VALUE
 
 
+def _load_latest_native_smoke_cached() -> dict[str, Any]:
+    """Load and cache `latest_native.json` by file stat stamp without calling `load_dalton_meta()`."""
+    global _SMOKE_CACHE_KEY, _SMOKE_CACHE_VALUE
+    stamp = _file_stat_stamp(LATEST_NATIVE_SMOKE_PATH)
+    if _SMOKE_CACHE_KEY == stamp and _SMOKE_CACHE_VALUE is not None:
+        return _SMOKE_CACHE_VALUE
+    data = _load_latest_native_smoke()
+    _SMOKE_CACHE_KEY = stamp
+    _SMOKE_CACHE_VALUE = data
+    return data
+
+
 def clear_tool_capability_cache() -> None:
     """Clear the cached overlay/smoke capability snapshot (test helper)."""
-    global _CAPABILITY_CACHE_KEY, _CAPABILITY_CACHE_VALUE
+    global _CAPABILITY_CACHE_KEY, _CAPABILITY_CACHE_VALUE, _SMOKE_CACHE_KEY, _SMOKE_CACHE_VALUE
     _CAPABILITY_CACHE_KEY = None
     _CAPABILITY_CACHE_VALUE = None
+    _SMOKE_CACHE_KEY = None
+    _SMOKE_CACHE_VALUE = None
 
 
 def _merged_model_entry(model_key: str) -> dict[str, Any] | None:

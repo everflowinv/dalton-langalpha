@@ -615,9 +615,9 @@ return {
       ],
       "validators": [
         {
-          "command": "python .agents/skills/xlsx/scripts/audit.py \"$(ls model/{ticker}-model-v*.xlsx | sort -V | tail -1)\" --strict",
+          "command": "python3 .agents/skills/dalton-model/scripts/model_readable.py \"$(ls model/{ticker}-model-v*.xlsx | sort -V | tail -1)\"",
           "pass_when": "exit_zero",
-          "description": "对新版本模型做严格审计（audit --strict）"
+          "description": "核对新版本模型文件存在且可由 openpyxl 正常打开读取（不因提示性扫描阻断）"
         }
       ]
     },
@@ -794,7 +794,7 @@ const [report, model] = await parallel([
   () =>
     args.model_path
       ? agent(
-          `${base} 按 .agents/skills/model-update/SKILL.md 更新模型 ${args.model_path}：触发类型 Results；先出映射表到 ${R}/mapping.md，再写入另存的新版本（不覆盖旧版），Change Log 完整；recalc 与 audit --strict 通过；输出 EPS walk 与估值变化到 ${R}/model-delta.md。`,
+          `${base} 按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/rollforward.md（对照一致预期时按需读 .agents/skills/dalton-model/references/sanity-check.md）基于原模型 ${args.model_path}（已按 dalton-model 第 1 步优先采用用户本次上传或指定的文件，其次为已登记模型）滚动更新：原件与已有版本保持只读，先输出财报披露行项与模型行项映射表到 ${R}/mapping.md，写入当季实际值并校准远期驱动假设；工作区尚无 model/${T}-model-v*.xlsx 时另存为 ${W}/model/${T}-model-v01.xlsx，已有版本时另存为下一版，并在变更记录（工作簿最前面的 README & Changelog 工作表，或原模型已有的 Change Log 工作表）写明本次改动与原因；运行 python3 .agents/skills/xlsx/scripts/recalc.py <新版本路径> 重算缓存值、python3 .agents/skills/dalton-model/scripts/model_style.py parts-diff ${args.model_path} <新版本路径> 核对部件变动，以及 python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc <新版本路径> 提示性扫描并逐条核对（属问题的修正并重算；合理建模处理、扫描超时或执行失败、以及 Checks〔勾稽检查〕表个别未显示 OK 的条目均写入变更记录后继续）；运行 python3 .agents/skills/dalton-model/scripts/model_style.py lineage --file ${R}/model_lineage.json --output <新版本路径> --baseline ${args.model_path} 记录输入输出路径与哈希；输出新旧版本每股收益（EPS）变动拆解（EPS walk）与估值变化到 ${R}/model-delta.md。`,
           { agentType: 'general-purpose', label: '模型更新', phase: '深度点评与模型', schema: OUT }
         )
       : Promise.resolve(null),
@@ -959,7 +959,7 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
   const modelClause =
     modelPath === null
       ? ''
-      : `模型若有改动走 .agents/skills/model-update/SKILL.md，另存为 ${target}，不覆盖旧版本；模型没改就原样沿用 ${modelPath}。不管改没改，都必须在 files 里回报当前模型的路径（另存则报 ${target}，未改则报 ${modelPath}）。`
+      : `模型若有改动，按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/rollforward.md 保持原件只读，另存为 ${target}，运行 python3 .agents/skills/xlsx/scripts/recalc.py ${target} 重算与 python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc ${target} 提示性扫描并逐条核对（属问题的修正并重算；保留项、扫描超时或执行失败随本次改动一并写入变更记录〔README & Changelog 或 Change Log 工作表〕后继续），再运行 python3 .agents/skills/dalton-model/scripts/model_style.py lineage --file ${R}/model_lineage.json --output ${target} --baseline ${modelPath} 记录输入输出路径与哈希；另存后将报告与 ${R}/model-delta.md 中代表当前模型的路径及单元格引用改为指向 ${target}（model-delta.md 中用于对比的旧版本数值保留原引用），模型输出有变化时同步更新两份文档中受影响的数值；模型未改则原样沿用 ${modelPath}。无论是否修改，均须在 files 里回报当前模型路径（另存报 ${target}，未改报 ${modelPath}）。`
   const fixed = await agent(
     `先核对 ${reportPath} 的 sha256 是否与审稿前（${
       currentSha || '成稿记录值'
@@ -1094,7 +1094,7 @@ const kp = await agent(
     currentSha || '修订后记录值'
   }）一致。${finalModel ? `最终模型为 ${finalModel.path}。` : ''}然后汇总 ${R}/ 全部文件与审稿意见（${
     finalReview ? '见下' : '审稿缺席：只写 NO_CHANGE 以外结论为待审说明，不改核心支柱状态'
-  }），按 PK.2 的 JSON Schema 写知识层修订草案 ${R}/knowledge-revision.json（{doc: {ops, reason, evidence_refs}}）：thesis 支柱信号与证据行、debate 变化、drivers 新读数、management 指引兑现行、lessons（前瞻错判的原因）、models（新模型版本登记，若模型更新失败则写“模型未更新”并排人工跟进）、事件五词终判。\n${
+  }），按 PK.2 的 JSON Schema 写知识层修订草案 ${R}/knowledge-revision.json（{doc: {ops, reason, evidence_refs}}）：thesis 支柱信号与证据行、debate 变化、drivers 新读数、management 指引兑现行、lessons（前瞻错判的原因）、models（按 .agents/skills/dalton-model/SKILL.md 第 7 步登记新模型版本与关键输出单元格；若模型更新失败则写“模型未更新”并在 agenda_ops 排入人工跟进待办）、事件五词终判。\n${
     finalReview ? JSON.stringify(finalReview) : ''
   }`,
   { agentType: 'general-purpose', label: '知识层修订草案', phase: '审稿', schema: OUT }
@@ -1247,9 +1247,9 @@ return {
       ],
       "validators": [
         {
-          "command": "python .agents/skills/xlsx/scripts/audit.py \"$(ls model/{ticker}-model-v*.xlsx | sort -V | tail -1)\" --strict",
+          "command": "python3 .agents/skills/dalton-model/scripts/model_readable.py \"$(ls model/{ticker}-model-v*.xlsx | sort -V | tail -1)\"",
           "pass_when": "exit_zero",
-          "description": "对最终版模型（修订后为 v02）做静态审计（audit --strict）"
+          "description": "核对最终版模型文件（修订后为递增版本）存在且可由 openpyxl 正常打开读取（不因提示性扫描阻断）"
         }
       ]
     },
@@ -1325,7 +1325,7 @@ return {
 export const meta = {
   name: 'full-coverage',
   description:
-    'Dalton 完整覆盖：一手材料与数字底表 → frame → A∥B∥C∥D 取证 → 建模（串行，失败即停）→ 单一写手成稿 → 语言审查（两轮，第 2 轮在终稿上）→ check-model∥独立审稿 → 一轮修订 → 知识层修订草案',
+    'Dalton 完整覆盖：一手材料与数字底表 → frame → A∥B∥C∥D 取证 → 建模（串行，失败即停）→ 单一写手成稿 → 语言审查（两轮，第 2 轮在终稿上）→ 只读审模型∥独立审稿 → 一轮修订 → 知识层修订草案',
 }
 
 const { ticker: T, company: C, workspace_dir: W, as_of: D } = args
@@ -1597,11 +1597,12 @@ if (evMissing.length) {
   }
 }
 
-// 建模串行在最前、失败即停：估值、三情景与 Street vs House 的数字全部来自模型，
-// 模型不在，后面的写作与审稿都是白跑（3 天运行记录审查发现的问题）。门禁四问：
-// 子任务自检（recalc / audit --strict / Checks）是否回报通过、是否声明了本次的
-// model/<TICKER>-model-vNN.xlsx（规范化后完整路径相等；别的目录或别的公司不算）、
-// 声明的产物是否在盘上、只读探针对它实跑 audit --strict 是否通过（不只信自报）。
+// 建模串行在最前、仅模型文件缺失或损坏时停止：估值、基准预测与 Street vs House 的数字来自模型，
+// 模型文件本身不在或打不开时，后续写作与审稿无法展开。门禁只核对三项：
+// 子任务是否产出结果、是否声明了本次的 model/<TICKER>-model-vNN.xlsx（规范化后完整路径相等；
+// 别的目录或别的公司不算）、以及声明的文件在盘上存在且可由 openpyxl 正常打开读取（model_readable.py）。
+// model_scan.py --recalc 提示性扫描的提示、超时或执行失败，以及 Checks 某行未显示 OK 的原因，
+// 均写入 Checks 表与变更记录，工作流继续。
 const MODEL_OUT = {
   type: 'object',
   properties: {
@@ -1610,7 +1611,7 @@ const MODEL_OUT = {
     sha256: { type: 'string', minLength: 64 },
     checks_passed: { type: 'boolean' },
   },
-  required: ['files', 'summary', 'checks_passed'],
+  required: ['files', 'summary'],
 }
 // 模型路径与版本：解析与“另存为下一版”都以磁盘最新版本为准（第 3 轮 #1）。
 const modelFileIn = (files) => {
@@ -1632,34 +1633,34 @@ const resolveFinalModel = async (label, phaseName = '解析最终模型') => {
   return r && typeof r.path === 'string' && r.path && shaOf(r) ? { path: normPath(r.path), sha256: r.sha256 } : null
 }
 phase('建模')
-// 只读探针对模型实跑 audit --strict（收尾契约同一条命令），探针结果为门禁依据，
-// 不只信子任务自报的 checks_passed（第 3 轮 #4）。门禁和之后实际使用的模型必须是同一个文件，
-// 所以解析出磁盘最新版本后，若与建模回报的不同，对最新版本再审一次。
-const strictAudit = async (audited, label) => {
-  const modelAudit = await agent(
-    `只读核验（不写任何文件）。执行 bash：f='${audited}'；python .agents/skills/xlsx/scripts/audit.py "$f" --strict >/dev/null 2>&1 && echo "$f|audit_ok" || echo "$f|audit_failed"。返回 files 数组，只含这一行原样输出。`,
+// 只读探针对模型实跑秒级可读性核验（与收尾契约共用 model_readable.py，由 openpyxl 只读打开并核对各工作表）：
+// 提示性扫描超时、执行失败或提示项均记入变更记录，工作流继续。门禁和之后实际使用的模型必须是同一个文件，
+// 所以解析出磁盘最新版本后，若与建模回报的不同，对最新版本再核验一次。
+const modelReadableProbe = async (targetModel, label) => {
+  const probe = await agent(
+    `只读核验（不写任何文件）。执行 bash：f='${targetModel}'；python3 .agents/skills/dalton-model/scripts/model_readable.py "$f" >/dev/null 2>&1 && echo "$f|readable_ok" || echo "$f|readable_failed"。返回 files 数组，只含这一行原样输出。`,
     { agentType: 'dalton-evidence', label, phase: '建模', schema: PROBE_OUT, checkFiles: false }
   )
-  const auditEntry = modelAudit && Array.isArray(modelAudit.files)
-    ? modelAudit.files.find((e) => typeof e === 'string' && e.startsWith(`${audited}|`))
+  const entry = probe && Array.isArray(probe.files)
+    ? probe.files.find((e) => typeof e === 'string' && e.startsWith(`${targetModel}|`))
     : undefined
-  if (modelAudit === null || auditEntry === undefined) {
+  if (probe === null || entry === undefined) {
     return gateBlock(
-      '模型审计探针失败，无法确认模型通过 audit --strict',
-      '模型审计探针未回报结果；请重试或修复模型后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+      '模型可读性探针失败，无法确认模型文件可正常打开',
+      '模型可读性探针未回报结果；请重试或修复模型后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
     )
   }
-  if (!auditEntry.endsWith('|audit_ok')) {
+  if (!entry.endsWith('|readable_ok')) {
     return gateBlock(
-      `建模自检未通过（只读探针对 ${audited} 实跑 audit --strict 失败），已停在成稿之前`,
-      '建模自检未通过，已停在成稿之前；修复模型至 audit --strict 通过后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+      `模型文件不可读或已损坏（只读探针对 ${targetModel} 实跑工作簿可读性检查失败），已停在成稿之前`,
+      '模型文件不可读或已损坏，已停在成稿之前；修复模型文件至可正常打开后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
     )
   }
   return null
 }
-let auditedModel = ''
+let checkedModel = ''
 const model = await agent(
-  `${base} 按 ${S}/references/model-spec.md 建模型 ${W}/model/${T}-model-v01.xlsx（三表 + DCF + comps + Facts/Guidance vs Actual/Street vs House 三页），支线材料 ${R}/e*.md。recalc 与 audit --strict 必须通过，Checks 全 OK。返回 Scenarios 三情景的每股价值与关键驱动；checks_passed 只有在 recalc、audit --strict、Checks 全部通过时才是 true，任一失败或未跑都必须是 false 并在 summary 里写明失败项。若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。`,
+  `${base} 先读 .agents/skills/dalton-model/SKILL.md 与 ${S}/references/model-spec.md，结合支线材料 ${R}/e*.md 在 ${W}/model/ 产出模型：按 .agents/skills/dalton-model/SKILL.md 第 1 步选择起点原模型（优先采用用户本次指定或上传至 sources/ 的模型文件，其次取 data/models.json 与 model/ 下的最新版本；均无模型时按 model-spec.md 的 15 页规格新建）。原件与历史版本保持只读，新文件名取 model/${T}-model-v*.xlsx 当前最大版本号加一（尚无该文件时存为 ${W}/model/${T}-model-v01.xlsx；已有版本时另存为下一版，如最大为 v01 则另存为 v02）。在原模型上滚动维护时，按 .agents/skills/dalton-model/references/rollforward.md 沿用其结构、预测方法与格式（先运行 python3 .agents/skills/dalton-model/scripts/model_style.py profile <原模型路径> --out ${R}/style_profile.json 提取格式画像），补齐预测期及 Facts（数字底表镜像）、Guidance vs Actual（12 季指引兑现）、Street vs House（本方与市场预期对比）、Checks（勾稽检查）四张工作表，不新建情景页；尚无模型时按 model-spec.md 的 15 张业务工作表（另在工作簿最前面加 README & Changelog 变更记录工作表）新建，保留 Scenarios（情景分析）页并通过 .agents/skills/dalton-model/scripts/model_style.py 的 apply_cell_style 统一写格式。完成后运行 python3 .agents/skills/xlsx/scripts/recalc.py <新版本路径> 重算缓存值，并运行 python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc <新版本路径> 提示性扫描，将结果写入 Checks 表与变更记录（扫描超时、执行失败、保留不改的提示项或 Checks 未显示 OK 的条目均在变更记录写明原因后继续，不阻断交付）；维护原模型时加跑 python3 .agents/skills/dalton-model/scripts/model_style.py parts-diff <原模型路径> <新版本路径> 核对部件变动；最后运行 python3 .agents/skills/dalton-model/scripts/model_style.py lineage --file ${R}/model_lineage.json --output <新版本路径>（有原模型时加 --baseline <原模型路径>）记录输入输出路径与哈希。新建 15 页模型时返回 Scenarios 三情景的每股价值与关键驱动，在原模型上滚动维护时返回原模型估值区域（如有）的基准估值与关键驱动；若属中断续跑且盘上已有本轮未写完的新版本半成品，确认并非用户原件或已登记历史版本后可在该半成品上续写。`,
   { agentType: 'general-purpose', label: '建模', phase: '建模', schema: MODEL_OUT }
 )
 {
@@ -1669,12 +1670,8 @@ const model = await agent(
       '建模失败，已停在成稿之前；补齐模型后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
     )
   }
-  if (model.checks_passed !== true) {
-    const why = model.summary ? `：${model.summary}` : ''
-    return gateBlock(
-      `建模自检未通过（recalc / audit --strict / Checks 任一失败或未回报${why}），已停在成稿之前`,
-      '建模自检未通过，已停在成稿之前；修复模型（recalc、audit --strict、Checks 全部通过）后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
-    )
+  if (model.checks_passed === false) {
+    log(`建模提示性核对存在未通过项或扫描异常（已记入核对记录/变更记录，工作流继续）：${model.summary || '见模型变更记录'}`)
   }
   // 声明产物里必须有规范化后正好等于 model/<TICKER>-model-vNN.xlsx 的文件：
   // 别的目录（archive/…）、别的公司（AAPL-…）或脚本、报告都不算本次的建模产物（第 3 轮 #3）。
@@ -1703,13 +1700,13 @@ const model = await agent(
       '建模失败，已停在成稿之前；补齐模型后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
     )
   }
-  auditedModel = modelDeclared[0]
-  const auditBlock = await strictAudit(auditedModel, '模型审计')
-  if (auditBlock !== null) return auditBlock
+  checkedModel = modelDeclared[0]
+  const readableBlock = await modelReadableProbe(checkedModel, '模型可读性核验')
+  if (readableBlock !== null) return readableBlock
 }
 
 // 写作、审模型、审稿与“另存为下一版”一律基于磁盘最新模型版本（第 3 轮 #1）：resume 时
-// 盘上可能已有上一 run 修订另存的 v02+，仍按 v01 审稿、并指示另存为已存在的 v02 都是错的。
+// 盘上可能已有上一 run 修订另存的更高版本，仍按旧版本审稿或覆盖既有版本都是错的。
 const initialModel = await resolveFinalModel('解析模型（建模后）', '建模')
 if (initialModel === null) {
   return gateBlock(
@@ -1718,23 +1715,23 @@ if (initialModel === null) {
   )
 }
 let modelPath = initialModel.path
-if (modelPath !== auditedModel) {
-  const latestBlock = await strictAudit(modelPath, '模型审计（最新版本）')
+if (modelPath !== normPath(checkedModel)) {
+  const latestBlock = await modelReadableProbe(modelPath, '模型可读性核验（最新版本）')
   if (latestBlock !== null) return latestBlock
-}
-if (modelPath !== normPath(`${W}/model/${T}-model-v01.xlsx`)) {
-  log(`磁盘最新模型版本为 ${modelPath}（可能来自上一 run 的修订另存），写作、审稿与修订都按该版本进行`)
+  log(`磁盘最新模型版本为 ${modelPath}（高于建模子任务回报的 ${checkedModel}，可能来自上一 run 的修订另存），写作、审稿与修订都按该版本进行`)
 }
 
 // 一位写手一次成稿：三位写手分段接力会让各段复述上下文，是 DASH memo 重复的成因之一。
 // resume 保护：语言审查、审稿修订或人工补稿都会原位改 drafts/<D>-memo.md，journal 的
 // 产物哈希随之失配、“成稿”会重新派发——所以派发前先探测并校验（第 3 轮 #2）：
-// 通过结构校验的完整稿才当成稿沿用（不重写）；半成品/空文件派写手在已有内容基础上
-// 续写补全（保留已有内容，不推倒重写）；没有文件才从头写成。
+// 只有结构校验通过、引用的模型路径一致、且 .memo-model.json 记录的路径与哈希与本次最终模型一致的完整稿才直接沿用（缺少该记录按 stale_model 处理）；
+// 若模型路径或哈希已变更（stale_model），派写手按新模型更新受影响的预测、估值与引用后再送审；
+// 半成品/空文件派写手在已有内容基础上续写补全；没有文件才从头写成。
 const memoPath = `${W}/drafts/${D}-memo.md`
+const memoModelMeta = `${R}/.memo-model.json`
 phase('成稿')
 const memoProbe = await agent(
-  `只读核验（不写任何文件）。执行 bash：f='${memoPath}'；if ! test -e "$f"; then echo "$f|absent"; elif [ "$(wc -c < "$f")" -ge 500 ] && python ${S}/scripts/validate_memo.py --mode full "$f" >/dev/null 2>&1; then echo "$f|ok|$(sha256sum "$f" | cut -d' ' -f1)"; else echo "$f|incomplete"; fi。返回 files 数组，只含这一行原样输出。`,
+  `只读核验（不写任何文件）。执行 bash：f='${memoPath}'；m='${modelPath}'；msha='${initialModel.sha256}'；meta='${memoModelMeta}'；if ! test -e "$f"; then echo "$f|absent"; elif [ "$(wc -c < "$f")" -ge 500 ] && python ${S}/scripts/validate_memo.py --mode full "$f" >/dev/null 2>&1; then if python3 -c "import json, os, re, sys; f, m, msha, meta = sys.argv[1:5]; txt = open(f, encoding='utf-8').read(); refs = [r.lstrip('./') for r in re.findall(r'model:([^\\s!#]+\\.xlsx)[!#]', txt, re.I)]; ok = all(r == m for r in refs); ok = ok and os.path.exists(meta) and json.load(open(meta, encoding='utf-8')).get('path') == m and json.load(open(meta, encoding='utf-8')).get('sha256') == msha; sys.exit(0 if ok else 1)" "$f" "$m" "$msha" "$meta" >/dev/null 2>&1; then echo "$f|ok|$(sha256sum "$f" | cut -d' ' -f1)"; else echo "$f|stale_model"; fi; else echo "$f|incomplete"; fi。返回 files 数组，只含这一行原样输出。`,
   { agentType: 'dalton-evidence', label: 'memo 探测', phase: '成稿', schema: HASH, checkFiles: false }
 )
 const memoFiles = memoProbe && Array.isArray(memoProbe.files) ? memoProbe.files : null
@@ -1748,30 +1745,33 @@ const memoEntry = memoFiles.find((e) => typeof e === 'string' && e.startsWith(`$
 if (memoEntry === undefined) {
   return gateBlock(
     `memo 探测结果缺 ${memoPath} 的条目`,
-    'memo 探测子任务的输出不含该路径的“<路径>|ok|<哈希> / incomplete / absent”条目；请重试后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+    'memo 探测子任务的输出不含该路径的“<路径>|ok|<哈希> / stale_model / incomplete / absent”条目；请重试后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
   )
 }
 const memoTail = memoEntry.slice(memoPath.length + 1)
 const memoCompleteSha = memoTail.startsWith('ok|') && /^[0-9a-f]{64}$/.test(memoTail.slice(3)) ? memoTail.slice(3) : null
 const memoPartial = memoTail === 'incomplete'
-if (memoCompleteSha === null && !memoPartial && memoTail !== 'absent') {
+const memoStaleModel = memoTail === 'stale_model'
+if (memoCompleteSha === null && !memoPartial && !memoStaleModel && memoTail !== 'absent') {
   return gateBlock(
     `memo 探测结果无法解析（${memoEntry}）`,
-    'memo 探测条目既不是 ok|<64 位哈希>也不是 incomplete / absent；请重试后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+    'memo 探测条目既不是 ok|<64 位哈希>也不是 stale_model / incomplete / absent；请重试后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
   )
 }
 const memo = memoCompleteSha
   ? {
       files: [memoPath],
-      summary: `盘上已有 ${memoPath} 且结构校验通过（含语言审查或审稿修订），沿用最新稿，不重写`,
+      summary: `盘上已有 ${memoPath}，结构校验通过且引用的模型路径与哈希与本次最终模型 ${modelPath} 一致，沿用最新稿，不重写`,
       sha256: memoCompleteSha,
     }
   : await agent(
-      `${base} 通读 ${R}/questions.md（12 问研究提纲）、${R}/e*.md（含文末逐题证据小结）、${R}/facts.md 与模型 ${modelPath} 的 Scenarios / Street vs House / Valuation Summary 输出，同步按支线证据更新 ${R}/questions.md 每问的 A / B / C / D 自评档位（只写在底稿、不进备忘录正文），并按 ${S}/references/memo-writing.md（章节顺序：摘要 → 公司与商业模式 → 行业与竞争〔可并入上一节〕→ 业务质量 → 核心投资逻辑与争议 → 财务预测与估值 → 风险 → 管理层 → 跟踪 → 附录 → 引用）一次写成完整备忘录 ${memoPath}${
-        memoPartial
-          ? `。盘上已有 ${memoPath} 的半成品（结构校验未通过）：先读已有内容，保留其中可用的部分，补齐缺失的章节与引用，修到结构完整；不要推倒重写已有内容`
-          : ''
-      }。写给基金经理看：每件事只写一遍、12 问不进正文、计算过程放附录；信息缺口写它对判断的影响，不罗列“未披露”；成稿后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处。跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} --research-dir ${R} 到 0 FAIL，并返回 ${memoPath} 的 sha256。`,
+      `${base} 通读 ${R}/questions.md（12 问研究提纲）、${R}/e*.md（含文末逐题证据小结）、${R}/facts.md 与本次最终模型 ${modelPath}（sha256：${initialModel.sha256}）的输出（新建 15 页模型时读取 Scenarios〔情景分析〕、Street vs House〔本方与市场预期对比〕、Valuation Summary〔估值汇总〕；在原模型上滚动维护时读取 Street vs House 与原模型估值区域，原模型未设情景页时备忘录三情景从原模型估值区域或分析师假设取数，并在正文用文字说明情景假设及模型里没有对应计算），同步按支线证据更新 ${R}/questions.md 每问的 A / B / C / D 自评档位（只写在底稿、不进备忘录正文），并按 ${S}/references/memo-writing.md（章节顺序：摘要 → 公司与商业模式 → 行业与竞争〔可并入上一节〕→ 业务质量 → 核心投资逻辑与争议 → 财务预测与估值 → 风险 → 管理层 → 跟踪 → 附录 → 引用）完成备忘录 ${memoPath}${
+        memoStaleModel
+          ? `。盘上已有 ${memoPath}（结构完整），但引用的模型路径或哈希与本次最终模型 ${modelPath}（sha256：${initialModel.sha256}）不一致：先读已有备忘录，保留未受影响的章节与论证，对照本次最终模型 ${modelPath} 更新受影响的预测、估值、表格与全部 model: 引用`
+          : memoPartial
+            ? `。盘上已有 ${memoPath} 的半成品（结构校验未通过）：先读已有内容，保留其中可用的部分，补齐缺失的章节与引用，修到结构完整；不要推倒重写已有内容`
+            : ''
+      }。写给基金经理看：每件事只写一遍、12 问不进正文、计算过程放附录；信息缺口写它对判断的影响，不罗列“未披露”；成稿后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处。随后把本次最终模型信息写入 ${memoModelMeta}（JSON：{"path": "${modelPath}", "sha256": "${initialModel.sha256}"}），跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} --research-dir ${R} 到 0 FAIL，并返回 ${memoPath} 的 sha256。`,
       { agentType: 'general-purpose', label: '成稿', phase: '成稿', schema: DRAFT_OUT }
     )
 const memoSha = shaOf(memo)
@@ -1795,8 +1795,8 @@ phase('审模型与审稿')
 const [mcheck, reviewRaw] = await parallel([
   () =>
     agent(
-      `按 .agents/skills/check-model/SKILL.md 审 ${modelPath}，只出报告不改模型，报告写 ${R}/model-check.md。`,
-      { agentType: 'general-purpose', label: 'check-model', phase: '审模型与审稿', schema: OUT }
+      `按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/sanity-check.md 对 ${modelPath} 做只读核查（原件只读）：运行 python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc ${modelPath} 做提示性扫描（若扫描超时或执行失败，如实记录状态并直接基于工作簿完成核查），结合公司财年、指标口径、三表勾稽与市场一致预期逐条复核，只输出核查报告至 ${R}/model-check.md。`,
+      { agentType: 'general-purpose', label: '只读审模型', phase: '审模型与审稿', schema: OUT }
     ),
   () =>
     !memoOk
@@ -1855,7 +1855,7 @@ let resolved = null
 while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 1) {
   rounds += 1
   const target = nextVersion(modelPath)
-  const modelClause = `模型若有改动走 .agents/skills/model-update/SKILL.md，另存为 ${target}，不覆盖旧版本；模型没改就原样沿用 ${modelPath}。不管改没改，都必须在 files 里回报当前模型的路径（另存则报 ${target}，未改则报 ${modelPath}）`
+  const modelClause = `模型若有改动，按 .agents/skills/dalton-model/SKILL.md 与 .agents/skills/dalton-model/references/rollforward.md 保持原件只读，另存为 ${target}，运行 python3 .agents/skills/xlsx/scripts/recalc.py ${target} 重算与 python3 .agents/skills/dalton-model/scripts/model_scan.py --recalc ${target} 提示性扫描并逐条核对（属问题的修正并重算；保留项、扫描超时或执行失败随本次改动一并写入变更记录〔README & Changelog 或 Change Log 工作表〕后继续），再运行 python3 .agents/skills/dalton-model/scripts/model_style.py lineage --file ${R}/model_lineage.json --output ${target} --baseline ${modelPath} 记录输入输出路径与哈希；模型未改则原样沿用 ${modelPath}。无论是否修改，均须在 files 里回报当前模型路径（另存报 ${target}，未改报 ${modelPath}）`
   fix = await agent(
     `${base} 先核对 ${memoPath} 的 sha256 是否与审稿前（${
       currentMemoSha || '当前记录值'
@@ -1988,14 +1988,14 @@ const kp =
   !memoOk
     ? null
     : await agent(
-        `${base} 先核对 ${memoPath} 的 sha256 是否为修订后哈希（${currentMemoSha || '修订后记录值'}）；最终模型为 ${finalModel.path}；再对比 ${W} 根目录现有知识层，按 PK.2 的 JSON Schema 写知识层修订草案 ${R}/knowledge-revision.json（结构为 {doc: {ops, reason, evidence_refs}}）：每处改动给旧值、新值、原因、证据（引用编号）。管理层指引风格与 C4 历史写入 management 部分；不直接修改 ${W}/data/。`,
+        `${base} 先核对 ${memoPath} 的 sha256 是否为修订后哈希（${currentMemoSha || '修订后记录值'}）；最终模型为 ${finalModel.path}；再对比 ${W} 根目录现有知识层，按 PK.2 的 JSON Schema 写知识层修订草案 ${R}/knowledge-revision.json（结构为 {doc: {ops, reason, evidence_refs}}）：每处改动给旧值、新值、原因、证据（引用编号）。管理层指引风格与 12 季指引兑现历史（ec.md 第 C4 节）写入 management 部分，models 部分按 .agents/skills/dalton-model/SKILL.md 第 7 步登记最终模型版本与关键输出单元格；不直接修改 ${W}/data/。`,
         { agentType: 'general-purpose', label: '知识层修订草案', phase: '修订', schema: OUT }
       )
 
 // facts / frame / 支线 / 建模的缺失已在前置门禁返回，这里只收写作与审稿阶段的失败。
 if (!memoOk) incomplete.push('memo 成稿失败（草稿或其 sha256 缺失/非法）')
 if (lang1Failed) incomplete.push('语言审查第 1 轮失败（结果或其 sha256 缺失/非法），未按清单修改')
-if (mcheck === null) incomplete.push('check-model 失败')
+if (mcheck === null) incomplete.push('只读审模型失败')
 if (review === null && memoOk) incomplete.push('独立审稿失败')
 if (!reviewPassed && !incomplete.length) incomplete.push('审稿未最终通过（无 pass 记录）')
 if (kp === null && memoOk) incomplete.push('知识层修订草案失败')

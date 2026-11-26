@@ -176,6 +176,21 @@ class RecoveryScanner:
             await release_abandoned_claims(
                 assume_dead=assume_dead and not wg.guard_enabled()
             )
+            # DALTON-HOOK(channel-chart-snapshot): expire chart_snapshots stuck in pending >10m after worker crash
+            try:
+                from src.dalton.capabilities import CapabilityId, has_capability
+
+                if has_capability(CapabilityId.CHANNEL_GATEWAY):
+                    from src.dalton.channel_chart_snapshots import (
+                        expire_stale_pending_chart_snapshots,
+                    )
+
+                    await expire_stale_pending_chart_snapshots()
+            except Exception:
+                logger.warning(
+                    "[RecoveryScanner] stale pending chart snapshot cleanup failed",
+                    exc_info=True,
+                )
 
         if not open_runs and not open_task_runs:
             return 0

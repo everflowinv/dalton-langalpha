@@ -1,12 +1,15 @@
-import React, { Suspense, useMemo } from 'react';
+import React, { Suspense, useCallback, useEffect, useEffectEvent, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertCircle, AlertTriangle } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { useArtifactGrant } from '@/hooks/useArtifact';
+// DALTON-HOOK(mobile-web): artifactPathKey & workspace rootDir for unified HtmlFrameDocState reporting
+import { artifactPathKey, useArtifactGrant } from '@/hooks/useArtifact';
+import { useWorkspaceFolders } from '../../../contexts/WorkspaceContext';
 import type { ArtifactVersionView } from '../../filePanel/useArtifactVersionView';
-import { BridgedFrame, type FrameSource } from './BridgedFrame';
+import { BridgedFrame, type FrameSource, type HtmlFrameDocState } from './BridgedFrame';
 import { LazyCommentLayer as CommentLayer } from './comments/lazyCommentLayer';
 import type { CommentUi } from './comments/useCommentUi';
+import { docStatesEqual } from './pageProtocol';
 import { ISOLATED_PAGE_SANDBOX, SERVED_HTML_SANDBOX } from './sandbox';
 import { useLiveFrame, type FrameLinkHandler } from './liveFrame';
 import { buildServeUrl, versionPrefix } from './wsfilesUrl';
@@ -51,6 +54,8 @@ interface ArtifactFramesProps {
   anchorSeq?: number | null;
   /** Where a link to another workspace file opens. */
   onOpenLink?: FrameLinkHandler | null;
+  // DALTON-HOOK(mobile-web): report the active frame's (live or version) HtmlFrameDocState
+  onShownDocChange?: ((state: HtmlFrameDocState) => void) | null;
 }
 
 /** The owner's grant never arrived, so nothing will load until a retry. */
@@ -88,9 +93,11 @@ function VersionNotice({ title, hint, children }: { title: string; hint: string;
  * version.
  */
 export function ArtifactFrames({
-  revision, fileName, workspaceId, filePath, view, shown = true, prefix: givenPrefix = null, anchor = null, anchorSeq = null, onOpenLink = null,
+  revision, fileName, workspaceId, filePath, view, shown = true, prefix: givenPrefix = null, anchor = null, anchorSeq = null, onOpenLink = null, onShownDocChange = null,
 }: ArtifactFramesProps): React.ReactElement {
   const { t } = useTranslation();
+  const root = useWorkspaceFolders()?.rootDir;
+  const expectedLiveDocKey = artifactPathKey(filePath, root);
   const live = useLiveFrame({ workspaceId, filePath, prefix: givenPrefix, inject: 'comments', revision, anchor, anchorSeq, onOpenLink });
 
   // A published version, framed from the artifact's own grant.
@@ -108,6 +115,30 @@ export function ArtifactFrames({
       sandbox: g.isolated ? ISOLATED_PAGE_SANDBOX : SERVED_HTML_SANDBOX,
     };
   }, [entry, versionGrant.data, artifactId]);
+
+  // DALTON-HOOK(mobile-web): track published-version frame document state keyed by versionSource.key
+  const versionKey = versionSource?.key ?? null;
+  const versionExpectedDocKey = entry?.entry_path ? artifactPathKey(entry.entry_path, root) : expectedLiveDocKey;
+  const [versionDocEntry, setVersionDocEntry] = useState<{ key: string | null; state: HtmlFrameDocState }>({
+    key: null,
+    state: { kind: 'pending' },
+  });
+  const handleVersionDocStateChange = useCallback(
+    (next: HtmlFrameDocState, frameKey: string | null) => {
+      if (frameKey !== versionKey) return;
+      setVersionDocEntry((prev) =>
+        prev.key === frameKey && docStatesEqual(prev.state, next)
+          ? prev
+          : { key: frameKey, state: next },
+      );
+    },
+    [versionKey],
+  );
+  const versionHasDocState = versionDocEntry.key !== null;
+  const versionDocState: HtmlFrameDocState =
+    versionKey !== null && versionDocEntry.key === versionKey
+      ? versionDocEntry.state
+      : { kind: 'pending' };
 
   let versionNotice: React.ReactNode = null;
   if (version !== null) {
@@ -129,6 +160,19 @@ export function ArtifactFrames({
     }
   }
 
+  // DALTON-HOOK(mobile-web): report active layer's HtmlFrameDocState once a BridgedFrame has attached
+  const activeDocState: HtmlFrameDocState | null =
+    version === null
+      ? (live.failed || !live.hasDocState ? null : live.docState)
+      : (versionNotice || (!versionHasDocState && !live.hasDocState) ? null : versionDocState);
+  const reportShownDoc = useEffectEvent((state: HtmlFrameDocState) => {
+    onShownDocChange?.(state);
+  });
+  useEffect(() => {
+    if (!shown || !activeDocState) return;
+    reportShownDoc(activeDocState);
+  }, [shown, activeDocState]);
+
   return (
     <div className="artifact-frames">
       <div className="artifact-frames-layer" data-shown={version === null}>
@@ -139,7 +183,11 @@ export function ArtifactFrames({
             source={live.source}
             title={fileName || 'HTML Preview'}
             groundKey={filePath}
+            // DALTON-HOOK(mobile-web): track live frame HtmlFrameDocState
+            expectedDocKey={expectedLiveDocKey}
+            docRoot={root}
             onBridge={live.onBridge}
+            onDocStateChange={live.onDocStateChange}
             // The owner's own view: a page built on the kit shows their data.
             kit={{ grantKey: record?.code ?? null, active: liveShown }}
             overlay={(bridge, frameView) => (
@@ -165,6 +213,10 @@ export function ArtifactFrames({
             source={versionSource}
             title={fileName || 'HTML Preview'}
             groundKey={filePath}
+            // DALTON-HOOK(mobile-web): track published-version frame HtmlFrameDocState
+            expectedDocKey={versionExpectedDocKey}
+            docRoot={root}
+            onDocStateChange={handleVersionDocStateChange}
             notice={versionNotice}
           />
         </div>

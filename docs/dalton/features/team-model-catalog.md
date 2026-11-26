@@ -63,7 +63,7 @@ flowchart TD
 
 ### 2.1 数据库表设计与初始行（新增 Dalton 迁移）
 
-本分支当前唯一的 Dalton Alembic 迁移头为 **`d046`**（`src/dalton/migrations/versions/d046_scoped_data_map_cache.py:23-24`，其 `down_revision = "d048"`）。并行开发中微信多账号占用 `d049`、研究桥拆分从 `d050` 起；本方案 Batch 1 目录迁移（及 Batch 3 价格提醒迁移，若独立合入）均紧接合入时刻主分支唯一的 Dalton `head`（下文记作 `d05X_team_model_catalog.py`）。全部新建表均为 Dalton 自有表，迁移内幂等插入 `singleton_id = 1, revision = 0` 初始空目录行与初始审计行：
+Batch 1 迁移 `d051_team_model_catalog.py` 创建团队模型目录核心表并幂等插入 `revision = 0` 初始空目录行与初始审计行；Batch 3 迁移 `d055_drop_model_price_alerts.py` 删除未启用的价格提醒空表。全部新建表均为 Dalton 自有表：
 
 1. **当前生效目录单行表 `dalton_team_model_catalog`**：
    ```sql
@@ -123,32 +123,7 @@ flowchart TD
        updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
    );
    ```
-4. **第三方价格变动提醒表 `dalton_model_price_alerts`**（Batch 3 启用）：
-   ```sql
-   CREATE TABLE IF NOT EXISTS dalton_model_price_alerts (
-       alert_id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-       model_key             TEXT NOT NULL,
-       provider              TEXT NOT NULL,
-       model_id              TEXT NOT NULL,
-       card_target           TEXT NOT NULL CHECK (card_target IN ('cash', 'notional')),
-       alert_kind            TEXT NOT NULL CHECK (alert_kind IN ('public_price_listed', 'public_price_changed')),
-       match_confidence      TEXT NOT NULL CHECK (match_confidence IN ('exact_route', 'reference_only')),
-       base_catalog_revision BIGINT NOT NULL,
-       current_pricing       JSONB NOT NULL,
-       detected_pricing      JSONB NOT NULL,
-       source_name           TEXT NOT NULL CHECK (source_name IN ('openrouter', 'litellm')),
-       source_url            TEXT NULL,
-       fingerprint           TEXT NOT NULL UNIQUE,
-       status                TEXT NOT NULL DEFAULT 'pending'
-                             CHECK (status IN ('pending', 'applied', 'dismissed')),
-       applied_revision      BIGINT NULL REFERENCES dalton_team_model_catalog_revisions(revision),
-       detected_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-       resolved_by           TEXT NULL,
-       resolved_at           TIMESTAMPTZ NULL
-   );
-   CREATE INDEX IF NOT EXISTS ix_dalton_price_alerts_status
-       ON dalton_model_price_alerts (status, detected_at DESC);
-   ```
+   > 注：`d051_team_model_catalog.py` 曾预建空表 `dalton_model_price_alerts`，已由迁移 `d055_drop_model_price_alerts.py` 删除；价格由管理员直接录入并标注来源。
 
 **`payload` JSONB 结构（`schema: "dalton-team-model-catalog/1"`）**：仅存放公开模型声明、价格评分、退役列表与引导精选增量（密钥字段独立存于 `dalton_catalog_provider_credentials`）：
 
@@ -398,7 +373,7 @@ sequenceDiagram
 
 ### 3.1 管理员门禁、严格字段白名单与只写凭据
 
-1. **三认证模式统一的管理员权限规则（前后端同源）**：全部团队目录管理、测试调用、旧文件修复、价格确认与回滚接口统一通过后端守卫 `require_catalog_admin(user_id)`（位于 `src/dalton/credentials.py:291-322` 与 `src/dalton/access_tiers.py:165-220`）鉴权，并与前端导航准入（`web/src/hooks/useTeamCredentials.ts:58-73` → `web/src/pages/Settings/components/SettingsRail.tsx:57-59` → `web/src/pages/Settings/sections.ts:99` `minTier: 'admin'`）共用同一条规则：
+1. **三认证模式统一的管理员权限规则（前后端同源）**：全部团队目录管理、测试调用、旧文件修复与回滚接口统一通过后端守卫 `require_catalog_admin(user_id)`（位于 `src/dalton/credentials.py:291-322` 与 `src/dalton/access_tiers.py:165-220`）鉴权，并与前端导航准入（`web/src/hooks/useTeamCredentials.ts:58-73` → `web/src/pages/Settings/components/SettingsRail.tsx:57-59` → `web/src/pages/Settings/sections.ts:99` `minTier: 'admin'`）共用同一条规则：
    - **`DALTON_AUTH_MODE=local`（独立核心多用户认证）**：直查 PostgreSQL `dalton_user_roles.tier == 'admin'`（`src/dalton/auth/roles.py:54-79`），数据库异常返回 `503`（Fail-Closed）；
    - **`DALTON_AUTH_MODE=supabase`（Everflow 团队认证）**：校验 `user_id` 属于 `DALTON_PM_USER_IDS`（`credentials.py:303`）；
    - **`DALTON_AUTH_MODE=oss`（独立核心默认回环试用模式，`scripts/standalone/init.sh:1005-1009` 启用 `DALTON_ALLOW_DEV_OSS_AUTH=1`）**：本机所有者（已通过鉴权且非 `COMPANY_SYSTEM_USER_ID` 的当前用户）视为管理员（`admin`），前后端一致展示目录管理入口并放行接口；其余非管理员请求一律返回 `403 Forbidden`。
@@ -443,28 +418,14 @@ sequenceDiagram
 
 ---
 
-## 4. 价格来源标注与第三方价格变动提醒
+## 4. 价格来源标注
 
 ### 4.1 价格来源结构化标注
 
 每张现金价格卡（`providers.models.<p>[].pricing_meta`）与订阅名义价格卡（`dalton_meta.<key>.notional_pricing`）记录：
-- `source_kind`：`"official"`（管理员对照厂商官方文档核实录入）| `"estimated"`（内部预估）| `"third_party"`（来自 OpenRouter / LiteLLM 等第三方公开目录）；
-- `estimated`：`boolean`（`source_kind == "estimated"` 或显式勾选估算时为 `true`，兼容 `src/dalton/llm/native_overlay.json:1622`；前端在模型浮窗、管理列表与预算明细旁渲染「估算」徽标）；
+- `source_kind`：`"official"`（管理员对照厂商官方文档核实录入）| `"estimated"`（内部预估）| `"third_party"`（管理员参考 OpenRouter、LiteLLM 等第三方公开目录手动录入）；
+- `estimated`：`boolean`（`source_kind == "estimated"` 或显式勾选估算时为 `true`，兼容 `src/dalton/llm/native_overlay.json:1622`；前端在管理员目录列表与对话模型选择浮窗（含右侧调优面板）按同一判定规则展示 `官方 / 估算 / 第三方` 徽标）；
 - `source_url`、`verified_at`（`YYYY-MM-DD`）与 `note`（`<= 280` 字）。
-
-### 4.2 定时第三方价格检查、双向渠道匹配与五条件原子确认
-
-1. **双形态共享配置与离线静默容错**：
-   - 在 `src/dalton/settings.py` 的 `DaltonConfig` 中定义带默认值的类型化配置项 `price_watch.enabled: bool = True`（`dalton.yaml` 同步声明），Everflow 与 Core 形态共享同一配置读取器；后台任务 `dalton-model-price-watch` 每 **24 小时**在分布式锁下向 **OpenRouter Models API（主）** 与 **LiteLLM 公开价格表（备）** 发起只读拉取（超时 10 秒，`follow_redirects=False`），支持管理页手动触发；
-   - **离线容错**：内网隔离环境或外部拉取失败时，捕获异常记录 `WARNING` 日志并更新最近检查状态为失败，**线上生效费率保持原值，服务启动、对话与预算计费正常进行**。
-2. **第三方来源标注 + 双向渠道可证性分类**：
-   - OpenRouter 与 LiteLLM 检测记录统一标记为第三方来源（`source_kind = "third_party"`）；
-   - 比对器同时核验**目标模型渠道**与**第三方源记录自身声明的渠道**：
-     - **`exact_route`（源与目标渠道双向可证，提供预填单价）**：仅限两类完全可证映射——① 目标提供商本身为 `openrouter` 且匹配 OpenRouter 官方列表对应条目；② LiteLLM 清单中显式标注一阶官方直连 `litellm_provider`（精确对应 `openai`、`anthropic`、`gemini`、`xai` 标准直连 API）且目标模型同样位于该官方直连现金提供商下；
-     - **`reference_only`（适用范围待人工确认，仅提示变动）**：凡第三方记录未标明直连官方渠道（如用 OpenRouter 聚合报价对照直连提供商）、或目标属于区域变体（`*-cn`）、Coding Plan 套餐（`z-ai-cn-coding` 等名义价）及目录新增变体的条目，统一归为 `reference_only`，界面仅展示参考变动提示与来源链接，由管理员核对所属渠道文档后手填单价。
-3. **五条件原子核对与同事务更新**：
-   - 管理员确认某条提醒 `alert_id` 提交新价格（表单默认 `source_kind = "third_party"`，核实厂商官网后可手动选 `"official"`）时，在 `dalton_team_model_catalog` 事务锁内**同时核对五项条件**：① `expected_revision == current_revision`；② `alert.status == 'pending'`；③ 目标模型键当前的 **`(provider, model_id)` 与提醒记录的 `(alert.provider, alert.model_id)` 完全一致**；④ `(alert.base_catalog_revision, current_revision]` 期间该模型的价格卡未被其他修订改写；⑤ 当前生效单价仍等于 `alert.current_pricing`（任一失配返回 `409 stale_price_alert`）；
-   - 全部通过后，在**同一事务**内写入新目录 `revision`、`revisions` 审计行，并将提醒更新为 `status = 'applied', applied_revision = new_revision`。
 
 ---
 
@@ -478,7 +439,7 @@ sequenceDiagram
 ### 5.2 列表与五分组编辑抽屉设计
 
 1. **目录列表卡片（`TeamModelCatalogCard`）**：
-   - 顶部设搜索框、提供商筛选、状态胶囊（`全部` / `可见` / `已隐藏` / `团队已退役` / `团队新增或改写`）、「版本历史（当前 `vN` · 一键回滚）」、「+ 新增提供商变体」与「+ 新增模型」；当存在 `pending` 价格提醒或 `legacy_sync_import_status == 'failed'` 时，首行展示带修复动作按钮（「重试导入」/「确认放弃旧文件」）的告警横幅；
+   - 顶部设搜索框、提供商筛选、状态胶囊（`全部` / `可见` / `已隐藏` / `团队已退役` / `团队新增或改写`）、「版本历史（当前 `vN` · 一键回滚）」、「+ 新增提供商变体」与「+ 新增模型」；当 `legacy_sync_import_status == 'failed'` 时，首行展示带修复动作按钮（「重试导入」/「确认放弃旧文件」）的告警横幅；
    - 行内展示提供商与凭据就绪徽标、显示名与 `model_key`、现金/名义单价及来源徽标（`官方` / `估算` / `第三方`）、窗口与模态、思考档位与三项评分，行尾提供 `编辑`、`复制新建`、`隐藏/显示`、`退役/恢复`（处于 `'failed'` 只读遗产退役集内的行将「恢复」置为禁用并提示先完成旧文件修复）。
 2. **新增 / 编辑抽屉（同提供商复制默认值 + 5 大分组）**：
    - 选择提供商后自动匹配同提供商现有同族模型预填窗口、输出上限、模态、思考协议写法、计费类型与家族；
@@ -498,7 +459,7 @@ sequenceDiagram
    - `GET /api/v1/models` 按同一 `catalog_revision = R` 取团队 `curated_setup`（未设置时取默认 5 项 `DALTON_SETUP_CANDIDATES`），剔除版本 `R` 中已退役或 `visible == False` 的模型（Core 同步剔除 `tool_calling == False`），输出 `dalton_setup_candidates` 与 `dalton_curated_providers`；
    - 前端 `useSetupFacts.ts:57-65`、`setupSteps.ts:18-22`、`useTeamModelsAvailable.ts:54-90`、`daltonTeamModelsCheck.ts:11`、`defaultChoices.ts:305-332` 与 `daltonSetup.ts:280-361` 统一消费该服务端字段；
    - 精选候选全部隐藏或退役时：Everflow 保持严格精选策略（`hasAvailableDaltonModels = false`，引导停留在 `/setup/model` 并提示联系管理员；管理端隐藏/退役最后一个可见精选前弹出风险确认）；Core 自动回退至 `resolveDaltonCoreFallbackModels`（`daltonSetup.ts:308-360`）。
-3. **预算与账单显示联动**：`/api/v1/dalton/budget/today` 优先汇总每笔调用已落库的 `cost`、`notional_cost` 与 `pricing_provider`，新增变体显示名从当前 `CompiledCatalog` 解析，估算费率旁展示「估算」徽标。
+3. **预算与账单显示联动**：`/api/v1/dalton/budget/today` 优先汇总每笔调用已落库的 `cost`、`notional_cost` 与 `pricing_provider`，新增变体显示名从当前 `CompiledCatalog` 解析。
 
 ---
 
@@ -507,7 +468,7 @@ sequenceDiagram
 ### 6.1 双形态能力注册与上游 `DALTON-HOOK` 规范
 
 1. **能力注册与三认证模式覆盖（`src/dalton/capabilities.py:811-865`）**：
-   - 将全部 `/api/v1/dalton/team-models/*` 路由处理函数登记入 `DALTON_ROUTE_CAPABILITY_REGISTRY`（归属 `CORE_CAPABILITY`），将 `"dalton-team-model-catalog-follow"` 与 `"dalton-model-price-watch"` 登记入 `BACKGROUND_LOOP_REGISTRY`（归属 `CORE_CAPABILITY`），通过 `tests/unit/dalton/test_core_capabilities_gate.py:759-795` 门禁校验；Core 默认回环试用安装（`DALTON_AUTH_MODE=oss`，`scripts/standalone/init.sh:1005-1009`）与公网多用户安装（`DALTON_AUTH_MODE=local`）统一按 §3.1 规则向管理员/本机所有者开放目录管理；
+   - 将全部 `/api/v1/dalton/team-models/*` 路由处理函数登记入 `DALTON_ROUTE_CAPABILITY_REGISTRY`（归属 `CORE_CAPABILITY`），将 `"dalton-team-model-catalog-follow"` 登记入 `BACKGROUND_LOOP_REGISTRY`（归属 `CORE_CAPABILITY`），通过 `tests/unit/dalton/test_core_capabilities_gate.py:759-795` 门禁校验；Core 默认回环试用安装（`DALTON_AUTH_MODE=oss`，`scripts/standalone/init.sh:1005-1009`）与公网多用户安装（`DALTON_AUTH_MODE=local`）统一按 §3.1 规则向管理员/本机所有者开放目录管理；
    - OAuth 订阅专属路由继续归属 `CapabilityId.NATIVE_OAUTH_SYNC`；团队目录在写入校验、合并、启动导入与版本回滚四处统一执行 `CapabilityId.NATIVE_OAUTH_SYNC` 裁剪（关闭时直调 API 提交任何 `*-oauth` 键返回 `400 oauth_capability_disabled`）。
 2. **上游文件 `DALTON-HOOK` 合规（`scripts/dalton/check_hooks.sh`）**：
    - 受保护清单 `src/llms/manifest/*.json` 保持零改动；
@@ -537,7 +498,7 @@ sequenceDiagram
 |---|---|---|---|
 | **Batch 1：数据库目录与专属凭据表、跨部署回合快照、全路径出站与 Fake-IP 守卫、`NativeModelsCard` 收口及管理/回滚 API** | 1) 新增 Dalton 迁移（接合入时唯一头，当前为 `d046`）建表（`dalton_catalog_provider_credentials` 存完整规范化 `canonical_bound_url`）并幂等插入 `revision = 0` 初始行；<br>2) 实现三层合并全覆盖（含 `ModelConfig`、`load_dalton_meta` 深度合并、`notional_pricing.py` 按 `(provider, norm_id(model_id))` 唯一索引与歧义拒绝、`task_costs.py`、系列扩展、剥离变体 `env_key`、按**解析后提供商与继承地址**拒绝个人 `custom_models` 落入目录变体、窄字段固定路由、出厂硬退役与只读遗产退役恢复锁定、升级同名晋升及 `CapabilityId.NATIVE_OAUTH_SYNC` 裁剪）；<br>3) 实现新请求向 PostgreSQL 点查 `revision` + `revision -> CompiledCatalog` 只读缓存 + 单调预热 + **回合启动随运行记录持久化含 `(bound_base_url, key_fingerprint)` 的 `effective_catalog_snapshot`（含首次上线旧运行补写快照兼容）**；<br>4) 实现三认证模式管理员守卫（含 `DALTON_AUTH_MODE=oss` 本机所有者）、目录变体专属凭据绑定、全 5 条发送路径构造期+发送期双重校验、改址/换凭据在途与恢复调用终止，以及兼容 `network.fake_ip_cidrs`（DoH 核验真实公网 IP 直连 + 原主机名 TLS 校验）与 `HeldTransport` 的 `CatalogVariantTransport`；<br>5) 同批完成 `NativeModelsCard` 读写切库、`used_legacy_sync` 历史识别、先提交再可重试归档、退役名单无法确认时暂停同步新增模型并仅放行出厂非已知退役模型、只读遗产键禁普通恢复及 `retry_import` / `abandon_legacy_file` 修复接口；<br>6) 实现管理员 CRUD、隐藏、退役（六源分类 + 在 `schedule.py` `user_automations_lock`、`file.py`、`company_agent_writes.py`、`lifecycle.py`、`user_subagents.py`、`subagent_fanout.py` 最外层覆盖单元锁之前加目录共享锁并锁内校验模型 + 按所有者校验批量替换与 `reasoning_effort` 调和）、测试调用、版本列表及带完整 `base_url` 凭据校验 + 沿替换链按目标版本整体还原任务 + 恢复后引用检查的一键回滚 API。 | • 新建：`src/dalton/migrations/versions/d05X_team_model_catalog.py`、`src/dalton/database/team_model_catalog.py`、`src/dalton/services/team_model_catalog/`<br>• Dalton 模块：`src/dalton/llm/{overlay.py,notional_pricing.py,antigravity_series.py}`、`src/dalton/autonomy/schedule.py`、`src/dalton/services/{native_admin.py,company_agent_writes.py}`、`src/dalton/{access_tiers.py,credentials.py,settings.py,capabilities.py}`、`src/dalton/budget/service.py`、`src/dalton/app/router.py`<br>• 带已登记 `DALTON-HOOK` 的上游模块：`src/llms/{llm.py,pricing_utils.py,task_costs.py}`、`src/utils/tracking/core.py`、`src/ptc_agent/agent/middleware/file_operations/multimodal_strip.py`、`src/server/services/llm/{byok.py,clients.py,custom_catalog.py,egress.py,service.py,provider_models/service.py}`、`src/server/services/automations/{file.py,lifecycle.py}`、`src/server/services/plugins/subagent_fanout.py`、`src/server/database/runs/{lifecycle.py,subagent_runs.py}`、`src/server/services/report_back/restart.py`、`src/server/app/{setup.py,api_keys.py}`、`scripts/dalton/check_hooks.sh` | 1) **双固定端口多进程与三认证模式验收**：在 `8001` 与 `8002` 验证 `X-Dalton-Catalog-Revision` 即时跃升、Redis 断连兜底与旧 `expected_revision` `409`；分别验证 `local`、`supabase` 与 `oss`（回环试用本机所有者为 `admin`）的权限准入；<br>2) **回合中途改价、跨镜像恢复与旧运行补写验收**：验证在途回合中途改价/退役按启动快照结算；模拟镜像静态清单变更及同地址更换变体凭据后由 `restart.py` 恢复回合，断言沿用快照费率并因 `key_fingerprint` 变化终止旧绑定调用；验证无快照旧运行自动补写快照后恢复/结算；<br>3) **解析后地址拦截与全路径 Fake-IP 出站验收**：验证个人模型通过持有人已存 `base_url` 间接落到目录变体 `bound_base_url` 时在保存与调用均返回 `400`；断言全部 5 条路径零继承 `env_key` 或持有人密钥；验证 Fake-IP DoH 真实公网 IP 直连与 `HeldTransport` 阻断内网/`http`/`302`；<br>4) **计费与名义价格唯一键验收**：用本地假端点与记账函数断言现金与订阅名义计费精确，同 `(provider, model_id)` 异价返回 `400 ambiguous_notional_pricing`；<br>5) **最外层退役锁、连续替换链回滚与原生导入容错**：验证 `schedule.py`、`file.py`、`company_agent_writes.py`、`subagent_fanout.py` 最外层锁与退役并发无死锁；验证连续两次目录替换 `A → B → C` 回滚至初始目标版本时一步整体还原为 `A`（有用户修改的保持不动）；验证只改路径 `/v1 → /v2` 后回滚旧地址缺匹配凭据返回 `409 variant_credential_required`；验证曾使用旧文件的部署在文件截断/缺失时暂停同步新增模型、仅放行出厂非已知退役模型、普通恢复只读遗产键返回 `409` 及修复后正常退出 `failed`；`test_core_capabilities_gate.py` 与 `check_hooks.sh --strict --audit` 全绿。 |
 | **Batch 2：管理网页界面、手机端适配与选择器/首次引导全入口联动** | 1) 交付 `TeamModelCatalogCard`、5 分组编辑抽屉（同提供商复制默认值、变体只写凭据录入、「测试调用」诊断、恢复出厂默认）、退役批量替换弹窗、版本历史与回滚弹窗（支持回滚旧地址补填凭据）及原生文件导入异常修复弹窗；<br>2) 在 `useModels.ts` 与 `useTeamModelsAvailable.ts` 接入 `refetchInterval: 5 * 60_000` 定时主动刷新与 `X-Dalton-Catalog-Revision` 响应头即时失效；<br>3) 打通服务端同版本过滤的 `dalton_setup_candidates` / `dalton_curated_providers` 与前端 `useSetupFacts.ts`、`setupSteps.ts`、`daltonTeamModelsCheck.ts`、`defaultChoices.ts`、`daltonSetup.ts` 全入口联动；<br>4) 完成 `< 768px` 手机端卡片流与吸底全屏抽屉适配。 | `web/src/pages/Settings/panels/dalton/{DaltonTeamModelsPanel.tsx,TeamModelCatalogCard.tsx,TeamModelEditSheet.tsx,TeamModelHistoryDialog.tsx}`、`web/src/pages/Settings/sections.ts`、`web/src/config/daltonSetup.ts`、`web/src/pages/Setup/answers/{useSetupFacts.ts,setupSteps.ts,useTeamModelsAvailable.ts,daltonTeamModelsCheck.ts,defaultChoices.ts}`、`web/src/hooks/useModels.ts`、`web/src/locales/{zh-CN,en-US}.json` | 1) **端到端与前台空闲会话刷新（Playwright）**：管理员保存新模型后当前页立即可选；保持另一成员页面**始终停留在前台且零交互**，使用可控时钟断言其在 5 分钟 `refetchInterval` 上限内主动发请求拿到新目录；<br>2) **首次引导全入口验收**：隐藏或退役默认精选模型后，断言 `/setup/model` 准入与 `/setup/default` 推荐同步剔除，精选全空时 Everflow 与 Core 分别按契约兜底；<br>3) **双形态与手机端验收**：Core 零 `*-oauth` 露出，`375x812` 视口无溢出遮挡。 |
-| **Batch 3：价格来源徽标展示与定时第三方价格检查提醒** | 1) 启用 `dalton_model_price_alerts` 与 OpenRouter（主）/ LiteLLM（备）24 小时比对协程、手动点检接口；<br>2) 实现双向渠道可证性分类（`exact_route` vs `reference_only`）、五条件（含 `base_catalog_revision` 与 `model_id`）同事务原子确认及离线静默容错；<br>3) 在 `TeamModelCatalogCard` 顶部接入价格提醒横幅，并在模型浮窗与预算卡片展示 `官方 / 估算 / 第三方` 徽标。 | `src/dalton/services/team_model_catalog/price_watch.py`、`src/dalton/database/team_model_catalog.py`、`web/src/pages/Settings/panels/dalton/{PriceAlertsBanner.tsx,DaltonBudgetCard.tsx}` | 1) **双向渠道分类验收**：验证 OpenRouter 非直连项、区域变体与 Coding Plan 均归为 `reference_only`；<br>2) **五条件原子确认与离线容错**：验证模型改绑新 `model_id` 或期间已改价时确认旧提醒返回 `409 stale_price_alert`；断网拉取失败时线上费率不变、启动与对话零受阻。 |
+| **Batch 3：价格来源徽标展示与清理未启用提醒表** | 在对话模型选择浮窗（含调优面板）和管理员目录列表统一显示 `官方 / 估算 / 第三方` 徽标；`/api/v1/models` 仅公开只读 `source_kind` 与 `estimated`；删除未启用的价格提醒表。 | `src/dalton/migrations/versions/d055_drop_model_price_alerts.py`、`src/dalton/llm/notional_pricing.py`、`src/dalton/services/team_model_catalog/service.py`、`src/server/app/api_keys.py`、`web/src/pages/Settings/utils/priceSource.ts`、`web/src/pages/Settings/panels/dalton/TeamModelCatalogCard.tsx`、`web/src/components/ui/{chat-input.modelPicker.tsx,chat-input.modelTuning.tsx}`、`web/src/hooks/useFilteredModels.ts` | 1) **共享来源判定与界面验收**：共享判定函数单测通过；对话模型选择浮窗（含调优面板）与管理员目录列表按统一规则展示 `官方 / 估算 / 第三方` 徽标，有来源元数据才渲染；<br>2) **接口与迁移验收**：匿名 `GET /api/v1/models` 仅携带只读 `source_kind` / `estimated`（不含订阅名义单价），Dalton 关闭时完整响应与改动前一致，回退价格卡与 `notional_ref` 来源与费率同卡；`d055` 迁移正确升降级并保持 Dalton 迁移链唯一头节点。 |
 
 ---
 
@@ -552,10 +513,10 @@ sequenceDiagram
 | **定案 3** | **退役引用分类、最外层锁顺序与事务批量替换** | 磁盘配置与内置插件 `.md` 引用硬阻止退役；数据库表引用以及 `schedule.py` `user_automations_lock`、`file.py`、`company_agent_writes.py`、`lifecycle.py`、`user_subagents.py`、`subagent_fanout.py` 统一在最外层（覆盖单元锁与用户任务/覆盖锁之前）加目录共享咨询锁并在锁内验证生效模型，与退役排他锁严格同序；批量替换按所有者校验继任模型并调和 `reasoning_effort`，记录带 `(before_config_version, after_config_version)` / `(before_updated_at, after_updated_at)` 的 `side_effects`。 |
 | **定案 4** | **`NativeModelsCard` 同批收口、历史识别与只读遗产退役锁定** | Batch 1 同批切换读写与导入：先在事务内提交数据与 `'imported'` 完成标记，再执行可重试文件归档，`not_applicable` 仅在确认从未使用旧文件时提交；曾使用旧目录文件的部署在退役名单无法确认时暂停同步新增模型，仅允许调用出厂可用且不在任何已知退役记录里的模型，普通「恢复」对只读遗产退役集返回 `409` 保持下线，只有 `retry_import` 成功或 `abandon_legacy_file` 后才可恢复。 |
 | **定案 5** | **三模式管理权限、跨部署快照（含旧运行补写）与连续替换链整体回滚** | `local`、`supabase` 与 `oss`（回环试用本机所有者视为管理员）前后端共用同一管理权限规则；新请求向 PostgreSQL 确认 `revision` 并复用只读派生缓存，前端配置 5 分钟 `refetchInterval` 主动刷新；回合启动持久化含 `(bound_base_url, key_fingerprint)` 的 `effective_catalog_snapshot`，首次发布前的旧运行补写快照后恢复/结算；名义费率以 `(pricing_provider, norm_id(pricing_model_id))` 为唯一键；回滚先用完整 `base_url` 的 `canonical_url_key` / `endpoint_matches_prefix` 校验凭据，再沿替换记录链将无用户修改的任务一步整体还原至目标版本配置，最后基于恢复后状态做引用检查提交。 |
-| **定案 6** | **第三方价格检查机制** | 双形态统一读取 `DaltonConfig` 默认开启每 24 小时比对 OpenRouter 与 LiteLLM，诚实标注为 `third_party`，双向可证渠道方归为 `exact_route`、其余归为 `reference_only`，确认更新时五条件核对（含 `base_catalog_revision` 与 `model_id`）同事务生效，断网失败保持原价。 |
+| **定案 6** | **价格来源与维护方式** | 不做定时第三方价格比对；价格由管理员录入并标注来源。 |
 
 ---
 
-## 附录：待核实事项清单
+## 附录：迁移修订号记录
 
-1. **合入时刻主分支唯一的 Dalton 迁移修订号（待核实）**：当前工作树已核实唯一 Dalton Alembic 头节点为 `d046`（`src/dalton/migrations/versions/d046_scoped_data_map_cache.py:23-24`，其 `down_revision = "d048"`）。鉴于并行分支中微信多账号占用 `d049`、研究桥拆分从 `d050` 起，Batch 1 与 Batch 3（若拆分为独立迁移）合入主分支创建迁移文件时，需对齐当时主分支唯一的 Dalton `head` 顺位号。
+1. **Dalton 迁移修订号**：Batch 1 目录建表迁移为 `d051_team_model_catalog.py`；Batch 3 清理未启用空表的迁移为 `d055_drop_model_price_alerts.py`（合入主分支时按当时唯一 Dalton `head` 顺位对齐）。

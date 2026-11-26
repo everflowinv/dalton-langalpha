@@ -114,7 +114,7 @@
 - **估值基准与远期倍数**：锚定最新有效收盘价 **{价格}** [引用5]，对应股权市值 **{市值}**、企业价值（EV）**{EV}**（写明基础净现金〔账面净现金〕与扣除受限现金、可转债、租赁负债等经营性类债务后的严格净现金口径）[引用1][引用5]。当前股价对应远期倍数：**P/S（市销率）** {x}x、**P/E（市盈率）** {x}x、**EV/EBITDA（企业价值倍数）** {x}x、**EV/Sales（企业价值/营收倍数）** {x}x（硬件周期股加 **mid-cycle P/E〔中周期市盈率〕** {x}x）[引用4][引用5]。
 - **显式持有期**：按 {T 个月} 测算 [假设]。
 
-{一条 `model:` 引用只对应一个数字：若工作区已有 Excel 模型，表内由模型算出的远期 EPS、目标价区间中点、较现价空间与年化回报率（IRR）每个格子必须各自标独立的 [引用N]（如 [引用6] 至 [引用17]），并在文末 `## 引用` 分别指向模型各自的单个单元格（如 `model:model/<TICKER>-model-v<NN>.xlsx!Scenarios!C12`，严禁将多个不同数字指向同一个 `model:` 引用，也严禁引用 `B1:K45` 这类区域）；只有分析师自己设定的情景假设（或尚无正式模型时的情景测算）才标 [假设]。无客观依据时不设主观概率权重；本段填写说明不写进成稿。}
+{一条 `model:` 引用只对应一个数字：若工作区已有 Excel 模型，表内由模型算出的远期 EPS、目标价区间中点、较现价空间与年化回报率（IRR）每个格子各标独立的 [引用N]（如 [引用6] 至 [引用17]），在文末 `## 引用` 分别指向对应的单个单元格（如 `model:model/<TICKER>-model-v<NN>.xlsx!<估值页>!C12`，`<估值页>` 填实际工作表名，坐标写单个单元格而非 `B1:K45` 区域）；尚无模型，或模型未包含该项计算、由分析师自行设定的情景测算标 [假设]。无客观依据时不设主观概率权重；本段填写说明不写进成稿。}
 
 | 情景 | 核心驱动与利润率假设 | 远期 EPS | 目标估值方法与倍数 | 目标价区间（中点） | 较现价空间 | 年化回报率（IRR） |
 |---|---|---|---|---|---|---|
@@ -198,16 +198,16 @@
 [引用3]: evidence:E-20261023-03 （电话会纪要｜<!-- DALTON_CAP:alphaengine -->AlphaEngine / 法定归档<!-- DALTON_CAP_ELSE -->公司 IR / 公开电话会纪要<!-- /DALTON_CAP -->｜{标题}｜{日期}｜{doc_id 或链接}）
 [引用4]: prov:3f6c9a12-0000-0000-0000-000000000001 （卖方与独立研究｜<!-- DALTON_CAP:alphaengine|researchdata_bridge -->AlphaEngine / FUNDA AI / TMTB / Sales Notes<!-- DALTON_CAP_ELSE -->公开卖方点评与独立研究<!-- /DALTON_CAP -->｜{机构与标题}｜{日期}｜{<!-- DALTON_CAP:alphaengine|researchdata_bridge -->doc_id / mail:ID<!-- DALTON_CAP_ELSE -->来源链接<!-- /DALTON_CAP -->}）
 [引用5]: evidence:E-20261023-05 （行情与一致预期快照｜price_reaction.py 输出与一致预期快照｜{日期}｜research/.../price_reaction.json 及 data/consensus/...）
-[引用6]: model:model/META-model-v01.xlsx!Scenarios!C12 （本方模型｜Bull 情景远期 EPS｜{日期}）
-[引用7]: model:model/META-model-v01.xlsx!Scenarios!D12 （本方模型｜Bull 情景目标价中点｜{日期}）
-[引用8]: model:model/META-model-v01.xlsx!Scenarios!E12 （本方模型｜Bull 情景较现价空间｜{日期}）
-[引用9]: model:model/META-model-v01.xlsx!Scenarios!F12 （本方模型｜Bull 情景年化回报率 IRR｜{日期}）
-[引用10]: model:model/META-model-v01.xlsx!Scenarios!C13 （本方模型｜Base 情景远期 EPS｜{日期}）
-[引用11]: model:model/META-model-v01.xlsx!Scenarios!D13 （本方模型｜Base 情景目标价中点｜{日期}）
-[引用12]: model:model/META-model-v01.xlsx!Scenarios!E13 （本方模型｜Base 情景较现价空间｜{日期}）
-[引用13]: model:model/META-model-v01.xlsx!Scenarios!F13 （本方模型｜Base 情景年化回报率 IRR｜{日期}）
-[引用14]: model:model/META-model-v01.xlsx!Scenarios!C14 （本方模型｜Bear 情景远期 EPS｜{日期}）
-[引用15]: model:model/META-model-v01.xlsx!Scenarios!D14 （本方模型｜Bear 情景目标价中点｜{日期}）
-[引用16]: model:model/META-model-v01.xlsx!Scenarios!E14 （本方模型｜Bear 情景较现价空间｜{日期}）
-[引用17]: model:model/META-model-v01.xlsx!Scenarios!F14 （本方模型｜Bear 情景年化回报率 IRR｜{日期}）
+[引用6]: model:model/<TICKER>-model-v<NN>.xlsx!<估值页>!C12 （本方模型｜乐观情景远期 EPS，`<估值页>` 填实际工作表名；模型无对应单元格时在正文标 [假设]｜{日期}）
+[引用7]: model:model/<TICKER>-model-v<NN>.xlsx!<估值页>!D12 （本方模型｜乐观情景目标价中点｜{日期}）
+[引用8]: model:model/<TICKER>-model-v<NN>.xlsx!<估值页>!E12 （本方模型｜乐观情景较现价空间｜{日期}）
+[引用9]: model:model/<TICKER>-model-v<NN>.xlsx!<估值页>!F12 （本方模型｜乐观情景年化回报率 IRR｜{日期}）
+[引用10]: model:model/<TICKER>-model-v<NN>.xlsx!<估值页>!C13 （本方模型｜基准情景远期 EPS｜{日期}）
+[引用11]: model:model/<TICKER>-model-v<NN>.xlsx!<估值页>!D13 （本方模型｜基准情景目标价中点｜{日期}）
+[引用12]: model:model/<TICKER>-model-v<NN>.xlsx!<估值页>!E13 （本方模型｜基准情景较现价空间｜{日期}）
+[引用13]: model:model/<TICKER>-model-v<NN>.xlsx!<估值页>!F13 （本方模型｜基准情景年化回报率 IRR｜{日期}）
+[引用14]: model:model/<TICKER>-model-v<NN>.xlsx!<估值页>!C14 （本方模型｜悲观情景远期 EPS｜{日期}）
+[引用15]: model:model/<TICKER>-model-v<NN>.xlsx!<估值页>!D14 （本方模型｜悲观情景目标价中点｜{日期}）
+[引用16]: model:model/<TICKER>-model-v<NN>.xlsx!<估值页>!E14 （本方模型｜悲观情景较现价空间｜{日期}）
+[引用17]: model:model/<TICKER>-model-v<NN>.xlsx!<估值页>!F14 （本方模型｜悲观情景年化回报率 IRR｜{日期}）
 [引用18]: evidence:E-20261023-06 （赔率计算摘要｜knowledge_update dry_run 输出｜{日期}｜research/.../underwriting-summary.md）

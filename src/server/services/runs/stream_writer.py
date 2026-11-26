@@ -185,6 +185,10 @@ async def append_run_end_event(
     stopped_by: Optional[str] = None,
     # DALTON-HOOK(channel-deliverables): include persisted turn_deliverables on run_end SSE frame
     turn_deliverables: Optional[Sequence[Dict[str, Any]]] = None,
+    # DALTON-HOOK(channel-chart-snapshot): include persisted chart_snapshots, report chart_layers, and outbound_blocked on run_end SSE frame
+    chart_snapshots: Optional[Sequence[Dict[str, Any]]] = None,
+    chart_layers: Optional[Sequence[Dict[str, Any]]] = None,
+    outbound_blocked: Optional[bool] = None,
     redis_event_ttl: int,
     max_stored_messages: int,
 ) -> None:
@@ -280,6 +284,13 @@ async def append_run_end_event(
         # DALTON-HOOK(channel-deliverables): attach verified DM turn deliverables on run_end
         if turn_deliverables:
             frame_data["turn_deliverables"] = list(turn_deliverables)
+        # DALTON-HOOK(channel-chart-snapshot): attach persisted chart_snapshots, report chart_layers, and outbound_blocked on run_end
+        if chart_snapshots:
+            frame_data["chart_snapshots"] = list(chart_snapshots)
+        if chart_layers:
+            frame_data["chart_layers"] = list(chart_layers)
+        if outbound_blocked is not None:
+            frame_data["outbound_blocked"] = bool(outbound_blocked)
         data = json.dumps(frame_data, ensure_ascii=False)
         payload = f"event: {RUN_END_EVENT_TYPE}\ndata: {data}\n\n".encode(
             "utf-8"

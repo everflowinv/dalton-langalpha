@@ -44,7 +44,7 @@ export interface FeishuMarkdownAstNode {
 }
 
 export interface FeishuSchema2CardElement {
-  tag: "markdown" | "hr" | "div" | "button" | "action";
+  tag: "markdown" | "hr" | "div" | "button" | "action" | "img" | "__img__";
   content?: string;
   [key: string]: unknown;
 }
@@ -1486,4 +1486,91 @@ export function parseMergeForwardContent(
     return rendered;
   }
   return `${rendered.slice(0, 19_961).trimEnd()}\n... [Merged-forward content truncated]`;
+}
+
+/**
+ * Builds a Schema 2.0 Feishu card for a system chart_layer snapshot or interactive widget deep link (§2.3).
+ *
+ * When `imagePlaceholder` is provided (DM chart PNG ready), embeds a `{ tag: "__img__", path }`
+ * node that `FeishuChannelAdapter.sendCard` uploads via `im.image.create` and replaces with
+ * `{ tag: "img", img_key, preview: true }`. Bottom includes an `open_url` button when `webUrl` is reachable.
+ */
+export function buildFeishuChartSnapshotCard(params: {
+  title: string;
+  chartId?: string;
+  imagePlaceholder?: string;
+  webUrl?: string | null;
+  isWidget?: boolean;
+  fixedCopy?: boolean;
+}): FeishuSchema2Card {
+  const useFixed = Boolean(params.fixedCopy || params.isWidget);
+  const fixedLabel = params.isWidget ? "交互组件" : "看盘图表";
+  const safeTitle = useFixed
+    ? fixedLabel
+    : escapeFeishuCardPlainText(
+        params.title.trim() || params.chartId?.trim() || fixedLabel,
+      );
+  const elements: FeishuSchema2CardElement[] = [];
+
+  if (params.imagePlaceholder && !useFixed) {
+    elements.push({
+      tag: "__img__",
+      path: params.imagePlaceholder,
+      alt: {
+        tag: "plain_text",
+        content: safeTitle,
+      },
+    });
+  } else {
+    const desc = useFixed
+      ? params.isWidget
+        ? "交互组件已生成，请登录后在网页端查看交互视图。"
+        : "看盘图表已生成，请登录后在网页端查看交互视图。"
+      : `看盘图表 **${safeTitle}** 已生成，请点击下方入口在网页端查看交互视图。`;
+    elements.push({
+      tag: "markdown",
+      content: escapeFeishuCardMarkdownText(desc),
+    });
+  }
+
+  const cleanUrl = (params.webUrl ?? "").trim();
+  if (cleanUrl) {
+    elements.push({
+      tag: "button",
+      type: "primary",
+      text: {
+        tag: "plain_text",
+        content: params.isWidget ? "打开网页交互组件" : "打开网页交互版",
+      },
+      behaviors: [
+        {
+          type: "open_url",
+          default_url: cleanUrl,
+        },
+      ],
+    });
+  } else {
+    elements.push({
+      tag: "markdown",
+      content: "请在网页端对应会话或工作区查看交互视图。",
+    });
+  }
+
+  return {
+    schema: "2.0",
+    config: {
+      width_mode: "fill",
+      wide_screen_mode: true,
+    },
+    header: {
+      title: {
+        tag: "plain_text",
+        content: safeTitle,
+      },
+      template: "blue",
+    },
+    body: {
+      elements,
+    },
+  };
 }

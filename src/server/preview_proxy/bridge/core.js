@@ -15,6 +15,10 @@
 
 var VERSION = 1;
 var viewer = window.parent;
+// DALTON-HOOK(mobile-web): per-document identifier echoed on both page:ready and page:pong.
+var DOC_ID = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+  ? crypto.randomUUID()
+  : ('d_' + Math.random().toString(36).slice(2) + '_' + Date.now().toString(36));
 
 // The viewer's origin, learned from its first message. A page cannot know
 // it in advance: the app can be served from any origin.
@@ -27,10 +31,14 @@ function hello() {
   // answers with its first message, whose origin every later message is
   // addressed to. The path tells the viewer whose comments these are after
   // a link in the document took the frame to another file.
+  // DALTON-HOOK(mobile-web): report tri-state docLocation (path / root / invalidPath) and docId on page:ready.
+  var loc = docLocation();
   /** @type {PageToViewerWire} */
-  var message = { type: 'page:ready', v: VERSION };
-  var path = docPath();
-  if (path) message.path = path;
+  var message = loc.kind === 'path'
+    ? { type: 'page:ready', v: VERSION, docId: DOC_ID, path: loc.path }
+    : loc.kind === 'root'
+      ? { type: 'page:ready', v: VERSION, docId: DOC_ID, root: true }
+      : { type: 'page:ready', v: VERSION, docId: DOC_ID, invalidPath: true };
   viewer.postMessage(message, '*');
 }
 
@@ -116,22 +124,55 @@ function round(n) {
 /** @type {typeof import('../../../../web/src/pages/ChatAgent/components/viewers/html/pageProtocol').MAX_DOC_PATH} */
 var MAX_DOC_PATH = 1024;
 
-// The file this document is, workspace-relative: the part of the URL after
-// a version's /v/<seq>/, or after the grant of the owner's live view
-// (/wsfiles/g/<grant>/). The first such step is the prefix; a later one is
-// part of the path. A path too long to be a file's is left out, not cut.
-var DOC_PATH = /\/(?:v\/[0-9]+|wsfiles\/g\/[^\/]+)\/(.+)$/;
+// DALTON-HOOK(mobile-web): left-anchored tri-state docLocation() covering all 6 served path
+// prefixes, pathless version root entries (DOC_ROOT), and explicit invalid/unrecognized flagging.
+// 1. /api/v1/wsfiles/g/<grant>/<path>
+// 2. /api/v1/public/shared/<token>/files/serve/<path>
+// 3. /api/v1/artifacts/g/<grant>/v/<seq>/<path>
+// 4. /api/v1/dalton/monitors/(g|public)/<id>/v/<seq>/<path>
+// 5. /g/<grant>/v/<seq>/<path>
+// 6. /v/<seq>/<path>
+var DOC_PATH = /^\/(?:api\/v1\/(?:wsfiles\/g\/[^\/]+|public\/shared\/[^\/]+\/files\/serve|artifacts\/g\/[^\/]+\/v\/[0-9]+|dalton\/monitors\/(?:g|public)\/[^\/]+\/v\/[0-9]+)|g\/[^\/]+\/v\/[0-9]+|v\/[0-9]+)\/(.+)$/;
 
-function docPath() {
-  var match = DOC_PATH.exec(location.pathname);
-  if (!match) return null;
-  var path;
-  try {
-    path = decodeURIComponent(match[1]);
-  } catch (e) {
-    return null;
+// Left-anchored pathless version root entries (e.g. public monitor root `${prefix}/`).
+var DOC_ROOT = /^\/(?:(?:api\/v1\/(?:artifacts\/g\/[^\/]+|dalton\/monitors\/(?:g|public)\/[^\/]+)|g\/[^\/]+)\/)?v\/[0-9]+\/?$/;
+
+var CTRL_CHAR = /[\u0000-\u001f\u007f]/;
+
+/**
+ * Classify the framed document's URL pathname into a validated workspace-relative
+ * path, a confirmed pathless version root, or an invalid/unrecognized location.
+ * @returns {{ kind: 'path', path: string } | { kind: 'root' } | { kind: 'invalid' }}
+ */
+function docLocation() {
+  var pathname = location.pathname;
+  var match = DOC_PATH.exec(pathname);
+  if (match) {
+    var decoded;
+    try {
+      decoded = decodeURIComponent(match[1]);
+    } catch (e) {
+      return { kind: 'invalid' };
+    }
+    if (decoded.length > MAX_DOC_PATH) return { kind: 'invalid' };
+    if (decoded.indexOf('\\') !== -1 || CTRL_CHAR.test(decoded)) return { kind: 'invalid' };
+    var path = decoded.replace(/^\/+/, '');
+    if (!path || path.length > MAX_DOC_PATH) return { kind: 'invalid' };
+    var segments = path.split('/');
+    for (var i = 0; i < segments.length; i++) {
+      if (segments[i] === '..') return { kind: 'invalid' };
+    }
+    return { kind: 'path', path: path };
   }
-  return path.length <= MAX_DOC_PATH ? path : null;
+  if (DOC_ROOT.test(pathname)) return { kind: 'root' };
+  return { kind: 'invalid' };
+}
+
+// DALTON-HOOK(mobile-web): preserve docPath() helper for loads.js using docLocation()
+/** @returns {string | null} */
+function docPath() {
+  var loc = docLocation();
+  return loc.kind === 'path' ? loc.path : null;
 }
 
 // ---- Scrolling, the ground, settling ----
@@ -398,6 +439,12 @@ listen('page:monitor-grant', function (data) {
   } catch (e) {
     // Ignore CustomEvent failure on restricted runtimes.
   }
+});
+
+// DALTON-HOOK(mobile-web): confirm the same bridged document owns the frame after load completes.
+listen('page:ping', function (data) {
+  if (!data || typeof data.seq !== 'number' || !isFinite(data.seq)) return;
+  send({ type: 'page:pong', seq: data.seq, docId: DOC_ID });
 });
 
 // A window the document has no tie to is not heard, by this bridge or the

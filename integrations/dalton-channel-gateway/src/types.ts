@@ -534,6 +534,7 @@ export interface AutomationRunTargetRecord {
 export interface AgentAutomationRunFinishRequest {
   status: "completed" | "failed" | "stopped" | "interrupted" | "cancelled";
   thread_id?: string | null;
+  run_id?: string | null;
   final_text?: string | null;
 }
 

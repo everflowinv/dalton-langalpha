@@ -1,0 +1,36 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/dalton/channels/internal/snapshots/status?run_id=run-snap-ready-1&thread_id=11111111-1111-4111-8111-111111111111&platform=feishu"
+  },
+  "response": {
+    "body": {
+      "has_pending": false,
+      "outbound_blocked": false,
+      "run_id": "run-snap-ready-1",
+      "snapshots": [
+        {
+          "artifact_type": "chart_layer",
+          "chart_id": "NVDA:1day",
+          "command_id": "cmd-bg-1",
+          "error": null,
+          "height": 720,
+          "layer_id": "layer-nvda-1",
+          "pending_since": "2026-11-25T10:00:00.000000Z",
+          "sha256": "567e3611094b537115a14c3a314014e8dfcb2b6e993ede8b2da85be93f200849",
+          "size_bytes": 69,
+          "snapshot_key": "channel-snapshots/11111111-1111-4111-8111-111111111111/567e3611094b5371/chart_layer-nvda-1.png",
+          "status": "ready",
+          "symbol": "NVDA",
+          "timeframe": "1day",
+          "title": "NVDA 日线支撑位",
+          "updated_at": "2026-11-25T10:00:03.000000Z",
+          "width": 1200,
+          "workspace_id": "ws-contract-1"
+        }
+      ],
+      "thread_id": "11111111-1111-4111-8111-111111111111"
+    },
+    "status": 200
+  }
+}

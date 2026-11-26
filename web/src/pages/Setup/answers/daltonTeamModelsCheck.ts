@@ -363,6 +363,7 @@ export async function checkDaltonTeamModelsAvailable({
   // DALTON-HOOK(standalone-core): overlay Core recorded tool-calling probe verdicts before availability gating
   const effectiveMetadata = applyDaltonProviderToolProbes(visible.metadata, configuredProviders, customModels);
 
+  // DALTON-HOOK(team-model-catalog): pass version-aligned server `dalton_setup_candidates` into availability check
   return {
     available: hasAvailableDaltonModels(
       offered,
@@ -371,6 +372,7 @@ export async function checkDaltonTeamModelsAvailable({
       true,
       rejectedProviders,
       modelsData.dalton_profile,
+      modelsData.dalton_setup_candidates,
     ),
     rejectedProviders,
   };

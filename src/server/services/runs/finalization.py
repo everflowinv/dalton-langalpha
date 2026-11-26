@@ -241,6 +241,33 @@ async def assemble_finalize_artifacts(
             persist_metadata["turn_deliverables"] = recorded_deliverables
             metadata["persisted_turn_deliverables"] = recorded_deliverables
 
+    # DALTON-HOOK(channel-chart-snapshot): read persisted chart_snapshots (incl. command_report linked),
+    # query report_source/command_reports chart_layers, and outbound_blocked state for run_end emission
+    # WITHOUT putting them into persist_metadata (never overwrite concurrent DB updates).
+    try:
+        from src.dalton.capabilities import CapabilityId, has_capability
+
+        if has_capability(CapabilityId.CHANNEL_GATEWAY):
+            from src.dalton.channel_chart_snapshots import get_run_end_chart_payload
+
+            snap_state = await get_run_end_chart_payload(
+                run_id=key[1],
+                thread_id=key[0],
+            )
+            snap_blocked = snap_state.get("outbound_blocked")
+            if isinstance(snap_blocked, bool):
+                metadata["persisted_outbound_blocked"] = snap_blocked
+            if snap_blocked is False and snap_state.get("chart_snapshots"):
+                metadata["persisted_chart_snapshots"] = snap_state["chart_snapshots"]
+            if snap_state.get("chart_layers"):
+                metadata["persisted_report_chart_layers"] = snap_state["chart_layers"]
+    except Exception:
+        logger.debug(
+            "[Finalize] reading persisted chart_snapshots for run %s failed",
+            key[1],
+            exc_info=True,
+        )
+
     return RunOutcome(
         status=status,
         interrupt_reason=interrupt_reason,

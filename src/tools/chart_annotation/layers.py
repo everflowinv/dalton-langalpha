@@ -144,22 +144,96 @@ class Staged:
             )
 
 
-async def publish_outbox(outbox: Outbox, workspace_id: str | None) -> Published:
+async def publish_outbox(
+    outbox: Outbox,
+    workspace_id: str | None,
+    *,
+    # DALTON-HOOK(channel-chart-snapshot): optional turn identity for DM snapshot persistence & background render
+    thread_id: str | None = None,
+    run_id: str | None = None,
+    user_id: str | None = None,
+) -> Published:
     """Validate, store and stream the layers a run published. Never raises:
     the job has ended either way, and what went wrong is told in the text."""
     if not outbox:
         return Published()
     try:
-        return await _publish(outbox, workspace_id)
+        return await _publish(
+            outbox,
+            workspace_id,
+            thread_id=thread_id,
+            run_id=run_id,
+            user_id=user_id,
+        )
     except Exception:
         logger.exception("[chart_layers] publishing a run's outbox failed")
         return Published(_UNPROCESSED)
 
 
-async def _publish(outbox: Outbox, workspace_id: str | None) -> Published:
+async def _publish(
+    outbox: Outbox,
+    workspace_id: str | None,
+    *,
+    # DALTON-HOOK(channel-chart-snapshot): optional turn identity for DM snapshot persistence & background render
+    thread_id: str | None = None,
+    run_id: str | None = None,
+    user_id: str | None = None,
+) -> Published:
     staged = await asyncio.to_thread(_stage, outbox, workspace_id)
     if not staged.bodies:
         return staged.stored()
+    # DALTON-HOOK(channel-chart-snapshot): commit chart layers and pending DM snapshot rows in the same DB transaction
+    registered_snapshots: list[dict[str, Any]] = []
+    if thread_id and run_id:
+        from src.dalton.capabilities import CapabilityId, has_capability
+
+        if has_capability(CapabilityId.CHANNEL_GATEWAY):
+            from src.dalton.channel_chart_snapshots import (
+                register_pending_chart_snapshots_in_tx,
+                schedule_chart_snapshots_render,
+            )
+            from src.server.database.chart_annotation import encode_layers, insert_layers
+            from src.server.database.pool import get_db_connection
+
+            try:
+                rows = await encode_layers(staged.bodies)
+                async with get_db_connection() as conn:
+                    async with conn.transaction():
+                        await insert_layers(conn, rows)
+                        try:
+                            async with conn.transaction():
+                                registered_snapshots = await register_pending_chart_snapshots_in_tx(
+                                    conn,
+                                    thread_id=thread_id,
+                                    run_id=run_id,
+                                    user_id=user_id,
+                                    bodies=staged.bodies,
+                                )
+                        except Exception:
+                            logger.warning(
+                                "[chart_layers] registering pending DM chart snapshots failed; continuing without snapshots",
+                                exc_info=True,
+                            )
+                            registered_snapshots = []
+            except Exception:
+                logger.exception("[chart_layers] storing %d layer(s) failed", len(staged.bodies))
+                return staged.unsaved()
+            staged.emit()
+            if registered_snapshots and user_id:
+                try:
+                    schedule_chart_snapshots_render(
+                        thread_id=thread_id,
+                        run_id=run_id,
+                        user_id=user_id,
+                        bodies=staged.bodies,
+                        registered_entries=registered_snapshots,
+                    )
+                except Exception:
+                    logger.warning(
+                        "[chart_layers] scheduling DM chart snapshot render failed",
+                        exc_info=True,
+                    )
+            return staged.stored()
     try:
         await add_layers(staged.bodies)
     except Exception:

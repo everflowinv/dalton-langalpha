@@ -31,6 +31,18 @@ from us_top_framework import TopFrameworkConfig, evaluate_top_framework, top_dig
 from us_top_framework_selftest import top_framework_checks as top_framework_checks
 from us_market_sections import MONITOR_CSS, bottom_monitor_section, state_monitor_section, top_monitor_section
 from gs_prime_positioning import evaluate_gs_prime_signals, render_gs_prime_section, update_gs_prime_store
+from jepq_signal import (
+    JEPQ_CARD_TITLE,
+    JEPQ_STATE_REL,
+    build_jepq_card_section,
+    detect_jepq_light_change,
+    evaluate_jepq_signal,
+    format_jepq_digest_line,
+    load_jepq_state,
+    render_jepq_section,
+    save_jepq_light,
+    validate_jepq,
+)
 from dashboard_copy import (
     UI_COPY,
     display_asset_name,
@@ -1846,7 +1858,7 @@ def tech_state(z: Any) -> str:
     return "中性"
 
 
-def digest_lines(signals: dict[str, Any]) -> list[str]:
+def digest_lines(signals: dict[str, Any], prev_jepq_light: str | None = None) -> list[str]:
     """把 signals.json 渲染成飞书卡片的 markdown。
 
     只读 signals.json，不碰行情：卡片里的每个数字都必须能在同一份 JSON 里找到，
@@ -1880,6 +1892,8 @@ def digest_lines(signals: dict[str, Any]) -> list[str]:
         gp = us["gs_prime"]
         out.append("- GS Prime：" + (signals_join(gp.get("hits", []))
                                     or f"无极端信号（{gp.get('reading', '读数缺失')}）"))
+    if "jepq" in signals:
+        out.append(format_jepq_digest_line(signals["jepq"], prev_light=prev_jepq_light))
     out.append("")
 
     st = signals.get("us_stocks", {})
@@ -1935,6 +1949,7 @@ DIGEST_CARD_TITLE_TOP = "🔺 美股顶部"
 DIGEST_CARD_TITLE_BOTTOM = "🔻 美股底部"
 DIGEST_CARD_TITLE_US_OTHER = "美股其他"
 DIGEST_CARD_TITLE_ASIA = "A股 · 港股 · 日韩台"
+DIGEST_CARD_TITLE_JEPQ = JEPQ_CARD_TITLE
 
 
 def digest_tone(text: str) -> str:
@@ -1958,7 +1973,7 @@ def strip_bullet(line: str) -> str:
     return line[2:] if line.startswith("- ") else line
 
 
-def digest_card_sections(signals: dict[str, Any]) -> list[dict[str, Any]]:
+def digest_card_sections(signals: dict[str, Any], prev_jepq_light: str | None = None) -> list[dict[str, Any]]:
     """卡片 2.0 的分节模型：title / lead（已着色）/ lines（已着色，正常字号）/ quiet（灰色小字）。"""
     us = signals.get("us_market", {})
     topbottom = us.get("topbottom", {})
@@ -2073,14 +2088,23 @@ def digest_card_sections(signals: dict[str, Any]) -> list[dict[str, Any]]:
         else:
             asia_section["quiet"].append(f"{label}：无信号（{block.get('reading', '读数缺失')}）")
     sections.append(asia_section)
+    if "jepq" in signals:
+        sections.append(
+            build_jepq_card_section(
+                signals["jepq"],
+                prev_light=prev_jepq_light,
+                paint=paint,
+                warn_tone=DIGEST_CARD_WARN,
+            )
+        )
     return sections
 
 
-def digest_card(signals: dict[str, Any]) -> dict[str, Any]:
+def digest_card(signals: dict[str, Any], prev_jepq_light: str | None = None) -> dict[str, Any]:
     """把 signals.json 渲染成飞书 Card Schema 2.0。
 
     版式：标题栏颜色跟顶部/底部状态机走（顶部活动=红，底部活动=绿，都没有=indigo），
-    右上角两枚标签写顶部、底部当前阶段；正文四节，节与节之间用分隔线。
+    右上角两枚标签写顶部、底部当前阶段；正文按市场与策略分节，节与节之间用分隔线。
     warnings 仍在最后，橙色正常字号——这是卡片上唯一能看出「某块数据今天没取到」的地方。
     只用 markdown / hr 两种元素：schema 2.0 不支持 note，小字走 text_size=notation。
     """
@@ -2090,7 +2114,7 @@ def digest_card(signals: dict[str, Any]) -> dict[str, Any]:
     top_active = bool(top_fw.get("active"))
     bottom_active = bool(bottom_fw.get("active"))
     elements: list[dict[str, Any]] = []
-    for section in digest_card_sections(signals):
+    for section in digest_card_sections(signals, prev_jepq_light=prev_jepq_light):
         block = [f"**{section['title']}**" + (f"　{section['lead']}" if section["lead"] else "")]
         block += [f"- {line}" for line in section["lines"]]
         elements.append({"tag": "markdown", "content": "\n".join(block)})
@@ -2162,11 +2186,13 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
     tickers += [x["ticker"] for x in config.get("relative_extras", [])]
     for basket in config.get("equal_weight_baskets", []):
         tickers += list(basket["members"]) + [basket["benchmark"]]
+    existing_tickers = set(tickers)
+    tickers += ["QQQ", "JEPQ"]
     cache = WORKSPACE / "state/sentiment-dashboard/yfinance_prices.pkl" if use_cache else None
     # SPX/trend needs a complete pre-anchor history; other tickers simply begin
     # on their own listing dates.
     prices = download_prices(tickers, "2014-01-01", cache)
-    if not prices:
+    if not any(t in prices for t in existing_tickers):
         raise RuntimeError("price download returned no usable series")
     # Yahoo 000300.SS can omit weeks of daily bars while still returning today's
     # quote. Use the same continuous CSI300 close history as the A-share tab.
@@ -2863,6 +2889,9 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
         store=gs_prime_store, signals_block=gs_prime_signal, qqq_price=qqq_price,
         chart=chart, series_payload=series_payload, hline=hline, metric_card=metric_card, fmt=fmt,
     )
+    jepq_ref = [prices.get("SPY"), prices.get("^GSPC")]
+    jepq_signal = evaluate_jepq_signal(prices.get("QQQ"), prices.get("JEPQ"), reference_series=jepq_ref)
+    jepq_monitor_html = render_jepq_section(jepq_signal, metric_card=metric_card, fmt=fmt)
 
     overview_copy = UI_COPY["overview"]
     f_rows = overview_copy["freshness_rows"]
@@ -3050,6 +3079,7 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
             + bbg_us_stale_banner
             + bottom_monitor_html
             + top_monitor_html
+            + jepq_monitor_html
             + state_monitor_section(
                 spx_trend_chart=spx_trend_chart,
                 gs_prime_html=gs_prime_html,
@@ -3313,6 +3343,7 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
             "reading": " · ".join(f"{n} {s:.0f}" for n, s, _ in asia_scores if s is not None) or "杠杆综合分本次读不到",
             "rows": [{"name": n, "score": s, "hint": h} for n, s, h in asia_scores],
         },
+        "jepq": jepq_signal,
         "footnotes": [
             f"美股与个股读数截至 {us_as_of}（Yahoo 复权收盘）；"
             f"周期/防御、Momentum、AH 来自 Bloomberg CSV，截至 {bbg.get('as_of', '未知')}。",
@@ -3350,7 +3381,7 @@ def build_dashboard(output: Path, use_cache: bool = True) -> dict[str, Any]:
     panels_dir = output.parent / "panels"
     split_panels_meta = write_split_panels(panels_dir, sections, data_as_of)
     overlong_notes = long_notes(html_doc)
-    warnings = [x for x in ["NDX/SPW使用RSP代理" if ratio_proxy else None, "FRED部分数据不可用" if any(v.empty for v in fred.values()) else None, f"A股盘中资金流快照缺失：{flow_snapshot.get('error','')}" if not flow_snapshot.get("ok") and not flow_snapshot.get("blocked") else None, f"指数长历史缺失：{'、'.join(history['missing'])}" if history["missing"] else None, f"日韩台图缺数据：{'、'.join(asia_charts['missing'])}" if asia_charts["missing"] else None, f"MSCI指数用缓存未刷新：{'、'.join(asia_charts['stale'])}" if asia_charts["stale"] else None, f"A股量能取数失败：{turnover_snapshot.get('error','')}" if not turnover_snapshot.get("ok") else None, "日韩台综合分历史未落盘，1W/1M位移缺失" if not asia_trail_rows else None, f"行情缺失标的：{'、'.join(price_missing)}" if price_missing else None, f"趋势线算不出：{'、'.join(trend_missing)}" if trend_missing else None, f"缺少趋势线冻结参数：{'、'.join(trend_unfrozen)}" if trend_unfrozen else None, f"趋势线OHLC取数失败，退回缓存：{'、'.join(trend_stale)}" if trend_stale else None, ("彭博数据未更新" if not bbg.get("ok") else f"彭博数据落后{effective_bbg_stale_days}天（{'、'.join(bbg_stale_parts_all) or bbg_asof_val}）" if effective_bbg_stale_days is not None and effective_bbg_stale_days > BBG_STALE_DAYS else None), *[f"美股底部框架：{x}" for x in bottom_framework.get("warnings", [])], *[f"美股底部环境：{x}" for x in bottom_environment.get("warnings", [])], *[f"美股顶部框架：{x}" for x in top_framework.get("warnings", [])], f"图注超过{NOTE_MAX_CHARS}字：{'；'.join(overlong_notes)}" if overlong_notes else None] if x]
+    warnings = [x for x in ["NDX/SPW使用RSP代理" if ratio_proxy else None, "FRED部分数据不可用" if any(v.empty for v in fred.values()) else None, f"A股盘中资金流快照缺失：{flow_snapshot.get('error','')}" if not flow_snapshot.get("ok") and not flow_snapshot.get("blocked") else None, f"指数长历史缺失：{'、'.join(history['missing'])}" if history["missing"] else None, f"日韩台图缺数据：{'、'.join(asia_charts['missing'])}" if asia_charts["missing"] else None, f"MSCI指数用缓存未刷新：{'、'.join(asia_charts['stale'])}" if asia_charts["stale"] else None, f"A股量能取数失败：{turnover_snapshot.get('error','')}" if not turnover_snapshot.get("ok") else None, "日韩台综合分历史未落盘，1W/1M位移缺失" if not asia_trail_rows else None, f"行情缺失标的：{'、'.join(price_missing)}" if price_missing else None, f"JEPQ—QQQ 信号缺失：{jepq_signal.get('error', '数据不足')}" if not jepq_signal.get("ok") else None, f"趋势线算不出：{'、'.join(trend_missing)}" if trend_missing else None, f"缺少趋势线冻结参数：{'、'.join(trend_unfrozen)}" if trend_unfrozen else None, f"趋势线OHLC取数失败，退回缓存：{'、'.join(trend_stale)}" if trend_stale else None, ("彭博数据未更新" if not bbg.get("ok") else f"彭博数据落后{effective_bbg_stale_days}天（{'、'.join(bbg_stale_parts_all) or bbg_asof_val}）" if effective_bbg_stale_days is not None and effective_bbg_stale_days > BBG_STALE_DAYS else None), *[f"美股底部框架：{x}" for x in bottom_framework.get("warnings", [])], *[f"美股底部环境：{x}" for x in bottom_environment.get("warnings", [])], *[f"美股顶部框架：{x}" for x in top_framework.get("warnings", [])], f"图注超过{NOTE_MAX_CHARS}字：{'；'.join(overlong_notes)}" if overlong_notes else None] if x]
     warnings.extend(dict.fromkeys(china_stock_warnings))
     signals["warnings"] = list(warnings)
     # notices 只进构建日志和 --json 结果，不上卡片：已知、已定性、不需要每天处理的取数缺口。
@@ -3760,7 +3791,7 @@ def refit_trend(tickers: list[str], write: bool) -> dict[str, Any]:
     return {"ok": all(x["ok"] for x in changes), "written": bool(write), "config": str(CONFIG_PATH), "changes": changes}
 
 
-def run_digest(signals_path: Path, out: Path) -> dict[str, Any]:
+def run_digest(signals_path: Path, out: Path, jepq_state_path: Path | None = None) -> dict[str, Any]:
     """把 build 落下的 signals.json 渲染成飞书速览卡片。"""
     if not signals_path.exists():
         return {"ok": False, "error": f"{signals_path} 不存在", "hint": "先跑 scripts/run.sh build --json 生成 signals.json"}
@@ -3769,6 +3800,40 @@ def run_digest(signals_path: Path, out: Path) -> dict[str, Any]:
     if stale is not None and stale > DIGEST_STALE_DAYS:
         return {"ok": False, "error": f"signals.json 停在 {signals.get('date')}，落后 {stale} 天",
                 "hint": "先跑 scripts/run.sh build --no-cache --json 刷新，再发卡片"}
+    state_path = jepq_state_path if jepq_state_path is not None else WORKSPACE / JEPQ_STATE_REL
+    has_jepq = "jepq" in signals
+    jepq_raw = signals.get("jepq") if has_jepq else None
+    jepq_valid = validate_jepq(jepq_raw) if has_jepq else None
+    prev_jepq_state = load_jepq_state(state_path) if has_jepq else None
+    prev_jepq_light = prev_jepq_state["light"] if prev_jepq_state else None
+    prev_jepq_asof = prev_jepq_state["asof"] if prev_jepq_state else ""
+    jepq_change = detect_jepq_light_change(
+        jepq_valid["light"] if jepq_valid is not None else None,
+        prev_jepq_light,
+        current_asof=jepq_valid["asof"] if jepq_valid is not None else "",
+        prev_asof=prev_jepq_asof,
+    )
+    if has_jepq:
+        if jepq_valid is not None:
+            signals = {
+                **signals,
+                "jepq": {
+                    **jepq_valid,
+                    "prev_light": prev_jepq_light,
+                    "prev_asof": prev_jepq_asof,
+                    "changed": jepq_change["changed"],
+                },
+            }
+        else:
+            existing_warnings = list(signals.get("warnings") or [])
+            if not any("JEPQ—QQQ" in str(w) for w in existing_warnings):
+                err_msg = (
+                    jepq_raw.get("error") or jepq_raw.get("reason")
+                    if isinstance(jepq_raw, dict)
+                    else None
+                ) or "数据字段不完整或格式无效"
+                existing_warnings.append(f"JEPQ—QQQ 信号缺失：{err_msg}")
+            signals = {**signals, "warnings": existing_warnings}
     markdown = "\n".join(digest_lines(signals)).rstrip() + "\n"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(markdown, encoding="utf-8")
@@ -3776,11 +3841,19 @@ def run_digest(signals_path: Path, out: Path) -> dict[str, Any]:
     card = digest_card(signals)
     card_path = out.with_suffix(".card.json")
     card_path.write_text(json.dumps(card, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # JEPQ 状态只在卡片成功生成落盘、数据通过统一校验且 asof 晚于已保存日期时写回；缺数或旧日期保留旧状态。
+    if jepq_valid is not None and jepq_change["should_save"]:
+        save_jepq_light(state_path, jepq_valid["light"], jepq_valid["asof"])
     return {
         "ok": True, "date": signals.get("date", ""), "stale_days": stale, "markdown_path": str(out),
         "card_path": str(card_path), "card_template": card["header"]["template"],
         "title": f"📈 情绪看板速览 — {signals.get('date', '')}",
         "chars": len(markdown), "warnings": signals.get("warnings", []),
+        "jepq": {
+            "light": jepq_change["light"],
+            "prev_light": prev_jepq_light,
+            "changed": jepq_change["changed"],
+        },
         "hits": {
             "美股顶底": signals["us_market"]["topbottom"]["hits"], "Momentum": signals["us_market"]["momentum"]["hits"],
             "纳指/等权": signals["us_market"].get("ndx_spw", {}).get("hits", []),

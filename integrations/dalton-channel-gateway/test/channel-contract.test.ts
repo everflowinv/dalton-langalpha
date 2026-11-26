@@ -450,6 +450,10 @@ describe("Shared Backend <-> Gateway Contract Tests (real FastAPI fixtures)", ()
     const threadId = "11111111-1111-4111-8111-111111111111";
     const runId = "run-contract-1";
 
+    expect(
+      (sseFixture.replay_done.outbound_blocked_by_run as Record<string, boolean>)?.[runId],
+    ).toBe(false);
+
     for (const mode of ["run_end", "replay_done"] as const) {
       const feishu = makeStubAdapter("feishu");
       const claimedKeys: string[] = [];

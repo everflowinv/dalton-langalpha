@@ -239,6 +239,25 @@ async def settle(
         return None
     if ended.get("outbox_layers"):
         staged.emit()
+        # DALTON-HOOK(channel-chart-snapshot): spawn background render for DM chart snapshots committed as pending in finalize
+        if ended.get("_pending_chart_snapshots") and staged.bodies:
+            try:
+                from src.dalton.channel_chart_snapshots import (
+                    schedule_chart_snapshots_render,
+                )
+
+                schedule_chart_snapshots_render(
+                    thread_id=str(ended["conversation_thread_id"]),
+                    run_id=str(ended["run_id"]),
+                    user_id=str(ended.get("user_id") or ""),
+                    bodies=staged.bodies,
+                    registered_entries=ended.get("_pending_chart_snapshots"),
+                )
+            except Exception:
+                logger.warning(
+                    f"[COMMANDS] scheduling DM chart snapshot render for {row['command_id']} failed",
+                    exc_info=True,
+                )
     if found:
         try:
             await jobs.discard_jobs(runtime.exec, [ref])

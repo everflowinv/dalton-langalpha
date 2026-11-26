@@ -96,6 +96,8 @@ export interface SendMessageDiscordParams {
   onConfirmedThread?: (confirmed: { address: string }) => Promise<void>;
   /** Resolves (and caches) a DM channel id for a recipient user id. */
   resolveDmChannelId?: (recipientUserId: string) => Promise<string>;
+  /** Optional Discord message components (e.g. ActionRow with Link Button). */
+  components?: Array<Record<string, unknown>>;
 }
 
 export interface SendMessageDiscordResult {
@@ -289,6 +291,9 @@ export async function sendMessageDiscord(
     content: outboundContent,
     nonce,
     allowed_mentions: { parse: [] },
+    ...(params.components && params.components.length > 0
+      ? { components: params.components }
+      : {}),
   };
   if (
     params.replyToMessageId &&
@@ -354,6 +359,8 @@ export async function sendFileDiscord(
     threadScopeKey?: string | null;
     resolveDmChannelId?: (recipientUserId: string) => Promise<string>;
     verifyRecipientBeforeSend?: () => Promise<void>;
+    /** Optional Discord message components (e.g. ActionRow with Link Button). */
+    components?: Array<Record<string, unknown>>;
   },
 ): Promise<{ messageId: string; channelId: string }> {
   const parsed = parseDiscordTarget(params.targetAddress);
@@ -393,6 +400,9 @@ export async function sendFileDiscord(
       content: params.text ?? "",
       nonce: createDiscordMessageNonce(),
       files: [file],
+      ...(params.components && params.components.length > 0
+        ? { components: params.components }
+        : {}),
     });
   } catch (err) {
     throw classifyDiscordDeliveryError(err, { stage: "send", message: "Discord file send failed" });

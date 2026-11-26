@@ -132,6 +132,21 @@ class DaltonMetaInput(BaseModel):
     awaiting_release: bool | None = None
 
 
+class InlineProviderVariantUpdateInput(BaseModel):
+    """Inline provider variant update executed atomically inside a model create/update transaction."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider_slug: str = Field(min_length=2, max_length=63)
+    display_name: str = Field(min_length=1, max_length=120)
+    sdk: str = Field(min_length=1, max_length=32)
+    parent_provider: str = Field(min_length=1, max_length=63)
+    access_type: Literal["api_key", "coding_plan"] = "api_key"
+    billing: Literal["cash", "subscription"] = "cash"
+    base_url: str = Field(min_length=8, max_length=512)
+    api_key: str | None = Field(default=None, min_length=1, max_length=4096)
+
+
 class CatalogModelUpsertInput(BaseModel):
     """Explicit whitelist for creating/updating a team catalog model (§3.1 #2)."""
 
@@ -157,6 +172,8 @@ class CatalogModelUpsertInput(BaseModel):
     alias: list[str] | None = None
     dalton_meta: DaltonMetaInput | None = None
     task_costs_bound: dict[str, Any] | None = None
+    provider_variant_update: InlineProviderVariantUpdateInput | None = None
+    curated_setup_member: bool | None = None
     expected_revision: int | None = None
     comment: str | None = Field(default=None, max_length=500)
 
@@ -318,7 +335,7 @@ def validate_no_forbidden_params_or_credentials(obj: Any, context: str) -> None:
 
 
 def validate_provider_variant_input(
-    data: ProviderVariantUpsertInput,
+    data: ProviderVariantUpsertInput | InlineProviderVariantUpdateInput,
     *,
     compiled: Any,
     is_update: bool = False,

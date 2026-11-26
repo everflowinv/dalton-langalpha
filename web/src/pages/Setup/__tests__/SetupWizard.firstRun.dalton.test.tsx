@@ -684,20 +684,22 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     expect(emptyNotice).toHaveTextContent(/contact your administrator/i);
     expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
 
-    // Also verify DefaultStep cannot mark setup complete when model pool is empty
+    // Also verify visiting /setup/default with empty team pool redirects to /setup/model and blocks completion
     cleanup();
     server.state.progress.models = 'langalpha_models';
     server.state.progress.runs_on = 'cloud';
     renderRealWizardApp('/setup/default');
 
-    const defaultEmpty = await screen.findByTestId('setup-default-team-models-empty', {}, { timeout: 5000 });
-    expect(defaultEmpty).toHaveTextContent(/contact your administrator/i);
-    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+    const modelEmpty = await screen.findByTestId('setup-model-team-models-empty', {}, { timeout: 5000 });
+    expect(screen.getByTestId('location')).toHaveTextContent('/setup/model');
+    expect(modelEmpty).toHaveTextContent(/contact your administrator/i);
+    expect(screen.queryByRole('button', { name: 'Continue' })).toBeNull();
     expect(server.state.progress.setup_completed_at).toBeNull();
 
-    // Admin configures team models; clicking Retry loads them, unlocks Continue, and saves BOTH recommended models
+    // Admin configures team models; clicking Retry moves to /setup/default, unlocks Continue, and saves BOTH recommended models
     server.state.teamModelsConfigured = true;
     await user.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/default'), { timeout: 5000 });
     await waitFor(() => expect(screen.getByRole('radio', { name: /Gemini 4 Neon/i })).toBeChecked(), { timeout: 5000 });
     const continueBtn = screen.getByRole('button', { name: 'Continue' });
     expect(continueBtn).toBeEnabled();
@@ -734,19 +736,21 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     await waitFor(() => expect(screen.getByTestId('setup-use-team-models-empty')).toBeInTheDocument(), { timeout: 5000 });
     expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
 
-    // Same on /setup/default: rejected provider models are excluded -> contact admin + Retry
+    // Same on /setup/default: rejected provider models are excluded -> redirects to /setup/model with contact admin + Retry
     cleanup();
     server.state.progress.models = 'langalpha_models';
     server.state.progress.runs_on = 'cloud';
     renderRealWizardApp('/setup/default');
-    expect(await screen.findByTestId('setup-default-team-models-empty', {}, { timeout: 5000 })).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+    expect(await screen.findByTestId('setup-model-team-models-empty', {}, { timeout: 5000 })).toBeInTheDocument();
+    expect(screen.getByTestId('location')).toHaveTextContent('/setup/model');
+    expect(screen.queryByRole('button', { name: 'Continue' })).toBeNull();
 
-    // Admin replaces the key so available-models succeeds -> Retry recovers
+    // Admin replaces the key so available-models succeeds -> Retry recovers and moves to /setup/default
     server.state.availableModelsByProvider = {
       openai: { status: 'ok', ready: ['gpt-6.2-astra-oauth', 'gpt-6.2-sol-oauth'] },
     };
     await user.click(screen.getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(screen.getByTestId('location')).toHaveTextContent('/setup/default'), { timeout: 5000 });
     await waitFor(
       () => expect(screen.getByRole('radio', { name: /GPT-6\.2 Astra/i })).toBeChecked(),
       { timeout: 5000 },
@@ -1152,15 +1156,16 @@ describe('Dalton real-router & real-progress SetupWizard first-run flows', () =>
     expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
 
-    // Non-admin on /setup/default -> never falls back to GPT 5 Pro; shows contact-admin + Retry
+    // Non-admin on /setup/default -> never falls back to GPT 5 Pro; redirects to /setup/model with contact-admin + Retry
     cleanup();
     server.state.progress.models = 'langalpha_models';
     server.state.progress.runs_on = 'cloud';
     renderRealWizardApp('/setup/default');
-    const defaultEmpty = await screen.findByTestId('setup-default-team-models-empty', {}, { timeout: 5000 });
-    expect(defaultEmpty).toHaveTextContent(/No recommended team models configured yet\. Please contact your administrator\./i);
+    const modelEmpty = await screen.findByTestId('setup-model-team-models-empty', {}, { timeout: 5000 });
+    expect(screen.getByTestId('location')).toHaveTextContent('/setup/model');
+    expect(modelEmpty).toHaveTextContent(/No recommended team models configured yet\. Please contact your administrator\./i);
     expect(screen.queryByRole('radio', { name: /GPT 5 Pro/i })).toBeNull();
-    expect(screen.getByRole('button', { name: 'Continue' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Continue' })).toBeNull();
 
     // Legacy /setup/defaults also blocks Continue even if uncurated models were previously saved
     cleanup();

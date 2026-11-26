@@ -10,9 +10,10 @@ import { Group } from '@/components/modelAccess/parts';
 import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(dalton-setup): Dalton build & unified team-model availability check
 // DALTON-HOOK(standalone-core): delegate profile & control config to Dalton helper
+// DALTON-HOOK(team-model-catalog): resolve curated providers from server `dalton_curated_providers`
 import { isDaltonBuild } from '@/config/brand';
 import { getDaltonModelStepConfig } from '@/config/daltonSetup';
-import { DALTON_CURATED_PROVIDERS, effectiveModelsAnswer } from '../answers/setupSteps';
+import { effectiveModelsAnswer, isDaltonEverflowCuratedEmpty, resolveDaltonCuratedProviders } from '../answers/setupSteps';
 import { useDaltonTeamModels } from '../answers/useTeamModels';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import { useAccount, useRule } from '@/hooks/useAccount';
@@ -51,7 +52,14 @@ export default function ModelStep() {
   if (!flow.answers) return <Navigate to="/setup" replace />;
   const effectiveModels = effectiveModelsAnswer(flow.answers.models, team.available);
   if (isDaltonBuild && team.available) return <Navigate to="/setup/default" replace />;
-  if (isDaltonBuild && team.empty && !team.canManage) {
+  // DALTON-HOOK(team-model-catalog): in Everflow, when the live catalog revision defines zero curated candidates (`[]`)
+  // or team credentials are not configured yet (`team.empty`), hold non-admin members on /setup/model with a contact-admin
+  // notice; keep admins (canManage) in SubscriptionStep with policy-permitted connections and subscriptions.
+  const everflowCuratedEmpty = isDaltonEverflowCuratedEmpty(
+    team.daltonProfile,
+    team.daltonSetupCandidates,
+  );
+  if ((everflowCuratedEmpty || (isDaltonBuild && team.empty)) && !team.canManage) {
     return (
       <div data-testid="setup-model-team-models-empty">
         <WizardStepHeader
@@ -67,8 +75,21 @@ export default function ModelStep() {
     );
   }
   if (isDaltonBuild && effectiveModels === 'claude_code') return <Navigate to="/setup/use" replace />;
-  if (effectiveModels === 'langalpha_models') return <Navigate to="/setup/default" replace />;
-  if (effectiveModels !== 'claude_code') return <SubscriptionStep flow={flow} teamModelsAvailable={team.available} daltonProfile={team.daltonProfile} />;
+  // DALTON-HOOK(team-model-catalog): keep admins on SubscriptionStep when Everflow curated setup is empty instead of bouncing to empty /setup/default
+  if (effectiveModels === 'langalpha_models' && !(isDaltonBuild && (team.empty || everflowCuratedEmpty))) {
+    return <Navigate to="/setup/default" replace />;
+  }
+  if (effectiveModels !== 'claude_code') {
+    return (
+      <SubscriptionStep
+        flow={flow}
+        teamModelsAvailable={team.available}
+        daltonProfile={team.daltonProfile}
+        daltonCuratedProviders={team.daltonCuratedProviders}
+        canManage={team.canManage}
+      />
+    );
+  }
   switch (step.kind) {
     case 'loading':
       return <StepLoading />;
@@ -256,7 +277,20 @@ function ClaudeCodeTokenStep({ flow, askConsent }: { flow: Flow; askConsent: boo
 
 // DALTON-HOOK(dalton-setup): pass teamModelsAvailable to AnswersStrip
 // DALTON-HOOK(standalone-core): pass daltonProfile to Dalton helper for Core/Everflow control config
-function SubscriptionStep({ flow, teamModelsAvailable, daltonProfile }: { flow: Flow; teamModelsAvailable: boolean; daltonProfile?: string | null }) {
+// DALTON-HOOK(team-model-catalog): pass version-aligned `daltonCuratedProviders` and `canManage` into getDaltonModelStepConfig
+function SubscriptionStep({
+  flow,
+  teamModelsAvailable,
+  daltonProfile,
+  daltonCuratedProviders,
+  canManage,
+}: {
+  flow: Flow;
+  teamModelsAvailable: boolean;
+  daltonProfile?: string | null;
+  daltonCuratedProviders?: readonly string[];
+  canManage?: boolean;
+}) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const location = useLocation();
@@ -279,7 +313,8 @@ function SubscriptionStep({ flow, teamModelsAvailable, daltonProfile }: { flow: 
     daltonProfile,
     ownKeys,
     configured,
-    curatedProviders: DALTON_CURATED_PROVIDERS,
+    curatedProviders: resolveDaltonCuratedProviders(daltonCuratedProviders),
+    canManage,
   });
 
   // Back from a connect page with what it connected: that becomes the

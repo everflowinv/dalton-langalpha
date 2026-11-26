@@ -585,6 +585,42 @@ export interface VerifyDmRecipientResponse {
   message?: string;
 }
 
+export type ChartSnapshotStatus = "pending" | "ready" | "failed";
+
+export interface ChartSnapshotItem {
+  artifact_type?: "chart_layer" | string;
+  status: ChartSnapshotStatus | string;
+  workspace_id?: string | null;
+  chart_id: string;
+  symbol?: string | null;
+  timeframe?: string | null;
+  layer_id: string;
+  title?: string | null;
+  command_id?: string | null;
+  snapshot_key?: string | null;
+  sha256?: string | null;
+  size_bytes?: number | null;
+  width?: number | null;
+  height?: number | null;
+  error?: string | null;
+  pending_since?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ChartSnapshotsStatusResponse {
+  run_id: string;
+  thread_id: string;
+  outbound_blocked?: boolean | null;
+  has_pending: boolean;
+  snapshots: ChartSnapshotItem[];
+}
+
+export interface DownloadedChartSnapshot {
+  content: Buffer;
+  mimeType: string;
+  filename: string;
+}
+
 export interface I7DeliveriesProgressRequest {
   delivery_key: string;
   sent_chunks?: number;
@@ -817,6 +853,9 @@ export interface RecoverAutomationRunRow {
   user_id: string;
   workspace_id: string | null;
   thread_id: string | null;
+  run_id?: string | null;
+  chart_snapshots?: ChartSnapshotItem[];
+  outbound_blocked?: boolean;
   automation_name: string;
   entries: string[];
   status: "registered" | "finishing" | "finished";
@@ -855,6 +894,7 @@ export interface I8AutomationRunStartResponse {
 export interface I8AutomationRunFinishRequest {
   status?: string | null;
   thread_id?: string | null;
+  run_id?: string | null;
   final_text?: string | null;
   targets?: AutomationRunTargetRecord[] | null;
   mark_finished?: boolean;
@@ -867,6 +907,9 @@ export interface I8AutomationRunFinishResponse {
   user_id: string;
   workspace_id: string | null;
   thread_id: string | null;
+  run_id?: string | null;
+  chart_snapshots?: ChartSnapshotItem[];
+  outbound_blocked?: boolean;
   automation_name: string;
   finish_status: string | null;
   final_text: string | null;
@@ -1571,6 +1614,23 @@ export interface BackendClient {
     artifactId: string,
     maxBytes?: number,
   ): Promise<DataTaskDownloadedArtifact>;
+
+  getChartSnapshotsStatus?(params: {
+    runId: string;
+    threadId?: string | null;
+    platform?: ChannelPlatform | null;
+    signal?: AbortSignal;
+    timeoutMs?: number;
+  }): Promise<ChartSnapshotsStatusResponse>;
+
+  downloadChartSnapshot?(params: {
+    snapshotKey: string;
+    runId: string;
+    targetAddress: string;
+    deliveryKey?: string | null;
+    deliveryAttempt?: number | null;
+    maxBytes?: number;
+  }): Promise<DownloadedChartSnapshot>;
 }
 
 export class BackendHttpError extends Error {
@@ -2965,6 +3025,133 @@ export class HttpBackendClient implements BackendClient {
       params.path.split("/").pop()?.trim() || "deliverable";
     const sha256 = resp.headers.get("x-deliverable-sha256") ?? null;
     return { content, mimeType, filename, sha256 };
+  }
+
+  /**
+   * Poll Postgres-authoritative chart_snapshots status for a run (cross-process safe).
+   */
+  async getChartSnapshotsStatus(params: {
+    runId: string;
+    threadId?: string | null;
+    platform?: ChannelPlatform | null;
+    signal?: AbortSignal;
+    timeoutMs?: number;
+  }): Promise<ChartSnapshotsStatusResponse> {
+    const query: Record<string, string> = {
+      run_id: params.runId,
+    };
+    if (params.threadId) {
+      query.thread_id = params.threadId;
+    }
+    if (params.platform) {
+      query.platform = params.platform;
+    }
+    const { data } = await this.jsonRequest<ChartSnapshotsStatusResponse>(
+      "GET",
+      "/api/v1/dalton/channels/internal/snapshots/status",
+      {
+        query,
+        timeoutMs:
+          typeof params.timeoutMs === "number" && params.timeoutMs > 0
+            ? params.timeoutMs
+            : 10_000,
+        signal: params.signal,
+        redirect: "error",
+        cache: "no-store",
+        strictJson: true,
+        operationLabel: "getChartSnapshotsStatus",
+      },
+    );
+    return data;
+  }
+
+  /**
+   * Download a verified DM-only PNG chart snapshot by key (`GET /internal/snapshots/{snapshot_key}`).
+   */
+  async downloadChartSnapshot(params: {
+    snapshotKey: string;
+    runId: string;
+    targetAddress: string;
+    deliveryKey?: string | null;
+    deliveryAttempt?: number | null;
+    maxBytes?: number;
+  }): Promise<DownloadedChartSnapshot> {
+    const encodedPath = params.snapshotKey
+      .split("/")
+      .map((seg) => encodeURIComponent(seg))
+      .join("/");
+    const url = new URL(
+      `${this.baseUrl}/api/v1/dalton/channels/internal/snapshots/${encodedPath}`,
+    );
+    url.searchParams.set("run_id", params.runId);
+    url.searchParams.set("target_address", params.targetAddress);
+    if (params.deliveryKey && params.deliveryKey.trim()) {
+      url.searchParams.set("delivery_key", params.deliveryKey.trim());
+    }
+    if (
+      typeof params.deliveryAttempt === "number" &&
+      Number.isFinite(params.deliveryAttempt)
+    ) {
+      url.searchParams.set("delivery_attempt", String(params.deliveryAttempt));
+    }
+    const maxBytes = params.maxBytes ?? MAX_ATTACHMENT_BYTES;
+
+    const resp = await this.fetchImpl(url, {
+      method: "GET",
+      headers: this.headers(undefined, undefined, true),
+      redirect: "error",
+      cache: "no-store",
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (resp.status >= 300 && resp.status < 400) {
+      void resp.body?.cancel().catch(() => undefined);
+      throw new BackendHttpError(
+        `downloadChartSnapshot redirect rejected (${resp.status})`,
+        resp.status,
+        null,
+      );
+    }
+    if (!resp.ok) {
+      let body: unknown = null;
+      try {
+        body = await resp.json();
+      } catch {
+        body = null;
+      }
+      if (resp.status === 409) {
+        this.checkStaleGatewayEpoch(resp.status, body, url.pathname);
+      }
+      throw new BackendHttpError(
+        `downloadChartSnapshot failed (${resp.status})`,
+        resp.status,
+        body,
+      );
+    }
+    const contentLengthHeader = resp.headers.get("content-length");
+    if (contentLengthHeader) {
+      const parsedLen = Number.parseInt(contentLengthHeader, 10);
+      if (Number.isFinite(parsedLen) && parsedLen > maxBytes) {
+        await resp.body?.cancel().catch(() => undefined);
+        throw new SafeFetchError(
+          "size_exceeded",
+          `Chart snapshot exceeds byte limit (${parsedLen} bytes)`,
+        );
+      }
+    }
+    const content = resp.body
+      ? await readStreamWithLimit(resp.body, { maxBytes })
+      : Buffer.from(await resp.arrayBuffer());
+    if (content.byteLength > maxBytes) {
+      throw new SafeFetchError(
+        "size_exceeded",
+        `Chart snapshot exceeds byte limit (${content.byteLength} bytes)`,
+      );
+    }
+    const mimeType =
+      resp.headers.get("content-type")?.split(";")[0]?.trim() || "image/png";
+    const filename =
+      params.snapshotKey.split("/").pop()?.trim() || "chart_snapshot.png";
+    return { content, mimeType, filename };
   }
 
   async authorizeDataTaskNotificationPlan(

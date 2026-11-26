@@ -1,5 +1,16 @@
-import type { BackendClient, I4StateResponse } from "./backend-client.js";
+import type {
+  BackendClient,
+  ChartSnapshotItem,
+  I4StateResponse,
+} from "./backend-client.js";
 import { canViewPlatformChat, type ChannelAdapter } from "./channels/adapter.js";
+import {
+  deliverTurnChartsAndWidgets,
+  extractRunChartsAndWidgetsFromReplay,
+  parseChartSnapshotsList,
+  type CollectedChartLayerRef,
+  type CollectedHtmlWidgetRef,
+} from "./chart-snapshots.js";
 import { DeliveryService } from "./delivery-service.js";
 import {
   type AgentAutomationOutputPutRequest,
@@ -728,6 +739,7 @@ export class AgentRoutesHandler {
         {
           status: body.status,
           thread_id: body.thread_id ?? null,
+          run_id: body.run_id ?? null,
           final_text: body.final_text ?? null,
           mark_finished: false,
         },
@@ -777,6 +789,7 @@ export class AgentRoutesHandler {
       {
         status: body.status,
         thread_id: body.thread_id ?? null,
+        run_id: body.run_id ?? null,
         final_text: body.final_text ?? null,
         mark_finished: false,
       },
@@ -810,6 +823,9 @@ export class AgentRoutesHandler {
       executionId,
       userId: claimed.data.user_id || userId,
       threadId: claimed.data.thread_id ?? body.thread_id ?? null,
+      runId: claimed.data.run_id ?? null,
+      initialSnapshots: claimed.data.chart_snapshots,
+      outboundBlocked: claimed.data.outbound_blocked,
       automationName: claimed.data.automation_name,
       finishStatus:
         (body.status ??
@@ -830,6 +846,9 @@ export class AgentRoutesHandler {
     executionId: string;
     userId: string;
     threadId: string | null;
+    runId?: string | null;
+    initialSnapshots?: ChartSnapshotItem[];
+    outboundBlocked?: boolean;
     automationName: string;
     finishStatus: AgentAutomationRunFinishRequest["status"];
     finalText: string | null;
@@ -855,6 +874,84 @@ export class AgentRoutesHandler {
           "…";
       }
 
+      // Recover chart layers, snapshots, and widgets for completed automation runs
+      // so DM snapshots and deep links are delivered alongside automation text.
+      const effectiveRunId = params.runId?.trim() || null;
+      let autoInitialSnapshots = parseChartSnapshotsList(params.initialSnapshots);
+      let autoCharts: CollectedChartLayerRef[] = [];
+      let autoWidgets: CollectedHtmlWidgetRef[] = [];
+      let autoOutboundBlocked: boolean | undefined =
+        typeof params.outboundBlocked === "boolean" ? params.outboundBlocked : undefined;
+
+      if (
+        finishStatus === "completed" &&
+        threadId &&
+        effectiveRunId &&
+        typeof this.backend.replayThreadMessages === "function"
+      ) {
+        try {
+          const recovered = await extractRunChartsAndWidgetsFromReplay({
+            backend: this.backend,
+            userId,
+            threadId,
+            targetRunId: effectiveRunId,
+          });
+          autoCharts = recovered.charts;
+          autoWidgets = recovered.widgets;
+          if (autoInitialSnapshots.length === 0 && recovered.snapshots.length > 0) {
+            autoInitialSnapshots = recovered.snapshots;
+          }
+          if (typeof recovered.outboundBlocked === "boolean") {
+            autoOutboundBlocked =
+              autoOutboundBlocked === true || recovered.outboundBlocked;
+          }
+        } catch {
+          // Best-effort replay enrichment; snapshots from finish_automation_run still work.
+        }
+      }
+
+      const hasAutomationChartsOrWidgets =
+        finishStatus === "completed" &&
+        Boolean(effectiveRunId) &&
+        (autoCharts.length > 0 ||
+          autoInitialSnapshots.length > 0 ||
+          autoWidgets.length > 0);
+
+      const deliverAutomationChartsForTarget = async (
+        t: AutomationRunTargetRecord,
+      ): Promise<boolean> => {
+        if (!hasAutomationChartsOrWidgets || !effectiveRunId || !t.address) {
+          return false;
+        }
+        const prefix = t.address.split(":", 1)[0]?.trim().toLowerCase() ?? "";
+        const platform: ChannelPlatform | null =
+          prefix === "feishu" || prefix === "discord" || prefix === "weixin"
+            ? prefix
+            : prefix === "wechat"
+              ? "weixin"
+              : null;
+        if (!platform) return false;
+        const chartRes = await deliverTurnChartsAndWidgets({
+          backend: this.backend,
+          adapters: this.adapters,
+          webBaseUrl: this.webBaseUrl,
+          userId,
+          threadId,
+          runId: effectiveRunId,
+          platform,
+          targetAddress: t.address,
+          deliveryKey: `automation:${executionId}:${t.entry}:charts`,
+          deliveryKind: "automation",
+          executionId,
+          outboundBlocked: autoOutboundBlocked,
+          activityOrigin: "notification",
+          charts: autoCharts,
+          initialSnapshots: autoInitialSnapshots,
+          widgets: autoWidgets,
+        });
+        return chartRes.settled && chartRes.sentImages + chartRes.sentLinks > 0;
+      };
+
       for (const t of targets) {
         if (!t.ok || !t.address) {
           results.push({
@@ -868,6 +965,7 @@ export class AgentRoutesHandler {
 
         if (finishStatus === "completed") {
           if (t.agent_sent) {
+            await deliverAutomationChartsForTarget(t);
             results.push({
               ...t,
               reached: true,
@@ -892,6 +990,10 @@ export class AgentRoutesHandler {
               deliveryRes.status === "sent" ||
               deliveryRes.status === "partial"
             ) {
+              await deliverAutomationChartsForTarget({
+                ...t,
+                address: deliveryRes.address ?? t.address,
+              });
               results.push({
                 ...t,
                 address: deliveryRes.address ?? t.address,
@@ -907,6 +1009,17 @@ export class AgentRoutesHandler {
                 error: deliveryRes.message || "Failed to deliver automation summary.",
               });
             }
+            continue;
+          }
+
+          const chartsDelivered = await deliverAutomationChartsForTarget(t);
+          if (chartsDelivered) {
+            results.push({
+              ...t,
+              reached: true,
+              via: "fallback",
+              error: null,
+            });
             continue;
           }
 

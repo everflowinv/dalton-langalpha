@@ -362,6 +362,7 @@
       "requires": [
         "dalton-conventions",
         "research-conventions",
+        "dalton-model",
         "run-workflow"
       ]
     },
@@ -418,6 +419,7 @@
       "requires": [
         "dalton-conventions",
         "research-conventions",
+        "dalton-model",
         "run-workflow"
       ]
     },

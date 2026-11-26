@@ -99,14 +99,17 @@ export function getDaltonModelStepConfig(params: {
   ownKeys: boolean;
   configured: ReadonlySet<string>;
   curatedProviders: ReadonlySet<string>;
+  canManage?: boolean;
 }): DaltonModelStepConfig {
   const curatedOnly = isDaltonCuratedOnly(params.dalton, params.daltonProfile);
+  const curatedEmptyForAdmin =
+    curatedOnly && Boolean(params.canManage) && params.curatedProviders.size === 0;
   const canContinue = !curatedOnly || [...params.configured].some((p) => params.curatedProviders.has(p));
   return {
     curatedOnly,
-    showPlanGroups: !curatedOnly && params.ownKeys,
-    showApiKeyLink: !curatedOnly && params.ownKeys,
-    allowedSignIns: curatedOnly ? params.curatedProviders : undefined,
+    showPlanGroups: (!curatedOnly || curatedEmptyForAdmin) && params.ownKeys,
+    showApiKeyLink: (!curatedOnly || curatedEmptyForAdmin) && params.ownKeys,
+    allowedSignIns: curatedOnly && !curatedEmptyForAdmin ? params.curatedProviders : undefined,
     canContinue,
   };
 }
@@ -114,6 +117,8 @@ export function getDaltonModelStepConfig(params: {
 export interface DaltonSetupFilterOptions {
   profile?: string | null;
   metadata?: Record<string, DaltonModelMeta | undefined>;
+  /** Version-aligned curated setup candidate list returned by `GET /api/v1/models` (`dalton_setup_candidates`). */
+  serverCandidates?: readonly string[] | null;
 }
 
 const ratingScore = (value: number | undefined): number =>
@@ -270,23 +275,56 @@ export async function probeDaltonCustomProviderModels(
   }
 }
 
+const CURATED_FALLBACK_BY_PRIMARY: ReadonlyMap<string, string> = new Map(
+  DALTON_SETUP_CANDIDATES
+    .filter((entry): entry is { primary: string; fallback: string } => Boolean(entry.fallback))
+    .map((entry) => [entry.primary, entry.fallback]),
+);
+
 /**
- * Resolve `DALTON_SETUP_CANDIDATES` against the member's currently available
- * models: takes `primary`, else `fallback`, else skips.
+ * Resolve curated setup candidates against the member's currently available
+ * models.
  *
- * - Everflow: preserves the original 5 curated candidates rule verbatim.
+ * When `serverCandidates` (from `GET /api/v1/models` `dalton_setup_candidates`)
+ * is provided (including an empty `[]` when all curated models were hidden or
+ * retired), it is authoritative and replaces the static `DALTON_SETUP_CANDIDATES`
+ * list so setup admission and recommendations stay aligned with the compiled
+ * catalog revision.
+ *
+ * - Everflow: preserves strict curated ordering (`[]` when none is available).
  * - Core: excludes curated candidates explicitly marked `tool_calling === false`.
  */
 export function resolveDaltonSetupCandidates(
   available: Iterable<string>,
   metadata?: Record<string, DaltonModelMeta | undefined>,
   profile?: string | null,
+  serverCandidates?: readonly string[] | null,
 ): string[] {
   const set = available instanceof Set ? available : new Set(available);
   const core = isCoreDaltonProfile(profile);
   const eligible = (model: string): boolean =>
     set.has(model) && (!core || !isDaltonToolCallingRejected(metadata?.[model]));
   const out: string[] = [];
+  const seen = new Set<string>();
+
+  if (Array.isArray(serverCandidates)) {
+    for (const model of serverCandidates) {
+      if (eligible(model)) {
+        if (!seen.has(model)) {
+          seen.add(model);
+          out.push(model);
+        }
+      } else {
+        const fallback = CURATED_FALLBACK_BY_PRIMARY.get(model);
+        if (fallback && eligible(fallback) && !seen.has(fallback)) {
+          seen.add(fallback);
+          out.push(fallback);
+        }
+      }
+    }
+    return out;
+  }
+
   for (const entry of DALTON_SETUP_CANDIDATES) {
     if (eligible(entry.primary)) {
       out.push(entry.primary);
@@ -352,7 +390,12 @@ export function resolveDaltonSetupModels(
   fallbackPool?: Iterable<string>,
 ): string[] {
   const core = isCoreDaltonProfile(options.profile);
-  const curated = resolveDaltonSetupCandidates(available, options.metadata, options.profile);
+  const curated = resolveDaltonSetupCandidates(
+    available,
+    options.metadata,
+    options.profile,
+    options.serverCandidates,
+  );
   if (!core) return curated;
   if (curated.length > 0 && curated.some((m) => isDaltonToolCallingConfirmed(options.metadata?.[m]))) {
     return curated;
@@ -438,12 +481,13 @@ export function pickDaltonConnectedDefault(
   offered: readonly string[],
   metadata?: Record<string, DaltonModelMeta | undefined>,
   profile?: string | null,
+  serverCandidates?: readonly string[] | null,
 ): string | null {
-  return resolveDaltonConfirmedSetupModels(offered, { profile, metadata })[0] ?? null;
+  return resolveDaltonConfirmedSetupModels(offered, { profile, metadata, serverCandidates })[0] ?? null;
 }
 
 /**
- * Narrow provider model groups to the resolved `DALTON_SETUP_CANDIDATES` in
+ * Narrow provider model groups to the resolved curated candidates in
  * their exact fixed order (preserving provider grouping).
  *
  * When none of the curated candidates is available (or in Core, none is confirmed):
@@ -464,7 +508,12 @@ export function filterDaltonCuratedModels(
       if (!ownerOf.has(m)) ownerOf.set(m, provider);
     }
   }
-  const curated = resolveDaltonSetupCandidates(ownerOf.keys(), options.metadata, options.profile);
+  const curated = resolveDaltonSetupCandidates(
+    ownerOf.keys(),
+    options.metadata,
+    options.profile,
+    options.serverCandidates,
+  );
   const useCurated =
     curated.length > 0 && (!core || curated.some((m) => isDaltonToolCallingConfirmed(options.metadata?.[m])));
   if (!useCurated) {
@@ -634,9 +683,16 @@ export function hasAvailableDaltonModels(
   dalton: boolean,
   rejectedProviders?: ReadonlySet<string>,
   runtimeProfile?: string | null,
+  serverCandidates?: readonly string[] | null,
 ): boolean {
   const filtered = filterDaltonProviderModels(groups, metadata, payers, dalton, rejectedProviders);
   const offered = Object.values(filtered).flatMap((p) => p.models ?? []);
   if (!dalton) return offered.length > 0;
-  return resolveDaltonConfirmedSetupModels(offered, { profile: runtimeProfile, metadata }).length > 0;
+  return (
+    resolveDaltonConfirmedSetupModels(offered, {
+      profile: runtimeProfile,
+      metadata,
+      serverCandidates,
+    }).length > 0
+  );
 }

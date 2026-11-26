@@ -4151,6 +4151,11 @@
         "emptyCap": "Enter a workspace cap in USD"
       }
     },
+    "priceSource": {
+      "official": "Official",
+      "estimated": "Estimated",
+      "thirdParty": "Third-party"
+    },
     "openclaw": {
       "title": "OpenClaw Models (via Dalton Broker)",
       "healthChecking": "Checking...",

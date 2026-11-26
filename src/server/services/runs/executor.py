@@ -1068,6 +1068,10 @@ class LocalRunExecutor:
         stopped_by: Optional[str] = None,
         # DALTON-HOOK(channel-deliverables): pass persisted DM turn deliverables on run_end
         turn_deliverables: Optional[list[dict[str, Any]]] = None,
+        # DALTON-HOOK(channel-chart-snapshot): pass persisted chart_snapshots, report chart_layers, and outbound_blocked on run_end
+        chart_snapshots: Optional[list[dict[str, Any]]] = None,
+        chart_layers: Optional[list[dict[str, Any]]] = None,
+        outbound_blocked: Optional[bool] = None,
     ) -> None:
         """Write the closing frames to the per-run Stream (I6), exactly once.
 
@@ -1110,6 +1114,9 @@ class LocalRunExecutor:
             closing_frames=closing_frames,
             stopped_by=stopped_by,
             turn_deliverables=turn_deliverables,  # DALTON-HOOK(channel-deliverables)
+            chart_snapshots=chart_snapshots,  # DALTON-HOOK(channel-chart-snapshot)
+            chart_layers=chart_layers,  # DALTON-HOOK(channel-chart-snapshot)
+            outbound_blocked=outbound_blocked,  # DALTON-HOOK(channel-chart-snapshot)
             redis_event_ttl=self.redis_event_ttl,
             max_stored_messages=self.max_stored_messages,
         )
@@ -1497,6 +1504,10 @@ class LocalRunExecutor:
                 stopped_by=SUSPENSION_STOPPER if verdict.stopped_by_suspension else None,
                 # DALTON-HOOK(channel-deliverables): forward persisted DM turn deliverables on run_end
                 turn_deliverables=metadata.get("persisted_turn_deliverables"),
+                # DALTON-HOOK(channel-chart-snapshot): forward persisted chart_snapshots, report chart_layers, and outbound_blocked on run_end
+                chart_snapshots=metadata.get("persisted_chart_snapshots"),
+                chart_layers=metadata.get("persisted_report_chart_layers"),
+                outbound_blocked=metadata.get("persisted_outbound_blocked"),
             )
 
             if status == "completed" and completion_callback:
