@@ -3158,3 +3158,85 @@ class TestAuthSettingsStaleGraceAndBackgroundRefresh:
         assert dalton_auth._auth_settings_cache is not None
         assert dalton_auth._auth_settings_cache.is_ready is True
         assert dalton_auth._auth_settings_retry is None
+
+    @pytest.mark.asyncio
+    async def test_request_starts_refresh_then_background_retry_joins_and_succeeds_without_cancellation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """请求在冷却到期后先发起共享刷新、后台重试醒来后加入等待，刷新成功取消后台重试不得中断请求。"""
+        now_box = {"t": 25000.0}
+        monkeypatch.setattr(
+            dalton_auth,
+            "_monotonic",
+            create_autospec(dalton_auth._monotonic, side_effect=lambda: now_box["t"]),
+        )
+        sleep_entered = asyncio.Event()
+        sleep_release = asyncio.Event()
+
+        async def _controlled_sleep(delay_s: float) -> None:
+            sleep_entered.set()
+            await sleep_release.wait()
+
+        monkeypatch.setattr(
+            dalton_auth,
+            "_sleep",
+            create_autospec(dalton_auth._sleep, side_effect=_controlled_sleep),
+        )
+        ok_payload = {
+            "disable_signup": True,
+            "mailer_autoconfirm": False,
+            "external": {"email": True, "anonymous_users": False},
+        }
+        calls = {"n": 0}
+        req_refresh_started = asyncio.Event()
+        req_refresh_release = asyncio.Event()
+
+        async def _staged_fetch(url: str, key: str) -> dict[str, Any]:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ConnectError("initial transient outage")
+            req_refresh_started.set()
+            await req_refresh_release.wait()
+            return ok_payload
+
+        monkeypatch.setattr(
+            dalton_auth,
+            "_fetch_supabase_auth_settings",
+            create_autospec(_fetch_supabase_auth_settings, side_effect=_staged_fetch),
+        )
+        raw_token = _make_jwt(sub="user-grace-1", email="analyst1@dalton.org")
+
+        # 1. Initial failure schedules background retry task (sleeping on _controlled_sleep)
+        with pytest.raises(HTTPException) as exc1:
+            await verify_dalton_token(raw_token)
+        assert exc1.value.status_code == 503
+        assert calls["n"] == 1
+        retry_task = dalton_auth._auth_settings_retry_task
+        assert retry_task is not None
+        await asyncio.wait_for(sleep_entered.wait(), timeout=1.0)
+
+        # 2. Retry cooldown expires on clock; incoming request starts the shared refresh FIRST
+        now_box["t"] += dalton_auth._AUTH_SETTINGS_RETRY_TTL_S + 0.1
+        req_task = asyncio.create_task(verify_dalton_token(raw_token))
+        await asyncio.wait_for(req_refresh_started.wait(), timeout=1.0)
+        assert calls["n"] == 2
+        shared_refresh = dalton_auth._auth_settings_refresh_task
+        assert shared_refresh is not None and not shared_refresh.done()
+
+        # 3. Background retry wakes up while request's shared refresh is still in-flight and awaits it
+        sleep_release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert calls["n"] == 2
+        assert not retry_task.done()
+
+        # 4. Shared refresh succeeds -> cancels background retry, but MUST NOT cancel shared_refresh or req_task!
+        req_refresh_release.set()
+        auth_info = await asyncio.wait_for(req_task, timeout=1.0)
+        assert auth_info.user_id == "user-grace-1"
+        assert await asyncio.wait_for(retry_task, timeout=1.0) is True
+        assert shared_refresh.done() and not shared_refresh.cancelled()
+        assert calls["n"] == 2
+        assert dalton_auth._auth_settings_cache is not None
+        assert dalton_auth._auth_settings_cache.is_ready is True
+        assert dalton_auth._auth_settings_retry is None

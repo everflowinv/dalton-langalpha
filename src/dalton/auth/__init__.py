@@ -153,12 +153,14 @@ async def _run_background_auth_retry(
                 return bool(cached[2])
 
             # Share the single-flight refresh task so incoming requests reuse this in-flight check.
+            # Shield the await so cancelling the retry task on refresh completion never propagates
+            # cancellation back into the shared refresh task awaited by live requests.
             task, _created = _schedule_background_auth_refresh(
                 supabase_url,
                 publishable_key,
                 schedule_retry_on_failure=False,
             )
-            ok = await task
+            ok = await asyncio.shield(task)
             if ok:
                 return True
 
