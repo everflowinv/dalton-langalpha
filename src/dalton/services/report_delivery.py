@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import re
 import secrets
 import time
@@ -87,6 +88,13 @@ REST_NON_INTERACTIVE_CONFIRM_REFUSED_MESSAGE = (
 CONFIRMATION_INVALID_MESSAGE = (
     "一次性确认凭据无效、已过期、已使用或与当前提交目标不一致，请重新确认后再提交。"
 )
+PASSWORDLESS_OSS_CONFIRM_REFUSED_MESSAGE = (
+    "当前为免密 OSS 部署模式，缺少可验证的网页登录会话，拒绝签发或批准定时报告外发确认；"
+    "请管理员先启用登录认证（DALTON_AUTH_MODE=local 或 supabase）后再操作。"
+)
+
+# Process-local fallback for unit tests whose fake DB connection has no SQL cursor.
+_IN_MEMORY_HITL_SNAPSHOTS: dict[tuple[str, str], dict[str, Any]] = {}
 
 _FEISHU_TENANT_TOKEN_URL = (
     "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
@@ -2068,6 +2076,310 @@ def _hash_confirmation_token(token: str) -> str:
     return hashlib.sha256(str(token or "").strip().encode("utf-8")).hexdigest()
 
 
+def check_verifiable_web_login_session(
+    principal: Any,
+    raw_request: Any,
+) -> tuple[bool, str | None]:
+    """Return ``(ok, error_message)`` verifying a real web login session (no passwordless OSS fallback).
+
+    - Rejects non-``session`` principals (``service``, ``computer``, ``oauth``, ``pat``) and
+      requests carrying ``X-Service-Token``.
+    - In ``HOST_MODE == 'oss'`` without Supabase/local auth (``DALTON_AUTH_MODE == 'oss'``),
+      rejects passwordless fallback whenever ``LANGALPHA_OWNER_SECRET`` is unset, prompting
+      the administrator to enable login authentication first. When ``LANGALPHA_OWNER_SECRET``
+      is configured (desktop app), rejects ``Authorization`` headers and requires a valid
+      ``x-langalpha-owner`` HMAC header.
+    - In ``HOST_MODE == 'platform'``, ``DALTON_AUTH_MODE == 'local'``, or Supabase auth,
+      every ``session`` principal was verified from a signed login session token.
+    """
+    from src.config import settings as app_settings
+    from src.dalton.auth import is_dalton_supabase_auth_enabled
+    from src.dalton.settings import get_dalton_auth_mode
+    from src.server.auth import owner_requests
+
+    if principal is None or raw_request is None:
+        return False, "仅允许可验证的网页登录会话签发或批准定时报告外发确认。"
+    auth_kind = str(getattr(principal, "auth", "") or "").strip().lower()
+    if auth_kind != "session":
+        return False, "仅允许网页登录会话通过确认卡片签发或批准定时报告外发确认。"
+    headers = getattr(raw_request, "headers", None)
+    if headers is None:
+        return False, "缺少有效请求头，无法验证网页登录会话。"
+    if str(headers.get("x-service-token") or "").strip():
+        return False, "服务令牌不可签发或批准定时报告外发确认。"
+
+    if app_settings.HOST_MODE == "oss" and not is_dalton_supabase_auth_enabled():
+        auth_mode = get_dalton_auth_mode()
+        if auth_mode == "oss":
+            if not os.environ.get(owner_requests.OWNER_SECRET_ENV, ""):
+                return False, PASSWORDLESS_OSS_CONFIRM_REFUSED_MESSAGE
+            if str(headers.get("authorization") or "").strip():
+                return False, "OSS 模式下携带令牌的请求不可签发或批准定时报告外发确认。"
+            scope = getattr(raw_request, "scope", None)
+            if not isinstance(scope, Mapping) or not owner_requests.is_owner(scope):
+                return False, "缺少有效的桌面端所有权校验头，无法验证登录会话。"
+            return True, None
+        if auth_mode != "local":
+            return False, PASSWORDLESS_OSS_CONFIRM_REFUSED_MESSAGE
+
+    return True, None
+
+
+def _extract_interrupt_answer_confirm_token(answer: Any) -> str | None:
+    decisions = (
+        answer.get("decisions")
+        if isinstance(answer, Mapping)
+        else getattr(answer, "decisions", None)
+    )
+    if not decisions:
+        return None
+    first = decisions[0]
+    raw = (
+        first.get("confirm_token")
+        if isinstance(first, Mapping)
+        else getattr(first, "confirm_token", None)
+    )
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return None
+
+
+def verify_report_delivery_interrupt_resume(
+    action_req: Mapping[str, Any],
+    answer: Any,
+    *,
+    principal: Any,
+    raw_request: Any,
+) -> None:
+    """Enforce verifiable web login session and confirm_token integrity for AD5 HITL approvals."""
+    from fastapi import HTTPException
+
+    ok_session, reason = check_verifiable_web_login_session(principal, raw_request)
+    if not ok_session:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "web_session_required",
+                "message": reason or PASSWORDLESS_OSS_CONFIRM_REFUSED_MESSAGE,
+            },
+        )
+
+    caller_user_id = str(getattr(principal, "user_id", "") or "").strip()
+    expected_token = str(action_req.get("confirm_token") or "").strip()
+    returned_token = _extract_interrupt_answer_confirm_token(answer)
+    raw_report = action_req.get("report_targets")
+    raw_text = action_req.get("text_targets")
+    raw_failure = action_req.get("failure_targets")
+    token_ok = False
+    if (
+        caller_user_id
+        and expected_token
+        and returned_token
+        and returned_token == expected_token
+        and isinstance(raw_report, list)
+        and isinstance(raw_failure, list)
+        and (raw_text is None or isinstance(raw_text, list))
+    ):
+        recomputed = compute_report_delivery_confirm_token(
+            action=str(action_req.get("action") or "set"),
+            caller_user_id=caller_user_id,
+            automation_id=action_req.get("automation_id"),
+            config_version=action_req.get("config_version"),
+            profile=str(action_req.get("profile") or ""),
+            report_targets=raw_report,
+            text_targets=raw_text,
+            failure_targets=raw_failure,
+        )
+        token_ok = expected_token == recomputed
+    if not token_ok:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "confirm_token_mismatch",
+                "message": "确认凭据无效或与待确认外发目标不一致，请重新确认。",
+            },
+        )
+
+
+def clear_in_memory_hitl_snapshots() -> None:
+    """Clear process-local test fallback HITL snapshots."""
+    _IN_MEMORY_HITL_SNAPSHOTS.clear()
+
+
+def _normalize_hitl_snapshot_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    raw_labels = row.get("target_labels")
+    labels = dict(raw_labels) if isinstance(raw_labels, Mapping) else {}
+    raw_text = row.get("text_targets")
+    return {
+        "thread_id": str(row.get("thread_id") or ""),
+        "tool_call_id": str(row.get("tool_call_id") or ""),
+        "caller_user_id": str(row.get("caller_user_id") or ""),
+        "automation_id": str(row.get("automation_id") or ""),
+        "automation_name": str(row.get("automation_name") or ""),
+        "config_version": _coerce_config_version(row.get("config_version")),
+        "profile": str(row.get("profile") or ""),
+        "report_targets": list(row.get("report_targets") or []),
+        "text_targets": list(raw_text) if isinstance(raw_text, list) else None,
+        "failure_targets": list(row.get("failure_targets") or []),
+        "group_targets": list(row.get("group_targets") or []),
+        "non_caller_dm_targets": list(row.get("non_caller_dm_targets") or []),
+        "target_labels": labels,
+        "needs_confirmation": bool(row.get("needs_confirmation")),
+        "confirm_token": str(row.get("confirm_token") or ""),
+    }
+
+
+async def save_report_delivery_hitl_snapshot(
+    snapshot: Mapping[str, Any],
+    *,
+    conn: Any = None,
+) -> None:
+    """Persist a pending AD5 HITL confirmation snapshot keyed by ``(thread_id, tool_call_id)``."""
+    norm = _normalize_hitl_snapshot_row(snapshot)
+    if not norm["tool_call_id"]:
+        raise ReportDeliveryError(
+            "缺少 tool_call_id，无法建立待确认快照。",
+            code="invalid_request",
+        )
+    async with _use_conn(conn) as db_conn:
+        if not _conn_has_cursor(db_conn):
+            _IN_MEMORY_HITL_SNAPSHOTS.setdefault(
+                (norm["thread_id"], norm["tool_call_id"]),
+                copy.deepcopy(norm),
+            )
+            return
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                INSERT INTO dalton_report_delivery_hitl_snapshots (
+                    thread_id,
+                    tool_call_id,
+                    caller_user_id,
+                    automation_id,
+                    automation_name,
+                    config_version,
+                    profile,
+                    report_targets,
+                    text_targets,
+                    failure_targets,
+                    group_targets,
+                    non_caller_dm_targets,
+                    target_labels,
+                    needs_confirmation,
+                    confirm_token
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                    %s, %s
+                )
+                ON CONFLICT (thread_id, tool_call_id) DO NOTHING
+                """,
+                (
+                    norm["thread_id"],
+                    norm["tool_call_id"],
+                    norm["caller_user_id"],
+                    norm["automation_id"],
+                    norm["automation_name"],
+                    norm["config_version"],
+                    norm["profile"],
+                    json.dumps(norm["report_targets"], ensure_ascii=False),
+                    (
+                        json.dumps(norm["text_targets"], ensure_ascii=False)
+                        if norm["text_targets"] is not None
+                        else None
+                    ),
+                    json.dumps(norm["failure_targets"], ensure_ascii=False),
+                    json.dumps(norm["group_targets"], ensure_ascii=False),
+                    json.dumps(norm["non_caller_dm_targets"], ensure_ascii=False),
+                    json.dumps(norm["target_labels"], ensure_ascii=False),
+                    norm["needs_confirmation"],
+                    norm["confirm_token"],
+                ),
+            )
+
+
+async def load_report_delivery_hitl_snapshot(
+    *,
+    thread_id: str,
+    tool_call_id: str,
+    caller_user_id: str,
+    conn: Any = None,
+) -> dict[str, Any] | None:
+    """Load the persisted pending AD5 HITL confirmation snapshot for ``(thread_id, tool_call_id)``."""
+    tid = str(thread_id or "")
+    tcid = str(tool_call_id or "")
+    uid = str(caller_user_id or "").strip()
+    if not tcid or not uid:
+        return None
+    async with _use_conn(conn) as db_conn:
+        if not _conn_has_cursor(db_conn):
+            found = _IN_MEMORY_HITL_SNAPSHOTS.get((tid, tcid))
+            if found is not None and found.get("caller_user_id") == uid:
+                return copy.deepcopy(found)
+            return None
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT thread_id,
+                       tool_call_id,
+                       caller_user_id,
+                       automation_id,
+                       automation_name,
+                       config_version,
+                       profile,
+                       report_targets,
+                       text_targets,
+                       failure_targets,
+                       group_targets,
+                       non_caller_dm_targets,
+                       target_labels,
+                       needs_confirmation,
+                       confirm_token
+                FROM dalton_report_delivery_hitl_snapshots
+                WHERE thread_id = %s
+                  AND tool_call_id = %s
+                  AND caller_user_id = %s
+                """,
+                (tid, tcid, uid),
+            )
+            row = await cur.fetchone()
+    if not row:
+        return None
+    return _normalize_hitl_snapshot_row(row)
+
+
+async def delete_report_delivery_hitl_snapshot(
+    *,
+    thread_id: str,
+    tool_call_id: str,
+    caller_user_id: str,
+    conn: Any = None,
+) -> None:
+    """Delete a consumed or declined AD5 HITL confirmation snapshot."""
+    tid = str(thread_id or "")
+    tcid = str(tool_call_id or "")
+    uid = str(caller_user_id or "").strip()
+    if not tcid or not uid:
+        return
+    async with _use_conn(conn) as db_conn:
+        if not _conn_has_cursor(db_conn):
+            existing = _IN_MEMORY_HITL_SNAPSHOTS.get((tid, tcid))
+            if existing is not None and existing.get("caller_user_id") == uid:
+                _IN_MEMORY_HITL_SNAPSHOTS.pop((tid, tcid), None)
+            return
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                """
+                DELETE FROM dalton_report_delivery_hitl_snapshots
+                WHERE thread_id = %s
+                  AND tool_call_id = %s
+                  AND caller_user_id = %s
+                """,
+                (tid, tcid, uid),
+            )
+
+
 async def issue_report_delivery_confirmation(
     *,
     actor_user_id: str,
@@ -3169,6 +3481,13 @@ async def prepare_rest_report_profile_write(
         raise ReportDeliveryError(
             REST_NON_INTERACTIVE_CONFIRM_REFUSED_MESSAGE,
             code="confirmation_required",
+        )
+
+    ok_session, session_reason = check_verifiable_web_login_session(principal, http_request)
+    if not ok_session:
+        raise ReportDeliveryError(
+            session_reason or PASSWORDLESS_OSS_CONFIRM_REFUSED_MESSAGE,
+            code="web_session_required",
         )
 
     headers = getattr(http_request, "headers", None)

@@ -147,6 +147,7 @@ def _report_delivery_http_error(exc: Exception) -> HTTPException:
         "owner_tier_forbidden",
         "confirmation_required",
         "confirmation_invalid",
+        "web_session_required",
     }:
         return HTTPException(status_code=403, detail=detail)
     if code in {"not_found", "forbidden_or_not_found"}:
@@ -632,16 +633,34 @@ async def update_automation(
             elif has_rp:
                 # Bind the unlocked read version as a write condition so a concurrent
                 # clear/replace of report_profile cannot be overwritten without confirmation.
+                # An explicit expected_config_version MUST match the version at which
+                # report_profile was observed unchanged; otherwise fail closed with 409.
                 raw_cv = existing_row.get("config_version")
                 if isinstance(raw_cv, int) and not isinstance(raw_cv, bool):
+                    explicit_cv = extract_expected_config_version(request)
+                    if explicit_cv is not None and explicit_cv != raw_cv:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="任务配置版本已变更，请刷新后重试。",
+                        )
                     unchanged_rp_observed_cv = raw_cv
     route_warning: str | None = None
     try:
         # DALTON-HOOK(company-automations): validate optional expected_config_version and propagate via context
         expected_cv = extract_expected_config_version(request)
-        if expected_cv is None and unchanged_rp_observed_cv is not None:
+        if unchanged_rp_observed_cv is not None:
             expected_cv = unchanged_rp_observed_cv
         fields = request.model_dump(exclude_none=True)
+        # DALTON-HOOK(report-delivery): never persist an explicit null report_profile key
+        if (
+            report_profile_plan is None
+            and isinstance(fields.get("metadata"), dict)
+            and "report_profile" in fields["metadata"]
+            and fields["metadata"].get("report_profile") is None
+        ):
+            cleaned_meta = dict(fields["metadata"])
+            cleaned_meta.pop("report_profile", None)
+            fields["metadata"] = cleaned_meta
         # DALTON-HOOK(automation-model): allow explicit null llm_model to clear model override
         if "llm_model" in request.model_fields_set and request.llm_model is None:
             fields["llm_model"] = None

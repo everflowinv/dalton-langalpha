@@ -45,9 +45,40 @@ def upgrade() -> None:
             ON dalton_report_delivery_confirmations (actor_user_id, expires_at)
         """
     )
+    op.execute(
+        """
+        CREATE TABLE IF NOT EXISTS dalton_report_delivery_hitl_snapshots (
+            thread_id TEXT NOT NULL,
+            tool_call_id TEXT NOT NULL,
+            caller_user_id TEXT NOT NULL,
+            automation_id TEXT NOT NULL,
+            automation_name TEXT NOT NULL,
+            config_version INTEGER NULL,
+            profile TEXT NOT NULL,
+            report_targets JSONB NOT NULL,
+            text_targets JSONB NULL,
+            failure_targets JSONB NOT NULL,
+            group_targets JSONB NOT NULL,
+            non_caller_dm_targets JSONB NOT NULL,
+            target_labels JSONB NOT NULL,
+            needs_confirmation BOOLEAN NOT NULL,
+            confirm_token TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (thread_id, tool_call_id)
+        )
+        """
+    )
+    op.execute(
+        """
+        CREATE INDEX IF NOT EXISTS ix_dalton_report_delivery_hitl_snapshots_created_at
+            ON dalton_report_delivery_hitl_snapshots (created_at)
+        """
+    )
 
 
 def downgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
+    op.execute("DROP INDEX IF EXISTS ix_dalton_report_delivery_hitl_snapshots_created_at")
+    op.execute("DROP TABLE IF EXISTS dalton_report_delivery_hitl_snapshots")
     op.execute("DROP INDEX IF EXISTS ix_dalton_report_delivery_confirmations_actor_expires")
     op.execute("DROP TABLE IF EXISTS dalton_report_delivery_confirmations")

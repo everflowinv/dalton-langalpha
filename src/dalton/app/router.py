@@ -3250,17 +3250,13 @@ def _require_web_session_for_report_delivery_confirm(
     principal: Any, http_request: Request
 ) -> None:
     from src.dalton.auth.tokens import _normalize_origin
+    from src.dalton.services.report_delivery import check_verifiable_web_login_session
 
-    auth_kind = str(getattr(principal, "auth", "") or "").strip().lower()
-    if auth_kind != "session":
+    ok_session, reason = check_verifiable_web_login_session(principal, http_request)
+    if not ok_session:
         raise HTTPException(
             status_code=403,
-            detail="仅允许网页登录会话通过确认卡片签发或预检定时报告外发确认凭据。",
-        )
-    if str(http_request.headers.get("x-service-token") or "").strip():
-        raise HTTPException(
-            status_code=403,
-            detail="服务令牌不可签发定时报告外发确认凭据。",
+            detail=reason or "仅允许可验证的网页登录会话签发或预检定时报告外发确认凭据。",
         )
     sec_fetch_site = str(http_request.headers.get("sec-fetch-site") or "").strip().lower()
     if sec_fetch_site != "same-origin":

@@ -155,6 +155,7 @@ def _patch_common_set_deps(
     master_enabled: bool = True,
 ) -> dict[str, Any]:
     row = auto_row if auto_row is not None else _make_automation_row()
+    rd_svc.clear_in_memory_hitl_snapshots()
 
     get_tier_mock = create_autospec(rd_svc.get_user_tier, return_value=tier)
     monkeypatch.setattr(rd_svc, "get_user_tier", get_tier_mock)
@@ -4547,6 +4548,7 @@ async def test_ad5_rest_post_and_patch_require_one_time_credential_and_block_tok
         yield conn or _ConfConn()
 
     monkeypatch.setattr(rd_svc, "get_db_connection", _conf_conn)
+    monkeypatch.setenv("DALTON_AUTH_MODE", "local")
 
     http_req = Request({"type": "http", "headers": [], "app": MagicMock()})
 
@@ -4752,6 +4754,7 @@ async def test_ad5_r2_confirmation_issue_requires_same_origin_and_sec_fetch_site
     from src.dalton.capabilities import CapabilityId
 
     _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="admin", is_feishu_member=True)
+    monkeypatch.setenv("DALTON_AUTH_MODE", "local")
     monkeypatch.setattr(dalton_router, "_require_dalton_enabled", lambda: None)
     monkeypatch.setattr(dalton_router, "require_capability", lambda cap: None)
     assert CapabilityId.CHANNEL_GATEWAY is not None
@@ -5117,3 +5120,529 @@ async def test_ad5_r2_hitl_card_displays_actual_text_recipients(
     )
     card_disabled = hitl_calls[-1][1]
     assert card_disabled["args"]["纯文本目标"] == "不发送纯文本"
+
+
+@pytest.mark.asyncio
+async def test_ad5_r3_passwordless_oss_rejects_precheck_issue_and_rest_confirm_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """AD5 r3 (Lead #1): passwordless OSS fallback (no LANGALPHA_OWNER_SECRET) refuses
+    confirmation precheck, issuance, and REST writes needing confirmation, prompting
+    the admin to enable login; OSS desktop app with valid owner secret is allowed."""
+    from fastapi import HTTPException
+    from src.dalton.app import router as dalton_router
+
+    _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="admin", is_feishu_member=True)
+    monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
+    monkeypatch.setattr("src.dalton.auth.is_dalton_supabase_auth_enabled", lambda: False)
+    monkeypatch.setenv("DALTON_AUTH_MODE", "oss")
+    monkeypatch.delenv("LANGALPHA_OWNER_SECRET", raising=False)
+    monkeypatch.setattr(dalton_router, "_require_dalton_enabled", lambda: None)
+    monkeypatch.setattr(dalton_router, "require_capability", lambda _cap: None)
+    monkeypatch.setattr(
+        automations_app.cli_approval,
+        "automation_runs",
+        create_autospec(automations_app.cli_approval.automation_runs, return_value=None),
+    )
+    issued_spy = create_autospec(
+        rd_svc.issue_report_delivery_confirmation,
+        return_value={
+            "confirmation_id": "conf-oss-1",
+            "confirmation_token": "rdc_oss_tok",
+            "expires_at": "2026-11-26T10:00:00+00:00",
+            "payload_digest": "b" * 64,
+        },
+    )
+    monkeypatch.setattr(rd_svc, "issue_report_delivery_confirmation", issued_spy)
+
+    grp_profile = {
+        "profile": "daily-filing-alert",
+        "report_targets": [_FEISHU_CHAT_AUTH],
+        "failure_targets": [],
+    }
+    body = dalton_router.ReportDeliveryConfirmRequest(
+        action="create",
+        name="Daily Filing",
+        instruction=_DAILY_FILING_INST,
+        report_profile=grp_profile,
+    )
+    sess_principal = MagicMock()
+    sess_principal.user_id = _OWNER
+    sess_principal.auth = "session"
+
+    def _same_origin_req(extra_headers: list[tuple[bytes, bytes]] | None = None) -> Request:
+        return Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "scheme": "http",
+                "server": ("127.0.0.1", 8000),
+                "path": "/api/v1/dalton/report-delivery/confirmations",
+                "headers": [
+                    (b"host", b"127.0.0.1:8000"),
+                    (b"origin", b"http://127.0.0.1:8000"),
+                    (b"sec-fetch-site", b"same-origin"),
+                    *(extra_headers or []),
+                ],
+            }
+        )
+
+    # 1. Passwordless OSS (no LANGALPHA_OWNER_SECRET): precheck, issue, and POST all 403.
+    with pytest.raises(HTTPException) as exc_pre:
+        await dalton_router.report_delivery_precheck_endpoint(
+            body, sess_principal, _same_origin_req()
+        )
+    assert exc_pre.value.status_code == 403
+    assert "启用登录" in str(exc_pre.value.detail)
+
+    with pytest.raises(HTTPException) as exc_iss:
+        await dalton_router.issue_report_delivery_confirmation_endpoint(
+            body, sess_principal, _same_origin_req()
+        )
+    assert exc_iss.value.status_code == 403
+    assert "启用登录" in str(exc_iss.value.detail)
+    issued_spy.assert_not_awaited()
+
+    with pytest.raises(HTTPException) as exc_post:
+        await automations_app.create_automation(
+            AutomationCreate(
+                name="API Report Sync",
+                trigger_type="cron",
+                cron_expression="0 8 * * *",
+                instruction=_DAILY_FILING_INST,
+                workspace_id=UUID(_WS_UUID),
+                metadata={"report_profile": grp_profile},
+                report_delivery_confirmation_token="rdc_some_token",
+            ),
+            sess_principal,
+            _same_origin_req(),
+        )
+    assert exc_post.value.status_code == 403
+    assert "启用登录" in str(exc_post.value.detail)
+
+    # 2. Desktop OSS with LANGALPHA_OWNER_SECRET requires matching x-langalpha-owner header.
+    monkeypatch.setenv("LANGALPHA_OWNER_SECRET", "desktop-secret-xyz")
+    with pytest.raises(HTTPException) as exc_no_hdr:
+        await dalton_router.issue_report_delivery_confirmation_endpoint(
+            body, sess_principal, _same_origin_req()
+        )
+    assert exc_no_hdr.value.status_code == 403
+
+    with pytest.raises(HTTPException) as exc_with_auth:
+        await dalton_router.issue_report_delivery_confirmation_endpoint(
+            body,
+            sess_principal,
+            _same_origin_req(
+                [
+                    (b"x-langalpha-owner", b"desktop-secret-xyz"),
+                    (b"authorization", b"Bearer leaked"),
+                ]
+            ),
+        )
+    assert exc_with_auth.value.status_code == 403
+
+    ok_res = await dalton_router.issue_report_delivery_confirmation_endpoint(
+        body,
+        sess_principal,
+        _same_origin_req([(b"x-langalpha-owner", b"desktop-secret-xyz")]),
+    )
+    assert ok_res["confirmation_token"] == "rdc_oss_tok"
+    issued_spy.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ad5_r3_patch_explicit_version_mismatch_rejects_and_cannot_bypass_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """AD5 r3 (Lead #2 / Codex #1): PATCH carrying an unchanged report_profile at precheck
+    version N with an explicit expected_config_version=N+1 must fail 409 immediately
+    instead of overwriting the observed version and bypassing confirmation after a concurrent clear."""
+    from datetime import datetime, timezone
+    from fastapi import HTTPException
+
+    mocks = _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="admin", is_feishu_member=True)
+    now = datetime.now(timezone.utc)
+    grp_profile = {
+        "profile": "daily-filing-alert",
+        "report_targets": [_FEISHU_CHAT_AUTH],
+        "failure_targets": [],
+    }
+    existing_row = {
+        "automation_id": UUID(_AUTO_UUID),
+        "user_id": _OWNER,
+        "name": "API Report Sync",
+        "description": None,
+        "trigger_type": "cron",
+        "cron_expression": "0 8 * * *",
+        "timezone": "UTC",
+        "trigger_config": None,
+        "next_run_at": None,
+        "last_run_at": None,
+        "instruction": _DAILY_FILING_INST,
+        "workspace_id": UUID(_WS_UUID),
+        "llm_model": None,
+        "additional_context": None,
+        "thread_strategy": "new",
+        "conversation_thread_id": None,
+        "status": "active",
+        "max_failures": 3,
+        "failure_count": 0,
+        "disable_reason": None,
+        "delivery_config": None,
+        "metadata": {"report_profile": grp_profile},
+        "config_version": 3,
+        "created_at": now,
+        "updated_at": now,
+        "last_execution": None,
+        "scope": "personal",
+    }
+    mocks["get_auto"].side_effect = None
+    mocks["get_auto"].return_value = dict(existing_row)
+    monkeypatch.setattr(
+        automations_app.cli_approval,
+        "automation_runs",
+        create_autospec(automations_app.cli_approval.automation_runs, return_value=None),
+    )
+    handler_update = create_autospec(automations_app.handler.update_automation, return_value=existing_row)
+    monkeypatch.setattr(automations_app.handler, "update_automation", handler_update)
+
+    principal = MagicMock()
+    principal.user_id = _OWNER
+    principal.auth = "session"
+    http_req = Request({"type": "http", "headers": [], "app": MagicMock()})
+
+    # Explicit expected_config_version=4 != precheck observed version 3 -> 409 before any write.
+    with pytest.raises(HTTPException) as exc_mismatch:
+        await automations_app.update_automation(
+            _AUTO_UUID,
+            principal,
+            http_req,
+            body={
+                "metadata": {"report_profile": grp_profile, "note": "race"},
+                "expected_config_version": 4,
+            },
+        )
+    assert exc_mismatch.value.status_code == 409
+    handler_update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ad5_r3_resume_persists_snapshot_and_handles_reject_before_reprecheck(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """AD5 r3 (Lead #3 / Codex #3): pending HITL confirmation snapshot is persisted by
+    (thread_id, tool_call_id) before interrupt. When owner unbinds Discord while the card
+    is pending, resuming the tool reads the original decision FIRST:
+    - reject returns user_declined with ZERO writes (never skips hitl_confirm!)
+    - approve re-verifies the frozen snapshot targets (owner_discord) and fails dm_not_bound."""
+    from langgraph.errors import GraphInterrupt
+
+    owner_discord = "discord:user:777777777777777777"
+    row = _make_automation_row(user_id=_OTHER_USER, config_version=5)
+    mocks = _patch_common_set_deps(
+        monkeypatch, tmp_path=tmp_path, tier="admin", auto_row=row, is_feishu_member=True
+    )
+
+    # Cursor-backed SQL store verifying actual dalton_report_delivery_hitl_snapshots persistence.
+    snap_table: dict[tuple[str, str], dict[str, Any]] = {}
+
+    class _SnapCur:
+        def __init__(self) -> None:
+            self._one: dict[str, Any] | None = None
+
+        async def __aenter__(self) -> "_SnapCur":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+        async def execute(self, sql: str, params: tuple[Any, ...] = ()) -> None:
+            self._one = None
+            if "INSERT INTO dalton_report_delivery_hitl_snapshots" in sql:
+                (
+                    tid, tcid, cuid, aid, aname, cver, prof,
+                    rt_json, tt_json, ft_json, gt_json, dm_json, lbl_json,
+                    needs_c, tok,
+                ) = params
+                snap_table.setdefault(
+                    (tid, tcid),
+                    {
+                        "thread_id": tid,
+                        "tool_call_id": tcid,
+                        "caller_user_id": cuid,
+                        "automation_id": aid,
+                        "automation_name": aname,
+                        "config_version": cver,
+                        "profile": prof,
+                        "report_targets": json.loads(rt_json),
+                        "text_targets": json.loads(tt_json) if tt_json is not None else None,
+                        "failure_targets": json.loads(ft_json),
+                        "group_targets": json.loads(gt_json),
+                        "non_caller_dm_targets": json.loads(dm_json),
+                        "target_labels": json.loads(lbl_json),
+                        "needs_confirmation": needs_c,
+                        "confirm_token": tok,
+                    },
+                )
+            elif "DELETE FROM dalton_report_delivery_hitl_snapshots" in sql:
+                tid, tcid, cuid = params
+                rec = snap_table.get((tid, tcid))
+                if rec and rec["caller_user_id"] == cuid:
+                    snap_table.pop((tid, tcid), None)
+            elif "SELECT" in sql and "FROM dalton_report_delivery_hitl_snapshots" in sql:
+                tid, tcid, cuid = params
+                rec = snap_table.get((tid, tcid))
+                if rec and rec["caller_user_id"] == cuid:
+                    self._one = dict(rec)
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            return self._one
+
+    class _SnapTx:
+        async def __aenter__(self) -> "_SnapTx":
+            return self
+
+        async def __aexit__(self, *args: Any) -> bool:
+            return False
+
+    class _SnapConn:
+        def transaction(self) -> _SnapTx:
+            return _SnapTx()
+
+        def cursor(self, **kwargs: Any) -> _SnapCur:
+            return _SnapCur()
+
+    @asynccontextmanager
+    async def _snap_get_conn(conn: Any = None):
+        yield conn or _SnapConn()
+
+    monkeypatch.setattr(rd_svc, "get_db_connection", _snap_get_conn)
+
+    async def _tier_for(uid: str) -> str:
+        return "admin" if uid == _ADMIN else "internal"
+
+    async def _get_auto_any(aid: str, uid: str, *, conn: Any = None) -> dict[str, Any] | None:
+        return dict(row) if aid == _AUTO_UUID else None
+
+    mocks["get_tier"].side_effect = _tier_for
+    mocks["get_auto"].side_effect = _get_auto_any
+
+    owner_has_discord = {"bound": True}
+
+    async def _dm_identities(uid: str, *, conn: Any = None) -> list[dict[str, Any]]:
+        if uid == _OTHER_USER:
+            if not owner_has_discord["bound"]:
+                return []
+            return [
+                {
+                    "platform": "discord",
+                    "platform_user_id": "777777777777777777",
+                    "target": owner_discord,
+                    "supports_report_cards": False,
+                    "supports_text_targets": True,
+                    "supports_failure_targets": True,
+                }
+            ]
+        return _caller_identities()
+
+    rd_svc.list_caller_dm_identities.side_effect = _dm_identities
+
+    tool = create_report_delivery_tools()[0]
+    call_args = {
+        "action": "set",
+        "automation_id": _AUTO_UUID,
+        # Caller's own DM only -> confirmation is triggered solely by owner's default Discord failure_target!
+        "report_targets": [_CALLER_FEISHU_DM],
+    }
+
+    # --- Case 1: Pause (GraphInterrupt) -> owner unbinds Discord -> admin clicks REJECT ---
+    captured_card: dict[str, Any] = {}
+
+    def _raise_interrupt(action_type: str, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        captured_card.clear()
+        captured_card.update(payload)
+        raise GraphInterrupt(("pause",))
+
+    monkeypatch.setattr(
+        rd_tools,
+        "hitl_confirm",
+        create_autospec(_REAL_HITL_CONFIRM, side_effect=_raise_interrupt),
+    )
+
+    with pytest.raises(GraphInterrupt):
+        await tool.ainvoke(
+            {"name": tool.name, "args": call_args, "id": "tc-resume-rej", "type": "tool_call"},
+            config=_cfg(_ADMIN),
+        )
+    assert ("t-1", "tc-resume-rej") in snap_table
+    assert snap_table[("t-1", "tc-resume-rej")]["failure_targets"] == [owner_discord]
+    assert captured_card["failure_targets"] == [owner_discord]
+
+    # Owner unbinds Discord while card is pending!
+    owner_has_discord["bound"] = False
+
+    # Resume with admin's REJECT decision: must NOT skip hitl_confirm and must NOT write!
+    hitl_reject_mock = create_autospec(
+        _REAL_HITL_CONFIRM,
+        return_value=(False, {"decisions": [{"type": "reject"}]}),
+    )
+    monkeypatch.setattr(rd_tools, "hitl_confirm", hitl_reject_mock)
+
+    res_rej = _tool_json(
+        await tool.ainvoke(
+            {"name": tool.name, "args": call_args, "id": "tc-resume-rej", "type": "tool_call"},
+            config=_cfg(_ADMIN),
+        )
+    )
+    assert res_rej["ok"] is False
+    assert res_rej["error"] == "user_declined"
+    hitl_reject_mock.assert_called_once()
+    mocks["update_auto"].assert_not_awaited()
+    assert ("t-1", "tc-resume-rej") not in snap_table
+
+    # --- Case 2: Pause -> owner unbinds Discord -> admin clicks APPROVE ---
+    owner_has_discord["bound"] = True
+    monkeypatch.setattr(
+        rd_tools,
+        "hitl_confirm",
+        create_autospec(_REAL_HITL_CONFIRM, side_effect=_raise_interrupt),
+    )
+    with pytest.raises(GraphInterrupt):
+        await tool.ainvoke(
+            {"name": tool.name, "args": call_args, "id": "tc-resume-app", "type": "tool_call"},
+            config=_cfg(_ADMIN),
+        )
+    saved_tok = snap_table[("t-1", "tc-resume-app")]["confirm_token"]
+
+    # Owner unbinds Discord while card is pending; admin approves -> snapshot recheck rejects dm_not_bound!
+    owner_has_discord["bound"] = False
+    hitl_approve_mock = create_autospec(
+        _REAL_HITL_CONFIRM,
+        return_value=(True, {"decisions": [{"type": "approve", "confirm_token": saved_tok}]}),
+    )
+    monkeypatch.setattr(rd_tools, "hitl_confirm", hitl_approve_mock)
+
+    res_app = _tool_json(
+        await tool.ainvoke(
+            {"name": tool.name, "args": call_args, "id": "tc-resume-app", "type": "tool_call"},
+            config=_cfg(_ADMIN),
+        )
+    )
+    assert res_app["ok"] is False
+    assert res_app["error"] == "dm_not_bound"
+    hitl_approve_mock.assert_called_once()
+    mocks["update_auto"].assert_not_awaited()
+    assert ("t-1", "tc-resume-app") not in snap_table
+
+
+@pytest.mark.asyncio
+async def test_ad5_r3_patch_report_profile_null_clears_config_and_routes_without_422(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """AD5 r3 (Lead #4 / Codex #4): PATCH with metadata.report_profile=None passes
+    AutomationUpdate validation (no 422), strips report_profile from saved metadata,
+    and clears the automation:<id> route & override via server clear logic."""
+    from datetime import datetime, timezone
+    from pydantic import ValidationError
+    from src.dalton.notify import dispatch as dispatch_mod
+    from src.server.models.automation import AutomationUpdate
+
+    monkeypatch.setenv("DALTON_ENABLED", "1")
+
+    # 1. Model accepts report_profile=None on PATCH, while still rejecting malformed non-null shapes.
+    parsed_null = AutomationUpdate.model_validate(
+        {"metadata": {"keep_me": "yes", "report_profile": None}}
+    )
+    assert parsed_null.metadata == {"keep_me": "yes", "report_profile": None}
+    with pytest.raises(ValidationError):
+        AutomationUpdate.model_validate(
+            {"metadata": {"report_profile": {"profile": "invalid", "report_targets": []}}}
+        )
+
+    # 2. End-to-end PATCH with report_profile=None clears saved metadata and automation:<id> route.
+    mocks = _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="internal", is_feishu_member=True)
+    now = datetime.now(timezone.utc)
+    grp_profile = {
+        "profile": "daily-filing-alert",
+        "report_targets": [_FEISHU_CHAT_AUTH],
+        "failure_targets": [],
+    }
+    existing_row = {
+        "automation_id": UUID(_AUTO_UUID),
+        "user_id": _OWNER,
+        "name": "Web Clear Report",
+        "description": None,
+        "trigger_type": "cron",
+        "cron_expression": "0 8 * * *",
+        "timezone": "UTC",
+        "trigger_config": None,
+        "next_run_at": None,
+        "last_run_at": None,
+        "instruction": _DAILY_FILING_INST,
+        "workspace_id": UUID(_WS_UUID),
+        "llm_model": None,
+        "additional_context": None,
+        "thread_strategy": "new",
+        "conversation_thread_id": None,
+        "status": "active",
+        "max_failures": 3,
+        "failure_count": 0,
+        "disable_reason": None,
+        "delivery_config": None,
+        "metadata": {"keep_me": "yes", "report_profile": grp_profile},
+        "config_version": 4,
+        "created_at": now,
+        "updated_at": now,
+        "last_execution": None,
+        "scope": "personal",
+    }
+    mocks["get_auto"].side_effect = None
+    mocks["get_auto"].return_value = dict(existing_row)
+    monkeypatch.setattr(
+        automations_app.cli_approval,
+        "automation_runs",
+        create_autospec(automations_app.cli_approval.automation_runs, return_value=None),
+    )
+    monkeypatch.setattr(
+        dispatch_mod,
+        "populate_automation_notify_state",
+        create_autospec(dispatch_mod.populate_automation_notify_state, return_value=None),
+    )
+
+    saved_fields: dict[str, Any] = {}
+
+    async def _fake_handler_update(*, automation_id: str, user_id: str, fields: dict[str, Any], conn: Any = None):
+        saved_fields.clear()
+        saved_fields.update(fields)
+        updated = dict(existing_row)
+        updated["metadata"] = dict(fields.get("metadata") or {})
+        updated["config_version"] = 5
+        return updated
+
+    monkeypatch.setattr(
+        automations_app.handler,
+        "update_automation",
+        create_autospec(automations_app.handler.update_automation, side_effect=_fake_handler_update),
+    )
+
+    principal = MagicMock()
+    principal.user_id = _OWNER
+    principal.auth = "session"
+    http_req = Request({"type": "http", "headers": [], "app": MagicMock()})
+
+    resp = await automations_app.update_automation(
+        _AUTO_UUID,
+        principal,
+        http_req,
+        body={"metadata": {"keep_me": "yes", "report_profile": None}},
+    )
+    assert resp.metadata == {"keep_me": "yes"}
+    assert "report_profile" not in saved_fields["metadata"]
+    mocks["patch_prefs"].assert_awaited_once()
+    clear_patch = mocks["patch_prefs"].await_args.args[1]
+    assert clear_patch[rd_svc.DALTON_NOTIFY_OVERRIDES_KEY][f"automation:{_AUTO_UUID}"] is None
+    assert clear_patch[rd_svc.DALTON_NOTIFY_ROUTES_KEY][f"automation:{_AUTO_UUID}"] is None

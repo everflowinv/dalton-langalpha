@@ -101,6 +101,34 @@ vi.mock('../utils/api', async (importOriginal) => {
         last_execution: null,
       } as Automation,
     })),
+    updateAutomation: vi.fn(async (id, payload) => ({
+      data: {
+        automation_id: id,
+        user_id: 'user-1',
+        name: payload.name ?? 'Updated',
+        description: payload.description ?? null,
+        trigger_type: 'cron',
+        cron_expression: payload.cron_expression ?? '0 9 * * 1-5',
+        timezone: payload.timezone ?? 'America/New_York',
+        trigger_config: null,
+        next_run_at: null,
+        last_run_at: null,
+        instruction: payload.instruction ?? 'Run report.',
+        workspace_id: 'ws-1',
+        llm_model: null,
+        thread_strategy: 'continue',
+        conversation_thread_id: null,
+        status: 'active',
+        max_failures: 3,
+        failure_count: 0,
+        disable_reason: null,
+        delivery_config: null,
+        metadata: payload.metadata ?? {},
+        created_at: '2026-11-26T00:00:00Z',
+        updated_at: '2026-11-26T00:00:00Z',
+        last_execution: null,
+      } as Automation,
+    })),
     ...personalReadMocks(listAutomations),
   };
 });
@@ -275,5 +303,66 @@ describe('Automations report delivery confirmation dialog (AD5)', () => {
     expect(await screen.findAllByText('Group One')).toHaveLength(1);
     expect(screen.getAllByText('Group Two')).toHaveLength(1);
     expect(screen.getAllByText(label('automation:reportDeliveryTextDisabled')).length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('clears report_profile by submitting metadata.report_profile=null directly without confirmation dialog', async () => {
+    const existingAuto: Automation = {
+      automation_id: 'auto-clear-1',
+      user_id: 'user-1',
+      name: 'Existing Group Report',
+      description: null,
+      trigger_type: 'cron',
+      cron_expression: '0 9 * * 1-5',
+      timezone: 'America/New_York',
+      trigger_config: null,
+      next_run_at: null,
+      last_run_at: null,
+      instruction: 'Run daily filing alert report.',
+      workspace_id: 'ws-1',
+      llm_model: null,
+      thread_strategy: 'continue',
+      conversation_thread_id: null,
+      status: 'active',
+      max_failures: 3,
+      failure_count: 0,
+      disable_reason: null,
+      delivery_config: null,
+      metadata: {
+        keep_flag: true,
+        report_profile: {
+          profile: 'daily-filing-alert',
+          report_targets: ['feishu:chat:oc_group_auth_1'],
+          failure_targets: [],
+        },
+      },
+      created_at: '2026-11-26T00:00:00Z',
+      updated_at: '2026-11-26T00:00:00Z',
+      last_execution: null,
+    };
+    vi.mocked(api.listAutomations).mockResolvedValue({
+      data: { automations: [existingAuto], total: 1 },
+      status: 200,
+      statusText: 'OK',
+      headers: {},
+    });
+
+    renderWithProviders(<Automations />, { route: '/automations?view=manage&id=auto-clear-1' });
+
+    fireEvent.click(await screen.findByRole('button', { name: label('automation:edit') }));
+    fireEvent.click(await screen.findByRole('button', { name: new RegExp(label('automation:moreOptions')) }));
+    fireEvent.click(await screen.findByRole('button', { name: label('automation:reportDeliveryClear') }));
+    fireEvent.click(screen.getByRole('button', { name: label('automation:saveChanges') }));
+
+    await waitFor(() => {
+      expect(api.updateAutomation).toHaveBeenCalledTimes(1);
+    });
+    expect(confirmMocks.precheck).not.toHaveBeenCalled();
+    expect(confirmMocks.issue).not.toHaveBeenCalled();
+    const [updatedId, patchPayload] = vi.mocked(api.updateAutomation).mock.calls[0] ?? [];
+    expect(updatedId).toBe('auto-clear-1');
+    expect(patchPayload?.metadata).toEqual({
+      keep_flag: true,
+      report_profile: null,
+    });
   });
 });

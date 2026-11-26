@@ -648,8 +648,8 @@ class AutomationUpdate(_ScheduleFields):
 
     @model_validator(mode="after")
     def _keeps_the_stored_kind(self, info: ValidationInfo) -> "AutomationUpdate":
-        # DALTON-HOOK(report-delivery): reject malformed report_profile shape on REST/model validation
-        _validate_metadata_report_profile(self.metadata)
+        # DALTON-HOOK(report-delivery): reject malformed report_profile shape on REST/model validation; null clears it
+        _validate_metadata_report_profile(self.metadata, allow_null=True)
         kind = (info.context or {}).get("trigger_type")
         if kind is None:
             return self
@@ -663,8 +663,10 @@ class AutomationUpdate(_ScheduleFields):
 
 
 # DALTON-HOOK(report-delivery): validate metadata.report_profile structure when Dalton is enabled
-def _validate_metadata_report_profile(metadata: Any) -> None:
+def _validate_metadata_report_profile(metadata: Any, *, allow_null: bool = False) -> None:
     if not isinstance(metadata, dict) or "report_profile" not in metadata:
+        return
+    if allow_null and metadata.get("report_profile") is None:
         return
     from src.dalton.settings import is_dalton_enabled
 

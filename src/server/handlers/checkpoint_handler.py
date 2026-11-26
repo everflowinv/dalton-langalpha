@@ -342,60 +342,6 @@ def _is_reject_answer(answer: Any) -> bool:
     return decision_type == "reject"
 
 
-def _extract_answer_confirm_token(answer: Any) -> str | None:
-    decisions = (
-        answer.get("decisions")
-        if isinstance(answer, dict)
-        else getattr(answer, "decisions", None)
-    )
-    if not decisions:
-        return None
-    first = decisions[0]
-    raw = (
-        first.get("confirm_token")
-        if isinstance(first, dict)
-        else getattr(first, "confirm_token", None)
-    )
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
-    return None
-
-
-def _verify_report_delivery_interrupt_answer(
-    action_req: dict[str, Any],
-    answer: Any,
-    *,
-    caller_user_id: str,
-) -> bool:
-    """Verify confirm_token integrity for ``dalton_report_delivery_set`` approval."""
-    from src.dalton.services.report_delivery import (
-        compute_report_delivery_confirm_token,
-    )
-
-    expected_token = str(action_req.get("confirm_token") or "").strip()
-    returned_token = _extract_answer_confirm_token(answer)
-    if not expected_token or not returned_token or returned_token != expected_token:
-        return False
-    raw_report = action_req.get("report_targets")
-    raw_text = action_req.get("text_targets")
-    raw_failure = action_req.get("failure_targets")
-    if not isinstance(raw_report, list) or not isinstance(raw_failure, list):
-        return False
-    if raw_text is not None and not isinstance(raw_text, list):
-        return False
-    recomputed = compute_report_delivery_confirm_token(
-        action=str(action_req.get("action") or "set"),
-        caller_user_id=caller_user_id,
-        automation_id=action_req.get("automation_id"),
-        config_version=action_req.get("config_version"),
-        profile=str(action_req.get("profile") or ""),
-        report_targets=raw_report,
-        text_targets=raw_text,
-        failure_targets=raw_failure,
-    )
-    return expected_token == recomputed
-
-
 def _snapshot_matches_action(
     snapshot: dict[str, Any], action_req: dict[str, Any]
 ) -> bool:
@@ -547,18 +493,17 @@ async def _verify_web_confirm_resume(
             continue
         action_req = _interrupt_action_request(guarded_by_id[iid]) or {}
         if action_req.get("type") == "dalton_report_delivery_set":
-            if not _verify_report_delivery_interrupt_answer(
+            # DALTON-HOOK(report-delivery): delegate AD5 session & confirm_token verification to src.dalton
+            from src.dalton.services.report_delivery import (
+                verify_report_delivery_interrupt_resume,
+            )
+
+            verify_report_delivery_interrupt_resume(
                 action_req,
                 answers[iid],
-                caller_user_id=str(principal.user_id),
-            ):
-                raise HTTPException(
-                    status_code=403,
-                    detail={
-                        "code": "confirm_token_mismatch",
-                        "message": "确认凭据无效或与待确认外发目标不一致，请重新确认。",
-                    },
-                )
+                principal=principal,
+                raw_request=raw_request,
+            )
             continue
         tool_call_id = action_req.get("tool_call_id")
         snap = (

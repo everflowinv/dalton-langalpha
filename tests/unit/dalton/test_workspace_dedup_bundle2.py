@@ -630,3 +630,210 @@ async def test_bd5_r2_recheck_detects_unmatched_candidate_unit_archived_mid_chec
     assert snap.status == "clear"
     assert collect_calls["n"] == 2
     assert (ws_baba, "阿里研究", None) in snap.checked_candidates
+
+
+@pytest.mark.asyncio
+async def test_bd6_r3_locked_recheck_matches_proposal_and_phase1_colleague_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BD6 r3 (Codex #5): locked Phase 2 check_duplicate_snapshot_unchanged uses the exact
+    same strict colleague predicate as proposal and lock-free Phase 1 so colleague 'Aapl'
+    vs new 'aapl' (no LLM match, no unit_ticker) succeeds instead of failing scope_changed,
+    while colleague explicit ticker 'AAPL' or unit_ticker='AAPL' is rejected in all three phases."""
+    from src.dalton import sharing as sharing_mod
+    from src.server.database import workspace as ws_db
+
+    ws_colleague = "bbbbbbbb-bbbb-4bbb-8bbb-00000000aa11"
+
+    def _run_case(colleague_name: str, unit_ticker: str | None) -> Any:
+        ws_row = {
+            "workspace_id": ws_colleague,
+            "user_id": COLLEAGUE_ID,
+            "name": colleague_name,
+            "status": "stopped",
+            "owner_name": "Bob",
+            "owner_email": "bob@team.com",
+            "unit_ticker": unit_ticker,
+            "is_home_stand_in": False,
+            "is_historical_duplicate": False,
+            "last_activity_at": None,
+            "updated_at": None,
+            "created_at": None,
+        }
+
+        class _LockedCur:
+            def __init__(self) -> None:
+                self._rows: list[dict[str, Any]] = []
+
+            async def execute(self, sql: str, _params: Any = None) -> None:
+                text = " ".join(sql.split())
+                if "FROM workspaces w" in text:
+                    self._rows = [dict(ws_row)]
+                else:
+                    self._rows = []
+
+            async def fetchall(self) -> list[dict[str, Any]]:
+                return list(self._rows)
+
+        return _LockedCur()
+
+    monkeypatch.setattr("src.dalton.settings.is_dalton_local_auth_enabled", lambda: False)
+    monkeypatch.setattr(sharing_mod, "is_dalton_local_auth_enabled", lambda: False)
+    monkeypatch.setattr(
+        sharing_mod,
+        "get_dalton_allowed_emails",
+        lambda: frozenset({"alice@team.com", "bob@team.com"}),
+    )
+    monkeypatch.setattr(sharing_mod, "is_invite_pm", lambda _u: False)
+    monkeypatch.setattr(sharing_mod, "is_company_system_user", lambda _u: False)
+
+    # Colleague 'Aapl' (no unit_ticker) vs new 'aapl': locked Phase 2 agrees with Phase 0 & 1 (True).
+    ok_mixed = await ws_db.check_duplicate_snapshot_unchanged(
+        _run_case("Aapl", None),
+        USER_ID,
+        "aapl",
+        verified_company_candidates=[(ws_colleague, "Aapl", None)],
+        check_colleague_duplicate=True,
+    )
+    assert ok_mixed is True
+
+    # Colleague explicit ticker 'AAPL' vs new 'aapl': locked Phase 2 rejects (False).
+    ok_explicit = await ws_db.check_duplicate_snapshot_unchanged(
+        _run_case("AAPL", None),
+        USER_ID,
+        "aapl",
+        verified_company_candidates=[(ws_colleague, "AAPL", None)],
+        check_colleague_duplicate=True,
+    )
+    assert ok_explicit is False
+
+    # Colleague 'Aapl' WITH registered unit_ticker='AAPL' vs new 'aapl': locked Phase 2 rejects (False).
+    ok_unit = await ws_db.check_duplicate_snapshot_unchanged(
+        _run_case("Aapl", "AAPL"),
+        USER_ID,
+        "aapl",
+        verified_company_candidates=[(ws_colleague, "Aapl", "AAPL")],
+        check_colleague_duplicate=True,
+    )
+    assert ok_unit is False
+
+
+@pytest.mark.asyncio
+async def test_e1_r3_multibatch_timeout_not_masked_by_ordinary_batch_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E1 r3 (Codex #6): when multiple dedup batches run and one batch fails with an
+    ordinary error while another hits the timeout deadline (no valid matches), TimeoutError
+    must NOT be masked by the ordinary error so the web create entry receives dedup_unavailable."""
+    import asyncio
+
+    # Force 3 batches (batch size = 1, 3 colleague workspaces)
+    ws_rows = [
+        {
+            "workspace_id": f"bbbbbbbb-bbbb-4bbb-8bbb-00000000e10{i}",
+            "user_id": COLLEAGUE_ID,
+            "name": f"Company {i}",
+            "status": "stopped",
+            "owner_name": "Bob",
+            "owner_email": "bob@team.com",
+            "is_home_stand_in": False,
+            "is_historical_duplicate": False,
+            "last_activity_at": None,
+            "updated_at": None,
+            "created_at": None,
+        }
+        for i in range(3)
+    ]
+
+    class _Cur:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: Any):
+            return False
+
+        async def execute(self, sql: str, _params: Any = None) -> None:
+            text = " ".join(sql.split())
+            if "FROM workspaces w" in text:
+                self._rows = [dict(r) for r in ws_rows]
+            else:
+                self._rows = []
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._rows)
+
+    class _Conn:
+        def cursor(self, **_kwargs: Any) -> _Cur:
+            return _Cur()
+
+    @asynccontextmanager
+    async def _use_conn(c: Any = None):
+        yield c or _Conn()
+
+    monkeypatch.setattr(dedup_mod, "get_db_connection", _use_conn)
+    monkeypatch.setattr(dedup_mod, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(dedup_mod, "DEDUP_BATCH_SIZE", 1)
+    monkeypatch.setattr(dedup_mod, "DEDUP_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(
+        dedup_mod,
+        "get_user_tier",
+        create_autospec(dedup_mod._REAL_GET_USER_TIER, return_value="internal"),
+    )
+    monkeypatch.setattr(dedup_mod, "_is_internal_team_owner", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "_resolve_dedup_models",
+        create_autospec(dedup_mod._resolve_dedup_models, return_value=["test-model"]),
+    )
+
+    orig_run_batch = dedup_mod._run_batch_with_fallback
+
+    # Case A: batch 0 returns empty matches, batch 1 raises ordinary ValueError, batch 2 hangs past deadline.
+    batch_idx = {"n": 0}
+
+    async def _mixed_partial_batch(**_kwargs: Any) -> list[Any]:
+        i = batch_idx["n"]
+        batch_idx["n"] += 1
+        if i == 0:
+            return []
+        if i == 1:
+            raise ValueError("ordinary parse failure")
+        await asyncio.sleep(1.0)
+        return []
+
+    monkeypatch.setattr(
+        dedup_mod,
+        "_run_batch_with_fallback",
+        create_autospec(orig_run_batch, side_effect=_mixed_partial_batch),
+    )
+
+    with pytest.raises(TimeoutError):
+        await find_existing_company_workspace(
+            USER_ID, "NewCo", channel="web", raise_on_timeout=True
+        )
+
+    # Case B: 0 batches succeed — batch 0 & 1 raise ordinary error, batch 2 hangs past deadline -> still TimeoutError!
+    batch_idx_b = {"n": 0}
+
+    async def _all_fail_with_timeout(**_kwargs: Any) -> list[Any]:
+        i = batch_idx_b["n"]
+        batch_idx_b["n"] += 1
+        if i < 2:
+            raise RuntimeError("ordinary error")
+        await asyncio.sleep(1.0)
+        return []
+
+    monkeypatch.setattr(
+        dedup_mod,
+        "_run_batch_with_fallback",
+        create_autospec(orig_run_batch, side_effect=_all_fail_with_timeout),
+    )
+
+    with pytest.raises(TimeoutError):
+        await find_existing_company_workspace(
+            USER_ID, "NewCo", channel="web", raise_on_timeout=True
+        )

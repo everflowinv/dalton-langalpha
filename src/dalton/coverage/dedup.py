@@ -1289,35 +1289,46 @@ async def _judge_candidates_with_llm(
         await asyncio.gather(*pending, return_exceptions=True)
 
     succeeded = 0
-    failed_exc: Exception | None = None
+    timed_out_exc: Exception | None = None
+    other_failed_exc: Exception | None = None
     all_hits: list[tuple[_CandidateEntry, str, str]] = []
 
     for task in done:
         exc = task.exception()
         if exc is not None:
-            failed_exc = exc if isinstance(exc, Exception) else RuntimeError(type(exc).__name__)
+            if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+                if timed_out_exc is None:
+                    timed_out_exc = exc
+            elif other_failed_exc is None:
+                other_failed_exc = (
+                    exc if isinstance(exc, Exception) else RuntimeError(type(exc).__name__)
+                )
             continue
         succeeded += 1
         all_hits.extend(task.result())
 
-    if pending and failed_exc is None:
-        failed_exc = TimeoutError("Workspace dedup LLM timed out")
+    if pending and timed_out_exc is None:
+        timed_out_exc = TimeoutError("Workspace dedup LLM timed out")
 
+    primary_exc = timed_out_exc or other_failed_exc
     ws_count = stats["workspace_count"] if stats is not None else len(entries)
     if succeeded == 0:
-        raise failed_exc or TimeoutError("Workspace dedup LLM timed out")
+        raise primary_exc or TimeoutError("Workspace dedup LLM timed out")
 
     if suggestion_out is not None and not is_external:
         best_suggestion = _pick_best_suggestion(batch_suggestions)
         if best_suggestion is not None:
             suggestion_out.append(best_suggestion)
 
-    if failed_exc is not None:
+    if primary_exc is not None:
         if partial_failure_out is not None:
-            partial_failure_out.append(failed_exc)
+            if timed_out_exc is not None:
+                partial_failure_out.append(timed_out_exc)
+            if other_failed_exc is not None:
+                partial_failure_out.append(other_failed_exc)
         logger.warning(
             "Company workspace dedup partial batch failure (%s, succeeded=%d/%d, workspace_count=%d)",
-            type(failed_exc).__name__,
+            type(primary_exc).__name__,
             succeeded,
             len(batches),
             ws_count,
@@ -1741,6 +1752,52 @@ def _is_explicit_ticker_shape(raw: str | None) -> bool:
     return 1 <= len(s) <= 5 and s.isalpha() and s.isupper()
 
 
+def colleague_workspace_name_matches_ticker(
+    target_name: str,
+    candidate_name: str | None,
+    *,
+    strict_name_ticker_shape: bool = True,
+) -> bool:
+    """Whether ``candidate_name`` deterministically matches ``target_name`` as a ticker.
+
+    Shared by proposal, lock-free recheck, and locked Phase 2 colleague verification so
+    all three phases agree on non-explicit mixed-case names (e.g. ``Aapl`` vs ``aapl``).
+    """
+    target_ticker_key = canonical_workspace_ticker_key(target_name)
+    if target_ticker_key is None:
+        return False
+    name_key = canonical_workspace_ticker_key(candidate_name)
+    if name_key != target_ticker_key:
+        return False
+    if not strict_name_ticker_shape:
+        return True
+    return _is_explicit_ticker_shape(target_name) or _is_explicit_ticker_shape(
+        candidate_name
+    )
+
+
+def colleague_workspace_deterministic_match(
+    target_name: str,
+    *,
+    candidate_name: str | None,
+    candidate_unit_ticker: str | None = None,
+    strict_name_ticker_shape: bool = True,
+) -> bool:
+    """Single shared deterministic predicate for colleague workspace candidates across
+    proposal (Phase 0), lock-free recheck (Phase 1), and locked write recheck (Phase 2)."""
+    target_ticker_key = canonical_workspace_ticker_key(target_name)
+    if target_ticker_key is None:
+        return False
+    unit_key = normalize_ticker_key(candidate_unit_ticker)
+    if unit_key is not None and unit_key == target_ticker_key:
+        return True
+    return colleague_workspace_name_matches_ticker(
+        target_name,
+        candidate_name,
+        strict_name_ticker_shape=strict_name_ticker_shape,
+    )
+
+
 async def _deterministic_ticker_match_entries(
     *,
     uid: str,
@@ -1763,7 +1820,6 @@ async def _deterministic_ticker_match_entries(
     target_ticker_key = canonical_workspace_ticker_key(raw_name)
     if target_ticker_key is None:
         return []
-    raw_is_explicit_ticker = _is_explicit_ticker_shape(raw_name)
 
     live_by_unit_id: dict[str, tuple[_CandidateEntry, dict[str, Any] | None]] = {}
     live_by_ws_id: dict[str, tuple[_CandidateEntry, dict[str, Any] | None]] = {}
@@ -1798,11 +1854,10 @@ async def _deterministic_ticker_match_entries(
         ):
             continue
         unit_key = normalize_ticker_key(entry.unit_ticker)
-        name_key = canonical_workspace_ticker_key(entry.workspace_name)
-        name_matches = name_key == target_ticker_key and (
-            not strict_name_ticker_shape
-            or raw_is_explicit_ticker
-            or _is_explicit_ticker_shape(entry.workspace_name)
+        name_matches = colleague_workspace_name_matches_ticker(
+            raw_name,
+            entry.workspace_name,
+            strict_name_ticker_shape=strict_name_ticker_shape,
         )
         if unit_key != target_ticker_key and not name_matches:
             continue
@@ -1869,11 +1924,10 @@ async def _deterministic_ticker_match_entries(
         ):
             continue
         live_unit_key = normalize_ticker_key(live_entry.unit_ticker)
-        live_name_key = canonical_workspace_ticker_key(live_entry.workspace_name)
-        live_name_matches = live_name_key == target_ticker_key and (
-            not strict_name_ticker_shape
-            or raw_is_explicit_ticker
-            or _is_explicit_ticker_shape(live_entry.workspace_name)
+        live_name_matches = colleague_workspace_name_matches_ticker(
+            raw_name,
+            live_entry.workspace_name,
+            strict_name_ticker_shape=strict_name_ticker_shape,
         )
         if live_unit_key != target_ticker_key and not live_name_matches:
             continue
@@ -2139,7 +2193,7 @@ async def _find_matches(
         ]
     if not all_live_hits:
         if raise_on_timeout:
-            for exc in llm_partial_failures:
+            for exc in (*llm_partial_failures, *recheck_failures):
                 if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
                     raise exc
         if suggestion_out:

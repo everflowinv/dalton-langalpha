@@ -1454,6 +1454,7 @@ async def check_duplicate_snapshot_unchanged(
 
         if check_colleague_duplicate:
             from src.dalton import settings as dalton_settings
+            from src.dalton.coverage.dedup import colleague_workspace_deterministic_match
             from src.dalton.sharing import is_internal_team_owner
 
             internal_user_ids: Optional[set[str]] = None
@@ -1518,10 +1519,11 @@ async def check_duplicate_snapshot_unchanged(
                     and ws_id_s == expected_duplicate_workspace_id
                 ):
                     continue
-                if _same_name_or_ticker(name, ws_name):
-                    return False
-                if unit_ticker is not None and _same_name_or_ticker(
-                    name, unit_ticker, candidate_is_ticker=True
+                if colleague_workspace_deterministic_match(
+                    name,
+                    candidate_name=ws_name,
+                    candidate_unit_ticker=unit_ticker,
+                    strict_name_ticker_shape=True,
                 ):
                     return False
 
