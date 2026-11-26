@@ -34,13 +34,15 @@ export function connectedModel(
   customModels: readonly CustomModelEntry[],
   connectionOf: ConnectionOf,
   daltonProfile?: string | null,
+  daltonSetupCandidates?: readonly string[] | null,
 ): string | null {
   const offered = listedFor(provider, models, metadata, customModels, connectionOf);
   if (provider === CLAUDE_CODE) return claudeCodeStartModel(offered, metadata, accountDefault);
-  // DALTON-HOOK(dalton-setup): restrict auto-saved connected default to the 5 curated candidates
+  // DALTON-HOOK(dalton-setup): restrict auto-saved connected default to curated candidates
   // DALTON-HOOK(standalone-core): Core profile falls back to connected tool-calling models
+  // DALTON-HOOK(team-model-catalog): pass version-aligned `dalton_setup_candidates`
   if (isDaltonBuild) {
-    return pickDaltonConnectedDefault(offered, metadata, daltonProfile);
+    return pickDaltonConnectedDefault(offered, metadata, daltonProfile, daltonSetupCandidates);
   }
   return strongestModel(offered, metadata)?.model ?? offered[0] ?? null;
 }
@@ -84,10 +86,20 @@ export function useSaveConnectedDefault() {
   /** The model `provider` would start on, null until that is decided
    *  (`settled`) and, for any but Claude Code, without its own list read
    *  (`listRead`). */
+  // DALTON-HOOK(team-model-catalog): forward server `dalton_setup_candidates` into connectedModel
   const modelFor = (provider: string) =>
     !settled(provider) || (provider !== CLAUDE_CODE && !listRead(provider))
       ? null
-      : connectedModel(provider, models, effectiveMetadata, accountDefault, customModels, connectionOf, rawApiResponse?.dalton_profile);
+      : connectedModel(
+          provider,
+          models,
+          effectiveMetadata,
+          accountDefault,
+          customModels,
+          connectionOf,
+          rawApiResponse?.dalton_profile,
+          rawApiResponse?.dalton_setup_candidates,
+        );
   /** Resolves whether a default was saved. */
   const save = async (model: string): Promise<boolean> => {
     try {

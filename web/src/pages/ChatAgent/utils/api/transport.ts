@@ -10,6 +10,8 @@ import { authGeneration, bearerTokenOf, getAuthHeaders, refreshAccessToken } fro
 import { holdReload } from '@/lib/reloadHolds';
 import { RUN_STREAM_BEAT_MS, watchStreamSilence, type StreamSilenceWatch } from '@/lib/streamSilence';
 import { noteIfSuspended } from '@/lib/accountSuspension';
+// DALTON-HOOK(team-model-catalog): observe X-Dalton-Catalog-Revision and catalog 400 errors on raw SSE fetch streams
+import { observeCatalogModelError, observeCatalogRevisionHeader } from '@/lib/dalton/catalogRevision';
 
 export const baseURL = api.defaults.baseURL;
 
@@ -116,6 +118,8 @@ export async function streamFetch(
     }
     throw error;
   }
+  // DALTON-HOOK(team-model-catalog): observe X-Dalton-Catalog-Revision on SSE stream response headers
+  observeCatalogRevisionHeader(res.headers, { url });
   // Snapshot Content-Location before body errors so callers can recover the
   // canonical reconnect URL (carries ?run_id=…) even when a 4xx aborts later.
   const contentLocation = res.headers.get('Content-Location');
@@ -167,6 +171,8 @@ export async function streamFetch(
       }
     } catch { /* ignore parse errors */ }
     if (res.status === 403) noteIfSuspended(errorInfo);
+    // DALTON-HOOK(team-model-catalog): refresh catalog caches on 400 model_removed / model_retired / catalog_route_changed SSE refusals
+    if (res.status === 400) observeCatalogModelError(res.status, errorInfo);
     console.error(`[api] ${opts.method || 'GET'} ${url} failed:`, res.status, detail);
     const err: Error & { status?: number; errorInfo?: Record<string, unknown> } =
       new Error(detail || `HTTP error! status: ${res.status}`);

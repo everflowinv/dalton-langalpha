@@ -43,6 +43,11 @@ export interface ModelsResponse {
   task_cost_baseline?: TaskCostBaseline | null;
   // DALTON-HOOK(standalone-core): expose deployment profile (everflow vs core) for setup wizard gating
   dalton_profile?: 'everflow' | 'core';
+  // DALTON-HOOK(team-model-catalog): expose server capability flag, compiled catalog revision, and version-aligned setup candidates/providers
+  team_catalog_enabled?: boolean;
+  catalog_revision?: number;
+  dalton_setup_candidates?: string[];
+  dalton_curated_providers?: string[];
 }
 
 export async function getAvailableModels(): Promise<ModelsResponse> {

@@ -299,6 +299,8 @@ export const SETTINGS = {
 
   daltonCoverage: { section: 'coverage', anchor: 'dalton-coverage', labelKey: 'settings:dalton.coverageLabel', descKey: 'settings:dalton.coverageDesc', keywords: '覆盖结构 行业 独立公司 绑定工作区 未归类工作区 coverage sector company' },
 
+  // DALTON-HOOK(team-model-catalog): register team model catalog card in Team Management -> Models & Providers
+  daltonTeamModelCatalog: { section: 'teamModels', anchor: 'dalton-team-model-catalog', labelKey: 'settings:dalton.teamCatalogLabel', descKey: 'settings:dalton.teamCatalogDesc', keywords: '团队模型目录 新增模型 模型价格 评分 退役 回滚 供应商变体 team model catalog pricing ratings retire rollback provider variant' },
   daltonProviders: { section: 'teamModels', anchor: 'dalton-providers', labelKey: 'settings:dalton.providersLabel', descKey: 'settings:dalton.providersDesc', keywords: '团队凭据 模型与数据源状态 团队共享凭据 供应商 team credentials provider status' },
   daltonNativeModels: { section: 'teamModels', anchor: 'dalton-native-models', labelKey: 'dalton.nativeModels.title', descKey: 'dalton.nativeModels.footnote', keywords: '模型目录同步 同步模型 退役模型 model catalog sync', capability: 'native_oauth_sync' },
 

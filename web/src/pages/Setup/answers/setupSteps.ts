@@ -11,6 +11,7 @@
  */
 import type { OnboardingModels, OnboardingProgress, OnboardingProgressPatch, OnboardingRunsOn, OnboardingSetupStep } from '@/api/onboarding';
 // DALTON-HOOK(dalton-setup): Dalton builds never require the Claude Code model step and only advance from /setup/model on curated-candidate subscriptions
+// DALTON-HOOK(team-model-catalog): keep Everflow empty-curated check pure (no daltonSetup/api/client import) so node-env tests can load setupSteps and gate
 import { isDaltonBuild } from '@/config/brand';
 import { WELCOME_PATH } from '@/pages/Onboarding/welcome/paths';
 
@@ -20,6 +21,33 @@ export const DALTON_CURATED_PROVIDERS: ReadonlySet<string> = new Set([
   'claude-oauth',
   'codex-oauth',
 ]);
+
+// DALTON-HOOK(team-model-catalog): prefer version-aligned server `dalton_curated_providers` (including empty []) over static fallback
+export function resolveDaltonCuratedProviders(
+  serverProviders?: readonly string[] | null,
+): ReadonlySet<string> {
+  if (Array.isArray(serverProviders)) {
+    return new Set(serverProviders);
+  }
+  return DALTON_CURATED_PROVIDERS;
+}
+
+// DALTON-HOOK(team-model-catalog): true when Everflow's live catalog revision defines zero curated setup candidates (`dalton_setup_candidates: []`)
+export function isDaltonEverflowCuratedEmpty(
+  daltonProfile?: string | null,
+  daltonSetupCandidates?: readonly string[] | null,
+): boolean {
+  if (!isDaltonBuild) return false;
+  const runtime = daltonProfile?.trim().toLowerCase();
+  const isCore =
+    runtime === 'core'
+      ? true
+      : runtime === 'everflow'
+        ? false
+        : (import.meta.env.VITE_DALTON_PROFILE as string | undefined)?.trim().toLowerCase() === 'core';
+  if (isCore) return false;
+  return Array.isArray(daltonSetupCandidates) && daltonSetupCandidates.length === 0;
+}
 
 export type ModelsAnswer = OnboardingModels;
 export type RunsOnAnswer = OnboardingRunsOn;
@@ -51,6 +79,8 @@ export interface SetupFacts {
   providerConnected: boolean;
   // DALTON-HOOK(dalton-setup): true when Dalton team sharing is active with available models
   teamModelsAvailable?: boolean;
+  // DALTON-HOOK(team-model-catalog): true when Dalton team sharing or Everflow curated candidates have zero usable setup models
+  teamModelsEmpty?: boolean;
   /** The last setup step the record says was finished. */
   lastStep: SetupStep | null;
 }
@@ -86,7 +116,13 @@ export function effectiveModelsAnswer(models: ModelsAnswer, teamModelsAvailable 
 }
 
 /** Whether the answers need a model connected in setup. */
-export const needsModelStep = (answers: SetupAnswers, teamModelsAvailable = false): boolean => {
+// DALTON-HOOK(team-model-catalog): keep /setup/model in the rail when Everflow curated setup or team models are empty
+export const needsModelStep = (
+  answers: SetupAnswers,
+  teamModelsAvailable = false,
+  teamModelsEmpty = false,
+): boolean => {
+  if (isDaltonBuild && teamModelsEmpty) return true;
   const models = effectiveModelsAnswer(answers.models, teamModelsAvailable);
   return models !== 'langalpha_models';
 };
@@ -97,15 +133,17 @@ export const needsModelStep = (answers: SetupAnswers, teamModelsAvailable = fals
  * it), so connecting a computer never changes the rail under the user.
  */
 // DALTON-HOOK(dalton-setup): accept optional teamModelsAvailable beside server step state
+// DALTON-HOOK(team-model-catalog): accept optional teamModelsEmpty so /setup/model stays reachable when curated setup is empty
 export function setupRail(
   answers: SetupAnswers,
   server: ServerStepState = null,
   teamModelsAvailable = false,
+  teamModelsEmpty = false,
 ): SetupStep[] {
   return [
     ...(server ? (['server'] as const) : []),
     ...(answers.runsOn === 'own_computer' ? (['computer'] as const) : []),
-    ...(needsModelStep(answers, teamModelsAvailable) ? (['model'] as const) : []),
+    ...(needsModelStep(answers, teamModelsAvailable, teamModelsEmpty) ? (['model'] as const) : []),
     'default',
   ];
 }
@@ -123,6 +161,8 @@ export function nextSetupStep(facts: SetupFacts): SetupStep | 'done' {
   const models = effectiveModelsAnswer(facts.answers.models, !!facts.teamModelsAvailable);
   // One already connected while Home is on the cloud is offered as Home once.
   if (runsOn === 'own_computer' && (!facts.ownComputer || (facts.homeOnCloud && facts.lastStep === null))) return 'computer';
+  // DALTON-HOOK(team-model-catalog): hold members (including saved langalpha_models) on /setup/model when live curated/team models are empty
+  if (isDaltonBuild && facts.teamModelsEmpty) return 'model';
   if (!isDaltonBuild && models === 'claude_code' && !facts.claudeCodeToken) return 'model';
   if (models === 'subscription_or_key' && !facts.providerConnected) return 'model';
   return 'default';

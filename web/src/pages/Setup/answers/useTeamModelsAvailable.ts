@@ -1,5 +1,6 @@
 // DALTON-HOOK(dalton-setup): lightweight entry-safe Dalton team-model availability hook
-import { useContext } from 'react';
+// DALTON-HOOK(team-model-catalog): active 5-minute catalog refresh, header invalidation, and version-aligned curated setup fields
+import { useContext, useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/api/client';
 import type { ModelsResponse } from '@/api/model';
@@ -9,6 +10,10 @@ import type { DaltonDeploymentProfile } from '@/config/daltonSetup';
 import { AuthContext } from '@/contexts/AuthContext';
 import type { ConfiguredProvider } from '@/hooks/useConfiguredProviders';
 import { fetchTeamCredentialsStatus } from '@/hooks/useTeamCredentials';
+import {
+  attachCatalogRevisionQueryClient,
+  setTeamCatalogEnabled,
+} from '@/lib/dalton/catalogRevision';
 import { queryKeys } from '@/lib/queryKeys';
 import type { AccountPolicy } from '@/types/api';
 
@@ -20,6 +25,9 @@ export interface TeamModelsAvailability {
   unread: boolean;
   rejectedProviders: ReadonlySet<string>;
   daltonProfile?: DaltonDeploymentProfile;
+  catalogRevision?: number;
+  daltonSetupCandidates?: readonly string[];
+  daltonCuratedProviders?: readonly string[];
 }
 
 const EMPTY_REJECTED: ReadonlySet<string> = new Set();
@@ -49,6 +57,7 @@ function useDaltonTeamModelsAvailableImpl(
   policy: AccountPolicy | null,
 ): TeamModelsAvailability {
   const queryClient = useQueryClient();
+  useEffect(() => attachCatalogRevisionQueryClient(queryClient), [queryClient]);
   const userId = useContext(AuthContext)?.userId ?? null;
   const active = enabled && isDaltonAuth && Boolean(userId);
 
@@ -57,9 +66,27 @@ function useDaltonTeamModelsAvailableImpl(
     queryFn: async () => (await api.get<ModelsResponse>('/api/v1/models')).data,
     enabled,
     staleTime: 5 * 60_000,
+    refetchInterval: (query) =>
+      query.state.data?.team_catalog_enabled === true ? 5 * 60_000 : false,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: true,
     retry: false,
   });
+  useEffect(() => {
+    if (modelsCatalog.data !== undefined) {
+      setTeamCatalogEnabled(modelsCatalog.data.team_catalog_enabled === true);
+    }
+  }, [modelsCatalog.data]);
   const daltonProfile = modelsCatalog.data?.dalton_profile;
+  const catalogRevision = modelsCatalog.data?.catalog_revision;
+  const daltonSetupCandidates = modelsCatalog.data?.dalton_setup_candidates;
+  const daltonCuratedProviders = modelsCatalog.data?.dalton_curated_providers;
+  const catalogFields = {
+    ...(daltonProfile ? { daltonProfile } : {}),
+    ...(catalogRevision !== undefined ? { catalogRevision } : {}),
+    ...(daltonSetupCandidates !== undefined ? { daltonSetupCandidates } : {}),
+    ...(daltonCuratedProviders !== undefined ? { daltonCuratedProviders } : {}),
+  };
   // DALTON-HOOK(standalone-core): do not guess deployment profile while /api/v1/models is pending or failed
   const catalogPending = enabled && modelsCatalog.isPending;
   const catalogUnread = enabled && modelsCatalog.isError && modelsCatalog.data === undefined;
@@ -76,7 +103,17 @@ function useDaltonTeamModelsAvailableImpl(
   const ready = shared && !providersLoading;
 
   const { data, isPending, isError } = useQuery({
-    queryKey: [...queryKeys.dalton.all, 'team-models-available', userId, providers, byokEnabled, providersUnread, policy],
+    queryKey: [
+      ...queryKeys.dalton.all,
+      'team-models-available',
+      userId,
+      providers,
+      byokEnabled,
+      providersUnread,
+      policy,
+      catalogRevision,
+      daltonSetupCandidates,
+    ],
     queryFn: async () =>
       (await import('./daltonTeamModelsCheck')).checkDaltonTeamModelsAvailable({
         queryClient,
@@ -90,13 +127,13 @@ function useDaltonTeamModelsAvailableImpl(
     retry: false,
   });
 
-  if (catalogPending) return { ...INERT, isLoading: true, daltonProfile };
-  if (catalogUnread) return { ...INERT, unread: true, daltonProfile };
-  if (!active) return daltonProfile ? { ...INERT, daltonProfile } : INERT;
-  if (creds.isPending) return { ...INERT, isLoading: true, daltonProfile };
-  if (!shared) return daltonProfile ? { ...INERT, daltonProfile } : INERT;
-  if (providersLoading || (ready && isPending)) return { ...INERT, shared: true, isLoading: true, daltonProfile };
-  if (isError && data === undefined) return { ...INERT, shared: true, unread: true, daltonProfile };
+  if (catalogPending) return { ...INERT, isLoading: true, ...catalogFields };
+  if (catalogUnread) return { ...INERT, unread: true, ...catalogFields };
+  if (!active) return Object.keys(catalogFields).length > 0 ? { ...INERT, ...catalogFields } : INERT;
+  if (creds.isPending) return { ...INERT, isLoading: true, ...catalogFields };
+  if (!shared) return Object.keys(catalogFields).length > 0 ? { ...INERT, ...catalogFields } : INERT;
+  if (providersLoading || (ready && isPending)) return { ...INERT, shared: true, isLoading: true, ...catalogFields };
+  if (isError && data === undefined) return { ...INERT, shared: true, unread: true, ...catalogFields };
   const available = Boolean(data?.available);
   return {
     shared: true,
@@ -105,7 +142,7 @@ function useDaltonTeamModelsAvailableImpl(
     isLoading: false,
     unread: false,
     rejectedProviders: data?.rejectedProviders ?? EMPTY_REJECTED,
-    daltonProfile,
+    ...catalogFields,
   };
 }
 

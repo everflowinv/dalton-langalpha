@@ -470,6 +470,9 @@ async def get_team_model_revision_endpoint(
     from src.dalton.database.team_model_catalog import get_catalog_revision
     from src.dalton.services.team_model_catalog.compiled import get_compiled_catalog_async
     from src.dalton.services.team_model_catalog.constants import CATALOG_REVISION_HEADER
+    from src.dalton.services.team_model_catalog.service import (
+        sanitize_revision_record_for_capabilities,
+    )
 
     row = await get_catalog_revision(revision)
     if row is None:
@@ -479,7 +482,10 @@ async def get_team_model_revision_endpoint(
         )
     compiled = await get_compiled_catalog_async()
     response.headers[CATALOG_REVISION_HEADER] = str(compiled.revision)
-    return {"current_revision": compiled.revision, "revision_record": row}
+    sanitized_row = sanitize_revision_record_for_capabilities(
+        row, oauth_sync_enabled=compiled.oauth_sync_enabled
+    )
+    return {"current_revision": compiled.revision, "revision_record": sanitized_row}
 
 
 @router.post("/team-models/rollback")

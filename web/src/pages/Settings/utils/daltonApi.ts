@@ -874,3 +874,426 @@ export async function verifyDaltonWeixinQrCode(
   );
   return data;
 }
+
+// ---------------------------------------------------------------------------
+// Team Model Catalog (d051): admin CRUD, variants, curated setup, rollback, test-call
+// ---------------------------------------------------------------------------
+
+export type TeamCatalogPriceSourceKind = 'official' | 'estimated' | 'third_party';
+export type TeamCatalogBillingMode = 'cash' | 'subscription';
+export type TeamCatalogModelSource = 'team_added' | 'team_overridden' | 'factory';
+export type TeamCatalogLegacyImportStatus =
+  | 'pending'
+  | 'not_applicable'
+  | 'imported'
+  | 'failed'
+  | 'abandoned';
+
+export interface TeamCatalogPricingTier {
+  max_tokens: number | null;
+  rate: number;
+  cached_input?: number | null;
+  cache_read?: number | null;
+}
+
+export interface TeamCatalogPricingCard {
+  input?: number | null;
+  output?: number | null;
+  cached_input?: number | null;
+  cache_read?: number | null;
+  cache_5m?: number | null;
+  cache_1h?: number | null;
+  unit?: string;
+  input_tiers?: TeamCatalogPricingTier[] | null;
+  output_tiers?: TeamCatalogPricingTier[] | null;
+  input_pricing_mode?: string | null;
+  output_pricing_mode?: string | null;
+  source_kind?: TeamCatalogPriceSourceKind | null;
+  estimated?: boolean | null;
+  source?: string | null;
+  source_url?: string | null;
+  verified_at?: string | null;
+  note?: string | null;
+}
+
+export interface TeamCatalogPricingMeta {
+  source_kind?: TeamCatalogPriceSourceKind;
+  estimated?: boolean | null;
+  source?: string | null;
+  source_url?: string | null;
+  verified_at?: string | null;
+  note?: string | null;
+}
+
+export interface TeamCatalogDaltonMeta {
+  family?: string | null;
+  billing?: TeamCatalogBillingMode | null;
+  tool_calling?: boolean | null;
+  forbidden_for_roles?: string[] | null;
+  notional_pricing?: TeamCatalogPricingCard | null;
+  notional_ref?: string | null;
+  series?: string | null;
+  awaiting_release?: boolean | null;
+}
+
+export interface TeamCatalogReasoningConfig {
+  efforts?: string[];
+  default?: string;
+  write?: string | null;
+  on?: Record<string, unknown>;
+  off?: Record<string, unknown>;
+  [extra: string]: unknown;
+}
+
+export interface TeamCatalogModelItem {
+  model_key: string;
+  model_id: string;
+  provider: string;
+  provider_sdk?: string | null;
+  provider_display_name: string;
+  provider_connected: boolean;
+  catalog_defined_provider: boolean;
+  display_name: string;
+  visible: boolean;
+  source: TeamCatalogModelSource;
+  status: 'visible' | 'hidden';
+  intelligence: number | null;
+  speed: number | null;
+  plain_language: number | null;
+  context: number | null;
+  compaction_profile: string | null;
+  input_modalities: string[];
+  reasoning: TeamCatalogReasoningConfig | null;
+  pricing: TeamCatalogPricingCard | null;
+  pricing_meta: TeamCatalogPricingMeta | null;
+  dalton_meta: TeamCatalogDaltonMeta;
+  /** Read-only model fields returned by GET /api/v1/dalton/team-models for edit-mode echo (credentials stripped). */
+  parameters?: Record<string, unknown> | null;
+  extra_body?: Record<string, unknown> | null;
+  prompt_guidance?: string | null;
+  alias?: string[] | null;
+  task_costs_bound?: { model?: string; times?: number } | null;
+}
+
+export interface TeamCatalogRetiredItem {
+  key: string;
+  provider: string;
+  retired_at: string | null;
+  retired_by: string | null;
+  scope: 'team' | 'readonly_legacy';
+  restorable: boolean;
+}
+
+export interface TeamCatalogProviderVariant {
+  provider_slug: string;
+  display_name: string;
+  sdk: string;
+  parent_provider: string;
+  access_type: 'api_key' | 'coding_plan';
+  billing: TeamCatalogBillingMode;
+  base_url: string;
+  credential_configured: boolean;
+  key_fingerprint: string | null;
+  bound_base_url: string | null;
+  updated_at: string | null;
+}
+
+export interface TeamCatalogOverviewResponse {
+  revision: number;
+  payload_sha256: string;
+  legacy_sync_import_status: TeamCatalogLegacyImportStatus;
+  legacy_sync_import_error: string | null;
+  models: TeamCatalogModelItem[];
+  retired: TeamCatalogRetiredItem[];
+  provider_variants: TeamCatalogProviderVariant[];
+  parent_provider_groups: string[];
+  supported_variant_sdks: string[];
+  curated_setup: string[] | null;
+  dalton_setup_candidates: string[];
+  dalton_curated_providers: string[];
+}
+
+export interface TeamCatalogRevisionRecord {
+  revision: number;
+  action: string;
+  target_keys: string[];
+  payload_sha256: string;
+  diff_summary: Record<string, unknown>;
+  side_effects: Array<Record<string, unknown>>;
+  comment: string | null;
+  restored_from: number | null;
+  actor_user_id: string;
+  actor_label: string | null;
+  created_at: string;
+}
+
+export interface TeamCatalogRevisionsResponse {
+  revision: number;
+  revisions: TeamCatalogRevisionRecord[];
+}
+
+export interface TeamCatalogRevisionDetailResponse {
+  current_revision: number;
+  revision_record: TeamCatalogRevisionRecord;
+}
+
+export interface TeamCatalogInlineVariantUpdatePayload {
+  provider_slug: string;
+  display_name: string;
+  sdk: string;
+  parent_provider: string;
+  access_type: 'api_key' | 'coding_plan';
+  billing: TeamCatalogBillingMode;
+  base_url: string;
+  api_key?: string;
+}
+
+export interface TeamCatalogModelUpsertPayload {
+  model_key?: string;
+  model_id?: string;
+  provider?: string;
+  display_name?: string;
+  visible?: boolean;
+  prompt_guidance?: string | null;
+  intelligence?: number | null;
+  speed?: number | null;
+  plain_language?: number | null;
+  context?: number | null;
+  compaction_profile?: string | null;
+  input_modalities?: string[];
+  parameters?: Record<string, unknown> | null;
+  extra_body?: Record<string, unknown> | null;
+  reasoning?: TeamCatalogReasoningConfig | null;
+  pricing?: TeamCatalogPricingCard | null;
+  pricing_meta?: TeamCatalogPricingMeta | null;
+  alias?: string[] | null;
+  dalton_meta?: TeamCatalogDaltonMeta | null;
+  task_costs_bound?: { model?: string | null; times?: number | null } | null;
+  provider_variant_update?: TeamCatalogInlineVariantUpdatePayload | null;
+  curated_setup_member?: boolean | null;
+  expected_revision?: number;
+  comment?: string | null;
+}
+
+export interface TeamCatalogProviderVariantUpsertPayload {
+  provider_slug: string;
+  display_name: string;
+  sdk: string;
+  parent_provider: string;
+  access_type: 'api_key' | 'coding_plan';
+  billing: TeamCatalogBillingMode;
+  base_url: string;
+  api_key?: string;
+  expected_revision?: number;
+  comment?: string | null;
+}
+
+export interface TeamCatalogRetirePayload {
+  successor_model?: string | null;
+  migrate_user_defaults?: boolean;
+  clear_subagent_model?: boolean;
+  expected_revision?: number;
+  comment?: string | null;
+}
+
+export interface TeamCatalogRollbackPayload {
+  target_revision: number;
+  expected_revision?: number;
+  variant_credentials?: Record<string, { base_url: string; api_key: string }>;
+  successor_for_dropped?: Record<string, string>;
+  comment?: string | null;
+}
+
+export interface TeamCatalogRollbackResponse {
+  revision: number;
+  restored_from: number;
+  restored_tasks: Array<Record<string, unknown>>;
+  skipped_user_modified_tasks: Array<Record<string, unknown>>;
+  revision_record: TeamCatalogRevisionRecord;
+}
+
+export interface TeamCatalogTestCallPayload {
+  model_key?: string | null;
+  provider: string;
+  model_id: string;
+  base_url?: string | null;
+  api_key?: string | null;
+  sdk?: string | null;
+  parameters?: Record<string, unknown> | null;
+  extra_body?: Record<string, unknown> | null;
+}
+
+export interface TeamCatalogTestCallResponse {
+  ok: boolean;
+  tool_calling_verified?: boolean;
+  provider?: string;
+  model_id?: string;
+  error?: string;
+  message?: string;
+}
+
+export interface TeamCatalogLegacyResolvePayload {
+  action: 'retry_import' | 'abandon_legacy_file';
+  persist_known_retired?: boolean;
+  expected_revision?: number;
+  comment?: string | null;
+}
+
+export interface TeamCatalogMutationResult {
+  revision: number;
+  model_key?: string;
+  provider_slug?: string;
+  side_effects?: Array<Record<string, unknown>>;
+  legacy_sync_import_status?: TeamCatalogLegacyImportStatus;
+  revision_record?: TeamCatalogRevisionRecord;
+}
+
+export async function fetchTeamModelCatalog(): Promise<TeamCatalogOverviewResponse> {
+  const { data } = await api.get<TeamCatalogOverviewResponse>('/api/v1/dalton/team-models');
+  return data;
+}
+
+export async function createTeamCatalogModel(
+  payload: TeamCatalogModelUpsertPayload,
+): Promise<TeamCatalogMutationResult> {
+  const { data } = await api.post<TeamCatalogMutationResult>('/api/v1/dalton/team-models', payload);
+  return data;
+}
+
+export async function updateTeamCatalogModel(
+  modelKey: string,
+  payload: TeamCatalogModelUpsertPayload,
+): Promise<TeamCatalogMutationResult> {
+  const { data } = await api.put<TeamCatalogMutationResult>(
+    `/api/v1/dalton/team-models/${encodeURIComponent(modelKey)}`,
+    payload,
+  );
+  return data;
+}
+
+export async function setTeamCatalogModelVisibility(
+  modelKey: string,
+  payload: { visible: boolean; expected_revision?: number; comment?: string | null },
+): Promise<TeamCatalogMutationResult> {
+  const { data } = await api.post<TeamCatalogMutationResult>(
+    `/api/v1/dalton/team-models/${encodeURIComponent(modelKey)}/visibility`,
+    payload,
+  );
+  return data;
+}
+
+export async function retireTeamCatalogModel(
+  modelKey: string,
+  payload: TeamCatalogRetirePayload,
+): Promise<TeamCatalogMutationResult> {
+  const { data } = await api.post<TeamCatalogMutationResult>(
+    `/api/v1/dalton/team-models/${encodeURIComponent(modelKey)}/retire`,
+    payload,
+  );
+  return data;
+}
+
+export async function restoreTeamCatalogModel(
+  modelKey: string,
+  payload: { expected_revision?: number; comment?: string | null },
+): Promise<TeamCatalogMutationResult> {
+  const { data } = await api.post<TeamCatalogMutationResult>(
+    `/api/v1/dalton/team-models/${encodeURIComponent(modelKey)}/restore`,
+    payload,
+  );
+  return data;
+}
+
+export async function restoreTeamCatalogModelDefault(
+  modelKey: string,
+  payload: { expected_revision?: number; comment?: string | null },
+): Promise<TeamCatalogMutationResult> {
+  const { data } = await api.post<TeamCatalogMutationResult>(
+    `/api/v1/dalton/team-models/${encodeURIComponent(modelKey)}/restore-default`,
+    payload,
+  );
+  return data;
+}
+
+export async function createTeamCatalogProviderVariant(
+  payload: TeamCatalogProviderVariantUpsertPayload,
+): Promise<TeamCatalogMutationResult> {
+  const { data } = await api.post<TeamCatalogMutationResult>(
+    '/api/v1/dalton/team-models/provider-variants',
+    payload,
+  );
+  return data;
+}
+
+export async function updateTeamCatalogProviderVariant(
+  providerSlug: string,
+  payload: TeamCatalogProviderVariantUpsertPayload,
+): Promise<TeamCatalogMutationResult> {
+  const { data } = await api.put<TeamCatalogMutationResult>(
+    `/api/v1/dalton/team-models/provider-variants/${encodeURIComponent(providerSlug)}`,
+    payload,
+  );
+  return data;
+}
+
+export async function updateTeamCatalogCuratedSetup(payload: {
+  curated_setup: string[] | null;
+  expected_revision?: number;
+  comment?: string | null;
+}): Promise<TeamCatalogMutationResult> {
+  const { data } = await api.put<TeamCatalogMutationResult>(
+    '/api/v1/dalton/team-models/curated',
+    payload,
+  );
+  return data;
+}
+
+export async function fetchTeamCatalogRevisions(
+  limit = 50,
+  offset = 0,
+): Promise<TeamCatalogRevisionsResponse> {
+  const { data } = await api.get<TeamCatalogRevisionsResponse>(
+    '/api/v1/dalton/team-models/revisions',
+    { params: { limit, offset } },
+  );
+  return data;
+}
+
+export async function fetchTeamCatalogRevisionDetail(
+  revision: number,
+): Promise<TeamCatalogRevisionDetailResponse> {
+  const { data } = await api.get<TeamCatalogRevisionDetailResponse>(
+    `/api/v1/dalton/team-models/revisions/${revision}`,
+  );
+  return data;
+}
+
+export async function rollbackTeamCatalog(
+  payload: TeamCatalogRollbackPayload,
+): Promise<TeamCatalogRollbackResponse> {
+  const { data } = await api.post<TeamCatalogRollbackResponse>(
+    '/api/v1/dalton/team-models/rollback',
+    payload,
+  );
+  return data;
+}
+
+export async function testCallTeamCatalogModel(
+  payload: TeamCatalogTestCallPayload,
+): Promise<TeamCatalogTestCallResponse> {
+  const { data } = await api.post<TeamCatalogTestCallResponse>(
+    '/api/v1/dalton/team-models/test-call',
+    payload,
+  );
+  return data;
+}
+
+export async function resolveTeamCatalogLegacyImport(
+  payload: TeamCatalogLegacyResolvePayload,
+): Promise<TeamCatalogMutationResult> {
+  const { data } = await api.post<TeamCatalogMutationResult>(
+    '/api/v1/dalton/team-models/legacy-import/resolve',
+    payload,
+  );
+  return data;
+}

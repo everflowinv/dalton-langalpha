@@ -8,6 +8,8 @@ const E2E_PORT = Number(process.env.E2E_PORT) || 5176;
 // app is served, not per test. So it gets a server of its own rather than a
 // flag some spec could flip.
 const E2E_AUTH_PORT = Number(process.env.E2E_AUTH_PORT) || 5177;
+// DALTON-HOOK(team-model-catalog): dedicated Dalton UI dev/preview server so isDaltonBuild is enabled for team-model-catalog E2E specs
+const E2E_DALTON_PORT = Number(process.env.E2E_DALTON_PORT) || 5178;
 // The API origin both apps bake in. Nothing listens on it: each worker starts
 // its own mock server on the next ports up (E2E_MOCK_PORT + 1 + its parallel
 // index) and e2e/fixtures.js routes the page's API traffic there, so a checkout
@@ -57,11 +59,15 @@ const appServer = PERF_BUILD
   ? serve(E2E_PORT, 'dist-perf', process.env.PERF_UNMINIFIED ? ' --minify false' : '')
   : serve(E2E_PORT, E2E_BUILD ? 'dist-e2e/oss' : null);
 const authServer = serve(E2E_AUTH_PORT, E2E_BUILD ? 'dist-e2e/auth' : null);
+// DALTON-HOOK(team-model-catalog): serve Dalton-enabled bundle for the dalton-catalog project
+const daltonServer = serve(E2E_DALTON_PORT, E2E_BUILD ? 'dist-e2e/dalton' : null);
 
 /** Origins a dev server answers, which e2e/global-setup.js warms. */
 const devServerOrigins = [
   !PERF_BUILD && !E2E_BUILD && `http://127.0.0.1:${E2E_PORT}`,
   !E2E_BUILD && `http://127.0.0.1:${E2E_AUTH_PORT}`,
+  // DALTON-HOOK(team-model-catalog): warm Dalton UI dev server before worker specs start
+  !E2E_BUILD && `http://127.0.0.1:${E2E_DALTON_PORT}`,
 ].filter(Boolean);
 
 export default defineConfig({
@@ -125,17 +131,37 @@ export default defineConfig({
         VITE_API_BASE_URL: `http://127.0.0.1:${E2E_MOCK_PORT}`,
       },
     },
+    // DALTON-HOOK(team-model-catalog): Dalton-enabled webServer so isDaltonBuild is true in team-model-catalog.spec.js
+    {
+      ...daltonServer,
+      port: E2E_DALTON_PORT,
+      reuseExistingServer: false,
+      env: {
+        VITE_HOST_MODE: 'oss',
+        VITE_DALTON_UI: 'true',
+        VITE_SUPABASE_URL: '',
+        VITE_SUPABASE_PUBLISHABLE_KEY: '',
+        VITE_API_BASE_URL: `http://127.0.0.1:${E2E_MOCK_PORT}`,
+      },
+    },
   ],
   projects: [
     {
       name: 'chromium',
-      testIgnore: /auth-surface\..*\.spec\.js/,
+      // DALTON-HOOK(team-model-catalog): run team-model-catalog.spec.js under the dalton-catalog project where isDaltonBuild is enabled
+      testIgnore: /(?:auth-surface\..*|team-model-catalog)\.spec\.js/,
       use: { browserName: 'chromium' },
     },
     {
       name: 'auth-surface',
       testMatch: /auth-surface\..*\.spec\.js/,
       use: { browserName: 'chromium', baseURL: `http://127.0.0.1:${E2E_AUTH_PORT}` },
+    },
+    // DALTON-HOOK(team-model-catalog): dedicated Playwright project with VITE_DALTON_UI=true
+    {
+      name: 'dalton-catalog',
+      testMatch: /team-model-catalog\.spec\.js/,
+      use: { browserName: 'chromium', baseURL: `http://127.0.0.1:${E2E_DALTON_PORT}` },
     },
   ],
 });
