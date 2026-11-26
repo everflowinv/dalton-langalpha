@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from typing import Any
 from unittest.mock import create_autospec
 
 import pytest
