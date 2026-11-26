@@ -504,8 +504,10 @@ ALLOWED_HOOKS=(
   "mobile-web"
   # Channel sandbox link rewriting: preserve validated ?redirect= deep links across login in App.tsx.
   "channel-links"
-  # SYNC13 S2 (#872): deployment kill switch for Drive — skips starting
-  # DriveTrashSweep in lifespan when features.drive.enabled is false.
+  # SYNC13 S2 (#872): deployment kill switch for Drive — refuses enabling Drive
+  # while Dalton colleague access or computer_cli_tokens is active (features.py,
+  # setup.py), skips DriveTrashSweep, and answers 404 before auth/param validation
+  # on drive.py and drive_mount.py when Drive is off.
   "drive-kill-switch"
 )
 

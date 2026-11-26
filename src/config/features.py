@@ -552,6 +552,13 @@ def system_flag(key: str) -> SystemFlag:
         if override.min_tier is not None:
             min_tier = override.min_tier
     enabled = enabled and all(system_flag(parent).enabled for parent in spec.requires)
+    # DALTON-HOOK(drive-kill-switch): keep Drive forced off while Dalton colleague
+    # access or computer_cli_tokens is enabled (until cross-user Drive isolation lands).
+    if key == "drive" and enabled:
+        from src.dalton.capabilities import is_drive_blocked_by_dalton
+
+        if is_drive_blocked_by_dalton():
+            enabled = False
     return SystemFlag(enabled=enabled, gate=gate, min_tier=min_tier)
 
 

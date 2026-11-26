@@ -24,134 +24,6 @@ def _env(primary: str, *fallbacks: str, default: str = "") -> str:
     return default
 
 
-DEFAULT_MULTIPART_ABORT_DAYS = 7
-MULTIPART_LIFECYCLE_RULE_ID = "abort-incomplete-multipart-uploads"
-
-
-def _rule_prefix(rule: dict[str, object]) -> str:
-    flt = rule.get("Filter")
-    if isinstance(flt, dict):
-        if isinstance(flt.get("Prefix"), str):
-            return flt["Prefix"]
-        and_block = flt.get("And")
-        if isinstance(and_block, dict) and isinstance(and_block.get("Prefix"), str):
-            return and_block["Prefix"]
-    if isinstance(rule.get("Prefix"), str):
-        return rule["Prefix"]
-    return ""
-
-
-def _ensure_multipart_lifecycle_rule(
-    client: object,
-    *,
-    bucket: str,
-    min_days: int = DEFAULT_MULTIPART_ABORT_DAYS,
-) -> int:
-    """Ensure the bucket aborts incomplete multipart uploads after >= ``min_days`` days.
-
-    Preserves any existing lifecycle rules while guaranteeing coverage for
-    ``uploads/`` (and prefixed keys) via a bucket-wide rule.
-    """
-    get_lifecycle = getattr(client, "get_bucket_lifecycle_configuration", None)
-    put_lifecycle = getattr(client, "put_bucket_lifecycle_configuration", None)
-    if not callable(get_lifecycle) or not callable(put_lifecycle):
-        print(
-            f"[minio-init] WARNING: S3 client does not expose lifecycle APIs; "
-            f"skipping multipart abort rule on '{bucket}'.",
-            file=sys.stderr,
-        )
-        return 0
-
-    existing_rules: list[dict[str, object]] = []
-    try:
-        cfg = get_lifecycle(Bucket=bucket)
-        raw_rules = cfg.get("Rules") if isinstance(cfg, dict) else None
-        if isinstance(raw_rules, list):
-            existing_rules = [r for r in raw_rules if isinstance(r, dict)]
-    except ClientError as exc:
-        code = str(exc.response.get("Error", {}).get("Code", ""))
-        status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0) or 0)
-        if code in ("NotImplemented", "MethodNotAllowed"):
-            print(
-                f"[minio-init] WARNING: lifecycle API unsupported on '{bucket}' ({code}); skipping.",
-                file=sys.stderr,
-            )
-            return 0
-        if code != "NoSuchLifecycleConfiguration" and status != 404:
-            print(
-                f"[minio-init] ERROR reading lifecycle rules on '{bucket}': {exc}",
-                file=sys.stderr,
-            )
-            return 1
-    except Exception as exc:
-        print(
-            f"[minio-init] ERROR reading lifecycle rules on '{bucket}': {exc}",
-            file=sys.stderr,
-        )
-        return 1
-
-    covered_days: list[int] = []
-    for rule in existing_rules:
-        if rule.get("Status") != "Enabled":
-            continue
-        abort_cfg = rule.get("AbortIncompleteMultipartUpload")
-        if not isinstance(abort_cfg, dict):
-            continue
-        prefix = _rule_prefix(rule)
-        if prefix == "" or "uploads/".startswith(prefix):
-            covered_days.append(int(abort_cfg.get("DaysAfterInitiation") or 0))
-
-    if covered_days and min(covered_days) >= min_days:
-        print(
-            f"[minio-init] Bucket '{bucket}' already has multipart abort lifecycle rule "
-            f"(min {min(covered_days)} days >= {min_days} days).",
-            flush=True,
-        )
-        return 0
-
-    kept_rules = [
-        rule for rule in existing_rules if rule.get("ID") != MULTIPART_LIFECYCLE_RULE_ID
-    ]
-    kept_rules.append(
-        {
-            "ID": MULTIPART_LIFECYCLE_RULE_ID,
-            "Status": "Enabled",
-            "Filter": {"Prefix": ""},
-            "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": min_days},
-        }
-    )
-    try:
-        put_lifecycle(
-            Bucket=bucket,
-            LifecycleConfiguration={"Rules": kept_rules},
-        )
-    except ClientError as exc:
-        code = str(exc.response.get("Error", {}).get("Code", ""))
-        if code in ("NotImplemented", "MethodNotAllowed"):
-            print(
-                f"[minio-init] WARNING: lifecycle API unsupported on '{bucket}' ({code}); skipping.",
-                file=sys.stderr,
-            )
-            return 0
-        print(
-            f"[minio-init] ERROR setting lifecycle rule on '{bucket}': {exc}",
-            file=sys.stderr,
-        )
-        return 1
-    except Exception as exc:
-        print(
-            f"[minio-init] ERROR setting lifecycle rule on '{bucket}': {exc}",
-            file=sys.stderr,
-        )
-        return 1
-
-    print(
-        f"[minio-init] Configured {min_days}-day AbortIncompleteMultipartUpload rule on '{bucket}'.",
-        flush=True,
-    )
-    return 0
-
-
 def _ensure_private_bucket(
     client: object,
     *,
@@ -192,10 +64,6 @@ def _ensure_private_bucket(
             file=sys.stderr,
         )
         return 1
-
-    rc = _ensure_multipart_lifecycle_rule(client, bucket=bucket)
-    if rc != 0:
-        return rc
 
     client.head_bucket(Bucket=bucket)  # type: ignore[attr-defined]
     print(f"[minio-init] Verified private bucket '{bucket}' at {endpoint}.", flush=True)
@@ -260,16 +128,19 @@ def main() -> int:
         ),
     )
 
+    initialized: set[tuple[str, str]] = set()
+
     rc = _ensure_private_bucket(client, bucket=bucket, region=region, endpoint=endpoint)
     if rc != 0:
         return rc
+    initialized.add((endpoint, bucket))
 
     # Optional general storage bucket initialization when STORAGE_BUCKET_NAME is set
     # to a distinct bucket on the same MinIO endpoint.
     storage_bucket = _env("STORAGE_BUCKET_NAME")
-    if storage_bucket and storage_bucket != bucket:
+    if storage_bucket:
         storage_endpoint = _env("STORAGE_ENDPOINT_URL", default=endpoint).rstrip("/")
-        if storage_endpoint == endpoint:
+        if storage_endpoint == endpoint and (storage_endpoint, storage_bucket) not in initialized:
             storage_region = _env("STORAGE_REGION", default=region)
             rc = _ensure_private_bucket(
                 client,
@@ -279,19 +150,21 @@ def main() -> int:
             )
             if rc != 0:
                 return rc
+            initialized.add((storage_endpoint, storage_bucket))
 
     # Optional transcription bucket initialization when DALTON_ASR_STORAGE_BUCKET_NAME is set
     # against the same MinIO endpoint (keeps default Core behavior unchanged when unset).
     asr_bucket = _env("DALTON_ASR_STORAGE_BUCKET_NAME")
-    if asr_bucket and asr_bucket not in (bucket, storage_bucket):
+    if asr_bucket:
         asr_endpoint = _env("DALTON_ASR_STORAGE_ENDPOINT_URL", default=endpoint).rstrip("/")
-        if asr_endpoint == endpoint:
+        if asr_endpoint == endpoint and (asr_endpoint, asr_bucket) not in initialized:
             asr_region = _env("DALTON_ASR_STORAGE_REGION", default=region)
             rc = _ensure_private_bucket(
                 client, bucket=asr_bucket, region=asr_region, endpoint=asr_endpoint
             )
             if rc != 0:
                 return rc
+            initialized.add((asr_endpoint, asr_bucket))
 
     return 0
 

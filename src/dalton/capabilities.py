@@ -1131,3 +1131,66 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("chat_uploads.py", "cancel_chat_upload_endpoint"): CORE_CAPABILITY,
     }
 )
+
+
+def drive_disabled_reasons() -> tuple[str, ...]:
+    """Return active Dalton switches that forbid enabling upstream Drive.
+
+    Drive remains forced off in Dalton whenever either colleague workspace
+    access (``is_dalton_sharing_auth_enabled`` / ``is_colleague_dispatch_enabled``)
+    or per-computer CLI tokens (``computer_cli_tokens``) is enabled, until
+    cross-user mount unmount-before-handoff, caller-propagated ``converge_soon``,
+    and caller-bound CLI token Drive permissions land in a dedicated batch.
+    """
+    from src.dalton.settings import (
+        is_colleague_dispatch_enabled,
+        is_computer_cli_tokens_enabled,
+        is_dalton_enabled,
+        is_dalton_sharing_auth_enabled,
+    )
+
+    if not is_dalton_enabled():
+        return ()
+    reasons: list[str] = []
+    if is_dalton_sharing_auth_enabled() or is_colleague_dispatch_enabled():
+        reasons.append("colleague_sharing")
+    if is_computer_cli_tokens_enabled():
+        reasons.append("computer_cli_tokens")
+    return tuple(reasons)
+
+
+def is_drive_blocked_by_dalton() -> bool:
+    """Return True when active Dalton switches require Drive to stay off."""
+    return bool(drive_disabled_reasons())
+
+
+def check_drive_startup_guard(log: logging.Logger) -> bool:
+    """Log an error at startup if ``features.drive.enabled`` is refused by Dalton.
+
+    Returns ``True`` when Drive was configured enabled and forced off by active
+    colleague access or ``computer_cli_tokens``; returns ``False`` otherwise.
+    """
+    from src.config import features as feature_catalog
+
+    spec = feature_catalog.FEATURES.get("drive")
+    if spec is None:
+        return False
+    override = feature_catalog.get_infrastructure_config().features.get("drive")
+    configured_enabled = (
+        override.enabled
+        if override is not None and override.enabled is not None
+        else spec.enabled
+    )
+    if not configured_enabled:
+        return False
+    reasons = drive_disabled_reasons()
+    if not reasons:
+        return False
+    log.error(
+        "Refusing to enable Drive (features.drive.enabled=true) while Dalton %s "
+        "is enabled; forcing Drive off across all routes, mounts, and background "
+        "tasks until cross-user unmount-before-handoff, caller-propagated "
+        "converge_soon, and caller-bound CLI token Drive permissions are completed.",
+        ", ".join(reasons),
+    )
+    return True

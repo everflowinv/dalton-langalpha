@@ -20,6 +20,7 @@ from typing import Any, TypeVar
 
 from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.routing import APIRoute  # DALTON-HOOK(drive-kill-switch)
 from pydantic import BaseModel, ValidationError
 
 from ptc_agent.core.sandbox.livefs_mount import CallContext
@@ -34,6 +35,7 @@ from ptc_agent.core.sandbox.livefs_runtime.drive_protocol import (
     encode_frame,
 )
 from ptc_agent.core.sandbox.livefs_runtime.protocol import CALL_HEADER, PREFIX
+from src.config.features import is_feature_enabled_system  # DALTON-HOOK(drive-kill-switch)
 from src.server.app.drive_http import byte_range, etag_of, receive, status_of
 from src.server.app.mount_calls import caller, mutation
 from src.server.database.computer import get_computer
@@ -48,7 +50,28 @@ from src.utils.storage import multipart_enabled
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix=f"{PREFIX}/{ACTION_PREFIX}", tags=["Drive mount"])
+# DALTON-HOOK(drive-kill-switch): check deployment-level Drive switch before
+# mount-token auth or query/body validation so disabled deployments always answer 404.
+class _DriveMountGateRoute(APIRoute):
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def handler(request: Request) -> Response:
+            if not is_feature_enabled_system("drive"):
+                return JSONResponse(
+                    {"code": "not_found", "message": "The Drive is off", "path": ""},
+                    status_code=404,
+                )
+            return await original(request)
+
+        return handler
+
+
+router = APIRouter(
+    prefix=f"{PREFIX}/{ACTION_PREFIX}",
+    tags=["Drive mount"],
+    route_class=_DriveMountGateRoute,  # DALTON-HOOK(drive-kill-switch)
+)
 
 #: Past this many changed entries a ``changes`` answer asks for a resync: one
 #: change (a folder move) can touch a whole space, and the manifest is the

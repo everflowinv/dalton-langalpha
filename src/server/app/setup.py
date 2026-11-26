@@ -851,9 +851,12 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to start ProvenanceGCService: {e}")
 
-    # DALTON-HOOK(drive-kill-switch): do not start DriveTrashSweep when Drive feature is disabled
+    # DALTON-HOOK(drive-kill-switch): refuse enabling Drive when colleague access
+    # or computer_cli_tokens is active, and skip DriveTrashSweep when Drive is off.
     from src.config.features import is_feature_enabled_system
+    from src.dalton.capabilities import check_drive_startup_guard
 
+    check_drive_startup_guard(logger)
     if is_feature_enabled_system("drive"):
         # Start the Drive's trash sweep (purges what the trash has kept long enough)
         try:

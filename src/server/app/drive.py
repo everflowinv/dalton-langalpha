@@ -17,9 +17,11 @@ from typing import Annotated, Any
 from urllib.parse import urlencode
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse  # DALTON-HOOK(drive-kill-switch)
+from fastapi.routing import APIRoute  # DALTON-HOOK(drive-kill-switch)
 
 from src.config.core import get_infrastructure_config
+from src.config.features import is_feature_enabled_system  # DALTON-HOOK(drive-kill-switch)
 from src.server.app.drive_http import byte_range, etag_of, receive, status_of
 from src.server.database.pool import DATABASE_UNAVAILABLE
 from src.server.dependencies import cli_approval
@@ -54,7 +56,28 @@ from src.server.utils.http_headers import content_disposition
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1/drive", tags=["Drive"])
+# DALTON-HOOK(drive-kill-switch): check deployment-level Drive switch before auth,
+# permission, or parameter validation so disabled deployments always answer 404.
+class _DriveGateRoute(APIRoute):
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def handler(request: Request) -> Response:
+            if not is_feature_enabled_system("drive"):
+                return JSONResponse(
+                    status_code=404,
+                    content={"detail": {"type": "not_found", "message": "No such space"}},
+                )
+            return await original(request)
+
+        return handler
+
+
+router = APIRouter(
+    prefix="/api/v1/drive",
+    tags=["Drive"],
+    route_class=_DriveGateRoute,  # DALTON-HOOK(drive-kill-switch)
+)
 
 ReadPrincipal = Annotated[Principal, Depends(require_scopes("drive:read"))]
 WritePrincipal = Annotated[Principal, Depends(require_scopes("drive:write"))]
