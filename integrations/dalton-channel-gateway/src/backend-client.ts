@@ -1047,6 +1047,7 @@ export interface WeixinLoginSessionGetResponse {
   qrcode?: string | null;
   qrcode_img_content?: string | null;
   redirect_base_url?: string | null;
+  created_at?: string | null;
   expires_at?: string | null;
   connected?: boolean;
   already_connected?: boolean;
@@ -1076,6 +1077,7 @@ export interface WeixinLoginSessionPatchResponse {
   status?: string;
   account_status?: string | null;
   login_version?: number;
+  created_at?: string | null;
   expires_at?: string | null;
   redirect_base_url?: string | null;
   ilink_bot_id?: string | null;

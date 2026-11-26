@@ -191,24 +191,23 @@ def _match_user_automation(
 def _automation_route_key(automation: Mapping[str, Any]) -> str | None:
     """Return the route/override storage key for ``automation``.
 
-    Report automations (validated ``report_profile`` or report skill) and
-    custom automations always use ``f"automation:{automation_id}"``. Other
-    inherent categories keep their display name.
+    Aligns with ``_notify_route_keys`` write precedence: ``data_task`` keeps
+    ``data:<scope>``, and every other automation with an ``automation_id``
+    writes ``f"automation:{automation_id}"`` (falling back to display name only
+    when ``automation_id`` is absent).
     """
     auto_id = str(automation.get("automation_id") or "").strip()
-    from src.dalton.database.automation_reports import (
-        automation_has_validated_report_profile,
-    )
-    from src.dalton.services.report_delivery import instruction_uses_report_skill
-
-    if automation_has_validated_report_profile(automation) or instruction_uses_report_skill(
-        automation.get("instruction")
-    ):
+    classification = classify_automation_for_notify(automation)
+    if classification is not None and classification.category == "data_task":
+        if classification.scope:
+            return f"data:{classification.scope}"
         return f"automation:{auto_id}" if auto_id else None
-    if classify_automation_for_notify(automation) is not None:
+    if auto_id:
+        return f"automation:{auto_id}"
+    if classification is not None:
         name = str(automation.get("name") or "").strip()
         return name or None
-    return f"automation:{auto_id}" if auto_id else None
+    return None
 
 
 def _format_target_display(

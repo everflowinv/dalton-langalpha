@@ -18,6 +18,7 @@ import {
   backgroundDefaultChoice,
   slotDefaultModel,
   modelPrefs,
+  resolveDaltonAutomationNotifyState, // DALTON-HOOK(weixin-multi-account): test automation:<id> override precedence
   modelProfile,
   readDefaultModelScope,
   splitPreferenceWrite,
@@ -251,5 +252,35 @@ describe('pruneModelReferences', () => {
 
   it('reads a slot still in the legacy column', () => {
     expect(pruneModelReferences({ other_preference: { preferred_model: 'gpt-4o' } }, isGone)).toEqual({ preferred_model: null });
+  });
+});
+
+// DALTON-HOOK(weixin-multi-account): verify inherent-category override precedence matches dispatch.py
+describe('resolveDaltonAutomationNotifyState', () => {
+  it('prefers automation:<id> override over display name for inherent categories and falls back to name', () => {
+    const auto = {
+      automation_id: 'earn-1',
+      name: 'dalton-googl-earn-2026q1-t0',
+      dalton_notify_category: 'earnings_t0',
+    };
+    expect(
+      resolveDaltonAutomationNotifyState(auto, {
+        'automation:earn-1': false,
+        'dalton-googl-earn-2026q1-t0': true,
+      }),
+    ).toEqual({ enabled: false, source: 'task' });
+
+    expect(
+      resolveDaltonAutomationNotifyState(auto, {
+        'automation:earn-1': true,
+        'dalton-googl-earn-2026q1-t0': false,
+      }),
+    ).toEqual({ enabled: true, source: 'task' });
+
+    expect(
+      resolveDaltonAutomationNotifyState(auto, {
+        'dalton-googl-earn-2026q1-t0': false,
+      }),
+    ).toEqual({ enabled: false, source: 'task' });
   });
 });

@@ -8,7 +8,11 @@ import { usePreferences } from '@/hooks/usePreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { queryKeys } from '@/lib/queryKeys';
 import { modelPrefs, splitPreferenceWrite } from '@/lib/modelPreferences';
-import { fetchDaltonFeishuGroups, type DaltonFeishuGroup } from '@/pages/Settings/utils/daltonApi';
+import {
+  fetchDaltonChannelBindings,
+  fetchDaltonFeishuGroups,
+  type DaltonFeishuGroup,
+} from '@/pages/Settings/utils/daltonApi';
 import type { Automation } from '@/types/automation';
 
 interface AutomationNotifyTargetsProps {
@@ -26,11 +30,24 @@ function isChatTarget(target: string): boolean {
   return target.startsWith('feishu:chat:');
 }
 
+function isDiscordChannelTarget(target: string): boolean {
+  return target.startsWith('discord:channel:');
+}
+
+function isGroupOrChannelTarget(target: string): boolean {
+  return isChatTarget(target) || isDiscordChannelTarget(target);
+}
+
+function isWeixinUserTarget(target: string): boolean {
+  return target.startsWith('weixin:user:');
+}
+
 /** The route entry a task resolves to:
  *  For custom tasks, uses `dalton_notify_route_targets` returned directly by
  *  the automations list endpoint (never the stale preference cache). For
- *  inherent categories, resolves via exact name, lowercased name,
- *  `category:<cat>`, bare category. `null` means no route (personal targets only). */
+ *  inherent categories, resolves via `automation:<id>` first, falling back to
+ *  legacy exact name, lowercased name, `category:<cat>`, bare category. `null`
+ *  means no route (personal targets only). */
 export function resolveNotifyRouteEntry(
   automation: Pick<
     Automation,
@@ -49,7 +66,9 @@ export function resolveNotifyRouteEntry(
     return { list: [], source: 'task' };
   }
   const name = automation.name.trim();
+  const idKey = automation.automation_id ? `automation:${automation.automation_id}` : '';
   const candidates: Array<[string, 'task' | 'category']> = [
+    ...(idKey ? ([[idKey, 'task']] as Array<[string, 'task' | 'category']>) : []),
     [name, 'task'],
     [name.toLowerCase(), 'task'],
     [`category:${category}`, 'category'],
@@ -91,7 +110,13 @@ export function AutomationNotifyTargets({
   automation,
 }: AutomationNotifyTargetsProps): React.ReactElement | null {
   const { hasCapability } = useCapabilities();
-  const canNotifyChannels = hasCapability(['channel_gateway', 'channel_feishu', 'channel_discord']);
+  const canWeixin = hasCapability('channel_weixin');
+  const canNotifyChannels = hasCapability([
+    'channel_gateway',
+    'channel_feishu',
+    'channel_discord',
+    'channel_weixin',
+  ]);
   const { preferences, isLoading, isLoaded } = usePreferences();
   const updatePreferences = useUpdatePreferences();
   const queryClient = useQueryClient();
@@ -126,6 +151,37 @@ export function AutomationNotifyTargets({
   const routes = (prefs.dalton_notify_routes ?? {}) as NotifyRoutes;
   const isCustom = automation.dalton_notify_category === 'custom';
 
+  const bindingsQuery = useQuery({
+    queryKey: queryKeys.dalton.channelBindings(),
+    queryFn: () =>
+      typeof fetchDaltonChannelBindings === 'function'
+        ? fetchDaltonChannelBindings()
+        : Promise.resolve(null),
+    enabled: Boolean(automation.dalton_notify_category) && prefsReady && masterEnabled && canWeixin,
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+  const wxAccount = bindingsQuery.data?.weixin_account;
+  const connectedWeixinTarget =
+    canWeixin &&
+    wxAccount &&
+    wxAccount.status === 'active' &&
+    wxAccount.channel_enabled !== false &&
+    wxAccount.member_allowed !== false &&
+    wxAccount.platform_user_id
+      ? `weixin:user:${wxAccount.platform_user_id}`
+      : null;
+  const connectedWeixinLabel = connectedWeixinTarget
+    ? wxAccount?.ilink_username ||
+      wxAccount?.platform_username ||
+      wxAccount?.masked_ilink_user_id ||
+      t('dalton.notifyTargets.platformWeixin')
+    : '';
+  const effectiveLabels: Record<string, string> =
+    connectedWeixinTarget && !labels[connectedWeixinTarget]
+      ? { ...labels, [connectedWeixinTarget]: connectedWeixinLabel }
+      : labels;
+
   // The route this task resolves to: for custom tasks, uses the API-returned
   // dalton_notify_route_targets (or local edit state while refetch is in flight)
   // rather than the preference cache.
@@ -136,28 +192,41 @@ export function AutomationNotifyTargets({
   const routeEntry = resolveNotifyRouteEntry(effectiveAutomation, routes);
   const routeList = routeEntry ? routeEntry.list : [];
   const inheritsCategory = routeEntry?.source === 'category';
+  const weixinStatusKnown = !canWeixin || (bindingsQuery.data !== undefined && !bindingsQuery.isError);
   const serverRoutePersonal =
     isCustom && Array.isArray(automation.dalton_notify_route_targets)
-      ? automation.dalton_notify_route_targets.filter((t) => !isChatTarget(t))
+      ? automation.dalton_notify_route_targets.filter(
+          (t) =>
+            !isGroupOrChannelTarget(t) &&
+            (!weixinStatusKnown || !isWeixinUserTarget(t) || t === connectedWeixinTarget),
+        )
       : [];
   // For custom tasks, checked personal targets come directly from the server
-  // route (never filtered against a potentially stale preference cache). For
+  // route (never filtered against a potentially stale preference cache, except
+  // dropping disconnected/replaced personal WeChat IDs once bindings load). For
   // inherent categories, stale caches may name deleted personal targets; they
   // drop out here as on the server. An explicit empty route ([] = deliver
   // nowhere) stays a list — only a missing entry means "no route".
   const selectedPersonal: string[] | null = routeEntry
-    ? routeList.filter((t) => (isCustom ? !isChatTarget(t) : targets.includes(t)))
+    ? routeList.filter((t) =>
+        isCustom
+          ? !isGroupOrChannelTarget(t) &&
+            (!weixinStatusKnown || !isWeixinUserTarget(t) || t === connectedWeixinTarget)
+          : targets.includes(t) || t === connectedWeixinTarget,
+      )
     : null;
   const selectedChats: string[] = routeEntry ? routeList.filter((t) => isChatTarget(t)) : [];
-  const personalOptions = isCustom
-    ? Array.from(
-        new Set([
-          ...targets,
-          ...serverRoutePersonal,
-          ...(selectedPersonal ?? []),
-        ]),
-      )
-    : targets;
+  const selectedDiscordChannels: string[] = routeEntry
+    ? routeList.filter((t) => isDiscordChannelTarget(t))
+    : [];
+  const selectedGroupTargets: string[] = [...selectedChats, ...selectedDiscordChannels];
+  const personalOptions = Array.from(
+    new Set([
+      ...targets.filter((t) => !weixinStatusKnown || !isWeixinUserTarget(t) || t === connectedWeixinTarget),
+      ...(connectedWeixinTarget ? [connectedWeixinTarget] : []),
+      ...(isCustom ? [...serverRoutePersonal, ...(selectedPersonal ?? [])] : []),
+    ]),
+  );
 
   // The group list is itself the tier gate: the endpoint answers 403 for an
   // external member, and no auth context is read here — a render without
@@ -205,34 +274,31 @@ export function AutomationNotifyTargets({
     return null;
   }
 
-  const routeKey =
-    isCustom && automation.automation_id
-      ? `automation:${automation.automation_id}`
-      : automation.name;
+  const routeKey = automation.automation_id
+    ? `automation:${automation.automation_id}`
+    : automation.name;
 
   const toggleTarget = (target: string) => {
     if (saving) return;
-    const isChat = isChatTarget(target);
-    // With no route of its own (or a category one), an inherent-category task
-    // currently reaches every personal target — that is the baseline being edited.
-    // A custom task without an explicit route reaches nothing; with a server route,
-    // its baseline preserves all existing route entries (personal + chat).
-    const basePersonal = selectedPersonal ?? (isCustom ? [] : targets);
-    const baseChats = selectedChats;
-    const nextPersonal = isChat
-      ? basePersonal
-      : basePersonal.includes(target)
-        ? basePersonal.filter((t) => t !== target)
-        : [...basePersonal, target];
-    const nextChats = isChat
-      ? baseChats.includes(target)
-        ? baseChats.filter((t) => t !== target)
-        : [...baseChats, target]
-      : baseChats;
-    // Every edit saves an explicit task-level list, never null: null would
-    // fall back to the category route (or all personal targets) and undo the
-    // edit. An emptied list stays [] — "deliver nowhere".
-    const nextRoute = [...nextPersonal, ...nextChats];
+    // When a route already exists, add/remove only the clicked target so every
+    // other entry (discord:channel:*, Feishu groups, personal targets) stays intact,
+    // while pruning any stale/disconnected personal WeChat targets before submit.
+    // Without an existing route, an inherent-category task starts from the user's
+    // current global personal targets, while a custom task starts from [].
+    const rawBase =
+      routeEntry !== null ? [...routeList] : isCustom ? [] : [...targets];
+    const baseRoute = weixinStatusKnown
+      ? rawBase.filter((t) => !isWeixinUserTarget(t) || t === connectedWeixinTarget)
+      : rawBase;
+    const nextRaw = baseRoute.includes(target)
+      ? baseRoute.filter((t) => t !== target)
+      : [...baseRoute, target];
+    // Preserve personal-before-group ordering while keeping every non-clicked target
+    // (including discord:channel:*, Feishu groups, and personal targets) intact.
+    const nextRoute = [
+      ...nextRaw.filter((t) => !isGroupOrChannelTarget(t)),
+      ...nextRaw.filter((t) => isGroupOrChannelTarget(t)),
+    ];
     setSaveError(null);
     setSaving(true);
     if (isCustom) {
@@ -316,8 +382,8 @@ export function AutomationNotifyTargets({
           >
             {notifyTargetsSelectionLabel(
               selectedPersonal,
-              selectedChats,
-              labels,
+              selectedGroupTargets,
+              effectiveLabels,
               groupName,
               t('dalton.notify.targetsNone'),
               '仅个人目标',
@@ -345,11 +411,11 @@ export function AutomationNotifyTargets({
             {personalOptions.map((target) =>
               row(
                 target,
-                labels[target] || (targets.includes(target) ? '未命名目标' : target),
+                effectiveLabels[target] || (targets.includes(target) ? '未命名目标' : target),
                 target,
-                // No route of its own means every personal target is reached;
-                // the checks say what delivery actually does.
-                selectedPersonal === null ? true : selectedPersonal.includes(target),
+                // No route of its own means every configured personal target is reached;
+                // a connected WeChat account not yet enabled in dalton_notify_targets starts unchecked.
+                selectedPersonal === null ? targets.includes(target) : selectedPersonal.includes(target),
                 () => toggleTarget(target),
                 `个人目标 ${target}`,
               ),
@@ -385,6 +451,26 @@ export function AutomationNotifyTargets({
                     true,
                     () => toggleTarget(target),
                     `飞书群 ${id}`,
+                  );
+                })}
+              </div>
+            </>
+          )}
+          {selectedDiscordChannels.length > 0 && (
+            <>
+              <p className="px-2 pt-2 pb-0.5 text-[11px] font-semibold" style={{ color: 'var(--color-text-secondary)' }}>
+                Discord 频道
+              </p>
+              <div className="flex flex-col">
+                {selectedDiscordChannels.map((target) => {
+                  const id = target.replace(/^discord:channel:/, '');
+                  return row(
+                    target,
+                    effectiveLabels[target] || `Discord #${id}`,
+                    target,
+                    routeList.includes(target),
+                    () => toggleTarget(target),
+                    `Discord 频道 ${id}`,
                   );
                 })}
               </div>

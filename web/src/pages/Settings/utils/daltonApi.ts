@@ -731,16 +731,52 @@ export interface DaltonChannelIdentityPublic {
   updated_at: string | null;
 }
 
-/** Normalized `bindings[platform]` from the same response. */
+/** Normalized `bindings[platform]` from `GET /channels/bindings`. */
 export interface DaltonChannelBindingState {
   linked: boolean;
   platform: string;
   platform_user_id: string | null;
   platform_username: string | null;
   updated_at: string | null;
+  account_id?: string | null;
+  status?: string | null;
+  masked_ilink_user_id?: string | null;
+  has_usable_context_token?: boolean | null;
 }
 
-/** Public Weixin bot fields returned by the bindings API. */
+/** Personal Weixin account status returned inside `GET /channels/bindings` (`weixin_account`). */
+export type DaltonWeixinMemberStatus =
+  | 'unconfigured'
+  | 'active'
+  | 'pending_verification'
+  | 'expired'
+  | 'paused'
+  | 'disabled'
+  | string;
+
+export interface DaltonWeixinMemberAccountView {
+  linked: boolean;
+  platform: 'weixin' | string;
+  status: DaltonWeixinMemberStatus;
+  raw_status?: string | null;
+  disabled_reason?: string | null;
+  channel_enabled: boolean;
+  allow_external?: boolean;
+  member_allowed: boolean;
+  deny_reason: string | null;
+  account_id: string | null;
+  platform_user_id: string | null;
+  masked_ilink_user_id: string | null;
+  platform_username: string | null;
+  ilink_username: string | null;
+  bot_generation?: number | null;
+  active_push_ready: boolean;
+  last_inbound_at: string | null;
+  created_at?: string | null;
+  updated_at: string | null;
+}
+
+/** @deprecated Legacy single-bot payload kept optional for older test fixtures. */
 export interface DaltonWeixinBotPublicState {
   configured: boolean;
   status: 'unconfigured' | 'active' | 'expired' | 'error' | string;
@@ -756,7 +792,7 @@ export interface DaltonChannelBindingsResponse {
   user_id: string;
   user_tier: 'admin' | 'internal' | 'external' | string;
   home_workspace_id: string;
-  /** Always includes feishu, discord, and weixin. Read status from here. */
+  /** Includes enabled platforms (`weixin` omitted when `channel_weixin` is off). */
   bindings: Record<DaltonChannelPlatform, DaltonChannelBindingState>;
   identities: Partial<Record<string, DaltonChannelIdentityPublic>>;
   settings: {
@@ -764,13 +800,13 @@ export interface DaltonChannelBindingsResponse {
     apps: Record<string, unknown>;
   };
   chat_bindings: unknown;
-  weixin_bot: DaltonWeixinBotPublicState | null;
+  weixin_account?: DaltonWeixinMemberAccountView | null;
+  weixin_bot?: DaltonWeixinBotPublicState | null;
 }
 
 /**
  * `POST /channels/bind-codes`.
- * The body is `{ platform }` for the signed-in user. The response is
- * `command` (`/bind DLT-XXXX-XXXX`) and `expires_in_seconds` (600).
+ * The body is `{ platform }` for the signed-in user (Feishu/Discord only).
  */
 export interface DaltonChannelBindCodeCreateResponse {
   code: string;
@@ -781,32 +817,138 @@ export interface DaltonChannelBindCodeCreateResponse {
 }
 
 export interface DaltonChannelUnbindResponse {
-  unbound: boolean;
+  ok?: boolean;
+  unbound?: boolean;
   platform: DaltonChannelPlatform | string;
+  user_id?: string;
+  account_id?: string | null;
+  deleted_account?: boolean;
+  superseded_login_sessions?: number;
+  accounts_revision?: number;
 }
 
 /** QR statuses the login API returns after normalization. */
 export type DaltonWeixinQrPublicStatus =
+  | 'starting'
   | 'wait'
   | 'scaned'
   | 'scaned_but_redirect'
   | 'verify_code'
   | 'confirmed'
   | 'expired'
+  | 'superseded'
+  | 'failed'
   | 'error';
 
 export interface DaltonWeixinQrPublicResponse {
   session_key: string;
   status: DaltonWeixinQrPublicStatus;
   connected?: boolean;
+  already_connected?: boolean;
+  pending_verification?: boolean;
+  verify_code_accepted?: boolean;
+  need_rescan?: boolean;
+  revoked?: boolean;
   qrcode_url?: string | null;
   qrcode_img_content?: string | null;
   expires_at?: string | null;
+  account_id?: string | null;
+  account_status?: string | null;
   ilink_bot_id?: string | null;
   ilink_user_id?: string | null;
+  masked_ilink_user_id?: string | null;
   ilink_username?: string | null;
   bot_generation?: number | null;
+  accounts_revision?: number | null;
+  code?: string | null;
   message?: string | null;
+}
+
+/** Preset audit reasons enforced by `validate_admin_unbind_reason` in backend. */
+export const DALTON_WEIXIN_ADMIN_UNBIND_REASONS = [
+  '离职交接',
+  '手机遗失应急',
+  '误绑微信号',
+  '其他原因',
+] as const;
+
+export type DaltonWeixinAdminUnbindReason =
+  (typeof DALTON_WEIXIN_ADMIN_UNBIND_REASONS)[number];
+
+export interface DaltonWeixinGatewayLeaseInfo {
+  instance_id: string;
+  epoch: number;
+  acquired_at: string | null;
+  expires_at: string | null;
+  active: boolean;
+}
+
+export interface DaltonWeixinAdminMemberItem {
+  account_id: string | null;
+  user_id: string;
+  user_email: string | null;
+  user_name: string | null;
+  user_tier: 'admin' | 'internal' | 'external' | string;
+  ilink_bot_id: string | null;
+  ilink_username: string | null;
+  masked_ilink_user_id: string | null;
+  status:
+    | 'active'
+    | 'pending_verification'
+    | 'expired'
+    | 'disabled'
+    | 'login_pending'
+    | string;
+  prev_status: string | null;
+  disabled_reason: 'external_access_disabled' | 'member_not_in_roster' | string | null;
+  bot_generation: number | null;
+  has_pending_login: boolean;
+  pending_login_status: 'starting' | 'wait' | 'scaned' | 'verify_code' | string | null;
+  last_inbound_at: string | null;
+  last_error_code: string | null;
+  updated_at: string | null;
+}
+
+export interface DaltonWeixinAdminAuditLogItem {
+  audit_id: string;
+  action: string;
+  operator_user_id: string;
+  target_user_id: string | null;
+  weixin_account_id: string | null;
+  ilink_bot_id: string | null;
+  masked_ilink_user_id: string | null;
+  reason: string;
+  metadata: Record<string, unknown>;
+  created_at: string | null;
+}
+
+export interface DaltonWeixinAdminOverviewResponse {
+  enabled: boolean;
+  allow_external: boolean;
+  db_allow_external: boolean | null;
+  accounts_revision: number;
+  max_concurrent_accounts: number;
+  active_poller_count: number;
+  connected_count: number;
+  pending_verification_count: number;
+  expired_count: number;
+  gateway_lease: DaltonWeixinGatewayLeaseInfo | null;
+  accounts: DaltonWeixinAdminMemberItem[];
+  audit_logs: DaltonWeixinAdminAuditLogItem[];
+}
+
+export interface DaltonWeixinAdminConfigUpdatePayload {
+  enabled?: boolean;
+  allow_external?: boolean;
+}
+
+export interface DaltonWeixinAdminConfigUpdateResponse {
+  ok: boolean;
+  enabled: boolean;
+  allow_external: boolean;
+  accounts_revision: number;
+  disabled_count: number;
+  restored_count: number;
 }
 
 export async function fetchDaltonChannelBindings(): Promise<DaltonChannelBindingsResponse> {
@@ -846,20 +988,32 @@ export async function unbindDaltonChannel(
   return data;
 }
 
-export async function startDaltonWeixinQrLogin(): Promise<DaltonWeixinQrPublicResponse> {
+export interface DaltonWeixinQrRequestOptions {
+  signal?: AbortSignal;
+}
+
+export async function startDaltonWeixinQrLogin(
+  options?: DaltonWeixinQrRequestOptions,
+): Promise<DaltonWeixinQrPublicResponse> {
   const { data } = await api.post<DaltonWeixinQrPublicResponse>(
     '/api/v1/dalton/channels/weixin/qrcode/start',
     {},
+    options?.signal ? { signal: options.signal } : undefined,
   );
   return data;
 }
 
 export async function waitDaltonWeixinQrLogin(
   sessionKey: string,
+  options?: DaltonWeixinQrRequestOptions,
 ): Promise<DaltonWeixinQrPublicResponse> {
   const { data } = await api.get<DaltonWeixinQrPublicResponse>(
     '/api/v1/dalton/channels/weixin/qrcode/wait',
-    { params: { session_key: sessionKey } },
+    {
+      params: { session_key: sessionKey },
+      timeout: 50_000,
+      ...(options?.signal ? { signal: options.signal } : {}),
+    },
   );
   return data;
 }
@@ -867,10 +1021,51 @@ export async function waitDaltonWeixinQrLogin(
 export async function verifyDaltonWeixinQrCode(
   sessionKey: string,
   verifyCode: string,
+  options?: DaltonWeixinQrRequestOptions,
 ): Promise<DaltonWeixinQrPublicResponse> {
   const { data } = await api.post<DaltonWeixinQrPublicResponse>(
     '/api/v1/dalton/channels/weixin/qrcode/verify-code',
     { session_key: sessionKey, verify_code: verifyCode },
+    options?.signal ? { signal: options.signal } : undefined,
+  );
+  return data;
+}
+
+export async function fetchDaltonWeixinAdminOverview(): Promise<DaltonWeixinAdminOverviewResponse> {
+  const { data } = await api.get<DaltonWeixinAdminOverviewResponse>(
+    '/api/v1/dalton/channels/weixin/admin/overview',
+  );
+  return data;
+}
+
+export async function updateDaltonWeixinAdminConfig(
+  payload: DaltonWeixinAdminConfigUpdatePayload,
+): Promise<DaltonWeixinAdminConfigUpdateResponse> {
+  const { data } = await api.put<DaltonWeixinAdminConfigUpdateResponse>(
+    '/api/v1/dalton/channels/weixin/admin/config',
+    payload,
+  );
+  return data;
+}
+
+export async function adminUnbindDaltonWeixinAccount(
+  accountId: string,
+  reason: DaltonWeixinAdminUnbindReason,
+): Promise<DaltonChannelUnbindResponse> {
+  const { data } = await api.delete<DaltonChannelUnbindResponse>(
+    `/api/v1/dalton/channels/weixin/admin/accounts/${encodeURIComponent(accountId)}`,
+    { data: { reason } },
+  );
+  return data;
+}
+
+export async function adminRevokeDaltonWeixinUser(
+  targetUserId: string,
+  reason: DaltonWeixinAdminUnbindReason,
+): Promise<DaltonChannelUnbindResponse> {
+  const { data } = await api.delete<DaltonChannelUnbindResponse>(
+    `/api/v1/dalton/channels/weixin/admin/users/${encodeURIComponent(targetUserId)}/weixin`,
+    { data: { reason } },
   );
   return data;
 }

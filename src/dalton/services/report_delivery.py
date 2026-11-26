@@ -1999,6 +1999,7 @@ async def validate_report_profile_change(
     action: str | None = None,
     after_metadata: Mapping[str, Any] | None = None,
     previous_groups_override: Sequence[str] | None = None,
+    previous_dm_targets_override: Sequence[str] | None = None,
     skip_skill_match: bool = False,
     conn: Any = None,
     verify_member_fn: Callable[[str, str], Awaitable[tuple[bool, str | None]]] | None = None,
@@ -2102,6 +2103,23 @@ async def validate_report_profile_change(
     norm_failure = list(parsed_ok.get("failure_targets") or [])
     all_raw_targets = norm_report + (norm_text or []) + norm_failure
 
+    prev_weixin_dm_targets: set[str] = set()
+    raw_prev_dms: list[str] = []
+    if previous_dm_targets_override is not None:
+        raw_prev_dms.extend(str(t) for t in previous_dm_targets_override if isinstance(t, str))
+    elif prev_parsed is not None:
+        raw_prev_dms.extend(list(prev_parsed.get("report_targets") or []))
+        if prev_parsed.get("text_targets") is not None:
+            raw_prev_dms.extend(list(prev_parsed["text_targets"]))
+        raw_prev_dms.extend(list(prev_parsed.get("failure_targets") or []))
+    for raw_prev in raw_prev_dms:
+        try:
+            prev_canonical, prev_plat, prev_kind, _ = parse_delivery_target(raw_prev)
+        except Exception:
+            continue
+        if prev_kind == "dm" and prev_plat == "weixin":
+            prev_weixin_dm_targets.add(prev_canonical)
+
     checked_targets: set[str] = set()
     caller_open_id: str | None = None
     owner_tier_checked: str | None = None
@@ -2115,6 +2133,8 @@ async def validate_report_profile_change(
         checked_targets.add(canonical)
 
         if kind == "dm":
+            if plat == "weixin" and canonical in prev_weixin_dm_targets:
+                continue
             if caller_tier != "admin" and canonical not in caller_dm_set:
                 raise ReportDeliveryError(
                     f"私信目标 {canonical} 未绑定在你的账号下，只能发送到你本人已绑定的私信渠道。",
@@ -2487,15 +2507,20 @@ async def sync_report_delivery_routes_in_tx(
     """Sync ``automation:<id>`` route/override (or clear it) inside the caller's DB transaction."""
     route_key = f"automation:{automation_id}"
     if change.profile is not None:
-        updated_prefs = await apply_dalton_notify_preference_patch(
-            owner_user_id,
-            {
-                DALTON_NOTIFY_OVERRIDES_KEY: {route_key: True},
-                DALTON_NOTIFY_ROUTES_KEY: {route_key: change.route_targets},
-            },
-            conn=db_conn,
-            skip_report_profile_validation=True,
-        )
+        from src.dalton.llm.model_prefs import TuningError
+
+        try:
+            updated_prefs = await apply_dalton_notify_preference_patch(
+                owner_user_id,
+                {
+                    DALTON_NOTIFY_OVERRIDES_KEY: {route_key: True},
+                    DALTON_NOTIFY_ROUTES_KEY: {route_key: change.route_targets},
+                },
+                conn=db_conn,
+                skip_report_profile_validation=True,
+            )
+        except TuningError as exc:
+            raise ReportDeliveryError(str(exc), code="dm_not_bound") from exc
         if change.authorized_group_bindings:
             await sync_owner_group_chat_settings(
                 owner_user_id,

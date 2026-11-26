@@ -386,11 +386,11 @@ describe('per-task Feishu/Discord notify switches on Automations page', () => {
 
     fireEvent.click(earnSwitch);
     await waitFor(() => {
-      // Only the changed key is submitted in the patch
+      // Only the changed key is submitted in the patch (automation:<id> when automation_id is present)
       expect(prefMocks.mutateAsync).toHaveBeenCalledWith({
         model_preference: {
           dalton_notify_overrides: {
-            'dalton-googl-earn-2026q1-t0': false,
+            'automation:auto-earn-t0': false,
           },
         },
       });
@@ -405,7 +405,7 @@ describe('per-task Feishu/Discord notify switches on Automations page', () => {
     // Sibling override remains intact after deep merge
     expect(prefMocks.preferences.model_preference.dalton_notify_overrides).toEqual({
       'dalton-nvda-earn-2026q1-tp1': false,
-      'dalton-googl-earn-2026q1-t0': false,
+      'automation:auto-earn-t0': false,
     });
   });
 });

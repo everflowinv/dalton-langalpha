@@ -2102,11 +2102,11 @@ async def test_dalton_notify_settings_set_route_confirm_writes_via_shared_valida
     assert len(upserted_patches) == 1
     written = upserted_patches[0]
     assert written["dalton_notify_routes"] == {
-        "dalton-nvda-earn-2026q1-t0": ["feishu:user:ou_me_1", "feishu:chat:oc_g1"]
+        "automation:a-1": ["feishu:user:ou_me_1", "feishu:chat:oc_g1"]
     }
     assert "dalton_notify_enabled" not in written
     assert written["dalton_notify_overrides"] == {
-        "dalton-nvda-earn-2026q1-t0": True
+        "automation:a-1": True
     }
 
     # 3. Empty targets=[] -> writes explicit [] ("不推送")
@@ -2124,7 +2124,7 @@ async def test_dalton_notify_settings_set_route_confirm_writes_via_shared_valida
     assert res_empty["success"] is True
     assert res_empty["targets"] == []
     assert upserted_patches[-1]["dalton_notify_routes"] == {
-        "dalton-nvda-earn-2026q1-t0": []
+        "automation:a-1": []
     }
 
 
@@ -2856,20 +2856,20 @@ async def test_set_route_concurrent_modification_preserves_other_task_route(
     assert len(upserted_patches) == 1
     assert upserted_patches[0] == {
         "dalton_notify_routes": {
-            "dalton-nvda-earn-2026q1-t0": ["feishu:user:ou_me_1"]
+            "automation:a-1": ["feishu:user:ou_me_1"]
         },
         "dalton_notify_overrides": {
-            "dalton-nvda-earn-2026q1-t0": True
+            "automation:a-1": True
         },
     }
     # Deep merge preserved the concurrent change to Morning Macro Digest:
     assert stored_prefs["model_preference"]["dalton_notify_routes"] == {
         "Morning Macro Digest": ["feishu:chat:oc_g1"],
-        "dalton-nvda-earn-2026q1-t0": ["feishu:user:ou_me_1"],
+        "automation:a-1": ["feishu:user:ou_me_1"],
     }
     assert stored_prefs["model_preference"]["dalton_notify_overrides"] == {
         "Morning Macro Digest": True,
-        "dalton-nvda-earn-2026q1-t0": True,
+        "automation:a-1": True,
     }
 
 
@@ -4081,3 +4081,646 @@ async def test_phase1_c5_unit_managed_initial_dispatch_and_retry_dm_only_and_ski
         stamped_unit_version=unit_version,
     )
     assert (g_ok5, g_reason5, g_chats5) == (True, None, False)
+
+
+@pytest.mark.asyncio
+async def test_weixin_notify_route_allows_own_active_account_without_global_target_and_rejects_unbound() -> None:
+    """Task-level personal WeChat routing does not widen other tasks and rejects unbound/foreign IDs."""
+    own_wx = "weixin:user:wx_alice_active"
+    other_wx = "weixin:user:wx_bob_other"
+    bound = {"feishu:user:ou_alice", own_wx}
+
+    # 1. Task route accepts caller's active WeChat even when NOT in global dalton_notify_targets
+    route_bag: dict[str, Any] = {
+        DALTON_NOTIFY_ROUTES_KEY: {
+            "dalton-googl-earn-2026q1-t0": ["feishu:user:ou_alice", own_wx],
+        }
+    }
+    validate_dalton_model_preferences(
+        route_bag,
+        effective_model_preference={
+            DALTON_NOTIFY_TARGETS_KEY: ["feishu:user:ou_alice"],
+            **route_bag,
+        },
+        stored_model_preference={
+            DALTON_NOTIFY_TARGETS_KEY: ["feishu:user:ou_alice"],
+        },
+        bound_dm_targets=bound,
+    )
+    assert route_bag[DALTON_NOTIFY_ROUTES_KEY]["dalton-googl-earn-2026q1-t0"] == [
+        "feishu:user:ou_alice",
+        own_wx,
+    ]
+
+    # 2. Foreign or unbound WeChat ID is rejected in both routes and manual dalton_notify_targets
+    with pytest.raises(TuningError):
+        validate_dalton_model_preferences(
+            {
+                DALTON_NOTIFY_ROUTES_KEY: {
+                    "dalton-googl-earn-2026q1-t0": [other_wx],
+                }
+            },
+            effective_model_preference={
+                DALTON_NOTIFY_TARGETS_KEY: ["feishu:user:ou_alice"],
+            },
+            bound_dm_targets=bound,
+        )
+
+    with pytest.raises(TuningError):
+        validate_dalton_model_preferences(
+            {DALTON_NOTIFY_TARGETS_KEY: [other_wx]},
+            bound_dm_targets=bound,
+        )
+
+    # Own active WeChat is accepted in manual dalton_notify_targets
+    manual_bag: dict[str, Any] = {DALTON_NOTIFY_TARGETS_KEY: ["feishu:user:ou_alice", own_wx]}
+    validate_dalton_model_preferences(manual_bag, bound_dm_targets=bound)
+    assert manual_bag[DALTON_NOTIFY_TARGETS_KEY] == ["feishu:user:ou_alice", own_wx]
+
+    # 3. Dispatch layer: Task A (routed to WeChat) delivers to Feishu + WeChat,
+    #    while Task B (no dedicated route) still delivers ONLY to global Feishu target.
+    enabled_fn = create_autospec(dispatch_mod.resolve_dalton_notify_enabled, return_value=True)
+    overrides_fn = create_autospec(dispatch_mod.resolve_dalton_notify_overrides, return_value={})
+    targets_fn = create_autospec(
+        dispatch_mod.resolve_dalton_notify_targets,
+        return_value=["feishu:user:ou_alice"],
+    )
+    routes_fn = create_autospec(
+        dispatch_mod.resolve_dalton_notify_routes,
+        return_value={"dalton-googl-earn-2026q1-t0": ["feishu:user:ou_alice", own_wx]},
+    )
+    admin_fn = create_autospec(dispatch_mod._default_notify_admin, return_value=True)
+    active_wx_fn = create_autospec(
+        dispatch_mod.resolve_active_dalton_weixin_targets,
+        return_value={own_wx},
+    )
+
+    ok_a, skip_a, targets_a = await evaluate_user_notify_eligibility(
+        "u-alice",
+        {"name": "dalton-googl-earn-2026q1-t0"},
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        is_admin_fn=admin_fn,
+        resolve_active_weixin_targets_fn=active_wx_fn,
+    )
+    assert (ok_a, skip_a, targets_a) == (True, None, ["feishu:user:ou_alice", own_wx])
+
+    ok_b, skip_b, targets_b = await evaluate_user_notify_eligibility(
+        "u-alice",
+        {"name": "dalton-aapl-earn-2026q1-t0"},
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        is_admin_fn=admin_fn,
+        resolve_active_weixin_targets_fn=active_wx_fn,
+    )
+    assert (ok_b, skip_b, targets_b) == (True, None, ["feishu:user:ou_alice"])
+
+
+@pytest.mark.asyncio
+async def test_same_name_different_id_automations_do_not_share_weixin_route() -> None:
+    """Two automations sharing a display name keep isolated routes via automation:<id>."""
+    own_wx = "weixin:user:wx_alice_active"
+    enabled_fn = create_autospec(dispatch_mod.resolve_dalton_notify_enabled, return_value=True)
+    overrides_fn = create_autospec(dispatch_mod.resolve_dalton_notify_overrides, return_value={})
+    targets_fn = create_autospec(
+        dispatch_mod.resolve_dalton_notify_targets,
+        return_value=["feishu:user:ou_alice"],
+    )
+    routes_fn = create_autospec(
+        dispatch_mod.resolve_dalton_notify_routes,
+        return_value={"automation:id-a": ["feishu:user:ou_alice", own_wx]},
+    )
+    admin_fn = create_autospec(dispatch_mod._default_notify_admin, return_value=True)
+    active_wx_fn = create_autospec(
+        dispatch_mod.resolve_active_dalton_weixin_targets,
+        return_value={own_wx},
+    )
+
+    auto_a = {"automation_id": "id-a", "name": "dalton-googl-earn-2026q1-t0"}
+    auto_b = {"automation_id": "id-b", "name": "dalton-googl-earn-2026q1-t0"}
+
+    ok_a, skip_a, targets_a = await evaluate_user_notify_eligibility(
+        "u-alice",
+        auto_a,
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        is_admin_fn=admin_fn,
+        resolve_active_weixin_targets_fn=active_wx_fn,
+    )
+    assert (ok_a, skip_a, targets_a) == (True, None, ["feishu:user:ou_alice", own_wx])
+
+    # Same-named task B with different ID keeps only its default Feishu target
+    ok_b, skip_b, targets_b = await evaluate_user_notify_eligibility(
+        "u-alice",
+        auto_b,
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        is_admin_fn=admin_fn,
+        resolve_active_weixin_targets_fn=active_wx_fn,
+    )
+    assert (ok_b, skip_b, targets_b) == (True, None, ["feishu:user:ou_alice"])
+
+    # Legacy display-name key still acts as fallback when no ID key exists
+    legacy_routes_fn = create_autospec(
+        dispatch_mod.resolve_dalton_notify_routes,
+        return_value={"dalton-googl-earn-2026q1-t0": ["feishu:user:ou_alice", own_wx]},
+    )
+    ok_leg, skip_leg, targets_leg = await evaluate_user_notify_eligibility(
+        "u-alice",
+        auto_b,
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=legacy_routes_fn,
+        is_admin_fn=admin_fn,
+        resolve_active_weixin_targets_fn=active_wx_fn,
+    )
+    assert (ok_leg, skip_leg, targets_leg) == (True, None, ["feishu:user:ou_alice", own_wx])
+
+
+@pytest.mark.asyncio
+async def test_stale_unbound_weixin_target_filtered_at_dispatch_and_unblocks_preference_edits() -> None:
+    """After unbinding/rebinding WeChat, stale weixin:user: targets do not deliver and do not block saving."""
+    old_wx = "weixin:user:wx_old_unbound"
+    new_wx = "weixin:user:wx_new_active"
+    foreign_wx = "weixin:user:wx_foreign"
+    bound = {"feishu:user:ou_alice", "discord:user:123456", new_wx}
+
+    # 1. Dispatch filters out stale old_wx from routes and global list
+    enabled_fn = create_autospec(dispatch_mod.resolve_dalton_notify_enabled, return_value=True)
+    overrides_fn = create_autospec(dispatch_mod.resolve_dalton_notify_overrides, return_value={})
+    targets_fn = create_autospec(
+        dispatch_mod.resolve_dalton_notify_targets,
+        return_value=["feishu:user:ou_alice", old_wx],
+    )
+    routes_fn = create_autospec(
+        dispatch_mod.resolve_dalton_notify_routes,
+        return_value={"automation:id-a": ["feishu:user:ou_alice", old_wx]},
+    )
+    admin_fn = create_autospec(dispatch_mod._default_notify_admin, return_value=True)
+    active_wx_fn = create_autospec(
+        dispatch_mod.resolve_active_dalton_weixin_targets,
+        return_value={new_wx},
+    )
+
+    ok_r, skip_r, targets_r = await evaluate_user_notify_eligibility(
+        "u-alice",
+        {"automation_id": "id-a", "name": "dalton-googl-earn-2026q1-t0"},
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        is_admin_fn=admin_fn,
+        resolve_active_weixin_targets_fn=active_wx_fn,
+    )
+    assert (ok_r, skip_r, targets_r) == (True, None, ["feishu:user:ou_alice"])
+
+    # 2. Server allows removing or keeping pre-existing stale old_wx when editing other targets
+    stored = {
+        DALTON_NOTIFY_TARGETS_KEY: ["feishu:user:ou_alice", old_wx],
+        DALTON_NOTIFY_ROUTES_KEY: {"automation:id-a": ["feishu:user:ou_alice", old_wx]},
+    }
+    add_discord_bag = {
+        DALTON_NOTIFY_TARGETS_KEY: ["feishu:user:ou_alice", old_wx, "discord:user:123456"],
+    }
+    validate_dalton_model_preferences(
+        add_discord_bag,
+        effective_model_preference={**stored, **add_discord_bag},
+        stored_model_preference=stored,
+        bound_dm_targets=bound,
+    )
+    assert "discord:user:123456" in add_discord_bag[DALTON_NOTIFY_TARGETS_KEY]
+
+    # Removing old_wx from route (or adding new_wx while replacing old_wx) succeeds
+    edit_route_bag = {
+        DALTON_NOTIFY_ROUTES_KEY: {"automation:id-a": ["feishu:user:ou_alice", new_wx]},
+    }
+    validate_dalton_model_preferences(
+        edit_route_bag,
+        effective_model_preference={**stored, **edit_route_bag},
+        stored_model_preference=stored,
+        bound_dm_targets=bound,
+    )
+    assert edit_route_bag[DALTON_NOTIFY_ROUTES_KEY]["automation:id-a"] == [
+        "feishu:user:ou_alice",
+        new_wx,
+    ]
+
+    # Newly adding an unbound/foreign WeChat ID is still rejected
+    with pytest.raises(TuningError):
+        validate_dalton_model_preferences(
+            {DALTON_NOTIFY_ROUTES_KEY: {"automation:id-a": ["feishu:user:ou_alice", foreign_wx]}},
+            effective_model_preference=stored,
+            stored_model_preference=stored,
+            bound_dm_targets=bound,
+        )
+    with pytest.raises(TuningError):
+        validate_dalton_model_preferences(
+            {DALTON_NOTIFY_TARGETS_KEY: ["feishu:user:ou_alice", old_wx, foreign_wx]},
+            effective_model_preference=stored,
+            stored_model_preference=stored,
+            bound_dm_targets=bound,
+        )
+
+
+@pytest.mark.asyncio
+async def test_set_route_writes_automation_id_key_for_inherent_same_name_tasks_and_isolates_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r5 #1: Assistant set_route writes automation:<id> for inherent tasks so same-named A/B stay isolated."""
+    from src.dalton.tools import notify_tools as nt_mod
+
+    auto_a = {
+        "automation_id": "id-a",
+        "name": "dalton-googl-earn-2026q1-t0",
+        "status": "active",
+        "created_at": "2026-11-20T00:00:00+00:00",
+    }
+    auto_b = {
+        "automation_id": "id-b",
+        "name": "dalton-googl-earn-2026q1-t0",
+        "status": "active",
+        "created_at": "2026-11-21T00:00:00+00:00",
+    }
+    assert nt_mod._automation_route_key(auto_a) == "automation:id-a"
+    assert nt_mod._automation_route_key(auto_b) == "automation:id-b"
+
+    routes_store: dict[str, list[str]] = {
+        "dalton-googl-earn-2026q1-t0": ["feishu:user:ou_alice"],
+        "automation:id-a": ["feishu:user:ou_alice"],
+    }
+    overrides_store: dict[str, bool] = {}
+
+    async def _fake_list_automations(uid: str) -> list[dict[str, Any]]:
+        _ = uid
+        return [auto_a, auto_b]
+
+    async def _fake_apply_patch(
+        uid: str, patch: dict[str, Any], *, user_confirmed: bool = False
+    ) -> dict[str, Any]:
+        _ = (uid, user_confirmed)
+        for k, v in (patch.get(DALTON_NOTIFY_ROUTES_KEY) or {}).items():
+            routes_store[k] = list(v)
+        for k, v in (patch.get(nt_mod.DALTON_NOTIFY_OVERRIDES_KEY) or {}).items():
+            overrides_store[k] = bool(v)
+        return {"model_preference": {DALTON_NOTIFY_ROUTES_KEY: dict(routes_store)}}
+
+    monkeypatch.setattr(
+        nt_mod.auto_db,
+        "list_all_automations",
+        create_autospec(nt_mod.auto_db.list_all_automations, side_effect=_fake_list_automations),
+    )
+    monkeypatch.setattr(
+        nt_mod,
+        "resolve_dalton_notify_enabled",
+        create_autospec(nt_mod.resolve_dalton_notify_enabled, return_value=True),
+    )
+    monkeypatch.setattr(
+        nt_mod,
+        "resolve_dalton_notify_targets",
+        create_autospec(
+            nt_mod.resolve_dalton_notify_targets,
+            return_value=["feishu:user:ou_alice", "feishu:user:ou_backup"],
+        ),
+    )
+    monkeypatch.setattr(
+        nt_mod,
+        "resolve_dalton_notify_target_labels",
+        create_autospec(
+            nt_mod.resolve_dalton_notify_target_labels,
+            return_value={
+                "feishu:user:ou_alice": "Alice",
+                "feishu:user:ou_backup": "Backup",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        nt_mod,
+        "resolve_dalton_notify_routes",
+        create_autospec(nt_mod.resolve_dalton_notify_routes, side_effect=lambda _u: dict(routes_store)),
+    )
+    monkeypatch.setattr(
+        nt_mod,
+        "apply_dalton_notify_preference_patch",
+        create_autospec(nt_mod.apply_dalton_notify_preference_patch, side_effect=_fake_apply_patch),
+    )
+    monkeypatch.setattr(
+        nt_mod,
+        "hitl_confirm",
+        create_autospec(
+            nt_mod.hitl_confirm,
+            side_effect=lambda _t, payload: (
+                True,
+                {"decisions": [{"type": "approve", "confirm_token": payload["confirm_token"]}]},
+            ),
+        ),
+    )
+
+    tool = nt_mod.create_notify_tools()[0]
+    cmd = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "id-a",
+                "targets": ["Backup"],
+            }
+        ),
+        config={"configurable": {"user_id": "u-alice"}},
+    )
+    body = json.loads(cmd.update["messages"][0].content)
+    assert body["success"] is True
+    assert body["route_key"] == "automation:id-a"
+    assert routes_store["automation:id-a"] == ["feishu:user:ou_backup"]
+    assert routes_store["dalton-googl-earn-2026q1-t0"] == ["feishu:user:ou_alice"]
+    assert overrides_store["automation:id-a"] is True
+
+    # Actual delivery: A uses updated automation:id-a -> Backup; B falls back to legacy name -> Alice
+    enabled_fn = create_autospec(dispatch_mod.resolve_dalton_notify_enabled, return_value=True)
+    overrides_fn = create_autospec(
+        dispatch_mod.resolve_dalton_notify_overrides,
+        return_value=dict(overrides_store),
+    )
+    targets_fn = create_autospec(
+        dispatch_mod.resolve_dalton_notify_targets,
+        return_value=["feishu:user:ou_alice", "feishu:user:ou_backup"],
+    )
+    routes_fn = create_autospec(
+        dispatch_mod.resolve_dalton_notify_routes,
+        return_value=dict(routes_store),
+    )
+    admin_fn = create_autospec(dispatch_mod._default_notify_admin, return_value=False)
+
+    res_a = await evaluate_user_notify_eligibility(
+        "u-alice",
+        auto_a,
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        is_admin_fn=admin_fn,
+    )
+    res_b = await evaluate_user_notify_eligibility(
+        "u-alice",
+        auto_b,
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        is_admin_fn=admin_fn,
+    )
+    assert res_a == (True, None, ["feishu:user:ou_backup"])
+    assert res_b == (True, None, ["feishu:user:ou_alice"])
+
+
+@pytest.mark.asyncio
+async def test_report_delivery_allows_retaining_preexisting_stale_weixin_and_rejects_new_unbound() -> None:
+    """r5 #6: report_delivery pre-check permits keeping pre-existing stale WeChat DM but rejects newly added unbound IDs."""
+    from src.dalton.services import report_delivery as rd_mod
+
+    stale_wx = "weixin:user:wx_stale_old"
+    unbound_new_wx = "weixin:user:wx_foreign_new"
+    auto = {
+        "automation_id": "auto-rpt-1",
+        "user_id": "u-alice",
+        "name": "Daily Report",
+        "metadata": {
+            "report_profile": {
+                "profile": "market-digest-am",
+                "report_targets": ["feishu:user:ou_alice"],
+                "text_targets": [stale_wx],
+                "failure_targets": [],
+            }
+        },
+    }
+    get_tier_fn = create_autospec(rd_mod.get_user_tier, return_value="internal")
+    list_dm_fn = create_autospec(
+        rd_mod.list_caller_dm_identities,
+        return_value=[{"target": "feishu:user:ou_alice"}, {"target": "discord:user:112233"}],
+    )
+    list_groups_fn = create_autospec(rd_mod.list_authorized_group_bindings, return_value=[])
+
+    # Keeping pre-existing stale_wx while adding bound discord DM succeeds
+    change = await rd_mod.validate_report_profile_change(
+        "u-alice",
+        auto,
+        {
+            "profile": "market-digest-am",
+            "report_targets": ["feishu:user:ou_alice"],
+            "text_targets": [stale_wx, "discord:user:112233"],
+            "failure_targets": ["discord:user:112233"],
+        },
+        via_rest=True,
+        skip_skill_match=True,
+        get_tier_fn=get_tier_fn,
+        list_dm_identities_fn=list_dm_fn,
+        list_group_bindings_fn=list_groups_fn,
+    )
+    assert change.profile is not None
+    assert stale_wx in (change.profile.get("text_targets") or [])
+
+    # Newly adding unbound_new_wx is still rejected with dm_not_bound
+    with pytest.raises(rd_mod.ReportDeliveryError) as exc_info:
+        await rd_mod.validate_report_profile_change(
+            "u-alice",
+            auto,
+            {
+                "profile": "market-digest-am",
+                "report_targets": ["feishu:user:ou_alice"],
+                "text_targets": [stale_wx, unbound_new_wx],
+                "failure_targets": [],
+            },
+            via_rest=True,
+            skip_skill_match=True,
+            get_tier_fn=get_tier_fn,
+            list_dm_identities_fn=list_dm_fn,
+            list_group_bindings_fn=list_groups_fn,
+        )
+    assert exc_info.value.code == "dm_not_bound"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_filters_weixin_targets_fail_closed_when_active_weixin_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r5 #6: Active WeChat lookup DB error fails closed to empty set so stale WeChat never delivers."""
+    from src.server.database import pool as pool_mod
+
+    @asynccontextmanager
+    async def _failing_db():
+        raise RuntimeError("db unavailable")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(pool_mod, "get_db_connection", _failing_db)
+
+    active = await dispatch_mod.resolve_active_dalton_weixin_targets("u-alice")
+    assert active == set()
+
+    enabled_fn = create_autospec(dispatch_mod.resolve_dalton_notify_enabled, return_value=True)
+    overrides_fn = create_autospec(dispatch_mod.resolve_dalton_notify_overrides, return_value={})
+    targets_fn = create_autospec(
+        dispatch_mod.resolve_dalton_notify_targets,
+        return_value=["feishu:user:ou_alice", "weixin:user:wx_stale"],
+    )
+    routes_fn = create_autospec(
+        dispatch_mod.resolve_dalton_notify_routes,
+        return_value={"automation:id-1": ["feishu:user:ou_alice", "weixin:user:wx_stale"]},
+    )
+    admin_fn = create_autospec(dispatch_mod._default_notify_admin, return_value=False)
+
+    ok, skip_reason, effective = await evaluate_user_notify_eligibility(
+        "u-alice",
+        {"automation_id": "id-1", "name": "dalton-googl-earn-2026q1-t0"},
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        is_admin_fn=admin_fn,
+    )
+    assert (ok, skip_reason, effective) == (True, None, ["feishu:user:ou_alice"])
+
+
+@pytest.mark.asyncio
+async def test_inherent_task_id_override_toggle_off_and_on_matches_dispatch() -> None:
+    """r6 #1: Toggling automation:<id> override off yields toggle_off and toggling back on overrides False."""
+    auto = {"automation_id": "auto-earn-1", "name": "dalton-googl-earn-2026q1-t0"}
+    enabled_fn = create_autospec(dispatch_mod.resolve_dalton_notify_enabled, return_value=True)
+    targets_fn = create_autospec(
+        dispatch_mod.resolve_dalton_notify_targets,
+        return_value=["feishu:user:ou_alice"],
+    )
+    routes_fn = create_autospec(dispatch_mod.resolve_dalton_notify_routes, return_value={})
+    admin_fn = create_autospec(dispatch_mod._default_notify_admin, return_value=False)
+
+    # Page toggled off -> writes automation:auto-earn-1: False (overrides legacy name: True)
+    res_off = await evaluate_user_notify_eligibility(
+        "u-alice",
+        auto,
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=create_autospec(
+            dispatch_mod.resolve_dalton_notify_overrides,
+            return_value={
+                "automation:auto-earn-1": False,
+                "dalton-googl-earn-2026q1-t0": True,
+            },
+        ),
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        is_admin_fn=admin_fn,
+    )
+    assert res_off == (False, "toggle_off", [])
+
+    # Page toggled on -> writes automation:auto-earn-1: True (overrides legacy name: False)
+    res_on = await evaluate_user_notify_eligibility(
+        "u-alice",
+        auto,
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=create_autospec(
+            dispatch_mod.resolve_dalton_notify_overrides,
+            return_value={
+                "automation:auto-earn-1": True,
+                "dalton-googl-earn-2026q1-t0": False,
+            },
+        ),
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        is_admin_fn=admin_fn,
+    )
+    assert res_on == (True, None, ["feishu:user:ou_alice"])
+
+
+@pytest.mark.asyncio
+async def test_report_delivery_sync_route_rejects_reintroducing_unbound_weixin_and_allows_preexisting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """r6 #4: sync_report_delivery_routes_in_tx enforces same WeChat retention/binding rule as preference save."""
+    from src.dalton.services import report_delivery as rd_mod
+
+    stale_wx = "weixin:user:wx_stale_removed"
+    active_wx = "weixin:user:wx_owner_active"
+    route_key = "automation:auto-rpt-sync-1"
+    stored_prefs: dict[str, Any] = {
+        "model_preference": {
+            "dalton_notify_targets": ["feishu:user:ou_alice"],
+            "dalton_notify_routes": {route_key: ["feishu:user:ou_alice"]},
+            "dalton_notify_overrides": {route_key: True},
+        },
+        "other_preference": {},
+    }
+    upserted: list[dict[str, Any]] = []
+    _mock_locked_prefs_db(monkeypatch, stored_prefs, upserted)
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "load_bound_dm_targets",
+        create_autospec(
+            model_prefs_mod.load_bound_dm_targets,
+            return_value={"feishu:user:ou_alice", active_wx},
+        ),
+    )
+
+    def _make_change(targets: list[str]) -> rd_mod.ValidatedReportProfileChange:
+        return rd_mod.ValidatedReportProfileChange(
+            actor_user_id="u-alice",
+            caller_tier="internal",
+            owner_user_id="u-alice",
+            automation_id="auto-rpt-sync-1",
+            automation_name="Daily Report",
+            action="update",
+            before_metadata={},
+            after_metadata={},
+            profile={
+                "profile": "market-digest-am",
+                "report_targets": ["feishu:user:ou_alice"],
+                "text_targets": targets,
+                "failure_targets": [],
+            },
+            previous_groups=[],
+            new_groups=[],
+            route_targets=targets,
+        )
+
+    async with pool_mod.get_db_connection() as fake_conn:
+        # 1. Route already dropped stale_wx -> report sync cannot re-introduce unbound stale_wx
+        with pytest.raises(rd_mod.ReportDeliveryError) as exc_readd:
+            await rd_mod.sync_report_delivery_routes_in_tx(
+                fake_conn,
+                owner_user_id="u-alice",
+                automation_id="auto-rpt-sync-1",
+                change=_make_change(["feishu:user:ou_alice", stale_wx]),
+            )
+        assert exc_readd.value.code == "dm_not_bound"
+        assert upserted == []
+
+        # 2. If locked route ALREADY retains stale_wx, keeping stale_wx is allowed
+        stored_prefs["model_preference"]["dalton_notify_routes"][route_key] = [
+            "feishu:user:ou_alice",
+            stale_wx,
+        ]
+        res_keep = await rd_mod.sync_report_delivery_routes_in_tx(
+            fake_conn,
+            owner_user_id="u-alice",
+            automation_id="auto-rpt-sync-1",
+            change=_make_change(["feishu:user:ou_alice", stale_wx]),
+        )
+        assert res_keep is not None
+        assert stale_wx in stored_prefs["model_preference"]["dalton_notify_routes"][route_key]
+
+        # 3. Adding owner's active bound WeChat succeeds
+        res_active = await rd_mod.sync_report_delivery_routes_in_tx(
+            fake_conn,
+            owner_user_id="u-alice",
+            automation_id="auto-rpt-sync-1",
+            change=_make_change(["feishu:user:ou_alice", active_wx]),
+        )
+        assert res_active is not None
+        assert stored_prefs["model_preference"]["dalton_notify_routes"][route_key] == [
+            "feishu:user:ou_alice",
+            active_wx,
+        ]
