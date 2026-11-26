@@ -936,5 +936,5 @@
     "goToTeamModels": "Go to team model settings",
     "statusUnavailable": "Could not load team credentials status right now. Refresh to try again."
   },
-  "daltonAuthOnly": "This page is only available in Everflow Team Edition."
+  "daltonAuthOnly": "This page is only available in {{brand}} Team Edition."
 }

@@ -53,7 +53,8 @@ function ClaudeCodeStepInner() {
         <ClaudeCodeSheet setup={setup} tokenRows={tokenRows} onRemoveToken={setRemoving} onCover={noCover} onLeave={skipSetup} />
       )}
       {removing && <RemoveClaudeCodeTokenDialog target={removing} onClose={() => setRemoving(null)} />}
-      <ComputersDialogHost planInPlace />
+      {/* DALTON-HOOK(page-host-status-fanout): Setup has no fan-out above its host, so the host hears machines out itself */}
+      <ComputersDialogHost planInPlace statusFanout />
       <SetupFooter
         back={{ label: t('setup:back'), onClick: () => navigate('/setup/provider', { state: { list: 'oauth' } }) }}
         primary={{

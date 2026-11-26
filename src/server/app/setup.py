@@ -898,7 +898,12 @@ async def lifespan(app: FastAPI):
                 "or one sooner than 7 days; parts of an upload interrupted "
                 "mid-transfer are kept and billed without one, and a Drive file "
                 "sent in parts may stay open up to 6 days before one aborts it. "
-                "Add an AbortIncompleteMultipartUpload lifecycle rule of at least 7 days."
+                "Add an AbortIncompleteMultipartUpload lifecycle rule of at least 7 days. "
+                # DALTON-HOOK(drive-guidance): MinIO has no such rule; say what stands in for it
+                "On MinIO the equivalent is its stale_uploads_expiry setting "
+                "(MINIO_API_STALE_UPLOADS_EXPIRY, 24h by default), set to 7 days or longer "
+                "before turning the Drive on; MinIO keeps that setting to itself, so this "
+                "warning appears there either way."
             )
     except Exception as e:
         logger.info(f"Skipped the multipart cleanup rule check: {e!r}")

@@ -1,8 +1,12 @@
 # The Drive
 
-The Drive feature is currently feature-gated. A user turns it on among the experiments in their settings.
+<!-- DALTON-HOOK(drive-guidance): the administrator's deployment switch comes first; while it is off the user's own switch is hidden too -->
+The Drive is switched on in two steps: the deployment's, which the administrator sets, then the user's own.
 
-It is on for you when your prompt has a `<drive_system>` section. Without one, or in a shared workspace, a call naming `.agents/drive` is refused as not available. Tell the user where to turn it on, and keep the file in the workspace until they do.
+1. The deployment's switch is `features.drive.enabled` in the server's `config.yaml`. While it is off the Drive stays hidden for everyone, its page, its row among the experiments and its routes alike, so a user who wants the Drive asks their administrator to turn it on.
+2. With the deployment's switch on, each user turns the Drive on for themselves under Settings → Experiments. A deployment that keeps Experiments out of Settings leaves this switch with the administrator as well.
+
+It is on for you when your prompt has a `<drive_system>` section. Outside one, or in a shared workspace, a call naming `.agents/drive` comes back as not available. Then tell the user the two steps above, and keep the file in the workspace until they have turned the Drive on.
 
 ## What it is
 

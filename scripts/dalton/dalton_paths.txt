@@ -635,3 +635,7 @@ web/src/pages/ChatAgent/components/__tests__/ChatView.channelDeepLinks.test.tsx
 web/src/pages/Settings/utils/priceSource.ts
 web/src/pages/Settings/utils/__tests__/priceSource.test.ts
 web/src/components/ui/__tests__/chat-input.priceSource.dalton.test.tsx
+# Frontend fix bundle 4: where focus lands when the New workspace dialog closes (DALTON-HOOK(dialog-focus-return)),
+# and a machine that finishes preparing while Settings is open (DALTON-HOOK(page-host-status-fanout)).
+web/src/pages/ChatAgent/components/__tests__/CreateWorkspaceModal.focusReturn.test.tsx
+web/src/pages/Settings/__tests__/Settings.computerReady.test.tsx

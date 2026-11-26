@@ -3107,6 +3107,10 @@ async def test_http_retry_and_pending_input_retry_routes_preserve_system_only_to
         assert workflow_run_metas[-1] is not None
         assert "llm_model_system_only" not in workflow_run_metas[-1]
         assert workflow_run_metas[-1]["automation_source_execution_id"] == EXEC_ID
+        # The run record carries the snapshot's effort beside the link to its
+        # execution, as test_automation_effort_inheritance.py reads them.
+        assert workflow_run_metas[-1]["automation_reasoning_effort_configured"] is True
+        assert workflow_run_metas[-1]["automation_reasoning_effort"] == "medium"
 
         # (2) Pending-input /retry (failed before graph checkpoint -> input_rerun_request)
         monkeypatch.setattr(
@@ -3144,6 +3148,9 @@ async def test_http_retry_and_pending_input_retry_routes_preserve_system_only_to
         assert workflow_run_metas[-1] is not None
         assert "llm_model_system_only" not in workflow_run_metas[-1]
         assert workflow_run_metas[-1]["automation_source_execution_id"] == EXEC_ID
+        # A rerun of the input writes the same three markers as the checkpoint retry above.
+        assert workflow_run_metas[-1]["automation_reasoning_effort_configured"] is True
+        assert workflow_run_metas[-1]["automation_reasoning_effort"] == "medium"
 
 
 @pytest.mark.asyncio

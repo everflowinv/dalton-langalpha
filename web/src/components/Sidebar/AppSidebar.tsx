@@ -365,7 +365,7 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
         <div className="sidebar-section-actions">
           <button
             className="nav-panel-dismiss-btn sidebar-section-action-btn"
-            onClick={() => openCreateWorkspace?.()}
+            onClick={(e) => openCreateWorkspace?.(e.currentTarget)} // DALTON-HOOK(dialog-focus-return): focus comes back to this button
             aria-label={t('workspace.newWorkspace')}
             title={t('workspace.newWorkspace')}
           >

@@ -13,13 +13,19 @@ Covers:
 5. Standalone Core ``scripts/standalone/minio_init.py`` skips unsupported
    lifecycle writes, preserves bucket policy error semantics, and deduplicates
    buckets by ``(endpoint, bucket)``.
+6. The guidance an operator and a user read: ``langalpha-doc``'s Drive
+   reference names the administrator's deployment switch before the user's
+   own, and the multipart-cleanup startup warning says what to set on MinIO,
+   whose lifecycle API has no rule to add.
 """
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import importlib.util
 import logging
+import re
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -61,6 +67,10 @@ from src.server.services.livefs import outcomes as livefs_outcomes
 from src.server.services.livefs.tokens import LivefsIdentity
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+LANGALPHA_DOC_DRIVE = (
+    REPO_ROOT / "plugins" / "langalpha_service" / "skills" / "langalpha-doc" / "references" / "drive.md"
+)
+SETUP_PY_PATH = REPO_ROOT / "src" / "server" / "app" / "setup.py"
 OWNER = "owner-user-1"
 COLLEAGUE = "colleague-user-2"
 COMPUTER = "11111111-1111-1111-1111-111111111111"
@@ -698,3 +708,50 @@ def test_minio_init_dedups_asr_bucket_by_endpoint_and_bucket_name(monkeypatch):
         call.kwargs["Bucket"] for call in fake_s3_same.delete_bucket_policy.call_args_list
     ]
     assert cleared_same == ["chat-uploads", "shared-media"]
+
+
+def test_langalpha_doc_drive_guide_leads_with_the_administrators_switch():
+    """While ``features.drive.enabled`` is off the Experiments row is hidden too, so
+    a user sent straight to Experiments looks for a setting that is not there. The
+    reference names the administrator's switch first and the user's own second."""
+    # The prose the agent reads: without the hook marker standing over it.
+    source = LANGALPHA_DOC_DRIVE.read_text(encoding="utf-8")
+    intro = re.sub(r"<!--.*?-->", "", source, flags=re.DOTALL).split("## What it is")[0]
+
+    # The switch that hides the other one, by the key the administrator sets.
+    assert "features.drive.enabled" in intro
+    deployment_at = intro.index("features.drive.enabled")
+    assert "administrator" in intro[: deployment_at + 200]
+
+    # Then where the user's own switch is, once the deployment's is on.
+    users_at = intro.index("Experiments")
+    assert deployment_at < users_at
+
+    # The sentence that made the user's switch sound like the only one.
+    assert "A user turns it on among the experiments in their settings." not in intro
+
+
+def test_multipart_cleanup_warning_says_what_to_set_on_minio():
+    """MinIO's lifecycle API serves no ``AbortIncompleteMultipartUpload`` rule, so
+    against it the rule check is ``False`` at every startup and the warning is all
+    an operator gets: it has to name MinIO's own setting beside the S3 and R2 rule."""
+    tree = ast.parse(SETUP_PY_PATH.read_text(encoding="utf-8"))
+    messages = [
+        node.args[0].value
+        for node in ast.walk(tree)
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "warning"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and "Storage bucket has no rule expiring incomplete multipart uploads" in node.args[0].value
+        )
+    ]
+    assert len(messages) == 1, messages
+    message = messages[0]
+
+    assert "AbortIncompleteMultipartUpload" in message
+    assert "stale_uploads_expiry" in message
+    assert "MINIO_API_STALE_UPLOADS_EXPIRY" in message
