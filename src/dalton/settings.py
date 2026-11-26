@@ -658,6 +658,10 @@ def is_problem_reports_enabled() -> bool:
 
 def is_coverage_units_enabled() -> bool:
     """Whether the coverage-unit registry (`dalton_coverage_units`, d023) takes part in identity resolution."""
+    from src.dalton.capabilities import CapabilityId, has_capability
+
+    if not has_capability(CapabilityId.COLLEAGUE_SHARING):
+        return False
     env_flag = os.getenv("DALTON_COVERAGE_UNITS_ENABLED")
     if env_flag is not None:
         return env_flag.strip().lower() in ("1", "true", "yes")

@@ -94,10 +94,10 @@ async def latest_version(workspace_id: str, doc_key: str) -> dict[str, Any] | No
 
 
 async def latest_valid_version(
-    workspace_id: str, doc_key: str
+    workspace_id: str, doc_key: str, *, conn: Any = None
 ) -> dict[str, Any] | None:
     """Return the latest ``schema_valid=TRUE`` version row for rendering and preflight."""
-    async with get_db_connection() as conn:
+    async with get_db_connection(conn) as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""

@@ -1015,6 +1015,7 @@ BACKGROUND_LOOP_REGISTRY: Mapping[str, CapabilityId | None] = MappingProxyType(
         "dalton-data-task-scheduler": CapabilityId.DATA_JOBS,
         "dalton-chat-upload-cleanup": CORE_CAPABILITY,
         "dalton-team-model-catalog-follow": CORE_CAPABILITY,
+        "dalton-startup-watchlist-reconcile": CORE_CAPABILITY,
         # Filtered by filter_reconnectable_builtin_mcp (skips disabled servers like researchdata)
         "mcp-builtin-reconnect": CORE_CAPABILITY,
         # Upstream core platform background tasks & services
@@ -1276,6 +1277,13 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("chat_uploads.py", "download_sandbox_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "get_chat_upload_endpoint"): CORE_CAPABILITY,
         ("chat_uploads.py", "cancel_chat_upload_endpoint"): CORE_CAPABILITY,
+        # --- watchlist.py (Personal Watchlist three-tier & outbox reconciler) ---
+        ("watchlist.py", "get_watchlist_endpoint"): CORE_CAPABILITY,
+        ("watchlist.py", "get_watchlist_metrics_endpoint"): CORE_CAPABILITY,
+        ("watchlist.py", "get_watchlist_tier_policies_endpoint"): CORE_CAPABILITY,
+        ("watchlist.py", "preview_watchlist_mutation_endpoint"): CORE_CAPABILITY,
+        ("watchlist.py", "mutate_watchlist_endpoint"): CORE_CAPABILITY,
+        ("watchlist.py", "reconcile_watchlist_endpoint"): CORE_CAPABILITY,
         # --- research_host/app.py (standalone research-host service) ---
         ("research_host/app.py", "healthz"): CORE_CAPABILITY,
         ("research_host/app.py", "get_drain"): CORE_CAPABILITY,

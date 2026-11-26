@@ -638,6 +638,13 @@ web/src/pages/ChatAgent/components/__tests__/ChatView.channelDeepLinks.test.tsx
 web/src/pages/Settings/utils/priceSource.ts
 web/src/pages/Settings/utils/__tests__/priceSource.test.ts
 web/src/components/ui/__tests__/chat-input.priceSource.dalton.test.tsx
+# Personal Watchlist Batch 1: Dalton-owned watchlist pages, hooks, confirmation card, and tests (DALTON-HOOK(watchlist)).
+web/src/pages/MarketView/components/watchlist/
+web/src/pages/MarketView/__tests__/MarketView.watchlist.test.tsx
+web/src/pages/Dashboard/hooks/useCoverageWatchlistData.ts
+web/src/pages/Dashboard/widgets/definitions/__tests__/PortfolioWatchlistWidget.coverage.test.tsx
+web/src/pages/ChatAgent/components/WatchlistConfirmCard.tsx
+web/src/pages/ChatAgent/session/interrupts/__tests__/watchlistConfirmCard.test.tsx
 # AD5 + Bundle 2: server-side report delivery confirmation and workspace create/dedup tests.
 tests/unit/server/test_workspace_bundle2.py
 web/src/pages/Automations/__tests__/Automations.reportDeliveryConfirm.test.tsx

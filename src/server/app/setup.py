@@ -256,6 +256,8 @@ _dalton_data_task_scheduler_task: asyncio.Task | None = None
 _dalton_chat_upload_cleanup_task: asyncio.Task | None = None
 # DALTON-HOOK(team-model-catalog): hold strong reference to catalog prewarm follower task
 _dalton_team_catalog_follow_task: asyncio.Task | None = None
+# DALTON-HOOK(watchlist): hold strong reference to one-shot startup outbox reconcile scan
+_dalton_watchlist_reconcile_startup_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
@@ -272,7 +274,8 @@ async def lifespan(app: FastAPI):
         _dalton_transcription_reconcile_task, \
         _dalton_data_task_scheduler_task, \
         _dalton_chat_upload_cleanup_task, \
-        _dalton_team_catalog_follow_task
+        _dalton_team_catalog_follow_task, \
+        _dalton_watchlist_reconcile_startup_task
 
     # Configure logging based on environment settings (first thing on startup)
     configure_logging()
@@ -968,6 +971,16 @@ async def lifespan(app: FastAPI):
             name="dalton-startup-data-source-health",
         )
 
+    # DALTON-HOOK(watchlist): one-shot startup scan to drain unfinished watchlist outbox jobs
+    from src.dalton.settings import is_dalton_enabled
+    from src.dalton.watchlist.reconciler import run_startup_reconcile_scan
+
+    if is_dalton_enabled():
+        _dalton_watchlist_reconcile_startup_task = asyncio.create_task(
+            run_startup_reconcile_scan(),
+            name="dalton-startup-watchlist-reconcile",
+        )
+
     # DALTON-HOOK(transcriptions-reconcile): start 5-minute background reconciliation loop when Dalton & ASR reconciliation are enabled
     from src.dalton.services.transcriptions import (
         is_transcription_reconciliation_enabled,
@@ -1058,6 +1071,11 @@ async def lifespan(app: FastAPI):
         _dalton_health_startup_task.cancel()
         await asyncio.gather(_dalton_health_startup_task, return_exceptions=True)
         _dalton_health_startup_task = None
+    # DALTON-HOOK(watchlist): cancel startup watchlist reconcile scan on shutdown if still running
+    if _dalton_watchlist_reconcile_startup_task is not None:
+        _dalton_watchlist_reconcile_startup_task.cancel()
+        await asyncio.gather(_dalton_watchlist_reconcile_startup_task, return_exceptions=True)
+        _dalton_watchlist_reconcile_startup_task = None
     # DALTON-HOOK(transcriptions-reconcile): cancel periodic ASR reconciliation task on shutdown
     if _dalton_transcription_reconcile_task is not None:
         _dalton_transcription_reconcile_task.cancel()

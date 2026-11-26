@@ -169,6 +169,13 @@ def validate_automation_name(name: str, ticker: str | None = None) -> tuple[bool
     return True, None
 
 
+def _format_move_pct_label(pct: float) -> str:
+    val = float(pct)
+    if val.is_integer():
+        return str(int(val))
+    return f"{val:g}"
+
+
 def build_company_watch_specs(
     *,
     ticker: str,
@@ -176,14 +183,42 @@ def build_company_watch_specs(
     tier: str = "Core",
     timezone_name: str | None = None,
     unit_id: str | None = None,
+    policy: Mapping[str, Any] | Any | None = None,
+    is_private: bool = False,
 ) -> list[dict[str, Any]]:
-    """Return the standard automation definitions for a covered company (PK.15 / A13)."""
+    """Return the standard automation definitions for a covered company (PK.15 / A13).
+
+    ``radar`` and any unknown tier default to an all-disabled policy (empty list
+    ``[]``), and unlisted private companies (``is_private=True``) also return
+    ``[]``. When an explicit ``policy`` is supplied, only tasks enabled by that
+    policy are built using its cron/timezone/threshold parameters.
+    """
+    if is_private:
+        return []
+
+    from src.dalton.watchlist.policies import (
+        TierPolicy,
+        get_default_tier_policy,
+        policy_from_mapping,
+    )
+
+    norm_tier = str(tier or "").strip().lower()
+    if isinstance(policy, TierPolicy):
+        eff_policy = policy
+    elif isinstance(policy, Mapping):
+        eff_policy = policy_from_mapping(norm_tier, policy)
+    else:
+        eff_policy = get_default_tier_policy(norm_tier)
+
     t_upper = ticker.upper()
     t_lower = ticker.lower()
     is_cnhk = t_upper.endswith((".HK", ".SS", ".SZ", ".SH"))
     tz = timezone_name or ("Asia/Shanghai" if is_cnhk else "America/New_York")
-    watch_cron = "*/30 6-20 * * 1-5" if tier.lower() == "core" else "30 7 * * 1-5"
-    delta_cron, delta_tz = resolve_delta_schedule(tier)
+    watch_cron = eff_policy.watch_cron
+    delta_cron = eff_policy.delta_cron
+    delta_tz = eff_policy.delta_timezone or DELTA_TIMEZONE
+    move_pct = float(eff_policy.move_threshold_pct)
+    move_pct_label = _format_move_pct_label(move_pct)
     clean_unit_id = str(unit_id or "").strip()
 
     def _with_unit(meta: dict[str, Any]) -> dict[str, Any]:
@@ -191,120 +226,131 @@ def build_company_watch_specs(
             meta["unit_id"] = clean_unit_id
         return meta
 
-    return [
-        {
-            "name": f"dalton-{t_lower}-watch",
-            "description": f"{t_upper} 日常信号巡检（零 token 预检通过后唤醒分析师）",
-            "trigger_type": "cron",
-            "cron_expression": watch_cron,
-            "timezone": tz,
-            "workspace_id": workspace_id,
-            "thread_strategy": "new",
-            "instruction": (
-                f"请阅读本轮 `<dalton_wake>` 中的触发信号，使用 `.agents/skills/dalton-agenda/SKILL.md` 与相关分析技能处理 {t_upper} 的最新事项，"
-                "更新公司知识层并在收盘前写入 `knowledge_append_verdict`。"
-            ),
-            "metadata": _with_unit(
-                {
-                    "dalton_managed": True,
-                    "dalton_kind": "company_watch",
-                    "ticker": t_upper,
-                    "tier": tier,
-                }
-            ),
-        },
-        {
-            "name": f"dalton-{t_lower}-delta",
-            "description": f"{t_upper} 盘后 Thesis Delta 复盘",
-            "trigger_type": "cron",
-            "cron_expression": delta_cron,
-            "timezone": delta_tz,
-            "workspace_id": workspace_id,
-            "thread_strategy": "new",
-            "instruction": (
-                f"请按 `.agents/skills/dalton-thesis-delta/SKILL.md` 对 {t_upper} 最新证据、预期变化与催化剂进展做复盘，"
-                "必要时更新 `thesis` / `debate` / `agenda` 并追加一条 `knowledge_append_verdict`。"
-            ),
-            "metadata": _with_unit(
-                {
-                    "dalton_managed": True,
-                    "dalton_kind": "weekly_delta",
-                    "ticker": t_upper,
-                    "tier": tier,
-                }
-            ),
-        },
-        {
-            "name": f"dalton-{t_lower}-move-up",
-            "description": f"{t_upper} 单日涨幅 ≥ 4% 异动归因",
-            "trigger_type": "price",
-            "timezone": tz,
-            "workspace_id": workspace_id,
-            "thread_strategy": "new",
-            "trigger_config": {
-                "symbol": t_upper,
-                "market": "stock",
-                "conditions": [
+    specs: list[dict[str, Any]] = []
+    if eff_policy.watch_enabled:
+        specs.append(
+            {
+                "name": f"dalton-{t_lower}-watch",
+                "description": f"{t_upper} 日常信号巡检（零 token 预检通过后唤醒分析师）",
+                "trigger_type": "cron",
+                "cron_expression": watch_cron,
+                "timezone": tz,
+                "workspace_id": workspace_id,
+                "thread_strategy": "new",
+                "instruction": (
+                    f"请阅读本轮 `<dalton_wake>` 中的触发信号，使用 `.agents/skills/dalton-agenda/SKILL.md` 与相关分析技能处理 {t_upper} 的最新事项，"
+                    "更新公司知识层并在收盘前写入 `knowledge_append_verdict`。"
+                ),
+                "metadata": _with_unit(
                     {
-                        "type": "pct_change_above",
-                        "value": 4.0,
-                        "reference": "previous_close",
+                        "dalton_managed": True,
+                        "dalton_kind": "company_watch",
+                        "ticker": t_upper,
+                        "tier": tier,
                     }
-                ],
-                "retrigger": {
-                    "mode": "recurring",
-                    "cooldown_seconds": 86400,
-                },
-            },
-            "instruction": (
-                f"{t_upper} 日内涨幅达到或超过 +4%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 第一步先用 `WebSearch` 与 `x_search` 搜最新新闻和 X（当天与前一天）拿到“今天发生了什么”，再去查基本面、卖方预期与同行联动原因，"
-                "并追加 `knowledge_append_verdict`。"
-            ),
-            "metadata": _with_unit(
-                {
-                    "dalton_managed": True,
-                    "dalton_kind": "price_move",
-                    "ticker": t_upper,
-                    "direction": "up",
-                }
-            ),
-        },
-        {
-            "name": f"dalton-{t_lower}-move-down",
-            "description": f"{t_upper} 单日跌幅 ≥ 4% 异动归因",
-            "trigger_type": "price",
-            "timezone": tz,
-            "workspace_id": workspace_id,
-            "thread_strategy": "new",
-            "trigger_config": {
-                "symbol": t_upper,
-                "market": "stock",
-                "conditions": [
+                ),
+            }
+        )
+    if eff_policy.delta_enabled:
+        specs.append(
+            {
+                "name": f"dalton-{t_lower}-delta",
+                "description": f"{t_upper} 盘后 Thesis Delta 复盘",
+                "trigger_type": "cron",
+                "cron_expression": delta_cron,
+                "timezone": delta_tz,
+                "workspace_id": workspace_id,
+                "thread_strategy": "new",
+                "instruction": (
+                    f"请按 `.agents/skills/dalton-thesis-delta/SKILL.md` 对 {t_upper} 最新证据、预期变化与催化剂进展做复盘，"
+                    "必要时更新 `thesis` / `debate` / `agenda` 并追加一条 `knowledge_append_verdict`。"
+                ),
+                "metadata": _with_unit(
                     {
-                        "type": "pct_change_below",
-                        "value": 4.0,
-                        "reference": "previous_close",
+                        "dalton_managed": True,
+                        "dalton_kind": "weekly_delta",
+                        "ticker": t_upper,
+                        "tier": tier,
                     }
-                ],
-                "retrigger": {
-                    "mode": "recurring",
-                    "cooldown_seconds": 86400,
-                },
-            },
-            "instruction": (
-                f"{t_upper} 日内跌幅达到或超过 -4%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 第一步先用 `WebSearch` 与 `x_search` 搜最新新闻和 X（当天与前一天）拿到“今天发生了什么”，再去查基本面、卖方预期与同行联动原因，"
-                "并追加 `knowledge_append_verdict`。"
-            ),
-            "metadata": _with_unit(
+                ),
+            }
+        )
+    if eff_policy.move_enabled:
+        specs.extend(
+            [
                 {
-                    "dalton_managed": True,
-                    "dalton_kind": "price_move",
-                    "ticker": t_upper,
-                    "direction": "down",
-                }
-            ),
-        },
-    ]
+                    "name": f"dalton-{t_lower}-move-up",
+                    "description": f"{t_upper} 单日涨幅 ≥ {move_pct_label}% 异动归因",
+                    "trigger_type": "price",
+                    "timezone": tz,
+                    "workspace_id": workspace_id,
+                    "thread_strategy": "new",
+                    "trigger_config": {
+                        "symbol": t_upper,
+                        "market": "stock",
+                        "conditions": [
+                            {
+                                "type": "pct_change_above",
+                                "value": move_pct,
+                                "reference": "previous_close",
+                            }
+                        ],
+                        "retrigger": {
+                            "mode": "recurring",
+                            "cooldown_seconds": 86400,
+                        },
+                    },
+                    "instruction": (
+                        f"{t_upper} 日内涨幅达到或超过 +{move_pct_label}%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 第一步先用 `WebSearch` 与 `x_search` 搜最新新闻和 X（当天与前一天）拿到“今天发生了什么”，再去查基本面、卖方预期与同行联动原因，"
+                        "并追加 `knowledge_append_verdict`。"
+                    ),
+                    "metadata": _with_unit(
+                        {
+                            "dalton_managed": True,
+                            "dalton_kind": "price_move",
+                            "ticker": t_upper,
+                            "direction": "up",
+                        }
+                    ),
+                },
+                {
+                    "name": f"dalton-{t_lower}-move-down",
+                    "description": f"{t_upper} 单日跌幅 ≥ {move_pct_label}% 异动归因",
+                    "trigger_type": "price",
+                    "timezone": tz,
+                    "workspace_id": workspace_id,
+                    "thread_strategy": "new",
+                    "trigger_config": {
+                        "symbol": t_upper,
+                        "market": "stock",
+                        "conditions": [
+                            {
+                                "type": "pct_change_below",
+                                "value": move_pct,
+                                "reference": "previous_close",
+                            }
+                        ],
+                        "retrigger": {
+                            "mode": "recurring",
+                            "cooldown_seconds": 86400,
+                        },
+                    },
+                    "instruction": (
+                        f"{t_upper} 日内跌幅达到或超过 -{move_pct_label}%。请按 `.agents/skills/dalton-stock-move/SKILL.md` 第一步先用 `WebSearch` 与 `x_search` 搜最新新闻和 X（当天与前一天）拿到“今天发生了什么”，再去查基本面、卖方预期与同行联动原因，"
+                        "并追加 `knowledge_append_verdict`。"
+                    ),
+                    "metadata": _with_unit(
+                        {
+                            "dalton_managed": True,
+                            "dalton_kind": "price_move",
+                            "ticker": t_upper,
+                            "direction": "down",
+                        }
+                    ),
+                },
+            ]
+        )
+    return specs
 
 
 def build_sector_watch_specs(
@@ -1662,6 +1708,29 @@ async def schedule_dalton_automation_helper(
                         "message": "只有 PM 用户可以修改或启停 Home 全局任务。",
                     }
 
+        if resolved_action in ("upsert", "resume") and not is_home_target:
+            from src.dalton.watchlist.pause_guards import (
+                extract_automation_ticker,
+                validate_earnings_stage_allowed_for_user,
+            )
+
+            earn_target_name = str(
+                (existing.get("name") if isinstance(existing, Mapping) and existing.get("name") else None)
+                or resolved_name
+            )
+            earn_target_ticker = (
+                extract_automation_ticker(existing)
+                or (str(resolved_ticker) if resolved_ticker else None)
+            )
+            earn_guard_err = await validate_earnings_stage_allowed_for_user(
+                task_owner,
+                earn_target_name,
+                ticker=earn_target_ticker,
+                conn=active_conn,
+            )
+            if earn_guard_err is not None:
+                return earn_guard_err
+
         if resolved_action in ("pause", "resume"):
             if not existing:
                 return {"ok": False, "error": f"未找到任务 `{resolved_name}`"}
@@ -1689,10 +1758,12 @@ async def schedule_dalton_automation_helper(
                     if isinstance(existing_meta, Mapping) and (
                         "handoff_paused_reason" in existing_meta
                         or "paused_by_user" in existing_meta
+                        or "paused_by_policy" in existing_meta
                     ):
                         cleaned_meta = dict(existing_meta)
                         cleaned_meta.pop("handoff_paused_reason", None)
                         cleaned_meta.pop("paused_by_user", None)
+                        cleaned_meta.pop("paused_by_policy", None)
                         update_fields["metadata"] = cleaned_meta
             except AutomationRefusal as exc:
                 return {
@@ -1784,6 +1855,18 @@ async def schedule_dalton_automation_helper(
                     apply_locked_pause_schedule(locked_view, effective_kwargs)
                 else:
                     apply_locked_resume_schedule(locked_view, effective_kwargs)
+                    if not locked_is_home:
+                        from src.dalton.watchlist.pause_guards import (
+                            assert_locked_earnings_resume_allowed,
+                        )
+
+                        await assert_locked_earnings_resume_allowed(
+                            task_owner,
+                            locked_view,
+                            effective_kwargs,
+                            conn=_locked_conn,
+                            ticker=str(resolved_ticker) if resolved_ticker else None,
+                        )
                     locked_meta = locked_view.get("metadata")
                     if isinstance(locked_meta, Mapping) and (
                         "handoff_paused_reason" in locked_meta

@@ -3304,6 +3304,7 @@ def _load_coverage_roster(
         is_live = bool(raw_held) or sec == "Live Position"
         is_core = tier == "core"
         is_watch = tier == "watch"
+        is_radar = tier == "radar"
         search_names = [x.strip() for x in (raw_sn or []) if x.strip()]
         adr = (raw_adr or "").strip().upper()
         match_tickers = {t, t.replace("-", ".")}
@@ -3318,6 +3319,7 @@ def _load_coverage_roster(
             "is_live_position": is_live,
             "is_core_coverage": is_core,
             "is_watch": is_watch,
+            "is_radar": is_radar,
             "search_names": search_names,
         })
     return roster, str(cov_file), None

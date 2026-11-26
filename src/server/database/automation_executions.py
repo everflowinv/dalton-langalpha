@@ -994,6 +994,7 @@ async def list_executions(
     offset: int = 0,
     scope: Optional[str] = None,
     computer_id: Optional[str] = None,  # DALTON-HOOK(history-computer-scope)
+    conn: Any = None,  # DALTON-HOOK(watchlist)
 ) -> tuple[List[Dict[str, Any]], bool]:
     """A page of a user's executions newest first, narrowed to one
     automation, thread, status or wait reason when given, and whether more
@@ -1048,7 +1049,8 @@ async def list_executions(
     # DALTON-HOOK(history-computer-scope): verify thread workspace ownership on join and split computer-scoped branches
     thread_join = owned_execution_thread_join_sql("e", "a", "t")
 
-    async with get_db_connection() as conn:
+    # DALTON-HOOK(watchlist): reuse caller's transaction/lock connection when supplied
+    async with (get_db_connection(conn) if conn is not None else get_db_connection()) as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             if computer_id is None:
                 await cur.execute(f"""

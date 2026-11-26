@@ -8,6 +8,10 @@
 import type { AssistantMessage } from '@/types/chat';
 import { updateMessage } from '../../hooks/utils/messageHelpers';
 import { setCardStatus } from './buckets';
+import {
+  isWatchlistInterruptType,
+  projectLiveWatchlistInterrupt,
+} from '@/lib/dalton/watchlistInterrupts'; // DALTON-HOOK(watchlist)
 import { buildCreditPauseState } from './creditPauseCard';
 import { isToolApprovalInterrupt, toolApprovalCards } from './toolApprovalCard';
 import type { PendingInterrupt, SSEEvent, StreamProcessorRefs } from '../types';
@@ -254,6 +258,10 @@ export function projectLiveInterrupt(
       });
     }
     // --- DALTON-HOOK(cos-settings-tools): end ---
+  // DALTON-HOOK(watchlist): project live personal watchlist confirmation interrupt via Dalton helper
+  } else if (isWatchlistInterruptType(actionType)) {
+    const order = eventOrder(event, () => ++refs.contentOrderCounterRef.current);
+    projectLiveWatchlistInterrupt({ actionType, interruptId: event.interrupt_id, proposalData: actionRequests[0] as Record<string, unknown>, assistantMessageId, order, interruptAlreadyRendered, setMessages: rt.setMessages, updateMessage, setCardStatus, appendCardSegment, arm });
   } else if (actionType === 'credit_pause') {
     // --- Credit pause interrupt ---
     const proposalId = event.interrupt_id!;

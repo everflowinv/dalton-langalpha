@@ -5,7 +5,7 @@ card before `POST /api/v1/automations` or `PATCH /api/v1/automations/{id}` saves
 a `metadata.report_profile` containing group/channel targets or non-caller DM targets.
 
 Revision ID: d057
-Revises: d055
+Revises: d056
 Create Date: 2026-11-26
 """
 
@@ -16,7 +16,7 @@ from collections.abc import Sequence
 from alembic import op
 
 revision: str = "d057"
-down_revision: str | None = "d055"
+down_revision: str | None = "d056"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

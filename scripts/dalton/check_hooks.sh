@@ -88,6 +88,8 @@ ALLOWED_HOOKS=(
   "dalton-patch-tool-calls"
   "fake-ip-allow"
   "coverage-tracking"
+  # Personal Watchlist: three-tier confirmation snapshots, checkpoint resume checks, and UI hooks
+  "watchlist"
   # LaneC: sector-layer visualization — the sidebar coverage tree, the
   # workspace-row sector/member chips, and the gallery affiliation bar all
   # read the coverage-units listing (lib/dalton/coverage.ts derivation).

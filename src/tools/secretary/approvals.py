@@ -529,6 +529,100 @@ async def build_archive_workspace_snapshot(
 # --- DALTON-HOOK(cos-settings-tools): end ---
 
 
+# --- DALTON-HOOK(watchlist): begin ---
+_WATCHLIST_CONFIRMABLE_ACTIONS: frozenset[str] = frozenset(
+    {
+        "add",
+        "set_tier",
+        "remove",
+        "add_group",
+        "remove_group",
+        "set_tier_policy",
+        "reset_tier_policy",
+    }
+)
+
+
+async def build_watchlist_confirmation_snapshot(
+    user_id: str, call: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Build and freeze the read-only confirmation snapshot for ``dalton_coverage``.
+
+    Runs once in ``StandingApprovalMiddleware.aafter_model`` before the tool
+    runs or pauses on ``interrupt()``. Returns ``None`` when the proposed call
+    is exempt from confirmation (e.g. ``add`` of ≤5 net-new tickers).
+    """
+    from src.dalton.coverage.service import CoverageDataSourceError
+    from src.dalton.watchlist.service import WatchlistMutationService
+
+    args = call.get("args")
+    if not isinstance(args, dict):
+        return None
+    raw_action = str(args.get("action") or "").strip().lower()
+    if raw_action not in _WATCHLIST_CONFIRMABLE_ACTIONS:
+        return None
+    call_id = str(call.get("id") or "")
+
+    try:
+        preview = await WatchlistMutationService().preview_mutation(
+            user_id,
+            action=raw_action,
+            tickers=args.get("tickers"),
+            tier=args.get("tier"),
+            label=args.get("label"),
+            criteria=args.get("criteria") if isinstance(args.get("criteria"), dict) else None,
+            default_tier=args.get("default_tier"),
+            auto_refresh=bool(args.get("auto_refresh", True)),
+            group_id=args.get("group_id"),
+            tags=args.get("tags") if isinstance(args.get("tags"), list) else None,
+            override_user_pause=bool(args.get("override_user_pause", False)),
+            tool_call_id=call_id,
+        )
+    except CoverageDataSourceError as exc:
+        return {
+            "action": None,
+            "raw_action": raw_action,
+            "tool_call_id": call_id,
+            "owner_user_id": str(user_id),
+            "requires_confirmation": False,
+            "precheck_error": str(exc),
+            "precheck_error_code": "MarketDataUnavailable",
+            "precheck_error_payload": exc.to_dict(),
+        }
+    except ValueError as exc:
+        return {
+            "action": None,
+            "raw_action": raw_action,
+            "tool_call_id": call_id,
+            "owner_user_id": str(user_id),
+            "requires_confirmation": False,
+            "precheck_error": str(exc),
+            "precheck_error_code": "invalid_arguments",
+        }
+    except Exception as exc:
+        logger.warning(
+            "watchlist_snapshot_preview_failed action=%s exc_type=%s",
+            raw_action,
+            type(exc).__name__,
+        )
+        return {
+            "action": None,
+            "raw_action": raw_action,
+            "tool_call_id": call_id,
+            "owner_user_id": str(user_id),
+            "requires_confirmation": False,
+            "precheck_error": "预览观察名单变更失败，请稍后重试。",
+            "precheck_error_code": "watchlist_preview_failed",
+        }
+
+    if preview.get("precheck_error"):
+        return preview
+    if not preview.get("requires_confirmation"):
+        return None
+    return preview
+# --- DALTON-HOOK(watchlist): end ---
+
+
 async def _standing_create_withheld(user_id: str, call: dict[str, Any]) -> bool:
     """Whether a workspace create approved in advance must still ask.
 
@@ -635,7 +729,17 @@ class StandingApprovalMiddleware(AgentMiddleware):
             for call in calls
             if _is_archive_workspace_call(call) and call.get("id")
         }
-        if not wanted and not archive_calls:
+        # DALTON-HOOK(watchlist): collect confirmable dalton_coverage calls for snapshot freezing
+        watchlist_calls = {
+            call["id"]: call
+            for call in calls
+            if call.get("name") == "dalton_coverage"
+            and isinstance(call.get("args"), dict)
+            and str(call["args"].get("action") or "").strip().lower()
+            in _WATCHLIST_CONFIRMABLE_ACTIONS
+            and call.get("id")
+        }
+        if not wanted and not archive_calls and not watchlist_calls:
             return None
         granted = await _granted(self._user_id) if wanted else set()
         # DALTON-HOOK(workspace-duplicate-guard): the duplicate check reads the proposed call
@@ -672,10 +776,22 @@ class StandingApprovalMiddleware(AgentMiddleware):
             )
             if snapshot is not None:
                 approval_snapshots[call_id] = snapshot
-        update: dict[str, Any] = {"preapproved_calls": preapproved_calls}
+        # DALTON-HOOK(watchlist): freeze confirmation snapshots for personal watchlist mutations
+        for call_id, call in watchlist_calls.items():
+            prev_snap = existing_snapshots.get(call_id)
+            snapshot = (
+                dict(prev_snap)
+                if isinstance(prev_snap, dict)
+                else await build_watchlist_confirmation_snapshot(self._user_id, call)
+            )
+            if snapshot is not None:
+                approval_snapshots[call_id] = snapshot
+        update: dict[str, Any] = {}
+        if wanted or archive_calls:
+            update["preapproved_calls"] = preapproved_calls
         if approval_snapshots:
             update["approval_snapshots"] = approval_snapshots
-        return update
+        return update or None
         # --- DALTON-HOOK(cos-settings-tools): end ---
 
 

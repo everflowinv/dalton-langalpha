@@ -1610,6 +1610,7 @@ def build_director_tools(
         ticker: str | None = None,
         workspace_id: str | None = None,
         source: str = "user",
+        override_pause_versions: dict[str, int] | None = None,
         config: RunnableConfig = None,
     ) -> str:
         """Inspect, enable, or disable the standard autonomous tracking suite (`watch`, `delta`, `move-up`, `move-down`) for a company workspace — or the two sector tasks (`agenda`, `delta`) for a sector workspace.
@@ -1873,12 +1874,14 @@ def build_director_tools(
             task_owner = await _verify_tracking_workspace_owner(target_ws_id, user_id)
             try:
                 if act == "enable":
-                    is_user_action = src == "user"
+                    # r4 Decision 3: tool-triggered enable respects manual pauses unless version-authorized
+                    allow_override = src == "user" and override_pause_versions is not None
                     res = await enable_tracking(
                         task_owner,
                         target_ws_id,
-                        force=is_user_action,
-                        respect_user_pause=not is_user_action,
+                        force=allow_override,
+                        respect_user_pause=not allow_override,
+                        override_pause_versions=override_pause_versions if allow_override else None,
                         viewer_user_id=user_id,
                     )
                 else:

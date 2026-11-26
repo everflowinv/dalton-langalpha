@@ -4740,12 +4740,12 @@ async def test_ad5_unattended_automation_turn_refuses_without_hanging_and_migrat
         assert res["error"] == "automation_turn_confirmation_forbidden"
     hitl_spy.assert_not_called()
 
-    # Migration d057 chains directly off d055 and defines dalton_report_delivery_confirmations.
+    # Migration d057 chains directly off d056 and defines dalton_report_delivery_confirmations.
     import importlib
 
     mig = importlib.import_module("src.dalton.migrations.versions.d057_report_delivery_confirmations")
     assert mig.revision == "d057"
-    assert mig.down_revision == "d055"
+    assert mig.down_revision == "d056"
 
 
 @pytest.mark.asyncio

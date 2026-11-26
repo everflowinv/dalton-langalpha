@@ -113,6 +113,13 @@ export interface SecretaryActionRenderBlock {
   key: string;
   segment: ContentSegmentRecord;
 }
+// --- DALTON-HOOK(watchlist): begin ---
+export interface WatchlistProposalRenderBlock {
+  type: 'watchlist_batch_add' | 'watchlist_set_tier' | 'watchlist_remove' | 'watchlist_tier_policy';
+  key: string;
+  segment: ContentSegmentRecord;
+}
+// --- DALTON-HOOK(watchlist): end ---
 export interface CreditPauseRenderBlock {
   type: 'credit_pause';
   key: string;
@@ -152,6 +159,7 @@ export type RenderBlock =
   | StartQuestionRenderBlock
   | PTCAgentRenderBlock
   | SecretaryActionRenderBlock
+  | WatchlistProposalRenderBlock // DALTON-HOOK(watchlist)
   | CreditPauseRenderBlock
   | ToolApprovalRenderBlock
   | PastPlanRenderBlock
@@ -263,6 +271,14 @@ export function buildRenderBlocks(
         if (s.type === 'delete_thread') return true;
         // DALTON-HOOK(cos-settings-tools): keep archive_workspace segment
         if (s.type === 'archive_workspace') return true;
+        // --- DALTON-HOOK(watchlist): begin ---
+        if (
+          s.type === 'watchlist_batch_add'
+          || s.type === 'watchlist_set_tier'
+          || s.type === 'watchlist_remove'
+          || s.type === 'watchlist_tier_policy'
+        ) return true;
+        // --- DALTON-HOOK(watchlist): end ---
         if (s.type === 'credit_pause') return true;
         if (s.type === 'tool_approval') return true;
         if (s.type === 'html_widget') return true;
@@ -458,6 +474,16 @@ export function buildRenderBlocks(
         } else if (seg.type === 'delete_workspace' || seg.type === 'stop_workspace' || seg.type === 'delete_thread' || seg.type === 'archive_workspace') {
           flushActivity();
           blocks.push({ type: seg.type, key: `secretary-${seg.type}-${seg.proposalId}`, segment: seg });
+        // --- DALTON-HOOK(watchlist): begin ---
+        } else if (
+          seg.type === 'watchlist_batch_add'
+          || seg.type === 'watchlist_set_tier'
+          || seg.type === 'watchlist_remove'
+          || seg.type === 'watchlist_tier_policy'
+        ) {
+          flushActivity();
+          blocks.push({ type: seg.type, key: `watchlist-${seg.type}-${seg.proposalId}`, segment: seg });
+        // --- DALTON-HOOK(watchlist): end ---
         } else if (seg.type === 'credit_pause') {
           flushActivity();
           blocks.push({ type: 'credit_pause', key: `credit-pause-${seg.proposalId}`, segment: seg });

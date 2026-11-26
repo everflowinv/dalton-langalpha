@@ -147,6 +147,8 @@ class AgentInputs:
     #: (``shared_workspaces_member_context``); None for a call between
     #: turns and for every other turn.
     member_context: MemberContext | None = None
+    # DALTON-HOOK(watchlist): fail-closed shared-thread flag for personal watchlist tool withholding
+    thread_is_shared: bool = False
 
     @classmethod
     async def read(
@@ -192,6 +194,10 @@ class AgentInputs:
         project = await resolve_project_context(session, workspace_id)
         if project is not None and acting_for and acting_for != workspace_id:
             project = replace(project, acting_for=acting_for)
+        # DALTON-HOOK(watchlist): resolve thread share status (fail-closed) once for tool assembly
+        from src.dalton.watchlist.privacy import is_thread_shared
+
+        thread_is_shared = True if identity.shared else await is_thread_shared(thread_id)
         return cls(
             identity=identity,
             # DALTON-HOOK(colleague-dispatch): store workspace owner identity
@@ -218,6 +224,7 @@ class AgentInputs:
                 else None
             ),
             member_context=member_context,
+            thread_is_shared=thread_is_shared,
         )
 
     def build_kwargs(self) -> dict[str, Any]:
@@ -249,6 +256,9 @@ class AgentInputs:
             and self.workspace_owner_id != self.identity.sender
         ):
             kwargs["workspace_owner_id"] = self.workspace_owner_id
+        # DALTON-HOOK(watchlist): forward shared-thread state into graph/tool assembly
+        if self.thread_is_shared:
+            kwargs["thread_is_shared"] = True
         return kwargs
 
     def claude_code_launcher(

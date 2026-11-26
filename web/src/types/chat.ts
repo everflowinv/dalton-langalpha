@@ -211,6 +211,17 @@ export interface ToolApprovalSegment {
   order: number;
 }
 
+// DALTON-HOOK(watchlist): re-export personal watchlist proposal types from Dalton module
+export type {
+  WatchlistProposalActionType,
+  WatchlistProposalAffectedTicker,
+  WatchlistProposalAffectedWorkspace,
+  WatchlistProposalSegment,
+  WatchlistProposalState,
+  WatchlistProposalWorkspaceTaskChange,
+} from '@/lib/dalton/watchlistChatTypes';
+import type { WatchlistProposalSegment, WatchlistProposalState } from '@/lib/dalton/watchlistChatTypes';
+
 export type ContentSegment =
   | ReasoningSegment
   | TextSegment
@@ -226,7 +237,8 @@ export type ContentSegment =
   | DeleteThreadSegment
   | ArchiveWorkspaceSegment // DALTON-HOOK(cos-settings-tools)
   | CreditPauseSegment
-  | ToolApprovalSegment;
+  | ToolApprovalSegment
+  | WatchlistProposalSegment; // DALTON-HOOK(watchlist)
 
 // --- Process Records ---
 
@@ -500,6 +512,7 @@ export interface SecretaryActionProposalState {
   interruptId?: string;
 }
 
+
 /**
  * ``resuming`` is the in-flight leg and exists because a resume can be refused:
  * admission re-runs the quota check and answers 429 without opening a turn, so
@@ -686,6 +699,8 @@ export type AssistantMessage = {
   questionProposals?: Record<string, QuestionProposalState>;
   ptcAgentProposals?: Record<string, PTCAgentProposalState>;
   secretaryActionProposals?: Record<string, SecretaryActionProposalState>;
+  // DALTON-HOOK(watchlist): personal watchlist confirmation proposals
+  watchlistProposals?: Record<string, WatchlistProposalState>;
   creditPauses?: Record<string, CreditPauseState>;
   toolApprovals?: Record<string, ToolApprovalState>;
   // Runtime flags

@@ -73,6 +73,18 @@ _CARDS: dict[str, frozenset[str] | None] = {
     # DALTON-HOOK(cos-settings-tools): register archive confirmation card
     "manage_workspaces": frozenset({"create", "delete", "archive"}),
     "manage_threads": frozenset({"delete"}),
+    # DALTON-HOOK(watchlist): dalton_coverage mutating actions may pause on hitl_confirm
+    "dalton_coverage": frozenset(
+        {
+            "add",
+            "set_tier",
+            "remove",
+            "add_group",
+            "remove_group",
+            "set_tier_policy",
+            "reset_tier_policy",
+        }
+    ),
 }
 
 

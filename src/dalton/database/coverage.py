@@ -6,7 +6,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from psycopg.rows import dict_row
 
@@ -30,6 +30,8 @@ def _normalize_row(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
         ("aliases", {}),
         ("earnings", {}),
         ("extra", {}),
+        ("tags", []),
+        ("task_overrides", None),
         ("criteria", {}),
         ("ledger", {}),
     ):
@@ -38,6 +40,14 @@ def _normalize_row(row: Mapping[str, Any] | None) -> dict[str, Any] | None:
                 out[json_col] = json.loads(out[json_col])
             except Exception:
                 out[json_col] = default
+    if "tags" in out and out["tags"] is None:
+        out["tags"] = []
+    if "sort_order" in out and out["sort_order"] is None:
+        out["sort_order"] = 0
+    if "is_pinned" in out:
+        out["is_pinned"] = bool(out["is_pinned"])
+    if "is_private" in out:
+        out["is_private"] = bool(out["is_private"])
     return out
 
 
@@ -53,6 +63,14 @@ async def acquire_coverage_advisory_lock(conn: Any, user_id: str) -> None:
         )
 
 
+_COVERAGE_SELECT_COLS = """
+                    user_id, ticker, name, tier, market, peer_group,
+                    peers, aliases, earnings, extra,
+                    tags, sort_order, is_pinned, is_private, task_overrides,
+                    source, group_id::text AS group_id, added_at, updated_at
+"""
+
+
 async def list_coverage_rows(
     user_id: str,
     *,
@@ -66,11 +84,8 @@ async def list_coverage_rows(
     async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
-                SELECT
-                    user_id, ticker, name, tier, market, peer_group,
-                    peers, aliases, earnings, extra, source,
-                    group_id::text AS group_id, added_at, updated_at
+                f"""
+                SELECT{_COVERAGE_SELECT_COLS}
                 FROM dalton_coverage
                 WHERE user_id = %s
                 ORDER BY added_at ASC, ticker ASC
@@ -86,11 +101,8 @@ async def list_all_coverage_rows(*, conn: Any = None) -> list[dict[str, Any]]:
     async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
-                SELECT
-                    user_id, ticker, name, tier, market, peer_group,
-                    peers, aliases, earnings, extra, source,
-                    group_id::text AS group_id, added_at, updated_at
+                f"""
+                SELECT{_COVERAGE_SELECT_COLS}
                 FROM dalton_coverage
                 ORDER BY user_id ASC, added_at ASC, ticker ASC
                 """
@@ -114,11 +126,8 @@ async def get_coverage_row(
     async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
-                SELECT
-                    user_id, ticker, name, tier, market, peer_group,
-                    peers, aliases, earnings, extra, source,
-                    group_id::text AS group_id, added_at, updated_at
+                f"""
+                SELECT{_COVERAGE_SELECT_COLS}
                 FROM dalton_coverage
                 WHERE user_id = %s AND ticker = %s
                 """,
@@ -176,19 +185,33 @@ async def upsert_coverage_rows(
                 aliases_json = json.dumps(r.get("aliases") or {}, ensure_ascii=False)
                 earnings_json = json.dumps(r.get("earnings") or {}, ensure_ascii=False)
                 extra_json = json.dumps(r.get("extra") or {}, ensure_ascii=False)
+                tags_json = json.dumps(r.get("tags") or [], ensure_ascii=False)
+                sort_order = int(r.get("sort_order") or 0)
+                is_pinned = bool(r.get("is_pinned", False))
+                is_private = bool(r.get("is_private", False))
+                raw_overrides = r.get("task_overrides")
+                overrides_json = (
+                    json.dumps(raw_overrides, ensure_ascii=False)
+                    if raw_overrides is not None
+                    else None
+                )
                 source = str(r.get("source") or "chat").strip().lower()
                 group_id = str(r["group_id"]) if r.get("group_id") else None
 
                 await cur.execute(
-                    """
+                    f"""
                     INSERT INTO dalton_coverage (
                         user_id, ticker, name, tier, market, peer_group,
-                        peers, aliases, earnings, extra, source, group_id,
+                        peers, aliases, earnings, extra,
+                        tags, sort_order, is_pinned, is_private, task_overrides,
+                        source, group_id,
                         added_at, updated_at
                     )
                     VALUES (
                         %s, %s, %s, %s, %s, %s,
-                        %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s::uuid,
+                        %s::jsonb, %s::jsonb, %s::jsonb, %s::jsonb,
+                        %s::jsonb, %s, %s, %s, %s::jsonb,
+                        %s, %s::uuid,
                         NOW() + (%s * INTERVAL '1 microsecond'), NOW()
                     )
                     ON CONFLICT (user_id, ticker) DO UPDATE
@@ -212,6 +235,24 @@ async def upsert_coverage_rows(
                         aliases = EXCLUDED.aliases,
                         earnings = EXCLUDED.earnings,
                         extra = EXCLUDED.extra,
+                        tags = CASE
+                            WHEN EXCLUDED.source = 'group' AND dalton_coverage.tags <> '[]'::jsonb
+                                THEN dalton_coverage.tags
+                            ELSE EXCLUDED.tags
+                        END,
+                        sort_order = CASE
+                            WHEN EXCLUDED.source = 'group' THEN dalton_coverage.sort_order
+                            ELSE EXCLUDED.sort_order
+                        END,
+                        is_pinned = CASE
+                            WHEN EXCLUDED.source = 'group' THEN dalton_coverage.is_pinned
+                            ELSE EXCLUDED.is_pinned
+                        END,
+                        is_private = EXCLUDED.is_private OR dalton_coverage.is_private,
+                        task_overrides = CASE
+                            WHEN EXCLUDED.source = 'group' THEN dalton_coverage.task_overrides
+                            ELSE EXCLUDED.task_overrides
+                        END,
                         source = CASE
                             WHEN EXCLUDED.source = 'group' AND dalton_coverage.source <> 'group'
                                 THEN dalton_coverage.source
@@ -219,10 +260,7 @@ async def upsert_coverage_rows(
                         END,
                         group_id = COALESCE(EXCLUDED.group_id, dalton_coverage.group_id),
                         updated_at = NOW()
-                    RETURNING
-                        user_id, ticker, name, tier, market, peer_group,
-                        peers, aliases, earnings, extra, source,
-                        group_id::text AS group_id, added_at, updated_at
+                    RETURNING{_COVERAGE_SELECT_COLS}
                     """,
                     (
                         uid,
@@ -235,6 +273,11 @@ async def upsert_coverage_rows(
                         aliases_json,
                         earnings_json,
                         extra_json,
+                        tags_json,
+                        sort_order,
+                        is_pinned,
+                        is_private,
+                        overrides_json,
                         source,
                         group_id,
                         idx,
@@ -327,17 +370,51 @@ async def update_coverage_tier(
         await acquire_coverage_advisory_lock(c, uid)
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
+                f"""
                 UPDATE dalton_coverage
                 SET tier = %s,
                     updated_at = NOW()
                 WHERE user_id = %s AND ticker = ANY(%s)
-                RETURNING
-                    user_id, ticker, name, tier, market, peer_group,
-                    peers, aliases, earnings, extra, source,
-                    group_id::text AS group_id, added_at, updated_at
+                RETURNING{_COVERAGE_SELECT_COLS}
                 """,
                 (tier, uid, cleaned),
+            )
+            rows = await cur.fetchall()
+            return [_normalize_row(r) for r in rows if r is not None]  # type: ignore[misc]
+
+    if conn is not None:
+        return await _run_in_tx(conn)
+    async with get_db_connection() as c:
+        async with c.transaction():
+            return await _run_in_tx(c)
+
+
+async def update_coverage_tags(
+    user_id: str,
+    tickers: list[str],
+    tags: list[str],
+    *,
+    conn: Any = None,
+) -> list[dict[str, Any]]:
+    """Update ``tags`` JSONB column for ``tickers`` in ``dalton_coverage`` under advisory lock."""
+    uid = str(user_id or "").strip()
+    cleaned = [str(t).strip().upper() for t in tickers if str(t).strip()]
+    if not uid or not cleaned:
+        return []
+    tags_json = json.dumps(list(tags), ensure_ascii=False)
+
+    async def _run_in_tx(c: Any) -> list[dict[str, Any]]:
+        await acquire_coverage_advisory_lock(c, uid)
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                UPDATE dalton_coverage
+                SET tags = %s::jsonb,
+                    updated_at = NOW()
+                WHERE user_id = %s AND ticker = ANY(%s)
+                RETURNING{_COVERAGE_SELECT_COLS}
+                """,
+                (tags_json, uid, cleaned),
             )
             rows = await cur.fetchall()
             return [_normalize_row(r) for r in rows if r is not None]  # type: ignore[misc]
@@ -582,6 +659,33 @@ async def update_coverage_group_resolved(
             return await _run_in_tx(c)
 
 
+def compute_exclusive_group_deletion_tickers(
+    group_id: str,
+    existing_groups: Sequence[Mapping[str, Any]],
+    rows: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Return sorted tickers that would be exclusively deleted when ``group_id`` is removed."""
+    gid = str(group_id or "").strip()
+    if not gid:
+        return []
+    valid_other_group_ids = {
+        str(g["group_id"]).strip()
+        for g in existing_groups
+        if g.get("group_id") and str(g["group_id"]).strip() != gid
+    }
+    to_delete: list[str] = []
+    for r in rows:
+        gids = extract_row_group_ids(r)
+        if gid not in gids and str(r.get("group_id") or "") != gid:
+            continue
+        remaining = [g for g in gids if g != gid and g in valid_other_group_ids]
+        src = str(r.get("source") or "chat").strip().lower()
+        sym = str(r.get("ticker") or "").strip().upper()
+        if sym and src == "group" and not remaining:
+            to_delete.append(sym)
+    return sorted(set(to_delete))
+
+
 async def delete_coverage_group_and_exclusive_members(
     user_id: str,
     group_id: str,
@@ -603,7 +707,10 @@ async def delete_coverage_group_and_exclusive_members(
             if g.get("group_id") and str(g["group_id"]).strip() != gid
         }
         rows = await list_coverage_rows(uid, conn=c)
-        to_delete_tickers: list[str] = []
+        to_delete_tickers = compute_exclusive_group_deletion_tickers(
+            gid, existing_groups, rows
+        )
+        to_delete_set = set(to_delete_tickers)
         to_update_rows: list[tuple[str, str | None, str]] = []
 
         for r in rows:
@@ -611,10 +718,9 @@ async def delete_coverage_group_and_exclusive_members(
             if gid not in gids and str(r.get("group_id") or "") != gid:
                 continue
             remaining = [g for g in gids if g != gid and g in valid_other_group_ids]
-            src = str(r.get("source") or "chat").strip().lower()
             sym = str(r["ticker"]).strip().upper()
-            if src == "group" and not remaining:
-                to_delete_tickers.append(sym)
+            if sym in to_delete_set:
+                continue
             else:
                 new_extra = dict(r.get("extra") or {})
                 stale_gids = [

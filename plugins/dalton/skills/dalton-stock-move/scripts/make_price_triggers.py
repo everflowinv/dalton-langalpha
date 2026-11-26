@@ -31,6 +31,68 @@ from move_quant import (  # noqa: E402
 
 DEFAULT_THRESHOLD_PCT = 4.0  # 默认取自 stock_tracker 配置的 price_1d_pct: 4.0
 
+# Default per-tier move trigger policy: radar and any unknown tier are disabled by default (Item 12).
+DEFAULT_TIER_MOVE_ENABLED: dict[str, bool] = {
+    "core": True,
+    "watch": True,
+    "radar": False,
+}
+
+
+def load_tier_policies_yaml(coverage_path: str | Path) -> dict[str, dict[str, Any]]:
+    """Load optional ``tier_policies`` section from ``coverage.yaml``."""
+    p = Path(coverage_path)
+    if not p.exists():
+        return {}
+    try:
+        import yaml  # type: ignore
+
+        raw = yaml.safe_load(p.read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and isinstance(raw.get("tier_policies"), dict):
+            return {
+                str(k).strip().lower(): dict(v)
+                for k, v in raw["tier_policies"].items()
+                if isinstance(v, dict)
+            }
+    except Exception:
+        pass
+    return {}
+
+
+def resolve_move_trigger_policy(
+    company: dict[str, Any],
+    tier_policies: dict[str, dict[str, Any]],
+    default_threshold: float,
+) -> tuple[bool, float]:
+    """Return ``(move_enabled, threshold_pct)`` from company overrides -> tier_policies -> defaults.
+
+    ``radar`` and any unknown tier default to ``move_enabled=False``.
+    """
+    c_tier = str(company.get("tier") or "").strip().lower()
+    pol = tier_policies.get(c_tier) if isinstance(tier_policies, dict) else None
+    if isinstance(pol, dict) and isinstance(pol.get("move_enabled"), bool):
+        move_enabled = bool(pol["move_enabled"])
+    else:
+        move_enabled = bool(DEFAULT_TIER_MOVE_ENABLED.get(c_tier, False))
+
+    threshold = default_threshold
+    if isinstance(pol, dict) and pol.get("move_threshold_pct") is not None:
+        try:
+            threshold = float(pol["move_threshold_pct"])
+        except (TypeError, ValueError):
+            pass
+
+    overrides = company.get("task_overrides")
+    if isinstance(overrides, dict):
+        if isinstance(overrides.get("move_enabled"), bool):
+            move_enabled = bool(overrides["move_enabled"])
+        if overrides.get("move_threshold_pct") is not None:
+            try:
+                threshold = float(overrides["move_threshold_pct"])
+            except (TypeError, ValueError):
+                pass
+    return move_enabled, threshold
+
 
 def slug_ticker(ticker: str) -> str:
     return ticker.strip().lower().replace(".", "-")
@@ -198,6 +260,7 @@ def main() -> int:
 
     args = parser.parse_args()
     companies = load_coverage_yaml(args.coverage)
+    tier_policies = load_tier_policies_yaml(args.coverage)
     tier_target = args.tier.strip().lower()
     only_tickers = (
         {t.strip().upper() for t in args.tickers.split(",") if t.strip()}
@@ -228,6 +291,12 @@ def main() -> int:
         if ticker in PRIVATE_TICKERS or is_private_company_entry(c):
             skipped.append({"ticker": ticker, "reason": "private_or_no_market_data"})
             continue
+        move_enabled, policy_threshold = resolve_move_trigger_policy(
+            c, tier_policies, args.threshold
+        )
+        if not move_enabled:
+            skipped.append({"ticker": ticker, "reason": "tier_policy_move_disabled"})
+            continue
         market = str(c.get("market") or "US").upper()
         if not args.include_non_us and (market != "US" or "." in ticker or len(ticker) > 10):
             skipped.append({"ticker": ticker, "reason": "non_us_skipped_by_default"})
@@ -237,7 +306,9 @@ def main() -> int:
             continue
 
         thr, threshold_note = (
-            compute_vol_threshold(ticker, args.threshold) if args.compute_vol else (args.threshold, None)
+            compute_vol_threshold(ticker, policy_threshold)
+            if args.compute_vol
+            else (policy_threshold, None)
         )
         ws_id = None
         if isinstance(c.get("workspace"), dict) and c["workspace"].get("id"):

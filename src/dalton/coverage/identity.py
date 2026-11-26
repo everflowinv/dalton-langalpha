@@ -324,12 +324,26 @@ def classify_workspace_coverage(
 _NOT_LOADED = object()
 
 
-async def _load_doc_content(workspace_id: str, doc_key: str) -> Any:
+async def _load_doc_content(
+    workspace_id: str,
+    doc_key: str,
+    *,
+    conn: Any = None,
+    raise_on_error: bool = False,
+) -> Any:
     from src.dalton.database import knowledge as db_knowledge
 
     try:
-        row = await db_knowledge.latest_valid_version(workspace_id, doc_key)
-    except Exception:
+        row = (
+            await db_knowledge.latest_valid_version(workspace_id, doc_key, conn=conn)
+            if conn is not None
+            else await db_knowledge.latest_valid_version(workspace_id, doc_key)
+        )
+    except Exception as exc:
+        if raise_on_error:
+            raise CoverageIdentityUnavailableError(
+                f"工作区知识文档（{doc_key}）查询失败，无法确认标的身份。"
+            ) from exc
         return None
     if not row:
         return None
@@ -345,6 +359,7 @@ async def resolve_workspace_coverage_identity(
     registered_units: Mapping[str, Mapping[str, Any]] | None = None,
     automations: list[Mapping[str, Any]] | None = None,
     conn: Any = None,
+    raise_on_doc_error: bool = False,
 ) -> WorkspaceCoverageIdentity:
     """The one resolver used by tracking, the board and the director probe.
 
@@ -400,9 +415,13 @@ async def resolve_workspace_coverage_identity(
                 # Company unit without a ticker: the company identity stands,
                 # the ticker falls through to the compatible rules.
                 if company_content is _NOT_LOADED and ws_id:
-                    company_content = await _load_doc_content(ws_id, "company")
+                    company_content = await _load_doc_content(
+                        ws_id, "company", conn=conn, raise_on_error=raise_on_doc_error
+                    )
                 if thesis_content is _NOT_LOADED and ws_id:
-                    thesis_content = await _load_doc_content(ws_id, "thesis")
+                    thesis_content = await _load_doc_content(
+                        ws_id, "thesis", conn=conn, raise_on_error=raise_on_doc_error
+                    )
                 compat_ticker, compat_source = _compat_ticker(
                     workspace,
                     company_content=None if company_content is _NOT_LOADED else company_content,
@@ -418,9 +437,13 @@ async def resolve_workspace_coverage_identity(
                 )
 
     if company_content is _NOT_LOADED and ws_id:
-        company_content = await _load_doc_content(ws_id, "company")
+        company_content = await _load_doc_content(
+            ws_id, "company", conn=conn, raise_on_error=raise_on_doc_error
+        )
     if thesis_content is _NOT_LOADED and ws_id:
-        thesis_content = await _load_doc_content(ws_id, "thesis")
+        thesis_content = await _load_doc_content(
+            ws_id, "thesis", conn=conn, raise_on_error=raise_on_doc_error
+        )
     return classify_workspace_coverage(
         workspace,
         company_content=None if company_content is _NOT_LOADED else company_content,

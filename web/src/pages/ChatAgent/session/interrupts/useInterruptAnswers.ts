@@ -13,7 +13,13 @@ import type { PendingInterrupt, SetMessages } from '../types';
 import type { AnswerBoard } from './answerBoard';
 import { PROPOSAL_DATA_KEY_MAP, setCardFields, setCardStatus } from './buckets';
 
-type ProposalBucket = keyof AssistantMessage & ('workspaceProposals' | 'questionProposals' | 'secretaryActionProposals');
+// DALTON-HOOK(watchlist): include watchlistProposals in ProposalBucket
+type ProposalBucket = keyof AssistantMessage & (
+  | 'workspaceProposals'
+  | 'questionProposals'
+  | 'secretaryActionProposals'
+  | 'watchlistProposals'
+);
 
 interface InterruptAnswerDeps {
   pendingInterrupt: PendingInterrupt | null;
@@ -80,8 +86,10 @@ export function useInterruptAnswers({
     const interruptId = (typeof proposal?.interruptId === 'string' && proposal.interruptId)
       ? proposal.interruptId
       : pendingInterrupt.interruptId;
+    // DALTON-HOOK(watchlist): watchlistProposals also wait for tool_call_result settlement (stay in 'submitting' on approve)
     const waitsForToolResult =
       bucket === 'workspaceProposals'
+      || bucket === 'watchlistProposals'
       || (bucket === 'secretaryActionProposals'
         && (proposal?.actionType === 'archive_workspace' || pendingInterrupt.type === 'archive_workspace'));
     const nextStatus = verdict === 'approve'
@@ -96,6 +104,17 @@ export function useInterruptAnswers({
     resumeWithHitlResponse({ [interruptId!]: { decisions: [decision] } });
   }, [pendingInterrupt, setMessages, resumeWithHitlResponse]);
 
+  // DALTON-HOOK(watchlist): route watchlist card decisions through answerBoard by interruptId for mixed parallel HITL support
+  const decideWatchlistProposal = useCallback((verdict: 'approve' | 'reject', proposal?: Record<string, unknown>) => {
+    const interruptId = (typeof proposal?.interruptId === 'string' && proposal.interruptId) || pendingInterrupt?.interruptId;
+    const proposalId = (typeof proposal?.proposalId === 'string' && proposal.proposalId) || interruptId || pendingInterrupt?.proposalId;
+    if (!interruptId || !proposalId) return;
+    setMessages((prev) => setCardFields(prev, 'watchlistProposals', proposalId, {
+      status: verdict === 'approve' ? 'submitting' : 'rejected', failure_code: undefined, failure_error: undefined,
+    }));
+    collectHitlResponseAndMaybeResume(interruptId, { decisions: [{ type: verdict }] });
+  }, [pendingInterrupt, setMessages, collectHitlResponseAndMaybeResume]);
+
   const proposalHandlers = useMemo(() => ({
     handleApproveCreateWorkspace: (proposal?: Record<string, unknown>) =>
       decidePendingProposal('workspaceProposals', 'approve', proposal),
@@ -109,7 +128,12 @@ export function useInterruptAnswers({
       decidePendingProposal('secretaryActionProposals', 'approve', proposal),
     handleRejectSecretaryAction: (proposal?: Record<string, unknown>) =>
       decidePendingProposal('secretaryActionProposals', 'reject', proposal),
-  }), [decidePendingProposal]);
+    // DALTON-HOOK(watchlist): approve/reject personal watchlist confirmation cards via answerBoard
+    handleApproveWatchlistAction: (proposal?: Record<string, unknown>) =>
+      decideWatchlistProposal('approve', proposal),
+    handleRejectWatchlistAction: (proposal?: Record<string, unknown>) =>
+      decideWatchlistProposal('reject', proposal),
+  }), [decidePendingProposal, decideWatchlistProposal]);
   // --- DALTON-HOOK(cos-settings-tools): end ---
 
   // The clicked PTC card supplies its own proposal and interrupt ids, for the

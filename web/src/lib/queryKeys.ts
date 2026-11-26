@@ -563,6 +563,15 @@ export const queryKeys = {
       'revision',
       revision,
     ],
+    // DALTON-HOOK(watchlist): personal watchlist, metrics, and tier policies query keys
+    watchlist: () => [...queryKeys.dalton.all, 'watchlist'],
+    watchlistMetrics: (symbolsKey = 'all') => [
+      ...queryKeys.dalton.all,
+      'watchlist',
+      'metrics',
+      symbolsKey,
+    ],
+    watchlistTierPolicies: () => [...queryKeys.dalton.all, 'watchlist', 'tier-policies'],
   },
   // DALTON-HOOK(monitors): query keys for Dalton Monitors list, detail, artifact lookup, and company members
   daltonMonitors: {

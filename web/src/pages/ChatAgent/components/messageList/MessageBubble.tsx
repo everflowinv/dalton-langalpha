@@ -634,6 +634,8 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         isSubagentView={isSubagentView}
         ptcAgentProposals={(message.ptcAgentProposals as Record<string, PTCAgentProposalState>) || EMPTY_OBJ}
         secretaryActionProposals={(message.secretaryActionProposals as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
+        // DALTON-HOOK(watchlist): pass personal watchlist confirmation proposals to MessageContentSegments
+        watchlistProposals={(message.watchlistProposals as Record<string, Record<string, unknown>>) || EMPTY_OBJ}
         creditPauses={(message.creditPauses as Record<string, CreditPauseState>) || EMPTY_OBJ}
         toolApprovals={(message.toolApprovals as Record<string, ToolApprovalState>) || EMPTY_OBJ}
         htmlWidgetProcesses={(message.htmlWidgetProcesses as Record<string, Record<string, unknown>>) || EMPTY_OBJ}

@@ -443,6 +443,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     handleRejectPTCAgent,
     handleApproveSecretaryAction,
     handleRejectSecretaryAction,
+    // DALTON-HOOK(watchlist): personal watchlist confirmation card handlers
+    handleApproveWatchlistAction,
+    handleRejectWatchlistAction,
     handleResumeCreditPause,
     handleApproveToolCall,
     handleRejectToolCall,
@@ -1499,6 +1502,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     onRejectPTCAgent: handleRejectPTCAgent,
     onApproveSecretaryAction: handleApproveSecretaryAction,
     onRejectSecretaryAction: handleRejectSecretaryAction,
+    // DALTON-HOOK(watchlist): wire personal watchlist confirmation handlers
+    onApproveWatchlistAction: handleApproveWatchlistAction,
+    onRejectWatchlistAction: handleRejectWatchlistAction,
     onResumeCreditPause: handleResumeCreditPause,
     onApproveToolCall: handleApproveToolCall,
     onRejectToolCall: handleRejectToolCall,

@@ -14,6 +14,11 @@ import {
   historyCardKey,
   CARD_BUCKET_FOR_TYPE,
 } from './buckets';
+import {
+  isWatchlistInterruptType,
+  projectHistoryWatchlistInterrupt,
+  rearmHistoryWatchlistInterrupt,
+} from '@/lib/dalton/watchlistInterrupts'; // DALTON-HOOK(watchlist)
 import { claimedCardFields, evidenceLookup, type ApprovalEvidence } from './claims';
 import { buildCreditPauseState } from './creditPauseCard';
 import {
@@ -139,6 +144,13 @@ export function projectHistoryInterrupt(
         });
       }
     // --- DALTON-HOOK(cos-settings-tools): end ---
+    // DALTON-HOOK(watchlist): re-arm stranded watchlist confirmation card via Dalton helper
+    } else if (rearmHistoryWatchlistInterrupt({
+      actionType, interruptId: event.interrupt_id, proposalData: actionRequests[0], assistantMessageId: interruptAssistantId || '',
+      setPending: (pid) => rt.setMessages((prev) => setCardStatus(prev, 'watchlistProposals', pid, 'pending')),
+      pendingHistoryInterrupts: ctx.pendingHistoryInterrupts,
+    })) {
+      // handled by Dalton helper
     }
     return;
   }
@@ -361,6 +373,10 @@ export function projectHistoryInterrupt(
         });
       }
       // --- DALTON-HOOK(cos-settings-tools): end ---
+    // DALTON-HOOK(watchlist): project history personal watchlist confirmation interrupt via Dalton helper
+    } else if (isWatchlistInterruptType(actionType)) {
+      const order = eventOrder(event, () => ++pairState.contentOrderCounter);
+      projectHistoryWatchlistInterrupt({ actionType, interruptId: event.interrupt_id, proposalData: actionRequests[0] as Record<string, unknown>, assistantMessageId: interruptAssistantId, order, setMessages: rt.setMessages, updateMessage, pendingHistoryInterrupts: ctx.pendingHistoryInterrupts });
     } else if (actionType === 'credit_pause') {
       // --- Credit pause interrupt (history) ---
       const proposalId = event.interrupt_id!;

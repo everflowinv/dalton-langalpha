@@ -511,9 +511,17 @@
     },
     "portfolioWatchlist": {
       "title": "Portfolio + Watchlist",
-      "description": "Combined holdings and watchlist with a Watch / Holdings tab switcher.",
+      "description": "Combined holdings, watchlist, and coverage list switcher.",
+      "headerCoverage": "Coverage",
       "headerWatchlist": "Watchlist",
       "headerHoldings": "Holdings",
+      "tierAll": "All",
+      "tierCore": "Core",
+      "tierWatch": "Watch",
+      "tierRadar": "Radar",
+      "unlisted": "Unlisted",
+      "coverageTruncated": "Showing top {{shown}} of {{total}}",
+      "viewAllCoverage": "View all",
       "addSymbol": "Add Symbol",
       "addTransaction": "Add Transaction",
       "cardTitle": "Portfolio"
