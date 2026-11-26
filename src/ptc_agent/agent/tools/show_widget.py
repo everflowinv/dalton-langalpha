@@ -371,6 +371,8 @@ def create_show_widget_tool(backend: SandboxBackend) -> BaseTool:
 
         artifact: dict[str, Any] = {
             "type": "html_widget",
+            # DALTON-HOOK(channel-deep-links): persist stable widget_id in checkpointed artifact for replay and deep links
+            "widget_id": widget_id,
             "html": html,
             "title": display_title,
         }

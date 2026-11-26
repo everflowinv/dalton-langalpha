@@ -1015,6 +1015,8 @@ DALTON_ROUTE_CAPABILITY_REGISTRY: Mapping[
         ("channels_router.py", "internal_deliveries_progress_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_topics_lookup_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_deliverables_download_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_snapshots_status_endpoint"): CapabilityId.CHANNEL_GATEWAY,
+        ("channels_router.py", "internal_snapshots_download_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_inbound_progress_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_steers_reconcile_endpoint"): CapabilityId.CHANNEL_GATEWAY,
         ("channels_router.py", "internal_recover_endpoint"): CapabilityId.CHANNEL_GATEWAY,

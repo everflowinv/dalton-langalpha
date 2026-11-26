@@ -628,3 +628,6 @@ web/src/pages/Setup/steps/__tests__/ModelStep.dalton.test.tsx
 # External member permissions Batch 3: preview bridge docLocation & unified HtmlFrameDocState unit and Playwright E2E tests.
 web/src/pages/ChatAgent/components/viewers/html/__tests__/HtmlFrameDocState.test.tsx
 web/e2e/external-member-perms-b3.spec.js
+# Channel Phase 2 Batch 2: ?chart=&layer= and ?widget= deep-link targeting hook & test (DALTON-HOOK(channel-deep-links)).
+web/src/pages/ChatAgent/components/chatView/useChannelDeepLinks.ts
+web/src/pages/ChatAgent/components/__tests__/ChatView.channelDeepLinks.test.tsx

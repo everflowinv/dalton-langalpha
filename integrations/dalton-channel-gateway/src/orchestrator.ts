@@ -3,6 +3,7 @@ import type { AgentRoutesHandler } from "./agent-routes.js";
 import {
   type BackendClient,
   BackendHttpError,
+  type ChartSnapshotItem,
   type DeliveryActivityOrigin,
   type I1RegisterAndResolveResponse,
   type I3SessionCommandRequest,
@@ -35,6 +36,15 @@ import {
   type DeliveryService,
   WEIXIN_ROTATION_DENY_CODES,
 } from "./delivery-service.js";
+import {
+  type CollectedChartLayerRef,
+  type CollectedHtmlWidgetRef,
+  chartLayerCompositeKey,
+  collectPublishedChartLayers,
+  collectReportSourceChartLayers,
+  deliverTurnChartsAndWidgets,
+  parseChartSnapshotsList,
+} from "./chart-snapshots.js";
 import { isStaleGatewayEpochError } from "./gateway-lease.js";
 
 type WeixinAttachmentAbortReason = "shutdown" | "superseded";
@@ -374,6 +384,11 @@ export class ChannelGatewayOrchestrator {
   private readonly activeInboundTurns = new Set<Promise<void>>();
   private readonly settledDeliverableKeys = new Set<string>();
   private readonly inFlightDeliverableSettlements = new Map<
+    string,
+    Promise<boolean>
+  >();
+  private readonly settledChartKeys = new Set<string>();
+  private readonly inFlightChartSettlements = new Map<
     string,
     Promise<boolean>
   >();
@@ -4650,6 +4665,10 @@ export class ChannelGatewayOrchestrator {
     let sawTurnAccepted = false;
     let runEndOutcome: string | null = null;
     let runEndDeliverables: TurnDeliverableItem[] = [];
+    let runEndChartSnapshots: ChartSnapshotItem[] = [];
+    let runEndOutboundBlocked: boolean | undefined;
+    const collectedCharts = new Map<string, CollectedChartLayerRef>();
+    const collectedWidgets = new Map<string, CollectedHtmlWidgetRef>();
     let progressRecorded = false;
     let interruptCleared = false;
     let runStartedCallbackInvoked = false;
@@ -4710,6 +4729,9 @@ export class ChannelGatewayOrchestrator {
         }
         if (typeof payload.turn_index === "number") {
           currentTurnIndex = payload.turn_index;
+        }
+        if (sse.event === "metadata") {
+          collectReportSourceChartLayers(payload, collectedCharts);
         }
         if (currentThreadId && !progressRecorded) {
           progressRecorded = true;
@@ -4877,6 +4899,15 @@ export class ChannelGatewayOrchestrator {
         continue;
       }
 
+      if (sse.event === "artifact") {
+        this.collectArtifactChartOrWidget(
+          payload,
+          collectedCharts,
+          collectedWidgets,
+        );
+        continue;
+      }
+
       if (sse.event === "run_end") {
         sawTurnAccepted = true;
         sawRunEnd = true;
@@ -4895,6 +4926,11 @@ export class ChannelGatewayOrchestrator {
         runEndDeliverables = this.parseTurnDeliverables(
           payload.turn_deliverables,
         );
+        runEndChartSnapshots = parseChartSnapshotsList(payload.chart_snapshots);
+        collectPublishedChartLayers(payload.chart_layers, collectedCharts);
+        if (typeof payload.outbound_blocked === "boolean") {
+          runEndOutboundBlocked = payload.outbound_blocked;
+        }
         continue;
       }
 
@@ -5409,6 +5445,33 @@ export class ChannelGatewayOrchestrator {
       }
     }
 
+    if (
+      !sawInterrupt &&
+      !fallbackDeliveryFailed &&
+      !prog.has_in_flight_or_unknown_current_text &&
+      currentRunId &&
+      (collectedCharts.size > 0 ||
+        runEndChartSnapshots.length > 0 ||
+        collectedWidgets.size > 0)
+    ) {
+      await this.settleTurnChartsAndWidgets({
+        userId,
+        threadId: currentThreadId,
+        runId: currentRunId,
+        platform: event.platform,
+        targetAddress: event.chatAddress,
+        inboundMessageId: event.messageId,
+        threadScopeKey: event.threadScopeKey,
+        sourceScopeKey: event.threadScopeKey,
+        sourceGeneration: resolved.generation,
+        activityOrigin: params.isAttachedStream ? "replay" : "conversation",
+        charts: [...collectedCharts.values()],
+        initialSnapshots: runEndChartSnapshots,
+        widgets: [...collectedWidgets.values()],
+        outboundBlocked: runEndOutboundBlocked,
+      });
+    }
+
     // Preserve `fallback_pending: true` if an `/agent/send` to current conversation is still `in_flight` or `unknown`,
     // or if `executeDelivery` returned an explicit failure status!
     const keepFallbackPending =
@@ -5797,6 +5860,10 @@ export class ChannelGatewayOrchestrator {
     let resolvedRunId = runId;
     let anyPageSucceeded = false;
     const replayDeliverablesByRun = new Map<string, TurnDeliverableItem[]>();
+    const replayChartSnapshotsByRun = new Map<string, ChartSnapshotItem[]>();
+    const replayOutboundBlockedByRun = new Map<string, boolean>();
+    const replayChartsByRun = new Map<string, Map<string, CollectedChartLayerRef>>();
+    const replayWidgetsByRun = new Map<string, Map<string, CollectedHtmlWidgetRef>>();
     let tipInterruptDelivered = false;
     let tipInterruptDeliveryFailed = false;
     let terminalEmptyOutcome:
@@ -5811,6 +5878,7 @@ export class ChannelGatewayOrchestrator {
     const getReplayElapsedMs = (): number =>
       Math.max(this.nowFn() - replayWaitStartedAtMs, accumulatedReplaySleepMs);
     let unsettledPass = 0;
+    let usedPostRunEndOvertimeReplay = false;
 
     while (!this.shuttingDown) {
       let beforeTurn: number | undefined = undefined;
@@ -6081,6 +6149,12 @@ export class ChannelGatewayOrchestrator {
                 }
                 if (evtRunId) {
                   settledRunsInBatch.add(evtRunId);
+                  let cMap = replayChartsByRun.get(evtRunId);
+                  if (!cMap) {
+                    cMap = new Map<string, CollectedChartLayerRef>();
+                    replayChartsByRun.set(evtRunId, cMap);
+                  }
+                  collectReportSourceChartLayers(data.metadata, cMap);
                 }
               }
               continue;
@@ -6109,6 +6183,22 @@ export class ChannelGatewayOrchestrator {
               }
               if (rId) {
                 settledRunsInBatch.add(rId);
+                if (
+                  sse.event === "tool_call_result" &&
+                  data.artifact &&
+                  typeof data.artifact === "object" &&
+                  !Array.isArray(data.artifact)
+                ) {
+                  let cMap = replayChartsByRun.get(rId);
+                  if (!cMap) {
+                    cMap = new Map<string, CollectedChartLayerRef>();
+                    replayChartsByRun.set(rId, cMap);
+                  }
+                  collectPublishedChartLayers(
+                    (data.artifact as Record<string, unknown>).chart_layers,
+                    cMap,
+                  );
+                }
               }
               continue;
             }
@@ -6243,6 +6333,29 @@ export class ChannelGatewayOrchestrator {
               continue;
             }
 
+            if (sse.event === "artifact") {
+              const rId =
+                typeof data.response_id === "string"
+                  ? data.response_id
+                  : typeof data.run_id === "string"
+                    ? data.run_id
+                    : currentEventRunId;
+              if (rId) {
+                let cMap = replayChartsByRun.get(rId);
+                if (!cMap) {
+                  cMap = new Map<string, CollectedChartLayerRef>();
+                  replayChartsByRun.set(rId, cMap);
+                }
+                let wMap = replayWidgetsByRun.get(rId);
+                if (!wMap) {
+                  wMap = new Map<string, CollectedHtmlWidgetRef>();
+                  replayWidgetsByRun.set(rId, wMap);
+                }
+                this.collectArtifactChartOrWidget(data, cMap, wMap);
+              }
+              continue;
+            }
+
             if (sse.event === "replay_done" || sse.event === "history_page") {
               if (sse.event === "replay_done") {
                 sawReplayDone = true;
@@ -6258,6 +6371,35 @@ export class ChannelGatewayOrchestrator {
                     const parsedItems = this.parseTurnDeliverables(rawItems);
                     if (parsedItems.length > 0) {
                       replayDeliverablesByRun.set(rid, parsedItems);
+                    }
+                  }
+                }
+                const rawSnapsByRun = data.chart_snapshots_by_run;
+                if (
+                  rawSnapsByRun &&
+                  typeof rawSnapsByRun === "object" &&
+                  !Array.isArray(rawSnapsByRun)
+                ) {
+                  for (const [rid, rawSnaps] of Object.entries(
+                    rawSnapsByRun as Record<string, unknown>,
+                  )) {
+                    const parsedSnaps = parseChartSnapshotsList(rawSnaps);
+                    if (parsedSnaps.length > 0) {
+                      replayChartSnapshotsByRun.set(rid, parsedSnaps);
+                    }
+                  }
+                }
+                const rawBlockedByRun = data.outbound_blocked_by_run;
+                if (
+                  rawBlockedByRun &&
+                  typeof rawBlockedByRun === "object" &&
+                  !Array.isArray(rawBlockedByRun)
+                ) {
+                  for (const [rid, rawBlocked] of Object.entries(
+                    rawBlockedByRun as Record<string, unknown>,
+                  )) {
+                    if (typeof rawBlocked === "boolean") {
+                      replayOutboundBlockedByRun.set(rid, rawBlocked);
                     }
                   }
                 }
@@ -6346,6 +6488,47 @@ export class ChannelGatewayOrchestrator {
             foundText = liveSettled.assistantText;
             foundTargetTurn = true;
             resolvedRunId = activeMainRunFromSnapshot.runId;
+            if (liveSettled.charts.length > 0) {
+              let cMap = replayChartsByRun.get(resolvedRunId);
+              if (!cMap) {
+                cMap = new Map<string, CollectedChartLayerRef>();
+                replayChartsByRun.set(resolvedRunId, cMap);
+              }
+              for (const chart of liveSettled.charts) {
+                cMap.set(
+                  chartLayerCompositeKey(chart.chartId, chart.layerId),
+                  chart,
+                );
+              }
+            }
+            if (liveSettled.widgets.length > 0) {
+              let wMap = replayWidgetsByRun.get(resolvedRunId);
+              if (!wMap) {
+                wMap = new Map<string, CollectedHtmlWidgetRef>();
+                replayWidgetsByRun.set(resolvedRunId, wMap);
+              }
+              for (const widget of liveSettled.widgets) {
+                wMap.set(widget.artifactId, widget);
+              }
+            }
+            if (liveSettled.chartSnapshots.length > 0) {
+              const mergedSnaps = new Map<string, ChartSnapshotItem>();
+              for (const s of replayChartSnapshotsByRun.get(resolvedRunId) ?? []) {
+                mergedSnaps.set(chartLayerCompositeKey(s.chart_id, s.layer_id), s);
+              }
+              for (const s of liveSettled.chartSnapshots) {
+                mergedSnaps.set(chartLayerCompositeKey(s.chart_id, s.layer_id), s);
+              }
+              replayChartSnapshotsByRun.set(resolvedRunId, [
+                ...mergedSnaps.values(),
+              ]);
+            }
+            if (typeof liveSettled.outboundBlocked === "boolean") {
+              replayOutboundBlockedByRun.set(
+                resolvedRunId,
+                liveSettled.outboundBlocked,
+              );
+            }
             break;
           }
         }
@@ -6747,13 +6930,25 @@ export class ChannelGatewayOrchestrator {
 
       // If the target turn was seen as an in-flight stub (e.g. `messaging.py:1256 -> 1289` race where the turn completed
       // between replay page generation and `build_thread_snapshot`, or attached stream broke before `run_end`),
-      // keep polling `/messages/replay` with backoff up to `busyThreadMaxWaitMs` until it settles!
+      // keep polling `/messages/replay` with backoff up to `busyThreadMaxWaitMs` until it settles.
+      // When attaching via a non-zero cursor and `run_end` was already observed (`immediateReplayAfterLiveRunEnd`),
+      // always allow one immediate full `/messages/replay` read even if `busyThreadMaxWaitMs` has elapsed so long
+      // runs that finished after >30m still deliver their text, charts, and widgets; the wait cap still bounds
+      // runs that have not finished yet.
+      const withinWaitBudget = getReplayElapsedMs() < this.busyThreadMaxWaitMs;
+      const allowPostRunEndOvertimeReplay =
+        immediateReplayAfterLiveRunEnd && !usedPostRunEndOvertimeReplay;
       const canContinueWaiting =
         !this.shuttingDown &&
-        getReplayElapsedMs() < this.busyThreadMaxWaitMs &&
-        (sawUnsettledTargetTurn || unsettledPass < BACKOFF_DELAYS_MS.length);
+        ((withinWaitBudget &&
+          (sawUnsettledTargetTurn || unsettledPass < BACKOFF_DELAYS_MS.length)) ||
+          allowPostRunEndOvertimeReplay);
       if (!canContinueWaiting) {
         break;
+      }
+
+      if (!withinWaitBudget && allowPostRunEndOvertimeReplay) {
+        usedPostRunEndOvertimeReplay = true;
       }
 
       if (!immediateReplayAfterLiveRunEnd) {
@@ -7009,6 +7204,44 @@ export class ChannelGatewayOrchestrator {
       }
     }
 
+    if (
+      !fallbackTextDeliveryFailed &&
+      !tipInterruptDeliveryFailed &&
+      !prog.has_in_flight_or_unknown_current_text &&
+      resolvedRunId
+    ) {
+      const replaySnaps = replayChartSnapshotsByRun.get(resolvedRunId) ?? [];
+      const replayCharts = [
+        ...(replayChartsByRun.get(resolvedRunId)?.values() ?? []),
+      ];
+      const replayWidgets = [
+        ...(replayWidgetsByRun.get(resolvedRunId)?.values() ?? []),
+      ];
+      if (
+        replaySnaps.length > 0 ||
+        replayCharts.length > 0 ||
+        replayWidgets.length > 0
+      ) {
+        await this.settleTurnChartsAndWidgets({
+          userId,
+          threadId,
+          runId: resolvedRunId,
+          platform,
+          targetAddress,
+          inboundMessageId: inboundMessageId ?? null,
+          threadScopeKey: scopeKey ?? null,
+          sourceScopeKey: scopeKey ?? null,
+          sourceGeneration: generation ?? null,
+          activityOrigin:
+            activityOrigin ?? (isBackgroundRun ? "notification" : "replay"),
+          charts: replayCharts,
+          initialSnapshots: replaySnaps,
+          widgets: replayWidgets,
+          outboundBlocked: replayOutboundBlockedByRun.get(resolvedRunId),
+        });
+      }
+    }
+
     if (fallbackTextDeliveryFailed || tipInterruptDeliveryFailed) {
       if (inboundMessageId) {
         await this.backend.updateInboundProgress({
@@ -7078,7 +7311,21 @@ export class ChannelGatewayOrchestrator {
     inboundMessageId?: string | null;
     scopeKey?: string | null;
     generation?: number | null;
-  }): Promise<{ settled: boolean; runEnded: boolean; assistantText: string }> {
+  }): Promise<{
+    settled: boolean;
+    runEnded: boolean;
+    assistantText: string;
+    charts: CollectedChartLayerRef[];
+    widgets: CollectedHtmlWidgetRef[];
+    chartSnapshots: ChartSnapshotItem[];
+    outboundBlocked?: boolean;
+  }> {
+    const emptyArtifacts = {
+      charts: [] as CollectedChartLayerRef[],
+      widgets: [] as CollectedHtmlWidgetRef[],
+      chartSnapshots: [] as ChartSnapshotItem[],
+      outboundBlocked: undefined as boolean | undefined,
+    };
     try {
       const streamResp = await this.backend.streamThreadMessages(
         params.userId,
@@ -7086,7 +7333,7 @@ export class ChannelGatewayOrchestrator {
         { runId: params.runId, lastEventId: params.lastEventId },
       );
       if (!streamResp.isSse || !streamResp.events) {
-        return { settled: false, runEnded: false, assistantText: "" };
+        return { settled: false, runEnded: false, assistantText: "", ...emptyArtifacts };
       }
 
       const preCursorText = params.preCursorText ?? "";
@@ -7098,6 +7345,10 @@ export class ChannelGatewayOrchestrator {
       let sawInterrupt = false;
       let interruptDelivered = true;
       let runEndOutcome = "completed";
+      const collectedCharts = new Map<string, CollectedChartLayerRef>();
+      const collectedWidgets = new Map<string, CollectedHtmlWidgetRef>();
+      let runEndChartSnapshots: ChartSnapshotItem[] = [];
+      let runEndOutboundBlocked: boolean | undefined;
 
       for await (const sse of streamResp.events) {
         if (sse.event === ":comment") continue;
@@ -7106,6 +7357,39 @@ export class ChannelGatewayOrchestrator {
         if (sse.event === "stream_gap" || sse.event === "error") {
           sawStreamGap = true;
           break;
+        }
+
+        if (sse.event === "metadata") {
+          collectReportSourceChartLayers(payload, collectedCharts);
+          continue;
+        }
+
+        if (sse.event === "user_message") {
+          collectReportSourceChartLayers(payload.metadata, collectedCharts);
+          continue;
+        }
+
+        if (sse.event === "artifact") {
+          this.collectArtifactChartOrWidget(
+            payload,
+            collectedCharts,
+            collectedWidgets,
+          );
+          continue;
+        }
+
+        if (sse.event === "tool_call_result") {
+          if (
+            payload.artifact &&
+            typeof payload.artifact === "object" &&
+            !Array.isArray(payload.artifact)
+          ) {
+            collectPublishedChartLayers(
+              (payload.artifact as Record<string, unknown>).chart_layers,
+              collectedCharts,
+            );
+          }
+          continue;
         }
 
         if (sse.event === "tool_calls") {
@@ -7192,6 +7476,11 @@ export class ChannelGatewayOrchestrator {
               : typeof payload.status === "string"
                 ? payload.status
                 : "completed";
+          runEndChartSnapshots = parseChartSnapshotsList(payload.chart_snapshots);
+          collectPublishedChartLayers(payload.chart_layers, collectedCharts);
+          if (typeof payload.outbound_blocked === "boolean") {
+            runEndOutboundBlocked = payload.outbound_blocked;
+          }
           continue;
         }
       }
@@ -7201,6 +7490,7 @@ export class ChannelGatewayOrchestrator {
           settled: interruptDelivered,
           runEnded: true,
           assistantText: "",
+          ...emptyArtifacts,
         };
       }
       if (sawRunEnd && runEndOutcome === "completed") {
@@ -7210,15 +7500,14 @@ export class ChannelGatewayOrchestrator {
             : lastCompletedSegmentText;
         // Backend `src/server/handlers/chat/run_stream_reader.py:183` only yields events strictly AFTER `last_event_id`
         // (`cursor = f"{last_event_id}-0"`), and `src/server/services/history/replay/stubs.py:88` emits `archived = []`
-        // for an in-flight turn (`open_run`). If we attached with a non-null cursor `lastEventId` and `preCursorText` was
-        // not present in the replay page (unless a post-cursor `tool_calls` started a brand-new final segment with non-empty
-        // post-tool text), or if `sawStreamGap` occurred, or if the combined text is empty, we must NOT deliver only the
-        // tail segment or treat empty text as settled! Return `settled: false, runEnded: true` so `deliverReplayFallback`
-        // immediately re-polls `/messages/replay` now that the turn has completed and committed its full checkpoint.
+        // (only `user_message`) for an in-flight turn (`open_run`). Even if a post-cursor `tool_calls` started a new
+        // text segment with non-empty post-tool text, any pre-cursor `html_widget` artifacts or un-snapshotted
+        // `chart_layer` events emitted before `last_event_id` are absent from both the stub replay page and the resumed
+        // tail stream. Always return `settled: false, runEnded: true` when attaching with a non-null cursor without
+        // pre-cursor replay content (or on `sawStreamGap` / empty text) so `deliverReplayFallback` immediately re-reads
+        // the full committed `/messages/replay` before settling.
         const missingPreCursorPrefix =
-          params.lastEventId !== null &&
-          preCursorText.length === 0 &&
-          !(sawPostCursorToolCalls && currentSegmentText.trim().length > 0);
+          params.lastEventId !== null && preCursorText.length === 0;
         const combinedText = sawPostCursorToolCalls
           ? postCursorText
           : `${preCursorText}${postCursorText}`;
@@ -7227,13 +7516,21 @@ export class ChannelGatewayOrchestrator {
           missingPreCursorPrefix ||
           combinedText.trim().length === 0
         ) {
-          return { settled: false, runEnded: true, assistantText: "" };
+          return { settled: false, runEnded: true, assistantText: "", ...emptyArtifacts };
         }
-        return { settled: true, runEnded: true, assistantText: combinedText };
+        return {
+          settled: true,
+          runEnded: true,
+          assistantText: combinedText,
+          charts: [...collectedCharts.values()],
+          widgets: [...collectedWidgets.values()],
+          chartSnapshots: runEndChartSnapshots,
+          outboundBlocked: runEndOutboundBlocked,
+        };
       }
-      return { settled: false, runEnded: sawRunEnd, assistantText: "" };
+      return { settled: false, runEnded: sawRunEnd, assistantText: "", ...emptyArtifacts };
     } catch {
-      return { settled: false, runEnded: false, assistantText: "" };
+      return { settled: false, runEnded: false, assistantText: "", ...emptyArtifacts };
     }
   }
 
@@ -8289,6 +8586,10 @@ export class ChannelGatewayOrchestrator {
     let interruptDelivered = true;
     let runEndOutcome: string | null = null;
     let runEndDeliverables: TurnDeliverableItem[] = [];
+    let runEndChartSnapshots: ChartSnapshotItem[] = [];
+    let runEndOutboundBlocked: boolean | undefined;
+    const collectedCharts = new Map<string, CollectedChartLayerRef>();
+    const collectedWidgets = new Map<string, CollectedHtmlWidgetRef>();
     let settledOk = false;
 
     try {
@@ -8321,6 +8622,39 @@ export class ChannelGatewayOrchestrator {
             break;
           }
 
+          if (sse.event === "artifact") {
+            this.collectArtifactChartOrWidget(
+              payload,
+              collectedCharts,
+              collectedWidgets,
+            );
+            continue;
+          }
+
+          if (sse.event === "tool_call_result") {
+            if (
+              payload.artifact &&
+              typeof payload.artifact === "object" &&
+              !Array.isArray(payload.artifact)
+            ) {
+              collectPublishedChartLayers(
+                (payload.artifact as Record<string, unknown>).chart_layers,
+                collectedCharts,
+              );
+            }
+            continue;
+          }
+
+          if (sse.event === "metadata") {
+            collectReportSourceChartLayers(payload, collectedCharts);
+            continue;
+          }
+
+          if (sse.event === "user_message") {
+            collectReportSourceChartLayers(payload.metadata, collectedCharts);
+            continue;
+          }
+
           if (sse.event === "run_end") {
             sawRunEnd = true;
             runEndOutcome =
@@ -8332,6 +8666,13 @@ export class ChannelGatewayOrchestrator {
             runEndDeliverables = this.parseTurnDeliverables(
               payload.turn_deliverables,
             );
+            runEndChartSnapshots = parseChartSnapshotsList(
+              payload.chart_snapshots,
+            );
+            collectPublishedChartLayers(payload.chart_layers, collectedCharts);
+            if (typeof payload.outbound_blocked === "boolean") {
+              runEndOutboundBlocked = payload.outbound_blocked;
+            }
             continue;
           }
 
@@ -8555,6 +8896,30 @@ export class ChannelGatewayOrchestrator {
               keepFallbackPending = true;
             }
           }
+          if (
+            !keepFallbackPending &&
+            !sawStreamErrorOrGap &&
+            !prog.has_in_flight_or_unknown_current_text &&
+            (collectedCharts.size > 0 ||
+              runEndChartSnapshots.length > 0 ||
+              collectedWidgets.size > 0)
+          ) {
+            await this.settleTurnChartsAndWidgets({
+              userId: handle.userId,
+              threadId: handle.threadId,
+              runId,
+              platform: handle.platform,
+              targetAddress: handle.targetAddress,
+              threadScopeKey: handle.scopeKey,
+              sourceScopeKey: handle.scopeKey,
+              sourceGeneration: handle.generation,
+              activityOrigin: "notification",
+              charts: [...collectedCharts.values()],
+              initialSnapshots: runEndChartSnapshots,
+              widgets: [...collectedWidgets.values()],
+              outboundBlocked: runEndOutboundBlocked,
+            });
+          }
         }
       }
 
@@ -8603,7 +8968,16 @@ export class ChannelGatewayOrchestrator {
         !handle.syncingReconnect &&
         !handle.needsReconnectSync
       ) {
-        await this.evaluateWatchCloseConditions(handle.userId, handle.threadId);
+        try {
+          await this.evaluateWatchCloseConditions(
+            handle.userId,
+            handle.threadId,
+          );
+        } catch (err) {
+          if (isStaleGatewayEpochError(err)) {
+            throw err;
+          }
+        }
       }
     }
   }
@@ -10036,6 +10410,9 @@ export class ChannelGatewayOrchestrator {
       executionId: autoRun.execution_id,
       userId: autoRun.user_id,
       threadId: autoRun.thread_id,
+      runId: autoRun.run_id ?? null,
+      initialSnapshots: autoRun.chart_snapshots,
+      outboundBlocked: autoRun.outbound_blocked,
       automationName: autoRun.automation_name,
       finishStatus: autoRun.finish_status ?? "completed",
       finalText: autoRun.final_text,
@@ -10377,6 +10754,180 @@ export class ChannelGatewayOrchestrator {
         settlementPromise
       ) {
         this.inFlightDeliverableSettlements.delete(deliveryKey);
+      }
+    }
+  }
+
+  private collectArtifactChartOrWidget(
+    rawPayload: Record<string, unknown>,
+    chartsMap: Map<string, CollectedChartLayerRef>,
+    widgetsMap: Map<string, CollectedHtmlWidgetRef>,
+  ): void {
+    const artifactType =
+      typeof rawPayload.artifact_type === "string"
+        ? rawPayload.artifact_type.trim()
+        : "";
+    const inner =
+      rawPayload.payload &&
+      typeof rawPayload.payload === "object" &&
+      !Array.isArray(rawPayload.payload)
+        ? (rawPayload.payload as Record<string, unknown>)
+        : rawPayload;
+
+    if (artifactType === "chart_layer") {
+      const op =
+        typeof inner.op === "string" ? inner.op.trim().toLowerCase() : "add";
+      if (op === "remove") {
+        const cid = typeof inner.chart_id === "string" ? inner.chart_id.trim() : "";
+        const ids = Array.isArray(inner.ids) ? inner.ids : [];
+        for (const id of ids) {
+          if (typeof id === "string") {
+            const lid = id.trim();
+            if (!lid) continue;
+            if (cid) {
+              chartsMap.delete(chartLayerCompositeKey(cid, lid));
+            } else {
+              for (const [k, entry] of chartsMap.entries()) {
+                if (entry.layerId === lid) {
+                  chartsMap.delete(k);
+                }
+              }
+            }
+          }
+        }
+        return;
+      }
+      if (op === "clear") {
+        const cid = typeof inner.chart_id === "string" ? inner.chart_id.trim() : "";
+        if (cid) {
+          for (const [k, entry] of chartsMap.entries()) {
+            if (entry.chartId === cid) {
+              chartsMap.delete(k);
+            }
+          }
+        }
+        return;
+      }
+      const layerId =
+        typeof inner.layer_id === "string"
+          ? inner.layer_id.trim()
+          : typeof rawPayload.artifact_id === "string"
+            ? rawPayload.artifact_id.trim()
+            : "";
+      const chartId =
+        typeof inner.chart_id === "string" ? inner.chart_id.trim() : "";
+      if (!layerId || !chartId) return;
+      const layerObj =
+        inner.layer && typeof inner.layer === "object" && !Array.isArray(inner.layer)
+          ? (inner.layer as Record<string, unknown>)
+          : null;
+      const title =
+        typeof inner.title === "string" && inner.title.trim()
+          ? inner.title.trim()
+          : typeof layerObj?.title === "string" && layerObj.title.trim()
+            ? layerObj.title.trim()
+            : chartId;
+      chartsMap.set(chartLayerCompositeKey(chartId, layerId), {
+        chartId,
+        layerId,
+        symbol: typeof inner.symbol === "string" ? inner.symbol : null,
+        timeframe: typeof inner.timeframe === "string" ? inner.timeframe : null,
+        title,
+        workspaceId:
+          typeof inner.workspace_id === "string" ? inner.workspace_id : null,
+      });
+      return;
+    }
+
+    if (artifactType === "html_widget") {
+      const artifactId =
+        typeof rawPayload.artifact_id === "string"
+          ? rawPayload.artifact_id.trim()
+          : typeof inner.artifact_id === "string"
+            ? inner.artifact_id.trim()
+            : "";
+      if (!artifactId) return;
+      const title =
+        typeof inner.title === "string" && inner.title.trim()
+          ? inner.title.trim()
+          : artifactId;
+      const monitorSlug =
+        typeof inner.monitor_slug === "string" && inner.monitor_slug.trim()
+          ? inner.monitor_slug.trim()
+          : null;
+      widgetsMap.set(artifactId, {
+        artifactId,
+        title,
+        monitorSlug,
+      });
+    }
+  }
+
+  private async settleTurnChartsAndWidgets(params: {
+    userId: string;
+    threadId: string | null;
+    runId: string;
+    platform: ChannelPlatform;
+    targetAddress: string;
+    inboundMessageId?: string | null;
+    threadScopeKey?: string | null;
+    sourceScopeKey?: string | null;
+    sourceGeneration?: number | null;
+    activityOrigin?: DeliveryActivityOrigin | null;
+    charts: CollectedChartLayerRef[];
+    initialSnapshots?: ChartSnapshotItem[];
+    widgets: CollectedHtmlWidgetRef[];
+    outboundBlocked?: boolean;
+  }): Promise<boolean> {
+    const deliveryKey = `charts:${params.runId}`;
+    if (this.settledChartKeys.has(deliveryKey)) {
+      return true;
+    }
+    const existing = this.inFlightChartSettlements.get(deliveryKey);
+    if (existing) {
+      return await existing;
+    }
+    const task = (async (): Promise<boolean> => {
+      const res = await deliverTurnChartsAndWidgets({
+        backend: this.backend,
+        adapters: this.adapters,
+        webBaseUrl: this.webBaseUrl,
+        userId: params.userId,
+        threadId: params.threadId,
+        runId: params.runId,
+        platform: params.platform,
+        targetAddress: params.targetAddress,
+        inboundMessageId: params.inboundMessageId ?? null,
+        threadScopeKey: params.threadScopeKey ?? null,
+        sourceScopeKey: params.sourceScopeKey ?? params.threadScopeKey ?? null,
+        sourceGeneration: params.sourceGeneration ?? null,
+        activityOrigin: params.activityOrigin ?? "conversation",
+        charts: params.charts,
+        initialSnapshots: params.initialSnapshots,
+        widgets: params.widgets,
+        outboundBlocked: params.outboundBlocked,
+        nowFn: this.nowFn,
+      });
+      if (res.settled) {
+        if (
+          this.settledChartKeys.size >=
+          ChannelGatewayOrchestrator.MAX_SETTLED_DELIVERABLE_KEYS
+        ) {
+          const oldest = this.settledChartKeys.values().next().value;
+          if (oldest !== undefined) {
+            this.settledChartKeys.delete(oldest);
+          }
+        }
+        this.settledChartKeys.add(deliveryKey);
+      }
+      return res.settled;
+    })();
+    this.inFlightChartSettlements.set(deliveryKey, task);
+    try {
+      return await task;
+    } finally {
+      if (this.inFlightChartSettlements.get(deliveryKey) === task) {
+        this.inFlightChartSettlements.delete(deliveryKey);
       }
     }
   }

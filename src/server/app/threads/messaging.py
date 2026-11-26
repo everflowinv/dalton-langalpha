@@ -1762,30 +1762,49 @@ async def replay_thread_messages(
 
                 if has_capability(CapabilityId.CHANNEL_GATEWAY):
                     deliverables_by_run: dict[str, list[dict[str, object]]] = {}
+                    # DALTON-HOOK(channel-chart-snapshot): expose persisted chart_snapshots per run on replay_done (including command_report linked runs)
+                    from src.dalton.channel_chart_snapshots import (
+                        resolve_replay_chart_snapshots_by_run,
+                    )
+
                     responses_map = getattr(rows, "responses_by_turn", None)
                     resp_rows = (
                         responses_map.values()
                         if isinstance(responses_map, dict)
                         else ()
                     )
+                    # DALTON-HOOK(channel-chart-snapshot): propagate persisted outbound_blocked state per run on replay_done
+                    outbound_blocked_by_run: dict[str, bool] = {}
                     for resp_row in resp_rows:
                         if not isinstance(resp_row, dict):
                             continue
-                        if is_run_row_outbound_blocked(resp_row):
-                            continue
-                        resp_meta = resp_row.get("metadata")
-                        if not isinstance(resp_meta, dict):
-                            continue
-                        td = resp_meta.get("turn_deliverables")
                         rid = str(
                             resp_row.get("conversation_response_id")
                             or resp_row.get("run_id")
                             or ""
                         ).strip()
+                        blocked = is_run_row_outbound_blocked(resp_row)
+                        if rid:
+                            outbound_blocked_by_run[rid] = blocked
+                        if blocked:
+                            continue
+                        resp_meta = resp_row.get("metadata")
+                        if not isinstance(resp_meta, dict):
+                            continue
+                        td = resp_meta.get("turn_deliverables")
                         if rid and isinstance(td, list) and td:
                             deliverables_by_run[rid] = td
+                    chart_snapshots_by_run = await resolve_replay_chart_snapshots_by_run(
+                        thread_id=thread_id,
+                        queries=getattr(rows, "queries", None),
+                        responses_by_turn=responses_map if isinstance(responses_map, dict) else None,
+                    )
                     if deliverables_by_run:
                         done["turn_deliverables_by_run"] = deliverables_by_run
+                    if chart_snapshots_by_run:
+                        done["chart_snapshots_by_run"] = chart_snapshots_by_run
+                    if outbound_blocked_by_run:
+                        done["outbound_blocked_by_run"] = outbound_blocked_by_run
             seq += 1
             yield f"id: {seq}\nevent: replay_done\ndata: {json.dumps(done, default=str)}\n\n"
 

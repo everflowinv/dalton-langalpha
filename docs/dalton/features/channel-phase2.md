@@ -189,36 +189,42 @@
 
 ### 2.3 功能 ②a：系统看盘图表图层转图片并附网页交互版链接
 
-> **推进说明**：本节对应第 2 批，进入编码开发前先完成 §6.2「第 2 批开发前设计复核清单」核实收口。
+> **推进说明**：本节对应第 2 批，第 2 批开发前复核清单 2 条已由负责人拍板收口并直接落入本节与 §6.2。
 
 本阶段聚焦渲染**系统内置看盘图表图层（`chart_layer`）**：渲染页 `libs/chartkit/chartkit/render/chart-render.html`（由 `cd web && pnpm build:chart-render` 构建产物提供，见 `libs/chartkit/chartkit/_renderer.py:32-33`）接收后端行情 K 线序列与经 `chartkit.schema.parse_layer` 强类型校验的绘图结构数据（页面内仅运行系统自有绘图代码）。由于研究总监在读取同事资料时生成的图层标注或序列可能带有跨工作区分析信息，生成的 PNG 快照存入 Dalton 对象存储后**仅在发起人本人私聊（`chat_type == 'dm'`）中发送图片**并附网页交互版登录深链；**群聊与频道会话（`chat_type == 'group'`）**以及自定义交互组件（`ShowWidget` / `html_widget`）统一输出需登录鉴权的网页交互版深链。
 
-#### （1）系统看盘图表渲染、异步行情预取、部署级并发锁与私聊快照鉴权
+#### （1）系统看盘图表渲染、异步行情预取、跨进程状态持久化与私聊快照鉴权
 
 1. **复用双形态对象存储配置（覆盖 Core 默认 MinIO 与 Everflow S3/R2）**：
    - 新增快照存储辅助模块 `src/dalton/channel_snapshot_storage.py`（**新增**），直接复用 `src/dalton/chat_upload_storage.py` 的双形态凭据解析与客户端池：优先读取 `DALTON_CHAT_UPLOAD_STORAGE_*`（`docker-compose.core.yml:213-216` 已为 `DALTON_PROFILE=core` 默认配置 `http://minio:9000` 与 `chat-uploads` 存储桶），未配置时自动回退读取 Everflow 生产已有的 `DALTON_ASR_STORAGE_*`（`src/dalton/transcription_storage.py`），并在服务启动时复用桶就绪探测。
    - 快照对象统一存放在键前缀 `channel-snapshots/{thread_id}/{sha256[:16]}/` 下，与 `chat-uploads/` 聊天附件前缀相互独立，支持多后端 worker 进程直接跨进程读写。
-2. **主异步循环行情预取与双出口渲染（隔离工作线程与主流程异常）**：
-   - 复用 `libs/chartkit/chartkit/_renderer.py` 的单工作线程渲染器 `RENDERER`（`_renderer.py:302-320`）与离线打包页面 `chart-render.html`（运行在虚拟源 `https://chart-snapshot.invalid`，`_renderer.py:224` 已内置 `service_workers="block"`；在 `_launch` `:364` 启动参数补加 `--host-resolver-rules="MAP * ~NOTFOUND"`，并将 `:229` 的路由注册提升至 `context.route("**/*", handle)`，仅响应本地 `RENDER_DIR` 静态资源与内存 `api()` 路由）。
-   - **主事件循环异步取数 + 纯内存同步闭包供给渲染线程**：现有 `ChartBars`（`libs/chartkit/chartkit/_bars_source.py:40-58`）在无事件循环的 `chartkit-bars` 守护线程中同步调用 `tool(start, end)`，且 `Renderer` 每进程仅维护一条渲染工作线程。因此，在提交 `SnapshotJob`（`_renderer.py:82`）之前，先在后端**主异步事件循环**上按回合发起人 `user_id`（对齐 `src/server/app/market_data.py:12` `DataReadUserId`）调用 `src/server/services/cache/daily_cache_service.py`（`DailyCacheService`）或 `src/server/services/cache/intraday_cache_service.py`（`IntradayCacheService`）取好图层所需窗口的 OHLCV（开盘价、最高价、最低价、收盘价与成交量）数据，封装为纯内存同步闭包 `backend_market_bars_tool`（直接返回 `fetch_bars` 契约所需的 `{data, timezone, source}` 字典）交给 `SnapshotJob`。渲染超时或异常全部在快照辅助函数内部捕获并记录日志，仅跳过当前图片生成，确保 `layers.py::_publish` 与 `commands/settle.py` 主结算流程正常完成。
-   - 同时接入两处图层落库出口（均标注 `DALTON-HOOK(channel-chart-snapshot)`，在 `has_capability(CapabilityId.CHANNEL_GATEWAY)` 为真、当前会话关联发起人本人私聊渠道或私聊投递自动化、且 `is_run_outbound_blocked == False` 时触发）：
-     1) **同步工具出口**：`src/tools/chart_annotation/layers.py` 的 `_publish`（`:159`）完成 `add_layers` 落库后；
-     2) **后台命令结算出口**：`src/server/services/commands/settle.py`（`:230-241`）中脱离前台等待的后台命令通过 `cr_db.finalize` 持久化 `outbox_layers` 后。
-   - 渲染出的 PNG（默认尺寸 `1200×720`）写入 `channel-snapshots/{thread_id}/{sha256[:16]}/chart_{layer_id}.png`，并将快照元数据 `{ snapshot_key, sha256, size_bytes, width, height, artifact_type: "chart_layer", chart_id, layer_id, title }` 持久化写入运行记录元数据 `chart_snapshots`。
-3. **PostgreSQL 部署级并发锁、私聊快照读取鉴权与网页交互深链**：
-   - **部署级并发采用 PostgreSQL 锁控制**：结合进程内 `_RENDER_SEMAPHORE` 与 **PostgreSQL 顾问锁（或数据库槽位表）**协调多后端 worker 间的全局 Chromium 渲染并发（默认部署级总并发上限 `2`，单张超时 `25` 秒，单回合最多自动渲染前 `4` 张系统图表），避免多 worker 各自独立拉起超额浏览器实例；对象存储未配置、未安装 Chromium 或等待锁超时时，网关平稳发送文字结论与网页交互登录深链。
-   - 在 `src/dalton/app/channels_router.py` 新增 `GET /api/v1/dalton/channels/internal/snapshots/{snapshot_key:path}`（**新增**，路由登记 `CapabilityId.CHANNEL_GATEWAY`，解析目标平台后调用 `require_channel_platform_capability(platform)`，接收查询参数 `run_id` 与 `target_address`）：
-     - 校验 `snapshot_key` 严格匹配正则 `^channel-snapshots/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/([0-9a-f]{16})/chart_[A-Za-z0-9_.-]+\.png$`（拦截路径穿越与编码绕过）；
-     - 核验路径提取出的快照 `thread_id` 与本次 `run_id` 所属运行的 `conversation_thread_id` 完全一致，`snapshot_key` 位于该 `(thread_id, run_id)` 持久化的 `chart_snapshots` 清单内，会话归属有效且该运行 `is_run_row_outbound_blocked`（`src/dalton/colleague_outbound_guard.py:418`）为 `False`；
-     - **严格核对本人私聊目标**：核对 `target_address` 为私聊地址，且属于该 `thread_id` 发起人当前已有效绑定的本人私聊目标（飞书匹配 `dalton_channel_identities` 本人 `open_id` 单聊、Discord 匹配本人 `user_id` 私聊、微信匹配当前活跃绑定账号本人单聊）；凡群聊目标或目标地址与发起人本人私聊不一致的请求均拒绝返回图片字节，由网关改发网页交互版登录深链；核对通过并校验对象 `sha256` 一致后返回 PNG 字节流。
+2. **主异步循环行情预取、双出口同事务写 `pending` 与后台渲染（已收口复核清单 #1）**：
+   - 复用 `libs/chartkit/chartkit/_renderer.py` 的单工作线程渲染器 `RENDERER`（`_renderer.py:302-320`）与离线打包页面 `chart-render.html`（运行在虚拟源 `https://chart-snapshot.invalid`，`_renderer.py:224` 已内置 `service_workers="block"`；在 `_launch` `:364` 启动参数补加 `--host-resolver-rules=MAP * ~NOTFOUND`，并将 `:229` 的路由注册提升至 `context.route("**/*", handle)`，仅响应本地 `RENDER_DIR` 静态资源与内存 `api()` 路由）。
+   - **主事件循环异步取数 + 纯内存同步闭包供给渲染线程**：现有 `ChartBars`（`libs/chartkit/chartkit/_bars_source.py:40-58`）在无事件循环的 `chartkit-bars` 守护线程中同步调用 `tool(start, end)`，且 `Renderer` 每进程仅维护一条渲染工作线程。因此，在提交 `SnapshotJob`（`_renderer.py:82`）之前，先在后端**主异步事件循环**上按回合发起人 `user_id`（对齐 `src/server/app/market_data.py:12` `DataReadUserId`）调用 `src/server/services/cache/daily_cache_service.py`（`DailyCacheService`）或 `src/server/services/cache/intraday_cache_service.py`（`IntradayCacheService`）取好图层所需窗口的 OHLCV（开盘价、最高价、最低价、收盘价与成交量）数据，封装为纯内存同步闭包 `backend_market_bars_tool`（直接返回 `fetch_bars` 契约所需的 `{data, timezone, source}` 字典）交给 `SnapshotJob`。渲染超时或异常全部在快照后台任务内部捕获并记录日志，将该项标记为 `failed`，确保 `layers.py::_publish` 与 `commands/settle.py` 主结算流程正常完成。
+   - **PostgreSQL 跨进程状态机（同事务先写 `pending`，后台任务更新 `ready` / `failed`，10 分钟滞留清理）**：
+     - 运行记录 `conversation_responses.metadata.chart_snapshots` 每项持久化 `status: "pending" | "ready" | "failed"`（连同 `artifact_type: "chart_layer"`、`workspace_id`、`chart_id`、`symbol`、`timeframe`、`layer_id`、`title`、`command_id`、`pending_since`、`updated_at`；就绪后写入 `snapshot_key`、`sha256`、`size_bytes`、`width`、`height`；失败写入 `error`）。
+     - 同时接入两处图层落库出口（均标注 `DALTON-HOOK(channel-chart-snapshot)`，在 `has_capability(CapabilityId.CHANNEL_GATEWAY)` 为真、当前会话关联发起人本人私聊渠道或私聊投递自动化、且 `is_run_outbound_blocked == False` 时触发，单回合最多自动渲染前 `4` 张系统图表）：
+       1) **同步工具出口**：`src/tools/chart_annotation/layers.py` 的 `_publish`（`:159`）在提交图层落库的**同一数据库事务内**先向 `conversation_responses.metadata.chart_snapshots` 写入 `status = "pending"`，随后投递后台异步渲染任务；
+       2) **后台命令结算出口**：`src/server/database/runs/command_runs.py` 的 `finalize` 在提交 `outbox_layers` 与回报任务的**同一数据库事务内**先向关联运行记录 `chart_snapshots` 写入 `status = "pending"`（带 `command_id`，回报回合按 `report_source.command_id` 关联可见），随后 `src/server/services/commands/settle.py`（`:230-241`）在提交成功后投递后台异步渲染任务；
+     - 渲染出的 PNG（默认尺寸 `1200×720`）写入 `channel-snapshots/{thread_id}/{sha256[:16]}/chart_{layer_id}.png` 后，原子将对应项更新为 `status = "ready"`（失败或跳过则更新为 `status = "failed"`）。
+     - **滞留 `pending` 自动清理**：后端 `RecoveryScanner` 周期清理任务将 `pending_since` 超过 **10 分钟（600 秒）**仍处于 `status = "pending"` 的记录（例如图层提交后渲染进程异常退出导致长期 `pending`）原子标记为 `status = "failed"`。
+3. **PostgreSQL 部署级并发锁、跨进程状态轮询、私聊快照读取鉴权与网页交互深链**：
+   - **部署级并发采用 PostgreSQL 锁控制**：结合进程内 `_RENDER_SEMAPHORE` 与 **PostgreSQL 顾问锁槽位**协调多后端 worker 间的全局 Chromium 渲染并发（默认部署级总并发上限 `2`，单张超时 `25` 秒，单回合最多自动渲染前 `4` 张系统图表），避免多 worker 各自独立拉起超额浏览器实例；对象存储未配置、未安装 Chromium 或等待锁超时时，条目落为 `failed`，网关平稳发送文字结论与网页交互登录深链。
+   - 在 `src/dalton/app/channels_router.py` 新增两处内部端点（均登记 `CapabilityId.CHANNEL_GATEWAY`，解析目标平台后调用 `require_channel_platform_capability(platform)`，且静态路径 `/internal/snapshots/status` 注册在通配下载路径之前）：
+     1) **`GET /api/v1/dalton/channels/internal/snapshots/status`（新增）**：接收查询参数 `run_id`、`thread_id` 与可选 `platform`，直接以 PostgreSQL 为准返回该运行（含关联 `command_report` 后台命令）当前的 `chart_snapshots` 清单与 `has_pending` 标志，供跨进程网关轮询；
+     2) **`GET /api/v1/dalton/channels/internal/snapshots/{snapshot_key:path}`（新增）**：接收查询参数 `run_id` 与 `target_address`：
+        - 校验 `snapshot_key` 严格匹配正则 `^channel-snapshots/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/([0-9a-f]{16})/chart_[A-Za-z0-9_.-]+\.png$`（拦截路径穿越与编码绕过）；
+        - 核验路径提取出的快照 `thread_id` 与本次 `run_id` 所属运行的 `conversation_thread_id` 完全一致，`snapshot_key` 位于该 `(thread_id, run_id)`（含关联 `command_report` 命令）持久化的 `chart_snapshots` 清单内且 `status == "ready"`，会话归属有效且该运行 `is_run_row_outbound_blocked`（`src/dalton/colleague_outbound_guard.py:418`）为 `False`；
+        - **严格核对本人私聊目标**：核对 `target_address` 为私聊地址，且属于该 `thread_id` 发起人当前已有效绑定的本人私聊目标（飞书匹配 `dalton_channel_identities` 本人 `open_id` 单聊、Discord 匹配本人 `user_id` 私聊、微信匹配当前活跃绑定账号本人单聊）；凡群聊目标或目标地址与发起人本人私聊不一致的请求均拒绝返回图片字节，由网关改发网页交互版登录深链；核对通过并校验对象 `sha256` 一致后返回 PNG 字节流。
    - **网页交互深链定位**：
      - `chart_layer`：`${WEB_BASE_URL}/chat/t/${threadId}?chart=${encodeURIComponent(chartId)}&layer=${encodeURIComponent(layerId)}`（私聊连同高清 PNG 一并发出；群聊直接发送该交互深链）；
      - `html_widget`（`ShowWidget`）：本阶段统一输出网页深链 `${WEB_BASE_URL}/chat/t/${threadId}?widget=${encodeURIComponent(artifactId)}`（若已发布为对目标受众可见的监控看板则输出 `/monitors/${slug}`）；
      - 前端 `web/src/pages/ChatAgent/components/ChatView.tsx`（**新增参数解析**，标注 `// DALTON-HOOK(channel-deep-links)`）识别 `?chart=&layer=` 自动展开右侧看盘面板并定位到指定图层，识别 `?widget=` 自动滚动高亮对应组件卡片。
 
-#### （2）网关收集与三渠道投递
+#### （2）网关收集、20 秒就绪等待与三渠道投递
 
 - `src/orchestrator.ts` 在实时流（`consumeTurnSseStream`）、断线回放流（`deliverReplayFallback` / `consumeInFlightReplayRunStream`，读取 `/messages/replay` 返回的持久化 `chart_snapshots` 清单）及后台唤醒/命令回报流（`consumeBackgroundRunStream`）中按 `layer_id` 去重收集本轮系统图表元数据（以及 `html_widget` 的网页深链信息）。
+- **跨进程 `pending` 最多等待 20 秒规则**：网关在私聊结算投递图表前，对已 `ready` 的快照直接拉取图片；对仍为 `pending` 的快照按 `run_id` / `thread_id` 轮询后端 `GET /internal/snapshots/status`（以数据库为准），**最多等待 20 秒**；期间转为 `ready` 则发送 PNG 图片，超时仍为 `pending`（含渲染进程异常退出场景）或状态为 `failed` 则平稳发送网页交互深链。
 - 在回合结算时（群聊与频道会话对 `chart_layer` 与 `ShowWidget` 统一附网页交互登录深链；发起人本人私聊执行图片投递）：
   - **飞书私聊**：构造 Schema 2.0 卡片（`src/channels/feishu/format.ts`），调 `im.image.create` 上传 PNG（超过 `10 MB` 时自动使用 1x 尺寸或转 WebP 并复核体积），嵌入 `tag: "img"`（`preview: true`），底部放置 `open_url` 按钮 `[打开网页交互版]`；群聊或 `ShowWidget` 放置网页交互深链按钮。
   - **Discord 私聊**：将 PNG 作为私聊消息附件上传，并附加含 `Link Button`（`style = 5`，标签 `打开网页交互版`）的 `ActionRow`；群频道/子区或 `ShowWidget` 发送说明与 `[打开网页交互版]` / `[打开网页交互组件]` `Link Button`。
@@ -761,24 +767,21 @@ flowchart LR
 
 ---
 
-#### 第 2 批（开发前先过复核清单）：系统看盘图表图层转图片附网页交互版链接（②a）
+#### 第 2 批（已定稿，复核清单已收口）：系统看盘图表图层转图片附网页交互版链接（②a）
 
-> [!IMPORTANT]
-> **开发前前置要求**：轮到第 2 批启动编码开发前，须先对照当时最新代码逐条复核并闭合下方「第 2 批开发前设计复核清单」（共 2 条）。
-
-- **第 2 批开发前设计复核清单（共 2 条）**：
-  1. **后台命令结算与图表快照生成的跨进程时序（Codex r4 中，§2.3（1）第 2 项）**：`src/server/services/commands/settle.py` 中 `cr_db.finalize` 提交图层与回报记录后才生成并保存 PNG，另一进程可能先读取消费回报而只发出链接，或渲染进程在保存 PNG 前退出；开发前针对当时 `settle.py` 与回报流代码复核后台图层快照处理状态的持久化方案、回报等待就绪的时间预算与超时发链接规则，并补测双进程分别完成命令结算与回报投递、以及图层提交后渲染进程退出的场景。
-  2. **Core 形态默认关闭与显式启用后的私聊图片投递测试分层（Codex r4 中，§1.3、§6.2 第 2 批）**：对齐 §1.3 `DALTON_PROFILE=core` 默认关闭渠道能力的设定，开发前明确拆分两项测试与验收：① 默认 `DALTON_PROFILE=core` 下渠道端点与快照门禁保持关闭；② 在 Core 环境下显式启用 `CHANNEL_GATEWAY` 及对应平台子能力并配置凭据后，直接复用内置 `DALTON_CHAT_UPLOAD_STORAGE_*` MinIO 完成私聊系统图表 PNG 投递。
+- **第 2 批开发前设计复核清单收口定案（2 条）**：
+  1. **后台命令结算与图表快照生成的跨进程时序（已收口）**：快照生成状态持久化在 PostgreSQL（`conversation_responses.metadata.chart_snapshots` 每项携带 `status: "pending" | "ready" | "failed"`、`pending_since`、`updated_at`、`command_id` 等字段）；图层提交时在**同一数据库事务内**先写入 `pending`（覆盖同步 `_publish` 与后台命令 `command_runs.finalize`），渲染在后台异步任务中执行，完成后原子更新为 `ready`（附 `snapshot_key`、`sha256`、`size_bytes`、`width`、`height`）或 `failed`。网关投递回报时：`ready` 直接拉取发图；`pending` 轮询后端 `GET /internal/snapshots/status`（以 PostgreSQL 为准）**最多等待 20 秒**，超时或 `failed` 改发网页交互深链；渲染进程异常退出导致长期 `pending` 时，网关超时后平稳发链接，并由后端 `RecoveryScanner` 清理任务在 **10 分钟（600 秒）**后把滞留 `pending` 标记为 `failed`。
+  2. **Core 形态默认关闭与显式启用后的私聊图片投递测试分层（已收口）**：拆分两层独立测试与验收：① 默认 `DALTON_PROFILE=core` 下渠道端点（含 `/internal/snapshots/status` 与 `/internal/snapshots/{snapshot_key:path}`）与快照渲染门禁全部保持关闭；② Core 环境下显式启用 `CHANNEL_GATEWAY` 及对应平台子能力并配置凭据后，直接复用内置 `DALTON_CHAT_UPLOAD_STORAGE_*`（MinIO）完成私聊系统图表 PNG 投递（单元测试中使用 `create_autospec` 替身对象存储保持接口签名）。
 - **主要改动文件**：
-  - **后端 Dalton 文件**：`src/dalton/channel_snapshot_storage.py`（**新增**，复用 `DALTON_CHAT_UPLOAD_STORAGE_*` / `DALTON_ASR_STORAGE_*` 及 PostgreSQL 并发顾问锁）、`src/dalton/app/channels_router.py`（新增 `/internal/snapshots/{snapshot_key:path}`，核验本人私聊绑定与运行一致性）、`src/dalton/capabilities.py`。
-  - **后端与前端上游文件（均加 `DALTON-HOOK`）**：`src/tools/chart_annotation/layers.py`（`_publish` 主循环预取行情与快照出口）、`src/server/services/commands/settle.py`（后台命令 `outbox_layers` 快照出口）、`libs/chartkit/chartkit/_renderer.py`（`--host-resolver-rules`、`context.route` 与纯内存同步行情闭包适配）、`web/src/pages/ChatAgent/components/ChatView.tsx`（解析 `?chart=&layer=` 与 `?widget=`）。
-  - **网关文件**：`src/orchestrator.ts`、`src/delivery-service.ts`、`src/backend-client.ts`、飞书端 `format.ts`、Discord 端 `send.ts`、微信端 `send.ts`。
+  - **后端 Dalton 文件**：`src/dalton/channel_snapshot_storage.py`（**新增**，复用 `DALTON_CHAT_UPLOAD_STORAGE_*` / `DALTON_ASR_STORAGE_*` 及 PostgreSQL 并发顾问锁）、`src/dalton/channel_chart_snapshots.py`（**新增**，跨进程 `pending/ready/failed` 状态机、主循环行情预取与后台渲染、10 分钟滞留清理、私聊快照鉴权）、`src/dalton/app/channels_router.py`（新增 `/internal/snapshots/status` 与 `/internal/snapshots/{snapshot_key:path}`）、`src/dalton/capabilities.py`。
+  - **后端与前端上游文件（均加 `DALTON-HOOK`）**：`src/ptc_agent/agent/tools/command_handoff.py`、`src/tools/chart_annotation/layers.py`（`_publish` 同事务写 `pending` 与后台渲染出口）、`src/server/database/runs/command_runs.py` 与 `src/server/services/commands/settle.py`（后台命令 `outbox_layers` 同事务写 `pending` 与后台渲染出口）、`src/server/services/runs/recovery.py`（10 分钟滞留 `pending` 清理）、`src/server/services/runs/finalization.py`、`src/server/services/runs/executor.py`、`src/server/services/runs/stream_writer.py`、`src/server/app/threads/messaging.py`（`run_end` 与 `/messages/replay` 暴露 `chart_snapshots`）、`libs/chartkit/chartkit/_renderer.py`（`--host-resolver-rules`、`context.route` 与超时参数）、`web/src/pages/ChatAgent/components/ChatView.tsx` 与 `MessageContentSegments.tsx`（解析 `?chart=&layer=` 与 `?widget=`）。
+  - **网关文件**：`src/orchestrator.ts`、`src/delivery-service.ts`、`src/backend-client.ts`、`src/channels/adapter.ts`、飞书端 `format.ts` / `monitor.ts`、Discord 端 `send.ts` / `index.ts`、微信端 `send.ts`。
 - **测试覆盖**：
-  1. **Core 存储复用、主循环异步取数与 Postgres 部署级并发锁**：验证主事件循环按发起人 `user_id` 从 `DailyCacheService` / `IntradayCacheService` 预取 OHLCV 并交给 `chartkit-bars` 线程同步读取生成 PNG，多 worker 下由 PostgreSQL 顾问锁限制全局渲染并发，渲染失败只跳过当前图且保持 `settle` 主流程正常完成；分别覆盖 Core 默认关闭态与显式开启渠道能力后的 MinIO 快照读写；
-  2. **仅本人私聊发图、本人私聊 `target_address` 鉴权及群聊/`ShowWidget` 深链边界**：验证发起人本人私聊正常获取并发送 `chart_layer` PNG 快照，而群聊目标、`target_address` 非该会话发起人当前绑定本人私聊、快照 `thread_id` 与运行不一致、以及 `is_run_row_outbound_blocked == True` 的受限轮次均改发网页交互登录深链；验证 `ShowWidget`（`html_widget`）统一输出网页交互深链；
-  3. **严格键校验与断流回放**：验证 `/internal/snapshots/{snapshot_key:path}` 拦截 `..`、编码绕过与非本运行 `snapshot_key`；验证 SSE 断流重连回放与前端 `?chart=&layer=`、`?widget=` 定位。
+  1. **跨进程时序、Core 双层测试、主循环异步取数与 Postgres 部署级并发锁**：验证双进程分别完成后台命令结算与回报投递（进程 A 同事务写 `pending` 后后台写 `ready`，进程 B 实时查库并下发）、图层提交后渲染进程异常退出（网关 20 秒超时转深链 + 后端 10 分钟清理标 `failed`）、主事件循环按发起人 `user_id` 从 `DailyCacheService` / `IntradayCacheService` 预取 OHLCV 并交给 `chartkit-bars` 线程同步读取生成 PNG、多 worker 下 PostgreSQL 顾问锁限制全局渲染并发；分别覆盖默认 `DALTON_PROFILE=core` 关闭态门禁与 Core 显式开启 `CHANNEL_GATEWAY` + 平台子能力后经 `DALTON_CHAT_UPLOAD_STORAGE_*` 替身对象存储完成私聊 PNG 投递；
+  2. **仅本人私聊发图、本人私聊 `target_address` 鉴权及群聊/`ShowWidget` 深链边界**：验证发起人本人私聊正常获取并发送 `chart_layer` PNG 快照（飞书 Schema 2.0 卡片内嵌图片 + 按钮、Discord multipart PNG + Link Button、微信加密图片 + 深链），而群聊目标、`target_address` 非该会话发起人当前绑定本人私聊、快照 `thread_id` 与运行不一致、以及 `is_run_row_outbound_blocked == True` 的受限轮次均改发网页交互登录深链；验证 `ShowWidget`（`html_widget`）统一输出网页交互深链；
+  3. **共享契约夹具、严格键校验与断流回放**：新增后端真实路由与网关 Vitest 共用契约夹具测试（覆盖 `/internal/snapshots/status`、`/internal/snapshots/{snapshot_key:path}` 鉴权与错误码、`replay_done` `chart_snapshots_by_run`）；验证拦截 `..`、编码绕过与非本运行 `snapshot_key`；验证 SSE 断流重连回放与前端 `?chart=&layer=`、`?widget=` 定位。
 - **上线验收标准**：
-  - 完成第 2 批复核清单收口后，显式启用渠道的 Core 安装与 Everflow 环境下，发起人私聊直接收到高清系统看盘图表图片并附网页交互视图入口，群聊统一发送网页交互登录深链；`bash scripts/dalton/check_hooks.sh --strict` 通过。
+  - 显式启用渠道的 Core 安装与 Everflow 环境下，发起人私聊直接收到高清系统看盘图表图片并附网页交互视图入口，后台命令跨进程结算与渲染异常均可平稳收敛，群聊统一发送网页交互登录深链；`bash scripts/dalton/check_hooks.sh --strict` 通过。
 
 ---
 

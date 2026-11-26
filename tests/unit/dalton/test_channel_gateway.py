@@ -1991,7 +1991,7 @@ class InMemoryChannelStore:
             ]
 
         if "UPDATE dalton_channel_automation_runs" in norm:
-            f_status, f_text, tid, targets_json, exec_id = params
+            f_status, f_text, tid, run_id, targets_json, exec_id = params
             r = self.automation_runs[str(exec_id)]
             r["status"] = "finished" if "SET status = 'finished'" in norm else "finishing"
             if f_status is not None:
@@ -2000,6 +2000,8 @@ class InMemoryChannelStore:
                 r["final_text"] = str(f_text)
             if tid is not None:
                 r["thread_id"] = UUID(str(tid))
+            if run_id is not None:
+                r["run_id"] = str(run_id)
             r["targets"] = (
                 targets_json.obj
                 if hasattr(targets_json, "obj")

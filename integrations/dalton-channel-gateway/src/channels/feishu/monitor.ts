@@ -1344,10 +1344,15 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       );
     }
 
+    if (options.verifyRecipientBeforeSend) {
+      await options.verifyRecipientBeforeSend();
+    }
+
     const res = await sendCardFeishu(client, {
       to: target,
       card: resolvedCard,
       replyToMessageId: options.replyToMessageId,
+      replyInThread: options.replyInThread,
     });
     return {
       messageId: res.messageId,

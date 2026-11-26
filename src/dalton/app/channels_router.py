@@ -427,6 +427,7 @@ class AutomationRunFinishRequest(BaseModel):
 
     status: str | None = None
     thread_id: str | None = None
+    run_id: str | None = None
     final_text: str | None = None
     targets: list[dict[str, Any]] | None = None
     mark_finished: bool = False
@@ -859,6 +860,68 @@ async def internal_deliverables_download_endpoint(
             media_type=mime_type,
             headers={
                 "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_name}",
+                "Cache-Control": "no-store",
+            },
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.get(
+    "/internal/snapshots/status",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_snapshots_status_endpoint(
+    run_id: str = Query(..., min_length=1),
+    thread_id: str | None = Query(default=None),
+    platform: str | None = Query(default=None),
+) -> Any:
+    """Query Postgres-authoritative chart_snapshots status (pending/ready/failed) for cross-process polling."""
+    from src.dalton.channel_chart_snapshots import get_run_chart_snapshots_status
+
+    try:
+        return await get_run_chart_snapshots_status(
+            run_id=run_id,
+            thread_id=thread_id,
+            platform=platform,
+        )
+    except HTTPException as exc:
+        return _handle_structured_http_error(exc)
+
+
+@channels_router.get(
+    "/internal/snapshots/{snapshot_key:path}",
+    dependencies=[Depends(require_channel_service_token)],
+)
+async def internal_snapshots_download_endpoint(
+    snapshot_key: str,
+    request: Request,
+    run_id: str = Query(..., min_length=1),
+    target_address: str = Query(..., min_length=1),
+    delivery_key: str | None = Query(default=None),
+    delivery_attempt: int | None = Query(default=None),
+) -> Any:
+    """Download a verified DM-only PNG chart snapshot after strict key, run, and owner DM binding checks."""
+    from urllib.parse import quote as _url_quote
+
+    from src.dalton.channel_chart_snapshots import download_verified_chart_snapshot
+
+    try:
+        raw_epoch = request.headers.get("X-Gateway-Epoch")
+        content_bytes, mime_type, filename = await download_verified_chart_snapshot(
+            snapshot_key=snapshot_key,
+            run_id=run_id,
+            target_address=target_address,
+            delivery_key=delivery_key,
+            delivery_attempt=delivery_attempt,
+            gateway_epoch=raw_epoch,
+        )
+        encoded_name = _url_quote(filename, safe="")
+        return Response(
+            content=content_bytes,
+            media_type=mime_type,
+            headers={
+                "Content-Disposition": f"inline; filename*=UTF-8''{encoded_name}",
                 "Cache-Control": "no-store",
             },
         )
@@ -1302,6 +1365,7 @@ async def internal_automation_runs_finish_endpoint(
         execution_id=execution_id,
         status=body.status,
         thread_id=body.thread_id,
+        run_id=body.run_id,
         final_text=body.final_text,
         targets=body.targets,
         mark_finished=body.mark_finished,

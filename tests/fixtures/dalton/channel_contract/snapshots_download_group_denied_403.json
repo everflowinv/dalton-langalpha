@@ -1,0 +1,13 @@
+{
+  "request": {
+    "method": "GET",
+    "path": "/api/v1/dalton/channels/internal/snapshots/channel-snapshots/11111111-1111-4111-8111-111111111111/567e3611094b5371/chart_layer-nvda-1.png?run_id=run-snap-ready-1&target_address=feishu%3Aoc_grp_1"
+  },
+  "response": {
+    "body": {
+      "code": "snapshot_dm_only",
+      "message": "Chart snapshots are only available for direct messages."
+    },
+    "status": 403
+  }
+}

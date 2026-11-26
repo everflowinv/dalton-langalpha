@@ -102,6 +102,8 @@ export interface SendTextChunkOptions {
   weixinAccountId?: string | null;
   /** Optional abort signal created before preflight to cancel on lease loss or account change. */
   signal?: AbortSignal;
+  /** Optional Discord message components (e.g. ActionRow with Link Button). */
+  components?: Array<Record<string, unknown>>;
 }
 
 export interface SendTextChunkResult {
@@ -142,6 +144,8 @@ export interface SendFileOptions {
   weixinAccountId?: string | null;
   /** Optional abort signal created before preflight to cancel on lease loss or account change. */
   signal?: AbortSignal;
+  /** Optional Discord message components (e.g. ActionRow with Link Button). */
+  components?: Array<Record<string, unknown>>;
 }
 
 export interface SendFileResult {
@@ -170,6 +174,10 @@ export interface SendCardOptions {
   card: Record<string, unknown>;
   images?: SendCardImageInput[];
   replyToMessageId?: string | null;
+  /** Feishu: reply in topic (`reply_in_thread: true`) for bot-owned group topics. */
+  replyInThread?: boolean;
+  /** Optional DM recipient re-verification called after image upload and before card dispatch. */
+  verifyRecipientBeforeSend?: () => Promise<void>;
 }
 
 export interface SendCardResult {
