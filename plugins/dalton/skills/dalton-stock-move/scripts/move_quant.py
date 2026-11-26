@@ -47,7 +47,7 @@ HIST_LOOKBACK_DAYS = 60      # 窗口起点前 60 个交易日计算日超额标
 MIN_HIST_SAMPLES = 20        # 历史样本数 > 20 才计算 σ 和 z 值
 ADTV_LOOKBACK_DAYS = 20      # 当日成交量对比前 20 个交易日均量（不含当日）
 
-PRIVATE_TICKERS = {"SPCX", "OPENAI", "ANTHROPIC"}
+PRIVATE_TICKERS = {"OPENAI"}
 DEFAULT_FUTURES = ["NQ=F", "ES=F"]
 NON_US_EXTENDED_UNSUPPORTED_SUFFIXES = (
     ".HK", ".SH", ".SS", ".SZ", ".T", ".L", ".KS", ".KQ", ".TW", ".TWO",

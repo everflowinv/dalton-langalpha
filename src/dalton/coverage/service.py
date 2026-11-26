@@ -785,6 +785,10 @@ async def get_company_coverage(*, conn: Any = None) -> dict[str, Any]:
     for row in rows:
         if not isinstance(row, Mapping):
             continue
+        # Item 14: shared company coverage excludes radar / unknown tiers
+        row_tier = str(row.get("tier") or "").strip().lower()
+        if row_tier not in ("core", "watch"):
+            continue
         uid = str(row.get("user_id") or "").strip()
         if not uid:
             continue
@@ -1021,9 +1025,23 @@ async def render_coverage_yaml(user_id: str, *, conn: Any = None) -> str:
 
 
 async def render_company_coverage_yaml(*, conn: Any = None) -> str:
-    """Render the company-execution coverage union as YAML."""
+    """Render the shared Home company-execution coverage scope as YAML (tickers only; no personal tiers/tags/radar)."""
     doc = await get_company_coverage(conn=conn)
-    return dump_coverage_yaml(doc)
+    scope_companies = [
+        {
+            "ticker": str(c.get("ticker") or "").strip().upper(),
+            "market": str(c.get("market") or "").strip().upper(),
+        }
+        for c in (doc.get("companies") or [])
+        if c.get("ticker")
+    ]
+    scope_doc: dict[str, Any] = {
+        "schema_version": doc.get("schema_version", 1),
+        "as_of": doc.get("as_of"),
+        "generated_at": doc.get("generated_at"),
+        "companies": scope_companies,
+    }
+    return dump_coverage_yaml(scope_doc)
 
 
 async def _resolve_home_sandbox_backend(user_id: str) -> Any:
@@ -1784,6 +1802,28 @@ async def add_user_coverage_tickers(
     norm_tier = normalize_tier(tier, default="watch")
     norm_source = normalize_source(source, default="chat")
 
+    if conn is None and group_id is None:
+        from src.dalton.watchlist.service import WatchlistMutationService
+
+        res = await WatchlistMutationService().execute_mutation(
+            uid,
+            action="add",
+            tickers=list(tickers),
+            tier=norm_tier,
+            source=norm_source,
+            prevalidated=prevalidated,
+            sync_home=sync_home,
+        )
+        added_companies = list(res.get("added") or [])
+        units_unavailable = (
+            await _overlay_canonical_unit_workspaces(uid, added_companies)
+            if added_companies
+            else False
+        )
+        if units_unavailable:
+            res["units_unavailable"] = True
+        return res
+
     if prevalidated is not None:
         valid_items: list[dict[str, Any]] = []
         not_found: list[str] = []
@@ -1877,11 +1917,7 @@ async def remove_user_coverage_tickers(
     user_id: str,
     tickers: Sequence[str],
 ) -> dict[str, Any]:
-    """Remove tickers from `user_id`'s coverage roster.
-
-    If a removed ticker has an existing company workspace under `user_id`,
-    notes that the workspace and its automations are not deleted.
-    """
+    """Remove tickers from `user_id`'s coverage roster via WatchlistMutationService (same-tx Outbox + reconciler)."""
     uid = str(user_id or "").strip()
     if not uid:
         raise ValueError("user_id is required")
@@ -1898,32 +1934,13 @@ async def remove_user_coverage_tickers(
             "home_synced": False,
         }
 
-    ws_by_ticker = await _user_workspace_tickers(uid)
-    preserved_workspaces = [t for t in cleaned if t in ws_by_ticker]
+    from src.dalton.watchlist.service import WatchlistMutationService
 
-    removed = await coverage_db.delete_coverage_tickers(uid, cleaned)
-    invalidate_user_aliases_cache(uid)
-    not_found = [t for t in cleaned if t not in set(removed)]
-    if removed and await coverage_db.count_coverage_rows(uid) > 0:
-        await ensure_user_earnings_calendar_automation(uid)
-    home_synced = await sync_user_coverage_to_home(uid)
-
-    notice: str | None = None
-    if preserved_workspaces:
-        notice = (
-            f"{', '.join(preserved_workspaces)} 已有公司 workspace，workspace 和自动任务不会被删除。"
-        )
-
-    return {
-        "ok": True,
-        "removed": removed,
-        "removed_tickers": removed,
-        "not_found": not_found,
-        "workspaces_preserved": preserved_workspaces,
-        "notice": notice,
-        "workspace_notice": notice,
-        "home_synced": home_synced,
-    }
+    return await WatchlistMutationService().execute_mutation(
+        uid,
+        action="remove",
+        tickers=cleaned,
+    )
 
 
 async def set_user_coverage_tier(
@@ -2383,7 +2400,7 @@ async def add_coverage_group(
     default_tier: str = "watch",
     auto_refresh: bool = True,
 ) -> dict[str, Any]:
-    """Create a coverage rule group and upsert its resolved companies with `source='group'`."""
+    """Create a coverage rule group via WatchlistMutationService (same-tx Outbox + reconciler)."""
     uid = str(user_id or "").strip()
     if not uid:
         raise ValueError("user_id is required")
@@ -2392,79 +2409,35 @@ async def add_coverage_group(
         raise ValueError("label is required")
     norm_tier = normalize_tier(default_tier, default="watch")
 
-    preview = await preview_coverage_group(clean_label, criteria)
-    resolved_companies = preview.get("companies") or []
-    rejected_tickers = list(preview.get("not_found") or [])
-    prevalidated = {str(c["ticker"]).upper(): c for c in resolved_companies if c.get("ticker")}
+    from src.dalton.watchlist.service import WatchlistMutationService
 
-    now_utc = datetime.now(timezone.utc)
-    async with coverage_db.get_db_connection() as conn:
-        async with conn.transaction():
-            await coverage_db.acquire_coverage_advisory_lock(conn, uid)
-            group_row = await coverage_db.insert_coverage_group(
-                uid,
-                label=clean_label,
-                criteria=dict(criteria),
-                default_tier=norm_tier,
-                auto_refresh=bool(auto_refresh),
-                last_resolved_at=now_utc,
-                conn=conn,
-            )
-            group_id = str(group_row["group_id"])
-            add_res = await add_user_coverage_tickers(
-                uid,
-                list(prevalidated.keys()),
-                tier=norm_tier,
-                source="group",
-                group_id=group_id,
-                prevalidated=prevalidated,
-                conn=conn,
-                ensure_automation=False,
-                sync_home=False,
-            )
-
-    invalidate_user_aliases_cache(uid)
-    automation_res: dict[str, Any] = {}
-    if prevalidated:
-        automation_res = await ensure_user_earnings_calendar_automation(uid)
-    home_synced = await sync_user_coverage_to_home(uid)
-
-    group_out: dict[str, Any] = {
-        "ok": True,
-        "group": group_row,
-        "resolved_count": len(prevalidated),
-        "added_tickers": add_res.get("added_tickers", []),
-        "not_found": rejected_tickers,
-        "rejected": rejected_tickers,
-        "automation": automation_res or None,
-        "automation_created": automation_res.get("action") == "created",
-        "home_synced": home_synced,
-    }
-    if add_res.get("units_unavailable"):
-        group_out["units_unavailable"] = True
-    return group_out
+    return await WatchlistMutationService().execute_mutation(
+        uid,
+        action="add_group",
+        label=clean_label,
+        criteria=criteria,
+        default_tier=norm_tier,
+        auto_refresh=auto_refresh,
+    )
 
 
 async def remove_coverage_group(
     user_id: str,
     group_id: str,
 ) -> dict[str, Any]:
-    """Delete a coverage group and remove coverage entries added exclusively by that group."""
+    """Delete a coverage group via WatchlistMutationService (same-tx Outbox + reconciler)."""
     uid = str(user_id or "").strip()
     gid = str(group_id or "").strip()
     if not uid or not gid:
         raise ValueError("user_id and group_id are required")
 
-    res = await coverage_db.delete_coverage_group_and_exclusive_members(uid, gid)
-    invalidate_user_aliases_cache(uid)
-    if await coverage_db.count_coverage_rows(uid) > 0:
-        await ensure_user_earnings_calendar_automation(uid)
-    home_synced = await sync_user_coverage_to_home(uid)
-    return {
-        "ok": True,
-        **res,
-        "home_synced": home_synced,
-    }
+    from src.dalton.watchlist.service import WatchlistMutationService
+
+    return await WatchlistMutationService().execute_mutation(
+        uid,
+        action="remove_group",
+        group_id=gid,
+    )
 
 
 async def resolve_coverage_group(
@@ -2566,11 +2539,35 @@ async def resolve_coverage_group(
                 uid, gid, last_resolved_at=resolved_ts, conn=conn
             )
 
+            # Item 5: insert Outbox reconcile job in the SAME transaction as group resolution
+            from src.dalton.watchlist.policies import (
+                get_user_tier_policies,
+                insert_reconcile_job,
+            )
+
+            live_policies = await get_user_tier_policies(uid, conn=conn)
+            outbox_job_resolve = await insert_reconcile_job(
+                uid,
+                trigger_action="resolve_group",
+                target_policy_versions={
+                    t: p.policy_version for t, p in live_policies.items()
+                },
+                pending_tickers=list(new_tickers),
+                override_user_pause=False,
+                conn=conn,
+            )
+
     invalidate_user_aliases_cache(uid)
 
     if matched_by_ticker or existing_rows:
         await ensure_user_earnings_calendar_automation(uid)
-    home_synced = await sync_user_coverage_to_home(uid) if sync_home else False
+
+    from src.dalton.watchlist.reconciler import TierPolicyReconciler
+
+    reconcile_res = await TierPolicyReconciler().reconcile_job(
+        uid, str(outbox_job_resolve["job_id"]), sync_home=sync_home
+    )
+    home_synced = bool(reconcile_res.get("yaml_synced", False)) if sync_home else False
 
     resolve_out: dict[str, Any] = {
         "ok": True,
@@ -2580,6 +2577,8 @@ async def resolve_coverage_group(
         "stale_tickers": marked_stale,
         "not_found": rejected_tickers,
         "rejected": rejected_tickers,
+        "job_id": str(outbox_job_resolve["job_id"]),
+        "reconcile_status": reconcile_res.get("status"),
         "home_synced": home_synced,
     }
     if add_res.get("units_unavailable"):

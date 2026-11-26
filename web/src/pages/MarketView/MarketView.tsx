@@ -2,11 +2,17 @@ import React, { useState, useRef, useEffect, useEffectEvent, useCallback, useMem
 import { useNavigate, useSearchParams } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
-import { ArrowLeft, Info } from 'lucide-react';
+import { Info } from 'lucide-react';
 import { useToast } from '@/components/ui/use-toast';
-// DALTON-HOOK(watchlist): gate full-page personal watchlist route on Dalton build
-import { isDaltonBuild } from '@/config/brand';
+// DALTON-HOOK(watchlist): Dalton personal watchlist route & toolbar helpers
 import { WatchlistWorkspace } from './components/watchlist/WatchlistWorkspace';
+import {
+  BackToWatchlistButton,
+  navigateDaltonChartJump,
+  shouldConsumeMarketRouteParam,
+  shouldShowDaltonWatchlist,
+  syncDaltonMarketSymbolParam,
+} from './components/watchlist/marketViewWatchlistHook';
 import './MarketView.css';
 import StockHeader from './components/StockHeader';
 import MarketChart from './components/MarketChart';
@@ -19,7 +25,7 @@ import MarketChatPanel from './components/MarketChatPanel';
 import { QuoteList } from './components/quoteList/QuoteList';
 import { QuoteListDrawer } from './components/quoteList/QuoteListDrawer';
 import { INTERVALS } from './utils/chartConstants';
-import { MARKET_VIEW_ROUTE_PARAMS, buildMarketViewUrl, readMarketViewRoute } from './utils/marketRoute';
+import { MARKET_VIEW_ROUTE_PARAMS, readMarketViewRoute } from './utils/marketRoute';
 import { useWorkspaces } from '@/hooks/useWorkspaces';
 import { homeWorkspaceQuery, resolveChatWorkspace } from '@/hooks/useHomeWorkspace';
 import type { Workspace } from '@/types/api';
@@ -109,8 +115,7 @@ function MarketViewInner() {
   // and React bails, so the link's conversation survives the landing.
   const [openingRoute] = useState(() => readMarketViewRoute(searchParams));
   // DALTON-HOOK(watchlist): `/market` without `?symbol=` opens the full personal watchlist in Dalton builds
-  const routeHasSymbol = Boolean(readMarketViewRoute(searchParams).symbol);
-  const showWatchlistView = isDaltonBuild && !routeHasSymbol;
+  const showWatchlistView = shouldShowDaltonWatchlist(searchParams);
   // Every way in (link, saved pref, search, sidebar, chip) lands on the display
   // spelling, so a `600519.SS` link, its header, pref and chart keys all read
   // `600519.SH` from the first render.
@@ -276,15 +281,7 @@ function MarketViewInner() {
       setSelectedInterval((cur) => (cur === tf ? cur : tf));
     }
     // DALTON-HOOK(watchlist): push chart URL when jumping from watchlist list view so Back returns to /market
-    if (isDaltonBuild) {
-      navigate(
-        buildMarketViewUrl({
-          symbol: sym,
-          ...(timeframe ? { timeframe: normalizeTimeframe(timeframe) } : {}),
-        }),
-        { replace: !showWatchlistView },
-      );
-    }
+    navigateDaltonChartJump(navigate, sym, timeframe ? normalizeTimeframe(timeframe) : undefined, showWatchlistView);
   }, [selectedStock, navigate, showWatchlistView]);
 
   // A request to show layers made while the page is open (the agent publishing
@@ -351,9 +348,9 @@ function MarketViewInner() {
       setChatReturnPath(route.returnTo);
     }
     // `thread` stays for MarketChatPanel, which consumes it itself.
-    // DALTON-HOOK(watchlist): keep `symbol` and `tf` in the URL so reload and back/forward between /market and /market?symbol= stay lossless
+    // DALTON-HOOK(watchlist): keep `symbol` and `tf` in URL for Dalton back/forward between /market and /market?symbol=
     const consumed = MARKET_VIEW_ROUTE_PARAMS.filter(
-      (key) => key !== 'thread' && (!isDaltonBuild || (key !== 'symbol' && key !== 'tf')) && searchParams.has(key),
+      (key) => shouldConsumeMarketRouteParam(key) && searchParams.has(key),
     );
     if (consumed.length > 0) {
       setSearchParams((prev) => {
@@ -373,13 +370,7 @@ function MarketViewInner() {
     setChartMeta(null);
     setShowOverview(false);
     // DALTON-HOOK(watchlist): reflect symbol switches in the URL in Dalton builds
-    if (isDaltonBuild && nextSym) {
-      setSearchParams((prev) => {
-        const next = new URLSearchParams(prev);
-        next.set('symbol', nextSym);
-        return next;
-      }, { replace: true });
-    }
+    syncDaltonMarketSymbolParam(setSearchParams, nextSym);
   }, [setSearchParams]);
 
   // Subscribe selected stock to WS feed
@@ -594,28 +585,13 @@ function MarketViewInner() {
     setChartMeta(null);
     setShowOverview(false);
     // DALTON-HOOK(watchlist): sync symbol picks to URL
-    if (isDaltonBuild && nextSym) {
-      setSearchParams((prev) => {
-        const next = new URLSearchParams(prev);
-        next.set('symbol', nextSym);
-        return next;
-      }, { replace: true });
-    }
+    syncDaltonMarketSymbolParam(setSearchParams, nextSym);
   }, [setSearchParams]);
 
   // DALTON-HOOK(watchlist): button returning from K-line view to `/market` personal watchlist
-  const backToWatchlistButton = isDaltonBuild ? (
-    <button
-      type="button"
-      data-testid="back-to-watchlist-btn"
-      onClick={() => navigate('/market')}
-      className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs font-medium hover:bg-(--color-bg-hover) mr-1"
-      style={{ color: 'var(--color-text-secondary)' }}
-    >
-      <ArrowLeft className="h-3.5 w-3.5" />
-      <span>{t('marketView:watchlist.backToWatchlist')}</span>
-    </button>
-  ) : null;
+  const backToWatchlistButton = (
+    <BackToWatchlistButton onBack={() => navigate('/market')} label={t('marketView:watchlist.backToWatchlist')} />
+  );
 
   // The chart toolbar's own end: the watchlist and holdings, then the company overview.
   const toolbarTrail = useMemo(() => (

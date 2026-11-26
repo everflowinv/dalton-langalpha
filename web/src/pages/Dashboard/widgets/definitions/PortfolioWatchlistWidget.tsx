@@ -1,11 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useLocale } from '@/hooks/useLocale';
 import { isDaltonBuild } from '@/config/brand'; // DALTON-HOOK(watchlist)
 import { AnimatePresence } from '@/lib/framer';
 import { SwapCell } from '@/components/ui/crossfade';
-import { ArrowRight, Wallet } from 'lucide-react';
+import { Wallet } from 'lucide-react';
 import { useDashboardContext } from '../framework/DashboardDataContext';
 import { registerWidget } from '../framework/WidgetRegistry';
 import { useWidgetContextExport } from '../framework/contextSnapshot';
@@ -19,15 +18,18 @@ import { RowAttachButton } from '../../components/RowAttachButton';
 import type { WidgetRenderProps } from '../types';
 import { formatSignedPct2 } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
 import { watchlistQuoteRow } from '../../hooks/useWatchlistData';
-import {
-  coverageQuoteRow,
-  MAX_DASHBOARD_COVERAGE_QUOTES,
-  type CoverageWatchlistRow,
-} from '../../hooks/useCoverageWatchlistData'; // DALTON-HOOK(watchlist)
 import type { WatchlistTier } from '@/lib/dalton/watchlist'; // DALTON-HOOK(watchlist)
+import {
+  buildCoverageFullContextExport,
+  buildCoverageRowContextExport,
+  CoverageWatchlistTabPanel,
+  getPortfolioWatchlistTabs,
+  normalizeCoverageContext,
+  resolveInitialPortfolioWatchlistTab,
+  type PortfolioWatchlistTabKey,
+} from '../../components/dalton/CoverageWatchlistTab'; // DALTON-HOOK(watchlist)
 import { WidgetCardMeta } from '../framework/widgetCardSlots';
 import {
-  CoverageWatchlistRowItem, // DALTON-HOOK(watchlist)
   HoldingsAddButton,
   HoldingsSkeleton,
   useHoldingsSkeletonRows,
@@ -46,14 +48,12 @@ import {
 } from './_holdingsHelpers';
 
 // DALTON-HOOK(watchlist): include personal 'coverage' tab first in Dalton builds
-type PWTabKey = 'coverage' | 'watchlist' | 'portfolio';
+type PWTabKey = PortfolioWatchlistTabKey;
 
 type PortfolioWatchlistConfig = {
   defaultTab?: PWTabKey;
   valuesHidden?: boolean;
 };
-
-const EMPTY_COVERAGE_ROWS: CoverageWatchlistRow[] = [];
 
 function PortfolioWatchlistWidget({
   instance,
@@ -61,7 +61,6 @@ function PortfolioWatchlistWidget({
 }: WidgetRenderProps<PortfolioWatchlistConfig>) {
   const { t } = useTranslation();
   const locale = useLocale();
-  const navigate = useNavigate();
   const {
     coverage: rawCoverage,
     portfolio,
@@ -71,36 +70,19 @@ function PortfolioWatchlistWidget({
     dashboard,
   } = useDashboardContext();
 
-  // DALTON-HOOK(watchlist): normalize optional coverage context for legacy test harnesses
-  const coverage = rawCoverage ?? {
-    rows: EMPTY_COVERAGE_ROWS,
-    totalCount: 0,
-    quotedLimit: MAX_DASHBOARD_COVERAGE_QUOTES,
-    counts: { core: 0, watch: 0, radar: 0, total: 0, groups: 0 },
-    loading: false,
-    loaded: true,
-    refetch: async () => undefined,
-  };
-
-  // DALTON-HOOK(watchlist): preserve saved defaultTab verbatim; for new cards without defaultTab, auto-select 'coverage' when non-empty
+  // DALTON-HOOK(watchlist): normalize coverage context and preserve saved defaultTab
+  const coverage = normalizeCoverageContext(rawCoverage);
   const savedDefaultTab = instance.config.defaultTab;
   const userPickedTabRef = useRef(false);
-  const [activeTab, setActiveTab] = useState<PWTabKey>(() => {
-    if (savedDefaultTab) {
-      if (!isDaltonBuild && savedDefaultTab === 'coverage') return 'watchlist';
-      return savedDefaultTab;
-    }
-    if (isDaltonBuild && coverage.totalCount > 0) return 'coverage';
-    return 'watchlist';
-  });
+  const [activeTab, setActiveTab] = useState<PWTabKey>(() =>
+    resolveInitialPortfolioWatchlistTab(savedDefaultTab, coverage.totalCount),
+  );
   const [coverageTier, setCoverageTier] = useState<WatchlistTier | 'all'>('all');
   const [valuesHidden, setValuesHidden] = useState(!!instance.config.valuesHidden);
 
   useEffect(() => {
     if (savedDefaultTab || userPickedTabRef.current || !isDaltonBuild) return;
-    if (coverage.loaded && coverage.totalCount > 0 && activeTab !== 'coverage') {
-      setActiveTab('coverage');
-    }
+    if (coverage.loaded && coverage.totalCount > 0 && activeTab !== 'coverage') setActiveTab('coverage');
   }, [savedDefaultTab, coverage.loaded, coverage.totalCount, activeTab]);
 
   const filteredCoverageRows = useMemo(
@@ -113,26 +95,17 @@ function PortfolioWatchlistWidget({
   // active tab's row collection.
   useWidgetContextExport(instance.id, {
     full: () => {
-      // --- DALTON-HOOK(watchlist): begin ---
+      // DALTON-HOOK(watchlist): export personal watchlist tab snapshot
       if (activeTab === 'coverage') {
-        const rows = filteredCoverageRows.map((r) => coverageQuoteRow(r, dashboard.marketStatus));
-        const body = serializeQuoteRowsToMarkdown(rows);
-        const text = wrapWidgetContext(
-          'personal.portfolioWatchlist',
-          { tab: 'coverage', tier: coverageTier, count: coverage.totalCount, shown: rows.length },
-          body,
-        );
-        return {
-          widget_type: 'personal.portfolioWatchlist',
-          widget_id: instance.id,
-          label: `${t('dashboard:widgets.portfolioWatchlist.headerCoverage')} · ${coverage.totalCount}`,
-          description: rows.length ? `${rows.length} symbol${rows.length === 1 ? '' : 's'}` : 'empty',
-          captured_at: new Date().toISOString(),
-          text,
-          data: { tab: 'coverage', tier: coverageTier, totalCount: coverage.totalCount, rows },
-        };
+        return buildCoverageFullContextExport({
+          instanceId: instance.id,
+          coverage,
+          filteredRows: filteredCoverageRows,
+          coverageTier,
+          marketStatus: dashboard.marketStatus,
+          headerLabel: t('dashboard:widgets.portfolioWatchlist.headerCoverage'),
+        });
       }
-      // --- DALTON-HOOK(watchlist): end ---
       if (activeTab === 'watchlist') {
         // DALTON-HOOK(extended-hours-quotes): Pass marketStatus so full watchlist export includes extended-hours quotes.
         const rows = watchlist.rows.map((r) => watchlistQuoteRow(r, dashboard.marketStatus));
@@ -175,33 +148,16 @@ function PortfolioWatchlistWidget({
       };
     },
     rows: (rowId: string) => {
-      // --- DALTON-HOOK(watchlist): begin ---
+      // DALTON-HOOK(watchlist): export single personal watchlist row
       if (activeTab === 'coverage') {
-        const row = coverage.rows.find((r) => r.symbol === rowId);
-        if (!row) return null;
-        const quote = coverageQuoteRow(row, dashboard.marketStatus);
-        const body = serializeQuoteRowToMarkdown(quote);
-        const text = wrapWidgetContext(
-          'personal.portfolioWatchlist/row',
-          { tab: 'coverage', symbol: row.symbol, tier: row.tier },
-          body,
-        );
-        const labelPct = quote.changePercent;
-        return {
-          widget_type: 'personal.portfolioWatchlist/row',
-          widget_id: `${instance.id}/${rowId}`,
-          label:
-            row.symbol +
-            (!row.is_private && row.quoteAvailable && labelPct !== undefined
-              ? ` · ${formatSignedPct2(labelPct)}`
-              : ''),
-          description: t('dashboard:widgets.portfolioWatchlist.headerCoverage'),
-          captured_at: new Date().toISOString(),
-          text,
-          data: { row: quote, tab: 'coverage', tier: row.tier },
-        };
+        return buildCoverageRowContextExport({
+          instanceId: instance.id,
+          rowId,
+          coverage,
+          marketStatus: dashboard.marketStatus,
+          headerLabel: t('dashboard:widgets.portfolioWatchlist.headerCoverage'),
+        });
       }
-      // --- DALTON-HOOK(watchlist): end ---
       if (activeTab === 'watchlist') {
         const row = watchlist.rows.find((r) => (r.watchlist_item_id ?? r.symbol) === rowId);
         if (!row) return null;
@@ -295,16 +251,7 @@ function PortfolioWatchlistWidget({
         : portfolio.rows.length;
 
   // DALTON-HOOK(watchlist): tab order `[关注列表][自选股][持仓]` in Dalton builds
-  const tabs: { key: PWTabKey; label: string }[] = isDaltonBuild
-    ? [
-        { key: 'coverage', label: t('dashboard:widgets.portfolioWatchlist.headerCoverage') },
-        { key: 'watchlist', label: t('dashboard:widgets.portfolioWatchlist.headerWatchlist') },
-        { key: 'portfolio', label: t('dashboard:widgets.portfolioWatchlist.headerHoldings') },
-      ]
-    : [
-        { key: 'watchlist', label: t('dashboard:widgets.portfolioWatchlist.headerWatchlist') },
-        { key: 'portfolio', label: t('dashboard:widgets.portfolioWatchlist.headerHoldings') },
-      ];
+  const tabs = getPortfolioWatchlistTabs(t);
 
   return (
     <div className="widget-term dash-fill">
@@ -339,79 +286,19 @@ function PortfolioWatchlistWidget({
           riseKey={activeTab}
           swapKey={`${activeTab}:${showSkeleton ? 'loading' : 'ready'}`}
         >
-          {/* --- DALTON-HOOK(watchlist): begin --- */}
+          {/* DALTON-HOOK(watchlist): render personal watchlist tab panel via Dalton component */}
           {activeTab === 'coverage' ? (
-            <div>
-              <div className="flex flex-wrap items-center gap-1 px-1 pb-1.5" role="group">
-                {(
-                  [
-                    ['all', t('dashboard:widgets.portfolioWatchlist.tierAll')],
-                    ['core', t('dashboard:widgets.portfolioWatchlist.tierCore')],
-                    ['watch', t('dashboard:widgets.portfolioWatchlist.tierWatch')],
-                    ['radar', t('dashboard:widgets.portfolioWatchlist.tierRadar')],
-                  ] as const
-                ).map(([key, label]) => (
-                  <button
-                    key={key}
-                    type="button"
-                    aria-pressed={coverageTier === key}
-                    onClick={() => setCoverageTier(key)}
-                    className="text-[11px] px-2 py-0.5 rounded-full border widget-drag-cancel"
-                    style={{
-                      backgroundColor: coverageTier === key ? 'var(--color-bg-hover)' : 'transparent',
-                      borderColor: 'var(--color-border-muted)',
-                      color: coverageTier === key ? 'var(--color-text-primary)' : 'var(--color-text-tertiary)',
-                    }}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-              <WatchlistTable>
-                {showCoverageSkeleton ? (
-                  <HoldingsSkeleton count={coverageSkeletonRows} />
-                ) : (
-                  <AnimatePresence initial={false}>
-                    {filteredCoverageRows.map((row) => (
-                      <CoverageWatchlistRowItem
-                        key={row.symbol}
-                        item={row}
-                        marketStatus={dashboard.marketStatus}
-                        attach={
-                          <RowAttachButton
-                            instanceId={instance.id}
-                            rowId={row.symbol}
-                          />
-                        }
-                      />
-                    ))}
-                  </AnimatePresence>
-                )}
-              </WatchlistTable>
-              <div className="flex items-center justify-between px-2 pt-2 text-xs">
-                {coverage.totalCount > coverage.quotedLimit ? (
-                  <span style={{ color: 'var(--color-text-tertiary)' }}>
-                    {t('dashboard:widgets.portfolioWatchlist.coverageTruncated', {
-                      shown: coverage.quotedLimit,
-                      total: coverage.totalCount,
-                    })}
-                  </span>
-                ) : (
-                  <span />
-                )}
-                <button
-                  type="button"
-                  onClick={() => navigate('/market')}
-                  className="inline-flex items-center gap-1 font-medium hover:underline widget-drag-cancel"
-                  style={{ color: 'var(--color-accent-light)' }}
-                >
-                  <span>{t('dashboard:widgets.portfolioWatchlist.viewAllCoverage')}</span>
-                  <ArrowRight className="h-3 w-3" />
-                </button>
-              </div>
-            </div>
+            <CoverageWatchlistTabPanel
+              instanceId={instance.id}
+              coverage={coverage}
+              filteredRows={filteredCoverageRows}
+              coverageTier={coverageTier}
+              onSelectTier={setCoverageTier}
+              showSkeleton={showCoverageSkeleton}
+              skeletonRows={coverageSkeletonRows}
+              marketStatus={dashboard.marketStatus}
+            />
           ) : activeTab === 'watchlist' ? (
-          /* --- DALTON-HOOK(watchlist): end --- */
             <div>
               <WatchlistTable>
                 {showWatchlistSkeleton ? (

@@ -962,7 +962,7 @@ async def test_resync_delta_schedule_watch_to_core_no_tracking_and_paused(
     assert res_demoted_paused["old_cron_expression"] == "0 11 * * 2-6"
     assert res_demoted_paused["new_cron_expression"] == "0 11 * * 6"
     assert res_demoted_paused["new_timezone"] == "Asia/Shanghai"
-    assert res_demoted_paused["new_next_run_at"] is not None
+    assert res_demoted_paused["new_next_run_at"] is None
     assert res_demoted_paused["status"] == "paused"
     assert res_demoted_paused["paused_by_user"] is True
 
@@ -971,7 +971,7 @@ async def test_resync_delta_schedule_watch_to_core_no_tracking_and_paused(
     assert by_name["dalton-echo-delta"]["metadata"]["paused_by_user"] is True
     assert by_name["dalton-echo-delta"]["cron_expression"] == "0 11 * * 6"
     assert by_name["dalton-echo-delta"]["timezone"] == "Asia/Shanghai"
-    assert by_name["dalton-echo-delta"]["next_run_at"] is not None
+    assert by_name["dalton-echo-delta"]["next_run_at"] is None
     assert by_name["dalton-echo-delta"]["metadata"]["tier"] == "watch"
 
 

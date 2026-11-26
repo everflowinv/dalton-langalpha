@@ -293,7 +293,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         ent = entries.get(t, {})
         if cov.get("is_private") and not ent:
             continue
-        tier = str(ent.get("tier") or cov.get("tier") or "Watch").capitalize()
+        tier = str(cov.get("tier") or ent.get("tier") or "Watch").capitalize()
         grp = (cov.get("earnings") or {}).get("group") if isinstance(cov.get("earnings"), dict) else None
         status = ent.get("status", "pending")
         date_status = ent.get("date_status", "unannounced")
@@ -380,17 +380,21 @@ def cmd_check(args: argparse.Namespace) -> int:
     is_confirmed = bool(entry and entry.get("status") == "confirmed" and entry.get("date_status") == "confirmed")
     old_date = entry.get("date") if entry else None
     same_date = bool(is_confirmed and old_date == args.date)
-    tier_val = (entry or {}).get("tier") or cov.get("tier")
+    # Item 9: prioritize live coverage tier over stale ledger tier
+    tier_val = cov.get("tier") or (entry or {}).get("tier")
+    cov_ws_id = (cov.get("workspace") or {}).get("workspace_id") if isinstance(cov.get("workspace"), dict) else None
+    effective_ws_id = (entry or {}).get("workspace_id") or cov_ws_id
     expected_stages = (
         resolve_earnings_stages(
             tier_val,
             tier_policies=tier_policies,
             task_overrides=cov.get("task_overrides") if isinstance(cov, dict) else None,
         )
-        if (entry and entry.get("workspace_id"))
+        if effective_ws_id
         else []
     )
-    has_autos = (not expected_stages) or bool(entry and entry.get("automations"))
+    existing_autos = (entry or {}).get("automations") if isinstance((entry or {}).get("automations"), dict) else {}
+    has_autos = (not expected_stages) or all(stage in existing_autos for stage in expected_stages)
     recorded = bool(same_date and has_autos)
     date_changed = bool(is_confirmed and old_date and old_date != args.date)
 
@@ -421,7 +425,8 @@ def cmd_mark(args: argparse.Namespace) -> int:
     now_iso = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
     name = args.name or existing.get("name") or cov.get("name") or ticker
-    tier = (args.tier or existing.get("tier") or cov.get("tier") or "watch").capitalize()
+    # Item 9: prioritize explicit --tier, then live coverage tier, then stale ledger tier
+    tier = (args.tier or cov.get("tier") or existing.get("tier") or "watch").capitalize()
     cov_ws_id = (cov.get("workspace") or {}).get("workspace_id") if isinstance(cov.get("workspace"), dict) else None
     workspace_id = (
         args.workspace_id
@@ -458,7 +463,19 @@ def cmd_mark(args: argparse.Namespace) -> int:
             if args.tp1:
                 automations["tp1"] = args.tp1
         elif existing.get("automations") and existing.get("quarter") == args.quarter:
-            automations = existing["automations"]
+            # Item 9: recompute/filter against live effective stages so tier changes update tasks immediately
+            expected_defaults = default_automations_for(
+                ticker,
+                args.quarter,
+                tier=tier,
+                workspace_id=workspace_id,
+                tier_policies=tier_policies,
+                task_overrides=cov.get("task_overrides") if isinstance(cov, dict) else None,
+            )
+            automations = {
+                stage: existing["automations"].get(stage) or default_fname
+                for stage, default_fname in expected_defaults.items()
+            }
         else:
             automations = default_automations_for(
                 ticker,
@@ -971,7 +988,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sp_list = sub.add_parser("list", help="List coverage and ledger status")
-    sp_list.add_argument("--tier", choices=["core", "watch", "Core", "Watch"], default=None)
+    sp_list.add_argument("--tier", choices=["core", "watch", "radar", "Core", "Watch", "Radar"], default=None)
     sp_list.add_argument("--group", default=None)
     sp_list.add_argument("--status", choices=["pending", "confirmed", "reported"], default=None)
     sp_list.add_argument("--json", action="store_true", default=argparse.SUPPRESS)

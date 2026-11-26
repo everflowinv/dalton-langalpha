@@ -284,6 +284,16 @@ async def astream_ptc_workflow(
         or user_id
     )
     is_colleague_turn = (not identity.shared) and (workspace_owner_id != str(user_id))
+    # DALTON-HOOK(watchlist): strip client personal watchlist context on shared or foreign turns
+    if request.additional_context:
+        from src.dalton.watchlist.privacy import strip_watchlist_context_if_shared
+
+        request.additional_context = strip_watchlist_context_if_shared(
+            request.additional_context,
+            is_shared=bool(identity.shared),
+            user_id=user_id,
+            workspace_owner_id=workspace_owner_id,
+        )
     tail_turn_no_new_work = bool((run_metadata or {}).get("tail_turn_no_new_work"))
     origin_channel = str((run_metadata or {}).get("origin_channel") or "web")
     start_time = time.time()

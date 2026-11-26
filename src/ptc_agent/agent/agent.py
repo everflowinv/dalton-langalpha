@@ -1166,12 +1166,20 @@ class PTCAgent:
 
         # DALTON-HOOK(dalton-tools): build role-scoped Dalton tools before rendering prompt
         # DALTON-HOOK(team-memory-toggle): mount conversation_search and render its prompt line from deployment/tier availability only (not personal toggle)
+        # DALTON-HOOK(watchlist): withhold personal watchlist tool on shared or foreign workspace turns
         from src.dalton.tools import build_dalton_tools
+        from src.dalton.watchlist.privacy import is_personal_watchlist_turn_allowed
 
         dalton_tools = build_dalton_tools(
             role,
             filesystem_backend,
             user_tier=user_tier,
+            allow_personal_watchlist=is_personal_watchlist_turn_allowed(
+                own_data=own_data,
+                user_id=user_id,
+                owner_id=owner_id,
+                workspace_owner_id=workspace_owner_id,
+            ),
         )
         conversation_search_available = any(
             getattr(t, "name", None) == "conversation_search" for t in dalton_tools

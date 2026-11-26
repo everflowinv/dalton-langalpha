@@ -37,6 +37,12 @@ from src.dalton.coverage.models import (
 import src.dalton.coverage.service as coverage_svc
 import src.dalton.database.coverage as coverage_db
 import src.dalton.database.watch as watch_db
+from src.dalton.watchlist import policies as _wl_policies_orig_mod
+from src.dalton.watchlist import reconciler as _wl_reconciler_orig_mod
+
+_ORIG_INSERT_RECONCILE_JOB = _wl_policies_orig_mod.insert_reconcile_job
+_ORIG_RECONCILE_JOB = _wl_reconciler_orig_mod.TierPolicyReconciler.reconcile_job
+_ORIG_USER_WORKSPACE_TICKERS = coverage_svc._user_workspace_tickers
 from src.dalton.tools import build_dalton_tools
 from src.dalton.tools.coverage_tools import build_coverage_tools
 from src.server.utils.api import get_current_user_id
@@ -471,6 +477,125 @@ def _wire_coverage_store(monkeypatch: pytest.MonkeyPatch, store: _InMemoryCovera
             fn_name,
             create_autospec(orig, side_effect=bound),
         )
+
+    # Wire in-memory watchlist outbox & reconciler hooks so legacy coverage entry points
+    # converging onto WatchlistMutationService run against the in-memory store.
+    import src.dalton.watchlist.policies as wl_policies_mod
+    import src.dalton.watchlist.reconciler as wl_reconciler_mod
+    import src.dalton.watchlist.service as wl_service_mod
+
+    store_jobs: dict[str, dict[str, Any]] = {}
+
+    async def _store_insert_job(
+        uid: str,
+        *,
+        trigger_action: str,
+        target_policy_versions: Any,
+        pending_tickers: Any,
+        override_user_pause: bool = False,
+        job_context: Any = None,
+        job_id: str | None = None,
+        conn: Any = None,
+    ) -> dict[str, Any]:
+        _ = (override_user_pause, conn)
+        jid = job_id or f"store-job-{len(store_jobs) + 1}"
+        job = {
+            "job_id": jid,
+            "user_id": uid,
+            "trigger_action": trigger_action,
+            "target_policy_versions": dict(target_policy_versions),
+            "pending_tickers": list(pending_tickers),
+            "completed_tickers": [],
+            "failed_items": [],
+            "job_context": dict(job_context or {}),
+            "yaml_synced": False,
+            "status": "pending",
+        }
+        store_jobs[jid] = job
+        return dict(job)
+
+    async def _store_reconcile_job(
+        self: Any,
+        uid: str,
+        jid: str,
+        *,
+        sync_home: bool = True,
+        _preclaimed_job: Any = None,
+    ) -> dict[str, Any]:
+        _ = (self, _preclaimed_job)
+        job = store_jobs[jid]
+        job["completed_tickers"] = list(job["pending_tickers"])
+        job["pending_tickers"] = []
+        if sync_home:
+            synced = bool(await coverage_svc.sync_user_coverage_to_home(uid))
+            job["yaml_synced"] = synced
+        job["status"] = "completed" if job["yaml_synced"] or not sync_home else "partial"
+        return {
+            "ok": job["status"] == "completed",
+            "job_id": jid,
+            "status": job["status"],
+            "yaml_synced": job["yaml_synced"],
+            "failed_items": [],
+        }
+
+    async def _store_policies(uid: str, *, conn: Any = None):
+        _ = (uid, conn)
+        return dict(wl_policies_mod.DEFAULT_TIER_POLICIES)
+
+    orig_get_policies = wl_policies_mod.get_user_tier_policies
+    orig_insert_job = wl_policies_mod.insert_reconcile_job
+    policies_mock = create_autospec(orig_get_policies, side_effect=_store_policies)
+    insert_job_mock = create_autospec(orig_insert_job, side_effect=_store_insert_job)
+
+    monkeypatch.setattr(wl_policies_mod, "get_user_tier_policies", policies_mock)
+    monkeypatch.setattr(wl_service_mod, "get_user_tier_policies", policies_mock)
+    monkeypatch.setattr(wl_policies_mod, "insert_reconcile_job", insert_job_mock)
+    monkeypatch.setattr(wl_service_mod, "insert_reconcile_job", insert_job_mock)
+    monkeypatch.setattr(
+        wl_reconciler_mod.TierPolicyReconciler,
+        "reconcile_job",
+        create_autospec(wl_reconciler_mod.TierPolicyReconciler.reconcile_job, side_effect=_store_reconcile_job),
+    )
+    async def _proxy_validate(tickers: Any):
+        return await coverage_svc.validate_and_enrich_tickers(tickers)
+
+    async def _proxy_preview_group(label: str, criteria: Any):
+        return await coverage_svc.preview_coverage_group(label, criteria)
+
+    async def _proxy_ensure_cal(uid: str):
+        return await coverage_svc.ensure_user_earnings_calendar_automation(uid)
+
+    async def _proxy_user_ws(uid: str):
+        return await coverage_svc._user_workspace_tickers(uid)
+
+    monkeypatch.setattr(
+        wl_service_mod,
+        "validate_and_enrich_tickers",
+        create_autospec(coverage_svc.validate_and_enrich_tickers, side_effect=_proxy_validate),
+    )
+    monkeypatch.setattr(
+        wl_service_mod,
+        "preview_coverage_group",
+        create_autospec(coverage_svc.preview_coverage_group, side_effect=_proxy_preview_group),
+    )
+    monkeypatch.setattr(
+        wl_service_mod,
+        "ensure_user_earnings_calendar_automation",
+        create_autospec(coverage_svc.ensure_user_earnings_calendar_automation, side_effect=_proxy_ensure_cal),
+    )
+    monkeypatch.setattr(
+        wl_service_mod,
+        "_user_workspace_tickers",
+        create_autospec(coverage_svc._user_workspace_tickers, side_effect=_proxy_user_ws),
+    )
+    monkeypatch.setattr(
+        wl_service_mod,
+        "resolve_company_workspace_id",
+        create_autospec(
+            wl_reconciler_mod.resolve_company_workspace_id,
+            return_value=None,
+        ),
+    )
     return fake_pool
 
 
@@ -690,7 +815,7 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
         coverage_svc,
         "_user_workspace_tickers",
         create_autospec(
-            coverage_svc._user_workspace_tickers,
+            _ORIG_USER_WORKSPACE_TICKERS,
             return_value={"NVDA": "ws-nvda-123"},
         ),
     )
@@ -711,10 +836,11 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
         target_policy_versions: Any,
         pending_tickers: Any,
         override_user_pause: bool = False,
+        job_context: Any = None,
         job_id: str | None = None,
         conn: Any = None,
     ) -> dict[str, Any]:
-        _ = (override_user_pause, conn)
+        _ = (override_user_pause, job_context, conn)
         jid = job_id or f"job-{len(reconcile_jobs_store) + 1}"
         job = {
             "job_id": jid,
@@ -736,8 +862,9 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
         jid: str,
         *,
         sync_home: bool = True,
+        _preclaimed_job: Any = None,
     ) -> dict[str, Any]:
-        _ = self
+        _ = (self, _preclaimed_job)
         job = reconcile_jobs_store[jid]
         reconciled_batches.append(list(job["pending_tickers"]))
         job["completed_tickers"] = list(job["pending_tickers"])
@@ -760,10 +887,10 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
     )
     monkeypatch.setattr(cov_tools_mod, "hitl_confirm", hitl_mock)
     monkeypatch.setattr(
-        wl_service_mod,
+        coverage_svc,
         "_user_workspace_tickers",
         create_autospec(
-            wl_service_mod._user_workspace_tickers,
+            _ORIG_USER_WORKSPACE_TICKERS,
             return_value={"NVDA": "ws-nvda-123"},
         ),
     )
@@ -779,36 +906,27 @@ async def test_cos_coverage_tool_binding_actions_and_quarterly_preflight(
     )
     monkeypatch.setattr(
         wl_service_mod,
+        "resolve_workspace_tracking_owner",
+        create_autospec(
+            wl_service_mod.resolve_workspace_tracking_owner,
+            return_value=USER_ALICE,
+        ),
+    )
+    monkeypatch.setattr(
+        wl_service_mod,
         "list_all_user_automations",
         create_autospec(wl_service_mod.list_all_user_automations, return_value=[]),
-    )
-    monkeypatch.setattr(
-        wl_service_mod,
-        "get_user_tier_policies",
-        create_autospec(
-            wl_policies_mod.get_user_tier_policies,
-            return_value=dict(wl_policies_mod.DEFAULT_TIER_POLICIES),
-        ),
-    )
-    monkeypatch.setattr(
-        wl_service_mod,
-        "insert_reconcile_job",
-        create_autospec(wl_policies_mod.insert_reconcile_job, side_effect=_fake_insert_job),
-    )
-    monkeypatch.setattr(
-        wl_service_mod,
-        "ensure_user_earnings_calendar_automation",
-        create_autospec(
-            wl_service_mod.ensure_user_earnings_calendar_automation,
-            side_effect=_fake_ensure_cal_auto,
-        ),
     )
     monkeypatch.setattr(
         wl_policies_mod,
         "list_unfinished_reconcile_jobs",
         create_autospec(wl_policies_mod.list_unfinished_reconcile_jobs, return_value=[]),
     )
-    monkeypatch.setattr(wl_reconciler_mod.TierPolicyReconciler, "reconcile_job", _fake_reconcile_job)
+    fake_insert_spec = create_autospec(_ORIG_INSERT_RECONCILE_JOB, side_effect=_fake_insert_job)
+    fake_reconcile_spec = create_autospec(_ORIG_RECONCILE_JOB, side_effect=_fake_reconcile_job)
+    monkeypatch.setattr(wl_service_mod, "insert_reconcile_job", fake_insert_spec)
+    monkeypatch.setattr(wl_policies_mod, "insert_reconcile_job", fake_insert_spec)
+    monkeypatch.setattr(wl_reconciler_mod.TierPolicyReconciler, "reconcile_job", fake_reconcile_spec)
 
     tool = build_coverage_tools(role="chief_of_staff")[0]
     cfg = {"configurable": {"user_id": USER_ALICE}}
@@ -1517,23 +1635,17 @@ async def test_two_users_mutual_isolation_service_and_router(
     assert r_bob_set_tier_alice.json()["updated"] == []
     assert r_bob_set_tier_alice.json()["not_found"] == ["AAPL"]
 
-    # The REST route moves the delta schedule like Chief of Staff's tool does,
-    # only for tickers it actually updated.
-    import src.dalton.autonomy.tracking as tracking_mod
-
-    rest_resync = create_autospec(
-        tracking_mod.resync_delta_schedule,
-        return_value={"ticker": "MSFT", "updated": True},
-    )
-    monkeypatch.setattr(tracking_mod, "resync_delta_schedule", rest_resync)
+    # Item 5: legacy REST POST /coverage converges onto WatchlistMutationService
+    # (same-tx Outbox + TierPolicyReconciler), updating only Bob's own MSFT row.
     r_bob_core = client.post(
         "/api/v1/dalton/coverage",
         json={"action": "set_tier", "tickers": ["MSFT", "AAPL"], "tier": "core"},
     )
     assert r_bob_core.status_code == 200
     assert r_bob_core.json()["updated"] == ["MSFT"]
-    rest_resync.assert_awaited_once_with(USER_BOB, "MSFT", tier="core")
-    assert r_bob_core.json()["delta_schedule"] == [{"ticker": "MSFT", "updated": True}]
+    assert r_bob_core.json()["not_found"] == ["AAPL"]
+    assert r_bob_core.json()["job_id"]
+    assert r_bob_core.json()["reconcile_status"] == "completed"
 
     r_bob_rm_alice = client.post(
         "/api/v1/dalton/coverage",

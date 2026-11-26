@@ -62,7 +62,7 @@ def upgrade() -> None:
         """
     )
 
-    # Backfill unlisted companies (e.g. OPENAI) and legacy extra.tags
+    # Backfill unlisted companies (e.g. OPENAI), legacy extra.tags, and restore radar rows saved by downgrade()
     op.execute(
         """
         UPDATE dalton_coverage
@@ -70,6 +70,16 @@ def upgrade() -> None:
         WHERE ticker IN ('OPENAI')
            OR UPPER(COALESCE(market, '')) = 'PRIVATE'
            OR COALESCE(extra->>'is_private', '') = 'true'
+        """
+    )
+    op.execute(
+        """
+        UPDATE dalton_coverage
+        SET tier = 'radar',
+            extra = COALESCE(extra, '{}'::jsonb) - 'downgraded_from_tier' - 'downgraded_silent',
+            updated_at = NOW()
+        WHERE COALESCE(extra->>'downgraded_from_tier', '') = 'radar'
+           OR COALESCE(extra->>'downgraded_silent', '') = 'true'
         """
     )
     op.execute(
@@ -127,6 +137,7 @@ def upgrade() -> None:
             completed_tickers JSONB NOT NULL DEFAULT '[]'::jsonb,
             failed_items JSONB NOT NULL DEFAULT '[]'::jsonb,
             override_user_pause BOOLEAN NOT NULL DEFAULT FALSE,
+            job_context JSONB NOT NULL DEFAULT '{}'::jsonb,
             yaml_synced BOOLEAN NOT NULL DEFAULT FALSE,
             status VARCHAR(24) NOT NULL DEFAULT 'pending'
                 CHECK (status IN ('pending', 'running', 'completed', 'partial')),

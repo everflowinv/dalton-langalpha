@@ -511,6 +511,7 @@ def build_dalton_tools(
     enabled: bool | None = None,
     user_tier: str | None = None,
     team_memory_enabled: bool = False,
+    allow_personal_watchlist: bool = True,
 ) -> list[BaseTool]:
     """Return role- and capability-appropriate Dalton tools for the main agent (`DALTON-HOOK(dalton-tools)`).
 
@@ -555,6 +556,8 @@ def build_dalton_tools(
     tools: list[BaseTool] = []
     for entry in DALTON_TOOL_REGISTRY:
         if active_role not in entry.roles:
+            continue
+        if entry.id == "coverage_tools_cos" and not allow_personal_watchlist:
             continue
         if not _passes_tier_gate(
             entry.min_tier,

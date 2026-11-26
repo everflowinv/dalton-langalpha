@@ -145,6 +145,9 @@ export interface WatchlistPreviewResponse {
   not_found?: string[];
   expected_roster_hash?: string;
   expected_policy_versions?: Record<string, number>;
+  expected_pause_versions?: Record<string, number>;
+  override_user_pause?: boolean;
+  group_id?: string | null;
   affected_tickers: WatchlistAffectedTicker[];
   affected_workspaces: WatchlistAffectedWorkspace[];
   task_summary: WatchlistTaskSummary;
@@ -167,6 +170,11 @@ export interface WatchlistMutateRequestBody {
   expected_roster_hash?: string;
   expected_policy_versions?: Record<string, number>;
   expected_target_tickers?: string[];
+  expected_action?: string;
+  expected_target_tier?: string | null;
+  expected_group_id?: string | null;
+  expected_override_user_pause?: boolean;
+  expected_pause_versions?: Record<string, number>;
 }
 
 export interface WatchlistMutateResponse {

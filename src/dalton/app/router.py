@@ -2691,11 +2691,8 @@ async def mutate_user_coverage_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     _require_dalton_enabled()
-    from src.dalton.coverage import (
-        CoverageDataSourceError,
-        add_user_coverage_tickers,
-        remove_user_coverage_tickers,
-    )
+    from src.dalton.coverage import CoverageDataSourceError
+    from src.dalton.watchlist.service import WatchlistMutationService
 
     uid = str(user_id).strip()
     act = str(body.action or "").strip().lower()
@@ -2703,20 +2700,33 @@ async def mutate_user_coverage_endpoint(
     if not tickers:
         raise HTTPException(status_code=400, detail="tickers is required")
 
+    svc = WatchlistMutationService()
     try:
         if act == "add":
-            return await add_user_coverage_tickers(
+            return await svc.execute_mutation(
                 uid,
-                tickers,
+                action="add",
+                tickers=tickers,
                 tier=body.tier or "watch",
                 source="ui",
             )
         if act == "remove":
-            return await remove_user_coverage_tickers(uid, tickers)
+            return await svc.execute_mutation(
+                uid,
+                action="remove",
+                tickers=tickers,
+                source="ui",
+            )
         if act == "set_tier":
-            from src.dalton.autonomy.tracking import set_tier_and_resync
-
-            return await set_tier_and_resync(uid, tickers, tier=body.tier or "watch")
+            res = await svc.execute_mutation(
+                uid,
+                action="set_tier",
+                tickers=tickers,
+                tier=body.tier or "watch",
+                source="ui",
+            )
+            res.setdefault("delta_schedule", [])
+            return res
     except CoverageDataSourceError as exc:
         raise HTTPException(status_code=503, detail=exc.to_dict()) from exc
     except ValueError as exc:

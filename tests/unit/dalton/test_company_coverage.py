@@ -561,6 +561,14 @@ async def test_company_preflight_syncs_union_personal_preflight_unchanged(
         ),
         _coverage_row("admin-1", "AMD", tier="watch", name="AMD", updated_at=included_at),
         _coverage_row(
+            "internal-1",
+            "NET",
+            tier="radar",
+            name="Cloudflare Radar",
+            updated_at=included_at,
+            extra={"tags": ["secret-tag"]},
+        ),
+        _coverage_row(
             "external-1",
             "EXT",
             name="External",
@@ -655,9 +663,14 @@ async def test_company_preflight_syncs_union_personal_preflight_unchanged(
 
     assert company_yaml[0] == company_yaml[1] == company_yaml[2]
     parsed = yaml.safe_load(company_yaml[0])
+    # Item 14: shared Home keeps only internal/admin core+watch ticker scope (no radar, no personal tier/tags)
     assert [c["ticker"] for c in parsed["companies"]] == ["AMD", "NVDA"]
-    assert parsed["tiers"]["core"]["count"] == 1
-    assert parsed["tiers"]["watch"]["count"] == 1
+    assert "tiers" not in parsed
+    assert "tier_policies" not in parsed
+    assert all("tier" not in c and "tags" not in c for c in parsed["companies"])
+    assert "NET" not in company_yaml[0]
+    assert "secret-tag" not in company_yaml[0]
+    assert "radar" not in company_yaml[0].lower()
     assert "2026-06-06T00:00:00+00:00" in company_yaml[0]
     assert "2099" not in company_yaml[0]
     assert "member-note" not in company_yaml[0]

@@ -35,7 +35,7 @@ from typing import Any
 
 warnings.filterwarnings("ignore")
 
-PRIVATE_TICKERS = {"SPCX", "OPENAI", "ANTHROPIC"}
+PRIVATE_TICKERS = {"OPENAI"}
 PRIVATE_NAMES = {"SpaceX", "OpenAI", "Anthropic"}
 
 EXTRA_PEERS: dict[str, list[str]] = {

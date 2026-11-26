@@ -693,11 +693,36 @@ async def _sync_home_coverage_for_preflight(
     is_home_dalton = (
         kind in ("calendar", "director_daily", "director_weekly") or not ticker
     ) and not str(kind).startswith("sector_")
-    if not is_home_dalton or not persist:
+    if not persist:
         return None
 
     company_execution = is_company_system_user(user_id)
     eff_sync_timeout = max(0.05, float(sync_timeout_s or HOME_COVERAGE_SYNC_TIMEOUT_S))
+
+    # Item 11: ANY personal preflight belonging to user_id (including company-ticker tasks)
+    # scans and drains unfinished personal watchlist outbox jobs.
+    if not company_execution:
+        try:
+            from src.dalton.watchlist.reconciler import TierPolicyReconciler
+
+            await asyncio.wait_for(
+                TierPolicyReconciler().reconcile_pending_jobs(
+                    user_id, sync_home=not is_home_dalton
+                ),
+                timeout=eff_sync_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[DALTON_PREFLIGHT] watchlist reconcile_pending_jobs timed out after %.2fs for user=%s",
+                eff_sync_timeout,
+                user_id,
+            )
+        except Exception as e:
+            logger.debug("[DALTON_PREFLIGHT] watchlist reconcile_pending_jobs skipped: %s", e)
+
+    if not is_home_dalton:
+        return None
+
     group_refresh_summary: Optional[str] = None
     # Company execution must not refresh member groups or create member calendar tasks.
     if kind == "calendar" and not company_execution:
@@ -720,22 +745,21 @@ async def _sync_home_coverage_for_preflight(
         except Exception as e:
             logger.warning("[DALTON_PREFLIGHT] refresh_due_coverage_groups_for_preflight failed: %s", e)
 
+    # Item 13: capture the exact set of unsynced job IDs BEFORE rendering coverage.yaml
+    # so any new mutation committed during/after render is NOT prematurely marked yaml_synced=TRUE.
+    covered_job_ids: list[str] | None = None
     if not company_execution:
         try:
-            from src.dalton.watchlist.reconciler import TierPolicyReconciler
+            from src.dalton.watchlist.policies import list_unfinished_reconcile_jobs
 
-            await asyncio.wait_for(
-                TierPolicyReconciler().reconcile_pending_jobs(user_id, sync_home=False),
-                timeout=eff_sync_timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "[DALTON_PREFLIGHT] watchlist reconcile_pending_jobs timed out after %.2fs for user=%s",
-                eff_sync_timeout,
-                user_id,
-            )
+            unsynced_before = await list_unfinished_reconcile_jobs(user_id)
+            covered_job_ids = [
+                str(j["job_id"])
+                for j in unsynced_before
+                if j.get("job_id") and not j.get("yaml_synced")
+            ]
         except Exception as e:
-            logger.debug("[DALTON_PREFLIGHT] watchlist reconcile_pending_jobs skipped: %s", e)
+            logger.debug("[DALTON_PREFLIGHT] list_unfinished_reconcile_jobs skipped: %s", e)
 
     async def _render_and_sync() -> bool:
         if company_execution:
@@ -746,11 +770,13 @@ async def _sync_home_coverage_for_preflight(
 
     try:
         synced = await asyncio.wait_for(_render_and_sync(), timeout=eff_sync_timeout)
-        if synced and not company_execution:
+        if synced and not company_execution and covered_job_ids:
             try:
                 from src.dalton.watchlist.reconciler import TierPolicyReconciler
 
-                await TierPolicyReconciler().mark_yaml_synced_for_user(user_id)
+                await TierPolicyReconciler().mark_yaml_synced_for_user(
+                    user_id, covered_job_ids=covered_job_ids
+                )
             except Exception as e:
                 logger.debug("[DALTON_PREFLIGHT] mark_yaml_synced_for_user skipped: %s", e)
     except asyncio.TimeoutError:

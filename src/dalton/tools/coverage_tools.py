@@ -9,6 +9,7 @@ from typing import Annotated, Any
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
+from langgraph.errors import GraphBubbleUp
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 
@@ -306,9 +307,10 @@ def build_coverage_tools(*, role: str = "chief_of_staff") -> list[BaseTool]:
                 label=label,
                 criteria=criteria,
                 default_tier=default_tier,
-                group_id=group_id,
+                group_id=snap.get("group_id") or group_id,
                 override_user_pause=bool(snap.get("override_user_pause", override_user_pause)),
                 expected_snapshot=snap,
+                require_snapshot=bool(snap.get("requires_confirmation")),
             )
             return success_command(
                 _json_safe(
@@ -321,6 +323,8 @@ def build_coverage_tools(*, role: str = "chief_of_staff") -> list[BaseTool]:
                 ),
                 tool_call_id,
             )
+        except GraphBubbleUp:
+            raise
         except WatchlistScopeChangedError:
             return error_command(
                 "情况已变化，请重新发起",

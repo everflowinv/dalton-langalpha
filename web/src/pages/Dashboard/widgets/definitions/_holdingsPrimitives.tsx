@@ -19,8 +19,6 @@ import {
 } from '@/components/ui/context-menu';
 import { TermChange, TermKV } from '@/pages/ChatAgent/components/charts/TermCard';
 import type { WatchlistRow } from '../../hooks/useWatchlistData';
-// DALTON-HOOK(watchlist): compact personal coverage row type
-import type { CoverageWatchlistRow } from '../../hooks/useCoverageWatchlistData';
 import type { PortfolioRow } from '../../hooks/usePortfolioData';
 import { portfolioSummary } from './_holdingsHelpers';
 import {
@@ -370,73 +368,6 @@ export function PortfolioNavSummary({ rows, valuesHidden, onToggleHidden }: Port
 
 // DALTON-HOOK(watchlist): add 'coverage' skeleton row default alongside watchlist and portfolio
 const SKELETON_ROWS = { coverage: 5, watchlist: 5, portfolio: 3 } as const;
-
-// --- DALTON-HOOK(watchlist): begin ---
-const COVERAGE_TIER_LABEL_KEY = {
-  core: 'dashboard:widgets.portfolioWatchlist.tierCore',
-  watch: 'dashboard:widgets.portfolioWatchlist.tierWatch',
-  radar: 'dashboard:widgets.portfolioWatchlist.tierRadar',
-} as const;
-
-export function CoverageWatchlistRowItem({
-  item,
-  marketStatus,
-  attach,
-}: {
-  item: CoverageWatchlistRow;
-  marketStatus: MarketStatusData | null;
-  attach?: ReactNode;
-}) {
-  const { t } = useTranslation();
-  const locale = useLocale();
-  const navigate = useNavigate();
-  const hasQuote = !item.is_private && item.quoteAvailable !== false;
-  const code = quoteCurrency(item.currency, item.symbol, item.assetClass);
-  const quoteDisplay = deriveQuoteDisplay(item, marketStatus);
-  const mainPrice = quoteDisplay.mainPrice;
-  const mainChangePct = quoteDisplay.mainChangePct;
-
-  return (
-    <motion.tr
-      initial={{ opacity: 0, y: 8 }}
-      animate={{ opacity: 1, y: 0 }}
-      transition={TWEEN.quick}
-      className="row-attach-host"
-      data-clickable=""
-      data-testid={`coverage-row-${item.symbol}`}
-      onClick={() => navigate(`/market?symbol=${encodeURIComponent(item.symbol)}`)}
-    >
-      <td className="term-fill term-code term-strong dash-attach-cell">
-        <TickerLabel symbol={item.symbol}>
-          <span title={item.name || item.symbol}>{item.symbol}</span>
-        </TickerLabel>
-        <span className="ml-1.5 text-[10px] font-normal px-1 py-0.5 rounded" style={{ backgroundColor: 'var(--color-bg-elevated)', color: 'var(--color-text-tertiary)' }}>
-          {t(COVERAGE_TIER_LABEL_KEY[item.tier])}
-        </span>
-        {attach}
-      </td>
-      <td className="term-num">
-        {item.is_private ? (
-          <span className="term-t3">{t('dashboard:widgets.portfolioWatchlist.unlisted')}</span>
-        ) : hasQuote && mainPrice != null ? (
-          formatMoney(item.places && item.places > 2 ? Number(mainPrice) : roundQuote2(Number(mainPrice)), code, locale, { upTo: item.places })
-        ) : (
-          <span className="term-t3">{DASH}</span>
-        )}
-      </td>
-      <td className="term-num">
-        {item.is_private || !hasQuote ? (
-          <span className="term-t3">{DASH}</span>
-        ) : mainChangePct != null ? (
-          <TermChange value={roundQuote2(Number(mainChangePct))} />
-        ) : (
-          <span className="term-t3">{DASH}</span>
-        )}
-      </td>
-    </motion.tr>
-  );
-}
-// --- DALTON-HOOK(watchlist): end ---
 const MAX_SKELETON_ROWS = 10;
 
 /** How many skeleton rows a list should show: as many as it held the last

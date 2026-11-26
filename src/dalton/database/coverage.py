@@ -6,7 +6,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from psycopg.rows import dict_row
 
@@ -659,6 +659,33 @@ async def update_coverage_group_resolved(
             return await _run_in_tx(c)
 
 
+def compute_exclusive_group_deletion_tickers(
+    group_id: str,
+    existing_groups: Sequence[Mapping[str, Any]],
+    rows: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Return sorted tickers that would be exclusively deleted when ``group_id`` is removed."""
+    gid = str(group_id or "").strip()
+    if not gid:
+        return []
+    valid_other_group_ids = {
+        str(g["group_id"]).strip()
+        for g in existing_groups
+        if g.get("group_id") and str(g["group_id"]).strip() != gid
+    }
+    to_delete: list[str] = []
+    for r in rows:
+        gids = extract_row_group_ids(r)
+        if gid not in gids and str(r.get("group_id") or "") != gid:
+            continue
+        remaining = [g for g in gids if g != gid and g in valid_other_group_ids]
+        src = str(r.get("source") or "chat").strip().lower()
+        sym = str(r.get("ticker") or "").strip().upper()
+        if sym and src == "group" and not remaining:
+            to_delete.append(sym)
+    return sorted(set(to_delete))
+
+
 async def delete_coverage_group_and_exclusive_members(
     user_id: str,
     group_id: str,
@@ -680,7 +707,10 @@ async def delete_coverage_group_and_exclusive_members(
             if g.get("group_id") and str(g["group_id"]).strip() != gid
         }
         rows = await list_coverage_rows(uid, conn=c)
-        to_delete_tickers: list[str] = []
+        to_delete_tickers = compute_exclusive_group_deletion_tickers(
+            gid, existing_groups, rows
+        )
+        to_delete_set = set(to_delete_tickers)
         to_update_rows: list[tuple[str, str | None, str]] = []
 
         for r in rows:
@@ -688,10 +718,9 @@ async def delete_coverage_group_and_exclusive_members(
             if gid not in gids and str(r.get("group_id") or "") != gid:
                 continue
             remaining = [g for g in gids if g != gid and g in valid_other_group_ids]
-            src = str(r.get("source") or "chat").strip().lower()
             sym = str(r["ticker"]).strip().upper()
-            if src == "group" and not remaining:
-                to_delete_tickers.append(sym)
+            if sym in to_delete_set:
+                continue
             else:
                 new_extra = dict(r.get("extra") or {})
                 stale_gids = [

@@ -6,15 +6,20 @@
  * has its own projection in fromLiveEvent.
  */
 
-import type { AssistantMessage, WatchlistProposalActionType } from '@/types/chat'; // DALTON-HOOK(watchlist)
+import type { AssistantMessage } from '@/types/chat';
 import { updateMessage } from '../../hooks/utils/messageHelpers';
 import {
   setCardStatus,
   resolvePendingHistoryInterrupt,
   historyCardKey,
   CARD_BUCKET_FOR_TYPE,
-  WATCHLIST_INTERRUPT_TYPES, // DALTON-HOOK(watchlist)
 } from './buckets';
+import {
+  applyWatchlistProposalToMessage,
+  buildWatchlistProposalState,
+  isWatchlistInterruptType,
+  WATCHLIST_INTERRUPT_TYPES,
+} from '@/lib/dalton/watchlistInterrupts'; // DALTON-HOOK(watchlist)
 import { claimedCardFields, evidenceLookup, type ApprovalEvidence } from './claims';
 import { buildCreditPauseState } from './creditPauseCard';
 import {
@@ -360,67 +365,18 @@ export function projectHistoryInterrupt(
         interruptId: event.interrupt_id,
         toolCallId: proposalData.tool_call_id,
       });
-    // --- DALTON-HOOK(watchlist): begin ---
-    } else if (actionType && WATCHLIST_INTERRUPT_TYPES.has(actionType)) {
+    // DALTON-HOOK(watchlist): project history personal watchlist confirmation interrupt via Dalton helper
+    } else if (isWatchlistInterruptType(actionType)) {
       const proposalId = event.interrupt_id || `watchlist-${actionType}-history-${Date.now()}`;
-      const proposalData = actionRequests[0] as Record<string, unknown>;
       const order = eventOrder(event, () => ++pairState.contentOrderCounter);
-      const toolCallId = typeof proposalData.tool_call_id === 'string' ? proposalData.tool_call_id : '';
-      const hasToolCallId = toolCallId.length > 0;
-
+      const { state, toolCallId, hasToolCallId } = buildWatchlistProposalState(actionType, actionRequests[0] as Record<string, unknown>, event.interrupt_id);
       rt.setMessages((prev) =>
-        updateMessage(prev, interruptAssistantId, (m) => {
-          if (m.role !== 'assistant') return m;
-          const msg = m as AssistantMessage;
-          return {
-            ...msg,
-            contentSegments: [
-              ...(msg.contentSegments || []),
-              { type: actionType as WatchlistProposalActionType, proposalId, order },
-            ],
-            watchlistProposals: {
-              ...(msg.watchlistProposals || {}),
-              [proposalId]: {
-                actionType: actionType as WatchlistProposalActionType,
-                raw_action: typeof proposalData.raw_action === 'string' ? proposalData.raw_action : undefined,
-                name: typeof proposalData.name === 'string' ? proposalData.name : undefined,
-                description: typeof proposalData.description === 'string' ? proposalData.description : undefined,
-                owner_user_id: typeof proposalData.owner_user_id === 'string' ? proposalData.owner_user_id : undefined,
-                expected_roster_hash: typeof proposalData.expected_roster_hash === 'string' ? proposalData.expected_roster_hash : undefined,
-                expected_policy_versions: (proposalData.expected_policy_versions as Record<string, number> | undefined),
-                target_tickers: Array.isArray(proposalData.target_tickers) ? (proposalData.target_tickers as string[]) : undefined,
-                target_tier: typeof proposalData.target_tier === 'string' ? proposalData.target_tier : null,
-                affected_tickers: Array.isArray(proposalData.affected_tickers) ? (proposalData.affected_tickers as never[]) : undefined,
-                affected_workspaces: Array.isArray(proposalData.affected_workspaces) ? (proposalData.affected_workspaces as never[]) : undefined,
-                task_summary: (proposalData.task_summary as Record<string, number> | undefined),
-                preserve_workspace_notice: typeof proposalData.preserve_workspace_notice === 'string' ? proposalData.preserve_workspace_notice : null,
-                group_id: typeof proposalData.group_id === 'string' ? proposalData.group_id : null,
-                group_label: typeof proposalData.group_label === 'string' ? proposalData.group_label : null,
-                tool_call_id: toolCallId || undefined,
-                interruptId: event.interrupt_id,
-                status: hasToolCallId ? 'pending' : 'failed',
-                ...(hasToolCallId
-                  ? {}
-                  : {
-                      failure_code: 'scope_changed',
-                      failure_error: '情况已变化，请重新发起',
-                    }),
-              },
-            },
-          };
-        }),
+        updateMessage(prev, interruptAssistantId, (m) =>
+          m.role === 'assistant'
+            ? applyWatchlistProposalToMessage(m as AssistantMessage, actionType, proposalId, order, state, (segs, s) => [...(segs || []), s])
+            : m),
       );
-
-      if (hasToolCallId) {
-        ctx.pendingHistoryInterrupts.push({
-          type: actionType,
-          assistantMessageId: interruptAssistantId,
-          proposalId,
-          interruptId: event.interrupt_id,
-          toolCallId,
-        });
-      }
-    // --- DALTON-HOOK(watchlist): end ---
+      if (hasToolCallId) ctx.pendingHistoryInterrupts.push({ type: actionType, assistantMessageId: interruptAssistantId, proposalId, interruptId: event.interrupt_id, toolCallId });
     } else if (actionType === 'credit_pause') {
       // --- Credit pause interrupt (history) ---
       const proposalId = event.interrupt_id!;

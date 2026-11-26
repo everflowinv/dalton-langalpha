@@ -17,6 +17,7 @@ from src.dalton.watchlist import reconciler as reconciler_mod
 from src.dalton.watchlist import service as service_mod
 from src.server.database import automation as auto_db
 from src.server.database import automation_executions as exec_db
+from src.server.database import workspace as ws_db
 from src.server.services.automation_scheduler import AutomationScheduler
 
 
@@ -30,6 +31,7 @@ class _FakeWatchlistInfra:
         self.automations: dict[str, dict[str, Any]] = {}
         self.workspaces: dict[tuple[str, str], str] = {}
         self.workspace_owners: dict[str, str] = {}
+        self.workspace_rows: dict[str, dict[str, Any]] = {}
         self.lock_events: list[tuple[str, str | None]] = []
         self.skip_calls: list[dict[str, Any]] = []
         self.update_conns: dict[str, list[Any]] = {}
@@ -37,6 +39,7 @@ class _FakeWatchlistInfra:
         self.home_sync_result = True
         self.home_sync_calls = 0
         self.fail_tickers: set[str] = set()
+        self.schedule_fail_tickers: set[str] = set()
         self._conn_seq = 0
 
     def add_automation(
@@ -52,6 +55,7 @@ class _FakeWatchlistInfra:
         metadata: dict[str, Any] | None = None,
         trigger_config: dict[str, Any] | None = None,
         next_run_at: datetime | None = None,
+        config_version: int = 1,
     ) -> dict[str, Any]:
         aid = str(uuid.uuid4())
         row = {
@@ -67,6 +71,7 @@ class _FakeWatchlistInfra:
             "trigger_config": trigger_config,
             "status": status,
             "next_run_at": next_run_at,
+            "config_version": config_version,
             "metadata": dict(metadata or {}),
         }
         self.automations[aid] = row
@@ -78,6 +83,15 @@ class _FakeWatchlistInfra:
         async def _get_cov(uid: str, ticker: str, *, conn: Any = None) -> dict[str, Any] | None:
             _ = conn
             row = infra.coverage.get((uid, ticker.upper()))
+            return dict(row) if row is not None else None
+
+        async def _list_cov(uid: str, *, conn: Any = None) -> list[dict[str, Any]]:
+            _ = conn
+            return [dict(v) for (u, _), v in infra.coverage.items() if u == uid]
+
+        async def _get_ws(ws_id: str, *, conn: Any = None) -> dict[str, Any] | None:
+            _ = conn
+            row = infra.workspace_rows.get(ws_id)
             return dict(row) if row is not None else None
 
         async def _get_policies(uid: str, *, conn: Any = None) -> dict[str, policies_mod.TierPolicy]:
@@ -95,6 +109,7 @@ class _FakeWatchlistInfra:
             target_policy_versions: Any,
             pending_tickers: Any,
             override_user_pause: bool = False,
+            job_context: Any = None,
             job_id: str | None = None,
             conn: Any = None,
         ) -> dict[str, Any]:
@@ -109,10 +124,30 @@ class _FakeWatchlistInfra:
                 "completed_tickers": [],
                 "failed_items": [],
                 "override_user_pause": bool(override_user_pause),
+                "job_context": dict(job_context or {}),
                 "yaml_synced": False,
                 "status": "pending",
             }
             infra.jobs[jid] = job
+            return dict(job)
+
+        async def _claim_job(
+            uid: str,
+            jid: str,
+            *,
+            stale_seconds: int = 300,
+            force_claim: bool = False,
+            conn: Any = None,
+        ) -> dict[str, Any] | None:
+            _ = (stale_seconds, conn)
+            job = infra.jobs.get(jid)
+            if not job or job["user_id"] != uid:
+                return None
+            if job["status"] == "running" and not force_claim:
+                return None
+            if job["status"] == "completed" and job.get("yaml_synced"):
+                return None
+            job["status"] = "running"
             return dict(job)
 
         async def _get_job(uid: str, jid: str, *, conn: Any = None) -> dict[str, Any] | None:
@@ -210,6 +245,8 @@ class _FakeWatchlistInfra:
             _ = (ticker, role, action, conn, kwargs)
             if ticker and ticker.upper() in infra.fail_tickers:
                 raise RuntimeError("simulated single-company write error")
+            if ticker and ticker.upper() in infra.schedule_fail_tickers:
+                return {"ok": False, "error": "schedule_refused"}
             created = infra.add_automation(
                 user_id=user_id,
                 workspace_id=workspace_id,
@@ -252,7 +289,7 @@ class _FakeWatchlistInfra:
             infra.home_sync_calls += 1
             return infra.home_sync_result
 
-        def _nudge() -> None:
+        async def _nudge() -> None:
             infra.price_nudges += 1
 
         monkeypatch.setattr(
@@ -261,9 +298,24 @@ class _FakeWatchlistInfra:
             create_autospec(coverage_db.get_coverage_row, side_effect=_get_cov),
         )
         monkeypatch.setattr(
+            coverage_db,
+            "list_coverage_rows",
+            create_autospec(coverage_db.list_coverage_rows, side_effect=_list_cov),
+        )
+        monkeypatch.setattr(
+            ws_db,
+            "get_workspace",
+            create_autospec(ws_db.get_workspace, side_effect=_get_ws),
+        )
+        monkeypatch.setattr(
             reconciler_mod,
             "get_user_tier_policies",
             create_autospec(policies_mod.get_user_tier_policies, side_effect=_get_policies),
+        )
+        monkeypatch.setattr(
+            reconciler_mod,
+            "claim_reconcile_job",
+            create_autospec(policies_mod.claim_reconcile_job, side_effect=_claim_job),
         )
         monkeypatch.setattr(
             reconciler_mod,
@@ -288,7 +340,10 @@ class _FakeWatchlistInfra:
         monkeypatch.setattr(
             reconciler_mod,
             "_user_automations_lock_for_write",
-            _fake_lock,
+            create_autospec(
+                reconciler_mod._user_automations_lock_for_write,
+                side_effect=_fake_lock,
+            ),
         )
         monkeypatch.setattr(
             reconciler_mod,
@@ -637,3 +692,185 @@ def test_dst_aware_cron_and_threshold_validation() -> None:
     assert policies_mod.validate_earnings_stages(["tp1", "tm3"]) == ("tm3", "tp1")
     with pytest.raises(ValueError):
         policies_mod.validate_earnings_stages(["t99"])
+
+
+@pytest.mark.asyncio
+async def test_r3_reconciler_removed_workspace_rebound_check_and_ok_false_and_exclusive_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Items 6 & 7: removed workspace verified inside lock; ok=False fails ticker; active claim skips duplicate."""
+    infra = _FakeWatchlistInfra()
+    infra.install(monkeypatch)
+    uid = "u1"
+
+    # Item 6: META removed, but its old workspace ws-meta was rebound to AMD -> must NOT pause!
+    infra.workspace_owners["ws-meta"] = uid
+    infra.workspace_rows["ws-meta"] = {"workspace_id": "ws-meta", "name": "AMD", "status": "active"}
+    w_row = infra.add_automation(user_id=uid, workspace_id="ws-meta", name="dalton-meta-watch", status="active")
+    res_rebound = await reconciler_mod.TierPolicyReconciler().reconcile_company(
+        uid, "META", removed_workspace_id="ws-meta"
+    )
+    assert res_rebound["skipped"] is True
+    assert res_rebound["reason"] == "workspace_ticker_changed"
+    assert infra.automations[w_row["automation_id"]]["status"] == "active"
+
+    # Item 7: schedule_dalton_automation_helper returning ok=False marks ticker failed & job partial
+    infra.workspaces[(uid, "NVDA")] = "ws-nvda"
+    infra.workspace_owners["ws-nvda"] = uid
+    infra.coverage[(uid, "NVDA")] = {"user_id": uid, "ticker": "NVDA", "tier": "core", "is_private": False}
+    infra.schedule_fail_tickers.add("NVDA")
+    jid = str(uuid.uuid4())
+    infra.jobs[jid] = {
+        "job_id": jid,
+        "user_id": uid,
+        "trigger_action": "set_tier",
+        "target_policy_versions": {"core": 1},
+        "pending_tickers": ["NVDA"],
+        "completed_tickers": [],
+        "failed_items": [],
+        "override_user_pause": False,
+        "job_context": {},
+        "yaml_synced": False,
+        "status": "pending",
+    }
+    res_fail = await reconciler_mod.TierPolicyReconciler().reconcile_job(uid, jid)
+    assert res_fail["status"] == "partial"
+    assert len(res_fail["failed_items"]) == 1
+    assert res_fail["failed_items"][0]["ticker"] == "NVDA"
+
+    # Item 7: job already running/claimed returns claimed=False, reason=already_claimed
+    infra.jobs[jid]["status"] = "running"
+    res_dup = await reconciler_mod.TierPolicyReconciler().reconcile_job(uid, jid)
+    assert res_dup["claimed"] is False
+    assert res_dup["reason"] == "already_claimed"
+
+
+@pytest.mark.asyncio
+async def test_r3_scoped_override_user_pause_disabled_and_dotted_ticker_earnings_pause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Items 8 & 9: version-bound override_user_pause, disabled preservation, 0700.HK slug & earnings stage pause."""
+    infra = _FakeWatchlistInfra()
+    infra.install(monkeypatch)
+    uid = "u1"
+    ws_id = "ws-0700"
+    infra.workspaces[(uid, "0700.HK")] = ws_id
+    infra.workspace_owners[ws_id] = uid
+    infra.coverage[(uid, "0700.HK")] = {
+        "user_id": uid,
+        "ticker": "0700.HK",
+        "tier": "watch",
+        "is_private": False,
+    }
+
+    # 1. User paused move-up at version 2 (confirmation was at version 1!) -> must NOT clear pause
+    move_up = infra.add_automation(
+        user_id=uid,
+        workspace_id=ws_id,
+        name="dalton-0700-hk-move-up",
+        trigger_type="price",
+        cron_expression=None,
+        status="paused",
+        config_version=2,
+        metadata={"paused_by_user": True},
+    )
+    # 2. Disabled move-down -> must NEVER turn back to active
+    move_down = infra.add_automation(
+        user_id=uid,
+        workspace_id=ws_id,
+        name="dalton-0700.hk-move-down",
+        trigger_type="price",
+        cron_expression=None,
+        status="disabled",
+        metadata={"paused_by_policy": True},
+    )
+    # 3. Future earnings tasks: tm3 (dropped in watch!) vs t0 (kept in watch!)
+    future_tm3 = infra.add_automation(
+        user_id=uid,
+        workspace_id=ws_id,
+        name="dalton-0700-hk-earn-fy26q4-tm3",
+        trigger_type="once",
+        cron_expression=None,
+        status="active",
+        next_run_at=datetime.now(UTC) + timedelta(days=4),
+        metadata={"paused_by_user": False},
+    )
+    future_t0 = infra.add_automation(
+        user_id=uid,
+        workspace_id=ws_id,
+        name="dalton-0700-hk-earn-fy26q4-t0",
+        trigger_type="once",
+        cron_expression=None,
+        status="active",
+        next_run_at=datetime.now(UTC) + timedelta(days=7),
+    )
+
+    await reconciler_mod.TierPolicyReconciler().reconcile_company(
+        uid,
+        "0700.HK",
+        override_user_pause=True,
+        override_pause_versions={move_up["automation_id"]: 1},
+    )
+
+    # New user pause (version 2 != 1) was NOT overridden; next_run_at is None
+    assert infra.automations[move_up["automation_id"]]["status"] == "paused"
+    assert infra.automations[move_up["automation_id"]]["next_run_at"] is None
+    assert infra.automations[move_up["automation_id"]]["metadata"]["paused_by_user"] is True
+
+    # Disabled row stayed disabled
+    assert infra.automations[move_down["automation_id"]]["status"] == "disabled"
+
+    # tm3 paused by policy with next_run_at=None & skipped on same conn; t0 stayed active
+    assert infra.automations[future_tm3["automation_id"]]["status"] == "paused"
+    assert infra.automations[future_tm3["automation_id"]]["next_run_at"] is None
+    assert infra.automations[future_tm3["automation_id"]]["metadata"]["paused_by_policy"] is True
+    assert infra.automations[future_t0["automation_id"]]["status"] == "active"
+    assert any(future_tm3["automation_id"] in c["automation_ids"] for c in infra.skip_calls)
+
+
+@pytest.mark.asyncio
+async def test_r3_coverage_units_enabled_uses_real_query_with_conn_and_propagates_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Items 16 & 19: coverage units enabled calls list_active_company_units_with_ticker(conn=conn) & does not swallow DB errors."""
+    from src.dalton import capabilities as cap_mod
+    from src.dalton import settings as dalton_settings
+    from src.dalton.database import coverage_units as cu_db
+
+    monkeypatch.setattr(cap_mod, "has_capability", create_autospec(cap_mod.has_capability, return_value=True))
+    monkeypatch.setattr(dalton_settings, "is_coverage_units_enabled", create_autospec(dalton_settings.is_coverage_units_enabled, return_value=True))
+
+    seen_conns: list[Any] = []
+
+    async def _list_units(*, conn: Any = None):
+        seen_conns.append(conn)
+        return [
+            {
+                "unit_id": "cu-1",
+                "ticker": "NVDA",
+                "ticker_key": "NVDA",
+                "lead_analyst_user_id": "alice",
+                "workspace_id": "ws-unit-nvda",
+            }
+        ]
+
+    real_list_units = cu_db.list_active_company_units_with_ticker
+    monkeypatch.setattr(
+        cu_db,
+        "list_active_company_units_with_ticker",
+        create_autospec(real_list_units, side_effect=_list_units),
+    )
+
+    sentinel_conn = object()
+    ws = await reconciler_mod.resolve_company_workspace_id("alice", "NVDA", conn=sentinel_conn)
+    assert ws == "ws-unit-nvda"
+    assert seen_conns == [sentinel_conn]
+
+    # DB errors MUST propagate clearly instead of being silently swallowed
+    monkeypatch.setattr(
+        cu_db,
+        "list_active_company_units_with_ticker",
+        create_autospec(real_list_units, side_effect=RuntimeError("pg connection reset")),
+    )
+    with pytest.raises(RuntimeError, match="pg connection reset"):
+        await reconciler_mod.resolve_company_workspace_id("alice", "NVDA", conn=sentinel_conn)

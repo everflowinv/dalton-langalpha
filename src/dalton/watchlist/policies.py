@@ -416,8 +416,17 @@ def _normalize_reconcile_job_row(row: Mapping[str, Any] | None) -> dict[str, Any
     out["completed_tickers"] = list(_ensure_json(out.get("completed_tickers"), []) or [])
     out["failed_items"] = list(_ensure_json(out.get("failed_items"), []) or [])
     out["override_user_pause"] = bool(out.get("override_user_pause", False))
+    out["job_context"] = dict(_ensure_json(out.get("job_context"), {}) or {})
     out["yaml_synced"] = bool(out.get("yaml_synced", False))
     return out
+
+
+_RECONCILE_JOB_SELECT_COLS = """
+    job_id::text AS job_id, user_id, trigger_action,
+    target_policy_versions, pending_tickers, completed_tickers,
+    failed_items, override_user_pause, job_context, yaml_synced, status,
+    created_at, updated_at
+"""
 
 
 async def insert_reconcile_job(
@@ -427,6 +436,7 @@ async def insert_reconcile_job(
     target_policy_versions: Mapping[str, int],
     pending_tickers: Sequence[str],
     override_user_pause: bool = False,
+    job_context: Mapping[str, Any] | None = None,
     job_id: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
@@ -447,28 +457,25 @@ async def insert_reconcile_job(
         ensure_ascii=False,
     )
     pending_json = json.dumps(cleaned_tickers, ensure_ascii=False)
+    context_json = json.dumps(dict(job_context or {}), ensure_ascii=False)
 
     async def _run(c: Any) -> dict[str, Any]:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
+                f"""
                 INSERT INTO dalton_watchlist_reconcile_jobs (
                     job_id, user_id, trigger_action, target_policy_versions,
                     pending_tickers, completed_tickers, failed_items,
-                    override_user_pause, yaml_synced, status,
+                    override_user_pause, job_context, yaml_synced, status,
                     created_at, updated_at
                 )
                 VALUES (
                     %s::uuid, %s, %s, %s::jsonb,
                     %s::jsonb, '[]'::jsonb, '[]'::jsonb,
-                    %s, FALSE, 'pending',
+                    %s, %s::jsonb, FALSE, 'pending',
                     NOW(), NOW()
                 )
-                RETURNING
-                    job_id::text AS job_id, user_id, trigger_action,
-                    target_policy_versions, pending_tickers, completed_tickers,
-                    failed_items, override_user_pause, yaml_synced, status,
-                    created_at, updated_at
+                RETURNING {_RECONCILE_JOB_SELECT_COLS}
                 """,
                 (
                     jid,
@@ -477,6 +484,7 @@ async def insert_reconcile_job(
                     versions_json,
                     pending_json,
                     bool(override_user_pause),
+                    context_json,
                 ),
             )
             row = await cur.fetchone()
@@ -504,18 +512,109 @@ async def get_reconcile_job(
     async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
-                SELECT
-                    job_id::text AS job_id, user_id, trigger_action,
-                    target_policy_versions, pending_tickers, completed_tickers,
-                    failed_items, override_user_pause, yaml_synced, status,
-                    created_at, updated_at
+                f"""
+                SELECT {_RECONCILE_JOB_SELECT_COLS}
                 FROM dalton_watchlist_reconcile_jobs
                 WHERE user_id = %s AND job_id = %s::uuid
                 """,
                 (uid, jid),
             )
             return _normalize_reconcile_job_row(await cur.fetchone())
+
+
+async def claim_reconcile_job(
+    user_id: str,
+    job_id: str,
+    *,
+    stale_seconds: int = 300,
+    force_claim: bool = False,
+    conn: Any = None,
+) -> dict[str, Any] | None:
+    """Atomically claim one outbox job for exclusive execution via conditional UPDATE."""
+    uid = str(user_id or "").strip()
+    jid = str(job_id or "").strip()
+    if not uid or not jid:
+        return None
+
+    async def _run(c: Any) -> dict[str, Any] | None:
+        async with c.cursor(row_factory=dict_row) as cur:
+            if force_claim:
+                await cur.execute(
+                    f"""
+                    UPDATE dalton_watchlist_reconcile_jobs
+                    SET status = 'running', updated_at = NOW()
+                    WHERE user_id = %s
+                      AND job_id = %s::uuid
+                      AND (status IN ('pending', 'running', 'partial') OR yaml_synced = FALSE)
+                    RETURNING {_RECONCILE_JOB_SELECT_COLS}
+                    """,
+                    (uid, jid),
+                )
+            else:
+                await cur.execute(
+                    f"""
+                    UPDATE dalton_watchlist_reconcile_jobs
+                    SET status = 'running', updated_at = NOW()
+                    WHERE user_id = %s
+                      AND job_id = %s::uuid
+                      AND (
+                          status IN ('pending', 'partial')
+                          OR (status = 'running' AND updated_at < NOW() - (%s * INTERVAL '1 second'))
+                          OR (status = 'completed' AND yaml_synced = FALSE)
+                      )
+                    RETURNING {_RECONCILE_JOB_SELECT_COLS}
+                    """,
+                    (uid, jid, max(1, int(stale_seconds))),
+                )
+            return _normalize_reconcile_job_row(await cur.fetchone())
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as c, c.transaction():
+        return await _run(c)
+
+
+async def claim_unfinished_reconcile_jobs_for_startup(
+    *,
+    limit: int = 100,
+    conn: Any = None,
+) -> list[dict[str, Any]]:
+    """Atomically claim unfinished outbox jobs across all users on server startup using FOR UPDATE SKIP LOCKED."""
+    async def _run(c: Any) -> list[dict[str, Any]]:
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                WITH picked AS (
+                    SELECT job_id
+                    FROM dalton_watchlist_reconcile_jobs
+                    WHERE status IN ('pending', 'running', 'partial') OR yaml_synced = FALSE
+                    ORDER BY created_at ASC
+                    LIMIT %s
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE dalton_watchlist_reconcile_jobs j
+                SET status = 'running', updated_at = NOW()
+                FROM picked
+                WHERE j.job_id = picked.job_id
+                RETURNING
+                    j.job_id::text AS job_id, j.user_id, j.trigger_action,
+                    j.target_policy_versions, j.pending_tickers, j.completed_tickers,
+                    j.failed_items, j.override_user_pause, j.job_context,
+                    j.yaml_synced, j.status, j.created_at, j.updated_at
+                """,
+                (max(1, int(limit)),),
+            )
+            rows = await cur.fetchall()
+            return [
+                norm
+                for r in (rows or [])
+                if (norm := _normalize_reconcile_job_row(r)) is not None
+            ]
+
+    if conn is not None:
+        return await _run(conn)
+    async with get_db_connection() as c, c.transaction():
+        return await _run(c)
 
 
 async def list_unfinished_reconcile_jobs(
@@ -530,12 +629,8 @@ async def list_unfinished_reconcile_jobs(
     async with get_db_connection(conn) as c:
         async with c.cursor(row_factory=dict_row) as cur:
             await cur.execute(
-                """
-                SELECT
-                    job_id::text AS job_id, user_id, trigger_action,
-                    target_policy_versions, pending_tickers, completed_tickers,
-                    failed_items, override_user_pause, yaml_synced, status,
-                    created_at, updated_at
+                f"""
+                SELECT {_RECONCILE_JOB_SELECT_COLS}
                 FROM dalton_watchlist_reconcile_jobs
                 WHERE user_id = %s
                   AND (status IN ('pending', 'running', 'partial') OR yaml_synced = FALSE)
@@ -596,11 +691,7 @@ async def update_reconcile_job_progress(
                 UPDATE dalton_watchlist_reconcile_jobs
                 SET {", ".join(sets)}
                 WHERE user_id = %s AND job_id = %s::uuid
-                RETURNING
-                    job_id::text AS job_id, user_id, trigger_action,
-                    target_policy_versions, pending_tickers, completed_tickers,
-                    failed_items, override_user_pause, yaml_synced, status,
-                    created_at, updated_at
+                RETURNING {_RECONCILE_JOB_SELECT_COLS}
                 """,
                 tuple(params),
             )
@@ -627,6 +718,8 @@ __all__ = [
     "WATCH_CRON_CORE_DEFAULT",
     "WATCH_CRON_RADAR_TEMPLATE",
     "WATCH_CRON_WATCH_DEFAULT",
+    "claim_reconcile_job",
+    "claim_unfinished_reconcile_jobs_for_startup",
     "default_tier_policies_yaml_dict",
     "get_default_tier_policy",
     "get_reconcile_job",

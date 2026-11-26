@@ -1873,7 +1873,9 @@ def build_director_tools(
             task_owner = await _verify_tracking_workspace_owner(target_ws_id, user_id)
             try:
                 if act == "enable":
-                    is_user_action = src == "user"
+                    # Item 10: Chief of Staff path always respects manual pauses (force=False, respect_user_pause=True);
+                    # analyst-in-workspace explicit user enable keeps force=True when source="user".
+                    is_user_action = src == "user" and role != "chief_of_staff"
                     res = await enable_tracking(
                         task_owner,
                         target_ws_id,

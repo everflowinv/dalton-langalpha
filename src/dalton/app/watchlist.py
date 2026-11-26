@@ -61,9 +61,14 @@ class WatchlistMutateRequest(BaseModel):
     group_id: str | None = None
     tags: list[str] | None = None
     override_user_pause: bool = False
+    expected_action: str | None = None
     expected_roster_hash: str | None = None
     expected_policy_versions: dict[str, int] | None = None
     expected_target_tickers: list[str] | None = None
+    expected_target_tier: str | None = None
+    expected_group_id: str | None = None
+    expected_override_user_pause: bool | None = None
+    expected_pause_versions: dict[str, int] | None = None
 
 
 class WatchlistReconcileRequest(BaseModel):
@@ -163,12 +168,19 @@ async def mutate_watchlist_endpoint(
     if (
         body.expected_roster_hash is not None
         or body.expected_policy_versions is not None
+        or body.expected_target_tickers is not None
+        or body.expected_action is not None
     ):
         expected_snapshot = {
             "owner_user_id": uid,
+            "raw_action": body.expected_action,
             "expected_roster_hash": body.expected_roster_hash,
             "expected_policy_versions": body.expected_policy_versions,
             "target_tickers": body.expected_target_tickers,
+            "target_tier": body.expected_target_tier,
+            "group_id": body.expected_group_id,
+            "override_user_pause": body.expected_override_user_pause,
+            "expected_pause_versions": body.expected_pause_versions,
         }
 
     try:
@@ -186,6 +198,7 @@ async def mutate_watchlist_endpoint(
             tags=body.tags,
             override_user_pause=body.override_user_pause,
             expected_snapshot=expected_snapshot,
+            require_snapshot=True,
         )
     except WatchlistScopeChangedError as exc:
         raise HTTPException(

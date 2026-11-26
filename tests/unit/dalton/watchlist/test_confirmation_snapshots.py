@@ -6,13 +6,15 @@ import json
 import uuid
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from typing import Any
+from typing import Annotated, Any, TypedDict
 from unittest.mock import create_autospec
 
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableConfig
+from langgraph.graph.message import add_messages
 from langgraph.types import Command
 
 from src.dalton.app import dalton_router
@@ -31,6 +33,11 @@ from src.tools.secretary import _commands as sec_commands
 from src.tools.secretary.approvals import StandingApprovalMiddleware
 
 USER_ALICE = "user-alice-wl"
+
+
+class _RealHitlGraphState(TypedDict):
+    messages: Annotated[list, add_messages]
+    approval_snapshots: dict[str, dict[str, Any]]
 
 
 def _unpack_command_json(cmd: Command) -> tuple[dict[str, Any], Any]:
@@ -54,6 +61,8 @@ def _wire_in_memory_watchlist(
         "writes": 0,
         "reconciled_jobs": [],
         "workspaces": dict(workspaces or {}),
+        "workspace_owners": {},
+        "automations": [],
     }
 
     @asynccontextmanager
@@ -127,7 +136,17 @@ def _wire_in_memory_watchlist(
         g = state["groups"].get(gid)
         return dict(g) if g and g["user_id"] == uid else None
 
-    async def _insert_job(uid: str, *, trigger_action: str, target_policy_versions: Any, pending_tickers: Any, override_user_pause: bool = False, job_id: str | None = None, conn: Any = None):
+    async def _insert_job(
+        uid: str,
+        *,
+        trigger_action: str,
+        target_policy_versions: Any,
+        pending_tickers: Any,
+        override_user_pause: bool = False,
+        job_context: Any = None,
+        job_id: str | None = None,
+        conn: Any = None,
+    ):
         _ = conn
         jid = job_id or str(uuid.uuid4())
         job = {
@@ -139,25 +158,60 @@ def _wire_in_memory_watchlist(
             "completed_tickers": [],
             "failed_items": [],
             "override_user_pause": override_user_pause,
+            "job_context": dict(job_context or {}),
             "yaml_synced": False,
             "status": "pending",
         }
         state["jobs"][jid] = job
         return dict(job)
 
-    async def _fake_reconcile_job(self: Any, uid: str, jid: str, *, sync_home: bool = True):
-        _ = (self, uid, sync_home)
+    async def _update_tags(uid: str, tickers: list[str], tags: list[str], *, conn: Any = None):
+        _ = conn
+        state["writes"] += 1
+        out = []
+        for t in tickers:
+            row = state["rows"].get((uid, t.upper()))
+            if row:
+                row["tags"] = list(tags)
+                out.append(dict(row))
+        return out
+
+    async def _delete_group_and_exclusive(uid: str, gid: str, *, conn: Any = None):
+        _ = conn
+        state["writes"] += 1
+        existing_groups = [g for g in state["groups"].values() if g["user_id"] == uid]
+        rows = [v for (u, _), v in state["rows"].items() if u == uid]
+        to_del = coverage_db.compute_exclusive_group_deletion_tickers(gid, existing_groups, rows)
+        for sym in to_del:
+            state["rows"].pop((uid, sym), None)
+        grp = state["groups"].pop(gid, None)
+        return {
+            "deleted": grp is not None,
+            "group_id": gid,
+            "label": (grp or {}).get("label"),
+            "removed_tickers": to_del,
+        }
+
+    async def _fake_reconcile_job(
+        self: Any,
+        uid: str,
+        jid: str,
+        *,
+        sync_home: bool = True,
+        _preclaimed_job: Any = None,
+    ):
+        _ = (self, uid, sync_home, _preclaimed_job)
         state["reconciled_jobs"].append(jid)
         job = state["jobs"][jid]
         job["completed_tickers"] = list(job["pending_tickers"])
         job["pending_tickers"] = []
-        job["yaml_synced"] = True
-        job["status"] = "completed"
+        job["yaml_synced"] = bool(sync_home)
+        job["status"] = "completed" if sync_home else "partial"
         return {
-            "ok": True,
+            "ok": bool(sync_home),
             "job_id": jid,
-            "status": "completed",
-            "yaml_synced": True,
+            "status": job["status"],
+            "yaml_synced": job["yaml_synced"],
             "failed_items": [],
         }
 
@@ -233,9 +287,33 @@ def _wire_in_memory_watchlist(
         ),
     )
     monkeypatch.setattr(
+        coverage_db,
+        "update_coverage_tags",
+        create_autospec(coverage_db.update_coverage_tags, side_effect=_update_tags),
+    )
+    monkeypatch.setattr(
+        coverage_db,
+        "delete_coverage_group_and_exclusive_members",
+        create_autospec(
+            coverage_db.delete_coverage_group_and_exclusive_members,
+            side_effect=_delete_group_and_exclusive,
+        ),
+    )
+    monkeypatch.setattr(
+        service_mod,
+        "resolve_workspace_tracking_owner",
+        create_autospec(
+            service_mod.resolve_workspace_tracking_owner,
+            side_effect=lambda ws_id, workspace=None, *, conn=None, unit=None: state["workspace_owners"].get(ws_id, USER_ALICE),
+        ),
+    )
+    monkeypatch.setattr(
         service_mod,
         "list_all_user_automations",
-        create_autospec(service_mod.list_all_user_automations, return_value=[]),
+        create_autospec(
+            service_mod.list_all_user_automations,
+            side_effect=lambda uid, *, name_prefix=None, conn=None: list(state["automations"]),
+        ),
     )
     monkeypatch.setattr(
         service_mod,
@@ -258,7 +336,14 @@ def _wire_in_memory_watchlist(
             return_value={"ok": True, "action": "exists"},
         ),
     )
-    monkeypatch.setattr(reconciler_mod.TierPolicyReconciler, "reconcile_job", _fake_reconcile_job)
+    monkeypatch.setattr(
+        reconciler_mod.TierPolicyReconciler,
+        "reconcile_job",
+        create_autospec(
+            reconciler_mod.TierPolicyReconciler.reconcile_job,
+            side_effect=_fake_reconcile_job,
+        ),
+    )
     return state
 
 
@@ -553,6 +638,34 @@ def test_web_rest_watchlist_preview_mutate_conflict_and_company_isolation(
     assert prev["action"] == "watchlist_set_tier"
     assert prev["requires_confirmation"] is True
 
+    # Missing snapshot on confirmable set_tier -> 409 scope_changed & zero writes (Item 2)
+    r_missing = client.post(
+        "/api/v1/dalton/watchlist/mutate",
+        json={"action": "set_tier", "tickers": ["NVDA"], "tier": "radar"},
+    )
+    assert r_missing.status_code == 409
+    assert r_missing.json()["detail"]["code"] == "scope_changed"
+    assert state["writes"] == 0
+
+    # Tampered expected_target_tier -> 409 scope_changed & zero writes (Item 2)
+    r_tamper = client.post(
+        "/api/v1/dalton/watchlist/mutate",
+        json={
+            "action": "set_tier",
+            "tickers": ["NVDA"],
+            "tier": "radar",
+            "expected_action": "set_tier",
+            "expected_target_tier": "watch",
+            "expected_override_user_pause": False,
+            "expected_roster_hash": prev["expected_roster_hash"],
+            "expected_policy_versions": prev["expected_policy_versions"],
+            "expected_target_tickers": ["NVDA"],
+        },
+    )
+    assert r_tamper.status_code == 409
+    assert r_tamper.json()["detail"]["code"] == "scope_changed"
+    assert state["writes"] == 0
+
     # Mutate with stale expected_roster_hash -> 409 scope_changed & zero writes
     r_conflict = client.post(
         "/api/v1/dalton/watchlist/mutate",
@@ -560,6 +673,9 @@ def test_web_rest_watchlist_preview_mutate_conflict_and_company_isolation(
             "action": "set_tier",
             "tickers": ["NVDA"],
             "tier": "radar",
+            "expected_action": "set_tier",
+            "expected_target_tier": "radar",
+            "expected_override_user_pause": False,
             "expected_roster_hash": "stale-hash",
             "expected_policy_versions": prev["expected_policy_versions"],
             "expected_target_tickers": ["NVDA"],
@@ -569,16 +685,19 @@ def test_web_rest_watchlist_preview_mutate_conflict_and_company_isolation(
     assert r_conflict.json()["detail"]["code"] == "scope_changed"
     assert state["writes"] == 0
 
-    # Mutate with matching snapshot -> 200 & reconciled
+    # Mutate with matching full snapshot -> 200 & reconciled
     r_ok = client.post(
         "/api/v1/dalton/watchlist/mutate",
         json={
             "action": "set_tier",
             "tickers": ["NVDA"],
             "tier": "radar",
+            "expected_action": prev["raw_action"],
+            "expected_target_tier": prev["target_tier"],
+            "expected_override_user_pause": prev["override_user_pause"],
             "expected_roster_hash": prev["expected_roster_hash"],
             "expected_policy_versions": prev["expected_policy_versions"],
-            "expected_target_tickers": ["NVDA"],
+            "expected_target_tickers": prev["target_tickers"],
         },
     )
     assert r_ok.status_code == 200
@@ -590,3 +709,231 @@ def test_web_rest_watchlist_preview_mutate_conflict_and_company_isolation(
     current_user["id"] = COMPANY_SYSTEM_USER_ID
     r_sys = client.get("/api/v1/dalton/watchlist")
     assert r_sys.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_r3_real_langgraph_interrupt_pause_approve_and_reject_without_mocking_hitl_confirm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Item 1: Real LangGraph StateGraph + MemorySaver hits real hitl_confirm (GraphInterrupt NOT swallowed)."""
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.graph import END, START, StateGraph
+
+    initial = [
+        cov_models.company_to_row(
+            cov_models.make_new_company_dict("NVDA", name="NVIDIA", tier="core"),
+            user_id=USER_ALICE,
+            source="chat",
+        )
+    ]
+    state = _wire_in_memory_watchlist(
+        monkeypatch, initial_rows=initial, workspaces={"NVDA": "ws-nvda"}
+    )
+    tool = cov_tools_mod.build_coverage_tools(role="chief_of_staff")[0]
+
+    async def _run_tool(s: _RealHitlGraphState, config: RunnableConfig):
+        return await tool.ainvoke(
+            {
+                "name": "dalton_coverage",
+                "id": "call-real-hitl",
+                "type": "tool_call",
+                "args": {"action": "set_tier", "tickers": ["NVDA"], "tier": "radar"},
+            },
+            config=config,
+        )
+
+    builder = StateGraph(_RealHitlGraphState)
+    builder.add_node("tool_node", _run_tool)
+    builder.add_edge(START, "tool_node")
+    builder.add_edge("tool_node", END)
+    graph = builder.compile(checkpointer=MemorySaver())
+
+    snap = await service_mod.WatchlistMutationService().preview_mutation(
+        USER_ALICE,
+        action="set_tier",
+        tickers=["NVDA"],
+        tier="radar",
+        tool_call_id="call-real-hitl",
+    )
+
+    # 1. Pause -> Approve -> Resumes & writes DB
+    cfg_ok = {"configurable": {"thread_id": "t-approve", "user_id": USER_ALICE}}
+    paused = await graph.ainvoke({"messages": [], "approval_snapshots": {"call-real-hitl": snap}}, config=cfg_ok)
+    assert "__interrupt__" in paused
+    req0 = paused["__interrupt__"][0].value["action_requests"][0]
+    assert (req0.get("type") or req0.get("action")) == "watchlist_set_tier"
+    assert state["writes"] == 0
+
+    resumed_ok = await graph.ainvoke(
+        Command(resume={"decisions": [{"type": "approve"}]}),
+        config=cfg_ok,
+    )
+    assert "__interrupt__" not in resumed_ok
+    payload_ok = json.loads(resumed_ok["messages"][-1].content)
+    assert payload_ok["ok"] is True
+    assert state["rows"][(USER_ALICE, "NVDA")]["tier"] == "radar"
+
+    # 2. Pause -> Reject -> Zero DB writes
+    state["rows"][(USER_ALICE, "NVDA")]["tier"] = "core"
+    writes_before = state["writes"]
+    snap2 = await service_mod.WatchlistMutationService().preview_mutation(
+        USER_ALICE,
+        action="set_tier",
+        tickers=["NVDA"],
+        tier="radar",
+        tool_call_id="call-real-hitl",
+    )
+    cfg_rej = {"configurable": {"thread_id": "t-reject", "user_id": USER_ALICE}}
+    paused2 = await graph.ainvoke({"messages": [], "approval_snapshots": {"call-real-hitl": snap2}}, config=cfg_rej)
+    assert "__interrupt__" in paused2
+
+    resumed_rej = await graph.ainvoke(
+        Command(resume={"decisions": [{"type": "reject", "message": "cancel"}]}),
+        config=cfg_rej,
+    )
+    assert "__interrupt__" not in resumed_rej
+    rej_content = str(resumed_rej["messages"][-1].content)
+    assert "取消" in rej_content
+    assert state["writes"] == writes_before
+    assert state["rows"][(USER_ALICE, "NVDA")]["tier"] == "core"
+
+
+@pytest.mark.asyncio
+async def test_r3_exempt_boundaries_group_label_uuid_drift_and_update_tags_outbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Items 3, 4, 13: requested-count > 5 requires confirm; remove_group by label uses UUID & detects membership drift; update_tags writes outbox & covered_job_ids."""
+    gid = str(uuid.uuid4())
+    initial = [
+        cov_models.company_to_row(
+            cov_models.make_new_company_dict("NVDA", name="NVIDIA", tier="core"),
+            user_id=USER_ALICE,
+            source="chat",
+        ),
+        {
+            **cov_models.company_to_row(
+                cov_models.make_new_company_dict("AMD", name="AMD", tier="watch"),
+                user_id=USER_ALICE,
+                source="group",
+            ),
+            "group_id": gid,
+            "extra": {"group_ids": [gid]},
+        },
+    ]
+    state = _wire_in_memory_watchlist(
+        monkeypatch, initial_rows=initial, workspaces={"NVDA": "ws-nvda"}
+    )
+    state["groups"][gid] = {"group_id": gid, "user_id": USER_ALICE, "label": "AI Leaders"}
+
+    svc = service_mod.WatchlistMutationService()
+
+    # Item 4: 6 requested tickers where only 2 validate -> STILL requires confirmation (by requested count!)
+    async def _only_two_valid(tickers: Any):
+        valid = [{"ticker": t, "name": t, "market": "US"} for t in list(tickers)[:2]]
+        return valid, list(tickers)[2:]
+
+    monkeypatch.setattr(
+        service_mod,
+        "validate_and_enrich_tickers",
+        create_autospec(cov_svc.validate_and_enrich_tickers, side_effect=_only_two_valid),
+    )
+    prev_6 = await svc.preview_mutation(
+        USER_ALICE,
+        action="add",
+        tickers=["A1", "A2", "BAD1", "BAD2", "BAD3", "BAD4"],
+        tier="radar",
+    )
+    assert prev_6["requested_count"] == 6
+    assert len(prev_6["target_tickers"]) == 2
+    assert prev_6["requires_confirmation"] is True
+
+    # Item 4: add touching an existing ticker (even same tier, <=5) requires confirmation
+    prev_dup = await svc.preview_mutation(
+        USER_ALICE, action="add", tickers=["NVDA"], tier="core", skip_ticker_validation=True
+    )
+    assert prev_dup["requires_confirmation"] is True
+
+    # Item 3: remove_group previewed by label resolves UUID; drifting membership before Stage 1 -> scope_changed
+    prev_grp = await svc.preview_mutation(USER_ALICE, action="remove_group", label="AI Leaders")
+    assert prev_grp["group_id"] == gid
+    assert prev_grp["target_tickers"] == ["AMD"]
+
+    # Add another group member after preview -> exclusive deletion set drifts -> scope_changed with zero writes
+    state["rows"][(USER_ALICE, "AVGO")] = {
+        **cov_models.company_to_row(
+            cov_models.make_new_company_dict("AVGO", name="Broadcom", tier="watch"),
+            user_id=USER_ALICE,
+            source="group",
+        ),
+        "group_id": gid,
+        "extra": {"group_ids": [gid]},
+    }
+    with pytest.raises(service_mod.WatchlistScopeChangedError):
+        await svc.execute_mutation(
+            USER_ALICE,
+            action="remove_group",
+            label="AI Leaders",
+            expected_snapshot=prev_grp,
+            require_snapshot=True,
+        )
+    assert state["writes"] == 0
+
+    # Fresh preview after drift -> executes using resolved UUID even when label is passed
+    prev_grp2 = await svc.preview_mutation(USER_ALICE, action="remove_group", label="AI Leaders")
+    assert set(prev_grp2["target_tickers"]) == {"AMD", "AVGO"}
+    res_grp = await svc.execute_mutation(
+        USER_ALICE,
+        action="remove_group",
+        label="AI Leaders",
+        expected_snapshot=prev_grp2,
+        require_snapshot=True,
+    )
+    assert res_grp["ok"] is True
+    assert res_grp["group_id"] == gid
+    assert gid not in state["groups"]
+
+    # Item 13: update_tags writes tags + outbox job in same tx; covered_job_ids only settles pre-render jobs
+    res_tags = await svc.execute_mutation(
+        USER_ALICE,
+        action="update_tags",
+        tickers=["NVDA"],
+        tags=["ai", "gpu"],
+        sync_home=False,
+    )
+    assert res_tags["ok"] is True
+    j1 = res_tags["job_id"]
+    assert j1 in state["jobs"]
+    assert state["jobs"][j1]["trigger_action"] == "update_tags"
+    assert state["jobs"][j1]["yaml_synced"] is False
+
+    # Simulate a second job inserted AFTER render began
+    res_tags2 = await svc.execute_mutation(
+        USER_ALICE,
+        action="update_tags",
+        tickers=["NVDA"],
+        tags=["ai"],
+        sync_home=False,
+    )
+    j2 = res_tags2["job_id"]
+
+    async def _list_unf(uid: str, *, conn: Any = None):
+        _ = conn
+        return [dict(j) for j in state["jobs"].values() if j["user_id"] == uid and not j["yaml_synced"]]
+
+    async def _upd_prog(uid: str, jid: str, **kwargs):
+        _ = uid
+        job = state["jobs"][jid]
+        for k in ("yaml_synced", "status"):
+            if kwargs.get(k) is not None:
+                job[k] = kwargs[k]
+        return dict(job)
+
+    monkeypatch.setattr(reconciler_mod, "list_unfinished_reconcile_jobs", create_autospec(policies_mod.list_unfinished_reconcile_jobs, side_effect=_list_unf))
+    monkeypatch.setattr(reconciler_mod, "update_reconcile_job_progress", create_autospec(policies_mod.update_reconcile_job_progress, side_effect=_upd_prog))
+
+    marked = await reconciler_mod.TierPolicyReconciler().mark_yaml_synced_for_user(
+        USER_ALICE, covered_job_ids=[j1]
+    )
+    assert marked == 1
+    assert state["jobs"][j1]["yaml_synced"] is True
+    assert state["jobs"][j2]["yaml_synced"] is False

@@ -18,13 +18,11 @@ import { updateMessage } from '../../hooks/utils/messageHelpers';
 import { dispatchResultFields, type ToolResultLike } from '../../utils/dispatchResult';
 import type { HistoryInterruptInfo, SetMessages } from '../types';
 
-// DALTON-HOOK(watchlist): personal watchlist confirmation action types
-const WATCHLIST_INTERRUPT_TYPES = new Set([
-  'watchlist_batch_add',
-  'watchlist_set_tier',
-  'watchlist_remove',
-  'watchlist_tier_policy',
-]);
+import {
+  WATCHLIST_INTERRUPT_TYPES,
+  extractWatchlistOutcomeExtras,
+  settleWatchlistProposalsBucket,
+} from '@/lib/dalton/watchlistInterrupts'; // DALTON-HOOK(watchlist)
 
 /** Interrupt types that map to proposal-based HITL cards (workspace, question, ptc, secretary). */
 const PROPOSAL_INTERRUPT_TYPES = new Set([
@@ -309,29 +307,10 @@ function proposalResultFields(
   if (type === 'create_workspace') {
     return workspaceProposalResultFields(result);
   }
-  // --- DALTON-HOOK(watchlist): begin ---
+  // DALTON-HOOK(watchlist): enrich watchlist confirmation outcome with reconcile_status / job_id
   if (WATCHLIST_INTERRUPT_TYPES.has(type)) {
-    const outcome = proposalOutcomeFields(type, result);
-    if (outcome.status !== 'approved' || typeof result.content !== 'string') {
-      return outcome;
-    }
-    try {
-      const parsed: unknown = JSON.parse(result.content);
-      if (isPlainObject(parsed)) {
-        return {
-          ...outcome,
-          ...(typeof parsed.reconcile_status === 'string'
-            ? { reconcile_status: parsed.reconcile_status }
-            : {}),
-          ...(typeof parsed.job_id === 'string' ? { job_id: parsed.job_id } : {}),
-        };
-      }
-    } catch {
-      // Keep base outcome.
-    }
-    return outcome;
+    return extractWatchlistOutcomeExtras(proposalOutcomeFields(type, result), result.content);
   }
-  // --- DALTON-HOOK(watchlist): end ---
   return proposalOutcomeFields(type, result);
 }
 
@@ -388,30 +367,15 @@ function settleLiveProposalFromResult(
         msgChanged = true;
       }
     }
-    // --- DALTON-HOOK(watchlist): begin ---
-    let nextWatchlistProposals = m.watchlistProposals;
-    if (m.watchlistProposals) {
-      let bucketChanged = false;
-      const updatedCards: Record<string, WatchlistProposalState> = { ...m.watchlistProposals };
-      for (const [cardId, card] of Object.entries(m.watchlistProposals)) {
-        if (
-          card
-          && card.tool_call_id === toolCallId
-          && (card.status === 'submitting' || card.status === 'pending')
-        ) {
-          updatedCards[cardId] = {
-            ...card,
-            ...proposalResultFields(card.actionType || 'watchlist_set_tier', result),
-          } as WatchlistProposalState;
-          bucketChanged = true;
-        }
-      }
-      if (bucketChanged) {
-        nextWatchlistProposals = updatedCards;
-        msgChanged = true;
-      }
-    }
-    // --- DALTON-HOOK(watchlist): end ---
+    // DALTON-HOOK(watchlist): settle matching personal watchlist confirmation cards by tool_call_id
+    const wlSettled = settleWatchlistProposalsBucket(
+      m.watchlistProposals,
+      toolCallId,
+      result,
+      (t, r) => proposalResultFields(t || 'watchlist_set_tier', r) as Partial<WatchlistProposalState>,
+    );
+    const nextWatchlistProposals = wlSettled.next;
+    if (wlSettled.changed) msgChanged = true;
     if (!msgChanged) return m;
     changed = true;
     const updatedMsg: AssistantMessage = {
