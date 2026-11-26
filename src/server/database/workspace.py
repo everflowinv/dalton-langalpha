@@ -893,6 +893,7 @@ async def create_workspace_on_computer(
     expected_duplicate_workspace_name: Optional[str] = None,
     verified_company_candidates: Optional[Iterable[Tuple[str, str, Optional[str]]]] = None,
     check_colleague_duplicate: bool = False,
+    reject_reason_out: Optional[list[str]] = None,
     # --- DALTON-HOOK(cos-settings-tools): end ---
     conn=None,
 ) -> Optional[Dict[str, Any]]:
@@ -964,6 +965,27 @@ async def create_workspace_on_computer(
                     if expected_computer_kind is not None:
                         extra_fence += "\n                                  AND kind = %(expected_computer_kind)s"
                     async with owned.transaction():
+                        if reject_reason_out is not None:
+                            await cur.execute(
+                                f"""
+                                SELECT config
+                                FROM computers
+                                WHERE computer_id = %(computer_id)s AND {FENCE_NOT_DELETED}
+                                  AND user_id = %(user_id)s
+                                FOR SHARE
+                                """,
+                                {
+                                    "computer_id": computer_id,
+                                    "user_id": user_id,
+                                },
+                            )
+                            locked_state = await cur.fetchone()
+                            if (
+                                isinstance(locked_state, dict)
+                                and (locked_state.get("config") or {}).get("archiving")
+                            ):
+                                reject_reason_out.append("archiving")
+                                return None
                         if expected_computer_name is not None or expected_computer_kind is not None:
                             from src.tools.secretary.utils import spoken_computer_name
 

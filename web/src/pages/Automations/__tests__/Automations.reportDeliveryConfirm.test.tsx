@@ -180,19 +180,21 @@ describe('Automations report delivery confirmation dialog (AD5)', () => {
     await waitFor(() => {
       expect(confirmMocks.precheck).toHaveBeenCalledTimes(1);
     });
-    expect(await screen.findByText('Research Group 1')).toBeTruthy();
+    // text_targets=null inherits report_targets -> actual recipient appears under both report cards and plain text!
+    expect((await screen.findAllByText('Research Group 1')).length).toBe(2);
+    expect(screen.getByText(new RegExp(label('automation:reportDeliveryTextInheritedNote')))).toBeTruthy();
     expect(api.createAutomation).not.toHaveBeenCalled();
 
     // Cancel closes dialog without calling createAutomation
     fireEvent.click(screen.getByRole('button', { name: label('common.cancel') }));
     await waitFor(() => {
-      expect(screen.queryByText('Research Group 1')).toBeNull();
+      expect(screen.queryAllByText('Research Group 1')).toHaveLength(0);
     });
     expect(api.createAutomation).not.toHaveBeenCalled();
 
     // Submit again -> confirm -> issues one-time credential and attaches report_delivery_confirmation_token
     fireEvent.click(submitBtn);
-    await screen.findByText('Research Group 1');
+    await screen.findAllByText('Research Group 1');
     fireEvent.click(
       screen.getByRole('button', { name: label('automation:reportDeliveryConfirmCreate') }),
     );
@@ -203,5 +205,75 @@ describe('Automations report delivery confirmation dialog (AD5)', () => {
     });
     const sentPayload = vi.mocked(api.createAutomation).mock.calls[0]?.[0];
     expect(sentPayload?.report_delivery_confirmation_token).toBe('one-time-tok-xyz');
+  });
+
+  it('preserves trailing comma while typing multiple targets and distinguishes inherit vs disabled text_targets', async () => {
+    confirmMocks.precheck.mockResolvedValue({
+      data: {
+        needs_confirmation: true,
+        action: 'create',
+        automation_id: null,
+        automation_name: 'Multi Target Alert',
+        config_version: null,
+        profile: 'daily-filing-alert',
+        report_targets: ['feishu:chat:oc_group_1', 'feishu:chat:oc_group_2'],
+        text_targets: [],
+        failure_targets: [],
+        group_targets: ['feishu:chat:oc_group_1', 'feishu:chat:oc_group_2'],
+        non_caller_dm_targets: [],
+        target_labels: {
+          'feishu:chat:oc_group_1': 'Group One',
+          'feishu:chat:oc_group_2': 'Group Two',
+        },
+      },
+    });
+
+    renderWithProviders(<Automations />, { route: '/automations' });
+
+    fireEvent.click(await screen.findByText(label('automation:blankAutomation')));
+    fireEvent.change(await screen.findByLabelText(label('common.name')), {
+      target: { value: 'Multi Target Alert' },
+    });
+    fireEvent.change(screen.getByLabelText(label('automation:instruction')), {
+      target: { value: 'Run report.' },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: new RegExp(label('automation:moreOptions')) }));
+    fireEvent.click(
+      await screen.findByRole('button', { name: label('automation:reportDeliveryConfigure') }),
+    );
+    fireEvent.change(await screen.findByLabelText(label('automation:reportDeliveryConfirmProfile')), {
+      target: { value: 'daily-filing-alert' },
+    });
+
+    // Trailing comma must stay intact so user can type a second target.
+    const reportInput = (await screen.findByLabelText(
+      label('automation:reportDeliveryConfirmReportTargets'),
+    )) as HTMLInputElement;
+    fireEvent.change(reportInput, { target: { value: 'feishu:chat:oc_group_1,' } });
+    expect(reportInput.value).toBe('feishu:chat:oc_group_1,');
+    fireEvent.change(reportInput, { target: { value: 'feishu:chat:oc_group_1, feishu:chat:oc_group_2' } });
+    expect(reportInput.value).toBe('feishu:chat:oc_group_1, feishu:chat:oc_group_2');
+
+    // Explicitly choose "Do not send plain text" -> sends text_targets: [] instead of omitting it.
+    const textModeSelect = screen.getByLabelText(label('automation:reportDeliveryTextMode'));
+    fireEvent.change(textModeSelect, { target: { value: 'none' } });
+
+    fireEvent.click(screen.getByRole('button', { name: label('common.create') }));
+
+    await waitFor(() => {
+      expect(confirmMocks.precheck).toHaveBeenCalledTimes(1);
+    });
+    const precheckArg = confirmMocks.precheck.mock.calls[0]?.[0];
+    expect(precheckArg.report_profile.report_targets).toEqual([
+      'feishu:chat:oc_group_1',
+      'feishu:chat:oc_group_2',
+    ]);
+    expect(precheckArg.report_profile.text_targets).toEqual([]);
+
+    // Confirmation dialog displays report targets once (NOT duplicated into plain text) and shows disabled note.
+    expect(await screen.findAllByText('Group One')).toHaveLength(1);
+    expect(screen.getAllByText('Group Two')).toHaveLength(1);
+    expect(screen.getAllByText(label('automation:reportDeliveryTextDisabled')).length).toBeGreaterThanOrEqual(1);
   });
 });

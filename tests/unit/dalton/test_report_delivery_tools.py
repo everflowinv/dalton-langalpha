@@ -1132,6 +1132,7 @@ async def test_set_and_clear_atomicity_on_version_conflict(
             caller_user_id=_OWNER,
             automation_id=_AUTO_UUID,
             report_targets=[_FEISHU_CHAT_AUTH],
+            failure_targets=[],
             hitl_confirmed=True,
         )
     assert exc_set.value.code == "conflict"
@@ -4737,3 +4738,382 @@ async def test_ad5_unattended_automation_turn_refuses_without_hanging_and_migrat
     mig = importlib.import_module("src.dalton.migrations.versions.d057_report_delivery_confirmations")
     assert mig.revision == "d057"
     assert mig.down_revision == "d055"
+
+
+@pytest.mark.asyncio
+async def test_ad5_r2_confirmation_issue_requires_same_origin_and_sec_fetch_site(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """AD5 r2: REST confirmation precheck & issuance require session auth plus
+    same-origin Origin AND Sec-Fetch-Site: same-origin (missing or foreign rejected 403)."""
+    from fastapi import HTTPException
+    from src.dalton.app import router as dalton_router
+    from src.dalton.capabilities import CapabilityId
+
+    _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="admin", is_feishu_member=True)
+    monkeypatch.setattr(dalton_router, "_require_dalton_enabled", lambda: None)
+    monkeypatch.setattr(dalton_router, "require_capability", lambda cap: None)
+    assert CapabilityId.CHANNEL_GATEWAY is not None
+
+    issued_spy = create_autospec(
+        rd_svc.issue_report_delivery_confirmation,
+        return_value={
+            "confirmation_id": "conf-r2-1",
+            "confirmation_token": "rdc_valid_r2_token",
+            "expires_at": "2026-11-26T10:00:00+00:00",
+            "payload_digest": "a" * 64,
+        },
+    )
+    monkeypatch.setattr(rd_svc, "issue_report_delivery_confirmation", issued_spy)
+
+    body = dalton_router.ReportDeliveryConfirmRequest(
+        action="create",
+        name="Daily Filing",
+        instruction=_DAILY_FILING_INST,
+        report_profile={
+            "profile": "daily-filing-alert",
+            "report_targets": [_FEISHU_CHAT_AUTH],
+            "failure_targets": [],
+        },
+    )
+    sess_principal = MagicMock()
+    sess_principal.user_id = _OWNER
+    sess_principal.auth = "session"
+
+    def _req(headers: list[tuple[bytes, bytes]]) -> Request:
+        return Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "scheme": "https",
+                "server": ("app.example.com", 443),
+                "path": "/api/v1/dalton/report-delivery/confirmations",
+                "headers": [(b"host", b"app.example.com"), *headers],
+            }
+        )
+
+    bad_header_cases = [
+        [],  # Missing both Origin and Sec-Fetch-Site (e.g. curl)
+        [(b"origin", b"https://app.example.com")],  # Missing Sec-Fetch-Site
+        [(b"sec-fetch-site", b"same-origin")],  # Missing Origin
+        [
+            (b"origin", b"https://app.example.com"),
+            (b"sec-fetch-site", b"cross-site"),
+        ],
+        [
+            (b"origin", b"https://app.example.com"),
+            (b"sec-fetch-site", b"same-site"),
+        ],
+        [
+            (b"origin", b"https://app.example.com"),
+            (b"sec-fetch-site", b"none"),
+        ],
+        [
+            (b"origin", b"https://evil.example.com"),
+            (b"sec-fetch-site", b"same-origin"),
+        ],
+        [
+            (b"origin", b"https://app.example.com"),
+            (b"sec-fetch-site", b"same-origin"),
+            (b"x-service-token", b"svc-secret"),
+        ],
+    ]
+    for hdrs in bad_header_cases:
+        with pytest.raises(HTTPException) as exc:
+            await dalton_router.issue_report_delivery_confirmation_endpoint(
+                body, sess_principal, _req(hdrs)
+            )
+        assert exc.value.status_code == 403
+    issued_spy.assert_not_awaited()
+
+    good_req = _req(
+        [
+            (b"origin", b"https://app.example.com"),
+            (b"sec-fetch-site", b"same-origin"),
+        ]
+    )
+    for bad_auth in ("computer", "pat", "oauth", "service"):
+        bad_p = MagicMock()
+        bad_p.user_id = _OWNER
+        bad_p.auth = bad_auth
+        with pytest.raises(HTTPException) as exc:
+            await dalton_router.issue_report_delivery_confirmation_endpoint(
+                body, bad_p, good_req
+            )
+        assert exc.value.status_code == 403
+    issued_spy.assert_not_awaited()
+
+    res = await dalton_router.issue_report_delivery_confirmation_endpoint(
+        body, sess_principal, good_req
+    )
+    assert res["needs_confirmation"] is True
+    assert res["confirmation_token"] == "rdc_valid_r2_token"
+    issued_spy.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_ad5_r2_patch_unchanged_report_profile_binds_observed_config_version(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """AD5 r2: PATCH carrying an unchanged report_profile without expected_config_version
+    binds the unlocked read's config_version so a concurrent clear/replace causes 409
+    instead of silently writing stale group targets back."""
+    from datetime import datetime, timezone
+    from fastapi import HTTPException
+    from src.dalton.services.company_automations import (
+        AutomationVersionConflictError,
+        get_current_history_context,
+    )
+
+    mocks = _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="admin", is_feishu_member=True)
+    now = datetime.now(timezone.utc)
+    grp_profile = {
+        "profile": "daily-filing-alert",
+        "report_targets": [_FEISHU_CHAT_AUTH],
+        "failure_targets": [],
+    }
+    existing_row = {
+        "automation_id": UUID(_AUTO_UUID),
+        "user_id": _OWNER,
+        "name": "API Report Sync",
+        "description": None,
+        "trigger_type": "cron",
+        "cron_expression": "0 8 * * *",
+        "timezone": "UTC",
+        "trigger_config": None,
+        "next_run_at": None,
+        "last_run_at": None,
+        "instruction": _DAILY_FILING_INST,
+        "workspace_id": UUID(_WS_UUID),
+        "llm_model": None,
+        "additional_context": None,
+        "thread_strategy": "new",
+        "conversation_thread_id": None,
+        "status": "active",
+        "max_failures": 3,
+        "failure_count": 0,
+        "disable_reason": None,
+        "delivery_config": None,
+        "metadata": {"report_profile": grp_profile},
+        "config_version": 3,
+        "created_at": now,
+        "updated_at": now,
+        "last_execution": None,
+        "scope": "personal",
+    }
+    mocks["get_auto"].side_effect = None
+    mocks["get_auto"].return_value = dict(existing_row)
+    monkeypatch.setattr(
+        automations_app.cli_approval,
+        "automation_runs",
+        create_autospec(automations_app.cli_approval.automation_runs, return_value=None),
+    )
+
+    seen_expected_cv: list[int | None] = []
+
+    async def _update_sees_conflict(**kwargs: Any) -> dict[str, Any] | None:
+        ctx = get_current_history_context()
+        seen_expected_cv.append(ctx.expected_config_version if ctx is not None else None)
+        # Simulate another concurrent request having cleared report_profile (bumped version 3 -> 4).
+        raise AutomationVersionConflictError("stale version")
+
+    monkeypatch.setattr(
+        automations_app.handler,
+        "update_automation",
+        create_autospec(automations_app.handler.update_automation, side_effect=_update_sees_conflict),
+    )
+    principal = MagicMock()
+    principal.user_id = _OWNER
+    principal.auth = "session"
+    http_req = Request({"type": "http", "headers": [], "app": MagicMock()})
+
+    with pytest.raises(HTTPException) as exc_conflict:
+        await automations_app.update_automation(
+            _AUTO_UUID,
+            principal,
+            http_req,
+            body={"metadata": {"report_profile": grp_profile, "extra": "note"}},
+        )
+    assert exc_conflict.value.status_code == 409
+    assert seen_expected_cv == [3]
+
+
+@pytest.mark.asyncio
+async def test_ad5_r2_hitl_verified_targets_locked_no_owner_binding_drift(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """AD5 r2: after HITL confirmation, normalized targets (including derived failure_targets)
+    are persisted and passed explicitly to write, re-checking auth against those targets
+    instead of re-reading owner Discord bindings."""
+    old_discord = "discord:user:111111111111111111"
+    new_discord = "discord:user:999999999999999999"
+    row = _make_automation_row(user_id=_OTHER_USER)
+    mocks = _patch_common_set_deps(
+        monkeypatch, tmp_path=tmp_path, tier="admin", auto_row=row, is_feishu_member=True
+    )
+
+    async def _tier_for(uid: str) -> str:
+        return "admin" if uid == _ADMIN else "internal"
+
+    async def _get_auto_any(aid: str, uid: str, *, conn: Any = None) -> dict[str, Any] | None:
+        return dict(row) if aid == _AUTO_UUID else None
+
+    mocks["get_tier"].side_effect = _tier_for
+    mocks["get_auto"].side_effect = _get_auto_any
+
+    # Case A: owner adds a second Discord binding right before write; write keeps confirmed old_discord.
+    dm_calls = {"n": 0}
+
+    async def _dm_adds_new(uid: str, *, conn: Any = None) -> list[dict[str, Any]]:
+        if uid == _OTHER_USER:
+            dm_calls["n"] += 1
+            if dm_calls["n"] <= 4:
+                return [
+                    {
+                        "platform": "discord",
+                        "platform_user_id": "111111111111111111",
+                        "target": old_discord,
+                        "supports_report_cards": False,
+                        "supports_text_targets": True,
+                        "supports_failure_targets": True,
+                    }
+                ]
+            return [
+                {
+                    "platform": "discord",
+                    "platform_user_id": "999999999999999999",
+                    "target": new_discord,
+                    "supports_report_cards": False,
+                    "supports_text_targets": True,
+                    "supports_failure_targets": True,
+                },
+                {
+                    "platform": "discord",
+                    "platform_user_id": "111111111111111111",
+                    "target": old_discord,
+                    "supports_report_cards": False,
+                    "supports_text_targets": True,
+                    "supports_failure_targets": True,
+                },
+            ]
+        return _caller_identities()
+
+    rd_svc.list_caller_dm_identities.side_effect = _dm_adds_new
+    hitl_calls = _patch_hitl_approve(monkeypatch)
+    tool = create_report_delivery_tools()[0]
+
+    res = await _call_tool(
+        tool,
+        {
+            "action": "set",
+            "automation_id": _AUTO_UUID,
+            "report_targets": [_FEISHU_CHAT_AUTH],
+            # failure_targets omitted -> derived as [old_discord] at precheck
+        },
+        config=_cfg(_ADMIN),
+    )
+    assert res["ok"] is True
+    assert hitl_calls[0][1]["failure_targets"] == [old_discord]
+    # Persisted metadata keeps exact confirmed old_discord, NOT drifted new_discord.
+    saved_meta = mocks["update_auto"].await_args.kwargs["metadata"]
+    assert saved_meta["report_profile"]["failure_targets"] == [old_discord]
+
+    # Case B: owner unbinds old_discord and binds new_discord right before write ->
+    # write re-checks auth on confirmed old_discord and rejects with dm_not_bound!
+    dm_calls_b = {"n": 0}
+
+    async def _dm_replaces(uid: str, *, conn: Any = None) -> list[dict[str, Any]]:
+        if uid == _OTHER_USER:
+            dm_calls_b["n"] += 1
+            if dm_calls_b["n"] <= 3:
+                return [
+                    {
+                        "platform": "discord",
+                        "platform_user_id": "111111111111111111",
+                        "target": old_discord,
+                        "supports_report_cards": False,
+                        "supports_text_targets": True,
+                        "supports_failure_targets": True,
+                    }
+                ]
+            return [
+                {
+                    "platform": "discord",
+                    "platform_user_id": "999999999999999999",
+                    "target": new_discord,
+                    "supports_report_cards": False,
+                    "supports_text_targets": True,
+                    "supports_failure_targets": True,
+                }
+            ]
+        return _caller_identities()
+
+    rd_svc.list_caller_dm_identities.side_effect = _dm_replaces
+    mocks["update_auto"].reset_mock()
+    res_b = await _call_tool(
+        tool,
+        {
+            "action": "set",
+            "automation_id": _AUTO_UUID,
+            "report_targets": [_FEISHU_CHAT_AUTH],
+        },
+        config=_cfg(_ADMIN),
+    )
+    assert res_b["ok"] is False
+    assert res_b["error"] == "dm_not_bound"
+    mocks["update_auto"].assert_not_awaited()
+
+    # Case C: service boundary refuses hitl_confirmed=True with failure_targets=None.
+    with pytest.raises(rd_svc.ReportDeliveryError) as exc_none:
+        await rd_svc.set_report_delivery_config(
+            caller_user_id=_ADMIN,
+            automation_id=_AUTO_UUID,
+            profile="daily-filing-alert",
+            report_targets=[_FEISHU_CHAT_AUTH],
+            failure_targets=None,
+            hitl_confirmed=True,
+            expected_config_version=3,
+        )
+    assert exc_none.value.code == "invalid_request"
+
+
+@pytest.mark.asyncio
+async def test_ad5_r2_hitl_card_displays_actual_text_recipients(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """AD5 r2: HITL card distinguishes inherited report targets vs explicit empty text_targets=[]."""
+    _patch_common_set_deps(monkeypatch, tmp_path=tmp_path, tier="internal", is_feishu_member=True)
+    hitl_calls = _patch_hitl_approve(monkeypatch)
+    tool = create_report_delivery_tools()[0]
+
+    # Omitted text_targets -> inherits report_targets -> card displays actual recipients!
+    await _call_tool(
+        tool,
+        {
+            "action": "set",
+            "automation_id": _AUTO_UUID,
+            "report_targets": [_FEISHU_CHAT_AUTH],
+        },
+        config=_cfg(_OWNER),
+    )
+    card_inherit = hitl_calls[-1][1]
+    assert "沿用报告卡片目标" in str(card_inherit["args"]["纯文本目标"])
+    assert _FEISHU_CHAT_AUTH in str(card_inherit["args"]["纯文本目标"])
+
+    # Explicit text_targets=[] -> card displays "不发送纯文本" (does NOT inherit).
+    await _call_tool(
+        tool,
+        {
+            "action": "set",
+            "automation_id": _AUTO_UUID,
+            "report_targets": [_FEISHU_CHAT_AUTH],
+            "text_targets": [],
+        },
+        config=_cfg(_OWNER),
+    )
+    card_disabled = hitl_calls[-1][1]
+    assert card_disabled["args"]["纯文本目标"] == "不发送纯文本"

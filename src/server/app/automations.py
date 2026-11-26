@@ -578,6 +578,7 @@ async def update_automation(
     dalton_enabled = is_dalton_enabled()
     report_profile_plan = None
     existing_is_company = False
+    unchanged_rp_observed_cv: int | None = None
     if dalton_enabled and request.metadata is not None:
         from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID, is_company_system_user
 
@@ -593,7 +594,10 @@ async def update_automation(
                     existing_row = await _load_automation_for_actor(agent_id, user_id, "admin")
                 except Exception:
                     existing_row = None
-        if existing_row is not None:
+        if existing_row is None:
+            if "report_profile" in request.metadata:
+                raise_not_found("Automation")
+        else:
             existing_is_company = existing_row.get("scope") == "company" or is_company_system_user(
                 existing_row.get("user_id")
             )
@@ -625,10 +629,18 @@ async def update_automation(
                     )
                 except ReportDeliveryError as exc:
                     raise _report_delivery_http_error(exc) from None
+            elif has_rp:
+                # Bind the unlocked read version as a write condition so a concurrent
+                # clear/replace of report_profile cannot be overwritten without confirmation.
+                raw_cv = existing_row.get("config_version")
+                if isinstance(raw_cv, int) and not isinstance(raw_cv, bool):
+                    unchanged_rp_observed_cv = raw_cv
     route_warning: str | None = None
     try:
         # DALTON-HOOK(company-automations): validate optional expected_config_version and propagate via context
         expected_cv = extract_expected_config_version(request)
+        if expected_cv is None and unchanged_rp_observed_cv is not None:
+            expected_cv = unchanged_rp_observed_cv
         fields = request.model_dump(exclude_none=True)
         # DALTON-HOOK(automation-model): allow explicit null llm_model to clear model override
         if "llm_model" in request.model_fields_set and request.llm_model is None:

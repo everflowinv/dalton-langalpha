@@ -388,6 +388,12 @@
   "reportDeliveryConfirmFailureTargets": "Failure alert targets",
   "reportDeliveryTargetNone": "None",
   "reportDeliveryTargetUnset": "Not set",
+  "reportDeliveryTextMode": "Plain-text delivery mode",
+  "reportDeliveryTextModeInherit": "Inherit report card targets",
+  "reportDeliveryTextModeCustom": "Custom plain-text targets",
+  "reportDeliveryTextModeNone": "Do not send plain text",
+  "reportDeliveryTextInheritedNote": "inherits report card targets",
+  "reportDeliveryTextDisabled": "Do not send plain text",
   "reportDeliveryConfirmCreate": "Confirm & create",
   "reportDeliveryConfirmSave": "Confirm & save"
 }

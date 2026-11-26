@@ -124,6 +124,21 @@ def _format_card_targets(
     return [labels.get(t, t) for t in targets]
 
 
+def _format_text_card_targets(
+    text_targets: Sequence[str] | None,
+    report_targets: Sequence[str],
+    labels: Mapping[str, str],
+) -> list[str] | str:
+    if text_targets is None:
+        if report_targets:
+            inherited = [labels.get(t, t) for t in report_targets]
+            return f"沿用报告卡片目标：{'、'.join(inherited)}"
+        return "不发送纯文本（无目标）"
+    if not text_targets:
+        return "不发送纯文本"
+    return [labels.get(t, t) for t in text_targets]
+
+
 def _build_confirm_card_payload(
     precheck: ReportProfilePrecheckResult,
     confirm_token: str,
@@ -131,8 +146,8 @@ def _build_confirm_card_payload(
     report_display = _format_card_targets(
         precheck.report_targets, precheck.target_labels, empty_text="无"
     )
-    text_display = _format_card_targets(
-        precheck.text_targets, precheck.target_labels, empty_text="无", none_text="未设置"
+    text_display = _format_text_card_targets(
+        precheck.text_targets, precheck.report_targets, precheck.target_labels
     )
     failure_display = _format_card_targets(
         precheck.failure_targets, precheck.target_labels, empty_text="无"
@@ -271,6 +286,14 @@ def create_report_delivery_tools() -> list[BaseTool]:
                 )
 
                 hitl_verified = False
+                verified_profile = precheck.profile
+                verified_report_targets = list(precheck.report_targets)
+                verified_text_targets = (
+                    list(precheck.text_targets)
+                    if precheck.text_targets is not None
+                    else None
+                )
+                verified_failure_targets = list(precheck.failure_targets)
                 write_expected_cv = precheck.config_version
 
                 if precheck.needs_confirmation:
@@ -286,10 +309,10 @@ def create_report_delivery_tools() -> list[BaseTool]:
                         caller_user_id=caller_user_id,
                         automation_id=precheck.automation_id,
                         config_version=precheck.config_version,
-                        profile=str(precheck.profile or ""),
-                        report_targets=precheck.report_targets,
-                        text_targets=precheck.text_targets,
-                        failure_targets=precheck.failure_targets,
+                        profile=str(verified_profile or ""),
+                        report_targets=verified_report_targets,
+                        text_targets=verified_text_targets,
+                        failure_targets=verified_failure_targets,
                     )
                     card_payload = _build_confirm_card_payload(precheck, confirm_token)
                     approved, hitl_response = hitl_confirm(
@@ -304,13 +327,15 @@ def create_report_delivery_tools() -> list[BaseTool]:
                         )
 
                     returned_token = _extract_confirm_token(hitl_response)
+                    # Re-check authorization against the exact verified normalized targets
+                    # rather than re-reading owner default bindings when failure_targets was omitted.
                     precheck_now = await precheck_report_delivery_set(
                         caller_user_id=caller_user_id,
                         automation_id=aid,
-                        profile=profile,
-                        report_targets=raw_report_targets,
-                        failure_targets=failure_targets,
-                        text_targets=text_targets,
+                        profile=verified_profile,
+                        report_targets=verified_report_targets,
+                        failure_targets=verified_failure_targets,
+                        text_targets=verified_text_targets,
                     )
                     current_token = compute_report_delivery_confirm_token(
                         action="set",
@@ -334,15 +359,23 @@ def create_report_delivery_tools() -> list[BaseTool]:
                             tool_call_id,
                         )
                     hitl_verified = True
+                    verified_profile = precheck_now.profile
+                    verified_report_targets = list(precheck_now.report_targets)
+                    verified_text_targets = (
+                        list(precheck_now.text_targets)
+                        if precheck_now.text_targets is not None
+                        else None
+                    )
+                    verified_failure_targets = list(precheck_now.failure_targets)
                     write_expected_cv = precheck_now.config_version
 
                 res = await set_report_delivery_config(
                     caller_user_id=caller_user_id,
                     automation_id=aid,
-                    profile=profile,
-                    report_targets=raw_report_targets,
-                    failure_targets=failure_targets,
-                    text_targets=text_targets,
+                    profile=verified_profile,
+                    report_targets=verified_report_targets,
+                    failure_targets=verified_failure_targets,
+                    text_targets=verified_text_targets,
                     hitl_confirmed=hitl_verified,
                     expected_config_version=write_expected_cv,
                 )

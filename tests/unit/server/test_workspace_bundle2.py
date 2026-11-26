@@ -47,24 +47,23 @@ async def test_bo2_archiving_computer_mid_create_maps_to_409_computer_archiving(
     }
     archiving_comp = {**healthy_comp, "config": {"archiving": True}}
 
-    # First read (precheck) sees healthy; second read (after create_workspace_on_computer -> None) sees archiving.
-    get_comp_calls = {"n": 0}
-
-    async def _get_computer(cid: str) -> dict[str, Any] | None:
-        get_comp_calls["n"] += 1
-        if explicit_computer and get_comp_calls["n"] == 1:
-            return dict(healthy_comp)
-        return dict(archiving_comp)
+    # Simulate transaction observing archiving under FOR SHARE (populating reject_reason_out)
+    # EVEN IF archiving finishes and clears the flag before any subsequent get_computer read!
+    async def _create_rejected_by_archiving(*_a: Any, **kwargs: Any) -> Any:
+        out = kwargs.get("reject_reason_out")
+        if out is not None:
+            out.append("archiving")
+        return None
 
     monkeypatch.setattr(
         wm_mod,
         "get_computer",
-        create_autospec(wm_mod.get_computer, side_effect=_get_computer),
+        create_autospec(wm_mod.get_computer, return_value=dict(healthy_comp)),
     )
     monkeypatch.setattr(
         wm_mod,
         "create_workspace_on_computer",
-        create_autospec(wm_mod.create_workspace_on_computer, return_value=None),
+        create_autospec(wm_mod.create_workspace_on_computer, side_effect=_create_rejected_by_archiving),
     )
     monkeypatch.setattr(wm_mod, "server_owned_config_keys", lambda: frozenset())
 
@@ -198,3 +197,136 @@ def test_e3_workspace_create_ignores_wrong_types_on_coverage_fields_without_422(
     assert valid.ticker == "NVDA"
     assert valid.display_name == "NVIDIA"
     assert valid.skip_coverage_suggestion is True
+
+
+@pytest.mark.asyncio
+async def test_bo2_r2_db_create_workspace_on_computer_records_archiving_reason_under_share_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BO2 r2: create_workspace_on_computer checks archiving under FOR SHARE inside the
+    transaction and populates reject_reason_out=['archiving'] before releasing the lock."""
+    from contextlib import asynccontextmanager
+    from src.server.database import workspace as ws_db
+
+    executed_sql: list[str] = []
+
+    class _Cur:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: Any):
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            executed_sql.append(" ".join(sql.split()))
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            return {"config": {"archiving": True}}
+
+    class _Tx:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: Any):
+            return False
+
+    class _Conn:
+        def cursor(self, **_kw: Any) -> _Cur:
+            return _Cur()
+
+        def transaction(self) -> _Tx:
+            return _Tx()
+
+    @asynccontextmanager
+    async def _folder_alloc(_cid: str, conn: Any = None):
+        yield conn or _Conn()
+
+    monkeypatch.setattr(ws_db, "folder_allocation", _folder_alloc)
+    monkeypatch.setattr(
+        ws_db,
+        "lock_user_writes",
+        create_autospec(ws_db.lock_user_writes, return_value=None),
+    )
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace_dir_names_for_computer",
+        create_autospec(ws_db.get_workspace_dir_names_for_computer, return_value=()),
+    )
+    monkeypatch.setattr(
+        ws_db,
+        "get_computer",
+        create_autospec(ws_db.get_computer, return_value={"config": {}}),
+    )
+
+    reasons: list[str] = []
+    res = await ws_db.create_workspace_on_computer(
+        USER_ID,
+        "NVDA",
+        COMP_ID,
+        reject_reason_out=reasons,
+    )
+    assert res is None
+    assert reasons == ["archiving"]
+    assert any("FOR SHARE" in sql and "SELECT config FROM computers" in sql for sql in executed_sql)
+
+
+@pytest.mark.asyncio
+async def test_e1_r2_internal_model_15s_deadline_surfaces_dedup_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E1 r2: when the internal 15s dedup model deadline fires inside
+    find_existing_company_workspace, web workspace creation surfaces
+    dedup_warning_code='dedup_unavailable' instead of silently succeeding."""
+    now = datetime.now(timezone.utc)
+    created_ws = {
+        "workspace_id": WS_ID,
+        "user_id": USER_ID,
+        "name": "Tencent",
+        "description": "",
+        "status": "stopped",
+        "computer_id": COMP_ID,
+        "dir_name": "Tencent",
+        "created_at": now,
+        "updated_at": now,
+        "config": {},
+    }
+
+    monkeypatch.setattr(dedup_mod, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "_resolve_caller_tier",
+        create_autospec(dedup_mod._resolve_caller_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "_find_matches",
+        create_autospec(
+            dedup_mod._find_matches,
+            side_effect=TimeoutError("Workspace dedup LLM deadline exceeded"),
+        ),
+    )
+    monkeypatch.setattr(
+        workspaces_app.cli_approval,
+        "workspace_create",
+        create_autospec(workspaces_app.cli_approval.workspace_create, return_value=None),
+    )
+    mgr = create_autospec(WorkspaceManager, instance=True)
+    mgr.create_workspace.return_value = created_ws
+    monkeypatch.setattr(
+        WorkspaceManager,
+        "get_instance",
+        classmethod(lambda cls: mgr),
+    )
+
+    principal = Principal(user_id=USER_ID, auth="session")
+    http_req = Request({"type": "http", "headers": [], "app": object()})
+    resp = await workspaces_app.create_workspace(
+        WorkspaceCreate(name="Tencent"),
+        principal,
+        http_req,
+    )
+    assert resp.workspace_id == WS_ID
+    assert resp.dedup_warning_code == dedup_mod.WEB_DEDUP_UNAVAILABLE_CODE
+    assert resp.dedup_warning == dedup_mod.WEB_DEDUP_UNAVAILABLE_MESSAGE
+    mgr.create_workspace.assert_awaited_once()

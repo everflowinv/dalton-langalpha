@@ -1885,6 +1885,57 @@ async def _deterministic_ticker_match_entries(
     return matched_pairs
 
 
+async def _candidate_units_changed(
+    entries: Sequence[_CandidateEntry],
+    *,
+    conn: Any = None,
+) -> bool:
+    """Return True if any candidate's bound coverage unit archived, changed kind,
+    rebound to another workspace, or changed ticker since candidate collection."""
+    unit_entries = [entry for entry in entries if entry.unit_id]
+    if not unit_entries:
+        return False
+    unit_ids = sorted({entry.unit_id for entry in unit_entries if entry.unit_id})
+    unit_set = set(unit_ids)
+    by_unit_id: dict[str, dict[str, Any]] = {}
+    async with get_db_connection(conn) as c:
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT u.unit_id::text AS unit_id,
+                       u.status,
+                       u.kind,
+                       u.workspace_id::text AS workspace_id,
+                       u.ticker
+                FROM dalton_coverage_units u
+                WHERE u.unit_id = ANY(%s::uuid[])
+                """,
+                (unit_ids,),
+            )
+            for row in await cur.fetchall():
+                uid_row = _norm_uuid(row.get("unit_id"))
+                if uid_row and uid_row in unit_set:
+                    by_unit_id.setdefault(uid_row, dict(row))
+
+    for entry in unit_entries:
+        u_row = by_unit_id.get(entry.unit_id or "")
+        if u_row is None:
+            return True
+        u_kind = str(u_row.get("kind") or "company").strip().lower()
+        u_status = str(
+            u_row.get("status") if "status" in u_row else "active"
+        ).strip().lower()
+        if u_kind != "company" or u_status != "active":
+            return True
+        if _norm_uuid(u_row.get("workspace_id")) != entry.ws_id:
+            return True
+        if "ticker" in u_row and normalize_ticker_key(u_row.get("ticker")) != normalize_ticker_key(
+            entry.unit_ticker
+        ):
+            return True
+    return False
+
+
 async def _deterministic_ticker_match_snapshot(
     *,
     uid: str,
@@ -1916,6 +1967,7 @@ async def _deterministic_ticker_match_snapshot(
         unit_changed_out=unit_changed_out,
         downgraded_entries_out=downgraded_entries_out,
         skip_downgraded_rejudge=skip_downgraded_rejudge,
+        strict_name_ticker_shape=True,
         conn=conn,
     )
     if not matched_pairs:
@@ -1954,9 +2006,13 @@ async def _find_matches(
     channel: str,
     caller_tier: str,
     exclude_workspace_id: str | None = None,
+    raise_on_timeout: bool = False,
     conn: Any = None,
     stats: dict[str, int] | None = None,
 ) -> DuplicateMatch | None:
+    excluded_ws_id = _norm_uuid(exclude_workspace_id) or (
+        str(exclude_workspace_id or "").strip() or None
+    )
     entries: list[_CandidateEntry] = []
     carry_downgraded: list[_CandidateEntry] = []
     for _attempt in range(2):
@@ -1965,6 +2021,7 @@ async def _find_matches(
             uid,
             raw_name,
             caller_tier=caller_tier,
+            exclude_same_name_workspace_id=excluded_ws_id,
             conn=conn,
             stats=stats,
         )
@@ -1975,6 +2032,8 @@ async def _find_matches(
                     entries.append(d_entry)
                     seen_ws.add(d_entry.ws_id)
             carry_downgraded = []
+        if excluded_ws_id is not None:
+            entries = [e for e in entries if e.ws_id != excluded_ws_id]
         if early_exit or not entries:
             return None
 
@@ -1985,7 +2044,7 @@ async def _find_matches(
             raw_name=raw_name,
             entries=entries,
             is_external=(caller_tier == "external"),
-            expected_duplicate_workspace_id=exclude_workspace_id,
+            expected_duplicate_workspace_id=excluded_ws_id,
             unit_changed_out=det_unit_changed,
             downgraded_entries_out=det_downgraded,
             skip_downgraded_rejudge=allow_recollect,
@@ -2020,6 +2079,7 @@ async def _find_matches(
         break
 
     suggestion_out: list[DedupCoverageSuggestion] = []
+    llm_partial_failures: list[Exception] = []
     hits = await _judge_candidates_with_llm(
         uid=uid,
         raw_name=raw_name,
@@ -2027,8 +2087,13 @@ async def _find_matches(
         stats=stats,
         is_external=(caller_tier == "external"),
         suggestion_out=suggestion_out,
+        partial_failure_out=llm_partial_failures,
     )
     if not hits:
+        if raise_on_timeout:
+            for exc in llm_partial_failures:
+                if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                    raise exc
         if suggestion_out:
             return DuplicateMatch(
                 company=raw_name,
@@ -2065,7 +2130,18 @@ async def _find_matches(
             if ws_key_id:
                 seen_unverified_ws.add(ws_key_id)
             all_live_hits.append((upd_entry, f_ws, c_conf, r_reason))
+    if excluded_ws_id is not None:
+        all_live_hits = [
+            item
+            for item in all_live_hits
+            if str((item[1] or {}).get("workspace_id") or item[0].ws_id or "").strip()
+            != excluded_ws_id
+        ]
     if not all_live_hits:
+        if raise_on_timeout:
+            for exc in llm_partial_failures:
+                if isinstance(exc, (TimeoutError, asyncio.TimeoutError)):
+                    raise exc
         if suggestion_out:
             return DuplicateMatch(
                 company=raw_name,
@@ -2231,6 +2307,10 @@ async def recheck_company_workspace_before_create(
                     return det_match
                 if partial_failures:
                     return CompanyDedupRecheckSnapshot(status="unavailable")
+                if await _candidate_units_changed(entries):
+                    if allow_recollect:
+                        continue
+                    return CompanyDedupRecheckSnapshot(status="unavailable")
                 return CompanyDedupRecheckSnapshot(
                     status="clear",
                     checked_candidates=checked_candidates,
@@ -2272,6 +2352,10 @@ async def recheck_company_workspace_before_create(
                 if det_match is not None:
                     return det_match
                 if partial_failures:
+                    return CompanyDedupRecheckSnapshot(status="unavailable")
+                if await _candidate_units_changed(entries):
+                    if allow_recollect:
+                        continue
                     return CompanyDedupRecheckSnapshot(status="unavailable")
                 return CompanyDedupRecheckSnapshot(
                     status="clear",
@@ -2330,6 +2414,10 @@ async def recheck_company_workspace_before_create(
                 return det_match
             if partial_failures:
                 return CompanyDedupRecheckSnapshot(status="unavailable")
+            if await _candidate_units_changed(entries):
+                if allow_recollect:
+                    continue
+                return CompanyDedupRecheckSnapshot(status="unavailable")
             return CompanyDedupRecheckSnapshot(
                 status="clear",
                 checked_candidates=checked_candidates,
@@ -2351,6 +2439,7 @@ async def find_existing_company_workspace(
     *,
     channel: str = "web",
     exclude_workspace_id: str | None = None,
+    raise_on_timeout: bool = False,
     conn: Any = None,
 ) -> DuplicateMatch | None:
     """Return matching existing company workspaces, or None when clear / disabled / on error."""
@@ -2377,9 +2466,19 @@ async def find_existing_company_workspace(
             channel=cleaned_channel,
             caller_tier=caller_tier,
             exclude_workspace_id=exclude_workspace_id,
+            raise_on_timeout=raise_on_timeout,
             conn=conn,
             stats=stats,
         )
+    except (TimeoutError, asyncio.TimeoutError) as exc:
+        logger.warning(
+            "Company workspace dedup check timed out (%s, workspace_count=%d); proceeding",
+            type(exc).__name__,
+            stats["workspace_count"],
+        )
+        if raise_on_timeout:
+            raise
+        return None
     except Exception as exc:
         logger.warning(
             "Company workspace dedup check failed (%s, workspace_count=%d); proceeding",

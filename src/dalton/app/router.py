@@ -3231,20 +3231,50 @@ class ReportDeliveryConfirmRequest(BaseModel):
     expected_config_version: int | None = Field(default=None)
 
 
+def _allowed_same_origin_set_for_confirm(http_request: Request) -> set[str]:
+    from src.dalton.auth.tokens import _allowed_cookie_origins, _normalize_origin
+
+    allowed = set(_allowed_cookie_origins(http_request))
+    url = getattr(http_request, "url", None)
+    if url is not None:
+        scheme = getattr(url, "scheme", None)
+        netloc = getattr(url, "netloc", None)
+        if scheme and netloc:
+            norm = _normalize_origin(f"{scheme}://{netloc}")
+            if norm:
+                allowed.add(norm)
+    return allowed
+
+
 def _require_web_session_for_report_delivery_confirm(
     principal: Any, http_request: Request
 ) -> None:
+    from src.dalton.auth.tokens import _normalize_origin
+
     auth_kind = str(getattr(principal, "auth", "") or "").strip().lower()
     if auth_kind != "session":
         raise HTTPException(
             status_code=403,
             detail="仅允许网页登录会话通过确认卡片签发或预检定时报告外发确认凭据。",
         )
-    sec_fetch_site = str(http_request.headers.get("sec-fetch-site") or "").strip().lower()
-    if sec_fetch_site == "cross-site":
+    if str(http_request.headers.get("x-service-token") or "").strip():
         raise HTTPException(
             status_code=403,
-            detail="跨站请求不可签发定时报告外发确认凭据。",
+            detail="服务令牌不可签发定时报告外发确认凭据。",
+        )
+    sec_fetch_site = str(http_request.headers.get("sec-fetch-site") or "").strip().lower()
+    if sec_fetch_site != "same-origin":
+        raise HTTPException(
+            status_code=403,
+            detail="仅允许同源浏览器请求（Sec-Fetch-Site: same-origin）签发或预检定时报告外发确认凭据。",
+        )
+    raw_origin = str(http_request.headers.get("origin") or "").strip()
+    norm_origin = _normalize_origin(raw_origin) if raw_origin else None
+    allowed_origins = _allowed_same_origin_set_for_confirm(http_request)
+    if not norm_origin or norm_origin not in allowed_origins:
+        raise HTTPException(
+            status_code=403,
+            detail="缺少有效本站 Origin 请求头，拒绝签发或预检定时报告外发确认凭据。",
         )
 
 

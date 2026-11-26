@@ -3402,6 +3402,11 @@ async def set_report_delivery_config(
     norm_report = _dedup_parse(report_targets)
     norm_text = _dedup_parse(text_targets) if text_targets is not None else None
     if failure_targets is None:
+        if hitl_confirmed:
+            raise ReportDeliveryError(
+                "已核验的写入必须显式提供规范化后的 failure_targets，不能在确认后重新推导属主默认绑定。",
+                code="invalid_request",
+            )
         owner_identities = await list_caller_dm_identities(owner_user_id)
         norm_failure = default_failure_targets_for_identities(owner_identities)
     else:

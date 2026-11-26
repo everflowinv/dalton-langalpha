@@ -330,7 +330,10 @@ async def create_workspace(
             try:
                 dup = await asyncio.wait_for(
                     find_existing_company_workspace(
-                        x_user_id, request.name, channel="web"
+                        x_user_id,
+                        request.name,
+                        channel="web",
+                        raise_on_timeout=True,
                     ),
                     timeout=WEB_DEDUP_OVERALL_TIMEOUT_SECONDS,
                 )

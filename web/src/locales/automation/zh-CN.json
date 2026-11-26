@@ -385,6 +385,12 @@
   "reportDeliveryConfirmFailureTargets": "失败告警目标",
   "reportDeliveryTargetNone": "无",
   "reportDeliveryTargetUnset": "未设置",
+  "reportDeliveryTextMode": "纯文本发送方式",
+  "reportDeliveryTextModeInherit": "沿用报告卡片目标",
+  "reportDeliveryTextModeCustom": "自定义纯文本目标",
+  "reportDeliveryTextModeNone": "不发送纯文本",
+  "reportDeliveryTextInheritedNote": "沿用报告卡片目标",
+  "reportDeliveryTextDisabled": "不发送纯文本",
   "reportDeliveryConfirmCreate": "确认并创建",
   "reportDeliveryConfirmSave": "确认并保存"
 }

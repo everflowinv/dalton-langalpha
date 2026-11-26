@@ -23,19 +23,26 @@ export interface ReportDeliveryConfirmDialogProps {
 
 function TargetList({
   label,
+  note,
   targets,
   labels,
   emptyText,
 }: {
   label: string;
+  note?: string | null;
   targets: string[] | null;
   labels: Record<string, string>;
   emptyText: string;
 }) {
   return (
     <div className="space-y-1 text-sm">
-      <div className="font-medium" style={{ color: 'var(--color-text-secondary)' }}>
-        {label}
+      <div className="font-medium flex items-center gap-1.5" style={{ color: 'var(--color-text-secondary)' }}>
+        <span>{label}</span>
+        {note && (
+          <span className="text-xs font-normal" style={{ color: 'var(--color-text-tertiary)' }}>
+            （{note}）
+          </span>
+        )}
       </div>
       {targets && targets.length > 0 ? (
         <ul className="list-disc pl-5 space-y-0.5" style={{ color: 'var(--color-text-primary)' }}>
@@ -118,13 +125,18 @@ export default function ReportDeliveryConfirmDialog({
             />
             <TargetList
               label={t('automation:reportDeliveryConfirmTextTargets', '纯文本目标')}
-              targets={precheck.text_targets}
-              labels={labels}
-              emptyText={
-                precheck.text_targets === null
-                  ? t('automation:reportDeliveryTargetUnset', '未设置')
-                  : t('automation:reportDeliveryTargetNone', '无')
+              note={
+                precheck.text_targets === null && precheck.report_targets.length > 0
+                  ? t('automation:reportDeliveryTextInheritedNote', '沿用报告卡片目标')
+                  : null
               }
+              targets={
+                precheck.text_targets === null
+                  ? precheck.report_targets
+                  : precheck.text_targets
+              }
+              labels={labels}
+              emptyText={t('automation:reportDeliveryTextDisabled', '不发送纯文本')}
             />
             <TargetList
               label={t('automation:reportDeliveryConfirmFailureTargets', '失败告警目标')}

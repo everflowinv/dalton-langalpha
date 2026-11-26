@@ -322,3 +322,311 @@ def test_f6_bo3_chief_of_staff_prompt_includes_delete_switch_model_and_workspace
         for internal_code in ("BO2", "BO3", "BD5", "BD6", "F6", "AD5"):
             assert internal_code not in rendered
     assert WEB_DEDUP_OVERALL_TIMEOUT_SECONDS == 20.0
+
+
+@pytest.mark.asyncio
+async def test_bd6_r2_proposal_and_recheck_use_same_strict_name_ticker_shape_predicate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BD6 r2: both proposal (_find_matches) and lock-free recheck use
+    strict_name_ticker_shape=True so non-explicit mixed-case names like
+    'aapl' vs 'Aapl' or 'Anthropic' vs 'Anthropic' never mismatch between
+    proposal card disclosure and post-approval recheck."""
+    ws_colleague = "bbbbbbbb-bbbb-4bbb-8bbb-00000000aaaa"
+    ws_row = {
+        "workspace_id": ws_colleague,
+        "user_id": COLLEAGUE_ID,
+        "name": "Aapl",
+        "status": "stopped",
+        "owner_name": "Bob",
+        "owner_email": "bob@team.com",
+        "is_home_stand_in": False,
+        "is_historical_duplicate": False,
+        "last_activity_at": None,
+        "updated_at": None,
+        "created_at": None,
+    }
+
+    class _Cur:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: Any):
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            text = " ".join(sql.split())
+            if "FROM workspaces w" in text:
+                self._rows = [dict(ws_row)]
+            else:
+                self._rows = []
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._rows)
+
+    class _Conn:
+        def cursor(self, **_kwargs: Any) -> _Cur:
+            return _Cur()
+
+    @asynccontextmanager
+    async def _use_conn(c: Any = None):
+        yield c or _Conn()
+
+    monkeypatch.setattr(dedup_mod, "get_db_connection", _use_conn)
+    monkeypatch.setattr(dedup_mod, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "get_user_tier",
+        create_autospec(dedup_mod._REAL_GET_USER_TIER, return_value="internal"),
+    )
+    monkeypatch.setattr(dedup_mod, "_is_internal_team_owner", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "_resolve_dedup_models",
+        create_autospec(dedup_mod._resolve_dedup_models, return_value=["test-model"]),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "dalton_complete",
+        create_autospec(
+            dedup_mod._REAL_DALTON_COMPLETE,
+            return_value=SimpleNamespace(ok=True, data=DedupLlmResult(matches=[]), text=None),
+        ),
+    )
+
+    proposal_dup = await find_existing_company_workspace(USER_ID, "aapl", channel="cos")
+    recheck_snap = await recheck_company_workspace_before_create(USER_ID, "aapl", channel="cos")
+    assert proposal_dup is None
+    assert recheck_snap.status == "clear"
+
+
+@pytest.mark.asyncio
+async def test_bd5_r2_proposal_llm_excludes_disclosed_workspace_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BD5 r2: proposal-phase dedup excludes exclude_workspace_id from BOTH
+    deterministic matching AND LLM candidate judgment so the user's own
+    already-disclosed 00700 workspace never blocks confirmation card emission."""
+    ws_own = "bbbbbbbb-bbbb-4bbb-8bbb-000000000701"
+    ws_other = "bbbbbbbb-bbbb-4bbb-8bbb-000000000702"
+    ws_rows = [
+        {
+            "workspace_id": ws_own,
+            "user_id": USER_ID,
+            "name": "00700",
+            "status": "stopped",
+            "owner_name": "Alice",
+            "owner_email": "alice@team.com",
+            "is_home_stand_in": False,
+            "is_historical_duplicate": False,
+            "last_activity_at": None,
+            "updated_at": None,
+            "created_at": None,
+        },
+        {
+            "workspace_id": ws_other,
+            "user_id": COLLEAGUE_ID,
+            "name": "宏观笔记",
+            "status": "stopped",
+            "owner_name": "Bob",
+            "owner_email": "bob@team.com",
+            "is_home_stand_in": False,
+            "is_historical_duplicate": False,
+            "last_activity_at": None,
+            "updated_at": None,
+            "created_at": None,
+        },
+    ]
+
+    class _Cur:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: Any):
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            text = " ".join(sql.split())
+            if "FROM workspaces w" in text:
+                self._rows = [dict(r) for r in ws_rows]
+            else:
+                self._rows = []
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._rows)
+
+    class _Conn:
+        def cursor(self, **_kwargs: Any) -> _Cur:
+            return _Cur()
+
+    @asynccontextmanager
+    async def _use_conn(c: Any = None):
+        yield c or _Conn()
+
+    seen_prompts: list[str] = []
+
+    async def _fake_complete(**kwargs: Any) -> Any:
+        seen_prompts.append(str(kwargs.get("user_prompt") or ""))
+        return SimpleNamespace(ok=True, data=DedupLlmResult(matches=[]), text=None)
+
+    monkeypatch.setattr(dedup_mod, "get_db_connection", _use_conn)
+    monkeypatch.setattr(dedup_mod, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "get_user_tier",
+        create_autospec(dedup_mod._REAL_GET_USER_TIER, return_value="internal"),
+    )
+    monkeypatch.setattr(dedup_mod, "_is_internal_team_owner", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "_resolve_dedup_models",
+        create_autospec(dedup_mod._resolve_dedup_models, return_value=["test-model"]),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "dalton_complete",
+        create_autospec(dedup_mod._REAL_DALTON_COMPLETE, side_effect=_fake_complete),
+    )
+
+    dup = await find_existing_company_workspace(
+        USER_ID,
+        "700.HK",
+        channel="cos",
+        exclude_workspace_id=ws_own,
+    )
+    assert dup is None
+    assert len(seen_prompts) == 1
+    assert "00700" not in seen_prompts[0]
+    assert "宏观笔记" in seen_prompts[0]
+
+
+@pytest.mark.asyncio
+async def test_bd5_r2_recheck_detects_unmatched_candidate_unit_archived_mid_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BD5 r2: when an unrelated candidate's coverage unit (not matched by LLM or
+    deterministic code) archives during lock-free recheck, recheck detects the unit
+    change across the full candidate set, re-collects, and emits fresh checked_candidates."""
+    unit_baba = "aaaaaaaa-aaaa-4aaa-8aaa-00000000baba"
+    ws_baba = "bbbbbbbb-bbbb-4bbb-8bbb-00000000baba"
+    unit_state = {"status": "active"}
+
+    def _unit_row() -> dict[str, Any]:
+        return {
+            "unit_id": unit_baba,
+            "kind": "company",
+            "status": unit_state["status"],
+            "owner_user_id": COLLEAGUE_ID,
+            "lead_analyst_user_id": COLLEAGUE_ID,
+            "display_name": "阿里巴巴",
+            "workspace_id": ws_baba,
+            "ticker": "BABA",
+            "unit_updated_at": None,
+            "unit_created_at": None,
+            "workspace_name": "阿里研究",
+            "workspace_owner_id": COLLEAGUE_ID,
+            "workspace_status": "stopped",
+            "is_home_stand_in": False,
+            "is_historical_duplicate": False,
+            "workspace_last_activity_at": None,
+            "workspace_updated_at": None,
+            "workspace_created_at": None,
+            "owner_name": "Bob",
+            "owner_email": "bob@team.com",
+            "unit_owner_email": "bob@team.com",
+            "lead_name": "Bob",
+            "lead_email": "bob@team.com",
+        }
+
+    ws_baba_row = {
+        "workspace_id": ws_baba,
+        "user_id": COLLEAGUE_ID,
+        "name": "阿里研究",
+        "status": "stopped",
+        "owner_name": "Bob",
+        "owner_email": "bob@team.com",
+        "is_home_stand_in": False,
+        "is_historical_duplicate": False,
+        "last_activity_at": None,
+        "updated_at": None,
+        "created_at": None,
+    }
+
+    collect_calls = {"n": 0}
+
+    class _Cur:
+        def __init__(self) -> None:
+            self._rows: list[dict[str, Any]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args: Any):
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            text = " ".join(sql.split())
+            if "FROM dalton_coverage_units" in text:
+                row = _unit_row()
+                if isinstance(params, tuple) and params and isinstance(params[0], list):
+                    self._rows = [row] if unit_baba in set(params[0]) else []
+                else:
+                    collect_calls["n"] += 1
+                    self._rows = [row] if row["status"] == "active" else []
+            elif "FROM workspaces w" in text:
+                self._rows = [dict(ws_baba_row)]
+            else:
+                self._rows = []
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._rows)
+
+    class _Conn:
+        def cursor(self, **_kwargs: Any) -> _Cur:
+            return _Cur()
+
+    @asynccontextmanager
+    async def _use_conn(c: Any = None):
+        yield c or _Conn()
+
+    llm_calls = {"n": 0}
+
+    async def _fake_complete(**_kwargs: Any) -> Any:
+        llm_calls["n"] += 1
+        if llm_calls["n"] == 1:
+            # Unrelated coverage unit BABA gets archived while LLM evaluates NVDA!
+            unit_state["status"] = "archived"
+        return SimpleNamespace(ok=True, data=DedupLlmResult(matches=[]), text=None)
+
+    monkeypatch.setattr(dedup_mod, "get_db_connection", _use_conn)
+    monkeypatch.setattr(dedup_mod, "is_coverage_units_enabled", lambda: True)
+    monkeypatch.setattr(dedup_mod, "is_dalton_supabase_auth_enabled", lambda: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "get_user_tier",
+        create_autospec(dedup_mod._REAL_GET_USER_TIER, return_value="internal"),
+    )
+    monkeypatch.setattr(dedup_mod, "_is_internal_team_owner", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        dedup_mod,
+        "_resolve_dedup_models",
+        create_autospec(dedup_mod._resolve_dedup_models, return_value=["test-model"]),
+    )
+    monkeypatch.setattr(
+        dedup_mod,
+        "dalton_complete",
+        create_autospec(dedup_mod._REAL_DALTON_COMPLETE, side_effect=_fake_complete),
+    )
+
+    snap = await recheck_company_workspace_before_create(USER_ID, "NVDA", channel="cos")
+    assert snap.status == "clear"
+    assert collect_calls["n"] == 2
+    assert (ws_baba, "阿里研究", None) in snap.checked_candidates
