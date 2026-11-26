@@ -12,20 +12,86 @@
 #
 # Usage:
 #   bash scripts/dalton/check_public_edge.sh
+#   bash scripts/dalton/check_public_edge.sh --expected-build <entry-chunk> [--expected-release <release-tag>]
 #   DALTON_WS_TEST_TOKEN="<valid-supabase-jwt>" bash scripts/dalton/check_public_edge.sh
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 EDGE_PORT="${DALTON_EDGE_PORT:-8088}"
 EDGE_HOST="127.0.0.1"
-DIST_DIR="${REPO_ROOT}/web/dist"
+EXPECTED_BUILD="${DALTON_EXPECTED_BUILD_ID:-}"
+EXPECTED_RELEASE="${DALTON_EXPECTED_RELEASE_ID:-}"
+DIST_DIR=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --expected-build)
+      if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
+        echo "ERROR: --expected-build requires a build identifier" >&2
+        exit 2
+      fi
+      EXPECTED_BUILD="$2"
+      shift
+      ;;
+    --expected-build=*)
+      EXPECTED_BUILD="${1#--expected-build=}"
+      if [[ -z "$EXPECTED_BUILD" || "$EXPECTED_BUILD" == -* ]]; then
+        echo "ERROR: --expected-build requires a build identifier" >&2
+        exit 2
+      fi
+      ;;
+    --expected-release)
+      if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
+        echo "ERROR: --expected-release requires a release identifier" >&2
+        exit 2
+      fi
+      EXPECTED_RELEASE="$2"
+      shift
+      ;;
+    --expected-release=*)
+      EXPECTED_RELEASE="${1#--expected-release=}"
+      if [[ -z "$EXPECTED_RELEASE" || "$EXPECTED_RELEASE" == -* ]]; then
+        echo "ERROR: --expected-release requires a release identifier" >&2
+        exit 2
+      fi
+      ;;
+    --dist-dir)
+      if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == -* ]]; then
+        echo "ERROR: --dist-dir requires a directory path" >&2
+        exit 2
+      fi
+      DIST_DIR="$2"
+      shift
+      ;;
+    --dist-dir=*)
+      DIST_DIR="${1#--dist-dir=}"
+      if [[ -z "$DIST_DIR" || "$DIST_DIR" == -* ]]; then
+        echo "ERROR: --dist-dir requires a directory path" >&2
+        exit 2
+      fi
+      ;;
+    *)
+      echo "ERROR: Unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+if [[ -z "$DIST_DIR" ]]; then
+  if [[ -f "${REPO_ROOT}/web/releases/current/version.json" ]]; then
+    DIST_DIR="${REPO_ROOT}/web/releases/current"
+  else
+    DIST_DIR="${REPO_ROOT}/web/dist"
+  fi
+fi
 
 PYTHON_BIN="${REPO_ROOT}/.venv/bin/python"
 if [[ ! -x "$PYTHON_BIN" ]]; then
   PYTHON_BIN="$(command -v python3)"
 fi
 
-"$PYTHON_BIN" - "$EDGE_HOST" "$EDGE_PORT" "$DIST_DIR" <<'PY'
+"$PYTHON_BIN" - "$EDGE_HOST" "$EDGE_PORT" "$DIST_DIR" "$EXPECTED_BUILD" "$EXPECTED_RELEASE" <<'PY'
 from __future__ import annotations
 
 import base64
@@ -47,6 +113,8 @@ def fail(msg: str) -> NoReturn:
 host = sys.argv[1]
 port = int(sys.argv[2])
 dist_dir = Path(sys.argv[3])
+expected_build = sys.argv[4].strip() if len(sys.argv) > 4 else ""
+expected_release = sys.argv[5].strip() if len(sys.argv) > 5 else ""
 
 if host != "127.0.0.1":
     fail(f"check_public_edge.sh must only target 127.0.0.1, got {host!r}")
@@ -121,10 +189,26 @@ if "no-store" not in probe_json_hdrs.get("cache-control", ""):
     )
 
 version_file = dist_dir / "version.json"
+disk_build = ""
+disk_release = ""
+disk_help_hash = ""
 if version_file.exists():
+    try:
+        disk_payload = json.loads(version_file.read_text(encoding="utf-8"))
+        if isinstance(disk_payload, dict):
+            if isinstance(disk_payload.get("build"), str):
+                disk_build = disk_payload["build"].strip()
+            if isinstance(disk_payload.get("release"), str):
+                disk_release = disk_payload["release"].strip()
+            if isinstance(disk_payload.get("help_hash"), str):
+                disk_help_hash = disk_payload["help_hash"].strip()
+    except Exception as exc:
+        fail(f"Failed to parse local {version_file}: {exc}")
+
+if version_file.exists() or expected_build or expected_release:
     v_status, v_hdrs, v_body = request("GET", "/version.json")
     if v_status != 200:
-        fail(f"Expected GET /version.json -> 200 when file exists, got {v_status}")
+        fail(f"Expected GET /version.json -> 200 when build is active, got {v_status}")
     if "application/json" not in v_hdrs.get("content-type", ""):
         fail(f"Expected /version.json Content-Type application/json, got {v_hdrs.get('content-type')!r}")
     if "no-store" not in v_hdrs.get("cache-control", ""):
@@ -133,17 +217,51 @@ if version_file.exists():
         v_json = json.loads(v_body.decode("utf-8"))
     except Exception as exc:
         fail(f"Failed to parse /version.json as JSON: {exc}")
-    entry_chunk = v_json.get("build") if isinstance(v_json, dict) else None
-    if not isinstance(entry_chunk, str) or not entry_chunk:
+    served_build = v_json.get("build") if isinstance(v_json, dict) else None
+    if not isinstance(served_build, str) or not served_build:
         fail(f"Invalid version.json payload: {v_json!r}")
+    if expected_build and served_build != expected_build:
+        fail(
+            f"HTTP /version.json build mismatch: edge serves {served_build!r}, expected {expected_build!r}"
+        )
+    if disk_build and served_build != disk_build:
+        fail(
+            f"HTTP /version.json build mismatch against {version_file}: edge serves {served_build!r}, disk has {disk_build!r}"
+        )
+    served_release = v_json.get("release") if isinstance(v_json, dict) else None
+    if expected_release and served_release != expected_release:
+        fail(
+            f"HTTP /version.json release mismatch: edge serves {served_release!r}, expected {expected_release!r}"
+        )
+    if disk_release and served_release != disk_release:
+        fail(
+            f"HTTP /version.json release mismatch against {version_file}: edge serves {served_release!r}, disk has {disk_release!r}"
+        )
+    served_help_hash = v_json.get("help_hash") if isinstance(v_json, dict) else None
+    if disk_help_hash and served_help_hash != disk_help_hash:
+        fail(
+            f"HTTP /version.json help_hash mismatch against {version_file}: edge serves {served_help_hash!r}, disk has {disk_help_hash!r}"
+        )
 
-    # Verify hashed entry asset long-cache header
-    a_status, a_hdrs, _ = request("GET", f"/assets/{entry_chunk}")
-    if a_status != 200:
-        fail(f"Expected GET /assets/{entry_chunk} -> 200, got {a_status}")
-    a_cc = a_hdrs.get("cache-control", "")
-    if "max-age=31536000" not in a_cc or "immutable" not in a_cc:
-        fail(f"Expected /assets/{entry_chunk} Cache-Control immutable, got {a_cc!r}")
+    # Verify hashed entry asset long-cache header (read `entry` when present, falling back to `build`)
+    served_entry = v_json.get("entry") if isinstance(v_json, dict) else None
+    entry_chunk = served_entry.strip() if isinstance(served_entry, str) and served_entry.strip() else served_build
+    probe_asset = entry_chunk
+    if v_json.get("legacy_generated") is True and not (dist_dir / "assets" / entry_chunk).is_file():
+        assets_dir = dist_dir / "assets"
+        probe_asset = ""
+        if assets_dir.is_dir():
+            for cand in sorted(assets_dir.iterdir()):
+                if cand.is_file() and not cand.is_symlink():
+                    probe_asset = cand.name
+                    break
+    if probe_asset:
+        a_status, a_hdrs, _ = request("GET", f"/assets/{probe_asset}")
+        if a_status != 200:
+            fail(f"Expected GET /assets/{probe_asset} -> 200, got {a_status}")
+        a_cc = a_hdrs.get("cache-control", "")
+        if "max-age=31536000" not in a_cc or "immutable" not in a_cc:
+            fail(f"Expected /assets/{probe_asset} Cache-Control immutable, got {a_cc!r}")
 else:
     v_status, _, v_body = request("GET", "/version.json")
     if v_status != 404:

@@ -1,9 +1,11 @@
 #!/bin/bash
-# Deploy origin/dalton/main: wait idle, fetch once and pin TARGET=origin/dalton/main,
-# backup (waits for a fresh dump unless reused), ff to TARGET, frontend build,
-# channel-gateway build (automatic when integrations/dalton-channel-gateway/ changes
-# between PRE_FF and TARGET, or forced with --gateway), backend restart (runs Dalton
-# migrations), optional bridge/gateway restart and edge recreate, health checks.
+# Deploy origin/dalton/main: acquire exclusive flock, wait idle, fetch once and pin
+# TARGET=origin/dalton/main, backup (waits for a fresh dump unless reused), ff to TARGET,
+# verify protocol handshake and re-exec updated deploy script if changed in TARGET,
+# build frontend into web/releases/<build-id>/ (carrying over previous release's hashed
+# assets), build channel-gateway if changed, restart backend/crawler (and edge if config
+# changed), switch gateway, atomically switch web/releases/current symlink, verify HTTP
+# /version.json build id via check_public_edge.sh, and prune old frontend releases (keep 3).
 # Usage: deploy_main.sh [--bridge] [--gateway] [--recreate] [--expect-migration dNNN] [--reuse-backup-minutes N]
 # --reuse-backup-minutes N: skip the fresh dump only when the last backup-log line is an ' ok '
 #             dump at most N minutes old AND pre-deploy DB revisions for both migration chains
@@ -18,16 +20,22 @@
 #             import, kickstart com.dalton.channel-gateway, check /health, and record
 #             the healthy tree hash in .deploy-deployed-tree.
 set -uo pipefail
+DEPLOY_RESUME_PROTOCOL=2
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_FILE="${SCRIPT_DIR}/$(basename "${BASH_SOURCE[0]}")"
 REPO_ROOT="${DALTON_REPO_ROOT:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
-WAIT_IDLE_SCRIPT="${SCRIPT_DIR}/wait_backend_idle.sh"
+WAIT_IDLE_SCRIPT="${DALTON_WAIT_IDLE_SCRIPT:-${SCRIPT_DIR}/wait_backend_idle.sh}"
+DEPLOY_LOCK_FILE="${DALTON_DEPLOY_LOCK_FILE:-${HOME:-/tmp}/Library/Logs/Dalton/deploy_main.lock}"
+FRONTEND_KEEP_RELEASES=3
 EDGE_PORT="${DALTON_EDGE_PORT:-8088}"
 EDGE_WAIT_TIMEOUT=60
+EDGE_COMPOSE_TIMEOUT="${DALTON_EDGE_COMPOSE_TIMEOUT:-120}"
+EDGE_HEALTH_EXPECTED_BODY="dalton-edge-ok releases-v1"
 GATEWAY_PORT="${DALTON_GATEWAY_PORT:-8962}"
 GATEWAY_WAIT_TIMEOUT="${DALTON_GATEWAY_WAIT_TIMEOUT:-60}"
 GATEWAY_POLL_INTERVAL="${DALTON_GATEWAY_POLL_INTERVAL:-1}"
-GATEWAY_ENV_FILE="${DALTON_CHANNEL_GATEWAY_ENV_FILE:-$HOME/.config/dalton/channel-gateway.env}"
-CONTAINER_LOG_DIR="${DALTON_CONTAINER_LOG_DIR:-$HOME/Library/Logs/Dalton/containers}"
+GATEWAY_ENV_FILE="${DALTON_CHANNEL_GATEWAY_ENV_FILE:-${HOME:-/tmp}/.config/dalton/channel-gateway.env}"
+CONTAINER_LOG_DIR="${DALTON_CONTAINER_LOG_DIR:-${HOME:-/tmp}/Library/Logs/Dalton/containers}"
 CONTAINER_LOG_RETENTION_DAYS=14
 BRIDGE=0; GATEWAY=0; RECREATE=0; EXPECT=""; REUSE_BACKUP_MIN=""
 
@@ -51,6 +59,8 @@ Usage: deploy_main.sh [--bridge] [--gateway] [--recreate] [--expect-migration dN
   --recreate                Recreate backend/crawler containers instead of docker restart.
   --bridge                  Also kickstart com.dalton.researchdata-bridge.
   --gateway                 Force build and restart of com.dalton.channel-gateway (auto when integrations/dalton-channel-gateway/ changes).
+  --first-releases-rollout [--pre-ff <sha>]
+                            One-time first rollout from legacy web/dist to web/releases/current after fast-forward.
 EOF
 }
 
@@ -167,10 +177,79 @@ get_upstream_alembic_version() {
 }
 
 health() { curl -sf -m3 --noproxy '*' http://127.0.0.1:8000/health >/dev/null; }
+_expected_edge_health_mode() {
+  local caddyfile="${1:-${REPO_ROOT}/deploy/dalton/Caddyfile}"
+  if [ -f "$caddyfile" ]; then
+    if grep -q -- "$EDGE_HEALTH_EXPECTED_BODY" "$caddyfile" 2>/dev/null; then
+      printf 'body:%s' "$EDGE_HEALTH_EXPECTED_BODY"
+    elif grep -q '/__edge_health' "$caddyfile" 2>/dev/null; then
+      printf 'body:ok'
+    else
+      printf 'root:200'
+    fi
+  else
+    printf 'body:%s' "$EDGE_HEALTH_EXPECTED_BODY"
+  fi
+}
+
+_record_deferred_signal() {
+  DEFERRED_SIGNAL="${1:-TERM}"
+}
+
+_wait_pid_ignoring_signals() {
+  local pid="${1:-}" wrc=0
+  [ -n "$pid" ] || return 0
+  while :; do
+    wrc=0
+    wait "$pid" || wrc=$?
+    if kill -0 "$pid" 2>/dev/null; then
+      continue
+    fi
+    return "$wrc"
+  done
+}
+
 edge_ready() {
-  local max_time="${1:-2}" code
-  code=$(curl -s --max-time "$max_time" --noproxy '*' -o /dev/null -w '%{http_code}' "http://127.0.0.1:${EDGE_PORT}/") || return 1
-  [ "$code" = "200" ]
+  local max_time="${1:-2}" caddyfile="${2:-${REPO_ROOT}/deploy/dalton/Caddyfile}"
+  local mode="" expected_body="" url="" probe_out="" raw="" code="" body="" rc=0
+  mode=$(_expected_edge_health_mode "$caddyfile")
+  case "$mode" in
+    body:*)
+      expected_body="${mode#body:}"
+      url="http://127.0.0.1:${EDGE_PORT}/__edge_health"
+      ;;
+    root:200)
+      url="http://127.0.0.1:${EDGE_PORT}/"
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  probe_out=$(mktemp "${TMPDIR:-/tmp}/dalton-edge-ready.XXXXXX") || return 1
+  ACTIVE_STEP_OUT_FILE="$probe_out"
+  if _spawn_in_new_pgid "$probe_out" curl -s --max-time "$max_time" --noproxy '*' -w $'\n%{http_code}' "$url"; then
+    if [ "${ROLLBACK_IN_PROGRESS:-0}" = "1" ]; then
+      _wait_pid_ignoring_signals "$ACTIVE_STEP_CHILD_PID" || rc=$?
+    else
+      wait "$ACTIVE_STEP_CHILD_PID" || rc=$?
+    fi
+    ACTIVE_STEP_CHILD_PID=""
+    ACTIVE_STEP_PGID=""
+  else
+    rc=1
+  fi
+  raw=$(cat "$probe_out" 2>/dev/null || true)
+  rm -f "$probe_out"
+  ACTIVE_STEP_OUT_FILE=""
+  [ "$rc" -eq 0 ] || return 1
+  code="${raw##*$'\n'}"
+  body="${raw%$'\n'*}"
+  body="${body%$'\r'}"
+  if [ "$mode" = "root:200" ]; then
+    [ "$code" = "200" ]
+  else
+    [ "$code" = "200" ] && [ "$body" = "$expected_body" ]
+  fi
 }
 
 extract_edge_config() {
@@ -476,6 +555,513 @@ EOF
   [ "$old_edge" != "$new_edge" ]
 }
 
+_edge_compose_project_name() {
+  local proj=""
+  proj=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' dalton-langalpha-edge-1 2>/dev/null || true)
+  proj="${proj%$'\r'}"
+  if [ -n "$proj" ] && [ "$proj" != "<no value>" ] && [[ "$proj" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf '%s' "$proj"
+    return 0
+  fi
+  if [ -n "${COMPOSE_PROJECT_NAME:-}" ] && [[ "${COMPOSE_PROJECT_NAME}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf '%s' "${COMPOSE_PROJECT_NAME}"
+    return 0
+  fi
+  if [ -f "${REPO_ROOT}/.env" ]; then
+    proj=$(awk '
+      /^[[:space:]]*(export[[:space:]]+)?COMPOSE_PROJECT_NAME=/ {
+        line = $0
+        sub(/^[[:space:]]*(export[[:space:]]+)?COMPOSE_PROJECT_NAME=[[:space:]]*/, "", line)
+        if (line ~ /^"/) { sub(/^"/, "", line); sub(/".*$/, "", line) }
+        else if (line ~ /^'\''/) { sub(/^'\''/, "", line); sub(/'\''.*$/, "", line) }
+        else { sub(/[[:space:]]*#.*$/, "", line); sub(/[[:space:]]+$/, "", line) }
+        val = line
+      }
+      END { print val }
+    ' "${REPO_ROOT}/.env")
+    if [ -n "$proj" ] && [[ "$proj" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+      printf '%s' "$proj"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+_edge_compose_files_list() {
+  local commit_ref="${1:-}" f="" has_dalton=0 base=""
+  local saved_pre_ff="${PRE_FF:-}"
+  [ -n "$commit_ref" ] && PRE_FF="$commit_ref"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    printf '%s\n' "$f"
+    base=$(basename "$f")
+    [ "$base" = "docker-compose.dalton.yml" ] && has_dalton=1
+  done <<EOF
+$(compose_files_list)
+EOF
+  PRE_FF="$saved_pre_ff"
+  if [ "$has_dalton" = "0" ]; then
+    if [ -n "$commit_ref" ]; then
+      if git cat-file -e "${commit_ref}:docker-compose.dalton.yml" 2>/dev/null; then
+        printf '%s\n' "docker-compose.dalton.yml"
+      fi
+    elif [ -f "${REPO_ROOT}/docker-compose.dalton.yml" ]; then
+      printf '%s\n' "docker-compose.dalton.yml"
+    fi
+  fi
+}
+
+_resolve_compose_file_path() {
+  local f="${1:-}"
+  case "$f" in
+    /*) printf '%s' "$f" ;;
+    *) printf '%s/%s' "$REPO_ROOT" "$f" ;;
+  esac
+}
+
+_has_explicit_compose_file_setting() {
+  [ -n "${COMPOSE_FILE:-}" ] && return 0
+  [ -f "${REPO_ROOT}/.env" ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?COMPOSE_FILE=' "${REPO_ROOT}/.env"
+}
+
+EDGE_COMPOSE_ARGS=()
+
+_populate_edge_compose_args() {
+  local proj="" f="" resolved="" explicit_cf=0
+  local -a c_args=() f_args=()
+  EDGE_COMPOSE_ARGS=()
+  _has_explicit_compose_file_setting && explicit_cf=1
+  proj=$(_edge_compose_project_name || true)
+  if [ -n "$proj" ]; then
+    c_args+=(-p "$proj")
+  fi
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    resolved=$(_resolve_compose_file_path "$f")
+    if [ -f "$resolved" ]; then
+      f_args+=(-f "$resolved")
+    elif [ "$explicit_cf" = "1" ]; then
+      echo "ERROR: explicit COMPOSE_FILE entry not found: ${resolved}" >&2
+      return 1
+    fi
+  done <<EOF
+$(_edge_compose_files_list)
+EOF
+  if [ "${#f_args[@]}" -gt 0 ]; then
+    c_args+=(--project-directory "$REPO_ROOT")
+    if [ -f "${REPO_ROOT}/.env" ]; then
+      c_args+=(--env-file "${REPO_ROOT}/.env")
+    fi
+    c_args+=("${f_args[@]}")
+  fi
+  if [ "${#c_args[@]}" -gt 0 ]; then
+    EDGE_COMPOSE_ARGS=("${c_args[@]}")
+  fi
+  return 0
+}
+
+_run_edge_compose() {
+  _populate_edge_compose_args || return 1
+  if [ "${#EDGE_COMPOSE_ARGS[@]}" -gt 0 ]; then
+    docker compose "${EDGE_COMPOSE_ARGS[@]}" "$@"
+  else
+    docker compose "$@"
+  fi
+}
+
+_edge_live_running() {
+  local state=""
+  state=$(docker inspect -f '{{.State.Running}}' dalton-langalpha-edge-1 2>/dev/null || true)
+  state="${state%$'\r'}"
+  [ "$state" = "true" ]
+}
+
+_edge_live_mounts() {
+  docker inspect -f '{{range .Mounts}}{{.Type}}|{{.Source}}->{{.Destination}}{{"\n"}}{{end}}' dalton-langalpha-edge-1 2>/dev/null || true
+}
+
+# Parse edge service volume mounts from resolved `docker compose config` YAML (or raw compose YAML),
+# supporting both short syntax (`- src:dst[:ro]`) and long syntax (`- type: bind / source: ... / target: ...`).
+# Prints `type|resolved_source|target` lines.
+_parse_edge_mounts_from_compose_yaml() {
+  local yaml_text="${1:-}" py=""
+  [ -n "$yaml_text" ] || return 1
+  py=$(_resolve_deploy_python) || return 1
+  "$py" - "$REPO_ROOT" "$yaml_text" <<'PY'
+import os
+import re
+import sys
+
+repo_root, text = sys.argv[1:3]
+
+def unquote(val: str) -> str:
+    val = re.sub(r"\s+#.*$", "", val).strip()
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+        val = val[1:-1]
+    return val.strip()
+
+def resolve_src(mtype: str, src: str) -> str:
+    if not src:
+        return ""
+    if mtype != "bind":
+        return src
+    if os.path.isabs(src):
+        return os.path.realpath(src)
+    return os.path.realpath(os.path.join(repo_root, src))
+
+lines = text.splitlines()
+mounts = []
+in_volumes = False
+vol_indent = -1
+item_indent = -1
+cur_type = ""
+cur_src = ""
+cur_dst = ""
+
+def flush():
+    global cur_type, cur_src, cur_dst
+    if cur_dst:
+        mtype = cur_type or ("bind" if (cur_src.startswith((".", "/", "~")) or "/" in cur_src) else "volume")
+        mounts.append((mtype.lower(), resolve_src(mtype.lower(), cur_src), cur_dst))
+    cur_type = ""
+    cur_src = ""
+    cur_dst = ""
+
+for raw in lines:
+    if not raw.strip() or raw.lstrip().startswith("#"):
+        continue
+    ind = len(raw) - len(raw.lstrip(" "))
+    stripped = raw.strip()
+    if not in_volumes:
+        if re.match(r"^volumes:\s*(#.*)?$", stripped):
+            in_volumes = True
+            vol_indent = ind
+            item_indent = -1
+        continue
+    if ind <= vol_indent:
+        flush()
+        in_volumes = False
+        continue
+    if stripped.startswith("- ") or stripped == "-":
+        flush()
+        item_indent = ind
+        rest = stripped[1:].strip()
+        if not rest:
+            continue
+        if rest.startswith("type:"):
+            cur_type = unquote(rest.split(":", 1)[1])
+        elif rest.startswith("source:"):
+            cur_src = unquote(rest.split(":", 1)[1])
+        elif rest.startswith("target:"):
+            cur_dst = unquote(rest.split(":", 1)[1])
+        elif not re.match(r"^[A-Za-z0-9_.-]+:\s+", rest):
+            short = unquote(rest)
+            parts = short.split(":")
+            if len(parts) >= 2:
+                src, dst = parts[0].strip(), parts[1].strip()
+                mtype = "bind" if (src.startswith((".", "/", "~")) or "/" in src) else "volume"
+                mounts.append((mtype, resolve_src(mtype, src), dst))
+    elif item_indent >= 0 and ind > item_indent:
+        if stripped.startswith("type:"):
+            cur_type = unquote(stripped.split(":", 1)[1])
+        elif stripped.startswith("source:"):
+            cur_src = unquote(stripped.split(":", 1)[1])
+        elif stripped.startswith("target:"):
+            cur_dst = unquote(stripped.split(":", 1)[1])
+
+flush()
+for mtype, src, dst in mounts:
+    print(f"{mtype}|{src}|{dst}")
+PY
+}
+
+# Print all parsed edge mounts (`type|resolved_source|destination` lines) from resolved
+# `docker compose config` (falling back to docker-compose.dalton.yml only if config has no edge block).
+_edge_resolved_target_mounts() {
+  local cfg="" edge_cfg=""
+  cfg=$(_run_edge_compose config 2>/dev/null || true)
+  if [ -n "$cfg" ]; then
+    edge_cfg=$(printf '%s\n' "$cfg" | extract_edge_config)
+  fi
+  if [ -z "$edge_cfg" ] && [ -f "${REPO_ROOT}/docker-compose.dalton.yml" ]; then
+    edge_cfg=$(extract_edge_config < "${REPO_ROOT}/docker-compose.dalton.yml")
+  fi
+  [ -n "$edge_cfg" ] || return 1
+  _parse_edge_mounts_from_compose_yaml "$edge_cfg" 2>/dev/null
+}
+
+# Print `type|resolved_source|destination` for edge's web root mount (/srv-releases or /srv)
+# as resolved by `docker compose config`.
+_edge_target_web_mount() {
+  local parsed="" line="" found_srv=""
+  parsed=$(_edge_resolved_target_mounts 2>/dev/null || true)
+  [ -n "$parsed" ] || return 1
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      *"|/srv-releases")
+        printf '%s' "$line"
+        return 0
+        ;;
+      *"|/srv")
+        found_srv="$line"
+        ;;
+    esac
+  done <<<"$parsed"
+  if [ -n "$found_srv" ]; then
+    printf '%s' "$found_srv"
+    return 0
+  fi
+  return 1
+}
+
+_edge_target_uses_releases() {
+  local spec=""
+  spec=$(_edge_target_web_mount 2>/dev/null || true)
+  case "$spec" in
+    *"|/srv-releases") return 0 ;;
+  esac
+  return 1
+}
+
+_edge_mounts_check() {
+  local mode="$1" expected_src="$2" expected_dst="$3" expected_type="${4:-bind}" mounts="" py=""
+  mounts=$(_edge_live_mounts)
+  printf '%s\n' "$mounts" | grep -q -- '->' || return 2
+  py=$(_resolve_deploy_python) || return 2
+  "$py" - "$mode" "$expected_src" "$expected_dst" "$expected_type" "$REPO_ROOT" "$mounts" <<'PY'
+import os
+import sys
+
+mode, expected_src, expected_dst, expected_type, repo_root, mounts_raw = sys.argv[1:7]
+expected_type = (expected_type or "bind").strip().lower()
+mounts = []
+for raw in mounts_raw.splitlines():
+    line = raw.strip()
+    if "->" not in line:
+        continue
+    if "|" in line and line.index("|") < line.index("->"):
+        mtype, rest = line.split("|", 1)
+    else:
+        mtype, rest = "bind", line
+    src, dst = rest.rsplit("->", 1)
+    mounts.append((mtype.strip().lower(), src.strip(), dst.strip()))
+
+if not mounts:
+    sys.exit(2)
+
+expected_real = os.path.realpath(expected_src) if (expected_src and expected_type == "bind") else expected_src
+std_caddy_real = os.path.realpath(os.path.join(repo_root, "deploy/dalton/Caddyfile"))
+has_releases = any(dst == "/srv-releases" for _, _, dst in mounts)
+has_legacy_srv = any(dst == "/srv" for _, _, dst in mounts)
+
+def _src_eq(mtype: str, src: str, target_real: str) -> bool:
+    if mtype == "bind":
+        return os.path.realpath(src) == target_real
+    return src == target_real
+
+if mode == "exact_legacy_dist":
+    ok = (not has_releases) and any(
+        mtype == "bind" and dst == expected_dst and _src_eq(mtype, src, expected_real)
+        for mtype, src, dst in mounts
+    )
+    sys.exit(0 if ok else 1)
+elif mode == "any_legacy_srv":
+    ok = has_legacy_srv and not has_releases
+    sys.exit(0 if ok else 1)
+elif mode == "matches_target":
+    web_ok = any(
+        mtype == expected_type and dst == expected_dst and _src_eq(mtype, src, expected_real)
+        for mtype, src, dst in mounts
+    )
+    caddy_live = [(mtype, src, dst) for mtype, src, dst in mounts if dst == "/etc/caddy/Caddyfile"]
+    caddy_ok = True
+    if caddy_live:
+        caddy_ok = any(
+            mtype == "bind" and _src_eq(mtype, src, std_caddy_real)
+            for mtype, src, _ in caddy_live
+        )
+    sys.exit(0 if (web_ok and caddy_ok) else 1)
+sys.exit(2)
+PY
+}
+
+_edge_live_mounts_legacy_dist() {
+  _edge_live_running || return 1
+  _edge_mounts_check "exact_legacy_dist" "${REPO_ROOT}/web/dist" "/srv" "bind"
+}
+
+_edge_live_mounts_any_legacy_srv() {
+  _edge_mounts_check "any_legacy_srv" "" "/srv" "bind"
+}
+
+# Enforce the two supported production edge mount layouts after `docker compose config`:
+#   1) Legacy:   bind ${REPO_ROOT}/web/dist      -> /srv
+#   2) Releases: bind ${REPO_ROOT}/web/releases  -> /srv-releases
+# And when /etc/caddy/Caddyfile is mounted, it must be bind ${REPO_ROOT}/deploy/dalton/Caddyfile.
+# Rejects any non-standard mount (override to another dir, tmpfs, volume, etc.) before recreate.
+_validate_edge_standard_mounts() {
+  local require_dest="${1:-}" cfg="" edge_cfg="" parsed="" py=""
+  cfg=$(_run_edge_compose config 2>/dev/null || true)
+  if [ -n "$cfg" ]; then
+    edge_cfg=$(printf '%s\n' "$cfg" | extract_edge_config)
+  fi
+  if [ -z "$edge_cfg" ] && [ -f "${REPO_ROOT}/docker-compose.dalton.yml" ]; then
+    edge_cfg=$(extract_edge_config < "${REPO_ROOT}/docker-compose.dalton.yml")
+  fi
+  # Minimal unit-test repos with no edge service definition are skipped unless require_dest is explicit.
+  if [ -z "$edge_cfg" ]; then
+    [ -z "$require_dest" ] && return 0
+    echo "ERROR: edge service definition missing from compose configuration (required ${require_dest})" >&2
+    return 1
+  fi
+  parsed=$(_parse_edge_mounts_from_compose_yaml "$edge_cfg" 2>/dev/null || true)
+  py=$(_resolve_deploy_python) || return 1
+  "$py" - "$REPO_ROOT" "$require_dest" "$parsed" <<'PY'
+import os
+import sys
+
+repo_root, require_dest, mounts_raw = sys.argv[1:4]
+std_releases = os.path.realpath(os.path.join(repo_root, "web/releases"))
+std_dist = os.path.realpath(os.path.join(repo_root, "web/dist"))
+std_caddy = os.path.realpath(os.path.join(repo_root, "deploy/dalton/Caddyfile"))
+
+mounts = []
+for line in mounts_raw.splitlines():
+    parts = line.strip().split("|")
+    if len(parts) == 3:
+        mounts.append((parts[0].lower(), parts[1], parts[2]))
+
+web_mounts = [(t, s, d) for t, s, d in mounts if d in ("/srv", "/srv-releases")]
+caddy_mounts = [(t, s, d) for t, s, d in mounts if d == "/etc/caddy/Caddyfile"]
+
+supported_msg = (
+    f"Supported standard edge mounts are bind {std_dist}->/srv (legacy) or "
+    f"bind {std_releases}->/srv-releases (releases), with bind {std_caddy}->/etc/caddy/Caddyfile."
+)
+
+if len(web_mounts) != 1:
+    print(f"ERROR: unsupported edge web-root mounts ({web_mounts}). {supported_msg}", file=sys.stderr)
+    sys.exit(1)
+
+wtype, wsrc, wdst = web_mounts[0]
+expected_src = std_releases if wdst == "/srv-releases" else std_dist
+if wtype != "bind" or not wsrc or os.path.realpath(wsrc) != expected_src:
+    print(
+        f"ERROR: unsupported edge web-root mount {wtype}|{wsrc}->{wdst} (must be bind {expected_src}->{wdst}). {supported_msg}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+if require_dest and wdst != require_dest:
+    print(f"ERROR: expected edge web-root mount destination {require_dest}, got {wdst}. {supported_msg}", file=sys.stderr)
+    sys.exit(1)
+
+for ctype, csrc, cdst in caddy_mounts:
+    if ctype != "bind" or not csrc or os.path.realpath(csrc) != std_caddy:
+        print(
+            f"ERROR: unsupported edge Caddyfile mount {ctype}|{csrc}->{cdst} (must be bind {std_caddy}->/etc/caddy/Caddyfile). {supported_msg}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+print(f"{wtype}|{expected_src}|{wdst}")
+PY
+}
+
+_commit_mounts_legacy_dist() {
+  local commit_sha="${1:-}" cfg="" edge_cfg="" parsed="" py=""
+  [ -n "$commit_sha" ] || return 1
+  git cat-file -e "${commit_sha}:docker-compose.dalton.yml" 2>/dev/null || return 1
+  git cat-file -e "${commit_sha}:deploy/dalton/Caddyfile" 2>/dev/null || return 1
+  cfg=$(git show "${commit_sha}:docker-compose.dalton.yml" 2>/dev/null || true)
+  [ -n "$cfg" ] || return 1
+  edge_cfg=$(printf '%s\n' "$cfg" | extract_edge_config)
+  [ -n "$edge_cfg" ] || return 1
+  parsed=$(_parse_edge_mounts_from_compose_yaml "$edge_cfg" 2>/dev/null || true)
+  [ -n "$parsed" ] || return 1
+  py=$(_resolve_deploy_python) || return 1
+  "$py" - "$REPO_ROOT" "$parsed" <<'PY'
+import os
+import sys
+
+repo_root, mounts_raw = sys.argv[1:3]
+std_dist = os.path.realpath(os.path.join(repo_root, "web/dist"))
+mounts = [tuple(line.strip().split("|")) for line in mounts_raw.splitlines() if len(line.strip().split("|")) == 3]
+has_legacy = any(t == "bind" and d == "/srv" and os.path.realpath(s) == std_dist for t, s, d in mounts)
+has_releases = any(d == "/srv-releases" for _, _, d in mounts)
+sys.exit(0 if (has_legacy and not has_releases) else 1)
+PY
+}
+
+_commit_requires_releases_mount() {
+  local commit_sha="${1:-}" has_compose=0 has_caddy=0 cfg="" edge_cfg="" parsed="" caddy_cfg=""
+  [ -n "$commit_sha" ] || return 1
+  git cat-file -e "${commit_sha}:docker-compose.dalton.yml" 2>/dev/null && has_compose=1
+  git cat-file -e "${commit_sha}:deploy/dalton/Caddyfile" 2>/dev/null && has_caddy=1
+  if [ "$has_compose" = "1" ]; then
+    cfg=$(git show "${commit_sha}:docker-compose.dalton.yml" 2>/dev/null || true)
+    edge_cfg=$(printf '%s\n' "$cfg" | extract_edge_config)
+    if [ -n "$edge_cfg" ]; then
+      parsed=$(_parse_edge_mounts_from_compose_yaml "$edge_cfg" 2>/dev/null || true)
+      if printf '%s\n' "$parsed" | grep -q '|/srv-releases$'; then
+        return 0
+      fi
+    fi
+  fi
+  if [ "$has_caddy" = "1" ]; then
+    caddy_cfg=$(git show "${commit_sha}:deploy/dalton/Caddyfile" 2>/dev/null || true)
+    if printf '%s\n' "$caddy_cfg" | grep -q '/srv-releases/current'; then
+      return 0
+    fi
+  fi
+  if [ "$has_compose" = "0" ] && [ "$has_caddy" = "0" ]; then
+    _edge_target_uses_releases
+    return $?
+  fi
+  return 1
+}
+
+_edge_live_mount_mismatches_target() {
+  local spec="" target_type="" target_src="" target_dst="" rc=0 mounts="" py=""
+  spec=$(_edge_target_web_mount 2>/dev/null || true)
+  if [ -n "$spec" ]; then
+    IFS='|' read -r target_type target_src target_dst <<<"$spec"
+    _edge_mounts_check "matches_target" "$target_src" "$target_dst" "$target_type" || rc=$?
+  elif _edge_target_uses_releases; then
+    _edge_mounts_check "matches_target" "${REPO_ROOT}/web/releases" "/srv-releases" "bind" || rc=$?
+  else
+    _edge_mounts_check "matches_target" "${REPO_ROOT}/web/dist" "/srv" "bind" || rc=$?
+  fi
+  # rc=2 means no mount info available (minimal mock); rc=1 means web-root drift!
+  [ "$rc" -eq 1 ] && return 0
+  [ "$rc" -eq 2 ] && return 1
+  # Also check /etc/caddy/Caddyfile live bind source when reported by docker inspect.
+  mounts=$(_edge_live_mounts)
+  if printf '%s\n' "$mounts" | grep -q -- '->/etc/caddy/Caddyfile$'; then
+    py=$(_resolve_deploy_python) || return 1
+    if ! "$py" - "$REPO_ROOT" "$mounts" <<'PY'
+import os, sys
+repo_root, mounts_raw = sys.argv[1:3]
+std_caddy = os.path.realpath(os.path.join(repo_root, "deploy/dalton/Caddyfile"))
+for raw in mounts_raw.splitlines():
+    line = raw.strip()
+    if "->" not in line:
+        continue
+    mtype, rest = line.split("|", 1) if ("|" in line and line.index("|") < line.index("->")) else ("bind", line)
+    src, dst = rest.rsplit("->", 1)
+    if dst.strip() == "/etc/caddy/Caddyfile":
+        if mtype.strip().lower() != "bind" or os.path.realpath(src.strip()) != std_caddy:
+            sys.exit(1)
+sys.exit(0)
+PY
+    then
+      return 0
+    fi
+  fi
+  return 1
+}
+
 cleanup_old_container_logs() {
   [ -d "$CONTAINER_LOG_DIR" ] || return 0
   find "$CONTAINER_LOG_DIR" -maxdepth 1 -type f \( \
@@ -545,11 +1131,21 @@ apply_crawler() {
 }
 
 recreate_edge() {
-  local out rc
+  local up_out="" out="" rc=0
+  _populate_edge_compose_args || return 1
   save_container_logs "edge" "dalton-langalpha-edge-1"
-  out=$(docker compose up -d --no-deps --force-recreate edge 2>&1)
-  rc=$?
+  up_out=$(mktemp "${TMPDIR:-/tmp}/dalton-edge-up.XXXXXX") || return 1
+  if [ "${#EDGE_COMPOSE_ARGS[@]}" -gt 0 ]; then
+    _run_cmd_in_pgid_with_timeout "$EDGE_COMPOSE_TIMEOUT" 0 "$up_out" docker compose "${EDGE_COMPOSE_ARGS[@]}" up -d --no-deps --force-recreate edge || rc=$?
+  else
+    _run_cmd_in_pgid_with_timeout "$EDGE_COMPOSE_TIMEOUT" 0 "$up_out" docker compose up -d --no-deps --force-recreate edge || rc=$?
+  fi
+  out=$(cat "$up_out" 2>/dev/null || true)
+  rm -f "$up_out"
   [ -n "$out" ] && printf '%s\n' "$out" | tail -2
+  if [ "$rc" -eq 124 ]; then
+    echo "ERROR: docker compose edge recreate timed out after ${EDGE_COMPOSE_TIMEOUT}s" >&2
+  fi
   return "$rc"
 }
 
@@ -589,6 +1185,7 @@ wait_crawler_health() {
 }
 
 wait_edge_ready() {
+  local caddyfile="${1:-${REPO_ROOT}/deploy/dalton/Caddyfile}"
   local ok=0 deadline now remaining max_time i
   deadline=$(( $(date +%s) + EDGE_WAIT_TIMEOUT ))
   for i in $(seq 1 "$EDGE_WAIT_TIMEOUT"); do
@@ -597,7 +1194,7 @@ wait_edge_ready() {
     [ "$remaining" -le 0 ] && break
     max_time=2
     [ "$remaining" -lt "$max_time" ] && max_time="$remaining"
-    if edge_ready "$max_time"; then
+    if edge_ready "$max_time" "$caddyfile"; then
       if [ "$(date +%s)" -le "$deadline" ]; then
         ok=1
       fi
@@ -761,6 +1358,634 @@ else:
 PY
 }
 
+_frontend_releases_dir() {
+  printf '%s/web/releases' "$REPO_ROOT"
+}
+
+_frontend_current_link() {
+  printf '%s/current' "$(_frontend_releases_dir)"
+}
+
+_is_valid_frontend_release_id() {
+  local rel_id="${1:-}"
+  [ -n "$rel_id" ] || return 1
+  case "$rel_id" in
+    .|..|current|*/*|.*) return 1 ;;
+  esac
+  [[ "$rel_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+
+_read_frontend_current_release() {
+  local cur_link="" target=""
+  cur_link=$(_frontend_current_link)
+  [ -L "$cur_link" ] || return 1
+  target=$(readlink "$cur_link" 2>/dev/null || true)
+  _is_valid_frontend_release_id "$target" || return 1
+  printf '%s' "$target"
+}
+
+_read_frontend_build_id() {
+  local rel_dir="${1:-}" py=""
+  [ -n "$rel_dir" ] && [ -s "${rel_dir}/version.json" ] || return 1
+  py=$(_resolve_deploy_python) || return 1
+  "$py" -c 'import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+build = data.get("build") if isinstance(data, dict) else None
+if not isinstance(build, str) or not build.strip():
+    sys.exit(1)
+print(build.strip(), end="")' "${rel_dir}/version.json" 2>/dev/null
+}
+
+_read_frontend_release_tag() {
+  local rel_dir="${1:-}" py=""
+  [ -n "$rel_dir" ] && [ -s "${rel_dir}/version.json" ] || return 1
+  py=$(_resolve_deploy_python) || return 1
+  "$py" -c 'import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+rel = data.get("release") if isinstance(data, dict) else None
+if not isinstance(rel, str) or not rel.strip():
+    sys.exit(1)
+print(rel.strip(), end="")' "${rel_dir}/version.json" 2>/dev/null
+}
+
+_is_servable_legacy_dist_dir() {
+  local rel_dir="${1:-}"
+  [ -n "$rel_dir" ] && [ -d "$rel_dir" ] && [ ! -L "$rel_dir" ] \
+    && [ -s "${rel_dir}/index.html" ] && [ -d "${rel_dir}/assets" ] && [ -s "${rel_dir}/help/index.html" ]
+}
+
+_is_servable_frontend_release_dir() {
+  local rel_dir="${1:-}"
+  _is_servable_legacy_dist_dir "$rel_dir" && [ -s "${rel_dir}/version.json" ]
+}
+
+_is_complete_frontend_release_dir() {
+  _is_servable_frontend_release_dir "${1:-}"
+}
+
+_finalize_frontend_version_manifest() {
+  local rel_dir="${1:-}" rel_id="${2:-}" legacy_mode="${3:-0}" py=""
+  [ -n "$rel_dir" ] && [ -d "$rel_dir" ] || return 1
+  rel_id="${rel_id:-$(basename "$rel_dir")}"
+  py=$(_resolve_deploy_python) || return 1
+  "$py" - "$rel_dir" "$rel_id" "$legacy_mode" <<'PY'
+import datetime
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+rel_dir = Path(sys.argv[1])
+rel_id = sys.argv[2].strip()
+legacy_mode = sys.argv[3] == "1"
+version_file = rel_dir / "version.json"
+index_file = rel_dir / "index.html"
+assets_dir = rel_dir / "assets"
+help_dir = rel_dir / "help"
+
+payload = {}
+if version_file.is_file():
+    try:
+        loaded = json.loads(version_file.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            payload = loaded
+    except Exception:
+        payload = {}
+
+entry_raw = payload.get("entry") or payload.get("build")
+if not isinstance(entry_raw, str) or not entry_raw.strip():
+    if not legacy_mode:
+        print(f"ERROR: missing valid build/entry id in {version_file}", file=sys.stderr)
+        sys.exit(1)
+    legacy_ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    legacy_tag = rel_id if rel_id.startswith("legacy-") else f"legacy-{legacy_ts}"
+    detected_entry = ""
+    if index_file.is_file():
+        html = index_file.read_text(encoding="utf-8", errors="replace")
+        for match in re.finditer(r'src=["\']/assets/([^"\'?#]+)["\']', html):
+            cand = match.group(1).strip()
+            if cand and "/" not in cand and (assets_dir / cand).is_file():
+                detected_entry = cand
+                break
+    entry_id = detected_entry or legacy_tag
+    payload["legacy_generated"] = True
+    payload["legacy_id"] = legacy_tag
+else:
+    entry_id = entry_raw.strip()
+
+hasher = hashlib.sha256()
+if help_dir.is_dir():
+    for root, dirs, files in os.walk(help_dir):
+        dirs.sort()
+        for name in sorted(files):
+            fp = Path(root) / name
+            if fp.is_symlink() or not fp.is_file():
+                continue
+            rel = fp.relative_to(help_dir).as_posix()
+            hasher.update(rel.encode("utf-8"))
+            hasher.update(b"\0")
+            hasher.update(fp.read_bytes())
+            hasher.update(b"\0")
+help_hash = hasher.hexdigest()[:16]
+
+composite_build = f"{entry_id}+help-{help_hash}@{rel_id}"
+payload["entry"] = entry_id
+# Legacy copied JS reads only `build`; keep `build == entry` during legacy migration so
+# existing browsers do not show false stale-build prompts, while `release` still carries
+# the unique legacy release identity verified by check_public_edge.sh.
+payload["build"] = entry_id if legacy_mode else composite_build
+payload["help_hash"] = help_hash
+payload["release_id"] = rel_id
+payload["release"] = composite_build
+
+tmp = version_file.with_name(f"version.json.tmp.{os.getpid()}")
+tmp.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+os.replace(tmp, version_file)
+PY
+}
+
+_is_active_frontend_release_dir() {
+  local dir="${1:-}" rel_dir="" cur_id="" base=""
+  [ -n "$dir" ] || return 1
+  rel_dir=$(_frontend_releases_dir)
+  cur_id=$(_read_frontend_current_release || true)
+  [ -n "$cur_id" ] || return 1
+  base=$(basename "$dir")
+  if [ "$dir" = "${rel_dir}/${cur_id}" ] || [ "$base" = "$cur_id" ]; then
+    return 0
+  fi
+  return 1
+}
+
+# One-time migration from legacy web/dist into web/releases/legacy-<ts>-<pid> with
+# web/releases/current pointing at it. Keeps web/dist intact on disk so rollback to a
+# pre-releases compose/Caddyfile still works without rebuilding.
+ensure_frontend_releases_initialized() {
+  local rel_dir="" cur_link="" cur_id="" legacy_dist="" legacy_id="" legacy_dir=""
+  rel_dir=$(_frontend_releases_dir)
+  cur_link=$(_frontend_current_link)
+  if [ -L "$rel_dir" ]; then
+    echo "ERROR: ${rel_dir} must be a real directory, not a symlink" >&2
+    return 1
+  fi
+  if [ -e "$rel_dir" ] && [ ! -d "$rel_dir" ]; then
+    echo "ERROR: ${rel_dir} exists and is not a directory" >&2
+    return 1
+  fi
+  mkdir -p "$rel_dir" || return 1
+  cur_id=$(_read_frontend_current_release || true)
+  if [ -n "$cur_id" ] && _is_servable_frontend_release_dir "${rel_dir}/${cur_id}"; then
+    PREV_FRONTEND_RELEASE_ID="$cur_id"
+    return 0
+  fi
+  legacy_dist="${REPO_ROOT}/web/dist"
+  if _is_servable_legacy_dist_dir "$legacy_dist"; then
+    legacy_id="legacy-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    legacy_dir="${rel_dir}/${legacy_id}"
+    if ! mkdir "$legacy_dir" || ! cp -Rp "${legacy_dist}/." "${legacy_dir}/"; then
+      rm -rf "$legacy_dir" 2>/dev/null || true
+      echo "ERROR: failed to migrate ${legacy_dist} into ${legacy_dir}" >&2
+      return 1
+    fi
+    if ! _finalize_frontend_version_manifest "$legacy_dir" "$legacy_id" 1; then
+      rm -rf "$legacy_dir" 2>/dev/null || true
+      echo "ERROR: failed to finalize version.json for migrated release ${legacy_dir}" >&2
+      return 1
+    fi
+    if ! _record_own_frontend_assets "$legacy_dir"; then
+      rm -rf "$legacy_dir" 2>/dev/null || true
+      echo "ERROR: failed to record asset manifest for migrated release ${legacy_dir}" >&2
+      return 1
+    fi
+    if ! _is_servable_frontend_release_dir "$legacy_dir"; then
+      rm -rf "$legacy_dir" 2>/dev/null || true
+      echo "ERROR: migrated frontend release incomplete: ${legacy_dir}" >&2
+      return 1
+    fi
+    if ! _atomic_replace_symlink "$legacy_id" "$cur_link"; then
+      rm -rf "$legacy_dir" 2>/dev/null || true
+      echo "ERROR: failed to set ${cur_link} -> ${legacy_id}" >&2
+      return 1
+    fi
+    PREV_FRONTEND_RELEASE_ID="$legacy_id"
+    echo "$(date '+%T') migrated legacy web/dist into web/releases/${legacy_id} (web/dist preserved)"
+  fi
+  return 0
+}
+
+_record_own_frontend_assets() {
+  local rel_dir="${1:-}" py=""
+  [ -n "$rel_dir" ] && [ -d "${rel_dir}/assets" ] || return 1
+  py=$(_resolve_deploy_python) || return 1
+  "$py" - "$rel_dir" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+rel_dir = Path(sys.argv[1])
+pagefind_hashed_suffixes = (".pf_fragment", ".pf_index", ".pf_meta", ".pf_filter")
+own = []
+for sub in ("assets", "help/_astro", "help/pagefind"):
+    root_dir = rel_dir / sub
+    if not root_dir.is_dir() or root_dir.is_symlink():
+        continue
+    for cur_root, dirs, files in os.walk(root_dir):
+        dirs.sort()
+        for name in sorted(files):
+            fp = Path(cur_root) / name
+            if fp.is_symlink() or not fp.is_file():
+                continue
+            if sub == "help/pagefind" and not name.endswith(pagefind_hashed_suffixes):
+                continue
+            own.append(fp.relative_to(rel_dir).as_posix())
+own.sort()
+manifest = rel_dir / ".deploy-own-assets"
+with manifest.open("w", encoding="utf-8") as fh:
+    fh.write("# format=v2\n")
+    for item in own:
+        fh.write(f"{item}\n")
+PY
+}
+
+# Copy (hard-link with copy fallback) a release's own hashed files under assets/,
+# help/_astro/, and content-addressed help/pagefind/ files (*.pf_fragment, *.pf_index,
+# *.pf_meta, *.pf_filter) into target_dir without overwriting target files, so open tabs
+# loading old (or rolled-back new) lazy chunks/search shards never hit 404 and assets do
+# not accumulate unboundedly across generations.
+_carry_over_hashed_assets() {
+  local src_dir="${1:-}" dst_dir="${2:-}" py=""
+  [ -n "$src_dir" ] && [ -n "$dst_dir" ] || return 0
+  [ "$src_dir" != "$dst_dir" ] || return 0
+  [ -d "$src_dir" ] && [ -d "$dst_dir" ] || return 0
+  py=$(_resolve_deploy_python) || return 1
+  "$py" - "$src_dir" "$dst_dir" <<'PY'
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+src_dir = Path(sys.argv[1])
+dst_dir = Path(sys.argv[2])
+# Match Vite (-<hash>.<ext>) or Astro/hashed (.<hash>.<ext>) filenames in top-level assets/.
+top_asset_hashed_re = re.compile(r"(?:-[A-Za-z0-9_-]+|\.[A-Za-z0-9_-]{6,})\.[A-Za-z0-9]+$")
+pagefind_hashed_suffixes = (".pf_fragment", ".pf_index", ".pf_meta", ".pf_filter")
+
+
+def _scan_sub(sub: str, only_pagefind_hashed: bool = False) -> list[str]:
+    found = []
+    sub_dir = src_dir / sub
+    if not sub_dir.is_dir() or sub_dir.is_symlink():
+        return found
+    for cur_root, dirs, files in os.walk(sub_dir):
+        dirs.sort()
+        for name in sorted(files):
+            fp = Path(cur_root) / name
+            if fp.is_symlink() or not fp.is_file():
+                continue
+            if only_pagefind_hashed and not name.endswith(pagefind_hashed_suffixes):
+                continue
+            found.append(fp.relative_to(src_dir).as_posix())
+    return found
+
+
+manifest = src_dir / ".deploy-own-assets"
+candidates = []
+if manifest.is_file():
+    lines = [raw.strip() for raw in manifest.read_text(encoding="utf-8").splitlines() if raw.strip()]
+    is_v2 = bool(lines and lines[0] == "# format=v2")
+    for line in lines:
+        if line.startswith("#"):
+            continue
+        if "/" not in line:
+            candidates.append(f"assets/{line}")
+        else:
+            candidates.append(line)
+    # Legacy r2 manifests only listed assets/ files; supplement with help/_astro and hashed help/pagefind.
+    if not is_v2:
+        candidates.extend(_scan_sub("help/_astro"))
+        candidates.extend(_scan_sub("help/pagefind", only_pagefind_hashed=True))
+else:
+    candidates.extend(_scan_sub("assets"))
+    candidates.extend(_scan_sub("help/_astro"))
+    candidates.extend(_scan_sub("help/pagefind", only_pagefind_hashed=True))
+
+seen = set()
+for rel in candidates:
+    if not rel or rel in seen or rel.startswith("/") or "\\" in rel:
+        continue
+    seen.add(rel)
+    parts = rel.split("/")
+    if any(p in ("", ".", "..") for p in parts):
+        continue
+    if parts[0] == "assets":
+        if len(parts) == 2 and not top_asset_hashed_re.search(parts[1]):
+            continue
+    elif len(parts) >= 3 and parts[0] == "help" and parts[1] == "_astro":
+        pass
+    elif len(parts) >= 3 and parts[0] == "help" and parts[1] == "pagefind":
+        if not parts[-1].endswith(pagefind_hashed_suffixes):
+            continue
+    else:
+        continue
+    src = src_dir / rel
+    dst = dst_dir / rel
+    if src.is_symlink() or not src.is_file():
+        continue
+    if dst.exists() or dst.is_symlink():
+        continue
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(src, dst)
+    except OSError:
+        tmp_dst = dst.with_name(f".{dst.name}.tmp.{os.getpid()}")
+        try:
+            shutil.copy2(src, tmp_dst)
+            os.replace(tmp_dst, dst)
+        except Exception:
+            try:
+                if tmp_dst.exists() or tmp_dst.is_symlink():
+                    tmp_dst.unlink()
+            except OSError:
+                pass
+            raise
+PY
+}
+
+_carry_over_prev_hashed_assets() {
+  _carry_over_hashed_assets "${1:-}" "${2:-}"
+}
+
+cleanup_frontend_staging() {
+  local rel_dir="" rc=0
+  rel_dir=$(_frontend_releases_dir)
+  rm -f "${rel_dir}/current.tmp.$$" 2>/dev/null || true
+  if [ -n "${ACTIVE_FRONTEND_RELEASE_DIR:-}" ] && { [ -e "${ACTIVE_FRONTEND_RELEASE_DIR}" ] || [ -L "${ACTIVE_FRONTEND_RELEASE_DIR}" ]; }; then
+    if _is_active_frontend_release_dir "${ACTIVE_FRONTEND_RELEASE_DIR}"; then
+      ACTIVE_FRONTEND_RELEASE_DIR=""
+    else
+      rm -rf "${ACTIVE_FRONTEND_RELEASE_DIR}" || rc=$?
+    fi
+  fi
+  if [ "$rc" -eq 0 ]; then
+    ACTIVE_FRONTEND_RELEASE_DIR=""
+  fi
+  return "$rc"
+}
+
+switch_frontend_from_staging() {
+  local rel_dir="" cur_link="" new_id="${NEW_FRONTEND_RELEASE_ID:-}" new_dir="" cur_id=""
+  rel_dir=$(_frontend_releases_dir)
+  cur_link=$(_frontend_current_link)
+  new_dir="${ACTIVE_FRONTEND_RELEASE_DIR:-${rel_dir}/${new_id}}"
+  if ! _is_valid_frontend_release_id "$new_id" || ! _is_servable_frontend_release_dir "$new_dir"; then
+    echo "ERROR: frontend release directory incomplete: ${new_dir:-unset}" >&2
+    return 1
+  fi
+  cur_id=$(_read_frontend_current_release || true)
+  if [ -n "$cur_id" ] && [ "$cur_id" != "$new_id" ]; then
+    PREV_FRONTEND_RELEASE_ID="$cur_id"
+  fi
+  # Reuse the single atomic symlink replacement helper shared with channel-gateway
+  if ! _atomic_replace_symlink "$new_id" "$cur_link"; then
+    echo "ERROR: failed to atomically switch ${cur_link} -> ${new_id}" >&2
+    return 1
+  fi
+  ACTIVE_FRONTEND_RELEASE_DIR=""
+  FRONTEND_SWITCHED=1
+  return 0
+}
+
+restore_frontend_from_prev() {
+  local rel_dir="" cur_link="" prev_id="${PREV_FRONTEND_RELEASE_ID:-}" active_id=""
+  rel_dir=$(_frontend_releases_dir)
+  cur_link=$(_frontend_current_link)
+  FRONTEND_CARRY_OVER_FAILED=0
+  if ! _is_valid_frontend_release_id "$prev_id" || ! _is_servable_frontend_release_dir "${rel_dir}/${prev_id}"; then
+    echo "ERROR: previous frontend release unavailable for rollback: ${prev_id:-unset}" >&2
+    FRONTEND_REVERT_STATE="restore_failed"
+    return 1
+  fi
+  # Before switching current back, carry over the outgoing new release's hashed assets
+  # (assets/, help/_astro/, and hashed help/pagefind/) into prev_id so browsers that fetched
+  # the new HTML during public edge checks keep receiving 200 after rollback.
+  active_id=$(_read_frontend_current_release || printf '%s' "${NEW_FRONTEND_RELEASE_ID:-}")
+  if [ -n "$active_id" ] && [ "$active_id" != "$prev_id" ] && [ -d "${rel_dir}/${active_id}" ]; then
+    if ! _carry_over_hashed_assets "${rel_dir}/${active_id}" "${rel_dir}/${prev_id}"; then
+      FRONTEND_CARRY_OVER_FAILED=1
+      echo "WARN: failed to carry over outgoing release (${active_id}) hashed assets into ${prev_id}; restoring current to ${prev_id} and preserving ${active_id}" >&2
+    fi
+  fi
+  if ! _atomic_replace_symlink "$prev_id" "$cur_link"; then
+    echo "ERROR: failed to atomically restore ${cur_link} -> ${prev_id}" >&2
+    FRONTEND_REVERT_STATE="restore_failed"
+    return 1
+  fi
+  FRONTEND_SWITCHED=0
+  FRONTEND_REVERT_STATE="reverted"
+  return 0
+}
+
+prune_old_frontend_releases() {
+  local keep="${1:-$FRONTEND_KEEP_RELEASES}" rel_dir="" cur_id="" prev_id="" py="" local_lock=0 rc=0
+  _ensure_deploy_lock_held || return 1
+  local_lock="$_ENSURED_LOCAL_LOCK"
+  if [ "$local_lock" = "1" ]; then
+    trap '_on_deploy_interrupt_signal INT' INT
+    trap '_on_deploy_interrupt_signal TERM' TERM
+  fi
+  rel_dir=$(_frontend_releases_dir)
+  if [ ! -d "$rel_dir" ]; then
+    if [ "$local_lock" = "1" ]; then
+      trap - INT TERM
+      release_deploy_lock || true
+    fi
+    return 0
+  fi
+  cur_id=$(_read_frontend_current_release || true)
+  prev_id="${PREV_FRONTEND_RELEASE_ID:-}"
+  if ! py=$(_resolve_deploy_python); then
+    if [ "$local_lock" = "1" ]; then
+      trap - INT TERM
+      release_deploy_lock || true
+    fi
+    return 1
+  fi
+  "$py" - "$rel_dir" "$keep" "$cur_id" "$prev_id" <<'PY' || rc=$?
+import os
+import shutil
+import sys
+
+rel_dir, keep_raw, cur_id, prev_id = sys.argv[1:5]
+keep = max(1, int(keep_raw))
+pinned = {x for x in (cur_id, prev_id) if x}
+
+dirs = []
+for name in os.listdir(rel_dir):
+    if name == "current" or name.startswith("."):
+        continue
+    full = os.path.join(rel_dir, name)
+    if os.path.islink(full) or not os.path.isdir(full):
+        continue
+    st = os.stat(full)
+    dirs.append((st.st_mtime_ns, name, full))
+
+dirs.sort(key=lambda item: (item[0], item[1]), reverse=True)
+kept = set(pinned)
+for _mtime, name, _full in dirs:
+    if len(kept) >= keep:
+        break
+    kept.add(name)
+
+for _mtime, name, full in dirs:
+    if name not in kept:
+        shutil.rmtree(full)
+PY
+  if [ "$local_lock" = "1" ]; then
+    trap - INT TERM
+    release_deploy_lock || true
+  fi
+  return "$rc"
+}
+
+manual_switch_frontend_release() {
+  local rel_id="${1:-}" rel_dir="" cur_link="" cur_id="" local_lock=0 rc=0
+  _ensure_deploy_lock_held || return 1
+  local_lock="$_ENSURED_LOCAL_LOCK"
+  if [ "$local_lock" = "1" ]; then
+    trap '_on_deploy_interrupt_signal INT' INT
+    trap '_on_deploy_interrupt_signal TERM' TERM
+  fi
+  rel_dir=$(_frontend_releases_dir)
+  cur_link=$(_frontend_current_link)
+  if ! _is_valid_frontend_release_id "$rel_id" || ! _is_servable_frontend_release_dir "${rel_dir}/${rel_id}"; then
+    echo "ERROR: manual_switch_frontend_release: invalid or incomplete release '${rel_id}' under ${rel_dir}" >&2
+    if [ "$local_lock" = "1" ]; then
+      trap - INT TERM
+      release_deploy_lock || true
+    fi
+    return 1
+  fi
+  cur_id=$(_read_frontend_current_release || true)
+  if [ -n "$cur_id" ] && [ "$cur_id" != "$rel_id" ] && [ -d "${rel_dir}/${cur_id}" ]; then
+    if ! _carry_over_hashed_assets "${rel_dir}/${cur_id}" "${rel_dir}/${rel_id}"; then
+      echo "ERROR: manual_switch_frontend_release: failed to carry over hashed assets from ${cur_id} into ${rel_id}; aborting switch" >&2
+      if [ "$local_lock" = "1" ]; then
+        trap - INT TERM
+        release_deploy_lock || true
+      fi
+      return 1
+    fi
+  fi
+  if ! _atomic_replace_symlink "$rel_id" "$cur_link"; then
+    rc=1
+  else
+    echo "switched ${cur_link} -> ${rel_id}"
+  fi
+  if [ "$local_lock" = "1" ]; then
+    trap - INT TERM
+    release_deploy_lock || true
+  fi
+  return "$rc"
+}
+
+manual_build_frontend_release() {
+  local rel_dir="" cur_id="" short_head="" new_id="" new_dir="" local_lock=0 build_out_file="" build_rc=0
+  _ensure_deploy_lock_held || return 1
+  local_lock="$_ENSURED_LOCAL_LOCK"
+  if [ "$local_lock" = "1" ]; then
+    trap '_on_deploy_interrupt_signal INT' INT
+    trap '_on_deploy_interrupt_signal TERM' TERM
+  fi
+  if ! cd "$REPO_ROOT"; then
+    if [ "$local_lock" = "1" ]; then
+      trap - INT TERM
+      release_deploy_lock || true
+    fi
+    return 1
+  fi
+  if ! ensure_frontend_releases_initialized; then
+    if [ "$local_lock" = "1" ]; then
+      trap - INT TERM
+      release_deploy_lock || true
+    fi
+    return 1
+  fi
+  rel_dir=$(_frontend_releases_dir)
+  cur_id=$(_read_frontend_current_release || true)
+  short_head=$(git rev-parse --short=12 HEAD 2>/dev/null || echo "manual")
+  new_id="${short_head}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  new_dir="${rel_dir}/${new_id}"
+  build_out_file=$(mktemp "${TMPDIR:-/tmp}/dalton-manual-fe-build.XXXXXX") || {
+    if [ "$local_lock" = "1" ]; then
+      trap - INT TERM
+      release_deploy_lock || true
+    fi
+    return 1
+  }
+  ACTIVE_FRONTEND_RELEASE_DIR="$new_dir"
+  ACTIVE_STEP_OUT_FILE="$build_out_file"
+  build_rc=0
+  if _spawn_in_new_pgid "$build_out_file" bash scripts/dalton/build_frontend_prod.sh --require-supabase --out-dir "$new_dir"; then
+    wait "$ACTIVE_STEP_CHILD_PID" || build_rc=$?
+    ACTIVE_STEP_CHILD_PID=""
+    ACTIVE_STEP_PGID=""
+  else
+    build_rc=1
+  fi
+  cat "$build_out_file" 2>/dev/null || true
+  rm -f "$build_out_file"
+  ACTIVE_STEP_OUT_FILE=""
+  if [ "$build_rc" -ne 0 ] || ! _is_servable_frontend_release_dir "$new_dir"; then
+    rm -rf "$new_dir" 2>/dev/null || true
+    ACTIVE_FRONTEND_RELEASE_DIR=""
+    if [ "$local_lock" = "1" ]; then
+      trap - INT TERM
+      release_deploy_lock || true
+    fi
+    return 1
+  fi
+  if ! _finalize_frontend_version_manifest "$new_dir" "$new_id" 0 \
+     || ! _record_own_frontend_assets "$new_dir"; then
+    rm -rf "$new_dir" 2>/dev/null || true
+    ACTIVE_FRONTEND_RELEASE_DIR=""
+    if [ "$local_lock" = "1" ]; then
+      trap - INT TERM
+      release_deploy_lock || true
+    fi
+    return 1
+  fi
+  if [ -n "$cur_id" ] && [ -d "${rel_dir}/${cur_id}" ]; then
+    if ! _carry_over_hashed_assets "${rel_dir}/${cur_id}" "$new_dir"; then
+      rm -rf "$new_dir" 2>/dev/null || true
+      ACTIVE_FRONTEND_RELEASE_DIR=""
+      if [ "$local_lock" = "1" ]; then
+        trap - INT TERM
+        release_deploy_lock || true
+      fi
+      return 1
+    fi
+  fi
+  if ! _atomic_replace_symlink "$new_id" "$(_frontend_current_link)"; then
+    rm -rf "$new_dir" 2>/dev/null || true
+    ACTIVE_FRONTEND_RELEASE_DIR=""
+    if [ "$local_lock" = "1" ]; then
+      trap - INT TERM
+      release_deploy_lock || true
+    fi
+    return 1
+  fi
+  ACTIVE_FRONTEND_RELEASE_DIR=""
+  echo "built and activated web/releases/${new_id}"
+  if [ "$local_lock" = "1" ]; then
+    trap - INT TERM
+    release_deploy_lock || true
+  fi
+  return 0
+}
+
 _is_active_gateway_release_path() {
   local dir="${1:-}" gw_dir="" live_rel="" live_dir="" cand_real="" live_real="" rel_from_gw=""
   [ -n "$dir" ] || return 1
@@ -899,11 +2124,270 @@ cleanup_gateway_staging() {
   return "$rc"
 }
 
+ACTIVE_STEP_WATCHDOG_PID=""
+ACTIVE_STEP_TIMEOUT_MARKER=""
+
+_stop_active_step_watchdog() {
+  if [ -n "${ACTIVE_STEP_WATCHDOG_PID:-}" ]; then
+    kill -KILL "${ACTIVE_STEP_WATCHDOG_PID}" 2>/dev/null || true
+    _wait_pid_ignoring_signals "${ACTIVE_STEP_WATCHDOG_PID}" || true
+    ACTIVE_STEP_WATCHDOG_PID=""
+  fi
+  if [ -n "${ACTIVE_STEP_TIMEOUT_MARKER:-}" ]; then
+    rm -f "${ACTIVE_STEP_TIMEOUT_MARKER}" 2>/dev/null || true
+    ACTIVE_STEP_TIMEOUT_MARKER=""
+  fi
+}
+
+_spawn_in_new_pgid() {
+  local out_file="$1" py=""
+  shift
+  py=$(_resolve_deploy_python) || return 1
+  "$py" -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@" 9>&- >"$out_file" 2>&1 &
+  ACTIVE_STEP_CHILD_PID=$!
+  ACTIVE_STEP_PGID="$ACTIVE_STEP_CHILD_PID"
+}
+
+_run_cmd_in_pgid_with_timeout() {
+  local timeout_sec="${1:-120}" ignore_signals="${2:-0}" out_file="$3"
+  shift 3
+  local py="" marker="" rc=0 timed_out=0 child_pid="" child_pgid=""
+  py=$(_resolve_deploy_python) || return 1
+  marker=$(mktemp "${TMPDIR:-/tmp}/dalton-step-timeout.XXXXXX") || return 1
+  rm -f "$marker"
+  ACTIVE_STEP_OUT_FILE="$out_file"
+  ACTIVE_STEP_TIMEOUT_MARKER="$marker"
+  if ! _spawn_in_new_pgid "$out_file" "$@"; then
+    ACTIVE_STEP_OUT_FILE=""
+    ACTIVE_STEP_TIMEOUT_MARKER=""
+    return 1
+  fi
+  child_pid="$ACTIVE_STEP_CHILD_PID"
+  child_pgid="${ACTIVE_STEP_PGID:-$child_pid}"
+  "$py" - "$timeout_sec" "$child_pgid" "$child_pid" "$marker" 9>&- >/dev/null 2>&1 <<'PY' &
+import os, signal, sys, time
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+try:
+    os.setsid()
+except OSError:
+    pass
+timeout_sec = float(sys.argv[1])
+pgid = int(sys.argv[2])
+pid = int(sys.argv[3])
+marker = sys.argv[4]
+
+def _alive() -> bool:
+    for fn, target in ((os.killpg, pgid), (os.kill, pid)):
+        try:
+            fn(target, 0)
+            return True
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return True
+    return False
+
+deadline = time.monotonic() + timeout_sec
+while time.monotonic() < deadline:
+    if not _alive():
+        sys.exit(0)
+    time.sleep(min(0.05, max(0.01, deadline - time.monotonic())))
+
+if not _alive():
+    sys.exit(0)
+try:
+    with open(marker, "w", encoding="utf-8") as fh:
+        fh.write("timeout\n")
+except OSError:
+    pass
+for fn, target in ((os.killpg, pgid), (os.kill, pid)):
+    try:
+        fn(target, signal.SIGTERM)
+    except OSError:
+        pass
+term_deadline = time.monotonic() + 2.0
+while time.monotonic() < term_deadline:
+    if not _alive():
+        sys.exit(0)
+    time.sleep(0.05)
+for fn, target in ((os.killpg, pgid), (os.kill, pid)):
+    try:
+        fn(target, signal.SIGKILL)
+    except OSError:
+        pass
+kill_deadline = time.monotonic() + 5.0
+while time.monotonic() < kill_deadline:
+    if not _alive():
+        sys.exit(0)
+    time.sleep(0.05)
+PY
+  ACTIVE_STEP_WATCHDOG_PID=$!
+
+  if [ "$ignore_signals" = "1" ]; then
+    _wait_pid_ignoring_signals "$child_pid" || rc=$?
+  else
+    wait "$child_pid" || rc=$?
+  fi
+
+  if [ -f "$marker" ]; then
+    timed_out=1
+  fi
+  _stop_active_step_watchdog
+  if [ "$timed_out" = "1" ]; then
+    _terminate_active_step_pgid "$child_pid" "$child_pgid"
+    rc=124
+  fi
+  ACTIVE_STEP_CHILD_PID=""
+  ACTIVE_STEP_PGID=""
+  ACTIVE_STEP_OUT_FILE=""
+  return "$rc"
+}
+
+_terminate_active_step_pgid() {
+  local pid="${1:-}" pgid="${2:-}" py="" killer_pid=""
+  [ -n "$pid" ] || return 0
+  pgid="${pgid:-$pid}"
+  kill -TERM -- "-${pgid}" 2>/dev/null || true
+  kill -TERM "$pid" 2>/dev/null || true
+  py=$(_resolve_deploy_python 2>/dev/null || true)
+  if [ -n "$py" ]; then
+    "$py" - "$pgid" "$pid" 9>&- >/dev/null 2>&1 <<'PY' &
+import os, signal, sys, time
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+try:
+    os.setsid()
+except OSError:
+    pass
+pgid, pid = int(sys.argv[1]), int(sys.argv[2])
+time.sleep(5.0)
+for fn, target in ((os.killpg, pgid), (os.kill, pid)):
+    try:
+        fn(target, signal.SIGKILL)
+    except OSError:
+        pass
+PY
+    killer_pid=$!
+  fi
+  _wait_pid_ignoring_signals "$pid" || true
+  if [ -n "$killer_pid" ]; then
+    kill -KILL "$killer_pid" 2>/dev/null || true
+    _wait_pid_ignoring_signals "$killer_pid" || true
+  fi
+  if [ -n "$py" ]; then
+    # Run PGID reaper in its own session ignoring INT/TERM so a second multicast signal
+    # to the caller's process group cannot abort waiting for build descendants to exit.
+    "$py" - "$pgid" 9>&- >/dev/null 2>&1 <<'PY' &
+import os, signal, sys, time
+signal.signal(signal.SIGINT, signal.SIG_IGN)
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+try:
+    os.setsid()
+except OSError:
+    pass
+pgid = int(sys.argv[1])
+
+def _pgid_alive() -> bool:
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+if not _pgid_alive():
+    sys.exit(0)
+try:
+    os.killpg(pgid, signal.SIGTERM)
+except OSError:
+    pass
+deadline = time.monotonic() + 3.0
+while time.monotonic() < deadline:
+    if not _pgid_alive():
+        sys.exit(0)
+    time.sleep(0.05)
+try:
+    os.killpg(pgid, signal.SIGKILL)
+except OSError:
+    pass
+kill_deadline = time.monotonic() + 5.0
+while time.monotonic() < kill_deadline:
+    if not _pgid_alive():
+        sys.exit(0)
+    time.sleep(0.05)
+PY
+    local reaper_pid=$!
+    _wait_pid_ignoring_signals "$reaper_pid" || true
+  fi
+}
+
 _on_deploy_interrupt_signal() {
-  local sig="${1:-TERM}" code=143 gw_dir="" live_rel=""
-  trap - INT TERM
+  local sig="${1:-TERM}" code=143 gw_dir="" live_rel="" fe_cur=""
+  # Defer any subsequent INT/TERM signals so PGID cleanup and first-rollout rollback
+  # finish atomically instead of being aborted mid-way by a second signal.
+  trap '_record_deferred_signal INT' INT
+  trap '_record_deferred_signal TERM' TERM
   [ "$sig" = "INT" ] && code=130
+  if [ -n "${ACTIVE_REEXEC_CHILD_PID:-}" ]; then
+    # Backgrounded children in non-interactive shells ignore SIGINT, so always forward SIGTERM.
+    kill -TERM "${ACTIVE_REEXEC_CHILD_PID}" 2>/dev/null || true
+    _wait_pid_ignoring_signals "${ACTIVE_REEXEC_CHILD_PID}" || true
+    ACTIVE_REEXEC_CHILD_PID=""
+    if [ -n "${ACTIVE_REEXEC_TMP_DIR:-}" ] && [ -e "${ACTIVE_REEXEC_TMP_DIR}" ]; then
+      rm -rf "${ACTIVE_REEXEC_TMP_DIR}" 2>/dev/null || true
+      ACTIVE_REEXEC_TMP_DIR=""
+    fi
+    release_deploy_lock || true
+    echo "ERROR: deploy interrupted by SIG${sig} while re-executed child was running" >&2
+    exit "$code"
+  fi
+  _stop_active_step_watchdog
+  if [ -n "${ACTIVE_STEP_CHILD_PID:-}" ]; then
+    _terminate_active_step_pgid "${ACTIVE_STEP_CHILD_PID}" "${ACTIVE_STEP_PGID:-$ACTIVE_STEP_CHILD_PID}"
+    ACTIVE_STEP_CHILD_PID=""
+    ACTIVE_STEP_PGID=""
+  fi
+  if [ -n "${ACTIVE_STEP_OUT_FILE:-}" ] && [ -e "${ACTIVE_STEP_OUT_FILE}" ]; then
+    rm -f "${ACTIVE_STEP_OUT_FILE}" 2>/dev/null || true
+    ACTIVE_STEP_OUT_FILE=""
+  fi
+  if [ "${FIRST_ROLLOUT_EDGE_TOUCHED:-0}" = "1" ] && [ -n "${FIRST_ROLLOUT_ROLLBACK_PRE_FF:-}" ]; then
+    echo "ERROR: first-releases-rollout interrupted by SIG${sig} after edge recreate started; rolling edge back to web/dist (PRE_FF=${FIRST_ROLLOUT_ROLLBACK_PRE_FF})" >&2
+    ROLLBACK_IN_PROGRESS=1
+    if _rollback_first_rollout_edge "${FIRST_ROLLOUT_ROLLBACK_PRE_FF}"; then
+      FIRST_ROLLOUT_EDGE_TOUCHED=0
+      ROLLBACK_IN_PROGRESS=0
+      FIRST_ROLLOUT_ROLLBACK_PRE_FF=""
+      echo "first-releases-rollout rollback: edge restored onto web/dist after SIG${sig}"
+      release_deploy_lock || true
+      [ "${DEFERRED_SIGNAL:-}" = "INT" ] && code=130
+      [ "${DEFERRED_SIGNAL:-}" = "TERM" ] && code=143
+      exit "$code"
+    else
+      ROLLBACK_IN_PROGRESS=0
+      _mark_rollback_failed_lock "${FIRST_ROLLOUT_ROLLBACK_PRE_FF}" "interrupt_rollback_failed_SIG${sig}"
+      echo "ERROR: first-releases-rollout rollback failed after SIG${sig} (PRE_FF=${FIRST_ROLLOUT_ROLLBACK_PRE_FF}); preserving failure lock and rollback snapshot" >&2
+      _print_first_rollout_manual_recovery_steps "${FIRST_ROLLOUT_ROLLBACK_PRE_FF}"
+      exit "$code"
+    fi
+  fi
   gw_dir=$(_gateway_dir)
+  rm -f "$(_frontend_releases_dir)/current.tmp.$$" 2>/dev/null || true
+  if [ -n "${ACTIVE_FRONTEND_RELEASE_DIR:-}" ] && { [ -e "${ACTIVE_FRONTEND_RELEASE_DIR}" ] || [ -L "${ACTIVE_FRONTEND_RELEASE_DIR}" ]; }; then
+    if _is_active_frontend_release_dir "${ACTIVE_FRONTEND_RELEASE_DIR}"; then
+      fe_cur=$(_read_frontend_current_release || printf '%s' "${ACTIVE_FRONTEND_RELEASE_DIR}")
+      ACTIVE_FRONTEND_RELEASE_DIR=""
+      echo "WARN: deploy interrupted by SIG${sig}; preserving active frontend release ${fe_cur}" >&2
+    elif rm -rf "${ACTIVE_FRONTEND_RELEASE_DIR}" 2>/dev/null; then
+      ACTIVE_FRONTEND_RELEASE_DIR=""
+    else
+      echo "WARN: deploy interrupted by SIG${sig}; failed to clean up unswitched frontend release dir ${ACTIVE_FRONTEND_RELEASE_DIR}" >&2
+    fi
+  else
+    ACTIVE_FRONTEND_RELEASE_DIR=""
+  fi
   if [ -n "${ACTIVE_GATEWAY_IMPORT_TMP:-}" ] && [ -e "${ACTIVE_GATEWAY_IMPORT_TMP}" ]; then
     if rm -rf "${ACTIVE_GATEWAY_IMPORT_TMP}" 2>/dev/null; then
       ACTIVE_GATEWAY_IMPORT_TMP=""
@@ -918,6 +2402,7 @@ _on_deploy_interrupt_signal() {
       live_rel=$(readlink "${gw_dir}/.deploy-current" 2>/dev/null || printf '%s' "${ACTIVE_GATEWAY_STAGING_DIR}")
       ACTIVE_GATEWAY_STAGING_DIR=""
       STAGED_GATEWAY_RELEASE_ID=""
+      release_deploy_lock || true
       echo "ERROR: deploy interrupted by SIG${sig}; preserving active gateway release ${live_rel}" >&2
       exit "$code"
     fi
@@ -928,10 +2413,12 @@ _on_deploy_interrupt_signal() {
     else
       echo "ERROR: deploy interrupted by SIG${sig}; failed to clean up unswitched gateway staging release ${ACTIVE_GATEWAY_STAGING_DIR}" >&2
     fi
+    release_deploy_lock || true
     exit "$code"
   fi
   ACTIVE_GATEWAY_STAGING_DIR=""
   STAGED_GATEWAY_RELEASE_ID=""
+  release_deploy_lock || true
   echo "ERROR: deploy interrupted by SIG${sig}" >&2
   exit "$code"
 }
@@ -1861,9 +3348,34 @@ rollback_gateway_only() {
 }
 
 run_public_edge_check() {
-  local out rc
-  out=$(bash scripts/dalton/check_public_edge.sh 2>&1)
-  rc=$?
+  local expected_build="${1:-}" dist_dir="${2:-}" expected_release="${3:-}" out="" rc=0 out_file=""
+  local -a check_args=()
+  if [ -n "$expected_build" ]; then
+    check_args+=(--expected-build "$expected_build")
+  fi
+  if [ -n "$expected_release" ]; then
+    check_args+=(--expected-release "$expected_release")
+  fi
+  if [ -n "$dist_dir" ]; then
+    check_args+=(--dist-dir "$dist_dir")
+  elif [ -L "$(_frontend_current_link)" ]; then
+    check_args+=(--dist-dir "$(_frontend_current_link)")
+  fi
+  out_file=$(mktemp "${TMPDIR:-/tmp}/dalton-edge-check.XXXXXX") || return 1
+  ACTIVE_STEP_OUT_FILE="$out_file"
+  if [ "${#check_args[@]}" -gt 0 ]; then
+    _spawn_in_new_pgid "$out_file" bash scripts/dalton/check_public_edge.sh "${check_args[@]}" || rc=$?
+  else
+    _spawn_in_new_pgid "$out_file" bash scripts/dalton/check_public_edge.sh || rc=$?
+  fi
+  if [ "$rc" -eq 0 ]; then
+    wait "$ACTIVE_STEP_CHILD_PID" || rc=$?
+  fi
+  ACTIVE_STEP_CHILD_PID=""
+  ACTIVE_STEP_PGID=""
+  out=$(cat "$out_file" 2>/dev/null || true)
+  rm -f "$out_file"
+  ACTIVE_STEP_OUT_FILE=""
   if [ "$rc" -eq 0 ]; then
     [ -n "$out" ] && printf '%s\n' "$out" | tail -1
   else
@@ -1897,6 +3409,26 @@ PREV_GATEWAY_RELEASE_REL="${PREV_GATEWAY_RELEASE_REL:-}"
 TARGET_GATEWAY_TREE="${TARGET_GATEWAY_TREE:-}"
 PRE_FF_GATEWAY_TREE="${PRE_FF_GATEWAY_TREE:-}"
 PREV_DEPLOYED_GATEWAY_TREE="${PREV_DEPLOYED_GATEWAY_TREE:-}"
+FRONTEND_SWITCHED="${FRONTEND_SWITCHED:-0}"
+FRONTEND_REVERT_STATE="${FRONTEND_REVERT_STATE:-not_switched}"
+FRONTEND_CARRY_OVER_FAILED="${FRONTEND_CARRY_OVER_FAILED:-0}"
+ACTIVE_FRONTEND_RELEASE_DIR="${ACTIVE_FRONTEND_RELEASE_DIR:-}"
+NEW_FRONTEND_RELEASE_ID="${NEW_FRONTEND_RELEASE_ID:-}"
+PREV_FRONTEND_RELEASE_ID="${PREV_FRONTEND_RELEASE_ID:-}"
+FIRST_ROLLOUT_EDGE_TOUCHED=0
+FIRST_ROLLOUT_ROLLBACK_PRE_FF=""
+DEFERRED_SIGNAL=""
+ROLLBACK_IN_PROGRESS=0
+DEPLOY_BACKUP_STATUS="${DEPLOY_BACKUP_STATUS:-}"
+DEPLOY_TARGET_HEADS="${DEPLOY_TARGET_HEADS:-}"
+DEPLOY_FF_DONE="${DEPLOY_FF_DONE:-0}"
+DEPLOY_LOCK_OWNED=0
+_ENSURED_LOCAL_LOCK=0
+ACTIVE_REEXEC_CHILD_PID=""
+ACTIVE_REEXEC_TMP_DIR=""
+ACTIVE_STEP_CHILD_PID=""
+ACTIVE_STEP_PGID=""
+ACTIVE_STEP_OUT_FILE=""
 
 _print_manual_revert_instructions() {
   local cur_head="$1" cur_dalton_rev="$2" cur_upstream_rev="$3"
@@ -2049,8 +3581,13 @@ _print_manual_revert_instructions() {
   elif [ -z "$recommended_commit" ]; then
     echo "   请把 RESET_SHA 设为两条链 head 均等于数据库版本的提交（替换 <已核对一致的提交>）；确认一致前先不要重启后端。"
   fi
-  echo "8. 【方案 B】确认 7b 比对一致后，先将当前部署脚本备份到 /tmp/dalton_deploy_main.sh（防止复位到较早的 RESET_SHA 后工作区脚本尚无网关辅助函数），再复位代码、重建前端、处理渠道网关产物，并强制重建容器（后端仍处于停止状态才执行）："
-  echo "     cp scripts/dalton/ops/prod/deploy_main.sh /tmp/dalton_deploy_main.sh && git reset --keep \"\$RESET_SHA\" && (cd web && pnpm install --frozen-lockfile) && bash scripts/dalton/build_frontend_prod.sh --require-supabase"
+  echo "8. 【方案 B】确认 7b 比对一致后，先将当前部署脚本备份到 /tmp/dalton_deploy_main.sh（防止复位到较早的 RESET_SHA 后工作区脚本尚无前端/网关辅助函数），再复位代码、切换或重建前端版本目录、处理渠道网关产物，并强制重建容器（后端仍处于停止状态才执行）："
+  echo "     cp scripts/dalton/ops/prod/deploy_main.sh /tmp/dalton_deploy_main.sh && git reset --keep \"\$RESET_SHA\" && (cd web && pnpm install --frozen-lockfile)"
+  echo "   前端版本目录状态: current=$(_read_frontend_current_release || echo 未设置), prev=${PREV_FRONTEND_RELEASE_ID:-无}, new=${NEW_FRONTEND_RELEASE_ID:-无}（目录位于 web/releases/，旧版本已保留）。"
+  echo "   若 web/releases/ 中已有与 \$RESET_SHA 对应的版本目录，直接原子切换 current；否则在复位后的代码上新建版本目录并切换（若 \$RESET_SHA 仍使用旧版 web/dist 挂载，则改跑 bash scripts/dalton/build_frontend_prod.sh --require-supabase）："
+  echo "     DALTON_REPO_ROOT=\"${REPO_ROOT}\" DALTON_DEPLOY_LIB_ONLY=1 bash -c 'source /tmp/dalton_deploy_main.sh && manual_switch_frontend_release \"<版本目录名>\"'"
+  echo "     # 或在复位后的代码上新建版本目录并原子切换："
+  echo "     DALTON_REPO_ROOT=\"${REPO_ROOT}\" DALTON_DEPLOY_LIB_ONLY=1 bash -c 'source /tmp/dalton_deploy_main.sh && manual_build_frontend_release'"
   if [ "${GATEWAY_REVERT_STATE:-not_switched}" = "reverted" ]; then
     echo "   渠道网关已在回退阶段自动换回至上一版 release（gateway_revert_state=reverted；实际恢复的网关树哈希=${actual_gw_tree:-未知}；${pending_note}）：请对比 git rev-parse \"\${RESET_SHA}:integrations/dalton-channel-gateway\" 与该实际恢复树哈希 (${actual_gw_tree:-未知})；仅当实际恢复树哈希已知、两者相等且无 .deploy-gateway-pending 时无需重建，否则在复位后的代码上使用独立目录重建并原子切换（加载 reset 前备份的 /tmp/dalton_deploy_main.sh）："
     echo "     DALTON_REPO_ROOT=\"${REPO_ROOT}\" DALTON_DEPLOY_LIB_ONLY=1 bash -c 'source /tmp/dalton_deploy_main.sh && manual_rebuild_gateway_release'"
@@ -2104,14 +3641,37 @@ _can_auto_revert_to_pre_ff() {
 # MIGRATING_DEPLOY=0 and PRE_FF's migration heads match the pre-deploy DB revisions; otherwise
 # it aborts automatic code reset and prints manual instructions.
 revert_deploy() {
-  local need_post_health=0 build_out build_rc post_ok=1 cur_head gw_dir=""
-  local cur_dalton_rev="" cur_upstream_rev=""
+  local need_post_health=0 post_ok=1 cur_head gw_dir="" rel_dir="" revert_expected_build=""
+  local cur_dalton_rev="" cur_upstream_rev="" fe_was_switched="${FRONTEND_SWITCHED:-0}"
   local -a failed_steps=()
 
   gw_dir=$(_gateway_dir)
+  rel_dir=$(_frontend_releases_dir)
   GATEWAY_REVERT_STATE="not_switched"
   GATEWAY_REVERT_KICKSTART_OK=0
   GATEWAY_REVERT_HEALTH_OK=0
+  FRONTEND_REVERT_STATE="not_switched"
+
+  # Restore frontend symlink BEFORE checking _can_auto_revert_to_pre_ff and BEFORE
+  # git reset --keep, so neither migration protection nor a git reset failure can leave
+  # an unverified new release live or delete the previous release directory.
+  if [ "$fe_was_switched" = "1" ]; then
+    echo "$(date '+%T') reverting frontend web/releases/current"
+    if restore_frontend_from_prev; then
+      echo "frontend current atomically restored to web/releases/${PREV_FRONTEND_RELEASE_ID}"
+    else
+      echo "WARN: frontend restore to previous release failed (preserving web/releases/${PREV_FRONTEND_RELEASE_ID:-unknown} and web/releases/${NEW_FRONTEND_RELEASE_ID:-unknown})"
+      post_ok=0
+      failed_steps+=("frontend_revert")
+    fi
+  elif [ -n "${ACTIVE_FRONTEND_RELEASE_DIR:-}" ]; then
+    if ! cleanup_frontend_staging; then
+      echo "WARN: failed to remove unswitched frontend release directory"
+      post_ok=0
+      failed_steps+=("frontend_staging_cleanup")
+    fi
+  fi
+
   if [ "$GATEWAY_SWITCHED" = "1" ]; then
     echo "$(date '+%T') reverting channel gateway"
     if restore_gateway_from_prev; then
@@ -2139,6 +3699,7 @@ revert_deploy() {
   fi
 
   if ! _can_auto_revert_to_pre_ff; then
+    # Preserve both previous and new frontend release directories for operator inspection/choice.
     if [ "$GATEWAY_SWITCHED" = "1" ] && [ "$GATEWAY_REVERT_STATE" = "reverted" ] && [ "$GATEWAY_REVERT_KICKSTART_OK" = "1" ]; then
       if wait_gateway_health; then
         GATEWAY_REVERT_HEALTH_OK=1
@@ -2155,13 +3716,13 @@ revert_deploy() {
     return 1
   fi
 
-  if [ "$BACKEND_TOUCHED" = "1" ] || [ "$CRAWLER_TOUCHED" = "1" ] || [ "$EDGE_TOUCHED" = "1" ] || [ "$GATEWAY_SWITCHED" = "1" ]; then
+  if [ "$BACKEND_TOUCHED" = "1" ] || [ "$CRAWLER_TOUCHED" = "1" ] || [ "$EDGE_TOUCHED" = "1" ] || [ "$GATEWAY_SWITCHED" = "1" ] || [ "$fe_was_switched" = "1" ]; then
     need_post_health=1
   fi
   git update-index -q --refresh
   if ! git reset -q --keep "$PRE_FF"; then
     cur_head=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
-    echo "CODE REVERT FAILED — 代码未能恢复，需人工处理 (HEAD=${cur_head}, PRE_FF=${PRE_FF}; manual: git update-index --refresh && git reset --keep $PRE_FF)"
+    echo "CODE REVERT FAILED — 代码未能恢复，需人工处理 (HEAD=${cur_head}, PRE_FF=${PRE_FF}; frontend_current=$(_read_frontend_current_release || echo 未设置), prev_release=${PREV_FRONTEND_RELEASE_ID:-无}; manual: git update-index --refresh && git reset --keep $PRE_FF)"
     return 1
   fi
   cur_head=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
@@ -2179,14 +3740,22 @@ revert_deploy() {
     post_ok=0
     failed_steps+=("pnpm_install")
   fi
-  build_out=$(bash scripts/dalton/build_frontend_prod.sh --require-supabase 2>&1)
-  build_rc=$?
-  if [ "$build_rc" -eq 0 ] && grep -q "OK: Production bundle" <<<"$build_out"; then
-    echo "reverted to $(git rev-parse --short=9 HEAD), old frontend rebuilt"
+  if [ "$fe_was_switched" = "1" ]; then
+    if [ "$FRONTEND_REVERT_STATE" = "reverted" ]; then
+      if [ "${FRONTEND_CARRY_OVER_FAILED:-0}" = "1" ]; then
+        echo "WARN: preserving web/releases/${NEW_FRONTEND_RELEASE_ID:-unknown} because carrying over outgoing assets into ${PREV_FRONTEND_RELEASE_ID} failed"
+        post_ok=0
+        failed_steps+=("frontend_asset_carryover")
+      elif [ -n "${NEW_FRONTEND_RELEASE_ID:-}" ] && [ "${NEW_FRONTEND_RELEASE_ID}" != "${PREV_FRONTEND_RELEASE_ID:-}" ] \
+         && ! _is_active_frontend_release_dir "${rel_dir}/${NEW_FRONTEND_RELEASE_ID}"; then
+        rm -rf "${rel_dir}/${NEW_FRONTEND_RELEASE_ID}" 2>/dev/null || true
+      fi
+      echo "reverted to $(git rev-parse --short=9 HEAD), frontend current restored to web/releases/${PREV_FRONTEND_RELEASE_ID}"
+    else
+      echo "OLD FRONTEND RESTORE FAILED"
+    fi
   else
-    echo "OLD FRONTEND REBUILD FAILED"
-    post_ok=0
-    failed_steps+=("frontend_build")
+    echo "reverted to $(git rev-parse --short=9 HEAD), previous frontend release preserved"
   fi
   if [ "$BACKEND_TOUCHED" = "1" ]; then
     echo "$(date '+%T') reverting backend"
@@ -2255,7 +3824,13 @@ revert_deploy() {
         failed_steps+=("edge_ready")
       fi
     fi
-    if run_public_edge_check; then
+    revert_expected_build=""
+    local revert_expected_release=""
+    if [ -n "${PREV_FRONTEND_RELEASE_ID:-}" ] && [ -s "${rel_dir}/${PREV_FRONTEND_RELEASE_ID}/version.json" ]; then
+      revert_expected_build=$(_read_frontend_build_id "${rel_dir}/${PREV_FRONTEND_RELEASE_ID}" || true)
+      revert_expected_release=$(_read_frontend_release_tag "${rel_dir}/${PREV_FRONTEND_RELEASE_ID}" || true)
+    fi
+    if run_public_edge_check "$revert_expected_build" "" "$revert_expected_release"; then
       echo "POST-REVERT CHECK: public edge check OK"
     else
       echo "POST-REVERT CHECK: public edge check FAILED"
@@ -2284,7 +3859,7 @@ revert_deploy() {
     if [ "$need_post_health" = "1" ]; then
       echo "POST-REVERT HEALTH REPORT: all revert steps and post-revert checks passed"
     elif [ "${GATEWAY_BUILD_FAILED:-0}" = "1" ]; then
-      echo "POST-REVERT REPORT: code and frontend reverted (网关未切换，生产目录未改动)"
+      echo "POST-REVERT REPORT: code reverted, old frontend preserved (网关未切换，生产目录未改动)"
     else
       echo "POST-REVERT REPORT: all revert steps passed"
     fi
@@ -2662,147 +4237,761 @@ ensure_everflow_host_platform_env() {
   return 0
 }
 
+_acquire_deploy_lock() {
+  local lock_file="${DEPLOY_LOCK_FILE}" lock_dir="" py=""
+  if [ -z "$lock_file" ]; then
+    echo "ERROR: DEPLOY_LOCK_FILE is empty" >&2
+    return 1
+  fi
+  if [ -f "${lock_file}.rollback-failed" ]; then
+    echo "ERROR: deploy blocked because previous first-releases-rollout rollback failed (${lock_file}.rollback-failed):" >&2
+    cat "${lock_file}.rollback-failed" >&2 2>/dev/null || true
+    echo "Resolve edge recovery manually and remove ${lock_file}.rollback-failed before re-running deploy." >&2
+    return 1
+  fi
+  lock_dir=$(dirname "$lock_file")
+  if ! mkdir -p "$lock_dir" 2>/dev/null; then
+    echo "ERROR: failed to create deploy lock directory ${lock_dir}" >&2
+    return 1
+  fi
+  py=$(_resolve_deploy_python) || return 1
+  if ! exec 9<>"$lock_file"; then
+    echo "ERROR: failed to open deploy lock file ${lock_file}" >&2
+    return 1
+  fi
+  if ! "$py" - "$lock_file" "$$" "$REPO_ROOT" <<'PY'
+import datetime
+import fcntl
+import os
+import sys
+
+lock_file, pid_str, repo_root = sys.argv[1:4]
+sentinel = f"{lock_file}.rollback-failed"
+try:
+    fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    holder = ""
+    try:
+        with open(lock_file, encoding="utf-8") as fh:
+            holder = fh.read().strip()
+    except OSError:
+        holder = ""
+    detail = f" ({holder})" if holder else ""
+    print(f"ERROR: another deploy is already running; lock held on {lock_file}{detail}", file=sys.stderr)
+    sys.exit(1)
+
+# Re-check rollback failure state AFTER acquiring flock so a concurrent process cannot
+# slip past the pre-lock check while a failed rollback is writing the failure marker.
+existing = os.pread(9, 1024, 0).decode("utf-8", errors="replace")
+if os.path.exists(sentinel) or "state=rollback_failed" in existing:
+    print(f"ERROR: deploy blocked because previous first-releases-rollout rollback failed ({sentinel}):", file=sys.stderr)
+    if os.path.exists(sentinel):
+        try:
+            print(open(sentinel, encoding="utf-8").read().strip(), file=sys.stderr)
+        except OSError:
+            pass
+    elif existing.strip():
+        print(existing.strip(), file=sys.stderr)
+    print(f"Resolve edge recovery manually and remove {sentinel} (and clear {lock_file}) before re-running deploy.", file=sys.stderr)
+    sys.exit(1)
+
+os.ftruncate(9, 0)
+os.lseek(9, 0, os.SEEK_SET)
+ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+os.write(9, f"pid={pid_str} started={ts} repo={repo_root}\n".encode("utf-8"))
+os.fsync(9)
+PY
+  then
+    exec 9>&-
+    return 1
+  fi
+  DEPLOY_LOCK_OWNED=1
+  export DALTON_DEPLOY_LOCK_HELD_FD=9
+  export DALTON_DEPLOY_LOCK_FILE="$lock_file"
+  export DALTON_DEPLOY_LOCK_OWNER_PID="$$"
+  return 0
+}
+
+_mark_rollback_failed_lock() {
+  local pre_ff_sha="${1:-unknown}" reason="${2:-rollback_failed}"
+  local lock_file="${DEPLOY_LOCK_FILE}" sentinel="" rollback_dir="" ts="" py="" payload="" write_err=0
+  sentinel="${lock_file}.rollback-failed"
+  rollback_dir="${FIRST_ROLLOUT_ROLLBACK_DIR:-$(_first_rollout_rollbacks_root)}"
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo unknown)"
+  payload=$(printf 'state=rollback_failed\ntimestamp=%s\npid=%s\nrepo=%s\npre_ff=%s\nreason=%s\nrollback_dir=%s\n' \
+    "$ts" "$$" "$REPO_ROOT" "$pre_ff_sha" "$reason" "$rollback_dir")
+  # Persist rollback-failed state directly into the already-open lock FD 9 first (resilient
+  # even if creating a new sentinel file fails), then also write the .rollback-failed sentinel.
+  py=$(_resolve_deploy_python 2>/dev/null || true)
+  if [ -n "$py" ]; then
+    if ! "$py" - "$payload" <<'PY'
+import os, sys
+data = (sys.argv[1] + "\n").encode("utf-8")
+os.ftruncate(9, 0)
+os.lseek(9, 0, os.SEEK_SET)
+os.write(9, data)
+os.fsync(9)
+PY
+    then
+      echo "ERROR: failed to persist rollback_failed state to lock fd 9 (${lock_file})" >&2
+      write_err=1
+    fi
+  fi
+  if ! mkdir -p "$(dirname "$sentinel")" 2>/dev/null || ! printf '%s\n' "$payload" > "$sentinel"; then
+    echo "ERROR: failed to write rollback failure sentinel ${sentinel}; manual recovery required before unlocking ${lock_file}" >&2
+    write_err=1
+  fi
+  return "$write_err"
+}
+
+_print_first_rollout_manual_recovery_steps() {
+  local pre_ff_sha="${1:-unknown}" rollback_dir="" sentinel="" proj="" proj_flag=""
+  rollback_dir="${FIRST_ROLLOUT_ROLLBACK_DIR:-$(_first_rollout_rollbacks_root)}"
+  sentinel="${DEPLOY_LOCK_FILE}.rollback-failed"
+  if [ -s "${rollback_dir}/project.name" ]; then
+    proj=$(cat "${rollback_dir}/project.name" 2>/dev/null || true)
+  fi
+  [ -n "$proj" ] && proj_flag="-p ${proj} "
+  echo "FIRST-ROLLOUT ROLLBACK FAILED — 保留故障锁 (${sentinel} 与 ${DEPLOY_LOCK_FILE}) 及已解析回退快照 (${rollback_dir}/resolved-compose.yml)，请按以下步骤人工恢复："
+  echo "1. 检查 edge 容器状态与日志："
+  echo "     docker ps -a --filter name=dalton-langalpha-edge-1"
+  echo "     docker logs --tail 100 dalton-langalpha-edge-1"
+  echo "2. 在部署检出根目录 (${REPO_ROOT}) 使用冻结的解析后快照把 edge 挂回 web/dist（web/dist 保持完整）："
+  echo "     cd ${REPO_ROOT}"
+  echo "     docker compose ${proj_flag}--project-directory ${REPO_ROOT} -f ${rollback_dir}/resolved-compose.yml up -d --no-deps --force-recreate edge"
+  echo "3. 验证旧站点 HTTP 正常后，移除故障锁标记与锁文件再继续后续部署："
+  echo "     curl -fsS -m3 http://127.0.0.1:${EDGE_PORT}/ >/dev/null && echo edge-ok"
+  echo "     rm -f ${sentinel} ${DEPLOY_LOCK_FILE}"
+}
+
+_verify_inherited_deploy_lock() {
+  local lock_file="${DEPLOY_LOCK_FILE}" py=""
+  if [ "${DALTON_DEPLOY_LOCK_HELD_FD:-}" != "9" ] || [ -z "$lock_file" ]; then
+    echo "ERROR: re-executed deploy missing inherited deploy lock (DALTON_DEPLOY_LOCK_HELD_FD=${DALTON_DEPLOY_LOCK_HELD_FD:-unset})" >&2
+    return 1
+  fi
+  if [ -z "${DALTON_DEPLOY_LOCK_OWNER_PID:-}" ]; then
+    echo "ERROR: re-executed deploy missing DALTON_DEPLOY_LOCK_OWNER_PID from parent script; aborting resume — please re-run deploy_main.sh directly." >&2
+    return 1
+  fi
+  py=$(_resolve_deploy_python) || return 1
+  "$py" - "$lock_file" "${DALTON_DEPLOY_LOCK_OWNER_PID}" <<'PY'
+import os
+import sys
+
+lock_file, owner_raw = sys.argv[1:3]
+try:
+    owner_pid = int(owner_raw)
+    os.kill(owner_pid, 0)
+except Exception as exc:
+    print(f"ERROR: inherited DALTON_DEPLOY_LOCK_OWNER_PID={owner_raw!r} invalid: {exc}; please re-run deploy_main.sh directly.", file=sys.stderr)
+    sys.exit(1)
+try:
+    fd_st = os.fstat(9)
+    path_st = os.stat(lock_file)
+except OSError as exc:
+    print(f"ERROR: inherited deploy lock fd 9 invalid for {lock_file}: {exc}", file=sys.stderr)
+    sys.exit(1)
+if (fd_st.st_dev, fd_st.st_ino) != (path_st.st_dev, path_st.st_ino):
+    print(f"ERROR: inherited deploy lock fd 9 does not match {lock_file}", file=sys.stderr)
+    sys.exit(1)
+content = os.pread(9, 1024, 0).decode("utf-8", errors="replace")
+if f"pid={owner_pid}" not in content:
+    print(f"ERROR: inherited deploy lock fd 9 does not match DALTON_DEPLOY_LOCK_OWNER_PID={owner_pid}; please re-run deploy_main.sh directly.", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+release_deploy_lock() {
+  if [ "${DEPLOY_LOCK_OWNED:-0}" = "1" ]; then
+    exec 9>&-
+    DEPLOY_LOCK_OWNED=0
+    unset DALTON_DEPLOY_LOCK_HELD_FD
+    unset DALTON_DEPLOY_LOCK_OWNER_PID
+  fi
+  return 0
+}
+
+_ensure_deploy_lock_held() {
+  _ENSURED_LOCAL_LOCK=0
+  if [ "${DEPLOY_LOCK_OWNED:-0}" = "1" ]; then
+    return 0
+  fi
+  if [ "${DALTON_DEPLOY_LOCK_HELD_FD:-}" = "9" ] && _verify_inherited_deploy_lock 2>/dev/null; then
+    return 0
+  fi
+  _acquire_deploy_lock || return 1
+  _ENSURED_LOCAL_LOCK=1
+  return 0
+}
+
+_file_sha256() {
+  local f="${1:-}" out="" py=""
+  [ -n "$f" ] && [ -f "$f" ] && [ -r "$f" ] || return 1
+  if command -v shasum >/dev/null 2>&1; then
+    out=$(shasum -a 256 "$f" 2>/dev/null) || return 1
+    out="${out%%[[:space:]]*}"
+    [ -n "$out" ] || return 1
+    printf '%s' "$out"
+    return 0
+  elif command -v sha256sum >/dev/null 2>&1; then
+    out=$(sha256sum "$f" 2>/dev/null) || return 1
+    out="${out%%[[:space:]]*}"
+    [ -n "$out" ] || return 1
+    printf '%s' "$out"
+    return 0
+  fi
+  py=$(_resolve_deploy_python) || return 1
+  "$py" -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest(), end="")' "$f"
+}
+
+_write_deploy_reexec_state() {
+  local state_file="${1:-}"
+  [ -n "$state_file" ] || return 1
+  {
+    printf 'DEPLOY_RESUME_PROTOCOL=%s\n' "${DEPLOY_RESUME_PROTOCOL}"
+    printf 'DEPLOY_FF_DONE=%s\n' "${DEPLOY_FF_DONE:-1}"
+    printf 'PRE_FF=%s\n' "${PRE_FF:-}"
+    printf 'TARGET=%s\n' "${TARGET:-}"
+    printf 'PRE_FF_DALTON_REV=%s\n' "${PRE_FF_DALTON_REV:-}"
+    printf 'PRE_FF_UPSTREAM_REV=%s\n' "${PRE_FF_UPSTREAM_REV:-}"
+    printf 'DEPLOY_TARGET_HEADS=%s\n' "${DEPLOY_TARGET_HEADS:-}"
+    printf 'DEPLOY_BACKUP_STATUS=%s\n' "${DEPLOY_BACKUP_STATUS:-}"
+    printf 'HAD_PREEXISTING_GATEWAY_PENDING=%s\n' "${HAD_PREEXISTING_GATEWAY_PENDING:-0}"
+    printf 'PREV_DEPLOYED_GATEWAY_TREE=%s\n' "${PREV_DEPLOYED_GATEWAY_TREE:-}"
+    printf 'TARGET_GATEWAY_TREE=%s\n' "${TARGET_GATEWAY_TREE:-}"
+    printf 'PRE_FF_GATEWAY_TREE=%s\n' "${PRE_FF_GATEWAY_TREE:-}"
+    printf 'DEPLOY_GATEWAY=%s\n' "${DEPLOY_GATEWAY:-0}"
+  } > "$state_file"
+}
+
+_load_deploy_reexec_state() {
+  local state_file="${1:-}" line="" key="" val="" state_proto=""
+  if [ -z "$state_file" ] || [ ! -f "$state_file" ] || [ ! -r "$state_file" ]; then
+    echo "ERROR: re-exec state file missing or unreadable: ${state_file:-unset}" >&2
+    return 1
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    [ -n "$line" ] || continue
+    case "$line" in
+      *=*) ;;
+      *)
+        echo "ERROR: malformed line in re-exec state file: ${line}" >&2
+        return 1
+        ;;
+    esac
+    key="${line%%=*}"
+    val="${line#*=}"
+    case "$key" in
+      DEPLOY_RESUME_PROTOCOL) state_proto="$val" ;;
+      DEPLOY_FF_DONE) DEPLOY_FF_DONE="$val" ;;
+      PRE_FF) PRE_FF="$val" ;;
+      TARGET) TARGET="$val" ;;
+      PRE_FF_DALTON_REV) PRE_FF_DALTON_REV="$val" ;;
+      PRE_FF_UPSTREAM_REV) PRE_FF_UPSTREAM_REV="$val" ;;
+      DEPLOY_TARGET_HEADS) DEPLOY_TARGET_HEADS="$val" ;;
+      DEPLOY_BACKUP_STATUS) DEPLOY_BACKUP_STATUS="$val" ;;
+      HAD_PREEXISTING_GATEWAY_PENDING) HAD_PREEXISTING_GATEWAY_PENDING="$val" ;;
+      PREV_DEPLOYED_GATEWAY_TREE) PREV_DEPLOYED_GATEWAY_TREE="$val" ;;
+      TARGET_GATEWAY_TREE) TARGET_GATEWAY_TREE="$val" ;;
+      PRE_FF_GATEWAY_TREE) PRE_FF_GATEWAY_TREE="$val" ;;
+      DEPLOY_GATEWAY) DEPLOY_GATEWAY="$val" ;;
+      *)
+        echo "ERROR: unknown key in re-exec state file: ${key}" >&2
+        return 1
+        ;;
+    esac
+  done < "$state_file"
+  if [ "$state_proto" != "$DEPLOY_RESUME_PROTOCOL" ]; then
+    echo "ERROR: re-exec state protocol '${state_proto:-missing}' does not match expected '${DEPLOY_RESUME_PROTOCOL}'" >&2
+    return 1
+  fi
+  if [ "${DEPLOY_FF_DONE:-0}" != "1" ] || [ -z "${PRE_FF:-}" ] || [ -z "${TARGET:-}" ] || [ -z "${DEPLOY_TARGET_HEADS:-}" ]; then
+    echo "ERROR: incomplete re-exec state file ${state_file} (ff_done=${DEPLOY_FF_DONE:-0}, pre_ff=${PRE_FF:-}, target=${TARGET:-})" >&2
+    return 1
+  fi
+  return 0
+}
+
+validate_deploy_resume_handshake() {
+  local state_file="${1:-}"
+  if [ -z "$state_file" ]; then
+    echo "ERROR: --validate-resume requires a state file path" >&2
+    return 2
+  fi
+  shift
+  if [ "${1:-}" = "--" ]; then
+    shift
+  fi
+  _load_deploy_reexec_state "$state_file" || return 1
+  parse_deploy_args "$@" || return $?
+  return 0
+}
+
+# Returns: 0 = changed (re-exec needed), 1 = unchanged (no re-exec), 2 = hash read error.
+_deploy_scripts_changed_in_target() {
+  local running_deploy_sha="${1:-}" wait_idle_in_script_dir="${2:-0}" running_wait_idle_sha="${3:-}"
+  local repo_deploy="${REPO_ROOT}/scripts/dalton/ops/prod/deploy_main.sh"
+  local repo_wait_idle="${REPO_ROOT}/scripts/dalton/ops/prod/wait_backend_idle.sh"
+  local target_deploy_sha="" target_wait_idle_sha=""
+  [ -f "$repo_deploy" ] || return 1
+  if [ -z "$running_deploy_sha" ]; then
+    echo "ERROR: missing startup sha256 for running deploy_main.sh" >&2
+    return 2
+  fi
+  if ! target_deploy_sha=$(_file_sha256 "$repo_deploy"); then
+    echo "ERROR: failed to compute sha256 for ${repo_deploy}" >&2
+    return 2
+  fi
+  if [ "$running_deploy_sha" != "$target_deploy_sha" ]; then
+    return 0
+  fi
+  if [ "$wait_idle_in_script_dir" = "1" ] && [ -f "$repo_wait_idle" ]; then
+    if [ -z "$running_wait_idle_sha" ]; then
+      echo "ERROR: missing startup sha256 for running wait_backend_idle.sh" >&2
+      return 2
+    fi
+    if ! target_wait_idle_sha=$(_file_sha256 "$repo_wait_idle"); then
+      echo "ERROR: failed to compute sha256 for ${repo_wait_idle}" >&2
+      return 2
+    fi
+    if [ "$running_wait_idle_sha" != "$target_wait_idle_sha" ]; then
+      return 0
+    fi
+  elif [ "$WAIT_IDLE_SCRIPT" = "${SCRIPT_DIR}/wait_backend_idle.sh" ] && [ ! -f "$WAIT_IDLE_SCRIPT" ] && [ -f "$repo_wait_idle" ]; then
+    return 0
+  fi
+  return 1
+}
+
+_stop_on_reexec_handshake_failure() {
+  local msg="${1:-re-exec handshake failed}" cur_head="" cur_dalton_rev="" cur_upstream_rev=""
+  echo "ERROR: ${msg}; stopping without executing target deploy_main.sh (services and frontend untouched)" >&2
+  cur_head=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+  cur_dalton_rev=$(get_dalton_alembic_version || true)
+  cur_upstream_rev=$(get_upstream_alembic_version || true)
+  _print_manual_revert_instructions "$cur_head" "$cur_dalton_rev" "$cur_upstream_rev"
+  release_deploy_lock || true
+  trap - INT TERM
+  return 1
+}
+
 run_deploy_main() {
   local LOG before after out build_rc cur reused target_heads post_ff_head pre_restart_heads gw_diff_rc gw_rev_rc gw_tree_write_ok=0
+  local running_deploy_sha="" running_wait_idle_sha="" wait_idle_in_script_dir=0 scripts_changed_rc=0
+  local reexec_tmp="" state_file="" reexec_rc=0 child_proto="" short_target="" expected_build="" expected_release="" rel_dir="" cur_fe_rel=""
+  local -a orig_args=("$@")
+
+  # Anti-reentry marker and state file must always be paired.
+  if { [ -n "${DALTON_DEPLOY_REEXECED:-}" ] && [ -z "${DALTON_DEPLOY_STATE_FILE:-}" ]; } \
+     || { [ -z "${DALTON_DEPLOY_REEXECED:-}" ] && [ -n "${DALTON_DEPLOY_STATE_FILE:-}" ]; }; then
+    echo "ERROR: DALTON_DEPLOY_REEXECED and DALTON_DEPLOY_STATE_FILE must be set together (got reexeced='${DALTON_DEPLOY_REEXECED:-}', state_file='${DALTON_DEPLOY_STATE_FILE:-}')" >&2
+    exit 2
+  fi
+
   parse_deploy_args "$@" || exit $?
   cd "$REPO_ROOT" || exit 1
+  ACTIVE_FRONTEND_RELEASE_DIR=""
+  NEW_FRONTEND_RELEASE_ID=""
+  PREV_FRONTEND_RELEASE_ID=""
+  FRONTEND_SWITCHED=0
+  FRONTEND_REVERT_STATE="not_switched"
   ACTIVE_GATEWAY_STAGING_DIR=""
   ACTIVE_GATEWAY_IMPORT_TMP=""
   STAGED_GATEWAY_RELEASE_ID=""
+  ACTIVE_REEXEC_CHILD_PID=""
+  ACTIVE_REEXEC_TMP_DIR=""
+  DEPLOY_LOCK_OWNED=0
   trap '_on_deploy_interrupt_signal INT' INT
   trap '_on_deploy_interrupt_signal TERM' TERM
-  cleanup_old_container_logs
-  TARGET=""
-  bash "$WAIT_IDLE_SCRIPT" || { echo "still busy, abort"; exit 1; }
-  PRE_FF_DALTON_REV=$(get_dalton_alembic_version || true)
-  PRE_FF_UPSTREAM_REV=$(get_upstream_alembic_version || true)
-  echo "pre-deploy migrations: dalton=${PRE_FF_DALTON_REV:-未能读取}, upstream=${PRE_FF_UPSTREAM_REV:-未能读取}"
-  if [ -z "$PRE_FF_DALTON_REV" ] || [ -z "$PRE_FF_UPSTREAM_REV" ]; then
-    echo "pre-deploy migrations: DB version unreadable; treating as migrating deploy (fresh backup required, no auto-revert)"
-  fi
-  git fetch -q origin || { echo "git fetch failed, abort"; exit 1; }
-  TARGET=$(git rev-parse --verify origin/dalton/main 2>/dev/null) || { echo "cannot resolve origin/dalton/main, abort"; exit 1; }
-  echo "deploy target: ${TARGET} ($(git log -1 --oneline "$TARGET" 2>/dev/null || printf '%s' "$TARGET"))"
-  if ! git merge-base --is-ancestor HEAD "$TARGET" 2>/dev/null; then
-    echo "ERROR: 生产检出上有不在 origin/dalton/main 里的提交，先处理再部署 (HEAD=$(git rev-parse --short=9 HEAD 2>/dev/null || echo unknown), TARGET=${TARGET})" >&2
-    exit 1
-  fi
-  check_clean_migration_dirs || exit 1
-  target_heads=$(target_migration_heads "$TARGET") || { echo "ERROR: failed to resolve unique migration heads for target ${TARGET}, abort" >&2; exit 1; }
-  echo "target migration heads: ${target_heads}"
-  LOG="${DALTON_PG_BACKUP_LOG:-$HOME/Library/Logs/dalton-pg-backup.log}"; before=$(tail -1 "$LOG" 2>/dev/null)
-  reused=""
-  if [ -n "$REUSE_BACKUP_MIN" ] && no_pending_migrations "$TARGET"; then
-    reused=$(recent_ok_backup "$LOG" "$REUSE_BACKUP_MIN" "$(date +%s)") || reused=""
-  fi
-  if [ -n "$reused" ]; then
-    echo "backup: reusing (no migrations to deploy, dump within ${REUSE_BACKUP_MIN} min): $reused"
+
+  if [ -n "${DALTON_DEPLOY_REEXECED:-}" ] && [ -n "${DALTON_DEPLOY_STATE_FILE:-}" ]; then
+    _verify_inherited_deploy_lock || exit 1
+    _load_deploy_reexec_state "$DALTON_DEPLOY_STATE_FILE" || exit 1
+    if [ "$DALTON_DEPLOY_REEXECED" != "$TARGET" ]; then
+      echo "ERROR: DALTON_DEPLOY_REEXECED (${DALTON_DEPLOY_REEXECED}) does not match state TARGET (${TARGET})" >&2
+      exit 1
+    fi
+    post_ff_head=$(git rev-parse HEAD 2>/dev/null || true)
+    if [ "$post_ff_head" != "$TARGET" ]; then
+      echo "ERROR: resumed HEAD (${post_ff_head:-unknown}) does not match TARGET (${TARGET})" >&2
+      exit 1
+    fi
+    target_heads="$DEPLOY_TARGET_HEADS"
+    MIGRATING_DEPLOY=1
+    BACKEND_TOUCHED=0
+    CRAWLER_TOUCHED=0
+    EDGE_TOUCHED=0
+    BRIDGE_TOUCHED=0
+    GATEWAY_SWITCHED=0
+    GATEWAY_BUILD_FAILED=0
+    GATEWAY_REVERT_STATE="not_switched"
+    GATEWAY_REVERT_KICKSTART_OK=0
+    GATEWAY_REVERT_HEALTH_OK=0
+    GATEWAY_SWITCH_RESTORE_FAILED=0
+    ACTUAL_RESTORED_GATEWAY_TREE=""
+    echo "$(date '+%T') resumed re-executed deploy script for ${TARGET} (protocol=${DEPLOY_RESUME_PROTOCOL}, PRE_FF=${PRE_FF}, backup=${DEPLOY_BACKUP_STATUS:-done})"
   else
-    [ -n "$REUSE_BACKUP_MIN" ] && echo "backup: cannot reuse (migrations to deploy or no ok dump within ${REUSE_BACKUP_MIN} min); taking a fresh one"
-    launchctl kickstart "gui/$(id -u)/com.dalton.pg-backup"
-    for i in $(seq 1 360); do [ "$(tail -1 "$LOG" 2>/dev/null)" != "$before" ] && break; sleep 5; done  # 30 min: dumps of a 7.5G db take over 10 min
-    after=$(tail -1 "$LOG"); echo "backup: $after"
-    case "$after" in *" ok "*) [ "$after" != "$before" ] || { echo "no fresh backup, abort"; exit 1; };; *) echo "backup failed, abort"; exit 1;; esac
-  fi
-  # ff and frontend build only after the idle wait and backup, right before the restart, so the new
-  # frontend never goes live against the old backend and running code is not swapped under a busy backend.
-  PRE_FF=$(git rev-parse HEAD)
-  MIGRATING_DEPLOY=1
-  BACKEND_TOUCHED=0
-  CRAWLER_TOUCHED=0
-  EDGE_TOUCHED=0
-  BRIDGE_TOUCHED=0
-  GATEWAY_SWITCHED=0
-  GATEWAY_BUILD_FAILED=0
-  GATEWAY_REVERT_STATE="not_switched"
-  GATEWAY_REVERT_KICKSTART_OK=0
-  GATEWAY_REVERT_HEALTH_OK=0
-  GATEWAY_SWITCH_RESTORE_FAILED=0
-  HAD_PREEXISTING_GATEWAY_PENDING=0
-  ACTUAL_RESTORED_GATEWAY_TREE=""
-  TARGET_GATEWAY_TREE=""
-  PRE_FF_GATEWAY_TREE=""
-  PREV_DEPLOYED_GATEWAY_TREE=""
-  DEPLOY_GATEWAY=0
-  if [ -f "$(_gateway_pending_file)" ]; then
-    HAD_PREEXISTING_GATEWAY_PENDING=1
-  fi
-  PREV_DEPLOYED_GATEWAY_TREE=$(_read_gateway_deployed_tree || true)
-  if [ -d "$(_gateway_dir)" ] || [ -n "$PREV_DEPLOYED_GATEWAY_TREE" ] || [ "$HAD_PREEXISTING_GATEWAY_PENDING" = "1" ] || [ "$GATEWAY" = "1" ]; then
-    gw_rev_rc=0
-    TARGET_GATEWAY_TREE=$(git rev-parse "${TARGET}:integrations/dalton-channel-gateway" 2>/dev/null) || gw_rev_rc=$?
-    if [ "$gw_rev_rc" -ne 0 ] || [ -z "$TARGET_GATEWAY_TREE" ]; then
-      echo "ERROR: git rev-parse failed while checking ${TARGET}:integrations/dalton-channel-gateway (exit ${gw_rev_rc}): aborting before fast-forward (backend not restarted)" >&2
-      exit 1
-    fi
-    gw_rev_rc=0
-    PRE_FF_GATEWAY_TREE=$(git rev-parse "${PRE_FF}:integrations/dalton-channel-gateway" 2>/dev/null) || gw_rev_rc=$?
-    if [ "$gw_rev_rc" -ne 0 ] || [ -z "$PRE_FF_GATEWAY_TREE" ]; then
-      echo "ERROR: git rev-parse failed while checking ${PRE_FF}:integrations/dalton-channel-gateway (exit ${gw_rev_rc}): aborting before fast-forward (backend not restarted)" >&2
-      exit 1
-    fi
-  fi
-  if [ "$GATEWAY" = "1" ] || [ "$HAD_PREEXISTING_GATEWAY_PENDING" = "1" ]; then
-    DEPLOY_GATEWAY=1
-  else
-    gw_diff_rc=0
-    git diff --quiet "$PRE_FF" "$TARGET" -- integrations/dalton-channel-gateway/ 2>/dev/null || gw_diff_rc=$?
-    if [ "$gw_diff_rc" -ne 0 ] && [ "$gw_diff_rc" -ne 1 ]; then
-      echo "ERROR: git diff failed while checking integrations/dalton-channel-gateway/ (exit ${gw_diff_rc}): aborting before fast-forward (backend not restarted)" >&2
-      exit 1
-    fi
-    if [ "$gw_diff_rc" -eq 1 ]; then
-      DEPLOY_GATEWAY=1
-    elif [ -n "$PREV_DEPLOYED_GATEWAY_TREE" ] && [ "$PREV_DEPLOYED_GATEWAY_TREE" != "$TARGET_GATEWAY_TREE" ]; then
-      DEPLOY_GATEWAY=1
-    fi
-  fi
-  if [ "$DEPLOY_GATEWAY" = "1" ]; then
-    if ! _write_gateway_pending "${TARGET_GATEWAY_TREE:-pending}"; then
-      echo "ERROR: failed to write gateway pending marker to $(_gateway_pending_file): aborting before fast-forward (backend not restarted)" >&2
-      exit 1
-    fi
-    if [ -z "$PREV_DEPLOYED_GATEWAY_TREE" ] && [ -n "$PRE_FF_GATEWAY_TREE" ] && [ "$PRE_FF_GATEWAY_TREE" != "$TARGET_GATEWAY_TREE" ]; then
-      if ! _write_gateway_deployed_tree "$PRE_FF_GATEWAY_TREE"; then
-        echo "ERROR: failed to write pre-deploy gateway tree hash to $(_gateway_deployed_tree_file): aborting before fast-forward (backend not restarted)" >&2
+    _acquire_deploy_lock || exit 1
+    if [ -f "$SCRIPT_FILE" ]; then
+      if ! running_deploy_sha=$(_file_sha256 "$SCRIPT_FILE"); then
+        echo "ERROR: failed to compute startup sha256 for ${SCRIPT_FILE}" >&2
+        release_deploy_lock || true
         exit 1
       fi
-      PREV_DEPLOYED_GATEWAY_TREE="$PRE_FF_GATEWAY_TREE"
+    fi
+    if [ -f "$WAIT_IDLE_SCRIPT" ] && [ "$(cd "$(dirname "$WAIT_IDLE_SCRIPT")" 2>/dev/null && pwd)" = "$SCRIPT_DIR" ]; then
+      wait_idle_in_script_dir=1
+      if ! running_wait_idle_sha=$(_file_sha256 "$WAIT_IDLE_SCRIPT"); then
+        echo "ERROR: failed to compute startup sha256 for ${WAIT_IDLE_SCRIPT}" >&2
+        release_deploy_lock || true
+        exit 1
+      fi
+    fi
+    cleanup_old_container_logs
+    TARGET=""
+    DEPLOY_BACKUP_STATUS=""
+    DEPLOY_TARGET_HEADS=""
+    DEPLOY_FF_DONE=0
+    bash "$WAIT_IDLE_SCRIPT" || { echo "still busy, abort"; release_deploy_lock || true; exit 1; }
+    PRE_FF_DALTON_REV=$(get_dalton_alembic_version || true)
+    PRE_FF_UPSTREAM_REV=$(get_upstream_alembic_version || true)
+    echo "pre-deploy migrations: dalton=${PRE_FF_DALTON_REV:-未能读取}, upstream=${PRE_FF_UPSTREAM_REV:-未能读取}"
+    if [ -z "$PRE_FF_DALTON_REV" ] || [ -z "$PRE_FF_UPSTREAM_REV" ]; then
+      echo "pre-deploy migrations: DB version unreadable; treating as migrating deploy (fresh backup required, no auto-revert)"
+    fi
+    git fetch -q origin || { echo "git fetch failed, abort"; release_deploy_lock || true; exit 1; }
+    TARGET=$(git rev-parse --verify origin/dalton/main 2>/dev/null) || { echo "cannot resolve origin/dalton/main, abort"; release_deploy_lock || true; exit 1; }
+    echo "deploy target: ${TARGET} ($(git log -1 --oneline "$TARGET" 2>/dev/null || printf '%s' "$TARGET"))"
+    if ! git merge-base --is-ancestor HEAD "$TARGET" 2>/dev/null; then
+      echo "ERROR: 生产检出上有不在 origin/dalton/main 里的提交，先处理再部署 (HEAD=$(git rev-parse --short=9 HEAD 2>/dev/null || echo unknown), TARGET=${TARGET})" >&2
+      release_deploy_lock || true
+      exit 1
+    fi
+    # Transitional guard BEFORE fast-forward: when running edge still mounts legacy /srv
+    # while TARGET requires /srv-releases, stop cleanly with exit code 3 leaving HEAD,
+    # Compose, Caddyfile, working tree, and all services untouched.
+    if _edge_live_mounts_any_legacy_srv && _commit_requires_releases_mount "$TARGET"; then
+      local cur_head_pre_ff="" rollout_hint="bash scripts/dalton/ops/prod/deploy_main.sh --first-releases-rollout"
+      cur_head_pre_ff=$(git rev-parse HEAD 2>/dev/null || true)
+      if [ -n "$cur_head_pre_ff" ] && _commit_mounts_legacy_dist "$cur_head_pre_ff"; then
+        rollout_hint="${rollout_hint} --pre-ff ${cur_head_pre_ff}"
+      fi
+      echo "ERROR: running dalton-langalpha-edge-1 still mounts legacy web/dist on /srv while TARGET (${TARGET}) requires /srv-releases; aborting before fast-forward so HEAD (${cur_head_pre_ff:-unknown}), Compose, Caddyfile, and all services stay untouched. Fast-forward to ${TARGET} and run '${rollout_hint}' for the one-time transition." >&2
+      release_deploy_lock || true
+      trap - INT TERM
+      exit 3
+    fi
+    check_clean_migration_dirs || { release_deploy_lock || true; exit 1; }
+    target_heads=$(target_migration_heads "$TARGET") || { echo "ERROR: failed to resolve unique migration heads for target ${TARGET}, abort" >&2; release_deploy_lock || true; exit 1; }
+    echo "target migration heads: ${target_heads}"
+    LOG="${DALTON_PG_BACKUP_LOG:-$HOME/Library/Logs/dalton-pg-backup.log}"; before=$(tail -1 "$LOG" 2>/dev/null)
+    reused=""
+    if [ -n "$REUSE_BACKUP_MIN" ] && no_pending_migrations "$TARGET"; then
+      reused=$(recent_ok_backup "$LOG" "$REUSE_BACKUP_MIN" "$(date +%s)") || reused=""
+    fi
+    if [ -n "$reused" ]; then
+      DEPLOY_BACKUP_STATUS="reused"
+      echo "backup: reusing (no migrations to deploy, dump within ${REUSE_BACKUP_MIN} min): $reused"
+    else
+      [ -n "$REUSE_BACKUP_MIN" ] && echo "backup: cannot reuse (migrations to deploy or no ok dump within ${REUSE_BACKUP_MIN} min); taking a fresh one"
+      launchctl kickstart "gui/$(id -u)/com.dalton.pg-backup"
+      for i in $(seq 1 360); do [ "$(tail -1 "$LOG" 2>/dev/null)" != "$before" ] && break; sleep 5; done  # 30 min: dumps of a 7.5G db take over 10 min
+      after=$(tail -1 "$LOG"); echo "backup: $after"
+      case "$after" in *" ok "*) [ "$after" != "$before" ] || { echo "no fresh backup, abort"; release_deploy_lock || true; exit 1; };; *) echo "backup failed, abort"; release_deploy_lock || true; exit 1;; esac
+      DEPLOY_BACKUP_STATUS="fresh"
+    fi
+    # ff and staged builds only after the idle wait and backup, right before the restart, so the new
+    # frontend never goes live against the old backend and running code is not swapped under a busy backend.
+    PRE_FF=$(git rev-parse HEAD)
+    MIGRATING_DEPLOY=1
+    BACKEND_TOUCHED=0
+    CRAWLER_TOUCHED=0
+    EDGE_TOUCHED=0
+    BRIDGE_TOUCHED=0
+    GATEWAY_SWITCHED=0
+    GATEWAY_BUILD_FAILED=0
+    GATEWAY_REVERT_STATE="not_switched"
+    GATEWAY_REVERT_KICKSTART_OK=0
+    GATEWAY_REVERT_HEALTH_OK=0
+    GATEWAY_SWITCH_RESTORE_FAILED=0
+    HAD_PREEXISTING_GATEWAY_PENDING=0
+    ACTUAL_RESTORED_GATEWAY_TREE=""
+    TARGET_GATEWAY_TREE=""
+    PRE_FF_GATEWAY_TREE=""
+    PREV_DEPLOYED_GATEWAY_TREE=""
+    DEPLOY_GATEWAY=0
+    if [ -f "$(_gateway_pending_file)" ]; then
+      HAD_PREEXISTING_GATEWAY_PENDING=1
+    fi
+    PREV_DEPLOYED_GATEWAY_TREE=$(_read_gateway_deployed_tree || true)
+    if [ -d "$(_gateway_dir)" ] || [ -n "$PREV_DEPLOYED_GATEWAY_TREE" ] || [ "$HAD_PREEXISTING_GATEWAY_PENDING" = "1" ] || [ "$GATEWAY" = "1" ]; then
+      gw_rev_rc=0
+      TARGET_GATEWAY_TREE=$(git rev-parse "${TARGET}:integrations/dalton-channel-gateway" 2>/dev/null) || gw_rev_rc=$?
+      if [ "$gw_rev_rc" -ne 0 ] || [ -z "$TARGET_GATEWAY_TREE" ]; then
+        echo "ERROR: git rev-parse failed while checking ${TARGET}:integrations/dalton-channel-gateway (exit ${gw_rev_rc}): aborting before fast-forward (backend not restarted)" >&2
+        release_deploy_lock || true
+        exit 1
+      fi
+      gw_rev_rc=0
+      PRE_FF_GATEWAY_TREE=$(git rev-parse "${PRE_FF}:integrations/dalton-channel-gateway" 2>/dev/null) || gw_rev_rc=$?
+      if [ "$gw_rev_rc" -ne 0 ] || [ -z "$PRE_FF_GATEWAY_TREE" ]; then
+        echo "ERROR: git rev-parse failed while checking ${PRE_FF}:integrations/dalton-channel-gateway (exit ${gw_rev_rc}): aborting before fast-forward (backend not restarted)" >&2
+        release_deploy_lock || true
+        exit 1
+      fi
+    fi
+    if [ "$GATEWAY" = "1" ] || [ "$HAD_PREEXISTING_GATEWAY_PENDING" = "1" ]; then
+      DEPLOY_GATEWAY=1
+    else
+      gw_diff_rc=0
+      git diff --quiet "$PRE_FF" "$TARGET" -- integrations/dalton-channel-gateway/ 2>/dev/null || gw_diff_rc=$?
+      if [ "$gw_diff_rc" -ne 0 ] && [ "$gw_diff_rc" -ne 1 ]; then
+        echo "ERROR: git diff failed while checking integrations/dalton-channel-gateway/ (exit ${gw_diff_rc}): aborting before fast-forward (backend not restarted)" >&2
+        release_deploy_lock || true
+        exit 1
+      fi
+      if [ "$gw_diff_rc" -eq 1 ]; then
+        DEPLOY_GATEWAY=1
+      elif [ -n "$PREV_DEPLOYED_GATEWAY_TREE" ] && [ "$PREV_DEPLOYED_GATEWAY_TREE" != "$TARGET_GATEWAY_TREE" ]; then
+        DEPLOY_GATEWAY=1
+      fi
+    fi
+    if [ "$DEPLOY_GATEWAY" = "1" ]; then
+      if ! _write_gateway_pending "${TARGET_GATEWAY_TREE:-pending}"; then
+        echo "ERROR: failed to write gateway pending marker to $(_gateway_pending_file): aborting before fast-forward (backend not restarted)" >&2
+        release_deploy_lock || true
+        exit 1
+      fi
+      if [ -z "$PREV_DEPLOYED_GATEWAY_TREE" ] && [ -n "$PRE_FF_GATEWAY_TREE" ] && [ "$PRE_FF_GATEWAY_TREE" != "$TARGET_GATEWAY_TREE" ]; then
+        if ! _write_gateway_deployed_tree "$PRE_FF_GATEWAY_TREE"; then
+          echo "ERROR: failed to write pre-deploy gateway tree hash to $(_gateway_deployed_tree_file): aborting before fast-forward (backend not restarted)" >&2
+          release_deploy_lock || true
+          exit 1
+        fi
+        PREV_DEPLOYED_GATEWAY_TREE="$PRE_FF_GATEWAY_TREE"
+      fi
+    fi
+    git merge -q --ff-only "$TARGET" || { echo "ff failed, abort"; release_deploy_lock || true; exit 1; }
+    post_ff_head=$(git rev-parse HEAD 2>/dev/null || true)
+    if [ "$post_ff_head" != "$TARGET" ]; then
+      echo "ERROR: post-ff HEAD (${post_ff_head:-unknown}) does not match TARGET (${TARGET}): reverting" >&2
+      MIGRATING_DEPLOY=1
+      revert_deploy
+      release_deploy_lock || true
+      exit 1
+    fi
+    DEPLOY_TARGET_HEADS="$target_heads"
+    DEPLOY_FF_DONE=1
+
+    # If TARGET updated deploy_main.sh or wait_backend_idle.sh, copy the new scripts to a fresh
+    # temp dir, verify resume protocol + args + state compatibility handshake, and hand off
+    # under the same flock fd so fixes in TARGET take effect on the same deploy.
+    scripts_changed_rc=0
+    _deploy_scripts_changed_in_target "$running_deploy_sha" "$wait_idle_in_script_dir" "$running_wait_idle_sha" || scripts_changed_rc=$?
+    if [ "$scripts_changed_rc" -eq 2 ]; then
+      _stop_on_reexec_handshake_failure "failed to hash deploy scripts after fast-forward"
+      exit 1
+    elif [ "$scripts_changed_rc" -eq 0 ]; then
+      reexec_tmp=$(mktemp -d "${TMPDIR:-/tmp}/dalton-deploy-reexec.XXXXXX") || {
+        _stop_on_reexec_handshake_failure "failed to create temp dir for deploy script re-exec"
+        exit 1
+      }
+      if ! cp "${REPO_ROOT}/scripts/dalton/ops/prod/deploy_main.sh" "${reexec_tmp}/deploy_main.sh"; then
+        rm -rf "$reexec_tmp"
+        _stop_on_reexec_handshake_failure "failed to copy updated deploy_main.sh to ${reexec_tmp}"
+        exit 1
+      fi
+      if [ -f "${REPO_ROOT}/scripts/dalton/ops/prod/wait_backend_idle.sh" ]; then
+        if ! cp "${REPO_ROOT}/scripts/dalton/ops/prod/wait_backend_idle.sh" "${reexec_tmp}/wait_backend_idle.sh"; then
+          rm -rf "$reexec_tmp"
+          _stop_on_reexec_handshake_failure "failed to copy updated wait_backend_idle.sh to ${reexec_tmp}"
+          exit 1
+        fi
+      fi
+      if ! bash -n "${reexec_tmp}/deploy_main.sh" || { [ -f "${reexec_tmp}/wait_backend_idle.sh" ] && ! bash -n "${reexec_tmp}/wait_backend_idle.sh"; }; then
+        rm -rf "$reexec_tmp"
+        _stop_on_reexec_handshake_failure "updated deploy scripts in ${TARGET} failed bash -n syntax check"
+        exit 1
+      fi
+      child_proto=$(DALTON_DEPLOY_LIB_ONLY=0 DALTON_REPO_ROOT="$REPO_ROOT" bash "${reexec_tmp}/deploy_main.sh" --resume-protocol 2>/dev/null || true)
+      if [ "$child_proto" != "$DEPLOY_RESUME_PROTOCOL" ]; then
+        rm -rf "$reexec_tmp"
+        _stop_on_reexec_handshake_failure "re-exec protocol mismatch: target deploy_main.sh reports '${child_proto:-unsupported}', expected '${DEPLOY_RESUME_PROTOCOL}'"
+        exit 1
+      fi
+      state_file="${reexec_tmp}/deploy_state.env"
+      if ! _write_deploy_reexec_state "$state_file"; then
+        rm -rf "$reexec_tmp"
+        _stop_on_reexec_handshake_failure "failed to write re-exec state file ${state_file}"
+        exit 1
+      fi
+      if [ "${#orig_args[@]}" -gt 0 ]; then
+        if ! DALTON_DEPLOY_LIB_ONLY=0 DALTON_REPO_ROOT="$REPO_ROOT" bash "${reexec_tmp}/deploy_main.sh" --validate-resume "$state_file" -- "${orig_args[@]}"; then
+          rm -rf "$reexec_tmp"
+          _stop_on_reexec_handshake_failure "target deploy_main.sh rejected state format or CLI arguments during resume handshake"
+          exit 1
+        fi
+      else
+        if ! DALTON_DEPLOY_LIB_ONLY=0 DALTON_REPO_ROOT="$REPO_ROOT" bash "${reexec_tmp}/deploy_main.sh" --validate-resume "$state_file"; then
+          rm -rf "$reexec_tmp"
+          _stop_on_reexec_handshake_failure "target deploy_main.sh rejected state format during resume handshake"
+          exit 1
+        fi
+      fi
+      echo "$(date '+%T') deploy script changed in ${TARGET}; handshake ok (protocol=${DEPLOY_RESUME_PROTOCOL}); re-executing updated script from ${reexec_tmp}"
+      ACTIVE_REEXEC_TMP_DIR="$reexec_tmp"
+      reexec_rc=0
+      if [ "$wait_idle_in_script_dir" = "1" ]; then
+        if [ "${#orig_args[@]}" -gt 0 ]; then
+          DALTON_WAIT_IDLE_SCRIPT="" \
+          DALTON_DEPLOY_REEXECED="$TARGET" \
+          DALTON_DEPLOY_STATE_FILE="$state_file" \
+          DALTON_DEPLOY_LIB_ONLY=0 \
+          DALTON_REPO_ROOT="$REPO_ROOT" \
+          bash "${reexec_tmp}/deploy_main.sh" "${orig_args[@]}" &
+        else
+          DALTON_WAIT_IDLE_SCRIPT="" \
+          DALTON_DEPLOY_REEXECED="$TARGET" \
+          DALTON_DEPLOY_STATE_FILE="$state_file" \
+          DALTON_DEPLOY_LIB_ONLY=0 \
+          DALTON_REPO_ROOT="$REPO_ROOT" \
+          bash "${reexec_tmp}/deploy_main.sh" &
+        fi
+      else
+        if [ "${#orig_args[@]}" -gt 0 ]; then
+          DALTON_DEPLOY_REEXECED="$TARGET" \
+          DALTON_DEPLOY_STATE_FILE="$state_file" \
+          DALTON_DEPLOY_LIB_ONLY=0 \
+          DALTON_REPO_ROOT="$REPO_ROOT" \
+          bash "${reexec_tmp}/deploy_main.sh" "${orig_args[@]}" &
+        else
+          DALTON_DEPLOY_REEXECED="$TARGET" \
+          DALTON_DEPLOY_STATE_FILE="$state_file" \
+          DALTON_DEPLOY_LIB_ONLY=0 \
+          DALTON_REPO_ROOT="$REPO_ROOT" \
+          bash "${reexec_tmp}/deploy_main.sh" &
+        fi
+      fi
+      ACTIVE_REEXEC_CHILD_PID=$!
+      wait "$ACTIVE_REEXEC_CHILD_PID" || reexec_rc=$?
+      ACTIVE_REEXEC_CHILD_PID=""
+      rm -rf "$reexec_tmp"
+      ACTIVE_REEXEC_TMP_DIR=""
+      release_deploy_lock || true
+      trap - INT TERM
+      return "$reexec_rc"
     fi
   fi
-  git merge -q --ff-only "$TARGET" || { echo "ff failed, abort"; exit 1; }
-  post_ff_head=$(git rev-parse HEAD 2>/dev/null || true)
-  if [ "$post_ff_head" != "$TARGET" ]; then
-    echo "ERROR: post-ff HEAD (${post_ff_head:-unknown}) does not match TARGET (${TARGET}): reverting" >&2
-    MIGRATING_DEPLOY=1
-    revert_deploy
-    exit 1
-  fi
+
   if ! compute_migrating_deploy; then
     echo "ERROR: failed to determine migrating_deploy for HEAD; treating as migrating deploy" >&2
     MIGRATING_DEPLOY=1
     revert_deploy
+    release_deploy_lock || true
     exit 1
   fi
   echo "$(date '+%T') ff to $(git log --oneline -1) (migrating_deploy=${MIGRATING_DEPLOY})"
+  if ! _validate_edge_standard_mounts >/dev/null; then
+    echo "ERROR: aborting normal deploy due to unsupported edge mount configuration (keeping existing services untouched)" >&2
+    revert_deploy
+    release_deploy_lock || true
+    exit 1
+  fi
+  if _edge_target_uses_releases && _edge_live_mounts_any_legacy_srv; then
+    local rollout_hint="bash scripts/dalton/ops/prod/deploy_main.sh --first-releases-rollout"
+    if [ -n "${PRE_FF:-}" ] && _commit_mounts_legacy_dist "${PRE_FF}"; then
+      rollout_hint="${rollout_hint} --pre-ff ${PRE_FF}"
+    fi
+    echo "ERROR: running dalton-langalpha-edge-1 still mounts legacy web/dist on /srv; normal deploy leaves the fast-forwarded checkout (${TARGET}) and existing edge/services untouched. Run '${rollout_hint}' to complete the one-time transition." >&2
+    release_deploy_lock || true
+    trap - INT TERM
+    exit 3
+  fi
   RECREATE_EDGE=0
-  if ! git diff --quiet "$PRE_FF" HEAD -- deploy/dalton/Caddyfile 2>/dev/null || edge_compose_changed; then
+  if ! git diff --quiet "$PRE_FF" HEAD -- deploy/dalton/Caddyfile 2>/dev/null \
+     || edge_compose_changed \
+     || _edge_live_mount_mismatches_target; then
     RECREATE_EDGE=1
+  fi
+  # Initialize web/releases/current from legacy web/dist on first rollout (leaving web/dist intact).
+  if ! ensure_frontend_releases_initialized; then
+    echo "ERROR: failed to initialize web/releases/: reverting (backend not restarted)" >&2
+    revert_deploy
+    release_deploy_lock || true
+    exit 1
   fi
   # Host jobs (conversation archive) run on this checkout's .venv, not the container: keep it on the
   # lockfile, or a new dependency breaks them silently (2026-10-28..11-01 archive failures).
   uv sync --frozen -q 2>&1 | tail -2 || echo "WARN: host venv sync failed (host jobs may break)"
   # The build does not install: keep web/node_modules on the lockfile (sync5 changed it).
-  (cd web && pnpm install --frozen-lockfile) >/dev/null 2>&1 || { echo "pnpm install failed: reverting"; revert_deploy; exit 1; }
-  out=$(bash scripts/dalton/build_frontend_prod.sh --require-supabase 2>&1)
-  build_rc=$?
+  (cd web && pnpm install --frozen-lockfile) >/dev/null 2>&1 || { echo "pnpm install failed: reverting"; revert_deploy; release_deploy_lock || true; exit 1; }
+  rel_dir=$(_frontend_releases_dir)
+  short_target="${TARGET:0:12}"
+  short_target="${short_target:-deploy}"
+  NEW_FRONTEND_RELEASE_ID="${short_target}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  ACTIVE_FRONTEND_RELEASE_DIR="${rel_dir}/${NEW_FRONTEND_RELEASE_ID}"
+  if [ -e "$ACTIVE_FRONTEND_RELEASE_DIR" ] || [ -L "$ACTIVE_FRONTEND_RELEASE_DIR" ]; then
+    echo "ERROR: frontend release directory already exists: ${ACTIVE_FRONTEND_RELEASE_DIR}: reverting (backend not restarted)" >&2
+    ACTIVE_FRONTEND_RELEASE_DIR=""
+    revert_deploy
+    release_deploy_lock || true
+    exit 1
+  fi
+  local build_out_file=""
+  build_out_file=$(mktemp "${TMPDIR:-/tmp}/dalton-fe-build.XXXXXX") || {
+    echo "ERROR: failed to create temp output file for frontend build: reverting (backend not restarted)" >&2
+    cleanup_frontend_staging || true
+    revert_deploy
+    release_deploy_lock || true
+    exit 1
+  }
+  ACTIVE_STEP_OUT_FILE="$build_out_file"
+  build_rc=0
+  if _spawn_in_new_pgid "$build_out_file" bash scripts/dalton/build_frontend_prod.sh --require-supabase --out-dir "$ACTIVE_FRONTEND_RELEASE_DIR"; then
+    wait "$ACTIVE_STEP_CHILD_PID" || build_rc=$?
+    ACTIVE_STEP_CHILD_PID=""
+    ACTIVE_STEP_PGID=""
+  else
+    build_rc=1
+  fi
+  out=$(cat "$build_out_file" 2>/dev/null || true)
+  rm -f "$build_out_file"
+  ACTIVE_STEP_OUT_FILE=""
   printf '%s\n' "$out" | grep -E "VITE_DALTON_AUTH=|OK:|ERROR|OVER BUDGET" || true
   # Here-string, not a pipe: under pipefail, grep -q stopping early on a long build log
   # SIGPIPEs printf and reads as a failed build (2026-11-17, #380 deploy).
-  if [ "$build_rc" -ne 0 ] || ! grep -q "OK: Production bundle" <<<"$out"; then
-    echo "frontend build failed: reverting (backend not restarted)"
+  if [ "$build_rc" -ne 0 ] || ! grep -q "OK: Production bundle" <<<"$out" \
+     || ! _is_servable_frontend_release_dir "$ACTIVE_FRONTEND_RELEASE_DIR"; then
+    echo "frontend build failed: cleaning staging and reverting (backend not restarted)"
+    cleanup_frontend_staging || true
     revert_deploy
+    release_deploy_lock || true
     exit 1
+  fi
+  if ! _finalize_frontend_version_manifest "$ACTIVE_FRONTEND_RELEASE_DIR" "$NEW_FRONTEND_RELEASE_ID" 0; then
+    echo "ERROR: failed to finalize frontend version.json manifest: reverting (backend not restarted)" >&2
+    cleanup_frontend_staging || true
+    revert_deploy
+    release_deploy_lock || true
+    exit 1
+  fi
+  if ! _record_own_frontend_assets "$ACTIVE_FRONTEND_RELEASE_DIR"; then
+    echo "ERROR: failed to record frontend asset manifest: reverting (backend not restarted)" >&2
+    cleanup_frontend_staging || true
+    revert_deploy
+    release_deploy_lock || true
+    exit 1
+  fi
+  if [ -n "${PREV_FRONTEND_RELEASE_ID:-}" ] && [ -d "${rel_dir}/${PREV_FRONTEND_RELEASE_ID}" ]; then
+    if ! _carry_over_hashed_assets "${rel_dir}/${PREV_FRONTEND_RELEASE_ID}" "$ACTIVE_FRONTEND_RELEASE_DIR"; then
+      echo "ERROR: failed to carry over previous hashed assets: reverting (backend not restarted)" >&2
+      cleanup_frontend_staging || true
+      revert_deploy
+      release_deploy_lock || true
+      exit 1
+    fi
   fi
   if [ "$DEPLOY_GATEWAY" = "1" ]; then
     echo "$(date '+%T') building channel gateway in staging"
@@ -2810,33 +4999,38 @@ run_deploy_main() {
       GATEWAY_BUILD_FAILED=1
       echo "gateway build failed (网关未切换，生产目录未改动): cleaning staging and reverting (backend not restarted)"
       revert_deploy
+      release_deploy_lock || true
       exit 1
     fi
   fi
   # Re-check right before the restart: the backup and build take minutes, and a turn
   # started in that gap would be cut off (2026-10-28: a new EDU turn died this way).
   busy() { [ "$(docker exec dalton-langalpha-postgres-1 psql -U postgres -d postgres -Atc "select (select count(*) from conversation_threads where current_status='in_progress')+(select count(*) from subagent_runs where status='in_progress')")" != "0" ]; }
-  while busy; do echo "$(date '+%T') work started during backup/build; waiting for idle again"; bash "$WAIT_IDLE_SCRIPT" || { echo "still busy: reverting (backend not restarted)"; revert_deploy; exit 1; }; done
+  while busy; do echo "$(date '+%T') work started during backup/build; waiting for idle again"; bash "$WAIT_IDLE_SCRIPT" || { echo "still busy: reverting (backend not restarted)"; revert_deploy; release_deploy_lock || true; exit 1; }; done
 
   if ! check_clean_migration_dirs; then
     echo "ERROR: pre-restart migration directory check failed (migration directories changed after pre-backup check): reverting (backend not restarted)" >&2
     revert_deploy
+    release_deploy_lock || true
     exit 1
   fi
   if ! pre_restart_heads=$(target_migration_heads HEAD); then
     echo "ERROR: pre-restart migration head check failed for HEAD: reverting (backend not restarted)" >&2
     revert_deploy
+    release_deploy_lock || true
     exit 1
   fi
   if [ "$pre_restart_heads" != "$target_heads" ]; then
     echo "ERROR: pre-restart migration heads (${pre_restart_heads}) differ from pre-backup target heads (${target_heads}): reverting (backend not restarted)" >&2
     revert_deploy
+    release_deploy_lock || true
     exit 1
   fi
 
   if ! ensure_everflow_host_platform_env "${REPO_ROOT}/.env"; then
     echo "ERROR: DALTON_HOST_PLATFORM check failed: reverting (backend not restarted)" >&2
     revert_deploy
+    release_deploy_lock || true
     exit 1
   fi
 
@@ -2844,6 +5038,7 @@ run_deploy_main() {
   if ! apply_backend; then
     echo "ERROR: backend restart/recreate failed: reverting"
     revert_deploy
+    release_deploy_lock || true
     exit 1
   fi
   # P6b crawler service: same image as the backend, code from bind mounts, so a restart picks up the ff.
@@ -2853,15 +5048,42 @@ run_deploy_main() {
     if ! apply_crawler; then
       echo "ERROR: crawler restart/recreate failed: reverting"
       revert_deploy
+      release_deploy_lock || true
       exit 1
     fi
   fi
   if [ "$RECREATE_EDGE" = "1" ]; then
-    echo "$(date '+%T') edge config changed; recreating edge"
+    local pre_rec_mount="" pre_rec_rc=0 target_rel_type="" target_rel_src="" target_rel_dst="" target_cur_link="" target_cur_id=""
+    pre_rec_mount=$(_validate_edge_standard_mounts) || pre_rec_rc=$?
+    if [ "$pre_rec_rc" -eq 1 ]; then
+      echo "ERROR: refusing to recreate edge due to unsupported mount configuration (keeping existing edge mount): reverting" >&2
+      revert_deploy
+      release_deploy_lock || true
+      exit 1
+    fi
+    if [ "$pre_rec_rc" -eq 0 ] && [ -n "$pre_rec_mount" ]; then
+      IFS='|' read -r target_rel_type target_rel_src target_rel_dst <<<"$pre_rec_mount"
+      if [ "$target_rel_dst" = "/srv-releases" ]; then
+        target_cur_link="${target_rel_src}/current"
+        target_cur_id=""
+        if [ -L "$target_cur_link" ]; then
+          target_cur_id=$(readlink "$target_cur_link" 2>/dev/null || true)
+          _is_valid_frontend_release_id "$target_cur_id" || target_cur_id=""
+        fi
+        if [ -z "$target_cur_id" ] || ! _is_servable_frontend_release_dir "${target_rel_src}/${target_cur_id}"; then
+          echo "ERROR: refusing to recreate edge onto /srv-releases because ${target_cur_link} is missing or unservable (keeping existing edge mount): reverting" >&2
+          revert_deploy
+          release_deploy_lock || true
+          exit 1
+        fi
+      fi
+    fi
+    echo "$(date '+%T') edge config or live mount changed; recreating edge"
     EDGE_TOUCHED=1
     if ! recreate_edge; then
       echo "ERROR: edge recreate failed: reverting"
       revert_deploy
+      release_deploy_lock || true
       exit 1
     fi
   fi
@@ -2869,6 +5091,7 @@ run_deploy_main() {
   if ! wait_backend_health; then
     echo "ERROR: backend health check failed: reverting"
     revert_deploy
+    release_deploy_lock || true
     exit 1
   fi
   cur=$(docker exec dalton-langalpha-backend-1 sh -c "cd /app && uv run alembic -c src/dalton/alembic.ini current 2>/dev/null" | tail -1 || true); echo "dalton migration: $cur"
@@ -2878,6 +5101,7 @@ run_deploy_main() {
     launchctl kickstart -k "gui/$(id -u)/com.dalton.researchdata-bridge" || {
       echo "ERROR: researchdata-bridge kickstart failed: reverting"
       revert_deploy
+      release_deploy_lock || true
       exit 1
     }
     sleep 5
@@ -2886,6 +5110,7 @@ run_deploy_main() {
   if [ "$DEPLOY_GATEWAY" = "1" ]; then
     echo "$(date '+%T') switching channel gateway from staging"
     if ! switch_gateway_from_staging; then
+      cleanup_frontend_staging || true
       cur_head=$(git rev-parse HEAD 2>/dev/null || echo unknown)
       if [ "${GATEWAY_SWITCH_RESTORE_FAILED:-0}" = "1" ] || [ ! -f "$(_gateway_dir)/dist/index.mjs" ] || [ ! -d "$(_gateway_dir)/node_modules" ]; then
         echo "ERROR: channel-gateway switch from staging failed and recovery left incomplete state: preserving staging and backup directories"
@@ -2905,22 +5130,29 @@ run_deploy_main() {
           "跳过（未重启网关）" \
           "$(_describe_gateway_disk_state 1 "$cur_head")"
       fi
+      release_deploy_lock || true
       exit 1
     fi
     if ! verify_gateway_production_import; then
+      cleanup_frontend_staging || true
       echo "ERROR: channel-gateway production import check failed: rolling back gateway only"
       rollback_gateway_only 0
+      release_deploy_lock || true
       exit 1
     fi
     echo "$(date '+%T') restarting channel gateway"
     if ! launchctl kickstart -k "gui/$(id -u)/com.dalton.channel-gateway"; then
+      cleanup_frontend_staging || true
       echo "ERROR: channel-gateway kickstart failed: rolling back gateway only"
       rollback_gateway_only 1
+      release_deploy_lock || true
       exit 1
     fi
     if ! wait_gateway_health; then
+      cleanup_frontend_staging || true
       echo "ERROR: channel-gateway health check failed: rolling back gateway only"
       rollback_gateway_only 1
+      release_deploy_lock || true
       exit 1
     fi
     if [ -n "$TARGET_GATEWAY_TREE" ]; then
@@ -2936,28 +5168,637 @@ run_deploy_main() {
   if ! wait_crawler_health; then
     echo "ERROR: crawler health check failed: reverting"
     revert_deploy
+    release_deploy_lock || true
     exit 1
   fi
   if [ "$RECREATE_EDGE" = "1" ]; then
     if ! wait_edge_ready; then
-      echo "ERROR: edge not responding with HTTP 200 on 127.0.0.1:${EDGE_PORT} within ${EDGE_WAIT_TIMEOUT}s: reverting"
+      echo "ERROR: edge not responding with '${EDGE_HEALTH_EXPECTED_BODY}' (HTTP 200) on 127.0.0.1:${EDGE_PORT}/__edge_health within ${EDGE_WAIT_TIMEOUT}s: reverting"
       revert_deploy
+      release_deploy_lock || true
       exit 1
     fi
   fi
-  if ! run_public_edge_check; then
-    echo "ERROR: public edge check failed: reverting"
+  expected_build=$(_read_frontend_build_id "$ACTIVE_FRONTEND_RELEASE_DIR" || true)
+  expected_release=$(_read_frontend_release_tag "$ACTIVE_FRONTEND_RELEASE_DIR" || true)
+  if [ -z "$expected_build" ] || [ -z "$expected_release" ]; then
+    echo "ERROR: cannot read build/release id from ${ACTIVE_FRONTEND_RELEASE_DIR}/version.json: reverting" >&2
+    cleanup_frontend_staging || true
     revert_deploy
+    release_deploy_lock || true
     exit 1
   fi
+  echo "$(date '+%T') atomically switching web/releases/current -> ${NEW_FRONTEND_RELEASE_ID} (build=${expected_build}, release=${expected_release})"
+  if ! switch_frontend_from_staging; then
+    echo "ERROR: frontend switch failed: reverting"
+    cleanup_frontend_staging || true
+    revert_deploy
+    release_deploy_lock || true
+    exit 1
+  fi
+  if ! run_public_edge_check "$expected_build" "$(_frontend_current_link)" "$expected_release"; then
+    echo "ERROR: public edge check failed: reverting"
+    revert_deploy
+    release_deploy_lock || true
+    exit 1
+  fi
+  prune_old_frontend_releases "$FRONTEND_KEEP_RELEASES" || echo "WARN: failed to prune old frontend releases" >&2
   if [ "$DEPLOY_GATEWAY" = "1" ] && [ "$gw_tree_write_ok" = "1" ]; then
     if ! _clear_gateway_pending; then
       echo "WARN: failed to remove $(_gateway_pending_file)" >&2
     fi
   fi
+  release_deploy_lock || true
   trap - INT TERM
 }
 
+_resolve_first_rollout_pre_ff() {
+  local explicit_sha="${1:-}" cand=""
+  if [ -n "$explicit_sha" ]; then
+    if ! cand=$(git rev-parse --verify "${explicit_sha}^{commit}" 2>/dev/null); then
+      echo "ERROR: --pre-ff commit not found: ${explicit_sha}" >&2
+      return 1
+    fi
+    if ! _commit_mounts_legacy_dist "$cand"; then
+      echo "ERROR: --pre-ff commit ${cand} does not bind-mount this checkout's web/dist -> /srv (with deploy/dalton/Caddyfile) in docker-compose.dalton.yml" >&2
+      return 1
+    fi
+    printf '%s' "$cand"
+    return 0
+  fi
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    if _commit_mounts_legacy_dist "$cand"; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done <<EOF
+$(git rev-list -n 50 HEAD~1 2>/dev/null || true)
+EOF
+  echo "ERROR: could not find a PRE_FF ancestor bind-mounting web/dist -> /srv (pass --pre-ff <sha>)" >&2
+  return 1
+}
+
+_extract_edge_image_from_compose_yaml() {
+  local edge_cfg="${1:-}" py=""
+  [ -n "$edge_cfg" ] || { printf '%s' "caddy:2.9.1-alpine"; return 0; }
+  py=$(_resolve_deploy_python 2>/dev/null || true)
+  if [ -z "$py" ]; then
+    printf '%s' "caddy:2.9.1-alpine"
+    return 0
+  fi
+  "$py" - "$edge_cfg" <<'PY'
+import re, sys
+for line in sys.argv[1].splitlines():
+    m = re.match(r'^\s*image:\s*["\']?([^"\'\s#]+)["\']?\s*(?:#.*)?$', line)
+    if m:
+        print(m.group(1), end="")
+        sys.exit(0)
+print("caddy:2.9.1-alpine", end="")
+PY
+}
+
+_validate_caddyfile_with_edge_image() {
+  local cf="${1:-}" edge_image="${2:-caddy:2.9.1-alpine}" out="" rc=0
+  [ -s "$cf" ] || return 1
+  out=$(docker run --rm --entrypoint caddy -v "${cf}:/etc/caddy/Caddyfile:ro" "$edge_image" validate --config /etc/caddy/Caddyfile --adapter caddyfile 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "ERROR: rollback Caddyfile failed 'caddy validate' with ${edge_image}: ${out}" >&2
+    return 1
+  fi
+  return 0
+}
+
+FIRST_ROLLOUT_ROLLBACK_DIR=""
+
+_first_rollout_rollbacks_root() {
+  printf '%s/.first-rollout-rollback' "$(_frontend_releases_dir)"
+}
+
+_allocate_first_rollout_rollback_dir() {
+  local rb_root="" ts="" seq=1 cand=""
+  rb_root=$(_first_rollout_rollbacks_root)
+  mkdir -p "$rb_root" || return 1
+  ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  while [ "$seq" -le 999 ]; do
+    cand="${rb_root}/attempt-${ts}-$$-${seq}"
+    if mkdir "$cand" 2>/dev/null; then
+      printf '%s' "$cand"
+      return 0
+    fi
+    seq=$((seq + 1))
+  done
+  echo "ERROR: failed to allocate unique rollback snapshot directory under ${rb_root}" >&2
+  return 1
+}
+
+# Returns 0 if any container (running or stopped) bind-mounts a path inside `target_dir`,
+# OR if container mount inspection fails (fail-closed so active snapshots are never deleted).
+# Returns 1 only when inspection succeeds and confirms NO container binds `target_dir`.
+_first_rollout_rollback_dir_is_bound() {
+  local target_dir="${1:-}" cids="" mounts="" py="" rc=0
+  [ -n "$target_dir" ] || return 1
+  cids=$(docker ps -aq 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    return 0
+  fi
+  [ -n "$cids" ] || return 1
+  # shellcheck disable=SC2086
+  mounts=$(docker inspect -f '{{range .Mounts}}{{.Source}}{{"\n"}}{{end}}' $cids 2>/dev/null) || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    return 0
+  fi
+  [ -n "$mounts" ] || return 1
+  py=$(_resolve_deploy_python 2>/dev/null || true)
+  [ -n "$py" ] || return 0
+  "$py" - "$target_dir" "$mounts" <<'PY'
+import os
+import sys
+
+target_real = os.path.realpath(sys.argv[1])
+for raw in sys.argv[2].splitlines():
+    src = raw.strip()
+    if not src:
+        continue
+    # Support mock inspect lines formatted as `type|src->dst` or `src->dst` as well as plain `src`.
+    if "->" in src:
+        src = src.rsplit("->", 1)[0]
+        if "|" in src:
+            src = src.split("|", 1)[1]
+    src = src.strip()
+    if not src:
+        continue
+    src_real = os.path.realpath(src)
+    try:
+        if os.path.commonpath([src_real, target_real]) == target_real:
+            sys.exit(0)
+    except ValueError:
+        continue
+sys.exit(1)
+PY
+}
+
+_cleanup_unused_first_rollout_rollbacks() {
+  local rb_root="" cand=""
+  rb_root=$(_first_rollout_rollbacks_root)
+  [ -d "$rb_root" ] || return 0
+  for cand in "${rb_root}"/attempt-*; do
+    [ -e "$cand" ] || continue
+    if ! _first_rollout_rollback_dir_is_bound "$cand"; then
+      rm -rf "$cand" 2>/dev/null || true
+    fi
+  done
+  return 0
+}
+
+_prepare_first_rollout_rollback() {
+  local pre_ff_sha="${1:-}" rollback_dir="" attempt_name="" snap_rel="" f="" py="" proj="" ext_idx=0 rel_f="" dest_f=""
+  local resolved_cfg="" edge_cfg="" parsed_mounts="" explicit_cf=0 rollback_edge_image=""
+  local -a pre_args=() copied_compose_files=() frozen_args=()
+  _has_explicit_compose_file_setting && explicit_cf=1
+  if ! rollback_dir=$(_allocate_first_rollout_rollback_dir); then
+    echo "ERROR: failed to create rollback snapshot directory under $(_first_rollout_rollbacks_root)" >&2
+    return 1
+  fi
+  FIRST_ROLLOUT_ROLLBACK_DIR="$rollback_dir"
+  attempt_name=$(basename "$rollback_dir")
+  snap_rel="./web/releases/.first-rollout-rollback/${attempt_name}/Caddyfile"
+  if ! git show "${pre_ff_sha}:deploy/dalton/Caddyfile" > "${rollback_dir}/Caddyfile" 2>/dev/null \
+     || [ ! -s "${rollback_dir}/Caddyfile" ]; then
+    echo "ERROR: failed to extract ${pre_ff_sha}:deploy/dalton/Caddyfile for edge rollback" >&2
+    return 1
+  fi
+  proj=$(_edge_compose_project_name || true)
+  if [ -n "$proj" ]; then
+    pre_args+=(-p "$proj")
+    frozen_args+=(-p "$proj")
+    printf '%s\n' "$proj" > "${rollback_dir}/project.name" || return 1
+  fi
+  pre_args+=(--project-directory "$REPO_ROOT")
+  frozen_args+=(--project-directory "$REPO_ROOT")
+  if [ -f "${REPO_ROOT}/.env" ]; then
+    pre_args+=(--env-file "${REPO_ROOT}/.env")
+  fi
+  py=$(_resolve_deploy_python) || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    dest_f=""
+    case "$f" in
+      /*)
+        rel_f=$("$py" - "$REPO_ROOT" "$f" <<'PY'
+import os, sys
+root = os.path.realpath(sys.argv[1])
+path = os.path.realpath(sys.argv[2])
+try:
+    rel = os.path.relpath(path, root)
+except ValueError:
+    rel = ""
+if rel and not rel.startswith("..") and not os.path.isabs(rel):
+    print(rel, end="")
+PY
+        )
+        if [ -n "$rel_f" ] && git cat-file -e "${pre_ff_sha}:${rel_f}" 2>/dev/null; then
+          dest_f="${rollback_dir}/${rel_f}"
+          mkdir -p "$(dirname "$dest_f")" || return 1
+          git show "${pre_ff_sha}:${rel_f}" > "$dest_f" 2>/dev/null || return 1
+        elif [ -f "$f" ] && [ -r "$f" ]; then
+          ext_idx=$((ext_idx + 1))
+          dest_f="${rollback_dir}/ext-${ext_idx}-$(basename "$f")"
+          cp "$f" "$dest_f" || return 1
+        else
+          echo "ERROR: explicit compose file unavailable for rollback snapshot: ${f}" >&2
+          return 1
+        fi
+        ;;
+      *)
+        if git cat-file -e "${pre_ff_sha}:${f}" 2>/dev/null; then
+          dest_f="${rollback_dir}/${f}"
+          mkdir -p "$(dirname "$dest_f")" || return 1
+          git show "${pre_ff_sha}:${f}" > "$dest_f" 2>/dev/null || return 1
+        elif [ "$explicit_cf" = "1" ]; then
+          echo "ERROR: explicit compose file missing in PRE_FF (${pre_ff_sha}): ${f}" >&2
+          return 1
+        fi
+        ;;
+    esac
+    if [ -n "$dest_f" ]; then
+      [ -s "$dest_f" ] || return 1
+      pre_args+=(-f "$dest_f")
+      copied_compose_files+=("$dest_f")
+    fi
+  done <<EOF
+$(_edge_compose_files_list "$pre_ff_sha")
+EOF
+  if [ "${#copied_compose_files[@]}" -eq 0 ]; then
+    echo "ERROR: rollback snapshot has no compose files for PRE_FF=${pre_ff_sha}" >&2
+    return 1
+  fi
+  # Rewrite BOTH short syntax and long syntax /etc/caddy/Caddyfile bind mounts across all snapshot compose files.
+  "$py" - "$snap_rel" "${copied_compose_files[@]}" <<'PY' || return 1
+from pathlib import Path
+import re
+import sys
+
+snap_rel = sys.argv[1]
+
+for cf_path in sys.argv[2:]:
+    p = Path(cf_path)
+    lines = p.read_text(encoding="utf-8").splitlines(keepends=True)
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        m_short = re.match(r'^(\s*-\s*["\']?)([^"\':\s]+Caddyfile)(:/etc/caddy/Caddyfile.*)$', line)
+        if m_short:
+            out.append(f"{m_short.group(1)}{snap_rel}{m_short.group(3)}\n")
+            i += 1
+            continue
+        m_item = re.match(r'^(\s*)-\s*(.*)$', line)
+        if m_item:
+            item_ind = len(m_item.group(1))
+            block = [line]
+            j = i + 1
+            while j < len(lines):
+                nxt = lines[j]
+                if nxt.strip() == "" or nxt.lstrip().startswith("#"):
+                    block.append(nxt)
+                    j += 1
+                    continue
+                nxt_ind = len(nxt) - len(nxt.lstrip(" "))
+                if nxt_ind <= item_ind:
+                    break
+                block.append(nxt)
+                j += 1
+            block_text = "".join(block)
+            if re.search(r'(?m)^\s*(?:-\s*)?target:\s*["\']?/etc/caddy/Caddyfile["\']?\s*(?:#.*)?$', block_text):
+                rewritten = []
+                for bl in block:
+                    m_src = re.match(r'^(\s*(?:-\s*)?source:\s*["\']?)([^"\'\s#]+)(["\']?.*)$', bl)
+                    if m_src:
+                        nl = "\n" if bl.endswith("\n") else ""
+                        rewritten.append(f"{m_src.group(1)}{snap_rel}{m_src.group(3)}{nl}")
+                    else:
+                        rewritten.append(bl)
+                out.extend(rewritten)
+            else:
+                out.extend(block)
+            i = j
+            continue
+        out.append(line)
+        i += 1
+    p.write_text("".join(out), encoding="utf-8")
+PY
+  if ! resolved_cfg=$(docker compose "${pre_args[@]}" config 2>&1); then
+    echo "ERROR: pre-rollout rollback compose validation failed for PRE_FF=${pre_ff_sha}: ${resolved_cfg}" >&2
+    return 1
+  fi
+  edge_cfg=$(printf '%s\n' "$resolved_cfg" | extract_edge_config)
+  parsed_mounts=$(_parse_edge_mounts_from_compose_yaml "$edge_cfg" 2>/dev/null || true)
+  if ! "$py" - "$REPO_ROOT" "${rollback_dir}/Caddyfile" "$parsed_mounts" <<'PY'
+import os
+import sys
+
+repo_root, snap_caddy, mounts_raw = sys.argv[1:4]
+expected_caddy = os.path.realpath(snap_caddy)
+expected_dist = os.path.realpath(os.path.join(repo_root, "web/dist"))
+mounts = []
+for line in mounts_raw.splitlines():
+    parts = line.strip().split("|")
+    if len(parts) == 3:
+        mounts.append((parts[0], parts[1], parts[2]))
+
+has_snap_caddy = any(t == "bind" and dst == "/etc/caddy/Caddyfile" and os.path.realpath(src) == expected_caddy for t, src, dst in mounts)
+has_legacy_dist = any(t == "bind" and dst == "/srv" and os.path.realpath(src) == expected_dist for t, src, dst in mounts)
+has_releases = any(dst == "/srv-releases" for _, _, dst in mounts)
+if not has_snap_caddy or not has_legacy_dist or has_releases:
+    print(
+        f"ERROR: resolved rollback compose mounts invalid (snap_caddy={has_snap_caddy}, legacy_dist={has_legacy_dist}, has_releases={has_releases}, mounts={mounts})",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+PY
+  then
+    return 1
+  fi
+  # Validate rollback Caddyfile with the old edge image (`caddy validate`) BEFORE touching running edge.
+  rollback_edge_image=$(_extract_edge_image_from_compose_yaml "$edge_cfg")
+  if ! _validate_caddyfile_with_edge_image "${rollback_dir}/Caddyfile" "$rollback_edge_image"; then
+    return 1
+  fi
+  # Freeze the resolved Compose YAML so automatic rollback and manual recovery reuse the exact
+  # validated configuration without re-reading .env or recomputing project/file lists.
+  printf '%s\n' "$resolved_cfg" > "${rollback_dir}/resolved-compose.yml" || return 1
+  frozen_args+=(-f "${rollback_dir}/resolved-compose.yml")
+  printf '%s\n' "${frozen_args[@]}" > "${rollback_dir}/compose.args" || return 1
+  return 0
+}
+
+_verify_legacy_dist_http_ok() {
+  local rollback_caddyfile="${1:-}" probe_out="" raw="" code="" rc=0
+  if ! wait_edge_ready "$rollback_caddyfile"; then
+    echo "ERROR: rolled-back edge readiness probe failed against ${rollback_caddyfile}" >&2
+    return 1
+  fi
+  probe_out=$(mktemp "${TMPDIR:-/tmp}/dalton-legacy-http.XXXXXX") || return 1
+  if _spawn_in_new_pgid "$probe_out" curl -s --max-time 3 --noproxy '*' -w $'\n%{http_code}' "http://127.0.0.1:${EDGE_PORT}/"; then
+    _wait_pid_ignoring_signals "$ACTIVE_STEP_CHILD_PID" || rc=$?
+    ACTIVE_STEP_CHILD_PID=""
+    ACTIVE_STEP_PGID=""
+  else
+    rc=1
+  fi
+  raw=$(cat "$probe_out" 2>/dev/null || true)
+  rm -f "$probe_out"
+  [ "$rc" -eq 0 ] || return 1
+  code="${raw##*$'\n'}"
+  [ "$code" = "200" ]
+}
+
+_rollback_first_rollout_edge() {
+  local pre_ff_sha="${1:-}" rollback_dir="" arg="" out="" rc=0
+  local -a pre_args=()
+  rollback_dir="${FIRST_ROLLOUT_ROLLBACK_DIR:-}"
+  if [ -z "$rollback_dir" ] || [ ! -s "${rollback_dir}/Caddyfile" ] || [ ! -s "${rollback_dir}/compose.args" ]; then
+    _prepare_first_rollout_rollback "$pre_ff_sha" || return 1
+    rollback_dir="${FIRST_ROLLOUT_ROLLBACK_DIR}"
+  fi
+  while IFS= read -r arg; do
+    [ -n "$arg" ] && pre_args+=("$arg")
+  done < "${rollback_dir}/compose.args"
+  [ "${#pre_args[@]}" -gt 0 ] || return 1
+  save_container_logs "edge" "dalton-langalpha-edge-1"
+  local up_out=""
+  up_out=$(mktemp "${TMPDIR:-/tmp}/dalton-rb-up.XXXXXX") || return 1
+  _run_cmd_in_pgid_with_timeout "$EDGE_COMPOSE_TIMEOUT" 1 "$up_out" docker compose "${pre_args[@]}" up -d --no-deps --force-recreate edge || rc=$?
+  out=$(cat "$up_out" 2>/dev/null || true)
+  rm -f "$up_out"
+  [ -n "$out" ] && printf '%s\n' "$out" | tail -3
+  if [ "$rc" -eq 124 ]; then
+    echo "ERROR: rollback docker compose up timed out after ${EDGE_COMPOSE_TIMEOUT}s" >&2
+  fi
+  [ "$rc" -eq 0 ] || return "$rc"
+  if ! _verify_legacy_dist_http_ok "${rollback_dir}/Caddyfile"; then
+    echo "ERROR: rolled-back edge on web/dist failed HTTP 200 verification" >&2
+    return 1
+  fi
+  return 0
+}
+
+run_first_releases_rollout() {
+  local explicit_pre_ff="" rollout_pre_ff="" rel_dir="" cur_link="" legacy_dist="" legacy_id="" legacy_dir=""
+  local expected_build="" expected_release="" exit_rc=1
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --pre-ff)
+        if [ $# -lt 2 ] || [ -z "${2:-}" ] || [[ "${2:-}" == -* ]]; then
+          echo "ERROR: --pre-ff requires a git commit argument" >&2
+          return 2
+        fi
+        explicit_pre_ff="$2"
+        shift
+        ;;
+      --pre-ff=*)
+        explicit_pre_ff="${1#--pre-ff=}"
+        if [ -z "$explicit_pre_ff" ] || [[ "$explicit_pre_ff" == -* ]]; then
+          echo "ERROR: --pre-ff requires a git commit argument" >&2
+          return 2
+        fi
+        ;;
+      *)
+        echo "ERROR: unknown argument for --first-releases-rollout: $1" >&2
+        return 2
+        ;;
+    esac
+    shift
+  done
+
+  cd "$REPO_ROOT" || return 1
+  DEPLOY_LOCK_OWNED=0
+  FIRST_ROLLOUT_EDGE_TOUCHED=0
+  FIRST_ROLLOUT_ROLLBACK_PRE_FF=""
+  FIRST_ROLLOUT_ROLLBACK_DIR=""
+  DEFERRED_SIGNAL=""
+  ROLLBACK_IN_PROGRESS=0
+  ACTIVE_FRONTEND_RELEASE_DIR=""
+  ACTIVE_STEP_CHILD_PID=""
+  ACTIVE_STEP_PGID=""
+  ACTIVE_STEP_OUT_FILE=""
+  ACTIVE_STEP_WATCHDOG_PID=""
+  ACTIVE_STEP_TIMEOUT_MARKER=""
+  trap '_on_deploy_interrupt_signal INT' INT
+  trap '_on_deploy_interrupt_signal TERM' TERM
+  _acquire_deploy_lock || return 1
+
+  if ! _validate_edge_standard_mounts "/srv-releases" >/dev/null \
+     || [ ! -f "${REPO_ROOT}/deploy/dalton/Caddyfile" ] \
+     || ! grep -q '/srv-releases/current' "${REPO_ROOT}/deploy/dalton/Caddyfile" \
+     || ! grep -q 'dalton-edge-ok' "${REPO_ROOT}/deploy/dalton/Caddyfile"; then
+    echo "ERROR: checkout must already be fast-forwarded to the standard web/releases compose and Caddyfile before running --first-releases-rollout" >&2
+    release_deploy_lock || true
+    trap - INT TERM
+    return 1
+  fi
+
+  if ! _edge_live_mounts_legacy_dist; then
+    echo "ERROR: --first-releases-rollout requires running dalton-langalpha-edge-1 to currently bind-mount ${REPO_ROOT}/web/dist on /srv (running=$(docker inspect -f '{{.State.Running}}' dalton-langalpha-edge-1 2>/dev/null || echo unknown), mounts=$(_edge_live_mounts | tr '\n' ' '))" >&2
+    release_deploy_lock || true
+    trap - INT TERM
+    return 1
+  fi
+
+  if ! rollout_pre_ff=$(_resolve_first_rollout_pre_ff "$explicit_pre_ff"); then
+    release_deploy_lock || true
+    trap - INT TERM
+    return 1
+  fi
+
+  legacy_dist="${REPO_ROOT}/web/dist"
+  if ! _is_servable_legacy_dist_dir "$legacy_dist"; then
+    echo "ERROR: ${legacy_dist} must contain index.html, assets/, and help/index.html before --first-releases-rollout" >&2
+    release_deploy_lock || true
+    trap - INT TERM
+    return 1
+  fi
+
+  rel_dir=$(_frontend_releases_dir)
+  cur_link=$(_frontend_current_link)
+  if [ -L "$rel_dir" ] || { [ -e "$rel_dir" ] && [ ! -d "$rel_dir" ]; }; then
+    echo "ERROR: ${rel_dir} must be a real directory" >&2
+    release_deploy_lock || true
+    trap - INT TERM
+    return 1
+  fi
+  mkdir -p "$rel_dir" || { release_deploy_lock || true; trap - INT TERM; return 1; }
+
+  # Prepare, freeze, and validate PRE_FF rollback compose + Caddyfile in an isolated per-attempt
+  # directory BEFORE touching edge, leaving any previous attempt's snapshot intact for running edge.
+  if ! _prepare_first_rollout_rollback "$rollout_pre_ff"; then
+    [ -n "${FIRST_ROLLOUT_ROLLBACK_DIR:-}" ] && rm -rf "${FIRST_ROLLOUT_ROLLBACK_DIR}" 2>/dev/null || true
+    FIRST_ROLLOUT_ROLLBACK_DIR=""
+    release_deploy_lock || true
+    trap - INT TERM
+    return 1
+  fi
+
+  legacy_id="legacy-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  legacy_dir="${rel_dir}/${legacy_id}"
+  ACTIVE_FRONTEND_RELEASE_DIR="$legacy_dir"
+  if ! mkdir "$legacy_dir" || ! cp -Rp "${legacy_dist}/." "${legacy_dir}/"; then
+    rm -rf "$legacy_dir" 2>/dev/null || true
+    [ -n "${FIRST_ROLLOUT_ROLLBACK_DIR:-}" ] && rm -rf "${FIRST_ROLLOUT_ROLLBACK_DIR}" 2>/dev/null || true
+    FIRST_ROLLOUT_ROLLBACK_DIR=""
+    ACTIVE_FRONTEND_RELEASE_DIR=""
+    echo "ERROR: failed to copy ${legacy_dist} into ${legacy_dir}" >&2
+    release_deploy_lock || true
+    trap - INT TERM
+    return 1
+  fi
+  if ! _finalize_frontend_version_manifest "$legacy_dir" "$legacy_id" 1 \
+     || ! _record_own_frontend_assets "$legacy_dir"; then
+    rm -rf "$legacy_dir" 2>/dev/null || true
+    [ -n "${FIRST_ROLLOUT_ROLLBACK_DIR:-}" ] && rm -rf "${FIRST_ROLLOUT_ROLLBACK_DIR}" 2>/dev/null || true
+    FIRST_ROLLOUT_ROLLBACK_DIR=""
+    ACTIVE_FRONTEND_RELEASE_DIR=""
+    echo "ERROR: failed to finalize version.json or asset manifest for ${legacy_dir}" >&2
+    release_deploy_lock || true
+    trap - INT TERM
+    return 1
+  fi
+  if ! _is_servable_frontend_release_dir "$legacy_dir"; then
+    rm -rf "$legacy_dir" 2>/dev/null || true
+    [ -n "${FIRST_ROLLOUT_ROLLBACK_DIR:-}" ] && rm -rf "${FIRST_ROLLOUT_ROLLBACK_DIR}" 2>/dev/null || true
+    FIRST_ROLLOUT_ROLLBACK_DIR=""
+    ACTIVE_FRONTEND_RELEASE_DIR=""
+    echo "ERROR: migrated release ${legacy_dir} is not servable (requires index.html, version.json, assets/, help/index.html)" >&2
+    release_deploy_lock || true
+    trap - INT TERM
+    return 1
+  fi
+  if ! _atomic_replace_symlink "$legacy_id" "$cur_link"; then
+    rm -rf "$legacy_dir" 2>/dev/null || true
+    [ -n "${FIRST_ROLLOUT_ROLLBACK_DIR:-}" ] && rm -rf "${FIRST_ROLLOUT_ROLLBACK_DIR}" 2>/dev/null || true
+    FIRST_ROLLOUT_ROLLBACK_DIR=""
+    ACTIVE_FRONTEND_RELEASE_DIR=""
+    echo "ERROR: failed to atomically set ${cur_link} -> ${legacy_id}" >&2
+    release_deploy_lock || true
+    trap - INT TERM
+    return 1
+  fi
+  ACTIVE_FRONTEND_RELEASE_DIR=""
+
+  if ! _is_servable_frontend_release_dir "${rel_dir}/$(_read_frontend_current_release || true)"; then
+    [ -n "${FIRST_ROLLOUT_ROLLBACK_DIR:-}" ] && rm -rf "${FIRST_ROLLOUT_ROLLBACK_DIR}" 2>/dev/null || true
+    FIRST_ROLLOUT_ROLLBACK_DIR=""
+    echo "ERROR: web/releases/current failed post-link servability check" >&2
+    release_deploy_lock || true
+    trap - INT TERM
+    return 1
+  fi
+
+  expected_build=$(_read_frontend_build_id "$legacy_dir" || true)
+  expected_release=$(_read_frontend_release_tag "$legacy_dir" || true)
+  echo "$(date '+%T') first-releases-rollout: migrated web/dist -> web/releases/${legacy_id} (build=${expected_build}, release=${expected_release}; web/dist preserved)"
+
+  FIRST_ROLLOUT_ROLLBACK_PRE_FF="$rollout_pre_ff"
+  FIRST_ROLLOUT_EDGE_TOUCHED=1
+  if ! recreate_edge \
+     || ! wait_edge_ready \
+     || ! run_public_edge_check "$expected_build" "$cur_link" "$expected_release"; then
+    echo "ERROR: first-releases-rollout edge switch or verification failed; rolling edge back to web/dist using PRE_FF=${rollout_pre_ff} (web/dist preserved)" >&2
+    # Defer INT/TERM from rollback start until legacy HTTP verification finishes.
+    trap '_record_deferred_signal INT' INT
+    trap '_record_deferred_signal TERM' TERM
+    ROLLBACK_IN_PROGRESS=1
+    if _rollback_first_rollout_edge "$rollout_pre_ff"; then
+      FIRST_ROLLOUT_EDGE_TOUCHED=0
+      ROLLBACK_IN_PROGRESS=0
+      FIRST_ROLLOUT_ROLLBACK_PRE_FF=""
+      echo "first-releases-rollout rollback: edge recreated onto web/dist using PRE_FF=${rollout_pre_ff}"
+      release_deploy_lock || true
+      trap - INT TERM
+      exit_rc=1
+      [ "${DEFERRED_SIGNAL:-}" = "INT" ] && exit_rc=130
+      [ "${DEFERRED_SIGNAL:-}" = "TERM" ] && exit_rc=143
+      return "$exit_rc"
+    else
+      ROLLBACK_IN_PROGRESS=0
+      _mark_rollback_failed_lock "$rollout_pre_ff" "failure_rollback_failed"
+      echo "ERROR: first-releases-rollout rollback failed to recreate edge onto web/dist (PRE_FF=${rollout_pre_ff}); preserving failure lock and rollback snapshot" >&2
+      _print_first_rollout_manual_recovery_steps "$rollout_pre_ff"
+      trap - INT TERM
+      exit_rc=1
+      [ "${DEFERRED_SIGNAL:-}" = "INT" ] && exit_rc=130
+      [ "${DEFERRED_SIGNAL:-}" = "TERM" ] && exit_rc=143
+      return "$exit_rc"
+    fi
+  fi
+
+  FIRST_ROLLOUT_EDGE_TOUCHED=0
+  FIRST_ROLLOUT_ROLLBACK_PRE_FF=""
+  _cleanup_unused_first_rollout_rollbacks
+  FIRST_ROLLOUT_ROLLBACK_DIR=""
+  echo "$(date '+%T') first-releases-rollout completed: edge serving web/releases/current -> ${legacy_id} (web/dist preserved)"
+  release_deploy_lock || true
+  trap - INT TERM
+  return 0
+}
+
 if [ "${DALTON_DEPLOY_LIB_ONLY:-0}" != "1" ]; then
+  case "${1:-}" in
+    --resume-protocol)
+      printf '%s\n' "$DEPLOY_RESUME_PROTOCOL"
+      exit 0
+      ;;
+    --validate-resume)
+      shift
+      validate_deploy_resume_handshake "$@"
+      exit $?
+      ;;
+    --first-releases-rollout)
+      shift
+      run_first_releases_rollout "$@"
+      exit $?
+      ;;
+  esac
   run_deploy_main "$@"
 fi

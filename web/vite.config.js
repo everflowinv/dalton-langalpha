@@ -58,6 +58,8 @@ export default defineConfig(({ command, mode }) => {
     .split(',')
     .map((host) => host.trim())
     .filter(Boolean)
+  // DALTON-HOOK(frontend-release-dir): allow build_frontend_prod.sh --out-dir to build into a staged release dir via the shared pnpm build script
+  const daltonOutDir = (process.env.DALTON_VITE_OUT_DIR || '').trim()
 
   return {
     base: env.VITE_CDN_BASE || '/',
@@ -92,6 +94,8 @@ export default defineConfig(({ command, mode }) => {
       ],
     },
     build: {
+      // DALTON-HOOK(frontend-release-dir): target the staged release dir when DALTON_VITE_OUT_DIR is set; default stays dist
+      ...(daltonOutDir ? { outDir: daltonOutDir, emptyOutDir: true } : {}),
       rolldownOptions: {
         // Explicit single entry: dev-only harness pages (e.g. intro-preview.html)
         // must never ship in the production build, even if a future Vite version
