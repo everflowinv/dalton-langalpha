@@ -1004,10 +1004,12 @@ def dispatch_oss_service_request(
     configured_token: str,
     *,
     host_mode: str,
+    scope: Mapping[str, Any] | None = None,
 ) -> bool:
     """Verify server self-dispatch in ``messaging._is_service_request``.
 
-    Only explicit ``DALTON_AUTH_MODE == "oss"`` trusts an empty service token.
+    Only explicit ``DALTON_AUTH_MODE == "oss"`` trusts an empty service token, and
+    only for trusted local loopback requests (fail closed on remote/proxied scopes).
     In ``local`` mode, requires a valid >=32-char matching ``X-Service-Token``.
     """
     from src.dalton.auth import is_dalton_service_request
@@ -1018,9 +1020,11 @@ def dispatch_oss_service_request(
 
     mode = get_dalton_auth_mode()
     if mode == "oss":
-        return service_token_matches(sent_token, configured_token) or (
-            not configured_token
-        )
+        if service_token_matches(sent_token, configured_token):
+            return True
+        if not configured_token:
+            return scope is None or is_trusted_oss_local_owner(scope)
+        return False
     if mode == "local":
         return is_dalton_service_request(sent_token, configured_token)
     return False

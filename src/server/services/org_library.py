@@ -83,25 +83,13 @@ async def publish_target(
     if not link_on:
         raise _link_off()
     # DALTON-HOOK(share-redaction): sanitize thread title/summary and persist per-item custom_title metadata
-    import inspect
-
     from src.dalton.share_redaction import (
         prepare_org_library_publish_fields,
         upsert_org_library_title_meta,
     )
 
-    find_item_fn = getattr(library_db, "find_item", None)
-    existing_row = (
-        await find_item_fn(thread_id=target_id, artifact_id=None)
-        if kind == "thread" and inspect.iscoroutinefunction(find_item_fn)
-        else None
-    )
     eff_title, eff_summary, is_custom_title = await prepare_org_library_publish_fields(
-        kind=kind,
-        thread=thread,
-        existing_item_id=str(existing_row["item_id"]) if existing_row else None,
-        title=title,
-        summary=summary,
+        kind=kind, thread=thread, title=title, summary=summary
     )
     published = await library_db.publish(
         org_id=org_id,
@@ -282,27 +270,14 @@ async def remove_item(
     """Remove an item: the publisher's own (``publisher_id``), or any of the
     organization's, as the owner or admin ``actor_id`` asked in the console,
     which the activity log records as theirs. The link itself stays."""
-    # DALTON-HOOK(share-redaction): read custom_title meta before deleting row, record per-row flag in activity
-    from src.dalton.share_redaction import (
-        delete_org_library_title_meta,
-        get_org_library_title_meta_map,
-        resolve_org_library_remove_activity_title,
-    )
-
-    meta_before = await get_org_library_title_meta_map([item_id])
-    was_custom = bool(meta_before.get(str(item_id), False))
     removed = await library_db.remove(item_id, publisher_id=publisher_id, org_id=org_id)
     if removed is None:
         raise not_found()
-    if removed["kind"] == "thread":
-        await delete_org_library_title_meta(item_id)
     await _drop_snapshot(removed.get("archive_key"))
-    act_title, custom_flag = await resolve_org_library_remove_activity_title(
-        removed, was_custom_title=was_custom
-    )
-    detail: dict[str, Any] = {"kind": removed["kind"], "title": act_title}
-    if removed["kind"] == "thread":
-        detail["custom_title"] = bool(custom_flag)
+    # DALTON-HOOK(share-redaction): compute per-row custom_title activity detail & delete title meta
+    from src.dalton.share_redaction import resolve_org_library_remove_meta
+
+    detail = await resolve_org_library_remove_meta(item_id, removed)
     if publisher_id is None:
         detail |= {"publisher_id": removed["publisher_id"], "from_console": True}
     activity.record(

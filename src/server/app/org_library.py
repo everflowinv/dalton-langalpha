@@ -296,6 +296,10 @@ async def publish_item(request: PublishRequest, user_id: CurrentUserId) -> Libra
         row = await library.publish_skill(
             member.org.id, user_id, request.skill_name or "", title, summary
         )
+        # DALTON-HOOK(share-redaction): route all org-library write responses through unified redaction exit
+        from src.dalton.share_redaction import redact_org_library_rows
+
+        row = (await redact_org_library_rows([row]))[0]
         return LibraryItem(**_item(row, user_id))
     target_id = str(request.target_id)
     thread_id, artifact_id = (

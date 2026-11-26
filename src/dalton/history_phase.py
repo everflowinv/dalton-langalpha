@@ -88,3 +88,28 @@ def split_content_blocks_by_phase(
             segments.append((visible, phase))
 
     return segments, reasoning
+
+
+def build_ai_phase_text_specs(
+    content: Any,
+    *,
+    is_close_out: bool,
+    has_tool_calls: bool,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Return ``(text_event_data_list, reasoning)`` for ``projector._project_ai_message``."""
+    if is_close_out:
+        return [], None
+    segments, reasoning = split_content_blocks_by_phase(
+        content, followed_by_tool_call=has_tool_calls
+    )
+    specs: list[dict[str, Any]] = []
+    last_idx = len(segments) - 1
+    for idx, (seg_text, seg_phase) in enumerate(segments):
+        data: dict[str, Any] = {
+            "content": seg_text,
+            "finish_reason": None if (has_tool_calls or idx != last_idx) else "stop",
+        }
+        if seg_phase:
+            data["phase"] = seg_phase
+        specs.append(data)
+    return specs, reasoning

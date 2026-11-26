@@ -205,7 +205,8 @@ class TestBuildAttachmentMetadata:
             assert result[0]["url"] == "https://cdn.example.com/key"
             uploaded_key, uploaded = mock_upload.call_args[0]
             assert "\n" not in uploaded_key
-            assert uploaded_key.startswith("attachments/t123/") and uploaded_key.endswith("/chart.png")
+            # DALTON-HOOK(share-redaction): new inline attachments upload under private-media/attachments/
+            assert uploaded_key.startswith("private-media/attachments/t123/") and uploaded_key.endswith("/chart.png")
             assert uploaded == b"abc"
             assert mock_upload.call_args.kwargs == {"content_type": "image/png"}
 

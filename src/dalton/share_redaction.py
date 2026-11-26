@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterable, Iterator, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from html import escape as html_escape
 from html.parser import HTMLParser
@@ -54,7 +55,7 @@ RENDERABLE_FENCE_LANGUAGES: frozenset[str] = frozenset(
     }
 )
 
-SAFE_WAKEUP_NOTICE_FIELDS: tuple[str, ...] = (
+SAFE_NOTIFICATION_FIELD_TUPLE: tuple[str, ...] = (
     "kind",
     "notice",
     "seq",
@@ -63,18 +64,14 @@ SAFE_WAKEUP_NOTICE_FIELDS: tuple[str, ...] = (
     "skipped",
     "fired_at",
     "timezone",
-)
-
-SAFE_MARKET_TARGET_FIELDS: tuple[str, ...] = (
     "target_id",
-    "kind",
-    "notice",
-    "fired_at",
 )
 
-SAFE_NOTIFICATION_FIELDS: frozenset[str] = frozenset(
-    (*SAFE_WAKEUP_NOTICE_FIELDS, *SAFE_MARKET_TARGET_FIELDS)
-)
+SAFE_WAKEUP_NOTICE_FIELDS: tuple[str, ...] = SAFE_NOTIFICATION_FIELD_TUPLE
+
+SAFE_MARKET_TARGET_FIELDS: tuple[str, ...] = SAFE_NOTIFICATION_FIELD_TUPLE
+
+SAFE_NOTIFICATION_FIELDS: frozenset[str] = frozenset(SAFE_NOTIFICATION_FIELD_TUPLE)
 
 _IMAGE_EXTENSIONS: frozenset[str] = frozenset(
     {"png", "jpg", "jpeg", "gif", "svg", "webp", "bmp", "ico", "avif"}
@@ -176,6 +173,19 @@ _HOST_PATH_RE = re.compile(
     r"|/mnt/livefs(?:/[^\s\"'<>)\]}（）「」『』【】，《》。；：！？]*)?)"
 )
 
+_RELATIVE_WS_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_.:/@-])(?:"
+    r"\.\.?/[A-Za-z0-9_.@+-][A-Za-z0-9_./@+-]*"
+    r"|(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.(?:"
+    r"pdf|md|markdown|txt|csv|tsv|json|jsonl|ya?ml|toml|ini|cfg|conf|env|xml|html?|css|scss|"
+    r"js|jsx|ts|tsx|mjs|cjs|py|pyc|sh|bash|zsh|sql|db|sqlite|parquet|feather|arrow|"
+    r"xlsx?|docx?|pptx?|rtf|png|jpe?g|gif|svg|webp|bmp|ico|avif|mp3|mp4|wav|m4a|webm|"
+    r"zip|tar|gz|tgz|bz2|7z|rar|log|out|err|tex|bib|r|rmd|ipynb|go|rs|java|c|cc|cpp|h|hpp|rb|php|swift|kt"
+    r")(?![A-Za-z0-9_/-])"
+    r")",
+    re.IGNORECASE,
+)
+
 _TRAILING_PUNCT = ".,;:!?)]}\"'"
 
 _MD_IMAGE_COUNT_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)|!\[[^\]]*\]\[[^\]]*\]|<\s*(?:img|picture|image|feimage)\b", re.IGNORECASE)
@@ -191,9 +201,42 @@ _MD_PARSER = (
     .enable("strikethrough")
 )
 
-# Cold-projection singleflight coordinator: (thread_id, before_turn, lines_epoch) -> Future
-_COLD_SINGLEFLIGHT: dict[tuple[str, Any, str], asyncio.Future[Any]] = {}
+# Cold-projection singleflight coordinator: (thread_id, before_turn, lines_epoch) -> Task
+_COLD_SINGLEFLIGHT: dict[tuple[str, Any, str], asyncio.Task[Any]] = {}
 _BG_WARM_TASKS: set[asyncio.Task[Any]] = set()
+_COLD_PROJECTION_HIT: ContextVar[list[bool] | None] = ContextVar(
+    "_COLD_PROJECTION_HIT", default=None
+)
+
+
+def mark_cold_projection_miss() -> None:
+    """Record that the current replay read ran cold checkpoint projection (cache miss)."""
+    flag = _COLD_PROJECTION_HIT.get()
+    if flag is not None:
+        flag[0] = True
+
+
+def normalize_merged_share_permissions(
+    existing_perms: Mapping[str, Any] | None,
+    incoming_perms: Any | None,
+) -> dict[str, Any]:
+    """Merge incoming permission fields onto ``existing_perms`` without ever elevating ``allow_files``.
+
+    Unified AU1 rule: whenever effective ``allow_files`` is False, ``allow_download`` is
+    forced to False. Partial updates (audience-only, download-only, or omitting ``allow_files``)
+    never flip ``allow_files`` from False to True.
+    """
+    merged: dict[str, Any] = (
+        dict(existing_perms) if isinstance(existing_perms, Mapping) else {}
+    )
+    if incoming_perms is not None:
+        fields_set = getattr(incoming_perms, "model_fields_set", None)
+        if fields_set:
+            merged.update(incoming_perms.model_dump(exclude_unset=True))
+    if not merged.get("allow_files"):
+        merged["allow_files"] = False
+        merged["allow_download"] = False
+    return merged
 
 
 @dataclass(frozen=True)
@@ -349,16 +392,16 @@ def _strip_thinking_from_plain_chunk(chunk: str, *, is_tail: bool) -> str:
     return cleaned
 
 
-def _split_code_protected_segments(text: str) -> list[tuple[bool, str]]:
-    """Split markdown into ``(is_code, segment)`` preserving fenced blocks & inline backtick spans."""
-    segments: list[tuple[bool, str]] = []
+def _split_code_protected_segments(text: str) -> list[tuple[str, str]]:
+    """Split markdown into ``(kind, segment)`` where ``kind`` is ``"plain"``, ``"inline_code"``, or ``"fence"``."""
+    segments: list[tuple[str, str]] = []
     buf: list[str] = []
     i = 0
     n = len(text)
 
     def flush_plain() -> None:
         if buf:
-            segments.append((False, "".join(buf)))
+            segments.append(("plain", "".join(buf)))
             buf.clear()
 
     at_line_start = True
@@ -400,7 +443,7 @@ def _split_code_protected_segments(text: str) -> list[tuple[bool, str]]:
                                 scan = next_nl + 1 if next_nl < n else n
                                 break
                             scan = next_nl + 1 if next_nl < n else n
-                        segments.append((True, text[block_start:scan]))
+                        segments.append(("fence", text[block_start:scan]))
                         i = scan
                         at_line_start = True
                         continue
@@ -427,7 +470,7 @@ def _split_code_protected_segments(text: str) -> list[tuple[bool, str]]:
                 search = end_t
             if found_close != -1:
                 flush_plain()
-                segments.append((True, text[i:found_close]))
+                segments.append(("inline_code", text[i:found_close]))
                 at_line_start = text[found_close - 1] == "\n"
                 i = found_close
                 continue
@@ -440,6 +483,91 @@ def _split_code_protected_segments(text: str) -> list[tuple[bool, str]]:
     return segments
 
 
+_NEED_MORE_THINKING_INLINE_START_RE = re.compile(
+    r"(?:^|\n)[ \t]*need\s+more\s+thinking\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_need_more_thinking_paragraphs(segments: list[tuple[str, str]]) -> str:
+    """Strip full ``NEED MORE THINKING`` paragraphs across plain and inline-code segments.
+
+    Fenced code blocks remain protected and delimit paragraphs; inline code spans
+    inside a ``NEED MORE THINKING`` paragraph are stripped along with all remaining
+    text in that paragraph up to the next blank line or fenced block.
+    """
+    out: list[str] = []
+    in_need_para = False
+    at_para_start = True
+
+    for kind, seg in segments:
+        if kind == "tag_break":
+            # A stripped <thinking> / <thinking_mode> block allows a directly-following
+            # `NEED MORE THINKING` paragraph even without an intervening blank line.
+            if not in_need_para:
+                at_para_start = True
+            continue
+        if not seg:
+            continue
+        if kind == "fence":
+            in_need_para = False
+            out.append(seg)
+            at_para_start = True
+            continue
+        if kind == "inline_code":
+            if in_need_para:
+                continue
+            out.append(seg)
+            at_para_start = False
+            continue
+
+        parts = re.split(r"(\n[ \t\r]*\n)", seg)
+        for idx, part in enumerate(parts):
+            if idx % 2 == 1:
+                # Blank-line paragraph separator
+                if in_need_para:
+                    in_need_para = False
+                    at_para_start = True
+                    if out and not _BLANK_LINE_RE.fullmatch(out[-1]):
+                        out.append(part)
+                else:
+                    if out or part.strip():
+                        out.append(part)
+                    at_para_start = True
+                continue
+
+            if not part:
+                continue
+            if in_need_para:
+                continue
+
+            if at_para_start and _NEED_MORE_THINKING_HEAD_RE.match(part.lstrip("\r\n")):
+                in_need_para = True
+                at_para_start = False
+                if out and _BLANK_LINE_RE.fullmatch(out[-1]):
+                    out.pop()
+                continue
+
+            # Also handle `NEED MORE THINKING` starting on a new line within a paragraph
+            m_line = _NEED_MORE_THINKING_INLINE_START_RE.search(part)
+            if m_line is not None:
+                prefix = part[: m_line.start()]
+                if prefix:
+                    out.append(prefix)
+                in_need_para = True
+                at_para_start = False
+                continue
+
+            out.append(part)
+            if part.strip():
+                at_para_start = False
+
+    # Trim dangling trailing blank-line separator left by stripping the final paragraph
+    while out and _BLANK_LINE_RE.fullmatch(out[-1]):
+        out.pop()
+    return "".join(out)
+
+
 def strip_inline_thinking_markers(text: str) -> str:
     """Strip all inline thinking markers anywhere in ``text`` outside code blocks/spans."""
     if not text:
@@ -449,36 +577,34 @@ def strip_inline_thinking_markers(text: str) -> str:
     if "<" not in low and "need" not in low:
         return text
 
-    # Track unclosed thinking blocks across segments carefully:
-    # Actually an unclosed <thinking> tag in plain text should consume until </thinking> or EOF,
-    # even if a code span sits inside the thinking block. So first split only on fenced code blocks
-    # and inline code spans outside thinking blocks!
-    out: list[str] = []
     segments = _split_code_protected_segments(text)
-    plain_indices = [idx for idx, (is_code, _) in enumerate(segments) if not is_code]
+    plain_indices = [idx for idx, (kind, _) in enumerate(segments) if kind == "plain"]
     last_plain_idx = plain_indices[-1] if plain_indices else -1
 
-    # Walk with persistent stack across non-code segments so `<thinking> `code` </thinking>`
-    # still strips the whole thinking block, while literal `` `<thinking>` `` outside thinking stays.
+    # Pass 1: strip <thinking> / <thinking_mode> blocks & truncated tail tag while
+    # preserving code fences and inline code outside thinking blocks.
+    after_tags: list[tuple[str, str]] = []
     stack: list[str] = []
-    for idx, (is_code, seg) in enumerate(segments):
-        if is_code:
+    for idx, (kind, seg) in enumerate(segments):
+        if kind != "plain":
             if not stack:
-                out.append(seg)
+                after_tags.append((kind, seg))
             continue
-        # Process plain segment with current stack
         pos = 0
-        seg_out: list[str] = []
         for m in _THINK_TAG_TOKEN_RE.finditer(seg):
             is_close = bool(m.group(1))
             tag_name = m.group(2).lower()
             if not stack:
                 if not is_close:
-                    seg_out.append(seg[pos : m.start()])
+                    before = seg[pos : m.start()]
+                    if before:
+                        after_tags.append(("plain", before))
                     stack.append(tag_name)
                     pos = m.end()
                 else:
-                    seg_out.append(seg[pos : m.start()])
+                    before = seg[pos : m.start()]
+                    if before:
+                        after_tags.append(("plain", before))
                     pos = m.end()
             else:
                 if not is_close:
@@ -489,17 +615,20 @@ def strip_inline_thinking_markers(text: str) -> str:
                             if stack.pop() == tag_name:
                                 break
                     if not stack:
+                        after_tags.append(("tag_break", ""))
                         pos = m.end()
         if not stack and pos < len(seg):
-            seg_out.append(seg[pos:])
-        cleaned_seg = "".join(seg_out)
-        if not stack:
-            cleaned_seg = _strip_thinking_from_plain_chunk(
-                cleaned_seg, is_tail=(idx == last_plain_idx)
-            )
-        out.append(cleaned_seg)
+            tail_seg = seg[pos:]
+            if idx == last_plain_idx and "<" in tail_seg[-24:]:
+                m_part = _TRAILING_PARTIAL_THINK_RE.search(tail_seg)
+                if m_part and len(m_part.group(0).strip()) >= 3:
+                    tail_seg = tail_seg[: m_part.start()]
+            if tail_seg:
+                after_tags.append(("plain", tail_seg))
 
-    return "".join(out).strip()
+    # Pass 2: strip full NEED MORE THINKING paragraphs across plain + inline-code spans.
+    result = _strip_need_more_thinking_paragraphs(after_tags)
+    return result.strip()
 
 
 # =============================================================================
@@ -743,6 +872,24 @@ def scrub_protected_references(
 
     # Generic host/sandbox paths
     res = _HOST_PATH_RE.sub(lambda m: _replace_host_path(m), res)
+
+    # Workspace-relative paths (e.g. `reports/q3.pdf`, `out/memo.md`, `./charts/a.png`),
+    # while leaving intact any allowed non-protected http(s):// URLs.
+    protected_url_spans: list[tuple[int, int]] = [
+        (m.start(), m.end()) for m in _INLINE_URL_RE.finditer(res)
+    ]
+
+    def _replace_rel_ws_path(m: re.Match[str]) -> str:
+        s, e = m.start(), m.end()
+        for us, ue in protected_url_spans:
+            if s >= us and e <= ue:
+                return m.group(0)
+        core, tail = _split_trailing_punct(m.group(0))
+        if not core:
+            return m.group(0)
+        return "[redacted-path]" + tail
+
+    res = _RELATIVE_WS_PATH_RE.sub(_replace_rel_ws_path, res)
     return res
 
 
@@ -1203,6 +1350,118 @@ def _scrub_renderable_fence_body(
     return cleaned
 
 
+_SAFE_PLACEHOLDER_TOKENS = frozenset(
+    {"[redacted-url]", "[redacted-path]", "[redacted-image-url]", "[已隐藏链接]"}
+)
+_SAFE_PLACEHOLDER_SPLIT_RE = re.compile(
+    r"(\[redacted-url\]|\[redacted-path\]|\[redacted-image-url\]|\[已隐藏链接\])"
+)
+
+
+def _escape_markdown_text_chunk(raw: str) -> str:
+    """Escape Markdown/HTML syntax characters in AST-decoded text tokens so
+    re-serialization can never turn escaped images/links/HTML back into active nodes."""
+    if not raw:
+        return raw
+    parts = _SAFE_PLACEHOLDER_SPLIT_RE.split(raw)
+    escaped_parts: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        if part in _SAFE_PLACEHOLDER_TOKENS:
+            escaped_parts.append(part)
+            continue
+        chunk = (
+            part.replace("\\", "\\\\")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("`", "\\`")
+            .replace("[", "\\[")
+            .replace("]", "\\]")
+        )
+        # Escape `!` when preceding `[` (now `\[`) or at end of text token (cross-token `![`)
+        chunk = chunk.replace("!\\[", "\\!\\[")
+        if chunk.endswith("!"):
+            chunk = chunk[:-1] + "\\!"
+        # Prevent `[redacted-url]` immediately followed by `(href)` from forming a link
+        if escaped_parts and escaped_parts[-1] in _SAFE_PLACEHOLDER_TOKENS:
+            if chunk.startswith("("):
+                chunk = "\\" + chunk
+        escaped_parts.append(chunk)
+    return "".join(escaped_parts)
+
+
+_AST_ALLOWED_HTML_TAGS = (
+    _HTML_SAFE_FORMATTING_TAGS | _HTML_CELL_TAGS | {"a", "redacted-image"}
+)
+_AST_HTML_TAG_RE = re.compile(r"<\s*(/?)\s*([A-Za-z][A-Za-z0-9:-]*)\b([^>]*)>")
+
+
+def _has_disallowed_ast_resource_nodes(
+    markdown: str,
+    *,
+    protected_urls: tuple[str, ...],
+    roots: tuple[str, ...],
+) -> bool:
+    """Re-parse serialized Markdown and assert no unauthorized resource/HTML nodes exist."""
+    tokens = _MD_PARSER.parse(markdown)
+    stack: list[Token] = list(tokens)
+    while stack:
+        tok = stack.pop()
+        if tok.children:
+            stack.extend(tok.children)
+        ttype = tok.type
+        if ttype == "image":
+            return True
+        if ttype == "link_open":
+            href = str(tok.attrGet("href") or "").strip()
+            if not href or is_protected_reference(
+                href,
+                protected_urls=protected_urls,
+                roots=roots,
+                treat_image_url_as_protected=True,
+            ):
+                return True
+            _, scheme, _, decoded_path = _normalize_url_for_check(href)
+            if not (
+                scheme in ("http", "https", "mailto")
+                or (scheme == "" and _STANDALONE_SHORT_LINK_RE.match(decoded_path))
+            ):
+                return True
+        if ttype in ("html_inline", "html_block"):
+            frag = tok.content.strip()
+            if not frag:
+                continue
+            tags = list(_AST_HTML_TAG_RE.finditer(frag))
+            if not tags:
+                return True
+            for m in tags:
+                is_close = bool(m.group(1))
+                tag = m.group(2).lower()
+                attrs = m.group(3) or ""
+                if tag not in _AST_ALLOWED_HTML_TAGS:
+                    return True
+                if is_close:
+                    continue
+                low_attrs = attrs.lower()
+                if re.search(
+                    r"\b(?:src|srcset|imagesrcset|poster|background|xlink:href|style|title|aria-[a-z0-9_-]+|data-[a-z0-9_-]+|on[a-z]+)\s*=",
+                    low_attrs,
+                ):
+                    return True
+                if tag == "a":
+                    href_m = re.search(r"""\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", attrs, re.IGNORECASE)
+                    href_val = (href_m.group(1) or href_m.group(2) or href_m.group(3) or "").strip() if href_m else ""
+                    if href_val and is_protected_reference(
+                        href_val,
+                        protected_urls=protected_urls,
+                        roots=roots,
+                        treat_image_url_as_protected=True,
+                    ):
+                        return True
+    return False
+
+
 def _render_inline_tokens(
     children: list[Token] | None,
     *,
@@ -1227,11 +1486,13 @@ def _render_inline_tokens(
         ttype = tok.type
 
         if ttype == "text":
-            _push(
-                scrub_protected_references(
-                    tok.content, protected_urls=protected_urls, roots=roots
-                )
+            scrubbed_text = scrub_protected_references(
+                tok.content,
+                protected_urls=protected_urls,
+                roots=roots,
+                scrub_all_image_urls=True,
             )
+            _push(_escape_markdown_text_chunk(scrubbed_text))
         elif ttype == "softbreak":
             _push("\n")
         elif ttype == "hardbreak":
@@ -1628,8 +1889,27 @@ def sanitize_shared_markdown(
 
     cleaned = _unwrap_backtick_file_refs(cleaned)
     tokens = _MD_PARSER.parse(cleaned)
-    rebuilt = _render_block_tokens(tokens, protected_urls=p_urls, roots=norm_roots)
-    return rebuilt.strip()
+    rebuilt = _render_block_tokens(tokens, protected_urls=p_urls, roots=norm_roots).strip()
+    # Defense-in-depth: verify re-parsed AST introduces zero unauthorized resource/HTML nodes.
+    if rebuilt and _has_disallowed_ast_resource_nodes(
+        rebuilt, protected_urls=p_urls, roots=norm_roots
+    ):
+        rebuilt = _render_block_tokens(
+            _MD_PARSER.parse(rebuilt), protected_urls=p_urls, roots=norm_roots
+        ).strip()
+        if rebuilt and _has_disallowed_ast_resource_nodes(
+            rebuilt, protected_urls=p_urls, roots=norm_roots
+        ):
+            # Final fail-closed fallback: escape all remaining angle brackets/brackets
+            rebuilt = _escape_markdown_text_chunk(
+                scrub_protected_references(
+                    rebuilt,
+                    protected_urls=p_urls,
+                    roots=norm_roots,
+                    scrub_all_image_urls=True,
+                )
+            ).strip()
+    return rebuilt
 
 
 # =============================================================================
@@ -1759,7 +2039,7 @@ async def prepare_org_library_publish_fields(
     *,
     kind: str,
     thread: Mapping[str, Any] | None,
-    existing_item_id: str | None,
+    existing_item_id: str | None = None,
     title: str | None,
     summary: str | None,
 ) -> tuple[str | None, str | None, bool]:
@@ -1770,8 +2050,13 @@ async def prepare_org_library_publish_fields(
     if kind != "thread":
         return title, summary, bool(title)
 
+    tid = str(thread.get("conversation_thread_id") or "") if isinstance(thread, Mapping) else ""
+    if not existing_item_id and tid:
+        existing_item_id = await _find_existing_org_library_thread_item_id(tid)
+
     eff = await resolve_effective_share_permissions(thread)
     roots = extract_thread_roots(thread)
+    p_urls = (await _load_thread_protected_urls_map([tid])).get(tid, ()) if (tid and not eff.allow_files) else ()
     existing_custom = False
     if existing_item_id:
         try:
@@ -1781,9 +2066,13 @@ async def prepare_org_library_publish_fields(
             existing_custom = False
 
     if title is not None and title.strip():
-        clean_t = clean_org_library_title(title, roots=roots) if not eff.allow_files else title
+        clean_t = (
+            clean_org_library_title(title, protected_urls=p_urls, roots=roots)
+            if not eff.allow_files
+            else title
+        )
         clean_s = (
-            clean_org_library_summary(summary, roots=roots)
+            clean_org_library_summary(summary, protected_urls=p_urls, roots=roots)
             if (summary is not None and not eff.allow_files)
             else summary
         )
@@ -1791,7 +2080,7 @@ async def prepare_org_library_publish_fields(
 
     # Title omitted on publish/re-publish
     clean_s = (
-        clean_org_library_summary(summary, roots=roots)
+        clean_org_library_summary(summary, protected_urls=p_urls, roots=roots)
         if (summary is not None and not eff.allow_files)
         else summary
     )
@@ -1814,11 +2103,15 @@ async def prepare_org_library_edit_fields(
         return title, summary, is_explicit, act_title
 
     tid = str(row.get("thread_id") or "")
-    threads_map = await _load_threads_for_redaction([tid]) if tid else {}
+    threads_map, protected_urls_map = await asyncio.gather(
+        _load_threads_for_redaction([tid]) if tid else asyncio.sleep(0, result={}),
+        _load_thread_protected_urls_map([tid]) if tid else asyncio.sleep(0, result={}),
+    )
     trow = threads_map.get(tid)
     ws = {"user_id": trow.get("owner_user_id")} if trow and trow.get("owner_user_id") else None
     eff = await resolve_effective_share_permissions(trow, ws)
     roots = extract_thread_roots(trow)
+    p_urls = protected_urls_map.get(tid, ())
 
     try:
         meta = await get_org_library_title_meta_map([item_id])
@@ -1827,13 +2120,17 @@ async def prepare_org_library_edit_fields(
         existing_custom = False
 
     clean_s = (
-        clean_org_library_summary(summary, roots=roots)
+        clean_org_library_summary(summary, protected_urls=p_urls, roots=roots)
         if (summary is not None and not eff.allow_files)
         else summary
     )
 
     if title is not None and title.strip():
-        clean_t = clean_org_library_title(title, roots=roots) if not eff.allow_files else title
+        clean_t = (
+            clean_org_library_title(title, protected_urls=p_urls, roots=roots)
+            if not eff.allow_files
+            else title
+        )
         return clean_t, clean_s, True, clean_t[:256]
 
     if not existing_custom and not eff.allow_files:
@@ -1841,7 +2138,9 @@ async def prepare_org_library_edit_fields(
 
     existing_title = str(row.get("title") or "")
     if not eff.allow_files:
-        existing_title = clean_org_library_title(existing_title, roots=roots)
+        existing_title = clean_org_library_title(
+            existing_title, protected_urls=p_urls, roots=roots
+        )
     return title, clean_s, existing_custom, existing_title[:256]
 
 
@@ -1967,10 +2266,38 @@ async def delete_org_library_title_meta(item_id: str) -> None:
         raise
 
 
+async def _find_existing_org_library_thread_item_id(thread_id: str) -> str | None:
+    """Look up existing ``org_library_items.item_id`` for ``thread_id`` directly from DB."""
+    if not thread_id:
+        return None
+    from src.server.database.pool import get_db_connection
+
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT item_id::text AS item_id
+                    FROM org_library_items
+                    WHERE thread_id = %s::uuid
+                    LIMIT 1
+                    """,
+                    (str(thread_id),),
+                )
+                row = await cur.fetchone()
+        return str(row["item_id"]) if row and row.get("item_id") else None
+    except RuntimeError as exc:
+        if "pool is not open" in str(exc).lower():
+            return None
+        raise
+    except Exception:
+        return None
+
+
 async def _load_threads_for_redaction(
     thread_ids: Iterable[str],
 ) -> dict[str, dict[str, Any]]:
-    """Batch-load thread rows + workspace roots needed for effective share permissions & scrubbing."""
+    """Batch-load thread rows + workspace roots (including ``w.previous_root_dirs``) for redaction."""
     ids = list({str(tid) for tid in thread_ids if tid})
     if not ids:
         return {}
@@ -1987,6 +2314,7 @@ async def _load_threads_for_redaction(
                            t.share_permissions,
                            w.user_id AS owner_user_id,
                            w.config AS workspace_config,
+                           w.previous_root_dirs AS previous_root_dirs,
                            c.root_dir AS computer_root_dir
                     FROM conversation_threads t
                     LEFT JOIN workspaces w ON w.workspace_id = t.workspace_id
@@ -2001,6 +2329,97 @@ async def _load_threads_for_redaction(
         if "pool is not open" in str(exc).lower():
             return {}
         raise
+
+
+async def _load_workspace_roots_map(
+    workspace_ids: Iterable[str],
+) -> dict[str, tuple[str, ...]]:
+    """Batch-load current & historical root dirs for workspaces (for rows without ``thread_id``)."""
+    ids = list({str(wid) for wid in workspace_ids if wid})
+    if not ids:
+        return {}
+    from src.server.database.pool import get_db_connection
+
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT w.workspace_id::text AS workspace_id,
+                           w.config AS workspace_config,
+                           w.previous_root_dirs AS previous_root_dirs,
+                           c.root_dir AS computer_root_dir
+                    FROM workspaces w
+                    LEFT JOIN computers c ON c.computer_id = w.computer_id
+                    WHERE w.workspace_id = ANY(%s::uuid[])
+                    """,
+                    (ids,),
+                )
+                rows = await cur.fetchall()
+        return {str(r["workspace_id"]): extract_thread_roots(r) for r in rows}
+    except RuntimeError as exc:
+        if "pool is not open" in str(exc).lower():
+            return {}
+        raise
+    except Exception:
+        return {}
+
+
+async def _load_thread_protected_urls_map(
+    thread_ids: Iterable[str],
+) -> dict[str, set[str]]:
+    """Batch-load each thread's registered ``protected_urls`` from the same DB sources as replay."""
+    ids = list({str(tid) for tid in thread_ids if tid})
+    if not ids:
+        return {}
+    from src.server.database.pool import get_db_connection
+
+    queries_by_tid: dict[str, list[dict[str, Any]]] = {}
+    responses_by_tid: dict[str, dict[Any, dict[str, Any]]] = {}
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT conversation_thread_id::text AS thread_id, metadata
+                    FROM conversation_queries
+                    WHERE conversation_thread_id = ANY(%s::uuid[])
+                      AND metadata IS NOT NULL
+                    """,
+                    (ids,),
+                )
+                for row in await cur.fetchall():
+                    tid = str(row["thread_id"])
+                    queries_by_tid.setdefault(tid, []).append(dict(row))
+
+                await cur.execute(
+                    """
+                    SELECT conversation_thread_id::text AS thread_id, turn_index, replay_facts
+                    FROM conversation_responses
+                    WHERE conversation_thread_id = ANY(%s::uuid[])
+                      AND replay_facts IS NOT NULL
+                    """,
+                    (ids,),
+                )
+                for row in await cur.fetchall():
+                    tid = str(row["thread_id"])
+                    responses_by_tid.setdefault(tid, {})[row.get("turn_index")] = dict(row)
+    except RuntimeError as exc:
+        if "pool is not open" in str(exc).lower():
+            return {}
+        raise
+    except Exception:
+        return {}
+
+    out: dict[str, set[str]] = {}
+    for tid in ids:
+        urls = collect_thread_protected_urls(
+            queries_by_tid.get(tid),
+            responses_by_tid.get(tid),
+        )
+        if urls:
+            out[tid] = urls
+    return out
 
 
 def extract_thread_roots(thread: Mapping[str, Any] | None) -> tuple[str, ...]:
@@ -2041,9 +2460,10 @@ async def redact_org_library_rows(
     item_ids = [str(r["item_id"]) for r in thread_rows_input if r.get("item_id")]
     thread_ids = [str(r["thread_id"]) for r in thread_rows_input if r.get("thread_id")]
 
-    meta_map, threads_map = await asyncio.gather(
+    meta_map, threads_map, protected_urls_map = await asyncio.gather(
         get_org_library_title_meta_map(item_ids),
         _load_threads_for_redaction(thread_ids),
+        _load_thread_protected_urls_map(thread_ids),
     )
 
     eff_cache: dict[str, EffectiveSharePermissions] = {}
@@ -2067,29 +2487,46 @@ async def redact_org_library_rows(
         eff = eff_cache.get(tid, EffectiveSharePermissions(False, False))
         if not eff.allow_files:
             roots = extract_thread_roots(trow)
+            p_urls = protected_urls_map.get(tid, ())
             is_custom = meta_map.get(str(copied.get("item_id") or ""), False)
             if is_custom:
                 copied["title"] = clean_org_library_title(
-                    copied.get("title"), roots=roots
+                    copied.get("title"), protected_urls=p_urls, roots=roots
                 )
             else:
                 copied["title"] = DEFAULT_SHARED_TITLE
             copied["summary"] = clean_org_library_summary(
-                copied.get("summary"), roots=roots
+                copied.get("summary"), protected_urls=p_urls, roots=roots
             )
         result.append(copied)
     return result
 
 
-def _scrub_detail_value(val: Any, *, roots: tuple[str, ...]) -> Any:
+def _scrub_detail_value(
+    val: Any,
+    *,
+    protected_urls: Iterable[str] = (),
+    roots: tuple[str, ...] = (),
+) -> Any:
     if isinstance(val, str):
-        return scrub_protected_references(val, roots=roots)
+        return scrub_protected_references(
+            val, protected_urls=protected_urls, roots=roots
+        )
     if isinstance(val, list):
-        return [_scrub_detail_value(v, roots=roots) for v in val]
+        return [
+            _scrub_detail_value(v, protected_urls=protected_urls, roots=roots)
+            for v in val
+        ]
     if isinstance(val, tuple):
-        return [_scrub_detail_value(v, roots=roots) for v in val]
+        return [
+            _scrub_detail_value(v, protected_urls=protected_urls, roots=roots)
+            for v in val
+        ]
     if isinstance(val, dict):
-        return {k: _scrub_detail_value(v, roots=roots) for k, v in val.items()}
+        return {
+            k: _scrub_detail_value(v, protected_urls=protected_urls, roots=roots)
+            for k, v in val.items()
+        }
     return val
 
 
@@ -2102,7 +2539,10 @@ async def redact_activity_rows(
       ``Action.LIBRARY_REMOVED`` (and any row carrying ``thread_id`` + ``detail.title``).
     - Judges each row's title strictly by that row's own ``detail.get("custom_title") is True``.
     - Strips internal ``custom_title`` marker from output ``detail``.
-    - Scrubs protected references & paths across ALL rows and ALL 33 ``Action`` types.
+    - Redacts ``detail.path`` for both thread-bound (``allow_files=False``) and
+      workspace-only rows (e.g. ``FILE_PUBLISHED`` / ``FILE_UNSHARED`` without ``thread_id``).
+    - Scrubs protected references (including thread ``protected_urls``), historical roots,
+      and relative workspace paths across ALL rows and ALL ``Action`` types.
     """
     if not rows:
         return []
@@ -2120,10 +2560,17 @@ async def redact_activity_rows(
         }
     )
 
-    thread_ids = [
-        str(r["thread_id"]) for r in rows if r.get("thread_id")
+    thread_ids = [str(r["thread_id"]) for r in rows if r.get("thread_id")]
+    workspace_ids_no_thread = [
+        str(r["workspace_id"])
+        for r in rows
+        if not r.get("thread_id") and r.get("workspace_id")
     ]
-    threads_map = await _load_threads_for_redaction(thread_ids)
+    threads_map, protected_urls_map, ws_roots_map = await asyncio.gather(
+        _load_threads_for_redaction(thread_ids),
+        _load_thread_protected_urls_map(thread_ids),
+        _load_workspace_roots_map(workspace_ids_no_thread),
+    )
 
     eff_cache: dict[str, EffectiveSharePermissions] = {}
     for tid in set(thread_ids):
@@ -2146,9 +2593,15 @@ async def redact_activity_rows(
         detail = dict(raw_detail) if isinstance(raw_detail, Mapping) else {}
 
         tid = str(copied.get("thread_id") or "")
+        wid = str(copied.get("workspace_id") or "")
         trow = threads_map.get(tid) if tid else None
-        roots = extract_thread_roots(trow)
-        eff = eff_cache.get(tid, EffectiveSharePermissions(False, False)) if tid else EffectiveSharePermissions(False, False)
+        roots = extract_thread_roots(trow) if trow is not None else ws_roots_map.get(wid, ())
+        p_urls = protected_urls_map.get(tid, ())
+        eff = (
+            eff_cache.get(tid, EffectiveSharePermissions(False, False))
+            if tid
+            else EffectiveSharePermissions(False, False)
+        )
 
         action_val = copied.get("action")
         is_library_thread = (
@@ -2163,19 +2616,23 @@ async def redact_activity_rows(
         if (is_library_thread or has_thread_title) and not eff.allow_files:
             if is_custom_title:
                 detail["title"] = clean_org_library_title(
-                    str(detail.get("title") or ""), roots=roots
+                    str(detail.get("title") or ""),
+                    protected_urls=p_urls,
+                    roots=roots,
                 )
             else:
                 detail["title"] = DEFAULT_SHARED_TITLE
 
-        if tid and not eff.allow_files and detail.get("path"):
+        # Redact `detail["path"]` when allow_files=False (both thread-bound and
+        # workspace-only rows such as Action.FILE_PUBLISHED which carry no thread_id).
+        if not eff.allow_files and isinstance(detail.get("path"), str) and detail["path"].strip():
             detail["path"] = "[redacted-path]"
 
         # Scrub all string values & string lists across every activity row
         for k, v in list(detail.items()):
             if k == "path" and v == "[redacted-path]":
                 continue
-            detail[k] = _scrub_detail_value(v, roots=roots)
+            detail[k] = _scrub_detail_value(v, protected_urls=p_urls, roots=roots)
 
         copied["detail"] = detail
         out.append(copied)
@@ -2485,9 +2942,10 @@ async def read_strict_public_replay_page(
 
     - Main request path always passes ``persist=False`` (strictly read-only).
     - Concurrent requests for the same ``(thread_id, before_turn, lines_epoch())``
-      coalesce onto a single ``read_replay_page(..., persist=False)`` call.
-    - Schedules non-blocking Redis-locked background ``persist=True`` warming so
-      subsequent requests hit the warm ``turn_slices`` cache.
+      coalesce onto a single shared ``Task`` awaited via ``asyncio.shield()``, so
+      cancelling any waiter never cancels the leader or raises ``InvalidStateError``.
+    - Schedules non-blocking Redis-locked background ``persist=True`` warming ONLY
+      when an actual cache miss occurred (``cold.project_stale`` ran), never on warm hits.
     """
     from src.server.services.history.replay import lines_epoch, read_replay_page
 
@@ -2496,37 +2954,43 @@ async def read_strict_public_replay_page(
 
     existing = _COLD_SINGLEFLIGHT.get(key)
     if existing is not None:
-        return await existing
+        return await asyncio.shield(existing)
 
-    loop = asyncio.get_running_loop()
-    fut: asyncio.Future[Any] = loop.create_future()
-    _COLD_SINGLEFLIGHT[key] = fut
-    try:
-        result = await read_replay_page(
-            rows,
-            before_turn=before_turn,
-            limit=limit,
-            budget=effective_budget,
-            persist=False,
-        )
-        fut.set_result(result)
-        if trigger_background_warm and result[1] == "checkpoint":
-            schedule_warm_shared_thread_slices(
-                str(rows.thread_id),
+    async def _leader() -> tuple[Any, str]:
+        miss_flag = [False]
+        token = _COLD_PROJECTION_HIT.set(miss_flag)
+        try:
+            result = await read_replay_page(
+                rows,
                 before_turn=before_turn,
                 limit=limit,
                 budget=effective_budget,
+                persist=False,
             )
-        return result
-    except BaseException as exc:
-        if not fut.done():
-            fut.set_exception(exc)
-            # Mark exception retrieved to avoid unhandled Future warning if no waiters
-            fut.exception()
-        raise
-    finally:
-        if _COLD_SINGLEFLIGHT.get(key) is fut:
+            if trigger_background_warm and miss_flag[0] and result[1] == "checkpoint":
+                schedule_warm_shared_thread_slices(
+                    str(rows.thread_id),
+                    before_turn=before_turn,
+                    limit=limit,
+                    budget=effective_budget,
+                )
+            return result
+        finally:
+            _COLD_PROJECTION_HIT.reset(token)
+
+    loop = asyncio.get_running_loop()
+    task: asyncio.Task[tuple[Any, str]] = loop.create_task(_leader())
+    _COLD_SINGLEFLIGHT[key] = task
+
+    def _cleanup(done_task: asyncio.Task[Any]) -> None:
+        if _COLD_SINGLEFLIGHT.get(key) is done_task:
             _COLD_SINGLEFLIGHT.pop(key, None)
+        # Retrieve exception if all callers disconnected to avoid unhandled task warnings
+        if not done_task.cancelled():
+            done_task.exception()
+
+    task.add_done_callback(_cleanup)
+    return await asyncio.shield(task)
 
 
 # =============================================================================
@@ -3260,3 +3724,202 @@ async def summarize_thread_share_redaction(thread_id: str) -> dict[str, int]:
         "images": images,
         "attachments": attachments,
     }
+
+
+# =============================================================================
+# THIN-HOOK ORCHESTRATORS FOR UPSTREAM ROUTERS & SERVICES
+# =============================================================================
+
+
+async def post_update_thread_share_hook(
+    thread_id: str, *, is_shared: bool
+) -> dict[str, int] | None:
+    """Background-warm slices on share enable and compute DB-only redaction summary."""
+    if is_shared:
+        schedule_warm_shared_thread_slices(thread_id)
+    try:
+        return await summarize_thread_share_redaction(thread_id)
+    except Exception:
+        return None
+
+
+async def build_public_replay_response(
+    share_token: str,
+    *,
+    before_turn: int | None,
+    get_shared_thread_fn: Any,
+    get_replay_thread_data_fn: Any,
+    observe_replay_stream_fn: Any,
+    shared_user_message_fn: Any,
+    share_redaction_cls: Any,
+) -> Any:
+    """Full AU1 public replay SSE orchestrator (thin-hook target for ``public.py``)."""
+    from fastapi import HTTPException
+    from fastapi.responses import StreamingResponse
+
+    from src.dalton.share_media import (
+        resolve_thread_media_bindings,
+        rewrite_items_for_public_media,
+    )
+    from src.server.database.pool import DATABASE_UNAVAILABLE
+    from src.server.services.history.replay import finish_lines, read_replay_page
+    from src.server.utils.api import database_unavailable
+
+    no_store_headers = {"Cache-Control": "no-store"}
+    try:
+        try:
+            thread = await get_shared_thread_fn(share_token)
+        except HTTPException as exc:
+            hdrs = dict(exc.headers or {})
+            hdrs.setdefault("Cache-Control", "no-store")
+            raise HTTPException(
+                status_code=exc.status_code, detail=exc.detail, headers=hdrs
+            ) from None
+        thread_id = str(thread["conversation_thread_id"])
+        eff = await resolve_effective_share_permissions(thread)
+        rows = await get_replay_thread_data_fn(thread_id)
+        if rows is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Shared thread not found",
+                headers=no_store_headers,
+            )
+        budget = get_public_share_page_budget()
+        if not eff.allow_files:
+            page, _ = await read_strict_public_replay_page(
+                rows,
+                before_turn=before_turn,
+                limit=PUBLIC_SHARE_MAX_TURNS,
+                budget=budget,
+            )
+        else:
+            page, _ = await read_replay_page(
+                rows,
+                before_turn=before_turn,
+                limit=PUBLIC_SHARE_MAX_TURNS,
+                budget=budget,
+                persist=True,
+            )
+            await finish_lines(thread_id, page.lines, status_only=True)
+    except DATABASE_UNAVAILABLE as e:
+        exc = database_unavailable("replaying a shared thread", logger, e)
+        hdrs = dict(getattr(exc, "headers", None) or {})
+        hdrs.setdefault("Cache-Control", "no-store")
+        raise HTTPException(
+            status_code=exc.status_code, detail=exc.detail, headers=hdrs
+        ) from None
+
+    emit_history_page = bool(page.has_more or before_turn is not None)
+
+    if not eff.allow_files:
+        strict = StrictNoFilesShareRedactor(
+            thread_id=thread_id,
+            responses_by_turn=rows.responses_by_turn,
+            open_runs=rows.open_runs,
+            roots=extract_thread_roots(thread),
+            protected_urls=collect_thread_protected_urls(
+                rows.queries, rows.responses_by_turn, rows.run_facts
+            ),
+        )
+
+        async def strict_event_generator():
+            seq = 0
+            if emit_history_page:
+                seq += 1
+                hp = {
+                    "first_turn_index": page.first_turn_index,
+                    "has_more": page.has_more,
+                }
+                yield (
+                    f"id: {seq}\n"
+                    f"event: history_page\n"
+                    f"data: {json.dumps(hp, default=str)}\n\n"
+                )
+            for item in strict.iter_redacted_events(page.lines):
+                seq += 1
+                yield (
+                    f"id: {seq}\n"
+                    f"event: {item['event']}\n"
+                    f"data: {json.dumps(item['data'], ensure_ascii=False, default=str)}\n\n"
+                )
+            seq += 1
+            yield f"id: {seq}\nevent: replay_done\ndata: {json.dumps({'thread_id': thread_id}, default=str)}\n\n"
+
+        return StreamingResponse(
+            observe_replay_stream_fn(strict_event_generator(), source="public"),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "Clear-Site-Data": '"cache"',
+            },
+        )
+
+    items = [line.item() for line in page.lines]
+    bindings = await resolve_thread_media_bindings(
+        thread,
+        rows.queries,
+        items,
+        responses_by_turn=rows.responses_by_turn,
+        run_facts=rows.run_facts,
+    )
+    items = rewrite_items_for_public_media(
+        items, thread_id=thread_id, share_token=share_token, bindings=bindings
+    )
+    redaction = share_redaction_cls(items)
+
+    async def event_generator():
+        seq = 0
+        if emit_history_page:
+            seq += 1
+            hp = {
+                "first_turn_index": page.first_turn_index,
+                "has_more": page.has_more,
+            }
+            yield (
+                f"id: {seq}\n"
+                f"event: history_page\n"
+                f"data: {json.dumps(hp, default=str)}\n\n"
+            )
+        for item in items:
+            event_type, data = item["event"], item["data"]
+            if event_type == "user_message":
+                replay_data = shared_user_message_fn(redaction, data)
+            else:
+                replay_data = redaction.event(event_type, data)
+                if replay_data is None:
+                    continue
+                replay_data.setdefault("thread_id", thread_id)
+            seq += 1
+            yield (
+                f"id: {seq}\n"
+                f"event: {event_type}\n"
+                f"data: {json.dumps(replay_data, ensure_ascii=False, default=str)}\n\n"
+            )
+
+        seq += 1
+        yield f"id: {seq}\nevent: replay_done\ndata: {json.dumps({'thread_id': thread_id}, default=str)}\n\n"
+
+    return StreamingResponse(
+        observe_replay_stream_fn(event_generator(), source="public"),
+        media_type="text/event-stream",
+        headers=no_store_headers,
+    )
+
+
+async def resolve_org_library_remove_meta(
+    item_id: str, removed: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Compute activity detail & delete per-item custom_title metadata on org-library removal."""
+    kind = str(removed.get("kind") or "")
+    detail: dict[str, Any] = {"kind": kind, "title": str(removed.get("title") or "")[:256]}
+    if kind != "thread":
+        return detail
+    meta_map = await get_org_library_title_meta_map([item_id])
+    was_custom = bool(meta_map.get(str(item_id), False))
+    act_title, custom_flag = await resolve_org_library_remove_activity_title(
+        removed, was_custom_title=was_custom
+    )
+    await delete_org_library_title_meta(item_id)
+    detail["title"] = act_title
+    detail["custom_title"] = bool(custom_flag)
+    return detail

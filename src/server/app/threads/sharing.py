@@ -239,26 +239,17 @@ async def update_thread_share(
     if isinstance(existing_perms, str):
         existing_perms = json.loads(existing_perms)
 
+    # DALTON-HOOK(share-redaction): merge permissions and collapse allow_download=False whenever allow_files is False
+    from src.dalton.share_redaction import normalize_merged_share_permissions
+
     if effective_req_permissions is not None and effective_req_permissions.model_fields_set:
-        # ``exclude_unset``: a request that speaks only about the flags must not
-        # silently widen a token scoped to one report back to the whole
-        # workspace, which a defaulted ``root_path`` of "" would do.
-        merged = {
-            **existing_perms,
-            **effective_req_permissions.model_dump(exclude_unset=True),
-        }
-        # DALTON-HOOK(share-redaction): normalize allow_download=False whenever allow_files is False
-        if (
-            "allow_files" in effective_req_permissions.model_fields_set
-            and not merged.get("allow_files")
-        ):
-            merged["allow_download"] = False
-        elif merged.get("allow_download") and not merged.get("allow_files"):
-            merged["allow_files"] = True
+        merged = normalize_merged_share_permissions(existing_perms, effective_req_permissions)
         kwargs["share_permissions"] = merged
         effective_perms = merged
     else:
-        effective_perms = existing_perms
+        effective_perms = normalize_merged_share_permissions(existing_perms, None)
+        if existing_perms.get("allow_download") and not existing_perms.get("allow_files"):
+            kwargs["share_permissions"] = effective_perms
 
     # DALTON-HOOK(monitors): block public shared-thread file exposure by non-admins
     if request.is_shared and (
@@ -272,18 +263,11 @@ async def update_thread_share(
     _record_share_change(x_user_id, thread_id, thread, updated)
 
     # DALTON-HOOK(share-redaction): warm raw turn_slices in background on share enable & compute DB-only summary
-    from src.dalton.share_redaction import (
-        schedule_warm_shared_thread_slices,
-        summarize_thread_share_redaction,
-    )
+    from src.dalton.share_redaction import post_update_thread_share_hook
 
-    if updated.get("is_shared"):
-        schedule_warm_shared_thread_slices(thread_id)
-    summary_dict: dict | None = None
-    try:
-        summary_dict = await summarize_thread_share_redaction(thread_id)
-    except Exception:
-        summary_dict = None
+    summary_dict = await post_update_thread_share_hook(
+        thread_id, is_shared=bool(updated.get("is_shared"))
+    )
 
     share_token = updated.get("share_token")
     perms = updated.get("share_permissions") or {}

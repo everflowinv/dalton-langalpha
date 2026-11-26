@@ -435,9 +435,28 @@ async def test_org_library_and_activity_per_row_title_summary_and_b6_deleted_thr
                     "share_permissions": {"allow_files": False},
                     "owner_user_id": "u1",
                     "computer_root_dir": "/Users/alice/ws",
+                    "previous_root_dirs": ["/srv/legacy_custom_root"],
                 },
                 # tid_deleted intentionally absent (physically deleted thread - B6)
             },
+        ),
+    )
+    monkeypatch.setattr(
+        share_redaction,
+        "_load_thread_protected_urls_map",
+        create_autospec(
+            share_redaction._load_thread_protected_urls_map,
+            return_value={
+                tid_alive: {"https://custom-media.internal/doc/SECRET_THREAD_URL_01"}
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        share_redaction,
+        "_load_workspace_roots_map",
+        create_autospec(
+            share_redaction._load_workspace_roots_map,
+            return_value={"ws-only-1": ("/srv/ws_only_root",)},
         ),
     )
 
@@ -447,7 +466,11 @@ async def test_org_library_and_activity_per_row_title_summary_and_b6_deleted_thr
             "kind": "thread",
             "thread_id": tid_alive,
             "title": "SECRET_AUTO_LIB_01",
-            "summary": "Check /api/v1/artifacts/g/v1.grant_lib_summary_01/v/1/a.html and /Users/alice/ws/secret.py",
+            "summary": (
+                "Check /api/v1/artifacts/g/v1.grant_lib_summary_01/v/1/a.html, "
+                "/Users/alice/ws/secret.py, /srv/legacy_custom_root/old.csv, "
+                "reports/q3.pdf, and https://custom-media.internal/doc/SECRET_THREAD_URL_01"
+            ),
         },
         {
             "item_id": item_custom,
@@ -469,6 +492,9 @@ async def test_org_library_and_activity_per_row_title_summary_and_b6_deleted_thr
     assert redacted_lib[0]["title"] == DEFAULT_SHARED_TITLE
     assert "grant_lib_summary_01" not in redacted_lib[0]["summary"]
     assert "/Users/alice/ws" not in redacted_lib[0]["summary"]
+    assert "/srv/legacy_custom_root" not in redacted_lib[0]["summary"]
+    assert "reports/q3.pdf" not in redacted_lib[0]["summary"]
+    assert "SECRET_THREAD_URL_01" not in redacted_lib[0]["summary"]
     assert redacted_lib[1]["title"] == "公开策略周报"
     assert "grant_lib_summary_01" not in redacted_lib[1]["summary"]
     # B6: physically deleted thread row stays stable and sanitized
@@ -476,7 +502,8 @@ async def test_org_library_and_activity_per_row_title_summary_and_b6_deleted_thr
     assert "grant_deleted" not in redacted_lib[2]["summary"]
 
     # Activity log: early auto-title row stays Shared Conversation even after item got custom title later,
-    # new custom_title=True row keeps explicit title, and all other Action rows have detail scrubbed.
+    # new custom_title=True row keeps explicit title, and all other Action rows (including workspace-only
+    # FILE_PUBLISHED with no thread_id) have detail & path scrubbed.
     now = datetime.now(timezone.utc)
     raw_activity = [
         {
@@ -497,7 +524,14 @@ async def test_org_library_and_activity_per_row_title_summary_and_b6_deleted_thr
             "event_id": str(uuid.uuid4()),
             "action": activity_svc.Action.FILE_PUBLISHED.value,
             "thread_id": tid_alive,
-            "detail": {"path": "/Users/alice/ws/SECRET_ACT_PATH_01.html", "note": "/api/v1/artifacts/g/v1.grant_act/v/1/x.html"},
+            "detail": {
+                "path": "/Users/alice/ws/SECRET_ACT_PATH_01.html",
+                "note": (
+                    "/api/v1/artifacts/g/v1.grant_act/v/1/x.html "
+                    "https://custom-media.internal/doc/SECRET_THREAD_URL_01 "
+                    "/srv/legacy_custom_root/old.md"
+                ),
+            },
             "created_at": now,
         },
         {
@@ -507,9 +541,17 @@ async def test_org_library_and_activity_per_row_title_summary_and_b6_deleted_thr
             "detail": {"kind": "thread", "title": "SECRET_DELETED_ACT"},
             "created_at": now,
         },
+        {
+            "event_id": str(uuid.uuid4()),
+            "action": activity_svc.Action.FILE_PUBLISHED.value,
+            "workspace_id": "ws-only-1",
+            "thread_id": None,
+            "detail": {"path": "reports/q3_confidential.pdf", "note": "/srv/ws_only_root/draft.md"},
+            "created_at": now,
+        },
     ]
     redacted_act = await share_redaction.redact_activity_rows(raw_activity)
-    assert len(redacted_act) == 4
+    assert len(redacted_act) == 5
     assert redacted_act[0]["detail"]["title"] == DEFAULT_SHARED_TITLE
     assert "custom_title" not in redacted_act[0]["detail"]
     assert redacted_act[1]["detail"]["title"] == "公开策略周报"
@@ -517,48 +559,84 @@ async def test_org_library_and_activity_per_row_title_summary_and_b6_deleted_thr
     assert redacted_act[2]["detail"]["path"] == "[redacted-path]"
     assert "SECRET_ACT_PATH_01" not in json.dumps(redacted_act[2]["detail"])
     assert "grant_act" not in json.dumps(redacted_act[2]["detail"])
+    assert "SECRET_THREAD_URL_01" not in json.dumps(redacted_act[2]["detail"])
+    assert "/srv/legacy_custom_root" not in json.dumps(redacted_act[2]["detail"])
     assert redacted_act[3]["detail"]["title"] == DEFAULT_SHARED_TITLE
+    assert redacted_act[4]["detail"]["path"] == "[redacted-path]"
+    assert "q3_confidential.pdf" not in json.dumps(redacted_act[4]["detail"])
+    assert "/srv/ws_only_root" not in json.dumps(redacted_act[4]["detail"])
 
 
 @pytest.mark.asyncio
-async def test_singleflight_coalesces_concurrent_cold_reads(
+async def test_singleflight_coalesces_concurrent_cold_reads_and_isolates_waiter_cancel(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = 0
     gate = asyncio.Event()
+    mark_miss = False
 
     async def _slow_read(rows, **kwargs):
         nonlocal calls
         calls += 1
         assert kwargs.get("persist") is False
+        if mark_miss:
+            share_redaction.mark_cold_projection_miss()
         await gate.wait()
         return ReplayPage(lines=[], first_turn_index=0, has_more=False), "checkpoint"
 
     from src.server.services.history import replay as replay_mod
 
-    monkeypatch.setattr(replay_mod, "read_replay_page", _slow_read)
-    monkeypatch.setattr(replay_mod, "lines_epoch", lambda: "test-epoch-1")
+    read_spy = create_autospec(replay_mod.read_replay_page, side_effect=_slow_read)
+    warm_spy = create_autospec(
+        share_redaction.schedule_warm_shared_thread_slices, return_value=None
+    )
+    monkeypatch.setattr(replay_mod, "read_replay_page", read_spy)
+    monkeypatch.setattr(
+        replay_mod, "lines_epoch", create_autospec(replay_mod.lines_epoch, return_value="test-epoch-1")
+    )
+    monkeypatch.setattr(share_redaction, "schedule_warm_shared_thread_slices", warm_spy)
 
     rows = SimpleNamespace(thread_id=str(uuid.uuid4()))
 
+    # 1. Warm hit (no cold projection miss) + cancelling a waiter must not break leader or other waiters
     tasks = [
         asyncio.create_task(
             share_redaction.read_strict_public_replay_page(
-                rows, trigger_background_warm=False
+                rows, trigger_background_warm=True
             )
         )
         for _ in range(10)
     ]
     await asyncio.sleep(0.02)
+    # Cancel a waiter (index 3) and even the first caller (index 0)
+    tasks[3].cancel()
+    tasks[0].cancel()
     gate.set()
-    results = await asyncio.gather(*tasks)
-    assert len(results) == 10
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    assert isinstance(results[0], asyncio.CancelledError)
+    assert isinstance(results[3], asyncio.CancelledError)
+    succeeded = [r for idx, r in enumerate(results) if idx not in (0, 3)]
+    assert len(succeeded) == 8
+    assert all(not isinstance(r, BaseException) for r in succeeded)
     assert calls == 1
+    # Hot cache hit returning "checkpoint" must NOT schedule background warm
+    warm_spy.assert_not_called()
+
+    # 2. Actual cold cache miss (cold.project_stale -> mark_cold_projection_miss) schedules warm once
+    gate.clear()
+    mark_miss = True
+    t_cold = asyncio.create_task(
+        share_redaction.read_strict_public_replay_page(rows, trigger_background_warm=True)
+    )
+    await asyncio.sleep(0.01)
+    gate.set()
+    await t_cold
+    warm_spy.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_ops_script_verify_and_warm(monkeypatch: pytest.MonkeyPatch) -> None:
-    target_a = share_media.ActiveStorageTarget(
+    target_s3 = share_media.ActiveStorageTarget(
         provider="s3",
         bucket_name="primary-bucket",
         endpoint_url="http://127.0.0.1:9000",
@@ -572,30 +650,159 @@ async def test_ops_script_verify_and_warm(monkeypatch: pytest.MonkeyPatch) -> No
         sensitive_prefixes=("private-media/", "blobs/", "provenance/", "memo/"),
         public_url_bases=("https://cdn.example.com",),
     )
+    target_oss = share_media.ActiveStorageTarget(
+        provider="oss",
+        bucket_name="oss-bucket",
+        endpoint_url="https://oss-cn-hangzhou.aliyuncs.com",
+        signing_endpoint_url="https://oss-cn-hangzhou.aliyuncs.com",
+        region="cn-hangzhou",
+        addressing_style="virtual",
+        access_key_id="ak",
+        secret_access_key="sk",
+        roles=("upstream",),
+        key_prefixes=("",),
+        sensitive_prefixes=("private-media/", "provenance/"),
+        public_url_bases=("https://oss-bucket.oss-cn-hangzhou.aliyuncs.com",),
+    )
 
+    written_probes: list[tuple[str, str]] = []
+    cleaned_probes: list[tuple[str, str]] = []
     seen_urls: list[str] = []
+
+    def _fake_put_probe(target, key):
+        written_probes.append((target.provider, key))
+
+        def _cleanup():
+            cleaned_probes.append((target.provider, key))
+
+        return _cleanup
 
     def _fake_get_403(url: str, *, timeout_s: float = 10.0) -> tuple[int | None, str]:
         seen_urls.append(url)
         return 403, "Forbidden"
 
+    # 1. Default probe_write=True writes & deletes probes on BOTH S3 and OSS and requires strict 403
     ok, checks = ops_script.verify_storage_targets(
-        targets=[target_a], probe_write=False, http_get_fn=_fake_get_403
+        targets=[target_s3, target_oss],
+        http_get_fn=_fake_get_403,
+        put_probe_fn=_fake_put_probe,
+        find_existing_fn=lambda t, p: None,
     )
     assert ok is True
-    assert len(checks) == 8  # 4 prefixes x (origin + CDN)
+    assert len(written_probes) == 6  # 4 S3 + 2 OSS
+    assert len(cleaned_probes) == 6
+    assert any(p == "oss" for p, _ in written_probes)
     assert any("cdn.example.com/provenance/" in u for u in seen_urls)
     assert any("127.0.0.1:9000/primary-bucket/memo/" in u for u in seen_urls)
+    assert any("oss-bucket.oss-cn-hangzhou.aliyuncs.com/provenance/" in u for u in seen_urls)
 
-    # Any 200 immediately fails verification
-    def _fake_get_leak(url: str, *, timeout_s: float = 10.0) -> tuple[int | None, str]:
-        return (200, "OK") if "/provenance/" in url else (403, "Forbidden")
-
-    ok2, checks2 = ops_script.verify_storage_targets(
-        targets=[target_a], probe_write=False, http_get_fn=_fake_get_leak
+    # 2. HTTP 404 MUST FAIL verification (never false-pass on missing key)
+    ok_404, checks_404 = ops_script.verify_storage_targets(
+        targets=[target_s3],
+        http_get_fn=lambda url, timeout_s=10.0: (404, "Not Found"),
+        put_probe_fn=_fake_put_probe,
+        find_existing_fn=lambda t, p: None,
     )
-    assert ok2 is False
-    assert any(not c.ok and c.status_code == 200 for c in checks2)
+    assert ok_404 is False
+    assert all(not c.ok and c.status_code == 404 for c in checks_404)
+
+    # 3. Any 200 immediately fails verification
+    ok_200, checks_200 = ops_script.verify_storage_targets(
+        targets=[target_s3],
+        http_get_fn=lambda url, timeout_s=10.0: (200, "OK") if "/provenance/" in url else (403, "Forbidden"),
+        put_probe_fn=_fake_put_probe,
+        find_existing_fn=lambda t, p: None,
+    )
+    assert ok_200 is False
+    assert any(not c.ok and c.status_code == 200 for c in checks_200)
+
+    # 4. Probe cleanup failure MUST fail verification
+    def _failing_cleanup_put(target, key):
+        def _boom():
+            raise RuntimeError("delete denied")
+        return _boom
+
+    ok_clean, checks_clean = ops_script.verify_storage_targets(
+        targets=[target_oss],
+        http_get_fn=_fake_get_403,
+        put_probe_fn=_failing_cleanup_put,
+        find_existing_fn=lambda t, p: None,
+    )
+    assert ok_clean is False
+    assert any("cleanup failed" in c.detail for c in checks_clean)
+
+    # 5. --no-probe-write with no existing object MUST fail verification
+    ok_noprobe, checks_noprobe = ops_script.verify_storage_targets(
+        targets=[target_s3],
+        probe_write=False,
+        http_get_fn=_fake_get_403,
+        find_existing_fn=lambda t, p: None,
+    )
+    assert ok_noprobe is False
+    assert all("no existing object" in c.detail for c in checks_noprobe)
+
+    # 6. --warm-shared-slices opens & closes BOTH app pool and checkpointer pool and warms persist=True
+    from contextlib import asynccontextmanager
+    from src.server.database import pool as db_pool
+    from src.server.database.conversation import replay_rows as replay_rows_mod
+    from src.server.services.history import replay as replay_mod
+
+    shared_tid = str(uuid.uuid4())
+    lifecycle: list[str] = []
+
+    async def _fake_open_pools():
+        lifecycle.append("open_pools")
+        return ("fake-pool", "fake-cp", True, True)
+
+    async def _fake_close_pools(conv_pool, cp, opened_app, opened_cp):
+        assert opened_app is True and opened_cp is True
+        lifecycle.append("close_pools")
+
+    class _FakeWarmCur:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def execute(self, sql, params=None):
+            return None
+
+        async def fetchall(self):
+            return [{"thread_id": shared_tid}]
+
+    class _FakeWarmConn:
+        def cursor(self, row_factory=None):
+            return _FakeWarmCur()
+
+    @asynccontextmanager
+    async def _fake_warm_conn():
+        yield _FakeWarmConn()
+
+    fake_rows = SimpleNamespace(thread_id=shared_tid)
+    read_warm_spy = create_autospec(
+        replay_mod.read_replay_page,
+        return_value=(ReplayPage(lines=[], first_turn_index=0, has_more=False), "checkpoint"),
+    )
+    monkeypatch.setattr(ops_script, "_ensure_cli_pools_open", _fake_open_pools)
+    monkeypatch.setattr(ops_script, "_close_cli_pools", _fake_close_pools)
+    monkeypatch.setattr(db_pool, "get_db_connection", _fake_warm_conn)
+    monkeypatch.setattr(
+        replay_rows_mod,
+        "get_replay_thread_data",
+        create_autospec(replay_rows_mod.get_replay_thread_data, return_value=fake_rows),
+    )
+    monkeypatch.setattr(replay_mod, "read_replay_page", read_warm_spy)
+    monkeypatch.setattr(
+        replay_mod, "lines_epoch", create_autospec(replay_mod.lines_epoch, return_value="warm-epoch-1")
+    )
+
+    warm_res = await ops_script.warm_shared_slices(limit_threads=10, concurrency=2)
+    assert lifecycle == ["open_pools", "close_pools"]
+    assert warm_res["warmed"] == 1
+    assert warm_res["failed"] == 0
+    read_warm_spy.assert_awaited_once()
+    assert read_warm_spy.await_args.kwargs["persist"] is True
 
 
 @pytest.mark.asyncio
@@ -847,3 +1054,350 @@ async def test_public_share_metadata_and_replay_headers_and_redaction(
     assert "event: history_page" in replay_resp.text
     assert "最终观点" in replay_resp.text
     assert "tool_calls" not in replay_resp.text
+
+
+def test_share_permissions_post_normalization_and_conflict_combinations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Severe #1: Real POST /threads/{id}/share & GET /share never elevate allow_files from False to True."""
+    from src.server.app.threads import sharing as threads_sharing
+    from src.server.services.shared_workspaces.access import Access
+
+    tid = str(uuid.uuid4())
+    ws_id = str(uuid.uuid4())
+    share_token = "tok-norm-test"
+    db_state: dict[str, Any] = {
+        "conversation_thread_id": tid,
+        "workspace_id": ws_id,
+        "user_id": "admin-1",
+        "owner_id": "admin-1",
+        "is_shared": True,
+        "share_token": share_token,
+        "share_permissions": {"allow_files": False, "allow_download": True, "audience": "public"},
+    }
+
+    async def _get_thread(_tid: str):
+        return dict(db_state)
+
+    async def _upd_thread(_tid: str, **kwargs):
+        if "is_shared" in kwargs:
+            db_state["is_shared"] = kwargs["is_shared"]
+        if "share_permissions" in kwargs:
+            db_state["share_permissions"] = dict(kwargs["share_permissions"])
+        return dict(db_state)
+
+    monkeypatch.setattr(
+        threads_sharing,
+        "_authorize_thread_share",
+        create_autospec(threads_sharing._authorize_thread_share, return_value=Access("admin-1")),
+    )
+    monkeypatch.setattr(
+        threads_sharing,
+        "get_thread_by_id",
+        create_autospec(threads_sharing.get_thread_by_id, side_effect=_get_thread),
+    )
+    monkeypatch.setattr(
+        threads_sharing,
+        "update_thread_sharing",
+        create_autospec(threads_sharing.update_thread_sharing, side_effect=_upd_thread),
+    )
+    monkeypatch.setattr(
+        threads_sharing,
+        "_require_admin_for_share_files",
+        create_autospec(threads_sharing._require_admin_for_share_files, return_value=None),
+    )
+    monkeypatch.setattr(
+        threads_sharing,
+        "require_members_audience",
+        create_autospec(threads_sharing.require_members_audience, return_value=None),
+    )
+    monkeypatch.setattr(
+        threads_sharing,
+        "refuse_public_link_of",
+        create_autospec(threads_sharing.refuse_public_link_of, return_value=None),
+    )
+    monkeypatch.setattr(
+        threads_sharing,
+        "offered",
+        create_autospec(threads_sharing.offered, return_value=["public", "organization"]),
+    )
+    monkeypatch.setattr(
+        threads_sharing,
+        "_record_share_change",
+        create_autospec(threads_sharing._record_share_change, return_value=None),
+    )
+    monkeypatch.setattr(
+        share_redaction,
+        "post_update_thread_share_hook",
+        create_autospec(
+            share_redaction.post_update_thread_share_hook,
+            return_value={"widgets": 0, "tool_calls": 0, "images": 0, "attachments": 0},
+        ),
+    )
+    monkeypatch.setattr(
+        share_access,
+        "get_shared_thread",
+        create_autospec(share_access.get_shared_thread, side_effect=lambda _tok: dict(db_state)),
+    )
+
+    app = FastAPI()
+    app.include_router(threads_sharing.router)
+    app.include_router(public_app.router)
+    app.dependency_overrides[api_utils.get_current_user_id] = lambda: "admin-1"
+    client = TestClient(app)
+
+    # 1. Reading legacy conflict row collapses allow_download -> False
+    r_get = client.get(f"/api/v1/threads/{tid}/share")
+    assert r_get.status_code == 200
+    assert r_get.json()["permissions"]["allow_files"] is False
+    assert r_get.json()["permissions"]["allow_download"] is False
+
+    # 2. Updating ONLY audience on legacy conflict row MUST NOT elevate allow_files to True
+    r_aud = client.post(
+        f"/api/v1/threads/{tid}/share",
+        json={"is_shared": True, "permissions": {"audience": "organization"}},
+    )
+    assert r_aud.status_code == 200
+    assert db_state["share_permissions"]["allow_files"] is False
+    assert db_state["share_permissions"]["allow_download"] is False
+    assert db_state["share_permissions"]["audience"] == "organization"
+
+    # 3. Explicitly posting allow_files=False, allow_download=True MUST save allow_files=False, allow_download=False
+    r_conflict = client.post(
+        f"/api/v1/threads/{tid}/share",
+        json={"is_shared": True, "permissions": {"allow_files": False, "allow_download": True}},
+    )
+    assert r_conflict.status_code == 200
+    assert db_state["share_permissions"]["allow_files"] is False
+    assert db_state["share_permissions"]["allow_download"] is False
+    assert r_conflict.json()["permissions"]["allow_files"] is False
+    assert r_conflict.json()["permissions"]["allow_download"] is False
+
+    # Visitor file & media access stays 403 after POST
+    r_files = client.get(f"/api/v1/public/shared/{share_token}/files")
+    assert r_files.status_code == 403
+    assert r_files.headers.get("cache-control") == "no-store"
+
+    # 4. Posting ONLY allow_download=True (without allow_files) on allow_files=False thread MUST stay False
+    r_dl_only = client.post(
+        f"/api/v1/threads/{tid}/share",
+        json={"is_shared": True, "permissions": {"allow_download": True}},
+    )
+    assert r_dl_only.status_code == 200
+    assert db_state["share_permissions"]["allow_files"] is False
+    assert db_state["share_permissions"]["allow_download"] is False
+
+    # 5. Explicitly posting allow_files=True, allow_download=True succeeds
+    r_both = client.post(
+        f"/api/v1/threads/{tid}/share",
+        json={"is_shared": True, "permissions": {"allow_files": True, "allow_download": True}},
+    )
+    assert r_both.status_code == 200
+    assert db_state["share_permissions"]["allow_files"] is True
+    assert db_state["share_permissions"]["allow_download"] is True
+
+    # 6. Turning allow_files=False alone collapses allow_download=False
+    r_off = client.post(
+        f"/api/v1/threads/{tid}/share",
+        json={"is_shared": True, "permissions": {"allow_files": False}},
+    )
+    assert r_off.status_code == 200
+    assert db_state["share_permissions"]["allow_files"] is False
+    assert db_state["share_permissions"]["allow_download"] is False
+
+
+@pytest.mark.asyncio
+async def test_controlled_media_thread_binding_blocks_unbound_objects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """High #2: Only sign & serve media demonstrably bound to the target thread."""
+    tid = str(uuid.uuid4())
+    other_tid = str(uuid.uuid4())
+    ws_id = str(uuid.uuid4())
+    own_att_url = f"https://cdn.example/private-media/attachments/{tid}/batch1/ok.png"
+    own_img_url = f"https://cdn.example/private-media/response-images/{tid}/abc/chart.png"
+    victim_att_url = "https://cdn.example/attachments/victim-att-id/secret.pdf"
+    victim_img_url = f"https://cdn.example/private-media/response-images/{other_tid}/abc/leak.png"
+    victim_widget_url = f"https://cdn.example/private-media/widgets/{other_tid}/w.json"
+
+    monkeypatch.setattr(
+        share_media,
+        "_allowed_storage_origins",
+        create_autospec(
+            share_media._allowed_storage_origins,
+            return_value={"https://cdn.example"},
+        ),
+    )
+
+    thread = {"conversation_thread_id": tid, "workspace_id": ws_id, "user_id": "u1"}
+    queries = [
+        {"metadata": {"attachments": [{"url": own_att_url}]}},
+    ]
+    items = [
+        # Attacker pastes victim URLs in user_message free text
+        {
+            "event": "user_message",
+            "data": {
+                "content": f"{victim_att_url} {victim_img_url} {victim_widget_url} https://evil.other/response-images/{tid}/x.png",
+            },
+        },
+        # Assistant embeds legitimate captured image + foreign URL
+        {
+            "event": "message_chunk",
+            "data": {
+                "role": "assistant",
+                "content": f"![ok]({own_img_url}) {victim_img_url} {victim_att_url}",
+            },
+        },
+    ]
+
+    bindings = await share_media.resolve_thread_media_bindings(thread, queries, items)
+    assert own_att_url in bindings
+    assert own_img_url in bindings
+    assert victim_att_url not in bindings
+    assert victim_img_url not in bindings
+    assert victim_widget_url not in bindings
+    assert f"https://evil.other/response-images/{tid}/x.png" not in bindings
+
+    # Read side: even with a valid HMAC token, unbound attachments/, widgets/, response-images/,
+    # and chat_upload upload_id not registered on thread_id MUST return 404 with Cache-Control: no-store.
+    monkeypatch.setattr(
+        share_media,
+        "_load_thread_query_metadata_rows",
+        create_autospec(share_media._load_thread_query_metadata_rows, return_value=[]),
+    )
+    monkeypatch.setattr(
+        share_media,
+        "read_controlled_object_bytes",
+        create_autospec(share_media.read_controlled_object_bytes, return_value=b"SECRET_BYTES"),
+    )
+
+    for backend, bad_ref in (
+        ("upstream", "attachments/victim-att-id/secret.pdf"),
+        ("upstream", f"widgets/{other_tid}/w.json"),
+        ("upstream", "widgets/legacy_unbound.json"),
+        ("upstream", f"response-images/{other_tid}/abc/leak.png"),
+        ("chat_upload", str(uuid.uuid4())),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            await share_media._serve_media_payload(
+                thread_id=tid,
+                workspace_id=ws_id,
+                thread_owner_id="u1",
+                backend=backend,
+                ref_id=bad_ref,
+                cache_control="no-store",
+            )
+        assert exc.value.status_code == 404
+        assert (exc.value.headers or {}).get("Cache-Control") == "no-store"
+
+    # Own thread-scoped media succeeds
+    ok_resp = await share_media._serve_media_payload(
+        thread_id=tid,
+        workspace_id=ws_id,
+        thread_owner_id="u1",
+        backend="upstream",
+        ref_id=f"private-media/response-images/{tid}/abc/chart.png",
+        cache_control="no-store",
+    )
+    assert ok_resp.status_code == 200
+    assert ok_resp.headers.get("cache-control") == "no-store"
+
+
+def test_oss_upload_acl_fallback_and_s3_presigned_put_acl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Medium: OSS upload retries without ACL on ACL-not-supported error; S3 presigned PUT signs ACL."""
+    from src.utils.storage import oss_uploader, s3_compatible
+
+    # 1. OSS upload_bytes & upload_file ACL fallback
+    put_calls: list[Any] = []
+
+    class _FakeOssAclError(Exception):
+        code = "AccessControlListNotSupported"
+
+    class _FakeOssClient:
+        def put_object(self, req):
+            put_calls.append(req)
+            if getattr(req, "acl", None) == "private":
+                raise _FakeOssAclError("Bucket does not allow ACLs")
+            return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(oss_uploader, "get_oss_client", lambda: _FakeOssClient())
+    monkeypatch.setattr(oss_uploader.OSSConfig, "BUCKET_NAME", "oss-test-bucket")
+
+    assert oss_uploader.upload_bytes("private-media/t1/a.png", b"hello") is True
+    assert len(put_calls) == 2
+    assert getattr(put_calls[0], "acl", None) == "private"
+    assert getattr(put_calls[1], "acl", None) is None
+
+    put_calls.clear()
+    sample = tmp_path / "sample.txt"
+    sample.write_bytes(b"file-body")
+    assert oss_uploader.upload_file("private-media/t1/sample.txt", str(sample)) is True
+    assert len(put_calls) == 2
+    assert getattr(put_calls[0], "acl", None) == "private"
+    assert getattr(put_calls[1], "acl", None) is None
+
+    # 2. S3 presigned single PUT attaches private ACL for non-avatar keys and skips avatars/
+    presign_calls: list[dict[str, Any]] = []
+
+    class _FakeS3Client:
+        def generate_presigned_url(self, op, *, Params, ExpiresIn):
+            presign_calls.append(dict(Params))
+            return "https://store.example/presigned"
+
+    monkeypatch.setattr(s3_compatible, "_get_client", lambda: _FakeS3Client())
+    sha = "a" * 64
+    out_priv = s3_compatible.get_signed_upload_url(
+        f"blobs/u1/{sha}", sha256_hex=sha, content_length=10, content_type="application/octet-stream"
+    )
+    assert out_priv is not None
+    assert presign_calls[-1].get("ACL") == "private"
+    assert out_priv[1].get("x-amz-acl") == "private"
+
+    out_avatar = s3_compatible.get_signed_upload_url(
+        "avatars/u1.png", sha256_hex=sha, content_length=10, content_type="image/png"
+    )
+    assert out_avatar is not None
+    assert "ACL" not in presign_calls[-1]
+    assert "x-amz-acl" not in out_avatar[1]
+
+
+def test_public_error_responses_carry_no_store_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Low: 404/error responses on public share, file, and media routes carry Cache-Control: no-store."""
+    monkeypatch.setattr(
+        public_app,
+        "resolve_link",
+        create_autospec(public_app.resolve_link, return_value=None),
+    )
+    monkeypatch.setattr(
+        public_app,
+        "_shared_thread_for",
+        create_autospec(
+            public_app._shared_thread_for,
+            side_effect=HTTPException(status_code=404, detail="Shared link not found"),
+        ),
+    )
+    not_found_shared = create_autospec(
+        share_access.get_shared_thread,
+        side_effect=HTTPException(status_code=404, detail="Shared thread not found"),
+    )
+    monkeypatch.setattr(share_access, "get_shared_thread", not_found_shared)
+    monkeypatch.setattr(public_app, "get_shared_thread", not_found_shared)
+
+    app = FastAPI()
+    app.include_router(public_app.router)
+    client = TestClient(app)
+
+    for url in (
+        "/api/v1/public/shared/invalid-tok",
+        "/api/v1/public/shared/invalid-tok/replay",
+        "/api/v1/public/shared/invalid-tok/files?path=../etc/passwd",
+        "/api/v1/public/shared/invalid-tok/media/bad-ref",
+    ):
+        r = client.get(url)
+        assert r.status_code == 404, f"Expected 404 for {url}, got {r.status_code}"
+        assert r.headers.get("cache-control") == "no-store", f"Missing no-store on {url}"

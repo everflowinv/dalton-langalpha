@@ -482,6 +482,7 @@ def test_safe_title_summary_and_nested_notifications_9_keys() -> None:
                     "skipped": 0,
                     "fired_at": "2026-11-26T10:00:00Z",
                     "timezone": "UTC",
+                    "target_id": "t-wake-1",
                     "price": {"symbol": "SECRET_WAKE_SYM_06", "target": 987.65},
                     "order": {"order_id": "SECRET_ORD_06"},
                 }
@@ -493,7 +494,12 @@ def test_safe_title_summary_and_nested_notifications_9_keys() -> None:
                     "target_id": "t-1",
                     "kind": "price",
                     "notice": "hit",
+                    "seq": 1,
+                    "total": 3,
+                    "last": False,
+                    "skipped": 0,
                     "fired_at": "2026-11-26T10:05:00Z",
+                    "timezone": "UTC",
                     "symbol": "SECRET_TICKER_06",
                     "armed_price": 950.01,
                     "fired_price": 988.12,
@@ -517,8 +523,8 @@ def test_safe_title_summary_and_nested_notifications_9_keys() -> None:
         "attachments",
     ):
         assert forbidden not in dumped
-    assert set(safe_meta["wakeup"]["notices"][0].keys()) <= SAFE_NOTIFICATION_FIELDS
-    assert set(safe_meta["market_target"]["notices"][0].keys()) <= SAFE_NOTIFICATION_FIELDS
+    assert set(safe_meta["wakeup"]["notices"][0].keys()) == SAFE_NOTIFICATION_FIELDS
+    assert set(safe_meta["market_target"]["notices"][0].keys()) == SAFE_NOTIFICATION_FIELDS
 
     # Steering notification fixed notices
     red = StrictNoFilesShareRedactor(thread_id="t1", responses_by_turn={0: {"status": "completed"}})
@@ -663,3 +669,90 @@ def test_d059_migration_contract() -> None:
         assert "DROP TABLE IF EXISTS dalton_org_library_title_meta" in joined_down
     finally:
         d059.op = orig_op
+
+
+def test_need_more_thinking_with_inline_code_strips_entire_paragraph() -> None:
+    """Codex High: NEED MORE THINKING paragraphs containing inline code must be stripped completely."""
+    raw = (
+        "NEED MORE THINKING\n"
+        "Check `secret_model.py` and verify SECRET_AFTER_CODE_01 before answering.\n\n"
+        "正式回答：保留这段内容。\n\n"
+        "NEED MORE THINKING: inspect `a/b.csv` then `c/d.json` and SECRET_TAIL_02."
+    )
+    cleaned = strip_inline_thinking_markers(raw)
+    assert "NEED MORE THINKING" not in cleaned
+    assert "secret_model.py" not in cleaned
+    assert "SECRET_AFTER_CODE_01" not in cleaned
+    assert "a/b.csv" not in cleaned
+    assert "SECRET_TAIL_02" not in cleaned
+    assert "正式回答：保留这段内容。" in cleaned
+
+    # Literal inline code mid-paragraph and fenced code remain untouched
+    safe = (
+        "Mentioning `NEED MORE THINKING` inside a sentence stays.\n\n"
+        "```text\nNEED MORE THINKING\nin fence\n```"
+    )
+    cleaned_safe = strip_inline_thinking_markers(safe)
+    assert "`NEED MORE THINKING`" in cleaned_safe
+    assert "in fence" in cleaned_safe
+
+
+def test_markdown_reassembly_prevents_escaped_image_and_html_injection() -> None:
+    """Codex High: Escaped Markdown images / HTML must not become active nodes after AST serialization."""
+    from src.dalton.share_redaction import _MD_PARSER
+
+    payloads = [
+        r"\![secret alt](https://evil.example/leak.png)",
+        r"\<img src='https://evil.example/leak2.png' onerror='alert(1)'>",
+        r"&lt;img src=&quot;https://evil.example/leak3.png&quot;&gt;",
+        r"\[click](https://evil.example/secret.png)",
+        r"\<svg onload='alert(1)'><image href='https://evil.example/s.svg'/></svg>",
+    ]
+    for payload in payloads:
+        sanitized = sanitize_shared_markdown(payload)
+        assert "leak.png" not in sanitized
+        assert "leak2.png" not in sanitized
+        assert "leak3.png" not in sanitized
+        assert "secret.png" not in sanitized
+        assert "s.svg" not in sanitized
+        # Re-parse serialized Markdown and assert zero active image / html / link nodes
+        tokens = _MD_PARSER.parse(sanitized)
+        stack = list(tokens)
+        while stack:
+            tok = stack.pop()
+            if tok.children:
+                stack.extend(tok.children)
+            assert tok.type != "image", f"Unexpected image token from {payload!r} -> {sanitized!r}"
+            if tok.type in ("html_inline", "html_block"):
+                assert tok.content.startswith("<redacted-image") or tok.content == "</redacted-image>", (
+                    f"Unexpected HTML token {tok.content!r} from {payload!r} -> {sanitized!r}"
+                )
+            assert tok.type != "link_open", f"Unexpected link token from {payload!r} -> {sanitized!r}"
+
+
+def test_workspace_relative_paths_scrubbed_consistently_across_markdown_and_code() -> None:
+    """Grok Medium: Workspace-relative paths (reports/q3.pdf, `out/memo.md`) scrubbed everywhere."""
+    md = (
+        "详见 reports/q3.pdf 和 `out/memo.md` 以及 ./charts/fig1.png。\n\n"
+        "指标 P/E 为 18.5，日期 2025/11/26，保留 [短链](https://app.local/a/AbCdEf123456) "
+        "和 https://example.com/docs/guide.html。\n\n"
+        "```python\n"
+        "df = read_csv('data/q3/metrics.csv')\n"
+        "```\n"
+    )
+    sanitized = sanitize_shared_markdown(md)
+    assert "reports/q3.pdf" not in sanitized
+    assert "out/memo.md" not in sanitized
+    assert "./charts/fig1.png" not in sanitized
+    assert "data/q3/metrics.csv" not in sanitized
+    assert "[redacted-path]" in sanitized
+    # Benign ratios, dates, and public URLs / short links preserved
+    assert "P/E" in sanitized
+    assert "2025/11/26" in sanitized
+    assert "https://app.local/a/AbCdEf123456" in sanitized
+    assert "https://example.com/docs/guide.html" in sanitized
+
+    # Org library summary scrubbing also removes workspace-relative paths
+    cleaned_sum = clean_org_library_summary("详见 reports/q3.pdf 与 out/memo.md")
+    assert "reports/q3.pdf" not in cleaned_sum
+    assert "out/memo.md" not in cleaned_sum

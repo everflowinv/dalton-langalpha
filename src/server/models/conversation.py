@@ -568,8 +568,9 @@ class SharePermissions(BaseModel):
 
     @model_validator(mode="after")
     def download_requires_files(self):
-        if self.allow_download and not self.allow_files:
-            self.allow_files = True
+        # DALTON-HOOK(share-redaction): allow_files=false always collapses allow_download=false (never elevate allow_files to true)
+        if not self.allow_files and self.allow_download:
+            self.allow_download = False
         return self
 
 

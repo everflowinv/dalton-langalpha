@@ -12,12 +12,9 @@ from pydantic import ValidationError
 from src.server.models.conversation import (
     ConversationMessage,
     FeedbackRequest,
-    FeedbackResponse,
     MessageQuery,
     MessageResponse,
-    ResponseFullDetail,
     SharePermissions,
-    ThreadDeleteResponse,
     ThreadExternalIdRequest,
     ThreadShareRequest,
     ThreadShareResponse,
@@ -80,17 +77,26 @@ class TestWorkspaceThreadsListResponse:
 
 
 class TestSharePermissions:
-    """SharePermissions auto-corrects allow_download -> allow_files."""
+    """SharePermissions enforces allow_files=False -> allow_download=False."""
 
     def test_defaults(self):
         perms = SharePermissions()
         assert perms.allow_files is False
         assert perms.allow_download is False
 
-    def test_download_implies_files(self):
+    def test_download_requires_files(self):
+        # DALTON-HOOK(share-redaction): allow_files=False collapses allow_download=False (never elevates allow_files)
         perms = SharePermissions(allow_download=True, allow_files=False)
-        assert perms.allow_files is True
-        assert perms.allow_download is True
+        assert perms.allow_files is False
+        assert perms.allow_download is False
+
+        perms_implicit = SharePermissions(allow_download=True)
+        assert perms_implicit.allow_files is False
+        assert perms_implicit.allow_download is False
+
+        perms_both = SharePermissions(allow_files=True, allow_download=True)
+        assert perms_both.allow_files is True
+        assert perms_both.allow_download is True
 
     def test_files_without_download(self):
         perms = SharePermissions(allow_files=True, allow_download=False)

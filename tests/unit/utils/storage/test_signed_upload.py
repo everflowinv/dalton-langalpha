@@ -35,9 +35,15 @@ def test_presign_binds_digest_length_and_type():
     assert params["ContentLength"] == 12
     assert params["ContentType"] == "application/octet-stream"
     assert params["ChecksumSHA256"] == expected_b64
+    # DALTON-HOOK(share-redaction): presigned single PUT binds private ACL for non-avatar keys
+    assert params["ACL"] == "private"
     assert kwargs["ExpiresIn"] == 600
     # The uploader must send exactly what was signed.
-    assert headers == {"Content-Type": "application/octet-stream", "x-amz-checksum-sha256": expected_b64}
+    assert headers == {
+        "Content-Type": "application/octet-stream",
+        "x-amz-checksum-sha256": expected_b64,
+        "x-amz-acl": "private",
+    }
 
 
 def test_presign_failure_returns_none_not_raise():

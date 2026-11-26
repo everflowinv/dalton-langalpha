@@ -128,19 +128,34 @@ def upload_file(key: str, file_path: str, content_type: str | None = None) -> bo
 
     try:
         client = get_oss_client()
-        # DALTON-HOOK(share-redaction): attach object-level private ACL on OSS upload for non-avatar keys
-        from src.dalton.share_media import storage_private_acl_kwargs
+        # DALTON-HOOK(share-redaction): attach object-level private ACL on OSS upload with ACL-unsupported fallback
+        from src.dalton.share_media import (
+            is_acl_not_supported_error,
+            storage_private_acl_kwargs,
+        )
 
         acl_kwargs = storage_private_acl_kwargs(key, provider="oss")
 
         with path_obj.open("rb") as f:
-            result = client.put_object(oss.PutObjectRequest(
-                bucket=OSSConfig.BUCKET_NAME,
-                key=full_key(key),
-                body=f,
-                content_type=content_type,
-                **acl_kwargs,
-            ))
+            try:
+                result = client.put_object(oss.PutObjectRequest(
+                    bucket=OSSConfig.BUCKET_NAME,
+                    key=full_key(key),
+                    body=f,
+                    content_type=content_type,
+                    **acl_kwargs,
+                ))
+            except Exception as acl_exc:
+                if acl_kwargs and is_acl_not_supported_error(acl_exc):
+                    f.seek(0)
+                    result = client.put_object(oss.PutObjectRequest(
+                        bucket=OSSConfig.BUCKET_NAME,
+                        key=full_key(key),
+                        body=f,
+                        content_type=content_type,
+                    ))
+                else:
+                    raise
 
         logger.debug(f"Uploaded {path_obj} to OSS as {key} (ContentType: {content_type}), status: {result.status_code}")
         return True
@@ -226,18 +241,32 @@ def upload_bytes(
 
     try:
         client = get_oss_client()
-        # DALTON-HOOK(share-redaction): attach object-level private ACL on OSS upload for non-avatar keys
-        from src.dalton.share_media import storage_private_acl_kwargs
+        # DALTON-HOOK(share-redaction): attach object-level private ACL on OSS upload with ACL-unsupported fallback
+        from src.dalton.share_media import (
+            is_acl_not_supported_error,
+            storage_private_acl_kwargs,
+        )
 
         acl_kwargs = storage_private_acl_kwargs(key, provider="oss")
 
-        result = client.put_object(oss.PutObjectRequest(
-            bucket=OSSConfig.BUCKET_NAME,
-            key=full_key(key),
-            body=data,
-            content_type=content_type,
-            **acl_kwargs,
-        ))
+        try:
+            result = client.put_object(oss.PutObjectRequest(
+                bucket=OSSConfig.BUCKET_NAME,
+                key=full_key(key),
+                body=data,
+                content_type=content_type,
+                **acl_kwargs,
+            ))
+        except Exception as acl_exc:
+            if acl_kwargs and is_acl_not_supported_error(acl_exc):
+                result = client.put_object(oss.PutObjectRequest(
+                    bucket=OSSConfig.BUCKET_NAME,
+                    key=full_key(key),
+                    body=data,
+                    content_type=content_type,
+                ))
+            else:
+                raise
 
         logger.debug(f"Uploaded bytes to OSS as {key} (ContentType: {content_type}), status: {result.status_code}")
         return True

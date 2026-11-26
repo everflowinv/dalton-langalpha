@@ -997,7 +997,9 @@ main() {
 
   printf "\n== Configuring %s ==\n" "$ENV_FILE"
   mkdir -p "$(dirname "$ENV_FILE")"
+  local fresh_install=0
   if [[ ! -f "$ENV_FILE" ]]; then
+    fresh_install=1
     local seed_tmp
     seed_tmp="$(mktemp "$(dirname "$ENV_FILE")/.env.seed.XXXXXX")"
     chmod 600 "$seed_tmp"
@@ -1035,9 +1037,14 @@ main() {
   fi
 
   if is_loopback_domain "$domain"; then
-    write_env_key "DOMAIN" "$domain"
-    set_env_if_empty "DALTON_AUTH_MODE" "oss" || true
-    set_env_if_empty "DALTON_ALLOW_DEV_OSS_AUTH" "1" || true
+    local existing_auth_mode
+    existing_auth_mode="$(get_env_value_any "DALTON_AUTH_MODE")"
+    if [[ "$fresh_install" -eq 1 || -z "$existing_auth_mode" ]]; then
+      # Fresh Compose install behind Caddy defaults to local auth so owner requests work through edge
+      configure_public_domain_local_auth "$domain"
+    else
+      write_env_key "DOMAIN" "$domain"
+    fi
     validate_domain_for_auth "$domain"
   else
     configure_public_domain_local_auth "$domain"

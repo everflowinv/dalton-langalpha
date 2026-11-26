@@ -64,9 +64,12 @@ from src.server.utils.secret_redactor import (
 )
 from src.utils.mime import resolve_content_type
 
+from src.dalton.share_media import NoStorePublicAPIRoute  # DALTON-HOOK(share-redaction)
+
 logger = logging.getLogger(__name__)
 
-share_files_router = APIRouter(tags=["Public Sharing"])
+# DALTON-HOOK(share-redaction): enforce Cache-Control: no-store across all public file responses and errors
+share_files_router = APIRouter(tags=["Public Sharing"], route_class=NoStorePublicAPIRoute)
 
 # Every sandbox failure on these routes collapses into the same 404 an absent
 # path gets. They are unauthenticated, so a 503 would confirm that a guessed
@@ -240,12 +243,8 @@ async def _stored_listing(target: SharedFileTarget, normalized_path: str) -> lis
 async def list_shared_files(
     share_token: str,
     path: str = Query(".", description="Directory to list."),
-    response: Response = None,  # DALTON-HOOK(share-redaction)
 ):
     """List files in a shared thread's workspace. Requires allow_files permission."""
-    # DALTON-HOOK(share-redaction): enforce Cache-Control: no-store on all public file routes
-    if response is not None:
-        response.headers["Cache-Control"] = "no-store"
     # Reject `..` before it reaches the sandbox path validator, which only
     # prefix-checks the work dir and does not resolve `..`, so an unresolved
     # `../../etc/passwd` would otherwise read outside the workspace on a live
@@ -273,7 +272,6 @@ async def list_shared_files(
 async def resolve_shared_file(
     share_token: str,
     body: ResolveFileRefRequest,
-    response: Response = None,  # DALTON-HOOK(share-redaction)
 ):
     """Resolve a file reference inside a shared thread's workspace.
 
@@ -281,9 +279,6 @@ async def resolve_shared_file(
     wakes a sandbox and never finds a file that listing would hide, the share
     scope included.
     """
-    # DALTON-HOOK(share-redaction): enforce Cache-Control: no-store on all public file routes
-    if response is not None:
-        response.headers["Cache-Control"] = "no-store"
     target = await resolve_shared_files(share_token, require_files=True)
     if is_unbound(target.workspace):
         return {"status": "unavailable", "reason": HOME_NOT_ON_COMPUTER_REASON, "matches": []}
@@ -319,12 +314,8 @@ async def read_shared_file(
         le=DEFAULT_READ_LIMIT_LINES,
         description="Max lines.",
     ),
-    response: Response = None,  # DALTON-HOOK(share-redaction)
 ):
     """Read a text file from a shared thread's workspace. Requires allow_files permission."""
-    # DALTON-HOOK(share-redaction): enforce Cache-Control: no-store on all public file routes
-    if response is not None:
-        response.headers["Cache-Control"] = "no-store"
     # See list_shared_files: reject `..` before the sandbox validator, which
     # does not resolve it.
     if _has_traversal(path):

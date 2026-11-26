@@ -308,26 +308,37 @@ def get_signed_upload_url(
     uploader from the body it streams.
     """
     checksum_b64 = base64.b64encode(bytes.fromhex(sha256_hex)).decode("ascii")
+    # DALTON-HOOK(share-redaction): bind private ACL on presigned single PUT for non-avatar keys
+    from src.dalton.share_media import storage_private_acl_kwargs
+
+    acl_kwargs = storage_private_acl_kwargs(
+        key, provider="s3", endpoint_url=StorageConfig.ENDPOINT_URL
+    )
+    params: dict[str, Any] = {
+        "Bucket": StorageConfig.BUCKET_NAME,
+        "Key": key,
+        "ContentLength": content_length,
+        "ContentType": content_type,
+        "ChecksumSHA256": checksum_b64,
+        **acl_kwargs,
+    }
     try:
         client = _get_client()
         url = client.generate_presigned_url(
             "put_object",
-            Params={
-                "Bucket": StorageConfig.BUCKET_NAME,
-                "Key": key,
-                "ContentLength": content_length,
-                "ContentType": content_type,
-                "ChecksumSHA256": checksum_b64,
-            },
+            Params=params,
             ExpiresIn=expires_in,
         )
     except Exception as e:
         logger.error(f"Failed to presign upload for {key}: {e}")
         return None
-    return url, {
+    headers = {
         "Content-Type": content_type,
         "x-amz-checksum-sha256": checksum_b64,
     }
+    if acl_kwargs.get("ACL"):
+        headers["x-amz-acl"] = str(acl_kwargs["ACL"])
+    return url, headers
 
 
 # The store's own multipart limits, and the part size chosen against them.

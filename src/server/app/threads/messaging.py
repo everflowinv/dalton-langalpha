@@ -7,7 +7,7 @@ from uuid import UUID, uuid4
 
 import asyncio
 
-from fastapi import Depends, Header, HTTPException, Query, Request, Response  # DALTON-HOOK(share-redaction)
+from fastapi import Depends, Header, HTTPException, Query, Request  # DALTON-HOOK(share-redaction)
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from src.config.settings import get_sse_keepalive_interval
@@ -366,7 +366,9 @@ def _is_service_request(raw_request: Request | None) -> bool:
     from src.dalton.settings import get_dalton_auth_mode
 
     if HOST_MODE == "oss" and get_dalton_auth_mode() != "oss":
-        return dispatch_oss_service_request(sent, token, host_mode=HOST_MODE)
+        return dispatch_oss_service_request(
+            sent, token, host_mode=HOST_MODE, scope=raw_request.scope if raw_request else None
+        )
     trusted = (
         HOST_MODE == "oss"
         and not token
@@ -1717,29 +1719,11 @@ async def replay_thread_messages(
         paged = limit is not None or before_turn is not None
 
         # DALTON-HOOK(share-redaction): mint dalton_oss_media_session cookie & rewrite owner media URLs
-        from src.dalton.share_media import (
-            mint_oss_media_session_cookie,
-            resolve_thread_media_bindings,
-            rewrite_lines_for_owner_media,
-        )
+        from src.dalton.share_media import prepare_owner_replay_media
 
-        _media_cookie_holder = Response()
-        _oss_session = mint_oss_media_session_cookie(request, _media_cookie_holder)
-        _sid_hash, _origin_hash = _oss_session if _oss_session else ("", "")
-        _media_bindings = await resolve_thread_media_bindings(
-            rows.thread,
-            rows.queries,
-            [ln.item() for ln in replay_lines if ln.event in ("user_message", "message_chunk", "steering_delivered")],
+        replay_lines, _media_set_cookies = await prepare_owner_replay_media(
+            request, rows, replay_lines, thread_id=thread_id, viewer_id=x_user_id
         )
-        if _media_bindings:
-            replay_lines = rewrite_lines_for_owner_media(
-                replay_lines,
-                thread_id=thread_id,
-                viewer_id=x_user_id,
-                bindings=_media_bindings,
-                sid_hash=_sid_hash,
-                origin_hash=_origin_hash,
-            )
 
         async def event_generator():
             seq = 0
@@ -1848,9 +1832,8 @@ async def replay_thread_messages(
             },
         )
         # DALTON-HOOK(share-redaction): attach minted dalton_oss_media_session Set-Cookie header to owner replay response
-        for _hdr_k, _hdr_v in _media_cookie_holder.raw_headers:
-            if _hdr_k.lower() == b"set-cookie":
-                stream_resp.raw_headers.append((_hdr_k, _hdr_v))
+        for _cookie_val in _media_set_cookies:
+            stream_resp.headers.append("set-cookie", _cookie_val)
         return stream_resp
 
     except DATABASE_UNAVAILABLE as e:

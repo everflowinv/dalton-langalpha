@@ -33,6 +33,7 @@ from urllib.parse import unquote, urlsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
+from fastapi.routing import APIRoute
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from psycopg.rows import dict_row
 
@@ -66,8 +67,31 @@ _ACL_UNSUPPORTED_CODES = frozenset(
 
 _optional_bearer = HTTPBearer(auto_error=False)
 
+class NoStorePublicAPIRoute(APIRoute):
+    """Ensure every public share response and HTTPException carries ``Cache-Control: no-store``."""
+
+    def get_route_handler(self):
+        original = super().get_route_handler()
+
+        async def _no_store_handler(request: Any) -> Any:
+            try:
+                resp = await original(request)
+            except HTTPException as exc:
+                hdrs = dict(exc.headers or {})
+                hdrs.setdefault("Cache-Control", "no-store")
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail=exc.detail,
+                    headers=hdrs,
+                ) from None
+            resp.headers["Cache-Control"] = "no-store"
+            return resp
+
+        return _no_store_handler
+
+
 owner_media_router = APIRouter(prefix="/api/v1/threads", tags=["Thread Media"])
-public_media_router = APIRouter(tags=["Public Sharing"])
+public_media_router = APIRouter(tags=["Public Sharing"], route_class=NoStorePublicAPIRoute)
 
 # Process-local ephemeral fallback secret when no persistent signing secret is configured.
 _EPHEMERAL_MEDIA_SECRET = secrets.token_hex(32)
@@ -116,7 +140,7 @@ def storage_private_acl_kwargs(
 
 
 def is_acl_not_supported_error(exc: BaseException) -> bool:
-    """Return True when S3/R2 refuses object ACLs (e.g. ``BucketOwnerEnforced``)."""
+    """Return True when S3/R2/OSS refuses object ACLs (e.g. ``BucketOwnerEnforced``)."""
     resp = getattr(exc, "response", None)
     if isinstance(resp, Mapping):
         code = str((resp.get("Error") or {}).get("Code") or "")
@@ -125,7 +149,21 @@ def is_acl_not_supported_error(exc: BaseException) -> bool:
             if code in ("InvalidRequest", "InvalidArgument"):
                 return "acl" in msg or "access control list" in msg
             return True
-    return "accesscontrollistnotsupported" in str(exc).lower()
+    # Alibabacloud OSS SDK OssError / ServiceError attributes
+    for attr in ("code", "error_code"):
+        raw_code = str(getattr(exc, attr, "") or "")
+        if raw_code in _ACL_UNSUPPORTED_CODES or raw_code in ("InvalidObjectAcl", "PutObjectAclNotAllowed"):
+            if raw_code in ("InvalidRequest", "InvalidArgument"):
+                raw_msg = str(getattr(exc, "message", "") or exc).lower()
+                return "acl" in raw_msg or "access control list" in raw_msg
+            return True
+    low = str(exc).lower()
+    return (
+        "accesscontrollistnotsupported" in low
+        or "invalidobjectacl" in low
+        or ("bucket does not allow acls" in low)
+        or ("acl" in low and "not supported" in low)
+    )
 
 
 def to_private_media_key(key: str) -> str:
@@ -239,9 +277,18 @@ def _resolve_upstream_runtime_config() -> dict[str, Any] | None:
             return None
         endpoint = (os.getenv("OSS_ENDPOINT") or "").strip().rstrip("/")
         region = (os.getenv("OSS_REGION") or "").strip()
-        public_base = (
-            f"https://{bucket}.{endpoint}" if endpoint and not endpoint.startswith("http") else (endpoint or "")
-        )
+        if endpoint:
+            if "://" in endpoint:
+                scheme, rest = endpoint.split("://", 1)
+                public_base = (
+                    endpoint
+                    if rest.lower().startswith(f"{bucket.lower()}.")
+                    else f"{scheme}://{bucket}.{rest}"
+                )
+            else:
+                public_base = f"https://{bucket}.{endpoint}"
+        else:
+            public_base = ""
         return {
             "provider": "oss",
             "bucket_name": bucket,
@@ -255,7 +302,7 @@ def _resolve_upstream_runtime_config() -> dict[str, Any] | None:
             "public_url_base": public_base.rstrip("/"),
         }
 
-    # S3-compatible (STORAGE_* with legacy S3_* / AWS_* fallback)
+    # S3-compatible (STORAGE_* with legacy S3_* / AWS_* fallback, matching s3_client.py)
     bucket = (os.getenv("STORAGE_BUCKET_NAME") or os.getenv("S3_BUCKET_NAME") or "").strip()
     if not bucket:
         return None
@@ -268,7 +315,17 @@ def _resolve_upstream_runtime_config() -> dict[str, Any] | None:
         style = "virtual"
     if not public_base:
         if endpoint:
-            public_base = f"{endpoint}/{bucket}" if style == "path" else endpoint
+            if style == "path":
+                public_base = f"{endpoint}/{bucket}"
+            elif "://" in endpoint:
+                scheme, rest = endpoint.split("://", 1)
+                public_base = (
+                    endpoint
+                    if rest.lower().startswith(f"{bucket.lower()}.")
+                    else f"{scheme}://{bucket}.{rest}"
+                )
+            else:
+                public_base = f"https://{bucket}.{endpoint}"
         else:
             public_base = f"https://{bucket}.s3.{region}.amazonaws.com"
     return {
@@ -705,29 +762,30 @@ def mint_public_media_ref(
 
 def verify_public_media_ref(media_ref: str, *, expected_thread_id: str) -> dict[str, Any]:
     """Verify opaque ``media_ref`` binding to ``expected_thread_id``."""
+    _no_store = {"Cache-Control": "no-store"}
     cleaned = str(media_ref or "").strip()
     parts = cleaned.split(".")
     if len(parts) != 2 or not parts[0] or not parts[1]:
-        raise HTTPException(status_code=404, detail="Media not found")
+        raise HTTPException(status_code=404, detail="Media not found", headers=_no_store)
     p_b64, s_b64 = parts
     expected = hmac.new(_media_hmac_key(), p_b64.encode("ascii"), hashlib.sha256).digest()
     try:
         supplied = _b64u_decode(s_b64)
     except Exception:
-        raise HTTPException(status_code=404, detail="Media not found") from None
+        raise HTTPException(status_code=404, detail="Media not found", headers=_no_store) from None
     if not hmac.compare_digest(supplied, expected):
-        raise HTTPException(status_code=404, detail="Media not found")
+        raise HTTPException(status_code=404, detail="Media not found", headers=_no_store)
     try:
         claims = json.loads(_b64u_decode(p_b64).decode("utf-8"))
     except Exception:
-        raise HTTPException(status_code=404, detail="Media not found") from None
+        raise HTTPException(status_code=404, detail="Media not found", headers=_no_store) from None
     if (
         not isinstance(claims, dict)
         or claims.get("v") != 1
         or claims.get("typ") != "dalton_pub_media"
         or str(claims.get("tid") or "") != str(expected_thread_id)
     ):
-        raise HTTPException(status_code=404, detail="Media not found")
+        raise HTTPException(status_code=404, detail="Media not found", headers=_no_store)
     return claims
 
 
@@ -876,54 +934,291 @@ async def _fetch_ready_chat_uploads(
     return {str(r["upload_id"]): dict(r) for r in rows}
 
 
+def _is_safe_object_key(key: str) -> bool:
+    cleaned = str(key or "").strip().lstrip("/")
+    if not cleaned or "\x00" in cleaned or "\\" in cleaned:
+        return False
+    parts = cleaned.split("/")
+    return all(p and p not in (".", "..") for p in parts)
+
+
+def _allowed_storage_origins() -> set[str]:
+    origins: set[str] = set()
+    try:
+        targets = resolve_active_storage_targets()
+    except Exception:
+        return origins
+    for t in targets:
+        for raw_u in (t.endpoint_url, t.signing_endpoint_url, *t.public_url_bases):
+            if not raw_u:
+                continue
+            cand = raw_u if "://" in raw_u else f"https://{raw_u}"
+            norm = _normalize_origin_str(cand)
+            if norm:
+                origins.add(norm)
+        if t.bucket_name and t.provider == "s3" and t.region:
+            norm_aws = _normalize_origin_str(f"https://{t.bucket_name}.s3.{t.region}.amazonaws.com")
+            if norm_aws:
+                origins.add(norm_aws)
+    return origins
+
+
+def _is_url_from_configured_storage(url: str) -> bool:
+    """Return True if ``url`` matches a configured storage origin (or no storage origins are configured)."""
+    origins = _allowed_storage_origins()
+    if not origins:
+        return True
+    norm = _normalize_origin_str(url)
+    return bool(norm and norm in origins)
+
+
+def _is_thread_prefixed_upstream_key(thread_id: str, key: str) -> bool:
+    """Return True iff ``key`` is directly scoped under ``{prefix}/{thread_id}/...``."""
+    if not thread_id or not _is_safe_object_key(key):
+        return False
+    cleaned = strip_private_media_prefix(key)
+    for prefix in ("response-images/", "attachments/", "widgets/"):
+        if cleaned.startswith(f"{prefix}{thread_id}/"):
+            return True
+    return False
+
+
+def _extract_registered_query_attachment_keys_and_ids(
+    queries: Iterable[Mapping[str, Any]],
+) -> tuple[set[str], set[str], set[str]]:
+    """Return ``(normalized_keys, attachment_ids, upload_ids)`` from persisted query metadata."""
+    keys: set[str] = set()
+    att_ids: set[str] = set()
+    upload_ids: set[str] = set()
+    for q in queries:
+        meta = q.get("metadata") if isinstance(q, Mapping) else None
+        if not isinstance(meta, Mapping):
+            continue
+        for att in meta.get("attachments") or ():
+            if not isinstance(att, Mapping):
+                continue
+            raw_url = att.get("url")
+            if isinstance(raw_url, str) and raw_url.strip():
+                k = extract_upstream_key_from_url(raw_url)
+                if k and _is_safe_object_key(k):
+                    keys.add(strip_private_media_prefix(k))
+            raw_att_id = att.get("attachment_id") or att.get("id")
+            if isinstance(raw_att_id, str) and raw_att_id.strip():
+                att_ids.add(raw_att_id.strip())
+            raw_uid = att.get("upload_id")
+            if isinstance(raw_uid, str) and raw_uid.strip():
+                upload_ids.add(raw_uid.strip())
+    return keys, att_ids, upload_ids
+
+
+async def _load_thread_query_metadata_rows(thread_id: str) -> list[dict[str, Any]]:
+    """Load persisted ``conversation_queries`` metadata for ``thread_id``."""
+    from src.server.database.pool import get_db_connection
+
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT metadata
+                FROM conversation_queries
+                WHERE conversation_thread_id = %s::uuid
+                  AND metadata IS NOT NULL
+                """,
+                (str(thread_id),),
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def _verify_staged_attachment_owner(
+    attachment_id: str,
+    cleaned_key: str,
+    *,
+    owner_id: str | None = None,
+) -> bool:
+    """If a ``chat_attachments`` DB row exists for ``attachment_id``, verify key & owner match."""
+    try:
+        from src.server.database.chat_attachments import get_attachment
+
+        row = await get_attachment(attachment_id)
+    except RuntimeError as exc:
+        if "pool is not open" in str(exc).lower():
+            return True
+        return False
+    except Exception:
+        return False
+
+    if row is None:
+        # Legacy inline/migrated attachment without a chat_attachments staging row:
+        # thread query metadata membership was already verified by caller.
+        return True
+    row_key = strip_private_media_prefix(str(row.get("object_key") or ""))
+    if row_key and row_key != cleaned_key:
+        return False
+    if owner_id and row.get("user_id") and str(row["user_id"]) != str(owner_id):
+        return False
+    return True
+
+
+async def _is_attachment_bound_to_thread(
+    thread_id: str,
+    key: str,
+    *,
+    owner_id: str | None = None,
+    queries: Iterable[Mapping[str, Any]] | None = None,
+) -> bool:
+    """Verify an ``attachments/*`` object key is bound to ``thread_id`` (fail closed)."""
+    if not thread_id or not _is_safe_object_key(key):
+        return False
+    cleaned = strip_private_media_prefix(key)
+    if not cleaned.startswith("attachments/"):
+        return False
+    if cleaned.startswith(f"attachments/{thread_id}/"):
+        return True
+
+    parts = cleaned.split("/")
+    if len(parts) < 3:
+        return False
+    att_id = parts[1]
+
+    if queries is None:
+        try:
+            query_rows = await _load_thread_query_metadata_rows(thread_id)
+        except Exception:
+            logger.debug("Attachment thread binding check failed for thread %s", thread_id, exc_info=True)
+            return False
+    else:
+        query_rows = list(queries)
+
+    reg_keys, reg_att_ids, _ = _extract_registered_query_attachment_keys_and_ids(query_rows)
+    if cleaned not in reg_keys and att_id not in reg_att_ids:
+        return False
+
+    return await _verify_staged_attachment_owner(att_id, cleaned, owner_id=owner_id)
+
+
+async def _is_chat_upload_bound_to_thread(
+    thread_id: str,
+    upload_id: str,
+    *,
+    queries: Iterable[Mapping[str, Any]] | None = None,
+) -> bool:
+    """Verify a Dalton ``chat_upload`` ``upload_id`` is registered on ``thread_id`` (fail closed)."""
+    uid = str(upload_id or "").strip()
+    if not thread_id or not uid:
+        return False
+    if queries is None:
+        try:
+            query_rows = await _load_thread_query_metadata_rows(thread_id)
+        except Exception:
+            logger.debug("Chat upload thread binding check failed for thread %s", thread_id, exc_info=True)
+            return False
+    else:
+        query_rows = list(queries)
+
+    _, _, reg_upload_ids = _extract_registered_query_attachment_keys_and_ids(query_rows)
+    return uid in reg_upload_ids
+
+
 async def resolve_thread_media_bindings(
     thread: Mapping[str, Any],
     queries: Iterable[Mapping[str, Any]],
     items: Iterable[Mapping[str, Any]],
+    *,
+    responses_by_turn: Mapping[Any, Mapping[str, Any]] | None = None,
+    run_facts: Iterable[Mapping[str, Any]] | None = None,
 ) -> dict[str, tuple[str, str]]:
-    """Collect URL/upload_id -> ``(backend, ref_id)`` bindings for a thread's media.
+    """Collect verified URL/upload_id -> ``(backend, ref_id)`` bindings for a thread's media.
 
-    Also resolves historical ``upload_id``-only Dalton large-file attachments via
-    ``dalton_chat_file_uploads`` (verifying ``workspace_id``, ``state='ready'``,
-    ``cleaned_at IS NULL``).
+    Only signs media demonstrably registered to ``thread``:
+    - Persisted ``queries[*].metadata.attachments`` URLs (verified storage origin + thread/attachment binding)
+    - Persisted ``queries[*].metadata.attachments[*].upload_id`` (verified in ``dalton_chat_file_uploads``)
+    - Server-captured assistant images under ``response-images/{thread_id}/...`` (from ``replay_facts.images``
+      or assistant ``message_chunk`` content, verified against configured storage origins)
+
+    Never signs arbitrary URLs pasted into user message text or foreign ``attachments/`` / ``widgets/`` keys.
     """
+    thread_id = str(
+        thread.get("conversation_thread_id") or thread.get("thread_id") or ""
+    ).strip()
+    if not thread_id:
+        return {}
+    owner_id = str(thread.get("user_id") or thread.get("owner_id") or "").strip() or None
+    query_list = list(queries)
+
     bindings: dict[str, tuple[str, str]] = {}
     upload_ids: set[str] = set()
 
-    def _scan_url(u: Any) -> None:
+    async def _register_upstream_url(u: Any, *, allow_staged_attachment: bool) -> None:
         if not isinstance(u, str) or not u.strip():
             return
+        if not _is_url_from_configured_storage(u):
+            return
         key = extract_upstream_key_from_url(u)
-        if key:
-            bindings[u] = ("upstream", key)
+        if not key or not _is_safe_object_key(key):
+            return
+        cleaned = strip_private_media_prefix(key)
+        if cleaned.startswith("response-images/") or cleaned.startswith("widgets/"):
+            if _is_thread_prefixed_upstream_key(thread_id, key):
+                bindings[u] = ("upstream", key)
+            return
+        if cleaned.startswith("attachments/"):
+            if cleaned.startswith(f"attachments/{thread_id}/"):
+                bindings[u] = ("upstream", key)
+            elif allow_staged_attachment and await _is_attachment_bound_to_thread(
+                thread_id, key, owner_id=owner_id, queries=query_list
+            ):
+                bindings[u] = ("upstream", key)
 
-    for q in queries:
+    # 1. Server-registered query attachments (persisted in conversation_queries)
+    for q in query_list:
         meta = q.get("metadata") if isinstance(q, Mapping) else None
         if isinstance(meta, Mapping):
             for att in meta.get("attachments") or ():
                 if not isinstance(att, Mapping):
                     continue
                 if att.get("url"):
-                    _scan_url(att["url"])
+                    await _register_upstream_url(att["url"], allow_staged_attachment=True)
                 if att.get("upload_id"):
                     upload_ids.add(str(att["upload_id"]))
 
+    # 2. Server-recorded captured sandbox images in replay_facts
+    for container in (
+        *(responses_by_turn.values() if isinstance(responses_by_turn, Mapping) else ()),
+        *(run_facts or ()),
+    ):
+        if not isinstance(container, Mapping):
+            continue
+        facts = container.get("replay_facts") if "replay_facts" in container else container
+        if not isinstance(facts, Mapping):
+            continue
+        imgs = facts.get("images")
+        img_urls = imgs.values() if isinstance(imgs, Mapping) else (imgs if isinstance(imgs, list) else ())
+        for u in img_urls:
+            await _register_upstream_url(u, allow_staged_attachment=False)
+
+    # 3. Replay items: assistant message_chunk may embed thread-scoped response-images/{thread_id}/...
+    #    User messages & steering free text are NEVER scanned for arbitrary URLs.
     for item in items:
-        data = item.get("data") if isinstance(item, Mapping) else None
+        if not isinstance(item, Mapping):
+            continue
+        event_type = item.get("event")
+        data = item.get("data")
         if not isinstance(data, Mapping):
             continue
-        meta = data.get("metadata")
-        if isinstance(meta, Mapping):
-            for att in meta.get("attachments") or ():
-                if isinstance(att, Mapping):
-                    if att.get("url"):
-                        _scan_url(att["url"])
-                    if att.get("upload_id"):
-                        upload_ids.add(str(att["upload_id"]))
-        content = data.get("content")
-        if isinstance(content, str) and ("response-images/" in content or "attachments/" in content or "private-media/" in content):
-            for m in re.finditer(r"https?://[^\s\"'<>)]+", content):
-                _scan_url(m.group(0))
+        if event_type == "message_chunk":
+            role = data.get("role")
+            if role in (None, "", "assistant"):
+                content = data.get("content")
+                if isinstance(content, str) and (
+                    "response-images/" in content or "private-media/" in content
+                ):
+                    for m in re.finditer(r"https?://[^\s\"'<>)]+", content):
+                        u = m.group(0)
+                        k = extract_upstream_key_from_url(u)
+                        if k and strip_private_media_prefix(k).startswith(
+                            f"response-images/{thread_id}/"
+                        ):
+                            await _register_upstream_url(u, allow_staged_attachment=False)
 
     ws_id = str(thread.get("workspace_id") or "")
     if upload_ids and ws_id:
@@ -1062,6 +1357,57 @@ def rewrite_lines_for_owner_media(
     return out
 
 
+async def prepare_owner_replay_media(
+    request: Request | None,
+    rows: Any,
+    replay_lines: list[Any],
+    *,
+    thread_id: str,
+    viewer_id: str,
+) -> tuple[list[Any], list[str]]:
+    """Mint ``dalton_oss_media_session`` cookie (when applicable) and rewrite owner media URLs.
+
+    Thin-hook entry point for ``src/server/app/threads/messaging.py``. Returns
+    ``(rewritten_lines, set_cookie_headers)``.
+    """
+    set_cookies: list[str] = []
+    sid_hash, origin_hash = "", ""
+    if request is not None:
+        cookie_holder = Response()
+        oss_session = mint_oss_media_session_cookie(request, cookie_holder)
+        if oss_session:
+            sid_hash, origin_hash = oss_session
+        set_cookies = cookie_holder.headers.getlist("set-cookie")
+
+    thread_dict = dict(rows.thread) if isinstance(getattr(rows, "thread", None), Mapping) else {}
+    thread_dict.setdefault("conversation_thread_id", thread_id)
+    queries = getattr(rows, "queries", None) or ()
+    responses_by_turn = getattr(rows, "responses_by_turn", None)
+    run_facts = getattr(rows, "run_facts", None)
+
+    bindings = await resolve_thread_media_bindings(
+        thread_dict,
+        queries,
+        [
+            ln.item()
+            for ln in replay_lines
+            if ln.event in ("user_message", "message_chunk", "steering_delivered")
+        ],
+        responses_by_turn=responses_by_turn,
+        run_facts=run_facts,
+    )
+    if bindings:
+        replay_lines = rewrite_lines_for_owner_media(
+            replay_lines,
+            thread_id=thread_id,
+            viewer_id=viewer_id,
+            bindings=bindings,
+            sid_hash=sid_hash,
+            origin_hash=origin_hash,
+        )
+    return replay_lines, set_cookies
+
+
 # =============================================================================
 # STREAMING RESPONSE BUILDERS & MEDIA ENDPOINTS
 # =============================================================================
@@ -1070,6 +1416,7 @@ async def _serve_media_payload(
     *,
     thread_id: str,
     workspace_id: str,
+    thread_owner_id: str = "",
     backend: str,
     ref_id: str,
     cache_control: str,
@@ -1079,34 +1426,48 @@ async def _serve_media_payload(
         "X-Content-Type-Options": "nosniff",
         "Content-Security-Policy": _MEDIA_SANDBOX_CSP,
     }
+    err_headers = {"Cache-Control": cache_control}
 
     if backend == "upstream":
-        # Verify ref_id belongs to allowed thread media prefix
+        if not _is_safe_object_key(ref_id):
+            raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
         cleaned = strip_private_media_prefix(ref_id)
-        if not cleaned.startswith(_MIGRABLE_UPSTREAM_PREFIXES):
-            raise HTTPException(status_code=404, detail="Media not found")
-        if (cleaned.startswith("response-images/") or cleaned.startswith("attachments/")) and (
-            f"/{thread_id}/" not in f"/{cleaned}" and not cleaned.startswith("attachments/")
-        ):
-            raise HTTPException(status_code=404, detail="Media not found")
+        if cleaned.startswith("response-images/"):
+            if not cleaned.startswith(f"response-images/{thread_id}/"):
+                raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
+        elif cleaned.startswith("widgets/"):
+            if not cleaned.startswith(f"widgets/{thread_id}/"):
+                raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
+        elif cleaned.startswith("attachments/"):
+            bound = await _is_attachment_bound_to_thread(
+                thread_id, cleaned, owner_id=thread_owner_id or None
+            )
+            if not bound:
+                raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
+        else:
+            raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
+
         raw = await asyncio.to_thread(read_controlled_object_bytes, ref_id)
         if raw is None:
-            raise HTTPException(status_code=404, detail="Media not found")
+            raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
         mime = resolve_content_type(cleaned)
         return Response(content=raw, media_type=mime, headers=base_headers)
 
     if backend == "chat_upload":
         from src.dalton import chat_upload_storage as chat_store
 
+        bound = await _is_chat_upload_bound_to_thread(thread_id, ref_id)
+        if not bound:
+            raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
         ready = await _fetch_ready_chat_uploads(workspace_id, [ref_id])
         row = ready.get(str(ref_id))
         if row is None:
-            raise HTTPException(status_code=404, detail="Media not found")
+            raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
         resolved_key = await asyncio.to_thread(
             chat_store.resolve_existing_chat_upload_key, str(row["object_key"])
         )
         if not resolved_key:
-            raise HTTPException(status_code=404, detail="Media not found")
+            raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
         mime = str(row.get("mime_type") or "") or resolve_content_type(
             str(row.get("safe_filename") or resolved_key)
         )
@@ -1116,7 +1477,7 @@ async def _serve_media_payload(
 
         return StreamingResponse(_chunks(), media_type=mime, headers=base_headers)
 
-    raise HTTPException(status_code=404, detail="Media not found")
+    raise HTTPException(status_code=404, detail="Media not found", headers=err_headers)
 
 
 @owner_media_router.get("/{thread_id}/media/{media_token}")
@@ -1134,10 +1495,15 @@ async def serve_owner_thread_media(
 
     thread = await get_thread_by_id(thread_id)
     if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Thread not found",
+            headers={"Cache-Control": "private, no-store"},
+        )
     return await _serve_media_payload(
         thread_id=thread_id,
         workspace_id=str(thread.get("workspace_id") or ""),
+        thread_owner_id=str(thread.get("user_id") or thread.get("owner_id") or ""),
         backend=str(claims.get("b") or ""),
         ref_id=str(claims.get("ref") or ""),
         cache_control="private, no-store",
@@ -1153,7 +1519,13 @@ async def serve_shared_thread_media(
     from src.dalton.share_redaction import resolve_effective_share_permissions
     from src.server.app.share_access import get_shared_thread
 
-    thread = await get_shared_thread(share_token)
+    try:
+        thread = await get_shared_thread(share_token)
+    except HTTPException as exc:
+        hdrs = dict(exc.headers or {})
+        hdrs.setdefault("Cache-Control", "no-store")
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail, headers=hdrs) from None
+
     eff = await resolve_effective_share_permissions(thread)
     if not eff.allow_files:
         raise HTTPException(
@@ -1169,6 +1541,7 @@ async def serve_shared_thread_media(
     return await _serve_media_payload(
         thread_id=thread_id,
         workspace_id=str(thread.get("workspace_id") or ""),
+        thread_owner_id=str(thread.get("user_id") or thread.get("owner_id") or ""),
         backend=str(claims.get("b") or ""),
         ref_id=str(claims.get("ref") or ""),
         cache_control="no-store",
